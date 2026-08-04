@@ -2001,6 +2001,156 @@ else
   echo "$OUT_MIRROR" >&2
 fi
 
+# ── Case 24 (#892, Codex P2): preserve safe renamed fetch mappings ─────
+# A safe mapping need not retain the remote branch name. Repositories commonly
+# map a remote `release` head to a local `origin/stable` tracking ref. The
+# cleanup probe and apply-side fetch must honour that source-to-destination
+# mapping; replacing it with the conventional `heads/* → origin/*` map would
+# see no remote `stable`, prune the live `origin/stable` ref, and remove this
+# clean worktree.
+MAPPED_ROOT="$WORKDIR/renamed-refspec"
+MAPPED_REMOTE="$MAPPED_ROOT/remote.git"
+MAPPED_MAIN="$MAPPED_ROOT/main"
+MAPPED_WT="$MAPPED_ROOT/stable-worktree"
+mkdir -p "$MAPPED_ROOT"
+git init -q --bare "$MAPPED_REMOTE"
+git init -q "$MAPPED_MAIN"
+(
+  cd "$MAPPED_MAIN"
+  git config user.email "test@example.com"
+  git config user.name "Test"
+  git config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$MAPPED_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b release
+  git push -q -u origin release
+  git checkout -q main
+  git config --unset-all remote.origin.fetch
+  git config --add remote.origin.fetch '+refs/heads/release:refs/remotes/origin/stable'
+  git fetch -q origin '+refs/heads/release:refs/remotes/origin/stable'
+  git branch --track stable origin/stable
+  git worktree add -q "$MAPPED_WT" stable
+) >/dev/null 2>&1
+
+set +e
+OUT_MAPPED_DRY=$( cd "$MAPPED_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_MAPPED_DRY=$?
+set -e
+if [ "$RC_MAPPED_DRY" -eq 0 ] && ! echo "$OUT_MAPPED_DRY" | grep -Fq -- "$MAPPED_WT"; then
+  pass "#892 dry-run honours a configured release→origin/stable mapping"
+else
+  fail "#892 dry-run misclassified a live renamed remote mapping"
+  echo "$OUT_MAPPED_DRY" >&2
+fi
+
+set +e
+OUT_MAPPED_APPLY=$( cd "$MAPPED_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_MAPPED_APPLY=$?
+set -e
+if [ "$RC_MAPPED_APPLY" -eq 0 ] && [ -d "$MAPPED_WT" ] \
+   && git -C "$MAPPED_MAIN" rev-parse --verify -q refs/remotes/origin/stable >/dev/null; then
+  pass "#892 --apply preserves a live worktree and its renamed tracking ref"
+else
+  fail "DATA LOSS: --apply pruned a live renamed tracking ref or removed its worktree"
+  echo "$OUT_MAPPED_APPLY" >&2
+fi
+
+# ── Case 25 (#892, Codex P2): branch names may contain a pipe ──────────
+# Git forbids tabs in ref names but permits `|`. The stale-branch snapshot and
+# its merged-sweep transport must therefore use a tab record separator; the
+# former pipe format split `pipe|branch` into two unrelated fields and omitted
+# the confirmed-deleted remote branch completely.
+PIPE_ROOT="$WORKDIR/pipe-refname"
+PIPE_REMOTE="$PIPE_ROOT/remote.git"
+PIPE_MAIN="$PIPE_ROOT/main"
+PIPE_BRANCH='pipe|branch'
+mkdir -p "$PIPE_ROOT"
+git init -q --bare "$PIPE_REMOTE"
+git init -q "$PIPE_MAIN"
+(
+  cd "$PIPE_MAIN"
+  git config user.email "test@example.com"
+  git config user.name "Test"
+  git config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$PIPE_REMOTE"
+  git push -q -u origin main
+  git branch "$PIPE_BRANCH"
+  git push -q -u origin "$PIPE_BRANCH"
+  git --git-dir="$PIPE_REMOTE" branch -D "$PIPE_BRANCH"
+) >/dev/null 2>&1
+
+set +e
+OUT_PIPE=$( cd "$PIPE_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_PIPE=$?
+set -e
+if [ "$RC_PIPE" -eq 0 ] && echo "$OUT_PIPE" | grep -Fq -- "$PIPE_BRANCH"; then
+  pass "#892 a stale branch whose legal name contains | is reported"
+else
+  fail "#892 a stale branch containing | was lost while serializing the snapshot"
+  echo "$OUT_PIPE" >&2
+fi
+
+# ── Case 26 (#892, Codex P2): apply-side parser pins English locale ────
+# Model a localized `git branch -vv` by translating its human-facing gone
+# marker only when LC_ALL is absent. The helper must pin LC_ALL=C for this
+# parser so --apply reaches the same gone branch it would see in an English
+# environment.
+LOCALE_ROOT="$WORKDIR/localized-gone"
+LOCALE_REMOTE="$LOCALE_ROOT/remote.git"
+LOCALE_MAIN="$LOCALE_ROOT/main"
+LOCALE_BRANCH='localized-gone'
+LOCALE_WT="$LOCALE_ROOT/gone-worktree"
+LOCALE_STUB="$LOCALE_ROOT/git-stub"
+mkdir -p "$LOCALE_ROOT"
+git init -q --bare "$LOCALE_REMOTE"
+git init -q "$LOCALE_MAIN"
+(
+  cd "$LOCALE_MAIN"
+  git config user.email "test@example.com"
+  git config user.name "Test"
+  git config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$LOCALE_REMOTE"
+  git push -q -u origin main
+  git branch "$LOCALE_BRANCH"
+  git push -q -u origin "$LOCALE_BRANCH"
+  git worktree add -q "$LOCALE_WT" "$LOCALE_BRANCH"
+  git --git-dir="$LOCALE_REMOTE" branch -D "$LOCALE_BRANCH"
+  git fetch -q --prune origin
+) >/dev/null 2>&1
+mkdir -p "$LOCALE_STUB"
+cat >"$LOCALE_STUB/git" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = branch ] && [ "$2" = -vv ] && [ "${LC_ALL:-}" != C ]; then
+  "$REAL_GIT" "$@" | sed 's/: gone\]/: verschwunden\]/'
+  exit "${PIPESTATUS[0]}"
+fi
+exec "$REAL_GIT" "$@"
+EOF
+chmod +x "$LOCALE_STUB/git"
+
+set +e
+OUT_LOCALE=$( cd "$LOCALE_MAIN" && REAL_GIT="$(command -v git)" PATH="$LOCALE_STUB:$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_LOCALE=$?
+set -e
+if [ "$RC_LOCALE" -eq 0 ] && [ ! -d "$LOCALE_WT" ]; then
+  pass "#892 --apply parses gone-upstream state with LC_ALL=C"
+else
+  fail "#892 localized gone marker made --apply retain the stale worktree"
+  echo "$OUT_LOCALE" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

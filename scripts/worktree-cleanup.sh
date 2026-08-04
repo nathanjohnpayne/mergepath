@@ -253,11 +253,32 @@ MAIN_WORKTREE=$(cd "$GIT_COMMON_DIR/.." && pwd)
 # to refs/remotes/origin/*, the exact namespace gone_branches() reads via
 # %(upstream:short)) and tag pruning/following is turned off for this one
 # invocation. Nothing outside refs/remotes/origin/* can be deleted here.
+#
+# Preserve a safe configured source-to-destination mapping rather than replacing
+# it with the conventional `heads/* → origin/*` mapping. A repository may map
+# `refs/heads/release:refs/remotes/origin/stable`, for example; overwriting that
+# mapping would prune `origin/stable` and mistake the live `release` branch for
+# a deletion. Mappings outside the remote-tracking namespace remain excluded.
 if [ "$MODE" = "apply" ]; then
   if git -C "$MAIN_WORKTREE" remote get-url origin >/dev/null 2>&1; then
+    SAFE_FETCH_REFSPECS=()
+    while IFS= read -r refspec; do
+      safe_refspec=${refspec#+}
+      case "$safe_refspec" in
+        refs/heads/*:refs/remotes/origin/*)
+          SAFE_FETCH_REFSPECS+=("$refspec")
+          ;;
+      esac
+    done < <(git -C "$MAIN_WORKTREE" config --get-all remote.origin.fetch 2>/dev/null || true)
+    # A remote with no safe configured mapping (for example, a mirror refspec
+    # into refs/heads/*) still gets the conventional safe tracking map. This
+    # does not inherit the unsafe destination, and it lets gone detection work
+    # for repositories that have never configured remote-tracking refs.
+    if [ "${#SAFE_FETCH_REFSPECS[@]}" -eq 0 ]; then
+      SAFE_FETCH_REFSPECS=("+refs/heads/*:refs/remotes/origin/*")
+    fi
     if ! git -C "$MAIN_WORKTREE" -c fetch.pruneTags=false \
-         fetch --prune --no-tags origin \
-         '+refs/heads/*:refs/remotes/origin/*' >/dev/null 2>&1; then
+         fetch --prune --no-tags origin "${SAFE_FETCH_REFSPECS[@]}" >/dev/null 2>&1; then
       echo "worktree-cleanup.sh: warning: \`git fetch --prune origin\` failed; gone-upstream detection may miss recently-merged branches this run" >&2
     fi
   fi
@@ -530,7 +551,7 @@ EOF
 # We grab the branch name when the third field carries `: gone]`.
 gone_branches() {
   cd "$MAIN_WORKTREE" || return 0
-  git branch -vv 2>/dev/null | awk '
+  LC_ALL=C git branch -vv 2>/dev/null | awk '
     {
       # Strip leading whitespace and the current-branch marker.
       line = $0
@@ -544,6 +565,46 @@ gone_branches() {
       }
     }
   '
+}
+
+# Print the remote `refs/heads/...` ref that populates an upstream such as
+# `origin/stable`, using only configured mappings whose destinations stay in
+# `refs/remotes/origin/*`. The empty result is deliberately inconclusive: a
+# branch with no safe configured mapping is never treated as stale.
+origin_head_for_upstream() {
+  local upstream="$1" tracking_ref refspec source destination
+  local dest_prefix dest_suffix source_prefix source_suffix wildcard
+  tracking_ref="refs/remotes/$upstream"
+  while IFS= read -r refspec; do
+    refspec=${refspec#+}
+    case "$refspec" in
+      refs/heads/*:refs/remotes/origin/*) ;;
+      *) continue ;;
+    esac
+    source=${refspec%%:*}
+    destination=${refspec#*:}
+    case "$destination" in
+      *\*)
+        dest_prefix=${destination%%\**}
+        dest_suffix=${destination#*\*}
+        case "$tracking_ref" in
+          "$dest_prefix"*"$dest_suffix")
+            wildcard=${tracking_ref#"$dest_prefix"}
+            wildcard=${wildcard%"$dest_suffix"}
+            source_prefix=${source%%\**}
+            source_suffix=${source#*\*}
+            printf '%s%s%s\n' "$source_prefix" "$wildcard" "$source_suffix"
+            return 0
+            ;;
+        esac
+        ;;
+      "$tracking_ref")
+        printf '%s\n' "$source"
+        return 0
+        ;;
+    esac
+  done < <(git -C "$MAIN_WORKTREE" config --get-all remote.origin.fetch 2>/dev/null || true)
+  return 1
 }
 
 # Detect local branches whose upstream tracks `origin/<name>` but which
@@ -584,19 +645,21 @@ stale_unpruned_branches() {
   heads_file=$(mktemp "${TMPDIR:-/tmp}/wcleanup-remoteheads.XXXXXX") || return 0
   # `<sha>\t<refname>` per line; keep the refname column only.
   printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$heads_file"
-  local branch upstream remote_name
-  git for-each-ref --format='%(refname:short)|%(upstream:short)' refs/heads/ 2>/dev/null |
-  while IFS='|' read -r branch upstream; do
+  local branch upstream remote_head
+  # Git ref names may contain `|`, but cannot contain a tab. Use a tab record
+  # separator so every branch/upstream pair round-trips losslessly.
+  git for-each-ref --format='%(refname:short)%09%(upstream:short)' refs/heads/ 2>/dev/null |
+  while IFS=$'\t' read -r branch upstream; do
     [ -n "$branch" ] || continue
     case "$upstream" in
       origin/*) ;;
       *) continue ;;
     esac
     is_gone_branch "$branch" && continue
-    remote_name="${upstream#origin/}"
+    remote_head=$(origin_head_for_upstream "$upstream") || continue
     # Exact full-path match: `-Fx` so a branch named `feat` is never
     # satisfied by the remote having `feature`.
-    grep -Fxq -- "refs/heads/$remote_name" "$heads_file" && continue
+    grep -Fxq -- "$remote_head" "$heads_file" && continue
     echo "$branch"
   done
   rm -f "$heads_file"
@@ -1087,11 +1150,11 @@ fi
 # `gone` there), so this union changes nothing under --apply.
 MERGE_SWEEP_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-mergesweep.XXXXXX")
 {
-  awk '{ print $0 "|gone" }' "$GONE_FILE"
-  awk '{ print $0 "|stale-unpruned" }' "$STALE_UNPRUNED_FILE"
+  awk '{ printf "%s\t%s\n", $0, "gone" }' "$GONE_FILE"
+  awk '{ printf "%s\t%s\n", $0, "stale-unpruned" }' "$STALE_UNPRUNED_FILE"
 } >"$MERGE_SWEEP_FILE"
 
-while IFS='|' read -r LOCAL_BRANCH SWEEP_SRC; do
+while IFS=$'\t' read -r LOCAL_BRANCH SWEEP_SRC; do
   [ -n "$LOCAL_BRANCH" ] || continue
   STALE_NOTE=""
   if [ "$SWEEP_SRC" = "stale-unpruned" ]; then
