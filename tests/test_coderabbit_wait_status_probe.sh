@@ -1756,7 +1756,35 @@ test_884_count_bodies_fails_closed_unit() {
   fi
 }
 
+test_884_clearance_reviews_api_failure_fails_closed() {
+  # Phase 4b P1 on #884. The --probe path already refused a failed reviews read
+  # (test_probe_reviews_api_failure_is_infra_not_clean above), but the
+  # CLEARANCE path reached that same read through head_review_finding_bodies,
+  # which tested only whether the review id came back EMPTY. A failed lookup
+  # and a genuine "no review on this head" are both empty, so an API failure
+  # emitted `[]`, the counter graded it a confident zero, and the wait reported
+  # `cleared` on a head whose inline findings were never inspected. Reuses the
+  # probe scenario's stub (clean summary, reviews endpoint exits 44) so the two
+  # paths are asserted against identical upstream failure.
+  local dir rc=0 status
+  dir=$(make_case clearance-reviews-fail 600 true 30 3 2)
+  ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_SCENARIO=probe_reviews_api_failure \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  status=$(jq -r '.status // "none"' "$dir/out.json" 2>/dev/null || echo "none")
+  if [ "$rc" != "0" ] && [ "$status" != "cleared" ]; then
+    pass "#884: a reviews-API failure on the clearance path fails closed (rc=$rc status=$status), never cleared"
+  else
+    fail "#884: a failed reviews read produced rc=$rc status=$status — a false clear"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
 test_884_count_bodies_fails_closed_unit
+test_884_clearance_reviews_api_failure_fails_closed
 test_446_newer_comment_suppresses_stale_status
 test_timeout_probe_posts_once_and_surfaces_reply
 test_existing_status_probe_reply_never_clears

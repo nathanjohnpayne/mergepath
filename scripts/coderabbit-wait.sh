@@ -1322,14 +1322,28 @@ latest_head_pinned_review_id() {
 # set, which can include 🧹 Nitpick / 🟡 Minor.
 head_review_finding_bodies() {
   local pulls_comments latest_review_id
-  latest_review_id=$(latest_head_pinned_review_id)
+  # Explicit propagation, for the reason latest_head_pinned_review states one
+  # level down: this runs inside the nested command substitution in
+  # count_potential_issues, where errexit cannot be relied on. Without the
+  # check a failed reviews read is indistinguishable from a genuine "no review
+  # on this head" — both leave $latest_review_id empty — so the function would
+  # emit `[]`, the counter would read a confident zero, and a transient API
+  # failure would surface as `cleared`. An empty id with a SUCCESSFUL lookup is
+  # still the real no-review state and still emits `[]`.
+  latest_review_id=$(latest_head_pinned_review_id) || {
+    log "FATAL: could not read the HEAD-pinned review id — refusing to report an empty finding set"
+    return 3
+  }
 
   if [ -z "$latest_review_id" ] || [ "$latest_review_id" = "null" ]; then
     echo '[]'
     return
   fi
 
-  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
+  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments") || {
+    log "FATAL: could not read the inline comments for the HEAD-pinned review — refusing to report an empty finding set"
+    return 3
+  }
   echo "$pulls_comments" | jq -c \
     --arg bot "$BOT_LOGIN" \
     --argjson review_id "$latest_review_id" '
@@ -1421,7 +1435,13 @@ crw_count_blocking_bodies() {
 # codex-review-request.sh uses via `pull_request_review_id`. See
 # propagation-round Codex finding (P1) on device-platform-reporting#51.
 count_potential_issues() {
-  crw_count_blocking_bodies "$(head_review_finding_bodies)"
+  local bodies
+  # Propagated rather than inlined into the argument: a `$( )` failure inside
+  # an argument list is invisible, and crw_count_blocking_bodies would then be
+  # asked to grade the empty string. It refuses that too, but only this form
+  # reports the actual cause.
+  bodies=$(head_review_finding_bodies) || return 3
+  crw_count_blocking_bodies "$bodies"
 }
 
 # Count unaddressed inline findings on HEAD whose coderabbit_tier_of tier is
@@ -1433,7 +1453,10 @@ count_potential_issues() {
 # block is absent.
 count_blocking_tier_issues() {
   local candidates cand_count blocking body tier i
-  candidates=$(head_review_finding_bodies)
+  candidates=$(head_review_finding_bodies) || {
+    log "blocking-tier count could not read the HEAD-pinned findings — reporting unknown rather than a count"
+    return 3
+  }
 
   blocking=0
   # Same fail-closed shape check as crw_count_blocking_bodies. Safe on this
@@ -1537,7 +1560,14 @@ summary_body_has_potential_issue_marker() {
 count_potential_issues_for_sha() {
   local sha=$1
   local pulls_comments bodies
-  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
+  # Same explicit propagation as head_review_finding_bodies: this counter is
+  # also reached through command substitution, so a `die 3` inside the fetch
+  # exits only its own subshell and would otherwise leave an empty list to be
+  # graded as zero findings.
+  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments") || {
+    log "FATAL: could not read the inline comments for $sha — refusing to report an empty finding set"
+    return 3
+  }
   bodies=$(echo "$pulls_comments" | jq -c \
     --arg bot "$BOT_LOGIN" \
     --arg sha "$sha" \
