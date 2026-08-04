@@ -34,7 +34,14 @@
 #              to the current repo via `gh repo view`.
 #
 # Environment:
-#   GH_TOKEN   Required. Needs pull_requests:read.
+#   GH_TOKEN   Required. Needs pull_requests:read AND issues:read.
+#              `issues:read` is for the PR-level SUMMARY surface added in
+#              #832 (`repos/{repo}/issues/{pr}/comments`). It is not
+#              optional: that read is fail-CLOSED, so a token without the
+#              permission gets a 403 and the gate exits 2 rather than
+#              silently skipping the surface. The bundled workflow grants
+#              it; ad-hoc and private-repo callers using a fine-grained
+#              token must provision it too.
 #   PR_NUMBER  Optional fallback for the positional arg. The
 #              scheduled-sweep job in
 #              .github/workflows/coderabbit-severity-gate.yml passes
@@ -541,19 +548,39 @@ EOF
 # Drop CodeRabbit's pre-merge check table from the body before classifying.
 # That table grades PR hygiene and renders a `⚠️ Warning` row for a
 # below-threshold docstring score — not a code finding (3 of 5 sampled
-# summaries carry one). awk with fixed-string index() rather than a sed range
-# so the delimiters carry zero regex exposure. The strip runs only when the
-# START delimiter precedes the END: with only presence checked, an END
-# rendered before a START would latch the suppressor at START and quietly drop
-# everything to EOF — including a real finding.
+# summaries carry one).
+#
+# STRUCTURAL and FENCE-AWARE, on the same reasoning as the stanza parser above
+# (Codex P1 round 4 on #886), and this one is the more dangerous of the pair
+# because it deletes text rather than reclassifying it. Matching the delimiter
+# as a SUBSTRING anywhere let PR-controlled text move the suppressor's start:
+# a PR whose diff contains the start delimiter, quoted back by CodeRabbit in
+# its walkthrough ABOVE the genuine table, made the strip span from that quote
+# to the real table's end — silently deleting every genuine blocking finding in
+# between and clearing a required gate. So a delimiter counts only as a whole
+# line at column 0, outside a fenced code block.
+#
+# The pairing rule is unchanged and still load-bearing: strip only a START that
+# has an END AFTER it. With presence alone checked, a stray START (or an END
+# rendered first) latches the suppressor and drops everything to EOF.
 summary_strip_pre_merge_block() {
-  local body=$1 s_line e_line
-  s_line=$(printf '%s\n' "$body" | grep -nF "$CR_PRE_MERGE_BLOCK_START" | head -1 | cut -d: -f1 || true)
-  e_line=$(printf '%s\n' "$body" | grep -nF "$CR_PRE_MERGE_BLOCK_END" | head -1 | cut -d: -f1 || true)
-  if [ -n "$s_line" ] && [ -n "$e_line" ] && [ "$s_line" -lt "$e_line" ]; then
-    printf '%s' "$body" | awk \
-      -v s="$CR_PRE_MERGE_BLOCK_START" -v e="$CR_PRE_MERGE_BLOCK_END" \
-      'index($0,s){k=1} !k; index($0,e){k=0}'
+  local body=$1 pair
+  # Emit "<start_line> <end_line>" for the first structural START that is
+  # followed by a structural END, or nothing at all.
+  pair=$(printf '%s\n' "$body" | awk \
+    -v s="$CR_PRE_MERGE_BLOCK_START" -v e="$CR_PRE_MERGE_BLOCK_END" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/[ \t]+$/, "", line)
+      if (line ~ /^```/) { fence = !fence; next }
+      if (fence) next
+      if (line == s && !have_s) { have_s = 1; sl = NR; next }
+      if (line == e && have_s) { print sl " " NR; exit }
+    }
+  ')
+  if [ -n "$pair" ]; then
+    printf '%s\n' "$body" | awk -v sl="${pair% *}" -v el="${pair#* }" 'NR < sl || NR > el'
     return 0
   fi
   printf '%s' "$body"
@@ -778,8 +805,17 @@ fi
 # ones, which carry no review thread — so the reviewThreads scan has nothing to
 # look up and is skipped entirely rather than run for its side effects.
 report_verdict() {
-  local unresolved=$1 count
+  local unresolved=$1 count inline_count
   count=$(echo "$unresolved" | jq 'length')
+  # Derived from what is actually being REPORTED, not from BLOCKING_COUNT
+  # (Codex P2 round 4 on #886). BLOCKING_COUNT counts pre-resolution inline
+  # CANDIDATES, so with every inline thread already resolved and only a summary
+  # finding left it is still nonzero — and the remediation block below would
+  # tell the reader to resolve inline threads that are neither listed nor
+  # unresolved. Counting the reported findings makes the instruction true by
+  # construction in both call sites, including the summary-only path where
+  # UNRESOLVED_BLOCKING does not exist yet.
+  inline_count=$(echo "$unresolved" | jq '[ .[] | select(.path != "(PR-level summary comment)") ] | length')
 
   if [ "$count" -gt 0 ]; then
     echo ""
@@ -787,11 +823,12 @@ report_verdict() {
     echo "$unresolved" | jq -r '
       .[] | "  - [\(.tier | ascii_upcase)] \(.path):\(.line) (comment id \(.id))\n      \(.body_snippet)"
     '
-    # Guarded on the INLINE count (CodeRabbit, #886): on a summary-only
-    # failure there is no thread to resolve, and printing an instruction the
-    # reader cannot follow on the findings in front of them is worse than
-    # printing nothing — the summary block below is the applicable one.
-    if [ "$BLOCKING_COUNT" -gt 0 ]; then
+    # Guarded on the REPORTED inline count (CodeRabbit, #886): on a
+    # summary-only failure there is no thread to resolve, and printing an
+    # instruction the reader cannot follow on the findings in front of them is
+    # worse than printing nothing — the summary block below is the applicable
+    # one.
+    if [ "$inline_count" -gt 0 ]; then
       echo ""
       echo "Resolve each inline thread via the GitHub UI (or the GraphQL"
       echo "resolveReviewThread mutation) once the finding is addressed."

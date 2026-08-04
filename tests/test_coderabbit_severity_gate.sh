@@ -2074,6 +2074,119 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# ===========================================================================
+# Codex round 4 on #886.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Test 39 (#886, Codex P1): the pre-merge-table strip must not be steerable by
+# PR-controlled text. It DELETES body text, so a start delimiter quoted by
+# CodeRabbit ABOVE the genuine table made the suppressor span from the quote to
+# the real table's end — silently removing every blocking finding in between
+# and clearing a required gate. Same structural + fence-aware rule as the
+# stanza parser, and this is the more dangerous of the two.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 39 (#886): quoted pre-merge start delimiter does not swallow a finding → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+QUOTED_DELIM_BODY="$(make_summary_body "$HEAD_SHA" "The diff adds this delimiter as a fixture:
+
+\`\`\`
+<!-- pre_merge_checks_walkthrough_start -->
+\`\`\`
+
+$SUMMARY_BLOCKING_FINDING
+
+<!-- pre_merge_checks_walkthrough_start -->
+| Docstring coverage | ⚠️ Warning | 12.00% is below the 80.00% threshold |
+<!-- pre_merge_checks_walkthrough_end -->
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$QUOTED_DELIM_BODY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "a quoted start delimiter does not extend the strip over a real finding → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1' (the finding must survive the strip); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 39b (#886, Codex P1): the narrowing must not stop the strip doing its
+# job — a genuine table between genuine structural delimiters is still removed,
+# so a docstring-coverage ⚠️ row still does not gate. Test 22 covers the plain
+# case; this one pins it with a fenced quote of the delimiter also present.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 39b (#886): genuine table still stripped alongside a quoted delimiter → exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+QUOTED_PLUS_REAL_TABLE="$(make_summary_body "$HEAD_SHA" "Fixture text quoting the delimiter:
+
+\`\`\`
+<!-- pre_merge_checks_walkthrough_start -->
+\`\`\`
+
+<!-- pre_merge_checks_walkthrough_start -->
+| Docstring coverage | ⚠️ Warning | 12.00% is below the 80.00% threshold |
+<!-- pre_merge_checks_walkthrough_end -->
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$QUOTED_PLUS_REAL_TABLE")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+  pass "the real pre-merge table is still stripped → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 40 (#886, Codex P2): with every blocking inline thread RESOLVED and only
+# a summary finding left, the report must not tell the reader to resolve inline
+# threads. `BLOCKING_COUNT` counts pre-resolution candidates, so it is nonzero
+# here; the guard has to key on what is actually being reported.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 40 (#886): resolved inline + unresolved summary → no inline instruction"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_COMMENTS_R40=$(make_single_comment_fixture "$HEAD_SHA" "$MAJOR_BODY")
+FIXTURE_THREADS_R40=$(make_threads_fixture '[{isResolved: true, comment_ids: [2001]}]')
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS_R40" \
+  FIXTURE_THREADS="$FIXTURE_THREADS_R40" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "(PR-level summary comment)" \
+    && ! echo "$OUT" | grep -q "Resolve each inline thread"; then
+  pass "resolved inline candidate does not resurrect the inline instruction → exit 1"
+else
+  fail "expected rc=1, the summary finding listed, and no inline instruction; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # ---------------------------------------------------------------------------
 echo
 echo "============================================"
