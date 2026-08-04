@@ -331,8 +331,30 @@ jobs:
             # snapshot — skip the publish and let that run's (newer) verdict
             # stand. Nothing is cancelled, so no run ever owes a check_run it
             # cannot deliver, and the scheduled sweep remains the backstop.
-            pre_fp=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-              --jq '[.[] | "\(.id):\(.updated_at)"] | sort | join(",")' 2>/dev/null || echo "__unreadable__")
+            #
+            # The fingerprint covers each comment's BODY, not just its identity
+            # metadata (Codex P1 on #886). GitHub reports `updated_at` at second
+            # resolution, so an acknowledgement or summary edited twice inside
+            # one second changes the verdict while `id:updated_at` stays
+            # byte-identical — and the guard would then wave through exactly the
+            # stale publication it exists to stop. The body is what the verdict
+            # is computed from, so the body is what has to be compared.
+            #
+            # Raw content rather than a digest, deliberately: hashing would add
+            # a dependency whose absence makes both fingerprints degrade to the
+            # same value, which reads as "unchanged" and silently disables the
+            # guard. A large shell variable costs nothing here.
+            cr_surface_fp() {
+              gh api "repos/$REPO/issues/$1/comments" --paginate \
+                --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join(" ")' \
+                2>/dev/null || printf '__unreadable__%s' "$RANDOM"
+            }
+
+            # A failed read yields a UNIQUE sentinel, so an unreadable surface
+            # can never compare equal to anything — including another failed
+            # read. That keeps the guard fail-CLOSED: it skips the publication
+            # rather than assuming nothing moved while it could not look.
+            pre_fp=$(cr_surface_fp "$PR")
 
             set +e
             output=$(scripts/coderabbit-severity-gate.sh "$PR" "$REPO" 2>&1)
@@ -340,8 +362,7 @@ jobs:
             set -e
             echo "$output"
 
-            post_fp=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-              --jq '[.[] | "\(.id):\(.updated_at)"] | sort | join(",")' 2>/dev/null || echo "__unreadable__")
+            post_fp=$(cr_surface_fp "$PR")
             if [ "$pre_fp" != "$post_fp" ]; then
               # Deliberately a NOTICE, not a warning or error: a superseded
               # snapshot is the guard working, not a failure. The run that
