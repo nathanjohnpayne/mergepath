@@ -63,6 +63,8 @@
 #   30. markerless full-review summary with a fresh exact-head CodeRabbit review
 #       object gates; without that object, or when it predates the object, it
 #       remains out of scope.
+#   30a. a review-triggered run holds until its exact-head summary is present.
+#   30b. stale marker-led and current markerless summaries are both evaluated.
 #
 # Ack scoping (#886 — an ack clears the findings it acknowledged, nothing else):
 #   30. ack for finding set {A} vs a same-head re-review that rewrote the
@@ -2681,6 +2683,67 @@ if [ "$RC" = 0 ] && echo "$OUT" | grep -q "predates completed CodeRabbit review 
   pass "markerless body that predates its exact-head review object remains out of scope"
 else
   fail "expected rc=0 with markerless summary rejected as stale; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# The pull_request_review event can land before CodeRabbit publishes its
+# PR-level summary. On that one event path the required check must not turn
+# green during the publication gap: issue_comment then re-runs the normal
+# arrival-independent scan once the summary exists.
+echo "--- Test 47d (#886): review event waits for a markerless summary → exit 1"
+FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture '[]')
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "awaiting its PR-level summary" \
+    && grep -Fq "REQUIRE_REVIEW_SUMMARY: \${{ github.event_name == 'pull_request_review' }}" "$ROOT/.github/workflows/coderabbit-severity-gate.yml"; then
+  pass "review-triggered run remains non-green until the current-head summary publishes"
+else
+  fail "expected rc=1 while a current-head review awaits its summary; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# Marker-led summaries and markerless full-review summaries are separate
+# CodeRabbit serializations, not fallbacks for one another. A stale marker-led
+# comment must not hide a fresh markerless body that carries the only P1.
+echo "--- Test 47e (#886): stale marker-led + current markerless summary → exit 1"
+STALE_MARKER_SUMMARY=$(make_summary_body "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "No required finding here.")
+FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture "$(jq -n \
+  --arg marker "$STALE_MARKER_SUMMARY" --arg markerless "$MARKERLESS_FULL_REVIEW" '
+  [
+    { id: 7001, user: { login: "coderabbitai[bot]" }, author_association: "NONE", body: $marker,
+      created_at: "2026-08-04T00:00:00Z", updated_at: "2026-08-04T00:00:00Z" },
+    { id: 7002, user: { login: "coderabbitai[bot]" }, author_association: "NONE", body: $markerless,
+      created_at: "2026-08-04T00:00:00Z", updated_at: "2026-08-04T00:00:20Z" }
+  ]
+')")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "comment id 7002" \
+    && echo "$OUT" | grep -q "markerless full-review summary"; then
+  pass "a stale marker-led summary cannot shadow a current markerless finding"
+else
+  fail "expected rc=1 with current markerless finding despite stale marker-led summary; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 

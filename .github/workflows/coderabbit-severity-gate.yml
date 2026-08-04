@@ -167,6 +167,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           REPO: ${{ github.repository }}
+          # A review object can arrive before CodeRabbit publishes its
+          # PR-level summary. Only the review-submission event must hold for
+          # that publication: a normal push has no evidence that a review has
+          # started, while the later issue_comment sweep evaluates the summary
+          # itself and supersedes this temporary non-green result (#886).
+          REQUIRE_REVIEW_SUMMARY: ${{ github.event_name == 'pull_request_review' }}
         run: |
           set -euo pipefail
           # Bootstrap (nathanjohnpayne/mergepath#577): we run the TRUSTED copy of
