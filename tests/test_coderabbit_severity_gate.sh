@@ -387,7 +387,7 @@ run_gate() {
 }
 
 # CodeRabbit finding bodies (heuristic markers coderabbit_tier_of reads).
-HEAD_SHA="abc123def456"
+HEAD_SHA="abc123def456abc123def456abc123def456abcd"
 MAJOR_BODY="**⚠️ Potential issue** | **Major**
 
 This pointer can be null."
@@ -2440,16 +2440,13 @@ fi
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# Test 45 (#886, Phase 4b P1): the commits-range extraction accepts a 7-to-40
-# character range end, so the comparison must be a PREFIX match against the
-# 40-character API head. Requiring equality made the tolerated abbreviation
-# unmatchable — the two halves of the function contradicted each other, and if
-# CodeRabbit ever abbreviates, every summary silently falls out of scope and
-# its findings go ungated. (Every real body sampled in this repo writes the
-# full 40; the inconsistency is the defect, not the observed data.)
+# Test 45 (#886, Phase 4b P2): a shortened commits-range end cannot identify a
+# unique Git object. A PR author can create a later current head with the same
+# prefix, so the required gate must fail closed until CodeRabbit supplies the
+# full current SHA.
 # ---------------------------------------------------------------------------
 echo
-echo "--- Test 45 (#886): an ABBREVIATED commits-range end still names this head → exit 1"
+echo "--- Test 45 (#886): an ABBREVIATED commits-range end is out of scope → exit 0"
 SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
 SHORT_HEAD=$(printf '%s' "$HEAD_SHA" | cut -c1-10)
 ABBREV_RANGE_SUMMARY="$(make_summary_body "$SHORT_HEAD" "$SUMMARY_BLOCKING_FINDING")"
@@ -2464,21 +2461,20 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
-  pass "an abbreviated range end prefix-matches the full head → in scope, exit 1"
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "does not name $HEAD_SHA as its commits-range end"; then
+  pass "an abbreviated range end cannot identify this head → out of scope, exit 0"
 else
-  fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  fail "expected rc=0 with the out-of-scope log line; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
 # ---------------------------------------------------------------------------
-# Test 45b (#886): prefix matching must not become "any prefix of anything". A
-# range end that is NOT a prefix of this head still puts the summary out of
-# scope — test 20 covers the plain stale case; this pins that the loosening did
-# not swallow it.
+# Test 45b (#886): a shortened range end for another SHA is likewise out of
+# scope. This keeps the short-form rejection independent of whether the prefix
+# happens to resemble the current head.
 # ---------------------------------------------------------------------------
 echo
-echo "--- Test 45b (#886): an abbreviation of a DIFFERENT sha is still out of scope → exit 0"
+echo "--- Test 45b (#886): a DIFFERENT abbreviated sha is out of scope → exit 0"
 SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
 FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
   "$(make_summary_body "fedcba9876" "$SUMMARY_BLOCKING_FINDING")")
@@ -2493,7 +2489,7 @@ OUT=$(
 RC=$?
 set -e
 if [ "$RC" = 0 ] && echo "$OUT" | grep -q "does not name $HEAD_SHA as its commits-range end"; then
-  pass "an abbreviation of another sha stays out of scope → exit 0"
+  pass "a different abbreviated sha stays out of scope → exit 0"
 else
   fail "expected rc=0 with the out-of-scope log line; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2

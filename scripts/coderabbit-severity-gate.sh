@@ -590,10 +590,10 @@ summary_stanzas_all_benign() {
 # Y"), which a position-blind token match accepts.
 #
 # The range is EXTRACTED and then compared as a string rather than
-# interpolating the head into the pattern: the extraction's `[0-9a-f]` class
-# already bounds both tokens (so a longer digest merely CONTAINING the head
-# cannot match), and keeping the head out of the regex means no caller-supplied
-# value is ever evaluated as a pattern.
+# interpolating the head into the pattern. Require full object IDs: a shortened
+# SHA is not a unique commit identifier, and a PR author can produce a later
+# head with the same prefix. Keeping the head out of the regex means no
+# caller-supplied value is ever evaluated as a pattern.
 summary_names_head() {
   local ranges end want r
   # Extracted from the UNFENCED body only (Codex P1 round 5 on #886). A
@@ -611,33 +611,20 @@ summary_names_head() {
   # would fall out of scope, and its findings would go ungated. That is a false
   # CLEAR bought with precision, which is the wrong trade for a required gate.
   ranges=$(summary_unfenced_numbered "$1" | sed 's/^[0-9]*	//' \
-    | grep -oiE 'between [0-9a-f]{7,40} and [0-9a-f]{7,40}' || true)
+    | grep -oiE 'between [0-9a-f]{40} and [0-9a-f]{40}' || true)
   [ -n "$ranges" ] || return 1
   # Hex is case-insensitive; GitHub renders shas lowercase but the comparison
   # must not depend on that, or an uppercase range would silently drop this
   # head's summary out of scope.
   want=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
-  # PREFIX comparison, not equality (Phase 4b P1 on #886). The extraction above
-  # deliberately accepts a 7-to-40 character range end, and every real body
-  # sampled in this repo writes the full 40 — but equality against the
-  # API-provided 40-character head made the tolerated abbreviation unmatchable,
-  # so the two halves of this function contradicted each other. That is not a
-  # harmless inconsistency: if CodeRabbit ever abbreviates, which is exactly the
-  # kind of presentation change this function is written not to depend on, EVERY
-  # summary silently falls out of scope and its findings go ungated.
-  #
-  # A prefix match is safe in the other direction too. The extraction's
-  # `[0-9a-f]` class bounds the token, so a longer digest merely CONTAINING the
-  # head cannot reach here; and the abbreviation is authored by CodeRabbit, not
-  # by the pusher, so there is no input to steer. The `-gt 0` length guard keeps
-  # an empty extraction from prefix-matching everything.
+  # Exact comparison only. An abbreviated end cannot distinguish the current
+  # head from another commit with the same prefix, so fail closed until the
+  # summary names the full current object ID.
   while IFS= read -r r; do
     [ -n "$r" ] || continue
     end=$(printf '%s' "$r" | awk '{print $4}' | tr '[:upper:]' '[:lower:]')
     [ -n "$end" ] || continue
-    case "$want" in
-      "$end"*) return 0 ;;
-    esac
+    [ "$end" = "$want" ] && return 0
   done <<EOF
 $ranges
 EOF
