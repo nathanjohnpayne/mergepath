@@ -120,9 +120,11 @@ jobs:
           # 1200s deadline, then hard-failed with a false "did not
           # complete successfully within 1200s" — blocking a perfectly
           # mergeable Dependabot PR. With `check_name=lint` the same
-          # commit returns total_count=2, so there is no page 2 to miss
-          # and the truncation is fixed at the source rather than papered
-          # over with --paginate.
+          # commit returns total_count=2. The filter keeps the usual query
+          # small, but it does NOT bound the result set: repeated
+          # re-dispatches can still leave more than 100 matching runs on a
+          # single HEAD. Request every page as well, then select the latest
+          # exact match locally.
           #
           # Passed via `-X GET -f` so gh URL-encodes the value. Check
           # names legitimately contain spaces (e.g. "Label Gate", "Merge
@@ -136,7 +138,7 @@ jobs:
           # handful of rows. `sort_by(...) | last` is unchanged — latest
           # run of that check still wins.
           latest_check_run() {
-            gh api -X GET "repos/${GITHUB_REPOSITORY}/commits/$2/check-runs" \
+            gh api --paginate -X GET "repos/${GITHUB_REPOSITORY}/commits/$2/check-runs" \
               -f check_name="$1" -F per_page=100 \
               | jq -c --arg check "$1" '[.check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty'
           }
