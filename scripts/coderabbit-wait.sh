@@ -63,7 +63,8 @@
 #              summary-only class: rc 0 means REPORTED, NOT clean; rc 2 is
 #              the one verdict probe mode makes (a blocking marker carried
 #              solely by the PR-level summary, which no required gate
-#              dispositions); rc 7 means not yet. Equivalent to
+#              dispositions, reported as `potential_issue_count: 1`); rc 7
+#              means not yet. Equivalent to
 #              CODERABBIT_WAIT_PROBE=1. Use the polling mode for a verdict.
 #
 # Environment:
@@ -106,8 +107,9 @@
 #      status=paused and skip_reason=paused so the caller can raise
 #      `auto_pause_after_reviewed_commits` or intervene.
 #   5. On review (non-rate-limit, non-in-progress): emit JSON, exit 0.
-#      Also scans inline diff comments for "Potential issue" / "⚠️"
-#      markers and surfaces them in the JSON so callers can decide.
+#      Also grades inline diff comments with the shared `coderabbit_tier_of`
+#      classifier (scripts/lib/feedback-policy-helpers.sh) and surfaces the
+#      blocking (p0/p1) count in the JSON so callers can decide (#837).
 #   6. If total elapsed > max_wait_seconds: if a pause was OBSERVED during
 #      polling (a durable same-id pause NOTE never advances the resume
 #      budget to its cap), exit 6 (SKIPPED) with status=paused /
@@ -150,6 +152,17 @@
 #       "submitted_at": "<iso-8601>",
 #       "body_excerpt": "<first 200 chars>"
 #     },
+#     # Count of unaddressed inline findings on HEAD that the shared
+#     # `coderabbit_tier_of` classifier grades BLOCKING (its p0/p1 rungs:
+#     # 🟠 Major, Potential issue, ⚠️). Same classifier the required gate
+#     # scripts/coderabbit-severity-gate.sh uses, so the advisory count and the
+#     # blocking gate read one vendor format (#837).
+#     #
+#     # On a `--probe` run this is NOT a findings verdict (#834): a probe never
+#     # counts inline findings, so the value is 0 on every probe terminal
+#     # EXCEPT the one verdict probe mode makes — the summary-only blocking
+#     # marker below, which emits status `findings`, rc 2, and the literal
+#     # count 1 standing for that single summary-carried finding.
 #     "potential_issue_count": N,
 #     # blocking_tier_unresolved (#577): count of unaddressed inline HEAD
 #     # findings whose coderabbit_tier_of tier is in the resolved
@@ -216,10 +229,12 @@
 #   }
 #
 # Exit codes:
-#   0   CodeRabbit posted a real review on current HEAD with no
-#       "Potential issue"/⚠️ markers. Safe to proceed.
-#   2   CodeRabbit posted a real review with at least one P0/P1-equivalent
-#       marker. Caller should address before proceeding.
+#   0   CodeRabbit posted a real review on current HEAD and nothing on it
+#       grades P0/P1-equivalent under the shared `coderabbit_tier_of`
+#       classifier. Safe to proceed.
+#   2   CodeRabbit posted a real review carrying at least one P0/P1-equivalent
+#       finding — an inline finding, or one carried solely by the PR-level
+#       summary (#535). Caller should address before proceeding.
 #   3   API / infrastructure error. Error on stderr.
 #   4   Timeout — max_wait_seconds elapsed without a real review. Caller
 #       may log a warning and proceed (CodeRabbit is advisory), or block.
@@ -249,8 +264,10 @@
 #       and NOT "no findings". rc 2 is the ONE verdict probe mode makes,
 #       unchanged in meaning (#535): a blocking marker carried solely by the
 #       PR-level summary, which no required gate dispositions.
-#       `potential_issue_count` carries no verdict on a probe run. Use the
-#       polling mode for a verdict.
+#       `potential_issue_count` carries no verdict on a probe run: 0 on every
+#       probe terminal except that rc-2 one, where it is the literal 1 of the
+#       summary-carried finding rather than a scan of the inline surface. Use
+#       the polling mode for a verdict.
 #
 # Design notes:
 #   - Read-only except for retry-trigger comments, the auto-pause
@@ -302,6 +319,23 @@ if [ ! -r "$__CODERABBIT_WAIT_DIR/lib/reviewers-helpers.sh" ]; then
 fi
 # shellcheck source=lib/reviewers-helpers.sh
 . "$__CODERABBIT_WAIT_DIR/lib/reviewers-helpers.sh"
+
+# Shared finding-severity classifier (#576). Hard-required for the same reason
+# reviewers-helpers is: since #837 the potential-issue COUNTING path grades
+# findings with `coderabbit_tier_of` — the one classifier
+# scripts/coderabbit-severity-gate.sh already uses — instead of this script's
+# own `Potential issue`/⚠️ grep, which missed CodeRabbit's current severity-badge
+# format and reported `cleared` on a 🟠 Major finding. A missing lib would
+# degrade every count to a crash-or-zero, i.e. back to the false clearance this
+# helper exists to prevent, so it must error rather than fall back. The lib is
+# `type: canonical, consumers: all` in .mergepath-sync.yml, so every consumer
+# already carries it.
+if [ ! -r "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh" ]; then
+  echo "ERROR: feedback-policy-helpers missing: $__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/feedback-policy-helpers.sh
+. "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh"
 
 # --- argument parsing -------------------------------------------------------
 
@@ -562,16 +596,16 @@ RATE_LIMIT_BUFFER_SECONDS=30
 STATUS_SUCCESS_GRACE_SECONDS=120
 
 # --- tier-aware classification (#577) ---------------------------------------
-# Additive tier-awareness layered ON TOP of the existing binary
-# `Potential issue`/⚠️ detector — it NEVER replaces the exit-code fast-paths
-# below (HEAD-anchoring, rate-limit, auto-pause). When the feedback_policy
-# block is PRESENT, this surfaces a `blocking_tier_unresolved` count (findings
-# on HEAD whose coderabbit_tier_of tier is in the resolved required set) in
-# the emitted JSON. When the block is ABSENT — or the shared lib is not on
-# disk (some test harnesses stage this script without scripts/lib) —
-# BLOCKING_TIER_UNRESOLVED stays `null` and the exit-code contract is
-# byte-identical to before. Guarded source, same posture as the preflight
-# helpers above: surfacing is best-effort, not a gate.
+# Additive tier-awareness layered ON TOP of the binary blocking-finding
+# detector — it NEVER replaces the exit-code fast-paths below (HEAD-anchoring,
+# rate-limit, auto-pause). When the feedback_policy block is PRESENT, this
+# surfaces a `blocking_tier_unresolved` count (findings on HEAD whose
+# coderabbit_tier_of tier is in the resolved required set) in the emitted JSON.
+# When the block is ABSENT, BLOCKING_TIER_UNRESOLVED stays `null` and the
+# exit-code contract is byte-identical to before: surfacing is best-effort, not
+# a gate. The classifier itself is hard-sourced at the top of this script
+# (#837) — the binary count depends on it — so only the CONFIG block presence
+# is conditional here.
 #
 # NOTE: the merge-BLOCKING CodeRabbit gate is scripts/coderabbit-severity-gate.sh
 # (a required check); this helper only REPORTS the count so the authoring
@@ -579,10 +613,7 @@ STATUS_SUCCESS_GRACE_SECONDS=120
 # `blocking` flag. It does not itself block.
 BLOCKING_TIER_UNRESOLVED="null"
 FEEDBACK_POLICY_PRESENT=false
-if [ -f "$CONFIG" ] && grep -qE '^feedback_policy:' "$CONFIG" \
-    && [ -r "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh" ]; then
-  # shellcheck source=lib/feedback-policy-helpers.sh
-  . "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh"
+if [ -f "$CONFIG" ] && grep -qE '^feedback_policy:' "$CONFIG"; then
   set +e
   __CRW_REQUIRED_TIERS=$(resolve_required_tiers "$CONFIG")
   __CRW_RT_RC=$?
@@ -918,7 +949,7 @@ log "anchor = $HEAD_ANCHOR (source: $ANCHOR_SOURCE)"
 # The real blocking bot-review signal is already in, so cap the CodeRabbit poll
 # budget to post_clearance_max_wait_seconds (default 240) instead of the full
 # max_wait_seconds — CodeRabbit still gets that window to land a clear (exit 0)
-# or a Potential issue / ⚠️ finding (exit 2), both handled exactly as before; a
+# or a blocking p0/p1 finding (exit 2), both handled exactly as before; a
 # still-pending CodeRabbit after the cap falls through to the same advisory
 # exit-4 timeout. Only ever SHORTENS the ceiling (min of the two), never
 # lengthens it. Placed AFTER head resolution so it can head-pin the clearance.
@@ -1061,7 +1092,58 @@ classify_comment() {
 # Pure string predicates over a CodeRabbit summary body. No globals beyond the
 # constants defined above, no I/O — extracted by sentinel and sourced directly
 # by tests/test_coderabbit_wait_status_probe.sh, the pattern
-# tests/test_audit_branch_protection.sh already uses.
+# tests/test_audit_branch_protection.sh already uses. Their one external
+# dependency is `coderabbit_tier_of` from scripts/lib/feedback-policy-helpers.sh
+# (#837), which the extracting test sources alongside this block.
+
+# True when a body classifies as a BLOCKING CodeRabbit finding: the p0/p1 rungs
+# of the shared `coderabbit_tier_of` ladder (CodeRabbit never maps to p0 today;
+# both are named so a future lib change cannot silently downgrade one).
+#
+# This is the whole of #837. The counting path used to key on a private
+# `grep -iE 'Potential issue|⚠️'`, which CodeRabbit's current finding format no
+# longer satisfies: a Major security finding renders as the severity-badge
+# prefix `_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_` and carries the
+# machine tag `cr-indicator-types:potential_issue`, but no literal
+# "Potential issue" / ⚠️ text — so the count came back 0 and the wait reported
+# `cleared` on a blocking finding (observed live on #835). The shared
+# classifier already reads `🟠 Major`, and scripts/coderabbit-severity-gate.sh
+# — the REQUIRED gate — already classifies through it. Routing this path
+# through the same function means the advisory count and the blocking gate read
+# one vendor format, and a future format drift is fixed in one place.
+#
+# Two consequences of adopting the shared contract, both deliberate:
+#   - it is case-SENSITIVE where the old grep was case-insensitive. CodeRabbit
+#     emits the title-case marker, and agreeing byte-for-byte with the required
+#     gate is the point of the change.
+#   - it grades the first 600 chars of what it is given (the lib's documented
+#     anchor — the badge sits at the top of a finding), so callers pass one
+#     finding body, or one line of a multi-finding summary, never a whole
+#     multi-finding document.
+crw_body_is_blocking_finding() {
+  case "$(coderabbit_tier_of "${1:-}")" in
+    p0|p1) return 0 ;;
+  esac
+  return 1
+}
+
+# True when ANY line of the given scan classifies as a blocking finding.
+#
+# LINE-wise, not body-wise, because a PR-level summary is a document holding
+# many finding stanzas: `coderabbit_tier_of` answers "what tier is THIS
+# finding", so the summary is fed to it one line at a time — which is also the
+# granularity at which CodeRabbit renders the badge. Blank lines are skipped;
+# they cannot carry a marker.
+crw_scan_has_blocking_marker() {
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if crw_body_is_blocking_finding "$line"; then
+      return 0
+    fi
+  done <<< "${1:-}"
+  return 1
+}
 
 # True when the body carries at least one outcome stanza AND every stanza is
 # benign. TOTAL counts occurrences of the bare wrapper prefix, not a KIND
@@ -1094,8 +1176,10 @@ summary_names_head() {
   printf '%s' "$1" | grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)"
 }
 
-# True when the body carries a `Potential issue` / ⚠️ blocking marker OUTSIDE
-# the pre-merge check table. awk with fixed-string index() rather than a sed
+# True when the body carries a blocking finding marker OUTSIDE the pre-merge
+# check table — classified by crw_scan_has_blocking_marker above, so the
+# summary surface and the inline surface grade one vendor format (#837). awk
+# with fixed-string index() rather than a sed
 # range so the delimiters carry zero regex exposure. The strip runs only when
 # the START delimiter precedes the END: with only presence checked, an END
 # rendered before a START would latch the suppressor at START and quietly
@@ -1111,7 +1195,7 @@ summary_blocking_marker_present() {
       -v s="$CR_PRE_MERGE_BLOCK_START" -v e="$CR_PRE_MERGE_BLOCK_END" \
       'index($0,s){k=1} !k; index($0,e){k=0}')
   fi
-  printf '%s' "$scan" | grep -qiE 'Potential issue|⚠️'
+  crw_scan_has_blocking_marker "$scan"
 }
 # END coderabbit_summary_helpers
 
@@ -1170,32 +1254,37 @@ scan_latest_comment_best_effort() {
   latest_comment_from_issue_comments "$issue_comments"
 }
 
-# Count unaddressed "Potential issue" / ⚠️ markers in the pulls inline
-# comment list, scoped to the LATEST CodeRabbit review on the current
-# HEAD. The naive "all bot comments after HEAD_ANCHOR" shape would keep
-# stale findings from an earlier review round (same HEAD, pre-retry) in
-# the count forever, so a PR could stay permanently in the `findings`
-# state even after the next review comes back clean. Mirror the latest-
-# review-scoping pattern codex-review-request.sh uses via
-# `pull_request_review_id`. See propagation-round Codex finding (P1)
-# on device-platform-reporting#51.
-#
 # CodeRabbit may later reply to a finding thread with its hidden
 # `review_comment_addressed` marker after an agent fixes/rebuts the
-# finding. Treat that bot-authored marker as authoritative for this
-# helper's advisory gate; ordinary human/agent replies do not clear a
-# finding by themselves.
+# finding. Treat that bot-authored marker as authoritative for the counting
+# helpers below; ordinary human/agent replies do not clear a finding by
+# themselves.
+#
 # Id of the latest CodeRabbit review object pinned to the current HEAD, or
 # empty. Pin the selection to the current HEAD commit (`commit_id ==
-# HEAD_SHA`), not just freshness (`submitted_at >= HEAD_ANCHOR`). A review
-# submitted after the anchor but referencing an intermediate commit (e.g. a
-# rapid push sequence where CodeRabbit reviewed an earlier SHA) must not be
-# chosen as the HEAD review. Mirror the HEAD-pinning in
+# HEAD_SHA`). A review submitted recently but referencing an intermediate
+# commit (e.g. a rapid push sequence where CodeRabbit reviewed an earlier SHA)
+# must not be chosen as the HEAD review. Mirror the HEAD-pinning in
 # scripts/codex-review-check.sh (commit_id == $sha).
 #
-# Factored out of count_potential_issues (#814) so the probe-mode evidence
-# check below reuses this selection rather than adding a second copy of it —
-# scripts/ci/check_workflow_parsers exists to police exactly that.
+# The SHA match is the WHOLE test; there is deliberately no
+# `submitted_at >= HEAD_ANCHOR` conjunct (#824). HEAD_ANCHOR derives from the
+# HEAD committer date, which whoever pushed controls: a metadata-rewritten
+# commit or a skewed local clock dates the head into the future, and a
+# legitimate review OF THAT EXACT SHA then has `submitted_at < HEAD_ANCHOR` and
+# was discarded until wall-clock caught up — failing CLOSED, so a genuinely
+# reviewed PR reported no findings-scope review and paged an operator. Requiring
+# both let the weaker, pusher-controlled condition veto the stronger,
+# GitHub-owned one. commit_id is immutable head identity and does not expire,
+# which is the same argument probe_emit_verdict's own anchor-free selection
+# already makes below.
+#
+# Dropping the anchor STRENGTHENS the count it feeds rather than loosening it:
+# the filter could only ever remove SHA-matched reviews, so the counts below can
+# now only rise. In particular an unchanged head that has sat longer than
+# `coderabbit.wallclock_freshness_window_seconds` no longer loses its own review
+# — the #224 false-clear that count_potential_issues_for_sha was introduced to
+# route around.
 latest_head_pinned_review() {
   local reviews
   # Explicit propagation, not errexit. fetch_api_array's `die 3` exits only
@@ -1204,10 +1293,9 @@ latest_head_pinned_review() {
   # API read into a confident "no review on this head". Whether errexit fires
   # depends on the caller's context, so it cannot be relied on — check here.
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return 3
-  echo "$reviews" | jq -c --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" --arg head_sha "$HEAD_SHA" '
+  echo "$reviews" | jq -c --arg bot "$BOT_LOGIN" --arg head_sha "$HEAD_SHA" '
     [ .[]
       | select(.user.login == $bot)
-      | select(.submitted_at >= $after)
       | select(.commit_id == $head_sha)
     ]
     | sort_by(.submitted_at) | last
@@ -1219,70 +1307,44 @@ latest_head_pinned_review_id() {
   latest_head_pinned_review | jq -r '.id // empty'
 }
 
-count_potential_issues() {
+# JSON array of the UNADDRESSED root inline finding bodies belonging to the
+# latest CodeRabbit review on the current HEAD; `[]` when no review is pinned
+# to HEAD. One selection shared by BOTH counters below, so the scoping — latest
+# review on HEAD, root comments only, minus the roots CodeRabbit itself later
+# marked `review_comment_addressed` — cannot drift between them (#824: the
+# tier-aware counter carried its own copy of the HEAD-pinned review selection,
+# which would otherwise have kept the timestamp veto that copy embedded).
+#
+# Emits BODIES, not a count: severity classification belongs to the shared
+# `coderabbit_tier_of` in bash, not to a re-implementation of its heuristic in
+# jq. Bodies are unfiltered by severity here on purpose — the potential-issue
+# counter keeps p0/p1 and the tier-aware counter keeps the configured required
+# set, which can include 🧹 Nitpick / 🟡 Minor.
+head_review_finding_bodies() {
   local pulls_comments latest_review_id
-  latest_review_id=$(latest_head_pinned_review_id)
+  # Explicit propagation, for the reason latest_head_pinned_review states one
+  # level down: this runs inside the nested command substitution in
+  # count_potential_issues, where errexit cannot be relied on. Without the
+  # check a failed reviews read is indistinguishable from a genuine "no review
+  # on this head" — both leave $latest_review_id empty — so the function would
+  # emit `[]`, the counter would read a confident zero, and a transient API
+  # failure would surface as `cleared`. An empty id with a SUCCESSFUL lookup is
+  # still the real no-review state and still emits `[]`.
+  latest_review_id=$(latest_head_pinned_review_id) || {
+    log "FATAL: could not read the HEAD-pinned review id — refusing to report an empty finding set"
+    return 3
+  }
 
   if [ -z "$latest_review_id" ] || [ "$latest_review_id" = "null" ]; then
-    echo "0"
+    echo '[]'
     return
   fi
 
-  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
-  echo "$pulls_comments" | jq \
-    --arg bot "$BOT_LOGIN" \
-    --argjson review_id "$latest_review_id" '
-    [ .[]
-      | select(.user.login == $bot)
-      | select(.in_reply_to_id != null)
-      | select((.body // "") | test("review_comment_addressed"; "i"))
-      | .in_reply_to_id
-    ] as $addressed_root_ids
-    | [ .[]
-      | select(.user.login == $bot)
-      | select(.pull_request_review_id == $review_id)
-      | select(.in_reply_to_id == null)
-      | select((.body // "") | test("Potential issue|⚠️"; "i"))
-      | select(.id as $id | ($addressed_root_ids | index($id)) == null)
-    ] | length
-  '
-}
-
-# Count unaddressed inline findings on HEAD whose coderabbit_tier_of tier is
-# in the resolved required set (#577). Tier-aware sibling of
-# count_potential_issues: SAME latest-review-on-HEAD + review_comment_addressed
-# scoping, but stage 1 (jq) emits the candidate finding BODIES and stage 2
-# (bash) classifies each with the shared coderabbit_tier_of and keeps only
-# required-tier ones — reusing the classifier rather than re-implementing its
-# heuristic in jq. Additive/advisory only: the return value populates the
-# JSON's blocking_tier_unresolved and NEVER feeds an exit code. Guarded by
-# FEEDBACK_POLICY_PRESENT at the single call site, so it never runs (and the
-# lib functions are never referenced) when the block is absent.
-count_blocking_tier_issues() {
-  local reviews pulls_comments latest_review_id candidates cand_count blocking body tier i
-  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
-  latest_review_id=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" --arg head_sha "$HEAD_SHA" '
-    [ .[]
-      | select(.user.login == $bot)
-      | select(.submitted_at >= $after)
-      | select(.commit_id == $head_sha)
-    ]
-    | sort_by(.submitted_at) | last
-    | if . == null then null else .id end
-  ')
-
-  if [ -z "$latest_review_id" ] || [ "$latest_review_id" = "null" ]; then
-    echo "0"
-    return
-  fi
-
-  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
-  # Stage 1: same addressed-root exclusion + latest-review scoping as
-  # count_potential_issues, but emit each candidate's body (NOT a count) so
-  # stage 2 can tier-classify. We keep the `Potential issue|⚠️` prefilter OFF
-  # here on purpose: coderabbit_tier_of also grades 🧹 Nitpick / Refactor
-  # findings, which a required nitpick/p2 tier must be able to catch.
-  candidates=$(echo "$pulls_comments" | jq -c \
+  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments") || {
+    log "FATAL: could not read the inline comments for the HEAD-pinned review — refusing to report an empty finding set"
+    return 3
+  }
+  echo "$pulls_comments" | jq -c \
     --arg bot "$BOT_LOGIN" \
     --argjson review_id "$latest_review_id" '
     [ .[]
@@ -1298,13 +1360,116 @@ count_blocking_tier_issues() {
       | select(.id as $id | ($addressed_root_ids | index($id)) == null)
       | (.body // "")
     ]
-  ')
+  '
+}
+
+# BEGIN coderabbit_count_helpers
+# Length of a JSON array, or a NON-ZERO return when the input is not one.
+#
+# The counting paths below used a bare `jq 'length'` on the stated assumption
+# that a dead upstream `fetch_api_array` would make jq "fail loudly". It does
+# not, and the assumption inverted the very guarantee #837 exists to provide:
+#
+#   * `jq 'length'` on EMPTY stdin runs the filter zero times — it prints
+#     nothing and exits 0. `total` came back empty, `[ "$i" -lt "" ]` errored,
+#     and because a `while` CONDITION is exempt from errexit the loop was
+#     simply skipped and the function echoed `0` with status 0. An upstream
+#     API death therefore read as "zero blocking findings" — a silent
+#     false-clear, the exact failure #837 fixes elsewhere in this file.
+#   * A non-array JSON value is the same hazard by another route: `{}` has
+#     length 0, and a string reports its character count.
+#   * A multi-VALUE stream is a third route, and the one a per-value filter
+#     cannot see: `[] []` makes jq run the filter twice and print `0\n0`,
+#     which is not an integer, so `[ "$i" -lt "0\n0" ]` errors and the loop is
+#     skipped exactly as in the empty case.
+#
+# `-s` (slurp) collapses the whole stream into ONE array, which turns all
+# three routes into a single assertion: the stream must hold exactly one
+# value, and that value must be an array. Empty slurps to `[]` (length 0),
+# multi-value to length > 1, and a non-array to a length-1 stream whose sole
+# element fails the type test — every one of them an error, never a count.
+#
+# Reported by CodeRabbit (🟠 Major) on #884; the multi-value route was a
+# second 🟠 Major against the first version of this guard.
+crw_json_array_length() {
+  printf '%s' "${1:-}" \
+    | jq -s -e '
+        if ((length == 1) and (.[0] | type == "array"))
+        then (.[0] | length)
+        else error("expected exactly one JSON array")
+        end' 2>/dev/null
+}
+
+# Count the bodies in a JSON array that classify as BLOCKING findings (#837).
+# Fails closed on an empty/malformed argument, which happens when a
+# `fetch_api_array` upstream died inside its command substitution: returning
+# non-zero makes the `$( )` callers trip `set -e` and fail loudly, rather than
+# letting an API error read as zero findings.
+#
+# Its two dependencies are `crw_body_is_blocking_finding` from the
+# coderabbit_summary_helpers block and the script's stderr `log`, so the
+# extracting test sources that block alongside this one.
+crw_count_blocking_bodies() {
+  local bodies=${1:-} total count=0 body i=0
+  total=$(crw_json_array_length "$bodies") || {
+    log "FATAL: blocking-finding count received input that is not a JSON array — refusing to report a count (an upstream fetch almost certainly failed)"
+    return 3
+  }
+  while [ "$i" -lt "$total" ]; do
+    body=$(printf '%s' "$bodies" | jq -r ".[$i]")
+    if crw_body_is_blocking_finding "$body"; then
+      count=$((count + 1))
+    fi
+    i=$((i + 1))
+  done
+  echo "$count"
+}
+# END coderabbit_count_helpers
+
+# Count unaddressed blocking inline findings in the pulls inline comment list,
+# scoped to the LATEST CodeRabbit review on the current HEAD. The naive "all
+# bot comments after HEAD_ANCHOR" shape would keep stale findings from an
+# earlier review round (same HEAD, pre-retry) in the count forever, so a PR
+# could stay permanently in the `findings` state even after the next review
+# comes back clean. Mirror the latest-review-scoping pattern
+# codex-review-request.sh uses via `pull_request_review_id`. See
+# propagation-round Codex finding (P1) on device-platform-reporting#51.
+count_potential_issues() {
+  local bodies
+  # Propagated rather than inlined into the argument: a `$( )` failure inside
+  # an argument list is invisible, and crw_count_blocking_bodies would then be
+  # asked to grade the empty string. It refuses that too, but only this form
+  # reports the actual cause.
+  bodies=$(head_review_finding_bodies) || return 3
+  crw_count_blocking_bodies "$bodies"
+}
+
+# Count unaddressed inline findings on HEAD whose coderabbit_tier_of tier is
+# in the resolved required set (#577). Tier-aware sibling of
+# count_potential_issues over the SAME candidate set, differing only in which
+# tiers it keeps. Additive/advisory only: the return value populates the JSON's
+# blocking_tier_unresolved and NEVER feeds an exit code. Guarded by
+# FEEDBACK_POLICY_PRESENT at the single call site, so it never runs when the
+# block is absent.
+count_blocking_tier_issues() {
+  local candidates cand_count blocking body tier i
+  candidates=$(head_review_finding_bodies) || {
+    log "blocking-tier count could not read the HEAD-pinned findings — reporting unknown rather than a count"
+    return 3
+  }
 
   blocking=0
-  cand_count=$(echo "$candidates" | jq 'length')
+  # Same fail-closed shape check as crw_count_blocking_bodies. Safe on this
+  # advisory path: the single call site already wraps it in `|| true` and
+  # validates the result as numeric-or-null, so refusing here surfaces as
+  # `blocking_tier_unresolved: null` (unknown) instead of a false 0.
+  cand_count=$(crw_json_array_length "$candidates") || {
+    log "blocking-tier count received input that is not a JSON array — reporting unknown rather than a count"
+    return 3
+  }
   i=0
   while [ "$i" -lt "$cand_count" ]; do
-    body=$(echo "$candidates" | jq -r ".[$i]")
+    body=$(printf '%s' "$candidates" | jq -r ".[$i]")
     tier=$(coderabbit_tier_of "$body")
     if crw_tier_is_required "$tier"; then
       blocking=$((blocking + 1))
@@ -1315,7 +1480,8 @@ count_blocking_tier_issues() {
 }
 
 # Returns 0 (true) if the latest PR-level CodeRabbit SUMMARY comment body
-# carries a `Potential issue` / ⚠️ marker, else 1.
+# carries a line the shared `coderabbit_tier_of` classifier grades blocking
+# (p0/p1 — 🟠 Major, Potential issue, ⚠️; #837), else 1.
 #
 # count_potential_issues() scans only INLINE `pulls/{pr}/comments`. When
 # CodeRabbit surfaces a finding solely in its PR-level summary body
@@ -1357,16 +1523,24 @@ summary_body_has_potential_issue_marker() {
 # commits) equals the given SHA and whose creation time is not older than
 # HEAD_IDENTITY_ANCHOR.
 #
-# Why this is needed (codex CHANGES_REQUESTED on PR #224 round 2 +
-# CodeRabbit ⚠️ Major @ line 581): the freshness-anchored count_potential_
-# issues filters reviews with `submitted_at >= HEAD_ANCHOR`. Once the same
-# unchanged HEAD sits longer than `coderabbit.wallclock_freshness_window_
-# seconds` (default 1800s / 30 min), HEAD_ANCHOR advances past the prior
-# CodeRabbit review's submitted_at, latest_review_id becomes null, and the
-# helper returns 0 — false-clearing the fast-path even while the same SHA
-# still has unresolved Potential issue/⚠️ inline findings. The fast-path is
-# the only caller that has authoritative per-SHA scope (from the StatusContext
-# check) and should leverage it.
+# Why this was INTRODUCED (codex CHANGES_REQUESTED on PR #224 round 2 +
+# CodeRabbit ⚠️ Major @ line 581): count_potential_issues was freshness-anchored
+# then — it filtered reviews with `submitted_at >= HEAD_ANCHOR`, so once the
+# same unchanged HEAD sat longer than `coderabbit.wallclock_freshness_window_
+# seconds` (default 1800s / 30 min), HEAD_ANCHOR advanced past the prior
+# CodeRabbit review's submitted_at, latest_review_id became null, and the
+# helper returned 0 — false-clearing the fast-path even while the same SHA
+# still had unresolved blocking inline findings.
+#
+# That #224 cause is GONE since #824: latest_head_pinned_review now selects on
+# `commit_id == HEAD_SHA` alone, so count_potential_issues can no longer lose a
+# SHA-matched review to the wall-clock floor. Do not read the paragraph above
+# as current behaviour of the sibling. This variant is kept because its SCOPE
+# is still the right one for the fast-path caller, not because the sibling is
+# broken: the fast-path is the only caller holding authoritative per-SHA
+# evidence (from the StatusContext check), and this helper scopes by each
+# inline comment's own `commit_id` — which survives GitHub's rebase remapping —
+# rather than by the review object the comment belongs to.
 #
 # Why still keep a non-wallclock freshness floor: GitHub can preserve or
 # remap inline review comments across a rebase/force-push so an old comment
@@ -1377,17 +1551,24 @@ summary_body_has_potential_issue_marker() {
 #
 # Filter shape: root inline review comments where the bot author posted
 # a comment whose `commit_id == HEAD_SHA` (i.e., GitHub still considers
-# it applicable to HEAD after any rebases) and whose body contains a
-# `Potential issue` / `⚠️` marker, excluding roots CodeRabbit itself
-# later marked with `review_comment_addressed`. Resolved-thread state is
+# it applicable to HEAD after any rebases), excluding roots CodeRabbit itself
+# later marked with `review_comment_addressed`; severity is graded in bash by
+# the shared classifier (#837), not by a jq pattern. Resolved-thread state is
 # not consulted directly; the explicit bot marker is the narrow signal
 # that a current-head finding has been addressed without relying on
 # GitHub conversation-resolution state.
 count_potential_issues_for_sha() {
   local sha=$1
-  local pulls_comments
-  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
-  echo "$pulls_comments" | jq \
+  local pulls_comments bodies
+  # Same explicit propagation as head_review_finding_bodies: this counter is
+  # also reached through command substitution, so a `die 3` inside the fetch
+  # exits only its own subshell and would otherwise leave an empty list to be
+  # graded as zero findings.
+  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments") || {
+    log "FATAL: could not read the inline comments for $sha — refusing to report an empty finding set"
+    return 3
+  }
+  bodies=$(echo "$pulls_comments" | jq -c \
     --arg bot "$BOT_LOGIN" \
     --arg sha "$sha" \
     --arg after "$HEAD_IDENTITY_ANCHOR" '
@@ -1402,10 +1583,11 @@ count_potential_issues_for_sha() {
       | select(.commit_id == $sha)
       | select((.created_at // "") >= $after)
       | select(.in_reply_to_id == null)
-      | select((.body // "") | test("Potential issue|⚠️"; "i"))
       | select(.id as $id | ($addressed_root_ids | index($id)) == null)
-    ] | length
-  '
+      | (.body // "")
+    ]
+  ')
+  crw_count_blocking_bodies "$bodies"
 }
 
 iso_on_or_after() {
@@ -1764,10 +1946,10 @@ emit_terminal_review_after_probe_if_present() {
       # scans only pulls/{pr}/comments) so the probe-wait clearance path
       # cannot false-clear over a summary-only finding either.
       if [ "$potential_issues" -gt 0 ]; then
-        log "CodeRabbit review landed during status-probe wait with $potential_issues Potential issue/⚠️ marker(s) — emitting findings (exit 2)"
+        log "CodeRabbit review landed during status-probe wait with $potential_issues blocking (p0/p1) inline finding(s) — emitting findings (exit 2)"
         emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
       elif summary_body_has_potential_issue_marker; then
-        log "CodeRabbit review landed during status-probe wait with 0 inline markers but a Potential issue/⚠️ marker in the PR-level summary body — emitting findings (exit 2)"
+        log "CodeRabbit review landed during status-probe wait with 0 blocking inline findings but a blocking marker in the PR-level summary body — emitting findings (exit 2)"
         emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
       fi
       log "CodeRabbit review landed during status-probe wait with no high-severity markers — emitting cleared (exit 0)"
@@ -2087,19 +2269,20 @@ emit_status_context_verdict() {
   # whenever the review finishes, even if Potential issue / ⚠️
   # comments were posted. Codex (chatgpt-codex-connector[bot]) caught
   # this on PR #224 round 1 (P1 finding, line 546). The fix: scan
-  # inline `Potential issue` / `⚠️` markers anchored on HEAD before
-  # declaring clearance.
+  # inline findings anchored on HEAD and count the ones the shared
+  # classifier grades blocking (#837) before declaring clearance.
   #
   # Round 2 sharpening (codex CHANGES_REQUESTED + CodeRabbit ⚠️ Major
   # @ line 581 on the round 1 fix): use `count_potential_issues_for_sha
-  # "$HEAD_SHA"` rather than `count_potential_issues`. The latter is
-  # filtered by HEAD_ANCHOR (wallclock freshness floor); after 30 min
-  # on the same unchanged HEAD, anchor advances past prior reviews and
-  # the count drops to 0 — false-clearing the fast-path. The
-  # SHA-scoped variant ignores the wallclock anchor entirely and counts
-  # findings whose `commit_id == HEAD_SHA`, which is the right scope
-  # given the fast-path already has authoritative SHA-level evidence
-  # from the StatusContext check.
+  # "$HEAD_SHA"` rather than `count_potential_issues`. The latter WAS
+  # then filtered by HEAD_ANCHOR (wallclock freshness floor), so after
+  # 30 min on the same unchanged HEAD the anchor advanced past prior
+  # reviews and the count dropped to 0 — false-clearing the fast-path.
+  # #824 removed that timestamp conjunct, so the sibling no longer
+  # false-clears that way; the SHA-scoped variant stays because it
+  # counts findings by each comment's own `commit_id == HEAD_SHA`,
+  # which is the right scope given the fast-path already has
+  # authoritative SHA-level evidence from the StatusContext check.
   local potential_issues synthetic
   potential_issues=$(count_potential_issues_for_sha "$HEAD_SHA")
   # Keep the synthetic review object compatible with the documented
@@ -2125,10 +2308,10 @@ emit_status_context_verdict() {
       body_excerpt: ("CodeRabbit StatusContext = " + $state + " on " + $sha + " (potential_issue_count=" + ($p | tostring) + ")")
     }')
   if [ "$potential_issues" -gt 0 ]; then
-    log "StatusContext $state but $potential_issues Potential issue/⚠️ marker(s) on HEAD — emitting findings (exit 2)"
+    log "StatusContext $state but $potential_issues blocking (p0/p1) inline finding(s) on HEAD — emitting findings (exit 2)"
     emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
   fi
-  log "StatusContext $state and 0 Potential issue/⚠️ markers — emitting cleared (exit 0)"
+  log "StatusContext $state and 0 blocking (p0/p1) inline findings — emitting cleared (exit 0)"
   emit_json_and_exit "cleared" 0 "$synthetic" 0
 }
 
@@ -2740,10 +2923,10 @@ while :; do
       # PR-level summary-body marker so a finding surfaced solely in the
       # summary body still yields findings instead of false-clearing.
       if [ "$POTENTIAL_ISSUES" -gt 0 ]; then
-        log "CodeRabbit review posted with $POTENTIAL_ISSUES Potential issue/⚠️ markers"
+        log "CodeRabbit review posted with $POTENTIAL_ISSUES blocking (p0/p1) inline finding(s)"
         emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
       elif summary_body_has_potential_issue_marker; then
-        log "CodeRabbit review posted with 0 inline markers but a Potential issue/⚠️ marker in the PR-level summary body — findings"
+        log "CodeRabbit review posted with 0 blocking inline findings but a blocking marker in the PR-level summary body — findings"
         emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
       else
         log "CodeRabbit review posted with no high-severity markers — cleared"
