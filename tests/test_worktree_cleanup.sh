@@ -562,6 +562,14 @@ ORPHAN_DIR="$MAIN/.claude/worktrees/agent-zzzz-orphan"
 mkdir -p "$ORPHAN_DIR"
 echo "leftover" > "$ORPHAN_DIR/marker.txt"
 
+# The orphan root can also legitimately contain a registered worktree. It is
+# deliberately adjacent to the orphan fixture so --apply --orphan-clean proves
+# that the NUL worktree-record parser never drops an active path from KNOWN_FILE.
+REGISTERED_CLAUDE_BRANCH="registered-claude-worktree"
+REGISTERED_CLAUDE_WT="$MAIN/.claude/worktrees/agent-registered"
+git branch "$REGISTERED_CLAUDE_BRANCH"
+git worktree add -q "$REGISTERED_CLAUDE_WT" "$REGISTERED_CLAUDE_BRANCH"
+
 # ── Case 6: verified-merged local branch with no worktree ─────────────
 MERGED_BRANCH="merged-local"
 git branch "$MERGED_BRANCH"
@@ -1118,6 +1126,17 @@ else
   show_out_on_fail
 fi
 
+REGISTERED_CLAUDE_LABEL=$(echo "$OUT" | awk -v p="$REGISTERED_CLAUDE_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if ! echo "$REGISTERED_CLAUDE_LABEL" | grep -q "ORPHAN .claude/worktrees"; then
+  pass "registered .claude/worktrees/ worktree is not misclassified as an orphan"
+else
+  fail "registered .claude/worktrees/ worktree was misclassified as an orphan"
+  show_out_on_fail
+fi
+
 # Case 6: verified-merged local branch listed as MERGED local branch.
 if echo "$OUT" | grep -q "MERGED local branch" \
    && echo "$OUT" | grep -q -- "$MERGED_BRANCH"; then
@@ -1654,6 +1673,17 @@ else
   echo "$OUT2" >&2
 fi
 
+# #892: REC_FILE is NUL-delimited. The orphan scan must consume its complete
+# six-field records rather than parsing it as pipe text, or --orphan-clean can
+# delete this still-registered worktree.
+if [ -d "$REGISTERED_CLAUDE_WT" ] \
+   && git worktree list --porcelain | grep -Fq -- "$REGISTERED_CLAUDE_WT"; then
+  pass "--orphan-clean preserves a registered .claude/worktrees/ worktree"
+else
+  fail "DATA LOSS: --orphan-clean removed a registered .claude/worktrees/ worktree"
+  echo "$OUT4" >&2
+fi
+
 # Case 20 (#762 r2 P3): the PR-state-unknown branch worktree is never removed.
 if [ -d "$UNKNOWN_PR_WT" ]; then
   pass "PR-state-unknown branch worktree retained by --apply"
@@ -1844,6 +1874,7 @@ git worktree unlock "$SUB_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$SUB_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$SUBMOD_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNKNOWN_PR_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$REGISTERED_CLAUDE_WT" >/dev/null 2>&1 || true
 # #892: the free-form stale-unpruned worktree is retained by the widened
 # content gate, so it too is a human decision the audit keeps flagging.
 git worktree remove --force "$STALE_WT" >/dev/null 2>&1 || true
@@ -2428,6 +2459,125 @@ if [ "$RC_PLUS" -eq 0 ] && [ ! -d "$PLUS_WT" ]; then
 else
   fail "#892 branch-list marker parsing dropped a branch's leading plus"
   echo "$OUT_PLUS" >&2
+fi
+
+# ── Case 32 (#892, CodeRabbit): negatives require a safe positive mapping ──
+# A negative refspec on its own cannot fetch anything. An unsafe mirror mapping
+# plus a negative must therefore use the conventional SAFE fallback, rather
+# than handing `git fetch` an invalid negatives-only list and silently losing
+# gone-upstream detection.
+NEG_ONLY_ROOT="$WORKDIR/negative-only-refspec"
+NEG_ONLY_REMOTE="$NEG_ONLY_ROOT/remote.git"
+NEG_ONLY_MAIN="$NEG_ONLY_ROOT/main"
+NEG_ONLY_BRANCH='wip'
+mkdir -p "$NEG_ONLY_ROOT"
+git init -q --bare "$NEG_ONLY_REMOTE"
+git init -q "$NEG_ONLY_MAIN"
+(
+  cd "$NEG_ONLY_MAIN"
+  git -C "$NEG_ONLY_MAIN" config user.email "test@example.com"
+  git -C "$NEG_ONLY_MAIN" config user.name "Test"
+  git -C "$NEG_ONLY_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$NEG_ONLY_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b "$NEG_ONLY_BRANCH"
+  git push -q -u origin "$NEG_ONLY_BRANCH"
+  git checkout -q main
+  git config --unset-all remote.origin.fetch
+  git config --add remote.origin.fetch '+refs/heads/*:refs/heads/*'
+  git config --add remote.origin.fetch '^refs/heads/wip'
+  git update-ref -d "refs/remotes/origin/$NEG_ONLY_BRANCH"
+) >/dev/null 2>&1
+set +e
+OUT_NEG_ONLY=$( cd "$NEG_ONLY_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_NEG_ONLY=$?
+set -e
+if [ "$RC_NEG_ONLY" -eq 0 ] \
+   && ! echo "$OUT_NEG_ONLY" | grep -Fq 'git fetch --prune origin` failed' \
+   && git -C "$NEG_ONLY_MAIN" rev-parse --verify -q "refs/remotes/origin/$NEG_ONLY_BRANCH" >/dev/null; then
+  pass "#892 negative-only safe filter falls back to a valid remote-tracking mapping"
+else
+  fail "#892 negative-only safe filter did not use the conventional fallback mapping"
+  echo "$OUT_NEG_ONLY" >&2
+fi
+
+# ── Case 33 (#892, Codex P2): dry-run shares the fallback refmap ─────────
+# A branch may still track refs/remotes/origin/foo even though origin's only
+# configured fetch mapping is an unsafe mirror. The fallback that makes apply
+# prune in the remote-tracking namespace must make dry-run classify the same
+# deleted remote head; otherwise preview says clean and apply removes it.
+FALLBACK_ROOT="$WORKDIR/fallback-refmap"
+FALLBACK_REMOTE="$FALLBACK_ROOT/remote.git"
+FALLBACK_MAIN="$FALLBACK_ROOT/main"
+FALLBACK_BRANCH='fallback-gone'
+FALLBACK_WT="$FALLBACK_ROOT/fallback-worktree"
+mkdir -p "$FALLBACK_ROOT"
+git init -q --bare "$FALLBACK_REMOTE"
+git init -q "$FALLBACK_MAIN"
+(
+  cd "$FALLBACK_MAIN"
+  git -C "$FALLBACK_MAIN" config user.email "test@example.com"
+  git -C "$FALLBACK_MAIN" config user.name "Test"
+  git -C "$FALLBACK_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$FALLBACK_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b "$FALLBACK_BRANCH"
+  git push -q -u origin "$FALLBACK_BRANCH"
+  FALLBACK_TIP=$(git rev-parse "refs/heads/$FALLBACK_BRANCH")
+  git checkout -q main
+  git config --unset-all remote.origin.fetch
+  git config --add remote.origin.fetch '+refs/heads/*:refs/heads/*'
+  git update-ref "refs/remotes/origin/$FALLBACK_BRANCH" "$FALLBACK_TIP"
+  # A local remote preserves this full upstream even though origin's fetch
+  # refmap is mirror-style. This is the dry-run/apply mismatch under test.
+  git config "branch.$FALLBACK_BRANCH.remote" .
+  git config "branch.$FALLBACK_BRANCH.merge" "refs/remotes/origin/$FALLBACK_BRANCH"
+  git worktree add -q "$FALLBACK_WT" "$FALLBACK_BRANCH"
+  git --git-dir="$FALLBACK_REMOTE" branch -D "$FALLBACK_BRANCH"
+) >/dev/null 2>&1
+set +e
+OUT_FALLBACK_DRY=$( cd "$FALLBACK_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_FALLBACK_DRY=$?
+set -e
+if [ "$RC_FALLBACK_DRY" -eq 2 ] && echo "$OUT_FALLBACK_DRY" | grep -Fq -- "$FALLBACK_WT"; then
+  pass "#892 dry-run applies the safe fallback refmap before probing remote heads"
+else
+  fail "#892 dry-run omitted a branch that apply's fallback refmap would prune"
+  echo "$OUT_FALLBACK_DRY" >&2
+fi
+
+# ── Case 34 (#892, CodeRabbit): porcelain failure cannot mean no worktrees ─
+# A process substitution hides the producer status. Simulate an old or broken
+# Git that rejects `worktree list --porcelain -z`: the audit must terminate
+# before an empty REC_FILE can be interpreted as a clean worktree inventory.
+PORCELAIN_FAIL_STUB="$WORKDIR/porcelain-fail-git"
+mkdir -p "$PORCELAIN_FAIL_STUB"
+cat >"$PORCELAIN_FAIL_STUB/git" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "worktree" ] && [ "$2" = "list" ] && [ "$3" = "--porcelain" ] && [ "$4" = "-z" ]; then
+  exit 129
+fi
+exec "$REAL_GIT" "$@"
+EOF
+chmod +x "$PORCELAIN_FAIL_STUB/git"
+set +e
+OUT_PORCELAIN_FAIL=$( cd "$MAIN" && REAL_GIT="$(command -v git)" PATH="$PORCELAIN_FAIL_STUB:$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_PORCELAIN_FAIL=$?
+set -e
+if [ "$RC_PORCELAIN_FAIL" -ne 0 ] \
+   && echo "$OUT_PORCELAIN_FAIL" | grep -Fq "could not read git worktree porcelain records"; then
+  pass "#892 unreadable NUL porcelain inventory fails closed instead of looking empty"
+else
+  fail "#892 an unreadable NUL porcelain inventory did not fail closed"
+  echo "$OUT_PORCELAIN_FAIL" >&2
 fi
 
 echo ""

@@ -259,31 +259,41 @@ MAIN_WORKTREE=$(cd "$GIT_COMMON_DIR/.." && pwd)
 # `refs/heads/release:refs/remotes/origin/stable`, for example; overwriting that
 # mapping would prune `origin/stable` and mistake the live `release` branch for
 # a deletion. Mappings outside the remote-tracking namespace remain excluded.
+safe_fetch_refspecs() {
+  local refspec safe_refspec
+  local positive_refspecs=() negative_refspecs=()
+  while IFS= read -r refspec; do
+    safe_refspec=${refspec#+}
+    case "$safe_refspec" in
+      refs/heads/*:refs/remotes/origin/*)
+        positive_refspecs+=("$refspec")
+        ;;
+      ^refs/heads/*)
+        # A negative refspec is meaningful only alongside a positive mapping.
+        # Do not hand `git fetch` a negatives-only list: it rejects it, which
+        # makes --apply lose gone-upstream detection entirely. If no safe
+        # configured positive mapping survives the filter below, use the
+        # conventional safe mapping instead and do not inherit exclusions that
+        # belonged to an unsafe or unrelated configured destination.
+        negative_refspecs+=("$refspec")
+        ;;
+    esac
+  done < <(git -C "$MAIN_WORKTREE" config --get-all remote.origin.fetch 2>/dev/null || true)
+
+  if [ "${#positive_refspecs[@]}" -eq 0 ]; then
+    printf '%s\n' '+refs/heads/*:refs/remotes/origin/*'
+    return 0
+  fi
+  printf '%s\n' "${positive_refspecs[@]}"
+  printf '%s\n' "${negative_refspecs[@]}"
+}
+
 if [ "$MODE" = "apply" ]; then
   if git -C "$MAIN_WORKTREE" remote get-url origin >/dev/null 2>&1; then
     SAFE_FETCH_REFSPECS=()
     while IFS= read -r refspec; do
-      safe_refspec=${refspec#+}
-      case "$safe_refspec" in
-        refs/heads/*:refs/remotes/origin/*)
-          SAFE_FETCH_REFSPECS+=("$refspec")
-          ;;
-        ^refs/heads/*)
-          # Negative refspecs exclude remote heads from the positive mapping.
-          # They have no destination and are safe only alongside a safe
-          # positive mapping; dropping one can prune an intentionally retained
-          # tracking ref and its clean worktree.
-          SAFE_FETCH_REFSPECS+=("$refspec")
-          ;;
-      esac
-    done < <(git -C "$MAIN_WORKTREE" config --get-all remote.origin.fetch 2>/dev/null || true)
-    # A remote with no safe configured mapping (for example, a mirror refspec
-    # into refs/heads/*) still gets the conventional safe tracking map. This
-    # does not inherit the unsafe destination, and it lets gone detection work
-    # for repositories that have never configured remote-tracking refs.
-    if [ "${#SAFE_FETCH_REFSPECS[@]}" -eq 0 ]; then
-      SAFE_FETCH_REFSPECS=("+refs/heads/*:refs/remotes/origin/*")
-    fi
+      SAFE_FETCH_REFSPECS+=("$refspec")
+    done < <(safe_fetch_refspecs)
     # Positional refspecs do NOT override remote.origin.fetch on their own.
     # Clear the configured refmap first: otherwise a mirror mapping such as
     # +refs/heads/*:refs/heads/* still updates local branches while this
@@ -609,7 +619,7 @@ source_is_negatively_refspec_excluded() {
         esac
         ;;
     esac
-  done < <(git -C "$MAIN_WORKTREE" config --get-all remote.origin.fetch 2>/dev/null || true)
+  done < <(safe_fetch_refspecs)
   return 1
 }
 
@@ -655,7 +665,7 @@ origin_head_for_upstream() {
         return 0
         ;;
     esac
-  done < <(git -C "$MAIN_WORKTREE" config --get-all remote.origin.fetch 2>/dev/null || true)
+  done < <(safe_fetch_refspecs)
   return 1
 }
 
@@ -729,8 +739,17 @@ stale_unpruned_branches() {
 # BRANCH is the short ref name (without refs/heads/) or empty for detached;
 # DETACHED is "1" iff the entry was marked detached.
 worktree_records() {
-  local line path branch detached head locked lock_reason ref
-  cd "$MAIN_WORKTREE" || return 0
+  local line path branch detached head locked lock_reason ref records_file
+  cd "$MAIN_WORKTREE" || return 1
+  records_file=$(mktemp "${TMPDIR:-/tmp}/wcleanup-worktree-records.XXXXXX") || {
+    echo "worktree-cleanup.sh: error: could not create a temporary worktree-record snapshot" >&2
+    return 1
+  }
+  if ! git worktree list --porcelain -z >"$records_file" 2>/dev/null; then
+    rm -f "$records_file"
+    echo "worktree-cleanup.sh: error: could not read git worktree porcelain records" >&2
+    return 1
+  fi
   path=""; branch=""; detached="0"; head=""; locked="0"; lock_reason=""
   while IFS= read -r -d '' line; do
     case "$line" in
@@ -754,13 +773,14 @@ worktree_records() {
         lock_reason=${lock_reason# }
         ;;
     esac
-  done < <(git worktree list --porcelain -z 2>/dev/null)
+  done <"$records_file"
   # Porcelain records normally end in a blank NUL field. Keep the flush for
   # older Git variants that omit the final separator.
   if [ -n "$path" ]; then
     printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
       "$path" "$branch" "$detached" "$head" "$locked" "$lock_reason"
   fi
+  rm -f "$records_file"
 }
 
 # ── Gather state ──────────────────────────────────────────────────────
@@ -1337,9 +1357,20 @@ if [ -d "$ORPHAN_ROOT" ]; then
   ORPHAN_ROOT_PHYS_TS="${ORPHAN_ROOT_PHYS%/}/"
 
   # Collect known worktree paths into a set (one per line) and check each
-  # subdir against it.
+  # subdir against it. REC_FILE is NUL-delimited: parsing it with awk or grep
+  # treats it as binary on some platforms and silently drops registered paths,
+  # which can turn an active .claude/worktrees checkout into an orphan-clean
+  # deletion candidate. Consume all six fields so the next record stays
+  # aligned, and emit only the first (the worktree path).
   KNOWN_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-known.XXXXXX")
-  awk -F'|' '{ print $1 }' "$REC_FILE" >"$KNOWN_FILE"
+  while IFS= read -r -d '' known_path \
+    && IFS= read -r -d '' known_branch \
+    && IFS= read -r -d '' known_detached \
+    && IFS= read -r -d '' known_head \
+    && IFS= read -r -d '' known_locked \
+    && IFS= read -r -d '' known_lock_reason; do
+    printf '%s\n' "$known_path"
+  done <"$REC_FILE" >"$KNOWN_FILE"
   for d in "$ORPHAN_ROOT"/*; do
     [ -d "$d" ] || continue
 
