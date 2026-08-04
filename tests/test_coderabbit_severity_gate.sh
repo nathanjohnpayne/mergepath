@@ -2187,6 +2187,188 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# ===========================================================================
+# Codex round 5 on #886. The three structural scans share one CommonMark fence
+# reader; these cases drive it through the fence forms the first hand-rolled
+# copies did not recognise, and pin the commits-range scan to unfenced text.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Test 41 (#886, Codex P1): a TILDE fence. The earlier fence checks matched only
+# a bare three-backtick line, so `~~~` quoted content was read as CodeRabbit's
+# own markup — walking straight past the round-1 stanza fix. A quoted column-0
+# rate-limit stanza inside a tilde fence must not suppress the summary.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 41 (#886): stanza quoted inside a ~~~ fence → still a report, exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+TILDE_FENCE_SUMMARY="$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING
+
+The diff adds this fixture line:
+
+~~~
+<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+~~~
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$TILDE_FENCE_SUMMARY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "a tilde-fenced stanza quote does not suppress the summary → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 41b (#886, Codex P1): a LONGER backtick fence containing a three-backtick
+# line. CommonMark closes a fence only on the same character at >= the opening
+# run length, so the inner ``` is content, not a closer. A naive toggle would
+# reopen the scan mid-block and read the quoted delimiter as real — here that
+# would let a quoted pre-merge start delimiter delete a genuine finding.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 41b (#886): inner \`\`\` does not close a \`\`\`\`\` fence → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+LONG_FENCE_SUMMARY="$(make_summary_body "$HEAD_SHA" "Quoted fixture, nested fences:
+
+\`\`\`\`\`
+\`\`\`
+<!-- pre_merge_checks_walkthrough_start -->
+\`\`\`
+\`\`\`\`\`
+
+$SUMMARY_BLOCKING_FINDING
+
+<!-- pre_merge_checks_walkthrough_start -->
+| Docstring coverage | ⚠️ Warning | 12.00% is below the 80.00% threshold |
+<!-- pre_merge_checks_walkthrough_end -->
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$LONG_FENCE_SUMMARY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "a longer fence is not closed by a shorter inner one → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 42 (#886, Codex P1): the commits-range scan reads UNFENCED text only. A
+# quoted `between X and <head>` string let a stale summary pass as this head's
+# report, and both error directions are unsafe on this predicate — so the fix
+# is precision, not a fail-direction argument. Here the ONLY occurrence of the
+# head is a fenced quote, and the genuine range names a different head, so the
+# summary is out of scope and its finding must not gate.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 42 (#886): a fenced commits-range quote does not bring a stale summary into scope"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+QUOTED_RANGE_SUMMARY="$(make_summary_body "deadbeefdeadbeef" "$SUMMARY_BLOCKING_FINDING
+
+The diff quotes an older range:
+
+\`\`\`
+Reviewing files that changed from the base of the PR and between $PREV_SHA and $HEAD_SHA
+\`\`\`
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$QUOTED_RANGE_SUMMARY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && echo "$OUT" | grep -q "does not name $HEAD_SHA as its commits-range end"; then
+  pass "a fenced range quote is not CodeRabbit's commits row → out of scope, exit 0"
+else
+  fail "expected rc=0 with the out-of-scope log line; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 42b (#886): the genuine, unfenced commits row is still found — the
+# narrowing above must not push a real report out of scope, which would be a
+# false clear of its own.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 42b (#886): the genuine unfenced commits row is still in scope → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "the real commits row still brings the summary into scope → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 43 (#886, Codex P2): with no summary finding, the ack fingerprint is
+# never printed or consulted, so an absent hasher must not fail the gate.
+# Simulated by running with a PATH that has neither sha256sum nor shasum.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 43 (#886): no summary finding + no hasher on PATH → clean exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+NOHASH_BIN="$WORKDIR/nohash.$$"
+mkdir -p "$NOHASH_BIN"
+for tool in bash sh env awk sed grep jq gh cat cut tr head printf sort wc mkdir rm dirname basename; do
+  tp=$(command -v "$tool" 2>/dev/null || true)
+  [ -n "$tp" ] && ln -sf "$tp" "$NOHASH_BIN/$tool"
+done
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_NITPICK_FINDING")")
+set +e
+OUT=$(
+  PATH="$NOHASH_BIN" \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! echo "$OUT" | grep -q "neither sha256sum nor shasum"; then
+  pass "an unused hashing dependency does not redden a clean gate → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' and no hasher error; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # ---------------------------------------------------------------------------
 echo
 echo "============================================"

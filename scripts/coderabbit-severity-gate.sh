@@ -452,6 +452,68 @@ CR_SUMMARY_BENIGN_STANZA_RE='auto-generated comment: (summarize|release notes) b
 CR_PRE_MERGE_BLOCK_START='<!-- pre_merge_checks_walkthrough_start -->'
 CR_PRE_MERGE_BLOCK_END='<!-- pre_merge_checks_walkthrough_end -->'
 
+# --- shared fence-aware line filter ----------------------------------------
+#
+# THREE structural scans below need the same question answered — "is this line
+# CodeRabbit's own markup, or content CodeRabbit is quoting?" — and each of them
+# turned out to be a false clear of this required gate when it got that answer
+# wrong (stanza detection, the pre-merge strip, and the commits-range match).
+# They share ONE implementation rather than three copies, because the first
+# attempt did carry three copies and they were three different degrees of wrong
+# (Codex P1 round 5 on #886: the copies recognised only a bare three-backtick
+# fence, so a `~~~` or ````` quote walked straight past two fixes made for
+# exactly this).
+#
+# Fence recognition follows CommonMark rather than a convenient subset: an
+# opener is 3+ backticks OR 3+ tildes, indented up to 3 spaces, optionally with
+# an info string; a closer must use the SAME character, be at least as long,
+# and carry nothing but whitespace after it. Getting any of those wrong
+# reintroduces the bug — a `~~~` block whose contents are read as markup, or a
+# ```` fence "closed" by an inner ``` line.
+#
+# Deliberately interval-free regexes (`/^ ? ? ?/`, explicit run counting): awk
+# interval expressions are not portable across the BWK awk on macOS and the
+# mawk/gawk on CI runners, and a silently-unsupported `{3,}` would degrade this
+# to matching nothing.
+CR_AWK_FENCE_PRELUDE='
+function fence_info(s, out,   c, n) {
+  sub(/^ ? ? ?/, "", s)
+  c = substr(s, 1, 1)
+  if (c != "`" && c != "~") return 0
+  n = 0
+  while (substr(s, n + 1, 1) == c) n++
+  if (n < 3) return 0
+  out["char"] = c
+  out["len"] = n
+  out["rest"] = substr(s, n + 1)
+  return 1
+}
+function fence_update(l,   inf) {
+  if (!fence_info(l, inf)) return 0
+  if (!FENCE) { FENCE = 1; FCH = inf["char"]; FLEN = inf["len"]; return 1 }
+  if (inf["char"] == FCH && inf["len"] >= FLEN && inf["rest"] ~ /^[ \t]*$/) {
+    FENCE = 0; FCH = ""; FLEN = 0
+  }
+  return 1
+}
+'
+
+# Emit `<original line number>\t<CR-stripped line>` for every line of the body
+# that is OUTSIDE a fenced code block, dropping the fence delimiter lines
+# themselves. The line number is carried because the pre-merge strip has to map
+# its decision back onto the original body.
+summary_unfenced_numbered() {
+  printf '%s\n' "$1" | awk "$CR_AWK_FENCE_PRELUDE"'
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (fence_update(line)) next
+      if (FENCE) next
+      printf "%d\t%s\n", NR, line
+    }
+  '
+}
+
 # Emit one normalized line per STRUCTURAL stanza OPENER in the body.
 #
 # "Structural" is the whole point (Codex P1 round 1 on #886). Counting the bare
@@ -481,12 +543,9 @@ CR_PRE_MERGE_BLOCK_END='<!-- pre_merge_checks_walkthrough_end -->'
 # closers), and counting closers made the total depend on which stanza kinds
 # happen to be wrapped.
 summary_stanza_opener_lines() {
-  printf '%s\n' "$1" | awk '
-    /^```/ { fence = !fence; next }
-    fence { next }
+  summary_unfenced_numbered "$1" | sed 's/^[0-9]*	//' | awk '
     {
       line = $0
-      sub(/\r$/, "", line)
       sub(/[ \t]+$/, "", line)
       if (line ~ /^<!-- This is an auto-generated comment: .* by coderabbit\.ai -->$/) {
         print line
@@ -529,7 +588,22 @@ summary_stanzas_all_benign() {
 # value is ever evaluated as a pattern.
 summary_names_head() {
   local ranges end want r
-  ranges=$(printf '%s' "$1" | grep -oiE 'between [0-9a-f]{7,40} and [0-9a-f]{7,40}' || true)
+  # Extracted from the UNFENCED body only (Codex P1 round 5 on #886). A
+  # whole-body match accepted a `between <sha> and <sha>` string that CodeRabbit
+  # was merely QUOTING from the diff, which is enough to make a stale summary
+  # read as this head's report — and both error directions are unsafe here, so
+  # this is one of the few places where precision matters rather than a
+  # fail-direction argument. Excluding fenced quotes is a strict improvement:
+  # CodeRabbit's own commits row is never inside a fence, so nothing genuine is
+  # lost.
+  #
+  # NOT narrowed to the `📥 Commits` section, though that would be more precise
+  # still: the section heading is CodeRabbit presentation that can change
+  # without notice, and if it did, the range would stop being found, the summary
+  # would fall out of scope, and its findings would go ungated. That is a false
+  # CLEAR bought with precision, which is the wrong trade for a required gate.
+  ranges=$(summary_unfenced_numbered "$1" | sed 's/^[0-9]*	//' \
+    | grep -oiE 'between [0-9a-f]{7,40} and [0-9a-f]{7,40}' || true)
   [ -n "$ranges" ] || return 1
   # Hex is case-insensitive; GitHub renders shas lowercase but the comparison
   # must not depend on that, or an uppercase range would silently drop this
@@ -567,16 +641,14 @@ summary_strip_pre_merge_block() {
   local body=$1 pair
   # Emit "<start_line> <end_line>" for the first structural START that is
   # followed by a structural END, or nothing at all.
-  pair=$(printf '%s\n' "$body" | awk \
+  pair=$(summary_unfenced_numbered "$body" | awk -F'\t' \
     -v s="$CR_PRE_MERGE_BLOCK_START" -v e="$CR_PRE_MERGE_BLOCK_END" '
     {
-      line = $0
-      sub(/\r$/, "", line)
+      n = $1
+      line = substr($0, index($0, "\t") + 1)
       sub(/[ \t]+$/, "", line)
-      if (line ~ /^```/) { fence = !fence; next }
-      if (fence) next
-      if (line == s && !have_s) { have_s = 1; sl = NR; next }
-      if (line == e && have_s) { print sl " " NR; exit }
+      if (line == s && !have_s) { have_s = 1; sl = n; next }
+      if (line == e && have_s) { print sl " " n; exit }
     }
   ')
   if [ -n "$pair" ]; then
@@ -762,11 +834,20 @@ log "found $SUMMARY_BLOCKING_COUNT blocking-tier summary finding(s) on HEAD"
 # makes "a verbatim paste of any contiguous region of this output cannot ack"
 # true rather than merely likely. tests/test_coderabbit_severity_gate.sh
 # asserts that rendering directly, so unindenting it there fails the suite.
-SUMMARY_FINDINGS_FINGERPRINT=$(
-  summary_findings_fingerprint "$SUMMARY_FINDINGS_FINGERPRINT_INPUT"
-)
-SUMMARY_ACK_TOKEN="[mergepath-summary-ack: $HEAD_SHA $SUMMARY_FINDINGS_FINGERPRINT]"
+#
+# Computed only when there is a summary finding to acknowledge (Codex P2 round
+# 5 on #886). summary_findings_fingerprint `die 2`s when neither sha256sum nor
+# shasum is on PATH — the right call when an ack has to be bound to a finding
+# set, and the wrong one when there is no finding, no token printed and nothing
+# to bind: an unconditional call turned an otherwise-clean required check red
+# over a hashing dependency it was not going to use.
+SUMMARY_FINDINGS_FINGERPRINT=''
+SUMMARY_ACK_TOKEN=''
 if [ "$SUMMARY_BLOCKING_COUNT" -gt 0 ]; then
+  SUMMARY_FINDINGS_FINGERPRINT=$(
+    summary_findings_fingerprint "$SUMMARY_FINDINGS_FINGERPRINT_INPUT"
+  )
+  SUMMARY_ACK_TOKEN="[mergepath-summary-ack: $HEAD_SHA $SUMMARY_FINDINGS_FINGERPRINT]"
   if echo "$ISSUE_COMMENTS_JSON" | jq -e --arg tok "$SUMMARY_ACK_TOKEN" '
     any(.[];
       ((.user.login // "") | endswith("[bot]") | not)
