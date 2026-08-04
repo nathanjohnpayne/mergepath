@@ -483,9 +483,17 @@ function fence_info(s, out,   c, n) {
   n = 0
   while (substr(s, n + 1, 1) == c) n++
   if (n < 3) return 0
+  out["rest"] = substr(s, n + 1)
+  # CommonMark: the info string of a BACKTICK fence may not contain a backtick
+  # (tilde fences have no such restriction). Accepting one made an ordinary
+  # prose line carrying backticks read as an opener, which puts the reader into
+  # a fence that never legitimately closes and hides everything after it —
+  # including the genuine commits range, which then takes the summary out of
+  # scope and clears the gate. Rejecting the line here is the correct outcome
+  # and not merely the safe one: such a line is not a fence in any renderer.
+  if (c == "`" && index(out["rest"], "`") > 0) return 0
   out["char"] = c
   out["len"] = n
-  out["rest"] = substr(s, n + 1)
   return 1
 }
 function fence_update(l,   inf) {

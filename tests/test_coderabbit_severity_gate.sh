@@ -2370,6 +2370,72 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 44 (#886, Codex P1 round 6): a backtick fence opener may not carry a
+# backtick in its info string (CommonMark; tilde fences have no such rule).
+# Accepting one let an ordinary prose line read as an opener, putting the
+# reader into a fence that never legitimately closes — hiding everything after
+# it, INCLUDING the genuine commits range, which takes the summary out of scope
+# and clears the gate. Note the direction: this one suppresses by opening a
+# fence, the mirror image of the round-5 cases which suppressed by closing one.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 44 (#886): a backtick line with backticks in its info string is not a fence → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+BAD_OPENER_SUMMARY="$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING
+
+\`\`\`sh with \`inline\` ticks
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$BAD_OPENER_SUMMARY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "an invalid backtick opener does not hide the commits range → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1' (the summary must stay in scope); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 44b (#886): the restriction is backtick-only. A TILDE opener may carry
+# anything in its info string, so a `~~~` fence with backticks after it is
+# still a fence and still hides its contents.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 44b (#886): a tilde opener may carry backticks in its info string"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+TILDE_INFO_SUMMARY="$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING
+
+~~~sh with \`inline\` ticks
+<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+~~~
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$TILDE_INFO_SUMMARY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "a tilde fence with a backticked info string still fences its contents → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_coderabbit_severity_gate.sh: $PASS passed, $FAIL failed"
