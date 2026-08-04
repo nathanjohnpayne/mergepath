@@ -344,9 +344,18 @@ jobs:
             # a dependency whose absence makes both fingerprints degrade to the
             # same value, which reads as "unchanged" and silently disables the
             # guard. A large shell variable costs nothing here.
+            #
+            # The record separator is written as the jq ESCAPE `\u001e`, never
+            # as a raw control byte (Codex P1 on #886). A literal NUL in the
+            # workflow source makes the YAML document invalid — Ruby Psych
+            # rejects it with "control characters are not allowed" — and GitHub
+            # would then refuse to register the workflow at all, silently
+            # removing a required check rather than failing a run. jq expands
+            # the escape at runtime, so the delimiter is still a byte that
+            # cannot occur in a comment body, while the file stays printable.
             cr_surface_fp() {
               gh api "repos/$REPO/issues/$1/comments" --paginate \
-                --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join(" ")' \
+                --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join("\u001e")' \
                 2>/dev/null || printf '__unreadable__%s' "$RANDOM"
             }
 
