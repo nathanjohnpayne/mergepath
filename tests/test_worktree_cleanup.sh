@@ -2068,6 +2068,7 @@ PIPE_ROOT="$WORKDIR/pipe-refname"
 PIPE_REMOTE="$PIPE_ROOT/remote.git"
 PIPE_MAIN="$PIPE_ROOT/main"
 PIPE_BRANCH='pipe|branch'
+PIPE_WT="$PIPE_ROOT/pipe-worktree"
 mkdir -p "$PIPE_ROOT"
 git init -q --bare "$PIPE_REMOTE"
 git init -q "$PIPE_MAIN"
@@ -2084,6 +2085,7 @@ git init -q "$PIPE_MAIN"
   git push -q -u origin main
   git branch "$PIPE_BRANCH"
   git push -q -u origin "$PIPE_BRANCH"
+  git worktree add -q "$PIPE_WT" "$PIPE_BRANCH"
   git --git-dir="$PIPE_REMOTE" branch -D "$PIPE_BRANCH"
 ) >/dev/null 2>&1
 
@@ -2091,11 +2093,22 @@ set +e
 OUT_PIPE=$( cd "$PIPE_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
 RC_PIPE=$?
 set -e
-if [ "$RC_PIPE" -eq 0 ] && echo "$OUT_PIPE" | grep -Fq -- "$PIPE_BRANCH"; then
-  pass "#892 a stale branch whose legal name contains | is reported"
+if [ "$RC_PIPE" -eq 2 ] && echo "$OUT_PIPE" | grep -Fq -- "$PIPE_WT"; then
+  pass "#892 a stale branch-attached worktree whose legal name contains | is reported"
 else
-  fail "#892 a stale branch containing | was lost while serializing the snapshot"
+  fail "#892 a stale worktree branch containing | was lost while serializing records"
   echo "$OUT_PIPE" >&2
+fi
+
+set +e
+OUT_PIPE_APPLY=$( cd "$PIPE_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_PIPE_APPLY=$?
+set -e
+if [ "$RC_PIPE_APPLY" -eq 0 ] && [ ! -d "$PIPE_WT" ]; then
+  pass "#892 --apply removes the clean stale worktree whose branch contains |"
+else
+  fail "#892 --apply did not reach the stale worktree whose branch contains |"
+  echo "$OUT_PIPE_APPLY" >&2
 fi
 
 # ── Case 26 (#892, Codex P1): branch/tag name collisions stay fail-safe ─
@@ -2218,6 +2231,203 @@ if [ "$RC_LOCALE" -eq 0 ] && [ ! -d "$LOCALE_WT" ]; then
 else
   fail "#892 localized gone marker made --apply retain the stale worktree"
   echo "$OUT_LOCALE" >&2
+fi
+
+# ── Case 28 (#892, Codex P1): configured refmaps cannot update branches ──
+# Positional fetch refspecs ADD to remote.origin.fetch; they do not replace it.
+# The helper must clear a mirror-style configured refmap before fetching or an
+# unpushed local commit on a same-named remote branch is force-rewound.
+REFMAP_ROOT="$WORKDIR/refmap-override"
+REFMAP_REMOTE="$REFMAP_ROOT/remote.git"
+REFMAP_MAIN="$REFMAP_ROOT/main"
+REFMAP_BRANCH='topic'
+mkdir -p "$REFMAP_ROOT"
+git init -q --bare "$REFMAP_REMOTE"
+git init -q "$REFMAP_MAIN"
+(
+  cd "$REFMAP_MAIN"
+  git -C "$REFMAP_MAIN" config user.email "test@example.com"
+  git -C "$REFMAP_MAIN" config user.name "Test"
+  git -C "$REFMAP_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$REFMAP_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b "$REFMAP_BRANCH"
+  git push -q -u origin "$REFMAP_BRANCH"
+  echo "unpushed local follow-up" > follow-up.txt
+  git add follow-up.txt
+  git commit -q -m "must not be fetched away"
+  git checkout -q main
+  git config --unset-all remote.origin.fetch
+  git config --add remote.origin.fetch '+refs/heads/*:refs/heads/*'
+) >/dev/null 2>&1
+REFMAP_LOCAL_TIP=$(git -C "$REFMAP_MAIN" rev-parse "refs/heads/$REFMAP_BRANCH")
+REFMAP_REMOTE_TIP=$(git --git-dir="$REFMAP_REMOTE" rev-parse "refs/heads/$REFMAP_BRANCH")
+set +e
+OUT_REFMAP=$( cd "$REFMAP_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_REFMAP=$?
+set -e
+if [ "$RC_REFMAP" -eq 0 ] \
+   && [ "$(git -C "$REFMAP_MAIN" rev-parse "refs/heads/$REFMAP_BRANCH")" = "$REFMAP_LOCAL_TIP" ] \
+   && [ "$REFMAP_LOCAL_TIP" != "$REFMAP_REMOTE_TIP" ]; then
+  pass "#892 --apply clears configured refmaps before its safe fetch (unpushed branch tip survives)"
+else
+  fail "DATA LOSS: configured refmap rewound an unpushed local branch during --apply"
+  echo "$OUT_REFMAP" >&2
+fi
+
+# ── Case 29 (#892, Codex P2): negative refspecs remain exclusions ─────────
+# A configured `^refs/heads/excluded` means the remote-tracking ref is outside
+# this helper's fetch/prune scope. Dropping it would prune that ref, make the
+# clean worktree appear gone, and remove it even though normal git fetch keeps
+# it deliberately excluded.
+NEG_ROOT="$WORKDIR/negative-refspec"
+NEG_REMOTE="$NEG_ROOT/remote.git"
+NEG_MAIN="$NEG_ROOT/main"
+NEG_BRANCH='excluded'
+NEG_WT="$NEG_ROOT/excluded-worktree"
+mkdir -p "$NEG_ROOT"
+git init -q --bare "$NEG_REMOTE"
+git init -q "$NEG_MAIN"
+(
+  cd "$NEG_MAIN"
+  git -C "$NEG_MAIN" config user.email "test@example.com"
+  git -C "$NEG_MAIN" config user.name "Test"
+  git -C "$NEG_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$NEG_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b "$NEG_BRANCH"
+  git push -q -u origin "$NEG_BRANCH"
+  git checkout -q main
+  git config --unset-all remote.origin.fetch
+  git config --add remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+  git config --add remote.origin.fetch '^refs/heads/excluded'
+  git worktree add -q "$NEG_WT" "$NEG_BRANCH"
+  git --git-dir="$NEG_REMOTE" branch -D "$NEG_BRANCH"
+) >/dev/null 2>&1
+set +e
+OUT_NEG_DRY=$( cd "$NEG_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_NEG_DRY=$?
+set -e
+if [ "$RC_NEG_DRY" -eq 0 ] && ! echo "$OUT_NEG_DRY" | grep -Fq -- "$NEG_WT"; then
+  pass "#892 dry-run treats a negative-refspec source as inconclusive"
+else
+  fail "#892 dry-run treated a negative-refspec source as stale"
+  echo "$OUT_NEG_DRY" >&2
+fi
+set +e
+OUT_NEG_APPLY=$( cd "$NEG_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_NEG_APPLY=$?
+set -e
+if [ "$RC_NEG_APPLY" -eq 0 ] && [ -d "$NEG_WT" ] \
+   && git -C "$NEG_MAIN" rev-parse --verify -q "refs/remotes/origin/$NEG_BRANCH" >/dev/null; then
+  pass "#892 --apply preserves a negative-refspec tracking ref and its worktree"
+else
+  fail "DATA LOSS: --apply pruned a negative-refspec tracking ref or removed its worktree"
+  echo "$OUT_NEG_APPLY" >&2
+fi
+
+# ── Case 30 (#892, Codex P2): upstreams use their full ref name ───────────
+# When refs/heads/origin/foo exists, Git renders foo's upstream as
+# remotes/origin/foo under %(upstream:short). The full %(upstream) value stays
+# canonical, so dry-run and apply agree that a deleted foo worktree is stale.
+UPSTREAM_ROOT="$WORKDIR/ambiguous-upstream"
+UPSTREAM_REMOTE="$UPSTREAM_ROOT/remote.git"
+UPSTREAM_MAIN="$UPSTREAM_ROOT/main"
+UPSTREAM_BRANCH='foo'
+UPSTREAM_WT="$UPSTREAM_ROOT/foo-worktree"
+mkdir -p "$UPSTREAM_ROOT"
+git init -q --bare "$UPSTREAM_REMOTE"
+git init -q "$UPSTREAM_MAIN"
+(
+  cd "$UPSTREAM_MAIN"
+  git -C "$UPSTREAM_MAIN" config user.email "test@example.com"
+  git -C "$UPSTREAM_MAIN" config user.name "Test"
+  git -C "$UPSTREAM_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$UPSTREAM_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b "$UPSTREAM_BRANCH"
+  git push -q -u origin "$UPSTREAM_BRANCH"
+  git checkout -q main
+  git branch -D "$UPSTREAM_BRANCH"
+  git branch --track "$UPSTREAM_BRANCH" "origin/$UPSTREAM_BRANCH"
+  git branch "origin/$UPSTREAM_BRANCH"
+  git worktree add -q "$UPSTREAM_WT" "$UPSTREAM_BRANCH"
+  git --git-dir="$UPSTREAM_REMOTE" branch -D "$UPSTREAM_BRANCH"
+) >/dev/null 2>&1
+set +e
+OUT_UPSTREAM_DRY=$( cd "$UPSTREAM_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_UPSTREAM_DRY=$?
+set -e
+if [ "$RC_UPSTREAM_DRY" -eq 2 ] && echo "$OUT_UPSTREAM_DRY" | grep -Fq -- "$UPSTREAM_WT"; then
+  pass "#892 dry-run finds a stale worktree when %(upstream:short) is ambiguous"
+else
+  fail "#892 ambiguous short upstream caused dry-run to omit a stale worktree"
+  echo "$OUT_UPSTREAM_DRY" >&2
+fi
+set +e
+OUT_UPSTREAM_APPLY=$( cd "$UPSTREAM_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_UPSTREAM_APPLY=$?
+set -e
+if [ "$RC_UPSTREAM_APPLY" -eq 0 ] && [ ! -d "$UPSTREAM_WT" ]; then
+  pass "#892 --apply reaches the stale worktree behind an ambiguous short upstream"
+else
+  fail "#892 ambiguous short upstream made --apply retain the stale worktree"
+  echo "$OUT_UPSTREAM_APPLY" >&2
+fi
+
+# ── Case 31 (#892, Codex P2): a branch itself may begin with plus ─────────
+PLUS_ROOT="$WORKDIR/leading-plus"
+PLUS_REMOTE="$PLUS_ROOT/remote.git"
+PLUS_MAIN="$PLUS_ROOT/main"
+PLUS_BRANCH='+foo'
+PLUS_WT="$PLUS_ROOT/plus-worktree"
+mkdir -p "$PLUS_ROOT"
+git init -q --bare "$PLUS_REMOTE"
+git init -q "$PLUS_MAIN"
+(
+  cd "$PLUS_MAIN"
+  git -C "$PLUS_MAIN" config user.email "test@example.com"
+  git -C "$PLUS_MAIN" config user.name "Test"
+  git -C "$PLUS_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$PLUS_REMOTE"
+  git push -q -u origin main
+  git branch "$PLUS_BRANCH"
+  # `git push` parses a plus in a refspec as its force marker even when the
+  # plus belongs to the branch name. Install the remote and tracking refs
+  # directly so this fixture exercises Git's legal refname, not refspec
+  # shorthand parsing.
+  PLUS_TIP=$(git rev-parse "refs/heads/$PLUS_BRANCH")
+  git --git-dir="$PLUS_REMOTE" update-ref "refs/heads/$PLUS_BRANCH" "$PLUS_TIP"
+  git update-ref "refs/remotes/origin/$PLUS_BRANCH" "$PLUS_TIP"
+  git branch --set-upstream-to="origin/$PLUS_BRANCH" "$PLUS_BRANCH"
+  git worktree add -q "$PLUS_WT" "$PLUS_BRANCH"
+  git --git-dir="$PLUS_REMOTE" branch -D "$PLUS_BRANCH"
+) >/dev/null 2>&1
+set +e
+OUT_PLUS=$( cd "$PLUS_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_PLUS=$?
+set -e
+if [ "$RC_PLUS" -eq 0 ] && [ ! -d "$PLUS_WT" ]; then
+  pass "#892 --apply preserves a leading plus in a stale branch name"
+else
+  fail "#892 branch-list marker parsing dropped a branch's leading plus"
+  echo "$OUT_PLUS" >&2
 fi
 
 echo ""

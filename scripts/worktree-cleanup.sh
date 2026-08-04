@@ -251,7 +251,7 @@ MAIN_WORKTREE=$(cd "$GIT_COMMON_DIR/.." && pwd)
 # local-only tags. Both are ordinary operator configuration this script must
 # not inherit, so the refmap is supplied explicitly (pinning the destination
 # to refs/remotes/origin/*, the exact namespace gone_branches() reads via
-# %(upstream:short)) and tag pruning/following is turned off for this one
+# the full %(upstream) ref) and tag pruning/following is turned off for this one
 # invocation. Nothing outside refs/remotes/origin/* can be deleted here.
 #
 # Preserve a safe configured source-to-destination mapping rather than replacing
@@ -268,6 +268,13 @@ if [ "$MODE" = "apply" ]; then
         refs/heads/*:refs/remotes/origin/*)
           SAFE_FETCH_REFSPECS+=("$refspec")
           ;;
+        ^refs/heads/*)
+          # Negative refspecs exclude remote heads from the positive mapping.
+          # They have no destination and are safe only alongside a safe
+          # positive mapping; dropping one can prune an intentionally retained
+          # tracking ref and its clean worktree.
+          SAFE_FETCH_REFSPECS+=("$refspec")
+          ;;
       esac
     done < <(git -C "$MAIN_WORKTREE" config --get-all remote.origin.fetch 2>/dev/null || true)
     # A remote with no safe configured mapping (for example, a mirror refspec
@@ -277,8 +284,13 @@ if [ "$MODE" = "apply" ]; then
     if [ "${#SAFE_FETCH_REFSPECS[@]}" -eq 0 ]; then
       SAFE_FETCH_REFSPECS=("+refs/heads/*:refs/remotes/origin/*")
     fi
+    # Positional refspecs do NOT override remote.origin.fetch on their own.
+    # Clear the configured refmap first: otherwise a mirror mapping such as
+    # +refs/heads/*:refs/heads/* still updates local branches while this
+    # supposedly-safe fetch runs. The positional safe mappings below are then
+    # the complete fetch/prune destination set.
     if ! git -C "$MAIN_WORKTREE" -c fetch.pruneTags=false \
-         fetch --prune --no-tags origin "${SAFE_FETCH_REFSPECS[@]}" >/dev/null 2>&1; then
+         fetch --prune --no-tags --refmap= origin "${SAFE_FETCH_REFSPECS[@]}" >/dev/null 2>&1; then
       echo "worktree-cleanup.sh: warning: \`git fetch --prune origin\` failed; gone-upstream detection may miss recently-merged branches this run" >&2
     fi
   fi
@@ -557,9 +569,13 @@ gone_branches() {
   cd "$MAIN_WORKTREE" || return 0
   LC_ALL=C git branch -vv 2>/dev/null | awk '
     {
-      # Strip leading whitespace and the current-branch marker.
+      # Strip leading whitespace and exactly ONE branch-list marker. Git uses
+      # `* ` for the current branch and `+ ` for a branch checked out in
+      # another worktree; a legal branch itself may begin with `+`, so removing
+      # every leading plus turns `+ +foo` into the nonexistent `foo`.
       line = $0
-      sub(/^[ *+]+/, "", line)
+      sub(/^[ \t]*/, "", line)
+      sub(/^[*+][ \t]+/, "", line)
       # Branch name is the first whitespace-delimited token.
       n = split(line, parts, /[ \t]+/)
       branch = parts[1]
@@ -571,14 +587,43 @@ gone_branches() {
   '
 }
 
-# Print the remote `refs/heads/...` ref that populates an upstream such as
-# `origin/stable`, using only configured mappings whose destinations stay in
+# Return success when $1 (a remote source ref) is excluded by a configured
+# negative fetch refspec. A negative refspec intentionally withholds both its
+# fetch and its prune effects, so dry-run must treat its mapping as
+# inconclusive rather than reporting a worktree that --apply will retain.
+source_is_negatively_refspec_excluded() {
+  local source="$1" refspec pattern prefix suffix
+  while IFS= read -r refspec; do
+    case "$refspec" in
+      ^refs/heads/*)
+        pattern=${refspec#^}
+        case "$pattern" in
+          *\*)
+            prefix=${pattern%%\**}
+            suffix=${pattern#*\*}
+            case "$source" in
+              "$prefix"*"$suffix") return 0 ;;
+            esac
+            ;;
+          "$source") return 0 ;;
+        esac
+        ;;
+    esac
+  done < <(git -C "$MAIN_WORKTREE" config --get-all remote.origin.fetch 2>/dev/null || true)
+  return 1
+}
+
+# Print the remote `refs/heads/...` ref that populates a full upstream ref such
+# as `refs/remotes/origin/stable`, using only configured mappings whose destinations stay in
 # `refs/remotes/origin/*`. The empty result is deliberately inconclusive: a
 # branch with no safe configured mapping is never treated as stale.
 origin_head_for_upstream() {
-  local upstream="$1" tracking_ref refspec source destination
+  local tracking_ref="$1" refspec source destination
   local dest_prefix dest_suffix source_prefix source_suffix wildcard
-  tracking_ref="refs/remotes/$upstream"
+  case "$tracking_ref" in
+    refs/remotes/origin/*) ;;
+    *) return 1 ;;
+  esac
   while IFS= read -r refspec; do
     refspec=${refspec#+}
     case "$refspec" in
@@ -597,12 +642,15 @@ origin_head_for_upstream() {
             wildcard=${wildcard%"$dest_suffix"}
             source_prefix=${source%%\**}
             source_suffix=${source#*\*}
-            printf '%s%s%s\n' "$source_prefix" "$wildcard" "$source_suffix"
+            source="$source_prefix$wildcard$source_suffix"
+            source_is_negatively_refspec_excluded "$source" && return 1
+            printf '%s\n' "$source"
             return 0
             ;;
         esac
         ;;
       "$tracking_ref")
+        source_is_negatively_refspec_excluded "$source" && return 1
         printf '%s\n' "$source"
         return 0
         ;;
@@ -656,11 +704,11 @@ stale_unpruned_branches() {
   # when a tag shares its short name. The input is already constrained to
   # refs/heads, so strip that namespace directly and retain the canonical
   # branch name for the gone/PR lookups below.
-  git for-each-ref --format='%(refname:lstrip=2)%09%(upstream:short)' refs/heads/ 2>/dev/null |
+  git for-each-ref --format='%(refname:lstrip=2)%09%(upstream)' refs/heads/ 2>/dev/null |
   while IFS=$'\t' read -r branch upstream; do
     [ -n "$branch" ] || continue
     case "$upstream" in
-      origin/*) ;;
+      refs/remotes/origin/*) ;;
       *) continue ;;
     esac
     is_gone_branch "$branch" && continue
@@ -673,37 +721,46 @@ stale_unpruned_branches() {
   rm -f "$heads_file"
 }
 
-# Parse `git worktree list --porcelain` into pipe-delimited records:
-#   PATH|BRANCH_OR_DETACHED|HEAD|LOCKED(0/1)|LOCK_REASON
+# Parse `git worktree list --porcelain -z` into NUL-delimited six-field
+# records: PATH, BRANCH_OR_DETACHED, DETACHED(0/1), HEAD, LOCKED(0/1),
+# LOCK_REASON. Git ref names may contain `|`, and worktree paths and lock
+# reasons may contain any printable delimiter, so pipe/tab records are not
+# lossless. NUL is the one byte Git path/ref data cannot carry.
 # BRANCH is the short ref name (without refs/heads/) or empty for detached;
 # DETACHED is "1" iff the entry was marked detached.
 worktree_records() {
+  local line path branch detached head locked lock_reason ref
   cd "$MAIN_WORKTREE" || return 0
-  git worktree list --porcelain 2>/dev/null | awk '
-    function flush() {
-      if (path != "") {
-        printf "%s|%s|%s|%s|%d|%s\n", path, branch, detached, head, locked, lock_reason
-      }
-      path=""; branch=""; detached="0"; head=""; locked=0; lock_reason=""
-    }
-    /^worktree / { flush(); path = substr($0, 10); next }
-    /^HEAD /     { head = substr($0, 6); next }
-    /^branch /   {
-      ref = substr($0, 8)
-      sub(/^refs\/heads\//, "", ref)
-      branch = ref
-      next
-    }
-    /^detached/  { detached = "1"; next }
-    /^locked/    {
-      locked = 1
-      if (length($0) > 6) {
-        lock_reason = substr($0, 8)
-      }
-      next
-    }
-    END { flush() }
-  '
+  path=""; branch=""; detached="0"; head=""; locked="0"; lock_reason=""
+  while IFS= read -r -d '' line; do
+    case "$line" in
+      "")
+        if [ -n "$path" ]; then
+          printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+            "$path" "$branch" "$detached" "$head" "$locked" "$lock_reason"
+        fi
+        path=""; branch=""; detached="0"; head=""; locked="0"; lock_reason=""
+        ;;
+      worktree\ *) path=${line#worktree } ;;
+      HEAD\ *) head=${line#HEAD } ;;
+      branch\ *)
+        ref=${line#branch }
+        branch=${ref#refs/heads/}
+        ;;
+      detached) detached="1" ;;
+      locked*)
+        locked="1"
+        lock_reason=${line#locked}
+        lock_reason=${lock_reason# }
+        ;;
+    esac
+  done < <(git worktree list --porcelain -z 2>/dev/null)
+  # Porcelain records normally end in a blank NUL field. Keep the flush for
+  # older Git variants that omit the final separator.
+  if [ -n "$path" ]; then
+    printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+      "$path" "$branch" "$detached" "$head" "$locked" "$lock_reason"
+  fi
 }
 
 # ── Gather state ──────────────────────────────────────────────────────
@@ -759,8 +816,16 @@ if [ "$MODE" = "dry-run" ]; then
 fi
 
 branch_checked_out() {
-  local b="$1"
-  awk -F'|' -v branch="$b" '$2 == branch { found = 1 } END { exit found ? 0 : 1 }' "$REC_FILE"
+  local b="$1" rec_path rec_branch rec_detached rec_head rec_locked rec_lock_reason
+  while IFS= read -r -d '' rec_path \
+    && IFS= read -r -d '' rec_branch \
+    && IFS= read -r -d '' rec_detached \
+    && IFS= read -r -d '' rec_head \
+    && IFS= read -r -d '' rec_locked \
+    && IFS= read -r -d '' rec_lock_reason; do
+    [ "$rec_branch" = "$b" ] && return 0
+  done <"$REC_FILE"
+  return 1
 }
 
 # ── Classify and act ──────────────────────────────────────────────────
@@ -872,7 +937,12 @@ try_remove() {
 echo "${C_BOLD}worktree-cleanup.sh${C_RESET} — mode=${MODE} main=${MAIN_WORKTREE}"
 echo ""
 
-while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_REASON; do
+while IFS= read -r -d '' WT_PATH \
+  && IFS= read -r -d '' WT_BRANCH \
+  && IFS= read -r -d '' WT_DETACHED \
+  && IFS= read -r -d '' WT_HEAD \
+  && IFS= read -r -d '' WT_LOCKED \
+  && IFS= read -r -d '' WT_LOCK_REASON; do
   [ -z "$WT_PATH" ] && continue
   # Skip the main worktree itself.
   if [ "$WT_PATH" = "$MAIN_WORKTREE" ]; then
