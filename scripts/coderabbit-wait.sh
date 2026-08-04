@@ -1349,13 +1349,44 @@ head_review_finding_bodies() {
   '
 }
 
+# BEGIN coderabbit_count_helpers
+# Length of a JSON array, or a NON-ZERO return when the input is not one.
+#
+# The counting paths below used a bare `jq 'length'` on the stated assumption
+# that a dead upstream `fetch_api_array` would make jq "fail loudly". It does
+# not, and the assumption inverted the very guarantee #837 exists to provide:
+#
+#   * `jq 'length'` on EMPTY stdin runs the filter zero times — it prints
+#     nothing and exits 0. `total` came back empty, `[ "$i" -lt "" ]` errored,
+#     and because a `while` CONDITION is exempt from errexit the loop was
+#     simply skipped and the function echoed `0` with status 0. An upstream
+#     API death therefore read as "zero blocking findings" — a silent
+#     false-clear, the exact failure #837 fixes elsewhere in this file.
+#   * A non-array JSON value is the same hazard by another route: `{}` has
+#     length 0, and a string reports its character count.
+#
+# So validate the shape and refuse to produce a count. Reported by CodeRabbit
+# (🟠 Major) on #884.
+crw_json_array_length() {
+  printf '%s' "${1:-}" \
+    | jq -e 'if type == "array" then length else error("not a JSON array") end' 2>/dev/null
+}
+
 # Count the bodies in a JSON array that classify as BLOCKING findings (#837).
-# Deliberately unguarded against an empty/malformed argument: that only happens
-# when a `fetch_api_array` upstream died inside its command substitution, and
-# jq must fail loudly there rather than let an API error read as zero findings.
+# Fails closed on an empty/malformed argument, which happens when a
+# `fetch_api_array` upstream died inside its command substitution: returning
+# non-zero makes the `$( )` callers trip `set -e` and fail loudly, rather than
+# letting an API error read as zero findings.
+#
+# Its two dependencies are `crw_body_is_blocking_finding` from the
+# coderabbit_summary_helpers block and the script's stderr `log`, so the
+# extracting test sources that block alongside this one.
 crw_count_blocking_bodies() {
   local bodies=${1:-} total count=0 body i=0
-  total=$(printf '%s' "$bodies" | jq 'length')
+  total=$(crw_json_array_length "$bodies") || {
+    log "FATAL: blocking-finding count received input that is not a JSON array — refusing to report a count (an upstream fetch almost certainly failed)"
+    return 3
+  }
   while [ "$i" -lt "$total" ]; do
     body=$(printf '%s' "$bodies" | jq -r ".[$i]")
     if crw_body_is_blocking_finding "$body"; then
@@ -1365,6 +1396,7 @@ crw_count_blocking_bodies() {
   done
   echo "$count"
 }
+# END coderabbit_count_helpers
 
 # Count unaddressed blocking inline findings in the pulls inline comment list,
 # scoped to the LATEST CodeRabbit review on the current HEAD. The naive "all
@@ -1390,7 +1422,14 @@ count_blocking_tier_issues() {
   candidates=$(head_review_finding_bodies)
 
   blocking=0
-  cand_count=$(printf '%s' "$candidates" | jq 'length')
+  # Same fail-closed shape check as crw_count_blocking_bodies. Safe on this
+  # advisory path: the single call site already wraps it in `|| true` and
+  # validates the result as numeric-or-null, so refusing here surfaces as
+  # `blocking_tier_unresolved: null` (unknown) instead of a false 0.
+  cand_count=$(crw_json_array_length "$candidates") || {
+    log "blocking-tier count received input that is not a JSON array — reporting unknown rather than a count"
+    return 3
+  }
   i=0
   while [ "$i" -lt "$cand_count" ]; do
     body=$(printf '%s' "$candidates" | jq -r ".[$i]")

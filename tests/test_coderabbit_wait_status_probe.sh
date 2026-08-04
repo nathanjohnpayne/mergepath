@@ -1697,6 +1697,57 @@ _⚠️ Potential issue_ after an inverted pair"
   fi
 }
 
+test_884_count_bodies_fails_closed_unit() {
+  # #884: the counting path must never answer "0 blocking findings" for input
+  # it could not read. The pre-fix code relied on `jq 'length'` failing loudly
+  # on a dead upstream fetch; it does not — on EMPTY stdin jq prints nothing
+  # and exits 0, the `while` condition errored (exempt from errexit), and the
+  # function echoed 0 with status 0. That is a silent false-clear of exactly
+  # the kind #837 fixes, so it is asserted directly on the pure helpers rather
+  # than through the stub harness, which cannot produce a dead fetch.
+  local snip="$WORKDIR/count-helpers.sh" bad="" out rc
+  awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  awk '/^# BEGIN coderabbit_count_helpers$/{f=1;next} /^# END coderabbit_count_helpers$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >>"$snip"
+  # The real classifier the blocking predicate grades each line with, plus the
+  # script's stderr logger, which crw_count_blocking_bodies calls on refusal.
+  # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+  . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  log() { echo "[coderabbit-wait] $*" >&2; }
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  # 1. A dead upstream fetch (empty string) must REFUSE, not report zero.
+  rc=0; out=$(crw_count_blocking_bodies "" 2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad empty-returned-success"
+  [ "$out" != "0" ] || bad="$bad empty-reported-zero"
+
+  # 2. A non-array JSON value is the same hazard by another route.
+  rc=0; out=$(crw_count_blocking_bodies '{}' 2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad object-returned-success"
+  rc=0; out=$(crw_count_blocking_bodies '"a string"' 2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad string-returned-success"
+
+  # 3. A genuinely empty array is NOT an error — it is a real zero.
+  rc=0; out=$(crw_count_blocking_bodies '[]' 2>/dev/null) || rc=$?
+  { [ "$rc" -eq 0 ] && [ "$out" = "0" ]; } || bad="$bad empty-array-not-clean-zero"
+
+  # 4. Valid arrays still count correctly: the badge-only Major of #837 counts,
+  #    ordinary prose does not.
+  rc=0
+  out=$(crw_count_blocking_bodies \
+    '["_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_","just a nitpick"]' 2>/dev/null) || rc=$?
+  { [ "$rc" -eq 0 ] && [ "$out" = "1" ]; } || bad="$bad valid-array-count=$out/rc=$rc"
+
+  if [ -z "$bad" ]; then
+    pass "#884: crw_count_blocking_bodies fails closed on unreadable input, still counts valid arrays"
+  else
+    fail "#884 count fail-closed:$bad"
+  fi
+}
+
+test_884_count_bodies_fails_closed_unit
 test_446_newer_comment_suppresses_stale_status
 test_timeout_probe_posts_once_and_surfaces_reply
 test_existing_status_probe_reply_never_clears
