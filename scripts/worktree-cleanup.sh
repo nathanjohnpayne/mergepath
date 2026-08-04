@@ -239,9 +239,25 @@ MAIN_WORKTREE=$(cd "$GIT_COMMON_DIR/.." && pwd)
 # contract); it instead reports the condition without mutating anything —
 # see stale_unpruned_branches() below. Best-effort: a missing `origin`
 # remote or a network failure here must not abort the whole run.
+#
+# "REMOTE-TRACKING refs only" is enforced, not assumed (Codex P1 on #892).
+# A bare `git fetch --prune origin` inherits whatever refspec `origin` is
+# configured with, and `--prune` deletes refs in that refspec's DESTINATION
+# namespace. Under a mirror-style `remote.origin.fetch =
+# +refs/heads/*:refs/heads/*`, the destination IS refs/heads/*, so the prune
+# deletes LOCAL BRANCHES absent from the remote — including unpushed
+# local-only work — before this script reaches a single merged-PR or
+# exact-tip safety check. `fetch.pruneTags=true` widens it again to
+# local-only tags. Both are ordinary operator configuration this script must
+# not inherit, so the refmap is supplied explicitly (pinning the destination
+# to refs/remotes/origin/*, the exact namespace gone_branches() reads via
+# %(upstream:short)) and tag pruning/following is turned off for this one
+# invocation. Nothing outside refs/remotes/origin/* can be deleted here.
 if [ "$MODE" = "apply" ]; then
   if git -C "$MAIN_WORKTREE" remote get-url origin >/dev/null 2>&1; then
-    if ! git -C "$MAIN_WORKTREE" fetch --prune origin >/dev/null 2>&1; then
+    if ! git -C "$MAIN_WORKTREE" -c fetch.pruneTags=false \
+         fetch --prune --no-tags origin \
+         '+refs/heads/*:refs/remotes/origin/*' >/dev/null 2>&1; then
       echo "worktree-cleanup.sh: warning: \`git fetch --prune origin\` failed; gone-upstream detection may miss recently-merged branches this run" >&2
     fi
   fi
@@ -541,19 +557,34 @@ gone_branches() {
 # Requires $GONE_FILE (is_gone_branch()) to already be populated, so callers
 # must invoke this AFTER `gone_branches >"$GONE_FILE"`.
 #
-# For each candidate, `git ls-remote --exit-code --heads origin
-# refs/heads/<remote-name>` is queried directly:
-#   exit 0  → the branch still exists on the remote. Not our case; skip.
-#   exit 2  → the query SUCCEEDED and found no matching ref — the remote
-#             branch is gone, confirming the local tracking ref is simply
-#             unpruned. Report it.
-#   other   → the query FAILED (no network, auth failure, no route to the
-#             remote). This is a verification failure, not evidence the
-#             branch was deleted — fail closed and do not report, mirroring
-#             gh_branch_merged_pr_status()'s unknown/none distinction.
+# ONE remote round-trip per run, not one per branch (Codex P2 on #892). The
+# remote's head refs are snapshotted with a single `git ls-remote --heads
+# origin` and every membership question is then answered locally. Querying
+# per branch made a plain dry-run an N-round-trip operation — 36 connections
+# on this repo's own checkout — which against an SSH or high-latency remote
+# turns a local audit into a minutes-long, possibly repeatedly-authenticating
+# one.
+#
+# Failure semantics, mirroring gh_branch_merged_pr_status()'s unknown/none
+# distinction:
+#   ls-remote exit 0   → the query SUCCEEDED; the printed refs are the whole
+#                        truth about the remote's heads. A branch absent from
+#                        that set is confirmed deleted → report it. Exit 0
+#                        with EMPTY output is a successful query against a
+#                        remote with no heads at all — unusual but real, and
+#                        it correctly makes every tracking branch stale.
+#   any other exit     → the query FAILED (no network, auth failure, unknown
+#                        remote). Not evidence any branch was deleted: fail
+#                        closed and report nothing.
 stale_unpruned_branches() {
   cd "$MAIN_WORKTREE" || return 0
-  local branch upstream remote_name rc
+  local snapshot snapshot_rc=0 heads_file
+  snapshot=$(git ls-remote --heads origin 2>/dev/null) || snapshot_rc=$?
+  [ "$snapshot_rc" -eq 0 ] || return 0
+  heads_file=$(mktemp "${TMPDIR:-/tmp}/wcleanup-remoteheads.XXXXXX") || return 0
+  # `<sha>\t<refname>` per line; keep the refname column only.
+  printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$heads_file"
+  local branch upstream remote_name
   git for-each-ref --format='%(refname:short)|%(upstream:short)' refs/heads/ 2>/dev/null |
   while IFS='|' read -r branch upstream; do
     [ -n "$branch" ] || continue
@@ -563,12 +594,12 @@ stale_unpruned_branches() {
     esac
     is_gone_branch "$branch" && continue
     remote_name="${upstream#origin/}"
-    rc=0
-    git ls-remote --exit-code --heads origin "refs/heads/$remote_name" >/dev/null 2>&1 || rc=$?
-    if [ "$rc" -eq 2 ]; then
-      echo "$branch"
-    fi
+    # Exact full-path match: `-Fx` so a branch named `feat` is never
+    # satisfied by the remote having `feature`.
+    grep -Fxq -- "refs/heads/$remote_name" "$heads_file" && continue
+    echo "$branch"
   done
+  rm -f "$heads_file"
 }
 
 # Parse `git worktree list --porcelain` into pipe-delimited records:
@@ -845,30 +876,45 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
     if ! is_gone_branch "$WT_BRANCH"; then
       WT_STALE_NOTE=" (remote-tracking ref is stale, not yet gone per \`git branch -vv\` — run \`git fetch --prune\` or re-run with --apply)"
     fi
-    # A PR-slug worktree must clear the comprehensive content gate before ANY
-    # removal, including this gone-upstream fast path. Without this the
-    # invariant is only half-real: rule 1 runs FIRST and `continue`s, so a
-    # `.mergepath-worktrees/pr-N-*` checkout whose upstream is already [gone]
-    # never reached worktree_content_state and `--apply` deleted uncommitted,
-    # untracked, gitignored or submodule content outright — the very loss the
-    # gate below was added to prevent (#762 r3 P1).
+    # EVERY branch-attached worktree must clear the comprehensive content gate
+    # before ANY removal, including this gone-upstream fast path. Without this
+    # the invariant is only half-real: rule 1 runs FIRST and `continue`s, so a
+    # checkout whose upstream is already [gone] never reached
+    # worktree_content_state and `--apply` deleted uncommitted, untracked,
+    # gitignored or submodule content outright — the very loss the gate was
+    # added to prevent (#762 r3 P1).
     #
-    # Scoped to PR-slug paths on purpose: those are the ones this tool's
-    # convention says it owns and may delete unattended. A non-slug
-    # gone-upstream worktree keeps its long-standing behaviour.
-    if [ -n "$pr_num" ]; then
-      wt_state=$(worktree_content_state "$WT_PATH") || true
-      if [ "$wt_state" != "clean" ] && [ "$wt_state" != "missing" ]; then
-        print_record "[PR #${pr_num} gone-upstream but working tree is ${wt_state} — review manually, keeping]" "$C_YELLOW" \
-          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
-        if [ "$wt_state" = "ignored" ]; then
-          echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first${WT_STALE_NOTE}"
-        else
-          echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first${WT_STALE_NOTE}"
-        fi
-        SUMMARY_UNCLEAN_KEPT+=("$WT_PATH ($WT_BRANCH [gone], $wt_state)")
-        continue
+    # The gate used to be scoped to PR-slug paths, on the reasoning that a
+    # non-slug gone-upstream worktree was outside what this tool claims to own.
+    # #822 invalidated that reasoning (Codex P1 on #892): before #822 a branch
+    # only became `gone` when the OPERATOR had pruned, so the tool acted on a
+    # set the operator had already curated. Now `--apply` prunes first and the
+    # tool discovers gone branches itself, so worktrees that were never
+    # eligible for unattended removal are now reached — and a free-form path
+    # (`~/GitHub/.mergepath-worktrees/spike-foo`) is exactly the shape holding
+    # a `.env` or `node_modules/` that exists nowhere else. Widening the
+    # detection without widening the gate would have made this fix a
+    # data-destroying one. The gate is cheap (one `git status`) and refuses
+    # only removals that were never provably safe.
+    wt_state=$(worktree_content_state "$WT_PATH") || true
+    if [ "$wt_state" != "clean" ] && [ "$wt_state" != "missing" ]; then
+      if [ -n "$pr_num" ]; then
+        wt_gate_label="PR #${pr_num} gone-upstream"
+      else
+        wt_gate_label="gone-upstream"
       fi
+      print_record "[${wt_gate_label} but working tree is ${wt_state} — review manually, keeping]" "$C_YELLOW" \
+        "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
+      if [ "$wt_state" = "ignored" ]; then
+        echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first${WT_STALE_NOTE}"
+      else
+        echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first${WT_STALE_NOTE}"
+      fi
+      SUMMARY_UNCLEAN_KEPT+=("$WT_PATH ($WT_BRANCH [gone], $wt_state)")
+      if [ -n "$WT_STALE_NOTE" ]; then
+        SUMMARY_STALE_UNPRUNED+=("$WT_BRANCH")
+      fi
+      continue
     fi
     if [ "$WT_LOCKED" = "1" ]; then
       print_record "[LOCKED gone-upstream]" "$C_YELLOW" \
@@ -1247,7 +1293,23 @@ printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
 # (merged branches / gone kept / merged+extra / gone unverified) by its
 # actual merged-PR status — this counter exists so the unpruned-ref CLASS
 # itself is never invisible, even though it is not a distinct disposition.
-printf "  gone (stale remote ref, unpruned): %d\n" "${#SUMMARY_STALE_UNPRUNED[@]}"
+#
+# Counted by DISTINCT BRANCH, not by append (Codex P2 on #892). One branch
+# can legitimately reach two appenders: the worktree classification records
+# it, and the merged-branch sweep — which runs over every stale-unpruned
+# branch regardless of whether a worktree is attached — records it again. The
+# raw array length therefore reported three for two branches in exactly the
+# worktree case this PR added. The array is kept as-is so each append site
+# stays a plain, order-independent statement; the de-duplication happens once,
+# here, where the CLASS (not the appends) is what is being reported.
+stale_unpruned_distinct_count() {
+  if [ "${#SUMMARY_STALE_UNPRUNED[@]}" -eq 0 ]; then
+    echo 0
+    return 0
+  fi
+  printf '%s\n' "${SUMMARY_STALE_UNPRUNED[@]}" | sort -u | wc -l | tr -d '[:space:]'
+}
+printf "  gone (stale remote ref, unpruned): %s\n" "$(stale_unpruned_distinct_count)"
 printf "  open-PR retained: %d\n" "${#SUMMARY_OPEN_PR[@]}"
 printf "  orphan dirs:      %d\n" "${#SUMMARY_ORPHAN[@]}"
 

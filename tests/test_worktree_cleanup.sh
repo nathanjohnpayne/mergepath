@@ -695,9 +695,32 @@ if git branch -vv | grep -F -- "$STALE_WT_BRANCH" | grep -q ': gone\]'; then
 fi
 # Sanity-check the ignored-content premise (mirrors case 17): plain
 # --porcelain must be silent, otherwise the fixture proves nothing about
-# gitignored content surviving a provably-safe removal.
+# gitignored content surviving a removal this helper must refuse.
 if [ -n "$(git -C "$STALE_WT" status --porcelain)" ]; then
   fail "fixture setup: expected plain --porcelain to be EMPTY for the ignored-only stale-unpruned worktree"
+fi
+
+# ── Case 22b (#892, Codex r1 P1): the CLEAN counterpart ────────────────
+# Case 22 above proves the content gate refuses to remove a stale-unpruned
+# worktree holding content that exists nowhere else. That alone cannot prove
+# dry-run and --apply AGREE, because both would also "agree" if the helper
+# had simply stopped removing stale-unpruned worktrees entirely. This
+# fixture is the removal-direction half: same stale-unpruned shape, nothing
+# in the working tree, so the gate passes and both modes must classify it
+# [STALE gone-upstream] and --apply must remove it. Same deleted-in-the-bare-
+# repo, never-pruned constraint as cases 21 and 22.
+STALE_WT_CLEAN_BRANCH="stale-unpruned-clean-worktree-branch"
+git branch "$STALE_WT_CLEAN_BRANCH"
+git push -q -u origin "$STALE_WT_CLEAN_BRANCH"
+STALE_WT_CLEAN="$WORKDIR/stale-unpruned-wt-clean"
+git worktree add -q "$STALE_WT_CLEAN" "$STALE_WT_CLEAN_BRANCH"
+git --git-dir="$REMOTE" branch -D "$STALE_WT_CLEAN_BRANCH"
+# Deliberately NO `git fetch --prune` here either.
+if git branch -vv | grep -F -- "$STALE_WT_CLEAN_BRANCH" | grep -q ': gone\]'; then
+  fail "fixture setup: expected $STALE_WT_CLEAN_BRANCH to NOT be marked gone yet"
+fi
+if [ -n "$(git -C "$STALE_WT_CLEAN" status --porcelain --ignored --untracked-files=all --ignore-submodules=none)" ]; then
+  fail "fixture setup: expected the clean stale-unpruned worktree to report NOTHING at all"
 fi
 
 # ── gh stub on PATH ───────────────────────────────────────────────────
@@ -1212,6 +1235,21 @@ else
   fail "#822 summary stale-unpruned count missing/zero"
   show_out_on_fail
 fi
+# The counter counts DISTINCT BRANCHES, not appends (Codex r1 P2 on #892).
+# Exactly three fixture branches are stale-unpruned: the bare local branch
+# (case 21), the worktree-attached one (case 22) and its clean counterpart
+# (case 22b). Two of those reach two appenders each — once during worktree
+# classification and again in the merged-branch sweep, which runs over the
+# whole stale-unpruned set regardless of any attached worktree — so a raw
+# array length reports five. An inequality assertion cannot see that; only
+# the exact value can.
+STALE_UNPRUNED_N=$(echo "$OUT" | sed -n 's/.*gone (stale remote ref, unpruned): *\([0-9][0-9]*\).*/\1/p' | head -1)
+if [ "${STALE_UNPRUNED_N:-0}" -eq 3 ]; then
+  pass "#892 stale-unpruned counter reports 3 distinct branches (no double-count)"
+else
+  fail "#892 stale-unpruned counter is ${STALE_UNPRUNED_N:-unset}, expected 3 distinct branches"
+  show_out_on_fail
+fi
 # Read-only contract: dry-run must perform NO ref mutation. The remote-
 # tracking ref for this branch must still be present after the dry-run
 # above (an actual `git fetch --prune` would have removed it).
@@ -1230,11 +1268,29 @@ else
   fail "#892 stale-unpruned worktree missing from dry-run output entirely (silent-omission regression)"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -q "STALE gone-upstream" \
-   && echo "$OUT" | grep -q -- "$STALE_WT"; then
-  pass "#892 stale-unpruned worktree classified as STALE gone-upstream"
+# Correlating a record's LABEL with its PATH matters here, because two
+# fixtures differ only in content and one path is a prefix of the other
+# ("...-wt" vs "...-wt-clean") — a substring grep would satisfy either
+# assertion from the other's record. print_record emits the label, then
+# "    path:     <path>" on the next line, so pair them exactly.
+record_label() {
+  awk -v want="$1" '
+    index($0, "    path:     ") == 1 {
+      if (substr($0, 15) == want) print prev
+    }
+    { prev = $0 }
+  '
+}
+
+# It carries only gitignored content, so the content gate must classify it
+# "review manually, keeping" — NOT as a removable [STALE gone-upstream]. The
+# gate applies to every branch-attached worktree, not only PR-slug paths,
+# precisely because #822's `fetch --prune` is what made a free-form checkout
+# like this one reachable at all (Codex r1 P1 on #892).
+if echo "$OUT" | record_label "$STALE_WT" | grep -q "gone-upstream but working tree is ignored"; then
+  pass "#892 stale-unpruned worktree with gitignored content is gated, not marked removable"
 else
-  fail "#892 stale-unpruned worktree not classified as STALE gone-upstream"
+  fail "#892 stale-unpruned worktree with gitignored content was not routed through the content gate"
   show_out_on_fail
 fi
 if echo "$OUT" | grep -q -- "$STALE_WT_BRANCH" \
@@ -1242,6 +1298,20 @@ if echo "$OUT" | grep -q -- "$STALE_WT_BRANCH" \
   pass "#892 dry-run explains the stale-remote-tracking-ref reason for the worktree"
 else
   fail "#892 no stale-remote-tracking-ref reason line found for the worktree"
+  show_out_on_fail
+fi
+# Case 22b: the clean counterpart clears the gate, so it IS classified
+# removable — the removal-direction half of dry-run/--apply agreement.
+if echo "$OUT" | grep -q -- "$STALE_WT_CLEAN"; then
+  pass "#892 clean stale-unpruned worktree is reported in dry-run (never silently omitted)"
+else
+  fail "#892 clean stale-unpruned worktree missing from dry-run output entirely"
+  show_out_on_fail
+fi
+if echo "$OUT" | record_label "$STALE_WT_CLEAN" | grep -q "STALE gone-upstream"; then
+  pass "#892 clean stale-unpruned worktree classified as STALE gone-upstream"
+else
+  fail "#892 clean stale-unpruned worktree not classified as STALE gone-upstream"
   show_out_on_fail
 fi
 # Read-only contract: dry-run must perform NO ref mutation for this branch
@@ -1339,20 +1409,27 @@ else
   pass "#822 stale-unpruned merged branch deleted by --apply (fetch --prune fixed the gone detection)"
 fi
 
-# Case 22 (#892): --apply's leading `git fetch --prune origin` makes the
-# worktree's branch genuinely `gone`, so the worktree is removed exactly as
-# a plain gone-upstream worktree would be (case 2) — dry-run and --apply
-# must agree on this, which is the whole point of the fix.
-if echo "$OUT3" | grep -q -- "$STALE_WT"; then
-  fail "#892 stale-unpruned worktree still present after --apply"
+# Case 22 (#892): --apply's leading prune makes the worktree's branch
+# genuinely `gone`, so --apply reaches exactly the same classification
+# dry-run showed — and for THIS worktree that classification is "keeping",
+# because the content gate refuses to delete the gitignored canary. Both
+# modes agreeing on "keeping" is the point; the pre-fix code had dry-run
+# silent and --apply destructive.
+if [ -d "$STALE_WT" ] && [ -f "$STALE_WT_CANARY" ] \
+   && grep -q "SECRET=nowhere-else" "$STALE_WT_CANARY"; then
+  pass "#892 stale-unpruned worktree with gitignored content retained by --apply (canary intact)"
+else
+  fail "DATA LOSS: --apply deleted the gitignored canary in the stale-unpruned worktree $STALE_WT"
+  echo "$OUT3" >&2
+fi
+# Case 22b (#892): the clean counterpart has nothing to protect, so the gate
+# passes and --apply removes it — dry-run said [STALE gone-upstream] and
+# --apply acts on it. This is the removal-direction agreement.
+if [ -d "$STALE_WT_CLEAN" ] || echo "$OUT3" | grep -q -- "$STALE_WT_CLEAN"; then
+  fail "#892 clean stale-unpruned worktree survived --apply (dry-run/--apply disagree)"
   echo "$OUT3" >&2
 else
-  pass "#892 stale-unpruned worktree removed by --apply (dry-run/--apply now agree)"
-fi
-if [ -d "$STALE_WT" ]; then
-  fail "#892 stale-unpruned worktree directory still exists after --apply"
-else
-  pass "#892 stale-unpruned worktree directory removed by --apply"
+  pass "#892 clean stale-unpruned worktree removed by --apply (dry-run/--apply agree)"
 fi
 if echo "$OUT3" | grep -q -- "$PR_WT"; then
   fail "detached closed-PR worktree still present after --apply"
@@ -1486,11 +1563,14 @@ fi
 # total_candidates accounting read SUMMARY_UNCLEAN_KEPT, so the record was
 # printed but the audit exited as if nothing needed a human (Phase 4b P1).
 UNCLEAN_N=$(echo "$OUT3" | sed -n 's/.*unclean PR worktrees (review): *\([0-9][0-9]*\).*/\1/p' | head -1)
-EXPECTED_UNCLEAN=$((7 + SUB_OK))
+# Eight, not seven, since #892 extended the content gate past PR-slug paths:
+# the free-form stale-unpruned worktree (case 22) is now gated and therefore
+# counted rather than silently removed.
+EXPECTED_UNCLEAN=$((8 + SUB_OK))
 if [ "${UNCLEAN_N:-0}" -eq "$EXPECTED_UNCLEAN" ]; then
-  pass "retained gone-upstream PR-slug worktree is counted in the unclean bucket"
+  pass "retained gone-upstream worktrees are counted in the unclean bucket"
 else
-  fail "unclean-bucket count is ${UNCLEAN_N:-unset}, expected $EXPECTED_UNCLEAN (seven required retained-unclean fixtures plus the optional submodule index-flag fixture when available) — a retained worktree is landing in an uncounted bucket"
+  fail "unclean-bucket count is ${UNCLEAN_N:-unset}, expected $EXPECTED_UNCLEAN (eight required retained-unclean fixtures plus the optional submodule index-flag fixture when available) — a retained worktree is landing in an uncounted bucket"
   echo "$OUT3" | grep -E "unclean PR worktrees" >&2
 fi
 if [ -f "$GONE_PR_CANARY" ] && grep -q "nowhere else" "$GONE_PR_CANARY"; then
@@ -1764,6 +1844,9 @@ git worktree unlock "$SUB_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$SUB_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$SUBMOD_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNKNOWN_PR_WT" >/dev/null 2>&1 || true
+# #892: the free-form stale-unpruned worktree is retained by the widened
+# content gate, so it too is a human decision the audit keeps flagging.
+git worktree remove --force "$STALE_WT" >/dev/null 2>&1 || true
 set +e
 OUT6=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1)
 RC6=$?
@@ -1840,6 +1923,83 @@ fi
 # Clean up the test symlink + external dir.
 rm -f "$MAIN/.claude/worktrees/agent-symlink-escape"
 rm -rf "$EXT_DIR"
+
+# ── Case 23 (#892, Codex r1 P1): prune scope is pinned, not inherited ──
+# #822 gave --apply a `git fetch --prune origin`. `--prune` deletes refs in
+# the DESTINATION namespace of the refspec it is given, and a bare
+# `fetch --prune origin` inherits `remote.origin.fetch`. Under a
+# mirror-style `+refs/heads/*:refs/heads/*` that destination is refs/heads/*,
+# so the prune deletes LOCAL BRANCHES the remote does not have — including
+# never-pushed work — before any merged-PR or exact-tip check runs.
+# `fetch.pruneTags=true` extends the same reach to local-only tags. Neither
+# is exotic configuration, and neither is this helper's to inherit.
+#
+# Deliberately a self-contained repo rather than a case bolted onto the main
+# fixture: the whole point is a NON-default remote.origin.fetch, and setting
+# that on the shared clone would silently change every case above it.
+MIRROR_ROOT="$WORKDIR/mirror-refspec"
+MIRROR_REMOTE="$MIRROR_ROOT/remote.git"
+MIRROR_MAIN="$MIRROR_ROOT/main"
+mkdir -p "$MIRROR_ROOT"
+git init -q --bare "$MIRROR_REMOTE"
+git init -q "$MIRROR_MAIN"
+(
+  cd "$MIRROR_MAIN"
+  git config user.email "test@example.com"
+  git config user.name "Test"
+  git config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$MIRROR_REMOTE"
+  git push -q -u origin main
+  # The two configurations under test, both perfectly legal.
+  git config remote.origin.fetch '+refs/heads/*:refs/heads/*'
+  git config fetch.pruneTags true
+  # Never-pushed work: two local branches and a local tag the remote has
+  # never seen. An inherited prune deletes all three.
+  git branch --no-track local-only
+  git branch --no-track work
+  git tag local-only-tag
+  # HEAD must sit on a branch the remote does NOT have, or git refuses the
+  # whole fetch ("refusing to fetch into branch 'refs/heads/main' checked out
+  # at ...") and the prune never runs — which would make this case vacuous.
+  # Measured on git 2.50.1: with HEAD on `work`, the inherited refspec prunes
+  # `other-local`, `work` (the CHECKED-OUT branch) and `local-only-tag`, and
+  # exits 0.
+  git checkout -q work
+  # Force the remote-tracking ref to be absent so the "still populates
+  # refs/remotes/origin/*" assertion below proves the helper's own fetch ran,
+  # not the `push -u` above.
+  git update-ref -d refs/remotes/origin/main
+) >/dev/null 2>&1
+
+set +e
+OUT_MIRROR=$( cd "$MIRROR_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+set -e
+
+if git -C "$MIRROR_MAIN" rev-parse --verify -q refs/heads/local-only >/dev/null \
+   && git -C "$MIRROR_MAIN" rev-parse --verify -q refs/heads/work >/dev/null; then
+  pass "#892 --apply's prune did not delete never-pushed local branches under a mirror-style refspec"
+else
+  fail "DATA LOSS: --apply's fetch --prune deleted local branches (inherited refs/heads/* destination)"
+  echo "$OUT_MIRROR" >&2
+fi
+if git -C "$MIRROR_MAIN" rev-parse --verify -q refs/tags/local-only-tag >/dev/null; then
+  pass "#892 --apply's prune did not delete a local-only tag under fetch.pruneTags=true"
+else
+  fail "DATA LOSS: --apply's fetch --prune deleted local tag 'local-only-tag' (inherited fetch.pruneTags)"
+  echo "$OUT_MIRROR" >&2
+fi
+# The pinned refmap must still do its actual job: refs/remotes/origin/main
+# is what gone-detection reads, so the fetch has to have populated it.
+if git -C "$MIRROR_MAIN" rev-parse --verify -q refs/remotes/origin/main >/dev/null; then
+  pass "#892 pinned refmap still populates refs/remotes/origin/* (prune scope narrowed, not disabled)"
+else
+  fail "#892 pinned refmap did not populate refs/remotes/origin/main — gone-detection has no input"
+  echo "$OUT_MIRROR" >&2
+fi
 
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
