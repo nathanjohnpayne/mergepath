@@ -91,7 +91,8 @@ case "${1:-}" in
     case "${FAKE_MODE:-success}" in
       success)
         cat <<'JSON'
-{"check_runs":[{"name":"Label Gate","status":"completed","conclusion":"failure","started_at":"2026-08-04T00:00:00Z"},{"name":"Label Gate","status":"completed","conclusion":"success","started_at":"2026-08-04T00:01:00Z"},{"name":"Other","status":"completed","conclusion":"failure","started_at":"2026-08-04T00:02:00Z"}]}
+{"check_runs":[{"name":"Label Gate","status":"completed","conclusion":"success","started_at":"2026-08-04T00:01:00Z"},{"name":"Other","status":"completed","conclusion":"failure","started_at":"2026-08-04T00:02:00Z"}]}
+{"check_runs":[{"name":"Label Gate","status":"completed","conclusion":"failure","started_at":"2026-08-04T00:00:00Z"}]}
 JSON
         ;;
       absent)

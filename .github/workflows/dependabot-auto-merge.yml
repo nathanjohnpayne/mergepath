@@ -140,7 +140,7 @@ jobs:
           latest_check_run() {
             gh api --paginate -X GET "repos/${GITHUB_REPOSITORY}/commits/$2/check-runs" \
               -f check_name="$1" -F per_page=100 \
-              | jq -c --arg check "$1" '[.check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty'
+              | jq -sc --arg check "$1" '[.[] | .check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty'
           }
 
           # NOTE (unfixed here, deliberately): the `lint` default is a
