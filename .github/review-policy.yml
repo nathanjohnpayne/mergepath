@@ -148,8 +148,14 @@ feedback_policy:
 #   2. Read BOTH API endpoints:
 #      - gh api repos/{owner}/{repo}/issues/{pr}/comments  (PR-level summary)
 #      - gh api repos/{owner}/{repo}/pulls/{pr}/comments    (inline diff comments)
-#   3. Grep inline comments for "Potential issue" or "⚠️" — every flagged
-#      finding must be explicitly addressed (fixed or dismissed with reasoning).
+#   3. Grade inline comments with the shared `coderabbit_tier_of` ladder
+#      (scripts/lib/feedback-policy-helpers.sh) rather than grepping for the
+#      literal "Potential issue" / "⚠️": a current Major renders as the badge
+#      prefix "_🟠 Major_" with the machine tag
+#      "cr-indicator-types:potential_issue" and contains neither string, so the
+#      literal grep returned zero and the wait reported cleared on a blocking
+#      finding (#835, fixed in #837). Every p0/p1 finding must be explicitly
+#      addressed (fixed or dismissed with reasoning).
 #
 # To reverse: set enabled: false, delete .coderabbit.yml, uninstall the
 # CodeRabbit GitHub App. All agent instructions use conditional language
