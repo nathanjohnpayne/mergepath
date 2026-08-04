@@ -1364,12 +1364,26 @@ head_review_finding_bodies() {
 #     false-clear, the exact failure #837 fixes elsewhere in this file.
 #   * A non-array JSON value is the same hazard by another route: `{}` has
 #     length 0, and a string reports its character count.
+#   * A multi-VALUE stream is a third route, and the one a per-value filter
+#     cannot see: `[] []` makes jq run the filter twice and print `0\n0`,
+#     which is not an integer, so `[ "$i" -lt "0\n0" ]` errors and the loop is
+#     skipped exactly as in the empty case.
 #
-# So validate the shape and refuse to produce a count. Reported by CodeRabbit
-# (🟠 Major) on #884.
+# `-s` (slurp) collapses the whole stream into ONE array, which turns all
+# three routes into a single assertion: the stream must hold exactly one
+# value, and that value must be an array. Empty slurps to `[]` (length 0),
+# multi-value to length > 1, and a non-array to a length-1 stream whose sole
+# element fails the type test — every one of them an error, never a count.
+#
+# Reported by CodeRabbit (🟠 Major) on #884; the multi-value route was a
+# second 🟠 Major against the first version of this guard.
 crw_json_array_length() {
   printf '%s' "${1:-}" \
-    | jq -e 'if type == "array" then length else error("not a JSON array") end' 2>/dev/null
+    | jq -s -e '
+        if ((length == 1) and (.[0] | type == "array"))
+        then (.[0] | length)
+        else error("expected exactly one JSON array")
+        end' 2>/dev/null
 }
 
 # Count the bodies in a JSON array that classify as BLOCKING findings (#837).

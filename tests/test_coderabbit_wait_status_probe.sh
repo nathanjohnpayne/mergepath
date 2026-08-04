@@ -1729,11 +1729,20 @@ test_884_count_bodies_fails_closed_unit() {
   rc=0; out=$(crw_count_blocking_bodies '"a string"' 2>/dev/null) || rc=$?
   [ "$rc" -ne 0 ] || bad="$bad string-returned-success"
 
-  # 3. A genuinely empty array is NOT an error — it is a real zero.
+  # 3. A multi-VALUE stream is the route a per-value filter cannot see: `[] []`
+  #    printed `0\n0`, which is not an integer, so the `while` condition
+  #    errored and the loop was skipped exactly as in the empty case.
+  rc=0; out=$(crw_count_blocking_bodies '[] []' 2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad multivalue-returned-success"
+  [ "$out" != "0" ] || bad="$bad multivalue-reported-zero"
+  rc=0; out=$(crw_count_blocking_bodies 'null' 2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad null-returned-success"
+
+  # 4. A genuinely empty array is NOT an error — it is a real zero.
   rc=0; out=$(crw_count_blocking_bodies '[]' 2>/dev/null) || rc=$?
   { [ "$rc" -eq 0 ] && [ "$out" = "0" ]; } || bad="$bad empty-array-not-clean-zero"
 
-  # 4. Valid arrays still count correctly: the badge-only Major of #837 counts,
+  # 5. Valid arrays still count correctly: the badge-only Major of #837 counts,
   #    ordinary prose does not.
   rc=0
   out=$(crw_count_blocking_bodies \
