@@ -148,7 +148,10 @@
 #       # submitted_at — the same instant created_at carries on that
 #       # endpoint, named explicitly so the Phase 4b barrier's temporal
 #       # conjunct (probe.context_updated_at at-or-after this) reads a
-#       # field whose meaning cannot drift with the endpoint.
+#       # field whose meaning cannot drift with the endpoint. The object is
+#       # the newest head-pinned review RUN, never a body-less review object
+#       # created for a conversational thread reply (#900) — a reply refreshes
+#       # no status, so anchoring the conjunct on one made it unsatisfiable.
 #       "submitted_at": "<iso-8601>",
 #       "body_excerpt": "<first 200 chars>"
 #     },
@@ -2315,6 +2318,60 @@ emit_status_context_verdict() {
   emit_json_and_exit "cleared" 0 "$synthetic" 0
 }
 
+# BEGIN coderabbit_review_run_selector
+# Select the newest HEAD-pinned CodeRabbit review object that is an actual
+# review RUN. This object is the rc-7 evidence the Phase 4b barrier reads, and
+# its `submitted_at` is the anchor that barrier's temporal conjunct
+# (`probe.context_updated_at >= review.submitted_at`) compares the per-SHA
+# StatusContext refresh against.
+#
+# Pure: jq over the passed strings only, no globals and no I/O — extracted by
+# sentinel and sourced directly by tests/test_coderabbit_wait_status_probe.sh,
+# the same pattern as the coderabbit_summary_helpers block above. It makes no
+# API read, so it does not re-introduce the swallowed-`die 3` hazard that keeps
+# the two fetches in probe_emit_verdict inline; a jq failure here is this
+# function's own nonzero status and reaches the caller's `|| die 3`.
+#
+# #900: the `reviews` endpoint carries two KINDS of coderabbitai[bot] object on
+# one head, and only one of them is a run. CodeRabbit also creates a review
+# object for a CONVERSATIONAL REPLY on a review thread — its answer to a
+# rebuttal, or to the `[mergepath-resolve:<class>]` tag reply
+# scripts/resolve-pr-threads.sh posts to clear the pre-merge conversation gate.
+# A reply starts no run, so no further StatusContext is ever published for that
+# head: taking a reply as the anchor makes the temporal conjunct false forever,
+# and a provider that has demonstrably finished reads as not-yet until the
+# retry budget escalates. Because the review-loop rules require replying on
+# every finding thread, clearing the conversation gate re-armed the wedge on
+# every PR CodeRabbit had raised a thread on.
+#
+# Measured on #889, head `2433fe99`: five objects — two runs carrying 1787- and
+# 1722-character summary bodies, each followed by a `success` status one second
+# later, and three replies carrying an empty body and no status. A NON-EMPTY
+# body separated all five, so that is the discriminator: a run always publishes
+# its `Actionable comments posted: N` / walkthrough summary body, while a
+# reply's review-level body is `""`.
+#
+# The discriminator belongs here, at selection, rather than at the barrier: the
+# barrier needs the newest RUN's timestamp, and a filter applied downstream
+# could only reject the reply, not recover the run underneath it.
+#
+# Fail-closed posture is unchanged. With no body-bearing object this emits
+# nothing, the rc-7 payload carries no `review`, and the barrier stays on its
+# bounded not-yet wait.
+#
+# crw_select_head_pinned_review_run <reviews-json> <bot-login> <head-sha>
+crw_select_head_pinned_review_run() {
+  printf '%s' "${1:-}" | jq -c --arg bot "${2:-}" --arg sha "${3:-}" '
+    [ .[] | select(.user.login == $bot) | select(.commit_id == $sha)
+      | select(((.body // "") | length) > 0) ]
+    | sort_by(.submitted_at) | last
+    | if . == null then empty
+      else {id, created_at: .submitted_at, submitted_at, endpoint: "reviews",
+            body_excerpt: ((.body // "")[0:200])} end
+  '
+}
+# END coderabbit_review_run_selector
+
 # --- probe verdict (#814) ---------------------------------------------------
 #
 # Probe mode answers ONE question and never enters the poll loop:
@@ -2401,13 +2458,14 @@ probe_emit_verdict() {
   # explicitly so the Phase 4b barrier's temporal conjunct
   # (probe.context_updated_at at-or-after the object) reads a field whose
   # meaning cannot drift with the endpoint.
-  review=$(printf '%s' "$reviews" | jq -c --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
-    [ .[] | select(.user.login == $bot) | select(.commit_id == $sha) ]
-    | sort_by(.submitted_at) | last
-    | if . == null then empty
-      else {id, created_at: .submitted_at, submitted_at, endpoint: "reviews",
-            body_excerpt: ((.body // "")[0:200])} end
-  ') || die 3 "failed to select the HEAD-pinned review"
+  #
+  # Body-less conversational replies are excluded at selection (#900) — see
+  # crw_select_head_pinned_review_run above. `review_at` below therefore
+  # anchors the summary scan on the newest RUN rather than on whatever object
+  # is newest, which is also the anchor that scan always meant: a run's
+  # summary follows the run, and a reply landing after it never carried one.
+  review=$(crw_select_head_pinned_review_run "$reviews" "$BOT_LOGIN" "$HEAD_SHA") \
+    || die 3 "failed to select the HEAD-pinned review"
 
   if [ -n "$review" ]; then
     review_at=$(printf '%s' "$review" | jq -r '.created_at // empty')
