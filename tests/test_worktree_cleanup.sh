@@ -1945,9 +1945,9 @@ git init -q --bare "$MIRROR_REMOTE"
 git init -q "$MIRROR_MAIN"
 (
   cd "$MIRROR_MAIN"
-  git config user.email "test@example.com"
-  git config user.name "Test"
-  git config commit.gpgsign false
+  git -C "$MIRROR_MAIN" config user.email "test@example.com"
+  git -C "$MIRROR_MAIN" config user.name "Test"
+  git -C "$MIRROR_MAIN" config commit.gpgsign false
   git checkout -q -b main
   echo seed > seed.txt
   git add seed.txt
@@ -2017,9 +2017,9 @@ git init -q --bare "$MAPPED_REMOTE"
 git init -q "$MAPPED_MAIN"
 (
   cd "$MAPPED_MAIN"
-  git config user.email "test@example.com"
-  git config user.name "Test"
-  git config commit.gpgsign false
+  git -C "$MAPPED_MAIN" config user.email "test@example.com"
+  git -C "$MAPPED_MAIN" config user.name "Test"
+  git -C "$MAPPED_MAIN" config commit.gpgsign false
   git checkout -q -b main
   echo seed > seed.txt
   git add seed.txt
@@ -2073,9 +2073,9 @@ git init -q --bare "$PIPE_REMOTE"
 git init -q "$PIPE_MAIN"
 (
   cd "$PIPE_MAIN"
-  git config user.email "test@example.com"
-  git config user.name "Test"
-  git config commit.gpgsign false
+  git -C "$PIPE_MAIN" config user.email "test@example.com"
+  git -C "$PIPE_MAIN" config user.name "Test"
+  git -C "$PIPE_MAIN" config commit.gpgsign false
   git checkout -q -b main
   echo seed > seed.txt
   git add seed.txt
@@ -2098,7 +2098,76 @@ else
   echo "$OUT_PIPE" >&2
 fi
 
-# ── Case 26 (#892, Codex P2): apply-side parser pins English locale ────
+# ── Case 26 (#892, Codex P1): branch/tag name collisions stay fail-safe ─
+# A tag and a branch may share a short name. Git resolves a bare revision
+# name through its disambiguation rules, where the tag can win. The cleanup
+# decision must instead compare the merged PR head to refs/heads/<name>, or a
+# local follow-up commit on the branch can be mistaken for the tag's old,
+# merged tip and deleted by --apply.
+COLLIDE_ROOT="$WORKDIR/branch-tag-collision"
+COLLIDE_REMOTE="$COLLIDE_ROOT/remote.git"
+COLLIDE_MAIN="$COLLIDE_ROOT/main"
+COLLIDE_BRANCH='same-short-name'
+COLLIDE_STUB="$COLLIDE_ROOT/stub-bin"
+mkdir -p "$COLLIDE_ROOT" "$COLLIDE_STUB"
+git init -q --bare "$COLLIDE_REMOTE"
+git init -q "$COLLIDE_MAIN"
+(
+  cd "$COLLIDE_MAIN"
+  git -C "$COLLIDE_MAIN" config user.email "test@example.com"
+  git -C "$COLLIDE_MAIN" config user.name "Test"
+  git -C "$COLLIDE_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$COLLIDE_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b "$COLLIDE_BRANCH"
+  git push -q -u origin "$COLLIDE_BRANCH"
+  # Both refs point at the simulated merged PR head before the branch gains
+  # an unpushed follow-up commit.
+  git tag "$COLLIDE_BRANCH"
+  echo follow-up > follow-up.txt
+  git add follow-up.txt
+  git commit -q -m "local follow-up after PR merge"
+  git checkout -q main
+  git push -q origin --delete "$COLLIDE_BRANCH"
+) >/dev/null 2>&1
+COLLIDE_MERGED_TIP=$(git -C "$COLLIDE_MAIN" rev-parse "refs/heads/$COLLIDE_BRANCH^")
+cat >"$COLLIDE_STUB/gh" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
+  head=""
+  while [ "\$#" -gt 0 ]; do
+    case "\$1" in
+      --head) head="\$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  if [ "\$head" = "$COLLIDE_BRANCH" ]; then
+    echo "$COLLIDE_MERGED_TIP"
+    exit 0
+  fi
+fi
+exec "$STUB_DIR/gh" "\$@"
+EOF
+chmod +x "$COLLIDE_STUB/gh"
+
+set +e
+OUT_COLLIDE=$( cd "$COLLIDE_MAIN" && PATH="$COLLIDE_STUB:$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_COLLIDE=$?
+set -e
+if [ "$RC_COLLIDE" -eq 0 ] \
+   && git -C "$COLLIDE_MAIN" rev-parse --verify -q "refs/heads/$COLLIDE_BRANCH" >/dev/null \
+   && echo "$OUT_COLLIDE" | grep -Fq -- "local tip has unmerged commit(s) on top"; then
+  pass "#892 --apply preserves a diverged branch when a tag has the same short name"
+else
+  fail "DATA LOSS: a branch/tag short-name collision made --apply delete local follow-up work"
+  echo "$OUT_COLLIDE" >&2
+fi
+
+# ── Case 27 (#892, Codex P2): apply-side parser pins English locale ────
 # Model a localized `git branch -vv` by translating its human-facing gone
 # marker only when LC_ALL is absent. The helper must pin LC_ALL=C for this
 # parser so --apply reaches the same gone branch it would see in an English
@@ -2114,9 +2183,9 @@ git init -q --bare "$LOCALE_REMOTE"
 git init -q "$LOCALE_MAIN"
 (
   cd "$LOCALE_MAIN"
-  git config user.email "test@example.com"
-  git config user.name "Test"
-  git config commit.gpgsign false
+  git -C "$LOCALE_MAIN" config user.email "test@example.com"
+  git -C "$LOCALE_MAIN" config user.name "Test"
+  git -C "$LOCALE_MAIN" config commit.gpgsign false
   git checkout -q -b main
   echo seed > seed.txt
   git add seed.txt

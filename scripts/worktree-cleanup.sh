@@ -514,7 +514,11 @@ gh_branch_merged_pr_status() {
     echo "unknown"
     return 1
   fi
-  tip=$(git -C "$MAIN_WORKTREE" rev-parse "$branch" 2>/dev/null) || { echo "unknown"; return 1; }
+  # A local tag may legally share this branch's short name. Resolve the
+  # branch ref explicitly: a bare revision name can prefer the tag, which
+  # would make an unmerged commit on the branch look like the merged tag tip
+  # and permit a destructive `git branch -D`.
+  tip=$(git -C "$MAIN_WORKTREE" rev-parse --verify "refs/heads/$branch" 2>/dev/null) || { echo "unknown"; return 1; }
   merged_heads=$(cd "$MAIN_WORKTREE" && gh pr list --head "$branch" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null) || { echo "unknown"; return 1; }
   # Successful lookup, no merged PR for this head name → not safe to delete.
   if [ -z "$merged_heads" ]; then
@@ -648,7 +652,11 @@ stale_unpruned_branches() {
   local branch upstream remote_head
   # Git ref names may contain `|`, but cannot contain a tab. Use a tab record
   # separator so every branch/upstream pair round-trips losslessly.
-  git for-each-ref --format='%(refname:short)%09%(upstream:short)' refs/heads/ 2>/dev/null |
+  # `refname:short` expands an ambiguous local branch name to `heads/<name>`
+  # when a tag shares its short name. The input is already constrained to
+  # refs/heads, so strip that namespace directly and retain the canonical
+  # branch name for the gone/PR lookups below.
+  git for-each-ref --format='%(refname:lstrip=2)%09%(upstream:short)' refs/heads/ 2>/dev/null |
   while IFS=$'\t' read -r branch upstream; do
     [ -n "$branch" ] || continue
     case "$upstream" in
