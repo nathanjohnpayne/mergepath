@@ -714,9 +714,11 @@ ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "
 # `**Actionable comments posted: N**` (#886, Codex P1). That exact first-line
 # shape is not enough on its own: unlike the marker format it carries no
 # commits-range anchor, so accept it only when a CodeRabbit review object is
-# anchored to this exact PR head. The review object supplies the scope that the
-# body does not. Fetch it only when such a candidate exists; a failed required
-# verification fails closed instead of treating the candidate as clean.
+# anchored to this exact PR head. Its comment must also be fresh at-or-after
+# that completed review object: otherwise an older markerless body can inherit
+# a later exact-head object and briefly publish a stale verdict. Fetch the
+# reviews only when such a candidate exists; a failed required verification
+# fails closed instead of treating the candidate as clean.
 SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
   --arg bot "$BOT_LOGIN" --arg m "$CR_SUMMARY_MARKER" '
   [ .[]
@@ -732,32 +734,43 @@ SUMMARY_BODY=$(echo "$SUMMARY_JSON" | jq -r '.body')
 SUMMARY_SCOPE='commits-range'
 
 if [ "$SUMMARY_ID" = "0" ]; then
-  MARKERLESS_SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
+  MARKERLESS_SUMMARIES_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
     --arg bot "$BOT_LOGIN" --arg re "$CR_MARKERLESS_FULL_REVIEW_RE" '
     [ .[]
       | select(.user.login == $bot)
       | select((.body // "") | test($re))
+      | . + { fresh_at: ([.created_at, (.updated_at // .created_at)]
+                          | map(select(type == "string" and . != "")) | max // "") }
     ]
-    | sort_by(.id)
-    | last
-    | { id: (.id // 0), body: (.body // "") }
+    | map({ id: (.id // 0), body: (.body // ""), fresh_at })
   ')
-  MARKERLESS_SUMMARY_ID=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.id')
-  if [ "$MARKERLESS_SUMMARY_ID" != "0" ]; then
+  MARKERLESS_SUMMARY_COUNT=$(echo "$MARKERLESS_SUMMARIES_JSON" | jq 'length')
+  if [ "$MARKERLESS_SUMMARY_COUNT" -gt 0 ]; then
     REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "CodeRabbit reviews for markerless summary")
-    if echo "$REVIEWS_JSON" | jq -e --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
-      any(.[];
-        (.user.login == $bot)
-        and (.commit_id == $sha)
-        and (.state == "COMMENTED" or .state == "APPROVED" or .state == "CHANGES_REQUESTED")
-      )
-    ' >/dev/null; then
+    MARKERLESS_REVIEW_AT=$(echo "$REVIEWS_JSON" | jq -r --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+      [ .[]
+        | select(.user.login == $bot)
+        | select(.commit_id == $sha)
+        | select(.state == "COMMENTED" or .state == "APPROVED" or .state == "CHANGES_REQUESTED")
+        | .submitted_at
+        | select(type == "string" and . != "")
+      ] | max // ""
+    ')
+    MARKERLESS_SUMMARY_JSON=$(echo "$MARKERLESS_SUMMARIES_JSON" | jq -c --arg at "$MARKERLESS_REVIEW_AT" '
+      if $at == "" then null
+      else [ .[] | select(.fresh_at >= $at) ] | sort_by(.fresh_at, .id) | last
+      end
+    ')
+    MARKERLESS_SUMMARY_ID=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.id // 0')
+    if [ "$MARKERLESS_SUMMARY_ID" != "0" ]; then
       SUMMARY_JSON=$MARKERLESS_SUMMARY_JSON
       SUMMARY_ID=$MARKERLESS_SUMMARY_ID
       SUMMARY_BODY=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.body')
       SUMMARY_SCOPE='review-object'
+    elif [ -z "$MARKERLESS_REVIEW_AT" ]; then
+      log "markerless CodeRabbit full-review candidate has no timestamped completed CodeRabbit review object on $HEAD_SHA — no summary findings in scope"
     else
-      log "markerless CodeRabbit full-review candidate (comment id $MARKERLESS_SUMMARY_ID) has no completed CodeRabbit review object on $HEAD_SHA — no summary findings in scope"
+      log "markerless CodeRabbit full-review candidate predates completed CodeRabbit review object on $HEAD_SHA — no summary findings in scope"
     fi
   fi
 fi
@@ -797,11 +810,11 @@ if [ -z "$SUMMARY_BODY" ]; then
   log "no CodeRabbit PR-level summary comment found — no summary findings in scope"
 elif [ "$SUMMARY_SCOPE" = 'review-object' ]; then
   # The strict markerless result line identifies the known full-review format,
-  # and the exact-head review object above supplies the scope / completion
+  # and the fresh exact-head review object above supplies the scope / completion
   # anchor that this format omits. Do not apply the marker-format stanza or
   # commits-range predicates: neither exists in this legitimate shape.
   SUMMARY_SCAN=$(summary_strip_pre_merge_block "$SUMMARY_BODY")
-  log "PR-level markerless full-review summary (comment id $SUMMARY_ID) is anchored by a completed CodeRabbit review object on $HEAD_SHA"
+  log "PR-level markerless full-review summary (comment id $SUMMARY_ID) is anchored by a fresh completed CodeRabbit review object on $HEAD_SHA"
 elif ! summary_stanzas_all_benign "$SUMMARY_BODY"; then
   log "PR-level summary (comment id $SUMMARY_ID) carries a non-benign outcome stanza (rate limit / failure / in progress) — not a completed report, no summary findings in scope"
 elif ! summary_names_head "$SUMMARY_BODY" "$HEAD_SHA"; then

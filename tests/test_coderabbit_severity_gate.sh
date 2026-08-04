@@ -60,8 +60,9 @@
 #   28. unreadable `issues/{pr}/comments` → FAIL CLOSED → exit 2.
 #   29. inline + summary findings both counted; 29b resolving the inline
 #       thread leaves exactly the summary one (inline behavior unchanged).
-#   30. markerless full-review summary with an exact-head CodeRabbit review
-#       object gates; without that object it remains out of scope.
+#   30. markerless full-review summary with a fresh exact-head CodeRabbit review
+#       object gates; without that object, or when it predates the object, it
+#       remains out of scope.
 #
 # Ack scoping (#886 — an ack clears the findings it acknowledged, nothing else):
 #   30. ack for finding set {A} vs a same-head re-review that rewrote the
@@ -1045,14 +1046,15 @@ make_issue_comments_fixture() {
 # Review-object fixture for CodeRabbit's markerless full-review format. Its
 # exact `commit_id` is the scope anchor that an ordinary summary body lacks.
 make_reviews_fixture() {
-  local sha=$1 state=${2:-COMMENTED}
+  local sha=$1 state=${2:-COMMENTED} submitted_at=${3:-2026-08-04T00:00:10Z}
   local file="$WORKDIR/reviews.$$.$RANDOM.json"
-  jq -n --arg sha "$sha" --arg state "$state" '
+  jq -n --arg sha "$sha" --arg state "$state" --arg submitted_at "$submitted_at" '
     [{
       id: 8001,
       user: { login: "coderabbitai[bot]" },
       commit_id: $sha,
-      state: $state
+      state: $state,
+      submitted_at: $submitted_at
     }]
   ' > "$file"
   echo "$file"
@@ -1065,13 +1067,18 @@ make_reviews_fixture() {
 #   $3 = ack body (optional)
 #   $4 = ack author login
 #   $5 = ack author_association
+#   $6 = summary created_at (default: 2026-08-04T00:00:00Z)
+#   $7 = summary updated_at (default: created_at)
 make_summary_issue_comments() {
   local body=$1 login=${2:-coderabbitai[bot]}
   local ack_body=${3:-} ack_login=${4:-} ack_assoc=${5:-}
+  local created_at=${6:-2026-08-04T00:00:00Z}
+  local updated_at=${7:-$created_at}
   make_issue_comments_fixture "$(jq -n \
-    --arg body "$body" --arg login "$login" \
+    --arg body "$body" --arg login "$login" --arg created_at "$created_at" --arg updated_at "$updated_at" \
     --arg ab "$ack_body" --arg al "$ack_login" --arg aa "$ack_assoc" '
-    [ { id: 7001, user: { login: $login }, author_association: "NONE", body: $body } ]
+    [ { id: 7001, user: { login: $login }, author_association: "NONE", body: $body,
+        created_at: $created_at, updated_at: $updated_at } ]
     + (if $ab == "" then []
        else [ { id: 7002, user: { login: $al }, author_association: $aa, body: $ab } ]
        end)
@@ -2609,8 +2616,9 @@ FIXTURE_THREADS=$(make_threads_fixture '[]')
 MARKERLESS_FULL_REVIEW="**Actionable comments posted: 1**
 
 $SUMMARY_BLOCKING_FINDING"
-FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$MARKERLESS_FULL_REVIEW")
-FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$MARKERLESS_FULL_REVIEW" \
+  "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:00Z" "2026-08-04T00:00:20Z")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z")
 set +e
 OUT=$(
   FIXTURE_PR="$FIXTURE_PR" \
@@ -2643,10 +2651,36 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "has no completed CodeRabbit review object"; then
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "has no timestamped completed CodeRabbit review object"; then
   pass "markerless body without a current-head review object remains out of scope"
 else
   fail "expected rc=0 with markerless summary rejected without head review; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# A current-head review object must correlate to the publication that carries
+# the markerless body. Without the fresh_at floor, an older clean-looking
+# markerless summary can borrow a later review object and transiently clear
+# the gate until the asynchronous issue_comment sweep catches up.
+echo "--- Test 47c (#886): markerless body predating head review object → exit 0"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$MARKERLESS_FULL_REVIEW" \
+  "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:00Z" "2026-08-04T00:00:05Z")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "predates completed CodeRabbit review object"; then
+  pass "markerless body that predates its exact-head review object remains out of scope"
+else
+  fail "expected rc=0 with markerless summary rejected as stale; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
