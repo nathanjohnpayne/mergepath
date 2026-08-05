@@ -361,19 +361,43 @@ baseline_marker_path() {
 # false failure on a tree nobody snapshotted, and it reds every consumer's
 # repo-lint through the fixture.
 #
-# The marker names the config file it was taken from, so the copy is
-# recognisable without weakening anything: a request whose recorded config
-# is not this checkout's config describes a different subject and is not
-# this run's to answer for. Two shapes are deliberately NOT foreign — a
-# marker carrying no recorded path (a snapshot from an older revision of
-# this check) and a checkout whose own config cannot be resolved at all
-# (the destroyed-repository case #803 exists to catch) — because both must
-# keep failing closed rather than be waved through as somebody else's.
+# The marker names the DIRECTORY it was taken in, and that name is the whole
+# test, because the test has to work where there is no git left to ask.
+# Exactly two shapes arrive here holding a marker with no repository under
+# it, and they need opposite answers:
+#
+#   - the checkout the snapshot WAS taken in, whose `.git` a later step
+#     deleted. It is still this directory, and the failure #803 exists to
+#     raise must fire;
+#   - a working-tree COPY. `tests/test_repo_lint_consumer_safety.sh` rsyncs
+#     this tree excluding `.git` and never `git init`s the result, so the
+#     fixture inherits the request, is not a repository at all, and no
+#     snapshot was ever taken of it.
+#
+# Deriving the answer from the recorded CONFIG cannot separate them: the
+# copy has no config to resolve, so "cannot resolve my own config" — the
+# reading that keeps the destroyed-repository case failing closed — also
+# claimed every non-repository fixture as this checkout and reported it as
+# a checkout whose metadata had been destroyed, redding every consumer's
+# repo-lint. A directory name needs no git and tells the two apart outright.
+#
+# A marker recording no root names no checkout, so it does not name this
+# one. It cannot be a request from this revision of the check, which always
+# writes the root first.
 marker_records_this_checkout() {
-  local recorded="$1" here
-  [ -n "$recorded" ] || return 0
-  here="$(config_path 2>/dev/null)" || return 0
-  [ "$(canonical_path "$recorded")" = "$(canonical_path "$here")" ]
+  local recorded="$1"
+  [ -n "$recorded" ] || return 1
+  [ "$(canonical_dir "$recorded")" = "$(canonical_dir "$REPO_ROOT")" ]
+}
+
+# Physical absolute form of a DIRECTORY. `canonical_path` below is built for
+# a file — it canonicalises the parent and re-attaches the basename — which
+# leaves a directory spelled `.` or `foo/.` distinguishable from the same
+# directory spelled plainly. The marker comparison is between two spellings
+# produced by two different processes, so it needs the form that collapses
+# them.
+canonical_dir() {
+  ( cd -- "$1" 2>/dev/null && pwd -P ) || printf '%s\n' "$1"
 }
 
 config_path() {
@@ -628,9 +652,11 @@ if [ "$MODE" = "snapshot" ]; then
   cp "$CFG" "$BASE"
   # The marker records WHAT was snapshotted, not merely that something was.
   # The later report pass is a different process with no memory of this one,
-  # and the recorded config path is how it tells "this repository is clean"
-  # apart from "this repository is gone" — the state a deleted checkout
-  # leaves behind, in which every other assertion here falls silent.
+  # and these records are how it tells "this repository is clean" apart from
+  # "this repository is gone" — the state a deleted checkout leaves behind,
+  # in which every other assertion here falls silent. The ROOT is what
+  # identifies the checkout (see marker_records_this_checkout); the config
+  # path is the subject whose disappearance the report pass reports on.
   #
   # Records are NUL-framed, the one delimiter a path cannot contain. A
   # newline-delimited record splits a checkout path holding a newline across
@@ -638,7 +664,8 @@ if [ "$MODE" = "snapshot" ]; then
   # matches it against nothing, and files this checkout's own request as
   # somebody else's — which turns the deleted-evidence FAIL this marker
   # exists to raise back into a PASS, for a path the filesystem accepts.
-  printf 'config=%s\0baseline=%s\0' "$CFG" "$BASE" > "$BASE_MARKER"
+  printf 'root=%s\0config=%s\0baseline=%s\0' \
+    "$(canonical_dir "$REPO_ROOT")" "$CFG" "$BASE" > "$BASE_MARKER"
   echo "check_git_identity_hygiene: snapshot recorded ($BASE)"
   exit 0
 fi
@@ -1003,7 +1030,8 @@ EOF
 # ── Part B: .git/config byte-comparison against a recorded baseline ───
 # Same two-phase contract as Part A: $1 is "pre-suite" or "post-suite".
 assert_config_unchanged() {
-  local phase="$1" base marker cfg culprit recorded_cfg line marker_mine=0
+  local phase="$1" base marker cfg culprit recorded_cfg recorded_root line
+  local marker_mine=0
   if [ "$phase" = "post-suite" ] && [ -n "$PRE_SUITE_BASELINE" ]; then
     # The live baseline lives inside this worktree's git dir, so a suite that
     # deleted `.git` deleted the thing this compares against. The copy
@@ -1018,18 +1046,20 @@ assert_config_unchanged() {
   # config puts this run under an obligation to account for a baseline.
   if [ -f "$marker" ]; then
     recorded_cfg=""
+    recorded_root=""
     # NUL-framed, matching the writer: a path may contain a newline, so a
     # line-framed read would hand back a truncated path that matches no
     # checkout at all.
     while IFS= read -r -d '' line; do
       case "$line" in
-        config=*) recorded_cfg="${line#config=}"; break ;;
+        root=*)   recorded_root="${line#root=}" ;;
+        config=*) recorded_cfg="${line#config=}" ;;
       esac
     done < "$marker"
-    if marker_records_this_checkout "$recorded_cfg"; then
+    if marker_records_this_checkout "$recorded_root"; then
       marker_mine=1
     elif [ "$phase" != "post-suite" ]; then
-      echo "check_git_identity_hygiene: ignoring a snapshot request recorded for another checkout ($recorded_cfg)"
+      echo "check_git_identity_hygiene: ignoring a snapshot request recorded for another checkout (${recorded_root:-no recorded root})"
     fi
   fi
   # A snapshot that outlived its own subject. Checked in the PRE-SUITE phase

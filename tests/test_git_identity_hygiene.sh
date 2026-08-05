@@ -1693,6 +1693,34 @@ else
   fail "newline-path marker read as a foreign request: rc=$RC out=$OUT"
 fi
 
+# Case 63f: the copy case 63c covers with the git dir it does NOT have.
+# `tests/test_repo_lint_consumer_safety.sh` rsyncs this working tree with
+# `.git` excluded and never `git init`s the result, so the fixture inherits
+# the request and is not a repository at all. Deciding "is this mine?" from
+# the recorded CONFIG could not tell that tree from the #803 case — both
+# have a marker and no resolvable config — and claimed it, reporting a
+# checkout nobody snapshotted as one whose metadata had been destroyed.
+# That reds every consumer's repo-lint through the fixture.
+SNAPNR_SRC="$WORKDIR/snapshot-nonrepo-source-repo"
+git init -q -b main "$SNAPNR_SRC"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNR_SRC" bash "$CHECK" --snapshot >/dev/null 2>&1
+SNAPNR_COPY="$WORKDIR/snapshot-nonrepo-copy"
+mkdir -p "$SNAPNR_COPY/.mergepath"
+cp "$SNAPNR_SRC/.mergepath/gitconfig-baseline.requested" \
+  "$SNAPNR_COPY/.mergepath/gitconfig-baseline.requested"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNR_COPY" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
+  && printf '%s' "$OUT" | grep -q "recorded for another checkout" \
+  && ! printf '%s' "$OUT" | grep -q "snapshotted repository is missing"; then
+  pass "non-repository tree copy inheriting the request: not this checkout's snapshot"
+else
+  fail "inherited request failed a non-repository fixture: rc=$RC out=$OUT"
+fi
+
 # ── Newline-safe include-target collection (#804) ──────────────────────
 
 # Case 64: a Git include target is an ordinary filename and may contain a
