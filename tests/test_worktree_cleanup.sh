@@ -1126,10 +1126,32 @@ else
   show_out_on_fail
 fi
 
-REGISTERED_CLAUDE_LABEL=$(echo "$OUT" | awk -v p="$REGISTERED_CLAUDE_WT" '
-  /^  \[/            { label = $0 }
-  $1 == "path:" && $2 == p { print label; exit }
-')
+# Resolve the report record label that a given worktree path was filed under.
+report_label_for() {
+  echo "$OUT" | awk -v p="$1" '
+    /^  \[/            { label = $0 }
+    $1 == "path:" && $2 == p { print label; exit }
+  '
+}
+
+# Positive control for the extractor itself. The registered-worktree assertion
+# below is a NEGATIVE one, so an empty capture satisfies it for free: if the
+# report format drifts, or this awk stops matching paths, the assertion would
+# pass while proving nothing (CodeRabbit 🟡 on #892). Pinning the extractor
+# against a path whose label IS known makes that failure mode loud instead.
+ORPHAN_CONTROL_LABEL=$(report_label_for "$ORPHAN_DIR")
+if echo "$ORPHAN_CONTROL_LABEL" | grep -q "ORPHAN .claude/worktrees"; then
+  pass "report label extractor resolves a known path to its record label"
+else
+  fail "report label extractor did not resolve the orphan fixture (negative assertions below would be vacuous)"
+  show_out_on_fail
+fi
+
+# A healthy registered worktree is reported under a non-ORPHAN label, or — the
+# normal case, since the report lists only entries needing attention — is not
+# reported at all. Either is correct. What it must never be is swept into the
+# orphan bucket merely for living under .claude/worktrees/.
+REGISTERED_CLAUDE_LABEL=$(report_label_for "$REGISTERED_CLAUDE_WT")
 if ! echo "$REGISTERED_CLAUDE_LABEL" | grep -q "ORPHAN .claude/worktrees"; then
   pass "registered .claude/worktrees/ worktree is not misclassified as an orphan"
 else
@@ -2619,8 +2641,14 @@ git init -q "$DANGLING_HEAD_MAIN"
 ) >/dev/null 2>&1
 set +e
 OUT_DANGLING_HEAD=$( cd "$DANGLING_HEAD_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_DANGLING_HEAD=$?
 set -e
-if ! echo "$OUT_DANGLING_HEAD" | grep -Fq 'git fetch --prune origin` failed' \
+# The prune succeeding is only half the claim: --apply must also run to
+# completion. Without the exit-status assertion the case still passes when the
+# ref is pruned and the helper then dies further down, so require rc 0 the same
+# way Case 32 does.
+if [ "$RC_DANGLING_HEAD" -eq 0 ] \
+   && ! echo "$OUT_DANGLING_HEAD" | grep -Fq 'git fetch --prune origin` failed' \
    && ! git -C "$DANGLING_HEAD_MAIN" rev-parse --verify -q \
         "refs/remotes/origin/$DANGLING_HEAD_BRANCH" >/dev/null; then
   pass "#892 --apply prunes against a remote whose HEAD is dangling"
