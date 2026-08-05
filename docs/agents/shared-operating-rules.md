@@ -64,11 +64,11 @@ An agent MUST therefore obtain explicit human confirmation before issuing any MC
 The boundary is the **effect of the call**, not the name of the tool:
 
 - **No confirmation needed** — listing, getting, searching, querying, and reading logs, metrics, or audit history.
-- **Confirm first** — anything that creates, updates, or deletes: a generic API-execution tool invoked with any method other than `GET`, and any tool whose name or documented behavior is create / update / delete / put / deploy.
+- **Confirm first** — anything that creates, updates, or deletes, plus anything whose effect cannot be established as read-only. Transport method alone does not settle this: a read-only query issued over `POST` — a GraphQL or search endpoint — needs no confirmation, while a `POST` that provisions a resource does. Where the effect is genuinely indeterminate, treat it as mutating and ask.
 
 Two failure modes this rule closes:
 
-1. **A generic executor hides its blast radius behind one schema.** Where a single tool accepts an arbitrary method and path, the same innocuous-looking call shape serves both a harmless read and an account-wide delete. (The case that prompted this rule: a Cloudflare MCP server exposing one `execute` tool taking an arbitrary HTTP method.) Confirmation must therefore key on the request the agent is about to issue, never on the tool's name or its usual use.
+1. **A generic executor hides its blast radius behind one schema.** Where a single tool accepts an arbitrary method and path, one innocuous-looking call shape serves both a harmless read and an account-wide delete, and neither the tool name nor its schema distinguishes them. Confirmation must therefore key on the request the agent is about to issue, never on the tool's name or its usual use.
 2. **Plausible intent is not authorization.** A task that implies infrastructure change — "set up the new domain" — authorizes proposing that change, not performing it. Intent inferred from surrounding work is the weakest possible warrant for an irreversible action.
 
 When asking, state the exact operation, the target resource, and **the account or scope being acted on**. A single credential commonly covers an entire production account, so the scope is the part a human most needs to check, and it is the part an agent is least likely to have chosen deliberately.
