@@ -34,6 +34,12 @@ This applies to every hand-rolled, mid-session investigative query, not just the
 
 The shipped gate scripts already bake this in --- `fetch_api_array` wraps `gh api --paginate` for the REST arrays, and the GraphQL reads use cursor loops --- so this rule is aimed at the ad-hoc queries those helpers do not cover. When in doubt, add `--paginate`: it is a no-op on a short list and the only safe default on a long one.
 
+## Background job mutations to mergepath test suites
+
+The `tests/test_phase_4b_automation.sh` suite drives the real orchestrator with fake adapter CLIs. Any mutation to a config reader or classifier can change which path the orchestrator takes and land it on `p4b_run_with_timeout` with the default **900s** `ADAPTER_TIMEOUT`, repeatedly. Mutating `scripts/phase-4b/lib.sh` and running the full test suite produces hangs that can exceed 11 hours.
+
+Do not mutate `scripts/phase-4b/lib.sh` and run `tests/test_phase_4b_automation.sh`; this trap violates the expected-duration rule above and produces adapter timeouts that no agent attention will interrupt. Instead, source the lib and assert directly on pure functions — the helper suite runs in about 2 seconds.
+
 ## 1Password CLI authentication failures
 
 If any `op` command (`op read`, `op inject`, `op run`, `op document get`, or any script that wraps them) fails with a sign-in or authentication error — including but not limited to:
