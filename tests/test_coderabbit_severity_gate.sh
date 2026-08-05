@@ -2854,6 +2854,50 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# Dismissing a CodeRabbit review is one of this gate's own triggers. If the
+# dismissed object stopped anchoring, the dismissal itself would clear a
+# summary-only blocking finding on exit 0 — a second, undocumented way off a
+# surface whose only exit is meant to be the collaborator ack.
+echo "--- Test 47d1c (#886): a DISMISSED review still anchors its markerless summary → exit 1"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$MARKERLESS_FULL_REVIEW" \
+  "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:00Z" "2026-08-04T00:00:20Z")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" DISMISSED "2026-08-04T00:00:10Z")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)"; then
+  pass "dismissing the review does not drop the anchor or clear the summary finding"
+else
+  fail "expected rc=1 with the dismissed review still anchoring the summary; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# The sweep's compare-and-swap has to sample every surface the verdict is
+# computed from. Since the sweep opted into the publication hold, that includes
+# review objects: a review submitted between the gate's reviews read and the
+# check_run POST leaves the comment fingerprint byte-identical, so a
+# comments-only guard would publish a success computed before the review existed.
+echo "--- Test 47d1d (#886): the sweep snapshot guard samples the review surface"
+FP_FN=$(sed -n '/^ *cr_surface_fp() {/,/^ *}/p' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
+FP_FAILCLOSED=$(printf '%s\n' "$FP_FN" | grep -c '|| return 1')
+if printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/issues/$1/comments' \
+    && printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/pulls/$1/reviews' \
+    && printf '%s\n' "$FP_FN" | grep -Fq "printf '%s\\035%s'" \
+    && [ "$FP_FAILCLOSED" -eq 2 ]; then
+  pass "cr_surface_fp fingerprints reviews as well as comments, failing closed on either read"
+else
+  fail "expected cr_surface_fp to sample both surfaces and fail closed on each read (fail-closed lines: $FP_FAILCLOSED)"
+fi
+
 # The correlation floor is scoped to the review-triggered path. On the
 # arrival-independent sweep an uncorrelated candidate must stay IN scope:
 # dropping it there yields zero candidates, which passes, and a real blocking

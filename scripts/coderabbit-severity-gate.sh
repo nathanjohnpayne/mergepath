@@ -796,11 +796,21 @@ if [ "$MARKERLESS_SUMMARY_COUNT" -gt 0 ] || [ "$REQUIRE_REVIEW_SUMMARY" = "true"
   # genuine current summary — a permanent hold on a PR whose review demonstrably
   # finished, re-armed by every thread reply. Five such objects sat on this PR's
   # own head while its one real run carried a 9906-byte body.
+  #
+  # DISMISSED counts as an anchor (Codex P1 on #886). The question here is
+  # whether the bot reviewed this head, not whether its review is still
+  # standing — and `pull_request_review: [dismissed]` is one of this gate's own
+  # triggers, so dropping the state made dismissing the review re-run the gate
+  # with its anchor removed. A markerless summary then fell out of scope and a
+  # summary-only blocking finding cleared on exit 0, giving dismissal a second
+  # job as a bypass of the collaborator ack channel that is supposed to be the
+  # only way off that surface.
   HEAD_REVIEW_AT=$(echo "$REVIEWS_JSON" | jq -r --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
     [ .[]
       | select(.user.login == $bot)
       | select(.commit_id == $sha)
-      | select(.state == "COMMENTED" or .state == "APPROVED" or .state == "CHANGES_REQUESTED")
+      | select(.state == "COMMENTED" or .state == "APPROVED"
+               or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
       | select(((.body // "") | gsub("\\s"; "")) != "")
       | .submitted_at
       | select(type == "string" and . != "")
@@ -845,11 +855,13 @@ fi
 # this head; a candidate that predates it belongs to the previous publication.
 #
 # Restricted to REQUIRE_REVIEW_SUMMARY=true because dropping the candidate is
-# only fail-CLOSED there: with the flag set, zero candidates means the hold
-# below exits 1. On the arrival-independent sweep paths zero candidates means
-# "nothing in scope yet" and passes, so applying the same filter would discard
-# a real summary finding and fail OPEN. A missing/unparseable timestamp sorts
-# below any real one and is therefore dropped, which is the safe direction here.
+# only safe there: with the flag set, zero candidates reaches the hold below and
+# exits 3, which withholds a verdict. Without it, zero candidates means "nothing
+# in scope yet" and PASSES, so applying the same filter would discard a real
+# summary finding and fail OPEN. Both bundled workflow arms set the flag; the
+# default-false path is for ad-hoc and third-party callers, which have no
+# publication to withhold. A missing or unparseable timestamp sorts below any
+# real one and is therefore dropped, which is the safe direction here.
 if [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] && [ -n "$HEAD_REVIEW_AT" ]; then
   SUMMARY_UNCORRELATED=$(echo "$SUMMARY_CANDIDATES" | jq -r --arg at "$HEAD_REVIEW_AT" '
     [ .[] | select((.fresh_at // "") < $at) | (.id | tostring) ] | join(", ")

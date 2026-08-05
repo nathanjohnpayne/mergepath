@@ -381,9 +381,37 @@ jobs:
             # removing a required check rather than failing a run. jq expands
             # the escape at runtime, so the delimiter is still a byte that
             # cannot occur in a comment body, while the file stays printable.
+            # The snapshot covers EVERY surface the verdict is computed from,
+            # which since the publication hold includes review OBJECTS as well
+            # as PR comments (Codex P1 on #886). With REQUIRE_REVIEW_SUMMARY set
+            # here, the gate reads pulls/{pr}/reviews to decide whether a
+            # current-head run is awaiting its summary; a review submitted after
+            # that read but before the POST leaves the comment fingerprint
+            # byte-identical, so a comments-only guard would wave through an
+            # rc 0 success computed before the review existed, republishing green
+            # over the pull_request_review job's rc 3 red. A surface the verdict
+            # depends on and the guard does not sample is not guarded.
+            #
+            # Either read failing fails the WHOLE fingerprint, which the caller
+            # answers by skipping the publication. A half-read surface must never
+            # become a fingerprint: it would compare equal to the other run's
+            # half-read and read as "unchanged", which is the guard silently
+            # disabling itself — the same reasoning as the no-sentinel rule
+            # below.
+            #
+            # The halves are joined with the OCTAL escape `\035` (group
+            # separator), not ``: POSIX printf defines octal escapes while
+            # `\uNNNN` is a bash 4.2+ extension, and a byte no comment or review
+            # body can contain is what keeps the two halves unambiguous. Same
+            # no-raw-control-byte rule as the record separator above — the escape
+            # is expanded at runtime, the YAML source stays printable.
             cr_surface_fp() {
-              gh api "repos/$REPO/issues/$1/comments" --paginate \
-                --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join("\u001e")'
+              local comments reviews
+              comments=$(gh api "repos/$REPO/issues/$1/comments" --paginate \
+                --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join("\u001e")') || return 1
+              reviews=$(gh api "repos/$REPO/pulls/$1/reviews" --paginate \
+                --jq '[.[] | "\(.id):\(.state):\(.commit_id // ""):\(.submitted_at // ""):\(.body // "")"] | sort | join("\u001e")') || return 1
+              printf '%s\035%s' "$comments" "$reviews"
             }
 
             # A read failure is NOT serialized into a sentinel: $RANDOM is not
