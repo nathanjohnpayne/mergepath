@@ -2734,7 +2734,11 @@ EVENT_JOB=$(awk '
   in_job && /^  scheduled-sweep:/ { exit }
   in_job { print }
 ' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
-EVENT_FLAG=$(printf '%s\n' "$EVENT_JOB" | grep -c '^ *REQUIRE_REVIEW_SUMMARY:')
+# `|| true`: grep -c exits 1 on a count of ZERO, which is exactly the regression
+# this asserts against, and a failing command substitution aborts the suite under
+# `set -e` — so the regression would surface as a crash that also stops every
+# later test, instead of as this test failing (CodeRabbit, #886).
+EVENT_FLAG=$(printf '%s\n' "$EVENT_JOB" | grep -c '^ *REQUIRE_REVIEW_SUMMARY:' || true)
 if [ "$EVENT_FLAG" -eq 1 ] \
     && printf '%s\n' "$EVENT_JOB" | grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' \
     && ! printf '%s\n' "$EVENT_JOB" | grep '^ *REQUIRE_REVIEW_SUMMARY:' | grep -q 'github.event_name'; then
@@ -2953,7 +2957,10 @@ FP_FN=$(awk '
   in_fn { print }
   in_fn && /^            \}$/ { exit }
 ' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
-FP_FAILCLOSED=$(printf '%s\n' "$FP_FN" | grep -c '|| return 1')
+# `|| true` for the same `set -e` reason as the EVENT_FLAG count above: a
+# fingerprint function stripped of its fail-closed reads counts ZERO, and the
+# bare form would abort the suite rather than fail this assertion.
+FP_FAILCLOSED=$(printf '%s\n' "$FP_FN" | grep -c '|| return 1' || true)
 if printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/issues/$1/comments' \
     && printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/pulls/$1/reviews' \
     && printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/pulls/$1/comments' \
