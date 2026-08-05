@@ -3428,6 +3428,76 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 47h3 (#886, Codex P1 round 15): the mirror image of 47h. Taking the floor
+# from recognised runs alone stops a later unrecognised run from HIDING a
+# finding, and by itself it also stops that run from being noticed at all: when
+# the earlier recognised summary is CLEAN, the gate published success while
+# CodeRabbit's newest serialization on this head sat unread — which is the
+# summary-only blocking finding this gate exists to catch, cleared by a required
+# check.
+#
+# The hold applies to a would-be PASS only, which is why 47h above still reports
+# its Major on rc 1 rather than disappearing into this hold. Same two runs as
+# 47h, with 8001's body carrying a nitpick instead of a Major: 47h and 47h3 have
+# byte-identical run 8002 and differ only in whether the READ verdict is clean,
+# so nothing but the pass/fail distinction can produce their different answers.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 47h3 (#886): a newer unrecognised run withholds an otherwise-clean pass → exit 3"
+FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture '[]')
+FIXTURE_REVIEWS=$(make_issue_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" \
+  --arg clean "**Actionable comments posted: 0**
+
+$SUMMARY_NITPICK_FINDING" '
+  [ { id: 8001, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:10Z", body: $clean },
+    { id: 8002, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:30Z", body: "### Review complete\n\nSee the inline comments." } ]
+')")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 3 ] && echo "$OUT" | grep -q "unrecognised head-pinned review run object(s): 8002" \
+    && ! echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+  pass "a clean earlier publication cannot certify a head whose newest run is unread"
+else
+  fail "expected rc=3 naming the unread newer run 8002; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# The hold is scoped to REQUIRE_REVIEW_SUMMARY, like the correlation filter it
+# rides beside: an ad-hoc or third-party caller has no publication to withhold
+# and asked for the arrival-independent answer. Same fixture, flag unset.
+echo "--- Test 47h4 (#886): the unread-run hold does not fire for an ad-hoc caller → exit 0"
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! echo "$OUT" | grep -q "unrecognised head-pinned review run object"; then
+  pass "the default-false path keeps its arrival-independent answer"
+else
+  fail "expected rc=0 with no hold when REQUIRE_REVIEW_SUMMARY is unset; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Test 48 (#886, Codex P2): the scheduled workflow's stale-snapshot guard
 # must preserve read status separately. Serializing failed reads as a random
 # fingerprint only probabilistically skips a publish; a read failure has no

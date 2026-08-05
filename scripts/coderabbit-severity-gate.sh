@@ -960,6 +960,45 @@ SUMMARY_CORRELATION_AT=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -r '
   [ .[] | .fresh_at | select(. != "") ] | max // ""
 ')
 
+# The head-pinned runs NO acceptor recognised, restricted to the ones NEWER than
+# every recognised summary (Codex P1 round 15 on #886). Taking the correlation
+# floor from recognised runs alone fixed one asymmetry and opened its mirror
+# image: a later unrecognised run no longer discards the earlier recognised
+# candidate, so when that earlier candidate is CLEAN the gate publishes success
+# while CodeRabbit's newest serialization on this head sits unread — which is
+# exactly the summary-only blocking finding this gate exists to catch. The
+# candidate is not "stale" in the sense the floor is about, but the head is no
+# longer fully read, and the spec's contract is that a completed current-head run
+# with no recognised summary HOLDS.
+#
+# `$at == ""` (no recognised run at all) counts every unrecognised run, because
+# then nothing on the review surface has been read and any verdict in hand came
+# from the comment surface alone.
+#
+# This does NOT drop candidates, and that distinction is the whole point. Codex's
+# literal remedy — treat the newer unrecognised run as superseding older
+# candidates — is the HEAD_REVIEW_AT floor again, and it re-breaks the case this
+# round fixed: an earlier recognised summary carrying a real Major would vanish
+# into the hold instead of being reported. Both properties hold together because
+# they apply to different verdicts. A blocking finding still gates on exit 1 —
+# fail-closed, retirable by a push, and it names the finding. Only a would-be
+# PASS is withheld, which is the verdict an unread run can actually invalidate.
+HEAD_UNRECOGNISED_NEWER_IDS=$(jq -rn \
+  --argjson runs "$HEAD_REVIEW_RUNS_JSON" \
+  --argjson recognised "$HEAD_SUMMARY_RUNS_JSON" \
+  --arg at "$SUMMARY_CORRELATION_AT" '
+  ($recognised | map(.id)) as $known
+  | [ $runs[]
+      # `. as $run` FIRST: inside `index(...)` the input `.` is $known, the
+      # ARRAY, so a bare `.id` there indexes an array with a string and aborts
+      # the whole gate (the jq dot-rebind hazard).
+      | . as $run
+      | select(($known | index($run.id)) == null)
+      | select($at == "" or (($run.fresh_at // "") > $at))
+      | ($run.id | tostring) ]
+  | join(", ")
+')
+
 REVIEW_OBJECT_SUMMARY_JSON=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -c 'last // {}')
 REVIEW_OBJECT_SUMMARY_ID=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.id // 0')
 if [ "$REVIEW_OBJECT_SUMMARY_ID" != "0" ]; then
@@ -1312,7 +1351,24 @@ if [ "$SUMMARY_BLOCKING_COUNT" -gt 0 ]; then
   fi
 fi
 
+# Withhold a PASS while a newer head-pinned run remains unread (Codex P1 round
+# 15 on #886). Called from BOTH clean exits — the summary-only one below and
+# report_verdict's, which is reached with a zero count once every inline thread
+# is resolved. Guarded on REQUIRE_REVIEW_SUMMARY for the same reason the
+# correlation filter is: with the flag set, a hold withholds a verdict the
+# publishers know how to handle (the event arm goes non-green, the sweep declines
+# to publish), while an ad-hoc caller has no publication to withhold and gets the
+# arrival-independent answer it asked for.
+hold_on_unrecognised_newer_run() {
+  [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] || return 0
+  [ -n "$HEAD_UNRECOGNISED_NEWER_IDS" ] || return 0
+  echo "CodeRabbit published a later review run on $HEAD_SHA whose body matches no summary acceptor, so the clean verdict in hand is from an earlier publication; holding this gate run. (unrecognised head-pinned review run object(s): $HEAD_UNRECOGNISED_NEWER_IDS)" >&2
+  echo "CodeRabbit blocking-tier unresolved: pending (summary publication in flight)"
+  exit 3
+}
+
 if [ "$BLOCKING_COUNT" -eq 0 ] && [ "$SUMMARY_BLOCKING_COUNT" -eq 0 ]; then
+  hold_on_unrecognised_newer_run
   echo "CodeRabbit blocking-tier unresolved: 0"
   exit 0
 fi
@@ -1370,11 +1426,16 @@ report_verdict() {
     echo ""
   fi
 
-  echo "CodeRabbit blocking-tier unresolved: $count"
-
   if [ "$count" -gt 0 ]; then
+    echo "CodeRabbit blocking-tier unresolved: $count"
     exit 1
   fi
+  # A zero count here is a PASS reached after thread classification, so it is
+  # subject to the same unread-newer-run hold as the summary-only exit above.
+  # The verdict line is printed inside each branch rather than before them
+  # because the hold prints its own, and a run must emit exactly one.
+  hold_on_unrecognised_newer_run
+  echo "CodeRabbit blocking-tier unresolved: $count"
   exit 0
 }
 
