@@ -23,6 +23,17 @@ This applies to every hand-rolled, mid-session investigative query, not just the
 
 The shipped gate scripts already bake this in --- `fetch_api_array` wraps `gh api --paginate` for the REST arrays, and the GraphQL reads use cursor loops --- so this rule is aimed at the ad-hoc queries those helpers do not cover. When in doubt, add `--paginate`: it is a no-op on a short list and the only safe default on a long one.
 
+## Background jobs and expected duration
+
+A backgrounded command must have an expected duration stated when it is launched, and must be checked against that expectation. Never report "still running" as a status without comparing elapsed time to the expectation. A completion notification fires only on completion; a hung job produces no notification and no error — it is indistinguishable from a job legitimately working. Passive waiting has no failure detection by default.
+
+Corollaries:
+
+- Prefer a self-terminating command — put `timeout N` inside it — so a hang dies on its own rather than depending on the agent noticing.
+- A job with no obvious duration still has a bound: provider-poll helpers carry their own `max_wait_seconds` / `review_timeout_seconds`, so quote that as the expectation.
+- Investigate any job that exceeds roughly 3× its expected duration; do not report "still running" as though that were a normal status.
+- "It is still going" is not a status. "It is at 4 minutes against an expected 2" is.
+
 ## 1Password CLI authentication failures
 
 If any `op` command (`op read`, `op inject`, `op run`, `op document get`, or any script that wraps them) fails with a sign-in or authentication error — including but not limited to:
@@ -54,6 +65,26 @@ These three rules hold in every repository, whatever it deploys and however it d
 1. **Never move a secret through a human.** Do not ask anyone to paste a raw credential, token, or key into chat, an issue, or a PR comment, and never print a resolved secret value in logs or command output. A credential manager hands the value to the tool that needs it; it does not pass through a transcript.
 2. **No long-lived keys by convenience.** Do not introduce long-lived service-account keys or on-disk deploy keys into repo docs, scripts, or secret stores unless the project explicitly requires them and a human has approved that requirement. Short-lived, manager-resolved credentials are the default form.
 3. **Do not downgrade a repo's auth model unilaterally.** Where a repository's deploy or CI auth is 1Password-backed — the fleet default — switching it back to routine browser login, an interactive CLI login, or an unmanaged on-disk key needs explicit human approval. Reaching for the downgrade because a credential lookup failed is the specific move this rule forbids; see the pause-and-prompt procedure above.
+
+## Mutating MCP tool calls need explicit confirmation
+
+A connected MCP server routinely exposes write and delete operations against live infrastructure — DNS zones, object storage, databases, deployed services — under the same account that serves production. These calls are unlike every other change an agent makes: they land in no diff, no branch protection gates them, and no reviewer sees them before they take effect. There is no PR to decline and frequently no undo.
+
+An agent MUST therefore obtain explicit human confirmation before issuing any MCP tool call that creates, modifies, or deletes a live resource. Read-only calls need no confirmation and should be used freely — investigating thoroughly before proposing a change is the behavior this rule is meant to encourage, not restrain.
+
+The boundary is the **effect of the call**, not the name of the tool:
+
+- **No confirmation needed** — listing, getting, searching, querying, and reading logs, metrics, or audit history.
+- **Confirm first** — anything that creates, updates, or deletes, plus anything whose effect cannot be established as read-only. Transport method alone does not settle this: a read-only query issued over `POST` — a GraphQL or search endpoint — needs no confirmation, while a `POST` that provisions a resource does. Where the effect is genuinely indeterminate, treat it as mutating and ask.
+
+Two failure modes this rule closes:
+
+1. **A generic executor hides its blast radius behind one schema.** Where a single tool accepts an arbitrary method and path, one innocuous-looking call shape serves both a harmless read and an account-wide delete, and neither the tool name nor its schema distinguishes them. Confirmation must therefore key on the request the agent is about to issue, never on the tool's name or its usual use.
+2. **Plausible intent is not authorization.** A task that implies infrastructure change — "set up the new domain" — authorizes proposing that change, not performing it. Intent inferred from surrounding work is the weakest possible warrant for an irreversible action.
+
+When asking, state the exact operation, the target resource, and **the account or scope being acted on**. A single credential commonly covers an entire production account, so the scope is the part a human most needs to check, and it is the part an agent is least likely to have chosen deliberately.
+
+Nothing here narrows the stricter rules already in force above: a mutating call that would also move a secret through a human, or that would downgrade a repository's auth model, stays forbidden regardless of confirmation. See nathanjohnpayne/mergepath#908 for the capability review that produced this rule.
 
 ## Bug fix escalation policy
 

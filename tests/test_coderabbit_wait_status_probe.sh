@@ -33,6 +33,9 @@ make_case() {
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
+  # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
+  # grades findings with the shared coderabbit_tier_of.
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
@@ -95,6 +98,12 @@ bot='coderabbitai[bot]'
 head_time='2026-06-04T00:00:00Z'
 probe_time='2026-06-04T00:00:01Z'
 reply_time='2026-06-04T00:00:06Z'
+# Every review object the reviews endpoint serves below is a review RUN, and a
+# run always publishes a summary body. GitHub returns `body` on every review
+# object, so a fixture that omitted it modelled a shape the API does not emit —
+# and since #900 the emptiness of that field is what separates a run from the
+# body-less review object CodeRabbit creates for a conversational thread reply.
+run_body='**Actionable comments posted: 0**'
 
 fake_now() {
   local clock_file="$state_dir/fake-time"
@@ -205,7 +214,7 @@ case "$endpoint" in
           count=$(cat "$state_dir/probe-count")
         fi
         if [ "$count" -gt 0 ] && [ "$(fake_now)" -ge 2000000006 ]; then
-          printf '[{"id":9901,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$reply_time"
+          printf '[{"id":9901,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         else
           printf '[]\n'
         fi
@@ -213,32 +222,50 @@ case "$endpoint" in
       summary_marker_only)
         # #535.1: one CodeRabbit review on HEAD, no inline findings, but the
         # PR-level summary body carries a Potential issue marker.
-        printf '[{"id":9921,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9921,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       probe_review_on_head)
         # #814: a genuine CodeRabbit review already on HEAD. --probe must
         # return the SAME terminal verdict the polling mode does.
-        printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
+        ;;
+      badge_only_inline_finding)
+        # #837: an ordinary review on HEAD. The interesting part is the FORMAT
+        # of its inline finding (pulls endpoint below).
+        printf '[{"id":9711,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
+        ;;
+      badge_only_summary_finding)
+        # #837 acceptance 2: the same format carried SOLELY by the PR-level
+        # summary, which is the one verdict --probe makes.
+        printf '[{"id":9721,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
+        ;;
+      future_dated_head_review)
+        # #824: the review is pinned to THIS head (commit_id head-sha) but was
+        # submitted BEFORE the head committer date — the shape a future-dated
+        # or metadata-rewritten commit produces, since the committer date is
+        # whatever the pusher wrote. Pre-fix the `submitted_at >= HEAD_ANCHOR`
+        # conjunct discarded it and the finding below went uncounted.
+        printf '[{"id":9731,"user":{"login":"%s"},"submitted_at":"2026-06-03T00:00:00Z","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$run_body"
         ;;
       probe_review_object_premerge_warning)
-        printf '[{"id":9991,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9991,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       probe_notice_after_review)
         # #814 round 9: HEAD review exists; the only later bot comment is a
         # rate-limit notice, so publication is NOT complete.
-        printf '[{"id":9981,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9981,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       probe_narration_after_review|probe_narration_over_notice)
         # #833: HEAD review exists; the later bot comments include a
         # status-probe narration reply (issues endpoint below).
-        printf '[{"id":9983,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9983,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       probe_summary_lands_during_probe_clean|probe_summary_lands_during_probe_marker)
         # #869 TOCTOU: a head-pinned review object; the PR-level summary
         # lands BETWEEN the probe's first issue-comments snapshot and its
         # status read (the issues endpoint below serves the two snapshots
         # by fetch count).
-        printf '[{"id":9998,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","state":"COMMENTED"}]\n' "$bot" "$reply_time"
+        printf '[{"id":9998,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","state":"COMMENTED","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
       probe_reviews_api_failure)
         # #814 / Phase 4b P2 on #823: the reviews fetch fails while the probe
@@ -252,13 +279,13 @@ case "$endpoint" in
         # also what an unchanged head looks like once a wall-clock freshness
         # floor has advanced past it. Selection is by commit_id alone, so it
         # must still read as reported.
-        printf '[{"id":9971,"user":{"login":"%s"},"submitted_at":"2026-06-03T00:00:00Z","commit_id":"head-sha"}]\n' "$bot"
+        printf '[{"id":9971,"user":{"login":"%s"},"submitted_at":"2026-06-03T00:00:00Z","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$run_body"
         ;;
       probe_stale_anchor)
         # #814 / Codex P1 on #823: CodeRabbit reviewed the PREVIOUS head only.
         # The review object is pinned to old-sha, so no HEAD-pinned evidence
         # exists — only the summary issue comment, which carries no SHA.
-        printf '[{"id":9951,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"old-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9951,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"old-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       probe_summary_lags_review)
         # #814 / Phase 4b P1 on #823: mid-publication. A HEAD-pinned review
@@ -266,14 +293,14 @@ case "$endpoint" in
         # passing HEAD_ANCHOR is the PRIOR head's, posted earlier. Existence
         # alone would clear; the summary must also be at least as recent as
         # the review it is credited to.
-        printf '[{"id":9961,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$reply_time"
+        printf '[{"id":9961,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
       intermediate_review_head_pin)
         # #535.2: a NEWER review (later submitted_at) references an
         # intermediate commit, while the HEAD review is older. The
         # HEAD-pinned selection must pick the HEAD review (9931), not the
         # newer intermediate one (9932).
-        printf '[{"id":9931,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"},{"id":9932,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"intermediate-sha"}]\n' "$bot" "$head_time" "$bot" "$reply_time"
+        printf '[{"id":9931,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"},{"id":9932,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"intermediate-sha","body":"%s"}]\n' "$bot" "$head_time" "$bot" "$reply_time" "$run_body" "$run_body"
         ;;
       *)
         printf '[]\n'
@@ -303,6 +330,20 @@ case "$endpoint" in
         # #535.1: no inline findings at all — the marker lives only in the
         # PR-level summary body (issues endpoint below).
         printf '[]\n'
+        ;;
+      badge_only_inline_finding)
+        # #837, verbatim from the live #835 finding (comment 3687972302): the
+        # severity-badge prefix CodeRabbit emits today, plus the machine tag.
+        # There is NO literal "Potential issue" and NO ⚠️ anywhere in the body,
+        # so the retired `grep -iE 'Potential issue|⚠️'` counted zero and the
+        # helper reported `cleared` on a Major security finding.
+        printf '[{"id":9712,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","commit_id":"head-sha","pull_request_review_id":9711,"in_reply_to_id":null,"body":"_🔒 Security \\u0026 Privacy_ | _🟠 Major_ | _⚡ Quick win_\\n\\n**Reject the diagnostic bypass in merge-gate callers.**\\n\\nThe caller accepts a bypass flag that skips the gate.\\n\\n<!-- cr-indicator-types:potential_issue -->"}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      future_dated_head_review)
+        # #824: an ordinary blocking finding on the SHA-matched review. Its
+        # own timestamps predate the head committer date too, so nothing but
+        # the commit_id ties it to this head.
+        printf '[{"id":9732,"user":{"login":"%s"},"created_at":"2026-06-03T00:00:00Z","updated_at":"2026-06-03T00:00:00Z","commit_id":"head-sha","pull_request_review_id":9731,"in_reply_to_id":null,"body":"_⚠️ Potential issue_\\n\\nFinding on the SHA-matched review."}]\n' "$bot"
         ;;
       intermediate_review_head_pin)
         # #535.2: the ⚠️ inline finding is tied to the HEAD review (9931).
@@ -441,6 +482,18 @@ case "$endpoint" in
         # marker, so clearance is decided purely by the HEAD-pinned inline
         # count (which finds the finding on the HEAD review).
         printf '[{"id":8831,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\nSee inline findings on the latest HEAD review."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      badge_only_inline_finding|future_dated_head_review)
+        # A marker-free summary, so the verdict can only come from the inline
+        # count — the surface each of these two cases is actually about.
+        printf '[{"id":8711,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\nSee inline findings on the HEAD review."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      badge_only_summary_finding)
+        # #837 acceptance 2: the modern badge format carried ONLY by the
+        # PR-level summary. No inline comment exists, so this is the #535
+        # class — the finding no required gate dispositions — in the format
+        # the retired grep could not see.
+        printf '[{"id":8721,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\n<details>\\n<summary>scripts/foo.sh (1)</summary>\\n\\n_🔒 Security \\u0026 Privacy_ | _🟠 Major_ | _⚡ Quick win_\\n\\n**Reject the diagnostic bypass in merge-gate callers.**\\n\\n<!-- cr-indicator-types:potential_issue -->"}]\n' "$bot" "$head_time" "$head_time"
         ;;
       probe_clean_incremental)
         # #851 fixtures: no review object (reviews endpoint falls to its []
@@ -1519,6 +1572,61 @@ test_851_review_object_premerge_shares_strip() {
   fi
 }
 
+test_837_badge_only_inline_finding_is_counted() {
+  # #837, the live #835 false clearance. A 🟠 Major security finding whose body
+  # carries NO literal "Potential issue" and NO ⚠️ must still be counted, so the
+  # run reports findings instead of `cleared`. The PR-level summary is
+  # deliberately marker-free: only the inline count can produce this verdict, so
+  # a regression cannot be masked by the #535 summary path.
+  local dir rc status potential
+  dir=$(make_case badge-only-inline 600 false 0 2)
+  rc=$(run_case "$dir" badge_only_inline_finding)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  potential=$(jq -r '.potential_issue_count' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "2" ] && [ "$status" = "findings" ] && [ "$potential" = "1" ]; then
+    pass "#837: a 🟠 Major finding with no Potential issue/⚠️ text is counted (rc 2, count 1)"
+  else
+    fail "#837: expected rc 2/findings/count 1 for the badge-only finding; got rc=$rc status=$status count=$potential"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_837_badge_only_summary_finding_probe_is_findings() {
+  # #837 acceptance 2. --probe makes exactly one verdict — a blocking marker
+  # carried solely by the PR-level summary (#535) — and it must recognize that
+  # marker in CodeRabbit's current badge format, not just the retired literals.
+  local dir rc status
+  dir=$(make_case badge-only-summary 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" badge_only_summary_finding)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "2" ] && [ "$status" = "findings" ]; then
+    pass "#837: --probe returns findings for a summary-only finding in the badge format"
+  else
+    fail "#837 probe: expected rc 2/findings for the badge-only summary; got rc=$rc status=$status"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_824_sha_matched_review_is_honored_regardless_of_timestamp() {
+  # #824. The HEAD committer date is pusher-controlled; when it is dated ahead
+  # of GitHub's clock, a review OF THIS EXACT SHA has submitted_at < the anchor.
+  # Requiring both the SHA match and the timestamp let the weaker, spoofable
+  # condition veto the stronger one, dropping the review — and with it every
+  # finding scoped to it — until wall-clock caught up. commit_id alone selects
+  # it now, so the finding is counted immediately.
+  local dir rc status potential
+  dir=$(make_case future-dated-head 600 false 0 2)
+  rc=$(run_case "$dir" future_dated_head_review)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  potential=$(jq -r '.potential_issue_count' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "2" ] && [ "$status" = "findings" ] && [ "$potential" = "1" ]; then
+    pass "#824: a SHA-matched review is honored though it predates the head committer date (rc 2, count 1)"
+  else
+    fail "#824: expected rc 2/findings/count 1 for the SHA-matched aged review; got rc=$rc status=$status count=$potential"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
 test_851_summary_helpers_unit() {
   # The three predicates are pure; extract the sentinel block and source it so
   # the 40-hex token boundary and the zero-stanza vacuity guard are assertable
@@ -1531,6 +1639,12 @@ test_851_summary_helpers_unit() {
     "$ROOT/scripts/coderabbit-wait.sh")"
   awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
     "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  # The block's one external dependency (#837): the shared classifier the
+  # blocking-marker predicate grades each line with. Sourced from the same
+  # canonical lib the script hard-requires, so the unit assertions below run
+  # against the real classifier rather than a test-local stand-in.
+  # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+  . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
   # shellcheck disable=SC1090
   . "$snip"
   h40='0123456789abcdef0123456789abcdef01234567'
@@ -1589,6 +1703,208 @@ _⚠️ Potential issue_ after an inverted pair"
   fi
 }
 
+test_884_count_bodies_fails_closed_unit() {
+  # #884: the counting path must never answer "0 blocking findings" for input
+  # it could not read. The pre-fix code relied on `jq 'length'` failing loudly
+  # on a dead upstream fetch; it does not — on EMPTY stdin jq prints nothing
+  # and exits 0, the `while` condition errored (exempt from errexit), and the
+  # function echoed 0 with status 0. That is a silent false-clear of exactly
+  # the kind #837 fixes, so it is asserted directly on the pure helpers rather
+  # than through the stub harness, which cannot produce a dead fetch.
+  local snip="$WORKDIR/count-helpers.sh" bad="" out rc
+  awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  awk '/^# BEGIN coderabbit_count_helpers$/{f=1;next} /^# END coderabbit_count_helpers$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >>"$snip"
+  # The real classifier the blocking predicate grades each line with, plus the
+  # script's stderr logger, which crw_count_blocking_bodies calls on refusal.
+  # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+  . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  log() { echo "[coderabbit-wait] $*" >&2; }
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  # 1. A dead upstream fetch (empty string) must REFUSE, not report zero.
+  rc=0; out=$(crw_count_blocking_bodies "" 2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad empty-returned-success"
+  [ "$out" != "0" ] || bad="$bad empty-reported-zero"
+
+  # 2. A non-array JSON value is the same hazard by another route.
+  rc=0; out=$(crw_count_blocking_bodies '{}' 2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad object-returned-success"
+  rc=0; out=$(crw_count_blocking_bodies '"a string"' 2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad string-returned-success"
+
+  # 3. A multi-VALUE stream is the route a per-value filter cannot see: `[] []`
+  #    printed `0\n0`, which is not an integer, so the `while` condition
+  #    errored and the loop was skipped exactly as in the empty case.
+  rc=0; out=$(crw_count_blocking_bodies '[] []' 2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad multivalue-returned-success"
+  [ "$out" != "0" ] || bad="$bad multivalue-reported-zero"
+  rc=0; out=$(crw_count_blocking_bodies 'null' 2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad null-returned-success"
+
+  # 4. A genuinely empty array is NOT an error — it is a real zero.
+  rc=0; out=$(crw_count_blocking_bodies '[]' 2>/dev/null) || rc=$?
+  { [ "$rc" -eq 0 ] && [ "$out" = "0" ]; } || bad="$bad empty-array-not-clean-zero"
+
+  # 5. Valid arrays still count correctly: the badge-only Major of #837 counts,
+  #    ordinary prose does not.
+  rc=0
+  out=$(crw_count_blocking_bodies \
+    '["_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_","just a nitpick"]' 2>/dev/null) || rc=$?
+  { [ "$rc" -eq 0 ] && [ "$out" = "1" ]; } || bad="$bad valid-array-count=$out/rc=$rc"
+
+  if [ -z "$bad" ]; then
+    pass "#884: crw_count_blocking_bodies fails closed on unreadable input, still counts valid arrays"
+  else
+    fail "#884 count fail-closed:$bad"
+  fi
+}
+
+test_884_clearance_reviews_api_failure_fails_closed() {
+  # Phase 4b P1 on #884. The --probe path already refused a failed reviews read
+  # (test_probe_reviews_api_failure_is_infra_not_clean above), but the
+  # CLEARANCE path reached that same read through head_review_finding_bodies,
+  # which tested only whether the review id came back EMPTY. A failed lookup
+  # and a genuine "no review on this head" are both empty, so an API failure
+  # emitted `[]`, the counter graded it a confident zero, and the wait reported
+  # `cleared` on a head whose inline findings were never inspected. Reuses the
+  # probe scenario's stub (clean summary, reviews endpoint exits 44) so the two
+  # paths are asserted against identical upstream failure.
+  local dir rc=0 status
+  dir=$(make_case clearance-reviews-fail 600 true 30 3 2)
+  ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_SCENARIO=probe_reviews_api_failure \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  if [ -s "$dir/out.json" ]; then
+    status=$(jq -er '.status' "$dir/out.json" 2>/dev/null) || {
+      fail "#884: reviews-API failure emitted malformed JSON instead of the expected infra exit"
+      sed 's/^/      /' "$dir/err.log" >&2 || true
+      return
+    }
+  else
+    status="no-json (expected for infra exit)"
+  fi
+  if [ "$rc" = "3" ] && grep -q "simulated reviews API failure" "$dir/err.log"; then
+    pass "#884: a reviews-API failure on the clearance path exits 3 (rc=$rc status=$status)"
+  else
+    fail "#884: a failed reviews read produced rc=$rc status=$status — expected the reviews-API infra failure"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_900_review_run_selector_ignores_bodyless_replies() {
+  # #900. The `reviews` endpoint carries two kinds of coderabbitai[bot] object
+  # on one head: review RUNS, and the review objects CodeRabbit creates for a
+  # CONVERSATIONAL REPLY on a review thread. Only a run publishes a summary
+  # body and refreshes the per-SHA StatusContext, so anchoring the Phase 4b
+  # barrier's temporal conjunct on the newest object outright let a reply pin
+  # the anchor past a status no later run would ever refresh — a permanent
+  # not-yet on a provider that had finished.
+  #
+  # The fixture is the five-object shape measured on #889 head 2433fe99: two
+  # runs with non-empty summary bodies, each followed by a `success` status one
+  # second later, and three body-less replies (CodeRabbit answering a rebuttal,
+  # then the `[mergepath-resolve:...]` tag reply). Asserted on the pure
+  # selector and then chained through the REAL barrier classifier, because the
+  # defect is a selection rather than a verdict and the stub harness's fixtures
+  # carry a single review object.
+  local snip="$WORKDIR/review-run-selector.sh" bad="" reviews sel inverse
+  local bot='coderabbitai[bot]' sha='2433fe99'
+
+  awk '/^# BEGIN coderabbit_review_run_selector$/{f=1;next} /^# END coderabbit_review_run_selector$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  # shellcheck disable=SC1090
+  . "$snip"
+  # The one consumer of the selected object: the barrier arm whose conjunct the
+  # reply defeated. Sourced from the shipped library so the chained assertions
+  # below run against real behaviour rather than a restatement of it. lib.sh is
+  # sourced-not-executed and defines only p4b_* names.
+  # shellcheck source=../scripts/phase-4b/lib.sh
+  . "$ROOT/scripts/phase-4b/lib.sh"
+
+  # <review-json|null> <context_updated_at> -> an rc-7 probe payload.
+  _p4b_probe_json() {
+    jq -nc --argjson rev "${1:-null}" --arg cu "$2" --arg sha "$sha" '
+      {head_sha: $sha,
+       probe: {observed: "awaiting-summary", context_state: "success",
+               context_updated_at: $cu}}
+      + (if $rev == null then {} else {review: $rev} end)'
+  }
+
+  reviews='[
+    {"id":4859383068,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:08:14Z","body":"**Actionable comments posted: 1**"},
+    {"id":4859408200,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:13:18Z","body":""},
+    {"id":4859458474,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:23:26Z","body":"**Actionable comments posted: 0**"},
+    {"id":4859497649,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:31:38Z","body":""},
+    {"id":4859498139,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:31:44Z","body":null},
+    {"id":7000000001,"user":{"login":"other-reviewer[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:40:00Z","body":"a body-bearing object from another bot"},
+    {"id":7000000002,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeef",
+     "submitted_at":"2026-08-04T22:45:00Z","body":"a body-bearing object on another head"}
+  ]'
+
+  # 1. The selector returns the newest body-BEARING object — the second run —
+  #    not the newest object. The two trailing rows also keep the pre-existing
+  #    bot-login and commit_id filters asserted: either would win on
+  #    submitted_at if it were dropped.
+  sel=$(crw_select_head_pinned_review_run "$reviews" "$bot" "$sha")
+  [ "$(printf '%s' "$sel" | jq -r '.id')" = "4859458474" ] || bad="$bad selected-id"
+  [ "$(printf '%s' "$sel" | jq -r '.submitted_at')" = "2026-08-04T22:23:26Z" ] || bad="$bad selected-at"
+  [ "$(printf '%s' "$sel" | jq -r '.endpoint')" = "reviews" ] || bad="$bad selected-endpoint"
+
+  # 2. Chained through the barrier: the status refreshed one second after that
+  #    run corroborates it, so the #889 shape now OPENS instead of wedging.
+  [ "$(p4b_barrier_class_coderabbit "$sha" 7 \
+        "$(_p4b_probe_json "$sel" '2026-08-04T22:23:27Z')")" = "reported" ] \
+    || bad="$bad barrier-not-reported"
+
+  # 3. The #875 temporal concern stays closed. When the newest object IS a real
+  #    run — a same-SHA rerun whose summary and status refresh are still
+  #    pending — the status still exposed is the PREVIOUS run's, and the
+  #    barrier must hold.
+  inverse='[
+    {"id":4859458474,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:23:26Z","body":"**Actionable comments posted: 0**"},
+    {"id":4859497649,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:31:38Z","body":"**Actionable comments posted: 2**"}
+  ]'
+  sel=$(crw_select_head_pinned_review_run "$inverse" "$bot" "$sha")
+  [ "$(printf '%s' "$sel" | jq -r '.id')" = "4859497649" ] || bad="$bad inverse-selected-id"
+  [ "$(p4b_barrier_class_coderabbit "$sha" 7 \
+        "$(_p4b_probe_json "$sel" '2026-08-04T22:23:27Z')")" = "not-yet" ] \
+    || bad="$bad inverse-barrier-opened"
+
+  # 4. Fail-closed posture is unchanged: replies ONLY selects nothing, the rc-7
+  #    payload then carries no `review`, and the barrier keeps its bounded wait.
+  sel=$(crw_select_head_pinned_review_run \
+    '[{"id":4859497649,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+       "submitted_at":"2026-08-04T22:31:38Z","body":""}]' "$bot" "$sha")
+  [ -z "$sel" ] || bad="$bad replies-only-selected-something"
+  [ "$(p4b_barrier_class_coderabbit "$sha" 7 \
+        "$(_p4b_probe_json null '2026-08-04T22:23:27Z')")" = "not-yet" ] \
+    || bad="$bad no-evidence-opened"
+
+  unset -f _p4b_probe_json
+  if [ -z "$bad" ]; then
+    pass "#900: a body-less CodeRabbit reply object no longer anchors the barrier's temporal conjunct"
+  else
+    fail "#900 review-run selection:$bad"
+  fi
+}
+
+test_900_review_run_selector_ignores_bodyless_replies
+test_884_count_bodies_fails_closed_unit
+test_884_clearance_reviews_api_failure_fails_closed
 test_446_newer_comment_suppresses_stale_status
 test_timeout_probe_posts_once_and_surfaces_reply
 test_existing_status_probe_reply_never_clears
@@ -1619,6 +1935,9 @@ test_probe_unknown_option_fails_closed
 test_851_summary_evidence_matrix
 test_851_review_object_premerge_shares_strip
 test_851_summary_helpers_unit
+test_837_badge_only_inline_finding_is_counted
+test_837_badge_only_summary_finding_probe_is_findings
+test_824_sha_matched_review_is_honored_regardless_of_timestamp
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

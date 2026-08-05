@@ -2,6 +2,8 @@
 
 This catalog documents every normative rule of Mergepath in English, in one place, with a stable ID per rule. It is a **derived model**, like the root [`CONTEXT.md`](https://github.com/nathanjohnpayne/mergepath/blob/main/CONTEXT.md) glossary: the canonical sources — `REVIEW_POLICY.md`, `AGENTS.md`, `DEPLOYMENT.md`, `.github/review-policy.yml`, `rules/repo_rules.md`, `ai_agent_tooling_standard.md`, the `docs/agents/` tree, and the propagation manifest — remain the normative homes, and on any divergence the source wins. Each entry cites its source; nothing here adds a rule that does not exist at a source.
 
+IDs are stable and never reused or renumbered, so a rule added later takes the next free ID in its part and is filed under the section matching its source. Numeric order therefore need not follow document order — read the section headings, not the numbers, to find a topic.
+
 Legend: **●** marks a configuration rule — it constrains an observable arrangement of entities (identities, PRs, reviews, labels, threads, docs, manifest entries) and is machine-checkable in principle; the OWL companion ([`mergepath-rules.ttl`](mergepath-rules.ttl), see [`README.md`](README.md)) formalizes a core subset of these as axioms whose violation a reasoner detects. **○** marks a procedural rule — it constrains ordering, waiting, or judgment, and is enforced by agents, reviewers, and the shell gates rather than a logic reasoner.
 
 The catalog has two parts mirroring the corpus: **Part R** (the review pipeline: `REVIEW_POLICY.md`, `AGENTS.md` § Code Review Policy, `review-policy.yml`) and **Part G** (structure and governance: the Standard, `rules/`, `docs/agents/`, the manifest). The sources themselves overlap — AGENTS.md summarizes REVIEW_POLICY.md, the overlay restates parts of the shared core as recorded transitional debt — so a handful of rules appear in both parts under their respective sources; load-bearing duplicates carry cross-references.
@@ -872,6 +874,20 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 **G-187.** Single-item reads are not lists and need no pagination. ● — docs/agents/shared-operating-rules.md
 
 **G-188.** When in doubt, paginate — a no-op on short lists, the only safe default on long ones. ○ — docs/agents/shared-operating-rules.md
+
+### Background jobs and expected duration
+
+**G-378.** A backgrounded command carries an expected duration stated at launch, and is checked against that expectation. ○ — docs/agents/shared-operating-rules.md
+
+**G-379.** "Still running" is never reported as a status without comparing elapsed time to the expectation. ○ — docs/agents/shared-operating-rules.md
+
+**G-380.** A self-terminating command is preferred — `timeout N` inside it — so a hang dies on its own rather than on the agent noticing. ○ — docs/agents/shared-operating-rules.md
+
+**G-381.** A job with no obvious duration still quotes a bound: the provider-poll helper's own `max_wait_seconds` / `review_timeout_seconds`. ○ — docs/agents/shared-operating-rules.md
+
+**G-382.** Any job exceeding roughly 3× its expected duration is investigated rather than reported as normal. ○ — docs/agents/shared-operating-rules.md
+
+**G-383.** Mutating `scripts/phase-4b/lib.sh` and then running `tests/test_phase_4b_automation.sh` against it is forbidden — the orchestrator stacks 900s adapter timeouts; the pure helpers are sourced and asserted on directly instead. ○ — docs/agents/operating-rules.md
 
 ### Secrets and credential failure
 
