@@ -798,9 +798,16 @@ if [ "$MARKERLESS_SUMMARY_COUNT" -gt 0 ]; then
   MARKERLESS_SUMMARY_ID=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.id // 0')
   if [ "$MARKERLESS_SUMMARY_ID" != "0" ]; then
     MARKERLESS_SUMMARY_BODY=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.body')
+    # fresh_at travels WITH the candidate. This selection has already applied
+    # the >= HEAD_REVIEW_AT floor, so dropping the field would leave the
+    # correlation filter below reading it as "" and discarding a candidate it
+    # had just admitted — a false HOLD on the review-triggered path (CodeRabbit
+    # Major on #886).
+    MARKERLESS_SUMMARY_FRESH_AT=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.fresh_at // ""')
     SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c \
       --argjson id "$MARKERLESS_SUMMARY_ID" --arg body "$MARKERLESS_SUMMARY_BODY" \
-      '. + [{id: $id, body: $body, scope: "review-object"}]')
+      --arg fresh_at "$MARKERLESS_SUMMARY_FRESH_AT" \
+      '. + [{id: $id, body: $body, scope: "review-object", fresh_at: $fresh_at}]')
   elif [ -z "$HEAD_REVIEW_AT" ]; then
     log "markerless CodeRabbit full-review candidate has no timestamped completed CodeRabbit review object on $HEAD_SHA — no summary findings in scope"
   else

@@ -2769,6 +2769,35 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# The correlation filter reads each candidate's own fresh_at, so the markerless
+# candidate has to carry the value its selection floor already checked. Dropping
+# it made the filter discard a candidate it had just admitted — a false HOLD
+# reachable only when REQUIRE_REVIEW_SUMMARY and the markerless format meet.
+echo "--- Test 47d3b (#886): review event + correlated markerless summary → exit 1 on its finding"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$MARKERLESS_FULL_REVIEW" \
+  "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:00Z" "2026-08-04T00:00:20Z")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)" \
+    && ! echo "$OUT" | grep -q "awaiting its PR-level summary" \
+    && ! echo "$OUT" | grep -q "predate the completed CodeRabbit review object"; then
+  pass "a correlated markerless summary is classified, not discarded, on the review-triggered path"
+else
+  fail "expected rc=1 from the markerless finding rather than the publication hold; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # The correlation floor is scoped to the review-triggered path. On the
 # arrival-independent sweep an uncorrelated candidate must stay IN scope:
 # dropping it there yields zero candidates, which passes, and a real blocking
