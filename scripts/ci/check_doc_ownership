@@ -150,13 +150,42 @@ mp_path_is_unsafe() {
 mp_markdown_renderable_text() {
   local f="$1"
   awk '
+    # BLOCK_TAGS is the HTML block condition 6 tag list (`source` left it and
+    # `search` joined it in CommonMark 0.31), sentinel-padded so a substring
+    # lookup cannot false-match a longer name. OPEN_TAG_ONLY / CLOSE_TAG_ONLY
+    # spell condition 7 — a complete tag, attributes and all, alone on its
+    # line. They are built as strings rather than written as /literals/
+    # because an attribute value may be single-quoted, and this whole program
+    # is one shell single-quoted string; the quote characters are made with
+    # %c for the same reason. LIST_MARKER is shared by the classifier and the
+    # marker-width measurement so the two cannot drift apart.
+    BEGIN {
+      SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BT = sprintf("%c", 96)
+      LIST_MARKER = "^([-+*]|[0-9]+[.)])[[:space:]]+"
+      BLOCK_TAGS = " address article aside base basefont blockquote body"
+      BLOCK_TAGS = BLOCK_TAGS " caption center col colgroup dd details"
+      BLOCK_TAGS = BLOCK_TAGS " dialog dir div dl dt fieldset figcaption"
+      BLOCK_TAGS = BLOCK_TAGS " figure footer form frame frameset h1 h2 h3"
+      BLOCK_TAGS = BLOCK_TAGS " h4 h5 h6 head header hr html iframe legend li"
+      BLOCK_TAGS = BLOCK_TAGS " link main menu menuitem nav noframes ol"
+      BLOCK_TAGS = BLOCK_TAGS " optgroup option p param search section"
+      BLOCK_TAGS = BLOCK_TAGS " summary table tbody td tfoot th thead title"
+      BLOCK_TAGS = BLOCK_TAGS " tr track ul "
+      tagname = "[A-Za-z][A-Za-z0-9-]*"
+      attrvalue = "([^ \t" DQ SQ "=<>" BT "]+"
+      attrvalue = attrvalue "|" SQ "[^" SQ "]*" SQ
+      attrvalue = attrvalue "|" DQ "[^" DQ "]*" DQ ")"
+      attr = "[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*([ \t]*=[ \t]*" attrvalue ")?"
+      OPEN_TAG_ONLY = "^<" tagname "(" attr ")*[ \t]*/?>[ \t]*$"
+      CLOSE_TAG_ONLY = "^</" tagname "[ \t]*>[ \t]*$"
+    }
     function run_len(s, at, ch, n) {
       n = 0
       while (substr(s, at + n, 1) == ch) n++
       return n
     }
     function is_list_marker(s) {
-      return s ~ /^([-+*]|[0-9]+[.)])[[:space:]]+/
+      return s ~ LIST_MARKER
     }
     function is_thematic_break(s, compact, ch, i) {
       compact = s
@@ -180,7 +209,48 @@ mp_markdown_renderable_text() {
       }
       return 1
     }
-    function opens_text_flow(s, hashes) {
+    # Does the line begin one of the seven HTML block start conditions
+    # CommonMark defines? Only those replace or interrupt paragraph text. A
+    # line that merely BEGINS with a `<` — inline HTML, an autolink, an
+    # incomplete tag — is ordinary paragraph content, and reading it as a
+    # block boundary closes the paragraph and erases the indented
+    # continuation lines that follow it from the link scan (#811).
+    #
+    # Condition 7 (a complete open or closing tag alone on the line) is the
+    # one kind that cannot interrupt an OPEN paragraph, so it is tested only
+    # when no text flow is already open; the tag names condition 1 owns are
+    # excluded from it, as the spec excludes them.
+    #
+    # Condition 4 is spelled `<!` + an UPPERCASE ASCII letter, the reading
+    # markdown-it-py implements — the parser the prose-wrap tooling in this
+    # repo relies on, and the one the wrapped reference definition support
+    # below was verified against. It is also the safe reading of the 0.31
+    # relaxation to any ASCII letter: treating a lowercase `<!doctype` line
+    # as prose keeps a following continuation link VISIBLE to the scan
+    # instead of silently hiding it.
+    function opens_html_block(s, flow_open,   low, rest, name, after) {
+      if (substr(s, 1, 1) != "<") return 0
+      low = tolower(s)
+      if (low ~ /^<(pre|script|style|textarea)([[:space:]>]|$)/) return 1
+      if (substr(s, 1, 4) == "<!--") return 1
+      if (substr(s, 1, 2) == "<?") return 1
+      if (substr(s, 1, 9) == "<![CDATA[") return 1
+      if (substr(s, 1, 2) == "<!" && substr(s, 3, 1) ~ /^[A-Z]$/) return 1
+      rest = (substr(s, 1, 2) == "</") ? substr(s, 3) : substr(s, 2)
+      if (match(rest, /^[A-Za-z][A-Za-z0-9-]*/)) {
+        name = tolower(substr(rest, 1, RLENGTH))
+        after = substr(rest, RLENGTH + 1)
+        if (index(BLOCK_TAGS, " " name " ") > 0 \
+            && (after == "" || after ~ /^[[:space:]>]/ || substr(after, 1, 2) == "/>")) {
+          return 1
+        }
+      }
+      if (flow_open) return 0
+      if (low ~ /^<\/?(pre|script|style|textarea)([[:space:]>]|\/|$)/) return 0
+      if (s ~ OPEN_TAG_ONLY || s ~ CLOSE_TAG_ONLY) return 1
+      return 0
+    }
+    function opens_text_flow(s, flow_open,   hashes) {
       # A block quote may lazily continue its paragraph without repeating the
       # `>` marker on the next line. Classify the quoted block content, not
       # the container marker itself.
@@ -190,13 +260,26 @@ mp_markdown_renderable_text() {
       }
       if (s == "") return 0
       if (is_thematic_break(s) || is_setext_underline(s)) return 0
-      if (is_list_marker(s)) return 1
+      if (is_list_marker(s)) {
+        # A list item is a container whose content is parsed as blocks in its
+        # own right, so the item opens a paragraph only when its FIRST child
+        # is one. Consume the marker and classify what follows by the same
+        # rules; a heading-first or thematic-break-first item opens no text
+        # flow, and the indented lines under it really are code (#812).
+        match(s, LIST_MARKER)
+        # Reported back so the caller can measure indented code from the item
+        # CONTENT column rather than from column zero.
+        marker_columns += RLENGTH
+        s = substr(s, RLENGTH + 1)
+        if (s == "") return 0
+        return opens_text_flow(s, flow_open)
+      }
       if (substr(s, 1, 1) == "#") {
         hashes = run_len(s, 1, "#")
         if (hashes <= 6 && substr(s, hashes + 1) ~ /^([[:space:]]|$)/) return 0
       }
       if (s ~ /^\[[^]]+\]:[[:space:]]*/) return 0
-      if (s ~ /^<([!?\/]|[[:alpha:]])/) return 0
+      if (opens_html_block(s, flow_open)) return 0
       return 1
     }
     function strip_inline_code(s, out, pos, rel, open, width, scan, got, close_width) {
@@ -265,8 +348,19 @@ mp_markdown_renderable_text() {
       # Indented code cannot interrupt an open paragraph or list item. Keep an
       # indented line renderable while that text flow is open; only blank it
       # when indentation can really start a CommonMark code block.
+      #
+      # Inside a list item, indentation is measured from the item CONTENT
+      # column, so code begins four columns past THAT, not past column zero:
+      # under `- # Governance` a four-space line is still item prose and only
+      # a six-space one is code. Without that column, classifying a
+      # block-first item correctly (#812) would blank the ordinary item prose
+      # that follows it. The column is dropped again by the first line
+      # indented less than it that is not a lazy continuation — that line
+      # closes the item.
+      if (indent < code_column && !text_flow_open) code_column = 0
+      code_indent = (line ~ /^\t/) ? 4 : indent
       if (!reference_continuation && !text_flow_open \
-          && (line ~ /^\t/ || substr(line, 1, 4) == "    ")) {
+          && code_indent >= code_column + 4) {
         print ""
         next
       }
@@ -282,7 +376,9 @@ mp_markdown_renderable_text() {
       } else {
         flow_probe = line
         sub(/^[[:space:]]*/, "", flow_probe)
-        text_flow_open = opens_text_flow(flow_probe)
+        marker_columns = 0
+        text_flow_open = opens_text_flow(flow_probe, text_flow_open)
+        if (marker_columns > 0) code_column = indent + marker_columns
       }
     }
   ' "$f"
@@ -360,7 +456,11 @@ mp_doc_link_targets() {
 
           # Bare destination: the `)` that closes the link is the first
           # one encountered at nesting depth zero. Backslash escapes do
-          # not affect balancing and are unescaped for path comparison.
+          # not affect balancing, and the escape is carried through rather
+          # than resolved here: normalize_target() below resolves escapes
+          # and character references together, in one pass, and unescaping
+          # twice would let `\&#46;` — an escaped ampersand, which renders
+          # literally — decode into a `.` the reader never sees.
           depth = 0
           target = ""
           destination_done = 0
@@ -369,7 +469,7 @@ mp_doc_link_targets() {
             if (c == "\\" && j < n) {
               nextc = substr(line, j + 1, 1)
               if (nextc ~ /[[:punct:]]/) {
-                if (!destination_done) target = target nextc
+                if (!destination_done) target = target c nextc
                 j++
                 continue
               }
@@ -432,9 +532,77 @@ mp_doc_link_targets() {
         -e 's/\)$//' \
         -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
     | awk '
+        # CommonMark resolves entity and numeric character references inside
+        # a link destination (§ Entity and numeric character references), so
+        # the path a reader actually opens is the DECODED one:
+        # `[audit](hub&#46;md)` navigates to `hub.md`. Comparing the encoded
+        # spelling against the inventory therefore misses a hub-only target
+        # the browser resolves perfectly well (#807).
+        #
+        # NAMED_CP is the complete set of HTML5 named references whose
+        # expansion is a single ASCII character — the closed set that can
+        # spell a character of the repo-relative Markdown paths this
+        # inventory declares. Decoding stops at ASCII deliberately: the %c
+        # conversion for a code point above 127 is implementation-defined
+        # across the awks CI runs (mawk emits one byte; gawk in a UTF-8
+        # locale emits the multibyte character), so a non-ASCII expansion
+        # has no deterministic byte spelling to compare against a filename.
+        # Such a reference is left encoded, which loses a match rather than
+        # inventing one, and the numeric spelling of an ASCII character is
+        # decoded in full either way.
+        BEGIN {
+          refs = "Tab 9 NewLine 10 excl 33 QUOT 34 quot 34 num 35 dollar 36"
+          refs = refs " percnt 37 AMP 38 amp 38 apos 39 lpar 40 rpar 41"
+          refs = refs " ast 42 midast 42 plus 43 comma 44 period 46 sol 47"
+          refs = refs " colon 58 semi 59 LT 60 lt 60 equals 61 GT 62 gt 62"
+          refs = refs " quest 63 commat 64 lbrack 91 lsqb 91 bsol 92"
+          refs = refs " rbrack 93 rsqb 93 Hat 94 UnderBar 95 lowbar 95"
+          refs = refs " DiacriticalGrave 96 grave 96 lbrace 123 lcub 123"
+          refs = refs " VerticalLine 124 verbar 124 vert 124 rbrace 125"
+          refs = refs " rcub 125"
+          n_refs = split(refs, named_ref, " ")
+          for (i = 1; i < n_refs; i += 2) {
+            NAMED_CP[named_ref[i]] = named_ref[i + 1] + 0
+          }
+        }
         function hex_value(c, p) {
           p = index("0123456789ABCDEF", toupper(c))
           return p ? p - 1 : -1
+        }
+        # Decode the character reference starting at s[i] (an "&"). Sets the
+        # global REF_LEN to the source length consumed; REF_LEN 0 means "not
+        # a character reference", and the caller emits the "&" literally.
+        #
+        # The length caps are the spec form: `&#` + 1-7 decimal digits + `;`,
+        # `&#x` + 1-6 hex digits + `;`. They are tested with length() rather
+        # than an {1,7} interval, which not every awk implementation
+        # supports.
+        function char_reference_at(s, i,   rest, semi, body, digits, cp, k) {
+          REF_LEN = 0
+          rest = substr(s, i)
+          semi = index(rest, ";")
+          if (semi < 3) return ""
+          body = substr(rest, 2, semi - 2)
+          if (substr(body, 1, 1) != "#") {
+            if (!(body in NAMED_CP)) return ""
+            REF_LEN = semi
+            return sprintf("%c", NAMED_CP[body])
+          }
+          digits = substr(body, 2)
+          if (substr(digits, 1, 1) == "x" || substr(digits, 1, 1) == "X") {
+            digits = substr(digits, 2)
+            if (digits !~ /^[0-9A-Fa-f]+$/ || length(digits) > 6) return ""
+            cp = 0
+            for (k = 1; k <= length(digits); k++) {
+              cp = cp * 16 + hex_value(substr(digits, k, 1))
+            }
+          } else {
+            if (digits !~ /^[0-9]+$/ || length(digits) > 7) return ""
+            cp = digits + 0
+          }
+          if (cp < 1 || cp > 127) return ""
+          REF_LEN = semi
+          return sprintf("%c", cp)
         }
         function percent_decode(s, out, i, c, hi, lo) {
           out = ""
@@ -453,24 +621,49 @@ mp_doc_link_targets() {
           }
           return out
         }
-        function unescape_punctuation(s, out, i, c, nextc) {
+        # Backslash escapes and character references are resolved in ONE
+        # left-to-right pass, because CommonMark resolves them together and
+        # re-reads neither result as syntax. Two separate passes get both
+        # directions wrong: an escaped ampersand (`\&#46;`, which renders
+        # literally) would decode anyway, and `&#38;#46;` — an escaped
+        # ampersand written as a reference — would decode twice into a `.`
+        # the reader never sees.
+        function unescape_and_decode(s,   out, i, c, nextc, decoded) {
           out = ""
-          for (i = 1; i <= length(s); i++) {
+          i = 1
+          while (i <= length(s)) {
             c = substr(s, i, 1)
-            nextc = substr(s, i + 1, 1)
-            if (c == "\\" && nextc ~ /[[:punct:]]/) {
-              out = out nextc
-              i++
-            } else {
+            if (c == "\\") {
+              nextc = substr(s, i + 1, 1)
+              if (nextc != "" && nextc ~ /[[:punct:]]/) {
+                out = out nextc
+                i += 2
+                continue
+              }
               out = out c
+              i++
+              continue
             }
+            if (c == "&") {
+              decoded = char_reference_at(s, i)
+              if (REF_LEN > 0) {
+                out = out decoded
+                i += REF_LEN
+                continue
+              }
+            }
+            out = out c
+            i++
           }
           return out
         }
         function normalize_target(s) {
-          s = unescape_punctuation(s)
+          s = unescape_and_decode(s)
           # URL parsing recognizes raw query/fragment delimiters before
-          # percent decoding, so encoded %3F/%23 remain filename bytes.
+          # percent decoding, so encoded %3F/%23 remain filename bytes. A
+          # character reference is resolved BEFORE the URL is read, though,
+          # so a `&#63;` really does start a query string — which is why the
+          # decode above runs first.
           sub(/[?#].*$/, "", s)
           return percent_decode(s)
         }

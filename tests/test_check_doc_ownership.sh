@@ -1671,6 +1671,164 @@ docs/agents/hub(1).md|# Hub-only machinery")
   fi
 done
 
+# ── CommonMark conformance matrix (Cases 14v / 14w / 14x) ────────────
+#
+# Every row below is derived from the CommonMark 0.31.2 spec section it
+# names, not from the shape of the code under test, and each is checked
+# against the rendered HTML the repo's own reference parser produces
+# (markdown-it-py's commonmark preset — the parser the prose-wrap
+# tooling already relies on, and the one the wrapped-reference-definition
+# support above was verified against).
+#
+# Assertions are ANCHORED and EXACT rather than substring greps: the
+# whole diagnostic line is reconstructed and matched with `grep -xF`, and
+# the number of `FAIL:` lines in the output is counted, so a row can
+# neither pass on a fragment of some unrelated failure nor hide a second
+# finding it did not intend to provoke.
+CM_TAIL="— a canonical doc is mirrored verbatim to every consumer, a hub-only doc never travels, so that reference resolves on the hub and 404s downstream. Drop the reference, restate the content inline, or link it as an absolute https://github.com/... URL."
+
+# The link RENDERS, so check 10 must report it — exactly once, naming the
+# resolved-target spelling, with no other failure alongside it.
+expect_rendered() {
+  local label="$1" rc="$2" out="$3" hub="${4:-docs/agents/hub.md}"
+  local want="FAIL: canonical doc 'docs/agents/shared.md' references the hub-only doc '$hub' by a relative Markdown link that resolves to it $CM_TAIL"
+  local exact total
+  exact=$(printf '%s\n' "$out" | grep -cxF -- "$want" || true)
+  total=$(printf '%s\n' "$out" | grep -c '^FAIL: ' || true)
+  if [ "$rc" = "1" ] && [ "$exact" = "1" ] && [ "$total" = "1" ]; then
+    pass "$label"
+  else
+    fail "$label (rc=$rc exact=$exact total=$total): $out"
+  fi
+}
+
+# The link does NOT render — it is code, raw HTML, or a destination that
+# never resolves to the hub-only path — so the run must be a clean PASS
+# over the whole fixture inventory, with no failure of any kind.
+expect_not_rendered() {
+  local label="$1" rc="$2" out="$3" ndocs="${4:-2}"
+  local want="check_doc_ownership: PASS ($ndocs docs/agents doc(s) classified; classes: canonical per-repo-owned hub-only)"
+  local exact total
+  exact=$(printf '%s\n' "$out" | grep -cxF -- "$want" || true)
+  total=$(printf '%s\n' "$out" | grep -c '^FAIL: ' || true)
+  if [ "$rc" = "0" ] && [ "$exact" = "1" ] && [ "$total" = "0" ]; then
+    pass "$label"
+  else
+    fail "$label (rc=$rc exact=$exact total=$total): $out"
+  fi
+}
+
+# One canonical-doc body against the two-doc truth fixture.
+run_truth_body() {
+  run_with_doc_bodies "$MANIFEST_TRUTH" \
+    "docs/agents/shared.md|$1
+docs/agents/hub.md|# Hub-only machinery"
+}
+
+# Drive a `label|body` matrix through run_truth_body and assert the given
+# rendering verdict for every row.
+run_cm_matrix() {
+  local verdict="$1" prefix="$2" row label body
+  shift 2
+  for row in "$@"; do
+    label="${row%%|*}"
+    body="${row#*|}"
+    set +e
+    out=$(run_truth_body "$body")
+    rc=$?
+    set -e
+    "$verdict" "$prefix: $label" "$rc" "$out"
+  done
+}
+
+# --- Case 14v: character references in link destinations (#807) ------
+# § Entity and numeric character references: a reference is recognized in
+# a link destination and resolves to the character it names, so the
+# destination a reader's browser opens is the DECODED path. Comparing the
+# encoded spelling lets `[audit](hub&#46;md)` reach a hub-only sibling
+# with check 10 silent.
+run_cm_matrix expect_rendered "Case 14v" \
+  'decimal reference (the #807 reproduction)|See [the audit](hub&#46;md) for details.' \
+  'lowercase-x hex reference|See [the audit](hub&#x2E;md) for details.' \
+  'uppercase-X hex reference|See [the audit](hub&#X2E;md) for details.' \
+  'seven decimal digits is the longest decimal form|See [the audit](hub&#0000046;md) for details.' \
+  'six hex digits is the longest hex form|See [the audit](hub&#x00002E;md) for details.' \
+  'named reference with an ASCII expansion|See [the audit](hub&period;md) for details.' \
+  'named and numeric references spell ./ together|See [the audit](&#46;&sol;hub.md) for details.' \
+  'angle-bracket destination|See [the audit](<hub&#46;md>) for details.' \
+  'same-line reference definition|See [the audit].\n\n[the audit]: hub&#46;md' \
+  'wrapped reference definition|See [the audit].\n\n[the audit]:\nhub&#46;md' \
+  'image destination|![the audit](hub&#46;md)'
+
+#
+# Each row that must NOT resolve carries a destination that WOULD resolve to
+# the hub-only path under the specific mis-decode it guards against — a
+# greedy read past the missing semicolon, a lifted digit cap, or a bad
+# reference silently dropped instead of left standing. A fixture that cannot
+# reach `hub.md` under any of those would be clean for no reason at all.
+run_cm_matrix expect_not_rendered "Case 14v" \
+  'a reference needs its semicolon terminator|See [the audit](hub&#46md) for details.' \
+  'eight decimal digits exceed the decimal form|See [the audit](hub&#00000046;md) for details.' \
+  'seven hex digits exceed the hex form|See [the audit](hub&#x000002E;md) for details.' \
+  'an undefined entity name stays literal|See [the audit](hub&perio;.md) for details.' \
+  'code point zero is not a deleted character|See [the audit](hub&#0;.md) for details.' \
+  'decoded output is not rescanned for references|See [the audit](hub&#38;#46;md) for details.' \
+  'a backslash escape suppresses the reference|See [the audit](hub\\&#46;md) for details.' \
+  'references do not resolve inside a code span|Inline example: `[the audit](hub&#46;md)`.' \
+  'a one-character body is not an entity name|See [the audit](hub&x;.md) for details.' \
+  'a numeric reference needs at least one digit|See [the audit](hub&#;.md) for details.'
+
+# --- Case 14w: HTML blocks vs inline HTML (#811) ---------------------
+# § HTML blocks defines seven start conditions. Only those close the
+# surrounding text flow; a line that merely BEGINS with a `<` — inline
+# HTML, an autolink, an incomplete tag — is ordinary paragraph content,
+# and its indented continuation lines still render links. Each row pairs
+# an opener with a four-space continuation carrying the link, so the
+# verdict reads directly as "was the continuation still scanned?".
+run_cm_matrix expect_rendered "Case 14w" \
+  'inline HTML followed by text is paragraph content|<b>bold</b> governance\n    See [the audit](hub.md)' \
+  'an autolink line is a paragraph, not an HTML block|<https://example.com>\n    See [the audit](hub.md)' \
+  'condition 4 needs a letter after the bang|<!5 not a declaration\n    See [the audit](hub.md)' \
+  'condition 4 is uppercase-only in the parsers that render these docs|<!doctype html>\n    See [the audit](hub.md)' \
+  'condition 7 cannot interrupt an open paragraph|Governance\n<custom-tag>\n    See [the audit](hub.md)' \
+  'a complete tag followed by text is not condition 7|<custom-tag> governance\n    See [the audit](hub.md)' \
+  'an incomplete tag is not condition 7|<custom-tag\n    See [the audit](hub.md)' \
+  'a non-block tag name is not condition 6|<span>governance\n    See [the audit](hub.md)' \
+  'source left the condition 6 tag list in 0.31|<source>governance\n    See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 14w" \
+  'condition 1 — pre|<pre>\n    See [the audit](hub.md)' \
+  'condition 1 — textarea|<textarea>\n    See [the audit](hub.md)' \
+  'condition 2 — comment|<!-- note -->\n    See [the audit](hub.md)' \
+  'condition 3 — processing instruction|<?php echo; ?>\n    See [the audit](hub.md)' \
+  'condition 4 — declaration|<!DOCTYPE html>\n    See [the audit](hub.md)' \
+  'condition 5 — CDATA section|<![CDATA[x]]>\n    See [the audit](hub.md)' \
+  'condition 6 — block tag|<div>\n    See [the audit](hub.md)' \
+  'condition 6 — closing block tag|</div>\n    See [the audit](hub.md)' \
+  'condition 6 — tag name at end of line|<div\n    See [the audit](hub.md)' \
+  'condition 6 — block tag followed by text|<div>governance\n    See [the audit](hub.md)' \
+  'condition 6 — search joined the tag list in 0.31|<search>governance\n    See [the audit](hub.md)' \
+  'condition 7 — complete tag alone on the line|<custom-tag>\n    See [the audit](hub.md)' \
+  'condition 7 — closing tag alone on the line|</custom-tag>\n    See [the audit](hub.md)'
+
+# --- Case 14x: list-item content classification (#812) ---------------
+# § List items: an item is a container whose content is parsed as blocks
+# in its own right, and indentation inside it is measured from the item
+# CONTENT column. So a marker does not by itself open a paragraph — its
+# first child decides — and the column at which indentation starts a code
+# block moves with the marker.
+run_cm_matrix expect_rendered "Case 14x" \
+  'an ordinary item keeps a deep continuation visible|- Governance\n      See [the audit](hub.md)' \
+  'a heading-first item still renders prose at the content column|- # Governance\n    See [the audit](hub.md)' \
+  'a second paragraph inside an item renders|- Governance\n\n    See [the audit](hub.md)' \
+  'an ordered marker widens the content column|1. # Governance\n      See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 14x" \
+  'a heading-first item leaves genuine indented code (the #812 reproduction)|- # Governance\n      See [the audit](hub.md)' \
+  'a thematic-break-first item does the same|- * * *\n      See [the audit](hub.md)' \
+  'the ordered content column shifts the code threshold|1. # Governance\n       See [the audit](hub.md)' \
+  'the content column resets when the list ends|- # Governance\n\nGovernance\n\n    See [the audit](hub.md)'
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).
