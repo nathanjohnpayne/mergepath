@@ -285,7 +285,17 @@ safe_fetch_refspecs() {
     return 0
   fi
   printf '%s\n' "${positive_refspecs[@]}"
-  printf '%s\n' "${negative_refspecs[@]}"
+  # Guard the empty case: `printf '%s\n'` with NO operands still executes its
+  # format once and emits a blank line, which the caller reads back as an empty
+  # array element and passes to `git fetch` as a positional refspec. Git reads
+  # an empty refspec operand as a request for the remote's HEAD, so on a remote
+  # whose HEAD is unborn or dangling the whole fetch dies with
+  # `fatal: couldn't find remote ref HEAD` — and this script swallows that into
+  # a warning, silently losing gone-upstream detection for the entire --apply
+  # run (Codex P2 on #892).
+  if [ "${#negative_refspecs[@]}" -gt 0 ]; then
+    printf '%s\n' "${negative_refspecs[@]}"
+  fi
 }
 
 if [ "$MODE" = "apply" ]; then

@@ -2580,6 +2580,55 @@ else
   echo "$OUT_PORCELAIN_FAIL" >&2
 fi
 
+# ── Case 35 (#892, Codex P2): no empty refspec operand when negatives absent ─
+# With no negative fetch refspec configured — the normal case — the refspec
+# printer must emit nothing extra. A bare `printf '%s\n'` runs its format once
+# and yields a blank line, which reaches `git fetch` as an empty positional
+# refspec; Git reads that as a request for the remote's HEAD, so a remote whose
+# HEAD is unborn or dangling aborts the entire fetch with
+# `fatal: couldn't find remote ref HEAD`. The helper swallows that into a
+# warning, so --apply would keep exiting 0 while pruning nothing at all.
+DANGLING_HEAD_ROOT="$WORKDIR/dangling-remote-head"
+DANGLING_HEAD_REMOTE="$DANGLING_HEAD_ROOT/remote.git"
+DANGLING_HEAD_MAIN="$DANGLING_HEAD_ROOT/main"
+DANGLING_HEAD_BRANCH='dangling-head-gone'
+mkdir -p "$DANGLING_HEAD_ROOT"
+git init -q --bare "$DANGLING_HEAD_REMOTE"
+# The remote's HEAD names a branch that will never exist. This is ordinary
+# remote state (an empty repo, or a default branch renamed out from under the
+# symref), not a contrivance.
+git --git-dir="$DANGLING_HEAD_REMOTE" symbolic-ref HEAD refs/heads/never-created
+git init -q "$DANGLING_HEAD_MAIN"
+(
+  cd "$DANGLING_HEAD_MAIN"
+  git -C "$DANGLING_HEAD_MAIN" config user.email "test@example.com"
+  git -C "$DANGLING_HEAD_MAIN" config user.name "Test"
+  git -C "$DANGLING_HEAD_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$DANGLING_HEAD_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b "$DANGLING_HEAD_BRANCH"
+  git push -q -u origin "$DANGLING_HEAD_BRANCH"
+  git checkout -q main
+  # Server-side deletion, with the stale tracking ref left behind — exactly the
+  # #822 shape whose detection depends on this prune succeeding.
+  git --git-dir="$DANGLING_HEAD_REMOTE" branch -D "$DANGLING_HEAD_BRANCH"
+) >/dev/null 2>&1
+set +e
+OUT_DANGLING_HEAD=$( cd "$DANGLING_HEAD_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+set -e
+if ! echo "$OUT_DANGLING_HEAD" | grep -Fq 'git fetch --prune origin` failed' \
+   && ! git -C "$DANGLING_HEAD_MAIN" rev-parse --verify -q \
+        "refs/remotes/origin/$DANGLING_HEAD_BRANCH" >/dev/null; then
+  pass "#892 --apply prunes against a remote whose HEAD is dangling"
+else
+  fail "#892 an empty fetch refspec operand aborted the prune on a dangling remote HEAD"
+  echo "$OUT_DANGLING_HEAD" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
