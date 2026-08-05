@@ -60,11 +60,15 @@
 #   28. unreadable `issues/{pr}/comments` → FAIL CLOSED → exit 2.
 #   29. inline + summary findings both counted; 29b resolving the inline
 #       thread leaves exactly the summary one (inline behavior unchanged).
-#   30. markerless full-review summary with a fresh exact-head CodeRabbit review
-#       object gates; without that object, or when it predates the object, it
-#       remains out of scope.
-#   30a. a review-triggered run holds until its exact-head summary is present.
-#   30b. stale marker-led and current markerless summaries are both evaluated.
+#   47. markerless full-review summary on the PR-comment surface with a fresh
+#       exact-head CodeRabbit review object gates; 47b without that object and
+#       47c when it predates the object, it remains out of scope.
+#   47d. a head-pinned review run whose body matches no acceptor holds the run.
+#   47e. stale marker-led and current markerless summaries are both evaluated.
+#   47f. the production shape: a terminal head-pinned review OBJECT carrying the
+#       markerless summary clears the hold even when the marker-led walkthrough
+#       still names an older head (47f2: its findings are classified, not just
+#       counted as a candidate).
 #
 # Ack scoping (#886 — an ack clears the findings it acknowledged, nothing else):
 #   30. ack for finding set {A} vs a same-head re-review that rewrote the
@@ -1001,6 +1005,13 @@ fi
 SUMMARY_MARKER_LINE='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
 RATE_LIMIT_STANZA='<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
 PREV_SHA='0000111122223333444455556666777788889999'
+# A stale head that is a FULL 40-hex object id. `summary_names_head` extracts
+# with `between [0-9a-f]{40} and [0-9a-f]{40}`, so an abbreviated stale sha never
+# parses and the summary falls out of scope through the SHORT-SHA path — which
+# test 45 already owns — instead of the stale-head or range-POSITION path the
+# test using it names (CodeRabbit Major on #886). Anything asserting "a
+# different head" or "the head is the range START" has to use this.
+STALE_SHA='deadbeef1234deadbeef1234deadbeef1234dead'
 
 # Compose a CodeRabbit PR-level summary body.
 #   $1 = sha to name as the commits-range END (the head the summary reports on)
@@ -1196,7 +1207,7 @@ FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
 FIXTURE_COMMENTS=$(make_comments_fixture '[]')
 FIXTURE_THREADS=$(make_threads_fixture '[]')
 FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
-  "$(make_summary_body "deadbeef1234" "$SUMMARY_BLOCKING_FINDING")")
+  "$(make_summary_body "$STALE_SHA" "$SUMMARY_BLOCKING_FINDING")")
 set +e
 OUT=$(
   FIXTURE_PR="$FIXTURE_PR" \
@@ -1222,7 +1233,7 @@ echo "--- Test 20b (#832): head is the range START, not the END → exit 0"
 SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
 STALE_START_SUMMARY="$(printf '%s\n\n%s\n\n%s\n' \
   "$SUMMARY_MARKER_LINE" "$SUMMARY_BLOCKING_FINDING" \
-  "Reviewing files that changed from the base of the PR and between $HEAD_SHA and deadbeef1234")"
+  "Reviewing files that changed from the base of the PR and between $HEAD_SHA and $STALE_SHA")"
 FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$STALE_START_SUMMARY")
 set +e
 OUT=$(
@@ -2320,7 +2331,7 @@ fi
 echo
 echo "--- Test 42 (#886): a fenced commits-range quote does not bring a stale summary into scope"
 SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
-QUOTED_RANGE_SUMMARY="$(make_summary_body "deadbeefdeadbeef" "$SUMMARY_BLOCKING_FINDING
+QUOTED_RANGE_SUMMARY="$(make_summary_body "$STALE_SHA" "$SUMMARY_BLOCKING_FINDING
 
 The diff quotes an older range:
 
@@ -2694,12 +2705,20 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
-# A review object can land before CodeRabbit publishes its PR-level summary,
-# and the required check must not turn green during that gap: issue_comment
-# then re-runs the normal arrival-independent scan once the summary exists.
-echo "--- Test 47d (#886): review event waits for a markerless summary → exit 1"
+# What the hold is FOR, once the summary is read out of the run object's own
+# body: a head-pinned CodeRabbit review RUN exists and NO acceptor recognises a
+# summary in it — a serialization this gate cannot classify. Holding is the
+# correct answer to that, because a gate that cannot read the review must not
+# certify it. This is now the ONLY route to rc 3: a run carrying a recognised
+# serialization becomes a candidate the moment the run exists, so the hold can
+# no longer fire merely because the walkthrough comment has not caught up (the
+# steady-state deadlock measured on this PR, covered by test 47f).
+echo "--- Test 47d (#886): a head run whose body matches no acceptor → exit 3"
 FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture '[]')
-FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z" \
+  "### Review complete
+
+See the inline comments.")
 set +e
 OUT=$(
   REQUIRE_REVIEW_SUMMARY=true \
@@ -2712,10 +2731,14 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 3 ] && echo "$OUT" | grep -q "awaiting its PR-level summary"; then
-  pass "review-triggered run remains non-green until the current-head summary publishes"
+# The run id is asserted too: the hold's remaining case is an UNRECOGNISED body,
+# so the operator has to be told which object was not recognised or the message
+# is unactionable.
+if [ "$RC" = 3 ] && echo "$OUT" | grep -q "awaiting its PR-level summary" \
+    && echo "$OUT" | grep -q "review run object(s): 8001"; then
+  pass "a run whose serialization no acceptor recognises holds the run, naming the object"
 else
-  fail "expected rc=3 while a current-head review awaits its summary; got rc=$RC"
+  fail "expected rc=3 naming the unrecognised run object; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
@@ -2829,13 +2852,19 @@ else
 fi
 
 # A marker-led summary's commits-range end still names the head after CodeRabbit
-# re-reviews the SAME head, so the SHA-only scope test alone keeps the previous
-# publication in scope and skips the hold above. On the review-triggered path
-# the candidate must belong to the triggering review, or the run stays red until
-# the issue_comment sweep sees the replacement summary.
-echo "--- Test 47d2 (#886): review event + marker summary predating the review → exit 1"
+# re-reviews the SAME head, so the SHA-only scope test alone keeps the PREVIOUS
+# publication in scope. On the review-triggered path that stale candidate must be
+# dropped and the verdict must come from the CURRENT run's own summary instead.
+#
+# Non-vacuous by construction: the stale marker-led summary carries a BLOCKING
+# finding while the current run reports none, so the two answers differ. A
+# regressed correlation filter classifies the stale summary and shows up as rc 1;
+# only dropping it yields rc 0. (Before the review-object sourcing this case
+# could only be expressed as the hold, because there was no current summary for
+# the verdict to come from.)
+echo "--- Test 47d2 (#886): review event + marker summary predating the review → dropped, exit 0"
 FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
-  "$(make_summary_body "$HEAD_SHA" 'No required finding here.')" \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING")" \
   "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:00Z" "2026-08-04T00:00:00Z")
 FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z")
 set +e
@@ -2850,11 +2879,12 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 3 ] && echo "$OUT" | grep -q "awaiting its PR-level summary" \
-    && echo "$OUT" | grep -q "predate the completed CodeRabbit review object"; then
-  pass "a marker-led summary from the previous publication cannot clear a review-triggered run"
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && echo "$OUT" | grep -q "predate the completed CodeRabbit review object" \
+    && echo "$OUT" | grep -q "markerless full-review summary in review object 8001"; then
+  pass "a marker-led summary from the previous publication is dropped for the current run's own"
 else
-  fail "expected rc=3 with the uncorrelated marker summary dropped; got rc=$RC"
+  fail "expected rc=0 with the uncorrelated marker summary dropped; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
@@ -3051,6 +3081,112 @@ if [ "$RC" = 1 ] && echo "$OUT" | grep -q "comment id 7002" \
   pass "a stale marker-led summary cannot shadow a current markerless finding"
 else
   fail "expected rc=1 with current markerless finding despite stale marker-led summary; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 47f (#886): the MEASURED production shape, and the deadlock it produced.
+#
+# On a real PR with CodeRabbit TERMINAL for the head — review object present,
+# commit StatusContext `CodeRabbit = success` — the gate still exited 3, because
+# the marker-led walkthrough comment is updated in place and was still naming an
+# OLDER head, and the markerless predicate was applied to the PR-comment surface
+# where CodeRabbit never writes it (0 occurrences across ten real PRs, against 17
+# in review-object bodies). Steady state was therefore zero candidates: the event
+# job published red forever and the sweep, the only publisher that could retire
+# it, answered rc 3 by declining. Under `enforce_admins: true` there is no
+# break-glass, so merging deadlocked the repo.
+#
+# The fixture is that state exactly: terminal head-pinned review OBJECT carrying
+# the markerless summary, walkthrough naming a stale head, hold flag set.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 47f (#886): terminal review object + stale walkthrough → no hold, exit 0"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$STALE_SHA" 'No required finding here.')" \
+  "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:00Z" "2026-08-04T00:00:00Z")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z" \
+  "**Actionable comments posted: 0**
+
+No blocking findings on this head.")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && ! echo "$OUT" | grep -q "awaiting its PR-level summary" \
+    && echo "$OUT" | grep -q "markerless full-review summary in review object 8001" \
+    && echo "$OUT" | grep -q "head-pinned by its commit_id to $HEAD_SHA"; then
+  pass "a terminal review object clears the hold even when the walkthrough names an older head"
+else
+  fail "expected rc=0 with no hold on a terminal CodeRabbit; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# Not merely COUNTED as a candidate — CLASSIFIED. Clearing the hold by admitting
+# a body the gate then never reads would trade a deadlock for a false clear, so
+# the same fixture with a P1 in the review-object body must gate on it.
+echo "--- Test 47f2 (#886): the review object's own body is classified → exit 1"
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z" \
+  "**Actionable comments posted: 1**
+
+$SUMMARY_BLOCKING_FINDING")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)" \
+    && ! echo "$OUT" | grep -q "awaiting its PR-level summary"; then
+  pass "a blocking finding in the review object's own body gates rather than clearing"
+else
+  fail "expected rc=1 from the review-object body's own finding; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# The scope anchor is the object's GitHub-owned commit_id, not its timestamp: a
+# review object on ANOTHER head contributes nothing, however recent it is. Pairs
+# with 47d0b — without an anchor there is no hold either, because this gate does
+# not enforce review ARRIVAL (that would pin every push red until CodeRabbit got
+# round to the PR).
+echo "--- Test 47f3 (#886): a review object on another head is not this head's summary → exit 0"
+FIXTURE_REVIEWS=$(make_reviews_fixture "$PREV_SHA" COMMENTED "2026-08-04T00:09:59Z" \
+  "**Actionable comments posted: 1**
+
+$SUMMARY_BLOCKING_FINDING")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! echo "$OUT" | grep -q "awaiting its PR-level summary" \
+    && ! echo "$OUT" | grep -q "markerless full-review summary in review object"; then
+  pass "a review object pinned to another head neither gates nor holds"
+else
+  fail "expected rc=0 with an off-head review object ignored; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 

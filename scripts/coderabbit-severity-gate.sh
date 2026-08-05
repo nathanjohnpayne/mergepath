@@ -50,11 +50,11 @@
 #              find it easier to set it as env.
 #   REPO       Optional fallback for the positional REPO arg. Same
 #              motivation as PR_NUMBER above.
-#   REQUIRE_REVIEW_SUMMARY  Optional true|false (default false). The bundled
-#              pull_request_review workflow path sets true: once a completed
-#              CodeRabbit review object exists on HEAD, hold this run red
-#              until a current PR-level summary is correlated to it. Other
-#              callers retain the normal arrival-independent gate behavior.
+#   REQUIRE_REVIEW_SUMMARY  Optional true|false (default false). Both bundled
+#              workflow arms set true: once a completed CodeRabbit review run
+#              exists on HEAD, hold this run rather than publish a verdict
+#              until a summary is correlated to that run. Other callers retain
+#              the normal arrival-independent gate behavior.
 #
 # Algorithm:
 #   1. Read .github/review-policy.yml `coderabbit.severity_gate.enabled`.
@@ -74,13 +74,16 @@
 #   5. SHA scope: a finding only gates if its comment was attached to the
 #      PR's current HEAD. A finding from an earlier SHA that is now either
 #      resolved OR no longer on HEAD does not count.
-#   5b. Also fetch the PR-LEVEL SUMMARY surface via
-#      `repos/{repo}/issues/{pr}/comments` (#832) and classify it with the
-#      SAME coderabbit_tier_of — CodeRabbit can carry a blocking finding
-#      solely in its summary, with no inline anchor and therefore no review
-#      thread. See the "PR-level summary surface" section below for the
-#      identity / scope / completeness rules, and for the acknowledgement
-#      channel that stands in for "Resolve conversation" on that surface.
+#   5b. Also fetch the SUMMARY surface — the head-pinned CodeRabbit review
+#      objects (`repos/{repo}/pulls/{pr}/reviews`, where the markerless
+#      full-review body lives) and the PR-level comments
+#      (`repos/{repo}/issues/{pr}/comments`, where the marker-led walkthrough
+#      lives) — and classify both with the SAME coderabbit_tier_of (#832).
+#      CodeRabbit can carry a blocking finding solely in its summary, with no
+#      inline anchor and therefore no review thread. See the "PR-level summary
+#      surface" section below for the identity / scope / completeness rules,
+#      and for the acknowledgement channel that stands in for "Resolve
+#      conversation" on that surface.
 #   6. Print one line per unresolved blocking-tier finding to stdout for
 #      CI visibility, then the summary "CodeRabbit blocking-tier
 #      unresolved: N".
@@ -92,11 +95,14 @@
 #       gate blocks.
 #   2   Usage / config error. Error message on stderr.
 #   3   REQUIRE_REVIEW_SUMMARY only: a completed CodeRabbit review run is on
-#       the current HEAD but its PR-level summary has not published yet, so
-#       the findings on that surface are not knowable. NOT a finding count.
+#       the current HEAD and NO acceptor recognised a summary for it, so the
+#       findings on that surface are not knowable. NOT a finding count.
 #       An event-driven caller treats it as non-green; the scheduled /
 #       issue_comment sweep must DECLINE TO PUBLISH rather than post a
-#       success read off the previous publication.
+#       success read off the previous publication. Since the primary acceptor
+#       reads the summary out of the run object's OWN body, this no longer
+#       fires merely because the walkthrough comment has not caught up — it
+#       means the run's serialization is one this gate cannot classify.
 #
 # Design notes:
 #   - Read-only. Only GETs against the GitHub API.
@@ -728,15 +734,17 @@ esac
 # tests/test_coderabbit_wait_status_probe.sh (#794).
 #
 # CodeRabbit also has a markerless full-review format whose first line is
-# `**Actionable comments posted: N**` (#886, Codex P1). That exact first-line
-# shape is not enough on its own: unlike the marker format it carries no
-# commits-range anchor, so accept it only when a CodeRabbit review object is
-# anchored to this exact PR head. Its comment must also be fresh at-or-after
-# that completed review object: otherwise an older markerless body can inherit
-# a later exact-head object and briefly publish a stale verdict. Fetch the
-# reviews when such a candidate exists, or when a review-triggered gate run
-# must hold for summary publication; a failed required verification fails
-# closed instead of treating the candidate as clean.
+# `**Actionable comments posted: N**` (#886, Codex P1). In production that
+# format is written in the REVIEW OBJECT body, which is where the primary
+# acceptor below reads it from. The same predicate is still applied to this
+# PR-comment surface as a retained secondary acceptor: it costs nothing, it can
+# only ADD candidates (the fail-closed direction), and a serialization that
+# moved onto comments must not silently un-gate its findings. On that surface
+# the shape is not enough on its own — unlike the marker format it carries no
+# commits-range anchor — so accept it only when a CodeRabbit review run is
+# anchored to this exact PR head, and only when the comment is fresh at-or-after
+# that run; otherwise an older markerless body can inherit a later exact-head
+# object and briefly publish a stale verdict.
 MARKER_SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
   --arg bot "$BOT_LOGIN" --arg m "$CR_SUMMARY_MARKER" '
   [ .[]
@@ -752,6 +760,67 @@ MARKER_SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
 MARKER_SUMMARY_ID=$(echo "$MARKER_SUMMARY_JSON" | jq -r '.id')
 MARKER_SUMMARY_BODY=$(echo "$MARKER_SUMMARY_JSON" | jq -r '.body')
 MARKER_SUMMARY_FRESH_AT=$(echo "$MARKER_SUMMARY_JSON" | jq -r '.fresh_at')
+
+# --- head-pinned CodeRabbit review RUN objects ------------------------------
+#
+# Read UNCONDITIONALLY, because pulls/{pr}/reviews is the surface CodeRabbit's
+# markerless full-review summary is actually written on. Measured across ten
+# real PRs (#886, #902, #889, #884, #874, #873, #866, #872, #880, #867):
+# `**Actionable comments posted: N**` occurs ZERO times in issues/{pr}/comments
+# and SEVENTEEN times in pulls/{pr}/reviews. Applying the markerless predicate
+# only to the comment surface made that acceptor contribute a candidate zero
+# percent of the time against production data, so with a TERMINAL CodeRabbit on
+# the head the candidate set was routinely EMPTY, the publication hold below
+# never cleared, and the required check stayed red with no break-glass under
+# `enforce_admins: true`.
+#
+# Unconditional rather than flag-gated: both bundled workflow arms already set
+# REQUIRE_REVIEW_SUMMARY=true and so already pay for this read, and for an
+# ad-hoc caller the alternative to paying for it is not reading the surface the
+# findings are on — a false CLEAR of a required gate rather than a saving. A
+# failed read is fetch_api_array's die 2, never an empty result read as "no
+# findings".
+REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "CodeRabbit review objects")
+
+# Only a review RUN carries (and anchors) a summary — a NON-EMPTY body is the
+# discriminator, the same one mergepath#900 measured. CodeRabbit also creates a
+# head-pinned COMMENTED review object for a conversational REPLY on a review
+# thread (its answer to a rebuttal, or to the `[mergepath-resolve:<class>]` tag
+# reply resolve-pr-threads.sh posts to clear the pre-merge conversation gate).
+# Those carry an empty body and start no run, so no summary ever accompanies
+# them. Taking the newest object outright let a reply that lands AFTER the
+# summary push the correlation floor past it, and the filter below then
+# discarded the genuine current summary — a permanent hold on a PR whose review
+# demonstrably finished, re-armed by every thread reply. Five such objects sat
+# on this PR's own head while its one real run carried a 9906-byte body.
+#
+# DISMISSED counts as a run (Codex P1 on #886). The question here is whether the
+# bot reviewed this head, not whether its review is still standing — and
+# `pull_request_review: [dismissed]` is one of this gate's own triggers, so
+# dropping the state made dismissing the review re-run the gate with its anchor
+# removed. A markerless summary then fell out of scope and a summary-only
+# blocking finding cleared on exit 0, giving dismissal a second job as a bypass
+# of the collaborator ack channel that is supposed to be the only way off that
+# surface.
+HEAD_REVIEW_RUNS_JSON=$(echo "$REVIEWS_JSON" | jq -c \
+  --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+  [ .[]
+    | select(.user.login == $bot)
+    | select(.commit_id == $sha)
+    | select(.state == "COMMENTED" or .state == "APPROVED"
+             or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+    | select(((.body // "") | gsub("\\s"; "")) != "")
+    | { id: (.id // 0),
+        body: (.body // ""),
+        fresh_at: (.submitted_at | if type == "string" then . else "" end) }
+  ]
+  | sort_by(.fresh_at, .id)
+')
+HEAD_REVIEW_AT=$(echo "$HEAD_REVIEW_RUNS_JSON" | jq -r '
+  [ .[] | .fresh_at | select(. != "") ] | max // ""
+')
+HEAD_REVIEW_RUN_IDS=$(echo "$HEAD_REVIEW_RUNS_JSON" | jq -r \
+  '[ .[] | .id | tostring ] | join(", ")')
 
 # The marker-led summarize and markerless full-review serializations are both
 # live CodeRabbit protocols. They are not mutually exclusive: a stale marker
@@ -771,6 +840,39 @@ if [ "$MARKER_SUMMARY_ID" != "0" ]; then
   fi
 fi
 
+# PRIMARY ACCEPTOR: the markerless full-review summary in the body of a
+# head-pinned review RUN object.
+#
+# Scoped by the object's GitHub-owned `commit_id` alone — the same
+# no-spoofable-timestamp posture the marker-led commits range has, and a
+# STRONGER one than the marker path can offer, because the anchor travels with
+# the report instead of having to be re-stamped onto a comment afterwards. That
+# distinction is the whole defect this closes: CodeRabbit updates the
+# walkthrough comment IN PLACE and does not reliably re-carry a commits range
+# naming the current head, so the marker-led path can find nothing while
+# CodeRabbit is demonstrably terminal on that head (measured on this PR: review
+# object present, commit StatusContext `CodeRabbit = success`, walkthrough still
+# naming an older head). The marker-led path above therefore stays an ACCEPTOR
+# and is no longer a REQUIREMENT.
+#
+# `last` after the sort_by above, so a same-head re-review's newer run wins over
+# the run it replaced; a markerless body on an older run is then dropped by the
+# correlation filter below on the review-triggered path, exactly as a superseded
+# marker-led summary is.
+REVIEW_OBJECT_SUMMARY_JSON=$(echo "$HEAD_REVIEW_RUNS_JSON" | jq -c \
+  --arg re "$CR_MARKERLESS_FULL_REVIEW_RE" '
+  [ .[] | select(.body | test($re)) ] | last // {}
+')
+REVIEW_OBJECT_SUMMARY_ID=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.id // 0')
+if [ "$REVIEW_OBJECT_SUMMARY_ID" != "0" ]; then
+  REVIEW_OBJECT_SUMMARY_BODY=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.body')
+  REVIEW_OBJECT_SUMMARY_FRESH_AT=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.fresh_at // ""')
+  SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c \
+    --argjson id "$REVIEW_OBJECT_SUMMARY_ID" --arg body "$REVIEW_OBJECT_SUMMARY_BODY" \
+    --arg fresh_at "$REVIEW_OBJECT_SUMMARY_FRESH_AT" \
+    '. + [{id: $id, body: $body, scope: "review-object-body", fresh_at: $fresh_at}]')
+fi
+
 MARKERLESS_SUMMARIES_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
   --arg bot "$BOT_LOGIN" --arg re "$CR_MARKERLESS_FULL_REVIEW_RE" '
   [ .[]
@@ -782,41 +884,6 @@ MARKERLESS_SUMMARIES_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
   | map({ id: (.id // 0), body: (.body // ""), fresh_at })
 ')
 MARKERLESS_SUMMARY_COUNT=$(echo "$MARKERLESS_SUMMARIES_JSON" | jq 'length')
-HEAD_REVIEW_AT=''
-if [ "$MARKERLESS_SUMMARY_COUNT" -gt 0 ] || [ "$REQUIRE_REVIEW_SUMMARY" = "true" ]; then
-  REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "CodeRabbit reviews for markerless summary")
-  # Only a review RUN anchors the summary — a NON-EMPTY body is the
-  # discriminator, the same one mergepath#900 measured. CodeRabbit also creates
-  # a head-pinned COMMENTED review object for a conversational REPLY on a review
-  # thread (its answer to a rebuttal, or to the `[mergepath-resolve:<class>]` tag
-  # reply resolve-pr-threads.sh posts to clear the pre-merge conversation gate).
-  # Those carry an empty body and start no run, so no summary ever follows them.
-  # Taking the newest object outright let a reply that lands AFTER the summary
-  # push this floor past it, and the correlation filter below then discarded the
-  # genuine current summary — a permanent hold on a PR whose review demonstrably
-  # finished, re-armed by every thread reply. Five such objects sat on this PR's
-  # own head while its one real run carried a 9906-byte body.
-  #
-  # DISMISSED counts as an anchor (Codex P1 on #886). The question here is
-  # whether the bot reviewed this head, not whether its review is still
-  # standing — and `pull_request_review: [dismissed]` is one of this gate's own
-  # triggers, so dropping the state made dismissing the review re-run the gate
-  # with its anchor removed. A markerless summary then fell out of scope and a
-  # summary-only blocking finding cleared on exit 0, giving dismissal a second
-  # job as a bypass of the collaborator ack channel that is supposed to be the
-  # only way off that surface.
-  HEAD_REVIEW_AT=$(echo "$REVIEWS_JSON" | jq -r --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
-    [ .[]
-      | select(.user.login == $bot)
-      | select(.commit_id == $sha)
-      | select(.state == "COMMENTED" or .state == "APPROVED"
-               or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
-      | select(((.body // "") | gsub("\\s"; "")) != "")
-      | .submitted_at
-      | select(type == "string" and . != "")
-    ] | max // ""
-  ')
-fi
 if [ "$MARKERLESS_SUMMARY_COUNT" -gt 0 ]; then
   MARKERLESS_SUMMARY_JSON=$(echo "$MARKERLESS_SUMMARIES_JSON" | jq -c --arg at "$HEAD_REVIEW_AT" '
     if $at == "" then null
@@ -917,7 +984,19 @@ if [ "$SUMMARY_CANDIDATE_COUNT" -eq 0 ]; then
     # publication. Collapsing both into 1 forced a choice between a sweep that
     # reopens the gap and a sweep that can hold a required check red with no ack
     # channel and no break-glass under `enforce_admins: true`.
-    echo "CodeRabbit current-HEAD review is awaiting its PR-level summary; holding this gate run." >&2
+    #
+    # REACHING THIS IS NOW RARE BY CONSTRUCTION. The primary acceptor reads the
+    # summary out of the review RUN object's own body, so a run that carries a
+    # recognised serialization is a candidate the moment it exists — there is no
+    # second surface for it to wait on. What is left here is the genuinely
+    # unknown state: a head-pinned run whose body matches NO acceptor, i.e. a
+    # serialization this gate cannot classify. Holding is the correct answer to
+    # that (a gate that cannot read the review must not certify it), and the run
+    # ids are printed so an operator can see which body was not recognised
+    # rather than having to re-derive it. Bounding the hold for the residual
+    # case is #906 / #896, which own the ordered-publisher work this gate's two
+    # publishers need.
+    echo "CodeRabbit current-HEAD review is awaiting its PR-level summary; holding this gate run. (head-pinned review run object(s): $HEAD_REVIEW_RUN_IDS)" >&2
     echo "CodeRabbit blocking-tier unresolved: pending (summary publication in flight)"
     exit 3
   fi
@@ -929,7 +1008,15 @@ while IFS= read -r SUMMARY_JSON; do
   SUMMARY_ID=$(echo "$SUMMARY_JSON" | jq -r '.id')
   SUMMARY_BODY=$(echo "$SUMMARY_JSON" | jq -r '.body')
   SUMMARY_SCOPE=$(echo "$SUMMARY_JSON" | jq -r '.scope')
-  if [ "$SUMMARY_SCOPE" = 'review-object' ]; then
+  if [ "$SUMMARY_SCOPE" = 'review-object-body' ]; then
+    # Scope and completion both come from the review object itself: its
+    # GitHub-owned commit_id names this head, and its non-empty body is the
+    # report. Do not apply the marker-format stanza or commits-range predicates:
+    # neither exists in this legitimate shape, and requiring the commits range —
+    # which lives on a comment CodeRabbit re-stamps lazily — is what made this
+    # gate hold forever on a terminal review.
+    log "CodeRabbit markerless full-review summary in review object $SUMMARY_ID, head-pinned by its commit_id to $HEAD_SHA"
+  elif [ "$SUMMARY_SCOPE" = 'review-object' ]; then
     # The strict markerless result line identifies the known full-review format,
     # and the fresh exact-head review object above supplies the scope / completion
     # anchor that this format omits. Do not apply the marker-format stanza or
