@@ -55,6 +55,26 @@ These three rules hold in every repository, whatever it deploys and however it d
 2. **No long-lived keys by convenience.** Do not introduce long-lived service-account keys or on-disk deploy keys into repo docs, scripts, or secret stores unless the project explicitly requires them and a human has approved that requirement. Short-lived, manager-resolved credentials are the default form.
 3. **Do not downgrade a repo's auth model unilaterally.** Where a repository's deploy or CI auth is 1Password-backed — the fleet default — switching it back to routine browser login, an interactive CLI login, or an unmanaged on-disk key needs explicit human approval. Reaching for the downgrade because a credential lookup failed is the specific move this rule forbids; see the pause-and-prompt procedure above.
 
+## Mutating MCP tool calls need explicit confirmation
+
+A connected MCP server routinely exposes write and delete operations against live infrastructure — DNS zones, object storage, databases, deployed services — under the same account that serves production. These calls are unlike every other change an agent makes: they land in no diff, no branch protection gates them, and no reviewer sees them before they take effect. There is no PR to decline and frequently no undo.
+
+An agent MUST therefore obtain explicit human confirmation before issuing any MCP tool call that creates, modifies, or deletes a live resource. Read-only calls need no confirmation and should be used freely — investigating thoroughly before proposing a change is the behavior this rule is meant to encourage, not restrain.
+
+The boundary is the **effect of the call**, not the name of the tool:
+
+- **No confirmation needed** — listing, getting, searching, querying, and reading logs, metrics, or audit history.
+- **Confirm first** — anything that creates, updates, or deletes: a generic API-execution tool invoked with any method other than `GET`, and any tool whose name or documented behavior is create / update / delete / put / deploy.
+
+Two failure modes this rule closes:
+
+1. **A generic executor hides its blast radius behind one schema.** Where a single tool accepts an arbitrary method and path, the same innocuous-looking call shape serves both a harmless read and an account-wide delete. (The case that prompted this rule: a Cloudflare MCP server exposing one `execute` tool taking an arbitrary HTTP method.) Confirmation must therefore key on the request the agent is about to issue, never on the tool's name or its usual use.
+2. **Plausible intent is not authorization.** A task that implies infrastructure change — "set up the new domain" — authorizes proposing that change, not performing it. Intent inferred from surrounding work is the weakest possible warrant for an irreversible action.
+
+When asking, state the exact operation, the target resource, and **the account or scope being acted on**. A single credential commonly covers an entire production account, so the scope is the part a human most needs to check, and it is the part an agent is least likely to have chosen deliberately.
+
+Nothing here narrows the stricter rules already in force above: a mutating call that would also move a secret through a human, or that would downgrade a repository's auth model, stays forbidden regardless of confirmation. See nathanjohnpayne/mergepath#908 for the capability review that produced this rule.
+
 ## Bug fix escalation policy
 
 These rules prevent agents from repeatedly patching symptoms of a structural defect. They are derived from a real failure where one agent made six unsuccessful fix attempts on the same issue because every attempt preserved the same broken architectural assumption.
