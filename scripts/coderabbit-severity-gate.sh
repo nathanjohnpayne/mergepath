@@ -983,10 +983,25 @@ SUMMARY_CORRELATION_AT=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -r '
 # they apply to different verdicts. A blocking finding still gates on exit 1 —
 # fail-closed, retirable by a push, and it names the finding. Only a would-be
 # PASS is withheld, which is the verdict an unread run can actually invalidate.
+#
+# "NEWER" IS TOTAL, AND UNKNOWN ORDER COUNTS AS NEWER (CodeRabbit Major on #886).
+# `>` on the timestamp alone leaves two fail-OPEN gaps, and both matter here for
+# the opposite reason they are safe elsewhere in this file. A candidate with no
+# usable timestamp is DROPPED by the correlation filter, and dropping is the safe
+# direction there; an unread RUN with no usable timestamp must be KEPT, because
+# ignoring it is exactly the certify-on-an-older-clean-summary hole this block
+# exists to close. So an unrecognised run whose `submitted_at` is absent or
+# non-string counts as newer unconditionally: the gate cannot place it in the
+# order, and a run it cannot order is a run it must not certify around.
+# Equal timestamps are broken by the run id, giving the same total order
+# `(fresh_at, id)` that HEAD_REVIEW_RUNS_JSON is already sorted by — two runs can
+# share a second, and under `>` alone the later one silently read as not-newer.
+SUMMARY_CORRELATION_ID=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -r 'last.id // 0')
 HEAD_UNRECOGNISED_NEWER_IDS=$(jq -rn \
   --argjson runs "$HEAD_REVIEW_RUNS_JSON" \
   --argjson recognised "$HEAD_SUMMARY_RUNS_JSON" \
-  --arg at "$SUMMARY_CORRELATION_AT" '
+  --arg at "$SUMMARY_CORRELATION_AT" \
+  --argjson atid "$SUMMARY_CORRELATION_ID" '
   ($recognised | map(.id)) as $known
   | [ $runs[]
       # `. as $run` FIRST: inside `index(...)` the input `.` is $known, the
@@ -994,7 +1009,11 @@ HEAD_UNRECOGNISED_NEWER_IDS=$(jq -rn \
       # the whole gate (the jq dot-rebind hazard).
       | . as $run
       | select(($known | index($run.id)) == null)
-      | select($at == "" or (($run.fresh_at // "") > $at))
+      | (if ($run.fresh_at | type) == "string" then $run.fresh_at else "" end) as $ts
+      | select($at == ""
+               or $ts == ""
+               or $ts > $at
+               or ($ts == $at and ($run.id // 0) > $atid))
       | ($run.id | tostring) ]
   | join(", ")
 ')

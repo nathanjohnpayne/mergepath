@@ -3497,6 +3497,104 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# An unread run the gate cannot ORDER is still an unread run (CodeRabbit Major on
+# #886). `>` on the timestamp alone left two fail-open gaps in 47h3's predicate:
+# a run whose `submitted_at` is absent compares below every real timestamp, and a
+# run sharing a second with the recognised summary compares equal. Both read as
+# "not newer" and let the older clean summary certify the head. Dropping an
+# unusable timestamp is the safe direction for a CANDIDATE and the unsafe one for
+# a RUN, which is why the two predicates deliberately differ.
+echo "--- Test 47h5 (#886): an unread run with no submitted_at counts as newer → exit 3"
+FIXTURE_REVIEWS=$(make_issue_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" \
+  --arg clean "**Actionable comments posted: 0**
+
+$SUMMARY_NITPICK_FINDING" '
+  [ { id: 8001, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:10Z", body: $clean },
+    { id: 8002, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: null, body: "### Review complete\n\nSee the inline comments." } ]
+')")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 3 ] && echo "$OUT" | grep -q "unrecognised head-pinned review run object(s): 8002"; then
+  pass "a run the gate cannot place in the order is not certified around"
+else
+  fail "expected rc=3 naming the untimestamped run 8002; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo "--- Test 47h6 (#886): an unread run sharing the summary's timestamp counts as newer → exit 3"
+FIXTURE_REVIEWS=$(make_issue_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" \
+  --arg clean "**Actionable comments posted: 0**
+
+$SUMMARY_NITPICK_FINDING" '
+  [ { id: 8001, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:10Z", body: $clean },
+    { id: 8002, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:10Z", body: "### Review complete\n\nSee the inline comments." } ]
+')")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 3 ] && echo "$OUT" | grep -q "unrecognised head-pinned review run object(s): 8002"; then
+  pass "the (submitted_at, id) total order breaks a shared-second tie"
+else
+  fail "expected rc=3 naming the same-second run 8002; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# The tie-break is by ID and not "any equal timestamp holds": an unrecognised run
+# that shares the second but sorts BELOW the recognised summary is part of the
+# publication already read, not a later one, and must not withhold the pass.
+echo "--- Test 47h7 (#886): an unread run BELOW the summary in the total order does not hold → exit 0"
+FIXTURE_REVIEWS=$(make_issue_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" \
+  --arg clean "**Actionable comments posted: 0**
+
+$SUMMARY_NITPICK_FINDING" '
+  [ { id: 8000, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:10Z", body: "### Review complete\n\nSee the inline comments." },
+    { id: 8001, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:10Z", body: $clean } ]
+')")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! echo "$OUT" | grep -q "unrecognised head-pinned review run object"; then
+  pass "an earlier same-second run belongs to the publication already read"
+else
+  fail "expected rc=0 with no hold on the lower-id same-second run; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # ---------------------------------------------------------------------------
 # Test 48 (#886, Codex P2): the scheduled workflow's stale-snapshot guard
 # must preserve read status separately. Serializing failed reads as a random
