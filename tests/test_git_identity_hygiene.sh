@@ -1948,6 +1948,34 @@ else
   fail "mixed subsection/protected keys: hits=$N_HITS rc=$RC out=$OUT"
 fi
 
+# Case 65h: the key may be QUOTED as a whole word. The shell removes the
+# quotes and Git is handed the protected key, so the write happens; the
+# closing quote is also what stands between the key and the whitespace the
+# matcher requires after it, so both ends have to be admitted together.
+run_on_fixture "tests/quoted-key.sh" '#!/usr/bin/env bash
+git config "user.email" "leak@example.com"
+git config '"'"'commit.gpgsign'"'"' false
+'
+N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/quoted-key\.sh:' || true)"
+if [ "$RC" = "1" ] && [ "$N_HITS" -eq 2 ]; then
+  pass "protected key quoted as a whole word: reported in both quote styles"
+else
+  fail "quoted protected key missed: hits=$N_HITS rc=$RC out=$OUT"
+fi
+
+# Case 65i: the converse. Admitting a quote PAIR must not admit a quote
+# anywhere — a subsection-qualified key inside quotes is still not a write
+# to a protected key, and an unterminated word is not one Git ever receives.
+run_on_fixture "tests/quoted-subsection-keys.sh" '#!/usr/bin/env bash
+git config "foo.bar/user.email" "not-protected@example.com"
+git config '"'"'a.b:commit.gpgsign'"'"' true
+'
+if [ "$RC" = "0" ]; then
+  pass "quoted subsection-qualified keys: still not reported"
+else
+  fail "quoted subsection keys falsely flagged: rc=$RC out=$OUT"
+fi
+
 # Case 65g: a shell escape may stand between the boundary and the key.
 # `git config \user.email x` writes the identity — the shell drops the
 # backslash and Git is handed `user.email` — while the word as written does

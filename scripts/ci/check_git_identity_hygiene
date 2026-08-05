@@ -369,10 +369,13 @@ baseline_marker_path() {
 #   - the checkout the snapshot WAS taken in, whose `.git` a later step
 #     deleted. It is still this directory, and the failure #803 exists to
 #     raise must fire;
-#   - a working-tree COPY. `tests/test_repo_lint_consumer_safety.sh` rsyncs
-#     this tree excluding `.git` and never `git init`s the result, so the
-#     fixture inherits the request, is not a repository at all, and no
-#     snapshot was ever taken of it.
+#   - a working-tree COPY. The repo-lint consumer-safety fixture is built by
+#     rsyncing this tree with `.git` excluded and is never `git init`-ed, so
+#     it inherits the request, is not a repository at all, and no snapshot
+#     was ever taken of it. (Named in prose rather than by path: the gate
+#     below reads only the hub marker, and spelling a hub-only test file
+#     here would enrol this wrapper in the consumer-residue lattice as a
+#     dependency it does not have.)
 #
 # Deriving the answer from the recorded CONFIG cannot separate them: the
 # copy has no config to resolve, so "cannot resolve my own config" — the
@@ -1358,21 +1361,36 @@ else
     # What tells them apart is the WORD. A write names the protected key as a
     # whole command-line word and its value follows after whitespace, so the
     # word begins at the start of the piece or after whitespace; a subsection
-    # character sits inside the word and is neither. A quote is deliberately
-    # NOT in the set: the trailing `[[:space:]]+` below already excludes the
-    # quoted spelling `git config "user.email" x`, so admitting an opening
-    # quote here would match nothing this does not already match.
+    # character sits inside the word and is neither.
     #
-    # ONE character may stand between the boundary and the key: a backslash.
-    # `git config \user.email leak@example.com` writes the identity — the
-    # shell drops the escape and Git is handed `user.email` — while the word
-    # as written does not begin with `u`. Nothing is reopened by allowing it,
-    # because the subsection case never reaches this position: in
-    # `foo.bar\user.email` the character before the backslash is `r`, not a
-    # boundary, so the match never starts there.
+    # Two things may stand between the boundary and the key, because the
+    # SHELL removes them before Git sees the word:
+    #
+    #   - a backslash. `git config \user.email leak@example.com` writes the
+    #     identity while the word as written does not begin with `u`;
+    #   - a matching pair of quotes around the whole key.
+    #     `git config "user.email" x` and `git config \047user.email\047 x`
+    #     write it too, and the closing quote is also what stands between
+    #     the key and the whitespace the pattern requires after it — so both
+    #     ends have to be admitted together or neither matches.
+    #
+    # Neither reopens the subsection class, because both are matched only
+    # where a boundary already is: in `foo.bar/user.email` the character in
+    # front is `/`, and in `"foo.bar/user.email"` it is still `/`, so the
+    # match never starts at the key in either. The quotes are admitted as a
+    # PAIR spelled out per quote character rather than as an optional
+    # single one, so `"user.email` — an unterminated word Git never
+    # receives — does not match.
+    #
+    # A key quoted in PART (`user.\047email\047`, `"user".email`) is not
+    # covered: recovering it means applying the word rules of the shell to
+    # the text, which is a different scanner from this one. Tracked as a
+    # follow-up rather than approximated here, because a half-rule that
+    # strips quotes anywhere in the word is exactly how the subsection
+    # false positives came back the last two times.
     function key_assign_pos(s,   lower, pos, rest) {
       lower = tolower(s)
-      if (!match(lower, /(^|[[:space:]])\\?(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+/))
+      if (!match(lower, /(^|[[:space:]])\\?(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign|"(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)"|\047(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)\047)[[:space:]]+/))
         return 0
       # Step over the boundary character: it is not part of the key, and
       # this position is what the caller cuts the option region at. Every
