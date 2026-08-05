@@ -157,11 +157,16 @@ mp_markdown_renderable_text() {
     # line. They are built as strings rather than written as /literals/
     # because an attribute value may be single-quoted, and this whole program
     # is one shell single-quoted string; the quote characters are made with
-    # %c for the same reason. LIST_MARKER is shared by the classifier and the
-    # marker-width measurement so the two cannot drift apart.
+    # %c for the same reason. LIST_MARKER_CORE is the bullet or ordered
+    # marker alone; LIST_MARKER is built FROM it, so the classifier and the
+    # marker-width measurement cannot drift apart. The whitespace run after
+    # the marker is deliberately NOT part of the width the measurement uses —
+    # CommonMark bounds it, and tabs inside it are columns rather than
+    # characters (see list_marker_columns).
     BEGIN {
       SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BT = sprintf("%c", 96)
-      LIST_MARKER = "^([-+*]|[0-9]+[.)])[[:space:]]+"
+      LIST_MARKER_CORE = "^([-+*]|[0-9]+[.)])"
+      LIST_MARKER = LIST_MARKER_CORE "[[:space:]]+"
       BLOCK_TAGS = " address article aside base basefont blockquote body"
       BLOCK_TAGS = BLOCK_TAGS " caption center col colgroup dd details"
       BLOCK_TAGS = BLOCK_TAGS " dialog dir div dl dt fieldset figcaption"
@@ -186,6 +191,66 @@ mp_markdown_renderable_text() {
     }
     function is_list_marker(s) {
       return s ~ LIST_MARKER
+    }
+    # CommonMark 0.31.2 § Tabs: "tabs in lines are not expanded to spaces.
+    # However, in contexts where spaces help to define block structure, tabs
+    # behave as if they were replaced by spaces with a tab stop of 4
+    # characters." Every width this program compares against a code threshold
+    # is therefore a COLUMN count, and a tab advances to the next multiple of
+    # four rather than by one.
+    function tab_stop_advance(col) {
+      return 4 - (col % 4)
+    }
+    # Columns of leading whitespace on a line, tabs expanded. `indent` in the
+    # main rule is a CHARACTER offset (it feeds substr), which equals this
+    # only when the run holds no tab.
+    function lead_columns(s,   i, c, ch) {
+      c = 0
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        if (ch == " ") c++
+        else if (ch == "\t") c += tab_stop_advance(c)
+        else break
+      }
+      return c
+    }
+    # Columns from the start of a list marker to the CONTENT column of the
+    # item, per CommonMark 0.31.2 § List items. A marker of width W followed
+    # by N columns of whitespace puts the content at W+N in the basic case,
+    # which the spec BOUNDS at 1 <= N <= 4. A wider run falls to the separate
+    # "item starting with indented code" rule: the content column is W+1 and
+    # the first child of the item is an indented code block. "Item starting
+    # with a blank line" — nothing after the run — is W+1 as well. Measuring
+    # W+N unbounded mis-places every subsequent line in the item by N-1
+    # columns, which both hides a rendered link behind a phantom code block
+    # and reports one that only ever rendered as code.
+    #
+    # `col` is the absolute starting column of the marker, needed because a
+    # tab in the run advances to the next four-column tab stop rather than by
+    # one column. Sets LM_CHARS (source characters the marker plus its run
+    # occupy, valid only when LM_CODE_FIRST is 0) and LM_CODE_FIRST (1 when
+    # the first child of the item is an indented code block).
+    function list_marker_columns(s, col,   w, n, i, ch, cur, adv) {
+      LM_CHARS = 0; LM_CODE_FIRST = 0
+      if (!match(s, LIST_MARKER_CORE)) return 0
+      w = RLENGTH
+      cur = col + w
+      n = 0
+      i = w + 1
+      while (i <= length(s)) {
+        ch = substr(s, i, 1)
+        if (ch == " ") { cur++; n++ }
+        else if (ch == "\t") { adv = tab_stop_advance(cur); cur += adv; n += adv }
+        else break
+        i++
+      }
+      if (n == 0) return 0
+      if (n > 4 || i > length(s)) {
+        LM_CODE_FIRST = (i <= length(s))
+        return w + 1
+      }
+      LM_CHARS = i - 1
+      return w + n
     }
     function is_thematic_break(s, compact, ch, i) {
       compact = s
@@ -250,13 +315,22 @@ mp_markdown_renderable_text() {
       if (s ~ OPEN_TAG_ONLY || s ~ CLOSE_TAG_ONLY) return 1
       return 0
     }
-    function opens_text_flow(s, flow_open,   hashes) {
+    function opens_text_flow(s, flow_open,   hashes, cols) {
       # A block quote may lazily continue its paragraph without repeating the
       # `>` marker on the next line. Classify the quoted block content, not
-      # the container marker itself.
+      # the container marker itself. `flow_column` advances across the
+      # container markers too, because a tab further along the line expands
+      # against the absolute tab stops of that line.
       while (substr(s, 1, 1) == ">") {
         s = substr(s, 2)
-        if (substr(s, 1, 1) ~ /[[:space:]]/) s = substr(s, 2)
+        flow_column += 1
+        if (substr(s, 1, 1) == "\t") {
+          flow_column += tab_stop_advance(flow_column)
+          s = substr(s, 2)
+        } else if (substr(s, 1, 1) ~ /[[:space:]]/) {
+          flow_column += 1
+          s = substr(s, 2)
+        }
       }
       if (s == "") return 0
       if (is_thematic_break(s) || is_setext_underline(s)) return 0
@@ -266,12 +340,17 @@ mp_markdown_renderable_text() {
         # is one. Consume the marker and classify what follows by the same
         # rules; a heading-first or thematic-break-first item opens no text
         # flow, and the indented lines under it really are code (#812).
-        match(s, LIST_MARKER)
+        cols = list_marker_columns(s, flow_column)
         # Reported back so the caller can measure indented code from the item
         # CONTENT column rather than from column zero.
-        marker_columns += RLENGTH
-        s = substr(s, RLENGTH + 1)
-        if (s == "") return 0
+        marker_columns += cols
+        flow_column += cols
+        # The wide-run and blank-marker cases above put the first child of the
+        # item in an indented code block, or in no block at all; neither opens
+        # a text flow, and neither leaves a first child to classify.
+        if (LM_CODE_FIRST) { item_code_first = 1; return 0 }
+        if (LM_CHARS >= length(s)) return 0
+        s = substr(s, LM_CHARS + 1)
         return opens_text_flow(s, flow_open)
       }
       if (substr(s, 1, 1) == "#") {
@@ -313,6 +392,10 @@ mp_markdown_renderable_text() {
       indent = match(line, /[^ ]/) - 1
       if (indent < 0) indent = length(line)
       rest = substr(line, indent + 1)
+      # `indent` is a character offset (it feeds substr and the fence rules);
+      # `col_indent` is the same run measured in COLUMNS, which is what every
+      # code-block threshold below compares against.
+      col_indent = lead_columns(line)
 
       if (in_fence) {
         if (indent <= 3 && substr(rest, 1, 1) == fence_char) {
@@ -357,15 +440,13 @@ mp_markdown_renderable_text() {
       # that follows it. The column is dropped again by the first line
       # indented less than it that is not a lazy continuation — that line
       # closes the item.
-      if (indent < code_column && !text_flow_open) code_column = 0
-      code_indent = (line ~ /^\t/) ? 4 : indent
+      if (col_indent < code_column && !text_flow_open) code_column = 0
       if (!reference_continuation && !text_flow_open \
-          && code_indent >= code_column + 4) {
+          && col_indent >= code_column + 4) {
         print ""
         next
       }
       rendered = strip_inline_code(line)
-      print rendered
       probe = rendered
       sub(/^[[:space:]]*/, "", probe)
       if (probe ~ /^\[[^]]+\]:[[:space:]]*$/) {
@@ -377,9 +458,18 @@ mp_markdown_renderable_text() {
         flow_probe = line
         sub(/^[[:space:]]*/, "", flow_probe)
         marker_columns = 0
+        flow_column = col_indent
+        item_code_first = 0
         text_flow_open = opens_text_flow(flow_probe, text_flow_open)
-        if (marker_columns > 0) code_column = indent + marker_columns
+        if (marker_columns > 0) code_column = col_indent + marker_columns
+        # A list item whose first child is an indented code block renders the
+        # remainder of its OWN marker line as that code, so the marker line
+        # carries no link either. The blanking above only ever reaches the
+        # lines that FOLLOW a marker, so this case has to be caught here or a
+        # link that never rendered gets reported.
+        if (item_code_first) rendered = ""
       }
+      print rendered
     }
   ' "$f"
 }

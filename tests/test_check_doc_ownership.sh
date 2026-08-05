@@ -1829,6 +1829,38 @@ run_cm_matrix expect_not_rendered "Case 14x" \
   'the ordered content column shifts the code threshold|1. # Governance\n       See [the audit](hub.md)' \
   'the content column resets when the list ends|- # Governance\n\nGovernance\n\n    See [the audit](hub.md)'
 
+# --- Case 14y: the width of the run after a list marker --------------
+# § List items bounds the basic case at a marker of width W followed by
+# `1 <= N <= 4` spaces of indentation, which puts the content at W+N. A
+# WIDER run is a different rule — "item starting with indented code" —
+# under which the content column is W+1 and the first child of the item
+# is an indented code block. § Tabs then says a tab in that run behaves
+# as spaces to a four-column tab stop, so N is a COLUMN count and a tab
+# is worth up to four of it, never one.
+#
+# Reading the run as an unbounded character count therefore mis-measures
+# the item by N-1 columns in BOTH directions: it hides a link that really
+# renders (every row below the first) and reports one that only ever
+# rendered as code (the N1/N4 rows). Case 14x cannot see either, because
+# none of its rows puts more than a single space after the marker.
+#
+# Every row is checked against markdown-it-py's commonmark preset, the
+# same reference parser Cases 14v/14w/14x use.
+run_cm_matrix expect_rendered "Case 14y" \
+  'four spaces is still the basic case (N=4 boundary control)|-    # Governance\n       See [the audit](hub.md)' \
+  'five spaces falls back to the W+1 content column|-     # Governance\n    See [the audit](hub.md)' \
+  'a tab after the marker spans columns, not one character|-\t# Governance\n      See [the audit](hub.md)' \
+  'a tab stop is absolute, so a wider marker consumes less of it|1.\t# Governance\n       See [the audit](hub.md)' \
+  'the fallback column does not grow with the run|-      # Governance\n     See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 14y" \
+  'a wide run makes the marker line itself indented code|-     See [the audit](hub.md)' \
+  'four spaces keeps the code threshold at W+N+4 (N=4 control)|-    # Governance\n         See [the audit](hub.md)' \
+  'a tab-set content column still starts code four past it|-\t# Governance\n        See [the audit](hub.md)' \
+  'two tabs overrun the bound and code-start the item|-\t\tSee [the audit](hub.md)' \
+  'a space then a tab reaches column four outside a list|Governance\n\n \t[the audit](hub.md)' \
+  'the W+1 fallback still starts code four columns past itself|-     # Governance\n      See [the audit](hub.md)'
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).
