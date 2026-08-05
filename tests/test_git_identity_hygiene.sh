@@ -1618,6 +1618,59 @@ else
   fail "intact snapshotted checkout: rc=$RC out=$OUT"
 fi
 
+# Case 63c: keeping the request in the working tree also means it travels
+# with a COPY of that tree, while the baseline it refers to — which lives in
+# the git dir — does not. That is not hypothetical: the consumer-safety
+# fixture is built by copying this checkout's working tree with `.git`
+# excluded and then `git init`-ing the result, so a snapshot recorded by an
+# earlier repo_lint step arrives in the fixture with nothing to compare
+# against. The copy then presents the exact shape of a tampered checkout —
+# a request whose evidence is gone — for a snapshot nobody took of it, and
+# the resulting failure reds every consumer's repo-lint. The request names
+# the config it was taken from, so the copy is recognisable as somebody
+# else's and left alone.
+SNAPSRC_REPO="$WORKDIR/snapshot-copy-source-repo"
+git init -q -b main "$SNAPSRC_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPSRC_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+SNAPCOPY_REPO="$WORKDIR/snapshot-copy-fixture-repo"
+mkdir -p "$SNAPCOPY_REPO/.mergepath"
+cp "$SNAPSRC_REPO/.mergepath/gitconfig-baseline.requested" \
+  "$SNAPCOPY_REPO/.mergepath/gitconfig-baseline.requested"
+git init -q -b main "$SNAPCOPY_REPO"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPCOPY_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
+  && printf '%s' "$OUT" | grep -q "recorded for another checkout" \
+  && ! printf '%s' "$OUT" | grep -q "baseline is missing" \
+  && ! printf '%s' "$OUT" | grep -q "snapshotted repository is missing"; then
+  pass "a working-tree copy inherits the request but not the baseline: not this checkout's snapshot"
+else
+  fail "copied snapshot request failed a checkout nobody snapshotted: rc=$RC out=$OUT"
+fi
+
+# Case 63d: the converse, so recognising a foreign request cannot have been
+# implemented by ignoring requests generally. In the checkout the snapshot
+# was actually taken in, removing the baseline while the request stands is
+# still the missing-evidence failure it was before.
+SNAPOWN_REPO="$WORKDIR/snapshot-own-baseline-gone-repo"
+git init -q -b main "$SNAPOWN_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOWN_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+rm -f "$SNAPOWN_REPO/.git/mergepath-gitconfig-baseline"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOWN_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "the requested snapshot baseline is missing" \
+  && ! printf '%s' "$OUT" | grep -q "recorded for another checkout"; then
+  pass "own snapshot with the baseline deleted: still fails closed"
+else
+  fail "own request with a deleted baseline was waved through: rc=$RC out=$OUT"
+fi
+
 # ── Newline-safe include-target collection (#804) ──────────────────────
 
 # Case 64: a Git include target is an ordinary filename and may contain a

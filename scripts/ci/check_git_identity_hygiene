@@ -84,7 +84,11 @@
 #      with no marker, no baseline and no repository to find, so it reads
 #      the tree as an ordinary non-repository and reports success. The
 #      request outlives the metadata instead, and the final run fails
-#      closed when either the repository or its baseline is gone.
+#      closed when either the repository or its baseline is gone. Living in
+#      the working tree also means the request travels with a COPY of that
+#      tree while the baseline it names does not, so the request records
+#      the config file it was taken from and a run that finds one naming
+#      some other checkout's config leaves it alone.
 #
 #   C. Static scan for the idiom that produces the corruption (HUB-ONLY).
 #      Flags any tracked shell script or Markdown doc that writes one of
@@ -344,6 +348,32 @@ baseline_path() {
 # request about, which is what lets the final run say the subject is gone.
 baseline_marker_path() {
   printf '%s\n' "$REPO_ROOT/.mergepath/gitconfig-baseline.requested"
+}
+
+# Whether a marker found here is a request about THIS checkout.
+#
+# Moving the request into the worktree split it from the baseline it refers
+# to, which stays in the git dir: a tree COPY — `rsync`/`tar` of the working
+# tree, which is how the consumer-safety fixture is built — carries the
+# request and leaves the baseline behind. The copy then presents the exact
+# shape of a tampered checkout, "a snapshot was requested here and its
+# evidence is gone", when no snapshot was ever requested for it. That is a
+# false failure on a tree nobody snapshotted, and it reds every consumer's
+# repo-lint through the fixture.
+#
+# The marker names the config file it was taken from, so the copy is
+# recognisable without weakening anything: a request whose recorded config
+# is not this checkout's config describes a different subject and is not
+# this run's to answer for. Two shapes are deliberately NOT foreign — a
+# marker carrying no recorded path (a snapshot from an older revision of
+# this check) and a checkout whose own config cannot be resolved at all
+# (the destroyed-repository case #803 exists to catch) — because both must
+# keep failing closed rather than be waved through as somebody else's.
+marker_records_this_checkout() {
+  local recorded="$1" here
+  [ -n "$recorded" ] || return 0
+  here="$(config_path 2>/dev/null)" || return 0
+  [ "$(canonical_path "$recorded")" = "$(canonical_path "$here")" ]
 }
 
 config_path() {
@@ -966,7 +996,7 @@ EOF
 # ── Part B: .git/config byte-comparison against a recorded baseline ───
 # Same two-phase contract as Part A: $1 is "pre-suite" or "post-suite".
 assert_config_unchanged() {
-  local phase="$1" base marker cfg culprit recorded_cfg line
+  local phase="$1" base marker cfg culprit recorded_cfg line marker_mine=0
   if [ "$phase" = "post-suite" ] && [ -n "$PRE_SUITE_BASELINE" ]; then
     # The live baseline lives inside this worktree's git dir, so a suite that
     # deleted `.git` deleted the thing this compares against. The copy
@@ -976,6 +1006,22 @@ assert_config_unchanged() {
     base="$(baseline_path 2>/dev/null)" || base=""
   fi
   marker="$(baseline_marker_path)"
+  # A marker that arrived with a copy of the working tree is a record of
+  # somebody else's snapshot; only a marker naming this checkout's own
+  # config puts this run under an obligation to account for a baseline.
+  if [ -f "$marker" ]; then
+    recorded_cfg=""
+    while IFS= read -r line; do
+      case "$line" in
+        config=*) recorded_cfg="${line#config=}"; break ;;
+      esac
+    done < "$marker"
+    if marker_records_this_checkout "$recorded_cfg"; then
+      marker_mine=1
+    elif [ "$phase" != "post-suite" ]; then
+      echo "check_git_identity_hygiene: ignoring a snapshot request recorded for another checkout ($recorded_cfg)"
+    fi
+  fi
   # A snapshot that outlived its own subject. Checked in the PRE-SUITE phase
   # only, because that is the cross-PROCESS window the marker exists to
   # cover: `--snapshot` ran as an earlier repo_lint step, something between
@@ -983,13 +1029,7 @@ assert_config_unchanged() {
   # pre-suite state to notice it with. (A suite that deletes `.git` inside
   # THIS process is reported by assert_repo_metadata_intact, which can name
   # the suite; re-reporting it here would only duplicate that failure.)
-  if [ "$phase" != "post-suite" ] && [ -f "$marker" ]; then
-    recorded_cfg=""
-    while IFS= read -r line; do
-      case "$line" in
-        config=*) recorded_cfg="${line#config=}"; break ;;
-      esac
-    done < "$marker"
+  if [ "$phase" != "post-suite" ] && [ "$marker_mine" -eq 1 ]; then
     if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
       || { [ -n "$recorded_cfg" ] && [ ! -f "$recorded_cfg" ]; }; then
       cat >&2 <<EOF
@@ -1012,7 +1052,7 @@ EOF
       return 1
     fi
   fi
-  if [ -f "$marker" ] && [ ! -f "$base" ]; then
+  if [ "$marker_mine" -eq 1 ] && [ ! -f "$base" ]; then
     cat >&2 <<EOF
 check_git_identity_hygiene: FAIL (the requested snapshot baseline is missing)
 
