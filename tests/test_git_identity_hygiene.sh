@@ -1814,6 +1814,28 @@ else
   fail "trailing-newline include target escaped the walk: rc=$RC out=$OUT"
 fi
 
+# Case 64d: the same filename shape reached by an ACTIVE include, which is
+# seen twice — once by the scope read (as an origin) and once by the walk.
+# The two halves of the dedupe key must be canonicalised the same way: with
+# only the walk's half lossless, the truncated origin matched nothing, one
+# override was reported twice, and the first `--file` remediation named a
+# path no file has.
+NLTA_REPO="$WORKDIR/newline-tail-active-include-repo"
+git init -q -b main "$NLTA_REPO"
+NLTA_INCLUDE="$NLTA_REPO/.git/active-identity"$'\n'
+printf '[user]\n\temail = newline-tail-active@example.com\n' > "$NLTA_INCLUDE"
+git -C "$NLTA_REPO" config --local include.path "$NLTA_INCLUDE"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NLTA_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+N_ENTRIES="$(printf '%s\n' "$OUT" | grep -c "newline-tail-active@example.com" || true)"
+if [ "$RC" = "1" ] && [ "$N_ENTRIES" -eq 1 ]; then
+  pass "active include whose filename ENDS in a newline: reported once, not twice"
+else
+  fail "trailing-newline active include double-reported: entries=$N_ENTRIES rc=$RC out=$OUT"
+fi
+
 # Case 64b: two `includeIf` entries pointing at the SAME target still yield
 # one entry and one remediation. The dedupe moved from a substring test
 # over joined text to an element comparison over an array, and an array

@@ -839,8 +839,16 @@ assert_no_local_identity() {
       while IFS= read -r -d '' origin \
         && IFS= read -r -d '' value; do
         originfile=""
+        # Canonicalised into the variable, not through `$( )`, because the
+        # origin arrived NUL-framed and losslessly: this value is one half
+        # of the dedupe key the conditional-include pass matches the WALK's
+        # include path against, and the walk's half now keeps a trailing
+        # newline. Truncating only this half makes the two spellings of one
+        # file compare unequal, so a single override is reported twice — and
+        # the first `--file` remediation names the truncated path, which
+        # clears nothing.
         case "$origin" in
-          file:*) originfile="$(canonical_path "${origin#file:}")" ;;
+          file:*) canonical_path_into originfile "${origin#file:}" ;;
         esac
 
         if [ -n "$value" ]; then
