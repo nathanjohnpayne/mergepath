@@ -435,6 +435,17 @@ config_path() {
 # whether or not the path's own last byte is a newline.
 canonical_path_into() {
   local __cpi_p="$2" __cpi_d __cpi_b __cpi_out
+  # An empty spelling names no file, and must not come back naming one. The
+  # relative branch below would prefix it with the checkout root and the
+  # trailing-slash loop would then reduce it to the checkout root itself —
+  # turning "no path" into a path that exists, which a caller testing the
+  # result for emptiness would read as a real scope file. Empty in, empty
+  # out. Reported by returning the empty string rather than a status,
+  # because callers invoke this bare under `set -e`.
+  if [ -z "$__cpi_p" ]; then
+    printf -v "$1" '%s' ''
+    return 0
+  fi
   case "$__cpi_p" in
     /*) ;;
     *) __cpi_p="$REPO_ROOT/$__cpi_p" ;;
