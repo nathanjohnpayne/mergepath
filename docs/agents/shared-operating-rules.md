@@ -23,6 +23,17 @@ This applies to every hand-rolled, mid-session investigative query, not just the
 
 The shipped gate scripts already bake this in --- `fetch_api_array` wraps `gh api --paginate` for the REST arrays, and the GraphQL reads use cursor loops --- so this rule is aimed at the ad-hoc queries those helpers do not cover. When in doubt, add `--paginate`: it is a no-op on a short list and the only safe default on a long one.
 
+## Background jobs and expected duration
+
+A backgrounded command must have an expected duration stated when it is launched, and must be checked against that expectation. Never report "still running" as a status without comparing elapsed time to the expectation. A completion notification fires only on completion; a hung job produces no notification and no error — it is indistinguishable from a job legitimately working. Passive waiting has no failure detection by default.
+
+Corollaries:
+
+- Prefer a self-terminating command — put `timeout N` inside it — so a hang dies on its own rather than depending on the agent noticing.
+- A job with no obvious duration still has a bound: provider-poll helpers carry their own `max_wait_seconds` / `review_timeout_seconds`, so quote that as the expectation.
+- Investigate any job that exceeds roughly 3× its expected duration; do not report "still running" as though that were a normal status.
+- "It is still going" is not a status. "It is at 4 minutes against an expected 2" is.
+
 ## 1Password CLI authentication failures
 
 If any `op` command (`op read`, `op inject`, `op run`, `op document get`, or any script that wraps them) fails with a sign-in or authentication error — including but not limited to:
