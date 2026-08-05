@@ -98,6 +98,12 @@ bot='coderabbitai[bot]'
 head_time='2026-06-04T00:00:00Z'
 probe_time='2026-06-04T00:00:01Z'
 reply_time='2026-06-04T00:00:06Z'
+# Every review object the reviews endpoint serves below is a review RUN, and a
+# run always publishes a summary body. GitHub returns `body` on every review
+# object, so a fixture that omitted it modelled a shape the API does not emit —
+# and since #900 the emptiness of that field is what separates a run from the
+# body-less review object CodeRabbit creates for a conversational thread reply.
+run_body='**Actionable comments posted: 0**'
 
 fake_now() {
   local clock_file="$state_dir/fake-time"
@@ -208,7 +214,7 @@ case "$endpoint" in
           count=$(cat "$state_dir/probe-count")
         fi
         if [ "$count" -gt 0 ] && [ "$(fake_now)" -ge 2000000006 ]; then
-          printf '[{"id":9901,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$reply_time"
+          printf '[{"id":9901,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         else
           printf '[]\n'
         fi
@@ -216,22 +222,22 @@ case "$endpoint" in
       summary_marker_only)
         # #535.1: one CodeRabbit review on HEAD, no inline findings, but the
         # PR-level summary body carries a Potential issue marker.
-        printf '[{"id":9921,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9921,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       probe_review_on_head)
         # #814: a genuine CodeRabbit review already on HEAD. --probe must
         # return the SAME terminal verdict the polling mode does.
-        printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       badge_only_inline_finding)
         # #837: an ordinary review on HEAD. The interesting part is the FORMAT
         # of its inline finding (pulls endpoint below).
-        printf '[{"id":9711,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9711,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       badge_only_summary_finding)
         # #837 acceptance 2: the same format carried SOLELY by the PR-level
         # summary, which is the one verdict --probe makes.
-        printf '[{"id":9721,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9721,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       future_dated_head_review)
         # #824: the review is pinned to THIS head (commit_id head-sha) but was
@@ -239,27 +245,27 @@ case "$endpoint" in
         # or metadata-rewritten commit produces, since the committer date is
         # whatever the pusher wrote. Pre-fix the `submitted_at >= HEAD_ANCHOR`
         # conjunct discarded it and the finding below went uncounted.
-        printf '[{"id":9731,"user":{"login":"%s"},"submitted_at":"2026-06-03T00:00:00Z","commit_id":"head-sha"}]\n' "$bot"
+        printf '[{"id":9731,"user":{"login":"%s"},"submitted_at":"2026-06-03T00:00:00Z","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$run_body"
         ;;
       probe_review_object_premerge_warning)
-        printf '[{"id":9991,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9991,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       probe_notice_after_review)
         # #814 round 9: HEAD review exists; the only later bot comment is a
         # rate-limit notice, so publication is NOT complete.
-        printf '[{"id":9981,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9981,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       probe_narration_after_review|probe_narration_over_notice)
         # #833: HEAD review exists; the later bot comments include a
         # status-probe narration reply (issues endpoint below).
-        printf '[{"id":9983,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9983,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       probe_summary_lands_during_probe_clean|probe_summary_lands_during_probe_marker)
         # #869 TOCTOU: a head-pinned review object; the PR-level summary
         # lands BETWEEN the probe's first issue-comments snapshot and its
         # status read (the issues endpoint below serves the two snapshots
         # by fetch count).
-        printf '[{"id":9998,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","state":"COMMENTED"}]\n' "$bot" "$reply_time"
+        printf '[{"id":9998,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","state":"COMMENTED","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
       probe_reviews_api_failure)
         # #814 / Phase 4b P2 on #823: the reviews fetch fails while the probe
@@ -273,13 +279,13 @@ case "$endpoint" in
         # also what an unchanged head looks like once a wall-clock freshness
         # floor has advanced past it. Selection is by commit_id alone, so it
         # must still read as reported.
-        printf '[{"id":9971,"user":{"login":"%s"},"submitted_at":"2026-06-03T00:00:00Z","commit_id":"head-sha"}]\n' "$bot"
+        printf '[{"id":9971,"user":{"login":"%s"},"submitted_at":"2026-06-03T00:00:00Z","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$run_body"
         ;;
       probe_stale_anchor)
         # #814 / Codex P1 on #823: CodeRabbit reviewed the PREVIOUS head only.
         # The review object is pinned to old-sha, so no HEAD-pinned evidence
         # exists — only the summary issue comment, which carries no SHA.
-        printf '[{"id":9951,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"old-sha"}]\n' "$bot" "$head_time"
+        printf '[{"id":9951,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"old-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
       probe_summary_lags_review)
         # #814 / Phase 4b P1 on #823: mid-publication. A HEAD-pinned review
@@ -287,14 +293,14 @@ case "$endpoint" in
         # passing HEAD_ANCHOR is the PRIOR head's, posted earlier. Existence
         # alone would clear; the summary must also be at least as recent as
         # the review it is credited to.
-        printf '[{"id":9961,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$reply_time"
+        printf '[{"id":9961,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
       intermediate_review_head_pin)
         # #535.2: a NEWER review (later submitted_at) references an
         # intermediate commit, while the HEAD review is older. The
         # HEAD-pinned selection must pick the HEAD review (9931), not the
         # newer intermediate one (9932).
-        printf '[{"id":9931,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"},{"id":9932,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"intermediate-sha"}]\n' "$bot" "$head_time" "$bot" "$reply_time"
+        printf '[{"id":9931,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"},{"id":9932,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"intermediate-sha","body":"%s"}]\n' "$bot" "$head_time" "$bot" "$reply_time" "$run_body" "$run_body"
         ;;
       *)
         printf '[]\n'
@@ -1791,6 +1797,112 @@ test_884_clearance_reviews_api_failure_fails_closed() {
   fi
 }
 
+test_900_review_run_selector_ignores_bodyless_replies() {
+  # #900. The `reviews` endpoint carries two kinds of coderabbitai[bot] object
+  # on one head: review RUNS, and the review objects CodeRabbit creates for a
+  # CONVERSATIONAL REPLY on a review thread. Only a run publishes a summary
+  # body and refreshes the per-SHA StatusContext, so anchoring the Phase 4b
+  # barrier's temporal conjunct on the newest object outright let a reply pin
+  # the anchor past a status no later run would ever refresh — a permanent
+  # not-yet on a provider that had finished.
+  #
+  # The fixture is the five-object shape measured on #889 head 2433fe99: two
+  # runs with non-empty summary bodies, each followed by a `success` status one
+  # second later, and three body-less replies (CodeRabbit answering a rebuttal,
+  # then the `[mergepath-resolve:...]` tag reply). Asserted on the pure
+  # selector and then chained through the REAL barrier classifier, because the
+  # defect is a selection rather than a verdict and the stub harness's fixtures
+  # carry a single review object.
+  local snip="$WORKDIR/review-run-selector.sh" bad="" reviews sel inverse
+  local bot='coderabbitai[bot]' sha='2433fe99'
+
+  awk '/^# BEGIN coderabbit_review_run_selector$/{f=1;next} /^# END coderabbit_review_run_selector$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  # shellcheck disable=SC1090
+  . "$snip"
+  # The one consumer of the selected object: the barrier arm whose conjunct the
+  # reply defeated. Sourced from the shipped library so the chained assertions
+  # below run against real behaviour rather than a restatement of it. lib.sh is
+  # sourced-not-executed and defines only p4b_* names.
+  # shellcheck source=../scripts/phase-4b/lib.sh
+  . "$ROOT/scripts/phase-4b/lib.sh"
+
+  # <review-json|null> <context_updated_at> -> an rc-7 probe payload.
+  _p4b_probe_json() {
+    jq -nc --argjson rev "${1:-null}" --arg cu "$2" --arg sha "$sha" '
+      {head_sha: $sha,
+       probe: {observed: "awaiting-summary", context_state: "success",
+               context_updated_at: $cu}}
+      + (if $rev == null then {} else {review: $rev} end)'
+  }
+
+  reviews='[
+    {"id":4859383068,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:08:14Z","body":"**Actionable comments posted: 1**"},
+    {"id":4859408200,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:13:18Z","body":""},
+    {"id":4859458474,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:23:26Z","body":"**Actionable comments posted: 0**"},
+    {"id":4859497649,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:31:38Z","body":""},
+    {"id":4859498139,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:31:44Z","body":null},
+    {"id":7000000001,"user":{"login":"other-reviewer[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:40:00Z","body":"a body-bearing object from another bot"},
+    {"id":7000000002,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeef",
+     "submitted_at":"2026-08-04T22:45:00Z","body":"a body-bearing object on another head"}
+  ]'
+
+  # 1. The selector returns the newest body-BEARING object — the second run —
+  #    not the newest object. The two trailing rows also keep the pre-existing
+  #    bot-login and commit_id filters asserted: either would win on
+  #    submitted_at if it were dropped.
+  sel=$(crw_select_head_pinned_review_run "$reviews" "$bot" "$sha")
+  [ "$(printf '%s' "$sel" | jq -r '.id')" = "4859458474" ] || bad="$bad selected-id"
+  [ "$(printf '%s' "$sel" | jq -r '.submitted_at')" = "2026-08-04T22:23:26Z" ] || bad="$bad selected-at"
+  [ "$(printf '%s' "$sel" | jq -r '.endpoint')" = "reviews" ] || bad="$bad selected-endpoint"
+
+  # 2. Chained through the barrier: the status refreshed one second after that
+  #    run corroborates it, so the #889 shape now OPENS instead of wedging.
+  [ "$(p4b_barrier_class_coderabbit "$sha" 7 \
+        "$(_p4b_probe_json "$sel" '2026-08-04T22:23:27Z')")" = "reported" ] \
+    || bad="$bad barrier-not-reported"
+
+  # 3. The #875 temporal concern stays closed. When the newest object IS a real
+  #    run — a same-SHA rerun whose summary and status refresh are still
+  #    pending — the status still exposed is the PREVIOUS run's, and the
+  #    barrier must hold.
+  inverse='[
+    {"id":4859458474,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:23:26Z","body":"**Actionable comments posted: 0**"},
+    {"id":4859497649,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+     "submitted_at":"2026-08-04T22:31:38Z","body":"**Actionable comments posted: 2**"}
+  ]'
+  sel=$(crw_select_head_pinned_review_run "$inverse" "$bot" "$sha")
+  [ "$(printf '%s' "$sel" | jq -r '.id')" = "4859497649" ] || bad="$bad inverse-selected-id"
+  [ "$(p4b_barrier_class_coderabbit "$sha" 7 \
+        "$(_p4b_probe_json "$sel" '2026-08-04T22:23:27Z')")" = "not-yet" ] \
+    || bad="$bad inverse-barrier-opened"
+
+  # 4. Fail-closed posture is unchanged: replies ONLY selects nothing, the rc-7
+  #    payload then carries no `review`, and the barrier keeps its bounded wait.
+  sel=$(crw_select_head_pinned_review_run \
+    '[{"id":4859497649,"user":{"login":"coderabbitai[bot]"},"commit_id":"2433fe99",
+       "submitted_at":"2026-08-04T22:31:38Z","body":""}]' "$bot" "$sha")
+  [ -z "$sel" ] || bad="$bad replies-only-selected-something"
+  [ "$(p4b_barrier_class_coderabbit "$sha" 7 \
+        "$(_p4b_probe_json null '2026-08-04T22:23:27Z')")" = "not-yet" ] \
+    || bad="$bad no-evidence-opened"
+
+  unset -f _p4b_probe_json
+  if [ -z "$bad" ]; then
+    pass "#900: a body-less CodeRabbit reply object no longer anchors the barrier's temporal conjunct"
+  else
+    fail "#900 review-run selection:$bad"
+  fi
+}
+
+test_900_review_run_selector_ignores_bodyless_replies
 test_884_count_bodies_fails_closed_unit
 test_884_clearance_reviews_api_failure_fails_closed
 test_446_newer_comment_suppresses_stale_status
