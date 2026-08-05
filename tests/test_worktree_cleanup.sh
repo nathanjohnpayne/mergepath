@@ -2676,9 +2676,13 @@ make_gone_worktree_fixture() {
   git init -q "$main"
   (
     cd "$main" || exit 1
-    git config user.email "test@example.com"
-    git config user.name "Test"
-    git config commit.gpgsign false
+    # Identity writes target the fixture repo explicitly rather than relying on
+    # the subshell cwd — bare `git config` here is what check_git_identity_hygiene
+    # rejects, and a cwd-dependent write is one stray `cd` away from editing the
+    # real repo's config.
+    git -C "$main" config user.email "test@example.com"
+    git -C "$main" config user.name "Test"
+    git -C "$main" config commit.gpgsign false
     git checkout -q -b main
     echo seed > seed.txt
     git add seed.txt
@@ -2751,9 +2755,9 @@ git init -q --bare "$SUBMOD_INNER"
 git init -q "$SUBMOD_ROOT/innerseed"
 (
   cd "$SUBMOD_ROOT/innerseed" || exit 1
-  git config user.email "test@example.com"
-  git config user.name "Test"
-  git config commit.gpgsign false
+  git -C "$SUBMOD_ROOT/innerseed" config user.email "test@example.com"
+  git -C "$SUBMOD_ROOT/innerseed" config user.name "Test"
+  git -C "$SUBMOD_ROOT/innerseed" config commit.gpgsign false
   git checkout -q -b main
   echo inner > inner.txt
   git add inner.txt
@@ -2761,16 +2765,23 @@ git init -q "$SUBMOD_ROOT/innerseed"
   git remote add origin "$SUBMOD_INNER"
   git push -q -u origin main
 ) >/dev/null 2>&1
+# The bare remote's HEAD still points at git's DEFAULT initial branch, which is
+# `master` unless init.defaultBranch says otherwise — and only `main` was ever
+# pushed. `git submodule add` clones and checks out HEAD, so on a runner with
+# the stock default it aborts with `fatal: You are on a branch yet to be born`
+# and takes the whole suite down with exit 128. Pointing HEAD at the branch that
+# exists makes the fixture independent of the runner's init.defaultBranch.
+git --git-dir="$SUBMOD_INNER" symbolic-ref HEAD refs/heads/main
 (
   cd "$SUBMOD_ROOT/main" || exit 1
-  git config protocol.file.allow always
-  git -c protocol.file.allow=always submodule add -q "$SUBMOD_INNER" sub
+  git -C "$SUBMOD_ROOT/main" config protocol.file.allow always
+  git -c protocol.file.allow=always submodule add -q -b main "$SUBMOD_INNER" sub
   git commit -q -m "add submodule"
   # The submodule carries a mirror-style refspec: its own fetch maps remote
   # heads straight onto local heads, which is what makes an inherited --prune
   # dangerous there.
   git -C sub config remote.origin.fetch '+refs/heads/*:refs/heads/*'
-  git config fetch.recurseSubmodules true
+  git -C "$SUBMOD_ROOT/main" config fetch.recurseSubmodules true
 ) >/dev/null 2>&1
 set +e
 OUT_SUBMOD=$( cd "$SUBMOD_ROOT/main" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
@@ -2812,9 +2823,14 @@ set +e
 OUT_PRUNETAGS=$( cd "$PRUNETAGS_ROOT/main" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
 RC_PRUNETAGS=$?
 set -e
+# The worktree assertion is what keeps this from passing for the wrong reason:
+# a helper that skipped the scoped prune entirely would also preserve both
+# tags. Requiring the stale worktree to be gone proves the prune ran AND was
+# confined to refs/remotes/origin/* (CodeRabbit 🟡 on #892).
 if [ "$RC_PRUNETAGS" -eq 0 ] \
    && git -C "$PRUNETAGS_ROOT/main" rev-parse --verify -q refs/tags/shared >/dev/null \
-   && git -C "$PRUNETAGS_ROOT/main" rev-parse --verify -q refs/tags/local-only >/dev/null; then
+   && git -C "$PRUNETAGS_ROOT/main" rev-parse --verify -q refs/tags/local-only >/dev/null \
+   && [ ! -d "$PRUNETAGS_ROOT/gone-worktree" ]; then
   pass "#892 --apply preserves local tags under remote.origin.pruneTags=true"
 else
   fail "#892 remote.origin.pruneTags=true let --apply delete local tags"
