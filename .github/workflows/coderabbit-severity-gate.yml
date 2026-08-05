@@ -10,7 +10,10 @@ name: CodeRabbit Severity Gate
 # Reports "CodeRabbit blocking-tier unresolved: N" via
 # scripts/coderabbit-severity-gate.sh. The script exits 1 (gate fails)
 # when any CodeRabbit blocking-tier thread on the current HEAD is
-# unresolved.
+# unresolved, and 3 when a current-HEAD review run has not published its
+# PR-level summary yet — the event-driven job answers 3 by going non-green
+# and the sweep by declining to publish, so no publisher posts a verdict
+# read off the previous publication.
 #
 # Gate ON/OFF is controlled by coderabbit.severity_gate.enabled in
 # .github/review-policy.yml. Mergepath sets it to true (the canonical
@@ -192,12 +195,22 @@ jobs:
           #   0 = no unresolved blocking-tier findings on HEAD (or gate disabled)
           #   1 = unresolved blocking-tier findings present (gate blocks)
           #   2 = config / usage error (CI failure, not a gate block)
+          #   3 = a current-HEAD review run is awaiting its PR-level summary
           set +e
           scripts/coderabbit-severity-gate.sh "$PR_NUMBER" "$REPO"
           rc=$?
           set -e
           if [ "$rc" -eq 2 ]; then
             echo "::error::coderabbit-severity-gate.sh exited 2 (config/usage error)"
+            exit 1
+          fi
+          if [ "$rc" -eq 3 ]; then
+            # Non-green, deliberately. This job publishes the NATIVE check for
+            # this head, so declining to publish is not available to it — the
+            # check would simply keep whatever the previous event left, which is
+            # the success this hold exists to withhold. The sweep is the arm
+            # that skips instead (#886).
+            echo "::error::CodeRabbit review on this HEAD has not published its PR-level summary yet; holding this run non-green until it does"
             exit 1
           fi
           exit "$rc"
@@ -291,6 +304,15 @@ jobs:
           # same gate. GitHub keys required checks on (head_sha, name); a
           # fresh check_run with the same name supersedes the stale one.
           CHECK_NAME: "CodeRabbit unresolved blocking findings"
+          # The sweep honors the publication hold too (Codex P1 + CodeRabbit
+          # Major on #886). Without it the sweep is a second publisher of the
+          # same required check running the arrival-INDEPENDENT scan, so a sweep
+          # landing between a review object and its PR-level summary posted
+          # success over the review run's red and reopened the gap. It is safe
+          # here precisely because the sweep answers rc 3 by DECLINING TO
+          # PUBLISH: the hold withholds a success, it never manufactures a red
+          # this arm cannot retire.
+          REQUIRE_REVIEW_SUMMARY: "true"
         run: |
           set -euo pipefail
           # Bootstrap (see the event-driven job): the trusted script is run from
@@ -399,6 +421,21 @@ jobs:
               continue
             fi
 
+            if [ "$rc" -eq 3 ]; then
+              # The ONE case where declining to publish is correct. A review run
+              # is on this head and its PR-level summary has not landed, so the
+              # findings on that surface are not knowable yet — and the only
+              # verdict this sweep could compute is read off the PREVIOUS
+              # publication. Publishing success would overwrite the event-driven
+              # run's red with a stale clean read; publishing failure would let
+              # this arm pin a required check red with no ack channel and no
+              # break-glass under `enforce_admins: true`. Skipping leaves the
+              # event run's verdict standing and self-clears on the next sweep
+              # once the summary publishes (#886).
+              echo "::notice::PR #$PR has a current-HEAD CodeRabbit review awaiting its PR-level summary; skipping this publication so the review run's verdict stands"
+              echo "::endgroup::"
+              continue
+            fi
             case "$rc" in
               0) conclusion="success" ;;
               1) conclusion="failure" ;;

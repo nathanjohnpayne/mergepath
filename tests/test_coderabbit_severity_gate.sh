@@ -1047,16 +1047,24 @@ make_issue_comments_fixture() {
 
 # Review-object fixture for CodeRabbit's markerless full-review format. Its
 # exact `commit_id` is the scope anchor that an ordinary summary body lacks.
+# The BODY is load-bearing, not decoration: only a review RUN anchors a summary,
+# and a non-empty body is what separates one from the body-less object CodeRabbit
+# creates for a conversational thread reply (mergepath#900). A fixture without it
+# would be a reply carrier, and every case built on this helper would silently
+# stop anchoring.
 make_reviews_fixture() {
   local sha=$1 state=${2:-COMMENTED} submitted_at=${3:-2026-08-04T00:00:10Z}
+  local body=${4:-**Actionable comments posted: 0**}
   local file="$WORKDIR/reviews.$$.$RANDOM.json"
-  jq -n --arg sha "$sha" --arg state "$state" --arg submitted_at "$submitted_at" '
+  jq -n --arg sha "$sha" --arg state "$state" --arg submitted_at "$submitted_at" \
+    --arg body "$body" '
     [{
       id: 8001,
       user: { login: "coderabbitai[bot]" },
       commit_id: $sha,
       state: $state,
-      submitted_at: $submitted_at
+      submitted_at: $submitted_at,
+      body: $body
     }]
   ' > "$file"
   echo "$file"
@@ -2705,11 +2713,59 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "awaiting its PR-level summary" \
+if [ "$RC" = 3 ] && echo "$OUT" | grep -q "awaiting its PR-level summary" \
     && grep -Fq "REQUIRE_REVIEW_SUMMARY: \${{ github.event_name == 'pull_request_review' }}" "$ROOT/.github/workflows/coderabbit-severity-gate.yml"; then
   pass "review-triggered run remains non-green until the current-head summary publishes"
 else
-  fail "expected rc=1 while a current-head review awaits its summary; got rc=$RC"
+  fail "expected rc=3 while a current-head review awaits its summary; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# rc 3 is not a finding count, and the two publishers of this check have to
+# answer it differently: the event-driven job cannot decline to publish (it owns
+# the native check for the head), while the sweep must decline rather than post
+# a verdict read off the previous publication. Both halves are asserted against
+# the workflow, since a gate exit code with no consumer changes nothing.
+echo "--- Test 47d1 (#886): both publishers act on the rc 3 hold"
+if grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
+    && grep -Fq 'if [ "$rc" -eq 3 ]; then' "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
+    && grep -Fq "skipping this publication so the review run's verdict stands" "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
+    && grep -Fq "holding this run non-green until it does" "$ROOT/.github/workflows/coderabbit-severity-gate.yml"; then
+  pass "the sweep opts into the hold and skips publication; the event-driven job goes non-green"
+else
+  fail "expected the sweep to set REQUIRE_REVIEW_SUMMARY and skip on rc 3, and the event job to fail on it"
+fi
+
+# A CodeRabbit conversational REPLY creates a head-pinned COMMENTED review
+# object with an EMPTY body and starts no run, so no summary ever follows it
+# (mergepath#900). Letting one set the correlation floor pushed that floor past
+# the genuine summary and held the run forever — re-armed by every thread reply.
+echo "--- Test 47d1b (#886): a body-less reply object does not set the correlation floor"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" 'No required finding here.')" \
+  "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:20Z" "2026-08-04T00:00:20Z")
+FIXTURE_REVIEWS=$(make_issue_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" '
+  [ { id: 8001, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:10Z", body: "**Actionable comments posted: 0**" },
+    { id: 8002, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:30Z", body: "" } ]
+')")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && ! echo "$OUT" | grep -q "awaiting its PR-level summary"; then
+  pass "a reply-carrier review object cannot push the floor past the genuine summary"
+else
+  fail "expected rc=0 with the summary still correlated to the real run; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
@@ -2735,11 +2791,11 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "awaiting its PR-level summary" \
+if [ "$RC" = 3 ] && echo "$OUT" | grep -q "awaiting its PR-level summary" \
     && echo "$OUT" | grep -q "predate the completed CodeRabbit review object"; then
   pass "a marker-led summary from the previous publication cannot clear a review-triggered run"
 else
-  fail "expected rc=1 with the uncorrelated marker summary dropped; got rc=$RC"
+  fail "expected rc=3 with the uncorrelated marker summary dropped; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 

@@ -91,6 +91,12 @@
 #   1   One or more unresolved blocking-tier findings on current HEAD —
 #       gate blocks.
 #   2   Usage / config error. Error message on stderr.
+#   3   REQUIRE_REVIEW_SUMMARY only: a completed CodeRabbit review run is on
+#       the current HEAD but its PR-level summary has not published yet, so
+#       the findings on that surface are not knowable. NOT a finding count.
+#       An event-driven caller treats it as non-green; the scheduled /
+#       issue_comment sweep must DECLINE TO PUBLISH rather than post a
+#       success read off the previous publication.
 #
 # Design notes:
 #   - Read-only. Only GETs against the GitHub API.
@@ -779,11 +785,23 @@ MARKERLESS_SUMMARY_COUNT=$(echo "$MARKERLESS_SUMMARIES_JSON" | jq 'length')
 HEAD_REVIEW_AT=''
 if [ "$MARKERLESS_SUMMARY_COUNT" -gt 0 ] || [ "$REQUIRE_REVIEW_SUMMARY" = "true" ]; then
   REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "CodeRabbit reviews for markerless summary")
+  # Only a review RUN anchors the summary — a NON-EMPTY body is the
+  # discriminator, the same one mergepath#900 measured. CodeRabbit also creates
+  # a head-pinned COMMENTED review object for a conversational REPLY on a review
+  # thread (its answer to a rebuttal, or to the `[mergepath-resolve:<class>]` tag
+  # reply resolve-pr-threads.sh posts to clear the pre-merge conversation gate).
+  # Those carry an empty body and start no run, so no summary ever follows them.
+  # Taking the newest object outright let a reply that lands AFTER the summary
+  # push this floor past it, and the correlation filter below then discarded the
+  # genuine current summary — a permanent hold on a PR whose review demonstrably
+  # finished, re-armed by every thread reply. Five such objects sat on this PR's
+  # own head while its one real run carried a 9906-byte body.
   HEAD_REVIEW_AT=$(echo "$REVIEWS_JSON" | jq -r --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
     [ .[]
       | select(.user.login == $bot)
       | select(.commit_id == $sha)
       | select(.state == "COMMENTED" or .state == "APPROVED" or .state == "CHANGES_REQUESTED")
+      | select(((.body // "") | gsub("\\s"; "")) != "")
       | .submitted_at
       | select(type == "string" and . != "")
     ] | max // ""
@@ -878,9 +896,18 @@ SUMMARY_FINDINGS_FINGERPRINT_INPUT=''
 SUMMARY_CANDIDATE_COUNT=$(echo "$SUMMARY_CANDIDATES" | jq 'length')
 if [ "$SUMMARY_CANDIDATE_COUNT" -eq 0 ]; then
   if [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] && [ -n "$HEAD_REVIEW_AT" ]; then
-    echo "CodeRabbit current-HEAD review is awaiting its PR-level summary; holding this review-triggered gate run." >&2
-    echo "CodeRabbit blocking-tier unresolved: 1"
-    exit 1
+    # Exit 3, NOT 1 (Codex P1 + CodeRabbit Major on #886). "A review has begun
+    # and its summary is not published yet" is not a finding count, and the two
+    # publishers have to act on it differently: an event-driven run has to go
+    # non-green, while the sweep — the only publisher that can restore this
+    # check through the Checks API — must DECLINE TO PUBLISH rather than
+    # overwrite the event run's red with a success read off the previous
+    # publication. Collapsing both into 1 forced a choice between a sweep that
+    # reopens the gap and a sweep that can hold a required check red with no ack
+    # channel and no break-glass under `enforce_admins: true`.
+    echo "CodeRabbit current-HEAD review is awaiting its PR-level summary; holding this gate run." >&2
+    echo "CodeRabbit blocking-tier unresolved: pending (summary publication in flight)"
+    exit 3
   fi
   log "no CodeRabbit PR-level summary comment found — no summary findings in scope"
 fi
