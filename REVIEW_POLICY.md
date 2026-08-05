@@ -289,6 +289,22 @@ Before moving past Phase 2.5, confirm all of the following:
 - [ ] Substantive findings fixed or dismissed with reasoning
 - [ ] Recorded each finding's disposition (fixed / rebutted) via `scripts/coderabbit-record-feedback.sh` (disposition-logging only — no reaction posted; #584)
 
+### Real-Time Per-Finding Disposition (#865)
+
+Every disposition step described above — triage reply, fix, verdict recording (`codex-record-feedback.sh` / `coderabbit-record-feedback.sh`), and, when a thread exists, thread resolution (the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate)) — happens **per finding, at the moment that finding is worked**, not gathered up and run once at the end of the round or deferred to the merge endgame; summary-only findings (no review thread to resolve) use the documented summary-ack path instead ([§ Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate)). This is a sequencing rule layered on top of the existing steps above; it does not introduce a new mechanism or a new required check.
+
+On PR #852 (round 4 → 5), bot findings sat visibly unresolved for over an hour while the authoring agent fixed them in a batch: the reaction, the on-thread reply, and the thread resolution all happened together at the end of the round. From the PR page it was impossible to tell which findings were already fixed, which were rebutted, and which were still open — that state lived only in the agent's own session, not on GitHub where the owner and the other reviewing bot could see it.
+
+The required sequencing, per finding:
+
+1. **On triage** (before or alongside the fix): reply on the finding's own thread with the verdict — what will be fixed, what is rebutted and why, or what is deferred and to which follow-up issue.
+2. **On fix landing** (the commit exists, tests pass): record the verdict via `scripts/codex-record-feedback.sh` or `scripts/coderabbit-record-feedback.sh` and resolve that thread through the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate)'s disposition-matched path — per finding, immediately, not queued for a later sweep.
+3. **Rebuttals and deferrals** get the same treatment: reply and recorded verdict at the moment the disposition is decided, with any follow-up issue linked in that same reply — never held until the round or the merge endgame.
+
+The end-of-round sweep (and the weekly unresolved-feedback sweep, [§ Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate)) remains only as a **completeness check** — confirming nothing was missed — never as the primary mechanism for disposing of findings. Head-pinned scans (`codex-record-feedback.sh --scan`) already depend on this: recording while the finding's head is still current, rather than racing the next push, is only reliable when recording happens as each finding is worked (see the capture-before-push guidance in Phase 3 step 9 and Phase 4a step 13a-bis above).
+
+**Superseded `CHANGES_REQUESTED` reviews.** The same real-time discipline applies to a CLI-driven reviewer's review *state* (Phase 4b, step 13b): once every finding in a `CHANGES_REQUESTED` round has been individually dispositioned — fixed with the commit pushed, or rebutted/deferred with the record posted — on a newer HEAD, the superseded review is dismissed the moment that round is fully dispositioned — not left stale until the next round's review or the final merge check. A round that is not fully dispositioned — for example, an open rebuttal the reviewer has not seen — keeps its review standing until the next round's verdict supersedes it; do not dismiss a `CHANGES_REQUESTED` review while any finding from that round remains undispositioned on the current HEAD. Dismiss it with the identity-checked path (the external reviewer's own identity, or a collaborator dismissal recorded with a reason citing the newer HEAD and the round it superseded), the same fail-closed, identity-checked posture the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate) uses for thread resolution.
+
 ### Pre-Merge Review Conversation Gate
 
 Every merge path must pass this gate immediately before calling `gh pr merge`, and must repeat it after any push or review-thread reply that can change GitHub conversation state.
@@ -608,7 +624,7 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
 
 ## Feedback Disposition Policy
 
-The `feedback_policy` block in `.github/review-policy.yml` controls **which bot-review findings the authoring agent must disposition before merge**. A *disposition* is one of: **fix** the code, **or** post a **rebuttal** reply explaining why the finding does not apply — and then **resolve the thread**. It governs disposition *requirements* only; it does not change who reviews or the external-review threshold.
+The `feedback_policy` block in `.github/review-policy.yml` controls **which bot-review findings the authoring agent must disposition before merge**. A *disposition* is one of: **fix** the code, post a **rebuttal** reply explaining why the finding does not apply, or — for a **discretionary**-tier finding only — post a **deferral** reply that links a follow-up issue; a **required**-tier (P0/P1) finding must be fixed or rebutted (the sole deferral route for a required-tier finding is the summary-only ack path, [§ Enforcement](#enforcement-two-symmetric-gates)). Record the verdict for each finding via `codex-record-feedback.sh` / `coderabbit-record-feedback.sh`, then complete the applicable thread-resolution or summary-ack path. It governs disposition *requirements* only; it does not change who reviews or the external-review threshold. Every disposition happens in real time, per finding, as it is worked — never batched at round end; see [§ Real-Time Per-Finding Disposition](#real-time-per-finding-disposition-865).
 
 ### Normalized severity ladder
 

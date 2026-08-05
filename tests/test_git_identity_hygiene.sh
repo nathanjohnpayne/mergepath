@@ -466,6 +466,35 @@ else
   fail "REVIEW_POLICY.md still publishes executable global placeholder identity writes"
 fi
 
+# Case 26c: #865's "Superseded CHANGES_REQUESTED reviews" precondition
+# (REVIEW_POLICY.md § Real-Time Per-Finding Disposition) must match the
+# pinned decision comment
+# (github.com/nathanjohnpayne/mergepath/issues/865#issuecomment-5160596834),
+# not a more permissive restatement of it. The decision requires the
+# dismissal precondition to name all three real dispositions (fixed,
+# rebutted, deferred — a deferred-only round is not "fixed-and-pushed, or
+# rebutted on-thread") and to carve out a round with an open rebuttal the
+# reviewer has not yet answered: that round keeps its review standing
+# until a later round's verdict supersedes it, rather than becoming
+# dismissible the instant a reply lands. Losing either half re-opens the
+# short-circuit § No-self-approve scoping exists to prevent: dismissing a
+# cross-agent CHANGES_REQUESTED review the reviewer never accepted.
+if grep -qF 'fixed with the commit pushed, or rebutted/deferred with the record posted' "$ROOT/REVIEW_POLICY.md"; then
+  pass "#865: dismissal precondition names fixed/rebutted/deferred with the record posted"
+else
+  fail "#865: REVIEW_POLICY.md dismissal precondition dropped 'deferred' or the record-posted requirement"
+fi
+if grep -qF "keeps its review standing until the next round's verdict supersedes it" "$ROOT/REVIEW_POLICY.md"; then
+  pass "#865: undispositioned-round carve-out (review stands until superseded) is present"
+else
+  fail "#865: REVIEW_POLICY.md is missing the undispositioned-round carve-out from the pinned decision"
+fi
+if grep -qF '(fixed-and-pushed, or rebutted on-thread)' "$ROOT/REVIEW_POLICY.md"; then
+  fail "#865: REVIEW_POLICY.md still carries the pre-fix permissive precondition wording"
+else
+  pass "#865: pre-fix permissive precondition wording ('fixed-and-pushed, or rebutted on-thread') is gone"
+fi
+
 # ── Part A: the live-repo identity assertion ──────────────────────────
 
 IDREPO="$WORKDIR/idrepo"
