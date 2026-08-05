@@ -1565,6 +1565,273 @@ else
   fail "scratch files left behind: rc=$RC leftover=$LEFTOVER"
 fi
 
+# ── Fail-closed: a snapshot whose subject was deleted (#803) ───────────
+
+# Case 63: `--snapshot` and the final report run in SEPARATE processes — an
+# early repo_lint step and the job's last one — so everything that carries
+# between them is on disk. With the snapshot request stored under `.git`, a
+# step that removed the checkout took the request away with the subject:
+# the final run found no marker, no baseline and no repository, read the
+# tree as an ordinary non-repository, and reported PASS for a job that had
+# destroyed the very thing it was asserting about. The marker is asserted
+# to live outside `.git` and to survive its deletion, because that is what
+# leaves anything behind for the final run to fail on.
+SNAPGONE_REPO="$WORKDIR/snapshot-subject-gone-repo"
+git init -q -b main "$SNAPGONE_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPGONE_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+MARKER_UNDER_GIT="$(find "$SNAPGONE_REPO/.git" -name '*baseline.requested*' | wc -l | tr -d ' ')"
+rm -rf "$SNAPGONE_REPO/.git"
+MARKER_KEPT=0
+if [ -f "$SNAPGONE_REPO/.mergepath/gitconfig-baseline.requested" ]; then
+  MARKER_KEPT=1
+fi
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPGONE_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && [ "$MARKER_UNDER_GIT" = "0" ] \
+  && [ "$MARKER_KEPT" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "snapshotted repository is missing" \
+  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "snapshot then deleted .git: the request survives outside metadata and fails closed"
+else
+  fail "deleted checkout blessed after --snapshot: under_git=$MARKER_UNDER_GIT kept=$MARKER_KEPT rc=$RC out=$OUT"
+fi
+
+# Case 63b: the converse — the branch above fires on a missing SUBJECT, not
+# on the mere presence of a recorded snapshot. An intact checkout still
+# reports the ordinary unchanged-since-snapshot result.
+SNAPOK_REPO="$WORKDIR/snapshot-subject-intact-repo"
+git init -q -b main "$SNAPOK_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOK_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOK_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "unchanged since snapshot" \
+  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
+  && ! printf '%s' "$OUT" | grep -q "snapshotted repository is missing"; then
+  pass "intact checkout with a recorded snapshot: still passes"
+else
+  fail "intact snapshotted checkout: rc=$RC out=$OUT"
+fi
+
+# ── Newline-safe include-target collection (#804) ──────────────────────
+
+# Case 64: a Git include target is an ordinary filename and may contain a
+# NEWLINE. Collecting the walk's targets as newline-delimited text split
+# one such file into two entries that named nothing; neither existed, both
+# were dropped by the file test, and the dormant identity behind it was
+# never inspected — free to reactivate the moment its condition matched.
+NLREPO="$WORKDIR/newline-include-repo"
+git init -q -b main "$NLREPO"
+NL_INCLUDE="$NLREPO/.git/dormant"$'\n'"identity"
+printf '[user]\n\temail = newline-include@example.com\n' > "$NL_INCLUDE"
+git -C "$NLREPO" config --local includeIf.onbranch:release.path "$NL_INCLUDE"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NLREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+REMEDY="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]+git .*--unset-all user\.email' | head -1 || true)"
+set +e
+eval "$REMEDY" >/dev/null 2>&1
+NL_LEFT="$(git config --file "$NL_INCLUDE" --get user.email 2>/dev/null)"
+OUT_AFTER="$(MERGEPATH_GIT_IDENTITY_ROOT="$NLREPO" bash "$CHECK" 2>&1)"
+RC_AFTER=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "newline-include@example.com" \
+  && printf '%s' "$OUT" | grep -q "inactive include" \
+  && [ -n "$REMEDY" ] && [ -z "$NL_LEFT" ] && [ "$RC_AFTER" = "0" ]; then
+  pass "include target whose filename contains a newline: inspected, and its remediation lands on that file"
+else
+  fail "newline include target escaped the walk: rc=$RC remedy='$REMEDY' left='$NL_LEFT' after=$RC_AFTER out=$OUT after_out=$OUT_AFTER"
+fi
+
+# Case 64b: two `includeIf` entries pointing at the SAME target still yield
+# one entry and one remediation. The dedupe moved from a substring test
+# over joined text to an element comparison over an array, and an array
+# whose membership test is wrong duplicates instead of losing — the failure
+# in the opposite direction, and just as visible to an operator.
+DEDUPE_INC_REPO="$WORKDIR/dedupe-include-repo"
+git init -q -b main "$DEDUPE_INC_REPO"
+printf '[user]\n\temail = deduped@example.com\n' > "$DEDUPE_INC_REPO/.git/shared-identity"
+git -C "$DEDUPE_INC_REPO" config --local includeIf.onbranch:release.path shared-identity
+git -C "$DEDUPE_INC_REPO" config --local includeIf.onbranch:hotfix.path shared-identity
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$DEDUPE_INC_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+N_ENTRIES="$(printf '%s\n' "$OUT" | grep -c "user.email = deduped@example.com" || true)"
+N_REMEDIES="$(printf '%s\n' "$OUT" | grep -c -- "--unset-all user.email" || true)"
+if [ "$RC" = "1" ] && [ "$N_ENTRIES" -eq 1 ] && [ "$N_REMEDIES" -eq 1 ]; then
+  pass "one include target reached by two includeIf entries: reported once"
+else
+  fail "duplicate include-target reporting: entries=$N_ENTRIES remedies=$N_REMEDIES rc=$RC out=$OUT"
+fi
+
+# ── Precision: the protected keys are COMPLETE keys (#805) ─────────────
+
+# Case 65: the identity-key pattern carried no boundary in front of it, so
+# it matched the TAIL of any key ending in the same letters.
+# `notuser.email`, `precommit.gpgsign` and `retag.gpgsign` are all valid
+# git config keys, none of them protected and none of them touching commit
+# attribution, and every one of them was reported as a write to the key it
+# merely ends with.
+run_on_fixture "tests/suffix-keys.sh" '#!/usr/bin/env bash
+git config notuser.email "not-protected@example.com"
+git config precommit.gpgsign false
+git config retag.gpgsign false
+git config myuser.name "not-protected"
+'
+if [ "$RC" = "0" ]; then
+  pass "config keys that merely END in a protected key: not reported"
+else
+  fail "suffix-sharing config keys falsely flagged: rc=$RC out=$OUT"
+fi
+
+# Case 65b: the converse, so anchoring the pattern cannot have been
+# achieved by turning the scan off. Suffix-sharing keys sit either side of
+# a real write, and only the real write is reported.
+run_on_fixture "tests/suffix-mixed.sh" '#!/usr/bin/env bash
+git config notuser.email "not-protected@example.com"
+git config user.email "leak@example.com"
+git config retag.gpgsign false
+'
+N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/suffix-mixed\.sh:' || true)"
+if [ "$RC" = "1" ] \
+  && [ "$N_HITS" -eq 1 ] \
+  && printf '%s' "$OUT" | grep -q "tests/suffix-mixed.sh:3:"; then
+  pass "suffix keys around a real write: only the exact protected key is reported"
+else
+  fail "mixed suffix/protected keys: hits=$N_HITS rc=$RC out=$OUT"
+fi
+
+# Case 65c: the same mix inside ONE logical command. The line is cut at
+# shell separators and each piece judged alone, so the suffix key must not
+# stand in for the protected one in either direction: the write is still
+# reported, and the piece that only carries a suffix key contributes
+# nothing of its own.
+run_on_fixture "tests/suffix-same-line.sh" '#!/usr/bin/env bash
+git config retag.gpgsign false && git config user.email "leak@example.com"
+git config precommit.gpgsign false && git config notuser.email "not-protected@example.com"
+'
+N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/suffix-same-line\.sh:' || true)"
+if [ "$RC" = "1" ] \
+  && [ "$N_HITS" -eq 1 ] \
+  && printf '%s' "$OUT" | grep -q "tests/suffix-same-line.sh:2:"; then
+  pass "suffix and protected keys in one command: only the protected write is reported"
+else
+  fail "same-line suffix/protected mix: hits=$N_HITS rc=$RC out=$OUT"
+fi
+
+# ── Linked worktrees: identity lives in every one of them (#806) ───────
+
+# Case 66: `git config --worktree` reads the INVOKING worktree's
+# config.worktree and nothing else, so a protected key parked in a SIBLING
+# linked worktree passed a check run from the main worktree — while every
+# commit made in that sibling was attributed and signed under it. The
+# offending file is what the remediation has to name: no scope reachable
+# from the main worktree would clear it.
+LWMAIN="$WORKDIR/linked-identity-main"
+LWSIB="$WORKDIR/linked-identity-sibling"
+git init -q -b main "$LWMAIN"
+printf 'seed\n' > "$LWMAIN/seed.txt"
+git -C "$LWMAIN" add seed.txt
+git -C "$LWMAIN" -c user.name=fixture -c user.email=fixture@example.com \
+  commit -q -m seed
+git -C "$LWMAIN" worktree add -q -b linked "$LWSIB"
+git -C "$LWMAIN" config --local extensions.worktreeConfig true
+git -C "$LWSIB" config --worktree user.email "linked-worktree@example.com"
+# Invisible to every scope the main worktree can read for ITSELF, which is
+# exactly what made the old check report success on this repository.
+LW_OWN_SCOPE="$(git -C "$LWMAIN" config --worktree --get user.email 2>/dev/null || true)"
+LW_LOCAL="$(git -C "$LWMAIN" config --local --includes --get user.email 2>/dev/null || true)"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$LWMAIN" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+REMEDY="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]+git .*--unset-all user\.email' | head -1 || true)"
+set +e
+eval "$REMEDY" >/dev/null 2>&1
+LW_LEFT="$(git -C "$LWSIB" config --worktree --get user.email 2>/dev/null)"
+OUT_AFTER="$(MERGEPATH_GIT_IDENTITY_ROOT="$LWMAIN" bash "$CHECK" 2>&1)"
+RC_AFTER=$?
+set -e
+if [ -z "$LW_OWN_SCOPE" ] && [ -z "$LW_LOCAL" ] \
+  && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "linked-worktree@example.com" \
+  && printf '%s' "$OUT" | grep -q "worktrees/linked-identity-sibling/config.worktree" \
+  && [ -n "$REMEDY" ] && [ -z "$LW_LEFT" ] && [ "$RC_AFTER" = "0" ]; then
+  pass "identity in a sibling linked worktree: caught from the main worktree and cleared by the printed command"
+else
+  fail "sibling linked-worktree identity escaped: own='$LW_OWN_SCOPE' local='$LW_LOCAL' rc=$RC remedy='$REMEDY' left='$LW_LEFT' after=$RC_AFTER out=$OUT"
+fi
+
+# Case 66b: a sibling's file is read outright rather than through a scope,
+# so a DORMANT one is inspected on the same terms as an active one.
+# Disabling extensions.worktreeConfig deletes nobody's config.worktree, and
+# re-enabling it reactivates every identity in them with no fresh write for
+# a later run to catch.
+DLWMAIN="$WORKDIR/dormant-linked-main"
+DLWSIB="$WORKDIR/dormant-linked-sibling"
+git init -q -b main "$DLWMAIN"
+printf 'seed\n' > "$DLWMAIN/seed.txt"
+git -C "$DLWMAIN" add seed.txt
+git -C "$DLWMAIN" -c user.name=fixture -c user.email=fixture@example.com \
+  commit -q -m seed
+git -C "$DLWMAIN" worktree add -q -b dormant-linked "$DLWSIB"
+git -C "$DLWMAIN" config --local extensions.worktreeConfig true
+git -C "$DLWSIB" config --worktree user.signingkey DORMANTKEY
+git -C "$DLWMAIN" config --local extensions.worktreeConfig false
+DLW_FILE="$DLWMAIN/.git/worktrees/dormant-linked-sibling/config.worktree"
+DLW_PRESENT=0
+if [ -f "$DLW_FILE" ]; then
+  DLW_PRESENT=1
+fi
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$DLWMAIN" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+REMEDY="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]+git .*--unset-all user\.signingkey' | head -1 || true)"
+set +e
+eval "$REMEDY" >/dev/null 2>&1
+DLW_LEFT="$(git config --file "$DLW_FILE" --get user.signingkey 2>/dev/null)"
+OUT_AFTER="$(MERGEPATH_GIT_IDENTITY_ROOT="$DLWMAIN" bash "$CHECK" 2>&1)"
+RC_AFTER=$?
+set -e
+if [ "$DLW_PRESENT" = "1" ] && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "dormant linked worktree" \
+  && printf '%s' "$OUT" | grep -q "DORMANTKEY" \
+  && [ -n "$REMEDY" ] && [ -z "$DLW_LEFT" ] && [ "$RC_AFTER" = "0" ]; then
+  pass "dormant sibling config.worktree: inspected and cleared like an active one"
+else
+  fail "dormant sibling worktree identity escaped: present=$DLW_PRESENT rc=$RC remedy='$REMEDY' left='$DLW_LEFT' after=$RC_AFTER out=$OUT"
+fi
+
+# Case 66c: the converse — the invoking worktree's OWN config.worktree is
+# not also enumerated as a sibling. It is reachable through its scope, and
+# reporting it twice would hand an operator two remediation commands for
+# one override.
+SELFWT_REPO="$WORKDIR/self-worktree-repo"
+git init -q -b main "$SELFWT_REPO"
+git -C "$SELFWT_REPO" config --local extensions.worktreeConfig true
+git -C "$SELFWT_REPO" config --worktree user.email "self-worktree@example.com"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SELFWT_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+N_ENTRIES="$(printf '%s\n' "$OUT" | grep -c "user.email = self-worktree@example.com" || true)"
+N_REMEDIES="$(printf '%s\n' "$OUT" | grep -c -- "--unset-all user.email" || true)"
+if [ "$RC" = "1" ] && [ "$N_ENTRIES" -eq 1 ] && [ "$N_REMEDIES" -eq 1 ] \
+  && ! printf '%s' "$OUT" | grep -q "linked worktree"; then
+  pass "the invoking worktree's own config.worktree: reported once, not also as a sibling"
+else
+  fail "own config.worktree double-reported: entries=$N_ENTRIES remedies=$N_REMEDIES rc=$RC out=$OUT"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────
 echo
 echo "test_git_identity_hygiene: $PASS passed, $FAIL failed"
