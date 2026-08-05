@@ -2713,6 +2713,89 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# A marker-led summary's commits-range end still names the head after CodeRabbit
+# re-reviews the SAME head, so the SHA-only scope test alone keeps the previous
+# publication in scope and skips the hold above. On the review-triggered path
+# the candidate must belong to the triggering review, or the run stays red until
+# the issue_comment sweep sees the replacement summary.
+echo "--- Test 47d2 (#886): review event + marker summary predating the review → exit 1"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" 'No required finding here.')" \
+  "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:00Z" "2026-08-04T00:00:00Z")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "awaiting its PR-level summary" \
+    && echo "$OUT" | grep -q "predate the completed CodeRabbit review object"; then
+  pass "a marker-led summary from the previous publication cannot clear a review-triggered run"
+else
+  fail "expected rc=1 with the uncorrelated marker summary dropped; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# The correlation floor must not be a blanket hold: once the summary for THIS
+# review publishes, the same review-triggered run classifies it and goes green.
+echo "--- Test 47d3 (#886): review event + summary published after the review → exit 0"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" 'No required finding here.')" \
+  "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:20Z" "2026-08-04T00:00:20Z")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! echo "$OUT" | grep -q "awaiting its PR-level summary"; then
+  pass "a marker-led summary correlated to the triggering review still clears the run"
+else
+  fail "expected rc=0 once the correlated summary publishes; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# The correlation floor is scoped to the review-triggered path. On the
+# arrival-independent sweep an uncorrelated candidate must stay IN scope:
+# dropping it there yields zero candidates, which passes, and a real blocking
+# summary finding would go unenforced.
+echo "--- Test 47d4 (#886): sweep path keeps an uncorrelated marker summary in scope → exit 1"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING")" \
+  "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:00Z" "2026-08-04T00:00:00Z")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && ! echo "$OUT" | grep -q "predate the completed CodeRabbit review object"; then
+  pass "the sweep path still enforces an uncorrelated marker-led summary finding"
+else
+  fail "expected rc=1 with the sweep path unaffected by the correlation floor; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # Marker-led summaries and markerless full-review summaries are separate
 # CodeRabbit serializations, not fallbacks for one another. A stale marker-led
 # comment must not hide a fresh markerless body that carries the only P1.

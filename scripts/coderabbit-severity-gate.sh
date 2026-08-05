@@ -736,13 +736,16 @@ MARKER_SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
   [ .[]
     | select(.user.login == $bot)
     | select((.body // "") | startswith($m))
+    | . + { fresh_at: ([.created_at, (.updated_at // .created_at)]
+                        | map(select(type == "string" and . != "")) | max // "") }
   ]
   | sort_by(.id)
   | last
-  | { id: (.id // 0), body: (.body // "") }
+  | { id: (.id // 0), body: (.body // ""), fresh_at: (.fresh_at // "") }
 ')
 MARKER_SUMMARY_ID=$(echo "$MARKER_SUMMARY_JSON" | jq -r '.id')
 MARKER_SUMMARY_BODY=$(echo "$MARKER_SUMMARY_JSON" | jq -r '.body')
+MARKER_SUMMARY_FRESH_AT=$(echo "$MARKER_SUMMARY_JSON" | jq -r '.fresh_at')
 
 # The marker-led summarize and markerless full-review serializations are both
 # live CodeRabbit protocols. They are not mutually exclusive: a stale marker
@@ -757,7 +760,8 @@ if [ "$MARKER_SUMMARY_ID" != "0" ]; then
   else
     SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c \
       --argjson id "$MARKER_SUMMARY_ID" --arg body "$MARKER_SUMMARY_BODY" \
-      '. + [{id: $id, body: $body, scope: "commits-range"}]')
+      --arg fresh_at "$MARKER_SUMMARY_FRESH_AT" \
+      '. + [{id: $id, body: $body, scope: "commits-range", fresh_at: $fresh_at}]')
   fi
 fi
 
@@ -801,6 +805,35 @@ if [ "$MARKERLESS_SUMMARY_COUNT" -gt 0 ]; then
     log "markerless CodeRabbit full-review candidate has no timestamped completed CodeRabbit review object on $HEAD_SHA — no summary findings in scope"
   else
     log "markerless CodeRabbit full-review candidate predates completed CodeRabbit review object on $HEAD_SHA — no summary findings in scope"
+  fi
+fi
+
+# Same-head re-review correlation, on the review-triggered path ONLY (Codex P1
+# on #886). The scope predicates above are SHA-only for a marker-led summary:
+# its commits-range end still names this head after CodeRabbit re-reviews the
+# SAME head (the `@coderabbitai full review` recovery flow, mergepath#898). So
+# the previous — possibly clean — summary keeps SUMMARY_CANDIDATE_COUNT
+# nonzero, the publication hold below never fires, and the run can publish
+# success in the window before the replacement summary lands. Correlate the
+# candidate to the triggering review the same way the markerless path already
+# does, by requiring it to be fresh at-or-after the completed review object on
+# this head; a candidate that predates it belongs to the previous publication.
+#
+# Restricted to REQUIRE_REVIEW_SUMMARY=true because dropping the candidate is
+# only fail-CLOSED there: with the flag set, zero candidates means the hold
+# below exits 1. On the arrival-independent sweep paths zero candidates means
+# "nothing in scope yet" and passes, so applying the same filter would discard
+# a real summary finding and fail OPEN. A missing/unparseable timestamp sorts
+# below any real one and is therefore dropped, which is the safe direction here.
+if [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] && [ -n "$HEAD_REVIEW_AT" ]; then
+  SUMMARY_UNCORRELATED=$(echo "$SUMMARY_CANDIDATES" | jq -r --arg at "$HEAD_REVIEW_AT" '
+    [ .[] | select((.fresh_at // "") < $at) | (.id | tostring) ] | join(", ")
+  ')
+  if [ -n "$SUMMARY_UNCORRELATED" ]; then
+    log "PR-level summary comment(s) $SUMMARY_UNCORRELATED predate the completed CodeRabbit review object on $HEAD_SHA — not this review's publication"
+    SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c --arg at "$HEAD_REVIEW_AT" '
+      [ .[] | select((.fresh_at // "") >= $at) ]
+    ')
   fi
 fi
 
