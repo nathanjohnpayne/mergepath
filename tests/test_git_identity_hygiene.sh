@@ -1671,6 +1671,28 @@ else
   fail "own request with a deleted baseline was waved through: rc=$RC out=$OUT"
 fi
 
+# Case 63e: the marker records a config PATH, and a filesystem path may
+# contain a newline. Framed by newline, the recorded path split across two
+# records and the reader took the first line for the whole of it — so the
+# checkout failed to recognise its OWN request, reported it as somebody
+# else's, and returned PASS on the deleted baseline that case 63d fails
+# on. Fail-open, on a path the filesystem accepts.
+SNAPNL_REPO="$WORKDIR/snapshot-newline"$'\n'"path-repo"
+git init -q -b main "$SNAPNL_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNL_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+rm -f "$SNAPNL_REPO/.git/mergepath-gitconfig-baseline"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNL_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "the requested snapshot baseline is missing" \
+  && ! printf '%s' "$OUT" | grep -q "recorded for another checkout"; then
+  pass "newline in the checkout path: the marker still names this checkout"
+else
+  fail "newline-path marker read as a foreign request: rc=$RC out=$OUT"
+fi
+
 # ── Newline-safe include-target collection (#804) ──────────────────────
 
 # Case 64: a Git include target is an ordinary filename and may contain a
@@ -1778,6 +1800,41 @@ if [ "$RC" = "1" ] \
   pass "suffix and protected keys in one command: only the protected write is reported"
 else
   fail "same-line suffix/protected mix: hits=$N_HITS rc=$RC out=$OUT"
+fi
+
+# Case 65d: a git config SUBSECTION accepts any byte, so a key can end in
+# a protected key behind a separator no character class can call a
+# boundary. `git config foo.bar/user.email x` stores `foo.bar/user.email`
+# and leaves `git config --get user.email` unset (git 2.50.1); the `:`
+# spelling behaves the same. Neither is a write to a protected key, and
+# neither may red repo_lint.
+run_on_fixture "tests/subsection-keys.sh" '#!/usr/bin/env bash
+git config foo.bar/user.email "not-protected@example.com"
+git config foo.bar:user.email "not-protected@example.com"
+git config a.b/commit.gpgsign true
+git config a.b:tag.gpgsign true
+git config x.y/user.signingkey ABC123
+'
+if [ "$RC" = "0" ]; then
+  pass "subsection keys ending in a protected key: not reported"
+else
+  fail "subsection-qualified config keys falsely flagged: rc=$RC out=$OUT"
+fi
+
+# Case 65e: the converse, so the word boundary cannot have been achieved
+# by narrowing the scan away from real writes standing beside one.
+run_on_fixture "tests/subsection-mixed.sh" '#!/usr/bin/env bash
+git config foo.bar/user.email "not-protected@example.com"
+git config user.email "leak@example.com"
+git config a.b:commit.gpgsign true
+'
+N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/subsection-mixed\.sh:' || true)"
+if [ "$RC" = "1" ] \
+  && [ "$N_HITS" -eq 1 ] \
+  && printf '%s' "$OUT" | grep -q "tests/subsection-mixed.sh:3:"; then
+  pass "subsection keys around a real write: only the exact protected key is reported"
+else
+  fail "mixed subsection/protected keys: hits=$N_HITS rc=$RC out=$OUT"
 fi
 
 # ── Linked worktrees: identity lives in every one of them (#806) ───────

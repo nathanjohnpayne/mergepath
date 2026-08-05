@@ -631,7 +631,14 @@ if [ "$MODE" = "snapshot" ]; then
   # and the recorded config path is how it tells "this repository is clean"
   # apart from "this repository is gone" — the state a deleted checkout
   # leaves behind, in which every other assertion here falls silent.
-  printf 'config=%s\nbaseline=%s\n' "$CFG" "$BASE" > "$BASE_MARKER"
+  #
+  # Records are NUL-framed, the one delimiter a path cannot contain. A
+  # newline-delimited record splits a checkout path holding a newline across
+  # two lines, and the reader then takes the prefix for the whole path,
+  # matches it against nothing, and files this checkout's own request as
+  # somebody else's — which turns the deleted-evidence FAIL this marker
+  # exists to raise back into a PASS, for a path the filesystem accepts.
+  printf 'config=%s\0baseline=%s\0' "$CFG" "$BASE" > "$BASE_MARKER"
   echo "check_git_identity_hygiene: snapshot recorded ($BASE)"
   exit 0
 fi
@@ -1011,7 +1018,10 @@ assert_config_unchanged() {
   # config puts this run under an obligation to account for a baseline.
   if [ -f "$marker" ]; then
     recorded_cfg=""
-    while IFS= read -r line; do
+    # NUL-framed, matching the writer: a path may contain a newline, so a
+    # line-framed read would hand back a truncated path that matches no
+    # checkout at all.
+    while IFS= read -r -d '' line; do
       case "$line" in
         config=*) recorded_cfg="${line#config=}"; break ;;
       esac
@@ -1227,19 +1237,33 @@ else
     # A lone backslash is the physical half of a continued command; the
     # logical-line join below removes it before this function sees the value.
     #
-    # The key must be a COMPLETE config key, not a suffix of one. Without a
-    # boundary in front, the pattern matched the tail of every key ending in
-    # the same letters, so `notuser.email`, `precommit.gpgsign` and
+    # The key must be a COMPLETE command-line word, not a suffix of one.
+    # Without a boundary in front, the pattern matched the tail of every key
+    # ending in the same letters, so `notuser.email`, `precommit.gpgsign` and
     # `retag.gpgsign` — all valid keys, none of them protected, none of them
     # touching commit attribution — were reported as writes to the protected
-    # ones. The boundary class is the character set a git config key is built
-    # from: alphanumerics, `-` and `.` (section, optional subsection, name),
-    # plus `_`, which git rejects in a key outright, so a token carrying one
-    # writes nothing to reject. Anything else in front is a real boundary — a
-    # space, a tab, a quote, the start of the piece.
+    # ones.
+    #
+    # Spelling that boundary as "any character a git config key is not built
+    # from" reopens the same class one layer down, because a SUBSECTION may
+    # hold any byte: `git config foo.bar/user.email x` and its `:` spelling
+    # are accepted keys that store `foo.bar/user.email`, and `git config
+    # --get user.email` stays unset after either (verified on git 2.50.1).
+    # The `/` or `:` is not a boundary there — it is the last character of
+    # the subsection — yet it reads as one to any character class, so a
+    # harmless config write is reported as an unscoped identity write and
+    # reds repo_lint. No character class can tell the two apart.
+    #
+    # What tells them apart is the WORD. A write names the protected key as a
+    # whole command-line word and its value follows after whitespace, so the
+    # word begins at the start of the piece or after whitespace; a subsection
+    # character sits inside the word and is neither. A quote is deliberately
+    # NOT in the set: the trailing `[[:space:]]+` below already excludes the
+    # quoted spelling `git config "user.email" x`, so admitting an opening
+    # quote here would match nothing this does not already match.
     function key_assign_pos(s,   lower, pos, rest) {
       lower = tolower(s)
-      if (!match(lower, /(^|[^a-z0-9._-])(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+/))
+      if (!match(lower, /(^|[[:space:]])(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+/))
         return 0
       # Step over the boundary character: it is not part of the key, and
       # this position is what the caller cuts the option region at. Every
@@ -1247,7 +1271,7 @@ else
       # separator on its end or dropping it come out the same today; the
       # step is here so the returned value keeps meaning what the function
       # is named for rather than "one byte before the key, usually". A
-      # matched boundary is never a letter (the class above excludes them),
+      # matched boundary is never a letter (the class above is whitespace),
       # which is what tells one apart from a match that began at `^`.
       pos = RSTART
       if (substr(lower, pos, 1) !~ /[a-z]/) pos++
