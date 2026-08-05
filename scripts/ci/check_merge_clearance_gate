@@ -596,8 +596,10 @@ if [ -f "$WORKFLOW" ]; then
   #
   # The other two properties are #849 holes that a parse closes cheaply: the
   # phase-2 step's own HEAD_SHA binding (a job-scoped grep is satisfied by
-  # phase 1's), and GH_TOKEN on every gh-invoking step (an unbound token makes
-  # the call fall back to no credentials and the publish 401s).
+  # phase 1's), and GH_TOKEN on every producer step that runs a shell (an
+  # unbound token makes a gh call fall back to no credentials and the publish
+  # 401s; #854 replaced "every step that LOOKS like it invokes gh" with the
+  # decidable universal-plus-pinned-exemptions form).
   #
   # Parser posture, and the two cases are NOT the same:
   #   - PyYAML ABSENT is an environment gap → loud SKIP, exit 0. Same idiom as
@@ -644,9 +646,115 @@ JOB_IF_ALLOWED = {
 }
 
 
-def normalized_if(value):
-    return " ".join(str(value).split())
+# One wrapper strip, and only a WHOLE-value one. `if: X` and `if: ${{ X }}`
+# are the same condition to Actions, so an otherwise-identical respelling must
+# not read as a different condition against the pins above. The interior is
+# rejected when it opens or closes a second wrapper: `${{ a }} && ${{ b }}` and
+# `${{ a }}x` are string interpolation rather than one expression, and
+# unwrapping either would change what is being compared.
+_WRAPPED_EXPRESSION = re.compile(r"^\$\{\{(?P<inner>.*)\}\}$", re.DOTALL)
 
+
+def unwrap_expression(text):
+    match = _WRAPPED_EXPRESSION.match(text.strip())
+    if match is None:
+        return text.strip()
+    inner = match.group("inner")
+    if "${{" in inner or "}}" in inner:
+        return text.strip()
+    return inner.strip()
+
+
+def normalized_if(value):
+    """Whitespace- and wrapper-insensitive spelling of a condition."""
+    return " ".join(unwrap_expression(str(value)).split())
+
+
+def pinned_condition(pin):
+    """The normalised pin, or None when the (job, step) pair has none.
+
+    normalized_if never returns None, so an absent pin can never compare equal
+    to a real condition — the no-pin case stays fail-closed.
+    """
+    return None if pin is None else normalized_if(pin)
+
+
+# Words Actions evaluates false once the wrapper and quotes are off. Numbers
+# are NOT enumerated here; they go through the parse below.
+FALSY_WORDS = frozenset(("false", "null", ""))
+
+
+def falsy_condition(value):
+    """True when `value` is a literal condition Actions can never satisfy.
+
+    #854 item 2. The earlier shape carried a tuple of falsy spellings and
+    review kept finding members it lacked (`-0`, `0.0`, `''`, `0x0`, internal
+    whitespace) — the #849 enumeration ladder in miniature. This is ONE
+    normalisation pass instead of a list: strip the ${{ }} wrapper, strip a
+    surrounding quote pair, then read the remainder as an integer with base
+    auto-detection (`0x0`, `0o0`, `0b0`, `-0`), as a float (`0.0`, `0e9`), and
+    against the false/null/empty words. PyYAML-resolved bools, numbers and None
+    are handled as values before any of that.
+
+    The boundary is stated rather than chased, and it is safe in ONE direction
+    by construction: this classification only ever ADDS a rejection. Acceptance
+    is decided exclusively by exact match against a pinned condition, so a
+    falsy form this pass misses is still refused for being off-allowlist — it
+    is merely reported as an unpinned condition instead of an unreachable one.
+    Over-classification (a quoted `'0'`, which Actions may well read as a
+    truthy non-empty string) can only reject a condition nobody pins.
+    """
+    if isinstance(value, bool):
+        return value is False
+    if value is None:
+        return True
+    if isinstance(value, (int, float)):
+        return value == 0
+    text = " ".join(unwrap_expression(str(value)).split())
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    if text.lower() in FALSY_WORDS:
+        return True
+    try:
+        return int(text, 0) == 0
+    except ValueError:
+        pass
+    try:
+        return float(text) == 0.0
+    except ValueError:
+        return False
+
+
+# Appended to every falsy-literal rejection so the boundary travels with the
+# message rather than living only in this comment block.
+FALSY_BOUNDARY = (
+    "      Falsy is decided by one normalisation pass, not a literal list: the",
+    "      ${{ }} wrapper and any surrounding quote pair come off, then the",
+    "      remainder is read as an integer in any base (0x0, 0o0, -0), as a",
+    "      float (0.0, 0e9), and against false/null/empty. A spelling that pass",
+    "      misses is still rejected by the exact pin, so this classification can",
+    "      only add rejections, never widen acceptance (#854).",
+)
+
+
+def needs_dependencies(value):
+    """(dependency names, malformed?) for a job-level `needs:` value.
+
+    #854 item 3. `needs` presence is rejected either way — this file's standing
+    posture is key ABSENCE over value interpretation, and an empty key is a
+    latent edge that a one-token later edit fills in with no structural signal.
+    What differs is the CAUSE reported, because the three shapes are not the
+    same defect: a non-empty edge set is the producer-skipping one, an empty
+    sequence declares no edge at all, and anything else is not a shape Actions
+    accepts (`needs` is a job id or a sequence of them).
+    """
+    if isinstance(value, str):
+        return ([value.strip()], False) if value.strip() else ([], True)
+    if isinstance(value, list):
+        if any(not isinstance(item, str) or not item.strip() for item in value):
+            return ([], True)
+        return ([item.strip() for item in value], False)
+    return ([], True)
 
 
 failures = []
@@ -816,12 +924,26 @@ for key in PRODUCERS:
             "      on the sweep and dispatch producers it silently drops a refresh",
             "      that nothing re-fires until the next scheduled pass.")
     if "needs" in job:
-        bad("FAIL: [#850 producer eligibility] job '%s' declares needs: %r." % (key, job["needs"]),
-            "      A dependency that fails or is skipped skips this producer before",
-            "      its own condition is even evaluated, leaving the trigger and every",
-            "      pinned condition intact while that path stops refreshing the",
-            "      required context. No producer may gate on another job.")
-    allowed = JOB_IF_ALLOWED.get(key, ())
+        dependencies, malformed = needs_dependencies(job["needs"])
+        if malformed:
+            bad("FAIL: [#850 producer eligibility] job '%s' declares a malformed" % key,
+                "      needs: %r. Actions accepts a job id or a sequence of them; any" % job["needs"],
+                "      other shape is a workflow this repository cannot reason about,",
+                "      so it is refused on its own cause rather than read as either an",
+                "      edge or the absence of one.")
+        elif dependencies:
+            bad("FAIL: [#850 producer eligibility] job '%s' declares needs: %s." % (key, ", ".join(dependencies)),
+                "      A dependency that fails or is skipped skips this producer before",
+                "      its own condition is even evaluated, leaving the trigger and every",
+                "      pinned condition intact while that path stops refreshing the",
+                "      required context. No producer may gate on another job.")
+        else:
+            bad("FAIL: [#850 producer eligibility] job '%s' declares an empty needs:" % key,
+                "      %r. An empty edge set skips nothing today, so this is not the" % job["needs"],
+                "      skipped-producer defect — but the key must still be absent: adding",
+                "      a dependency to an existing needs: is a one-token diff, whereas",
+                "      introducing the key is a visible one.")
+    allowed = tuple(normalized_if(item) for item in JOB_IF_ALLOWED.get(key, ()))
     if allowed and "if" not in job:
         bad("FAIL: [#850 producer eligibility] job '%s' has no job-level if: at all," % key,
             "      but its pinned allowlist expects one. The condition scopes each",
@@ -829,12 +951,21 @@ for key in PRODUCERS:
             "      example) runs on every pull_request event with an empty client",
             "      payload and exits red — and an exactness claim that is only",
             "      checked when the key is supplied is not exact (App P2 on #852).")
+    elif "if" in job and falsy_condition(job["if"]):
+        # Classified BEFORE the allowlist, so the cause is named rather than
+        # reported as generic drift — and so a diff that relaxes the pin and
+        # the workflow together still goes red on the literal itself.
+        bad("FAIL: [#850 producer eligibility] job '%s' carries a job-level if: %r" % (key, job["if"]),
+            "      that is a FALSY LITERAL: the job can never run on any event, so",
+            "      the trigger and every matched string stay intact while that path",
+            "      stops refreshing the required context.",
+            *FALSY_BOUNDARY)
     elif "if" in job and normalized_if(job["if"]) not in allowed:
         bad("FAIL: [#850 producer eligibility] job '%s' carries a job-level if: %r" % (key, job["if"]),
-            "      outside its pinned allowlist. A falsy literal or an always-false",
-            "      expression both leave every trigger and matched string intact",
-            "      while that path stops refreshing the required context; only an",
-            "      exact condition can be proven eligible structurally.")
+            "      outside its pinned allowlist. An always-false expression leaves",
+            "      every trigger and matched string intact while that path stops",
+            "      refreshing the required context; only an exact condition can be",
+            "      proven eligible structurally.")
 
 # Property 2b — no producer STEP may be disabled either (cross-agent P1 and
 # two App P2s on #852). A falsy literal, an extended conjunction ending in
@@ -843,7 +974,9 @@ for key in PRODUCERS:
 # while the step never runs. Literal-falsy detection cannot terminate over
 # expressions, so every step-level `if:` in a producer job must match a
 # PINNED expression exactly — the same posture as the job-level allowlist: a
-# legitimate condition change updates the pin in the same diff.
+# legitimate condition change updates the pin in the same diff. falsy_condition
+# runs first, but only to NAME an unreachable literal (#854 item 2); the pin
+# remains the sole thing that grants acceptance.
 # Keyed by (job, step name), not a global set (cross-agent P1, round 3): the
 # close step carrying the sweep's find-guard would pass a global allowlist
 # while that expression is false in a job with no `find` step — every pinned
@@ -875,7 +1008,13 @@ for key in PRODUCERS:
                 "      this producer's publish chain, so the key must be absent on",
                 "      every producer step — its default is already the required",
                 "      behavior.")
-        if "if" in step and normalized_if(step["if"]) != STEP_IF_ALLOWED.get((key, sname)):
+        if "if" in step and falsy_condition(step["if"]):
+            bad("FAIL: [#850 producer eligibility] step %r in job '%s' carries a" % (sname, key),
+                "      step-level if: %r that is a FALSY LITERAL — the job still runs" % step["if"],
+                "      but this step never does, so that trigger path stops publishing",
+                "      while every string assertion stays satisfied.",
+                *FALSY_BOUNDARY)
+        elif "if" in step and normalized_if(step["if"]) != pinned_condition(STEP_IF_ALLOWED.get((key, sname))):
             bad("FAIL: [#850 producer eligibility] step %r in job '%s' carries a" % (sname, key),
                 "      step-level if: %r that is not ITS pinned condition — the job" % step["if"],
                 "      still runs but this step may never, so that trigger path can",
@@ -911,15 +1050,38 @@ elif (close_step.get("env") or {}).get("HEAD_SHA") not in HEAD_SHA_OK:
         "      binding either kills the step under set -u or publishes on a commit",
         "      branch protection never consults.")
 
-# Property 4 — every gh-invoking step binds the token (#849 hole).
-# Detection runs over the UN-stripped body on purpose: prose mentioning `gh`
-# only ever OVER-includes a step (it then has to bind the token it does not
-# use), whereas stripping first would let a `gh` call hidden after a `#` on a
-# live line escape the requirement entirely.
-# Matches bare `gh `, path-qualified `/usr/bin/gh `, and quoted `"gh" `
-# invocations (cross-agent P1 on #852). Over-inclusion (prose mentioning gh)
-# only forces a token binding on a step that may not need one — the
-# fail-closed direction; under-inclusion exempts a real unauthenticated call.
+# Property 4 — every producer step that runs a shell binds the token (#849
+# hole; closed the terminating way by #854 item 1).
+#
+# The #852 shape asked "does this run body invoke gh?" and answered it with a
+# regex over the body. That question has no decidable text answer: `gh`,
+# `/usr/bin/gh`, `"gh"`, `$(command -v gh)`, `${GH_BIN}` and `"$GH"` are the
+# same call, and the last three carry no matchable `gh` token at all — so each
+# widening of the pattern leaves another spelling exempt, which is the #849
+# enumeration ladder rather than a fence.
+#
+# Inverted, the question IS decidable, and it is asked of the workflow's
+# structure rather than of its shell: a producer step that runs a shell binds
+# GH_TOKEN unless it is pinned token-free here. Any refactor into any spelling
+# whatsoever, and every NEW step, then require the binding by default; granting
+# an exemption is a visible one-line edit in this file, the same loud coupling
+# the if: allowlists already carry. Over-inclusion (a step that authenticates
+# nothing now has to bind a token it does not use) is the fail-closed
+# direction.
+#
+# Keyed by (job, step name), like STEP_IF_ALLOWED: a name is only token-free in
+# the job whose step of that name was reviewed as making no authenticated call.
+STEP_NO_TOKEN = {
+    # Reads the event payload out of env and writes an output. No API call.
+    ("merge-clearance-gate", "Resolve PR number"),
+    # Maps the rc already captured by the gate step into this job's native
+    # conclusion. No API call.
+    ("merge-clearance-gate", "Report gate verdict"),
+}
+# Retained as a belt on the EXEMPT set only: an exempt step whose body visibly
+# invokes gh has outgrown its exemption. Matching runs over the UN-stripped
+# body on purpose — stripping first would let a call hidden after a `#` on a
+# live line escape.
 GH_INVOKE = re.compile(r"(?<![A-Za-z0-9_-])[\"']?gh[\"']?[ \t]")
 for key in PRODUCERS:
     job = jobs.get(key)
@@ -928,15 +1090,25 @@ for key in PRODUCERS:
     for step in job.get("steps") or []:
         if not isinstance(step, dict):
             continue
-        if not GH_INVOKE.search(step.get("run") or ""):
-            continue
+        if "run" not in step:
+            continue  # a `uses:` step runs no shell of its own
+        sname = step.get("name") or "<unnamed>"
         token = (step.get("env") or {}).get("GH_TOKEN")
-        if token not in GH_TOKEN_OK:
-            bad("FAIL: [#850 gh token binding] step %r in job '%s' invokes gh but" % (step.get("name") or "<unnamed>", key),
-                "      binds GH_TOKEN to %r. The only accepted value is" % token,
-                "      ${{ secrets.GITHUB_TOKEN }} — gh with no token falls back to",
-                "      unauthenticated and the check_run publish 401s, leaving that",
-                "      trigger path silently not refreshing the required context.")
+        if (key, sname) not in STEP_NO_TOKEN:
+            if token not in GH_TOKEN_OK:
+                bad("FAIL: [#850 gh token binding] step %r in job '%s' runs a shell" % (sname, key),
+                    "      but binds GH_TOKEN to %r. Every producer step binds the token" % token,
+                    "      unless it is pinned token-free in this check: whether a body",
+                    "      calls gh is not decidable from its text (a path-qualified,",
+                    "      quoted or command-substituted invocation is the same call with",
+                    "      no shared spelling), and gh with no token falls back to",
+                    "      unauthenticated — the publish then 401s and that trigger path",
+                    "      silently stops refreshing the required context (#854).")
+        elif token not in GH_TOKEN_OK and GH_INVOKE.search(str(step.get("run") or "")):
+            bad("FAIL: [#850 gh token binding] step %r in job '%s' is pinned as" % (sname, key),
+                "      token-free, but its run body invokes gh. That exemption is only",
+                "      for steps making no authenticated call at all: drop the pin and",
+                "      bind GH_TOKEN to ${{ secrets.GITHUB_TOKEN }} (#854).")
 
 if failures:
     print("\n".join(failures))
