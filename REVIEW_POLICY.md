@@ -291,7 +291,7 @@ Before moving past Phase 2.5, confirm all of the following:
 
 ### Real-Time Per-Finding Disposition (#865)
 
-Every disposition step described above — triage reply, fix, verdict recording (`codex-record-feedback.sh` / `coderabbit-record-feedback.sh`), and thread resolution (the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate)) — happens **per finding, at the moment that finding is worked**, not gathered up and run once at the end of the round or deferred to the merge endgame. This is a sequencing rule layered on top of the existing steps above; it does not introduce a new mechanism or a new required check.
+Every disposition step described above — triage reply, fix, verdict recording (`codex-record-feedback.sh` / `coderabbit-record-feedback.sh`), and, when a thread exists, thread resolution (the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate)) — happens **per finding, at the moment that finding is worked**, not gathered up and run once at the end of the round or deferred to the merge endgame; summary-only findings (no review thread to resolve) use the documented summary-ack path instead ([§ Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate)). This is a sequencing rule layered on top of the existing steps above; it does not introduce a new mechanism or a new required check.
 
 On PR #852 (round 4 → 5), bot findings sat visibly unresolved for over an hour while the authoring agent fixed them in a batch: the reaction, the on-thread reply, and the thread resolution all happened together at the end of the round. From the PR page it was impossible to tell which findings were already fixed, which were rebutted, and which were still open — that state lived only in the agent's own session, not on GitHub where the owner and the other reviewing bot could see it.
 
@@ -624,7 +624,7 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
 
 ## Feedback Disposition Policy
 
-The `feedback_policy` block in `.github/review-policy.yml` controls **which bot-review findings the authoring agent must disposition before merge**. A *disposition* is one of: **fix** the code, **or** post a **rebuttal** reply explaining why the finding does not apply — and then **resolve the thread**. It governs disposition *requirements* only; it does not change who reviews or the external-review threshold. Every disposition happens in real time, per finding, as it is worked — never batched at round end; see [§ Real-Time Per-Finding Disposition](#real-time-per-finding-disposition-865).
+The `feedback_policy` block in `.github/review-policy.yml` controls **which bot-review findings the authoring agent must disposition before merge**. A *disposition* is one of: **fix** the code, post a **rebuttal** reply explaining why the finding does not apply, or post a **deferral** reply that links a follow-up issue — record the verdict for each finding via `codex-record-feedback.sh` / `coderabbit-record-feedback.sh`, then complete the applicable thread-resolution or summary-ack path. It governs disposition *requirements* only; it does not change who reviews or the external-review threshold. Every disposition happens in real time, per finding, as it is worked — never batched at round end; see [§ Real-Time Per-Finding Disposition](#real-time-per-finding-disposition-865).
 
 ### Normalized severity ladder
 
