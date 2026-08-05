@@ -3191,6 +3191,243 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 47g (#886): CodeRabbit's OTHER terminal serialization — no
+# `Actionable comments posted` header at all.
+#
+# Measured across `pulls/{pr}/reviews` for 20 mergepath PRs: of 22 non-empty
+# coderabbitai[bot] review bodies, 2 open with a blank line and then
+# `<details><summary>🧹 Nitpick comments (N)</summary>` and carry no header line
+# anywhere (mergepath#880 review 4848342765 on 9601e872, mergepath#849 review
+# 4833684457 on 1b8195da). Both are complete terminal reports, and on #880's head
+# 4848342765 was the ONLY CodeRabbit review object. With the header as the sole
+# acceptor the candidate set was empty on a terminal review — rc 3, which the
+# event arm publishes as a native FAILURE and the sweep declines to retire, on a
+# body that never changes and with no break-glass under `enforce_admins: true`.
+#
+# The escape the object itself carries: its own `📥 Commits` range names the head,
+# corroborating the GitHub-owned `commit_id` it is already pinned by.
+# ---------------------------------------------------------------------------
+
+# Compose the header-less terminal report, in the shape measured on #880.
+#   $1 = sha to name as the commits-range END
+#   $2 = findings text
+#   $3 = extra stanza marker (optional — makes the body a non-report)
+# The leading blank lines and the trailing `... by CodeRabbit for review status`
+# comment are both real: the latter is NOT a stanza opener (no `: <kind> by
+# coderabbit.ai`), which is why a run body legitimately carries zero stanzas.
+make_headerless_review_body() {
+  local head=$1 findings=$2 extra=${3:-}
+  {
+    printf '\n\n'
+    if [ -n "$extra" ]; then
+      printf '%s\n\n' "$extra"
+    fi
+    printf '%s\n' '<details>'
+    printf '%s\n\n' '<summary>🧹 Nitpick comments (1)</summary><blockquote>'
+    printf '%s\n\n' "$findings"
+    printf '%s\n\n' '</blockquote></details>'
+    printf '%s\n' '<details>'
+    printf '%s\n\n' '<summary>📥 Commits</summary>'
+    printf 'Reviewing files that changed from the base of the PR and between %s and %s.\n' \
+      "$PREV_SHA" "$head"
+    printf '%s\n\n' '</details>'
+    printf '%s\n' '<!-- This is an auto-generated comment by CodeRabbit for review status -->'
+  }
+}
+
+echo
+echo "--- Test 47g (#886): header-less terminal review body naming HEAD → no hold, exit 0"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$STALE_SHA" 'No required finding here.')" \
+  "coderabbitai[bot]" "" "" "" "2026-08-04T00:00:00Z" "2026-08-04T00:00:00Z")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z" \
+  "$(make_headerless_review_body "$HEAD_SHA" "$SUMMARY_NITPICK_FINDING")")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && ! echo "$OUT" | grep -q "awaiting its PR-level summary" \
+    && echo "$OUT" | grep -q "markerless full-review summary in review object 8001" \
+    && echo "$OUT" | grep -q "recognised by: own-commits-range"; then
+  pass "a header-less terminal report is recognised by the commits range in its own body"
+else
+  fail "expected rc=0 with the header-less report accepted; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# Non-vacuous: admitting a body the gate then never reads would trade the
+# deadlock for a false clear, so the SAME serialization carrying a Major must
+# gate on it. Only the classification tells 47g and 47g2 apart.
+echo "--- Test 47g2 (#886): a header-less body's own finding is classified → exit 1"
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z" \
+  "$(make_headerless_review_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING")")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)" \
+    && ! echo "$OUT" | grep -q "awaiting its PR-level summary"; then
+  pass "a blocking finding in a header-less review body gates rather than clearing"
+else
+  fail "expected rc=1 from the header-less body's own finding; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# The acceptor is the ANCHOR, not the shape. A header-less body whose commits
+# range names an OLDER head is not this head's report, and admitting it on
+# `commit_id` alone would let any unrecognised serialization certify the head.
+echo "--- Test 47g3 (#886): header-less body naming an older head is not accepted → exit 3"
+FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture '[]')
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z" \
+  "$(make_headerless_review_body "$STALE_SHA" "$SUMMARY_NITPICK_FINDING")")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 3 ] && echo "$OUT" | grep -q "review run object(s): 8001"; then
+  pass "a header-less body naming another head does not certify this one"
+else
+  fail "expected rc=3 on a header-less body naming a stale head; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ...and a body whose own markup says the publication produced NO review is not a
+# report however precisely it names the head. The guard is the narrow one — at
+# least one non-benign stanza — not the marker format's all-benign test, which a
+# genuine run body (zero stanzas) would fail.
+echo "--- Test 47g4 (#886): a rate-limited header-less body naming HEAD is not a report → exit 3"
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z" \
+  "$(make_headerless_review_body "$HEAD_SHA" "$SUMMARY_NITPICK_FINDING" "$RATE_LIMIT_STANZA")")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 3 ] && echo "$OUT" | grep -q "review run object(s): 8001"; then
+  pass "a non-benign stanza keeps a head-naming body out of scope"
+else
+  fail "expected rc=3 on a rate-limited header-less body; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 47h (#886): the correlation floor comes from runs that CARRY a recognised
+# summary, never from any non-empty run.
+#
+# HEAD_REVIEW_AT is max(submitted_at) over every non-empty head-pinned run,
+# unrecognised ones included, and the REQUIRE_REVIEW_SUMMARY correlation filter
+# drops candidates below it. A later unrecognised run therefore discarded the
+# recognised summary — including the review-object-body candidate, whose fresh_at
+# IS its own run's submitted_at — so a head where a readable summary demonstrably
+# existed reported neither its finding nor a success. Same unretirable red as
+# 47g, reached from the opposite direction. Same-head double runs are production
+# shapes (#886 commit 5d04dfc9 → reviews 4860672174 + 4860719383).
+#
+# Non-vacuous: the recognised run carries a Major, so a poisoned floor is rc 3
+# and an honest one is rc 1. The two answers cannot be confused.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 47h (#886): a later unrecognised run does not discard the recognised summary → exit 1"
+FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture '[]')
+FIXTURE_REVIEWS=$(make_issue_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" \
+  --arg blocking "**Actionable comments posted: 1**
+
+$SUMMARY_BLOCKING_FINDING" '
+  [ { id: 8001, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:10Z", body: $blocking },
+    { id: 8002, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:30Z", body: "### Review complete\n\nSee the inline comments." } ]
+')")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)" \
+    && ! echo "$OUT" | grep -q "awaiting its PR-level summary"; then
+  pass "an unrecognised later run cannot poison the floor and hide a recognised Major"
+else
+  fail "expected rc=1 reporting the recognised run's Major; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# Supersession still works, and is what the floor is FOR: when the later run's
+# body IS recognised, it replaces the earlier publication rather than being
+# ignored. Same two runs as 47h with 8002 carrying a real terminal report, so the
+# Major is dropped as superseded and the verdict comes from the current run.
+echo "--- Test 47h2 (#886): a later RECOGNISED run supersedes the earlier summary → exit 0"
+FIXTURE_REVIEWS=$(make_issue_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" \
+  --arg blocking "**Actionable comments posted: 1**
+
+$SUMMARY_BLOCKING_FINDING" \
+  --arg current "$(make_headerless_review_body "$HEAD_SHA" "$SUMMARY_NITPICK_FINDING")" '
+  [ { id: 8001, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:10Z", body: $blocking },
+    { id: 8002, user: { login: "coderabbitai[bot]" }, commit_id: $sha, state: "COMMENTED",
+      submitted_at: "2026-08-04T00:00:30Z", body: $current } ]
+')")
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && echo "$OUT" | grep -q "markerless full-review summary in review object 8002" \
+    && ! echo "$OUT" | grep -q "awaiting its PR-level summary"; then
+  pass "the newest recognised run's own summary is the verdict on a same-head re-review"
+else
+  fail "expected rc=0 from the superseding run's summary; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Test 48 (#886, Codex P2): the scheduled workflow's stale-snapshot guard
 # must preserve read status separately. Serializing failed reads as a random
 # fingerprint only probabilistically skips a publish; a read failure has no

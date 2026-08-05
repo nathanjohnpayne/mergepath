@@ -604,6 +604,31 @@ summary_stanzas_all_benign() {
   [ "${total:-0}" -gt 0 ] && [ "$total" = "$benign" ]
 }
 
+# True when the body carries at least one structural outcome stanza and at least
+# one of them is NON-benign — i.e. CodeRabbit said in its own markup that this
+# publication produced no review (`rate limited`, `failure`, `review in
+# progress`).
+#
+# This is deliberately NOT the negation of summary_stanzas_all_benign. That
+# predicate answers "is this a completed marker-format report?", and a body with
+# ZERO stanzas fails it — correct for the marker format, whose completed shape
+# always carries the `summarize` stanza. A review RUN object's body carries no
+# such stanza at all (measured: mergepath#880 review 4848342765 closes with
+# `<!-- This is an auto-generated comment by CodeRabbit for review status -->`,
+# which is not a stanza opener), so requiring all-benign there would reject every
+# genuine run body. The question the run-object acceptors need is the narrower
+# one: did CodeRabbit itself declare this publication a non-review? Zero stanzas
+# is not such a declaration; a `rate limited` stanza is.
+summary_has_non_benign_stanza() {
+  local openers nonbenign
+  openers=$(summary_stanza_opener_lines "$1")
+  [ -n "$openers" ] || return 1
+  # `|| true` for the same `set -o pipefail` reason as above: `grep -vc` exits 1
+  # when every line matches, while still printing the 0 this wants.
+  nonbenign=$(printf '%s\n' "$openers" | grep -vciE "$CR_SUMMARY_BENIGN_STANZA_RE" || true)
+  [ "${nonbenign:-0}" -gt 0 ]
+}
+
 # True when $2 (the PR HEAD sha) is the RANGE END of a `between <prev> and
 # <head>` commits line in $1. Position matters twice over: the range START is
 # the PREVIOUSLY-reviewed head, so a force-push back to it would read a later
@@ -840,8 +865,8 @@ if [ "$MARKER_SUMMARY_ID" != "0" ]; then
   fi
 fi
 
-# PRIMARY ACCEPTOR: the markerless full-review summary in the body of a
-# head-pinned review RUN object.
+# PRIMARY ACCEPTORS: the full-review summary in the body of a head-pinned review
+# RUN object.
 #
 # Scoped by the object's GitHub-owned `commit_id` alone — the same
 # no-spoofable-timestamp posture the marker-led commits range has, and a
@@ -855,22 +880,97 @@ fi
 # naming an older head). The marker-led path above therefore stays an ACCEPTOR
 # and is no longer a REQUIREMENT.
 #
-# `last` after the sort_by above, so a same-head re-review's newer run wins over
-# the run it replaced; a markerless body on an older run is then dropped by the
-# correlation filter below on the review-triggered path, exactly as a superseded
-# marker-led summary is.
-REVIEW_OBJECT_SUMMARY_JSON=$(echo "$HEAD_REVIEW_RUNS_JSON" | jq -c \
-  --arg re "$CR_MARKERLESS_FULL_REVIEW_RE" '
-  [ .[] | select(.body | test($re)) ] | last // {}
+# TWO acceptors, because ONE does not cover CodeRabbit's ordinary terminal
+# report. Measured across `pulls/{pr}/reviews` for 20 mergepath PRs (#886, #902,
+# #900, #898, #889, #884, #874, #873, #872, #869, #867, #866, #880, #865, #849,
+# #843, #909, #876, #887, #883): of 22 non-empty `coderabbitai[bot]` review
+# bodies, 2 (9%) carry NO `Actionable comments posted` header at all — they open
+# with a blank line and then `<details><summary>🧹 Nitpick comments (N)</summary>`
+# (mergepath#880 review 4848342765 on 9601e872, mergepath#849 review 4833684457
+# on 1b8195da). Both are COMPLETE terminal reports, and on #880's head that
+# object was the only CodeRabbit review object there was. With the header as the
+# sole acceptor the candidate set was empty on a terminal review, which is rc 3 —
+# and rc 3 is unretirable: the event-driven arm publishes a native FAILURE on
+# that head and the sweep, the only arm that can restore the check, declines to
+# publish on it. Every later sweep re-reads the same stable body and skips again,
+# `@coderabbitai full review` reproduces the same serialization, and
+# `enforce_admins: true` leaves no break-glass. So the second acceptor is not a
+# convenience: without it this gate manufactures exactly the red nothing retires
+# that the spec says it cannot.
+#
+#   1. HEADER — the body matches CR_MARKERLESS_FULL_REVIEW_RE, the machine-shaped
+#      result line of the format CodeRabbit writes most of the time.
+#   2. SELF-ANCHORED — the body carries its OWN `📥 Commits` range whose end names
+#      this head. That is the same bot-authored evidence the marker-led path
+#      accepts on the comment surface, here corroborated by the object's
+#      GitHub-owned `commit_id`: two independent anchors naming the same head,
+#      which is strictly stronger than the marker path's one. The #880 body
+#      carries `between 21cf07b5… and 9601e872…` — the anchor the gate needed was
+#      inside the object it was already holding on.
+#
+# Acceptor 2 declines a body whose own markup says the publication produced no
+# review (a `rate limited` / `failure` / `review in progress` stanza). It does
+# NOT require the marker format's all-benign test: a run body legitimately
+# carries zero stanzas, so demanding one would reject every real run.
+#
+# The recognised runs are collected in order (the sort_by above), so `last` is
+# the newest: a same-head re-review's newer run wins over the run it replaced,
+# and the superseded body is dropped by the correlation filter below on the
+# review-triggered path, exactly as a superseded marker-led summary is.
+HEAD_SUMMARY_RUNS_JSON='[]'
+while IFS= read -r cr_run_json; do
+  [ -n "$cr_run_json" ] || continue
+  cr_run_body=$(printf '%s' "$cr_run_json" | jq -r '.body')
+  cr_run_recognised_by=''
+  # jq's `test` rather than a shell grep, so the acceptor keeps the exact
+  # semantics the constant was written against.
+  if printf '%s' "$cr_run_json" \
+      | jq -e --arg re "$CR_MARKERLESS_FULL_REVIEW_RE" '.body | test($re)' >/dev/null; then
+    cr_run_recognised_by='markerless-result-line'
+  elif summary_names_head "$cr_run_body" "$HEAD_SHA" \
+      && ! summary_has_non_benign_stanza "$cr_run_body"; then
+    cr_run_recognised_by='own-commits-range'
+  fi
+  [ -n "$cr_run_recognised_by" ] || continue
+  HEAD_SUMMARY_RUNS_JSON=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -c \
+    --argjson run "$cr_run_json" --arg by "$cr_run_recognised_by" \
+    '. + [ $run + {recognised_by: $by} ]')
+done <<EOF
+$(echo "$HEAD_REVIEW_RUNS_JSON" | jq -c '.[]')
+EOF
+
+# The correlation floor for the same-head re-review filter below. Taken from the
+# runs that actually CARRY a recognised summary, never from any non-empty run
+# (CodeRabbit Major / Codex P1 on #886). HEAD_REVIEW_AT is max(submitted_at) over
+# every non-empty head-pinned run INCLUDING ones no acceptor recognises, and
+# using it as the floor let a later unrecognised run discard the recognised
+# summary — up to and including the review-object-body candidate itself, whose
+# fresh_at IS its own run's submitted_at. Both input shapes are production-real:
+# same-head double runs exist (#886 commit 5d04dfc9 → reviews 4860672174 +
+# 4860719383), and an unrecognised body is whatever serialization the acceptors
+# above have not been taught. The result was that a head carrying a demonstrably
+# recognised summary — with a genuine Major in it — reported neither the Major
+# nor a success, reaching the same unretirable red from the opposite direction.
+#
+# HEAD_REVIEW_AT keeps its own job: it arms the publication HOLD, which asks "did
+# CodeRabbit run on this head at all", not "which publication does this candidate
+# belong to". The two questions have different answers and now have different
+# variables.
+SUMMARY_CORRELATION_AT=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -r '
+  [ .[] | .fresh_at | select(. != "") ] | max // ""
 ')
+
+REVIEW_OBJECT_SUMMARY_JSON=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -c 'last // {}')
 REVIEW_OBJECT_SUMMARY_ID=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.id // 0')
 if [ "$REVIEW_OBJECT_SUMMARY_ID" != "0" ]; then
   REVIEW_OBJECT_SUMMARY_BODY=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.body')
   REVIEW_OBJECT_SUMMARY_FRESH_AT=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.fresh_at // ""')
+  REVIEW_OBJECT_SUMMARY_BY=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.recognised_by // ""')
   SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c \
     --argjson id "$REVIEW_OBJECT_SUMMARY_ID" --arg body "$REVIEW_OBJECT_SUMMARY_BODY" \
-    --arg fresh_at "$REVIEW_OBJECT_SUMMARY_FRESH_AT" \
-    '. + [{id: $id, body: $body, scope: "review-object-body", fresh_at: $fresh_at}]')
+    --arg fresh_at "$REVIEW_OBJECT_SUMMARY_FRESH_AT" --arg by "$REVIEW_OBJECT_SUMMARY_BY" \
+    '. + [{id: $id, body: $body, scope: "review-object-body", fresh_at: $fresh_at,
+           recognised_by: $by}]')
 fi
 
 MARKERLESS_SUMMARIES_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
@@ -884,8 +984,20 @@ MARKERLESS_SUMMARIES_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
   | map({ id: (.id // 0), body: (.body // ""), fresh_at })
 ')
 MARKERLESS_SUMMARY_COUNT=$(echo "$MARKERLESS_SUMMARIES_JSON" | jq 'length')
+# The comment-surface acceptor needs BOTH halves of the anchor, and they are two
+# different variables for the reason above. EXISTENCE stays on HEAD_REVIEW_AT —
+# any completed run proves CodeRabbit reviewed this head, which is what a body
+# with no anchor of its own is borrowing. FRESHNESS prefers the recognised-summary
+# floor, so a later unrecognised run cannot push the floor past a comment that
+# genuinely belongs to the current publication. With no recognised run the two
+# collapse to the previous behaviour.
+if [ -n "$SUMMARY_CORRELATION_AT" ]; then
+  SUMMARY_FRESHNESS_AT=$SUMMARY_CORRELATION_AT
+else
+  SUMMARY_FRESHNESS_AT=$HEAD_REVIEW_AT
+fi
 if [ "$MARKERLESS_SUMMARY_COUNT" -gt 0 ]; then
-  MARKERLESS_SUMMARY_JSON=$(echo "$MARKERLESS_SUMMARIES_JSON" | jq -c --arg at "$HEAD_REVIEW_AT" '
+  MARKERLESS_SUMMARY_JSON=$(echo "$MARKERLESS_SUMMARIES_JSON" | jq -c --arg at "$SUMMARY_FRESHNESS_AT" '
     if $at == "" then null
     else [ .[] | select(.fresh_at >= $at) ] | sort_by(.fresh_at, .id) | last
     end
@@ -929,13 +1041,21 @@ fi
 # default-false path is for ad-hoc and third-party callers, which have no
 # publication to withhold. A missing or unparseable timestamp sorts below any
 # real one and is therefore dropped, which is the safe direction here.
-if [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] && [ -n "$HEAD_REVIEW_AT" ]; then
-  SUMMARY_UNCORRELATED=$(echo "$SUMMARY_CANDIDATES" | jq -r --arg at "$HEAD_REVIEW_AT" '
+#
+# The floor is SUMMARY_CORRELATION_AT — the newest run carrying a RECOGNISED
+# summary — and never HEAD_REVIEW_AT. A run this gate cannot read is not a
+# publication a candidate can be late for, and treating it as one discarded the
+# recognised summary and produced a hold on a head where the verdict was sitting
+# in hand. With no recognised run the floor is empty and no candidate is dropped:
+# the marker-led surface then supplies the verdict, which is the same answer this
+# filter would have given before any review object existed.
+if [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] && [ -n "$SUMMARY_CORRELATION_AT" ]; then
+  SUMMARY_UNCORRELATED=$(echo "$SUMMARY_CANDIDATES" | jq -r --arg at "$SUMMARY_CORRELATION_AT" '
     [ .[] | select((.fresh_at // "") < $at) | (.id | tostring) ] | join(", ")
   ')
   if [ -n "$SUMMARY_UNCORRELATED" ]; then
     log "PR-level summary comment(s) $SUMMARY_UNCORRELATED predate the completed CodeRabbit review object on $HEAD_SHA — not this review's publication"
-    SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c --arg at "$HEAD_REVIEW_AT" '
+    SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c --arg at "$SUMMARY_CORRELATION_AT" '
       [ .[] | select((.fresh_at // "") >= $at) ]
     ')
   fi
@@ -985,7 +1105,7 @@ if [ "$SUMMARY_CANDIDATE_COUNT" -eq 0 ]; then
     # reopens the gap and a sweep that can hold a required check red with no ack
     # channel and no break-glass under `enforce_admins: true`.
     #
-    # REACHING THIS IS NOW RARE BY CONSTRUCTION. The primary acceptor reads the
+    # REACHING THIS IS NOW RARE BY CONSTRUCTION. The primary acceptors read the
     # summary out of the review RUN object's own body, so a run that carries a
     # recognised serialization is a candidate the moment it exists — there is no
     # second surface for it to wait on. What is left here is the genuinely
@@ -993,9 +1113,17 @@ if [ "$SUMMARY_CANDIDATE_COUNT" -eq 0 ]; then
     # serialization this gate cannot classify. Holding is the correct answer to
     # that (a gate that cannot read the review must not certify it), and the run
     # ids are printed so an operator can see which body was not recognised
-    # rather than having to re-derive it. Bounding the hold for the residual
-    # case is #906 / #896, which own the ordered-publisher work this gate's two
-    # publishers need.
+    # rather than having to re-derive it.
+    #
+    # "Rare" is a claim about COVERAGE, and coverage was measured rather than
+    # assumed: across the 22 non-empty CodeRabbit review bodies on 20 mergepath
+    # PRs, the two acceptors between them recognise every one. Neither acceptor
+    # alone does — the header misses 2 (9%), which is how this hold became a red
+    # nothing retires on an ordinary zero-actionable-comments report. Any future
+    # widening belongs here, in the acceptors, not in a bound on the hold:
+    # bounding it would trade an unretirable red for an uncertified pass.
+    # Bounding the hold for the residual case is #906 / #896, which own the
+    # ordered-publisher work this gate's two publishers need.
     echo "CodeRabbit current-HEAD review is awaiting its PR-level summary; holding this gate run. (head-pinned review run object(s): $HEAD_REVIEW_RUN_IDS)" >&2
     echo "CodeRabbit blocking-tier unresolved: pending (summary publication in flight)"
     exit 3
@@ -1011,11 +1139,12 @@ while IFS= read -r SUMMARY_JSON; do
   if [ "$SUMMARY_SCOPE" = 'review-object-body' ]; then
     # Scope and completion both come from the review object itself: its
     # GitHub-owned commit_id names this head, and its non-empty body is the
-    # report. Do not apply the marker-format stanza or commits-range predicates:
-    # neither exists in this legitimate shape, and requiring the commits range —
-    # which lives on a comment CodeRabbit re-stamps lazily — is what made this
-    # gate hold forever on a terminal review.
-    log "CodeRabbit markerless full-review summary in review object $SUMMARY_ID, head-pinned by its commit_id to $HEAD_SHA"
+    # report. Do not apply the marker-format all-benign stanza test: it does not
+    # exist in this legitimate shape. Which acceptor recognised the body is
+    # printed, because the two answer different questions about the same object
+    # and an operator reading a verdict should not have to re-derive which one
+    # fired.
+    log "CodeRabbit markerless full-review summary in review object $SUMMARY_ID, head-pinned by its commit_id to $HEAD_SHA (recognised by: $(echo "$SUMMARY_JSON" | jq -r '.recognised_by // "unknown"'))"
   elif [ "$SUMMARY_SCOPE" = 'review-object' ]; then
     # The strict markerless result line identifies the known full-review format,
     # and the fresh exact-head review object above supplies the scope / completion
