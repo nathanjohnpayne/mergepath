@@ -2694,10 +2694,9 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
-# The pull_request_review event can land before CodeRabbit publishes its
-# PR-level summary. On that one event path the required check must not turn
-# green during the publication gap: issue_comment then re-runs the normal
-# arrival-independent scan once the summary exists.
+# A review object can land before CodeRabbit publishes its PR-level summary,
+# and the required check must not turn green during that gap: issue_comment
+# then re-runs the normal arrival-independent scan once the summary exists.
 echo "--- Test 47d (#886): review event waits for a markerless summary → exit 1"
 FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture '[]')
 FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA" COMMENTED "2026-08-04T00:00:10Z")
@@ -2713,12 +2712,36 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 3 ] && echo "$OUT" | grep -q "awaiting its PR-level summary" \
-    && grep -Fq "REQUIRE_REVIEW_SUMMARY: \${{ github.event_name == 'pull_request_review' }}" "$ROOT/.github/workflows/coderabbit-severity-gate.yml"; then
+if [ "$RC" = 3 ] && echo "$OUT" | grep -q "awaiting its PR-level summary"; then
   pass "review-triggered run remains non-green until the current-head summary publishes"
 else
   fail "expected rc=3 while a current-head review awaits its summary; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# The PUBLISHER is the job, not the event. Scoping REQUIRE_REVIEW_SUMMARY to
+# `pull_request_review` left the SAME job — the one that owns the native check
+# for this head — running the arrival-independent scan on its other triggers, so
+# a pull_request_review_comment (CodeRabbit's own inline comments fire one each)
+# or a pull_request [edited] landing inside the publication gap published a
+# success over the review run's rc 3 red, under the same check name and on the
+# same head. Structural, because the guarded code runs in Actions: assert the
+# event-driven job opts in unconditionally and carries no event-name condition
+# on the flag (Codex P1 on #886).
+echo "--- Test 47d0 (#886): the event-driven publisher honors the hold on every event it serves"
+EVENT_JOB=$(awk '
+  /^  coderabbit-severity-gate:/ { in_job = 1 }
+  in_job && /^  scheduled-sweep:/ { exit }
+  in_job { print }
+' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
+EVENT_FLAG=$(printf '%s\n' "$EVENT_JOB" | grep -c '^ *REQUIRE_REVIEW_SUMMARY:')
+if [ "$EVENT_FLAG" -eq 1 ] \
+    && printf '%s\n' "$EVENT_JOB" | grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' \
+    && ! printf '%s\n' "$EVENT_JOB" | grep '^ *REQUIRE_REVIEW_SUMMARY:' | grep -q 'github.event_name'; then
+  pass "the event-driven job sets the hold flag once, unconditionally"
+else
+  fail "expected exactly one unconditional REQUIRE_REVIEW_SUMMARY: \"true\" in the event-driven job (found $EVENT_FLAG setting(s))"
+  printf '%s\n' "$EVENT_JOB" | grep -n 'REQUIRE_REVIEW_SUMMARY' | sed 's/^/      /' >&2
 fi
 
 # rc 3 is not a finding count, and the two publishers of this check have to
@@ -2727,7 +2750,11 @@ fi
 # a verdict read off the previous publication. Both halves are asserted against
 # the workflow, since a gate exit code with no consumer changes nothing.
 echo "--- Test 47d1 (#886): both publishers act on the rc 3 hold"
-if grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
+SWEEP_JOB=$(awk '
+  /^  scheduled-sweep:/ { in_job = 1 }
+  in_job { print }
+' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
+if printf '%s\n' "$SWEEP_JOB" | grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' \
     && grep -Fq 'if [ "$rc" -eq 3 ]; then' "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
     && grep -Fq "skipping this publication so the review run's verdict stands" "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
     && grep -Fq "holding this run non-green until it does" "$ROOT/.github/workflows/coderabbit-severity-gate.yml"; then
@@ -2882,20 +2909,53 @@ else
 fi
 
 # The sweep's compare-and-swap has to sample every surface the verdict is
-# computed from. Since the sweep opted into the publication hold, that includes
-# review objects: a review submitted between the gate's reviews read and the
-# check_run POST leaves the comment fingerprint byte-identical, so a
-# comments-only guard would publish a success computed before the review existed.
-echo "--- Test 47d1d (#886): the sweep snapshot guard samples the review surface"
-FP_FN=$(sed -n '/^ *cr_surface_fp() {/,/^ *}/p' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
+# computed from, and there are FOUR. The PR-comment surface carries the summary;
+# the review-object surface decides the publication hold the sweep opted into;
+# and the gate's ORIGINAL input — unresolved blocking INLINE findings — is read
+# from pulls/{pr}/comments plus GraphQL reviewThreads. A thread resolved, or a
+# finding posted/edited/deleted, between the gate's read and the check_run POST
+# leaves a comments+reviews-only fingerprint byte-identical, so the guard
+# republishes a stale success over a now-unresolved blocking finding.
+echo "--- Test 47d1d (#886): the sweep snapshot guard samples every verdict surface"
+# Extract to the closing brace AT THE FUNCTION'S OWN INDENT. A `/^ *}/` range
+# end stops at the first `}` of the embedded GraphQL document instead and
+# truncates the body, which silently under-counts the fail-closed reads below.
+FP_FN=$(awk '
+  /^            cr_surface_fp\(\) \{$/ { in_fn = 1 }
+  in_fn { print }
+  in_fn && /^            \}$/ { exit }
+' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
 FP_FAILCLOSED=$(printf '%s\n' "$FP_FN" | grep -c '|| return 1')
 if printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/issues/$1/comments' \
     && printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/pulls/$1/reviews' \
-    && printf '%s\n' "$FP_FN" | grep -Fq "printf '%s\\035%s'" \
-    && [ "$FP_FAILCLOSED" -eq 2 ]; then
-  pass "cr_surface_fp fingerprints reviews as well as comments, failing closed on either read"
+    && printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/pulls/$1/comments' \
+    && printf '%s\n' "$FP_FN" | grep -Fq 'reviewThreads(first: 100, after: $endCursor)' \
+    && printf '%s\n' "$FP_FN" | grep -Fq 'nodes { id isResolved }' \
+    && printf '%s\n' "$FP_FN" | grep -Fq "printf '%s\\035%s\\035%s\\035%s'" \
+    && [ "$FP_FAILCLOSED" -eq 4 ]; then
+  pass "cr_surface_fp fingerprints comments, reviews, inline findings and thread state, failing closed on each read"
 else
-  fail "expected cr_surface_fp to sample both surfaces and fail closed on each read (fail-closed lines: $FP_FAILCLOSED)"
+  fail "expected cr_surface_fp to sample all four surfaces and fail closed on each read (fail-closed lines: $FP_FAILCLOSED)"
+fi
+
+# A raw C0 control byte anywhere in the workflow makes the YAML document
+# unloadable — Ruby Psych rejects the file with "control characters are not
+# allowed" — and GitHub then refuses to register the workflow at all. For a
+# REQUIRED check that is worse than a failing run: the check silently stops
+# existing. Two of this file's delimiters ARE control bytes, written as the jq
+# and printf escapes so the source stays printable; a prose mention of one that
+# pastes the byte itself is the same document-level break (Codex P1 on #886).
+echo "--- Test 47d1e (#886): the workflow source carries no raw control bytes"
+# Delete TAB, LF, printable ASCII and every high byte (UTF-8 continuation), so
+# what survives is exactly the C0 bytes YAML forbids, plus DEL.
+CTRL_BYTES=$(LC_ALL=C tr -d '\11\12\40-\176\200-\377' \
+  < "$ROOT/.github/workflows/coderabbit-severity-gate.yml" | LC_ALL=C wc -c | tr -d '[:space:]')
+if [ "$CTRL_BYTES" -eq 0 ]; then
+  pass "no raw C0 control byte in the workflow source"
+else
+  fail "workflow source contains $CTRL_BYTES raw control byte(s); GitHub cannot load the document"
+  LC_ALL=C grep -n '[^[:print:][:space:]]' "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
+    | head -5 | sed 's/^/      /' >&2
 fi
 
 # The correlation floor is scoped to the review-triggered path. On the

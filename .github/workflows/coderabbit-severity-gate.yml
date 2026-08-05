@@ -171,11 +171,28 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           REPO: ${{ github.repository }}
           # A review object can arrive before CodeRabbit publishes its
-          # PR-level summary. Only the review-submission event must hold for
-          # that publication: a normal push has no evidence that a review has
-          # started, while the later issue_comment sweep evaluates the summary
-          # itself and supersedes this temporary non-green result (#886).
-          REQUIRE_REVIEW_SUMMARY: ${{ github.event_name == 'pull_request_review' }}
+          # PR-level summary, and every publisher of this required check has to
+          # honor that hold — the job, not the event, is the publisher (Codex P1
+          # on #886). Scoping the flag to `pull_request_review` left the same job
+          # running the arrival-INDEPENDENT scan on its other events: a
+          # `pull_request_review_comment` (CodeRabbit's own inline comments fire
+          # one each) or a `pull_request` [edited]/[reopened] landing inside the
+          # gap published a native success over the review run's rc-3 red, on the
+          # same head and under the same check name — the round-11 sweep hole,
+          # reached through a sibling event instead.
+          #
+          # Unconditional `true` rather than a longer event allow-list, because
+          # the flag is not what decides a hold: the gate holds only when a
+          # completed CodeRabbit review RUN sits on the CURRENT head with no
+          # correlated summary. A push cannot be in that state (its synchronize
+          # event carries a NEW head that no review has touched yet), so the
+          # "a push has no evidence a review started" case the old conditional
+          # protected is already answered by the anchor, and an allow-list would
+          # only have to grow again the next time a trigger is added. Both arms
+          # now set it identically; they still ANSWER rc 3 differently (this job
+          # goes non-green, the sweep declines to publish), which is where the
+          # asymmetry belongs.
+          REQUIRE_REVIEW_SUMMARY: "true"
         run: |
           set -euo pipefail
           # Bootstrap (nathanjohnpayne/mergepath#577): we run the TRUSTED copy of
@@ -382,36 +399,69 @@ jobs:
             # the escape at runtime, so the delimiter is still a byte that
             # cannot occur in a comment body, while the file stays printable.
             # The snapshot covers EVERY surface the verdict is computed from,
-            # which since the publication hold includes review OBJECTS as well
-            # as PR comments (Codex P1 on #886). With REQUIRE_REVIEW_SUMMARY set
-            # here, the gate reads pulls/{pr}/reviews to decide whether a
-            # current-head run is awaiting its summary; a review submitted after
-            # that read but before the POST leaves the comment fingerprint
-            # byte-identical, so a comments-only guard would wave through an
-            # rc 0 success computed before the review existed, republishing green
-            # over the pull_request_review job's rc 3 red. A surface the verdict
-            # depends on and the guard does not sample is not guarded.
+            # and that is all FOUR of them (Codex P1 on #886). Sampling only the
+            # PR-comment and review-object surfaces left the gate's ORIGINAL and
+            # primary input unguarded: the verdict counts unresolved blocking
+            # INLINE findings, and it computes those from pulls/{pr}/comments
+            # (the finding bodies the tier ladder grades) and from GraphQL
+            # reviewThreads (`isResolved`). A thread resolved — or a finding
+            # posted, edited, or deleted — between the gate's read and the
+            # Checks API POST leaves a comments+reviews fingerprint
+            # byte-identical, so the guard waves through a verdict computed
+            # against a surface that has since moved: a stale success
+            # republished over a now-unresolved blocking finding, standing until
+            # the next sweep. The review-object part is here for the same reason
+            # one step earlier — with REQUIRE_REVIEW_SUMMARY set, the gate
+            # reads pulls/{pr}/reviews to decide whether a current-head run is
+            # awaiting its summary, and a review submitted inside that window
+            # republished green over the pull_request_review job's rc 3 red. A
+            # surface the verdict depends on and the guard does not sample is
+            # not guarded.
             #
-            # Either read failing fails the WHOLE fingerprint, which the caller
+            # The thread part samples `id:isResolved` and not the thread's
+            # comment ids: resolution state is the only thing that surface
+            # contributes to the verdict, and the finding bodies it would
+            # otherwise duplicate are already covered by the inline part.
+            #
+            # ANY read failing fails the WHOLE fingerprint, which the caller
             # answers by skipping the publication. A half-read surface must never
             # become a fingerprint: it would compare equal to the other run's
             # half-read and read as "unchanged", which is the guard silently
             # disabling itself — the same reasoning as the no-sentinel rule
             # below.
             #
-            # The halves are joined with the OCTAL escape `\035` (group
-            # separator), not ``: POSIX printf defines octal escapes while
-            # `\uNNNN` is a bash 4.2+ extension, and a byte no comment or review
-            # body can contain is what keeps the two halves unambiguous. Same
-            # no-raw-control-byte rule as the record separator above — the escape
-            # is expanded at runtime, the YAML source stays printable.
+            # The parts are joined with the OCTAL escape `\035` (group
+            # separator), never the raw byte that escape stands for: POSIX printf
+            # defines octal escapes while `\uNNNN` is a bash 4.2+ extension, and
+            # a byte no comment, review, or node id can contain is what keeps the
+            # parts unambiguous. Same no-raw-control-byte rule as the record
+            # separator above — the escape is expanded at runtime and the YAML
+            # source stays printable. A raw control byte anywhere in this file
+            # makes the whole document unloadable (Ruby Psych: "control
+            # characters are not allowed"), which unregisters a required check
+            # instead of failing a run.
             cr_surface_fp() {
-              local comments reviews
+              local comments reviews inline threads
               comments=$(gh api "repos/$REPO/issues/$1/comments" --paginate \
                 --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join("\u001e")') || return 1
               reviews=$(gh api "repos/$REPO/pulls/$1/reviews" --paginate \
                 --jq '[.[] | "\(.id):\(.state):\(.commit_id // ""):\(.submitted_at // ""):\(.body // "")"] | sort | join("\u001e")') || return 1
-              printf '%s\035%s' "$comments" "$reviews"
+              inline=$(gh api "repos/$REPO/pulls/$1/comments" --paginate \
+                --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join("\u001e")') || return 1
+              threads=$(gh api graphql --paginate \
+                -F owner="${REPO%%/*}" -F name="${REPO##*/}" -F pr="$1" \
+                -f query='query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $pr) {
+                      reviewThreads(first: 100, after: $endCursor) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { id isResolved }
+                      }
+                    }
+                  }
+                }' \
+                --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | "\(.id):\(.isResolved)"] | sort | join("\u001e")') || return 1
+              printf '%s\035%s\035%s\035%s' "$comments" "$reviews" "$inline" "$threads"
             }
 
             # A read failure is NOT serialized into a sentinel: $RANDOM is not
