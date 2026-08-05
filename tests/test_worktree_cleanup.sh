@@ -2234,10 +2234,16 @@ else
 fi
 
 # ── Case 27 (#892, Codex P2): apply-side parser pins English locale ────
-# Model a localized `git branch -vv` by translating its human-facing gone
-# marker only when LC_ALL is absent. The helper must pin LC_ALL=C for this
-# parser so --apply reaches the same gone branch it would see in an English
-# environment.
+# Model a localized gone marker by translating it only when LC_ALL is absent.
+# The helper must pin LC_ALL=C for this parser so --apply reaches the same gone
+# branch it would see in an English environment.
+#
+# The stub intercepts `for-each-ref`, which is what gone_branches() reads. It
+# used to intercept `git branch -vv`; when the parser moved to for-each-ref
+# (Phase 4b P2 on #892 — color and `]` in branch names both corrupt the
+# porcelain listing) that stub became inert and this case passed without
+# exercising anything. Localization is still the risk being guarded: the
+# `[gone]` tracking atom comes from the same translated message catalog.
 LOCALE_ROOT="$WORKDIR/localized-gone"
 LOCALE_REMOTE="$LOCALE_ROOT/remote.git"
 LOCALE_MAIN="$LOCALE_ROOT/main"
@@ -2267,8 +2273,8 @@ git init -q "$LOCALE_MAIN"
 mkdir -p "$LOCALE_STUB"
 cat >"$LOCALE_STUB/git" <<'EOF'
 #!/usr/bin/env bash
-if [ "$1" = branch ] && [ "$2" = -vv ] && [ "${LC_ALL:-}" != C ]; then
-  "$REAL_GIT" "$@" | sed 's/: gone\]/: verschwunden\]/'
+if [ "$1" = for-each-ref ] && [ "${LC_ALL:-}" != C ]; then
+  "$REAL_GIT" "$@" | sed 's/\[gone\]/[verschwunden]/'
   exit "${PIPESTATUS[0]}"
 fi
 exec "$REAL_GIT" "$@"
@@ -2655,6 +2661,164 @@ if [ "$RC_DANGLING_HEAD" -eq 0 ] \
 else
   fail "#892 an empty fetch refspec operand aborted the prune on a dangling remote HEAD"
   echo "$OUT_DANGLING_HEAD" >&2
+fi
+
+# Build a fixture holding one gone-upstream branch (remote deleted server-side,
+# tracking ref left stale) with a clean worktree on it, so `--apply` should
+# reclassify and remove that worktree. Used by the three cases below, each of
+# which changes ONE config knob and asserts the removal still happens.
+# $1 destination root, $2 branch name; echoes nothing, sets no globals.
+make_gone_worktree_fixture() {
+  local root="$1" branch="$2"
+  local remote="$root/remote.git" main="$root/main" wt="$root/gone-worktree"
+  mkdir -p "$root"
+  git init -q --bare "$remote"
+  git init -q "$main"
+  (
+    cd "$main" || exit 1
+    git config user.email "test@example.com"
+    git config user.name "Test"
+    git config commit.gpgsign false
+    git checkout -q -b main
+    echo seed > seed.txt
+    git add seed.txt
+    git commit -q -m "seed"
+    git remote add origin "$remote"
+    git push -q -u origin main
+    git branch "$branch"
+    git push -q -u origin "$branch"
+    git worktree add -q "$wt" "$branch"
+    # Server-side deletion, tracking ref deliberately left unpruned.
+    git --git-dir="$remote" branch -D "$branch"
+  ) >/dev/null 2>&1
+}
+
+# ── Case 36 (#892, Phase 4b P2): gone parsing survives forced color ─────
+# `color.branch=always` is a legal user setting and it colors non-tty output by
+# design. Parsing `git branch -vv` under it yields a branch token with ANSI
+# escapes glued on (`gonebr<ESC>[m`), so --apply looks up a branch that does not
+# exist and silently retains everything it just pruned. The parser must read a
+# plumbing surface that carries no color.
+COLOR_ROOT="$WORKDIR/forced-color"
+COLOR_BRANCH='color-forced-gone'
+make_gone_worktree_fixture "$COLOR_ROOT" "$COLOR_BRANCH"
+git -C "$COLOR_ROOT/main" config color.branch always
+git -C "$COLOR_ROOT/main" config color.ui always
+set +e
+OUT_COLOR=$( cd "$COLOR_ROOT/main" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_COLOR=$?
+set -e
+if [ "$RC_COLOR" -eq 0 ] && [ ! -d "$COLOR_ROOT/gone-worktree" ]; then
+  pass "#892 --apply reaches a gone branch under color.branch=always"
+else
+  fail "#892 forced branch color made --apply retain the stale worktree"
+  echo "$OUT_COLOR" >&2
+fi
+
+# ── Case 37 (#892, Phase 4b P2): ']' is legal in a branch name ──────────
+# check-ref-format forbids `[` but NOT `]`, so `topic]` is a legal branch. It
+# renders as `[origin/topic]: gone]`, which a `\[[^]]*: gone\]` marker test
+# cannot match — the branch is dropped from the sweep in apply mode right after
+# the prune removed its tracking ref.
+BRACKET_ROOT="$WORKDIR/bracket-branch"
+BRACKET_BRANCH='bracket-gone]'
+make_gone_worktree_fixture "$BRACKET_ROOT" "$BRACKET_BRANCH"
+set +e
+OUT_BRACKET=$( cd "$BRACKET_ROOT/main" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_BRACKET=$?
+set -e
+if [ "$RC_BRACKET" -eq 0 ] && [ ! -d "$BRACKET_ROOT/gone-worktree" ]; then
+  pass "#892 --apply reaches a gone branch whose name contains ']'"
+else
+  fail "#892 a ']' in the branch name hid it from the apply-side gone sweep"
+  echo "$OUT_BRACKET" >&2
+fi
+
+# ── Case 38 (#892, Phase 4b P1): the safe fetch must not recurse ────────
+# With `fetch.recurseSubmodules=true` the apply-side fetch recurses into every
+# populated submodule, and those child fetches use each SUBMODULE's refspecs —
+# outside the namespace this fetch confines itself to. Measured: against a
+# submodule carrying a mirror-style refspec the parent fetch exits NON-ZERO
+# ("refusing to fetch into branch 'refs/heads/main' checked out"), which the
+# helper swallows into a warning — so the whole --apply run silently loses
+# gone-upstream detection. Assert on that observable: no fetch-failure warning,
+# and the stale worktree still gets removed.
+SUBMOD_ROOT="$WORKDIR/submodule-recurse"
+SUBMOD_BRANCH='submodule-host-gone'
+make_gone_worktree_fixture "$SUBMOD_ROOT" "$SUBMOD_BRANCH"
+SUBMOD_INNER="$SUBMOD_ROOT/inner.git"
+git init -q --bare "$SUBMOD_INNER"
+git init -q "$SUBMOD_ROOT/innerseed"
+(
+  cd "$SUBMOD_ROOT/innerseed" || exit 1
+  git config user.email "test@example.com"
+  git config user.name "Test"
+  git config commit.gpgsign false
+  git checkout -q -b main
+  echo inner > inner.txt
+  git add inner.txt
+  git commit -q -m "inner"
+  git remote add origin "$SUBMOD_INNER"
+  git push -q -u origin main
+) >/dev/null 2>&1
+(
+  cd "$SUBMOD_ROOT/main" || exit 1
+  git config protocol.file.allow always
+  git -c protocol.file.allow=always submodule add -q "$SUBMOD_INNER" sub
+  git commit -q -m "add submodule"
+  # The submodule carries a mirror-style refspec: its own fetch maps remote
+  # heads straight onto local heads, which is what makes an inherited --prune
+  # dangerous there.
+  git -C sub config remote.origin.fetch '+refs/heads/*:refs/heads/*'
+  git config fetch.recurseSubmodules true
+) >/dev/null 2>&1
+set +e
+OUT_SUBMOD=$( cd "$SUBMOD_ROOT/main" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_SUBMOD=$?
+set -e
+if [ "$RC_SUBMOD" -eq 0 ] \
+   && ! echo "$OUT_SUBMOD" | grep -Fq 'git fetch --prune origin` failed' \
+   && [ ! -d "$SUBMOD_ROOT/gone-worktree" ]; then
+  pass "#892 --apply's safe fetch does not recurse into submodules"
+else
+  fail "#892 submodule recursion broke the safe fetch and lost gone-upstream detection"
+  echo "$OUT_SUBMOD" >&2
+fi
+
+# ── Case 39 (#892, Phase 4b P1 rebuttal): pruneTags cannot reach tags ───
+# A Phase 4b P1 argued that `remote.origin.pruneTags=true` overrides
+# `-c fetch.pruneTags=false` (remote-specific config does win) and so this
+# fetch deletes local tags. Measured on git 2.50.1 it does NOT: clearing the
+# refmap and passing an explicit `+refs/heads/*:refs/remotes/origin/*` means
+# no tag refspec ever enters the refmap, so tag pruning has nothing to act on.
+# The finding was rebutted rather than patched — but the property it feared
+# losing is real and worth pinning, so assert it directly. The naive
+# `git fetch --prune origin` this fixture would otherwise get DOES delete both
+# tags, which is what makes the assertion non-vacuous.
+PRUNETAGS_ROOT="$WORKDIR/prunetags-config"
+PRUNETAGS_BRANCH='prunetags-gone'
+make_gone_worktree_fixture "$PRUNETAGS_ROOT" "$PRUNETAGS_BRANCH"
+(
+  cd "$PRUNETAGS_ROOT/main" || exit 1
+  # `shared` exists on both sides, then is deleted on the remote; `local-only`
+  # never existed there. Tag pruning removes both.
+  git tag shared
+  git push -q origin shared
+  git tag local-only
+  git --git-dir="$PRUNETAGS_ROOT/remote.git" tag -d shared
+  git config remote.origin.pruneTags true
+) >/dev/null 2>&1
+set +e
+OUT_PRUNETAGS=$( cd "$PRUNETAGS_ROOT/main" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_PRUNETAGS=$?
+set -e
+if [ "$RC_PRUNETAGS" -eq 0 ] \
+   && git -C "$PRUNETAGS_ROOT/main" rev-parse --verify -q refs/tags/shared >/dev/null \
+   && git -C "$PRUNETAGS_ROOT/main" rev-parse --verify -q refs/tags/local-only >/dev/null; then
+  pass "#892 --apply preserves local tags under remote.origin.pruneTags=true"
+else
+  fail "#892 remote.origin.pruneTags=true let --apply delete local tags"
+  echo "$OUT_PRUNETAGS" >&2
 fi
 
 echo ""

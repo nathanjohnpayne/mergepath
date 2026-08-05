@@ -309,8 +309,20 @@ if [ "$MODE" = "apply" ]; then
     # +refs/heads/*:refs/heads/* still updates local branches while this
     # supposedly-safe fetch runs. The positional safe mappings below are then
     # the complete fetch/prune destination set.
+    # --no-recurse-submodules: with `fetch.recurseSubmodules=true` (or
+    # `submodule.recurse=true`) this fetch recurses into every populated
+    # submodule, and the child fetches use each SUBMODULE's own refspecs —
+    # outside the namespace confinement asserted above. Measured on git
+    # 2.50.1: the parent fetch logs `Fetching submodule sub` and, against a
+    # submodule carrying a mirror-style `+refs/heads/*:refs/heads/*`, exits
+    # NON-ZERO ("refusing to fetch into branch 'refs/heads/main' checked
+    # out"). That failure is swallowed into the warning below, so a repo
+    # with submodules loses gone-upstream detection for the whole --apply
+    # run — before considering what a mirror refspec does to a submodule
+    # branch that ISN'T checked out (Phase 4b P1 on #892).
     if ! git -C "$MAIN_WORKTREE" -c fetch.pruneTags=false \
-         fetch --prune --no-tags --refmap= origin "${SAFE_FETCH_REFSPECS[@]}" >/dev/null 2>&1; then
+         fetch --prune --no-tags --no-recurse-submodules --refmap= origin \
+         "${SAFE_FETCH_REFSPECS[@]}" >/dev/null 2>&1; then
       echo "worktree-cleanup.sh: warning: \`git fetch --prune origin\` failed; gone-upstream detection may miss recently-merged branches this run" >&2
     fi
   fi
@@ -582,26 +594,46 @@ EOF
   return 1
 }
 
-# Read gone-upstream branches from `git branch -vv`. The format is:
-#   [<spaces>]<branch> <sha> [origin/<branch>: gone] <subject>
-# We grab the branch name when the third field carries `: gone]`.
+# Read gone-upstream branches.
+#
+# This reads `for-each-ref`'s plumbing output, NOT `git branch -vv`. The
+# porcelain listing is a human-facing rendering and parsing it is wrong twice
+# over (both measured on git 2.50.1, Phase 4b review on #892):
+#
+#   * Color. Under `color.branch=always` — a legal user setting, and one that
+#     survives into non-tty output by design — every line carries ANSI escapes:
+#     `  gonebr<ESC>[m 845fcdb [<ESC>[34morigin/gonebr<ESC>[m: gone] seed`. The
+#     first whitespace token is then `gonebr<ESC>[m`, not `gonebr`, so --apply
+#     silently operates on a branch name that does not exist while dry-run,
+#     which reaches the same branches through `ls-remote`, still finds them.
+#   * `]` in a branch name. `]` is NOT forbidden by check-ref-format (only `[`
+#     is), so `topic]` is a legal branch, and it renders as
+#     `[origin/topic]: gone]`. A `\[[^]]*: gone\]` marker test cannot match
+#     that, so the branch is dropped from the sweep in apply mode right after
+#     the prune removed its tracking ref.
+#
+# `%(upstream:track)` emits exactly `[gone]` for a gone upstream and is
+# unaffected by both: verified emitting bare `topic] [gone]` under
+# `color.branch=always`. It also carries no `* ` / `+ ` list marker, so the
+# leading-plus ambiguity that the porcelain parser had to special-case does
+# not arise. A branch name cannot contain a space (check-ref-format), so the
+# trailing tracking atom is unambiguous to strip.
+#
+# The name comes from `%(refname:lstrip=2)`, NOT `%(refname:short)`: `:short`
+# shortens only as far as stays unambiguous, so when a TAG shares the branch's
+# name it yields `heads/<branch>` instead of `<branch>` — which is exactly the
+# branch/tag short-name collision Case 26 guards against. `lstrip=2` drops the
+# literal `refs/heads/` prefix and nothing else.
 gone_branches() {
   cd "$MAIN_WORKTREE" || return 0
-  LC_ALL=C git branch -vv 2>/dev/null | awk '
+  LC_ALL=C git for-each-ref \
+    --format='%(refname:lstrip=2) %(upstream:track)' refs/heads/ 2>/dev/null | awk '
     {
-      # Strip leading whitespace and exactly ONE branch-list marker. Git uses
-      # `* ` for the current branch and `+ ` for a branch checked out in
-      # another worktree; a legal branch itself may begin with `+`, so removing
-      # every leading plus turns `+ +foo` into the nonexistent `foo`.
-      line = $0
-      sub(/^[ \t]*/, "", line)
-      sub(/^[*+][ \t]+/, "", line)
-      # Branch name is the first whitespace-delimited token.
-      n = split(line, parts, /[ \t]+/)
-      branch = parts[1]
-      # Search for the gone marker anywhere on the line.
-      if (line ~ /\[[^]]*: gone\]/) {
-        print branch
+      # Trailing field is the tracking atom; the name is everything before it.
+      if ($NF == "[gone]") {
+        name = $0
+        sub(/[ \t]+\[gone\][ \t]*$/, "", name)
+        if (name != "") { print name }
       }
     }
   '
