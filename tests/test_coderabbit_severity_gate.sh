@@ -2744,6 +2744,34 @@ else
   printf '%s\n' "$EVENT_JOB" | grep -n 'REQUIRE_REVIEW_SUMMARY' | sed 's/^/      /' >&2
 fi
 
+# The unconditional flag is only safe because the flag does not decide a hold —
+# the ANCHOR does. On a push there is no CodeRabbit review on the new head, so a
+# run with the flag set must PASS rather than hold; if it held, every
+# synchronize event would pin the required check red until CodeRabbit got round
+# to the PR, which is review-ARRIVAL enforcement this gate deliberately does not
+# do. This is the invariant that let the event allow-list collapse to "true".
+echo "--- Test 47d0b (#886): flag set with no review on HEAD does not hold → exit 0"
+FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture '[]')
+FIXTURE_REVIEWS=$(make_issue_comments_fixture '[]')
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && ! echo "$OUT" | grep -q "awaiting its PR-level summary"; then
+  pass "the hold needs an anchor: no current-head review means no hold, flag or not"
+else
+  fail "expected rc=0 with the flag set and no current-head review; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # rc 3 is not a finding count, and the two publishers of this check have to
 # answer it differently: the event-driven job cannot decline to publish (it owns
 # the native check for the head), while the sweep must decline rather than post
@@ -3033,9 +3061,9 @@ WORKFLOW="$ROOT/.github/workflows/coderabbit-severity-gate.yml"
 if ! grep -Fq '__unreadable__' "$WORKFLOW" \
     && grep -Fq 'pre_fp_rc=$?' "$WORKFLOW" \
     && grep -Fq 'post_fp_rc=$?' "$WORKFLOW" \
-    && grep -Fq 'if [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; then' "$WORKFLOW" \
+    && grep -Fq '{ [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; }; then' "$WORKFLOW" \
     && awk '
-      /if \[ "\$pre_fp_rc" -ne 0 \] \|\| \[ "\$post_fp_rc" -ne 0 \]; then/ { guarding=1; next }
+      /\{ \[ "\$pre_fp_rc" -ne 0 \] \|\| \[ "\$post_fp_rc" -ne 0 \]; \}; then/ { guarding=1; next }
       guarding && /continue/ { found=1; exit }
       guarding && /^            fi/ { exit }
       END { exit(found ? 0 : 1) }
@@ -3043,6 +3071,40 @@ if ! grep -Fq '__unreadable__' "$WORKFLOW" \
   pass "unreadable fingerprint snapshots skip publication without a random sentinel"
 else
   fail "workflow must retain fingerprint read status and continue on either read failure"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 48b (#886, Codex P1): the gate's fail-closed rc 2 must reach the
+# check_run even when the snapshot guard cannot compare. The two failures are
+# CORRELATED, not independent — cr_surface_fp and the gate read the same
+# issues/{pr}/comments endpoint — so an unreadable endpoint trips the guard and
+# exits the gate 2 in the same breath, and a guard ordered first swallowed the
+# fail-closed verdict, leaving a possibly-stale SUCCESS on the head. Structural,
+# because the ordering lives in Actions.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 48b (#886): a fail-closed rc 2 outranks both snapshot guards"
+SWEEP_STEP=$(awk '
+  /^      - name: Re-evaluate gate per PR and post check_run$/ { in_step = 1 }
+  in_step { print }
+' "$WORKFLOW")
+# `|| true` on every extraction: grep exits 1 on no match, and under `set -e` a
+# failing command substitution aborts the whole suite — which turns a real
+# regression into a vanished test rather than a reported failure.
+GUARDS_CONDITIONED=$(printf '%s\n' "$SWEEP_STEP" \
+  | grep -c '^ *if \[ "\$gate_infra_error" -eq 0 \]' || true)
+# The classifier must be computed BEFORE the first guard it conditions, and rc 3
+# must stay OUTSIDE the infra-error set so the hold keeps declining to publish.
+CLASSIFIER_LINE=$(printf '%s\n' "$SWEEP_STEP" | grep -n '^ *gate_infra_error=0$' | head -1 | cut -d: -f1 || true)
+FIRST_GUARD_LINE=$(printf '%s\n' "$SWEEP_STEP" | grep -n '^ *if \[ "\$gate_infra_error" -eq 0 \]' | head -1 | cut -d: -f1 || true)
+if [ "$GUARDS_CONDITIONED" -eq 2 ] \
+    && [ -n "$CLASSIFIER_LINE" ] && [ -n "$FIRST_GUARD_LINE" ] \
+    && [ "$CLASSIFIER_LINE" -lt "$FIRST_GUARD_LINE" ] \
+    && printf '%s\n' "$SWEEP_STEP" | grep -Fq '0|1|3) ;;' \
+    && printf '%s\n' "$SWEEP_STEP" | grep -Fq '*) gate_infra_error=1 ;;'; then
+  pass "both snapshot guards defer to the gate's fail-closed exit, and rc 3 still holds"
+else
+  fail "expected rc 2 to bypass both snapshot guards (guards conditioned: $GUARDS_CONDITIONED, classifier line: ${CLASSIFIER_LINE:-none}, first guard line: ${FIRST_GUARD_LINE:-none})"
 fi
 
 # ---------------------------------------------------------------------------

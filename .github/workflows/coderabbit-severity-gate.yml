@@ -485,12 +485,36 @@ jobs:
             post_fp=$(cr_surface_fp "$PR")
             post_fp_rc=$?
             set -e
-            if [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; then
+            # The gate's own FAIL-CLOSED exit outranks every snapshot guard
+            # (Codex P1 on #886). rc 2 publishes a failure (see the case below),
+            # but both `continue`s underneath used to run FIRST, and the two
+            # failures they skip on are correlated rather than independent: the
+            # fingerprint and the gate read the SAME issues/{pr}/comments
+            # endpoint, so an endpoint that is unreadable makes pre/post_fp_rc
+            # nonzero AND the gate exit 2 in the same breath. The skip then
+            # swallowed the fail-closed verdict and left whatever check_run was
+            # already on the head standing — which since #832 can be a SUCCESS
+            # recorded before an acknowledgement was edited away. That is the
+            # exact hole the round-6 rc 2 fix closed, reopened through the guard,
+            # and reopened in the common case rather than a rare one.
+            #
+            # Safe to publish past a guard that cannot compare, because rc 2 is
+            # not a verdict read off a stale surface — it is "this run could not
+            # read", and the failure it posts is retired by the next sweep the
+            # moment the read succeeds. That is what separates it from the rc 3
+            # hold below, which must not mint a red no arm can retire.
+            gate_infra_error=0
+            case "$rc" in
+              0|1|3) ;;
+              *) gate_infra_error=1 ;;
+            esac
+            if [ "$gate_infra_error" -eq 0 ] \
+              && { [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; }; then
               echo "::warning::PR #$PR comment surface could not be fingerprinted before and after the gate; skipping this publication for a fresh retry"
               echo "::endgroup::"
               continue
             fi
-            if [ "$pre_fp" != "$post_fp" ]; then
+            if [ "$gate_infra_error" -eq 0 ] && [ "$pre_fp" != "$post_fp" ]; then
               # Deliberately a NOTICE, not a warning or error: a superseded
               # snapshot is the guard working, not a failure. The run that
               # caused the change publishes the current verdict.
@@ -526,7 +550,9 @@ jobs:
                 # summary merge until a later sweep happened to succeed. The
                 # gate's own rc 2 is fail-closed for exactly this reason; the
                 # sweep has to carry that through to the check it publishes
-                # rather than quietly declining to publish one.
+                # rather than quietly declining to publish one. The snapshot
+                # guards above are ordered behind this for the same reason —
+                # see the `gate_infra_error` note there.
                 echo "::error::coderabbit-severity-gate.sh rc=$rc on PR #$PR (config/usage error)"
                 had_infra_error=1
                 conclusion="failure"
