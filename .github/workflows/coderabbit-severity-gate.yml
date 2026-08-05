@@ -10,7 +10,10 @@ name: CodeRabbit Severity Gate
 # Reports "CodeRabbit blocking-tier unresolved: N" via
 # scripts/coderabbit-severity-gate.sh. The script exits 1 (gate fails)
 # when any CodeRabbit blocking-tier thread on the current HEAD is
-# unresolved.
+# unresolved, and 3 when a current-HEAD review run has not published its
+# PR-level summary yet — the event-driven job answers 3 by going non-green
+# and the sweep by declining to publish, so no publisher posts a verdict
+# read off the previous publication.
 #
 # Gate ON/OFF is controlled by coderabbit.severity_gate.enabled in
 # .github/review-policy.yml. Mergepath sets it to true (the canonical
@@ -52,6 +55,23 @@ on:
   # review-submission event.
   pull_request_review_comment:
     types: [created, edited, deleted]
+  # issue_comment is the PR-LEVEL comment surface (#832, Codex P1 round 2 on
+  # #886). Since the gate started classifying CodeRabbit's PR-level summary, a
+  # blocking finding can appear, change, or disappear with no pull_request*
+  # event firing at all — and so can the acknowledgement token that clears one.
+  # Without this trigger a previously-green required check stays green for up
+  # to 15 minutes after CodeRabbit publishes a summary-only finding, and the
+  # PR is mergeable through that window; symmetrically, an ack cannot turn a
+  # red check green promptly.
+  #
+  # Routed to the SWEEP job, not the event-driven one, and that is not an
+  # arbitrary choice: Actions only attaches a check to a PR's head SHA for
+  # pull_request* events, so an issue_comment-triggered run of the event-driven
+  # job would produce a workflow run that never updates the required check.
+  # The sweep already posts a check_run on the head SHA via the Checks API for
+  # exactly this reason, so the fix is to reuse it, scoped to the one PR.
+  issue_comment:
+    types: [created, edited, deleted]
   # Periodic sweep — catches the "human clicks Resolve conversation on a
   # CodeRabbit blocking-tier thread" case. The thread-resolution webhook
   # fires but does NOT trigger Actions workflows (no Actions event for it
@@ -64,6 +84,15 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # `issues: read` for the gate script's `/issues/{pr}/comments` read — the
+  # PR-level SUMMARY surface (#832). CodeRabbit can carry a blocking finding
+  # solely in its summary, which has no inline anchor; the gate classifies that
+  # surface too. Not optional and not merely a nicety: that read is fail-CLOSED
+  # (an unreadable endpoint exits 2, which this workflow turns into a CI
+  # failure), so without this scope the gate would 403 and go red on every PR.
+  # Same scope, same endpoint, same reason as merge-clearance-gate.yml (Codex
+  # P2 on PR #429).
+  issues: read
   # `checks: write` is required for the scheduled sweep job: it posts a
   # check_run on each open PR's head SHA so a UI-resolve clears the
   # stuck-red required check without a push. The event-driven job below
@@ -77,9 +106,20 @@ jobs:
     name: CodeRabbit unresolved blocking findings
     runs-on: ubuntu-latest
     # Event-driven path. The scheduled sweep below runs the same gate but
-    # on every open PR via the Checks API; gating this job to non-schedule
-    # events avoids paying for an empty no-op run.
-    if: github.event_name != 'schedule'
+    # on every open PR via the Checks API; gating this job away from the
+    # sweep's events avoids paying for an empty no-op run.
+    #
+    # `issue_comment` is excluded as well as `schedule` (Codex P2 round 3 on
+    # #886). It has to be an explicit exclusion, not an inherited one: this
+    # job's PR resolver only understands `pull_request*` payloads, so leaving
+    # the condition as `!= 'schedule'` started this job on every PR and issue
+    # comment in the repo and failed it at "Unsupported event" — a red job on
+    # ordinary conversation, and under the name of the REQUIRED check. Adding
+    # a trigger to `on:` obliges every job in the file to say whether it
+    # handles it.
+    if: >-
+      github.event_name != 'schedule'
+      && github.event_name != 'issue_comment'
     steps:
       - name: Checkout repo (default branch — trusted gate script)
         # Pin to the default branch, NOT the PR HEAD. The gate is a
@@ -130,6 +170,29 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           REPO: ${{ github.repository }}
+          # A review object can arrive before CodeRabbit publishes its
+          # PR-level summary, and every publisher of this required check has to
+          # honor that hold — the job, not the event, is the publisher (Codex P1
+          # on #886). Scoping the flag to `pull_request_review` left the same job
+          # running the arrival-INDEPENDENT scan on its other events: a
+          # `pull_request_review_comment` (CodeRabbit's own inline comments fire
+          # one each) or a `pull_request` [edited]/[reopened] landing inside the
+          # gap published a native success over the review run's rc-3 red, on the
+          # same head and under the same check name — the round-11 sweep hole,
+          # reached through a sibling event instead.
+          #
+          # Unconditional `true` rather than a longer event allow-list, because
+          # the flag is not what decides a hold: the gate holds only when a
+          # completed CodeRabbit review RUN sits on the CURRENT head with no
+          # correlated summary. A push cannot be in that state (its synchronize
+          # event carries a NEW head that no review has touched yet), so the
+          # "a push has no evidence a review started" case the old conditional
+          # protected is already answered by the anchor, and an allow-list would
+          # only have to grow again the next time a trigger is added. Both arms
+          # now set it identically; they still ANSWER rc 3 differently (this job
+          # goes non-green, the sweep declines to publish), which is where the
+          # asymmetry belongs.
+          REQUIRE_REVIEW_SUMMARY: "true"
         run: |
           set -euo pipefail
           # Bootstrap (nathanjohnpayne/mergepath#577): we run the TRUSTED copy of
@@ -149,12 +212,22 @@ jobs:
           #   0 = no unresolved blocking-tier findings on HEAD (or gate disabled)
           #   1 = unresolved blocking-tier findings present (gate blocks)
           #   2 = config / usage error (CI failure, not a gate block)
+          #   3 = a current-HEAD review run is awaiting its PR-level summary
           set +e
           scripts/coderabbit-severity-gate.sh "$PR_NUMBER" "$REPO"
           rc=$?
           set -e
           if [ "$rc" -eq 2 ]; then
             echo "::error::coderabbit-severity-gate.sh exited 2 (config/usage error)"
+            exit 1
+          fi
+          if [ "$rc" -eq 3 ]; then
+            # Non-green, deliberately. This job publishes the NATIVE check for
+            # this head, so declining to publish is not available to it — the
+            # check would simply keep whatever the previous event left, which is
+            # the success this hold exists to withhold. The sweep is the arm
+            # that skips instead (#886).
+            echo "::error::CodeRabbit review on this HEAD has not published its PR-level summary yet; holding this run non-green until it does"
             exit 1
           fi
           exit "$rc"
@@ -173,7 +246,18 @@ jobs:
     # Required-check resolution keys on (head_sha, name), so the new check
     # supersedes the stale red one. Idempotent: no-op when the gate result
     # is unchanged (and a clean pass everywhere the gate is disabled).
-    if: github.event_name == 'schedule'
+    #
+    # Also serves `issue_comment` on a PR (#832 / Codex P1 round 2 on #886) —
+    # a summary finding or its acknowledgement lands on that surface and fires
+    # no pull_request* event, and only this job can refresh the required check
+    # on the head SHA. The job NAME is deliberately left reading "scheduled"
+    # despite now serving two triggers: check names are load-bearing in this
+    # repo's branch protection, and renaming one to gain descriptive accuracy
+    # is not worth the class of breakage that causes.
+    if: >-
+      github.event_name == 'schedule'
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request != null)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo (default branch — trusted scripts)
@@ -188,8 +272,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_PR: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
+          # issue_comment path (#832): re-evaluate ONLY the PR that received
+          # the comment. Sweeping all open PRs on every PR comment would turn
+          # ordinary conversation into a repo-wide gate re-run.
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            if [ -z "$COMMENT_PR" ] || [ "$COMMENT_PR" = "null" ]; then
+              echo "::error::issue_comment event carried no issue number"
+              exit 1
+            fi
+            {
+              echo 'prs<<EOF'
+              printf '%s\n' "$COMMENT_PR"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # List ALL open PRs. The gate script itself short-circuits when
           # coderabbit.severity_gate.enabled=false, so we don't filter by
           # label here. `--limit 500` mirrors codex-p1-gate.yml's bound.
@@ -220,6 +321,15 @@ jobs:
           # same gate. GitHub keys required checks on (head_sha, name); a
           # fresh check_run with the same name supersedes the stale one.
           CHECK_NAME: "CodeRabbit unresolved blocking findings"
+          # The sweep honors the publication hold too (Codex P1 + CodeRabbit
+          # Major on #886). Without it the sweep is a second publisher of the
+          # same required check running the arrival-INDEPENDENT scan, so a sweep
+          # landing between a review object and its PR-level summary posted
+          # success over the review run's red and reopened the gap. It is safe
+          # here precisely because the sweep answers rc 3 by DECLINING TO
+          # PUBLISH: the hold withholds a success, it never manufactures a red
+          # this arm cannot retire.
+          REQUIRE_REVIEW_SUMMARY: "true"
         run: |
           set -euo pipefail
           # Bootstrap (see the event-driven job): the trusted script is run from
@@ -245,20 +355,207 @@ jobs:
               continue
             fi
 
+            # STALE-SNAPSHOT GUARD (Codex round 4 + Phase 4b P1 on #886).
+            # Two comment events close together produce two concurrent sweeps,
+            # and because same-name check runs supersede one another, an OLDER
+            # run finishing last can republish a stale SUCCESS over a newer,
+            # correct FAILURE — leaving the required check green on a summary
+            # whose acknowledgement was just edited or deleted.
+            #
+            # Fixed by compare-and-swap on the surface the verdict is computed
+            # from, NOT by a `concurrency:` block. mergepath#843 established
+            # that adding `concurrency` to a job publishing a required check
+            # cancels the PENDING member even with `cancel-in-progress: false`,
+            # leaving a `cancelled` native check that blocks merge permanently
+            # and cannot be retired by a rerun. On a gate with
+            # `enforce_admins: true` that trades a transient stale-green window
+            # for an unfixable deadlock.
+            #
+            # So: fingerprint the PR-comment surface before the gate runs, and
+            # again after. If it moved, another event has superseded this
+            # snapshot — skip the publish and let that run's (newer) verdict
+            # stand. Nothing is cancelled, so no run ever owes a check_run it
+            # cannot deliver, and the scheduled sweep remains the backstop.
+            #
+            # The fingerprint covers each comment's BODY, not just its identity
+            # metadata (Codex P1 on #886). GitHub reports `updated_at` at second
+            # resolution, so an acknowledgement or summary edited twice inside
+            # one second changes the verdict while `id:updated_at` stays
+            # byte-identical — and the guard would then wave through exactly the
+            # stale publication it exists to stop. The body is what the verdict
+            # is computed from, so the body is what has to be compared.
+            #
+            # Raw content rather than a digest, deliberately: hashing would add
+            # a dependency whose absence makes both fingerprints degrade to the
+            # same value, which reads as "unchanged" and silently disables the
+            # guard. A large shell variable costs nothing here.
+            #
+            # The record separator is written as the jq ESCAPE `\u001e`, never
+            # as a raw control byte (Codex P1 on #886). A literal NUL in the
+            # workflow source makes the YAML document invalid — Ruby Psych
+            # rejects it with "control characters are not allowed" — and GitHub
+            # would then refuse to register the workflow at all, silently
+            # removing a required check rather than failing a run. jq expands
+            # the escape at runtime, so the delimiter is still a byte that
+            # cannot occur in a comment body, while the file stays printable.
+            # The snapshot covers EVERY surface the verdict is computed from,
+            # and that is all FOUR of them (Codex P1 on #886). Sampling only the
+            # PR-comment and review-object surfaces left the gate's ORIGINAL and
+            # primary input unguarded: the verdict counts unresolved blocking
+            # INLINE findings, and it computes those from pulls/{pr}/comments
+            # (the finding bodies the tier ladder grades) and from GraphQL
+            # reviewThreads (`isResolved`). A thread resolved — or a finding
+            # posted, edited, or deleted — between the gate's read and the
+            # Checks API POST leaves a comments+reviews fingerprint
+            # byte-identical, so the guard waves through a verdict computed
+            # against a surface that has since moved: a stale success
+            # republished over a now-unresolved blocking finding, standing until
+            # the next sweep. The review-object part is here for the same reason
+            # one step earlier — with REQUIRE_REVIEW_SUMMARY set, the gate
+            # reads pulls/{pr}/reviews to decide whether a current-head run is
+            # awaiting its summary, and a review submitted inside that window
+            # republished green over the pull_request_review job's rc 3 red. A
+            # surface the verdict depends on and the guard does not sample is
+            # not guarded.
+            #
+            # The thread part samples `id:isResolved` and not the thread's
+            # comment ids: resolution state is the only thing that surface
+            # contributes to the verdict, and the finding bodies it would
+            # otherwise duplicate are already covered by the inline part.
+            #
+            # ANY read failing fails the WHOLE fingerprint, which the caller
+            # answers by skipping the publication. A half-read surface must never
+            # become a fingerprint: it would compare equal to the other run's
+            # half-read and read as "unchanged", which is the guard silently
+            # disabling itself — the same reasoning as the no-sentinel rule
+            # below.
+            #
+            # The parts are joined with the OCTAL escape `\035` (group
+            # separator), never the raw byte that escape stands for: POSIX printf
+            # defines octal escapes while `\uNNNN` is a bash 4.2+ extension, and
+            # a byte no comment, review, or node id can contain is what keeps the
+            # parts unambiguous. Same no-raw-control-byte rule as the record
+            # separator above — the escape is expanded at runtime and the YAML
+            # source stays printable. A raw control byte anywhere in this file
+            # makes the whole document unloadable (Ruby Psych: "control
+            # characters are not allowed"), which unregisters a required check
+            # instead of failing a run.
+            cr_surface_fp() {
+              local comments reviews inline threads
+              comments=$(gh api "repos/$REPO/issues/$1/comments" --paginate \
+                --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join("\u001e")') || return 1
+              reviews=$(gh api "repos/$REPO/pulls/$1/reviews" --paginate \
+                --jq '[.[] | "\(.id):\(.state):\(.commit_id // ""):\(.submitted_at // ""):\(.body // "")"] | sort | join("\u001e")') || return 1
+              inline=$(gh api "repos/$REPO/pulls/$1/comments" --paginate \
+                --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join("\u001e")') || return 1
+              threads=$(gh api graphql --paginate \
+                -F owner="${REPO%%/*}" -F name="${REPO##*/}" -F pr="$1" \
+                -f query='query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $pr) {
+                      reviewThreads(first: 100, after: $endCursor) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { id isResolved }
+                      }
+                    }
+                  }
+                }' \
+                --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | "\(.id):\(.isResolved)"] | sort | join("\u001e")') || return 1
+              printf '%s\035%s\035%s\035%s' "$comments" "$reviews" "$inline" "$threads"
+            }
+
+            # A read failure is NOT serialized into a sentinel: $RANDOM is not
+            # a collision-proof identity, and the guard's contract is to
+            # publish only after observing one stable comment surface. Keep the
+            # read status separately and skip publication whenever either
+            # snapshot is unreadable. The next issue-comment event or scheduled
+            # sweep retries from a fresh snapshot.
+            set +e
+            pre_fp=$(cr_surface_fp "$PR")
+            pre_fp_rc=$?
+            set -e
+
             set +e
             output=$(scripts/coderabbit-severity-gate.sh "$PR" "$REPO" 2>&1)
             rc=$?
             set -e
             echo "$output"
 
+            set +e
+            post_fp=$(cr_surface_fp "$PR")
+            post_fp_rc=$?
+            set -e
+            # The gate's own FAIL-CLOSED exit outranks every snapshot guard
+            # (Codex P1 on #886). rc 2 publishes a failure (see the case below),
+            # but both `continue`s underneath used to run FIRST, and the two
+            # failures they skip on are correlated rather than independent: the
+            # fingerprint and the gate read the SAME issues/{pr}/comments
+            # endpoint, so an endpoint that is unreadable makes pre/post_fp_rc
+            # nonzero AND the gate exit 2 in the same breath. The skip then
+            # swallowed the fail-closed verdict and left whatever check_run was
+            # already on the head standing — which since #832 can be a SUCCESS
+            # recorded before an acknowledgement was edited away. That is the
+            # exact hole the round-6 rc 2 fix closed, reopened through the guard,
+            # and reopened in the common case rather than a rare one.
+            #
+            # Safe to publish past a guard that cannot compare, because rc 2 is
+            # not a verdict read off a stale surface — it is "this run could not
+            # read", and the failure it posts is retired by the next sweep the
+            # moment the read succeeds. That is what separates it from the rc 3
+            # hold below, which must not mint a red no arm can retire.
+            gate_infra_error=0
+            case "$rc" in
+              0|1|3) ;;
+              *) gate_infra_error=1 ;;
+            esac
+            if [ "$gate_infra_error" -eq 0 ] \
+              && { [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; }; then
+              echo "::warning::PR #$PR comment surface could not be fingerprinted before and after the gate; skipping this publication for a fresh retry"
+              echo "::endgroup::"
+              continue
+            fi
+            if [ "$gate_infra_error" -eq 0 ] && [ "$pre_fp" != "$post_fp" ]; then
+              # Deliberately a NOTICE, not a warning or error: a superseded
+              # snapshot is the guard working, not a failure. The run that
+              # caused the change publishes the current verdict.
+              echo "::notice::PR #$PR comment surface changed while the gate ran; skipping this publication so the newer run's verdict stands"
+              echo "::endgroup::"
+              continue
+            fi
+
+            if [ "$rc" -eq 3 ]; then
+              # The ONE case where declining to publish is correct. A review run
+              # is on this head and its PR-level summary has not landed, so the
+              # findings on that surface are not knowable yet — and the only
+              # verdict this sweep could compute is read off the PREVIOUS
+              # publication. Publishing success would overwrite the event-driven
+              # run's red with a stale clean read; publishing failure would let
+              # this arm pin a required check red with no ack channel and no
+              # break-glass under `enforce_admins: true`. Skipping leaves the
+              # event run's verdict standing and self-clears on the next sweep
+              # once the summary publishes (#886).
+              echo "::notice::PR #$PR has a current-HEAD CodeRabbit review awaiting its PR-level summary; skipping this publication so the review run's verdict stands"
+              echo "::endgroup::"
+              continue
+            fi
             case "$rc" in
               0) conclusion="success" ;;
               1) conclusion="failure" ;;
               *)
+                # rc 2 PUBLISHES A FAILURE, it does not skip (Codex P1 round 6
+                # on #886). Skipping left whatever check_run was already on the
+                # head standing — and since #832 that stale check can be a
+                # SUCCESS recorded before an acknowledgement was edited or
+                # deleted, so branch protection would let the now-unacknowledged
+                # summary merge until a later sweep happened to succeed. The
+                # gate's own rc 2 is fail-closed for exactly this reason; the
+                # sweep has to carry that through to the check it publishes
+                # rather than quietly declining to publish one. The snapshot
+                # guards above are ordered behind this for the same reason —
+                # see the `gate_infra_error` note there.
                 echo "::error::coderabbit-severity-gate.sh rc=$rc on PR #$PR (config/usage error)"
                 had_infra_error=1
-                echo "::endgroup::"
-                continue
+                conclusion="failure"
                 ;;
             esac
 
