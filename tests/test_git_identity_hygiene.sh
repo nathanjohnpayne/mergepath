@@ -1721,6 +1721,44 @@ else
   fail "inherited request failed a non-repository fixture: rc=$RC out=$OUT"
 fi
 
+# Case 63g: the marker path is WORKING-TREE content now, so a pull request
+# can make its directory a symlink. `>` follows one, which would turn
+# `--snapshot` — the job's FIRST repo_lint step, before this check has
+# asserted anything — into a write to whatever the link names. The old
+# `.git`-local path was not checkout-controlled and had nothing to refuse.
+SNAPLINK_REPO="$WORKDIR/snapshot-symlinked-state-repo"
+git init -q -b main "$SNAPLINK_REPO"
+SNAPLINK_TARGET="$WORKDIR/snapshot-symlink-target"
+mkdir -p "$SNAPLINK_TARGET"
+ln -s "$SNAPLINK_TARGET" "$SNAPLINK_REPO/.mergepath"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPLINK_REPO" bash "$CHECK" --snapshot 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "snapshot state path is a symlink" \
+  && [ ! -e "$SNAPLINK_TARGET/gitconfig-baseline.requested" ]; then
+  pass "symlinked snapshot state dir: refused, nothing written through the link"
+else
+  fail "snapshot wrote through a symlinked state dir: rc=$RC out=$OUT"
+fi
+
+# Case 63h: the converse — refusing a link cannot have been implemented by
+# refusing the ordinary case. A real directory still records normally.
+SNAPPLAIN_REPO="$WORKDIR/snapshot-plain-state-repo"
+git init -q -b main "$SNAPPLAIN_REPO"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPPLAIN_REPO" bash "$CHECK" --snapshot 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "snapshot recorded" \
+  && [ -f "$SNAPPLAIN_REPO/.mergepath/gitconfig-baseline.requested" ]; then
+  pass "ordinary state dir: snapshot still recorded"
+else
+  fail "ordinary snapshot refused: rc=$RC out=$OUT"
+fi
+
 # ── Newline-safe include-target collection (#804) ──────────────────────
 
 # Case 64: a Git include target is an ordinary filename and may contain a
@@ -1751,6 +1789,29 @@ if [ "$RC" = "1" ] \
   pass "include target whose filename contains a newline: inspected, and its remediation lands on that file"
 else
   fail "newline include target escaped the walk: rc=$RC remedy='$REMEDY' left='$NL_LEFT' after=$RC_AFTER out=$OUT after_out=$OUT_AFTER"
+fi
+
+# Case 64c: the same filename shape with the newline LAST. Case 64's name
+# carries its newline in the middle, which survives a command substitution;
+# a TRAILING one does not — `$( )` strips every trailing newline, so the
+# canonicalised target came back one byte short, the file test asked about
+# a name no file has, and the identity behind it was dropped exactly as
+# before the newline-safe collection was written.
+NLTREPO="$WORKDIR/newline-tail-include-repo"
+git init -q -b main "$NLTREPO"
+NLT_INCLUDE="$NLTREPO/.git/dormant-identity"$'\n'
+printf '[user]\n\temail = newline-tail-include@example.com\n' > "$NLT_INCLUDE"
+git -C "$NLTREPO" config --local includeIf.onbranch:release.path "$NLT_INCLUDE"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NLTREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "newline-tail-include@example.com" \
+  && printf '%s' "$OUT" | grep -q "inactive include"; then
+  pass "include target whose filename ENDS in a newline: inspected"
+else
+  fail "trailing-newline include target escaped the walk: rc=$RC out=$OUT"
 fi
 
 # Case 64b: two `includeIf` entries pointing at the SAME target still yield
@@ -1863,6 +1924,21 @@ if [ "$RC" = "1" ] \
   pass "subsection keys around a real write: only the exact protected key is reported"
 else
   fail "mixed subsection/protected keys: hits=$N_HITS rc=$RC out=$OUT"
+fi
+
+# Case 65g: a shell escape may stand between the boundary and the key.
+# `git config \user.email x` writes the identity — the shell drops the
+# backslash and Git is handed `user.email` — while the word as written does
+# not begin with `u`. A word boundary that admits nothing between itself
+# and the key reads this as no write at all.
+run_on_fixture "tests/escaped-key.sh" '#!/usr/bin/env bash
+git config \user.email "leak@example.com"
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/escaped-key.sh:2:"; then
+  pass "shell-escaped protected key: still reported"
+else
+  fail "escaped protected key missed: rc=$RC out=$OUT"
 fi
 
 # ── Linked worktrees: identity lives in every one of them (#806) ───────

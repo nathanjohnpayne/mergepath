@@ -416,16 +416,50 @@ config_path() {
 # include — while a scope's own file is derived from `rev-parse`. Without
 # normalising both, the comparison never matches and every ordinary
 # `--local` offender would be described as arriving through an include.
-canonical_path() {
-  local p="$1" d b
-  case "$p" in
+# Canonicalise into the NAMED variable, which is the form that can keep a
+# trailing newline. A filename may end in one, and every ordinary way of
+# moving a path through the shell drops it: `$(basename …)`, `$(pwd -P)` and
+# any `$( )` around this function all strip EVERY trailing newline from what
+# they capture. The name then comes back one byte short, the caller's `-f`
+# test asks about a file nobody has, and the identity behind that include is
+# skipped — the same silent drop the newline-safe collection exists to end,
+# one layer below the array that holds the result.
+#
+# So the split is done with parameter expansion (lossless), and the one
+# capture that remains — the physical form of the DIRECTORY, which only `cd`
+# can produce — is padded with a sentinel byte. Removing the sentinel and
+# then the single newline `pwd` itself printed leaves exactly the path,
+# whether or not the path's own last byte is a newline.
+canonical_path_into() {
+  local __cpi_p="$2" __cpi_d __cpi_b __cpi_out
+  case "$__cpi_p" in
     /*) ;;
-    *) p="$REPO_ROOT/$p" ;;
+    *) __cpi_p="$REPO_ROOT/$__cpi_p" ;;
   esac
-  d="$(dirname -- "$p")"
-  b="$(basename -- "$p")"
-  ( cd "$d" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$b" ) \
-    || printf '%s\n' "$p"
+  # Trailing slashes, dropped the way `basename`/`dirname` drop them, so a
+  # directory spelled `a/b/` still canonicalises as `a/b`.
+  while [ "$__cpi_p" != "/" ] && [ "${__cpi_p%/}" != "$__cpi_p" ]; do
+    __cpi_p="${__cpi_p%/}"
+  done
+  __cpi_b="${__cpi_p##*/}"
+  __cpi_d="${__cpi_p%/*}"
+  [ -n "$__cpi_d" ] || __cpi_d="/"
+  __cpi_out="$(cd -- "$__cpi_d" 2>/dev/null && pwd -P; printf 'x')"
+  __cpi_out="${__cpi_out%x}"
+  __cpi_out="${__cpi_out%$'\n'}"
+  if [ -z "$__cpi_out" ]; then
+    printf -v "$1" '%s' "$__cpi_p"
+    return 0
+  fi
+  printf -v "$1" '%s/%s' "$__cpi_out" "$__cpi_b"
+}
+
+# The same value on stdout, for the callers that compare two paths inline and
+# cannot carry a trailing newline through `$( )` anyway.
+canonical_path() {
+  local __cp_value
+  canonical_path_into __cp_value "$1"
+  printf '%s\n' "$__cp_value"
 }
 
 # The file a given scope writes when it is named directly. Anything else
@@ -623,7 +657,7 @@ collect_include_targets() {
       [ "$dup" -eq 1 ] || INCLUDE_UNRESOLVED+=("$unres")
       continue
     fi
-    target="$(canonical_path "$target")"
+    canonical_path_into target "$target"
     [ -f "$target" ] || continue
     dup=0
     for (( i = 0; i < ${#INCLUDE_FILES[@]}; i++ )); do
@@ -645,10 +679,39 @@ if [ "$MODE" = "snapshot" ]; then
   fi
   BASE="$(baseline_path)"
   BASE_MARKER="$(baseline_marker_path)"
+  BASE_MARKER_DIR="$(dirname -- "$BASE_MARKER")"
+  # The marker lives in the WORKING TREE, which means its directory and the
+  # marker itself are checkout content — replaceable by a pull request with a
+  # symlink pointing anywhere the runner can write. `>` follows one, so a
+  # tracked `.mergepath` → `../.git` (or a tracked marker file naming a later
+  # CI script) would make `--snapshot` overwrite that target during the first
+  # repo_lint step, before this check has asserted anything at all. The old
+  # `.git`-local path was not checkout-controlled and had nothing to refuse.
+  #
+  # Refused rather than resolved: no legitimate checkout needs this path to be
+  # a link, so there is no case to preserve, and unlinking it would still race
+  # the tree it came from. Checked before `mkdir -p`, which follows a symlinked
+  # directory silently and would report success on the linked-to target.
+  if [ -L "$BASE_MARKER_DIR" ] || [ -L "$BASE_MARKER" ]; then
+    cat >&2 <<EOF
+check_git_identity_hygiene: FAIL (the snapshot state path is a symlink)
+
+$BASE_MARKER
+
+is reached through a symbolic link. That path is working-tree content, so a
+link there redirects this step's write to whatever the link names — and this
+step runs before any assertion in this check, as the repository's own lint.
+No snapshot was recorded.
+
+Replace the link with a real directory and a real file (or remove it and let
+--snapshot create both), then re-run.
+EOF
+    exit 1
+  fi
   # The state dir first: a baseline recorded without its marker is a
   # comparison the next run has no reason to make, so failing here has to
   # happen before anything looks like a completed snapshot.
-  mkdir -p "$(dirname -- "$BASE_MARKER")"
+  mkdir -p "$BASE_MARKER_DIR"
   cp "$CFG" "$BASE"
   # The marker records WHAT was snapshotted, not merely that something was.
   # The later report pass is a different process with no memory of this one,
@@ -1291,9 +1354,17 @@ else
     # NOT in the set: the trailing `[[:space:]]+` below already excludes the
     # quoted spelling `git config "user.email" x`, so admitting an opening
     # quote here would match nothing this does not already match.
+    #
+    # ONE character may stand between the boundary and the key: a backslash.
+    # `git config \user.email leak@example.com` writes the identity — the
+    # shell drops the escape and Git is handed `user.email` — while the word
+    # as written does not begin with `u`. Nothing is reopened by allowing it,
+    # because the subsection case never reaches this position: in
+    # `foo.bar\user.email` the character before the backslash is `r`, not a
+    # boundary, so the match never starts there.
     function key_assign_pos(s,   lower, pos, rest) {
       lower = tolower(s)
-      if (!match(lower, /(^|[[:space:]])(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+/))
+      if (!match(lower, /(^|[[:space:]])\\?(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+/))
         return 0
       # Step over the boundary character: it is not part of the key, and
       # this position is what the caller cuts the option region at. Every
