@@ -521,43 +521,66 @@ p4b_barrier_note_pending() {
 # behind. The whole root is safe to delete when no Phase 4b run is in flight —
 # the durable record of what was posted is the timeline marker, never a claim.
 #
-# EVERY branch yields an ABSOLUTE path (CodeRabbit, round 1). A relative root is
-# read as cwd-relative by mkdir, so two invocations started from two directories
-# would contend for two different roots — the cross-checkout split #858 exists to
-# remove, reintroduced through the override rather than through the default. A
-# relative `P4B_CLAIM_DIR` is therefore anchored at the cwd once, here, so it
-# also survives anything that chdirs mid-run; a relative `XDG_STATE_HOME` is
-# IGNORED, which is what the XDG base-directory spec requires of a reader.
+# EVERY branch is ABSOLUTE BY CONSTRUCTION: each `printf` is either guarded by
+# a `/*` case or derived from `p4b_repo_root`, which resolves through `cd -P`.
+#
+# A RELATIVE operator-supplied root is IGNORED rather than used, and the next
+# branch decides. This is the one treatment that keeps the guarantee #858 is
+# about. Anchoring a relative root at `$PWD` — the intermediate shape this
+# function briefly carried — makes it absolute without making it
+# checkout-independent: two invocations started from two directories still
+# expand the same relative override to two different roots, which is the split
+# reintroduced through an operator-supplied directory instead of through the
+# default (CodeRabbit round 1 asked for reject-or-absolutise; Codex P2 round 2
+# showed that absolutise-at-cwd is not enough, and both are satisfied by
+# ignoring). It also matches what the XDG base-directory spec already requires
+# of a reader for a relative `XDG_STATE_HOME`, so all three variables now obey
+# one rule instead of three.
+#
+# Falling through is safe in every direction: an ignored `P4B_CLAIM_DIR` lands
+# on the shared per-user root, which is *more* serialized than what the
+# operator asked for, never less.
 p4b_barrier_claim_root() {
   local base host
-  if [ -n "${P4B_CLAIM_DIR:-}" ]; then
-    case "$P4B_CLAIM_DIR" in
-      /*) printf '%s' "$P4B_CLAIM_DIR" ;;
-      *)  printf '%s/%s' "${PWD:-.}" "$P4B_CLAIM_DIR" ;;
-    esac
-    return 0
-  fi
-  base="${XDG_STATE_HOME:-}"
-  case "$base" in /*) ;; *) base='' ;; esac
+  case "${P4B_CLAIM_DIR:-}" in
+    /*) printf '%s' "$P4B_CLAIM_DIR" ; return 0 ;;
+  esac
+  base=""
+  case "${XDG_STATE_HOME:-}" in /*) base="$XDG_STATE_HOME" ;; esac
   if [ -z "$base" ]; then
     case "${HOME:-}" in /*) base="$HOME/.local/state" ;; esac
   fi
-  if [ -z "$base" ]; then
-    printf '%s' "${P4B_ACCT_STATE_DIR:-$(p4b_repo_root)/.mergepath}"
+  if [ -n "$base" ]; then
+    host="$(uname -n 2>/dev/null || true)"
+    host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || true)"
+    printf '%s/mergepath/write-claims/%s' "$base" "${host:-localhost}"
     return 0
   fi
-  host="$(uname -n 2>/dev/null || true)"
-  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || true)"
-  printf '%s/mergepath/write-claims/%s' "$base" "${host:-localhost}"
+  # No home to anchor on: today's per-checkout location, which is per-checkout
+  # by design, so there is no cross-checkout guarantee left to protect here.
+  case "${P4B_ACCT_STATE_DIR:-}" in
+    /*) printf '%s' "$P4B_ACCT_STATE_DIR" ; return 0 ;;
+  esac
+  printf '%s/.mergepath' "$(p4b_repo_root)"
 }
 
 # p4b_barrier_claim_path <repo> <pr> <key> <kind>
 # One path per (repo, PR, key, write class) so a resume claim and a trigger
 # claim can never be read for one another (#846, #847), under the shared root
 # above so every checkout on this machine contends for the same one (#858).
+#
+# The repo slug is INJECTIVE (Codex P2, round 2). `tr '/' '-'` mapped
+# `foo-bar/baz` and `foo/bar-baz` onto one slug — harmless while claims lived
+# under the checkout's own state dir, and newly reachable now that #858 puts
+# every repo on this machine under one root, where a collision lets one run
+# decline or reap another repository's live claim. `%` is not a legal character
+# in a GitHub owner or repository name, so `/` → `%2F` cannot be forged by any
+# real slug and the encoding is reversible. Claims carry no durable meaning —
+# the record of what was posted is the timeline marker — so re-spelling the
+# path costs nothing beyond one stranded empty directory per in-flight run.
 p4b_barrier_claim_path() {
   local repo_slug
-  repo_slug="$(printf '%s' "${1:-unknown}" | tr '/' '-')"
+  repo_slug="$(printf '%s' "${1:-unknown}" | sed 's|/|%2F|g')"
   printf '%s/phase-4b-barrier/%s-pr%s-%s.%s.claim' \
     "$(p4b_barrier_claim_root)" "$repo_slug" "${2:-0}" "${3:-nohead}" "${4:-trigger}"
 }

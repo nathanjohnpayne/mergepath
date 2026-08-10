@@ -3066,13 +3066,17 @@ _xc_reads() {
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
   printf '%s' "$n"
 }
+# The library owns the claim-path spelling; asking it keeps a format change
+# from surfacing here as a poll timeout blamed on the claim never appearing
+# (CodeRabbit, round 2).
+_xc_claim() { ( P4B_CLAIM_DIR="$WORK/xc-claims" p4b_barrier_claim_path owner/repo 11 xchead trigger ); }
 _checkout "$WORK/xc-state-a" >"$WORK/xc-out-a" 2>/dev/null &
 _xc_a=$!
 _n=0
-while [ ! -d "$WORK/xc-claims/phase-4b-barrier/owner-repo-pr11-xchead.trigger.claim" ] && [ "$_n" -lt 100 ]; do
+while [ ! -d "$(_xc_claim)" ] && [ "$_n" -lt 100 ]; do
   sleep 0.1; _n=$((_n+1))
 done
-[ -d "$WORK/xc-claims/phase-4b-barrier/owner-repo-pr11-xchead.trigger.claim" ] || bad="$bad shared-claim-never-observed"
+[ -d "$(_xc_claim)" ] || bad="$bad shared-claim-never-observed"
 _checkout "$WORK/xc-state-b" >"$WORK/xc-out-b" 2>/dev/null &
 _xc_b=$!
 wait "$_xc_b" || true
@@ -3125,10 +3129,14 @@ fi
 # (CodeRabbit, round 1). Each branch is asserted directly here instead, in a
 # subshell so the section's pinned override is restored afterwards.
 #
-# `mkdir -p` reads a relative root as cwd-relative, so a relative override or a
-# relative XDG_STATE_HOME would put two invocations started from two directories
-# on two different roots — the split #858 removes, arriving through the override
-# instead of the default. Every branch must therefore be absolute.
+# `mkdir -p` reads a relative root as cwd-relative, so a relative value in ANY
+# of the three operator-supplied variables would put two invocations started
+# from two directories on two different roots — the split #858 removes,
+# arriving through an operator-supplied directory instead of through the
+# default. Every branch must therefore be absolute, and every relative value
+# must be IGNORED rather than anchored: anchoring at $PWD makes the root
+# absolute without making it checkout-independent, which is the guarantee under
+# test (Codex P2, round 2).
 bad=""
 _claim_root() ( unset P4B_CLAIM_DIR XDG_STATE_HOME; "$@" >/dev/null 2>&1; p4b_barrier_claim_root )
 # Default: per-user, per-HOST, and independent of the checkout.
@@ -3153,13 +3161,19 @@ case "$_r" in
   "$WORK/fakehome/.local/state/mergepath/write-claims/"?*) ;;
   *) bad="$bad relative-xdg-honoured=$_r" ;;
 esac
-# A relative override is anchored at the cwd once, here, so it is stable for the
-# life of the claim even if something chdirs mid-run. Compare against the
-# post-`cd` $PWD, not against $WORK: a TMPDIR with a trailing slash makes the two
-# spellings differ by a doubled separator while naming the same directory.
-_wd="$( cd "$WORK" && pwd )"
-_r="$( ( cd "$WORK" && P4B_CLAIM_DIR=rel-claims p4b_barrier_claim_root ) )"
-[ "$_r" = "$_wd/rel-claims" ] || bad="$bad relative-override=$_r"
+# A relative OVERRIDE is ignored the same way, and the shared default decides.
+# Two runs started from two directories must not disagree about the root; the
+# fall-through direction is the safe one, because the shared root is MORE
+# serialized than what the operator asked for, never less. Asserted from two
+# different working directories so an anchored-at-$PWD implementation, which is
+# absolute but still cwd-dependent, cannot pass.
+_r="$( ( cd "$WORK" && P4B_CLAIM_DIR=rel-claims HOME="$WORK/fakehome" p4b_barrier_claim_root ) )"
+_r2="$( ( cd / && P4B_CLAIM_DIR=rel-claims HOME="$WORK/fakehome" p4b_barrier_claim_root ) )"
+[ "$_r" = "$_r2" ] || bad="$bad relative-override-cwd-dependent=$_r/$_r2"
+case "$_r" in
+  "$WORK/fakehome/.local/state/mergepath/write-claims/"?*) ;;
+  *) bad="$bad relative-override-honoured=$_r" ;;
+esac
 # An absolute override is used verbatim — the property every test above relies on.
 _r="$( P4B_CLAIM_DIR="$WORK/abs-claims" p4b_barrier_claim_root )"
 [ "$_r" = "$WORK/abs-claims" ] || bad="$bad absolute-override=$_r"
@@ -3167,8 +3181,24 @@ _r="$( P4B_CLAIM_DIR="$WORK/abs-claims" p4b_barrier_claim_root )"
 # closed in a configuration that has always worked.
 _r="$( ( unset P4B_CLAIM_DIR XDG_STATE_HOME HOME; P4B_ACCT_STATE_DIR="$WORK/nohome-state" p4b_barrier_claim_root ) )"
 [ "$_r" = "$WORK/nohome-state" ] || bad="$bad homeless-root=$_r"
+# ...and P4B_ACCT_STATE_DIR is operator-supplied too, so a relative one is
+# ignored on that branch as well and the repo-root default decides. That
+# default is absolute by construction (`cd -P` in p4b_repo_root), which is what
+# keeps the last branch honest (CodeRabbit round 2, Codex P2 round 2).
+_r="$( ( cd "$WORK" && unset P4B_CLAIM_DIR XDG_STATE_HOME HOME; P4B_ACCT_STATE_DIR=rel-state p4b_barrier_claim_root ) )"
+case "$_r" in
+  /*/.mergepath) ;;
+  *) bad="$bad homeless-relative-root=$_r" ;;
+esac
+# The repo slug is injective: two DISTINCT repos that a `/`→`-` flattening
+# collapsed onto one slug must reach two different claim paths, or one run
+# declines on the other repository's live claim under the now-shared root
+# (Codex P2, round 2).
+_p1="$( P4B_CLAIM_DIR="$WORK/abs-claims" p4b_barrier_claim_path foo-bar/baz 3 k trigger )"
+_p2="$( P4B_CLAIM_DIR="$WORK/abs-claims" p4b_barrier_claim_path foo/bar-baz 3 k trigger )"
+[ "$_p1" != "$_p2" ] || bad="$bad repo-slug-collision=$_p1"
 if [ -z "$bad" ]; then
-  pass "#858: the claim root is per-user, per-HOST and always absolute; relative XDG is ignored and a homeless run falls back"
+  pass "#858: the claim root is per-user, per-HOST and absolute on every branch; every relative operator value is ignored; the repo slug is injective"
 else
   fail "#858: claim root resolution wrong:$bad"
 fi
@@ -3202,7 +3232,11 @@ _write() { # <kind> <key> [dry]
     p4b_barrier_maybe_write "$1" owner/repo 7 "$2" rev-bot "${3:-false}"
   )
 }
-_wp_claim() { printf '%s/phase-4b-barrier/owner-repo-pr7-%s.%s.claim' "$WORK/wp-claims" "$1" "${2:-trigger}"; }
+# Ask the library for the path rather than re-spelling its format here
+# (CodeRabbit, round 2): a hand-written copy turns a format change into a
+# poll-loop timeout reported as "claim never observed", which names the wrong
+# cause. p4b_barrier_claim_path owns the one spelling.
+_wp_claim() { ( P4B_CLAIM_DIR="$WORK/wp-claims" p4b_barrier_claim_path owner/repo 7 "$1" "${2:-trigger}" ); }
 
 # Two concurrent invocations on one head. A takes the claim and blocks inside
 # the claimed region (the gh stub waits for wp-go); the test starts B only
@@ -3247,7 +3281,7 @@ bad=""
 _paused_probe() { # <pause_id> <fresh_at>
   printf '{"probe":{"observed":"paused"},"review":{"id":%s,"fresh_at":"%s"}}' "$1" "$2"
 }
-_resume() { # <head> <pause_id> <fresh_at>
+_resume_bg() { # <head> <pause_id> <fresh_at> — the CROSS-HEAD race helper.
   (
     export P4B_ACCT_STATE_DIR="$WORK/wp-state"
     export P4B_CLAIM_DIR="$WORK/wp-claims"
@@ -3257,7 +3291,7 @@ _resume() { # <head> <pause_id> <fresh_at>
   )
 }
 rm -f "$WORK/wp-go"; : >"$WORK/wp-hold"
-_resume oldhead 771 2026-01-01T00:00:00Z >"$WORK/wp-out-r-old" &
+_resume_bg oldhead 771 2026-01-01T00:00:00Z >"$WORK/wp-out-r-old" &
 _wp_a=$!
 _n=0
 while [ ! -d "$(_wp_claim pause-771 resume)" ] && [ "$_n" -lt 100 ]; do
@@ -3266,7 +3300,7 @@ done
 [ -d "$(_wp_claim pause-771 resume)" ] || bad="$bad note-level-claim-never-observed"
 # A head-scoped claim would leave this path free and let the second run in.
 [ ! -d "$(_wp_claim pause-771-newhead resume)" ] || bad="$bad claim-was-head-scoped"
-_resume newhead 771 2026-01-01T00:00:00Z >"$WORK/wp-out-r-new" &
+_resume_bg newhead 771 2026-01-01T00:00:00Z >"$WORK/wp-out-r-new" &
 _wp_b=$!
 wait "$_wp_b" || true
 : >"$WORK/wp-go"
@@ -3379,6 +3413,21 @@ jq -n --arg m "$(p4b_barrier_marker resume pause-771)" \
   >"$WORK/wp-comments.json"
 : >"$WORK/wp-writes.log"
 [ "$(_resume "$(_pj paused 771)")" = "already-resumed" ] || bad="$bad legacy-marker-missed"
+# ...and the OTHER direction, pinned because it is a decision rather than an
+# oversight (Codex P2, round 2). A legacy marker OLDER than the note's current
+# fresh_at does NOT count, so an in-place edit during the upgrade window buys
+# one more resume. Exempting the legacy arm from the floor would suppress that
+# resume — but a legacy marker carries no head and no episode, so the exemption
+# is at-most-once-per-note-id-forever, which is #862's original defect: a note
+# genuinely re-paused after the marker was written would never be answered and
+# the bound would page a human. #862 ranks a missed resume above a duplicated
+# one, so the floor stays and the duplicate is the priced side. Bounded at one
+# per head, and only on a PR that straddles the upgrade.
+jq -n --arg m "$(p4b_barrier_marker resume pause-771)" \
+  '[{user:{login:"rev-bot"},created_at:"2026-06-04T11:59:00Z",body:($m+"\n\n@coderabbitai resume")}]' \
+  >"$WORK/wp-comments.json"
+: >"$WORK/wp-writes.log"
+[ "$(_resume "$(_pj paused 771)")" = "resumed" ] || bad="$bad legacy-marker-exempted-from-floor"
 # A spent pause note stays spent within its OWN episode — and note this
 # marker's created_at TIES the note's fresh_at, which is why the family arm
 # compares `>=` and not `>`: GitHub timestamps carry second precision, so our
