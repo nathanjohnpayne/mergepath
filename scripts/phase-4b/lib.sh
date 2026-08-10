@@ -411,13 +411,55 @@ p4b_barrier_marker_path() {  # <repo> <pr> <head>
     "$state" "$repo_slug" "${2:-0}" "${3:-nohead}"
 }
 
+# p4b_barrier_canon_epoch <raw>
+# Print <raw> as a plain base-10 integer usable in BOTH `[ -gt ]` and `$(( ))`,
+# or print nothing and return 1 when it is not (#840).
+#
+# "Digit-only" is not enough, because the two readers disagree on a digit run
+# that is not canonical decimal. `[ -gt ]` parses base 10 always; `$(( ))`
+# reads a leading zero as OCTAL. So a marker of `0755` compares as 755 and
+# subtracts as 493 — measured on origin/main as an elapsed of ~1.79e9 seconds,
+# which exhausts any budget on the first read and hands every retry to a human.
+# `0899` is not a legal octal literal at all: the arithmetic expansion fails
+# outright ("value too great for base") and note_pending returns non-zero with
+# no elapsed. And a digit run wider than int64 makes `[ -gt ]` error with
+# "integer expression expected" while `$(( ))` wraps to a NEGATIVE elapsed,
+# which reads as "barely started" and leaves the wait unbounded.
+#
+# Stripping the leading zeros makes both readers agree on base 10; the width
+# cap keeps every later comparison total. 18 digits is the widest run that
+# cannot overflow a signed 64-bit integer, and anything that wide is still
+# accepted as a value — it simply lands in the future-dated repair branch,
+# which is the conservative direction.
+p4b_barrier_canon_epoch() {
+  local raw="${1:-}" stripped
+  case "$raw" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  stripped="${raw#"${raw%%[!0]*}"}"
+  [ -n "$stripped" ] || stripped=0
+  [ "${#stripped}" -le 18 ] || return 1
+  printf '%s' "$stripped"
+}
+
+# Plausibility floor for a marker epoch. Canonicalising `0755` to 755 makes the
+# two readers AGREE, but they agree on a 1970 timestamp: elapsed comes out near
+# 1.79e9 seconds, every budget is exhausted on the first read, and the barrier
+# pages a human on a corrupt file — forever, because nothing repairs it. So the
+# range check is the other half of #840, not a nicety. Any marker this code
+# wrote came from `date +%s`, so a value below 2001-09-09 cannot be one; the
+# floor is far under every real timestamp and far over every artefact of the
+# short-digit corruption class. The too-NEW side needs no constant: a
+# future-dated value is already repaired by the clock-skew branch below.
+P4B_BARRIER_MIN_EPOCH=1000000000
+
 # p4b_barrier_note_pending <repo> <pr> <head>
 # Record the first not-yet for this head and print the seconds elapsed since
 # it. Prints 0 on the first observation. Advisory: if the state dir cannot be
 # written the wait simply never accumulates, so the barrier keeps returning
 # pending rather than escalating early — the safe direction.
 p4b_barrier_note_pending() {
-  local marker started now
+  local marker started now canon
   marker="$(p4b_barrier_marker_path "$1" "$2" "$3")"
   now="$(date +%s)"
   if [ -f "$marker" ]; then
@@ -427,18 +469,20 @@ p4b_barrier_note_pending() {
     printf '%s\n' "$now" >"$marker" 2>/dev/null || true
     started="$now"
   fi
-  case "$started" in
-    ''|*[!0-9]*)
-      # A crash or partial write can leave the marker empty or non-numeric.
-      # Returning 0 without repairing it means every later one-shot invocation
-      # reads the same invalid value, reports zero elapsed again, and the
-      # bounded retry never exhausts — so the manual fallback is never reached
-      # and the wait is unbounded in practice. Reinitialize instead.
-      printf '%s\n' "$now" >"$marker" 2>/dev/null || true
-      printf '0'
-      return 0
-      ;;
-  esac
+  canon="$(p4b_barrier_canon_epoch "$started" 2>/dev/null || true)"
+  if [ -z "$canon" ] || [ "$canon" -lt "$P4B_BARRIER_MIN_EPOCH" ]; then
+    # A crash or partial write can leave the marker empty, non-numeric, a digit
+    # run the two readers disagree on, or a value no clock could have produced
+    # (#840). Returning 0 without repairing it means every later one-shot
+    # invocation reads the same invalid value, reports the same nonsense
+    # elapsed, and the bound never behaves — either the manual fallback is
+    # never reached (wait unbounded) or it is reached immediately on every
+    # retry (a human paged for a corrupt file). Reinitialize instead.
+    printf '%s\n' "$now" >"$marker" 2>/dev/null || true
+    printf '0'
+    return 0
+  fi
+  started="$canon"
   if [ "$started" -gt "$now" ]; then
     # Future-dated marker (clock skew or tampering): treat as fresh rather
     # than producing a negative elapsed, so the budget restarts. Rewrite it,
@@ -451,13 +495,135 @@ p4b_barrier_note_pending() {
   printf '%s' "$(( now - started ))"
 }
 
-# p4b_barrier_claim_path <repo> <pr> <head> <kind>
-# Sibling of the pending marker, one path per write class so a resume claim
-# and a trigger claim can never be read for one another (#846, #847).
+# p4b_barrier_claim_root
+# Where claims live. Deliberately NOT the checkout's state dir (#858): the
+# pending marker measures how long THIS checkout has waited and is rightly
+# per-checkout, but a claim is a reservation over a shared external resource —
+# the PR timeline — so scoping it to the checkout serialized nothing between
+# two Phase 4b invocations run from two trusted checkouts, and both posted.
+#
+# Per-user, per-HOST, checkout-independent. The host component is load-bearing
+# rather than cosmetic: ownership is a PID (below), and PIDs are comparable
+# only within one machine. On a networked or synced home directory a bare
+# shared root would let machine B read machine A's live PID, find some
+# unrelated local process alive at that number, and decline forever — or find
+# it dead and steal a live claim. Keying the root by host keeps the PID test
+# meaning what it says, at the cost of not coordinating across machines, where
+# no filesystem lock could have coordinated anyway.
+#
+# Falls back to the old per-checkout location only when there is no home to
+# anchor on, which preserves today's behaviour rather than failing closed in a
+# configuration that has always worked.
+#
+# Residue: a process killed inside the region strands one directory holding one
+# pid file. It is reaped by the next claimant on the same key, so an active key
+# self-heals; a key never revisited (an old PR head) just leaves the empty pair
+# behind. The whole root is safe to delete when no Phase 4b run is in flight —
+# the durable record of what was posted is the timeline marker, never a claim.
+#
+# EVERY branch is ABSOLUTE BY CONSTRUCTION: each `printf` is either guarded by
+# a `/*` case or derived from `p4b_repo_root`, which resolves through `cd -P`.
+#
+# A RELATIVE operator-supplied root is IGNORED rather than used, and the next
+# branch decides. This is the one treatment that keeps the guarantee #858 is
+# about. Anchoring a relative root at `$PWD` — the intermediate shape this
+# function briefly carried — makes it absolute without making it
+# checkout-independent: two invocations started from two directories still
+# expand the same relative override to two different roots, which is the split
+# reintroduced through an operator-supplied directory instead of through the
+# default (CodeRabbit round 1 asked for reject-or-absolutise; Codex P2 round 2
+# showed that absolutise-at-cwd is not enough, and both are satisfied by
+# ignoring). It also matches what the XDG base-directory spec already requires
+# of a reader for a relative `XDG_STATE_HOME`, so all three variables now obey
+# one rule instead of three.
+#
+# Falling through is safe in every direction: an ignored `P4B_CLAIM_DIR` lands
+# on the shared per-user root, which is *more* serialized than what the
+# operator asked for, never less.
+#
+# An override chooses the BASE, never the host scoping — see the comment on the
+# host component below.
+p4b_barrier_claim_root() {
+  local base host
+  # Pick the BASE. Each branch is absolute or it does not win.
+  base=""
+  case "${P4B_CLAIM_DIR:-}" in /*) base="$P4B_CLAIM_DIR" ;; esac
+  if [ -z "$base" ]; then
+    case "${XDG_STATE_HOME:-}" in /*) base="$XDG_STATE_HOME/mergepath/write-claims" ;; esac
+  fi
+  if [ -z "$base" ]; then
+    case "${HOME:-}" in /*) base="$HOME/.local/state/mergepath/write-claims" ;; esac
+  fi
+  if [ -z "$base" ]; then
+    # No home to anchor on: today's per-checkout location.
+    case "${P4B_ACCT_STATE_DIR:-}" in
+      /*) base="$P4B_ACCT_STATE_DIR" ;;
+      *)  base="$(p4b_repo_root)/.mergepath" ;;
+    esac
+  fi
+  # The host component belongs to the CLAIM NAMESPACE, not to the base, so it
+  # is appended on every branch including an explicit override (Codex P2, round
+  # 3). Ownership is a machine-local PID; point the override at NFS or a synced
+  # directory and, without this, host B reads host A's live PID, finds some
+  # unrelated local process at that number and either reaps a live claim or
+  # holds the barrier against a dead one. Host-scoping declines to coordinate
+  # across machines — which no filesystem lock over PIDs could have done
+  # anyway — instead of coordinating them wrongly.
+  host="$(uname -n 2>/dev/null || true)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || true)"
+  printf '%s/%s' "$base" "${host:-localhost}"
+}
+
+# p4b_barrier_claim_path <repo> <pr> <key> <kind>
+# One path per (repo, PR, key, write class) so a resume claim and a trigger
+# claim can never be read for one another (#846, #847), under the shared root
+# above so every checkout on this machine contends for the same one (#858).
+#
+# The repo slug is INJECTIVE (Codex P2, round 2). `tr '/' '-'` mapped
+# `foo-bar/baz` and `foo/bar-baz` onto one slug — harmless while claims lived
+# under the checkout's own state dir, and newly reachable now that #858 puts
+# every repo on this machine under one root, where a collision lets one run
+# decline or reap another repository's live claim. `%` is not a legal character
+# in a GitHub owner or repository name, so `/` → `%2F` cannot be forged by any
+# real slug and the encoding is reversible. Claims carry no durable meaning —
+# the record of what was posted is the timeline marker — so re-spelling the
+# path costs nothing beyond one stranded empty directory per in-flight run.
+#
+# Case is CANONICALISED first (Codex P2, round 3). GitHub repository identity
+# is case-insensitive, so `--repo Owner/Repo` and `--repo owner/repo` name one
+# repository and must reserve one claim; on a case-sensitive filesystem they
+# otherwise took two directories and both entered the region. Folding case is
+# not a loss of injectivity for the same reason it is needed — the spellings it
+# merges are the same repository.
 p4b_barrier_claim_path() {
-  local base
-  base="$(p4b_barrier_marker_path "$1" "$2" "$3")"
-  printf '%s.%s.claim' "${base%.pending}" "${4:-trigger}"
+  local repo_slug
+  repo_slug="$(printf '%s' "${1:-unknown}" | tr 'A-Z' 'a-z' | sed 's|/|%2F|g')"
+  printf '%s/phase-4b-barrier/%s-pr%s-%s.%s.claim' \
+    "$(p4b_barrier_claim_root)" "$repo_slug" "${2:-0}" "${3:-nohead}" "${4:-trigger}"
+}
+
+# p4b_barrier_self_pid — sets P4B_SELF_PID to the PID of the process executing
+# THIS shell, which inside a subshell is not `$$`.
+#
+# Sets a variable rather than printing, deliberately: reading it back through
+# `$(p4b_barrier_self_pid)` would fork one more subshell and measure THAT one,
+# reintroducing the very misattribution this closes.
+#
+# Bash 3.2 — the macOS system shell and this library's stated portability floor
+# — has no BASHPID, so `${BASHPID:-$$}` alone would leave every macOS run with
+# the defect. A command substitution forks exactly one child and execs the
+# simple command inside it, so that child's PPID is this shell: the value
+# BASHPID would have printed. Measured on 3.2.57 against a background
+# subshell's own `$!`. `$$` stays the last resort, which is today's behaviour.
+p4b_barrier_self_pid() {
+  if [ -n "${BASHPID:-}" ]; then
+    P4B_SELF_PID="$BASHPID"
+    return 0
+  fi
+  P4B_SELF_PID="$(exec sh -c 'echo $PPID' 2>/dev/null)" || P4B_SELF_PID=''
+  case "$P4B_SELF_PID" in
+    ''|*[!0-9]*) P4B_SELF_PID="$$" ;;
+  esac
 }
 
 # p4b_barrier_claim <path>
@@ -470,13 +636,35 @@ p4b_barrier_claim_path() {
 # Deliberately no timestamp and no clock-based stale-breaking: every such
 # rule either steals a live claim (two writes — the failure this exists to
 # prevent) or strands a second one. Ownership is the winner's PID instead:
-# claims are per-checkout by construction, so a recorded owner that is no
-# longer alive on this machine proves abandonment, and only the NEXT claimant
-# breaks it — never any concurrent evaluation. A clear_pending that removed
-# claims was the round-1 defect here: an open or drift outcome in one
-# invocation deleted another invocation's LIVE claim mid-region, and a third
-# retry could then re-claim and double-post.
+# claims are per-HOST by construction (see p4b_barrier_claim_root), so a
+# recorded owner that is no longer alive on this machine proves abandonment,
+# and only the NEXT claimant breaks it — never any concurrent evaluation. A
+# clear_pending that removed claims was the round-1 defect here: an open or
+# drift outcome in one invocation deleted another invocation's LIVE claim
+# mid-region, and a third retry could then re-claim and double-post.
+#
+# The owner recorded is BASHPID, not `$$` (#859). `$$` is the PID of the
+# shell that STARTED bash and does not change inside a subshell, and every
+# caller reaches this through `out="$(p4b_barrier_maybe_write …)"` — a command
+# substitution, hence a subshell. Recording `$$` therefore named a process
+# that is not the one executing the claimed region, and got the liveness test
+# backwards in both directions: when the subshell died the parent stayed
+# alive, so the claim read as held and NO later claimant could ever reap it;
+# and when the parent died first the claim read as abandoned, so another
+# caller could reap it while the original subshell was still mid-post — then
+# the original's release deleted the successor's live claim. BASHPID names the
+# process actually inside the region — see p4b_barrier_self_pid above, which
+# obtains it on bash 3.2 too.
 p4b_barrier_claim() {
+  # Resolve the owner BEFORE the mkdir gate. A claim directory whose pid file
+  # is not yet written reads as ownerless, and ownerless is unreclaimable by
+  # construction (below: an unparseable owner declines, and release refuses a
+  # claim it does not own) — a permanently stuck key, which is fail-closed but
+  # still a stuck key. On bash 3.2 the lookup forks a subshell and costs ~34x a
+  # BASHPID read, so doing it after mkdir would widen that window by the same
+  # factor for exactly no benefit: the value is a property of THIS shell and
+  # does not depend on winning. Ordered this way the window is one printf.
+  p4b_barrier_self_pid
   mkdir -p "$(dirname "$1")" 2>/dev/null || return 1
   if ! mkdir "$1" 2>/dev/null; then
     local owner
@@ -506,10 +694,25 @@ p4b_barrier_claim() {
     fi
     rmdir "$1.reaplock" 2>/dev/null || true
   fi
-  printf '%s\n' "$$" >"$1/pid" 2>/dev/null || { rm -rf "$1" 2>/dev/null; return 1; }
+  printf '%s\n' "$P4B_SELF_PID" >"$1/pid" 2>/dev/null || { rm -rf "$1" 2>/dev/null; return 1; }
 }
 
-p4b_barrier_release() { rm -rf "${1:?}" 2>/dev/null || true; }
+# p4b_barrier_release [path]
+# Release a claim THIS process holds. Ownership-aware (#859): a claim whose
+# recorded owner is not us belongs to a successor that reaped our abandoned
+# claim, and removing it would drop a live reservation mid-write — the exact
+# double-post the claim exists to prevent. A foreign or missing owner is left
+# alone; the next claimant's dead-owner check is what reclaims it. An EMPTY
+# path is a no-op, not an error: a dry run takes no claim and still runs the
+# same release path. The ownership test is also what makes `rm -rf` safe here
+# — it can only match a directory this process created.
+p4b_barrier_release() {
+  local path="${1:-}"
+  [ -n "$path" ] || return 0
+  p4b_barrier_self_pid
+  [ "$(cat "$path/pid" 2>/dev/null || true)" = "$P4B_SELF_PID" ] || return 0
+  rm -rf "$path" 2>/dev/null || true
+}
 
 # p4b_barrier_clear_pending <repo> <pr> <head>
 # Drop the marker only. Called on every non-not-yet outcome so a later
@@ -540,6 +743,15 @@ p4b_barrier_clear_pending() {
 # to conserve. The probe cannot close it either: between posting and
 # CodeRabbit reacting, observed is still `none`, which is the same sub-minute
 # race that produced two @codex review triggers on #820.
+# p4b_barrier_marker_prefix <kind> <key>
+# The marker without its closing delimiter, so a family of keys sharing a
+# prefix can be matched with one `contains`. Sole definition of the marker
+# spelling — p4b_barrier_marker closes it — because a second copy of the
+# format string is a second thing to keep in sync with live PR bodies.
+p4b_barrier_marker_prefix() {
+  printf '<!-- mergepath-coderabbit-%s:%s' "${1:-trigger}" "${2:-nohead}"
+}
+
 # p4b_barrier_marker <kind> <head>   kind ∈ trigger | resume
 # Two write classes, two markers (#847). A resume satisfying the trigger's
 # "already spent" test would suppress the review request for this head
@@ -547,7 +759,7 @@ p4b_barrier_clear_pending() {
 # The trigger spelling is kept byte-identical to the pre-#847 literal — live
 # PRs already carry it.
 p4b_barrier_marker() {
-  printf '<!-- mergepath-coderabbit-%s:%s -->' "${1:-trigger}" "${2:-nohead}"
+  printf '%s -->' "$(p4b_barrier_marker_prefix "${1:-trigger}" "${2:-nohead}")"
 }
 
 p4b_barrier_trigger_marker() {
@@ -562,7 +774,7 @@ p4b_barrier_trigger_posted() {
   p4b_barrier_write_posted trigger "$1" "$2" "$3"
 }
 
-# p4b_barrier_write_count <kind> <key> <reviewer_login> <issue_comments_json> [bare_since]
+# p4b_barrier_write_count <kind> <key> <reviewer_login> <issue_comments_json> [since] [family_key]
 # Prints how many spent-marks of this kind the reviewer identity has on the
 # timeline for this key. Author-scoped for the same reason the boolean was;
 # the count costs nothing extra (same read) and makes a cross-checkout
@@ -570,18 +782,58 @@ p4b_barrier_trigger_posted() {
 # as `already-…-duplicate` instead of silently indistinguishable from the
 # normal already-spent case.
 #
+# THE MARKER ARM HAS TWO HALVES when a <family_key> is given (the resume kind
+# — see p4b_barrier_maybe_resume for how the two keys are formed):
+#
+#   exact <key>   — counted regardless of age. <key> pins the pause note AND
+#                   the head, and re-pausing costs the bot new reviewed
+#                   commits, which costs a new head, so within one head our
+#                   own marked resume is unconditionally the answer to this
+#                   note. This half is what makes the dedup idempotent across
+#                   an IN-PLACE EDIT of the note: CodeRabbit edits one pause
+#                   comment (a Finishing-Touches checkbox tick bumps it) and
+#                   every freshness-derived identity — a fresh_at in the key,
+#                   or a fresh_at conjunct on its own — mints a new episode on
+#                   each edit and posts again. The head does not move when the
+#                   note is edited, so this half cannot be bumped that way.
+#   <family_key>  — any marked resume for the SAME pause note under a
+#                   different head, counted only when it was created at or
+#                   after <since> (the note's CodeRabbit-owned fresh_at). This
+#                   is #862's second remedy and it carries the cross-head
+#                   dedup round 1 asked for: a standing pause note that has
+#                   not changed since we answered it is still answered, so a
+#                   Codex-forced push does not buy a second resume, while a
+#                   note REWRITTEN after our resume (the new pause episode
+#                   #862 is about) is not, and the recovery fires again. `>=`,
+#                   not `>`: second-precision timestamps let our own resume
+#                   tie the note it answers, and a tie is an answer.
+#                   With <since> empty — a note whose freshness we could not
+#                   read — the family counts unconditionally, i.e. the
+#                   historical at-most-once per note id, which spends nothing.
+#
+# <family_key> MUST end with the key separator (`pause-771-`, never
+# `pause-771`): the family is matched as a marker PREFIX, and the separator is
+# what stops note 771's family from also matching note 7710's keys. The family
+# match additionally accepts the pre-#862 id-only marker spelling — the family
+# key minus that trailing separator — so a PR already carrying one from an
+# earlier run is not resumed a second time on the first run after this ships.
+#
+# Residual, deliberately: a new head PLUS an in-place edit of a standing note
+# satisfies neither half and buys one extra resume — bounded at one per head,
+# where the pre-fix shape was one per edit.
+#
 # For the resume kind, a BARE `@<bot> resume` first line also counts when it
-# was created at or after <bare_since> (the pause note's CodeRabbit-owned
-# fresh_at): coderabbit-wait.sh's own pause recovery posts exactly that body
-# with no marker, and two dedup vocabularies that cannot read each other's
-# writes double-post against one pause note (Codex P2, round 2). The episode
-# scoping keeps round 1's per-pause-note keying: an old episode's bare
-# resume predates the current note's fresh_at and does not suppress a new
-# recovery. Neither timestamp is pusher-controlled. STRICTLY later, not >=:
-# GitHub timestamps carry second precision, so a prior episode's resume can
-# tie the new note's fresh_at — counting it would leave the new pause
+# was created after <since>: coderabbit-wait.sh's own pause recovery posts
+# exactly that body with no marker, and two dedup vocabularies that cannot
+# read each other's writes double-post against one pause note (Codex P2,
+# round 2). Neither timestamp is pusher-controlled. STRICTLY later here, not
+# >=: GitHub timestamps carry second precision, so a prior episode's resume
+# can tie the new note's fresh_at — counting it would leave the new pause
 # unrecovered until escalation, while not counting it risks at worst one
-# duplicate resume inside a one-second window (Codex P2, round 5).
+# duplicate resume inside a one-second window (Codex P2, round 5). The bare
+# form deliberately gets NO head-scoped half: it carries no pause-note id, so
+# a head-scoped bare resume would suppress every later pause note on that
+# same head.
 #
 # Author scope: the marker arm stays pinned to the SELECTED reviewer — the
 # marker proves this automation spent the key. The bare arm accepts every
@@ -591,8 +843,14 @@ p4b_barrier_trigger_posted() {
 # session's), and a single-identity filter posts a second resume over it
 # (Codex P2, round 3).
 p4b_barrier_write_count() {
-  local m trusted bot
+  local m fam legacy trusted bot
   m="$(p4b_barrier_marker "$1" "$2")"
+  fam=""
+  legacy=""
+  if [ -n "${6:-}" ]; then
+    fam="$(p4b_barrier_marker_prefix "$1" "$6")"
+    legacy="$(p4b_barrier_marker "$1" "${6%-}")"
+  fi
   trusted="$(p4b_available_reviewers 2>/dev/null | jq -R . 2>/dev/null | jq -sc . 2>/dev/null || printf '[]')"
   case "$trusted" in '['*) ;; *) trusted='[]' ;; esac
   # The bare form is the CONFIGURED bot's exact command, compared as a string
@@ -602,10 +860,16 @@ p4b_barrier_write_count() {
   bot="$(p4b_policy_block_field coderabbit bot_login)"
   bot="${bot:-coderabbitai}"
   bot="${bot%\[bot\]}"
-  printf '%s' "${4:-[]}" | jq --arg m "$m" --arg who "${3:-}" --arg since "${5:-}" \
+  printf '%s' "${4:-[]}" | jq --arg m "$m" --arg fam "$fam" --arg legacy "$legacy" \
+    --arg who "${3:-}" --arg since "${5:-}" \
     --arg cmd "@${bot} resume" --argjson revs "$trusted" '
     [.[]? | select(
-        (((.user.login // "") == $who) and ((.body // "") | contains($m)))
+        (((.user.login // "") == $who)
+         and (((.body // "") | contains($m))
+              or ($fam != ""
+                  and (((.body // "") | contains($fam))
+                       or ((.body // "") | contains($legacy)))
+                  and ($since == "" or ((.created_at // "") >= $since)))))
         or ($since != ""
             and ((.user.login // "") as $l | (($l == $who) or ($revs | index($l) != null)))
             and ((.created_at // "") > $since)
@@ -681,10 +945,22 @@ p4b_barrier_post_trigger() {
   return "$rc"
 }
 
-# p4b_barrier_maybe_write <kind> <repo> <pr> <key> <reviewer> <dry_run> [bare_since]
+# p4b_barrier_maybe_write <kind> <repo> <pr> <key> <reviewer> <dry_run> [since] [family_key] [claim_key]
 # claim -> read -> dedup -> post at most once, for either write class. Prints
 # the action taken; never fails the caller, because a write that could not be
 # posted still leaves the bounded retry and the human escalation behind it.
+#
+# <claim_key> defaults to <key> and exists because the MARKER key and the
+# MUTUAL-EXCLUSION key answer different questions (Codex P1, round 1). The
+# marker records which episode was answered; the claim reserves the right to
+# post at all. Scoping the claim by anything finer than the resource being
+# reserved silently unserializes concurrent writers: an old-head run that
+# already probed a pause and a new-head run started after a push hold two
+# different claims, both read the timeline before either comment is visible,
+# and both post — the marker scan only dedups writes that have LANDED. The
+# resume class therefore claims at pause-note level while marking per head; the
+# trigger class reserves one request per head, which is what its key already
+# names, so it passes nothing and the default keeps today's behaviour.
 #
 # The claim wraps the WHOLE read-and-post region (#846): the read and the post
 # were not atomic, so two overlapping invocations for the same head could both
@@ -695,11 +971,21 @@ p4b_barrier_post_trigger() {
 # by nothing — the timeline marker stays the only durable account of what was
 # posted, so over-spend is never traded for starvation: a failed post releases
 # the claim and the next bounded retry re-attempts.
+#
+# A DRY RUN takes no claim. The claim reserves the right to POST, and a dry run
+# never posts; now that the root is shared across checkouts (#858) rather than
+# private to one, a rehearsal that claimed would make a concurrent REAL run
+# decline. phase-4b-review.sh already goes to explicit lengths to keep dry-run
+# state out of real state (Codex P2 on #842) and this is the same rule for the
+# same reason.
 p4b_barrier_maybe_write() {
-  local kind="$1" repo="$2" pr="$3" key="$4" reviewer="$5" dry="${6:-false}" bare_since="${7:-}"
-  local claim comments raw n out
-  claim="$(p4b_barrier_claim_path "$repo" "$pr" "$key" "$kind")"
-  p4b_barrier_claim "$claim" || { printf '%s-claim-declined' "$kind"; return 0; }
+  local kind="$1" repo="$2" pr="$3" key="$4" reviewer="$5" dry="${6:-false}" since="${7:-}" family="${8:-}"
+  local claim_key="${9:-$4}"
+  local claim="" comments raw n out
+  if [ "$dry" != true ]; then
+    claim="$(p4b_barrier_claim_path "$repo" "$pr" "$claim_key" "$kind")"
+    p4b_barrier_claim "$claim" || { printf '%s-claim-declined' "$kind"; return 0; }
+  fi
   # Re-read the timeline rather than trusting process state: the bounded retry
   # runs as a fresh one-shot process each time, so "already spent" has to be
   # durable in the PR itself.
@@ -720,7 +1006,7 @@ p4b_barrier_maybe_write() {
     '['*) ;;
     *) p4b_barrier_release "$claim"; printf '%s-read-failed' "$kind"; return 0 ;;
   esac
-  n="$(p4b_barrier_write_count "$kind" "$key" "$reviewer" "$comments" "$bare_since")"
+  n="$(p4b_barrier_write_count "$kind" "$key" "$reviewer" "$comments" "$since" "$family")"
   if [ "$n" -gt 1 ]; then
     # Two markers can only mean two checkouts raced before this change, or a
     # write reported failed actually landed and was retried. Surfaced, not
@@ -764,12 +1050,13 @@ p4b_barrier_maybe_trigger() {
 # p4b_barrier_maybe_resume <repo> <pr> <head> <reviewer> <probe_json> <dry_run>
 # The pause recovery (#847): on observed=paused, post `@<bot> resume` at most
 # once per PAUSE EVENT, deduplicated by its own timeline marker so a resume
-# and the review trigger can never be confused for one another. The dedup
-# keys on the pause notice's comment id, not the head (Codex P2, round 1): a
-# pause is PR-level and durable across pushes, so a per-head key would post
-# one resume per Codex-forced push while the same pause note stands. The
-# comment id is CodeRabbit-owned and carried in the probe's evidence; a
-# paused observation without one declines rather than guessing a key.
+# and the review trigger can never be confused for one another. The pause
+# notice's comment id is the anchor of both keys below, never the head alone
+# (Codex P2, round 1): a pause is PR-level and durable across pushes, so a
+# per-head key would post one resume per Codex-forced push while the same
+# pause note stands. The comment id is CodeRabbit-owned and carried in the
+# probe's evidence; a paused observation without one declines rather than
+# guessing a key.
 #
 # The barrier posts the resume itself rather than delegating to
 # coderabbit-wait.sh's polling mode: delegation would need new
@@ -784,7 +1071,7 @@ p4b_barrier_maybe_trigger() {
 # would have made.
 p4b_barrier_maybe_resume() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" json="$5" dry="${6:-false}"
-  local observed pause_id pause_fresh out
+  local observed pause_id pause_fresh pause_key pause_family out
   observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
   [ "$observed" = paused ] || { printf 'skipped'; return 0; }
   pause_id="$(printf '%s' "$json" | jq -r '.review.id // empty' 2>/dev/null || true)"
@@ -793,10 +1080,43 @@ p4b_barrier_maybe_resume() {
   esac
   # The pause key rides the same argument slot the trigger uses for the head:
   # it keys the claim, the marker, and nothing else, so one write core serves
-  # both classes unchanged. The note's fresh_at scopes the bare-form interop
-  # dedup to this pause episode — see p4b_barrier_write_count.
+  # both classes unchanged. The note's fresh_at scopes the family and the
+  # bare-form interop dedup — see p4b_barrier_write_count.
   pause_fresh="$(printf '%s' "$json" | jq -r '.review.fresh_at // .review.updated_at // .review.created_at // empty' 2>/dev/null || true)"
-  out="$(p4b_barrier_maybe_write resume "$repo" "$pr" "pause-$pause_id" "$reviewer" "$dry" "$pause_fresh")"
+  # TWO keys, not one (#862 and its regression). The EXACT key is the note id
+  # plus the head; the FAMILY is every key for that note id under any head.
+  #
+  # The exact key is what makes the recovery idempotent inside one pause
+  # episode. Anything derived from the note's freshness is not: CodeRabbit
+  # edits ONE pause comment in place — coderabbit-wait.sh documents the same
+  # behaviour for its summary — so a Finishing-Touches checkbox tick bumps
+  # fresh_at with no new pause, and a fresh_at-derived key (or a bare
+  # fresh_at conjunct) reads every such edit as a new episode and resumes
+  # again, once per edit, against the five-per-hour allowance the marker
+  # exists to conserve. The head cannot be bumped that way, and re-pausing
+  # costs the bot new reviewed commits, which costs a new head — so "same
+  # note, same head" is exactly "no new episode since we answered".
+  #
+  # The family carries the cross-head half round 1 asked for: a standing note
+  # unchanged since our resume is still answered by it, so a Codex-forced
+  # push buys no second resume, while a note rewritten AFTER our resume is a
+  # new episode and the recovery fires. That freshness test lives on the
+  # family arm, where a `>=` comparison is safe, rather than in the key.
+  #
+  # A note with no usable timestamp collapses to the historical at-most-once
+  # per note id: the family then counts unconditionally.
+  #
+  # The CLAIM is keyed on the pause note ALONE, deliberately not on the exact
+  # key (Codex P1, round 1). The marker is per episode, but the thing being
+  # reserved is "the right to post a resume for this note", which is not
+  # per-head: an old-head bounded retry and a new-head run started after a push
+  # overlap routinely, and two head-scoped claims let both read the timeline
+  # before either comment lands and both post. Claiming at note level restores
+  # the pre-#862 mutual exclusion — the loser declines and, on its next retry,
+  # counts the winner's marker through the family arm.
+  pause_key="pause-$pause_id-${head:-nohead}"
+  pause_family="pause-$pause_id-"
+  out="$(p4b_barrier_maybe_write resume "$repo" "$pr" "$pause_key" "$reviewer" "$dry" "$pause_fresh" "$pause_family" "pause-$pause_id")"
   case "$out" in
     already-resume)           printf 'already-resumed' ;;
     already-resume-duplicate) printf 'already-resumed-duplicate' ;;
