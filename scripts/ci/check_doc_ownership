@@ -165,7 +165,17 @@ mp_markdown_renderable_text() {
     # characters (see list_marker_columns).
     BEGIN {
       SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BT = sprintf("%c", 96)
-      LIST_MARKER_CORE = "^([-+*]|[0-9]+[.)])"
+      # CommonMark 0.31.2 § List items bounds an ordered-list marker at
+      # "1-9 arabic digits". Spelled as nine optional digits rather than an
+      # {1,9} interval, which not every awk implementation supports — the
+      # same reason the numeric-reference length caps further down are
+      # tested with length(). Left unbounded, `1234567890.` reads as a
+      # marker and the phantom content column it creates suppresses the
+      # following continuation line as indented code; the spec makes that
+      # line ordinary paragraph text, so its link renders and check 10
+      # must still see it.
+      ORDERED_DIGITS = "[0-9][0-9]?[0-9]?[0-9]?[0-9]?[0-9]?[0-9]?[0-9]?[0-9]?"
+      LIST_MARKER_CORE = "^([-+*]|" ORDERED_DIGITS "[.)])"
       LIST_MARKER = LIST_MARKER_CORE "[[:space:]]+"
       BLOCK_TAGS = " address article aside base basefont blockquote body"
       BLOCK_TAGS = BLOCK_TAGS " caption center col colgroup dd details"
@@ -263,11 +273,21 @@ mp_markdown_renderable_text() {
     # following line against a list content column that does not exist, which
     # blanks rendered text as indented code: `Governance` then `2. # Notes`
     # then a seven-space link line is ONE paragraph and the link renders.
-    function can_interrupt_paragraph(s,   w, marker, rest) {
+    function can_interrupt_paragraph(s,   w, marker, rest, start) {
       if (!match(s, LIST_MARKER_CORE)) return 0
       w = RLENGTH
       marker = substr(s, 1, w)
-      if (marker ~ /^[0-9]+[.)]$/ && marker !~ /^1[.)]$/) return 0
+      # The spec restriction is on the START NUMBER — the marker digits READ
+      # AS A NUMBER — not on how those digits are spelled. `01.` and `1.`
+      # both start at 1 and both interrupt. Testing the literal spellings
+      # `1.`/`1)` instead rejected every leading-zero form: the paragraph
+      # stayed open, no item container was ever recorded, and the item
+      # content that followed was then measured against column zero and
+      # blanked as top-level indented code.
+      if (marker ~ /^[0-9]/) {
+        start = substr(marker, 1, w - 1)
+        if (start + 0 != 1) return 0
+      }
       rest = substr(s, w + 1)
       sub(/^[[:space:]]+/, "", rest)
       if (rest == "") return 0
@@ -373,7 +393,21 @@ mp_markdown_renderable_text() {
         cols = list_marker_columns(s, flow_column)
         # Reported back so the caller can measure indented code from the item
         # CONTENT column rather than from column zero.
+        #
+        # EVERY marker on the line records its own frame. `- - # inner`
+        # opens TWO items, and pushing only the summed column left the outer
+        # one with no frame at all: the first line that dedented out of the
+        # inner item popped the single frame and dropped straight to column
+        # zero, so the later prose of the outer item was measured against
+        # the top-level four-column threshold and blanked as code. The
+        # recorded value stays the RUNNING SUM rather than `flow_column`,
+        # because these columns are relative to the indent of the line
+        # itself — which the caller adds, and which `flow_column` has
+        # already absorbed along with any block-quote markers ahead of the
+        # list.
         marker_columns += cols
+        mc_n++
+        mc[mc_n] = marker_columns
         flow_column += cols
         # The wide-run and blank-marker cases above put the first child of the
         # item in an indented code block, or in no block at all; neither opens
@@ -512,15 +546,39 @@ mp_markdown_renderable_text() {
         text_flow_open = 0
       } else if (reference_continuation) {
         text_flow_open = 0
+      } else if (text_flow_open && col_indent >= code_column + 4) {
+        # Indented code cannot interrupt a paragraph, so while one is open
+        # a line this deep is lazy CONTINUATION TEXT — whatever block it
+        # may look like. The classifier below is handed the line with its
+        # indentation stripped and so cannot see the column at all, which
+        # is the whole question here: it read a four-space `- # Heading`
+        # under an open paragraph as a list starting there, closed the
+        # paragraph that was really still open, and blanked the
+        # continuation line after it as item code.
+        #
+        # The rule is one branch rather than a bullet-specific guard
+        # because it holds for every block shape. Verified against the
+        # reference parser with a paragraph open: at four columns past the
+        # container, a bullet, an ordered marker, an ATX heading, a
+        # thematic break, a block quote, a setext underline and an HTML
+        # block ALL stay paragraph text. The HTML block is the
+        # discriminating control — at three columns it does interrupt the
+        # paragraph and the link below it does not render, at four it does
+        # not interrupt and the link does.
+        text_flow_open = 1
       } else {
         flow_probe = line
         sub(/^[[:space:]]*/, "", flow_probe)
         marker_columns = 0
+        mc_n = 0
         flow_column = col_indent
         item_code_first = 0
         text_flow_open = opens_text_flow(flow_probe, text_flow_open)
-        if (marker_columns > 0) {
-          push_container(col_indent + marker_columns)
+        if (mc_n > 0) {
+          # Outermost frame first: each push pops the frames deeper than it,
+          # so replaying them in order rebuilds the WHOLE container stack the
+          # line opened rather than only its innermost item.
+          for (mc_i = 1; mc_i <= mc_n; mc_i++) push_container(col_indent + mc[mc_i])
         } else if (!text_flow_open) {
           # The pop above runs BEFORE the line is classified, so it has to
           # assume a dedented line might lazily continue the open paragraph
@@ -698,26 +756,42 @@ mp_doc_link_targets() {
         # spelling against the inventory therefore misses a hub-only target
         # the browser resolves perfectly well (#807).
         #
-        # NAMED_TEXT is the complete set of HTML5 named references whose
-        # expansion is entirely ASCII — the closed set that can spell a
-        # character of the repo-relative Markdown paths this inventory
-        # declares. That set has 46 members: 45 whose expansion is a single
-        # character, listed below as name/code-point pairs, and `fjlig`,
-        # the ONE whose expansion is two ASCII characters (`fj`). Keying the
-        # table by code point silently excluded it, so `[audit](hub&fjlig;.md)`
-        # reached `hubfj.md` while the destination stayed encoded — a
-        # hub-only sibling the browser resolves and the scan never saw. The
-        # table therefore stores the expansion as a STRING, and a
-        # multi-character ASCII expansion is a value like any other rather
-        # than an unrepresentable case. Decoding stops at ASCII deliberately: the %c
-        # conversion for a code point above 127 is implementation-defined
-        # across the awks CI runs (mawk emits one byte; gawk in a UTF-8
-        # locale emits the multibyte character), so a non-ASCII expansion
-        # has no deterministic byte spelling to compare against a filename.
-        # Such a reference is left encoded, which loses a match rather than
-        # inventing one, and the numeric spelling of an ASCII character is
-        # decoded in full either way.
+        # NAMED_TEXT holds every named reference this checker can expand.
+        # It stores the expansion as a STRING, not as a code point: keying
+        # by code point could not represent `&fjlig;` (which expands to the
+        # two ASCII characters `fj`), so `[audit](hub&fjlig;.md)` reached
+        # `hubfj.md` while the destination stayed encoded — a hub-only
+        # sibling the browser resolves and the scan never saw.
+        #
+        # Two tables feed it. `refs` is the COMPLETE set of HTML5 named
+        # references whose expansion is entirely ASCII: 46 members, 45
+        # single-character ones listed as name/code-point pairs plus
+        # `fjlig`. `latin` is every HTML5 named reference whose expansion
+        # lies in Latin-1 Supplement or Latin Extended-A (U+00A0-U+017F,
+        # 234 members, all single-character) — the accented letters that
+        # actually spell European filenames. Both are generated from the
+        # published HTML5 table, not hand-collected.
+        #
+        # Decoding no longer stops at ASCII. A code point above 127 now has
+        # a deterministic byte spelling on every awk CI runs, because
+        # utf8_of below picks the emit primitive that is correct for the
+        # implementation it is running on rather than assuming one of them
+        # (see the measurement in its header comment). A named reference
+        # outside BOTH tables — an expansion outside the Latin blocks, such
+        # as `&Alpha;` — is still left encoded, which loses a match rather
+        # than inventing one; the numeric spelling of the same character
+        # decodes in full either way, so no character is unreachable, only
+        # one SPELLING of an exotic one. That residual is catalogued on
+        # #929 rather than paid for with the whole 2125-entry table.
         BEGIN {
+          # Measured on BWK awk 20200816, gawk 5.4.1 and mawk 1.3.4: a
+          # LITERAL multi-byte character in this source survives
+          # byte-identically on all three, in both a UTF-8 locale and
+          # LC_ALL=C. Its length() is therefore a reliable runtime probe of
+          # whether THIS awk counts characters or bytes — and so of what
+          # sprintf("%c", n) means above ASCII.
+          REPLACEMENT = "�"
+          CHAR_ORIENTED = (length(REPLACEMENT) == 1)
           refs = "Tab 9 NewLine 10 excl 33 QUOT 34 quot 34 num 35 dollar 36"
           refs = refs " percnt 37 AMP 38 amp 38 apos 39 lpar 40 rpar 41"
           refs = refs " ast 42 midast 42 plus 43 comma 44 period 46 sol 47"
@@ -729,11 +803,115 @@ mp_doc_link_targets() {
           refs = refs " rcub 125"
           n_refs = split(refs, named_ref, " ")
           for (i = 1; i < n_refs; i += 2) {
-            NAMED_TEXT[named_ref[i]] = sprintf("%c", named_ref[i + 1] + 0)
+            NAMED_TEXT[named_ref[i]] = utf8_of(named_ref[i + 1] + 0)
           }
           # The 46th: the only HTML5 named reference whose expansion is more
           # than one ASCII character. It has no code point to list above.
           NAMED_TEXT["fjlig"] = "fj"
+          latin = "AElig 198 Aacute 193 Abreve 258 Acirc 194 Agrave 192"
+          latin = latin " Amacr 256 Aogon 260 Aring 197 Atilde 195 Auml 196"
+          latin = latin " COPY 169 Cacute 262 Ccaron 268 Ccedil 199 Ccirc 264"
+          latin = latin " Cdot 266 Cedilla 184 CenterDot 183 Dcaron 270"
+          latin = latin " DiacriticalAcute 180 Dot 168 DoubleDot 168"
+          latin = latin " Dstrok 272 ENG 330 ETH 208 Eacute 201 Ecaron 282"
+          latin = latin " Ecirc 202 Edot 278 Egrave 200 Emacr 274 Eogon 280"
+          latin = latin " Euml 203 Gbreve 286 Gcedil 290 Gcirc 284 Gdot 288"
+          latin = latin " Hcirc 292 Hstrok 294 IJlig 306 Iacute 205 Icirc 206"
+          latin = latin " Idot 304 Igrave 204 Imacr 298 Iogon 302 Itilde 296"
+          latin = latin " Iuml 207 Jcirc 308 Kcedil 310 Lacute 313 Lcaron 317"
+          latin = latin " Lcedil 315 Lmidot 319 Lstrok 321 Nacute 323"
+          latin = latin " Ncaron 327 Ncedil 325 NonBreakingSpace 160"
+          latin = latin " Ntilde 209 OElig 338 Oacute 211 Ocirc 212"
+          latin = latin " Odblac 336 Ograve 210 Omacr 332 Oslash 216"
+          latin = latin " Otilde 213 Ouml 214 PlusMinus 177 REG 174"
+          latin = latin " Racute 340 Rcaron 344 Rcedil 342 Sacute 346"
+          latin = latin " Scaron 352 Scedil 350 Scirc 348 THORN 222"
+          latin = latin " Tcaron 356 Tcedil 354 Tstrok 358 Uacute 218"
+          latin = latin " Ubreve 364 Ucirc 219 Udblac 368 Ugrave 217"
+          latin = latin " Umacr 362 Uogon 370 Uring 366 Utilde 360 Uuml 220"
+          latin = latin " Wcirc 372 Yacute 221 Ycirc 374 Yuml 376 Zacute 377"
+          latin = latin " Zcaron 381 Zdot 379 aacute 225 abreve 259"
+          latin = latin " acirc 226 acute 180 aelig 230 agrave 224 amacr 257"
+          latin = latin " angst 197 aogon 261 aring 229 atilde 227 auml 228"
+          latin = latin " brvbar 166 cacute 263 ccaron 269 ccedil 231"
+          latin = latin " ccirc 265 cdot 267 cedil 184 cent 162 centerdot 183"
+          latin = latin " circledR 174 copy 169 curren 164 dcaron 271 deg 176"
+          latin = latin " die 168 div 247 divide 247 dstrok 273 eacute 233"
+          latin = latin " ecaron 283 ecirc 234 edot 279 egrave 232 emacr 275"
+          latin = latin " eng 331 eogon 281 eth 240 euml 235 frac12 189"
+          latin = latin " frac14 188 frac34 190 gbreve 287 gcirc 285"
+          latin = latin " gdot 289 half 189 hcirc 293 hstrok 295 iacute 237"
+          latin = latin " icirc 238 iexcl 161 igrave 236 ijlig 307 imacr 299"
+          latin = latin " imath 305 inodot 305 iogon 303 iquest 191"
+          latin = latin " itilde 297 iuml 239 jcirc 309 kcedil 311"
+          latin = latin " kgreen 312 lacute 314 laquo 171 lcaron 318"
+          latin = latin " lcedil 316 lmidot 320 lstrok 322 macr 175 micro 181"
+          latin = latin " middot 183 nacute 324 napos 329 nbsp 160 ncaron 328"
+          latin = latin " ncedil 326 not 172 ntilde 241 oacute 243 ocirc 244"
+          latin = latin " odblac 337 oelig 339 ograve 242 omacr 333 ordf 170"
+          latin = latin " ordm 186 oslash 248 otilde 245 ouml 246 para 182"
+          latin = latin " plusmn 177 pm 177 pound 163 racute 341 raquo 187"
+          latin = latin " rcaron 345 rcedil 343 reg 174 sacute 347"
+          latin = latin " scaron 353 scedil 351 scirc 349 sect 167 shy 173"
+          latin = latin " strns 175 sup1 185 sup2 178 sup3 179 szlig 223"
+          latin = latin " tcaron 357 tcedil 355 thorn 254 times 215"
+          latin = latin " tstrok 359 uacute 250 ubreve 365 ucirc 251"
+          latin = latin " udblac 369 ugrave 249 umacr 363 uml 168 uogon 371"
+          latin = latin " uring 367 utilde 361 uuml 252 wcirc 373"
+          latin = latin " yacute 253 ycirc 375 yen 165 yuml 255 zacute 378"
+          latin = latin " zcaron 382 zdot 380"
+          n_latin = split(latin, latin_ref, " ")
+          for (i = 1; i < n_latin; i += 2) {
+            NAMED_TEXT[latin_ref[i]] = utf8_of(latin_ref[i + 1] + 0)
+          }
+        }
+        # Encode a Unicode code point as the bytes a filename carries.
+        #
+        # NEITHER available primitive is portable on its own. Measured on
+        # BWK awk 20200816, gawk 5.4.1 and mawk 1.3.4 in a UTF-8 locale:
+        #
+        #   sprintf("%c", 252)          BWK: fc   gawk: c3 bc   mawk: fc
+        #   sprintf("%c",195) then 188  BWK: c3 bc   mawk: c3 bc
+        #                               gawk: c3 83 c2 bc
+        #   a literal "u-umlaut" here   ALL THREE: c3 bc
+        #
+        # gawk in a UTF-8 locale reads "%c" as a CODE POINT — so it emits
+        # the right character for one, and DOUBLE-ENCODES a hand-built
+        # byte. BWK awk and mawk read "%c" as a BYTE — so a hand-built
+        # sequence is right and a code point above 127 comes out as its
+        # Latin-1 byte. Each implementation therefore gets the primitive
+        # that is correct FOR IT, selected by the CHAR_ORIENTED probe.
+        # Both branches were measured to emit the same bytes for the same
+        # code point, which is what makes this decode deterministic across
+        # CI runners instead of implementation-defined.
+        #
+        # CR and LF are mapped to U+FFFD for a reason of this program
+        # rather than of the spec: targets are emitted ONE PER LINE, so a
+        # decoded newline would split a single destination into two records
+        # and the tail could false-match an inventory path — a canonical
+        # doc linking `prefix&NewLine;hub.md` reporting a reference to
+        # `hub.md` that no reader can follow. U+FFFD keeps the destination
+        # a single record and matches no declared path, which loses a match
+        # rather than inventing one. (The reference parser keeps the
+        # newline and percent-encodes it: `prefix%0Ahub.md`, one
+        # destination, still not `hub.md`.) The out-of-range guard is
+        # defensive — char_reference_at rejects those values before they
+        # reach here, and every table entry is a valid code point.
+        function utf8_of(cp) {
+          if (cp <= 0 || cp > 1114111) return REPLACEMENT
+          if (cp >= 55296 && cp <= 57343) return REPLACEMENT
+          if (cp == 10 || cp == 13) return REPLACEMENT
+          if (cp < 128 || CHAR_ORIENTED) return sprintf("%c", cp)
+          if (cp < 2048) {
+            return sprintf("%c%c", 192 + int(cp / 64), 128 + cp % 64)
+          }
+          if (cp < 65536) {
+            return sprintf("%c%c%c", 224 + int(cp / 4096), \
+                           128 + int(cp / 64) % 64, 128 + cp % 64)
+          }
+          return sprintf("%c%c%c%c", 240 + int(cp / 262144), \
+                         128 + int(cp / 4096) % 64, \
+                         128 + int(cp / 64) % 64, 128 + cp % 64)
         }
         function hex_value(c, p) {
           p = index("0123456789ABCDEF", toupper(c))
@@ -770,9 +948,29 @@ mp_doc_link_targets() {
             if (digits !~ /^[0-9]+$/ || length(digits) > 7) return ""
             cp = digits + 0
           }
-          if (cp < 1 || cp > 127) return ""
+          # Every code point that names a character decodes, so no numeric
+          # reference to a real character is compared by its ENCODED
+          # spelling any more — that was the false-negative path
+          # `[audit](h&#252;b.md)` took to reach a hub-only `hüb.md`
+          # unreported.
+          #
+          # A value that names no character — U+0000, a surrogate, or one
+          # above U+10FFFF — is NOT a character reference here, and the "&"
+          # is emitted literally. The spec substitutes U+FFFD for these,
+          # but that rule is written for reference-in-TEXT; in DESTINATION
+          # position the reference parser leaves them untouched, and both
+          # spellings were measured to agree that the result names no
+          # declared doc:
+          #
+          #   `[l](a&#0;b.md)`        text: a<U+FFFD>b   href: a&#0;b.md
+          #   `[l](a&#xD800;b.md)`    text: a<U+FFFD>b   href: a&#xD800;b.md
+          #
+          # Following the destination reading keeps this checker aligned
+          # with the parser whose output decides whether a link renders.
+          if (cp < 1 || cp > 1114111) return ""
+          if (cp >= 55296 && cp <= 57343) return ""
           REF_LEN = semi
-          return sprintf("%c", cp)
+          return utf8_of(cp)
         }
         function percent_decode(s, out, i, c, hi, lo) {
           out = ""

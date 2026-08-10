@@ -1972,6 +1972,170 @@ else
   fail "Case 15b control unexpected (rc=$rc): $out"
 fi
 
+# --- Case 15c: every marker on a line records its own container ------
+# § List items makes each marker a container in its own right, so
+# `- - # inner` opens TWO items — content columns 2 and 4 — and the line
+# that dedents back to column 2 closes only the inner one. Recording just
+# the SUMMED column left the outer item with no frame at all: that dedent
+# popped the single column-4 frame, dropped the code threshold to zero,
+# and blanked the second paragraph of the outer item as top-level
+# indented code, taking its link out of the scan with it.
+#
+# Case 15 covers the one-marker-per-line dedent and cannot see this row,
+# because with a single marker the sum and the innermost frame are the
+# same number. The control below is exactly that shape, and it renders at
+# the same boundary — which is why the summed column looked correct.
+#
+# The boundary is the point: with the outer frame restored, code begins
+# four columns past the OUTER content column (2 + 4 = 6), so five spaces
+# render and six do not. Every row is checked against markdown-it-py's
+# commonmark preset, as in Cases 14v-15b.
+run_cm_matrix expect_rendered "Case 15c" \
+  'two markers on one line keep the OUTER frame as well as the inner|- - # inner\n  Outer\n\n     See [the audit](hub.md)' \
+  'one marker on the line is the shape the summed column got right|- # inner\n  Outer\n\n     See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15c" \
+  'code begins four columns past the OUTER content column, not the inner|- - # inner\n  Outer\n\n      See [the audit](hub.md)' \
+  'the one-marker control shares that boundary exactly|- # inner\n  Outer\n\n      See [the audit](hub.md)'
+
+# --- Case 15d: paragraph interruption reads the START NUMBER ---------
+# § Lists restricts interruption to an ordered item whose "start number
+# is 1" — a property of the number the digits SPELL, not of how they are
+# spelled. `01.` and `1.` both start at 1 and both interrupt a paragraph.
+# Matching the literal spellings `1.` / `1)` instead rejected every
+# leading-zero form: the paragraph was kept open, no item container was
+# ever recorded, and the content of the item was then measured against
+# column zero and blanked as top-level code.
+#
+# Case 15 covers the start-number restriction only through `2.`, which
+# the spelling test and the parsed test agree about; the disagreement is
+# visible only where the two readings differ, which is a leading zero.
+#
+# `01. ` puts content at column 4, so item prose runs to seven spaces and
+# code begins at eight. The non-interrupting control is a genuinely
+# different document — one paragraph, then top-level code from column
+# four — which is why its boundary is four rather than eight.
+run_cm_matrix expect_rendered "Case 15d" \
+  'a leading-zero ordered marker starts at 1, so it interrupts|Governance\n01. # Notes\n\n       See [the audit](hub.md)' \
+  'the plain spelling of the same start number (control)|Governance\n1. # Notes\n\n      See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15d" \
+  'code still begins four columns past the item content column|Governance\n01. # Notes\n\n        See [the audit](hub.md)' \
+  'a leading zero does not rescue a start number above 1|Governance\n02. # Notes\n\n    See [the audit](hub.md)'
+
+# --- Case 15e: an ordered marker is bounded at nine digits -----------
+# § List items: an ordered-list marker is "1-9 arabic digits" followed by
+# `.` or `)`. A tenth digit makes it ordinary paragraph text, so the line
+# that follows is a lazy paragraph continuation and its link renders —
+# but an unbounded pattern reads it as a marker with content column 12
+# and suppresses that continuation as indented code.
+#
+# The two rows are a minimal pair: the SAME sixteen-space continuation,
+# one digit of difference in the marker, opposite verdicts. Nine digits
+# really is a marker, so its item does start indented code at eleven plus
+# four — which is what makes the bound observable rather than cosmetic.
+run_cm_matrix expect_rendered "Case 15e" \
+  'ten digits is not a marker, so the next line continues the paragraph|1234567890. # Notes\n                See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15e" \
+  'nine digits IS a marker and its item code-starts at W+1+4 (control)|123456789. # Notes\n                See [the audit](hub.md)'
+
+# --- Case 15f: character references above ASCII (#807) ---------------
+# § Entity and numeric character references resolves a reference inside a
+# link destination, so `[audit](hub&#248;.md)` opens `hubø.md`. Capping
+# the decode at ASCII compared every non-ASCII reference by its ENCODED
+# spelling, which is a silent false negative: the reader reaches the
+# hub-only sibling and the scan never sees it.
+#
+# The cap existed for a real portability reason, and these rows are the
+# regression test for the fix as much as the conformance test for the
+# rule — run the suite under BWK awk, gawk and mawk. Measured on BWK awk
+# 20200816, gawk 5.4.1 and mawk 1.3.4 in a UTF-8 locale: `sprintf("%c",
+# 252)` emits the single Latin-1 byte `fc` on BWK awk and mawk but the
+# UTF-8 character `c3 bc` on gawk, while a hand-built byte pair `195`
+# `188` is right on BWK awk and mawk and double-encoded to `c3 83 c2 bc`
+# on gawk. Neither primitive is portable alone; the decoder picks the one
+# that is correct for the implementation it is running on.
+#
+# U+00F8 is deliberate. It has no canonical decomposition, so its NFC and
+# NFD spellings are byte-identical and this fixture behaves the same on a
+# normalizing filesystem as on a preserving one — a decomposable letter
+# such as U+00FC would make the row depend on the runner.
+MANIFEST_NONASCII="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+  - path: docs/agents/hubø.md
+    class: hub-only
+"
+for ref_spelling in \
+  'hub&#248;.md' 'hub&#xF8;.md' 'hub&#XF8;.md' 'hub&#0000248;.md' \
+  'hub&oslash;.md' 'hubø.md'
+do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_NONASCII" \
+    "docs/agents/shared.md|See [the audit]($ref_spelling) for details.
+docs/agents/hubø.md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "1" ] \
+     && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hubø.md'"; then
+    pass "Case 15f: '$ref_spelling' resolves to its non-ASCII target"
+  else
+    fail "Case 15f ('$ref_spelling') unexpected (rc=$rc): $out"
+  fi
+done
+
+# A decoded newline must not split ONE destination into two records.
+# `prefix&NewLine;hub.md` is a single destination that reaches no file;
+# emitting the decoded newline raw made the tail its own record, and that
+# record `hub.md` then false-matched the hub-only sibling and reported a
+# reference no reader can follow. The reference parser keeps it as one
+# percent-encoded destination, `prefix%0Ahub.md`.
+run_cm_matrix expect_not_rendered "Case 15f" \
+  'a decoded newline does not split one destination into two targets|See [the audit](prefix&NewLine;hub.md) for details.' \
+  'the numeric spelling of the same character behaves identically|See [the audit](prefix&#10;hub.md) for details.' \
+  'a carriage return is held to the same rule|See [the audit](prefix&#13;hub.md) for details.'
+
+# --- Case 15g: indentation decides whether a block can interrupt -----
+# § Indented code blocks: indented code "cannot interrupt a paragraph".
+# So while a paragraph is open, a line four or more columns past the
+# current container is lazy continuation TEXT no matter what block it
+# looks like — the marker, hash or tag is ordinary paragraph content at
+# that depth. The classifier is handed the line with its indentation
+# stripped, so it could not see the column, read the shape as a block
+# start, closed the paragraph and blanked the continuation after it.
+#
+# Case 15 tests interruption by SHAPE (a non-1 ordered marker, an empty
+# item) and cannot see this: here the shape is a perfectly valid
+# interrupting marker and only its COLUMN stops it.
+#
+# The last two rows are the discriminating controls, and they matter
+# because most rows in this family render either way. Same nine-space
+# link line, marker moved one column: at three columns the bullet DOES
+# interrupt, so the item content column is 5 and nine spaces is item
+# code; at four it does not interrupt, so nine spaces is more paragraph.
+# And with no paragraph open at all, the same four-column shape is
+# ordinary top-level indented code.
+#
+# Every row is checked against markdown-it-py's commonmark preset.
+run_cm_matrix expect_rendered "Case 15g" \
+  'a bullet four columns in cannot interrupt an open paragraph|Governance\n    - # Heading\n    [the audit](hub.md)' \
+  'nor can an ordered marker at that column|Governance\n    1. # Heading\n    [the audit](hub.md)' \
+  'nor an ATX heading|Governance\n    # Heading\n    [the audit](hub.md)' \
+  'nor a thematic break|Governance\n    ---\n    [the audit](hub.md)' \
+  'nor a block quote|Governance\n    > quoted\n    [the audit](hub.md)' \
+  'an HTML block is continuation text at four columns too|Governance\n    <div>\n    [the audit](hub.md)' \
+  'the continuation keeps running past the code threshold|Governance\n    - # Heading\n         [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15g" \
+  'one column less and the bullet interrupts, making that line item code|Governance\n   - # Heading\n         [the audit](hub.md)' \
+  'with no paragraph open the same shape is top-level indented code|    - # Heading\n    [the audit](hub.md)'
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).
