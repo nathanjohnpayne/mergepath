@@ -1890,6 +1890,88 @@ run_cm_matrix expect_not_rendered "Case 14z" \
   'code still begins four columns past the W+1 content column|+ \n      See [the audit](hub.md)' \
   'the wider ordered marker moves that threshold with it|1. \n       See [the audit](hub.md)'
 
+# --- Case 15: container transitions and list interruption ------------
+# § Lists: "In order for a list to interrupt a paragraph, it must begin
+# with a non-blank list item, and if ordered, the start number must be
+# 1." § List items makes each item a container, so the indented-code
+# threshold is a STACK of content columns — leaving an inner item
+# restores the enclosing one rather than dropping to column zero.
+#
+# All three readings below moved a line across the code boundary, and in
+# both directions: a marker that cannot interrupt a paragraph closed it
+# and blanked the continuation (rendered link hidden); a dedent out of a
+# nested item dropped the outer column and blanked the prose of the outer
+# item (rendered link hidden); and a stale column left behind by a
+# dedented line that closes an item kept real top-level code visible
+# (link reported that never rendered).
+#
+# The controls matter as much as the reproductions: a `1.` marker and a
+# bullet marker DO interrupt a paragraph, so their continuations must
+# stay classified as item content, not as more of the paragraph.
+#
+# Every row is checked against markdown-it-py's commonmark preset first,
+# as in Cases 14v-14z.
+run_cm_matrix expect_rendered "Case 15" \
+  'an ordered marker starting above 1 cannot interrupt a paragraph|Governance\n2. # Notes\n       See [the audit](hub.md)' \
+  'an empty item cannot interrupt a paragraph either|Governance\n+ \n    See [the audit](hub.md)' \
+  'leaving a nested item restores the content column of the outer one|- # outer\n  - # inner\n  Outer\n\n    See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15" \
+  'a start-1 ordered marker DOES interrupt (control)|Governance\n1. # Notes\n       See [the audit](hub.md)' \
+  'a bullet marker DOES interrupt (control)|Governance\n- # Notes\n      See [the audit](hub.md)' \
+  'a dedent that closes the item drops its column with it|- Governance\n# Heading\n    See [the audit](hub.md)' \
+  'a complete closing tag starts a type 7 HTML block|</pre>\n    See [the audit](hub.md)' \
+  'the type 7 exclusion never applied to closing tags (control)|</div>\n    See [the audit](hub.md)' \
+  'an opening pre tag is still condition 1 (control)|<pre>\n    See [the audit](hub.md)'
+
+# --- Case 15b: a named reference whose expansion is TWO ASCII chars ---
+# The HTML5 named-reference table has exactly 46 members whose expansion
+# is entirely ASCII, and exactly one of those — `&fjlig;`, which expands
+# to `fj` — is longer than a single character. Keying the decode table by
+# CODE POINT could not represent it, so the destination stayed encoded
+# and the hub-only sibling it reaches was never compared. This needs its
+# own inventory because the resolved target is `hubfj.md`, not the
+# `hub.md` every other rendering row resolves to.
+MANIFEST_FJ="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+  - path: docs/agents/hubfj.md
+    class: hub-only
+"
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_FJ" \
+  'docs/agents/shared.md|See [the audit](hub&fjlig;.md) for details.
+docs/agents/hubfj.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] \
+   && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hubfj.md'"; then
+  pass "Case 15b: a two-character ASCII named reference resolves to its target"
+else
+  fail "Case 15b unexpected (rc=$rc): $out"
+fi
+
+# CONTROL: the same destination spelled literally must report identically,
+# so the row above passes because the reference DECODED and not because
+# something else in the fixture failed.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_FJ" \
+  'docs/agents/shared.md|See [the audit](hubfj.md) for details.
+docs/agents/hubfj.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] \
+   && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hubfj.md'"; then
+  pass "Case 15b: the literal spelling of that target reports identically (control)"
+else
+  fail "Case 15b control unexpected (rc=$rc): $out"
+fi
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).

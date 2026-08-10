@@ -255,6 +255,24 @@ mp_markdown_renderable_text() {
       LM_CHARS = i - 1
       return w + n
     }
+    # CommonMark 0.31.2 § Lists: "In order for a list to interrupt a
+    # paragraph, it must begin with a non-blank list item, and if ordered,
+    # the start number must be 1." A marker that fails either test is not a
+    # list at all while a paragraph is open — it is more of that paragraph.
+    # Classifying it as a list closes the paragraph and re-measures every
+    # following line against a list content column that does not exist, which
+    # blanks rendered text as indented code: `Governance` then `2. # Notes`
+    # then a seven-space link line is ONE paragraph and the link renders.
+    function can_interrupt_paragraph(s,   w, marker, rest) {
+      if (!match(s, LIST_MARKER_CORE)) return 0
+      w = RLENGTH
+      marker = substr(s, 1, w)
+      if (marker ~ /^[0-9]+[.)]$/ && marker !~ /^1[.)]$/) return 0
+      rest = substr(s, w + 1)
+      sub(/^[[:space:]]+/, "", rest)
+      if (rest == "") return 0
+      return 1
+    }
     function is_thematic_break(s, compact, ch, i) {
       compact = s
       gsub(/[[:space:]]/, "", compact)
@@ -286,8 +304,12 @@ mp_markdown_renderable_text() {
     #
     # Condition 7 (a complete open or closing tag alone on the line) is the
     # one kind that cannot interrupt an OPEN paragraph, so it is tested only
-    # when no text flow is already open; the tag names condition 1 owns are
-    # excluded from it, as the spec excludes them.
+    # when no text flow is already open. The spec excludes `pre`, `script`,
+    # `style` and `textarea` from it — but only as OPEN tags, which condition
+    # 1 owns anyway. A complete CLOSING tag does start a type 7 block whatever
+    # its name, so excluding `</pre>` too left it as prose and opened text
+    # flow over raw HTML: `</pre>` followed by an indented line reported a
+    # link that never rendered.
     #
     # Condition 4 is spelled `<!` + an UPPERCASE ASCII letter, the reading
     # markdown-it-py implements — the parser the prose-wrap tooling in this
@@ -314,7 +336,8 @@ mp_markdown_renderable_text() {
         }
       }
       if (flow_open) return 0
-      if (low ~ /^<\/?(pre|script|style|textarea)([[:space:]>]|\/|$)/) return 0
+      if (substr(s, 1, 2) != "</" \
+          && low ~ /^<(pre|script|style|textarea)([[:space:]>]|\/|$)/) return 0
       if (s ~ OPEN_TAG_ONLY || s ~ CLOSE_TAG_ONLY) return 1
       return 0
     }
@@ -338,6 +361,10 @@ mp_markdown_renderable_text() {
       if (s == "") return 0
       if (is_thematic_break(s) || is_setext_underline(s)) return 0
       if (is_list_marker(s)) {
+        # ... but only when a list may start here at all. With a paragraph
+        # open, a marker that cannot interrupt it leaves the paragraph — and
+        # its content column — exactly as they were.
+        if (flow_open && !can_interrupt_paragraph(s)) return 1
         # A list item is a container whose content is parsed as blocks in its
         # own right, so the item opens a paragraph only when its FIRST child
         # is one. Consume the marker and classify what follows by the same
@@ -374,6 +401,23 @@ mp_markdown_renderable_text() {
       if (s ~ /^\[[^]]+\]:[[:space:]]*/) return 0
       if (opens_html_block(s, flow_open)) return 0
       return 1
+    }
+    # Container content columns, innermost last. List items nest, so the
+    # threshold for indented code is a STACK, not a scalar: leaving an inner
+    # item must restore the column of the item enclosing it, and setting the
+    # scalar back to zero instead measured the prose of the outer item against the
+    # top-level four-column threshold and blanked it. Popping every frame
+    # indented deeper than `col` leaves `code_column` at the innermost
+    # container the line is still inside — zero when it is inside none.
+    function pop_containers(col) {
+      while (cc_n > 0 && cc[cc_n] > col) { delete cc[cc_n]; cc_n-- }
+      code_column = (cc_n > 0) ? cc[cc_n] : 0
+    }
+    function push_container(col) {
+      pop_containers(col)
+      cc_n++
+      cc[cc_n] = col
+      code_column = col
     }
     function strip_inline_code(s, out, pos, rel, open, width, scan, got, close_width) {
       out = ""; pos = 1
@@ -454,7 +498,7 @@ mp_markdown_renderable_text() {
       # that follows it. The column is dropped again by the first line
       # indented less than it that is not a lazy continuation — that line
       # closes the item.
-      if (col_indent < code_column && !text_flow_open) code_column = 0
+      if (!text_flow_open) pop_containers(col_indent)
       if (!reference_continuation && !text_flow_open \
           && col_indent >= code_column + 4) {
         print ""
@@ -475,7 +519,18 @@ mp_markdown_renderable_text() {
         flow_column = col_indent
         item_code_first = 0
         text_flow_open = opens_text_flow(flow_probe, text_flow_open)
-        if (marker_columns > 0) code_column = col_indent + marker_columns
+        if (marker_columns > 0) {
+          push_container(col_indent + marker_columns)
+        } else if (!text_flow_open) {
+          # The pop above runs BEFORE the line is classified, so it has to
+          # assume a dedented line might lazily continue the open paragraph
+          # and leave the container alone. Once the line is classified we
+          # know it did not — a heading after `- Governance` closes the item
+          # — and the stale column has to go, or the next indented line is
+          # measured against a container that no longer contains it and real
+          # top-level code is reported as prose.
+          pop_containers(col_indent)
+        }
         # A list item whose first child is an indented code block renders the
         # remainder of its OWN marker line as that code, so the marker line
         # carries no link either. The blanking above only ever reaches the
@@ -643,10 +698,18 @@ mp_doc_link_targets() {
         # spelling against the inventory therefore misses a hub-only target
         # the browser resolves perfectly well (#807).
         #
-        # NAMED_CP is the complete set of HTML5 named references whose
-        # expansion is a single ASCII character — the closed set that can
-        # spell a character of the repo-relative Markdown paths this
-        # inventory declares. Decoding stops at ASCII deliberately: the %c
+        # NAMED_TEXT is the complete set of HTML5 named references whose
+        # expansion is entirely ASCII — the closed set that can spell a
+        # character of the repo-relative Markdown paths this inventory
+        # declares. That set has 46 members: 45 whose expansion is a single
+        # character, listed below as name/code-point pairs, and `fjlig`,
+        # the ONE whose expansion is two ASCII characters (`fj`). Keying the
+        # table by code point silently excluded it, so `[audit](hub&fjlig;.md)`
+        # reached `hubfj.md` while the destination stayed encoded — a
+        # hub-only sibling the browser resolves and the scan never saw. The
+        # table therefore stores the expansion as a STRING, and a
+        # multi-character ASCII expansion is a value like any other rather
+        # than an unrepresentable case. Decoding stops at ASCII deliberately: the %c
         # conversion for a code point above 127 is implementation-defined
         # across the awks CI runs (mawk emits one byte; gawk in a UTF-8
         # locale emits the multibyte character), so a non-ASCII expansion
@@ -666,8 +729,11 @@ mp_doc_link_targets() {
           refs = refs " rcub 125"
           n_refs = split(refs, named_ref, " ")
           for (i = 1; i < n_refs; i += 2) {
-            NAMED_CP[named_ref[i]] = named_ref[i + 1] + 0
+            NAMED_TEXT[named_ref[i]] = sprintf("%c", named_ref[i + 1] + 0)
           }
+          # The 46th: the only HTML5 named reference whose expansion is more
+          # than one ASCII character. It has no code point to list above.
+          NAMED_TEXT["fjlig"] = "fj"
         }
         function hex_value(c, p) {
           p = index("0123456789ABCDEF", toupper(c))
@@ -688,9 +754,9 @@ mp_doc_link_targets() {
           if (semi < 3) return ""
           body = substr(rest, 2, semi - 2)
           if (substr(body, 1, 1) != "#") {
-            if (!(body in NAMED_CP)) return ""
+            if (!(body in NAMED_TEXT)) return ""
             REF_LEN = semi
-            return sprintf("%c", NAMED_CP[body])
+            return NAMED_TEXT[body]
           }
           digits = substr(body, 2)
           if (substr(digits, 1, 1) == "x" || substr(digits, 1, 1) == "X") {
