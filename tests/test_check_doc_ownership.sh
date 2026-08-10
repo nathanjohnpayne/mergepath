@@ -2335,6 +2335,18 @@ if [ -f "$ROOT/.mergepath-sync.yml" ]; then
 fi
 
 echo
+# Say on STDOUT whether the CommonMark oracle actually ran. Without this the
+# only trace is a stderr note, so a CI job with no markdown-it-py reports a
+# clean pass that silently skipped every renderer cross-check — the matrix
+# would be back to confirming that the checker agrees with expectations
+# written by the same hand. The repo_lint job is such an environment today
+# (tracked in #929); making the skip visible is what keeps a green run from
+# being mistaken for a verified one.
+if [ "${CM_ORACLE_READY:-0}" = "1" ]; then
+  echo "test_check_doc_ownership: CommonMark oracle ACTIVE (rows cross-checked against markdown-it-py)"
+else
+  echo "test_check_doc_ownership: CommonMark oracle SKIPPED (markdown-it-py absent; rows NOT cross-checked)"
+fi
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then
   echo "test_check_doc_ownership: FAIL ($FAIL/$TOTAL failed)"
