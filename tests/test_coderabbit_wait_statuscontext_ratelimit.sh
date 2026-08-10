@@ -464,6 +464,27 @@ test_status_description_predicate_unit() {
   [ "$FAIL" -ne "$before" ] || pass "12: crw_status_description_permits_clearance — empty and completed clear; rate-limited, pending and unknown wordings do not"
 }
 
+# --- Test 14: the window rule is scoped to the arbitration's BLIND SPOT -----
+# Same notice and status as test 9, but with a freshness window wide enough
+# that the notice IS admitted to the anchored scan. The existing arbitration
+# then governs and reaches its own answer — here the #446 branch, where an
+# unscoped notice CREATED before the success is stale and does not suppress,
+# so the head clears. A window rule that ignored the status timestamp would
+# override that and suppress forever; scripts/ci/check_canonical_bugs_263caf3
+# catches the same regression from the other side. The defect #891/#912 report
+# is the notice going BLIND, not the arbitration being wrong.
+test_open_window_inside_freshness_defers_to_arbitration() {
+  local dir rc before=$FAIL
+  dir=$(make_case "open-window-inside-freshness" "$RATE_LIMIT_BODY_LONG_WINDOW" \
+    "$STATUS_AFTER_NOTICE" "Review completed" "$NOTICE_AGED_TIME" 999999999)
+  rc=$(run_case "$dir")
+  [ "$rc" = "0" ] || fail "14: expected exit 0 (the #446 arbitration clears an unscoped pre-success notice), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "14: status=$(jqf "$dir" '.status'), expected cleared"
+  grep -q 'remains authoritative' "$dir/err.log" || fail "14: expected the #446 arbitration to decide this, not the window rule; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  grep -q 'published window has NOT expired' "$dir/err.log" && fail "14: the window rule fired while the notice was inside the freshness floor — it must be scoped to the blind spot"
+  [ "$FAIL" -ne "$before" ] || pass "14: the published-window rule applies ONLY when nothing survived the freshness floor; a visible notice is still arbitrated against the status"
+}
+
 # --- Test 13: #912 — the fast-path verdict carries the STATUS' own time -----
 # The #909 false clear was hard to spot because the JSON looked head-anchored
 # and current: `review.created_at` was the script's OBSERVATION time while the
@@ -496,6 +517,7 @@ test_aged_notice_with_expired_window_clears
 test_trailing_probe_flag_is_usage_error
 test_status_description_predicate_unit
 test_status_context_verdict_carries_status_created_at
+test_open_window_inside_freshness_defers_to_arbitration
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"

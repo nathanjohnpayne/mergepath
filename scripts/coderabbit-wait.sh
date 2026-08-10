@@ -1878,16 +1878,28 @@ status_context_fast_path_blocked_by_comment() {
     return 0
   }
 
-  # #891/#912: an aged-out notice whose PUBLISHED window is still open is
-  # CodeRabbit's current word, whatever the wall-clock freshness floor says.
-  if active_notice=$(crw_active_rate_limit_notice "$issue_comments"); then
-    active_id=$(echo "$active_notice" | jq -r '.id')
-    log "StatusContext success suppressed because CodeRabbit's newest comment id=$active_id is a rate-limit notice whose published window has NOT expired (${CRW_ACTIVE_RATE_LIMIT_REMAINING}s remaining) — the published window governs for its full duration, independent of the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s wallclock freshness floor (#891/#912)"
-    return 0
-  fi
-
   latest=$(latest_comment_from_issue_comments "$issue_comments")
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
+    # #891/#912, and ONLY here. Nothing survived the wall-clock freshness
+    # floor, so the arbitration below has no input at all — this is the one
+    # state in which an aged-out rate-limit notice is invisible to it. A
+    # notice whose PUBLISHED window has not expired is still CodeRabbit's
+    # current word: its windows (59 min observed) outrun the default 1800s
+    # floor, so it ages out mid-window and a stale success set while
+    # rate-limited clears an unreviewed head (#909).
+    #
+    # Deliberately NOT applied when the floor did admit a comment. The
+    # arbitration below already weighs a visible notice against the status —
+    # by HEAD reference, by the published window widening the grace
+    # (#596/#599), and by created_at ordering for an unscoped one (#446) —
+    # and a window rule that ignores the status timestamp would override all
+    # three, turning a genuinely-later success into a permanent suppression.
+    # The defect is the notice going BLIND, not the arbitration being wrong.
+    if active_notice=$(crw_active_rate_limit_notice "$issue_comments"); then
+      active_id=$(echo "$active_notice" | jq -r '.id')
+      log "StatusContext success suppressed because no CodeRabbit comment survived the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s freshness floor, but its newest comment id=$active_id is a rate-limit notice whose published window has NOT expired (${CRW_ACTIVE_RATE_LIMIT_REMAINING}s remaining) — the published window governs for its full duration (#891/#912)"
+      return 0
+    fi
     return 1
   fi
 
