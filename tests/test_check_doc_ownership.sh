@@ -1725,14 +1725,95 @@ run_truth_body() {
 docs/agents/hub.md|# Hub-only machinery"
 }
 
+# The matrix's oracle, actually executed.
+#
+# Every row declares a RENDERING verdict — "a reader following this body
+# reaches the hub-only doc" or "no reader does". That is a claim about the
+# reference parser, so the reference parser should decide it instead of a
+# hard-coded expectation that agrees with the implementation by construction.
+# Left unrun, an assumption shared by check_doc_ownership and these rows
+# passes the suite silently: it hid two rows asserting that eight decimal and
+# seven hex digits do NOT decode, when markdown-it-py decodes both — a
+# reader reached `hub.md` and neither the checker nor the suite noticed.
+#
+# Availability follows scripts/lint-md-prose-wrap.sh: markdown-it-py is
+# pinned at 4.2.0 by .github/workflows/md-prose-wrap.yml and that gate soft-
+# passes without it, so a checkout lacking it keeps the declared verdicts
+# rather than failing on a missing dependency.
+CM_ORACLE="$WORKDIR/cm_oracle.py"
+cat > "$CM_ORACLE" <<'CM_ORACLE_EOF'
+"""Print `rendered` when markdown-it-py's commonmark preset resolves any link
+or image in the body (read from stdin) to the hub-only doc, else
+`not_rendered`. Destinations are percent-decoded and resolved relative to the
+canonical doc, which is what a reader's browser does with the emitted href."""
+import posixpath
+import sys
+from urllib.parse import unquote, urlsplit
+
+from markdown_it import MarkdownIt
+
+DOC = "docs/agents/shared.md"
+HUB = "docs/agents/hub.md"
+BASE = posixpath.dirname(DOC)
+
+destinations = []
+for token in MarkdownIt("commonmark").parse(sys.stdin.read()):
+    if token.type != "inline":
+        continue
+    for child in token.children or []:
+        if child.type == "link_open":
+            destinations.append(child.attrGet("href"))
+        elif child.type == "image":
+            destinations.append(child.attrGet("src"))
+
+verdict = "not_rendered"
+for dest in destinations:
+    if not dest:
+        continue
+    parts = urlsplit(dest)
+    if parts.scheme or parts.netloc:
+        continue  # absolute URL — never a repo-relative reference
+    path = unquote(parts.path)
+    if path and posixpath.normpath(posixpath.join(BASE, path)) == HUB:
+        verdict = "rendered"
+        break
+print(verdict)
+CM_ORACLE_EOF
+
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import markdown_it' >/dev/null 2>&1; then
+  CM_ORACLE_READY=1
+else
+  CM_ORACLE_READY=0
+  echo "NOTE: markdown-it-py unavailable — CommonMark matrix rows run without" \
+       "the reference-renderer cross-check" >&2
+fi
+
 # Drive a `label|body` matrix through run_truth_body and assert the given
-# rendering verdict for every row.
+# rendering verdict for every row. The reference renderer is consulted first:
+# when it disagrees with the row's declared verdict the ROW is wrong, and no
+# checker result can settle that, so the disagreement is reported instead.
 run_cm_matrix() {
-  local verdict="$1" prefix="$2" row label body
+  local verdict="$1" prefix="$2" row label body want seen orc
   shift 2
+  want="not_rendered"
+  [ "$verdict" = "expect_rendered" ] && want="rendered"
   for row in "$@"; do
     label="${row%%|*}"
     body="${row#*|}"
+    if [ "$CM_ORACLE_READY" = "1" ]; then
+      set +e
+      seen=$(printf '%b\n' "$body" | python3 "$CM_ORACLE" 2>&1)
+      orc=$?
+      set -e
+      if [ "$orc" != "0" ]; then
+        fail "$prefix: $label — reference renderer errored (rc=$orc): $seen"
+        continue
+      fi
+      if [ "$seen" != "$want" ]; then
+        fail "$prefix: $label — reference renderer says '$seen', row declares '$want'"
+        continue
+      fi
+    fi
     set +e
     out=$(run_truth_body "$body")
     rc=$?
@@ -1751,8 +1832,10 @@ run_cm_matrix expect_rendered "Case 14v" \
   'decimal reference (the #807 reproduction)|See [the audit](hub&#46;md) for details.' \
   'lowercase-x hex reference|See [the audit](hub&#x2E;md) for details.' \
   'uppercase-X hex reference|See [the audit](hub&#X2E;md) for details.' \
-  'seven decimal digits is the longest decimal form|See [the audit](hub&#0000046;md) for details.' \
-  'six hex digits is the longest hex form|See [the audit](hub&#x00002E;md) for details.' \
+  'seven decimal digits is within the decimal form|See [the audit](hub&#0000046;md) for details.' \
+  'eight decimal digits is the longest decimal form|See [the audit](hub&#00000046;md) for details.' \
+  'six hex digits is within the hex form|See [the audit](hub&#x00002E;md) for details.' \
+  'eight hex digits is the longest hex form|See [the audit](hub&#x0000002E;md) for details.' \
   'named reference with an ASCII expansion|See [the audit](hub&period;md) for details.' \
   'named and numeric references spell ./ together|See [the audit](&#46;&sol;hub.md) for details.' \
   'angle-bracket destination|See [the audit](<hub&#46;md>) for details.' \
@@ -1768,8 +1851,8 @@ run_cm_matrix expect_rendered "Case 14v" \
 # reach `hub.md` under any of those would be clean for no reason at all.
 run_cm_matrix expect_not_rendered "Case 14v" \
   'a reference needs its semicolon terminator|See [the audit](hub&#46md) for details.' \
-  'eight decimal digits exceed the decimal form|See [the audit](hub&#00000046;md) for details.' \
-  'seven hex digits exceed the hex form|See [the audit](hub&#x000002E;md) for details.' \
+  'nine decimal digits exceed the decimal form|See [the audit](hub&#000000046;md) for details.' \
+  'nine hex digits exceed the hex form|See [the audit](hub&#x00000002E;md) for details.' \
   'an undefined entity name stays literal|See [the audit](hub&perio;.md) for details.' \
   'code point zero is not a deleted character|See [the audit](hub&#0;.md) for details.' \
   'decoded output is not rescanned for references|See [the audit](hub&#38;#46;md) for details.' \

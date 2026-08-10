@@ -921,10 +921,24 @@ mp_doc_link_targets() {
         # global REF_LEN to the source length consumed; REF_LEN 0 means "not
         # a character reference", and the caller emits the "&" literally.
         #
-        # The length caps are the spec form: `&#` + 1-7 decimal digits + `;`,
-        # `&#x` + 1-6 hex digits + `;`. They are tested with length() rather
-        # than an {1,7} interval, which not every awk implementation
-        # supports.
+        # The length caps are EIGHT digits in either base, and they come from
+        # the renderer rather than from the prose of the spec. § Entity and
+        # numeric character references says 1-7 decimal and 1-6 hex — but
+        # this check does not ask "is this reference well-spelled", it asks
+        # "does a reader following this link land on a hub-only doc", and
+        # that is answered by the parser that produces the href. Measured
+        # against the commonmark preset of markdown-it-py 4.2.0 in
+        # DESTINATION position: `hub&#00000046;md` and `hub&#x0000002E;md`
+        # (eight digits each) both render as links to `hub.md`, and nine
+        # digits in either base does not. Spelling the prose caps here left
+        # both of those as a silent false negative — the reader reaches the
+        # hub-only sibling and the scan compares the encoded spelling. The
+        # caps are tested with length() rather than an {1,8} interval, which
+        # not every awk implementation supports.
+        #
+        # NOTE: this whole awk program is a single-quoted shell string, so a
+        # lone apostrophe in a comment ENDS it and bash then parses the awk
+        # source as commands. Keep comments apostrophe-free.
         function char_reference_at(s, i,   rest, semi, body, digits, cp, k) {
           REF_LEN = 0
           rest = substr(s, i)
@@ -939,13 +953,13 @@ mp_doc_link_targets() {
           digits = substr(body, 2)
           if (substr(digits, 1, 1) == "x" || substr(digits, 1, 1) == "X") {
             digits = substr(digits, 2)
-            if (digits !~ /^[0-9A-Fa-f]+$/ || length(digits) > 6) return ""
+            if (digits !~ /^[0-9A-Fa-f]+$/ || length(digits) > 8) return ""
             cp = 0
             for (k = 1; k <= length(digits); k++) {
               cp = cp * 16 + hex_value(substr(digits, k, 1))
             }
           } else {
-            if (digits !~ /^[0-9]+$/ || length(digits) > 7) return ""
+            if (digits !~ /^[0-9]+$/ || length(digits) > 8) return ""
             cp = digits + 0
           }
           # Every code point that names a character decodes, so no numeric
