@@ -968,23 +968,54 @@ mp_doc_link_targets() {
           # `[audit](h&#252;b.md)` took to reach a hub-only `hüb.md`
           # unreported.
           #
-          # A value that names no character — U+0000, a surrogate, or one
-          # above U+10FFFF — is NOT a character reference here, and the "&"
-          # is emitted literally. The spec substitutes U+FFFD for these,
-          # but that rule is written for reference-in-TEXT; in DESTINATION
-          # position the reference parser leaves them untouched, and both
-          # spellings were measured to agree that the result names no
-          # declared doc:
+          # A value the renderer rejects is NOT a character reference here,
+          # and the "&" is emitted literally. The spec substitutes U+FFFD
+          # for these, but that rule is written for reference-in-TEXT; in
+          # DESTINATION position the reference parser leaves the source
+          # untouched, and the destination reading is the one that decides
+          # where a reader lands:
           #
           #   `[l](a&#0;b.md)`        text: a<U+FFFD>b   href: a&#0;b.md
           #   `[l](a&#xD800;b.md)`    text: a<U+FFFD>b   href: a&#xD800;b.md
           #
           # Following the destination reading keeps this checker aligned
           # with the parser whose output decides whether a link renders.
-          if (cp < 1 || cp > 1114111) return ""
-          if (cp >= 55296 && cp <= 57343) return ""
+          if (!valid_entity_code(cp)) return ""
           REF_LEN = semi
           return utf8_of(cp)
+        }
+        # Which code points the RENDERER will decode. Rejecting a value here
+        # means the reference stays literal source text, which is what the
+        # renderer does with it — it does not substitute U+FFFD.
+        #
+        # Measured in DESTINATION position with the commonmark preset of
+        # markdown-it-py 4.2.0, every range below is left literal:
+        #
+        #   U+0000-U+0008, U+000B, U+000E-U+001F  C0 except tab, LF, FF, CR
+        #   U+007F-U+009F                         DEL and the C1 range
+        #   U+D800-U+DFFF                         surrogates
+        #   U+FDD0-U+FDEF                         noncharacters
+        #   any value whose low 16 bits are FFFE or FFFF
+        #   above U+10FFFF                        out of range
+        #
+        # Only the surrogate and out-of-range rows were rejected before, so
+        # `&#128;` decoded to a character the renderer never emits. That is a
+        # divergence in the false-NEGATIVE direction: a hub-only doc whose
+        # name carries the literal spelling is reachable by a reader and
+        # invisible to the scan. The C1 range is where this bites hardest,
+        # because HTML5 remaps it (`&#128;` to EURO) while CommonMark does
+        # neither the remap nor the decode — so neither an HTML5 table nor a
+        # plain decode matches the renderer, and leaving it literal does.
+        function valid_entity_code(cp,   low) {
+          if (cp <= 8 || cp == 11) return 0
+          if (cp >= 14 && cp <= 31) return 0
+          if (cp >= 127 && cp <= 159) return 0
+          if (cp >= 55296 && cp <= 57343) return 0
+          if (cp >= 64976 && cp <= 65007) return 0
+          if (cp > 1114111) return 0
+          low = cp % 65536
+          if (low == 65534 || low == 65535) return 0
+          return 1
         }
         function percent_decode(s, out, i, c, hi, lo) {
           out = ""

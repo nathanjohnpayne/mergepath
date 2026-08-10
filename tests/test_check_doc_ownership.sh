@@ -1861,6 +1861,57 @@ run_cm_matrix expect_not_rendered "Case 14v" \
   'a one-character body is not an entity name|See [the audit](hub&x;.md) for details.' \
   'a numeric reference needs at least one digit|See [the audit](hub&#;.md) for details.'
 
+# --- Case 14v2: the renderer decides WHICH code points decode --------
+# § Entity and numeric character references says an invalid code point
+# becomes U+FFFD, but that rule is about a reference in TEXT. In DESTINATION
+# position the renderer instead leaves a reference it rejects as literal
+# source, and it rejects far more than the surrogates and out-of-range
+# values this checker used to: all of C0 except tab/LF/FF/CR, DEL and the
+# whole C1 range, the noncharacters, and any value ending FFFE or FFFF.
+#
+# Decoding one of those INVENTS a destination. `h&#128;b.md` is left alone
+# by the renderer, so the href still carries a `#` and a reader lands on
+# `h&` — never on `h<U+0080>b.md`. A checker that decodes anyway resolves to
+# exactly that name, so declaring it hub-only produced a report about a
+# reference no reader can follow. The verdict on the shared `hub.md` fixture
+# cannot see this, because both readings miss `hub.md`; naming the hub-only
+# doc by the string the DECODE produces is what makes the two separable.
+ENTITY_MANIFEST() {
+  printf '%s\npaths:\n  - path: docs/agents/shared.md\n    type: canonical\n    consumers: all\ndoc_ownership:\n  - path: docs/agents/shared.md\n    class: canonical\n  - path: "%s"\n    class: hub-only\n' \
+    "$MIN_HEADER" "$1"
+}
+
+C1_CHAR="$(printf '\302\200')"
+set +e
+out=$(run_with_doc_bodies "$(ENTITY_MANIFEST "docs/agents/h${C1_CHAR}b.md")" \
+  "docs/agents/shared.md|See [the audit](h&#128;b.md) for details.
+docs/agents/h${C1_CHAR}b.md|# Hub-only machinery")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && ! printf '%s\n' "$out" | grep -q 'references the hub-only doc'; then
+  pass "Case 14v2: a C1 reference does not decode, so no reference to the decoded name is invented"
+else
+  fail "Case 14v2 (C1 stays literal) unexpected (rc=$rc): $out"
+fi
+
+# The discriminating control, one code point higher. U+00A0 IS valid, so the
+# renderer decodes it and a reader really does land on a doc named with the
+# character itself. Rejecting this one would be the same error in the
+# opposite direction — a real reference lost — and the pair pins the
+# boundary at exactly U+009F/U+00A0 rather than somewhere nearby.
+NBSP="$(printf '\302\240')"
+set +e
+out=$(run_with_doc_bodies "$(ENTITY_MANIFEST "docs/agents/h${NBSP}b.md")" \
+  "docs/agents/shared.md|See [the audit](h&#160;b.md) for details.
+docs/agents/h${NBSP}b.md|# Hub-only machinery")
+rc=$?
+set -e
+if [ "$rc" = "1" ] && printf '%s\n' "$out" | grep -qF "references the hub-only doc 'docs/agents/h${NBSP}b.md'"; then
+  pass "Case 14v2: U+00A0 is one past the C1 range, so it still decodes"
+else
+  fail "Case 14v2 (U+00A0 decodes) unexpected (rc=$rc): $out"
+fi
+
 # --- Case 14w: HTML blocks vs inline HTML (#811) ---------------------
 # § HTML blocks defines seven start conditions. Only those close the
 # surrounding text flow; a line that merely BEGINS with a `<` — inline
