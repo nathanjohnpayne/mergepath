@@ -1862,8 +1862,14 @@ git worktree remove --force "$STALE_WT" >/dev/null 2>&1 || true
 # reaching a clean audit is the assertion: it proves the advice is actionable
 # and that the report clears once followed, rather than being a permanent
 # exit-2 nag.
-git fetch -q --prune origin >/dev/null 2>&1 || true
-git branch -D "$STALE_UNPRUNED_BRANCH" >/dev/null 2>&1 || true
+#
+# Both commands must SUCCEED. Suppressing their status would let the clean-audit
+# assertion below evaluate a state the remediation never reached, and report the
+# audit as broken when the fixture is what failed.
+git fetch -q --prune origin >/dev/null 2>&1 \
+  || fail "fixture: prune failed, so the prescribed remediation was never applied"
+git branch -D "$STALE_UNPRUNED_BRANCH" >/dev/null 2>&1 \
+  || fail "fixture: could not delete $STALE_UNPRUNED_BRANCH after the prune"
 set +e
 OUT6=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1)
 RC6=$?
