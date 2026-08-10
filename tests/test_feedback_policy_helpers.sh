@@ -176,6 +176,50 @@ eq ""        "$(coderabbit_tier_of 'This is a Minor cleanup note, not a CodeRabb
 eq ""        "$(coderabbit_tier_of 'This is Trivial, no finding badge.')"                    "cr_tier_of: bare titlecase Trivial prose -> empty (#581 4b F2)"
 eq "p2"      "$(coderabbit_tier_of '_📐 Maintainability_ | _🟡 Minor_: This cleanup is Trivial but visible')" "cr_tier_of: Minor badge beats Trivial-in-prose -> p2 (#581 4b F2)"
 
+# --- #888: the two blind spots ---------------------------------------------
+# 1. A `🔴 Critical` badge carrying NO other blocking marker. Before the rung
+#    it graded the same as an unbadged body — unclassified — so neither the
+#    advisory coderabbit-wait.sh count nor the required
+#    coderabbit-severity-gate.sh saw the TOP severity. It joins p1 (not p0):
+#    resolve_required_tiers returns {p1} when a consumer has no
+#    feedback_policy block, so a CodeRabbit p0 would leave Critical
+#    non-blocking exactly where Major blocks.
+eq "p1"      "$(coderabbit_tier_of '_🔒 Security \& Privacy_ | _🔴 Critical_: remote code execution')" "cr_tier_of #888: bare 🔴 Critical badge -> p1 (top severity is no longer unclassified)"
+eq "p1"      "$(coderabbit_tier_of '_🔴 Critical_ | _🟡 Minor_ in the prose below')"                    "cr_tier_of #888: 🔴 Critical outranks a 🟡 Minor badge on the same line"
+
+# 2. The machine tag with no rendered severity badge. `cr-indicator-types` is
+#    the vendor-stable, explicitly machine-readable signal (the #593
+#    precedent); the badge is the surface that already drifted once (#835/#837).
+#    It is a FALLBACK — a body that already classifies keeps its tier — and it
+#    is matched over the FULL body, because the tag renders as a trailing HTML
+#    comment AFTER the finding prose, i.e. routinely past the 600-char badge
+#    anchor.
+CR_TAG='<!-- cr-indicator-types:potential_issue -->'
+eq "p1"      "$(coderabbit_tier_of "**Reject the diagnostic bypass in merge-gate callers.**
+
+The caller accepts a bypass flag that skips the gate.
+
+$CR_TAG")" "cr_tier_of #888: machine tag with no severity badge -> p1"
+# The live shape: the tag sits far past the 600-char badge anchor.
+cr_pad=$(head -c 2000 /dev/zero | tr '\0' 'x')
+eq "p1"      "$(coderabbit_tier_of "**A finding with a long body.**
+
+$cr_pad
+
+$CR_TAG")" "cr_tier_of #888: machine tag beyond the 600-char badge anchor still -> p1"
+# Fallback, not an override: a badged body keeps the badge's tier. The tag
+# names the CATEGORY, the badge names the SEVERITY.
+eq "p2"      "$(coderabbit_tier_of "_📐 Maintainability_ | _🟡 Minor_: rename var
+
+$CR_TAG")" "cr_tier_of #888: badge still wins over the machine tag (Minor + potential_issue -> p2)"
+eq "nitpick" "$(coderabbit_tier_of '_🧹 Nitpick_: tidy this
+
+<!-- cr-indicator-types:nitpick -->')" "cr_tier_of #888: a nitpick-valued tag is not upgraded"
+# Only the exact `potential_issue` value is blocking; other values are not.
+eq ""        "$(coderabbit_tier_of 'A plain suggestion with no badge.
+
+<!-- cr-indicator-types:refactor_suggestion -->')" "cr_tier_of #888: a non-potential_issue tag value stays unclassified"
+
 # --- rc-safety under set -euo pipefail (#581 4b F1) ------------------------
 # A markerless / unclassified call must return rc 0 + empty output, NOT abort a
 # `tier=$(fn "$body")` caller. Asserted directly: the eq cases above nest the

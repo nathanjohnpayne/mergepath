@@ -30,7 +30,9 @@
 # The normalized ladder (see REVIEW_POLICY.md § Feedback Disposition Policy):
 #   p0  critical   p1  high   p2  minor   p3  trivial   nitpick  style
 # Codex maps EXACTLY (badge markers); CodeRabbit maps HEURISTICALLY (category
-# + Critical/Major/Minor qualifier — it has no numeric scale).
+# + Critical/Major/Minor qualifier — it has no numeric scale), with its
+# machine-generated `cr-indicator-types` tag as a last-resort fallback for a
+# body that carries no rendered badge at all (#888).
 
 # Read a scalar field directly under the feedback_policy: block. Mirrors the
 # block-scoped awk reader used by codex_field (scripts/codex-p1-gate.sh) and
@@ -139,23 +141,63 @@ codex_tier_of() {
 # 600 chars (the marker sits near the top), ordered highest-confidence first.
 #
 # CodeRabbit markers → tier (p0 is Codex-only; CodeRabbit never maps to p0):
-#   🟠 Major / Potential issue / ⚠️  → p1
-#   🧹 Nitpick                       → nitpick
-#   🔵 Trivial / Outside diff range  → p3
-#   🟡 Minor                         → p2
-# Anything else (Refactor suggestion, plain Note, bare titlecase prose) → empty.
+#   🔴 Critical / 🟠 Major / Potential issue / ⚠️  → p1
+#   🧹 Nitpick                                     → nitpick
+#   🔵 Trivial / Outside diff range                → p3
+#   🟡 Minor                                       → p2
+# Anything else (Refactor suggestion, plain Note, bare titlecase prose) → empty,
+# EXCEPT the machine-tag fallback below.
+#
+# `🔴 Critical` completes the severity-emoji family (#888). Before it, a
+# Critical-badged finding carrying no other blocking marker graded the same as
+# an unbadged one — the #837 false-clear class at the TOP severity, blind in the
+# advisory `coderabbit-wait.sh` count AND in the required
+# `coderabbit-severity-gate.sh`, because #884 routed both through this one
+# ladder.
+#
+# It joins the p1 rung rather than opening a CodeRabbit p0, even though p0 is
+# what "critical" means in the normalized ladder. `resolve_required_tiers`
+# returns `{p1}` when a consumer has no `feedback_policy` block, so a
+# CodeRabbit p0 would leave the TOP severity NON-blocking in exactly the repos
+# where a Major already blocks — a worse inversion than the blind spot it
+# fixes. At p1, Critical blocks wherever Major blocks, in every config, which
+# is the only relation that is never weaker.
+#
+# Machine-tag fallback (#888). CodeRabbit appends a machine-generated indicator
+# tag to a finding body — `<!-- cr-indicator-types:potential_issue -->` — and
+# that tag is the vendor-stable, explicitly machine-readable signal (the same
+# reason the #593 rate-limit fix keyed on an auto-generated marker), while the
+# rendered badge is the surface that has already drifted once. A body carrying
+# ONLY the tag graded untiered, so neither counter saw it.
+#
+# Three deliberate properties:
+#   - it is a FALLBACK, consulted only after every badge rung misses, so a body
+#     that classifies today keeps exactly the tier it has. `🟡 Minor` plus the
+#     tag stays p2: the tag names the CATEGORY (potential issue vs nitpick vs
+#     refactor), the badge names the SEVERITY, and the badge is the one this
+#     ladder grades.
+#   - it scans the FULL body, not the 600-char head, because the tag renders as
+#     a trailing HTML comment after the finding prose (verbatim in the live #835
+#     body, and in tests/test_coderabbit_wait_status_probe.sh's fixture of it).
+#     A head-anchored match would see it only on short bodies.
+#   - only the exact `potential_issue` value is matched. The tag's other values
+#     (`nitpick`, `refactor_suggestion`, …) are not blocking, and guessing at
+#     an unobserved vocabulary is how a classifier over-blocks.
 coderabbit_tier_of() {
-  local head
+  local body head
   # Truncate via parameter expansion (not `printf | head -c`): under
   # `set -euo pipefail` a large body makes head close the pipe early and
   # printf exits 141 (SIGPIPE), which aborts every caller. The badge markers
   # matched below are near the start, so a 600-char cut is more than enough.
-  head="${1:-}"; head="${head:0:600}"
+  body="${1:-}"; head="${body:0:600}"
   case "$head" in
-    *"🟠 Major"*|*"Potential issue"*|*"⚠️"*)  echo p1; return 0 ;;
+    *"🔴 Critical"*|*"🟠 Major"*|*"Potential issue"*|*"⚠️"*)  echo p1; return 0 ;;
     *"🧹 Nitpick"*)                            echo nitpick; return 0 ;;
     *"🔵 Trivial"*|*"Outside diff range"*)     echo p3; return 0 ;;
     *"🟡 Minor"*)                              echo p2; return 0 ;;
+  esac
+  case "$body" in
+    *"cr-indicator-types:potential_issue"*)    echo p1; return 0 ;;
   esac
   return 0
 }

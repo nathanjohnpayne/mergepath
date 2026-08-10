@@ -3656,6 +3656,59 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 49 (#888): the two closed classifier blind spots reach the REQUIRED gate.
+#
+# The rungs live in scripts/lib/feedback-policy-helpers.sh, which is the whole
+# point — #884 routed the advisory coderabbit-wait.sh count and this gate
+# through one classifier, so a blind spot there went blind in both at once, and
+# a private rule in either would re-open the drift #837 closed. These two cases
+# assert the gate BLOCKS on each shape end-to-end rather than asserting the
+# classifier is called: the classifier's own tiering is unit-tested in
+# tests/test_feedback_policy_helpers.sh.
+#
+#   a. a bare `🔴 Critical` badge with no other blocking marker
+#   b. a body whose ONLY signal is the machine tag `cr-indicator-types:
+#      potential_issue`, rendered where CodeRabbit puts it — a trailing HTML
+#      comment after the prose
+# ---------------------------------------------------------------------------
+BARE_CRITICAL_BODY="_🔒 Security & Privacy_ | _🔴 Critical_
+
+Remote code execution via the unvalidated path."
+MARKER_ONLY_BODY="**Reject the diagnostic bypass in merge-gate callers.**
+
+The caller accepts a bypass flag that skips the gate.
+
+<!-- cr-indicator-types:potential_issue -->"
+
+for case_name in bare-critical marker-only; do
+  case "$case_name" in
+    bare-critical) CASE_BODY="$BARE_CRITICAL_BODY"; CASE_LABEL="a bare 🔴 Critical badge" ;;
+    *)             CASE_BODY="$MARKER_ONLY_BODY";  CASE_LABEL="a machine-tag-only body (cr-indicator-types:potential_issue)" ;;
+  esac
+  echo
+  echo "--- Test 49 (#888): $CASE_LABEL, unresolved"
+  SCRATCH=$(make_scratch_with_config true)
+  FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+  FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$CASE_BODY")
+  FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [2001]}]')
+  set +e
+  OUT=$(
+    FIXTURE_PR="$FIXTURE_PR" \
+    FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+    FIXTURE_THREADS="$FIXTURE_THREADS" \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1
+  )
+  RC=$?
+  set -e
+  if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+    pass "#888: $CASE_LABEL blocks the required gate (rc 1, unresolved 1)"
+  else
+    fail "#888: expected rc=1 with 'unresolved: 1' for $CASE_LABEL; got rc=$RC"
+    echo "$OUT" | sed 's/^/      /' >&2
+  fi
+done
+
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_coderabbit_severity_gate.sh: $PASS passed, $FAIL failed"

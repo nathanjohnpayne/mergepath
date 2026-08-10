@@ -633,12 +633,12 @@ Both reviewers are mapped onto one ladder so a single policy covers them:
 | Tier | Meaning | Codex (exact) | CodeRabbit (heuristic) |
 |------|---------|---------------|------------------------|
 | `p0` | critical / blocker | `![P0 Badge]` / `**P0` | — (Codex-only; CodeRabbit tops at p1) |
-| `p1` | high / blocking | `![P1 Badge]` / `**P1` | `⚠️ Potential issue` / `🟠 Major` |
+| `p1` | high / blocking | `![P1 Badge]` / `**P1` | `⚠️ Potential issue` / `🟠 Major` / `🔴 Critical` / the `cr-indicator-types:potential_issue` machine tag |
 | `p2` | minor | `![P2 Badge]` / `**P2` | `🟡 Minor` |
 | `p3` | cosmetic / trivial | `![P3 Badge]` / `**P3` | `🔵 Trivial` |
 | `nitpick` | style / nit | — (Codex P3 maps to `p3`) | `🧹 Nitpick` |
 
-The CodeRabbit column mirrors `classify_severity` (`scripts/lib/daily-feedback-rollup-helpers.sh`), the repo's canonical badge parser: CodeRabbit findings are keyed off the severity badge, top out at `p1` (Major / Potential issue / ⚠️), and never map to `p0` — `p0` is Codex-only. A Refactor suggestion or a stray "security" mention carries no severity badge, so it is unclassified (discretionary).
+The CodeRabbit column mirrors `classify_severity` (`scripts/lib/daily-feedback-rollup-helpers.sh`), the repo's canonical badge parser: CodeRabbit findings are keyed off the severity badge, top out at `p1` (Critical / Major / Potential issue / ⚠️), and never map to `p0` — `p0` is Codex-only. `🔴 Critical` joins the `p1` rung rather than opening a CodeRabbit `p0` (#888): `resolve_required_tiers` yields `{p1}` when a repo has no `feedback_policy` block, so a CodeRabbit `p0` would leave the top severity non-blocking exactly where a Major already blocks. A Refactor suggestion or a stray "security" mention carries no severity badge, so it is unclassified (discretionary) — unless the body carries CodeRabbit's machine-generated `cr-indicator-types:potential_issue` tag, which grades `p1` as a last-resort fallback when no badge is present at all (#888). The tag is a fallback, never an override: a badged body keeps its badge's tier, because the tag names the finding's category and the badge names its severity.
 
 Codex emits an explicit machine-readable badge per finding; CodeRabbit has no numeric scale, so its tier is derived heuristically (category + a `Critical`/`Major`/`Minor` qualifier) by `coderabbit_tier_of` in `scripts/lib/feedback-policy-helpers.sh`.
 
