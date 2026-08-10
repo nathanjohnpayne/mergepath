@@ -35,6 +35,13 @@ git clone ... /tmp/<repo>-pr123-review
 - Relocate a stray worktree with `git worktree move <old> ~/GitHub/.<repo>-worktrees/<slug>` — never plain `mv`, which breaks git's `gitdir` back-pointers.
 - Remove a merged or stale worktree with `git worktree remove <path>`. Cleanup policy and audit tooling live in `docs/agents/operating-rules.md` § Worktree lifecycle.
 
+### Two hazards for anyone writing cleanup tooling
+
+Both of these make a *merged* branch or its checkout look like live work, so tooling that gets either wrong retains stale state forever while reporting a clean run.
+
+- **A squash-merged branch is not an ancestor of the default branch.** Under squash merge the branch's own commits never enter the default branch's history, so `git rev-list --count origin/main..<branch>` stays permanently non-zero for a branch whose PR demonstrably merged. Decide "merged" from PR state — `gh pr list --head <branch> --state merged`, comparing the merged PR's recorded head against the local tip — never from ancestry against the default branch. An ancestry test is the natural thing to reach for and it is wrong: it reads as a confident "unmerged, do not touch" for every squash-merged branch.
+- **"Upstream gone" is a separate signal from "merged", and it lags.** `git branch -vv`'s `[origin/<branch>: gone]` marker appears only after a `git fetch --prune` has removed the stale `refs/remotes/origin/<branch>`, so a branch whose remote was deleted on merge keeps a live-looking upstream until someone happens to prune. Tooling that treats gone-upstream as a *precondition* for its merged check must either prune first or probe the remote directly (`git ls-remote`), or a merged branch is silently retained and never reaches the merged check at all.
+
 ## Scope and enforcement honesty
 
 This is a machine-local filesystem convention. Repository CI cannot see or enforce anything about paths outside the repo checkout it runs in, so there is no CI gate for it and none should be added. It is enforced by agents following it, by local audit tooling run on demand, and by reviewers flagging violations when a checkout path surfaces in a review or handoff transcript.
