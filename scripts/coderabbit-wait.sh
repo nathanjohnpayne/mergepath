@@ -148,7 +148,15 @@
 #       # place, so created_at can predate the head it attests by a day or
 #       # more. fresh_at carries the edit time; consumers needing head
 #       # identity read head_sha, never a timestamp.
-#       "endpoint": "issues" | "pulls" | "reviews",
+#       # The StatusContext fast path emits the synthetic
+#       # "status_context" endpoint, where there is no GitHub review object:
+#       # `id` is null and `created_at` is the STATUS' own creation time,
+#       # never the synthesis time (#912) — a verdict off a status that has
+#       # sat untouched for 40 minutes must not read as current. The
+#       # synthesis time is carried separately as `observed_at`, emitted on
+#       # that endpoint only.
+#       "observed_at": "<iso-8601>",
+#       "endpoint": "issues" | "pulls" | "reviews" | "status_context",
 #       # "reviews" evidence only (#869, additive): the object's own
 #       # submitted_at — the same instant created_at carries on that
 #       # endpoint, named explicitly so the Phase 4b barrier's temporal
@@ -2504,24 +2512,36 @@ emit_status_context_verdict() {
   # counts findings by each comment's own `commit_id == HEAD_SHA`,
   # which is the right scope given the fast-path already has
   # authoritative SHA-level evidence from the StatusContext check.
+  local status_created_at=${2:-}
   local potential_issues synthetic
   potential_issues=$(count_potential_issues_for_sha "$HEAD_SHA")
   # Keep the synthetic review object compatible with the documented
   # contract at the top of this file: `{ id, created_at, endpoint,
   # body_excerpt }`. The fast-path has no underlying GitHub review,
-  # so `id` is null and `created_at` is the synthesis time — but a
-  # caller reading `review.id` or `review.created_at` no longer hits
-  # a missing key and breaks. `endpoint` keeps the new
-  # "status_context" value (a documented extension for this path); the
-  # extra `head_sha` / `context_state` / `potential_issue_count`
-  # fields are additive. (CodeRabbit Major, #272.)
+  # so `id` is null — but a caller reading `review.id` or
+  # `review.created_at` no longer hits a missing key and breaks.
+  # `endpoint` keeps the new "status_context" value (a documented
+  # extension for this path); the extra `head_sha` / `context_state` /
+  # `potential_issue_count` fields are additive. (CodeRabbit Major, #272.)
+  #
+  # `created_at` is the STATUS' own creation time, not the synthesis time
+  # (#912). Emitting the observation time made a verdict off a stale status
+  # look head-anchored and current: on #909 the JSON read
+  # `created_at: 2026-08-05T03:01:04Z` while the status it trusted had been
+  # sitting untouched since `02:18:59Z`, and nothing in the payload showed
+  # that. The synthesis time is not lost — it moves to the additive
+  # `observed_at`, so a reader can see both the evidence's age and when the
+  # helper looked. Falls back to the synthesis time only when the caller
+  # passed no status timestamp, so the field is never absent or null.
   synthetic=$(jq -nc \
     --arg sha "$HEAD_SHA" \
     --arg state "$state" \
+    --arg status_at "$status_created_at" \
     --argjson p "$potential_issues" \
     '{
       id: null,
-      created_at: (now | todateiso8601),
+      created_at: (if $status_at == "" then (now | todateiso8601) else $status_at end),
+      observed_at: (now | todateiso8601),
       endpoint: "status_context",
       head_sha: $sha,
       context_state: $state,
@@ -3126,7 +3146,7 @@ if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
       log "StatusContext success on $HEAD_SHA carries description '$INITIAL_CTX_DESC', which does not name a completed review — CodeRabbit is reporting that it did NOT review this head, so this is not clearance; falling through to the comment-driven poll (#891/#897/#912)"
     elif ! status_context_fast_path_blocked_by_comment "$INITIAL_CTX_CREATED"; then
       log "StatusContext success — entering fast-path verdict (scans inline findings before clearance)"
-      emit_status_context_verdict "$INITIAL_CTX"
+      emit_status_context_verdict "$INITIAL_CTX" "$INITIAL_CTX_CREATED"
     fi
   fi
 fi
@@ -3152,7 +3172,7 @@ while :; do
         log "mid-loop StatusContext success on $HEAD_SHA carries description '$LOOP_CTX_DESC', which does not name a completed review — not clearance (#891/#897/#912)"
       elif ! status_context_fast_path_blocked_by_comment "$LOOP_CTX_CREATED"; then
         log "CodeRabbit StatusContext flipped to success mid-loop on $HEAD_SHA — entering fast-path verdict"
-        emit_status_context_verdict "$LOOP_CTX"
+        emit_status_context_verdict "$LOOP_CTX" "$LOOP_CTX_CREATED"
       fi
     fi
   fi

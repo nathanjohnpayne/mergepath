@@ -464,6 +464,25 @@ test_status_description_predicate_unit() {
   [ "$FAIL" -ne "$before" ] || pass "12: crw_status_description_permits_clearance — empty and completed clear; rate-limited, pending and unknown wordings do not"
 }
 
+# --- Test 13: #912 — the fast-path verdict carries the STATUS' own time -----
+# The #909 false clear was hard to spot because the JSON looked head-anchored
+# and current: `review.created_at` was the script's OBSERVATION time while the
+# status it trusted had been sitting untouched for 40 minutes. `created_at` is
+# now the status' own creation time and the observation time moves to the
+# additive `observed_at`, so a reader sees the evidence's age AND when the
+# helper looked.
+test_status_context_verdict_carries_status_created_at() {
+  local dir rc before=$FAIL
+  dir=$(make_case "verdict-timestamps" "$REVIEW_BODY_CLEAN" "$STATUS_AFTER_NOTICE" "Review completed")
+  rc=$(run_case "$dir")
+  [ "$rc" = "0" ] || fail "13: expected exit 0 (cleared), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.review.endpoint')" = "status_context" ] || fail "13: expected the fast-path verdict, got endpoint=$(jqf "$dir" '.review.endpoint')"
+  [ "$(jqf "$dir" '.review.created_at')" = "$STATUS_AFTER_NOTICE" ] || fail "13: review.created_at=$(jqf "$dir" '.review.created_at'), expected the status' own created_at $STATUS_AFTER_NOTICE"
+  [ "$(jqf "$dir" '.review.observed_at')" != "null" ] || fail "13: review.observed_at is null; the synthesis time must still be carried"
+  [ "$(jqf "$dir" '.review.observed_at')" != "$STATUS_AFTER_NOTICE" ] || fail "13: review.observed_at equals the status time; it must be the observation time"
+  [ "$FAIL" -ne "$before" ] || pass "13: #912 — the status_context verdict carries the status' own created_at, with the observation time in observed_at"
+}
+
 test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
 test_headref_later_success_clears
@@ -476,6 +495,7 @@ test_aged_notice_with_open_window_suppresses
 test_aged_notice_with_expired_window_clears
 test_trailing_probe_flag_is_usage_error
 test_status_description_predicate_unit
+test_status_context_verdict_carries_status_created_at
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"
