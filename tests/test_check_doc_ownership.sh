@@ -1736,10 +1736,22 @@ docs/agents/hub.md|# Hub-only machinery"
 # seven hex digits do NOT decode, when markdown-it-py decodes both — a
 # reader reached `hub.md` and neither the checker nor the suite noticed.
 #
-# Availability follows scripts/lint-md-prose-wrap.sh: markdown-it-py is
-# pinned at 4.2.0 by .github/workflows/md-prose-wrap.yml and that gate soft-
-# passes without it, so a checkout lacking it keeps the declared verdicts
-# rather than failing on a missing dependency.
+# Availability follows scripts/lint-md-prose-wrap.sh: the interpreter is
+# ${MD_REFLOW_PYTHON:-python3} and markdown-it-py is pinned at 4.2.0 by
+# .github/workflows/md-prose-wrap.yml, which soft-passes without it. A
+# checkout lacking it keeps the declared verdicts rather than failing on a
+# missing dependency.
+#
+# Availability is NOT enough, though: a renderer is only an oracle for the
+# CommonMark version these rows are written against. The propagated
+# repo_lint.yml installs nothing and picks up whatever markdown-it-py the
+# runner happens to carry, which today is a 0.30-era build — and 0.30 and
+# 0.31 disagree about the HTML block condition 6 tag list that Case 14w
+# exercises directly. Cross-checking 0.31 rows against a 0.30 renderer
+# reports the ROWS as wrong when it is the renderer that targets another
+# spec, so activation is gated on a conformance probe (below) and a
+# non-conforming renderer SKIPS the cross-check with that reason named.
+CM_ORACLE_PYTHON="${MD_REFLOW_PYTHON:-python3}"
 CM_ORACLE="$WORKDIR/cm_oracle.py"
 cat > "$CM_ORACLE" <<'CM_ORACLE_EOF'
 """Print `rendered` when markdown-it-py's commonmark preset resolves any link
@@ -1780,12 +1792,73 @@ for dest in destinations:
 print(verdict)
 CM_ORACLE_EOF
 
-if command -v python3 >/dev/null 2>&1 && python3 -c 'import markdown_it' >/dev/null 2>&1; then
-  CM_ORACLE_READY=1
+# The conformance probe. Two tags, one in each direction, both drawn from the
+# 0.30 -> 0.31 delta rather than from any row that has ever failed: 0.31
+# removed `source` from the condition 6 tag list and added `search`. A
+# renderer that inverts either one is answering a different specification
+# than the rows ask about, and its verdicts are not evidence about them.
+CM_ORACLE_PROBE="$WORKDIR/cm_oracle_probe.py"
+cat > "$CM_ORACLE_PROBE" <<'CM_ORACLE_PROBE_EOF'
+"""Print `match` when the installed markdown-it-py implements the CommonMark
+version the matrix rows are written against, on the axis the matrix is
+version-sensitive about; otherwise print a one-line reason it is not an
+oracle for those rows."""
+from markdown_it import MarkdownIt
+
+MD = MarkdownIt("commonmark")
+
+
+def opens_html_block(tag):
+    """True when `<tag>` starts an HTML block that swallows the next line.
+
+    A condition 6 tag closes the surrounding text flow, so the four-space
+    continuation below is raw block content and its link never renders. Any
+    other tag leaves a paragraph open and the continuation still links.
+    """
+    body = "<" + tag + ">governance\n    See [the audit](hub.md)\n"
+    for token in MD.parse(body):
+        if token.type != "inline":
+            continue
+        for child in token.children or []:
+            if child.type == "link_open":
+                return False
+    return True
+
+
+EXPECTED = (("search", True), ("source", False))
+seen = [(tag, opens_html_block(tag)) for tag, _ in EXPECTED]
+if seen == [(tag, want) for tag, want in EXPECTED]:
+    print("match")
+else:
+    print(
+        "renderer HTML block condition 6 tag list is not CommonMark 0.31 ("
+        + ", ".join(tag + "=" + str(got) for tag, got in seen)
+        + ")"
+    )
+CM_ORACLE_PROBE_EOF
+
+CM_ORACLE_READY=0
+CM_ORACLE_SKIP_REASON=""
+if ! command -v "$CM_ORACLE_PYTHON" >/dev/null 2>&1; then
+  CM_ORACLE_SKIP_REASON="$CM_ORACLE_PYTHON not found"
+elif ! "$CM_ORACLE_PYTHON" -c 'import markdown_it' >/dev/null 2>&1; then
+  CM_ORACLE_SKIP_REASON="markdown-it-py absent"
 else
-  CM_ORACLE_READY=0
-  echo "NOTE: markdown-it-py unavailable — CommonMark matrix rows run without" \
-       "the reference-renderer cross-check" >&2
+  set +e
+  cm_probe_out=$("$CM_ORACLE_PYTHON" "$CM_ORACLE_PROBE" 2>&1)
+  cm_probe_rc=$?
+  set -e
+  if [ "$cm_probe_rc" != "0" ]; then
+    CM_ORACLE_SKIP_REASON="reference-renderer probe errored (rc=$cm_probe_rc): $cm_probe_out"
+  elif [ "$cm_probe_out" != "match" ]; then
+    CM_ORACLE_SKIP_REASON="$cm_probe_out"
+  else
+    CM_ORACLE_READY=1
+  fi
+fi
+if [ "$CM_ORACLE_READY" != "1" ]; then
+  echo "NOTE: CommonMark matrix rows run without the reference-renderer" \
+       "cross-check — $CM_ORACLE_SKIP_REASON" >&2
 fi
 
 # Drive a `label|body` matrix through run_truth_body and assert the given
@@ -1802,7 +1875,7 @@ run_cm_matrix() {
     body="${row#*|}"
     if [ "$CM_ORACLE_READY" = "1" ]; then
       set +e
-      seen=$(printf '%b\n' "$body" | python3 "$CM_ORACLE" 2>&1)
+      seen=$(printf '%b\n' "$body" | "$CM_ORACLE_PYTHON" "$CM_ORACLE" 2>&1)
       orc=$?
       set -e
       if [ "$orc" != "0" ]; then
@@ -2335,17 +2408,20 @@ if [ -f "$ROOT/.mergepath-sync.yml" ]; then
 fi
 
 echo
-# Say on STDOUT whether the CommonMark oracle actually ran. Without this the
-# only trace is a stderr note, so a CI job with no markdown-it-py reports a
-# clean pass that silently skipped every renderer cross-check — the matrix
-# would be back to confirming that the checker agrees with expectations
-# written by the same hand. The repo_lint job is such an environment today
-# (tracked in #929); making the skip visible is what keeps a green run from
-# being mistaken for a verified one.
+# Say on STDOUT whether the CommonMark oracle actually ran, and when it did
+# not, why. Without this the only trace is a stderr note, so an environment
+# whose renderer is missing or targets another spec version reports a clean
+# pass that silently skipped every cross-check — the matrix would be back to
+# confirming that the checker agrees with expectations written by the same
+# hand. The propagated repo_lint job is such an environment today (tracked in
+# #929): it installs nothing, so its renderer is whatever the runner carries.
+# Printing the reason is what keeps a green run from being mistaken for a
+# verified one, and distinguishes "no renderer here" from "the renderer here
+# answers a different specification".
 if [ "${CM_ORACLE_READY:-0}" = "1" ]; then
   echo "test_check_doc_ownership: CommonMark oracle ACTIVE (rows cross-checked against markdown-it-py)"
 else
-  echo "test_check_doc_ownership: CommonMark oracle SKIPPED (markdown-it-py absent; rows NOT cross-checked)"
+  echo "test_check_doc_ownership: CommonMark oracle SKIPPED (${CM_ORACLE_SKIP_REASON:-unavailable}; rows NOT cross-checked)"
 fi
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then
