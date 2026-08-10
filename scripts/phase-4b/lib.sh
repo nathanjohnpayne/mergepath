@@ -540,28 +540,38 @@ p4b_barrier_note_pending() {
 # Falling through is safe in every direction: an ignored `P4B_CLAIM_DIR` lands
 # on the shared per-user root, which is *more* serialized than what the
 # operator asked for, never less.
+#
+# An override chooses the BASE, never the host scoping — see the comment on the
+# host component below.
 p4b_barrier_claim_root() {
   local base host
-  case "${P4B_CLAIM_DIR:-}" in
-    /*) printf '%s' "$P4B_CLAIM_DIR" ; return 0 ;;
-  esac
+  # Pick the BASE. Each branch is absolute or it does not win.
   base=""
-  case "${XDG_STATE_HOME:-}" in /*) base="$XDG_STATE_HOME" ;; esac
+  case "${P4B_CLAIM_DIR:-}" in /*) base="$P4B_CLAIM_DIR" ;; esac
   if [ -z "$base" ]; then
-    case "${HOME:-}" in /*) base="$HOME/.local/state" ;; esac
+    case "${XDG_STATE_HOME:-}" in /*) base="$XDG_STATE_HOME/mergepath/write-claims" ;; esac
   fi
-  if [ -n "$base" ]; then
-    host="$(uname -n 2>/dev/null || true)"
-    host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || true)"
-    printf '%s/mergepath/write-claims/%s' "$base" "${host:-localhost}"
-    return 0
+  if [ -z "$base" ]; then
+    case "${HOME:-}" in /*) base="$HOME/.local/state/mergepath/write-claims" ;; esac
   fi
-  # No home to anchor on: today's per-checkout location, which is per-checkout
-  # by design, so there is no cross-checkout guarantee left to protect here.
-  case "${P4B_ACCT_STATE_DIR:-}" in
-    /*) printf '%s' "$P4B_ACCT_STATE_DIR" ; return 0 ;;
-  esac
-  printf '%s/.mergepath' "$(p4b_repo_root)"
+  if [ -z "$base" ]; then
+    # No home to anchor on: today's per-checkout location.
+    case "${P4B_ACCT_STATE_DIR:-}" in
+      /*) base="$P4B_ACCT_STATE_DIR" ;;
+      *)  base="$(p4b_repo_root)/.mergepath" ;;
+    esac
+  fi
+  # The host component belongs to the CLAIM NAMESPACE, not to the base, so it
+  # is appended on every branch including an explicit override (Codex P2, round
+  # 3). Ownership is a machine-local PID; point the override at NFS or a synced
+  # directory and, without this, host B reads host A's live PID, finds some
+  # unrelated local process at that number and either reaps a live claim or
+  # holds the barrier against a dead one. Host-scoping declines to coordinate
+  # across machines — which no filesystem lock over PIDs could have done
+  # anyway — instead of coordinating them wrongly.
+  host="$(uname -n 2>/dev/null || true)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || true)"
+  printf '%s/%s' "$base" "${host:-localhost}"
 }
 
 # p4b_barrier_claim_path <repo> <pr> <key> <kind>
@@ -578,9 +588,16 @@ p4b_barrier_claim_root() {
 # real slug and the encoding is reversible. Claims carry no durable meaning —
 # the record of what was posted is the timeline marker — so re-spelling the
 # path costs nothing beyond one stranded empty directory per in-flight run.
+#
+# Case is CANONICALISED first (Codex P2, round 3). GitHub repository identity
+# is case-insensitive, so `--repo Owner/Repo` and `--repo owner/repo` name one
+# repository and must reserve one claim; on a case-sensitive filesystem they
+# otherwise took two directories and both entered the region. Folding case is
+# not a loss of injectivity for the same reason it is needed — the spellings it
+# merges are the same repository.
 p4b_barrier_claim_path() {
   local repo_slug
-  repo_slug="$(printf '%s' "${1:-unknown}" | sed 's|/|%2F|g')"
+  repo_slug="$(printf '%s' "${1:-unknown}" | tr 'A-Z' 'a-z' | sed 's|/|%2F|g')"
   printf '%s/phase-4b-barrier/%s-pr%s-%s.%s.claim' \
     "$(p4b_barrier_claim_root)" "$repo_slug" "${2:-0}" "${3:-nohead}" "${4:-trigger}"
 }

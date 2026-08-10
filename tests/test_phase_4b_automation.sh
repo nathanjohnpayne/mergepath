@@ -3174,20 +3174,26 @@ case "$_r" in
   "$WORK/fakehome/.local/state/mergepath/write-claims/"?*) ;;
   *) bad="$bad relative-override-honoured=$_r" ;;
 esac
-# An absolute override is used verbatim — the property every test above relies on.
+# An absolute override chooses the BASE and nothing else. The host component is
+# part of the claim namespace, not of the base, so it survives an override —
+# point one at NFS without it and host B reads host A's live PID (Codex P2,
+# round 3). The default root's host suffix is reused as the expected value, so
+# this cannot pass by both sides being empty.
+_host="${_r##*/}"
+[ -n "$_host" ] || bad="$bad host-suffix-empty"
 _r="$( P4B_CLAIM_DIR="$WORK/abs-claims" p4b_barrier_claim_root )"
-[ "$_r" = "$WORK/abs-claims" ] || bad="$bad absolute-override=$_r"
+[ "$_r" = "$WORK/abs-claims/$_host" ] || bad="$bad absolute-override=$_r"
 # No home at all: fall back to today's per-checkout location rather than fail
 # closed in a configuration that has always worked.
 _r="$( ( unset P4B_CLAIM_DIR XDG_STATE_HOME HOME; P4B_ACCT_STATE_DIR="$WORK/nohome-state" p4b_barrier_claim_root ) )"
-[ "$_r" = "$WORK/nohome-state" ] || bad="$bad homeless-root=$_r"
+[ "$_r" = "$WORK/nohome-state/$_host" ] || bad="$bad homeless-root=$_r"
 # ...and P4B_ACCT_STATE_DIR is operator-supplied too, so a relative one is
 # ignored on that branch as well and the repo-root default decides. That
 # default is absolute by construction (`cd -P` in p4b_repo_root), which is what
 # keeps the last branch honest (CodeRabbit round 2, Codex P2 round 2).
 _r="$( ( cd "$WORK" && unset P4B_CLAIM_DIR XDG_STATE_HOME HOME; P4B_ACCT_STATE_DIR=rel-state p4b_barrier_claim_root ) )"
 case "$_r" in
-  /*/.mergepath) ;;
+  /*/.mergepath/?*) ;;
   *) bad="$bad homeless-relative-root=$_r" ;;
 esac
 # The repo slug is injective: two DISTINCT repos that a `/`→`-` flattening
@@ -3197,8 +3203,15 @@ esac
 _p1="$( P4B_CLAIM_DIR="$WORK/abs-claims" p4b_barrier_claim_path foo-bar/baz 3 k trigger )"
 _p2="$( P4B_CLAIM_DIR="$WORK/abs-claims" p4b_barrier_claim_path foo/bar-baz 3 k trigger )"
 [ "$_p1" != "$_p2" ] || bad="$bad repo-slug-collision=$_p1"
+# ...and case-canonical, because GitHub repository identity is case-insensitive:
+# `--repo Owner/Repo` and `--repo owner/repo` name ONE repository and must
+# reserve ONE claim, which on a case-sensitive filesystem they did not (Codex
+# P2, round 3).
+_p3="$( P4B_CLAIM_DIR="$WORK/abs-claims" p4b_barrier_claim_path Owner/Repo 3 k trigger )"
+_p4="$( P4B_CLAIM_DIR="$WORK/abs-claims" p4b_barrier_claim_path owner/repo 3 k trigger )"
+[ "$_p3" = "$_p4" ] || bad="$bad repo-case-split=$_p3/$_p4"
 if [ -z "$bad" ]; then
-  pass "#858: the claim root is per-user, per-HOST and absolute on every branch; every relative operator value is ignored; the repo slug is injective"
+  pass "#858: the claim root is per-user and absolute on every branch, host-scoped even under an override; every relative operator value is ignored; the repo slug is injective and case-canonical"
 else
   fail "#858: claim root resolution wrong:$bad"
 fi
