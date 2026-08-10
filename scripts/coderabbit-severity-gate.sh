@@ -1241,6 +1241,17 @@ while IFS= read -r SUMMARY_JSON; do
   # 🟡 Minor on #936). The shared function scopes the tag fallback to the
   # stanza it trails; coderabbit-wait.sh's summary scan grades through the same
   # one, so the advisory and required readings of one body cannot diverge.
+  #
+  # Graded BEFORE the loop, with the status checked, because a here-document
+  # discards its command substitution's exit status: `done <<EOF\n$(pipeline)`
+  # cannot fail. An awk that died on a pathological body therefore produced an
+  # empty stream, the loop found nothing, and this REQUIRED gate reported zero
+  # blocking summary findings — a failed read reading as a clean report, which
+  # is the fail-open shape the gate exists to prevent (CodeRabbit 🟠 Major on
+  # #936). Exit 2, the config/infra code the gate already uses for "cannot
+  # decide", never 0.
+  SUMMARY_GRADED=$(summary_unfenced_numbered "$SUMMARY_SCAN" | coderabbit_scan_tiers) \
+    || die 2 "failed to grade the PR-level summary (comment id $SUMMARY_ID) — refusing to report zero blocking findings from an unread summary"
   while IFS= read -r cr_graded; do
     [ -n "$cr_graded" ] || continue
     cr_line_no=${cr_graded%%	*}
@@ -1262,7 +1273,7 @@ while IFS= read -r SUMMARY_JSON; do
       ')
     fi
   done <<EOF
-$(summary_unfenced_numbered "$SUMMARY_SCAN" | coderabbit_scan_tiers)
+$SUMMARY_GRADED
 EOF
   # Only bind a fingerprint when there is something to acknowledge. With no
   # blocking finding the token is never printed and never consulted, and

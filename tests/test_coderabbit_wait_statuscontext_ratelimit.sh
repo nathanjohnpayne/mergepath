@@ -420,9 +420,12 @@ test_aged_notice_with_open_window_suppresses() {
 
 # --- Test 10: escape — an aged-out notice whose window has EXPIRED ----------
 # The suppression is scoped by the PUBLISHED window, not by "a notice exists".
-# Same fixture as test 9 with a 13-minute window (780s + 30s buffer = 810s),
-# long expired at 2400s elapsed, so the head clears exactly as it did before —
-# the boundary that keeps this rule from becoming an unbounded block.
+# Same aged timestamps as test 9, but a DIFFERENT notice body:
+# RATE_LIMIT_BODY_HEADREF, whose published window is 13 minutes (780s + 30s
+# buffer = 810s) and so long expired at 2400s elapsed. Because that body names
+# HEAD_SHA, the #596 HEAD-referencing arbitration participates here too, and
+# the head clears exactly as it did before — the boundary that keeps this rule
+# from becoming an unbounded block.
 test_aged_notice_with_expired_window_clears() {
   local dir rc before=$FAIL
   dir=$(make_case "aged-expired-window" "$RATE_LIMIT_BODY_HEADREF" \

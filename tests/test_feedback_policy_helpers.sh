@@ -339,6 +339,32 @@ eq "$(cr_scan_pairs "$CR_MINOR_TAGGED")" \
    "$(printf '%s\n' "$CR_MINOR_TAGGED" | awk '{ printf "%d\t%s\n", NR, $0 }' | coderabbit_scan_tiers \
       | awk -F'\t' '{ printf "%s%s:%s", (NR > 1 ? " " : ""), $1, $2 }')" \
   "cr_scan_tiers: --number agrees line-for-line with a caller-numbered stream"
+# The stanza TERMINATOR is the tag's presence, not its tier. CodeRabbit's tag
+# vocabulary is wider than the one blocking value: a `nitpick` or
+# `refactor_suggestion` tag closes its finding just as a `potential_issue` one
+# does. Keying the reset on "the tag graded" instead left the badged stanza's
+# tier latched across such a terminator, and the NEXT finding — the badge-less
+# one the #888 rung exists for — was suppressed as though that earlier badge
+# had graded it. An UNDER-block, on the required gate. Without the fix this
+# reads `1:p2` and the p1 on line 11 is silently gone (Codex P1 on #936).
+eq "1:p2 11:p1" "$(cr_scan_pairs '_🔒 Security & Privacy_ | _🟡 Minor_ | _⚡ Quick win_
+
+**Bound the retry delay.**
+
+<!-- cr-indicator-types:nitpick -->
+
+**Reject the diagnostic bypass in merge-gate callers.**
+
+The caller accepts a bypass flag that skips the gate.
+
+<!-- cr-indicator-types:potential_issue -->')" \
+  "cr_scan_tiers #936: a non-blocking tag value still CLOSES its stanza, so the next badge-less finding keeps the #888 fallback"
+# And the terminator does not become a promoter: an unrecognized tag value on a
+# badge-less stanza grades nothing, because only `potential_issue` is blocking.
+eq "" "$(cr_scan_pairs '**Rename the temp variable.**
+
+<!-- cr-indicator-types:refactor_suggestion -->')" \
+  "cr_scan_tiers #936: closing a stanza is not grading it — a non-blocking tag value alone emits no tier"
 # rc-safety under `set -euo pipefail`, the same contract the two classifiers
 # carry: no graded line is rc 0 + empty, not a failure that aborts the caller.
 rc=0; out=$(printf 'ordinary prose with no marker\n' | coderabbit_scan_tiers --number) || rc=$?

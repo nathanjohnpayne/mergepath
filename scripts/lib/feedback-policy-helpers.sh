@@ -274,10 +274,14 @@ coderabbit_tier_of() {
 # So the stanza, not the line, is the unit the fallback is defined over. The
 # tag CLOSES the finding stanza it trails, which makes the rule expressible
 # without parsing CodeRabbit's `<details>` scaffolding: a tag line grades only
-# when no badge has graded since the previous tag line. A tag always closes the
-# stanza whether or not it graded, so the NEXT badge-less finding still gets
-# its fallback — that reset is what keeps this a scoping rule rather than a
-# one-shot suppression.
+# when no badge has graded since the previous tag line. ANY `cr-indicator-types:`
+# line closes the stanza — the terminator test is the tag's presence, not its
+# tier, so a `nitpick` / `refactor_suggestion` tag ends its finding exactly as a
+# `potential_issue` one does, and the NEXT badge-less finding still gets its
+# fallback. That reset is what keeps this a scoping rule rather than a one-shot
+# suppression; keying it on the tag's tier instead latched a badged stanza
+# across a non-blocking terminator and swallowed the next finding's p1
+# (Codex P1 on #936).
 #
 # The suppression is deliberately narrow because it moves toward under-blocking,
 # the unsafe direction for a classifier. It withholds a p1 only when a rendered
@@ -285,7 +289,7 @@ coderabbit_tier_of() {
 # a MORE specific answer — and never when the badge rungs found nothing, which
 # is the whole case #888 added the tag rung for.
 coderabbit_scan_tiers() {
-  local numbered lineno line tier stanza_badge_tier="" tab self_number=0 n=0
+  local numbered lineno line tier stanza_badge_tier="" stanza_had_badge tab self_number=0 n=0
   [ "${1:-}" != "--number" ] || self_number=1
   tab=$'\t'
   while IFS= read -r numbered; do
@@ -305,13 +309,28 @@ coderabbit_scan_tiers() {
       printf '%s\t%s\t%s\n' "$lineno" "$tier" "$line"
       continue
     fi
-    tier=$(coderabbit_indicator_tag_tier_of "$line")
-    [ -n "$tier" ] || continue
-    if [ -n "$stanza_badge_tier" ]; then
-      stanza_badge_tier=""
+    # A `cr-indicator-types:` line closes the stanza it trails whatever VALUE
+    # the tag carries — the terminator test is the tag's presence, not its
+    # tier. Keying the reset on `coderabbit_indicator_tag_tier_of` returning
+    # non-empty instead left a badged stanza's tier latched across a
+    # `nitpick` / `refactor_suggestion` terminator, so the NEXT finding — the
+    # badge-less one the #888 fallback exists for — was suppressed as though
+    # that earlier badge had graded it. That is an UNDER-block, on the
+    # required gate, in exactly the direction this rung was added to close
+    # (Codex P1 on #936).
+    case "$line" in
+      *"cr-indicator-types:"*) ;;
+      *) continue ;;
+    esac
+    stanza_had_badge=$stanza_badge_tier
+    stanza_badge_tier=""
+    if [ -n "$stanza_had_badge" ]; then
       continue
     fi
-    printf '%s\t%s\t%s\n' "$lineno" "$tier" "$line"
+    tier=$(coderabbit_indicator_tag_tier_of "$line")
+    if [ -n "$tier" ]; then
+      printf '%s\t%s\t%s\n' "$lineno" "$tier" "$line"
+    fi
   done
   return 0
 }

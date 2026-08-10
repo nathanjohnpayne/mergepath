@@ -1846,15 +1846,27 @@ newest_bot_comment_from_issue_comments() {
   echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}'
 }
 
-# Seconds still remaining on the window reported by the last successful
-# crw_active_rate_limit_notice call. Written only on its rc-0 path; read only
-# by that call's immediate caller, for the log line.
-CRW_ACTIVE_RATE_LIMIT_REMAINING=0
+# Seconds still remaining on the published window ride along ON the emitted
+# notice, as the additive `rate_limit_remaining_seconds` field, rather than in
+# a global. Every call site captures this function in a command substitution
+# (`notice=$(crw_active_rate_limit_notice …)`), so an assignment made inside it
+# dies with the subshell and the parent keeps whatever it had — the three
+# suppression-path log lines reported `0s remaining` for the entire published
+# window (Codex P3 / CodeRabbit 🟡 Minor on #936). Log-only, no verdict reads
+# it, but a diagnostic that always prints the same wrong number is worse than
+# none on exactly the path #909 was hard to read from.
 
 # Emits CodeRabbit's newest comment when it is a rate-limit notice whose
 # PUBLISHED window has not yet expired; returns non-zero (no output) otherwise.
 #
 #   crw_active_rate_limit_notice [<issue-comments-json>]
+#
+# The emitted object is the comment plus one additive field,
+# `rate_limit_remaining_seconds` — see the note above for why it rides on the
+# output rather than in a global. Additive because the poll loop adopts this
+# object as its `LATEST` comment, and every consumer there either reads named
+# fields or re-projects (`{id, created_at, endpoint, body_excerpt}`), so the
+# extra key reaches no emitted JSON.
 #
 # #891 / #912. Rate-limit detection is gated on a comment that survives the
 # `NOW - wallclock_freshness_window_seconds` floor (default 1800s). CodeRabbit's
@@ -1903,14 +1915,13 @@ crw_active_rate_limit_notice() {
   elapsed=$(rate_limit_window_elapsed_seconds "$fresh_at" "$(date +%s)")
   remaining=$((window + RATE_LIMIT_BUFFER_SECONDS - elapsed))
   [ "$remaining" -gt 0 ] || return 1
-  CRW_ACTIVE_RATE_LIMIT_REMAINING=$remaining
-  printf '%s' "$latest"
+  printf '%s' "$latest" | jq -c --argjson r "$remaining" '. + {rate_limit_remaining_seconds: $r}'
 }
 
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
   local issue_comments latest class comment_id comment_created_at comment_fresh_at comment_body
-  local active_notice active_id
+  local active_notice active_id active_remaining
   # ONE fetch, shared by both checks below. Explicitly status-checked: a
   # `die 3` inside fetch_api_array exits only its own command substitution, so
   # an unchecked read failure left the scan with empty input, every classifier
@@ -1940,7 +1951,8 @@ status_context_fast_path_blocked_by_comment() {
     # The defect is the notice going BLIND, not the arbitration being wrong.
     if active_notice=$(crw_active_rate_limit_notice "$issue_comments"); then
       active_id=$(echo "$active_notice" | jq -r '.id')
-      log "StatusContext success suppressed because no CodeRabbit comment survived the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s freshness floor, but its newest comment id=$active_id is a rate-limit notice whose published window has NOT expired (${CRW_ACTIVE_RATE_LIMIT_REMAINING}s remaining) — the published window governs for its full duration (#891/#912)"
+      active_remaining=$(echo "$active_notice" | jq -r '.rate_limit_remaining_seconds // "unknown"')
+      log "StatusContext success suppressed because no CodeRabbit comment survived the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s freshness floor, but its newest comment id=$active_id is a rate-limit notice whose published window has NOT expired (${active_remaining}s remaining) — the published window governs for its full duration (#891/#912)"
       return 0
     fi
     return 1
@@ -3105,7 +3117,7 @@ probe_emit_verdict() {
   # static skip (which is the stronger "will never fire" claim) and after the
   # head-pinned summary branch (a completed review outranks an older notice).
   if active_notice=$(crw_active_rate_limit_notice "$issue_comments"); then
-    log "probe: no head evidence, and CodeRabbit's newest comment is a rate-limit notice with ${CRW_ACTIVE_RATE_LIMIT_REMAINING}s left on its published window (#891/#912)"
+    log "probe: no head evidence, and CodeRabbit's newest comment is a rate-limit notice with $(printf '%s' "$active_notice" | jq -r '.rate_limit_remaining_seconds // "unknown"')s left on its published window (#891/#912)"
     probe_not_yet "rate_limit" \
       "$(printf '%s' "$active_notice" | jq -c '{id, created_at, updated_at, fresh_at, endpoint, body_excerpt: ((.body // "")[0:200])}')"
   fi
@@ -3277,7 +3289,7 @@ while :; do
     # THIS iteration's latest comment so the arm handles it exactly as it would
     # have while the notice was fresh.
     if ACTIVE_RATE_LIMIT=$(crw_active_rate_limit_notice); then
-      log "no CodeRabbit comment inside the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s freshness window, but its newest comment is a rate-limit notice with ${CRW_ACTIVE_RATE_LIMIT_REMAINING}s left on the published window — honoring it (#891/#912)"
+      log "no CodeRabbit comment inside the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s freshness window, but its newest comment is a rate-limit notice with $(printf '%s' "$ACTIVE_RATE_LIMIT" | jq -r '.rate_limit_remaining_seconds // "unknown"')s left on the published window — honoring it (#891/#912)"
       LATEST="$ACTIVE_RATE_LIMIT"
     else
       log "no CodeRabbit comment yet (elapsed ${ELAPSED}s); sleeping ${POLL_INTERVAL_SECONDS}s"
