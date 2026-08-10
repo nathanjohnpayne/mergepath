@@ -359,6 +359,26 @@ The caller accepts a bypass flag that skips the gate.
 
 <!-- cr-indicator-types:potential_issue -->')" \
   "cr_scan_tiers #936: a non-blocking tag value still CLOSES its stanza, so the next badge-less finding keeps the #888 fallback"
+# The terminator is the RENDERED tag, not the token. A badged finding whose
+# PROSE discusses `cr-indicator-types:` — which is what a CodeRabbit finding
+# ABOUT this parser looks like, and one already exists on #936 — must not close
+# its own stanza early. Matching the bare token did: the stanza reset on the
+# prose line, the real trailing tag arrived badge-less, and this 🟡 Minor
+# finding graded p1 on the required gate with no thread to resolve it. Without
+# the fix this reads `1:p2 7:p1` (Codex P2 on #936).
+eq "1:p2" "$(cr_scan_pairs '_📐 Maintainability & Code Quality_ | _🟡 Minor_ | _⚡ Quick win_
+
+**Bound the machine-tag match.**
+
+The rung matches cr-indicator-types:potential_issue as a bare substring, so
+potential_issue_extra also grades p1.
+
+<!-- cr-indicator-types:potential_issue -->')" \
+  "cr_scan_tiers #936: prose mentioning the tag token does not close the stanza — only the rendered tag line does"
+# The counterpart: a rendered tag is still recognized with leading whitespace
+# and a trailing CR, the shapes a real body reaches this function with.
+eq "1:p1" "$(cr_scan_pairs '   <!-- cr-indicator-types:potential_issue -->   ')" \
+  "cr_scan_tiers: a rendered tag line is recognized despite surrounding whitespace"
 # And the terminator does not become a promoter: an unrecognized tag value on a
 # badge-less stanza grades nothing, because only `potential_issue` is blocking.
 eq "" "$(cr_scan_pairs '**Rename the temp variable.**

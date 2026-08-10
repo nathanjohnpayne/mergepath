@@ -274,11 +274,14 @@ coderabbit_tier_of() {
 # So the stanza, not the line, is the unit the fallback is defined over. The
 # tag CLOSES the finding stanza it trails, which makes the rule expressible
 # without parsing CodeRabbit's `<details>` scaffolding: a tag line grades only
-# when no badge has graded since the previous tag line. ANY `cr-indicator-types:`
-# line closes the stanza — the terminator test is the tag's presence, not its
-# tier, so a `nitpick` / `refactor_suggestion` tag ends its finding exactly as a
-# `potential_issue` one does, and the NEXT badge-less finding still gets its
-# fallback. That reset is what keeps this a scoping rule rather than a one-shot
+# when no badge has graded since the previous tag line. Any RENDERED
+# `cr-indicator-types:` tag line closes the stanza — the terminator test is the
+# tag's presence, not its tier, so a `nitpick` / `refactor_suggestion` tag ends
+# its finding exactly as a `potential_issue` one does, and the NEXT badge-less
+# finding still gets its fallback. "Rendered" is load-bearing: the whole trimmed
+# line must be the HTML comment, so prose that merely mentions the token — a
+# finding about this parser, which this repo produces — does not close a stanza
+# early and promote the real tag below it. That reset is what keeps this a scoping rule rather than a one-shot
 # suppression; keying it on the tag's tier instead latched a badged stanza
 # across a non-blocking terminator and swallowed the next finding's p1
 # (Codex P1 on #936).
@@ -289,7 +292,7 @@ coderabbit_tier_of() {
 # a MORE specific answer — and never when the badge rungs found nothing, which
 # is the whole case #888 added the tag rung for.
 coderabbit_scan_tiers() {
-  local numbered lineno line tier stanza_badge_tier="" stanza_had_badge tab self_number=0 n=0
+  local numbered lineno line tag_line tier stanza_badge_tier="" stanza_had_badge tab self_number=0 n=0
   [ "${1:-}" != "--number" ] || self_number=1
   tab=$'\t'
   while IFS= read -r numbered; do
@@ -318,8 +321,26 @@ coderabbit_scan_tiers() {
     # that earlier badge had graded it. That is an UNDER-block, on the
     # required gate, in exactly the direction this rung was added to close
     # (Codex P1 on #936).
-    case "$line" in
-      *"cr-indicator-types:"*) ;;
+    #
+    # The terminator is the RENDERED tag — a line whose whole trimmed content
+    # is the HTML comment CodeRabbit emits — not any line containing the
+    # token. Matching the bare token closed a stanza on PROSE that merely
+    # discusses `cr-indicator-types:`, which on this repo is not hypothetical:
+    # a CodeRabbit finding ABOUT this parser reads exactly that way, and one
+    # already has (its 🟡 Minor on #936). The real trailing tag then arrived
+    # with the stanza already reset, graded as badge-less, and its 🟡 Minor
+    # finding took a [P1] on the required gate with no thread to resolve it —
+    # the very symptom the stanza scoping was added to remove (Codex P2 on
+    # #936).
+    #
+    # Unlike the GRADING rung above, over-matching is not the safe side here:
+    # it does not merely add a tier, it closes a stanza early and hands the
+    # next line a promotion. The rendered shape is the one CodeRabbit actually
+    # writes, on its own line, in every observed body and fixture.
+    tag_line=${line#"${line%%[![:space:]]*}"}
+    tag_line=${tag_line%"${tag_line##*[![:space:]]}"}
+    case "$tag_line" in
+      "<!--"*"cr-indicator-types:"*"-->") ;;
       *) continue ;;
     esac
     stanza_had_badge=$stanza_badge_tier
