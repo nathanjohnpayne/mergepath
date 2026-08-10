@@ -1861,6 +1861,35 @@ run_cm_matrix expect_not_rendered "Case 14y" \
   'a space then a tab reaches column four outside a list|Governance\n\n \t[the audit](hub.md)' \
   'the W+1 fallback still starts code four columns past itself|-     # Governance\n      See [the audit](hub.md)'
 
+# --- Case 14z: a marker line that carries no first child -------------
+# § List items: an item may "start with a blank line" — the marker and
+# its whitespace run reach the end of the line and the item's first child
+# begins on a LATER line. The content column is W+1, exactly as in the
+# wide-run case, but nothing on the marker line remains to classify.
+#
+# Case 14y measures that column; it cannot see this row, because every
+# one of its markers is followed by content on the same line. Reading the
+# case as "consume the marker, then classify the remainder" left the
+# remainder equal to the WHOLE line, so the classifier recursed on an
+# unchanged string and never returned: `+ ` in a canonical doc hung the
+# check or overflowed the awk stack instead of producing a verdict. The
+# `-` and `*` bullets reach a setext-underline test first and so never
+# showed it; `+`, `1.` and `1)` do not.
+#
+# The rendering rows below are the terminating half — the item's later
+# content still measures from W+1 — so a regression to the old reading is
+# caught as a failure rather than only as a hang. Every row is checked
+# against markdown-it-py's commonmark preset, as in Cases 14v–14y.
+run_cm_matrix expect_rendered "Case 14z" \
+  'a `+ ` item with no first child on the marker line|+ \n    See [the audit](hub.md)' \
+  'a `* ` item with no first child on the marker line|* \n    See [the audit](hub.md)' \
+  'an ordered `1. ` item measures W+1 from its wider marker|1. \n     See [the audit](hub.md)' \
+  'the paren-delimited `1) ` ordered marker behaves the same|1) \n     See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 14z" \
+  'code still begins four columns past the W+1 content column|+ \n      See [the audit](hub.md)' \
+  'the wider ordered marker moves that threshold with it|1. \n       See [the audit](hub.md)'
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).

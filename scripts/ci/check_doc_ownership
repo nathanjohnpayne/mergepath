@@ -228,10 +228,12 @@ mp_markdown_renderable_text() {
     # `col` is the absolute starting column of the marker, needed because a
     # tab in the run advances to the next four-column tab stop rather than by
     # one column. Sets LM_CHARS (source characters the marker plus its run
-    # occupy, valid only when LM_CODE_FIRST is 0) and LM_CODE_FIRST (1 when
-    # the first child of the item is an indented code block).
+    # occupy, valid only when the marker line carries a first child — so zero
+    # in both fallback cases), LM_CODE_FIRST (1 when the first child of the
+    # item is an indented code block) and LM_BLANK_FIRST (1 when the marker
+    # and its run reach the end of the line, leaving no first child there).
     function list_marker_columns(s, col,   w, n, i, ch, cur, adv) {
-      LM_CHARS = 0; LM_CODE_FIRST = 0
+      LM_CHARS = 0; LM_CODE_FIRST = 0; LM_BLANK_FIRST = 0
       if (!match(s, LIST_MARKER_CORE)) return 0
       w = RLENGTH
       cur = col + w
@@ -247,6 +249,7 @@ mp_markdown_renderable_text() {
       if (n == 0) return 0
       if (n > 4 || i > length(s)) {
         LM_CODE_FIRST = (i <= length(s))
+        LM_BLANK_FIRST = (i > length(s))
         return w + 1
       }
       LM_CHARS = i - 1
@@ -349,7 +352,18 @@ mp_markdown_renderable_text() {
         # item in an indented code block, or in no block at all; neither opens
         # a text flow, and neither leaves a first child to classify.
         if (LM_CODE_FIRST) { item_code_first = 1; return 0 }
-        if (LM_CHARS >= length(s)) return 0
+        # "Item starting with a blank line": the marker and its whitespace run
+        # reach the end of the line, so the item has no first child HERE to
+        # classify — and nothing is left to recurse ON. Reading only LM_CHARS
+        # against the line length missed it, because LM_CHARS is zero in that
+        # fallback rather than the whole line: `substr(s, 1)` handed back the
+        # SAME string and the recursion never terminated. A `+ ` line in a
+        # canonical doc then hung the check or overflowed the awk stack
+        # instead of producing a verdict, so the guard is a hang, not a
+        # misclassification. LM_CHARS <= 0 is held alongside the flag so any
+        # future path that returns without a first child fails safe the same
+        # way.
+        if (LM_BLANK_FIRST || LM_CHARS <= 0 || LM_CHARS >= length(s)) return 0
         s = substr(s, LM_CHARS + 1)
         return opens_text_flow(s, flow_open)
       }
