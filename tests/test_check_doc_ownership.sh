@@ -2471,6 +2471,92 @@ run_cm_matrix expect_rendered "Case 15j" \
 run_cm_matrix expect_not_rendered "Case 15j" \
   'nine columns past the nested content column is genuine item code|Governance\n- 2. # Heading\n\n         See [the audit](hub.md)'
 
+# --- Case 15k: a sibling item REPLACES the one before it -------------
+# § List items: a marker at column S closes every container whose content
+# starts deeper than S — including the sibling item it replaces. The
+# frame push popped against the new CONTENT column instead of the marker
+# column, which is the same value only while consecutive markers keep the
+# same width. Widen the run after the second marker and the first frame
+# is shallower than the second, so it survived UNDERNEATH it: `- one`
+# then `-   # two` left a column-2 frame below a column-4 frame, and once
+# the list closed that stale frame raised the code threshold to six and
+# scanned a four-space line the renderer had already made top-level
+# indented code.
+#
+# The rows widen the run three ways — two spaces, three spaces, and an
+# ordered marker — because the defect is about the RELATION between the
+# marker column and the content column, not about any one width. The
+# controls are the equal-width case, where the two columns coincide and
+# the old code was already right, and the same widened shape with the
+# link one column shallower, which is genuinely still item prose.
+run_cm_matrix expect_not_rendered "Case 15k" \
+  'a widened sibling must not leave the previous frame underneath it|- one\n-   # two\n  # outside\n    [audit](hub.md)' \
+  'a three-space run does the same|- one\n-    # two\n  # outside\n    [audit](hub.md)' \
+  'ordered siblings widen the same way|1. one\n1.   # two\n   # outside\n    [audit](hub.md)'
+
+run_cm_matrix expect_rendered "Case 15k" \
+  'equal-width siblings were always right|- one\n- # two\n  # outside\n    [audit](hub.md)' \
+  'one column shallower is still item prose|- one\n-   # two\n  # outside\n   [audit](hub.md)'
+
+# --- Case 15l: the newline sentinel must not alias a real name -------
+# Targets are emitted one per line, so a decoded CR or LF would split one
+# destination into two records. Substituting a character cannot fix that
+# whichever character is chosen: U+FFFD was picked on the claim that it
+# "matches no declared path", and U+FFFD is a perfectly legal pathname
+# character — so `prefix&NewLine;hub.md` matched a hub-only doc named
+# `prefix<U+FFFD>hub.md` and invented an ownership failure.
+#
+# The destination is dropped instead, which cannot alias anything because
+# no value is compared. Every spelling that reaches a newline is checked,
+# in both bases and through both the reference and the percent-escape
+# paths, because they resolve by different code paths — a named
+# expansion is built once at startup and returned verbatim, so it does
+# not pass back through the decoder that raises the flag.
+#
+# The last row is the discriminating control: dropping every destination
+# would satisfy all the rows above, so the LITERAL U+FFFD spelling must
+# still resolve to the same doc and still be reported.
+MANIFEST_FFFD="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+  - path: docs/agents/prefix�hub.md
+    class: hub-only
+"
+for nl_spelling in \
+  'prefix&NewLine;hub.md' 'prefix&#10;hub.md' 'prefix&#13;hub.md' \
+  'prefix&#x0A;hub.md' 'prefix%0Ahub.md' 'prefix%0Dhub.md'
+do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_FFFD" \
+    "docs/agents/shared.md|See [the audit]($nl_spelling) for details.
+docs/agents/prefix�hub.md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "0" ] && echo "$out" | grep -q "check_doc_ownership: PASS"; then
+    pass "Case 15l: '$nl_spelling' does not alias the U+FFFD-named doc"
+  else
+    fail "Case 15l ('$nl_spelling') unexpected (rc=$rc): $out"
+  fi
+done
+
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_FFFD" \
+  "docs/agents/shared.md|See [the audit](prefix�hub.md) for details.
+docs/agents/prefix�hub.md|# Hub-only machinery")
+rc=$?
+set -e
+if [ "$rc" = "1" ] \
+   && echo "$out" | grep -q "references the hub-only doc 'docs/agents/prefix�hub.md'"; then
+  pass "Case 15l: the literal U+FFFD spelling still resolves (control)"
+else
+  fail "Case 15l (literal U+FFFD control) unexpected (rc=$rc): $out"
+fi
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).

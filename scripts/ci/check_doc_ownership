@@ -457,8 +457,18 @@ mp_markdown_renderable_text() {
       while (cc_n > 0 && cc[cc_n] > col) { delete cc[cc_n]; cc_n-- }
       code_column = (cc_n > 0) ? cc[cc_n] : 0
     }
-    function push_container(col) {
-      pop_containers(col)
+    # `col` is the new container CONTENT column; `start_col` is the column its
+    # MARKER begins at. The two differ, and only the marker column says which
+    # frames this container replaces: a marker at column S closes every
+    # container whose content starts deeper than S, including the SIBLING item
+    # it replaces. Popping at the content column instead kept a sibling frame
+    # alive underneath the new one whenever the run after the new marker was
+    # wider — `- one` then `-   # two` left the column-2 frame of the first
+    # item under the column-4 frame of the second — and that stale frame rose
+    # as a code threshold of six once the list closed, so top-level indented
+    # code was scanned as prose.
+    function push_container(col, start_col) {
+      pop_containers(start_col)
       cc_n++
       cc[cc_n] = col
       code_column = col
@@ -597,10 +607,19 @@ mp_markdown_renderable_text() {
         item_code_first = 0
         text_flow_open = opens_text_flow(flow_probe, text_flow_open)
         if (mc_n > 0) {
-          # Outermost frame first: each push pops the frames deeper than it,
-          # so replaying them in order rebuilds the WHOLE container stack the
-          # line opened rather than only its innermost item.
-          for (mc_i = 1; mc_i <= mc_n; mc_i++) push_container(col_indent + mc[mc_i])
+          # Outermost frame first: each push pops the frames its own MARKER
+          # closes, so replaying them in order rebuilds the WHOLE container
+          # stack the line opened rather than only its innermost item.
+          #
+          # Each marker starts where the previous one puts its content, and
+          # the outermost starts at the indent of the line. That start column
+          # is what the push pops against — see push_container: popping at the
+          # content column instead let a sibling item survive under its
+          # replacement.
+          for (mc_i = 1; mc_i <= mc_n; mc_i++) {
+            push_container(col_indent + mc[mc_i], \
+                           (mc_i > 1) ? col_indent + mc[mc_i - 1] : col_indent)
+          }
         } else if (!text_flow_open) {
           # The pop above runs BEFORE the line is classified, so it has to
           # assume a dedented line might lazily continue the open paragraph
@@ -825,7 +844,14 @@ mp_doc_link_targets() {
           refs = refs " rcub 125"
           n_refs = split(refs, named_ref, " ")
           for (i = 1; i < n_refs; i += 2) {
+            # A named expansion is stored ONCE here and returned verbatim
+            # later, so the newline flag utf8_of raises would be lost by the
+            # time `&NewLine;` is actually resolved. Capture it now, against
+            # the same predicate rather than a second list of code points,
+            # and char_reference_at re-raises it on use.
+            TARGET_NEWLINE = 0
             NAMED_TEXT[named_ref[i]] = utf8_of(named_ref[i + 1] + 0)
+            if (TARGET_NEWLINE) NAMED_NEWLINE[named_ref[i]] = 1
           }
           # The 46th: the only HTML5 named reference whose expansion is more
           # than one ASCII character. It has no code point to list above.
@@ -884,8 +910,14 @@ mp_doc_link_targets() {
           latin = latin " zcaron 382 zdot 380"
           n_latin = split(latin, latin_ref, " ")
           for (i = 1; i < n_latin; i += 2) {
+            # Same capture as the ASCII table above. No Latin-1 name expands
+            # to a newline today, so this raises nothing — it is here so the
+            # two tables cannot drift into disagreeing about the rule.
+            TARGET_NEWLINE = 0
             NAMED_TEXT[latin_ref[i]] = utf8_of(latin_ref[i + 1] + 0)
+            if (TARGET_NEWLINE) NAMED_NEWLINE[latin_ref[i]] = 1
           }
+          TARGET_NEWLINE = 0
         }
         # Encode a Unicode code point as the bytes a filename carries.
         #
@@ -907,22 +939,38 @@ mp_doc_link_targets() {
         # code point, which is what makes this decode deterministic across
         # CI runners instead of implementation-defined.
         #
-        # CR and LF are mapped to U+FFFD for a reason of this program
-        # rather than of the spec: targets are emitted ONE PER LINE, so a
-        # decoded newline would split a single destination into two records
-        # and the tail could false-match an inventory path — a canonical
-        # doc linking `prefix&NewLine;hub.md` reporting a reference to
-        # `hub.md` that no reader can follow. U+FFFD keeps the destination
-        # a single record and matches no declared path, which loses a match
-        # rather than inventing one. (The reference parser keeps the
-        # newline and percent-encodes it: `prefix%0Ahub.md`, one
-        # destination, still not `hub.md`.) The out-of-range guard is
-        # defensive — char_reference_at rejects those values before they
-        # reach here, and every table entry is a valid code point.
+        # CR and LF are handled for a reason of this program rather than of
+        # the spec: targets are emitted ONE PER LINE, so a decoded newline
+        # would split a single destination into two records and the tail
+        # could false-match an inventory path — a canonical doc linking
+        # `prefix&NewLine;hub.md` reporting a reference to `hub.md` that no
+        # reader can follow. (The reference parser keeps the newline and
+        # percent-encodes it: `prefix%0Ahub.md`, one destination, still not
+        # `hub.md`.)
+        #
+        # SUBSTITUTING a character cannot solve that, whichever character is
+        # picked. U+FFFD was chosen on the claim that it "matches no declared
+        # path", and that claim is false: U+FFFD is a legal pathname
+        # character, so a hub-only doc named `prefix<U+FFFD>hub.md` was
+        # matched by `prefix&NewLine;hub.md` and drew a false ownership
+        # failure. Every substitute has some such name.
+        #
+        # So the destination is DROPPED instead of rewritten. A flag records
+        # that a newline was decoded and normalize_target returns the empty
+        # string, which the emit filter discards. That loses a match rather
+        # than inventing one, and it cannot alias anything, because no value
+        # is ever compared. Nothing true is lost either: the target and
+        # inventory lists are newline-separated the whole way through this
+        # program, so a path that genuinely contains a newline is not
+        # representable in them to begin with.
+        #
+        # The out-of-range guard is defensive — char_reference_at rejects
+        # those values before they reach here, and every table entry is a
+        # valid code point.
         function utf8_of(cp) {
           if (cp <= 0 || cp > 1114111) return REPLACEMENT
           if (cp >= 55296 && cp <= 57343) return REPLACEMENT
-          if (cp == 10 || cp == 13) return REPLACEMENT
+          if (cp == 10 || cp == 13) { TARGET_NEWLINE = 1; return REPLACEMENT }
           if (cp < 128 || CHAR_ORIENTED) return sprintf("%c", cp)
           if (cp < 2048) {
             return sprintf("%c%c", 192 + int(cp / 64), 128 + cp % 64)
@@ -970,6 +1018,9 @@ mp_doc_link_targets() {
           if (substr(body, 1, 1) != "#") {
             if (!(body in NAMED_TEXT)) return ""
             REF_LEN = semi
+            # The expansion was computed once at startup, so re-raise the
+            # newline flag its construction recorded.
+            if (body in NAMED_NEWLINE) TARGET_NEWLINE = 1
             return NAMED_TEXT[body]
           }
           digits = substr(body, 2)
@@ -1165,6 +1216,10 @@ mp_doc_link_targets() {
           return out
         }
         function normalize_target(s) {
+          # Reset per destination: the flag is set by utf8_of when a decoded
+          # CR or LF appears anywhere in THIS destination, in a character
+          # reference or a percent escape alike.
+          TARGET_NEWLINE = 0
           s = unescape_and_decode(s)
           # URL parsing recognizes raw query/fragment delimiters before
           # percent decoding, so encoded %3F/%23 remain filename bytes. A
@@ -1172,7 +1227,9 @@ mp_doc_link_targets() {
           # so a `&#63;` really does start a query string — which is why the
           # decode above runs first.
           sub(/[?#].*$/, "", s)
-          return percent_decode(s)
+          s = percent_decode(s)
+          if (TARGET_NEWLINE) return ""
+          return s
         }
         {
           sub(/^[[:space:]]+/, "")
