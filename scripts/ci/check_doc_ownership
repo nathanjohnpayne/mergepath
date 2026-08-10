@@ -500,6 +500,25 @@ mp_markdown_renderable_text() {
         next
       }
 
+      # A blank line closes the text flow but NOT the containers: a list item
+      # may hold one and keep going, so it must not reach the pop below.
+      if (line ~ /^[[:space:]]*$/) {
+        text_flow_open = 0
+        print ""
+        next
+      }
+
+      # The container stack is updated for every line that starts a new block
+      # at its own indentation, which includes the ones that return early. A
+      # fence opener is such a line, and while the pop lived only after the
+      # fence branch a dedented fence left the previous list frame standing:
+      # `- # Item`, a column-zero fence, then a four-space link line kept the
+      # two-column frame, raised the code threshold to six, and scanned a
+      # line the renderer had already made top-level indented code — a false
+      # ownership failure. Lines INSIDE a fence still do not pop, because
+      # they are fence content and not blocks in their own right.
+      if (!text_flow_open) pop_containers(col_indent)
+
       ch = substr(rest, 1, 1)
       if (indent <= 3 && (ch == "`" || ch == "~")) {
         width = run_len(rest, 1, ch)
@@ -514,12 +533,6 @@ mp_markdown_renderable_text() {
         }
       }
 
-      if (line ~ /^[[:space:]]*$/) {
-        text_flow_open = 0
-        print ""
-        next
-      }
-
       # Indented code cannot interrupt an open paragraph or list item. Keep an
       # indented line renderable while that text flow is open; only blank it
       # when indentation can really start a CommonMark code block.
@@ -532,7 +545,6 @@ mp_markdown_renderable_text() {
       # that follows it. The column is dropped again by the first line
       # indented less than it that is not a lazy continuation — that line
       # closes the item.
-      if (!text_flow_open) pop_containers(col_indent)
       if (!reference_continuation && !text_flow_open \
           && col_indent >= code_column + 4) {
         print ""
@@ -1055,6 +1067,23 @@ mp_doc_link_targets() {
               if (b < 128 || b > 191) { ok = 0; break }
               cp = cp * 64 + (b - 128)
             }
+            # A continuation-byte range check is not UTF-8 well-formedness.
+            # Unicode Table 3-7 also bounds the SCALAR each sequence LENGTH
+            # may carry, and a decoder that skips that bound invents a
+            # character no reader ever sees. %E0%81%81 is an overlong
+            # spelling: the bytes are malformed and the renderer yields
+            # replacement characters, but decoding by continuation range
+            # alone produced 65, so a hub-only doc named A.md drew a false
+            # ownership failure from a link nobody can follow.
+            #
+            # The two-byte minimum is already enforced by the lead-byte
+            # range above, where 194 excludes the overlong C0 and C1 leads.
+            # The three- and four-byte minima, the surrogate range and the
+            # U+10FFFF ceiling have to be spelled out here.
+            if (ok && need == 2 && cp < 2048) ok = 0
+            if (ok && need == 3 && cp < 65536) ok = 0
+            if (ok && cp >= 55296 && cp <= 57343) ok = 0
+            if (ok && cp > 1114111) ok = 0
             if (!ok) {
               out = out REPLACEMENT
               k++

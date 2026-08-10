@@ -2387,6 +2387,53 @@ run_cm_matrix expect_not_rendered "Case 15g" \
   'one column less and the bullet interrupts, making that line item code|Governance\n   - # Heading\n         [the audit](hub.md)' \
   'with no paragraph open the same shape is top-level indented code|    - # Heading\n    [the audit](hub.md)'
 
+# --- Case 15h: percent escapes must be WELL-FORMED UTF-8 -------------
+# A continuation-byte range check is not UTF-8 well-formedness. Unicode
+# Table 3-7 also bounds the scalar each sequence LENGTH may carry, and a
+# decoder that checks only the range accepts an overlong spelling, a
+# surrogate and a scalar past U+10FFFF — inventing a character the reader
+# never sees. `%E0%81%A8` is the overlong three-byte spelling of `h`: the
+# renderer yields replacement characters and reaches nothing, while a
+# range-only decoder read `hub.md` and reported a canonical doc for a link
+# nobody can follow.
+#
+# The last two rows are the discriminating controls. Rejecting malformed
+# input is trivially satisfied by rejecting everything, so a well-formed
+# escape for the same letter — written in the position the overlong rows
+# attack — must still decode and still be reported.
+run_cm_matrix expect_not_rendered "Case 15h" \
+  'an overlong three-byte escape does not spell the target|See [the audit](%E0%81%A8ub.md) for details.' \
+  'an overlong four-byte escape does not either|See [the audit](%F0%80%81%A8ub.md) for details.' \
+  'a surrogate escape is not a character|See [the audit](%ED%A0%A8ub.md) for details.' \
+  'an escape above U+10FFFF is not a character|See [the audit](%F4%90%80%A8ub.md) for details.'
+
+run_cm_matrix expect_rendered "Case 15h" \
+  'the well-formed escape for that same letter still decodes|See [the audit](%68ub.md) for details.' \
+  'and so does one in the middle of the name|See [the audit](h%75b.md) for details.'
+
+# --- Case 15i: a dedented fence closes the containers it leaves ------
+# § Fenced code blocks: a fence opener is a block start like any other, so
+# the container stack is updated at its indentation before it is handled.
+# While the pop ran only on the lines that reach the code-threshold test,
+# the fence branch returned first and left the previous list frame
+# standing: after `- # Item` a column-zero fence closed the item for the
+# renderer but not for the checker, whose stale two-column frame raised
+# the code threshold to six and left a four-space line scan-visible that
+# the renderer had already made top-level indented code.
+#
+# The controls separate the fix from a blanket "a fence clears the stack":
+# a fence INSIDE the item must LEAVE the frame standing, so the same
+# four-space line after it is still item prose, and six columns past it is
+# still code.
+run_cm_matrix expect_not_rendered "Case 15i" \
+  'a dedented fence closes the item, so the line after it is top-level code|- # Item\n\n```\ncode\n```\n\n    See [the audit](hub.md)' \
+  'a tilde fence closes it the same way|- # Item\n\n~~~\ncode\n~~~\n\n    See [the audit](hub.md)' \
+  'six columns past a surviving item frame is still code|- # Item\n\n  ```\n  code\n  ```\n\n      See [the audit](hub.md)'
+
+run_cm_matrix expect_rendered "Case 15i" \
+  'without the fence that four-space line is item prose|- # Item\n\n    See [the audit](hub.md)' \
+  'a fence INSIDE the item leaves the item frame standing|- # Item\n\n  ```\n  code\n  ```\n\n    See [the audit](hub.md)'
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).
