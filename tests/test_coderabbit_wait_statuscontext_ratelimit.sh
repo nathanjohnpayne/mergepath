@@ -210,6 +210,16 @@ case "\$endpoint" in
   repos/owner/repo/pulls/999/reviews) printf '[]\n' ;;
   repos/owner/repo/pulls/999/comments) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
+    # CODERABBIT_TEST_FAIL_ISSUES_AFTER=<n>: serve the first n reads normally,
+    # then fail. Models a transient API failure landing between the fast path's
+    # notice scan and its summary-marker read.
+    n=0
+    if [ -f "\$state_dir/issues-read-count" ]; then n=\$(cat "\$state_dir/issues-read-count"); fi
+    n=\$((n + 1)); printf '%s\n' "\$n" >"\$state_dir/issues-read-count"
+    if [ -n "\${CODERABBIT_TEST_FAIL_ISSUES_AFTER:-}" ] && [ "\$n" -gt "\$CODERABBIT_TEST_FAIL_ISSUES_AFTER" ]; then
+      echo "simulated issue-comments API failure" >&2
+      exit 44
+    fi
     body=\$(cat "\$state_dir/comment-body.txt")
     if [ -z "\$body" ]; then printf '[]\n'; else
       jq -cn --arg bot "\$bot" --arg t "\$comment_time" --arg body "\$body" \
@@ -464,6 +474,37 @@ test_status_description_predicate_unit() {
   [ "$FAIL" -ne "$before" ] || pass "12: crw_status_description_permits_clearance — empty and completed clear; rate-limited, pending and unknown wordings do not"
 }
 
+# --- Test 15: a failed summary read must not read as "no summary finding" ---
+# CodeRabbit 🟠 Major on #936. `summary_body_has_potential_issue_marker` is used
+# as an `if` condition, and `fetch_api_array`'s `die 3` exits only its own
+# command substitution — so a dead API left the helper grading an empty body,
+# `summary_blocking_marker_present ""` returned false, and the fast path
+# CLEARED. That is the same false clear on the very route #877 added the check
+# to close. The read now propagates rc 3 and both call sites die 3.
+#
+# The stub serves the first issue-comments read (the fast path's notice scan,
+# which finds a clean review comment and does not suppress) and fails every
+# read after it — so the failure lands exactly on the summary-marker read.
+test_failed_summary_read_does_not_clear() {
+  local dir rc=0 before=$FAIL
+  dir=$(make_case "summary-read-failure" "$REVIEW_BODY_CLEAN" "$STATUS_TIME" "Review completed")
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_FAIL_ISSUES_AFTER=1 \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  [ "$rc" != "0" ] || fail "15: FALSE-CLEARED (exit 0) after the summary read failed; err=$(tail -4 "$dir/err.log")"
+  [ "$rc" = "3" ] || fail "15: expected exit 3 (infra), got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'refusing to report a clearance' "$dir/err.log" || fail "15: expected the fail-closed summary-read message; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "15: a failed PR-level summary read is exit 3 (infra), never a clearance"
+}
+
 # --- Test 14: the window rule is scoped to the arbitration's BLIND SPOT -----
 # Same notice and status as test 9, but with a freshness window wide enough
 # that the notice IS admitted to the anchored scan. The existing arbitration
@@ -518,6 +559,7 @@ test_trailing_probe_flag_is_usage_error
 test_status_description_predicate_unit
 test_status_context_verdict_carries_status_created_at
 test_open_window_inside_freshness_defers_to_arbitration
+test_failed_summary_read_does_not_clear
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"

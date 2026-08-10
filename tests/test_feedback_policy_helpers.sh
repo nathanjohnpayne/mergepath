@@ -219,6 +219,23 @@ eq "nitpick" "$(coderabbit_tier_of '_🧹 Nitpick_: tidy this
 eq ""        "$(coderabbit_tier_of 'A plain suggestion with no badge.
 
 <!-- cr-indicator-types:refactor_suggestion -->')" "cr_tier_of #888: a non-potential_issue tag value stays unclassified"
+# The value is bounded on the right: a longer value that merely STARTS with
+# `potential_issue` is a different value (CodeRabbit 🟡 Minor on #936).
+eq ""        "$(coderabbit_tier_of 'A finding with no badge.
+
+<!-- cr-indicator-types:potential_issue_extra -->')" "cr_tier_of #936: a suffixed tag value (potential_issue_extra) is NOT the potential_issue tag"
+# ...and the bound must not cost the tag at end-of-body, or in a comma-joined
+# value list, both of which are the same value.
+eq "p1"      "$(coderabbit_tier_of 'A finding with no badge.
+
+<!-- cr-indicator-types:potential_issue -->
+')" "cr_tier_of #936: the tag still matches with trailing whitespace"
+eq "p1"      "$(coderabbit_tier_of 'A finding with no badge.
+
+cr-indicator-types:potential_issue')" "cr_tier_of #936: the tag still matches at end of body (no trailing character)"
+eq "p1"      "$(coderabbit_tier_of 'A finding with no badge.
+
+<!-- cr-indicator-types:potential_issue,nitpick -->')" "cr_tier_of #936: a comma-joined value list containing potential_issue still grades p1"
 
 # --- rc-safety under set -euo pipefail (#581 4b F1) ------------------------
 # A markerless / unclassified call must return rc 0 + empty output, NOT abort a

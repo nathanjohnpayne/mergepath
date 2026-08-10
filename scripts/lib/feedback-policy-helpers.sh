@@ -180,7 +180,16 @@ codex_tier_of() {
 #     a trailing HTML comment after the finding prose (verbatim in the live #835
 #     body, and in tests/test_coderabbit_wait_status_probe.sh's fixture of it).
 #     A head-anchored match would see it only on short bodies.
-#   - only the exact `potential_issue` value is matched. The tag's other values
+#   - only the exact `potential_issue` VALUE is matched, bounded on the right
+#     by a non-word character or end of string, so a longer value that merely
+#     starts with it (`potential_issue_extra`) does not grade blocking
+#     (CodeRabbit 🟡 Minor on #936). The bound is deliberately NOT the full
+#     rendered comment `<!-- cr-indicator-types:potential_issue -->`: that
+#     under-matches any rendering variation CodeRabbit ships — a comma-joined
+#     value list, different inner spacing — and under-matching here means a
+#     real blocking finding goes unclassified, which is the failure direction
+#     this rung exists to close. Over-matching only ever grades something
+#     blocking that is not; that is the safe side. The tag's other values
 #     (`nitpick`, `refactor_suggestion`, …) are not blocking, and guessing at
 #     an unobserved vocabulary is how a classifier over-blocks.
 coderabbit_tier_of() {
@@ -197,7 +206,8 @@ coderabbit_tier_of() {
     *"🟡 Minor"*)                              echo p2; return 0 ;;
   esac
   case "$body" in
-    *"cr-indicator-types:potential_issue"*)    echo p1; return 0 ;;
+    *"cr-indicator-types:potential_issue"[!A-Za-z0-9_]*|*"cr-indicator-types:potential_issue") \
+      echo p1; return 0 ;;
   esac
   return 0
 }

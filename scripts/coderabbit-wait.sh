@@ -1609,9 +1609,22 @@ count_blocking_tier_issues() {
 # Mirrors latest_comment_from_issue_comments: filter to the bot login,
 # newest comment on/after the HEAD anchor (max of created_at/updated_at,
 # since CodeRabbit edits the summary in place).
+# Return codes, and BOTH call sites must honour all three:
+#   0  a blocking marker is present in the head-anchored summary
+#   1  no blocking marker
+#   3  the summary could NOT be read (infra)
+#
+# The rc-3 rung exists because this helper is used as an `if` condition, and a
+# `die 3` inside `fetch_api_array` exits only its own command substitution
+# (CodeRabbit 🟠 Major on #936). Without the explicit propagation the function
+# carried on with empty input, `summary_blocking_marker_present ""` returned
+# false, and the caller read a dead API as "no summary-only finding" — a
+# false clear, on the exact route #877 added this check to close. Treating rc 3
+# as "absent" anywhere re-opens it; the callers `die 3` instead, which is what
+# every other failed read in this file already does.
 summary_body_has_potential_issue_marker() {
   local issue_comments latest_body
-  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
   # Mirror latest_comment_from_issue_comments: exclude status-probe narration
   # replies so a newer probe comment doesn't mask an earlier real summary that
   # contains a "Potential issue" marker (false-clear of the #535 gate).
@@ -2584,10 +2597,18 @@ emit_status_context_verdict() {
   # potential_issue_count stays the INLINE count (0), byte-for-byte with the
   # polling `review` arm's summary-only emit, so the two routes remain
   # indistinguishable to a caller. The exit code carries the verdict.
-  if summary_body_has_potential_issue_marker; then
-    log "StatusContext $state and 0 blocking inline findings, but the head-anchored PR-level summary carries a blocking marker — emitting findings (exit 2) (#877/#535)"
-    emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
-  fi
+  local summary_marker_rc=0
+  summary_body_has_potential_issue_marker || summary_marker_rc=$?
+  case "$summary_marker_rc" in
+    0)
+      log "StatusContext $state and 0 blocking inline findings, but the head-anchored PR-level summary carries a blocking marker — emitting findings (exit 2) (#877/#535)"
+      emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
+      ;;
+    1) : ;;   # no summary-only marker — fall through to clearance
+    *)
+      die 3 "could not read the PR-level summary to rule out a summary-only blocking marker on $HEAD_SHA — refusing to report a clearance"
+      ;;
+  esac
   log "StatusContext $state and 0 blocking (p0/p1) inline findings — emitting cleared (exit 0)"
   emit_json_and_exit "cleared" 0 "$synthetic" 0
 }
@@ -3353,13 +3374,25 @@ while :; do
       if [ "$POTENTIAL_ISSUES" -gt 0 ]; then
         log "CodeRabbit review posted with $POTENTIAL_ISSUES blocking (p0/p1) inline finding(s)"
         emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
-      elif summary_body_has_potential_issue_marker; then
-        log "CodeRabbit review posted with 0 blocking inline findings but a blocking marker in the PR-level summary body — findings"
-        emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
-      else
-        log "CodeRabbit review posted with no high-severity markers — cleared"
-        emit_json_and_exit "cleared" 0 "$REVIEW_JSON" 0
       fi
+      # Three-way, not a boolean: rc 3 means the summary could not be READ, and
+      # collapsing that into "no marker" is the false clear documented on the
+      # helper (CodeRabbit 🟠 Major on #936).
+      SUMMARY_MARKER_RC=0
+      summary_body_has_potential_issue_marker || SUMMARY_MARKER_RC=$?
+      case "$SUMMARY_MARKER_RC" in
+        0)
+          log "CodeRabbit review posted with 0 blocking inline findings but a blocking marker in the PR-level summary body — findings"
+          emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
+          ;;
+        1)
+          log "CodeRabbit review posted with no high-severity markers — cleared"
+          emit_json_and_exit "cleared" 0 "$REVIEW_JSON" 0
+          ;;
+        *)
+          die 3 "could not read the PR-level summary to rule out a summary-only blocking marker on $HEAD_SHA — refusing to report a clearance"
+          ;;
+      esac
       ;;
   esac
 done
