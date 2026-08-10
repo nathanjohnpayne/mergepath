@@ -520,14 +520,28 @@ p4b_barrier_note_pending() {
 # self-heals; a key never revisited (an old PR head) just leaves the empty pair
 # behind. The whole root is safe to delete when no Phase 4b run is in flight —
 # the durable record of what was posted is the timeline marker, never a claim.
+#
+# EVERY branch yields an ABSOLUTE path (CodeRabbit, round 1). A relative root is
+# read as cwd-relative by mkdir, so two invocations started from two directories
+# would contend for two different roots — the cross-checkout split #858 exists to
+# remove, reintroduced through the override rather than through the default. A
+# relative `P4B_CLAIM_DIR` is therefore anchored at the cwd once, here, so it
+# also survives anything that chdirs mid-run; a relative `XDG_STATE_HOME` is
+# IGNORED, which is what the XDG base-directory spec requires of a reader.
 p4b_barrier_claim_root() {
   local base host
   if [ -n "${P4B_CLAIM_DIR:-}" ]; then
-    printf '%s' "$P4B_CLAIM_DIR"
+    case "$P4B_CLAIM_DIR" in
+      /*) printf '%s' "$P4B_CLAIM_DIR" ;;
+      *)  printf '%s/%s' "${PWD:-.}" "$P4B_CLAIM_DIR" ;;
+    esac
     return 0
   fi
   base="${XDG_STATE_HOME:-}"
-  [ -n "$base" ] || { [ -n "${HOME:-}" ] && base="$HOME/.local/state"; }
+  case "$base" in /*) ;; *) base='' ;; esac
+  if [ -z "$base" ]; then
+    case "${HOME:-}" in /*) base="$HOME/.local/state" ;; esac
+  fi
   if [ -z "$base" ]; then
     printf '%s' "${P4B_ACCT_STATE_DIR:-$(p4b_repo_root)/.mergepath}"
     return 0
@@ -602,6 +616,15 @@ p4b_barrier_self_pid() {
 # process actually inside the region — see p4b_barrier_self_pid above, which
 # obtains it on bash 3.2 too.
 p4b_barrier_claim() {
+  # Resolve the owner BEFORE the mkdir gate. A claim directory whose pid file
+  # is not yet written reads as ownerless, and ownerless is unreclaimable by
+  # construction (below: an unparseable owner declines, and release refuses a
+  # claim it does not own) — a permanently stuck key, which is fail-closed but
+  # still a stuck key. On bash 3.2 the lookup forks a subshell and costs ~34x a
+  # BASHPID read, so doing it after mkdir would widen that window by the same
+  # factor for exactly no benefit: the value is a property of THIS shell and
+  # does not depend on winning. Ordered this way the window is one printf.
+  p4b_barrier_self_pid
   mkdir -p "$(dirname "$1")" 2>/dev/null || return 1
   if ! mkdir "$1" 2>/dev/null; then
     local owner
@@ -631,7 +654,6 @@ p4b_barrier_claim() {
     fi
     rmdir "$1.reaplock" 2>/dev/null || true
   fi
-  p4b_barrier_self_pid
   printf '%s\n' "$P4B_SELF_PID" >"$1/pid" 2>/dev/null || { rm -rf "$1" 2>/dev/null; return 1; }
 }
 
@@ -883,10 +905,22 @@ p4b_barrier_post_trigger() {
   return "$rc"
 }
 
-# p4b_barrier_maybe_write <kind> <repo> <pr> <key> <reviewer> <dry_run> [since] [family_key]
+# p4b_barrier_maybe_write <kind> <repo> <pr> <key> <reviewer> <dry_run> [since] [family_key] [claim_key]
 # claim -> read -> dedup -> post at most once, for either write class. Prints
 # the action taken; never fails the caller, because a write that could not be
 # posted still leaves the bounded retry and the human escalation behind it.
+#
+# <claim_key> defaults to <key> and exists because the MARKER key and the
+# MUTUAL-EXCLUSION key answer different questions (Codex P1, round 1). The
+# marker records which episode was answered; the claim reserves the right to
+# post at all. Scoping the claim by anything finer than the resource being
+# reserved silently unserializes concurrent writers: an old-head run that
+# already probed a pause and a new-head run started after a push hold two
+# different claims, both read the timeline before either comment is visible,
+# and both post — the marker scan only dedups writes that have LANDED. The
+# resume class therefore claims at pause-note level while marking per head; the
+# trigger class reserves one request per head, which is what its key already
+# names, so it passes nothing and the default keeps today's behaviour.
 #
 # The claim wraps the WHOLE read-and-post region (#846): the read and the post
 # were not atomic, so two overlapping invocations for the same head could both
@@ -906,9 +940,10 @@ p4b_barrier_post_trigger() {
 # same reason.
 p4b_barrier_maybe_write() {
   local kind="$1" repo="$2" pr="$3" key="$4" reviewer="$5" dry="${6:-false}" since="${7:-}" family="${8:-}"
+  local claim_key="${9:-$4}"
   local claim="" comments raw n out
   if [ "$dry" != true ]; then
-    claim="$(p4b_barrier_claim_path "$repo" "$pr" "$key" "$kind")"
+    claim="$(p4b_barrier_claim_path "$repo" "$pr" "$claim_key" "$kind")"
     p4b_barrier_claim "$claim" || { printf '%s-claim-declined' "$kind"; return 0; }
   fi
   # Re-read the timeline rather than trusting process state: the bounded retry
@@ -1030,9 +1065,18 @@ p4b_barrier_maybe_resume() {
   #
   # A note with no usable timestamp collapses to the historical at-most-once
   # per note id: the family then counts unconditionally.
+  #
+  # The CLAIM is keyed on the pause note ALONE, deliberately not on the exact
+  # key (Codex P1, round 1). The marker is per episode, but the thing being
+  # reserved is "the right to post a resume for this note", which is not
+  # per-head: an old-head bounded retry and a new-head run started after a push
+  # overlap routinely, and two head-scoped claims let both read the timeline
+  # before either comment lands and both post. Claiming at note level restores
+  # the pre-#862 mutual exclusion — the loser declines and, on its next retry,
+  # counts the winner's marker through the family arm.
   pause_key="pause-$pause_id-${head:-nohead}"
   pause_family="pause-$pause_id-"
-  out="$(p4b_barrier_maybe_write resume "$repo" "$pr" "$pause_key" "$reviewer" "$dry" "$pause_fresh" "$pause_family")"
+  out="$(p4b_barrier_maybe_write resume "$repo" "$pr" "$pause_key" "$reviewer" "$dry" "$pause_fresh" "$pause_family" "pause-$pause_id")"
   case "$out" in
     already-resume)           printf 'already-resumed' ;;
     already-resume-duplicate) printf 'already-resumed-duplicate' ;;

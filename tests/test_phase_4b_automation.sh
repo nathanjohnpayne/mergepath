@@ -3119,6 +3119,60 @@ else
   fail "#858: cross-checkout claim coordination wrong:$bad"
 fi
 
+# p4b_barrier_claim_root itself. Everything above pins P4B_CLAIM_DIR, which is
+# the FIRST branch the function takes — so #858's actual change, the default
+# root, had no coverage at all and a full revert of it left the suite green
+# (CodeRabbit, round 1). Each branch is asserted directly here instead, in a
+# subshell so the section's pinned override is restored afterwards.
+#
+# `mkdir -p` reads a relative root as cwd-relative, so a relative override or a
+# relative XDG_STATE_HOME would put two invocations started from two directories
+# on two different roots — the split #858 removes, arriving through the override
+# instead of the default. Every branch must therefore be absolute.
+bad=""
+_claim_root() ( unset P4B_CLAIM_DIR XDG_STATE_HOME; "$@" >/dev/null 2>&1; p4b_barrier_claim_root )
+# Default: per-user, per-HOST, and independent of the checkout.
+_r="$(_claim_root export XDG_STATE_HOME="$WORK/xdg-state")"
+case "$_r" in
+  "$WORK/xdg-state/mergepath/write-claims/"?*) ;;
+  *) bad="$bad xdg-root=$_r" ;;
+esac
+# The host component is load-bearing: ownership is a PID, and PIDs are
+# comparable only within one machine.
+[ "$_r" != "$WORK/xdg-state/mergepath/write-claims/" ] || bad="$bad host-component-empty"
+# HOME is the fallback anchor when XDG_STATE_HOME is unset.
+_r="$(_claim_root export HOME="$WORK/fakehome")"
+case "$_r" in
+  "$WORK/fakehome/.local/state/mergepath/write-claims/"?*) ;;
+  *) bad="$bad home-root=$_r" ;;
+esac
+# A RELATIVE XDG_STATE_HOME must be ignored, not joined — what the XDG base-
+# directory spec requires of a reader, and what keeps the root absolute.
+_r="$( ( unset P4B_CLAIM_DIR; XDG_STATE_HOME=relative-state HOME="$WORK/fakehome"; export XDG_STATE_HOME HOME; p4b_barrier_claim_root ) )"
+case "$_r" in
+  "$WORK/fakehome/.local/state/mergepath/write-claims/"?*) ;;
+  *) bad="$bad relative-xdg-honoured=$_r" ;;
+esac
+# A relative override is anchored at the cwd once, here, so it is stable for the
+# life of the claim even if something chdirs mid-run. Compare against the
+# post-`cd` $PWD, not against $WORK: a TMPDIR with a trailing slash makes the two
+# spellings differ by a doubled separator while naming the same directory.
+_wd="$( cd "$WORK" && pwd )"
+_r="$( ( cd "$WORK" && P4B_CLAIM_DIR=rel-claims p4b_barrier_claim_root ) )"
+[ "$_r" = "$_wd/rel-claims" ] || bad="$bad relative-override=$_r"
+# An absolute override is used verbatim — the property every test above relies on.
+_r="$( P4B_CLAIM_DIR="$WORK/abs-claims" p4b_barrier_claim_root )"
+[ "$_r" = "$WORK/abs-claims" ] || bad="$bad absolute-override=$_r"
+# No home at all: fall back to today's per-checkout location rather than fail
+# closed in a configuration that has always worked.
+_r="$( ( unset P4B_CLAIM_DIR XDG_STATE_HOME HOME; P4B_ACCT_STATE_DIR="$WORK/nohome-state" p4b_barrier_claim_root ) )"
+[ "$_r" = "$WORK/nohome-state" ] || bad="$bad homeless-root=$_r"
+if [ -z "$bad" ]; then
+  pass "#858: the claim root is per-user, per-HOST and always absolute; relative XDG is ignored and a homeless run falls back"
+else
+  fail "#858: claim root resolution wrong:$bad"
+fi
+
 # The claimed write core, end to end against stubs. The wrapper stub records
 # one LINE per delivered write; the gh stub BLOCKS until told to go, which is
 # what makes the concurrency test below deterministic on any runner — no
@@ -3178,6 +3232,54 @@ if [ -z "$bad" ]; then
   pass "#846: two concurrent write attempts deliver exactly one comment; the loser declines on the claim"
 else
   fail "#846: concurrency wrong:$bad"
+fi
+
+# The same race for the RESUME class, across two DIFFERENT heads (Codex P1,
+# round 1). This is the combination #862's per-head marker key made reachable:
+# a bounded retry still running against the old head overlaps a run started
+# after a push, both observe the SAME pause note, and neither can see the
+# other's comment yet because it has not been posted. The marker scan cannot
+# help here — it only counts writes that have landed — so mutual exclusion has
+# to come from the claim, which means the claim is keyed on the pause note and
+# not on the head. Head-scoping it delivers two resumes against the same note.
+bad=""
+: >"$WORK/wp-writes.log"
+_paused_probe() { # <pause_id> <fresh_at>
+  printf '{"probe":{"observed":"paused"},"review":{"id":%s,"fresh_at":"%s"}}' "$1" "$2"
+}
+_resume() { # <head> <pause_id> <fresh_at>
+  (
+    export P4B_ACCT_STATE_DIR="$WORK/wp-state"
+    export P4B_CLAIM_DIR="$WORK/wp-claims"
+    export P4B_GH_AS_REVIEWER="$WORK/wp-wrapper.sh"
+    export PATH="$WORK/wp-bin:$PATH"
+    p4b_barrier_maybe_resume owner/repo 7 "$1" rev-bot "$(_paused_probe "$2" "$3")" false
+  )
+}
+rm -f "$WORK/wp-go"; : >"$WORK/wp-hold"
+_resume oldhead 771 2026-01-01T00:00:00Z >"$WORK/wp-out-r-old" &
+_wp_a=$!
+_n=0
+while [ ! -d "$(_wp_claim pause-771 resume)" ] && [ "$_n" -lt 100 ]; do
+  sleep 0.1; _n=$((_n+1))
+done
+[ -d "$(_wp_claim pause-771 resume)" ] || bad="$bad note-level-claim-never-observed"
+# A head-scoped claim would leave this path free and let the second run in.
+[ ! -d "$(_wp_claim pause-771-newhead resume)" ] || bad="$bad claim-was-head-scoped"
+_resume newhead 771 2026-01-01T00:00:00Z >"$WORK/wp-out-r-new" &
+_wp_b=$!
+wait "$_wp_b" || true
+: >"$WORK/wp-go"
+wait "$_wp_a" || true
+rm -f "$WORK/wp-hold" "$WORK/wp-go"
+_delivered="$(grep -c '^WRITE:' "$WORK/wp-writes.log" 2>/dev/null || true)"
+[ "${_delivered:-0}" = "1" ] || bad="$bad delivered=$_delivered"
+grep -q '^resumed$' "$WORK/wp-out-r-old" || bad="$bad winner-output=$(cat "$WORK/wp-out-r-old")"
+grep -q 'resume-claim-declined' "$WORK/wp-out-r-new" || bad="$bad loser-output=$(cat "$WORK/wp-out-r-new")"
+if [ -z "$bad" ]; then
+  pass "#862/#846: two heads probing ONE pause note serialize on a note-level claim and deliver exactly one resume"
+else
+  fail "#862/#846: cross-head resume concurrency wrong:$bad"
 fi
 
 # Failure directions of the claimed core, each on a fresh head so claims and
