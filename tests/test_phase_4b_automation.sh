@@ -3191,11 +3191,12 @@ _r="$( ( unset P4B_CLAIM_DIR XDG_STATE_HOME HOME; P4B_ACCT_STATE_DIR="$WORK/noho
 # ignored on that branch as well and the repo-root default decides. That
 # default is absolute by construction (`cd -P` in p4b_repo_root), which is what
 # keeps the last branch honest (CodeRabbit round 2, Codex P2 round 2).
+# The expected value is computed from p4b_repo_root in the SAME subshell and
+# compared whole, not pattern-matched: "some absolute path containing
+# /.mergepath/" is satisfied by a wrong checkout root, so the loose form would
+# not have measured the contract the comment above states (CodeRabbit, round 3).
 _r="$( ( cd "$WORK" && unset P4B_CLAIM_DIR XDG_STATE_HOME HOME; P4B_ACCT_STATE_DIR=rel-state p4b_barrier_claim_root ) )"
-case "$_r" in
-  /*/.mergepath/?*) ;;
-  *) bad="$bad homeless-relative-root=$_r" ;;
-esac
+[ "$_r" = "$(p4b_repo_root)/.mergepath/$_host" ] || bad="$bad homeless-relative-root=$_r"
 # The repo slug is injective: two DISTINCT repos that a `/`→`-` flattening
 # collapsed onto one slug must reach two different claim paths, or one run
 # declines on the other repository's live claim under the now-shared root
