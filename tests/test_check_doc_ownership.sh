@@ -2401,6 +2401,13 @@ run_cm_matrix expect_not_rendered "Case 15g" \
 # input is trivially satisfied by rejecting everything, so a well-formed
 # escape for the same letter — written in the position the overlong rows
 # attack — must still decode and still be reported.
+#
+# The overlong pair is what fails if the bounds come back out; a surrogate
+# and an above-ceiling scalar cannot be made to spell an ASCII target, so
+# those two rows assert the same property at the other two boundaries
+# without being able to name `hub.md`. They are kept because the property
+# is "no malformed escape resolves to the target", not "these two inputs
+# do not".
 run_cm_matrix expect_not_rendered "Case 15h" \
   'an overlong three-byte escape does not spell the target|See [the audit](%E0%81%A8ub.md) for details.' \
   'an overlong four-byte escape does not either|See [the audit](%F0%80%81%A8ub.md) for details.' \
@@ -2433,6 +2440,36 @@ run_cm_matrix expect_not_rendered "Case 15i" \
 run_cm_matrix expect_rendered "Case 15i" \
   'without the fence that four-space line is item prose|- # Item\n\n    See [the audit](hub.md)' \
   'a fence INSIDE the item leaves the item frame standing|- # Item\n\n  ```\n  code\n  ```\n\n    See [the audit](hub.md)'
+
+# --- Case 15j: an item opens a FRESH block context -------------------
+# § List items: the content of an item is parsed as blocks in its own
+# right, so no paragraph is open inside it — whatever was open outside
+# stopped at the marker. While the classifier recursed into the item
+# carrying the OUTER paragraph state, the item re-applied the
+# paragraph-interruption rules to its own first child: under an open
+# paragraph the nested marker of `- 2. # Heading` was rejected as unable
+# to interrupt, so that item never pushed a content column, and prose six
+# or seven columns in was measured against the OUTER frame and blanked as
+# code.
+#
+# This one runs the other way from the rest of the family. The renderer
+# shows that line as ordinary nested-item prose, so the checker was not
+# raising a false alarm — it was MISSING a hub-only reference, which is
+# the direction that lets a bad link ship.
+#
+# The controls are chosen so that "always recurse with a fresh paragraph"
+# cannot pass by being indiscriminate: the item content column must still
+# bound indented code (nine columns in IS code), a nested marker starting
+# at 1 — which could always interrupt — must be unchanged, and the shape
+# with no outer paragraph at all must stay exactly as it was.
+run_cm_matrix expect_rendered "Case 15j" \
+  'a nested marker that cannot interrupt the outer paragraph still opens its own item|Governance\n- 2. # Heading\n\n       See [the audit](hub.md)' \
+  'six columns in is nested-item prose too|Governance\n- 2. # Heading\n\n      See [the audit](hub.md)' \
+  'a nested marker starting at 1 behaves identically|Governance\n- 1. # Heading\n\n       See [the audit](hub.md)' \
+  'with no outer paragraph open the same shape already worked|- 2. # Heading\n\n       See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15j" \
+  'nine columns past the nested content column is genuine item code|Governance\n- 2. # Heading\n\n         See [the audit](hub.md)'
 
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between

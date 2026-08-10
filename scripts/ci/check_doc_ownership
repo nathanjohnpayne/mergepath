@@ -426,7 +426,17 @@ mp_markdown_renderable_text() {
         # way.
         if (LM_BLANK_FIRST || LM_CHARS <= 0 || LM_CHARS >= length(s)) return 0
         s = substr(s, LM_CHARS + 1)
-        return opens_text_flow(s, flow_open)
+        # The item content is parsed as blocks IN ITS OWN RIGHT, so no
+        # paragraph is open inside it yet — whatever was open outside stopped
+        # at the marker. Carrying flow_open in made the item inherit the outer
+        # paragraph and re-apply the interrupt rules to its own first child:
+        # under an open paragraph, `- 2. # Heading` had its NESTED marker
+        # rejected as unable to interrupt, so that item never pushed a content
+        # column and prose six or seven columns in was measured against the
+        # OUTER frame and blanked as code. The renderer shows it as ordinary
+        # nested-item prose, so a hub-only link there escaped check 10
+        # entirely — a missed reference, not a false alarm.
+        return opens_text_flow(s, 0)
       }
       if (substr(s, 1, 1) == "#") {
         hashes = run_len(s, 1, "#")
