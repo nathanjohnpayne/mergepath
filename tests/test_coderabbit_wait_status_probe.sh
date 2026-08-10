@@ -1666,6 +1666,7 @@ test_851_summary_helpers_unit() {
   # tests/test_audit_branch_protection.sh.
   local snip="$WORKDIR/summary-helpers.sh" h40 h64 bad=""
   local clean_body chat_body failure_body inside_body outside_body trunc_body
+  local minor_tagged_body tag_only_body
   eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END)=' \
     "$ROOT/scripts/coderabbit-wait.sh")"
   awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
@@ -1727,8 +1728,37 @@ _⚠️ Potential issue_ after an inverted pair"
   # END rendered before START is not a block; stripping to EOF from the
   # latched START would swallow the real marker after it.
   summary_blocking_marker_present "$inverted_body" || bad="$bad inverted-delims"
+  # #936: the #888 machine-tag rung is a FALLBACK the badge wins over, and this
+  # predicate grades a multi-finding document LINE BY LINE. CodeRabbit renders
+  # one finding's badge and its `cr-indicator-types` tag on different lines, so
+  # per-line the tag's p1 overrode a 🟡 Minor badge four lines above it and this
+  # advisory scan reported a discretionary finding as blocking — while the same
+  # body read p2 through the whole-body inline path, the probe/polling
+  # divergence class #851 closed. Scoping the tag rung to the stanza it trails
+  # lives in coderabbit_scan_tiers, so this predicate and the REQUIRED
+  # scripts/coderabbit-severity-gate.sh summary loop grade one document the
+  # same way.
+  minor_tagged_body='_🔒 Security & Privacy_ | _🟡 Minor_ | _⚡ Quick win_
+
+**Bound the retry delay.**
+
+<!-- cr-indicator-types:potential_issue -->'
+  tag_only_body='**Reject the diagnostic bypass in merge-gate callers.**
+
+The caller accepts a bypass flag that skips the gate.
+
+<!-- cr-indicator-types:potential_issue -->'
+  summary_blocking_marker_present "$minor_tagged_body" && bad="$bad minor-promoted-by-tag"
+  # The escape, in the same document shape: with no badge anywhere in the
+  # stanza the tag is still the only signal, and it must still read blocking.
+  summary_blocking_marker_present "$tag_only_body" || bad="$bad tag-only-lost"
+  # And the scoping is per stanza: the badge-less finding BELOW a badged one
+  # still grades blocking, or the fix would have traded #936 for #888.
+  summary_blocking_marker_present "$minor_tagged_body
+
+$tag_only_body" || bad="$bad second-stanza-lost"
   if [ -z "$bad" ]; then
-    pass "#851 helpers: stanza vacuity guard, 40-hex token boundary, pre-merge strip"
+    pass "#851 helpers: stanza vacuity guard, 40-hex token boundary, pre-merge strip; #936 per-stanza tag scoping"
   else
     fail "#851 helpers:$bad"
   fi

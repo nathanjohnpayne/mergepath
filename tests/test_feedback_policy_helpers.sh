@@ -24,6 +24,9 @@
 #   coderabbit_tier_of
 #     14. nitpick / potential-issue default / critical / minor / major /
 #         refactor / plain-note
+#   coderabbit_scan_tiers
+#     15. document-level grading: the machine-tag rung is scoped to the finding
+#         stanza it trails, so a badge three lines above still wins
 #
 # Bash 3.2 portable.
 
@@ -252,6 +255,96 @@ if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "coderabbit_tier_of: markerless i
 # head closed the pipe early).
 rc=0; big=$(head -c 100000 /dev/zero | tr '\0' 'x'); out=$(coderabbit_tier_of "🟠 Major $big") || rc=$?
 if [ "$rc" -eq 0 ] && [ "$out" = "p1" ]; then pass "coderabbit_tier_of: large body classifies without SIGPIPE abort (#652)"; else fail "coderabbit_tier_of: large body rc=$rc out=[$out]"; fi
+
+# --- 15. coderabbit_scan_tiers: the ladder over a DOCUMENT (#936) ----------
+#
+# The badge-wins property asserted above ("cr_tier_of #888: badge still wins
+# over the machine tag") is a claim about ONE FINDING, and it held only because
+# those cases hand the whole finding to the classifier as one string. CodeRabbit
+# does not render it that way: the severity badge leads the finding and the
+# `cr-indicator-types` tag trails it as an HTML comment several lines below. Both
+# line-wise callers — the REQUIRED scripts/coderabbit-severity-gate.sh summary
+# loop and scripts/coderabbit-wait.sh's crw_scan_has_blocking_marker — grade a
+# summary one line at a time, so each rung fired on its own line and the tag's
+# p1 overrode the badge on the surface that actually gates.
+#
+# These cases pin the document-level contract those callers now share.
+
+# Render the graded stream compactly as `<line>:<tier>` pairs, so an assertion
+# names WHICH line graded and at what tier — a bare "is anything blocking"
+# check would pass on the defect (it blocks, just for the wrong reason).
+cr_scan_pairs() {
+  printf '%s\n' "$1" \
+    | coderabbit_scan_tiers --number \
+    | awk -F'\t' '{ printf "%s%s:%s", (NR > 1 ? " " : ""), $1, $2 }'
+}
+
+# The live stanza shape (verbatim structure of the #835 body, and of
+# tests/test_coderabbit_wait_status_probe.sh's fixture of it): badge line,
+# blank, bold title, blank, prose, blank, trailing tag.
+CR_MINOR_TAGGED='_🔒 Security & Privacy_ | _🟡 Minor_ | _⚡ Quick win_
+
+**Bound the retry delay.**
+
+The delay grows without a ceiling.
+
+<!-- cr-indicator-types:potential_issue -->'
+CR_TAG_ONLY='**Reject the diagnostic bypass in merge-gate callers.**
+
+The caller accepts a bypass flag that skips the gate.
+
+<!-- cr-indicator-types:potential_issue -->'
+
+eq "1:p2" "$(cr_scan_pairs "$CR_MINOR_TAGGED")" \
+  "cr_scan_tiers #936: a 🟡 Minor stanza keeps its badge tier — the trailing tag does not re-grade the same finding p1"
+eq "5:p1" "$(cr_scan_pairs "$CR_TAG_ONLY")" \
+  "cr_scan_tiers #888: a stanza with NO rendered badge still grades p1 off the tag (the rung the scoping must not cost)"
+# Both in one document, in that order: the scoping is per stanza, not a
+# one-shot suppression. The tag CLOSES the stanza it trails whether or not it
+# graded, so the second, badge-less finding still gets its fallback. Without
+# that reset this reads `1:p2` alone and the #888 rung dies after the first
+# badge in the document.
+eq "1:p2 13:p1" "$(cr_scan_pairs "$CR_MINOR_TAGGED
+
+$CR_TAG_ONLY")" \
+  "cr_scan_tiers #936: the tag rung is scoped to its own stanza — a later badge-less finding still grades p1"
+# Same shape at the OTHER discretionary rungs: the tag must not promote them
+# either, since `resolve_required_tiers` calls nitpick/p3 discretionary by
+# default exactly as it does p2.
+eq "1:nitpick" "$(cr_scan_pairs '_🧹 Nitpick_ | _⚡ Quick win_
+
+**Rename the temp variable.**
+
+<!-- cr-indicator-types:potential_issue -->')" \
+  "cr_scan_tiers #936: a 🧹 Nitpick stanza is not promoted to p1 by its trailing tag"
+# A genuinely blocking stanza still grades blocking, and exactly ONCE — the
+# badge line — so a required gate lists one finding rather than two rows for
+# one finding.
+eq "1:p1" "$(cr_scan_pairs '_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
+
+**Reject the bypass.**
+
+<!-- cr-indicator-types:potential_issue -->')" \
+  "cr_scan_tiers: a 🟠 Major stanza grades p1 once, on its badge line"
+# Line numbers come from the CALLER's numbering, never from a rescan: the
+# severity gate feeds a fence-FILTERED stream and reports positions in the
+# original summary, so a self-counted number would point at the wrong line.
+eq "31:p1" "$(printf '31\t_🟠 Major_: the retry loop never terminates.\n' | coderabbit_scan_tiers \
+  | awk -F'\t' '{ printf "%s:%s", $1, $2 }')" \
+  "cr_scan_tiers: the emitted line number is the caller's, so a fence-filtered stream keeps original positions"
+# `--number` numbers the stream itself, and must agree with a caller that
+# numbered it — the coderabbit-wait.sh predicate uses the self-numbering form
+# precisely so no external command sits between the body and the rule.
+eq "$(cr_scan_pairs "$CR_MINOR_TAGGED")" \
+   "$(printf '%s\n' "$CR_MINOR_TAGGED" | awk '{ printf "%d\t%s\n", NR, $0 }' | coderabbit_scan_tiers \
+      | awk -F'\t' '{ printf "%s%s:%s", (NR > 1 ? " " : ""), $1, $2 }')" \
+  "cr_scan_tiers: --number agrees line-for-line with a caller-numbered stream"
+# rc-safety under `set -euo pipefail`, the same contract the two classifiers
+# carry: no graded line is rc 0 + empty, not a failure that aborts the caller.
+rc=0; out=$(printf 'ordinary prose with no marker\n' | coderabbit_scan_tiers --number) || rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "coderabbit_scan_tiers: a document with no marker is rc0+empty under set -e"; else fail "coderabbit_scan_tiers: markerless rc=$rc out=[$out]"; fi
+rc=0; out=$(printf '' | coderabbit_scan_tiers) || rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "coderabbit_scan_tiers: empty input is rc0+empty under set -e"; else fail "coderabbit_scan_tiers: empty rc=$rc out=[$out]"; fi
 
 # ---------------------------------------------------------------------------
 echo

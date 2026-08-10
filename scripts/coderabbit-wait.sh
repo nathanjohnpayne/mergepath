@@ -1211,9 +1211,11 @@ classify_comment() {
 # Pure string predicates over a CodeRabbit summary body. No globals beyond the
 # constants defined above, no I/O — extracted by sentinel and sourced directly
 # by tests/test_coderabbit_wait_status_probe.sh, the pattern
-# tests/test_audit_branch_protection.sh already uses. Their one external
-# dependency is `coderabbit_tier_of` from scripts/lib/feedback-policy-helpers.sh
-# (#837), which the extracting test sources alongside this block.
+# tests/test_audit_branch_protection.sh already uses. Their external
+# dependencies are the shared ladder in scripts/lib/feedback-policy-helpers.sh
+# — `coderabbit_tier_of` for a single body (#837) and `coderabbit_scan_tiers`
+# for a multi-finding document (#936) — which the extracting test sources
+# alongside this block.
 
 # True when a body classifies as a BLOCKING CodeRabbit finding: the p0/p1 rungs
 # of the shared `coderabbit_tier_of` ladder (CodeRabbit never maps to p0 today;
@@ -1249,18 +1251,36 @@ crw_body_is_blocking_finding() {
 # True when ANY line of the given scan classifies as a blocking finding.
 #
 # LINE-wise, not body-wise, because a PR-level summary is a document holding
-# many finding stanzas: `coderabbit_tier_of` answers "what tier is THIS
-# finding", so the summary is fed to it one line at a time — which is also the
-# granularity at which CodeRabbit renders the badge. Blank lines are skipped;
-# they cannot carry a marker.
+# many finding stanzas: the ladder answers "what tier is THIS finding", so the
+# summary is fed to it one line at a time — which is also the granularity at
+# which CodeRabbit renders the badge. Blank lines are skipped; they cannot
+# carry a marker.
+#
+# Through `coderabbit_scan_tiers`, not a per-line `coderabbit_tier_of`, for the
+# reason documented at that function: the machine-tag rung is a fallback the
+# badge wins over, and CodeRabbit renders the badge and the tag on DIFFERENT
+# lines, so a per-line loop lets the tag's p1 override a 🟡 Minor badge three
+# lines above it (#936). The severity gate's summary loop grades through the
+# same function, so the advisory count here and the required gate keep reading
+# one document the same way — the #837/#884 property this file already relies
+# on.
 crw_scan_has_blocking_marker() {
-  local line
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    if crw_body_is_blocking_finding "$line"; then
-      return 0
-    fi
-  done <<< "${1:-}"
+  local graded rest tier tab
+  tab=$'\t'
+  # `--number` rather than piping through a numbering process: this predicate
+  # is reached from an `if`, where `set -e` is suspended, so an external
+  # command that failed here would empty the stream and the answer would be
+  # "no blocking marker" — a silent false clear. printf is a builtin and the
+  # grader is a shell function, so nothing in this pipeline can fail into one.
+  graded=$(printf '%s\n' "${1:-}" | coderabbit_scan_tiers --number)
+  while IFS= read -r rest; do
+    [ -n "$rest" ] || continue
+    rest=${rest#*"$tab"}
+    tier=${rest%%"$tab"*}
+    case "$tier" in
+      p0|p1) return 0 ;;
+    esac
+  done <<< "$graded"
   return 1
 }
 
@@ -1609,7 +1629,16 @@ count_blocking_tier_issues() {
 # Mirrors latest_comment_from_issue_comments: filter to the bot login,
 # newest comment on/after the HEAD anchor (max of created_at/updated_at,
 # since CodeRabbit edits the summary in place).
-# Return codes, and BOTH call sites must honour all three:
+#
+# `$1` is the freshness anchor, defaulting to HEAD_ANCHOR — which is what the
+# two POLL-side callers want, because each is reached only after a comment
+# already survived that same floor, and the verdict must be read off the very
+# comment they classified. The StatusContext fast path passes
+# HEAD_IDENTITY_ANCHOR instead; the argument for that is at ITS call site, and
+# the short version is that it is the one caller reached when NOTHING survived
+# the floor.
+#
+# Return codes, and ALL call sites must honour all three:
 #   0  a blocking marker is present in the head-anchored summary
 #   1  no blocking marker
 #   3  the summary could NOT be read (infra)
@@ -1623,12 +1652,13 @@ count_blocking_tier_issues() {
 # as "absent" anywhere re-opens it; the callers `die 3` instead, which is what
 # every other failed read in this file already does.
 summary_body_has_potential_issue_marker() {
+  local anchor="${1:-$HEAD_ANCHOR}"
   local issue_comments latest_body
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
   # Mirror latest_comment_from_issue_comments: exclude status-probe narration
   # replies so a newer probe comment doesn't mask an earlier real summary that
   # contains a "Potential issue" marker (false-clear of the #535 gate).
-  latest_body=$(echo "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
+  latest_body=$(echo "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg after "$anchor" '
     def status_probe_reply:
       ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
     [ .[]
@@ -2597,8 +2627,33 @@ emit_status_context_verdict() {
   # potential_issue_count stays the INLINE count (0), byte-for-byte with the
   # polling `review` arm's summary-only emit, so the two routes remain
   # indistinguishable to a caller. The exit code carries the verdict.
+  #
+  # HEAD_IDENTITY_ANCHOR, not the helper's HEAD_ANCHOR default — the same anchor
+  # count_potential_issues_for_sha uses three lines above, and for the same
+  # reason. HEAD_ANCHOR carries the moving wallclock floor
+  # (`coderabbit.wallclock_freshness_window_seconds`, live value 1800s), and
+  # this is the ONE site reached when nothing survived that floor: the two poll
+  # callers each run after a comment already passed it, so there the floor
+  # cannot hide the comment being verdicted. Here it can, and did — on an
+  # unchanged head whose summary had merely aged past 30 minutes, no comment
+  # qualified, `summary_blocking_marker_present ""` read false, and the fast
+  # path CLEARED over a summary carrying a blocking marker. That is the #877
+  # false clear this OR-sibling was added to close, re-entered through the
+  # anchor. Both other routes read that same head as findings: the polling
+  # `review` arm off the comment it classified, and `--probe` off its
+  # anchor-free `startswith(SUMMARY_MARKER)` + summary_names_head selection. So
+  # the floor made agent-review and the Phase 4b barrier disagree about one
+  # head purely because a clock advanced — and the merge-gating run is the LATE
+  # one (.github/workflows/agent-review.yml runs this in polling mode at
+  # approval time, after the Codex loop and the 4b barrier), i.e. the run most
+  # likely to be looking at an aged summary.
+  #
+  # Anchored, not anchor-free: HEAD_IDENTITY_ANCHOR is the head's own
+  # committer/force-push time, so a summary predating this head still drops out
+  # as a prior head's report. Resurrecting those would block every push that
+  # follows a blocking review, with nothing able to clear it.
   local summary_marker_rc=0
-  summary_body_has_potential_issue_marker || summary_marker_rc=$?
+  summary_body_has_potential_issue_marker "$HEAD_IDENTITY_ANCHOR" || summary_marker_rc=$?
   case "$summary_marker_rc" in
     0)
       log "StatusContext $state and 0 blocking inline findings, but the head-anchored PR-level summary carries a blocking marker — emitting findings (exit 2) (#877/#535)"

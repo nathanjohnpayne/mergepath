@@ -23,6 +23,7 @@
 #   resolve_required_tiers [cfg]           # one blocking tier per line
 #   codex_tier_of "<comment-body>"         # p0..p3 or empty
 #   coderabbit_tier_of "<comment-body>"    # p0..p3|nitpick or empty
+#   coderabbit_scan_tiers                  # stdin/stdout, LINE-wise documents
 #
 # cfg defaults to $CONFIG (the global the gate scripts set) and then to
 # .github/review-policy.yml, matching scripts/lib/reviewers-helpers.sh.
@@ -175,7 +176,10 @@ codex_tier_of() {
 #     that classifies today keeps exactly the tier it has. `🟡 Minor` plus the
 #     tag stays p2: the tag names the CATEGORY (potential issue vs nitpick vs
 #     refactor), the badge names the SEVERITY, and the badge is the one this
-#     ladder grades.
+#     ladder grades. That property is a statement about ONE finding, not about
+#     one string — CodeRabbit renders the badge and the tag on different lines,
+#     so a caller grading a multi-finding document line-by-line must go through
+#     `coderabbit_scan_tiers` below to keep it.
 #   - it scans the FULL body, not the 600-char head, because the tag renders as
 #     a trailing HTML comment after the finding prose (verbatim in the live #835
 #     body, and in tests/test_coderabbit_wait_status_probe.sh's fixture of it).
@@ -192,22 +196,122 @@ codex_tier_of() {
 #     blocking that is not; that is the safe side. The tag's other values
 #     (`nitpick`, `refactor_suggestion`, …) are not blocking, and guessing at
 #     an unobserved vocabulary is how a classifier over-blocks.
-coderabbit_tier_of() {
-  local body head
+#
+# The two rungs are separate functions so the ONE ladder can also be applied
+# line-wise (`coderabbit_scan_tiers` below) without the fallback silently
+# becoming an override. `coderabbit_tier_of` is their composition and is the
+# entry point for grading ONE finding body; nothing else may re-implement
+# either rung.
+
+# The BADGE rung alone: the rendered severity markers, anchored on the first
+# 600 chars. Empty when the text carries none.
+coderabbit_badge_tier_of() {
+  local head
   # Truncate via parameter expansion (not `printf | head -c`): under
   # `set -euo pipefail` a large body makes head close the pipe early and
   # printf exits 141 (SIGPIPE), which aborts every caller. The badge markers
   # matched below are near the start, so a 600-char cut is more than enough.
-  body="${1:-}"; head="${body:0:600}"
+  head="${1:-}"; head="${head:0:600}"
   case "$head" in
     *"🔴 Critical"*|*"🟠 Major"*|*"Potential issue"*|*"⚠️"*)  echo p1; return 0 ;;
     *"🧹 Nitpick"*)                            echo nitpick; return 0 ;;
     *"🔵 Trivial"*|*"Outside diff range"*)     echo p3; return 0 ;;
     *"🟡 Minor"*)                              echo p2; return 0 ;;
   esac
-  case "$body" in
+  return 0
+}
+
+# The MACHINE-TAG rung alone: scanned over the FULL text, per the second
+# deliberate property above. Empty unless the exact `potential_issue` value is
+# present.
+coderabbit_indicator_tag_tier_of() {
+  case "${1:-}" in
     *"cr-indicator-types:potential_issue"[!A-Za-z0-9_]*|*"cr-indicator-types:potential_issue") \
       echo p1; return 0 ;;
   esac
+  return 0
+}
+
+coderabbit_tier_of() {
+  local tier
+  tier=$(coderabbit_badge_tier_of "${1:-}")
+  [ -n "$tier" ] || tier=$(coderabbit_indicator_tag_tier_of "${1:-}")
+  [ -z "$tier" ] || echo "$tier"
+}
+
+# Grade a CodeRabbit DOCUMENT — a PR-level summary, which holds many finding
+# stanzas — one line at a time, and emit only the lines that grade.
+#
+#   stdin   `<line-number><TAB><line>`   (the caller owns the numbering, so a
+#                                        fence-filtered stream keeps the line
+#                                        numbers of the ORIGINAL document)
+#           with `--number`: raw lines, numbered from 1 by this function
+#   stdout  `<line-number><TAB><tier><TAB><line>`
+#
+# `--number` exists so a caller that does not need positions is not forced to
+# add a numbering process to reach the rule. It is not a convenience: the
+# coderabbit-wait.sh caller is a BOOLEAN reached from an `if`, where `set -e`
+# is suspended — a numbering step that failed there would leave the stream
+# empty and the predicate would answer "no blocking marker", the exact silent
+# false clear this file's callers keep closing. Both entry points are then
+# builtins end to end, with no external command able to fail into a clear.
+#
+# Input is read with plain `read`, so each stream must end in a newline; both
+# call sites produce one (`printf '%s\n'`, awk's `printf "…\n"`).
+#
+# WHY THIS EXISTS, rather than each caller looping over `coderabbit_tier_of`.
+# The machine-tag rung is documented as a fallback that a badge always wins
+# over ("`🟡 Minor` plus the tag stays p2"), and that property holds only while
+# badge and tag are in the SAME string. CodeRabbit does not render them that
+# way: the badge leads the finding and the tag trails it as an HTML comment
+# several lines below. Graded line-by-line, the badge line and the tag line are
+# separate strings, each rung fires on its own line, and the tag's p1 OVERRIDES
+# the badge on every line-wise surface — including the REQUIRED
+# scripts/coderabbit-severity-gate.sh, where a 🟡 Minor summary finding then
+# takes an unretirable red graded [P1] under a `{p1}` blocking set that calls
+# p2 discretionary (CodeRabbit's own summary surface, reported on #936).
+#
+# So the stanza, not the line, is the unit the fallback is defined over. The
+# tag CLOSES the finding stanza it trails, which makes the rule expressible
+# without parsing CodeRabbit's `<details>` scaffolding: a tag line grades only
+# when no badge has graded since the previous tag line. A tag always closes the
+# stanza whether or not it graded, so the NEXT badge-less finding still gets
+# its fallback — that reset is what keeps this a scoping rule rather than a
+# one-shot suppression.
+#
+# The suppression is deliberately narrow because it moves toward under-blocking,
+# the unsafe direction for a classifier. It withholds a p1 only when a rendered
+# badge for the same finding was already graded — i.e. only when the ladder has
+# a MORE specific answer — and never when the badge rungs found nothing, which
+# is the whole case #888 added the tag rung for.
+coderabbit_scan_tiers() {
+  local numbered lineno line tier stanza_badge_tier="" tab self_number=0 n=0
+  [ "${1:-}" != "--number" ] || self_number=1
+  tab=$'\t'
+  while IFS= read -r numbered; do
+    n=$((n + 1))
+    if [ "$self_number" = 1 ]; then
+      lineno=$n
+      line=$numbered
+    else
+      [ -n "$numbered" ] || continue
+      lineno=${numbered%%"$tab"*}
+      line=${numbered#*"$tab"}
+    fi
+    [ -n "$line" ] || continue
+    tier=$(coderabbit_badge_tier_of "$line")
+    if [ -n "$tier" ]; then
+      stanza_badge_tier=$tier
+      printf '%s\t%s\t%s\n' "$lineno" "$tier" "$line"
+      continue
+    fi
+    tier=$(coderabbit_indicator_tag_tier_of "$line")
+    [ -n "$tier" ] || continue
+    if [ -n "$stanza_badge_tier" ]; then
+      stanza_badge_tier=""
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "$lineno" "$tier" "$line"
+  done
   return 0
 }

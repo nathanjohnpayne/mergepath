@@ -83,6 +83,15 @@ _🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
 NOTICE_AGED_TIME='2033-05-18T02:53:20Z'   # stubbed NOW - 2400s
 STATUS_AFTER_NOTICE='2033-05-18T03:20:00Z'
 
+# The same 40-minutes-ago instant as NOTICE_AGED_TIME, named for the surface it
+# stamps in the #877 fast-path cases: a PR-level review SUMMARY that has sat
+# unchanged on an unchanged head for longer than the 1800s wallclock freshness
+# floor. Nothing about the head changed; only the clock moved.
+SUMMARY_AGED_TIME='2033-05-18T02:53:20Z'   # stubbed NOW - 2400s
+# A summary belonging to a PRIOR head: stamped BEFORE the head commit's own
+# committer date, so it is stale by HEAD IDENTITY and not merely by wall clock.
+SUMMARY_PRIOR_HEAD_TIME='2026-06-03T23:00:00Z'
+
 # The live #891 / #912 notice: a 59-minute published window, longer than the
 # 1800s wallclock freshness floor, so it ages out of the anchored comment scan
 # while the rate limit it announces is still in force. No HEAD reference — the
@@ -545,6 +554,57 @@ test_status_context_verdict_carries_status_created_at() {
   [ "$FAIL" -ne "$before" ] || pass "13: #912 — the status_context verdict carries the status' own created_at, with the observation time in observed_at"
 }
 
+# --- Test 16: #877 — the summary surface must not AGE OUT of the fast path --
+# Same fixture as test 5 (StatusContext success, zero inline findings, one
+# PR-level summary carrying `_🟠 Major_`) with one difference: the summary is 40
+# minutes old and the freshness window is the live 1800s, so the moving
+# wallclock floor has advanced past it. Nothing about the head changed — only a
+# clock advanced — and the fast path is the ONE site reached when nothing
+# survives that floor, so selecting the summary through HEAD_ANCHOR meant no
+# comment qualified, `summary_blocking_marker_present ""` returned false, and
+# the head CLEARED. The inline sibling three lines above uses the floor-free
+# HEAD_IDENTITY_ANCHOR for exactly this reason (#224), and `--probe` selects the
+# summary anchor-free, so the two routes verdicted the same unchanged head
+# differently: polling cleared while the probe reported findings.
+#
+# Operationally this is the merge gate: .github/workflows/agent-review.yml runs
+# the waiter in polling mode at APPROVAL time, long after the CodeRabbit round,
+# i.e. on precisely the aged head this cleared on.
+test_aged_summary_only_marker_is_findings_not_cleared() {
+  local dir rc before=$FAIL
+  dir=$(make_case "aged-summary-marker" "$REVIEW_BODY_SUMMARY_ONLY_MARKER" \
+    "$STATUS_AFTER_NOTICE" "Review completed" "$SUMMARY_AGED_TIME" 1800)
+  rc=$(run_case "$dir")
+  # Non-vacuity: the floor must actually govern the anchor here, or this is
+  # test 5 again with different timestamps and proves nothing about aging.
+  grep -q 'anchor = .*(source: wallclock floor' "$dir/err.log" \
+    || fail "16: the wallclock floor did not govern the anchor — the fixture no longer reproduces the aged-summary state; err=$(grep 'anchor =' "$dir/err.log")"
+  [ "$rc" != "0" ] || fail "16: fast-path FALSE-CLEARED (exit 0) over a summary-only blocking marker that had merely aged past the wallclock floor; err=$(tail -4 "$dir/err.log")"
+  [ "$rc" = "2" ] || fail "16: expected exit 2 (findings), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "findings" ] || fail "16: status=$(jqf "$dir" '.status'), expected findings"
+  [ "$(jqf "$dir" '.review.endpoint')" = "status_context" ] || fail "16: review.endpoint=$(jqf "$dir" '.review.endpoint'), expected status_context (the verdict must come from the fast path)"
+  grep -q 'PR-level summary carries a blocking marker' "$dir/err.log" || fail "16: expected the #877 summary-marker log line; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  [ "$FAIL" -ne "$before" ] || pass "16: #877 — an unchanged head does not transition from findings to cleared because the wallclock floor advanced past its summary"
+}
+
+# --- Test 17: escape — the fast-path summary read is ANCHORED, not anchor-free
+# The fix is a swap from the moving wallclock floor to HEAD_IDENTITY_ANCHOR (the
+# head's own committer/force-push time), NOT the removal of the anchor. A
+# summary stamped BEFORE the head commit exists belongs to a PRIOR head, and
+# resurrecting it would block every push that follows a blocking review — the
+# opposite failure, and one no push could clear. An anchor-free read fails here.
+test_prior_head_summary_marker_does_not_block() {
+  local dir rc before=$FAIL
+  dir=$(make_case "prior-head-summary-marker" "$REVIEW_BODY_SUMMARY_ONLY_MARKER" \
+    "$STATUS_AFTER_NOTICE" "Review completed" "$SUMMARY_PRIOR_HEAD_TIME" 1800)
+  rc=$(run_case "$dir")
+  [ "$rc" = "0" ] || fail "17: expected exit 0 (cleared) — a summary predating the head commit is a PRIOR head's report, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "17: status=$(jqf "$dir" '.status'), expected cleared"
+  [ "$(jqf "$dir" '.review.endpoint')" = "status_context" ] || fail "17: expected the fast-path verdict, got endpoint=$(jqf "$dir" '.review.endpoint')"
+  grep -q 'PR-level summary carries a blocking marker' "$dir/err.log" && fail "17: a prior head's summary blocked this head — the fast-path summary read went anchor-free instead of head-identity-anchored"
+  [ "$FAIL" -ne "$before" ] || pass "17: escape — the fast-path summary read is anchored to head identity; a prior head's blocking summary does not block this head"
+}
+
 test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
 test_headref_later_success_clears
@@ -560,6 +620,8 @@ test_status_description_predicate_unit
 test_status_context_verdict_carries_status_created_at
 test_open_window_inside_freshness_defers_to_arbitration
 test_failed_summary_read_does_not_clear
+test_aged_summary_only_marker_is_findings_not_cleared
+test_prior_head_summary_marker_does_not_block
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"

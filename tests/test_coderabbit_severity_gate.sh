@@ -3709,6 +3709,107 @@ for case_name in bare-critical marker-only; do
 done
 
 # ---------------------------------------------------------------------------
+# Test 50 (#936): the #888 machine-tag rung must not OVERRIDE the badge on the
+# SUMMARY surface — this gate's line-wise path.
+#
+# Test 49's two cases both run through make_single_comment_fixture, i.e. the
+# INLINE path, where the whole finding body is handed to the classifier as one
+# string and the documented fallback ordering holds by construction. The
+# summary path grades LINE BY LINE, and CodeRabbit renders one finding's badge
+# and its `cr-indicator-types` tag on different lines — so each rung fired on
+# its own line, the tag line graded [P1], and a 🟡 Minor summary finding took a
+# red on a REQUIRED gate whose blocking set ({p1} by default) calls p2
+# discretionary. A summary finding has no review thread, so that red had no
+# "Resolve conversation" escape either.
+#
+# 50a is the defect (must NOT gate), 50b the escape (the tag rung still gates
+# when there is no badge at all), 50c the non-vacuity control (the same body
+# DOES gate once p2 is required — so 50a is the tier decision, not a summary
+# path that stopped seeing the finding).
+# ---------------------------------------------------------------------------
+SUMMARY_MINOR_TAGGED_FINDING='_🔒 Security & Privacy_ | _🟡 Minor_ | _⚡ Quick win_
+
+**Bound the retry delay.**
+
+The delay grows without a ceiling.
+
+<!-- cr-indicator-types:potential_issue -->'
+SUMMARY_TAG_ONLY_FINDING='**Reject the diagnostic bypass in merge-gate callers.**
+
+The caller accepts a bypass flag that skips the gate.
+
+<!-- cr-indicator-types:potential_issue -->'
+
+echo
+echo "--- Test 50a (#936): summary 🟡 Minor + trailing machine tag → exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_MINOR_TAGGED_FINDING")")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)"; then
+  pass "#936: a 🟡 Minor summary finding is not promoted to [P1] by its trailing machine tag → exit 0"
+else
+  fail "#936: expected rc=0 with 'unresolved: 0' and no [P1] summary listing; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo "--- Test 50b (escape): summary finding with NO badge, tag only → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_TAG_ONLY_FINDING")")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)"; then
+  pass "#936 escape: the #888 tag rung still gates a badge-less summary finding → exit 1"
+else
+  fail "#936 escape: expected rc=1 with 'unresolved: 1' + a [P1] summary listing; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo "--- Test 50c (control): the SAME 50a body + p2 required → exit 1 as [P2]"
+SCRATCH=$(make_scratch_with_policy "$P2_REQUIRED_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_MINOR_TAGGED_FINDING")")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "\[P2\] (PR-level summary comment)"; then
+  pass "#936 control: the same summary finding gates as [P2] once p2 is required (50a is the tier, not a blind path)"
+else
+  fail "#936 control: expected rc=1 + a [P2] summary listing; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_coderabbit_severity_gate.sh: $PASS passed, $FAIL failed"
