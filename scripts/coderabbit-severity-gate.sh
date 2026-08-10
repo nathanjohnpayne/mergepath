@@ -34,7 +34,14 @@
 #              to the current repo via `gh repo view`.
 #
 # Environment:
-#   GH_TOKEN   Required. Needs pull_requests:read.
+#   GH_TOKEN   Required. Needs pull_requests:read AND issues:read.
+#              `issues:read` is for the PR-level SUMMARY surface added in
+#              #832 (`repos/{repo}/issues/{pr}/comments`). It is not
+#              optional: that read is fail-CLOSED, so a token without the
+#              permission gets a 403 and the gate exits 2 rather than
+#              silently skipping the surface. The bundled workflow grants
+#              it; ad-hoc and private-repo callers using a fine-grained
+#              token must provision it too.
 #   PR_NUMBER  Optional fallback for the positional arg. The
 #              scheduled-sweep job in
 #              .github/workflows/coderabbit-severity-gate.yml passes
@@ -43,6 +50,11 @@
 #              find it easier to set it as env.
 #   REPO       Optional fallback for the positional REPO arg. Same
 #              motivation as PR_NUMBER above.
+#   REQUIRE_REVIEW_SUMMARY  Optional true|false (default false). Both bundled
+#              workflow arms set true: once a completed CodeRabbit review run
+#              exists on HEAD, hold this run rather than publish a verdict
+#              until a summary is correlated to that run. Other callers retain
+#              the normal arrival-independent gate behavior.
 #
 # Algorithm:
 #   1. Read .github/review-policy.yml `coderabbit.severity_gate.enabled`.
@@ -62,6 +74,16 @@
 #   5. SHA scope: a finding only gates if its comment was attached to the
 #      PR's current HEAD. A finding from an earlier SHA that is now either
 #      resolved OR no longer on HEAD does not count.
+#   5b. Also fetch the SUMMARY surface — the head-pinned CodeRabbit review
+#      objects (`repos/{repo}/pulls/{pr}/reviews`, where the markerless
+#      full-review body lives) and the PR-level comments
+#      (`repos/{repo}/issues/{pr}/comments`, where the marker-led walkthrough
+#      lives) — and classify both with the SAME coderabbit_tier_of (#832).
+#      CodeRabbit can carry a blocking finding solely in its summary, with no
+#      inline anchor and therefore no review thread. See the "PR-level summary
+#      surface" section below for the identity / scope / completeness rules,
+#      and for the acknowledgement channel that stands in for "Resolve
+#      conversation" on that surface.
 #   6. Print one line per unresolved blocking-tier finding to stdout for
 #      CI visibility, then the summary "CodeRabbit blocking-tier
 #      unresolved: N".
@@ -72,6 +94,15 @@
 #   1   One or more unresolved blocking-tier findings on current HEAD —
 #       gate blocks.
 #   2   Usage / config error. Error message on stderr.
+#   3   REQUIRE_REVIEW_SUMMARY only: a completed CodeRabbit review run is on
+#       the current HEAD and NO acceptor recognised a summary for it, so the
+#       findings on that surface are not knowable. NOT a finding count.
+#       An event-driven caller treats it as non-green; the scheduled /
+#       issue_comment sweep must DECLINE TO PUBLISH rather than post a
+#       success read off the previous publication. Since the primary acceptor
+#       reads the summary out of the run object's OWN body, this no longer
+#       fires merely because the walkthrough comment has not caught up — it
+#       means the run's serialization is one this gate cannot classify.
 #
 # Design notes:
 #   - Read-only. Only GETs against the GitHub API.
@@ -83,12 +114,18 @@
 #     GraphQL" — the same mechanism the author or any collaborator already
 #     uses to clear any review thread. Resolving a finding that
 #     legitimately does not apply (rebutted with rationale, moot, deferred
-#     to a follow-up issue) clears the gate.
+#     to a follow-up issue) clears the gate. A summary-only finding has no
+#     thread; its override path is the head-and-finding-set-pinned collaborator
+#     ack comment documented in the "PR-level summary surface" section (#832).
 #
 # References:
 #   - nathanjohnpayne/mergepath#574 — the symmetric feedback policy
 #   - nathanjohnpayne/mergepath#577 — this script + the generalized Codex gate
+#   - nathanjohnpayne/mergepath#535 — CodeRabbit can carry a finding in the
+#     PR-level summary alone; taught the advisory waiter to look
+#   - nathanjohnpayne/mergepath#832 — teaching THIS (required) gate the same
 #   - scripts/codex-p1-gate.sh — the Codex twin this mirrors
+#   - scripts/coderabbit-wait.sh — canonical source of the summary predicates
 #   - REVIEW_POLICY.md § Feedback Disposition Policy — the normalized ladder
 
 set -euo pipefail
@@ -382,11 +419,1047 @@ while [ "$i" -lt "$CAND_COUNT" ]; do
 done
 
 BLOCKING_COUNT=$(echo "$BLOCKING_COMMENTS" | jq 'length')
-log "found $BLOCKING_COUNT blocking-tier comment(s) on HEAD"
+log "found $BLOCKING_COUNT blocking-tier inline comment(s) on HEAD"
 
-if [ "$BLOCKING_COUNT" -eq 0 ]; then
+# --- fetch CodeRabbit blocking-tier PR-level SUMMARY findings (#832) --------
+#
+# `pulls/{pr}/comments` above returns inline review comments only. CodeRabbit
+# also publishes a PR-level summary on `issues/{pr}/comments`, and it can carry
+# a blocking finding that has NO inline anchor at all (#535 established this is
+# real, and taught the ADVISORY waiter to look; the REQUIRED gate was never
+# taught the same thing — the inversion #832 filed).
+#
+# Three properties this surface needs and the inline surface gets for free:
+#
+#   IDENTITY. Select the summary BY its auto-generated marker, never as "the
+#   newest CodeRabbit comment". CodeRabbit keeps exactly one marker-carrying
+#   comment per PR and edits it in place; a CodeRabbit CHAT REPLY is a
+#   different comment that carries no marker, and two live replies (#794,
+#   #518) embed a full 40-hex head SHA lifted from a pasted `gh pr view`
+#   snippet — marker selection makes those structurally unable to supply
+#   evidence here.
+#
+#   SCOPE. An inline comment carries `commit_id`; a summary comment carries no
+#   commit field at all. The honest anchor is the one CODERABBIT itself writes
+#   into the body: the `📥 Commits` line's range END (`between <prev> and
+#   <head>`). It is bot-authored content naming a SHA, exactly like the
+#   `Reviewed commit:` line the Codex path anchors on. It is deliberately NOT
+#   a timestamp: no wall-clock floor is consulted anywhere below, so a finding
+#   can never age out of view, and no pusher-controlled clock can move the
+#   boundary (per REVIEW_POLICY.md's no-spoofable-timestamp rule and the #535
+#   HEAD_ANCHOR caveat the issue calls out).
+#
+#   COMPLETENESS. The commits range describes whatever run last touched the
+#   comment, INCLUDING runs that produced no review (`rate limited`,
+#   `failure`, `review in progress` — #790 names the head exactly while saying
+#   "Review failed"). So the summary counts as a report only when every
+#   outcome stanza present is benign. ALLOW-list, not deny-list: a stanza KIND
+#   CodeRabbit has not shipped yet reads as not-a-report, never as clean.
+#
+# The four constants and the two predicates below are the canonical ones from
+# scripts/coderabbit-wait.sh (SUMMARY_MARKER, CR_SUMMARY_BENIGN_STANZA_RE,
+# CR_PRE_MERGE_BLOCK_*, summary_stanzas_all_benign, summary_names_head). They
+# are duplicated here rather than sourced: this required gate must not take a
+# runtime dependency on the advisory waiter, and the shared lib
+# (scripts/lib/feedback-policy-helpers.sh) is contractually a pure
+# tier-classifier. Keep the two copies in lockstep — the same posture the
+# GraphQL pagination block below carries with scripts/codex-p1-gate.sh.
+CR_SUMMARY_MARKER='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+CR_SUMMARY_BENIGN_STANZA_RE='auto-generated comment: (summarize|release notes) by coderabbit\.ai'
+CR_PRE_MERGE_BLOCK_START='<!-- pre_merge_checks_walkthrough_start -->'
+CR_PRE_MERGE_BLOCK_END='<!-- pre_merge_checks_walkthrough_end -->'
+# CodeRabbit's current full-review format can omit CR_SUMMARY_MARKER entirely
+# and lead with this machine-shaped result line. It is intentionally narrow:
+# prose such as a chat reply must not become a summary merely because a review
+# object exists on the same head.
+CR_MARKERLESS_FULL_REVIEW_RE='^\*\*Actionable comments posted: [0-9]+\*\*(\r?\n|$)'
+
+# --- shared fence-aware line filter ----------------------------------------
+#
+# THREE structural scans below need the same question answered — "is this line
+# CodeRabbit's own markup, or content CodeRabbit is quoting?" — and each of them
+# turned out to be a false clear of this required gate when it got that answer
+# wrong (stanza detection, the pre-merge strip, and the commits-range match).
+# They share ONE implementation rather than three copies, because the first
+# attempt did carry three copies and they were three different degrees of wrong
+# (Codex P1 round 5 on #886: the copies recognised only a bare three-backtick
+# fence, so a `~~~` or ````` quote walked straight past two fixes made for
+# exactly this).
+#
+# Fence recognition follows CommonMark rather than a convenient subset: an
+# opener is 3+ backticks OR 3+ tildes, indented up to 3 spaces, optionally with
+# an info string; a closer must use the SAME character, be at least as long,
+# and carry nothing but whitespace after it. Getting any of those wrong
+# reintroduces the bug — a `~~~` block whose contents are read as markup, or a
+# ```` fence "closed" by an inner ``` line.
+#
+# Deliberately interval-free regexes (`/^ ? ? ?/`, explicit run counting): awk
+# interval expressions are not portable across the BWK awk on macOS and the
+# mawk/gawk on CI runners, and a silently-unsupported `{3,}` would degrade this
+# to matching nothing.
+CR_AWK_FENCE_PRELUDE='
+function fence_info(s, out,   c, n) {
+  sub(/^ ? ? ?/, "", s)
+  c = substr(s, 1, 1)
+  if (c != "`" && c != "~") return 0
+  n = 0
+  while (substr(s, n + 1, 1) == c) n++
+  if (n < 3) return 0
+  out["rest"] = substr(s, n + 1)
+  # CommonMark: the info string of a BACKTICK fence may not contain a backtick
+  # (tilde fences have no such restriction). Accepting one made an ordinary
+  # prose line carrying backticks read as an opener, which puts the reader into
+  # a fence that never legitimately closes and hides everything after it —
+  # including the genuine commits range, which then takes the summary out of
+  # scope and clears the gate. Rejecting the line here is the correct outcome
+  # and not merely the safe one: such a line is not a fence in any renderer.
+  if (c == "`" && index(out["rest"], "`") > 0) return 0
+  out["char"] = c
+  out["len"] = n
+  return 1
+}
+function fence_update(l,   inf) {
+  if (!fence_info(l, inf)) return 0
+  if (!FENCE) { FENCE = 1; FCH = inf["char"]; FLEN = inf["len"]; return 1 }
+  if (inf["char"] == FCH && inf["len"] >= FLEN && inf["rest"] ~ /^[ \t]*$/) {
+    FENCE = 0; FCH = ""; FLEN = 0
+  }
+  return 1
+}
+'
+
+# Emit `<original line number>\t<CR-stripped line>` for every line of the body
+# that is OUTSIDE a fenced code block, dropping the fence delimiter lines
+# themselves. The line number is carried because the pre-merge strip has to map
+# its decision back onto the original body.
+summary_unfenced_numbered() {
+  printf '%s\n' "$1" | awk "$CR_AWK_FENCE_PRELUDE"'
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (fence_update(line)) next
+      if (FENCE) next
+      printf "%d\t%s\n", NR, line
+    }
+  '
+}
+
+# Emit one normalized line per STRUCTURAL stanza OPENER in the body.
+#
+# "Structural" is the whole point (Codex P1 round 1 on #886). Counting the bare
+# `auto-generated comment: ` substring anywhere in the body lets PR-CONTROLLED
+# text decide whether this summary is a completed report: CodeRabbit quotes
+# changed code in its walkthrough and in summary findings, so a PR that merely
+# CONTAINS the rate-limit marker as source text — this very PR's test fixtures
+# do — inflates the non-benign count and makes an otherwise-complete summary
+# read as "not a report". That path exits 0 with any real blocking finding in
+# that summary ungated: a false clear of a required gate, produced by content
+# the PR author writes. Precisely the failure class #832 exists to close.
+#
+# So a stanza counts only in the shape CodeRabbit actually writes it: a whole
+# line, at column 0, wrapping a KIND — and only OUTSIDE a fenced code block,
+# because a fence is how a quoted marker reaches the rendered body at column 0.
+# Both narrowings move the same way: they can only shrink the non-benign count,
+# never grow it. That direction is deliberate. Over-counting non-benign skips
+# the summary and clears the gate (fails OPEN); under-counting classifies a
+# body that produced no review, which finds no `⚠️`/`P1` lines in a rate-limit
+# notice and, in the #790 stale-text case, gates on findings rather than
+# clearing (fails CLOSED). Only one of those two errors can pass a blocking
+# finding through, and this shape cannot make it.
+#
+# `end of auto-generated comment:` CLOSERS are deliberately not openers, so a
+# stanza contributes exactly once whether or not CodeRabbit closes it. Real
+# bodies carry both forms (mergepath#874's summary has three openers and two
+# closers), and counting closers made the total depend on which stanza kinds
+# happen to be wrapped.
+summary_stanza_opener_lines() {
+  summary_unfenced_numbered "$1" | sed 's/^[0-9]*	//' | awk '
+    {
+      line = $0
+      sub(/[ \t]+$/, "", line)
+      if (line ~ /^<!-- This is an auto-generated comment: .* by coderabbit\.ai -->$/) {
+        print line
+      }
+    }
+  '
+}
+
+# True when the body carries at least one outcome stanza AND every stanza is
+# benign. The KIND allow-list ($CR_SUMMARY_BENIGN_STANZA_RE) is unchanged and
+# stays in lockstep with scripts/coderabbit-wait.sh; only WHERE it is applied
+# narrowed, to the structural openers above. The `-gt 0` guard is load-bearing,
+# not defensive — a body with zero stanzas is no report at all and must not
+# pass vacuously. ALLOW-list, not deny-list: a KIND CodeRabbit has not shipped
+# yet reads as not-a-report, never as clean, including one containing angle
+# brackets (`failure <head-changed>`), which the `.*` KIND span still matches.
+summary_stanzas_all_benign() {
+  local openers total benign
+  openers=$(summary_stanza_opener_lines "$1")
+  [ -n "$openers" ] || return 1
+  # `|| true` on both: grep exits 1 on no match, which `set -o pipefail` would
+  # promote to a failed assignment. `grep -c` still prints 0, which is the
+  # answer we want.
+  total=$(printf '%s\n' "$openers" | grep -c . || true)
+  benign=$(printf '%s\n' "$openers" | grep -ciE "$CR_SUMMARY_BENIGN_STANZA_RE" || true)
+  [ "${total:-0}" -gt 0 ] && [ "$total" = "$benign" ]
+}
+
+# True when the body carries at least one structural outcome stanza and at least
+# one of them is NON-benign — i.e. CodeRabbit said in its own markup that this
+# publication produced no review (`rate limited`, `failure`, `review in
+# progress`).
+#
+# This is deliberately NOT the negation of summary_stanzas_all_benign. That
+# predicate answers "is this a completed marker-format report?", and a body with
+# ZERO stanzas fails it — correct for the marker format, whose completed shape
+# always carries the `summarize` stanza. A review RUN object's body carries no
+# such stanza at all (measured: mergepath#880 review 4848342765 closes with
+# `<!-- This is an auto-generated comment by CodeRabbit for review status -->`,
+# which is not a stanza opener), so requiring all-benign there would reject every
+# genuine run body. The question the run-object acceptors need is the narrower
+# one: did CodeRabbit itself declare this publication a non-review? Zero stanzas
+# is not such a declaration; a `rate limited` stanza is.
+summary_has_non_benign_stanza() {
+  local openers nonbenign
+  openers=$(summary_stanza_opener_lines "$1")
+  [ -n "$openers" ] || return 1
+  # `|| true` for the same `set -o pipefail` reason as above: `grep -vc` exits 1
+  # when every line matches, while still printing the 0 this wants.
+  nonbenign=$(printf '%s\n' "$openers" | grep -vciE "$CR_SUMMARY_BENIGN_STANZA_RE" || true)
+  [ "${nonbenign:-0}" -gt 0 ]
+}
+
+# True when $2 (the PR HEAD sha) is the RANGE END of a `between <prev> and
+# <head>` commits line in $1. Position matters twice over: the range START is
+# the PREVIOUSLY-reviewed head, so a force-push back to it would read a later
+# round's summary as this head's; and a "Review failed" body names the
+# abandoned NEW head in refusal prose ("changed during the review from X to
+# Y"), which a position-blind token match accepts.
+#
+# The range is EXTRACTED and then compared as a string rather than
+# interpolating the head into the pattern. Require full object IDs: a shortened
+# SHA is not a unique commit identifier, and a PR author can produce a later
+# head with the same prefix. Keeping the head out of the regex means no
+# caller-supplied value is ever evaluated as a pattern.
+summary_names_head() {
+  local ranges end want r
+  # Extracted from the UNFENCED body only (Codex P1 round 5 on #886). A
+  # whole-body match accepted a `between <sha> and <sha>` string that CodeRabbit
+  # was merely QUOTING from the diff, which is enough to make a stale summary
+  # read as this head's report — and both error directions are unsafe here, so
+  # this is one of the few places where precision matters rather than a
+  # fail-direction argument. Excluding fenced quotes is a strict improvement:
+  # CodeRabbit's own commits row is never inside a fence, so nothing genuine is
+  # lost.
+  #
+  # NOT narrowed to the `📥 Commits` section, though that would be more precise
+  # still: the section heading is CodeRabbit presentation that can change
+  # without notice, and if it did, the range would stop being found, the summary
+  # would fall out of scope, and its findings would go ungated. That is a false
+  # CLEAR bought with precision, which is the wrong trade for a required gate.
+  ranges=$(summary_unfenced_numbered "$1" | sed 's/^[0-9]*	//' \
+    | grep -oiE 'between [0-9a-f]{40} and [0-9a-f]{40}' || true)
+  [ -n "$ranges" ] || return 1
+  # Hex is case-insensitive; GitHub renders shas lowercase but the comparison
+  # must not depend on that, or an uppercase range would silently drop this
+  # head's summary out of scope.
+  want=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+  # Exact comparison only. An abbreviated end cannot distinguish the current
+  # head from another commit with the same prefix, so fail closed until the
+  # summary names the full current object ID.
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    end=$(printf '%s' "$r" | awk '{print $4}' | tr '[:upper:]' '[:lower:]')
+    [ -n "$end" ] || continue
+    [ "$end" = "$want" ] && return 0
+  done <<EOF
+$ranges
+EOF
+  return 1
+}
+
+# Drop CodeRabbit's pre-merge check table from the body before classifying.
+# That table grades PR hygiene and renders a `⚠️ Warning` row for a
+# below-threshold docstring score — not a code finding (3 of 5 sampled
+# summaries carry one).
+#
+# STRUCTURAL and FENCE-AWARE, on the same reasoning as the stanza parser above
+# (Codex P1 round 4 on #886), and this one is the more dangerous of the pair
+# because it deletes text rather than reclassifying it. Matching the delimiter
+# as a SUBSTRING anywhere let PR-controlled text move the suppressor's start:
+# a PR whose diff contains the start delimiter, quoted back by CodeRabbit in
+# its walkthrough ABOVE the genuine table, made the strip span from that quote
+# to the real table's end — silently deleting every genuine blocking finding in
+# between and clearing a required gate. So a delimiter counts only as a whole
+# line at column 0, outside a fenced code block.
+#
+# The pairing rule is unchanged and still load-bearing: strip only a START that
+# has an END AFTER it. With presence alone checked, a stray START (or an END
+# rendered first) latches the suppressor and drops everything to EOF.
+summary_strip_pre_merge_block() {
+  local body=$1 pair
+  # Emit "<start_line> <end_line>" for the first structural START that is
+  # followed by a structural END, or nothing at all.
+  pair=$(summary_unfenced_numbered "$body" | awk -F'\t' \
+    -v s="$CR_PRE_MERGE_BLOCK_START" -v e="$CR_PRE_MERGE_BLOCK_END" '
+    {
+      n = $1
+      line = substr($0, index($0, "\t") + 1)
+      sub(/[ \t]+$/, "", line)
+      if (line == s && !have_s) { have_s = 1; sl = n; next }
+      if (line == e && have_s) { print sl " " n; exit }
+    }
+  ')
+  if [ -n "$pair" ]; then
+    printf '%s\n' "$body" | awk -v sl="${pair% *}" -v el="${pair#* }" 'NR < sl || NR > el'
+    return 0
+  fi
+  printf '%s' "$body"
+}
+
+# Fingerprint the classified blocking summary lines, for the ack token below.
+# Portable SHA-256 (sha256sum on Linux/CI, shasum -a 256 on macOS), truncated
+# to 12 hex chars — this is a change detector, not a security boundary: the
+# collaborator copies whatever the gate prints, so the only property that
+# matters is that a different finding set yields a different token. With
+# neither hasher on PATH the gate cannot bind an ack to a finding set at all,
+# which is a config error (die 2), never a silent fall back to head-only
+# pinning.
+summary_findings_fingerprint() {
+  local out
+  if command -v sha256sum >/dev/null 2>&1; then
+    out=$(printf '%s' "$1" | sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then
+    out=$(printf '%s' "$1" | shasum -a 256)
+  else
+    die 2 "neither sha256sum nor shasum found on PATH — cannot fingerprint the summary finding set for the acknowledgement token"
+  fi
+  printf '%s' "$out" | awk '{print substr($1, 1, 12)}'
+}
+
+# The issues endpoint is a REQUIRED read: an unreadable one is a scan that
+# cannot be trusted complete, so fetch_api_array's die 2 (fail closed) is the
+# correct outcome — never an empty result silently treated as "no findings".
+ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level issue comments")
+
+REQUIRE_REVIEW_SUMMARY=${REQUIRE_REVIEW_SUMMARY:-false}
+case "$REQUIRE_REVIEW_SUMMARY" in
+  true|false) ;;
+  *) die 2 "REQUIRE_REVIEW_SUMMARY must be true|false; got '$REQUIRE_REVIEW_SUMMARY'" ;;
+esac
+
+# `startswith`, not `contains` — the same predicate scripts/coderabbit-wait.sh
+# uses at its own selection site, and for the same reason (Codex P1 round 2 on
+# #886). The marker opens the real summary at byte zero; a CodeRabbit CHAT
+# REPLY can QUOTE it further down. Containment lets such a reply — which always
+# has the higher comment id, so `last` picks it — stand in for the summary. It
+# carries no structural stanza, so it is then rejected as "not a completed
+# report" and the real current-head summary is never examined: a false CLEAR of
+# this required gate. The shape is a live one, fixture 7917/7918 in
+# tests/test_coderabbit_wait_status_probe.sh (#794).
+#
+# CodeRabbit also has a markerless full-review format whose first line is
+# `**Actionable comments posted: N**` (#886, Codex P1). In production that
+# format is written in the REVIEW OBJECT body, which is where the primary
+# acceptor below reads it from. The same predicate is still applied to this
+# PR-comment surface as a retained secondary acceptor: it costs nothing, it can
+# only ADD candidates (the fail-closed direction), and a serialization that
+# moved onto comments must not silently un-gate its findings. On that surface
+# the shape is not enough on its own — unlike the marker format it carries no
+# commits-range anchor — so accept it only when a CodeRabbit review run is
+# anchored to this exact PR head, and only when the comment is fresh at-or-after
+# that run; otherwise an older markerless body can inherit a later exact-head
+# object and briefly publish a stale verdict.
+MARKER_SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
+  --arg bot "$BOT_LOGIN" --arg m "$CR_SUMMARY_MARKER" '
+  [ .[]
+    | select(.user.login == $bot)
+    | select((.body // "") | startswith($m))
+    | . + { fresh_at: ([.created_at, (.updated_at // .created_at)]
+                        | map(select(type == "string" and . != "")) | max // "") }
+  ]
+  | sort_by(.id)
+  | last
+  | { id: (.id // 0), body: (.body // ""), fresh_at: (.fresh_at // "") }
+')
+MARKER_SUMMARY_ID=$(echo "$MARKER_SUMMARY_JSON" | jq -r '.id')
+MARKER_SUMMARY_BODY=$(echo "$MARKER_SUMMARY_JSON" | jq -r '.body')
+MARKER_SUMMARY_FRESH_AT=$(echo "$MARKER_SUMMARY_JSON" | jq -r '.fresh_at')
+
+# --- head-pinned CodeRabbit review RUN objects ------------------------------
+#
+# Read UNCONDITIONALLY, because pulls/{pr}/reviews is the surface CodeRabbit's
+# markerless full-review summary is actually written on. Measured across ten
+# real PRs (#886, #902, #889, #884, #874, #873, #866, #872, #880, #867):
+# `**Actionable comments posted: N**` occurs ZERO times in issues/{pr}/comments
+# and SEVENTEEN times in pulls/{pr}/reviews. Applying the markerless predicate
+# only to the comment surface made that acceptor contribute a candidate zero
+# percent of the time against production data, so with a TERMINAL CodeRabbit on
+# the head the candidate set was routinely EMPTY, the publication hold below
+# never cleared, and the required check stayed red with no break-glass under
+# `enforce_admins: true`.
+#
+# Unconditional rather than flag-gated: both bundled workflow arms already set
+# REQUIRE_REVIEW_SUMMARY=true and so already pay for this read, and for an
+# ad-hoc caller the alternative to paying for it is not reading the surface the
+# findings are on — a false CLEAR of a required gate rather than a saving. A
+# failed read is fetch_api_array's die 2, never an empty result read as "no
+# findings".
+REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "CodeRabbit review objects")
+
+# Only a review RUN carries (and anchors) a summary — a NON-EMPTY body is the
+# discriminator, the same one mergepath#900 measured. CodeRabbit also creates a
+# head-pinned COMMENTED review object for a conversational REPLY on a review
+# thread (its answer to a rebuttal, or to the `[mergepath-resolve:<class>]` tag
+# reply resolve-pr-threads.sh posts to clear the pre-merge conversation gate).
+# Those carry an empty body and start no run, so no summary ever accompanies
+# them. Taking the newest object outright let a reply that lands AFTER the
+# summary push the correlation floor past it, and the filter below then
+# discarded the genuine current summary — a permanent hold on a PR whose review
+# demonstrably finished, re-armed by every thread reply. Five such objects sat
+# on this PR's own head while its one real run carried a 9906-byte body.
+#
+# DISMISSED counts as a run (Codex P1 on #886). The question here is whether the
+# bot reviewed this head, not whether its review is still standing — and
+# `pull_request_review: [dismissed]` is one of this gate's own triggers, so
+# dropping the state made dismissing the review re-run the gate with its anchor
+# removed. A markerless summary then fell out of scope and a summary-only
+# blocking finding cleared on exit 0, giving dismissal a second job as a bypass
+# of the collaborator ack channel that is supposed to be the only way off that
+# surface.
+HEAD_REVIEW_RUNS_JSON=$(echo "$REVIEWS_JSON" | jq -c \
+  --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+  [ .[]
+    | select(.user.login == $bot)
+    | select(.commit_id == $sha)
+    | select(.state == "COMMENTED" or .state == "APPROVED"
+             or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+    | select(((.body // "") | gsub("\\s"; "")) != "")
+    | { id: (.id // 0),
+        body: (.body // ""),
+        fresh_at: (.submitted_at | if type == "string" then . else "" end) }
+  ]
+  | sort_by(.fresh_at, .id)
+')
+HEAD_REVIEW_AT=$(echo "$HEAD_REVIEW_RUNS_JSON" | jq -r '
+  [ .[] | .fresh_at | select(. != "") ] | max // ""
+')
+HEAD_REVIEW_RUN_IDS=$(echo "$HEAD_REVIEW_RUNS_JSON" | jq -r \
+  '[ .[] | .id | tostring ] | join(", ")')
+
+# The marker-led summarize and markerless full-review serializations are both
+# live CodeRabbit protocols. They are not mutually exclusive: a stale marker
+# comment must never suppress a current markerless review summary, or vice
+# versa. Scope each independently, then classify every current candidate below.
+SUMMARY_CANDIDATES='[]'
+if [ "$MARKER_SUMMARY_ID" != "0" ]; then
+  if ! summary_stanzas_all_benign "$MARKER_SUMMARY_BODY"; then
+    log "PR-level summary (comment id $MARKER_SUMMARY_ID) carries a non-benign outcome stanza (rate limit / failure / in progress) — not a completed report, no summary findings in scope"
+  elif ! summary_names_head "$MARKER_SUMMARY_BODY" "$HEAD_SHA"; then
+    log "PR-level summary (comment id $MARKER_SUMMARY_ID) does not name $HEAD_SHA as its commits-range end — not this head's report, no summary findings in scope"
+  else
+    SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c \
+      --argjson id "$MARKER_SUMMARY_ID" --arg body "$MARKER_SUMMARY_BODY" \
+      --arg fresh_at "$MARKER_SUMMARY_FRESH_AT" \
+      '. + [{id: $id, body: $body, scope: "commits-range", fresh_at: $fresh_at}]')
+  fi
+fi
+
+# PRIMARY ACCEPTORS: the full-review summary in the body of a head-pinned review
+# RUN object.
+#
+# Scoped by the object's GitHub-owned `commit_id` alone — the same
+# no-spoofable-timestamp posture the marker-led commits range has, and a
+# STRONGER one than the marker path can offer, because the anchor travels with
+# the report instead of having to be re-stamped onto a comment afterwards. That
+# distinction is the whole defect this closes: CodeRabbit updates the
+# walkthrough comment IN PLACE and does not reliably re-carry a commits range
+# naming the current head, so the marker-led path can find nothing while
+# CodeRabbit is demonstrably terminal on that head (measured on this PR: review
+# object present, commit StatusContext `CodeRabbit = success`, walkthrough still
+# naming an older head). The marker-led path above therefore stays an ACCEPTOR
+# and is no longer a REQUIREMENT.
+#
+# TWO acceptors, because ONE does not cover CodeRabbit's ordinary terminal
+# report. Measured across `pulls/{pr}/reviews` for 20 mergepath PRs (#886, #902,
+# #900, #898, #889, #884, #874, #873, #872, #869, #867, #866, #880, #865, #849,
+# #843, #909, #876, #887, #883): of 22 non-empty `coderabbitai[bot]` review
+# bodies, 2 (9%) carry NO `Actionable comments posted` header at all — they open
+# with a blank line and then `<details><summary>🧹 Nitpick comments (N)</summary>`
+# (mergepath#880 review 4848342765 on 9601e872, mergepath#849 review 4833684457
+# on 1b8195da). Both are COMPLETE terminal reports, and on #880's head that
+# object was the only CodeRabbit review object there was. With the header as the
+# sole acceptor the candidate set was empty on a terminal review, which is rc 3 —
+# and rc 3 is unretirable: the event-driven arm publishes a native FAILURE on
+# that head and the sweep, the only arm that can restore the check, declines to
+# publish on it. Every later sweep re-reads the same stable body and skips again,
+# `@coderabbitai full review` reproduces the same serialization, and
+# `enforce_admins: true` leaves no break-glass. So the second acceptor is not a
+# convenience: without it this gate manufactures exactly the red nothing retires
+# that the spec says it cannot.
+#
+#   1. HEADER — the body matches CR_MARKERLESS_FULL_REVIEW_RE, the machine-shaped
+#      result line of the format CodeRabbit writes most of the time.
+#   2. SELF-ANCHORED — the body carries its OWN `📥 Commits` range whose end names
+#      this head. That is the same bot-authored evidence the marker-led path
+#      accepts on the comment surface, here corroborated by the object's
+#      GitHub-owned `commit_id`: two independent anchors naming the same head,
+#      which is strictly stronger than the marker path's one. The #880 body
+#      carries `between 21cf07b5… and 9601e872…` — the anchor the gate needed was
+#      inside the object it was already holding on.
+#
+# Acceptor 2 declines a body whose own markup says the publication produced no
+# review (a `rate limited` / `failure` / `review in progress` stanza). It does
+# NOT require the marker format's all-benign test: a run body legitimately
+# carries zero stanzas, so demanding one would reject every real run.
+#
+# The recognised runs are collected in order (the sort_by above), so `last` is
+# the newest: a same-head re-review's newer run wins over the run it replaced,
+# and the superseded body is dropped by the correlation filter below on the
+# review-triggered path, exactly as a superseded marker-led summary is.
+HEAD_SUMMARY_RUNS_JSON='[]'
+while IFS= read -r cr_run_json; do
+  [ -n "$cr_run_json" ] || continue
+  cr_run_body=$(printf '%s' "$cr_run_json" | jq -r '.body')
+  cr_run_recognised_by=''
+  # jq's `test` rather than a shell grep, so the acceptor keeps the exact
+  # semantics the constant was written against.
+  if printf '%s' "$cr_run_json" \
+      | jq -e --arg re "$CR_MARKERLESS_FULL_REVIEW_RE" '.body | test($re)' >/dev/null; then
+    cr_run_recognised_by='markerless-result-line'
+  elif summary_names_head "$cr_run_body" "$HEAD_SHA" \
+      && ! summary_has_non_benign_stanza "$cr_run_body"; then
+    cr_run_recognised_by='own-commits-range'
+  fi
+  [ -n "$cr_run_recognised_by" ] || continue
+  HEAD_SUMMARY_RUNS_JSON=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -c \
+    --argjson run "$cr_run_json" --arg by "$cr_run_recognised_by" \
+    '. + [ $run + {recognised_by: $by} ]')
+done <<EOF
+$(echo "$HEAD_REVIEW_RUNS_JSON" | jq -c '.[]')
+EOF
+
+# The correlation floor for the same-head re-review filter below. Taken from the
+# runs that actually CARRY a recognised summary, never from any non-empty run
+# (CodeRabbit Major / Codex P1 on #886). HEAD_REVIEW_AT is max(submitted_at) over
+# every non-empty head-pinned run INCLUDING ones no acceptor recognises, and
+# using it as the floor let a later unrecognised run discard the recognised
+# summary — up to and including the review-object-body candidate itself, whose
+# fresh_at IS its own run's submitted_at. Both input shapes are production-real:
+# same-head double runs exist (#886 commit 5d04dfc9 → reviews 4860672174 +
+# 4860719383), and an unrecognised body is whatever serialization the acceptors
+# above have not been taught. The result was that a head carrying a demonstrably
+# recognised summary — with a genuine Major in it — reported neither the Major
+# nor a success, reaching the same unretirable red from the opposite direction.
+#
+# HEAD_REVIEW_AT keeps its own job: it arms the publication HOLD, which asks "did
+# CodeRabbit run on this head at all", not "which publication does this candidate
+# belong to". The two questions have different answers and now have different
+# variables.
+SUMMARY_CORRELATION_AT=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -r '
+  [ .[] | .fresh_at | select(. != "") ] | max // ""
+')
+
+# The head-pinned runs NO acceptor recognised, restricted to the ones NEWER than
+# every recognised summary (Codex P1 round 15 on #886). Taking the correlation
+# floor from recognised runs alone fixed one asymmetry and opened its mirror
+# image: a later unrecognised run no longer discards the earlier recognised
+# candidate, so when that earlier candidate is CLEAN the gate publishes success
+# while CodeRabbit's newest serialization on this head sits unread — which is
+# exactly the summary-only blocking finding this gate exists to catch. The
+# candidate is not "stale" in the sense the floor is about, but the head is no
+# longer fully read, and the spec's contract is that a completed current-head run
+# with no recognised summary HOLDS.
+#
+# `$at == ""` (no recognised run at all) counts every unrecognised run, because
+# then nothing on the review surface has been read and any verdict in hand came
+# from the comment surface alone.
+#
+# This does NOT drop candidates, and that distinction is the whole point. Codex's
+# literal remedy — treat the newer unrecognised run as superseding older
+# candidates — is the HEAD_REVIEW_AT floor again, and it re-breaks the case this
+# round fixed: an earlier recognised summary carrying a real Major would vanish
+# into the hold instead of being reported. Both properties hold together because
+# they apply to different verdicts. A blocking finding still gates on exit 1 —
+# fail-closed, retirable by a push, and it names the finding. Only a would-be
+# PASS is withheld, which is the verdict an unread run can actually invalidate.
+#
+# "NEWER" IS TOTAL, AND UNKNOWN ORDER COUNTS AS NEWER (CodeRabbit Major on #886).
+# `>` on the timestamp alone leaves two fail-OPEN gaps, and both matter here for
+# the opposite reason they are safe elsewhere in this file. A candidate with no
+# usable timestamp is DROPPED by the correlation filter, and dropping is the safe
+# direction there; an unread RUN with no usable timestamp must be KEPT, because
+# ignoring it is exactly the certify-on-an-older-clean-summary hole this block
+# exists to close. So an unrecognised run whose `submitted_at` is absent or
+# non-string counts as newer unconditionally: the gate cannot place it in the
+# order, and a run it cannot order is a run it must not certify around.
+# Equal timestamps are broken by the run id, giving the same total order
+# `(fresh_at, id)` that HEAD_REVIEW_RUNS_JSON is already sorted by — two runs can
+# share a second, and under `>` alone the later one silently read as not-newer.
+SUMMARY_CORRELATION_ID=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -r 'last.id // 0')
+HEAD_UNRECOGNISED_NEWER_IDS=$(jq -rn \
+  --argjson runs "$HEAD_REVIEW_RUNS_JSON" \
+  --argjson recognised "$HEAD_SUMMARY_RUNS_JSON" \
+  --arg at "$SUMMARY_CORRELATION_AT" \
+  --argjson atid "$SUMMARY_CORRELATION_ID" '
+  ($recognised | map(.id)) as $known
+  | [ $runs[]
+      # `. as $run` FIRST: inside `index(...)` the input `.` is $known, the
+      # ARRAY, so a bare `.id` there indexes an array with a string and aborts
+      # the whole gate (the jq dot-rebind hazard).
+      | . as $run
+      | select(($known | index($run.id)) == null)
+      | (if ($run.fresh_at | type) == "string" then $run.fresh_at else "" end) as $ts
+      | select($at == ""
+               or $ts == ""
+               or $ts > $at
+               or ($ts == $at and ($run.id // 0) > $atid))
+      | ($run.id | tostring) ]
+  | join(", ")
+')
+
+REVIEW_OBJECT_SUMMARY_JSON=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -c 'last // {}')
+REVIEW_OBJECT_SUMMARY_ID=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.id // 0')
+if [ "$REVIEW_OBJECT_SUMMARY_ID" != "0" ]; then
+  REVIEW_OBJECT_SUMMARY_BODY=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.body')
+  REVIEW_OBJECT_SUMMARY_FRESH_AT=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.fresh_at // ""')
+  REVIEW_OBJECT_SUMMARY_BY=$(echo "$REVIEW_OBJECT_SUMMARY_JSON" | jq -r '.recognised_by // ""')
+  SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c \
+    --argjson id "$REVIEW_OBJECT_SUMMARY_ID" --arg body "$REVIEW_OBJECT_SUMMARY_BODY" \
+    --arg fresh_at "$REVIEW_OBJECT_SUMMARY_FRESH_AT" --arg by "$REVIEW_OBJECT_SUMMARY_BY" \
+    '. + [{id: $id, body: $body, scope: "review-object-body", fresh_at: $fresh_at,
+           recognised_by: $by}]')
+fi
+
+MARKERLESS_SUMMARIES_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
+  --arg bot "$BOT_LOGIN" --arg re "$CR_MARKERLESS_FULL_REVIEW_RE" '
+  [ .[]
+    | select(.user.login == $bot)
+    | select((.body // "") | test($re))
+    | . + { fresh_at: ([.created_at, (.updated_at // .created_at)]
+                        | map(select(type == "string" and . != "")) | max // "") }
+  ]
+  | map({ id: (.id // 0), body: (.body // ""), fresh_at })
+')
+MARKERLESS_SUMMARY_COUNT=$(echo "$MARKERLESS_SUMMARIES_JSON" | jq 'length')
+# The comment-surface acceptor needs BOTH halves of the anchor, and they are two
+# different variables for the reason above. EXISTENCE stays on HEAD_REVIEW_AT —
+# any completed run proves CodeRabbit reviewed this head, which is what a body
+# with no anchor of its own is borrowing. FRESHNESS prefers the recognised-summary
+# floor, so a later unrecognised run cannot push the floor past a comment that
+# genuinely belongs to the current publication. With no recognised run the two
+# collapse to the previous behaviour.
+if [ -n "$SUMMARY_CORRELATION_AT" ]; then
+  SUMMARY_FRESHNESS_AT=$SUMMARY_CORRELATION_AT
+else
+  SUMMARY_FRESHNESS_AT=$HEAD_REVIEW_AT
+fi
+if [ "$MARKERLESS_SUMMARY_COUNT" -gt 0 ]; then
+  MARKERLESS_SUMMARY_JSON=$(echo "$MARKERLESS_SUMMARIES_JSON" | jq -c --arg at "$SUMMARY_FRESHNESS_AT" '
+    if $at == "" then null
+    else [ .[] | select(.fresh_at >= $at) ] | sort_by(.fresh_at, .id) | last
+    end
+  ')
+  MARKERLESS_SUMMARY_ID=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.id // 0')
+  if [ "$MARKERLESS_SUMMARY_ID" != "0" ]; then
+    MARKERLESS_SUMMARY_BODY=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.body')
+    # fresh_at travels WITH the candidate. This selection has already applied
+    # the >= HEAD_REVIEW_AT floor, so dropping the field would leave the
+    # correlation filter below reading it as "" and discarding a candidate it
+    # had just admitted — a false HOLD on the review-triggered path (CodeRabbit
+    # Major on #886).
+    MARKERLESS_SUMMARY_FRESH_AT=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.fresh_at // ""')
+    SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c \
+      --argjson id "$MARKERLESS_SUMMARY_ID" --arg body "$MARKERLESS_SUMMARY_BODY" \
+      --arg fresh_at "$MARKERLESS_SUMMARY_FRESH_AT" \
+      '. + [{id: $id, body: $body, scope: "review-object", fresh_at: $fresh_at}]')
+  elif [ -z "$HEAD_REVIEW_AT" ]; then
+    log "markerless CodeRabbit full-review candidate has no timestamped completed CodeRabbit review object on $HEAD_SHA — no summary findings in scope"
+  else
+    log "markerless CodeRabbit full-review candidate predates completed CodeRabbit review object on $HEAD_SHA — no summary findings in scope"
+  fi
+fi
+
+# Same-head re-review correlation, on the review-triggered path ONLY (Codex P1
+# on #886). The scope predicates above are SHA-only for a marker-led summary:
+# its commits-range end still names this head after CodeRabbit re-reviews the
+# SAME head (the `@coderabbitai full review` recovery flow, mergepath#898). So
+# the previous — possibly clean — summary keeps SUMMARY_CANDIDATE_COUNT
+# nonzero, the publication hold below never fires, and the run can publish
+# success in the window before the replacement summary lands. Correlate the
+# candidate to the triggering review the same way the markerless path already
+# does, by requiring it to be fresh at-or-after the completed review object on
+# this head; a candidate that predates it belongs to the previous publication.
+#
+# Restricted to REQUIRE_REVIEW_SUMMARY=true because dropping the candidate is
+# only safe there: with the flag set, zero candidates reaches the hold below and
+# exits 3, which withholds a verdict. Without it, zero candidates means "nothing
+# in scope yet" and PASSES, so applying the same filter would discard a real
+# summary finding and fail OPEN. Both bundled workflow arms set the flag; the
+# default-false path is for ad-hoc and third-party callers, which have no
+# publication to withhold. A missing or unparseable timestamp sorts below any
+# real one and is therefore dropped, which is the safe direction here.
+#
+# The floor is SUMMARY_CORRELATION_AT — the newest run carrying a RECOGNISED
+# summary — and never HEAD_REVIEW_AT. A run this gate cannot read is not a
+# publication a candidate can be late for, and treating it as one discarded the
+# recognised summary and produced a hold on a head where the verdict was sitting
+# in hand. With no recognised run the floor is empty and no candidate is dropped:
+# the marker-led surface then supplies the verdict, which is the same answer this
+# filter would have given before any review object existed.
+if [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] && [ -n "$SUMMARY_CORRELATION_AT" ]; then
+  SUMMARY_UNCORRELATED=$(echo "$SUMMARY_CANDIDATES" | jq -r --arg at "$SUMMARY_CORRELATION_AT" '
+    [ .[] | select((.fresh_at // "") < $at) | (.id | tostring) ] | join(", ")
+  ')
+  if [ -n "$SUMMARY_UNCORRELATED" ]; then
+    log "PR-level summary comment(s) $SUMMARY_UNCORRELATED predate the completed CodeRabbit review object on $HEAD_SHA — not this review's publication"
+    SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c --arg at "$SUMMARY_CORRELATION_AT" '
+      [ .[] | select((.fresh_at // "") >= $at) ]
+    ')
+  fi
+fi
+
+# Classify the summary with the SAME shared coderabbit_tier_of the inline path
+# uses — there is deliberately no second classifier. It is applied PER LINE
+# rather than to the whole body because the classifier truncates its input to
+# the first 600 chars (a deliberate anti-drift choice for a single finding
+# body, and wrong for a multi-kilobyte summary): line-wise application is
+# exactly a whole-body scan with the truncation removed, and it yields a
+# reportable location and snippet per finding for free.
+#
+# The acknowledgement token below is fingerprinted from the WHOLE classified
+# body (SUMMARY_FINDINGS_FINGERPRINT_INPUT), not from the classified lines
+# alone. Fingerprinting only the marker-bearing lines was the round-2 shape and
+# it was very nearly a no-op (Codex P1 round 1 on #886): CodeRabbit writes a
+# finding as a marker line — `_⚠️ Potential issue_` — on its own, with the
+# actual finding on the lines BELOW it, so a same-head re-review that replaces
+# finding A with finding B keeps that marker line byte-identical and produced
+# an identical fingerprint. A's ack then cleared B, which is exactly the false
+# clear the fingerprint was introduced to prevent.
+#
+# Hashing the whole classified body is deliberately blunter than hashing
+# per-finding blocks. A block-scoped fingerprint would have to decide where a
+# finding ends, and the boundary is not ours to define — CodeRabbit owns that
+# layout, and a wrong boundary silently reopens this same hole (a finding whose
+# file header sits ABOVE its marker moves between files without the hash
+# moving). Whole-body errs toward invalidating an ack that a cosmetic edit
+# would have survived, and that error is free: the gate stays red and prints
+# the fresh token, so recovery is one line. The opposite error passes an
+# undispositioned blocking finding through a required gate. The pre-merge check
+# table — the one part of the body that churns without a re-review — is already
+# stripped before this point, so ordinary noise does not reach the hash.
+SUMMARY_BLOCKING='[]'
+SUMMARY_FINDINGS_FINGERPRINT_INPUT=''
+SUMMARY_CANDIDATE_COUNT=$(echo "$SUMMARY_CANDIDATES" | jq 'length')
+if [ "$SUMMARY_CANDIDATE_COUNT" -eq 0 ]; then
+  if [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] && [ -n "$HEAD_REVIEW_AT" ]; then
+    # Exit 3, NOT 1 (Codex P1 + CodeRabbit Major on #886). "A review has begun
+    # and its summary is not published yet" is not a finding count, and the two
+    # publishers have to act on it differently: an event-driven run has to go
+    # non-green, while the sweep — the only publisher that can restore this
+    # check through the Checks API — must DECLINE TO PUBLISH rather than
+    # overwrite the event run's red with a success read off the previous
+    # publication. Collapsing both into 1 forced a choice between a sweep that
+    # reopens the gap and a sweep that can hold a required check red with no ack
+    # channel and no break-glass under `enforce_admins: true`.
+    #
+    # REACHING THIS IS NOW RARE BY CONSTRUCTION. The primary acceptors read the
+    # summary out of the review RUN object's own body, so a run that carries a
+    # recognised serialization is a candidate the moment it exists — there is no
+    # second surface for it to wait on. What is left here is the genuinely
+    # unknown state: a head-pinned run whose body matches NO acceptor, i.e. a
+    # serialization this gate cannot classify. Holding is the correct answer to
+    # that (a gate that cannot read the review must not certify it), and the run
+    # ids are printed so an operator can see which body was not recognised
+    # rather than having to re-derive it.
+    #
+    # "Rare" is a claim about COVERAGE, and coverage was measured rather than
+    # assumed: across the 22 non-empty CodeRabbit review bodies on 20 mergepath
+    # PRs, the two acceptors between them recognise every one. Neither acceptor
+    # alone does — the header misses 2 (9%), which is how this hold became a red
+    # nothing retires on an ordinary zero-actionable-comments report. Any future
+    # widening belongs here, in the acceptors, not in a bound on the hold:
+    # bounding it would trade an unretirable red for an uncertified pass.
+    # Bounding the hold for the residual case is #906 / #896, which own the
+    # ordered-publisher work this gate's two publishers need.
+    echo "CodeRabbit current-HEAD review is awaiting its PR-level summary; holding this gate run. (head-pinned review run object(s): $HEAD_REVIEW_RUN_IDS)" >&2
+    echo "CodeRabbit blocking-tier unresolved: pending (summary publication in flight)"
+    exit 3
+  fi
+  log "no CodeRabbit PR-level summary comment found — no summary findings in scope"
+fi
+
+while IFS= read -r SUMMARY_JSON; do
+  [ -n "$SUMMARY_JSON" ] || continue
+  SUMMARY_ID=$(echo "$SUMMARY_JSON" | jq -r '.id')
+  SUMMARY_BODY=$(echo "$SUMMARY_JSON" | jq -r '.body')
+  SUMMARY_SCOPE=$(echo "$SUMMARY_JSON" | jq -r '.scope')
+  if [ "$SUMMARY_SCOPE" = 'review-object-body' ]; then
+    # Scope and completion both come from the review object itself: its
+    # GitHub-owned commit_id names this head, and its non-empty body is the
+    # report. Do not apply the marker-format all-benign stanza test: it does not
+    # exist in this legitimate shape. Which acceptor recognised the body is
+    # printed, because the two answer different questions about the same object
+    # and an operator reading a verdict should not have to re-derive which one
+    # fired.
+    log "CodeRabbit markerless full-review summary in review object $SUMMARY_ID, head-pinned by its commit_id to $HEAD_SHA (recognised by: $(echo "$SUMMARY_JSON" | jq -r '.recognised_by // "unknown"'))"
+  elif [ "$SUMMARY_SCOPE" = 'review-object' ]; then
+    # The strict markerless result line identifies the known full-review format,
+    # and the fresh exact-head review object above supplies the scope / completion
+    # anchor that this format omits. Do not apply the marker-format stanza or
+    # commits-range predicates: neither exists in this legitimate shape.
+    log "PR-level markerless full-review summary (comment id $SUMMARY_ID) is anchored by a fresh completed CodeRabbit review object on $HEAD_SHA"
+  fi
+  SUMMARY_SCAN=$(summary_strip_pre_merge_block "$SUMMARY_BODY")
+  if [ -n "$SUMMARY_SCAN" ]; then
+  SUMMARY_BLOCKING_BEFORE=$(echo "$SUMMARY_BLOCKING" | jq 'length')
+  # Classify UNFENCED lines only (Phase 4b P2 on #886, and Codex's earlier P2 —
+  # both reviewers landed on this). The three structural scans had already been
+  # taught to ignore fenced quotes; the finding loop had not, so a PR whose diff
+  # contains `_⚠️ Potential issue_`, `P1`, or any other classifier marker as
+  # SOURCE TEXT could manufacture a blocking summary finding against itself when
+  # CodeRabbit quoted it back. This repo's own test fixtures contain exactly
+  # such strings.
+  #
+  # I deferred this once (#893) on the argument that skipping fenced content in
+  # the CLASSIFIER inverts the fail direction — and that argument was wrong on
+  # the facts. CodeRabbit's finding markers are markdown emphasis rendered as
+  # PROSE; a finding's code snippet sits inside a fence but the marker line that
+  # classifies never does. So no genuine finding is lost, and the change is a
+  # pure precision gain rather than a fail-open trade. #893 is closed by this.
+  #
+  # Line numbers stay those of SUMMARY_SCAN, not of the filtered stream, so a
+  # reported location still points at the real line in the summary.
+  while IFS= read -r cr_numbered; do
+    [ -n "$cr_numbered" ] || continue
+    cr_line_no=${cr_numbered%%	*}
+    cr_line=${cr_numbered#*	}
+    [ -n "$cr_line" ] || continue
+    cr_tier=$(coderabbit_tier_of "$cr_line")
+    if tier_is_required "$cr_tier"; then
+      SUMMARY_BLOCKING=$(echo "$SUMMARY_BLOCKING" | jq -c \
+        --argjson id "$SUMMARY_ID" --argjson line "$cr_line_no" \
+        --arg tier "$cr_tier" --arg body "$cr_line" '
+        . + [ {
+          id: $id,
+          path: "(PR-level summary comment)",
+          line: $line,
+          tier: $tier,
+          body_snippet: ($body | .[0:120])
+        } ]
+      ')
+    fi
+  done <<EOF
+$(summary_unfenced_numbered "$SUMMARY_SCAN")
+EOF
+  # Only bind a fingerprint when there is something to acknowledge. With no
+  # blocking finding the token is never printed and never consulted, and
+  # hashing the body anyway would make the (unused) token churn on every
+  # walkthrough edit.
+  #
+  # SALTED WITH THE ACTIVE BLOCKING TIER SET (Codex P1 round 2 on #886). The
+  # summary body alone does not determine what is blocking about it — the
+  # resolved `required` tier set does, and that set comes from the TRUSTED
+  # DEFAULT-BRANCH policy, so it can tighten while this PR is open. A summary
+  # carrying both P1 and P2 text under a `{p1}` policy hashes identically under
+  # `{p1,p2}`, so an ack written when only the P1 was blocking would clear a P2
+  # the collaborator was never shown as blocking. Salting means a policy change
+  # invalidates prior acks exactly as a push or a re-review does.
+  SUMMARY_BLOCKING_AFTER=$(echo "$SUMMARY_BLOCKING" | jq 'length')
+  if [ "$SUMMARY_BLOCKING_AFTER" -gt "$SUMMARY_BLOCKING_BEFORE" ]; then
+    SUMMARY_FINDINGS_FINGERPRINT_INPUT="${SUMMARY_FINDINGS_FINGERPRINT_INPUT}
+summary-comment: $SUMMARY_ID
+$SUMMARY_SCAN"
+  fi
+  fi
+done <<EOF
+$(echo "$SUMMARY_CANDIDATES" | jq -c '.[]')
+EOF
+
+if [ -n "$SUMMARY_FINDINGS_FINGERPRINT_INPUT" ]; then
+  SUMMARY_FINDINGS_FINGERPRINT_INPUT="required-tiers: $(echo "$REQUIRED_TIERS" | tr '\n' ' ')$SUMMARY_FINDINGS_FINGERPRINT_INPUT"
+fi
+
+SUMMARY_BLOCKING_COUNT=$(echo "$SUMMARY_BLOCKING" | jq 'length')
+log "found $SUMMARY_BLOCKING_COUNT blocking-tier summary finding(s) on HEAD"
+
+# Resolution channel for a summary-only finding (#832 acceptance criterion 3).
+# A summary finding has no review thread, so "Resolve conversation" — the
+# inline path's escape hatch — does not exist for it. A FIXED finding clears
+# itself: the next push produces a new summary for the new head without the
+# marker. A REBUTTED or DEFERRED one has no such path, and with
+# `enforce_admins: true` there is no break-glass either, so the gate would
+# deadlock the PR permanently without an explicit acknowledgement channel.
+#
+# The channel: a PR comment whose FIRST LINE is exactly the token
+#   [mergepath-summary-ack: <HEAD sha> <finding-set fingerprint>]
+# written by a human collaborator (author_association OWNER / MEMBER /
+# COLLABORATOR — a GitHub-computed field, not something the commenter sets)
+# and, per the same reasoning that keeps bots out of the reviewer set, not by
+# a `[bot]` account. Rationale for the rebuttal or deferral goes on the lines
+# BELOW the token.
+#
+# Head-pinned by construction, not by clock: the token names the current head
+# sha, so an ack cannot be written before the commit it clears exists, and a
+# subsequent push invalidates every prior ack. That is the same anchor the
+# summary selection above uses, and again involves no timestamp.
+#
+# FINDING-PINNED as well as head-pinned. Head-pinning alone binds the ack to a
+# COMMIT, not to the finding set that was on screen when it was written, and
+# the summary surface can change WITHOUT the head changing: a same-head
+# re-review (`@coderabbitai review`, `@coderabbitai resume`, or the rate-limit
+# `try again` retry that scripts/coderabbit-wait.sh posts itself) rewrites the
+# summary — in place, or as a later comment this script then selects — with a
+# finding the acking collaborator never saw. A head-only ack would clear that
+# new finding retroactively, and a required gate would pass with an
+# undispositioned blocking finding on it. So the token also carries a
+# fingerprint of the classified blocking lines: change the finding set and
+# every prior ack stops matching, exactly as a push does. Fingerprinting the
+# CONTENT (rather than ordering acks against the summary's comment id) is what
+# survives an in-place edit, which leaves the comment id untouched.
+#
+# ANCHORED, not substring-matched. This script PRINTS the token verbatim in its
+# own failure output below, and pasting a failing check's output into a PR
+# comment while triaging it is routine agent behaviour in this repo. A bare
+# "body contains the token" test would let that paste clear the gate silently.
+# Requiring the token to BE the comment's first line (no leading whitespace —
+# the failure block renders it indented, and inside surrounding prose) means a
+# quote of this script's output can never satisfy it, while a deliberate ack is
+# a one-line copy. The two halves of that argument have to be kept in step: the
+# report below renders the token INDENTED and never at column 0, which is what
+# makes "a verbatim paste of any contiguous region of this output cannot ack"
+# true rather than merely likely. tests/test_coderabbit_severity_gate.sh
+# asserts that rendering directly, so unindenting it there fails the suite.
+#
+# Computed only when there is a summary finding to acknowledge (Codex P2 round
+# 5 on #886). summary_findings_fingerprint `die 2`s when neither sha256sum nor
+# shasum is on PATH — the right call when an ack has to be bound to a finding
+# set, and the wrong one when there is no finding, no token printed and nothing
+# to bind: an unconditional call turned an otherwise-clean required check red
+# over a hashing dependency it was not going to use.
+SUMMARY_FINDINGS_FINGERPRINT=''
+SUMMARY_ACK_TOKEN=''
+if [ "$SUMMARY_BLOCKING_COUNT" -gt 0 ]; then
+  SUMMARY_FINDINGS_FINGERPRINT=$(
+    summary_findings_fingerprint "$SUMMARY_FINDINGS_FINGERPRINT_INPUT"
+  )
+  SUMMARY_ACK_TOKEN="[mergepath-summary-ack: $HEAD_SHA $SUMMARY_FINDINGS_FINGERPRINT]"
+  if echo "$ISSUE_COMMENTS_JSON" | jq -e --arg tok "$SUMMARY_ACK_TOKEN" '
+    any(.[];
+      ((.user.login // "") | endswith("[bot]") | not)
+      and ((.author_association // "") as $aa
+           | (["OWNER", "MEMBER", "COLLABORATOR"] | index($aa)) != null)
+      and (((.body // "") | gsub("\r"; "") | split("\n")) as $lines
+           | (($lines[0] // "") | sub("[ \t]+$"; "")) == $tok
+             # A RATIONALE IS PART OF THE ACK (Codex P2 round 2 on #886). The
+             # spec and REVIEW_POLICY both say the reason goes on the lines
+             # below the token; without this the bare token cleared a required
+             # gate with no recorded disposition at all, so the documented
+             # contract and the enforced one disagreed. The test is mechanical
+             # — at least one non-blank line after the token — deliberately not
+             # a "substantive text" heuristic, which would be unpredictable to
+             # satisfy and is not the kind of judgement a merge gate should be
+             # making.
+             and (($lines[1:] | map(sub("^[ \t]+"; "") | sub("[ \t]+$"; ""))
+                   | map(select(. != "")) | length) > 0))
+    )
+  ' >/dev/null 2>&1; then
+    log "summary findings acknowledged for $HEAD_SHA (finding set $SUMMARY_FINDINGS_FINGERPRINT) by a collaborator ack comment — not gating"
+    SUMMARY_BLOCKING='[]'
+    SUMMARY_BLOCKING_COUNT=0
+  fi
+fi
+
+# Withhold a PASS while a newer head-pinned run remains unread (Codex P1 round
+# 15 on #886). Called from BOTH clean exits — the summary-only one below and
+# report_verdict's, which is reached with a zero count once every inline thread
+# is resolved. Guarded on REQUIRE_REVIEW_SUMMARY for the same reason the
+# correlation filter is: with the flag set, a hold withholds a verdict the
+# publishers know how to handle (the event arm goes non-green, the sweep declines
+# to publish), while an ad-hoc caller has no publication to withhold and gets the
+# arrival-independent answer it asked for.
+hold_on_unrecognised_newer_run() {
+  [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] || return 0
+  [ -n "$HEAD_UNRECOGNISED_NEWER_IDS" ] || return 0
+  echo "CodeRabbit published a later review run on $HEAD_SHA whose body matches no summary acceptor, so the clean verdict in hand is from an earlier publication; holding this gate run. (unrecognised head-pinned review run object(s): $HEAD_UNRECOGNISED_NEWER_IDS)" >&2
+  echo "CodeRabbit blocking-tier unresolved: pending (summary publication in flight)"
+  exit 3
+}
+
+if [ "$BLOCKING_COUNT" -eq 0 ] && [ "$SUMMARY_BLOCKING_COUNT" -eq 0 ]; then
+  hold_on_unrecognised_newer_run
   echo "CodeRabbit blocking-tier unresolved: 0"
   exit 0
+fi
+
+# --- verdict reporting ------------------------------------------------------
+#
+# A function because the two paths below reach it from different depths: when
+# the inline surface produced no candidates, the only findings left are summary
+# ones, which carry no review thread — so the reviewThreads scan has nothing to
+# look up and is skipped entirely rather than run for its side effects.
+report_verdict() {
+  local unresolved=$1 count inline_count
+  count=$(echo "$unresolved" | jq 'length')
+  # Derived from what is actually being REPORTED, not from BLOCKING_COUNT
+  # (Codex P2 round 4 on #886). BLOCKING_COUNT counts pre-resolution inline
+  # CANDIDATES, so with every inline thread already resolved and only a summary
+  # finding left it is still nonzero — and the remediation block below would
+  # tell the reader to resolve inline threads that are neither listed nor
+  # unresolved. Counting the reported findings makes the instruction true by
+  # construction in both call sites, including the summary-only path where
+  # UNRESOLVED_BLOCKING does not exist yet.
+  inline_count=$(echo "$unresolved" | jq '[ .[] | select(.path != "(PR-level summary comment)") ] | length')
+
+  if [ "$count" -gt 0 ]; then
+    echo ""
+    echo "Unresolved CodeRabbit blocking-tier findings on current HEAD ($HEAD_SHA):"
+    echo "$unresolved" | jq -r '
+      .[] | "  - [\(.tier | ascii_upcase)] \(.path):\(.line) (comment id \(.id))\n      \(.body_snippet)"
+    '
+    # Guarded on the REPORTED inline count (CodeRabbit, #886): on a
+    # summary-only failure there is no thread to resolve, and printing an
+    # instruction the reader cannot follow on the findings in front of them is
+    # worse than printing nothing — the summary block below is the applicable
+    # one.
+    if [ "$inline_count" -gt 0 ]; then
+      echo ""
+      echo "Resolve each inline thread via the GitHub UI (or the GraphQL"
+      echo "resolveReviewThread mutation) once the finding is addressed."
+    fi
+    if [ "$SUMMARY_BLOCKING_COUNT" -gt 0 ]; then
+      echo ""
+      echo "Findings listed against \"(PR-level summary comment)\" have no review"
+      echo "thread to resolve. Fixing one clears it on its own: the next push"
+      echo "produces a summary for the new head without the finding. To record a"
+      echo "rebuttal or a deferral instead, post a PR comment whose FIRST LINE is"
+      echo "the token below, unindented, with the rationale on the lines under it"
+      echo "(at least one non-blank line of rationale is required):"
+      echo "    $SUMMARY_ACK_TOKEN"
+      echo "The ack must come from a collaborator. It is pinned both to this head"
+      echo "and to the finding set above, so a later push OR a re-review that"
+      echo "changes the summary invalidates it. Quoting this output back into a"
+      echo "comment does NOT ack anything: the token is printed indented here and"
+      echo "on its own it acks nothing unless it leads the comment."
+    fi
+    echo ""
+  fi
+
+  if [ "$count" -gt 0 ]; then
+    echo "CodeRabbit blocking-tier unresolved: $count"
+    exit 1
+  fi
+  # A zero count here is a PASS reached after thread classification, so it is
+  # subject to the same unread-newer-run hold as the summary-only exit above.
+  # The verdict line is printed inside each branch rather than before them
+  # because the hold prints its own, and a run must emit exactly one.
+  hold_on_unrecognised_newer_run
+  echo "CodeRabbit blocking-tier unresolved: $count"
+  exit 0
+}
+
+if [ "$BLOCKING_COUNT" -eq 0 ]; then
+  report_verdict "$SUMMARY_BLOCKING"
 fi
 
 # --- fetch review-thread resolution state via GraphQL ----------------------
@@ -552,25 +1625,12 @@ UNRESOLVED_BLOCKING=$(echo "$BLOCKING_COMMENTS" | jq \
   ]
 ')
 
-UNRESOLVED_COUNT=$(echo "$UNRESOLVED_BLOCKING" | jq 'length')
-
 # --- report ----------------------------------------------------------------
 
-if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
-  echo ""
-  echo "Unresolved CodeRabbit blocking-tier findings on current HEAD ($HEAD_SHA):"
-  echo "$UNRESOLVED_BLOCKING" | jq -r '
-    .[] | "  - [\(.tier | ascii_upcase)] \(.path):\(.line) (comment id \(.id))\n      \(.body_snippet)"
-  '
-  echo ""
-  echo "Resolve each thread via the GitHub UI (or GraphQL"
-  echo "resolveReviewThread mutation) once the finding is addressed."
-  echo ""
-fi
-
-echo "CodeRabbit blocking-tier unresolved: $UNRESOLVED_COUNT"
-
-if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
-  exit 1
-fi
-exit 0
+# Summary findings are appended AFTER the thread-classified inline ones: they
+# carry no thread, so the resolution map above says nothing about them, and any
+# ack that would clear them was already applied when SUMMARY_BLOCKING was built.
+report_verdict "$(jq -c -n \
+  --argjson inline "$UNRESOLVED_BLOCKING" \
+  --argjson summary "$SUMMARY_BLOCKING" \
+  '$inline + $summary')"

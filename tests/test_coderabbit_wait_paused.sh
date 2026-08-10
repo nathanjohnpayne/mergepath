@@ -52,6 +52,9 @@ make_case() {
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
+  # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
+  # grades findings with the shared coderabbit_tier_of.
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
@@ -221,8 +224,11 @@ case "$endpoint" in
     case "$scenario" in
       probe_skip_with_head_review)
         # #814: a real HEAD-pinned review exists on a PR whose auto-review
-        # eligibility would otherwise skip (draft / non-base-branch).
-        printf '[{"id":9801,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$review_time"
+        # eligibility would otherwise skip (draft / non-base-branch). It is a
+        # review RUN, so it carries a summary body — the #900 discriminator
+        # that separates a run from the body-less review object CodeRabbit
+        # creates for a conversational thread reply.
+        printf '[{"id":9801,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"**Actionable comments posted: 1**"}]\n' "$bot" "$review_time"
         ;;
       probe_skip_with_active_review)
         # #814: no review object yet — a manual trigger is still running.

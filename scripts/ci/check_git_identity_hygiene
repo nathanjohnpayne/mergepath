@@ -50,6 +50,19 @@
 #      the parent config. Set MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 to opt
 #      out on a checkout that genuinely wants a per-repo identity.
 #
+#      Every worktree of the repository is inspected, not only the one
+#      the check was invoked from. `git config --worktree` reads the
+#      INVOKING worktree's config.worktree and nothing else, so a
+#      protected key parked in a sibling passed a check run from the main
+#      worktree while every commit made in that sibling obeyed it. The
+#      siblings are enumerated from the common repository — the main
+#      worktree's file at the top of the common dir, each linked
+#      worktree's under `worktrees/<name>/` — and read as FILES, which is
+#      also what makes a DORMANT one inspectable: turning
+#      extensions.worktreeConfig off deletes nobody's config.worktree,
+#      and turning it back on reactivates every identity in them without
+#      a fresh write for a later run to catch.
+#
 #   B. Baseline comparison (`--snapshot`, then a later plain run).
 #      `--snapshot` copies .git/config to a scratch path inside this
 #      worktree's git dir; a later plain run byte-compares against it. Wiring
@@ -61,6 +74,21 @@
 #          scripts/ci/check_git_identity_hygiene --snapshot
 #          bash tests/test_<suite>.sh            # ... or the whole suite
 #          scripts/ci/check_git_identity_hygiene
+#
+#      Those are two separate PROCESSES, so the only thing carrying
+#      between them is on disk — and the SNAPSHOT REQUEST is therefore
+#      kept outside repository metadata, in this worktree's gitignored
+#      `.mergepath/` state dir. A marker under `.git` is erased by the
+#      very event it exists to notice: a step that deletes the checkout
+#      takes the request away with the subject, leaving the final run
+#      with no marker, no baseline and no repository to find, so it reads
+#      the tree as an ordinary non-repository and reports success. The
+#      request outlives the metadata instead, and the final run fails
+#      closed when either the repository or its baseline is gone. Living in
+#      the working tree also means the request travels with a COPY of that
+#      tree while the baseline it names does not, so the request records
+#      the config file it was taken from and a run that finds one naming
+#      some other checkout's config leaves it alone.
 #
 #   C. Static scan for the idiom that produces the corruption (HUB-ONLY).
 #      Flags any tracked shell script or Markdown doc that writes one of
@@ -84,6 +112,13 @@
 #      case-insensitive in both its section and its name: `git config
 #      User.Email up@example.com` writes exactly the override a later
 #      `git config user.email` reads back.
+#
+#      They are matched as COMPLETE keys. Without a boundary in front,
+#      the pattern matched the tail of every key ending in the same
+#      letters, so `notuser.email`, `precommit.gpgsign` and
+#      `retag.gpgsign` — all valid git config keys, none of them
+#      protected, none of them deciding who a commit claims to be — were
+#      reported as writes to the key they merely end with.
 #
 #      A path-qualified executable counts. `/usr/bin/git config
 #      user.email …` writes the file a bare `git` writes.
@@ -157,7 +192,10 @@
 # is, which is why Part A inspects the worktree scope too. It probes that
 # scope only where the extension makes it a distinct file: with the
 # extension off, `--worktree` resolves to `--local`, so probing both would
-# report one override twice under two names.
+# report one override twice under two names. Every OTHER worktree's file
+# is read by name rather than through a scope, so the extension's state
+# does not decide whether a sibling is looked at — only whether the value
+# it holds is live this second, which is not the invariant being asserted.
 #
 # Parts A and B run TWICE: once before the paired regression suite and
 # again after it. The suite is a tracked test that the static scan
@@ -190,9 +228,10 @@
 #
 # Exit codes:
 #   0 — pass (or a documented skip).
-#   1 — a local identity override, an include path that could not be
-#       resolved, a baseline mismatch, a scan hit, or a suite that removed
-#       this repository's metadata.
+#   1 — a local identity override (in this worktree or any other), an
+#       include path that could not be resolved, a baseline mismatch, a
+#       snapshotted repository that has since been deleted, a scan hit, or
+#       a suite that removed this repository's metadata.
 
 set -euo pipefail
 
@@ -296,11 +335,72 @@ baseline_path() {
 # deleted. Without a separate marker, removing the evidence changes the next
 # report pass from "compare" to "nothing to check" and silently blesses any
 # config mutation made in between.
+#
+# The marker therefore lives OUTSIDE repository metadata, in this worktree's
+# gitignored `.mergepath/` state directory. `--snapshot` and the final report
+# run in two separate PROCESSES — an early repo_lint step and the job's last
+# one — so nothing carries between them except what is on disk, and a marker
+# kept under `.git` is erased by the very event it exists to notice: a step
+# that deletes the checkout takes the request away with the subject, and the
+# final run then finds no marker, no baseline and no repository, treats the
+# tree as an ordinary non-repository, and reports success (#803). Stored
+# beside the worktree instead, the request outlives the metadata it is a
+# request about, which is what lets the final run say the subject is gone.
 baseline_marker_path() {
-  local gitdir
-  gitdir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" \
-    || return 1
-  printf '%s\n' "$gitdir/mergepath-gitconfig-baseline.requested"
+  printf '%s\n' "$REPO_ROOT/.mergepath/gitconfig-baseline.requested"
+}
+
+# Whether a marker found here is a request about THIS checkout.
+#
+# Moving the request into the worktree split it from the baseline it refers
+# to, which stays in the git dir: a tree COPY — `rsync`/`tar` of the working
+# tree, which is how the consumer-safety fixture is built — carries the
+# request and leaves the baseline behind. The copy then presents the exact
+# shape of a tampered checkout, "a snapshot was requested here and its
+# evidence is gone", when no snapshot was ever requested for it. That is a
+# false failure on a tree nobody snapshotted, and it reds every consumer's
+# repo-lint through the fixture.
+#
+# The marker names the DIRECTORY it was taken in, and that name is the whole
+# test, because the test has to work where there is no git left to ask.
+# Exactly two shapes arrive here holding a marker with no repository under
+# it, and they need opposite answers:
+#
+#   - the checkout the snapshot WAS taken in, whose `.git` a later step
+#     deleted. It is still this directory, and the failure #803 exists to
+#     raise must fire;
+#   - a working-tree COPY. The repo-lint consumer-safety fixture is built by
+#     rsyncing this tree with `.git` excluded and is never `git init`-ed, so
+#     it inherits the request, is not a repository at all, and no snapshot
+#     was ever taken of it. (Named in prose rather than by path: the gate
+#     below reads only the hub marker, and spelling a hub-only test file
+#     here would enrol this wrapper in the consumer-residue lattice as a
+#     dependency it does not have.)
+#
+# Deriving the answer from the recorded CONFIG cannot separate them: the
+# copy has no config to resolve, so "cannot resolve my own config" — the
+# reading that keeps the destroyed-repository case failing closed — also
+# claimed every non-repository fixture as this checkout and reported it as
+# a checkout whose metadata had been destroyed, redding every consumer's
+# repo-lint. A directory name needs no git and tells the two apart outright.
+#
+# A marker recording no root names no checkout, so it does not name this
+# one. It cannot be a request from this revision of the check, which always
+# writes the root first.
+marker_records_this_checkout() {
+  local recorded="$1"
+  [ -n "$recorded" ] || return 1
+  [ "$(canonical_dir "$recorded")" = "$(canonical_dir "$REPO_ROOT")" ]
+}
+
+# Physical absolute form of a DIRECTORY. `canonical_path` below is built for
+# a file — it canonicalises the parent and re-attaches the basename — which
+# leaves a directory spelled `.` or `foo/.` distinguishable from the same
+# directory spelled plainly. The marker comparison is between two spellings
+# produced by two different processes, so it needs the form that collapses
+# them.
+canonical_dir() {
+  ( cd -- "$1" 2>/dev/null && pwd -P ) || printf '%s\n' "$1"
 }
 
 config_path() {
@@ -319,16 +419,61 @@ config_path() {
 # include — while a scope's own file is derived from `rev-parse`. Without
 # normalising both, the comparison never matches and every ordinary
 # `--local` offender would be described as arriving through an include.
-canonical_path() {
-  local p="$1" d b
-  case "$p" in
+# Canonicalise into the NAMED variable, which is the form that can keep a
+# trailing newline. A filename may end in one, and every ordinary way of
+# moving a path through the shell drops it: `$(basename …)`, `$(pwd -P)` and
+# any `$( )` around this function all strip EVERY trailing newline from what
+# they capture. The name then comes back one byte short, the caller's `-f`
+# test asks about a file nobody has, and the identity behind that include is
+# skipped — the same silent drop the newline-safe collection exists to end,
+# one layer below the array that holds the result.
+#
+# So the split is done with parameter expansion (lossless), and the one
+# capture that remains — the physical form of the DIRECTORY, which only `cd`
+# can produce — is padded with a sentinel byte. Removing the sentinel and
+# then the single newline `pwd` itself printed leaves exactly the path,
+# whether or not the path's own last byte is a newline.
+canonical_path_into() {
+  local __cpi_p="$2" __cpi_d __cpi_b __cpi_out
+  # An empty spelling names no file, and must not come back naming one. The
+  # relative branch below would prefix it with the checkout root and the
+  # trailing-slash loop would then reduce it to the checkout root itself —
+  # turning "no path" into a path that exists, which a caller testing the
+  # result for emptiness would read as a real scope file. Empty in, empty
+  # out. Reported by returning the empty string rather than a status,
+  # because callers invoke this bare under `set -e`.
+  if [ -z "$__cpi_p" ]; then
+    printf -v "$1" '%s' ''
+    return 0
+  fi
+  case "$__cpi_p" in
     /*) ;;
-    *) p="$REPO_ROOT/$p" ;;
+    *) __cpi_p="$REPO_ROOT/$__cpi_p" ;;
   esac
-  d="$(dirname -- "$p")"
-  b="$(basename -- "$p")"
-  ( cd "$d" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$b" ) \
-    || printf '%s\n' "$p"
+  # Trailing slashes, dropped the way `basename`/`dirname` drop them, so a
+  # directory spelled `a/b/` still canonicalises as `a/b`.
+  while [ "$__cpi_p" != "/" ] && [ "${__cpi_p%/}" != "$__cpi_p" ]; do
+    __cpi_p="${__cpi_p%/}"
+  done
+  __cpi_b="${__cpi_p##*/}"
+  __cpi_d="${__cpi_p%/*}"
+  [ -n "$__cpi_d" ] || __cpi_d="/"
+  __cpi_out="$(cd -- "$__cpi_d" 2>/dev/null && pwd -P; printf 'x')"
+  __cpi_out="${__cpi_out%x}"
+  __cpi_out="${__cpi_out%$'\n'}"
+  if [ -z "$__cpi_out" ]; then
+    printf -v "$1" '%s' "$__cpi_p"
+    return 0
+  fi
+  printf -v "$1" '%s/%s' "$__cpi_out" "$__cpi_b"
+}
+
+# The same value on stdout, for the callers that compare two paths inline and
+# cannot carry a trailing newline through `$( )` anyway.
+canonical_path() {
+  local __cp_value
+  canonical_path_into __cp_value "$1"
+  printf '%s\n' "$__cp_value"
 }
 
 # The file a given scope writes when it is named directly. Anything else
@@ -345,6 +490,48 @@ scope_file() {
       ;;
     *) return 1 ;;
   esac
+}
+
+# Every OTHER worktree's `config.worktree`, one NUL-terminated path each —
+# NUL-framed because a worktree path is an ordinary filename and may carry
+# a newline, the same losslessness the include walk needs.
+#
+# `git config --worktree` reads the INVOKING worktree's file and nothing
+# else, so a protected key parked in a sibling linked worktree is invisible
+# from here while being fully live for every commit made over there — a
+# check run from the main worktree reported success on a repository that
+# was misattributing commits (#806). The files are enumerated from the
+# COMMON repository, which is what every worktree shares: the main
+# worktree's own file sits at the top of the common dir, and each linked
+# worktree's under `worktrees/<name>/`.
+#
+# They are read as FILES rather than through a scope, which also settles
+# the dormant case: turning extensions.worktreeConfig off does not delete
+# anybody's config.worktree, and turning it back on reactivates every
+# identity in them with no fresh write for a later run to catch. A file
+# read obeys neither switch, so an inactive sibling is inspected on exactly
+# the same terms as an active one.
+sibling_worktree_configs() {
+  local common self_gitdir cfg canon
+  common="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null)" \
+    || return 0
+  case "$common" in
+    /*) ;;
+    *) common="$REPO_ROOT/$common" ;;
+  esac
+  common="$(canonical_path "$common")"
+  # Without knowing which file is our own, the invoking worktree's
+  # config.worktree would be reported twice — once under its scope and
+  # once as a sibling — with two remediation commands for one override.
+  self_gitdir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" \
+    || return 0
+  self_gitdir="$(canonical_path "$self_gitdir")"
+  for cfg in "$common/config.worktree" "$common"/worktrees/*/config.worktree; do
+    [ -f "$cfg" ] || continue
+    canon="$(canonical_path "$cfg")"
+    [ "$canon" != "$self_gitdir/config.worktree" ] || continue
+    printf '%s\0' "$canon"
+  done
 }
 
 # The home directory of a NAMED user, looked up the way git looks it up
@@ -443,15 +630,25 @@ resolve_include_path() {
 # repository's own config either way, and that is the invariant being
 # asserted — this repository carries no local identity override, not
 # "none of them is active this second".
-INCLUDE_FILES=""
+#
+# An ARRAY, not a newline-joined string. An include target is an ordinary
+# filename and Git accepts one containing a NEWLINE, so serialising the
+# collected paths into newline-delimited text split a single dormant
+# identity file into two entries that name nothing: neither half existed,
+# both were dropped by the `-f` test, and the override behind that file was
+# never inspected and stayed live (#804). A bash array holds every path
+# losslessly, whatever bytes it carries.
+INCLUDE_FILES=()
 # Include entries whose path this check could NOT resolve, one
-# "<key>\037<raw path>\037<declaring file>" record per line. Reported as
-# offenders: git resolves `~user/…` itself and obeys what it finds, so an
-# entry the walk cannot follow is precisely where a dormant override
-# would hide, and passing it over is the only outcome that hides one.
-INCLUDE_UNRESOLVED=""
+# "<key>\037<raw path>\037<declaring file>" record per array element.
+# Reported as offenders: git resolves `~user/…` itself and obeys what it
+# finds, so an entry the walk cannot follow is precisely where a dormant
+# override would hide, and passing it over is the only outcome that hides
+# one. An array for the same reason as above — a raw include path is
+# arbitrary config text.
+INCLUDE_UNRESOLVED=()
 collect_include_targets() {
-  local file="$1" depth="$2" rec key raw target unres
+  local file="$1" depth="$2" rec key raw target unres i dup
   # git's own include-recursion cap; with the already-collected test
   # below it is also the brake on an include cycle.
   [ "$depth" -lt 10 ] || return 0
@@ -465,18 +662,25 @@ collect_include_targets() {
     [ -n "$raw" ] || continue
     if ! resolve_include_path "$raw" "$file" target; then
       unres="$key"$'\037'"$raw"$'\037'"$file"
-      case $'\n'"$INCLUDE_UNRESOLVED" in
-        *$'\n'"$unres"$'\n'*) ;;
-        *) INCLUDE_UNRESOLVED+="$unres"$'\n' ;;
-      esac
+      dup=0
+      for (( i = 0; i < ${#INCLUDE_UNRESOLVED[@]}; i++ )); do
+        [ "${INCLUDE_UNRESOLVED[$i]}" = "$unres" ] || continue
+        dup=1
+        break
+      done
+      [ "$dup" -eq 1 ] || INCLUDE_UNRESOLVED+=("$unres")
       continue
     fi
-    target="$(canonical_path "$target")"
+    canonical_path_into target "$target"
     [ -f "$target" ] || continue
-    case $'\n'"$INCLUDE_FILES" in
-      *$'\n'"$target"$'\n'*) continue ;;
-    esac
-    INCLUDE_FILES+="$target"$'\n'
+    dup=0
+    for (( i = 0; i < ${#INCLUDE_FILES[@]}; i++ )); do
+      [ "${INCLUDE_FILES[$i]}" = "$target" ] || continue
+      dup=1
+      break
+    done
+    [ "$dup" -eq 0 ] || continue
+    INCLUDE_FILES+=("$target")
     collect_include_targets "$target" "$((depth + 1))"
   done < <(git -C "$REPO_ROOT" config --file "$file" -z \
              --get-regexp '^(include|includeif\..*)\.path$' 2>/dev/null)
@@ -489,8 +693,56 @@ if [ "$MODE" = "snapshot" ]; then
   fi
   BASE="$(baseline_path)"
   BASE_MARKER="$(baseline_marker_path)"
+  BASE_MARKER_DIR="$(dirname -- "$BASE_MARKER")"
+  # The marker lives in the WORKING TREE, which means its directory and the
+  # marker itself are checkout content — replaceable by a pull request with a
+  # symlink pointing anywhere the runner can write. `>` follows one, so a
+  # tracked `.mergepath` → `../.git` (or a tracked marker file naming a later
+  # CI script) would make `--snapshot` overwrite that target during the first
+  # repo_lint step, before this check has asserted anything at all. The old
+  # `.git`-local path was not checkout-controlled and had nothing to refuse.
+  #
+  # Refused rather than resolved: no legitimate checkout needs this path to be
+  # a link, so there is no case to preserve, and unlinking it would still race
+  # the tree it came from. Checked before `mkdir -p`, which follows a symlinked
+  # directory silently and would report success on the linked-to target.
+  if [ -L "$BASE_MARKER_DIR" ] || [ -L "$BASE_MARKER" ]; then
+    cat >&2 <<EOF
+check_git_identity_hygiene: FAIL (the snapshot state path is a symlink)
+
+$BASE_MARKER
+
+is reached through a symbolic link. That path is working-tree content, so a
+link there redirects this step's write to whatever the link names — and this
+step runs before any assertion in this check, as the repository's own lint.
+No snapshot was recorded.
+
+Replace the link with a real directory and a real file (or remove it and let
+--snapshot create both), then re-run.
+EOF
+    exit 1
+  fi
+  # The state dir first: a baseline recorded without its marker is a
+  # comparison the next run has no reason to make, so failing here has to
+  # happen before anything looks like a completed snapshot.
+  mkdir -p "$BASE_MARKER_DIR"
   cp "$CFG" "$BASE"
-  : > "$BASE_MARKER"
+  # The marker records WHAT was snapshotted, not merely that something was.
+  # The later report pass is a different process with no memory of this one,
+  # and these records are how it tells "this repository is clean" apart from
+  # "this repository is gone" — the state a deleted checkout leaves behind,
+  # in which every other assertion here falls silent. The ROOT is what
+  # identifies the checkout (see marker_records_this_checkout); the config
+  # path is the subject whose disappearance the report pass reports on.
+  #
+  # Records are NUL-framed, the one delimiter a path cannot contain. A
+  # newline-delimited record splits a checkout path holding a newline across
+  # two lines, and the reader then takes the prefix for the whole path,
+  # matches it against nothing, and files this checkout's own request as
+  # somebody else's — which turns the deleted-evidence FAIL this marker
+  # exists to raise back into a PASS, for a path the filesystem accepts.
+  printf 'root=%s\0config=%s\0baseline=%s\0' \
+    "$(canonical_dir "$REPO_ROOT")" "$CFG" "$BASE" > "$BASE_MARKER"
   echo "check_git_identity_hygiene: snapshot recorded ($BASE)"
   exit 0
 fi
@@ -512,36 +764,65 @@ assert_no_local_identity() {
   fi
 
   local offenders="" remedies="" scope key origin originfile value
-  local entry remedy scopefile scopes via_include=0 via_conditional=0
-  local seen_values="" dedupe incfile via_unresolved=0
+  local entry remedy scopefile via_include=0 via_conditional=0
+  local dedupe incfile via_unresolved=0
   local unres unres_key unres_rest unres_raw unres_file
-  local repo_q path_q worktree_file scope_label
+  local repo_q path_q worktree_file scope_label scope_kind
+  local wt_extension_on=0 sibling si inc_i sv_i unr_i dup
+  local -a seen_values scope_kinds scope_names scope_labels scope_files
+  seen_values=(); scope_kinds=(); scope_names=(); scope_labels=(); scope_files=()
   repo_q="$(shell_quote "$REPO_ROOT")"
+  # Each entry below is one place an identity value can be written down,
+  # carried as four parallel arrays: how to read it (`scope` — through
+  # `--local`/`--worktree`, or `file` — by naming the file outright), the
+  # scope name, the label the report prints, and the file that scope
+  # writes. Reading a file outright is what makes an inactive or
+  # non-invoking worktree inspectable at all: neither has a scope to be
+  # read through from here.
+  #
   # `--worktree` is a DISTINCT scope only when extensions.worktreeConfig
   # is enabled; with the extension off git treats it as an alias for
   # `--local`, so probing both would report every local setting twice and
   # print two remediation commands for one override. Probe the worktree
   # scope only where it is real, and each offender is then named once, in
   # the scope that actually holds it.
-  scopes="local"
   worktree_file="$(canonical_path "$(scope_file worktree)" 2>/dev/null || true)"
+  scope_kinds+=("scope"); scope_names+=("local"); scope_labels+=("local")
+  scope_files+=("$(canonical_path "$(scope_file local)" 2>/dev/null || true)")
   if [ "$(git -C "$REPO_ROOT" config --local --get --type=bool \
             extensions.worktreeConfig 2>/dev/null || true)" = "true" ]; then
-    scopes="local worktree"
+    wt_extension_on=1
+    scope_kinds+=("scope"); scope_names+=("worktree"); scope_labels+=("worktree")
+    scope_files+=("$worktree_file")
   elif [ -f "$worktree_file" ]; then
     # Turning the extension off does not remove config.worktree. Read the
     # dormant file directly so re-enabling the extension cannot reactivate an
     # identity that passed while inactive.
-    scopes="local dormant-worktree"
+    scope_kinds+=("file"); scope_names+=(""); scope_labels+=("dormant worktree")
+    scope_files+=("$worktree_file")
   fi
-  for scope in $scopes; do
-    if [ "$scope" = "dormant-worktree" ]; then
-      scopefile="$worktree_file"
-      scope_label="dormant worktree"
+  # Every OTHER worktree of this repository (#806). `--worktree` reaches
+  # only the invoking one, so without these a protected key sitting in a
+  # sibling's config.worktree passes a check run from the main worktree
+  # while every commit made in that sibling obeys it. They are labelled
+  # with the file that holds them, because that file — not a scope — is
+  # what the remediation has to name.
+  while IFS= read -r -d '' sibling; do
+    scope_kinds+=("file")
+    scope_names+=("")
+    if [ "$wt_extension_on" -eq 1 ]; then
+      scope_labels+=("linked worktree $sibling")
     else
-      scopefile="$(canonical_path "$(scope_file "$scope")" 2>/dev/null || true)"
-      scope_label="$scope"
+      scope_labels+=("dormant linked worktree $sibling")
     fi
+    scope_files+=("$sibling")
+  done < <(sibling_worktree_configs)
+
+  for (( si = 0; si < ${#scope_kinds[@]}; si++ )); do
+    scope_kind="${scope_kinds[$si]}"
+    scope="${scope_names[$si]}"
+    scope_label="${scope_labels[$si]}"
+    scopefile="${scope_files[$si]}"
     for key in $IDENTITY_KEYS; do
       # `--includes` is load-bearing. It defaults to OFF whenever a
       # specific file is named — which `--local` and `--worktree` both
@@ -572,8 +853,16 @@ assert_no_local_identity() {
       while IFS= read -r -d '' origin \
         && IFS= read -r -d '' value; do
         originfile=""
+        # Canonicalised into the variable, not through `$( )`, because the
+        # origin arrived NUL-framed and losslessly: this value is one half
+        # of the dedupe key the conditional-include pass matches the WALK's
+        # include path against, and the walk's half now keeps a trailing
+        # newline. Truncating only this half makes the two spellings of one
+        # file compare unequal, so a single override is reported twice — and
+        # the first `--file` remediation names the truncated path, which
+        # clears nothing.
         case "$origin" in
-          file:*) originfile="$(canonical_path "${origin#file:}")" ;;
+          file:*) canonical_path_into originfile "${origin#file:}" ;;
         esac
 
         if [ -n "$value" ]; then
@@ -597,7 +886,7 @@ assert_no_local_identity() {
           remedy="    git -C $repo_q config --file $path_q --unset-all $key"
           via_include=1
         else
-          if [ "$scope" = "dormant-worktree" ]; then
+          if [ "$scope_kind" = "file" ]; then
             path_q="$(shell_quote "$scopefile")"
             remedy="    git -C $repo_q config --file $path_q --unset-all $key"
           else
@@ -615,9 +904,9 @@ assert_no_local_identity() {
         esac
         # What the conditional-include pass below compares against, so an
         # include whose condition IS active is not reported twice.
-        seen_values+="$key"$'\037'"${originfile:-$scopefile}"$'\037'"$value"$'\n'
+        seen_values+=("$key"$'\037'"${originfile:-$scopefile}"$'\037'"$value")
       done < <(
-        if [ "$scope" = "dormant-worktree" ]; then
+        if [ "$scope_kind" = "file" ]; then
           git -C "$REPO_ROOT" config --file "$scopefile" --includes \
             --show-origin -z --get-all "$key" 2>/dev/null
         else
@@ -631,18 +920,25 @@ assert_no_local_identity() {
     # includes whose condition does not match this checkout right now.
     # Each file is read with `--file` and WITHOUT `--includes`, so it
     # contributes only its own values and the walk supplies the rest.
-    INCLUDE_FILES=""
-    INCLUDE_UNRESOLVED=""
+    INCLUDE_FILES=()
+    INCLUDE_UNRESOLVED=()
     [ -z "$scopefile" ] || collect_include_targets "$scopefile" 0
-    while IFS= read -r incfile; do
-      [ -n "$incfile" ] || continue
+    for (( inc_i = 0; inc_i < ${#INCLUDE_FILES[@]}; inc_i++ )); do
+      incfile="${INCLUDE_FILES[$inc_i]}"
       for key in $IDENTITY_KEYS; do
-        while IFS= read -r value; do
+        # `-z` for the same reason the active-scope read above uses it: a
+        # configured value may itself contain a newline, and the dedupe
+        # below compares against records the NUL-framed read produced.
+        while IFS= read -r -d '' value; do
           dedupe="$key"$'\037'"$incfile"$'\037'"$value"
-          case $'\n'"$seen_values" in
-            *$'\n'"$dedupe"$'\n'*) continue ;;
-          esac
-          seen_values+="$dedupe"$'\n'
+          dup=0
+          for (( sv_i = 0; sv_i < ${#seen_values[@]}; sv_i++ )); do
+            [ "${seen_values[$sv_i]}" = "$dedupe" ] || continue
+            dup=1
+            break
+          done
+          [ "$dup" -eq 0 ] || continue
+          seen_values+=("$dedupe")
           if [ -n "$value" ]; then
             entry="  $scope_label: $key = $value (via inactive include: $incfile)"
           else
@@ -656,17 +952,17 @@ assert_no_local_identity() {
             *$'\n'"$remedy"$'\n'*) ;;
             *) remedies+="$remedy"$'\n' ;;
           esac
-        done < <(git -C "$REPO_ROOT" config --file "$incfile" \
+        done < <(git -C "$REPO_ROOT" config --file "$incfile" -z \
                    --get-all "$key" 2>/dev/null)
       done
-    done <<< "$INCLUDE_FILES"
+    done
 
     # Include entries the walk could not follow. Reported rather than
     # skipped: git performs its own expansion and obeys any identity key
     # behind one of these paths, so "could not read it" must not read as
     # "there is nothing there".
-    while IFS= read -r unres; do
-      [ -n "$unres" ] || continue
+    for (( unr_i = 0; unr_i < ${#INCLUDE_UNRESOLVED[@]}; unr_i++ )); do
+      unres="${INCLUDE_UNRESOLVED[$unr_i]}"
       unres_key="${unres%%$'\037'*}"
       unres_rest="${unres#*$'\037'}"
       unres_raw="${unres_rest%%$'\037'*}"
@@ -680,7 +976,7 @@ assert_no_local_identity() {
         *$'\n'"$remedy"$'\n'*) ;;
         *) remedies+="$remedy"$'\n' ;;
       esac
-    done <<< "$INCLUDE_UNRESOLVED"
+    done
   done
   [ -n "$offenders" ] || return 0
 
@@ -819,17 +1115,69 @@ EOF
 # ── Part B: .git/config byte-comparison against a recorded baseline ───
 # Same two-phase contract as Part A: $1 is "pre-suite" or "post-suite".
 assert_config_unchanged() {
-  local phase="$1" base marker cfg culprit
+  local phase="$1" base marker cfg culprit recorded_cfg recorded_root line
+  local marker_mine=0
   if [ "$phase" = "post-suite" ] && [ -n "$PRE_SUITE_BASELINE" ]; then
     # The live baseline lives inside this worktree's git dir, so a suite that
     # deleted `.git` deleted the thing this compares against. The copy
     # taken before the suite ran is outside the repository and survives.
     base="$PRE_SUITE_BASELINE"
   else
-    base="$(baseline_path 2>/dev/null)" || return 0
+    base="$(baseline_path 2>/dev/null)" || base=""
   fi
-  marker="$(baseline_marker_path 2>/dev/null)" || return 0
-  if [ -f "$marker" ] && [ ! -f "$base" ]; then
+  marker="$(baseline_marker_path)"
+  # A marker that arrived with a copy of the working tree is a record of
+  # somebody else's snapshot; only a marker naming this checkout's own
+  # config puts this run under an obligation to account for a baseline.
+  if [ -f "$marker" ]; then
+    recorded_cfg=""
+    recorded_root=""
+    # NUL-framed, matching the writer: a path may contain a newline, so a
+    # line-framed read would hand back a truncated path that matches no
+    # checkout at all.
+    while IFS= read -r -d '' line; do
+      case "$line" in
+        root=*)   recorded_root="${line#root=}" ;;
+        config=*) recorded_cfg="${line#config=}" ;;
+      esac
+    done < "$marker"
+    if marker_records_this_checkout "$recorded_root"; then
+      marker_mine=1
+    elif [ "$phase" != "post-suite" ]; then
+      echo "check_git_identity_hygiene: ignoring a snapshot request recorded for another checkout (${recorded_root:-no recorded root})"
+    fi
+  fi
+  # A snapshot that outlived its own subject. Checked in the PRE-SUITE phase
+  # only, because that is the cross-PROCESS window the marker exists to
+  # cover: `--snapshot` ran as an earlier repo_lint step, something between
+  # then and now removed the checkout, and this process has no in-memory
+  # pre-suite state to notice it with. (A suite that deletes `.git` inside
+  # THIS process is reported by assert_repo_metadata_intact, which can name
+  # the suite; re-reporting it here would only duplicate that failure.)
+  if [ "$phase" != "post-suite" ] && [ "$marker_mine" -eq 1 ]; then
+    if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
+      || { [ -n "$recorded_cfg" ] && [ ! -f "$recorded_cfg" ]; }; then
+      cat >&2 <<EOF
+check_git_identity_hygiene: FAIL (the snapshotted repository is missing)
+
+A prior --snapshot call requested byte-for-byte .git/config comparison for
+$REPO_ROOT, and that repository's metadata is gone now. The snapshot and
+this check run in separate processes, so a step between them deleted the
+checkout — the same wrong-target mistake as an unscoped \`git config\`, one
+directory up.
+
+Every other assertion in this check reaches the repository through \`.git\`
+and would report "nothing to check here", so the missing subject is
+reported rather than passed over: a deleted config is not evidence that
+the config stayed unchanged.
+
+Restore the checkout, and run --snapshot again only after confirming the
+current config is the intended clean baseline.
+EOF
+      return 1
+    fi
+  fi
+  if [ "$marker_mine" -eq 1 ] && [ ! -f "$base" ]; then
     cat >&2 <<EOF
 check_git_identity_hygiene: FAIL (the requested snapshot baseline is missing)
 
@@ -1003,11 +1351,68 @@ else
     # even option-shaped tokens (`--show-origin`, `-z`) as the value to write.
     # A lone backslash is the physical half of a continued command; the
     # logical-line join below removes it before this function sees the value.
+    #
+    # The key must be a COMPLETE command-line word, not a suffix of one.
+    # Without a boundary in front, the pattern matched the tail of every key
+    # ending in the same letters, so `notuser.email`, `precommit.gpgsign` and
+    # `retag.gpgsign` — all valid keys, none of them protected, none of them
+    # touching commit attribution — were reported as writes to the protected
+    # ones.
+    #
+    # Spelling that boundary as "any character a git config key is not built
+    # from" reopens the same class one layer down, because a SUBSECTION may
+    # hold any byte: `git config foo.bar/user.email x` and its `:` spelling
+    # are accepted keys that store `foo.bar/user.email`, and `git config
+    # --get user.email` stays unset after either (verified on git 2.50.1).
+    # The `/` or `:` is not a boundary there — it is the last character of
+    # the subsection — yet it reads as one to any character class, so a
+    # harmless config write is reported as an unscoped identity write and
+    # reds repo_lint. No character class can tell the two apart.
+    #
+    # What tells them apart is the WORD. A write names the protected key as a
+    # whole command-line word and its value follows after whitespace, so the
+    # word begins at the start of the piece or after whitespace; a subsection
+    # character sits inside the word and is neither.
+    #
+    # Two things may stand between the boundary and the key, because the
+    # SHELL removes them before Git sees the word:
+    #
+    #   - a backslash. `git config \user.email leak@example.com` writes the
+    #     identity while the word as written does not begin with `u`;
+    #   - a matching pair of quotes around the whole key.
+    #     `git config "user.email" x` and `git config \047user.email\047 x`
+    #     write it too, and the closing quote is also what stands between
+    #     the key and the whitespace the pattern requires after it — so both
+    #     ends have to be admitted together or neither matches.
+    #
+    # Neither reopens the subsection class, because both are matched only
+    # where a boundary already is: in `foo.bar/user.email` the character in
+    # front is `/`, and in `"foo.bar/user.email"` it is still `/`, so the
+    # match never starts at the key in either. The quotes are admitted as a
+    # PAIR spelled out per quote character rather than as an optional
+    # single one, so `"user.email` — an unterminated word Git never
+    # receives — does not match.
+    #
+    # A key quoted in PART (`user.\047email\047`, `"user".email`) is not
+    # covered: recovering it means applying the word rules of the shell to
+    # the text, which is a different scanner from this one. Tracked as a
+    # follow-up rather than approximated here, because a half-rule that
+    # strips quotes anywhere in the word is exactly how the subsection
+    # false positives came back the last two times.
     function key_assign_pos(s,   lower, pos, rest) {
       lower = tolower(s)
-      if (!match(lower, /(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+/))
+      if (!match(lower, /(^|[[:space:]])\\?(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign|"(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)"|\047(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)\047)[[:space:]]+/))
         return 0
+      # Step over the boundary character: it is not part of the key, and
+      # this position is what the caller cuts the option region at. Every
+      # suppressor is read from that region as a whole token, so keeping a
+      # separator on its end or dropping it come out the same today; the
+      # step is here so the returned value keeps meaning what the function
+      # is named for rather than "one byte before the key, usually". A
+      # matched boundary is never a letter (the class above is whitespace),
+      # which is what tells one apart from a match that began at `^`.
       pos = RSTART
+      if (substr(lower, pos, 1) !~ /[a-z]/) pos++
       rest = substr(s, RSTART + RLENGTH)
       if (rest == "" || rest ~ /^[#`)<>]/) return 0
       if (rest ~ /^\\[[:space:]]*$/) return 0

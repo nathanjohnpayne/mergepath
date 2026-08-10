@@ -466,6 +466,35 @@ else
   fail "REVIEW_POLICY.md still publishes executable global placeholder identity writes"
 fi
 
+# Case 26c: #865's "Superseded CHANGES_REQUESTED reviews" precondition
+# (REVIEW_POLICY.md § Real-Time Per-Finding Disposition) must match the
+# pinned decision comment
+# (github.com/nathanjohnpayne/mergepath/issues/865#issuecomment-5160596834),
+# not a more permissive restatement of it. The decision requires the
+# dismissal precondition to name all three real dispositions (fixed,
+# rebutted, deferred — a deferred-only round is not "fixed-and-pushed, or
+# rebutted on-thread") and to carve out a round with an open rebuttal the
+# reviewer has not yet answered: that round keeps its review standing
+# until a later round's verdict supersedes it, rather than becoming
+# dismissible the instant a reply lands. Losing either half re-opens the
+# short-circuit § No-self-approve scoping exists to prevent: dismissing a
+# cross-agent CHANGES_REQUESTED review the reviewer never accepted.
+if grep -qF 'fixed with the commit pushed, or rebutted/deferred with the record posted' "$ROOT/REVIEW_POLICY.md"; then
+  pass "#865: dismissal precondition names fixed/rebutted/deferred with the record posted"
+else
+  fail "#865: REVIEW_POLICY.md dismissal precondition dropped 'deferred' or the record-posted requirement"
+fi
+if grep -qF "keeps its review standing until the next round's verdict supersedes it" "$ROOT/REVIEW_POLICY.md"; then
+  pass "#865: undispositioned-round carve-out (review stands until superseded) is present"
+else
+  fail "#865: REVIEW_POLICY.md is missing the undispositioned-round carve-out from the pinned decision"
+fi
+if grep -qF '(fixed-and-pushed, or rebutted on-thread)' "$ROOT/REVIEW_POLICY.md"; then
+  fail "#865: REVIEW_POLICY.md still carries the pre-fix permissive precondition wording"
+else
+  pass "#865: pre-fix permissive precondition wording ('fixed-and-pushed, or rebutted on-thread') is gone"
+fi
+
 # ── Part A: the live-repo identity assertion ──────────────────────────
 
 IDREPO="$WORKDIR/idrepo"
@@ -1563,6 +1592,537 @@ if [ "$RC" = "1" ] && [ "$LEFTOVER" = "0" ]; then
   pass "scratch files: removed on exit, including on the failure path"
 else
   fail "scratch files left behind: rc=$RC leftover=$LEFTOVER"
+fi
+
+# ── Fail-closed: a snapshot whose subject was deleted (#803) ───────────
+
+# Case 63: `--snapshot` and the final report run in SEPARATE processes — an
+# early repo_lint step and the job's last one — so everything that carries
+# between them is on disk. With the snapshot request stored under `.git`, a
+# step that removed the checkout took the request away with the subject:
+# the final run found no marker, no baseline and no repository, read the
+# tree as an ordinary non-repository, and reported PASS for a job that had
+# destroyed the very thing it was asserting about. The marker is asserted
+# to live outside `.git` and to survive its deletion, because that is what
+# leaves anything behind for the final run to fail on.
+SNAPGONE_REPO="$WORKDIR/snapshot-subject-gone-repo"
+git init -q -b main "$SNAPGONE_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPGONE_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+MARKER_UNDER_GIT="$(find "$SNAPGONE_REPO/.git" -name '*baseline.requested*' | wc -l | tr -d ' ')"
+rm -rf "$SNAPGONE_REPO/.git"
+MARKER_KEPT=0
+if [ -f "$SNAPGONE_REPO/.mergepath/gitconfig-baseline.requested" ]; then
+  MARKER_KEPT=1
+fi
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPGONE_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && [ "$MARKER_UNDER_GIT" = "0" ] \
+  && [ "$MARKER_KEPT" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "snapshotted repository is missing" \
+  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "snapshot then deleted .git: the request survives outside metadata and fails closed"
+else
+  fail "deleted checkout blessed after --snapshot: under_git=$MARKER_UNDER_GIT kept=$MARKER_KEPT rc=$RC out=$OUT"
+fi
+
+# Case 63b: the converse — the branch above fires on a missing SUBJECT, not
+# on the mere presence of a recorded snapshot. An intact checkout still
+# reports the ordinary unchanged-since-snapshot result.
+SNAPOK_REPO="$WORKDIR/snapshot-subject-intact-repo"
+git init -q -b main "$SNAPOK_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOK_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOK_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "unchanged since snapshot" \
+  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
+  && ! printf '%s' "$OUT" | grep -q "snapshotted repository is missing"; then
+  pass "intact checkout with a recorded snapshot: still passes"
+else
+  fail "intact snapshotted checkout: rc=$RC out=$OUT"
+fi
+
+# Case 63c: keeping the request in the working tree also means it travels
+# with a COPY of that tree, while the baseline it refers to — which lives in
+# the git dir — does not. That is not hypothetical: the consumer-safety
+# fixture is built by copying this checkout's working tree with `.git`
+# excluded and then `git init`-ing the result, so a snapshot recorded by an
+# earlier repo_lint step arrives in the fixture with nothing to compare
+# against. The copy then presents the exact shape of a tampered checkout —
+# a request whose evidence is gone — for a snapshot nobody took of it, and
+# the resulting failure reds every consumer's repo-lint. The request names
+# the config it was taken from, so the copy is recognisable as somebody
+# else's and left alone.
+SNAPSRC_REPO="$WORKDIR/snapshot-copy-source-repo"
+git init -q -b main "$SNAPSRC_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPSRC_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+SNAPCOPY_REPO="$WORKDIR/snapshot-copy-fixture-repo"
+mkdir -p "$SNAPCOPY_REPO/.mergepath"
+cp "$SNAPSRC_REPO/.mergepath/gitconfig-baseline.requested" \
+  "$SNAPCOPY_REPO/.mergepath/gitconfig-baseline.requested"
+git init -q -b main "$SNAPCOPY_REPO"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPCOPY_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
+  && printf '%s' "$OUT" | grep -q "recorded for another checkout" \
+  && ! printf '%s' "$OUT" | grep -q "baseline is missing" \
+  && ! printf '%s' "$OUT" | grep -q "snapshotted repository is missing"; then
+  pass "a working-tree copy inherits the request but not the baseline: not this checkout's snapshot"
+else
+  fail "copied snapshot request failed a checkout nobody snapshotted: rc=$RC out=$OUT"
+fi
+
+# Case 63d: the converse, so recognising a foreign request cannot have been
+# implemented by ignoring requests generally. In the checkout the snapshot
+# was actually taken in, removing the baseline while the request stands is
+# still the missing-evidence failure it was before.
+SNAPOWN_REPO="$WORKDIR/snapshot-own-baseline-gone-repo"
+git init -q -b main "$SNAPOWN_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOWN_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+rm -f "$SNAPOWN_REPO/.git/mergepath-gitconfig-baseline"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPOWN_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "the requested snapshot baseline is missing" \
+  && ! printf '%s' "$OUT" | grep -q "recorded for another checkout"; then
+  pass "own snapshot with the baseline deleted: still fails closed"
+else
+  fail "own request with a deleted baseline was waved through: rc=$RC out=$OUT"
+fi
+
+# Case 63e: the marker records a config PATH, and a filesystem path may
+# contain a newline. Framed by newline, the recorded path split across two
+# records and the reader took the first line for the whole of it — so the
+# checkout failed to recognise its OWN request, reported it as somebody
+# else's, and returned PASS on the deleted baseline that case 63d fails
+# on. Fail-open, on a path the filesystem accepts.
+SNAPNL_REPO="$WORKDIR/snapshot-newline"$'\n'"path-repo"
+git init -q -b main "$SNAPNL_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNL_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+rm -f "$SNAPNL_REPO/.git/mergepath-gitconfig-baseline"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNL_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "the requested snapshot baseline is missing" \
+  && ! printf '%s' "$OUT" | grep -q "recorded for another checkout"; then
+  pass "newline in the checkout path: the marker still names this checkout"
+else
+  fail "newline-path marker read as a foreign request: rc=$RC out=$OUT"
+fi
+
+# Case 63f: the copy case 63c covers with the git dir it does NOT have.
+# `tests/test_repo_lint_consumer_safety.sh` rsyncs this working tree with
+# `.git` excluded and never `git init`s the result, so the fixture inherits
+# the request and is not a repository at all. Deciding "is this mine?" from
+# the recorded CONFIG could not tell that tree from the #803 case — both
+# have a marker and no resolvable config — and claimed it, reporting a
+# checkout nobody snapshotted as one whose metadata had been destroyed.
+# That reds every consumer's repo-lint through the fixture.
+SNAPNR_SRC="$WORKDIR/snapshot-nonrepo-source-repo"
+git init -q -b main "$SNAPNR_SRC"
+MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNR_SRC" bash "$CHECK" --snapshot >/dev/null 2>&1
+SNAPNR_COPY="$WORKDIR/snapshot-nonrepo-copy"
+mkdir -p "$SNAPNR_COPY/.mergepath"
+cp "$SNAPNR_SRC/.mergepath/gitconfig-baseline.requested" \
+  "$SNAPNR_COPY/.mergepath/gitconfig-baseline.requested"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPNR_COPY" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
+  && printf '%s' "$OUT" | grep -q "recorded for another checkout" \
+  && ! printf '%s' "$OUT" | grep -q "snapshotted repository is missing"; then
+  pass "non-repository tree copy inheriting the request: not this checkout's snapshot"
+else
+  fail "inherited request failed a non-repository fixture: rc=$RC out=$OUT"
+fi
+
+# Case 63g: the marker path is WORKING-TREE content now, so a pull request
+# can make its directory a symlink. `>` follows one, which would turn
+# `--snapshot` — the job's FIRST repo_lint step, before this check has
+# asserted anything — into a write to whatever the link names. The old
+# `.git`-local path was not checkout-controlled and had nothing to refuse.
+SNAPLINK_REPO="$WORKDIR/snapshot-symlinked-state-repo"
+git init -q -b main "$SNAPLINK_REPO"
+SNAPLINK_TARGET="$WORKDIR/snapshot-symlink-target"
+mkdir -p "$SNAPLINK_TARGET"
+ln -s "$SNAPLINK_TARGET" "$SNAPLINK_REPO/.mergepath"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPLINK_REPO" bash "$CHECK" --snapshot 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "snapshot state path is a symlink" \
+  && [ ! -e "$SNAPLINK_TARGET/gitconfig-baseline.requested" ]; then
+  pass "symlinked snapshot state dir: refused, nothing written through the link"
+else
+  fail "snapshot wrote through a symlinked state dir: rc=$RC out=$OUT"
+fi
+
+# Case 63h: the converse — refusing a link cannot have been implemented by
+# refusing the ordinary case. A real directory still records normally.
+SNAPPLAIN_REPO="$WORKDIR/snapshot-plain-state-repo"
+git init -q -b main "$SNAPPLAIN_REPO"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SNAPPLAIN_REPO" bash "$CHECK" --snapshot 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "snapshot recorded" \
+  && [ -f "$SNAPPLAIN_REPO/.mergepath/gitconfig-baseline.requested" ]; then
+  pass "ordinary state dir: snapshot still recorded"
+else
+  fail "ordinary snapshot refused: rc=$RC out=$OUT"
+fi
+
+# ── Newline-safe include-target collection (#804) ──────────────────────
+
+# Case 64: a Git include target is an ordinary filename and may contain a
+# NEWLINE. Collecting the walk's targets as newline-delimited text split
+# one such file into two entries that named nothing; neither existed, both
+# were dropped by the file test, and the dormant identity behind it was
+# never inspected — free to reactivate the moment its condition matched.
+NLREPO="$WORKDIR/newline-include-repo"
+git init -q -b main "$NLREPO"
+NL_INCLUDE="$NLREPO/.git/dormant"$'\n'"identity"
+printf '[user]\n\temail = newline-include@example.com\n' > "$NL_INCLUDE"
+git -C "$NLREPO" config --local includeIf.onbranch:release.path "$NL_INCLUDE"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NLREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+REMEDY="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]+git .*--unset-all user\.email' | head -1 || true)"
+set +e
+eval "$REMEDY" >/dev/null 2>&1
+NL_LEFT="$(git config --file "$NL_INCLUDE" --get user.email 2>/dev/null)"
+OUT_AFTER="$(MERGEPATH_GIT_IDENTITY_ROOT="$NLREPO" bash "$CHECK" 2>&1)"
+RC_AFTER=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "newline-include@example.com" \
+  && printf '%s' "$OUT" | grep -q "inactive include" \
+  && [ -n "$REMEDY" ] && [ -z "$NL_LEFT" ] && [ "$RC_AFTER" = "0" ]; then
+  pass "include target whose filename contains a newline: inspected, and its remediation lands on that file"
+else
+  fail "newline include target escaped the walk: rc=$RC remedy='$REMEDY' left='$NL_LEFT' after=$RC_AFTER out=$OUT after_out=$OUT_AFTER"
+fi
+
+# Case 64c: the same filename shape with the newline LAST. Case 64's name
+# carries its newline in the middle, which survives a command substitution;
+# a TRAILING one does not — `$( )` strips every trailing newline, so the
+# canonicalised target came back one byte short, the file test asked about
+# a name no file has, and the identity behind it was dropped exactly as
+# before the newline-safe collection was written.
+NLTREPO="$WORKDIR/newline-tail-include-repo"
+git init -q -b main "$NLTREPO"
+NLT_INCLUDE="$NLTREPO/.git/dormant-identity"$'\n'
+printf '[user]\n\temail = newline-tail-include@example.com\n' > "$NLT_INCLUDE"
+git -C "$NLTREPO" config --local includeIf.onbranch:release.path "$NLT_INCLUDE"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NLTREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "newline-tail-include@example.com" \
+  && printf '%s' "$OUT" | grep -q "inactive include"; then
+  pass "include target whose filename ENDS in a newline: inspected"
+else
+  fail "trailing-newline include target escaped the walk: rc=$RC out=$OUT"
+fi
+
+# Case 64d: the same filename shape reached by an ACTIVE include, which is
+# seen twice — once by the scope read (as an origin) and once by the walk.
+# The two halves of the dedupe key must be canonicalised the same way: with
+# only the walk's half lossless, the truncated origin matched nothing, one
+# override was reported twice, and the first `--file` remediation named a
+# path no file has.
+NLTA_REPO="$WORKDIR/newline-tail-active-include-repo"
+git init -q -b main "$NLTA_REPO"
+NLTA_INCLUDE="$NLTA_REPO/.git/active-identity"$'\n'
+printf '[user]\n\temail = newline-tail-active@example.com\n' > "$NLTA_INCLUDE"
+git -C "$NLTA_REPO" config --local include.path "$NLTA_INCLUDE"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NLTA_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+N_ENTRIES="$(printf '%s\n' "$OUT" | grep -c "newline-tail-active@example.com" || true)"
+if [ "$RC" = "1" ] && [ "$N_ENTRIES" -eq 1 ]; then
+  pass "active include whose filename ENDS in a newline: reported once, not twice"
+else
+  fail "trailing-newline active include double-reported: entries=$N_ENTRIES rc=$RC out=$OUT"
+fi
+
+# Case 64b: two `includeIf` entries pointing at the SAME target still yield
+# one entry and one remediation. The dedupe moved from a substring test
+# over joined text to an element comparison over an array, and an array
+# whose membership test is wrong duplicates instead of losing — the failure
+# in the opposite direction, and just as visible to an operator.
+DEDUPE_INC_REPO="$WORKDIR/dedupe-include-repo"
+git init -q -b main "$DEDUPE_INC_REPO"
+printf '[user]\n\temail = deduped@example.com\n' > "$DEDUPE_INC_REPO/.git/shared-identity"
+git -C "$DEDUPE_INC_REPO" config --local includeIf.onbranch:release.path shared-identity
+git -C "$DEDUPE_INC_REPO" config --local includeIf.onbranch:hotfix.path shared-identity
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$DEDUPE_INC_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+N_ENTRIES="$(printf '%s\n' "$OUT" | grep -c "user.email = deduped@example.com" || true)"
+N_REMEDIES="$(printf '%s\n' "$OUT" | grep -c -- "--unset-all user.email" || true)"
+if [ "$RC" = "1" ] && [ "$N_ENTRIES" -eq 1 ] && [ "$N_REMEDIES" -eq 1 ]; then
+  pass "one include target reached by two includeIf entries: reported once"
+else
+  fail "duplicate include-target reporting: entries=$N_ENTRIES remedies=$N_REMEDIES rc=$RC out=$OUT"
+fi
+
+# ── Precision: the protected keys are COMPLETE keys (#805) ─────────────
+
+# Case 65: the identity-key pattern carried no boundary in front of it, so
+# it matched the TAIL of any key ending in the same letters.
+# `notuser.email`, `precommit.gpgsign` and `retag.gpgsign` are all valid
+# git config keys, none of them protected and none of them touching commit
+# attribution, and every one of them was reported as a write to the key it
+# merely ends with.
+run_on_fixture "tests/suffix-keys.sh" '#!/usr/bin/env bash
+git config notuser.email "not-protected@example.com"
+git config precommit.gpgsign false
+git config retag.gpgsign false
+git config myuser.name "not-protected"
+'
+if [ "$RC" = "0" ]; then
+  pass "config keys that merely END in a protected key: not reported"
+else
+  fail "suffix-sharing config keys falsely flagged: rc=$RC out=$OUT"
+fi
+
+# Case 65b: the converse, so anchoring the pattern cannot have been
+# achieved by turning the scan off. Suffix-sharing keys sit either side of
+# a real write, and only the real write is reported.
+run_on_fixture "tests/suffix-mixed.sh" '#!/usr/bin/env bash
+git config notuser.email "not-protected@example.com"
+git config user.email "leak@example.com"
+git config retag.gpgsign false
+'
+N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/suffix-mixed\.sh:' || true)"
+if [ "$RC" = "1" ] \
+  && [ "$N_HITS" -eq 1 ] \
+  && printf '%s' "$OUT" | grep -q "tests/suffix-mixed.sh:3:"; then
+  pass "suffix keys around a real write: only the exact protected key is reported"
+else
+  fail "mixed suffix/protected keys: hits=$N_HITS rc=$RC out=$OUT"
+fi
+
+# Case 65c: the same mix inside ONE logical command. The line is cut at
+# shell separators and each piece judged alone, so the suffix key must not
+# stand in for the protected one in either direction: the write is still
+# reported, and the piece that only carries a suffix key contributes
+# nothing of its own.
+run_on_fixture "tests/suffix-same-line.sh" '#!/usr/bin/env bash
+git config retag.gpgsign false && git config user.email "leak@example.com"
+git config precommit.gpgsign false && git config notuser.email "not-protected@example.com"
+'
+N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/suffix-same-line\.sh:' || true)"
+if [ "$RC" = "1" ] \
+  && [ "$N_HITS" -eq 1 ] \
+  && printf '%s' "$OUT" | grep -q "tests/suffix-same-line.sh:2:"; then
+  pass "suffix and protected keys in one command: only the protected write is reported"
+else
+  fail "same-line suffix/protected mix: hits=$N_HITS rc=$RC out=$OUT"
+fi
+
+# Case 65d: a git config SUBSECTION accepts any byte, so a key can end in
+# a protected key behind a separator no character class can call a
+# boundary. `git config foo.bar/user.email x` stores `foo.bar/user.email`
+# and leaves `git config --get user.email` unset (git 2.50.1); the `:`
+# spelling behaves the same. Neither is a write to a protected key, and
+# neither may red repo_lint.
+run_on_fixture "tests/subsection-keys.sh" '#!/usr/bin/env bash
+git config foo.bar/user.email "not-protected@example.com"
+git config foo.bar:user.email "not-protected@example.com"
+git config a.b/commit.gpgsign true
+git config a.b:tag.gpgsign true
+git config x.y/user.signingkey ABC123
+'
+if [ "$RC" = "0" ]; then
+  pass "subsection keys ending in a protected key: not reported"
+else
+  fail "subsection-qualified config keys falsely flagged: rc=$RC out=$OUT"
+fi
+
+# Case 65e: the converse, so the word boundary cannot have been achieved
+# by narrowing the scan away from real writes standing beside one.
+run_on_fixture "tests/subsection-mixed.sh" '#!/usr/bin/env bash
+git config foo.bar/user.email "not-protected@example.com"
+git config user.email "leak@example.com"
+git config a.b:commit.gpgsign true
+'
+N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/subsection-mixed\.sh:' || true)"
+if [ "$RC" = "1" ] \
+  && [ "$N_HITS" -eq 1 ] \
+  && printf '%s' "$OUT" | grep -q "tests/subsection-mixed.sh:3:"; then
+  pass "subsection keys around a real write: only the exact protected key is reported"
+else
+  fail "mixed subsection/protected keys: hits=$N_HITS rc=$RC out=$OUT"
+fi
+
+# Case 65h: the key may be QUOTED as a whole word. The shell removes the
+# quotes and Git is handed the protected key, so the write happens; the
+# closing quote is also what stands between the key and the whitespace the
+# matcher requires after it, so both ends have to be admitted together.
+run_on_fixture "tests/quoted-key.sh" '#!/usr/bin/env bash
+git config "user.email" "leak@example.com"
+git config '"'"'commit.gpgsign'"'"' false
+'
+N_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/quoted-key\.sh:' || true)"
+if [ "$RC" = "1" ] && [ "$N_HITS" -eq 2 ]; then
+  pass "protected key quoted as a whole word: reported in both quote styles"
+else
+  fail "quoted protected key missed: hits=$N_HITS rc=$RC out=$OUT"
+fi
+
+# Case 65i: the converse. Admitting a quote PAIR must not admit a quote
+# anywhere — a subsection-qualified key inside quotes is still not a write
+# to a protected key, and an unterminated word is not one Git ever receives.
+run_on_fixture "tests/quoted-subsection-keys.sh" '#!/usr/bin/env bash
+git config "foo.bar/user.email" "not-protected@example.com"
+git config '"'"'a.b:commit.gpgsign'"'"' true
+'
+if [ "$RC" = "0" ]; then
+  pass "quoted subsection-qualified keys: still not reported"
+else
+  fail "quoted subsection keys falsely flagged: rc=$RC out=$OUT"
+fi
+
+# Case 65g: a shell escape may stand between the boundary and the key.
+# `git config \user.email x` writes the identity — the shell drops the
+# backslash and Git is handed `user.email` — while the word as written does
+# not begin with `u`. A word boundary that admits nothing between itself
+# and the key reads this as no write at all.
+run_on_fixture "tests/escaped-key.sh" '#!/usr/bin/env bash
+git config \user.email "leak@example.com"
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/escaped-key.sh:2:"; then
+  pass "shell-escaped protected key: still reported"
+else
+  fail "escaped protected key missed: rc=$RC out=$OUT"
+fi
+
+# ── Linked worktrees: identity lives in every one of them (#806) ───────
+
+# Case 66: `git config --worktree` reads the INVOKING worktree's
+# config.worktree and nothing else, so a protected key parked in a SIBLING
+# linked worktree passed a check run from the main worktree — while every
+# commit made in that sibling was attributed and signed under it. The
+# offending file is what the remediation has to name: no scope reachable
+# from the main worktree would clear it.
+LWMAIN="$WORKDIR/linked-identity-main"
+LWSIB="$WORKDIR/linked-identity-sibling"
+git init -q -b main "$LWMAIN"
+printf 'seed\n' > "$LWMAIN/seed.txt"
+git -C "$LWMAIN" add seed.txt
+git -C "$LWMAIN" -c user.name=fixture -c user.email=fixture@example.com \
+  commit -q -m seed
+git -C "$LWMAIN" worktree add -q -b linked "$LWSIB"
+git -C "$LWMAIN" config --local extensions.worktreeConfig true
+git -C "$LWSIB" config --worktree user.email "linked-worktree@example.com"
+# Invisible to every scope the main worktree can read for ITSELF, which is
+# exactly what made the old check report success on this repository.
+LW_OWN_SCOPE="$(git -C "$LWMAIN" config --worktree --get user.email 2>/dev/null || true)"
+LW_LOCAL="$(git -C "$LWMAIN" config --local --includes --get user.email 2>/dev/null || true)"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$LWMAIN" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+REMEDY="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]+git .*--unset-all user\.email' | head -1 || true)"
+set +e
+eval "$REMEDY" >/dev/null 2>&1
+LW_LEFT="$(git -C "$LWSIB" config --worktree --get user.email 2>/dev/null)"
+OUT_AFTER="$(MERGEPATH_GIT_IDENTITY_ROOT="$LWMAIN" bash "$CHECK" 2>&1)"
+RC_AFTER=$?
+set -e
+if [ -z "$LW_OWN_SCOPE" ] && [ -z "$LW_LOCAL" ] \
+  && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "linked-worktree@example.com" \
+  && printf '%s' "$OUT" | grep -q "worktrees/linked-identity-sibling/config.worktree" \
+  && [ -n "$REMEDY" ] && [ -z "$LW_LEFT" ] && [ "$RC_AFTER" = "0" ]; then
+  pass "identity in a sibling linked worktree: caught from the main worktree and cleared by the printed command"
+else
+  fail "sibling linked-worktree identity escaped: own='$LW_OWN_SCOPE' local='$LW_LOCAL' rc=$RC remedy='$REMEDY' left='$LW_LEFT' after=$RC_AFTER out=$OUT"
+fi
+
+# Case 66b: a sibling's file is read outright rather than through a scope,
+# so a DORMANT one is inspected on the same terms as an active one.
+# Disabling extensions.worktreeConfig deletes nobody's config.worktree, and
+# re-enabling it reactivates every identity in them with no fresh write for
+# a later run to catch.
+DLWMAIN="$WORKDIR/dormant-linked-main"
+DLWSIB="$WORKDIR/dormant-linked-sibling"
+git init -q -b main "$DLWMAIN"
+printf 'seed\n' > "$DLWMAIN/seed.txt"
+git -C "$DLWMAIN" add seed.txt
+git -C "$DLWMAIN" -c user.name=fixture -c user.email=fixture@example.com \
+  commit -q -m seed
+git -C "$DLWMAIN" worktree add -q -b dormant-linked "$DLWSIB"
+git -C "$DLWMAIN" config --local extensions.worktreeConfig true
+git -C "$DLWSIB" config --worktree user.signingkey DORMANTKEY
+git -C "$DLWMAIN" config --local extensions.worktreeConfig false
+DLW_FILE="$DLWMAIN/.git/worktrees/dormant-linked-sibling/config.worktree"
+DLW_PRESENT=0
+if [ -f "$DLW_FILE" ]; then
+  DLW_PRESENT=1
+fi
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$DLWMAIN" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+REMEDY="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]+git .*--unset-all user\.signingkey' | head -1 || true)"
+set +e
+eval "$REMEDY" >/dev/null 2>&1
+DLW_LEFT="$(git config --file "$DLW_FILE" --get user.signingkey 2>/dev/null)"
+OUT_AFTER="$(MERGEPATH_GIT_IDENTITY_ROOT="$DLWMAIN" bash "$CHECK" 2>&1)"
+RC_AFTER=$?
+set -e
+if [ "$DLW_PRESENT" = "1" ] && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "dormant linked worktree" \
+  && printf '%s' "$OUT" | grep -q "DORMANTKEY" \
+  && [ -n "$REMEDY" ] && [ -z "$DLW_LEFT" ] && [ "$RC_AFTER" = "0" ]; then
+  pass "dormant sibling config.worktree: inspected and cleared like an active one"
+else
+  fail "dormant sibling worktree identity escaped: present=$DLW_PRESENT rc=$RC remedy='$REMEDY' left='$DLW_LEFT' after=$RC_AFTER out=$OUT"
+fi
+
+# Case 66c: the converse — the invoking worktree's OWN config.worktree is
+# not also enumerated as a sibling. It is reachable through its scope, and
+# reporting it twice would hand an operator two remediation commands for
+# one override.
+SELFWT_REPO="$WORKDIR/self-worktree-repo"
+git init -q -b main "$SELFWT_REPO"
+git -C "$SELFWT_REPO" config --local extensions.worktreeConfig true
+git -C "$SELFWT_REPO" config --worktree user.email "self-worktree@example.com"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SELFWT_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+N_ENTRIES="$(printf '%s\n' "$OUT" | grep -c "user.email = self-worktree@example.com" || true)"
+N_REMEDIES="$(printf '%s\n' "$OUT" | grep -c -- "--unset-all user.email" || true)"
+if [ "$RC" = "1" ] && [ "$N_ENTRIES" -eq 1 ] && [ "$N_REMEDIES" -eq 1 ] \
+  && ! printf '%s' "$OUT" | grep -q "linked worktree"; then
+  pass "the invoking worktree's own config.worktree: reported once, not also as a sibling"
+else
+  fail "own config.worktree double-reported: entries=$N_ENTRIES remedies=$N_REMEDIES rc=$RC out=$OUT"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────

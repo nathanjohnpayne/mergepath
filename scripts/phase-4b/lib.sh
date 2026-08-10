@@ -242,6 +242,18 @@ p4b_barrier_class_coderabbit() {
       # unparseable, fails closed to not-yet — old probe JSON simply keeps
       # the barrier on its pre-#869 bounded wait.
       #
+      # Which object review.submitted_at names is settled upstream, and it
+      # has to be a review RUN (#900): CodeRabbit also creates a review
+      # object for a CONVERSATIONAL REPLY on a thread — its answer to a
+      # rebuttal or to a resolve tag reply — and a reply starts no run, so
+      # no further StatusContext is ever published for that head. Anchoring
+      # on one made this comparison unsatisfiable rather than merely
+      # pending, and the barrier burned its whole budget on a provider that
+      # had finished. crw_select_head_pinned_review_run in
+      # scripts/coderabbit-wait.sh excludes replies by their empty body, so
+      # what arrives here is the newest run; with no run on the head the
+      # probe emits no `review` at all and the first conjunct fails closed.
+      #
       # And an ACTIVE adverse state named by the probe takes precedence
       # over the evidence pair (P1 round 3 on #875): probe.observed on
       # this branch is the class of the newest pending notice beneath the

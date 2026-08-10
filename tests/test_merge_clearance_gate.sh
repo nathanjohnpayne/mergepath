@@ -1819,6 +1819,66 @@ mcg22_case x3 's{^(  dispatch-recheck:\n)}{$1    concurrency:\n      group: mcg-
 #     value-reading acceptance would wave it through (two App P2s on #852).
 mcg22_case z 's{^(      - name: Find open PRs\n)}{$1        continue-on-error: no\n}m' \
   fail "continue-on-error"
+
+# --- #854 robustness completions -------------------------------------------
+#
+# Three properties, each a completion of a #850 tier rather than a new tier.
+# Every case below is non-vacuous against the PRE-#854 check: aa/ab exercise a
+# gh spelling its regex detector never matched, ac the exemption that replaced
+# that detector, ad/ae the two needs: shapes it reported under one cause, and
+# af/ag/ah the normalisation pass that replaced its falsy-literal list.
+#
+# aa — a COMMAND-SUBSTITUTED gh invocation in a step that binds no token. The
+#      detector asked "does this body invoke gh?"; `"$(command -v gh)" api` is
+#      the same call with no matchable `gh` token, so the step exempted itself
+#      and its unauthenticated POST would 401. The inverted rule — every
+#      producer step that runs a shell binds the token unless pinned token-free
+#      — has no spelling to escape through (#854 item 1).
+mcg22_case aa 's{^(      - name: Re-evaluate gate per PR and post check_run\n)}{      - name: Refresh the rate limit\n        run: |\n          "\$(command -v gh)" api /rate_limit >/dev/null\n$1}m' \
+  fail "[#850 gh token binding] step 'Refresh the rate limit' in job 'scheduled-sweep'"
+# ab — the SAME step with the binding present must pass. Without this control
+#      aa would also be satisfied by a rule that rejects every added step, and
+#      the universal form would be indistinguishable from an unsatisfiable one.
+mcg22_case ab 's{^(      - name: Re-evaluate gate per PR and post check_run\n)}{      - name: Refresh the rate limit\n        env:\n          GH_TOKEN: \$\{\{ secrets.GITHUB_TOKEN \}\}\n        run: |\n          "\$(command -v gh)" api /rate_limit >/dev/null\n$1}m' \
+  pass
+# ac — a pinned token-free step that grows a gh call. The exemption exists for
+#      steps making no authenticated call at all, so the retained regex still
+#      serves as a belt over exactly that set: an exemption that outgrows its
+#      justification must go red rather than inherit silence.
+mcg22_case ac 's{(      - name: Report gate verdict.*?        run: \|\n)}{$1          gh api /rate_limit >/dev/null\n}s' \
+  fail "[#850 gh token binding] step 'Report gate verdict' in job 'merge-clearance-gate' is pinned as"
+# ad — an EMPTY needs:. Still rejected (key absence over value interpretation,
+#      this tier's standing posture) but reported as its own cause: an empty
+#      edge set skips nothing, so calling it the skipped-producer defect
+#      misnames what the workflow does (#854 item 3).
+mcg22_case ad 's{^(  merge-clearance-gate:\n)}{$1    needs: []\n}m' \
+  fail "declares an empty needs:"
+# ae — a needs: MAPPING. Not a shape Actions accepts at all, so it is neither
+#      an edge nor the absence of one and must fail on the malformed cause
+#      instead of being described as a dependency on a job named after a dict.
+mcg22_case ae 's{^(  merge-clearance-gate:\n)}{$1    needs:\n      preflight: true\n}m' \
+  fail "declares a malformed"
+# af — a negative-zero float with internal whitespace inside the wrapper. The
+#      enumerated tuple missed `-0`, `0.0` and the whitespace variants one
+#      review round at a time; one normalisation pass (unwrap, unquote, parse
+#      in any base, parse as float) names them all, and the case asserts the
+#      CLASSIFICATION rather than a bare rejection — off-allowlist alone was
+#      already red, which is what made the ladder invisible (#854 item 2).
+mcg22_case af 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{   -0.0   \}\}}sm' \
+  fail 'that is a FALSY LITERAL'
+# ag — the same pass at STEP level, on a base-prefixed integer: float() never
+#      sees 0b0, so the classification has to read integers with base
+#      auto-detection rather than one more literal in a list.
+mcg22_case ag 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2\$\{\{ 0b0 \}\}}sm' \
+  fail 'that is a FALSY LITERAL'
+# ah — the pinned condition RESPELLED inside an expression wrapper. `if: X` and
+#      `if: ${{ X }}` are the same condition to Actions, so a spelling-exact
+#      pin reds a workflow that changed nothing; normalising the wrapper is
+#      what makes the pin a claim about the condition instead of its typography.
+#      Semantics-preserving by construction: only a whole-value wrapper whose
+#      interior opens no second one is stripped.
+mcg22_case ah 's{(  scheduled-sweep:.*?)^    if: github.event_name == \x27schedule\x27$}{$1    if: \$\{\{ github.event_name == \x27schedule\x27 \}\}}sm' \
+  pass
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this

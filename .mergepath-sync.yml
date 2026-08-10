@@ -361,9 +361,14 @@ paths:
     type: canonical
     consumers: all
     # Hard-sources scripts/lib/reviewers-helpers.sh (#453) for the
-    # token-derived expected-reviewer allow-list; exits 3 if absent.
+    # token-derived expected-reviewer allow-list; exits 3 if absent. Since
+    # #837 it also hard-sources scripts/lib/feedback-policy-helpers.sh: the
+    # potential-issue count grades findings with the shared coderabbit_tier_of
+    # rather than a private marker grep, so a consumer missing that lib must
+    # error rather than silently count zero blocking findings.
     requires:
       - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
   # #489 CodeRabbit-rate-limit auto-merge disposition gate. agent-review.yml's
   # exit-5 (rate-limited) branch calls this script to decide whether the
   # Codex-failover path may auto-merge. Absent on a consumer it exits 127 and
@@ -614,6 +619,13 @@ paths:
   # check_gh_as_author (#466). Without it propagated, a consumer's
   # check_gh_as_author fails pre-flight with `Missing required file`.
   - path: tests/test_check_no_bare_gh_writes.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/ci/check_workflow_parsers (#889): a PATH-shimmed gh
+  # regression test for the Dependabot current-HEAD check wait. Keep the
+  # test with the parser check so consumers receive the behavioral coverage
+  # rather than only its structural assertions.
+  - path: tests/test_dependabot_auto_merge_check_wait.sh
     type: canonical
     consumers: all
   # Pairs with scripts/ci/check_git_identity_hygiene (#777), the guard
@@ -1242,6 +1254,7 @@ paths:
       - "tests/test_gh_as_reviewer.sh"         # check_gh_as_author
       - "tests/test_gh_wrapper_parallel.sh"    # check_gh_as_author
       - "tests/test_check_no_bare_gh_writes.sh"  # check_gh_as_author (#466)
+      - "tests/test_dependabot_auto_merge_check_wait.sh"  # check_workflow_parsers (#889)
       - "tests/test_git_identity_hygiene.sh"   # check_git_identity_hygiene (#777)
       - "tests/test_op_preflight_check.sh"     # check_op_preflight_contract
       - "tests/test_op_preflight_token_mode.sh"  # check_op_preflight_contract
