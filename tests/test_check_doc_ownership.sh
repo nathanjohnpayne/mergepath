@@ -1912,6 +1912,50 @@ else
   fail "Case 14v2 (U+00A0 decodes) unexpected (rc=$rc): $out"
 fi
 
+# --- Case 14v3: one character, three spellings, one verdict ----------
+# A hub-only doc named with a non-ASCII character is reachable three ways:
+# the character itself, a numeric reference, and a percent-escape. All three
+# are the same destination to a reader, so all three must report.
+#
+# The percent spelling is where the awk implementations used to split.
+# Percent-escapes name BYTES and utf8_of emits whatever unit the running awk
+# counts, so emitting each escaped byte with sprintf("%c") was right on a
+# byte-oriented awk and double-encoded on gawk, which reads the same call as
+# a CODE POINT. That made the verdict depend on which awk ran the check —
+# `%C3%B8` matched `ø.md` under BWK awk and mawk and missed it under gawk.
+# This row is only meaningful when the suite runs under all three.
+OSLASH="$(printf '\303\270')"
+for spelling in "h${OSLASH}b.md" 'h&#248;b.md' 'h%C3%B8b.md'; do
+  set +e
+  out=$(run_with_doc_bodies "$(ENTITY_MANIFEST "docs/agents/h${OSLASH}b.md")" \
+    "docs/agents/shared.md|See [the audit](${spelling}) for details.
+docs/agents/h${OSLASH}b.md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "1" ] && printf '%s\n' "$out" | grep -qF "references the hub-only doc 'docs/agents/h${OSLASH}b.md'"; then
+    pass "Case 14v3: '$spelling' resolves to the same hub-only doc"
+  else
+    fail "Case 14v3 ('$spelling') unexpected (rc=$rc): $out"
+  fi
+done
+
+# The discriminating control: the double-encoded spelling is a DIFFERENT
+# name, and must not match. Without it, a decoder that emitted the
+# double-encoded form for every awk would still pass the rows above by
+# matching itself.
+DOUBLED="$(printf '\303\203\302\270')"
+set +e
+out=$(run_with_doc_bodies "$(ENTITY_MANIFEST "docs/agents/h${DOUBLED}b.md")" \
+  "docs/agents/shared.md|See [the audit](h%C3%B8b.md) for details.
+docs/agents/h${DOUBLED}b.md|# Hub-only machinery")
+rc=$?
+set -e
+if [ "$rc" = "0" ] && ! printf '%s\n' "$out" | grep -q 'references the hub-only doc'; then
+  pass "Case 14v3: the double-encoded name is not what a percent-escape resolves to"
+else
+  fail "Case 14v3 (double-encoded control) unexpected (rc=$rc): $out"
+fi
+
 # --- Case 14w: HTML blocks vs inline HTML (#811) ---------------------
 # § HTML blocks defines seven start conditions. Only those close the
 # surrounding text flow; a line that merely BEGINS with a `<` — inline
