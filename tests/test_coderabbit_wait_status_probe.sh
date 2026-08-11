@@ -1600,12 +1600,28 @@ test_857_aged_pause_reaches_the_resume_path() {
   cls=$(bash -c '. "$1/scripts/phase-4b/lib.sh"; p4b_barrier_class_coderabbit head-sha "$3" "$(cat "$2")"' \
     _ "$ROOT" "$dir/out.json" "$rc" 2>/dev/null || echo PARSE_ERROR)
   # And the resume helper must IDENTIFY the note from this evidence. dry=true,
-  # so nothing is posted; "resume-unidentified" is the pre-fix outcome.
-  resume_gate=$(bash -c '. "$1/scripts/phase-4b/lib.sh"; P4B_CLAIM_DIR="$3" p4b_barrier_maybe_resume owner/repo 999 head-sha rev-bot "$(cat "$2")" true' \
+  # so nothing is posted; "resume-unidentified" is the pre-fix outcome and
+  # "would-resume" is the ONLY outcome that proves identification succeeded.
+  #
+  # Asserted POSITIVELY, on CodeRabbit's finding: every failure token also
+  # differs from "resume-unidentified", so a negative check accepts them all.
+  # This one had teeth missing in both directions — the helper re-reads the PR
+  # timeline for its at-most-once marker, so with the real gh on PATH the call
+  # left the sandbox, failed against a repo named `owner/repo`, and returned
+  # `resume-read-failed`, which passed. A stub serving an EMPTY timeline keeps
+  # the read hermetic and leaves the outcome decided by the identification step
+  # alone: no marker + dry run = would-resume.
+  mkdir -p "$dir/resume-bin"
+  cat >"$dir/resume-bin/gh" <<'RESUME_GH'
+#!/usr/bin/env bash
+printf '[]\n'
+RESUME_GH
+  chmod +x "$dir/resume-bin/gh"
+  resume_gate=$(PATH="$dir/resume-bin:$PATH" bash -c '. "$1/scripts/phase-4b/lib.sh"; P4B_CLAIM_DIR="$3" p4b_barrier_maybe_resume owner/repo 999 head-sha rev-bot "$(cat "$2")" true' \
     _ "$ROOT" "$dir/out.json" "$dir/state/claims" 2>/dev/null || echo HELPER_ERROR)
   if [ "$rc" = "7" ] && [ "$obs" = "paused" ] && [ "$ev_id" = "7925" ] \
      && [ "$ev_fresh" != "MISSING" ] && [ "$cls" = "not-yet" ] \
-     && [ "$resume_gate" != "resume-unidentified" ] && [ "$resume_gate" != "skipped" ] \
+     && [ "$resume_gate" = "would-resume" ] \
      && [ "$(probe_count "$dir")" = "0" ]; then
     pass "#857: an aged pause note is reported anchor-free with its comment id, so the barrier's resume path can key on it"
   else
