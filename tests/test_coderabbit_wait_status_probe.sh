@@ -273,6 +273,25 @@ case "$endpoint" in
         echo "simulated reviews API failure" >&2
         exit 44
         ;;
+      review_during_probe_summary_unreadable)
+        # No head-pinned review object, so head_review_finding_bodies returns
+        # [] and the inline count is 0 — the post-probe emitter then falls
+        # through to the summary-marker read. Record that THIS read happened,
+        # gated on the probe having posted: it is the one fetch that sits
+        # between the emitter's comment scan and its summary-marker read, so
+        # the issues stub can fail exactly that read. (Marking on
+        # pulls/comments does not work: the empty reviews list short-circuits
+        # before it, so that endpoint is never reached and the failure never
+        # arms.)
+        count=0
+        if [ -f "$state_dir/probe-count" ]; then
+          count=$(cat "$state_dir/probe-count")
+        fi
+        if [ "$count" -gt 0 ]; then
+          printf '1\n' >"$state_dir/inline-count-read"
+        fi
+        printf '[]\n'
+        ;;
       probe_finding_predates_head)
         # #814: SHA-pinned evidence that predates the head committer date —
         # the shape a future-dated or metadata-rewritten head produces, and
@@ -483,6 +502,34 @@ case "$endpoint" in
         fi
         if [ "$count" -gt 0 ] && [ "$(fake_now)" -ge 2000000006 ]; then
           printf '[{"id":8803,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"CodeRabbit review completed. See inline findings."}]\n' "$bot" "$reply_time" "$reply_time"
+        else
+          printf '[]\n'
+        fi
+        ;;
+      review_during_probe_summary_unreadable)
+        # Codex P1 on #936. Same shape as review_arrives_during_probe, but the
+        # inline count is ZERO (pulls serves []), so the post-probe emitter
+        # reaches summary_body_has_potential_issue_marker — and the read that
+        # helper makes FAILS. The first post-probe read serves the review
+        # summary (so the comment classifies and the route is entered); every
+        # read after it dies, which is exactly the transient failure landing
+        # between the classification and the summary-marker check.
+        count=0
+        if [ -f "$state_dir/probe-count" ]; then
+          count=$(cat "$state_dir/probe-count")
+        fi
+        if [ "$count" -gt 0 ] && [ "$(fake_now)" -ge 2000000006 ]; then
+          # Fail the issues read that FOLLOWS the inline-count read, not an
+          # nth read: the inline count is the only pulls fetch on this route,
+          # so the marker below pins the failure to the summary-marker read
+          # exactly. Failing by count instead landed on the probe REPLY poll
+          # and the run timed out (rc 4) before ever reaching the emitter —
+          # green for the wrong reason.
+          if [ -f "$state_dir/inline-count-read" ]; then
+            echo "simulated issue-comments API failure" >&2
+            exit 44
+          fi
+          printf '[{"id":8804,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nCodeRabbit review completed."}]\n' "$bot" "$reply_time" "$reply_time"
         else
           printf '[]\n'
         fi
@@ -828,6 +875,33 @@ test_review_during_probe_wait_emits_findings() {
     fail "review during probe wait: review.endpoint=$review_endpoint, expected issues"
   else
     pass "real review during status-probe wait emits findings instead of timeout"
+  fi
+}
+
+test_review_during_probe_wait_unreadable_summary_is_infra() {
+  # Codex P1 on #936. `summary_body_has_potential_issue_marker` returns THREE
+  # states — 0 marker present, 1 absent, 3 the summary could not be READ — and
+  # its contract is that every call site honours all three. This route read it
+  # as an `elif` condition, which collapses rc 3 into rc 1 and falls straight
+  # through to `cleared`: a dead API reading as a clean summary, on the one
+  # verdict path reached after the status-probe wait rather than from the poll
+  # loop. The polling `review` arm and the StatusContext fast path already had
+  # the three-way form; this site did not.
+  #
+  # Zero inline findings, so the emitter reaches the summary read; the read
+  # then fails. Must be rc 3 (infra), never rc 0.
+  local dir rc status
+  dir=$(make_case "review-during-probe-unreadable-summary" 1 true 6 2)
+  rc=$(run_case "$dir" review_during_probe_summary_unreadable)
+  status=$(jq -r '.status // "none"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "0" ] || [ "$status" = "cleared" ]; then
+    fail "#936: FALSE-CLEARED after the post-probe summary read failed (rc=$rc status=$status); err=$(tail -3 "$dir/err.log")"
+  elif [ "$rc" != "3" ]; then
+    fail "#936: expected exit 3 (infra) from the post-probe summary read failure, got $rc; err=$(tail -3 "$dir/err.log")"
+  elif ! grep -q 'refusing to report a clearance' "$dir/err.log"; then
+    fail "#936: expected the fail-closed summary-read message; err=$(tail -3 "$dir/err.log")"
+  else
+    pass "#936: an unreadable summary on the post-probe verdict path is infra rc 3, never a clearance"
   fi
 }
 
@@ -2039,6 +2113,7 @@ test_rate_limit_stalled_does_not_probe
 test_probe_post_failure_stays_timeout_advisory
 test_probe_reply_poll_failure_stays_timeout_advisory
 test_review_during_probe_wait_emits_findings
+test_review_during_probe_wait_unreadable_summary_is_infra
 test_535_1_summary_body_marker_emits_findings
 test_535_2_head_pinned_review_selection_emits_findings
 test_probe_no_comment_is_not_yet

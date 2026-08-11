@@ -2208,7 +2208,7 @@ find_status_probe_reply() {
 }
 
 emit_terminal_review_after_probe_if_present() {
-  local latest class potential_issues review_json
+  local latest class potential_issues review_json summary_marker_rc
   latest=$(scan_latest_comment_best_effort)
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
     return 0
@@ -2225,12 +2225,30 @@ emit_terminal_review_after_probe_if_present() {
       if [ "$potential_issues" -gt 0 ]; then
         log "CodeRabbit review landed during status-probe wait with $potential_issues blocking (p0/p1) inline finding(s) — emitting findings (exit 2)"
         emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
-      elif summary_body_has_potential_issue_marker; then
-        log "CodeRabbit review landed during status-probe wait with 0 blocking inline findings but a blocking marker in the PR-level summary body — emitting findings (exit 2)"
-        emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
       fi
-      log "CodeRabbit review landed during status-probe wait with no high-severity markers — emitting cleared (exit 0)"
-      emit_json_and_exit "cleared" 0 "$review_json" 0
+      # Three-way, not a boolean, exactly as the polling `review` arm reads it.
+      # An `elif summary_body_has_potential_issue_marker` collapses the
+      # helper's rc 3 (summary UNREADABLE) into rc 1 (no marker) and falls
+      # straight through to `cleared` — a dead API reading as a clean summary,
+      # on the one route that emits a verdict after the probe wait rather than
+      # from the poll loop (Codex P1 on #936). The helper's contract is that
+      # ALL THREE states are honoured at every call site; this was the site
+      # that did not.
+      summary_marker_rc=0
+      summary_body_has_potential_issue_marker || summary_marker_rc=$?
+      case "$summary_marker_rc" in
+        0)
+          log "CodeRabbit review landed during status-probe wait with 0 blocking inline findings but a blocking marker in the PR-level summary body — emitting findings (exit 2)"
+          emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
+          ;;
+        1)
+          log "CodeRabbit review landed during status-probe wait with no high-severity markers — emitting cleared (exit 0)"
+          emit_json_and_exit "cleared" 0 "$review_json" 0
+          ;;
+        *)
+          die 3 "could not read the PR-level summary to rule out a summary-only blocking marker on $HEAD_SHA — refusing to report a clearance"
+          ;;
+      esac
       ;;
     *)
       log "latest CodeRabbit comment after status-probe wait is class=$class; continuing timeout"
