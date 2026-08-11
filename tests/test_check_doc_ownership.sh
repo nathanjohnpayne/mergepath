@@ -2840,17 +2840,65 @@ run_cm_matrix expect_not_rendered "Case 15q" \
 #
 # Every row was measured against BOTH renderers — markdown-it-py 4.2.0 and
 # cmark-gfm through GitHub's own rendering API — and they agree row for row.
+#
+# The base is a COLUMN count, so the run that supplies it is measured in
+# columns and a tab advances to the next tab stop. Accepting only literal
+# spaces made the whole exception inert wherever the indentation was spelled
+# with a tab, which is the pair of tab rows below.
 run_cm_matrix expect_rendered "Case 15r" \
   'four columns after the quote closes is outer item prose|- para\n    > - # inner\n\n    See [the audit](hub.md)' \
   'a marked blank keeps the quote and its inner item alive|- para\n    > - # inner\n    >\n    >     See [the audit](hub.md)' \
-  'the allowance follows a wider item too|-   para\n     > - # inner\n\n       See [the audit](hub.md)'
+  'the allowance follows a wider item too|-   para\n     > - # inner\n\n       See [the audit](hub.md)' \
+  'a tab-spelled prefix, one column short of the threshold|-\tpara\n\t> - # inner\n\n\t   See [the audit](hub.md)'
 
 run_cm_matrix expect_not_rendered "Case 15r" \
+  'a tab-spelled container prefix counts in columns too|-\tpara\n\t> - # inner\n\n\t    See [the audit](hub.md)' \
+  'and the same with no inner list to tag|-\tpara\n\t> quote\n\n\t    See [the audit](hub.md)' \
+  'a tab-indented item with no quote at all (control)|-\tpara\n\n\t    See [the audit](hub.md)' \
   'a quote four columns inside an item is still a quote|- para\n    > - # inner\n\n      See [the audit](hub.md)' \
   'and so is one with no inner list to tag|- para\n    > quote\n\n      See [the audit](hub.md)' \
   'with NO container, four spaces is indented code (control)|    > quote\n\n    See [the audit](hub.md)' \
   'and still is when the line below it is deeper (control)|    > quote\n\n      See [the audit](hub.md)' \
   'three spaces at top level is a real quote (control)|   > quote\n\n    See [the audit](hub.md)'
+
+# --- Case 15t: HTML-block separators are ASCII, and the ORACLE IS WRONG HERE ---
+# The same locale-dependent `[[:space:]]` defect as Case 15s below, in the
+# HTML-block conditions. § HTML blocks admits a space, a tab, a line ending,
+# `>` or `/>` after the tag name, and under gawk in a UTF-8 locale
+# `[[:space:]]` also matched Unicode separators. `<div<U+2003>>governance`
+# therefore opened a condition-6 block under gawk and stayed prose under BWK
+# awk and mawk, so the same document produced two different ownership verdicts.
+#
+# THESE ROWS DELIBERATELY BYPASS THE REFERENCE-RENDERER CROSS-CHECK, and that
+# is the whole reason they are written out longhand instead of going through
+# run_cm_matrix. This is the first place found where the two renderers
+# themselves disagree on a row the checker has to decide:
+#
+#   markdown-it-py 4.2.0  opens the HTML block on U+2003  -> link NOT rendered
+#   cmark-gfm (GitHub)    does not                        -> link RENDERED
+#
+# Measured on all three inputs through GitHub POST /markdown, mode gfm. The
+# rule this PR adopted — agree with the renderer readers actually use, because
+# the checker exists to predict where a reader following a link lands —
+# settles it for cmark-gfm, so the checker is ASCII-only and these rows assert
+# the cmark-gfm verdict. Running them through the oracle would fail them
+# against markdown-it-py, which is a disagreement about the target parser and
+# not a defect in either the rows or the checker.
+#
+# This is the exemption #929 item 25 predicted would eventually be needed. It
+# is confined to the rows where the divergence is measured, and every other row
+# in this file still goes through the oracle. The rows run under the UTF-8
+# locale pin below, alongside Case 15s, because they turn on the identical gawk
+# ctype behaviour and would be equally inert under LC_ALL=C.
+cm_15t() {
+  local label="$1" body="$2" verdict="$3"
+  local out rc
+  set +e
+  out=$(run_truth_body "$body")
+  rc=$?
+  set -e
+  "$verdict" "Case 15t: $label" "$rc" "$out"
+}
 
 # --- Case 15s: the marker run is spaces and tabs, not [[:space:]] ---
 # § List items allows only spaces and tabs after a list marker, and
@@ -2871,14 +2919,64 @@ run_cm_matrix expect_not_rendered "Case 15r" \
 # continuation of an ordinary paragraph and the link does. The tab row is the
 # control on the other side — a tab IS a valid marker run and must keep
 # behaving like one.
-run_cm_matrix expect_rendered "Case 15s" \
-  'an em space after a hyphen is not a marker run|-\xe2\x80\x83# Heading\n      See [the audit](hub.md)' \
-  'nor after a star|*\xe2\x80\x83# Heading\n      See [the audit](hub.md)' \
-  'nor after an ordered marker|1.\xe2\x80\x83# Heading\n      See [the audit](hub.md)' \
-  'a tab after the marker IS a run and sets its column (control)|-\t# Heading\n      See [the audit](hub.md)'
+#
+# THESE ROWS ONLY TEST ANYTHING UNDER A UTF-8 LOCALE. The behaviour they pin is
+# gawk reading `[[:space:]]` against the ctype table of the running locale, and
+# under `LC_ALL=C` gawk sees the em space as three separate bytes and matches
+# none of them. Measured: piping U+2003 to gawk reports `length=3
+# space_match=0` under `LC_ALL=C` and `length=1 space_match=1` under
+# `en_US.UTF-8`. Left to the ambient locale the rows would pass in C with the
+# defect fully restored — verified by re-running the revert mutation under
+# `LC_ALL=C` with gawk, where it kills nothing and the suite is green. So the
+# locale is pinned for the duration of this case, and when the runner offers no
+# UTF-8 locale at all the case is SKIPPED WITH THE REASON NAMED rather than run
+# vacuously green, the same contract the reference-renderer gate above uses.
+CM_UTF8_LOCALE=""
+for cand in C.UTF-8 en_US.UTF-8 C.utf8 en_US.utf8; do
+  if locale -a 2>/dev/null | grep -qxF "$cand"; then CM_UTF8_LOCALE="$cand"; break; fi
+done
+if [ -z "$CM_UTF8_LOCALE" ]; then
+  CM_UTF8_LOCALE=$(locale -a 2>/dev/null | grep -iE '\.(utf-?8)$' | head -1)
+fi
+if [ -z "$CM_UTF8_LOCALE" ]; then
+  echo "NOTE: Cases 15s and 15t SKIPPED — no UTF-8 locale on this runner, so" \
+       "gawk cannot match U+2003 with [[:space:]] and these rows would pass" \
+       "vacuously." >&2
+else
+  cm_saved_lc_all="${LC_ALL-}"
+  cm_saved_lc_ctype="${LC_CTYPE-}"
+  cm_saved_lang="${LANG-}"
+  export LC_ALL="$CM_UTF8_LOCALE" LC_CTYPE="$CM_UTF8_LOCALE" LANG="$CM_UTF8_LOCALE"
 
-run_cm_matrix expect_not_rendered "Case 15s" \
-  'a plain space after the marker is a run, so six columns is item code|- # Heading\n      See [the audit](hub.md)'
+  run_cm_matrix expect_rendered "Case 15s" \
+    'an em space after a hyphen is not a marker run|-\xe2\x80\x83# Heading\n      See [the audit](hub.md)' \
+    'nor after a star|*\xe2\x80\x83# Heading\n      See [the audit](hub.md)' \
+    'nor after an ordered marker|1.\xe2\x80\x83# Heading\n      See [the audit](hub.md)' \
+    'a tab after the marker IS a run and sets its column (control)|-\t# Heading\n      See [the audit](hub.md)'
+
+  run_cm_matrix expect_not_rendered "Case 15s" \
+    'a plain space after the marker is a run, so six columns is item code|- # Heading\n      See [the audit](hub.md)'
+
+  # Case 15t rides the same pin: its rows turn on the identical gawk ctype
+  # behaviour, so under LC_ALL=C they would be just as inert.
+  cm_15t 'an em space after a tag name is not an HTML-block separator' \
+    '<div\xe2\x80\x83>governance\n    See [the audit](hub.md)' expect_rendered
+  cm_15t 'nor after a condition-1 tag name' \
+    '<pre\xe2\x80\x83>governance\n    See [the audit](hub.md)' expect_rendered
+  cm_15t 'nor before an attribute' \
+    '<div\xe2\x80\x83class=x>\n    See [the audit](hub.md)' expect_rendered
+  cm_15t 'a plain space IS a separator (control)' \
+    '<div >governance\n    See [the audit](hub.md)' expect_not_rendered
+  cm_15t 'and so is a tab (control)' \
+    '<div\t>governance\n    See [the audit](hub.md)' expect_not_rendered
+
+  # Restored rather than left set: every case after this one is tuned to the
+  # ambient locale, and several turn on whether the running awk counts bytes or
+  # code points.
+  if [ -n "$cm_saved_lc_all" ]; then export LC_ALL="$cm_saved_lc_all"; else unset LC_ALL; fi
+  if [ -n "$cm_saved_lc_ctype" ]; then export LC_CTYPE="$cm_saved_lc_ctype"; else unset LC_CTYPE; fi
+  if [ -n "$cm_saved_lang" ]; then export LANG="$cm_saved_lang"; else unset LANG; fi
+fi
 
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between

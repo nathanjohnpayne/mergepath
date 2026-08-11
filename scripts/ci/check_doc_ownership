@@ -369,10 +369,19 @@ mp_markdown_renderable_text() {
     # relaxation to any ASCII letter: treating a lowercase `<!doctype` line
     # as prose keeps a following continuation link VISIBLE to the scan
     # instead of silently hiding it.
+    #
+    # Every separator below is `[ \t]` and NOT `[[:space:]]`, for the reason
+    # LIST_MARKER carries the same spelling: the HTML-block grammar admits a
+    # space, a tab, a line ending, `>` or `/>` after the tag name, and under
+    # gawk in a UTF-8 locale `[[:space:]]` also matches Unicode separators
+    # that BWK awk and mawk do not. `<div<U+2003>>governance` therefore opened
+    # a condition-6 block under gawk and stayed prose under the other two, so
+    # the same document produced different ownership verdicts depending on
+    # which supported awk CI happened to select.
     function opens_html_block(s, flow_open,   low, rest, name, after) {
       if (substr(s, 1, 1) != "<") return 0
       low = tolower(s)
-      if (low ~ /^<(pre|script|style|textarea)([[:space:]>]|$)/) return 1
+      if (low ~ /^<(pre|script|style|textarea)([ \t>]|$)/) return 1
       if (substr(s, 1, 4) == "<!--") return 1
       if (substr(s, 1, 2) == "<?") return 1
       if (substr(s, 1, 9) == "<![CDATA[") return 1
@@ -382,13 +391,13 @@ mp_markdown_renderable_text() {
         name = tolower(substr(rest, 1, RLENGTH))
         after = substr(rest, RLENGTH + 1)
         if (index(BLOCK_TAGS, " " name " ") > 0 \
-            && (after == "" || after ~ /^[[:space:]>]/ || substr(after, 1, 2) == "/>")) {
+            && (after == "" || after ~ /^[ \t>]/ || substr(after, 1, 2) == "/>")) {
           return 1
         }
       }
       if (flow_open) return 0
       if (substr(s, 1, 2) != "</" \
-          && low ~ /^<(pre|script|style|textarea)([[:space:]>]|\/|$)/) return 0
+          && low ~ /^<(pre|script|style|textarea)([ \t>]|\/|$)/) return 0
       if (s ~ OPEN_TAG_ONLY || s ~ CLOSE_TAG_ONLY) return 1
       return 0
     }
@@ -572,13 +581,26 @@ mp_markdown_renderable_text() {
     # quote did not take it down with it; the stale frame raised the code
     # threshold and a six-column link was reported although both renderers
     # render it as indented code in the OUTER item.
-    function quote_depth(s, base,   d, i, run, eaten) {
+    function quote_depth(s, base,   d, i, run, eaten, ch) {
       d = 0
       i = 1
       # Container indentation first, and only as much of it as is actually
       # there — a line may be dedented below `base` and still open a quote.
+      #
+      # `base` is a COLUMN count, so the run that supplies it is measured in
+      # columns too and a tab advances to the next tab stop rather than by one.
+      # Accepting only literal spaces made the whole exception inert wherever
+      # the indentation was spelled with a tab: under `-<TAB>para`, the line
+      # `<TAB>> - # inner` consumed no prefix at all, so its `>` was never
+      # reached, the inner frame was tagged at quote depth zero, and it
+      # outlived the quote exactly as it did before the base existed.
       eaten = 0
-      while (eaten < base && substr(s, i, 1) == " ") { eaten++; i++ }
+      while (eaten < base) {
+        ch = substr(s, i, 1)
+        if (ch == " ") { eaten++; i++ }
+        else if (ch == "\t") { eaten += tab_stop_advance(eaten); i++ }
+        else break
+      }
       while (i <= length(s)) {
         # At most three spaces may precede a marker; a fourth is indentation,
         # which makes the line content rather than a deeper quote.
