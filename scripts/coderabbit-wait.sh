@@ -2683,6 +2683,50 @@ probe_emit_verdict() {
         log "probe: CodeRabbit has reported on $HEAD_SHA (run complete per the per-SHA status; no summary-level marker)"
         emit_json_and_exit "reported" 0 "$review" 0
       fi
+      # #857 item 1, review-object arm (Phase 4b P1). The anchor-free pause
+      # read below covers only the NO-review-object branch, so a durable pause
+      # note that predates a HEAD-pinned run is invisible here: the anchored
+      # scan finds nothing at-or-after the run, `newest_class` is empty, and
+      # the probe emits `awaiting-summary` with the review OBJECT as evidence.
+      # p4b_barrier_maybe_resume gates on observed=paused and keys its
+      # at-most-once marker on the pause note's comment id, so neither is
+      # reachable from that emission — the barrier requests a review from a
+      # still-paused bot and waits out its budget, which is the exact failure
+      # item 1 exists to close. The ordering is not hypothetical: #852 showed a
+      # summarize comment whose last edit PREDATES this head's review objects
+      # and was never refreshed; a pause stanza in that slot behaves the same.
+      #
+      # Placed AFTER the item-2 terminal deliberately. A per-SHA success
+      # correlated to this run proves CodeRabbit ran on THIS head after the
+      # note was written — an explicit `@coderabbitai review` still runs while
+      # auto-review is paused — so the completed run is the stronger claim and
+      # keeps winning. Declining a demonstrably completed head on an older note
+      # would be the ancient-notice deadlock the anchored triage exists to
+      # prevent.
+      #
+      # Gated on `newest_class` empty for the same reason the terminal is: any
+      # notice at-or-after the run already names the observed state through
+      # PROBE_OBSERVED, including a pause, and that anchored reading is the
+      # more current one.
+      #
+      # Fail direction: strictly additive recovery. Today this state escalates
+      # after the full budget with no resume attempted; with this arm it
+      # escalates after the full budget having attempted the one resume the
+      # #847 recovery is bounded to. Nothing that already opened stops opening.
+      if [ -z "$newest_class" ]; then
+        summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
+          || die 3 "failed to select the CodeRabbit summary comment for the pause re-read"
+        if [ -n "$summary" ]; then
+          sbody=$(printf '%s' "$summary" | base64 --decode | jq -r '.body')
+          if [ "$(classify_comment "$sbody")" = "paused" ]; then
+            log "probe: no notice after the run on $HEAD_SHA, but the anchor-free summary is a PAUSE — reporting paused with the note as evidence so the resume path is reachable (#857)"
+            PROBE_CONTEXT_STATE=""
+            PROBE_CONTEXT_UPDATED_AT=""
+            sjson=$(printf '%s' "$summary" | base64 --decode | jq -r '.json')
+            probe_not_yet "paused" "$sjson"
+          fi
+        fi
+      fi
       log "probe: review object on $HEAD_SHA but no terminal summary yet (newest=${newest_class:-none}, context_state=${PROBE_CONTEXT_STATE:-unsampled}, context_updated_at=${PROBE_CONTEXT_UPDATED_AT:-unsampled})"
       probe_not_yet "$PROBE_OBSERVED" "$review"
     done

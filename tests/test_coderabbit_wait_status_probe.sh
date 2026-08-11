@@ -295,13 +295,17 @@ case "$endpoint" in
         # the review it is credited to.
         printf '[{"id":9961,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
-      probe_run_complete_stale_stanza|probe_run_complete_summary_precedes_object)
+      probe_run_complete_stale_stanza|probe_run_complete_summary_precedes_object|probe_run_pause_precedes_object)
         # #857 item 2, the live #852 shape: a HEAD-pinned review RUN at
         # reply_time whose PR-level summary was last touched BEFORE it and
         # never refreshed afterwards, so no comment at-or-after the run ever
         # classifies as a review summary and the publication-completion rule
         # can never be satisfied. The per-SHA status (driven by
         # CODERABBIT_TEST_STATUS_TIME) is what says the run ENDED.
+        #
+        # probe_run_pause_precedes_object reuses the same run object for the
+        # item-1 review-object arm: same ordering, but the stanza that predates
+        # the run is a PAUSE rather than a rate limit.
         printf '[{"id":9965,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
       intermediate_review_head_pin)
@@ -429,6 +433,17 @@ case "$endpoint" in
         # become the summary the rule waits for. Marker-free, so once the
         # per-SHA status says the run ended the verdict is a clean report.
         printf '[{"id":7940,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n> [!WARNING]\\n> ## Review limit reached\\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->"}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      probe_run_pause_precedes_object)
+        # #857 item 1, review-object arm (Phase 4b P1 on this PR). Same
+        # ordering as the stale-stanza fixture above — the summarize comment's
+        # last edit predates the HEAD-pinned run and is never refreshed — but
+        # the stanza is a PAUSE. `newest_class` is therefore empty, so the
+        # anchored triage sees nothing, and before this arm the probe emitted
+        # `awaiting-summary` with the review OBJECT as evidence: the barrier's
+        # #847 resume gates on observed=paused and keys its at-most-once marker
+        # on the NOTE's comment id, so neither was reachable.
+        printf '[{"id":7942,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n<!-- This is an auto-generated comment: review paused by coderabbit.ai -->\\n> [!NOTE]\\n> ## Reviews paused\\n<!-- end of auto-generated comment: review paused by coderabbit.ai -->"}]\n' "$bot" "$head_time" "$head_time"
         ;;
       probe_run_complete_summary_precedes_object)
         # #857 third instance (comment 5156584647), observed on #852 at 08:18Z:
@@ -1719,6 +1734,65 @@ test_857_completed_run_without_a_following_summary() {
   fi
 }
 
+test_857_pause_predating_a_run_reaches_the_resume_path() {
+  # #857 item 1, review-object arm. Phase 4b P1 on this PR: the anchor-free
+  # pause read only covered the NO-review-object branch, so a durable pause
+  # note that predates a HEAD-pinned run stayed invisible — the anchored scan
+  # finds nothing at-or-after the run, and the probe emitted `awaiting-summary`
+  # carrying the review OBJECT. p4b_barrier_maybe_resume gates on
+  # observed=paused AND keys its at-most-once marker on the note's comment id,
+  # so from that emission the recovery could not fire at all.
+  #
+  # Direction 1 — no correlated success: report the pause, with the NOTE as
+  # evidence, so both halves of the resume gate are satisfied.
+  local dir rc obs ev_id cls resume_gate
+  dir=$(make_case probe-857-pause-before-run 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(run_probe_case "$dir" probe_run_pause_precedes_object)
+  obs=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ev_id=$(jq -r '.review.id // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  cls=$(bash -c '. "$1/scripts/phase-4b/lib.sh"; p4b_barrier_class_coderabbit head-sha "$3" "$(cat "$2")"' \
+    _ "$ROOT" "$dir/out.json" "$rc" 2>/dev/null || echo PARSE_ERROR)
+  # Same hermetic stub as test_857_aged_pause_reaches_the_resume_path: an empty
+  # timeline leaves the outcome decided by identification alone.
+  mkdir -p "$dir/resume-bin"
+  cat >"$dir/resume-bin/gh" <<'RESUME_GH2'
+#!/usr/bin/env bash
+printf '[]\n'
+RESUME_GH2
+  chmod +x "$dir/resume-bin/gh"
+  resume_gate=$(PATH="$dir/resume-bin:$PATH" bash -c '. "$1/scripts/phase-4b/lib.sh"; P4B_CLAIM_DIR="$3" p4b_barrier_maybe_resume owner/repo 999 head-sha rev-bot "$(cat "$2")" true' \
+    _ "$ROOT" "$dir/out.json" "$dir/state/claims" 2>/dev/null || echo HELPER_ERROR)
+  if [ "$rc" = "7" ] && [ "$obs" = "paused" ] && [ "$ev_id" = "7942" ] \
+     && [ "$cls" = "not-yet" ] && [ "$resume_gate" = "would-resume" ] \
+     && [ "$(probe_count "$dir")" = "0" ]; then
+    pass "#857: a pause note predating a HEAD-pinned run is reported anchor-free, so the resume path is reachable from the review-object branch too"
+  else
+    fail "#857 pause-before-run → rc=$rc observed=$obs evidence_id=$ev_id class=$cls resume=$resume_gate"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+
+  # Direction 2 — the same fixture WITH a per-SHA success correlated to the
+  # run. The completed run is the stronger claim: an explicit
+  # `@coderabbitai review` runs while auto-review is paused, so a run that
+  # ENDED on this head after the note was written must keep reporting.
+  # Declining it on the older note would be the ancient-notice deadlock the
+  # anchored triage exists to prevent, so the item-2 terminal keeps winning.
+  local dir2 rc2 status2 obs2
+  dir2=$(make_case probe-857-pause-before-run-success 600 true 30 3 2)
+  enable_trust_status_context "$dir2"
+  rc2=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
+    run_probe_case "$dir2" probe_run_pause_precedes_object)
+  status2=$(jq -r '.status' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
+  obs2=$(jq -r '.probe.observed // "MISSING"' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc2" = "0" ] && [ "$status2" = "reported" ] && [ "$obs2" = "terminal" ]; then
+    pass "#857: a run that ENDED after the pause note still reports — the new arm does not deadlock a completed head on an older pause"
+  else
+    fail "#857 pause-before-run + correlated success → rc=$rc2 status=$status2 observed=$obs2 (expected 0/reported/terminal)"
+    sed 's/^/      /' "$dir2/err.log" >&2 || true
+  fi
+}
+
 test_851_review_object_premerge_shares_strip() {
   # The review-object rc-2 site and Site E share one blocking-marker helper.
   # A head-pinned review whose summary carries only a pre-merge hygiene row
@@ -2179,6 +2253,7 @@ test_probe_summary_lagging_head_review_is_not_yet
 test_869_probe_awaiting_summary_context_state
 test_869_probe_summary_landing_mid_probe_is_scanned
 test_857_aged_pause_reaches_the_resume_path
+test_857_pause_predating_a_run_reaches_the_resume_path
 test_857_completed_run_without_a_following_summary
 test_857_summary_selector_unit
 test_857_completion_timestamp_conjunct_unit
