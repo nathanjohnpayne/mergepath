@@ -1669,6 +1669,50 @@ fi  # end REQUIRE_CI_GREEN
 #
 # Only a Codex-bot signal, so compute it only when codex.enabled=true;
 # leaves disabled repos byte-identical in behavior.
+
+# BEGIN codex_block_marker_selector
+# Select the newest account-/connection-level BLOCK marker on this head, as
+# `{reason, created_at}` or `null` (#722).
+#
+# Extracted verbatim from its single call site so the selection is assertable
+# without driving the whole gate (#839): the barrier's escalate-instead-of-wait
+# routing is only as good as this predicate, and until now nothing exercised it
+# — the coverage was a structural grep for the `exit 2` guard, which cannot
+# tell whether the marker that reaches it is ever found. Same
+# extract-by-sentinel pattern as crw_select_head_pinned_review_run in
+# scripts/coderabbit-wait.sh.
+#
+# Pure: jq over the passed strings only, no globals and no I/O.
+#
+# Three filters, each load-bearing:
+#   author        only the Codex connector bot's own comments say anything
+#                 about the Codex account.
+#   freshness     at-or-after the caller's threshold, so a marker from a prior
+#                 head cannot resurface as a live block.
+#   non-verdict   a comment leading with the `Codex Review:` header is a
+#                 REVIEW; Codex quoting its own limits inside one is not a
+#                 block. Mirrors audit-codex-latency.sh's precedence.
+#
+# crc_select_codex_block_marker <issue-comments-json> <bot-login> <after-iso> <usage-re> <not-connected-re>
+crc_select_codex_block_marker() {
+  echo "${1:-[]}" | jq -c \
+    --arg bot "${2:-}" --arg after "${3:-}" \
+    --arg usage_re "${4:-}" --arg nc_re "${5:-}" '
+    [ .[]
+      | select(.user.login == $bot)
+      | select(.created_at >= $after)
+      | select(((.body // "") | test("(?im)^\\s*codex review:")) | not)
+      | ( if ((.body // "") | test($usage_re; "i")) then "usage_limit"
+          elif ((.body // "") | test($nc_re; "i")) then "not_connected"
+          else null end ) as $reason
+      | select($reason != null)
+      | { reason: $reason, created_at: .created_at }
+    ]
+    | max_by(.created_at) // null
+  '
+}
+# END codex_block_marker_selector
+
 CODEX_HEAD_VERDICT_TIME=""
 CODEX_HEAD_VERDICT_ANY_TIME=""
 CODEX_CARRYFORWARD_VERDICT_TIME=""
@@ -1739,22 +1783,8 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   # failure message, never into the clearance decision. Shares the regexes
   # with the live trigger script via scripts/lib/codex-failure-markers.sh.
   if [ "$CODEX_FAILURE_MARKERS_OK" = "true" ]; then
-    CODEX_BLOCKED_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
-      --arg bot "$BOT_LOGIN" --arg after "$REACTION_THRESHOLD" \
-      --arg usage_re "$CODEX_USAGE_LIMIT_MARKER_RE" \
-      --arg nc_re "$CODEX_NOT_CONNECTED_MARKER_RE" '
-      [ .[]
-        | select(.user.login == $bot)
-        | select(.created_at >= $after)
-        | select(((.body // "") | test("(?im)^\\s*codex review:")) | not)
-        | ( if ((.body // "") | test($usage_re; "i")) then "usage_limit"
-            elif ((.body // "") | test($nc_re; "i")) then "not_connected"
-            else null end ) as $reason
-        | select($reason != null)
-        | { reason: $reason, created_at: .created_at }
-      ]
-      | max_by(.created_at) // null
-    ')
+    CODEX_BLOCKED_JSON=$(crc_select_codex_block_marker "$ISSUE_COMMENTS_JSON" "$BOT_LOGIN" \
+      "$REACTION_THRESHOLD" "$CODEX_USAGE_LIMIT_MARKER_RE" "$CODEX_NOT_CONNECTED_MARKER_RE")
     CODEX_BLOCKED_REASON=$(echo "$CODEX_BLOCKED_JSON" | jq -r 'if . == null then "" else .reason end')
     CODEX_BLOCKED_TIME=$(echo "$CODEX_BLOCKED_JSON" | jq -r 'if . == null then "" else .created_at end')
     if [ -n "$CODEX_BLOCKED_REASON" ]; then
