@@ -153,7 +153,7 @@ if [ "$1" = "api" ]; then
 
   case "$endpoint" in
     graphql)
-      if printf '%s' "$q" | grep -q 'PullRequestReviewThread'; then
+      if grep -q 'PullRequestReviewThread' <<<"$q"; then
         f="FIXTURE_TCOMMENTS_${node_id}_${cursor}"
         cat "${!f:-/dev/null}"
         exit 0
@@ -1411,7 +1411,7 @@ ACK_FINGERPRINT=$(printf '%s' "$ACK_TOKEN" | awk '{print $3}' | tr -d ']')
 
 echo
 echo "--- Test 24a (#886): the gate prints a head + finding-set pinned token"
-if printf '%s' "$ACK_TOKEN" | grep -q "^\[mergepath-summary-ack: $HEAD_SHA [0-9a-f]\{12\}\]$"; then
+if grep -q "^\[mergepath-summary-ack: $HEAD_SHA [0-9a-f]\{12\}\]$" <<<"$ACK_TOKEN"; then
   pass "printed ack token carries the head AND a finding-set fingerprint"
 else
   fail "expected '[mergepath-summary-ack: $HEAD_SHA <12 hex>]'; got '$ACK_TOKEN'"
@@ -1742,8 +1742,8 @@ fi
 # ---------------------------------------------------------------------------
 echo
 echo "--- Test 31b (#886): the printed token is never at column 0"
-if printf '%s\n' "$ACK_PROBE_OUT" | grep -q "mergepath-summary-ack" \
-    && ! printf '%s\n' "$ACK_PROBE_OUT" | grep -q "^\[mergepath-summary-ack:"; then
+if grep -q "mergepath-summary-ack" <<<"$ACK_PROBE_OUT" \
+    && ! grep -q "^\[mergepath-summary-ack:" <<<"$ACK_PROBE_OUT"; then
   pass "gate output renders the ack token indented, never leading a line"
 else
   fail "the gate must print the ack token, and must never print it at column 0"
@@ -2800,8 +2800,8 @@ EVENT_JOB=$(awk '
 # later test, instead of as this test failing (CodeRabbit, #886).
 EVENT_FLAG=$(printf '%s\n' "$EVENT_JOB" | grep -c '^ *REQUIRE_REVIEW_SUMMARY:' || true)
 if [ "$EVENT_FLAG" -eq 1 ] \
-    && printf '%s\n' "$EVENT_JOB" | grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' \
-    && ! printf '%s\n' "$EVENT_JOB" | grep '^ *REQUIRE_REVIEW_SUMMARY:' | grep -q 'github.event_name'; then
+    && grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' <<<"$EVENT_JOB" \
+    && ! grep '^ *REQUIRE_REVIEW_SUMMARY:' <<<"$EVENT_JOB" | grep -q 'github.event_name'; then
   pass "the event-driven job sets the hold flag once, unconditionally"
 else
   fail "expected exactly one unconditional REQUIRE_REVIEW_SUMMARY: \"true\" in the event-driven job (found $EVENT_FLAG setting(s))"
@@ -2846,7 +2846,7 @@ SWEEP_JOB=$(awk '
   /^  scheduled-sweep:/ { in_job = 1 }
   in_job { print }
 ' "$ROOT/.github/workflows/coderabbit-severity-gate.yml")
-if printf '%s\n' "$SWEEP_JOB" | grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' \
+if grep -Fq 'REQUIRE_REVIEW_SUMMARY: "true"' <<<"$SWEEP_JOB" \
     && grep -Fq 'if [ "$rc" -eq 3 ]; then' "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
     && grep -Fq "skipping this publication so the review run's verdict stands" "$ROOT/.github/workflows/coderabbit-severity-gate.yml" \
     && grep -Fq "holding this run non-green until it does" "$ROOT/.github/workflows/coderabbit-severity-gate.yml"; then
@@ -3028,12 +3028,12 @@ FP_FN=$(awk '
 # fingerprint function stripped of its fail-closed reads counts ZERO, and the
 # bare form would abort the suite rather than fail this assertion.
 FP_FAILCLOSED=$(printf '%s\n' "$FP_FN" | grep -c '|| return 1' || true)
-if printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/issues/$1/comments' \
-    && printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/pulls/$1/reviews' \
-    && printf '%s\n' "$FP_FN" | grep -Fq 'repos/$REPO/pulls/$1/comments' \
-    && printf '%s\n' "$FP_FN" | grep -Fq 'reviewThreads(first: 100, after: $endCursor)' \
-    && printf '%s\n' "$FP_FN" | grep -Fq 'nodes { id isResolved }' \
-    && printf '%s\n' "$FP_FN" | grep -Fq "printf '%s\\035%s\\035%s\\035%s'" \
+if grep -Fq 'repos/$REPO/issues/$1/comments' <<<"$FP_FN" \
+    && grep -Fq 'repos/$REPO/pulls/$1/reviews' <<<"$FP_FN" \
+    && grep -Fq 'repos/$REPO/pulls/$1/comments' <<<"$FP_FN" \
+    && grep -Fq 'reviewThreads(first: 100, after: $endCursor)' <<<"$FP_FN" \
+    && grep -Fq 'nodes { id isResolved }' <<<"$FP_FN" \
+    && grep -Fq "printf '%s\\035%s\\035%s\\035%s'" <<<"$FP_FN" \
     && [ "$FP_FAILCLOSED" -eq 4 ]; then
   pass "cr_surface_fp fingerprints comments, reviews, inline findings and thread state, failing closed on each read"
 else
@@ -3685,15 +3685,69 @@ FIRST_GUARD_LINE=$(printf '%s\n' "$SWEEP_STEP" | grep -n '^ *if \[ "\$gate_infra
 if [ "$GUARDS_CONDITIONED" -eq 2 ] \
     && [ -n "$CLASSIFIER_LINE" ] && [ -n "$FIRST_GUARD_LINE" ] \
     && [ "$CLASSIFIER_LINE" -lt "$FIRST_GUARD_LINE" ] \
-    && printf '%s\n' "$SWEEP_STEP" | grep -Fq '0|1|3) ;;' \
-    && printf '%s\n' "$SWEEP_STEP" | grep -Fq '*) gate_infra_error=1 ;;'; then
+    && grep -Fq '0|1|3) ;;' <<<"$SWEEP_STEP" \
+    && grep -Fq '*) gate_infra_error=1 ;;' <<<"$SWEEP_STEP"; then
   pass "both snapshot guards defer to the gate's fail-closed exit, and rc 3 still holds"
 else
   fail "expected rc 2 to bypass both snapshot guards (guards conditioned: $GUARDS_CONDITIONED, classifier line: ${CLASSIFIER_LINE:-none}, first guard line: ${FIRST_GUARD_LINE:-none})"
 fi
 
 # ---------------------------------------------------------------------------
-# Test 49 (#888): the 🔴 Critical rung reaches the REQUIRED gate.
+# Test 49 (#947): regression for the #520 SIGPIPE race. `grep -q` exits on
+# the FIRST match; when the match sits near the top of a payload large
+# enough to fill the pipe buffer, a `printf ... | grep -q` producer can
+# still be writing when grep closes its end, taking SIGPIPE/EPIPE — and
+# under this file's `set -euo pipefail`, that turns a MATCHING assertion
+# into a spurious failure. The herestring form (`grep -q PAT <<<"$VAR"`)
+# has no second process to signal, so it cannot race. Build a payload well
+# past the pipe buffer (64 KiB, matching the ~20 KB SWEEP_JOB shape from the
+# original flake) with the needle on line 1, and run both forms enough
+# times that the piped form would be expected to fail at least once if the
+# race were still live.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 49 (#947): the herestring idiom survives a large early-match payload the piped form races on"
+NEEDLE='SIGPIPE_RACE_NEEDLE'
+RACE_PAYLOAD=$(
+  printf '%s\n' "$NEEDLE"
+  # A plain Bash loop instead of `yes | head -n 2000`: the pipeline form
+  # requires `|| true` to survive the expected SIGPIPE when `head` stops
+  # reading, but that same guard would also mask a genuine failure in
+  # payload construction, silently shrinking the payload below the size
+  # this regression test needs.
+  padding_line=0
+  while [ "$padding_line" -lt 2000 ]; do
+    printf '%s\n' 'padding padding padding padding padding padding padding padding'
+    padding_line=$((padding_line + 1))
+  done
+)
+RACE_ITERS=200
+RACE_PIPED_FAILURES=0
+i=0
+while [ "$i" -lt "$RACE_ITERS" ]; do
+  # Deliberately the OLD racy idiom, run in a subshell with `set +e` so one
+  # SIGPIPE-induced failure doesn't abort this test loop under `set -e`.
+  if ! (set +e; printf '%s\n' "$RACE_PAYLOAD" | grep -q "$NEEDLE"); then
+    RACE_PIPED_FAILURES=$((RACE_PIPED_FAILURES + 1))
+  fi
+  # The fixed herestring idiom must never fail — this is the assertion.
+  if ! grep -q "$NEEDLE" <<<"$RACE_PAYLOAD"; then
+    fail "herestring grep -q missed a needle present in the payload (iteration $i)"
+  fi
+  i=$((i + 1))
+done
+if [ "$RACE_PIPED_FAILURES" -gt 0 ]; then
+  pass "confirmed the racy piped idiom can drop matches under pipefail ($RACE_PIPED_FAILURES/$RACE_ITERS runs) while the herestring form stayed correct every time — this is why #947 converts the file's assertions to herestrings rather than reinventing the #520 remedy"
+else
+  # The race is timing-dependent (#520, #947) and is not guaranteed to
+  # reproduce on every host/kernel/iteration count. Absence of a piped
+  # failure here does not mean the herestring conversion was unnecessary —
+  # it means this run got lucky, same as the local runs noted in #947.
+  pass "herestring grep -q stayed correct across $RACE_ITERS large-payload iterations (the racy piped form did not happen to fault this run; see #520/#947 for why it still must not be used)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 50 (#888): the 🔴 Critical rung reaches the REQUIRED gate.
 #
 # The rung lives in scripts/lib/feedback-policy-helpers.sh, which is the whole
 # point — #884 routed the advisory coderabbit-wait.sh count and this gate
@@ -3711,7 +3765,7 @@ BARE_CRITICAL_BODY="_🔒 Security & Privacy_ | _🔴 Critical_
 Remote code execution via the unvalidated path."
 
 echo
-echo "--- Test 49 (#888): a bare 🔴 Critical badge, unresolved"
+echo "--- Test 50 (#888): a bare 🔴 Critical badge, unresolved"
 SCRATCH=$(make_scratch_with_config true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
 FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$BARE_CRITICAL_BODY")
@@ -3733,7 +3787,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 50 (#936): the summary READ is never allowed to fail into "zero
+# Test 51 (#936): the summary READ is never allowed to fail into "zero
 # findings".
 #
 # This gate's PR-level summary path grades a DOCUMENT: it feeds the summary
@@ -3750,7 +3804,7 @@ SUMMARY_MAJOR_FINDING='_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win
 The caller accepts a bypass flag that skips the gate.'
 
 echo
-echo "--- Test 50 (#936): a FAILED summary read is never 'zero findings'"
+echo "--- Test 51 (#936): a FAILED summary read is never 'zero findings'"
 # `done <<EOF\n\$(reader)\nEOF` discards the command substitution's status, so
 # an awk that died on a pathological body produced an empty stream, the loop
 # found nothing, and this REQUIRED gate printed `unresolved: 0` and exited 0 —
@@ -3764,7 +3818,7 @@ FIXTURE_COMMENTS=$(make_comments_fixture '[]')
 FIXTURE_THREADS=$(make_threads_fixture '[]')
 FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
   "$(make_summary_body "$HEAD_SHA" "$SUMMARY_MAJOR_FINDING")")
-AWK_COUNTER="$WORKDIR/awk-calls-50"
+AWK_COUNTER="$WORKDIR/awk-calls-51"
 : >"$AWK_COUNTER"
 # Count the reader's runs on THIS fixture with nothing failing, so the
 # threshold below is derived rather than guessed: every run but the last is the
