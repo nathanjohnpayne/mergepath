@@ -2727,6 +2727,63 @@ run_cm_matrix expect_not_rendered "Case 15o" \
   'a thematic break is not a blank-first item|---\n    See [the audit](hub.md)' \
   'nor is its spaced spelling|- - -\n    See [the audit](hub.md)'
 
+# --- Case 15p: a dedented block quote closes the list it interrupts ---
+# § Block quotes: "The block quote can interrupt a paragraph." That single
+# sentence is what separates a block quote from indented code here, and the
+# container stack was reading the two the same way.
+#
+# The stack is popped for a line that starts a new block at its own
+# indentation, but only while no text flow is open — a guard against
+# treating a lazy continuation as a dedent. A block quote is the one shape
+# that guard must not cover: it is always a new block, and the paragraph it
+# opens INSIDE itself was being read as evidence that the list outside it
+# was still running. So `- para`, a column-zero `> quote`, a blank line and
+# a four-column link kept the column-2 item frame alive, raised the code
+# threshold to six, and reported as a link a line both renderers make
+# top-level indented code — a false ownership failure, and the same one a
+# dedented fence used to produce.
+#
+# The rows that pin the fix to block quotes rather than to dedents in
+# general are the ones where the quote is still INSIDE the item: at the
+# content column and one column past it the item survives and its own
+# threshold still governs, and four columns past it the line is lazy
+# continuation text that never had a quote depth to begin with, because
+# `quote_depth` stops counting at a four-space run. A list living inside a
+# quote is the mirror control — its frame carries the quote depth, so a
+# deeper quote is not "deeper than the frame" and nothing pops.
+#
+# The last two rendered rows pin the comparison itself rather than the rule.
+# A frame at quote depth zero is the common case, so relaxing the test from
+# "deeper than the frame" to "as deep as the frame" makes it fire on EVERY
+# unquoted line and the lazy-continuation guard stops existing: a dedented
+# lazy line then a blank then item prose pops the frame, drops the threshold
+# to four, and blanks as top-level code a line both renderers keep inside the
+# item — the miss direction. Those two rows fail under that relaxation and
+# pass under the rule as written.
+#
+# Every row was measured against BOTH renderers — markdown-it-py 4.2.0 and
+# cmark-gfm through GitHub's own rendering API — and they agree row for row.
+run_cm_matrix expect_rendered "Case 15p" \
+  'three columns after a dedented quote is top-level prose|- para\n> quote\n\n   See [the audit](hub.md)' \
+  'with no blank between, the same columns are quote continuation|- para\n> quote\n    See [the audit](hub.md)' \
+  'a quote AT the content column stays inside the item|- para\n  > quote\n\n    See [the audit](hub.md)' \
+  'and one column past it is still inside the item|- para\n   > quote\n\n    See [the audit](hub.md)' \
+  'six columns in, the quote is lazy continuation text|- para\n      > quote\n\n    See [the audit](hub.md)' \
+  'a marker inside a quote still carries its own content column|> - para\n>       See [the audit](hub.md)' \
+  'a bullet after the closing blank is top-level again|- para\n> quote\n\n- See [the audit](hub.md)' \
+  'no quote at all leaves the item paragraph open (control)|- para\n\n    See [the audit](hub.md)' \
+  'an unquoted dedent is still a lazy continuation, not a pop|- para\nlazy\n\n    See [the audit](hub.md)' \
+  'and the same holds under a wider marker|-   para\nlazy\n\n      See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15p" \
+  'a dedented block quote closes the list it interrupts|- para\n> quote\n\n    See [the audit](hub.md)' \
+  'it closes a nested list to the same depth|- - para\n> quote\n\n    See [the audit](hub.md)' \
+  'a doubled quote marker closes it just the same|- para\n> > quote\n\n    See [the audit](hub.md)' \
+  'six columns under a quote at the content column is item code|- para\n  > quote\n\n      See [the audit](hub.md)' \
+  'eight columns is code whichever frame is standing|- - para\n> quote\n\n        See [the audit](hub.md)' \
+  'a list INSIDE a quote dies with the quote, not with this rule|> - para\n>   more\n\n    See [the audit](hub.md)' \
+  'a dedented heading closes the list the same way (control)|- para\n# Governance\n\n    See [the audit](hub.md)'
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).

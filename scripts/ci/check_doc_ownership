@@ -631,7 +631,29 @@ mp_markdown_renderable_text() {
       # line the renderer had already made top-level indented code — a false
       # ownership failure. Lines INSIDE a fence still do not pop, because
       # they are fence content and not blocks in their own right.
-      if (!text_flow_open) pop_containers(col_indent, line_quote)
+      #
+      # The `text_flow_open` guard is a LAZY-CONTINUATION guard: a dedented
+      # line under an open paragraph may be continuation text, and popping on
+      # it would measure real item prose against a container that is still
+      # open. A block quote is the shape that guard must not cover, because a
+      # block quote INTERRUPTS a paragraph — it is a new block, never a lazy
+      # continuation. Without the exception, `- para`, a column-zero
+      # `> quote`, a blank and a four-column link kept the column-2 frame
+      # alive on the strength of the paragraph inside the QUOTE, raised the
+      # code threshold to six, and reported as a link a line both renderers
+      # make top-level indented code — a false ownership failure.
+      #
+      # The exception is self-limiting and needs no column test of its own:
+      # it fires only when the quote depth of the line is deeper than that of
+      # the frame, and pop_containers still compares columns, so a quote that
+      # opens AT or INSIDE the item content column (`- para` then
+      # `  > quote`) pops nothing and stays item content. A quote four or
+      # more columns past the content column never reaches here at all:
+      # `quote_depth` stops at a four-space run, so such a line carries depth
+      # zero and is read as the lazy continuation text it really is.
+      if (!text_flow_open || (cc_n > 0 && line_quote > cq[cc_n])) {
+        pop_containers(col_indent, line_quote)
+      }
       # This line is not blank, so the blank-first item it may sit in has
       # taken content and is no longer bounded at one blank. Clearing here
       # rather than at the end keeps the flag off frames this line goes on
