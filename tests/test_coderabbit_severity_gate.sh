@@ -3673,11 +3673,16 @@ echo "--- Test 49 (#947): the herestring idiom survives a large early-match payl
 NEEDLE='SIGPIPE_RACE_NEEDLE'
 RACE_PAYLOAD=$(
   printf '%s\n' "$NEEDLE"
-  # `|| true`: `yes` is killed by SIGPIPE the instant `head` stops reading,
-  # which is the expected/intended shutdown for this idiom, not a failure —
-  # but under this file's `set -o pipefail` that SIGPIPE exit would abort
-  # the whole suite if left unguarded.
-  yes 'padding padding padding padding padding padding padding padding' | head -n 2000 || true
+  # A plain Bash loop instead of `yes | head -n 2000`: the pipeline form
+  # requires `|| true` to survive the expected SIGPIPE when `head` stops
+  # reading, but that same guard would also mask a genuine failure in
+  # payload construction, silently shrinking the payload below the size
+  # this regression test needs.
+  padding_line=0
+  while [ "$padding_line" -lt 2000 ]; do
+    printf '%s\n' 'padding padding padding padding padding padding padding padding'
+    padding_line=$((padding_line + 1))
+  done
 )
 RACE_ITERS=200
 RACE_PIPED_FAILURES=0
