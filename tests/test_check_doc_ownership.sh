@@ -2784,6 +2784,39 @@ run_cm_matrix expect_not_rendered "Case 15p" \
   'a list INSIDE a quote dies with the quote, not with this rule|> - para\n>   more\n\n    See [the audit](hub.md)' \
   'a dedented heading closes the list the same way (control)|- para\n# Governance\n\n    See [the audit](hub.md)'
 
+# --- Case 15q: a dedented FENCE closes the list under an open paragraph ---
+# The same hole as Case 15p, on the shape the pop was originally written
+# for. § Fenced code blocks: a fence can interrupt a paragraph, so a
+# dedented opener is never a lazy continuation and must close the list it
+# leaves. Behind the `text_flow_open` guard the pop only ever fired when
+# nothing was open: after `- # Item` the heading closes the flow and the
+# fence popped (Case 15i), but after `- para` the paragraph was still open,
+# the column-2 frame survived a list the fence had already ended, and a
+# four-column line both renderers make top-level indented code was reported
+# as a link.
+#
+# So the opener is recognized BEFORE the pop instead of after it. The rows
+# that keep it honest are the ones where the fence is NOT a dedent — at the
+# item content column the item survives and its own six-column threshold
+# still governs — and the two shapes that are not fences at all: a backtick
+# in a backtick info string, and a run shorter than three.
+#
+# Every row was measured against BOTH renderers — markdown-it-py 4.2.0 and
+# cmark-gfm through GitHub's own rendering API — and they agree row for row.
+run_cm_matrix expect_rendered "Case 15q" \
+  'three columns after a dedented fence is top-level prose|- para\n```\nx\n```\n\n   See [the audit](hub.md)' \
+  'a fence AT the content column leaves the item standing|- para\n  ```\n  x\n  ```\n\n    See [the audit](hub.md)' \
+  'a backtick in a backtick info string is prose, not a fence|- para\n``` a`b\n\n    See [the audit](hub.md)' \
+  'and a two-character run is not a fence either|- para\n``\n\n    See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15q" \
+  'a dedented fence closes the item under an open paragraph|- para\n```\nx\n```\n\n    See [the audit](hub.md)' \
+  'the tilde spelling closes it the same way|- para\n~~~\nx\n~~~\n\n    See [the audit](hub.md)' \
+  'it closes a nested item to the same depth|- - para\n```\nx\n```\n\n    See [the audit](hub.md)' \
+  'six columns under a fence at the content column is item code|- para\n  ```\n  x\n  ```\n\n      See [the audit](hub.md)' \
+  'a link inside the dedented fence is fence content|- para\n```\nSee [the audit](hub.md)\n```' \
+  'a heading item still closes the same way (control)|- # Item\n```\nx\n```\n\n    See [the audit](hub.md)'
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).

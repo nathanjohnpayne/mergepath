@@ -651,7 +651,26 @@ mp_markdown_renderable_text() {
       # more columns past the content column never reaches here at all:
       # `quote_depth` stops at a four-space run, so such a line carries depth
       # zero and is read as the lazy continuation text it really is.
-      if (!text_flow_open || (cc_n > 0 && line_quote > cq[cc_n])) {
+      # A FENCE OPENER is the other shape that interrupts a paragraph, and it
+      # needs the same exception for the same reason. The pop above was
+      # introduced FOR the dedented fence, but behind the `text_flow_open`
+      # guard it only ever fired when nothing was open: after `- # Item` a
+      # heading closes the flow and the fence popped, while after `- para` the
+      # paragraph was still open and the frame survived a list the fence had
+      # already ended — the identical false ownership failure, on the shape
+      # the guard was written for. So the opener is recognized BEFORE the pop
+      # rather than after it, and the branch that consumes it reuses the
+      # answer instead of re-deciding.
+      ch = substr(rest, 1, 1)
+      fence_here = 0
+      if (indent <= 3 && (ch == "`" || ch == "~")) {
+        width = run_len(rest, 1, ch)
+        tail = substr(rest, width + 1)
+        # CommonMark forbids a backtick in a backtick fence info string.
+        # Such a line is rendered prose, not a fence opener.
+        if (width >= 3 && !(ch == "`" && index(tail, "`") > 0)) fence_here = 1
+      }
+      if (!text_flow_open || fence_here || (cc_n > 0 && line_quote > cq[cc_n])) {
         pop_containers(col_indent, line_quote)
       }
       # This line is not blank, so the blank-first item it may sit in has
@@ -660,18 +679,11 @@ mp_markdown_renderable_text() {
       # to push, which set it themselves below.
       if (cc_n > 0) cb[cc_n] = 0
 
-      ch = substr(rest, 1, 1)
-      if (indent <= 3 && (ch == "`" || ch == "~")) {
-        width = run_len(rest, 1, ch)
-        tail = substr(rest, width + 1)
-        # CommonMark forbids a backtick in a backtick fence info string.
-        # Such a line is rendered prose, not a fence opener.
-        if (width >= 3 && !(ch == "`" && index(tail, "`") > 0)) {
-          in_fence = 1; fence_char = ch; fence_width = width
-          text_flow_open = 0
-          print ""
-          next
-        }
+      if (fence_here) {
+        in_fence = 1; fence_char = ch; fence_width = width
+        text_flow_open = 0
+        print ""
+        next
       }
 
       # Indented code cannot interrupt an open paragraph or list item. Keep an
