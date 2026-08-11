@@ -2605,11 +2605,14 @@ doc_ownership:
     class: canonical
   - path: \"docs/agents/#hub.md\"
     class: hub-only
+  - path: \"docs/agents/?hub.md\"
+    class: hub-only
 "
 set +e
 out=$(run_with_doc_bodies "$MANIFEST_HASH" \
   "docs/agents/shared.md|See [the audit](%23hub.md) for details.
-docs/agents/#hub.md|# Hub-only machinery")
+docs/agents/#hub.md|# Hub-only machinery
+docs/agents/?hub.md|# Hub-only machinery")
 rc=$?
 set -e
 if [ "$rc" = "1" ] \
@@ -2617,6 +2620,30 @@ if [ "$rc" = "1" ] \
   pass "Case 15n: an encoded '#' is a pathname character, not a fragment"
 else
   fail "Case 15n (%23 path) unexpected (rc=$rc): $out"
+fi
+
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_HASH" \
+  "docs/agents/shared.md|See [the audit](%3Fhub.md) for details.
+docs/agents/#hub.md|# Hub-only machinery
+docs/agents/?hub.md|# Hub-only machinery")
+rc=$?
+set -e
+if [ "$rc" = "1" ] \
+   && echo "$out" | grep -q "references the hub-only doc 'docs/agents/?hub.md'"; then
+  pass "Case 15n: an encoded '?' is a pathname character, not a query"
+else
+  fail "Case 15n (%3F path) unexpected (rc=$rc): $out"
+fi
+
+set +e
+out=$(run_truth_body 'See [the audit](other.md?hub.md) for details.')
+rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_doc_ownership: PASS"; then
+  pass "Case 15n: a real query string is still discarded (control)"
+else
+  fail "Case 15n (real query control) unexpected (rc=$rc): $out"
 fi
 
 set +e
