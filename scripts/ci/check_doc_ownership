@@ -176,7 +176,15 @@ mp_markdown_renderable_text() {
       # must still see it.
       ORDERED_DIGITS = "[0-9][0-9]?[0-9]?[0-9]?[0-9]?[0-9]?[0-9]?[0-9]?[0-9]?"
       LIST_MARKER_CORE = "^([-+*]|" ORDERED_DIGITS "[.)])"
-      LIST_MARKER = LIST_MARKER_CORE "[[:space:]]+"
+      # The trailer is optional-or-end, not a required whitespace run: a
+      # marker ALONE on its line is a list item whose first child is nothing
+      # at all. Requiring the run classified `-`, `*`, `+`, `1.` and `1)` as
+      # ordinary text, so the item opened no container and every line under
+      # it was measured against column zero — six columns under `*` was
+      # scanned as a lazy continuation although the renderer had already made
+      # it item code, and four columns under `-` was blanked as top-level
+      # code although the renderer resolves the link there.
+      LIST_MARKER = LIST_MARKER_CORE "([[:space:]]|$)"
       BLOCK_TAGS = " address article aside base basefont blockquote body"
       BLOCK_TAGS = BLOCK_TAGS " caption center col colgroup dd details"
       BLOCK_TAGS = BLOCK_TAGS " dialog dir div dl dt fieldset figcaption"
@@ -256,7 +264,17 @@ mp_markdown_renderable_text() {
         else break
         i++
       }
-      if (n == 0) return 0
+      # No whitespace run at all has two readings, and only the length of the
+      # line separates them. A marker with a non-space character right after
+      # it (`-x`) is not a marker; a marker with NOTHING after it is the same
+      # "item starting with a blank line" the wide-run branch below handles,
+      # so it takes the same W+1 content column. Returning zero for both left
+      # a bare marker with no container and its content measured from column
+      # zero.
+      if (n == 0) {
+        if (i > length(s)) { LM_BLANK_FIRST = 1; return w + 1 }
+        return 0
+      }
       if (n > 4 || i > length(s)) {
         LM_CODE_FIRST = (i <= length(s))
         LM_BLANK_FIRST = (i > length(s))
@@ -379,7 +397,23 @@ mp_markdown_renderable_text() {
         }
       }
       if (s == "") return 0
-      if (is_thematic_break(s) || is_setext_underline(s)) return 0
+      if (is_thematic_break(s)) return 0
+      # A setext underline exists only UNDER a paragraph — it is the thing
+      # that turns the paragraph above it into a heading. Applying the shape
+      # test with nothing open read every line of dashes or equals as a
+      # block boundary in its own right: `=` alone opens a paragraph for
+      # both renderers, so a four-column line below it is a lazy
+      # continuation whose link renders, and this blanked it as code. It
+      # also shadowed the list branch for the one bullet whose marker is
+      # spelled with the same character — `-` and `- ` never reached it, so
+      # a blank-first bullet pushed no content frame and a hub-only link
+      # four or five columns under it was missed entirely.
+      #
+      # The order against the list branch matters and is the reason this is
+      # a separate test rather than a condition inside it: with a paragraph
+      # open, `- ` is a setext underline and NOT a list, because a list can
+      # interrupt a paragraph only when it begins with a non-blank item.
+      if (flow_open && is_setext_underline(s)) return 0
       if (is_list_marker(s)) {
         # ... but only when a list may start here at all. With a paragraph
         # open, a marker that cannot interrupt it leaves the paragraph — and
@@ -424,7 +458,15 @@ mp_markdown_renderable_text() {
         # misclassification. LM_CHARS <= 0 is held alongside the flag so any
         # future path that returns without a first child fails safe the same
         # way.
-        if (LM_BLANK_FIRST || LM_CHARS <= 0 || LM_CHARS >= length(s)) return 0
+        if (LM_BLANK_FIRST || LM_CHARS <= 0 || LM_CHARS >= length(s)) {
+          # Reported back so the caller can bound how long the frame lives.
+          # An item that begins with a blank line is allowed exactly one, so
+          # its container closes on the NEXT blank rather than surviving to
+          # the end of the document. Read off the innermost marker, which is
+          # where the recursion stops.
+          if (LM_BLANK_FIRST) item_blank_first = 1
+          return 0
+        }
         s = substr(s, LM_CHARS + 1)
         # The item content is parsed as blocks IN ITS OWN RIGHT, so no
         # paragraph is open inside it yet — whatever was open outside stopped
@@ -464,9 +506,24 @@ mp_markdown_renderable_text() {
     # pops no matter how its column compares.
     function pop_containers(col, qdepth) {
       while (cc_n > 0 && (cc[cc_n] > col || cq[cc_n] > qdepth)) {
-        delete cc[cc_n]; delete cq[cc_n]; cc_n--
+        delete cc[cc_n]; delete cq[cc_n]; delete cb[cc_n]; cc_n--
       }
       code_column = (cc_n > 0) ? cc[cc_n] : 0
+    }
+    # CommonMark 0.31.2 § List items: "A list item can begin with at most one
+    # blank line." So a container opened by a marker with nothing after it
+    # lives only until the next line, and a blank one there leaves the item
+    # empty and closes it — what follows is measured from the column OUTSIDE
+    # the list. `cb` flags exactly those frames; every other frame survives a
+    # blank, because an item that already has content may hold one and keep
+    # going. Without the distinction, `- ` then a blank then a four-column
+    # link would keep the column-2 frame, raise the code threshold to six,
+    # and report top-level indented code as prose.
+    function close_blank_first_frame() {
+      if (cc_n > 0 && cb[cc_n]) {
+        delete cc[cc_n]; delete cq[cc_n]; delete cb[cc_n]; cc_n--
+        code_column = (cc_n > 0) ? cc[cc_n] : 0
+      }
     }
     # `col` is the new container CONTENT column; `start_col` is the column its
     # MARKER begins at. The two differ, and only the marker column says which
@@ -483,6 +540,7 @@ mp_markdown_renderable_text() {
       cc_n++
       cc[cc_n] = col
       cq[cc_n] = qdepth
+      cb[cc_n] = 0
       code_column = col
     }
     # How many block quotes this line opens with. Up to three spaces of
@@ -554,8 +612,11 @@ mp_markdown_renderable_text() {
       }
 
       # A blank line closes the text flow but NOT the containers: a list item
-      # may hold one and keep going, so it must not reach the pop below.
+      # may hold one and keep going, so it must not reach the pop below. The
+      # one exception is an item that BEGAN with a blank line, which is
+      # bounded at that single blank — see close_blank_first_frame.
       if (line ~ /^[[:space:]]*$/) {
+        close_blank_first_frame()
         text_flow_open = 0
         print ""
         next
@@ -571,6 +632,11 @@ mp_markdown_renderable_text() {
       # ownership failure. Lines INSIDE a fence still do not pop, because
       # they are fence content and not blocks in their own right.
       if (!text_flow_open) pop_containers(col_indent, line_quote)
+      # This line is not blank, so the blank-first item it may sit in has
+      # taken content and is no longer bounded at one blank. Clearing here
+      # rather than at the end keeps the flag off frames this line goes on
+      # to push, which set it themselves below.
+      if (cc_n > 0) cb[cc_n] = 0
 
       ch = substr(rest, 1, 1)
       if (indent <= 3 && (ch == "`" || ch == "~")) {
@@ -638,6 +704,7 @@ mp_markdown_renderable_text() {
         mc_n = 0
         flow_column = col_indent
         item_code_first = 0
+        item_blank_first = 0
         text_flow_open = opens_text_flow(flow_probe, text_flow_open)
         if (mc_n > 0) {
           # Outermost frame first: each push pops the frames its own MARKER
@@ -654,6 +721,12 @@ mp_markdown_renderable_text() {
                            (mc_i > 1) ? col_indent + mc[mc_i - 1] : col_indent, \
                            line_quote)
           }
+          # Only the INNERMOST marker can be the one with nothing after it —
+          # every marker outside it has the next marker as its content — so
+          # the one-blank bound belongs to the frame the loop pushed last.
+          # `- - ` then a blank closes the inner item and leaves the outer
+          # one standing, which is what both renderers do.
+          if (item_blank_first) cb[cc_n] = 1
         } else if (!text_flow_open) {
           # The pop above runs BEFORE the line is classified, so it has to
           # assume a dedented line might lazily continue the open paragraph
@@ -1144,10 +1217,18 @@ mp_doc_link_targets() {
         # decoded to code points, and every code point is emitted through
         # utf8_of — the one place that knows what a character is on this awk.
         # A byte that is not part of a well-formed sequence (a stray
-        # continuation, a truncated run, an overlong lead) becomes U+FFFD,
-        # which names no declared path. That also gives percent-escapes the
-        # CR/LF handling the reference decoder already has, for the same
-        # one-destination-per-record reason.
+        # continuation, a truncated run, an overlong lead) DROPS the whole
+        # destination, by the same reasoning as the decoded newline below:
+        # U+FFFD is a legal pathname character, so emitting it and comparing
+        # anyway lets `%FFhub.md` match a hub-only doc really named
+        # `<U+FFFD>hub.md` and invent an ownership failure — while the href
+        # a reader follows still says `%FF`, whose byte is not the UTF-8
+        # spelling of that name. U+FFFD is still written into the decoded
+        # text so the shape of the rest of the run is preserved; the flag,
+        # not the character, is what keeps the value from being compared.
+        # That also gives percent-escapes the CR/LF handling the reference
+        # decoder already has, for the same one-destination-per-record
+        # reason.
         function decode_escape_run(n,   out, k, b, cp, need, j, ok) {
           out = ""
           k = 1
@@ -1160,6 +1241,7 @@ mp_doc_link_targets() {
             else if (b >= 240 && b <= 244) { cp = b - 240; need = 3 }
             if (need < 0 || k + need > n) {
               out = out REPLACEMENT
+              TARGET_DROP = 1
               k++
               continue
             }
@@ -1188,6 +1270,7 @@ mp_doc_link_targets() {
             if (ok && cp > 1114111) ok = 0
             if (!ok) {
               out = out REPLACEMENT
+              TARGET_DROP = 1
               k++
               continue
             }

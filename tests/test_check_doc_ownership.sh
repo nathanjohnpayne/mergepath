@@ -2532,10 +2532,19 @@ doc_ownership:
 # only alias — and `%00` reached the same U+FFFD-named doc. Every OTHER
 # control byte IS legal in a pathname and is emitted as itself, which is why
 # `%01` needs no row here and gets none.
+#
+# A MALFORMED UTF-8 escape run aliases by exactly the same mechanism, and
+# the last four spellings are the four ways a run can be malformed: a byte
+# that is no part of any sequence, a stray continuation, a truncated run,
+# and an overlong spelling. Each one decoded to U+FFFD and compared, so
+# `prefix%FFhub.md` matched the U+FFFD-named doc although the href a reader
+# follows still says `%FF`, whose byte is not that name in UTF-8 or in any
+# other encoding a repository path uses.
 for nl_spelling in \
   'prefix&NewLine;hub.md' 'prefix&#10;hub.md' 'prefix&#13;hub.md' \
   'prefix&#x0A;hub.md' 'prefix%0Ahub.md' 'prefix%0Dhub.md' \
-  'prefix%00hub.md'
+  'prefix%00hub.md' 'prefix%FFhub.md' 'prefix%80hub.md' \
+  'prefix%C3hub.md' 'prefix%E0%80%80hub.md'
 do
   set +e
   out=$(run_with_doc_bodies "$MANIFEST_FFFD" \
@@ -2655,6 +2664,68 @@ if [ "$rc" = "0" ] && echo "$out" | grep -q "check_doc_ownership: PASS"; then
 else
   fail "Case 15n (real fragment control) unexpected (rc=$rc): $out"
 fi
+
+# --- Case 15o: a marker line with no content is still a container ----
+# § List items: "When the list item starts with a blank line, the number
+# of spaces following the list marker does not change the required
+# indentation" — the content column is W+1. Two tests upstream of that
+# rule stopped such a line from ever reaching it.
+#
+# The setext-underline shape test ran with nothing open, and a setext
+# underline only exists UNDER a paragraph. `-` and `- ` are spelled with
+# the underline character, so a blank-first bullet was classified as a
+# block boundary, pushed no frame, and left the threshold at four: a
+# hub-only link four or five columns beneath it was blanked as top-level
+# code and MISSED — the false-negative direction. `=` alone is the same
+# defect without a list in sight: it opens a paragraph for both
+# renderers, so the line below it is a lazy continuation whose link
+# renders.
+#
+# The marker test then required a whitespace run after the marker, so a
+# BARE marker was not a marker at all. For `*`, `+` and the ordered forms
+# that runs the other way, as a false positive: with no frame, six
+# columns under `*` was scanned as a lazy continuation of a phantom
+# paragraph although the renderer had already made it item code.
+#
+# The one-blank bound comes with the fix rather than after it. An item
+# that begins with a blank line may hold exactly that one, so the frame
+# these rows create must close on the next blank — otherwise fixing the
+# miss above would invent a false ownership failure four columns under an
+# item that no longer exists.
+#
+# Every row was measured against BOTH renderers — markdown-it-py 4.2.0
+# and cmark-gfm through GitHub's own rendering API — and they agree row
+# for row. The controls are the ones that separate this from "treat any
+# short line as a list": a paragraph above turns the same `- ` back into
+# a setext underline, a thematic break stays a thematic break in both its
+# spellings, the content column still bounds indented code one column
+# further in, and a non-blank-first item still survives two blank lines.
+run_cm_matrix expect_rendered "Case 15o" \
+  'four columns under a blank-first bullet is item prose|- \n    See [the audit](hub.md)' \
+  'five columns is the last item-prose column|- \n     See [the audit](hub.md)' \
+  'a BARE marker opens the same item|-\n    See [the audit](hub.md)' \
+  'a tab after the marker still leaves no first child|-\t\n    See [the audit](hub.md)' \
+  'a bare ordered marker takes its own wider column|1.\n      See [the audit](hub.md)' \
+  'the paren spelling behaves identically|1)\n      See [the audit](hub.md)' \
+  'the inner of two blank-first markers bounds the code|- -\n      See [the audit](hub.md)' \
+  'an indented blank-first bullet shifts its column too|  - \n      See [the audit](hub.md)' \
+  'a bare equals sign opens a paragraph, not a heading underline|=\n    See [the audit](hub.md)' \
+  'an item that takes content on the next line keeps its frame|- \n- x\n    See [the audit](hub.md)' \
+  'three columns after the closing blank is top-level prose|- \n\n   See [the audit](hub.md)' \
+  'an item with content may still hold two blank lines|- # Item\n\n\n    See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15o" \
+  'six columns under a blank-first bullet is item code|- \n      See [the audit](hub.md)' \
+  'the same bound applies to a bare star marker|*\n      See [the audit](hub.md)' \
+  'and to a bare plus marker|+\n      See [the audit](hub.md)' \
+  'seven columns under a bare ordered marker is item code|1.\n       See [the audit](hub.md)' \
+  'a second blank line closes the empty item|- \n\n    See [the audit](hub.md)' \
+  'and what follows it is top-level indented code|- \n\n     See [the audit](hub.md)' \
+  'the closing blank leaves the OUTER item standing|- -\n\n      See [the audit](hub.md)' \
+  'eight columns is code inside the inner item|- -\n        See [the audit](hub.md)' \
+  'a paragraph above makes the same line a setext underline|Governance\n- \n    See [the audit](hub.md)' \
+  'a thematic break is not a blank-first item|---\n    See [the audit](hub.md)' \
+  'nor is its spaced spelling|- - -\n    See [the audit](hub.md)'
 
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
