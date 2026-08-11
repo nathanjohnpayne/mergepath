@@ -184,7 +184,20 @@ mp_markdown_renderable_text() {
       # scanned as a lazy continuation although the renderer had already made
       # it item code, and four columns under `-` was blanked as top-level
       # code although the renderer resolves the link there.
-      LIST_MARKER = LIST_MARKER_CORE "([[:space:]]|$)"
+      #
+      # The trailer is spelled `[ \t]` and NOT `[[:space:]]`, because the two
+      # are not the same set and the difference is an awk-implementation
+      # divergence rather than a style choice. § List items allows only spaces
+      # and tabs after the marker, and list_marker_columns consumes only those
+      # two. Under gawk in a UTF-8 locale `[[:space:]]` also matches Unicode
+      # whitespace, so `-<U+2003># Heading` entered the list branch, measured a
+      # zero-column marker, closed the text flow and blanked the four-column
+      # line under it — while BWK awk and mawk, being byte-oriented, read the
+      # same line as an ordinary paragraph with a rendered lazy continuation.
+      # Both renderers agree with the byte-oriented reading, so gawk MISSED a
+      # hub-only reference the others reported, and check 10 returned a
+      # different verdict depending on which awk CI happened to run.
+      LIST_MARKER = LIST_MARKER_CORE "([ \t]|$)"
       BLOCK_TAGS = " address article aside base basefont blockquote body"
       BLOCK_TAGS = BLOCK_TAGS " caption center col colgroup dd details"
       BLOCK_TAGS = BLOCK_TAGS " dialog dir div dl dt fieldset figcaption"
@@ -546,9 +559,26 @@ mp_markdown_renderable_text() {
     # How many block quotes this line opens with. Up to three spaces of
     # indentation may precede each `>`, and one space after it is part of the
     # marker rather than of the content.
-    function quote_depth(s,   d, i, run) {
+    #
+    # `base` is the CONTENT COLUMN of the innermost container the line is
+    # currently inside, and it is consumed before the three-space allowance is
+    # applied — because that allowance is relative to the container, not to
+    # column zero. Measuring from column zero rejected a valid quote marker
+    # that merely sat inside an indented item: after `- para`, the line
+    # `    > - # inner` puts its `>` two columns into item content, well
+    # short of the six that would make it code, yet four absolute spaces broke
+    # the loop and the depth came back zero. The list frame that line pushed
+    # was then tagged at quote depth zero, so the unmarked blank that ends the
+    # quote did not take it down with it; the stale frame raised the code
+    # threshold and a six-column link was reported although both renderers
+    # render it as indented code in the OUTER item.
+    function quote_depth(s, base,   d, i, run, eaten) {
       d = 0
       i = 1
+      # Container indentation first, and only as much of it as is actually
+      # there — a line may be dedented below `base` and still open a quote.
+      eaten = 0
+      while (eaten < base && substr(s, i, 1) == " ") { eaten++; i++ }
       while (i <= length(s)) {
         # At most three spaces may precede a marker; a fourth is indentation,
         # which makes the line content rather than a deeper quote.
@@ -586,7 +616,11 @@ mp_markdown_renderable_text() {
       line = $0
       # How deep in block quotes this line is marked. Container frames are
       # tagged with it so a list inside a quote dies when the quote does.
-      line_quote = quote_depth(line)
+      # `code_column` is the content column of the innermost container still
+      # standing FROM THE PREVIOUS LINE, which is the right base: the quote
+      # allowance is relative to the container this line arrives inside, and
+      # this line has not yet been given the chance to leave it.
+      line_quote = quote_depth(line, code_column)
       reference_continuation = 0
       if (reference_pending) {
         reference_pending = 0

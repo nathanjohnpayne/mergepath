@@ -2817,6 +2817,69 @@ run_cm_matrix expect_not_rendered "Case 15q" \
   'a link inside the dedented fence is fence content|- para\n```\nSee [the audit](hub.md)\n```' \
   'a heading item still closes the same way (control)|- # Item\n```\nx\n```\n\n    See [the audit](hub.md)'
 
+# --- Case 15r: quote depth is measured from the container, not column 0 ---
+# § Block quotes allows up to three spaces of indentation before the `>`.
+# That allowance is relative to the container the line arrives inside, and
+# measuring it from column zero rejected a perfectly valid marker for
+# sitting in an indented item: after `- para`, the line `    > - # inner`
+# puts its `>` two columns into item content — well short of the six that
+# would make it code — yet four ABSOLUTE spaces broke the count and the
+# depth came back zero.
+#
+# The depth is not cosmetic: it is what a container frame is tagged with, so
+# a list inside a quote dies when the quote does. Tagged at zero, the inner
+# frame outlived the unmarked blank that ends the quote, raised the code
+# threshold, and a six-column line both renderers render as indented code in
+# the OUTER item was reported as a link.
+#
+# The base is the content column of the innermost container still standing
+# from the previous line, and only as much of it as is really there — a line
+# may be dedented below it and still open a quote. The top-level rows are
+# the ones that keep the base from leaking: with no container, four spaces
+# before a `>` is still indented code and not a quote.
+#
+# Every row was measured against BOTH renderers — markdown-it-py 4.2.0 and
+# cmark-gfm through GitHub's own rendering API — and they agree row for row.
+run_cm_matrix expect_rendered "Case 15r" \
+  'four columns after the quote closes is outer item prose|- para\n    > - # inner\n\n    See [the audit](hub.md)' \
+  'a marked blank keeps the quote and its inner item alive|- para\n    > - # inner\n    >\n    >     See [the audit](hub.md)' \
+  'the allowance follows a wider item too|-   para\n     > - # inner\n\n       See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15r" \
+  'a quote four columns inside an item is still a quote|- para\n    > - # inner\n\n      See [the audit](hub.md)' \
+  'and so is one with no inner list to tag|- para\n    > quote\n\n      See [the audit](hub.md)' \
+  'with NO container, four spaces is indented code (control)|    > quote\n\n    See [the audit](hub.md)' \
+  'and still is when the line below it is deeper (control)|    > quote\n\n      See [the audit](hub.md)' \
+  'three spaces at top level is a real quote (control)|   > quote\n\n    See [the audit](hub.md)'
+
+# --- Case 15s: the marker run is spaces and tabs, not [[:space:]] ---
+# § List items allows only spaces and tabs after a list marker, and
+# list_marker_columns consumes only those two. The classifier spelled the
+# same trailer `[[:space:]]`, and the two are not the same set: under gawk in
+# a UTF-8 locale `[[:space:]]` also matches Unicode whitespace, while BWK awk
+# and mawk are byte-oriented and do not.
+#
+# So `-<U+2003># Heading` entered the list branch under gawk only, measured a
+# zero-column marker, closed the text flow, and blanked the line under it —
+# MISSING a hub-only reference that BWK awk and mawk both reported, and both
+# renderers render. A check whose verdict depends on which awk CI happens to
+# run is worse than one that is uniformly wrong, and this suite runs under
+# all three precisely to catch that.
+#
+# Six columns is the discriminating depth: under a REAL marker run that is
+# item code and the link does not render, and under a non-marker it is a lazy
+# continuation of an ordinary paragraph and the link does. The tab row is the
+# control on the other side — a tab IS a valid marker run and must keep
+# behaving like one.
+run_cm_matrix expect_rendered "Case 15s" \
+  'an em space after a hyphen is not a marker run|-\xe2\x80\x83# Heading\n      See [the audit](hub.md)' \
+  'nor after a star|*\xe2\x80\x83# Heading\n      See [the audit](hub.md)' \
+  'nor after an ordered marker|1.\xe2\x80\x83# Heading\n      See [the audit](hub.md)' \
+  'a tab after the marker IS a run and sets its column (control)|-\t# Heading\n      See [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15s" \
+  'a plain space after the marker is a run, so six columns is item code|- # Heading\n      See [the audit](hub.md)'
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).
