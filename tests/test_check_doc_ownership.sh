@@ -2527,9 +2527,15 @@ doc_ownership:
   - path: docs/agents/prefix�hub.md
     class: hub-only
 "
+# `%00` is the same rule on a different byte. NUL is not a newline, but it
+# is likewise not a byte any pathname can carry, so substituting for it can
+# only alias — and `%00` reached the same U+FFFD-named doc. Every OTHER
+# control byte IS legal in a pathname and is emitted as itself, which is why
+# `%01` needs no row here and gets none.
 for nl_spelling in \
   'prefix&NewLine;hub.md' 'prefix&#10;hub.md' 'prefix&#13;hub.md' \
-  'prefix&#x0A;hub.md' 'prefix%0Ahub.md' 'prefix%0Dhub.md'
+  'prefix&#x0A;hub.md' 'prefix%0Ahub.md' 'prefix%0Dhub.md' \
+  'prefix%00hub.md'
 do
   set +e
   out=$(run_with_doc_bodies "$MANIFEST_FFFD" \
@@ -2555,6 +2561,72 @@ if [ "$rc" = "1" ] \
   pass "Case 15l: the literal U+FFFD spelling still resolves (control)"
 else
   fail "Case 15l (literal U+FFFD control) unexpected (rc=$rc): $out"
+fi
+
+# --- Case 15m: a list inside a block quote dies with the quote -------
+# § Block quotes: an unmarked blank line ends the quote, and everything
+# open inside it ends too. A container frame recorded only its COLUMN,
+# which cannot express that: after `> - # Heading` the list frame sat at
+# column 4 and outlived the quote, so a following four-space line was
+# measured against a list that no longer existed and top-level indented
+# code was scanned as prose. Frames now carry the quote depth they were
+# opened at and pop when the line is shallower.
+#
+# The controls are both directions of "does the quote still hold": the
+# same list still inside the quote must keep its frame, and the same
+# shape with no quote at all must be unchanged.
+run_cm_matrix expect_not_rendered "Case 15m" \
+  'an unmarked blank line ends the quote and the list inside it|> - # Heading\n\n    See [the audit](hub.md)'
+
+run_cm_matrix expect_rendered "Case 15m" \
+  'the frame survives while the quote does|> - # Heading\n>\n>     See [the audit](hub.md)' \
+  'the same shape outside a quote is unchanged|- # Heading\n\n    See [the audit](hub.md)'
+
+# --- Case 15n: an ENCODED delimiter is path data ---------------------
+# Query and fragment delimiters are recognized in URL syntax, before
+# percent decoding — that is why the extractor strips `[?#]...` first and
+# decodes afterwards. It follows that a pure fragment can never reach the
+# consumer as text: `#section` arrives empty and `a.md#frag` arrives as
+# `a.md`. The consumer re-tested for a leading `#` anyway, and that
+# redundant test was actively wrong, because a decoded `%23` is a
+# pathname character by then. A hub-only doc named `#hub.md` was
+# therefore reachable through `%23hub.md` with check 10 silent.
+#
+# `%3F` is the same rule on the other delimiter, and it already worked —
+# it is here so the pair cannot drift apart. The real fragment is the
+# control that keeps the strip honest.
+MANIFEST_HASH="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+  - path: \"docs/agents/#hub.md\"
+    class: hub-only
+"
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_HASH" \
+  "docs/agents/shared.md|See [the audit](%23hub.md) for details.
+docs/agents/#hub.md|# Hub-only machinery")
+rc=$?
+set -e
+if [ "$rc" = "1" ] \
+   && echo "$out" | grep -q "references the hub-only doc 'docs/agents/#hub.md'"; then
+  pass "Case 15n: an encoded '#' is a pathname character, not a fragment"
+else
+  fail "Case 15n (%23 path) unexpected (rc=$rc): $out"
+fi
+
+set +e
+out=$(run_truth_body 'See [the audit](other.md#hub.md) for details.')
+rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_doc_ownership: PASS"; then
+  pass "Case 15n: a real fragment is still discarded (control)"
+else
+  fail "Case 15n (real fragment control) unexpected (rc=$rc): $out"
 fi
 
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
