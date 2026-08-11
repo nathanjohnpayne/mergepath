@@ -1231,18 +1231,7 @@ while IFS= read -r SUMMARY_JSON; do
   # Line numbers stay those of SUMMARY_SCAN, not of the filtered stream, so a
   # reported location still points at the real line in the summary.
   #
-  # Graded by `coderabbit_scan_tiers`, not by a per-line `coderabbit_tier_of`.
-  # A summary is a DOCUMENT of finding stanzas, and CodeRabbit renders one
-  # finding's severity badge and its `cr-indicator-types` machine tag on
-  # DIFFERENT lines. Per-line, each rung fired on its own line and the tag's p1
-  # overrode the badge — so a 🟡 Minor summary finding took a red on THIS
-  # required gate, graded [P1] under a blocking set ({p1} by default) whose
-  # policy calls p2 discretionary, and with no thread to resolve (CodeRabbit
-  # 🟡 Minor on #936). The shared function scopes the tag fallback to the
-  # stanza it trails; coderabbit-wait.sh's summary scan grades through the same
-  # one, so the advisory and required readings of one body cannot diverge.
-  #
-  # Graded BEFORE the loop, with the status checked, because a here-document
+  # Read BEFORE the loop, with the status checked, because a here-document
   # discards its command substitution's exit status: `done <<EOF\n$(pipeline)`
   # cannot fail. An awk that died on a pathological body therefore produced an
   # empty stream, the loop found nothing, and this REQUIRED gate reported zero
@@ -1250,15 +1239,14 @@ while IFS= read -r SUMMARY_JSON; do
   # is the fail-open shape the gate exists to prevent (CodeRabbit 🟠 Major on
   # #936). Exit 2, the config/infra code the gate already uses for "cannot
   # decide", never 0.
-  SUMMARY_GRADED=$(summary_unfenced_numbered "$SUMMARY_SCAN" | coderabbit_scan_tiers) \
-    || die 2 "failed to grade the PR-level summary (comment id $SUMMARY_ID) — refusing to report zero blocking findings from an unread summary"
-  while IFS= read -r cr_graded; do
-    [ -n "$cr_graded" ] || continue
-    cr_line_no=${cr_graded%%	*}
-    cr_graded=${cr_graded#*	}
-    cr_tier=${cr_graded%%	*}
-    cr_line=${cr_graded#*	}
+  SUMMARY_NUMBERED=$(summary_unfenced_numbered "$SUMMARY_SCAN") \
+    || die 2 "failed to read the PR-level summary (comment id $SUMMARY_ID) — refusing to report zero blocking findings from an unread summary"
+  while IFS= read -r cr_numbered; do
+    [ -n "$cr_numbered" ] || continue
+    cr_line_no=${cr_numbered%%	*}
+    cr_line=${cr_numbered#*	}
     [ -n "$cr_line" ] || continue
+    cr_tier=$(coderabbit_tier_of "$cr_line")
     if tier_is_required "$cr_tier"; then
       SUMMARY_BLOCKING=$(echo "$SUMMARY_BLOCKING" | jq -c \
         --argjson id "$SUMMARY_ID" --argjson line "$cr_line_no" \
@@ -1273,7 +1261,7 @@ while IFS= read -r SUMMARY_JSON; do
       ')
     fi
   done <<EOF
-$SUMMARY_GRADED
+$SUMMARY_NUMBERED
 EOF
   # Only bind a fingerprint when there is something to acknowledge. With no
   # blocking finding the token is never printed and never consulted, and

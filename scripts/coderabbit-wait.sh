@@ -1211,11 +1211,10 @@ classify_comment() {
 # Pure string predicates over a CodeRabbit summary body. No globals beyond the
 # constants defined above, no I/O — extracted by sentinel and sourced directly
 # by tests/test_coderabbit_wait_status_probe.sh, the pattern
-# tests/test_audit_branch_protection.sh already uses. Their external
-# dependencies are the shared ladder in scripts/lib/feedback-policy-helpers.sh
-# — `coderabbit_tier_of` for a single body (#837) and `coderabbit_scan_tiers`
-# for a multi-finding document (#936) — which the extracting test sources
-# alongside this block.
+# tests/test_audit_branch_protection.sh already uses. Their only external
+# dependency is the shared `coderabbit_tier_of` ladder in
+# scripts/lib/feedback-policy-helpers.sh (#837), which the extracting test
+# sources alongside this block.
 
 # True when a body classifies as a BLOCKING CodeRabbit finding: the p0/p1 rungs
 # of the shared `coderabbit_tier_of` ladder (CodeRabbit never maps to p0 today;
@@ -1255,32 +1254,14 @@ crw_body_is_blocking_finding() {
 # summary is fed to it one line at a time — which is also the granularity at
 # which CodeRabbit renders the badge. Blank lines are skipped; they cannot
 # carry a marker.
-#
-# Through `coderabbit_scan_tiers`, not a per-line `coderabbit_tier_of`, for the
-# reason documented at that function: the machine-tag rung is a fallback the
-# badge wins over, and CodeRabbit renders the badge and the tag on DIFFERENT
-# lines, so a per-line loop lets the tag's p1 override a 🟡 Minor badge three
-# lines above it (#936). The severity gate's summary loop grades through the
-# same function, so the advisory count here and the required gate keep reading
-# one document the same way — the #837/#884 property this file already relies
-# on.
 crw_scan_has_blocking_marker() {
-  local graded rest tier tab
-  tab=$'\t'
-  # `--number` rather than piping through a numbering process: this predicate
-  # is reached from an `if`, where `set -e` is suspended, so an external
-  # command that failed here would empty the stream and the answer would be
-  # "no blocking marker" — a silent false clear. printf is a builtin and the
-  # grader is a shell function, so nothing in this pipeline can fail into one.
-  graded=$(printf '%s\n' "${1:-}" | coderabbit_scan_tiers --number)
-  while IFS= read -r rest; do
-    [ -n "$rest" ] || continue
-    rest=${rest#*"$tab"}
-    tier=${rest%%"$tab"*}
-    case "$tier" in
-      p0|p1) return 0 ;;
-    esac
-  done <<< "$graded"
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if crw_body_is_blocking_finding "$line"; then
+      return 0
+    fi
+  done <<< "${1:-}"
   return 1
 }
 

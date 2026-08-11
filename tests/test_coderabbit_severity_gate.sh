@@ -3693,214 +3693,82 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 49 (#888): the two closed classifier blind spots reach the REQUIRED gate.
+# Test 49 (#888): the 🔴 Critical rung reaches the REQUIRED gate.
 #
-# The rungs live in scripts/lib/feedback-policy-helpers.sh, which is the whole
+# The rung lives in scripts/lib/feedback-policy-helpers.sh, which is the whole
 # point — #884 routed the advisory coderabbit-wait.sh count and this gate
 # through one classifier, so a blind spot there went blind in both at once, and
-# a private rule in either would re-open the drift #837 closed. These two cases
-# assert the gate BLOCKS on each shape end-to-end rather than asserting the
-# classifier is called: the classifier's own tiering is unit-tested in
-# tests/test_feedback_policy_helpers.sh.
+# a private rule in either would re-open the drift #837 closed. This case
+# asserts the gate BLOCKS on a bare `🔴 Critical` badge end-to-end rather than
+# asserting the classifier is called: the classifier's own tiering is
+# unit-tested in tests/test_feedback_policy_helpers.sh.
 #
-#   a. a bare `🔴 Critical` badge with no other blocking marker
-#   b. a body whose ONLY signal is the machine tag `cr-indicator-types:
-#      potential_issue`, rendered where CodeRabbit puts it — a trailing HTML
-#      comment after the prose
+# #888's other blind spot — a body whose only signal is the
+# `cr-indicator-types:potential_issue` machine tag — is #945, not this change.
 # ---------------------------------------------------------------------------
 BARE_CRITICAL_BODY="_🔒 Security & Privacy_ | _🔴 Critical_
 
 Remote code execution via the unvalidated path."
-MARKER_ONLY_BODY="**Reject the diagnostic bypass in merge-gate callers.**
-
-The caller accepts a bypass flag that skips the gate.
-
-<!-- cr-indicator-types:potential_issue -->"
-
-for case_name in bare-critical marker-only; do
-  case "$case_name" in
-    bare-critical) CASE_BODY="$BARE_CRITICAL_BODY"; CASE_LABEL="a bare 🔴 Critical badge" ;;
-    *)             CASE_BODY="$MARKER_ONLY_BODY";  CASE_LABEL="a machine-tag-only body (cr-indicator-types:potential_issue)" ;;
-  esac
-  echo
-  echo "--- Test 49 (#888): $CASE_LABEL, unresolved"
-  SCRATCH=$(make_scratch_with_config true)
-  FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
-  FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$CASE_BODY")
-  FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [2001]}]')
-  set +e
-  OUT=$(
-    FIXTURE_PR="$FIXTURE_PR" \
-    FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-    FIXTURE_THREADS="$FIXTURE_THREADS" \
-      run_gate "$SCRATCH" 99 owner/repo 2>&1
-  )
-  RC=$?
-  set -e
-  if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
-    pass "#888: $CASE_LABEL blocks the required gate (rc 1, unresolved 1)"
-  else
-    fail "#888: expected rc=1 with 'unresolved: 1' for $CASE_LABEL; got rc=$RC"
-    echo "$OUT" | sed 's/^/      /' >&2
-  fi
-done
-
-# ---------------------------------------------------------------------------
-# Test 50 (#936): the #888 machine-tag rung must not OVERRIDE the badge on the
-# SUMMARY surface — this gate's line-wise path.
-#
-# Test 49's two cases both run through make_single_comment_fixture, i.e. the
-# INLINE path, where the whole finding body is handed to the classifier as one
-# string and the documented fallback ordering holds by construction. The
-# summary path grades LINE BY LINE, and CodeRabbit renders one finding's badge
-# and its `cr-indicator-types` tag on different lines — so each rung fired on
-# its own line, the tag line graded [P1], and a 🟡 Minor summary finding took a
-# red on a REQUIRED gate whose blocking set ({p1} by default) calls p2
-# discretionary. A summary finding has no review thread, so that red had no
-# "Resolve conversation" escape either.
-#
-# 50a is the defect (must NOT gate), 50b the escape (the tag rung still gates
-# when there is no badge at all), 50c the non-vacuity control (the same body
-# DOES gate once p2 is required — so 50a is the tier decision, not a summary
-# path that stopped seeing the finding).
-# ---------------------------------------------------------------------------
-SUMMARY_MINOR_TAGGED_FINDING='_🔒 Security & Privacy_ | _🟡 Minor_ | _⚡ Quick win_
-
-**Bound the retry delay.**
-
-The delay grows without a ceiling.
-
-<!-- cr-indicator-types:potential_issue -->'
-SUMMARY_MINOR_NITPICK_TAG_FINDING='_🔒 Security & Privacy_ | _🟡 Minor_ | _⚡ Quick win_
-
-**Bound the retry delay.**
-
-The delay grows without a ceiling.
-
-<!-- cr-indicator-types:nitpick -->'
-SUMMARY_TAG_ONLY_FINDING='**Reject the diagnostic bypass in merge-gate callers.**
-
-The caller accepts a bypass flag that skips the gate.
-
-<!-- cr-indicator-types:potential_issue -->'
 
 echo
-echo "--- Test 50a (#936): summary 🟡 Minor + trailing machine tag → exit 0"
+echo "--- Test 49 (#888): a bare 🔴 Critical badge, unresolved"
+SCRATCH=$(make_scratch_with_config true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$BARE_CRITICAL_BODY")
+FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [2001]}]')
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "#888: a bare 🔴 Critical badge blocks the required gate (rc 1, unresolved 1)"
+else
+  fail "#888: expected rc=1 with 'unresolved: 1' for a bare 🔴 Critical badge; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 50 (#936): the summary READ is never allowed to fail into "zero
+# findings".
+#
+# This gate's PR-level summary path grades a DOCUMENT: it feeds the summary
+# through `summary_unfenced_numbered` and classifies the surviving lines. The
+# reader ran INSIDE the loop's here-document, and a here-document discards its
+# command substitution's exit status — so a dead reader produced an empty
+# stream, the loop found nothing, and the REQUIRED gate reported zero blocking
+# summary findings from a summary it had never read.
+# ---------------------------------------------------------------------------
+SUMMARY_MAJOR_FINDING='_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
+
+**Reject the diagnostic bypass in merge-gate callers.**
+
+The caller accepts a bypass flag that skips the gate.'
+
+echo
+echo "--- Test 50 (#936): a FAILED summary read is never 'zero findings'"
+# `done <<EOF\n\$(reader)\nEOF` discards the command substitution's status, so
+# an awk that died on a pathological body produced an empty stream, the loop
+# found nothing, and this REQUIRED gate printed `unresolved: 0` and exited 0 —
+# a failed READ reading as a clean REPORT (CodeRabbit 🟠 Major on #936). The
+# body here carries a genuine blocking finding — a 🟠 Major badge, p1 on the
+# shared ladder — so a gate that still says zero is reporting on a summary it
+# never read.
 SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
 FIXTURE_COMMENTS=$(make_comments_fixture '[]')
 FIXTURE_THREADS=$(make_threads_fixture '[]')
 FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
-  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_MINOR_TAGGED_FINDING")")
-set +e
-OUT=$(
-  FIXTURE_PR="$FIXTURE_PR" \
-  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-  FIXTURE_THREADS="$FIXTURE_THREADS" \
-  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
-    run_gate "$SCRATCH" 99 owner/repo 2>&1
-)
-RC=$?
-set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
-    && ! echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)"; then
-  pass "#936: a 🟡 Minor summary finding is not promoted to [P1] by its trailing machine tag → exit 0"
-else
-  fail "#936: expected rc=0 with 'unresolved: 0' and no [P1] summary listing; got rc=$RC"
-  echo "$OUT" | sed 's/^/      /' >&2
-fi
-
-echo "--- Test 50b (escape): summary finding with NO badge, tag only → exit 1"
-SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
-FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
-  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_TAG_ONLY_FINDING")")
-set +e
-OUT=$(
-  FIXTURE_PR="$FIXTURE_PR" \
-  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-  FIXTURE_THREADS="$FIXTURE_THREADS" \
-  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
-    run_gate "$SCRATCH" 99 owner/repo 2>&1
-)
-RC=$?
-set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
-    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)"; then
-  pass "#936 escape: the #888 tag rung still gates a badge-less summary finding → exit 1"
-else
-  fail "#936 escape: expected rc=1 with 'unresolved: 1' + a [P1] summary listing; got rc=$RC"
-  echo "$OUT" | sed 's/^/      /' >&2
-fi
-
-echo "--- Test 50c (control): the SAME 50a body + p2 required → exit 1 as [P2]"
-SCRATCH=$(make_scratch_with_policy "$P2_REQUIRED_POLICY")
-FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
-  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_MINOR_TAGGED_FINDING")")
-set +e
-OUT=$(
-  FIXTURE_PR="$FIXTURE_PR" \
-  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-  FIXTURE_THREADS="$FIXTURE_THREADS" \
-  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
-    run_gate "$SCRATCH" 99 owner/repo 2>&1
-)
-RC=$?
-set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "\[P2\] (PR-level summary comment)"; then
-  pass "#936 control: the same summary finding gates as [P2] once p2 is required (50a is the tier, not a blind path)"
-else
-  fail "#936 control: expected rc=1 + a [P2] summary listing; got rc=$RC"
-  echo "$OUT" | sed 's/^/      /' >&2
-fi
-
-echo "--- Test 50d (#936): a NON-blocking tag closes its stanza → the next badge-less finding still gates"
-# The stanza terminator is the tag's PRESENCE, not its tier. CodeRabbit's tag
-# vocabulary is wider than `potential_issue`, and keying the reset on "the tag
-# graded" left the 🟡 Minor stanza's tier latched across a `nitpick`
-# terminator — so the badge-less finding below it, whose only signal is the
-# #888 tag, was suppressed as though that earlier badge had graded it. This
-# gate then reported ZERO blocking summary findings on a summary that carries
-# one: an under-block on the REQUIRED gate (Codex P1 on #936). Asserted here,
-# end to end, and not only on the shared helper, because the direction of the
-# failure is a merge that should not have happened.
-SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
-FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
-  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_MINOR_NITPICK_TAG_FINDING
-
-$SUMMARY_TAG_ONLY_FINDING")")
-set +e
-OUT=$(
-  FIXTURE_PR="$FIXTURE_PR" \
-  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-  FIXTURE_THREADS="$FIXTURE_THREADS" \
-  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
-    run_gate "$SCRATCH" 99 owner/repo 2>&1
-)
-RC=$?
-set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
-    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)"; then
-  pass "#936: a non-blocking tag value closes its stanza, so the next badge-less finding still gates → exit 1"
-else
-  fail "#936: expected rc=1 with 'unresolved: 1' + a [P1] summary listing; got rc=$RC"
-  echo "$OUT" | sed 's/^/      /' >&2
-fi
-
-echo "--- Test 50e (#936): a FAILED summary grading pipeline is never 'zero findings'"
-# `done <<EOF\n\$(pipeline)\nEOF` discards the command substitution's status, so
-# an awk that died on a pathological body produced an empty stream, the loop
-# found nothing, and this REQUIRED gate printed `unresolved: 0` and exited 0 —
-# a failed READ reading as a clean REPORT (CodeRabbit 🟠 Major on #936). The
-# body here carries a genuine blocking finding, so a gate that still says zero
-# is reporting on a summary it never read.
-SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
-FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
-  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_TAG_ONLY_FINDING")")
-AWK_COUNTER="$WORKDIR/awk-calls-50e"
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_MAJOR_FINDING")")
+AWK_COUNTER="$WORKDIR/awk-calls-50"
 : >"$AWK_COUNTER"
 # Count the reader's runs on THIS fixture with nothing failing, so the
 # threshold below is derived rather than guessed: every run but the last is the
-# classifier's, and the last is the graded pipeline under test.
+# classifier's, and the last is the summary read under test.
 CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER=9999 \
 CR_GATE_TEST_AWK_COUNTER="$AWK_COUNTER" \
   FIXTURE_PR="$FIXTURE_PR" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
@@ -3925,7 +3793,7 @@ set -e
 if [ "$TOTAL_AWK" -gt 1 ] && [ "$RC" != 0 ] \
     && ! echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
     && ! echo "$OUT" | grep -q "carries a non-benign outcome stanza"; then
-  pass "#936: a failed summary grading pipeline fails closed rather than reporting zero blocking findings"
+  pass "#936: a failed summary read fails closed rather than reporting zero blocking findings"
 else
   fail "#936: expected a nonzero exit with no 'unresolved: 0' claim and a classified summary; got rc=$RC (reader runs=$TOTAL_AWK)"
   echo "$OUT" | sed 's/^/      /' >&2
