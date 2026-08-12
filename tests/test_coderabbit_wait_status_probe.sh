@@ -295,6 +295,12 @@ case "$endpoint" in
         # the review it is credited to.
         printf '[{"id":9961,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
+      probe_run_pause_precedes_object)
+        # #857 item 1, review-object arm: the summarize comment's pause
+        # stanza predates the HEAD-pinned run, so anchor-aware triage cannot
+        # surface it without the explicit anchor-free pause read below.
+        printf '[{"id":9965,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
+        ;;
       intermediate_review_head_pin)
         # #535.2: a NEWER review (later submitted_at) references an
         # intermediate commit, while the HEAD review is older. The
@@ -411,6 +417,17 @@ case "$endpoint" in
         # object at reply_time. Clean body, so nothing else would block a
         # clear — only the temporal correlation check does.
         printf '[{"id":7806,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nPrior head summary."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      probe_run_pause_precedes_object)
+        # #857 item 1, review-object arm (Phase 4b P1 on this PR). Same
+        # ordering as the stale-stanza fixture above — the summarize comment's
+        # last edit predates the HEAD-pinned run and is never refreshed — but
+        # the stanza is a PAUSE. `newest_class` is therefore empty, so the
+        # anchored triage sees nothing, and before this arm the probe emitted
+        # `awaiting-summary` with the review OBJECT as evidence: the barrier's
+        # #847 resume gates on observed=paused and keys its at-most-once marker
+        # on the NOTE's comment id, so neither was reachable.
+        printf '[{"id":7942,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n<!-- This is an auto-generated comment: review paused by coderabbit.ai -->\\n> [!NOTE]\\n> ## Reviews paused\\n<!-- end of auto-generated comment: review paused by coderabbit.ai -->"}]\n' "$bot" "$head_time" "$head_time"
         ;;
       probe_notice_after_review)
         printf '[{"id":9982,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached"}]\n' "$bot" "$reply_time" "$reply_time"
@@ -1533,12 +1550,123 @@ probe_summary_review_failed|notyet:summary-without-head-review|a Review-failed s
 probe_summary_skip_review|notyet:summary-without-head-review|an explicit skip-review stanza naming the head is not a report (#797)
 probe_summary_unknown_stanza|notyet:summary-without-head-review|a stanza KIND CodeRabbit has not shipped reads not-yet, never clean
 probe_summary_legacy_ratelimit_prose|notyet:none|an aged summary with legacy rate-limit prose is rejected by class alone
-probe_summary_paused_aged|notyet:none|an aged paused summary naming the head is rejected by class alone (#593)
+probe_summary_paused_aged|notyet:paused|an aged paused summary is still a PAUSE, reported anchor-free so the resume path sees it (#857)
 probe_summary_midreview|notyet:in_progress|a mid-review summary that already names the head stays in_progress
 probe_summary_chat_reply_only|notyet:summary-without-head-review|a SHA-quoting chat reply with a prior-head summary must not clear (#794)
 probe_summary_marker_outside_premerge|findings|a blocking marker outside the pre-merge table escalates immediately as rc 2
 probe_summary_premerge_truncated|findings|a truncated pre-merge block strips nothing and fails toward rc 2
 ROWS
+}
+
+test_857_aged_pause_reaches_the_resume_path() {
+  # #857 item 1 (Codex P2 on #856). The anchored triage drops a pause note
+  # whose fresh_at predates the new head's committer date — which is what every
+  # fix push produces — so the probe reported observed=none. The Phase 4b
+  # barrier's #847 pause recovery keys on the note carried in the probe
+  # evidence, so it was never reached: the barrier posted a review request to a
+  # still-paused bot and then waited out its whole budget.
+  #
+  # The summarize comment carries the pause stanza and is selected anchor-free,
+  # so its class recovers what the anchor hid. Two things are asserted, and the
+  # SECOND is the one that makes the recovery work: `observed` is the value
+  # p4b_barrier_maybe_resume gates on, and the evidence must be the pause
+  # comment itself, because that helper keys its at-most-once marker on the
+  # note's comment id and DECLINES ("resume-unidentified") without one.
+  local dir rc obs ev_id ev_fresh cls resume_gate
+  dir=$(make_case probe-857-aged-pause 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_summary_paused_aged)
+  obs=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ev_id=$(jq -r '.review.id // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ev_fresh=$(jq -r '.review.fresh_at // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  # Chained through the SHIPPED barrier arm rather than a restatement of it:
+  # not-yet is what keeps the bounded wait, and it is the class that reaches
+  # the resume call site in p4b_same_head_barrier.
+  cls=$(bash -c '. "$1/scripts/phase-4b/lib.sh"; p4b_barrier_class_coderabbit head-sha "$3" "$(cat "$2")"' \
+    _ "$ROOT" "$dir/out.json" "$rc" 2>/dev/null || echo PARSE_ERROR)
+  # And the resume helper must IDENTIFY the note from this evidence. dry=true,
+  # so nothing is posted; "resume-unidentified" is the pre-fix outcome and
+  # "would-resume" is the ONLY outcome that proves identification succeeded.
+  #
+  # Asserted POSITIVELY, on CodeRabbit's finding: every failure token also
+  # differs from "resume-unidentified", so a negative check accepts them all.
+  # This one had teeth missing in both directions — the helper re-reads the PR
+  # timeline for its at-most-once marker, so with the real gh on PATH the call
+  # left the sandbox, failed against a repo named `owner/repo`, and returned
+  # `resume-read-failed`, which passed. A stub serving an EMPTY timeline keeps
+  # the read hermetic and leaves the outcome decided by the identification step
+  # alone: no marker + dry run = would-resume.
+  mkdir -p "$dir/resume-bin"
+  cat >"$dir/resume-bin/gh" <<'RESUME_GH'
+#!/usr/bin/env bash
+printf '[]\n'
+RESUME_GH
+  chmod +x "$dir/resume-bin/gh"
+  resume_gate=$(PATH="$dir/resume-bin:$PATH" bash -c '. "$1/scripts/phase-4b/lib.sh"; P4B_CLAIM_DIR="$3" p4b_barrier_maybe_resume owner/repo 999 head-sha rev-bot "$(cat "$2")" true' \
+    _ "$ROOT" "$dir/out.json" "$dir/state/claims" 2>/dev/null || echo HELPER_ERROR)
+  if [ "$rc" = "7" ] && [ "$obs" = "paused" ] && [ "$ev_id" = "7925" ] \
+     && [ "$ev_fresh" != "MISSING" ] && [ "$cls" = "not-yet" ] \
+     && [ "$resume_gate" = "would-resume" ] \
+     && [ "$(probe_count "$dir")" = "0" ]; then
+    pass "#857: an aged pause note is reported anchor-free with its comment id, so the barrier's resume path can key on it"
+  else
+    fail "#857 aged pause → rc=$rc observed=$obs evidence_id=$ev_id fresh_at=$ev_fresh class=$cls resume=$resume_gate"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+
+  # rate_limit stays ANCHORED. Reading it anchor-free too would let an ancient
+  # window decline the trigger forever — the deadlock the anchored triage
+  # exists to prevent. The aged legacy-prose fixture is the same shape as the
+  # pause one apart from its class, so this is the discriminating pair.
+  local dir2 rc2 obs2
+  dir2=$(make_case probe-857-aged-ratelimit 600 true 30 3 2)
+  rc2=$(run_probe_case "$dir2" probe_summary_legacy_ratelimit_prose)
+  obs2=$(jq -r '.probe.observed // "MISSING"' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc2" = "7" ] && [ "$obs2" = "none" ]; then
+    pass "#857: an aged rate-limit summary stays anchored (observed=none) — only paused is read anchor-free"
+  else
+    fail "#857 aged rate-limit → rc=$rc2 observed=$obs2 (expected 7/none)"
+    sed 's/^/      /' "$dir2/err.log" >&2 || true
+  fi
+}
+
+test_857_pause_predating_a_run_reaches_the_resume_path() {
+  # #857 item 1, review-object arm. Phase 4b P1 on this PR: the anchor-free
+  # pause read only covered the NO-review-object branch, so a durable pause
+  # note that predates a HEAD-pinned run stayed invisible — the anchored scan
+  # finds nothing at-or-after the run, and the probe emitted `awaiting-summary`
+  # carrying the review OBJECT. p4b_barrier_maybe_resume gates on
+  # observed=paused AND keys its at-most-once marker on the note's comment id,
+  # so from that emission the recovery could not fire at all.
+  #
+  # Direction 1 — no correlated success: report the pause, with the NOTE as
+  # evidence, so both halves of the resume gate are satisfied.
+  local dir rc obs ev_id cls resume_gate
+  dir=$(make_case probe-857-pause-before-run 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(run_probe_case "$dir" probe_run_pause_precedes_object)
+  obs=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ev_id=$(jq -r '.review.id // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  cls=$(bash -c '. "$1/scripts/phase-4b/lib.sh"; p4b_barrier_class_coderabbit head-sha "$3" "$(cat "$2")"' \
+    _ "$ROOT" "$dir/out.json" "$rc" 2>/dev/null || echo PARSE_ERROR)
+  # Same hermetic stub as test_857_aged_pause_reaches_the_resume_path: an empty
+  # timeline leaves the outcome decided by identification alone.
+  mkdir -p "$dir/resume-bin"
+  cat >"$dir/resume-bin/gh" <<'RESUME_GH2'
+#!/usr/bin/env bash
+printf '[]\n'
+RESUME_GH2
+  chmod +x "$dir/resume-bin/gh"
+  resume_gate=$(PATH="$dir/resume-bin:$PATH" bash -c '. "$1/scripts/phase-4b/lib.sh"; P4B_CLAIM_DIR="$3" p4b_barrier_maybe_resume owner/repo 999 head-sha rev-bot "$(cat "$2")" true' \
+    _ "$ROOT" "$dir/out.json" "$dir/state/claims" 2>/dev/null || echo HELPER_ERROR)
+  if [ "$rc" = "7" ] && [ "$obs" = "paused" ] && [ "$ev_id" = "7942" ] \
+     && [ "$cls" = "not-yet" ] && [ "$resume_gate" = "would-resume" ] \
+     && [ "$(probe_count "$dir")" = "0" ]; then
+    pass "#857: a pause note predating a HEAD-pinned run is reported anchor-free, so the resume path is reachable from the review-object branch too"
+  else
+    fail "#857 pause-before-run → rc=$rc observed=$obs evidence_id=$ev_id class=$cls resume=$resume_gate"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+
 }
 
 test_851_review_object_premerge_shares_strip() {
@@ -1624,6 +1752,49 @@ test_824_sha_matched_review_is_honored_regardless_of_timestamp() {
   else
     fail "#824: expected rc 2/findings/count 1 for the SHA-matched aged review; got rc=$rc status=$status count=$potential"
     sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_857_summary_selector_unit() {
+  # The marker-led summary selection is now read from TWO probe branches, so it
+  # is a shared function; the properties its call sites depend on are asserted
+  # on it directly. `startswith` (not containment) is the #794 property: a chat
+  # reply QUOTING the marker is the freshest candidate and must not win.
+  local snip="$WORKDIR/summary-selector.sh" bad="" marker sel comments
+  marker='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+  awk '/^# BEGIN coderabbit_summary_selector$/{f=1;next} /^# END coderabbit_summary_selector$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  comments=$(jq -nc --arg m "$marker" '[
+    {id: 1, user: {login: "coderabbitai[bot]"}, created_at: "2026-06-04T00:00:00Z",
+     updated_at: "2026-06-04T00:00:00Z", body: ($m + "\nolder summary")},
+    {id: 2, user: {login: "coderabbitai[bot]"}, created_at: "2026-06-04T00:00:01Z",
+     updated_at: "2026-06-04T00:00:04Z", body: ($m + "\nnewest summary")},
+    {id: 3, user: {login: "coderabbitai[bot]"}, created_at: "2026-06-04T00:00:09Z",
+     updated_at: "2026-06-04T00:00:09Z", body: ("a reply that quotes " + $m + " mid-body")},
+    {id: 4, user: {login: "someone-else"}, created_at: "2026-06-04T00:00:10Z",
+     updated_at: "2026-06-04T00:00:10Z", body: ($m + "\nnot the bot")}
+  ]')
+  sel=$(crw_select_summary_comment "$comments" 'coderabbitai[bot]' "$marker")
+  [ -n "$sel" ] || bad="$bad selected-nothing"
+  [ "$(printf '%s' "$sel" | base64 --decode | jq -r '.json | fromjson | .id')" = "2" ] \
+    || bad="$bad wrong-comment"
+  # fresh_at is max(created_at, updated_at) — the in-place edit, not creation.
+  [ "$(printf '%s' "$sel" | base64 --decode | jq -r '.json | fromjson | .fresh_at')" = "2026-06-04T00:00:04Z" ] \
+    || bad="$bad wrong-fresh-at"
+  [ "$(printf '%s' "$sel" | base64 --decode | jq -r '.json | fromjson | .endpoint')" = "issues" ] \
+    || bad="$bad wrong-endpoint"
+  # No summary at all selects nothing, which is what makes both call sites
+  # degrade to their pre-existing behaviour rather than to a false verdict.
+  [ -z "$(crw_select_summary_comment '[]' 'coderabbitai[bot]' "$marker")" ] \
+    || bad="$bad empty-selected-something"
+
+  if [ -z "$bad" ]; then
+    pass "#857: the shared summary selector is marker-led at byte zero, bot-scoped, and newest-by-fresh_at"
+  else
+    fail "#857 summary selector:$bad"
   fi
 }
 
@@ -1922,6 +2093,9 @@ test_probe_summary_without_head_review_is_not_yet
 test_probe_summary_lagging_head_review_is_not_yet
 test_869_probe_awaiting_summary_context_state
 test_869_probe_summary_landing_mid_probe_is_scanned
+test_857_aged_pause_reaches_the_resume_path
+test_857_pause_predating_a_run_reaches_the_resume_path
+test_857_summary_selector_unit
 test_probe_reviews_api_failure_is_infra_not_clean
 test_probe_summary_only_marker_is_findings
 test_probe_notice_after_review_is_not_complete
