@@ -3403,9 +3403,24 @@ run_cm_matrix expect_not_rendered "Case 15aa" \
   'type 5: and inside a CDATA section|<![CDATA[\nSee [the audit](hub.md)\n]]>' \
   'a blank line does NOT end a type 1 block|<script>\n\nSee [the audit](hub.md)\n</script>' \
   'the opener line carries block content, not Markdown|<div>See [the audit](hub.md)' \
-  'type 7: a complete tag alone opens a block too|<span>\nSee [the audit](hub.md)'
+  'type 7: a complete tag alone opens a block too|<span>\nSee [the audit](hub.md)' \
+  'a quoted block still swallows its own quoted content|> <script>\n> See [the audit](hub.md)\n> </script>'
 
+# An HTML block lives inside a CONTAINER, and both ways of leaving that
+# container end it. These rows are the MISS direction, which is why they were
+# worth another round: a state machine that keeps blanking after the block is
+# over deletes rendered links from the scan, and the first version of this
+# case had exactly that defect (Codex P2 on #925).
+#
+#   the terminator is tested against block CONTENT, so a MARKED blank (a line
+#   holding only `>`) ends a quoted type 6 block; passing the raw line to the
+#   whitespace test never matched and the block ran on
+#   the CONTAINER closing ends it with no closer of its own, so an unquoted
+#   line after `> <script>` is ordinary Markdown again
 run_cm_matrix expect_rendered "Case 15aa" \
+  'a marked blank ends a quoted type 6 block|> <div>\n>\n> See [the audit](hub.md)' \
+  'leaving the quote ends the block it held|> <script>\nSee [the audit](hub.md)' \
+  'and an unmarked blank does both at once|> <div>\n\nSee [the audit](hub.md)' \
   'a blank line DOES end a type 6 block (control)|<div>\n\nSee [the audit](hub.md)' \
   'and the link after a closed type 6 block renders|<div>\nx\n</div>\n\nSee [the audit](hub.md)' \
   'the line after a type 1 closer is Markdown again|<script>\nx\n</script>\nSee [the audit](hub.md)' \

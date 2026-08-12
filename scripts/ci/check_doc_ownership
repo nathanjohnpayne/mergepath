@@ -852,14 +852,29 @@ mp_markdown_renderable_text() {
       # while types 6 and 7 end at a blank line which is NOT. So the blank
       # falls through to the branch below rather than being consumed here —
       # it still has to close the text flow and bound a blank-first item.
+      # The end condition is tested against the block CONTENT, which means
+      # after the active block-quote prefix. A quoted type 6 block ends at a
+      # MARKED blank — `> <div>`, a line holding only `>`, then `> [audit](…)`
+      # renders that link in both renderers — and passing the raw line to the
+      # whitespace test kept the block open and blanked it, which is the MISS
+      # direction (Codex P2 on #925). QD_CHARS is zero on an unquoted line, so
+      # nothing outside a quote changes.
+      # An HTML block also ends when the CONTAINER holding it ends, with no
+      # closer of its own: `> <script>` followed by an unquoted line leaves
+      # the quote, and both renderers render that line as ordinary Markdown.
+      # Carrying the state on regardless blanked it, and a blanked line is a
+      # MISSED reference (Codex P2 on #925). The depth is recorded at the
+      # opener, so an unquoted block is never affected.
+      if (in_html && line_quote < html_quote) in_html = 0
       if (in_html) {
+        html_content = substr(line, QD_CHARS + 1)
         if (in_html <= 5) {
-          if (html_block_ends(line, in_html)) in_html = 0
+          if (html_block_ends(html_content, in_html)) in_html = 0
           text_flow_open = 0
           print ""
           next
         }
-        if (html_block_ends(line, in_html)) {
+        if (html_block_ends(html_content, in_html)) {
           in_html = 0
         } else {
           text_flow_open = 0
@@ -1042,7 +1057,11 @@ mp_markdown_renderable_text() {
         # here as well; the branch above only ever sees the lines after it.
         if (html_opened) {
           rendered = ""
-          in_html = (html_block_ends(line, html_opened)) ? 0 : html_opened
+          in_html = (html_block_ends(substr(line, QD_CHARS + 1), html_opened)) \
+                    ? 0 : html_opened
+          # The quote depth the block was opened AT, so it can be closed when
+          # that container closes — see the guard above.
+          html_quote = line_quote
         }
       }
       print rendered
