@@ -23,7 +23,6 @@
 #   resolve_required_tiers [cfg]           # one blocking tier per line
 #   codex_tier_of "<comment-body>"         # p0..p3 or empty
 #   coderabbit_tier_of "<comment-body>"    # p0..p3|nitpick or empty
-#   mp_strict_iso_at_or_after <lhs> <rhs>  # fail-closed timestamp predicate
 #
 # cfg defaults to $CONFIG (the global the gate scripts set) and then to
 # .github/review-policy.yml, matching scripts/lib/reviewers-helpers.sh.
@@ -32,18 +31,6 @@
 #   p0  critical   p1  high   p2  minor   p3  trivial   nitpick  style
 # Codex maps EXACTLY (badge markers); CodeRabbit maps HEURISTICALLY (category
 # + Critical/Major/Minor qualifier — it has no numeric scale).
-
-# True only when both ISO-8601 timestamps parse and lhs is at-or-after rhs.
-# This is the fail-closed counterpart to a predicate that may suppress a
-# fast-path: an absent or malformed timestamp must never count as evidence
-# that a provider's context post-dates its review.
-mp_strict_iso_at_or_after() {
-  local lhs="${1:-}" rhs="${2:-}"
-  [ -n "$lhs" ] && [ -n "$rhs" ] || return 1
-  [ "$(jq -nr --arg l "$lhs" --arg r "$rhs" \
-        'try (($l | fromdateiso8601) >= ($r | fromdateiso8601)) catch false' \
-        2>/dev/null || printf 'false')" = "true" ]
-}
 
 # Read a scalar field directly under the feedback_policy: block. Mirrors the
 # block-scoped awk reader used by codex_field (scripts/codex-p1-gate.sh) and

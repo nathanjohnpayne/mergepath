@@ -436,10 +436,6 @@ paths:
       - "scripts/phase-4b/"
       - "scripts/gh-as-reviewer.sh"
       - "scripts/post-phase-4b-handoff.sh"
-      # The Phase 4b barrier shares its fail-closed timestamp predicate with
-      # coderabbit-wait.sh through this helper. Keep it explicit so the kit
-      # never reaches a consumer without the predicate it sources.
-      - "scripts/lib/feedback-policy-helpers.sh"
       # The #814 same-head barrier invokes both of these directly, by path,
       # on every non-dry run. A consumer that receives the orchestrator
       # without them — or with copies predating `--probe` (#823) and the

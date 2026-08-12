@@ -26,14 +26,6 @@ p4b_die()  { local c="$1"; shift; echo "[phase-4b] ERROR: $*" >&2; exit "$c"; }
 # are found regardless of $PWD or how the caller was invoked.
 P4B_LIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# CodeRabbit's probe and the Phase 4b barrier need one fail-closed timestamp
-# predicate. This is already a required dependency of coderabbit-wait.sh, so
-# centralizing it there preserves that script's standalone package layout.
-P4B_FEEDBACK_HELPERS="$(cd -P "$P4B_LIB_DIR/.." && pwd)/lib/feedback-policy-helpers.sh"
-[ -r "$P4B_FEEDBACK_HELPERS" ] || p4b_die 3 "missing required helper: $P4B_FEEDBACK_HELPERS"
-# shellcheck source=../lib/feedback-policy-helpers.sh
-. "$P4B_FEEDBACK_HELPERS"
-
 # Resolve the repo root from this library's own location (follow symlinks),
 # NOT $PWD — the same posture scripts/phase-4b-classifier.sh uses so a
 # PATH-symlinked or subdir invocation still finds the policy file.
@@ -163,7 +155,6 @@ p4b_top_field() {
 # class. Pure: jq over the passed string only, no I/O, always returns 0.
 p4b_barrier_class_coderabbit() {
   local head="$1" rc="$2" json="$3" probe_head probe_observed
-  local probe_review_submitted_at probe_context_updated_at
   case "$rc" in
     0)
       # Terminal, but only for the head about to be approved. An rc 0
@@ -290,13 +281,16 @@ p4b_barrier_class_coderabbit() {
       # barrier's own drift check.
       probe_head="$(printf '%s' "$json" | jq -r '.head_sha // empty' 2>/dev/null || true)"
       probe_observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
-      probe_review_submitted_at="$(printf '%s' "$json" | jq -r '.review.submitted_at // empty' 2>/dev/null || true)"
-      probe_context_updated_at="$(printf '%s' "$json" | jq -r '.probe.context_updated_at // empty' 2>/dev/null || true)"
       if [ -n "$probe_head" ] && [ "$probe_head" = "$head" ] \
          && { [ "$probe_observed" = "awaiting-summary" ] || [ "$probe_observed" = "terminal" ]; } \
          && [ "$(printf '%s' "$json" | jq -r '.review.endpoint // empty' 2>/dev/null || true)" = "reviews" ] \
          && [ "$(printf '%s' "$json" | jq -r '.probe.context_state // empty' 2>/dev/null || true)" = "success" ] \
-         && mp_strict_iso_at_or_after "$probe_context_updated_at" "$probe_review_submitted_at"; then
+         && [ "$(printf '%s' "$json" | jq -r '
+                  (.review.submitted_at // "") as $r
+                  | (.probe.context_updated_at // "") as $c
+                  | if $r == "" or $c == "" then false
+                    else (try (($c | fromdateiso8601) >= ($r | fromdateiso8601)) catch false)
+                    end' 2>/dev/null || true)" = "true" ]; then
         printf 'reported'
       else
         printf 'not-yet'
