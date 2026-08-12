@@ -236,11 +236,13 @@ mp_markdown_renderable_text() {
     function tab_stop_advance(col) {
       return 4 - (col % 4)
     }
-    # Columns of leading whitespace on a line, tabs expanded. `indent` in the
-    # main rule is a CHARACTER offset (it feeds substr), which equals this
-    # only when the run holds no tab.
-    function lead_columns(s,   i, c, ch) {
-      c = 0
+    # The ABSOLUTE column of the first character of `s` that is not a space or
+    # tab, given that `s` itself starts at column `start`. The starting column
+    # is a parameter because a tab advances to the next tab stop of the LINE,
+    # so a run measured from the wrong origin lands on the wrong stop — which
+    # is exactly what happens to the text after a block-quote marker.
+    function content_column(s, start,   i, c, ch) {
+      c = start
       for (i = 1; i <= length(s); i++) {
         ch = substr(s, i, 1)
         if (ch == " ") c++
@@ -248,6 +250,10 @@ mp_markdown_renderable_text() {
         else break
       }
       return c
+    }
+    # Columns of leading whitespace on a whole line, tabs expanded.
+    function lead_columns(s) {
+      return content_column(s, 0)
     }
     # Columns from the start of a list marker to the CONTENT column of the
     # item, per CommonMark 0.31.2 § List items. A marker of width W followed
@@ -638,9 +644,18 @@ mp_markdown_renderable_text() {
     # quote did not take it down with it; the stale frame raised the code
     # threshold and a six-column link was reported although both renderers
     # render it as indented code in the OUTER item.
+    #
+    # Two more facts about the prefix are reported back, because every
+    # allowance measured "from the start of the line" is really measured from
+    # the end of the container prefix: QD_CHARS is how many SOURCE CHARACTERS
+    # the markers and their attached spaces occupy, and QD_COL is the absolute
+    # COLUMN the content after them begins at. Both are zero on an unquoted
+    # line, which is what makes the callers uniform.
     function quote_depth(s, base,   d, i, run, eaten, ch, col, adv) {
       d = 0
       i = 1
+      QD_CHARS = 0
+      QD_COL = 0
       # Container indentation first, and only as much of it as is actually
       # there — a line may be dedented below `base` and still open a quote.
       #
@@ -688,6 +703,12 @@ mp_markdown_renderable_text() {
         ch = substr(s, i, 1)
         if (ch == " ") { i++; col++ }
         else if (ch == "\t") { col += tab_stop_advance(col); i++ }
+        # Snapshot after each ACCEPTED marker rather than at the end of the
+        # loop: the loop exits having already consumed the whitespace run that
+        # failed the marker test, and that run is content indentation, not
+        # prefix.
+        QD_CHARS = i - 1
+        QD_COL = col
       }
       return d
     }
@@ -740,18 +761,43 @@ mp_markdown_renderable_text() {
         reference_pending = 0
         if (line !~ /^[ \t]*$/) reference_continuation = 1
       }
-      indent = match(line, /[^ ]/) - 1
-      if (indent < 0) indent = length(line)
-      rest = substr(line, indent + 1)
-      # `indent` is a character offset (it feeds substr and the fence rules);
-      # `col_indent` is the same run measured in COLUMNS, which is what every
-      # code-block threshold below compares against.
+      # The leading whitespace run of the whole line, measured in COLUMNS,
+      # which is what every code-block threshold below compares against.
       col_indent = lead_columns(line)
 
+      # CommonMark 0.31.2 § Fenced code blocks allows a fence "indented by up
+      # to three spaces" — and that allowance, like every other one in the
+      # spec, is relative to the CONTENT COLUMN of the container the line
+      # arrives inside, not to column zero. Measuring it absolutely made the
+      # two shapes below unrecognizable as fences, so both renderers put the
+      # link inside a code block and this program scanned it as prose (#929
+      # item 29, both FALSE ownership failures):
+      #
+      #   `10. para` then a four-column fence — the item content column is
+      #   already four, so the fence sits at relative zero
+      #   `> ` then a fence — the marker takes two columns before the content
+      #   of the quote even begins
+      #
+      # `fence_body` is the line with the block-quote prefix and the
+      # indentation stripped, so the fence characters are at its front for
+      # both the opener and the closer; `fence_col` is the absolute column
+      # they start at, and `fence_base` the column the container puts content
+      # at. Inside a quote that base is the column after the markers, which is
+      # the innermost container measurable here; outside one it is the
+      # container stack. A NEGATIVE difference is fine and deliberate: a fence
+      # dedented below its container is still a fence, and still closes what
+      # it leaves.
+      fence_rest = substr(line, QD_CHARS + 1)
+      fence_off = match(fence_rest, /[^ \t]/) - 1
+      if (fence_off < 0) fence_off = length(fence_rest)
+      fence_body = substr(fence_rest, fence_off + 1)
+      fence_col = content_column(fence_rest, QD_COL)
+      fence_base = (line_quote > 0) ? QD_COL : code_column
+
       if (in_fence) {
-        if (indent <= 3 && substr(rest, 1, 1) == fence_char) {
-          width = run_len(rest, 1, fence_char)
-          tail = substr(rest, width + 1)
+        if (fence_col - fence_base <= 3 && substr(fence_body, 1, 1) == fence_char) {
+          width = run_len(fence_body, 1, fence_char)
+          tail = substr(fence_body, width + 1)
           if (width >= fence_width && tail ~ /^[ \t]*$/) in_fence = 0
         }
         text_flow_open = 0
@@ -809,11 +855,11 @@ mp_markdown_renderable_text() {
       # the guard was written for. So the opener is recognized BEFORE the pop
       # rather than after it, and the branch that consumes it reuses the
       # answer instead of re-deciding.
-      ch = substr(rest, 1, 1)
+      ch = substr(fence_body, 1, 1)
       fence_here = 0
-      if (indent <= 3 && (ch == "`" || ch == "~")) {
-        width = run_len(rest, 1, ch)
-        tail = substr(rest, width + 1)
+      if (fence_col - fence_base <= 3 && (ch == "`" || ch == "~")) {
+        width = run_len(fence_body, 1, ch)
+        tail = substr(fence_body, width + 1)
         # CommonMark forbids a backtick in a backtick fence info string.
         # Such a line is rendered prose, not a fence opener.
         if (width >= 3 && !(ch == "`" && index(tail, "`") > 0)) fence_here = 1
@@ -960,10 +1006,20 @@ mp_markdown_renderable_text() {
 #                     ships broken to every consumer with check 10 silent
 #                     (#797 review).
 #
-# Each producer carries its own `|| true`: the brace group is the left
-# side of a pipeline (so it runs in a subshell where `set -e` applies),
-# and a no-match exit 1 from the FIRST grep would otherwise abort the
-# group and silently discard the later producers' output.
+# The `|| true` inside the brace group belongs to the GREP and to nothing
+# else. The group is the left side of a pipeline, so it runs in a subshell
+# where `set -e` applies, and a no-match exit 1 from that grep would abort the
+# group and silently discard the later producers' output — a real outcome,
+# because a doc need not carry a same-line reference definition.
+#
+# The two awk producers carry no such guard, deliberately. Neither has a
+# no-match state: they read every line and print what they find, so a nonzero
+# exit from either means the classifier DIED, and swallowing that turns check
+# 10 into a clean PASS on a document nobody could read. Measured on this
+# program: restore the recursion the classifier used to use and hand it a
+# document deep enough to segfault BWK awk, and with the guards in place the
+# whole check exits 0 with no findings. The callers now inspect the status —
+# see check 10 — so the same input reports a scan failure instead.
 mp_doc_link_targets() {
   local f="$1"
   # `$2` selects which stream the final awk emits: empty (the default) for the
@@ -1050,7 +1106,7 @@ mp_doc_link_targets() {
           }
         }
       }
-    ' || true
+    '
     mp_markdown_renderable_text "$f" | grep -oE '^[[:space:]]{0,3}\[[^]]+\]:[[:space:]]*(<[^>]*>|[^[:space:]]+)' || true
     # Wrapped reference definition: a label + colon with NOTHING after it
     # on that line, then the destination as the first token of the next
@@ -1077,7 +1133,7 @@ mp_doc_link_targets() {
         indent = match($0, /[^[:space:]]/) - 1
         if (indent >= 0 && indent <= 3) pending = 1
       }
-    ' || true
+    '
   } | sed -E \
         -e 's/^\]\(//' \
         -e 's/\)$//' \
@@ -1587,28 +1643,43 @@ mp_doc_link_targets() {
         # no safer — every control byte except NUL, CR and LF is a legal
         # pathname byte here and is emitted as itself. A separate stream
         # cannot alias anything.
+        # The blank-line filter lives here rather than in a trailing
+        # `grep -v ... || true`, and that placement is load-bearing. A `grep`
+        # last in the pipeline exits 1 whenever it filters everything out,
+        # which is an ORDINARY outcome (a doc with no destinations at all), so
+        # the `|| true` that covered it also covered a producer that DIED. The
+        # consequence is measurable on this program: restore the recursion the
+        # classifier used to use, hand it a document deep enough to segfault
+        # BWK awk, and check 10 prints a clean PASS on a document it could not
+        # read. With the filter moved inside, the last stage is this awk and
+        # its exit status means what it says.
         function emit_target(decoded, raw) {
           if (EMIT == "unresolvable") {
             if (TARGET_UNRESOLVED) print raw
             return
           }
+          if (decoded ~ /^[[:space:]]*$/) return
           print decoded
         }
         {
           sub(/^[[:space:]]+/, "")
-          raw = $0
           if (substr($0, 1, 1) == "<") {
             gt = index($0, ">")
             if (gt > 1) {
-              emit_target(normalize_target(substr($0, 2, gt - 2)), raw)
+              # The destination AS WRITTEN is the angle wrapper, not the whole
+              # line: a reference definition may carry a title after it, and
+              # quoting `<x.md> "Title"` as the destination names something
+              # the author did not write. The bare branch below already trims
+              # at the first space; this is the same trim.
+              emit_target(normalize_target(substr($0, 2, gt - 2)), \
+                          substr($0, 1, gt))
               next
             }
           }
           sub(/[[:space:]].*$/, "")
           emit_target(normalize_target($0), $0)
         }
-      ' \
-    | grep -v '^[[:space:]]*$' || true
+      '
 }
 
 # The destinations of `$1` that carry a named character reference this program
@@ -2417,8 +2488,22 @@ if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
     [ -f "$REPO_ROOT/$canon_doc" ] || continue
 
     # Resolve this doc's link targets ONCE, not once per hub-only doc.
+    #
+    # The extraction is captured and its STATUS inspected rather than read
+    # straight from a here-string, because a here-string discards it. The
+    # extractor cannot fail quietly and be harmless: it produces the evidence
+    # this whole check reasons from, so no output is indistinguishable from a
+    # clean document. Measured on this program by restoring the recursion the
+    # classifier used to use and handing it a document deep enough to segfault
+    # BWK awk — the check printed PASS. It now reports the scan failure and
+    # skips the comparisons that would be made on absent evidence.
     canon_dir="${canon_doc%/*}"
     [ "$canon_dir" = "$canon_doc" ] && canon_dir="."
+    if ! link_targets_out=$(mp_doc_link_targets "$REPO_ROOT/$canon_doc"); then
+      echo "FAIL: canonical doc '$canon_doc' could not be scanned for link targets — the Markdown extractor exited non-zero, so its link inventory is unknown and this doc was NOT checked against the hub-only inventory. Re-run the check; if it repeats, the document is hitting a limit of the extractor and belongs on an issue rather than in a silent pass."
+      FAILED=1
+      continue
+    fi
     resolved_targets=""
     while IFS= read -r link_target; do
       case "$link_target" in
@@ -2437,7 +2522,7 @@ if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
         ''|*://*|mailto:*|//*) continue ;;
       esac
       resolved_targets="${resolved_targets}$(mp_resolve_relative "$canon_dir" "$link_target")"$'\n'
-    done <<< "$(mp_doc_link_targets "$REPO_ROOT/$canon_doc")"
+    done <<< "$link_targets_out"
 
     # (c) A destination this checker cannot fully decode is UNVERIFIABLE, not
     # clean. The named-reference table covers ASCII and the two Latin blocks;
@@ -2448,11 +2533,20 @@ if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
     # destination trades that MISS for a possible false positive, which is
     # the direction a guardrail should err in, and the author has two exact
     # spellings to reach for instead.
+    #
+    # Captured and status-checked for the same reason as the pass above, and
+    # more sharply: a stream that exists to report what could not be decoded
+    # must not be the one stream that goes quiet when the decoder breaks.
+    if ! unresolvable_out=$(mp_doc_unresolvable_destinations "$REPO_ROOT/$canon_doc"); then
+      echo "FAIL: canonical doc '$canon_doc' could not be scanned for unresolvable link destinations — the Markdown extractor exited non-zero, so nothing about this doc's destinations is known."
+      FAILED=1
+      continue
+    fi
     while IFS= read -r raw_dest; do
       [ -n "$raw_dest" ] || continue
       echo "FAIL: canonical doc '$canon_doc' has the link destination '$raw_dest', which carries a named character reference this check cannot expand — the destination a reader opens is therefore unknown, and it cannot be compared against the hub-only inventory. Write the character itself, or its numeric reference (&#NNN; or &#xHH;), both of which are decoded in full; if the text is meant literally, spell the ampersand &amp;."
       FAILED=1
-    done <<< "$(mp_doc_unresolvable_destinations "$REPO_ROOT/$canon_doc")"
+    done <<< "$unresolvable_out"
 
     while IFS= read -r hub_doc; do
       [ -n "$hub_doc" ] || continue

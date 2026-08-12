@@ -3276,6 +3276,14 @@ cm_15x 'a reference DEFINITION destination is covered too' \
 cm_15x 'and so is an angle-bracket destination' \
   'α.md' 'See [the audit](<&alpha;.md>) for details.' \
   expect_unresolvable '<&alpha;.md>'
+# The diagnostic quotes the destination AS WRITTEN, which for the angle form
+# is the wrapper and not the rest of the line. A reference definition may
+# carry a title after it, and the bare branch trims at the first space, so
+# without the matching trim the message named `<x.md> "Title"` as a
+# destination nobody wrote (CodeRabbit, #925).
+cm_15x 'the angle form is trimmed to the wrapper, title excluded' \
+  'α.md' '[the audit]: <&alpha;.md> "Title"\n\nSee [the audit] for details.' \
+  expect_unresolvable '<&alpha;.md>'
 cm_15x 'a plausible non-name is reported too, deliberately' \
   'hub.md' 'See [the audit](hub&perio;.md) for details.' \
   expect_unresolvable 'hub&perio;.md'
@@ -3287,6 +3295,83 @@ cm_15x 'a plausible non-name is reported too, deliberately' \
 cm_15x 'the flag does not leak to the destination after it' \
   'hub.md' 'See [the audit](x&perio;.md) and [the other](other.md).' \
   expect_unresolvable 'x&perio;.md'
+
+# --- Case 15y: a fence is recognised RELATIVE to its container -------
+# #929 item 29. § Fenced code blocks allows a fence "indented by up to three
+# spaces", and like every other allowance in the spec that is measured from
+# the CONTENT COLUMN of the container the line arrives inside, not from column
+# zero. Measuring it absolutely made a fence at the content column of a wide
+# ordered item, or after a block-quote marker, invisible — so both renderers
+# put the link inside a code block and this program scanned it as prose. Two
+# false ownership failures, plus two more the same fix reaches.
+#
+# Every row here is checked against markdown-it-py by run_cm_matrix AND was
+# measured against cmark-gfm through GitHub POST /markdown, mode gfm. The two
+# renderers agree on all of them, so there is no bypass in this case.
+#
+# The rows come in pairs on purpose. A fence that is recognised must also be
+# CLOSED at the same relative indent, or the fix trades a false positive for a
+# swallowed document: the `not rendered` row of each pair puts the link INSIDE
+# the fence, and the `rendered` row puts it after the closer.
+run_cm_matrix expect_not_rendered "Case 15y" \
+  'a fence at the content column of a wide ordered item|10. para\n    ```\n    See [the audit](hub.md)\n    ```' \
+  'a fence after a block-quote marker|> ```\n> See [the audit](hub.md)\n> ```' \
+  'and one two columns into a bullet item|- para\n    ```\n    See [the audit](hub.md)\n    ```' \
+  'content four columns inside a quoted fence is its code|> ```\n>     See [the audit](hub.md)\n> ```' \
+  'a column-zero fence still swallows its content (control)|```\nSee [the audit](hub.md)\n```' \
+  'three spaces at top level is still a fence (control)|   ```\n   See [the audit](hub.md)\n   ```' \
+  'four spaces at top level is indented code (control)|    ```\n    See [the audit](hub.md)\n    ```'
+
+run_cm_matrix expect_rendered "Case 15y" \
+  'the ordered-item fence CLOSES, so the line after it is prose|10. para\n    ```\n    x\n    ```\n    See [the audit](hub.md)' \
+  'the quoted fence closes too|> ```\n> x\n> ```\n>\n> See [the audit](hub.md)' \
+  'and the bullet-item one|- para\n    ```\n    x\n    ```\n    See [the audit](hub.md)' \
+  'four columns into a quote is NOT a fence, so the link renders|>     ```\n> See [the audit](hub.md)' \
+  'a column-zero fence closes at column zero (control)|```\nx\n```\nSee [the audit](hub.md)'
+
+# --- Case 15z: an extractor that cannot read the doc FAILS the check ---
+# Check 10 reasons entirely from the extractor's output, so "no output" and
+# "no links" are the same string and the second one is a PASS. Every producer
+# used to carry `|| true` and the final `grep -v` supplied the exit status, so
+# a classifier that DIED produced an empty inventory and the check reported a
+# clean pass on a document nobody could read. That is not hypothetical: it is
+# what the recursion mutation in Case 15w does at 7000 markers under BWK awk.
+#
+# Marker-depth is not a portable way to provoke it — the crashing interpreter
+# and depth are build-specific, and the depths that crash one awk cost another
+# a minute and a half. An UNREADABLE FILE provokes the identical failure in
+# every awk in milliseconds: the file exists, so check 3b does not report it
+# and the loop does not skip it, and awk exits non-zero trying to open it.
+#
+# Skipped with the reason named when the chmod does not bite, which is what
+# happens in a container running as root.
+cm_unreadable_fix="$(mktemp -d "$WORKDIR/fix.XXXXXX")"
+mkdir -p "$cm_unreadable_fix/docs/agents" "$cm_unreadable_fix/scripts"
+: > "$cm_unreadable_fix/scripts/sync-to-downstream.sh"
+printf '%s' "$MANIFEST_TRUTH" > "$cm_unreadable_fix/manifest.yml"
+printf '%s\n' 'See [the audit](hub.md) for details.' \
+  > "$cm_unreadable_fix/docs/agents/shared.md"
+printf '%s\n' '# Hub-only machinery' > "$cm_unreadable_fix/docs/agents/hub.md"
+chmod 000 "$cm_unreadable_fix/docs/agents/shared.md"
+if [ -r "$cm_unreadable_fix/docs/agents/shared.md" ]; then
+  echo "NOTE: Case 15z SKIPPED — chmod 000 left the file readable (running as" \
+       "root?), so the extractor cannot be made to fail here." >&2
+  echo "test_check_doc_ownership: Case 15z SKIPPED (file still readable after chmod 000; extractor failure NOT verified)"
+else
+  set +e
+  out=$(MERGEPATH_MANIFEST_PATH="$cm_unreadable_fix/manifest.yml" \
+        MERGEPATH_REPO_ROOT="$cm_unreadable_fix" bash "$CHECK" 2>&1)
+  rc=$?
+  set -e
+  want="FAIL: canonical doc 'docs/agents/shared.md' could not be scanned for link targets — the Markdown extractor exited non-zero, so its link inventory is unknown and this doc was NOT checked against the hub-only inventory. Re-run the check; if it repeats, the document is hitting a limit of the extractor and belongs on an issue rather than in a silent pass."
+  exact=$(printf '%s\n' "$out" | grep -cxF -- "$want" || true)
+  if [ "$rc" = "1" ] && [ "$exact" = "1" ]; then
+    pass "Case 15z: an unreadable canonical doc fails the check instead of passing it"
+  else
+    fail "Case 15z (rc=$rc exact=$exact): $out"
+  fi
+fi
+chmod 644 "$cm_unreadable_fix/docs/agents/shared.md" 2>/dev/null || true
 
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
