@@ -76,6 +76,29 @@ _🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
 
 </details>'
 
+# A blocking PR-level summary that QUOTES the pause marker inside a fenced code
+# block — the shape a CodeRabbit summary takes whenever it quotes a diff hunk
+# from this very file, whose classifier constants are that literal text.
+# `classify_comment` is a fixed-string grep with no fence awareness, so it grades
+# this body `paused`. It is nonetheless a real review summary carrying a real
+# `_🟠 Major_` badge (CodeRabbit 🟠 Major on #936).
+REVIEW_BODY_SUMMARY_QUOTING_PAUSE_MARKER='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+
+**Actionable comments posted: 1**
+
+<details>
+<summary>scripts/coderabbit-wait.sh (1)</summary>
+
+_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
+
+**The pause marker is compared case-sensitively.**
+
+```
+review paused by coderabbit.ai
+```
+
+</details>'
+
 # Two offsets from the wallclock the `date +%s` stub reports — epoch
 # 2000000000, i.e. 2033-05-18T03:33:20Z. Used by the #891/#912 aged-notice
 # cases: the notice sits 40 minutes in the past, outside a 1800s freshness
@@ -692,6 +715,42 @@ test_later_notice_does_not_mask_head_summary() {
   [ "$FAIL" -ne "$before" ] || pass "18: #936 — the summary read selects the latest review SUMMARY, so a later rate-limit notice cannot mask a blocking one"
 }
 
+# --- Test 21: #936 — the class filter must never LOSE a blocking summary ----
+# CodeRabbit 🟠 Major on the test-18 fix, confirmed by measurement rather than
+# by reading: on this fixture the class-blind selection exits 2 (findings) and
+# the review-class selection exits 0 (cleared). The class filter is therefore
+# only safe if it can never subtract — a summary it fails to recognize must
+# still be graded.
+#
+# `classify_comment` is a fixed-string grep over the whole body with no fence
+# awareness, so a real summary that QUOTES `review paused by coderabbit.ai` —
+# the shape produced whenever CodeRabbit quotes a diff hunk of this very file,
+# whose classifier constants are that literal text — grades `paused` and was
+# skipped, leaving no review-class candidate and a `no marker` return.
+#
+# The rule is now preference, not exclusion: the newest REVIEW-class body wins
+# when one exists (test 18), and otherwise the helper grades the newest
+# candidate, which is exactly what it did before the class filter existed. That
+# makes the filter monotone — it can promote a summary over a later notice, and
+# it can never demote one to nothing.
+test_misclassified_summary_is_still_graded() {
+  local dir rc before=$FAIL
+  dir=$(make_case "quoting-summary" "$REVIEW_BODY_SUMMARY_QUOTING_PAUSE_MARKER" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$SUMMARY_ON_HEAD_TIME" 999999999)
+  rc=$(run_case "$dir")
+  # Non-vacuity: the body must actually be misclassified, or the class filter
+  # selects it directly and this is test 5 with a longer fixture.
+  grep -q 'class=paused' "$dir/err.log" \
+    || fail "21: the fixture no longer misclassifies — classify_comment did not grade it paused; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  grep -q 'entering fast-path verdict' "$dir/err.log" \
+    || fail "21: the fast path was suppressed instead of entered — the fixture no longer reaches the selection; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
+  [ "$rc" != "0" ] || fail "21: FALSE-CLEARED (exit 0) — the class filter dropped a blocking summary it could not recognize; err=$(tail -4 "$dir/err.log")"
+  [ "$rc" = "2" ] || fail "21: expected exit 2 (findings), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "findings" ] || fail "21: status=$(jqf "$dir" '.status'), expected findings"
+  grep -q 'PR-level summary carries a blocking marker' "$dir/err.log" || fail "21: expected the #877 summary-marker log line; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  [ "$FAIL" -ne "$before" ] || pass "21: #936 — the review-class filter is a PREFERENCE, not an exclusion: a summary it misgrades is still graded"
+}
+
 # --- Test 19: #936 — a failed summary DERIVE is rc 3, not 'no marker' -------
 # Codex P1 on #936, sibling of test 15. There the API read failed and
 # fetch_api_array's `|| return 3` caught it. Here the read SUCCEEDS and the jq
@@ -763,6 +822,7 @@ test_failed_summary_read_does_not_clear
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
 test_later_notice_does_not_mask_head_summary
+test_misclassified_summary_is_still_graded
 test_failed_summary_derive_does_not_clear
 test_negated_completed_description_does_not_take_fast_path
 

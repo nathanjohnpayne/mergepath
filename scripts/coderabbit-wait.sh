@@ -1694,13 +1694,32 @@ count_blocking_tier_issues() {
 # by position; the class filter also subsumes the status-probe exclusion the
 # old jq spelled out itself, since `status_probe` is one of the classes.
 #
-# No review-class comment at or after the anchor is rc 1 (`no marker`), not
-# rc 3: an absent summary is a definite answer — there is no summary-only
-# finding on this head — and it is the same answer the previous shape gave when
-# nothing survived the anchor. Only a failed READ is rc 3.
+# The class filter is a PREFERENCE, never an EXCLUSION (CodeRabbit 🟠 Major on
+# the first cut of this selection). `classify_comment` is a fixed-string grep
+# over the whole body with no fence awareness, so a genuine summary that merely
+# QUOTES one of the markers grades as that class — and on this file that is not
+# hypothetical, because the markers ARE the literal constants a CodeRabbit
+# summary quotes whenever it reports a finding on the classifier. Skipping such
+# a body outright left no review-class candidate and returned `no marker` from a
+# summary carrying a badge. Measured: on that fixture the class-blind selection
+# exits 2 (findings) and an exclusion-shaped filter exits 0 (cleared) — a false
+# clear this selection would have INTRODUCED.
+#
+# So the newest review-class body wins when one exists, and otherwise the helper
+# grades the newest candidate — exactly what it did before the filter existed.
+# That makes the change monotone: it can promote a summary over a later notice,
+# and it can never demote one to nothing. The residual (a misclassified summary
+# with a later notice above it) is unchanged from the pre-filter behaviour
+# rather than made worse, and the classifier's own fence-blindness belongs to
+# the machine-marker redesign in #878.
+#
+# No candidate at all is rc 1 (`no marker`), not rc 3: an absent summary is a
+# definite answer — there is no summary-only finding on this head — and
+# `summary_blocking_marker_present ""` is the same answer the previous shape
+# gave when nothing survived the anchor. Only a failed READ is rc 3.
 summary_body_has_potential_issue_marker() {
   local anchor="${1:-$HEAD_ANCHOR}"
-  local issue_comments candidates candidate_count body i
+  local issue_comments candidates candidate_count newest_body body i
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
   # Newest-first bodies of the head-anchored bot comments. Ordering is the
   # whole point: the scan below takes the FIRST review-class body, which is the
@@ -1716,6 +1735,10 @@ summary_body_has_potential_issue_marker() {
     | map(.body // "")
   ') || return 3
   candidate_count=$(crw_json_array_length "$candidates") || return 3
+  # The pre-filter selection, captured before the scan so the fallback below is
+  # literally the old behaviour rather than a reconstruction of it. Empty when
+  # there are no candidates, which is the old empty-body answer too.
+  newest_body=$(printf '%s' "$candidates" | jq -r '.[0] // ""') || return 3
   i=0
   while [ "$i" -lt "$candidate_count" ]; do
     body=$(printf '%s' "$candidates" | jq -r ".[$i]") || return 3
@@ -1730,7 +1753,7 @@ summary_body_has_potential_issue_marker() {
     fi
     i=$((i + 1))
   done
-  return 1
+  summary_blocking_marker_present "$newest_body"
 }
 
 # SHA-scoped variant of count_potential_issues, used by the StatusContext
