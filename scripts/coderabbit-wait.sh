@@ -351,9 +351,6 @@ fi
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh"
 
-# shellcheck source=phase-4b/lib.sh
-. "$__CODERABBIT_WAIT_DIR/phase-4b/lib.sh"
-
 # --- argument parsing -------------------------------------------------------
 
 # --probe (#814): read-only, zero-budget, single-scan mode.

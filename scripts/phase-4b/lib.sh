@@ -18,20 +18,6 @@ p4b_warn() { echo "[phase-4b] WARN: $*" >&2; }
 # p4b_die <exit-code> <message...>
 p4b_die()  { local c="$1"; shift; echo "[phase-4b] ERROR: $*" >&2; exit "$c"; }
 
-# mp_strict_iso_at_or_after <lhs> <rhs>
-#
-# True only when both ISO-8601 timestamps parse and lhs is at-or-after rhs.
-# This is deliberately the permissive predicate's fail-closed counterpart to
-# coderabbit-wait.sh's iso_on_or_after: a false result keeps a provider barrier
-# closed, so absent or malformed data must never count as corroboration.
-mp_strict_iso_at_or_after() {
-  local lhs="${1:-}" rhs="${2:-}"
-  [ -n "$lhs" ] && [ -n "$rhs" ] || return 1
-  [ "$(jq -nr --arg l "$lhs" --arg r "$rhs" \
-        'try (($l | fromdateiso8601) >= ($r | fromdateiso8601)) catch false' \
-        2>/dev/null || printf 'false')" = "true" ]
-}
-
 # --- config location -------------------------------------------------------
 
 # This library's own directory, captured at SOURCE time (when BASH_SOURCE is
@@ -39,6 +25,14 @@ mp_strict_iso_at_or_after() {
 # lib.sh (e.g. verdict.schema.json) are resolved relative to this, so they
 # are found regardless of $PWD or how the caller was invoked.
 P4B_LIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# CodeRabbit's probe and the Phase 4b barrier need one fail-closed timestamp
+# predicate. This is already a required dependency of coderabbit-wait.sh, so
+# centralizing it there preserves that script's standalone package layout.
+P4B_FEEDBACK_HELPERS="$(cd -P "$P4B_LIB_DIR/.." && pwd)/lib/feedback-policy-helpers.sh"
+[ -r "$P4B_FEEDBACK_HELPERS" ] || p4b_die 3 "missing required helper: $P4B_FEEDBACK_HELPERS"
+# shellcheck source=../lib/feedback-policy-helpers.sh
+. "$P4B_FEEDBACK_HELPERS"
 
 # Resolve the repo root from this library's own location (follow symlinks),
 # NOT $PWD — the same posture scripts/phase-4b-classifier.sh uses so a

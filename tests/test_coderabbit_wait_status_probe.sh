@@ -29,9 +29,8 @@ make_case() {
   local max_resume_retries=${6:-2}
   local dir="$WORKDIR/$name"
 
-  mkdir -p "$dir/scripts/lib" "$dir/scripts/phase-4b" "$dir/.github" "$dir/bin" "$dir/state"
+  mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
-  cp "$ROOT/scripts/phase-4b/lib.sh" "$dir/scripts/phase-4b/lib.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
   # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
@@ -1892,8 +1891,6 @@ test_857_completion_timestamp_conjunct_unit() {
     "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
-  # shellcheck source=../scripts/phase-4b/lib.sh
-  . "$ROOT/scripts/phase-4b/lib.sh"
   # shellcheck disable=SC1090
   . "$snip"
 
