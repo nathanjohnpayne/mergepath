@@ -92,6 +92,16 @@ SUMMARY_AGED_TIME='2033-05-18T02:53:20Z'   # stubbed NOW - 2400s
 # committer date, so it is stale by HEAD IDENTITY and not merely by wall clock.
 SUMMARY_PRIOR_HEAD_TIME='2026-06-03T23:00:00Z'
 
+# The #936 SELECTION case: a head-anchored blocking summary, then a LATER
+# non-review notice, then a StatusContext success later still. The notice is
+# newer than the summary (so it wins a class-blind "newest bot comment" pick)
+# but was CREATED before the success (so the #446 arbitration reads it as stale
+# and leaves the fast path unsuppressed) — the exact overlap in which the fast
+# path grades the notice and never sees the summary underneath it.
+SUMMARY_ON_HEAD_TIME='2026-06-04T00:00:10Z'
+NOTICE_AFTER_SUMMARY_TIME='2026-06-04T00:00:20Z'
+STATUS_AFTER_BOTH_TIME='2026-06-04T00:30:00Z'
+
 # The live #891 / #912 notice: a 59-minute published window, longer than the
 # 1800s wallclock freshness floor, so it ages out of the anchored comment scan
 # while the rate limit it announces is still in force. No HEAD reference — the
@@ -119,12 +129,19 @@ RATE_LIMIT_BODY_LONG_WINDOW='<!-- This is an auto-generated comment: rate limite
 #                       (default HEAD_TIME).
 #   freshness_window    coderabbit.wallclock_freshness_window_seconds (default
 #                       999999999 = effectively never ages a comment out).
+#   second_body         an OPTIONAL second issue comment (id 7702), served
+#                       alongside the first. Empty (default) keeps the
+#                       single-comment shape every earlier fixture models.
+#   second_time         created_at/updated_at for that second comment (default
+#                       HEAD_TIME). Stamp it after `comment_time` to model a
+#                       later bot comment sitting ABOVE an earlier one.
 #   An EMPTY comment_body serves an empty issue-comments list — the #897 shape,
 #   where the status description is the ONLY evidence of the rate limit.
 make_case() {
   local name=$1 comment_body=$2 status_time=${3:-$STATUS_TIME}
   local status_description=${4:-} comment_time=${5:-$HEAD_TIME}
   local freshness_window=${6:-999999999}
+  local second_body=${7:-} second_time=${8:-$HEAD_TIME}
   local dir="$WORKDIR/$name"
 
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
@@ -137,6 +154,7 @@ make_case() {
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   printf '%s' "$comment_body" >"$dir/state/comment-body.txt"
+  printf '%s' "$second_body" >"$dir/state/comment-body-2.txt"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
 coderabbit:
@@ -184,6 +202,7 @@ head_time='$HEAD_TIME'
 status_time='$status_time'
 status_description='$status_description'
 comment_time='$comment_time'
+second_time='$second_time'
 state_dir=\${CODERABBIT_TEST_STATE_DIR:?}
 [ "\${1:-}" = "api" ] || { echo "unexpected gh command: \$*" >&2; exit 99; }
 shift
@@ -229,10 +248,25 @@ case "\$endpoint" in
       echo "simulated issue-comments API failure" >&2
       exit 44
     fi
+    # CODERABBIT_TEST_ISSUES_MALFORMED_AFTER=<n>: serve the first n reads
+    # normally, then serve a well-formed JSON ARRAY whose elements are not
+    # comment objects. fetch_api_array's own \`jq -s 'add // []'\` accepts it
+    # (it is one array), so the read SUCCEEDS and the failure lands on the
+    # per-comment jq that derives the summary body — the Codex P1 shape on #936.
+    if [ -n "\${CODERABBIT_TEST_ISSUES_MALFORMED_AFTER:-}" ] && [ "\$n" -gt "\$CODERABBIT_TEST_ISSUES_MALFORMED_AFTER" ]; then
+      printf '[42]\n'
+      exit 0
+    fi
     body=\$(cat "\$state_dir/comment-body.txt")
+    body2=""
+    if [ -f "\$state_dir/comment-body-2.txt" ]; then body2=\$(cat "\$state_dir/comment-body-2.txt"); fi
     if [ -z "\$body" ]; then printf '[]\n'; else
       jq -cn --arg bot "\$bot" --arg t "\$comment_time" --arg body "\$body" \
-        '[{id:7701,user:{login:\$bot},created_at:\$t,updated_at:\$t,body:\$body}]'
+        --arg t2 "\$second_time" --arg body2 "\$body2" \
+        '[{id:7701,user:{login:\$bot},created_at:\$t,updated_at:\$t,body:\$body}]
+         + (if \$body2 == "" then []
+            else [{id:7702,user:{login:\$bot},created_at:\$t2,updated_at:\$t2,body:\$body2}]
+            end)'
     fi ;;
   *) echo "unexpected gh api endpoint: \$endpoint" >&2; exit 99 ;;
 esac
@@ -475,6 +509,8 @@ test_status_description_predicate_unit() {
   crw_status_description_permits_clearance ""                  || bad="$bad empty"
   crw_status_description_permits_clearance "Review completed"   || bad="$bad completed"
   crw_status_description_permits_clearance "review complete"    || bad="$bad complete-lower"
+  # Surrounding whitespace is transport noise, not vocabulary.
+  crw_status_description_permits_clearance "  Review completed  " || bad="$bad padded"
   # The three live refusal/pending descriptions.
   crw_status_description_permits_clearance "Review rate limited" && bad="$bad rate-limited"
   crw_status_description_permits_clearance "Review in progress"  && bad="$bad in-progress"
@@ -482,8 +518,19 @@ test_status_description_predicate_unit() {
   # A wording nobody has shipped: unknown must NOT clear, or the guard is a
   # deny-list again.
   crw_status_description_permits_clearance "Review quota exhausted" && bad="$bad unknown"
+  # Codex P1 on #936: the predicate matched `review complete` as a SUBSTRING,
+  # so every one of these — two of which state the review did NOT happen, and
+  # the third that it has not finished — satisfied the guard that exists to
+  # reject them. An exact allowlist over the normalized string is the only
+  # shape where a longer wording cannot inherit a shorter one's clearance.
+  crw_status_description_permits_clearance "No review completed"     && bad="$bad negated"
+  crw_status_description_permits_clearance "Review completely skipped" && bad="$bad adverb"
+  crw_status_description_permits_clearance "Review completion pending" && bad="$bad pending"
+  # The same failure from the other side: a prefix-anchored fix would still
+  # accept anything that STARTS with the permitted phrase.
+  crw_status_description_permits_clearance "Review complete — 0 files reviewed" && bad="$bad suffixed"
   [ -z "$bad" ] || fail "12: description predicate wrong on:$bad"
-  [ "$FAIL" -ne "$before" ] || pass "12: crw_status_description_permits_clearance — empty and completed clear; rate-limited, pending and unknown wordings do not"
+  [ "$FAIL" -ne "$before" ] || pass "12: crw_status_description_permits_clearance — only empty and the exact completed-review wordings clear; substring near-misses, refusals and unknown wordings do not"
 }
 
 # --- Test 15: a failed summary read must not read as "no summary finding" ---
@@ -608,6 +655,96 @@ test_prior_head_summary_marker_does_not_block() {
   [ "$FAIL" -ne "$before" ] || pass "17: escape — the fast-path summary read is anchored to head identity; a prior head's blocking summary does not block this head"
 }
 
+# --- Test 18: #936 — a LATER notice must not mask the head-anchored summary --
+# Codex P1 on #936, and a hazard this PR opened. summary_body_has_potential_
+# issue_marker selects the newest head-anchored bot comment of ANY class. Its
+# two POLL callers are safe by construction — each runs inside `case class in
+# review)`, so the newest comment is already known to be a review summary and
+# the helper re-picks that same comment. The StatusContext fast path added by
+# this PR establishes no such precondition, so it feeds the helper an input it
+# was never defined over.
+#
+# The fixture is the overlap where that matters. Three events on one head:
+#   summary @00:00:10  a `review` comment carrying `_🟠 Major_` (the #535 class)
+#   notice  @00:00:20  a rate-limit notice — newer, but NOT head-referencing
+#   success @00:30:00  the StatusContext, created after both
+# The #446 arbitration reads an unscoped notice CREATED BEFORE the success as
+# stale and leaves the fast path unsuppressed (the `remains authoritative`
+# branch — asserted below so this case cannot silently become a suppression
+# test). The fast path then runs, and a class-blind pick grades the NOTICE,
+# finds no badge in it, and clears — over a blocking summary two comments down
+# that the polling `review` arm and `--probe` both report as findings.
+test_later_notice_does_not_mask_head_summary() {
+  local dir rc before=$FAIL
+  dir=$(make_case "later-notice-masks-summary" "$REVIEW_BODY_SUMMARY_ONLY_MARKER" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$SUMMARY_ON_HEAD_TIME" 999999999 \
+    "$RATE_LIMIT_BODY_LONG_WINDOW" "$NOTICE_AFTER_SUMMARY_TIME")
+  rc=$(run_case "$dir")
+  # Non-vacuity: the notice must be visible to the arbitration AND lose there,
+  # or this is test 5 with an extra comment and proves nothing about selection.
+  grep -q 'remains authoritative' "$dir/err.log" \
+    || fail "18: the fast path was suppressed instead of entered — the fixture no longer reaches the selection; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
+  [ "$rc" != "0" ] || fail "18: fast-path FALSE-CLEARED (exit 0) — a later non-review notice masked the head-anchored blocking summary; err=$(tail -4 "$dir/err.log")"
+  [ "$rc" = "2" ] || fail "18: expected exit 2 (findings), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "findings" ] || fail "18: status=$(jqf "$dir" '.status'), expected findings"
+  [ "$(jqf "$dir" '.review.endpoint')" = "status_context" ] || fail "18: review.endpoint=$(jqf "$dir" '.review.endpoint'), expected status_context (the verdict must come from the fast path)"
+  grep -q 'PR-level summary carries a blocking marker' "$dir/err.log" || fail "18: expected the #877 summary-marker log line; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  [ "$FAIL" -ne "$before" ] || pass "18: #936 — the summary read selects the latest review SUMMARY, so a later rate-limit notice cannot mask a blocking one"
+}
+
+# --- Test 19: #936 — a failed summary DERIVE is rc 3, not 'no marker' -------
+# Codex P1 on #936, sibling of test 15. There the API read failed and
+# fetch_api_array's `|| return 3` caught it. Here the read SUCCEEDS and the jq
+# that derives the summary body fails instead — the stub serves `[42]`, a
+# well-formed array whose elements are not comment objects, so `.user.login`
+# errors. Every caller invokes this helper in an `if`/`||` context, which
+# disables errexit inside it, so an unchecked assignment carried on with an
+# empty body, `summary_blocking_marker_present ""` returned false, and the
+# function returned 1 (`no marker`) — clearance from an unread summary. The
+# derive is status-checked and returns 3, same as the fetch above it.
+test_failed_summary_derive_does_not_clear() {
+  local dir rc=0 before=$FAIL
+  dir=$(make_case "summary-derive-failure" "$REVIEW_BODY_CLEAN" "$STATUS_TIME" "Review completed")
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_ISSUES_MALFORMED_AFTER=1 \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  [ "$rc" != "0" ] || fail "19: FALSE-CLEARED (exit 0) after the summary-body derive failed; err=$(tail -4 "$dir/err.log")"
+  [ "$rc" = "3" ] || fail "19: expected exit 3 (infra), got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'refusing to report a clearance' "$dir/err.log" || fail "19: expected the fail-closed summary-read message; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "19: a failed summary-body DERIVE (not just a failed fetch) is exit 3 (infra), never a clearance"
+}
+
+# --- Test 20: #936 — 'No review completed' is a refusal, end to end ---------
+# Codex P1 on #936. The description predicate matched `*"review complete"*` as
+# a SUBSTRING, so three wordings that state the review did NOT happen cleared
+# the guard whose entire purpose is to reject them. Unit-asserted in test 12;
+# this case proves the predicate is still WIRED, by running the whole script
+# against a status whose description is one of them.
+#
+# The expected outcome is not "blocked" but "not cleared BY THE FAST PATH": the
+# verdict falls through to the comment-driven poll, which reaches its own answer
+# off the clean review comment. `review.endpoint` is the assertion that
+# separates the two routes.
+test_negated_completed_description_does_not_take_fast_path() {
+  local dir rc before=$FAIL
+  dir=$(make_case "desc-no-review-completed" "$REVIEW_BODY_CLEAN" "$STATUS_TIME" "No review completed")
+  rc=$(run_case "$dir")
+  grep -q 'does not name a completed review' "$dir/err.log" \
+    || fail "20: the description guard did not fire on 'No review completed'; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  [ "$(jqf "$dir" '.review.endpoint')" != "status_context" ] \
+    || fail "20: the fast path took a status describing NO completed review as clearance evidence"
+  [ "$rc" = "0" ] || fail "20: expected the poll route to reach exit 0 off the clean review comment, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "20: 'No review completed' suppresses the fast path; the verdict comes from the comment-driven poll instead"
+}
+
 test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
 test_headref_later_success_clears
@@ -625,6 +762,9 @@ test_open_window_inside_freshness_defers_to_arbitration
 test_failed_summary_read_does_not_clear
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
+test_later_notice_does_not_mask_head_summary
+test_failed_summary_derive_does_not_clear
+test_negated_completed_description_does_not_take_fast_path
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"

@@ -889,14 +889,39 @@ fetch_api_array_best_effort() {
 # A liveness cost paid on a shape that has never false-cleared is the wrong
 # trade.
 #
-# `review complete` is matched as a prefix so it covers both "Review complete"
-# and "Review completed" without a redundant second pattern.
+# The permitted wordings are an EXACT allowlist over the normalized string, not
+# a substring or prefix match (Codex P1 on #936). `*"review complete"*` read
+# "names a completed review" off any description CONTAINING that phrase, and
+# three wordings contain it while meaning the opposite or less:
+#
+#   No review completed        the review did NOT happen
+#   Review completely skipped  the review did NOT happen
+#   Review complete — 0 files reviewed   (a prefix-anchored fix accepts this too)
+#
+# A guard whose whole job is to reject descriptions that deny a completed review
+# cannot be satisfied by a longer wording that embeds one. Exactness is what
+# makes the doctrine above hold in both directions: only a description that IS
+# one of the completed-review wordings clears, and every other non-empty string
+# — refusal, pending, extended, or unseen — falls through to the comment-driven
+# poll. The set is small and vendor-published, so enumerating it costs nothing;
+# a wording CodeRabbit adds later suppresses the fast path until it is added
+# here, which is a liveness cost on the safe side.
+#
+# Normalization is case and SURROUNDING whitespace only — transport noise, not
+# vocabulary. A whitespace-only description normalizes to empty and takes the
+# empty-description escape above, since it is indistinguishable from an absent
+# field. Nothing else is stripped: trailing punctuation or an appended clause
+# makes the string a wording nobody has shipped, which is exactly the case the
+# positive test is meant to refuse.
 crw_status_description_permits_clearance() {
   local desc=${1:-} lower
-  [ -n "$desc" ] || return 0
   lower=$(printf '%s' "$desc" | tr '[:upper:]' '[:lower:]')
+  # Bash 3.2 trim: strip the leading, then the trailing, whitespace run.
+  lower="${lower#"${lower%%[![:space:]]*}"}"
+  lower="${lower%"${lower##*[![:space:]]}"}"
+  [ -n "$lower" ] || return 0
   case "$lower" in
-    *"review complete"*) return 0 ;;
+    "review complete"|"review completed") return 0 ;;
   esac
   return 1
 }
@@ -1632,32 +1657,80 @@ count_blocking_tier_issues() {
 # false clear, on the exact route #877 added this check to close. Treating rc 3
 # as "absent" anywhere re-opens it; the callers `die 3` instead, which is what
 # every other failed read in this file already does.
+#
+# The SAME rung covers the jq that derives the body, not only the fetch (Codex
+# P1 on #936). An `if`/`||` call context disables errexit inside the function,
+# so an unchecked assignment let a failed derive — a well-formed but
+# unexpectedly-shaped payload, where the fetch's own `add // []` succeeds and
+# `.user.login` then errors — carry on with an empty body and return 1 (`no
+# marker`): clearance off a summary nothing ever read. Every read on this path
+# is status-checked; there is no rung that means "I could not tell" other than
+# 3.
+#
+# SELECTION — the latest review SUMMARY, not the latest bot comment of any
+# class (Codex P1 on #936, a hazard the #877 fast-path caller opened). The
+# helper originally served only the two POLL callers, and there the two
+# selections coincide: each runs inside `case class in review)`, so the newest
+# head-anchored bot comment is already known to be a review summary and
+# re-picking it returns the very comment the caller classified. The
+# StatusContext fast path establishes no such precondition, and a class-blind
+# "newest bot comment" pick is wrong exactly there.
+#
+# The reachable shape is a later notice sitting ABOVE the summary. A
+# rate-limit / paused / in-progress notice suppresses the fast path only while
+# `status_context_fast_path_blocked_by_comment` still holds it against the
+# status — and that arbitration deliberately releases an unscoped notice
+# CREATED BEFORE the success (#446, the 263caf3 "Bug 6" regression). Once it
+# does, the notice is still the newest comment: this helper graded the NOTICE,
+# found no badge in a body that carries none by construction, and cleared over
+# a blocking summary two comments down that the polling `review` arm and
+# `--probe` both report as findings.
+#
+# Classified through `classify_comment`, the same ladder the poll loop routes
+# every comment through, rather than a second jq predicate — a duplicated
+# classifier is how the summary and inline surfaces drifted apart in #837/#851,
+# and the vendor's own markers change. Non-review classes are SKIPPED rather
+# than terminating the scan, so a notice cannot mask the summary underneath it
+# by position; the class filter also subsumes the status-probe exclusion the
+# old jq spelled out itself, since `status_probe` is one of the classes.
+#
+# No review-class comment at or after the anchor is rc 1 (`no marker`), not
+# rc 3: an absent summary is a definite answer — there is no summary-only
+# finding on this head — and it is the same answer the previous shape gave when
+# nothing survived the anchor. Only a failed READ is rc 3.
 summary_body_has_potential_issue_marker() {
   local anchor="${1:-$HEAD_ANCHOR}"
-  local issue_comments latest_body
+  local issue_comments candidates candidate_count body i
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
-  # Mirror latest_comment_from_issue_comments: exclude status-probe narration
-  # replies so a newer probe comment doesn't mask an earlier real summary that
-  # contains a "Potential issue" marker (false-clear of the #535 gate).
-  latest_body=$(echo "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg after "$anchor" '
-    def status_probe_reply:
-      ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
+  # Newest-first bodies of the head-anchored bot comments. Ordering is the
+  # whole point: the scan below takes the FIRST review-class body, which is the
+  # LATEST summary.
+  candidates=$(printf '%s' "$issue_comments" | jq -c --arg bot "$BOT_LOGIN" --arg after "$anchor" '
     [ .[]
       | select(.user.login == $bot)
       | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
       | select(.fresh_at >= $after)
-      | select(status_probe_reply | not)
     ]
     | sort_by(.fresh_at)
-    | last
-    | (.body // "")
-  ')
-  # Through the shared helper, not a raw grep: the pre-merge check table's
-  # hygiene `⚠️ Warning` rows are not findings, and the probe already reads
-  # them that way — a raw grep here made the SAME body a `findings` verdict in
-  # polling and a `reported` one in probe, so agent-review and the Phase 4b
-  # barrier disagreed about one head (adversarial verification on #851).
-  summary_blocking_marker_present "$latest_body"
+    | reverse
+    | map(.body // "")
+  ') || return 3
+  candidate_count=$(crw_json_array_length "$candidates") || return 3
+  i=0
+  while [ "$i" -lt "$candidate_count" ]; do
+    body=$(printf '%s' "$candidates" | jq -r ".[$i]") || return 3
+    if [ "$(classify_comment "$body")" = "review" ]; then
+      # Through the shared helper, not a raw grep: the pre-merge check table's
+      # hygiene `⚠️ Warning` rows are not findings, and the probe already reads
+      # them that way — a raw grep here made the SAME body a `findings` verdict
+      # in polling and a `reported` one in probe, so agent-review and the Phase
+      # 4b barrier disagreed about one head (adversarial verification on #851).
+      summary_blocking_marker_present "$body"
+      return $?
+    fi
+    i=$((i + 1))
+  done
+  return 1
 }
 
 # SHA-scoped variant of count_potential_issues, used by the StatusContext
