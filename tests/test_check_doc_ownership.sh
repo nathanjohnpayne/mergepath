@@ -1926,12 +1926,12 @@ run_cm_matrix expect_not_rendered "Case 14v" \
   'a reference needs its semicolon terminator|See [the audit](hub&#46md) for details.' \
   'nine decimal digits exceed the decimal form|See [the audit](hub&#000000046;md) for details.' \
   'nine hex digits exceed the hex form|See [the audit](hub&#x00000002E;md) for details.' \
-  'an undefined entity name stays literal|See [the audit](hub&perio;.md) for details.' \
   'code point zero is not a deleted character|See [the audit](hub&#0;.md) for details.' \
   'decoded output is not rescanned for references|See [the audit](hub&#38;#46;md) for details.' \
   'a backslash escape suppresses the reference|See [the audit](hub\\&#46;md) for details.' \
   'references do not resolve inside a code span|Inline example: `[the audit](hub&#46;md)`.' \
   'a one-character body is not an entity name|See [the audit](hub&x;.md) for details.' \
+  'nor is one with a character outside the name class|See [the audit](hub&per-io;.md) for details.' \
   'a numeric reference needs at least one digit|See [the audit](hub&#;.md) for details.'
 
 # --- Case 14v2: the renderer decides WHICH code points decode --------
@@ -3177,6 +3177,116 @@ cm_15w 'the bound leaves the text flow OPEN, so the line below it is scanned' \
   "$(cm_markers 150)para\n$(cm_spaces 210)See [the audit](hub.md)" expect_rendered
 cm_15w 'two thousand markers still produce a verdict, and still claim the link' \
   "$(cm_markers 2000)See [the audit](hub.md)" expect_rendered
+
+# --- Case 15x: a named reference the table cannot expand is REPORTED ---
+# #929 item 31, the one gap in the extractor that pointed the wrong way. The
+# named-reference tables hold ASCII, Latin-1 Supplement and Latin Extended-A;
+# HTML5 defines about 2100 more names. A destination carrying one of those
+# used to be compared in its still-ENCODED spelling, which matches no
+# inventory path — so the reference was silently permitted while every reader
+# followed it. Greek, math and the arrows are all in that gap.
+#
+# Both renderers agree on every input below, so there is no oracle bypass
+# here; they are written longhand only because the fixture needs a hub-only
+# doc named with the DECODED character, which the shared `hub.md` fixture
+# cannot be. Measured with markdown-it-py 4.2.0 and with cmark-gfm through
+# GitHub POST /markdown, mode gfm:
+#
+#   [the audit](&alpha;.md)        both: href="%CE%B1.md"
+#   [the audit](&#945;.md)         both: href="%CE%B1.md"
+#   [the audit](&aacute;.md)       both: href="%C3%A1.md"
+#   [the audit](&amp;alpha;.md)    both: href="&amp;alpha;.md"
+#   [the audit](&notaname;.md)     both: href="&amp;notaname;.md"
+#
+# THE TRIGGER IS DELIBERATELY WIDER THAN HTML5, and the `&perio;` row is where
+# that shows. Both renderers leave `&perio;` literal — it is a near-miss of
+# `&period;` and not a name at all — so the checker reporting it is a FALSE
+# POSITIVE, and it used to be a clean row in Case 14v asserting exactly that.
+# It moved here deliberately: telling a real name apart from a plausible
+# non-name needs precisely the 2100-entry table this avoids embedding, and
+# between a false positive an author can fix in one edit and a MISS nobody
+# ever sees, a guardrail takes the false positive. Two exact spellings are
+# offered in the diagnostic, and both are pinned by rows below: the numeric
+# reference for a character, `&amp;` for a literal ampersand.
+#
+# The bound that costs nothing is kept: HTML5 defines no single-character
+# name, so `&x;` cannot be one, and neither can a body carrying a character
+# outside the name class. Both stay literal and both keep their Case 14v rows.
+CM_UNRESOLVED_TAIL="which carries a named character reference this check cannot expand — the destination a reader opens is therefore unknown, and it cannot be compared against the hub-only inventory. Write the character itself, or its numeric reference (&#NNN; or &#xHH;), both of which are decoded in full; if the text is meant literally, spell the ampersand &amp;."
+
+# The destination is unverifiable, so the run must report exactly that, once,
+# quoting the destination as written — and nothing else alongside it.
+expect_unresolvable() {
+  local label="$1" rc="$2" out="$3" dest="$4"
+  local want="FAIL: canonical doc 'docs/agents/shared.md' has the link destination '$dest', $CM_UNRESOLVED_TAIL"
+  local exact total
+  exact=$(printf '%s\n' "$out" | grep -cxF -- "$want" || true)
+  total=$(printf '%s\n' "$out" | grep -c '^FAIL: ' || true)
+  if [ "$rc" = "1" ] && [ "$exact" = "1" ] && [ "$total" = "1" ]; then
+    pass "$label"
+  else
+    fail "$label (rc=$rc exact=$exact total=$total): $out"
+  fi
+}
+
+# One canonical-doc body against a two-doc fixture whose hub-only doc is NAMED
+# BY THE CALLER, so a destination that decodes to a non-ASCII name has
+# something to resolve to. U+03B1 and U+00E1 both have stable NFC/NFD
+# spellings for this fixture: the Greek letter has no decomposition at all,
+# and the row that uses the accented one is the row where the table already
+# resolves it, so a normalizing filesystem cannot change either verdict.
+run_named_hub_body() {
+  local hub="$1" body="$2"
+  run_with_doc_bodies "$(ENTITY_MANIFEST "docs/agents/$hub")" \
+    "docs/agents/shared.md|$body
+docs/agents/$hub|# Hub-only machinery"
+}
+
+cm_15x() {
+  local label="$1" hub="$2" body="$3" verdict="$4" arg="${5:-}"
+  local out rc
+  set +e
+  out=$(run_named_hub_body "$hub" "$body")
+  rc=$?
+  set -e
+  "$verdict" "Case 15x: $label" "$rc" "$out" "$arg"
+}
+
+cm_15x 'a name outside the tables is reported, not permitted' \
+  'α.md' 'See [the audit](&alpha;.md) for details.' \
+  expect_unresolvable '&alpha;.md'
+cm_15x 'the same character as a numeric reference still resolves' \
+  'α.md' 'See [the audit](&#945;.md) for details.' \
+  expect_rendered 'docs/agents/α.md'
+cm_15x 'and so does the character written literally' \
+  'α.md' 'See [the audit](α.md) for details.' \
+  expect_rendered 'docs/agents/α.md'
+cm_15x 'a name the table DOES hold is unaffected' \
+  'á.md' 'See [the audit](&aacute;.md) for details.' \
+  expect_rendered 'docs/agents/á.md'
+cm_15x 'an escaped ampersand is a literal, and reports nothing' \
+  'α.md' 'See [the audit](&amp;alpha;.md) for details.' \
+  expect_not_rendered
+cm_15x 'the same name in prose is not a destination' \
+  'α.md' 'The letter &alpha; is used in prose only.' \
+  expect_not_rendered
+cm_15x 'a reference DEFINITION destination is covered too' \
+  'α.md' '[the audit]: &alpha;.md\n\nSee [the audit] for details.' \
+  expect_unresolvable '&alpha;.md'
+cm_15x 'and so is an angle-bracket destination' \
+  'α.md' 'See [the audit](<&alpha;.md>) for details.' \
+  expect_unresolvable '<&alpha;.md>'
+cm_15x 'a plausible non-name is reported too, deliberately' \
+  'hub.md' 'See [the audit](hub&perio;.md) for details.' \
+  expect_unresolvable 'hub&perio;.md'
+# The flag is per-DESTINATION, and every destination in the document runs
+# through the same awk process. Dropping its reset would make the first
+# unresolvable destination condemn every one after it, which no other row can
+# see: this one carries a clean second link, so the count of failures is the
+# assertion.
+cm_15x 'the flag does not leak to the destination after it' \
+  'hub.md' 'See [the audit](x&perio;.md) and [the other](other.md).' \
+  expect_unresolvable 'x&perio;.md'
 
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between

@@ -966,6 +966,10 @@ mp_markdown_renderable_text() {
 # group and silently discard the later producers' output.
 mp_doc_link_targets() {
   local f="$1"
+  # `$2` selects which stream the final awk emits: empty (the default) for the
+  # resolved destinations check 10 compares, `unresolvable` for the ones whose
+  # character references cannot be expanded — see mp_doc_unresolvable_destinations.
+  local emit="${2:-}"
   {
     # Inline destinations need a small stateful reader rather than
     # `grep -o '\]([^)]*)'`: CommonMark bare destinations may contain
@@ -1078,7 +1082,7 @@ mp_doc_link_targets() {
         -e 's/^\]\(//' \
         -e 's/\)$//' \
         -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
-    | awk '
+    | awk -v EMIT="$emit" '
         # CommonMark resolves entity and numeric character references inside
         # a link destination (§ Entity and numeric character references), so
         # the path a reader actually opens is the DECODED one:
@@ -1312,7 +1316,39 @@ mp_doc_link_targets() {
           if (semi < 3) return ""
           body = substr(rest, 2, semi - 2)
           if (substr(body, 1, 1) != "#") {
-            if (!(body in NAMED_TEXT)) return ""
+            if (!(body in NAMED_TEXT)) {
+              # An unknown NAME is not the same thing as "not a reference",
+              # and treating the two alike is the one failure mode this
+              # program must not have. The tables above hold ASCII, Latin-1
+              # Supplement and Latin Extended-A; HTML5 defines about 2100 more
+              # names, and every one of them the renderer resolves and this
+              # table does not was a SILENT MISS — the encoded spelling was
+              # compared, matched nothing, and the reference was permitted.
+              # Measured in destination position, markdown-it-py 4.2.0 and
+              # cmark-gfm agreeing exactly:
+              #
+              #   [the audit](&alpha;.md)     both: href="%CE%B1.md"
+              #   [the audit](&notaname;.md)  both: href="&amp;notaname;.md"
+              #
+              # So a hub-only doc actually named with that Greek letter was
+              # reachable by every reader and invisible to check 10 (#929
+              # item 31). Completing the table means about 2100 more names
+              # including the multi-code-point expansions, in awk; failing
+              # closed costs one flag and turns the MISS into a report the
+              # author can act on, which is the direction a guardrail should
+              # err in.
+              #
+              # The trigger is deliberately WIDER than HTML5: `&notaname;` is
+              # reported too, although both renderers leave it literal, because
+              # distinguishing the two needs exactly the table this avoids
+              # embedding. It is bounded on the one axis that costs nothing —
+              # HTML5 defines no single-character name, so `&x;` cannot be one
+              # and is still read as literal text.
+              if (length(body) >= 2 && body ~ /^[A-Za-z][A-Za-z0-9]*$/) {
+                TARGET_UNRESOLVED = 1
+              }
+              return ""
+            }
             REF_LEN = semi
             # The expansion was computed once at startup, so re-raise the
             # newline flag its construction recorded.
@@ -1524,8 +1560,11 @@ mp_doc_link_targets() {
         function normalize_target(s) {
           # Reset per destination: the flag is set by utf8_of when a decoded
           # CR or LF appears anywhere in THIS destination, in a character
-          # reference or a percent escape alike.
+          # reference or a percent escape alike. TARGET_UNRESOLVED is the
+          # same shape, raised by char_reference_at for a named reference this
+          # program cannot expand.
           TARGET_DROP = 0
+          TARGET_UNRESOLVED = 0
           s = unescape_and_decode(s)
           # URL parsing recognizes raw query/fragment delimiters before
           # percent decoding, so encoded %3F/%23 remain filename bytes. A
@@ -1537,20 +1576,47 @@ mp_doc_link_targets() {
           if (TARGET_DROP) return ""
           return s
         }
+        # `EMIT` picks the stream. Empty (the default) is the resolved
+        # destination, one per line, which is what check 10 compares against
+        # the inventory. `unresolvable` is the destination AS WRITTEN, and
+        # only for the ones normalize_target could not fully resolve.
+        #
+        # Two passes over one extractor rather than one pass with a marker
+        # line mixed into the default stream: any marker is a string that some
+        # real destination could also decode to, and a decoded control byte is
+        # no safer — every control byte except NUL, CR and LF is a legal
+        # pathname byte here and is emitted as itself. A separate stream
+        # cannot alias anything.
+        function emit_target(decoded, raw) {
+          if (EMIT == "unresolvable") {
+            if (TARGET_UNRESOLVED) print raw
+            return
+          }
+          print decoded
+        }
         {
           sub(/^[[:space:]]+/, "")
+          raw = $0
           if (substr($0, 1, 1) == "<") {
             gt = index($0, ">")
             if (gt > 1) {
-              print normalize_target(substr($0, 2, gt - 2))
+              emit_target(normalize_target(substr($0, 2, gt - 2)), raw)
               next
             }
           }
           sub(/[[:space:]].*$/, "")
-          print normalize_target($0)
+          emit_target(normalize_target($0), $0)
         }
       ' \
     | grep -v '^[[:space:]]*$' || true
+}
+
+# The destinations of `$1` that carry a named character reference this program
+# cannot expand, emitted AS WRITTEN so the diagnostic can quote what the author
+# typed. See char_reference_at for why an unknown name is reported rather than
+# compared in its encoded spelling.
+mp_doc_unresolvable_destinations() {
+  mp_doc_link_targets "$1" unresolvable
 }
 
 # Resolve a link target against the directory of the document carrying
@@ -2372,6 +2438,21 @@ if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
       esac
       resolved_targets="${resolved_targets}$(mp_resolve_relative "$canon_dir" "$link_target")"$'\n'
     done <<< "$(mp_doc_link_targets "$REPO_ROOT/$canon_doc")"
+
+    # (c) A destination this checker cannot fully decode is UNVERIFIABLE, not
+    # clean. The named-reference table covers ASCII and the two Latin blocks;
+    # a name outside it used to be compared in its still-encoded spelling,
+    # which matches no inventory path and quietly permitted the link — so
+    # `[the audit](&alpha;.md)`, which every reader resolves, hid a hub-only
+    # doc actually named with that letter (#929 item 31). Reporting the
+    # destination trades that MISS for a possible false positive, which is
+    # the direction a guardrail should err in, and the author has two exact
+    # spellings to reach for instead.
+    while IFS= read -r raw_dest; do
+      [ -n "$raw_dest" ] || continue
+      echo "FAIL: canonical doc '$canon_doc' has the link destination '$raw_dest', which carries a named character reference this check cannot expand — the destination a reader opens is therefore unknown, and it cannot be compared against the hub-only inventory. Write the character itself, or its numeric reference (&#NNN; or &#xHH;), both of which are decoded in full; if the text is meant literally, spell the ampersand &amp;."
+      FAILED=1
+    done <<< "$(mp_doc_unresolvable_destinations "$REPO_ROOT/$canon_doc")"
 
     while IFS= read -r hub_doc; do
       [ -n "$hub_doc" ] || continue
