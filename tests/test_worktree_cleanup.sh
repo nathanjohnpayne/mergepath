@@ -562,6 +562,14 @@ ORPHAN_DIR="$MAIN/.claude/worktrees/agent-zzzz-orphan"
 mkdir -p "$ORPHAN_DIR"
 echo "leftover" > "$ORPHAN_DIR/marker.txt"
 
+# The orphan root can also legitimately contain a registered worktree. It is
+# deliberately adjacent to the orphan fixture so --apply --orphan-clean proves
+# that the NUL worktree-record parser never drops an active path from KNOWN_FILE.
+REGISTERED_CLAUDE_BRANCH="registered-claude-worktree"
+REGISTERED_CLAUDE_WT="$MAIN/.claude/worktrees/agent-registered"
+git branch "$REGISTERED_CLAUDE_BRANCH"
+git worktree add -q "$REGISTERED_CLAUDE_WT" "$REGISTERED_CLAUDE_BRANCH"
+
 # ── Case 6: verified-merged local branch with no worktree ─────────────
 MERGED_BRANCH="merged-local"
 git branch "$MERGED_BRANCH"
@@ -639,6 +647,65 @@ git branch "$UNKNOWN_BRANCH"
 git push -q -u origin "$UNKNOWN_BRANCH"
 git push -q origin --delete "$UNKNOWN_BRANCH"
 git fetch -q --prune
+
+# ── Case 21 (#822): merged branch, remote deleted, ref NOT pruned ─────
+# The actual bug: a squash-merged branch whose remote was deleted (the
+# `gh pr merge --delete-branch` shape) but whose LOCAL refs/remotes/
+# origin/<branch> tracking ref was never pruned. `git branch -vv` does not
+# mark it `gone` (nothing ran `git fetch --prune` for it — deliberately, no
+# such call follows below), so the pre-fix gone_branches() sweep skipped it
+# entirely and it was retained silently forever. This fixture MUST be the
+# last branch created before the `gh` stub, and no `git fetch --prune`
+# may run afterward in this script, or it would launder the very
+# condition being tested.
+STALE_UNPRUNED_BRANCH="merged-local-stale-unpruned-ref"
+git branch "$STALE_UNPRUNED_BRANCH"
+git push -q -u origin "$STALE_UNPRUNED_BRANCH"
+STALE_UNPRUNED_TIP=$(git rev-parse "$STALE_UNPRUNED_BRANCH")
+# Delete the branch directly in the bare "remote" repo, bypassing this
+# clone's own `git push --delete`. Since Git 1.8.5, a delete-push
+# auto-removes the LOCAL refs/remotes/origin/<branch> tracking ref as a
+# push side effect — which would launder the very condition under test.
+# Deleting server-side instead (mirroring `gh pr merge --delete-branch` via
+# the API, exactly the #822 scenario) leaves this clone's tracking ref
+# genuinely stale: it still exists locally, but the bare repo no longer has
+# the branch.
+git --git-dir="$REMOTE" branch -D "$STALE_UNPRUNED_BRANCH"
+# Deliberately NO `git fetch --prune` here — that omission is the bug.
+# Sanity-check the fixture's own premise: `git branch -vv` must NOT report
+# this branch as gone, or the fixture proves nothing about the unpruned-ref
+# case.
+if git branch -vv | grep -F -- "$STALE_UNPRUNED_BRANCH" | grep -q ': gone\]'; then
+  fail "fixture setup: expected $STALE_UNPRUNED_BRANCH to NOT be marked gone yet"
+fi
+
+# ── Case 22 (#822): a stale-unpruned branch that has a WORKTREE on it ───
+# Case 21's branch has no worktree. This one does, and the two must not
+# diverge: the branch is still surfaced by the merged-branch sweep with the
+# stale-ref reason, and NOTHING about the worktree is acted on, because this
+# audit does not prune and so never reclassifies the branch as gone (#932).
+# Its only content is gitignored, which makes the "--apply left it alone"
+# assertion a data-loss canary rather than a bare directory check. Same
+# "no fetch --prune afterward" constraint as case 21 — the branch must stay
+# in the deleted-server-side-only shape.
+STALE_WT_BRANCH="stale-unpruned-worktree-branch"
+git branch "$STALE_WT_BRANCH"
+git push -q -u origin "$STALE_WT_BRANCH"
+STALE_WT="$WORKDIR/stale-unpruned-wt"
+git worktree add -q "$STALE_WT" "$STALE_WT_BRANCH"
+STALE_WT_CANARY="$STALE_WT/.env"
+echo "SECRET=nowhere-else" > "$STALE_WT_CANARY"
+git --git-dir="$REMOTE" branch -D "$STALE_WT_BRANCH"
+# Deliberately NO `git fetch --prune` here — that omission is the bug.
+if git branch -vv | grep -F -- "$STALE_WT_BRANCH" | grep -q ': gone\]'; then
+  fail "fixture setup: expected $STALE_WT_BRANCH to NOT be marked gone yet"
+fi
+# Sanity-check the ignored-content premise (mirrors case 17): plain
+# --porcelain must be silent, otherwise the fixture proves nothing about
+# gitignored content surviving a removal this helper must refuse.
+if [ -n "$(git -C "$STALE_WT" status --porcelain)" ]; then
+  fail "fixture setup: expected plain --porcelain to be EMPTY for the ignored-only stale-unpruned worktree"
+fi
 
 # ── gh stub on PATH ───────────────────────────────────────────────────
 STUB_DIR="$WORKDIR/stub-bin"
@@ -736,6 +803,10 @@ if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
   fi
   if [ "\$head" = "$SAMERUN_BRANCH" ]; then
     echo "$SAMERUN_MERGED_TIP"
+    exit 0
+  fi
+  if [ "\$head" = "$STALE_UNPRUNED_BRANCH" ]; then
+    echo "$STALE_UNPRUNED_TIP"
     exit 0
   fi
   if [ "\$head" = "$UNKNOWN_BRANCH" ]; then
@@ -1031,6 +1102,39 @@ else
   show_out_on_fail
 fi
 
+# Resolve the report record label that a given worktree path was filed under.
+report_label_for() {
+  echo "$OUT" | awk -v p="$1" '
+    /^  \[/            { label = $0 }
+    $1 == "path:" && $2 == p { print label; exit }
+  '
+}
+
+# Positive control for the extractor itself. The registered-worktree assertion
+# below is a NEGATIVE one, so an empty capture satisfies it for free: if the
+# report format drifts, or this awk stops matching paths, the assertion would
+# pass while proving nothing (CodeRabbit 🟡 on #892). Pinning the extractor
+# against a path whose label IS known makes that failure mode loud instead.
+ORPHAN_CONTROL_LABEL=$(report_label_for "$ORPHAN_DIR")
+if echo "$ORPHAN_CONTROL_LABEL" | grep -q "ORPHAN .claude/worktrees"; then
+  pass "report label extractor resolves a known path to its record label"
+else
+  fail "report label extractor did not resolve the orphan fixture (negative assertions below would be vacuous)"
+  show_out_on_fail
+fi
+
+# A healthy registered worktree is reported under a non-ORPHAN label, or — the
+# normal case, since the report lists only entries needing attention — is not
+# reported at all. Either is correct. What it must never be is swept into the
+# orphan bucket merely for living under .claude/worktrees/.
+REGISTERED_CLAUDE_LABEL=$(report_label_for "$REGISTERED_CLAUDE_WT")
+if ! echo "$REGISTERED_CLAUDE_LABEL" | grep -q "ORPHAN .claude/worktrees"; then
+  pass "registered .claude/worktrees/ worktree is not misclassified as an orphan"
+else
+  fail "registered .claude/worktrees/ worktree was misclassified as an orphan"
+  show_out_on_fail
+fi
+
 # Case 6: verified-merged local branch listed as MERGED local branch.
 if echo "$OUT" | grep -q "MERGED local branch" \
    && echo "$OUT" | grep -q -- "$MERGED_BRANCH"; then
@@ -1115,6 +1219,112 @@ else
   show_out_on_fail
 fi
 
+# Case 21 (#822): the merged branch whose remote-tracking ref is stale
+# (remote deleted, but no `fetch --prune` has run for it) must be surfaced
+# explicitly in dry-run — never silently retained — and its own summary
+# counter must be non-zero.
+STALE_LABEL=$(echo "$OUT" | awk -v b="$STALE_UNPRUNED_BRANCH" '
+  /^  \[/            { label = $0 }
+  $1 == "branch:" && $2 == b { print label; exit }
+')
+if [ -n "$STALE_LABEL" ]; then
+  pass "#822 stale-unpruned merged branch is reported in dry-run (never silently retained)"
+else
+  fail "#822 stale-unpruned merged branch missing from dry-run output entirely (silent retention regression)"
+  show_out_on_fail
+fi
+if echo "$STALE_LABEL" | grep -q "MERGED local branch"; then
+  pass "#822 stale-unpruned merged branch classified as a MERGED local branch"
+else
+  fail "#822 stale-unpruned merged branch misclassified (label=$STALE_LABEL)"
+  show_out_on_fail
+fi
+if echo "$OUT" | grep -q -- "$STALE_UNPRUNED_BRANCH" \
+   && echo "$OUT" | grep -q "remote-tracking ref is stale"; then
+  pass "#822 dry-run explains the stale-remote-tracking-ref reason"
+else
+  fail "#822 no stale-remote-tracking-ref reason line found"
+  show_out_on_fail
+fi
+if echo "$OUT" | grep -qE "gone \(stale remote ref, unpruned\): +[1-9]"; then
+  pass "#822 summary shows ≥1 stale-unpruned gone branch"
+else
+  fail "#822 summary stale-unpruned count missing/zero"
+  show_out_on_fail
+fi
+# The counter must report the exact number of stale-unpruned branches, not
+# merely a non-zero one. Two fixture branches are in that state: the bare
+# local branch (case 21) and the worktree-attached one (case 22). An
+# inequality assertion would pass on an over-count, and over-counting is the
+# specific way this counter has gone wrong before — it is fed from an array
+# that a second append site would silently inflate.
+STALE_UNPRUNED_N=$(echo "$OUT" | sed -n 's/.*gone (stale remote ref, unpruned): *\([0-9][0-9]*\).*/\1/p' | head -1)
+if [ "${STALE_UNPRUNED_N:-0}" -eq 2 ]; then
+  pass "#822 stale-unpruned counter reports exactly the 2 stale-unpruned branches"
+else
+  fail "#822 stale-unpruned counter is ${STALE_UNPRUNED_N:-unset}, expected 2"
+  show_out_on_fail
+fi
+# Read-only contract: dry-run must perform NO ref mutation. The remote-
+# tracking ref for this branch must still be present after the dry-run
+# above (an actual `git fetch --prune` would have removed it).
+if git rev-parse --verify -q "refs/remotes/origin/$STALE_UNPRUNED_BRANCH" >/dev/null; then
+  pass "#822 dry-run performed no ref mutation (stale remote-tracking ref still present)"
+else
+  fail "#822 dry-run mutated refs: stale remote-tracking ref for $STALE_UNPRUNED_BRANCH is gone"
+fi
+
+# Case 22 (#822): a stale-unpruned branch that HAS a worktree is surfaced by
+# the same merged-branch sweep, carrying the same stale-ref reason. Pair the
+# label with its record so this cannot be satisfied by some other fixture's
+# line: print_record emits the label, then "    branch:   <name>".
+STALE_WT_LABEL=$(echo "$OUT" | awk -v b="$STALE_WT_BRANCH" '
+  /^  \[/            { label = $0 }
+  $1 == "branch:" && $2 == b { print label; exit }
+')
+if [ -n "$STALE_WT_LABEL" ]; then
+  pass "#822 stale-unpruned branch with a worktree is reported in dry-run"
+else
+  fail "#822 stale-unpruned branch with a worktree missing from dry-run output entirely"
+  show_out_on_fail
+fi
+# The reason line follows its own record, so require the two adjacent rather
+# than merely both present somewhere in the output.
+if echo "$OUT" | awk -v b="$STALE_WT_BRANCH" '
+  $1 == "branch:" && $2 == b { seen = 1; next }
+  seen && /remote-tracking ref is stale/ { found = 1 }
+  seen && /^  \[/ { seen = 0 }
+  END { exit(found ? 0 : 1) }
+'; then
+  pass "#822 dry-run explains the stale-remote-tracking-ref reason for that branch"
+else
+  fail "#822 no stale-remote-tracking-ref reason line attached to $STALE_WT_BRANCH"
+  show_out_on_fail
+fi
+# The worktree itself is NOT reclassified: nothing pruned, so the branch is
+# not `gone` and the worktree keeps whatever disposition it had. Asserting the
+# absence of a gone-upstream record for it is what pins the reduced scope —
+# it fails the moment a prune (or a stale-unpruned union) reaches this
+# classification, which is #932's change to make deliberately.
+if ! echo "$OUT" | grep -Fq -- "$STALE_WT"; then
+  pass "#822 dry-run does not advertise the worktree as gone-upstream (no prune ran)"
+else
+  fail "#822 dry-run classified a worktree on an unpruned branch that --apply will not touch"
+  show_out_on_fail
+fi
+# Read-only contract: dry-run must perform NO ref mutation for this branch
+# either, and the gitignored canary must still exist untouched.
+if git rev-parse --verify -q "refs/remotes/origin/$STALE_WT_BRANCH" >/dev/null; then
+  pass "#892 dry-run performed no ref mutation for the worktree's branch"
+else
+  fail "#892 dry-run mutated refs: stale remote-tracking ref for $STALE_WT_BRANCH is gone"
+fi
+if [ -f "$STALE_WT_CANARY" ]; then
+  pass "#892 dry-run left the gitignored canary untouched"
+else
+  fail "#892 dry-run destroyed the gitignored canary (should never mutate anything)"
+fi
+
 # Summary counts: at least 1 in each of gone/detached/locked/orphan.
 if echo "$OUT" | grep -qE "gone-upstream: +[1-9]"; then
   pass "summary shows ≥1 gone-upstream"
@@ -1184,6 +1394,44 @@ if echo "$OUT3" | grep -q -- "$GONE_WT"; then
   echo "$OUT3" >&2
 else
   pass "gone-upstream worktree removed by --apply"
+fi
+
+# Case 21 (#822): --apply does NOT prune, so it does not reclassify this
+# branch and does not delete it. That is the deliberate scope of this change:
+# #822's detection half lands read-only, and teaching --apply to prune (with a
+# primitive that cannot inherit operator refspec configuration) is #932.
+#
+# This is a live boundary assertion, not a placeholder. --apply runs against a
+# repo where refs/remotes/origin/<branch> is stale and a MERGED PR exists for
+# the head name with an exactly-matching tip: every gate downstream of `gone`
+# would pass. Only the absence of a prune keeps the branch. Reintroducing one
+# fails here first, which is the intent — a prune must arrive with #932's
+# tests, not as a side effect.
+if git rev-parse --verify -q "refs/heads/$STALE_UNPRUNED_BRANCH" >/dev/null 2>&1; then
+  pass "#822 --apply leaves the stale-unpruned merged branch alone (no prune; tracked in #932)"
+else
+  fail "#822 --apply deleted a branch whose remote-tracking ref was never pruned"
+  echo "$OUT2" >&2
+fi
+# The read-only contract now holds in BOTH modes: --apply must not have
+# mutated the stale remote-tracking ref either.
+if git rev-parse --verify -q "refs/remotes/origin/$STALE_UNPRUNED_BRANCH" >/dev/null; then
+  pass "#822 --apply performed no remote-tracking-ref mutation (nothing prunes)"
+else
+  fail "#822 --apply pruned refs/remotes/origin/$STALE_UNPRUNED_BRANCH"
+  echo "$OUT2" >&2
+fi
+
+# Case 22 (#822): the worktree on a stale-unpruned branch is untouched by
+# --apply, and its gitignored canary — content that exists nowhere else —
+# survives. The canary is what makes this a data-loss guard rather than a
+# restatement of the assertion above.
+if [ -d "$STALE_WT" ] && [ -f "$STALE_WT_CANARY" ] \
+   && grep -q "SECRET=nowhere-else" "$STALE_WT_CANARY"; then
+  pass "#822 --apply left the stale-unpruned worktree and its gitignored canary intact"
+else
+  fail "DATA LOSS: --apply deleted the gitignored canary in the stale-unpruned worktree $STALE_WT"
+  echo "$OUT3" >&2
 fi
 if echo "$OUT3" | grep -q -- "$PR_WT"; then
   fail "detached closed-PR worktree still present after --apply"
@@ -1319,7 +1567,7 @@ fi
 UNCLEAN_N=$(echo "$OUT3" | sed -n 's/.*unclean PR worktrees (review): *\([0-9][0-9]*\).*/\1/p' | head -1)
 EXPECTED_UNCLEAN=$((7 + SUB_OK))
 if [ "${UNCLEAN_N:-0}" -eq "$EXPECTED_UNCLEAN" ]; then
-  pass "retained gone-upstream PR-slug worktree is counted in the unclean bucket"
+  pass "retained gone-upstream worktrees are counted in the unclean bucket"
 else
   fail "unclean-bucket count is ${UNCLEAN_N:-unset}, expected $EXPECTED_UNCLEAN (seven required retained-unclean fixtures plus the optional submodule index-flag fixture when available) — a retained worktree is landing in an uncounted bucket"
   echo "$OUT3" | grep -E "unclean PR worktrees" >&2
@@ -1403,6 +1651,17 @@ if git worktree list --porcelain | grep -Fq -- "$LOCKMISS_PR_WT"; then
 else
   fail "premise broken: git worktree prune cleared a locked entry — revisit the locked+missing routing"
   echo "$OUT2" >&2
+fi
+
+# #892: REC_FILE is NUL-delimited. The orphan scan must consume its complete
+# six-field records rather than parsing it as pipe text, or --orphan-clean can
+# delete this still-registered worktree.
+if [ -d "$REGISTERED_CLAUDE_WT" ] \
+   && git worktree list --porcelain | grep -Fq -- "$REGISTERED_CLAUDE_WT"; then
+  pass "--orphan-clean preserves a registered .claude/worktrees/ worktree"
+else
+  fail "DATA LOSS: --orphan-clean removed a registered .claude/worktrees/ worktree"
+  echo "$OUT4" >&2
 fi
 
 # Case 20 (#762 r2 P3): the PR-state-unknown branch worktree is never removed.
@@ -1595,6 +1854,22 @@ git worktree unlock "$SUB_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$SUB_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$SUBMOD_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNKNOWN_PR_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$REGISTERED_CLAUDE_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$STALE_WT" >/dev/null 2>&1 || true
+# #822: the stale-unpruned branches are reported, never removed, so resolving
+# them is the operator action the report's own reason line prescribes — prune,
+# then delete what that reclassifies. Doing exactly what the message says and
+# reaching a clean audit is the assertion: it proves the advice is actionable
+# and that the report clears once followed, rather than being a permanent
+# exit-2 nag.
+#
+# Both commands must SUCCEED. Suppressing their status would let the clean-audit
+# assertion below evaluate a state the remediation never reached, and report the
+# audit as broken when the fixture is what failed.
+git fetch -q --prune origin >/dev/null 2>&1 \
+  || fail "fixture: prune failed, so the prescribed remediation was never applied"
+git branch -D "$STALE_UNPRUNED_BRANCH" >/dev/null 2>&1 \
+  || fail "fixture: could not delete $STALE_UNPRUNED_BRANCH after the prune"
 set +e
 OUT6=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1)
 RC6=$?
@@ -1671,6 +1946,484 @@ fi
 # Clean up the test symlink + external dir.
 rm -f "$MAIN/.claude/worktrees/agent-symlink-escape"
 rm -rf "$EXT_DIR"
+
+# ── Case 24 (#892, Codex P2): a renamed fetch mapping is not misread ─────
+# A configured mapping need not retain the remote branch name. Repositories
+# commonly map a remote `release` head to a local `origin/stable` tracking ref.
+# The stale-ref probe answers "which remote head populates
+# refs/remotes/origin/<name>?" from `remote.origin.fetch`, so under a renamed
+# mapping the conventional answer is simply wrong: it would find no remote
+# `stable` and report a perfectly live branch as a deleted one.
+#
+# The probe handles this by declining — origin_fetch_is_conventional() gates it
+# to the default refspec and anything else reports nothing at all. That is the
+# fail-closed direction (a missed report, never a false one) and it is the
+# whole of the behaviour under a non-default refspec now that nothing prunes;
+# #932 revisits it against the replacement prune primitive.
+MAPPED_ROOT="$WORKDIR/renamed-refspec"
+MAPPED_REMOTE="$MAPPED_ROOT/remote.git"
+MAPPED_MAIN="$MAPPED_ROOT/main"
+MAPPED_WT="$MAPPED_ROOT/stable-worktree"
+mkdir -p "$MAPPED_ROOT"
+git init -q --bare "$MAPPED_REMOTE"
+git init -q "$MAPPED_MAIN"
+(
+  cd "$MAPPED_MAIN"
+  git -C "$MAPPED_MAIN" config user.email "test@example.com"
+  git -C "$MAPPED_MAIN" config user.name "Test"
+  git -C "$MAPPED_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$MAPPED_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b release
+  git push -q -u origin release
+  git checkout -q main
+  git config --unset-all remote.origin.fetch
+  git config --add remote.origin.fetch '+refs/heads/release:refs/remotes/origin/stable'
+  git fetch -q origin '+refs/heads/release:refs/remotes/origin/stable'
+  git branch --track stable origin/stable
+  git worktree add -q "$MAPPED_WT" stable
+) >/dev/null 2>&1
+
+set +e
+OUT_MAPPED_DRY=$( cd "$MAPPED_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_MAPPED_DRY=$?
+set -e
+# `stable` is the discriminating branch: it tracks refs/remotes/origin/stable,
+# and the remote has no `refs/heads/stable` at all — only `release`. A probe
+# that assumed the conventional mapping would therefore call this live branch
+# stale. The fail-closed gate declines to evaluate the repo instead, so the
+# branch is absent and the class counter reads 0.
+if [ "$RC_MAPPED_DRY" -eq 0 ] \
+   && ! echo "$OUT_MAPPED_DRY" | grep -Fq -- "branch:   stable"; then
+  pass "#892 a renamed release→origin/stable mapping is not misread as a stale ref"
+else
+  fail "#892 dry-run misclassified a live renamed remote mapping as stale"
+  echo "$OUT_MAPPED_DRY" >&2
+fi
+MAPPED_STALE_N=$(echo "$OUT_MAPPED_DRY" | sed -n 's/.*gone (stale remote ref, unpruned): *\([0-9][0-9]*\).*/\1/p' | head -1)
+if [ "${MAPPED_STALE_N:-x}" = "0" ]; then
+  pass "#892 the stale-ref probe declines a non-conventional remote.origin.fetch (fail closed)"
+else
+  fail "#892 stale-unpruned counter is ${MAPPED_STALE_N:-unset} under a renamed refspec, expected 0"
+  echo "$OUT_MAPPED_DRY" >&2
+fi
+
+# ── Case 25 (#892, Codex P2): branch names may contain a pipe ──────────
+# Git forbids tabs in ref names but permits `|`. The stale-branch snapshot and
+# its merged-sweep transport must therefore use a tab record separator; the
+# former pipe format split `pipe|branch` into two unrelated fields and omitted
+# the confirmed-deleted remote branch completely.
+PIPE_ROOT="$WORKDIR/pipe-refname"
+PIPE_REMOTE="$PIPE_ROOT/remote.git"
+PIPE_MAIN="$PIPE_ROOT/main"
+PIPE_BRANCH='pipe|branch'
+PIPE_WT="$PIPE_ROOT/pipe-worktree"
+mkdir -p "$PIPE_ROOT"
+git init -q --bare "$PIPE_REMOTE"
+git init -q "$PIPE_MAIN"
+(
+  cd "$PIPE_MAIN"
+  git -C "$PIPE_MAIN" config user.email "test@example.com"
+  git -C "$PIPE_MAIN" config user.name "Test"
+  git -C "$PIPE_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$PIPE_REMOTE"
+  git push -q -u origin main
+  git branch "$PIPE_BRANCH"
+  git push -q -u origin "$PIPE_BRANCH"
+  git worktree add -q "$PIPE_WT" "$PIPE_BRANCH"
+  git --git-dir="$PIPE_REMOTE" branch -D "$PIPE_BRANCH"
+) >/dev/null 2>&1
+
+set +e
+OUT_PIPE=$( cd "$PIPE_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_PIPE=$?
+set -e
+# Assert on the BRANCH record, which is what the tab-separated snapshot carries.
+# Under the old pipe-delimited format `pipe|branch` split into two unrelated
+# fields and the branch vanished from the sweep entirely — no record, and the
+# stale-ref counter reads 0 rather than 1.
+# Exit 0, not 2: with no merged PR for the head name the branch lands in the
+# advisory "gone kept (unmerged)" bucket, which is deliberately not a removal
+# candidate. The record and the counter are the observable, not the exit code.
+if [ "$RC_PIPE" -eq 0 ] \
+   && echo "$OUT_PIPE" | grep -Fq -- "branch:   $PIPE_BRANCH" \
+   && echo "$OUT_PIPE" | grep -qE "gone \(stale remote ref, unpruned\): +1"; then
+  pass "#892 a stale branch whose legal name contains | survives the snapshot round-trip"
+else
+  fail "#892 a stale branch containing | was lost while serializing records"
+  echo "$OUT_PIPE" >&2
+fi
+
+# The dry-run assertion above needed the tracking ref STALE, which is what the
+# stale-ref probe reads. The apply assertion below needs it GONE, which is what
+# gone_branches() reads — and this audit never prunes (#932), so the fixture
+# performs the prune itself between the two runs. Both parsers see a `|` in the
+# branch name; only their inputs differ.
+git -C "$PIPE_MAIN" fetch -q --prune origin
+set +e
+OUT_PIPE_APPLY=$( cd "$PIPE_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_PIPE_APPLY=$?
+set -e
+if [ "$RC_PIPE_APPLY" -eq 0 ] && [ ! -d "$PIPE_WT" ]; then
+  pass "#892 --apply removes the clean stale worktree whose branch contains |"
+else
+  fail "#892 --apply did not reach the stale worktree whose branch contains |"
+  echo "$OUT_PIPE_APPLY" >&2
+fi
+
+# ── Case 26 (#892, Codex P1): branch/tag name collisions stay fail-safe ─
+# A tag and a branch may share a short name. Git resolves a bare revision
+# name through its disambiguation rules, where the tag can win. The cleanup
+# decision must instead compare the merged PR head to refs/heads/<name>, or a
+# local follow-up commit on the branch can be mistaken for the tag's old,
+# merged tip and deleted by --apply.
+COLLIDE_ROOT="$WORKDIR/branch-tag-collision"
+COLLIDE_REMOTE="$COLLIDE_ROOT/remote.git"
+COLLIDE_MAIN="$COLLIDE_ROOT/main"
+COLLIDE_BRANCH='same-short-name'
+COLLIDE_STUB="$COLLIDE_ROOT/stub-bin"
+mkdir -p "$COLLIDE_ROOT" "$COLLIDE_STUB"
+git init -q --bare "$COLLIDE_REMOTE"
+git init -q "$COLLIDE_MAIN"
+(
+  cd "$COLLIDE_MAIN"
+  git -C "$COLLIDE_MAIN" config user.email "test@example.com"
+  git -C "$COLLIDE_MAIN" config user.name "Test"
+  git -C "$COLLIDE_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$COLLIDE_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b "$COLLIDE_BRANCH"
+  git push -q -u origin "$COLLIDE_BRANCH"
+  # Both refs point at the simulated merged PR head before the branch gains
+  # an unpushed follow-up commit.
+  git tag "$COLLIDE_BRANCH"
+  echo follow-up > follow-up.txt
+  git add follow-up.txt
+  git commit -q -m "local follow-up after PR merge"
+  git checkout -q main
+  git push -q origin --delete "$COLLIDE_BRANCH"
+) >/dev/null 2>&1
+COLLIDE_MERGED_TIP=$(git -C "$COLLIDE_MAIN" rev-parse "refs/heads/$COLLIDE_BRANCH^")
+cat >"$COLLIDE_STUB/gh" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
+  head=""
+  while [ "\$#" -gt 0 ]; do
+    case "\$1" in
+      --head) head="\$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  if [ "\$head" = "$COLLIDE_BRANCH" ]; then
+    echo "$COLLIDE_MERGED_TIP"
+    exit 0
+  fi
+fi
+exec "$STUB_DIR/gh" "\$@"
+EOF
+chmod +x "$COLLIDE_STUB/gh"
+
+set +e
+OUT_COLLIDE=$( cd "$COLLIDE_MAIN" && PATH="$COLLIDE_STUB:$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_COLLIDE=$?
+set -e
+if [ "$RC_COLLIDE" -eq 0 ] \
+   && git -C "$COLLIDE_MAIN" rev-parse --verify -q "refs/heads/$COLLIDE_BRANCH" >/dev/null \
+   && echo "$OUT_COLLIDE" | grep -Fq -- "local tip has unmerged commit(s) on top"; then
+  pass "#892 --apply preserves a diverged branch when a tag has the same short name"
+else
+  fail "DATA LOSS: a branch/tag short-name collision made --apply delete local follow-up work"
+  echo "$OUT_COLLIDE" >&2
+fi
+
+# ── Case 27 (#892, Codex P2): apply-side parser pins English locale ────
+# Model a localized gone marker by translating it only when LC_ALL is absent.
+# The helper must pin LC_ALL=C for this parser so --apply reaches the same gone
+# branch it would see in an English environment.
+#
+# The stub intercepts `for-each-ref`, which is what gone_branches() reads. It
+# used to intercept `git branch -vv`; when the parser moved to for-each-ref
+# (Phase 4b P2 on #892 — color and `]` in branch names both corrupt the
+# porcelain listing) that stub became inert and this case passed without
+# exercising anything. Localization is still the risk being guarded: the
+# `[gone]` tracking atom comes from the same translated message catalog.
+LOCALE_ROOT="$WORKDIR/localized-gone"
+LOCALE_REMOTE="$LOCALE_ROOT/remote.git"
+LOCALE_MAIN="$LOCALE_ROOT/main"
+LOCALE_BRANCH='localized-gone'
+LOCALE_WT="$LOCALE_ROOT/gone-worktree"
+LOCALE_STUB="$LOCALE_ROOT/git-stub"
+mkdir -p "$LOCALE_ROOT"
+git init -q --bare "$LOCALE_REMOTE"
+git init -q "$LOCALE_MAIN"
+(
+  cd "$LOCALE_MAIN"
+  git -C "$LOCALE_MAIN" config user.email "test@example.com"
+  git -C "$LOCALE_MAIN" config user.name "Test"
+  git -C "$LOCALE_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$LOCALE_REMOTE"
+  git push -q -u origin main
+  git branch "$LOCALE_BRANCH"
+  git push -q -u origin "$LOCALE_BRANCH"
+  git worktree add -q "$LOCALE_WT" "$LOCALE_BRANCH"
+  git --git-dir="$LOCALE_REMOTE" branch -D "$LOCALE_BRANCH"
+  git fetch -q --prune origin
+) >/dev/null 2>&1
+mkdir -p "$LOCALE_STUB"
+cat >"$LOCALE_STUB/git" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = for-each-ref ] && [ "${LC_ALL:-}" != C ]; then
+  "$REAL_GIT" "$@" | sed 's/\[gone\]/[verschwunden]/'
+  exit "${PIPESTATUS[0]}"
+fi
+exec "$REAL_GIT" "$@"
+EOF
+chmod +x "$LOCALE_STUB/git"
+
+set +e
+OUT_LOCALE=$( cd "$LOCALE_MAIN" && REAL_GIT="$(command -v git)" PATH="$LOCALE_STUB:$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_LOCALE=$?
+set -e
+if [ "$RC_LOCALE" -eq 0 ] && [ ! -d "$LOCALE_WT" ]; then
+  pass "#892 --apply parses gone-upstream state with LC_ALL=C"
+else
+  fail "#892 localized gone marker made --apply retain the stale worktree"
+  echo "$OUT_LOCALE" >&2
+fi
+
+# ── Case 30 (#892, Codex P2): upstreams use their full ref name ───────────
+# When refs/heads/origin/foo exists, Git renders foo's upstream as
+# remotes/origin/foo under %(upstream:short). The full %(upstream) value stays
+# canonical, so dry-run and apply agree that a deleted foo worktree is stale.
+UPSTREAM_ROOT="$WORKDIR/ambiguous-upstream"
+UPSTREAM_REMOTE="$UPSTREAM_ROOT/remote.git"
+UPSTREAM_MAIN="$UPSTREAM_ROOT/main"
+UPSTREAM_BRANCH='foo'
+UPSTREAM_WT="$UPSTREAM_ROOT/foo-worktree"
+mkdir -p "$UPSTREAM_ROOT"
+git init -q --bare "$UPSTREAM_REMOTE"
+git init -q "$UPSTREAM_MAIN"
+(
+  cd "$UPSTREAM_MAIN"
+  git -C "$UPSTREAM_MAIN" config user.email "test@example.com"
+  git -C "$UPSTREAM_MAIN" config user.name "Test"
+  git -C "$UPSTREAM_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$UPSTREAM_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b "$UPSTREAM_BRANCH"
+  git push -q -u origin "$UPSTREAM_BRANCH"
+  git checkout -q main
+  git branch -D "$UPSTREAM_BRANCH"
+  git branch --track "$UPSTREAM_BRANCH" "origin/$UPSTREAM_BRANCH"
+  git branch "origin/$UPSTREAM_BRANCH"
+  git worktree add -q "$UPSTREAM_WT" "$UPSTREAM_BRANCH"
+  git --git-dir="$UPSTREAM_REMOTE" branch -D "$UPSTREAM_BRANCH"
+) >/dev/null 2>&1
+set +e
+OUT_UPSTREAM_DRY=$( cd "$UPSTREAM_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_UPSTREAM_DRY=$?
+set -e
+# The probe derives the remote head from the FULL %(upstream) ref. Under
+# %(upstream:short) this fixture renders foo's upstream as `remotes/origin/foo`
+# — because a local branch literally named `origin/foo` makes the short form
+# ambiguous — which no longer starts with `refs/remotes/origin/`, so the branch
+# is skipped and the stale-ref counter reads 0 instead of 1.
+# Exit 0 for the same reason as case 25: no merged PR, so the branch is
+# reported and counted but is not a removal candidate.
+if [ "$RC_UPSTREAM_DRY" -eq 0 ] \
+   && echo "$OUT_UPSTREAM_DRY" | grep -Fq -- "branch:   $UPSTREAM_BRANCH" \
+   && echo "$OUT_UPSTREAM_DRY" | grep -qE "gone \(stale remote ref, unpruned\): +1"; then
+  pass "#892 dry-run finds the stale branch when %(upstream:short) is ambiguous"
+else
+  fail "#892 ambiguous short upstream caused dry-run to omit a stale branch"
+  echo "$OUT_UPSTREAM_DRY" >&2
+fi
+# Same split as case 25: dry-run reads the STALE ref via the probe, --apply
+# reads the GONE marker via gone_branches(), and nothing here prunes (#932),
+# so the fixture prunes between the two runs. The ambiguity under test —
+# a local branch literally named `origin/foo` — is present for both parsers.
+git -C "$UPSTREAM_MAIN" fetch -q --prune origin
+set +e
+OUT_UPSTREAM_APPLY=$( cd "$UPSTREAM_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_UPSTREAM_APPLY=$?
+set -e
+if [ "$RC_UPSTREAM_APPLY" -eq 0 ] && [ ! -d "$UPSTREAM_WT" ]; then
+  pass "#892 --apply reaches the stale worktree behind an ambiguous short upstream"
+else
+  fail "#892 ambiguous short upstream made --apply retain the stale worktree"
+  echo "$OUT_UPSTREAM_APPLY" >&2
+fi
+
+# ── Case 31 (#892, Codex P2): a branch itself may begin with plus ─────────
+PLUS_ROOT="$WORKDIR/leading-plus"
+PLUS_REMOTE="$PLUS_ROOT/remote.git"
+PLUS_MAIN="$PLUS_ROOT/main"
+PLUS_BRANCH='+foo'
+PLUS_WT="$PLUS_ROOT/plus-worktree"
+mkdir -p "$PLUS_ROOT"
+git init -q --bare "$PLUS_REMOTE"
+git init -q "$PLUS_MAIN"
+(
+  cd "$PLUS_MAIN"
+  git -C "$PLUS_MAIN" config user.email "test@example.com"
+  git -C "$PLUS_MAIN" config user.name "Test"
+  git -C "$PLUS_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$PLUS_REMOTE"
+  git push -q -u origin main
+  git branch "$PLUS_BRANCH"
+  # `git push` parses a plus in a refspec as its force marker even when the
+  # plus belongs to the branch name. Install the remote and tracking refs
+  # directly so this fixture exercises Git's legal refname, not refspec
+  # shorthand parsing.
+  PLUS_TIP=$(git rev-parse "refs/heads/$PLUS_BRANCH")
+  git --git-dir="$PLUS_REMOTE" update-ref "refs/heads/$PLUS_BRANCH" "$PLUS_TIP"
+  git update-ref "refs/remotes/origin/$PLUS_BRANCH" "$PLUS_TIP"
+  git branch --set-upstream-to="origin/$PLUS_BRANCH" "$PLUS_BRANCH"
+  git worktree add -q "$PLUS_WT" "$PLUS_BRANCH"
+  git --git-dir="$PLUS_REMOTE" branch -D "$PLUS_BRANCH"
+  # This audit never prunes (#932), and the parser under test — gone_branches()
+  # — reads the gone marker, so the fixture establishes it.
+  git fetch -q --prune origin
+) >/dev/null 2>&1
+set +e
+OUT_PLUS=$( cd "$PLUS_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_PLUS=$?
+set -e
+if [ "$RC_PLUS" -eq 0 ] && [ ! -d "$PLUS_WT" ]; then
+  pass "#892 --apply preserves a leading plus in a stale branch name"
+else
+  fail "#892 branch-list marker parsing dropped a branch's leading plus"
+  echo "$OUT_PLUS" >&2
+fi
+
+# ── Case 34 (#892, CodeRabbit): porcelain failure cannot mean no worktrees ─
+# A process substitution hides the producer status. Simulate an old or broken
+# Git that rejects `worktree list --porcelain -z`: the audit must terminate
+# before an empty REC_FILE can be interpreted as a clean worktree inventory.
+PORCELAIN_FAIL_STUB="$WORKDIR/porcelain-fail-git"
+mkdir -p "$PORCELAIN_FAIL_STUB"
+cat >"$PORCELAIN_FAIL_STUB/git" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "worktree" ] && [ "$2" = "list" ] && [ "$3" = "--porcelain" ] && [ "$4" = "-z" ]; then
+  exit 129
+fi
+exec "$REAL_GIT" "$@"
+EOF
+chmod +x "$PORCELAIN_FAIL_STUB/git"
+set +e
+OUT_PORCELAIN_FAIL=$( cd "$MAIN" && REAL_GIT="$(command -v git)" PATH="$PORCELAIN_FAIL_STUB:$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_PORCELAIN_FAIL=$?
+set -e
+if [ "$RC_PORCELAIN_FAIL" -ne 0 ] \
+   && echo "$OUT_PORCELAIN_FAIL" | grep -Fq "could not read git worktree porcelain records"; then
+  pass "#892 unreadable NUL porcelain inventory fails closed instead of looking empty"
+else
+  fail "#892 an unreadable NUL porcelain inventory did not fail closed"
+  echo "$OUT_PORCELAIN_FAIL" >&2
+fi
+
+# Build a fixture holding one gone-upstream branch (remote deleted server-side,
+# then pruned so `%(upstream:track)` really reads `[gone]`) with a clean
+# worktree on it, so `--apply` should classify and remove that worktree. Used
+# by the cases below, each of which changes ONE knob and asserts the removal
+# still happens — they exercise gone_branches()'s PARSER, so the fixture has to
+# supply the gone marker itself; this audit never prunes (#932).
+# $1 destination root, $2 branch name; echoes nothing, sets no globals.
+make_gone_worktree_fixture() {
+  local root="$1" branch="$2"
+  local remote="$root/remote.git" main="$root/main" wt="$root/gone-worktree"
+  mkdir -p "$root"
+  git init -q --bare "$remote"
+  git init -q "$main"
+  (
+    cd "$main" || exit 1
+    # Identity writes target the fixture repo explicitly rather than relying on
+    # the subshell cwd — bare `git config` here is what check_git_identity_hygiene
+    # rejects, and a cwd-dependent write is one stray `cd` away from editing the
+    # real repo's config.
+    git -C "$main" config user.email "test@example.com"
+    git -C "$main" config user.name "Test"
+    git -C "$main" config commit.gpgsign false
+    git checkout -q -b main
+    echo seed > seed.txt
+    git add seed.txt
+    git commit -q -m "seed"
+    git remote add origin "$remote"
+    git push -q -u origin main
+    git branch "$branch"
+    git push -q -u origin "$branch"
+    git worktree add -q "$wt" "$branch"
+    # Server-side deletion, then prune: the gone marker is the fixture's
+    # precondition, not something the helper under test produces.
+    git --git-dir="$remote" branch -D "$branch"
+    git fetch -q --prune origin
+  ) >/dev/null 2>&1
+}
+
+# ── Case 36 (#892, Phase 4b P2): gone parsing survives forced color ─────
+# `color.branch=always` is a legal user setting and it colors non-tty output by
+# design. Parsing `git branch -vv` under it yields a branch token with ANSI
+# escapes glued on (`gonebr<ESC>[m`), so --apply looks up a branch that does not
+# exist and silently retains everything it just pruned. The parser must read a
+# plumbing surface that carries no color.
+COLOR_ROOT="$WORKDIR/forced-color"
+COLOR_BRANCH='color-forced-gone'
+make_gone_worktree_fixture "$COLOR_ROOT" "$COLOR_BRANCH"
+git -C "$COLOR_ROOT/main" config color.branch always
+git -C "$COLOR_ROOT/main" config color.ui always
+set +e
+OUT_COLOR=$( cd "$COLOR_ROOT/main" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_COLOR=$?
+set -e
+if [ "$RC_COLOR" -eq 0 ] && [ ! -d "$COLOR_ROOT/gone-worktree" ]; then
+  pass "#892 --apply reaches a gone branch under color.branch=always"
+else
+  fail "#892 forced branch color made --apply retain the stale worktree"
+  echo "$OUT_COLOR" >&2
+fi
+
+# ── Case 37 (#892, Phase 4b P2): ']' is legal in a branch name ──────────
+# check-ref-format forbids `[` but NOT `]`, so `topic]` is a legal branch. It
+# renders as `[origin/topic]: gone]`, which a `\[[^]]*: gone\]` marker test
+# cannot match — the branch is dropped from the sweep in apply mode right after
+# the prune removed its tracking ref.
+BRACKET_ROOT="$WORKDIR/bracket-branch"
+BRACKET_BRANCH='bracket-gone]'
+make_gone_worktree_fixture "$BRACKET_ROOT" "$BRACKET_BRANCH"
+set +e
+OUT_BRACKET=$( cd "$BRACKET_ROOT/main" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply 2>&1 )
+RC_BRACKET=$?
+set -e
+if [ "$RC_BRACKET" -eq 0 ] && [ ! -d "$BRACKET_ROOT/gone-worktree" ]; then
+  pass "#892 --apply reaches a gone branch whose name contains ']'"
+else
+  fail "#892 a ']' in the branch name hid it from the apply-side gone sweep"
+  echo "$OUT_BRACKET" >&2
+fi
 
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"

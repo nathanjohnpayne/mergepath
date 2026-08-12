@@ -107,9 +107,61 @@
 #      pass so a branch whose worktree was removed earlier in the same
 #      --apply run becomes eligible for deletion in that run (#605).
 #
+#      "gone" per the `%(upstream:track)` atom requires `git fetch
+#      --prune` to have already removed the stale
+#      `refs/remotes/origin/<branch>` — nothing in this script ever ran
+#      `fetch --prune`, so a branch whose remote was deleted on merge (the
+#      normal `gh pr merge --delete-branch` shape) kept a live-looking
+#      upstream, was never classified `gone`, and was retained
+#      indefinitely with no trace in the summary (#822). This script now
+#      DETECTS that condition instead of depending on a prior prune:
+#      stale_unpruned_branches() probes each non-gone branch's upstream
+#      against the remote with `git ls-remote` — a network READ, never a
+#      ref mutation — and any branch whose remote-tracking ref is provably
+#      stale is reported explicitly, tagged with a reason and counted
+#      separately, rather than omitted.
+#
+#      The probe is dry-run only, and NOTHING here prunes. Making --apply
+#      prune (so the class is removed rather than merely reported) is
+#      tracked in #932: the `git fetch --prune` route attempted for that
+#      was withdrawn because `git fetch` inherits operator configuration
+#      (`remote.origin.fetch`, `fetch.pruneTags`, `fetch.recurseSubmodules`)
+#      and three consecutive review rounds each found a new key that
+#      defeated the namespace confinement it relied on. The replacement is
+#      a direct `for-each-ref` / `update-ref -d` diff against the same
+#      `ls-remote` snapshot this probe already takes. Until that lands,
+#      `--apply` behaves as it always did: it acts only on branches the
+#      operator's own prune has already marked gone.
+#
+#      NOTE this is a DIFFERENT hazard from the squash-merge one under
+#      "Merged-state detection" below: an unpruned ref is a detection gap
+#      on the "gone" SIGNAL; ancestry-vs-squash is a detection gap on the
+#      "merged" SIGNAL. Fixing one does not touch the other, and both must
+#      hold for a branch to be provably safe to delete.
+#
 # Locked detection. `git worktree list --porcelain` emits a `locked`
 # line (possibly with a reason) for locked entries. We classify locked
 # worktrees separately so --apply doesn't disrupt active sessions.
+#
+# Merged-state detection: a squash-merged branch is NOT an ancestor of
+# main, so ancestry is not a merge test (#822). This repo squash-merges,
+# which means a merged branch's own commits never enter main's history and
+# `git rev-list --count origin/main..<branch>` stays permanently non-zero
+# long after its PR demonstrably merged — observed at "3 commits not in
+# main" for a branch whose PR was merged and whose remote branch had
+# already been deleted. Every "is this merged?" decision in this script
+# therefore comes from PR state via gh_branch_merged_pr_status() (`gh pr
+# list --head <branch> --state merged`, comparing the merged PR's recorded
+# headRefOid against the local tip), never from ancestry against main. An
+# ancestry-against-main test is the natural thing to reach for and it is
+# wrong here: it reads as a confident "unmerged, do not touch" and would
+# retain every squash-merged branch forever. The ancestry check that DOES
+# exist in gh_branch_merged_pr_status() is a different comparison — local
+# tip vs the MERGED PR's head, not vs main — and it only distinguishes
+# `exact` from `diverged` once PR state has already established that a
+# merged PR exists. The same hazard, stated for anyone writing separate
+# cleanup tooling, is in docs/agents/worktree-placement.md § Relocating
+# and removing.
 #
 # Exit codes:
 #   0  success (audit clean OR all requested removals succeeded)
@@ -415,7 +467,11 @@ gh_branch_merged_pr_status() {
     echo "unknown"
     return 1
   fi
-  tip=$(git -C "$MAIN_WORKTREE" rev-parse "$branch" 2>/dev/null) || { echo "unknown"; return 1; }
+  # A local tag may legally share this branch's short name. Resolve the
+  # branch ref explicitly: a bare revision name can prefer the tag, which
+  # would make an unmerged commit on the branch look like the merged tag tip
+  # and permit a destructive `git branch -D`.
+  tip=$(git -C "$MAIN_WORKTREE" rev-parse --verify "refs/heads/$branch" 2>/dev/null) || { echo "unknown"; return 1; }
   merged_heads=$(cd "$MAIN_WORKTREE" && gh pr list --head "$branch" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null) || { echo "unknown"; return 1; }
   # Successful lookup, no merged PR for this head name → not safe to delete.
   if [ -z "$merged_heads" ]; then
@@ -447,58 +503,203 @@ EOF
   return 1
 }
 
-# Read gone-upstream branches from `git branch -vv`. The format is:
-#   [<spaces>]<branch> <sha> [origin/<branch>: gone] <subject>
-# We grab the branch name when the third field carries `: gone]`.
+# Read gone-upstream branches.
+#
+# This reads `for-each-ref`'s plumbing output, NOT `git branch -vv`. The
+# porcelain listing is a human-facing rendering and parsing it is wrong twice
+# over (both measured on git 2.50.1, Phase 4b review on #892):
+#
+#   * Color. Under `color.branch=always` — a legal user setting, and one that
+#     survives into non-tty output by design — every line carries ANSI escapes:
+#     `  gonebr<ESC>[m 845fcdb [<ESC>[34morigin/gonebr<ESC>[m: gone] seed`. The
+#     first whitespace token is then `gonebr<ESC>[m`, not `gonebr`, so --apply
+#     silently operates on a branch name that does not exist while dry-run,
+#     which reaches the same branches through `ls-remote`, still finds them.
+#   * `]` in a branch name. `]` is NOT forbidden by check-ref-format (only `[`
+#     is), so `topic]` is a legal branch, and it renders as
+#     `[origin/topic]: gone]`. A `\[[^]]*: gone\]` marker test cannot match
+#     that, so the branch is dropped from the sweep in apply mode right after
+#     the prune removed its tracking ref.
+#
+# `%(upstream:track)` emits exactly `[gone]` for a gone upstream and is
+# unaffected by both: verified emitting bare `topic] [gone]` under
+# `color.branch=always`. It also carries no `* ` / `+ ` list marker, so the
+# leading-plus ambiguity that the porcelain parser had to special-case does
+# not arise. A branch name cannot contain a space (check-ref-format), so the
+# trailing tracking atom is unambiguous to strip.
+#
+# The name comes from `%(refname:lstrip=2)`, NOT `%(refname:short)`: `:short`
+# shortens only as far as stays unambiguous, so when a TAG shares the branch's
+# name it yields `heads/<branch>` instead of `<branch>` — which is exactly the
+# branch/tag short-name collision Case 26 guards against. `lstrip=2` drops the
+# literal `refs/heads/` prefix and nothing else.
 gone_branches() {
   cd "$MAIN_WORKTREE" || return 0
-  git branch -vv 2>/dev/null | awk '
+  LC_ALL=C git for-each-ref \
+    --format='%(refname:lstrip=2) %(upstream:track)' refs/heads/ 2>/dev/null | awk '
     {
-      # Strip leading whitespace and the current-branch marker.
-      line = $0
-      sub(/^[ *+]+/, "", line)
-      # Branch name is the first whitespace-delimited token.
-      n = split(line, parts, /[ \t]+/)
-      branch = parts[1]
-      # Search for the gone marker anywhere on the line.
-      if (line ~ /\[[^]]*: gone\]/) {
-        print branch
+      # Trailing field is the tracking atom; the name is everything before it.
+      if ($NF == "[gone]") {
+        name = $0
+        sub(/[ \t]+\[gone\][ \t]*$/, "", name)
+        if (name != "") { print name }
       }
     }
   '
 }
 
-# Parse `git worktree list --porcelain` into pipe-delimited records:
-#   PATH|BRANCH_OR_DETACHED|HEAD|LOCKED(0/1)|LOCK_REASON
+# Return success when origin's configured fetch refspecs are exactly the
+# conventional default, `[+]refs/heads/*:refs/remotes/origin/*`.
+#
+# stale_unpruned_branches() below has to answer "which remote head populates
+# refs/remotes/origin/<name>?", and only `remote.origin.fetch` knows. A
+# repository may map `refs/heads/release:refs/remotes/origin/stable`, may
+# exclude heads with a negative `^refs/heads/<pat>` refspec, or may map into
+# refs/heads/* entirely. Under any of those, a tracking ref's absence from
+# `git ls-remote --heads origin` under the conventional name is NOT evidence
+# that the remote branch was deleted.
+#
+# Rather than reimplement git's refspec matching to cover those cases, the
+# probe declines to evaluate them: a non-default configuration reports
+# nothing and the audit behaves exactly as it did before #822. That is the
+# fail-closed direction — the cost is a missed report, never a wrong one.
+# #932 revisits whether the restriction can lift once the prune mechanism it
+# was written against is replaced.
+origin_fetch_is_conventional() {
+  local refspec count=0
+  while IFS= read -r refspec; do
+    count=$((count + 1))
+    [ "$count" -eq 1 ] || return 1
+    case "${refspec#+}" in
+      'refs/heads/*:refs/remotes/origin/*') ;;
+      *) return 1 ;;
+    esac
+  done < <(git -C "$MAIN_WORKTREE" config --get-all remote.origin.fetch 2>/dev/null || true)
+  [ "$count" -eq 1 ]
+}
+
+# Detect local branches whose upstream tracks `origin/<name>` but which
+# `%(upstream:track)` does NOT (yet) mark `gone` — because the remote-tracking
+# ref refs/remotes/origin/<name> is stale, not because the remote branch
+# still exists (#822). Nothing in this script prunes (see the rule-4 header
+# and #932), so this probe is the whole of the fix: a pure network READ
+# (`git ls-remote`), never a local ref write, so it preserves the
+# read-only-by-default contract while still surfacing the condition instead
+# of silently omitting the branch.
+#
+# Requires $GONE_FILE (is_gone_branch()) to already be populated, so callers
+# must invoke this AFTER `gone_branches >"$GONE_FILE"`.
+#
+# ONE remote round-trip per run, not one per branch (Codex P2 on #892). The
+# remote's head refs are snapshotted with a single `git ls-remote --heads
+# origin` and every membership question is then answered locally. Querying
+# per branch made a plain dry-run an N-round-trip operation — 36 connections
+# on this repo's own checkout — which against an SSH or high-latency remote
+# turns a local audit into a minutes-long, possibly repeatedly-authenticating
+# one.
+#
+# Failure semantics, mirroring gh_branch_merged_pr_status()'s unknown/none
+# distinction:
+#   ls-remote exit 0   → the query SUCCEEDED; the printed refs are the whole
+#                        truth about the remote's heads. A branch absent from
+#                        that set is confirmed deleted → report it. Exit 0
+#                        with EMPTY output is a successful query against a
+#                        remote with no heads at all — unusual but real, and
+#                        it correctly makes every tracking branch stale.
+#   any other exit     → the query FAILED (no network, auth failure, unknown
+#                        remote). Not evidence any branch was deleted: fail
+#                        closed and report nothing.
+stale_unpruned_branches() {
+  cd "$MAIN_WORKTREE" || return 0
+  # A non-default refspec makes the tracking-ref → remote-head mapping
+  # unknowable here; decline rather than guess (origin_fetch_is_conventional).
+  origin_fetch_is_conventional || return 0
+  local snapshot snapshot_rc=0 heads_file
+  snapshot=$(git ls-remote --heads origin 2>/dev/null) || snapshot_rc=$?
+  [ "$snapshot_rc" -eq 0 ] || return 0
+  heads_file=$(mktemp "${TMPDIR:-/tmp}/wcleanup-remoteheads.XXXXXX") || return 0
+  # `<sha>\t<refname>` per line; keep the refname column only.
+  printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$heads_file"
+  local branch upstream remote_head
+  # Git ref names may contain `|`, but cannot contain a tab. Use a tab record
+  # separator so every branch/upstream pair round-trips losslessly.
+  # `refname:short` expands an ambiguous local branch name to `heads/<name>`
+  # when a tag shares its short name. The input is already constrained to
+  # refs/heads, so strip that namespace directly and retain the canonical
+  # branch name for the gone/PR lookups below.
+  git for-each-ref --format='%(refname:lstrip=2)%09%(upstream)' refs/heads/ 2>/dev/null |
+  while IFS=$'\t' read -r branch upstream; do
+    [ -n "$branch" ] || continue
+    case "$upstream" in
+      refs/remotes/origin/*) ;;
+      *) continue ;;
+    esac
+    is_gone_branch "$branch" && continue
+    # Conventional mapping, guaranteed by origin_fetch_is_conventional above:
+    # refs/remotes/origin/<name> is populated by the remote's
+    # refs/heads/<name>. Derive it from the FULL %(upstream) ref, never from
+    # %(upstream:short) — when a local branch literally named `origin/foo`
+    # exists, `:short` renders foo's upstream as `remotes/origin/foo` and the
+    # derived head name comes out wrong.
+    remote_head="refs/heads/${upstream#refs/remotes/origin/}"
+    # Exact full-path match: `-Fx` so a branch named `feat` is never
+    # satisfied by the remote having `feature`.
+    grep -Fxq -- "$remote_head" "$heads_file" && continue
+    echo "$branch"
+  done
+  rm -f "$heads_file"
+}
+
+# Parse `git worktree list --porcelain -z` into NUL-delimited six-field
+# records: PATH, BRANCH_OR_DETACHED, DETACHED(0/1), HEAD, LOCKED(0/1),
+# LOCK_REASON. Git ref names may contain `|`, and worktree paths and lock
+# reasons may contain any printable delimiter, so pipe/tab records are not
+# lossless. NUL is the one byte Git path/ref data cannot carry.
 # BRANCH is the short ref name (without refs/heads/) or empty for detached;
 # DETACHED is "1" iff the entry was marked detached.
 worktree_records() {
-  cd "$MAIN_WORKTREE" || return 0
-  git worktree list --porcelain 2>/dev/null | awk '
-    function flush() {
-      if (path != "") {
-        printf "%s|%s|%s|%s|%d|%s\n", path, branch, detached, head, locked, lock_reason
-      }
-      path=""; branch=""; detached="0"; head=""; locked=0; lock_reason=""
-    }
-    /^worktree / { flush(); path = substr($0, 10); next }
-    /^HEAD /     { head = substr($0, 6); next }
-    /^branch /   {
-      ref = substr($0, 8)
-      sub(/^refs\/heads\//, "", ref)
-      branch = ref
-      next
-    }
-    /^detached/  { detached = "1"; next }
-    /^locked/    {
-      locked = 1
-      if (length($0) > 6) {
-        lock_reason = substr($0, 8)
-      }
-      next
-    }
-    END { flush() }
-  '
+  local line path branch detached head locked lock_reason ref records_file
+  cd "$MAIN_WORKTREE" || return 1
+  records_file=$(mktemp "${TMPDIR:-/tmp}/wcleanup-worktree-records.XXXXXX") || {
+    echo "worktree-cleanup.sh: error: could not create a temporary worktree-record snapshot" >&2
+    return 1
+  }
+  if ! git worktree list --porcelain -z >"$records_file" 2>/dev/null; then
+    rm -f "$records_file"
+    echo "worktree-cleanup.sh: error: could not read git worktree porcelain records" >&2
+    return 1
+  fi
+  path=""; branch=""; detached="0"; head=""; locked="0"; lock_reason=""
+  while IFS= read -r -d '' line; do
+    case "$line" in
+      "")
+        if [ -n "$path" ]; then
+          printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+            "$path" "$branch" "$detached" "$head" "$locked" "$lock_reason"
+        fi
+        path=""; branch=""; detached="0"; head=""; locked="0"; lock_reason=""
+        ;;
+      worktree\ *) path=${line#worktree } ;;
+      HEAD\ *) head=${line#HEAD } ;;
+      branch\ *)
+        ref=${line#branch }
+        branch=${ref#refs/heads/}
+        ;;
+      detached) detached="1" ;;
+      locked*)
+        locked="1"
+        lock_reason=${line#locked}
+        lock_reason=${lock_reason# }
+        ;;
+    esac
+  done <"$records_file"
+  # Porcelain records normally end in a blank NUL field. Keep the flush for
+  # older Git variants that omit the final separator.
+  if [ -n "$path" ]; then
+    printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+      "$path" "$branch" "$detached" "$head" "$locked" "$lock_reason"
+  fi
+  rm -f "$records_file"
 }
 
 # ── Gather state ──────────────────────────────────────────────────────
@@ -510,7 +711,8 @@ worktree_records() {
 # bad form before #286's check was wired into CI).
 GONE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-gone.XXXXXX")
 REC_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-rec.XXXXXX")
-trap 'rm -f "$GONE_FILE" "$REC_FILE"' EXIT
+STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
+trap 'rm -f "$GONE_FILE" "$REC_FILE" "$STALE_UNPRUNED_FILE"' EXIT
 
 gone_branches >"$GONE_FILE"
 worktree_records >"$REC_FILE"
@@ -521,9 +723,31 @@ is_gone_branch() {
   grep -Fxq -- "$b" "$GONE_FILE"
 }
 
+# Dry-run only (#822). The probe exists to make a stale-unpruned merged
+# branch VISIBLE in the read-only audit; it deliberately does not widen what
+# --apply deletes. --apply still acts only on branches already marked gone by
+# a prune the operator ran, exactly as before #822 — teaching --apply to prune
+# for itself is #932. Keeping STALE_UNPRUNED_FILE empty under --apply is what
+# holds that line: every consumer below unions it into its input, so populating
+# it in apply mode would silently make this a removal change too.
+if [ "$MODE" = "dry-run" ]; then
+  stale_unpruned_branches >"$STALE_UNPRUNED_FILE"
+fi
+
 branch_checked_out() {
-  local b="$1"
-  awk -F'|' -v branch="$b" '$2 == branch { found = 1 } END { exit found ? 0 : 1 }' "$REC_FILE"
+  local b="$1" rec_path rec_branch rec_detached rec_head rec_locked rec_lock_reason
+  # Every field must be CONSUMED to keep the next record aligned, but only
+  # rec_branch is read. The rest are deliberate discards, not oversights.
+  # shellcheck disable=SC2034
+  while IFS= read -r -d '' rec_path \
+    && IFS= read -r -d '' rec_branch \
+    && IFS= read -r -d '' rec_detached \
+    && IFS= read -r -d '' rec_head \
+    && IFS= read -r -d '' rec_locked \
+    && IFS= read -r -d '' rec_lock_reason; do
+    [ "$rec_branch" = "$b" ] && return 0
+  done <"$REC_FILE"
+  return 1
 }
 
 # ── Classify and act ──────────────────────────────────────────────────
@@ -566,6 +790,13 @@ SUMMARY_DIVERGED_KEPT=()
 # unauthenticated / API error) — NOT evaluated, distinct from both "examined,
 # not merged" and the deletion candidates (Codex P2 on #610).
 SUMMARY_LOOKUP_UNKNOWN=()
+# Branches detected by stale_unpruned_branches() (#822): a `gone`-marker
+# false-negative because the local refs/remotes/origin/<branch> ref hasn't
+# been pruned yet, dry-run only. These ALSO land in whichever of the buckets
+# above their merged-PR status resolves to; this counter exists purely so
+# the class itself — "retained only because of an unpruned ref" — is never
+# invisible in the summary, per #822's acceptance criteria.
+SUMMARY_STALE_UNPRUNED=()
 
 print_record() {
   local label="$1" color="$2" path="$3" branch="$4" head="$5" upstream="$6" pr_state="$7" lock_reason="$8"
@@ -628,7 +859,12 @@ try_remove() {
 echo "${C_BOLD}worktree-cleanup.sh${C_RESET} — mode=${MODE} main=${MAIN_WORKTREE}"
 echo ""
 
-while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_REASON; do
+while IFS= read -r -d '' WT_PATH \
+  && IFS= read -r -d '' WT_BRANCH \
+  && IFS= read -r -d '' WT_DETACHED \
+  && IFS= read -r -d '' WT_HEAD \
+  && IFS= read -r -d '' WT_LOCKED \
+  && IFS= read -r -d '' WT_LOCK_REASON; do
   [ -z "$WT_PATH" ] && continue
   # Skip the main worktree itself.
   if [ "$WT_PATH" = "$MAIN_WORKTREE" ]; then
@@ -690,6 +926,14 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
   fi
 
   # Branch-attached worktree.
+  #
+  # Keyed on is_gone_branch() alone, deliberately. The stale-unpruned probe
+  # feeds the merged-branch SWEEP further down (a report), not this
+  # classification, because this classification drives removal under --apply
+  # and --apply's removal set is unchanged by #822. Unioning the probe in here
+  # would make dry-run advertise `[STALE gone-upstream]` — which reads as
+  # "--apply will remove this" — for a worktree --apply will not touch. #932
+  # (teaching --apply to prune) is where the two would converge again.
   if is_gone_branch "$WT_BRANCH"; then
     # A PR-slug worktree must clear the comprehensive content gate before ANY
     # removal, including this gone-upstream fast path. Without this the
@@ -868,8 +1112,29 @@ fi
 # remain as a standalone local ref after the remote branch is deleted. Verify
 # the PR's merged state before listing/deleting so ordinary unpublished work is
 # not swept up just because its upstream is gone.
-while IFS= read -r LOCAL_BRANCH; do
+#
+# The sweep set is GONE_FILE (branches `%(upstream:track)` already marks gone)
+# UNION STALE_UNPRUNED_FILE (dry-run only: branches whose remote-tracking ref
+# is stale but not yet pruned, per stale_unpruned_branches() — #822). Tagging
+# each branch by source lets the stale-unpruned case get its own summary
+# counter and an explicit reason note, without a second copy of this loop.
+# STALE_UNPRUNED_FILE is empty under --apply, so under --apply this union is a
+# no-op and the branch-deletion set is exactly what it was before #822: this
+# sweep DELETES what it classifies, so the stale-unpruned class reaching it in
+# apply mode would be a removal change, not a reporting one (#932).
+MERGE_SWEEP_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-mergesweep.XXXXXX")
+{
+  awk '{ printf "%s\t%s\n", $0, "gone" }' "$GONE_FILE"
+  awk '{ printf "%s\t%s\n", $0, "stale-unpruned" }' "$STALE_UNPRUNED_FILE"
+} >"$MERGE_SWEEP_FILE"
+
+while IFS=$'\t' read -r LOCAL_BRANCH SWEEP_SRC; do
   [ -n "$LOCAL_BRANCH" ] || continue
+  STALE_NOTE=""
+  if [ "$SWEEP_SRC" = "stale-unpruned" ]; then
+    STALE_NOTE=" (remote-tracking ref is stale, not yet marked gone — run \`git fetch --prune origin\`, then re-run this audit)"
+    SUMMARY_STALE_UNPRUNED+=("$LOCAL_BRANCH")
+  fi
   # `|| true`: the helper returns 1 for the "none" verdict, and under
   # `set -e` a `VAR=$(func)` assignment inherits that non-zero status and
   # would abort the script. The verdict string is already on stdout, so we
@@ -882,7 +1147,7 @@ while IFS= read -r LOCAL_BRANCH; do
     LOCAL_BRANCH_TIP=$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)
     print_record "[gone-upstream local branch — merged-PR lookup FAILED, keeping]" "$C_YELLOW" \
       "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$LOCAL_BRANCH_TIP" "[gone]" "" ""
-    echo "    reason:   could not verify merged state (gh missing, unauthenticated, or API error) — branch NOT evaluated"
+    echo "    reason:   could not verify merged state (gh missing, unauthenticated, or API error) — branch NOT evaluated${STALE_NOTE}"
     SUMMARY_LOOKUP_UNKNOWN+=("$LOCAL_BRANCH")
     continue
   fi
@@ -894,7 +1159,7 @@ while IFS= read -r LOCAL_BRANCH; do
     LOCAL_BRANCH_TIP=$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)
     print_record "[gone-upstream local branch — no merged PR, keeping]" "$C_DIM" \
       "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$LOCAL_BRANCH_TIP" "[gone]" "" ""
-    echo "    reason:   no merged PR found for head name (unpublished or unmerged work)"
+    echo "    reason:   no merged PR found for head name (unpublished or unmerged work)${STALE_NOTE}"
     SUMMARY_EXAMINED_NOT_MERGED+=("$LOCAL_BRANCH")
     continue
   fi
@@ -914,7 +1179,7 @@ while IFS= read -r LOCAL_BRANCH; do
     DIVERGED_TIP=$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)
     print_record "[MERGED PR, local tip has unmerged commit(s) on top — review manually, keeping]" "$C_YELLOW" \
       "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$DIVERGED_TIP" "[gone]" "MERGED+extra" ""
-    echo "    reason:   PR for this head name merged, but the local tip carries commit(s) beyond the merged head; not auto-deleted (may be unmerged follow-up work — delete by hand after review)"
+    echo "    reason:   PR for this head name merged, but the local tip carries commit(s) beyond the merged head; not auto-deleted (may be unmerged follow-up work — delete by hand after review)${STALE_NOTE}"
     SUMMARY_DIVERGED_KEPT+=("$LOCAL_BRANCH")
     continue
   fi
@@ -923,6 +1188,10 @@ while IFS= read -r LOCAL_BRANCH; do
   if branch_checked_out "$LOCAL_BRANCH"; then
     print_record "[MERGED local branch checked out — keeping]" "$C_YELLOW" \
       "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)" "[gone]" "MERGED" ""
+    # This path appends STALE_NOTE like every other: a checked-out branch is
+    # exactly where the operator would otherwise get no hint that a prune is
+    # what stands between this report and a `gone` classification.
+    echo "    reason:   PR for this head name merged and the local tip is an exact match, but the branch is checked out in a worktree${STALE_NOTE}"
     SUMMARY_LOCAL_BRANCH+=("$LOCAL_BRANCH (checked out)")
     if [ "$MODE" = "apply" ]; then
       echo "    -> skipped (branch is checked out in a worktree)"
@@ -933,6 +1202,9 @@ while IFS= read -r LOCAL_BRANCH; do
 
   print_record "[MERGED local branch]" "$C_RED" \
     "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)" "[gone]" "MERGED" ""
+  if [ -n "$STALE_NOTE" ]; then
+    echo "    reason:   PR for this head name merged and the local tip is an exact match${STALE_NOTE}"
+  fi
   SUMMARY_LOCAL_BRANCH+=("$LOCAL_BRANCH")
   if [ "$MODE" = "apply" ]; then
     echo "    -> deleting local branch"
@@ -942,7 +1214,8 @@ while IFS= read -r LOCAL_BRANCH; do
       SUMMARY_FAILED+=("$LOCAL_BRANCH (local branch)")
     fi
   fi
-done <"$GONE_FILE"
+done <"$MERGE_SWEEP_FILE"
+rm -f "$MERGE_SWEEP_FILE"
 
 # ── Orphan scan ───────────────────────────────────────────────────────
 ORPHAN_ROOT="$MAIN_WORKTREE/.claude/worktrees"
@@ -958,9 +1231,23 @@ if [ -d "$ORPHAN_ROOT" ]; then
   ORPHAN_ROOT_PHYS_TS="${ORPHAN_ROOT_PHYS%/}/"
 
   # Collect known worktree paths into a set (one per line) and check each
-  # subdir against it.
+  # subdir against it. REC_FILE is NUL-delimited: parsing it with awk or grep
+  # treats it as binary on some platforms and silently drops registered paths,
+  # which can turn an active .claude/worktrees checkout into an orphan-clean
+  # deletion candidate. Consume all six fields so the next record stays
+  # aligned, and emit only the first (the worktree path).
   KNOWN_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-known.XXXXXX")
-  awk -F'|' '{ print $1 }' "$REC_FILE" >"$KNOWN_FILE"
+  # Same deliberate-discard shape as branch_checked_out(): all six fields are
+  # consumed for alignment, only known_path is used.
+  # shellcheck disable=SC2034
+  while IFS= read -r -d '' known_path \
+    && IFS= read -r -d '' known_branch \
+    && IFS= read -r -d '' known_detached \
+    && IFS= read -r -d '' known_head \
+    && IFS= read -r -d '' known_locked \
+    && IFS= read -r -d '' known_lock_reason; do
+    printf '%s\n' "$known_path"
+  done <"$REC_FILE" >"$KNOWN_FILE"
   for d in "$ORPHAN_ROOT"/*; do
     [ -d "$d" ] || continue
 
@@ -1048,6 +1335,19 @@ printf "  merged+extra (review): %d\n" "${#SUMMARY_DIVERGED_KEPT[@]}"
 # Branches whose merged-PR lookup FAILED — not evaluated (gh missing /
 # unauthenticated / API error). Distinct from "gone kept (unmerged)".
 printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
+# Branches whose remote-tracking ref is stale rather than genuinely gone —
+# a `git branch -vv` false-negative this run would otherwise retain silently
+# (#822). Dry-run only; --apply prunes before classification so this is
+# always 0 there. Each of these ALSO appears in exactly one bucket above
+# (merged branches / gone kept / merged+extra / gone unverified) by its
+# actual merged-PR status — this counter exists so the unpruned-ref CLASS
+# itself is never invisible, even though it is not a distinct disposition.
+#
+# One append site (the merged-branch sweep), and its input — GONE_FILE UNION
+# STALE_UNPRUNED_FILE — carries each branch once, because
+# stale_unpruned_branches() skips anything already in GONE_FILE. So the array
+# length IS the branch count; nothing here needs de-duplicating.
+printf "  gone (stale remote ref, unpruned): %d\n" "${#SUMMARY_STALE_UNPRUNED[@]}"
 printf "  open-PR retained: %d\n" "${#SUMMARY_OPEN_PR[@]}"
 printf "  orphan dirs:      %d\n" "${#SUMMARY_ORPHAN[@]}"
 
