@@ -295,17 +295,10 @@ case "$endpoint" in
         # the review it is credited to.
         printf '[{"id":9961,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
-      probe_run_complete_stale_stanza|probe_run_complete_summary_precedes_object|probe_run_pause_precedes_object)
-        # #857 item 2, the live #852 shape: a HEAD-pinned review RUN at
-        # reply_time whose PR-level summary was last touched BEFORE it and
-        # never refreshed afterwards, so no comment at-or-after the run ever
-        # classifies as a review summary and the publication-completion rule
-        # can never be satisfied. The per-SHA status (driven by
-        # CODERABBIT_TEST_STATUS_TIME) is what says the run ENDED.
-        #
-        # probe_run_pause_precedes_object reuses the same run object for the
-        # item-1 review-object arm: same ordering, but the stanza that predates
-        # the run is a PAUSE rather than a rate limit.
+      probe_run_pause_precedes_object)
+        # #857 item 1, review-object arm: the summarize comment's pause
+        # stanza predates the HEAD-pinned run, so anchor-aware triage cannot
+        # surface it without the explicit anchor-free pause read below.
         printf '[{"id":9965,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
       intermediate_review_head_pin)
@@ -425,15 +418,6 @@ case "$endpoint" in
         # clear — only the temporal correlation check does.
         printf '[{"id":7806,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nPrior head summary."}]\n' "$bot" "$head_time" "$head_time"
         ;;
-      probe_run_complete_stale_stanza)
-        # #857 item 2: the summarize comment's LAST edit is a rate-limit
-        # stanza written BEFORE the run at reply_time. It is dropped by the
-        # publication scan's at-or-after filter (so `newest_class` is empty
-        # and nothing adverse is pending AFTER the run), and it can never
-        # become the summary the rule waits for. Marker-free, so once the
-        # per-SHA status says the run ended the verdict is a clean report.
-        printf '[{"id":7940,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n> [!WARNING]\\n> ## Review limit reached\\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->"}]\n' "$bot" "$head_time" "$head_time"
-        ;;
       probe_run_pause_precedes_object)
         # #857 item 1, review-object arm (Phase 4b P1 on this PR). Same
         # ordering as the stale-stanza fixture above — the summarize comment's
@@ -444,15 +428,6 @@ case "$endpoint" in
         # #847 resume gates on observed=paused and keys its at-most-once marker
         # on the NOTE's comment id, so neither was reachable.
         printf '[{"id":7942,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n<!-- This is an auto-generated comment: review paused by coderabbit.ai -->\\n> [!NOTE]\\n> ## Reviews paused\\n<!-- end of auto-generated comment: review paused by coderabbit.ai -->"}]\n' "$bot" "$head_time" "$head_time"
-        ;;
-      probe_run_complete_summary_precedes_object)
-        # #857 third instance (comment 5156584647), observed on #852 at 08:18Z:
-        # the summary edit landed at :49 and the review object at :52 — the
-        # summary-lags-object window INVERTED, so this run's own summary
-        # predates its object and the completion rule can never see it. It
-        # carries the #535 summary-only blocking marker, which the completion
-        # path must still grade: rc 2, not a clean open.
-        printf '[{"id":7941,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:05Z","updated_at":"2026-06-04T00:00:05Z","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 1**\\n\\n_⚠️ Potential issue_ carried only by this summary."}]\n' "$bot"
         ;;
       probe_notice_after_review)
         printf '[{"id":9982,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached"}]\n' "$bot" "$reply_time" "$reply_time"
@@ -1246,22 +1221,13 @@ test_869_probe_awaiting_summary_context_state() {
   # #869: the awaiting-summary rc-7 JSON is the ONE state whose evidence is
   # a HEAD-pinned review object, and the barrier requires
   # probe.context_state == "success" WITH probe.context_updated_at
-  # at-or-after review.submitted_at alongside it.
-  #
-  # Direction 1 has MOVED (#857 item 2). A head StatusContext success
-  # refreshed AFTER the object is the wedged-but-complete #866
-  # discriminator, and the probe now RESOLVES that state itself instead of
-  # emitting rc-7 evidence for the barrier to weigh: the run has ended, so
-  # waiting for a summary at-or-after it is unbounded by construction, and
-  # the newest summary is graded here (rc 0, or rc 2 on a #535 marker)
-  # rather than opened past ungraded. The full behaviour lives in
-  # test_857_completed_run_without_a_following_summary; what is asserted
-  # here is only that this direction no longer HOLDS. The barrier's rc-7
-  # conjuncts stay exactly as specced — they remain the compatibility floor
-  # for a probe emission that predates this change (the two files propagate
-  # independently, and P4B_CODERABBIT_WAIT can point at another delegate),
-  # and directions 2 and 3 below still exercise the emission.
-  #
+  # at-or-after review.submitted_at alongside it. Direction 1: a head
+  # StatusContext success refreshed AFTER the object (the
+  # wedged-but-complete #866 discriminator) — the probe emits state, its
+  # refresh time, and the object's submitted_at, and the barrier may open.
+  # This direction also exercises the still-absent arm of the TOCTOU
+  # re-scan: the success triggers the one bounded re-fetch, the summary is
+  # still absent on the second snapshot, and the rc-7 payload is kept.
   # Direction 2: with no status on the head the probe emits the sampled
   # "missing" — a bare just-posted review object whose summary (which can
   # carry the ONLY blocking marker, e.g. the auto-pause note) is still in
@@ -1269,19 +1235,22 @@ test_869_probe_awaiting_summary_context_state() {
   # time PREDATES the object is the PREVIOUS same-SHA run's — the probe
   # reports it faithfully, and the emitted timestamps are exactly what
   # makes the barrier refuse it.
-  local dir rc obs ep subat
+  local dir rc obs ep ctx ctxat subat
   dir=$(make_case probe-869-ctx-success 600 true 30 3 2)
   enable_trust_status_context "$dir"
   rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
     run_probe_case "$dir" probe_summary_lags_review)
   obs=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
   ep=$(jq -r '.review.endpoint // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ctx=$(jq -r '.probe.context_state // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ctxat=$(jq -r '.probe.context_updated_at // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
   subat=$(jq -r '.review.submitted_at // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
-  if [ "$rc" = "0" ] && [ "$obs" = "terminal" ] && [ "$ep" = "reviews" ] \
+  if [ "$rc" = "7" ] && [ "$obs" = "awaiting-summary" ] && [ "$ep" = "reviews" ] \
+     && [ "$ctx" = "success" ] && [ "$ctxat" = "2026-06-04T00:00:07Z" ] \
      && [ "$subat" = "2026-06-04T00:00:06Z" ] && [ "$(probe_count "$dir")" = "0" ]; then
-    pass "#869/#857 probe: a post-object StatusContext success now resolves the head at the probe (rc 0) instead of holding awaiting-summary"
+    pass "#869 probe: awaiting-summary with a post-object StatusContext success emits correlated context_state/context_updated_at/submitted_at (barrier may open)"
   else
-    fail "#869 probe: success direction → rc=$rc observed=$obs endpoint=$ep submitted_at=$subat"
+    fail "#869 probe: success direction → rc=$rc observed=$obs endpoint=$ep context_state=$ctx context_updated_at=$ctxat submitted_at=$subat"
     sed 's/^/      /' "$dir/err.log" >&2 || true
   fi
 
@@ -1660,80 +1629,6 @@ RESUME_GH
   fi
 }
 
-test_857_completed_run_without_a_following_summary() {
-  # #857 item 2, live on #852 for over two hours. A HEAD-pinned review RUN
-  # exists and the per-SHA StatusContext success POSTDATES it, but the
-  # summarize comment's last edit predates the run and is never refreshed —
-  # so no comment at-or-after the run ever classifies as a review summary and
-  # the publication-completion rule is unsatisfiable, not merely pending. The
-  # probe held awaiting-summary indefinitely while the polling gate read the
-  # same status and cleared in one second.
-  #
-  # Direction 1: correlated success ⇒ the run ENDED ⇒ report, with the
-  # newest summary still graded for the #535 marker (there is none here).
-  local dir rc status obs ep ctx fetches
-  dir=$(make_case probe-857-run-complete 600 true 30 3 2)
-  enable_trust_status_context "$dir"
-  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
-    run_probe_case "$dir" probe_run_complete_stale_stanza)
-  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
-  obs=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
-  ep=$(jq -r '.review.endpoint // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
-  ctx=$(jq -r '.probe.context_state | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
-  fetches=$(cat "$dir/state/issues-fetch-count" 2>/dev/null || echo 0)
-  if [ "$rc" = "0" ] && [ "$status" = "reported" ] && [ "$obs" = "terminal" ] \
-     && [ "$ep" = "reviews" ] && [ "$ctx" = "null" ] && [ "$(probe_count "$dir")" = "0" ]; then
-    pass "#857: a completed run whose stale summary predates it reports rc 0 instead of holding awaiting-summary forever"
-  else
-    fail "#857 run-complete → rc=$rc status=$status observed=$obs endpoint=$ep context_state=$ctx fetches=$fetches"
-    sed 's/^/      /' "$dir/err.log" >&2 || true
-  fi
-
-  # Direction 2 — the INVERTED window from the issue's third instance: this
-  # run's own summary landed three seconds BEFORE its object and carries the
-  # #535 summary-only blocking marker. Completing publication must GRADE that
-  # summary, not open past it. This is the assertion that makes the change
-  # safe rather than merely live.
-  local dir2 rc2 status2 count2
-  dir2=$(make_case probe-857-run-complete-marker 600 true 30 3 2)
-  enable_trust_status_context "$dir2"
-  rc2=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
-    run_probe_case "$dir2" probe_run_complete_summary_precedes_object)
-  status2=$(jq -r '.status' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
-  count2=$(jq -r '.potential_issue_count' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
-  if [ "$rc2" = "2" ] && [ "$status2" = "findings" ] && [ "$count2" = "1" ]; then
-    pass "#857: completing publication still grades the summary — a marker predating the object escalates rc 2"
-  else
-    fail "#857 inverted-window marker → rc=$rc2 status=$status2 count=$count2 (expected 2/findings/1)"
-    sed 's/^/      /' "$dir2/err.log" >&2 || true
-  fi
-
-  # Direction 3 — the same-SHA rerun (#875 round 2): the success PREDATES the
-  # run, so it belongs to the previous run against this sha and proves nothing
-  # about this one. The hold must stand, carrying the rc-7 evidence for the
-  # barrier to refuse on its own.
-  local dir3 rc3 obs3
-  dir3=$(make_case probe-857-run-complete-stalectx 600 true 30 3 2)
-  enable_trust_status_context "$dir3"
-  rc3=$(CODERABBIT_TEST_STATUS=success run_probe_case "$dir3" probe_run_complete_stale_stanza)
-  obs3=$(jq -r '.probe.observed // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
-  # Direction 4 — the policy opt-out. No status is sampled at all, so the
-  # completion conjunct cannot be met and the pre-#857 wait is preserved.
-  local dir4 rc4 obs4
-  dir4=$(make_case probe-857-run-complete-notrust 600 true 30 3 2)
-  rc4=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
-    run_probe_case "$dir4" probe_run_complete_stale_stanza)
-  obs4=$(jq -r '.probe.observed // "MISSING"' "$dir4/out.json" 2>/dev/null || echo PARSE_ERROR)
-  if [ "$rc3" = "7" ] && [ "$obs3" = "awaiting-summary" ] \
-     && [ "$rc4" = "7" ] && [ "$obs4" = "awaiting-summary" ]; then
-    pass "#857: a pre-run (previous-run) success and a trust opt-out both keep the bounded wait"
-  else
-    fail "#857 negatives → stale-ctx rc=$rc3/$obs3 no-trust rc=$rc4/$obs4 (expected 7/awaiting-summary both)"
-    sed 's/^/      /' "$dir3/err.log" >&2 || true
-    sed 's/^/      /' "$dir4/err.log" >&2 || true
-  fi
-}
-
 test_857_pause_predating_a_run_reaches_the_resume_path() {
   # #857 item 1, review-object arm. Phase 4b P1 on this PR: the anchor-free
   # pause read only covered the NO-review-object branch, so a durable pause
@@ -1772,25 +1667,6 @@ RESUME_GH2
     sed 's/^/      /' "$dir/err.log" >&2 || true
   fi
 
-  # Direction 2 — the same fixture WITH a per-SHA success correlated to the
-  # run. The completed run is the stronger claim: an explicit
-  # `@coderabbitai review` runs while auto-review is paused, so a run that
-  # ENDED on this head after the note was written must keep reporting.
-  # Declining it on the older note would be the ancient-notice deadlock the
-  # anchored triage exists to prevent, so the item-2 terminal keeps winning.
-  local dir2 rc2 status2 obs2
-  dir2=$(make_case probe-857-pause-before-run-success 600 true 30 3 2)
-  enable_trust_status_context "$dir2"
-  rc2=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
-    run_probe_case "$dir2" probe_run_pause_precedes_object)
-  status2=$(jq -r '.status' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
-  obs2=$(jq -r '.probe.observed // "MISSING"' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
-  if [ "$rc2" = "0" ] && [ "$status2" = "reported" ] && [ "$obs2" = "terminal" ]; then
-    pass "#857: a run that ENDED after the pause note still reports — the new arm does not deadlock a completed head on an older pause"
-  else
-    fail "#857 pause-before-run + correlated success → rc=$rc2 status=$status2 observed=$obs2 (expected 0/reported/terminal)"
-    sed 's/^/      /' "$dir2/err.log" >&2 || true
-  fi
 }
 
 test_851_review_object_premerge_shares_strip() {
@@ -1876,41 +1752,6 @@ test_824_sha_matched_review_is_honored_regardless_of_timestamp() {
   else
     fail "#824: expected rc 2/findings/count 1 for the SHA-matched aged review; got rc=$rc status=$status count=$potential"
     sed 's/^/      /' "$dir/err.log" >&2 || true
-  fi
-}
-
-test_857_completion_timestamp_conjunct_unit() {
-  # mp_strict_iso_at_or_after is the shared conjunct that RELEASES the #857 completion hold,
-  # and it is pure, so it is asserted directly rather than only through the stub
-  # harness — the harness can serve a parseable status time and nothing else, so
-  # the failure modes that matter here are unreachable from a fixture.
-  local snip="$WORKDIR/summary-helpers.sh" bad=""
-  eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END)=' \
-    "$ROOT/scripts/coderabbit-wait.sh")"
-  awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
-    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
-  # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
-  . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
-  # shellcheck disable=SC1090
-  . "$snip"
-
-  # It must fail CLOSED, unlike iso_on_or_after, whose callers want the
-  # conservative answer to be "suppress the fast-path". Here the permissive
-  # answer releases a hold, so an absent or unparseable timestamp has to read
-  # false. Getting this backwards would complete publication off old probe JSON
-  # that carries no context_updated_at at all.
-  mp_strict_iso_at_or_after 2026-06-04T00:00:07Z 2026-06-04T00:00:06Z || bad="$bad after-rejected"
-  mp_strict_iso_at_or_after 2026-06-04T00:00:06Z 2026-06-04T00:00:06Z || bad="$bad equal-rejected"
-  ! mp_strict_iso_at_or_after 2026-06-04T00:00:05Z 2026-06-04T00:00:06Z || bad="$bad before-accepted"
-  ! mp_strict_iso_at_or_after "" 2026-06-04T00:00:06Z || bad="$bad empty-lhs-accepted"
-  ! mp_strict_iso_at_or_after 2026-06-04T00:00:07Z "" || bad="$bad empty-rhs-accepted"
-  ! mp_strict_iso_at_or_after not-a-date 2026-06-04T00:00:06Z || bad="$bad unparseable-lhs-accepted"
-  ! mp_strict_iso_at_or_after 2026-06-04T00:00:07Z not-a-date || bad="$bad unparseable-rhs-accepted"
-
-  if [ -z "$bad" ]; then
-    pass "#857 helper: the completion timestamp conjunct fails closed on an absent or unparseable timestamp"
-  else
-    fail "#857 timestamp conjunct:$bad"
   fi
 }
 
@@ -2254,9 +2095,7 @@ test_869_probe_awaiting_summary_context_state
 test_869_probe_summary_landing_mid_probe_is_scanned
 test_857_aged_pause_reaches_the_resume_path
 test_857_pause_predating_a_run_reaches_the_resume_path
-test_857_completed_run_without_a_following_summary
 test_857_summary_selector_unit
-test_857_completion_timestamp_conjunct_unit
 test_probe_reviews_api_failure_is_infra_not_clean
 test_probe_summary_only_marker_is_findings
 test_probe_notice_after_review_is_not_complete

@@ -269,15 +269,10 @@
 #       no JSON, so a caller could not tell rc 1 from a crashed run.
 #
 #       In `--probe` mode rc 0 means REPORTED — a HEAD-pinned review object
-#       exists, or the summarize comment is head-pinned and completed (#851),
-#       or CodeRabbit has demonstrably FINISHED on this head without leaving a
-#       head-anchored artifact: a review run whose per-SHA StatusContext
-#       success postdates it while no summary followed (#857). That last one
-#       still grades the newest summary and takes rc 2 on a summary-only
-#       blocking marker. It does NOT mean "no findings". rc 2 is the ONE
-#       verdict probe mode makes, unchanged in meaning (#535): a blocking
-#       marker carried solely by the PR-level summary, which no required
-#       gate dispositions.
+#       exists, or the summarize comment is head-pinned and completed (#851).
+#       It does NOT mean "no findings". rc 2 is the ONE verdict probe mode
+#       makes, unchanged in meaning (#535): a blocking marker carried solely
+#       by the PR-level summary, which no required gate dispositions.
 #       `potential_issue_count` carries no verdict on a probe run: 0 on every
 #       probe terminal except that rc-2 one, where it is the literal 1 of the
 #       summary-carried finding rather than a scan of the inline surface. Use
@@ -2596,77 +2591,6 @@ probe_emit_verdict() {
           || die 3 "failed to re-fetch issue comments for the post-success re-scan"
         continue
       fi
-      # #857 item 2: publication is COMPLETE when the per-SHA StatusContext
-      # says this RUN finished, even though no summary landed after the object.
-      #
-      # The publication-completion rule exists to guarantee the summary was
-      # SCANNED, because the summary can carry the only blocking marker (#535).
-      # It implements that as "a bot comment at-or-after the object classifies
-      # as a review summary" — a rule two live orderings never satisfy. On #852
-      # the summarize comment's last edit was a rate-limit stanza written
-      # BEFORE the head's review objects and never refreshed afterwards; on the
-      # same PR at 08:18Z a requested full review wrote its summary edit at
-      # :49 and submitted its object at :52, inverting the window. Both times
-      # the probe held at awaiting-summary for hours while the polling gate
-      # read the same head's StatusContext and cleared in one second — two
-      # consumers disagreeing about a head that was demonstrably finished.
-      #
-      # A per-SHA success refreshed at-or-after the object's own submitted_at
-      # says the run ENDED. Nothing further is coming, so waiting for a summary
-      # that will never be written is unbounded by construction, and the right
-      # move is to grade the verdict off the summary that DOES exist. That
-      # reading is sound in both orderings: if this run had a summary-only
-      # finding it would have written it into the summary, and the summary is
-      # then either the one landing before the object (scanned here) or one
-      # landing after it (taken by the normal branch above).
-      #
-      # Four conjuncts, each fail-closed:
-      #   newest_class empty   NOTHING was posted after the run. An adverse
-      #                        notice that landed after it — rate_limit,
-      #                        paused, in_progress — asserts CodeRabbit is not
-      #                        done, and a postdating spurious success (#595)
-      #                        must not outrank it (#875 round 3). A summary
-      #                        after the run is handled above and never reaches
-      #                        here.
-      #   rescan_done          the #869 TOCTOU re-fetch has already run, so
-      #                        "no summary after the run" is a decision on a
-      #                        snapshot taken AFTER the status read, not before
-      #                        it.
-      #   context_state        the GitHub-owned per-SHA success. Null when the
-      #                        policy opts out of status trust, which fails
-      #                        closed here exactly as it does at the barrier.
-      #   at-or-after          same-run correlation. A success PREDATING the
-      #                        object belongs to the previous run against this
-      #                        sha (#875 round 2) and proves nothing about this
-      #                        one. Strict: an absent or unparseable timestamp
-      #                        is false, never true.
-      #
-      # The #535 obligation is discharged, not dropped: the summary is still
-      # graded, and a blocking marker still escalates rc 2 rather than opening
-      # the barrier.
-      if [ -z "$newest_class" ] && [ "$rescan_done" = true ] \
-         && [ "$PROBE_CONTEXT_STATE" = "success" ] \
-         && mp_strict_iso_at_or_after "$PROBE_CONTEXT_UPDATED_AT" "$review_at"; then
-        # rc 0 / rc 2 are non-rc-7 paths, so the context fields must be null
-        # in the emission — the documented contract, and the same clearing the
-        # published-summary path below performs.
-        log "probe: no summary after the run on $HEAD_SHA, but the per-SHA StatusContext success @ $PROBE_CONTEXT_UPDATED_AT postdates the run @ $review_at — publication is complete (#857)"
-        PROBE_CONTEXT_STATE=""
-        PROBE_CONTEXT_UPDATED_AT=""
-        sbody=""
-        summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
-          || die 3 "failed to select the CodeRabbit summary comment for the completed run"
-        if [ -n "$summary" ]; then
-          sbody=$(printf '%s' "$summary" | base64 --decode | jq -r '.body')
-        fi
-        PROBE_OBSERVED="terminal"
-        if [ -n "$sbody" ] && summary_blocking_marker_present "$sbody"; then
-          log "probe: the completed run's newest summary carries a summary-only blocking marker"
-          emit_json_and_exit "findings" 2 "$review" 1
-        fi
-        log "probe: CodeRabbit has reported on $HEAD_SHA (run complete per the per-SHA status; no summary-level marker)"
-        emit_json_and_exit "reported" 0 "$review" 0
-      fi
       # #857 item 1, review-object arm (Phase 4b P1). The anchor-free pause
       # read below covers only the NO-review-object branch, so a durable pause
       # note that predates a HEAD-pinned run is invisible here: the anchored
@@ -2679,14 +2603,6 @@ probe_emit_verdict() {
       # item 1 exists to close. The ordering is not hypothetical: #852 showed a
       # summarize comment whose last edit PREDATES this head's review objects
       # and was never refreshed; a pause stanza in that slot behaves the same.
-      #
-      # Placed AFTER the item-2 terminal deliberately. A per-SHA success
-      # correlated to this run proves CodeRabbit ran on THIS head after the
-      # note was written — an explicit `@coderabbitai review` still runs while
-      # auto-review is paused — so the completed run is the stronger claim and
-      # keeps winning. Declining a demonstrably completed head on an older note
-      # would be the ancient-notice deadlock the anchored triage exists to
-      # prevent.
       #
       # Gated on `newest_class` empty for the same reason the terminal is: any
       # notice at-or-after the run already names the observed state through
