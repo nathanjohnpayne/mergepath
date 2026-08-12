@@ -3063,6 +3063,107 @@ cm_15v 'a CRLF setext underline still closes the paragraph' \
 cm_15v 'and a plain CRLF link is still seen' \
   'See [the audit](hub.md)\r' expect_rendered
 
+# --- Case 15w: a deeply nested marker line still yields a VERDICT ----
+# What these rows pin is not a misclassification, it is the ABSENCE of an
+# answer. The classifier used to consume list markers by tail-calling itself
+# once per marker, so a line of many markers cost the required gate its
+# verdict — and WHICH way it did so depended on the awk, which is the worst
+# property a gate can have. Measured on this tree before the fix, with `- `
+# repeated N times:
+#
+#   BWK awk 20200816   segfaults from N=7000 (N=6500 still answers)
+#   mawk 1.3.4         answers; this build grows its eval stack, while the
+#                      build #929 item 33 was measured on dies at ~N=500 with
+#                      `program limit exceeded: eval stack size=1024`
+#   gawk 5.4.1         answers, but took 278s at N=5000 and climbed
+#
+# WHAT THESE ROWS DO AND DO NOT DISCRIMINATE, stated plainly because the
+# honest answer is interpreter-dependent.
+#
+# Two 150-marker rows pin the marker bound from both sides, because a bound is
+# a behaviour change and an untested one drifts.
+#
+#   DIRECTION — the classifier stops consuming at 100 markers and declares
+#   text flow OPEN there, so the rest of THAT line is still scanned. A bound
+#   that closed the flow instead would blank the line and MISS the reference;
+#   the link-on-the-marker-line row fails if anyone writes it that way.
+#
+#   PRESENCE — 150 markers, a blank, then a line indented 210 columns. The
+#   bound puts the content column at 2x100; without it the column would be
+#   2x150, and 210 falls between the two, so the line is indented code with
+#   the bound and item prose without it. Both renderers make it code (measured
+#   below), so this row goes through the ORACLE like any other: the bound is
+#   not a divergence here, it is closer to both renderers than the unbounded
+#   reading was, because neither renderer tracks nesting that deep either.
+#
+# The 2000-marker row is the crash row, and N=2000 is chosen so it costs every
+# awk here under three seconds. On THIS machine it is a verdict-and-cost row:
+# neither BWK awk (which crashes only from 7000) nor this mawk build fails at
+# 2000 without the fix. On the mawk builds carrying the fixed 1024-entry eval
+# stack — the `awk` a Debian or Ubuntu CI runner selects by default, and the
+# build item 33 was reported from — it is a live crash regression, because
+# 2000 markers is four times that stack. The depth that crashes BWK awk HERE
+# is deliberately not used: a 14000-character line costs gawk 84 seconds in
+# the destination extractor, whose superlinear cost in LINE LENGTH is a
+# separate defect — just as slow on a marker line carrying no link at all —
+# filed on #929 rather than fixed here.
+#
+# THE DEEP ROWS DELIBERATELY BYPASS THE REFERENCE-RENDERER CROSS-CHECK, for
+# the Case 15t reason and with the same longhand treatment. Past nine markers
+# the two renderers disagree, because markdown-it-py has an implementation
+# nesting cap and cmark-gfm does not:
+#
+#   markdown-it-py 4.2.0  maxNesting=20, two levels per marker, so from TEN
+#                         markers up it stops and the link is NOT rendered
+#   cmark-gfm (GitHub)    renders the link at every depth measured — 1, 2, 19,
+#                         20, 21, 30, 99, 100, 101, 150, 200, 500, 5000 and
+#                         10000, `href="hub.md"` present in every response. It
+#                         caps its OUTPUT at ten <ul> levels and makes the
+#                         rest siblings; the link still resolves.
+#
+# Measured through GitHub POST /markdown, mode gfm. The rule this PR adopted —
+# agree with the renderer readers actually use — settles it for cmark-gfm, so
+# the checker must CLAIM the link at any depth, which is what the deep rows
+# assert. The five-marker row is under BOTH renderers' caps, so it goes
+# through the oracle like every other row in this file.
+cm_repeat() {
+  # `$2` repeated `$1` times, built by doubling: a two-thousand-marker body is
+  # a handful of string concatenations rather than two thousand loop turns.
+  local n="$1" unit="$2" out=""
+  while [ "$n" -gt 0 ]; do
+    if [ $((n % 2)) -eq 1 ]; then out="$out$unit"; fi
+    unit="$unit$unit"
+    n=$((n / 2))
+  done
+  printf '%s' "$out"
+}
+cm_markers() { cm_repeat "$1" '- '; }
+cm_spaces() { cm_repeat "$1" ' '; }
+
+cm_15w() {
+  local label="$1" body="$2" verdict="$3"
+  local out rc
+  set +e
+  out=$(run_truth_body "$body")
+  rc=$?
+  set -e
+  "$verdict" "Case 15w: $label" "$rc" "$out"
+}
+
+run_cm_matrix expect_rendered "Case 15w" \
+  "five markers is an ordinary nested item (control)|$(cm_markers 5)See [the audit](hub.md)"
+
+# 210 columns: past 2x the bound, short of 2x the true depth. Both
+# markdown-it-py 4.2.0 and cmark-gfm make this indented code and render no
+# link, so the oracle rules on it.
+run_cm_matrix expect_not_rendered "Case 15w" \
+  "the bound is the content column past it too|$(cm_markers 150)para\n\n$(cm_spaces 210)See [the audit](hub.md)"
+
+cm_15w 'past the marker bound the line is still scanned, not blanked' \
+  "$(cm_markers 150)See [the audit](hub.md)" expect_rendered
+cm_15w 'two thousand markers still produce a verdict, and still claim the link' \
+  "$(cm_markers 2000)See [the audit](hub.md)" expect_rendered
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).

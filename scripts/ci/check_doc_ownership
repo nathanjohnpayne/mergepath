@@ -198,6 +198,10 @@ mp_markdown_renderable_text() {
       # hub-only reference the others reported, and check 10 returned a
       # different verdict depending on which awk CI happened to run.
       LIST_MARKER = LIST_MARKER_CORE "([ \t]|$)"
+      # How many list markers ONE line may open before the classifier stops
+      # consuming them. See opens_text_flow for why an implementation limit
+      # belongs here at all, and for what it does and does not cost.
+      MAX_LIST_MARKERS = 100
       BLOCK_TAGS = " address article aside base basefont blockquote body"
       BLOCK_TAGS = BLOCK_TAGS " caption center col colgroup dd details"
       BLOCK_TAGS = BLOCK_TAGS " dialog dir div dl dt fieldset figcaption"
@@ -324,27 +328,32 @@ mp_markdown_renderable_text() {
       if (rest == "") return 0
       return 1
     }
-    function is_thematic_break(s, compact, ch, i) {
+    # "All the same character" is asserted with ONE anchored match rather
+    # than a character-at-a-time scan. Under a multibyte-aware awk `substr`
+    # has to walk from the start of the string to find the i-th CHARACTER, so
+    # the loop these two functions used to run was quadratic in the length of
+    # the line — and opens_text_flow calls both once per list marker it
+    # consumes, which made the whole path cubic. gawk 5.4.1 took 278 seconds
+    # to classify a 5000-marker line and climbed from there.
+    #
+    # The built pattern is exactly the loop it replaces: `ch` is already known
+    # to be one of `*`, `-`, `_`, `=`, every one of which is literal inside a
+    # bracket expression, and a `-` immediately after `[` is literal too.
+    function is_thematic_break(s, compact, ch) {
       compact = s
       gsub(/[ \t]/, "", compact)
       if (length(compact) < 3) return 0
       ch = substr(compact, 1, 1)
       if (ch != "*" && ch != "-" && ch != "_") return 0
-      for (i = 2; i <= length(compact); i++) {
-        if (substr(compact, i, 1) != ch) return 0
-      }
-      return 1
+      return (compact ~ ("^[" ch "]+$"))
     }
-    function is_setext_underline(s, compact, ch, i) {
+    function is_setext_underline(s, compact, ch) {
       compact = s
       sub(/[ \t]+$/, "", compact)
       if (length(compact) < 1) return 0
       ch = substr(compact, 1, 1)
       if (ch != "=" && ch != "-") return 0
-      for (i = 2; i <= length(compact); i++) {
-        if (substr(compact, i, 1) != ch) return 0
-      }
-      return 1
+      return (compact ~ ("^[" ch "]+$"))
     }
     # Does the line begin one of the seven HTML block start conditions
     # CommonMark defines? Only those replace or interrupt paragraph text. A
@@ -401,114 +410,162 @@ mp_markdown_renderable_text() {
       if (s ~ OPEN_TAG_ONLY || s ~ CLOSE_TAG_ONLY) return 1
       return 0
     }
-    function opens_text_flow(s, flow_open,   hashes, cols) {
-      # A block quote may lazily continue its paragraph without repeating the
-      # `>` marker on the next line. Classify the quoted block content, not
-      # the container marker itself. `flow_column` advances across the
-      # container markers too, because a tab further along the line expands
-      # against the absolute tab stops of that line.
-      while (substr(s, 1, 1) == ">") {
-        s = substr(s, 2)
-        flow_column += 1
-        if (substr(s, 1, 1) == "\t") {
-          flow_column += tab_stop_advance(flow_column)
+    # The list branch consumes one marker and then classifies what is left of
+    # the line by the SAME rules, which it used to do by TAIL-CALLING this
+    # function once per marker. On a line of many markers that cost the gate
+    # its VERDICT rather than its accuracy, and how it did so depended on the
+    # awk — which is the worst property a required check can have. Measured on
+    # this tree with `- ` repeated N times:
+    #
+    #   BWK awk 20200816   segfaults from N=7000 (N=6500 still answers)
+    #   mawk 1.3.4         answers — this build grows its eval stack, while
+    #                      the build #929 item 33 was measured on exits with
+    #                      `program limit exceeded: eval stack size=1024`
+    #   gawk 5.4.1         answers, but took 278 seconds at N=5000 and climbed
+    #
+    # Three changes, because the crash had three independent causes and any
+    # one of them left alone still costs the gate its answer:
+    #
+    #   * THE RECURSION. The call is a genuine tail call, so the loop below is
+    #     the same computation in ONE stack frame at any depth. This is what
+    #     removes the segfault and the eval-stack exit outright, on every awk,
+    #     with no behaviour change of any kind.
+    #   * THE PER-MARKER SCANS. The two "all the same character" tests run
+    #     once per marker were quadratic in the length of the line, which made
+    #     the path cubic; they are single matches now (see is_thematic_break).
+    #   * THE MARKER COUNT ITSELF. Even linear per-marker work is superlinear
+    #     over the line, and measured that way gawk still needed 153 seconds
+    #     at N=3000. A gate that never returns is no better than one that
+    #     dies, so `MAX_LIST_MARKERS` stops the consumption at 100.
+    #
+    # What the bound costs, stated exactly rather than waved at. Past it the
+    # markers stop being consumed and text flow is declared OPEN, so the rest
+    # of THAT line stays visible to the link scan — the report direction, and
+    # the correct one against the renderer this program follows: cmark-gfm
+    # renders `- ` repeated 150 or 10000 times followed by a link AS a link
+    # (measured through GitHub POST /markdown at every depth up to 10000),
+    # capping its output at ten <ul> levels and making the rest siblings. What
+    # is lost is the exact content column for the FOLLOWING lines, which the
+    # bound puts at 100 markers rather than N. Observing that needs a list
+    # more than 100 markers deep AND a following line indented past 200
+    # columns; against that, neither renderer models this nesting faithfully
+    # anywhere near 100 either — markdown-it-py stops at ten markers.
+    function opens_text_flow(s, flow_open,   hashes, cols, markers) {
+      markers = 0
+      while (1) {
+        # A block quote may lazily continue its paragraph without repeating the
+        # `>` marker on the next line. Classify the quoted block content, not
+        # the container marker itself. `flow_column` advances across the
+        # container markers too, because a tab further along the line expands
+        # against the absolute tab stops of that line.
+        while (substr(s, 1, 1) == ">") {
           s = substr(s, 2)
-        } else if (substr(s, 1, 1) ~ /[ \t]/) {
           flow_column += 1
-          s = substr(s, 2)
+          if (substr(s, 1, 1) == "\t") {
+            flow_column += tab_stop_advance(flow_column)
+            s = substr(s, 2)
+          } else if (substr(s, 1, 1) ~ /[ \t]/) {
+            flow_column += 1
+            s = substr(s, 2)
+          }
         }
-      }
-      if (s == "") return 0
-      if (is_thematic_break(s)) return 0
-      # A setext underline exists only UNDER a paragraph — it is the thing
-      # that turns the paragraph above it into a heading. Applying the shape
-      # test with nothing open read every line of dashes or equals as a
-      # block boundary in its own right: `=` alone opens a paragraph for
-      # both renderers, so a four-column line below it is a lazy
-      # continuation whose link renders, and this blanked it as code. It
-      # also shadowed the list branch for the one bullet whose marker is
-      # spelled with the same character — `-` and `- ` never reached it, so
-      # a blank-first bullet pushed no content frame and a hub-only link
-      # four or five columns under it was missed entirely.
-      #
-      # The order against the list branch matters and is the reason this is
-      # a separate test rather than a condition inside it: with a paragraph
-      # open, `- ` is a setext underline and NOT a list, because a list can
-      # interrupt a paragraph only when it begins with a non-blank item.
-      if (flow_open && is_setext_underline(s)) return 0
-      if (is_list_marker(s)) {
-        # ... but only when a list may start here at all. With a paragraph
-        # open, a marker that cannot interrupt it leaves the paragraph — and
-        # its content column — exactly as they were.
-        if (flow_open && !can_interrupt_paragraph(s)) return 1
-        # A list item is a container whose content is parsed as blocks in its
-        # own right, so the item opens a paragraph only when its FIRST child
-        # is one. Consume the marker and classify what follows by the same
-        # rules; a heading-first or thematic-break-first item opens no text
-        # flow, and the indented lines under it really are code (#812).
-        cols = list_marker_columns(s, flow_column)
-        # Reported back so the caller can measure indented code from the item
-        # CONTENT column rather than from column zero.
+        if (s == "") return 0
+        if (is_thematic_break(s)) return 0
+        # A setext underline exists only UNDER a paragraph — it is the thing
+        # that turns the paragraph above it into a heading. Applying the shape
+        # test with nothing open read every line of dashes or equals as a
+        # block boundary in its own right: `=` alone opens a paragraph for
+        # both renderers, so a four-column line below it is a lazy
+        # continuation whose link renders, and this blanked it as code. It
+        # also shadowed the list branch for the one bullet whose marker is
+        # spelled with the same character — `-` and `- ` never reached it, so
+        # a blank-first bullet pushed no content frame and a hub-only link
+        # four or five columns under it was missed entirely.
         #
-        # EVERY marker on the line records its own frame. `- - # inner`
-        # opens TWO items, and pushing only the summed column left the outer
-        # one with no frame at all: the first line that dedented out of the
-        # inner item popped the single frame and dropped straight to column
-        # zero, so the later prose of the outer item was measured against
-        # the top-level four-column threshold and blanked as code. The
-        # recorded value stays the RUNNING SUM rather than `flow_column`,
-        # because these columns are relative to the indent of the line
-        # itself — which the caller adds, and which `flow_column` has
-        # already absorbed along with any block-quote markers ahead of the
-        # list.
-        marker_columns += cols
-        mc_n++
-        mc[mc_n] = marker_columns
-        flow_column += cols
-        # The wide-run and blank-marker cases above put the first child of the
-        # item in an indented code block, or in no block at all; neither opens
-        # a text flow, and neither leaves a first child to classify.
-        if (LM_CODE_FIRST) { item_code_first = 1; return 0 }
-        # "Item starting with a blank line": the marker and its whitespace run
-        # reach the end of the line, so the item has no first child HERE to
-        # classify — and nothing is left to recurse ON. Reading only LM_CHARS
-        # against the line length missed it, because LM_CHARS is zero in that
-        # fallback rather than the whole line: `substr(s, 1)` handed back the
-        # SAME string and the recursion never terminated. A `+ ` line in a
-        # canonical doc then hung the check or overflowed the awk stack
-        # instead of producing a verdict, so the guard is a hang, not a
-        # misclassification. LM_CHARS <= 0 is held alongside the flag so any
-        # future path that returns without a first child fails safe the same
-        # way.
-        if (LM_BLANK_FIRST || LM_CHARS <= 0 || LM_CHARS >= length(s)) {
-          # Reported back so the caller can bound how long the frame lives.
-          # An item that begins with a blank line is allowed exactly one, so
-          # its container closes on the NEXT blank rather than surviving to
-          # the end of the document. Read off the innermost marker, which is
-          # where the recursion stops.
-          if (LM_BLANK_FIRST) item_blank_first = 1
-          return 0
+        # The order against the list branch matters and is the reason this is
+        # a separate test rather than a condition inside it: with a paragraph
+        # open, `- ` is a setext underline and NOT a list, because a list can
+        # interrupt a paragraph only when it begins with a non-blank item.
+        if (flow_open && is_setext_underline(s)) return 0
+        if (is_list_marker(s)) {
+          # ... but only when a list may start here at all. With a paragraph
+          # open, a marker that cannot interrupt it leaves the paragraph — and
+          # its content column — exactly as they were.
+          if (flow_open && !can_interrupt_paragraph(s)) return 1
+          # Past the bound, stop consuming and leave the rest of the line to
+          # the link scan. See the note above the function for why the bound
+          # exists and exactly what it costs.
+          if (++markers > MAX_LIST_MARKERS) return 1
+          # A list item is a container whose content is parsed as blocks in its
+          # own right, so the item opens a paragraph only when its FIRST child
+          # is one. Consume the marker and classify what follows by the same
+          # rules; a heading-first or thematic-break-first item opens no text
+          # flow, and the indented lines under it really are code (#812).
+          cols = list_marker_columns(s, flow_column)
+          # Reported back so the caller can measure indented code from the item
+          # CONTENT column rather than from column zero.
+          #
+          # EVERY marker on the line records its own frame. `- - # inner`
+          # opens TWO items, and pushing only the summed column left the outer
+          # one with no frame at all: the first line that dedented out of the
+          # inner item popped the single frame and dropped straight to column
+          # zero, so the later prose of the outer item was measured against
+          # the top-level four-column threshold and blanked as code. The
+          # recorded value stays the RUNNING SUM rather than `flow_column`,
+          # because these columns are relative to the indent of the line
+          # itself — which the caller adds, and which `flow_column` has
+          # already absorbed along with any block-quote markers ahead of the
+          # list.
+          marker_columns += cols
+          mc_n++
+          mc[mc_n] = marker_columns
+          flow_column += cols
+          # The wide-run and blank-marker cases above put the first child of the
+          # item in an indented code block, or in no block at all; neither opens
+          # a text flow, and neither leaves a first child to classify.
+          if (LM_CODE_FIRST) { item_code_first = 1; return 0 }
+          # "Item starting with a blank line": the marker and its whitespace run
+          # reach the end of the line, so the item has no first child HERE to
+          # classify — and nothing is left to recurse ON. Reading only LM_CHARS
+          # against the line length missed it, because LM_CHARS is zero in that
+          # fallback rather than the whole line: `substr(s, 1)` handed back the
+          # SAME string and the recursion never terminated. A `+ ` line in a
+          # canonical doc then hung the check or overflowed the awk stack
+          # instead of producing a verdict, so the guard is a hang, not a
+          # misclassification. LM_CHARS <= 0 is held alongside the flag so any
+          # future path that returns without a first child fails safe the same
+          # way.
+          if (LM_BLANK_FIRST || LM_CHARS <= 0 || LM_CHARS >= length(s)) {
+            # Reported back so the caller can bound how long the frame lives.
+            # An item that begins with a blank line is allowed exactly one, so
+            # its container closes on the NEXT blank rather than surviving to
+            # the end of the document. Read off the innermost marker, which is
+            # where the recursion stops.
+            if (LM_BLANK_FIRST) item_blank_first = 1
+            return 0
+          }
+          s = substr(s, LM_CHARS + 1)
+          # The item content is parsed as blocks IN ITS OWN RIGHT, so no
+          # paragraph is open inside it yet — whatever was open outside stopped
+          # at the marker. Carrying flow_open in made the item inherit the outer
+          # paragraph and re-apply the interrupt rules to its own first child:
+          # under an open paragraph, `- 2. # Heading` had its NESTED marker
+          # rejected as unable to interrupt, so that item never pushed a content
+          # column and prose six or seven columns in was measured against the
+          # OUTER frame and blanked as code. The renderer shows it as ordinary
+          # nested-item prose, so a hub-only link there escaped check 10
+          # entirely — a missed reference, not a false alarm.
+          flow_open = 0
+          continue
         }
-        s = substr(s, LM_CHARS + 1)
-        # The item content is parsed as blocks IN ITS OWN RIGHT, so no
-        # paragraph is open inside it yet — whatever was open outside stopped
-        # at the marker. Carrying flow_open in made the item inherit the outer
-        # paragraph and re-apply the interrupt rules to its own first child:
-        # under an open paragraph, `- 2. # Heading` had its NESTED marker
-        # rejected as unable to interrupt, so that item never pushed a content
-        # column and prose six or seven columns in was measured against the
-        # OUTER frame and blanked as code. The renderer shows it as ordinary
-        # nested-item prose, so a hub-only link there escaped check 10
-        # entirely — a missed reference, not a false alarm.
-        return opens_text_flow(s, 0)
+        if (substr(s, 1, 1) == "#") {
+          hashes = run_len(s, 1, "#")
+          if (hashes <= 6 && substr(s, hashes + 1) ~ /^([ \t]|$)/) return 0
+        }
+        if (s ~ /^\[[^]]+\]:[ \t]*/) return 0
+        if (opens_html_block(s, flow_open)) return 0
+        return 1
       }
-      if (substr(s, 1, 1) == "#") {
-        hashes = run_len(s, 1, "#")
-        if (hashes <= 6 && substr(s, hashes + 1) ~ /^([ \t]|$)/) return 0
-      }
-      if (s ~ /^\[[^]]+\]:[ \t]*/) return 0
-      if (opens_html_block(s, flow_open)) return 0
-      return 1
     }
     # Container content columns, innermost last. List items nest, so the
     # threshold for indented code is a STACK, not a scalar: leaving an inner
