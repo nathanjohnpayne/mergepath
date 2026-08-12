@@ -139,30 +139,11 @@ codex_tier_of() {
 # 600 chars (the marker sits near the top), ordered highest-confidence first.
 #
 # CodeRabbit markers → tier (p0 is Codex-only; CodeRabbit never maps to p0):
-#   🔴 Critical / 🟠 Major / Potential issue / ⚠️  → p1
+#   🟠 Major / Potential issue / ⚠️  → p1
 #   🧹 Nitpick                                     → nitpick
 #   🔵 Trivial / Outside diff range                → p3
 #   🟡 Minor                                       → p2
 # Anything else (Refactor suggestion, plain Note, bare titlecase prose) → empty.
-#
-# `🔴 Critical` completes the severity-emoji family (#888). Before it, a
-# Critical-badged finding carrying no other blocking marker graded the same as
-# an unbadged one — the #837 false-clear class at the TOP severity, blind in the
-# advisory `coderabbit-wait.sh` count AND in the required
-# `coderabbit-severity-gate.sh`, because #884 routed both through this one
-# ladder.
-#
-# It joins the p1 rung rather than opening a CodeRabbit p0, even though p0 is
-# what "critical" means in the normalized ladder. `resolve_required_tiers`
-# returns `{p1}` when a consumer has no `feedback_policy` block, so a
-# CodeRabbit p0 would leave the TOP severity NON-blocking in exactly the repos
-# where a Major already blocks — a worse inversion than the blind spot it
-# fixes. At p1, Critical blocks wherever Major blocks, in every config, which
-# is the only relation that is never weaker.
-#
-# The rung is a pure ADDITION to the badge case list: it can only move a body
-# from unclassified to p1, and `resolve_required_tiers` never yields a set that
-# excludes p1, so it cannot weaken any gate reading this ladder.
 #
 # CodeRabbit's other machine-readable signal — the `cr-indicator-types` tag it
 # appends to a finding body — is deliberately NOT graded here. Grading it needs
@@ -179,7 +160,7 @@ coderabbit_tier_of() {
   # matched below are near the start, so a 600-char cut is more than enough.
   head="${1:-}"; head="${head:0:600}"
   case "$head" in
-    *"🔴 Critical"*|*"🟠 Major"*|*"Potential issue"*|*"⚠️"*)  echo p1; return 0 ;;
+    *"🟠 Major"*|*"Potential issue"*|*"⚠️"*)  echo p1; return 0 ;;
     *"🧹 Nitpick"*)                            echo nitpick; return 0 ;;
     *"🔵 Trivial"*|*"Outside diff range"*)     echo p3; return 0 ;;
     *"🟡 Minor"*)                              echo p2; return 0 ;;

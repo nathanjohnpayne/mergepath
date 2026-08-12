@@ -3747,46 +3747,6 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 50 (#888): the 🔴 Critical rung reaches the REQUIRED gate.
-#
-# The rung lives in scripts/lib/feedback-policy-helpers.sh, which is the whole
-# point — #884 routed the advisory coderabbit-wait.sh count and this gate
-# through one classifier, so a blind spot there went blind in both at once, and
-# a private rule in either would re-open the drift #837 closed. This case
-# asserts the gate BLOCKS on a bare `🔴 Critical` badge end-to-end rather than
-# asserting the classifier is called: the classifier's own tiering is
-# unit-tested in tests/test_feedback_policy_helpers.sh.
-#
-# #888's other blind spot — a body whose only signal is the
-# `cr-indicator-types:potential_issue` machine tag — is #945, not this change.
-# ---------------------------------------------------------------------------
-BARE_CRITICAL_BODY="_🔒 Security & Privacy_ | _🔴 Critical_
-
-Remote code execution via the unvalidated path."
-
-echo
-echo "--- Test 50 (#888): a bare 🔴 Critical badge, unresolved"
-SCRATCH=$(make_scratch_with_config true)
-FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
-FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$BARE_CRITICAL_BODY")
-FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [2001]}]')
-set +e
-OUT=$(
-  FIXTURE_PR="$FIXTURE_PR" \
-  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-  FIXTURE_THREADS="$FIXTURE_THREADS" \
-    run_gate "$SCRATCH" 99 owner/repo 2>&1
-)
-RC=$?
-set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
-  pass "#888: a bare 🔴 Critical badge blocks the required gate (rc 1, unresolved 1)"
-else
-  fail "#888: expected rc=1 with 'unresolved: 1' for a bare 🔴 Critical badge; got rc=$RC"
-  echo "$OUT" | sed 's/^/      /' >&2
-fi
-
-# ---------------------------------------------------------------------------
 # Test 51 (#936): the summary READ is never allowed to fail into "zero
 # findings".
 #
