@@ -2849,10 +2849,13 @@ run_cm_matrix expect_rendered "Case 15r" \
   'four columns after the quote closes is outer item prose|- para\n    > - # inner\n\n    See [the audit](hub.md)' \
   'a marked blank keeps the quote and its inner item alive|- para\n    > - # inner\n    >\n    >     See [the audit](hub.md)' \
   'the allowance follows a wider item too|-   para\n     > - # inner\n\n       See [the audit](hub.md)' \
-  'a tab-spelled prefix, one column short of the threshold|-\tpara\n\t> - # inner\n\n\t   See [the audit](hub.md)'
+  'a tab-spelled prefix, one column short of the threshold|-\tpara\n\t> - # inner\n\n\t   See [the audit](hub.md)' \
+  'a tab inside the allowance, one column short|- para\n  \t> - # inner\n\n    See [the audit](hub.md)'
 
 run_cm_matrix expect_not_rendered "Case 15r" \
   'a tab-spelled container prefix counts in columns too|-\tpara\n\t> - # inner\n\n\t    See [the audit](hub.md)' \
+  'a tab INSIDE the three-column allowance counts too|- para\n  \t> - # inner\n\n      See [the audit](hub.md)' \
+  'and a tab immediately after the base|- para\n\t> - # inner\n\n      See [the audit](hub.md)' \
   'and the same with no inner list to tag|-\tpara\n\t> quote\n\n\t    See [the audit](hub.md)' \
   'a tab-indented item with no quote at all (control)|-\tpara\n\n\t    See [the audit](hub.md)' \
   'a quote four columns inside an item is still a quote|- para\n    > - # inner\n\n      See [the audit](hub.md)' \
@@ -2956,6 +2959,45 @@ else
 
   run_cm_matrix expect_not_rendered "Case 15s" \
     'a plain space after the marker is a run, so six columns is item code|- # Heading\n      See [the audit](hub.md)'
+
+  # Case 15u: the rest of the block classifier, swept in one pass instead of
+  # one site per review round. Every [[:space:]] inside the renderable-text awk
+  # program is now the ASCII set, because CommonMark defines block structure in
+  # terms of spaces and tabs and a line ending cannot occur inside a line — so
+  # the POSIX class only ever added locale-dependent Unicode matches that made
+  # the verdict depend on which awk CI ran. Twelve sites moved; these rows
+  # cover the ones a document can actually reach, one per rule:
+  #
+  #   the list-interruption test  a nonblank item CAN interrupt a paragraph,
+  #                               and an em space is content, not blankness
+  #   thematic break              spaces and tabs may be interspersed, an em
+  #                               space is not, so the line stays a paragraph
+  #   ATX heading                 the run after the hashes is a space or tab
+  #   blank line                  only spaces and tabs make a line blank
+  #   setext underline            only spaces and tabs may trail it
+  #   fenced code closer          only spaces and tabs may trail it
+  #
+  # Each row is written so the em space FLIPS the verdict — the construct is
+  # recognized with ASCII whitespace and not with the em space — which is what
+  # makes it fail under the old spelling instead of passing either way. That
+  # is not automatic: a first draft of the blank-line, setext and fence rows
+  # put the em space somewhere the two spellings agreed, and reverting the
+  # whole sweep left all three green. Each now carries the ASCII control that
+  # proves the pair really does discriminate.
+  run_cm_matrix expect_rendered "Case 15u" \
+    'an em space after a valid marker separator is item content|Governance\n- \xe2\x80\x83\n\n    See [the audit](hub.md)' \
+    'an em space between dashes is not a thematic break|Governance\n- \xe2\x80\x83-\xe2\x80\x83-\n\n    See [the audit](hub.md)' \
+    'an em space after the hashes is not an ATX heading|#\xe2\x80\x83Governance\n    See [the audit](hub.md)' \
+    'a line of only an em space does not close a blank-first item|- \n\xe2\x80\x83\n    See [the audit](hub.md)' \
+    'a trailing em space is not a setext underline|Governance\n===\xe2\x80\x83\n    See [the audit](hub.md)' \
+    'an ASCII trailing space DOES close a fence (control)|- para\n```\nx\n``` \nSee [the audit](hub.md)'
+
+  run_cm_matrix expect_not_rendered "Case 15u" \
+    'an ASCII-only separator really does leave the item blank (control)|Governance\n- \n\n    See [the audit](hub.md)' \
+    'six columns under the same interrupted paragraph (control)|Governance\n- \xe2\x80\x83\n\n      See [the audit](hub.md)' \
+    'a real blank line DOES close a blank-first item (control)|- \n\n    See [the audit](hub.md)' \
+    'an ASCII trailing space IS a setext underline (control)|Governance\n=== \n    See [the audit](hub.md)' \
+    'a trailing em space does not close a fence|- para\n```\nx\n```\xe2\x80\x83\nSee [the audit](hub.md)'
 
   # Case 15t rides the same pin: its rows turn on the identical gawk ctype
   # behaviour, so under LC_ALL=C they would be just as inert.

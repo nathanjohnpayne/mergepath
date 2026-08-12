@@ -320,13 +320,13 @@ mp_markdown_renderable_text() {
         if (start + 0 != 1) return 0
       }
       rest = substr(s, w + 1)
-      sub(/^[[:space:]]+/, "", rest)
+      sub(/^[ \t]+/, "", rest)
       if (rest == "") return 0
       return 1
     }
     function is_thematic_break(s, compact, ch, i) {
       compact = s
-      gsub(/[[:space:]]/, "", compact)
+      gsub(/[ \t]/, "", compact)
       if (length(compact) < 3) return 0
       ch = substr(compact, 1, 1)
       if (ch != "*" && ch != "-" && ch != "_") return 0
@@ -337,7 +337,7 @@ mp_markdown_renderable_text() {
     }
     function is_setext_underline(s, compact, ch, i) {
       compact = s
-      sub(/[[:space:]]+$/, "", compact)
+      sub(/[ \t]+$/, "", compact)
       if (length(compact) < 1) return 0
       ch = substr(compact, 1, 1)
       if (ch != "=" && ch != "-") return 0
@@ -413,7 +413,7 @@ mp_markdown_renderable_text() {
         if (substr(s, 1, 1) == "\t") {
           flow_column += tab_stop_advance(flow_column)
           s = substr(s, 2)
-        } else if (substr(s, 1, 1) ~ /[[:space:]]/) {
+        } else if (substr(s, 1, 1) ~ /[ \t]/) {
           flow_column += 1
           s = substr(s, 2)
         }
@@ -504,9 +504,9 @@ mp_markdown_renderable_text() {
       }
       if (substr(s, 1, 1) == "#") {
         hashes = run_len(s, 1, "#")
-        if (hashes <= 6 && substr(s, hashes + 1) ~ /^([[:space:]]|$)/) return 0
+        if (hashes <= 6 && substr(s, hashes + 1) ~ /^([ \t]|$)/) return 0
       }
-      if (s ~ /^\[[^]]+\]:[[:space:]]*/) return 0
+      if (s ~ /^\[[^]]+\]:[ \t]*/) return 0
       if (opens_html_block(s, flow_open)) return 0
       return 1
     }
@@ -581,7 +581,7 @@ mp_markdown_renderable_text() {
     # quote did not take it down with it; the stale frame raised the code
     # threshold and a six-column link was reported although both renderers
     # render it as indented code in the OUTER item.
-    function quote_depth(s, base,   d, i, run, eaten, ch) {
+    function quote_depth(s, base,   d, i, run, eaten, ch, col, adv) {
       d = 0
       i = 1
       # Container indentation first, and only as much of it as is actually
@@ -601,15 +601,36 @@ mp_markdown_renderable_text() {
         else if (ch == "\t") { eaten += tab_stop_advance(eaten); i++ }
         else break
       }
+      # Every run from here on is measured in COLUMNS against `col`, the
+      # absolute column reached so far, because a tab advances to the next tab
+      # stop and how far it advances depends on where it starts. Counting
+      # characters instead made the three-column allowance wrong for every
+      # tab-spelled indentation: `- para` then two spaces, a tab and
+      # `> - # inner` puts the marker at column four, which CommonMark
+      # recognizes as a quote nested in the outer item, while a
+      # spaces-only loop stopped at the tab and read no marker at all.
+      col = eaten
       while (i <= length(s)) {
-        # At most three spaces may precede a marker; a fourth is indentation,
+        # At most three columns may precede a marker; a fourth is indentation,
         # which makes the line content rather than a deeper quote.
         run = 0
-        while (run < 4 && substr(s, i, 1) == " ") { run++; i++ }
+        while (run < 4) {
+          ch = substr(s, i, 1)
+          if (ch == " ") { run++; col++; i++ }
+          else if (ch == "\t") {
+            adv = tab_stop_advance(col)
+            run += adv; col += adv; i++
+          } else break
+        }
         if (run >= 4 || substr(s, i, 1) != ">") break
         d++
         i++
-        if (substr(s, i, 1) == " ") i++
+        col++
+        # One space or tab after the marker belongs to the marker, not to the
+        # content — and a tab there advances by columns like any other.
+        ch = substr(s, i, 1)
+        if (ch == " ") { i++; col++ }
+        else if (ch == "\t") { col += tab_stop_advance(col); i++ }
       }
       return d
     }
@@ -646,7 +667,7 @@ mp_markdown_renderable_text() {
       reference_continuation = 0
       if (reference_pending) {
         reference_pending = 0
-        if (line !~ /^[[:space:]]*$/) reference_continuation = 1
+        if (line !~ /^[ \t]*$/) reference_continuation = 1
       }
       indent = match(line, /[^ ]/) - 1
       if (indent < 0) indent = length(line)
@@ -660,7 +681,7 @@ mp_markdown_renderable_text() {
         if (indent <= 3 && substr(rest, 1, 1) == fence_char) {
           width = run_len(rest, 1, fence_char)
           tail = substr(rest, width + 1)
-          if (width >= fence_width && tail ~ /^[[:space:]]*$/) in_fence = 0
+          if (width >= fence_width && tail ~ /^[ \t]*$/) in_fence = 0
         }
         text_flow_open = 0
         print ""
@@ -671,7 +692,7 @@ mp_markdown_renderable_text() {
       # may hold one and keep going, so it must not reach the pop below. The
       # one exception is an item that BEGAN with a blank line, which is
       # bounded at that single blank — see close_blank_first_frame.
-      if (line ~ /^[[:space:]]*$/) {
+      if (line ~ /^[ \t]*$/) {
         close_blank_first_frame()
         text_flow_open = 0
         print ""
@@ -761,8 +782,8 @@ mp_markdown_renderable_text() {
       }
       rendered = strip_inline_code(line)
       probe = rendered
-      sub(/^[[:space:]]*/, "", probe)
-      if (probe ~ /^\[[^]]+\]:[[:space:]]*$/) {
+      sub(/^[ \t]*/, "", probe)
+      if (probe ~ /^\[[^]]+\]:[ \t]*$/) {
         reference_pending = 1
         text_flow_open = 0
       } else if (reference_continuation) {
@@ -789,7 +810,7 @@ mp_markdown_renderable_text() {
         text_flow_open = 1
       } else {
         flow_probe = line
-        sub(/^[[:space:]]*/, "", flow_probe)
+        sub(/^[ \t]*/, "", flow_probe)
         marker_columns = 0
         mc_n = 0
         flow_column = col_indent
