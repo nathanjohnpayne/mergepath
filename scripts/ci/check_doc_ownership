@@ -1367,6 +1367,7 @@ mp_doc_link_targets() {
         # source as commands. Keep comments apostrophe-free.
         function char_reference_at(s, i,   rest, semi, body, digits, cp, k) {
           REF_LEN = 0
+          REF_UNKNOWN_NAME = 0
           rest = substr(s, i)
           semi = index(rest, ";")
           if (semi < 3) return ""
@@ -1400,8 +1401,12 @@ mp_doc_link_targets() {
               # embedding. It is bounded on the one axis that costs nothing —
               # HTML5 defines no single-character name, so `&x;` cannot be one
               # and is still read as literal text.
+              #
+              # Reported as a fact about THIS reference rather than raised on
+              # the destination directly, because where in the destination it
+              # sits decides whether it matters at all — see normalize_target.
               if (length(body) >= 2 && body ~ /^[A-Za-z][A-Za-z0-9]*$/) {
-                TARGET_UNRESOLVED = 1
+                REF_UNKNOWN_NAME = 1
               }
               return ""
             }
@@ -1607,13 +1612,21 @@ mp_doc_link_targets() {
                 i += REF_LEN
                 continue
               }
+              # Record WHERE the first unexpandable name lands in the decoded
+              # destination. normalize_target needs the position, not just the
+              # fact, because a name in the query or fragment does not change
+              # the PATH this program compares.
+              if (REF_UNKNOWN_NAME && !TARGET_UNRESOLVED) {
+                TARGET_UNRESOLVED = 1
+                TARGET_UNRESOLVED_AT = length(out) + 1
+              }
             }
             out = out c
             i++
           }
           return out
         }
-        function normalize_target(s) {
+        function normalize_target(s,   cut) {
           # Reset per destination: the flag is set by utf8_of when a decoded
           # CR or LF appears anywhere in THIS destination, in a character
           # reference or a percent escape alike. TARGET_UNRESOLVED is the
@@ -1621,12 +1634,26 @@ mp_doc_link_targets() {
           # program cannot expand.
           TARGET_DROP = 0
           TARGET_UNRESOLVED = 0
+          TARGET_UNRESOLVED_AT = 0
           s = unescape_and_decode(s)
           # URL parsing recognizes raw query/fragment delimiters before
           # percent decoding, so encoded %3F/%23 remain filename bytes. A
           # character reference is resolved BEFORE the URL is read, though,
           # so a `&#63;` really does start a query string — which is why the
           # decode above runs first.
+          #
+          # An unexpandable name is only worth reporting when it is in the
+          # PATH, which is the only part this program compares. Both
+          # renderers percent-encode `hub.md#&alpha;section` to
+          # `hub.md#%CE%B1section`: the fragment changes, the path stays
+          # `hub.md`, and reporting the destination as unverifiable would be a
+          # false positive on a link that resolves perfectly (CodeRabbit,
+          # #925). The delimiter position is taken BEFORE the strip, and an
+          # unknown name at or past it is dropped.
+          cut = match(s, /[?#]/)
+          if (TARGET_UNRESOLVED && cut > 0 && TARGET_UNRESOLVED_AT >= cut) {
+            TARGET_UNRESOLVED = 0
+          }
           sub(/[?#].*$/, "", s)
           s = percent_decode(s)
           if (TARGET_DROP) return ""

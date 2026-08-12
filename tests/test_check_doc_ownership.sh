@@ -3287,6 +3287,25 @@ cm_15x 'the angle form is trimmed to the wrapper, title excluded' \
 cm_15x 'a plausible non-name is reported too, deliberately' \
   'hub.md' 'See [the audit](hub&perio;.md) for details.' \
   expect_unresolvable 'hub&perio;.md'
+# Only the PATH is compared against the inventory, so only an unexpandable
+# name in the PATH makes a destination unverifiable. Both renderers resolve
+# `hub.md#&alpha;section` to `hub.md#%CE%B1section` — the fragment changes, the
+# path does not — so reporting it would be a false positive on a link that
+# resolves perfectly (CodeRabbit, #925). The four rows pin both sides of the
+# delimiter, and the first two also prove the PATH comparison still runs: they
+# reach the hub-only doc and must be reported as THAT, not as unverifiable.
+cm_15x 'a name in the fragment leaves the path verifiable' \
+  'hub.md' 'See [the audit](hub.md#&alpha;x) for details.' \
+  expect_rendered 'docs/agents/hub.md'
+cm_15x 'and so does one in the query' \
+  'hub.md' 'See [the audit](hub.md?&alpha;=1) for details.' \
+  expect_rendered 'docs/agents/hub.md'
+cm_15x 'a name in the path is still reported, fragment or not' \
+  'α.md' 'See [the audit](&alpha;.md#x) for details.' \
+  expect_unresolvable '&alpha;.md#x'
+cm_15x 'and with a query after it' \
+  'α.md' 'See [the audit](&alpha;.md?a=1) for details.' \
+  expect_unresolvable '&alpha;.md?a=1'
 # The flag is per-DESTINATION, and every destination in the document runs
 # through the same awk process. Dropping its reset would make the first
 # unresolvable destination condemn every one after it, which no other row can
