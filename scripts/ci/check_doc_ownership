@@ -657,6 +657,20 @@ mp_markdown_renderable_text() {
     }
     {
       line = $0
+      # § Preliminaries: a line ending is a newline, a carriage return, or a
+      # carriage return + newline, and it is NOT part of the line. awk splits
+      # on the newline only, so a CRLF document hands every rule a trailing CR.
+      # It is stripped ONCE, here, rather than absorbed by the whitespace
+      # classes downstream — which is what used to happen, invisibly, while
+      # those classes were [[:space:]]. Narrowing them to the ASCII set the
+      # spec actually defines therefore broke CRLF documents until this line
+      # existed: a CRLF "blank" line stopped reading as blank, a fence closer
+      # with a trailing CR stopped closing its fence, and a link after that
+      # fence was scanned as code and MISSED. Normalizing the line ending is
+      # the right layer for it; widening the classes back would put a line
+      # ending into the definition of horizontal whitespace, where the spec
+      # does not put it.
+      sub(/\r$/, "", line)
       # How deep in block quotes this line is marked. Container frames are
       # tagged with it so a list inside a quote dies when the quote does.
       # `code_column` is the content column of the innermost container still

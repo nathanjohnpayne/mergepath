@@ -3020,6 +3020,49 @@ else
   if [ -n "$cm_saved_lang" ]; then export LANG="$cm_saved_lang"; else unset LANG; fi
 fi
 
+# --- Case 15v: a CRLF document classifies exactly like an LF one -----
+# § Preliminaries: a line ending is a newline, a carriage return, or a carriage
+# return + newline, and it is NOT part of the line. awk splits on the newline
+# only, so a CRLF document hands every rule a trailing CR.
+#
+# These rows exist because narrowing the whitespace classes to ASCII BROKE
+# CRLF documents, and nothing in the suite noticed. While the classes were
+# `[[:space:]]` the stray CR was being absorbed by them invisibly; once they
+# became `[ \t]` — the set the spec actually defines — a CRLF blank line
+# stopped reading as blank, a fence closer with a trailing CR stopped closing
+# its fence, and a link after that fence was scanned as code and MISSED. The
+# fix is to normalize the line ending once at input rather than to widen the
+# classes back, because a line ending is not horizontal whitespace.
+#
+# The rows are written as PAIRS against their LF twins, and the pairing is the
+# assertion: whatever the LF spelling decides, the CRLF spelling must decide
+# identically. They deliberately do not go through the reference renderer,
+# because `printf '%b'` + the oracle would compare a different pair of inputs
+# than the checker sees; the LF twin IS the oracle here, and each twin is
+# itself an oracle-checked row elsewhere in Cases 15o–15u.
+cm_15v() {
+  local label="$1" body="$2" verdict="$3"
+  local out rc
+  set +e
+  out=$(run_truth_body "$body")
+  rc=$?
+  set -e
+  "$verdict" "Case 15v: $label" "$rc" "$out"
+}
+
+cm_15v 'a CRLF blank line still closes the text flow' \
+  '- para\r\n\r\n      See [the audit](hub.md)\r' expect_not_rendered
+cm_15v 'and four columns under it is still item prose' \
+  '- para\r\n\r\n    See [the audit](hub.md)\r' expect_rendered
+cm_15v 'a CRLF heading still dedents and closes the item' \
+  '- para\r\n# Governance\r\n\r\n    See [the audit](hub.md)\r' expect_not_rendered
+cm_15v 'a CRLF fence closer still closes its fence' \
+  '- para\r\n```\r\nx\r\n```\r\nSee [the audit](hub.md)\r' expect_rendered
+cm_15v 'a CRLF setext underline still closes the paragraph' \
+  'Governance\r\n===\r\n    See [the audit](hub.md)\r' expect_not_rendered
+cm_15v 'and a plain CRLF link is still seen' \
+  'See [the audit](hub.md)\r' expect_rendered
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).
