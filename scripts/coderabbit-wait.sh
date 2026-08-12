@@ -205,6 +205,12 @@
 #       "observed": "none" | "rate_limit" | "paused" | "in_progress"
 #                   | "summary-without-head-review" | "awaiting-summary"
 #                   | "terminal",
+#       # `paused` is reported from TWO surfaces (#857): the head-anchored
+#       # triage, and — when the anchor has moved past the notice after a fix
+#       # push — the anchor-free summarize comment, whose evidence carries the
+#       # pause note's id so the Phase 4b barrier's #847 resume path can key on
+#       # it. rate_limit and in_progress stay anchored: an ancient window or a
+#       # transient marker must not decline the trigger forever.
 #       # The per-SHA CodeRabbit StatusContext state on the HEAD
 #       # (success|failure|pending|error|missing), sampled ONLY when the
 #       # rc-7 verdict carries a HEAD-pinned review object (endpoint
@@ -263,10 +269,10 @@
 #       no JSON, so a caller could not tell rc 1 from a crashed run.
 #
 #       In `--probe` mode rc 0 means REPORTED — a HEAD-pinned review object
-#       exists, or the summarize comment is head-pinned and completed (#851) —
-#       and NOT "no findings". rc 2 is the ONE verdict probe mode makes,
-#       unchanged in meaning (#535): a blocking marker carried solely by the
-#       PR-level summary, which no required gate dispositions.
+#       exists, or the summarize comment is head-pinned and completed (#851).
+#       It does NOT mean "no findings". rc 2 is the ONE verdict probe mode
+#       makes, unchanged in meaning (#535): a blocking marker carried solely
+#       by the PR-level summary, which no required gate dispositions.
 #       `potential_issue_count` carries no verdict on a probe run: 0 on every
 #       probe terminal except that rc-2 one, where it is the literal 1 of the
 #       summary-carried finding rather than a scan of the inline surface. Use
@@ -2372,6 +2378,40 @@ crw_select_head_pinned_review_run() {
 }
 # END coderabbit_review_run_selector
 
+# BEGIN coderabbit_summary_selector
+# Select the PR's single summarize comment — the newest bot comment whose body
+# STARTS with the auto-generated summarize marker — as base64(json+body), or
+# nothing.
+#
+# Extracted (#857) because the probe now reads it from TWO places: the
+# no-review-object branch, where it is the head evidence (#851), and the
+# review-object branch, where a completed run's verdict has to be graded off
+# whatever summary exists even though none landed after the object. One
+# definition so the selection cannot drift between them.
+#
+# `startswith`, not containment, and ANCHOR-FREE — both properties are
+# load-bearing and are argued at the #851 call site: CodeRabbit pastes the
+# marker literal into chat replies (and this repository carries it in source),
+# so a quoting reply would out-select the real summary; and the summary is
+# edited in place, so a wall-clock floor would stop counting a completed
+# publication once the head had sat long enough.
+#
+# Pure: jq over the passed strings only, no globals and no I/O.
+#
+# crw_select_summary_comment <issue-comments-json> <bot-login> <summary-marker>
+crw_select_summary_comment() {
+  printf '%s' "${1:-}" | jq -r --arg bot "${2:-}" --arg m "${3:-}" '
+    [ .[] | select(.user.login == $bot) | select((.body // "") | startswith($m))
+      | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)} ]
+    | sort_by(.fresh_at) | last
+    | if . == null then empty
+      else {json: ({id, created_at, updated_at, fresh_at, endpoint: "issues",
+                    body_excerpt: ((.body // "")[0:200])} | tojson),
+            body: (.body // "")} | @base64 end
+  '
+}
+# END coderabbit_summary_selector
+
 # --- probe verdict (#814) ---------------------------------------------------
 #
 # Probe mode answers ONE question and never enters the poll loop:
@@ -2436,6 +2476,7 @@ crw_select_head_pinned_review_run() {
 # made.
 probe_emit_verdict() {
   local reviews review review_at issue_comments cand row body class ctx_record
+  local summary sbody sjson sclass
   local summary_body="" newest_class="" rescan_done=false
 
   # Both reads are made DIRECTLY here, never through a helper. fetch_api_array
@@ -2550,6 +2591,42 @@ probe_emit_verdict() {
           || die 3 "failed to re-fetch issue comments for the post-success re-scan"
         continue
       fi
+      # #857 item 1, review-object arm (Phase 4b P1). The anchor-free pause
+      # read below covers only the NO-review-object branch, so a durable pause
+      # note that predates a HEAD-pinned run is invisible here: the anchored
+      # scan finds nothing at-or-after the run, `newest_class` is empty, and
+      # the probe emits `awaiting-summary` with the review OBJECT as evidence.
+      # p4b_barrier_maybe_resume gates on observed=paused and keys its
+      # at-most-once marker on the pause note's comment id, so neither is
+      # reachable from that emission — the barrier requests a review from a
+      # still-paused bot and waits out its budget, which is the exact failure
+      # item 1 exists to close. The ordering is not hypothetical: #852 showed a
+      # summarize comment whose last edit PREDATES this head's review objects
+      # and was never refreshed; a pause stanza in that slot behaves the same.
+      #
+      # Gated on `newest_class` empty for the same reason the terminal is: any
+      # notice at-or-after the run already names the observed state through
+      # PROBE_OBSERVED, including a pause, and that anchored reading is the
+      # more current one.
+      #
+      # Fail direction: strictly additive recovery. Today this state escalates
+      # after the full budget with no resume attempted; with this arm it
+      # escalates after the full budget having attempted the one resume the
+      # #847 recovery is bounded to. Nothing that already opened stops opening.
+      if [ -z "$newest_class" ]; then
+        summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
+          || die 3 "failed to select the CodeRabbit summary comment for the pause re-read"
+        if [ -n "$summary" ]; then
+          sbody=$(printf '%s' "$summary" | base64 --decode | jq -r '.body')
+          if [ "$(classify_comment "$sbody")" = "paused" ]; then
+            log "probe: no notice after the run on $HEAD_SHA, but the anchor-free summary is a PAUSE — reporting paused with the note as evidence so the resume path is reachable (#857)"
+            PROBE_CONTEXT_STATE=""
+            PROBE_CONTEXT_UPDATED_AT=""
+            sjson=$(printf '%s' "$summary" | base64 --decode | jq -r '.json')
+            probe_not_yet "paused" "$sjson"
+          fi
+        fi
+      fi
       log "probe: review object on $HEAD_SHA but no terminal summary yet (newest=${newest_class:-none}, context_state=${PROBE_CONTEXT_STATE:-unsampled}, context_updated_at=${PROBE_CONTEXT_UPDATED_AT:-unsampled})"
       probe_not_yet "$PROBE_OBSERVED" "$review"
     done
@@ -2636,18 +2713,31 @@ probe_emit_verdict() {
   # the review-object branch's own argument. The anchored triage above stays
   # anchored; dropping ITS anchor would let an ancient rate-limit notice
   # decline the trigger and deadlock differently.
-  local summary sbody sjson
-  summary=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg m "$SUMMARY_MARKER" '
-    [ .[] | select(.user.login == $bot) | select((.body // "") | startswith($m))
-      | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)} ]
-    | sort_by(.fresh_at) | last
-    | if . == null then empty
-      else {json: ({id, created_at, updated_at, fresh_at, endpoint: "issues",
-                    body_excerpt: ((.body // "")[0:200])} | tojson),
-            body: (.body // "")} | @base64 end
-  ') || die 3 "failed to select the CodeRabbit summary comment"
+  summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
+    || die 3 "failed to select the CodeRabbit summary comment"
   if [ -n "$summary" ]; then
     sbody=$(printf '%s' "$summary" | base64 --decode | jq -r '.body')
+    sclass=$(classify_comment "$sbody")
+    # #857 item 1: a DURABLE pause survives the head anchor.
+    #
+    # The anchored triage above drops a pause note whose fresh_at predates the
+    # new head's committer date, which is what every fix push produces — so the
+    # probe reported observed=none, the #847 resume path (which keys on the
+    # pause note carried in this evidence) was never reached, and the barrier
+    # posted a review request to a still-paused bot and waited out its budget.
+    # The summarize comment carries the pause stanza and is selected
+    # anchor-free, so reading ITS class recovers the state the anchor hid.
+    #
+    # ONLY paused. rate_limit and in_progress stay anchored deliberately: the
+    # anchored triage exists so an ANCIENT notice cannot decline the trigger
+    # forever, a rate-limit window expires on its own, and an in-progress
+    # marker is transient — reading either anchor-free would trade one deadlock
+    # for another. A pause is neither: it is PR-level, durable, and clears only
+    # when something posts `resume`, so an old note is still live state.
+    if [ "$sclass" = "paused" ]; then
+      sjson=$(printf '%s' "$summary" | base64 --decode | jq -r '.json')
+      probe_not_yet "paused" "$sjson"
+    fi
     # Three conjuncts. Each one alone admits a head-naming non-report state:
     #   class == review       rate-limited / paused / in-progress, including
     #                         the LEGACY prose forms that carry no marker.
@@ -2656,7 +2746,7 @@ probe_emit_verdict() {
     #                         ships next. Fail-closed by construction.
     #   head SHA present      a prior head's summary (#789), however recently
     #                         a Finishing-Touches checkbox edit bumped it.
-    if [ "$(classify_comment "$sbody")" = "review" ] \
+    if [ "$sclass" = "review" ] \
        && summary_stanzas_all_benign "$sbody" \
        && summary_names_head "$sbody" "$HEAD_SHA"; then
       sjson=$(printf '%s' "$summary" | base64 --decode | jq -r '.json')

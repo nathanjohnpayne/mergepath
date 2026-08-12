@@ -2781,6 +2781,75 @@ else
   fail "#842: blocked-Codex handling wrong:$bad"
 fi
 
+# #839: the routing above is only worth what it SAVES, and the saving is the
+# whole `coderabbit.max_wait_seconds` budget (1245s in this repo) that a
+# terminal account block used to burn before paging a human. Two properties
+# that nothing asserted before — the issue's acceptance criteria 1-3 as
+# BEHAVIOUR rather than as classifier arithmetic.
+bad=""
+_marker="$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-abc123.pending"
+_cxlog="$WORK/stub-cx-invocation.log"
+
+# A recording stub for the Codex delegate: same exit code, plus its argv and
+# the three overrides the barrier is contracted to pass.
+_barrier_recording_cx() { # <cx_rc> <cr_rc> <cr_json>
+  rm -f "$_cxlog"
+  cat >"$WORK/stub-cx.sh" <<EOF
+#!/bin/sh
+printf 'argv=%s\n' "\$*" >>"$_cxlog"
+printf 'skip_ci=%s require_approval=%s allow_sub=%s\n' \\
+  "\${CODEX_REVIEW_CHECK_SKIP_CI:-unset}" \\
+  "\${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-unset}" \\
+  "\${CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-unset}" >>"$_cxlog"
+exit $1
+EOF
+  printf "#!/bin/sh\nprintf '%%s' '%s'\nexit %s\n" "$3" "$2" >"$WORK/stub-cr.sh"
+  chmod +x "$WORK/stub-cx.sh" "$WORK/stub-cr.sh"
+  (
+    export MERGEPATH_REVIEW_POLICY_PATH="$WORK/barrier-both.yml"
+    export P4B_ACCT_STATE_DIR="$WORK/barrier-state"
+    export P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx.sh"
+    export P4B_CODERABBIT_WAIT="$WORK/stub-cr.sh"
+    export PATH="$WORK/barrier-bin:$PATH"
+    p4b_same_head_barrier owner/repo 7 abc123 rev-bot true
+  )
+}
+
+# 1. The rc-2 CANNOT-REPORT contract is only OFFERED under
+#    --diagnostic-signal-only, so the barrier has to actually ask for it. A
+#    merge-gate caller passes none of this and keeps the unchanged 0/1/3
+#    contract; if the barrier stopped passing the flag, the delegate would
+#    answer 1 for a blocked account and the budget burn would silently return.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(_barrier_recording_cx 2 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+grep -q -- '--diagnostic-signal-only' "$_cxlog" || bad="$bad no-diagnostic-flag"
+grep -q 'argv=.*--diagnostic-signal-only 7 owner/repo' "$_cxlog" || bad="$bad wrong-argv"
+grep -q 'skip_ci=1 require_approval=1 allow_sub=false' "$_cxlog" || bad="$bad missing-overrides"
+
+# 2. Criterion 1, as the thing the issue actually complains about: a blocked
+#    Codex spends NO budget. The bounded-retry marker is where elapsed time
+#    accumulates, so "no marker written for this head" IS "no wait started".
+[ "$rc" = 0 ] || bad="$bad blocked-not-open"
+[ ! -f "$_marker" ] || bad="$bad blocked-started-the-budget"
+
+# 3. Criterion 2: absence of a Codex signal — no block marker — is still
+#    not-yet, and DOES start the bounded wait. Without this the fix could be
+#    "waive everything", which would let Phase 4b approve ahead of a Codex
+#    round that simply had not landed yet.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(_barrier_recording_cx 1 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad absent-signal-not-pending"
+[ "$(printf '%s' "$out" | jq -r .codex)" = "not-yet" ] || bad="$bad absent-signal-class"
+[ -f "$_marker" ] || bad="$bad absent-signal-no-marker"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+
+unset -f _barrier_recording_cx
+if [ -z "$bad" ]; then
+  pass "#839: the barrier requests the diagnostic contract and a terminal block opens it without starting the retry budget"
+else
+  fail "#839: blocked-Codex budget routing wrong:$bad"
+fi
+
 # Codex round-1 findings on #842, all four in one place.
 bad=""
 # 1. Head drift is detected BEFORE any trigger. The probe resolves the LIVE
