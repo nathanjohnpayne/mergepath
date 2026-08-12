@@ -351,6 +351,9 @@ fi
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh"
 
+# shellcheck source=phase-4b/lib.sh
+. "$__CODERABBIT_WAIT_DIR/phase-4b/lib.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --probe (#814): read-only, zero-budget, single-scan mode.
@@ -1188,22 +1191,6 @@ summary_stanzas_all_benign() {
 # class keeps a longer digest containing the head from matching.
 summary_names_head() {
   printf '%s' "$1" | grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)"
-}
-
-# True only when BOTH timestamps parse as ISO-8601 and lhs is at-or-after rhs.
-#
-# Deliberately NOT iso_on_or_after, which fails OPEN (returns true) on empty or
-# unparseable input because its callers want the conservative answer to be
-# "suppress the fast-path". Here the true answer is the PERMISSIVE one — it is
-# a conjunct that lets the probe declare a run complete — so an absent or
-# unparseable timestamp has to read as false. Same construction as the Phase 4b
-# barrier's own correlation conjunct, so the two agree byte for byte.
-crw_iso_at_or_after() {
-  local lhs=${1:-} rhs=${2:-}
-  [ -n "$lhs" ] && [ -n "$rhs" ] || return 1
-  [ "$(jq -nr --arg l "$lhs" --arg r "$rhs" \
-        'try (($l | fromdateiso8601) >= ($r | fromdateiso8601)) catch false' \
-        2>/dev/null || printf 'false')" = "true" ]
 }
 
 # True when the body carries a blocking finding marker OUTSIDE the pre-merge
@@ -2662,7 +2649,7 @@ probe_emit_verdict() {
       # the barrier.
       if [ -z "$newest_class" ] && [ "$rescan_done" = true ] \
          && [ "$PROBE_CONTEXT_STATE" = "success" ] \
-         && crw_iso_at_or_after "$PROBE_CONTEXT_UPDATED_AT" "$review_at"; then
+         && mp_strict_iso_at_or_after "$PROBE_CONTEXT_UPDATED_AT" "$review_at"; then
         # rc 0 / rc 2 are non-rc-7 paths, so the context fields must be null
         # in the emission — the documented contract, and the same clearing the
         # published-summary path below performs.

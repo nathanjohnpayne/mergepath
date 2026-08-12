@@ -29,8 +29,9 @@ make_case() {
   local max_resume_retries=${6:-2}
   local dir="$WORKDIR/$name"
 
-  mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
+  mkdir -p "$dir/scripts/lib" "$dir/scripts/phase-4b" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
+  cp "$ROOT/scripts/phase-4b/lib.sh" "$dir/scripts/phase-4b/lib.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
   # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
@@ -1880,7 +1881,7 @@ test_824_sha_matched_review_is_honored_regardless_of_timestamp() {
 }
 
 test_857_completion_timestamp_conjunct_unit() {
-  # crw_iso_at_or_after is the conjunct that RELEASES the #857 completion hold,
+  # mp_strict_iso_at_or_after is the shared conjunct that RELEASES the #857 completion hold,
   # and it is pure, so it is asserted directly rather than only through the stub
   # harness — the harness can serve a parseable status time and nothing else, so
   # the failure modes that matter here are unreachable from a fixture.
@@ -1891,6 +1892,8 @@ test_857_completion_timestamp_conjunct_unit() {
     "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # shellcheck source=../scripts/phase-4b/lib.sh
+  . "$ROOT/scripts/phase-4b/lib.sh"
   # shellcheck disable=SC1090
   . "$snip"
 
@@ -1899,13 +1902,13 @@ test_857_completion_timestamp_conjunct_unit() {
   # answer releases a hold, so an absent or unparseable timestamp has to read
   # false. Getting this backwards would complete publication off old probe JSON
   # that carries no context_updated_at at all.
-  crw_iso_at_or_after 2026-06-04T00:00:07Z 2026-06-04T00:00:06Z || bad="$bad after-rejected"
-  crw_iso_at_or_after 2026-06-04T00:00:06Z 2026-06-04T00:00:06Z || bad="$bad equal-rejected"
-  ! crw_iso_at_or_after 2026-06-04T00:00:05Z 2026-06-04T00:00:06Z || bad="$bad before-accepted"
-  ! crw_iso_at_or_after "" 2026-06-04T00:00:06Z || bad="$bad empty-lhs-accepted"
-  ! crw_iso_at_or_after 2026-06-04T00:00:07Z "" || bad="$bad empty-rhs-accepted"
-  ! crw_iso_at_or_after not-a-date 2026-06-04T00:00:06Z || bad="$bad unparseable-lhs-accepted"
-  ! crw_iso_at_or_after 2026-06-04T00:00:07Z not-a-date || bad="$bad unparseable-rhs-accepted"
+  mp_strict_iso_at_or_after 2026-06-04T00:00:07Z 2026-06-04T00:00:06Z || bad="$bad after-rejected"
+  mp_strict_iso_at_or_after 2026-06-04T00:00:06Z 2026-06-04T00:00:06Z || bad="$bad equal-rejected"
+  ! mp_strict_iso_at_or_after 2026-06-04T00:00:05Z 2026-06-04T00:00:06Z || bad="$bad before-accepted"
+  ! mp_strict_iso_at_or_after "" 2026-06-04T00:00:06Z || bad="$bad empty-lhs-accepted"
+  ! mp_strict_iso_at_or_after 2026-06-04T00:00:07Z "" || bad="$bad empty-rhs-accepted"
+  ! mp_strict_iso_at_or_after not-a-date 2026-06-04T00:00:06Z || bad="$bad unparseable-lhs-accepted"
+  ! mp_strict_iso_at_or_after 2026-06-04T00:00:07Z not-a-date || bad="$bad unparseable-rhs-accepted"
 
   if [ -z "$bad" ]; then
     pass "#857 helper: the completion timestamp conjunct fails closed on an absent or unparseable timestamp"

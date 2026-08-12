@@ -18,6 +18,20 @@ p4b_warn() { echo "[phase-4b] WARN: $*" >&2; }
 # p4b_die <exit-code> <message...>
 p4b_die()  { local c="$1"; shift; echo "[phase-4b] ERROR: $*" >&2; exit "$c"; }
 
+# mp_strict_iso_at_or_after <lhs> <rhs>
+#
+# True only when both ISO-8601 timestamps parse and lhs is at-or-after rhs.
+# This is deliberately the permissive predicate's fail-closed counterpart to
+# coderabbit-wait.sh's iso_on_or_after: a false result keeps a provider barrier
+# closed, so absent or malformed data must never count as corroboration.
+mp_strict_iso_at_or_after() {
+  local lhs="${1:-}" rhs="${2:-}"
+  [ -n "$lhs" ] && [ -n "$rhs" ] || return 1
+  [ "$(jq -nr --arg l "$lhs" --arg r "$rhs" \
+        'try (($l | fromdateiso8601) >= ($r | fromdateiso8601)) catch false' \
+        2>/dev/null || printf 'false')" = "true" ]
+}
+
 # --- config location -------------------------------------------------------
 
 # This library's own directory, captured at SOURCE time (when BASH_SOURCE is
@@ -155,6 +169,7 @@ p4b_top_field() {
 # class. Pure: jq over the passed string only, no I/O, always returns 0.
 p4b_barrier_class_coderabbit() {
   local head="$1" rc="$2" json="$3" probe_head probe_observed
+  local probe_review_submitted_at probe_context_updated_at
   case "$rc" in
     0)
       # Terminal, but only for the head about to be approved. An rc 0
@@ -281,16 +296,13 @@ p4b_barrier_class_coderabbit() {
       # barrier's own drift check.
       probe_head="$(printf '%s' "$json" | jq -r '.head_sha // empty' 2>/dev/null || true)"
       probe_observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
+      probe_review_submitted_at="$(printf '%s' "$json" | jq -r '.review.submitted_at // empty' 2>/dev/null || true)"
+      probe_context_updated_at="$(printf '%s' "$json" | jq -r '.probe.context_updated_at // empty' 2>/dev/null || true)"
       if [ -n "$probe_head" ] && [ "$probe_head" = "$head" ] \
          && { [ "$probe_observed" = "awaiting-summary" ] || [ "$probe_observed" = "terminal" ]; } \
          && [ "$(printf '%s' "$json" | jq -r '.review.endpoint // empty' 2>/dev/null || true)" = "reviews" ] \
          && [ "$(printf '%s' "$json" | jq -r '.probe.context_state // empty' 2>/dev/null || true)" = "success" ] \
-         && [ "$(printf '%s' "$json" | jq -r '
-                  (.review.submitted_at // "") as $r
-                  | (.probe.context_updated_at // "") as $c
-                  | if $r == "" or $c == "" then false
-                    else (try (($c | fromdateiso8601) >= ($r | fromdateiso8601)) catch false)
-                    end' 2>/dev/null || true)" = "true" ]; then
+         && mp_strict_iso_at_or_after "$probe_context_updated_at" "$probe_review_submitted_at"; then
         printf 'reported'
       else
         printf 'not-yet'
