@@ -17,6 +17,8 @@ spec_test_map:
   coderabbit_review_sensing:
     - tests/test_coderabbit_wait_status_probe.sh
     - tests/test_phase_4b_automation.sh
+  doc_ownership_validation:
+    - tests/test_check_doc_ownership.sh
 
 # Glob patterns that identify test files. Supplements the default
 # ("tests/**/*.test.*") which doesn't cover shell-based tests.

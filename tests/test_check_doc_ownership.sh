@@ -3426,6 +3426,27 @@ run_cm_matrix expect_rendered "Case 15aa" \
   'the line after a type 1 closer is Markdown again|<script>\nx\n</script>\nSee [the audit](hub.md)' \
   'a plain paragraph link is untouched by any of this (control)|See [the audit](hub.md)'
 
+# --- Case 15ab: blocks opened by a list item close with that item ------
+# An HTML block and a fenced block are first children just like headings or
+# paragraphs. Each therefore inherits the list container that holds its marker:
+# an unindented line after `- <script>` is ordinary top-level Markdown, while
+# a fence after `- ` keeps its indented contents as code. The rows also pin the
+# two paths the extractor takes to get there: HTML state must remember its
+# opener's list frame, and list-item classification must carry a fence opener.
+run_cm_matrix expect_rendered "Case 15ab" \
+  'leaving a list closes its contained type 1 HTML block|- <script>\nSee [the audit](hub.md)'
+
+run_cm_matrix expect_not_rendered "Case 15ab" \
+  'a fence first child of a list item swallows its contents|- ```\n  See [the audit](hub.md)\n  ```'
+
+# Backslash escapes are ASCII punctuation only. A full-width stop is not an
+# escape target, so the literal backslash remains in the rendered destination;
+# treating a locale's Unicode punctuation class as CommonMark punctuation can
+# otherwise report a hub-only name on gawk that a reader never follows.
+cm_15x 'a backslash before non-ASCII punctuation stays literal' \
+  'hub。.md' 'See [the audit](hub\。.md) for details.' \
+  expect_not_rendered
+
 # --- Case 15z: an extractor that cannot read the doc FAILS the check ---
 # Check 10 reasons entirely from the extractor's output, so "no output" and
 # "no links" are the same string and the second one is a PASS. Every producer

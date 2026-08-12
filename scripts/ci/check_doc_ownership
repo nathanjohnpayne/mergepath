@@ -449,6 +449,22 @@ mp_markdown_renderable_text() {
       if (type == 5) return (index(s, "]]>") > 0)
       return 0
     }
+    # True when s opens a fenced code block. The opener is read both at top
+    # level and after consuming a list marker, so this one predicate keeps the
+    # information-string and width rules identical in both contexts.
+    function fence_opener(s,   ch, width, tail) {
+      FENCE_OPEN_CHAR = ""
+      FENCE_OPEN_WIDTH = 0
+      ch = substr(s, 1, 1)
+      if (ch != "`" && ch != "~") return 0
+      width = run_len(s, 1, ch)
+      tail = substr(s, width + 1)
+      # A backtick in a backtick-fence info string makes this ordinary prose.
+      if (width < 3 || (ch == "`" && index(tail, "`") > 0)) return 0
+      FENCE_OPEN_CHAR = ch
+      FENCE_OPEN_WIDTH = width
+      return 1
+    }
     # The list branch consumes one marker and then classifies what is left of
     # the line by the SAME rules, which it used to do by TAIL-CALLING this
     # function once per marker. On a line of many markers that cost the gate
@@ -602,6 +618,16 @@ mp_markdown_renderable_text() {
           if (hashes <= 6 && substr(s, hashes + 1) ~ /^([ \t]|$)/) return 0
         }
         if (s ~ /^\[[^]]+\]:[ \t]*/) return 0
+        # A list item whose first child is a fence has no Markdown text flow:
+        # `- ````, its indented contents and its matching closer are one code
+        # block. Leaving this to the prose fallback emitted links from inside
+        # that block, so carry the opener to the caller that owns fence state.
+        if (fence_opener(s)) {
+          item_fence_opened = 1
+          item_fence_char = FENCE_OPEN_CHAR
+          item_fence_width = FENCE_OPEN_WIDTH
+          return 0
+        }
         # The TYPE is reported back so the caller can carry the block past its
         # opener. Set here rather than inside opens_html_block so the two
         # other callers of that function stay pure predicates.
@@ -628,7 +654,7 @@ mp_markdown_renderable_text() {
     # pops no matter how its column compares.
     function pop_containers(col, qdepth) {
       while (cc_n > 0 && (cc[cc_n] > col || cq[cc_n] > qdepth)) {
-        delete cc[cc_n]; delete cq[cc_n]; delete cb[cc_n]; cc_n--
+        delete cc[cc_n]; delete cs[cc_n]; delete cq[cc_n]; delete cb[cc_n]; cc_n--
       }
       code_column = (cc_n > 0) ? cc[cc_n] : 0
     }
@@ -661,6 +687,7 @@ mp_markdown_renderable_text() {
       pop_containers(start_col, qdepth)
       cc_n++
       cc[cc_n] = col
+      cs[cc_n] = start_col
       cq[cc_n] = qdepth
       cb[cc_n] = 0
       code_column = col
@@ -865,17 +892,25 @@ mp_markdown_renderable_text() {
       # Carrying the state on regardless blanked it, and a blanked line is a
       # MISSED reference (Codex P2 on #925). The depth is recorded at the
       # opener, so an unquoted block is never affected.
-      if (in_html && line_quote < html_quote) in_html = 0
+      if (in_html && (line_quote < html_quote \
+          || (html_container_depth > 0 && col_indent <= html_container_start))) {
+        in_html = 0
+        html_container_depth = 0
+      }
       if (in_html) {
         html_content = substr(line, QD_CHARS + 1)
         if (in_html <= 5) {
-          if (html_block_ends(html_content, in_html)) in_html = 0
+          if (html_block_ends(html_content, in_html)) {
+            in_html = 0
+            html_container_depth = 0
+          }
           text_flow_open = 0
           print ""
           next
         }
         if (html_block_ends(html_content, in_html)) {
           in_html = 0
+          html_container_depth = 0
         } else {
           text_flow_open = 0
           print ""
@@ -933,14 +968,11 @@ mp_markdown_renderable_text() {
       # the guard was written for. So the opener is recognized BEFORE the pop
       # rather than after it, and the branch that consumes it reuses the
       # answer instead of re-deciding.
-      ch = substr(fence_body, 1, 1)
       fence_here = 0
-      if (fence_col - fence_base <= 3 && (ch == "`" || ch == "~")) {
-        width = run_len(fence_body, 1, ch)
-        tail = substr(fence_body, width + 1)
-        # CommonMark forbids a backtick in a backtick fence info string.
-        # Such a line is rendered prose, not a fence opener.
-        if (width >= 3 && !(ch == "`" && index(tail, "`") > 0)) fence_here = 1
+      if (fence_col - fence_base <= 3 && fence_opener(fence_body)) {
+        fence_here = 1
+        ch = FENCE_OPEN_CHAR
+        width = FENCE_OPEN_WIDTH
       }
       if (!text_flow_open || fence_here || (cc_n > 0 && line_quote > cq[cc_n])) {
         pop_containers(col_indent, line_quote)
@@ -1011,6 +1043,9 @@ mp_markdown_renderable_text() {
         flow_column = col_indent
         item_code_first = 0
         item_blank_first = 0
+        item_fence_opened = 0
+        item_fence_char = ""
+        item_fence_width = 0
         html_opened = 0
         text_flow_open = opens_text_flow(flow_probe, text_flow_open)
         if (mc_n > 0) {
@@ -1050,6 +1085,13 @@ mp_markdown_renderable_text() {
         # lines that FOLLOW a marker, so this case has to be caught here or a
         # link that never rendered gets reported.
         if (item_code_first) rendered = ""
+        if (item_fence_opened) {
+          in_fence = 1
+          fence_char = item_fence_char
+          fence_width = item_fence_width
+          text_flow_open = 0
+          rendered = ""
+        }
         # The OPENER of an HTML block is raw HTML too, and whatever follows
         # the tag ON THAT LINE is block content rather than Markdown —
         # `<div>See [the audit](hub.md)` renders no link in either renderer.
@@ -1062,6 +1104,8 @@ mp_markdown_renderable_text() {
           # The quote depth the block was opened AT, so it can be closed when
           # that container closes — see the guard above.
           html_quote = line_quote
+          html_container_depth = cc_n
+          html_container_start = (cc_n > 0) ? cs[cc_n] : -1
         }
       }
       print rendered
@@ -1118,13 +1162,20 @@ mp_doc_link_targets() {
   # resolved destinations check 10 compares, `unresolvable` for the ones whose
   # character references cannot be expanded — see mp_doc_unresolvable_destinations.
   local emit="${2:-}"
+  # CommonMark backslash escapes are limited to this ASCII punctuation set.
+  # Keep it in the shell and pass it to both awk stages so destination
+  # balancing and normalization share one definition across awk locales.
+  local ascii_punctuation=$'!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'
+  # These target-extraction awk stages compare pathname bytes. Pinning them to
+  # the C locale keeps BSD awk, gawk, and mawk aligned; the preceding renderer
+  # classifier keeps the caller's locale.
   {
     # Inline destinations need a small stateful reader rather than
     # `grep -o '\]([^)]*)'`: CommonMark bare destinations may contain
     # balanced parentheses (`hub(1).md`), and angle destinations may
     # contain parentheses or spaces. The first-closing-paren spelling
     # truncates those valid links and hides consumer-broken references.
-    mp_markdown_renderable_text "$f" | awk '
+    mp_markdown_renderable_text "$f" | LC_ALL=C awk -v ASCII_PUNCT="$ascii_punctuation" '
       {
         line = $0
         n = length(line)
@@ -1167,7 +1218,7 @@ mp_doc_link_targets() {
             c = substr(line, j, 1)
             if (c == "\\" && j < n) {
               nextc = substr(line, j + 1, 1)
-              if (nextc ~ /[[:punct:]]/) {
+              if (index(ASCII_PUNCT, nextc) > 0) {
                 if (!destination_done) target = target c nextc
                 j++
                 continue
@@ -1207,7 +1258,7 @@ mp_doc_link_targets() {
     # an `{0,3}` interval, which not every awk implementation supports.
     # A blank line after the colon ends the definition (CommonMark allows
     # at most one line ending there), so nothing is emitted for it.
-    mp_markdown_renderable_text "$f" | awk '
+    mp_markdown_renderable_text "$f" | LC_ALL=C awk '
       function print_target(s, gt) {
         sub(/^[[:space:]]+/, "", s)
         if (substr(s, 1, 1) == "<") {
@@ -1230,7 +1281,7 @@ mp_doc_link_targets() {
         -e 's/^\]\(//' \
         -e 's/\)$//' \
         -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
-    | awk -v EMIT="$emit" '
+    | LC_ALL=C awk -v EMIT="$emit" -v ASCII_PUNCT="$ascii_punctuation" '
         # CommonMark resolves entity and numeric character references inside
         # a link destination (§ Entity and numeric character references), so
         # the path a reader actually opens is the DECODED one:
@@ -1688,7 +1739,7 @@ mp_doc_link_targets() {
             c = substr(s, i, 1)
             if (c == "\\") {
               nextc = substr(s, i + 1, 1)
-              if (nextc != "" && nextc ~ /[[:punct:]]/) {
+              if (nextc != "" && index(ASCII_PUNCT, nextc) > 0) {
                 out = out nextc
                 i += 2
                 continue
