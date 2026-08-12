@@ -3306,6 +3306,24 @@ cm_15x 'a name in the path is still reported, fragment or not' \
 cm_15x 'and with a query after it' \
   'α.md' 'See [the audit](&alpha;.md?a=1) for details.' \
   expect_unresolvable '&alpha;.md?a=1'
+# A destination check 10 never compares cannot hide anything either, so an
+# unexpandable name inside one is not worth reporting — and reporting it would
+# block a portable canonical doc for no gain (Codex P2 on #925). The four rows
+# cover every arm of the skip list the resolved-target loop already uses:
+# absolute scheme, mailto, protocol-relative, and a name in the query of an
+# absolute URL. The relative rows above are the discriminating control.
+cm_15x 'a name in an absolute URL path is not reported' \
+  'hub.md' 'See [external](https://example.com/&alpha;/x) for details.' \
+  expect_not_rendered
+cm_15x 'nor one in its query' \
+  'hub.md' 'See [external](https://example.com/?x=&alpha;) for details.' \
+  expect_not_rendered
+cm_15x 'nor one in a mailto destination' \
+  'hub.md' 'See [mail](mailto:&alpha;@example.com) for details.' \
+  expect_not_rendered
+cm_15x 'nor one in a protocol-relative destination' \
+  'hub.md' 'See [p](//host/&alpha;/x) for details.' \
+  expect_not_rendered
 # The flag is per-DESTINATION, and every destination in the document runs
 # through the same awk process. Dropping its reset would make the first
 # unresolvable destination condemn every one after it, which no other row can

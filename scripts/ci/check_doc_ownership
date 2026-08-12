@@ -1753,9 +1753,21 @@ mp_doc_link_targets() {
         # BWK awk, and check 10 prints a clean PASS on a document it could not
         # read. With the filter moved inside, the last stage is this awk and
         # its exit status means what it says.
+        # The destinations check 10 never compares. Spelled to mirror the
+        # shell `case` in that loop character for character — `''|*://*|
+        # mailto:*|//*` — because the two lists saying different things is the
+        # whole defect this guards: an absolute URL cannot resolve to a
+        # repo-local doc, so an unexpandable name inside one hides nothing,
+        # and reporting it blocks a portable canonical doc for no gain (Codex
+        # P2 on #925). The empty case covers a destination dropped for a
+        # decoded newline or NUL, which the target pass discards as well.
+        function skipped_by_check_10(t) {
+          return (t == "" || index(t, "://") > 0 \
+                  || substr(t, 1, 7) == "mailto:" || substr(t, 1, 2) == "//")
+        }
         function emit_target(decoded, raw) {
           if (EMIT == "unresolvable") {
-            if (TARGET_UNRESOLVED) print raw
+            if (TARGET_UNRESOLVED && !skipped_by_check_10(decoded)) print raw
             return
           }
           if (decoded ~ /^[[:space:]]*$/) return
