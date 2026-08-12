@@ -3348,6 +3348,51 @@ run_cm_matrix expect_rendered "Case 15y" \
   'four columns into a quote is NOT a fence, so the link renders|>     ```\n> See [the audit](hub.md)' \
   'a column-zero fence closes at column zero (control)|```\nx\n```\nSee [the audit](hub.md)'
 
+# --- Case 15aa: an HTML block is carried PAST its opener ------------
+# #929 item 28. § HTML blocks gives each of the seven start conditions its own
+# END condition, and only the openers were recognised — nothing closed a block,
+# so every line after one was scanned as Markdown and a link between `<div>`
+# and `</div>` was reported although both renderers leave the whole thing raw.
+# A false ownership failure, and the natural completion of the #811 work.
+#
+# The seven conditions collapse into five terminator classes, and there is one
+# row per class plus the pairing control that proves the block actually ENDS:
+#
+#   1  <script> <pre> <style> <textarea>  a line containing the closing tag
+#   2  <!--                               a line containing -->
+#   3  <?                                 a line containing ?>
+#   4  <! + a letter                      a line containing >
+#   5  <![CDATA[                          a line containing ]]>
+#   6  a block tag name                   a BLANK line
+#   7  a complete tag alone on the line   a BLANK line
+#
+# The difference between the two groups is not cosmetic and both directions
+# are pinned: for 1 to 5 the line carrying the closer is PART of the block,
+# and a blank line does NOT end them — `<script>`, a blank, a link, `</script>`
+# renders no link, which is the row that fails if types 1 to 5 are given the
+# blank-line rule by mistake. For 6 and 7 the blank ends the block and is not
+# part of it, so the link after it renders.
+#
+# Every row is checked against markdown-it-py by run_cm_matrix AND was
+# measured against cmark-gfm through GitHub POST /markdown, mode gfm. The two
+# agree on all thirteen, so nothing here bypasses the oracle.
+run_cm_matrix expect_not_rendered "Case 15aa" \
+  'type 6: a link between a block tag and its closer|<div>\nSee [the audit](hub.md)\n</div>' \
+  'type 1: and inside a script block|<script>\nSee [the audit](hub.md)\n</script>' \
+  'type 2: and inside a comment|<!--\nSee [the audit](hub.md)\n-->' \
+  'type 3: and inside a processing instruction|<?\nSee [the audit](hub.md)\n?>' \
+  'type 4: and inside a declaration|<!A\nSee [the audit](hub.md)\n>' \
+  'type 5: and inside a CDATA section|<![CDATA[\nSee [the audit](hub.md)\n]]>' \
+  'a blank line does NOT end a type 1 block|<script>\n\nSee [the audit](hub.md)\n</script>' \
+  'the opener line carries block content, not Markdown|<div>See [the audit](hub.md)' \
+  'type 7: a complete tag alone opens a block too|<span>\nSee [the audit](hub.md)'
+
+run_cm_matrix expect_rendered "Case 15aa" \
+  'a blank line DOES end a type 6 block (control)|<div>\n\nSee [the audit](hub.md)' \
+  'and the link after a closed type 6 block renders|<div>\nx\n</div>\n\nSee [the audit](hub.md)' \
+  'the line after a type 1 closer is Markdown again|<script>\nx\n</script>\nSee [the audit](hub.md)' \
+  'a plain paragraph link is untouched by any of this (control)|See [the audit](hub.md)'
+
 # --- Case 15z: an extractor that cannot read the doc FAILS the check ---
 # Check 10 reasons entirely from the extractor's output, so "no output" and
 # "no links" are the same string and the second one is a PASS. Every producer

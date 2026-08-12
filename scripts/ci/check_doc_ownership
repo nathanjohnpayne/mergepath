@@ -393,27 +393,60 @@ mp_markdown_renderable_text() {
     # a condition-6 block under gawk and stayed prose under the other two, so
     # the same document produced different ownership verdicts depending on
     # which supported awk CI happened to select.
+    # Returns the CommonMark TYPE NUMBER (1-7), not a boolean, because the
+    # type is what says how the block ends — see html_block_ends. Zero means
+    # the line opens no HTML block, so every `if (opens_html_block(...))` reads
+    # the same as it did.
     function opens_html_block(s, flow_open,   low, rest, name, after) {
       if (substr(s, 1, 1) != "<") return 0
       low = tolower(s)
       if (low ~ /^<(pre|script|style|textarea)([ \t>]|$)/) return 1
-      if (substr(s, 1, 4) == "<!--") return 1
-      if (substr(s, 1, 2) == "<?") return 1
-      if (substr(s, 1, 9) == "<![CDATA[") return 1
-      if (substr(s, 1, 2) == "<!" && substr(s, 3, 1) ~ /^[A-Z]$/) return 1
+      if (substr(s, 1, 4) == "<!--") return 2
+      if (substr(s, 1, 2) == "<?") return 3
+      # Ahead of the condition-4 test, which its prefix would otherwise match.
+      if (substr(s, 1, 9) == "<![CDATA[") return 5
+      if (substr(s, 1, 2) == "<!" && substr(s, 3, 1) ~ /^[A-Z]$/) return 4
       rest = (substr(s, 1, 2) == "</") ? substr(s, 3) : substr(s, 2)
       if (match(rest, /^[A-Za-z][A-Za-z0-9-]*/)) {
         name = tolower(substr(rest, 1, RLENGTH))
         after = substr(rest, RLENGTH + 1)
         if (index(BLOCK_TAGS, " " name " ") > 0 \
             && (after == "" || after ~ /^[ \t>]/ || substr(after, 1, 2) == "/>")) {
-          return 1
+          return 6
         }
       }
       if (flow_open) return 0
       if (substr(s, 1, 2) != "</" \
           && low ~ /^<(pre|script|style|textarea)([ \t>]|\/|$)/) return 0
-      if (s ~ OPEN_TAG_ONLY || s ~ CLOSE_TAG_ONLY) return 1
+      if (s ~ OPEN_TAG_ONLY || s ~ CLOSE_TAG_ONLY) return 7
+      return 0
+    }
+    # Does `s` close an open HTML block of `type`? CommonMark 0.31.2 § HTML
+    # blocks gives each start condition its own end condition, and there are
+    # five distinct classes of them. Recognizing only the OPENERS — which is
+    # all this program used to do — left every line after one being scanned as
+    # Markdown, so `<div>`, a link, `</div>` reported a reference that both
+    # renderers treat as raw HTML and no reader can follow (#929 item 28, a
+    # FALSE ownership failure).
+    #
+    # For types 1 to 5 the line carrying the end condition is PART of the
+    # block; for 6 and 7 the block ends at a blank line, and that blank is
+    # not. The caller handles that difference, because the blank still has to
+    # close the text flow and bound a blank-first item like any other.
+    #
+    # The end condition is a line CONTAINING the closer, not a line matching
+    # it: `</script>` ends a type 1 block wherever on the line it sits, and
+    # anything after it on that line is still block content.
+    function html_block_ends(s, type,   low) {
+      if (type >= 6) return (s ~ /^[ \t]*$/)
+      if (type == 1) {
+        low = tolower(s)
+        return (low ~ /<\/(script|pre|style|textarea)>/)
+      }
+      if (type == 2) return (index(s, "-->") > 0)
+      if (type == 3) return (index(s, "?>") > 0)
+      if (type == 4) return (index(s, ">") > 0)
+      if (type == 5) return (index(s, "]]>") > 0)
       return 0
     }
     # The list branch consumes one marker and then classifies what is left of
@@ -569,7 +602,11 @@ mp_markdown_renderable_text() {
           if (hashes <= 6 && substr(s, hashes + 1) ~ /^([ \t]|$)/) return 0
         }
         if (s ~ /^\[[^]]+\]:[ \t]*/) return 0
-        if (opens_html_block(s, flow_open)) return 0
+        # The TYPE is reported back so the caller can carry the block past its
+        # opener. Set here rather than inside opens_html_block so the two
+        # other callers of that function stay pure predicates.
+        html_opened = opens_html_block(s, flow_open)
+        if (html_opened) return 0
         return 1
       }
     }
@@ -805,6 +842,32 @@ mp_markdown_renderable_text() {
         next
       }
 
+      # Inside an HTML block, nothing is Markdown. Only the OPENERS used to be
+      # recognized, so the classifier read every following line as prose and
+      # a link between `<div>` and `</div>` was reported although both
+      # renderers leave the whole thing raw (#929 item 28).
+      #
+      # The split at type 5 comes from the spec, not from convenience: 1 to 5 end
+      # on a line CONTAINING their closer and that line is part of the block,
+      # while types 6 and 7 end at a blank line which is NOT. So the blank
+      # falls through to the branch below rather than being consumed here —
+      # it still has to close the text flow and bound a blank-first item.
+      if (in_html) {
+        if (in_html <= 5) {
+          if (html_block_ends(line, in_html)) in_html = 0
+          text_flow_open = 0
+          print ""
+          next
+        }
+        if (html_block_ends(line, in_html)) {
+          in_html = 0
+        } else {
+          text_flow_open = 0
+          print ""
+          next
+        }
+      }
+
       # A blank line closes the text flow but NOT the containers: a list item
       # may hold one and keep going, so it must not reach the pop below. The
       # one exception is an item that BEGAN with a blank line, which is
@@ -933,6 +996,7 @@ mp_markdown_renderable_text() {
         flow_column = col_indent
         item_code_first = 0
         item_blank_first = 0
+        html_opened = 0
         text_flow_open = opens_text_flow(flow_probe, text_flow_open)
         if (mc_n > 0) {
           # Outermost frame first: each push pops the frames its own MARKER
@@ -971,6 +1035,15 @@ mp_markdown_renderable_text() {
         # lines that FOLLOW a marker, so this case has to be caught here or a
         # link that never rendered gets reported.
         if (item_code_first) rendered = ""
+        # The OPENER of an HTML block is raw HTML too, and whatever follows
+        # the tag ON THAT LINE is block content rather than Markdown —
+        # `<div>See [the audit](hub.md)` renders no link in either renderer.
+        # A one-line block ends on its own opener, so the closer is tested
+        # here as well; the branch above only ever sees the lines after it.
+        if (html_opened) {
+          rendered = ""
+          in_html = (html_block_ends(line, html_opened)) ? 0 : html_opened
+        }
       }
       print rendered
     }
