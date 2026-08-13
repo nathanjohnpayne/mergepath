@@ -3037,6 +3037,43 @@ rcp_case head-post \
   's{-f head_sha="\$HEAD_SHA"}{-f head_sha="\$GITHUB_SHA"}' \
   fail '[rcp head binding]'
 
+# The allowlist has to be an allowlist over BINDING SITES, not over one
+# lexical arrangement of flag, space and quote. The first version matched
+# only `-f\s+head_sha=`, and these three legal gh-CLI equivalents each bound
+# $GITHUB_SHA — the exact catastrophe A2 names — while the fence stayed
+# green. The quoted-whole-argument form is the publisher's OWN prevailing
+# style (every `output[...]` argument is written `-f "key=value"`), so it is
+# the spelling a maintainer reaches for first.
+rcp_case head-post-quoted-arg \
+  's{-f head_sha="\$HEAD_SHA" \\}{-f "head_sha=\$GITHUB_SHA" \\}' \
+  fail '[rcp head binding]'
+rcp_case head-post-typed-flag \
+  's{-f head_sha="\$hd" \\}{-F head_sha="\$GITHUB_SHA" \\}' \
+  fail '[rcp head binding]'
+rcp_case head-post-long-flag \
+  's{-f head_sha="\$RUN_HEAD" \\}{--field head_sha="\$GITHUB_SHA" \\}' \
+  fail '[rcp head binding]'
+# Non-vacuity in the other direction: judging the VALUE, not the spelling.
+# A respelled site that still binds an allowlisted variable is legal, and a
+# fence that reddened on it would be trading one leak for a false positive.
+rcp_case head-post-respelled-legal \
+  's{-f head_sha="\$head" \\}{-f "head_sha=\$head" \\}' \
+  pass
+# The count is pinned alongside the allowlist so a NEW POST cannot arrive
+# without its head binding being read — an added site binds an allowlisted
+# variable here, and must still be refused until the count moves in the same
+# diff.
+rcp_case head-post-count \
+  's{^([ \t]*-f head_sha="\$HEAD_SHA" \\)$}{$1\n$1}m' \
+  fail '[rcp head binding count]'
+# The github.sha backstop is matched case-insensitively; a backstop evaded by
+# pressing shift is not one. Mutated on a NEUTRAL env key so only the
+# backstop — not the HEAD_SHA/RUN_HEAD binding assertion — can produce the
+# verdict.
+rcp_case head-sha-case \
+  's{PARENT_RUN_ID: \$\{\{ github.event.workflow_run.id \}\}}{PARENT_RUN_ID: \$\{\{ GitHub.Sha \}\}}' \
+  fail '[rcp head binding]'
+
 # ── A4 — publish stays reachable and serialized on ONE fixed queue ─────
 rcp_case publish-falsy \
   's{^    if: github.event_name != .workflow_run. \|\| github.event.action == .completed.$}{    if: \$\{\{ false \}\}}m' \

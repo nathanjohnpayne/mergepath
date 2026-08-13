@@ -251,20 +251,80 @@ EXPECTED_DISPATCH_TYPES = ["merge-clearance-recheck", "required-check-republish"
 # could read state before a transition and POST after a newer one.
 EXPECTED_CONCURRENCY_GROUP = "rcp-publish"
 
-# A2 — every head_sha binding, as an ALLOWLIST over the bindings rather
-# than a denylist of wrong spellings (the #849 lesson: github.sha →
-# base.sha → literal-prefixed strings cannot be enumerated).
+# A2 — every head_sha binding SITE, as an ALLOWLIST over the values those
+# sites bind rather than a denylist of wrong spellings (the #849 lesson:
+# github.sha → base.sha → literal-prefixed strings cannot be enumerated).
+#
+# SCOPE, stated exactly, because the earlier wording over-claimed. What is
+# enforced is: every argument in the file that binds the Checks-API
+# `head_sha` field names an allowlisted variable, and the NUMBER of such
+# arguments is pinned. What is NOT enforced — and cannot be, by an
+# assertion over spelling — is the VALUE such a variable holds: a
+# `head="$GITHUB_SHA"` assignment inserted immediately before an
+# allowlisted `-f head_sha="$head"` POST rebinds it without touching any
+# binding site. That residual is a dataflow property; closing it needs the
+# shell interpreted, not matched. The site-and-count fence is what keeps a
+# NEW binding from arriving unexamined.
 HEAD_ENV_ALLOWED = {
     "HEAD_SHA": "${{ github.event.workflow_run.head_sha }}",
     "RUN_HEAD": "${{ github.event.workflow_run.head_sha }}",
 }
-# Shell variables a `-f head_sha=` may name: the two event bindings above
-# and the loop/parameter variables the pass derives from the open-PR list
-# read. Anything else is off-allowlist.
+# Shell expansions a head_sha binding may name: the two event bindings
+# above and the loop/parameter variables the pass derives from the
+# open-PR list read. Anything else is off-allowlist.
 HEAD_SHELL_ALLOWED = frozenset(
-    ('"$HEAD_SHA"', '"$RUN_HEAD"', '"$hd"', '"$head"', '"$head_sha"')
+    ("$HEAD_SHA", "$RUN_HEAD", "$hd", "$head", "$head_sha")
 )
-HEAD_SHA_ARG = re.compile(r'-f\s+head_sha=(\S+)')
+
+# Every gh-CLI spelling that binds a request field, because the flag is
+# where the first version of this assertion leaked: it matched only
+# `-f\s+head_sha=`, so three legal equivalents — `-f "head_sha=$X"` (the
+# quoted-whole-argument form, which is this file's OWN prevailing style
+# for every `output[...]` argument), `-F head_sha=$X` (the typed-field
+# flag), and the `--field` / `--raw-field` long forms — bound anything at
+# all and still passed. The scanner therefore reads the whole argument
+# TOKEN after any field flag and asks what it binds, instead of trusting
+# one lexical arrangement of flag, space and quote.
+FIELD_FLAG_ARG = re.compile(
+    r'(?:--raw-field|--field|-[fF])'
+    r'[ \t=]*(?:\\\n[ \t]*)?'          # the flag and its value may straddle a
+                                       # line continuation, as they do here
+    r'(?P<arg>"(?:[^"\\\n]|\\.)*"|\'[^\'\n]*\'|\S+)'
+)
+# The number of head_sha binding sites in the canonical publisher: the
+# phase-1 hold POST, the phase-2 verdict POST, the sweep POST, the
+# gate() helper's POST, and the ambiguity red. Pinned for the same reason
+# A8 pins the success-conclusion count — a new POST must arrive as a
+# conspicuous diff against this fence, where its head binding is read,
+# rather than as one more line nobody had to look at.
+EXPECTED_HEAD_SHA_BINDINGS = 5
+# Backstop only; the allowlist above is the fence. Case-insensitive
+# because a backstop evaded by pressing shift is not one.
+GITHUB_SHA_REF = re.compile(r"github\s*\.\s*sha", re.IGNORECASE)
+
+
+def head_sha_binding(arg):
+    """The value `arg` binds to the Checks-API head_sha field, or None.
+
+    Normalises the two quoting layers a shell argument can carry — the
+    whole-argument form `"head_sha=$X"` and the value-only form
+    `head_sha="$X"` — plus `${X}` bracing, so the allowlist compares
+    WHAT is bound rather than how it was typed. A single-quoted layer is
+    deliberately left in the returned value: it suppresses expansion, so
+    the binding is a literal string and must not match an allowlist of
+    expansions.
+    """
+    quote = ""
+    if len(arg) >= 2 and arg[0] in "\"'" and arg[-1] == arg[0]:
+        quote, arg = arg[0], arg[1:-1]
+    if not arg.startswith("head_sha="):
+        return None
+    value = arg[len("head_sha="):]
+    if quote == "'":
+        return "'%s'" % value
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        value = value[1:-1]
+    return re.sub(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$", r"$\1", value)
 
 failures = []
 
@@ -634,7 +694,11 @@ for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
             "      scope those lookups 403 into a degraded branch on repositories",
             "      whose default workflow permission is restricted.")
 
-# ── A2 — every head_sha binding is on an allowlist ─────────────────────
+# ── A2 — every head_sha binding SITE is on an allowlist ────────────────
+#
+# Scope is exactly the binding sites, by spelling, plus their count; the
+# value an allowlisted variable holds at the POST is a dataflow property
+# outside any assertion over text (see HEAD_SHELL_ALLOWED above).
 #
 # The catastrophe this prevents: on a workflow_run run `github.sha` is the
 # DEFAULT BRANCH's last commit, so one such binding puts all three
@@ -658,17 +722,36 @@ for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
                     "      contexts absent on every PR head, fleet-wide, permanently —",
                     "      with no partial degradation to warn anyone (#845 risks).")
 
-for match in HEAD_SHA_ARG.finditer(raw_text):
-    if match.group(1) not in HEAD_SHELL_ALLOWED:
-        bad("FAIL: [rcp head binding] a check-run POST binds head_sha=%s, which is"
-            % match.group(1),
-            "      not on the allowlist %s." % sorted(HEAD_SHELL_ALLOWED),
-            "      This is an ALLOWLIST over every binding rather than a denylist of",
-            "      wrong spellings on purpose: github.sha → base.sha →",
-            "      literal-prefixed strings cannot be enumerated (the #849 lesson).",
-            "      A legitimate new binding must be added here in the same diff.")
+head_bindings = [
+    value
+    for value in (
+        head_sha_binding(match.group("arg"))
+        for match in FIELD_FLAG_ARG.finditer(raw_text)
+    )
+    if value is not None
+]
 
-if "github.sha" in raw_text:
+for value in head_bindings:
+    if value not in HEAD_SHELL_ALLOWED:
+        bad("FAIL: [rcp head binding] a check-run POST binds head_sha=%s, which is"
+            % value,
+            "      not on the allowlist %s." % sorted(HEAD_SHELL_ALLOWED),
+            "      This is an ALLOWLIST over the value every binding site names,",
+            "      rather than a denylist of wrong spellings, on purpose: github.sha",
+            "      → base.sha → literal-prefixed strings cannot be enumerated (the",
+            "      #849 lesson). A legitimate new binding must be added here in the",
+            "      same diff.")
+
+if len(head_bindings) != EXPECTED_HEAD_SHA_BINDINGS:
+    bad("FAIL: [rcp head binding count] %d arguments bind head_sha; exactly %d are"
+        % (len(head_bindings), EXPECTED_HEAD_SHA_BINDINGS),
+        "      expected. The allowlist above only governs binding sites this fence",
+        "      can see, so the count is pinned to make a new or deleted POST arrive",
+        "      as a diff against this file — where its head binding gets read —",
+        "      rather than as one more line nobody had to look at. If the new site",
+        "      is legitimate, raise the count in the same diff.")
+
+if GITHUB_SHA_REF.search(raw_text):
     bad("FAIL: [rcp head binding] the publisher references github.sha. On a",
         "      workflow_run run that is the DEFAULT BRANCH's last commit, never the",
         "      PR head — every published context would land on a commit branch",
