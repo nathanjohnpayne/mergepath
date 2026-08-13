@@ -168,15 +168,54 @@ fi
 
 # The budget is a real bound, not decoration: a never-clearing checker under a
 # tiny budget still terminates in a block, and probes more than once.
-probe_log=$(CODERABBIT_RATE_LIMIT_GATE_CODEX_CHECK_BIN="$UNCLEARED_STUB" \
-  CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS=1 \
+#
+# Elapsed time is driven by a stubbed `date`, not by the wall clock, and `sleep`
+# is a no-op — otherwise a first probe that happened to cross a second boundary
+# would make the gate compute zero remaining budget and skip the re-probe, so a
+# correct gate could fail this test (CodeRabbit 🟡 on #960). The stub clock
+# returns the same second for the loop's first two reads and then advances one
+# second per read, which pins the probe count exactly:
+#
+#   probe 1 → now=T+0 → remaining 2 → sleep (no-op)
+#   probe 2 → now=T+1 → remaining 1 → sleep (no-op)
+#   probe 3 → now=T+2 → remaining 0 → break, block
+CLOCK_DIR="$STUB_DIR/clockbin"
+mkdir -p "$CLOCK_DIR"
+cat > "$CLOCK_DIR/date" <<'CLOCKSTUB'
+#!/usr/bin/env bash
+# Deterministic `date +%s` for the bounded-wait test. Any other invocation
+# falls through to the real date so the stub cannot silently change meaning.
+if [ "${1:-}" != "+%s" ]; then
+  exec /bin/date "$@"
+fi
+reads=0
+if [ -f "$MERGEPATH_TEST_CLOCK_FILE" ]; then
+  reads=$(cat "$MERGEPATH_TEST_CLOCK_FILE")
+fi
+reads=$((reads + 1))
+printf '%s\n' "$reads" > "$MERGEPATH_TEST_CLOCK_FILE"
+# Read 1 is the loop's `start`; read 2 closes probe 1 at the same second.
+step=$((reads - 2))
+if [ "$step" -lt 0 ]; then step=0; fi
+printf '%s\n' "$((1000 + step))"
+CLOCKSTUB
+cat > "$CLOCK_DIR/sleep" <<'SLEEPSTUB'
+#!/usr/bin/env bash
+exit 0
+SLEEPSTUB
+chmod +x "$CLOCK_DIR/date" "$CLOCK_DIR/sleep"
+
+probe_log=$(MERGEPATH_TEST_CLOCK_FILE="$STUB_DIR/clock.count" \
+  PATH="$CLOCK_DIR:$PATH" \
+  CODERABBIT_RATE_LIMIT_GATE_CODEX_CHECK_BIN="$UNCLEARED_STUB" \
+  CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_WAIT_SECONDS=2 \
   CODERABBIT_RATE_LIMIT_GATE_CLEARANCE_POLL_SECONDS=1 \
   bash "$GATE" "$ENGAGED" false 42 owner/repo 2>&1 || true)
 probe_count=$(printf '%s\n' "$probe_log" | grep -c 'stub codex-review-check' || true)
-if [ "$probe_count" -ge 2 ]; then
-  pass "#825 bounded wait re-probes while budget remains, then blocks ($probe_count probes)"
+if [ "$probe_count" -eq 3 ]; then
+  pass "#825 bounded wait re-probes while budget remains, then blocks (3 probes)"
 else
-  fail "#825 bounded wait should re-probe while budget remains (saw $probe_count probes)"
+  fail "#825 bounded wait should probe exactly 3 times under a 2s stub clock (saw $probe_count)"
 fi
 
 echo "----"
