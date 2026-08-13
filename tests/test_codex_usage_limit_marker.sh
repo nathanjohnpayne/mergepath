@@ -284,6 +284,7 @@ run_blocked_e2e() { # marker_body → prints "rc|blocked_reason|elapsed"
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin"
   cp "$REQUEST" "$dir/scripts/codex-review-request.sh"; chmod +x "$dir/scripts/codex-review-request.sh"
   cp "$LIB" "$dir/scripts/lib/codex-failure-markers.sh"
+  cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 author_identity: nathanjohnpayne
 codex:

@@ -23,9 +23,13 @@ make_case() {
   local review_timeout=${4:-0}
   local dir="$WORKDIR/$name"
 
-  mkdir -p "$dir/scripts" "$dir/.github" "$dir/bin" "$dir/state"
+  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/codex-review-request.sh" "$dir/scripts/codex-review-request.sh"
   chmod +x "$dir/scripts/codex-review-request.sh"
+  # #799: codex-review-request.sh HARD-sources this lib (exit 3 if absent),
+  # because the read it guards anchors every freshness comparison in the poll
+  # loop. Fixture trees must stage the real one.
+  cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
 codex:

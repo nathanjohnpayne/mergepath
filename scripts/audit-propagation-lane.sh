@@ -242,7 +242,19 @@ if [ ! -r "$__LANE_AUDIT_DIR/lib/reviewers-helpers.sh" ]; then
 fi
 # shellcheck source=lib/reviewers-helpers.sh
 . "$__LANE_AUDIT_DIR/lib/reviewers-helpers.sh"
-LANE_TOKEN_LOGIN=$(gh api user --jq .login 2>/dev/null || true)
+# Hard-required for the same fail-closed reason as reviewers-helpers.sh above:
+# this is the token-identity verification, and #799 made its emptiness guard
+# dead. The decision stayed safe by accident — a JSON error body is not in
+# available_reviewers either — but the diagnostic printed the blob as the
+# "identity", which sends the reader hunting a permissions problem that is
+# really an unreachable API.
+if [ ! -r "$__LANE_AUDIT_DIR/lib/gh-api-scalar.sh" ]; then
+  err "gh-api-scalar missing: $__LANE_AUDIT_DIR/lib/gh-api-scalar.sh (see #799)"
+  exit 3
+fi
+# shellcheck source=lib/gh-api-scalar.sh
+. "$__LANE_AUDIT_DIR/lib/gh-api-scalar.sh"
+LANE_TOKEN_LOGIN=$(gh_api_scalar --shape login "token identity" user --jq .login) || LANE_TOKEN_LOGIN=""
 if [ -z "$LANE_TOKEN_LOGIN" ] || ! login_is_available_reviewer "$LANE_TOKEN_LOGIN"; then
   err "live-mode token identity '${LANE_TOKEN_LOGIN:-<unresolvable>}' is not in available_reviewers — fail closed"
   exit 3

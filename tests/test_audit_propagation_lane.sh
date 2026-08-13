@@ -220,6 +220,67 @@ else
   fail "#521: token check should precede manifest/yq prereqs; got rc=$RC, out: $OUT"
 fi
 
+# --- #799: the token-identity read must not report an error body as the -----
+# --- identity --------------------------------------------------------------
+# `gh api user --jq .login` writes the JSON error body to STDOUT on an HTTP
+# failure, so `LANE_TOKEN_LOGIN=$(… || true)` came back holding
+# `{"message":"Bad credentials",…}` and the `[ -z ]` half of the guard never
+# fired. The DECISION stayed safe by a different route — a JSON blob is not in
+# available_reviewers either — but the diagnostic named the blob as the
+# effective identity, which sends the reader hunting a permissions problem
+# when the real fault is an unreachable or unauthenticated API. Both halves
+# are asserted: still exit 3, and the lane's OWN verdict line must name
+# `<unresolvable>` rather than quoting the blob as an identity.
+#
+# The assertion is scoped to that one line on purpose. gh_api_scalar DOES echo
+# the error body — to stderr, as a diagnostic, which is the point: the body is
+# useful to a human and fatal to a parser, so it belongs on the stream nobody
+# reads as a value. A blanket "the body appears nowhere in the output" check
+# would forbid the very reporting the fix adds.
+#
+# Driven at BOTH gh exit statuses. Exit 1 is what real gh does; exit 0 is the
+# pathological variant that only `--shape login` can catch.
+#
+# Run from a SCRATCH root, not from $ROOT. These two cases supply a token, so
+# unlike the fail-closed cases above they get past the token gate and reach the
+# `[ -f "$MANIFEST" ]` prerequisite — and check_repo_lint_consumer_safety runs
+# this whole suite inside a CONSUMER fixture tree that has no
+# `.mergepath-sync.yml`, where the script would exit 2 on the missing manifest
+# long before the identity read under test. CI caught exactly that. An empty
+# manifest file is enough: the identity gate fires before anything parses it,
+# and an absent review-policy.yml leaves available_reviewers empty, which only
+# makes the fail-closed verdict more certain.
+LANE799_ROOT="$WORKDIR/lane799-root"; mkdir -p "$LANE799_ROOT"
+: > "$LANE799_ROOT/.mergepath-sync.yml"
+for lane_rc in 1 0; do
+  LANE799_BIN="$WORKDIR/lane799-bin.$lane_rc"; mkdir -p "$LANE799_BIN"
+  cp "$STUB_BIN/yq" "$LANE799_BIN/yq"
+  cat > "$LANE799_BIN/gh" <<GH
+#!/usr/bin/env bash
+# Model real \`gh api --jq\` on an HTTP failure: error BODY on STDOUT with the
+# filter NOT applied, human-readable line on stderr. A stub writing the body
+# to stderr would prove nothing — the script's 2>/dev/null would swallow it
+# and the dead guard would fire correctly for the wrong reason (#799).
+printf '%s' '{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest","status":"401"}'
+echo "gh: Bad credentials (HTTP 401)" >&2
+exit $lane_rc
+GH
+  chmod +x "$LANE799_BIN/gh" "$LANE799_BIN/yq"
+  set +e
+  OUT=$( cd "$LANE799_ROOT" && PATH="$LANE799_BIN:$PATH" OP_PREFLIGHT_CACHE_DIR="$EMPTY_CACHE" \
+    MERGEPATH_AGENT="nobody-xyz" GH_TOKEN="dummy-token-for-the-identity-read" \
+    "$SCRIPT" --repos __none__ 2>&1 )
+  RC=$?
+  set -e
+  VERDICT_LINE=$(echo "$OUT" | grep "live-mode token identity" || true)
+  if [ "$RC" = "3" ] && echo "$VERDICT_LINE" | grep -q "'<unresolvable>'" \
+     && ! echo "$VERDICT_LINE" | grep -q '"message"'; then
+    pass "#799: an unreadable token-identity read reports <unresolvable>, not the error body (gh exit $lane_rc)"
+  else
+    fail "#799: token-identity diagnostic leaked the error body at gh exit $lane_rc; got rc=$RC, out: $OUT"
+  fi
+done
+
 echo ""
 echo "test_audit_propagation_lane: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

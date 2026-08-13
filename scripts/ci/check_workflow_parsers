@@ -237,6 +237,21 @@ YAML
 
 fp_stub="$fp_tmp/bin"
 mkdir -p "$fp_stub"
+# #799 fixture note. This stub keeps SYMBOLIC names for the things a caller
+# supplies (`--ref reviewed`, `--head updated`, tree/blob object ids that only
+# ever flow through jq), because they make the cases readable and `--ref`
+# genuinely accepts any ref. What it can no longer do is answer a field NAMED
+# `.sha` with prose: external_review_fingerprint.sh and
+# external_review_carryforward.sh now shape-check those, so a value GitHub
+# could never return reads as an unreadable response. The line is exactly
+# that — sha-shaped FIELDS return hex; caller-supplied REFS may stay words.
+#
+# The hex aliases, since they are no longer self-describing:
+#   ba5ec0  — the PR's current base            (was base-current)
+#   ba5e4ed — the base as of the reviewed head (was base-reviewed)
+#   ba5ec4a — the base after a base change     (was base-changed)
+#   2ea1ed  — the commit `abc1234` resolves to (was the word `reviewed`)
+#   171e4   — the intermediate signal commit   (was the word `intermediate`)
 cat >"$fp_stub/gh" <<'STUB'
 #!/usr/bin/env bash
 if [ "$1" != "api" ]; then
@@ -249,7 +264,7 @@ if [ "${1:-}" = "--paginate" ]; then
 fi
 endpoint="${1:-}"
 case "$endpoint" in
-  repos/example/repo/git/trees/reviewed?recursive=1|repos/example/repo/git/trees/updated?recursive=1|repos/example/repo/git/trees/updated-tree?recursive=1|repos/example/repo/git/trees/basechanged?recursive=1)
+  repos/example/repo/git/trees/reviewed?recursive=1|repos/example/repo/git/trees/2ea1ed?recursive=1|repos/example/repo/git/trees/updated?recursive=1|repos/example/repo/git/trees/updated-tree?recursive=1|repos/example/repo/git/trees/basechanged?recursive=1)
     cat <<'JSON'
 {"truncated":false,"tree":[
   {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"same-dependabot-blob"},
@@ -257,7 +272,7 @@ case "$endpoint" in
 ]}
 JSON
     ;;
-  repos/example/repo/git/trees/intermediate?recursive=1)
+  repos/example/repo/git/trees/intermediate?recursive=1|repos/example/repo/git/trees/171e4?recursive=1)
     if [ "${STUB_INTERMEDIATE_TREE_FAIL:-}" = "1" ]; then
       echo "stub gh: forced intermediate tree failure" >&2
       exit 1
@@ -269,7 +284,7 @@ JSON
 ]}
 JSON
     ;;
-  repos/example/repo/git/trees/base-reviewed?recursive=1|repos/example/repo/git/trees/base-current?recursive=1)
+  repos/example/repo/git/trees/ba5e4ed?recursive=1|repos/example/repo/git/trees/ba5ec0?recursive=1)
     cat <<'JSON'
 {"truncated":false,"tree":[
   {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"base-dependabot-blob"},
@@ -277,7 +292,7 @@ JSON
 ]}
 JSON
     ;;
-  repos/example/repo/git/trees/base-changed?recursive=1)
+  repos/example/repo/git/trees/ba5ec4a?recursive=1)
     cat <<'JSON'
 {"truncated":false,"tree":[
   {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"base-changed-dependabot-blob"},
@@ -303,19 +318,19 @@ JSON
     ;;
   repos/example/repo/pulls/7)
     if [ "${2:-}" = "--jq" ]; then
-      echo "base-current"
+      echo "ba5ec0"
     else
-      echo '{"base":{"sha":"base-current"}}'
+      echo '{"base":{"sha":"ba5ec0"}}'
     fi
     ;;
-  repos/example/repo/compare/base-current...reviewed)
-    if [ "${2:-}" = "--jq" ]; then echo "base-reviewed"; else echo '{"merge_base_commit":{"sha":"base-reviewed"}}'; fi
+  repos/example/repo/compare/ba5ec0...reviewed|repos/example/repo/compare/ba5ec0...2ea1ed)
+    if [ "${2:-}" = "--jq" ]; then echo "ba5e4ed"; else echo '{"merge_base_commit":{"sha":"ba5e4ed"}}'; fi
     ;;
-  repos/example/repo/compare/base-current...updated|repos/example/repo/compare/base-current...changed|repos/example/repo/compare/base-current...readmechanged|repos/example/repo/compare/base-current...commit-updated|repos/example/repo/compare/base-current...intermediate)
-    if [ "${2:-}" = "--jq" ]; then echo "base-current"; else echo '{"merge_base_commit":{"sha":"base-current"}}'; fi
+  repos/example/repo/compare/ba5ec0...updated|repos/example/repo/compare/ba5ec0...changed|repos/example/repo/compare/ba5ec0...readmechanged|repos/example/repo/compare/ba5ec0...commit-updated|repos/example/repo/compare/ba5ec0...intermediate|repos/example/repo/compare/ba5ec0...171e4)
+    if [ "${2:-}" = "--jq" ]; then echo "ba5ec0"; else echo '{"merge_base_commit":{"sha":"ba5ec0"}}'; fi
     ;;
-  repos/example/repo/compare/base-current...basechanged)
-    if [ "${2:-}" = "--jq" ]; then echo "base-changed"; else echo '{"merge_base_commit":{"sha":"base-changed"}}'; fi
+  repos/example/repo/compare/ba5ec0...basechanged)
+    if [ "${2:-}" = "--jq" ]; then echo "ba5ec4a"; else echo '{"merge_base_commit":{"sha":"ba5ec4a"}}'; fi
     ;;
   repos/example/repo/issues/7/comments)
     cat <<'JSON'
@@ -328,8 +343,12 @@ JSON
 [{"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"updated","submitted_at":"2026-07-06T11:00:00Z","state":"COMMENTED"}]
 JSON
     elif [ "${STUB_SOURCE_REVIEW:-}" = "1" ]; then
+      # commit_id follows the resolved candidate sha (`2ea1ed`, what
+      # commits/abc1234 now answers) so this review still lands ON the source
+      # commit — the whole point of the case. Matching it to the old word
+      # `reviewed` would silently turn this into a review of some other commit.
       cat <<'JSON'
-[{"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"reviewed","submitted_at":"2026-07-06T11:00:00Z","state":"COMMENTED"}]
+[{"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"2ea1ed","submitted_at":"2026-07-06T11:00:00Z","state":"COMMENTED"}]
 JSON
     elif [ "${STUB_INTERMEDIATE_REVIEW:-}" = "1" ]; then
       cat <<'JSON'
@@ -344,16 +363,16 @@ JSON
     ;;
   repos/example/repo/commits/abc1234)
     if [ "${2:-}" = "--jq" ]; then
-      echo "reviewed"
+      echo "2ea1ed"
     else
-      echo '{"sha":"reviewed"}'
+      echo '{"sha":"2ea1ed"}'
     fi
     ;;
   repos/example/repo/commits/intermediate)
     if [ "${2:-}" = "--jq" ]; then
-      echo "intermediate"
+      echo "171e4"
     else
-      echo '{"sha":"intermediate"}'
+      echo '{"sha":"171e4"}'
     fi
     ;;
   *)
@@ -422,7 +441,7 @@ fi
 
 carry_json=$(PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head updated --current-fingerprint "$updated_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
 if [ "$(echo "$carry_json" | jq -r .carried)" = "true" ] \
-   && [ "$(echo "$carry_json" | jq -r .source_commit)" = "reviewed" ]; then
+   && [ "$(echo "$carry_json" | jq -r .source_commit)" = "2ea1ed" ]; then
   pass=$((pass + 1))
   echo "  PASS: external review carry-forward accepts prior Codex verdict with matching fingerprint"
 else

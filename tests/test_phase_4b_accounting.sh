@@ -2563,7 +2563,13 @@ else fail "notional end-to-end (rc=$rc, rec=$REC_H)"; fi
 #     state never claims a phantom posted approval.
 STATE_I="$WORK/state-i"
 set +e
-run_orch "$STATE_I" "$POLICY_ON" fake-codex-approve 209 P4B_FAKE_LIVE_HEAD=zzz999 -- >/dev/null 2>&1; rc=$?
+# #799: the drifted head is `9de456`, not the old `zzz999`. This case models a
+# head that CHANGED, which needs a different but VALID object name — `zzz999`
+# is not hex and so is not a sha any API can return. Since the live-head
+# re-read shape-checks its answer, an impossible value now reads as an
+# UNREADABLE head (p4b_die 3) rather than a drifted one (exit 4), which is a
+# different branch than this case is about.
+run_orch "$STATE_I" "$POLICY_ON" fake-codex-approve 209 P4B_FAKE_LIVE_HEAD=9de456 -- >/dev/null 2>&1; rc=$?
 set -e
 LOG_I="$(find "$STATE_I/phase-4b-loops" -name '*.jsonl' 2>/dev/null | head -n1)"
 if [ "$rc" = 4 ] \

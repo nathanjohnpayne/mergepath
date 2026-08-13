@@ -68,7 +68,12 @@ emit() {
 case "$PATHARG" in
   repos/*/git/trees/*) emit "$(cat "$STUB_TREE_JSON")" ;;
   repos/*/commits/*)   emit '{"sha":"aaaa111122223333444455556666777788889999","commit":{"tree":{"sha":"t1"}}}' ;;
-  repos/*/compare/*)   emit '{"merge_base_commit":{"sha":"bbbb1111222233334444555566667777888899 99"}}' ;;
+  # #799: the space inside this literal was a typo — 41 characters with an
+  # embedded blank, which no git implementation and no GitHub response can
+  # produce. It went unnoticed for as long as nothing looked at the SHAPE of a
+  # sha; `--shape sha` rejects it on sight. Corrected to the 40-hex value the
+  # fixture obviously meant.
+  repos/*/compare/*)   emit '{"merge_base_commit":{"sha":"bbbb111122223333444455556666777788889999"}}' ;;
   repos/*/pulls/*)     emit '{"base":{"sha":"cccc111122223333444455556666777788889999"}}' ;;
   *)                   emit '{}' ;;
 esac
