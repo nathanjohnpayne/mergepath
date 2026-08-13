@@ -131,7 +131,17 @@ Our entire fleet authors as the single shared identity **`nathanjohnpayne`**. So
 
 ### The paired opt-out (#911)
 
-The `auto_review.enabled` rule is a *silent-failure* floor, not a prohibition on opting out. `reviews.auto_review.enabled: false` paired with `coderabbit.enabled: false` in `.github/review-policy.yml` is a deliberate, explicit, reviewable opt-out: the review-policy key is exactly where agents read the CodeRabbit posture, so nothing is left waiting on a bot that will never post. `scripts/ci/check_coderabbit_config` accepts that pairing with a NOTE and exits 0; a **lone** flip (no paired policy opt-out) still FAILs exactly as before. Note that the pre-#911 remediation text ("delete `.coderabbit.yml`") was wrong on its own terms — `auto_review.enabled` defaults to `true` for an ABSENT config, so deleting the file does not disable CodeRabbit; only the review-policy key does.
+The `auto_review.enabled` rule is a *silent-failure* floor, not a prohibition on opting out. `reviews.auto_review.enabled: false` paired with `coderabbit.enabled: false` in `.github/review-policy.yml` is a deliberate, explicit, reviewable opt-out: the review-policy key is exactly where agents read the CodeRabbit posture, so nothing is left waiting on a bot that will never post. `scripts/ci/check_coderabbit_config` accepts that pairing with a NOTE and exits 0; a **lone** flip (no paired policy opt-out) still FAILs exactly as before.
+
+The pairing is required because the two keys govern *different* systems, and neither one alone turns CodeRabbit off:
+
+| Knob | What it actually stops |
+|---|---|
+| `reviews.auto_review.enabled: false` in `.coderabbit.yml` | the App's **automatic** reviews (it still answers explicit `@coderabbitai review` commands) |
+| `coderabbit.enabled: false` in `.github/review-policy.yml` | **agent wait behavior only** — Phase 2.5. The App is unaffected; see REVIEW_POLICY.md § the `coderabbit` block |
+| uninstalling the CodeRabbit GitHub App | CodeRabbit **completely** |
+
+That table is also why the pre-#911 remediation text ("delete `.coderabbit.yml`") was wrong on its own terms: `auto_review.enabled` defaults to `true` for an ABSENT config, so deleting the file leaves the App auto-reviewing while `coderabbit.enabled: false` stops agents waiting for it — the exact worst state #911 names, where an advisory bot nobody is watching still parks unresolved threads in front of the conversation-resolution gate.
 
 The audit confirms those two remain the right load-bearing floor:
 
