@@ -967,6 +967,21 @@ else
   echo "  FAIL: the rc=5 branch must derive ext_protected via scripts/merge-clearance-gate.sh --derive-rate-limit-protection (init false, accept only literal true/false) and must not read labels, unlabeled events, or lane markers directly (#713)" >&2
 fi
 
+# 2e-ter (#825). The rate-limit gate's under-threshold arm can only run if the
+# workflow hands it the PR coordinates: an under-threshold head has no
+# external-review protection to derive, so the gate's ONLY remaining question
+# is whether the failover's own Codex review cleared this head — and it cannot
+# ask it without PR_NUMBER and REPO. Dropping the arguments silently restores
+# the #825 deadlock (the gate blocks fail-closed, so the regression is a stall,
+# not a hole, and would go unnoticed until the next rate-limited PR).
+if grep -Fq 'bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_protected" "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block"; then
+  pass=$((pass + 1))
+  echo "  PASS: rc=5 passes the PR coordinates to the rate-limit gate so its current-head Codex clearance arm can run (#825)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the rc=5 branch must invoke scripts/coderabbit-automerge-rate-limit-gate.sh with \"\$WAIT_JSON\" \"\$ext_protected\" \"\$PR_NUMBER\" \"\$REPO\" — without the coordinates the gate cannot verify current-head Codex clearance and every under-threshold rate-limit stall deadlocks again (#825)" >&2
+fi
+
 # 2e-bis. The rc=5-time derivation runs minutes before the merge and state
 # can change during the waits (a push, a propagation-lane verification
 # landing): the downgrade path must record itself (CR_RATE_LIMIT_DOWNGRADED

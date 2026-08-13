@@ -378,6 +378,19 @@ paths:
   - path: scripts/coderabbit-automerge-rate-limit-gate.sh
     type: canonical
     consumers: all
+    # #825 arm 2b invokes scripts/codex-review-check.sh directly, by path, on
+    # every unprotected head, and its safety rests on that checker HONORING
+    # CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false (#727). A checker
+    # predating that flag ignores it, so gate (c) accepts the very reviewer
+    # APPROVED that armed auto-merge as a Phase-4b substitute and the probe
+    # returns 0 before Codex has reviewed anything — the #512 r3 hole this arm
+    # exists to keep closed. A commit-path sync updates only changed canonical
+    # targets, so without this edge a consumer could take the new gate while
+    # keeping a stale checker; the closure gate must refuse to ship the caller
+    # ahead of the dependency it trusts (Codex P1 on #960, same reasoning as
+    # the scripts/phase-4b-review.sh edge below).
+    requires:
+      - "scripts/codex-review-check.sh"
   - path: scripts/codex-review-request.sh
     type: canonical
     consumers: all
