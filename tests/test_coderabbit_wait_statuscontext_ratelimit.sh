@@ -890,6 +890,52 @@ test_failed_reviews_read_does_not_clear() {
   [ "$FAIL" -ne "$before" ] || pass "23: a failed reviews read in the count_potential_issues chain is exit 3 (infra), never a finding count of zero"
 }
 
+# --- Test 24: #831 — the fast path's own read failure must not CLEAR ---------
+# The third #831 wrapper, and the only one whose guard was already in the tree
+# but unpinned: `status_context_fast_path_blocked_by_comment`. Its whole job is
+# to decide whether a CodeRabbit StatusContext success is trustworthy, and it
+# decides that by reading the comment list. An unchecked read failure hands it
+# an empty list, so every classifier below it sees nothing adverse, and the
+# function returns "not blocked" — the fast path then clears a head CodeRabbit
+# has publicly said it is rate-limited on. The failure and the all-clear are
+# the same observation, which is the #831 shape exactly.
+#
+# The fixture is test 1's, unchanged, and test 1 IS the control: same notice,
+# same near-simultaneous success, no injected failure, exit 5. The single
+# difference here is that the fast path's first issue-comments read fails, so
+# nothing but that read can account for a different verdict.
+#
+# Non-vacuous by mutation: replacing the `|| { log …; return 0; }` guard at
+# `status_context_fast_path_blocked_by_comment`'s fetch with a bare assignment
+# turns this run into `StatusContext success and 0 blocking (p0/p1) inline
+# findings — emitting cleared (exit 0)`. Asserted on that log line as well as
+# the exit code, because the clearance DECISION is the defect (#957) — an
+# exit-code-only assertion can be satisfied by an unrelated downstream crash.
+test_failed_fast_path_comment_read_does_not_clear() {
+  local dir rc=0 before=$FAIL
+  dir=$(make_case "fast-path-read-failure" "$RATE_LIMIT_BODY_HEADREF")
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_FAIL_ISSUES_ON=1 \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  if grep -q 'emitting cleared' "$dir/err.log"; then
+    fail "24: the StatusContext fast path CLEARED a rate-limited head off a comment-list read that had just failed; err=$(tail -4 "$dir/err.log")"
+  fi
+  [ "$rc" != "0" ] || fail "24: FALSE-CLEARED (exit 0) after the fast path's comment-list read failed"
+  [ "$rc" = "5" ] || fail "24: expected exit 5 (rate_limit_stalled, same as the test-1 control), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "24: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+  grep -q 'the issue-comments read failed' "$dir/err.log" \
+    || fail "24: expected the fast-path suppression message naming the failed read; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "24: a failed comment-list read inside the StatusContext fast path suppresses it (keep polling), never clears a rate-limited head"
+}
+
 # --- Test 20: #936 — 'No review completed' is a refusal, end to end ---------
 # Codex P1 on #936. The description predicate matched `*"review complete"*` as
 # a SUBSTRING, so three wordings that state the review did NOT happen cleared
@@ -936,6 +982,7 @@ test_failed_summary_derive_does_not_clear
 test_negated_completed_description_does_not_take_fast_path
 test_failed_comment_list_read_does_not_clear
 test_failed_reviews_read_does_not_clear
+test_failed_fast_path_comment_read_does_not_clear
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"
