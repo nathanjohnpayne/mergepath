@@ -35,6 +35,18 @@
 # value → binding → step → ordering). Precedent:
 # scripts/ci/check_merge_clearance_gate's #850 tier.
 #
+# PARSING IT IS NOT ENOUGH — it has to parse the way ACTIONS parses. A
+# cross-agent round on #974 found the whole trigger tier vacuous against
+# `On:`, because PyYAML's YAML 1.1 resolution turns `on`, `On`, `ON` and
+# `true` into one indistinguishable key while Actions reads the exact string
+# `on`. ActionsLoader below therefore keys every mapping on its RAW scalar
+# text. The same round found two more assertions vacuous in the ABSENCE
+# direction — a mapping whose extra keys were never pinned, and conditions
+# screened for falsiness instead of pinned — so the shape this file reaches
+# for is: pin the whole key set, and pin required keys as required rather
+# than as checked-if-present. An assertion that fires only where its subject
+# already exists is disarmed by deleting one line.
+#
 # ONE DISCLOSED EXCEPTION: the A2 head-binding SITE scan reads `raw_text`,
 # the file's shell text, because a `head_sha` binding has no YAML-level
 # expression to read. Stating it plainly because the residual is real —
@@ -231,6 +243,59 @@ EXPECTED_TRIGGERS = {"workflow_run", "repository_dispatch"}
 EXPECTED_WORKFLOW_RUN_TYPES = ["requested", "in_progress", "completed"]
 EXPECTED_DISPATCH_TYPES = ["merge-clearance-recheck", "required-check-republish"]
 
+# Each trigger's mapping is pinned WHOLE, not key by key, because the
+# dangerous additions are the ones that leave every checked value intact.
+# `branches` / `branches-ignore` under workflow_run filter on the PARENT
+# run's head branch, so `branches: [main]` passes every assertion below
+# while no PR-head delivery ever reaches this workflow again: requested,
+# in_progress and completed all stop, holds are neither opened nor retired,
+# and the three contexts sit pending or stale indefinitely (cross-agent P1
+# on #974). An absence has no positive spelling to test for, so the only
+# assertion that can carry one is an exact key set.
+EXPECTED_WORKFLOW_RUN_KEYS = {"workflows", "types"}
+EXPECTED_DISPATCH_KEYS = {"types"}
+
+# A13 — the top-level key vocabulary, exactly.
+#
+# The trigger block must be identified by its OWN key, with nothing else
+# able to stand in for it. ActionsLoader closes the aliasing half (`On:`,
+# `ON:` and `true:` are no longer the `on` key); this closes the other half,
+# a SECOND top-level key arriving alongside a correct `on:`. Actions reads a
+# fixed top-level vocabulary, so a key outside it is at best inert and at
+# worst makes the file invalid — and an invalid publisher does not run at
+# all, which is the liveness failure this whole fence exists to make loud. A
+# legitimate new top-level key is a one-line diff here.
+EXPECTED_TOP_LEVEL_KEYS = {"name", "on", "permissions", "env", "jobs"}
+
+# A4a — the eligibility shape of both phase jobs, pinned VERBATIM
+# (whitespace-normalised only, so reflowing the folded block is not a false
+# positive) rather than screened for conditions Actions cannot satisfy.
+#
+# Screening was the previous shape and it was vacuous in three directions at
+# once (cross-agent P1 on #974): it rejected a small set of literal-false
+# spellings, so any non-literal impossible condition passed; it was guarded
+# on the key's PRESENCE, so DELETING the `if:` disarmed it — the identical
+# one-line-deletion defect A6 carried; and it was scoped to `publish` alone,
+# so `open` had no eligibility assertion at all.
+#
+# LIMIT, stated rather than implied: this does not evaluate the expression.
+# The fence cannot decide that the pinned condition is the RIGHT one, only
+# that it is the reviewed one. A semantically equivalent respelling (a
+# `${{ }}` wrapper, reordered operands) trips it too, and that is the
+# assertion rather than a defect in it — the single condition deciding
+# whether each phase runs has to arrive here as a diff.
+EXPECTED_JOB_IF = {
+    OPEN_JOB: (
+        "github.event_name == 'workflow_run' && "
+        "(github.event.action == 'requested' || "
+        "github.event.action == 'in_progress')"
+    ),
+    PUBLISH_JOB: (
+        "github.event_name != 'workflow_run' || "
+        "github.event.action == 'completed'"
+    ),
+}
+
 # A4 — one FIXED queue, not a per-head group (cross-agent round 1 on
 # #867). Grouping by head left the sweep and dispatch paths outside the
 # serialization entirely, so an older evaluation on one of those paths
@@ -251,9 +316,18 @@ EXPECTED_CONCURRENCY_GROUP = "rcp-publish"
 # binding site. That residual is a dataflow property; closing it needs the
 # shell interpreted, not matched. The site-and-count fence is what keeps a
 # NEW binding from arriving unexamined.
-HEAD_ENV_ALLOWED = {
-    "HEAD_SHA": "${{ github.event.workflow_run.head_sha }}",
-    "RUN_HEAD": "${{ github.event.workflow_run.head_sha }}",
+#
+# The event-side half of A2 is the two step `env:` bindings the shell
+# expansions below resolve to, and it is the only half decided over the
+# parsed document. Pinned per job as REQUIRED-AND-EXACT rather than checked
+# where present: an assertion that fires only where the key already exists
+# is disarmed by deleting the key, and the shell-side allowlist cannot cover
+# that gap — the POST would still name an allowlisted variable, now unset,
+# the site count would be unchanged, and every context would be published on
+# an empty head_sha.
+REQUIRED_HEAD_ENV = {
+    OPEN_JOB: {"HEAD_SHA": "${{ github.event.workflow_run.head_sha }}"},
+    PUBLISH_JOB: {"RUN_HEAD": "${{ github.event.workflow_run.head_sha }}"},
 }
 # Shell expansions a head_sha binding may name: the two event bindings
 # above and the loop/parameter variables the pass derives from the
@@ -319,51 +393,55 @@ def bad(*lines):
     failures.extend(lines)
 
 
-class StrictLoader(yaml.SafeLoader):
-    """Duplicate mapping keys are a parse error, as they are for Actions.
+class ActionsLoader(yaml.SafeLoader):
+    """Mapping keys are their RAW scalar text, and duplicates are an error.
 
-    yaml.safe_load silently keeps the LAST duplicate, so a second `on:` or a
-    second `jobs:` would let this fence inspect a definition Actions never
-    runs. Duplicates are detected on the RAW scalar text, not the resolved
-    value: PyYAML 1.1 resolves both `on` and `true` to the boolean True, and
-    value-level comparison would report a duplicate for two keys Actions
-    keeps distinct.
+    Both halves exist because PyYAML's defaults diverge from Actions in ways
+    that let a trigger assertion pass over a document Actions never runs:
+
+      * KEY RESOLUTION. PyYAML applies YAML 1.1 boolean resolution, so the
+        plain keys `on`, `On` and `ON` all construct to the Python value
+        True — indistinguishable from each other and from a literal `true:`.
+        Actions is case-sensitive and reads the exact string key `on`, so a
+        document respelled `On:` carries NO trigger definition at all, while
+        a value-keyed check still finds a trigger mapping and passes it
+        (cross-agent P1 on #974). The same resolution makes `on:` and
+        `true:` COLLIDE, and safe_load keeps the LAST — so a stray `true:`
+        block would be inspected in place of the real one. Keying on
+        `key_node.value` (the scalar text the scanner produced, after
+        quoting is stripped and before any resolver runs) is Actions' own
+        semantics: a workflow mapping key is a string, never a boolean and
+        never a number. It also keeps `"on":` and `on:` the same key, which
+        is correct — both are the string `on` to Actions.
+      * DUPLICATES. safe_load keeps the LAST duplicate, so a second `on:` or
+        a second `jobs:` would let this fence inspect a definition Actions
+        never runs.
+
+    Merge keys are deliberately NOT flattened: Actions does not implement
+    YAML anchors, so `<<` is an ordinary key there and stays one here.
     """
 
     def construct_mapping(self, node, deep=False):
-        seen = set()
-        for key_node, _value in node.value:
+        if not isinstance(node, yaml.MappingNode):
+            return super().construct_mapping(node, deep)
+        mapping = {}
+        for key_node, value_node in node.value:
             if not isinstance(key_node, yaml.ScalarNode):
                 raise yaml.constructor.ConstructorError(
                     None, None,
                     "found unhashable (complex) mapping key", key_node.start_mark)
-            if key_node.value in seen:
+            if key_node.value in mapping:
                 raise yaml.constructor.ConstructorError(
                     None, None,
                     "found duplicate mapping key %r" % key_node.value,
                     key_node.start_mark)
-            seen.add(key_node.value)
-        return super().construct_mapping(node, deep)
+            mapping[key_node.value] = self.construct_object(value_node, deep=deep)
+        return mapping
 
 
 def load(path):
     with open(path, encoding="utf-8") as handle:
-        return yaml.load(handle, Loader=StrictLoader)
-
-
-def on_block(doc):
-    """The `on:` mapping, under either spelling.
-
-    PyYAML resolves the bare key `on` to the boolean True under YAML 1.1
-    while Actions reads it as the string "on"; a quoted `"on":` stays a
-    string. Both are the same trigger block, so both are accepted here —
-    reading only one spelling would make the whole trigger tier vacuous
-    against a legal respelling.
-    """
-    for key in (True, "on", "On", "ON"):
-        if key in doc:
-            return doc[key]
-    return None
+        return yaml.load(handle, Loader=ActionsLoader)
 
 
 def strip_shell_comments(text):
@@ -377,55 +455,6 @@ def strip_shell_comments(text):
     """
     text = re.sub(r"(?m)^[ \t]*#.*$", "", text)
     return re.sub(r"(?m)[ \t]#.*$", "", text)
-
-
-FALSY_WORDS = frozenset(("false", "null", ""))
-_WRAPPED = re.compile(r"^\$\{\{(?P<inner>.*)\}\}$", re.DOTALL)
-
-
-def unwrap(text):
-    """Strip one WHOLE-value ${{ }} wrapper. `if: X` and `if: ${{ X }}` are
-    the same condition to Actions. The interior is rejected when it opens or
-    closes a second wrapper, because `${{ a }} && ${{ b }}` is string
-    interpolation rather than one expression."""
-    match = _WRAPPED.match(str(text).strip())
-    if match is None:
-        return str(text).strip()
-    inner = match.group("inner")
-    if "${{" in inner or "}}" in inner:
-        return str(text).strip()
-    return inner.strip()
-
-
-def falsy_condition(value):
-    """True when `value` is a literal condition Actions can never satisfy.
-
-    ONE normalisation pass rather than a list of spellings (the #854 shape):
-    the wrapper and any surrounding quote pair come off, then the remainder
-    is read as an integer in any base, as a float, and against
-    false/null/empty. Safe in one direction by construction — this only ever
-    ADDS a rejection, so a falsy form it misses is still a condition nobody
-    pinned rather than an accepted one.
-    """
-    if isinstance(value, bool):
-        return value is False
-    if value is None:
-        return True
-    if isinstance(value, (int, float)):
-        return value == 0
-    text = " ".join(unwrap(value).split())
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
-        text = text[1:-1].strip()
-    if text.lower() in FALSY_WORDS:
-        return True
-    try:
-        return int(text, 0) == 0
-    except ValueError:
-        pass
-    try:
-        return float(text) == 0.0
-    except ValueError:
-        return False
 
 
 try:
@@ -477,13 +506,29 @@ for want in (OPEN_JOB, PUBLISH_JOB):
 open_job = jobs.get(OPEN_JOB) if isinstance(jobs.get(OPEN_JOB), dict) else None
 publish_job = jobs.get(PUBLISH_JOB) if isinstance(jobs.get(PUBLISH_JOB), dict) else None
 
+# ── A13 — the top-level key vocabulary, exactly ────────────────────────
+present_top = set(doc)
+if present_top != EXPECTED_TOP_LEVEL_KEYS:
+    bad("FAIL: [rcp top-level keys] the publisher's top-level keys are %s;"
+        % sorted(present_top),
+        "      exactly %s is required. This is what makes" % sorted(EXPECTED_TOP_LEVEL_KEYS),
+        "      the trigger block below identifiable by its own key: to Actions `On:`,",
+        "      `ON:` and `true:` are NOT the `on` key — a document respelled that way",
+        "      carries no trigger definition at all — and an extra top-level key",
+        "      arriving beside a correct `on:` changes what Actions accepts without",
+        "      changing anything else this fence reads.")
+
 # ── A9 — the trigger set, exactly ──────────────────────────────────────
-triggers = on_block(doc)
+#
+# `doc["on"]` is the EXACT, case-sensitive key Actions reads; ActionsLoader
+# keys the document on raw scalar text so no other spelling can answer here.
+triggers = doc.get("on")
 if not isinstance(triggers, dict):
-    bad("FAIL: [rcp trigger set] %s has no `on:` mapping; the publisher's" % PUBLISHER,
-        "      delivery paths cannot be inspected.")
+    bad("FAIL: [rcp trigger set] %s has no `on:` mapping under that exact," % PUBLISHER,
+        "      case-sensitive key; the publisher's delivery paths cannot be",
+        "      inspected.")
 else:
-    present = set(str(k) for k in triggers)
+    present = set(triggers)
     if present != EXPECTED_TRIGGERS:
         bad("FAIL: [rcp trigger set] the publisher's triggers are %s;" % sorted(present),
             "      exactly %s is required. workflow_dispatch must stay ABSENT" % sorted(EXPECTED_TRIGGERS),
@@ -493,23 +538,51 @@ else:
             "      cron already reaches this file through the workflow_run chain, so an",
             "      own cron would run a second full-fleet pass every interval).")
     wr = triggers.get("workflow_run")
-    wr_types = (wr or {}).get("types") if isinstance(wr, dict) else None
-    if list(wr_types or []) != EXPECTED_WORKFLOW_RUN_TYPES:
-        bad("FAIL: [rcp trigger set] workflow_run types are %r, not %r."
-            % (wr_types, EXPECTED_WORKFLOW_RUN_TYPES),
-            "      `requested` opens the hold at parent-run creation; `in_progress` is",
-            "      the RERUN cue (a rerun re-uses the run, so `requested` never",
-            "      re-fires and the re-evaluation window would carry no pending cover);",
-            "      `completed` is the publish cue.")
+    if not isinstance(wr, dict):
+        bad("FAIL: [rcp trigger set] workflow_run is %r, not a mapping — the" % wr,
+            "      parent list and activity types cannot be inspected and every",
+            "      assertion scoped to them would pass vacuously.")
+    else:
+        wr_keys = set(wr)
+        if wr_keys != EXPECTED_WORKFLOW_RUN_KEYS:
+            bad("FAIL: [rcp trigger set] workflow_run's keys are %s, not exactly %s."
+                % (sorted(wr_keys), sorted(EXPECTED_WORKFLOW_RUN_KEYS)),
+                "      The mapping is pinned WHOLE because the dangerous additions are",
+                "      the ones that leave every checked value intact: branches /",
+                "      branches-ignore filter on the PARENT run's head branch, so",
+                "      `branches: [main]` keeps this trigger looking correct while no",
+                "      PR-head delivery reaches the publisher again — requested,",
+                "      in_progress and completed all stop, holds are neither opened nor",
+                "      retired, and the three contexts sit pending or stale indefinitely.")
+        wr_types = wr.get("types")
+        if list(wr_types or []) != EXPECTED_WORKFLOW_RUN_TYPES:
+            bad("FAIL: [rcp trigger set] workflow_run types are %r, not %r."
+                % (wr_types, EXPECTED_WORKFLOW_RUN_TYPES),
+                "      `requested` opens the hold at parent-run creation; `in_progress` is",
+                "      the RERUN cue (a rerun re-uses the run, so `requested` never",
+                "      re-fires and the re-evaluation window would carry no pending cover);",
+                "      `completed` is the publish cue.")
     rd = triggers.get("repository_dispatch")
-    rd_types = (rd or {}).get("types") if isinstance(rd, dict) else None
-    if sorted(rd_types or []) != sorted(EXPECTED_DISPATCH_TYPES):
-        bad("FAIL: [rcp trigger set] repository_dispatch types are %r, not %r."
-            % (rd_types, EXPECTED_DISPATCH_TYPES),
-            "      merge-clearance-recheck is kept VERBATIM so the #658 propagation",
-            "      lane reaches this file unchanged; required-check-republish is the",
-            "      operator break-glass and the only on-demand remedy the two sibling",
-            "      contexts have ever had.")
+    if not isinstance(rd, dict):
+        bad("FAIL: [rcp trigger set] repository_dispatch is %r, not a mapping — the" % rd,
+            "      break-glass types cannot be inspected and the assertion below would",
+            "      pass vacuously.")
+    else:
+        rd_keys = set(rd)
+        if rd_keys != EXPECTED_DISPATCH_KEYS:
+            bad("FAIL: [rcp trigger set] repository_dispatch's keys are %s, not exactly"
+                % sorted(rd_keys),
+                "      %s. Pinned whole for the same reason as workflow_run:" % sorted(EXPECTED_DISPATCH_KEYS),
+                "      an added filter key leaves every value here intact while narrowing",
+                "      or silencing the deliveries that reach this workflow.")
+        rd_types = rd.get("types")
+        if sorted(rd_types or []) != sorted(EXPECTED_DISPATCH_TYPES):
+            bad("FAIL: [rcp trigger set] repository_dispatch types are %r, not %r."
+                % (rd_types, EXPECTED_DISPATCH_TYPES),
+                "      merge-clearance-recheck is kept VERBATIM so the #658 propagation",
+                "      lane reaches this file unchanged; required-check-republish is the",
+                "      operator break-glass and the only on-demand remedy the two sibling",
+                "      contexts have ever had.")
 
 # ── A6 — the parent name is read from the parent file, not asserted ─────
 #
@@ -589,13 +662,41 @@ if open_job is not None:
             "      queued open reaches a runner. The stale-write defense belongs to the",
             "      writer (the pre-POST freshness read), not to a queue here.")
 
-# ── A4 — publish is reachable, and serialized on ONE fixed queue ───────
+# ── A4a — both phase jobs keep their pinned eligibility shape ──────────
+#
+# The `if` is compared VERBATIM against EXPECTED_JOB_IF (see the constant for
+# what that does and does not claim); `needs` is pinned ABSENT, and that is
+# the sharper half. `needs: open` on `publish` leaves every value this fence
+# reads unchanged, and on a `completed` delivery `open`'s own condition is
+# false — a skipped dependency skips its dependent, so the publish pass never
+# runs and every hold phase 1 opened stays pending forever (cross-agent P1 on
+# #974).
+for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
+    if job is None:
+        continue
+    want_if = EXPECTED_JOB_IF[key]
+    got_if = job.get("if")
+    if got_if is None or " ".join(str(got_if).split()) != want_if:
+        bad("FAIL: [rcp job eligibility] job %r has if: %r, not the pinned"
+            % (key, got_if),
+            "      condition %r." % want_if,
+            "      `open` must run on exactly the requested/in_progress deliveries and",
+            "      `publish` on everything except `requested`. A condition Actions can",
+            "      never satisfy — literal or not — makes the publisher open holds it",
+            "      never closes; an ABSENT if: makes each job also run on the deliveries",
+            "      the other owns. Pinned verbatim rather than screened for falsiness,",
+            "      so an equivalent respelling arrives here as a diff too.")
+    if "needs" in job:
+        bad("FAIL: [rcp job eligibility] job %r declares needs: %r. The two phase"
+            % (key, job.get("needs")),
+            "      jobs run on DISJOINT deliveries, so a dependency between them is",
+            "      never satisfied. `needs: open` on `publish` reads as harmless and",
+            "      leaves every other value here intact, while on a `completed`",
+            "      delivery `open` skips and takes `publish` with it — no verdict is",
+            "      ever published and every hold stays pending.")
+
+# ── A4 — publish is serialized on ONE fixed queue ──────────────────────
 if publish_job is not None:
-    if "if" in publish_job and falsy_condition(publish_job["if"]):
-        bad("FAIL: [rcp publish eligibility] the `publish` job's if: %r is a literal"
-            % publish_job["if"],
-            "      Actions can never satisfy, so the publisher would open holds it",
-            "      never closes — every context pending, on every PR, forever.")
     conc = publish_job.get("concurrency")
     if not isinstance(conc, dict):
         bad("FAIL: [rcp publish queue] the `publish` job has no concurrency mapping.",
@@ -663,16 +764,27 @@ for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
 for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
     if job is None:
         continue
-    for step in job.get("steps") or []:
-        if not isinstance(step, dict):
-            continue
-        env = step.get("env") or {}
-        if not isinstance(env, dict):
-            continue
-        for name, want in HEAD_ENV_ALLOWED.items():
-            if name in env and str(env[name]) != want:
+    for name, want in REQUIRED_HEAD_ENV[key].items():
+        seen = []
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            env = step.get("env")
+            if isinstance(env, dict) and name in env:
+                seen.append(env[name])
+        if not seen:
+            bad("FAIL: [rcp head binding] job %r declares no %s step env binding."
+                % (key, name),
+                "      PRESENCE is pinned, not only the value: an assertion that fires",
+                "      solely where the key already exists is disarmed by deleting the",
+                "      key — the A6 defect, in a second place — and the shell-side",
+                "      allowlist cannot cover the gap, because the POST would still name",
+                "      an allowlisted variable, now unset, and publish every context on",
+                "      an empty head_sha.")
+        for got in seen:
+            if str(got) != want:
                 bad("FAIL: [rcp head binding] job %r binds %s to %r, not %r."
-                    % (key, name, env[name], want),
+                    % (key, name, got, want),
                     "      On a workflow_run run github.sha is the DEFAULT BRANCH's last",
                     "      commit. One wrong binding here makes all three required",
                     "      contexts absent on every PR head, fleet-wide, permanently —",
