@@ -188,6 +188,14 @@ fi
 
 command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
 
+# Hard-required (#799). Every documented fallback in this script keyed off an
+# empty head sha, and an unreadable read never produced one — see the call
+# sites below. A consumer missing the lib must die here rather than run with
+# the dead guards restored.
+[ -r "$ROOT/lib/gh-api-scalar.sh" ] || p4b_die 3 "missing helper: $ROOT/lib/gh-api-scalar.sh (see #799)"
+# shellcheck source=lib/gh-api-scalar.sh
+. "$ROOT/lib/gh-api-scalar.sh"
+
 # Auto-source the op-preflight reviewer PAT only after the disabled/mode checks.
 # The default disabled path must stay credential-free and exit 5 without
 # touching 1Password/GitHub auth state.
@@ -209,7 +217,12 @@ fi
 
 if [ -z "$HEAD" ]; then
   need_gh
-  HEAD="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+  # #799: the `[ -n "$HEAD" ]` guard below was dead. An unreadable response
+  # put the JSON error body in $HEAD, which then became the head every
+  # downstream drift check compares against — so a run that could not read
+  # the PR at all reviewed, and could approve, a "head" nobody has.
+  HEAD="$(gh_api_scalar --shape sha "HEAD sha for $REPO#$PR" \
+    "repos/$REPO/pulls/$PR" --jq '.head.sha')" || HEAD=""
   [ -n "$HEAD" ] || p4b_die 3 "could not resolve HEAD sha for $REPO#$PR; pass --head"
 fi
 
@@ -217,7 +230,15 @@ fi
 # even when --reviewer is forced so the cross-agent invariant still applies.
 if [ -z "$AUTHOR" ]; then
   need_gh
-  body="$(gh api "repos/$REPO/pulls/$PR" --jq '.body // ""' 2>/dev/null || true)"
+  # #799: `--jq '.body // ""'` reads as a safe default and is not one — gh
+  # emits the error body WITHOUT running the filter, so the `// ""` never
+  # applies. No `--shape` is possible on free text (a PR body may legitimately
+  # be empty, or contain anything), so the status is the whole guard here:
+  # gh_api_scalar returns 3 with empty stdout, and the Authoring-Agent parse
+  # below then finds nothing and dies with its own message instead of scanning
+  # a JSON error body for an agent name.
+  body="$(gh_api_scalar "PR body for $REPO#$PR" \
+    "repos/$REPO/pulls/$PR" --jq '.body // ""')" || body=""
   AUTHOR="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*Authoring-Agent:[[:space:]]*\([A-Za-z0-9_-]*\).*/\1/p' | head -n1)"
   [ -n "$AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body; pass --author"
 fi
@@ -622,7 +643,12 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     # then the issues would already exist — a head that drifted during the
     # adapter run must refuse here, with zero issues claiming an approval
     # that will never post.
-    live_head_pre="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+    # #799: this re-read exists to catch head drift, so an unreadable answer
+    # must NOT compare unequal-and-therefore-drifted, nor equal-and-therefore-
+    # safe. gh_api_scalar makes it empty, which is what the fall-back below
+    # already tested for.
+    live_head_pre="$(gh_api_scalar --shape sha "live PR head for $REPO#$PR" \
+      "repos/$REPO/pulls/$PR" --jq '.head.sha')" || live_head_pre=""
     [ -n "$live_head_pre" ] \
       || fall_back_to_manual "could not re-read the live PR head before filing post-review issues"
     if [ "$live_head_pre" != "$HEAD" ]; then
@@ -663,7 +689,8 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     # filing pins the just-filed issues to a head whose approval will be
     # refused at post_review, and a new-head rerun cannot reuse the old
     # head-pinned markers. Close this run's creations and refuse now.
-    live_head_post="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+    live_head_post="$(gh_api_scalar --shape sha "live PR head for $REPO#$PR" \
+      "repos/$REPO/pulls/$PR" --jq '.head.sha')" || live_head_post=""
     if [ -z "$live_head_post" ] || [ "$live_head_post" != "$HEAD" ]; then
       p4b_warn "PR head drifted during issue filing (reviewed $HEAD, live ${live_head_post:-unreadable}) — closing this run's filed issues as superseded"
       p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
@@ -907,7 +934,13 @@ post_review() {
     *) p4b_die 3 "unsupported review state flag: $state_flag" ;;
   esac
   local live_head
-  live_head="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+  # #799: the last drift check before a review POSTS. An unreadable read that
+  # arrived as a JSON blob compared unequal to $HEAD and took the
+  # fall_back_to_manual branch — the safe direction by luck, not by design,
+  # and the diagnostic named a "live head" that was an error body. Empty now
+  # means unread, and the guard on the next line is live.
+  live_head="$(gh_api_scalar --shape sha "live PR head for $REPO#$PR" \
+    "repos/$REPO/pulls/$PR" --jq '.head.sha')" || live_head=""
   [ -n "$live_head" ] || { p4b_acct_mark_unposted "could not re-read live PR head before posting review"; p4b_die 3 "could not re-read live PR head before posting review"; }
   if [ "$live_head" != "$HEAD" ]; then
     # Late-window drift (#674 round-5 P2): a push landing during body or

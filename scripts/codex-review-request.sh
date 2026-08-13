@@ -225,6 +225,19 @@ if [ -r "$__CODEX_REQUEST_DIR/lib/codex-failure-markers.sh" ]; then
   CODEX_FAILURE_MARKERS_OK=true
 fi
 
+# --- scalar API reads that must fail closed (#799) --------------------------
+# Hard-required, unlike the marker lib above: the one call site is the
+# post-trigger timestamp that anchors every "is this review newer than my
+# trigger?" comparison, and its documented wall-clock fallback was dead. A
+# degraded mode here is a wrong anchor, not a lost feature. Declared as a
+# `requires:` of this script in .mergepath-sync.yml.
+if [ ! -r "$__CODEX_REQUEST_DIR/lib/gh-api-scalar.sh" ]; then
+  echo "[codex-review-request] ERROR: missing helper: $__CODEX_REQUEST_DIR/lib/gh-api-scalar.sh (see #799)" >&2
+  exit 3
+fi
+# shellcheck source=lib/gh-api-scalar.sh
+. "$__CODEX_REQUEST_DIR/lib/gh-api-scalar.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # #489: --trigger-only posts (or confirms) the @codex review trigger and
@@ -1095,7 +1108,15 @@ post_codex_trigger() {
   # wall-clock issue on nathanpaynedotcom propagation PR #180 round 4.
   TRIGGER_COMMENT_ID=$(echo "$POST_OUTPUT" | grep -oE 'issuecomment-[0-9]+' | head -1 | sed 's/issuecomment-//' || true)
   if [ -n "$TRIGGER_COMMENT_ID" ]; then
-    TRIGGER_POST_TIME=$(gh api "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID" --jq '.created_at' 2>/dev/null || true)
+    # #799: the wall-clock fallback immediately below was unreachable on a
+    # failed read. The error body is non-empty, so `[ -z ]` passed and a JSON
+    # blob became TRIGGER_POST_TIME — which is then compared as a STRING
+    # against ISO-8601 comment timestamps, and `{"message":…` sorts above
+    # every `2026-…`, so every Codex response would read as pre-trigger and
+    # the poll would run to timeout. `--shape timestamp` is what makes the
+    # fallback fire rather than merely making the blob emptier.
+    TRIGGER_POST_TIME=$(gh_api_scalar --shape timestamp "trigger comment $TRIGGER_COMMENT_ID timestamp" \
+      "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID" --jq '.created_at') || TRIGGER_POST_TIME=""
   fi
   if [ -z "$TRIGGER_POST_TIME" ]; then
     # Fallback: local wall-clock minus a 60-second buffer for

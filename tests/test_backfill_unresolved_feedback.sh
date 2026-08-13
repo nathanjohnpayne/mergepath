@@ -24,9 +24,13 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # Fixture tree: backfill.sh resolves enumerate.sh from its own dir and
 # resolve-pr-threads.sh from <root>/scripts, so mirror that layout.
 FR="$SCRATCH/repo"
-mkdir -p "$FR/scripts/sweep-unresolved-feedback"
+mkdir -p "$FR/scripts/sweep-unresolved-feedback" "$FR/scripts/lib"
 cp "$SRC" "$FR/scripts/sweep-unresolved-feedback/backfill.sh"
 chmod +x "$FR/scripts/sweep-unresolved-feedback/backfill.sh"
+# #799: the trusted-ref guard hard-sources gh-api-scalar.sh from <root>/scripts
+# /lib, so the fixture tree must carry the REAL lib. Stubbing it would make the
+# fail-closed assertion below test the stub instead of the shipped contract.
+cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$FR/scripts/lib/gh-api-scalar.sh"
 
 # Stub enumerate.sh: emit NDJSON for 2 distinct PRs (with one duplicate line
 # to prove de-duplication) to $SWEEP_OUTPUT.

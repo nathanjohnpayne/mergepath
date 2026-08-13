@@ -152,7 +152,19 @@ if [ "$MODE" = "resolve-verified-propagation" ] && [ "${MERGEPATH_BACKFILL_TRUST
   # stale origin/<branch> that still equals HEAD — either would pass a local
   # comparison while the verifier byte-compares consumers against non-canonical
   # source. gh api reads the true tip regardless of local remote config.
-  trusted_head=$(gh api "repos/$CANONICAL_REPO/commits/$trusted_branch" --jq '.sha' 2>/dev/null || true)
+  # #799: the emptiness guard below was dead — an unreadable response left the
+  # JSON error body in trusted_head, which compares unequal to local_head and
+  # so still refused, but the refusal message printed the blob as the
+  # canonical tip. Empty now means unread, and the message says so.
+  # gh-api-scalar is mergepath-only here (this pipeline is not propagated), so
+  # it is sourced from the local checkout with an explicit existence check.
+  if [ ! -r "$ROOT/scripts/lib/gh-api-scalar.sh" ]; then
+    echo "backfill: missing helper: $ROOT/scripts/lib/gh-api-scalar.sh (see #799)" >&2; exit 1
+  fi
+  # shellcheck source=../lib/gh-api-scalar.sh
+  . "$ROOT/scripts/lib/gh-api-scalar.sh"
+  trusted_head=$(gh_api_scalar --shape sha "$CANONICAL_REPO@$trusted_branch tip" \
+    "repos/$CANONICAL_REPO/commits/$trusted_branch" --jq '.sha') || trusted_head=""
   local_head=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)
   if [ -z "$local_head" ] || [ -z "$trusted_head" ] || [ "$local_head" != "$trusted_head" ]; then
     echo "backfill: --mode resolve-verified-propagation verifies against the LOCAL checkout's canonical source." >&2
