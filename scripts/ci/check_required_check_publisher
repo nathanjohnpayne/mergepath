@@ -169,10 +169,20 @@ fi
 #   - The DOCUMENT failing to parse is a defect → hard FAIL naming the
 #     parse error. Silently matching nothing would let a broken edit land
 #     green and surface only when Actions rejects the workflow.
+#
+# The SKIP line spells this wrapper's own name, per the S2 assertion in
+# tests/test_consumer_residue_safety.sh: this wrapper declares a consumer
+# gate, and the residue lattice reads the literal
+# `check_required_check_publisher: SKIP` out of its output to decide the
+# SKIP half of each verdict pair. A `SKIP: <reason>` line here would read
+# as RUN on both sides and hide the whole SKIP-ONLY divergence class. That
+# spelling is reserved for tooling skips inside tests/, which are not
+# verdicts. It is also the reason the trailer below reports SKIP rather
+# than PASS in this case: two verdict lines in one run would leave the
+# lattice reading a state the wrapper never actually reached.
+TIER_SKIPPED=0
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
-  echo "  SKIP: PyYAML unavailable — the #845 publisher assertions did NOT run."
-  echo "        Install PyYAML to enforce the publisher's trigger set, head"
-  echo "        bindings, producer eligibility and write ordering."
+  TIER_SKIPPED=1
 elif ! REQUIRED_CHECKS_PIN="$(printf '%s\n' "${PINNED_REQUIRED_CHECKS[@]}")" \
      python3 - "$PUBLISHER" "$PARENT_WORKFLOW" "$WORKFLOW_DIR" <<'PY'
 import os
@@ -763,6 +773,16 @@ fi
 if [ "$FAILED" -ne 0 ]; then
   echo "check_required_check_publisher: FAIL"
   exit 1
+fi
+
+# A tier that did not run must not report PASS: on the hub the only thing
+# that ran is the pinned-list reconciliation, and a green trailer would
+# claim enforcement the run never performed.
+if [ "$TIER_SKIPPED" -ne 0 ]; then
+  echo "check_required_check_publisher: SKIP (PyYAML unavailable — the #845 publisher assertions did NOT run)"
+  echo "      Install PyYAML to enforce the publisher's trigger set, head"
+  echo "      bindings, producer eligibility and write ordering."
+  exit 0
 fi
 
 echo "check_required_check_publisher: PASS"
