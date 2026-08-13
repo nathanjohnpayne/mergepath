@@ -19,7 +19,7 @@ Audited: 2026-06-17, against the FAQ, `configuration/auto-review`, `reference/co
 |---|---|---|---|
 | `reviews.profile` | `chill` | `chill` | Matches default; pinned + floor-enforced (template). #234/#237 rationale holds — see below. |
 | `reviews.request_changes_workflow` | `false` | `false` | Matches default; floor-enforced (must not be `true`). Codex is the blocking gate, not CodeRabbit. |
-| `reviews.auto_review.enabled` | `true` | `true` | Matches default; floor-enforced (must not be `false`). |
+| `reviews.auto_review.enabled` | `true` | `true` | Matches default; floor-enforced (must not be `false` **unless** paired with `coderabbit.enabled: false` in `.github/review-policy.yml` — see the safety-floor section). |
 | `reviews.auto_review.drafts` | `false` | `false` | Matches default. Draft PRs are intentionally skipped. |
 | `reviews.auto_review.auto_incremental_review` | `true` | `true` (now explicit) | Matches default; pinned explicitly so the fix-up-loop posture is legible. See below. |
 | `reviews.auto_review.auto_pause_after_reviewed_commits` | `5` | unset (inherits `5`) | **Owned by #490** — do not pin here. See below. |
@@ -126,8 +126,12 @@ Our entire fleet authors as the single shared identity **`nathanjohnpayne`**. So
 
 `scripts/ci/check_coderabbit_config` enforces, fleet-wide, the two keys whose drift would silently weaken or deadlock review:
 
-- `reviews.auto_review.enabled` must not be explicitly `false` (would turn CodeRabbit off while the file still exists), and
-- `reviews.request_changes_workflow` must not be explicitly `true` (would make CodeRabbit post CHANGES_REQUESTED and hard-block PRs on branch protection, deadlocking the Codex-gated merge automation).
+- `reviews.auto_review.enabled` must not be explicitly `false` **while `coderabbit.enabled` is still `true`/absent** in `.github/review-policy.yml` (a lone flip turns CodeRabbit off while the file still exists, so agents keep waiting on a bot that silently stopped reviewing), and
+- `reviews.request_changes_workflow` must not be explicitly `true` (would make CodeRabbit post CHANGES_REQUESTED and hard-block PRs on branch protection, deadlocking the Codex-gated merge automation). This one is unconditional — the deadlock happens regardless of intent, so no paired opt-out applies.
+
+### The paired opt-out (#911)
+
+The `auto_review.enabled` rule is a *silent-failure* floor, not a prohibition on opting out. `reviews.auto_review.enabled: false` paired with `coderabbit.enabled: false` in `.github/review-policy.yml` is a deliberate, explicit, reviewable opt-out: the review-policy key is exactly where agents read the CodeRabbit posture, so nothing is left waiting on a bot that will never post. `scripts/ci/check_coderabbit_config` accepts that pairing with a NOTE and exits 0; a **lone** flip (no paired policy opt-out) still FAILs exactly as before. Note that the pre-#911 remediation text ("delete `.coderabbit.yml`") was wrong on its own terms — `auto_review.enabled` defaults to `true` for an ABSENT config, so deleting the file does not disable CodeRabbit; only the review-policy key does.
 
 The audit confirms those two remain the right load-bearing floor:
 
