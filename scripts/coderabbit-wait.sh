@@ -1020,7 +1020,6 @@ crw_status_description_permits_clearance() {
 CRW_STATUS_RECORD_UNREADABLE='{"state":"unreadable","created_at":"","updated_at":"","description":""}'
 
 check_status_context_record() {
-  local resp
   # Pagination (CodeRabbit ⚠️ Minor @ line 267 on PR #224 round 2):
   # `/commits/{ref}/statuses` defaults to per_page=30 and returns
   # statuses in reverse chronological order. Without `--paginate`, a
@@ -1043,9 +1042,46 @@ check_status_context_record() {
   # "I am not reviewing this head at all", and the only place that says so is
   # the description string `Review rate limited`. Carried here so
   # crw_status_description_permits_clearance can read it at the fast path.
-  local resp out
-  resp=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null \
-    | jq -s 'add // []' 2>/dev/null) || {
+  #
+  # The gh DIAGNOSTIC is captured and logged (#963). It used to go to
+  # `2>/dev/null`, so a 401, a 403, a 5xx, a secondary rate limit and a DNS
+  # failure all collapsed into the same silent `unreadable` record. That cost
+  # nothing while an unreadable statuses read merely fell through to the
+  # comment-driven poll; #936 made it consequential —
+  # `crw_probe_head_review_in_progress` exits rc 3 on it and
+  # `p4b_barrier_class_coderabbit` classes rc 3 as `escalate`, which pages a
+  # human — so the one reader who now needs the cause was the one who could not
+  # see it.
+  #
+  # `fetch_api_array`'s `2>&1` cannot be copied verbatim here, which is the
+  # whole reason this was filed separately: that form merges gh's error text
+  # into the stdout stream, and this call's stdout is the JSON `jq` parses.
+  # Splitting the pipeline is what makes the capture possible — the fetch and
+  # the flatten become two status-checked steps with stderr routed to a temp
+  # file, so `jq` only ever sees the response body. The split is also a
+  # diagnostic gain on its own: a transport failure and a malformed page now
+  # report as different things instead of one shrug.
+  #
+  # A missing `mktemp` costs the detail, never the verdict: the status checks
+  # below decide, and they are unaffected. Same posture as
+  # scripts/lib/gh-api-scalar.sh.
+  local resp out raw rc=0 err_file="" detail=""
+  err_file=$(mktemp "${TMPDIR:-/tmp}/crw-statuses-err.XXXXXX" 2>/dev/null) || err_file=""
+  if [ -n "$err_file" ]; then
+    raw=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/statuses" 2>"$err_file") || rc=$?
+    detail=$(tr '\n' ' ' <"$err_file" 2>/dev/null || true)
+    rm -f "$err_file"
+  else
+    raw=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null) || rc=$?
+    detail='(stderr not captured: mktemp unavailable)'
+  fi
+  if [ "$rc" -ne 0 ]; then
+    log "ERROR: failed to read the CodeRabbit StatusContext statuses on $HEAD_SHA (gh rc=$rc): $detail"
+    printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"
+    return
+  fi
+  resp=$(printf '%s' "$raw" | jq -s 'add // []' 2>/dev/null) || {
+    log "ERROR: failed to flatten the statuses pagination output on $HEAD_SHA — the statuses surface is UNREAD"
     printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"
     return
   }
@@ -1331,6 +1367,28 @@ classify_comment() {
     echo "in_progress"
     return
   fi
+  # The `review` default is deliberate, and it is only safe because NO CALLER
+  # MAY REACH IT WITH AN UNREAD BODY (#957 acceptance criterion 3).
+  #
+  # This is a pure classifier over a body a caller has already obtained. It has
+  # no way to tell "" apart from a body CodeRabbit really wrote that matches no
+  # marker, so it cannot itself distinguish absence from failure — and `review`
+  # is the right answer for the case it CAN see, because CodeRabbit's ordinary
+  # terminal report matches none of the markers above (the two live bodies in
+  # #880/#849 open with a bare `<details>`). Making the default `unknown`
+  # instead would move the fail-open from here to every arm's `case`, where a
+  # new class silently falls through: it relocates the hazard rather than
+  # removing it.
+  #
+  # What made the default dangerous was the READERS, not the ladder: a failed
+  # `issues/{pr}/comments` read used to hand the poll loop an empty body, which
+  # graded `review` — the one class whose arm can emit a clearance — so a dead
+  # API did not stall the loop, it ADVANCED it to a verdict (#957, captured
+  # live on #936 head d361075). Every reader that feeds this function now
+  # reports an unreadable surface as rc 3 with nothing on stdout
+  # (`fetch_api_array` #831/#965, `latest_comment_from_issue_comments` and
+  # `newest_bot_comment_from_issue_comments` #959), and every caller checks it,
+  # so `""` no longer arrives here from a failed read at all.
   echo "review"
 }
 
@@ -1463,9 +1521,26 @@ summary_blocking_marker_present() {
 # Codex finding (P1, line 285). Inline findings are instead scanned
 # separately by count_potential_issues() only after this function
 # reports a PR-level terminal state.
+#
+# Return codes, and ALL call sites must honour all three (#959):
+#   0  the comment list was DECODED. Stdout is `{}` (nothing qualifying) or the
+#      selected comment object — always non-empty.
+#   3  the comment list could NOT be decoded. NOTHING on stdout.
+#
+# The rc-3 rung is the same one `summary_body_has_potential_issue_marker` and
+# `fetch_api_array` already carry, and it was the one reader on this path
+# without it. #936 hardened the FETCH here; the DECODE that follows it stayed
+# unchecked, so a payload the fetch's own `add // []` accepts but this jq
+# chokes on — a well-formed array whose elements are not comment objects — left
+# `latest` EMPTY with status 0. Empty is not `{}`: `echo "" | jq 'length'` runs
+# the filter zero times, printing nothing and exiting 0, so the callers'
+# `[ "$(… | jq 'length')" = "0" ]` guard — written for "no qualifying comment" —
+# does not fire for "could not read the comments". Control then fell through to
+# `classify_comment ""`, which grades `review`, the one class whose arm can
+# emit a clearance.
 latest_comment_from_issue_comments() {
   local issue_comments=$1
-  local latest
+  local latest projected
   latest=$(echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
     def status_probe_reply:
       ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
@@ -1477,13 +1552,29 @@ latest_comment_from_issue_comments() {
     ]
     | sort_by(.fresh_at)
     | last // null
-  ')
+  ') || {
+    log "ERROR: failed to decode the CodeRabbit comment list — the comments are UNREAD, not empty"
+    return 3
+  }
+
+  # `jq` exiting 0 with empty stdout is not a state this filter can reach
+  # (`last // null` always emits one value), so an empty `$latest` means the
+  # decode did not really happen. Refusing it is what keeps the emptiness
+  # inference at the callers honest rather than dead.
+  if [ -z "$latest" ]; then
+    log "ERROR: the CodeRabbit comment-list decode produced no value at all — treating the comments as UNREAD"
+    return 3
+  fi
 
   if [ "$latest" = "null" ]; then
     echo '{}'
-    return
+    return 0
   fi
-  echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}'
+  projected=$(echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}') || {
+    log "ERROR: failed to project the selected CodeRabbit comment — the comment is UNREAD, not absent"
+    return 3
+  }
+  printf '%s\n' "$projected"
 }
 
 scan_latest_comment() {
@@ -2016,9 +2107,16 @@ rate_limit_window_elapsed_seconds() {
 # Anchor-free on purpose: the caller below asks "what was CodeRabbit's LAST
 # WORD", a question the moving wall-clock freshness floor answers wrongly by
 # construction — see crw_active_rate_limit_notice.
+#
+# Same three-rung decode contract as latest_comment_from_issue_comments
+# (#959): rc 3, nothing on stdout, when the payload cannot be decoded. The
+# swallow mattered here for the mirror-image reason — this feeds
+# `crw_active_rate_limit_notice`, whose `|| return 1` reads "I could not decode
+# the comments" as "there is no active rate-limit notice", which is the
+# NON-suppressing answer.
 newest_bot_comment_from_issue_comments() {
   local issue_comments=$1
-  local latest
+  local latest projected
   latest=$(echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" '
     def status_probe_reply:
       ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
@@ -2029,12 +2127,23 @@ newest_bot_comment_from_issue_comments() {
     ]
     | sort_by(.fresh_at)
     | last // null
-  ')
+  ') || {
+    log "ERROR: failed to decode the CodeRabbit comment list while looking for its newest comment — the comments are UNREAD, not empty"
+    return 3
+  }
+  if [ -z "$latest" ]; then
+    log "ERROR: the newest-comment decode produced no value at all — treating the comments as UNREAD"
+    return 3
+  fi
   if [ "$latest" = "null" ]; then
     echo '{}'
-    return
+    return 0
   fi
-  echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}'
+  projected=$(echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}') || {
+    log "ERROR: failed to project the newest CodeRabbit comment — the comment is UNREAD, not absent"
+    return 3
+  }
+  printf '%s\n' "$projected"
 }
 
 # Seconds still remaining on the published window ride along ON the emitted
@@ -2097,7 +2206,10 @@ crw_active_rate_limit_notice() {
   if [ -z "$issue_comments" ]; then
     issue_comments=$(fetch_api_array_best_effort "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
   fi
-  latest=$(newest_bot_comment_from_issue_comments "$issue_comments")
+  # rc 3 propagates as rc 3, never as "no notice" (#959): this helper's rc 1
+  # means "CodeRabbit's last word is not an open rate-limit window", which
+  # RELEASES a suppression, and an unread comment list is no basis for that.
+  latest=$(newest_bot_comment_from_issue_comments "$issue_comments") || return 3
   [ "$(echo "$latest" | jq 'length')" != "0" ] || return 1
   body=$(echo "$latest" | jq -r '.body')
   [ "$(classify_comment "$body")" = "rate_limit" ] || return 1
@@ -2112,7 +2224,7 @@ crw_active_rate_limit_notice() {
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
   local issue_comments latest class comment_id comment_created_at comment_fresh_at comment_body
-  local active_notice active_id active_remaining
+  local active_notice active_id active_remaining active_rc
   # ONE fetch, shared by both checks below. Explicitly status-checked: a failed
   # fetch_api_array read reaches a caller only as a return status (#831), so an
   # unchecked read failure left the scan with empty input, every classifier
@@ -2123,7 +2235,19 @@ status_context_fast_path_blocked_by_comment() {
     return 0
   }
 
-  latest=$(latest_comment_from_issue_comments "$issue_comments")
+  # The DECODE is status-checked too, not only the fetch above (#959). #936
+  # hardened the fetch and left this line bare, so a payload that survives
+  # `add // []` and then breaks this jq left `latest` empty — which does NOT
+  # take the empty-comment branch below, because `echo "" | jq 'length'` prints
+  # nothing rather than `0`. Control reached `classify_comment ""`, which grades
+  # `review`, which the `rate_limit|paused|in_progress` case does not match, and
+  # the function returned 1 — "not blocked" — clearing the fast path on comment
+  # evidence nothing ever read. Same verdict as the failed fetch above, for the
+  # same reason: an unread comment list cannot rule out an adverse notice.
+  latest=$(latest_comment_from_issue_comments "$issue_comments") || {
+    log "StatusContext success suppressed: the issue-comments list could not be DECODED, so a pending rate-limit / paused / in-progress notice cannot be ruled out — keep polling (#959)"
+    return 0
+  }
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
     # #891/#912, and ONLY here. Nothing survived the wall-clock freshness
     # floor, so the arbitration below has no input at all — this is the one
@@ -2140,7 +2264,19 @@ status_context_fast_path_blocked_by_comment() {
     # and a window rule that ignores the status timestamp would override all
     # three, turning a genuinely-later success into a permanent suppression.
     # The defect is the notice going BLIND, not the arbitration being wrong.
-    if active_notice=$(crw_active_rate_limit_notice "$issue_comments"); then
+    #
+    # Three-way, not a boolean (#959). `crw_active_rate_limit_notice` returns 3
+    # when the comment list could not be READ, and an `if …; then` collapses
+    # that into its rc 1 — "there is no open window" — which is the releasing
+    # answer. Take the suppressing one instead: an unread list rules nothing
+    # out.
+    active_rc=0
+    active_notice=$(crw_active_rate_limit_notice "$issue_comments") || active_rc=$?
+    if [ "$active_rc" = "3" ]; then
+      log "StatusContext success suppressed: no CodeRabbit comment survived the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s freshness floor AND the comment list could not be read well enough to rule out an open rate-limit window — keep polling (#959)"
+      return 0
+    fi
+    if [ "$active_rc" = "0" ]; then
       active_id=$(echo "$active_notice" | jq -r '.id')
       active_remaining=$(echo "$active_notice" | jq -r '.rate_limit_remaining_seconds // "unknown"')
       log "StatusContext success suppressed because no CodeRabbit comment survived the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s freshness floor, but its newest comment id=$active_id is a rate-limit notice whose published window has NOT expired (${active_remaining}s remaining) — the published window governs for its full duration (#891/#912)"
@@ -2419,7 +2555,18 @@ find_status_probe_reply() {
 
 emit_terminal_review_after_probe_if_present() {
   local latest class potential_issues review_json summary_marker_rc
-  latest=$(scan_latest_comment_best_effort)
+  # Status-checked (#957/#959). "Best effort" governs the FETCH — an
+  # unreadable surface is not fatal on the timeout path — but the DECODE now
+  # reports rc 3, and an unchecked assignment would leave `latest` empty, skip
+  # the length guard exactly as at the fast path, and reach
+  # `classify_comment ""` = `review`, whose arm can `emit_json_and_exit
+  # "cleared" 0`. Declining to emit anything is the conservative answer here:
+  # this helper only ever UPGRADES a timeout into a verdict, so returning
+  # without one leaves the advisory exit 4 in place.
+  latest=$(scan_latest_comment_best_effort) || {
+    log "post-probe terminal-review check: the comment list could not be read — leaving the advisory timeout in place rather than grading an unread head"
+    return 0
+  }
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
     return 0
   fi
@@ -3112,7 +3259,7 @@ crw_probe_head_review_in_progress() {
 # posture — the status can only ever REFUSE a claim here, never make one.
 probe_emit_verdict() {
   local reviews review review_at issue_comments cand row body class ctx_record
-  local active_notice
+  local active_notice active_rc
   local summary sbody sjson sclass
   local summary_body="" newest_class="" rescan_done=false
 
@@ -3441,7 +3588,22 @@ probe_emit_verdict() {
   # it has not reviewed; report that rather than silence. Placed after the
   # static skip (which is the stronger "will never fire" claim) and after the
   # head-pinned summary branch (a completed review outranks an older notice).
-  if active_notice=$(crw_active_rate_limit_notice "$issue_comments"); then
+  #
+  # Three-way here too (#957 acceptance criterion 4 — the `--probe` path checked
+  # for the same shape). rc 3 is an unreadable comment list, and an `if …; then`
+  # collapses it into rc 1, "no open window", which falls through to
+  # `probe_not_yet "none"` — reporting `observed: none`, "CodeRabbit has said
+  # nothing", off a list nothing decoded. The verdict direction was already
+  # safe (not-yet, never a clearance), but `observed` is what the Phase 4b
+  # barrier classifies on, so the distinction is load-bearing there. rc 3 is the
+  # same escalation the probe already takes for an unreadable statuses read
+  # (#936), for the same reason.
+  active_rc=0
+  active_notice=$(crw_active_rate_limit_notice "$issue_comments") || active_rc=$?
+  if [ "$active_rc" = "3" ]; then
+    die 3 "could not read CodeRabbit's newest comment on $HEAD_SHA while checking for an open rate-limit window — a failed read is not evidence that CodeRabbit has said nothing, so the probe refuses to report on it (#957)"
+  fi
+  if [ "$active_rc" = "0" ]; then
     log "probe: no head evidence, and CodeRabbit's newest comment is a rate-limit notice with $(printf '%s' "$active_notice" | jq -r '.rate_limit_remaining_seconds // "unknown"')s left on its published window (#891/#912)"
     probe_not_yet "rate_limit" \
       "$(printf '%s' "$active_notice" | jq -c '{id, created_at, updated_at, fresh_at, endpoint, body_excerpt: ((.body // "")[0:200])}')"
@@ -3629,11 +3791,23 @@ while :; do
     # silently disarmed (`codex_failover_requested: false` on #909). Honor it as
     # THIS iteration's latest comment so the arm handles it exactly as it would
     # have while the notice was fresh.
-    if ACTIVE_RATE_LIMIT=$(crw_active_rate_limit_notice); then
+    #
+    # Read three-way here too (#959). The loop's behaviour on rc 3 is already
+    # the safe one — keep polling — but the LOG line was not: "no CodeRabbit
+    # comment yet" is a claim about the PR, and an operator reading it off a
+    # failed read looks for a silent bot rather than for a broken surface. The
+    # verdict is unchanged; only the diagnosis is.
+    ACTIVE_RATE_LIMIT_RC=0
+    ACTIVE_RATE_LIMIT=$(crw_active_rate_limit_notice) || ACTIVE_RATE_LIMIT_RC=$?
+    if [ "$ACTIVE_RATE_LIMIT_RC" = "0" ]; then
       log "no CodeRabbit comment inside the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s freshness window, but its newest comment is a rate-limit notice with $(printf '%s' "$ACTIVE_RATE_LIMIT" | jq -r '.rate_limit_remaining_seconds // "unknown"')s left on the published window — honoring it (#891/#912)"
       LATEST="$ACTIVE_RATE_LIMIT"
     else
-      log "no CodeRabbit comment yet (elapsed ${ELAPSED}s); sleeping ${POLL_INTERVAL_SECONDS}s"
+      if [ "$ACTIVE_RATE_LIMIT_RC" = "3" ]; then
+        log "could not read CodeRabbit's newest comment while checking for an open rate-limit window (elapsed ${ELAPSED}s) — this is an unread surface, NOT an absent comment; sleeping ${POLL_INTERVAL_SECONDS}s and retrying (#959)"
+      else
+        log "no CodeRabbit comment yet (elapsed ${ELAPSED}s); sleeping ${POLL_INTERVAL_SECONDS}s"
+      fi
       sleep_or_timeout "$POLL_INTERVAL_SECONDS"
       continue
     fi

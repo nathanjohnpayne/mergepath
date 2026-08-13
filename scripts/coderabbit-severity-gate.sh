@@ -532,8 +532,31 @@ function fence_update(l,   inf) {
 # that is OUTSIDE a fenced code block, dropping the fence delimiter lines
 # themselves. The line number is carried because the pre-merge strip has to map
 # its decision back onto the original body.
+#
+# CONTRACT (#942), the same two-rung one `fetch_api_array` (#831/#965) and
+# `gh_api_scalar` (#799/#971) already carry in this repo — deliberately the
+# same rc so this does not become a third notion of failure:
+#
+#   rc 0  — the body WAS read. The numbered lines are on stdout, and an empty
+#           stdout means the body genuinely has no unfenced line.
+#   rc 3  — the body could NOT be read (awk died). NOTHING is written to
+#           stdout; the diagnostic goes to stderr.
+#
+# The stdout suppression is what makes the emptiness meaningful again, and it
+# is the half that matters most here. Four callers capture this reader in a
+# command substitution, and #936 fixed the LAST of them by checking the status.
+# The other three inferred "the body says nothing" from empty output, so a dead
+# awk — a locale/encoding fault, a memory limit, a mawk-vs-gawk difference on a
+# pathological line — reached this REQUIRED gate's merge decision as "nothing
+# blocking here" and it exited 0 (#942). Streaming the awk output straight to
+# stdout is what made a partial read indistinguishable from a complete one, so
+# the output is captured first and only replayed on success.
+#
+# `die` deliberately does NOT appear here: every caller is a `$( )`, so a `die`
+# would exit only the subshell — the same trap the status swallow already is.
 summary_unfenced_numbered() {
-  printf '%s\n' "$1" | awk "$CR_AWK_FENCE_PRELUDE"'
+  local out
+  out=$(printf '%s\n' "$1" | awk "$CR_AWK_FENCE_PRELUDE"'
     {
       line = $0
       sub(/\r$/, "", line)
@@ -541,7 +564,13 @@ summary_unfenced_numbered() {
       if (FENCE) next
       printf "%d\t%s\n", NR, line
     }
-  '
+  ') || {
+    log "ERROR: the fence-aware summary reader failed on this body — the summary is UNREAD, not empty"
+    return 3
+  }
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  fi
 }
 
 # Emit one normalized line per STRUCTURAL stanza OPENER in the body.
@@ -572,8 +601,14 @@ summary_unfenced_numbered() {
 # bodies carry both forms (mergepath#874's summary has three openers and two
 # closers), and counting closers made the total depend on which stanza kinds
 # happen to be wrapped.
+#
+# Carries the reader's rc-3 rung through unchanged (#942): "I could not read
+# this body" is not "this body has no stanza openers", and every predicate
+# built on top of this one has to be able to tell them apart.
 summary_stanza_opener_lines() {
-  summary_unfenced_numbered "$1" | sed 's/^[0-9]*	//' | awk '
+  local numbered out
+  numbered=$(summary_unfenced_numbered "$1") || return 3
+  out=$(printf '%s\n' "$numbered" | sed 's/^[0-9]*	//' | awk '
     {
       line = $0
       sub(/[ \t]+$/, "", line)
@@ -581,7 +616,13 @@ summary_stanza_opener_lines() {
         print line
       }
     }
-  '
+  ') || {
+    log "ERROR: the stanza-opener scan failed on this summary body — the summary is UNREAD, not stanza-free"
+    return 3
+  }
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  fi
 }
 
 # True when the body carries at least one outcome stanza AND every stanza is
@@ -592,15 +633,45 @@ summary_stanza_opener_lines() {
 # pass vacuously. ALLOW-list, not deny-list: a KIND CodeRabbit has not shipped
 # yet reads as not-a-report, never as clean, including one containing angle
 # brackets (`failure <head-changed>`), which the `.*` KIND span still matches.
+#
+# THREE states, not two (#942). The read status used to be swallowed by the
+# `$( )`, which manufactured the zero-stanza state the `-gt 0` guard is
+# watching for out of an infrastructure failure rather than out of the body —
+# and the caller then logged the specific, WRONG diagnosis "carries a
+# non-benign outcome stanza" for a body it had simply failed to read:
+#
+#   rc 0  every stanza present is benign — a completed marker-format report
+#   rc 1  not a completed report (zero stanzas, or at least one non-benign)
+#   rc 3  the body could NOT be read; the caller must HOLD, never drop the
+#         summary out of scope
 summary_stanzas_all_benign() {
-  local openers total benign
-  openers=$(summary_stanza_opener_lines "$1")
+  local openers total benign grc
+  openers=$(summary_stanza_opener_lines "$1") || return 3
   [ -n "$openers" ] || return 1
-  # `|| true` on both: grep exits 1 on no match, which `set -o pipefail` would
-  # promote to a failed assignment. `grep -c` still prints 0, which is the
-  # answer we want.
-  total=$(printf '%s\n' "$openers" | grep -c . || true)
-  benign=$(printf '%s\n' "$openers" | grep -ciE "$CR_SUMMARY_BENIGN_STANZA_RE" || true)
+  # The counters are READERS too, and `|| true` is rc-BLIND: it cannot tell
+  # grep's no-match (rc 1, the only status it was ever meant to absorb, on
+  # which `grep -c` still prints the 0 this wants) from grep's own ERROR
+  # (rc >= 2 — an invalid multibyte sequence or a bad locale, which is one of
+  # the production causes #942 names for the awk death). On an error grep
+  # prints NOTHING, so `total` came back empty, `${total:-0}` manufactured the
+  # zero-stanza state the `-gt 0` guard is watching for, and this predicate
+  # returned 1 — the caller then logged the specific, WRONG diagnosis "carries
+  # a non-benign outcome stanza" about a body it had failed to search and the
+  # required gate cleared. That is exactly the misdiagnosis #942's acceptance
+  # criterion 2 forbids, so the rc-3 rung has to cover the search as well as
+  # the read.
+  grc=0
+  total=$(printf '%s\n' "$openers" | grep -c .) || grc=$?
+  if [ "$grc" -gt 1 ]; then
+    log "ERROR: counting the outcome-stanza openers failed on this summary body — the summary is UNSEARCHED, not stanza-free"
+    return 3
+  fi
+  grc=0
+  benign=$(printf '%s\n' "$openers" | grep -ciE "$CR_SUMMARY_BENIGN_STANZA_RE") || grc=$?
+  if [ "$grc" -gt 1 ]; then
+    log "ERROR: grading the outcome-stanza openers against the benign allow-list failed on this summary body — the summary is UNSEARCHED, not non-benign"
+    return 3
+  fi
   [ "${total:-0}" -gt 0 ] && [ "$total" = "$benign" ]
 }
 
@@ -619,13 +690,27 @@ summary_stanzas_all_benign() {
 # genuine run body. The question the run-object acceptors need is the narrower
 # one: did CodeRabbit itself declare this publication a non-review? Zero stanzas
 # is not such a declaration; a `rate limited` stanza is.
+#
+# Same three-rung contract as summary_stanzas_all_benign (rc 3 = unreadable),
+# and here the swallow was the more dangerous of the two: this predicate is
+# read through a `!` at its call site, so an unreadable body came back as
+# "no non-benign stanza" and the run was ACCEPTED as a recognised summary.
 summary_has_non_benign_stanza() {
-  local openers nonbenign
-  openers=$(summary_stanza_opener_lines "$1")
+  local openers nonbenign grc
+  openers=$(summary_stanza_opener_lines "$1") || return 3
   [ -n "$openers" ] || return 1
-  # `|| true` for the same `set -o pipefail` reason as above: `grep -vc` exits 1
-  # when every line matches, while still printing the 0 this wants.
-  nonbenign=$(printf '%s\n' "$openers" | grep -vciE "$CR_SUMMARY_BENIGN_STANZA_RE" || true)
+  # Same rc split as above, and the same reason `|| true` cannot make it:
+  # `grep -vc` exits 1 when every line matches (still printing the 0 this
+  # wants) and >= 2 on its own error, printing nothing. Here the swallow was
+  # the worse of the two, because this predicate is read through a `!` at its
+  # call site: an unsearched body came back as "no non-benign stanza" and the
+  # run was ACCEPTED as a recognised summary.
+  grc=0
+  nonbenign=$(printf '%s\n' "$openers" | grep -vciE "$CR_SUMMARY_BENIGN_STANZA_RE") || grc=$?
+  if [ "$grc" -gt 1 ]; then
+    log "ERROR: grading the outcome-stanza openers against the benign allow-list failed on this summary body — the summary is UNSEARCHED, so whether it declares a non-review is unknown"
+    return 3
+  fi
   [ "${nonbenign:-0}" -gt 0 ]
 }
 
@@ -657,8 +742,31 @@ summary_names_head() {
   # without notice, and if it did, the range would stop being found, the summary
   # would fall out of scope, and its findings would go ungated. That is a false
   # CLEAR bought with precision, which is the wrong trade for a required gate.
-  ranges=$(summary_unfenced_numbered "$1" | sed 's/^[0-9]*	//' \
-    | grep -oiE 'between [0-9a-f]{40} and [0-9a-f]{40}' || true)
+  #
+  # Three rungs, as above (#942): rc 3 is "I could not read this body", which
+  # the `|| true` used to flatten into rc 1, "this body names no commits
+  # range" — i.e. into "not this head's report", which drops the summary and
+  # clears the gate.
+  #
+  # The commits-range grep below carries the same rung for the same reason.
+  # `|| true` is rc-BLIND — it absorbs grep's no-match (rc 1) and grep's own
+  # ERROR (rc >= 2, reachable on an invalid multibyte sequence or a bad
+  # locale) identically, and on an error grep prints nothing, so `ranges` came
+  # back empty and this returned 1: "not this head's report", from a body that
+  # was never searched. Statuses are captured explicitly rather than absorbed.
+  local numbered stripped grc
+  numbered=$(summary_unfenced_numbered "$1") || return 3
+  stripped=$(printf '%s\n' "$numbered" | sed 's/^[0-9]*	//') || {
+    log "ERROR: could not strip line numbers off the summary body while looking for its commits range — the summary is UNREAD"
+    return 3
+  }
+  grc=0
+  ranges=$(printf '%s\n' "$stripped" \
+    | grep -oiE 'between [0-9a-f]{40} and [0-9a-f]{40}') || grc=$?
+  if [ "$grc" -gt 1 ]; then
+    log "ERROR: the commits-range scan failed on this summary body — the summary is UNSEARCHED, not range-free"
+    return 3
+  fi
   [ -n "$ranges" ] || return 1
   # Hex is case-insensitive; GitHub renders shas lowercase but the comparison
   # must not depend on that, or an uppercase range would silently drop this
@@ -696,11 +804,22 @@ EOF
 # The pairing rule is unchanged and still load-bearing: strip only a START that
 # has an END AFTER it. With presence alone checked, a stray START (or an END
 # rendered first) latches the suppressor and drops everything to EOF.
+#
+# rc 3 when the body could not be read (#942). The fail DIRECTION of a
+# swallowed read is milder here than at the other two sites — an unread body
+# yields no pair, the strip becomes a no-op, and the un-stripped body reaches
+# the classifier, which can only ADD findings — but "milder" is not a contract.
+# Silently skipping the suppressor means the gate grades the pre-merge check
+# table's hygiene `⚠️ Warning` rows as code findings and reports a blocking
+# summary finding that CodeRabbit never made, which under `enforce_admins:
+# true` is a red with no honest ack to write. Say "unread" and let the caller
+# decide.
 summary_strip_pre_merge_block() {
-  local body=$1 pair
+  local body=$1 pair numbered stripped
+  numbered=$(summary_unfenced_numbered "$body") || return 3
   # Emit "<start_line> <end_line>" for the first structural START that is
   # followed by a structural END, or nothing at all.
-  pair=$(summary_unfenced_numbered "$body" | awk -F'\t' \
+  pair=$(printf '%s\n' "$numbered" | awk -F'\t' \
     -v s="$CR_PRE_MERGE_BLOCK_START" -v e="$CR_PRE_MERGE_BLOCK_END" '
     {
       n = $1
@@ -709,9 +828,32 @@ summary_strip_pre_merge_block() {
       if (line == s && !have_s) { have_s = 1; sl = n; next }
       if (line == e && have_s) { print sl " " n; exit }
     }
-  ')
+  ') || {
+    log "ERROR: the pre-merge-block scan failed on this summary body — the summary is UNREAD, so the check table cannot be located"
+    return 3
+  }
   if [ -n "$pair" ]; then
-    printf '%s\n' "$body" | awk -v sl="${pair% *}" -v el="${pair#* }" 'NR < sl || NR > el'
+    # The STRIP is a reader too, and it was the last unchecked one in this
+    # function: its output IS this function's return value, so a dead awk here
+    # produced an empty SUMMARY_SCAN and the caller's `[ -n "$SUMMARY_SCAN" ]`
+    # skipped the entire grading block — a required gate cleared on a body
+    # carrying a 🟠 Major, which is the very defect #942 exists to close, one
+    # line below the two reads above it.
+    #
+    # errexit does NOT rescue a streamed pipeline here, which is why the
+    # status is captured rather than left to `set -e`. The sole call site is
+    # `SUMMARY_SCAN=$(summary_strip_pre_merge_block "$SUMMARY_BODY") || die 2`,
+    # and errexit is suppressed inside a command substitution on the left of an
+    # `||` list: a dying awk that has already emitted a partial stream yields
+    # rc 0 and that partial output, uncaught (probed on bash 3.2).
+    stripped=$(printf '%s\n' "$body" \
+      | awk -v sl="${pair% *}" -v el="${pair#* }" 'NR < sl || NR > el') || {
+      log "ERROR: the pre-merge-block strip failed on this summary body — the summary is UNREAD, so the check table could not be removed"
+      return 3
+    }
+    if [ -n "$stripped" ]; then
+      printf '%s\n' "$stripped"
+    fi
     return 0
   fi
   printf '%s' "$body"
@@ -853,15 +995,38 @@ HEAD_REVIEW_RUN_IDS=$(echo "$HEAD_REVIEW_RUNS_JSON" | jq -r \
 # versa. Scope each independently, then classify every current candidate below.
 SUMMARY_CANDIDATES='[]'
 if [ "$MARKER_SUMMARY_ID" != "0" ]; then
-  if ! summary_stanzas_all_benign "$MARKER_SUMMARY_BODY"; then
+  # Both scope predicates are read as THREE-way (#942), never as booleans. The
+  # `if ! …` / `elif ! …` shape collapsed each helper's rc 3 (body UNREADABLE)
+  # into rc 1 (body says no), and rc 1 here means "not this head's completed
+  # report" — which drops the summary out of scope entirely, so the graded
+  # pipeline's own #936 guard is never reached and the gate prints
+  # `CodeRabbit blocking-tier unresolved: 0`. That is strictly worse than the
+  # site #936 fixed, because it fires EARLIER.
+  #
+  # Exit 2, the config/infra code this gate already uses for "cannot decide",
+  # and the log names the unread body rather than asserting a diagnosis about
+  # its contents. The old messages did assert one — "carries a non-benign
+  # outcome stanza" for a body carrying no such stanza — which sends an
+  # operator looking for a CodeRabbit rate limit instead of a broken read.
+  MARKER_BENIGN_RC=0
+  summary_stanzas_all_benign "$MARKER_SUMMARY_BODY" || MARKER_BENIGN_RC=$?
+  MARKER_NAMES_HEAD_RC=0
+  if [ "$MARKER_BENIGN_RC" = "3" ]; then
+    die 2 "could not READ the PR-level summary (comment id $MARKER_SUMMARY_ID) while classifying its outcome stanzas — an unread summary is not a non-report, and refusing to drop it from scope is the only answer that cannot clear this gate on a summary nobody read"
+  elif [ "$MARKER_BENIGN_RC" != "0" ]; then
     log "PR-level summary (comment id $MARKER_SUMMARY_ID) carries a non-benign outcome stanza (rate limit / failure / in progress) — not a completed report, no summary findings in scope"
-  elif ! summary_names_head "$MARKER_SUMMARY_BODY" "$HEAD_SHA"; then
-    log "PR-level summary (comment id $MARKER_SUMMARY_ID) does not name $HEAD_SHA as its commits-range end — not this head's report, no summary findings in scope"
   else
-    SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c \
-      --argjson id "$MARKER_SUMMARY_ID" --arg body "$MARKER_SUMMARY_BODY" \
-      --arg fresh_at "$MARKER_SUMMARY_FRESH_AT" \
-      '. + [{id: $id, body: $body, scope: "commits-range", fresh_at: $fresh_at}]')
+    summary_names_head "$MARKER_SUMMARY_BODY" "$HEAD_SHA" || MARKER_NAMES_HEAD_RC=$?
+    if [ "$MARKER_NAMES_HEAD_RC" = "3" ]; then
+      die 2 "could not READ the PR-level summary (comment id $MARKER_SUMMARY_ID) while looking for its commits range — an unread summary is not a stale one, and dropping it out of scope would clear this gate on a summary nobody read"
+    elif [ "$MARKER_NAMES_HEAD_RC" != "0" ]; then
+      log "PR-level summary (comment id $MARKER_SUMMARY_ID) does not name $HEAD_SHA as its commits-range end — not this head's report, no summary findings in scope"
+    else
+      SUMMARY_CANDIDATES=$(echo "$SUMMARY_CANDIDATES" | jq -c \
+        --argjson id "$MARKER_SUMMARY_ID" --arg body "$MARKER_SUMMARY_BODY" \
+        --arg fresh_at "$MARKER_SUMMARY_FRESH_AT" \
+        '. + [{id: $id, body: $body, scope: "commits-range", fresh_at: $fresh_at}]')
+    fi
   fi
 fi
 
@@ -927,9 +1092,28 @@ while IFS= read -r cr_run_json; do
   if printf '%s' "$cr_run_json" \
       | jq -e --arg re "$CR_MARKERLESS_FULL_REVIEW_RE" '.body | test($re)' >/dev/null; then
     cr_run_recognised_by='markerless-result-line'
-  elif summary_names_head "$cr_run_body" "$HEAD_SHA" \
-      && ! summary_has_non_benign_stanza "$cr_run_body"; then
-    cr_run_recognised_by='own-commits-range'
+  else
+    # Acceptor 2, read three-way (#942). The `&& ! …` conjunction was the worst
+    # of the swallowed-status sites in this file because the two operands fail
+    # in OPPOSITE directions: an unreadable body makes summary_names_head look
+    # like "not this head" (the run is skipped, which can strand the gate on
+    # the publication HOLD), while the NEGATED summary_has_non_benign_stanza
+    # turns the same unreadable body into "no refusal stanza" — i.e. this run
+    # gets ACCEPTED as a recognised summary and then graded, from a body no
+    # reader ever got through.
+    cr_names_head_rc=0
+    summary_names_head "$cr_run_body" "$HEAD_SHA" || cr_names_head_rc=$?
+    cr_nonbenign_rc=0
+    if [ "$cr_names_head_rc" = "3" ]; then
+      die 2 "could not READ the body of CodeRabbit review run $(printf '%s' "$cr_run_json" | jq -r '.id') while looking for its own commits range — refusing to decide whether it reports on $HEAD_SHA from a body nobody read"
+    elif [ "$cr_names_head_rc" = "0" ]; then
+      summary_has_non_benign_stanza "$cr_run_body" || cr_nonbenign_rc=$?
+      if [ "$cr_nonbenign_rc" = "3" ]; then
+        die 2 "could not READ the body of CodeRabbit review run $(printf '%s' "$cr_run_json" | jq -r '.id') while checking it for a refusal stanza — refusing to accept an unread body as a completed report"
+      elif [ "$cr_nonbenign_rc" != "0" ]; then
+        cr_run_recognised_by='own-commits-range'
+      fi
+    fi
   fi
   [ -n "$cr_run_recognised_by" ] || continue
   HEAD_SUMMARY_RUNS_JSON=$(echo "$HEAD_SUMMARY_RUNS_JSON" | jq -c \
@@ -1210,7 +1394,11 @@ while IFS= read -r SUMMARY_JSON; do
     # commits-range predicates: neither exists in this legitimate shape.
     log "PR-level markerless full-review summary (comment id $SUMMARY_ID) is anchored by a fresh completed CodeRabbit review object on $HEAD_SHA"
   fi
-  SUMMARY_SCAN=$(summary_strip_pre_merge_block "$SUMMARY_BODY")
+  # Status-checked for the same reason as the graded read below (#942): the
+  # strip is a reader too, and a `$( )` that swallows its status turns a dead
+  # awk into a silently-skipped suppressor.
+  SUMMARY_SCAN=$(summary_strip_pre_merge_block "$SUMMARY_BODY") \
+    || die 2 "failed to read the PR-level summary (comment id $SUMMARY_ID) while locating its pre-merge check table — refusing to grade a summary this gate could not read"
   if [ -n "$SUMMARY_SCAN" ]; then
   SUMMARY_BLOCKING_BEFORE=$(echo "$SUMMARY_BLOCKING" | jq 'length')
   # Classify UNFENCED lines only (Phase 4b P2 on #886, and Codex's earlier P2 —

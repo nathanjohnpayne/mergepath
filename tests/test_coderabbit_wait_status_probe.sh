@@ -2330,6 +2330,36 @@ test_936_unreadable_status_is_not_an_absent_status() {
     sed 's/^/      /' "$dir4/err.log" >&2 || true
   fi
 
+  # #963 — the CAUSE, not only the consequence. Route 1's message is accurate
+  # about what the run refuses to do and silent about why: `2>/dev/null` on the
+  # statuses read collapsed a 401, a 403, a 5xx, a secondary rate limit and a
+  # DNS failure into one wordless `unreadable`. That cost nothing while the
+  # failure merely fell through to the comment-driven poll; #936 made it
+  # consequential (rc 3 here → `escalate` at the Phase 4b barrier → a paged
+  # human), so the one reader who now needs the cause was the one who could not
+  # see it.
+  #
+  # Asserted on the STUB'S OWN stderr text, which appears nowhere else in the
+  # run, so the assertion cannot be satisfied by any other log line. Route 1's
+  # dir is reused deliberately: this is the same run, re-read for a different
+  # property, which is what makes it a diagnostic-quality claim about the
+  # existing verdict rather than a new verdict.
+  if grep -q 'simulated statuses endpoint failure' "$dir/err.log"; then
+    pass "#963: the failed statuses read surfaces gh's own diagnostic, so the rc-3 escalation names a cause"
+  else
+    fail "#963: the gh stderr from the failing statuses endpoint never reached the log — the rc-3 escalation still names no cause"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+  # …and the split that makes the capture possible must not have leaked that
+  # text onto the stream `jq` parses. If it had, the record would not be the
+  # `unreadable` one route 1 just asserted, so this pins the constraint the
+  # issue names: stderr captured SEPARATELY, stdout left clean for the parser.
+  if grep -q 'simulated statuses endpoint failure' "$dir/out.json" 2>/dev/null; then
+    fail "#963: gh's stderr reached stdout — the capture merged the streams that must stay separate"
+  else
+    pass "#963: the captured diagnostic stayed off stdout, so the statuses JSON reaching jq is unpolluted"
+  fi
+
   # Control B — the escape hatch. The read is trust-gated like every other
   # status read here, so trust_status_context_for_clearance: false must never
   # reach the endpoint at all, failing or not.
