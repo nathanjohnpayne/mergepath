@@ -328,17 +328,25 @@ EXPECTED_CONCURRENCY_KEYS = {"group", "cancel-in-progress"}
 # shell interpreted, not matched. The site-and-count fence is what keeps a
 # NEW binding from arriving unexamined.
 #
-# The event-side half of A2 is the two step `env:` bindings the shell
-# expansions below resolve to, and it is the only half decided over the
-# parsed document. Pinned per job as REQUIRED-AND-EXACT rather than checked
-# where present: an assertion that fires only where the key already exists
-# is disarmed by deleting the key, and the shell-side allowlist cannot cover
-# that gap — the POST would still name an allowlisted variable, now unset,
-# the site count would be unchanged, and every context would be published on
-# an empty head_sha.
+# The event-side half of A2 is the two consuming steps' `env:` bindings that
+# their shell expansions resolve to, and it is the only half decided over the
+# parsed document. Pinning the consuming step matters: a correct binding on
+# an unrelated no-op step does not reach the Checks-API POST, but a job-wide
+# scan would still pass. Bindings are REQUIRED-AND-EXACT rather than checked
+# where present: an assertion that fires only where the key already exists is
+# disarmed by deleting the key, and the shell-side allowlist cannot cover that
+# gap — the POST would still name an allowlisted variable, now unset, the site
+# count would be unchanged, and every context would be published on an empty
+# head_sha.
 REQUIRED_HEAD_ENV = {
-    OPEN_JOB: {"HEAD_SHA": "${{ github.event.workflow_run.head_sha }}"},
-    PUBLISH_JOB: {"RUN_HEAD": "${{ github.event.workflow_run.head_sha }}"},
+    OPEN_JOB: (
+        "Open pending entries on the event head",
+        {"HEAD_SHA": "${{ github.event.workflow_run.head_sha }}"},
+    ),
+    PUBLISH_JOB: (
+        "Resolve targets, evaluate gates, publish",
+        {"RUN_HEAD": "${{ github.event.workflow_run.head_sha }}"},
+    ),
 }
 # Shell expansions a head_sha binding may name: the two event bindings
 # above and the loop/parameter variables the pass derives from the
@@ -626,7 +634,7 @@ if isinstance(triggers, dict):
             "      parent's own top-level name:, not against a string in this check.")
     if not parent_loaded:
         pass  # already reported above; a second failure would just be noise
-    elif parent_name is None or not str(parent_name).strip():
+    elif not isinstance(parent_name, str) or not parent_name.strip():
         bad("FAIL: [rcp parent name] %s declares no usable top-level name:"
             % PARENT_WORKFLOW,
             "      (read as %r). Actions then names that workflow after its PATH," % parent_name,
@@ -635,7 +643,14 @@ if isinstance(triggers, dict):
             "      workflow that never fires looks identical to one that fires and",
             "      finds nothing to do. A missing parent name: must trip this",
             "      assertion, not disarm it.")
-    elif list(listed or []) != [parent_name]:
+    elif (not isinstance(listed, list) or len(listed) != 1
+          or not isinstance(listed[0], str)):
+        bad("FAIL: [rcp parent name] workflow_run.workflows is %r, not a list"
+            % listed,
+            "      containing exactly one workflow-name string. Actions requires a",
+            "      scalar top-level name: and a list of scalar workflow names; a",
+            "      matching pair of non-scalar YAML values cannot deliver this chain.")
+    elif listed != [parent_name]:
         bad("FAIL: [rcp parent name] workflow_run.workflows is %r but %s"
             % (listed, PARENT_WORKFLOW),
             "      declares name: %r. ONE parent is deliberate — the Merge" % parent_name,
@@ -789,31 +804,34 @@ for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
 for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
     if job is None:
         continue
-    for name, want in REQUIRED_HEAD_ENV[key].items():
-        seen = []
-        for step in job.get("steps") or []:
-            if not isinstance(step, dict):
-                continue
-            env = step.get("env")
-            if isinstance(env, dict) and name in env:
-                seen.append(env[name])
-        if not seen:
-            bad("FAIL: [rcp head binding] job %r declares no %s step env binding."
-                % (key, name),
-                "      PRESENCE is pinned, not only the value: an assertion that fires",
-                "      solely where the key already exists is disarmed by deleting the",
-                "      key — the A6 defect, in a second place — and the shell-side",
-                "      allowlist cannot cover the gap, because the POST would still name",
-                "      an allowlisted variable, now unset, and publish every context on",
-                "      an empty head_sha.")
-        for got in seen:
-            if str(got) != want:
-                bad("FAIL: [rcp head binding] job %r binds %s to %r, not %r."
-                    % (key, name, got, want),
-                    "      On a workflow_run run github.sha is the DEFAULT BRANCH's last",
-                    "      commit. One wrong binding here makes all three required",
-                    "      contexts absent on every PR head, fleet-wide, permanently —",
-                    "      with no partial degradation to warn anyone (#845 risks).")
+    step_name, bindings = REQUIRED_HEAD_ENV[key]
+    matching_steps = [
+        step for step in (job.get("steps") or [])
+        if isinstance(step, dict) and step.get("name") == step_name
+    ]
+    if len(matching_steps) != 1:
+        bad("FAIL: [rcp head binding] job %r has %d steps named %r; exactly one"
+            % (key, len(matching_steps), step_name),
+            "      consuming step is required so its head binding cannot be moved to",
+            "      an unrelated step while the Checks-API POST receives an empty value.")
+        continue
+    env = matching_steps[0].get("env")
+    for name, want in bindings.items():
+        if not isinstance(env, dict) or name not in env:
+            bad("FAIL: [rcp head binding] job %r consuming step %r declares no %s"
+                % (key, step_name, name),
+                "      env binding. PRESENCE is pinned on the step that expands it, not",
+                "      somewhere else in the job: an allowlisted shell variable that is",
+                "      unset at the POST publishes every context on an empty head_sha.")
+            continue
+        got = env[name]
+        if str(got) != want:
+            bad("FAIL: [rcp head binding] job %r binds %s to %r, not %r."
+                % (key, name, got, want),
+                "      On a workflow_run run github.sha is the DEFAULT BRANCH's last",
+                "      commit. One wrong binding here makes all three required",
+                "      contexts absent on every PR head, fleet-wide, permanently —",
+                "      with no partial degradation to warn anyone (#845 risks).")
 
 head_bindings = [
     value

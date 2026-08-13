@@ -3148,6 +3148,25 @@ rcp_parent_case() {  # <name> <perl-program-on-parent> <expect> [needle]
   rcp_verdict "$name" "$rc" "$expect" "$want" "$f.out"
 }
 
+# <name> <perl-program-on-publisher> <perl-program-on-parent> <expect> [needle]
+# Mutates both halves of a cross-file assertion. A fixture that only changes
+# one side cannot prove type validation: the old Python comparison accepted a
+# list-valued parent name only when the publisher carried the matching nested
+# list too.
+rcp_parent_pair_case() {
+  local name="$1" pub_prog="$2" parent_prog="$3" expect="$4" want="${5:-}" f p rc
+  f="$RCP_DIR/wf-$name.yml"
+  p="$RCP_DIR/parent-$name.yml"
+  perl -0777 -pe "$pub_prog" "$RCP_WF" > "$f"
+  perl -0777 -pe "$parent_prog" "$RCP_WFDIR/merge-clearance-gate.yml" > "$p"
+  if cmp -s "$RCP_WF" "$f" || cmp -s "$RCP_WFDIR/merge-clearance-gate.yml" "$p"; then
+    fail "#845 rcp case $name: a paired mutation changed nothing — anchor drifted"
+    return
+  fi
+  rc=$(rcp_run "$f" "$RCP_WFDIR" "$p")
+  rcp_verdict "$name" "$rc" "$expect" "$want" "$f.out"
+}
+
 # The needle is the MISSING-name message, not the bare `[rcp parent name]`
 # tag, because the tag alone does not discriminate: a blank name already
 # tripped the rename comparison, and a case that accepts either message
@@ -3161,6 +3180,20 @@ rcp_parent_case parent-name-missing 's{^name: Merge Clearance Gate\n}{}m' \
 # the wrong cause and sends a maintainer looking for a mismatch.
 rcp_parent_case parent-name-blank 's{^name: Merge Clearance Gate$}{name: ""}m' \
   fail 'declares no usable top-level name:'
+# Actions requires a scalar parent name and a list of scalar workflow names.
+# The old `list(listed) == [parent_name]` comparison accepted matching nested
+# lists, even though that trigger cannot deliver the publisher at all.
+rcp_parent_pair_case parent-name-nonscalar \
+  's{workflows: \["Merge Clearance Gate"\]}{workflows: [[Merge Clearance Gate]]}' \
+  's{^name: Merge Clearance Gate$}{name: [Merge Clearance Gate]}m' \
+  fail 'declares no usable top-level name:'
+# `workflows:` itself must be a list of strings. A one-character scalar name
+# was another old false clear: `list("M") == ["M"]` held even though Actions
+# treats the scalar as an invalid trigger value.
+rcp_parent_pair_case workflow-name-not-list \
+  's{workflows: \["Merge Clearance Gate"\]}{workflows: M}' \
+  's{^name: Merge Clearance Gate$}{name: M}m' \
+  fail 'not a list'
 # The third outcome, and the regression guard for the round-1 fix: an
 # UNREADABLE parent must report the load failure and NOT also report a
 # missing name. Tracking the load outcome separately from the name it
@@ -3189,7 +3222,13 @@ rcp_case head-env-publish \
 # open every hold on an empty head_sha.
 rcp_case head-env-absent \
   's{^          HEAD_SHA: \$\{\{ github.event.workflow_run.head_sha \}\}\n}{}m' \
-  fail 'declares no HEAD_SHA step env binding'
+  fail 'declares no HEAD_SHA'
+# A binding on an unrelated step does not reach the shell that POSTS the
+# check run. A job-wide scan accepted this relocation, so the canonical
+# consuming step is now part of the assertion's scope.
+rcp_case head-env-relocated \
+  's{(      - name: Open pending entries on the event head\n)}{      - name: Decoy head binding\n        env:\n          HEAD_SHA: \$\{\{ github.event.workflow_run.head_sha \}\}\n        run: echo decoy\n$1}s; s{(      - name: Open pending entries on the event head\n.*?\n)          HEAD_SHA: [^\n]*\n}{$1}sm' \
+  fail 'consuming step'
 # A denylist of wrong spellings does not terminate (#849): this case uses a
 # binding that is neither github.sha nor any spelling a denylist would carry,
 # and it must still be refused for being off-allowlist.
