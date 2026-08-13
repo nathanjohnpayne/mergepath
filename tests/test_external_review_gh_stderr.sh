@@ -324,6 +324,19 @@ else
   fail "#799: unexpected --shape any behaviour (rc=$SC_RC out='$SC_OUT')"
 fi
 
+# 10b. The status check carrying a case ON ITS OWN. Cases 7 and 9 are both
+#     also caught by --shape sha, so neither proves the status check is
+#     load-bearing for the VERDICT (measured: neutering the status check
+#     leaves 7 failing only on its diagnostic). This is the shapeless site —
+#     phase-4b-review.sh's PR-body read, where free text admits no predicate
+#     and the status is the whole guard. rc 3 here, not the blob.
+scalar_call err1 "$WORK/s10b.err" "PR body" "repos/o/r/pulls/1" --jq '.body // ""'
+if [ "$SC_RC" -eq 3 ] && [ -z "$SC_OUT" ]; then
+  pass "#799: a shapeless read still fails closed on a real gh failure (the status check standing alone)"
+else
+  fail "#799: a shapeless read leaked a failed gh call (rc=$SC_RC out='$SC_OUT')"
+fi
+
 # 11. An EMPTY successful read is not a failure. The whole point is that the
 #     two are distinguishable, which needs this direction asserted too.
 scalar_call empty "$WORK/s11.err" "PR body" "repos/o/r/pulls/1" --jq '.body // ""'
