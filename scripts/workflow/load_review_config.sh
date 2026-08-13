@@ -126,13 +126,13 @@ emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 #
 # This is the parser `.github/workflows/agent-review.yml`'s auto-merge job used
 # to run inline against its own checkout before #788 routed the identity
-# through this script's output — byte-for-byte, so the value the
-# AUTHOR_MERGE_TOKEN check now compares is the value it computed for itself
-# then, and the switch of SOURCE does not smuggle in a change of SYNTAX.
-# `scripts/ci/check_workflow_parsers` pins these semantics case by case
-# (bare / "double-quoted" / 'single-quoted').
+# through this script's output, so the value the AUTHOR_MERGE_TOKEN check now
+# compares is the value it computed for itself then, and the switch of SOURCE
+# does not smuggle in a change of SYNTAX for any policy a YAML parser accepts.
+# `scripts/ci/check_workflow_parsers` pins those semantics case by case
+# (bare / "double-quoted" / 'single-quoted'), and all three are unchanged.
 #
-# Three properties are load-bearing, and the older `grep key: | awk '{print
+# Four properties are load-bearing, and the older `grep key: | awk '{print
 # $2}'` form had none of them:
 #
 #   anchored     the key must start at column 0, so a nested `author_identity:`
@@ -142,6 +142,18 @@ emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 #                not "nathanjohnpayne". A quoted value compared verbatim
 #                against `gh api user --jq .login` never matches, which would
 #                turn a legal YAML spelling into a permanent merge refusal.
+#   paired       and only when the quote is CLOSED. The inline form stripped an
+#                opening quote unconditionally, so the malformed
+#                `author_identity: "nathanjohnpayne` — not YAML at all, and
+#                rejected by every real parser the other gates use — yielded a
+#                clean `nathanjohnpayne` here and authorized that identity to
+#                merge. An unterminated scalar proves no identity, so it emits
+#                nothing and the auto-merge step's `[ -z ]` branch disables the
+#                merge path, the same as an unreadable policy or one that names
+#                no identity at all. This is the ONE place the extracted parser
+#                deliberately diverges from the inline one it replaced, and it
+#                diverges only on input the inline one should never have
+#                accepted (CodeRabbit, PR #973).
 #   first-wins   `exit` after the first match. A repeated scalar key would
 #                otherwise print twice, and a GITHUB_OUTPUT entry is a single
 #                `key=value` LINE — Actions parses the second one as its own
@@ -152,11 +164,21 @@ policy_scalar() {  # <file> <key>
   awk -v key="$2:" '
     /^[^[:space:]]/ && $1 == key {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/^\047/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
-      gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
+      # A quoted scalar is unwrapped only as a PAIR: drop the opening quote,
+      # then require a closing one of the same kind at end-of-value (an inline
+      # trailing comment may follow it). No closing quote means the value is
+      # malformed, and `exit` without `print` emits nothing.
+      if ($0 ~ /^"/) {
+        $0 = substr($0, 2)
+        if ($0 !~ /"[[:space:]]*(#.*)?$/) exit
+        sub(/"[[:space:]]*(#.*)?$/, "", $0)
+      } else if ($0 ~ /^\047/) {
+        $0 = substr($0, 2)
+        if ($0 !~ /\047[[:space:]]*(#.*)?$/) exit
+        sub(/\047[[:space:]]*(#.*)?$/, "", $0)
+      } else {
+        gsub(/[[:space:]]*#.*$/, "", $0)
+      }
       sub(/[[:space:]]+$/, "", $0)
       print
       exit

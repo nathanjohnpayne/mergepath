@@ -141,6 +141,27 @@ codex:
   author_identity: release-bot
 YAML
 
+# A base policy whose `author_identity` opens a quote it never closes. This is
+# not YAML — every real parser rejects the document — but `load-config`'s
+# extraction is a line parser, and the inline form it replaced stripped the
+# opening quote unconditionally, so this file used to yield a clean
+# `nathanjohnpayne` and authorize that identity to merge. An unterminated scalar
+# proves nothing, so it must arrive at the merge gate empty like any other
+# unproven identity (CodeRabbit, PR #973). The threshold is spelled the same way
+# on purpose: the guard belongs to the shared helper, not to one key.
+TORN_POLICY="$WORK/torn-policy.yml"
+cat > "$TORN_POLICY" <<'YAML'
+external_review_threshold: "25
+
+external_review_paths:
+  - "release/**"
+
+available_reviewers:
+  - nathanpayne-codex
+
+author_identity: "nathanjohnpayne
+YAML
+
 CALLS_LOG="$WORK/gh-calls.log"
 
 GH_STUB="$WORK/gh"
@@ -175,13 +196,14 @@ case "$PATHARG" in
       dup)    cat "${STUB_DUP_POLICY:?}"; exit 0 ;;
       quirk)  cat "${STUB_QUIRK_POLICY:?}"; exit 0 ;;
       noauth) cat "${STUB_NOAUTH_POLICY:?}"; exit 0 ;;
+      torn)   cat "${STUB_TORN_POLICY:?}"; exit 0 ;;
       error) echo "gh: API rate limit exceeded (HTTP 403)" >&2; exit 1 ;;
     esac ;;
 esac
 echo "{}"
 STUB
 chmod +x "$GH_STUB"
-export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG" STUB_BASE_POLICY="$BASE_POLICY" STUB_DUP_POLICY="$DUP_POLICY" STUB_QUIRK_POLICY="$QUIRK_POLICY" STUB_NOAUTH_POLICY="$NOAUTH_POLICY"
+export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG" STUB_BASE_POLICY="$BASE_POLICY" STUB_DUP_POLICY="$DUP_POLICY" STUB_QUIRK_POLICY="$QUIRK_POLICY" STUB_NOAUTH_POLICY="$NOAUTH_POLICY" STUB_TORN_POLICY="$TORN_POLICY"
 hash -r 2>/dev/null || true
 
 OUT_FILE="$WORK/github-output.txt"
@@ -340,6 +362,43 @@ if [ "$(grep -c '' "$OUT_FILE" | tr -d ' ')" = "4" ]; then
   pass "an empty author_identity is still emitted as its own output line"
 else
   fail "missing-identity output shape: $(cat "$OUT_FILE")"
+fi
+
+# ---------------------------------------------------------------------------
+# 3e. A scalar that OPENS a quote and never closes it is the third route to an
+#     unproven identity, and the only one the extraction could invent a value
+#     for. The inline parser this helper replaced dropped the opening quote
+#     before anything proved a closing one existed, so
+#     `author_identity: "nathanjohnpayne` — malformed YAML, rejected outright by
+#     the parsers the other gates use — produced a clean `nathanjohnpayne` and
+#     authorized that identity at the merge gate.
+#
+#     Section 3c pins the opposite direction (a properly PAIRED quote must be
+#     stripped, or a legal spelling becomes a permanent merge refusal), so the
+#     two together say: unwrap a quote only as a pair.
+# ---------------------------------------------------------------------------
+export STUB_CONTENTS_MODE=torn
+run_loader release/1.x main
+if [ "$RC" -eq 0 ] && [ "$(out_value author_identity)" = "" ]; then
+  pass "an unterminated quoted author_identity emits nothing rather than an unquoted login (CodeRabbit, #973)"
+else
+  fail "unterminated quoted identity emitted '$(out_value author_identity)' (rc=$RC)"
+fi
+
+if [ "$(out_value threshold)" = "" ]; then
+  pass "the same guard applies to every scalar, not just the identity (unterminated threshold emits nothing)"
+else
+  fail "unterminated quoted threshold emitted '$(out_value threshold)'"
+fi
+
+# Non-vacuity: the file really was fetched and parsed. Without this, both
+# assertions above would also hold on the fail-closed branch, which empties
+# every scalar for an unrelated reason.
+if [ "$(out_value reviewers)" = '["nathanpayne-codex"]' ] \
+   && [ "$(out_value paths)" = '["release/**"]' ]; then
+  pass "the torn policy was still resolved and its list keys parsed (the empty scalars are not the fail-closed branch)"
+else
+  fail "torn policy mis-parsed its list keys (reviewers=$(out_value reviewers) paths=$(out_value paths))"
 fi
 
 # ---------------------------------------------------------------------------
@@ -574,6 +633,21 @@ if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "false" ]; then
   pass "a governing policy naming no author_identity disables automatic merge end to end, loader output through merge gate (#788)"
 else
   fail "end-to-end missing-identity path enabled the merge (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
+fi
+
+# 6f. The same end-to-end join for the torn-quote route, and the one where the
+#     consequence is worst: here the value the extraction would have invented is
+#     a REAL login (`nathanjohnpayne`, the fleet's author identity), so a step
+#     fed that value matches its own token and merges. Nothing in this test
+#     writes the identity — it is whatever the loader produced from a malformed
+#     policy — so section 3e alone cannot stand in for it.
+export STUB_CONTENTS_MODE=torn
+run_loader release/1.x main
+run_author_step "$(out_value author_identity)" "nathanjohnpayne"
+if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "false" ]; then
+  pass "a governing policy with an unterminated quoted author_identity disables automatic merge end to end (CodeRabbit, #973)"
+else
+  fail "end-to-end torn-quote path enabled the merge (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
 fi
 
 echo
