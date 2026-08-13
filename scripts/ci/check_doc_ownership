@@ -150,54 +150,631 @@ mp_path_is_unsafe() {
 mp_markdown_renderable_text() {
   local f="$1"
   awk '
+    # BLOCK_TAGS is the HTML block condition 6 tag list (`source` left it and
+    # `search` joined it in CommonMark 0.31), sentinel-padded so a substring
+    # lookup cannot false-match a longer name. OPEN_TAG_ONLY / CLOSE_TAG_ONLY
+    # spell condition 7 — a complete tag, attributes and all, alone on its
+    # line. They are built as strings rather than written as /literals/
+    # because an attribute value may be single-quoted, and this whole program
+    # is one shell single-quoted string; the quote characters are made with
+    # %c for the same reason. LIST_MARKER_CORE is the bullet or ordered
+    # marker alone; LIST_MARKER is built FROM it, so the classifier and the
+    # marker-width measurement cannot drift apart. The whitespace run after
+    # the marker is deliberately NOT part of the width the measurement uses —
+    # CommonMark bounds it, and tabs inside it are columns rather than
+    # characters (see list_marker_columns).
+    BEGIN {
+      SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BT = sprintf("%c", 96)
+      # CommonMark 0.31.2 § List items bounds an ordered-list marker at
+      # "1-9 arabic digits". Spelled as nine optional digits rather than an
+      # {1,9} interval, which not every awk implementation supports — the
+      # same reason the numeric-reference length caps further down are
+      # tested with length(). Left unbounded, `1234567890.` reads as a
+      # marker and the phantom content column it creates suppresses the
+      # following continuation line as indented code; the spec makes that
+      # line ordinary paragraph text, so its link renders and check 10
+      # must still see it.
+      ORDERED_DIGITS = "[0-9][0-9]?[0-9]?[0-9]?[0-9]?[0-9]?[0-9]?[0-9]?[0-9]?"
+      LIST_MARKER_CORE = "^([-+*]|" ORDERED_DIGITS "[.)])"
+      # The trailer is optional-or-end, not a required whitespace run: a
+      # marker ALONE on its line is a list item whose first child is nothing
+      # at all. Requiring the run classified `-`, `*`, `+`, `1.` and `1)` as
+      # ordinary text, so the item opened no container and every line under
+      # it was measured against column zero — six columns under `*` was
+      # scanned as a lazy continuation although the renderer had already made
+      # it item code, and four columns under `-` was blanked as top-level
+      # code although the renderer resolves the link there.
+      #
+      # The trailer is spelled `[ \t]` and NOT `[[:space:]]`, because the two
+      # are not the same set and the difference is an awk-implementation
+      # divergence rather than a style choice. § List items allows only spaces
+      # and tabs after the marker, and list_marker_columns consumes only those
+      # two. Under gawk in a UTF-8 locale `[[:space:]]` also matches Unicode
+      # whitespace, so `-<U+2003># Heading` entered the list branch, measured a
+      # zero-column marker, closed the text flow and blanked the four-column
+      # line under it — while BWK awk and mawk, being byte-oriented, read the
+      # same line as an ordinary paragraph with a rendered lazy continuation.
+      # Both renderers agree with the byte-oriented reading, so gawk MISSED a
+      # hub-only reference the others reported, and check 10 returned a
+      # different verdict depending on which awk CI happened to run.
+      LIST_MARKER = LIST_MARKER_CORE "([ \t]|$)"
+      # How many list markers ONE line may open before the classifier stops
+      # consuming them. See opens_text_flow for why an implementation limit
+      # belongs here at all, and for what it does and does not cost.
+      MAX_LIST_MARKERS = 100
+      BLOCK_TAGS = " address article aside base basefont blockquote body"
+      BLOCK_TAGS = BLOCK_TAGS " caption center col colgroup dd details"
+      BLOCK_TAGS = BLOCK_TAGS " dialog dir div dl dt fieldset figcaption"
+      BLOCK_TAGS = BLOCK_TAGS " figure footer form frame frameset h1 h2 h3"
+      BLOCK_TAGS = BLOCK_TAGS " h4 h5 h6 head header hr html iframe legend li"
+      BLOCK_TAGS = BLOCK_TAGS " link main menu menuitem nav noframes ol"
+      BLOCK_TAGS = BLOCK_TAGS " optgroup option p param search section"
+      BLOCK_TAGS = BLOCK_TAGS " summary table tbody td tfoot th thead title"
+      BLOCK_TAGS = BLOCK_TAGS " tr track ul "
+      tagname = "[A-Za-z][A-Za-z0-9-]*"
+      attrvalue = "([^ \t" DQ SQ "=<>" BT "]+"
+      attrvalue = attrvalue "|" SQ "[^" SQ "]*" SQ
+      attrvalue = attrvalue "|" DQ "[^" DQ "]*" DQ ")"
+      attr = "[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*([ \t]*=[ \t]*" attrvalue ")?"
+      OPEN_TAG_ONLY = "^<" tagname "(" attr ")*[ \t]*/?>[ \t]*$"
+      CLOSE_TAG_ONLY = "^</" tagname "[ \t]*>[ \t]*$"
+    }
     function run_len(s, at, ch, n) {
       n = 0
       while (substr(s, at + n, 1) == ch) n++
       return n
     }
     function is_list_marker(s) {
-      return s ~ /^([-+*]|[0-9]+[.)])[[:space:]]+/
+      return s ~ LIST_MARKER
     }
-    function is_thematic_break(s, compact, ch, i) {
+    # CommonMark 0.31.2 § Tabs: "tabs in lines are not expanded to spaces.
+    # However, in contexts where spaces help to define block structure, tabs
+    # behave as if they were replaced by spaces with a tab stop of 4
+    # characters." Every width this program compares against a code threshold
+    # is therefore a COLUMN count, and a tab advances to the next multiple of
+    # four rather than by one.
+    function tab_stop_advance(col) {
+      return 4 - (col % 4)
+    }
+    # The ABSOLUTE column of the first character of `s` that is not a space or
+    # tab, given that `s` itself starts at column `start`. The starting column
+    # is a parameter because a tab advances to the next tab stop of the LINE,
+    # so a run measured from the wrong origin lands on the wrong stop — which
+    # is exactly what happens to the text after a block-quote marker.
+    function content_column(s, start,   i, c, ch) {
+      c = start
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        if (ch == " ") c++
+        else if (ch == "\t") c += tab_stop_advance(c)
+        else break
+      }
+      return c
+    }
+    # Columns of leading whitespace on a whole line, tabs expanded.
+    function lead_columns(s) {
+      return content_column(s, 0)
+    }
+    # Columns from the start of a list marker to the CONTENT column of the
+    # item, per CommonMark 0.31.2 § List items. A marker of width W followed
+    # by N columns of whitespace puts the content at W+N in the basic case,
+    # which the spec BOUNDS at 1 <= N <= 4. A wider run falls to the separate
+    # "item starting with indented code" rule: the content column is W+1 and
+    # the first child of the item is an indented code block. "Item starting
+    # with a blank line" — nothing after the run — is W+1 as well. Measuring
+    # W+N unbounded mis-places every subsequent line in the item by N-1
+    # columns, which both hides a rendered link behind a phantom code block
+    # and reports one that only ever rendered as code.
+    #
+    # `col` is the absolute starting column of the marker, needed because a
+    # tab in the run advances to the next four-column tab stop rather than by
+    # one column. Sets LM_CHARS (source characters the marker plus its run
+    # occupy, valid only when the marker line carries a first child — so zero
+    # in both fallback cases), LM_CODE_FIRST (1 when the first child of the
+    # item is an indented code block) and LM_BLANK_FIRST (1 when the marker
+    # and its run reach the end of the line, leaving no first child there).
+    function list_marker_columns(s, col,   w, n, i, ch, cur, adv) {
+      LM_CHARS = 0; LM_CODE_FIRST = 0; LM_BLANK_FIRST = 0
+      if (!match(s, LIST_MARKER_CORE)) return 0
+      w = RLENGTH
+      cur = col + w
+      n = 0
+      i = w + 1
+      while (i <= length(s)) {
+        ch = substr(s, i, 1)
+        if (ch == " ") { cur++; n++ }
+        else if (ch == "\t") { adv = tab_stop_advance(cur); cur += adv; n += adv }
+        else break
+        i++
+      }
+      # No whitespace run at all has two readings, and only the length of the
+      # line separates them. A marker with a non-space character right after
+      # it (`-x`) is not a marker; a marker with NOTHING after it is the same
+      # "item starting with a blank line" the wide-run branch below handles,
+      # so it takes the same W+1 content column. Returning zero for both left
+      # a bare marker with no container and its content measured from column
+      # zero.
+      if (n == 0) {
+        if (i > length(s)) { LM_BLANK_FIRST = 1; return w + 1 }
+        return 0
+      }
+      if (n > 4 || i > length(s)) {
+        LM_CODE_FIRST = (i <= length(s))
+        LM_BLANK_FIRST = (i > length(s))
+        return w + 1
+      }
+      LM_CHARS = i - 1
+      return w + n
+    }
+    # CommonMark 0.31.2 § Lists: "In order for a list to interrupt a
+    # paragraph, it must begin with a non-blank list item, and if ordered,
+    # the start number must be 1." A marker that fails either test is not a
+    # list at all while a paragraph is open — it is more of that paragraph.
+    # Classifying it as a list closes the paragraph and re-measures every
+    # following line against a list content column that does not exist, which
+    # blanks rendered text as indented code: `Governance` then `2. # Notes`
+    # then a seven-space link line is ONE paragraph and the link renders.
+    function can_interrupt_paragraph(s,   w, marker, rest, start) {
+      if (!match(s, LIST_MARKER_CORE)) return 0
+      w = RLENGTH
+      marker = substr(s, 1, w)
+      # The spec restriction is on the START NUMBER — the marker digits READ
+      # AS A NUMBER — not on how those digits are spelled. `01.` and `1.`
+      # both start at 1 and both interrupt. Testing the literal spellings
+      # `1.`/`1)` instead rejected every leading-zero form: the paragraph
+      # stayed open, no item container was ever recorded, and the item
+      # content that followed was then measured against column zero and
+      # blanked as top-level indented code.
+      if (marker ~ /^[0-9]/) {
+        start = substr(marker, 1, w - 1)
+        if (start + 0 != 1) return 0
+      }
+      rest = substr(s, w + 1)
+      sub(/^[ \t]+/, "", rest)
+      if (rest == "") return 0
+      return 1
+    }
+    # "All the same character" is asserted with ONE anchored match rather
+    # than a character-at-a-time scan. Under a multibyte-aware awk `substr`
+    # has to walk from the start of the string to find the i-th CHARACTER, so
+    # the loop these two functions used to run was quadratic in the length of
+    # the line — and opens_text_flow calls both once per list marker it
+    # consumes, which made the whole path cubic. gawk 5.4.1 took 278 seconds
+    # to classify a 5000-marker line and climbed from there.
+    #
+    # The built pattern is exactly the loop it replaces: `ch` is already known
+    # to be one of `*`, `-`, `_`, `=`, every one of which is literal inside a
+    # bracket expression, and a `-` immediately after `[` is literal too.
+    function is_thematic_break(s, compact, ch) {
       compact = s
-      gsub(/[[:space:]]/, "", compact)
+      gsub(/[ \t]/, "", compact)
       if (length(compact) < 3) return 0
       ch = substr(compact, 1, 1)
       if (ch != "*" && ch != "-" && ch != "_") return 0
-      for (i = 2; i <= length(compact); i++) {
-        if (substr(compact, i, 1) != ch) return 0
-      }
-      return 1
+      return (compact ~ ("^[" ch "]+$"))
     }
-    function is_setext_underline(s, compact, ch, i) {
+    function is_setext_underline(s, compact, ch) {
       compact = s
-      sub(/[[:space:]]+$/, "", compact)
+      sub(/[ \t]+$/, "", compact)
       if (length(compact) < 1) return 0
       ch = substr(compact, 1, 1)
       if (ch != "=" && ch != "-") return 0
-      for (i = 2; i <= length(compact); i++) {
-        if (substr(compact, i, 1) != ch) return 0
+      return (compact ~ ("^[" ch "]+$"))
+    }
+    # Does the line begin one of the seven HTML block start conditions
+    # CommonMark defines? Only those replace or interrupt paragraph text. A
+    # line that merely BEGINS with a `<` — inline HTML, an autolink, an
+    # incomplete tag — is ordinary paragraph content, and reading it as a
+    # block boundary closes the paragraph and erases the indented
+    # continuation lines that follow it from the link scan (#811).
+    #
+    # Condition 7 (a complete open or closing tag alone on the line) is the
+    # one kind that cannot interrupt an OPEN paragraph, so it is tested only
+    # when no text flow is already open. The spec excludes `pre`, `script`,
+    # `style` and `textarea` from it — but only as OPEN tags, which condition
+    # 1 owns anyway. A complete CLOSING tag does start a type 7 block whatever
+    # its name, so excluding `</pre>` too left it as prose and opened text
+    # flow over raw HTML: `</pre>` followed by an indented line reported a
+    # link that never rendered.
+    #
+    # Condition 4 is spelled `<!` + an UPPERCASE ASCII letter, the reading
+    # markdown-it-py implements — the parser the prose-wrap tooling in this
+    # repo relies on, and the one the wrapped reference definition support
+    # below was verified against. It is also the safe reading of the 0.31
+    # relaxation to any ASCII letter: treating a lowercase `<!doctype` line
+    # as prose keeps a following continuation link VISIBLE to the scan
+    # instead of silently hiding it.
+    #
+    # Every separator below is `[ \t]` and NOT `[[:space:]]`, for the reason
+    # LIST_MARKER carries the same spelling: the HTML-block grammar admits a
+    # space, a tab, a line ending, `>` or `/>` after the tag name, and under
+    # gawk in a UTF-8 locale `[[:space:]]` also matches Unicode separators
+    # that BWK awk and mawk do not. `<div<U+2003>>governance` therefore opened
+    # a condition-6 block under gawk and stayed prose under the other two, so
+    # the same document produced different ownership verdicts depending on
+    # which supported awk CI happened to select.
+    # Returns the CommonMark TYPE NUMBER (1-7), not a boolean, because the
+    # type is what says how the block ends — see html_block_ends. Zero means
+    # the line opens no HTML block, so every `if (opens_html_block(...))` reads
+    # the same as it did.
+    function opens_html_block(s, flow_open,   low, rest, name, after) {
+      if (substr(s, 1, 1) != "<") return 0
+      low = tolower(s)
+      if (low ~ /^<(pre|script|style|textarea)([ \t>]|$)/) return 1
+      if (substr(s, 1, 4) == "<!--") return 2
+      if (substr(s, 1, 2) == "<?") return 3
+      # Ahead of the condition-4 test, which its prefix would otherwise match.
+      if (substr(s, 1, 9) == "<![CDATA[") return 5
+      if (substr(s, 1, 2) == "<!" && substr(s, 3, 1) ~ /^[A-Z]$/) return 4
+      rest = (substr(s, 1, 2) == "</") ? substr(s, 3) : substr(s, 2)
+      if (match(rest, /^[A-Za-z][A-Za-z0-9-]*/)) {
+        name = tolower(substr(rest, 1, RLENGTH))
+        after = substr(rest, RLENGTH + 1)
+        if (index(BLOCK_TAGS, " " name " ") > 0 \
+            && (after == "" || after ~ /^[ \t>]/ || substr(after, 1, 2) == "/>")) {
+          return 6
+        }
       }
+      if (flow_open) return 0
+      if (substr(s, 1, 2) != "</" \
+          && low ~ /^<(pre|script|style|textarea)([ \t>]|\/|$)/) return 0
+      if (s ~ OPEN_TAG_ONLY || s ~ CLOSE_TAG_ONLY) return 7
+      return 0
+    }
+    # Does `s` close an open HTML block of `type`? CommonMark 0.31.2 § HTML
+    # blocks gives each start condition its own end condition, and there are
+    # five distinct classes of them. Recognizing only the OPENERS — which is
+    # all this program used to do — left every line after one being scanned as
+    # Markdown, so `<div>`, a link, `</div>` reported a reference that both
+    # renderers treat as raw HTML and no reader can follow (#929 item 28, a
+    # FALSE ownership failure).
+    #
+    # For types 1 to 5 the line carrying the end condition is PART of the
+    # block; for 6 and 7 the block ends at a blank line, and that blank is
+    # not. The caller handles that difference, because the blank still has to
+    # close the text flow and bound a blank-first item like any other.
+    #
+    # The end condition is a line CONTAINING the closer, not a line matching
+    # it: `</script>` ends a type 1 block wherever on the line it sits, and
+    # anything after it on that line is still block content.
+    function html_block_ends(s, type,   low) {
+      if (type >= 6) return (s ~ /^[ \t]*$/)
+      if (type == 1) {
+        low = tolower(s)
+        return (low ~ /<\/(script|pre|style|textarea)>/)
+      }
+      if (type == 2) return (index(s, "-->") > 0)
+      if (type == 3) return (index(s, "?>") > 0)
+      if (type == 4) return (index(s, ">") > 0)
+      if (type == 5) return (index(s, "]]>") > 0)
+      return 0
+    }
+    # True when s opens a fenced code block. The opener is read both at top
+    # level and after consuming a list marker, so this one predicate keeps the
+    # information-string and width rules identical in both contexts.
+    function fence_opener(s,   ch, width, tail) {
+      FENCE_OPEN_CHAR = ""
+      FENCE_OPEN_WIDTH = 0
+      ch = substr(s, 1, 1)
+      if (ch != "`" && ch != "~") return 0
+      width = run_len(s, 1, ch)
+      tail = substr(s, width + 1)
+      # A backtick in a backtick-fence info string makes this ordinary prose.
+      if (width < 3 || (ch == "`" && index(tail, "`") > 0)) return 0
+      FENCE_OPEN_CHAR = ch
+      FENCE_OPEN_WIDTH = width
       return 1
     }
-    function opens_text_flow(s, hashes) {
-      # A block quote may lazily continue its paragraph without repeating the
-      # `>` marker on the next line. Classify the quoted block content, not
-      # the container marker itself.
-      while (substr(s, 1, 1) == ">") {
-        s = substr(s, 2)
-        if (substr(s, 1, 1) ~ /[[:space:]]/) s = substr(s, 2)
+    # The list branch consumes one marker and then classifies what is left of
+    # the line by the SAME rules, which it used to do by TAIL-CALLING this
+    # function once per marker. On a line of many markers that cost the gate
+    # its VERDICT rather than its accuracy, and how it did so depended on the
+    # awk — which is the worst property a required check can have. Measured on
+    # this tree with `- ` repeated N times:
+    #
+    #   BWK awk 20200816   segfaults from N=7000 (N=6500 still answers)
+    #   mawk 1.3.4         answers — this build grows its eval stack, while
+    #                      the build #929 item 33 was measured on exits with
+    #                      `program limit exceeded: eval stack size=1024`
+    #   gawk 5.4.1         answers, but took 278 seconds at N=5000 and climbed
+    #
+    # Three changes, because the crash had three independent causes and any
+    # one of them left alone still costs the gate its answer:
+    #
+    #   * THE RECURSION. The call is a genuine tail call, so the loop below is
+    #     the same computation in ONE stack frame at any depth. This is what
+    #     removes the segfault and the eval-stack exit outright, on every awk,
+    #     with no behaviour change of any kind.
+    #   * THE PER-MARKER SCANS. The two "all the same character" tests run
+    #     once per marker were quadratic in the length of the line, which made
+    #     the path cubic; they are single matches now (see is_thematic_break).
+    #   * THE MARKER COUNT ITSELF. Even linear per-marker work is superlinear
+    #     over the line, and measured that way gawk still needed 153 seconds
+    #     at N=3000. A gate that never returns is no better than one that
+    #     dies, so `MAX_LIST_MARKERS` stops the consumption at 100.
+    #
+    # What the bound costs, stated exactly rather than waved at. Past it the
+    # markers stop being consumed and text flow is declared OPEN, so the rest
+    # of THAT line stays visible to the link scan — the report direction, and
+    # the correct one against the renderer this program follows: cmark-gfm
+    # renders `- ` repeated 150 or 10000 times followed by a link AS a link
+    # (measured through GitHub POST /markdown at every depth up to 10000),
+    # capping its output at ten <ul> levels and making the rest siblings. What
+    # is lost is the exact content column for the FOLLOWING lines, which the
+    # bound puts at 100 markers rather than N. Observing that needs a list
+    # more than 100 markers deep AND a following line indented past 200
+    # columns; against that, neither renderer models this nesting faithfully
+    # anywhere near 100 either — markdown-it-py stops at ten markers.
+    function opens_text_flow(s, flow_open,   hashes, cols, markers) {
+      markers = 0
+      while (1) {
+        # A block quote may lazily continue its paragraph without repeating the
+        # `>` marker on the next line. Classify the quoted block content, not
+        # the container marker itself. `flow_column` advances across the
+        # container markers too, because a tab further along the line expands
+        # against the absolute tab stops of that line.
+        while (substr(s, 1, 1) == ">") {
+          s = substr(s, 2)
+          flow_column += 1
+          if (substr(s, 1, 1) == "\t") {
+            flow_column += tab_stop_advance(flow_column)
+            s = substr(s, 2)
+          } else if (substr(s, 1, 1) ~ /[ \t]/) {
+            flow_column += 1
+            s = substr(s, 2)
+          }
+        }
+        if (s == "") return 0
+        if (is_thematic_break(s)) return 0
+        # A setext underline exists only UNDER a paragraph — it is the thing
+        # that turns the paragraph above it into a heading. Applying the shape
+        # test with nothing open read every line of dashes or equals as a
+        # block boundary in its own right: `=` alone opens a paragraph for
+        # both renderers, so a four-column line below it is a lazy
+        # continuation whose link renders, and this blanked it as code. It
+        # also shadowed the list branch for the one bullet whose marker is
+        # spelled with the same character — `-` and `- ` never reached it, so
+        # a blank-first bullet pushed no content frame and a hub-only link
+        # four or five columns under it was missed entirely.
+        #
+        # The order against the list branch matters and is the reason this is
+        # a separate test rather than a condition inside it: with a paragraph
+        # open, `- ` is a setext underline and NOT a list, because a list can
+        # interrupt a paragraph only when it begins with a non-blank item.
+        if (flow_open && is_setext_underline(s)) return 0
+        if (is_list_marker(s)) {
+          # ... but only when a list may start here at all. With a paragraph
+          # open, a marker that cannot interrupt it leaves the paragraph — and
+          # its content column — exactly as they were.
+          if (flow_open && !can_interrupt_paragraph(s)) return 1
+          # Past the bound, stop consuming and leave the rest of the line to
+          # the link scan. See the note above the function for why the bound
+          # exists and exactly what it costs.
+          if (++markers > MAX_LIST_MARKERS) return 1
+          # A list item is a container whose content is parsed as blocks in its
+          # own right, so the item opens a paragraph only when its FIRST child
+          # is one. Consume the marker and classify what follows by the same
+          # rules; a heading-first or thematic-break-first item opens no text
+          # flow, and the indented lines under it really are code (#812).
+          cols = list_marker_columns(s, flow_column)
+          # Reported back so the caller can measure indented code from the item
+          # CONTENT column rather than from column zero.
+          #
+          # EVERY marker on the line records its own frame. `- - # inner`
+          # opens TWO items, and pushing only the summed column left the outer
+          # one with no frame at all: the first line that dedented out of the
+          # inner item popped the single frame and dropped straight to column
+          # zero, so the later prose of the outer item was measured against
+          # the top-level four-column threshold and blanked as code. The
+          # recorded value stays the RUNNING SUM rather than `flow_column`,
+          # because these columns are relative to the indent of the line
+          # itself — which the caller adds, and which `flow_column` has
+          # already absorbed along with any block-quote markers ahead of the
+          # list.
+          marker_columns += cols
+          mc_n++
+          mc[mc_n] = marker_columns
+          flow_column += cols
+          # The wide-run and blank-marker cases above put the first child of the
+          # item in an indented code block, or in no block at all; neither opens
+          # a text flow, and neither leaves a first child to classify.
+          if (LM_CODE_FIRST) { item_code_first = 1; return 0 }
+          # "Item starting with a blank line": the marker and its whitespace run
+          # reach the end of the line, so the item has no first child HERE to
+          # classify — and nothing is left to recurse ON. Reading only LM_CHARS
+          # against the line length missed it, because LM_CHARS is zero in that
+          # fallback rather than the whole line: `substr(s, 1)` handed back the
+          # SAME string and the recursion never terminated. A `+ ` line in a
+          # canonical doc then hung the check or overflowed the awk stack
+          # instead of producing a verdict, so the guard is a hang, not a
+          # misclassification. LM_CHARS <= 0 is held alongside the flag so any
+          # future path that returns without a first child fails safe the same
+          # way.
+          if (LM_BLANK_FIRST || LM_CHARS <= 0 || LM_CHARS >= length(s)) {
+            # Reported back so the caller can bound how long the frame lives.
+            # An item that begins with a blank line is allowed exactly one, so
+            # its container closes on the NEXT blank rather than surviving to
+            # the end of the document. Read off the innermost marker, which is
+            # where the recursion stops.
+            if (LM_BLANK_FIRST) item_blank_first = 1
+            return 0
+          }
+          s = substr(s, LM_CHARS + 1)
+          # The item content is parsed as blocks IN ITS OWN RIGHT, so no
+          # paragraph is open inside it yet — whatever was open outside stopped
+          # at the marker. Carrying flow_open in made the item inherit the outer
+          # paragraph and re-apply the interrupt rules to its own first child:
+          # under an open paragraph, `- 2. # Heading` had its NESTED marker
+          # rejected as unable to interrupt, so that item never pushed a content
+          # column and prose six or seven columns in was measured against the
+          # OUTER frame and blanked as code. The renderer shows it as ordinary
+          # nested-item prose, so a hub-only link there escaped check 10
+          # entirely — a missed reference, not a false alarm.
+          flow_open = 0
+          continue
+        }
+        if (substr(s, 1, 1) == "#") {
+          hashes = run_len(s, 1, "#")
+          if (hashes <= 6 && substr(s, hashes + 1) ~ /^([ \t]|$)/) return 0
+        }
+        if (s ~ /^\[[^]]+\]:[ \t]*/) return 0
+        # A list item whose first child is a fence has no Markdown text flow:
+        # `- ````, its indented contents and its matching closer are one code
+        # block. Leaving this to the prose fallback emitted links from inside
+        # that block, so carry the opener to the caller that owns fence state.
+        if (fence_opener(s)) {
+          item_fence_opened = 1
+          item_fence_char = FENCE_OPEN_CHAR
+          item_fence_width = FENCE_OPEN_WIDTH
+          return 0
+        }
+        # The TYPE is reported back so the caller can carry the block past its
+        # opener. Set here rather than inside opens_html_block so the two
+        # other callers of that function stay pure predicates.
+        html_opened = opens_html_block(s, flow_open)
+        if (html_opened) return 0
+        return 1
       }
-      if (s == "") return 0
-      if (is_thematic_break(s) || is_setext_underline(s)) return 0
-      if (is_list_marker(s)) return 1
-      if (substr(s, 1, 1) == "#") {
-        hashes = run_len(s, 1, "#")
-        if (hashes <= 6 && substr(s, hashes + 1) ~ /^([[:space:]]|$)/) return 0
+    }
+    # Container content columns, innermost last. List items nest, so the
+    # threshold for indented code is a STACK, not a scalar: leaving an inner
+    # item must restore the column of the item enclosing it, and setting the
+    # scalar back to zero instead measured the prose of the outer item against the
+    # top-level four-column threshold and blanked it. Popping every frame
+    # indented deeper than `col` leaves `code_column` at the innermost
+    # container the line is still inside — zero when it is inside none.
+    #
+    # A frame also remembers the BLOCK QUOTE DEPTH it was created at, because
+    # a column alone cannot say whether the container is still open. A list
+    # inside a quote dies with the quote: after `> - # Heading`, an unmarked
+    # blank line ends the quote and everything in it, yet the frame recorded
+    # only its column, so a following four-space line was measured against a
+    # list that no longer existed and top-level indented code was scanned as
+    # prose. A frame whose quote is deeper than the current line therefore
+    # pops no matter how its column compares.
+    function pop_containers(col, qdepth) {
+      while (cc_n > 0 && (cc[cc_n] > col || cq[cc_n] > qdepth)) {
+        delete cc[cc_n]; delete cs[cc_n]; delete cq[cc_n]; delete cb[cc_n]; cc_n--
       }
-      if (s ~ /^\[[^]]+\]:[[:space:]]*/) return 0
-      if (s ~ /^<([!?\/]|[[:alpha:]])/) return 0
-      return 1
+      code_column = (cc_n > 0) ? cc[cc_n] : 0
+    }
+    # CommonMark 0.31.2 § List items: "A list item can begin with at most one
+    # blank line." So a container opened by a marker with nothing after it
+    # lives only until the next line, and a blank one there leaves the item
+    # empty and closes it — what follows is measured from the column OUTSIDE
+    # the list. `cb` flags exactly those frames; every other frame survives a
+    # blank, because an item that already has content may hold one and keep
+    # going. Without the distinction, `- ` then a blank then a four-column
+    # link would keep the column-2 frame, raise the code threshold to six,
+    # and report top-level indented code as prose.
+    function close_blank_first_frame() {
+      if (cc_n > 0 && cb[cc_n]) {
+        delete cc[cc_n]; delete cq[cc_n]; delete cb[cc_n]; cc_n--
+        code_column = (cc_n > 0) ? cc[cc_n] : 0
+      }
+    }
+    # `col` is the new container CONTENT column; `start_col` is the column its
+    # MARKER begins at. The two differ, and only the marker column says which
+    # frames this container replaces: a marker at column S closes every
+    # container whose content starts deeper than S, including the SIBLING item
+    # it replaces. Popping at the content column instead kept a sibling frame
+    # alive underneath the new one whenever the run after the new marker was
+    # wider — `- one` then `-   # two` left the column-2 frame of the first
+    # item under the column-4 frame of the second — and that stale frame rose
+    # as a code threshold of six once the list closed, so top-level indented
+    # code was scanned as prose.
+    function push_container(col, start_col, qdepth) {
+      pop_containers(start_col, qdepth)
+      cc_n++
+      cc[cc_n] = col
+      cs[cc_n] = start_col
+      cq[cc_n] = qdepth
+      cb[cc_n] = 0
+      code_column = col
+    }
+    # How many block quotes this line opens with. Up to three spaces of
+    # indentation may precede each `>`, and one space after it is part of the
+    # marker rather than of the content.
+    #
+    # `base` is the CONTENT COLUMN of the innermost container the line is
+    # currently inside, and it is consumed before the three-space allowance is
+    # applied — because that allowance is relative to the container, not to
+    # column zero. Measuring from column zero rejected a valid quote marker
+    # that merely sat inside an indented item: after `- para`, the line
+    # `    > - # inner` puts its `>` two columns into item content, well
+    # short of the six that would make it code, yet four absolute spaces broke
+    # the loop and the depth came back zero. The list frame that line pushed
+    # was then tagged at quote depth zero, so the unmarked blank that ends the
+    # quote did not take it down with it; the stale frame raised the code
+    # threshold and a six-column link was reported although both renderers
+    # render it as indented code in the OUTER item.
+    #
+    # Two more facts about the prefix are reported back, because every
+    # allowance measured "from the start of the line" is really measured from
+    # the end of the container prefix: QD_CHARS is how many SOURCE CHARACTERS
+    # the markers and their attached spaces occupy, and QD_COL is the absolute
+    # COLUMN the content after them begins at. Both are zero on an unquoted
+    # line, which is what makes the callers uniform.
+    function quote_depth(s, base,   d, i, run, eaten, ch, col, adv) {
+      d = 0
+      i = 1
+      QD_CHARS = 0
+      QD_COL = 0
+      # Container indentation first, and only as much of it as is actually
+      # there — a line may be dedented below `base` and still open a quote.
+      #
+      # `base` is a COLUMN count, so the run that supplies it is measured in
+      # columns too and a tab advances to the next tab stop rather than by one.
+      # Accepting only literal spaces made the whole exception inert wherever
+      # the indentation was spelled with a tab: under `-<TAB>para`, the line
+      # `<TAB>> - # inner` consumed no prefix at all, so its `>` was never
+      # reached, the inner frame was tagged at quote depth zero, and it
+      # outlived the quote exactly as it did before the base existed.
+      eaten = 0
+      while (eaten < base) {
+        ch = substr(s, i, 1)
+        if (ch == " ") { eaten++; i++ }
+        else if (ch == "\t") { eaten += tab_stop_advance(eaten); i++ }
+        else break
+      }
+      # Every run from here on is measured in COLUMNS against `col`, the
+      # absolute column reached so far, because a tab advances to the next tab
+      # stop and how far it advances depends on where it starts. Counting
+      # characters instead made the three-column allowance wrong for every
+      # tab-spelled indentation: `- para` then two spaces, a tab and
+      # `> - # inner` puts the marker at column four, which CommonMark
+      # recognizes as a quote nested in the outer item, while a
+      # spaces-only loop stopped at the tab and read no marker at all.
+      col = eaten
+      while (i <= length(s)) {
+        # At most three columns may precede a marker; a fourth is indentation,
+        # which makes the line content rather than a deeper quote.
+        run = 0
+        while (run < 4) {
+          ch = substr(s, i, 1)
+          if (ch == " ") { run++; col++; i++ }
+          else if (ch == "\t") {
+            adv = tab_stop_advance(col)
+            run += adv; col += adv; i++
+          } else break
+        }
+        if (run >= 4 || substr(s, i, 1) != ">") break
+        d++
+        i++
+        col++
+        # One space or tab after the marker belongs to the marker, not to the
+        # content — and a tab there advances by columns like any other.
+        ch = substr(s, i, 1)
+        if (ch == " ") { i++; col++ }
+        else if (ch == "\t") { col += tab_stop_advance(col); i++ }
+        # Snapshot after each ACCEPTED marker rather than at the end of the
+        # loop: the loop exits having already consumed the whitespace run that
+        # failed the marker test, and that run is content indentation, not
+        # prefix.
+        QD_CHARS = i - 1
+        QD_COL = col
+      }
+      return d
     }
     function strip_inline_code(s, out, pos, rel, open, width, scan, got, close_width) {
       out = ""; pos = 1
@@ -222,41 +799,192 @@ mp_markdown_renderable_text() {
     }
     {
       line = $0
+      # § Preliminaries: a line ending is a newline, a carriage return, or a
+      # carriage return + newline, and it is NOT part of the line. awk splits
+      # on the newline only, so a CRLF document hands every rule a trailing CR.
+      # It is stripped ONCE, here, rather than absorbed by the whitespace
+      # classes downstream — which is what used to happen, invisibly, while
+      # those classes were [[:space:]]. Narrowing them to the ASCII set the
+      # spec actually defines therefore broke CRLF documents until this line
+      # existed: a CRLF "blank" line stopped reading as blank, a fence closer
+      # with a trailing CR stopped closing its fence, and a link after that
+      # fence was scanned as code and MISSED. Normalizing the line ending is
+      # the right layer for it; widening the classes back would put a line
+      # ending into the definition of horizontal whitespace, where the spec
+      # does not put it.
+      sub(/\r$/, "", line)
+      # How deep in block quotes this line is marked. Container frames are
+      # tagged with it so a list inside a quote dies when the quote does.
+      # `code_column` is the content column of the innermost container still
+      # standing FROM THE PREVIOUS LINE, which is the right base: the quote
+      # allowance is relative to the container this line arrives inside, and
+      # this line has not yet been given the chance to leave it.
+      line_quote = quote_depth(line, code_column)
       reference_continuation = 0
       if (reference_pending) {
         reference_pending = 0
-        if (line !~ /^[[:space:]]*$/) reference_continuation = 1
+        if (line !~ /^[ \t]*$/) reference_continuation = 1
       }
-      indent = match(line, /[^ ]/) - 1
-      if (indent < 0) indent = length(line)
-      rest = substr(line, indent + 1)
+      # The leading whitespace run of the whole line, measured in COLUMNS,
+      # which is what every code-block threshold below compares against.
+      col_indent = lead_columns(line)
+
+      # CommonMark 0.31.2 § Fenced code blocks allows a fence "indented by up
+      # to three spaces" — and that allowance, like every other one in the
+      # spec, is relative to the CONTENT COLUMN of the container the line
+      # arrives inside, not to column zero. Measuring it absolutely made the
+      # two shapes below unrecognizable as fences, so both renderers put the
+      # link inside a code block and this program scanned it as prose (#929
+      # item 29, both FALSE ownership failures):
+      #
+      #   `10. para` then a four-column fence — the item content column is
+      #   already four, so the fence sits at relative zero
+      #   `> ` then a fence — the marker takes two columns before the content
+      #   of the quote even begins
+      #
+      # `fence_body` is the line with the block-quote prefix and the
+      # indentation stripped, so the fence characters are at its front for
+      # both the opener and the closer; `fence_col` is the absolute column
+      # they start at, and `fence_base` the column the container puts content
+      # at. Inside a quote that base is the column after the markers, which is
+      # the innermost container measurable here; outside one it is the
+      # container stack. A NEGATIVE difference is fine and deliberate: a fence
+      # dedented below its container is still a fence, and still closes what
+      # it leaves.
+      fence_rest = substr(line, QD_CHARS + 1)
+      fence_off = match(fence_rest, /[^ \t]/) - 1
+      if (fence_off < 0) fence_off = length(fence_rest)
+      fence_body = substr(fence_rest, fence_off + 1)
+      fence_col = content_column(fence_rest, QD_COL)
+      fence_base = (line_quote > 0) ? QD_COL : code_column
 
       if (in_fence) {
-        if (indent <= 3 && substr(rest, 1, 1) == fence_char) {
-          width = run_len(rest, 1, fence_char)
-          tail = substr(rest, width + 1)
-          if (width >= fence_width && tail ~ /^[[:space:]]*$/) in_fence = 0
+        if (fence_col - fence_base <= 3 && substr(fence_body, 1, 1) == fence_char) {
+          width = run_len(fence_body, 1, fence_char)
+          tail = substr(fence_body, width + 1)
+          if (width >= fence_width && tail ~ /^[ \t]*$/) in_fence = 0
         }
         text_flow_open = 0
         print ""
         next
       }
 
-      ch = substr(rest, 1, 1)
-      if (indent <= 3 && (ch == "`" || ch == "~")) {
-        width = run_len(rest, 1, ch)
-        tail = substr(rest, width + 1)
-        # CommonMark forbids a backtick in a backtick fence info string.
-        # Such a line is rendered prose, not a fence opener.
-        if (width >= 3 && !(ch == "`" && index(tail, "`") > 0)) {
-          in_fence = 1; fence_char = ch; fence_width = width
+      # Inside an HTML block, nothing is Markdown. Only the OPENERS used to be
+      # recognized, so the classifier read every following line as prose and
+      # a link between `<div>` and `</div>` was reported although both
+      # renderers leave the whole thing raw (#929 item 28).
+      #
+      # The split at type 5 comes from the spec, not from convenience: 1 to 5 end
+      # on a line CONTAINING their closer and that line is part of the block,
+      # while types 6 and 7 end at a blank line which is NOT. So the blank
+      # falls through to the branch below rather than being consumed here —
+      # it still has to close the text flow and bound a blank-first item.
+      # The end condition is tested against the block CONTENT, which means
+      # after the active block-quote prefix. A quoted type 6 block ends at a
+      # MARKED blank — `> <div>`, a line holding only `>`, then `> [audit](…)`
+      # renders that link in both renderers — and passing the raw line to the
+      # whitespace test kept the block open and blanked it, which is the MISS
+      # direction (Codex P2 on #925). QD_CHARS is zero on an unquoted line, so
+      # nothing outside a quote changes.
+      # An HTML block also ends when the CONTAINER holding it ends, with no
+      # closer of its own: `> <script>` followed by an unquoted line leaves
+      # the quote, and both renderers render that line as ordinary Markdown.
+      # Carrying the state on regardless blanked it, and a blanked line is a
+      # MISSED reference (Codex P2 on #925). The depth is recorded at the
+      # opener, so an unquoted block is never affected.
+      if (in_html && (line_quote < html_quote \
+          || (html_container_depth > 0 && col_indent <= html_container_start))) {
+        in_html = 0
+        html_container_depth = 0
+      }
+      if (in_html) {
+        html_content = substr(line, QD_CHARS + 1)
+        if (in_html <= 5) {
+          if (html_block_ends(html_content, in_html)) {
+            in_html = 0
+            html_container_depth = 0
+          }
+          text_flow_open = 0
+          print ""
+          next
+        }
+        if (html_block_ends(html_content, in_html)) {
+          in_html = 0
+          html_container_depth = 0
+        } else {
           text_flow_open = 0
           print ""
           next
         }
       }
 
-      if (line ~ /^[[:space:]]*$/) {
+      # A blank line closes the text flow but NOT the containers: a list item
+      # may hold one and keep going, so it must not reach the pop below. The
+      # one exception is an item that BEGAN with a blank line, which is
+      # bounded at that single blank — see close_blank_first_frame.
+      if (line ~ /^[ \t]*$/) {
+        close_blank_first_frame()
+        text_flow_open = 0
+        print ""
+        next
+      }
+
+      # The container stack is updated for every line that starts a new block
+      # at its own indentation, which includes the ones that return early. A
+      # fence opener is such a line, and while the pop lived only after the
+      # fence branch a dedented fence left the previous list frame standing:
+      # `- # Item`, a column-zero fence, then a four-space link line kept the
+      # two-column frame, raised the code threshold to six, and scanned a
+      # line the renderer had already made top-level indented code — a false
+      # ownership failure. Lines INSIDE a fence still do not pop, because
+      # they are fence content and not blocks in their own right.
+      #
+      # The `text_flow_open` guard is a LAZY-CONTINUATION guard: a dedented
+      # line under an open paragraph may be continuation text, and popping on
+      # it would measure real item prose against a container that is still
+      # open. A block quote is the shape that guard must not cover, because a
+      # block quote INTERRUPTS a paragraph — it is a new block, never a lazy
+      # continuation. Without the exception, `- para`, a column-zero
+      # `> quote`, a blank and a four-column link kept the column-2 frame
+      # alive on the strength of the paragraph inside the QUOTE, raised the
+      # code threshold to six, and reported as a link a line both renderers
+      # make top-level indented code — a false ownership failure.
+      #
+      # The exception is self-limiting and needs no column test of its own:
+      # it fires only when the quote depth of the line is deeper than that of
+      # the frame, and pop_containers still compares columns, so a quote that
+      # opens AT or INSIDE the item content column (`- para` then
+      # `  > quote`) pops nothing and stays item content. A quote four or
+      # more columns past the content column never reaches here at all:
+      # `quote_depth` stops at a four-space run, so such a line carries depth
+      # zero and is read as the lazy continuation text it really is.
+      # A FENCE OPENER is the other shape that interrupts a paragraph, and it
+      # needs the same exception for the same reason. The pop above was
+      # introduced FOR the dedented fence, but behind the `text_flow_open`
+      # guard it only ever fired when nothing was open: after `- # Item` a
+      # heading closes the flow and the fence popped, while after `- para` the
+      # paragraph was still open and the frame survived a list the fence had
+      # already ended — the identical false ownership failure, on the shape
+      # the guard was written for. So the opener is recognized BEFORE the pop
+      # rather than after it, and the branch that consumes it reuses the
+      # answer instead of re-deciding.
+      fence_here = 0
+      if (fence_col - fence_base <= 3 && fence_opener(fence_body)) {
+        fence_here = 1
+        ch = FENCE_OPEN_CHAR
+        width = FENCE_OPEN_WIDTH
+      }
+      if (!text_flow_open || fence_here || (cc_n > 0 && line_quote > cq[cc_n])) {
+        pop_containers(col_indent, line_quote)
+      }
+      # This line is not blank, so the blank-first item it may sit in has
+      # taken content and is no longer bounded at one blank. Clearing here
+      # rather than at the end keeps the flag off frames this line goes on
+      # to push, which set it themselves below.
+      if (cc_n > 0) cb[cc_n] = 0
+
+      if (fence_here) {
+        in_fence = 1; fence_char = ch; fence_width = width
         text_flow_open = 0
         print ""
         next
@@ -265,25 +993,122 @@ mp_markdown_renderable_text() {
       # Indented code cannot interrupt an open paragraph or list item. Keep an
       # indented line renderable while that text flow is open; only blank it
       # when indentation can really start a CommonMark code block.
+      #
+      # Inside a list item, indentation is measured from the item CONTENT
+      # column, so code begins four columns past THAT, not past column zero:
+      # under `- # Governance` a four-space line is still item prose and only
+      # a six-space one is code. Without that column, classifying a
+      # block-first item correctly (#812) would blank the ordinary item prose
+      # that follows it. The column is dropped again by the first line
+      # indented less than it that is not a lazy continuation — that line
+      # closes the item.
       if (!reference_continuation && !text_flow_open \
-          && (line ~ /^\t/ || substr(line, 1, 4) == "    ")) {
+          && col_indent >= code_column + 4) {
         print ""
         next
       }
       rendered = strip_inline_code(line)
-      print rendered
       probe = rendered
-      sub(/^[[:space:]]*/, "", probe)
-      if (probe ~ /^\[[^]]+\]:[[:space:]]*$/) {
+      sub(/^[ \t]*/, "", probe)
+      if (probe ~ /^\[[^]]+\]:[ \t]*$/) {
         reference_pending = 1
         text_flow_open = 0
       } else if (reference_continuation) {
         text_flow_open = 0
+      } else if (text_flow_open && col_indent >= code_column + 4) {
+        # Indented code cannot interrupt a paragraph, so while one is open
+        # a line this deep is lazy CONTINUATION TEXT — whatever block it
+        # may look like. The classifier below is handed the line with its
+        # indentation stripped and so cannot see the column at all, which
+        # is the whole question here: it read a four-space `- # Heading`
+        # under an open paragraph as a list starting there, closed the
+        # paragraph that was really still open, and blanked the
+        # continuation line after it as item code.
+        #
+        # The rule is one branch rather than a bullet-specific guard
+        # because it holds for every block shape. Verified against the
+        # reference parser with a paragraph open: at four columns past the
+        # container, a bullet, an ordered marker, an ATX heading, a
+        # thematic break, a block quote, a setext underline and an HTML
+        # block ALL stay paragraph text. The HTML block is the
+        # discriminating control — at three columns it does interrupt the
+        # paragraph and the link below it does not render, at four it does
+        # not interrupt and the link does.
+        text_flow_open = 1
       } else {
         flow_probe = line
-        sub(/^[[:space:]]*/, "", flow_probe)
-        text_flow_open = opens_text_flow(flow_probe)
+        sub(/^[ \t]*/, "", flow_probe)
+        marker_columns = 0
+        mc_n = 0
+        flow_column = col_indent
+        item_code_first = 0
+        item_blank_first = 0
+        item_fence_opened = 0
+        item_fence_char = ""
+        item_fence_width = 0
+        html_opened = 0
+        text_flow_open = opens_text_flow(flow_probe, text_flow_open)
+        if (mc_n > 0) {
+          # Outermost frame first: each push pops the frames its own MARKER
+          # closes, so replaying them in order rebuilds the WHOLE container
+          # stack the line opened rather than only its innermost item.
+          #
+          # Each marker starts where the previous one puts its content, and
+          # the outermost starts at the indent of the line. That start column
+          # is what the push pops against — see push_container: popping at the
+          # content column instead let a sibling item survive under its
+          # replacement.
+          for (mc_i = 1; mc_i <= mc_n; mc_i++) {
+            push_container(col_indent + mc[mc_i], \
+                           (mc_i > 1) ? col_indent + mc[mc_i - 1] : col_indent, \
+                           line_quote)
+          }
+          # Only the INNERMOST marker can be the one with nothing after it —
+          # every marker outside it has the next marker as its content — so
+          # the one-blank bound belongs to the frame the loop pushed last.
+          # `- - ` then a blank closes the inner item and leaves the outer
+          # one standing, which is what both renderers do.
+          if (item_blank_first) cb[cc_n] = 1
+        } else if (!text_flow_open) {
+          # The pop above runs BEFORE the line is classified, so it has to
+          # assume a dedented line might lazily continue the open paragraph
+          # and leave the container alone. Once the line is classified we
+          # know it did not — a heading after `- Governance` closes the item
+          # — and the stale column has to go, or the next indented line is
+          # measured against a container that no longer contains it and real
+          # top-level code is reported as prose.
+          pop_containers(col_indent, line_quote)
+        }
+        # A list item whose first child is an indented code block renders the
+        # remainder of its OWN marker line as that code, so the marker line
+        # carries no link either. The blanking above only ever reaches the
+        # lines that FOLLOW a marker, so this case has to be caught here or a
+        # link that never rendered gets reported.
+        if (item_code_first) rendered = ""
+        if (item_fence_opened) {
+          in_fence = 1
+          fence_char = item_fence_char
+          fence_width = item_fence_width
+          text_flow_open = 0
+          rendered = ""
+        }
+        # The OPENER of an HTML block is raw HTML too, and whatever follows
+        # the tag ON THAT LINE is block content rather than Markdown —
+        # `<div>See [the audit](hub.md)` renders no link in either renderer.
+        # A one-line block ends on its own opener, so the closer is tested
+        # here as well; the branch above only ever sees the lines after it.
+        if (html_opened) {
+          rendered = ""
+          in_html = (html_block_ends(substr(line, QD_CHARS + 1), html_opened)) \
+                    ? 0 : html_opened
+          # The quote depth the block was opened AT, so it can be closed when
+          # that container closes — see the guard above.
+          html_quote = line_quote
+          html_container_depth = cc_n
+          html_container_start = (cc_n > 0) ? cs[cc_n] : -1
+        }
       }
+      print rendered
     }
   ' "$f"
 }
@@ -317,19 +1142,40 @@ mp_markdown_renderable_text() {
 #                     ships broken to every consumer with check 10 silent
 #                     (#797 review).
 #
-# Each producer carries its own `|| true`: the brace group is the left
-# side of a pipeline (so it runs in a subshell where `set -e` applies),
-# and a no-match exit 1 from the FIRST grep would otherwise abort the
-# group and silently discard the later producers' output.
+# The `|| true` inside the brace group belongs to the GREP and to nothing
+# else. The group is the left side of a pipeline, so it runs in a subshell
+# where `set -e` applies, and a no-match exit 1 from that grep would abort the
+# group and silently discard the later producers' output — a real outcome,
+# because a doc need not carry a same-line reference definition.
+#
+# The two awk producers carry no such guard, deliberately. Neither has a
+# no-match state: they read every line and print what they find, so a nonzero
+# exit from either means the classifier DIED, and swallowing that turns check
+# 10 into a clean PASS on a document nobody could read. Measured on this
+# program: restore the recursion the classifier used to use and hand it a
+# document deep enough to segfault BWK awk, and with the guards in place the
+# whole check exits 0 with no findings. The callers now inspect the status —
+# see check 10 — so the same input reports a scan failure instead.
 mp_doc_link_targets() {
   local f="$1"
+  # `$2` selects which stream the final awk emits: empty (the default) for the
+  # resolved destinations check 10 compares, `unresolvable` for the ones whose
+  # character references cannot be expanded — see mp_doc_unresolvable_destinations.
+  local emit="${2:-}"
+  # CommonMark backslash escapes are limited to this ASCII punctuation set.
+  # Keep it in the shell and pass it to both awk stages so destination
+  # balancing and normalization share one definition across awk locales.
+  local ascii_punctuation=$'!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'
+  # These target-extraction awk stages compare pathname bytes. Pinning them to
+  # the C locale keeps BSD awk, gawk, and mawk aligned; the preceding renderer
+  # classifier keeps the caller's locale.
   {
     # Inline destinations need a small stateful reader rather than
     # `grep -o '\]([^)]*)'`: CommonMark bare destinations may contain
     # balanced parentheses (`hub(1).md`), and angle destinations may
     # contain parentheses or spaces. The first-closing-paren spelling
     # truncates those valid links and hides consumer-broken references.
-    mp_markdown_renderable_text "$f" | awk '
+    mp_markdown_renderable_text "$f" | LC_ALL=C awk -v ASCII_PUNCT="$ascii_punctuation" '
       {
         line = $0
         n = length(line)
@@ -360,7 +1206,11 @@ mp_doc_link_targets() {
 
           # Bare destination: the `)` that closes the link is the first
           # one encountered at nesting depth zero. Backslash escapes do
-          # not affect balancing and are unescaped for path comparison.
+          # not affect balancing, and the escape is carried through rather
+          # than resolved here: normalize_target() below resolves escapes
+          # and character references together, in one pass, and unescaping
+          # twice would let `\&#46;` — an escaped ampersand, which renders
+          # literally — decode into a `.` the reader never sees.
           depth = 0
           target = ""
           destination_done = 0
@@ -368,8 +1218,8 @@ mp_doc_link_targets() {
             c = substr(line, j, 1)
             if (c == "\\" && j < n) {
               nextc = substr(line, j + 1, 1)
-              if (nextc ~ /[[:punct:]]/) {
-                if (!destination_done) target = target nextc
+              if (index(ASCII_PUNCT, nextc) > 0) {
+                if (!destination_done) target = target c nextc
                 j++
                 continue
               }
@@ -399,7 +1249,7 @@ mp_doc_link_targets() {
           }
         }
       }
-    ' || true
+    '
     mp_markdown_renderable_text "$f" | grep -oE '^[[:space:]]{0,3}\[[^]]+\]:[[:space:]]*(<[^>]*>|[^[:space:]]+)' || true
     # Wrapped reference definition: a label + colon with NOTHING after it
     # on that line, then the destination as the first token of the next
@@ -408,7 +1258,7 @@ mp_doc_link_targets() {
     # an `{0,3}` interval, which not every awk implementation supports.
     # A blank line after the colon ends the definition (CommonMark allows
     # at most one line ending there), so nothing is emitted for it.
-    mp_markdown_renderable_text "$f" | awk '
+    mp_markdown_renderable_text "$f" | LC_ALL=C awk '
       function print_target(s, gt) {
         sub(/^[[:space:]]+/, "", s)
         if (substr(s, 1, 1) == "<") {
@@ -426,68 +1276,600 @@ mp_doc_link_targets() {
         indent = match($0, /[^[:space:]]/) - 1
         if (indent >= 0 && indent <= 3) pending = 1
       }
-    ' || true
+    '
   } | sed -E \
         -e 's/^\]\(//' \
         -e 's/\)$//' \
         -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
-    | awk '
+    | LC_ALL=C awk -v EMIT="$emit" -v ASCII_PUNCT="$ascii_punctuation" '
+        # CommonMark resolves entity and numeric character references inside
+        # a link destination (§ Entity and numeric character references), so
+        # the path a reader actually opens is the DECODED one:
+        # `[audit](hub&#46;md)` navigates to `hub.md`. Comparing the encoded
+        # spelling against the inventory therefore misses a hub-only target
+        # the browser resolves perfectly well (#807).
+        #
+        # NAMED_TEXT holds every named reference this checker can expand.
+        # It stores the expansion as a STRING, not as a code point: keying
+        # by code point could not represent `&fjlig;` (which expands to the
+        # two ASCII characters `fj`), so `[audit](hub&fjlig;.md)` reached
+        # `hubfj.md` while the destination stayed encoded — a hub-only
+        # sibling the browser resolves and the scan never saw.
+        #
+        # Two tables feed it. `refs` is the COMPLETE set of HTML5 named
+        # references whose expansion is entirely ASCII: 46 members, 45
+        # single-character ones listed as name/code-point pairs plus
+        # `fjlig`. `latin` is every HTML5 named reference whose expansion
+        # lies in Latin-1 Supplement or Latin Extended-A (U+00A0-U+017F,
+        # 234 members, all single-character) — the accented letters that
+        # actually spell European filenames. Both are generated from the
+        # published HTML5 table, not hand-collected.
+        #
+        # Decoding no longer stops at ASCII. A code point above 127 now has
+        # a deterministic byte spelling on every awk CI runs, because
+        # utf8_of below picks the emit primitive that is correct for the
+        # implementation it is running on rather than assuming one of them
+        # (see the measurement in its header comment). A named reference
+        # outside BOTH tables — an expansion outside the Latin blocks, such
+        # as `&Alpha;` — is still left encoded, which loses a match rather
+        # than inventing one; the numeric spelling of the same character
+        # decodes in full either way, so no character is unreachable, only
+        # one SPELLING of an exotic one. That residual is catalogued on
+        # #929 rather than paid for with the whole 2125-entry table.
+        BEGIN {
+          # Measured on BWK awk 20200816, gawk 5.4.1 and mawk 1.3.4: a
+          # LITERAL multi-byte character in this source survives
+          # byte-identically on all three, in both a UTF-8 locale and
+          # LC_ALL=C. Its length() is therefore a reliable runtime probe of
+          # whether THIS awk counts characters or bytes — and so of what
+          # sprintf("%c", n) means above ASCII.
+          REPLACEMENT = "�"
+          CHAR_ORIENTED = (length(REPLACEMENT) == 1)
+          refs = "Tab 9 NewLine 10 excl 33 QUOT 34 quot 34 num 35 dollar 36"
+          refs = refs " percnt 37 AMP 38 amp 38 apos 39 lpar 40 rpar 41"
+          refs = refs " ast 42 midast 42 plus 43 comma 44 period 46 sol 47"
+          refs = refs " colon 58 semi 59 LT 60 lt 60 equals 61 GT 62 gt 62"
+          refs = refs " quest 63 commat 64 lbrack 91 lsqb 91 bsol 92"
+          refs = refs " rbrack 93 rsqb 93 Hat 94 UnderBar 95 lowbar 95"
+          refs = refs " DiacriticalGrave 96 grave 96 lbrace 123 lcub 123"
+          refs = refs " VerticalLine 124 verbar 124 vert 124 rbrace 125"
+          refs = refs " rcub 125"
+          n_refs = split(refs, named_ref, " ")
+          for (i = 1; i < n_refs; i += 2) {
+            # A named expansion is stored ONCE here and returned verbatim
+            # later, so the newline flag utf8_of raises would be lost by the
+            # time `&NewLine;` is actually resolved. Capture it now, against
+            # the same predicate rather than a second list of code points,
+            # and char_reference_at re-raises it on use.
+            TARGET_DROP = 0
+            NAMED_TEXT[named_ref[i]] = utf8_of(named_ref[i + 1] + 0)
+            if (TARGET_DROP) NAMED_DROP[named_ref[i]] = 1
+          }
+          # The 46th: the only HTML5 named reference whose expansion is more
+          # than one ASCII character. It has no code point to list above.
+          NAMED_TEXT["fjlig"] = "fj"
+          latin = "AElig 198 Aacute 193 Abreve 258 Acirc 194 Agrave 192"
+          latin = latin " Amacr 256 Aogon 260 Aring 197 Atilde 195 Auml 196"
+          latin = latin " COPY 169 Cacute 262 Ccaron 268 Ccedil 199 Ccirc 264"
+          latin = latin " Cdot 266 Cedilla 184 CenterDot 183 Dcaron 270"
+          latin = latin " DiacriticalAcute 180 Dot 168 DoubleDot 168"
+          latin = latin " Dstrok 272 ENG 330 ETH 208 Eacute 201 Ecaron 282"
+          latin = latin " Ecirc 202 Edot 278 Egrave 200 Emacr 274 Eogon 280"
+          latin = latin " Euml 203 Gbreve 286 Gcedil 290 Gcirc 284 Gdot 288"
+          latin = latin " Hcirc 292 Hstrok 294 IJlig 306 Iacute 205 Icirc 206"
+          latin = latin " Idot 304 Igrave 204 Imacr 298 Iogon 302 Itilde 296"
+          latin = latin " Iuml 207 Jcirc 308 Kcedil 310 Lacute 313 Lcaron 317"
+          latin = latin " Lcedil 315 Lmidot 319 Lstrok 321 Nacute 323"
+          latin = latin " Ncaron 327 Ncedil 325 NonBreakingSpace 160"
+          latin = latin " Ntilde 209 OElig 338 Oacute 211 Ocirc 212"
+          latin = latin " Odblac 336 Ograve 210 Omacr 332 Oslash 216"
+          latin = latin " Otilde 213 Ouml 214 PlusMinus 177 REG 174"
+          latin = latin " Racute 340 Rcaron 344 Rcedil 342 Sacute 346"
+          latin = latin " Scaron 352 Scedil 350 Scirc 348 THORN 222"
+          latin = latin " Tcaron 356 Tcedil 354 Tstrok 358 Uacute 218"
+          latin = latin " Ubreve 364 Ucirc 219 Udblac 368 Ugrave 217"
+          latin = latin " Umacr 362 Uogon 370 Uring 366 Utilde 360 Uuml 220"
+          latin = latin " Wcirc 372 Yacute 221 Ycirc 374 Yuml 376 Zacute 377"
+          latin = latin " Zcaron 381 Zdot 379 aacute 225 abreve 259"
+          latin = latin " acirc 226 acute 180 aelig 230 agrave 224 amacr 257"
+          latin = latin " angst 197 aogon 261 aring 229 atilde 227 auml 228"
+          latin = latin " brvbar 166 cacute 263 ccaron 269 ccedil 231"
+          latin = latin " ccirc 265 cdot 267 cedil 184 cent 162 centerdot 183"
+          latin = latin " circledR 174 copy 169 curren 164 dcaron 271 deg 176"
+          latin = latin " die 168 div 247 divide 247 dstrok 273 eacute 233"
+          latin = latin " ecaron 283 ecirc 234 edot 279 egrave 232 emacr 275"
+          latin = latin " eng 331 eogon 281 eth 240 euml 235 frac12 189"
+          latin = latin " frac14 188 frac34 190 gbreve 287 gcirc 285"
+          latin = latin " gdot 289 half 189 hcirc 293 hstrok 295 iacute 237"
+          latin = latin " icirc 238 iexcl 161 igrave 236 ijlig 307 imacr 299"
+          latin = latin " imath 305 inodot 305 iogon 303 iquest 191"
+          latin = latin " itilde 297 iuml 239 jcirc 309 kcedil 311"
+          latin = latin " kgreen 312 lacute 314 laquo 171 lcaron 318"
+          latin = latin " lcedil 316 lmidot 320 lstrok 322 macr 175 micro 181"
+          latin = latin " middot 183 nacute 324 napos 329 nbsp 160 ncaron 328"
+          latin = latin " ncedil 326 not 172 ntilde 241 oacute 243 ocirc 244"
+          latin = latin " odblac 337 oelig 339 ograve 242 omacr 333 ordf 170"
+          latin = latin " ordm 186 oslash 248 otilde 245 ouml 246 para 182"
+          latin = latin " plusmn 177 pm 177 pound 163 racute 341 raquo 187"
+          latin = latin " rcaron 345 rcedil 343 reg 174 sacute 347"
+          latin = latin " scaron 353 scedil 351 scirc 349 sect 167 shy 173"
+          latin = latin " strns 175 sup1 185 sup2 178 sup3 179 szlig 223"
+          latin = latin " tcaron 357 tcedil 355 thorn 254 times 215"
+          latin = latin " tstrok 359 uacute 250 ubreve 365 ucirc 251"
+          latin = latin " udblac 369 ugrave 249 umacr 363 uml 168 uogon 371"
+          latin = latin " uring 367 utilde 361 uuml 252 wcirc 373"
+          latin = latin " yacute 253 ycirc 375 yen 165 yuml 255 zacute 378"
+          latin = latin " zcaron 382 zdot 380"
+          n_latin = split(latin, latin_ref, " ")
+          for (i = 1; i < n_latin; i += 2) {
+            # Same capture as the ASCII table above. No Latin-1 name expands
+            # to a newline today, so this raises nothing — it is here so the
+            # two tables cannot drift into disagreeing about the rule.
+            TARGET_DROP = 0
+            NAMED_TEXT[latin_ref[i]] = utf8_of(latin_ref[i + 1] + 0)
+            if (TARGET_DROP) NAMED_DROP[latin_ref[i]] = 1
+          }
+          TARGET_DROP = 0
+        }
+        # Encode a Unicode code point as the bytes a filename carries.
+        #
+        # NEITHER available primitive is portable on its own. Measured on
+        # BWK awk 20200816, gawk 5.4.1 and mawk 1.3.4 in a UTF-8 locale:
+        #
+        #   sprintf("%c", 252)          BWK: fc   gawk: c3 bc   mawk: fc
+        #   sprintf("%c",195) then 188  BWK: c3 bc   mawk: c3 bc
+        #                               gawk: c3 83 c2 bc
+        #   a literal "u-umlaut" here   ALL THREE: c3 bc
+        #
+        # gawk in a UTF-8 locale reads "%c" as a CODE POINT — so it emits
+        # the right character for one, and DOUBLE-ENCODES a hand-built
+        # byte. BWK awk and mawk read "%c" as a BYTE — so a hand-built
+        # sequence is right and a code point above 127 comes out as its
+        # Latin-1 byte. Each implementation therefore gets the primitive
+        # that is correct FOR IT, selected by the CHAR_ORIENTED probe.
+        # Both branches were measured to emit the same bytes for the same
+        # code point, which is what makes this decode deterministic across
+        # CI runners instead of implementation-defined.
+        #
+        # CR and LF are handled for a reason of this program rather than of
+        # the spec: targets are emitted ONE PER LINE, so a decoded newline
+        # would split a single destination into two records and the tail
+        # could false-match an inventory path — a canonical doc linking
+        # `prefix&NewLine;hub.md` reporting a reference to `hub.md` that no
+        # reader can follow. (The reference parser keeps the newline and
+        # percent-encodes it: `prefix%0Ahub.md`, one destination, still not
+        # `hub.md`.)
+        #
+        # SUBSTITUTING a character cannot solve that, whichever character is
+        # picked. U+FFFD was chosen on the claim that it "matches no declared
+        # path", and that claim is false: U+FFFD is a legal pathname
+        # character, so a hub-only doc named `prefix<U+FFFD>hub.md` was
+        # matched by `prefix&NewLine;hub.md` and drew a false ownership
+        # failure. Every substitute has some such name.
+        #
+        # So the destination is DROPPED instead of rewritten. A flag records
+        # that a newline was decoded and normalize_target returns the empty
+        # string, which the emit filter discards. That loses a match rather
+        # than inventing one, and it cannot alias anything, because no value
+        # is ever compared. Nothing true is lost either: the target and
+        # inventory lists are newline-separated the whole way through this
+        # program, so a path that genuinely contains a newline is not
+        # representable in them to begin with.
+        #
+        # The out-of-range guard is defensive — char_reference_at rejects
+        # those values before they reach here, and every table entry is a
+        # valid code point.
+        # NUL is dropped for the same reason and by the same flag. It is not
+        # a newline, but it is likewise not a byte any pathname can carry, so
+        # substituting for it can only alias: `%00.md` reported a hub-only
+        # doc named `<U+FFFD>.md`, and the rendered URL still says `%00.md`.
+        # Every OTHER control byte IS legal in a pathname, is emitted as
+        # itself, and so needs none of this.
+        function utf8_of(cp) {
+          if (cp == 0) { TARGET_DROP = 1; return REPLACEMENT }
+          if (cp <= 0 || cp > 1114111) return REPLACEMENT
+          if (cp >= 55296 && cp <= 57343) return REPLACEMENT
+          if (cp == 10 || cp == 13) { TARGET_DROP = 1; return REPLACEMENT }
+          if (cp < 128 || CHAR_ORIENTED) return sprintf("%c", cp)
+          if (cp < 2048) {
+            return sprintf("%c%c", 192 + int(cp / 64), 128 + cp % 64)
+          }
+          if (cp < 65536) {
+            return sprintf("%c%c%c", 224 + int(cp / 4096), \
+                           128 + int(cp / 64) % 64, 128 + cp % 64)
+          }
+          return sprintf("%c%c%c%c", 240 + int(cp / 262144), \
+                         128 + int(cp / 4096) % 64, \
+                         128 + int(cp / 64) % 64, 128 + cp % 64)
+        }
         function hex_value(c, p) {
           p = index("0123456789ABCDEF", toupper(c))
           return p ? p - 1 : -1
         }
-        function percent_decode(s, out, i, c, hi, lo) {
+        # Decode the character reference starting at s[i] (an "&"). Sets the
+        # global REF_LEN to the source length consumed; REF_LEN 0 means "not
+        # a character reference", and the caller emits the "&" literally.
+        #
+        # The length caps are EIGHT digits in either base, and they come from
+        # the renderer rather than from the prose of the spec. § Entity and
+        # numeric character references says 1-7 decimal and 1-6 hex — but
+        # this check does not ask "is this reference well-spelled", it asks
+        # "does a reader following this link land on a hub-only doc", and
+        # that is answered by the parser that produces the href. Measured
+        # against the commonmark preset of markdown-it-py 4.2.0 in
+        # DESTINATION position: `hub&#00000046;md` and `hub&#x0000002E;md`
+        # (eight digits each) both render as links to `hub.md`, and nine
+        # digits in either base does not. Spelling the prose caps here left
+        # both of those as a silent false negative — the reader reaches the
+        # hub-only sibling and the scan compares the encoded spelling. The
+        # caps are tested with length() rather than an {1,8} interval, which
+        # not every awk implementation supports.
+        #
+        # NOTE: this whole awk program is a single-quoted shell string, so a
+        # lone apostrophe in a comment ENDS it and bash then parses the awk
+        # source as commands. Keep comments apostrophe-free.
+        function char_reference_at(s, i,   rest, semi, body, digits, cp, k) {
+          REF_LEN = 0
+          REF_UNKNOWN_NAME = 0
+          rest = substr(s, i)
+          semi = index(rest, ";")
+          if (semi < 3) return ""
+          body = substr(rest, 2, semi - 2)
+          if (substr(body, 1, 1) != "#") {
+            if (!(body in NAMED_TEXT)) {
+              # An unknown NAME is not the same thing as "not a reference",
+              # and treating the two alike is the one failure mode this
+              # program must not have. The tables above hold ASCII, Latin-1
+              # Supplement and Latin Extended-A; HTML5 defines about 2100 more
+              # names, and every one of them the renderer resolves and this
+              # table does not was a SILENT MISS — the encoded spelling was
+              # compared, matched nothing, and the reference was permitted.
+              # Measured in destination position, markdown-it-py 4.2.0 and
+              # cmark-gfm agreeing exactly:
+              #
+              #   [the audit](&alpha;.md)     both: href="%CE%B1.md"
+              #   [the audit](&notaname;.md)  both: href="&amp;notaname;.md"
+              #
+              # So a hub-only doc actually named with that Greek letter was
+              # reachable by every reader and invisible to check 10 (#929
+              # item 31). Completing the table means about 2100 more names
+              # including the multi-code-point expansions, in awk; failing
+              # closed costs one flag and turns the MISS into a report the
+              # author can act on, which is the direction a guardrail should
+              # err in.
+              #
+              # The trigger is deliberately WIDER than HTML5: `&notaname;` is
+              # reported too, although both renderers leave it literal, because
+              # distinguishing the two needs exactly the table this avoids
+              # embedding. It is bounded on the one axis that costs nothing —
+              # HTML5 defines no single-character name, so `&x;` cannot be one
+              # and is still read as literal text.
+              #
+              # Reported as a fact about THIS reference rather than raised on
+              # the destination directly, because where in the destination it
+              # sits decides whether it matters at all — see normalize_target.
+              if (length(body) >= 2 && body ~ /^[A-Za-z][A-Za-z0-9]*$/) {
+                REF_UNKNOWN_NAME = 1
+              }
+              return ""
+            }
+            REF_LEN = semi
+            # The expansion was computed once at startup, so re-raise the
+            # newline flag its construction recorded.
+            if (body in NAMED_DROP) TARGET_DROP = 1
+            return NAMED_TEXT[body]
+          }
+          digits = substr(body, 2)
+          if (substr(digits, 1, 1) == "x" || substr(digits, 1, 1) == "X") {
+            digits = substr(digits, 2)
+            if (digits !~ /^[0-9A-Fa-f]+$/ || length(digits) > 8) return ""
+            cp = 0
+            for (k = 1; k <= length(digits); k++) {
+              cp = cp * 16 + hex_value(substr(digits, k, 1))
+            }
+          } else {
+            if (digits !~ /^[0-9]+$/ || length(digits) > 8) return ""
+            cp = digits + 0
+          }
+          # Every code point that names a character decodes, so no numeric
+          # reference to a real character is compared by its ENCODED
+          # spelling any more — that was the false-negative path
+          # `[audit](h&#252;b.md)` took to reach a hub-only `hüb.md`
+          # unreported.
+          #
+          # A value the renderer rejects is NOT a character reference here,
+          # and the "&" is emitted literally. The spec substitutes U+FFFD
+          # for these, but that rule is written for reference-in-TEXT; in
+          # DESTINATION position the reference parser leaves the source
+          # untouched, and the destination reading is the one that decides
+          # where a reader lands:
+          #
+          #   `[l](a&#0;b.md)`        text: a<U+FFFD>b   href: a&#0;b.md
+          #   `[l](a&#xD800;b.md)`    text: a<U+FFFD>b   href: a&#xD800;b.md
+          #
+          # Following the destination reading keeps this checker aligned
+          # with the parser whose output decides whether a link renders.
+          if (!valid_entity_code(cp)) return ""
+          REF_LEN = semi
+          return utf8_of(cp)
+        }
+        # Which code points the RENDERER will decode. Rejecting a value here
+        # means the reference stays literal source text, which is what the
+        # renderer does with it — it does not substitute U+FFFD.
+        #
+        # Measured in DESTINATION position with the commonmark preset of
+        # markdown-it-py 4.2.0, every range below is left literal:
+        #
+        #   U+0000-U+0008, U+000B, U+000E-U+001F  C0 except tab, LF, FF, CR
+        #   U+007F-U+009F                         DEL and the C1 range
+        #   U+D800-U+DFFF                         surrogates
+        #   U+FDD0-U+FDEF                         noncharacters
+        #   any value whose low 16 bits are FFFE or FFFF
+        #   above U+10FFFF                        out of range
+        #
+        # Only the surrogate and out-of-range rows were rejected before, so
+        # `&#128;` decoded to a character the renderer never emits. That is a
+        # divergence in the false-NEGATIVE direction: a hub-only doc whose
+        # name carries the literal spelling is reachable by a reader and
+        # invisible to the scan. The C1 range is where this bites hardest,
+        # because HTML5 remaps it (`&#128;` to EURO) while CommonMark does
+        # neither the remap nor the decode — so neither an HTML5 table nor a
+        # plain decode matches the renderer, and leaving it literal does.
+        function valid_entity_code(cp,   low) {
+          if (cp <= 8 || cp == 11) return 0
+          if (cp >= 14 && cp <= 31) return 0
+          if (cp >= 127 && cp <= 159) return 0
+          if (cp >= 55296 && cp <= 57343) return 0
+          if (cp >= 64976 && cp <= 65007) return 0
+          if (cp > 1114111) return 0
+          low = cp % 65536
+          if (low == 65534 || low == 65535) return 0
+          return 1
+        }
+        # A percent-escape names a BYTE; utf8_of emits whatever unit the
+        # running awk counts. On a byte-oriented awk the two coincide, so
+        # sprintf("%c", byte) per escape was right. On a character-oriented
+        # awk it is not: gawk reads sprintf("%c", 195) as the CHARACTER
+        # U+00C3, so `%C3%B8` decoded one byte at a time became U+00C3 U+00B8
+        # — the double-encoded spelling of the same name. It compares unequal
+        # both to the literal filename and to the `&#248;` spelling, which
+        # made this verdict depend on which awk CI happened to run.
+        #
+        # An escape RUN is therefore buffered as byte values and UTF-8
+        # decoded to code points, and every code point is emitted through
+        # utf8_of — the one place that knows what a character is on this awk.
+        # A byte that is not part of a well-formed sequence (a stray
+        # continuation, a truncated run, an overlong lead) DROPS the whole
+        # destination, by the same reasoning as the decoded newline below:
+        # U+FFFD is a legal pathname character, so emitting it and comparing
+        # anyway lets `%FFhub.md` match a hub-only doc really named
+        # `<U+FFFD>hub.md` and invent an ownership failure — while the href
+        # a reader follows still says `%FF`, whose byte is not the UTF-8
+        # spelling of that name. U+FFFD is still written into the decoded
+        # text so the shape of the rest of the run is preserved; the flag,
+        # not the character, is what keeps the value from being compared.
+        # That also gives percent-escapes the CR/LF handling the reference
+        # decoder already has, for the same one-destination-per-record
+        # reason.
+        function decode_escape_run(n,   out, k, b, cp, need, j, ok) {
           out = ""
+          k = 1
+          while (k <= n) {
+            b = ESC_BYTE[k]
+            need = -1
+            if (b < 128) { cp = b; need = 0 }
+            else if (b >= 194 && b <= 223) { cp = b - 192; need = 1 }
+            else if (b >= 224 && b <= 239) { cp = b - 224; need = 2 }
+            else if (b >= 240 && b <= 244) { cp = b - 240; need = 3 }
+            if (need < 0 || k + need > n) {
+              out = out REPLACEMENT
+              TARGET_DROP = 1
+              k++
+              continue
+            }
+            ok = 1
+            for (j = 1; j <= need; j++) {
+              b = ESC_BYTE[k + j]
+              if (b < 128 || b > 191) { ok = 0; break }
+              cp = cp * 64 + (b - 128)
+            }
+            # A continuation-byte range check is not UTF-8 well-formedness.
+            # Unicode Table 3-7 also bounds the SCALAR each sequence LENGTH
+            # may carry, and a decoder that skips that bound invents a
+            # character no reader ever sees. %E0%81%81 is an overlong
+            # spelling: the bytes are malformed and the renderer yields
+            # replacement characters, but decoding by continuation range
+            # alone produced 65, so a hub-only doc named A.md drew a false
+            # ownership failure from a link nobody can follow.
+            #
+            # The two-byte minimum is already enforced by the lead-byte
+            # range above, where 194 excludes the overlong C0 and C1 leads.
+            # The three- and four-byte minima, the surrogate range and the
+            # U+10FFFF ceiling have to be spelled out here.
+            if (ok && need == 2 && cp < 2048) ok = 0
+            if (ok && need == 3 && cp < 65536) ok = 0
+            if (ok && cp >= 55296 && cp <= 57343) ok = 0
+            if (ok && cp > 1114111) ok = 0
+            if (!ok) {
+              out = out REPLACEMENT
+              TARGET_DROP = 1
+              k++
+              continue
+            }
+            out = out utf8_of(cp)
+            k += need + 1
+          }
+          return out
+        }
+        function percent_decode(s,   out, i, c, hi, lo, n) {
+          out = ""
+          n = 0
           for (i = 1; i <= length(s); i++) {
             c = substr(s, i, 1)
             if (c == "%" && i + 2 <= length(s)) {
               hi = hex_value(substr(s, i + 1, 1))
               lo = hex_value(substr(s, i + 2, 1))
               if (hi >= 0 && lo >= 0) {
-                out = out sprintf("%c", hi * 16 + lo)
+                n = n + 1
+                ESC_BYTE[n] = hi * 16 + lo
                 i += 2
                 continue
               }
             }
+            if (n > 0) {
+              out = out decode_escape_run(n)
+              n = 0
+            }
             out = out c
           }
+          if (n > 0) out = out decode_escape_run(n)
           return out
         }
-        function unescape_punctuation(s, out, i, c, nextc) {
+        # Backslash escapes and character references are resolved in ONE
+        # left-to-right pass, because CommonMark resolves them together and
+        # re-reads neither result as syntax. Two separate passes get both
+        # directions wrong: an escaped ampersand (`\&#46;`, which renders
+        # literally) would decode anyway, and `&#38;#46;` — an escaped
+        # ampersand written as a reference — would decode twice into a `.`
+        # the reader never sees.
+        function unescape_and_decode(s,   out, i, c, nextc, decoded) {
           out = ""
-          for (i = 1; i <= length(s); i++) {
+          i = 1
+          while (i <= length(s)) {
             c = substr(s, i, 1)
-            nextc = substr(s, i + 1, 1)
-            if (c == "\\" && nextc ~ /[[:punct:]]/) {
-              out = out nextc
-              i++
-            } else {
+            if (c == "\\") {
+              nextc = substr(s, i + 1, 1)
+              if (nextc != "" && index(ASCII_PUNCT, nextc) > 0) {
+                out = out nextc
+                i += 2
+                continue
+              }
               out = out c
+              i++
+              continue
             }
+            if (c == "&") {
+              decoded = char_reference_at(s, i)
+              if (REF_LEN > 0) {
+                out = out decoded
+                i += REF_LEN
+                continue
+              }
+              # Record WHERE the first unexpandable name lands in the decoded
+              # destination. normalize_target needs the position, not just the
+              # fact, because a name in the query or fragment does not change
+              # the PATH this program compares.
+              if (REF_UNKNOWN_NAME && !TARGET_UNRESOLVED) {
+                TARGET_UNRESOLVED = 1
+                TARGET_UNRESOLVED_AT = length(out) + 1
+              }
+            }
+            out = out c
+            i++
           }
           return out
         }
-        function normalize_target(s) {
-          s = unescape_punctuation(s)
+        function normalize_target(s,   cut) {
+          # Reset per destination: the flag is set by utf8_of when a decoded
+          # CR or LF appears anywhere in THIS destination, in a character
+          # reference or a percent escape alike. TARGET_UNRESOLVED is the
+          # same shape, raised by char_reference_at for a named reference this
+          # program cannot expand.
+          TARGET_DROP = 0
+          TARGET_UNRESOLVED = 0
+          TARGET_UNRESOLVED_AT = 0
+          s = unescape_and_decode(s)
           # URL parsing recognizes raw query/fragment delimiters before
-          # percent decoding, so encoded %3F/%23 remain filename bytes.
+          # percent decoding, so encoded %3F/%23 remain filename bytes. A
+          # character reference is resolved BEFORE the URL is read, though,
+          # so a `&#63;` really does start a query string — which is why the
+          # decode above runs first.
+          #
+          # An unexpandable name is only worth reporting when it is in the
+          # PATH, which is the only part this program compares. Both
+          # renderers percent-encode `hub.md#&alpha;section` to
+          # `hub.md#%CE%B1section`: the fragment changes, the path stays
+          # `hub.md`, and reporting the destination as unverifiable would be a
+          # false positive on a link that resolves perfectly (CodeRabbit,
+          # #925). The delimiter position is taken BEFORE the strip, and an
+          # unknown name at or past it is dropped.
+          cut = match(s, /[?#]/)
+          if (TARGET_UNRESOLVED && cut > 0 && TARGET_UNRESOLVED_AT >= cut) {
+            TARGET_UNRESOLVED = 0
+          }
           sub(/[?#].*$/, "", s)
-          return percent_decode(s)
+          s = percent_decode(s)
+          if (TARGET_DROP) return ""
+          return s
+        }
+        # `EMIT` picks the stream. Empty (the default) is the resolved
+        # destination, one per line, which is what check 10 compares against
+        # the inventory. `unresolvable` is the destination AS WRITTEN, and
+        # only for the ones normalize_target could not fully resolve.
+        #
+        # Two passes over one extractor rather than one pass with a marker
+        # line mixed into the default stream: any marker is a string that some
+        # real destination could also decode to, and a decoded control byte is
+        # no safer — every control byte except NUL, CR and LF is a legal
+        # pathname byte here and is emitted as itself. A separate stream
+        # cannot alias anything.
+        # The blank-line filter lives here rather than in a trailing
+        # `grep -v ... || true`, and that placement is load-bearing. A `grep`
+        # last in the pipeline exits 1 whenever it filters everything out,
+        # which is an ORDINARY outcome (a doc with no destinations at all), so
+        # the `|| true` that covered it also covered a producer that DIED. The
+        # consequence is measurable on this program: restore the recursion the
+        # classifier used to use, hand it a document deep enough to segfault
+        # BWK awk, and check 10 prints a clean PASS on a document it could not
+        # read. With the filter moved inside, the last stage is this awk and
+        # its exit status means what it says.
+        # The destinations check 10 never compares. Spelled to mirror the
+        # shell `case` in that loop character for character — `''|*://*|
+        # mailto:*|//*` — because the two lists saying different things is the
+        # whole defect this guards: an absolute URL cannot resolve to a
+        # repo-local doc, so an unexpandable name inside one hides nothing,
+        # and reporting it blocks a portable canonical doc for no gain (Codex
+        # P2 on #925). The empty case covers a destination dropped for a
+        # decoded newline or NUL, which the target pass discards as well.
+        function skipped_by_check_10(t) {
+          return (t == "" || index(t, "://") > 0 \
+                  || substr(t, 1, 7) == "mailto:" || substr(t, 1, 2) == "//")
+        }
+        function emit_target(decoded, raw) {
+          if (EMIT == "unresolvable") {
+            if (TARGET_UNRESOLVED && !skipped_by_check_10(decoded)) print raw
+            return
+          }
+          if (decoded ~ /^[[:space:]]*$/) return
+          print decoded
         }
         {
           sub(/^[[:space:]]+/, "")
           if (substr($0, 1, 1) == "<") {
             gt = index($0, ">")
             if (gt > 1) {
-              print normalize_target(substr($0, 2, gt - 2))
+              # The destination AS WRITTEN is the angle wrapper, not the whole
+              # line: a reference definition may carry a title after it, and
+              # quoting `<x.md> "Title"` as the destination names something
+              # the author did not write. The bare branch below already trims
+              # at the first space; this is the same trim.
+              emit_target(normalize_target(substr($0, 2, gt - 2)), \
+                          substr($0, 1, gt))
               next
             }
           }
           sub(/[[:space:]].*$/, "")
-          print normalize_target($0)
+          emit_target(normalize_target($0), $0)
         }
-      ' \
-    | grep -v '^[[:space:]]*$' || true
+      '
+}
+
+# The destinations of `$1` that carry a named character reference this program
+# cannot expand, emitted AS WRITTEN so the diagnostic can quote what the author
+# typed. See char_reference_at for why an unknown name is reported rather than
+# compared in its encoded spelling.
+mp_doc_unresolvable_destinations() {
+  mp_doc_link_targets "$1" unresolvable
 }
 
 # Resolve a link target against the directory of the document carrying
@@ -1288,17 +2670,65 @@ if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
     [ -f "$REPO_ROOT/$canon_doc" ] || continue
 
     # Resolve this doc's link targets ONCE, not once per hub-only doc.
+    #
+    # The extraction is captured and its STATUS inspected rather than read
+    # straight from a here-string, because a here-string discards it. The
+    # extractor cannot fail quietly and be harmless: it produces the evidence
+    # this whole check reasons from, so no output is indistinguishable from a
+    # clean document. Measured on this program by restoring the recursion the
+    # classifier used to use and handing it a document deep enough to segfault
+    # BWK awk — the check printed PASS. It now reports the scan failure and
+    # skips the comparisons that would be made on absent evidence.
     canon_dir="${canon_doc%/*}"
     [ "$canon_dir" = "$canon_doc" ] && canon_dir="."
+    if ! link_targets_out=$(mp_doc_link_targets "$REPO_ROOT/$canon_doc"); then
+      echo "FAIL: canonical doc '$canon_doc' could not be scanned for link targets — the Markdown extractor exited non-zero, so its link inventory is unknown and this doc was NOT checked against the hub-only inventory. Re-run the check; if it repeats, the document is hitting a limit of the extractor and belongs on an issue rather than in a silent pass."
+      FAILED=1
+      continue
+    fi
     resolved_targets=""
     while IFS= read -r link_target; do
       case "$link_target" in
-        # Empty, pure fragment, or already absolute (any scheme, plus
-        # protocol-relative `//host/...`) — nothing repo-relative to break.
-        ''|'#'*|*://*|mailto:*|//*) continue ;;
+        # Empty or already absolute (any scheme, plus protocol-relative
+        # `//host/...`) — nothing repo-relative to break.
+        #
+        # A pure fragment is NOT tested here, because it cannot arrive: the
+        # extractor strips `[?#]...` from the target while it is still in
+        # URL syntax, so `#section` reaches this loop as the empty string
+        # and `other.md#frag` as `other.md`. Re-testing for a leading `#`
+        # after decoding was therefore redundant, and worse than
+        # redundant — percent decoding runs after that strip, exactly so
+        # that an ENCODED delimiter stays path data, so `%23hub.md`
+        # arrives as the pathname `#hub.md` and was being discarded as a
+        # fragment. That silently missed a real canonical -> hub-only link.
+        ''|*://*|mailto:*|//*) continue ;;
       esac
       resolved_targets="${resolved_targets}$(mp_resolve_relative "$canon_dir" "$link_target")"$'\n'
-    done <<< "$(mp_doc_link_targets "$REPO_ROOT/$canon_doc")"
+    done <<< "$link_targets_out"
+
+    # (c) A destination this checker cannot fully decode is UNVERIFIABLE, not
+    # clean. The named-reference table covers ASCII and the two Latin blocks;
+    # a name outside it used to be compared in its still-encoded spelling,
+    # which matches no inventory path and quietly permitted the link — so
+    # `[the audit](&alpha;.md)`, which every reader resolves, hid a hub-only
+    # doc actually named with that letter (#929 item 31). Reporting the
+    # destination trades that MISS for a possible false positive, which is
+    # the direction a guardrail should err in, and the author has two exact
+    # spellings to reach for instead.
+    #
+    # Captured and status-checked for the same reason as the pass above, and
+    # more sharply: a stream that exists to report what could not be decoded
+    # must not be the one stream that goes quiet when the decoder breaks.
+    if ! unresolvable_out=$(mp_doc_unresolvable_destinations "$REPO_ROOT/$canon_doc"); then
+      echo "FAIL: canonical doc '$canon_doc' could not be scanned for unresolvable link destinations — the Markdown extractor exited non-zero, so nothing about this doc's destinations is known."
+      FAILED=1
+      continue
+    fi
+    while IFS= read -r raw_dest; do
+      [ -n "$raw_dest" ] || continue
+      echo "FAIL: canonical doc '$canon_doc' has the link destination '$raw_dest', which carries a named character reference this check cannot expand — the destination a reader opens is therefore unknown, and it cannot be compared against the hub-only inventory. Write the character itself, or its numeric reference (&#NNN; or &#xHH;), both of which are decoded in full; if the text is meant literally, spell the ampersand &amp;."
+      FAILED=1
+    done <<< "$unresolvable_out"
 
     while IFS= read -r hub_doc; do
       [ -n "$hub_doc" ] || continue
