@@ -15,7 +15,11 @@ set -euo pipefail
 #                       auto-merge-on-approval registered-reviewer gate, which
 #                       mirrors scripts/codex-review-check.sh gate (b) and the
 #                       required merge-clearance-gate.
-#   author_identity  -> the `assign` job's author check.
+#   author_identity  -> the `assign` job's author check, AND the identity the
+#                       auto-merge job requires AUTHOR_MERGE_TOKEN to resolve
+#                       to before it will call `gh pr merge` at all. That step
+#                       parsed the value out of its own unpinned checkout until
+#                       #788's second half moved it onto this output.
 #   threshold/paths  -> the `triage` job's preliminary requires-review calc.
 #
 # scripts/merge-clearance-gate.sh and scripts/codex-review-check.sh already
@@ -61,6 +65,10 @@ set -euo pipefail
 #                       have; `triage` fails closed on its own resolver failure
 #                       moments later and skips the fingerprint helper entirely.
 #   author_identity=    unproven, so left empty.
+#
+# A policy that RESOLVES but names no top-level `author_identity` is the same
+# unproven state by a different route, and is emitted the same way: empty. See
+# the note on the final `emit author_identity` below.
 #
 # Exiting 0 is the point: `triage` declares `needs: [load-config]` without
 # `always()`, so a hard failure here SKIPS triage, and a skipped labeling job
@@ -114,6 +122,64 @@ command -v jq >/dev/null 2>&1 || { echo "load_review_config.sh: jq is required" 
 
 emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 
+# Read one TOP-LEVEL scalar out of a policy file.
+#
+# This is the parser `.github/workflows/agent-review.yml`'s auto-merge job used
+# to run inline against its own checkout before #788 routed the identity
+# through this script's output — byte-for-byte, so the value the
+# AUTHOR_MERGE_TOKEN check now compares is the value it computed for itself
+# then, and the switch of SOURCE does not smuggle in a change of SYNTAX.
+# `scripts/ci/check_workflow_parsers` pins these semantics case by case
+# (bare / "double-quoted" / 'single-quoted').
+#
+# Three properties are load-bearing, and the older `grep key: | awk '{print
+# $2}'` form had none of them:
+#
+#   anchored     the key must start at column 0, so a nested `author_identity:`
+#                under another block — or the same word inside a comment — is
+#                not mistaken for the top-level setting.
+#   unquoted     `author_identity: "nathanjohnpayne"` yields nathanjohnpayne,
+#                not "nathanjohnpayne". A quoted value compared verbatim
+#                against `gh api user --jq .login` never matches, which would
+#                turn a legal YAML spelling into a permanent merge refusal.
+#   first-wins   `exit` after the first match. A repeated scalar key would
+#                otherwise print twice, and a GITHUB_OUTPUT entry is a single
+#                `key=value` LINE — Actions parses the second one as its own
+#                output entry. That shape became reachable when the policy
+#                could be FETCHED from another branch rather than always being
+#                the checked-out file.
+#
+# KNOWN LIMIT — tracked in #978, deliberately not fixed here. These are a LINE
+# parser's semantics, not YAML's, and on a malformed or adversarial policy the
+# two diverge: an unterminated quote is stripped into a clean value; a `#` with
+# no separating space opens a comment here where YAML reads it as part of the
+# scalar; a repeated key (in this or any other spelling) resolves first-wins
+# where YAML consumers resolve last-wins or reject the document. All three are
+# inherited verbatim — this script RELOCATES the expression above, it neither
+# sharpens nor weakens it, and `agent-review.yml` ran exactly these semantics
+# in exactly this authorization role before #788 moved the source. All three
+# also require the policy on the PR's BASE branch to be malformed, which is
+# protected content, where the defect #788 names was reachable from any PR by
+# editing policy on its own branch. #978 carries the design of the parsing
+# contract — including whether this scalar should come from a real YAML parser
+# at all — because three review rounds each found one more spelling, which is
+# the shape that says stop patching and go design.
+policy_scalar() {  # <file> <key>
+  awk -v key="$2:" '
+    /^[^[:space:]]/ && $1 == key {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^"/, "", $0)
+      gsub(/^\047/, "", $0)
+      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
+    }
+  ' "$1"
+}
+
 # Resolve the governing policy. stderr is left attached to the caller so the
 # resolver's diagnostics land in the job log; only stdout is captured, because
 # stdout is the policy PATH and merging the streams would turn a warning into a
@@ -143,7 +209,7 @@ else
   echo "Governing review policy: $CONFIG (fetched from non-default base '$BASE_REF' at $BASE_SHA)"
 fi
 
-# The extraction expressions below are byte-for-byte the ones the inline
+# The list extractions below are byte-for-byte the ones the inline
 # `load-config` step used, so a default-base PR — every PR in the fleet today —
 # produces identical outputs. Only the FILE they read changed.
 #
@@ -155,25 +221,21 @@ fi
 # `jq -c` (compact) is required: multi-line JSON cannot be written through the
 # `key=value` GITHUB_OUTPUT format (#30/#58).
 #
-# `|| true` on the greps because this script runs under `pipefail` (the inline
-# step did not): a policy missing the key would otherwise abort the step, and a
-# failed load-config SKIPS triage — see FAILURE HANDLING above. An empty value
-# is what the inline step produced, and it is what the callers already handle.
-THRESHOLD=$({ grep 'external_review_threshold:' "$CONFIG" || true; } | awk '{print $2}')
+# The scalars go through `policy_scalar` above rather than `grep key: | awk
+# '{print $2}'`. A missing key is not an error there either — awk simply prints
+# nothing, so a policy without the key yields the empty value the callers
+# already handle, without a `|| true` guard against `pipefail` aborting the
+# step (a failed load-config SKIPS triage — see FAILURE HANDLING above).
 PATHS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" external_review_paths \
   | jq -R -s -c 'split("\n") | map(select(length > 0))')
 REVIEWERS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" available_reviewers \
   | jq -R -s -c 'split("\n") | map(select(length > 0))')
-AUTHOR=$({ grep 'author_identity:' "$CONFIG" || true; } | awk '{print $2}')
+THRESHOLD=$(policy_scalar "$CONFIG" external_review_threshold)
+AUTHOR=$(policy_scalar "$CONFIG" author_identity)
 
-# A GITHUB_OUTPUT entry is a single `key=value` LINE. A policy that repeated a
-# scalar key would emit a second bare line that Actions then parses as its own
-# output entry — a shape newly reachable now that the policy can be fetched
-# from a non-default branch rather than only ever being the checked-out file.
-# Reduce each scalar to its first line; PATHS/REVIEWERS are single-line by
-# construction because `jq -c` compacts them.
-THRESHOLD=$(printf '%s' "$THRESHOLD" | head -n 1)
-AUTHOR=$(printf '%s' "$AUTHOR" | head -n 1)
+# Every emitted value is a single GITHUB_OUTPUT line: `policy_scalar` stops at
+# the first match (see its first-wins note), and PATHS/REVIEWERS are single-line
+# by construction because `jq -c` compacts them.
 
 # The resolver's contract: a non-default base returns a TEMP file and the
 # caller owns cleanup. The default-config path is the caller's own checkout and
@@ -183,4 +245,17 @@ AUTHOR=$(printf '%s' "$AUTHOR" | head -n 1)
 emit threshold "$THRESHOLD"
 emit paths "$PATHS"
 emit reviewers "$REVIEWERS"
-emit author_identity "${AUTHOR:-nathanjohnpayne}"
+
+# `$AUTHOR` verbatim, with NO `:-nathanjohnpayne` fallback. A governing policy
+# that is readable but carries no top-level `author_identity` proves no identity
+# either — the same state the resolver-failure branch above emits empty — and it
+# is the more reachable of the two, because a policy can simply omit the key (or
+# nest it under a block, which `policy_scalar` correctly declines to match)
+# without anything failing. Substituting a hard-coded login here would hand the
+# auto-merge step a non-empty EXPECTED_AUTHOR, skip its `[ -z ]` fail-closed
+# branch, and let AUTHOR_MERGE_TOKEN merge under an identity the governing
+# policy never named — the substitution #768/#769/#788 exist to prevent, moved
+# one file upstream rather than removed. The `assign` job keeps its own
+# `AUTHOR_IDENTITY || 'nathanjohnpayne'` default in JS, so dropping the default
+# here tightens the merge gate and leaves reviewer assignment unchanged.
+emit author_identity "$AUTHOR"
