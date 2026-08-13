@@ -3814,6 +3814,89 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 52 (#942): EVERY call site of the shared summary reader, not just the
+# one #936 fixed.
+#
+# Test 51 above pins the LAST reader run — the grading pipeline. `summary_
+# unfenced_numbered` has three other callers, and each one captures it in a
+# command substitution that drops the status: `summary_stanza_opener_lines`
+# (via summary_stanzas_all_benign / summary_has_non_benign_stanza), the
+# commits-range extraction in `summary_names_head`, and the `pair=` extraction
+# in `summary_strip_pre_merge_block`. A dead reader at the FIRST of those is
+# strictly worse than at the site #936 fixed, because it fires earlier: the
+# summary never becomes a candidate, so the graded pipeline's guard is never
+# reached and the gate prints `unresolved: 0`.
+#
+# The assertion is deliberately INDEX-FREE rather than one case per named
+# call site. Which run index belongs to which caller is an implementation
+# detail that moves whenever the scoping order changes, and a test pinned to
+# an index silently stops covering the site it was written for. Failing the
+# reader at EVERY index in turn asserts the property the issue actually
+# states — "a failed read at ANY of its call sites yields a nonzero gate exit"
+# — and keeps covering a fourth caller nobody has written yet.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 52 (#942): a FAILED summary read fails closed at EVERY reader call site"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_MAJOR_FINDING")")
+AWK_COUNTER="$WORKDIR/awk-calls-52"
+: >"$AWK_COUNTER"
+# Same derivation as test 51: count the reader's runs on this fixture with
+# nothing failing, so the indices below are measured rather than guessed.
+CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER=9999 \
+CR_GATE_TEST_AWK_COUNTER="$AWK_COUNTER" \
+  FIXTURE_PR="$FIXTURE_PR" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  run_gate "$SCRATCH" 99 owner/repo >/dev/null 2>&1 || true
+TOTAL_AWK_52=$(cat "$AWK_COUNTER" 2>/dev/null || echo 0)
+if [ "$TOTAL_AWK_52" -lt 2 ]; then
+  fail "#942: expected the shared summary reader to run more than once on this fixture; counted $TOTAL_AWK_52 (the multi-site coverage below would be vacuous)"
+fi
+SITE_FAILURES_52=''
+SITE_STANZA_MISDIAGNOSIS_52=''
+IDX_52=0
+while [ "$IDX_52" -lt "$TOTAL_AWK_52" ]; do
+  : >"$AWK_COUNTER"
+  set +e
+  OUT=$(
+    FIXTURE_PR="$FIXTURE_PR" \
+    FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+    FIXTURE_THREADS="$FIXTURE_THREADS" \
+    FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER="$IDX_52" \
+    CR_GATE_TEST_AWK_COUNTER="$AWK_COUNTER" \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1
+  )
+  RC=$?
+  set -e
+  if [ "$RC" = 0 ] || echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+    SITE_FAILURES_52="$SITE_FAILURES_52 run$((IDX_52 + 1))(rc=$RC)"
+  fi
+  # Acceptance criterion 2: the classifier must not report an UNREADABLE
+  # summary as one that "carries a non-benign outcome stanza". That message
+  # names a specific, wrong diagnosis — an operator reading it goes looking
+  # for a rate limit rather than for a broken read.
+  if echo "$OUT" | grep -q "carries a non-benign outcome stanza"; then
+    SITE_STANZA_MISDIAGNOSIS_52="$SITE_STANZA_MISDIAGNOSIS_52 run$((IDX_52 + 1))"
+  fi
+  IDX_52=$((IDX_52 + 1))
+done
+if [ -z "$SITE_FAILURES_52" ]; then
+  pass "#942: a failed summary read fails closed at all $TOTAL_AWK_52 reader call sites, never 'unresolved: 0'"
+else
+  fail "#942: a failed summary read still reported zero blocking findings at:$SITE_FAILURES_52 (of $TOTAL_AWK_52 reader runs)"
+fi
+if [ -z "$SITE_STANZA_MISDIAGNOSIS_52" ]; then
+  pass "#942: an unreadable summary is never misreported as carrying a non-benign outcome stanza"
+else
+  fail "#942: an unreadable summary was misdiagnosed as a non-benign outcome stanza at:$SITE_STANZA_MISDIAGNOSIS_52"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_coderabbit_severity_gate.sh: $PASS passed, $FAIL failed"

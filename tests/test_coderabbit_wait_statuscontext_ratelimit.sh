@@ -301,6 +301,17 @@ case "\$endpoint" in
       printf '[42]\n'
       exit 0
     fi
+    # CODERABBIT_TEST_ISSUES_MALFORMED_ON=<n>: serve the SAME non-object array
+    # on read n EXACTLY and every other read normally. Transient, for the same
+    # reason CODERABBIT_TEST_FAIL_ISSUES_ON is (#959): under a SUSTAINED
+    # malformed payload the polling loop's own summary read breaks too and the
+    # #936 guard stops the run, so the fixture would pass against the unfixed
+    # script. Only a single bad read leaves the decode under test as the sole
+    # cause of a different verdict.
+    if [ -n "\${CODERABBIT_TEST_ISSUES_MALFORMED_ON:-}" ] && [ "\$n" = "\$CODERABBIT_TEST_ISSUES_MALFORMED_ON" ]; then
+      printf '[42]\n'
+      exit 0
+    fi
     body=\$(cat "\$state_dir/comment-body.txt")
     body2=""
     if [ -f "\$state_dir/comment-body-2.txt" ]; then body2=\$(cat "\$state_dir/comment-body-2.txt"); fi
@@ -936,6 +947,104 @@ test_failed_fast_path_comment_read_does_not_clear() {
   [ "$FAIL" -ne "$before" ] || pass "24: a failed comment-list read inside the StatusContext fast path suppresses it (keep polling), never clears a rate-limited head"
 }
 
+# --- Test 25: #959 — the fast path's DECODE failure must not CLEAR either ----
+# Test 24 above pins the FETCH. #936 hardened that half and left the jq that
+# follows it bare, so a payload the fetch's own `add // []` accepts — a
+# well-formed array whose elements are not comment objects — left `latest`
+# EMPTY with status 0.
+#
+# Empty is not `{}`, and that is the whole mechanism: `echo "" | jq 'length'`
+# runs the filter zero times, so it prints NOTHING and exits 0, and the guard
+# `[ "$(…)" = "0" ]` — written for "no qualifying comment" — compares the empty
+# string against "0" and does not fire. Control fell through to
+# `classify_comment ""`, which grades `review`, which the
+# `rate_limit|paused|in_progress` case does not match, so the function returned
+# 1 ("not blocked") and the fast path cleared a head it had read nothing about.
+#
+# Same fixture and same control as test 24 (test 1: HEAD-referencing rate-limit
+# notice, near-simultaneous success, exit 5). The single difference is that the
+# fast path's issue-comments read SUCCEEDS and its decode fails, so nothing but
+# that decode can account for a different verdict. Asserted on the clearance
+# DECISION as well as the exit code, so an unrelated downstream crash cannot
+# satisfy it — the issue's own capture notes the defect was masked by exactly
+# such a crash.
+test_failed_fast_path_comment_decode_does_not_clear() {
+  local dir rc=0 before=$FAIL
+  dir=$(make_case "fast-path-decode-failure" "$RATE_LIMIT_BODY_HEADREF")
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_ISSUES_MALFORMED_ON=1 \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  if grep -q 'emitting cleared' "$dir/err.log"; then
+    fail "25: the StatusContext fast path CLEARED a rate-limited head off a comment-list DECODE that had just failed; err=$(tail -4 "$dir/err.log")"
+  fi
+  [ "$rc" != "0" ] || fail "25: FALSE-CLEARED (exit 0) after the fast path's comment-list decode failed"
+  [ "$rc" = "5" ] || fail "25: expected exit 5 (rate_limit_stalled, same as the test-1 control), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "25: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+  grep -q 'could not be DECODED' "$dir/err.log" \
+    || fail "25: expected the fast-path suppression message naming the failed decode; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "25: a failed comment-list DECODE inside the StatusContext fast path suppresses it (keep polling), never clears a rate-limited head"
+}
+
+# --- Test 26: #957/#959 — the POLLING loop's decode failure is infra, not a
+# graded review.
+#
+# Test 22 pins the polling loop's FETCH; this pins the DECODE on the same arm,
+# and this arm is the consequential one: the fast path is opt-in behind
+# `trust_status_context_for_clearance`, the poll loop is what every caller
+# reaches. `classify_comment ""` grades `review` — the one class whose arm can
+# emit a clearance — so a failed decode did not stall the loop, it ADVANCED it
+# to a verdict on a comment that does not exist. The live capture on #936 head
+# d361075 is asserted directly, because it is the observable signature:
+#
+#   [coderabbit-wait] latest CodeRabbit comment id= endpoint= class=review created= fresh_at=
+#   [coderabbit-wait] CodeRabbit review posted with no high-severity markers — cleared
+#
+# Same fixture as test 22's — an empty comment list and a `Review rate limited`
+# description, so the fast path is suppressed at the description guard and
+# never reads the comments. That makes read 1 the polling scan, and its control
+# (below) exits 4 (timeout) with no clearance, so only the injected malformed
+# payload can account for a different verdict.
+test_failed_poll_comment_decode_does_not_clear() {
+  local dir rc=0 ctl ctlrc before=$FAIL
+  ctl=$(make_case "poll-decode-control" "" "$STATUS_TIME" "Review rate limited")
+  ctlrc=$(run_case "$ctl")
+  [ "$ctlrc" = "4" ] \
+    || fail "26: control expected exit 4 (timeout) on a PR with no CodeRabbit comment at all, got $ctlrc; err=$(tail -4 "$ctl/err.log")"
+
+  dir=$(make_case "poll-decode-failure" "" "$STATUS_TIME" "Review rate limited")
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_ISSUES_MALFORMED_ON=1 \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  if grep -q 'no high-severity markers — cleared' "$dir/err.log"; then
+    fail "26: the polling review arm CLEARED on a comment list it had just failed to decode; err=$(tail -4 "$dir/err.log")"
+  fi
+  if grep -q 'class=review created= fresh_at=' "$dir/err.log"; then
+    fail "26: the loop graded an EMPTY comment as class=review — the #957 live signature; err=$(tail -4 "$dir/err.log")"
+  fi
+  [ "$rc" != "0" ] || fail "26: FALSE-CLEARED (exit 0) after the comment-list decode failed"
+  [ "$rc" = "3" ] || fail "26: expected exit 3 (infra) on the unreadable comment list, got $rc; err=$(tail -4 "$dir/err.log")"
+  if ! grep -q 'refusing to grade an unread head as a review' "$dir/err.log"; then
+    fail "26: expected the polling loop to name the unread comment list; err=$(tail -4 "$dir/err.log")"
+  fi
+  [ "$FAIL" -ne "$before" ] || pass "26: a failed comment-list DECODE in the polling loop is exit 3 (infra), never a graded 'review' on an empty comment"
+}
+
 # --- Test 20: #936 — 'No review completed' is a refusal, end to end ---------
 # Codex P1 on #936. The description predicate matched `*"review complete"*` as
 # a SUBSTRING, so three wordings that state the review did NOT happen cleared
@@ -983,6 +1092,8 @@ test_negated_completed_description_does_not_take_fast_path
 test_failed_comment_list_read_does_not_clear
 test_failed_reviews_read_does_not_clear
 test_failed_fast_path_comment_read_does_not_clear
+test_failed_fast_path_comment_decode_does_not_clear
+test_failed_poll_comment_decode_does_not_clear
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"
