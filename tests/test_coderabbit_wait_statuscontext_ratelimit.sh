@@ -271,6 +271,16 @@ case "\$endpoint" in
       echo "simulated issue-comments API failure" >&2
       exit 44
     fi
+    # CODERABBIT_TEST_FAIL_ISSUES_ON=<n>: fail read n EXACTLY and serve every
+    # other read normally — a transient blip, not an outage. The distinction is
+    # what isolates #831: under a SUSTAINED failure the polling loop's later
+    # summary read fails too and its own #936 guard stops the run, so a
+    # sustained-failure fixture would pass against the unfixed script. Only a
+    # single failed read leaves the wrapper under test as the sole cause.
+    if [ -n "\${CODERABBIT_TEST_FAIL_ISSUES_ON:-}" ] && [ "\$n" = "\$CODERABBIT_TEST_FAIL_ISSUES_ON" ]; then
+      echo "simulated transient issue-comments API failure on read \$n" >&2
+      exit 44
+    fi
     # CODERABBIT_TEST_ISSUES_MALFORMED_AFTER=<n>: serve the first n reads
     # normally, then serve a well-formed JSON ARRAY whose elements are not
     # comment objects. fetch_api_array's own \`jq -s 'add // []'\` accepts it
@@ -781,6 +791,58 @@ test_failed_summary_derive_does_not_clear() {
   [ "$FAIL" -ne "$before" ] || pass "19: a failed summary-body DERIVE (not just a failed fetch) is exit 3 (infra), never a clearance"
 }
 
+# --- Test 22: #831/#957 — a failed COMMENT-LIST read is rc 3, not a verdict -
+# The root #831 shape on the arm that matters most. `fetch_api_array` reports a
+# failed read ONLY by returning non-zero — its old `die` ran inside a command
+# substitution and killed just that subshell — and `scan_latest_comment` was
+# the last wrapper in the file that dropped that status. The loop was then
+# handed an empty object, `classify_comment ""` graded it `review` (the one
+# class whose arm can emit a clearance), and the run reached
+# `CodeRabbit review posted with no high-severity markers — cleared` on a head
+# nobody read. Captured live on #936 head d361075.
+#
+# Asserted on the LOG LINE as well as the exit code, deliberately (#957
+# acceptance 2). Pre-fix the process did not actually exit 0 — `jq --argjson
+# review ""` rejected the empty evidence object and killed it rc 2 — so an
+# exit-code-only assertion would pass against the unfixed script on an
+# accident. The clearance decision is the defect; the crash is the mask.
+#
+# The control run is half the test: same fixture, no injected failure, a PR
+# CodeRabbit never commented on. It must reach the advisory timeout, which is
+# what proves the clearance below is manufactured by the failed read rather
+# than by anything else in the fixture.
+test_failed_comment_list_read_does_not_clear() {
+  local dir rc=0 ctl ctlrc before=$FAIL
+  ctl=$(make_case "comment-list-control" "" "$STATUS_TIME" "Review rate limited")
+  ctlrc=$(run_case "$ctl")
+  [ "$ctlrc" = "4" ] \
+    || fail "22: control expected exit 4 (timeout) on a PR with no CodeRabbit comment at all, got $ctlrc; err=$(tail -4 "$ctl/err.log")"
+  if grep -q 'no high-severity markers — cleared' "$ctl/err.log"; then
+    fail "22: control reached a clearance verdict with an empty comment list — the fixture, not the injected failure, is doing the work"
+  fi
+
+  dir=$(make_case "comment-list-failure" "" "$STATUS_TIME" "Review rate limited")
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_FAIL_ISSUES_ON=1 \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  if grep -q 'no high-severity markers — cleared' "$dir/err.log"; then
+    fail "22: the polling loop reached a CLEARANCE verdict off a read that had just failed; err=$(tail -4 "$dir/err.log")"
+  fi
+  [ "$rc" != "0" ] || fail "22: FALSE-CLEARED (exit 0) after the comment-list read failed"
+  [ "$rc" = "3" ] || fail "22: expected exit 3 (infra), got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'refusing to grade an unread head' "$dir/err.log" \
+    || fail "22: expected the fail-closed comment-list message; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "22: a failed issue-comments read in the polling loop is exit 3 (infra) with no clearance verdict, never a graded 'review'"
+}
+
 # --- Test 20: #936 — 'No review completed' is a refusal, end to end ---------
 # Codex P1 on #936. The description predicate matched `*"review complete"*` as
 # a SUBSTRING, so three wordings that state the review did NOT happen cleared
@@ -825,6 +887,7 @@ test_later_notice_does_not_mask_head_summary
 test_misclassified_summary_is_still_graded
 test_failed_summary_derive_does_not_clear
 test_negated_completed_description_does_not_take_fast_path
+test_failed_comment_list_read_does_not_clear
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"

@@ -838,13 +838,42 @@ die() {
   exit "$code"
 }
 
+# Paginated array read. RETURNS 3 on failure; it cannot abort its caller.
+#
+# The contract used to be written as `die 3`, and that wording was the whole of
+# #831. `die` runs `exit`, but every call site is a command substitution, so
+# the exit killed only that subshell: the wrapping helper resumed with an empty
+# string and its own status 0, and a caller that infers "no results" from
+# emptiness read a failed API call as a confident negative — "an outage
+# manufacturing a clean verdict". It was patched one helper at a time — #590,
+# then three more found in a single review round on #823, then #936 — before
+# the contract itself was corrected here.
+#
+# `return` is not a weaker `die`; it is the SAME signal, honestly named. The
+# status is identical to the one the subshell exit produced, so a top-level
+# `VAR=$(fetch_api_array …)` still trips `set -e` and still leaves the script
+# with status 3. What changes is that the source no longer claims a power it
+# does not have, so nobody can read a call site as safe because "it dies".
+#
+# The obligation this puts on callers is unconditional: check the status, at
+# EVERY call site. Inside a function it is the only signal there is — errexit
+# is suspended for the whole body of a function invoked in a condition, an
+# OR-list, or a command substitution, which is how every wrapper below is
+# reached. Use `|| return`/`|| die` explicitly rather than relying on the
+# caller's context, or use fetch_api_array_best_effort when an unreadable
+# surface genuinely is not fatal.
 fetch_api_array() {
   local endpoint=$1
   local label=$2
   local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
-    || die 3 "failed to flatten $label pagination output"
+  raw=$(gh api --paginate "$endpoint" 2>&1) || {
+    log "ERROR: failed to fetch $label: $raw"
+    return 3
+  }
+  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
+    log "ERROR: failed to flatten $label pagination output"
+    return 3
+  }
 }
 
 fetch_api_array_best_effort() {
@@ -1127,7 +1156,12 @@ HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.commi
 # short enough that cross-cycle staleness is caught).
 HEAD_ANCHOR="$HEAD_COMMITTER_DATE"
 ANCHOR_SOURCE="HEAD committer date"
-TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
+# Stated, not left to errexit: this one IS a top-level assignment, so `set -e`
+# would abort here anyway — but writing the check makes the file uniform, so a
+# reader never has to work out which fetch_api_array call sites are protected
+# by their context and which carry their own guard (#831).
+TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline") \
+  || die 3 "failed to read the PR timeline for the force-push freshness anchor"
 LATEST_FORCE_PUSH_TIME=$(echo "$TIMELINE_JSON" | jq -r '
   [ .[] | select(.event == "head_ref_force_pushed") | .created_at ]
   | max // ""
@@ -1454,7 +1488,19 @@ latest_comment_from_issue_comments() {
 
 scan_latest_comment() {
   local issue_comments
-  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  # Explicit propagation (#831/#957) — the last wrapper in this file that
+  # inferred "no comment" from an unchecked read, and the worst-placed one.
+  # This is the POLLING arm, which every caller reaches; the StatusContext
+  # fast path is opt-in behind trust_status_context_for_clearance. And
+  # `classify_comment ""` grades an empty body `review` — the one class whose
+  # arm can emit a clearance — so a failed read did not stall the loop, it
+  # ADVANCED it to a verdict on evidence nobody read. Captured live on #936
+  # head d361075: a transient TLS failure produced
+  # `latest CodeRabbit comment id= endpoint= class=review` and then
+  # `CodeRabbit review posted with no high-severity markers — cleared`, saved
+  # from exit 0 only by the emitter's `--argjson` crash on the empty object —
+  # an accident, not a guard.
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
   latest_comment_from_issue_comments "$issue_comments"
 }
 
@@ -1500,11 +1546,11 @@ scan_latest_comment_best_effort() {
 # route around.
 latest_head_pinned_review() {
   local reviews
-  # Explicit propagation, not errexit. fetch_api_array's `die 3` exits only
-  # its own command-substitution subshell; this function would otherwise carry
-  # on with an empty $reviews and return 0 from the jq below, turning a failed
-  # API read into a confident "no review on this head". Whether errexit fires
-  # depends on the caller's context, so it cannot be relied on — check here.
+  # Explicit propagation, not errexit. fetch_api_array signals a failed read
+  # only by returning 3 (#831); this function would otherwise carry on with an
+  # empty $reviews and return 0 from the jq below, turning a failed API read
+  # into a confident "no review on this head". Whether errexit fires depends on
+  # the caller's context, so it cannot be relied on — check here.
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return 3
   echo "$reviews" | jq -c --arg bot "$BOT_LOGIN" --arg head_sha "$HEAD_SHA" '
     [ .[]
@@ -2067,9 +2113,9 @@ status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
   local issue_comments latest class comment_id comment_created_at comment_fresh_at comment_body
   local active_notice active_id active_remaining
-  # ONE fetch, shared by both checks below. Explicitly status-checked: a
-  # `die 3` inside fetch_api_array exits only its own command substitution, so
-  # an unchecked read failure left the scan with empty input, every classifier
+  # ONE fetch, shared by both checks below. Explicitly status-checked: a failed
+  # fetch_api_array read reaches a caller only as a return status (#831), so an
+  # unchecked read failure left the scan with empty input, every classifier
   # below saw nothing adverse, and the fast path CLEARED on a transient API
   # error — the same false-clear shape this whole function exists to prevent.
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || {
@@ -2623,13 +2669,22 @@ emit_json_and_exit() {
       findings|cleared)
         # Guard the advisory decoration so it can NEVER flip the terminal exit
         # code or break the JSON emit (nathanpayne-codex P2 on #590). Two
-        # layers: `|| true` stops a die inside count_blocking_tier_issues from
-        # aborting under set -e, and the numeric-or-null validation forces a
+        # layers: `|| true` stops a nonzero return from count_blocking_tier_issues
+        # from aborting under set -e, and the numeric-or-null validation forces a
         # value the downstream `jq --argjson` accepts. The earlier `$(...) ||
-        # VAR=null` was insufficient: when an internal fetch_api_array dies,
-        # count_blocking_tier_issues can exit 0 with EMPTY output, so the `||`
-        # never fired and the empty value broke `jq --argjson` — a hard failure
-        # on an otherwise-terminal path. Validation catches empty/non-numeric.
+        # VAR=null` was insufficient: when an internal fetch_api_array read
+        # failed, count_blocking_tier_issues could exit 0 with EMPTY output, so
+        # the `||` never fired and the empty value broke `jq --argjson` — a hard
+        # failure on an otherwise-terminal path.
+        #
+        # KEPT as belt-and-braces, not because that route is still open (#831
+        # acceptance 3). count_blocking_tier_issues propagates its read failure
+        # as rc 3 since #837, and every fetch_api_array wrapper in this file
+        # propagates since #831, so `|| true` is what converts that honest
+        # nonzero into the advisory `null` this decoration wants. The numeric
+        # validation still earns its place: it is the only layer that does not
+        # depend on any helper's return convention, and this is a report-only
+        # field that must never flip a terminal exit code.
         BLOCKING_TIER_UNRESOLVED=$(count_blocking_tier_issues 2>/dev/null || true)
         case "$BLOCKING_TIER_UNRESOLVED" in
           ''|*[!0-9]*) BLOCKING_TIER_UNRESOLVED=null ;;
@@ -3062,15 +3117,14 @@ probe_emit_verdict() {
   local summary_body="" newest_class="" rescan_done=false
 
   # Both reads are made DIRECTLY here, never through a helper. fetch_api_array
-  # signals failure with `die 3`, which inside a command substitution exits
-  # only that subshell — so a helper wrapping it (scan_latest_comment,
-  # count_potential_issues_for_sha, latest_head_pinned_review) carries on with
-  # empty input and returns 0. Any caller in a conditional or OR-list context
-  # then reads a failed API call as a confident negative. That pattern was
-  # found three times in three different helpers during review of this change;
-  # calling fetch_api_array directly is what makes `|| die 3` actually fire,
-  # because the failing status reaches this assignment rather than being
-  # swallowed by an intermediate function.
+  # signals a failed read only by returning 3, and an intermediate wrapper that
+  # does not propagate that status swallows it — the wrapper carries on with
+  # empty input and returns 0, and any caller in a conditional or OR-list
+  # context then reads a failed API call as a confident negative. That pattern
+  # was found three times in three different helpers during review of this
+  # change; calling fetch_api_array directly is what makes `|| die 3` fire
+  # here. Since #831 every wrapper in this file propagates too, so the choice
+  # is now defence in depth rather than the only safe route.
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") \
     || die 3 "failed to fetch reviews for the probe verdict"
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
@@ -3559,7 +3613,12 @@ while :; do
     fi
   fi
 
-  LATEST=$(scan_latest_comment)
+  # rc 3 is an unreadable comment list, never an empty one (#831/#957). The
+  # asymmetry this closes was stark: since #936 the `review` arm below already
+  # refuses to clear when it cannot read the SUMMARY body, while the loop
+  # cleared when it could not read the comment list at all.
+  LATEST=$(scan_latest_comment) \
+    || die 3 "could not read the CodeRabbit comment list on $HEAD_SHA — refusing to grade an unread head as a review"
 
   if [ "$(echo "$LATEST" | jq 'length')" = "0" ]; then
     # #891/#912: "nothing inside the freshness window" is not the same as
