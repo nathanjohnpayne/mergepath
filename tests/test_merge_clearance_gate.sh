@@ -3416,7 +3416,7 @@ rcp_dir_case native-producer-unparseable \
 # green. The quietest of the four.
 #
 # The name is REPLACED, not inserted. Inserting a second `name:` is a
-# duplicate mapping key, which StrictLoader rejects before the display-name
+# duplicate mapping key, which ActionsLoader rejects before the display-name
 # comparison is ever reached — so the case went red on the parse branch and
 # a bare `[rcp native producer]` needle called that a pass. It proved
 # nothing about name drift. Caught only after the needle was sharpened to
