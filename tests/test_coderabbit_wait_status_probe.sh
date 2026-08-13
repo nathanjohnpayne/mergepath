@@ -198,10 +198,20 @@ case "$endpoint" in
     # against the head review object; it defaults to head_time, which
     # PREDATES reply_time-stamped evidence, so tests exercising the
     # correlated direction must set it explicitly.
+    #
+    # `unreadable` (#936) is the third arm and it is NOT a status value: it
+    # makes the endpoint itself fail, so the caller's fetch pipeline exits
+    # nonzero. That is the transport failure Codex's P1 found conflated with
+    # `absent` — the fixture has to be able to tell them apart before the
+    # script can.
     case "${CODERABBIT_TEST_STATUS:-absent}" in
       success|failure|pending)
         printf '[{"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"}}]\n' \
           "${CODERABBIT_TEST_STATUS}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "$bot"
+        ;;
+      unreadable)
+        echo "simulated statuses endpoint failure" >&2
+        exit 42
         ;;
       *) printf '[]\n' ;;
     esac
@@ -2243,6 +2253,98 @@ test_919_pending_status_blocks_the_terminal_verdict() {
   fi
 }
 
+test_936_unreadable_status_is_not_an_absent_status() {
+  # Codex P1 on #936 head 18b1571. `check_status_context_record` serialized a
+  # FAILED statuses read as `{state: "missing"}` — byte-identical to the record
+  # it emits when CodeRabbit legitimately published no status on this head. The
+  # conflation is pre-existing (it dates to #224), but the #919 gate this PR
+  # adds is the first consumer for which the two have DIFFERENT correct
+  # answers: it blocks on exactly `pending`, so a transient read failure read
+  # as not-pending, the probe emitted `reported`, and the Phase 4b barrier
+  # could open on pre-completion artifacts. A failed read is not evidence that
+  # the run is finished.
+  #
+  # The fix gives the failure its own state, `unreadable`, and every consumer
+  # reads it through crw_status_record_state so an empty or unparseable record
+  # cannot degrade to a permissive value either.
+  #
+  # Route 1: the head-pinned review OBJECT route.
+  local dir rc status
+  dir=$(make_case probe-936-robj-unreadable 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=unreadable run_probe_case "$dir" probe_review_on_head)
+  status=$(jq -r '.status // "NONE"' "$dir/out.json" 2>/dev/null || echo NONE)
+  if [ "$rc" = "3" ] && [ "$status" != "reported" ]; then
+    pass "#936: an unreadable statuses read exits 3 (infra) on the review-object route — never a clean 'reported'"
+  else
+    fail "#936 route 1 (review object) → rc=$rc status=$status (expected rc 3, not reported)"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+
+  # Route 2: the #851 head-pinned SUMMARY route, which has no review object.
+  local dir2 rc2 status2
+  dir2=$(make_case probe-936-summary-unreadable 600 true 30 3 2)
+  enable_trust_status_context "$dir2"
+  rc2=$(CODERABBIT_TEST_STATUS=unreadable run_probe_case "$dir2" probe_clean_incremental)
+  status2=$(jq -r '.status // "NONE"' "$dir2/out.json" 2>/dev/null || echo NONE)
+  if [ "$rc2" = "3" ] && [ "$status2" != "reported" ]; then
+    pass "#936: an unreadable statuses read exits 3 on the head-pinned-summary route too"
+  else
+    fail "#936 route 2 (head-pinned summary) → rc=$rc2 status=$status2 (expected rc 3, not reported)"
+    sed 's/^/      /' "$dir2/err.log" >&2 || true
+  fi
+
+  # Route 3 — the OTHER consumer of the same record: the #869 rc-7 sample that
+  # feeds probe.context_state to the barrier. This one was already fail-closed
+  # (the barrier opens only on "success"), so it deliberately keeps its bounded
+  # not-yet instead of escalating to rc 3 — but it must report the failure
+  # HONESTLY rather than as the absent case, so the barrier's input distinguishes
+  # "CodeRabbit published no status" from "we could not read the statuses".
+  local dir3 rc3 obs3 ctx3
+  dir3=$(make_case probe-936-ctx-unreadable 600 true 30 3 2)
+  enable_trust_status_context "$dir3"
+  rc3=$(CODERABBIT_TEST_STATUS=unreadable run_probe_case "$dir3" probe_summary_lags_review)
+  obs3=$(jq -r '.probe.observed // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ctx3=$(jq -r '.probe.context_state // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc3" = "7" ] && [ "$obs3" = "awaiting-summary" ] && [ "$ctx3" = "unreadable" ]; then
+    pass "#936: the rc-7 barrier sample emits context_state=unreadable (never 'missing', never 'success') so the barrier stays closed on a failed read"
+  else
+    fail "#936 route 3 (rc-7 barrier sample) → rc=$rc3 observed=$obs3 context_state=$ctx3 (expected 7/awaiting-summary/unreadable)"
+    sed 's/^/      /' "$dir3/err.log" >&2 || true
+  fi
+
+  # Control A — the discrimination itself. The SAME scenario with the status
+  # legitimately ABSENT must still emit `missing` and still read terminal. This
+  # is the half the #851 clean incremental re-review depends on: if absence
+  # started reading as a failure, every previously-reviewed PR would deadlock.
+  local dir4 rc4 status4 obs4
+  dir4=$(make_case probe-936-absent-control 600 true 30 3 2)
+  enable_trust_status_context "$dir4"
+  rc4=$(run_probe_case "$dir4" probe_clean_incremental)
+  status4=$(jq -r '.status' "$dir4/out.json" 2>/dev/null || echo PARSE_ERROR)
+  obs4=$(jq -r '.probe.observed // "MISSING"' "$dir4/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc4" = "0" ] && [ "$status4" = "reported" ] && [ "$obs4" = "terminal" ]; then
+    pass "#936 control: a legitimately absent status still reads terminal — 'unreadable' did not swallow 'missing'"
+  else
+    fail "#936 control (absent status) → rc=$rc4 status=$status4 observed=$obs4"
+    sed 's/^/      /' "$dir4/err.log" >&2 || true
+  fi
+
+  # Control B — the escape hatch. The read is trust-gated like every other
+  # status read here, so trust_status_context_for_clearance: false must never
+  # reach the endpoint at all, failing or not.
+  local dir5 rc5 status5
+  dir5=$(make_case probe-936-untrusted-unreadable 600 true 30 3 2)
+  rc5=$(CODERABBIT_TEST_STATUS=unreadable run_probe_case "$dir5" probe_review_on_head)
+  status5=$(jq -r '.status' "$dir5/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc5" = "0" ] && [ "$status5" = "reported" ]; then
+    pass "#936 control: with trust_status_context_for_clearance false the failing endpoint is never consulted"
+  else
+    fail "#936 control (trust off) → rc=$rc5 status=$status5"
+    sed 's/^/      /' "$dir5/err.log" >&2 || true
+  fi
+}
+
 test_891_probe_open_rate_limit_window_is_not_silence() {
   # #891 acceptance 3: `--probe` must not transition `rate_limit` → `none`
   # purely because a clock advanced. The anchored triage stops seeing the
@@ -2274,6 +2376,7 @@ test_891_probe_open_rate_limit_window_is_not_silence() {
 
 test_900_review_run_selector_ignores_bodyless_replies
 test_919_pending_status_blocks_the_terminal_verdict
+test_936_unreadable_status_is_not_an_absent_status
 test_891_probe_open_rate_limit_window_is_not_silence
 test_884_count_bodies_fails_closed_unit
 test_884_clearance_reviews_api_failure_fails_closed

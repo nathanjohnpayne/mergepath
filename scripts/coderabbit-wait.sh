@@ -245,8 +245,13 @@
 #       # carries the ONLY blocking marker (#535), and the per-SHA success
 #       # is what discriminates the wedged-but-complete #866 state from
 #       # that mid-publication one.
+#       # `missing` means the surface was read and CodeRabbit published no
+#       # status; `unreadable` means the read itself failed and nothing was
+#       # observed (#936). The barrier opens only on "success", so both hold
+#       # it closed — they are kept apart so its input never reports an
+#       # absence it did not actually observe.
 #       "context_state": null | "success" | "failure" | "pending"
-#                        | "error" | "missing",
+#                        | "error" | "missing" | "unreadable",
 #       # The refresh time of that same status, sampled and nulled
 #       # together with context_state. The barrier additionally requires
 #       # this to be at-or-after the evidence object's submitted_at
@@ -935,11 +940,30 @@ crw_status_description_permits_clearance() {
 
 # Fetch the CodeRabbit `StatusContext` check on the current HEAD SHA.
 # Emits compact JSON with:
-#   { "state": "success|failure|pending|error|missing", "created_at": "..." }
+#   { "state": "success|failure|pending|error|missing|unreadable",
+#     "created_at": "...", "updated_at": "...", "description": "..." }
 #
-# `missing` covers both the no-statuses-yet case and any transient API
-# hiccup (network, 5xx, etc.) — caller treats it as "fall through to
-# the existing comment-driven path."
+# `missing` is a POSITIVE OBSERVATION: the statuses surface was read and
+# CodeRabbit has published no status on this head. `unreadable` is the
+# absence of an observation: the fetch or the parse failed and we know
+# nothing. Keeping them apart is the whole point of this record (#936).
+#
+# They used to be the same value, and for every consumer that existed at
+# the time that was harmless — each one acts only on `success`, so a
+# failed read fell through to the comment-driven path, which is the
+# conservative direction. The #919 `pending` gate is the first consumer
+# for which the two have different correct answers: it blocks on exactly
+# `pending`, so a transient read failure read as "not pending", the probe
+# emitted `reported`, and the Phase 4b barrier could open on
+# pre-completion artifacts (Codex P1 on #936). A failed read is not
+# evidence that a run has finished.
+#
+# Read every consumer's state through crw_status_record_state below rather
+# than a bare `jq -r '.state'`: under `set -e` suppression inside an `if`
+# condition a failed record read collapses to an EMPTY string, which is
+# equally not-`pending` and equally permissive. The helper maps every
+# unusable shape onto `unreadable` so no consumer can silently inherit a
+# permissive default.
 #
 # Two defensive guards (CodeRabbit ⚠️ Critical on PR #224 round 1):
 #
@@ -960,6 +984,12 @@ crw_status_description_permits_clearance() {
 # `/commits/{sha}/status` rolls up state but omits per-status creator
 # fields, which would defeat guard 1. Confirmed empirically — see
 # PR #224 round 2.
+#
+# The record emitted when the statuses surface could not be read or parsed.
+# Same shape as every other record so consumers need no special case beyond
+# the state value itself.
+CRW_STATUS_RECORD_UNREADABLE='{"state":"unreadable","created_at":"","updated_at":"","description":""}'
+
 check_status_context_record() {
   local resp
   # Pagination (CodeRabbit ⚠️ Minor @ line 267 on PR #224 round 2):
@@ -984,12 +1014,17 @@ check_status_context_record() {
   # "I am not reviewing this head at all", and the only place that says so is
   # the description string `Review rate limited`. Carried here so
   # crw_status_description_permits_clearance can read it at the fast path.
+  local resp out
   resp=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null) || {
-    jq -nc '{state: "missing", created_at: "", updated_at: "", description: ""}'
+    printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"
     return
   }
-  echo "$resp" | jq -c --arg bot "$BOT_LOGIN" '
+  # The filter's own failure is the second half of the same hazard: a
+  # malformed page that survives `add // []` but breaks this expression used
+  # to emit NOTHING, and an empty record reads as not-`pending` just as
+  # permissively as the old `missing` did.
+  out=$(printf '%s' "$resp" | jq -c --arg bot "$BOT_LOGIN" '
     [ .[]?
       | select(.context == "CodeRabbit")
       | select((.creator.login // "") == $bot)
@@ -1003,11 +1038,38 @@ check_status_context_record() {
          updated_at: (.updated_at // .created_at // ""),
          description: (.description // "")}
       end
-  '
+  ' 2>/dev/null) || {
+    printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"
+    return
+  }
+  if [ -z "$out" ]; then
+    printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"
+    return
+  fi
+  printf '%s\n' "$out"
+}
+
+# The single reader for a check_status_context_record record (#936).
+#
+# A well-formed record's state passes through verbatim — this does NOT
+# second-guess GitHub's status vocabulary, so a state the API adds later is
+# reported as itself rather than masked. Everything that is not a usable
+# observation — an empty string, a non-object, unparseable JSON, a missing or
+# non-string `.state` — reads `unreadable`. That is the one value every
+# consumer below is required to treat as "no observation", never as a
+# permissive default.
+crw_status_record_state() {
+  local rec=${1:-} state
+  state=$(printf '%s' "$rec" | jq -r '
+    if type == "object" and (.state | type) == "string" and (.state | length) > 0
+    then .state else "unreadable" end
+  ' 2>/dev/null) || state="unreadable"
+  [ -n "$state" ] || state="unreadable"
+  printf '%s' "$state"
 }
 
 check_status_context() {
-  check_status_context_record | jq -r '.state'
+  crw_status_record_state "$(check_status_context_record)"
 }
 
 # --- fetch PR metadata ------------------------------------------------------
@@ -2901,11 +2963,25 @@ crw_select_summary_comment() {
 # terminal status keeps the probe at not-yet until the caller's own bound
 # escalates. That is a hold rather than a false clear, which is the direction
 # this helper is for.
+#
+# #936 (Codex P1): the two non-pending outcomes are not the same outcome. A
+# read that returned `missing` is CodeRabbit's own statement that it published
+# no status here; a read that FAILED says nothing at all, and answering "not
+# pending" from it is a claim of terminality the evidence does not support —
+# in the one direction this helper exists to close. A failed read is therefore
+# infra rc 3, which is what every other failed read on the probe path already
+# does (the reviews fetch, the summary selection, the #869 re-scan). It is
+# also fail-closed at the barrier, which classes rc 3 as escalate rather than
+# reported. The `trust_status_context_for_clearance: false` opt-out remains
+# the escape hatch: it returns before the endpoint is touched at all.
 crw_probe_head_review_in_progress() {
   local rec state desc
   [ "$TRUST_STATUS_CONTEXT" = "true" ] || return 1
-  rec=$(check_status_context_record)
-  state=$(printf '%s' "$rec" | jq -r '.state // "missing"')
+  rec=$(check_status_context_record) || rec=""
+  state=$(crw_status_record_state "$rec")
+  if [ "$state" = "unreadable" ]; then
+    die 3 "failed to read the per-SHA CodeRabbit StatusContext on $HEAD_SHA — a failed read is not evidence that the run finished, so the probe refuses to report terminality on it (#936)"
+  fi
   [ "$state" = "pending" ] || return 1
   desc=$(printf '%s' "$rec" | jq -r '.description // ""')
   log "probe: the per-SHA CodeRabbit StatusContext on $HEAD_SHA is pending (${desc:-<no description>}) — a run is still underway, so the published artifacts are activity, not a finished review (#919)"
@@ -3078,10 +3154,20 @@ probe_emit_verdict() {
       # which fails closed at the barrier (not-yet). Sampled once — the
       # re-scan pass reuses the first sample rather than reading a surface
       # that postdates it.
+      #
+      # #936, and a DELIBERATE difference from the #919 gate above: this
+      # consumer was already fail-closed, because the barrier opens only on
+      # the exact value `success`, so a failed read cannot make it open no
+      # matter which non-success value it carries. It therefore keeps its
+      # bounded, self-clearing not-yet instead of escalating to rc 3 — a
+      # transient hiccup here costs one more probe cycle rather than a human.
+      # What changes is honesty: it now reports `unreadable` rather than
+      # borrowing `missing`, so the barrier's input distinguishes "CodeRabbit
+      # published no status" from "we could not read the statuses".
       if [ "$TRUST_STATUS_CONTEXT" = "true" ] && [ -z "$PROBE_CONTEXT_STATE" ]; then
-        ctx_record=$(check_status_context_record)
-        PROBE_CONTEXT_STATE=$(printf '%s' "$ctx_record" | jq -r '.state // "missing"')
-        PROBE_CONTEXT_UPDATED_AT=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""')
+        ctx_record=$(check_status_context_record) || ctx_record=""
+        PROBE_CONTEXT_STATE=$(crw_status_record_state "$ctx_record")
+        PROBE_CONTEXT_UPDATED_AT=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""' 2>/dev/null || printf '')
       fi
       # #869 TOCTOU: the success just observed post-dates the comments
       # snapshot, so the summary may already be up. One re-fetch, one
@@ -3422,11 +3508,18 @@ fi
 # CodeRabbit doesn't re-narrate when there's nothing new to flag.
 if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
   INITIAL_CTX_RECORD=$(check_status_context_record)
-  INITIAL_CTX=$(echo "$INITIAL_CTX_RECORD" | jq -r '.state')
-  INITIAL_CTX_CREATED=$(echo "$INITIAL_CTX_RECORD" | jq -r '.created_at')
-  INITIAL_CTX_DESC=$(echo "$INITIAL_CTX_RECORD" | jq -r '.description // ""')
+  INITIAL_CTX=$(crw_status_record_state "$INITIAL_CTX_RECORD")
+  INITIAL_CTX_CREATED=$(echo "$INITIAL_CTX_RECORD" | jq -r '.created_at // ""' 2>/dev/null || printf '')
+  INITIAL_CTX_DESC=$(echo "$INITIAL_CTX_RECORD" | jq -r '.description // ""' 2>/dev/null || printf '')
   log "initial CodeRabbit StatusContext = $INITIAL_CTX on $HEAD_SHA (description: ${INITIAL_CTX_DESC:-<none>})"
-  if [ "$INITIAL_CTX" = "success" ]; then
+  # #936: this arm only ever ACTS on `success`, so `unreadable` was already
+  # fail-closed here — it falls through to the comment-driven poll, which is
+  # the conservative path and the one a failed read should take. Named
+  # explicitly so the property is asserted rather than incidental, and so the
+  # log line stops calling a failed read an absent status.
+  if [ "$INITIAL_CTX" = "unreadable" ]; then
+    log "could not read the per-SHA CodeRabbit StatusContext on $HEAD_SHA — not treating an unreadable status as clearance or as absence; falling through to the comment-driven poll (#936)"
+  elif [ "$INITIAL_CTX" = "success" ]; then
     if ! crw_status_description_permits_clearance "$INITIAL_CTX_DESC"; then
       log "StatusContext success on $HEAD_SHA carries description '$INITIAL_CTX_DESC', which does not name a completed review — CodeRabbit is reporting that it did NOT review this head, so this is not clearance; falling through to the comment-driven poll (#891/#897/#912)"
     elif ! status_context_fast_path_blocked_by_comment "$INITIAL_CTX_CREATED"; then
@@ -3449,10 +3542,14 @@ while :; do
   # iteration; falls through to the comment scan if not success/failure.
   if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
     LOOP_CTX_RECORD=$(check_status_context_record)
-    LOOP_CTX=$(echo "$LOOP_CTX_RECORD" | jq -r '.state')
-    LOOP_CTX_CREATED=$(echo "$LOOP_CTX_RECORD" | jq -r '.created_at')
-    LOOP_CTX_DESC=$(echo "$LOOP_CTX_RECORD" | jq -r '.description // ""')
-    if [ "$LOOP_CTX" = "success" ]; then
+    LOOP_CTX=$(crw_status_record_state "$LOOP_CTX_RECORD")
+    LOOP_CTX_CREATED=$(echo "$LOOP_CTX_RECORD" | jq -r '.created_at // ""' 2>/dev/null || printf '')
+    LOOP_CTX_DESC=$(echo "$LOOP_CTX_RECORD" | jq -r '.description // ""' 2>/dev/null || printf '')
+    # #936: same shape as the pre-loop arm — acts only on `success`, so an
+    # unreadable read keeps polling rather than clearing. Stated, not implied.
+    if [ "$LOOP_CTX" = "unreadable" ]; then
+      log "could not read the per-SHA CodeRabbit StatusContext on $HEAD_SHA mid-loop — continuing to poll rather than treating the failed read as clearance or as absence (#936)"
+    elif [ "$LOOP_CTX" = "success" ]; then
       if ! crw_status_description_permits_clearance "$LOOP_CTX_DESC"; then
         log "mid-loop StatusContext success on $HEAD_SHA carries description '$LOOP_CTX_DESC', which does not name a completed review — not clearance (#891/#897/#912)"
       elif ! status_context_fast_path_blocked_by_comment "$LOOP_CTX_CREATED"; then
