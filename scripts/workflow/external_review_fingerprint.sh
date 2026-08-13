@@ -79,6 +79,18 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
+# Hard-required, not existence-guarded: gh_api_scalar is what keeps an
+# unreadable sha read from being mistaken for an absent one (#799), and this
+# script's whole output is a review-gating fingerprint. A consumer missing
+# the lib must error, not silently fall back to the shape that was broken.
+GH_API_SCALAR_LIB="$SCRIPT_DIR/../lib/gh-api-scalar.sh"
+if [ ! -r "$GH_API_SCALAR_LIB" ]; then
+  echo "external_review_fingerprint.sh: missing helper: $GH_API_SCALAR_LIB (see #799)" >&2
+  exit 2
+fi
+# shellcheck source=../lib/gh-api-scalar.sh
+. "$GH_API_SCALAR_LIB"
+
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum | awk '{print $1}'
@@ -276,13 +288,22 @@ FINGERPRINT_PATHS_JSON=$(printf '%s\n' "$FINGERPRINT_INPUT" | LC_ALL=C sort -u |
 HEAD_TREE_JSON=$(tree_for_ref "$REF") || exit 2
 HEAD_ENTRIES_JSON=$(entries_for_tree "$HEAD_TREE_JSON")
 
-PR_BASE_SHA=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .base.sha 2>/dev/null || true)
+# #799: both reads go through gh_api_scalar, which suppresses the error body
+# and returns 3, so the `[ -z ]` guards below are live again. They were dead:
+# a 4xx/5xx put `{"message":…}` in these variables, the guards passed, and the
+# blob was interpolated straight into the compare URL on the next line and
+# then hashed into the fingerprint that decides whether a prior external
+# review carries forward to this head (#705). `--shape sha` is the second
+# line of defence for a payload that somehow arrives with a zero status.
+PR_BASE_SHA=$(gh_api_scalar --shape sha "PR base sha for $REPO#$PR_NUMBER" \
+  "repos/$REPO/pulls/$PR_NUMBER" --jq .base.sha) || PR_BASE_SHA=""
 if [ -z "$PR_BASE_SHA" ]; then
   echo "external_review_fingerprint.sh: failed to resolve PR base sha for $REPO#$PR_NUMBER" >&2
   exit 2
 fi
 
-MERGE_BASE_SHA=$(gh api "repos/$REPO/compare/$PR_BASE_SHA...$REF" --jq '.merge_base_commit.sha // ""' 2>/dev/null || true)
+MERGE_BASE_SHA=$(gh_api_scalar --shape sha "merge base for $REF against PR base $PR_BASE_SHA" \
+  "repos/$REPO/compare/$PR_BASE_SHA...$REF" --jq '.merge_base_commit.sha // ""') || MERGE_BASE_SHA=""
 if [ -z "$MERGE_BASE_SHA" ]; then
   echo "external_review_fingerprint.sh: failed to resolve merge base for $REF against PR base $PR_BASE_SHA" >&2
   exit 2

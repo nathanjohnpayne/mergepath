@@ -357,6 +357,17 @@ paths:
   - path: scripts/lib/codex-failure-markers.sh
     type: canonical
     consumers: all
+  # Fail-closed scalar REST reader (#799). `gh api <path> --jq <expr>` writes
+  # the HTTP error body to STDOUT, so every call site that inferred failure
+  # from empty output was reading an outage as data. gh_api_scalar suppresses
+  # the body and returns 3 — the same contract #831 gave fetch_api_array,
+  # extended from arrays to scalars — plus optional sha/login/timestamp shape
+  # predicates as second-line defence. HARD-sourced (exit, not degrade) by
+  # every consumer below, because the degraded mode IS the defect: declared in
+  # each of their requires: so the lib can never ship behind its callers.
+  - path: scripts/lib/gh-api-scalar.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
@@ -405,9 +416,15 @@ paths:
     # OPEN and posts the trigger — the pre-#798 behavior — so the coupling is
     # soft; it is declared so the closure invariant records it and the gate
     # travels with its only caller.
+    #
+    # HARD-sources scripts/lib/gh-api-scalar.sh (#799) for the post-trigger
+    # timestamp read. Unlike the two soft deps above, an absent lib exits 3:
+    # the read anchors every "newer than my trigger?" comparison in the poll
+    # loop, so degrading it silently is worse than refusing to run.
     requires:
       - "scripts/lib/codex-failure-markers.sh"
       - "scripts/workflow/codex_auto_trigger_gate.sh"   # #798, content-free auto-trigger gate
+      - "scripts/lib/gh-api-scalar.sh"   # #799, fail-closed scalar API reads
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
@@ -459,6 +476,12 @@ paths:
       # must refuse to ship the caller ahead of its runtime dependencies.
       - "scripts/coderabbit-wait.sh"
       - "scripts/codex-review-check.sh"
+      # Hard-sourced (#799): all four head resolutions in this orchestrator —
+      # the initial --head default and the three drift re-reads around the
+      # post-review issue filing and the review POST — route through
+      # gh_api_scalar so an unreadable head is empty rather than a JSON blob.
+      # Absent, the script exits 3 by design.
+      - "scripts/lib/gh-api-scalar.sh"
   # Chat-side Phase 4b handoff block renderer (#281). Read-only,
   # stdout-only: emits the single-PR or batch handoff variant per
   # REVIEW_POLICY.md § Handoff Message Format § Chat-side handoff
@@ -520,9 +543,12 @@ paths:
     # reviewer token identity, and (existence-guarded) preflight-helpers.sh
     # to auto-source it (#454). preflight-helpers is consumers:all already;
     # both declared here so the #264 closure invariant covers them.
+    # Also hard-sources scripts/lib/gh-api-scalar.sh (#799): the token-identity
+    # read feeding login_is_available_reviewer above it.
     requires:
       - "scripts/lib/reviewers-helpers.sh"
       - "scripts/lib/preflight-helpers.sh"
+      - "scripts/lib/gh-api-scalar.sh"
   - path: tests/test_audit_propagation_lane.sh
     type: canonical
     consumers: all
@@ -1356,6 +1382,11 @@ paths:
     requires:
       - "scripts/lib/template-substitution.sh"   # verify-propagation-pr.sh templated render (#531)
       - "scripts/lib/manifest-fact-helpers.sh"   # verify-propagation-pr.sh consumer-facts load (#531)
+      # external_review_fingerprint.sh + external_review_carryforward.sh (both
+      # in this kit) hard-source it for their sha reads (#799). Those two
+      # decide whether a prior external-review clearance carries forward, so
+      # they exit 2 rather than run with the pre-#799 emptiness inference.
+      - "scripts/lib/gh-api-scalar.sh"           # #799, fail-closed scalar API reads
 
   # Templated entries — rendered per consumer via scripts/lib/
   # template-substitution.sh using the consumer's facts.* from the

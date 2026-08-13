@@ -35,9 +35,10 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 make_case() {
   local name=$1
   local dir="$WORKDIR/$name"
-  mkdir -p "$dir/scripts" "$dir/.github" "$dir/bin" "$dir/state"
+  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/codex-review-request.sh" "$dir/scripts/codex-review-request.sh"
   chmod +x "$dir/scripts/codex-review-request.sh"
+  cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 author_identity: nathanjohnpayne
@@ -189,12 +190,15 @@ SHA_CHANGED="cccccccccccccccccccccccccccccccccccccccc"
 make_gate_case() {
   local name=$1
   local dir="$WORKDIR/$name"
-  mkdir -p "$dir/scripts/workflow" "$dir/.github" "$dir/bin"
+  mkdir -p "$dir/scripts/workflow" "$dir/scripts/lib" "$dir/.github" "$dir/bin"
   cp "$GATE_SRC" "$FP_SRC" "$CF_SRC" \
      "$ROOT/scripts/workflow/parse_policy_list.sh" \
      "$ROOT/scripts/workflow/match_protected_paths.sh" \
      "$dir/scripts/workflow/"
   chmod +x "$dir/scripts/workflow/"*.sh
+  # #799: both external_review_* helpers hard-source ../lib/gh-api-scalar.sh
+  # (exit 2 if absent) for their sha reads, so the fixture tree needs it.
+  cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"
 
   # threshold 1 with a one-line diff makes the PR require external review, so
   # the fingerprint helper runs its full tree-fetching path.

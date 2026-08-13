@@ -81,6 +81,18 @@ fi
 FINGERPRINT_BIN="$SCRIPT_DIR/external_review_fingerprint.sh"
 [ -x "$FINGERPRINT_BIN" ] || { echo "external_review_carryforward.sh: missing executable helper: $FINGERPRINT_BIN" >&2; exit 2; }
 
+# Hard-required for the same reason as in external_review_fingerprint.sh:
+# this script decides whether a prior external-review clearance carries
+# forward, and #799's dead guards are on the two commit-resolution reads
+# below. See scripts/lib/gh-api-scalar.sh.
+GH_API_SCALAR_LIB="$SCRIPT_DIR/../lib/gh-api-scalar.sh"
+if [ ! -r "$GH_API_SCALAR_LIB" ]; then
+  echo "external_review_carryforward.sh: missing helper: $GH_API_SCALAR_LIB (see #799)" >&2
+  exit 2
+fi
+# shellcheck source=../lib/gh-api-scalar.sh
+. "$GH_API_SCALAR_LIB"
+
 # Run a gh invocation with stdout and stderr captured separately, so a
 # stderr warning/notice on an otherwise-successful call can't leak into
 # the stdout stream that callers parse as JSON with jq (#716). On
@@ -245,7 +257,15 @@ while IFS=$'\t' read -r source_time source_sha; do
     "$source_lc"*) resolved_sha="$HEAD_SHA" ;;
   esac
   if [ -z "$resolved_sha" ]; then
-    resolved_sha=$(gh api "repos/$REPO/commits/$source_sha" --jq .sha 2>/dev/null || true)
+    # #799: an unreadable response used to arrive here as the JSON error
+    # body, which is neither empty nor a sha — so the `continue` below never
+    # fired and the blob was lowercased and matched against comment anchors.
+    # gh_api_scalar leaves it empty instead. `--shape sha` matters more here
+    # than anywhere: `$source_sha` is scraped out of arbitrary comment text,
+    # so this endpoint legitimately 404s and the reply body is attacker-
+    # adjacent input rather than trusted API data.
+    resolved_sha=$(gh_api_scalar --shape sha "commit $source_sha in $REPO" \
+      "repos/$REPO/commits/$source_sha" --jq .sha) || resolved_sha=""
   fi
   # DELIBERATE ASYMMETRY — `continue` here, but `exit 2` for an unresolvable
   # NEWER signal below (#763). Both have been flagged as a fail-open hole; both
@@ -352,7 +372,14 @@ while IFS=$'\t' read -r source_time source_sha; do
       "$signal_lc"*) signal_resolved="$HEAD_SHA" ;;
     esac
     if [ -z "$signal_resolved" ]; then
-      signal_resolved=$(gh api "repos/$REPO/commits/$signal_sha" --jq .sha 2>/dev/null || true)
+      # #799: this is the latest-signal-wins guard the asymmetry note above
+      # calls "a small, safety-critical, machine-generated set where failing
+      # closed is right" — and it was NOT failing closed. An unreadable read
+      # left the error body here, the `[ -z ]` test passed, and a newer
+      # non-affirmative Codex signal was silently resolved to a blob that
+      # matched no fingerprint, so carry-forward proceeded past it.
+      signal_resolved=$(gh_api_scalar --shape sha "commit $signal_sha in $REPO" \
+        "repos/$REPO/commits/$signal_sha" --jq .sha) || signal_resolved=""
     fi
     if [ -z "$signal_resolved" ]; then
       echo "external_review_carryforward.sh: newer $signal_kind Codex signal at $signal_time references unresolvable commit $signal_sha; refusing carry-forward" >&2
