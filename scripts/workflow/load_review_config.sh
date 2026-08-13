@@ -15,7 +15,11 @@ set -euo pipefail
 #                       auto-merge-on-approval registered-reviewer gate, which
 #                       mirrors scripts/codex-review-check.sh gate (b) and the
 #                       required merge-clearance-gate.
-#   author_identity  -> the `assign` job's author check.
+#   author_identity  -> the `assign` job's author check, AND the identity the
+#                       auto-merge job requires AUTHOR_MERGE_TOKEN to resolve
+#                       to before it will call `gh pr merge` at all. That step
+#                       parsed the value out of its own unpinned checkout until
+#                       #788's second half moved it onto this output.
 #   threshold/paths  -> the `triage` job's preliminary requires-review calc.
 #
 # scripts/merge-clearance-gate.sh and scripts/codex-review-check.sh already
@@ -114,6 +118,48 @@ command -v jq >/dev/null 2>&1 || { echo "load_review_config.sh: jq is required" 
 
 emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 
+# Read one TOP-LEVEL scalar out of a policy file.
+#
+# This is the parser `.github/workflows/agent-review.yml`'s auto-merge job used
+# to run inline against its own checkout before #788 routed the identity
+# through this script's output — byte-for-byte, so the value the
+# AUTHOR_MERGE_TOKEN check now compares is the value it computed for itself
+# then, and the switch of SOURCE does not smuggle in a change of SYNTAX.
+# `scripts/ci/check_workflow_parsers` pins these semantics case by case
+# (bare / "double-quoted" / 'single-quoted').
+#
+# Three properties are load-bearing, and the older `grep key: | awk '{print
+# $2}'` form had none of them:
+#
+#   anchored     the key must start at column 0, so a nested `author_identity:`
+#                under another block — or the same word inside a comment — is
+#                not mistaken for the top-level setting.
+#   unquoted     `author_identity: "nathanjohnpayne"` yields nathanjohnpayne,
+#                not "nathanjohnpayne". A quoted value compared verbatim
+#                against `gh api user --jq .login` never matches, which would
+#                turn a legal YAML spelling into a permanent merge refusal.
+#   first-wins   `exit` after the first match. A repeated scalar key would
+#                otherwise print twice, and a GITHUB_OUTPUT entry is a single
+#                `key=value` LINE — Actions parses the second one as its own
+#                output entry. That shape became reachable when the policy
+#                could be FETCHED from another branch rather than always being
+#                the checked-out file.
+policy_scalar() {  # <file> <key>
+  awk -v key="$2:" '
+    /^[^[:space:]]/ && $1 == key {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^"/, "", $0)
+      gsub(/^\047/, "", $0)
+      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
+    }
+  ' "$1"
+}
+
 # Resolve the governing policy. stderr is left attached to the caller so the
 # resolver's diagnostics land in the job log; only stdout is captured, because
 # stdout is the policy PATH and merging the streams would turn a warning into a
@@ -143,7 +189,7 @@ else
   echo "Governing review policy: $CONFIG (fetched from non-default base '$BASE_REF' at $BASE_SHA)"
 fi
 
-# The extraction expressions below are byte-for-byte the ones the inline
+# The list extractions below are byte-for-byte the ones the inline
 # `load-config` step used, so a default-base PR — every PR in the fleet today —
 # produces identical outputs. Only the FILE they read changed.
 #
@@ -155,25 +201,21 @@ fi
 # `jq -c` (compact) is required: multi-line JSON cannot be written through the
 # `key=value` GITHUB_OUTPUT format (#30/#58).
 #
-# `|| true` on the greps because this script runs under `pipefail` (the inline
-# step did not): a policy missing the key would otherwise abort the step, and a
-# failed load-config SKIPS triage — see FAILURE HANDLING above. An empty value
-# is what the inline step produced, and it is what the callers already handle.
-THRESHOLD=$({ grep 'external_review_threshold:' "$CONFIG" || true; } | awk '{print $2}')
+# The scalars go through `policy_scalar` above rather than `grep key: | awk
+# '{print $2}'`. A missing key is not an error there either — awk simply prints
+# nothing, so a policy without the key yields the empty value the callers
+# already handle, without a `|| true` guard against `pipefail` aborting the
+# step (a failed load-config SKIPS triage — see FAILURE HANDLING above).
 PATHS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" external_review_paths \
   | jq -R -s -c 'split("\n") | map(select(length > 0))')
 REVIEWERS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" available_reviewers \
   | jq -R -s -c 'split("\n") | map(select(length > 0))')
-AUTHOR=$({ grep 'author_identity:' "$CONFIG" || true; } | awk '{print $2}')
+THRESHOLD=$(policy_scalar "$CONFIG" external_review_threshold)
+AUTHOR=$(policy_scalar "$CONFIG" author_identity)
 
-# A GITHUB_OUTPUT entry is a single `key=value` LINE. A policy that repeated a
-# scalar key would emit a second bare line that Actions then parses as its own
-# output entry — a shape newly reachable now that the policy can be fetched
-# from a non-default branch rather than only ever being the checked-out file.
-# Reduce each scalar to its first line; PATHS/REVIEWERS are single-line by
-# construction because `jq -c` compacts them.
-THRESHOLD=$(printf '%s' "$THRESHOLD" | head -n 1)
-AUTHOR=$(printf '%s' "$AUTHOR" | head -n 1)
+# Every emitted value is a single GITHUB_OUTPUT line: `policy_scalar` stops at
+# the first match (see its first-wins note), and PATHS/REVIEWERS are single-line
+# by construction because `jq -c` compacts them.
 
 # The resolver's contract: a non-default base returns a TEMP file and the
 # caller owns cleanup. The default-config path is the caller's own checkout and

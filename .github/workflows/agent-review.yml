@@ -951,6 +951,28 @@ jobs:
         if: steps.require_approval.outputs.proceed != 'false'
         env:
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          # The author identity this token must resolve to comes from the
+          # policy that GOVERNS this PR — the base branch's — which
+          # `load-config` already resolved through
+          # scripts/workflow/resolve_base_policy.sh (#788).
+          #
+          # This step used to parse `author_identity` out of THIS job's
+          # checkout, and that checkout is not pinned: on a `pull_request`
+          # event `actions/checkout` materializes `refs/pull/N/merge`, so the
+          # expected identity came from the PR's OWN copy of the policy, and on
+          # a `pull_request_review` event it came from a different file again.
+          # Two answers for one PR, neither of them the governing one — the
+          # remaining half of #788, on the surface that issue named explicitly
+          # (the auto-merge approval gate). A PR must not be able to nominate
+          # the identity that is allowed to merge it by editing policy on its
+          # own branch, and on a non-default base the default-branch copy is
+          # equally wrong in the other direction: it can name an identity the
+          # base policy does not permit to merge there.
+          EXPECTED_AUTHOR: ${{ needs.load-config.outputs.author_identity }}
+          # Diagnostic only, and an env var rather than a `${{ }}` expansion
+          # inside the shell below: a ref name interpolated into script text is
+          # the workflow-injection shape this repo keeps out of `run:` blocks.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::notice::AUTHOR_MERGE_TOKEN is not configured; automatic PR merge is disabled. Merge manually as the author identity."
@@ -958,27 +980,30 @@ jobs:
             exit 0
           fi
 
-          expected_author=$(awk '
-            /^[^[:space:]]/ && $1 == "author_identity:" {
-              sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-              gsub(/^"/, "", $0)
-              gsub(/^\047/, "", $0)
-              gsub(/"[[:space:]]*(#.*)?$/, "", $0)
-              gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
-              gsub(/[[:space:]]*#.*$/, "", $0)
-              sub(/[[:space:]]+$/, "", $0)
-              print
-              exit
-            }
-          ' .github/review-policy.yml)
-          expected_author="${expected_author:-nathanjohnpayne}"
+          # FAIL CLOSED on an unproven identity. An empty value means
+          # `load-config` could not resolve the governing policy (or was itself
+          # skipped — this job runs under `always()`), and it is exactly the
+          # fail-closed output scripts/workflow/load_review_config.sh emits in
+          # that case. Defaulting to a hard-coded login here would merge under
+          # an identity no policy we can read has authorized, which is the
+          # substitution #768/#769/#788 exist to prevent. Disabling the merge
+          # path costs nothing that is not already lost: the same fail-closed
+          # load-config emits `reviewers=[]`, so the arming gate above has
+          # already rejected every approver. The author merges manually, and
+          # the required merge-clearance gate is untouched either way.
+          expected_author="${EXPECTED_AUTHOR:-}"
+          if [ -z "$expected_author" ]; then
+            echo "::notice::The review policy governing this PR's base branch yielded no author_identity, so the identity permitted to merge here is unproven; automatic PR merge is disabled (#788). Merge manually as the author identity."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if ! actual_author=$(gh api user --jq .login); then
             echo "::error::AUTHOR_MERGE_TOKEN could not authenticate to GitHub. Refusing automatic merge."
             exit 1
           fi
           if [ "$actual_author" != "$expected_author" ]; then
-            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$actual_author', expected '$expected_author'. Refusing automatic merge."
+            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$actual_author', expected '$expected_author' (author_identity in the policy governing base branch '${BASE_REF:-?}'). Refusing automatic merge."
             exit 1
           fi
 

@@ -100,6 +100,27 @@ author_identity: release-bot
 author_identity: someone-else
 YAML
 
+# A base policy written in legal YAML spellings the old `grep key: | awk
+# '{print $2}'` extraction got wrong. It matters now that `author_identity`
+# leaves this script as a GITHUB_OUTPUT the auto-merge job compares against
+# `gh api user --jq .login` (#788): a value that arrives still wearing its
+# quotes never matches any login, so a quoted policy would become a permanent
+# merge refusal, and a nested key of the same name — which the unanchored grep
+# matched FIRST, being earlier in the file — would name the wrong identity
+# outright.
+QUIRK_POLICY="$WORK/quirk-policy.yml"
+cat > "$QUIRK_POLICY" <<'YAML'
+external_review_threshold: "25"  # quoted scalar with an inline comment
+
+codex:
+  author_identity: impostor-bot
+
+available_reviewers:
+  - nathanpayne-codex
+
+author_identity: 'release-bot'  # single-quoted, inline comment
+YAML
+
 CALLS_LOG="$WORK/gh-calls.log"
 
 GH_STUB="$WORK/gh"
@@ -117,6 +138,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$PATHARG" in
+  user)
+    # `gh api user --jq .login` — the auto-merge job's AUTHOR_MERGE_TOKEN
+    # identity probe (section 6).
+    printf '%s\n' "${STUB_TOKEN_LOGIN:-nathanjohnpayne}"
+    exit 0 ;;
   repos/*/pulls/*)
     cat "${STUB_PR_JSON:-/dev/null}"
     exit 0 ;;
@@ -127,13 +153,14 @@ case "$PATHARG" in
     case "${STUB_CONTENTS_MODE:-ok}" in
       ok)    cat "${STUB_BASE_POLICY:?}"; exit 0 ;;
       dup)   cat "${STUB_DUP_POLICY:?}"; exit 0 ;;
+      quirk) cat "${STUB_QUIRK_POLICY:?}"; exit 0 ;;
       error) echo "gh: API rate limit exceeded (HTTP 403)" >&2; exit 1 ;;
     esac ;;
 esac
 echo "{}"
 STUB
 chmod +x "$GH_STUB"
-export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG" STUB_BASE_POLICY="$BASE_POLICY" STUB_DUP_POLICY="$DUP_POLICY"
+export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG" STUB_BASE_POLICY="$BASE_POLICY" STUB_DUP_POLICY="$DUP_POLICY" STUB_QUIRK_POLICY="$QUIRK_POLICY"
 hash -r 2>/dev/null || true
 
 OUT_FILE="$WORK/github-output.txt"
@@ -229,6 +256,28 @@ if [ "$RC" -eq 0 ] \
   pass "a duplicated policy key still emits one line per output"
 else
   fail "duplicated policy key broke the output shape (rc=$RC): $(cat "$OUT_FILE")"
+fi
+
+# ---------------------------------------------------------------------------
+# 3c. Scalar spellings. The emitted `author_identity` is no longer just an
+#     input to a string comparison inside a script — since #788 it IS the
+#     identity the auto-merge job requires AUTHOR_MERGE_TOKEN to resolve to, so
+#     a value carrying its YAML quotes refuses every merge, and a nested key of
+#     the same name (matched first by an unanchored grep) authorizes the wrong
+#     one. Both spellings are legal YAML.
+# ---------------------------------------------------------------------------
+export STUB_CONTENTS_MODE=quirk
+run_loader release/1.x main
+if [ "$RC" -eq 0 ] && [ "$(out_value author_identity)" = "release-bot" ]; then
+  pass "a quoted, inline-commented author_identity is emitted unquoted, and a nested key of the same name does not win"
+else
+  fail "scalar spellings: author=$(out_value author_identity) (rc=$RC)"
+fi
+
+if [ "$(out_value threshold)" = "25" ]; then
+  pass "a quoted, inline-commented threshold is emitted as a bare number"
+else
+  fail "scalar spellings: threshold=$(out_value threshold)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -354,6 +403,96 @@ if ! grep -q . "$CALLS_LOG"; then
   pass "the step's default-base path makes ZERO gh API calls end to end (#769 short circuit preserved through the workflow)"
 else
   fail "the step made API calls on a default-base PR: $(cat "$CALLS_LOG")"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. The CONSUMER of `author_identity` that gates a real merge: the auto-merge
+#    job's `Check author merge token` step, as the runner executes it.
+#
+#    Exporting the identity from the governing policy is only half of #788. The
+#    step that decides whether AUTHOR_MERGE_TOKEN may call `gh pr merge` parsed
+#    `author_identity` out of its OWN checkout, and that job's
+#    `actions/checkout` carries no `ref:` — on a `pull_request` event it is
+#    `refs/pull/N/merge`, the PR's own copy of the policy, and on a
+#    `pull_request_review` event it is a different file again. Two answers for
+#    one PR, neither of them the base branch's.
+#
+#    So the assertions below are about SOURCE, not about parsing: each runs the
+#    lifted step inside a tree whose `.github/review-policy.yml` names
+#    `nathanjohnpayne`, and varies only the load-config output. A step that
+#    still reads the checked-out file agrees with itself in every case and
+#    fails 6a and 6b.
+#
+#    Lifted from the workflow rather than retyped, for the same reason as
+#    section 5: a copy keeps passing while the shipped step is broken.
+# ---------------------------------------------------------------------------
+STEP2="$WORK/author-token-step.sh"
+
+awk '
+  /^      - name: Check author merge token$/ { instep = 1; next }
+  instep && /^      - name: /                { instep = 0 }
+  instep && /^        run: \|$/              { inrun = 1; next }
+  inrun && /^          /                     { print substr($0, 11); next }
+  inrun && /^[[:space:]]*$/                  { print ""; next }
+  inrun                                      { inrun = 0 }
+' "$WORKFLOW" > "$STEP2"
+
+if [ -s "$STEP2" ] && grep -q 'AUTHOR_MERGE_TOKEN' "$STEP2"; then
+  pass "lifted the auto-merge author-token step out of agent-review.yml"
+else
+  fail "could not lift the author-token run block out of $WORKFLOW — section 6 asserts nothing"
+fi
+
+AUTH_TREE="$WORK/auth-tree"
+mkdir -p "$AUTH_TREE/.github"
+cp "$DEFAULT_CONFIG" "$AUTH_TREE/.github/review-policy.yml"   # names nathanjohnpayne
+
+# <expected_author> <token_login> ; sets ASRC / ASTEP_OUT / ASTEP_LOG
+run_author_step() {
+  ASTEP_OUT="$WORK/author-step-output.txt"
+  : > "$ASTEP_OUT"
+  ASTEP_LOG=$(cd "$AUTH_TREE" && GITHUB_OUTPUT="$ASTEP_OUT" GH_TOKEN="stub-author-token" \
+    EXPECTED_AUTHOR="$1" STUB_TOKEN_LOGIN="$2" BASE_REF="release/1.x" \
+    bash -e "$STEP2" 2>&1) && ASRC=0 || ASRC=$?
+}
+
+# 6a. The governing (base) policy names a different identity than the checked-out
+#     one, and the token is the checked-out one's. Refuse.
+run_author_step "release-bot" "nathanjohnpayne"
+if [ "$ASRC" -ne 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" != "true" ]; then
+  pass "a token that does not match the BASE policy's author_identity is refused, even when the checked-out policy names it (#788)"
+else
+  fail "base-policy mismatch was not refused (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
+fi
+
+# 6b. load-config could not prove the governing policy (its fail-closed output
+#     is an empty author_identity). Disable the merge path; do NOT fall back to
+#     a hard-coded login, which is the substitution #768/#769/#788 close.
+run_author_step "" "nathanjohnpayne"
+if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "false" ]; then
+  pass "an unproven author_identity disables automatic merge rather than defaulting to a hard-coded login (#788 fail-closed)"
+else
+  fail "unproven identity path (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
+fi
+
+# 6c. Positive control against a step that simply always disables: the ordinary
+#     fleet case, where the governing policy IS the checked-out one.
+run_author_step "nathanjohnpayne" "nathanjohnpayne"
+if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "true" ]; then
+  pass "a token matching the governing author_identity still enables automatic merge (#788 no-regression)"
+else
+  fail "positive control (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
+fi
+
+# 6d. The mirror of 6a, against a step hard-wired to expect nathanjohnpayne: a
+#     base policy naming release-bot, with a token that IS release-bot, merges —
+#     the checked-out policy's nathanjohnpayne is not consulted in either
+#     direction.
+run_author_step "release-bot" "release-bot"
+if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "true" ]; then
+  pass "a token matching a NON-default base policy's author_identity is accepted (the identity comes from the policy, not from a hard-coded name)"
+else
+  fail "non-default base identity accepted path (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
 fi
 
 echo
