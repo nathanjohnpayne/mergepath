@@ -88,6 +88,12 @@ YAML
 # can be FETCHED from another branch rather than always being the checked-out
 # file, and a second bare line in GITHUB_OUTPUT is parsed by Actions as its own
 # output entry.
+#
+# The identities are chosen to make the authorization consequence visible: the
+# FIRST is the fleet's real author identity, so a first-wins reading hands the
+# merge gate a value that matches its own token, while `yq` — the parser the
+# other gates read this same file with — resolves the key last-wins to
+# release-bot. Two gates, two answers, on which identity may merge.
 DUP_POLICY="$WORK/dup-policy.yml"
 cat > "$DUP_POLICY" <<'YAML'
 external_review_threshold: 25
@@ -96,8 +102,26 @@ external_review_threshold: 999999
 available_reviewers:
   - nathanpayne-codex
 
+author_identity: nathanjohnpayne
 author_identity: release-bot
-author_identity: someone-else
+YAML
+
+# A base policy whose scalars put `#` directly against the value, with no
+# separating whitespace. YAML opens a comment only when whitespace precedes the
+# `#`, so `nathanjohnpayne#disabled` is ONE plain scalar — `yq` reads it that
+# way — and a parser that strips at a bare `#` hands the merge gate the bare
+# login the policy never named.
+NOSPACE_POLICY="$WORK/nospace-policy.yml"
+cat > "$NOSPACE_POLICY" <<'YAML'
+external_review_threshold: 25#not-a-comment
+
+external_review_paths:
+  - "release/**"
+
+available_reviewers:
+  - nathanpayne-codex
+
+author_identity: nathanjohnpayne#disabled
 YAML
 
 # A base policy written in legal YAML spellings the old `grep key: | awk
@@ -197,13 +221,14 @@ case "$PATHARG" in
       quirk)  cat "${STUB_QUIRK_POLICY:?}"; exit 0 ;;
       noauth) cat "${STUB_NOAUTH_POLICY:?}"; exit 0 ;;
       torn)   cat "${STUB_TORN_POLICY:?}"; exit 0 ;;
+      nospace) cat "${STUB_NOSPACE_POLICY:?}"; exit 0 ;;
       error) echo "gh: API rate limit exceeded (HTTP 403)" >&2; exit 1 ;;
     esac ;;
 esac
 echo "{}"
 STUB
 chmod +x "$GH_STUB"
-export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG" STUB_BASE_POLICY="$BASE_POLICY" STUB_DUP_POLICY="$DUP_POLICY" STUB_QUIRK_POLICY="$QUIRK_POLICY" STUB_NOAUTH_POLICY="$NOAUTH_POLICY" STUB_TORN_POLICY="$TORN_POLICY"
+export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG" STUB_BASE_POLICY="$BASE_POLICY" STUB_DUP_POLICY="$DUP_POLICY" STUB_QUIRK_POLICY="$QUIRK_POLICY" STUB_NOAUTH_POLICY="$NOAUTH_POLICY" STUB_TORN_POLICY="$TORN_POLICY" STUB_NOSPACE_POLICY="$NOSPACE_POLICY"
 hash -r 2>/dev/null || true
 
 OUT_FILE="$WORK/github-output.txt"
@@ -287,18 +312,32 @@ fi
 
 # ---------------------------------------------------------------------------
 # 3b. A base policy that repeats a scalar key must still emit exactly four
-#     GITHUB_OUTPUT lines. A stray second line is not inert — Actions parses it
-#     as another `key=value` entry.
+#     GITHUB_OUTPUT lines — a stray second line is not inert, Actions parses it
+#     as another `key=value` entry — and the value it emits must be EMPTY.
+#
+#     Picking either occurrence is what makes a duplicate dangerous rather than
+#     merely untidy: `yq`, which every other gate reads this same policy with,
+#     resolves a duplicate key last-wins, so a helper that takes the first one
+#     disagrees with the rest of the pipeline about which identity may merge.
+#     The fixture is built so the disagreement pays out — the FIRST occurrence
+#     is the token's own login. Unproven is the only honest answer, and it
+#     reaches the merge gate as the same empty value an unreadable policy does.
 # ---------------------------------------------------------------------------
 export STUB_CONTENTS_MODE=dup
 run_loader release/1.x main
 if [ "$RC" -eq 0 ] \
    && [ "$(grep -c '' "$OUT_FILE" | tr -d ' ')" = "4" ] \
-   && [ "$(out_value threshold)" = "25" ] \
-   && [ "$(out_value author_identity)" = "release-bot" ]; then
-  pass "a duplicated policy key still emits one line per output"
+   && [ "$(out_value threshold)" = "" ] \
+   && [ "$(out_value author_identity)" = "" ]; then
+  pass "a duplicated policy key emits one empty line per scalar rather than picking an occurrence"
 else
-  fail "duplicated policy key broke the output shape (rc=$RC): $(cat "$OUT_FILE")"
+  fail "duplicated policy key (rc=$RC threshold=$(out_value threshold) author=$(out_value author_identity)): $(cat "$OUT_FILE")"
+fi
+
+if [ "$(out_value reviewers)" = '["nathanpayne-codex"]' ]; then
+  pass "the duplicated-key policy was still fetched and parsed (the empty scalars are not the fail-closed branch)"
+else
+  fail "duplicated-key policy mis-parsed its list keys (reviewers=$(out_value reviewers))"
 fi
 
 # ---------------------------------------------------------------------------
@@ -399,6 +438,40 @@ if [ "$(out_value reviewers)" = '["nathanpayne-codex"]' ] \
   pass "the torn policy was still resolved and its list keys parsed (the empty scalars are not the fail-closed branch)"
 else
   fail "torn policy mis-parsed its list keys (reviewers=$(out_value reviewers) paths=$(out_value paths))"
+fi
+
+# ---------------------------------------------------------------------------
+# 3f. The comment boundary. YAML opens a comment at `#` only when whitespace
+#     precedes it, so `author_identity: nathanjohnpayne#disabled` is a single
+#     plain scalar and `yq` — the parser the other gates read this file with —
+#     returns `nathanjohnpayne#disabled`. Stripping at a bare `#` instead
+#     produces `nathanjohnpayne`: a real login, matching the token, on a policy
+#     that named a different value. That is the same class as 3e, arriving
+#     through the one punctuation mark a strip-rule cannot tell apart from a
+#     comment.
+#
+#     Section 3c pins the other side — a `#` that IS separated by whitespace is
+#     still stripped — so the pair says: strip a comment only where YAML has
+#     one.
+# ---------------------------------------------------------------------------
+export STUB_CONTENTS_MODE=nospace
+run_loader release/1.x main
+if [ "$RC" -eq 0 ] && [ "$(out_value author_identity)" = "" ]; then
+  pass "a value with an unseparated # emits nothing rather than the prefix before it (Phase 4b, #973)"
+else
+  fail "unseparated-comment identity emitted '$(out_value author_identity)' (rc=$RC)"
+fi
+
+if [ "$(out_value threshold)" = "" ]; then
+  pass "the unseparated # is refused for every scalar, not just the identity"
+else
+  fail "unseparated-comment threshold emitted '$(out_value threshold)'"
+fi
+
+if [ "$(out_value reviewers)" = '["nathanpayne-codex"]' ]; then
+  pass "the unseparated-comment policy was still resolved and parsed (not the fail-closed branch)"
+else
+  fail "unseparated-comment policy mis-parsed its list keys (reviewers=$(out_value reviewers))"
 fi
 
 # ---------------------------------------------------------------------------
@@ -649,6 +722,22 @@ if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "false" ]; then
 else
   fail "end-to-end torn-quote path enabled the merge (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
 fi
+
+# 6g. The unseparated-comment and duplicate-key routes, joined end to end for
+#     the same reason as 6e and 6f: in both, the value a looser parser would
+#     have produced is `nathanjohnpayne` — the token's own login — so the merge
+#     gate would agree with itself and enable the merge on a policy that named
+#     something else (`nathanjohnpayne#disabled`) or named two things at once.
+for mode in nospace dup; do
+  export STUB_CONTENTS_MODE="$mode"
+  run_loader release/1.x main
+  run_author_step "$(out_value author_identity)" "nathanjohnpayne"
+  if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "false" ]; then
+    pass "a $mode governing policy disables automatic merge end to end, loader output through merge gate (#973)"
+  else
+    fail "end-to-end $mode path enabled the merge (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
+  fi
+done
 
 echo
 echo "== load_review_config (#788) tests: $PASS passed, $FAIL failed =="
