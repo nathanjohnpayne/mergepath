@@ -1166,10 +1166,14 @@ jobs:
               # NON-vacuously, or the PR is intrinsically external-review
               # and current-head Codex/Phase-4b clearance is already
               # satisfied. For PRs where both are false, --trigger-only
-              # does not wait for Codex, so proceeding would let a
-              # rate-limited PR merge with neither bot having reviewed it —
-              # those keep BLOCKING (Codex P2 on #512 r3). The disposition
-              # lives in the unit-tested, fail-closed
+              # does not wait for Codex, so proceeding on the stall alone
+              # would let a rate-limited PR merge with neither bot having
+              # reviewed it (Codex P2 on #512 r3). Since #825 the gate
+              # answers that by WAITING for the failover's Codex review to
+              # clear the head rather than by assuming it did: an
+              # unprotected head still blocks unless codex-review-check.sh
+              # confirms clearance on it. The disposition lives in the
+              # unit-tested, fail-closed
               # scripts/coderabbit-automerge-rate-limit-gate.sh.
               #
               # #713: ask merge-clearance-gate.sh itself for the rc=5
@@ -1212,8 +1216,23 @@ jobs:
                 ext_protected=true
                 echo "::notice::rc=5 protection folds in the #727 post-clearance signal: HEAD has verified Codex/Phase-4b clearance + reviewer APPROVED — the CodeRabbit rate-limit stall is advisory here."
               fi
-              if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_protected"; then
-                echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged and this head has active or already-satisfied external-review protection — proceeding."
+              # #825: pass the PR coordinates so the gate can run its arm 2b —
+              # a bounded wait for the failover's OWN Codex review to clear this
+              # head, verified by codex-review-check.sh (SKIP_CI,
+              # REQUIRE_APPROVAL_ON_HEAD, ALLOW_PHASE_4B_SUBSTITUTE=false: the
+              # same predicate the fast-path probe and the final re-verify use).
+              # The CODEX_CLEARED probe above cannot cover this: it runs BEFORE
+              # coderabbit-wait.sh, so on an under-threshold PR whose only Codex
+              # trigger is the failover itself, it necessarily reads "no
+              # clearance" — the trigger is posted seconds later, inside the
+              # wait. That is the #825 deadlock: `--derive-rate-limit-protection`
+              # is false by construction under threshold, the pre-wait probe is
+              # false by timing, and the stall is immediate because the Fair
+              # Usage window (2109s/2398s observed) exceeds the whole CodeRabbit
+              # budget. Arm 2b spends that unspendable budget on the Codex
+              # verdict instead, and still blocks unless a real one arrives.
+              if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_protected" "$PR_NUMBER" "$REPO"; then
+                echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged and this head has active or already-satisfied external-review protection, or the failover's own Codex review cleared it (#825) — proceeding."
                 # Record the downgrade for the final re-verify step: the
                 # protection derivation is re-run there against the live
                 # merge head, so state that changes during the waits (for
@@ -1221,7 +1240,7 @@ jobs:
                 # aborts the merge.
                 echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"
               else
-                echo "::error::CodeRabbit rate-limit retry budget exhausted — blocking auto-merge. Either the failover did not engage, or this head has neither an active merge-clearance external gate nor already-satisfied Codex/Phase-4b clearance. Human must re-trigger or merge manually."
+                echo "::error::CodeRabbit rate-limit retry budget exhausted — blocking auto-merge. Either the failover did not engage, or this head has no active merge-clearance external gate and the failover's Codex review did not clear it within the clearance budget (#825). Human must re-trigger or merge manually."
                 exit 1
               fi
               ;;
