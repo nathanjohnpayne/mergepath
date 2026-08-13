@@ -1230,6 +1230,17 @@ while IFS= read -r SUMMARY_JSON; do
   #
   # Line numbers stay those of SUMMARY_SCAN, not of the filtered stream, so a
   # reported location still points at the real line in the summary.
+  #
+  # Read BEFORE the loop, with the status checked, because a here-document
+  # discards its command substitution's exit status: `done <<EOF\n$(pipeline)`
+  # cannot fail. An awk that died on a pathological body therefore produced an
+  # empty stream, the loop found nothing, and this REQUIRED gate reported zero
+  # blocking summary findings — a failed read reading as a clean report, which
+  # is the fail-open shape the gate exists to prevent (CodeRabbit 🟠 Major on
+  # #936). Exit 2, the config/infra code the gate already uses for "cannot
+  # decide", never 0.
+  SUMMARY_NUMBERED=$(summary_unfenced_numbered "$SUMMARY_SCAN") \
+    || die 2 "failed to read the PR-level summary (comment id $SUMMARY_ID) — refusing to report zero blocking findings from an unread summary"
   while IFS= read -r cr_numbered; do
     [ -n "$cr_numbered" ] || continue
     cr_line_no=${cr_numbered%%	*}
@@ -1250,7 +1261,7 @@ while IFS= read -r SUMMARY_JSON; do
       ')
     fi
   done <<EOF
-$(summary_unfenced_numbered "$SUMMARY_SCAN")
+$SUMMARY_NUMBERED
 EOF
   # Only bind a fingerprint when there is something to acknowledge. With no
   # blocking finding the token is never printed and never consulted, and

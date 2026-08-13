@@ -100,6 +100,11 @@
 #      the notice's post time, not from when this helper first sees it), + 30s
 #      buffer, then post `@coderabbitai, try again.`, increment the retry
 #      counter, and continue polling. An already-expired window sleeps 0.
+#      A notice whose PUBLISHED window is still open reaches this arm even
+#      after it has aged past the wall-clock freshness floor (#891/#912): the
+#      floor exists to stop a STALE notice blocking a current head, and a
+#      notice's staleness is not evidence that the limit it announces lifted.
+#      CodeRabbit's observed windows (59 min) outrun the default 1800s floor.
 #   4b. On paused: post `@coderabbitai resume` (a one-shot `review`
 #      re-pauses after the next push, so resume is the correct verb),
 #      increment a resume-retry counter, and continue polling. If
@@ -143,7 +148,15 @@
 #       # place, so created_at can predate the head it attests by a day or
 #       # more. fresh_at carries the edit time; consumers needing head
 #       # identity read head_sha, never a timestamp.
-#       "endpoint": "issues" | "pulls" | "reviews",
+#       # The StatusContext fast path emits the synthetic
+#       # "status_context" endpoint, where there is no GitHub review object:
+#       # `id` is null and `created_at` is the STATUS' own creation time,
+#       # never the synthesis time (#912) — a verdict off a status that has
+#       # sat untouched for 40 minutes must not read as current. The
+#       # synthesis time is carried separately as `observed_at`, emitted on
+#       # that endpoint only.
+#       "observed_at": "<iso-8601>",
+#       "endpoint": "issues" | "pulls" | "reviews" | "status_context",
 #       # "reviews" evidence only (#869, additive): the object's own
 #       # submitted_at — the same instant created_at carries on that
 #       # endpoint, named explicitly so the Phase 4b barrier's temporal
@@ -202,6 +215,17 @@
 #       # the review object reads as awaiting-summary, or as the pending
 #       # notice beneath it) — so the value is not reachable and advertising
 #       # it would be a contract nobody can meet.
+#       #
+#       # Two of these values do not require a comment inside the wall-clock
+#       # freshness window. `rate_limit` is also emitted when CodeRabbit's
+#       # newest comment is a rate-limit notice whose PUBLISHED window has not
+#       # expired, however old the notice is (#891/#912) — otherwise the
+#       # observation flipped `rate_limit` → `none` with no provider-side
+#       # change, purely because a clock advanced. `in_progress` is also
+#       # emitted when the per-SHA StatusContext reads exactly `pending` on a
+#       # head that would otherwise be terminal (#919), because a run that is
+#       # underway makes the published artifacts activity rather than a
+#       # finished review.
 #       "observed": "none" | "rate_limit" | "paused" | "in_progress"
 #                   | "summary-without-head-review" | "awaiting-summary"
 #                   | "terminal",
@@ -221,8 +245,13 @@
 #       # carries the ONLY blocking marker (#535), and the per-SHA success
 #       # is what discriminates the wedged-but-complete #866 state from
 #       # that mid-publication one.
+#       # `missing` means the surface was read and CodeRabbit published no
+#       # status; `unreadable` means the read itself failed and nothing was
+#       # observed (#936). The barrier opens only on "success", so both hold
+#       # it closed — they are kept apart so its input never reports an
+#       # absence it did not actually observe.
 #       "context_state": null | "success" | "failure" | "pending"
-#                        | "error" | "missing",
+#                        | "error" | "missing" | "unreadable",
 #       # The refresh time of that same status, sampled and nulled
 #       # together with context_state. The barrier additionally requires
 #       # this to be at-or-after the evidence object's submitted_at
@@ -236,6 +265,22 @@
 #     "codex_failover_requested": true | false,
 #     "waited_seconds": N
 #   }
+#
+# The StatusContext fast path (`trust_status_context_for_clearance: true`)
+# short-circuits the poll when CodeRabbit has already published a per-SHA
+# success. Three things must hold before it clears, because `state: success`
+# alone means neither "reviewed" nor "clean":
+#   - the status' own `description` must name a COMPLETED review. CodeRabbit
+#     publishes its rate-limited state AS a success and says so only there
+#     ("Review rate limited"), so a success with a refusal description — or any
+#     description this helper does not recognize — is not clearance
+#     (#891/#897/#912).
+#   - no CodeRabbit comment may contradict it: a rate_limit / paused /
+#     in_progress notice near or after the status (#446/#596/#599), or a
+#     rate-limit notice whose published window has not expired (#891/#912).
+#   - neither the inline findings on the SHA nor the head-anchored PR-level
+#     summary may carry a blocking marker (#224/#837, and #877 for the
+#     summary-only surface the fast path used to skip).
 #
 # Exit codes:
 #   0   CodeRabbit posted a real review on current HEAD and nothing on it
@@ -397,6 +442,23 @@ if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
   echo "ERROR: PR_NUMBER must be an integer; got '$PR_NUMBER'" >&2
   exit 3
 fi
+
+# #888: the flag scan above is LEADING-only, so a flag written after the PR
+# number is not a flag — it is the REPO positional. `coderabbit-wait.sh 884
+# --probe` therefore ran a full POLLING wait against the repo named `--probe`
+# and died with a confusing `failed to fetch PR metadata: 404`. A repo name
+# cannot begin with `-`, so rejecting that shape turns the 404 into a usage
+# error that names the working form. The leading-flag design itself is
+# deliberate (it avoids a bash 3.2 empty-array hazard under `set -u` and keeps
+# every existing `<PR> [REPO]` caller working); only the mis-read is fixed.
+case "${2:-}" in
+  -*)
+    echo "ERROR: REPO must be 'owner/repo'; got the flag-shaped argument '$2'." >&2
+    echo "       Options are leading-only — write '$0 --probe <PR_NUMBER> [REPO]'." >&2
+    echo "Usage: $0 [--probe] <PR_NUMBER> [REPO]" >&2
+    exit 3
+    ;;
+esac
 
 REPO=${2:-}
 if [ -z "$REPO" ]; then
@@ -799,13 +861,109 @@ fetch_api_array_best_effort() {
   }
 }
 
+# BEGIN coderabbit_status_description_helpers
+# True when a CodeRabbit StatusContext `success` may be trusted as CLEARANCE,
+# judged by the status' own `description` string. Pure: no globals, no I/O —
+# extracted by sentinel and sourced directly by
+# tests/test_coderabbit_wait_statuscontext_ratelimit.sh.
+#
+# #891 / #897 / #912 are ONE defect filed three times from three sessions:
+# `state: success` does not mean "reviewed". CodeRabbit publishes its
+# rate-limited state AS a success status and carries the truth only in the
+# description. The observed vocabulary, from the three live captures:
+#
+#   success | Review completed      a run finished        (#912, af8496f @03:06:48Z)
+#   success | Review rate limited   NO review ran         (#897 c00abf0, #891 f0198d9,
+#                                                          #912 af8496f)
+#   pending | Review in progress    a run is underway     (#897, #919)
+#   pending | Review queued         a run is queued       (#897)
+#
+# Only `success` ever reaches the fast path, so the discriminator that matters
+# is between the first two. `emit_status_context_verdict` already knows success
+# means "completed, not clean" (#224) and scans inline findings before
+# clearing — but a rate-limited head has zero inline findings for the trivial
+# reason that nothing was scanned, so the finding scan cannot tell it from a
+# genuinely clean review.
+#
+# The test is POSITIVE — clear only on a description that names a completed
+# review. A deny-list of the known refusal wordings goes blind the moment
+# CodeRabbit renames one, and "the guard had no scope over a wording it had
+# never seen" is precisely the #891/#912 defect. An unrecognized NON-empty
+# description therefore suppresses the fast path, and the wait falls through to
+# the comment-driven poll that reaches its own verdict.
+#
+# The one escape is an EMPTY description, which is permitted. That is not a
+# hole: `description` is optional metadata in the statuses API, every observed
+# false clear carries a non-empty one, and refusing an empty description would
+# disable the fast path for any status posted without one — while the fast path
+# is what keeps a clean fix-up push from burning the whole poll budget (#221).
+# A liveness cost paid on a shape that has never false-cleared is the wrong
+# trade.
+#
+# The permitted wordings are an EXACT allowlist over the normalized string, not
+# a substring or prefix match (Codex P1 on #936). `*"review complete"*` read
+# "names a completed review" off any description CONTAINING that phrase, and
+# three wordings contain it while meaning the opposite or less:
+#
+#   No review completed        the review did NOT happen
+#   Review completely skipped  the review did NOT happen
+#   Review complete — 0 files reviewed   (a prefix-anchored fix accepts this too)
+#
+# A guard whose whole job is to reject descriptions that deny a completed review
+# cannot be satisfied by a longer wording that embeds one. Exactness is what
+# makes the doctrine above hold in both directions: only a description that IS
+# one of the completed-review wordings clears, and every other non-empty string
+# — refusal, pending, extended, or unseen — falls through to the comment-driven
+# poll. The set is small and vendor-published, so enumerating it costs nothing;
+# a wording CodeRabbit adds later suppresses the fast path until it is added
+# here, which is a liveness cost on the safe side.
+#
+# Normalization is case and SURROUNDING whitespace only — transport noise, not
+# vocabulary. A whitespace-only description normalizes to empty and takes the
+# empty-description escape above, since it is indistinguishable from an absent
+# field. Nothing else is stripped: trailing punctuation or an appended clause
+# makes the string a wording nobody has shipped, which is exactly the case the
+# positive test is meant to refuse.
+crw_status_description_permits_clearance() {
+  local desc=${1:-} lower
+  lower=$(printf '%s' "$desc" | tr '[:upper:]' '[:lower:]')
+  # Bash 3.2 trim: strip the leading, then the trailing, whitespace run.
+  lower="${lower#"${lower%%[![:space:]]*}"}"
+  lower="${lower%"${lower##*[![:space:]]}"}"
+  [ -n "$lower" ] || return 0
+  case "$lower" in
+    "review complete"|"review completed") return 0 ;;
+  esac
+  return 1
+}
+# END coderabbit_status_description_helpers
+
 # Fetch the CodeRabbit `StatusContext` check on the current HEAD SHA.
 # Emits compact JSON with:
-#   { "state": "success|failure|pending|error|missing", "created_at": "..." }
+#   { "state": "success|failure|pending|error|missing|unreadable",
+#     "created_at": "...", "updated_at": "...", "description": "..." }
 #
-# `missing` covers both the no-statuses-yet case and any transient API
-# hiccup (network, 5xx, etc.) — caller treats it as "fall through to
-# the existing comment-driven path."
+# `missing` is a POSITIVE OBSERVATION: the statuses surface was read and
+# CodeRabbit has published no status on this head. `unreadable` is the
+# absence of an observation: the fetch or the parse failed and we know
+# nothing. Keeping them apart is the whole point of this record (#936).
+#
+# They used to be the same value, and for every consumer that existed at
+# the time that was harmless — each one acts only on `success`, so a
+# failed read fell through to the comment-driven path, which is the
+# conservative direction. The #919 `pending` gate is the first consumer
+# for which the two have different correct answers: it blocks on exactly
+# `pending`, so a transient read failure read as "not pending", the probe
+# emitted `reported`, and the Phase 4b barrier could open on
+# pre-completion artifacts (Codex P1 on #936). A failed read is not
+# evidence that a run has finished.
+#
+# Read every consumer's state through crw_status_record_state below rather
+# than a bare `jq -r '.state'`: under `set -e` suppression inside an `if`
+# condition a failed record read collapses to an EMPTY string, which is
+# equally not-`pending` and equally permissive. The helper maps every
+# unusable shape onto `unreadable` so no consumer can silently inherit a
+# permissive default.
 #
 # Two defensive guards (CodeRabbit ⚠️ Critical on PR #224 round 1):
 #
@@ -826,6 +984,12 @@ fetch_api_array_best_effort() {
 # `/commits/{sha}/status` rolls up state but omits per-status creator
 # fields, which would defeat guard 1. Confirmed empirically — see
 # PR #224 round 2.
+#
+# The record emitted when the statuses surface could not be read or parsed.
+# Same shape as every other record so consumers need no special case beyond
+# the state value itself.
+CRW_STATUS_RECORD_UNREADABLE='{"state":"unreadable","created_at":"","updated_at":"","description":""}'
+
 check_status_context_record() {
   local resp
   # Pagination (CodeRabbit ⚠️ Minor @ line 267 on PR #224 round 2):
@@ -844,12 +1008,23 @@ check_status_context_record() {
   # status object — so updated_at and created_at coincide in practice; the
   # `// .created_at` fallback keeps the field meaningful if a proxy strips
   # one of them.
+  #
+  # `description` (#891/#897/#912): CodeRabbit publishes its own disqualifier
+  # in this field. `state: success` does NOT mean "reviewed" — it also means
+  # "I am not reviewing this head at all", and the only place that says so is
+  # the description string `Review rate limited`. Carried here so
+  # crw_status_description_permits_clearance can read it at the fast path.
+  local resp out
   resp=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null) || {
-    jq -nc '{state: "missing", created_at: "", updated_at: ""}'
+    printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"
     return
   }
-  echo "$resp" | jq -c --arg bot "$BOT_LOGIN" '
+  # The filter's own failure is the second half of the same hazard: a
+  # malformed page that survives `add // []` but breaks this expression used
+  # to emit NOTHING, and an empty record reads as not-`pending` just as
+  # permissively as the old `missing` did.
+  out=$(printf '%s' "$resp" | jq -c --arg bot "$BOT_LOGIN" '
     [ .[]?
       | select(.context == "CodeRabbit")
       | select((.creator.login // "") == $bot)
@@ -857,16 +1032,44 @@ check_status_context_record() {
     | sort_by(.created_at)
     | last
     | if . == null then
-        {state: "missing", created_at: "", updated_at: ""}
+        {state: "missing", created_at: "", updated_at: "", description: ""}
       else
         {state: (.state // "missing"), created_at: (.created_at // ""),
-         updated_at: (.updated_at // .created_at // "")}
+         updated_at: (.updated_at // .created_at // ""),
+         description: (.description // "")}
       end
-  '
+  ' 2>/dev/null) || {
+    printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"
+    return
+  }
+  if [ -z "$out" ]; then
+    printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"
+    return
+  fi
+  printf '%s\n' "$out"
+}
+
+# The single reader for a check_status_context_record record (#936).
+#
+# A well-formed record's state passes through verbatim — this does NOT
+# second-guess GitHub's status vocabulary, so a state the API adds later is
+# reported as itself rather than masked. Everything that is not a usable
+# observation — an empty string, a non-object, unparseable JSON, a missing or
+# non-string `.state` — reads `unreadable`. That is the one value every
+# consumer below is required to treat as "no observation", never as a
+# permissive default.
+crw_status_record_state() {
+  local rec=${1:-} state
+  state=$(printf '%s' "$rec" | jq -r '
+    if type == "object" and (.state | type) == "string" and (.state | length) > 0
+    then .state else "unreadable" end
+  ' 2>/dev/null) || state="unreadable"
+  [ -n "$state" ] || state="unreadable"
+  printf '%s' "$state"
 }
 
 check_status_context() {
-  check_status_context_record | jq -r '.state'
+  crw_status_record_state "$(check_status_context_record)"
 }
 
 # --- fetch PR metadata ------------------------------------------------------
@@ -1101,9 +1304,10 @@ classify_comment() {
 # Pure string predicates over a CodeRabbit summary body. No globals beyond the
 # constants defined above, no I/O — extracted by sentinel and sourced directly
 # by tests/test_coderabbit_wait_status_probe.sh, the pattern
-# tests/test_audit_branch_protection.sh already uses. Their one external
-# dependency is `coderabbit_tier_of` from scripts/lib/feedback-policy-helpers.sh
-# (#837), which the extracting test sources alongside this block.
+# tests/test_audit_branch_protection.sh already uses. Their only external
+# dependency is the shared `coderabbit_tier_of` ladder in
+# scripts/lib/feedback-policy-helpers.sh (#837), which the extracting test
+# sources alongside this block.
 
 # True when a body classifies as a BLOCKING CodeRabbit finding: the p0/p1 rungs
 # of the shared `coderabbit_tier_of` ladder (CodeRabbit never maps to p0 today;
@@ -1139,10 +1343,10 @@ crw_body_is_blocking_finding() {
 # True when ANY line of the given scan classifies as a blocking finding.
 #
 # LINE-wise, not body-wise, because a PR-level summary is a document holding
-# many finding stanzas: `coderabbit_tier_of` answers "what tier is THIS
-# finding", so the summary is fed to it one line at a time — which is also the
-# granularity at which CodeRabbit renders the badge. Blank lines are skipped;
-# they cannot carry a marker.
+# many finding stanzas: the ladder answers "what tier is THIS finding", so the
+# summary is fed to it one line at a time — which is also the granularity at
+# which CodeRabbit renders the badge. Blank lines are skipped; they cannot
+# carry a marker.
 crw_scan_has_blocking_marker() {
   local line
   while IFS= read -r line; do
@@ -1499,31 +1703,125 @@ count_blocking_tier_issues() {
 # Mirrors latest_comment_from_issue_comments: filter to the bot login,
 # newest comment on/after the HEAD anchor (max of created_at/updated_at,
 # since CodeRabbit edits the summary in place).
+#
+# `$1` is the freshness anchor, defaulting to HEAD_ANCHOR — which is what the
+# two POLL-side callers want, because each is reached only after a comment
+# already survived that same floor, and the verdict must be read off the very
+# comment they classified. The StatusContext fast path passes
+# HEAD_IDENTITY_ANCHOR instead; the argument for that is at ITS call site, and
+# the short version is that it is the one caller reached when NOTHING survived
+# the floor.
+#
+# Return codes, and ALL call sites must honour all three:
+#   0  a blocking marker is present in the head-anchored summary
+#   1  no blocking marker
+#   3  the summary could NOT be read (infra)
+#
+# The rc-3 rung exists because this helper is used as an `if` condition, and a
+# `die 3` inside `fetch_api_array` exits only its own command substitution
+# (CodeRabbit 🟠 Major on #936). Without the explicit propagation the function
+# carried on with empty input, `summary_blocking_marker_present ""` returned
+# false, and the caller read a dead API as "no summary-only finding" — a
+# false clear, on the exact route #877 added this check to close. Treating rc 3
+# as "absent" anywhere re-opens it; the callers `die 3` instead, which is what
+# every other failed read in this file already does.
+#
+# The SAME rung covers the jq that derives the body, not only the fetch (Codex
+# P1 on #936). An `if`/`||` call context disables errexit inside the function,
+# so an unchecked assignment let a failed derive — a well-formed but
+# unexpectedly-shaped payload, where the fetch's own `add // []` succeeds and
+# `.user.login` then errors — carry on with an empty body and return 1 (`no
+# marker`): clearance off a summary nothing ever read. Every read on this path
+# is status-checked; there is no rung that means "I could not tell" other than
+# 3.
+#
+# SELECTION — the latest review SUMMARY, not the latest bot comment of any
+# class (Codex P1 on #936, a hazard the #877 fast-path caller opened). The
+# helper originally served only the two POLL callers, and there the two
+# selections coincide: each runs inside `case class in review)`, so the newest
+# head-anchored bot comment is already known to be a review summary and
+# re-picking it returns the very comment the caller classified. The
+# StatusContext fast path establishes no such precondition, and a class-blind
+# "newest bot comment" pick is wrong exactly there.
+#
+# The reachable shape is a later notice sitting ABOVE the summary. A
+# rate-limit / paused / in-progress notice suppresses the fast path only while
+# `status_context_fast_path_blocked_by_comment` still holds it against the
+# status — and that arbitration deliberately releases an unscoped notice
+# CREATED BEFORE the success (#446, the 263caf3 "Bug 6" regression). Once it
+# does, the notice is still the newest comment: this helper graded the NOTICE,
+# found no badge in a body that carries none by construction, and cleared over
+# a blocking summary two comments down that the polling `review` arm and
+# `--probe` both report as findings.
+#
+# Classified through `classify_comment`, the same ladder the poll loop routes
+# every comment through, rather than a second jq predicate — a duplicated
+# classifier is how the summary and inline surfaces drifted apart in #837/#851,
+# and the vendor's own markers change. Non-review classes are SKIPPED rather
+# than terminating the scan, so a notice cannot mask the summary underneath it
+# by position; the class filter also subsumes the status-probe exclusion the
+# old jq spelled out itself, since `status_probe` is one of the classes.
+#
+# The class filter is a PREFERENCE, never an EXCLUSION (CodeRabbit 🟠 Major on
+# the first cut of this selection). `classify_comment` is a fixed-string grep
+# over the whole body with no fence awareness, so a genuine summary that merely
+# QUOTES one of the markers grades as that class — and on this file that is not
+# hypothetical, because the markers ARE the literal constants a CodeRabbit
+# summary quotes whenever it reports a finding on the classifier. Skipping such
+# a body outright left no review-class candidate and returned `no marker` from a
+# summary carrying a badge. Measured: on that fixture the class-blind selection
+# exits 2 (findings) and an exclusion-shaped filter exits 0 (cleared) — a false
+# clear this selection would have INTRODUCED.
+#
+# So the newest review-class body wins when one exists, and otherwise the helper
+# grades the newest candidate — exactly what it did before the filter existed.
+# That makes the change monotone: it can promote a summary over a later notice,
+# and it can never demote one to nothing. The residual (a misclassified summary
+# with a later notice above it) is unchanged from the pre-filter behaviour
+# rather than made worse, and the classifier's own fence-blindness belongs to
+# the machine-marker redesign in #878.
+#
+# No candidate at all is rc 1 (`no marker`), not rc 3: an absent summary is a
+# definite answer — there is no summary-only finding on this head — and
+# `summary_blocking_marker_present ""` is the same answer the previous shape
+# gave when nothing survived the anchor. Only a failed READ is rc 3.
 summary_body_has_potential_issue_marker() {
-  local issue_comments latest_body
-  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
-  # Mirror latest_comment_from_issue_comments: exclude status-probe narration
-  # replies so a newer probe comment doesn't mask an earlier real summary that
-  # contains a "Potential issue" marker (false-clear of the #535 gate).
-  latest_body=$(echo "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
-    def status_probe_reply:
-      ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
+  local anchor="${1:-$HEAD_ANCHOR}"
+  local issue_comments candidates candidate_count newest_body body i
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
+  # Newest-first bodies of the head-anchored bot comments. Ordering is the
+  # whole point: the scan below takes the FIRST review-class body, which is the
+  # LATEST summary.
+  candidates=$(printf '%s' "$issue_comments" | jq -c --arg bot "$BOT_LOGIN" --arg after "$anchor" '
     [ .[]
       | select(.user.login == $bot)
       | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
       | select(.fresh_at >= $after)
-      | select(status_probe_reply | not)
     ]
     | sort_by(.fresh_at)
-    | last
-    | (.body // "")
-  ')
-  # Through the shared helper, not a raw grep: the pre-merge check table's
-  # hygiene `⚠️ Warning` rows are not findings, and the probe already reads
-  # them that way — a raw grep here made the SAME body a `findings` verdict in
-  # polling and a `reported` one in probe, so agent-review and the Phase 4b
-  # barrier disagreed about one head (adversarial verification on #851).
-  summary_blocking_marker_present "$latest_body"
+    | reverse
+    | map(.body // "")
+  ') || return 3
+  candidate_count=$(crw_json_array_length "$candidates") || return 3
+  # The pre-filter selection, captured before the scan so the fallback below is
+  # literally the old behaviour rather than a reconstruction of it. Empty when
+  # there are no candidates, which is the old empty-body answer too.
+  newest_body=$(printf '%s' "$candidates" | jq -r '.[0] // ""') || return 3
+  i=0
+  while [ "$i" -lt "$candidate_count" ]; do
+    body=$(printf '%s' "$candidates" | jq -r ".[$i]") || return 3
+    if [ "$(classify_comment "$body")" = "review" ]; then
+      # Through the shared helper, not a raw grep: the pre-merge check table's
+      # hygiene `⚠️ Warning` rows are not findings, and the probe already reads
+      # them that way — a raw grep here made the SAME body a `findings` verdict
+      # in polling and a `reported` one in probe, so agent-review and the Phase
+      # 4b barrier disagreed about one head (adversarial verification on #851).
+      summary_blocking_marker_present "$body"
+      return $?
+    fi
+    i=$((i + 1))
+  done
+  summary_blocking_marker_present "$newest_body"
 }
 
 # SHA-scoped variant of count_potential_issues, used by the StatusContext
@@ -1663,11 +1961,145 @@ rate_limit_window_elapsed_seconds() {
   echo "$elapsed"
 }
 
+# The newest CodeRabbit comment on the PR, ANCHOR-FREE. Mirrors
+# latest_comment_from_issue_comments' selection (same bot filter, same
+# fresh_at = max(created_at, updated_at), same status-probe narration
+# exclusion) MINUS the `fresh_at >= HEAD_ANCHOR` filter. `{}` when the bot has
+# said nothing on this PR at all.
+#
+# Anchor-free on purpose: the caller below asks "what was CodeRabbit's LAST
+# WORD", a question the moving wall-clock freshness floor answers wrongly by
+# construction — see crw_active_rate_limit_notice.
+newest_bot_comment_from_issue_comments() {
+  local issue_comments=$1
+  local latest
+  latest=$(echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" '
+    def status_probe_reply:
+      ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
+    [ .[]
+      | select(.user.login == $bot)
+      | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+      | select(status_probe_reply | not)
+    ]
+    | sort_by(.fresh_at)
+    | last // null
+  ')
+  if [ "$latest" = "null" ]; then
+    echo '{}'
+    return
+  fi
+  echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}'
+}
+
+# Seconds still remaining on the published window ride along ON the emitted
+# notice, as the additive `rate_limit_remaining_seconds` field, rather than in
+# a global. Every call site captures this function in a command substitution
+# (`notice=$(crw_active_rate_limit_notice …)`), so an assignment made inside it
+# dies with the subshell and the parent keeps whatever it had — the three
+# suppression-path log lines reported `0s remaining` for the entire published
+# window (Codex P3 / CodeRabbit 🟡 Minor on #936). Log-only, no verdict reads
+# it, but a diagnostic that always prints the same wrong number is worse than
+# none on exactly the path #909 was hard to read from.
+
+# Emits CodeRabbit's newest comment when it is a rate-limit notice whose
+# PUBLISHED window has not yet expired; returns non-zero (no output) otherwise.
+#
+#   crw_active_rate_limit_notice [<issue-comments-json>]
+#
+# The emitted object is the comment plus one additive field,
+# `rate_limit_remaining_seconds` — see the note above for why it rides on the
+# output rather than in a global. Additive because the poll loop adopts this
+# object as its `LATEST` comment, and every consumer there either reads named
+# fields or re-projects (`{id, created_at, endpoint, body_excerpt}`), so the
+# extra key reaches no emitted JSON.
+#
+# #891 / #912. Rate-limit detection is gated on a comment that survives the
+# `NOW - wallclock_freshness_window_seconds` floor (default 1800s). CodeRabbit's
+# published windows run LONGER than that floor — 59 minutes was the observed
+# one — so the notice ages out of the freshness window while the rate limit it
+# announces is still in force. Once it does, `classify_comment` never sees it,
+# the rate-limit branch stops firing, and control falls through to a
+# StatusContext success that was set while rate-limited and never updated. On
+# #909 that converted a correct exit-5 block at 02:34 into `cleared`/exit 0 at
+# 03:01 on the same unchanged, unreviewed head.
+#
+# The freshness floor exists to stop a STALE notice from blocking a current
+# head. Staleness of a notice is not evidence of recovery, and the window's own
+# published end is the right scope for the suppression it carries.
+#
+# Both inputs are outside the pusher's control — the comment's
+# created_at/updated_at are GitHub-owned and the window is CodeRabbit-published
+# — so no timestamp the pusher can write participates in the decision.
+#
+# Three conjuncts, each load-bearing:
+#   newest overall     a notice that a LATER bot comment supersedes is not
+#                      CodeRabbit's current word. Without this, a 59-minute
+#                      window would mask a genuine review that landed 20
+#                      minutes into it.
+#   classifies rate_limit  via the shared classifier, marker-first (#593).
+#   window still open  `parse_rate_limit_window` must yield a window AND
+#                      fresh_at + window + buffer must be in the future. A
+#                      notice publishing no parseable window governs nothing
+#                      here; it is still handled while it is fresh.
+#
+# rate_limit_window_elapsed_seconds fails SAFE to 0 on an unparseable
+# timestamp, which here means "treat the window as fully open" — the
+# suppressing direction.
+crw_active_rate_limit_notice() {
+  local issue_comments=${1:-}
+  local latest body window fresh_at elapsed remaining
+  if [ -z "$issue_comments" ]; then
+    issue_comments=$(fetch_api_array_best_effort "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
+  fi
+  latest=$(newest_bot_comment_from_issue_comments "$issue_comments")
+  [ "$(echo "$latest" | jq 'length')" != "0" ] || return 1
+  body=$(echo "$latest" | jq -r '.body')
+  [ "$(classify_comment "$body")" = "rate_limit" ] || return 1
+  window=$(parse_rate_limit_window "$body") || return 1
+  fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
+  elapsed=$(rate_limit_window_elapsed_seconds "$fresh_at" "$(date +%s)")
+  remaining=$((window + RATE_LIMIT_BUFFER_SECONDS - elapsed))
+  [ "$remaining" -gt 0 ] || return 1
+  printf '%s' "$latest" | jq -c --argjson r "$remaining" '. + {rate_limit_remaining_seconds: $r}'
+}
+
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
-  local latest class comment_id comment_created_at comment_fresh_at comment_body
-  latest=$(scan_latest_comment)
+  local issue_comments latest class comment_id comment_created_at comment_fresh_at comment_body
+  local active_notice active_id active_remaining
+  # ONE fetch, shared by both checks below. Explicitly status-checked: a
+  # `die 3` inside fetch_api_array exits only its own command substitution, so
+  # an unchecked read failure left the scan with empty input, every classifier
+  # below saw nothing adverse, and the fast path CLEARED on a transient API
+  # error — the same false-clear shape this whole function exists to prevent.
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || {
+    log "StatusContext success suppressed: the issue-comments read failed, so a pending rate-limit / paused / in-progress notice cannot be ruled out — keep polling"
+    return 0
+  }
+
+  latest=$(latest_comment_from_issue_comments "$issue_comments")
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
+    # #891/#912, and ONLY here. Nothing survived the wall-clock freshness
+    # floor, so the arbitration below has no input at all — this is the one
+    # state in which an aged-out rate-limit notice is invisible to it. A
+    # notice whose PUBLISHED window has not expired is still CodeRabbit's
+    # current word: its windows (59 min observed) outrun the default 1800s
+    # floor, so it ages out mid-window and a stale success set while
+    # rate-limited clears an unreviewed head (#909).
+    #
+    # Deliberately NOT applied when the floor did admit a comment. The
+    # arbitration below already weighs a visible notice against the status —
+    # by HEAD reference, by the published window widening the grace
+    # (#596/#599), and by created_at ordering for an unscoped one (#446) —
+    # and a window rule that ignores the status timestamp would override all
+    # three, turning a genuinely-later success into a permanent suppression.
+    # The defect is the notice going BLIND, not the arbitration being wrong.
+    if active_notice=$(crw_active_rate_limit_notice "$issue_comments"); then
+      active_id=$(echo "$active_notice" | jq -r '.id')
+      active_remaining=$(echo "$active_notice" | jq -r '.rate_limit_remaining_seconds // "unknown"')
+      log "StatusContext success suppressed because no CodeRabbit comment survived the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s freshness floor, but its newest comment id=$active_id is a rate-limit notice whose published window has NOT expired (${active_remaining}s remaining) — the published window governs for its full duration (#891/#912)"
+      return 0
+    fi
     return 1
   fi
 
@@ -1940,7 +2372,7 @@ find_status_probe_reply() {
 }
 
 emit_terminal_review_after_probe_if_present() {
-  local latest class potential_issues review_json
+  local latest class potential_issues review_json summary_marker_rc
   latest=$(scan_latest_comment_best_effort)
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
     return 0
@@ -1957,12 +2389,30 @@ emit_terminal_review_after_probe_if_present() {
       if [ "$potential_issues" -gt 0 ]; then
         log "CodeRabbit review landed during status-probe wait with $potential_issues blocking (p0/p1) inline finding(s) — emitting findings (exit 2)"
         emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
-      elif summary_body_has_potential_issue_marker; then
-        log "CodeRabbit review landed during status-probe wait with 0 blocking inline findings but a blocking marker in the PR-level summary body — emitting findings (exit 2)"
-        emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
       fi
-      log "CodeRabbit review landed during status-probe wait with no high-severity markers — emitting cleared (exit 0)"
-      emit_json_and_exit "cleared" 0 "$review_json" 0
+      # Three-way, not a boolean, exactly as the polling `review` arm reads it.
+      # An `elif summary_body_has_potential_issue_marker` collapses the
+      # helper's rc 3 (summary UNREADABLE) into rc 1 (no marker) and falls
+      # straight through to `cleared` — a dead API reading as a clean summary,
+      # on the one route that emits a verdict after the probe wait rather than
+      # from the poll loop (Codex P1 on #936). The helper's contract is that
+      # ALL THREE states are honoured at every call site; this was the site
+      # that did not.
+      summary_marker_rc=0
+      summary_body_has_potential_issue_marker || summary_marker_rc=$?
+      case "$summary_marker_rc" in
+        0)
+          log "CodeRabbit review landed during status-probe wait with 0 blocking inline findings but a blocking marker in the PR-level summary body — emitting findings (exit 2)"
+          emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
+          ;;
+        1)
+          log "CodeRabbit review landed during status-probe wait with no high-severity markers — emitting cleared (exit 0)"
+          emit_json_and_exit "cleared" 0 "$review_json" 0
+          ;;
+        *)
+          die 3 "could not read the PR-level summary to rule out a summary-only blocking marker on $HEAD_SHA — refusing to report a clearance"
+          ;;
+      esac
       ;;
     *)
       log "latest CodeRabbit comment after status-probe wait is class=$class; continuing timeout"
@@ -2292,24 +2742,36 @@ emit_status_context_verdict() {
   # counts findings by each comment's own `commit_id == HEAD_SHA`,
   # which is the right scope given the fast-path already has
   # authoritative SHA-level evidence from the StatusContext check.
+  local status_created_at=${2:-}
   local potential_issues synthetic
   potential_issues=$(count_potential_issues_for_sha "$HEAD_SHA")
   # Keep the synthetic review object compatible with the documented
   # contract at the top of this file: `{ id, created_at, endpoint,
   # body_excerpt }`. The fast-path has no underlying GitHub review,
-  # so `id` is null and `created_at` is the synthesis time — but a
-  # caller reading `review.id` or `review.created_at` no longer hits
-  # a missing key and breaks. `endpoint` keeps the new
-  # "status_context" value (a documented extension for this path); the
-  # extra `head_sha` / `context_state` / `potential_issue_count`
-  # fields are additive. (CodeRabbit Major, #272.)
+  # so `id` is null — but a caller reading `review.id` or
+  # `review.created_at` no longer hits a missing key and breaks.
+  # `endpoint` keeps the new "status_context" value (a documented
+  # extension for this path); the extra `head_sha` / `context_state` /
+  # `potential_issue_count` fields are additive. (CodeRabbit Major, #272.)
+  #
+  # `created_at` is the STATUS' own creation time, not the synthesis time
+  # (#912). Emitting the observation time made a verdict off a stale status
+  # look head-anchored and current: on #909 the JSON read
+  # `created_at: 2026-08-05T03:01:04Z` while the status it trusted had been
+  # sitting untouched since `02:18:59Z`, and nothing in the payload showed
+  # that. The synthesis time is not lost — it moves to the additive
+  # `observed_at`, so a reader can see both the evidence's age and when the
+  # helper looked. Falls back to the synthesis time only when the caller
+  # passed no status timestamp, so the field is never absent or null.
   synthetic=$(jq -nc \
     --arg sha "$HEAD_SHA" \
     --arg state "$state" \
+    --arg status_at "$status_created_at" \
     --argjson p "$potential_issues" \
     '{
       id: null,
-      created_at: (now | todateiso8601),
+      created_at: (if $status_at == "" then (now | todateiso8601) else $status_at end),
+      observed_at: (now | todateiso8601),
       endpoint: "status_context",
       head_sha: $sha,
       context_state: $state,
@@ -2320,6 +2782,63 @@ emit_status_context_verdict() {
     log "StatusContext $state but $potential_issues blocking (p0/p1) inline finding(s) on HEAD — emitting findings (exit 2)"
     emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
   fi
+  # #877: the inline scan above is only ONE of the two surfaces a blocking
+  # finding can live on. The poll loop's `review` arm applies
+  # summary_body_has_potential_issue_marker as an OR-sibling to its inline
+  # count, and the probe's two verdict sites apply
+  # summary_blocking_marker_present the same way — this fast path applied
+  # neither, so a head whose sole blocking marker lives in the PR-level summary
+  # (the #535 summary-only class) cleared HERE while yielding `findings` on
+  # every other route. status_context_fast_path_blocked_by_comment does not
+  # cover it either: that function suppresses only rate_limit / paused /
+  # in_progress, and a summary carrying a finding classifies as `review`.
+  #
+  # Sited here rather than in the suppressor because the suppressor would only
+  # push the head into the poll loop to re-derive the same verdict a poll
+  # interval later, and because the extra read is paid ONLY on the branch that
+  # is about to clear — never on the findings branch above, which already has
+  # its answer.
+  #
+  # potential_issue_count stays the INLINE count (0), byte-for-byte with the
+  # polling `review` arm's summary-only emit, so the two routes remain
+  # indistinguishable to a caller. The exit code carries the verdict.
+  #
+  # HEAD_IDENTITY_ANCHOR, not the helper's HEAD_ANCHOR default — the same anchor
+  # count_potential_issues_for_sha uses three lines above, and for the same
+  # reason. HEAD_ANCHOR carries the moving wallclock floor
+  # (`coderabbit.wallclock_freshness_window_seconds`, live value 1800s), and
+  # this is the ONE site reached when nothing survived that floor: the two poll
+  # callers each run after a comment already passed it, so there the floor
+  # cannot hide the comment being verdicted. Here it can, and did — on an
+  # unchanged head whose summary had merely aged past 30 minutes, no comment
+  # qualified, `summary_blocking_marker_present ""` read false, and the fast
+  # path CLEARED over a summary carrying a blocking marker. That is the #877
+  # false clear this OR-sibling was added to close, re-entered through the
+  # anchor. Both other routes read that same head as findings: the polling
+  # `review` arm off the comment it classified, and `--probe` off its
+  # anchor-free `startswith(SUMMARY_MARKER)` + summary_names_head selection. So
+  # the floor made agent-review and the Phase 4b barrier disagree about one
+  # head purely because a clock advanced — and the merge-gating run is the LATE
+  # one (.github/workflows/agent-review.yml runs this in polling mode at
+  # approval time, after the Codex loop and the 4b barrier), i.e. the run most
+  # likely to be looking at an aged summary.
+  #
+  # Anchored, not anchor-free: HEAD_IDENTITY_ANCHOR is the head's own
+  # committer/force-push time, so a summary predating this head still drops out
+  # as a prior head's report. Resurrecting those would block every push that
+  # follows a blocking review, with nothing able to clear it.
+  local summary_marker_rc=0
+  summary_body_has_potential_issue_marker "$HEAD_IDENTITY_ANCHOR" || summary_marker_rc=$?
+  case "$summary_marker_rc" in
+    0)
+      log "StatusContext $state and 0 blocking inline findings, but the head-anchored PR-level summary carries a blocking marker — emitting findings (exit 2) (#877/#535)"
+      emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
+      ;;
+    1) : ;;   # no summary-only marker — fall through to clearance
+    *)
+      die 3 "could not read the PR-level summary to rule out a summary-only blocking marker on $HEAD_SHA — refusing to report a clearance"
+      ;;
+  esac
   log "StatusContext $state and 0 blocking (p0/p1) inline findings — emitting cleared (exit 0)"
   emit_json_and_exit "cleared" 0 "$synthetic" 0
 }
@@ -2412,6 +2931,63 @@ crw_select_summary_comment() {
 }
 # END coderabbit_summary_selector
 
+# #919: both of the probe's terminal conjuncts are satisfiable by artifacts of
+# CodeRabbit ACTIVITY rather than by a finished review.
+#
+#   - the "review object on the head" conjunct was satisfied by the body-less
+#     review object GitHub wraps around a single inline reply — CodeRabbit's
+#     `🐇 ✅` acknowledgement of a `[mergepath-resolve:…]` tag reply. Closed
+#     upstream at selection by crw_select_head_pinned_review_run (#900).
+#   - the "published summary" conjunct is satisfied by a review-stack REFRESH:
+#     CodeRabbit bumps the walkthrough comment's updated_at when a push arrives,
+#     BEFORE the run it announces completes. Nothing above distinguishes that
+#     from a summary published by a finished run, so fixing only the first
+#     conjunct still admits it.
+#
+# Measured on #892, head 304c861: a probe 29 seconds after the push reported
+# `terminal`, while the per-SHA StatusContext still read
+# `pending | Review in progress` ten minutes later — and CodeRabbit published no
+# body-carrying review object for that head at all. The Phase 4b barrier read
+# the same status and correctly held, so the probe and the barrier disagreed
+# and the barrier was right.
+#
+# So the probe consults the conjunct that was unambiguously correct there. The
+# test is deliberately narrow: ONLY the exact state `pending` blocks, never
+# `missing` / `error` / `failure` / `success`. `missing` is the shape of the
+# #851 clean incremental re-review, which publishes no status at all — treating
+# absence as in-progress would make every previously-reviewed PR read not-yet
+# forever, which is the deadlock #851 exists to prevent.
+#
+# Trust-gated like every other status read here. The disclosed cost is
+# liveness: a run that stalls with `pending` latched and never publishes a
+# terminal status keeps the probe at not-yet until the caller's own bound
+# escalates. That is a hold rather than a false clear, which is the direction
+# this helper is for.
+#
+# #936 (Codex P1): the two non-pending outcomes are not the same outcome. A
+# read that returned `missing` is CodeRabbit's own statement that it published
+# no status here; a read that FAILED says nothing at all, and answering "not
+# pending" from it is a claim of terminality the evidence does not support —
+# in the one direction this helper exists to close. A failed read is therefore
+# infra rc 3, which is what every other failed read on the probe path already
+# does (the reviews fetch, the summary selection, the #869 re-scan). It is
+# also fail-closed at the barrier, which classes rc 3 as escalate rather than
+# reported. The `trust_status_context_for_clearance: false` opt-out remains
+# the escape hatch: it returns before the endpoint is touched at all.
+crw_probe_head_review_in_progress() {
+  local rec state desc
+  [ "$TRUST_STATUS_CONTEXT" = "true" ] || return 1
+  rec=$(check_status_context_record) || rec=""
+  state=$(crw_status_record_state "$rec")
+  if [ "$state" = "unreadable" ]; then
+    die 3 "failed to read the per-SHA CodeRabbit StatusContext on $HEAD_SHA — a failed read is not evidence that the run finished, so the probe refuses to report terminality on it (#936)"
+  fi
+  [ "$state" = "pending" ] || return 1
+  desc=$(printf '%s' "$rec" | jq -r '.description // ""')
+  log "probe: the per-SHA CodeRabbit StatusContext on $HEAD_SHA is pending (${desc:-<no description>}) — a run is still underway, so the published artifacts are activity, not a finished review (#919)"
+  return 0
+}
+
 # --- probe verdict (#814) ---------------------------------------------------
 #
 # Probe mode answers ONE question and never enters the poll loop:
@@ -2474,8 +3050,14 @@ crw_select_summary_comment() {
 # on an object whose PR-level summary is still in flight. The status
 # upgrades nothing on its own; it seconds a claim the review object already
 # made.
+#
+# A SECOND, narrowing role is admitted at the two terminal emits (#919):
+# crw_probe_head_review_in_progress above downgrades an otherwise-terminal head
+# to rc 7 when the per-SHA status reads exactly `pending`. It is the same
+# posture — the status can only ever REFUSE a claim here, never make one.
 probe_emit_verdict() {
   local reviews review review_at issue_comments cand row body class ctx_record
+  local active_notice
   local summary sbody sjson sclass
   local summary_body="" newest_class="" rescan_done=false
 
@@ -2572,10 +3154,20 @@ probe_emit_verdict() {
       # which fails closed at the barrier (not-yet). Sampled once — the
       # re-scan pass reuses the first sample rather than reading a surface
       # that postdates it.
+      #
+      # #936, and a DELIBERATE difference from the #919 gate above: this
+      # consumer was already fail-closed, because the barrier opens only on
+      # the exact value `success`, so a failed read cannot make it open no
+      # matter which non-success value it carries. It therefore keeps its
+      # bounded, self-clearing not-yet instead of escalating to rc 3 — a
+      # transient hiccup here costs one more probe cycle rather than a human.
+      # What changes is honesty: it now reports `unreadable` rather than
+      # borrowing `missing`, so the barrier's input distinguishes "CodeRabbit
+      # published no status" from "we could not read the statuses".
       if [ "$TRUST_STATUS_CONTEXT" = "true" ] && [ -z "$PROBE_CONTEXT_STATE" ]; then
-        ctx_record=$(check_status_context_record)
-        PROBE_CONTEXT_STATE=$(printf '%s' "$ctx_record" | jq -r '.state // "missing"')
-        PROBE_CONTEXT_UPDATED_AT=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""')
+        ctx_record=$(check_status_context_record) || ctx_record=""
+        PROBE_CONTEXT_STATE=$(crw_status_record_state "$ctx_record")
+        PROBE_CONTEXT_UPDATED_AT=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""' 2>/dev/null || printf '')
       fi
       # #869 TOCTOU: the success just observed post-dates the comments
       # snapshot, so the summary may already be up. One re-fetch, one
@@ -2653,6 +3245,13 @@ probe_emit_verdict() {
       PROBE_OBSERVED="terminal"
       log "probe: CodeRabbit reported on $HEAD_SHA with a summary-only blocking marker"
       emit_json_and_exit "findings" 2 "$review" 1
+    fi
+    # #919: sited AFTER the summary-marker escalation on purpose. A blocking
+    # marker is a real signal a human must see, and downgrading it to not-yet
+    # would delay an escalation nothing else makes. Only the clean `reported`
+    # emit — the one a caller reads as "go" — is gated on the run being done.
+    if crw_probe_head_review_in_progress; then
+      probe_not_yet "in_progress" "$review"
     fi
     PROBE_OBSERVED="terminal"
     log "probe: CodeRabbit has reported on $HEAD_SHA (summary published, no summary-level marker)"
@@ -2760,6 +3359,13 @@ probe_emit_verdict() {
         log "probe: head-pinned summary on $HEAD_SHA carries a summary-only blocking marker"
         emit_json_and_exit "findings" 2 "$sjson" 1
       fi
+      # #919, same gate as the review-object site above: a summary is
+      # head-pinned by CONTENT, and CodeRabbit refreshes that content on push
+      # before the run completes. A per-SHA `pending` status says the run is
+      # not done, whatever the comment says.
+      if crw_probe_head_review_in_progress; then
+        probe_not_yet "in_progress" "$sjson"
+      fi
       log "probe: CodeRabbit reported on $HEAD_SHA via a head-pinned summary (clean incremental re-review, no review object)"
       emit_json_and_exit "reported" 0 "$sjson" 0
     fi
@@ -2771,6 +3377,20 @@ probe_emit_verdict() {
     PROBE_OBSERVED="terminal"
     log "probe: no CodeRabbit review on $HEAD_SHA and auto-review will not fire ($PROBE_STATIC_SKIP)"
     emit_json_and_exit "skipped" 6 "null" 0
+  fi
+
+  # #891/#912 AC: `--probe` must not transition `rate_limit` → `none` purely
+  # because a clock advanced. The anchored triage above stops seeing the notice
+  # once it ages past HEAD_ANCHOR, so a head whose review CodeRabbit is still
+  # refusing reported `observed: "none"` with no provider-side change in
+  # between. An unexpired published window is the provider's own statement that
+  # it has not reviewed; report that rather than silence. Placed after the
+  # static skip (which is the stronger "will never fire" claim) and after the
+  # head-pinned summary branch (a completed review outranks an older notice).
+  if active_notice=$(crw_active_rate_limit_notice "$issue_comments"); then
+    log "probe: no head evidence, and CodeRabbit's newest comment is a rate-limit notice with $(printf '%s' "$active_notice" | jq -r '.rate_limit_remaining_seconds // "unknown"')s left on its published window (#891/#912)"
+    probe_not_yet "rate_limit" \
+      "$(printf '%s' "$active_notice" | jq -c '{id, created_at, updated_at, fresh_at, endpoint, body_excerpt: ((.body // "")[0:200])}')"
   fi
 
   if [ -z "$cand" ]; then
@@ -2888,13 +3508,23 @@ fi
 # CodeRabbit doesn't re-narrate when there's nothing new to flag.
 if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
   INITIAL_CTX_RECORD=$(check_status_context_record)
-  INITIAL_CTX=$(echo "$INITIAL_CTX_RECORD" | jq -r '.state')
-  INITIAL_CTX_CREATED=$(echo "$INITIAL_CTX_RECORD" | jq -r '.created_at')
-  log "initial CodeRabbit StatusContext = $INITIAL_CTX on $HEAD_SHA"
-  if [ "$INITIAL_CTX" = "success" ]; then
-    if ! status_context_fast_path_blocked_by_comment "$INITIAL_CTX_CREATED"; then
+  INITIAL_CTX=$(crw_status_record_state "$INITIAL_CTX_RECORD")
+  INITIAL_CTX_CREATED=$(echo "$INITIAL_CTX_RECORD" | jq -r '.created_at // ""' 2>/dev/null || printf '')
+  INITIAL_CTX_DESC=$(echo "$INITIAL_CTX_RECORD" | jq -r '.description // ""' 2>/dev/null || printf '')
+  log "initial CodeRabbit StatusContext = $INITIAL_CTX on $HEAD_SHA (description: ${INITIAL_CTX_DESC:-<none>})"
+  # #936: this arm only ever ACTS on `success`, so `unreadable` was already
+  # fail-closed here — it falls through to the comment-driven poll, which is
+  # the conservative path and the one a failed read should take. Named
+  # explicitly so the property is asserted rather than incidental, and so the
+  # log line stops calling a failed read an absent status.
+  if [ "$INITIAL_CTX" = "unreadable" ]; then
+    log "could not read the per-SHA CodeRabbit StatusContext on $HEAD_SHA — not treating an unreadable status as clearance or as absence; falling through to the comment-driven poll (#936)"
+  elif [ "$INITIAL_CTX" = "success" ]; then
+    if ! crw_status_description_permits_clearance "$INITIAL_CTX_DESC"; then
+      log "StatusContext success on $HEAD_SHA carries description '$INITIAL_CTX_DESC', which does not name a completed review — CodeRabbit is reporting that it did NOT review this head, so this is not clearance; falling through to the comment-driven poll (#891/#897/#912)"
+    elif ! status_context_fast_path_blocked_by_comment "$INITIAL_CTX_CREATED"; then
       log "StatusContext success — entering fast-path verdict (scans inline findings before clearance)"
-      emit_status_context_verdict "$INITIAL_CTX"
+      emit_status_context_verdict "$INITIAL_CTX" "$INITIAL_CTX_CREATED"
     fi
   fi
 fi
@@ -2912,12 +3542,19 @@ while :; do
   # iteration; falls through to the comment scan if not success/failure.
   if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
     LOOP_CTX_RECORD=$(check_status_context_record)
-    LOOP_CTX=$(echo "$LOOP_CTX_RECORD" | jq -r '.state')
-    LOOP_CTX_CREATED=$(echo "$LOOP_CTX_RECORD" | jq -r '.created_at')
-    if [ "$LOOP_CTX" = "success" ]; then
-      if ! status_context_fast_path_blocked_by_comment "$LOOP_CTX_CREATED"; then
+    LOOP_CTX=$(crw_status_record_state "$LOOP_CTX_RECORD")
+    LOOP_CTX_CREATED=$(echo "$LOOP_CTX_RECORD" | jq -r '.created_at // ""' 2>/dev/null || printf '')
+    LOOP_CTX_DESC=$(echo "$LOOP_CTX_RECORD" | jq -r '.description // ""' 2>/dev/null || printf '')
+    # #936: same shape as the pre-loop arm — acts only on `success`, so an
+    # unreadable read keeps polling rather than clearing. Stated, not implied.
+    if [ "$LOOP_CTX" = "unreadable" ]; then
+      log "could not read the per-SHA CodeRabbit StatusContext on $HEAD_SHA mid-loop — continuing to poll rather than treating the failed read as clearance or as absence (#936)"
+    elif [ "$LOOP_CTX" = "success" ]; then
+      if ! crw_status_description_permits_clearance "$LOOP_CTX_DESC"; then
+        log "mid-loop StatusContext success on $HEAD_SHA carries description '$LOOP_CTX_DESC', which does not name a completed review — not clearance (#891/#897/#912)"
+      elif ! status_context_fast_path_blocked_by_comment "$LOOP_CTX_CREATED"; then
         log "CodeRabbit StatusContext flipped to success mid-loop on $HEAD_SHA — entering fast-path verdict"
-        emit_status_context_verdict "$LOOP_CTX"
+        emit_status_context_verdict "$LOOP_CTX" "$LOOP_CTX_CREATED"
       fi
     fi
   fi
@@ -2925,9 +3562,22 @@ while :; do
   LATEST=$(scan_latest_comment)
 
   if [ "$(echo "$LATEST" | jq 'length')" = "0" ]; then
-    log "no CodeRabbit comment yet (elapsed ${ELAPSED}s); sleeping ${POLL_INTERVAL_SECONDS}s"
-    sleep_or_timeout "$POLL_INTERVAL_SECONDS"
-    continue
+    # #891/#912: "nothing inside the freshness window" is not the same as
+    # "CodeRabbit has said nothing". A rate-limit notice whose PUBLISHED window
+    # is still open governs for that window's full duration — otherwise the
+    # notice ages out mid-window, the rate-limit arm below never runs, and the
+    # #489 Codex failover that compensates for a lost CodeRabbit round is
+    # silently disarmed (`codex_failover_requested: false` on #909). Honor it as
+    # THIS iteration's latest comment so the arm handles it exactly as it would
+    # have while the notice was fresh.
+    if ACTIVE_RATE_LIMIT=$(crw_active_rate_limit_notice); then
+      log "no CodeRabbit comment inside the ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s freshness window, but its newest comment is a rate-limit notice with $(printf '%s' "$ACTIVE_RATE_LIMIT" | jq -r '.rate_limit_remaining_seconds // "unknown"')s left on the published window — honoring it (#891/#912)"
+      LATEST="$ACTIVE_RATE_LIMIT"
+    else
+      log "no CodeRabbit comment yet (elapsed ${ELAPSED}s); sleeping ${POLL_INTERVAL_SECONDS}s"
+      sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+      continue
+    fi
   fi
 
   COMMENT_ID=$(echo "$LATEST" | jq -r '.id')
@@ -3073,13 +3723,25 @@ while :; do
       if [ "$POTENTIAL_ISSUES" -gt 0 ]; then
         log "CodeRabbit review posted with $POTENTIAL_ISSUES blocking (p0/p1) inline finding(s)"
         emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
-      elif summary_body_has_potential_issue_marker; then
-        log "CodeRabbit review posted with 0 blocking inline findings but a blocking marker in the PR-level summary body — findings"
-        emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
-      else
-        log "CodeRabbit review posted with no high-severity markers — cleared"
-        emit_json_and_exit "cleared" 0 "$REVIEW_JSON" 0
       fi
+      # Three-way, not a boolean: rc 3 means the summary could not be READ, and
+      # collapsing that into "no marker" is the false clear documented on the
+      # helper (CodeRabbit 🟠 Major on #936).
+      SUMMARY_MARKER_RC=0
+      summary_body_has_potential_issue_marker || SUMMARY_MARKER_RC=$?
+      case "$SUMMARY_MARKER_RC" in
+        0)
+          log "CodeRabbit review posted with 0 blocking inline findings but a blocking marker in the PR-level summary body — findings"
+          emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
+          ;;
+        1)
+          log "CodeRabbit review posted with no high-severity markers — cleared"
+          emit_json_and_exit "cleared" 0 "$REVIEW_JSON" 0
+          ;;
+        *)
+          die 3 "could not read the PR-level summary to rule out a summary-only blocking marker on $HEAD_SHA — refusing to report a clearance"
+          ;;
+      esac
       ;;
   esac
 done

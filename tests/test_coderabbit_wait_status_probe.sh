@@ -198,10 +198,20 @@ case "$endpoint" in
     # against the head review object; it defaults to head_time, which
     # PREDATES reply_time-stamped evidence, so tests exercising the
     # correlated direction must set it explicitly.
+    #
+    # `unreadable` (#936) is the third arm and it is NOT a status value: it
+    # makes the endpoint itself fail, so the caller's fetch pipeline exits
+    # nonzero. That is the transport failure Codex's P1 found conflated with
+    # `absent` — the fixture has to be able to tell them apart before the
+    # script can.
     case "${CODERABBIT_TEST_STATUS:-absent}" in
       success|failure|pending)
         printf '[{"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"}}]\n' \
           "${CODERABBIT_TEST_STATUS}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "$bot"
+        ;;
+      unreadable)
+        echo "simulated statuses endpoint failure" >&2
+        exit 42
         ;;
       *) printf '[]\n' ;;
     esac
@@ -272,6 +282,25 @@ case "$endpoint" in
         # is deciding. Must surface as rc 3 (infra), never as a clean rc 7.
         echo "simulated reviews API failure" >&2
         exit 44
+        ;;
+      review_during_probe_summary_unreadable)
+        # No head-pinned review object, so head_review_finding_bodies returns
+        # [] and the inline count is 0 — the post-probe emitter then falls
+        # through to the summary-marker read. Record that THIS read happened,
+        # gated on the probe having posted: it is the one fetch that sits
+        # between the emitter's comment scan and its summary-marker read, so
+        # the issues stub can fail exactly that read. (Marking on
+        # pulls/comments does not work: the empty reviews list short-circuits
+        # before it, so that endpoint is never reached and the failure never
+        # arms.)
+        count=0
+        if [ -f "$state_dir/probe-count" ]; then
+          count=$(cat "$state_dir/probe-count")
+        fi
+        if [ "$count" -gt 0 ]; then
+          printf '1\n' >"$state_dir/inline-count-read"
+        fi
+        printf '[]\n'
         ;;
       probe_finding_predates_head)
         # #814: SHA-pinned evidence that predates the head committer date —
@@ -389,6 +418,23 @@ case "$endpoint" in
       probe_in_progress)
         printf '[{"id":7802,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"CodeRabbit review in progress; hold tight."}]\n' "$bot" "$head_time" "$head_time"
         ;;
+      probe_ratelimit_aged_open_window)
+        # #891/#912: a rate-limit notice that has AGED OUT of the freshness
+        # window while the window it published is still open. Stamped 2400s
+        # before the stubbed wallclock (2000000000 = 2033-05-18T03:33:20Z), so
+        # a 1800s freshness floor drops it from the anchored triage; the
+        # 59-minute window it publishes still has ~1170s to run. Pre-fix the
+        # probe reported `observed: "none"` — the `rate_limit → none`
+        # transition with no provider-side change in between.
+        printf '[{"id":7941,"user":{"login":"%s"},"created_at":"2033-05-18T02:53:20Z","updated_at":"2033-05-18T02:53:20Z","body":"<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached\\n>\\n> **Next review available in:** **59 minutes**\\n\\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->"}]\n' "$bot"
+        ;;
+      probe_ratelimit_aged_expired_window)
+        # The boundary: identical shape, but the published window is 13
+        # minutes (780s + 30s buffer), long expired at 2400s elapsed. The
+        # suppression is scoped by the PUBLISHED window, not by "a notice
+        # exists", so this must still read as silence.
+        printf '[{"id":7942,"user":{"login":"%s"},"created_at":"2033-05-18T02:53:20Z","updated_at":"2033-05-18T02:53:20Z","body":"<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached\\n>\\n> **Next review available in:** **13 minutes**\\n\\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->"}]\n' "$bot"
+        ;;
       probe_narration)
         # #814: a status-probe narration reply strictly AFTER the HEAD
         # anchor, so it survives the freshness filter and actually reaches
@@ -483,6 +529,34 @@ case "$endpoint" in
         fi
         if [ "$count" -gt 0 ] && [ "$(fake_now)" -ge 2000000006 ]; then
           printf '[{"id":8803,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"CodeRabbit review completed. See inline findings."}]\n' "$bot" "$reply_time" "$reply_time"
+        else
+          printf '[]\n'
+        fi
+        ;;
+      review_during_probe_summary_unreadable)
+        # Codex P1 on #936. Same shape as review_arrives_during_probe, but the
+        # inline count is ZERO (pulls serves []), so the post-probe emitter
+        # reaches summary_body_has_potential_issue_marker — and the read that
+        # helper makes FAILS. The first post-probe read serves the review
+        # summary (so the comment classifies and the route is entered); every
+        # read after it dies, which is exactly the transient failure landing
+        # between the classification and the summary-marker check.
+        count=0
+        if [ -f "$state_dir/probe-count" ]; then
+          count=$(cat "$state_dir/probe-count")
+        fi
+        if [ "$count" -gt 0 ] && [ "$(fake_now)" -ge 2000000006 ]; then
+          # Fail the issues read that FOLLOWS the inline-count read, not an
+          # nth read: the inline count is the only pulls fetch on this route,
+          # so the marker below pins the failure to the summary-marker read
+          # exactly. Failing by count instead landed on the probe REPLY poll
+          # and the run timed out (rc 4) before ever reaching the emitter —
+          # green for the wrong reason.
+          if [ -f "$state_dir/inline-count-read" ]; then
+            echo "simulated issue-comments API failure" >&2
+            exit 44
+          fi
+          printf '[{"id":8804,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nCodeRabbit review completed."}]\n' "$bot" "$reply_time" "$reply_time"
         else
           printf '[]\n'
         fi
@@ -831,6 +905,33 @@ test_review_during_probe_wait_emits_findings() {
   fi
 }
 
+test_review_during_probe_wait_unreadable_summary_is_infra() {
+  # Codex P1 on #936. `summary_body_has_potential_issue_marker` returns THREE
+  # states — 0 marker present, 1 absent, 3 the summary could not be READ — and
+  # its contract is that every call site honours all three. This route read it
+  # as an `elif` condition, which collapses rc 3 into rc 1 and falls straight
+  # through to `cleared`: a dead API reading as a clean summary, on the one
+  # verdict path reached after the status-probe wait rather than from the poll
+  # loop. The polling `review` arm and the StatusContext fast path already had
+  # the three-way form; this site did not.
+  #
+  # Zero inline findings, so the emitter reaches the summary read; the read
+  # then fails. Must be rc 3 (infra), never rc 0.
+  local dir rc status
+  dir=$(make_case "review-during-probe-unreadable-summary" 1 true 6 2)
+  rc=$(run_case "$dir" review_during_probe_summary_unreadable)
+  status=$(jq -r '.status // "none"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "0" ] || [ "$status" = "cleared" ]; then
+    fail "#936: FALSE-CLEARED after the post-probe summary read failed (rc=$rc status=$status); err=$(tail -3 "$dir/err.log")"
+  elif [ "$rc" != "3" ]; then
+    fail "#936: expected exit 3 (infra) from the post-probe summary read failure, got $rc; err=$(tail -3 "$dir/err.log")"
+  elif ! grep -q 'refusing to report a clearance' "$dir/err.log"; then
+    fail "#936: expected the fail-closed summary-read message; err=$(tail -3 "$dir/err.log")"
+  else
+    pass "#936: an unreadable summary on the post-probe verdict path is infra rc 3, never a clearance"
+  fi
+}
+
 # #535.1: the findings gate must also honor a PR-level summary-body marker.
 # A CodeRabbit review on HEAD with ZERO inline findings but a "Potential
 # issue"/⚠️ marker in its PR-level summary body must emit findings (exit 2),
@@ -1073,14 +1174,18 @@ expected_observed() {
   local trust=$1 status=$2 scenario=$3
   # The StatusContext is deliberately not consulted as EXISTENCE evidence,
   # at either trust setting: CodeRabbit emits a spurious success shortly
-  # after a rate-limit notice, so it is not sound on its own. Its only
-  # probe-mode role is CONJUNCTIVE (#869): riding the rc-7 review-object
-  # JSON as probe.context_state / context_updated_at — and no swept
-  # scenario carries a head-pinned review object, so `observed` stays
-  # status-independent here. Both dimensions are swept anyway, so a future
-  # change that starts reading it elsewhere shows up as a mismatch; the
-  # ride-along path is pinned by the dedicated #869 cases below.
-  : "$trust" "$status"
+  # after a rate-limit notice, so it is not sound on its own. Its two
+  # probe-mode roles are both NARROWING, never widening — neither can turn a
+  # not-yet into a report:
+  #   * CONJUNCTIVE (#869): riding the rc-7 review-object JSON as
+  #     probe.context_state / context_updated_at. No swept scenario carries a
+  #     head-pinned review object with a masked summary, so that path is
+  #     pinned by the dedicated #869 cases below rather than here.
+  #   * BLOCKING (#919): a per-SHA state of exactly `pending` says a run is
+  #     underway, so the artifacts a terminal verdict rests on are activity
+  #     rather than a finished review. This is the one dimension `observed`
+  #     depends on the status for, and only at trust=true, only on the two
+  #     scenarios that reach a terminal emit.
   case "$scenario" in
     none)                  printf 'none\n' ;;
     rate_limit)            printf 'rate_limit\n' ;;
@@ -1088,12 +1193,19 @@ expected_observed() {
     probe_in_progress)     printf 'in_progress\n' ;;
     # Narration is filtered before classification, so it reads as nothing.
     probe_narration)       printf 'none\n' ;;
-    probe_review_on_head)  printf 'terminal\n' ;;
     # #851: the head-pinned completed summary is terminal evidence; the
-    # mid-review summary already naming the head is in_progress. Both at every
-    # trust × StatusContext combination — the probe never consults the
-    # StatusContext for either.
-    probe_clean_incremental) printf 'terminal\n' ;;
+    # mid-review summary already naming the head is in_progress. #919 adds the
+    # one exception: a trusted per-SHA `pending` blocks the terminal emit on
+    # both terminal routes. `missing` / `success` / `failure` never do —
+    # `missing` is the shape of the #851 clean incremental re-review, which
+    # publishes no status at all.
+    probe_review_on_head|probe_clean_incremental)
+      if [ "$trust" = "true" ] && [ "$status" = "pending" ]; then
+        printf 'in_progress\n'
+      else
+        printf 'terminal\n'
+      fi
+      ;;
     probe_summary_midreview) printf 'in_progress\n' ;;
     *)                     printf 'UNMAPPED\n' ;;
   esac
@@ -1102,7 +1214,10 @@ expected_observed() {
 test_probe_state_space_sweep() {
   local trust status scenario dir rc n=0 bad=0
   for trust in false true; do
-    for status in absent success failure; do
+    # `pending` joins the sweep with #919: it is the one status value that
+    # changes an `observed`, so leaving it out would let the new guard's
+    # blast radius go unmeasured across the rest of the state space.
+    for status in absent success failure pending; do
       for scenario in none rate_limit probe_paused probe_in_progress probe_narration probe_review_on_head probe_clean_incremental probe_summary_midreview; do
         n=$((n + 1))
         dir=$(make_case "sweep-$trust-$status-$scenario" 600 true 30 0 0)
@@ -2073,7 +2188,196 @@ test_900_review_run_selector_ignores_bodyless_replies() {
   fi
 }
 
+# Rewrite the fixture's freshness window. The default (999999999) makes the
+# HEAD committer date the anchor, so no comment ever ages out — which is
+# exactly the condition the #891/#912 cases need to break.
+set_freshness_window() {  # <dir> <seconds>
+  sed -i.bak "s/^  wallclock_freshness_window_seconds: .*\$/  wallclock_freshness_window_seconds: $2/" \
+    "$1/.github/review-policy.yml" && rm -f "$1/.github/review-policy.yml.bak"
+}
+
+test_919_pending_status_blocks_the_terminal_verdict() {
+  # #919, observed on #892 head 304c861: a probe 29 seconds after the push
+  # reported `terminal` while the per-SHA StatusContext still read
+  # `pending | Review in progress` ten minutes later. Both of the probe's
+  # terminal conjuncts were satisfied by artifacts of CodeRabbit ACTIVITY —
+  # a body-less reply wrapper (closed at selection by #900) and a walkthrough
+  # comment whose updated_at CodeRabbit bumps on push, BEFORE the run
+  # completes. The Phase 4b barrier read the same status and correctly held,
+  # so the probe and the barrier disagreed and the barrier was right.
+  #
+  # Route 1: the head-pinned review OBJECT route.
+  local dir rc
+  dir=$(make_case probe-919-robj-pending 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=pending run_probe_case "$dir" probe_review_on_head)
+  assert_probe_not_yet "$dir" "$rc" in_progress \
+    "#919: a per-SHA pending status blocks the review-object terminal verdict"
+
+  # Route 2: the #851 head-pinned SUMMARY route, which has no review object at
+  # all — the route a review-stack refresh satisfies most cheaply.
+  local dir2 rc2
+  dir2=$(make_case probe-919-summary-pending 600 true 30 3 2)
+  enable_trust_status_context "$dir2"
+  rc2=$(CODERABBIT_TEST_STATUS=pending run_probe_case "$dir2" probe_clean_incremental)
+  assert_probe_not_yet "$dir2" "$rc2" in_progress \
+    "#919: a per-SHA pending status blocks the head-pinned-summary terminal verdict"
+
+  # Control A — `missing` must NOT block. It is the shape of the #851 clean
+  # incremental re-review, which publishes no status; treating absence as
+  # in-progress would make every previously-reviewed PR read not-yet forever.
+  local dir3 rc3 status3 obs3
+  dir3=$(make_case probe-919-summary-nostatus 600 true 30 3 2)
+  enable_trust_status_context "$dir3"
+  rc3=$(run_probe_case "$dir3" probe_clean_incremental)
+  status3=$(jq -r '.status' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
+  obs3=$(jq -r '.probe.observed // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc3" = "0" ] && [ "$status3" = "reported" ] && [ "$obs3" = "terminal" ]; then
+    pass "#919 control: no per-SHA status at all still reads terminal (the #851 clean re-review keeps working)"
+  else
+    fail "#919 control (missing status) → rc=$rc3 status=$status3 observed=$obs3"
+    sed 's/^/      /' "$dir3/err.log" >&2 || true
+  fi
+
+  # Control B — the guard is trust-gated like every other status read here.
+  local dir4 rc4 status4 obs4
+  dir4=$(make_case probe-919-untrusted-pending 600 true 30 3 2)
+  rc4=$(CODERABBIT_TEST_STATUS=pending run_probe_case "$dir4" probe_review_on_head)
+  status4=$(jq -r '.status' "$dir4/out.json" 2>/dev/null || echo PARSE_ERROR)
+  obs4=$(jq -r '.probe.observed // "MISSING"' "$dir4/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc4" = "0" ] && [ "$status4" = "reported" ] && [ "$obs4" = "terminal" ]; then
+    pass "#919 control: with trust_status_context_for_clearance false the status is not consulted"
+  else
+    fail "#919 control (trust off) → rc=$rc4 status=$status4 observed=$obs4"
+    sed 's/^/      /' "$dir4/err.log" >&2 || true
+  fi
+}
+
+test_936_unreadable_status_is_not_an_absent_status() {
+  # Codex P1 on #936 head 18b1571. `check_status_context_record` serialized a
+  # FAILED statuses read as `{state: "missing"}` — byte-identical to the record
+  # it emits when CodeRabbit legitimately published no status on this head. The
+  # conflation is pre-existing (it dates to #224), but the #919 gate this PR
+  # adds is the first consumer for which the two have DIFFERENT correct
+  # answers: it blocks on exactly `pending`, so a transient read failure read
+  # as not-pending, the probe emitted `reported`, and the Phase 4b barrier
+  # could open on pre-completion artifacts. A failed read is not evidence that
+  # the run is finished.
+  #
+  # The fix gives the failure its own state, `unreadable`, and every consumer
+  # reads it through crw_status_record_state so an empty or unparseable record
+  # cannot degrade to a permissive value either.
+  #
+  # Route 1: the head-pinned review OBJECT route.
+  local dir rc status
+  dir=$(make_case probe-936-robj-unreadable 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=unreadable run_probe_case "$dir" probe_review_on_head)
+  status=$(jq -r '.status // "NONE"' "$dir/out.json" 2>/dev/null || echo NONE)
+  if [ "$rc" = "3" ] && [ "$status" != "reported" ]; then
+    pass "#936: an unreadable statuses read exits 3 (infra) on the review-object route — never a clean 'reported'"
+  else
+    fail "#936 route 1 (review object) → rc=$rc status=$status (expected rc 3, not reported)"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+
+  # Route 2: the #851 head-pinned SUMMARY route, which has no review object.
+  local dir2 rc2 status2
+  dir2=$(make_case probe-936-summary-unreadable 600 true 30 3 2)
+  enable_trust_status_context "$dir2"
+  rc2=$(CODERABBIT_TEST_STATUS=unreadable run_probe_case "$dir2" probe_clean_incremental)
+  status2=$(jq -r '.status // "NONE"' "$dir2/out.json" 2>/dev/null || echo NONE)
+  if [ "$rc2" = "3" ] && [ "$status2" != "reported" ]; then
+    pass "#936: an unreadable statuses read exits 3 on the head-pinned-summary route too"
+  else
+    fail "#936 route 2 (head-pinned summary) → rc=$rc2 status=$status2 (expected rc 3, not reported)"
+    sed 's/^/      /' "$dir2/err.log" >&2 || true
+  fi
+
+  # Route 3 — the OTHER consumer of the same record: the #869 rc-7 sample that
+  # feeds probe.context_state to the barrier. This one was already fail-closed
+  # (the barrier opens only on "success"), so it deliberately keeps its bounded
+  # not-yet instead of escalating to rc 3 — but it must report the failure
+  # HONESTLY rather than as the absent case, so the barrier's input distinguishes
+  # "CodeRabbit published no status" from "we could not read the statuses".
+  local dir3 rc3 obs3 ctx3
+  dir3=$(make_case probe-936-ctx-unreadable 600 true 30 3 2)
+  enable_trust_status_context "$dir3"
+  rc3=$(CODERABBIT_TEST_STATUS=unreadable run_probe_case "$dir3" probe_summary_lags_review)
+  obs3=$(jq -r '.probe.observed // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ctx3=$(jq -r '.probe.context_state // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc3" = "7" ] && [ "$obs3" = "awaiting-summary" ] && [ "$ctx3" = "unreadable" ]; then
+    pass "#936: the rc-7 barrier sample emits context_state=unreadable (never 'missing', never 'success') so the barrier stays closed on a failed read"
+  else
+    fail "#936 route 3 (rc-7 barrier sample) → rc=$rc3 observed=$obs3 context_state=$ctx3 (expected 7/awaiting-summary/unreadable)"
+    sed 's/^/      /' "$dir3/err.log" >&2 || true
+  fi
+
+  # Control A — the discrimination itself. The SAME scenario with the status
+  # legitimately ABSENT must still emit `missing` and still read terminal. This
+  # is the half the #851 clean incremental re-review depends on: if absence
+  # started reading as a failure, every previously-reviewed PR would deadlock.
+  local dir4 rc4 status4 obs4
+  dir4=$(make_case probe-936-absent-control 600 true 30 3 2)
+  enable_trust_status_context "$dir4"
+  rc4=$(run_probe_case "$dir4" probe_clean_incremental)
+  status4=$(jq -r '.status' "$dir4/out.json" 2>/dev/null || echo PARSE_ERROR)
+  obs4=$(jq -r '.probe.observed // "MISSING"' "$dir4/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc4" = "0" ] && [ "$status4" = "reported" ] && [ "$obs4" = "terminal" ]; then
+    pass "#936 control: a legitimately absent status still reads terminal — 'unreadable' did not swallow 'missing'"
+  else
+    fail "#936 control (absent status) → rc=$rc4 status=$status4 observed=$obs4"
+    sed 's/^/      /' "$dir4/err.log" >&2 || true
+  fi
+
+  # Control B — the escape hatch. The read is trust-gated like every other
+  # status read here, so trust_status_context_for_clearance: false must never
+  # reach the endpoint at all, failing or not.
+  local dir5 rc5 status5
+  dir5=$(make_case probe-936-untrusted-unreadable 600 true 30 3 2)
+  rc5=$(CODERABBIT_TEST_STATUS=unreadable run_probe_case "$dir5" probe_review_on_head)
+  status5=$(jq -r '.status' "$dir5/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc5" = "0" ] && [ "$status5" = "reported" ]; then
+    pass "#936 control: with trust_status_context_for_clearance false the failing endpoint is never consulted"
+  else
+    fail "#936 control (trust off) → rc=$rc5 status=$status5"
+    sed 's/^/      /' "$dir5/err.log" >&2 || true
+  fi
+}
+
+test_891_probe_open_rate_limit_window_is_not_silence() {
+  # #891 acceptance 3: `--probe` must not transition `rate_limit` → `none`
+  # purely because a clock advanced. The anchored triage stops seeing the
+  # notice once it ages past HEAD_ANCHOR, so a head CodeRabbit is still
+  # refusing to review reported `observed: "none"` with no provider-side
+  # change — which is the signal the Phase 4b barrier and #489 failover read.
+  local dir rc id
+  dir=$(make_case probe-891-open-window 600 true 30 3 2)
+  set_freshness_window "$dir" 1800
+  rc=$(run_probe_case "$dir" probe_ratelimit_aged_open_window)
+  assert_probe_not_yet "$dir" "$rc" rate_limit \
+    "#891: an aged-out notice whose published window is still OPEN reads rate_limit, not none"
+  id=$(jq -r '.review.id // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$id" = "7941" ]; then
+    pass "#891 probe: the rate_limit evidence names the notice that is still in force (id 7941)"
+  else
+    fail "#891 probe: expected review.id 7941 (the open-window notice), got $id"
+  fi
+
+  # The boundary: once the published window has expired the notice governs
+  # nothing, and the head reads as silence exactly as before.
+  local dir2 rc2
+  dir2=$(make_case probe-891-expired-window 600 true 30 3 2)
+  set_freshness_window "$dir2" 1800
+  rc2=$(run_probe_case "$dir2" probe_ratelimit_aged_expired_window)
+  assert_probe_not_yet "$dir2" "$rc2" none \
+    "#891 boundary: an aged notice whose published window EXPIRED is silence again"
+}
+
 test_900_review_run_selector_ignores_bodyless_replies
+test_919_pending_status_blocks_the_terminal_verdict
+test_936_unreadable_status_is_not_an_absent_status
+test_891_probe_open_rate_limit_window_is_not_silence
 test_884_count_bodies_fails_closed_unit
 test_884_clearance_reviews_api_failure_fails_closed
 test_446_newer_comment_suppresses_stale_status
@@ -2083,6 +2387,7 @@ test_rate_limit_stalled_does_not_probe
 test_probe_post_failure_stays_timeout_advisory
 test_probe_reply_poll_failure_stays_timeout_advisory
 test_review_during_probe_wait_emits_findings
+test_review_during_probe_wait_unreadable_summary_is_infra
 test_535_1_summary_body_marker_emits_findings
 test_535_2_head_pinned_review_selection_emits_findings
 test_probe_no_comment_is_not_yet

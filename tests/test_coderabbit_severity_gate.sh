@@ -199,6 +199,43 @@ exit 0
 STUB
 chmod +x "$STUB_DIR/gh"
 
+# awk shim: transparent, EXCEPT when CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER=<n> is
+# set, in which case the first n runs of `summary_unfenced_numbered`'s program
+# — identified by that program's own distinctive emit, `NR, line` — succeed and
+# every later one exits nonzero. Mirrors CODERABBIT_TEST_FAIL_ISSUES_AFTER in
+# tests/test_coderabbit_wait_statuscontext_ratelimit.sh.
+#
+# Scoped to that one program, and counted, on purpose. The reader is shared:
+# the summary CLASSIFIER (summary_stanza_opener_lines) runs it before the
+# summary GRADER does, and a stub that failed every run would drop the summary
+# as "not a report" long before the graded pipeline ran — the assertion would
+# pass with the fix reverted, proving nothing. The counter lets the classifier
+# through and fails only the grading run, which is the call site under test.
+# (The classifier's own swallowed-read path is a separate, pre-existing
+# fail-open; it is #942, not this case.) The real interpreter is resolved once,
+# now, before PATH is shadowed.
+REAL_AWK=$(command -v awk)
+cat >"$STUB_DIR/awk" <<STUB
+#!/bin/bash
+if [ -n "\${CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER:-}" ]; then
+  for __a in "\$@"; do
+    case "\$__a" in
+      *"NR, line"*)
+        __c_file="\${CR_GATE_TEST_AWK_COUNTER:-/dev/null}"
+        __c=\$(cat "\$__c_file" 2>/dev/null || echo 0)
+        __c=\$((__c + 1))
+        echo "\$__c" >"\$__c_file" 2>/dev/null || true
+        if [ "\$__c" -gt "\$CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER" ]; then
+          exit 9
+        fi
+        ;;
+    esac
+  done
+fi
+exec "$REAL_AWK" "\$@"
+STUB
+chmod +x "$STUB_DIR/awk"
+
 # ---------------------------------------------------------------------------
 # Helper: scratch repo dir with a .github/review-policy.yml that enables
 # (or disables) the gate. The script reads CONFIG=".github/review-policy.yml"
@@ -3707,6 +3744,73 @@ else
   # failure here does not mean the herestring conversion was unnecessary —
   # it means this run got lucky, same as the local runs noted in #947.
   pass "herestring grep -q stayed correct across $RACE_ITERS large-payload iterations (the racy piped form did not happen to fault this run; see #520/#947 for why it still must not be used)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 51 (#936): the summary READ is never allowed to fail into "zero
+# findings".
+#
+# This gate's PR-level summary path grades a DOCUMENT: it feeds the summary
+# through `summary_unfenced_numbered` and classifies the surviving lines. The
+# reader ran INSIDE the loop's here-document, and a here-document discards its
+# command substitution's exit status — so a dead reader produced an empty
+# stream, the loop found nothing, and the REQUIRED gate reported zero blocking
+# summary findings from a summary it had never read.
+# ---------------------------------------------------------------------------
+SUMMARY_MAJOR_FINDING='_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
+
+**Reject the diagnostic bypass in merge-gate callers.**
+
+The caller accepts a bypass flag that skips the gate.'
+
+echo
+echo "--- Test 51 (#936): a FAILED summary read is never 'zero findings'"
+# `done <<EOF\n\$(reader)\nEOF` discards the command substitution's status, so
+# an awk that died on a pathological body produced an empty stream, the loop
+# found nothing, and this REQUIRED gate printed `unresolved: 0` and exited 0 —
+# a failed READ reading as a clean REPORT (CodeRabbit 🟠 Major on #936). The
+# body here carries a genuine blocking finding — a 🟠 Major badge, p1 on the
+# shared ladder — so a gate that still says zero is reporting on a summary it
+# never read.
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_MAJOR_FINDING")")
+AWK_COUNTER="$WORKDIR/awk-calls-51"
+: >"$AWK_COUNTER"
+# Count the reader's runs on THIS fixture with nothing failing, so the
+# threshold below is derived rather than guessed: every run but the last is the
+# classifier's, and the last is the summary read under test.
+CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER=9999 \
+CR_GATE_TEST_AWK_COUNTER="$AWK_COUNTER" \
+  FIXTURE_PR="$FIXTURE_PR" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  run_gate "$SCRATCH" 99 owner/repo >/dev/null 2>&1 || true
+TOTAL_AWK=$(cat "$AWK_COUNTER" 2>/dev/null || echo 0)
+: >"$AWK_COUNTER"
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER=$((TOTAL_AWK - 1)) \
+  CR_GATE_TEST_AWK_COUNTER="$AWK_COUNTER" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+# The summary must have survived classification — otherwise the failure under
+# test never ran and a green here would be vacuous.
+if [ "$TOTAL_AWK" -gt 1 ] && [ "$RC" != 0 ] \
+    && ! echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! echo "$OUT" | grep -q "carries a non-benign outcome stanza"; then
+  pass "#936: a failed summary read fails closed rather than reporting zero blocking findings"
+else
+  fail "#936: expected a nonzero exit with no 'unresolved: 0' claim and a classified summary; got rc=$RC (reader runs=$TOTAL_AWK)"
+  echo "$OUT" | sed 's/^/      /' >&2
 fi
 
 # ---------------------------------------------------------------------------

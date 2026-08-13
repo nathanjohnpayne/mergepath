@@ -140,10 +140,18 @@ codex_tier_of() {
 #
 # CodeRabbit markers → tier (p0 is Codex-only; CodeRabbit never maps to p0):
 #   🟠 Major / Potential issue / ⚠️  → p1
-#   🧹 Nitpick                       → nitpick
-#   🔵 Trivial / Outside diff range  → p3
-#   🟡 Minor                         → p2
+#   🧹 Nitpick                                     → nitpick
+#   🔵 Trivial / Outside diff range                → p3
+#   🟡 Minor                                       → p2
 # Anything else (Refactor suggestion, plain Note, bare titlecase prose) → empty.
+#
+# CodeRabbit's other machine-readable signal — the `cr-indicator-types` tag it
+# appends to a finding body — is deliberately NOT graded here. Grading it needs
+# a definition of where one finding's stanza ends, because CodeRabbit renders a
+# finding's badge and its tag on different lines and both merge-relevant
+# callers grade a PR-level summary line by line; four successive framings of
+# that boundary produced four defects on #936. It is [#945](https://github.com/nathanjohnpayne/mergepath/issues/945),
+# with a spec-derived matrix, and #888 stays open for it.
 coderabbit_tier_of() {
   local head
   # Truncate via parameter expansion (not `printf | head -c`): under

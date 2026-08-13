@@ -22,7 +22,7 @@
 #   codex_tier_of
 #     13. badge ![P0 Badge]..![P3 Badge]; text **P1; none
 #   coderabbit_tier_of
-#     14. nitpick / potential-issue default / critical / minor / major /
+#     14. nitpick / potential-issue default / minor / major /
 #         refactor / plain-note
 #
 # Bash 3.2 portable.
@@ -166,7 +166,7 @@ eq "p1" "$(codex_tier_of '**P1** first, then **P3** later')"          "codex_tie
 # --- coderabbit_tier_of ----------------------------------------------------
 eq "nitpick" "$(coderabbit_tier_of '🧹 Nitpick: rename this var')"                         "cr_tier_of: nitpick"
 eq "p1"      "$(coderabbit_tier_of '⚠️ Potential issue: unhandled error')"                 "cr_tier_of: potential issue -> p1"
-eq "p1"      "$(coderabbit_tier_of '_⚠️ Potential issue_ | _🔴 Critical_: RCE')"            "cr_tier_of: critical/potential-issue -> p1 (CodeRabbit tops at p1)"
+eq "p1"      "$(coderabbit_tier_of '_⚠️ Potential issue_ | _🔴 Critical_: RCE')"            "cr_tier_of: potential-issue -> p1 even when prose names Critical"
 eq "p1"      "$(coderabbit_tier_of '_⚠️ Potential issue_ | _🟠 Major_: breaks on the minor version bump')" "cr_tier_of: major wins over minor-in-prose -> p1 (#581 r1)"
 eq "p2"      "$(coderabbit_tier_of '_📐 Maintainability_ | _🟡 Minor_: rename var')"        "cr_tier_of: minor (no potential-issue marker) -> p2"
 eq "p3"      "$(coderabbit_tier_of '_🔵 Trivial issue_: cosmetic tweak')"                   "cr_tier_of: trivial -> p3 (#581 r2)"
