@@ -19,6 +19,13 @@ spec_test_map:
     - tests/test_phase_4b_automation.sh
   doc_ownership_validation:
     - tests/test_check_doc_ownership.sh
+  # The publisher's fence and fixtures live in the merge-clearance suite
+  # (Test 25) rather than a file of their own: a new tests/ file wired into
+  # a propagated scripts/ci/check_* needs its own manifest requires: entry,
+  # which grows the diff for bookkeeping rather than content. The default
+  # filename search cannot find it, hence this entry (#845).
+  required_check_publisher:
+    - tests/test_merge_clearance_gate.sh
 
 # Glob patterns that identify test files. Supplements the default
 # ("tests/**/*.test.*") which doesn't cover shell-based tests.

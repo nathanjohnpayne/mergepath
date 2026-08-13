@@ -288,6 +288,17 @@ jobs:
       - name: check_merge_clearance_gate
         run: ./scripts/ci/check_merge_clearance_gate
 
+      - name: check_required_check_publisher
+        # Regression fence for .github/workflows/required-check-publisher.yml
+        # (#845 Stage A, shipped in #867) — the default-branch-owned single
+        # writer of the Checks-API lineage for the three script-backed
+        # required contexts. Asserts the trigger set (workflow_dispatch and
+        # schedule ABSENT), the head bindings, phase-1 position, the fixed
+        # publish queue, job-scoped write permissions, read-then-write
+        # ordering, and that the three natively-named gate jobs are retained.
+        # A consumer that has this wrapper but not yet the workflow SKIPs.
+        run: ./scripts/ci/check_required_check_publisher
+
       - name: install_yq_for_sync_manifest
         # mikefarah/yq is needed by check_sync_manifest and by
         # check_resolve_pr_threads (whose delegated
