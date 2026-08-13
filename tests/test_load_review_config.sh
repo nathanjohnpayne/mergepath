@@ -121,6 +121,26 @@ available_reviewers:
 author_identity: 'release-bot'  # single-quoted, inline comment
 YAML
 
+# A base policy that RESOLVES cleanly but names no TOP-LEVEL `author_identity`
+# — it carries only a nested one, under `codex:`. This is the unproven-identity
+# state that does not go through the resolver-failure branch: nothing failed,
+# the policy is readable, and it simply authorizes nobody to merge. It is the
+# more reachable of the two unproven states, because omitting a key (or nesting
+# it) requires no outage at all.
+NOAUTH_POLICY="$WORK/noauth-policy.yml"
+cat > "$NOAUTH_POLICY" <<'YAML'
+external_review_threshold: 50
+
+external_review_paths:
+  - "release/**"
+
+available_reviewers:
+  - nathanpayne-codex
+
+codex:
+  author_identity: release-bot
+YAML
+
 CALLS_LOG="$WORK/gh-calls.log"
 
 GH_STUB="$WORK/gh"
@@ -151,16 +171,17 @@ case "$PATHARG" in
     exit 0 ;;
   repos/*/contents/*)
     case "${STUB_CONTENTS_MODE:-ok}" in
-      ok)    cat "${STUB_BASE_POLICY:?}"; exit 0 ;;
-      dup)   cat "${STUB_DUP_POLICY:?}"; exit 0 ;;
-      quirk) cat "${STUB_QUIRK_POLICY:?}"; exit 0 ;;
+      ok)     cat "${STUB_BASE_POLICY:?}"; exit 0 ;;
+      dup)    cat "${STUB_DUP_POLICY:?}"; exit 0 ;;
+      quirk)  cat "${STUB_QUIRK_POLICY:?}"; exit 0 ;;
+      noauth) cat "${STUB_NOAUTH_POLICY:?}"; exit 0 ;;
       error) echo "gh: API rate limit exceeded (HTTP 403)" >&2; exit 1 ;;
     esac ;;
 esac
 echo "{}"
 STUB
 chmod +x "$GH_STUB"
-export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG" STUB_BASE_POLICY="$BASE_POLICY" STUB_DUP_POLICY="$DUP_POLICY" STUB_QUIRK_POLICY="$QUIRK_POLICY"
+export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG" STUB_BASE_POLICY="$BASE_POLICY" STUB_DUP_POLICY="$DUP_POLICY" STUB_QUIRK_POLICY="$QUIRK_POLICY" STUB_NOAUTH_POLICY="$NOAUTH_POLICY"
 hash -r 2>/dev/null || true
 
 OUT_FILE="$WORK/github-output.txt"
@@ -278,6 +299,47 @@ if [ "$(out_value threshold)" = "25" ]; then
   pass "a quoted, inline-commented threshold is emitted as a bare number"
 else
   fail "scalar spellings: threshold=$(out_value threshold)"
+fi
+
+# ---------------------------------------------------------------------------
+# 3d. A governing policy that RESOLVES but names no top-level `author_identity`
+#     must emit an EMPTY one.
+#
+#     This is the unproven-identity state that does NOT arrive through the
+#     resolver-failure branch of section 4: the fetch succeeded, the policy is
+#     readable, its threshold and reviewer list are exported normally — it just
+#     authorizes nobody to merge. It is also the more reachable of the two
+#     states, needing no outage: a policy can omit the key, or nest it under a
+#     block, which `policy_scalar` deliberately declines to match.
+#
+#     Emitting a hard-coded login here instead would make EXPECTED_AUTHOR
+#     non-empty in the auto-merge step, skipping the `[ -z ]` fail-closed branch
+#     that section 6b pins, and enabling a merge under an identity the governing
+#     policy never named. Section 6e runs that consequence end to end.
+# ---------------------------------------------------------------------------
+export STUB_CONTENTS_MODE=noauth
+run_loader release/1.x main
+if [ "$RC" -eq 0 ] && [ "$(out_value author_identity)" = "" ]; then
+  pass "a resolved policy with no top-level author_identity emits an empty identity, not a hard-coded login (#788 fail-closed)"
+else
+  fail "policy without author_identity emitted '$(out_value author_identity)' (rc=$RC)"
+fi
+
+# Non-vacuity: the policy really was resolved and parsed. Without this the
+# assertion above would also pass on the fail-closed branch, which empties the
+# identity for an entirely different reason.
+if [ "$(out_value threshold)" = "50" ] \
+   && [ "$(out_value reviewers)" = '["nathanpayne-codex"]' ] \
+   && [ "$(out_value paths)" = '["release/**"]' ]; then
+  pass "the same policy still exports its threshold, reviewers and paths (the empty identity is not the fail-closed branch)"
+else
+  fail "policy without author_identity mis-parsed its other keys (threshold=$(out_value threshold) reviewers=$(out_value reviewers) paths=$(out_value paths))"
+fi
+
+if [ "$(grep -c '' "$OUT_FILE" | tr -d ' ')" = "4" ]; then
+  pass "an empty author_identity is still emitted as its own output line"
+else
+  fail "missing-identity output shape: $(cat "$OUT_FILE")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -493,6 +555,25 @@ if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "true" ]; then
   pass "a token matching a NON-default base policy's author_identity is accepted (the identity comes from the policy, not from a hard-coded name)"
 else
   fail "non-default base identity accepted path (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
+fi
+
+# 6e. The two halves joined: the loader's real output for a governing policy
+#     that names no author_identity is handed to the lifted merge-gate step,
+#     exactly as `needs.load-config.outputs.author_identity` hands it over.
+#
+#     Sections 3d and 6b each pin one end and can both pass while the pipeline
+#     still merges: 6b feeds a hand-written empty string, so it never observes
+#     what the loader actually produces. Here the value is not written by this
+#     test at all. If the loader substitutes a login, EXPECTED_AUTHOR arrives
+#     non-empty, the token (which IS that login) matches, and automatic merge is
+#     enabled under an identity the governing policy never named.
+export STUB_CONTENTS_MODE=noauth
+run_loader release/1.x main
+run_author_step "$(out_value author_identity)" "nathanjohnpayne"
+if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "false" ]; then
+  pass "a governing policy naming no author_identity disables automatic merge end to end, loader output through merge gate (#788)"
+else
+  fail "end-to-end missing-identity path enabled the merge (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
 fi
 
 echo

@@ -66,6 +66,10 @@ set -euo pipefail
 #                       moments later and skips the fingerprint helper entirely.
 #   author_identity=    unproven, so left empty.
 #
+# A policy that RESOLVES but names no top-level `author_identity` is the same
+# unproven state by a different route, and is emitted the same way: empty. See
+# the note on the final `emit author_identity` below.
+#
 # Exiting 0 is the point: `triage` declares `needs: [load-config]` without
 # `always()`, so a hard failure here SKIPS triage, and a skipped labeling job
 # is fail-OPEN (#59's SKIPPED-as-SUCCESS class). Staying green with fail-closed
@@ -225,4 +229,17 @@ AUTHOR=$(policy_scalar "$CONFIG" author_identity)
 emit threshold "$THRESHOLD"
 emit paths "$PATHS"
 emit reviewers "$REVIEWERS"
-emit author_identity "${AUTHOR:-nathanjohnpayne}"
+
+# `$AUTHOR` verbatim, with NO `:-nathanjohnpayne` fallback. A governing policy
+# that is readable but carries no top-level `author_identity` proves no identity
+# either — the same state the resolver-failure branch above emits empty — and it
+# is the more reachable of the two, because a policy can simply omit the key (or
+# nest it under a block, which `policy_scalar` correctly declines to match)
+# without anything failing. Substituting a hard-coded login here would hand the
+# auto-merge step a non-empty EXPECTED_AUTHOR, skip its `[ -z ]` fail-closed
+# branch, and let AUTHOR_MERGE_TOKEN merge under an identity the governing
+# policy never named — the substitution #768/#769/#788 exist to prevent, moved
+# one file upstream rather than removed. The `assign` job keeps its own
+# `AUTHOR_IDENTITY || 'nathanjohnpayne'` default in JS, so dropping the default
+# here tightens the merge gate and leaves reviewer assignment unchanged.
+emit author_identity "$AUTHOR"
