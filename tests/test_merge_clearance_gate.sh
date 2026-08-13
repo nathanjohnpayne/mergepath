@@ -3002,40 +3002,41 @@ rcp_case doc-jobs-not-mapping 's{^jobs:$}{jobs: []\njobs_relocated:}m' \
 # the scope of the permission, queue, groupless and head-binding-env
 # assertions below, so it has to be reported rather than left to produce a
 # run that inspects nothing and prints PASS.
-rcp_case job-missing 's{^  publish:\n}{  publish-renamed:\n}m' fail '[rcp job shape]'
+rcp_case job-missing 's{^  publish:\n}{  publish-renamed:\n}m' \
+  fail 'the publisher has no'
 # A job key that parses to something other than a mapping is the same
 # emptied scope with a different spelling.
 rcp_case job-not-mapping 's{^  publish:$}{  publish: ["not-a-mapping"]\n  publish-relocated:}m' \
-  fail '[rcp job shape]'
+  fail 'does not parse to a mapping'
 
 # ── A9 — the trigger set, which is two ABSENCES as much as two presences ──
 # workflow_dispatch runs the SELECTED ref's copy of the file, so a PR branch
 # could be run with checks: write — P1a through the manual path.
 rcp_case trig-dispatch \
   's{^  repository_dispatch:$}{  workflow_dispatch:\n  repository_dispatch:}m' \
-  fail '[rcp trigger set]'
+  fail "the publisher's triggers are"
 # schedule stays absent until PR 4: the parent's */15 cron already reaches
 # this file through the workflow_run chain, so an own cron would run a
 # second full-fleet pass every interval.
 rcp_case trig-schedule \
   's{^  repository_dispatch:$}{  schedule:\n    - cron: "*/15 * * * *"\n  repository_dispatch:}m' \
-  fail '[rcp trigger set]'
+  fail "the publisher's triggers are"
 # in_progress is the RERUN cue — a rerun re-uses the run, so `requested`
 # never re-fires and the re-evaluation window would carry no pending cover.
 rcp_case trig-types \
   's{types: \[requested, in_progress, completed\]}{types: [requested, completed]}' \
-  fail '[rcp trigger set]'
+  fail 'workflow_run types are'
 # An `on:` that is not a mapping has no triggers to inspect; unreported it
 # would take the whole trigger tier with it.
 rcp_case trig-on-absent \
   's{^on:$}{on: just-a-string\non_relocated:}m' \
-  fail '[rcp trigger set]'
+  fail 'has no `on:` mapping'
 # required-check-republish is the operator break-glass and the only
 # on-demand remedy the two sibling contexts have ever had; dropping it is
 # silent until someone needs it.
 rcp_case trig-rd-types \
   's{types: \[merge-clearance-recheck, required-check-republish\]}{types: [merge-clearance-recheck]}' \
-  fail '[rcp trigger set]'
+  fail 'repository_dispatch types are'
 
 # ── A6 — the parent name is verified against the parent FILE ───────────
 # workflow_run matches the parent's exact top-level name:, so a rename on
@@ -3043,7 +3044,7 @@ rcp_case trig-rd-types \
 # workflow that never fires looks identical to one that finds nothing to do.
 rcp_case parent-name \
   's{workflows: \["Merge Clearance Gate"\]}{workflows: ["Merge Clearance Gate Renamed"]}' \
-  fail '[rcp parent name]'
+  fail 'workflow_run.workflows is'
 
 # A rename is only HALF the shape. The parent name is read out of the
 # parent FILE, so it is None in two different situations: the file did not
@@ -3096,13 +3097,13 @@ rcp_parent_case parent-unreadable 's{^name: Merge Clearance Gate$}{name: [unclos
 # PR head, fleet-wide, permanently, with no partial degradation.
 rcp_case head-env \
   's{HEAD_SHA: \$\{\{ github.event.workflow_run.head_sha \}\}}{HEAD_SHA: \$\{\{ github.sha \}\}}' \
-  fail '[rcp head binding]'
+  fail 'binds HEAD_SHA to'
 # A denylist of wrong spellings does not terminate (#849): this case uses a
 # binding that is neither github.sha nor any spelling a denylist would carry,
 # and it must still be refused for being off-allowlist.
 rcp_case head-post \
   's{-f head_sha="\$HEAD_SHA"}{-f head_sha="\$GITHUB_SHA"}' \
-  fail '[rcp head binding]'
+  fail 'a check-run POST binds head_sha='
 
 # The allowlist has to be an allowlist over BINDING SITES, not over one
 # lexical arrangement of flag, space and quote. The first version matched
@@ -3113,13 +3114,13 @@ rcp_case head-post \
 # the spelling a maintainer reaches for first.
 rcp_case head-post-quoted-arg \
   's{-f head_sha="\$HEAD_SHA" \\}{-f "head_sha=\$GITHUB_SHA" \\}' \
-  fail '[rcp head binding]'
+  fail 'a check-run POST binds head_sha='
 rcp_case head-post-typed-flag \
   's{-f head_sha="\$hd" \\}{-F head_sha="\$GITHUB_SHA" \\}' \
-  fail '[rcp head binding]'
+  fail 'a check-run POST binds head_sha='
 rcp_case head-post-long-flag \
   's{-f head_sha="\$RUN_HEAD" \\}{--field head_sha="\$GITHUB_SHA" \\}' \
-  fail '[rcp head binding]'
+  fail 'a check-run POST binds head_sha='
 # Non-vacuity in the other direction: judging the VALUE, not the spelling.
 # A respelled site that still binds an allowlisted variable is legal, and a
 # fence that reddened on it would be trading one leak for a false positive.
@@ -3170,7 +3171,7 @@ rcp_case head-comment-toplevel \
 # verdict.
 rcp_case head-sha-case \
   's{PARENT_RUN_ID: \$\{\{ github.event.workflow_run.id \}\}}{PARENT_RUN_ID: \$\{\{ GitHub.Sha \}\}}' \
-  fail '[rcp head binding]'
+  fail 'the publisher references github.sha'
 
 # ── A4 — publish stays reachable and serialized on ONE fixed queue ─────
 rcp_case publish-falsy \
@@ -3180,16 +3181,16 @@ rcp_case publish-falsy \
 # serialization entirely, which is the stale-restore the fixed queue closes.
 rcp_case publish-group \
   's{group: rcp-publish}{group: rcp-publish-\$\{\{ github.event.workflow_run.head_sha \}\}}' \
-  fail '[rcp publish queue]'
+  fail 'concurrency.group is'
 rcp_case publish-cancel \
   's{cancel-in-progress: false}{cancel-in-progress: true}' \
-  fail '[rcp publish queue]'
+  fail 'concurrency.cancel-in-progress is'
 # No queue at all is the same stale-restore as the wrong queue, and it is
 # reached by DELETING rather than editing — the direction a group/cancel
 # case cannot cover.
 rcp_case publish-noconc \
   's{^    concurrency:\n      group: rcp-publish\n      cancel-in-progress: false\n}{}m' \
-  fail '[rcp publish queue]'
+  fail 'has no concurrency mapping'
 
 # ── A10 — the open job stays groupless ────────────────────────────────
 # Queued, the hold waits behind a mid-flight stale pass: the write order is
@@ -3202,27 +3203,27 @@ rcp_case open-group \
 # ── A11 — write scope is job-scoped, never workflow-scoped ────────────
 rcp_case perms-actions \
   's{^      actions: read\n      checks: write\n    steps:}{      checks: write\n    steps:}m' \
-  fail '[rcp permissions]'
+  fail 'not read. Both jobs'
 # The workflow-level grant is P1a in miniature: it hands checks: write to
 # every future job added to this file.
 rcp_case perms-top \
   's{^permissions:\n  contents: read$}{permissions:\n  contents: read\n  checks: write}m' \
-  fail '[rcp permissions]'
+  fail 'grants checks: write at WORKFLOW'
 # The floor must be DECLARED, not inherited from a repository setting a
 # consumer may not share.
 rcp_case perms-top-absent \
   's{^permissions:\n  contents: read\n}{}m' \
-  fail '[rcp permissions]'
+  fail 'has no workflow-level permissions'
 # A job with no permissions mapping inherits the floor and cannot write
 # check runs at all — the publisher silently stops publishing.
 rcp_case perms-job-absent \
   's{^    permissions:\n(      .*\n|      #.*\n)+?      checks: write\n}{}m' \
-  fail '[rcp permissions]'
+  fail 'declares no permissions mapping'
 # checks: read is the one-token inversion: every POST 403s and that path
 # quietly stops refreshing all three contexts.
 rcp_case perms-job-checks \
   's{^      checks: write$}{      checks: read}m' \
-  fail '[rcp permissions]'
+  fail 'not write — its POSTs'
 
 # The phase-1 ordering cases (A3), the success-conclusion count (A8) and
 # the read-then-write ordering cases (A12) were REMOVED with their
@@ -3263,23 +3264,30 @@ rcp_dir_case() {
 # only.
 rcp_dir_case native-producer \
   'perl -0777 -i -pe "s{^  codex-p1-gate:\$}{  codex-p1-gate-renamed:}m" codex-p1-gate.yml' \
-  fail '[rcp native producer]'
+  fail "has no 'codex-p1-gate' job"
 # Deleting the whole gate workflow is the same loss by a blunter route, and
 # it is the one an assertion scoped to a job inside the file cannot see.
 rcp_dir_case native-producer-absent \
   'rm -f codex-p1-gate.yml' \
-  fail '[rcp native producer]'
+  fail 'is missing. It is the unconditional'
 # A gate workflow that does not parse produces nothing at all; silently
 # skipping it would report a producer the repo does not have.
 rcp_dir_case native-producer-unparseable \
   'printf "jobs:\n  x: [unclosed\n" > codex-p1-gate.yml' \
-  fail '[rcp native producer]'
-# Branch protection keys on the DISPLAY name, so adding a `name:` de-wires
+  fail 'does not parse:'
+# Branch protection keys on the DISPLAY name, so changing `name:` de-wires
 # the native lineage while the job key — and every other check — stays
 # green. The quietest of the four.
+#
+# The name is REPLACED, not inserted. Inserting a second `name:` is a
+# duplicate mapping key, which StrictLoader rejects before the display-name
+# comparison is ever reached — so the case went red on the parse branch and
+# a bare `[rcp native producer]` needle called that a pass. It proved
+# nothing about name drift. Caught only after the needle was sharpened to
+# the branch's own message, which is the argument for sharpening them.
 rcp_dir_case native-producer-name-drift \
-  'perl -0777 -i -pe "s{^(  codex-p1-gate:\n)}{\$1    name: Something Else\n}m" codex-p1-gate.yml' \
-  fail '[rcp native producer]'
+  'perl -0777 -i -pe "s{^(  codex-p1-gate:\n    name: )Codex P1 unresolved threads\$}{\$1Something Else}m" codex-p1-gate.yml' \
+  fail 'reports as'
 
 # The A7 observer fixture is REMOVED because the assertion it exercised was
 # wrong, not merely under-powered. GitHub documents the cap as three levels

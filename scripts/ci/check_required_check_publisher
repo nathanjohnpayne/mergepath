@@ -35,6 +35,17 @@
 # value → binding → step → ordering). Precedent:
 # scripts/ci/check_merge_clearance_gate's #850 tier.
 #
+# ONE DISCLOSED EXCEPTION: the A2 head-binding SITE scan reads `raw_text`,
+# the file's shell text, because a `head_sha` binding has no YAML-level
+# expression to read. Stating it plainly because the residual is real —
+# a `-f head_sha=…` token inside a here-document, a diagnostic string or an
+# unrelated command counts toward the pinned total, so non-binding text
+# could backfill the count for a binding that was removed. What the
+# allowlist and count DO buy is that a new or respelled binding site cannot
+# arrive without landing in this file as a diff. Narrowing the scan to
+# parsed shell arguments needs the same substrate as everything in #977 and
+# is tracked there.
+#
 # ─────────────────────────────────────────────────────────────────────
 # SCOPE — what this fence does NOT pin, and why not here (#977)
 # ─────────────────────────────────────────────────────────────────────
