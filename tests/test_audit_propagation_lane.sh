@@ -240,6 +240,18 @@ fi
 #
 # Driven at BOTH gh exit statuses. Exit 1 is what real gh does; exit 0 is the
 # pathological variant that only `--shape login` can catch.
+#
+# Run from a SCRATCH root, not from $ROOT. These two cases supply a token, so
+# unlike the fail-closed cases above they get past the token gate and reach the
+# `[ -f "$MANIFEST" ]` prerequisite — and check_repo_lint_consumer_safety runs
+# this whole suite inside a CONSUMER fixture tree that has no
+# `.mergepath-sync.yml`, where the script would exit 2 on the missing manifest
+# long before the identity read under test. CI caught exactly that. An empty
+# manifest file is enough: the identity gate fires before anything parses it,
+# and an absent review-policy.yml leaves available_reviewers empty, which only
+# makes the fail-closed verdict more certain.
+LANE799_ROOT="$WORKDIR/lane799-root"; mkdir -p "$LANE799_ROOT"
+: > "$LANE799_ROOT/.mergepath-sync.yml"
 for lane_rc in 1 0; do
   LANE799_BIN="$WORKDIR/lane799-bin.$lane_rc"; mkdir -p "$LANE799_BIN"
   cp "$STUB_BIN/yq" "$LANE799_BIN/yq"
@@ -255,7 +267,7 @@ exit $lane_rc
 GH
   chmod +x "$LANE799_BIN/gh" "$LANE799_BIN/yq"
   set +e
-  OUT=$( cd "$ROOT" && PATH="$LANE799_BIN:$PATH" OP_PREFLIGHT_CACHE_DIR="$EMPTY_CACHE" \
+  OUT=$( cd "$LANE799_ROOT" && PATH="$LANE799_BIN:$PATH" OP_PREFLIGHT_CACHE_DIR="$EMPTY_CACHE" \
     MERGEPATH_AGENT="nobody-xyz" GH_TOKEN="dummy-token-for-the-identity-read" \
     "$SCRIPT" --repos __none__ 2>&1 )
   RC=$?
