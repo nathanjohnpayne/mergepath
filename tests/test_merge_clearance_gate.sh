@@ -3133,23 +3133,36 @@ rcp_case head-post-respelled-legal \
 rcp_case head-post-count \
   's{^([ \t]*-f head_sha="\$HEAD_SHA" \\)$}{$1\n$1}m' \
   fail '[rcp head binding count]'
-# COMMENT STRIPPING, both directions, anchored on the count because the
-# count is what the stripping changes. The publisher documents its design
-# in prose right beside the code (#689), so an unstripped scan reads the
-# explanation as if it were the implementation.
+# COMMENT STRIPPING — three cases, because `strip_shell_comments` is two
+# regexes and they cover different columns. The publisher documents its
+# design in prose right beside the code (#689), so an unstripped scan reads
+# the explanation as if it were the implementation.
 #
-# Full-line: commenting a binding site OUT must drop the count to 4. If
-# stripping regressed, the count would still read 5 and this case would go
-# green while the site was gone — the fence certifying a shape it never saw.
+# Each case below was verified to DISCRIMINATE by disabling one regex in a
+# copy of the fence and confirming the case flips; a case that stays green
+# against a broken fence is not coverage.
+#
+# 1. Removal direction: commenting a binding site out must drop the count to
+#    4. Unstripped, the count would still read 5 and the fence would go
+#    green while the site was gone — certifying a shape it never saw.
 rcp_case head-comment-full \
   's{^([ \t]*)(-f head_sha="\$RUN_HEAD" \\)$}{$1# $2}m' \
   fail '[rcp head binding count]'
-# Inline, and it must PASS: a commented-out off-allowlist binding is prose,
-# not a binding. Unstripped it would read as a sixth site binding
-# $GITHUB_SHA and trip both the allowlist and the count — a false positive
-# on a file whose own style is to explain each POST beside it.
+# 2. Addition direction, INLINE (`[ \t]#` — a comment after code), and it
+#    must PASS: a commented-out off-allowlist binding is prose, not a
+#    binding. Unstripped it reads as a sixth site binding $GITHUB_SHA and
+#    trips both the allowlist and the count — a false positive on a file
+#    whose own style is to explain each POST beside it.
 rcp_case head-comment-inline \
   's{^([ \t]*-f head_sha="\$head" \\)$}{$1 # -f head_sha="\$GITHUB_SHA"}m' \
+  pass
+# 3. Addition direction, COLUMN 0 (`^[ \t]*#` — a whole-line comment). This
+#    is the case the inline regex cannot cover: it requires whitespace
+#    before the `#`, so an unindented comment reaches the scanner untouched.
+#    The publisher carries exactly this shape — top-level banner comments
+#    explaining the head-binding rules, including the wrong spellings.
+rcp_case head-comment-toplevel \
+  's{^(on:)$}{# -f head_sha="\$GITHUB_SHA"\n$1}m' \
   pass
 # The github.sha backstop is matched case-insensitively; a backstop evaded by
 # pressing shift is not one. Mutated on a NEUTRAL env key so only the
