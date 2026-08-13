@@ -262,9 +262,10 @@ REVIEWERS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" available_reviewer
 THRESHOLD=$(policy_scalar "$CONFIG" external_review_threshold)
 AUTHOR=$(policy_scalar "$CONFIG" author_identity)
 
-# Every emitted value is a single GITHUB_OUTPUT line: `policy_scalar` stops at
-# the first match (see its first-wins note), and PATHS/REVIEWERS are single-line
-# by construction because `jq -c` compacts them.
+# Every emitted value is a single GITHUB_OUTPUT line: `policy_scalar` prints at
+# most once — one line for a unique key, nothing for a repeated or unreadable
+# one (see its `unique` note) — and PATHS/REVIEWERS are single-line by
+# construction because `jq -c` compacts them.
 
 # The resolver's contract: a non-default base returns a TEMP file and the
 # caller owns cleanup. The default-config path is the caller's own checkout and
