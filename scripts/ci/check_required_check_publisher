@@ -306,6 +306,12 @@ EXPECTED_JOB_IF = {
 # serialization entirely, so an older evaluation on one of those paths
 # could read state before a transition and POST after a newer one.
 EXPECTED_CONCURRENCY_GROUP = "rcp-publish"
+# Actions permits exactly these two keys in a job `concurrency:` mapping, so
+# the mapping is pinned WHOLE for the same reason the trigger mappings are:
+# reading only the two keys the fence names leaves it silent about a third,
+# and an unsupported key here invalidates the default-branch publisher —
+# which then refreshes nothing at all (Codex P2, round 6 on #974).
+EXPECTED_CONCURRENCY_KEYS = {"group", "cancel-in-progress"}
 
 # A2 — every head_sha binding SITE, as an ALLOWLIST over the values those
 # sites bind rather than a denylist of wrong spellings (the #849 lesson:
@@ -685,12 +691,16 @@ for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
         bad("FAIL: [rcp job eligibility] job %r has if: %r, not the pinned"
             % (key, got_if),
             "      condition %r." % want_if,
-            "      `open` must run on exactly the requested/in_progress deliveries and",
-            "      `publish` on everything except `requested`. A condition Actions can",
-            "      never satisfy — literal or not — makes the publisher open holds it",
-            "      never closes; an ABSENT if: makes each job also run on the deliveries",
-            "      the other owns. Pinned verbatim rather than screened for falsiness,",
-            "      so an equivalent respelling arrives here as a diff too.")
+            "      The two are DISJOINT: `open` runs on the workflow_run requested and",
+            "      in_progress deliveries, `publish` on workflow_run completed plus every",
+            "      non-workflow_run delivery. in_progress is the rerun cue and belongs to",
+            "      `open` alone — a `publish` that also ran on it would overwrite the",
+            "      rerun's own hold before the parent finished evaluating, reopening the",
+            "      stale-verdict window. A condition Actions can never satisfy — literal",
+            "      or not — makes the publisher open holds it never closes; an ABSENT if:",
+            "      makes each job run on the other's deliveries too. Pinned verbatim",
+            "      rather than screened for falsiness, so an equivalent respelling",
+            "      arrives here as a diff too.")
     if "needs" in job:
         bad("FAIL: [rcp job eligibility] job %r declares needs: %r. The two phase"
             % (key, job.get("needs")),
@@ -709,6 +719,16 @@ if publish_job is not None:
             "      transition and POST after a newer evaluation, restoring a stale",
             "      verdict under live names.")
     else:
+        conc_keys = set(conc)
+        if conc_keys != EXPECTED_CONCURRENCY_KEYS:
+            bad("FAIL: [rcp publish queue] concurrency's keys are %s, not exactly %s."
+                % (sorted(conc_keys), sorted(EXPECTED_CONCURRENCY_KEYS)),
+                "      Actions permits only those two in a job concurrency mapping, so a",
+                "      third — a typo, or a key copied from the workflow level — makes the",
+                "      publisher's own definition invalid on the default branch, and an",
+                "      invalid workflow refreshes nothing at all. Pinned whole rather than",
+                "      key by key, like the trigger mappings above, because reading only",
+                "      the keys this fence names leaves it silent about the rest.")
         if conc.get("group") != EXPECTED_CONCURRENCY_GROUP:
             bad("FAIL: [rcp publish queue] concurrency.group is %r, not the fixed"
                 % conc.get("group"),

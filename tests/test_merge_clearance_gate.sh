@@ -3321,6 +3321,14 @@ rcp_case publish-group \
 rcp_case publish-cancel \
   's{cancel-in-progress: false}{cancel-in-progress: true}' \
   fail 'concurrency.cancel-in-progress is'
+# The concurrency mapping is pinned WHOLE, like the trigger mappings: Actions
+# permits only `group` and `cancel-in-progress` in a job concurrency block, so
+# a third key — a typo, or one copied from the workflow level — invalidates
+# the publisher's own definition, and an invalid workflow refreshes nothing.
+# Reading only the two keys the fence names left it silent about the rest.
+rcp_case publish-conc-extra-key \
+  's{^(      cancel-in-progress: false)$}{$1\n      cancel-in-progres: false}m' \
+  fail "concurrency's keys are"
 # No queue at all is the same stale-restore as the wrong queue, and it is
 # reached by DELETING rather than editing — the direction a group/cancel
 # case cannot cover.
