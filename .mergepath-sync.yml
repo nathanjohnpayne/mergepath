@@ -1359,6 +1359,15 @@ paths:
       - ".github/workflows/codex-p1-gate.yml"  # check_codex_p1_gate workflow shape
       - ".github/workflows/coderabbit-severity-gate.yml"  # check_coderabbit_severity_gate workflow shape (#577)
       - ".github/workflows/merge-clearance-gate.yml"  # check_merge_clearance_gate workflow shape
+      # check_required_check_publisher's subject (#845 PR 2). The publisher
+      # already travels as its own canonical entry above; this edge is the
+      # CLOSURE half — it makes a wave that ships the fence without the
+      # workflow structurally impossible, rather than relying on both
+      # entries happening to be in the same --sync-all run. The fence still
+      # SKIPs when its subject is absent (a pre-wave consumer is
+      # mid-rollout, not broken), so this edge is defence in depth on the
+      # #845 ordering constraint, not the only guard.
+      - ".github/workflows/required-check-publisher.yml"  # check_required_check_publisher subject
       - ".github/workflows/pr-audit.yml"       # check_pr_audit_codex_clearance
       - ".github/workflows/repo_lint.yml"      # check_ci_scripts_wired scans it; bidirectional with its requires: scripts/ci/ (#601)
   - path: scripts/gh-projects/
