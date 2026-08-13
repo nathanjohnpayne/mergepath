@@ -38,6 +38,56 @@ jobs:
       - name: make_ci_scripts_executable
         run: chmod +x scripts/ci/*
 
+      # #853 — provision the Python packages the check_* loop depends on
+      # explicitly, instead of relying on whatever the runner image happens
+      # to ship. Installed into an isolated venv (same pattern as
+      # .github/workflows/md-prose-wrap.yml) with its bin/ prepended to
+      # GITHUB_PATH, so every later step's bare `python3` resolves to this
+      # interpreter without any script needing to know about a venv.
+      #
+      #   - PyYAML backs the #850 structural assertions in
+      #     check_merge_clearance_gate and the agent-review.yml parse tier in
+      #     check_workflow_parsers. Both soft-SKIP (loud, exit 0) when PyYAML
+      #     is absent — the right posture for a bare local shell, but it left
+      #     CI enforcement resting on GitHub-hosted runner images happening
+      #     to ship PyYAML, an undocumented dependency of a merge-relevant
+      #     fence (#853). The check scripts keep their loud-SKIP posture for
+      #     local shells unchanged; this step is what makes CI never take
+      #     that path.
+      #   - markdown-it-py backs the CommonMark oracle in
+      #     tests/test_check_doc_ownership.sh (the regression net
+      #     check_doc_ownership runs). Same gap in the same job (#929 item
+      #     21): markdown-it-py is pinned at 4.2.0 for md-prose-wrap.yml but
+      #     was never installed for repo_lint.yml, so the oracle was active
+      #     locally and silently skipped in CI — exactly the state it exists
+      #     to prevent. Bundled here rather than filed separately because the
+      #     fix is the identical one step in the identical job.
+      #
+      # Versions are pinned deliberately: an unpinned `pip install` lets a
+      # future release silently change parse/render behavior for a
+      # merge-relevant gate and a CommonMark oracle, on a runner that always
+      # installs the latest release. PyYAML 6.0.2 is the current stable
+      # release (Sept 2024, still latest on 1.x-successor 6.x as of writing).
+      # markdown-it-py 4.2.0 matches the existing md-prose-wrap.yml pin so
+      # the two gates that both cross-check documents agree on one renderer
+      # version fleet-wide.
+      #
+      # No self-bootstrap `|| { ...; }` tail here, unlike several check_*
+      # steps below: a failed `pip install` (network, index, or resolver
+      # failure) or a package that installs but does not import must fail
+      # this step outright — silently soft-passing a missing CI dependency
+      # is exactly the failure mode #853 exists to close.
+      - name: install_python_ci_dependencies
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/ci-pyenv"
+          "$RUNNER_TEMP/ci-pyenv/bin/pip" install --quiet 'PyYAML==6.0.2' 'markdown-it-py==4.2.0'
+          echo "$RUNNER_TEMP/ci-pyenv/bin" >> "$GITHUB_PATH"
+          if ! "$RUNNER_TEMP/ci-pyenv/bin/python3" -c "import yaml, markdown_it" >/dev/null 2>&1; then
+            echo "FAIL: PyYAML / markdown-it-py did not import after install — CI dependency provisioning is broken" >&2
+            exit 1
+          fi
+
       # #777 part 1 of 2 — record .git/config BEFORE any step that runs a
       # test suite. The paired verification step at the END of this job
       # byte-compares against this snapshot, which turns "running the
