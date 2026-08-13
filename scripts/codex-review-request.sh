@@ -548,14 +548,35 @@ die() {
 # once per input (per page), which miscounts and misfilters on multi-page
 # PRs. Slurp with `-s` collects all inputs into an outer array, then `add`
 # concatenates the per-page arrays into one flat array. Defaults to `[]`
-# on empty input. Exits 3 on API or parse error.
+# on empty input.
+#
+# RETURNS 3 on failure; it cannot abort its caller (#966, mirroring the
+# #831 contract fix already applied to coderabbit-wait.sh). Every call
+# site here is a command substitution (`VAR=$(fetch_api_array …)`), so a
+# `die`/`exit` inside this function would kill only that subshell — the
+# assigning statement resumes with an empty string and status 0, and a
+# caller that infers "no results" from emptiness reads a failed API call
+# as a confident negative. `return` carries the SAME status a `die` exit
+# would have produced; the difference is that this function no longer
+# claims a power (aborting the whole script) it does not actually have
+# when called from inside another function. A top-level
+# `VAR=$(fetch_api_array …)` (outside any function) still trips
+# `set -euo pipefail` and exits the script with status 3 — unaffected by
+# this change. A call site INSIDE a function body must propagate the
+# status explicitly (`|| return 3` / `|| die 3 …`); see scan_codex_state
+# and trigger_ack_present below for the two call sites that needed it.
 fetch_api_array() {
   local endpoint=$1
   local label=$2
   local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
-    || die 3 "failed to flatten $label pagination output"
+  raw=$(gh api --paginate "$endpoint" 2>&1) || {
+    log "ERROR: failed to fetch $label: $raw"
+    return 3
+  }
+  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
+    log "ERROR: failed to flatten $label pagination output"
+    return 3
+  }
 }
 
 # --- Phase 4a entry gate (#486) ---------------------------------------------
@@ -666,10 +687,19 @@ log "ack_wait = ${ACK_WAIT_SECONDS}s    max_ack_retries = $MAX_ACK_RETRIES"
 scan_codex_state() {
   local reviews comments reactions issue_comments review findings reaction verdict blocked
 
-  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
-  comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
-  reactions=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions")
-  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  # Each read must propagate fetch_api_array's status explicitly (#966):
+  # scan_codex_state is invoked from every call site as
+  # `VAR=$(scan_codex_state)`, so it runs inside ITS OWN command
+  # substitution subshell — a `die` from within fetch_api_array, called
+  # from in here, would only kill that inner subshell too, leaving these
+  # assignments empty and status 0. `|| return 3` makes the caller's
+  # `if ! scan_codex_state; then die …` guard (below and at every call
+  # site) actually observe the failure instead of relying on the
+  # trailing `jq -n --argjson` emitter to crash on empty input.
+  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return 3
+  comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments") || return 3
+  reactions=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions") || return 3
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
 
   # Latest review from the Codex bot on the current HEAD commit, if any.
   # Codex always uses COMMENTED state regardless of findings. We also
@@ -1159,11 +1189,19 @@ post_codex_trigger() {
   reset_review_wait_clock
 }
 
+# Returns 0 = ack present, 1 = confirmed absent (read succeeded, no
+# matching reaction), 2 = could not read the reactions endpoint (#966).
+# Before the fix, a failed read fell through to the same "absent" outcome
+# as a genuinely-checked absence — the caller could not tell "Codex has
+# not acked yet" from "we don't know", and treated both as grounds to
+# eventually re-post `@codex review`. Fails open the same DIRECTION as
+# before (never silently reports an ack that did not happen), but now
+# names the read failure so wait_for_trigger_ack can log it distinctly.
 trigger_ack_present() {
   local reactions
 
   [ -n "$TRIGGER_COMMENT_ID" ] || return 1
-  reactions=$(fetch_api_array "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID/reactions" "trigger comment reactions")
+  reactions=$(fetch_api_array "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID/reactions" "trigger comment reactions") || return 2
   [ "$(echo "$reactions" | jq -r --arg bot "$BOT_LOGIN" --arg after "$TRIGGER_POST_TIME" '
     [ .[]
       | select(.user.login == $bot)
@@ -1175,7 +1213,7 @@ trigger_ack_present() {
 }
 
 wait_for_trigger_ack() {
-  local ack_start ack_deadline now remaining sleep_for
+  local ack_start ack_deadline now remaining sleep_for ack_rc
 
   if [ -z "$TRIGGER_COMMENT_ID" ]; then
     log "trigger comment id unavailable — skipping eyes-ack check and continuing normal poll"
@@ -1186,9 +1224,16 @@ wait_for_trigger_ack() {
   ack_deadline=$((ack_start + ACK_WAIT_SECONDS))
 
   while :; do
-    if trigger_ack_present; then
+    # `set -e` is active: a bare `trigger_ack_present; ack_rc=$?` would
+    # abort the script the moment trigger_ack_present returns non-zero,
+    # before ack_rc is even assigned. The `&&`/`||` pair captures the
+    # status without tripping errexit.
+    trigger_ack_present && ack_rc=0 || ack_rc=$?
+    if [ "$ack_rc" -eq 0 ]; then
       log "Codex eyes acknowledgment received on trigger comment $TRIGGER_COMMENT_ID"
       return 0
+    elif [ "$ack_rc" -eq 2 ]; then
+      log "could not read trigger comment reactions this poll — treating as unread, not as a confirmed missing ack (#966)"
     fi
 
     # If a terminal Codex signal arrives before the eyes reaction is

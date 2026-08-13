@@ -234,6 +234,37 @@ pts "post-trigger verdict (at threshold, >=) → true" \
 pts "pre-trigger (stale) verdict → false" \
   "false" '{"review":null,"reaction":null,"verdict":{"created_at":"2026-07-03T09:00:00Z"}}' "2026-07-03T10:00:00Z"
 
+# ── 9. Behavioral: a failed fetch_api_array read inside scan_codex_state
+#      reaches its callers as a non-zero status FROM scan_codex_state
+#      itself, not merely from the trailing `jq -n --argjson` emitter
+#      crashing on empty input (#966). Extract the LIVE function body
+#      (not a hand-copied stand-in) so this asserts the actual emission
+#      path, stub fetch_api_array to fail on the very first read, and
+#      confirm scan_codex_state's own return status is non-zero BEFORE
+#      it would ever reach the emitter.
+SCAN_FN="$(sed -n '/^scan_codex_state() {/,/^}/p' "$SCRIPT")"
+if [ -z "$SCAN_FN" ]; then
+  fail "could not extract scan_codex_state from $SCRIPT"
+else
+  scan_rc_output="$(bash -c '
+    set -eo pipefail
+    log() { :; }
+    fetch_api_array() { return 3; }   # every endpoint fails
+    REPO=owner/repo PR_NUMBER=1 HEAD_SHA=deadbeef BOT_LOGIN=chatgpt-codex-connector TRIGGER_SIGNAL_THRESHOLD=""
+    eval "$1"
+    if scan_codex_state >/dev/null 2>&1; then
+      echo "rc=0"
+    else
+      echo "rc=$?"
+    fi
+  ' _ "$SCAN_FN" 2>&1)"
+  if [ "$scan_rc_output" = "rc=3" ]; then
+    pass "scan_codex_state propagates a failed read as its own non-zero status (#966)"
+  else
+    fail "scan_codex_state did not propagate the failed read; got: $scan_rc_output"
+  fi
+fi
+
 echo ""
 echo "test_codex_review_request_verdict: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

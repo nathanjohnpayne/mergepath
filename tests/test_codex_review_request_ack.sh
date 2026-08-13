@@ -554,6 +554,47 @@ test_missing_identity_checker_skips_bridge() {
   fi
 }
 
+# trigger_ack_present must distinguish "confirmed no ack" (read succeeded,
+# no matching reaction) from "could not read the reactions" (#966). Before
+# the fix, a failed fetch_api_array read inside trigger_ack_present fell
+# through the same jq comparison as a genuine absence, so the caller could
+# never tell the two apart. Extract the LIVE function so this asserts the
+# actual emission path, not a hand-copied stand-in.
+test_trigger_ack_present_distinguishes_read_failure_from_absence() {
+  local script="$ROOT/scripts/codex-review-request.sh"
+  local fn
+  fn="$(sed -n '/^trigger_ack_present() {/,/^}/p' "$script")"
+  if [ -z "$fn" ]; then
+    fail "could not extract trigger_ack_present from $script"
+    return
+  fi
+
+  local read_failure_rc
+  read_failure_rc="$(bash -c '
+    set -eo pipefail
+    fetch_api_array() { return 3; }   # reactions endpoint unreachable
+    TRIGGER_COMMENT_ID=123 BOT_LOGIN=chatgpt-codex-connector TRIGGER_POST_TIME="2026-01-01T00:00:00Z" REPO=owner/repo
+    eval "$1"
+    trigger_ack_present && echo rc=0 || echo "rc=$?"
+  ' _ "$fn")"
+
+  local absent_rc
+  absent_rc="$(bash -c '
+    set -eo pipefail
+    fetch_api_array() { echo "[]"; }   # read succeeds, no reactions at all
+    TRIGGER_COMMENT_ID=123 BOT_LOGIN=chatgpt-codex-connector TRIGGER_POST_TIME="2026-01-01T00:00:00Z" REPO=owner/repo
+    eval "$1"
+    trigger_ack_present && echo rc=0 || echo "rc=$?"
+  ' _ "$fn")"
+
+  if [ "$read_failure_rc" = "rc=2" ] && [ "$absent_rc" = "rc=1" ]; then
+    pass "trigger_ack_present: read failure (rc=2) is distinct from confirmed absence (rc=1)"
+  else
+    fail "trigger_ack_present did not distinguish read failure from absence: read_failure=$read_failure_rc absent=$absent_rc"
+  fi
+}
+
+test_trigger_ack_present_distinguishes_read_failure_from_absence
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
 test_retry_cap_respected

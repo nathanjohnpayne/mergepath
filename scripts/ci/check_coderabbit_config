@@ -127,11 +127,19 @@ fi
 #
 #   reviews.auto_review.enabled    — a repo flipping this to `false`
 #       silently turns CodeRabbit off; the existence gate above still
-#       passes (the file is present), so nothing else would catch it.
+#       passes (the file is present), so nothing else would catch it —
+#       UNLESS it is paired with 'coderabbit.enabled: false' in
+#       review-policy.yml (#911), which is exactly where agents read the
+#       posture: that pairing is explicit, reviewable, and already caught.
+#       A LONE flip (auto_review disabled but coderabbit.enabled still
+#       true/absent) still fails: agents would keep waiting on a bot that
+#       silently stopped reviewing.
 #   reviews.request_changes_workflow — flipping this to `true` makes
 #       CodeRabbit post CHANGES_REQUESTED, which hard-blocks PRs on
 #       branch protection and can deadlock the merge-clearance automation
 #       (the design relies on Codex, not CodeRabbit, as the blocking gate).
+#       Unconditional — it deadlocks merges regardless of intent, so no
+#       paired opt-out applies here.
 #
 # Conservative by design: FAIL only on the explicit dangerous literal,
 # NOT on an absent key — CodeRabbit defaults auto_review.enabled=true and
@@ -142,11 +150,20 @@ fi
 posture_fail=0
 
 auto_review_enabled=$(yq -r '.reviews.auto_review.enabled' "$CONFIG" 2>/dev/null || echo "null")
-if [ "$auto_review_enabled" = "false" ]; then
-  echo "FAIL: reviews.auto_review.enabled is false — CodeRabbit auto-review is disabled."
-  echo "      Default is true; remove the override. If this repo truly opts out of CodeRabbit,"
-  echo "      set 'coderabbit.enabled: false' in .github/review-policy.yml AND delete .coderabbit.yml."
+if [ "$auto_review_enabled" = "false" ] && [ "$coderabbit_enabled" != "false" ]; then
+  echo "FAIL: reviews.auto_review.enabled is false — CodeRabbit auto-review is disabled, but"
+  echo "      coderabbit.enabled is not false in $REVIEW_POLICY, so agents are still waiting on"
+  echo "      a bot that silently stopped reviewing (an advisory thread nobody is waiting for"
+  echo "      can still block branch protection's conversation-resolution gate)."
+  echo "      Either remove the auto_review override, or pair it with"
+  echo "      'coderabbit.enabled: false' in .github/review-policy.yml to make the opt-out"
+  echo "      explicit and reviewable. Deleting .coderabbit.yml does NOT disable CodeRabbit —"
+  echo "      auto_review.enabled defaults to true for an ABSENT config."
   posture_fail=1
+elif [ "$auto_review_enabled" = "false" ]; then
+  echo "check_coderabbit_config: NOTE — reviews.auto_review.enabled is false, paired with"
+  echo "                         coderabbit.enabled: false in $REVIEW_POLICY. Treating this as"
+  echo "                         a deliberate, explicit opt-out (#911), not a posture violation."
 fi
 
 request_changes=$(yq -r '.reviews.request_changes_workflow' "$CONFIG" 2>/dev/null || echo "null")
