@@ -252,6 +252,10 @@ SCALAR_BIN="$WORK/scalar-bin"
 mkdir -p "$SCALAR_BIN"
 cat > "$SCALAR_BIN/gh" <<'STUB'
 #!/usr/bin/env bash
+# Call log, for the cases that assert a request was NOT made.
+if [ -n "${S799_CALL_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$S799_CALL_LOG"
+fi
 # One canned outcome per invocation, selected by S799_MODE:
 #   ok    — the value in S799_VALUE, exit 0 (a successful read)
 #   err1  — error body on STDOUT + human line on stderr, exit 1 (REAL gh)
@@ -357,13 +361,22 @@ fi
 
 # 13. An unknown --shape must fail closed and must NOT spend a request: a typo
 #     turning into "no checking at all" would silently reopen the class.
-SC_OUT=$(PATH="/nonexistent-so-gh-is-unavailable:$PATH" bash -c '
+#
+#     The stub is PRESENT and available here, and the assertion is that its
+#     call log stays EMPTY (CodeRabbit Minor). Making `gh` unavailable instead
+#     tests a weaker thing: an implementation that called gh first would fail
+#     on rc 127 and still return 3, so only the message text distinguished the
+#     orders. An empty call log asserts the ordering directly.
+: > "$WORK/s13.calls"
+SC_OUT=$(PATH="$SCALAR_BIN:$PATH" S799_CALL_LOG="$WORK/s13.calls" bash -c '
   . "$1"; gh_api_scalar --shape shaa "x" "repos/o/r/pulls/1" --jq .base.sha
 ' _ "$SCALAR_LIB" 2>"$WORK/s13.err") && SC_RC=0 || SC_RC=$?
-if [ "$SC_RC" -eq 3 ] && [ -z "$SC_OUT" ] && grep -q 'unknown --shape shaa' "$WORK/s13.err"; then
-  pass "#799: an unrecognised --shape fails closed before any request is made"
+if [ "$SC_RC" -eq 3 ] && [ -z "$SC_OUT" ] \
+   && [ ! -s "$WORK/s13.calls" ] \
+   && grep -q 'unknown --shape shaa' "$WORK/s13.err"; then
+  pass "#799: an unrecognised --shape fails closed before any request is made (call log empty)"
 else
-  fail "#799: an unrecognised --shape did not fail closed (rc=$SC_RC out='$SC_OUT')"
+  fail "#799: an unrecognised --shape did not fail closed (rc=$SC_RC out='$SC_OUT' calls=$(cat "$WORK/s13.calls" 2>/dev/null))"
 fi
 
 # 14-16. The predicates themselves, as accept/reject tables. Driven directly
