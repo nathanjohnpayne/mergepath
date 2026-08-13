@@ -258,7 +258,18 @@ case "\$endpoint" in
         '[{context:"CodeRabbit",creator:{login:\$bot},state:"success",created_at:\$t}]'
     fi ;;
   repos/owner/repo/issues/999/timeline) printf '[]\n' ;;
-  repos/owner/repo/pulls/999/reviews) printf '[]\n' ;;
+  repos/owner/repo/pulls/999/reviews)
+    # CODERABBIT_TEST_FAIL_REVIEWS=1: the reviews read fails. This is the
+    # entry fetch of the count_potential_issues chain
+    # (count_potential_issues -> head_review_finding_bodies ->
+    # latest_head_pinned_review_id -> latest_head_pinned_review), where an
+    # unreadable list and a genuinely empty one are otherwise the same
+    # observation: both leave the review id empty.
+    if [ -n "\${CODERABBIT_TEST_FAIL_REVIEWS:-}" ]; then
+      echo "simulated reviews API failure" >&2
+      exit 44
+    fi
+    printf '[]\n' ;;
   repos/owner/repo/pulls/999/comments) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
     # CODERABBIT_TEST_FAIL_ISSUES_AFTER=<n>: serve the first n reads normally,
@@ -269,6 +280,16 @@ case "\$endpoint" in
     n=\$((n + 1)); printf '%s\n' "\$n" >"\$state_dir/issues-read-count"
     if [ -n "\${CODERABBIT_TEST_FAIL_ISSUES_AFTER:-}" ] && [ "\$n" -gt "\$CODERABBIT_TEST_FAIL_ISSUES_AFTER" ]; then
       echo "simulated issue-comments API failure" >&2
+      exit 44
+    fi
+    # CODERABBIT_TEST_FAIL_ISSUES_ON=<n>: fail read n EXACTLY and serve every
+    # other read normally — a transient blip, not an outage. The distinction is
+    # what isolates #831: under a SUSTAINED failure the polling loop's later
+    # summary read fails too and its own #936 guard stops the run, so a
+    # sustained-failure fixture would pass against the unfixed script. Only a
+    # single failed read leaves the wrapper under test as the sole cause.
+    if [ -n "\${CODERABBIT_TEST_FAIL_ISSUES_ON:-}" ] && [ "\$n" = "\$CODERABBIT_TEST_FAIL_ISSUES_ON" ]; then
+      echo "simulated transient issue-comments API failure on read \$n" >&2
       exit 44
     fi
     # CODERABBIT_TEST_ISSUES_MALFORMED_AFTER=<n>: serve the first n reads
@@ -781,6 +802,140 @@ test_failed_summary_derive_does_not_clear() {
   [ "$FAIL" -ne "$before" ] || pass "19: a failed summary-body DERIVE (not just a failed fetch) is exit 3 (infra), never a clearance"
 }
 
+# --- Test 22: #831/#957 — a failed COMMENT-LIST read is rc 3, not a verdict -
+# The root #831 shape on the arm that matters most. `fetch_api_array` reports a
+# failed read ONLY by returning non-zero — its old `die` ran inside a command
+# substitution and killed just that subshell — and `scan_latest_comment` was
+# the last wrapper in the file that dropped that status. The loop was then
+# handed an empty object, `classify_comment ""` graded it `review` (the one
+# class whose arm can emit a clearance), and the run reached
+# `CodeRabbit review posted with no high-severity markers — cleared` on a head
+# nobody read. Captured live on #936 head d361075.
+#
+# Asserted on the LOG LINE as well as the exit code, deliberately (#957
+# acceptance 2). Pre-fix the process did not actually exit 0 — `jq --argjson
+# review ""` rejected the empty evidence object and killed it rc 2 — so an
+# exit-code-only assertion would pass against the unfixed script on an
+# accident. The clearance decision is the defect; the crash is the mask.
+#
+# The control run is half the test: same fixture, no injected failure, a PR
+# CodeRabbit never commented on. It must reach the advisory timeout, which is
+# what proves the clearance below is manufactured by the failed read rather
+# than by anything else in the fixture.
+test_failed_comment_list_read_does_not_clear() {
+  local dir rc=0 ctl ctlrc before=$FAIL
+  ctl=$(make_case "comment-list-control" "" "$STATUS_TIME" "Review rate limited")
+  ctlrc=$(run_case "$ctl")
+  [ "$ctlrc" = "4" ] \
+    || fail "22: control expected exit 4 (timeout) on a PR with no CodeRabbit comment at all, got $ctlrc; err=$(tail -4 "$ctl/err.log")"
+  if grep -q 'no high-severity markers — cleared' "$ctl/err.log"; then
+    fail "22: control reached a clearance verdict with an empty comment list — the fixture, not the injected failure, is doing the work"
+  fi
+
+  dir=$(make_case "comment-list-failure" "" "$STATUS_TIME" "Review rate limited")
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_FAIL_ISSUES_ON=1 \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  if grep -q 'no high-severity markers — cleared' "$dir/err.log"; then
+    fail "22: the polling loop reached a CLEARANCE verdict off a read that had just failed; err=$(tail -4 "$dir/err.log")"
+  fi
+  [ "$rc" != "0" ] || fail "22: FALSE-CLEARED (exit 0) after the comment-list read failed"
+  [ "$rc" = "3" ] || fail "22: expected exit 3 (infra), got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'refusing to grade an unread head' "$dir/err.log" \
+    || fail "22: expected the fail-closed comment-list message; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "22: a failed issue-comments read in the polling loop is exit 3 (infra) with no clearance verdict, never a graded 'review'"
+}
+
+# --- Test 23: #831 — a failed REVIEWS read is rc 3, not a zero finding count -
+# The second #831 wrapper chain, reached from the polling `review` arm:
+# count_potential_issues -> head_review_finding_bodies ->
+# latest_head_pinned_review_id -> latest_head_pinned_review, whose fetch is the
+# one that fails here. An unreadable reviews list and a genuinely empty one
+# both leave the review id empty, so without the propagation the chain emits
+# `[]`, the arm reads a confident zero, and the summary read (which succeeds)
+# then clears the head — exit 0 on inline findings nobody counted.
+#
+# The comment fixture is a CLEAN review summary, so the summary surface cannot
+# supply a `findings` verdict of its own: the only thing that can move this run
+# off exit 0 is the failed read.
+test_failed_reviews_read_does_not_clear() {
+  local dir rc=0 before=$FAIL
+  dir=$(make_case "reviews-read-failure" "$REVIEW_BODY_CLEAN" "$STATUS_TIME" "Review rate limited")
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_FAIL_REVIEWS=1 \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  if grep -q 'no high-severity markers — cleared' "$dir/err.log"; then
+    fail "23: the review arm CLEARED on an inline finding count taken from an unreadable reviews list; err=$(tail -4 "$dir/err.log")"
+  fi
+  [ "$rc" != "0" ] || fail "23: FALSE-CLEARED (exit 0) after the reviews read failed"
+  [ "$rc" = "3" ] || fail "23: expected exit 3 (infra), got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'failed to fetch reviews' "$dir/err.log" \
+    || fail "23: expected the failed reviews read to be named; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "23: a failed reviews read in the count_potential_issues chain is exit 3 (infra), never a finding count of zero"
+}
+
+# --- Test 24: #831 — the fast path's own read failure must not CLEAR ---------
+# The third #831 wrapper, and the only one whose guard was already in the tree
+# but unpinned: `status_context_fast_path_blocked_by_comment`. Its whole job is
+# to decide whether a CodeRabbit StatusContext success is trustworthy, and it
+# decides that by reading the comment list. An unchecked read failure hands it
+# an empty list, so every classifier below it sees nothing adverse, and the
+# function returns "not blocked" — the fast path then clears a head CodeRabbit
+# has publicly said it is rate-limited on. The failure and the all-clear are
+# the same observation, which is the #831 shape exactly.
+#
+# The fixture is test 1's, unchanged, and test 1 IS the control: same notice,
+# same near-simultaneous success, no injected failure, exit 5. The single
+# difference here is that the fast path's first issue-comments read fails, so
+# nothing but that read can account for a different verdict.
+#
+# Non-vacuous by mutation: replacing the `|| { log …; return 0; }` guard at
+# `status_context_fast_path_blocked_by_comment`'s fetch with a bare assignment
+# turns this run into `StatusContext success and 0 blocking (p0/p1) inline
+# findings — emitting cleared (exit 0)`. Asserted on that log line as well as
+# the exit code, because the clearance DECISION is the defect (#957) — an
+# exit-code-only assertion can be satisfied by an unrelated downstream crash.
+test_failed_fast_path_comment_read_does_not_clear() {
+  local dir rc=0 before=$FAIL
+  dir=$(make_case "fast-path-read-failure" "$RATE_LIMIT_BODY_HEADREF")
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_FAIL_ISSUES_ON=1 \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  if grep -q 'emitting cleared' "$dir/err.log"; then
+    fail "24: the StatusContext fast path CLEARED a rate-limited head off a comment-list read that had just failed; err=$(tail -4 "$dir/err.log")"
+  fi
+  [ "$rc" != "0" ] || fail "24: FALSE-CLEARED (exit 0) after the fast path's comment-list read failed"
+  [ "$rc" = "5" ] || fail "24: expected exit 5 (rate_limit_stalled, same as the test-1 control), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "24: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+  grep -q 'the issue-comments read failed' "$dir/err.log" \
+    || fail "24: expected the fast-path suppression message naming the failed read; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "24: a failed comment-list read inside the StatusContext fast path suppresses it (keep polling), never clears a rate-limited head"
+}
+
 # --- Test 20: #936 — 'No review completed' is a refusal, end to end ---------
 # Codex P1 on #936. The description predicate matched `*"review complete"*` as
 # a SUBSTRING, so three wordings that state the review did NOT happen cleared
@@ -825,6 +980,9 @@ test_later_notice_does_not_mask_head_summary
 test_misclassified_summary_is_still_graded
 test_failed_summary_derive_does_not_clear
 test_negated_completed_description_does_not_take_fast_path
+test_failed_comment_list_read_does_not_clear
+test_failed_reviews_read_does_not_clear
+test_failed_fast_path_comment_read_does_not_clear
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"
