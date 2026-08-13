@@ -3047,6 +3047,16 @@ rcp_case on-true-collision \
 #    top-level shape changed and no other assertion here would have seen it".
 rcp_case toplevel-extra-key 's{^on:$}{run-name: publisher\non:}m' \
   fail 'top-level keys are'
+# 3b. The same assertion, on the shape that motivates it beyond the `on` key.
+#     A WORKFLOW-level `concurrency:` block queues both jobs — including the
+#     one A10 requires to stay groupless — and A10 is scoped to the `open` job
+#     alone, so it cannot see a block placed a level up. This is a live Codex
+#     P2 on this PR, closed here by the vocabulary pin rather than by a second
+#     scoped assertion; the case exists so that coverage is asserted instead of
+#     incidental.
+rcp_case toplevel-concurrency \
+  's{^permissions:$}{concurrency:\n  group: rcp-all\n  cancel-in-progress: false\npermissions:}m' \
+  fail 'top-level keys are'
 # 4. Non-vacuity in the other direction: `"on":` is the SAME key to Actions,
 #    so a fence that reddened on it would be trading the leak for a false
 #    positive on a legal respelling.

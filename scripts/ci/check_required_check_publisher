@@ -265,6 +265,11 @@ EXPECTED_DISPATCH_KEYS = {"types"}
 # worst makes the file invalid — and an invalid publisher does not run at
 # all, which is the liveness failure this whole fence exists to make loud. A
 # legitimate new top-level key is a one-line diff here.
+#
+# It also reaches a shape no scoped assertion here can: a WORKFLOW-level
+# `concurrency:` block queues both jobs, including the one A10 requires to
+# stay groupless, and A10 is scoped to the `open` job so it cannot see a
+# block placed a level up.
 EXPECTED_TOP_LEVEL_KEYS = {"name", "on", "permissions", "env", "jobs"}
 
 # A4a — the eligibility shape of both phase jobs, pinned VERBATIM
