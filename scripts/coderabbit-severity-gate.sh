@@ -645,14 +645,33 @@ summary_stanza_opener_lines() {
 #   rc 3  the body could NOT be read; the caller must HOLD, never drop the
 #         summary out of scope
 summary_stanzas_all_benign() {
-  local openers total benign
+  local openers total benign grc
   openers=$(summary_stanza_opener_lines "$1") || return 3
   [ -n "$openers" ] || return 1
-  # `|| true` on both: grep exits 1 on no match, which `set -o pipefail` would
-  # promote to a failed assignment. `grep -c` still prints 0, which is the
-  # answer we want.
-  total=$(printf '%s\n' "$openers" | grep -c . || true)
-  benign=$(printf '%s\n' "$openers" | grep -ciE "$CR_SUMMARY_BENIGN_STANZA_RE" || true)
+  # The counters are READERS too, and `|| true` is rc-BLIND: it cannot tell
+  # grep's no-match (rc 1, the only status it was ever meant to absorb, on
+  # which `grep -c` still prints the 0 this wants) from grep's own ERROR
+  # (rc >= 2 — an invalid multibyte sequence or a bad locale, which is one of
+  # the production causes #942 names for the awk death). On an error grep
+  # prints NOTHING, so `total` came back empty, `${total:-0}` manufactured the
+  # zero-stanza state the `-gt 0` guard is watching for, and this predicate
+  # returned 1 — the caller then logged the specific, WRONG diagnosis "carries
+  # a non-benign outcome stanza" about a body it had failed to search and the
+  # required gate cleared. That is exactly the misdiagnosis #942's acceptance
+  # criterion 2 forbids, so the rc-3 rung has to cover the search as well as
+  # the read.
+  grc=0
+  total=$(printf '%s\n' "$openers" | grep -c .) || grc=$?
+  if [ "$grc" -gt 1 ]; then
+    log "ERROR: counting the outcome-stanza openers failed on this summary body — the summary is UNSEARCHED, not stanza-free"
+    return 3
+  fi
+  grc=0
+  benign=$(printf '%s\n' "$openers" | grep -ciE "$CR_SUMMARY_BENIGN_STANZA_RE") || grc=$?
+  if [ "$grc" -gt 1 ]; then
+    log "ERROR: grading the outcome-stanza openers against the benign allow-list failed on this summary body — the summary is UNSEARCHED, not non-benign"
+    return 3
+  fi
   [ "${total:-0}" -gt 0 ] && [ "$total" = "$benign" ]
 }
 
@@ -677,12 +696,21 @@ summary_stanzas_all_benign() {
 # read through a `!` at its call site, so an unreadable body came back as
 # "no non-benign stanza" and the run was ACCEPTED as a recognised summary.
 summary_has_non_benign_stanza() {
-  local openers nonbenign
+  local openers nonbenign grc
   openers=$(summary_stanza_opener_lines "$1") || return 3
   [ -n "$openers" ] || return 1
-  # `|| true` for the same `set -o pipefail` reason as above: `grep -vc` exits 1
-  # when every line matches, while still printing the 0 this wants.
-  nonbenign=$(printf '%s\n' "$openers" | grep -vciE "$CR_SUMMARY_BENIGN_STANZA_RE" || true)
+  # Same rc split as above, and the same reason `|| true` cannot make it:
+  # `grep -vc` exits 1 when every line matches (still printing the 0 this
+  # wants) and >= 2 on its own error, printing nothing. Here the swallow was
+  # the worse of the two, because this predicate is read through a `!` at its
+  # call site: an unsearched body came back as "no non-benign stanza" and the
+  # run was ACCEPTED as a recognised summary.
+  grc=0
+  nonbenign=$(printf '%s\n' "$openers" | grep -vciE "$CR_SUMMARY_BENIGN_STANZA_RE") || grc=$?
+  if [ "$grc" -gt 1 ]; then
+    log "ERROR: grading the outcome-stanza openers against the benign allow-list failed on this summary body — the summary is UNSEARCHED, so whether it declares a non-review is unknown"
+    return 3
+  fi
   [ "${nonbenign:-0}" -gt 0 ]
 }
 
@@ -718,16 +746,27 @@ summary_names_head() {
   # Three rungs, as above (#942): rc 3 is "I could not read this body", which
   # the `|| true` used to flatten into rc 1, "this body names no commits
   # range" — i.e. into "not this head's report", which drops the summary and
-  # clears the gate. The `|| true` now covers ONLY grep's no-match status, the
-  # single place it was ever meant to.
-  local numbered stripped
+  # clears the gate.
+  #
+  # The commits-range grep below carries the same rung for the same reason.
+  # `|| true` is rc-BLIND — it absorbs grep's no-match (rc 1) and grep's own
+  # ERROR (rc >= 2, reachable on an invalid multibyte sequence or a bad
+  # locale) identically, and on an error grep prints nothing, so `ranges` came
+  # back empty and this returned 1: "not this head's report", from a body that
+  # was never searched. Statuses are captured explicitly rather than absorbed.
+  local numbered stripped grc
   numbered=$(summary_unfenced_numbered "$1") || return 3
   stripped=$(printf '%s\n' "$numbered" | sed 's/^[0-9]*	//') || {
     log "ERROR: could not strip line numbers off the summary body while looking for its commits range — the summary is UNREAD"
     return 3
   }
+  grc=0
   ranges=$(printf '%s\n' "$stripped" \
-    | grep -oiE 'between [0-9a-f]{40} and [0-9a-f]{40}' || true)
+    | grep -oiE 'between [0-9a-f]{40} and [0-9a-f]{40}') || grc=$?
+  if [ "$grc" -gt 1 ]; then
+    log "ERROR: the commits-range scan failed on this summary body — the summary is UNSEARCHED, not range-free"
+    return 3
+  fi
   [ -n "$ranges" ] || return 1
   # Hex is case-insensitive; GitHub renders shas lowercase but the comparison
   # must not depend on that, or an uppercase range would silently drop this
@@ -776,7 +815,7 @@ EOF
 # true` is a red with no honest ack to write. Say "unread" and let the caller
 # decide.
 summary_strip_pre_merge_block() {
-  local body=$1 pair numbered
+  local body=$1 pair numbered stripped
   numbered=$(summary_unfenced_numbered "$body") || return 3
   # Emit "<start_line> <end_line>" for the first structural START that is
   # followed by a structural END, or nothing at all.
@@ -794,7 +833,27 @@ summary_strip_pre_merge_block() {
     return 3
   }
   if [ -n "$pair" ]; then
-    printf '%s\n' "$body" | awk -v sl="${pair% *}" -v el="${pair#* }" 'NR < sl || NR > el'
+    # The STRIP is a reader too, and it was the last unchecked one in this
+    # function: its output IS this function's return value, so a dead awk here
+    # produced an empty SUMMARY_SCAN and the caller's `[ -n "$SUMMARY_SCAN" ]`
+    # skipped the entire grading block — a required gate cleared on a body
+    # carrying a 🟠 Major, which is the very defect #942 exists to close, one
+    # line below the two reads above it.
+    #
+    # errexit does NOT rescue a streamed pipeline here, which is why the
+    # status is captured rather than left to `set -e`. The sole call site is
+    # `SUMMARY_SCAN=$(summary_strip_pre_merge_block "$SUMMARY_BODY") || die 2`,
+    # and errexit is suppressed inside a command substitution on the left of an
+    # `||` list: a dying awk that has already emitted a partial stream yields
+    # rc 0 and that partial output, uncaught (probed on bash 3.2).
+    stripped=$(printf '%s\n' "$body" \
+      | awk -v sl="${pair% *}" -v el="${pair#* }" 'NR < sl || NR > el') || {
+      log "ERROR: the pre-merge-block strip failed on this summary body — the summary is UNREAD, so the check table could not be removed"
+      return 3
+    }
+    if [ -n "$stripped" ]; then
+      printf '%s\n' "$stripped"
+    fi
     return 0
   fi
   printf '%s' "$body"
