@@ -265,6 +265,71 @@ else
   fi
 fi
 
+# ── 10. Behavioral: fetch_api_array must not let `gh api`'s STDERR reach
+#       the `jq -s` slurp. `gh api` prints diagnostics on calls that
+#       succeed (deprecation notices, retry chatter), and the old
+#       `2>&1` capture folded that prose into the JSON handed to jq —
+#       turning a healthy fetch into a spurious "failed to flatten"
+#       error, the false-failure mirror of #966's swallowed failure.
+#       Extract the LIVE function and drive it with a `gh` stub that
+#       writes valid JSON to stdout AND benign text to stderr.
+FETCH_FN="$(sed -n '/^fetch_api_array() {/,/^}/p' "$SCRIPT")"
+if [ -z "$FETCH_FN" ]; then
+  fail "could not extract fetch_api_array from $SCRIPT"
+else
+  fetch_stub_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-fetch-stderr.XXXXXX")"
+  cat >"$fetch_stub_dir/gh" <<'STUB'
+#!/bin/sh
+# Succeeds (exit 0) while emitting benign chatter on stderr, exactly as
+# `gh api` does for deprecation/retry notices.
+printf '%s\n' 'notice: benign stderr chatter from gh' >&2
+printf '%s\n' '[{"id":1},{"id":2}]'
+STUB
+  chmod +x "$fetch_stub_dir/gh"
+
+  fetch_ok_output="$(PATH="$fetch_stub_dir:$PATH" bash -c '
+    set -eo pipefail
+    log() { :; }
+    eval "$1"
+    if out=$(fetch_api_array "repos/o/r/x" "widgets"); then
+      printf "rc=0 ids=%s\n" "$(printf "%s" "$out" | jq -c "[.[].id]")"
+    else
+      printf "rc=%s\n" "$?"
+    fi
+  ' _ "$FETCH_FN" 2>/dev/null)"
+
+  if [ "$fetch_ok_output" = "rc=0 ids=[1,2]" ]; then
+    pass "fetch_api_array: benign gh stderr does not corrupt a successful fetch"
+  else
+    fail "fetch_api_array mishandled stderr on a successful fetch; got: $fetch_ok_output"
+  fi
+
+  # The failure path must still return 3 AND surface the stderr text in
+  # the log line, so separating the streams does not cost diagnostics.
+  cat >"$fetch_stub_dir/gh" <<'STUB'
+#!/bin/sh
+printf '%s\n' 'gh: HTTP 502 upstream exploded' >&2
+exit 1
+STUB
+  chmod +x "$fetch_stub_dir/gh"
+
+  fetch_err_output="$(PATH="$fetch_stub_dir:$PATH" bash -c '
+    set -eo pipefail
+    log() { printf "LOG:%s\n" "$*"; }
+    eval "$1"
+    fetch_api_array "repos/o/r/x" "widgets" || printf "rc=%s\n" "$?"
+  ' _ "$FETCH_FN" 2>/dev/null)"
+
+  if printf '%s' "$fetch_err_output" | grep -q 'HTTP 502 upstream exploded' \
+    && printf '%s' "$fetch_err_output" | grep -q 'rc=3'; then
+    pass "fetch_api_array: a failed fetch still returns 3 and logs gh's stderr"
+  else
+    fail "fetch_api_array lost the failure status or the stderr diagnostic; got: $fetch_err_output"
+  fi
+
+  rm -rf "$fetch_stub_dir"
+fi
+
 echo ""
 echo "test_codex_review_request_verdict: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

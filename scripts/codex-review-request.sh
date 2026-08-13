@@ -565,16 +565,37 @@ die() {
 # this change. A call site INSIDE a function body must propagate the
 # status explicitly (`|| return 3` / `|| die 3 …`); see scan_codex_state
 # and trigger_ack_present below for the two call sites that needed it.
+#
+# The two streams are captured SEPARATELY. `gh api` writes diagnostics to
+# stderr on calls that SUCCEED — deprecation notices, retry/backoff
+# chatter, token-scope warnings — so folding stderr into stdout with
+# `2>&1` feeds that prose to the `jq -s` slurp below, which then fails
+# and reports a healthy fetch as an error. That is the same dishonesty
+# this contract fix is about, pointed the other way: a swallowed failure
+# lies about a bad read, a merged stderr stream lies about a good one.
+# Only stdout reaches jq; stderr is kept solely for the diagnostic.
 fetch_api_array() {
   local endpoint=$1
   local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || {
-    log "ERROR: failed to fetch $label: $raw"
+  local raw err errfile rc=0
+
+  errfile=$(mktemp "${TMPDIR:-/tmp}/codex-review-request-api.XXXXXX") || {
+    log "ERROR: failed to allocate a stderr capture file while fetching $label"
     return 3
   }
+  # `raw=$(…)` on its own would trip errexit before rc could be read; the
+  # `|| rc=$?` form captures the status without aborting (same reason
+  # wait_for_trigger_ack uses the &&/|| pair below).
+  raw=$(gh api --paginate "$endpoint" 2>"$errfile") || rc=$?
+  err=$(cat "$errfile" 2>/dev/null) || err=""
+  rm -f "$errfile"
+
+  if [ "$rc" -ne 0 ]; then
+    log "ERROR: failed to fetch $label: $err"
+    return 3
+  fi
   echo "$raw" | jq -s 'add // []' 2>/dev/null || {
-    log "ERROR: failed to flatten $label pagination output"
+    log "ERROR: failed to flatten $label pagination output${err:+ (gh stderr: $err)}"
     return 3
   }
 }
