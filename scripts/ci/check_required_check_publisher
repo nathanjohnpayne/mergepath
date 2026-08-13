@@ -541,28 +541,63 @@ else:
 if isinstance(triggers, dict):
     listed = (triggers.get("workflow_run") or {}).get("workflows") \
         if isinstance(triggers.get("workflow_run"), dict) else None
+    # The load outcome is tracked SEPARATELY from the name it yields.
+    # Collapsing both into `parent_name is None` conflates an unreadable
+    # parent (already reported here) with a parent that parses cleanly and
+    # declares no top-level `name:` — and the second is exactly the shape
+    # this assertion exists to catch. Actions names an unnamed workflow
+    # after its PATH, so `workflows: ["Merge Clearance Gate"]` would then
+    # match no workflow and every event-driven publish is orphaned. Under
+    # a single `is not None` guard, DELETING one line from the parent
+    # disarms A6 instead of tripping it.
+    parent_loaded = True
+    parent_name = None
     try:
         parent_doc = load(PARENT_WORKFLOW)
         parent_name = (parent_doc or {}).get("name")
     except Exception as exc:
-        parent_name = None
+        parent_loaded = False
         bad("FAIL: [rcp parent name] could not read %s: %s"
             % (PARENT_WORKFLOW, " ".join(str(exc).split())),
             "      The publisher's workflow_run source must be verified against the",
             "      parent's own top-level name:, not against a string in this check.")
-    if parent_name is not None:
-        if list(listed or []) != [parent_name]:
-            bad("FAIL: [rcp parent name] workflow_run.workflows is %r but %s"
-                % (listed, PARENT_WORKFLOW),
-                "      declares name: %r. ONE parent is deliberate — the Merge" % parent_name,
-                "      Clearance Gate's trigger set is a measured strict superset of both",
-                "      siblings', so a single delivery per PR event carries every refresh",
-                "      signal. And workflow_run matches on the exact top-level name, so a",
-                "      rename on either side orphans every event-driven publish silently.")
+    if not parent_loaded:
+        pass  # already reported above; a second failure would just be noise
+    elif parent_name is None or not str(parent_name).strip():
+        bad("FAIL: [rcp parent name] %s declares no usable top-level name:"
+            % PARENT_WORKFLOW,
+            "      (read as %r). Actions then names that workflow after its PATH," % parent_name,
+            "      so this publisher's workflow_run.workflows entry matches nothing",
+            "      and every event-driven publish is orphaned — silently, because a",
+            "      workflow that never fires looks identical to one that fires and",
+            "      finds nothing to do. A missing parent name: must trip this",
+            "      assertion, not disarm it.")
+    elif list(listed or []) != [parent_name]:
+        bad("FAIL: [rcp parent name] workflow_run.workflows is %r but %s"
+            % (listed, PARENT_WORKFLOW),
+            "      declares name: %r. ONE parent is deliberate — the Merge" % parent_name,
+            "      Clearance Gate's trigger set is a measured strict superset of both",
+            "      siblings', so a single delivery per PR event carries every refresh",
+            "      signal. And workflow_run matches on the exact top-level name, so a",
+            "      rename on either side orphans every event-driven publish silently.")
 
 # ── A7 — chain depth stays at 2 of the documented maximum of 3 ─────────
+#
+# The same conflation A6 avoids applies here: this scan matches siblings
+# against the publisher's own top-level `name:`, so an unnamed publisher
+# would skip the scan entirely rather than fail it. Actions names an
+# unnamed workflow after its PATH, which is a name a sibling can still
+# list in `workflow_run.workflows:` — undetected, because the loop below
+# never runs. Requiring the name is trivially satisfiable and keeps the
+# assertion armed.
 publisher_name = doc.get("name")
-if publisher_name:
+if publisher_name is None or not str(publisher_name).strip():
+    bad("FAIL: [rcp chain depth] %s declares no usable top-level name:" % PUBLISHER,
+        "      (read as %r), so the sibling scan below has nothing to match" % publisher_name,
+        "      and this assertion would pass vacuously. Actions names an unnamed",
+        "      workflow after its PATH — a name a third workflow can still observe",
+        "      via workflow_run, which is the level-3 truncation this pins.")
+else:
     try:
         entries = sorted(os.listdir(WORKFLOW_DIR))
     except OSError as exc:

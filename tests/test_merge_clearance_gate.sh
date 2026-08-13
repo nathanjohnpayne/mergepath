@@ -3023,6 +3023,53 @@ rcp_case parent-name \
   's{workflows: \["Merge Clearance Gate"\]}{workflows: ["Merge Clearance Gate Renamed"]}' \
   fail '[rcp parent name]'
 
+# A rename is only HALF the shape. The parent name is read out of the
+# parent FILE, so it is None in two different situations: the file did not
+# load, and the file loaded fine but declares no top-level `name:`. Under
+# one `is not None` guard only the first is reported and the second skips
+# the comparison entirely — so DELETING one line from the parent disarms
+# A6 instead of tripping it. That deletion is the worse half: Actions then
+# names the parent after its PATH, `workflows: ["Merge Clearance Gate"]`
+# matches no workflow at all, and every event-driven publish is orphaned.
+# These cases mutate the PARENT rather than the publisher, so they need
+# the parent-path argument rcp_run already takes.
+rcp_parent_case() {  # <name> <perl-program-on-parent> <expect> [needle]
+  local name="$1" prog="$2" expect="$3" want="${4:-}" f p rc
+  f="$RCP_DIR/wf-$name.yml"
+  p="$RCP_DIR/parent-$name.yml"
+  cp "$RCP_WF" "$f"
+  perl -0777 -pe "$prog" "$RCP_WFDIR/merge-clearance-gate.yml" > "$p"
+  if cmp -s "$RCP_WFDIR/merge-clearance-gate.yml" "$p"; then
+    fail "#845 rcp case $name: the parent mutation changed nothing — anchor drifted"
+    return
+  fi
+  rc=$(rcp_run "$f" "$RCP_WFDIR" "$p")
+  rcp_verdict "$name" "$rc" "$expect" "$want" "$f.out"
+}
+
+# The needle is the MISSING-name message, not the bare `[rcp parent name]`
+# tag, because the tag alone does not discriminate: a blank name already
+# tripped the rename comparison, and a case that accepts either message
+# would pass against the very fence that carries the hole.
+rcp_parent_case parent-name-missing 's{^name: Merge Clearance Gate\n}{}m' \
+  fail 'declares no usable top-level name:'
+# An empty name: is the same orphaning with a different spelling — YAML
+# reads it as "" rather than None, so an `is None` test alone still lets it
+# through while Actions still falls back to the path. It has to be reported
+# as a MISSING name; the rename message the comparison used to emit names
+# the wrong cause and sends a maintainer looking for a mismatch.
+rcp_parent_case parent-name-blank 's{^name: Merge Clearance Gate$}{name: ""}m' \
+  fail 'declares no usable top-level name:'
+
+# ── A7 — the same conflation, on the publisher's own name ──────────────
+# A7 matches siblings against the publisher's top-level `name:`, so an
+# unnamed publisher skipped the sibling scan rather than failing it. The
+# path-derived name Actions substitutes is still a name a third workflow
+# can observe via workflow_run, so the level-3 truncation stays reachable
+# while the assertion reports nothing.
+rcp_case pub-name-missing 's{^name: Required Check Publisher\n}{}m' \
+  fail '[rcp chain depth]'
+
 # ── A2 — head bindings, as an allowlist over every binding ─────────────
 # The catastrophe: on a workflow_run run github.sha is the DEFAULT BRANCH's
 # last commit, so ONE such binding makes all three contexts absent on every
