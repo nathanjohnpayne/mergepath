@@ -2986,16 +2986,27 @@ rcp_verdict() {  # <name> <rc> <expect> <want> <out-file>
   fi
 }
 
-# ── A1 — a job natively named for a required context ──────────────────
-# Actions materialises a native check run per job; naming one for a
-# required context makes the publisher a SECOND producer on the lineage it
-# exists to consolidate, and a cancelled queue member then concludes
-# `cancelled` on a required context — unretirable through the API slot
-# (#843, measured on check run 91305386162).
-rcp_case job-key 's{^  publish:$}{  "Merge clearance gate":}m' fail '[rcp job-names]'
-# The display name defaults to the key, so BOTH have to be checked; a
-# key-only assertion is satisfied by renaming the `name:` alone.
-rcp_case job-name 's{^    name: publish$}{    name: Merge clearance gate}m' fail '[rcp job-names]'
+# ── Document-level preconditions ──────────────────────────────────────
+# These three guard the whole tier: each one, unreported, would leave every
+# assertion below scoped to nothing and printing PASS. They exit before the
+# `[rcp ...]` tags exist, so the needle is the message itself.
+rcp_case doc-unparseable 's{^on:$}{on:\n  bad: [unclosed}m' \
+  fail 'does not parse as YAML'
+rcp_case doc-root-not-mapping 's{\A.*\z}{- just\n- a\n- list\n}s' \
+  fail 'parses to a non-mapping root'
+rcp_case doc-jobs-not-mapping 's{^jobs:$}{jobs: []\njobs_relocated:}m' \
+  fail 'has no jobs: mapping'
+
+# ── A0 — the two-phase job split, which is the SCOPE of most assertions ──
+# Deleting one of the two jobs does not merely lose a property: it empties
+# the scope of the permission, queue, groupless and head-binding-env
+# assertions below, so it has to be reported rather than left to produce a
+# run that inspects nothing and prints PASS.
+rcp_case job-missing 's{^  publish:\n}{  publish-renamed:\n}m' fail '[rcp job shape]'
+# A job key that parses to something other than a mapping is the same
+# emptied scope with a different spelling.
+rcp_case job-not-mapping 's{^  publish:$}{  publish: ["not-a-mapping"]\n  publish-relocated:}m' \
+  fail '[rcp job shape]'
 
 # ── A9 — the trigger set, which is two ABSENCES as much as two presences ──
 # workflow_dispatch runs the SELECTED ref's copy of the file, so a PR branch
@@ -3013,6 +3024,17 @@ rcp_case trig-schedule \
 # never re-fires and the re-evaluation window would carry no pending cover.
 rcp_case trig-types \
   's{types: \[requested, in_progress, completed\]}{types: [requested, completed]}' \
+  fail '[rcp trigger set]'
+# An `on:` that is not a mapping has no triggers to inspect; unreported it
+# would take the whole trigger tier with it.
+rcp_case trig-on-absent \
+  's{^on:$}{on: just-a-string\non_relocated:}m' \
+  fail '[rcp trigger set]'
+# required-check-republish is the operator break-glass and the only
+# on-demand remedy the two sibling contexts have ever had; dropping it is
+# silent until someone needs it.
+rcp_case trig-rd-types \
+  's{types: \[merge-clearance-recheck, required-check-republish\]}{types: [merge-clearance-recheck]}' \
   fail '[rcp trigger set]'
 
 # ── A6 — the parent name is verified against the parent FILE ───────────
@@ -3060,15 +3082,13 @@ rcp_parent_case parent-name-missing 's{^name: Merge Clearance Gate\n}{}m' \
 # the wrong cause and sends a maintainer looking for a mismatch.
 rcp_parent_case parent-name-blank 's{^name: Merge Clearance Gate$}{name: ""}m' \
   fail 'declares no usable top-level name:'
-
-# ── A7 — the same conflation, on the publisher's own name ──────────────
-# A7 matches siblings against the publisher's top-level `name:`, so an
-# unnamed publisher skipped the sibling scan rather than failing it. The
-# path-derived name Actions substitutes is still a name a third workflow
-# can observe via workflow_run, so the level-3 truncation stays reachable
-# while the assertion reports nothing.
-rcp_case pub-name-missing 's{^name: Required Check Publisher\n}{}m' \
-  fail '[rcp chain depth]'
+# The third outcome, and the regression guard for the round-1 fix: an
+# UNREADABLE parent must report the load failure and NOT also report a
+# missing name. Tracking the load outcome separately from the name it
+# yields is what distinguishes the two; conflating them is what let a
+# one-line deletion disarm A6 in the first place.
+rcp_parent_case parent-unreadable 's{^name: Merge Clearance Gate$}{name: [unclosed}m' \
+  fail 'could not read'
 
 # ── A2 — head bindings, as an allowlist over every binding ─────────────
 # The catastrophe: on a workflow_run run github.sha is the DEFAULT BRANCH's
@@ -3113,6 +3133,24 @@ rcp_case head-post-respelled-legal \
 rcp_case head-post-count \
   's{^([ \t]*-f head_sha="\$HEAD_SHA" \\)$}{$1\n$1}m' \
   fail '[rcp head binding count]'
+# COMMENT STRIPPING, both directions, anchored on the count because the
+# count is what the stripping changes. The publisher documents its design
+# in prose right beside the code (#689), so an unstripped scan reads the
+# explanation as if it were the implementation.
+#
+# Full-line: commenting a binding site OUT must drop the count to 4. If
+# stripping regressed, the count would still read 5 and this case would go
+# green while the site was gone — the fence certifying a shape it never saw.
+rcp_case head-comment-full \
+  's{^([ \t]*)(-f head_sha="\$RUN_HEAD" \\)$}{$1# $2}m' \
+  fail '[rcp head binding count]'
+# Inline, and it must PASS: a commented-out off-allowlist binding is prose,
+# not a binding. Unstripped it would read as a sixth site binding
+# $GITHUB_SHA and trip both the allowlist and the count — a false positive
+# on a file whose own style is to explain each POST beside it.
+rcp_case head-comment-inline \
+  's{^([ \t]*-f head_sha="\$head" \\)$}{$1 # -f head_sha="\$GITHUB_SHA"}m' \
+  pass
 # The github.sha backstop is matched case-insensitively; a backstop evaded by
 # pressing shift is not one. Mutated on a NEUTRAL env key so only the
 # backstop — not the HEAD_SHA/RUN_HEAD binding assertion — can produce the
@@ -3133,6 +3171,12 @@ rcp_case publish-group \
 rcp_case publish-cancel \
   's{cancel-in-progress: false}{cancel-in-progress: true}' \
   fail '[rcp publish queue]'
+# No queue at all is the same stale-restore as the wrong queue, and it is
+# reached by DELETING rather than editing — the direction a group/cancel
+# case cannot cover.
+rcp_case publish-noconc \
+  's{^    concurrency:\n      group: rcp-publish\n      cancel-in-progress: false\n}{}m' \
+  fail '[rcp publish queue]'
 
 # ── A10 — the open job stays groupless ────────────────────────────────
 # Queued, the hold waits behind a mid-flight stale pass: the write order is
@@ -3151,82 +3195,85 @@ rcp_case perms-actions \
 rcp_case perms-top \
   's{^permissions:\n  contents: read$}{permissions:\n  contents: read\n  checks: write}m' \
   fail '[rcp permissions]'
+# The floor must be DECLARED, not inherited from a repository setting a
+# consumer may not share.
+rcp_case perms-top-absent \
+  's{^permissions:\n  contents: read\n}{}m' \
+  fail '[rcp permissions]'
+# A job with no permissions mapping inherits the floor and cannot write
+# check runs at all — the publisher silently stops publishing.
+rcp_case perms-job-absent \
+  's{^    permissions:\n(      .*\n|      #.*\n)+?      checks: write\n}{}m' \
+  fail '[rcp permissions]'
+# checks: read is the one-token inversion: every POST 403s and that path
+# quietly stops refreshing all three contexts.
+rcp_case perms-job-checks \
+  's{^      checks: write$}{      checks: read}m' \
+  fail '[rcp permissions]'
 
-# ── A3 — phase 1 first, unconditional, and actually opening the hold ───
-rcp_case phase1-position \
-  's{^    steps:\n      - name: Open pending entries on the event head}{    steps:\n      - name: Decoy first step\n        run: |\n          echo decoy\n      - name: Open pending entries on the event head}m' \
-  fail '[rcp phase-1 position]'
-# COMMENT STRIPPING. The publisher documents its design in prose right
-# beside the code, so an unstripped match finds the explanation after the
-# implementation is gone (#689). Without this case the phase-1 assertion is
-# decorative — it would pass on the very shape it exists to reject.
-rcp_case phase1-comment \
-  's{^(\s*)if gh api -X POST "repos/\$REPO/check-runs" \\\n(\s*)-f name="\$name" \\\n(\s*)-f head_sha="\$HEAD_SHA" \\\n(\s*)-f status="in_progress" \\}{$1# if gh api -X POST "repos/\$REPO/check-runs" -f status="in_progress" \\\n$1if false; then \\}m' \
-  fail '[rcp phase-1 position]'
-rcp_case phase1-conditional \
-  's{^        env:\n          GH_TOKEN: \$\{\{ secrets.GITHUB_TOKEN \}\}\n          REPO}{        if: always()\n        env:\n          GH_TOKEN: \$\{\{ secrets.GITHUB_TOKEN \}\}\n          REPO}m' \
-  fail '[rcp phase-1 unconditional]'
+# The phase-1 ordering cases (A3), the success-conclusion count (A8) and
+# the read-then-write ordering cases (A12) were REMOVED with their
+# assertions, not left as untested prose. Each asserted a property of the
+# SHELL by matching its text, and four review rounds on #974 found a new
+# spelling of that hole every round — the #849 non-termination signature.
+# #977 reinstates all three over a parsed shell AST. A mutation case for an
+# assertion that no longer exists is worse than no case: it reads as
+# coverage.
 
-# ── A8 — exactly one place can produce a green ────────────────────────
-# Every other failure direction here is an availability cost with a known
-# remedy; an unearned green is the only one that merges something.
-rcp_case success-count \
-  's{conclusion="failure"\n}{conclusion="success"\n}' \
-  fail '[rcp success conspicuousness]'
-
-# ── A12 — read-then-write ordering, the whole stale-write mechanism ────
-rcp_case fresh-absent \
-  's{(            local newer\n            if ! newer=.*?\n            fi\n)}{}s' \
-  fail '[rcp write ordering]'
-# Reversed rather than deleted: the strings are all still present, so only a
-# POSITION assertion catches it.
-rcp_case fresh-late \
-  's{(            local newer\n            if ! newer=.*?\n            fi\n)(.*?)(          \}\n)}{$2$1$3}s' \
-  fail '[rcp write ordering]'
-
-# ── A5 / A7 — sibling-scoped properties, mutated in the fixture DIR ────
+# ── A5 — sibling-scoped properties, mutated in the fixture DIR ─────────
 #
 # A5: deleting the natively-named job does not merge the two lineages, it
 # DELETES one — leaving a required context whose only producer is a
 # workflow, so a publisher that is absent, renamed, disabled or whose
 # workflow_run delivery drops leaves it with NO producer and blocks every
 # PR forever, with no partial degradation to warn anyone.
-RCP_DIR_A5="$RCP_DIR/wfdir-a5"
-mkdir -p "$RCP_DIR_A5"
-cp "$RCP_WFDIR"/*.yml "$RCP_DIR_A5/"
-perl -0777 -i -pe 's{^  codex-p1-gate:$}{  codex-p1-gate-renamed:}m' "$RCP_DIR_A5/codex-p1-gate.yml"
-if cmp -s "$RCP_WFDIR/codex-p1-gate.yml" "$RCP_DIR_A5/codex-p1-gate.yml"; then
-  fail "#845 rcp case native-producer: the mutation changed nothing — anchor drifted"
-else
-  cp "$RCP_WF" "$RCP_DIR_A5/required-check-publisher.yml"
-  RC=$(rcp_run "$RCP_DIR_A5/required-check-publisher.yml" "$RCP_DIR_A5" \
-       "$RCP_DIR_A5/merge-clearance-gate.yml")
-  rcp_verdict native-producer "$RC" fail '[rcp native producer]' \
-    "$RCP_DIR_A5/required-check-publisher.yml.out"
-fi
+# <name> <shell-run-inside-the-fixture-dir> <expect> [needle]
+#
+# The publisher itself is re-copied unmutated each time, so only the
+# sibling under test can produce the verdict.
+rcp_dir_case() {
+  local name="$1" prog="$2" expect="$3" want="${4:-}" dir rc
+  dir="$RCP_DIR/wfdir-$name"
+  rm -rf "$dir"; mkdir -p "$dir"
+  cp "$RCP_WFDIR"/*.yml "$dir/"
+  ( cd "$dir" && eval "$prog" )
+  if diff -q -r "$RCP_WFDIR" "$dir" >/dev/null 2>&1; then
+    fail "#845 rcp case $name: the mutation changed nothing — anchor drifted"
+    return
+  fi
+  cp "$RCP_WF" "$dir/required-check-publisher.yml"
+  rc=$(rcp_run "$dir/required-check-publisher.yml" "$dir" "$dir/merge-clearance-gate.yml")
+  rcp_verdict "$name" "$rc" "$expect" "$want" "$dir/required-check-publisher.yml.out"
+}
 
-# A7: chained workflow_run runs are capped at three levels and the publisher
-# already sits at level 2, so a third observer is silently TRUNCATED rather
-# than rejected — the failure mode is a workflow that simply never runs.
-RCP_DIR_A7="$RCP_DIR/wfdir-a7"
-mkdir -p "$RCP_DIR_A7"
-cp "$RCP_WFDIR"/*.yml "$RCP_DIR_A7/"
-cat >"$RCP_DIR_A7/observer.yml" <<'OBS'
-name: Publisher Observer
-on:
-  workflow_run:
-    workflows: ["Required Check Publisher"]
-    types: [completed]
-jobs:
-  noop:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo observing
-OBS
-RC=$(rcp_run "$RCP_DIR_A7/required-check-publisher.yml" "$RCP_DIR_A7" \
-     "$RCP_DIR_A7/merge-clearance-gate.yml")
-rcp_verdict chain-depth "$RC" fail '[rcp chain depth]' \
-  "$RCP_DIR_A7/required-check-publisher.yml.out"
+# Renaming the natively-named job: the context keeps a producer in name
+# only.
+rcp_dir_case native-producer \
+  'perl -0777 -i -pe "s{^  codex-p1-gate:\$}{  codex-p1-gate-renamed:}m" codex-p1-gate.yml' \
+  fail '[rcp native producer]'
+# Deleting the whole gate workflow is the same loss by a blunter route, and
+# it is the one an assertion scoped to a job inside the file cannot see.
+rcp_dir_case native-producer-absent \
+  'rm -f codex-p1-gate.yml' \
+  fail '[rcp native producer]'
+# A gate workflow that does not parse produces nothing at all; silently
+# skipping it would report a producer the repo does not have.
+rcp_dir_case native-producer-unparseable \
+  'printf "jobs:\n  x: [unclosed\n" > codex-p1-gate.yml' \
+  fail '[rcp native producer]'
+# Branch protection keys on the DISPLAY name, so adding a `name:` de-wires
+# the native lineage while the job key — and every other check — stays
+# green. The quietest of the four.
+rcp_dir_case native-producer-name-drift \
+  'perl -0777 -i -pe "s{^(  codex-p1-gate:\n)}{\$1    name: Something Else\n}m" codex-p1-gate.yml' \
+  fail '[rcp native producer]'
+
+# The A7 observer fixture is REMOVED because the assertion it exercised was
+# wrong, not merely under-powered. GitHub documents the cap as three levels
+# of CHAINED workflows, illustrated as A → B → C → D → E → F where "E and F
+# will not be run" — so C runs. The directly-triggered Merge Clearance Gate
+# is A, the publisher is B, and an observer of the publisher is C: inside
+# the cap. The fixture asserted a truncation that does not occur.
 
 # ── Consumer posture — the #845 ordering constraint, as a test ─────────
 #

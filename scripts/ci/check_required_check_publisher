@@ -19,11 +19,11 @@
 #   * add `workflow_dispatch:` and a PR branch's copy of this file can be
 #     run with `checks: write` — the P1a hole the publisher exists to
 #     close;
-#   * name a job for a required context and the publisher becomes a SECOND
-#     native producer whose cancelled runs cannot be retired (#843,
-#     measured: check run 91305386162 on 693aefc3);
-#   * drop the pre-POST freshness read and an older pass restores a stale
-#     verdict over a newer evaluation's hold.
+#   * grant `checks: write` at WORKFLOW scope and every future job in the
+#     file inherits it — how the four-workflow exposure set grew;
+#   * delete a natively-named job from a gate workflow and the required
+#     context it produced is left with a single producer that a workflow
+#     owns.
 #
 # None of that changes any existing check's verdict, which is precisely
 # the gap #845 was filed to close.
@@ -32,10 +32,45 @@
 # extracted text, and that is a deliberate reversal of #849 (mergepath's
 # most expensive lesson: eleven rounds and fifty-three review events, with
 # every finding a hole in an assertion rather than in behaviour — key →
-# value → binding → step → ordering). Text matching is reserved for the
-# shell INSIDE `run:` bodies, where YAML parsing genuinely cannot reach,
-# and those bodies are read out of the parse rather than grepped out of
-# the file. Precedent: scripts/ci/check_merge_clearance_gate's #850 tier.
+# value → binding → step → ordering). Precedent:
+# scripts/ci/check_merge_clearance_gate's #850 tier.
+#
+# ─────────────────────────────────────────────────────────────────────
+# SCOPE — what this fence does NOT pin, and why not here (#977)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Every property whose subject is the SHELL inside a `run:` body is out of
+# scope for this file, deliberately and by measurement rather than by
+# preference. Four review rounds on #974 produced one class of finding
+# repeatedly: an assertion that matches text where the property is
+# semantic. Each round found a NEW spelling of the same hole, which is the
+# #849 non-termination signature — so the remedy is a parsed-shell
+# substrate (`bashlex` / `shfmt --to-json`), not a sixth regex.
+#
+# Tracked in #977 and NOT asserted here:
+#   * phase-1 identity and ordering (which step opens the hold, that it
+#     iterates all three contexts, and that it POSTs rather than merely
+#     mentioning the endpoint);
+#   * the success-conclusion count (one spelling of `conclusion="success"`
+#     is countable; the assignment is not);
+#   * the read-then-write ordering of the freshness read and the head
+#     revalidation against the verdict POST (substring position is not
+#     control flow);
+#   * a job natively named for a required context, because `name:` may
+#     carry a `${{ }}` expression that Actions evaluates and a literal
+#     comparison cannot (this also retires the pinned required-context
+#     list and its hub-only reconciliation, which existed only to feed
+#     that comparison), plus the job-reachability half of the same
+#     property;
+#   * the all-jobs sweep for `checks: write` (the two known jobs ARE
+#     checked below; a third job added later is not).
+# Also tracked, in #976: the dataflow residual behind the head-binding
+# allowlist — reassigning an allowlisted variable immediately before a
+# POST rebinds it without touching any binding site.
+#
+# Stage A ships the publisher under SHADOW context names that are not in
+# branch protection, so nothing it publishes can affect a merge; that is
+# the window in which these are safe to fix properly rather than quickly.
 #
 # ─────────────────────────────────────────────────────────────────────
 # Consumer posture (the #845 ordering constraint, enforced not advised)
@@ -94,68 +129,13 @@ if [ ! -f "$PUBLISHER" ]; then
   exit 1
 fi
 
-# ─────────────────────────────────────────────────────────────────────
-# Hub-only drift cross-check for the pinned required-context list.
-# ─────────────────────────────────────────────────────────────────────
-#
-# Assertion A1 below needs the canonical required-check names. The fleet
-# audit owns them (scripts/audit-branch-protection.sh's
-# CANONICAL_REQUIRED_CHECKS), but that script is hub-only by construction
-# — a consumer has neither the manifest to iterate nor the admin token to
-# read its siblings — so this check cannot depend on it at runtime. The
-# names are therefore PINNED here (one enforced list, available
-# everywhere) and cross-checked against the audit's array WHEN THAT FILE
-# IS PRESENT, so hub CI fails loudly the moment the two drift rather than
-# letting a newly-required context go unfenced. This is the in-tree
-# hub-only-wrapper convention: a hermetic assertion plus a hub-only
-# reconciliation, never a hub-only dependency.
-PINNED_REQUIRED_CHECKS=(
-  "Label Gate"
-  "Self-Review Required"
-  "Codex P1 unresolved threads"
-  "CodeRabbit unresolved blocking findings"
-  "Merge clearance gate"
-)
-
-# Gated on the HUB MARKER, not on the audit file's presence. Adding a path
-# to the bootstrap mirror's exclude list stops FUTURE seeding; it does not
-# scrub the consumers already carrying the file, and gaycruisebingo
-# verifiably still carries this very script as stale residue frozen at its
-# bootstrap snapshot. A presence-gated cross-check would therefore red that
-# consumer's lint the first time mergepath's array legitimately changes —
-# the exact shape of the #774 round-2 regression that hard-failed
-# gaycruisebingo. The reconciliation is a hub concern; run it only on the
-# hub.
-AUDIT="scripts/audit-branch-protection.sh"
-if [ -f "$HUB_MARKER" ] && [ -f "$AUDIT" ]; then
-  audit_names="$(awk '
-    /^CANONICAL_REQUIRED_CHECKS=\(/ { inarr = 1; next }
-    inarr && /^\)/ { exit }
-    inarr {
-      line = $0
-      sub(/[[:space:]]*#.*$/, "", line)
-      if (line !~ /"/) next
-      # One quoted scalar per line in that array; take what is between the
-      # first pair of double quotes.
-      first = index(line, "\"")
-      rest = substr(line, first + 1)
-      second = index(rest, "\"")
-      if (second > 0) print substr(rest, 1, second - 1)
-    }
-  ' "$AUDIT" | sort)"
-  pinned_names="$(printf '%s\n' "${PINNED_REQUIRED_CHECKS[@]}" | sort)"
-  if [ "$audit_names" != "$pinned_names" ]; then
-    echo "FAIL: the pinned required-check list in this script has drifted from"
-    echo "      CANONICAL_REQUIRED_CHECKS in $AUDIT."
-    echo "      A context that is required in branch protection but absent from the"
-    echo "      pin is a context the publisher may legally name a job for — which"
-    echo "      makes it a second NATIVE producer whose cancelled runs cannot be"
-    echo "      retired through the Checks-API slot (#843/#845)."
-    echo "      audit:  $(printf '%s' "$audit_names" | tr '\n' '|')"
-    echo "      pinned: $(printf '%s' "$pinned_names" | tr '\n' '|')"
-    FAILED=1
-  fi
-fi
+# The pinned required-context list and its hub-only reconciliation against
+# scripts/audit-branch-protection.sh's CANONICAL_REQUIRED_CHECKS used to
+# live here. Both existed solely to supply the names for the "no job is
+# natively named for a required context" assertion, which #977 takes over
+# on a substrate that can read a `${{ }}`-bearing `name:`. A pinned list
+# with no consumer is a maintenance burden that asserts nothing, so it goes
+# with its assertion and returns with it.
 
 # ─────────────────────────────────────────────────────────────────────
 # The structural tier.
@@ -183,8 +163,7 @@ fi
 TIER_SKIPPED=0
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
   TIER_SKIPPED=1
-elif ! REQUIRED_CHECKS_PIN="$(printf '%s\n' "${PINNED_REQUIRED_CHECKS[@]}")" \
-     python3 - "$PUBLISHER" "$PARENT_WORKFLOW" "$WORKFLOW_DIR" <<'PY'
+elif ! python3 - "$PUBLISHER" "$PARENT_WORKFLOW" "$WORKFLOW_DIR" <<'PY'
 import os
 import re
 import sys
@@ -193,12 +172,8 @@ import yaml
 
 PUBLISHER, PARENT_WORKFLOW, WORKFLOW_DIR = sys.argv[1], sys.argv[2], sys.argv[3]
 
-REQUIRED_CHECK_NAMES = frozenset(
-    line for line in os.environ.get("REQUIRED_CHECKS_PIN", "").splitlines() if line
-)
-
-# The two publisher jobs, by key. Neither may be named for a required
-# context (A1) — that is the whole point of the split.
+# The two publisher jobs, by key. The split into two jobs is what makes
+# every failure after phase 1 fail CLOSED; one job cannot carry both.
 OPEN_JOB = "open"
 PUBLISH_JOB = "publish"
 
@@ -293,10 +268,10 @@ FIELD_FLAG_ARG = re.compile(
 )
 # The number of head_sha binding sites in the canonical publisher: the
 # phase-1 hold POST, the phase-2 verdict POST, the sweep POST, the
-# gate() helper's POST, and the ambiguity red. Pinned for the same reason
-# A8 pins the success-conclusion count — a new POST must arrive as a
-# conspicuous diff against this fence, where its head binding is read,
-# rather than as one more line nobody had to look at.
+# gate() helper's POST, and the ambiguity red. The count is what makes the
+# allowlist reach a binding site nobody added yet: a new POST must arrive
+# as a conspicuous diff against this fence, where its head binding gets
+# read, rather than as one more line nobody had to look at.
 EXPECTED_HEAD_SHA_BINDINGS = 5
 # Backstop only; the allowlist above is the fence. Case-insensitive
 # because a backstop evaded by pressing shift is not one.
@@ -465,35 +440,28 @@ if not isinstance(jobs, dict):
 
 raw_text = strip_shell_comments(open(PUBLISHER, encoding="utf-8").read())
 
-# ── A1 — no job is natively named for a required context ───────────────
+# ── A0 — the two-phase job split exists ────────────────────────────────
 #
-# Actions materialises a NATIVE check run named for each job. A job named
-# for a required context makes the publisher a second producer on the
-# lineage it exists to consolidate, and a cancelled member of a
-# concurrency group materialises exactly that check concluding `cancelled`
-# — which is not SUCCESS/SKIPPED/NEUTRAL and cannot be retired through the
-# Checks-API slot (#843, measured). Both the job KEY and its `name:` are
-# checked: the display name defaults to the key.
-for key, job in jobs.items():
-    if not isinstance(job, dict):
-        bad("FAIL: [rcp job-names] job %r does not parse to a mapping, so its" % key,
-            "      name and eligibility cannot be inspected.")
-        continue
-    display = job.get("name")
-    for candidate, source in ((key, "key"), (display, "name:")):
-        if candidate is not None and str(candidate) in REQUIRED_CHECK_NAMES:
-            bad("FAIL: [rcp job-names] job %s %r is a REQUIRED context name." % (source, candidate),
-                "      Actions materialises a native check run under that name, making",
-                "      the publisher a SECOND producer on the lineage it exists to",
-                "      consolidate — and a cancelled member of its concurrency group",
-                "      would conclude `cancelled` on a required context, which cannot",
-                "      be retired through the Checks-API slot (#843/#845).")
-
+# Every assertion below is scoped to `open` or `publish`, so their absence
+# is not merely a missing property — it silently empties the scope of most
+# of this fence. Reported here, first, rather than left to produce a run
+# that asserts nothing and prints PASS.
+#
+# What is NOT asserted: that neither job is natively NAMED for a required
+# context. `name:` may carry a `${{ }}` expression that Actions evaluates
+# and this fence cannot, so a literal comparison passes on exactly the
+# shape it exists to reject — the vacuity class #977 takes over.
 for want in (OPEN_JOB, PUBLISH_JOB):
     if want not in jobs:
-        bad("FAIL: [rcp job-names] the publisher has no %r job. The two-phase" % want,
+        bad("FAIL: [rcp job shape] the publisher has no %r job. The two-phase" % want,
             "      shape (open the hold, then publish the verdict) is what makes every",
-            "      failure after phase 1 fail CLOSED; one job cannot carry both.")
+            "      failure after phase 1 fail CLOSED; one job cannot carry both. It is",
+            "      also the scope of most assertions below, which would otherwise have",
+            "      nothing to inspect and pass vacuously.")
+    elif not isinstance(jobs[want], dict):
+        bad("FAIL: [rcp job shape] job %r does not parse to a mapping, so its" % want,
+            "      permissions, steps and concurrency cannot be inspected and every",
+            "      assertion scoped to it would pass vacuously.")
 
 open_job = jobs.get(OPEN_JOB) if isinstance(jobs.get(OPEN_JOB), dict) else None
 publish_job = jobs.get(PUBLISH_JOB) if isinstance(jobs.get(PUBLISH_JOB), dict) else None
@@ -581,86 +549,28 @@ if isinstance(triggers, dict):
             "      signal. And workflow_run matches on the exact top-level name, so a",
             "      rename on either side orphans every event-driven publish silently.")
 
-# ── A7 — chain depth stays at 2 of the documented maximum of 3 ─────────
+# A7 — "nothing may observe the publisher via workflow_run" — is REMOVED
+# here rather than deferred for coverage, because its stated cause is
+# false. GitHub documents the limit as three levels of CHAINED workflows
+# and illustrates it with A → B → C → D → E → F, where "workflows E and F
+# will not be run" — so B, C and D all run. The Merge Clearance Gate is
+# directly triggered (A), the publisher sits at B, and a workflow
+# observing the publisher sits at C: inside the cap, and it runs. The
+# blanket rejection and the spec sentence attributing it to truncation
+# both over-claimed, which a cross-agent P2 on #974 caught and this
+# measurement confirms. Whether the publisher should have observers at all
+# is a design question, not a cap consequence; it goes to #977 with the
+# publisher-name requirement that existed only to keep this scan armed.
+
+# ── A10 — the open job stays GROUPLESS ─────────────────────────────────
 #
-# The same conflation A6 avoids applies here: this scan matches siblings
-# against the publisher's own top-level `name:`, so an unnamed publisher
-# would skip the scan entirely rather than fail it. Actions names an
-# unnamed workflow after its PATH, which is a name a sibling can still
-# list in `workflow_run.workflows:` — undetected, because the loop below
-# never runs. Requiring the name is trivially satisfiable and keeps the
-# assertion armed.
-publisher_name = doc.get("name")
-if publisher_name is None or not str(publisher_name).strip():
-    bad("FAIL: [rcp chain depth] %s declares no usable top-level name:" % PUBLISHER,
-        "      (read as %r), so the sibling scan below has nothing to match" % publisher_name,
-        "      and this assertion would pass vacuously. Actions names an unnamed",
-        "      workflow after its PATH — a name a third workflow can still observe",
-        "      via workflow_run, which is the level-3 truncation this pins.")
-else:
-    try:
-        entries = sorted(os.listdir(WORKFLOW_DIR))
-    except OSError as exc:
-        entries = []
-        bad("FAIL: [rcp chain depth] could not list %s: %s" % (WORKFLOW_DIR, exc))
-    for entry in entries:
-        if not entry.endswith((".yml", ".yaml")):
-            continue
-        path = os.path.join(WORKFLOW_DIR, entry)
-        if os.path.abspath(path) == os.path.abspath(PUBLISHER):
-            continue
-        try:
-            other = load(path)
-        except Exception:
-            # A sibling that does not parse is another check's problem;
-            # this assertion is about who observes the publisher.
-            continue
-        if not isinstance(other, dict):
-            continue
-        other_on = on_block(other)
-        if not isinstance(other_on, dict):
-            continue
-        other_wr = other_on.get("workflow_run")
-        if not isinstance(other_wr, dict):
-            continue
-        if publisher_name in list(other_wr.get("workflows") or []):
-            bad("FAIL: [rcp chain depth] %s observes the publisher via" % path,
-                "      workflow_run. Chained workflow_run runs are capped at three",
-                "      levels; the publisher already sits at level 2, so a third",
-                "      observer would be silently truncated rather than rejected —",
-                "      the failure mode is a workflow that simply never runs.")
-
-# ── A3 — phase 1 is FIRST, unconditional, and actually opens the hold ──
+# (cross-agent round 3 on #867, superseding the round-2 queue-join.) The
+# hold must become visible BEFORE a mid-flight stale pass can finish, so
+# it cannot wait behind that pass in a queue. The stale-write hazard is
+# closed on the writer's side instead, by the pre-POST freshness read the
+# spec requires (§ Ordering and the stale-write defense) — whose ORDERING
+# this fence does not itself assert; see the scope note in the header.
 if open_job is not None:
-    steps = open_job.get("steps") or []
-    if not steps:
-        bad("FAIL: [rcp phase-1 position] the `open` job declares no steps, so",
-            "      nothing opens the pending entries and every later failure fails",
-            "      OPEN — the previous verdict stays usable.")
-    elif not isinstance(steps[0], dict):
-        bad("FAIL: [rcp phase-1 position] the FIRST entry of `open`.steps is not a",
-            "      mapping, so nothing opens the pending entries.")
-    else:
-        first = steps[0]
-        label = first.get("name") or "<unnamed>"
-        body = strip_shell_comments(str(first.get("run") or ""))
-        missing = [tok for tok in ('check-runs', 'in_progress') if tok not in body]
-        if missing:
-            bad("FAIL: [rcp phase-1 position] the FIRST step of `open` is %r, whose" % label,
-                "      run body is missing %s. Phase 1 must POST the" % ", ".join(missing),
-                "      in_progress entries BEFORE anything else in the job: everything",
-                "      after that line fails CLOSED only because the pending entry has",
-                "      already retired the previous verdict.")
-        if "if" in first:
-            bad("FAIL: [rcp phase-1 unconditional] the phase-1 step %r carries a" % label,
-                "      step-level if: %r. A conditional publisher skips exactly when the" % first["if"],
-                "      run it guards is the one that needed to retire a stale verdict.")
-
-    # A10 — the open job stays GROUPLESS (cross-agent round 3 on #867,
-    # superseding the round-2 queue-join). The hold must become visible
-    # BEFORE a mid-flight stale pass can finish, so it cannot wait behind
-    # that pass in a queue; the stale-write hazard is closed on the
-    # writer's side instead, by A12's freshness read.
     if "concurrency" in open_job:
         bad("FAIL: [rcp open groupless] the `open` job carries a concurrency block.",
             "      Queued, its pending entry waits behind a mid-flight stale pass —",
@@ -792,58 +702,13 @@ if GITHUB_SHA_REF.search(raw_text):
         "      PR head — every published context would land on a commit branch",
         "      protection never consults.")
 
-# ── A8 — exactly one place assigns a success conclusion ────────────────
-#
-# The conspicuousness fence already used in check_merge_clearance_gate:
-# an unearned green is the only failure direction that merges something,
-# so the number of places able to produce one is pinned at one.
-success_assignments = len(re.findall(r'conclusion="success"', raw_text))
-if success_assignments != 1:
-    bad("FAIL: [rcp success conspicuousness] %d places assign conclusion=\"success\";"
-        % success_assignments,
-        "      exactly 1 is allowed. Every other failure direction here is an",
-        "      availability cost with a known remedy; an unearned green is the only",
-        "      one that merges something. Keeping the count at one makes any new",
-        "      green-producing path a conspicuous diff rather than a quiet branch.")
-
-# ── A12 — the freshness read and head revalidation precede the POST ────
-#
-# Order is the whole mechanism. The freshness read withholds a verdict
-# whose slot already carries a NEWER pass's hold (server-assigned
-# started_at, tie-inclusive); the revalidation refuses to attach a
-# live-state verdict to a SHA the branch has moved off. Both are worthless
-# after the POST, and neither has a YAML-level expression — they live in
-# the shell, which is exactly where text matching is legitimate.
-if publish_job is not None:
-    bodies = [
-        strip_shell_comments(str(step.get("run") or ""))
-        for step in (publish_job.get("steps") or [])
-        if isinstance(step, dict) and step.get("run")
-    ]
-    body = "\n".join(bodies)
-    freshness = body.find('select(.started_at >= \\"$PASS_START\\")')
-    revalidate = body.find("live_head")
-    verdict = body.find('-f conclusion="$conclusion"')
-    if freshness < 0:
-        bad("FAIL: [rcp write ordering] the publish body has no pre-POST freshness",
-            "      read (a pending entry whose server-assigned started_at is at or",
-            "      after this pass's start). Without it an older pass overwrites the",
-            "      hold of a newer evaluation and restores a stale verdict.")
-    if revalidate < 0:
-        bad("FAIL: [rcp write ordering] the publish body never revalidates the PR's",
-            "      live head before posting. The gate scripts evaluate LIVE PR state,",
-            "      so a force-push mid-pass would attach a fresh-state verdict to the",
-            "      captured SHA — reusable if the branch ever returns to it.")
-    if verdict < 0:
-        bad("FAIL: [rcp write ordering] the publish body never posts a mapped",
-            "      conclusion, so the holds phase 1 opened are never closed.")
-    if freshness >= 0 and verdict >= 0 and freshness > verdict:
-        bad("FAIL: [rcp write ordering] the freshness read comes AFTER the verdict",
-            "      POST. Read-then-write is the entire mechanism; reversed, the check",
-            "      is decorative and the stale-write race it names is wide open.")
-    if revalidate >= 0 and verdict >= 0 and revalidate > verdict:
-        bad("FAIL: [rcp write ordering] the head revalidation comes AFTER the verdict",
-            "      POST, which is the same as not having it.")
+# A8 (exactly one `conclusion="success"` assignment) and A12 (the
+# freshness read and head revalidation precede the verdict POST) are
+# REMOVED, not weakened. Both were counts and substring positions over
+# shell text: respelling the quotes adds a second unearned-green path the
+# count never sees, and appearing-before is not executing-before. #977
+# reinstates both over a parsed shell AST, where the property is the one
+# actually asserted.
 
 # ── A5 — the native producers are RETAINED ─────────────────────────────
 for basename, (job_key, context) in NATIVE_PRODUCERS.items():
@@ -899,7 +764,7 @@ fi
 if [ "$TIER_SKIPPED" -ne 0 ]; then
   echo "check_required_check_publisher: SKIP (PyYAML unavailable — the #845 publisher assertions did NOT run)"
   echo "      Install PyYAML to enforce the publisher's trigger set, head"
-  echo "      bindings, producer eligibility and write ordering."
+  echo "      bindings, permission scope, queue shape and native producers."
   exit 0
 fi
 
