@@ -124,88 +124,59 @@ emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 
 # Read one TOP-LEVEL scalar out of a policy file.
 #
-# It recognizes a deliberately SMALL grammar and emits nothing for anything
-# outside it. That polarity is the design, not an accident, and it is what
-# changed after two review rounds each found another spelling a strip-the-bad-
-# parts parser got wrong (an unterminated quote; a `#` with no separating
-# space; a repeated key). Those are not three bugs but one: a line parser
-# cannot be argued into agreeing with YAML case by case, because the supply of
-# cases is unbounded — block scalars, flow mappings, anchors, tags and the rest
-# all still arrive here as text. So the question it answers is not "which parts
-# of this line do I strip" but "is this line unambiguously a simple scalar I
-# can prove the value of". Everything else — including every construct nobody
-# has thought of yet — is unproven, emits empty, and makes the auto-merge step
-# fail closed through its `[ -z ]` branch.
+# This is the parser `.github/workflows/agent-review.yml`'s auto-merge job used
+# to run inline against its own checkout before #788 routed the identity
+# through this script's output — byte-for-byte, so the value the
+# AUTHOR_MERGE_TOKEN check now compares is the value it computed for itself
+# then, and the switch of SOURCE does not smuggle in a change of SYNTAX.
+# `scripts/ci/check_workflow_parsers` pins these semantics case by case
+# (bare / "double-quoted" / 'single-quoted').
 #
-# What it accepts, after `<key>:` at column 0 followed by at least one space
-# or tab, is exactly one of:
-#
-#     "double quoted"     no embedded double quote
-#     'single quoted'     no embedded single quote
-#     bare-token          [A-Za-z0-9] then [A-Za-z0-9._-]*
-#
-# each optionally followed by whitespace and a `#` comment. That covers every
-# spelling of a login or a threshold, which is all this helper reads, and the
-# three cases `scripts/ci/check_workflow_parsers` pins.
-#
-# Why each rule is load-bearing at an AUTHORIZATION boundary — since #788 this
-# value IS the identity the auto-merge job requires AUTHOR_MERGE_TOKEN to
-# resolve to, so a value invented here authorizes a merge:
+# Three properties are load-bearing, and the older `grep key: | awk '{print
+# $2}'` form had none of them:
 #
 #   anchored     the key must start at column 0, so a nested `author_identity:`
 #                under another block — or the same word inside a comment — is
-#                not mistaken for the top-level setting. The unanchored
-#                `grep key: | awk '{print $2}'` this replaced matched the
-#                nested one FIRST, naming the wrong identity outright.
-#   paired       a quote is unwrapped only together with its closing partner.
-#                `author_identity: "nathanjohnpayne` is not YAML at all, and
-#                unwrapping it unconditionally (as the inline form did) turned
-#                a malformed policy into a clean login (CodeRabbit, PR #973).
-#   unquoted     but a properly paired quote IS unwrapped, because a value
-#                still wearing its quotes never matches `gh api user --jq
-#                .login` and would turn a legal spelling into a permanent
-#                merge refusal.
-#   separated    a `#` opens a comment only when whitespace precedes it — the
-#                YAML rule. `author_identity: nathanjohnpayne#disabled` is one
-#                plain scalar ending in `#disabled`; `yq` reads it that way,
-#                and stripping at a bare `#` handed the merge gate the bare
-#                login the policy did not name.
-#   unique       a repeated top-level key emits NOTHING, where an earlier draft
-#                took the first. YAML consumers resolve duplicates last-wins
-#                (`yq` does) or reject the document, so first-wins made this
-#                helper disagree with every other gate reading the same file —
-#                on which identity may merge. It also keeps the old reason the
-#                duplicate case needed handling at all: a GITHUB_OUTPUT entry
-#                is a single `key=value` LINE, and a second bare line is
-#                parsed by Actions as its own output entry. That shape became
-#                reachable once the policy could be FETCHED from another
-#                branch instead of always being the checked-out file.
+#                not mistaken for the top-level setting.
+#   unquoted     `author_identity: "nathanjohnpayne"` yields nathanjohnpayne,
+#                not "nathanjohnpayne". A quoted value compared verbatim
+#                against `gh api user --jq .login` never matches, which would
+#                turn a legal YAML spelling into a permanent merge refusal.
+#   first-wins   `exit` after the first match. A repeated scalar key would
+#                otherwise print twice, and a GITHUB_OUTPUT entry is a single
+#                `key=value` LINE — Actions parses the second one as its own
+#                output entry. That shape became reachable when the policy
+#                could be FETCHED from another branch rather than always being
+#                the checked-out file.
+#
+# KNOWN LIMIT — tracked in #978, deliberately not fixed here. These are a LINE
+# parser's semantics, not YAML's, and on a malformed or adversarial policy the
+# two diverge: an unterminated quote is stripped into a clean value; a `#` with
+# no separating space opens a comment here where YAML reads it as part of the
+# scalar; a repeated key (in this or any other spelling) resolves first-wins
+# where YAML consumers resolve last-wins or reject the document. All three are
+# inherited verbatim — this script RELOCATES the expression above, it neither
+# sharpens nor weakens it, and `agent-review.yml` ran exactly these semantics
+# in exactly this authorization role before #788 moved the source. All three
+# also require the policy on the PR's BASE branch to be malformed, which is
+# protected content, where the defect #788 names was reachable from any PR by
+# editing policy on its own branch. #978 carries the design of the parsing
+# contract — including whether this scalar should come from a real YAML parser
+# at all — because three review rounds each found one more spelling, which is
+# the shape that says stop patching and go design.
 policy_scalar() {  # <file> <key>
   awk -v key="$2:" '
     /^[^[:space:]]/ && $1 == key {
-      seen++
-      value = $0
-      sub(/^[^:]*:/, "", value)
-      # YAML requires separation space after the key. Without it this is not a
-      # scalar we can read (`key:value` is not a mapping entry at all).
-      if (value !~ /^[ \t]/) { bad = 1; next }
-      sub(/^[ \t]+/, "", value)
-      if (value ~ /^"[^"]*"([ \t]+#.*)?[ \t]*$/) {
-        value = substr(value, 2)
-        value = substr(value, 1, index(value, "\"") - 1)
-      } else if (value ~ /^\047[^\047]*\047([ \t]+#.*)?[ \t]*$/) {
-        value = substr(value, 2)
-        value = substr(value, 1, index(value, "\047") - 1)
-      } else if (value ~ /^[A-Za-z0-9][A-Za-z0-9._-]*([ \t]+#.*)?[ \t]*$/) {
-        sub(/[ \t]+#.*$/, "", value)
-        sub(/[ \t]+$/, "", value)
-      } else {
-        bad = 1
-      }
-      result = value
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^"/, "", $0)
+      gsub(/^\047/, "", $0)
+      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
     }
-    # No early exit: the whole file is scanned so a duplicate key is SEEN.
-    END { if (!bad && seen == 1) print result }
   ' "$1"
 }
 
@@ -262,10 +233,9 @@ REVIEWERS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" available_reviewer
 THRESHOLD=$(policy_scalar "$CONFIG" external_review_threshold)
 AUTHOR=$(policy_scalar "$CONFIG" author_identity)
 
-# Every emitted value is a single GITHUB_OUTPUT line: `policy_scalar` prints at
-# most once — one line for a unique key, nothing for a repeated or unreadable
-# one (see its `unique` note) — and PATHS/REVIEWERS are single-line by
-# construction because `jq -c` compacts them.
+# Every emitted value is a single GITHUB_OUTPUT line: `policy_scalar` stops at
+# the first match (see its first-wins note), and PATHS/REVIEWERS are single-line
+# by construction because `jq -c` compacts them.
 
 # The resolver's contract: a non-default base returns a TEMP file and the
 # caller owns cleanup. The default-config path is the caller's own checkout and

@@ -817,23 +817,6 @@ fi
 # from the PR BASE's policy rather than from that job's unpinned checkout. These
 # cases stay here as the spelling contract they always were; the live parser is
 # exercised end to end by tests/test_load_review_config.sh (section 3c).
-#
-# The three spellings below are the ones `policy_scalar` accepts, and it reads
-# them identically. It differs in what it does with everything ELSE: this
-# expression strips its way through any line and always prints something, while
-# `policy_scalar` recognizes only those three shapes and emits NOTHING
-# otherwise — which the auto-merge step reads as an unproven identity and fails
-# closed on. That matters on inputs where the two disagree with `yq`, the
-# parser the rest of the pipeline reads the same policy with:
-#
-#   author_identity: "nathanjohnpayne     unterminated; not YAML at all, but
-#                                         stripped here into a clean login
-#   author_identity: name#disabled        one plain scalar per YAML (and per
-#                                         `yq`); stripped here at the bare `#`
-#   the key repeated                      `yq` takes last-wins; taken here
-#                                         first-wins
-#
-# Sections 3b/3e/3f of tests/test_load_review_config.sh pin each one.
 author_identity_awk='
   /^[^[:space:]]/ && $1 == "author_identity:" {
     sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
