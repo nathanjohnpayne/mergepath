@@ -1233,8 +1233,18 @@ trigger_ack_present() {
   ')" = "true" ]
 }
 
+# Returns 0 = ack observed, 1 = ack CONFIRMED absent (at least one read
+# succeeded and saw no matching reaction), 2 = the window elapsed without a
+# single successful read, so absence was never confirmed (#966 / #980 Phase 4b
+# P1). Only 1 is grounds to re-post `@codex review`: distinguishing the unread
+# case in the log alone still let the deadline branch hand `run_trigger_ack_gate`
+# the same verdict as a confirmed absence, and a persistently unreadable
+# reactions endpoint would then re-trigger on evidence nobody ever had. That is
+# the same posture #722 already takes for a blocked account during this window —
+# when the ack state cannot be established, hand off to the poll loop rather
+# than spend a re-trigger on a guess.
 wait_for_trigger_ack() {
-  local ack_start ack_deadline now remaining sleep_for ack_rc
+  local ack_start ack_deadline now remaining sleep_for ack_rc ack_read_ok=false
 
   if [ -z "$TRIGGER_COMMENT_ID" ]; then
     log "trigger comment id unavailable — skipping eyes-ack check and continuing normal poll"
@@ -1255,6 +1265,11 @@ wait_for_trigger_ack() {
       return 0
     elif [ "$ack_rc" -eq 2 ]; then
       log "could not read trigger comment reactions this poll — treating as unread, not as a confirmed missing ack (#966)"
+    else
+      # A read that succeeded and found no matching reaction. One of these
+      # anywhere in the window is what makes the deadline verdict "absent"
+      # rather than "unknown".
+      ack_read_ok=true
     fi
 
     # If a terminal Codex signal arrives before the eyes reaction is
@@ -1278,6 +1293,10 @@ wait_for_trigger_ack() {
 
     now=$(date +%s)
     if [ "$now" -ge "$ack_deadline" ] || [ "$now" -ge "$DEADLINE" ]; then
+      if [ "$ack_read_ok" != "true" ]; then
+        log "eyes-ack window elapsed on trigger comment $TRIGGER_COMMENT_ID without a single readable reactions response — absence never confirmed, so no re-trigger (#980)"
+        return 2
+      fi
       log "no Codex eyes acknowledgment on trigger comment $TRIGGER_COMMENT_ID within ${ACK_WAIT_SECONDS}s"
       return 1
     fi
@@ -1293,7 +1312,7 @@ wait_for_trigger_ack() {
 }
 
 run_trigger_ack_gate() {
-  local retries_used=0
+  local retries_used=0 gate_rc
 
   [ "$TRIGGER_POSTED" = "true" ] || return 0
   if [ -z "$TRIGGER_COMMENT_ID" ]; then
@@ -1302,7 +1321,17 @@ run_trigger_ack_gate() {
   fi
 
   while :; do
-    if wait_for_trigger_ack; then
+    # Same `&&`/`||` capture as inside wait_for_trigger_ack: `set -e` would
+    # abort on a bare call before the status could be read.
+    wait_for_trigger_ack && gate_rc=0 || gate_rc=$?
+    if [ "$gate_rc" -eq 0 ]; then
+      return 0
+    fi
+    if [ "$gate_rc" -eq 2 ]; then
+      # The ack was never readable, so "Codex did not acknowledge" was never
+      # established. Re-posting here would spend a trigger on an unread
+      # endpoint rather than on an observed absence (#980 Phase 4b P1).
+      log "eyes-ack state unreadable for the whole window — continuing normal review poll, no trigger re-post"
       return 0
     fi
 

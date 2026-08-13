@@ -153,6 +153,14 @@ case "$endpoint" in
     printf '%s\n' "$endpoint" >>"$state_dir/ack-endpoints"
     comment_id=${endpoint#repos/owner/repo/issues/comments/}
     comment_id=${comment_id%/reactions}
+    # ONLY the reactions endpoint fails: every other read above still
+    # succeeds, which is the exact asymmetry the #980 Phase 4b P1 names
+    # (a script that keeps working can still never establish the ack).
+    if [ "$scenario" = "ack_read_fails" ]; then
+      printf '%s\n' "$comment_id" >>"$state_dir/ack-comments"
+      echo "gh: HTTP 502 reading reactions" >&2
+      exit 1
+    fi
     if [ "$scenario" = "eyes_present" ]; then
       printf '[{"user":{"login":"%s"},"content":"eyes","created_at":"%s","id":55}]\n' "$bot" "$now"
     else
@@ -292,6 +300,36 @@ test_missing_ack_retriggers_once() {
     fail "missing ack one retry: missing re-trigger log; stderr=$(cat "$dir/err.log")"
   else
     pass "missing eyes ack: exactly one re-trigger with max_ack_retries=1"
+  fi
+}
+
+# A reactions endpoint that NEVER reads must not produce a re-trigger
+# (#980 Phase 4b P1). Before the fix, the unread case (#966's rc 2) was
+# distinguished in the log only: the deadline branch returned the same 1 a
+# CONFIRMED absence returns, so run_trigger_ack_gate re-posted `@codex
+# review` on evidence that was never obtained. Same fixture as
+# test_missing_ack_retriggers_once (max_ack_retries=1) so the ONLY
+# difference is whether the read succeeds — a hardcoded pass would show up
+# as this test and that one agreeing.
+test_unreadable_ack_does_not_retrigger() {
+  local dir rc count
+  dir=$(make_case "ack-read-fails" 0 1)
+  rc=$(run_case "$dir" ack_read_fails)
+  count=$(trigger_count "$dir")
+
+  if [ "$rc" != "4" ]; then
+    fail "unreadable ack: exit $rc, expected 4; stderr=$(cat "$dir/err.log")"
+  elif [ "$count" != "1" ]; then
+    fail "unreadable ack: trigger count $count, expected 1 (the original only — no re-trigger)"
+  elif grep -q "because Codex did not acknowledge the trigger" "$dir/err.log"; then
+    # Anchored on the re-trigger sentence rather than on the bare phrase
+    # "re-posting '@codex review'": the new no-re-post log line names the
+    # thing it is NOT doing, so the loose phrase matches both outcomes.
+    fail "unreadable ack: re-triggered on an unconfirmed absence; stderr=$(cat "$dir/err.log")"
+  elif ! grep -q "absence never confirmed" "$dir/err.log"; then
+    fail "unreadable ack: missing the unread-window log line; stderr=$(cat "$dir/err.log")"
+  else
+    pass "unreadable eyes-ack window: no re-trigger, absence reported as unconfirmed"
   fi
 }
 
@@ -597,6 +635,7 @@ test_trigger_ack_present_distinguishes_read_failure_from_absence() {
 test_trigger_ack_present_distinguishes_read_failure_from_absence
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
+test_unreadable_ack_does_not_retrigger
 test_retry_cap_respected
 test_skip_path_posts_no_trigger_or_ack_check
 test_missing_comment_id_does_not_retrigger
