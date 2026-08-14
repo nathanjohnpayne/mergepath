@@ -594,7 +594,7 @@ fetch_api_array() {
     log "ERROR: failed to fetch $label: $err"
     return 3
   fi
-  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
+  printf '%s\n' "$raw" | jq -s 'add // []' 2>/dev/null || {
     log "ERROR: failed to flatten $label pagination output${err:+ (gh stderr: $err)}"
     return 3
   }
@@ -1219,24 +1219,33 @@ post_codex_trigger() {
 # before (never silently reports an ack that did not happen), but now
 # names the read failure so wait_for_trigger_ack can log it distinctly.
 trigger_ack_present() {
-  local reactions
+  local reactions found
 
   [ -n "$TRIGGER_COMMENT_ID" ] || return 1
   reactions=$(fetch_api_array "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID/reactions" "trigger comment reactions") || return 2
-  [ "$(echo "$reactions" | jq -r --arg bot "$BOT_LOGIN" --arg after "$TRIGGER_POST_TIME" '
+  # A valid-JSON-but-unexpected payload (non-array) makes the jq pipeline
+  # below fail; without this guard `found` was left empty and compared
+  # false, i.e. treated as a *confirmed* absent reaction rather than an
+  # unreadable one (CodeRabbit, PR #980 round 2).
+  found=$(echo "$reactions" | jq -r --arg bot "$BOT_LOGIN" --arg after "$TRIGGER_POST_TIME" '
     [ .[]
       | select(.user.login == $bot)
       | select(.content == "eyes")
       | select(.created_at >= $after)
     ]
     | length > 0
-  ')" = "true" ]
+  ') || return 2
+  [ "$found" = "true" ]
 }
 
-# Returns 0 = ack observed, 1 = ack CONFIRMED absent (at least one read
-# succeeded and saw no matching reaction), 2 = the window elapsed without a
-# single successful read, so absence was never confirmed (#966 / #980 Phase 4b
-# P1). Only 1 is grounds to re-post `@codex review`: distinguishing the unread
+# Returns 0 = ack observed, 1 = ack CONFIRMED absent (the LATEST poll before
+# the deadline succeeded and saw no matching reaction), 2 = the deadline was
+# reached without a successful read on the final poll, so absence was never
+# confirmed (#966 / #980 Phase 4b P1). An earlier successful-absence read does
+# NOT survive a later unread poll — only the most recent poll's outcome
+# governs the verdict, otherwise an ack landing between polls followed by a
+# run of unreadable polls would still read as "confirmed absent" from stale
+# evidence. Only 1 is grounds to re-post `@codex review`: distinguishing the unread
 # case in the log alone still let the deadline branch hand `run_trigger_ack_gate`
 # the same verdict as a confirmed absence, and a persistently unreadable
 # reactions endpoint would then re-trigger on evidence nobody ever had. That is
@@ -1265,10 +1274,16 @@ wait_for_trigger_ack() {
       return 0
     elif [ "$ack_rc" -eq 2 ]; then
       log "could not read trigger comment reactions this poll — treating as unread, not as a confirmed missing ack (#966)"
+      # A later unread poll must overrule an earlier successful-absence
+      # read (#980 Phase 4b P1 round 2): the deadline verdict reflects
+      # only the LATEST poll, not "any read in the window ever succeeded".
+      # Otherwise an ack that lands between polls, followed by a run of
+      # unreadable polls, would still report "confirmed absent" from the
+      # stale earlier read and wrongly authorize a re-trigger.
+      ack_read_ok=false
     else
-      # A read that succeeded and found no matching reaction. One of these
-      # anywhere in the window is what makes the deadline verdict "absent"
-      # rather than "unknown".
+      # A read that succeeded THIS poll and found no matching reaction.
+      # Only the most recent poll's outcome governs the deadline verdict.
       ack_read_ok=true
     fi
 

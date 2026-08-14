@@ -330,6 +330,57 @@ STUB
   rm -rf "$fetch_stub_dir"
 fi
 
+# ── 11. Behavioral: fetch_api_array's stdout must not go through an
+#       escape-interpreting `echo`. On a Bash install with `xpg_echo` set
+#       (some system shells, some user profiles), `echo "$raw"` converts a
+#       literal `\n` inside a JSON string value into a real newline before
+#       jq ever sees it, and can also collapse `\\` to `\` — corrupting
+#       valid JSON with an unescaped control character and making a
+#       healthy `gh api` response fail to parse (PR #980 Phase 4b P1,
+#       round 3). `printf '%s\n' "$raw"` never interprets escapes in its
+#       argument, so the payload survives byte-exact regardless of the
+#       shopt. Drive the LIVE function with a `gh` stub returning a body
+#       whose JSON string value contains an escaped newline and an escaped
+#       backslash, under `xpg_echo`.
+if [ -z "${FETCH_FN:-}" ]; then
+  FETCH_FN="$(sed -n '/^fetch_api_array() {/,/^}/p' "$SCRIPT")"
+fi
+if [ -z "$FETCH_FN" ]; then
+  fail "could not extract fetch_api_array from $SCRIPT (test 11)"
+else
+  escape_stub_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-fetch-escape.XXXXXX")"
+  cat >"$escape_stub_dir/gh" <<'STUB'
+#!/bin/sh
+# A single-element array whose "body" contains a JSON-escaped newline
+# (\n, two chars) and a JSON-escaped backslash (\\, two chars) — exactly
+# how gh api returns a multiline PR/issue comment body over the wire.
+printf '%s\n' '[{"id":1,"body":"line one\nline two \\ literal backslash"}]'
+STUB
+  chmod +x "$escape_stub_dir/gh"
+
+  escape_output="$(PATH="$escape_stub_dir:$PATH" bash -c '
+    set -eo pipefail
+    shopt -s xpg_echo
+    log() { :; }
+    eval "$1"
+    if out=$(fetch_api_array "repos/o/r/x" "widgets"); then
+      printf "rc=0 body=%s\n" "$(printf "%s" "$out" | jq -r ".[0].body")"
+    else
+      printf "rc=%s\n" "$?"
+    fi
+  ' _ "$FETCH_FN" 2>/dev/null)"
+
+  expected='rc=0 body=line one
+line two \ literal backslash'
+  if [ "$escape_output" = "$expected" ]; then
+    pass "fetch_api_array: a JSON payload with escaped newline/backslash round-trips under xpg_echo"
+  else
+    fail "fetch_api_array corrupted an escaped-newline/backslash payload under xpg_echo; got: $escape_output"
+  fi
+
+  rm -rf "$escape_stub_dir"
+fi
+
 echo ""
 echo "test_codex_review_request_verdict: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
