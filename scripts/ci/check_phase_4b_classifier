@@ -267,6 +267,29 @@ echo "phase-4b-classifier.sh reviewer-PAT pin tests (#533)"
 # reviewer-PAT sentinel — NOT the differing ambient GH_TOKEN — reached gh.
 SCRATCH_PAT=$(mktemp -d)
 GH_TOKEN_LOG="$SCRATCH_PAT/gh-token.log"
+
+# #951: the log records whichever GH_TOKEN reached the stub. On the happy
+# path that is one of this check's own fixture sentinels, but a run that
+# picks up an ambient OP_PREFLIGHT_REVIEWER_PAT puts a LIVE credential
+# there --- and this is a failure branch whose output goes to CI logs and
+# agent transcripts. So never dump the log. Report the assertion's own
+# terms instead: how many calls ran under each fixture sentinel, and how
+# many ran under something else. That is strictly more useful than the
+# raw dump for the thing being asserted, and it emits no token material.
+report_token_log() {
+  local log=$1 sentinel n other
+  if [ ! -s "$log" ]; then
+    echo "      gh calls recorded: 0 (the stub was never invoked)" >&2
+    return 0
+  fi
+  other=$(grep -c '^TOKEN=' "$log" || true)
+  for sentinel in reviewer-pat-sentinel ambient-bare-token ambient-only-token; do
+    n=$(grep -c "^TOKEN=$sentinel " "$log" || true)
+    other=$((other - n))
+    echo "      gh calls under fixture token '$sentinel': $n" >&2
+  done
+  echo "      gh calls under some OTHER token (value withheld --- may be a real credential, #951): $other" >&2
+}
 cat > "$SCRATCH_PAT/gh" <<GH_STUB
 #!/usr/bin/env bash
 # Record the effective GH_TOKEN per call, then return a benign payload so
@@ -291,10 +314,26 @@ chmod +x "$SCRATCH_PAT/gh"
 mkdir -p "$SCRATCH_PAT/.github"
 echo "phase_4b_default: complex-changes" > "$SCRATCH_PAT/.github/review-policy.yml"
 
+# #951: scrubbing the ENVIRONMENT is not enough to make this fixture's
+# credential state its own. phase-4b-classifier.sh sources
+# lib/preflight-helpers.sh, and load_preflight_env_vars re-populates
+# OP_PREFLIGHT_REVIEWER_PAT from the ON-DISK op-preflight cache
+# unconditionally --- even when the caller set it, and even when the
+# caller unset it. A warm cache (the normal state of an agent session)
+# therefore overwrites the sentinel below and defeats the `env -u` in the
+# fallback case, turning both assertions red on a developer machine while
+# a green CI (no cache on the runner) says nothing is wrong. Point the
+# cache lookup at an EMPTY directory so "no reviewer PAT" means it on
+# every machine. Empty, not absent: preflight_cache_dir honours the
+# override verbatim, and a missing session file is simply not fresh.
+mkdir -p "$SCRATCH_PAT/empty-cache"
+chmod 700 "$SCRATCH_PAT/empty-cache"
+
 set +e
 out=$(cd "$SCRATCH_PAT" && PATH="$SCRATCH_PAT:$PATH" \
   GH_TOKEN=ambient-bare-token \
   OP_PREFLIGHT_REVIEWER_PAT=reviewer-pat-sentinel \
+  OP_PREFLIGHT_CACHE_DIR="$SCRATCH_PAT/empty-cache" \
   MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_PAT/.github/review-policy.yml" \
   bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>&1)
 rc=$?
@@ -309,18 +348,26 @@ if [ "$rc" = "0" ] \
 else
   fail=$((fail + 1))
   echo "  FAIL: live gh api should run under the reviewer PAT (#533) (rc=$rc)" >&2
-  echo "    gh-token log:" >&2
-  sed 's/^/      /' "$GH_TOKEN_LOG" >&2 2>/dev/null || true
+  echo "    gh-token log (redacted, #951):" >&2
+  report_token_log "$GH_TOKEN_LOG"
   echo "$out" | sed 's/^/      /' >&2
 fi
 
 # Fallback: with no reviewer PAT, the pin falls back to the ambient GH_TOKEN
 # (the empty-token guard requires one or the other). The call must still run.
+# `env -u` PLUS the empty cache dir is what makes "no reviewer PAT" true
+# (#951): the case used to merely omit the assignment, so a caller
+# carrying a warm op-preflight cache handed the classifier a real PAT ---
+# which both failed the assertion and, before the redaction above,
+# printed the PAT. `env -u` alone closes only the env-var half; the cache
+# is re-read from disk regardless, so the override closes the other half.
 : > "$GH_TOKEN_LOG"
 set +e
 out=$(cd "$SCRATCH_PAT" && PATH="$SCRATCH_PAT:$PATH" \
   GH_TOKEN=ambient-only-token \
+  OP_PREFLIGHT_CACHE_DIR="$SCRATCH_PAT/empty-cache" \
   MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_PAT/.github/review-policy.yml" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT \
   bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>&1)
 rc=$?
 set -e
@@ -330,7 +377,8 @@ if [ "$rc" = "0" ] && grep -q 'TOKEN=ambient-only-token ARGS=.*pulls/99999/files
 else
   fail=$((fail + 1))
   echo "  FAIL: reviewer-PAT-absent fallback should use ambient GH_TOKEN (#533) (rc=$rc)" >&2
-  sed 's/^/      /' "$GH_TOKEN_LOG" >&2 2>/dev/null || true
+  echo "    gh-token log (redacted, #951):" >&2
+  report_token_log "$GH_TOKEN_LOG"
   echo "$out" | sed 's/^/      /' >&2
 fi
 rm -rf "$SCRATCH_PAT"
