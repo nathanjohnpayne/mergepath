@@ -242,11 +242,19 @@ echo "Test 1: addressed-elsewhere class (fix-commit detection)"
 # Thread: comment created 2026-01-01, anchored at scripts/foo.sh.
 # PR files include scripts/foo.sh. PR commits include one by
 # nathanpayne-claude on 2026-01-02 (after createdAt).
+# The short agent reply is the #990 finding-bound evidence: the fix-commit
+# proxy alone no longer concludes "actioned" anywhere, so the fixture carries
+# the per-finding artifact that makes this thread genuinely dispositioned.
+# It is deliberately <30 chars so rebuttal-recorded cannot fire and the case
+# still exercises the addressed-elsewhere fix-commit path it was written for.
 THREADS_T1='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
   {"id":"PRT_1","isResolved":false,"isOutdated":false,
    "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
    "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
-   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":1001}]}
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":1001},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in abc1234.","databaseId":1002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
   }
 ]}}}}}'
 FILES_T1='["scripts/foo.sh","scripts/bar.sh"]'
@@ -1264,9 +1272,16 @@ THREADS_T19='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount"
   {"id":"PRT_19","isResolved":false,"isOutdated":false,
    "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/resolve-pr-threads.sh","body":"Finding on a canonical path that we then fixed","createdAt":"2026-01-01T00:00:00Z"}]},
    "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
-   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Finding on a canonical path that we then fixed","databaseId":19001,"createdAt":"2026-01-01T00:00:00Z"}]}
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding on a canonical path that we then fixed","databaseId":19001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in can1234.","databaseId":19002,"createdAt":"2026-01-02T06:00:00Z"}
+   ]}
   }
 ]}}}}}'
+# The trailing short agent reply is the #990 finding-bound artifact: the
+# fix-commit proxy alone no longer concludes "actioned" anywhere, so the
+# fixture states outright that this finding was dispositioned. The case's
+# original subject is untouched — Test 28 locks the complement.
 FILES_T19='["scripts/resolve-pr-threads.sh"]'
 # Agent fix commit AFTER the finding, touching the anchored canonical file.
 COMMITS_T19='[{"sha":"can1234567","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
@@ -1316,10 +1331,15 @@ THREADS_T20='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount"
    "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
    "allComments":{"nodes":[
      {"author":{"login":"coderabbitai"},"body":"Finding later fixed","databaseId":20001,"createdAt":"2026-01-01T00:00:00Z"},
-     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred earlier; resolving for the gate.","databaseId":20002,"createdAt":"2026-01-02T00:00:00Z"}
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred earlier; resolving for the gate.","databaseId":20002,"createdAt":"2026-01-02T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in fix2020.","databaseId":20003,"createdAt":"2026-01-03T06:00:00Z"}
    ]}
   }
 ]}}}}}'
+# The trailing short agent reply is the #990 finding-bound artifact: the
+# fix-commit proxy alone no longer concludes "actioned" anywhere, so the
+# fixture states outright that this finding was dispositioned. The case's
+# original subject is untouched — Test 28 locks the complement.
 FILES_T20='["docs/x.md"]'
 COMMITS_T20='[{"sha":"fix2020abc","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
 CFILES_T20='{"fix2020abc":["docs/x.md"]}'
@@ -1431,9 +1451,16 @@ THREADS_T23='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount"
   {"id":"PRT_23","isResolved":false,"isOutdated":false,
    "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/z.md","body":"Finding fixed by a later commit","createdAt":"2026-01-01T00:00:00Z"}]},
    "commentsLast":{"nodes":[{"commit":{"oid":"OLDCOMMIT0"}}]},
-   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Finding fixed by a later commit","databaseId":23001,"createdAt":"2026-01-01T00:00:00Z"}]}
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding fixed by a later commit","databaseId":23001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in fix2323.","databaseId":23002,"createdAt":"2026-01-02T06:00:00Z"}
+   ]}
   }
 ]}}}}}'
+# The trailing short agent reply is the #990 finding-bound artifact: the
+# fix-commit proxy alone no longer concludes "actioned" anywhere, so the
+# fixture states outright that this finding was dispositioned. The case's
+# original subject is untouched — Test 28 locks the complement.
 FILES_T23='["docs/z.md"]'
 COMMITS_T23='[{"sha":"fix2323abc","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
 CFILES_T23='{"fix2323abc":["docs/z.md"]}'
@@ -1518,10 +1545,15 @@ THREADS_T25='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount"
    "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
    "allComments":{"nodes":[
      {"author":{"login":"coderabbitai"},"body":"Finding deferred earlier, then fixed","databaseId":25001,"createdAt":"2026-01-01T00:00:00Z"},
-     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred earlier; resolving for the gate.","databaseId":25002,"createdAt":"2026-01-02T00:00:00Z"}
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred earlier; resolving for the gate.","databaseId":25002,"createdAt":"2026-01-02T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in fix2525.","databaseId":25003,"createdAt":"2026-01-03T06:00:00Z"}
    ]}
   }
 ]}}}}}'
+# The trailing short agent reply is the #990 finding-bound artifact: the
+# fix-commit proxy alone no longer concludes "actioned" anywhere, so the
+# fixture states outright that this finding was dispositioned. The case's
+# original subject is untouched — Test 28 locks the complement.
 FILES_T25='["docs/upgraded.md"]'
 COMMITS_T25='[{"sha":"fix2525abc","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
 CFILES_T25='{"fix2525abc":["docs/upgraded.md"]}'
@@ -1614,6 +1646,9 @@ fi
 # also runs for routing classes: INFO line `canonical-coverage →
 # addressed-elsewhere`, tag addressed-elsewhere. (Tests 2/8/8b lock the
 # NON-actioned side: routing class → deferred-to-followup.)
+# The short agent reply supplies the #990 finding-bound evidence the upgrade
+# now requires; Test 32 locks the complement — same shape WITHOUT the reply
+# keeps the honest deferred-to-followup tag.
 # ─────────────────────────────────────────────────────────────────────
 echo
 echo "Test 27: actioned canonical-path thread auto-upgrades routing → addressed-elsewhere (#616)"
@@ -1622,7 +1657,10 @@ THREADS_T27='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount"
   {"id":"PRT_27","isResolved":false,"isOutdated":false,
    "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/resolve-pr-threads.sh","body":"Canonical-path finding that was then fixed","createdAt":"2026-01-01T00:00:00Z"}]},
    "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
-   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Canonical-path finding that was then fixed","databaseId":27001,"createdAt":"2026-01-01T00:00:00Z"}]}
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Canonical-path finding that was then fixed","databaseId":27001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed upstream.","databaseId":27002,"createdAt":"2026-01-02T06:00:00Z"}
+   ]}
   }
 ]}}}}}'
 FILES_T27='["scripts/resolve-pr-threads.sh"]'
@@ -1653,6 +1691,355 @@ else
   echo "  FAIL: actioned canonical-path thread was not upgraded to addressed-elsewhere (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Tests 28–32 (#990): --resolve-actioned must bind its evidence to the
+# FINDING, not to the anchored FILE.
+#
+# The reproduction is a single-file PR — the shape of every docs, spec,
+# wireframe and config PR, and the shape of gaycruisebingo#778 where 13
+# Codex findings (three P1) were resolved and tagged addressed-elsewhere
+# without ever being triaged. Two threads sit on the same one file; one
+# fix commit touches it; the file proxy therefore reports BOTH as actioned.
+# Exactly one thread carries a per-finding artifact.
+#
+# Shared fixture for 28/29/30/31 — thread B is identical in every case
+# except for the disposition artifact under test.
+# ─────────────────────────────────────────────────────────────────────
+
+# t990_threads <B-allComments-json> → the two-thread single-file fixture.
+t990_threads() {
+  local b_comments="$1"
+  cat <<JSON
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_990A","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"path":"wireframes/app.md","body":"P1: the state machine drops the error branch","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"chatgpt-codex-connector"},"body":"P1: the state machine drops the error branch","databaseId":99001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in c0ffee1.","databaseId":99002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  },
+  {"id":"PRT_990B","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"path":"wireframes/app.md","body":"P1: the retry loop has no backoff","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":${b_comments}}
+  }
+]}}}}}
+JSON
+}
+T990_B_BARE='[{"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"}]'
+FILES_T990='["wireframes/app.md"]'
+COMMITS_T990='[{"sha":"c0ffee1234","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
+CFILES_T990='{"c0ffee1234":["wireframes/app.md"]}'
+
+# run_t990 <log> <threads-json> [env KEY=VAL ...] → script stdout+stderr,
+# with $rc set by the caller. Always --resolve-actioned on a 1-file PR.
+run_t990() {
+  local log="$1" threads="$2"; shift 2
+  : > "$log"
+  make_gh_stub "$SCRATCH/gh-real" "$threads" "$FILES_T990" "$COMMITS_T990" "$CFILES_T990"
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  GH_ARGV_LOG="$log" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+    env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN "$@" \
+    bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo --resolve-actioned 2>&1
+}
+
+# resolved_threads <log> → the thread ids that were actually resolved.
+#
+# Read from the post-resolve readback query, whose `nodes(ids: [...])` literal
+# is exactly RESOLVED_IDS — the ids the script confirmed it mutated. The tag
+# reply and the resolve mutation both pass `-F id=`, so a field-based count
+# cannot tell them apart, and the multi-line mutation bodies in the argv log
+# defeat per-line matching. No readback means nothing was resolved.
+resolved_threads() {
+  grep -oE 'nodes\(ids: \[[^]]*\]' "$1" 2>/dev/null \
+    | grep -oE 'PRT_[A-Za-z0-9_]+' \
+    | sort -u
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 28: the reproduction. Both threads pass the file proxy; only the
+# one with an on-thread agent reply may be resolved. The never-triaged
+# P1 stays open, is counted as never-dispositioned, and forces exit 3 so
+# the caller sees that work remains.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 28: single-file PR — only the dispositioned finding resolves (#990)"
+
+set +e
+out=$(run_t990 "$SCRATCH/t28.log" "$(t990_threads "$T990_B_BARE")")
+rc=$?
+set -e
+
+t28_resolved=$(resolved_threads "$SCRATCH/t28.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 3 ] \
+   && [ "$t28_resolved" = "PRT_990A " ] \
+   && grep -q 'SKIP (never dispositioned: addressed-elsewhere rests on file-level evidence only)' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out" \
+   && grep -q 'Resolved: 1 ' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: PRT_990A resolved, the never-triaged P1 (PRT_990B) left unresolved, exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: single-file sweep not contained (rc=$rc, resolved='$t28_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 29: a per-finding LEDGER verdict is the other admissible artifact.
+# Thread B gets no reply but does get a codex-record-feedback.sh row for
+# its own comment id, recorded after the finding → both threads resolve.
+# This is the path that keeps the normal Phase 4a loop working, where
+# dispositions are recorded as 👍/👎 rather than as prose replies.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 29: a ledger verdict for the finding's comment id counts as evidence (#990)"
+
+T29_LEDGER="$SCRATCH/t29-codex-ledger.jsonl"
+jq -nc '{pr_number:778,repo:"test/repo",comment_id:99101,priority:"P1",verdict:"+1",
+         reaction:"+1",location:"pull_request_review_comment",action:"posted",
+         reviewer_identity:"nathanpayne-claude",reason:null,
+         recorded_at:"2026-01-04T00:00:00Z"}' > "$T29_LEDGER"
+
+set +e
+out=$(run_t990 "$SCRATCH/t29.log" "$(t990_threads "$T990_B_BARE")" \
+        CODEX_FEEDBACK_LEDGER="$T29_LEDGER")
+rc=$?
+set -e
+
+t29_resolved=$(resolved_threads "$SCRATCH/t29.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 0 ] \
+   && [ "$t29_resolved" = "PRT_990A PRT_990B " ] \
+   && grep -q 'verdict for finding 99101 recorded in t29-codex-ledger.jsonl' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 0' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: ledger verdict admitted; both threads resolved, exit 0"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: ledger verdict not admitted as finding-bound evidence (rc=$rc, resolved='$t29_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 30: the ledger row must post-date the latest re-raise. A verdict
+# recorded against an EARLIER round dispositioned that round, not the
+# live one — same staleness floor the rest of the gate uses (#565). Here
+# thread B carries a bot re-raise at 2026-01-05 and the ledger row is
+# from 2026-01-04, so the evidence is stale and B stays unresolved.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 30: a ledger verdict older than the latest re-raise is stale evidence (#990)"
+
+T990_B_RERAISED='[
+  {"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"},
+  {"author":{"login":"chatgpt-codex-connector"},"body":"Re-raise: backoff still missing on the second call path.","databaseId":99102,"createdAt":"2026-01-05T00:00:00Z"}
+]'
+T30_LEDGER="$SCRATCH/t30-codex-ledger.jsonl"
+jq -nc '{pr_number:778,repo:"test/repo",comment_id:99101,priority:"P1",verdict:"+1",
+         reaction:"+1",location:"pull_request_review_comment",action:"posted",
+         reviewer_identity:"nathanpayne-claude",reason:null,
+         recorded_at:"2026-01-04T00:00:00Z"}' > "$T30_LEDGER"
+COMMITS_T990_SAVE="$COMMITS_T990"
+COMMITS_T990='[{"sha":"c0ffee1234","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]'
+
+set +e
+out=$(run_t990 "$SCRATCH/t30.log" "$(t990_threads "$T990_B_RERAISED")" \
+        CODEX_FEEDBACK_LEDGER="$T30_LEDGER")
+rc=$?
+set -e
+COMMITS_T990="$COMMITS_T990_SAVE"
+
+t30_resolved=$(resolved_threads "$SCRATCH/t30.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 3 ] \
+   && [ "$t30_resolved" = "PRT_990A " ] \
+   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: pre-re-raise ledger row rejected; re-raised thread left unresolved"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale ledger row accepted (rc=$rc, resolved='$t30_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 31: this script's OWN [mergepath-resolve: ...] marker is not
+# evidence. A marker is the resolver's output — counting it would let a
+# tagged-but-readback-failed run from the old file-proxy behavior
+# bootstrap the evidence for the next run and re-sweep the same
+# never-triaged finding.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 31: a [mergepath-resolve:] marker reply is not disposition evidence (#990)"
+
+T990_B_MARKER='[
+  {"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"},
+  {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: addressed-elsewhere] addressed by commit c0ffee1 (touching wireframes/app.md).","databaseId":99103,"createdAt":"2026-01-02T00:00:00Z"}
+]'
+
+set +e
+out=$(run_t990 "$SCRATCH/t31.log" "$(t990_threads "$T990_B_MARKER")")
+rc=$?
+set -e
+
+t31_resolved=$(resolved_threads "$SCRATCH/t31.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 3 ] \
+   && [ "$t31_resolved" = "PRT_990A " ] \
+   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: marker reply rejected as self-produced; thread left unresolved"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: marker reply accepted as evidence (rc=$rc, resolved='$t31_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 32: complement of Test 27 on the --auto-resolve-bots side. That
+# mode's blunt contract is unchanged — it still resolves every current-
+# HEAD bot thread, because the operator invoking it has made the
+# disposition decision. What changes is the TAG: without finding-bound
+# evidence the honest deferred-to-followup stands instead of being
+# auto-upgraded to addressed-elsewhere. The distinction matters because
+# the daily rollup SKIPS the actioned classes, so a file-proxy upgrade
+# would stop the finding resurfacing exactly as a false resolve does.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 32: --auto-resolve-bots still resolves but keeps deferred-to-followup without finding evidence (#990)"
+
+THREADS_T32='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_32","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"path":"wireframes/app.md","body":"P1: the retry loop has no backoff","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99201,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+
+GH_ARGV_LOG="$SCRATCH/t32.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T32" "$FILES_T990" "$COMMITS_T990" "$CFILES_T990"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo --auto-resolve-bots 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'auto-upgraded' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: thread resolved under the deferral contract, tag stayed deferred-to-followup"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: file-proxy upgrade still relabels an undispositioned deferral (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 33 (#990): the ledger arm must be bound to THIS finding in THIS
+# repo, and must carry a real verdict.
+#
+# Test 29 proves a qualifying row is admitted; on its own that is
+# satisfied by "the ledger file exists and has any row", which would let
+# a ledger written for a DIFFERENT finding — the ordinary case on a
+# multi-round PR, where earlier rounds are recorded and the live one is
+# not — resolve an unread finding. That is the #990 failure with a
+# different proxy, so each conjunct of the row predicate needs its own
+# negative.
+#
+# One ledger, three non-qualifying rows, each targeting one conjunct:
+#   99999 / test/repo  / "+1"  → right repo, right verdict, WRONG finding
+#   99101 / other/repo / "+1"  → right finding+verdict, WRONG repo
+#   99101 / test/repo  / ""    → right finding+repo, NO verdict
+# Deleting any single conjunct from ledger_verdict_for_finding makes the
+# corresponding row qualify and resolves PRT_990B, so this one case is a
+# live assertion for all three.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 33: ledger rows for another finding, another repo, or no verdict are not evidence (#990)"
+
+T33_LEDGER="$SCRATCH/t33-codex-ledger.jsonl"
+{
+  jq -nc '{pr_number:778,repo:"test/repo",comment_id:99999,priority:"P1",verdict:"+1",
+           reaction:"+1",location:"pull_request_review_comment",action:"posted",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+  jq -nc '{pr_number:778,repo:"other/repo",comment_id:99101,priority:"P1",verdict:"+1",
+           reaction:"+1",location:"pull_request_review_comment",action:"posted",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+  jq -nc '{pr_number:778,repo:"test/repo",comment_id:99101,priority:"P1",verdict:"",
+           reaction:"",location:"pull_request_review_comment",action:"skipped",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+} > "$T33_LEDGER"
+
+set +e
+out=$(run_t990 "$SCRATCH/t33.log" "$(t990_threads "$T990_B_BARE")" \
+        CODEX_FEEDBACK_LEDGER="$T33_LEDGER")
+rc=$?
+set -e
+
+t33_resolved=$(resolved_threads "$SCRATCH/t33.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 3 ] \
+   && [ "$t33_resolved" = "PRT_990A " ] \
+   && grep -q 'SKIP (never dispositioned: addressed-elsewhere rests on file-level evidence only)' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out" \
+   && ! grep -q 'verdict for finding' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: none of the three near-miss rows admitted; PRT_990B left unresolved"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a non-matching ledger row was accepted as finding-bound evidence (rc=$rc, resolved='$t33_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 34 (#990, Codex P2 round 1 of #998): the marker exclusion rejects
+# the GENERATED marker reply, not every reply that mentions one.
+#
+# Test 31 locks the exclusion itself. Its complement is that the
+# exclusion must not over-reach: a substantive agent reply whose text
+# quotes an earlier marker — the natural way to write "that tag is stale,
+# here is what actually happened" — is a real disposition of the finding,
+# and a substring test discarded the whole reply as if this script had
+# emitted it. The finding was then reported never-dispositioned and left
+# unresolved, which is #990's own failure mode running backwards: a read
+# finding treated as unread.
+#
+# post_tag_reply emits "[mergepath-resolve: $class] $rationale", so the
+# generated form is the marker at the START of the body. Anchoring there
+# separates the two cases exactly.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 34: a reply that mentions a marker mid-sentence is still disposition evidence (#998 r1)"
+
+T990_B_QUOTES_MARKER='[
+  {"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"},
+  {"author":{"login":"nathanpayne-claude"},"body":"The [mergepath-resolve: deferred-to-followup] tag on this thread is stale — the backoff landed in c0ffee1.","databaseId":99104,"createdAt":"2026-01-02T00:00:00Z"}
+]'
+
+set +e
+out=$(run_t990 "$SCRATCH/t34.log" "$(t990_threads "$T990_B_QUOTES_MARKER")")
+rc=$?
+set -e
+
+t34_resolved=$(resolved_threads "$SCRATCH/t34.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 0 ] \
+   && [ "$t34_resolved" = "PRT_990A PRT_990B " ] \
+   && grep -q 'Skipped (never-dispositioned): 0' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: marker-quoting reply admitted; both threads resolved, exit 0"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a substantive reply was discarded because it mentions a marker (rc=$rc, resolved='$t34_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
 fi
 
 echo
