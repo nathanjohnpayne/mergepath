@@ -427,7 +427,14 @@ echo "resolve-pr-threads.sh keyring fallback (no empty GH_TOKEN trap)"
 cat > "$SCRATCH/gh" <<'GH_STUB'
 #!/usr/bin/env bash
 echo "ENV_GH_TOKEN_PRESENT=${GH_TOKEN+yes}" >> "$GH_ARGV_LOG"
-echo "ENV_GH_TOKEN_VALUE=${GH_TOKEN:-<unset>}" >> "$GH_ARGV_LOG"
+# #951: record the LENGTH, never the value. Nothing asserts on the value,
+# the failure branch below prints this whole log, and the token reaching
+# the stub is not always a fixture one --- resolve-pr-threads.sh
+# auto-sources the op-preflight cache, so a regression in the very
+# behaviour under test would put a real PAT here and then print it.
+# Length still separates the three states this case cares about: absent,
+# present-but-empty (0), present-and-set (>0).
+echo "ENV_GH_TOKEN_LENGTH=${#GH_TOKEN}" >> "$GH_ARGV_LOG"
 case "$1" in
   api)
     case "$2" in
@@ -459,9 +466,9 @@ rc=$?
 set -e
 
 # Stub captured env state. Assert GH_TOKEN was NOT set (or NOT empty).
-# An empty GH_TOKEN would show ENV_GH_TOKEN_PRESENT=yes + ENV_GH_TOKEN_VALUE=<unset>
-# (which renders as just the unset placeholder). Need to confirm absence
-# of the "ENV_GH_TOKEN_PRESENT=yes" line on graphql calls.
+# An empty GH_TOKEN would show ENV_GH_TOKEN_PRESENT=yes + ENV_GH_TOKEN_LENGTH=0.
+# Need to confirm absence of the "ENV_GH_TOKEN_PRESENT=yes" line on
+# graphql calls.
 if [ "$rc" = "0" ] && ! grep -q "^ENV_GH_TOKEN_PRESENT=yes$" "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: GH_TOKEN unset (not empty) when no PAT available — keyring fallback engaged"
