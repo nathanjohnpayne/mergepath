@@ -533,10 +533,32 @@ EOF
 # name it yields `heads/<branch>` instead of `<branch>` — which is exactly the
 # branch/tag short-name collision Case 26 guards against. `lstrip=2` drops the
 # literal `refs/heads/` prefix and nothing else.
+#
+# An unreadable inventory is NOT an empty one (#920 finding 1).
+# `%(upstream:track)` makes git resolve every branch's upstream through
+# `remote.origin.fetch`, and `git config` stores refspecs it never validates:
+# a stored `refs/heads/main:refs/remotes/origin/*` — wildcard DESTINATION, no
+# wildcard in the source — is a pair git rejects, so for-each-ref exits 128
+# with `fatal: invalid refspec` for the repository as a whole. Before this
+# guard that 128 travelled the pipeline through `pipefail` into `set -e` and
+# killed the audit with NO output and no diagnostic; the operator saw an empty
+# terminal and a bare exit 128. Fail closed the way worktree_records() already
+# does for its porcelain read — name the failure and return non-zero, so the
+# caller aborts instead of reading an empty $GONE_FILE as "nothing is gone".
 gone_branches() {
-  cd "$MAIN_WORKTREE" || return 0
-  LC_ALL=C git for-each-ref \
-    --format='%(refname:lstrip=2) %(upstream:track)' refs/heads/ 2>/dev/null | awk '
+  cd "$MAIN_WORKTREE" || {
+    echo "worktree-cleanup.sh: error: could not enter the main worktree to enumerate branch tracking state" >&2
+    return 1
+  }
+  local branch_state branch_state_rc=0
+  branch_state=$(LC_ALL=C git for-each-ref \
+    --format='%(refname:lstrip=2) %(upstream:track)' refs/heads/ 2>/dev/null) \
+    || branch_state_rc=$?
+  if [ "$branch_state_rc" -ne 0 ]; then
+    echo "worktree-cleanup.sh: error: could not read local branch tracking state (git for-each-ref exit ${branch_state_rc}) — check \`git config --get-all remote.origin.fetch\` for a refspec git rejects" >&2
+    return 1
+  fi
+  printf '%s\n' "$branch_state" | awk '
     {
       # Trailing field is the tracking atom; the name is everything before it.
       if ($NF == "[gone]") {
@@ -614,12 +636,15 @@ stale_unpruned_branches() {
   # A non-default refspec makes the tracking-ref → remote-head mapping
   # unknowable here; decline rather than guess (origin_fetch_is_conventional).
   origin_fetch_is_conventional || return 0
-  local snapshot snapshot_rc=0 heads_file
+  local snapshot snapshot_rc=0
   snapshot=$(git ls-remote --heads origin 2>/dev/null) || snapshot_rc=$?
   [ "$snapshot_rc" -eq 0 ] || return 0
-  heads_file=$(mktemp "${TMPDIR:-/tmp}/wcleanup-remoteheads.XXXXXX") || return 0
+  # Trap-visible global, not a `local` (#920 finding 2): under `set -e` any
+  # failure between mktemp and the inline `rm -f` below — a broken pipe, a
+  # SIGINT — exits without ever reaching the removal and leaks the file.
+  HEADS_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-remoteheads.XXXXXX") || return 0
   # `<sha>\t<refname>` per line; keep the refname column only.
-  printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$heads_file"
+  printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$HEADS_FILE"
   local branch upstream remote_head
   # Git ref names may contain `|`, but cannot contain a tab. Use a tab record
   # separator so every branch/upstream pair round-trips losslessly.
@@ -644,10 +669,11 @@ stale_unpruned_branches() {
     remote_head="refs/heads/${upstream#refs/remotes/origin/}"
     # Exact full-path match: `-Fx` so a branch named `feat` is never
     # satisfied by the remote having `feature`.
-    grep -Fxq -- "$remote_head" "$heads_file" && continue
+    grep -Fxq -- "$remote_head" "$HEADS_FILE" && continue
     echo "$branch"
   done
-  rm -f "$heads_file"
+  rm -f "$HEADS_FILE"
+  HEADS_FILE=""
 }
 
 # Parse `git worktree list --porcelain -z` into NUL-delimited six-field
@@ -658,14 +684,16 @@ stale_unpruned_branches() {
 # BRANCH is the short ref name (without refs/heads/) or empty for detached;
 # DETACHED is "1" iff the entry was marked detached.
 worktree_records() {
-  local line path branch detached head locked lock_reason ref records_file
+  local line path branch detached head locked lock_reason ref
   cd "$MAIN_WORKTREE" || return 1
-  records_file=$(mktemp "${TMPDIR:-/tmp}/wcleanup-worktree-records.XXXXXX") || {
+  # Trap-visible global, not a `local` (#920 finding 2): see HEADS_FILE above.
+  RECORDS_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-worktree-records.XXXXXX") || {
     echo "worktree-cleanup.sh: error: could not create a temporary worktree-record snapshot" >&2
     return 1
   }
-  if ! git worktree list --porcelain -z >"$records_file" 2>/dev/null; then
-    rm -f "$records_file"
+  if ! git worktree list --porcelain -z >"$RECORDS_FILE" 2>/dev/null; then
+    rm -f "$RECORDS_FILE"
+    RECORDS_FILE=""
     echo "worktree-cleanup.sh: error: could not read git worktree porcelain records" >&2
     return 1
   fi
@@ -692,14 +720,15 @@ worktree_records() {
         lock_reason=${lock_reason# }
         ;;
     esac
-  done <"$records_file"
+  done <"$RECORDS_FILE"
   # Porcelain records normally end in a blank NUL field. Keep the flush for
   # older Git variants that omit the final separator.
   if [ -n "$path" ]; then
     printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
       "$path" "$branch" "$detached" "$head" "$locked" "$lock_reason"
   fi
-  rm -f "$records_file"
+  rm -f "$RECORDS_FILE"
+  RECORDS_FILE=""
 }
 
 # ── Gather state ──────────────────────────────────────────────────────
@@ -712,7 +741,17 @@ worktree_records() {
 GONE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-gone.XXXXXX")
 REC_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-rec.XXXXXX")
 STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
-trap 'rm -f "$GONE_FILE" "$REC_FILE" "$STALE_UNPRUNED_FILE"' EXIT
+# EVERY mktemp site in this script is registered here (#920 finding 2). The
+# four later ones — HEADS_FILE and RECORDS_FILE inside the helpers above,
+# MERGE_SWEEP_FILE and KNOWN_FILE further down — used to rely solely on an
+# inline `rm -f` placed after their work. Under `set -e` any failure in
+# between (a failed `git` call, a closed pipe, SIGINT) exits before that line
+# and leaks the file into TMPDIR. The inline removals stay — they keep TMPDIR
+# tidy during a long run and they blank the variable so this trap has nothing
+# left to do — and the `${VAR:-}` expansions make the trap safe to fire before
+# any of the four has been assigned. `rm -f ''` is a silent no-op on both GNU
+# and BSD rm, so the empty slots cost nothing.
+trap 'rm -f "$GONE_FILE" "$REC_FILE" "$STALE_UNPRUNED_FILE" "${HEADS_FILE:-}" "${RECORDS_FILE:-}" "${MERGE_SWEEP_FILE:-}" "${KNOWN_FILE:-}"' EXIT
 
 gone_branches >"$GONE_FILE"
 worktree_records >"$REC_FILE"
@@ -1216,6 +1255,7 @@ while IFS=$'\t' read -r LOCAL_BRANCH SWEEP_SRC; do
   fi
 done <"$MERGE_SWEEP_FILE"
 rm -f "$MERGE_SWEEP_FILE"
+MERGE_SWEEP_FILE=""
 
 # ── Orphan scan ───────────────────────────────────────────────────────
 ORPHAN_ROOT="$MAIN_WORKTREE/.claude/worktrees"
@@ -1304,6 +1344,7 @@ if [ -d "$ORPHAN_ROOT" ]; then
     fi
   done
   rm -f "$KNOWN_FILE"
+  KNOWN_FILE=""
 fi
 
 # ── Summary + exit ────────────────────────────────────────────────────
