@@ -314,10 +314,26 @@ chmod +x "$SCRATCH_PAT/gh"
 mkdir -p "$SCRATCH_PAT/.github"
 echo "phase_4b_default: complex-changes" > "$SCRATCH_PAT/.github/review-policy.yml"
 
+# #951: scrubbing the ENVIRONMENT is not enough to make this fixture's
+# credential state its own. phase-4b-classifier.sh sources
+# lib/preflight-helpers.sh, and load_preflight_env_vars re-populates
+# OP_PREFLIGHT_REVIEWER_PAT from the ON-DISK op-preflight cache
+# unconditionally --- even when the caller set it, and even when the
+# caller unset it. A warm cache (the normal state of an agent session)
+# therefore overwrites the sentinel below and defeats the `env -u` in the
+# fallback case, turning both assertions red on a developer machine while
+# a green CI (no cache on the runner) says nothing is wrong. Point the
+# cache lookup at an EMPTY directory so "no reviewer PAT" means it on
+# every machine. Empty, not absent: preflight_cache_dir honours the
+# override verbatim, and a missing session file is simply not fresh.
+mkdir -p "$SCRATCH_PAT/empty-cache"
+chmod 700 "$SCRATCH_PAT/empty-cache"
+
 set +e
 out=$(cd "$SCRATCH_PAT" && PATH="$SCRATCH_PAT:$PATH" \
   GH_TOKEN=ambient-bare-token \
   OP_PREFLIGHT_REVIEWER_PAT=reviewer-pat-sentinel \
+  OP_PREFLIGHT_CACHE_DIR="$SCRATCH_PAT/empty-cache" \
   MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_PAT/.github/review-policy.yml" \
   bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>&1)
 rc=$?
@@ -339,14 +355,17 @@ fi
 
 # Fallback: with no reviewer PAT, the pin falls back to the ambient GH_TOKEN
 # (the empty-token guard requires one or the other). The call must still run.
-# `env -u` is what makes "no reviewer PAT" true (#951): the case used to
-# merely omit the assignment, so a caller carrying a warm op-preflight
-# cache handed the classifier a real PAT --- which both failed the
-# assertion and, before the redaction above, printed the PAT.
+# `env -u` PLUS the empty cache dir is what makes "no reviewer PAT" true
+# (#951): the case used to merely omit the assignment, so a caller
+# carrying a warm op-preflight cache handed the classifier a real PAT ---
+# which both failed the assertion and, before the redaction above,
+# printed the PAT. `env -u` alone closes only the env-var half; the cache
+# is re-read from disk regardless, so the override closes the other half.
 : > "$GH_TOKEN_LOG"
 set +e
 out=$(cd "$SCRATCH_PAT" && PATH="$SCRATCH_PAT:$PATH" \
   GH_TOKEN=ambient-only-token \
+  OP_PREFLIGHT_CACHE_DIR="$SCRATCH_PAT/empty-cache" \
   MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_PAT/.github/review-policy.yml" \
   env -u OP_PREFLIGHT_REVIEWER_PAT \
   bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>&1)
