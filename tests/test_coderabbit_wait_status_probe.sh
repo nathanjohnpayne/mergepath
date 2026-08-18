@@ -1976,6 +1976,29 @@ _⚠️ Potential issue_ after an inverted pair"
   summary_names_head "changed during the review from $b40 to $h40" "$h40" && bad="$bad sha-refusal-prose"
   # A longer digest CONTAINING the head is not the head.
   summary_names_head "between $b40 and $h64 here" "$h40" && bad="$bad sha-superstring"
+  # #968: the demotion predicate. It fires only when the body makes a head
+  # claim AND that claim is about another commit — never on a silent body, and
+  # never when one of its ranges DOES end at this head.
+  summary_names_only_other_head "between $b40 and $b40 today" "$h40" || bad="$bad other-head-missed"
+  summary_names_only_other_head "between $b40 and $h40 today" "$h40" && bad="$bad other-head-on-match"
+  # AC3: a body carrying no machine-readable range makes no head claim, so the
+  # freshness floor stays the only test — the predicate must stay silent.
+  summary_names_only_other_head "$clean_body" "$h40" && bad="$bad other-head-on-silent"
+  summary_names_only_other_head "$chat_body" "$h40" && bad="$bad other-head-on-chat"
+  # A range-end SHORTER or LONGER than 40 hex is not the live format; treating
+  # it as a claim would demote on a wording drift, which fails toward a stall.
+  summary_names_only_other_head "between $b40 and deadbeef today" "$h40" && bad="$bad other-head-on-short-end"
+  # An edited summary that names the head somewhere in a LATER range still
+  # names it, so the conjunction must clear it even with an earlier range for
+  # another commit above.
+  summary_names_only_other_head "between $b40 and $b40 then between $b40 and $h40" "$h40" \
+    && bad="$bad other-head-ignores-later-match"
+  # A 64-hex range end is not the live format either, and the two predicates
+  # must agree about that: summary_names_head rejects it as a match, and this
+  # one must reject it as a CLAIM. Widening only one to 40..64 would make a
+  # SHA-256 object name a claim that summary_names_head can never satisfy —
+  # a permanent demotion, i.e. a stall, on every head in such a repo.
+  summary_names_only_other_head "between $b40 and $h64 here" "$h40" && bad="$bad other-head-on-64hex"
   summary_blocking_marker_present "$inside_body" && bad="$bad premerge-stripped"
   summary_blocking_marker_present "$outside_body" || bad="$bad real-marker"
   summary_blocking_marker_present "$trunc_body" || bad="$bad truncated"
@@ -1983,9 +2006,9 @@ _⚠️ Potential issue_ after an inverted pair"
   # latched START would swallow the real marker after it.
   summary_blocking_marker_present "$inverted_body" || bad="$bad inverted-delims"
   if [ -z "$bad" ]; then
-    pass "#851 helpers: stanza vacuity guard, 40-hex token boundary, pre-merge strip"
+    pass "#851/#968 helpers: stanza vacuity guard, 40-hex token boundary, pre-merge strip, other-head demotion"
   else
-    fail "#851 helpers:$bad"
+    fail "#851/#968 helpers:$bad"
   fi
 }
 

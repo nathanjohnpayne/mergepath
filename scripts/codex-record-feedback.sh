@@ -350,10 +350,20 @@ NBSP=$'\xc2\xa0'
 fetch_api_array() {
   local endpoint=$1
   local label=$2
-  local raw
+  local raw flattened kind
   raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
+  flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) \
     || die 3 "failed to flatten $label pagination output"
+  # #967: `add` over a one-element stream returns that element unchanged, so a
+  # 200 whose body is a JSON OBJECT survives the flatten unexamined and reads
+  # downstream as an empty list — here, a round whose findings all vanish from
+  # the ledger. A read that succeeded but is not a list is a FAILED read, never
+  # an empty result.
+  kind=$(printf '%s' "$flattened" | jq -r 'type' 2>/dev/null) \
+    || die 3 "failed to read the type of the flattened $label payload"
+  [ "$kind" = "array" ] \
+    || die 3 "$label ($endpoint) came back as a JSON $kind, not a JSON array — the response was READ but is unusable as a list (#967)"
+  printf '%s\n' "$flattened"
 }
 
 # Normalize an arbitrary findings input into the canonical findings array:

@@ -597,10 +597,28 @@ fetch_api_array() {
     log "ERROR: failed to fetch $label: $err"
     return 3
   fi
-  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
+  local flattened kind
+  flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) || {
     log "ERROR: failed to flatten $label pagination output${err:+ (gh stderr: $err)}"
     return 3
   }
+  # #967: `add` over a one-element stream returns that element unchanged, so a
+  # 200 whose body is a JSON OBJECT survives the flatten unexamined, and every
+  # downstream `.[]` iterates that object's VALUES rather than a list's
+  # elements. In scan_codex_state that is a confident "no Codex reviews, no
+  # findings, no reactions" — a clean verdict manufactured by an unreadable
+  # payload. A read that succeeded but is not a list is a FAILED read (rc 3,
+  # which every scan_codex_state call site already propagates since #966),
+  # never an empty result.
+  kind=$(printf '%s' "$flattened" | jq -r 'type' 2>/dev/null) || {
+    log "ERROR: failed to read the type of the flattened $label payload"
+    return 3
+  }
+  if [ "$kind" != "array" ]; then
+    log "ERROR: $label ($endpoint) came back as a JSON $kind, not a JSON array — the response was READ but is unusable as a list (#967)"
+    return 3
+  fi
+  printf '%s\n' "$flattened"
 }
 
 # --- Phase 4a entry gate (#486) ---------------------------------------------

@@ -343,10 +343,22 @@ fi
 fetch_api_array() {
   local endpoint=$1
   local label=$2
-  local raw
+  local raw flattened kind
   raw=$(gh api --paginate "$endpoint" 2>&1) || die 2 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
+  flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) \
     || die 2 "failed to flatten $label pagination output"
+  # #967: `add` over a one-element stream returns that element unchanged, so a
+  # 200 whose body is a JSON OBJECT survives the flatten unexamined, and every
+  # downstream `.[]` then iterates that object's VALUES — none, for `{}`. On
+  # THIS script that is a required gate reporting zero blocking findings off a
+  # payload nobody could read, which is the #942 shape from the other side. A
+  # read that succeeded but is not a list is a FAILED read (die 2 — fail
+  # closed), never an empty result. Same assertion as scripts/coderabbit-wait.sh.
+  kind=$(printf '%s' "$flattened" | jq -r 'type' 2>/dev/null) \
+    || die 2 "failed to read the type of the flattened $label payload"
+  [ "$kind" = "array" ] \
+    || die 2 "$label ($endpoint) came back as a JSON $kind, not a JSON array — the response was READ but is unusable as a list (#967)"
+  printf '%s\n' "$flattened"
 }
 
 # --- fetch PR metadata ------------------------------------------------------

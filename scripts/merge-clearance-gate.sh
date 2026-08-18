@@ -312,10 +312,23 @@ clear_pass() {  # <reason>
 }
 
 fetch_api_array() {  # <endpoint> <label>
-  local endpoint=$1 label=$2 raw
+  local endpoint=$1 label=$2 raw flattened kind
   raw=$(gh api --paginate "$endpoint" 2>&1) || die 2 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
+  flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) \
     || die 2 "failed to flatten $label pagination output"
+  # #967: `add` over a one-element stream returns that element unchanged, so a
+  # 200 whose body is a JSON OBJECT survives the flatten unexamined. Every
+  # downstream `.[]` then iterates that object's VALUES — of which an empty
+  # object has none — so an unusable payload reads as a confident empty list.
+  # On this gate that reaches `[.[].filename]`, where an empty list means no
+  # protected path matched. A read that succeeded but is not a list is reported
+  # as a FAILED read, never as an empty result. Same assertion, same reason, as
+  # scripts/coderabbit-wait.sh.
+  kind=$(printf '%s' "$flattened" | jq -r 'type' 2>/dev/null) \
+    || die 2 "failed to read the type of the flattened $label payload"
+  [ "$kind" = "array" ] \
+    || die 2 "$label ($endpoint) came back as a JSON $kind, not a JSON array — the response was READ but is unusable as a list (#967)"
+  printf '%s\n' "$flattened"
 }
 
 # --- merge-clearance required-check enforcement probe (#772) ----------------
