@@ -1324,6 +1324,22 @@ HARNESS
   [ "$rc" = "3" ] || fail "32: unparseable review object exited $rc, expected 3"
   [ ! -s "$WORKDIR/emit-bad.out" ] || fail "32: unparseable review object still wrote JSON to stdout"
 
+  # 2b. Codex P2 on #995: `jq empty` is a WEAKER question than the one
+  #     `--argjson` asks, and the gap is not hypothetical — it exits 0 on a
+  #     whitespace-only string (zero JSON values) and on two concatenated
+  #     documents, both of which `--argjson` rejects. With the parse test alone
+  #     the guard passed and the run still died inside jq: rc 2 with no stdout,
+  #     the exact findings/infra misclassification #985 exists to remove. So
+  #     the invariant is "exactly one JSON value", asserted from both sides.
+  rc=0; bash "$harness" cleared 0 '   ' 0 >"$WORKDIR/emit-ws.out" 2>"$WORKDIR/emit-ws.err" || rc=$?
+  [ "$rc" = "3" ] || fail "32: whitespace-only review object exited $rc, expected 3 (jq empty accepts it; --argjson does not)"
+  [ ! -s "$WORKDIR/emit-ws.out" ] || fail "32: whitespace-only review object still wrote JSON to stdout"
+  grep -qi 'jq: invalid JSON text' "$WORKDIR/emit-ws.err" && fail "32: whitespace-only still dying inside jq rather than refusing the invariant"
+  rc=0; bash "$harness" cleared 0 '{} {}' 0 >"$WORKDIR/emit-multi.out" 2>"$WORKDIR/emit-multi.err" || rc=$?
+  [ "$rc" = "3" ] || fail "32: two JSON documents exited $rc, expected 3 — each parses, but together they are not one value"
+  [ ! -s "$WORKDIR/emit-multi.out" ] || fail "32: two JSON documents still wrote JSON to stdout"
+  grep -qi 'jq: invalid JSON text' "$WORKDIR/emit-multi.err" && fail "32: multi-document still dying inside jq rather than refusing the invariant"
+
   # 3. A well-formed emission is unchanged — the guard must cost nothing on the
   #    path every caller actually takes, INCLUDING the literal `null` that the
   #    timeout / paused / skipped emits pass.

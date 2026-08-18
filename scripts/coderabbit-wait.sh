@@ -1523,8 +1523,18 @@ summary_stanzas_all_benign() {
 # names the abandoned NEW head in refusal prose ("changed during the review
 # from X to Y"), which a position-blind token match accepts. The boundary
 # class keeps a longer digest containing the head from matching.
+#
+# The body is fed to grep by HERE-STRING, never through a pipe (Codex P1 on
+# #995). `set -o pipefail` is on, and `grep -q` exits the instant it matches:
+# on a body larger than the platform's pipe buffer whose range line is near
+# the start, the producer is still writing when grep leaves, takes SIGPIPE,
+# and the pipeline reports 141. Reproduced at 200 KiB: the predicate answers
+# "no match" on a body that plainly matches. Its two callers both take that
+# answer in the SAFE direction — this one only ever declines to clear — but
+# `summary_names_only_other_head` below does not, so the idiom is corrected in
+# both rather than left to be re-derived from which caller happens to read it.
 summary_names_head() {
-  printf '%s' "$1" | grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)"
+  grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)" <<<"$1"
 }
 
 # True when the body carries a machine-readable commits range AND none of its
@@ -1562,8 +1572,17 @@ summary_names_head() {
 # keeps the `fresh_at >= HEAD_ANCHOR` floor the only test for silent bodies
 # exactly as before (#968 AC3). Failing the other way would stall every PR on
 # CodeRabbit's next wording change.
+#
+# HERE-STRING, not a pipe, and the direction is why (Codex P1 on #995). With
+# `set -o pipefail` on, `printf … | grep -q` reports 141 when grep matches and
+# leaves before the producer has finished writing — which happens once the body
+# exceeds the pipe buffer and the range line sits near its start. `|| return 1`
+# then reads that as "this body makes no head claim", the demotion never fires,
+# and the previous head's summary clears this head: the exact #968 false clear
+# this predicate exists to close, restored on the large summaries most likely
+# to carry one. Reproduced at 200 KiB before the fix.
 summary_names_only_other_head() {  # <body> <head_sha>
-  printf '%s' "$1" | grep -qiE "between [0-9a-f]{40} and [0-9a-f]{40}([^0-9a-fA-F]|\$)" || return 1
+  grep -qiE "between [0-9a-f]{40} and [0-9a-f]{40}([^0-9a-fA-F]|\$)" <<<"$1" || return 1
   summary_names_head "$1" "$2" && return 1
   return 0
 }
@@ -2948,10 +2967,23 @@ emit_json_and_exit() {
   # bug, not a provider state — so it takes the infra exit and names its caller.
   #
   # The literal string `null` is NOT a violation: `timeout`, `paused` and
-  # `skipped` legitimately emit `review: null`, and `jq empty` accepts it.
-  # `jq -e` would not — it exits 1 on a `null` output — which is why the check
-  # below is a parse test and not a truthiness test.
-  if [ -z "$review_json" ] || ! printf '%s' "$review_json" | jq empty >/dev/null 2>&1; then
+  # `skipped` legitimately emit `review: null`, and a parse test accepts it.
+  # `jq -e` would not — it exits 1 on a `null` output — so the check is a parse
+  # test and not a truthiness test.
+  #
+  # The parse test is `jq -s 'length' == 1`, not `jq empty` (Codex P2 on #995).
+  # `jq empty` asks only "does every value here parse", which is a WEAKER
+  # question than the one `--argjson` asks: it exits 0 on a whitespace-only
+  # string (zero values) and on two concatenated documents (`{} {}`), both of
+  # which `--argjson` rejects — so the guard passed and the run still died
+  # inside jq with rc 2 and no stdout, which is precisely the
+  # findings/infra misclassification this change exists to remove. Slurping
+  # counts values instead: 0 for empty-or-whitespace, 2 for the double
+  # document, exactly 1 for `null` and for any single object, and a parse
+  # failure makes jq exit non-zero with no count at all.
+  local review_json_values
+  review_json_values=$(jq -s 'length' 2>/dev/null <<<"$review_json") || review_json_values=""
+  if [ -z "$review_json" ] || [ "$review_json_values" != "1" ]; then
     die 3 "internal invariant violated: emit_json_and_exit was called from ${FUNCNAME[1]:-<top-level>} (line ${BASH_LINENO[0]:-?}) with a review object jq cannot accept for status '$status' — refusing to emit rather than dying inside jq with the findings exit code (#985)"
   fi
 

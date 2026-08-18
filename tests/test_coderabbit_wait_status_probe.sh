@@ -2020,6 +2020,7 @@ test_851_summary_helpers_unit() {
   # tests/test_audit_branch_protection.sh.
   local snip="$WORKDIR/summary-helpers.sh" h40 h64 bad=""
   local clean_body chat_body failure_body inside_body outside_body trunc_body
+  local big_pad big_other_head big_this_head
   eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END)=' \
     "$ROOT/scripts/coderabbit-wait.sh")"
   awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
@@ -2098,6 +2099,25 @@ _⚠️ Potential issue_ after an inverted pair"
   # SHA-256 object name a claim that summary_names_head can never satisfy —
   # a permanent demotion, i.e. a stall, on every head in such a repo.
   summary_names_only_other_head "between $b40 and $h64 here" "$h40" && bad="$bad other-head-on-64hex"
+  # Codex P1 on #995: the predicate must not lose its claim on a LARGE body.
+  # Fed through `printf | grep -q` under this suite's own `set -o pipefail`,
+  # grep leaves the moment it matches, the producer takes SIGPIPE once the body
+  # exceeds the pipe buffer, the pipeline reports 141, and `|| return 1` reads
+  # a plainly-matching body as making no head claim — restoring the #968 false
+  # clear on exactly the summaries most likely to carry one. 200 KiB is well
+  # past the 64 KiB buffer on both Linux and macOS, and the range sits at the
+  # START so grep is certain to be done first. `summary_names_head` is asserted
+  # on the same body because it shares the idiom (its own callers take a false
+  # negative in the safe direction, so only this one is a false clear).
+  big_pad=$(printf '%*s' 200000 '' | tr ' ' 'x')
+  big_other_head="between $b40 and $b40 today
+$big_pad"
+  big_this_head="between $b40 and $h40 today
+$big_pad"
+  [ "${#big_other_head}" -gt 65536 ] || bad="$bad large-body-fixture-too-small"
+  summary_names_only_other_head "$big_other_head" "$h40" || bad="$bad other-head-lost-on-large-body"
+  summary_names_only_other_head "$big_this_head" "$h40" && bad="$bad other-head-fired-on-large-current-body"
+  summary_names_head "$big_this_head" "$h40" || bad="$bad names-head-lost-on-large-body"
   summary_blocking_marker_present "$inside_body" && bad="$bad premerge-stripped"
   summary_blocking_marker_present "$outside_body" || bad="$bad real-marker"
   summary_blocking_marker_present "$trunc_body" || bad="$bad truncated"
