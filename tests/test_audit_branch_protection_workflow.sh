@@ -248,7 +248,7 @@ run_audit_step() {  # <stub rc> <gh token>  → prints step stdout+stderr; sets 
   local stub_rc="$1" token="$2"
   local outfile="$WORKDIR/gh-output.$$"
   : > "$outfile"
-  rm -f "$WS/audit-output.txt" "$WS/fleet-summary.txt"
+  rm -f "$WS/audit-output.txt" "$WS/fleet-summary.txt" "$WS/step-summary.md"
   STEP_RC=0
   STEP_TEXT="$(
     cd "$WS" && \
@@ -256,9 +256,11 @@ run_audit_step() {  # <stub rc> <gh token>  → prints step stdout+stderr; sets 
     GH_TOKEN="$token" \
     HUB_REPO="owner/hub" \
     GITHUB_OUTPUT="$outfile" \
+    GITHUB_STEP_SUMMARY="$WS/step-summary.md" \
       bash "$WORKDIR/audit-step.sh" 2>&1
   )" || STEP_RC=$?
   STEP_OUTPUTS="$(cat "$outfile")"
+  STEP_SUMMARY="$(cat "$WS/step-summary.md" 2>/dev/null || true)"
   rm -f "$outfile"
 }
 
@@ -326,6 +328,83 @@ elif echo "$STEP_OUTPUTS" | grep -q "^result="; then
   fail "empty-token path must NOT set a result: [$STEP_OUTPUTS]"
 else
   pass "empty BRANCH_PROTECTION_AUDIT_TOKEN → fails before auditing, names secret + scope"
+fi
+
+# The guard above was already correct, and the audit still never produced a
+# single result: the secret was never provisioned, so every run since the
+# workflow landed aborted here and the only outward sign was a red cron in
+# the Actions tab (#989). A guard that fails correctly but illegibly is
+# still a silent audit. The failure therefore has to restate itself on the
+# RUN PAGE — the surface a human opens — and say what has to be created.
+if [ -z "$STEP_SUMMARY" ]; then
+  fail "empty-token abort wrote no job summary — the run page would show a red cron and nothing else (#989)"
+else
+  missing=""
+  # Each of these is a thing the owner cannot act without. They are asserted
+  # individually so a partial diagnostic cannot pass as a complete one.
+  for needle in \
+    'DID NOT RUN' \
+    'not a clean result' \
+    'BRANCH_PROTECTION_AUDIT_TOKEN' \
+    'Administration: read' \
+    'REVIEWER_ASSIGNMENT_TOKEN' \
+    'repository **admin**' \
+    'Secrets and variables' \
+    'docs/architecture/0002-branch-protection-enforcement-posture.md' \
+    'event_type=branch-protection-audit'
+  do
+    printf '%s' "$STEP_SUMMARY" | grep -qF "$needle" || missing="$missing [$needle]"
+  done
+
+  # `Administration: write` may appear only as the thing NOT to grant.
+  # Guidance that reads as an instruction to grant it is worse than none:
+  # it would hand a weekly unattended credential the power to rewrite the
+  # protection this audit exists to check.
+  write_ok=1
+  if printf '%s' "$STEP_SUMMARY" | grep -qF 'Administration: write'; then
+    if ! printf '%s' "$STEP_SUMMARY" | grep -F 'Administration: write' | grep -qi 'never'; then
+      write_ok=0
+    fi
+  fi
+
+  if [ -n "$missing" ]; then
+    fail "empty-token job summary is missing:$missing"
+  elif [ "$write_ok" -ne 1 ]; then
+    fail "the job summary must never present 'Administration: write' as the thing to provision"
+  else
+    pass "empty-token abort writes a self-describing job summary naming the secret, scope, identity, location and dispatch (#989)"
+  fi
+fi
+
+# The runbook the summary points at has to exist and has to be the section
+# it claims. A dangling pointer in the one message a stuck owner reads is
+# the same failure as no message.
+RUNBOOK="$ROOT/docs/architecture/0002-branch-protection-enforcement-posture.md"
+if [ ! -f "$RUNBOOK" ]; then
+  fail "the job summary points at $RUNBOOK, which does not exist"
+elif ! grep -q '^### Provisioning `BRANCH_PROTECTION_AUDIT_TOKEN`' "$RUNBOOK"; then
+  fail "$RUNBOOK has no '### Provisioning \`BRANCH_PROTECTION_AUDIT_TOKEN\`' section for the summary to point at"
+elif ! grep -q 'Administration: read' "$RUNBOOK"; then
+  fail "$RUNBOOK does not name the required scope"
+else
+  pass "the provisioning runbook the failure points at exists and names the scope (#989)"
+fi
+
+# Whitespace is not a token. An Actions secret set to " " exists, bumps
+# updated_at and is indistinguishable from a populated one on the Settings
+# page — so it must hit the same loud guard rather than reach the audit and
+# produce a fleet of 403s that reads as flaky infrastructure.
+run_audit_step 0 "   "
+if [ "$STEP_RC" -eq 0 ]; then
+  fail "a whitespace-only BRANCH_PROTECTION_AUDIT_TOKEN must fail the job, got rc=0"
+elif echo "$STEP_TEXT" | grep -q "stub fleet audit ran"; then
+  fail "a whitespace-only token must be rejected BEFORE the audit runs"
+elif ! echo "$STEP_TEXT" | grep -q "BRANCH_PROTECTION_AUDIT_TOKEN"; then
+  fail "whitespace-token diagnostic must name the secret; got: $STEP_TEXT"
+elif [ -z "$STEP_SUMMARY" ]; then
+  fail "a whitespace-only token must write the same self-describing job summary"
+else
+  pass "a whitespace-only BRANCH_PROTECTION_AUDIT_TOKEN is treated as empty, not as a token (#989)"
 fi
 
 # ===========================================================================
