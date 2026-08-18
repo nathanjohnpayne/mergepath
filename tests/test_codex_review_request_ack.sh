@@ -153,29 +153,6 @@ case "$endpoint" in
     printf '%s\n' "$endpoint" >>"$state_dir/ack-endpoints"
     comment_id=${endpoint#repos/owner/repo/issues/comments/}
     comment_id=${comment_id%/reactions}
-    # ONLY the reactions endpoint fails: every other read above still
-    # succeeds, which is the exact asymmetry the #980 Phase 4b P1 names
-    # (a script that keeps working can still never establish the ack).
-    if [ "$scenario" = "ack_read_fails" ]; then
-      printf '%s\n' "$comment_id" >>"$state_dir/ack-comments"
-      echo "gh: HTTP 502 reading reactions" >&2
-      exit 1
-    fi
-    # First poll reads clean (confirmed absence); every poll after that
-    # fails. Before the round-2 fix, `ack_read_ok` latched true on the
-    # first successful-absence read and never reset, so a run of later
-    # failures still reported "confirmed absent" at the deadline (#980
-    # Phase 4b P1 round 2) instead of "unread since the last poll".
-    if [ "$scenario" = "ack_flaky_then_fails" ]; then
-      printf '%s\n' "$comment_id" >>"$state_dir/ack-comments"
-      poll_num=$(wc -l <"$state_dir/ack-endpoints" | tr -d ' ')
-      if [ "$poll_num" -eq 1 ]; then
-        printf '[]\n'
-        exit 0
-      fi
-      echo "gh: HTTP 502 reading reactions (flaky, poll $poll_num)" >&2
-      exit 1
-    fi
     if [ "$scenario" = "eyes_present" ]; then
       printf '[{"user":{"login":"%s"},"content":"eyes","created_at":"%s","id":55}]\n' "$bot" "$now"
     else
@@ -315,63 +292,6 @@ test_missing_ack_retriggers_once() {
     fail "missing ack one retry: missing re-trigger log; stderr=$(cat "$dir/err.log")"
   else
     pass "missing eyes ack: exactly one re-trigger with max_ack_retries=1"
-  fi
-}
-
-# A reactions endpoint that NEVER reads must not produce a re-trigger
-# (#980 Phase 4b P1). Before the fix, the unread case (#966's rc 2) was
-# distinguished in the log only: the deadline branch returned the same 1 a
-# CONFIRMED absence returns, so run_trigger_ack_gate re-posted `@codex
-# review` on evidence that was never obtained. Same fixture as
-# test_missing_ack_retriggers_once (max_ack_retries=1) so the ONLY
-# difference is whether the read succeeds — a hardcoded pass would show up
-# as this test and that one agreeing.
-test_unreadable_ack_does_not_retrigger() {
-  local dir rc count
-  dir=$(make_case "ack-read-fails" 0 1)
-  rc=$(run_case "$dir" ack_read_fails)
-  count=$(trigger_count "$dir")
-
-  if [ "$rc" != "4" ]; then
-    fail "unreadable ack: exit $rc, expected 4; stderr=$(cat "$dir/err.log")"
-  elif [ "$count" != "1" ]; then
-    fail "unreadable ack: trigger count $count, expected 1 (the original only — no re-trigger)"
-  elif grep -q "because Codex did not acknowledge the trigger" "$dir/err.log"; then
-    # Anchored on the re-trigger sentence rather than on the bare phrase
-    # "re-posting '@codex review'": the new no-re-post log line names the
-    # thing it is NOT doing, so the loose phrase matches both outcomes.
-    fail "unreadable ack: re-triggered on an unconfirmed absence; stderr=$(cat "$dir/err.log")"
-  elif ! grep -q "absence never confirmed" "$dir/err.log"; then
-    fail "unreadable ack: missing the unread-window log line; stderr=$(cat "$dir/err.log")"
-  else
-    pass "unreadable eyes-ack window: no re-trigger, absence reported as unconfirmed"
-  fi
-}
-
-# The first poll in the ack window reads a confirmed absence, then every
-# poll after that fails to read the reactions endpoint at all (#980 Phase
-# 4b P1 round 2). The deadline verdict must reflect only the LATEST poll:
-# since that poll never read successfully, the window closes "unread", not
-# "confirmed absent" — so, same as test_unreadable_ack_does_not_retrigger,
-# there must be no re-trigger. ack_wait=12 with the real 5s poll interval
-# forces polls at t=0 (succeeds), 5, 10, 12 (all fail), so the stale first
-# read would otherwise survive three failed re-polls to the deadline.
-test_intermittent_ack_read_does_not_retrigger() {
-  local dir rc count
-  dir=$(make_case "ack-flaky-then-fails" 12 1 60)
-  rc=$(run_case "$dir" ack_flaky_then_fails 1)
-  count=$(trigger_count "$dir")
-
-  if [ "$rc" != "4" ]; then
-    fail "intermittent ack read: exit $rc, expected 4; stderr=$(cat "$dir/err.log")"
-  elif [ "$count" != "1" ]; then
-    fail "intermittent ack read: trigger count $count, expected 1 (no re-trigger on a stale earlier read)"
-  elif grep -q "because Codex did not acknowledge the trigger" "$dir/err.log"; then
-    fail "intermittent ack read: re-triggered on a stale confirmed-absence read; stderr=$(cat "$dir/err.log")"
-  elif ! grep -q "absence never confirmed" "$dir/err.log"; then
-    fail "intermittent ack read: missing the unread-window log line; stderr=$(cat "$dir/err.log")"
-  else
-    pass "intermittent ack read (succeeds once, then fails): no re-trigger, latest poll wins over a stale earlier read"
   fi
 }
 
@@ -634,83 +554,8 @@ test_missing_identity_checker_skips_bridge() {
   fi
 }
 
-# trigger_ack_present must distinguish "confirmed no ack" (read succeeded,
-# no matching reaction) from "could not read the reactions" (#966). Before
-# the fix, a failed fetch_api_array read inside trigger_ack_present fell
-# through the same jq comparison as a genuine absence, so the caller could
-# never tell the two apart. Extract the LIVE function so this asserts the
-# actual emission path, not a hand-copied stand-in.
-test_trigger_ack_present_distinguishes_read_failure_from_absence() {
-  local script="$ROOT/scripts/codex-review-request.sh"
-  local fn
-  fn="$(sed -n '/^trigger_ack_present() {/,/^}/p' "$script")"
-  if [ -z "$fn" ]; then
-    fail "could not extract trigger_ack_present from $script"
-    return
-  fi
-
-  local read_failure_rc
-  read_failure_rc="$(bash -c '
-    set -eo pipefail
-    fetch_api_array() { return 3; }   # reactions endpoint unreachable
-    TRIGGER_COMMENT_ID=123 BOT_LOGIN=chatgpt-codex-connector TRIGGER_POST_TIME="2026-01-01T00:00:00Z" REPO=owner/repo
-    eval "$1"
-    trigger_ack_present && echo rc=0 || echo "rc=$?"
-  ' _ "$fn")"
-
-  local absent_rc
-  absent_rc="$(bash -c '
-    set -eo pipefail
-    fetch_api_array() { echo "[]"; }   # read succeeds, no reactions at all
-    TRIGGER_COMMENT_ID=123 BOT_LOGIN=chatgpt-codex-connector TRIGGER_POST_TIME="2026-01-01T00:00:00Z" REPO=owner/repo
-    eval "$1"
-    trigger_ack_present && echo rc=0 || echo "rc=$?"
-  ' _ "$fn")"
-
-  if [ "$read_failure_rc" = "rc=2" ] && [ "$absent_rc" = "rc=1" ]; then
-    pass "trigger_ack_present: read failure (rc=2) is distinct from confirmed absence (rc=1)"
-  else
-    fail "trigger_ack_present did not distinguish read failure from absence: read_failure=$read_failure_rc absent=$absent_rc"
-  fi
-}
-
-# A valid-JSON-but-unexpected reactions payload (e.g. an error object
-# instead of an array) makes the jq filter inside trigger_ack_present fail.
-# Before the fix, that failure left `found` unset/empty, which the plain
-# `[ "$found" = "true" ]` test reports as a normal "false" — i.e. a
-# CONFIRMED absence (rc=1) rather than an unreadable result (rc=2), the
-# same false-positive class as a hard fetch failure (CodeRabbit, PR #980).
-test_trigger_ack_present_maps_bad_payload_to_unreadable() {
-  local script="$ROOT/scripts/codex-review-request.sh"
-  local fn
-  fn="$(sed -n '/^trigger_ack_present() {/,/^}/p' "$script")"
-  if [ -z "$fn" ]; then
-    fail "could not extract trigger_ack_present from $script"
-    return
-  fi
-
-  local bad_payload_rc
-  bad_payload_rc="$(bash -c '
-    set -eo pipefail
-    fetch_api_array() { echo "{\"message\":\"Not Found\"}"; }   # not an array
-    TRIGGER_COMMENT_ID=123 BOT_LOGIN=chatgpt-codex-connector TRIGGER_POST_TIME="2026-01-01T00:00:00Z" REPO=owner/repo
-    eval "$1"
-    trigger_ack_present && echo rc=0 || echo "rc=$?"
-  ' _ "$fn" 2>/dev/null)"
-
-  if [ "$bad_payload_rc" = "rc=2" ]; then
-    pass "trigger_ack_present: an unexpected (non-array) payload reads as unreadable (rc=2), not confirmed absence"
-  else
-    fail "trigger_ack_present treated a bad payload as confirmed absence instead of unreadable: got $bad_payload_rc"
-  fi
-}
-
-test_trigger_ack_present_distinguishes_read_failure_from_absence
-test_trigger_ack_present_maps_bad_payload_to_unreadable
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
-test_unreadable_ack_does_not_retrigger
-test_intermittent_ack_read_does_not_retrigger
 test_retry_cap_respected
 test_skip_path_posts_no_trigger_or_ack_check
 test_missing_comment_id_does_not_retrigger

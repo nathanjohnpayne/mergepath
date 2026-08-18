@@ -564,7 +564,11 @@ die() {
 # `set -euo pipefail` and exits the script with status 3 — unaffected by
 # this change. A call site INSIDE a function body must propagate the
 # status explicitly (`|| return 3` / `|| die 3 …`); see scan_codex_state
-# and trigger_ack_present below for the two call sites that needed it.
+# below for the call site migrated here. The other in-function site,
+# trigger_ack_present, is deliberately NOT migrated in this change: its
+# unread-vs-absent distinction is the eyes-ack deadline rule, specified
+# and tested as a whole in #987. It keeps the pre-existing behaviour —
+# an unreadable read reads as a missing ack — until then.
 #
 # The two streams are captured SEPARATELY. `gh api` writes diagnostics to
 # stderr on calls that SUCCEED — deprecation notices, retry/backoff
@@ -584,8 +588,7 @@ fetch_api_array() {
     return 3
   }
   # `raw=$(…)` on its own would trip errexit before rc could be read; the
-  # `|| rc=$?` form captures the status without aborting (same reason
-  # wait_for_trigger_ack uses the &&/|| pair below).
+  # `|| rc=$?` form captures the status without aborting.
   raw=$(gh api --paginate "$endpoint" 2>"$errfile") || rc=$?
   err=$(cat "$errfile" 2>/dev/null) || err=""
   rm -f "$errfile"
@@ -594,7 +597,7 @@ fetch_api_array() {
     log "ERROR: failed to fetch $label: $err"
     return 3
   fi
-  printf '%s\n' "$raw" | jq -s 'add // []' 2>/dev/null || {
+  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
     log "ERROR: failed to flatten $label pagination output${err:+ (gh stderr: $err)}"
     return 3
   }
@@ -1210,50 +1213,23 @@ post_codex_trigger() {
   reset_review_wait_clock
 }
 
-# Returns 0 = ack present, 1 = confirmed absent (read succeeded, no
-# matching reaction), 2 = could not read the reactions endpoint (#966).
-# Before the fix, a failed read fell through to the same "absent" outcome
-# as a genuinely-checked absence — the caller could not tell "Codex has
-# not acked yet" from "we don't know", and treated both as grounds to
-# eventually re-post `@codex review`. Fails open the same DIRECTION as
-# before (never silently reports an ack that did not happen), but now
-# names the read failure so wait_for_trigger_ack can log it distinctly.
 trigger_ack_present() {
-  local reactions found
+  local reactions
 
   [ -n "$TRIGGER_COMMENT_ID" ] || return 1
-  reactions=$(fetch_api_array "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID/reactions" "trigger comment reactions") || return 2
-  # A valid-JSON-but-unexpected payload (non-array) makes the jq pipeline
-  # below fail; without this guard `found` was left empty and compared
-  # false, i.e. treated as a *confirmed* absent reaction rather than an
-  # unreadable one (CodeRabbit, PR #980 round 2).
-  found=$(echo "$reactions" | jq -r --arg bot "$BOT_LOGIN" --arg after "$TRIGGER_POST_TIME" '
+  reactions=$(fetch_api_array "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID/reactions" "trigger comment reactions")
+  [ "$(echo "$reactions" | jq -r --arg bot "$BOT_LOGIN" --arg after "$TRIGGER_POST_TIME" '
     [ .[]
       | select(.user.login == $bot)
       | select(.content == "eyes")
       | select(.created_at >= $after)
     ]
     | length > 0
-  ') || return 2
-  [ "$found" = "true" ]
+  ')" = "true" ]
 }
 
-# Returns 0 = ack observed, 1 = ack CONFIRMED absent (the LATEST poll before
-# the deadline succeeded and saw no matching reaction), 2 = the deadline was
-# reached without a successful read on the final poll, so absence was never
-# confirmed (#966 / #980 Phase 4b P1). An earlier successful-absence read does
-# NOT survive a later unread poll — only the most recent poll's outcome
-# governs the verdict, otherwise an ack landing between polls followed by a
-# run of unreadable polls would still read as "confirmed absent" from stale
-# evidence. Only 1 is grounds to re-post `@codex review`: distinguishing the unread
-# case in the log alone still let the deadline branch hand `run_trigger_ack_gate`
-# the same verdict as a confirmed absence, and a persistently unreadable
-# reactions endpoint would then re-trigger on evidence nobody ever had. That is
-# the same posture #722 already takes for a blocked account during this window —
-# when the ack state cannot be established, hand off to the poll loop rather
-# than spend a re-trigger on a guess.
 wait_for_trigger_ack() {
-  local ack_start ack_deadline now remaining sleep_for ack_rc ack_read_ok=false
+  local ack_start ack_deadline now remaining sleep_for
 
   if [ -z "$TRIGGER_COMMENT_ID" ]; then
     log "trigger comment id unavailable — skipping eyes-ack check and continuing normal poll"
@@ -1264,27 +1240,9 @@ wait_for_trigger_ack() {
   ack_deadline=$((ack_start + ACK_WAIT_SECONDS))
 
   while :; do
-    # `set -e` is active: a bare `trigger_ack_present; ack_rc=$?` would
-    # abort the script the moment trigger_ack_present returns non-zero,
-    # before ack_rc is even assigned. The `&&`/`||` pair captures the
-    # status without tripping errexit.
-    trigger_ack_present && ack_rc=0 || ack_rc=$?
-    if [ "$ack_rc" -eq 0 ]; then
+    if trigger_ack_present; then
       log "Codex eyes acknowledgment received on trigger comment $TRIGGER_COMMENT_ID"
       return 0
-    elif [ "$ack_rc" -eq 2 ]; then
-      log "could not read trigger comment reactions this poll — treating as unread, not as a confirmed missing ack (#966)"
-      # A later unread poll must overrule an earlier successful-absence
-      # read (#980 Phase 4b P1 round 2): the deadline verdict reflects
-      # only the LATEST poll, not "any read in the window ever succeeded".
-      # Otherwise an ack that lands between polls, followed by a run of
-      # unreadable polls, would still report "confirmed absent" from the
-      # stale earlier read and wrongly authorize a re-trigger.
-      ack_read_ok=false
-    else
-      # A read that succeeded THIS poll and found no matching reaction.
-      # Only the most recent poll's outcome governs the deadline verdict.
-      ack_read_ok=true
     fi
 
     # If a terminal Codex signal arrives before the eyes reaction is
@@ -1308,10 +1266,6 @@ wait_for_trigger_ack() {
 
     now=$(date +%s)
     if [ "$now" -ge "$ack_deadline" ] || [ "$now" -ge "$DEADLINE" ]; then
-      if [ "$ack_read_ok" != "true" ]; then
-        log "eyes-ack window elapsed on trigger comment $TRIGGER_COMMENT_ID without a single readable reactions response — absence never confirmed, so no re-trigger (#980)"
-        return 2
-      fi
       log "no Codex eyes acknowledgment on trigger comment $TRIGGER_COMMENT_ID within ${ACK_WAIT_SECONDS}s"
       return 1
     fi
@@ -1327,7 +1281,7 @@ wait_for_trigger_ack() {
 }
 
 run_trigger_ack_gate() {
-  local retries_used=0 gate_rc
+  local retries_used=0
 
   [ "$TRIGGER_POSTED" = "true" ] || return 0
   if [ -z "$TRIGGER_COMMENT_ID" ]; then
@@ -1336,17 +1290,7 @@ run_trigger_ack_gate() {
   fi
 
   while :; do
-    # Same `&&`/`||` capture as inside wait_for_trigger_ack: `set -e` would
-    # abort on a bare call before the status could be read.
-    wait_for_trigger_ack && gate_rc=0 || gate_rc=$?
-    if [ "$gate_rc" -eq 0 ]; then
-      return 0
-    fi
-    if [ "$gate_rc" -eq 2 ]; then
-      # The ack was never readable, so "Codex did not acknowledge" was never
-      # established. Re-posting here would spend a trigger on an unread
-      # endpoint rather than on an observed absence (#980 Phase 4b P1).
-      log "eyes-ack state unreadable for the whole window — continuing normal review poll, no trigger re-post"
+    if wait_for_trigger_ack; then
       return 0
     fi
 
