@@ -894,8 +894,32 @@ die() {
 # comment objects) is a neighbour of this, not the same thing — that one is
 # caught by the per-comment derive guards, which only run once something has
 # already agreed the value is a list.
+#
+# ORDER IS THE WHOLE POINT (Codex P2 / Phase 4b P1 on #995). Asserting the type
+# of the FLATTENED value is too late, because `add // []` manufactures the very
+# array it would then be asked to judge: a 200 whose body is the JSON value
+# `null`, a 200 with an EMPTY body, and a `--paginate` stream of only `null`s
+# all reduce to `null` under `add` and are rewritten to `[]` by the fallback,
+# after which `type` reports `array` and the caller reads a confident "no
+# reviews on this head". A `null` page MIXED with real pages is worse: `add`
+# skips it silently, so a partially-unreadable pagination looks complete. So
+# the stream is judged first — at least one document, and every document an
+# array — and only then flattened. A genuinely empty page (`[]`) is one array
+# document and still passes, which is the distinction the flattened-value test
+# structurally cannot make.
 crw_flatten_api_array() {  # <raw> <label> <endpoint> — stdout: array; rc 1 on refusal
-  local raw=$1 label=$2 endpoint=$3 flattened kind
+  local raw=$1 label=$2 endpoint=$3 flattened kind shape
+  shape=$(jq -rs 'if length == 0 then "no JSON documents at all"
+                  elif any(.[]; type != "array") then
+                    "a stream of " + ([.[] | type] | unique | join("+")) + " values"
+                  else "array" end' 2>/dev/null <<<"$raw") || {
+    log "ERROR: failed to read the document shape of the $label ($endpoint) response"
+    return 1
+  }
+  if [ "$shape" != "array" ]; then
+    log "ERROR: $label ($endpoint) came back as $shape, not a stream of JSON arrays — the response was READ but is UNUSABLE as a list, so it is reported as a failed read rather than as an empty result (#967). The empty-list fallback is deliberately NOT applied here: it would turn an unreadable response into a confident zero."
+    return 1
+  fi
   flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) || {
     log "ERROR: failed to flatten $label ($endpoint) pagination output"
     return 1

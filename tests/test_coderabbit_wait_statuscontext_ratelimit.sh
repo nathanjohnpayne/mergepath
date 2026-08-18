@@ -360,6 +360,19 @@ case "\$endpoint" in
       printf '{}\n'
       exit 0
     fi
+    # CODERABBIT_TEST_REVIEWS_RAW=<text> (#995): serve an arbitrary 200 body,
+    # so the response modes \`add // []\` REWRITES rather than passes through
+    # are drivable — a body of \`null\`, an EMPTY body, and a pagination stream
+    # carrying a null page. Empty is spelled by the sentinel <EMPTY>, because a
+    # set-but-empty variable is indistinguishable from an unset one here.
+    if [ -n "\${CODERABBIT_TEST_REVIEWS_RAW:-}" ]; then
+      if [ "\$CODERABBIT_TEST_REVIEWS_RAW" = "<EMPTY>" ]; then
+        printf ''
+      else
+        printf '%s\n' "\$CODERABBIT_TEST_REVIEWS_RAW"
+      fi
+      exit 0
+    fi
     printf '[]\n' ;;
   repos/owner/repo/pulls/999/comments) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
@@ -1194,11 +1207,49 @@ test_non_array_reviews_body_does_not_clear() {
   # The diagnostic must name BOTH the endpoint and the type actually received
   # (#967 acceptance 1) — a bare "could not read" would leave an operator
   # guessing which surface and which shape.
-  grep -q 'came back as a JSON object, not a JSON array' "$dir/err.log" \
+  grep -q 'came back as a stream of object values, not a stream of JSON arrays' "$dir/err.log" \
     || fail "27: expected a diagnostic naming the received type; err=$(tail -4 "$dir/err.log")"
-  grep -q 'repos/owner/repo/pulls/999/reviews) came back as a JSON' "$dir/err.log" \
+  grep -q 'repos/owner/repo/pulls/999/reviews) came back as' "$dir/err.log" \
     || fail "27: the diagnostic should name the endpoint it read; err=$(tail -4 "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "27: #967 — a 200 whose body is a JSON object is an infra exit naming the type, never an empty result"
+}
+
+# --- Test 27b: #967 ordering — the fallback must not manufacture the array ---
+# Codex P2 and the Phase 4b P1 on #995. Asserting the type of the FLATTENED
+# value is too late: `add // []` REWRITES three unusable response modes into a
+# valid empty array before anything judges them — a body of `null`, an EMPTY
+# body, and a pagination stream carrying a null page (which `add` skips in
+# silence, so a partially-unreadable read looks complete). Each one is a
+# confident "no reviews on this head" manufactured by the fallback, which on
+# the polling arm is a clearance. The judgement therefore has to be made on the
+# RAW stream, and test 28 is the control that a genuine `[]` still clears.
+test_fallback_manufactured_array_does_not_clear() {
+  local dir rc mode before=$FAIL
+  for mode in 'null' '<EMPTY>' '[]
+null'; do
+    rc=0
+    dir=$(make_case "reviews-fallback-$(printf '%s' "$mode" | tr -dc 'a-zA-Z' | head -c 6)x" \
+      "$REVIEW_BODY_CLEAN" "$STATUS_TIME" "Review rate limited")
+    (
+      cd "$dir"
+      PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+        CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+        CODERABBIT_TEST_STATE_DIR="$dir/state" \
+        CODERABBIT_TEST_REVIEWS_RAW="$mode" \
+        CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+        CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+        ./scripts/coderabbit-wait.sh 999 owner/repo \
+        >"$dir/out.json" 2>"$dir/err.log"
+    ) || rc=$?
+    [ "$rc" != "0" ] \
+      || fail "27b: FALSE-CLEARED (exit 0) on a reviews body of [$mode] that the empty-list fallback rewrote into []; err=$(tail -4 "$dir/err.log")"
+    grep -q '"status": *"cleared"' "$dir/out.json" 2>/dev/null \
+      && fail "27b: emitted a cleared verdict off a manufactured empty array for [$mode]"
+    [ "$rc" = "3" ] || fail "27b: expected exit 3 (infra) for [$mode], got $rc; err=$(tail -4 "$dir/err.log")"
+    grep -q 'repos/owner/repo/pulls/999/reviews) came back as' "$dir/err.log" \
+      || fail "27b: the diagnostic should name the endpoint it read for [$mode]; err=$(tail -4 "$dir/err.log")"
+  done
+  [ "$FAIL" -ne "$before" ] || pass "27b: #967 ordering — a null body, an empty body and a null page are failed reads, not the empty list 'add // []' would have made of them"
 }
 
 # --- Test 28: #967 escape — a genuine empty list still clears ---------------
@@ -1424,6 +1475,7 @@ test_failed_fast_path_comment_read_does_not_clear
 test_failed_fast_path_comment_decode_does_not_clear
 test_failed_poll_comment_decode_does_not_clear
 test_non_array_reviews_body_does_not_clear
+test_fallback_manufactured_array_does_not_clear
 test_empty_reviews_array_still_clears
 test_summary_naming_other_head_does_not_clear
 test_summary_naming_current_head_still_clears

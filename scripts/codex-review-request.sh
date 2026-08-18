@@ -597,7 +597,26 @@ fetch_api_array() {
     log "ERROR: failed to fetch $label: $err"
     return 3
   fi
-  local flattened kind
+  local flattened kind shape
+  # #967, ordering half (Codex P2 / Phase 4b P1 on #995). The stream is judged
+  # BEFORE the flatten, because `add // []` manufactures the array the type
+  # assertion below would otherwise judge: a body of `null`, an EMPTY body and
+  # a stream of only `null`s all reduce to `null` under `add` and are rewritten
+  # to `[]`, and a `null` page mixed with real pages is skipped silently. In
+  # scan_codex_state that is a clean Codex verdict manufactured by an
+  # unreadable payload. At least one document, every document an array; a
+  # genuinely empty page (`[]`) is one array document and still passes.
+  shape=$(jq -rs 'if length == 0 then "no JSON documents at all"
+                  elif any(.[]; type != "array") then
+                    "a stream of " + ([.[] | type] | unique | join("+")) + " values"
+                  else "array" end' 2>/dev/null <<<"$raw") || {
+    log "ERROR: failed to read the document shape of the $label ($endpoint) response${err:+ (gh stderr: $err)}"
+    return 3
+  }
+  if [ "$shape" != "array" ]; then
+    log "ERROR: $label ($endpoint) came back as $shape, not a stream of JSON arrays — READ but UNUSABLE as a list, so it fails closed rather than reading as an empty result (#967)"
+    return 3
+  fi
   flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) || {
     log "ERROR: failed to flatten $label pagination output${err:+ (gh stderr: $err)}"
     return 3

@@ -507,8 +507,23 @@ die() {
 fetch_api_array() {
   local endpoint=$1
   local label=$2
-  local raw flattened kind
+  local raw flattened kind shape
   raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
+  # #967, ordering half (Codex P2 / Phase 4b P1 on #995). The stream is judged
+  # BEFORE the flatten, because `add // []` manufactures the array the type
+  # assertion below would otherwise judge: a body of `null`, an EMPTY body and
+  # a stream of only `null`s all reduce to `null` under `add` and are rewritten
+  # to `[]`, and a `null` page mixed with real pages is skipped silently. On
+  # this script an empty PR-files read weakens the protected-path derivation.
+  # At least one document, every document an array; a genuinely empty page
+  # (`[]`) is one array document and still passes.
+  shape=$(jq -rs 'if length == 0 then "no JSON documents at all"
+                  elif any(.[]; type != "array") then
+                    "a stream of " + ([.[] | type] | unique | join("+")) + " values"
+                  else "array" end' 2>/dev/null <<<"$raw") \
+    || die 3 "failed to read the document shape of the $label ($endpoint) response"
+  [ "$shape" = "array" ] \
+    || die 3 "$label ($endpoint) came back as $shape, not a stream of JSON arrays — READ but UNUSABLE as a list, so it fails closed rather than reading as an empty result (#967)"
   flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) \
     || die 3 "failed to flatten $label pagination output"
   # #967: `add` over a one-element stream returns that element unchanged, so a

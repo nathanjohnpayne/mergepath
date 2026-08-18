@@ -170,12 +170,18 @@ if [ "$1" = "api" ]; then
       fi
       exit 0
       ;;
+    # #995: an unset fixture emits `[]`, not an EMPTY body. `gh api` on a list
+    # endpoint always prints JSON on success — a zero-byte 200 is a transport
+    # fault, and since the #967 ordering fix `fetch_api_array` refuses it as an
+    # unreadable read rather than reading it as "no results". Modelling "no
+    # fixture" as an empty body made these stubs assert a shape gh never
+    # produces, which is the harness being wrong, not the guard.
     repos/*/pulls/*/comments)
-      cat "${FIXTURE_COMMENTS:-/dev/null}"
+      if [ -n "${FIXTURE_COMMENTS:-}" ]; then cat "$FIXTURE_COMMENTS"; else printf '[]\n'; fi
       exit 0
       ;;
     repos/*/pulls/*/reviews)
-      cat "${FIXTURE_REVIEWS:-/dev/null}"
+      if [ -n "${FIXTURE_REVIEWS:-}" ]; then cat "$FIXTURE_REVIEWS"; else printf '[]\n'; fi
       exit 0
       ;;
     repos/*/issues/*/comments)
@@ -185,7 +191,7 @@ if [ "$1" = "api" ]; then
         echo "gh: HTTP 502 Bad Gateway (issues/comments)" >&2
         exit 1
       fi
-      cat "${FIXTURE_ISSUE_COMMENTS:-/dev/null}"
+      if [ -n "${FIXTURE_ISSUE_COMMENTS:-}" ]; then cat "$FIXTURE_ISSUE_COMMENTS"; else printf '[]\n'; fi
       exit 0
       ;;
     repos/*/pulls/*)
