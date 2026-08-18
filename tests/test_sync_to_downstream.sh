@@ -1432,4 +1432,236 @@ echo "$output" | grep -q "requires-closure gate" \
   || fail "override-skipped consumer did not get a PR: $output"
 echo "PASS: requires-closure gate honors consumer overrides for required files (#624)"
 
+
+# ===========================================================================
+# .github/workflows/weekly-drift-audit.yml — bounded tracking-issue body (#988)
+# ===========================================================================
+#
+# The scheduled caller of `--audit` lives in that workflow, and its report
+# path is where the audit's output actually becomes visible. It inlined the
+# whole audit stream into a GitHub issue body unbounded, so from 2026-07-13
+# every weekly run detected drift and then failed to file it: `createIssue`
+# rejects a body over 65536 characters outright. The failure was
+# self-reinforcing — the more drift accumulated, the larger the report and
+# the more certain the rejection — so the lane went quiet exactly when it
+# had the most to say, and six weeks of drift went unreported behind a red
+# cron nobody read.
+#
+# These assertions live in this suite rather than in a suite of their own
+# because the workflow is `scripts/sync-to-downstream.sh --audit`'s only
+# scheduled caller, this file is already the hub-only home for that
+# script's contract, and `scripts/ci/check_sync_to_downstream` already
+# wires it into CI.
+#
+# The workflow's OWN bash is extracted with yq and executed against stubs
+# rather than re-implemented or grepped for: a text assertion over the YAML
+# could only say the budgeting code is present, never that a 130 KB audit
+# stream comes out the other side as a body GitHub accepts.
+
+WF_DRIFT="$ROOT/.github/workflows/weekly-drift-audit.yml"
+[[ -f "$WF_DRIFT" ]] || { echo "FAIL: missing $WF_DRIFT" >&2; exit 1; }
+
+wf_fail() { echo "FAIL: $*" >&2; exit 1; }
+
+wf_step() {  # <step name> — print that step's `run:` body
+  MP_STEP_NAME="$1" yq -r \
+    '.jobs.audit.steps[] | select(.name == strenv(MP_STEP_NAME)) | .run' "$WF_DRIFT"
+}
+
+WFDIR="$WORKDIR/drift-workflow"
+mkdir -p "$WFDIR/stub-bin"
+wf_step 'Summarise the audit per consumer'      > "$WFDIR/summarise-step.sh"
+wf_step 'Open or update the drift tracking issue' > "$WFDIR/issue-step.sh"
+[ -s "$WFDIR/summarise-step.sh" ] \
+  || wf_fail "could not extract the 'Summarise the audit per consumer' step from $WF_DRIFT"
+[ -s "$WFDIR/issue-step.sh" ] \
+  || wf_fail "could not extract the 'Open or update the drift tracking issue' step from $WF_DRIFT"
+
+# `gh` stub modelling the slice this step uses INCLUDING the server-side
+# validation GitHub applies. The body cap is the whole point: a permissive
+# stub would accept the very payload that has been failing in production
+# every week since 2026-07-13.
+cat >"$WFDIR/stub-bin/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "gh $*" >> "$GH_CALL_LOG"
+if [ "${1:-}" = "issue" ] && [ "${2:-}" = "list" ]; then
+  printf '%s' "${GH_STUB_EXISTING:-}"
+  exit 0
+fi
+if [ "${1:-}" = "issue" ] && { [ "${2:-}" = "create" ] || [ "${2:-}" = "edit" ]; }; then
+  body_file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --body-file) body_file="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$body_file" ] || { echo "stub: no --body-file" >&2; exit 1; }
+  n="$(wc -c < "$body_file" | tr -d '[:space:]')"
+  printf '%s\n' "$n" > "$GH_BODY_BYTES"
+  # GitHub rejects the whole call past 65536 characters; it does not
+  # truncate. Model that, plus an unconditional-failure switch for the
+  # "the write failed anyway" path.
+  if [ -n "${GH_STUB_WRITE_FAIL:-}" ]; then
+    echo "GraphQL: Something went wrong (createIssue)" >&2
+    exit 1
+  fi
+  if [ "$n" -gt 65536 ]; then
+    echo "GraphQL: Body is too long (maximum is 65536 characters) (createIssue)" >&2
+    exit 1
+  fi
+  echo "stub: issue written ($n characters)"
+  exit 0
+fi
+exit 0
+GHSTUB
+chmod +x "$WFDIR/stub-bin/gh"
+
+# One consumer section per consumer, each with a header line, a baseline
+# line and a run of status lines — the exact shape emit_status_line() and
+# emit_skip_line() produce above.
+wf_make_audit_output() {  # <file> <drift-lines-per-consumer>
+  local out=$1 n=$2 c i
+  : > "$out"
+  for c in alpha bravo charlie delta epsilon; do
+    printf '%s (x/%s)\n' "$c" "$c" >> "$out"
+    printf '  baseline: main@abc1234 (cache clone, refreshed from origin default branch)\n' >> "$out"
+    printf '  ✓ %-50s in sync\n' "scripts/in-sync.sh" >> "$out"
+    i=1
+    while [ "$i" -le "$n" ]; do
+      printf '  ✗ %-50s drift: %d diff line(s)\n' "scripts/deeply/nested/path/file-$i.sh" "$i" >> "$out"
+      i=$((i + 1))
+    done
+    printf '  ⊘ %-50s missing entirely\n' "scripts/absent.sh" >> "$out"
+    printf '  ↷ %-50s skipped per .sync-overrides.yml: local fork\n' "scripts/override.sh" >> "$out"
+    printf '\n' >> "$out"
+  done
+}
+
+wf_run_steps() {  # runs both steps in a clean dir; sets WF_RC / WF_TEXT
+  local dir=$1
+  WF_RC=0
+  WF_TEXT="$(
+    cd "$dir" && \
+    PATH="$WFDIR/stub-bin:$PATH" \
+    GH_CALL_LOG="$dir/gh-calls.log" \
+    GH_BODY_BYTES="$dir/body-bytes.txt" \
+    GITHUB_STEP_SUMMARY="$dir/step-summary.md" \
+    TRACKING_LABEL="propagation-drift" \
+    ISSUE_TITLE="Cross-repo propagation drift detected" \
+    REPO="nathanjohnpayne/mergepath" \
+    RUN_URL="https://github.com/nathanjohnpayne/mergepath/actions/runs/1" \
+      bash "$WFDIR/summarise-step.sh" > /dev/null && \
+    cd "$dir" && \
+    PATH="$WFDIR/stub-bin:$PATH" \
+    GH_CALL_LOG="$dir/gh-calls.log" \
+    GH_BODY_BYTES="$dir/body-bytes.txt" \
+    GITHUB_STEP_SUMMARY="$dir/step-summary.md" \
+    GH_STUB_EXISTING="${GH_STUB_EXISTING:-}" \
+    GH_STUB_WRITE_FAIL="${GH_STUB_WRITE_FAIL:-}" \
+    TRACKING_LABEL="propagation-drift" \
+    ISSUE_TITLE="Cross-repo propagation drift detected" \
+    REPO="nathanjohnpayne/mergepath" \
+    RUN_URL="https://github.com/nathanjohnpayne/mergepath/actions/runs/1" \
+      bash "$WFDIR/issue-step.sh" 2>&1
+  )" || WF_RC=$?
+}
+
+# --- (1) An oversized audit stream still produces a body GitHub accepts ---
+#
+# 400 drift lines x 5 consumers is ~130 KB — twice the cap, and the shape
+# every failing production run had.
+BIG="$WFDIR/big"; mkdir -p "$BIG"; : > "$BIG/gh-calls.log"
+wf_make_audit_output "$BIG/audit-output.txt" 400
+big_bytes="$(wc -c < "$BIG/audit-output.txt" | tr -d '[:space:]')"
+[ "$big_bytes" -gt 65536 ] \
+  || wf_fail "fixture is not oversized ($big_bytes bytes) — the assertion below would be vacuous"
+
+GH_STUB_EXISTING="" GH_STUB_WRITE_FAIL="" wf_run_steps "$BIG"
+[ "$WF_RC" -eq 0 ] || wf_fail "oversized audit output must still file the issue; step exited $WF_RC: $WF_TEXT"
+body_bytes="$(cat "$BIG/body-bytes.txt")"
+[ "$body_bytes" -le 65536 ] \
+  || wf_fail "issue body was $body_bytes characters — GitHub rejects anything over 65536"
+grep -q 'gh issue create' "$BIG/gh-calls.log" \
+  || wf_fail "no issue was created from an oversized audit run: $(cat "$BIG/gh-calls.log")"
+echo "PASS: a 130 KB audit stream still files a tracking issue under GitHub's 65536-char body cap (#988)"
+
+# --- (2) Truncation is announced, and says how much was dropped ----------
+grep -q 'truncated:' "$BIG/issue-body.txt" \
+  || wf_fail "truncated body does not say it was truncated"
+grep -Eq 'truncated: [0-9]+ of [0-9]+ audit output line\(s\) omitted' "$BIG/issue-body.txt" \
+  || wf_fail "truncation notice must count the omitted lines: $(grep -n 'truncated' "$BIG/issue-body.txt")"
+grep -q 'actions/runs/1' "$BIG/issue-body.txt" \
+  || wf_fail "truncation notice must point at the run log holding the full stream"
+# The raw-block budget has to be what bounds the body. The step also carries
+# a whole-body emergency clamp, and a clamped body is a DEGRADED report — it
+# loses the truncation notice, the closing fence and the footer. Pinning the
+# footer's survival is what stops a regression in the budget from hiding
+# behind the backstop and still passing the size assertion above.
+grep -q 'cc @nathanjohnpayne' "$BIG/issue-body.txt" \
+  || wf_fail "budgeted body lost its footer — it was cut by the emergency clamp, not bounded by the raw-block budget"
+if grep -q 'hard-clamped' "$BIG/issue-body.txt"; then
+  wf_fail "the raw-block budget must bound the body on its own; the whole-body clamp is a backstop, not the mechanism"
+fi
+echo "PASS: a truncated drift report says so, counts the omitted lines, and points at the run log (#988)"
+
+# --- (3) Truncation never costs the report a consumer -------------------
+#
+# The regression this closes is not only "the body was too long" — it is
+# "a report that has to shrink loses whole consumers off the alphabetical
+# tail". The per-consumer roll-up is carried whole for exactly that reason.
+for c in alpha bravo charlie delta epsilon; do
+  grep -q "^${c} (x/${c}) — in sync 1, drifted 400, missing 1, skipped 1$" "$BIG/issue-body.txt" \
+    || wf_fail "consumer '$c' is missing (or miscounted) in the truncated report: $(grep -n ' — in sync ' "$BIG/issue-body.txt")"
+done
+echo "PASS: every consumer is still named with its drift counts in a truncated report (#988)"
+
+# --- (4) A small audit is NOT truncated ---------------------------------
+#
+# Guards the other direction: a step that always truncates would pass every
+# assertion above while throwing away findings that fit.
+SMALL="$WFDIR/small"; mkdir -p "$SMALL"; : > "$SMALL/gh-calls.log"
+wf_make_audit_output "$SMALL/audit-output.txt" 3
+GH_STUB_EXISTING="" GH_STUB_WRITE_FAIL="" wf_run_steps "$SMALL"
+[ "$WF_RC" -eq 0 ] || wf_fail "small audit output must file the issue; step exited $WF_RC: $WF_TEXT"
+if grep -q 'truncated:' "$SMALL/issue-body.txt"; then
+  wf_fail "a small audit output must not be truncated"
+fi
+grep -q 'scripts/deeply/nested/path/file-3.sh' "$SMALL/issue-body.txt" \
+  || wf_fail "a small audit output must be carried in full"
+echo "PASS: an audit output that fits is carried whole, not truncated anyway (#988)"
+
+# --- (5) A failed write names what was lost -----------------------------
+#
+# The six weeks of silence were a red cron and a raw GraphQL line. If the
+# write fails for any other reason the run must still say, in an ::error::
+# annotation, that drift WAS detected and where to read it.
+FAILW="$WFDIR/failed-write"; mkdir -p "$FAILW"; : > "$FAILW/gh-calls.log"
+wf_make_audit_output "$FAILW/audit-output.txt" 3
+GH_STUB_EXISTING="" GH_STUB_WRITE_FAIL="1" wf_run_steps "$FAILW"
+[ "$WF_RC" -ne 0 ] || wf_fail "a failed issue write must fail the step"
+echo "$WF_TEXT" | grep -q '::error::' \
+  || wf_fail "a failed issue write must emit an ::error:: annotation: $WF_TEXT"
+echo "$WF_TEXT" | grep -q 'Drift WAS detected' \
+  || wf_fail "a failed issue write must say drift was detected but unfiled: $WF_TEXT"
+echo "$WF_TEXT" | grep -q 'actions/runs/1' \
+  || wf_fail "a failed issue write must point at the run holding the findings: $WF_TEXT"
+echo "PASS: a tracking-issue write failure reports that drift was detected and unfiled (#988)"
+
+# --- (6) The update path is bounded too ---------------------------------
+#
+# Once a tracking issue exists the workflow edits it in place, and
+# `updateIssue` enforces the same 65536 cap — so a fix that only bounded
+# the create path would move the failure rather than remove it.
+UPD="$WFDIR/update"; mkdir -p "$UPD"; : > "$UPD/gh-calls.log"
+wf_make_audit_output "$UPD/audit-output.txt" 400
+GH_STUB_EXISTING="4242" GH_STUB_WRITE_FAIL="" wf_run_steps "$UPD"
+[ "$WF_RC" -eq 0 ] || wf_fail "oversized audit output must still update the issue; step exited $WF_RC: $WF_TEXT"
+grep -q 'gh issue edit 4242' "$UPD/gh-calls.log" \
+  || wf_fail "the update path did not run: $(cat "$UPD/gh-calls.log")"
+upd_bytes="$(cat "$UPD/body-bytes.txt")"
+[ "$upd_bytes" -le 65536 ] \
+  || wf_fail "update-path body was $upd_bytes characters — over GitHub's cap"
+echo "PASS: the edit-in-place path is bounded by the same budget as the create path (#988)"
+
 echo "test_sync_to_downstream: PASS"

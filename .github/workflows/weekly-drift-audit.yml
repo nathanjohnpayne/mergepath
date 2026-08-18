@@ -239,6 +239,53 @@ jobs:
           echo "lane_rc=${rc}" >> "$GITHUB_OUTPUT"
           echo "Lane audit exited ${rc} (deferred to the end-of-job gate)"
 
+      - name: Summarise the audit per consumer
+        # Findings-first reporting (#988). The raw audit stream grows with
+        # the amount of drift, and it is the raw stream that has to be
+        # budgeted when the report goes into a GitHub issue body. This
+        # roll-up does not grow that way — it is exactly one line per
+        # consumer no matter how much drift there is — so it can always be
+        # carried WHOLE. Deriving it in its own step means the job summary
+        # and the tracking issue report the same numbers from the same
+        # derivation, and a truncated raw block never costs the report a
+        # consumer's name.
+        if: steps.audit.outputs.result == 'clean' || steps.audit.outputs.result == 'drift'
+        run: |
+          set -euo pipefail
+          # `scripts/sync-to-downstream.sh --audit` prints, per consumer:
+          #   <name> (<owner/repo>)            <- column 0, the header
+          #     baseline: <branch>@<sha> ...
+          #     <symbol> <path>  <detail>      <- two-space indent
+          # The symbols are emit_status_line() / emit_skip_line() in that
+          # script: ✓ in sync, ✗ drifted, ⊘ missing entirely, ↷ skipped
+          # per .sync-overrides.yml. They are matched as literal byte
+          # prefixes rather than by field index because the detail text
+          # after the path is free-form.
+          awk '
+            /^[^ \t]/ && /\)$/ { consumer = $0; order[++n] = consumer; next }
+            consumer == "" { next }
+            index($0, "  ✓ ") == 1 { ok[consumer]++;      next }
+            index($0, "  ✗ ") == 1 { drifted[consumer]++; next }
+            index($0, "  ⊘ ") == 1 { missing[consumer]++; next }
+            index($0, "  ↷ ") == 1 { skipped[consumer]++; next }
+            END {
+              for (i = 1; i <= n; i++) {
+                c = order[i]
+                printf "%s — in sync %d, drifted %d, missing %d, skipped %d\n", c, ok[c] + 0, drifted[c] + 0, missing[c] + 0, skipped[c] + 0
+              }
+            }
+          ' audit-output.txt > consumer-summary.txt
+
+          if [ ! -s consumer-summary.txt ]; then
+            # No consumer header line was recognised. Do not fail the job —
+            # the raw stream is still reportable — but never let an empty
+            # roll-up read as "no consumer was affected", which is the
+            # silent-audit failure mode this whole change exists to remove.
+            echo "::warning::Could not derive a per-consumer summary from the audit output (no consumer header line matched). The reports fall back to the raw audit stream."
+            echo "(per-consumer summary unavailable — the audit output did not parse into consumer sections; read the raw output below)" > consumer-summary.txt
+          fi
+          cat consumer-summary.txt
+
       - name: Write job summary
         # Runs for both clean (result=clean) and drift (result=drift).
         # The exit-2/3 paths above already failed the job and never
@@ -259,6 +306,12 @@ jobs:
               echo "A tracking issue (label \`${TRACKING_LABEL}\`) has been opened or updated. Drive propagation with"
               echo "\`scripts/sync-to-downstream.sh <commit-ish>\` — this cron only reports, it does not open consumer PRs."
             fi
+            echo
+            echo "## Per-consumer summary"
+            echo
+            echo '```'
+            cat consumer-summary.txt
+            echo '```'
             echo
             echo "## Audit output"
             echo
@@ -304,7 +357,40 @@ jobs:
           set -euo pipefail
           today="$(date -u '+%Y-%m-%d')"
 
-          # Build the issue body from the captured audit output.
+          # `wc` pads its count on some platforms; strip so the values are
+          # usable as plain integers in arithmetic and in `[ -gt ]`.
+          bytes_of() { wc -c < "$1" | tr -d '[:space:]'; }
+          lines_of() { wc -l < "$1" | tr -d '[:space:]'; }
+
+          # Self-contained fallback: the roll-up is produced by an earlier
+          # step, and a report that dies because its summary file is absent
+          # is the same class of failure as one that dies because its body
+          # is too long.
+          [ -f consumer-summary.txt ] || \
+            echo "(per-consumer summary unavailable — the summarising step did not run)" > consumer-summary.txt
+
+          # GitHub caps an issue body at 65536 characters and REJECTS the
+          # whole createIssue / updateIssue call past it — it does not
+          # truncate for you. This step used to inline the audit stream
+          # unbounded, so from 2026-07-13 every weekly run detected drift
+          # and then failed to file it, self-reinforcingly: the more drift
+          # accumulated, the larger the report, and the more certain the
+          # report was to be rejected — the lane went quiet exactly when it
+          # had the most to say (#988).
+          #
+          # The body is therefore assembled in three pieces, and the raw
+          # block is the ONLY one allowed to shrink:
+          #   body-head.txt   prose + the COMPLETE per-consumer roll-up
+          #   audit-block.txt the raw audit stream, budgeted by what is left
+          #   body-tail.txt   the footer
+          # Deriving the raw block's budget from the MEASURED size of the
+          # fixed parts, rather than from a guessed constant, is what makes
+          # "the body fits" a property of the assembly instead of a hope
+          # about the input. Truncating the roll-up instead would drop
+          # whole consumers from the report alphabetically — the opposite
+          # of what a truncated report should lose.
+          MAX_BODY=60000
+
           {
             echo "## Cross-repo propagation drift"
             echo
@@ -315,10 +401,21 @@ jobs:
             echo "- **Last audit:** ${today} (UTC)"
             echo "- **Run:** ${RUN_URL}"
             echo
+            echo "### Per-consumer summary"
+            echo
+            echo "Complete: every consumer the audit walked is named here, even when the raw"
+            echo "output below has to be truncated."
+            echo
+            echo '```'
+            cat consumer-summary.txt
+            echo '```'
+            echo
             echo "### Audit output"
             echo
             echo '```'
-            cat audit-output.txt
+          } > body-head.txt
+
+          {
             echo '```'
             echo
             echo "---"
@@ -331,7 +428,64 @@ jobs:
             echo "(see #168). The cron is read-only and never opens consumer PRs itself."
             echo
             echo "cc @nathanjohnpayne"
+          } > body-tail.txt
+
+          # Reserve room for the truncation notice itself, so adding the
+          # notice can never be what pushes the body back over the cap.
+          notice_reserve=400
+          budget=$(( MAX_BODY - $(bytes_of body-head.txt) - $(bytes_of body-tail.txt) - notice_reserve ))
+          if [ "$budget" -lt 0 ]; then budget=0; fi
+
+          total_lines="$(lines_of audit-output.txt)"
+          cp audit-output.txt audit-block.txt
+          omitted=0
+          if [ "$(bytes_of audit-block.txt)" -gt "$budget" ]; then
+            if [ "$budget" -le 0 ]; then
+              # No room at all for the raw stream. BSD `head -c 0` is an
+              # error ("illegal byte count") where GNU's is a no-op, so
+              # special-case it rather than let the platform decide whether
+              # the report gets filed.
+              : > audit-block.txt
+            else
+              head -c "$budget" audit-block.txt > audit-block.cut
+              # `head -c` cuts on a byte boundary, which can land mid-line
+              # and mid-UTF-8-sequence — the audit's status symbols
+              # (✓ ✗ ⊘ ↷) are multibyte. Dropping that last line is what
+              # keeps the body valid text instead of a string carrying a
+              # broken code point.
+              sed '$d' audit-block.cut > audit-block.txt
+              rm -f audit-block.cut
+            fi
+            omitted=$(( total_lines - $(lines_of audit-block.txt) ))
+          fi
+
+          {
+            cat body-head.txt
+            cat audit-block.txt
+            if [ "$omitted" -gt 0 ]; then
+              echo
+              echo "[... truncated: ${omitted} of ${total_lines} audit output line(s) omitted to stay under"
+              echo " GitHub's 65536-character issue-body cap. The per-consumer summary above is"
+              echo " complete; the full stream is in the run log: ${RUN_URL} ...]"
+            fi
+            cat body-tail.txt
           } > issue-body.txt
+
+          body_bytes="$(bytes_of issue-body.txt)"
+          if [ "$body_bytes" -gt "$MAX_BODY" ]; then
+            # Expected to be unreachable: the raw block was budgeted from
+            # the measured overhead. Reaching it means the FIXED part alone
+            # is oversized (an implausibly large consumer roll-up), so
+            # clamp by whole lines and say so — a degraded report beats a
+            # rejected call that takes the whole report down with it.
+            head -c "$MAX_BODY" issue-body.txt > issue-body.cut
+            sed '$d' issue-body.cut > issue-body.txt
+            rm -f issue-body.cut
+            printf '\n[... body hard-clamped at %s characters; full audit output in the run log: %s ...]\n' \
+              "$MAX_BODY" "$RUN_URL" >> issue-body.txt
+            echo "::warning::Drift issue body was ${body_bytes} characters after budgeting and had to be hard-clamped to ${MAX_BODY}. The per-consumer summary may be incomplete — read the run log: ${RUN_URL}"
+          fi
+          echo "Issue body assembled: $(bytes_of issue-body.txt) characters; ${omitted} of ${total_lines} audit line(s) omitted."
 
           # Find an existing OPEN tracking issue. Single source of truth:
           # the `propagation-drift` label. Take the lowest-numbered match
@@ -341,20 +495,30 @@ jobs:
           existing="$(gh issue list --repo "$REPO" --state open --limit 500 \
             --label "$TRACKING_LABEL" --json number --jq 'sort_by(.number) | .[0].number // ""')"
 
+          # Every write below is wrapped so a failure names what was lost.
+          # Bare `set -e` would fail the job with GitHub's raw API line and
+          # nothing else — which is how six weeks of detected-but-unfiled
+          # drift read as an unremarkable red cron.
           if [ -n "$existing" ]; then
             echo "Updating existing drift issue #${existing}."
-            gh issue edit "$existing" --repo "$REPO" \
+            if ! gh issue edit "$existing" --repo "$REPO" \
               --title "${ISSUE_TITLE}" \
-              --body-file issue-body.txt
+              --body-file issue-body.txt; then
+              echo "::error::Drift WAS detected, but tracking issue #${existing} could not be updated (body: $(bytes_of issue-body.txt) characters, GitHub's cap is 65536). The findings are in this run's job summary only: ${RUN_URL}"
+              exit 1
+            fi
             gh issue comment "$existing" --repo "$REPO" \
               --body ":warning: Drift still present as of ${today} (UTC). Issue body refreshed — see [latest run](${RUN_URL})."
             echo "issue=${existing}" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "No open drift issue — opening one."
-            gh issue create --repo "$REPO" \
+            if ! gh issue create --repo "$REPO" \
               --title "${ISSUE_TITLE}" \
               --label "$TRACKING_LABEL" \
-              --body-file issue-body.txt
+              --body-file issue-body.txt; then
+              echo "::error::Drift WAS detected, but no tracking issue could be opened (body: $(bytes_of issue-body.txt) characters, GitHub's cap is 65536). The findings are in this run's job summary only: ${RUN_URL}"
+              exit 1
+            fi
           fi
 
       - name: Close stale drift tracking issue on a clean audit

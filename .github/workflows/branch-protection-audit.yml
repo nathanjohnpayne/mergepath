@@ -64,7 +64,13 @@ name: Weekly branch-protection audit
 #   every repo, it could easily be mistaken for "nothing to report". Two
 #   guards prevent that:
 #     - the "Run the fleet audit" step fails the job outright when the
-#       secret is empty, naming the secret and the scope it needs;
+#       secret is empty or whitespace, naming the secret and the scope it
+#       needs — in an ::error:: annotation AND in a job summary on the run
+#       page, because a guard that fails correctly but only inside a
+#       collapsed log group is still a silent audit (#989). The summary
+#       states what has to be provisioned and points at
+#       docs/architecture/0002-branch-protection-enforcement-posture.md
+#       § Provisioning BRANCH_PROTECTION_AUDIT_TOKEN;
 #     - `--fleet` exits 2 (infrastructure) rather than 3 (drift) when any
 #       repo could not be read, and this workflow fails loudly on 2
 #       WITHOUT touching the rollup issue. A token that lost its scope can
@@ -209,10 +215,51 @@ jobs:
           HUB_REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
-          if [ -z "${GH_TOKEN}" ]; then
+          # An unset secret and a secret set to whitespace are the same
+          # thing to this audit, and GitHub cannot tell them apart from the
+          # Settings page either: an empty secret still exists and still
+          # bumps `updated_at`. Strip before testing so " " cannot buy a
+          # token-shaped value past the guard and into a fleet-wide run of
+          # 403s that reads as flaky infrastructure (#989).
+          if [ -z "$(printf '%s' "${GH_TOKEN}" | tr -d '[:space:]')" ]; then
             echo "::error::BRANCH_PROTECTION_AUDIT_TOKEN secret is empty — the audit cannot read branch protection without a token carrying the 'Administration:read' scope on every repo in .mergepath-sync.yml."
             echo "        The reviewer PAT (REVIEWER_ASSIGNMENT_TOKEN) is NOT a substitute: it lacks that scope and 403s on every repo (#177, #285)."
             echo "        Set BRANCH_PROTECTION_AUDIT_TOKEN in repo Settings -> Secrets and variables -> Actions."
+
+            # The annotation above is a line in a collapsed log group. This
+            # audit had never once produced a result: every run since it
+            # landed aborted here, and the only outward sign was a red cron
+            # nobody was reading (#989). A guard that fails correctly but
+            # illegibly is still a silent audit, so restate the failure on
+            # the run page itself — the surface a human actually opens —
+            # complete with what has to be provisioned. Written even though
+            # the step is about to exit non-zero: the summary is the report
+            # for a run that produced no audit.
+            {
+              echo "# Weekly branch-protection audit — DID NOT RUN"
+              echo
+              echo ":no_entry: **No audit was performed.** The \`BRANCH_PROTECTION_AUDIT_TOKEN\` secret is empty or unset, so this run read nothing and knows nothing. **This is not a clean result** — treat the fleet's protection posture as unverified since the last successful run."
+              echo
+              echo "## What has to be provisioned"
+              echo
+              echo "| | |"
+              echo "|---|---|"
+              echo "| **Secret name** | \`BRANCH_PROTECTION_AUDIT_TOKEN\` (Actions secret on \`${HUB_REPO}\`) |"
+              echo "| **Kind** | Fine-grained PAT, **read-only** |"
+              echo "| **Scope** | \`Administration: read\` on every repo in \`.mergepath-sync.yml\`, plus this hub |"
+              echo "| **Identity** | Must be a repository **admin** on the hub — the hub's admin-enforcement check reads \`current_user_can_bypass\`, which is only evidence about admins when the caller is one. A non-admin identity exits 2, not clean. |"
+              echo "| **Not this** | \`REVIEWER_ASSIGNMENT_TOKEN\` — the reviewer PAT lacks \`Administration:read\` and 403s on every repo (#177, #285). Pointing this workflow at it is not a fix. |"
+              echo "| **Never this** | \`Administration: write\`. It would hand a weekly, unattended, fleet-wide credential the power to rewrite the protection this workflow exists to audit. |"
+              echo "| **Where** | Settings → Secrets and variables → Actions → New repository secret |"
+              echo
+              echo "Provisioning is deliberately a human action — it mints a credential — and the full procedure, including storing the PAT in 1Password and guarding \`gh secret set\` against writing an empty value, is in [\`docs/architecture/0002-branch-protection-enforcement-posture.md\`](docs/architecture/0002-branch-protection-enforcement-posture.md) § Provisioning \`BRANCH_PROTECTION_AUDIT_TOKEN\`."
+              echo
+              echo "Once the secret exists, verify it off-schedule without waiting a week:"
+              echo
+              echo '```'
+              echo "gh api repos/${HUB_REPO}/dispatches -f event_type=branch-protection-audit"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 

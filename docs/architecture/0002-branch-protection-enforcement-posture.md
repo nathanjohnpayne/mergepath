@@ -77,6 +77,26 @@ Three properties of that automation are load-bearing and are covered by `tests/t
 - the rollup issue body is assembled findings-first, with the compact per-repo verdict table in whole and the verbose output truncated under a byte budget. A rollup that lets GitHub's body cap eat findings under-reports exactly when the fleet is at its worst;
 - the rollup issue is maintained by a read-then-write pair (look up the open issue, then create or update it), so the workflow serializes its runs under a concurrency group and treats a failed lookup as a job failure rather than as "nothing is open". Both shortcuts would break the single-rollup guarantee: concurrent runs would open duplicates, and a lookup error on a clean run would silently leave a genuine drift issue open.
 
+### Provisioning `BRANCH_PROTECTION_AUDIT_TOKEN`
+
+The audit cannot run at all until this secret exists, and it is deliberately not something the repository can provision for itself: minting a credential is an owner action. Every run of the workflow between the day it landed and the day the secret is set aborts at its preflight guard, which is correct — a guard that refused to run is the only honest alternative to an audit that reports a fleet-wide all-clear it never verified (#989).
+
+What the owner must create:
+
+1. **A fine-grained PAT, read-only.** The only permission it needs is `Administration: read`, granted on this hub and on every repo listed in `.mergepath-sync.yml`. Do not grant `Administration: write`: this is a weekly, unattended, fleet-wide credential, and write would give it the power to rewrite the exact protection it exists to audit — strictly worse than the drift being detected. The audit never calls a protection-mutating endpoint, so write buys nothing.
+2. **Under an identity that is a repository admin on the hub.** The hub's admin-enforcement check (see § Enforcement above) reads `current_user_can_bypass`, because GitHub withholds a ruleset's full `bypass_actors` list from a read-only caller. That field describes the *calling* identity, so it is evidence about admins only when the caller is one — a non-admin identity makes the audit exit 2 (unreadable) rather than report clean. In practice this is the author identity `nathanjohnpayne`, not a reviewer identity.
+3. **Stored in 1Password alongside the other machine PATs**, looked up by item ID rather than item title, per the PAT lookup table in `REVIEW_POLICY.md`.
+4. **Installed as the `BRANCH_PROTECTION_AUDIT_TOKEN` Actions secret** on `nathanjohnpayne/mergepath` — Settings → Secrets and variables → Actions → New repository secret. If installing it from the CLI, guard the value against being unset, because an empty secret still exists, still bumps `updated_at`, and is indistinguishable from a populated one on the Settings page — an empty write is precisely the failure mode that produced #989:
+
+   ```bash
+   : "${BP_AUDIT_PAT:?refusing to write an empty BRANCH_PROTECTION_AUDIT_TOKEN}"
+   printf '%s' "$BP_AUDIT_PAT" | gh secret set BRANCH_PROTECTION_AUDIT_TOKEN --repo nathanjohnpayne/mergepath
+   ```
+
+5. **Verify off-schedule rather than waiting a week**, with `gh api repos/nathanjohnpayne/mergepath/dispatches -f event_type=branch-protection-audit`, and confirm the run reaches a verdict instead of aborting at the preflight guard.
+
+The reviewer PAT (`REVIEWER_ASSIGNMENT_TOKEN`) is not a substitute and pointing the workflow at it is not a fix: it lacks `Administration:read` and 403s on every repo (#177, #285). Because that failure is uniform across the fleet, it is the one most easily mistaken for "nothing to report", which is why the workflow classifies an unreadable repo as exit 2 (infrastructure) and never as exit 0.
+
 ## Alternatives considered
 
 **Per-consumer opt-in — require only the gates a repo has enabled.** Rejected. It makes the protection posture a function of a config file that changes independently, so every knob flip silently creates a new gap and there is no single moment at which anyone is prompted to close it. It also produces a fleet where the audit's expected set differs per repo, which means a drift report has to be interpreted rather than read.
@@ -90,3 +110,4 @@ Three properties of that automation are load-bearing and are covered by `tests/t
 - The audit will report drift on all ten repos every Monday until the settings change lands. That is intended and should not be silenced by relaxing the canonical set.
 - Adding `Merge clearance gate` to the hub's required checks will block in-flight Phase-4 PRs that lack current-head clearance until they are cleared.
 - A new canonical gate added to `CANONICAL_REQUIRED_CHECKS` becomes required fleet-wide by this decision. Adding one is therefore a fleet-wide protection change and should update this record in the same PR.
+- Until `BRANCH_PROTECTION_AUDIT_TOKEN` is provisioned (see § Provisioning above), the audit reaches no verdict at all and the fleet's protection posture is unverified. Every such run fails at its preflight guard and says so on the run page; none of them is a clean result, and none of them can close an open rollup issue.
