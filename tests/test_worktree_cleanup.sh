@@ -97,6 +97,22 @@
 # `gh` is stubbed via a PATH shim that returns CLOSED for our test PR
 # number and "unknown" for anything else, so the test does not touch
 # the live GitHub API and remains hermetic.
+#
+# ── Assertion convention (#916) ────────────────────────────────────────
+# Almost every assertion here compares against literal report text — record
+# labels, reason strings, summary lines, worktree paths, branch names. Those
+# use `grep -Fq` (plus `--` wherever the pattern is interpolated and could
+# begin with `-`, and `-Fqx` where the whole line is the claim). They are NOT
+# regular expressions, and were never meant to be: written as `grep -q` the
+# metacharacters inside them were live, so `ORPHAN .claude/worktrees` matched
+# a malformed `ORPHAN Xclaude/worktrees` label and the assertion guarding
+# against exactly that misclassification passed on it.
+#
+# The handful of assertions that genuinely need a pattern — the summary
+# counters, which have to tolerate variable column padding — use `grep -qE`.
+# That spelling is the marker: `-Fq` means "this string, exactly", `-qE`
+# means "a pattern, deliberately". Adding a new assertion in either form is
+# fine; adding one as bare `grep -q` is what leaves the next reader guessing.
 
 set -euo pipefail
 
@@ -169,7 +185,7 @@ git fetch -q --prune
 
 # Sanity-check that the [gone] marker is actually present (otherwise
 # the test is meaningless).
-if ! git branch -vv | grep -q ': gone\]'; then
+if ! git branch -vv | grep -Fq ': gone]'; then
   fail "fixture setup: expected [gone] marker on gone-branch"
 fi
 
@@ -188,7 +204,11 @@ GONE_PR_CANARY="$GONE_PR_WT/unsaved.md"
 echo "work that exists nowhere else" > "$GONE_PR_CANARY"
 git push -q origin --delete "$GONE_PR_BRANCH"
 git fetch -q --prune
-if ! git branch -vv | grep -q "$GONE_PR_BRANCH.*: gone\]"; then
+# Two fixed-string stages rather than one `<branch>.*: gone]` regex (#916):
+# the branch name is interpolated, so a metacharacter in it would have been
+# live in the pattern, and `.*` was doing nothing a per-line `grep -F` filter
+# does not do more precisely — it cannot cross a line either way.
+if ! git branch -vv | grep -F -- "$GONE_PR_BRANCH" | grep -Fq ': gone]'; then
   fail "fixture setup: expected [gone] marker on $GONE_PR_BRANCH"
 fi
 
@@ -675,7 +695,7 @@ git --git-dir="$REMOTE" branch -D "$STALE_UNPRUNED_BRANCH"
 # Sanity-check the fixture's own premise: `git branch -vv` must NOT report
 # this branch as gone, or the fixture proves nothing about the unpruned-ref
 # case.
-if git branch -vv | grep -F -- "$STALE_UNPRUNED_BRANCH" | grep -q ': gone\]'; then
+if git branch -vv | grep -F -- "$STALE_UNPRUNED_BRANCH" | grep -Fq ': gone]'; then
   fail "fixture setup: expected $STALE_UNPRUNED_BRANCH to NOT be marked gone yet"
 fi
 
@@ -697,7 +717,7 @@ STALE_WT_CANARY="$STALE_WT/.env"
 echo "SECRET=nowhere-else" > "$STALE_WT_CANARY"
 git --git-dir="$REMOTE" branch -D "$STALE_WT_BRANCH"
 # Deliberately NO `git fetch --prune` here — that omission is the bug.
-if git branch -vv | grep -F -- "$STALE_WT_BRANCH" | grep -q ': gone\]'; then
+if git branch -vv | grep -F -- "$STALE_WT_BRANCH" | grep -Fq ': gone]'; then
   fail "fixture setup: expected $STALE_WT_BRANCH to NOT be marked gone yet"
 fi
 # Sanity-check the ignored-content premise (mirrors case 17): plain
@@ -705,6 +725,14 @@ fi
 # gitignored content surviving a removal this helper must refuse.
 if [ -n "$(git -C "$STALE_WT" status --porcelain)" ]; then
   fail "fixture setup: expected plain --porcelain to be EMPTY for the ignored-only stale-unpruned worktree"
+fi
+# Pin the premise the case's NEGATIVE assertion rests on (#920 finding 3).
+# That assertion says the report carries no record for $STALE_WT; a fixture in
+# which the worktree was never registered satisfies it for free, so the case
+# would report the absence of a problem it never created. Assert registration
+# here, where a failure names the fixture rather than the behaviour.
+if ! git worktree list --porcelain | grep -Fqx -- "worktree $STALE_WT"; then
+  fail "fixture setup: expected $STALE_WT to be a registered worktree (the case's negative record assertion would be vacuous)"
 fi
 
 # ── gh stub on PATH ───────────────────────────────────────────────────
@@ -843,7 +871,7 @@ else
 fi
 
 # Case 1: healthy worktree must NOT appear in any classification.
-if echo "$OUT" | grep -q -- "$HEALTHY_WT"; then
+if echo "$OUT" | grep -Fq -- "$HEALTHY_WT"; then
   fail "healthy worktree appeared in output (should be silent)"
   show_out_on_fail
 else
@@ -851,8 +879,8 @@ else
 fi
 
 # Case 2: gone-upstream worktree listed as STALE gone-upstream.
-if echo "$OUT" | grep -q "STALE gone-upstream" \
-   && echo "$OUT" | grep -q -- "$GONE_WT"; then
+if echo "$OUT" | grep -Fq "STALE gone-upstream" \
+   && echo "$OUT" | grep -Fq -- "$GONE_WT"; then
   pass "gone-upstream worktree listed as STALE gone-upstream"
 else
   fail "gone-upstream worktree not listed correctly"
@@ -860,8 +888,8 @@ else
 fi
 
 # Case 3: detached mergepath-pr-<num> with closed PR listed as STALE detached.
-if echo "$OUT" | grep -q "STALE detached PR #${PR_NUM}" \
-   && echo "$OUT" | grep -q -- "$PR_WT"; then
+if echo "$OUT" | grep -Fq "STALE detached PR #${PR_NUM}" \
+   && echo "$OUT" | grep -Fq -- "$PR_WT"; then
   pass "detached closed-PR worktree listed as STALE detached"
 else
   fail "detached closed-PR worktree not listed correctly"
@@ -870,8 +898,8 @@ fi
 
 # Case 12 (#739): hidden-folder pr-<n>-<desc> worktree is PR-state checked
 # and flagged STALE detached (the stub reports the PR MERGED).
-if echo "$OUT" | grep -q "STALE detached PR #${HIDDEN_PR_NUM}" \
-   && echo "$OUT" | grep -q -- "$HIDDEN_PR_WT"; then
+if echo "$OUT" | grep -Fq "STALE detached PR #${HIDDEN_PR_NUM}" \
+   && echo "$OUT" | grep -Fq -- "$HIDDEN_PR_WT"; then
   pass "hidden-folder pr-<n>-<desc> detached worktree PR-state checked + flagged STALE"
 else
   fail "hidden-folder detached PR worktree not recognized by the matcher"
@@ -885,7 +913,7 @@ NONPR_WT_LABEL=$(echo "$OUT" | awk -v p="$HIDDEN_NONPR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$NONPR_WT_LABEL" | grep -q "detached non-PR"; then
+if echo "$NONPR_WT_LABEL" | grep -Fq "detached non-PR"; then
   pass "free-form hidden-folder slug listed as detached non-PR (no PR number parsed)"
 else
   fail "free-form hidden-folder slug mislabeled (label='$NONPR_WT_LABEL')"
@@ -899,7 +927,7 @@ BRANCH_PR_LABEL=$(echo "$OUT" | awk -v p="$BRANCH_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$BRANCH_PR_LABEL" | grep -q "STALE PR #${BRANCH_PR_NUM} (MERGED) branch worktree"; then
+if echo "$BRANCH_PR_LABEL" | grep -Fq "STALE PR #${BRANCH_PR_NUM} (MERGED) branch worktree"; then
   pass "branch-attached pr-<n> worktree (live upstream, MERGED PR) flagged stale"
 else
   fail "branch-attached pr-<n> worktree not PR-state checked (label='$BRANCH_PR_LABEL')"
@@ -918,13 +946,13 @@ DIRTY_PR_LABEL=$(echo "$OUT" | awk -v p="$DIRTY_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$DIRTY_PR_LABEL" | grep -q "working tree is not clean — review manually, keeping"; then
+if echo "$DIRTY_PR_LABEL" | grep -Fq "working tree is not clean — review manually, keeping"; then
   pass "dirty closed-PR branch worktree surfaced under a review-manually record"
 else
   fail "dirty closed-PR branch worktree not surfaced for review (label='$DIRTY_PR_LABEL')"
   show_out_on_fail
 fi
-if echo "$DIRTY_PR_LABEL" | grep -q "STALE PR"; then
+if echo "$DIRTY_PR_LABEL" | grep -Fq "STALE PR"; then
   fail "dirty closed-PR branch worktree wrongly flagged as a removal candidate"
   show_out_on_fail
 else
@@ -936,7 +964,7 @@ else
   fail "summary unclean-PR-worktree count missing/zero"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -q "uncommitted or untracked content"; then
+if echo "$OUT" | grep -Fq "uncommitted or untracked content"; then
   pass "dirty worktree carries the uncommitted/untracked remediation line"
 else
   fail "dirty worktree missing its uncommitted/untracked remediation line"
@@ -948,7 +976,7 @@ OPEN_PR_LABEL=$(echo "$OUT" | awk -v p="$OPEN_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$OPEN_PR_LABEL" | grep -q "OPEN PR #${OPEN_PR_NUM} — keeping"; then
+if echo "$OPEN_PR_LABEL" | grep -Fq "OPEN PR #${OPEN_PR_NUM} — keeping"; then
   pass "branch-attached worktree for an OPEN PR reported still-active"
 else
   fail "branch-attached OPEN-PR worktree mislabeled (label='$OPEN_PR_LABEL')"
@@ -963,13 +991,13 @@ IGNORED_PR_LABEL=$(echo "$OUT" | awk -v p="$IGNORED_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$IGNORED_PR_LABEL" | grep -q "working tree is not clean — review manually, keeping"; then
+if echo "$IGNORED_PR_LABEL" | grep -Fq "working tree is not clean — review manually, keeping"; then
   pass "gitignored-only closed-PR branch worktree surfaced under a review-manually record"
 else
   fail "gitignored-only worktree not surfaced for review (label='$IGNORED_PR_LABEL')"
   show_out_on_fail
 fi
-if echo "$IGNORED_PR_LABEL" | grep -q "STALE PR"; then
+if echo "$IGNORED_PR_LABEL" | grep -Fq "STALE PR"; then
   fail "gitignored-only worktree wrongly flagged as a removal candidate"
   show_out_on_fail
 else
@@ -977,7 +1005,7 @@ else
 fi
 # The remediation must be TRUE for ignored content: you cannot commit or
 # stash a gitignored file, so the dirty-path wording would be wrong advice.
-if echo "$OUT" | grep -q "gitignored content only"; then
+if echo "$OUT" | grep -Fq "gitignored content only"; then
   pass "gitignored-only worktree carries an ignored-specific remediation line"
 else
   fail "gitignored-only worktree missing its ignored-specific remediation line"
@@ -992,7 +1020,7 @@ SUBMOD_PR_LABEL=$(echo "$OUT" | awk -v p="$SUBMOD_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$SUBMOD_PR_LABEL" | grep -q "working tree is not clean"; then
+if echo "$SUBMOD_PR_LABEL" | grep -Fq "working tree is not clean"; then
   pass "submodule-dirty worktree reported not-clean despite diff.ignoreSubmodules=all"
 else
   fail "submodule-dirty worktree mislabeled (label='$SUBMOD_PR_LABEL')"
@@ -1005,13 +1033,13 @@ PRUNE_PR_LABEL=$(echo "$OUT" | awk -v p="$PRUNE_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$PRUNE_PR_LABEL" | grep -q "worktree directory is MISSING — prunable"; then
+if echo "$PRUNE_PR_LABEL" | grep -Fq "worktree directory is MISSING — prunable"; then
   pass "missing-directory branch worktree classified prunable"
 else
   fail "missing-directory branch worktree mislabeled (label='$PRUNE_PR_LABEL')"
   show_out_on_fail
 fi
-if echo "$PRUNE_PR_LABEL" | grep -q "not clean"; then
+if echo "$PRUNE_PR_LABEL" | grep -Fq "not clean"; then
   fail "missing-directory worktree wrongly reported as unclean (nothing exists to commit/stash)"
   show_out_on_fail
 else
@@ -1033,13 +1061,13 @@ LOCKMISS_PR_LABEL=$(echo "$OUT" | awk -v p="$LOCKMISS_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$LOCKMISS_PR_LABEL" | grep -q "LOCKED PR #${LOCKMISS_PR_NUM} (MERGED) worktree directory is MISSING"; then
+if echo "$LOCKMISS_PR_LABEL" | grep -Fq "LOCKED PR #${LOCKMISS_PR_NUM} (MERGED) worktree directory is MISSING"; then
   pass "locked+missing branch worktree listed under the LOCKED record"
 else
   fail "locked+missing branch worktree mislabeled (label='$LOCKMISS_PR_LABEL')"
   show_out_on_fail
 fi
-if echo "$LOCKMISS_PR_LABEL" | grep -q "prunable"; then
+if echo "$LOCKMISS_PR_LABEL" | grep -Fq "prunable"; then
   fail "locked+missing worktree wrongly advertised as prunable (git worktree prune skips locked entries)"
   show_out_on_fail
 else
@@ -1052,7 +1080,7 @@ LOCKED_PR_LABEL=$(echo "$OUT" | awk -v p="$LOCKED_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$LOCKED_PR_LABEL" | grep -q "LOCKED PR #${LOCKED_PR_NUM} (CLOSED) branch worktree"; then
+if echo "$LOCKED_PR_LABEL" | grep -Fq "LOCKED PR #${LOCKED_PR_NUM} (CLOSED) branch worktree"; then
   pass "locked clean closed-PR branch worktree listed under the LOCKED record"
 else
   fail "locked closed-PR branch worktree mislabeled (label='$LOCKED_PR_LABEL')"
@@ -1066,7 +1094,7 @@ UNKNOWN_PR_LABEL=$(echo "$OUT" | awk -v p="$UNKNOWN_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$UNKNOWN_PR_LABEL" | grep -q "PR #${UNKNOWN_PR_NUM} state unknown — branch worktree"; then
+if echo "$UNKNOWN_PR_LABEL" | grep -Fq "PR #${UNKNOWN_PR_NUM} state unknown — branch worktree"; then
   pass "PR-state-unknown branch worktree surfaced under its own record"
 else
   fail "PR-state-unknown branch worktree mislabeled (label='$UNKNOWN_PR_LABEL')"
@@ -1084,9 +1112,9 @@ else
 fi
 
 # Case 4: locked worktree listed AND flagged as locked.
-if echo "$OUT" | grep -q "LOCKED gone-upstream" \
-   && echo "$OUT" | grep -q -- "$LOCKED_WT" \
-   && echo "$OUT" | grep -q "pretend agent owns this"; then
+if echo "$OUT" | grep -Fq "LOCKED gone-upstream" \
+   && echo "$OUT" | grep -Fq -- "$LOCKED_WT" \
+   && echo "$OUT" | grep -Fq "pretend agent owns this"; then
   pass "locked worktree listed AND flagged with lock reason"
 else
   fail "locked worktree not listed/flagged correctly"
@@ -1094,8 +1122,8 @@ else
 fi
 
 # Case 5: orphan listed as ORPHAN .claude/worktrees.
-if echo "$OUT" | grep -q "ORPHAN .claude/worktrees" \
-   && echo "$OUT" | grep -q -- "$ORPHAN_DIR"; then
+if echo "$OUT" | grep -Fq "ORPHAN .claude/worktrees" \
+   && echo "$OUT" | grep -Fq -- "$ORPHAN_DIR"; then
   pass "orphan .claude/worktrees/ dir listed as ORPHAN"
 else
   fail "orphan dir not listed correctly"
@@ -1116,7 +1144,7 @@ report_label_for() {
 # pass while proving nothing (CodeRabbit 🟡 on #892). Pinning the extractor
 # against a path whose label IS known makes that failure mode loud instead.
 ORPHAN_CONTROL_LABEL=$(report_label_for "$ORPHAN_DIR")
-if echo "$ORPHAN_CONTROL_LABEL" | grep -q "ORPHAN .claude/worktrees"; then
+if echo "$ORPHAN_CONTROL_LABEL" | grep -Fq "ORPHAN .claude/worktrees"; then
   pass "report label extractor resolves a known path to its record label"
 else
   fail "report label extractor did not resolve the orphan fixture (negative assertions below would be vacuous)"
@@ -1128,7 +1156,7 @@ fi
 # reported at all. Either is correct. What it must never be is swept into the
 # orphan bucket merely for living under .claude/worktrees/.
 REGISTERED_CLAUDE_LABEL=$(report_label_for "$REGISTERED_CLAUDE_WT")
-if ! echo "$REGISTERED_CLAUDE_LABEL" | grep -q "ORPHAN .claude/worktrees"; then
+if ! echo "$REGISTERED_CLAUDE_LABEL" | grep -Fq "ORPHAN .claude/worktrees"; then
   pass "registered .claude/worktrees/ worktree is not misclassified as an orphan"
 else
   fail "registered .claude/worktrees/ worktree was misclassified as an orphan"
@@ -1136,8 +1164,8 @@ else
 fi
 
 # Case 6: verified-merged local branch listed as MERGED local branch.
-if echo "$OUT" | grep -q "MERGED local branch" \
-   && echo "$OUT" | grep -q -- "$MERGED_BRANCH"; then
+if echo "$OUT" | grep -Fq "MERGED local branch" \
+   && echo "$OUT" | grep -Fq -- "$MERGED_BRANCH"; then
   pass "verified-merged local branch listed"
 else
   fail "verified-merged local branch not listed"
@@ -1154,13 +1182,18 @@ DIVERGED_LABEL=$(echo "$OUT" | awk -v b="$DIVERGED_BRANCH" '
   /^  \[/            { label = $0 }
   $1 == "branch:" && $2 == b { print label; exit }
 ')
-if echo "$DIVERGED_LABEL" | grep -q "MERGED PR.*review manually, keeping"; then
+# The whole label, fixed-string (#916). The former `MERGED PR.*review
+# manually, keeping` regex also matched the wrong record: `.*` spans the
+# entire middle of the label, so any future record beginning "MERGED PR" and
+# ending "review manually, keeping" satisfied it regardless of the reason text
+# in between — which is the only part that distinguishes this class.
+if echo "$DIVERGED_LABEL" | grep -Fq -- "[MERGED PR, local tip has unmerged commit(s) on top — review manually, keeping]"; then
   pass "diverged merged branch (extra commit on top) is surfaced under a review-manually record"
 else
   fail "diverged merged branch not surfaced for review (label='$DIVERGED_LABEL')"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -q "beyond the merged head"; then
+if echo "$OUT" | grep -Fq "beyond the merged head"; then
   pass "diverged merged branch surfaced with a CLEAR 'beyond the merged head' reason line"
 else
   fail "no 'beyond the merged head' reason line for the diverged branch (silent-skip risk)"
@@ -1170,8 +1203,8 @@ fi
 # Case 9 (#605): a gone-upstream branch with NO merged PR is EXAMINED and
 # kept, with an explicit "no merged PR" line — distinguishing "evaluated,
 # not a candidate" from "not evaluated".
-if echo "$OUT" | grep -q -- "$NOPR_BRANCH" \
-   && echo "$OUT" | grep -q "no merged PR"; then
+if echo "$OUT" | grep -Fq -- "$NOPR_BRANCH" \
+   && echo "$OUT" | grep -Fq "no merged PR"; then
   pass "gone-upstream branch with no merged PR is examined + kept with a clear reason"
 else
   fail "gone-upstream unmerged branch not surfaced as examined-but-kept"
@@ -1192,7 +1225,7 @@ NOPR_LABEL=$(echo "$OUT" | awk -v b="$NOPR_BRANCH" '
   /^  \[/            { label = $0 }
   $1 == "branch:" && $2 == b { print label; exit }
 ')
-if echo "$NOPR_LABEL" | grep -q "MERGED local branch"; then
+if echo "$NOPR_LABEL" | grep -Fq "MERGED local branch"; then
   fail "unmerged branch wrongly flagged as MERGED candidate (label=$NOPR_LABEL)"
   show_out_on_fail
 else
@@ -1206,7 +1239,7 @@ UNKNOWN_LABEL=$(echo "$OUT" | awk -v b="$UNKNOWN_BRANCH" '
   /^  \[/            { label = $0 }
   $1 == "branch:" && $2 == b { print label; exit }
 ')
-if echo "$UNKNOWN_LABEL" | grep -q "lookup FAILED"; then
+if echo "$UNKNOWN_LABEL" | grep -Fq "lookup FAILED"; then
   pass "lookup-failure branch surfaced as NOT EVALUATED (lookup FAILED label)"
 else
   fail "lookup-failure branch mislabeled (label=$UNKNOWN_LABEL)"
@@ -1233,14 +1266,14 @@ else
   fail "#822 stale-unpruned merged branch missing from dry-run output entirely (silent retention regression)"
   show_out_on_fail
 fi
-if echo "$STALE_LABEL" | grep -q "MERGED local branch"; then
+if echo "$STALE_LABEL" | grep -Fq "MERGED local branch"; then
   pass "#822 stale-unpruned merged branch classified as a MERGED local branch"
 else
   fail "#822 stale-unpruned merged branch misclassified (label=$STALE_LABEL)"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -q -- "$STALE_UNPRUNED_BRANCH" \
-   && echo "$OUT" | grep -q "remote-tracking ref is stale"; then
+if echo "$OUT" | grep -Fq -- "$STALE_UNPRUNED_BRANCH" \
+   && echo "$OUT" | grep -Fq "remote-tracking ref is stale"; then
   pass "#822 dry-run explains the stale-remote-tracking-ref reason"
 else
   fail "#822 no stale-remote-tracking-ref reason line found"
@@ -1306,7 +1339,17 @@ fi
 # absence of a gone-upstream record for it is what pins the reduced scope —
 # it fails the moment a prune (or a stale-unpruned union) reaches this
 # classification, which is #932's change to make deliberately.
-if ! echo "$OUT" | grep -Fq -- "$STALE_WT"; then
+# Resolved through report_label_for(), not a substring grep (#920 finding 3).
+# Two things are wrong with `! grep -Fq -- "$STALE_WT"` over the whole report.
+# It is a SUBSTRING test, so it answers about any path merely PREFIXED by
+# $STALE_WT rather than about this worktree — the collision the case's own
+# label assertions are already written around. And it is a NEGATIVE test with
+# no control, so report-format drift would satisfy it for free. The extractor
+# compares the `path:` field for equality, and it was positively controlled
+# against $ORPHAN_DIR on this same $OUT above, so an empty capture here means
+# "no record for this worktree" rather than "the extractor stopped working".
+STALE_WT_RECORD_LABEL=$(report_label_for "$STALE_WT")
+if [ -z "$STALE_WT_RECORD_LABEL" ]; then
   pass "#822 dry-run does not advertise the worktree as gone-upstream (no prune ran)"
 else
   fail "#822 dry-run classified a worktree on an unpruned branch that --apply will not touch"
@@ -1389,7 +1432,7 @@ else
   echo "$OUT3" >&2
 fi
 
-if echo "$OUT3" | grep -q -- "$GONE_WT"; then
+if echo "$OUT3" | grep -Fq -- "$GONE_WT"; then
   fail "gone-upstream worktree still present after --apply"
   echo "$OUT3" >&2
 else
@@ -1427,13 +1470,13 @@ fi
 # survives. The canary is what makes this a data-loss guard rather than a
 # restatement of the assertion above.
 if [ -d "$STALE_WT" ] && [ -f "$STALE_WT_CANARY" ] \
-   && grep -q "SECRET=nowhere-else" "$STALE_WT_CANARY"; then
+   && grep -Fq "SECRET=nowhere-else" "$STALE_WT_CANARY"; then
   pass "#822 --apply left the stale-unpruned worktree and its gitignored canary intact"
 else
   fail "DATA LOSS: --apply deleted the gitignored canary in the stale-unpruned worktree $STALE_WT"
   echo "$OUT3" >&2
 fi
-if echo "$OUT3" | grep -q -- "$PR_WT"; then
+if echo "$OUT3" | grep -Fq -- "$PR_WT"; then
   fail "detached closed-PR worktree still present after --apply"
   echo "$OUT3" >&2
 else
@@ -1441,7 +1484,7 @@ else
 fi
 # Case 12 (#739): the hidden-folder merged-PR worktree is removed by the
 # same --apply pass as the legacy shape.
-if [ -d "$HIDDEN_PR_WT" ] || echo "$OUT3" | grep -q -- "$HIDDEN_PR_WT"; then
+if [ -d "$HIDDEN_PR_WT" ] || echo "$OUT3" | grep -Fq -- "$HIDDEN_PR_WT"; then
   fail "hidden-folder detached merged-PR worktree still present after --apply"
   echo "$OUT3" >&2
 else
@@ -1459,7 +1502,7 @@ fi
 # and the BRANCH REF it was attached to survives (worktree removal never
 # deletes a ref, which is exactly why a clean working tree is sufficient
 # evidence that nothing is lost).
-if [ -d "$BRANCH_PR_WT" ] || echo "$OUT3" | grep -q -- "$BRANCH_PR_WT"; then
+if [ -d "$BRANCH_PR_WT" ] || echo "$OUT3" | grep -Fq -- "$BRANCH_PR_WT"; then
   fail "branch-attached merged-PR worktree still present after --apply"
   echo "$OUT2" >&2
 else
@@ -1503,7 +1546,7 @@ else
   fail "gitignored-only closed-PR branch worktree was removed by --apply"
   echo "$OUT2" >&2
 fi
-if [ -f "$IGNORED_CANARY" ] && grep -q "hunter2" "$IGNORED_CANARY"; then
+if [ -f "$IGNORED_CANARY" ] && grep -Fq "hunter2" "$IGNORED_CANARY"; then
   pass "gitignored .env canary survived --apply"
 else
   fail "DATA LOSS: --apply deleted gitignored content in $IGNORED_PR_WT"
@@ -1527,7 +1570,7 @@ else
   fail "untracked-only worktree was removed by --apply despite untracked content"
   echo "$OUT2" >&2
 fi
-if [ -f "$UNTRACKED_CANARY" ] && grep -q "uncommitted analysis" "$UNTRACKED_CANARY"; then
+if [ -f "$UNTRACKED_CANARY" ] && grep -Fq "uncommitted analysis" "$UNTRACKED_CANARY"; then
   pass "untracked canary survived --apply under status.showUntrackedFiles=no"
 else
   fail "DATA LOSS: --apply deleted untracked content in $UNTRACKED_PR_WT"
@@ -1548,13 +1591,13 @@ else
   fail "gone-upstream PR-slug worktree was removed by --apply despite dirty content"
   echo "$OUT2" >&2
 fi
-if [ -f "$SIGPIPE_CANARY" ] && grep -q "EDITED BEHIND THE FLAG" "$SIGPIPE_CANARY"; then
+if [ -f "$SIGPIPE_CANARY" ] && grep -Fq "EDITED BEHIND THE FLAG" "$SIGPIPE_CANARY"; then
   pass "index-flag edit survived --apply in a worktree whose ls-files -v exceeds a pipe buffer (${SIGPIPE_BYTES}B)"
 else
   fail "DATA LOSS: --apply deleted an index-flag-hidden edit that the SIGPIPE-prone scan missed"
   echo "$OUT2" >&2
 fi
-if [ -f "$FLAG_CANARY" ] && grep -q "behind an index flag" "$FLAG_CANARY"; then
+if [ -f "$FLAG_CANARY" ] && grep -Fq "behind an index flag" "$FLAG_CANARY"; then
   pass "index-flag-hidden edit survived --apply (assume-unchanged)"
 else
   fail "DATA LOSS: --apply deleted an edit hidden by assume-unchanged in $FLAG_PR_WT"
@@ -1572,7 +1615,7 @@ else
   fail "unclean-bucket count is ${UNCLEAN_N:-unset}, expected $EXPECTED_UNCLEAN (seven required retained-unclean fixtures plus the optional submodule index-flag fixture when available) — a retained worktree is landing in an uncounted bucket"
   echo "$OUT3" | grep -E "unclean PR worktrees" >&2
 fi
-if [ -f "$GONE_PR_CANARY" ] && grep -q "nowhere else" "$GONE_PR_CANARY"; then
+if [ -f "$GONE_PR_CANARY" ] && grep -Fq "nowhere else" "$GONE_PR_CANARY"; then
   pass "gone-upstream PR-slug canary survived --apply"
 else
   fail "DATA LOSS: --apply deleted uncommitted work in $GONE_PR_WT via the gone-upstream fast path"
@@ -1592,7 +1635,7 @@ else
   fail "submodule-carrying worktree was removed by --apply despite dirty submodule content"
   echo "$OUT2" >&2
 fi
-if [ -f "$SUBMOD_CANARY" ] && grep -q "uncommitted vendor patching" "$SUBMOD_CANARY"; then
+if [ -f "$SUBMOD_CANARY" ] && grep -Fq "uncommitted vendor patching" "$SUBMOD_CANARY"; then
   pass "submodule canary survived --apply under diff.ignoreSubmodules=all"
 else
   fail "DATA LOSS: --apply deleted untracked submodule content in $SUBMOD_PR_WT"
@@ -1603,7 +1646,7 @@ fi
 # stale administrative entry, so the missing-directory worktree is gone from
 # the follow-up dry-run. This is what makes the prunable bucket self-clearing
 # (unlike the unclean bucket, which waits on a human).
-if echo "$OUT3" | grep -q -- "$PRUNE_PR_WT"; then
+if echo "$OUT3" | grep -Fq -- "$PRUNE_PR_WT"; then
   fail "prunable branch worktree entry still registered after --apply"
   echo "$OUT3" >&2
 else
@@ -1634,7 +1677,7 @@ LOCKMISS_APPLY_BLOCK=$(echo "$OUT2" | awk -v p="$LOCKMISS_PR_WT" '
   $1 == "path:" && $2 == p { want = 1 }
   END      { if (want) print buf }
 ')
-if echo "$LOCKMISS_APPLY_BLOCK" | grep -q "skipped (locked; pass --force-locked to remove)"; then
+if echo "$LOCKMISS_APPLY_BLOCK" | grep -Fq "skipped (locked; pass --force-locked to remove)"; then
   pass "locked+missing entry reported as skipped-locked by bare --apply"
 else
   fail "locked+missing entry not reported as skipped-locked by bare --apply (block='$LOCKMISS_APPLY_BLOCK')"
@@ -1672,19 +1715,19 @@ else
   echo "$OUT2" >&2
 fi
 
-if echo "$OUT3" | grep -q -- "$LOCKED_WT"; then
+if echo "$OUT3" | grep -Fq -- "$LOCKED_WT"; then
   pass "locked worktree retained after --apply (no --force-locked)"
 else
   fail "locked worktree disappeared without --force-locked"
   echo "$OUT3" >&2
 fi
-if echo "$OUT3" | grep -q -- "$ORPHAN_DIR"; then
+if echo "$OUT3" | grep -Fq -- "$ORPHAN_DIR"; then
   pass "orphan retained after --apply (no --orphan-clean)"
 else
   fail "orphan disappeared without --orphan-clean"
   echo "$OUT3" >&2
 fi
-if git branch --list "$MERGED_BRANCH" | grep -q "$MERGED_BRANCH"; then
+if git branch --list "$MERGED_BRANCH" | grep -Fq -- "$MERGED_BRANCH"; then
   fail "verified-merged local branch still present after --apply"
   echo "$OUT3" >&2
 else
@@ -1694,7 +1737,7 @@ fi
 # Case 7 (#605 + Codex P1): the diverged branch (extra commit on top of the
 # merged head) is NOT auto-deleted by --apply — the extra commit(s) may be
 # unmerged follow-up work, so it is surfaced for manual review and KEPT.
-if git branch --list "$DIVERGED_BRANCH" | grep -q "$DIVERGED_BRANCH"; then
+if git branch --list "$DIVERGED_BRANCH" | grep -Fq -- "$DIVERGED_BRANCH"; then
   pass "diverged merged branch is NOT auto-deleted (surfaced for manual review, kept)"
 else
   fail "diverged merged branch was auto-deleted — could lose unmerged follow-up work"
@@ -1722,13 +1765,13 @@ fi
 # its branch ref in the SAME run (re-snapshot after removals). Assert both
 # the worktree is gone AND the branch ref is gone AND the removal+deletion
 # were both driven by the single OUT2 invocation.
-if echo "$OUT3" | grep -q -- "$SAMERUN_WT"; then
+if echo "$OUT3" | grep -Fq -- "$SAMERUN_WT"; then
   fail "same-run: gone-upstream worktree $SAMERUN_WT still present after --apply"
   echo "$OUT2" >&2
 else
   pass "same-run: gone-upstream worktree removed by --apply"
 fi
-if git branch --list "$SAMERUN_BRANCH" | grep -q "$SAMERUN_BRANCH"; then
+if git branch --list "$SAMERUN_BRANCH" | grep -Fq -- "$SAMERUN_BRANCH"; then
   fail "same-run: branch $SAMERUN_BRANCH NOT deleted in the same --apply (stale snapshot regression)"
   echo "$OUT2" >&2
 else
@@ -1750,10 +1793,10 @@ SAMERUN_LABEL=$(echo "$OUT2" | awk -v b="$SAMERUN_BRANCH" '
   /^  \[MERGED local branch/ { label = $0; want = 1; next }
   want && $1 == "branch:" { if ($2 == b) { print label; exit } want = 0 }
 ')
-if echo "$SAMERUN_LABEL" | grep -q "checked out — keeping"; then
+if echo "$SAMERUN_LABEL" | grep -Fq "checked out — keeping"; then
   fail "same-run: OUT2 labeled $SAMERUN_BRANCH 'checked out — keeping' (stale snapshot regression)"
   echo "$OUT2" >&2
-elif echo "$SAMERUN_LABEL" | grep -q "MERGED local branch"; then
+elif echo "$SAMERUN_LABEL" | grep -Fq "MERGED local branch"; then
   pass "same-run: OUT2 classified the just-un-worktree'd branch as a deletable MERGED record"
 else
   fail "same-run: could not find a MERGED-sweep record for $SAMERUN_BRANCH in OUT2 (label='$SAMERUN_LABEL')"
@@ -1761,7 +1804,7 @@ else
 fi
 
 # Case 9 (#605): unmerged gone-upstream branch is retained by --apply.
-if git branch --list "$NOPR_BRANCH" | grep -q "$NOPR_BRANCH"; then
+if git branch --list "$NOPR_BRANCH" | grep -Fq -- "$NOPR_BRANCH"; then
   pass "unmerged gone-upstream branch retained after --apply (never deleted)"
 else
   fail "unmerged gone-upstream branch was deleted despite having no merged PR"
@@ -1779,7 +1822,7 @@ RC4=$?
 # --force-locked, git's own refusal to remove a submodule worktree retains it
 # regardless, so the assertion would prove nothing.
 if [ "${SUB_OK:-0}" = "1" ]; then
-  if [ -f "$SUB_CANARY" ] && grep -q "SUBMODULE EDIT HIDDEN BY INDEX FLAG" "$SUB_CANARY"; then
+  if [ -f "$SUB_CANARY" ] && grep -Fq "SUBMODULE EDIT HIDDEN BY INDEX FLAG" "$SUB_CANARY"; then
     pass "submodule index-flag edit survived --apply --force-locked"
   else
     fail "DATA LOSS: --apply --force-locked deleted an index-flag-hidden edit inside a submodule"
@@ -1987,6 +2030,26 @@ git init -q "$MAPPED_MAIN"
   git branch --track stable origin/stable
   git worktree add -q "$MAPPED_WT" stable
 ) >/dev/null 2>&1
+# Pin the fixture premise before asserting on the behaviour (#920 finding 5's
+# class, which survives this case even though the case it was raised against
+# did not). The subshell above discards output and its status is unchecked, so
+# a `git worktree add` or `--track` that failed under a different git version
+# leaves a repo with no `stable` branch at all — and BOTH assertions below are
+# negative (`stable` absent from the report, counter reads 0), so they would
+# pass on that repo while proving nothing about the renamed mapping. Three
+# things have to be true for the case to mean anything: the mapping is stored,
+# the local branch exists tracking it, and the remote genuinely has no
+# `refs/heads/stable` for a conventional-mapping probe to find.
+if ! git -C "$MAPPED_MAIN" config --get-all remote.origin.fetch \
+     | grep -Fqx -- '+refs/heads/release:refs/remotes/origin/stable'; then
+  fail "fixture setup: expected the renamed release→origin/stable refspec to be the only remote.origin.fetch entry"
+fi
+if ! git -C "$MAPPED_MAIN" rev-parse --verify -q 'refs/heads/stable' >/dev/null; then
+  fail "fixture setup: expected a local 'stable' branch tracking origin/stable (both assertions below would be vacuous)"
+fi
+if git --git-dir="$MAPPED_REMOTE" rev-parse --verify -q 'refs/heads/stable' >/dev/null; then
+  fail "fixture setup: the remote must NOT carry refs/heads/stable — that absence is what the probe would misread"
+fi
 
 set +e
 OUT_MAPPED_DRY=$( cd "$MAPPED_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
@@ -2424,6 +2487,222 @@ else
   fail "#892 a ']' in the branch name hid it from the apply-side gone sweep"
   echo "$OUT_BRACKET" >&2
 fi
+
+# ── Case 40 (#920 finding 1): a refspec git rejects fails closed, loudly ──
+# `git config` stores refspecs it never validates. A wildcard DESTINATION with
+# no wildcard in the source — `refs/heads/main:refs/remotes/origin/*` — is a
+# pair git refuses, and `%(upstream:track)` has to resolve every branch's
+# upstream THROUGH remote.origin.fetch, so `for-each-ref` goes fatal for the
+# repository as a whole rather than for one ref. Before the guard that 128
+# rode `pipefail` into `set -e` and killed the run with an empty terminal: no
+# records, no summary, no message, exit 128. The audit must instead say what
+# it could not read, and must not emit classification records built on an
+# inventory it never obtained.
+BADSPEC_ROOT="$WORKDIR/invalid-refspec"
+BADSPEC_REMOTE="$BADSPEC_ROOT/remote.git"
+BADSPEC_MAIN="$BADSPEC_ROOT/main"
+mkdir -p "$BADSPEC_ROOT"
+git init -q --bare "$BADSPEC_REMOTE"
+git init -q "$BADSPEC_MAIN"
+(
+  cd "$BADSPEC_MAIN"
+  git -C "$BADSPEC_MAIN" config user.email "test@example.com"
+  git -C "$BADSPEC_MAIN" config user.name "Test"
+  git -C "$BADSPEC_MAIN" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$BADSPEC_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b topic
+  git push -q -u origin topic
+  git checkout -q main
+  git config --unset-all remote.origin.fetch
+  git config --add remote.origin.fetch 'refs/heads/main:refs/remotes/origin/*'
+) >/dev/null 2>&1
+# Premise: the refspec really is stored, and git really does reject it. Both
+# halves matter — a git version that accepted the pair would make the case
+# assert a failure mode that no longer exists, and it must say so rather than
+# quietly testing nothing.
+if ! git -C "$BADSPEC_MAIN" config --get-all remote.origin.fetch \
+     | grep -Fqx -- 'refs/heads/main:refs/remotes/origin/*'; then
+  fail "fixture setup: expected the mismatched-wildcard refspec to be stored in remote.origin.fetch"
+fi
+if git -C "$BADSPEC_MAIN" for-each-ref \
+     --format='%(refname:lstrip=2) %(upstream:track)' refs/heads/ >/dev/null 2>&1; then
+  fail "fixture setup: this git accepts refs/heads/main:refs/remotes/origin/* — the case's premise no longer holds"
+fi
+set +e
+OUT_BADSPEC=$( cd "$BADSPEC_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_BADSPEC=$?
+set -e
+if [ "$RC_BADSPEC" -ne 0 ] \
+   && echo "$OUT_BADSPEC" | grep -Fq -- "could not read local branch tracking state"; then
+  pass "#920 an unreadable branch inventory names the failure instead of dying silently"
+else
+  fail "#920 a git-rejected remote.origin.fetch aborted the audit with no diagnostic (rc=$RC_BADSPEC)"
+  echo "$OUT_BADSPEC" >&2
+fi
+# The other half of the acceptance criterion: failing closed must not mean
+# failing loudly-and-wrongly. No branch may be classified off an inventory the
+# run never read, so the report must carry no records at all.
+if ! echo "$OUT_BADSPEC" | grep -Fq -- "    path:     " \
+   && ! echo "$OUT_BADSPEC" | grep -Fq -- "    branch:   "; then
+  pass "#920 no classification records are emitted from an inventory that could not be read"
+else
+  fail "#920 the audit classified branches despite an unreadable branch inventory"
+  echo "$OUT_BADSPEC" >&2
+fi
+
+# ── Case 41 (#920 finding 2): the EXIT trap reclaims every mktemp site ──
+# stale_unpruned_branches() creates its remote-heads snapshot, then reads
+# `git for-each-ref … %(upstream)` in a pipeline. Under `set -eo pipefail` a
+# failure of that producer aborts the run BEFORE the function's inline
+# `rm -f`, which is precisely the window the inline removals cannot cover.
+# The stub below fails only that call — it is keyed on `%(upstream)` WITHOUT
+# `:track`, so gone_branches()'s own for-each-ref still succeeds and the run
+# reaches the snapshot before dying. A private TMPDIR makes the leak
+# observable without depending on what else is in the shared one.
+TRAP_ROOT="$WORKDIR/trap-cleanup"
+TRAP_TMPDIR="$TRAP_ROOT/tmp"
+TRAP_STUB="$TRAP_ROOT/stub"
+mkdir -p "$TRAP_TMPDIR" "$TRAP_STUB"
+cat >"$TRAP_STUB/git" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "for-each-ref" ] && [[ "$*" == *'%(upstream)'* ]] && [[ "$*" != *'%(upstream:track)'* ]]; then
+  exit 129
+fi
+exec "$REAL_GIT" "$@"
+EOF
+chmod +x "$TRAP_STUB/git"
+git init -q --bare "$TRAP_ROOT/remote.git"
+git init -q "$TRAP_ROOT/main"
+(
+  cd "$TRAP_ROOT/main"
+  git -C "$TRAP_ROOT/main" config user.email "test@example.com"
+  git -C "$TRAP_ROOT/main" config user.name "Test"
+  git -C "$TRAP_ROOT/main" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$TRAP_ROOT/remote.git"
+  git push -q -u origin main
+) >/dev/null 2>&1
+if [ -n "$(find "$TRAP_TMPDIR" -mindepth 1 -maxdepth 1 2>/dev/null)" ]; then
+  fail "fixture setup: the private TMPDIR for the trap case is not empty before the run"
+fi
+set +e
+OUT_TRAP=$( cd "$TRAP_ROOT/main" \
+  && TMPDIR="$TRAP_TMPDIR" REAL_GIT="$(command -v git)" PATH="$TRAP_STUB:$STUB_DIR:$PATH" \
+     bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_TRAP=$?
+set -e
+# Premise: the run really did abort mid-flight. A run that completed normally
+# would leave the TMPDIR clean via the inline removals alone, and the leak
+# assertion below would pass without ever exercising the trap.
+if [ "$RC_TRAP" -eq 0 ]; then
+  fail "fixture setup: the instrumented run exited 0 — it never reached the abort the trap has to cover"
+  echo "$OUT_TRAP" >&2
+fi
+TRAP_LEAKS=$(find "$TRAP_TMPDIR" -mindepth 1 -maxdepth 1 2>/dev/null | tr '\n' ' ')
+if [ -z "${TRAP_LEAKS// /}" ]; then
+  pass "#920 the EXIT trap reclaims the remote-heads snapshot when the run aborts mid-flight"
+else
+  fail "#920 aborted run leaked temp files into TMPDIR: $TRAP_LEAKS"
+  echo "$OUT_TRAP" >&2
+fi
+
+# ── Case 42 (#920 finding 2, r1): the EXIT trap deletes nothing it did not create ──
+# Widening the trap to cover HEADS_FILE / RECORDS_FILE / MERGE_SWEEP_FILE /
+# KNOWN_FILE gave it four names it does not own outright. The script runs
+# under `set -eo pipefail` with no `set -u`, so `${KNOWN_FILE:-}` expands an
+# INHERITED exported value verbatim, and the trap then `rm -f`s a path the
+# script never created. Two of the four are reachable on an ordinary run:
+# KNOWN_FILE is assigned only inside `[ -d "$ORPHAN_ROOT" ]`, so a repo with
+# no .claude/worktrees loses it on a plain --dry-run; stale_unpruned_branches()
+# is dry-run-only, so every successful --apply loses HEADS_FILE. The other two
+# go with any abort before their assignment. A read-only audit must not delete
+# a caller's file on nothing more than a name collision, so all three runs
+# below — success under --dry-run, success under --apply, and the mid-flight
+# abort from Case 40's fixture — are asserted against the same four sentinels.
+TRAPENV_ROOT="$WORKDIR/trap-inherited-env"
+TRAPENV_SENTINELS="$TRAPENV_ROOT/sentinels"
+mkdir -p "$TRAPENV_ROOT" "$TRAPENV_SENTINELS"
+git init -q --bare "$TRAPENV_ROOT/remote.git"
+git init -q "$TRAPENV_ROOT/main"
+(
+  cd "$TRAPENV_ROOT/main"
+  git -C "$TRAPENV_ROOT/main" config user.email "test@example.com"
+  git -C "$TRAPENV_ROOT/main" config user.name "Test"
+  git -C "$TRAPENV_ROOT/main" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$TRAPENV_ROOT/remote.git"
+  git push -q -u origin main
+) >/dev/null 2>&1
+# Premise: the --dry-run and --apply legs only exercise the KNOWN_FILE window
+# while this repo has no .claude/worktrees directory. A fixture that grew one
+# would move KNOWN_FILE into its assigned branch and the leg would pass for
+# the wrong reason.
+if [ -e "$TRAPENV_ROOT/main/.claude/worktrees" ]; then
+  fail "fixture setup: expected no .claude/worktrees in the inherited-env fixture (the KNOWN_FILE window would not open)"
+fi
+# Seeds the four sentinels and runs the helper with each one exported under the
+# matching variable name; echoes the names that did not survive.
+trapenv_run() {
+  local label="$1"
+  local dir="$2"
+  shift 2
+  local n missing=""
+  for n in HEADS RECORDS MERGE_SWEEP KNOWN; do
+    printf '%s\n' "do-not-delete-$n" > "$TRAPENV_SENTINELS/$n"
+  done
+  set +e
+  ( cd "$dir" \
+    && HEADS_FILE="$TRAPENV_SENTINELS/HEADS" \
+       RECORDS_FILE="$TRAPENV_SENTINELS/RECORDS" \
+       MERGE_SWEEP_FILE="$TRAPENV_SENTINELS/MERGE_SWEEP" \
+       KNOWN_FILE="$TRAPENV_SENTINELS/KNOWN" \
+       PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color "$@" ) >/dev/null 2>&1
+  TRAPENV_RC=$?
+  set -e
+  for n in HEADS RECORDS MERGE_SWEEP KNOWN; do
+    [ -e "$TRAPENV_SENTINELS/$n" ] || missing="$missing ${n}_FILE"
+  done
+  TRAPENV_MISSING="${missing# }"
+  TRAPENV_LABEL="$label"
+}
+trapenv_assert() {
+  if [ -z "$TRAPENV_MISSING" ]; then
+    pass "#920 the EXIT trap leaves inherited temp-file variables alone ($TRAPENV_LABEL)"
+  else
+    fail "#920 the EXIT trap deleted inherited paths it never created ($TRAPENV_LABEL, rc=$TRAPENV_RC): $TRAPENV_MISSING"
+  fi
+}
+trapenv_run "successful --dry-run" "$TRAPENV_ROOT/main" --dry-run
+# Premise: a run that died early would leave most of the trap unreached and
+# the survival assertion would say nothing about the successful path.
+if [ "$TRAPENV_RC" -ne 0 ]; then
+  fail "fixture setup: the inherited-env --dry-run exited $TRAPENV_RC — it never completed the run the assertion describes"
+fi
+trapenv_assert
+trapenv_run "successful --apply" "$TRAPENV_ROOT/main" --apply
+if [ "$TRAPENV_RC" -ne 0 ]; then
+  fail "fixture setup: the inherited-env --apply exited $TRAPENV_RC — it never completed the run the assertion describes"
+fi
+trapenv_assert
+# Third leg: the abort this PR's own gone_branches() guard introduces, which
+# fires before ANY of the four is assigned. Reuses Case 40's rejected-refspec
+# repo, whose premises are pinned there.
+trapenv_run "aborted run (rejected remote.origin.fetch)" "$BADSPEC_MAIN" --dry-run
+if [ "$TRAPENV_RC" -eq 0 ]; then
+  fail "fixture setup: the rejected-refspec run exited 0 — the pre-assignment abort window never opened"
+fi
+trapenv_assert
 
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
