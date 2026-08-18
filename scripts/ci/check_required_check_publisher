@@ -1,0 +1,938 @@
+#!/usr/bin/env bash
+# check_required_check_publisher
+#
+# Regression fence for .github/workflows/required-check-publisher.yml —
+# the default-branch-owned single writer of the Checks-API lineage for the
+# three script-backed required contexts (#845 Stage A, shipped in #867).
+#
+# ─────────────────────────────────────────────────────────────────────
+# Why a fence, and why THIS shape
+# ─────────────────────────────────────────────────────────────────────
+#
+# The publisher's security and liveness properties are all structural, and
+# every one of them is a one-token edit away from silently inverting:
+#
+#   * bind a published head_sha to `github.sha` and — because on a
+#     workflow_run run `github.sha` is the DEFAULT BRANCH's last commit —
+#     all three contexts become absent on every PR head, fleet-wide,
+#     permanently, with no partial degradation to warn anyone;
+#   * add `workflow_dispatch:` and a PR branch's copy of this file can be
+#     run with `checks: write` — the P1a hole the publisher exists to
+#     close;
+#   * grant `checks: write` at WORKFLOW scope and every future job in the
+#     file inherits it — how the four-workflow exposure set grew;
+#   * delete a natively-named job from a gate workflow and the required
+#     context it produced is left with a single producer that a workflow
+#     owns.
+#
+# None of that changes any existing check's verdict, which is precisely
+# the gap #845 was filed to close.
+#
+# ASSERTION KIND. This fence is written over the PARSED document, not over
+# extracted text, and that is a deliberate reversal of #849 (mergepath's
+# most expensive lesson: eleven rounds and fifty-three review events, with
+# every finding a hole in an assertion rather than in behaviour — key →
+# value → binding → step → ordering). Precedent:
+# scripts/ci/check_merge_clearance_gate's #850 tier.
+#
+# PARSING IT IS NOT ENOUGH — it has to parse the way ACTIONS parses. A
+# cross-agent round on #974 found the whole trigger tier vacuous against
+# `On:`, because PyYAML's YAML 1.1 resolution turns `on`, `On`, `ON` and
+# `true` into one indistinguishable key while Actions reads the exact string
+# `on`. ActionsLoader below therefore keys every mapping on its RAW scalar
+# text. The same round found two more assertions vacuous in the ABSENCE
+# direction — a mapping whose extra keys were never pinned, and conditions
+# screened for falsiness instead of pinned — so the shape this file reaches
+# for is: pin the whole key set, and pin required keys as required rather
+# than as checked-if-present. An assertion that fires only where its subject
+# already exists is disarmed by deleting one line.
+#
+# ONE DISCLOSED EXCEPTION: the A2 head-binding SITE scan reads `raw_text`,
+# the file's shell text, because a `head_sha` binding has no YAML-level
+# expression to read. Stating it plainly because the residual is real —
+# a `-f head_sha=…` token inside a here-document, a diagnostic string or an
+# unrelated command counts toward the pinned total, so non-binding text
+# could backfill the count for a binding that was removed. What the
+# allowlist and count DO buy is that a new or respelled binding site cannot
+# arrive without landing in this file as a diff. Narrowing the scan to
+# parsed shell arguments needs the same substrate as everything in #977 and
+# is tracked there.
+#
+# ─────────────────────────────────────────────────────────────────────
+# SCOPE — what this fence does NOT pin, and why not here (#977)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Every property whose subject is the SHELL inside a `run:` body is out of
+# scope for this file, deliberately and by measurement rather than by
+# preference. Four review rounds on #974 produced one class of finding
+# repeatedly: an assertion that matches text where the property is
+# semantic. Each round found a NEW spelling of the same hole, which is the
+# #849 non-termination signature — so the remedy is a parsed-shell
+# substrate (`bashlex` / `shfmt --to-json`), not a sixth regex.
+#
+# Tracked in #977 and NOT asserted here:
+#   * phase-1 identity and ordering (which step opens the hold, that it
+#     iterates all three contexts, and that it POSTs rather than merely
+#     mentioning the endpoint);
+#   * the success-conclusion count (one spelling of `conclusion="success"`
+#     is countable; the assignment is not);
+#   * the read-then-write ordering of the freshness read and the head
+#     revalidation against the verdict POST (substring position is not
+#     control flow);
+#   * a job natively named for a required context, because `name:` may
+#     carry a `${{ }}` expression that Actions evaluates and a literal
+#     comparison cannot (this also retires the pinned required-context
+#     list and its hub-only reconciliation, which existed only to feed
+#     that comparison), plus the job-reachability half of the same
+#     property;
+#   * the all-jobs sweep for `checks: write` (the two known jobs ARE
+#     checked below; a third job added later is not).
+# Also tracked, in #976: the dataflow residual behind the head-binding
+# allowlist — reassigning an allowlisted variable immediately before a
+# POST rebinds it without touching any binding site.
+#
+# Stage A ships the publisher under SHADOW context names that are not in
+# branch protection, so nothing it publishes can affect a merge; that is
+# the window in which these are safe to fix properly rather than quickly.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Consumer posture (the #845 ordering constraint, enforced not advised)
+# ─────────────────────────────────────────────────────────────────────
+#
+# This wrapper travels to every consumer in the scripts/ci/ kit and runs
+# in their repo_lint. The publisher workflow is a separate manifest
+# `canonical` entry, so on a partial or not-yet-run sync wave a consumer
+# can legitimately have this check and NOT have its subject. The
+# four-quadrant guard below is what keeps that from reddening nine
+# consumers' `lint` (the exact hazard #845's body names). Same idiom as
+# scripts/ci/check_export_consumer_facts:
+#
+#   subject absent + hub marker absent  → SKIP exit 0 (consumer, pre-wave)
+#   subject absent + hub marker PRESENT → FAIL       (mergepath misconfig:
+#                                          the publisher was deleted or
+#                                          renamed in a PR)
+#   subject present                     → assertions run
+#
+# The hub marker is scripts/sync-to-downstream.sh — mergepath-only by
+# construction and never propagated (check_propagation_closure's
+# ALLOW_LIST), so its presence identifies the canonical checkout.
+#
+# Invoked by .github/workflows/repo_lint.yml alongside the other
+# scripts/ci/check_* scripts.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+# Overridable so tests/test_merge_clearance_gate.sh can aim the assertions
+# at a mutated copy without touching the canonical workflow on disk. Same
+# contract as MERGE_CLEARANCE_WORKFLOW in check_merge_clearance_gate.
+PUBLISHER="${REQUIRED_CHECK_PUBLISHER_WORKFLOW:-.github/workflows/required-check-publisher.yml}"
+PARENT_WORKFLOW="${REQUIRED_CHECK_PUBLISHER_PARENT:-.github/workflows/merge-clearance-gate.yml}"
+WORKFLOW_DIR="${REQUIRED_CHECK_PUBLISHER_WORKFLOW_DIR:-.github/workflows}"
+HUB_MARKER="scripts/sync-to-downstream.sh"
+
+FAILED=0
+
+if [ ! -f "$PUBLISHER" ]; then
+  if [ ! -f "$HUB_MARKER" ]; then
+    echo "check_required_check_publisher: SKIP (consumer checkout: $PUBLISHER + $HUB_MARKER both absent)"
+    echo "      The publisher travels as a manifest canonical entry; this wrapper"
+    echo "      travels in the scripts/ci/ kit. A consumer that has the wrapper and"
+    echo "      not yet the workflow is mid-rollout, not broken."
+    exit 0
+  fi
+  echo "FAIL: $PUBLISHER is missing but $HUB_MARKER IS present — mergepath misconfig."
+  echo "      The single writer of the Checks-API lineage for three required"
+  echo "      contexts was deleted or renamed. Nothing else in the repo asserts"
+  echo "      its existence, and after #845 Stage D the gate workflows' own"
+  echo "      sweeps are gone, so its absence is silent (#845)."
+  echo "check_required_check_publisher: FAIL"
+  exit 1
+fi
+
+# The pinned required-context list and its hub-only reconciliation against
+# scripts/audit-branch-protection.sh's CANONICAL_REQUIRED_CHECKS used to
+# live here. Both existed solely to supply the names for the "no job is
+# natively named for a required context" assertion, which #977 takes over
+# on a substrate that can read a `${{ }}`-bearing `name:`. A pinned list
+# with no consumer is a maintenance burden that asserts nothing, so it goes
+# with its assertion and returns with it.
+
+# ─────────────────────────────────────────────────────────────────────
+# The structural tier.
+# ─────────────────────────────────────────────────────────────────────
+#
+# Parser posture, and the two cases are NOT the same (identical to
+# check_merge_clearance_gate's #850 tier):
+#   - PyYAML ABSENT is an environment gap → loud SKIP, exit 0. A YAML
+#     parser is never a hard dependency of a scripts/ci/check_*.
+#     GitHub-hosted runners ship PyYAML, so enforcement is real in CI.
+#   - The DOCUMENT failing to parse is a defect → hard FAIL naming the
+#     parse error. Silently matching nothing would let a broken edit land
+#     green and surface only when Actions rejects the workflow.
+#
+# The SKIP line spells this wrapper's own name, per the S2 assertion in
+# tests/test_consumer_residue_safety.sh: this wrapper declares a consumer
+# gate, and the residue lattice reads the literal
+# `check_required_check_publisher: SKIP` out of its output to decide the
+# SKIP half of each verdict pair. A `SKIP: <reason>` line here would read
+# as RUN on both sides and hide the whole SKIP-ONLY divergence class. That
+# spelling is reserved for tooling skips inside tests/, which are not
+# verdicts. It is also the reason the trailer below reports SKIP rather
+# than PASS in this case: two verdict lines in one run would leave the
+# lattice reading a state the wrapper never actually reached.
+TIER_SKIPPED=0
+if ! python3 -c "import yaml" >/dev/null 2>&1; then
+  TIER_SKIPPED=1
+elif ! python3 - "$PUBLISHER" "$PARENT_WORKFLOW" "$WORKFLOW_DIR" <<'PY'
+import os
+import re
+import sys
+
+import yaml
+
+PUBLISHER, PARENT_WORKFLOW, WORKFLOW_DIR = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# The two publisher jobs, by key. The split into two jobs is what makes
+# every failure after phase 1 fail CLOSED; one job cannot carry both.
+OPEN_JOB = "open"
+PUBLISH_JOB = "publish"
+
+# The three gate workflows and the job each must keep natively named for
+# its required context (A5). Deleting one of these jobs does NOT merge the
+# two lineages, it DELETES one — leaving the synthetic lineage as the sole
+# producer of a required context, so a renamed/disabled/absent publisher
+# means the context has no producer at all and every PR blocks forever
+# with no partial degradation (#845 decision document, section 0).
+#
+# Keyed by BASENAME and resolved against WORKFLOW_DIR so the assertion can
+# be aimed at a fixture directory, the same way the publisher and its
+# parent are aimed at fixture files.
+NATIVE_PRODUCERS = {
+    "merge-clearance-gate.yml": (
+        "merge-clearance-gate",
+        "Merge clearance gate",
+    ),
+    "codex-p1-gate.yml": (
+        "codex-p1-gate",
+        "Codex P1 unresolved threads",
+    ),
+    "coderabbit-severity-gate.yml": (
+        "coderabbit-severity-gate",
+        "CodeRabbit unresolved blocking findings",
+    ),
+}
+
+# A9 — the trigger set, pinned EXACTLY rather than as a set of presence
+# tests, because two of the four properties are ABSENCES and an absence
+# has no positive spelling to grep for:
+#   * workflow_dispatch is absent because a manual dispatch executes the
+#     SELECTED ref's copy of the file — a PR branch runnable with
+#     checks: write, which is P1a through the manual path (cross-agent
+#     round 1 on #867). The break-glass is repository_dispatch
+#     required-check-republish: PAT-gated, always the default-branch
+#     definition.
+#   * schedule is absent until PR 4 (cross-agent round 11): the parent's
+#     */15 cron already reaches this file through the workflow_run chain,
+#     so an own cron would run a SECOND full-fleet pass every interval.
+#     PR 4 re-adds it in the same diff that deletes the gate workflows'
+#     schedules, so every stage keeps exactly one cron path.
+EXPECTED_TRIGGERS = {"workflow_run", "repository_dispatch"}
+EXPECTED_WORKFLOW_RUN_TYPES = ["requested", "in_progress", "completed"]
+EXPECTED_DISPATCH_TYPES = ["merge-clearance-recheck", "required-check-republish"]
+
+# Each trigger's mapping is pinned WHOLE, not key by key, because the
+# dangerous additions are the ones that leave every checked value intact.
+# `branches` / `branches-ignore` under workflow_run filter on the PARENT
+# run's head branch, so `branches: [main]` passes every assertion below
+# while no PR-head delivery ever reaches this workflow again: requested,
+# in_progress and completed all stop, holds are neither opened nor retired,
+# and the three contexts sit pending or stale indefinitely (cross-agent P1
+# on #974). An absence has no positive spelling to test for, so the only
+# assertion that can carry one is an exact key set.
+EXPECTED_WORKFLOW_RUN_KEYS = {"workflows", "types"}
+EXPECTED_DISPATCH_KEYS = {"types"}
+
+# A13 — the top-level key vocabulary, exactly.
+#
+# The trigger block must be identified by its OWN key, with nothing else
+# able to stand in for it. ActionsLoader closes the aliasing half (`On:`,
+# `ON:` and `true:` are no longer the `on` key); this closes the other half,
+# a SECOND top-level key arriving alongside a correct `on:`. Actions reads a
+# fixed top-level vocabulary, so a key outside it is at best inert and at
+# worst makes the file invalid — and an invalid publisher does not run at
+# all, which is the liveness failure this whole fence exists to make loud. A
+# legitimate new top-level key is a one-line diff here.
+#
+# It also reaches a shape no scoped assertion here can: a WORKFLOW-level
+# `concurrency:` block queues both jobs, including the one A10 requires to
+# stay groupless, and A10 is scoped to the `open` job so it cannot see a
+# block placed a level up.
+EXPECTED_TOP_LEVEL_KEYS = {"name", "on", "permissions", "env", "jobs"}
+
+# A4a — the eligibility shape of both phase jobs, pinned VERBATIM
+# (whitespace-normalised only, so reflowing the folded block is not a false
+# positive) rather than screened for conditions Actions cannot satisfy.
+#
+# Screening was the previous shape and it was vacuous in three directions at
+# once (cross-agent P1 on #974): it rejected a small set of literal-false
+# spellings, so any non-literal impossible condition passed; it was guarded
+# on the key's PRESENCE, so DELETING the `if:` disarmed it — the identical
+# one-line-deletion defect A6 carried; and it was scoped to `publish` alone,
+# so `open` had no eligibility assertion at all.
+#
+# LIMIT, stated rather than implied: this does not evaluate the expression.
+# The fence cannot decide that the pinned condition is the RIGHT one, only
+# that it is the reviewed one. A semantically equivalent respelling (a
+# `${{ }}` wrapper, reordered operands) trips it too, and that is the
+# assertion rather than a defect in it — the single condition deciding
+# whether each phase runs has to arrive here as a diff.
+EXPECTED_JOB_IF = {
+    OPEN_JOB: (
+        "github.event_name == 'workflow_run' && "
+        "(github.event.action == 'requested' || "
+        "github.event.action == 'in_progress')"
+    ),
+    PUBLISH_JOB: (
+        "github.event_name != 'workflow_run' || "
+        "github.event.action == 'completed'"
+    ),
+}
+
+# A4 — one FIXED queue, not a per-head group (cross-agent round 1 on
+# #867). Grouping by head left the sweep and dispatch paths outside the
+# serialization entirely, so an older evaluation on one of those paths
+# could read state before a transition and POST after a newer one.
+EXPECTED_CONCURRENCY_GROUP = "rcp-publish"
+# Actions permits exactly these two keys in a job `concurrency:` mapping, so
+# the mapping is pinned WHOLE for the same reason the trigger mappings are:
+# reading only the two keys the fence names leaves it silent about a third,
+# and an unsupported key here invalidates the default-branch publisher —
+# which then refreshes nothing at all (Codex P2, round 6 on #974).
+EXPECTED_CONCURRENCY_KEYS = {"group", "cancel-in-progress"}
+
+# A2 — every head_sha binding SITE, as an ALLOWLIST over the values those
+# sites bind rather than a denylist of wrong spellings (the #849 lesson:
+# github.sha → base.sha → literal-prefixed strings cannot be enumerated).
+#
+# SCOPE, stated exactly, because the earlier wording over-claimed. What is
+# enforced is: every argument in the file that binds the Checks-API
+# `head_sha` field names an allowlisted variable, and the NUMBER of such
+# arguments is pinned. What is NOT enforced — and cannot be, by an
+# assertion over spelling — is the VALUE such a variable holds: a
+# `head="$GITHUB_SHA"` assignment inserted immediately before an
+# allowlisted `-f head_sha="$head"` POST rebinds it without touching any
+# binding site. That residual is a dataflow property; closing it needs the
+# shell interpreted, not matched. The site-and-count fence is what keeps a
+# NEW binding from arriving unexamined.
+#
+# The event-side half of A2 is the two consuming steps' `env:` bindings that
+# their shell expansions resolve to, and it is the only half decided over the
+# parsed document. Pinning the consuming step matters: a correct binding on
+# an unrelated no-op step does not reach the Checks-API POST, but a job-wide
+# scan would still pass. Bindings are REQUIRED-AND-EXACT rather than checked
+# where present: an assertion that fires only where the key already exists is
+# disarmed by deleting the key, and the shell-side allowlist cannot cover that
+# gap — the POST would still name an allowlisted variable, now unset, the site
+# count would be unchanged, and every context would be published on an empty
+# head_sha.
+REQUIRED_HEAD_ENV = {
+    OPEN_JOB: (
+        "Open pending entries on the event head",
+        {"HEAD_SHA": "${{ github.event.workflow_run.head_sha }}"},
+    ),
+    PUBLISH_JOB: (
+        "Resolve targets, evaluate gates, publish",
+        {"RUN_HEAD": "${{ github.event.workflow_run.head_sha }}"},
+    ),
+}
+# Shell expansions a head_sha binding may name: the two event bindings
+# above and the loop/parameter variables the pass derives from the
+# open-PR list read. Anything else is off-allowlist.
+HEAD_SHELL_ALLOWED = frozenset(
+    ("$HEAD_SHA", "$RUN_HEAD", "$hd", "$head", "$head_sha")
+)
+
+# Every gh-CLI spelling that binds a request field, because the flag is
+# where the first version of this assertion leaked: it matched only
+# `-f\s+head_sha=`, so three legal equivalents — `-f "head_sha=$X"` (the
+# quoted-whole-argument form, which is this file's OWN prevailing style
+# for every `output[...]` argument), `-F head_sha=$X` (the typed-field
+# flag), and the `--field` / `--raw-field` long forms — bound anything at
+# all and still passed. The scanner therefore reads the whole argument
+# TOKEN after any field flag and asks what it binds, instead of trusting
+# one lexical arrangement of flag, space and quote.
+FIELD_FLAG_ARG = re.compile(
+    r'(?:--raw-field|--field|-[fF])'
+    r'[ \t=]*(?:\\\n[ \t]*)?'          # the flag and its value may straddle a
+                                       # line continuation, as they do here
+    r'(?P<arg>"(?:[^"\\\n]|\\.)*"|\'[^\'\n]*\'|\S+)'
+)
+# The number of head_sha binding sites in the canonical publisher: the
+# phase-1 hold POST, the phase-2 verdict POST, the sweep POST, the
+# gate() helper's POST, and the ambiguity red. The count is what makes the
+# allowlist reach a binding site nobody added yet: a new POST must arrive
+# as a conspicuous diff against this fence, where its head binding gets
+# read, rather than as one more line nobody had to look at.
+EXPECTED_HEAD_SHA_BINDINGS = 5
+# Backstop only; the allowlist above is the fence. Case-insensitive
+# because a backstop evaded by pressing shift is not one.
+GITHUB_SHA_REF = re.compile(r"github\s*\.\s*sha", re.IGNORECASE)
+
+
+def head_sha_binding(arg):
+    """The value `arg` binds to the Checks-API head_sha field, or None.
+
+    Normalises the two quoting layers a shell argument can carry — the
+    whole-argument form `"head_sha=$X"` and the value-only form
+    `head_sha="$X"` — plus `${X}` bracing, so the allowlist compares
+    WHAT is bound rather than how it was typed. A single-quoted layer is
+    deliberately left in the returned value: it suppresses expansion, so
+    the binding is a literal string and must not match an allowlist of
+    expansions.
+    """
+    quote = ""
+    if len(arg) >= 2 and arg[0] in "\"'" and arg[-1] == arg[0]:
+        quote, arg = arg[0], arg[1:-1]
+    if not arg.startswith("head_sha="):
+        return None
+    value = arg[len("head_sha="):]
+    if quote == "'":
+        return "'%s'" % value
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        value = value[1:-1]
+    return re.sub(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$", r"$\1", value)
+
+failures = []
+
+
+def bad(*lines):
+    failures.extend(lines)
+
+
+class ActionsLoader(yaml.SafeLoader):
+    """Mapping keys are their RAW scalar text, and duplicates are an error.
+
+    Both halves exist because PyYAML's defaults diverge from Actions in ways
+    that let a trigger assertion pass over a document Actions never runs:
+
+      * KEY RESOLUTION. PyYAML applies YAML 1.1 boolean resolution, so the
+        plain keys `on`, `On` and `ON` all construct to the Python value
+        True — indistinguishable from each other and from a literal `true:`.
+        Actions is case-sensitive and reads the exact string key `on`, so a
+        document respelled `On:` carries NO trigger definition at all, while
+        a value-keyed check still finds a trigger mapping and passes it
+        (cross-agent P1 on #974). The same resolution makes `on:` and
+        `true:` COLLIDE, and safe_load keeps the LAST — so a stray `true:`
+        block would be inspected in place of the real one. Keying on
+        `key_node.value` (the scalar text the scanner produced, after
+        quoting is stripped and before any resolver runs) is Actions' own
+        semantics: a workflow mapping key is a string, never a boolean and
+        never a number. It also keeps `"on":` and `on:` the same key, which
+        is correct — both are the string `on` to Actions.
+      * DUPLICATES. safe_load keeps the LAST duplicate, so a second `on:` or
+        a second `jobs:` would let this fence inspect a definition Actions
+        never runs.
+
+    Merge keys are deliberately NOT flattened: Actions does not implement
+    YAML anchors, so `<<` is an ordinary key there and stays one here.
+    """
+
+    def construct_mapping(self, node, deep=False):
+        if not isinstance(node, yaml.MappingNode):
+            return super().construct_mapping(node, deep)
+        mapping = {}
+        for key_node, value_node in node.value:
+            if not isinstance(key_node, yaml.ScalarNode):
+                raise yaml.constructor.ConstructorError(
+                    None, None,
+                    "found unhashable (complex) mapping key", key_node.start_mark)
+            if key_node.value in mapping:
+                raise yaml.constructor.ConstructorError(
+                    None, None,
+                    "found duplicate mapping key %r" % key_node.value,
+                    key_node.start_mark)
+            mapping[key_node.value] = self.construct_object(value_node, deep=deep)
+        return mapping
+
+
+def load(path):
+    with open(path, encoding="utf-8") as handle:
+        return yaml.load(handle, Loader=ActionsLoader)
+
+
+def strip_shell_comments(text):
+    """Full-line AND inline `#` comments removed.
+
+    The publisher documents its design in prose right beside the code, so an
+    unstripped match finds the explanation after the implementation is gone
+    (#689, and case B of the #845 mutation suite). Inline stripping matters
+    as much as full-line: `checks: read # checks: write` is valid YAML that
+    disables the permission while still carrying the string.
+    """
+    text = re.sub(r"(?m)^[ \t]*#.*$", "", text)
+    return re.sub(r"(?m)[ \t]#.*$", "", text)
+
+
+try:
+    doc = load(PUBLISHER)
+except Exception as exc:
+    print("FAIL: %s does not parse as YAML: %s" % (PUBLISHER, " ".join(str(exc).split())))
+    print("      A workflow that cannot be parsed must fail LOUDLY here. Silently")
+    print("      matching nothing would let a broken edit land green and surface")
+    print("      only when Actions rejects the workflow at delivery time.")
+    sys.exit(1)
+
+if not isinstance(doc, dict):
+    print("FAIL: %s parses to a non-mapping root (%s) — not a workflow document;"
+          % (PUBLISHER, type(doc).__name__))
+    print("      every assertion below would have nothing to scope to.")
+    sys.exit(1)
+
+jobs = doc.get("jobs")
+if not isinstance(jobs, dict):
+    print("FAIL: %s parses but has no jobs: mapping — the #845 publisher" % PUBLISHER)
+    print("      assertions have nothing to scope to and would pass vacuously.")
+    sys.exit(1)
+
+raw_text = strip_shell_comments(open(PUBLISHER, encoding="utf-8").read())
+
+# ── A0 — the two-phase job split exists ────────────────────────────────
+#
+# Every assertion below is scoped to `open` or `publish`, so their absence
+# is not merely a missing property — it silently empties the scope of most
+# of this fence. Reported here, first, rather than left to produce a run
+# that asserts nothing and prints PASS.
+#
+# What is NOT asserted: that neither job is natively NAMED for a required
+# context. `name:` may carry a `${{ }}` expression that Actions evaluates
+# and this fence cannot, so a literal comparison passes on exactly the
+# shape it exists to reject — the vacuity class #977 takes over.
+for want in (OPEN_JOB, PUBLISH_JOB):
+    if want not in jobs:
+        bad("FAIL: [rcp job shape] the publisher has no %r job. The two-phase" % want,
+            "      shape (open the hold, then publish the verdict) is what makes every",
+            "      failure after phase 1 fail CLOSED; one job cannot carry both. It is",
+            "      also the scope of most assertions below, which would otherwise have",
+            "      nothing to inspect and pass vacuously.")
+    elif not isinstance(jobs[want], dict):
+        bad("FAIL: [rcp job shape] job %r does not parse to a mapping, so its" % want,
+            "      permissions, steps and concurrency cannot be inspected and every",
+            "      assertion scoped to it would pass vacuously.")
+
+open_job = jobs.get(OPEN_JOB) if isinstance(jobs.get(OPEN_JOB), dict) else None
+publish_job = jobs.get(PUBLISH_JOB) if isinstance(jobs.get(PUBLISH_JOB), dict) else None
+
+# ── A13 — the top-level key vocabulary, exactly ────────────────────────
+present_top = set(doc)
+if present_top != EXPECTED_TOP_LEVEL_KEYS:
+    bad("FAIL: [rcp top-level keys] the publisher's top-level keys are %s;"
+        % sorted(present_top),
+        "      exactly %s is required. This is what makes" % sorted(EXPECTED_TOP_LEVEL_KEYS),
+        "      the trigger block below identifiable by its own key: to Actions `On:`,",
+        "      `ON:` and `true:` are NOT the `on` key — a document respelled that way",
+        "      carries no trigger definition at all — and an extra top-level key",
+        "      arriving beside a correct `on:` changes what Actions accepts without",
+        "      changing anything else this fence reads.")
+
+# ── A9 — the trigger set, exactly ──────────────────────────────────────
+#
+# `doc["on"]` is the EXACT, case-sensitive key Actions reads; ActionsLoader
+# keys the document on raw scalar text so no other spelling can answer here.
+triggers = doc.get("on")
+if not isinstance(triggers, dict):
+    bad("FAIL: [rcp trigger set] %s has no `on:` mapping under that exact," % PUBLISHER,
+        "      case-sensitive key; the publisher's delivery paths cannot be",
+        "      inspected.")
+else:
+    present = set(triggers)
+    if present != EXPECTED_TRIGGERS:
+        bad("FAIL: [rcp trigger set] the publisher's triggers are %s;" % sorted(present),
+            "      exactly %s is required. workflow_dispatch must stay ABSENT" % sorted(EXPECTED_TRIGGERS),
+            "      (a manual dispatch runs the SELECTED ref's copy of this file, so a",
+            "      PR branch could be run with checks: write — P1a through the manual",
+            "      path); schedule must stay ABSENT until #845 PR 4 (the parent's */15",
+            "      cron already reaches this file through the workflow_run chain, so an",
+            "      own cron would run a second full-fleet pass every interval).")
+    wr = triggers.get("workflow_run")
+    if not isinstance(wr, dict):
+        bad("FAIL: [rcp trigger set] workflow_run is %r, not a mapping — the" % wr,
+            "      parent list and activity types cannot be inspected and every",
+            "      assertion scoped to them would pass vacuously.")
+    else:
+        wr_keys = set(wr)
+        if wr_keys != EXPECTED_WORKFLOW_RUN_KEYS:
+            bad("FAIL: [rcp trigger set] workflow_run's keys are %s, not exactly %s."
+                % (sorted(wr_keys), sorted(EXPECTED_WORKFLOW_RUN_KEYS)),
+                "      The mapping is pinned WHOLE because the dangerous additions are",
+                "      the ones that leave every checked value intact: branches /",
+                "      branches-ignore filter on the PARENT run's head branch, so",
+                "      `branches: [main]` keeps this trigger looking correct while no",
+                "      PR-head delivery reaches the publisher again — requested,",
+                "      in_progress and completed all stop, holds are neither opened nor",
+                "      retired, and the three contexts sit pending or stale indefinitely.")
+        wr_types = wr.get("types")
+        if list(wr_types or []) != EXPECTED_WORKFLOW_RUN_TYPES:
+            bad("FAIL: [rcp trigger set] workflow_run types are %r, not %r."
+                % (wr_types, EXPECTED_WORKFLOW_RUN_TYPES),
+                "      `requested` opens the hold at parent-run creation; `in_progress` is",
+                "      the RERUN cue (a rerun re-uses the run, so `requested` never",
+                "      re-fires and the re-evaluation window would carry no pending cover);",
+                "      `completed` is the publish cue.")
+    rd = triggers.get("repository_dispatch")
+    if not isinstance(rd, dict):
+        bad("FAIL: [rcp trigger set] repository_dispatch is %r, not a mapping — the" % rd,
+            "      break-glass types cannot be inspected and the assertion below would",
+            "      pass vacuously.")
+    else:
+        rd_keys = set(rd)
+        if rd_keys != EXPECTED_DISPATCH_KEYS:
+            bad("FAIL: [rcp trigger set] repository_dispatch's keys are %s, not exactly"
+                % sorted(rd_keys),
+                "      %s. Pinned whole for the same reason as workflow_run:" % sorted(EXPECTED_DISPATCH_KEYS),
+                "      an added filter key leaves every value here intact while narrowing",
+                "      or silencing the deliveries that reach this workflow.")
+        rd_types = rd.get("types")
+        if sorted(rd_types or []) != sorted(EXPECTED_DISPATCH_TYPES):
+            bad("FAIL: [rcp trigger set] repository_dispatch types are %r, not %r."
+                % (rd_types, EXPECTED_DISPATCH_TYPES),
+                "      merge-clearance-recheck is kept VERBATIM so the #658 propagation",
+                "      lane reaches this file unchanged; required-check-republish is the",
+                "      operator break-glass and the only on-demand remedy the two sibling",
+                "      contexts have ever had.")
+
+# ── A6 — the parent name is read from the parent file, not asserted ─────
+#
+# workflow_run fires only on the parent's EXACT top-level `name:`, so a
+# rename there silently orphans every event-driven publish — with no error
+# anywhere, because a workflow that never fires looks identical to one
+# that fires and finds nothing to do.
+if isinstance(triggers, dict):
+    listed = (triggers.get("workflow_run") or {}).get("workflows") \
+        if isinstance(triggers.get("workflow_run"), dict) else None
+    # The load outcome is tracked SEPARATELY from the name it yields.
+    # Collapsing both into `parent_name is None` conflates an unreadable
+    # parent (already reported here) with a parent that parses cleanly and
+    # declares no top-level `name:` — and the second is exactly the shape
+    # this assertion exists to catch. Actions names an unnamed workflow
+    # after its PATH, so `workflows: ["Merge Clearance Gate"]` would then
+    # match no workflow and every event-driven publish is orphaned. Under
+    # a single `is not None` guard, DELETING one line from the parent
+    # disarms A6 instead of tripping it.
+    parent_loaded = True
+    parent_name = None
+    try:
+        parent_doc = load(PARENT_WORKFLOW)
+        parent_name = (parent_doc or {}).get("name")
+    except Exception as exc:
+        parent_loaded = False
+        bad("FAIL: [rcp parent name] could not read %s: %s"
+            % (PARENT_WORKFLOW, " ".join(str(exc).split())),
+            "      The publisher's workflow_run source must be verified against the",
+            "      parent's own top-level name:, not against a string in this check.")
+    if not parent_loaded:
+        pass  # already reported above; a second failure would just be noise
+    elif not isinstance(parent_name, str) or not parent_name.strip():
+        bad("FAIL: [rcp parent name] %s declares no usable top-level name:"
+            % PARENT_WORKFLOW,
+            "      (read as %r). Actions then names that workflow after its PATH," % parent_name,
+            "      so this publisher's workflow_run.workflows entry matches nothing",
+            "      and every event-driven publish is orphaned — silently, because a",
+            "      workflow that never fires looks identical to one that fires and",
+            "      finds nothing to do. A missing parent name: must trip this",
+            "      assertion, not disarm it.")
+    elif (not isinstance(listed, list) or len(listed) != 1
+          or not isinstance(listed[0], str)):
+        bad("FAIL: [rcp parent name] workflow_run.workflows is %r, not a list"
+            % listed,
+            "      containing exactly one workflow-name string. Actions requires a",
+            "      scalar top-level name: and a list of scalar workflow names; a",
+            "      matching pair of non-scalar YAML values cannot deliver this chain.")
+    elif listed != [parent_name]:
+        bad("FAIL: [rcp parent name] workflow_run.workflows is %r but %s"
+            % (listed, PARENT_WORKFLOW),
+            "      declares name: %r. ONE parent is deliberate — the Merge" % parent_name,
+            "      Clearance Gate's trigger set is a measured strict superset of both",
+            "      siblings', so a single delivery per PR event carries every refresh",
+            "      signal. And workflow_run matches on the exact top-level name, so a",
+            "      rename on either side orphans every event-driven publish silently.")
+
+# A7 — "nothing may observe the publisher via workflow_run" — is REMOVED
+# here rather than deferred for coverage, because its stated cause is
+# false. GitHub documents the limit as three levels of CHAINED workflows
+# and illustrates it with A → B → C → D → E → F, where "workflows E and F
+# will not be run" — so B, C and D all run. The Merge Clearance Gate is
+# directly triggered (A), the publisher sits at B, and a workflow
+# observing the publisher sits at C: inside the cap, and it runs. The
+# blanket rejection and the spec sentence attributing it to truncation
+# both over-claimed, which a cross-agent P2 on #974 caught and this
+# measurement confirms. Whether the publisher should have observers at all
+# is a design question, not a cap consequence; it goes to #977 with the
+# publisher-name requirement that existed only to keep this scan armed.
+
+# ── A10 — the open job stays GROUPLESS ─────────────────────────────────
+#
+# (cross-agent round 3 on #867, superseding the round-2 queue-join.) The
+# hold must become visible BEFORE a mid-flight stale pass can finish, so
+# it cannot wait behind that pass in a queue. The stale-write hazard is
+# closed on the writer's side instead, by the pre-POST freshness read the
+# spec requires (§ Ordering and the stale-write defense) — whose ORDERING
+# this fence does not itself assert; see the scope note in the header.
+if open_job is not None:
+    if "concurrency" in open_job:
+        bad("FAIL: [rcp open groupless] the `open` job carries a concurrency block.",
+            "      Queued, its pending entry waits behind a mid-flight stale pass —",
+            "      reversing the write order but leaving a post-green window until the",
+            "      queued open reaches a runner. The stale-write defense belongs to the",
+            "      writer (the pre-POST freshness read), not to a queue here.")
+
+# ── A4a — both phase jobs keep their pinned eligibility shape ──────────
+#
+# The `if` is compared VERBATIM against EXPECTED_JOB_IF (see the constant for
+# what that does and does not claim); `needs` is pinned ABSENT, and that is
+# the sharper half. `needs: open` on `publish` leaves every value this fence
+# reads unchanged, and on a `completed` delivery `open`'s own condition is
+# false — a skipped dependency skips its dependent, so the publish pass never
+# runs and every hold phase 1 opened stays pending forever (cross-agent P1 on
+# #974).
+for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
+    if job is None:
+        continue
+    want_if = EXPECTED_JOB_IF[key]
+    got_if = job.get("if")
+    if got_if is None or " ".join(str(got_if).split()) != want_if:
+        bad("FAIL: [rcp job eligibility] job %r has if: %r, not the pinned"
+            % (key, got_if),
+            "      condition %r." % want_if,
+            "      The two are DISJOINT: `open` runs on the workflow_run requested and",
+            "      in_progress deliveries, `publish` on workflow_run completed plus every",
+            "      non-workflow_run delivery. in_progress is the rerun cue and belongs to",
+            "      `open` alone — a `publish` that also ran on it would overwrite the",
+            "      rerun's own hold before the parent finished evaluating, reopening the",
+            "      stale-verdict window. A condition Actions can never satisfy — literal",
+            "      or not — makes the publisher open holds it never closes; an ABSENT if:",
+            "      makes each job run on the other's deliveries too. Pinned verbatim",
+            "      rather than screened for falsiness, so an equivalent respelling",
+            "      arrives here as a diff too.")
+    if "needs" in job:
+        bad("FAIL: [rcp job eligibility] job %r declares needs: %r. The two phase"
+            % (key, job.get("needs")),
+            "      jobs run on DISJOINT deliveries, so a dependency between them is",
+            "      never satisfied. `needs: open` on `publish` reads as harmless and",
+            "      leaves every other value here intact, while on a `completed`",
+            "      delivery `open` skips and takes `publish` with it — no verdict is",
+            "      ever published and every hold stays pending.")
+
+# ── A4 — publish is serialized on ONE fixed queue ──────────────────────
+if publish_job is not None:
+    conc = publish_job.get("concurrency")
+    if not isinstance(conc, dict):
+        bad("FAIL: [rcp publish queue] the `publish` job has no concurrency mapping.",
+            "      Without one, a sweep or dispatch pass can read state before a",
+            "      transition and POST after a newer evaluation, restoring a stale",
+            "      verdict under live names.")
+    else:
+        conc_keys = set(conc)
+        if conc_keys != EXPECTED_CONCURRENCY_KEYS:
+            bad("FAIL: [rcp publish queue] concurrency's keys are %s, not exactly %s."
+                % (sorted(conc_keys), sorted(EXPECTED_CONCURRENCY_KEYS)),
+                "      Actions permits only those two in a job concurrency mapping, so a",
+                "      third — a typo, or a key copied from the workflow level — makes the",
+                "      publisher's own definition invalid on the default branch, and an",
+                "      invalid workflow refreshes nothing at all. Pinned whole rather than",
+                "      key by key, like the trigger mappings above, because reading only",
+                "      the keys this fence names leaves it silent about the rest.")
+        if conc.get("group") != EXPECTED_CONCURRENCY_GROUP:
+            bad("FAIL: [rcp publish queue] concurrency.group is %r, not the fixed"
+                % conc.get("group"),
+                "      %r. A per-HEAD group leaves the sweep and dispatch" % EXPECTED_CONCURRENCY_GROUP,
+                "      paths outside the serialization entirely (cross-agent round 1 on",
+                "      #867); one fixed queue makes every publish pass land in arrival",
+                "      order across all three paths.")
+        if conc.get("cancel-in-progress") is not False:
+            bad("FAIL: [rcp publish queue] concurrency.cancel-in-progress is %r, not"
+                % conc.get("cancel-in-progress"),
+                "      false. Cancelling the RUNNING member would abort a pass",
+                "      mid-write; the queue is safe here only because cancellation",
+                "      lands on the PENDING member, whose work every later member",
+                "      subsumes (every pass evaluates every open PR).")
+
+# ── A11 — write scope is job-scoped, never workflow-scoped ─────────────
+top_perms = doc.get("permissions")
+if isinstance(top_perms, dict) and top_perms.get("checks") == "write":
+    bad("FAIL: [rcp permissions] the publisher grants checks: write at WORKFLOW",
+        "      scope. The grant belongs to the two jobs that write; a workflow-level",
+        "      grant hands it to every future job added to this file, which is how",
+        "      the four-workflow P1a exposure set grew in the first place (#845).")
+elif not isinstance(top_perms, dict):
+    bad("FAIL: [rcp permissions] the publisher has no workflow-level permissions",
+        "      mapping. The default-permission floor must be declared here, not",
+        "      inherited from a repository setting a consumer may not share.")
+
+for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
+    if job is None:
+        continue
+    perms = job.get("permissions")
+    if not isinstance(perms, dict):
+        bad("FAIL: [rcp permissions] job %r declares no permissions mapping, so it" % key,
+            "      inherits the workflow floor and cannot write check runs at all.")
+        continue
+    if perms.get("checks") != "write":
+        bad("FAIL: [rcp permissions] job %r has checks: %r, not write — its POSTs"
+            % (key, perms.get("checks")),
+            "      403 and that path silently stops refreshing every required context.")
+    if perms.get("actions") != "read":
+        bad("FAIL: [rcp permissions] job %r has actions: %r, not read. Both jobs"
+            % (key, perms.get("actions")),
+            "      read Actions run state — `open` guards on the parent's status,",
+            "      `publish` reads its own server-issued start time — and without the",
+            "      scope those lookups 403 into a degraded branch on repositories",
+            "      whose default workflow permission is restricted.")
+
+# ── A2 — every head_sha binding SITE is on an allowlist ────────────────
+#
+# Scope is exactly the binding sites, by spelling, plus their count; the
+# value an allowlisted variable holds at the POST is a dataflow property
+# outside any assertion over text (see HEAD_SHELL_ALLOWED above).
+#
+# The catastrophe this prevents: on a workflow_run run `github.sha` is the
+# DEFAULT BRANCH's last commit, so one such binding puts all three
+# contexts on a commit branch protection never consults — absent on every
+# PR head, fleet-wide, permanently, with no partial degradation.
+for key, job in ((OPEN_JOB, open_job), (PUBLISH_JOB, publish_job)):
+    if job is None:
+        continue
+    step_name, bindings = REQUIRED_HEAD_ENV[key]
+    matching_steps = [
+        step for step in (job.get("steps") or [])
+        if isinstance(step, dict) and step.get("name") == step_name
+    ]
+    if len(matching_steps) != 1:
+        bad("FAIL: [rcp head binding] job %r has %d steps named %r; exactly one"
+            % (key, len(matching_steps), step_name),
+            "      consuming step is required so its head binding cannot be moved to",
+            "      an unrelated step while the Checks-API POST receives an empty value.")
+        continue
+    env = matching_steps[0].get("env")
+    for name, want in bindings.items():
+        if not isinstance(env, dict) or name not in env:
+            bad("FAIL: [rcp head binding] job %r consuming step %r declares no %s"
+                % (key, step_name, name),
+                "      env binding. PRESENCE is pinned on the step that expands it, not",
+                "      somewhere else in the job: an allowlisted shell variable that is",
+                "      unset at the POST publishes every context on an empty head_sha.")
+            continue
+        got = env[name]
+        if str(got) != want:
+            bad("FAIL: [rcp head binding] job %r binds %s to %r, not %r."
+                % (key, name, got, want),
+                "      On a workflow_run run github.sha is the DEFAULT BRANCH's last",
+                "      commit. One wrong binding here makes all three required",
+                "      contexts absent on every PR head, fleet-wide, permanently —",
+                "      with no partial degradation to warn anyone (#845 risks).")
+
+head_bindings = [
+    value
+    for value in (
+        head_sha_binding(match.group("arg"))
+        for match in FIELD_FLAG_ARG.finditer(raw_text)
+    )
+    if value is not None
+]
+
+for value in head_bindings:
+    if value not in HEAD_SHELL_ALLOWED:
+        bad("FAIL: [rcp head binding] a check-run POST binds head_sha=%s, which is"
+            % value,
+            "      not on the allowlist %s." % sorted(HEAD_SHELL_ALLOWED),
+            "      This is an ALLOWLIST over the value every binding site names,",
+            "      rather than a denylist of wrong spellings, on purpose: github.sha",
+            "      → base.sha → literal-prefixed strings cannot be enumerated (the",
+            "      #849 lesson). A legitimate new binding must be added here in the",
+            "      same diff.")
+
+if len(head_bindings) != EXPECTED_HEAD_SHA_BINDINGS:
+    bad("FAIL: [rcp head binding count] %d arguments bind head_sha; exactly %d are"
+        % (len(head_bindings), EXPECTED_HEAD_SHA_BINDINGS),
+        "      expected. The allowlist above only governs binding sites this fence",
+        "      can see, so the count is pinned to make a new or deleted POST arrive",
+        "      as a diff against this file — where its head binding gets read —",
+        "      rather than as one more line nobody had to look at. If the new site",
+        "      is legitimate, raise the count in the same diff.")
+
+if GITHUB_SHA_REF.search(raw_text):
+    bad("FAIL: [rcp head binding] the publisher references github.sha. On a",
+        "      workflow_run run that is the DEFAULT BRANCH's last commit, never the",
+        "      PR head — every published context would land on a commit branch",
+        "      protection never consults.")
+
+# A8 (exactly one `conclusion="success"` assignment) and A12 (the
+# freshness read and head revalidation precede the verdict POST) are
+# REMOVED, not weakened. Both were counts and substring positions over
+# shell text: respelling the quotes adds a second unearned-green path the
+# count never sees, and appearing-before is not executing-before. #977
+# reinstates both over a parsed shell AST, where the property is the one
+# actually asserted.
+
+# ── A5 — the native producers are RETAINED ─────────────────────────────
+for basename, (job_key, context) in NATIVE_PRODUCERS.items():
+    path = os.path.join(WORKFLOW_DIR, basename)
+    if not os.path.exists(path):
+        bad("FAIL: [rcp native producer] %s is missing. It is the unconditional" % path,
+            "      producer of the %r context; without it that context's only" % context,
+            "      producer is the synthetic lineage this publisher writes, and a",
+            "      publisher that is absent, renamed, disabled or whose workflow_run",
+            "      delivery drops leaves the context with NO producer at all — every",
+            "      PR blocked forever, with no partial degradation (#845 section 0).")
+        continue
+    try:
+        gate_doc = load(path)
+    except Exception as exc:
+        bad("FAIL: [rcp native producer] %s does not parse: %s"
+            % (path, " ".join(str(exc).split())))
+        continue
+    gate_jobs = (gate_doc or {}).get("jobs")
+    if not isinstance(gate_jobs, dict) or job_key not in gate_jobs:
+        bad("FAIL: [rcp native producer] %s has no %r job." % (path, job_key),
+            "      Deleting the natively-named job does not merge the two lineages, it",
+            "      DELETES one — leaving the required context with a single producer",
+            "      that a workflow owns.")
+        continue
+    gate_job = gate_jobs[job_key]
+    display = gate_job.get("name") if isinstance(gate_job, dict) else None
+    effective = display if display is not None else job_key
+    if str(effective) != context:
+        bad("FAIL: [rcp native producer] %s job %r reports as %r, not the required"
+            % (path, job_key, effective),
+            "      context %r. Branch protection keys on that display name, so a" % context,
+            "      drift here de-wires the native lineage while every other check",
+            "      stays green.")
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+sys.exit(0)
+PY
+then
+  FAILED=1
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_required_check_publisher: FAIL"
+  exit 1
+fi
+
+# A tier that did not run must not report PASS: on the hub the only thing
+# that ran is the pinned-list reconciliation, and a green trailer would
+# claim enforcement the run never performed.
+if [ "$TIER_SKIPPED" -ne 0 ]; then
+  echo "check_required_check_publisher: SKIP (PyYAML unavailable — the #845 publisher assertions did NOT run)"
+  echo "      Install PyYAML to enforce the publisher's trigger set, head"
+  echo "      bindings, permission scope, queue shape and native producers."
+  exit 0
+fi
+
+echo "check_required_check_publisher: PASS"
+exit 0

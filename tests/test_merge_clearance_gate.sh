@@ -2873,6 +2873,657 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 25 (#845 PR 2): the required-check publisher fence —
+# scripts/ci/check_required_check_publisher must reject a publisher that
+# lost each property it names.
+#
+# The publisher (.github/workflows/required-check-publisher.yml, #867) is the
+# default-branch-owned single writer of the Checks-API lineage for the three
+# script-backed required contexts. Its security and liveness properties are
+# all structural and every one is a one-token edit from silently inverting,
+# and — because the fence is what makes them enforceable — a fence that
+# passes on the broken shape is worse than none: it certifies the regression.
+#
+# It lives HERE rather than in a file of its own on purpose. A new tests/
+# file wired into a propagated scripts/ci/check_* needs its own manifest
+# `requires:` entry, which adds `<root>` to the diff and forces the whole
+# change over the cross-cutting-refactor line for bookkeeping rather than
+# for content. This file already owns the neighbouring subject (the same
+# required context, the same Checks-API slot, the same #843 two-phase
+# publish) and already travels in the scripts/ci/ kit's requires list.
+#
+# Every fixture is DERIVED from the canonical workflow, never hand-written:
+# a hand-maintained control drifted behind the check on five consecutive
+# rounds in #849, and a control weaker than its subject is a false pass in
+# exactly the direction that hides regressions. The mcg22_case no-op guard
+# is reused for the same reason — a mutation whose anchor drifted changes
+# nothing and would otherwise report a confident pass.
+#
+# Gated on PyYAML: the fence soft-skips its whole tier without it (the
+# scripts/ci/check_workflow_parsers posture), so there would be nothing to
+# test.
+# ---------------------------------------------------------------------------
+RCP_CHECK="$ROOT/scripts/ci/check_required_check_publisher"
+RCP_WF="$ROOT/.github/workflows/required-check-publisher.yml"
+
+if [ ! -x "$RCP_CHECK" ]; then
+  echo; echo "SKIP: Test 25 (#845) — scripts/ci/check_required_check_publisher absent"
+elif [ ! -f "$RCP_WF" ]; then
+  echo; echo "SKIP: Test 25 (#845) — required-check-publisher.yml absent"
+elif ! python3 -c "import yaml" >/dev/null 2>&1; then
+  echo; echo "SKIP: Test 25 (#845) — PyYAML unavailable, the fence's tier does not run"
+elif ! command -v perl >/dev/null 2>&1; then
+  echo; echo "SKIP: Test 25 (#845) — perl unavailable (fixtures are perl-derived)"
+else
+echo; echo "--- Test 25 (#845): publisher fence rejects each broken shape"
+
+RCP_DIR="$WORKDIR/rcp"
+mkdir -p "$RCP_DIR"
+
+# A fixture workflow DIRECTORY, so the sibling-scoped assertions (native
+# producers retained; nothing observes the publisher) can be mutated too.
+# Populated from the real .github/workflows so the controls cannot drift.
+RCP_WFDIR="$RCP_DIR/workflows"
+mkdir -p "$RCP_WFDIR"
+for _f in required-check-publisher.yml merge-clearance-gate.yml \
+          codex-p1-gate.yml coderabbit-severity-gate.yml; do
+  cp "$ROOT/.github/workflows/$_f" "$RCP_WFDIR/$_f"
+done
+
+# <fixture-workflow> [workflow-dir] [parent] -> echoes rc, output to <fixture>.out
+rcp_run() {
+  local out rc
+  set +e
+  out=$(REQUIRED_CHECK_PUBLISHER_WORKFLOW="$1" \
+        REQUIRED_CHECK_PUBLISHER_WORKFLOW_DIR="${2:-$RCP_WFDIR}" \
+        REQUIRED_CHECK_PUBLISHER_PARENT="${3:-$RCP_WFDIR/merge-clearance-gate.yml}" \
+        "$RCP_CHECK" 2>&1)
+  rc=$?
+  set -e
+  printf '%s' "$out" > "$1.out"
+  echo "$rc"
+}
+
+# <name> <perl-program-or-empty> <expect: fail|pass> [expected-FAIL-substring]
+#
+# The expected-message argument is what makes a case mean anything: a broken
+# fixture can go red for an unrelated reason, and a bare rc!=0 assertion
+# would call that a pass while proving nothing about the property under test.
+rcp_case() {
+  local name="$1" prog="$2" expect="$3" want="${4:-}" f rc
+  f="$RCP_DIR/wf-$name.yml"
+  if [ -n "$prog" ]; then
+    perl -0777 -pe "$prog" "$RCP_WF" > "$f"
+  else
+    cp "$RCP_WF" "$f"
+  fi
+  if [ -n "$prog" ] && cmp -s "$RCP_WF" "$f"; then
+    fail "#845 rcp case $name: the mutation changed nothing — anchor drifted"
+    return
+  fi
+  rc=$(rcp_run "$f")
+  rcp_verdict "$name" "$rc" "$expect" "$want" "$f.out"
+}
+
+rcp_verdict() {  # <name> <rc> <expect> <want> <out-file>
+  local name="$1" rc="$2" expect="$3" want="$4" outf="$5"
+  if [ "$expect" = pass ]; then
+    if [ "$rc" -eq 0 ]; then
+      pass "#845 rcp case $name: positive control — the canonical publisher is accepted"
+    else
+      fail "#845 rcp case $name: expected pass, got rc=$rc"
+      sed 's/^/      /' "$outf" | head -4 >&2
+    fi
+    return
+  fi
+  if [ "$rc" -eq 0 ]; then
+    fail "#845 rcp case $name: expected the fence to reject this shape, got rc=0"
+  elif [ -n "$want" ] && ! grep -qF -- "$want" "$outf"; then
+    fail "#845 rcp case $name: rejected, but not for its own reason (wanted: $want)"
+    grep '^FAIL' "$outf" | sed 's/^/      /' | head -3 >&2
+  else
+    pass "#845 rcp case $name: the fence rejects it, naming the right cause"
+  fi
+}
+
+# ── Document-level preconditions ──────────────────────────────────────
+# These three guard the whole tier: each one, unreported, would leave every
+# assertion below scoped to nothing and printing PASS. They exit before the
+# `[rcp ...]` tags exist, so the needle is the message itself.
+rcp_case doc-unparseable 's{^on:$}{on:\n  bad: [unclosed}m' \
+  fail 'does not parse as YAML'
+rcp_case doc-root-not-mapping 's{\A.*\z}{- just\n- a\n- list\n}s' \
+  fail 'parses to a non-mapping root'
+rcp_case doc-jobs-not-mapping 's{^jobs:$}{jobs: []\njobs_relocated:}m' \
+  fail 'has no jobs: mapping'
+# The loader's own two guards, which nothing else reaches. A DUPLICATE key is
+# the sharper one: yaml.safe_load keeps the LAST, so a second `jobs:` would
+# let this fence inspect a definition Actions never runs — it rejects
+# duplicates outright. A COMPLEX (non-scalar) key is unhashable and would
+# abort construction with a traceback rather than a named verdict.
+rcp_case doc-duplicate-key \
+  's{\z}{jobs:\n  extra:\n    runs-on: ubuntu-latest\n}s' \
+  fail 'duplicate mapping key'
+rcp_case doc-complex-key \
+  's{^jobs:$}{? [complex, key]\n: unreachable\njobs:}m' \
+  fail 'complex) mapping key'
+
+# ── A0 — the two-phase job split, which is the SCOPE of most assertions ──
+# Deleting one of the two jobs does not merely lose a property: it empties
+# the scope of the permission, queue, groupless and head-binding-env
+# assertions below, so it has to be reported rather than left to produce a
+# run that inspects nothing and prints PASS.
+rcp_case job-missing 's{^  publish:\n}{  publish-renamed:\n}m' \
+  fail 'the publisher has no'
+# A job key that parses to something other than a mapping is the same
+# emptied scope with a different spelling.
+rcp_case job-not-mapping 's{^  publish:$}{  publish: ["not-a-mapping"]\n  publish-relocated:}m' \
+  fail 'does not parse to a mapping'
+
+# ── A13 — the top-level key vocabulary, and the `on` key's exact spelling ──
+#
+# These four are the regression guard for the cross-agent P1 that found the
+# whole trigger tier vacuous against a legal-looking respelling. PyYAML
+# applies YAML 1.1 boolean resolution, so `on`, `On`, `ON` and `true` all
+# construct to one indistinguishable key; Actions is case-sensitive and reads
+# the exact string `on`. A checker that accepted any of those spellings
+# passed a document Actions carries NO trigger definition for.
+#
+# 1. `On:` — the respelling itself. Actions sees no `on` key at all.
+rcp_case on-capitalised 's{^on:$}{On:}m' \
+  fail 'has no `on:` mapping under that exact'
+# 2. `true:` ALONGSIDE a correct `on:` — the resolved-key COLLISION, and the
+#    sharpest of the four. The appended block is a valid-looking copy of the
+#    real trigger set, so under value-keyed loading `safe_load` kept the LAST
+#    of the two colliding keys and every assertion below inspected the
+#    APPENDED block while Actions read (or rejected) the real one. Keying on
+#    raw scalar text makes them two distinct keys, and the pinned vocabulary
+#    is what reports the second.
+rcp_case on-true-collision \
+  's{\z}{true:\n  workflow_run:\n    workflows: ["Merge Clearance Gate"]\n    types: [requested, in_progress, completed]\n  repository_dispatch:\n    types: [merge-clearance-recheck, required-check-republish]\n}s' \
+  fail 'top-level keys are'
+# 3. Any other extra top-level key. `run-name` is a real Actions key, which is
+#    the point: the claim is not "this key is invalid", it is "the publisher's
+#    top-level shape changed and no other assertion here would have seen it".
+rcp_case toplevel-extra-key 's{^on:$}{run-name: publisher\non:}m' \
+  fail 'top-level keys are'
+# 3b. The same assertion, on the shape that motivates it beyond the `on` key.
+#     A WORKFLOW-level `concurrency:` block queues both jobs — including the
+#     one A10 requires to stay groupless — and A10 is scoped to the `open` job
+#     alone, so it cannot see a block placed a level up. This is a live Codex
+#     P2 on this PR, closed here by the vocabulary pin rather than by a second
+#     scoped assertion; the case exists so that coverage is asserted instead of
+#     incidental.
+rcp_case toplevel-concurrency \
+  's{^permissions:$}{concurrency:\n  group: rcp-all\n  cancel-in-progress: false\npermissions:}m' \
+  fail 'top-level keys are'
+# 4. Non-vacuity in the other direction: `"on":` is the SAME key to Actions,
+#    so a fence that reddened on it would be trading the leak for a false
+#    positive on a legal respelling.
+rcp_case on-quoted 's{^on:$}{"on":}m' pass
+
+# ── A9 — the trigger set, which is two ABSENCES as much as two presences ──
+# workflow_dispatch runs the SELECTED ref's copy of the file, so a PR branch
+# could be run with checks: write — P1a through the manual path.
+rcp_case trig-dispatch \
+  's{^  repository_dispatch:$}{  workflow_dispatch:\n  repository_dispatch:}m' \
+  fail "the publisher's triggers are"
+# schedule stays absent until PR 4: the parent's */15 cron already reaches
+# this file through the workflow_run chain, so an own cron would run a
+# second full-fleet pass every interval.
+rcp_case trig-schedule \
+  's{^  repository_dispatch:$}{  schedule:\n    - cron: "*/15 * * * *"\n  repository_dispatch:}m' \
+  fail "the publisher's triggers are"
+# in_progress is the RERUN cue — a rerun re-uses the run, so `requested`
+# never re-fires and the re-evaluation window would carry no pending cover.
+rcp_case trig-types \
+  's{types: \[requested, in_progress, completed\]}{types: [requested, completed]}' \
+  fail 'workflow_run types are'
+# An `on:` that is not a mapping has no triggers to inspect; unreported it
+# would take the whole trigger tier with it.
+rcp_case trig-on-absent \
+  's{^on:$}{on: just-a-string\non_relocated:}m' \
+  fail 'has no `on:` mapping'
+# required-check-republish is the operator break-glass and the only
+# on-demand remedy the two sibling contexts have ever had; dropping it is
+# silent until someone needs it.
+rcp_case trig-rd-types \
+  's{types: \[merge-clearance-recheck, required-check-republish\]}{types: [merge-clearance-recheck]}' \
+  fail 'repository_dispatch types are'
+
+# Each trigger's mapping is pinned WHOLE, because the dangerous additions
+# leave every checked value intact. `branches` / `branches-ignore` filter on
+# the PARENT run's head branch, so this mutation keeps `workflows:` and
+# `types:` exactly as the fence wants them while no PR-head delivery ever
+# reaches the publisher again — requested, in_progress and completed all
+# stop, holds are neither opened nor retired, and the three contexts sit
+# pending or stale indefinitely (cross-agent P1 on #974). An absence has no
+# positive spelling to test for, so an exact key set is the only assertion
+# that can carry one.
+rcp_case wr-branches \
+  's{^(    types: \[requested, in_progress, completed\])$}{    branches: [main]\n$1}m' \
+  fail "workflow_run's keys are"
+rcp_case rd-extra-key \
+  's{^(    types: \[merge-clearance-recheck, required-check-republish\])$}{    branches: [main]\n$1}m' \
+  fail "repository_dispatch's keys are"
+# A trigger that parses to something other than a mapping empties the scope
+# of every assertion above it — the same vacuity as a missing `on:`, one
+# level down.
+rcp_case wr-not-mapping \
+  's{^  workflow_run:$}{  workflow_run: []\n  workflow_run_relocated:}m' \
+  fail '[rcp trigger set] workflow_run is'
+rcp_case rd-not-mapping \
+  's{^  repository_dispatch:$}{  repository_dispatch: []\n  repository_dispatch_relocated:}m' \
+  fail '[rcp trigger set] repository_dispatch is'
+
+# ── A6 — the parent name is verified against the parent FILE ───────────
+# workflow_run matches the parent's exact top-level name:, so a rename on
+# either side orphans every event-driven publish — silently, because a
+# workflow that never fires looks identical to one that finds nothing to do.
+rcp_case parent-name \
+  's{workflows: \["Merge Clearance Gate"\]}{workflows: ["Merge Clearance Gate Renamed"]}' \
+  fail 'workflow_run.workflows is'
+
+# A rename is only HALF the shape. The parent name is read out of the
+# parent FILE, so it is None in two different situations: the file did not
+# load, and the file loaded fine but declares no top-level `name:`. Under
+# one `is not None` guard only the first is reported and the second skips
+# the comparison entirely — so DELETING one line from the parent disarms
+# A6 instead of tripping it. That deletion is the worse half: Actions then
+# names the parent after its PATH, `workflows: ["Merge Clearance Gate"]`
+# matches no workflow at all, and every event-driven publish is orphaned.
+# These cases mutate the PARENT rather than the publisher, so they need
+# the parent-path argument rcp_run already takes.
+rcp_parent_case() {  # <name> <perl-program-on-parent> <expect> [needle]
+  local name="$1" prog="$2" expect="$3" want="${4:-}" f p rc
+  f="$RCP_DIR/wf-$name.yml"
+  p="$RCP_DIR/parent-$name.yml"
+  cp "$RCP_WF" "$f"
+  perl -0777 -pe "$prog" "$RCP_WFDIR/merge-clearance-gate.yml" > "$p"
+  if cmp -s "$RCP_WFDIR/merge-clearance-gate.yml" "$p"; then
+    fail "#845 rcp case $name: the parent mutation changed nothing — anchor drifted"
+    return
+  fi
+  rc=$(rcp_run "$f" "$RCP_WFDIR" "$p")
+  rcp_verdict "$name" "$rc" "$expect" "$want" "$f.out"
+}
+
+# <name> <perl-program-on-publisher> <perl-program-on-parent> <expect> [needle]
+# Mutates both halves of a cross-file assertion. A fixture that only changes
+# one side cannot prove type validation: the old Python comparison accepted a
+# list-valued parent name only when the publisher carried the matching nested
+# list too.
+rcp_parent_pair_case() {
+  local name="$1" pub_prog="$2" parent_prog="$3" expect="$4" want="${5:-}" f p rc
+  f="$RCP_DIR/wf-$name.yml"
+  p="$RCP_DIR/parent-$name.yml"
+  perl -0777 -pe "$pub_prog" "$RCP_WF" > "$f"
+  perl -0777 -pe "$parent_prog" "$RCP_WFDIR/merge-clearance-gate.yml" > "$p"
+  if cmp -s "$RCP_WF" "$f" || cmp -s "$RCP_WFDIR/merge-clearance-gate.yml" "$p"; then
+    fail "#845 rcp case $name: a paired mutation changed nothing — anchor drifted"
+    return
+  fi
+  rc=$(rcp_run "$f" "$RCP_WFDIR" "$p")
+  rcp_verdict "$name" "$rc" "$expect" "$want" "$f.out"
+}
+
+# The needle is the MISSING-name message, not the bare `[rcp parent name]`
+# tag, because the tag alone does not discriminate: a blank name already
+# tripped the rename comparison, and a case that accepts either message
+# would pass against the very fence that carries the hole.
+rcp_parent_case parent-name-missing 's{^name: Merge Clearance Gate\n}{}m' \
+  fail 'declares no usable top-level name:'
+# An empty name: is the same orphaning with a different spelling — YAML
+# reads it as "" rather than None, so an `is None` test alone still lets it
+# through while Actions still falls back to the path. It has to be reported
+# as a MISSING name; the rename message the comparison used to emit names
+# the wrong cause and sends a maintainer looking for a mismatch.
+rcp_parent_case parent-name-blank 's{^name: Merge Clearance Gate$}{name: ""}m' \
+  fail 'declares no usable top-level name:'
+# Actions requires a scalar parent name and a list of scalar workflow names.
+# The old `list(listed) == [parent_name]` comparison accepted matching nested
+# lists, even though that trigger cannot deliver the publisher at all.
+rcp_parent_pair_case parent-name-nonscalar \
+  's{workflows: \["Merge Clearance Gate"\]}{workflows: [[Merge Clearance Gate]]}' \
+  's{^name: Merge Clearance Gate$}{name: [Merge Clearance Gate]}m' \
+  fail 'declares no usable top-level name:'
+# `workflows:` itself must be a list of strings. A one-character scalar name
+# was another old false clear: `list("M") == ["M"]` held even though Actions
+# treats the scalar as an invalid trigger value.
+rcp_parent_pair_case workflow-name-not-list \
+  's{workflows: \["Merge Clearance Gate"\]}{workflows: M}' \
+  's{^name: Merge Clearance Gate$}{name: M}m' \
+  fail 'not a list'
+# The third outcome, and the regression guard for the round-1 fix: an
+# UNREADABLE parent must report the load failure and NOT also report a
+# missing name. Tracking the load outcome separately from the name it
+# yields is what distinguishes the two; conflating them is what let a
+# one-line deletion disarm A6 in the first place.
+rcp_parent_case parent-unreadable 's{^name: Merge Clearance Gate$}{name: [unclosed}m' \
+  fail 'could not read'
+
+# ── A2 — head bindings, as an allowlist over every binding ─────────────
+# The catastrophe: on a workflow_run run github.sha is the DEFAULT BRANCH's
+# last commit, so ONE such binding makes all three contexts absent on every
+# PR head, fleet-wide, permanently, with no partial degradation.
+rcp_case head-env \
+  's{HEAD_SHA: \$\{\{ github.event.workflow_run.head_sha \}\}}{HEAD_SHA: \$\{\{ github.sha \}\}}' \
+  fail 'binds HEAD_SHA to'
+# The publish job's own event binding — the second half of the same
+# assertion, which had no case and could only have failed on the `open` job.
+rcp_case head-env-publish \
+  's{RUN_HEAD: \$\{\{ github.event.workflow_run.head_sha \}\}}{RUN_HEAD: \$\{\{ github.sha \}\}}' \
+  fail 'binds RUN_HEAD to'
+# PRESENCE, not just value. Guarded on `if name in env`, the assertion above
+# fires only where the key already exists, so DELETING it disarmed the check
+# instead of tripping it — the A6 defect in a second place. The shell-side
+# allowlist cannot cover the gap: the POST still names `$HEAD_SHA`, which is
+# allowlisted, the site count is unchanged at five, and the publisher would
+# open every hold on an empty head_sha.
+rcp_case head-env-absent \
+  's{^          HEAD_SHA: \$\{\{ github.event.workflow_run.head_sha \}\}\n}{}m' \
+  fail 'declares no HEAD_SHA'
+# A binding on an unrelated step does not reach the shell that POSTS the
+# check run. A job-wide scan accepted this relocation, so the canonical
+# consuming step is now part of the assertion's scope.
+rcp_case head-env-relocated \
+  's{(      - name: Open pending entries on the event head\n)}{      - name: Decoy head binding\n        env:\n          HEAD_SHA: \$\{\{ github.event.workflow_run.head_sha \}\}\n        run: echo decoy\n$1}s; s{(      - name: Open pending entries on the event head\n.*?\n)          HEAD_SHA: [^\n]*\n}{$1}sm' \
+  fail 'consuming step'
+# A denylist of wrong spellings does not terminate (#849): this case uses a
+# binding that is neither github.sha nor any spelling a denylist would carry,
+# and it must still be refused for being off-allowlist.
+rcp_case head-post \
+  's{-f head_sha="\$HEAD_SHA"}{-f head_sha="\$GITHUB_SHA"}' \
+  fail 'a check-run POST binds head_sha='
+
+# The allowlist has to be an allowlist over BINDING SITES, not over one
+# lexical arrangement of flag, space and quote. The first version matched
+# only `-f\s+head_sha=`, and these three legal gh-CLI equivalents each bound
+# $GITHUB_SHA — the exact catastrophe A2 names — while the fence stayed
+# green. The quoted-whole-argument form is the publisher's OWN prevailing
+# style (every `output[...]` argument is written `-f "key=value"`), so it is
+# the spelling a maintainer reaches for first.
+rcp_case head-post-quoted-arg \
+  's{-f head_sha="\$HEAD_SHA" \\}{-f "head_sha=\$GITHUB_SHA" \\}' \
+  fail 'a check-run POST binds head_sha='
+rcp_case head-post-typed-flag \
+  's{-f head_sha="\$hd" \\}{-F head_sha="\$GITHUB_SHA" \\}' \
+  fail 'a check-run POST binds head_sha='
+rcp_case head-post-long-flag \
+  's{-f head_sha="\$RUN_HEAD" \\}{--field head_sha="\$GITHUB_SHA" \\}' \
+  fail 'a check-run POST binds head_sha='
+# Non-vacuity in the other direction: judging the VALUE, not the spelling.
+# A respelled site that still binds an allowlisted variable is legal, and a
+# fence that reddened on it would be trading one leak for a false positive.
+rcp_case head-post-respelled-legal \
+  's{-f head_sha="\$head" \\}{-f "head_sha=\$head" \\}' \
+  pass
+# The count is pinned alongside the allowlist so a NEW POST cannot arrive
+# without its head binding being read — an added site binds an allowlisted
+# variable here, and must still be refused until the count moves in the same
+# diff.
+rcp_case head-post-count \
+  's{^([ \t]*-f head_sha="\$HEAD_SHA" \\)$}{$1\n$1}m' \
+  fail '[rcp head binding count]'
+# COMMENT STRIPPING — three cases, because `strip_shell_comments` is two
+# regexes and they cover different columns. The publisher documents its
+# design in prose right beside the code (#689), so an unstripped scan reads
+# the explanation as if it were the implementation.
+#
+# Each case below was verified to DISCRIMINATE by disabling one regex in a
+# copy of the fence and confirming the case flips; a case that stays green
+# against a broken fence is not coverage.
+#
+# 1. Removal direction: commenting a binding site out must drop the count to
+#    4. Unstripped, the count would still read 5 and the fence would go
+#    green while the site was gone — certifying a shape it never saw.
+rcp_case head-comment-full \
+  's{^([ \t]*)(-f head_sha="\$RUN_HEAD" \\)$}{$1# $2}m' \
+  fail '[rcp head binding count]'
+# 2. Addition direction, INLINE (`[ \t]#` — a comment after code), and it
+#    must PASS: a commented-out off-allowlist binding is prose, not a
+#    binding. Unstripped it reads as a sixth site binding $GITHUB_SHA and
+#    trips both the allowlist and the count — a false positive on a file
+#    whose own style is to explain each POST beside it.
+rcp_case head-comment-inline \
+  's{^([ \t]*-f head_sha="\$head" \\)$}{$1 # -f head_sha="\$GITHUB_SHA"}m' \
+  pass
+# 3. Addition direction, COLUMN 0 (`^[ \t]*#` — a whole-line comment). This
+#    is the case the inline regex cannot cover: it requires whitespace
+#    before the `#`, so an unindented comment reaches the scanner untouched.
+#    The publisher carries exactly this shape — top-level banner comments
+#    explaining the head-binding rules, including the wrong spellings.
+rcp_case head-comment-toplevel \
+  's{^(on:)$}{# -f head_sha="\$GITHUB_SHA"\n$1}m' \
+  pass
+# The github.sha backstop is matched case-insensitively; a backstop evaded by
+# pressing shift is not one. Mutated on a NEUTRAL env key so only the
+# backstop — not the HEAD_SHA/RUN_HEAD binding assertion — can produce the
+# verdict.
+rcp_case head-sha-case \
+  's{PARENT_RUN_ID: \$\{\{ github.event.workflow_run.id \}\}}{PARENT_RUN_ID: \$\{\{ GitHub.Sha \}\}}' \
+  fail 'the publisher references github.sha'
+
+# ── A4a — both phase jobs keep their pinned eligibility shape ──────────
+#
+# The previous version of this assertion screened `publish`'s `if:` for
+# literal-false spellings, and a cross-agent P1 on #974 found it vacuous in
+# three directions at once. Each of the five cases below is one of those
+# directions; the first is the only one the old shape caught.
+#
+# 1. A literal-false condition (what the screen did catch).
+rcp_case publish-falsy \
+  's{^    if: github.event_name != .workflow_run. \|\| github.event.action == .completed.$}{    if: \$\{\{ false \}\}}m' \
+  fail '[rcp job eligibility]'
+# 2. A NON-literal condition Actions can never satisfy. No falsiness screen
+#    terminates against this class: an event name that never occurs is one
+#    spelling of infinitely many, which is why the condition is pinned
+#    verbatim instead of screened.
+rcp_case publish-impossible \
+  's{^    if: github.event_name != .workflow_run. \|\| github.event.action == .completed.$}{    if: github.event_name == \x27never-an-event\x27}m' \
+  fail '[rcp job eligibility]'
+# 3. DELETING the `if:`. The screen was guarded on the key's presence, so a
+#    one-line deletion disarmed it — the identical defect A6 carried. The
+#    publisher would then publish on `requested` too, on a head phase 1 has
+#    not finished claiming.
+rcp_case publish-if-absent \
+  's{^    if: github.event_name != .workflow_run. \|\| github.event.action == .completed.\n}{}m' \
+  fail '[rcp job eligibility]'
+# 4. The `open` job, which the screen never looked at AT ALL. Drifting its
+#    condition to the publish cue means no hold is ever opened: every
+#    verdict lands with no pending cover and a dropped delivery leaves the
+#    previous green standing.
+rcp_case open-if-drift \
+  's{\(github.event.action == \x27requested\x27}{(github.event.action == \x27completed\x27}' \
+  fail '[rcp job eligibility]'
+# 5. Deleting `open`'s condition, the same disarm one job over.
+rcp_case open-if-absent \
+  's{^    if: >-\n(      .*\n)+?    runs-on:}{    runs-on:}m' \
+  fail '[rcp job eligibility]'
+
+# `needs:` is pinned ABSENT on both, and it is the sharper half of the same
+# finding: it leaves every value the fence reads unchanged. The two phase
+# jobs run on DISJOINT deliveries, so on a `completed` delivery `open` skips
+# — and a skipped dependency skips its dependent, so `publish` never runs,
+# no verdict is ever published, and every hold phase 1 opened stays pending.
+rcp_case publish-needs \
+  's{^(  publish:\n    name: publish\n)}{$1    needs: open\n}m' \
+  fail 'declares needs:'
+rcp_case open-needs \
+  's{^(  open:\n    name: open\n)}{$1    needs: publish\n}m' \
+  fail 'declares needs:'
+# A per-HEAD group leaves the sweep and dispatch paths outside the
+# serialization entirely, which is the stale-restore the fixed queue closes.
+rcp_case publish-group \
+  's{group: rcp-publish}{group: rcp-publish-\$\{\{ github.event.workflow_run.head_sha \}\}}' \
+  fail 'concurrency.group is'
+rcp_case publish-cancel \
+  's{cancel-in-progress: false}{cancel-in-progress: true}' \
+  fail 'concurrency.cancel-in-progress is'
+# The concurrency mapping is pinned WHOLE, like the trigger mappings: Actions
+# permits only `group` and `cancel-in-progress` in a job concurrency block, so
+# a third key — a typo, or one copied from the workflow level — invalidates
+# the publisher's own definition, and an invalid workflow refreshes nothing.
+# Reading only the two keys the fence names left it silent about the rest.
+rcp_case publish-conc-extra-key \
+  's{^(      cancel-in-progress: false)$}{$1\n      cancel-in-progres: false}m' \
+  fail "concurrency's keys are"
+# No queue at all is the same stale-restore as the wrong queue, and it is
+# reached by DELETING rather than editing — the direction a group/cancel
+# case cannot cover.
+rcp_case publish-noconc \
+  's{^    concurrency:\n      group: rcp-publish\n      cancel-in-progress: false\n}{}m' \
+  fail 'has no concurrency mapping'
+
+# ── A10 — the open job stays groupless ────────────────────────────────
+# Queued, the hold waits behind a mid-flight stale pass: the write order is
+# reversed but a post-green window stays open until the queued job reaches a
+# runner (cross-agent round 3 on #867, superseding the round-2 queue-join).
+rcp_case open-group \
+  's{^    runs-on: ubuntu-latest\n(    # GROUPLESS)}{    runs-on: ubuntu-latest\n    concurrency:\n      group: rcp-open\n$1}m' \
+  fail '[rcp open groupless]'
+
+# ── A11 — write scope is job-scoped, never workflow-scoped ────────────
+rcp_case perms-actions \
+  's{^      actions: read\n      checks: write\n    steps:}{      checks: write\n    steps:}m' \
+  fail 'not read. Both jobs'
+# The workflow-level grant is P1a in miniature: it hands checks: write to
+# every future job added to this file.
+rcp_case perms-top \
+  's{^permissions:\n  contents: read$}{permissions:\n  contents: read\n  checks: write}m' \
+  fail 'grants checks: write at WORKFLOW'
+# The floor must be DECLARED, not inherited from a repository setting a
+# consumer may not share.
+rcp_case perms-top-absent \
+  's{^permissions:\n  contents: read\n}{}m' \
+  fail 'has no workflow-level permissions'
+# A job with no permissions mapping inherits the floor and cannot write
+# check runs at all — the publisher silently stops publishing.
+rcp_case perms-job-absent \
+  's{^    permissions:\n(      .*\n|      #.*\n)+?      checks: write\n}{}m' \
+  fail 'declares no permissions mapping'
+# checks: read is the one-token inversion: every POST 403s and that path
+# quietly stops refreshing all three contexts.
+rcp_case perms-job-checks \
+  's{^      checks: write$}{      checks: read}m' \
+  fail 'not write — its POSTs'
+
+# The phase-1 ordering cases (A3), the success-conclusion count (A8) and
+# the read-then-write ordering cases (A12) were REMOVED with their
+# assertions, not left as untested prose. Each asserted a property of the
+# SHELL by matching its text, and four review rounds on #974 found a new
+# spelling of that hole every round — the #849 non-termination signature.
+# #977 reinstates all three over a parsed shell AST. A mutation case for an
+# assertion that no longer exists is worse than no case: it reads as
+# coverage.
+
+# ── A5 — sibling-scoped properties, mutated in the fixture DIR ─────────
+#
+# A5: deleting the natively-named job does not merge the two lineages, it
+# DELETES one — leaving a required context whose only producer is a
+# workflow, so a publisher that is absent, renamed, disabled or whose
+# workflow_run delivery drops leaves it with NO producer and blocks every
+# PR forever, with no partial degradation to warn anyone.
+# <name> <shell-run-inside-the-fixture-dir> <expect> [needle]
+#
+# The publisher itself is re-copied unmutated each time, so only the
+# sibling under test can produce the verdict.
+rcp_dir_case() {
+  local name="$1" prog="$2" expect="$3" want="${4:-}" dir rc
+  dir="$RCP_DIR/wfdir-$name"
+  rm -rf "$dir"; mkdir -p "$dir"
+  cp "$RCP_WFDIR"/*.yml "$dir/"
+  ( cd "$dir" && eval "$prog" )
+  if diff -q -r "$RCP_WFDIR" "$dir" >/dev/null 2>&1; then
+    fail "#845 rcp case $name: the mutation changed nothing — anchor drifted"
+    return
+  fi
+  cp "$RCP_WF" "$dir/required-check-publisher.yml"
+  rc=$(rcp_run "$dir/required-check-publisher.yml" "$dir" "$dir/merge-clearance-gate.yml")
+  rcp_verdict "$name" "$rc" "$expect" "$want" "$dir/required-check-publisher.yml.out"
+}
+
+# Renaming the natively-named job: the context keeps a producer in name
+# only.
+rcp_dir_case native-producer \
+  'perl -0777 -i -pe "s{^  codex-p1-gate:\$}{  codex-p1-gate-renamed:}m" codex-p1-gate.yml' \
+  fail "has no 'codex-p1-gate' job"
+# Deleting the whole gate workflow is the same loss by a blunter route, and
+# it is the one an assertion scoped to a job inside the file cannot see.
+rcp_dir_case native-producer-absent \
+  'rm -f codex-p1-gate.yml' \
+  fail 'is missing. It is the unconditional'
+# A gate workflow that does not parse produces nothing at all; silently
+# skipping it would report a producer the repo does not have.
+rcp_dir_case native-producer-unparseable \
+  'printf "jobs:\n  x: [unclosed\n" > codex-p1-gate.yml' \
+  fail 'does not parse:'
+# Branch protection keys on the DISPLAY name, so changing `name:` de-wires
+# the native lineage while the job key — and every other check — stays
+# green. The quietest of the four.
+#
+# The name is REPLACED, not inserted. Inserting a second `name:` is a
+# duplicate mapping key, which ActionsLoader rejects before the display-name
+# comparison is ever reached — so the case went red on the parse branch and
+# a bare `[rcp native producer]` needle called that a pass. It proved
+# nothing about name drift. Caught only after the needle was sharpened to
+# the branch's own message, which is the argument for sharpening them.
+rcp_dir_case native-producer-name-drift \
+  'perl -0777 -i -pe "s{^(  codex-p1-gate:\n    name: )Codex P1 unresolved threads\$}{\$1Something Else}m" codex-p1-gate.yml' \
+  fail 'reports as'
+
+# The A7 observer fixture is REMOVED because the assertion it exercised was
+# wrong, not merely under-powered. GitHub documents the cap as three levels
+# of CHAINED workflows, illustrated as A → B → C → D → E → F where "E and F
+# will not be run" — so C runs. The directly-triggered Merge Clearance Gate
+# is A, the publisher is B, and an observer of the publisher is C: inside
+# the cap. The fixture asserted a truncation that does not occur.
+
+# ── Consumer posture — the #845 ordering constraint, as a test ─────────
+#
+# The fence travels in the scripts/ci/ kit; the publisher is a separate
+# manifest canonical entry. A consumer that has the wrapper and not yet the
+# workflow is mid-rollout, and this is the assertion that keeps it from
+# reddening nine consumers' lint. The mergepath direction is the other half:
+# there, the same absence is a deleted single writer and must be loud.
+RCP_CONSUMER="$RCP_DIR/consumer"
+mkdir -p "$RCP_CONSUMER/scripts/ci" "$RCP_CONSUMER/.github/workflows"
+cp "$RCP_CHECK" "$RCP_CONSUMER/scripts/ci/check_required_check_publisher"
+set +e
+OUT=$(cd "$RCP_CONSUMER" && ./scripts/ci/check_required_check_publisher 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "SKIP (consumer checkout"; then
+  pass "#845 rcp consumer: publisher + hub marker both absent → SKIP exit 0 (no consumer lint red)"
+else
+  fail "#845 rcp consumer: expected SKIP exit 0 on a consumer-shaped tree; got rc=$RC"
+  printf '%s\n' "$OUT" | sed 's/^/      /' | head -4 >&2
+fi
+
+RCP_HUB="$RCP_DIR/hub-missing"
+mkdir -p "$RCP_HUB/scripts/ci" "$RCP_HUB/.github/workflows"
+cp "$RCP_CHECK" "$RCP_HUB/scripts/ci/check_required_check_publisher"
+printf '#!/usr/bin/env bash\n' > "$RCP_HUB/scripts/sync-to-downstream.sh"
+set +e
+OUT=$(cd "$RCP_HUB" && ./scripts/ci/check_required_check_publisher 2>&1)
+RC=$?
+set -e
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "mergepath misconfig"; then
+  pass "#845 rcp hub: publisher absent with the hub marker present → FAIL (deleted single writer)"
+else
+  fail "#845 rcp hub: expected a loud FAIL when the publisher is missing on the hub; got rc=$RC"
+  printf '%s\n' "$OUT" | sed 's/^/      /' | head -4 >&2
+fi
+
+# ── Positive control, LAST ────────────────────────────────────────────
+# Placed after every mutation so a fence that had degenerated into
+# "accept everything" is already visible above rather than hidden behind a
+# single green line.
+rcp_case positive-control '' pass
+
+fi  # end Test 25 gating
+
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_merge_clearance_gate.sh: $PASS passed, $FAIL failed"

@@ -232,9 +232,48 @@ if [ -n "\${CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER:-}" ]; then
     esac
   done
 fi
+if [ -n "\${CR_GATE_TEST_FAIL_AWK_PROGRAM:-}" ]; then
+  for __a in "\$@"; do
+    case "\$__a" in
+      *"\$CR_GATE_TEST_FAIL_AWK_PROGRAM"*)
+        echo "awk: fixture failure on the program matching '\$CR_GATE_TEST_FAIL_AWK_PROGRAM'" >&2
+        exit 9
+        ;;
+    esac
+  done
+fi
 exec "$REAL_AWK" "\$@"
 STUB
 chmod +x "$STUB_DIR/awk"
+
+# The counter knob above is scoped, by design, to summary_unfenced_numbered's
+# program alone — matched on that program's own distinctive emit, `NR, line`.
+# That scoping is what makes tests 51 and 52 non-vacuous, and it is also what
+# makes them STRUCTURALLY incapable of failing the file's three OTHER awk
+# programs: the stanza-opener scan, the pre-merge PAIR scan, and the pre-merge
+# STRIP. `CR_GATE_TEST_FAIL_AWK_PROGRAM=<substring>` fails one named program
+# outright, so a reader that test 52's shim can never reach still gets covered.
+#
+# `CR_GATE_TEST_GREP_ERROR_ON=<substring>` is the same idea for grep, and it
+# tests a status grep can return that awk cannot usefully be made to: rc 2, its
+# own ERROR, as distinct from rc 1, no-match. `|| true` absorbs both
+# identically, so a grep that died on an invalid multibyte sequence or a bad
+# locale — a production cause #942's own body names — read as "this body says
+# no". The shim writes to stderr and exits 2, exactly as grep does.
+REAL_GREP=$(command -v grep)
+cat >"$STUB_DIR/grep" <<STUB
+#!/bin/bash
+if [ -n "\${CR_GATE_TEST_GREP_ERROR_ON:-}" ]; then
+  case "\$*" in
+    *"\$CR_GATE_TEST_GREP_ERROR_ON"*)
+      echo "grep: invalid byte sequence (fixture failure on '\$CR_GATE_TEST_GREP_ERROR_ON')" >&2
+      exit 2
+      ;;
+  esac
+fi
+exec "$REAL_GREP" "\$@"
+STUB
+chmod +x "$STUB_DIR/grep"
 
 # ---------------------------------------------------------------------------
 # Helper: scratch repo dir with a .github/review-policy.yml that enables
@@ -3811,6 +3850,240 @@ if [ "$TOTAL_AWK" -gt 1 ] && [ "$RC" != 0 ] \
 else
   fail "#936: expected a nonzero exit with no 'unresolved: 0' claim and a classified summary; got rc=$RC (reader runs=$TOTAL_AWK)"
   echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 52 (#942): EVERY call site of the shared summary reader, not just the
+# one #936 fixed.
+#
+# Test 51 above pins the LAST reader run — the grading pipeline. `summary_
+# unfenced_numbered` has three other callers, and each one captures it in a
+# command substitution that drops the status: `summary_stanza_opener_lines`
+# (via summary_stanzas_all_benign / summary_has_non_benign_stanza), the
+# commits-range extraction in `summary_names_head`, and the `pair=` extraction
+# in `summary_strip_pre_merge_block`. A dead reader at the FIRST of those is
+# strictly worse than at the site #936 fixed, because it fires earlier: the
+# summary never becomes a candidate, so the graded pipeline's guard is never
+# reached and the gate prints `unresolved: 0`.
+#
+# The assertion is deliberately INDEX-FREE rather than one case per named
+# call site. Which run index belongs to which caller is an implementation
+# detail that moves whenever the scoping order changes, and a test pinned to
+# an index silently stops covering the site it was written for. Failing the
+# reader at EVERY index in turn asserts the property the issue actually
+# states — "a failed read at ANY of its call sites yields a nonzero gate exit"
+# — and keeps covering a fourth caller nobody has written yet.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 52 (#942): a FAILED summary read fails closed at EVERY reader call site"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_MAJOR_FINDING")")
+AWK_COUNTER="$WORKDIR/awk-calls-52"
+: >"$AWK_COUNTER"
+# Same derivation as test 51: count the reader's runs on this fixture with
+# nothing failing, so the indices below are measured rather than guessed.
+CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER=9999 \
+CR_GATE_TEST_AWK_COUNTER="$AWK_COUNTER" \
+  FIXTURE_PR="$FIXTURE_PR" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  run_gate "$SCRATCH" 99 owner/repo >/dev/null 2>&1 || true
+TOTAL_AWK_52=$(cat "$AWK_COUNTER" 2>/dev/null || echo 0)
+if [ "$TOTAL_AWK_52" -lt 2 ]; then
+  fail "#942: expected the shared summary reader to run more than once on this fixture; counted $TOTAL_AWK_52 (the multi-site coverage below would be vacuous)"
+fi
+SITE_FAILURES_52=''
+SITE_STANZA_MISDIAGNOSIS_52=''
+IDX_52=0
+while [ "$IDX_52" -lt "$TOTAL_AWK_52" ]; do
+  : >"$AWK_COUNTER"
+  set +e
+  OUT=$(
+    FIXTURE_PR="$FIXTURE_PR" \
+    FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+    FIXTURE_THREADS="$FIXTURE_THREADS" \
+    FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    CR_GATE_TEST_FAIL_SUMMARY_AWK_AFTER="$IDX_52" \
+    CR_GATE_TEST_AWK_COUNTER="$AWK_COUNTER" \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1
+  )
+  RC=$?
+  set -e
+  if [ "$RC" = 0 ] || echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+    SITE_FAILURES_52="$SITE_FAILURES_52 run$((IDX_52 + 1))(rc=$RC)"
+  fi
+  # Acceptance criterion 2: the classifier must not report an UNREADABLE
+  # summary as one that "carries a non-benign outcome stanza". That message
+  # names a specific, wrong diagnosis — an operator reading it goes looking
+  # for a rate limit rather than for a broken read.
+  if echo "$OUT" | grep -q "carries a non-benign outcome stanza"; then
+    SITE_STANZA_MISDIAGNOSIS_52="$SITE_STANZA_MISDIAGNOSIS_52 run$((IDX_52 + 1))"
+  fi
+  IDX_52=$((IDX_52 + 1))
+done
+if [ -z "$SITE_FAILURES_52" ]; then
+  pass "#942: a failed summary read fails closed at all $TOTAL_AWK_52 reader call sites, never 'unresolved: 0'"
+else
+  fail "#942: a failed summary read still reported zero blocking findings at:$SITE_FAILURES_52 (of $TOTAL_AWK_52 reader runs)"
+fi
+if [ -z "$SITE_STANZA_MISDIAGNOSIS_52" ]; then
+  pass "#942: an unreadable summary is never misreported as carrying a non-benign outcome stanza"
+else
+  fail "#942: an unreadable summary was misdiagnosed as a non-benign outcome stanza at:$SITE_STANZA_MISDIAGNOSIS_52"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 53 (#942): the readers test 52 CANNOT reach.
+#
+# Test 52 fails the shared reader `summary_unfenced_numbered` at every one of
+# its call sites, and its shim keys on that program's own emit, `NR, line`.
+# That scoping is what makes it non-vacuous — and it is also a coverage
+# boundary: the file's three OTHER awk programs and all five of its greps never
+# run that string, so no index of test 52 can fail any of them. Each case below
+# fails ONE such reader, and each carries a CONTROL run on the same fixture with
+# nothing injected, so a green is measured against the verdict the gate reaches
+# when the reader works rather than assumed.
+#
+# The greps are failed with rc 2 — grep's own ERROR — not rc 1. `|| true` is
+# rc-blind and absorbs both identically, which is the whole defect: rc 2 is
+# reachable on an invalid multibyte sequence or a bad locale, one of the exact
+# production causes #942's body names for the awk death, and it makes grep
+# print NOTHING, so the load-bearing `-gt 0` / `-n` guards read a manufactured
+# empty result as an answer about the body.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 53 (#942): the pre-merge STRIP and the summary greps fail closed too"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+# A genuine 🟠 Major finding AND a genuine pre-merge check table, so the strip
+# has a pair to act on and the graded body still carries something blocking.
+STRIP_FIXTURE_BODY="$(make_summary_body "$HEAD_SHA" "$SUMMARY_MAJOR_FINDING
+
+<!-- pre_merge_checks_walkthrough_start -->
+| Docstring coverage | ⚠️ Warning | 12.00% is below the 80.00% threshold |
+<!-- pre_merge_checks_walkthrough_end -->")"
+FIXTURE_ISSUE_COMMENTS_53=$(make_summary_issue_comments "$STRIP_FIXTURE_BODY")
+
+# The control: no injection at all. This fixture must actually GATE, or every
+# case below would be asserting nonzero against a gate that was already red.
+set +e
+OUT_53_CONTROL=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS_53" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC_53_CONTROL=$?
+set -e
+if [ "$RC_53_CONTROL" != 0 ] \
+    && echo "$OUT_53_CONTROL" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "#942 control: the strip fixture gates on its 🟠 Major with every reader working"
+else
+  fail "#942 control: expected a nonzero exit reporting 1 unresolved blocking finding; got rc=$RC_53_CONTROL (the cases below would be vacuous)"
+  echo "$OUT_53_CONTROL" | sed 's/^/      /' >&2
+fi
+
+# 53a — the pre-merge STRIP awk. Its output IS summary_strip_pre_merge_block's
+# return value, so a dead awk yields an empty SUMMARY_SCAN and the caller's
+# `[ -n "$SUMMARY_SCAN" ]` skips the whole grading block. errexit cannot rescue
+# it: the call site is `SUMMARY_SCAN=$(…) || die 2`, and errexit is suppressed
+# inside a command substitution on the left of an `||` list.
+set +e
+OUT_53A=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS_53" \
+  CR_GATE_TEST_FAIL_AWK_PROGRAM='NR < sl' \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC_53A=$?
+set -e
+if [ "$RC_53A" != 0 ] \
+    && ! echo "$OUT_53A" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+  pass "#942: a failed pre-merge-block STRIP fails closed, never 'unresolved: 0'"
+else
+  fail "#942: a failed pre-merge-block strip cleared the gate; got rc=$RC_53A"
+  echo "$OUT_53A" | sed 's/^/      /' >&2
+fi
+
+# 53b — the commits-range grep in summary_names_head. On rc 2 `ranges` is
+# empty, which `|| true` handed to `[ -n "$ranges" ] || return 1` as "this body
+# names no commits range" — so the gate logged the specific claim "does not
+# name <HEAD_SHA> as its commits-range end" about a body it never searched.
+set +e
+OUT_53B=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS_53" \
+  CR_GATE_TEST_GREP_ERROR_ON='between [0-9a-f]{40}' \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC_53B=$?
+set -e
+if [ "$RC_53B" != 0 ] \
+    && ! echo "$OUT_53B" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! echo "$OUT_53B" | grep -q "does not name $HEAD_SHA as its commits-range end"; then
+  pass "#942: a grep ERROR on the commits-range scan fails closed, and is not reported as a stale summary"
+else
+  fail "#942: a grep error on the commits-range scan cleared the gate or was misdiagnosed as a stale summary; got rc=$RC_53B"
+  echo "$OUT_53B" | sed 's/^/      /' >&2
+fi
+
+# 53c — the benign allow-list grep, shared by summary_stanzas_all_benign and
+# summary_has_non_benign_stanza. On rc 2 the counts came back empty,
+# `${total:-0}` manufactured the zero-stanza state the `-gt 0` guard watches
+# for, and the caller logged "carries a non-benign outcome stanza" — the exact
+# wrong diagnosis acceptance criterion 2 forbids, now reached through the grep
+# rather than through the awk the PR hardened.
+set +e
+OUT_53C=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS_53" \
+  CR_GATE_TEST_GREP_ERROR_ON='auto-generated comment: (summarize' \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC_53C=$?
+set -e
+if [ "$RC_53C" != 0 ] \
+    && ! echo "$OUT_53C" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! echo "$OUT_53C" | grep -q "carries a non-benign outcome stanza"; then
+  pass "#942: a grep ERROR on the benign stanza allow-list fails closed, and is not misdiagnosed as a non-benign stanza"
+else
+  fail "#942: a grep error on the benign stanza allow-list cleared the gate or was misdiagnosed as a non-benign stanza; got rc=$RC_53C"
+  echo "$OUT_53C" | sed 's/^/      /' >&2
+fi
+
+# 53d — the stanza-opener COUNT grep on the line above it. Same manufactured
+# zero-stanza state, reached one grep earlier, and the pattern (`.`) is not the
+# allow-list one, so 53c cannot cover it.
+set +e
+OUT_53D=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS_53" \
+  CR_GATE_TEST_GREP_ERROR_ON='-c .' \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC_53D=$?
+set -e
+if [ "$RC_53D" != 0 ] \
+    && ! echo "$OUT_53D" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! echo "$OUT_53D" | grep -q "carries a non-benign outcome stanza"; then
+  pass "#942: a grep ERROR on the stanza-opener count fails closed, and is not misdiagnosed as a non-benign stanza"
+else
+  fail "#942: a grep error on the stanza-opener count cleared the gate or was misdiagnosed as a non-benign stanza; got rc=$RC_53D"
+  echo "$OUT_53D" | sed 's/^/      /' >&2
 fi
 
 # ---------------------------------------------------------------------------
