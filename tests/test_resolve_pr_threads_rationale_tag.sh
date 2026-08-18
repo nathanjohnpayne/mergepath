@@ -1941,6 +1941,65 @@ else
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 33 (#990): the ledger arm must be bound to THIS finding in THIS
+# repo, and must carry a real verdict.
+#
+# Test 29 proves a qualifying row is admitted; on its own that is
+# satisfied by "the ledger file exists and has any row", which would let
+# a ledger written for a DIFFERENT finding — the ordinary case on a
+# multi-round PR, where earlier rounds are recorded and the live one is
+# not — resolve an unread finding. That is the #990 failure with a
+# different proxy, so each conjunct of the row predicate needs its own
+# negative.
+#
+# One ledger, three non-qualifying rows, each targeting one conjunct:
+#   99999 / test/repo  / "+1"  → right repo, right verdict, WRONG finding
+#   99101 / other/repo / "+1"  → right finding+verdict, WRONG repo
+#   99101 / test/repo  / ""    → right finding+repo, NO verdict
+# Deleting any single conjunct from ledger_verdict_for_finding makes the
+# corresponding row qualify and resolves PRT_990B, so this one case is a
+# live assertion for all three.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 33: ledger rows for another finding, another repo, or no verdict are not evidence (#990)"
+
+T33_LEDGER="$SCRATCH/t33-codex-ledger.jsonl"
+{
+  jq -nc '{pr_number:778,repo:"test/repo",comment_id:99999,priority:"P1",verdict:"+1",
+           reaction:"+1",location:"pull_request_review_comment",action:"posted",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+  jq -nc '{pr_number:778,repo:"other/repo",comment_id:99101,priority:"P1",verdict:"+1",
+           reaction:"+1",location:"pull_request_review_comment",action:"posted",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+  jq -nc '{pr_number:778,repo:"test/repo",comment_id:99101,priority:"P1",verdict:"",
+           reaction:"",location:"pull_request_review_comment",action:"skipped",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+} > "$T33_LEDGER"
+
+set +e
+out=$(run_t990 "$SCRATCH/t33.log" "$(t990_threads "$T990_B_BARE")" \
+        CODEX_FEEDBACK_LEDGER="$T33_LEDGER")
+rc=$?
+set -e
+
+t33_resolved=$(resolved_threads "$SCRATCH/t33.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 3 ] \
+   && [ "$t33_resolved" = "PRT_990A " ] \
+   && grep -q 'SKIP (never dispositioned: addressed-elsewhere rests on file-level evidence only)' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out" \
+   && ! grep -q 'verdict for finding' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: none of the three near-miss rows admitted; PRT_990B left unresolved"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a non-matching ledger row was accepted as finding-bound evidence (rc=$rc, resolved='$t33_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"
