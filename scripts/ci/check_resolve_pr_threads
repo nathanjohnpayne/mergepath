@@ -427,7 +427,25 @@ echo "resolve-pr-threads.sh keyring fallback (no empty GH_TOKEN trap)"
 cat > "$SCRATCH/gh" <<'GH_STUB'
 #!/usr/bin/env bash
 echo "ENV_GH_TOKEN_PRESENT=${GH_TOKEN+yes}" >> "$GH_ARGV_LOG"
-echo "ENV_GH_TOKEN_VALUE=${GH_TOKEN:-<unset>}" >> "$GH_ARGV_LOG"
+# #951: record the LENGTH, never the value. Nothing asserts on the value,
+# the failure branch below prints this whole log, and the token reaching
+# the stub is not always a fixture one --- resolve-pr-threads.sh
+# auto-sources the op-preflight cache, so a regression in the very
+# behaviour under test would put a real PAT here and then print it.
+# Length still separates the three states this case cares about: absent,
+# present-but-empty (0), present-and-set (>0).
+#
+# Read through a defaulted copy rather than expanding ${#GH_TOKEN}
+# directly. This stub runs as its own bash process and so does NOT
+# inherit the caller's `set -u` (SHELLOPTS is not exported), which is why
+# the direct form works today and why this case --- whose whole premise
+# is an ABSENT GH_TOKEN --- passes. But that is an accident of the
+# parent's environment, not a property of the stub: export SHELLOPTS, or
+# add `set -u` here later, and the direct form aborts before the case can
+# assert anything. The defaulted copy renders identically (0 when absent)
+# under either regime. CodeRabbit raised the nounset shape on PR #993.
+token_value=${GH_TOKEN-}
+echo "ENV_GH_TOKEN_LENGTH=${#token_value}" >> "$GH_ARGV_LOG"
 case "$1" in
   api)
     case "$2" in
@@ -450,18 +468,31 @@ chmod +x "$SCRATCH/gh"
 GH_ARGV_LOG="$SCRATCH/gh-argv-keyring.log"
 : > "$GH_ARGV_LOG"
 
-# Crucially: unset both PAT vars in the subshell environment.
+# Crucially: unset both PAT vars in the subshell environment --- AND point
+# the preflight cache lookup at an empty directory (#951). `env -u` alone
+# closes only the env-var half of "no PAT available": resolve-pr-threads.sh
+# sources lib/preflight-helpers.sh, whose load_preflight_env_vars re-reads
+# OP_PREFLIGHT_REVIEWER_PAT from the ON-DISK cache unconditionally. On a
+# machine with a warm cache --- the normal state of an agent session --- the
+# unset variable was immediately refilled with a REAL PAT, this case failed,
+# and its failure branch prints the whole stub log. That is the same
+# unscrubbed-fixture rule this PR fixes elsewhere; before the length change
+# above it would have printed the PAT itself. CI (no cache on the runner)
+# could never see it.
+mkdir -p "$SCRATCH/empty-cache"
+chmod 700 "$SCRATCH/empty-cache"
 set +e
 out=$(GH_ARGV_LOG="$GH_ARGV_LOG" PATH="$SCRATCH:$PATH" \
-  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  OP_PREFLIGHT_CACHE_DIR="$SCRATCH/empty-cache" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u OP_PREFLIGHT_AUTHOR_PAT -u GH_TOKEN \
   bash "$SCRIPT" 99999 --repo test/repo 2>&1)
 rc=$?
 set -e
 
 # Stub captured env state. Assert GH_TOKEN was NOT set (or NOT empty).
-# An empty GH_TOKEN would show ENV_GH_TOKEN_PRESENT=yes + ENV_GH_TOKEN_VALUE=<unset>
-# (which renders as just the unset placeholder). Need to confirm absence
-# of the "ENV_GH_TOKEN_PRESENT=yes" line on graphql calls.
+# An empty GH_TOKEN would show ENV_GH_TOKEN_PRESENT=yes + ENV_GH_TOKEN_LENGTH=0.
+# Need to confirm absence of the "ENV_GH_TOKEN_PRESENT=yes" line on
+# graphql calls.
 if [ "$rc" = "0" ] && ! grep -q "^ENV_GH_TOKEN_PRESENT=yes$" "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: GH_TOKEN unset (not empty) when no PAT available — keyring fallback engaged"
