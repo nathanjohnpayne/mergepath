@@ -1913,6 +1913,105 @@ test_857_summary_selector_unit() {
   fi
 }
 
+test_968_summary_head_claim_unit() {
+  # #968 AC1. The wrapper that decides WHICH body the other-head demotion is
+  # read from. Driven directly because its three return codes are the whole
+  # contract and the live paths only ever exercise two of them: rc 3 needs a
+  # failed comment-list read, which the stub-gh integration fixtures reach only
+  # by breaking every other read in the run as well.
+  local snip="$WORKDIR/summary-head-claim.sh" bad="" rc
+  local h40 b40 marker fixture_summary fixture_chat
+  eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END|SUMMARY_MARKER)=' \
+    "$ROOT/scripts/coderabbit-wait.sh")"
+  # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+  . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  {
+    awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+    awk '/^# BEGIN coderabbit_summary_selector$/{f=1;next} /^# END coderabbit_summary_selector$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+    awk '/^# BEGIN coderabbit_summary_head_claim$/{f=1;next} /^# END coderabbit_summary_head_claim$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+  } >"$snip"
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  h40='0123456789abcdef0123456789abcdef01234567'
+  b40='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  marker="$SUMMARY_MARKER"
+  # Read by the extracted helper, not by this function — shellcheck cannot see
+  # the dynamic scope the sourced snippet resolves them through.
+  # shellcheck disable=SC2034
+  REPO=owner/repo
+  # shellcheck disable=SC2034
+  PR_NUMBER=999
+  BOT_LOGIN='coderabbitai[bot]'
+  log() { :; }
+
+  # The AC1 shape: a summary naming ANOTHER commit, with a newer benign chat
+  # reply above it. The reply is the freshest bot comment and makes no head
+  # claim, so reading the claim off "the newest comment" answers rc 1 here.
+  fixture_summary="$marker
+Reviewing files that changed from the base of the PR and between $b40 and $b40."
+  fixture_chat="🧩 Analysis chain
+
+the current head per gh pr view is $h40"
+  fetch_api_array() {
+    jq -nc --arg s "$fixture_summary" --arg c "$fixture_chat" --arg bot "$BOT_LOGIN" '[
+      {id: 7701, user: {login: $bot}, created_at: "2026-06-04T00:00:00Z",
+       updated_at: "2026-06-04T00:00:53Z", body: $s},
+      {id: 7702, user: {login: $bot}, created_at: "2026-06-04T00:01:30Z",
+       updated_at: "2026-06-04T00:01:30Z", body: $c}
+    ]'
+  }
+  rc=0; crw_summary_names_only_other_head "$h40" || rc=$?
+  [ "$rc" = "0" ] || bad="$bad other-head-not-refused(rc=$rc)"
+  # Control: the same two comments, the summary naming THIS head. Refusing
+  # here would stall every PR CodeRabbit chats on.
+  fixture_summary="$marker
+Reviewing files that changed from the base of the PR and between $b40 and $h40."
+  rc=0; crw_summary_names_only_other_head "$h40" || rc=$?
+  [ "$rc" = "1" ] || bad="$bad current-head-refused(rc=$rc)"
+
+  # No summary comment at all: a definite "nothing here claims another commit",
+  # which is what keeps the caller's other freshness tests deciding (AC3).
+  fetch_api_array() { printf '[]\n'; }
+  rc=0; crw_summary_names_only_other_head "$h40" || rc=$?
+  [ "$rc" = "1" ] || bad="$bad no-summary-not-1(rc=$rc)"
+
+  # An UNREADABLE comment list is rc 3, never rc 1. Folding it into 1 is the
+  # failed-read-as-clean confusion the neighbouring reads already refuse.
+  fetch_api_array() { return 3; }
+  rc=0; crw_summary_names_only_other_head "$h40" || rc=$?
+  [ "$rc" = "3" ] || bad="$bad unread-not-3(rc=$rc)"
+
+  # A summary body that cannot be DERIVED is rc 3 too — the selector returns a
+  # base64 payload, and a corrupt one is an unread body, not a silent one.
+  fetch_api_array() {
+    jq -nc --arg bot "$BOT_LOGIN" --arg m "$marker" '[
+      {id: 7701, user: {login: $bot}, created_at: "2026-06-04T00:00:00Z",
+       updated_at: "2026-06-04T00:00:00Z", body: $m}
+    ]'
+  }
+  crw_select_summary_comment() { printf 'not-base64-@@@\n'; }
+  # stderr silenced: the decode failure this case induces is the point, and its
+  # jq diagnostic would otherwise land in the middle of the suite's output.
+  rc=0; crw_summary_names_only_other_head "$h40" 2>/dev/null || rc=$?
+  [ "$rc" = "3" ] || bad="$bad bad-derive-not-3(rc=$rc)"
+
+  # Restore the extracted definitions this case stubbed over, so a later unit
+  # test in this file cannot inherit them.
+  unset -f fetch_api_array crw_select_summary_comment log
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  if [ -z "$bad" ]; then
+    pass "#968 AC1: the head claim is sourced from the marker-selected summary, and an unreadable comment list is rc 3 rather than 'no claim'"
+  else
+    fail "#968 AC1 summary head claim:$bad"
+  fi
+}
+
 test_851_summary_helpers_unit() {
   # The three predicates are pure; extract the sentinel block and source it so
   # the 40-hex token boundary and the zero-stanza vacuity guard are assertable
@@ -2467,6 +2566,7 @@ test_probe_unknown_option_fails_closed
 test_851_summary_evidence_matrix
 test_851_review_object_premerge_shares_strip
 test_851_summary_helpers_unit
+test_968_summary_head_claim_unit
 test_837_badge_only_inline_finding_is_counted
 test_837_badge_only_summary_finding_probe_is_findings
 test_824_sha_matched_review_is_honored_regardless_of_timestamp

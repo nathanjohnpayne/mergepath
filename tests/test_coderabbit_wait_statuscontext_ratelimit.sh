@@ -167,6 +167,22 @@ Reviewing files that changed from the base of the PR and between $BASE_SHA_40 an
 - Fixes
 <!-- end of auto-generated comment: release notes by coderabbit.ai -->"
 
+# A benign CodeRabbit CHAT REPLY, posted AFTER the summary was edited. This is
+# the #968 AC1 shape: it classifies `review` (no notice marker), carries no
+# outcome stanza, and carries no commits range, so a demotion read off "the
+# newest bot comment" finds no head claim and clears — while the summary two
+# comments down is still a verdict about the PREVIOUS head. Modelled on the two
+# live replies the script's SUMMARY_MARKER comment records (#794, #518),
+# including the full 40-hex head SHA they lift from a `gh pr view` snippet, so
+# the fixture also shows that carrying the SHA is not what makes evidence.
+CHAT_REPLY_AFTER_SUMMARY="🧩 Analysis chain
+
+Confirmed: the current head per gh pr view is $HEAD_SHA_40, and the helper is wired at the call site."
+
+# After SUMMARY_EDITED_AFTER_HEAD, so the reply is the newest bot comment and
+# wins any freshness-ordered pick.
+CHAT_REPLY_TIME='2026-06-04T00:01:30Z'
+
 # A clean summary carrying NO commits range at all — the shape whose freshness
 # the `fresh_at >= HEAD_ANCHOR` floor alone must keep deciding (#968 AC3).
 SUMMARY_NAMES_NO_SHA='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
@@ -1322,6 +1338,49 @@ HARNESS
   [ "$FAIL" -ne "$before" ] || pass "32: #985 — emit_json_and_exit refuses an empty/unparseable review object with exit 3 and no stdout, and emits well-formed values (null included) unchanged"
 }
 
+# --- Test 33: #968 AC1 — a later chat reply must not restore the false clear -
+# The residual the first #968 fix left: the demotion was evaluated against the
+# NEWEST bot comment, not against the summary. Here the summary (id 7701) is
+# the same edited, previous-head verdict test 29 uses, and a benign CodeRabbit
+# chat reply (id 7702) sits above it. The reply classifies `review`, carries no
+# blocking marker, and makes no head claim — so a demotion read off it is
+# vacuous and the run clears in zero seconds on a verdict about another commit.
+#
+# Non-vacuity is asserted two ways: the poll arm must really be grading the
+# REPLY (id=7702 in the freshness log, or the fixture has collapsed back into
+# test 29), and the refusal must name the summary rather than that comment id.
+test_later_chat_reply_does_not_restore_other_head_clear() {
+  local dir rc before=$FAIL
+  dir=$(make_case "summary-other-head-chat" "$SUMMARY_NAMES_PREVIOUS_HEAD" "$STATUS_TIME" \
+    "Review rate limited" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 \
+    "$CHAT_REPLY_AFTER_SUMMARY" "$CHAT_REPLY_TIME" "$HEAD_SHA_40" "$SUMMARY_EDITED_AFTER_HEAD")
+  rc=$(run_case "$dir")
+  grep -q 'latest CodeRabbit comment id=7702' "$dir/err.log" \
+    || fail "33: the poll arm did not grade the chat reply, so the fixture no longer models the AC1 gap; err=$(grep -i 'latest CodeRabbit comment' "$dir/err.log" | tail -2)"
+  [ "$rc" != "0" ] || fail "33: FALSE-CLEARED (exit 0) — a benign chat reply above the summary restored the #968 false clear; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "33: status=cleared on a verdict about a different commit"
+  [ "$rc" = "4" ] || fail "33: expected exit 4 (timeout — nothing on this head to verdict on), got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q "summary comment has no blocking markers, but its commits range names a different commit" "$dir/err.log" \
+    || fail "33: the refusal is not sourced from the SUMMARY comment; err=$(tail -4 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "33: #968 AC1 — the head claim is read from the marker-selected summary, so a later benign chat reply cannot clear another commit's verdict"
+}
+
+# --- Test 34: #968 AC1 escape — the summary still governs when it is current -
+# Same two-comment shape, one difference: the summary's commits range ends at
+# THIS head. The summary read must permit the clearance, or the fix trades a
+# false clear for a permanent stall on every PR CodeRabbit chats on.
+test_later_chat_reply_over_current_head_summary_still_clears() {
+  local dir rc before=$FAIL
+  dir=$(make_case "summary-current-head-chat" "$SUMMARY_NAMES_CURRENT_HEAD" "$STATUS_TIME" \
+    "Review rate limited" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 \
+    "$CHAT_REPLY_AFTER_SUMMARY" "$CHAT_REPLY_TIME" "$HEAD_SHA_40" "$SUMMARY_EDITED_AFTER_HEAD")
+  rc=$(run_case "$dir")
+  [ "$rc" = "0" ] || fail "34: expected exit 0 (cleared) — the summary names this head, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "34: status=$(jqf "$dir" '.status'), expected cleared"
+  grep -q 'names a different commit' "$dir/err.log" && fail "34: the summary-sourced demotion fired on a summary that names THIS head"
+  [ "$FAIL" -ne "$before" ] || pass "34: #968 AC1 escape — a chat reply above a CURRENT-head summary still clears, so the summary read adds refusals without adding stalls"
+}
+
 test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
 test_headref_later_success_clears
@@ -1353,6 +1412,8 @@ test_empty_reviews_array_still_clears
 test_summary_naming_other_head_does_not_clear
 test_summary_naming_current_head_still_clears
 test_summary_naming_no_sha_falls_through_to_floor
+test_later_chat_reply_does_not_restore_other_head_clear
+test_later_chat_reply_over_current_head_summary_still_clears
 test_emit_json_invariant_unit
 
 echo "----"

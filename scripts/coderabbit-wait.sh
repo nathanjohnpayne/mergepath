@@ -2642,6 +2642,7 @@ find_status_probe_reply() {
 
 emit_terminal_review_after_probe_if_present() {
   local latest body class potential_issues review_json summary_marker_rc
+  local summary_head_claim_rc
   # Status-checked (#957/#959). "Best effort" governs the FETCH — an
   # unreadable surface is not fatal on the timeout path — but the DECODE now
   # reports rc 3, and an unchecked assignment would leave `latest` empty, skip
@@ -2695,10 +2696,28 @@ emit_terminal_review_after_probe_if_present() {
           emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
           ;;
         1)
-          # #968, mirroring the polling `review` arm. This helper only ever
-          # UPGRADES the advisory timeout into a verdict, so declining to emit
-          # leaves exit 4 in place — the same conservative answer it already
-          # gives when the comment list cannot be read.
+          # #968, mirroring the polling `review` arm — including its AC1
+          # correction: the head claim is read off the SUMMARY, because `$body`
+          # is only the newest bot comment and a later benign chat reply makes
+          # no head claim at all.
+          #
+          # rc 3 is not fatal HERE, unlike at the polling arm. This helper only
+          # ever UPGRADES the advisory timeout into a verdict, so declining to
+          # emit leaves exit 4 in place — the same conservative answer it
+          # already gives when the comment list cannot be read.
+          summary_head_claim_rc=0
+          crw_summary_names_only_other_head "$HEAD_SHA" || summary_head_claim_rc=$?
+          case "$summary_head_claim_rc" in
+            0)
+              log "post-probe terminal-review check: the PR's CodeRabbit summary has no blocking markers, but its commits range names a different commit than $HEAD_SHA — leaving the advisory timeout in place rather than clearing on another commit's verdict (#968)"
+              return 0
+              ;;
+            1) : ;;
+            *)
+              log "post-probe terminal-review check: the CodeRabbit summary comment could not be read, so a verdict about another commit cannot be ruled out — leaving the advisory timeout in place"
+              return 0
+              ;;
+          esac
           if summary_names_only_other_head "$body" "$HEAD_SHA"; then
             log "post-probe terminal-review check: the newest comment has no blocking markers, but its commits range names a different commit than $HEAD_SHA — leaving the advisory timeout in place rather than clearing on another commit's verdict (#968)"
             return 0
@@ -3276,6 +3295,56 @@ crw_select_summary_comment() {
   '
 }
 # END coderabbit_summary_selector
+
+# BEGIN coderabbit_summary_head_claim
+# #968 AC1. The other-head demotion is a statement about the review SUMMARY,
+# and the two clearance sites evaluated it against whatever body the poll loop
+# happened to be holding instead. Those two coincide only while the summary IS
+# the newest bot comment. A CodeRabbit CHAT REPLY posted after it does not
+# coincide: it classifies `review`, carries no commits range, and therefore
+# makes no head claim at all, so the predicate answered "no claim" and the
+# exact #968 false clear returned. That shape is live, not hypothetical —
+# replies #794 and #518 are the two the SUMMARY_MARKER comment above already
+# records — and it reproduces on the stub-gh fixture below: a summary edited
+# after the push whose range ends at the PREVIOUS head, one benign reply above
+# it, verdict `cleared` with `waited_seconds: 0`.
+#
+# So the head claim is read from the comment the SUMMARY_MARKER selects, which
+# is the same anchor-free marker-led selection `--probe` already uses and the
+# reason a chat reply is STRUCTURALLY unable to supply this evidence: it does
+# not start with the marker at byte zero.
+#
+# Direction is unchanged from the predicate it wraps — this can only ever
+# REFUSE a clearance, never manufacture one — which is what makes reading a
+# mutable comment body acceptable evidence here.
+#
+# Return codes, and both call sites honour all three:
+#   0  a summary exists and every commits range in it ends at some OTHER
+#      commit. Refuse the clearance.
+#   1  no refusal: there is no summary comment, or its body carries no
+#      machine-readable range, or one of its ranges ends at this head. Those
+#      are #968 AC2/AC3 and stay exactly as they were.
+#   3  the issue-comment list could not be READ, or the selected body could not
+#      be derived. Never folded into 1 — "the surface is unreadable" reading as
+#      "the surface says nothing to refuse on" is the same failed-read-as-clean
+#      confusion #936/#959 closed at the neighbouring reads.
+#
+# crw_summary_names_only_other_head <head-sha>
+crw_summary_names_only_other_head() {
+  local head_sha=${1:?}
+  local issue_comments summary sbody
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
+    || return 3
+  summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
+    || return 3
+  # No summary comment on the PR at all is a definite answer, not an unread
+  # one: there is no verdict here about any commit, so there is nothing to
+  # demote and the caller's other freshness tests keep deciding.
+  [ -n "$summary" ] || return 1
+  sbody=$(printf '%s' "$summary" | base64 --decode | jq -r '.body') || return 3
+  summary_names_only_other_head "$sbody" "$head_sha"
+}
+# END coderabbit_summary_head_claim
 
 # #919: both of the probe's terminal conjuncts are satisfiable by artifacts of
 # CodeRabbit ACTIVITY rather than by a finished review.
@@ -4120,6 +4189,27 @@ while :; do
           # scan, and blocking is the safe direction anyway. It is the `cleared`
           # emit — the one a caller reads as "go" — that must not be reachable
           # from a verdict about another commit.
+          # Read the head claim off the SUMMARY (#968 AC1), not off the body
+          # this arm happens to be grading. Three-way for the same reason the
+          # marker read above is: an unreadable comment list is not a body that
+          # declines to make a claim.
+          SUMMARY_HEAD_CLAIM_RC=0
+          crw_summary_names_only_other_head "$HEAD_SHA" || SUMMARY_HEAD_CLAIM_RC=$?
+          case "$SUMMARY_HEAD_CLAIM_RC" in
+            0)
+              log "the PR's CodeRabbit summary comment has no blocking markers, but its commits range names a different commit than $HEAD_SHA — an in-place EDIT is not a re-review, so this is not clearance for this head (#968); sleeping ${POLL_INTERVAL_SECONDS}s"
+              sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+              continue
+              ;;
+            1) : ;;
+            *)
+              die 3 "could not read the CodeRabbit summary comment to rule out a verdict about another commit on $HEAD_SHA — refusing to report a clearance"
+              ;;
+          esac
+          # Kept as a second, independent carrier. The check can only REFUSE,
+          # so consulting the graded body as well is monotone: every refusal
+          # that fires today still fires, and the summary read above adds the
+          # ones a later chat reply used to hide.
           if summary_names_only_other_head "$COMMENT_BODY" "$HEAD_SHA"; then
             log "CodeRabbit comment id=$COMMENT_ID has no blocking markers, but its commits range names a different commit than $HEAD_SHA — an in-place EDIT is not a re-review, so this is not clearance for this head (#968); sleeping ${POLL_INTERVAL_SECONDS}s"
             sleep_or_timeout "$POLL_INTERVAL_SECONDS"
