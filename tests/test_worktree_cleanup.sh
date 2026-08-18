@@ -2614,6 +2614,96 @@ else
   echo "$OUT_TRAP" >&2
 fi
 
+# ── Case 42 (#920 finding 2, r1): the EXIT trap deletes nothing it did not create ──
+# Widening the trap to cover HEADS_FILE / RECORDS_FILE / MERGE_SWEEP_FILE /
+# KNOWN_FILE gave it four names it does not own outright. The script runs
+# under `set -eo pipefail` with no `set -u`, so `${KNOWN_FILE:-}` expands an
+# INHERITED exported value verbatim, and the trap then `rm -f`s a path the
+# script never created. Two of the four are reachable on an ordinary run:
+# KNOWN_FILE is assigned only inside `[ -d "$ORPHAN_ROOT" ]`, so a repo with
+# no .claude/worktrees loses it on a plain --dry-run; stale_unpruned_branches()
+# is dry-run-only, so every successful --apply loses HEADS_FILE. The other two
+# go with any abort before their assignment. A read-only audit must not delete
+# a caller's file on nothing more than a name collision, so all three runs
+# below — success under --dry-run, success under --apply, and the mid-flight
+# abort from Case 40's fixture — are asserted against the same four sentinels.
+TRAPENV_ROOT="$WORKDIR/trap-inherited-env"
+TRAPENV_SENTINELS="$TRAPENV_ROOT/sentinels"
+mkdir -p "$TRAPENV_ROOT" "$TRAPENV_SENTINELS"
+git init -q --bare "$TRAPENV_ROOT/remote.git"
+git init -q "$TRAPENV_ROOT/main"
+(
+  cd "$TRAPENV_ROOT/main"
+  git -C "$TRAPENV_ROOT/main" config user.email "test@example.com"
+  git -C "$TRAPENV_ROOT/main" config user.name "Test"
+  git -C "$TRAPENV_ROOT/main" config commit.gpgsign false
+  git checkout -q -b main
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m "seed"
+  git remote add origin "$TRAPENV_ROOT/remote.git"
+  git push -q -u origin main
+) >/dev/null 2>&1
+# Premise: the --dry-run and --apply legs only exercise the KNOWN_FILE window
+# while this repo has no .claude/worktrees directory. A fixture that grew one
+# would move KNOWN_FILE into its assigned branch and the leg would pass for
+# the wrong reason.
+if [ -e "$TRAPENV_ROOT/main/.claude/worktrees" ]; then
+  fail "fixture setup: expected no .claude/worktrees in the inherited-env fixture (the KNOWN_FILE window would not open)"
+fi
+# Seeds the four sentinels and runs the helper with each one exported under the
+# matching variable name; echoes the names that did not survive.
+trapenv_run() {
+  local label="$1"
+  local dir="$2"
+  shift 2
+  local n missing=""
+  for n in HEADS RECORDS MERGE_SWEEP KNOWN; do
+    printf '%s\n' "do-not-delete-$n" > "$TRAPENV_SENTINELS/$n"
+  done
+  set +e
+  ( cd "$dir" \
+    && HEADS_FILE="$TRAPENV_SENTINELS/HEADS" \
+       RECORDS_FILE="$TRAPENV_SENTINELS/RECORDS" \
+       MERGE_SWEEP_FILE="$TRAPENV_SENTINELS/MERGE_SWEEP" \
+       KNOWN_FILE="$TRAPENV_SENTINELS/KNOWN" \
+       PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color "$@" ) >/dev/null 2>&1
+  TRAPENV_RC=$?
+  set -e
+  for n in HEADS RECORDS MERGE_SWEEP KNOWN; do
+    [ -e "$TRAPENV_SENTINELS/$n" ] || missing="$missing ${n}_FILE"
+  done
+  TRAPENV_MISSING="${missing# }"
+  TRAPENV_LABEL="$label"
+}
+trapenv_assert() {
+  if [ -z "$TRAPENV_MISSING" ]; then
+    pass "#920 the EXIT trap leaves inherited temp-file variables alone ($TRAPENV_LABEL)"
+  else
+    fail "#920 the EXIT trap deleted inherited paths it never created ($TRAPENV_LABEL, rc=$TRAPENV_RC): $TRAPENV_MISSING"
+  fi
+}
+trapenv_run "successful --dry-run" "$TRAPENV_ROOT/main" --dry-run
+# Premise: a run that died early would leave most of the trap unreached and
+# the survival assertion would say nothing about the successful path.
+if [ "$TRAPENV_RC" -ne 0 ]; then
+  fail "fixture setup: the inherited-env --dry-run exited $TRAPENV_RC — it never completed the run the assertion describes"
+fi
+trapenv_assert
+trapenv_run "successful --apply" "$TRAPENV_ROOT/main" --apply
+if [ "$TRAPENV_RC" -ne 0 ]; then
+  fail "fixture setup: the inherited-env --apply exited $TRAPENV_RC — it never completed the run the assertion describes"
+fi
+trapenv_assert
+# Third leg: the abort this PR's own gone_branches() guard introduces, which
+# fires before ANY of the four is assigned. Reuses Case 40's rejected-refspec
+# repo, whose premises are pinned there.
+trapenv_run "aborted run (rejected remote.origin.fetch)" "$BADSPEC_MAIN" --dry-run
+if [ "$TRAPENV_RC" -eq 0 ]; then
+  fail "fixture setup: the rejected-refspec run exited 0 — the pre-assignment abort window never opened"
+fi
+trapenv_assert
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

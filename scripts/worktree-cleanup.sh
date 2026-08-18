@@ -751,6 +751,26 @@ STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
 # left to do — and the `${VAR:-}` expansions make the trap safe to fire before
 # any of the four has been assigned. `rm -f ''` is a silent no-op on both GNU
 # and BSD rm, so the empty slots cost nothing.
+#
+# The four names are initialised to the empty string FIRST, and that line is
+# load-bearing rather than defensive tidiness. This script runs under
+# `set -eo pipefail` with NO `set -u`, so `${HEADS_FILE:-}` does not mean
+# "unset unless this script assigned it" — it means "whatever is in scope",
+# and an exported variable of the same name inherited from the caller's
+# environment expands verbatim. Without these assignments the trap would
+# `rm -f` a path this script never created: `KNOWN_FILE` is only assigned
+# inside the `[ -d "$ORPHAN_ROOT" ]` branch, so a repository with no
+# `.claude/worktrees` directory deletes an inherited `KNOWN_FILE` on a plain
+# `--dry-run`, and `stale_unpruned_branches()` is dry-run-only, so every
+# successful `--apply` deletes an inherited `HEADS_FILE`. That turns a
+# read-only audit into a destructive one on nothing more than a name
+# collision in the environment. Assigning here shadows any inherited value
+# before the trap is installed and keeps the trap's reach to this script's
+# own `mktemp` files.
+HEADS_FILE=""
+RECORDS_FILE=""
+MERGE_SWEEP_FILE=""
+KNOWN_FILE=""
 trap 'rm -f "$GONE_FILE" "$REC_FILE" "$STALE_UNPRUNED_FILE" "${HEADS_FILE:-}" "${RECORDS_FILE:-}" "${MERGE_SWEEP_FILE:-}" "${KNOWN_FILE:-}"' EXIT
 
 gone_branches >"$GONE_FILE"
