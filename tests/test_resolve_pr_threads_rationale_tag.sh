@@ -2000,6 +2000,48 @@ else
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 34 (#990, Codex P2 round 1 of #998): the marker exclusion rejects
+# the GENERATED marker reply, not every reply that mentions one.
+#
+# Test 31 locks the exclusion itself. Its complement is that the
+# exclusion must not over-reach: a substantive agent reply whose text
+# quotes an earlier marker — the natural way to write "that tag is stale,
+# here is what actually happened" — is a real disposition of the finding,
+# and a substring test discarded the whole reply as if this script had
+# emitted it. The finding was then reported never-dispositioned and left
+# unresolved, which is #990's own failure mode running backwards: a read
+# finding treated as unread.
+#
+# post_tag_reply emits "[mergepath-resolve: $class] $rationale", so the
+# generated form is the marker at the START of the body. Anchoring there
+# separates the two cases exactly.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 34: a reply that mentions a marker mid-sentence is still disposition evidence (#998 r1)"
+
+T990_B_QUOTES_MARKER='[
+  {"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"},
+  {"author":{"login":"nathanpayne-claude"},"body":"The [mergepath-resolve: deferred-to-followup] tag on this thread is stale — the backoff landed in c0ffee1.","databaseId":99104,"createdAt":"2026-01-02T00:00:00Z"}
+]'
+
+set +e
+out=$(run_t990 "$SCRATCH/t34.log" "$(t990_threads "$T990_B_QUOTES_MARKER")")
+rc=$?
+set -e
+
+t34_resolved=$(resolved_threads "$SCRATCH/t34.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 0 ] \
+   && [ "$t34_resolved" = "PRT_990A PRT_990B " ] \
+   && grep -q 'Skipped (never-dispositioned): 0' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: marker-quoting reply admitted; both threads resolved, exit 0"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a substantive reply was discarded because it mentions a marker (rc=$rc, resolved='$t34_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"

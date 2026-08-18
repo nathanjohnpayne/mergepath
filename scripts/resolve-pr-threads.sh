@@ -2469,6 +2469,7 @@ derive_tag_class() {
     while [ "$k" -lt "$reply_count" ]; do
       local r_login
       local r_body
+      local r_body_trimmed
       local r_body_len
       r_login=$(printf '%s' "$thread_json" | jq -r ".all_comments[$k].author.login // \"\"")
       r_body=$(printf '%s' "$thread_json" | jq -r ".all_comments[$k].body // \"\"")
@@ -2476,8 +2477,17 @@ derive_tag_class() {
       # Skip our own [mergepath-resolve: ...] marker replies — a resolution
       # marker is not a rebuttal (step 0 already honored a recognized one;
       # this also covers an unrecognized-class marker). Codex P2 on #565.
-      case "$r_body" in
-        *"[mergepath-resolve:"*) k=$((k + 1)); continue ;;
+      # Anchored at the START of the body, which is the generated format
+      # (post_tag_reply emits "[mergepath-resolve: $class] $rationale"): a
+      # substring test also discarded a substantive rebuttal that merely
+      # MENTIONS a marker, e.g. "the [mergepath-resolve: deferred-to-followup]
+      # tag is stale; fixed in abc1234" (Codex P2, round 1 of #998). Kept
+      # byte-identical to thread_reply_disposition's scan so the
+      # rebuttal-recorded ⇒ dispositioned invariant still holds by
+      # construction.
+      r_body_trimmed="${r_body#"${r_body%%[![:space:]]*}"}"
+      case "$r_body_trimmed" in
+        "[mergepath-resolve:"*) k=$((k + 1)); continue ;;
       esac
       if [ -n "$r_login" ] && [ "$r_body_len" -ge 30 ] && is_agent_author_local "$r_login"; then
         echo "rebuttal-recorded"
@@ -2631,9 +2641,20 @@ EOF
 # Our own [mergepath-resolve: ...] marker replies are excluded: a marker is
 # this script's OUTPUT, and counting it would let a previous file-proxy run
 # bootstrap the evidence for the next one.
+#
+# The exclusion matches the GENERATED format only — the marker at the START of
+# the body, which is exactly how post_tag_reply emits it
+# ("[mergepath-resolve: $class] $rationale"). A substring match would discard a
+# substantive reply that merely MENTIONS a marker ("the
+# [mergepath-resolve: deferred-to-followup] tag is stale; fixed in abc1234"),
+# reporting a genuinely dispositioned finding as never-dispositioned and leaving
+# it unresolved — the exclusion is meant to reject this script's own output, not
+# every reply that talks about it (Codex P2, round 1 of #998). Leading
+# whitespace is stripped first so a body GitHub normalizes with a leading
+# newline is still recognized as generated.
 thread_reply_disposition() {
   local tj="$1"
-  local cnt i login body last_nonagent_idx=-1
+  local cnt i login body body_trimmed last_nonagent_idx=-1
   cnt=$(printf '%s' "$tj" | jq '.all_comments | length' 2>/dev/null || echo 0)
   case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
   i=0
@@ -2647,8 +2668,11 @@ thread_reply_disposition() {
   while [ "$k" -lt "$cnt" ]; do
     login=$(printf '%s' "$tj" | jq -r ".all_comments[$k].author.login // \"\"")
     body=$(printf '%s' "$tj" | jq -r ".all_comments[$k].body // \"\"")
-    case "$body" in
-      *"[mergepath-resolve:"*) k=$((k + 1)); continue ;;
+    # Strip leading whitespace, then reject ONLY a body that STARTS with the
+    # marker — i.e. this script's own generated tag reply.
+    body_trimmed="${body#"${body%%[![:space:]]*}"}"
+    case "$body_trimmed" in
+      "[mergepath-resolve:"*) k=$((k + 1)); continue ;;
     esac
     if [ -n "$login" ] && [ -n "$body" ] && is_agent_author_local "$login"; then
       return 0
