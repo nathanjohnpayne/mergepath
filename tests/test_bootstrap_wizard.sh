@@ -753,6 +753,44 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 22: bootstrap::wizard_err survives xpg_echo byte-for-byte (#885).
+#
+# The wizard's stage-failure resume hint carries a printf-%q-escaped
+# value. Extract the live function definition from the script (so this
+# asserts the ACTUAL emission path, not a hand-copied stand-in) and
+# invoke it in a subshell with `shopt -s xpg_echo` set — the wizard's
+# own shell may not inherit BASHOPTS from the environment on bash <4.1
+# (macOS ships 3.2), so the option is set INSIDE the wrapper rather than
+# relied on to propagate. A backslash-bearing value round-tripped
+# through printf %q must reparse via eval to the exact original string;
+# under the pre-fix `echo`-based emitter, xpg_echo collapses the %q
+# `\\` back to a single `\` and the reparse silently drops a character.
+# ---------------------------------------------------------------------------
+wizard_err_def="$(sed -n '/^bootstrap::wizard_err() {/p' "$SCRIPT")"
+if [ -z "$wizard_err_def" ]; then
+  fail "could not extract bootstrap::wizard_err from $SCRIPT"
+else
+  orig_value='/tmp/a\b'
+  escaped_value="$(printf '%q' "$orig_value")"
+  xpg_out="$(bash -c '
+    shopt -s xpg_echo
+    eval "$1"
+    bootstrap::wizard_err "stage failed. Resume with: cmd --target-dir $2"
+  ' _ "$wizard_err_def" "$escaped_value" 2>&1)"
+  # Strip the fixed "[bootstrap-wizard] ERROR: " prefix and reparse the
+  # rest the same way a human pasting the hint would: eval the
+  # %q-escaped token back into a shell variable.
+  hint_line="${xpg_out#*ERROR: }"
+  captured_token="${hint_line##*--target-dir }"
+  eval "reparsed_value=$captured_token"
+  if [ "$reparsed_value" = "$orig_value" ]; then
+    pass "wizard_err message survives xpg_echo byte-for-byte"
+  else
+    fail "xpg_echo corrupted the %q-escaped value: want '$orig_value', got '$reparsed_value' (raw: $xpg_out)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo

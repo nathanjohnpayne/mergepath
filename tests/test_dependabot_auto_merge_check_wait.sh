@@ -31,18 +31,27 @@ mkdir -p "$SHIM_DIR"
 
 extract_function() {
   local name="$1"
+  local file="${2:-$WORKFLOW}"
+  # The strip width is derived from the MATCHED header line's own
+  # indentation, not hardcoded (#904): a hardcoded `sub(/^          /,
+  # "")` (10 spaces) is silently wrong the moment the workflow's `run:
+  # |` block indentation changes for any unrelated reason, mis-dedenting
+  # every extracted line rather than failing loudly.
   awk -v name="$name" '
     $0 ~ "^[[:space:]]*" name "\\(\\)[[:space:]]*\\{" {
       capture = 1
+      match($0, /^[[:space:]]*/)
+      indent = RLENGTH
     }
     capture {
-      sub(/^          /, "")
-      print
+      line = $0
+      if (length(line) >= indent) line = substr(line, indent + 1)
+      print line
     }
     capture && /^[[:space:]]*}[[:space:]]*$/ {
       exit
     }
-  ' "$WORKFLOW"
+  ' "$file"
 }
 
 {
@@ -58,11 +67,45 @@ else
   fail "could not extract current-head check functions from workflow"
 fi
 
+# extract_function's dedent must be DERIVED from the matched header
+# line's own indentation, not a value hardcoded to this workflow's
+# current `run: |` nesting (#904). Prove it against a fixture indented
+# at a DIFFERENT level (4 spaces) than the real workflow (10 spaces): a
+# hardcoded strip width would either mis-dedent (leaving stray leading
+# spaces) or, if the fixture line is shorter than the hardcoded width,
+# eat into the content itself.
+INDENT_FIXTURE="$WORK/indent-fixture.yml"
+cat >"$INDENT_FIXTURE" <<'FIXTURE'
+some:
+  unrelated: yaml
+    other_function() {
+      echo "line one"
+      echo "line two"
+    }
+FIXTURE
+indent_extracted="$(extract_function other_function "$INDENT_FIXTURE")"
+indent_expected='other_function() {
+  echo "line one"
+  echo "line two"
+}'
+if [ "$indent_extracted" = "$indent_expected" ]; then
+  pass "extract_function derives the dedent width from the header's own indentation"
+else
+  fail "extract_function dedent is not indentation-derived; got: $indent_extracted"
+fi
+
 cat >"$SHIM_DIR/gh" <<'SHIM'
 #!/usr/bin/env bash
 set -euo pipefail
 
 printf '%s\n' "$*" >>"$SHIM_LOG"
+# Argument-boundary-preserving companion log (#905): $* collapses a
+# single argument containing spaces with two adjacent tokens separated
+# by a space, so the $*-joined line above cannot by itself prove the
+# form-encoded check_name is ONE argv element. This uses a unit
+# separator (0x1f) that cannot occur inside a shell argv element to
+# record each argument distinctly, one record per invocation.
+{ printf '%s\x1f' "$@"; printf '\n'; } >>"${SHIM_LOG}.argv"
 
 require_arg() {
   local expected="$1"
@@ -139,6 +182,7 @@ run_functions() {
 }
 
 : >"$SHIM_LOG"
+: >"${SHIM_LOG}.argv"
 if latest_output="$(run_functions success latest)"; then
   if [ "$(printf '%s' "$latest_output" | jq -c '{name,status,conclusion}')" = '{"name":"Label Gate","status":"completed","conclusion":"success"}' ]; then
     pass "paginated filtered lookup selects the latest exact-name run"
@@ -149,10 +193,37 @@ else
   fail "paginated filtered lookup failed"
 fi
 
+# This checks the OVERALL invocation shape and ordering via the $*-joined
+# log line. $* alone would collapse a single argument containing spaces
+# (e.g. `check_name=Label Gate` as one token) with two adjacent tokens
+# that happen to be separated by a space, so it cannot by itself prove
+# which one occurred — it is redundant/weaker coverage of flag order,
+# not of the argument boundary (#905).
 if grep -Fq -- '--paginate -X GET repos/owner/repo/commits/test-head/check-runs -f check_name=Label Gate -F per_page=100' "$SHIM_LOG"; then
-  pass "lookup uses paginated GET with a form-encoded spaced check name"
+  pass "lookup's overall invocation shape matches the expected flag order"
 else
   fail "lookup did not use the required paginated, form-encoded request shape"
+fi
+
+# The actual argument-boundary proof (#905): read the 0x1f-delimited argv
+# record and confirm `check_name=Label Gate` arrived as exactly ONE argv
+# element, not two adjacent elements ("check_name=Label" and "Gate")
+# that a $*-join would render identically. require_arg's "$@" walk above
+# already enforces this at runtime; this reads back the same evidence
+# independently of $*.
+argv_record="$(tail -n1 "${SHIM_LOG}.argv")"
+argv_field_count=0
+argv_has_exact_token=0
+IFS=$'\x1f' read -r -a argv_fields <<<"$argv_record"
+for argv_field in "${argv_fields[@]}"; do
+  [ -n "$argv_field" ] || continue
+  argv_field_count=$((argv_field_count + 1))
+  [ "$argv_field" = "check_name=Label Gate" ] && argv_has_exact_token=1
+done
+if [ "$argv_has_exact_token" -eq 1 ]; then
+  pass "check_name=Label Gate arrived as a single argv element, not two adjacent tokens"
+else
+  fail "check_name=Label Gate did not arrive as a single argv element (argv: $argv_record)"
 fi
 
 if success_output="$(run_functions success gate 2>&1)"; then

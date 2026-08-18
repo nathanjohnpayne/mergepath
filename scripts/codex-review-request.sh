@@ -548,14 +548,59 @@ die() {
 # once per input (per page), which miscounts and misfilters on multi-page
 # PRs. Slurp with `-s` collects all inputs into an outer array, then `add`
 # concatenates the per-page arrays into one flat array. Defaults to `[]`
-# on empty input. Exits 3 on API or parse error.
+# on empty input.
+#
+# RETURNS 3 on failure; it cannot abort its caller (#966, mirroring the
+# #831 contract fix already applied to coderabbit-wait.sh). Every call
+# site here is a command substitution (`VAR=$(fetch_api_array …)`), so a
+# `die`/`exit` inside this function would kill only that subshell — the
+# assigning statement resumes with an empty string and status 0, and a
+# caller that infers "no results" from emptiness reads a failed API call
+# as a confident negative. `return` carries the SAME status a `die` exit
+# would have produced; the difference is that this function no longer
+# claims a power (aborting the whole script) it does not actually have
+# when called from inside another function. A top-level
+# `VAR=$(fetch_api_array …)` (outside any function) still trips
+# `set -euo pipefail` and exits the script with status 3 — unaffected by
+# this change. A call site INSIDE a function body must propagate the
+# status explicitly (`|| return 3` / `|| die 3 …`); see scan_codex_state
+# below for the call site migrated here. The other in-function site,
+# trigger_ack_present, is deliberately NOT migrated in this change: its
+# unread-vs-absent distinction is the eyes-ack deadline rule, specified
+# and tested as a whole in #987. It keeps the pre-existing behaviour —
+# an unreadable read reads as a missing ack — until then.
+#
+# The two streams are captured SEPARATELY. `gh api` writes diagnostics to
+# stderr on calls that SUCCEED — deprecation notices, retry/backoff
+# chatter, token-scope warnings — so folding stderr into stdout with
+# `2>&1` feeds that prose to the `jq -s` slurp below, which then fails
+# and reports a healthy fetch as an error. That is the same dishonesty
+# this contract fix is about, pointed the other way: a swallowed failure
+# lies about a bad read, a merged stderr stream lies about a good one.
+# Only stdout reaches jq; stderr is kept solely for the diagnostic.
 fetch_api_array() {
   local endpoint=$1
   local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
-    || die 3 "failed to flatten $label pagination output"
+  local raw err errfile rc=0
+
+  errfile=$(mktemp "${TMPDIR:-/tmp}/codex-review-request-api.XXXXXX") || {
+    log "ERROR: failed to allocate a stderr capture file while fetching $label"
+    return 3
+  }
+  # `raw=$(…)` on its own would trip errexit before rc could be read; the
+  # `|| rc=$?` form captures the status without aborting.
+  raw=$(gh api --paginate "$endpoint" 2>"$errfile") || rc=$?
+  err=$(cat "$errfile" 2>/dev/null) || err=""
+  rm -f "$errfile"
+
+  if [ "$rc" -ne 0 ]; then
+    log "ERROR: failed to fetch $label: $err"
+    return 3
+  fi
+  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
+    log "ERROR: failed to flatten $label pagination output${err:+ (gh stderr: $err)}"
+    return 3
+  }
 }
 
 # --- Phase 4a entry gate (#486) ---------------------------------------------
@@ -666,10 +711,19 @@ log "ack_wait = ${ACK_WAIT_SECONDS}s    max_ack_retries = $MAX_ACK_RETRIES"
 scan_codex_state() {
   local reviews comments reactions issue_comments review findings reaction verdict blocked
 
-  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
-  comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
-  reactions=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions")
-  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  # Each read must propagate fetch_api_array's status explicitly (#966):
+  # scan_codex_state is invoked from every call site as
+  # `VAR=$(scan_codex_state)`, so it runs inside ITS OWN command
+  # substitution subshell — a `die` from within fetch_api_array, called
+  # from in here, would only kill that inner subshell too, leaving these
+  # assignments empty and status 0. `|| return 3` makes the caller's
+  # `if ! scan_codex_state; then die …` guard (below and at every call
+  # site) actually observe the failure instead of relying on the
+  # trailing `jq -n --argjson` emitter to crash on empty input.
+  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return 3
+  comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments") || return 3
+  reactions=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions") || return 3
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
 
   # Latest review from the Codex bot on the current HEAD commit, if any.
   # Codex always uses COMMENTED state regardless of findings. We also

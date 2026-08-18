@@ -167,6 +167,77 @@ run_case "consumer_request_changes_true_fails" 1 "reviews.request_changes_workfl
   profile: assertive
   request_changes_workflow: true"
 
+# --- Paired opt-out (#911) --------------------------------------------
+#
+# A LONE auto_review.enabled=false flip still fails (asserted above,
+# unchanged). PAIRED with coderabbit.enabled: false in
+# review-policy.yml, it is a deliberate, explicit, reviewable opt-out —
+# the same argument #248 already accepts for the file-absent case — and
+# must NOTE rather than FAIL. Deleting .coderabbit.yml (the gate's
+# pre-#911 remediation) does NOT disable CodeRabbit's auto-review
+# default, so it must not be the only way to satisfy this gate.
+run_case_with_policy() {
+  local name=$1
+  local want_rc=$2
+  local want_substr=$3
+  local detection=$4
+  local body=$5
+  local policy_coderabbit_enabled=$6
+
+  local case_root
+  case_root="$WORKDIR/$name"
+  mkdir -p "$case_root/scripts/ci" "$case_root/.github"
+  cp "$CHECK" "$case_root/scripts/ci/check_coderabbit_config"
+  chmod +x "$case_root/scripts/ci/check_coderabbit_config"
+  printf '%s\n' "$body" > "$case_root/.coderabbit.yml"
+  printf 'coderabbit:\n  enabled: %s\n' "$policy_coderabbit_enabled" \
+    > "$case_root/.github/review-policy.yml"
+
+  local out rc=0
+  out=$(
+    unset GITHUB_REPOSITORY
+    MERGEPATH_TEMPLATE_CHECK="$detection" \
+      "$case_root/scripts/ci/check_coderabbit_config" 2>&1
+  ) || rc=$?
+
+  if [ "$rc" -ne "$want_rc" ]; then
+    fail "$name: expected rc=$want_rc, got rc=$rc"
+    echo "  output: $out" >&2
+    return
+  fi
+  case "$out" in
+    *"$want_substr"*) pass "$name (rc=$rc)" ;;
+    *)
+      fail "$name: stdout missing '$want_substr'"
+      echo "  output: $out" >&2
+      ;;
+  esac
+}
+
+# Paired opt-out: auto_review.enabled=false AND coderabbit.enabled: false
+# in review-policy.yml → NOTE, exit 0. This is the acceptance-criteria
+# case #911 exists to fix.
+run_case_with_policy "paired_opt_out_passes" 0 \
+  "NOTE — reviews.auto_review.enabled is false" \
+  "skip" \
+  "reviews:
+  profile: assertive
+  auto_review:
+    enabled: false" \
+  "false"
+
+# Lone flip with an EXPLICIT coderabbit.enabled: true in review-policy.yml
+# (not merely absent) → still FAIL. Confirms the pairing check reads the
+# actual value, not just file presence.
+run_case_with_policy "lone_flip_with_explicit_enabled_true_fails" 1 \
+  "reviews.auto_review.enabled is false" \
+  "skip" \
+  "reviews:
+  profile: assertive
+  auto_review:
+    enabled: false" \
+  "true"
+
 # Template: request_changes_workflow=true → FAIL too.
 run_case "template_request_changes_true_fails" 1 "reviews.request_changes_workflow is true" \
   "force" \

@@ -70,11 +70,19 @@ jobs:
       #   - markdown-it-py backs the CommonMark oracle in
       #     tests/test_check_doc_ownership.sh (the regression net
       #     check_doc_ownership runs). Same gap in the same job (#929 item
-      #     21): markdown-it-py is pinned at 4.2.0 for md-prose-wrap.yml but
-      #     was never installed for repo_lint.yml, so the oracle was active
-      #     locally and silently skipped in CI — exactly the state it exists
-      #     to prevent. Bundled here rather than filed separately because the
-      #     fix is the identical one step in the identical job.
+      #     21, Addendum 7): the GitHub-hosted runner image ships an
+      #     importable markdown_it, but it answers CommonMark 0.30 while the
+      #     oracle's fixture rows target 0.31 — the two specs disagree on the
+      #     § HTML blocks condition 6 tag list, which is what Case 14w
+      #     exercises. So the renderer was never absent, and the skip was
+      #     never silent: since #925 the oracle gates on a conformance probe
+      #     and names the exact spec mismatch on stdout when it declines.
+      #     What was missing is a PINNED renderer that actually answers
+      #     0.31 — an unpinned install would still resolve to whatever
+      #     CommonMark version the runner's markdown-it-py happens to
+      #     implement, which is the wrong specification for these fixtures.
+      #     Bundled here rather than filed separately because the fix is the
+      #     identical one step in the identical job.
       #
       # Placed AFTER the #777 snapshot above, not before it: this is the only
       # step in the job that fetches and executes third-party code, so it

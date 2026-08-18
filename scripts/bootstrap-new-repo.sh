@@ -168,7 +168,14 @@ usage() {
 }
 
 bootstrap::wizard_log() { echo "[bootstrap-wizard] $*"; }
-bootstrap::wizard_err() { echo "[bootstrap-wizard] ERROR: $*" >&2; }
+# printf, not echo: under xpg_echo (default on some shells/platforms) the
+# echo builtin reinterprets backslash escapes in its argument. The
+# stage-failure resume hint carries a printf-%q-escaped value (see :798),
+# and %q's `\\` for a literal backslash collapses back to a single `\`
+# under echo+xpg_echo, silently corrupting the byte-exact value on paste.
+# printf '%s\n' never interprets escapes in its argument, so the message
+# round-trips exactly regardless of xpg_echo. See #885.
+bootstrap::wizard_err() { printf '%s\n' "[bootstrap-wizard] ERROR: $*" >&2; }
 
 # --- argument parsing -------------------------------------------------------
 
