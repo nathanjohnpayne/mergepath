@@ -1338,8 +1338,32 @@ parse_rate_limit_window() {
   return 1
 }
 
+# BEGIN coderabbit_comment_classifier
 # Classify a CodeRabbit comment body. Emits one of:
 #   rate_limit | paused | in_progress | status_probe | review
+#
+# Pure: string predicates over the passed body, reading only the marker
+# constants above. No globals beyond those and no I/O — extracted by sentinel
+# and sourced directly by tests/test_coderabbit_wait_status_probe.sh, the same
+# pattern as the coderabbit_summary_helpers block below.
+#
+# EVERY predicate below is fed by HERE-STRING, never through a pipe (#1005).
+# `set -o pipefail` is on and `grep -q` exits the instant it matches, so in
+# `producer | grep -q PATTERN` a body larger than the platform's pipe buffer
+# (64 KiB on both Linux and macOS) whose match sits near the START leaves the
+# producer still writing when grep returns: it takes SIGPIPE and the PIPELINE
+# reports 141, i.e. the predicate answers "no match" on a body that plainly
+# matches. Measured on the pre-fix idiom at 245894 bytes: `printf '%s' "$body"
+# | grep -Fqi "$RATE_LIMIT_MARKER"` returned 141 with the marker on line 1,
+# while the here-string form returned 0.
+#
+# The direction is what makes this ladder a false-CLEAR rather than a stall,
+# unlike the two summary predicates #995 corrected. A false negative here drops
+# a body OUT of rate_limit / paused / in_progress and into the `review` default
+# — the one class whose arm can emit a clearance — so a rate-limited, paused or
+# mid-review CodeRabbit reads as a completed clean report. `summary_names_head`
+# and `summary_names_only_other_head` below carry the same correction; this
+# block is the rest of the #1005 sweep.
 classify_comment() {
   local body=$1
   # #593: key on the stable auto-generated marker FIRST, before any prose
@@ -1347,13 +1371,13 @@ classify_comment() {
   # user-facing wording ("Rate limit exceeded" vs "Review limit reached" /
   # "Fair Usage Limits"). Fixed-string grep (-F) so the literal dots in
   # "coderabbit.ai" are not treated as regex wildcards, mirroring PAUSED_MARKER.
-  if printf '%s' "$body" | grep -Fqi "$RATE_LIMIT_MARKER"; then
+  if grep -Fqi "$RATE_LIMIT_MARKER" <<<"$body"; then
     echo "rate_limit"
     return
   fi
   # Legacy prose fallback: the original notice text, retained so a notice that
   # somehow lacks the marker (or an older cached body) still classifies.
-  if echo "$body" | grep -qiE 'rate[- ]limit exceeded'; then
+  if grep -qiE 'rate[- ]limit exceeded' <<<"$body"; then
     echo "rate_limit"
     return
   fi
@@ -1362,7 +1386,7 @@ classify_comment() {
   # literal dots in "coderabbit.ai" are not treated as regex wildcards.
   # Checked before in_progress/review so the durable pause is never mistaken
   # for a slow review.
-  if printf '%s' "$body" | grep -Fqi "$PAUSED_MARKER"; then
+  if grep -Fqi "$PAUSED_MARKER" <<<"$body"; then
     echo "paused"
     return
   fi
@@ -1373,7 +1397,7 @@ classify_comment() {
   # would let a run still underway read as a completed report. Placed BEFORE
   # the narration check on purpose: a body carrying both is mid-review first
   # and narration second, and no observed body carries both.
-  if printf '%s' "$body" | grep -Fqi "$IN_PROGRESS_MARKER"; then
+  if grep -Fqi "$IN_PROGRESS_MARKER" <<<"$body"; then
     echo "in_progress"
     return
   fi
@@ -1381,11 +1405,11 @@ classify_comment() {
   # `@coderabbitai, how is the review going?`, are narration. They
   # summarize current state and may mention open threads, but they are
   # not a review on HEAD and must never clear the #136 freshness gate.
-  if echo "$body" | grep -qiE 'CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits'; then
+  if grep -qiE 'CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits' <<<"$body"; then
     echo "status_probe"
     return
   fi
-  if echo "$body" | grep -qiE 'review in progress|currently reviewing|commits? under review'; then
+  if grep -qiE 'review in progress|currently reviewing|commits? under review' <<<"$body"; then
     echo "in_progress"
     return
   fi
@@ -1413,6 +1437,41 @@ classify_comment() {
   # so `""` no longer arrives here from a failed read at all.
   echo "review"
 }
+# END coderabbit_comment_classifier
+
+# #1005 sweep record. Every `grep -q…` in this file that grades a COMMENT BODY
+# is now fed by here-string; the remaining pipelines are recorded here with the
+# reason they are out of scope, so the next reader does not have to re-derive
+# which ones matter:
+#
+#   - classify_comment's six marker/prose predicates and
+#     `status_context_fast_path_blocked_by_comment`'s HEAD-reference test —
+#     FIXED above and below. All seven grade a body a caller fetched from the
+#     API, which is unbounded and routinely large.
+#   - `summary_names_head` / `summary_names_only_other_head` — fixed in #995.
+#   - the base-branch pattern test (`printf '%s\n' "$PR_BASE_REF" | grep -Eq`)
+#     — the producer is a single ref NAME, bounded by git's own
+#     `check-ref-format` limits and orders of magnitude under the 64 KiB pipe
+#     buffer, so the producer has always finished before grep can leave. Its rc
+#     is captured explicitly rather than tested, so a 141 would be visible as a
+#     third value rather than silently read as "no match".
+#
+# The six sibling scripts named in #1005 AC3 were swept too:
+#   - `codex-review-check.sh` — its one body-grading predicate
+#     (`^Authoring-Agent:` over `$PR_BODY`) is ALREADY a here-string; #283 r3
+#     found and fixed this exact shape there, and the reasoning is preserved in
+#     that file's comment block.
+#   - `coderabbit-severity-gate.sh` and `merge-clearance-gate.sh` — their
+#     `echo "$PR_NUMBER" | grep -qE '^[0-9]+$'` argument validators grade a
+#     command-line integer, not a body.
+#   - `merge-clearance-gate.sh`'s `printf '%s' "$contexts" | grep -Fxq` grades a
+#     locally-built newline list of required-check NAMES (single digits of
+#     entries), not an API body; and a false negative there returns 1 from the
+#     enforcement probe, which is the fail-closed direction.
+#   - `coderabbit-record-feedback.sh`, `codex-record-feedback.sh` and
+#     `codex-review-request.sh` — no `grep -q` pipeline at all.
+#   - `scripts/lib/feedback-policy-helpers.sh` — its one `grep -qE` reads a
+#     FILE, so there is no producer process to signal.
 
 # BEGIN coderabbit_summary_helpers
 # Pure string predicates over a CodeRabbit summary body. No globals beyond the
@@ -2379,7 +2438,15 @@ status_context_fast_path_blocked_by_comment() {
       comment_created_at=$(echo "$latest" | jq -r '.created_at // .fresh_at // .updated_at')
       comment_fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
       comment_body=$(echo "$latest" | jq -r '.body')
-      if printf '%s' "$comment_body" | grep -Fq "$HEAD_SHA"; then
+      # HERE-STRING, not a pipe, and the direction is why (#1005). A rate-limit
+      # or pause NOTE that references HEAD is often the LONGEST body on the PR
+      # — CodeRabbit appends its walkthrough to it — and the reference sits in
+      # the first stanza. Under `set -o pipefail` the producer takes SIGPIPE
+      # once the body outruns the pipe buffer, the pipeline reports 141, the
+      # `if` reads false, and the notice falls through to the #446 arbitration
+      # below, which can leave the StatusContext success authoritative: a false
+      # CLEAR over a CodeRabbit that has demonstrably not reviewed this head.
+      if grep -Fq "$HEAD_SHA" <<<"$comment_body"; then
         # #596: a HEAD-referencing rate_limit/paused/in_progress notice means
         # CodeRabbit has not (yet) completed a review of this HEAD. CodeRabbit
         # nonetheless flips its commit StatusContext to success while
@@ -2637,7 +2704,7 @@ find_status_probe_reply() {
 
 emit_terminal_review_after_probe_if_present() {
   local latest body class potential_issues review_json summary_marker_rc
-  local summary_head_claim_rc
+  local summary_head_claim_rc head_run_rc head_run_id
   # Status-checked (#957/#959). "Best effort" governs the FETCH — an
   # unreadable surface is not fatal on the timeout path — but the DECODE now
   # reports rc 3, and an unchecked assignment would leave `latest` empty, skip
@@ -2654,11 +2721,12 @@ emit_terminal_review_after_probe_if_present() {
     return 0
   fi
 
-  # Derived ONCE and reused. The body feeds two predicates now (the class
-  # ladder and the #968 head-claim check), and a second `$(… | jq -r '.body')`
-  # inside an `if` condition would run with errexit suspended: a jq failure
-  # there yields the empty string, which reads as "makes no head claim" and
-  # falls through to the clearance. One read, status-checked, cannot.
+  # Derived ONCE and status-checked. A `$(… | jq -r '.body')` written inline in
+  # an `if` condition would run with errexit suspended: a jq failure there
+  # yields the empty string, which `classify_comment` grades `review` — the one
+  # class whose arm can clear. One read, checked, cannot. (#1023 removed the
+  # second consumer this body used to have; the class ladder is now the only
+  # one, and the read still has to be checked for the same reason.)
   body=$(echo "$latest" | jq -r '.body') || {
     log "post-probe terminal-review check: the selected comment body could not be derived — leaving the advisory timeout in place rather than grading an unread comment"
     return 0
@@ -2700,23 +2768,33 @@ emit_terminal_review_after_probe_if_present() {
           # ever UPGRADES the advisory timeout into a verdict, so declining to
           # emit leaves exit 4 in place — the same conservative answer it
           # already gives when the comment list cannot be read.
-          summary_head_claim_rc=0
-          crw_summary_names_only_other_head "$HEAD_SHA" || summary_head_claim_rc=$?
-          case "$summary_head_claim_rc" in
-            0)
-              log "post-probe terminal-review check: the PR's CodeRabbit summary has no blocking markers, but its commits range names a different commit than $HEAD_SHA — leaving the advisory timeout in place rather than clearing on another commit's verdict (#968)"
-              return 0
-              ;;
-            1) : ;;
-            *)
-              log "post-probe terminal-review check: the CodeRabbit summary comment could not be read, so a verdict about another commit cannot be ruled out — leaving the advisory timeout in place"
-              return 0
-              ;;
-          esac
-          if summary_names_only_other_head "$body" "$HEAD_SHA"; then
-            log "post-probe terminal-review check: the newest comment has no blocking markers, but its commits range names a different commit than $HEAD_SHA — leaving the advisory timeout in place rather than clearing on another commit's verdict (#968)"
-            return 0
+          #
+          # #1003 / #1022: the same rung ordering the polling arm now applies —
+          # the mutable third rung is consulted only when no immutable
+          # head-pinned review run answers first. rc 1 and rc 3 both leave the
+          # demotion deciding.
+          head_run_rc=0
+          head_run_id=$(crw_head_pinned_clean_review_run "$HEAD_SHA") || head_run_rc=$?
+          if [ "$head_run_rc" = "0" ]; then
+            log "post-probe terminal-review check: CodeRabbit review run id=$head_run_id is pinned to $HEAD_SHA by commit_id and carries a clean report body — the exact-SHA rung wins outright, so the mutable summary's commits range does not demote this head (#1003/#1022)"
+          else
+            summary_head_claim_rc=0
+            crw_summary_names_only_other_head "$HEAD_SHA" || summary_head_claim_rc=$?
+            case "$summary_head_claim_rc" in
+              0)
+                log "post-probe terminal-review check: the PR's CodeRabbit summary has no blocking markers, but its commits range names a different commit than $HEAD_SHA — leaving the advisory timeout in place rather than clearing on another commit's verdict (#968)"
+                return 0
+                ;;
+              1) : ;;
+              *)
+                log "post-probe terminal-review check: the CodeRabbit summary comment could not be read, so a verdict about another commit cannot be ruled out — leaving the advisory timeout in place"
+                return 0
+                ;;
+            esac
           fi
+          # #1023: the second carrier that read `$body` — the newest bot
+          # comment, not the marker-selected summary — is gone here for the
+          # reason the polling arm records at the equivalent site.
           log "CodeRabbit review landed during status-probe wait with no high-severity markers — emitting cleared (exit 0)"
           emit_json_and_exit "cleared" 0 "$review_json" 0
           ;;
@@ -3353,6 +3431,80 @@ crw_summary_names_only_other_head() {
   summary_names_only_other_head "$sbody" "$head_sha"
 }
 # END coderabbit_summary_head_claim
+
+# BEGIN coderabbit_head_run_evidence
+# #1003 / #1022. The answer to "does a head-pinned CLEAN review run outrank the
+# #968 summary demotion?" is YES, and this helper is the evidence test that
+# decides it. AGENTS.md step 5.a and REVIEW_POLICY.md § Phase 3 now publish that
+# answer alongside the ladder.
+#
+# The defect: the published contract is an ORDERED ladder whose first rung is
+# "an exact SHA match wins outright". The #968 rung sits third and reads a
+# MUTABLE comment. Evaluating the third rung unconditionally inverts the
+# order — CodeRabbit reviews the current head, leaves the in-place walkthrough
+# naming the previous one (a behaviour this repo already documents), and the
+# demotion refuses a clearance the immutable `commit_id` evidence supports. The
+# run then polls to the advisory `exit 4` after `coderabbit.max_wait_seconds`.
+#
+# Why the #900 selector rather than a raw `commit_id == HEAD_SHA` match: #919
+# records that the bare conjunct is satisfiable by CodeRabbit ACTIVITY rather
+# than by a finished review. GitHub wraps a body-less review object around a
+# single inline reply, so CodeRabbit's `🐇 ✅` acknowledgement of a
+# `[mergepath-resolve:…]` tag reply — which the review-loop rules make us post
+# on EVERY finding thread — would otherwise read as a review run.
+# `crw_select_head_pinned_review_run` exists precisely to filter that: it
+# requires a NON-EMPTY review body, the discriminator measured on #889.
+#
+# Two further conjuncts beyond the selector, both fail-closed:
+#   - the run body must classify `review`. A head-pinned object whose body is a
+#     rate-limit / pause / in-progress notice is not a completed report, and
+#     `classify_comment` is the same ladder every other surface is graded with.
+#   - the run body must carry no blocking marker. The callers have already
+#     graded the inline findings and the SUMMARY body; a marker carried solely
+#     by the run body is dispositioned by neither, so it must not unlock a
+#     clearance route here.
+#
+# Direction is preserved: this can only ever WITHDRAW a refusal that rests on a
+# mutable comment, in favour of GitHub-owned immutable head identity. It never
+# promotes a body to clearance — the caller still has to pass the inline
+# finding count, the summary-marker gate and the class ladder before it reaches
+# the `cleared` emit at all.
+#
+# Return codes, and both call sites honour all three:
+#   0  a head-pinned, body-bearing, review-class, marker-free CodeRabbit run
+#      exists on this head. The exact-SHA rung is satisfied; skip the demotion.
+#   1  no such run. The demotion decides, exactly as before.
+#   3  the reviews list could not be READ, or the selected run could not be
+#      derived. Never folded into 0 — an unreadable surface must not withdraw a
+#      refusal, which is the same failed-read-as-clean confusion #936/#959
+#      closed at the neighbouring reads.
+#
+# crw_head_pinned_clean_review_run <head-sha>
+crw_head_pinned_clean_review_run() {
+  local head_sha=${1:?}
+  local reviews run run_id rbody
+  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return 3
+  run=$(crw_select_head_pinned_review_run "$reviews" "$BOT_LOGIN" "$head_sha") || return 3
+  # No body-bearing review object pinned to this head is a definite answer, not
+  # an unread one: there is no run to outrank the summary with.
+  [ -n "$run" ] || return 1
+  run_id=$(printf '%s' "$run" | jq -r '.id // empty') || return 3
+  [ -n "$run_id" ] || return 3
+  # Re-read the FULL body from the same array. The selector emits a 200-char
+  # `body_excerpt` for logging, and classifying an excerpt would grade a
+  # truncated document — the marker a run carries need not be in the first 200
+  # bytes.
+  rbody=$(printf '%s' "$reviews" | jq -r --argjson id "$run_id" \
+    '[ .[] | select(.id == $id) | (.body // "") ] | first // ""') || return 3
+  # The selector already required a non-empty body, so an empty one here means
+  # the id did not round-trip — an unread body, not a silent one.
+  [ -n "$rbody" ] || return 3
+  [ "$(classify_comment "$rbody")" = "review" ] || return 1
+  summary_blocking_marker_present "$rbody" && return 1
+  printf '%s\n' "$run_id"
+  return 0
+}
+# END coderabbit_head_run_evidence
 
 # #919: both of the probe's terminal conjuncts are satisfiable by artifacts of
 # CodeRabbit ACTIVITY rather than by a finished review.
@@ -4201,28 +4353,45 @@ while :; do
           # this arm happens to be grading. Three-way for the same reason the
           # marker read above is: an unreadable comment list is not a body that
           # declines to make a claim.
-          SUMMARY_HEAD_CLAIM_RC=0
-          crw_summary_names_only_other_head "$HEAD_SHA" || SUMMARY_HEAD_CLAIM_RC=$?
-          case "$SUMMARY_HEAD_CLAIM_RC" in
-            0)
-              log "the PR's CodeRabbit summary comment has no blocking markers, but its commits range names a different commit than $HEAD_SHA — an in-place EDIT is not a re-review, so this is not clearance for this head (#968); sleeping ${POLL_INTERVAL_SECONDS}s"
-              sleep_or_timeout "$POLL_INTERVAL_SECONDS"
-              continue
-              ;;
-            1) : ;;
-            *)
-              die 3 "could not read the CodeRabbit summary comment to rule out a verdict about another commit on $HEAD_SHA — refusing to report a clearance"
-              ;;
-          esac
-          # Kept as a second, independent carrier. The check can only REFUSE,
-          # so consulting the graded body as well is monotone: every refusal
-          # that fires today still fires, and the summary read above adds the
-          # ones a later chat reply used to hide.
-          if summary_names_only_other_head "$COMMENT_BODY" "$HEAD_SHA"; then
-            log "CodeRabbit comment id=$COMMENT_ID has no blocking markers, but its commits range names a different commit than $HEAD_SHA — an in-place EDIT is not a re-review, so this is not clearance for this head (#968); sleeping ${POLL_INTERVAL_SECONDS}s"
-            sleep_or_timeout "$POLL_INTERVAL_SECONDS"
-            continue
+          #
+          # #1003 / #1022: the demotion is the ladder's THIRD rung and reads a
+          # MUTABLE comment, so it is consulted only when the FIRST rung — an
+          # exact SHA match, i.e. an immutable head-pinned review run — has
+          # nothing to say. Evaluating it unconditionally inverted the
+          # published order and stalled a head CodeRabbit had demonstrably
+          # reviewed to the advisory timeout. rc 1 (no such run) and rc 3 (the
+          # reviews list is unreadable) both leave the demotion deciding, so an
+          # unreadable surface can never withdraw a refusal.
+          HEAD_RUN_RC=0
+          HEAD_RUN_ID=$(crw_head_pinned_clean_review_run "$HEAD_SHA") || HEAD_RUN_RC=$?
+          if [ "$HEAD_RUN_RC" = "0" ]; then
+            log "CodeRabbit review run id=$HEAD_RUN_ID is pinned to $HEAD_SHA by commit_id and carries a clean report body — the exact-SHA rung wins outright, so the mutable summary's commits range does not demote this head (#1003/#1022)"
+          else
+            SUMMARY_HEAD_CLAIM_RC=0
+            crw_summary_names_only_other_head "$HEAD_SHA" || SUMMARY_HEAD_CLAIM_RC=$?
+            case "$SUMMARY_HEAD_CLAIM_RC" in
+              0)
+                log "the PR's CodeRabbit summary comment has no blocking markers, but its commits range names a different commit than $HEAD_SHA — an in-place EDIT is not a re-review, so this is not clearance for this head (#968); sleeping ${POLL_INTERVAL_SECONDS}s"
+                sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+                continue
+                ;;
+              1) : ;;
+              *)
+                die 3 "could not read the CodeRabbit summary comment to rule out a verdict about another commit on $HEAD_SHA — refusing to report a clearance"
+                ;;
+            esac
           fi
+          # #1023 removed the second carrier that used to sit here: the same
+          # predicate applied to `$COMMENT_BODY`, which is merely the newest bot
+          # comment and need not be the marker-selected summary at all. It was
+          # justified as monotone — refusals only — but the refusals it added
+          # were not evidence about any review: a benign chat reply that QUOTES
+          # `between <old-base> and <old-head>` (a rebuttal citing the previous
+          # round, or a diff hunk from this very file) vetoed a valid
+          # current-head summary and forced the advisory timeout. That
+          # contradicts the published contract, which scopes the demotion to the
+          # summary's OWN commits range. The summary read above is the carrier
+          # of record; a non-summary comment carrying a range is quoting one.
           log "CodeRabbit review posted with no high-severity markers — cleared"
           emit_json_and_exit "cleared" 0 "$REVIEW_JSON" 0
           ;;

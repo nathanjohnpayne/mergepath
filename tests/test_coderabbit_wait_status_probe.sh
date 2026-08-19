@@ -2015,6 +2015,243 @@ Reviewing files that changed from the base of the PR and between $b40 and $h40."
   fi
 }
 
+test_1005_classifier_pipe_buffer_unit() {
+  # #1005. `classify_comment` is a pure classifier, so drive it directly from
+  # the extracted sentinel block rather than through a stub-gh fixture: the
+  # mutation this case has to verify — restoring the producer pipe — is a
+  # mechanical rewrite of the extracted copy, where mutating the orchestrated
+  # script would cost a full poll-loop run per class.
+  #
+  # The hazard: `set -o pipefail` is on and `grep -q` exits the instant it
+  # matches, so in `producer | grep -q PATTERN` a body past the platform's pipe
+  # buffer (64 KiB on Linux and macOS) whose match sits near the START leaves
+  # the producer writing into a closed pipe. It takes SIGPIPE, the PIPELINE
+  # reports 141, and the `if` reads false on a body that plainly matches.
+  #
+  # Direction is what makes this the false-CLEAR half of the family rather than
+  # #995's safe half: a false negative here drops the body OUT of rate_limit /
+  # paused / in_progress and into the `review` default — the one class whose
+  # arm can emit a clearance — so a rate-limited, paused or mid-review
+  # CodeRabbit reads as a completed clean report.
+  local snip="$WORKDIR/comment-classifier.sh" mut="$WORKDIR/comment-classifier-piped.sh"
+  local bad="" pad big_rl big_rl_prose big_paused big_prog big_probe big_prog_prose
+  eval "$(grep -E '^(RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER)=' \
+    "$ROOT/scripts/coderabbit-wait.sh")"
+  awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  pad=$(printf '%*s' 204800 '' | tr ' ' 'x')
+  [ "${#pad}" -gt 65536 ] || bad="$bad fixture-not-past-pipe-buffer"
+
+  big_rl="<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->
+$pad"
+  big_rl_prose="> [!WARNING]
+> Rate limit exceeded
+$pad"
+  big_paused="<!-- This is an auto-generated comment: $PAUSED_MARKER -->
+$pad"
+  big_prog="<!-- This is an auto-generated comment: $IN_PROGRESS_MARKER -->
+$pad"
+  big_probe="CodeRabbit review command invocation
+$pad"
+  big_prog_prose="Review in progress on this pull request.
+$pad"
+
+  [ "$(classify_comment "$big_rl")" = "rate_limit" ] || bad="$bad large-rate-limit-marker"
+  [ "$(classify_comment "$big_rl_prose")" = "rate_limit" ] || bad="$bad large-rate-limit-prose"
+  [ "$(classify_comment "$big_paused")" = "paused" ] || bad="$bad large-paused-marker"
+  [ "$(classify_comment "$big_prog")" = "in_progress" ] || bad="$bad large-in-progress-marker"
+  [ "$(classify_comment "$big_probe")" = "status_probe" ] || bad="$bad large-status-probe-prose"
+  [ "$(classify_comment "$big_prog_prose")" = "in_progress" ] || bad="$bad large-in-progress-prose"
+  # The escape that keeps the six above from passing for the wrong reason: a
+  # large body matching nothing is still `review`, so the fix cannot be
+  # classifying every long body as a notice.
+  [ "$(classify_comment "$pad")" = "review" ] || bad="$bad large-plain-body-not-review"
+  # And the small-body ladder is untouched — the here-string rewrite must not
+  # have moved any boundary.
+  [ "$(classify_comment "<!-- $RATE_LIMIT_MARKER -->")" = "rate_limit" ] || bad="$bad small-rate-limit"
+  [ "$(classify_comment "<!-- $PAUSED_MARKER -->")" = "paused" ] || bad="$bad small-paused"
+  [ "$(classify_comment "<!-- $IN_PROGRESS_MARKER -->")" = "in_progress" ] || bad="$bad small-in-progress"
+  [ "$(classify_comment "Actionable comments posted: 0")" = "review" ] || bad="$bad small-review"
+
+  # MUTATION. Rewrite every here-string back into the producer pipe on a COPY
+  # and confirm all six large-body classes collapse into `review`. Without this
+  # the assertions above would pass against any implementation that happens to
+  # match, and the pipe is the precise thing they exist to pin.
+  sed -E 's@grep (.*) <<<"\$body"@printf "%s" "$body" | grep \1@' "$snip" >"$mut"
+  grep -q '<<<"\$body"' "$mut" && bad="$bad mutation-left-a-here-string"
+  grep -q 'printf "%s" "\$body" | grep' "$mut" || bad="$bad mutation-produced-no-pipe"
+  (
+    set -o pipefail
+    # shellcheck disable=SC1090
+    . "$mut"
+    [ "$(classify_comment "$big_rl")" = "review" ] || exit 11
+    [ "$(classify_comment "$big_rl_prose")" = "review" ] || exit 12
+    [ "$(classify_comment "$big_paused")" = "review" ] || exit 13
+    [ "$(classify_comment "$big_prog")" = "review" ] || exit 14
+    [ "$(classify_comment "$big_probe")" = "review" ] || exit 15
+    [ "$(classify_comment "$big_prog_prose")" = "review" ] || exit 16
+    # The mutant must still be CORRECT on small bodies, or the case proves only
+    # that the rewrite broke the file rather than that the pipe is the cause.
+    [ "$(classify_comment "<!-- $RATE_LIMIT_MARKER -->")" = "rate_limit" ] || exit 17
+    [ "$(classify_comment "<!-- $PAUSED_MARKER -->")" = "paused" ] || exit 18
+  ) || bad="$bad mutation-not-observed(exit=$?)"
+
+  if [ -z "$bad" ]; then
+    pass "#1005: every classify_comment predicate survives a 200 KiB body, and restoring the producer pipe collapses all six notice classes into the clearing 'review' default"
+  else
+    fail "#1005 classifier pipe buffer:$bad"
+  fi
+}
+
+test_1003_head_run_evidence_unit() {
+  # #1003 / #1022. The evidence test that decides whether the ladder's FIRST
+  # rung — an exact SHA match — outranks the #968 summary demotion. Driven
+  # directly because its three return codes are the whole contract and the
+  # integration fixtures reach only two of them.
+  local snip="$WORKDIR/head-run-evidence.sh" bad="" rc out
+  local h40 b40 clean_body ack_body notice_body marker_body
+  eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END|SUMMARY_MARKER|RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER)=' \
+    "$ROOT/scripts/coderabbit-wait.sh")"
+  # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+  . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  {
+    awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+    awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+    awk '/^# BEGIN coderabbit_review_run_selector$/{f=1;next} /^# END coderabbit_review_run_selector$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+    awk '/^# BEGIN coderabbit_head_run_evidence$/{f=1;next} /^# END coderabbit_head_run_evidence$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+  } >"$snip"
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  h40='0123456789abcdef0123456789abcdef01234567'
+  b40='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  # Read by the extracted helper through dynamic scope, not by this function.
+  # shellcheck disable=SC2034
+  REPO=owner/repo
+  # shellcheck disable=SC2034
+  PR_NUMBER=999
+  BOT_LOGIN='coderabbitai[bot]'
+  log() { :; }
+
+  clean_body="**Actionable comments posted: 0**
+
+Reviewed everything up to $h40. LGTM!"
+  ack_body=""
+  notice_body="<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->
+
+> **Next review available in:** **13 minutes**"
+  marker_body="**Actionable comments posted: 1**
+
+_🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
+
+**Reject the diagnostic bypass.**"
+
+  # A body-bearing CodeRabbit run pinned to this head by commit_id is the
+  # ladder's first rung: rc 0, and the run's id on stdout so the caller can
+  # name its evidence in the log.
+  fetch_api_array() {
+    jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg b "$clean_body" '[
+      {id: 5501, user: {login: $bot}, commit_id: $sha,
+       submitted_at: "2026-06-04T00:01:00Z", body: $b}
+    ]'
+  }
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  [ "$rc" = "0" ] || bad="$bad clean-run-not-0(rc=$rc)"
+  [ "$out" = "5501" ] || bad="$bad clean-run-id($out)"
+
+  # #919: the body-LESS review object GitHub wraps around a single inline reply
+  # — CodeRabbit's `🐇 ✅` acknowledgement of a `[mergepath-resolve:…]` tag
+  # reply. It is CodeRabbit ACTIVITY, not a finished review, and the
+  # review-loop rules make us post the tag reply on every finding thread, so
+  # accepting it would re-arm the #900 wedge as a clearance route.
+  fetch_api_array() {
+    jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg b "$ack_body" '[
+      {id: 5502, user: {login: $bot}, commit_id: $sha,
+       submitted_at: "2026-06-04T00:01:00Z", body: $b}
+    ]'
+  }
+  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  [ "$rc" = "1" ] || bad="$bad bodyless-ack-not-1(rc=$rc)"
+
+  # A run pinned to ANOTHER commit says nothing about this head.
+  fetch_api_array() {
+    jq -nc --arg bot "$BOT_LOGIN" --arg sha "$b40" --arg b "$clean_body" '[
+      {id: 5503, user: {login: $bot}, commit_id: $sha,
+       submitted_at: "2026-06-04T00:01:00Z", body: $b}
+    ]'
+  }
+  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  [ "$rc" = "1" ] || bad="$bad other-commit-not-1(rc=$rc)"
+
+  # A head-pinned object whose BODY is a rate-limit notice is not a completed
+  # report, so it must not outrank the summary.
+  fetch_api_array() {
+    jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg b "$notice_body" '[
+      {id: 5504, user: {login: $bot}, commit_id: $sha,
+       submitted_at: "2026-06-04T00:01:00Z", body: $b}
+    ]'
+  }
+  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  [ "$rc" = "1" ] || bad="$bad notice-body-not-1(rc=$rc)"
+
+  # A head-pinned run whose body carries a BLOCKING marker is dispositioned by
+  # neither the inline count nor the summary-marker gate, so it must not unlock
+  # a clearance route either.
+  fetch_api_array() {
+    jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg b "$marker_body" '[
+      {id: 5505, user: {login: $bot}, commit_id: $sha,
+       submitted_at: "2026-06-04T00:01:00Z", body: $b}
+    ]'
+  }
+  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  [ "$rc" = "1" ] || bad="$bad blocking-marker-body-not-1(rc=$rc)"
+
+  # Newest-by-submitted_at wins, and the full body is read from the ARRAY
+  # rather than from the selector's 200-char excerpt.
+  fetch_api_array() {
+    jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg old "$marker_body" --arg new "$clean_body" '[
+      {id: 5506, user: {login: $bot}, commit_id: $sha,
+       submitted_at: "2026-06-04T00:01:00Z", body: $old},
+      {id: 5507, user: {login: $bot}, commit_id: $sha,
+       submitted_at: "2026-06-04T00:02:00Z", body: $new}
+    ]'
+  }
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  [ "$rc" = "0" ] || bad="$bad newest-run-not-0(rc=$rc)"
+  [ "$out" = "5507" ] || bad="$bad newest-run-id($out)"
+
+  # An empty list is a definite "no run on this head", not an unread one.
+  fetch_api_array() { printf '[]\n'; }
+  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  [ "$rc" = "1" ] || bad="$bad empty-list-not-1(rc=$rc)"
+
+  # An UNREADABLE reviews list is rc 3, never rc 0. Folding it into 0 would let
+  # a dead API WITHDRAW the #968 refusal — the failed-read-as-clean confusion
+  # #936/#959 closed at the neighbouring reads, pointed at the one predicate
+  # whose job is to stop a clearance.
+  fetch_api_array() { return 3; }
+  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  [ "$rc" = "3" ] || bad="$bad unread-not-3(rc=$rc)"
+
+  # Restore the extracted definitions this case stubbed over.
+  unset -f fetch_api_array log
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  if [ -z "$bad" ]; then
+    pass "#1003/#1022: the exact-SHA rung is satisfied only by a body-bearing, review-class, marker-free head-pinned run, and an unreadable reviews list is rc 3 rather than 'the rung is satisfied'"
+  else
+    fail "#1003 head run evidence:$bad"
+  fi
+}
+
 test_851_summary_helpers_unit() {
   # The three predicates are pure; extract the sentinel block and source it so
   # the 40-hex token boundary and the zero-stanza vacuity guard are assertable
@@ -2590,6 +2827,8 @@ test_851_summary_evidence_matrix
 test_851_review_object_premerge_shares_strip
 test_851_summary_helpers_unit
 test_968_summary_head_claim_unit
+test_1005_classifier_pipe_buffer_unit
+test_1003_head_run_evidence_unit
 test_837_badge_only_inline_finding_is_counted
 test_837_badge_only_summary_finding_probe_is_findings
 test_824_sha_matched_review_is_honored_regardless_of_timestamp
