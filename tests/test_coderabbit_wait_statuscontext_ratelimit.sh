@@ -171,6 +171,9 @@ make_case() {
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
+  # Hard-required by coderabbit-wait.sh since #1008: both fetch wrappers
+  # delegate the paginated-list algorithm to the shared reader.
+  cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"
   # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
   # grades findings with the shared coderabbit_tier_of.
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
@@ -1045,6 +1048,122 @@ test_failed_poll_comment_decode_does_not_clear() {
   [ "$FAIL" -ne "$before" ] || pass "26: a failed comment-list DECODE in the polling loop is exit 3 (infra), never a graded 'review' on an empty comment"
 }
 
+# --- Test 27: #1008 — the two wrappers keep DIFFERENT failure contracts -----
+# The paginated-list algorithm moved to scripts/lib/gh-api-array.sh, which
+# returns ONE status (3) for every unreadable response. This file keeps two
+# wrappers over it whose contracts are deliberately different: the strict one
+# reports the infra status 3, the best-effort one reports 1, because its
+# callers treat an unreadable surface as non-fatal and handing them 3 would
+# make it fatal. Sharing the algorithm must not collapse that distinction —
+# the failure ACTION is exactly the part each caller still owns.
+#
+# The best-effort wrapper also keeps two DISTINCT messages, one per failed
+# step, which is why the lib reports which step failed rather than only that
+# one did. Both messages are asserted, on both stubs, so a wrapper that
+# always logged the fetch wording would fail here rather than silently
+# mislabel every parse failure as a transport failure.
+#
+# Extracted by sed and driven directly against a PATH-shimmed `gh`: this is a
+# unit over the composition (wrapper + shared reader), not a whole stubbed run.
+test_fetch_wrapper_contracts_unit() {
+  local dir="$WORKDIR/fetch-wrapper-contracts" before=$FAIL
+  local fn_strict fn_best out err
+  mkdir -p "$dir/bin"
+  fn_strict=$(sed -n '/^fetch_api_array() {/,/^}/p' "$ROOT/scripts/coderabbit-wait.sh")
+  fn_best=$(sed -n '/^fetch_api_array_best_effort() {/,/^}/p' "$ROOT/scripts/coderabbit-wait.sh")
+  if [ -z "$fn_strict" ] || [ -z "$fn_best" ]; then
+    fail "27: could not extract the fetch wrappers from scripts/coderabbit-wait.sh"
+    return
+  fi
+  if [ ! -r "$ROOT/scripts/lib/gh-api-array.sh" ]; then
+    fail "27: scripts/lib/gh-api-array.sh is missing (#1008)"
+    return
+  fi
+
+  # (a) transport failure — gh exits non-zero, writing its one-line
+  #     diagnostic to stderr and its HTTP error BODY to stdout.
+  cat >"$dir/bin/gh" <<'STUB'
+#!/bin/sh
+printf '%s\n' '{"message":"Server Error","status":"500"}'
+printf '%s\n' 'gh: HTTP 500 upstream boom' >&2
+exit 1
+STUB
+  chmod +x "$dir/bin/gh"
+
+  out=$(PATH="$dir/bin:$PATH" bash -c '
+    set -euo pipefail
+    log() { printf "[log] %s\n" "$*" >&2; }
+    . "$1"
+    eval "$2"
+    eval "$3"
+    strict=0; v=$(fetch_api_array "repos/o/r/x" "reviews") || strict=$?
+    best=0;   w=$(fetch_api_array_best_effort "repos/o/r/x" "reviews") || best=$?
+    printf "strict=%s best=%s v=[%s] w=[%s]\n" "$strict" "$best" "$v" "$w"
+  ' _ "$ROOT/scripts/lib/gh-api-array.sh" "$fn_strict" "$fn_best" 2>"$dir/err.log")
+
+  [ "$out" = "strict=3 best=1 v=[] w=[]" ] \
+    || fail "27a: expected strict rc 3 / best-effort rc 1 with empty stdout on both; got: $out"
+  err=$(cat "$dir/err.log")
+  printf '%s' "$err" | grep -q 'ERROR: failed to fetch reviews' \
+    || fail "27a: the strict wrapper did not name the failed fetch; err=$err"
+  printf '%s' "$err" | grep -q 'HTTP 500 upstream boom' \
+    || fail "27a: the gh stderr diagnostic was lost; err=$err"
+  printf '%s' "$err" | grep -q 'best-effort fetch failed for reviews' \
+    || fail "27a: the best-effort wrapper lost its own fetch wording; err=$err"
+
+  # (b) parse failure — gh SUCCEEDS with a body that is not JSON, so the
+  #     fetch is fine and the flatten is what fails.
+  cat >"$dir/bin/gh" <<'STUB'
+#!/bin/sh
+printf '%s\n' 'this is not json'
+STUB
+  chmod +x "$dir/bin/gh"
+
+  out=$(PATH="$dir/bin:$PATH" bash -c '
+    set -euo pipefail
+    log() { printf "[log] %s\n" "$*" >&2; }
+    . "$1"
+    eval "$2"
+    eval "$3"
+    strict=0; v=$(fetch_api_array "repos/o/r/x" "reviews") || strict=$?
+    best=0;   w=$(fetch_api_array_best_effort "repos/o/r/x" "reviews") || best=$?
+    printf "strict=%s best=%s v=[%s] w=[%s]\n" "$strict" "$best" "$v" "$w"
+  ' _ "$ROOT/scripts/lib/gh-api-array.sh" "$fn_strict" "$fn_best" 2>"$dir/err2.log")
+
+  [ "$out" = "strict=3 best=1 v=[] w=[]" ] \
+    || fail "27b: expected strict rc 3 / best-effort rc 1 with empty stdout on both; got: $out"
+  err=$(cat "$dir/err2.log")
+  printf '%s' "$err" | grep -q 'ERROR: failed to flatten reviews pagination output' \
+    || fail "27b: the strict wrapper did not name the failed flatten; err=$err"
+  printf '%s' "$err" | grep -q 'best-effort fetch failed to flatten reviews pagination output' \
+    || fail "27b: the best-effort wrapper collapsed its flatten wording into the fetch one; err=$err"
+
+  # (c) the success escape: a genuinely empty page is a READ, not a failure,
+  #     and both wrappers must hand it back as `[]` with status 0. Without
+  #     this the two cases above would pass on a reader that failed always.
+  cat >"$dir/bin/gh" <<'STUB'
+#!/bin/sh
+printf '%s\n' '[]'
+STUB
+  chmod +x "$dir/bin/gh"
+
+  out=$(PATH="$dir/bin:$PATH" bash -c '
+    set -euo pipefail
+    log() { printf "[log] %s\n" "$*" >&2; }
+    . "$1"
+    eval "$2"
+    eval "$3"
+    strict=0; v=$(fetch_api_array "repos/o/r/x" "reviews") || strict=$?
+    best=0;   w=$(fetch_api_array_best_effort "repos/o/r/x" "reviews") || best=$?
+    printf "strict=%s best=%s v=[%s] w=[%s]\n" "$strict" "$best" "$v" "$w"
+  ' _ "$ROOT/scripts/lib/gh-api-array.sh" "$fn_strict" "$fn_best" 2>/dev/null)
+
+  [ "$out" = "strict=0 best=0 v=[[]] w=[[]]" ] \
+    || fail "27c: an empty page must read as [] with status 0 on both wrappers; got: $out"
+
+  [ "$FAIL" -ne "$before" ] || pass "27: #1008 — both wrappers share one algorithm while keeping their own statuses (3 vs 1), their own wordings, and the empty-page escape"
+}
+
 # --- Test 20: #936 — 'No review completed' is a refusal, end to end ---------
 # Codex P1 on #936. The description predicate matched `*"review complete"*` as
 # a SUBSTRING, so three wordings that state the review did NOT happen cleared
@@ -1094,6 +1213,7 @@ test_failed_reviews_read_does_not_clear
 test_failed_fast_path_comment_read_does_not_clear
 test_failed_fast_path_comment_decode_does_not_clear
 test_failed_poll_comment_decode_does_not_clear
+test_fetch_wrapper_contracts_unit
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"

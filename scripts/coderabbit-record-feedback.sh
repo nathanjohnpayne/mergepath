@@ -160,6 +160,18 @@ else
   exit 3
 fi
 
+# Shared paginated-list reader (#1008) — the fetch → capture → flatten
+# algorithm fetch_api_array below used to carry inline, alongside seven other
+# copies. Hard requirement for the same reason the classifier above is: an
+# undefined reader would surface as `command not found` on the findings read
+# the ledger is built from.
+if [ ! -r "$__CRRF_DIR/lib/gh-api-array.sh" ]; then
+  echo "[coderabbit-record-feedback] ERROR: scripts/lib/gh-api-array.sh is missing (paginated list reader). See #1008." >&2
+  exit 3
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$__CRRF_DIR/lib/gh-api-array.sh"
+
 # --- logging helpers --------------------------------------------------------
 
 log() {
@@ -384,14 +396,12 @@ coderabbit_field() {
 BOT_LOGIN=$(coderabbit_field bot_login)
 BOT_LOGIN=${BOT_LOGIN:-"coderabbitai[bot]"}
 
-# Paginated REST fetch helper — same shape as the severity gates.
+# Paginated REST fetch helper. The algorithm lives in
+# scripts/lib/gh-api-array.sh (#1008); what stays here is this recorder's
+# failure ACTION — `die 3`, so an unreadable findings surface aborts rather
+# than writing an empty disposition ledger for a round that had findings.
 fetch_api_array() {
-  local endpoint=$1
-  local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
-    || die 3 "failed to flatten $label pagination output"
+  gh_api_array "$1" "$2" || die 3 "$GH_API_ARRAY_ERROR"
 }
 
 # --- PR metadata (HEAD sha pins every ledger row) ----------------------------

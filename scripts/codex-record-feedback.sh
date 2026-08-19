@@ -143,6 +143,18 @@ if [ -r "$__CRF_DIR/lib/gh-token-resolver.sh" ]; then
   . "$__CRF_DIR/lib/gh-token-resolver.sh"
 fi
 
+# Shared paginated-list reader (#1008) — the fetch → capture → flatten
+# algorithm fetch_api_array below used to carry inline, alongside seven other
+# copies. Hard-required (unlike the two soft sources above): an undefined
+# reader would surface as `command not found` on the reviews and inline-comment
+# reads every finding in the ledger comes from.
+if [ ! -r "$__CRF_DIR/lib/gh-api-array.sh" ]; then
+  echo "[codex-record-feedback] ERROR: scripts/lib/gh-api-array.sh is missing (paginated list reader). See #1008." >&2
+  exit 3
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$__CRF_DIR/lib/gh-api-array.sh"
+
 # --- logging helpers --------------------------------------------------------
 
 log() {
@@ -347,13 +359,12 @@ NBSP=$'\xc2\xa0'
 
 # --- collect findings -------------------------------------------------------
 
+# Paginated REST fetch helper. The algorithm lives in
+# scripts/lib/gh-api-array.sh (#1008); what stays here is this recorder's
+# failure ACTION — `die 3`, so an unreadable findings surface aborts rather
+# than writing an empty disposition ledger for a round that had findings.
 fetch_api_array() {
-  local endpoint=$1
-  local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
-    || die 3 "failed to flatten $label pagination output"
+  gh_api_array "$1" "$2" || die 3 "$GH_API_ARRAY_ERROR"
 }
 
 # Normalize an arbitrary findings input into the canonical findings array:

@@ -40,6 +40,7 @@ make_case() {
   cp "$SCRIPT" "$dir/scripts/codex-record-feedback.sh"
   chmod +x "$dir/scripts/codex-record-feedback.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
+  cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 codex:
@@ -99,6 +100,7 @@ make_real_wrapper_case() {
   cp "$SCRIPT" "$dir/scripts/codex-record-feedback.sh"
   chmod +x "$dir/scripts/codex-record-feedback.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
+  cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
   cp "$ROOT/scripts/gh-as-reviewer.sh" "$dir/scripts/gh-as-reviewer.sh"
   chmod +x "$dir/scripts/gh-as-reviewer.sh"
   cp "$ROOT/scripts/identity-check.sh" "$dir/scripts/identity-check.sh"
