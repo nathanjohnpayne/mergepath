@@ -8,6 +8,17 @@ WRAPPER="$ROOT/scripts/gh-as-author.sh"
 
 [[ -x "$WRAPPER" ]] || { echo "missing or non-executable $WRAPPER" >&2; exit 1; }
 
+# #996: the gh stub below records whichever token the wrapper selected, and
+# several failure branches print that log. Every case pins its own token
+# inline, but gh-as-author.sh reads the AMBIENT OP_PREFLIGHT_AUTHOR_PAT and
+# GH_TOKEN when a case does not — so on an agent machine with a warm
+# preflight cache a real credential could reach the log, and a failing
+# assertion would print it. Scrub the ambient credential environment once
+# here so "the log holds a fixture token" is true by construction rather
+# than by the stub happening to reject the ambient one. Per-case `VAR=...`
+# prefixes still apply; this only changes the default.
+unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN
+
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gh-as-author-test.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
@@ -21,7 +32,7 @@ mkdir -p "$STUB_DIR"
 cat >"$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 LOG="${GH_CALLS_LOG:-/dev/null}"
-printf 'GH_TOKEN=%s GITHUB_TOKEN=%s gh' "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" >> "$LOG"
+printf 'GH_TOKEN=%s GITHUB_TOKEN=%s gh' "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" >> "$LOG"  # TOKEN_OUTPUT_EXEMPT: records the token the wrapper selected, which every case pins inline and asserts on exactly; the ambient credential env is scrubbed above (#996)
 for a in "$@"; do
   printf '\t%s' "$a" >> "$LOG"
 done

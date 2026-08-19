@@ -1,0 +1,687 @@
+#!/usr/bin/env bash
+# check_no_token_in_output
+#
+# Standing guard for #996 — the enforcement half of #951 / #993.
+#
+# #951 found a live PAT printed in cleartext by a checker's own failure
+# message. #993 fixed the three sites it could find by grepping `scripts/`
+# for five variable names and executing every checker that matched under a
+# sentinel environment. That is a point-in-time measurement: nothing
+# mechanically stops the next checker from reintroducing the shape. This
+# check is the mechanism.
+#
+# THE RULE
+#
+#   Under scripts/** and tests/**, a shell source line may not interpolate
+#   the VALUE of a known credential variable into an output command.
+#
+# ── What "known credential variable" means (design question 1) ───────────
+#
+# A CLOSED, EXPLICIT NAME LIST (TOKEN_NAMES below) — not a heuristic over
+# names matching TOKEN / PAT / SECRET / KEY.
+#
+# The list loses recall: a credential reached under some other name is
+# invisible to it. That is the deliberate trade. This check runs inside
+# repo_lint, which publishes the REQUIRED `lint` context, and repo_lint is
+# propagated to every consumer repo — so one false positive reds a required
+# check across the fleet with no break-glass. A gate that is right about a
+# smaller set beats one that is broadly right and occasionally wrong.
+#
+# The heuristic is also wrong on this tree, not just in principle. A
+# `*TOKEN*` name match fires on `SUMMARY_ACK_TOKEN` / `ACK_TOKEN` (the
+# mergepath-summary-ack marker), `MERGEPATH_EXPECT_READ_GH_TOKEN` and
+# `STEP_NO_TOKEN` (flags), and `BOOTSTRAP_SKIP_AUTHOR_TOKEN` (a switch) —
+# none of which hold credential material. Every one would need an
+# allow-list entry, and the allow-list is then the thing reviewers have to
+# get right, one repo at a time.
+#
+# Extending the list is a one-line edit here, in mergepath, which
+# propagates to every consumer with the rest of the scripts/ci kit.
+#
+# ── How legitimate emitters are exempted (design question 2) ─────────────
+#
+# An INLINE PRAGMA, visible at the site, never a path allow-list:
+#
+#   printf 'export OP_PREFLIGHT_REVIEWER_PAT=%q\n' "$OP_PREFLIGHT_REVIEWER_PAT"  # TOKEN_OUTPUT_EXEMPT: <reason>
+#
+# The reason is mandatory — a bare `TOKEN_OUTPUT_EXEMPT:` with nothing
+# after it still fails, the same hardening `NO_BARE_GH_WRITE_EXEMPT` got in
+# #466. `scripts/op-preflight.sh` is the canonical legitimate emitter:
+# writing those values to its cache IS its contract.
+#
+# Two forms are legal without any pragma because they emit a description
+# rather than the value — they are the #993 remediation, and the check is
+# built so that adopting it never trips the gate:
+#
+#   ${VAR}   flagged        ${#VAR}     length only, legal
+#   ${VAR:-} flagged        ${VAR:+set} constant alternate, legal
+#
+# So is passing a token through a REDACTOR: a function is treated as an
+# output command only when its body writes one of its own positional
+# parameters VERBATIM through echo/printf (`fail() { echo "FAIL: $*"; }`).
+# A redactor derives a length or a class and prints that, so by
+# construction it is not such a function and `$(describe_secret "$PAT")`
+# stays legal.
+#
+# ── What this check does NOT catch (design question 3) ───────────────────
+#
+# INDIRECTION IS NOT COVERED. This is a single-hop source-text scanner over
+# one line at a time. It has no dataflow, no cross-file analysis, and no
+# knowledge of what a variable holds at runtime. It does not catch:
+#
+#   * A token copied into a differently-named variable and then printed
+#     (`pat=$OP_PREFLIGHT_AUTHOR_PAT; echo "$pat"`), or reached through a
+#     function return, a file read, or `$(op read ...)`.
+#   * A token written to a log or temp file that some later line prints
+#     (`cat "$LOG"`) — the exact shape of the check_resolve_pr_threads and
+#     check_phase_4b_classifier leaks that #993 fixed. It DOES catch the
+#     line that puts the value into the log, when that line names the
+#     variable; it cannot connect that line to the `cat` that prints it.
+#   * `set -x` traces, `env` dumps, core dumps, or anything the shell emits
+#     on its own.
+#   * Any file this check does not scan: non-shell files, and everything
+#     outside scripts/** and tests/**.
+#
+# Stated plainly because #993's lesson was that an unstated limit reads as
+# a guarantee: NONE of the three leaks #993 fixed would have been caught by
+# this gate at their original sites, because all three reached the token
+# under another name or through a file. What this gate guarantees is
+# narrower and permanent — the direct form cannot come back silently.
+#
+# ── What counts as "output" ──────────────────────────────────────────────
+#
+#   * `echo` / `printf` at a command position.
+#   * An in-file message helper: a function whose body writes one of its
+#     own positional parameters verbatim through echo/printf.
+#   * The body of an INTERPOLATING here-doc (unquoted delimiter) opened by
+#     `cat` or an emitter — the shell expands those lines at write time.
+#
+# A value captured by a command substitution is NOT output: in
+# `_v=$(printf '%s' "$GH_TOKEN")` the value goes into a variable, not onto
+# a stream. A reference counts only when the segment at EVERY enclosing
+# level is an output command, so `echo "$(printf '%s' "$GH_TOKEN")"` is
+# flagged while `echo "$(GH_TOKEN="$PAT" gh api user)"` — the documented
+# read-path idiom, where gh's output is echoed and the token is not — is
+# not.
+#
+# Whole-line comments are skipped: they do not execute, and documentation
+# and remediation prose is full of deliberate examples.
+#
+# Usage:
+#   check_no_token_in_output              # self-test, then scan this repo
+#   check_no_token_in_output --self-test  # fixture suite only
+#   check_no_token_in_output --scan [DIR] # scan only (default: this repo)
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# ── The closed credential-variable list ──────────────────────────────────
+# Every name here holds live credential material at runtime somewhere in
+# this fleet. Names that merely *mention* a credential (an Actions secret
+# name in a string, a "which token should I use" flag) are deliberately
+# absent — see the header.
+TOKEN_NAMES="
+GH_TOKEN
+GITHUB_TOKEN
+GH_ENTERPRISE_TOKEN
+GITHUB_ENTERPRISE_TOKEN
+GH_RESOLVED_TOKEN
+OP_PREFLIGHT_AUTHOR_PAT
+OP_PREFLIGHT_REVIEWER_PAT
+OP_SERVICE_ACCOUNT_TOKEN
+AUTHOR_MERGE_TOKEN
+REVIEWER_ASSIGNMENT_TOKEN
+BRANCH_PROTECTION_AUDIT_TOKEN
+LABEL_REMOVAL_TOKEN
+CF_API_TOKEN
+CLOUDFLARE_API_TOKEN
+FIREBASE_TOKEN
+ANTHROPIC_AUTH_TOKEN
+CLAUDE_CODE_OAUTH_TOKEN
+"
+
+# Base output commands. In-file message helpers are discovered per file.
+EMITTER_COMMANDS="echo printf"
+
+# ─────────────────────────────────────────────────────────────────────────
+# The scanner.
+#
+# Pure awk so this runs before any tool install, on bash 3.2, with no
+# single-quote characters in the program (SQ is built with sprintf) so the
+# whole thing can live inside a single-quoted shell string.
+# ─────────────────────────────────────────────────────────────────────────
+read -r -d '' SCANNER <<'AWK_PROGRAM' || true
+BEGIN {
+  n = split(TOKENS, t, " ")
+  for (i = 1; i <= n; i++) if (t[i] != "") TOK[t[i]] = 1
+  n = split(EMITTERS, e, " ")
+  for (i = 1; i <= n; i++) if (e[i] != "") EMITBASE[e[i]] = 1
+  # Words that keep the NEXT word in command position.
+  n = split("env command builtin exec sudo time nohup stdbuf", p, " ")
+  for (i = 1; i <= n; i++) PASSTHRU[p[i]] = 1
+  SQ = sprintf("%c", 39)
+  found = 0
+}
+
+FNR == 1 {
+  if (NR > 1) process()
+  split("", LINES); NLINES = 0; split("", EMITFN)
+  CURFILE = FILENAME
+}
+{ LINES[++NLINES] = $0 }
+END { if (NR > 0) process(); exit found ? 1 : 0 }
+
+function process(   i) {
+  discover_helpers()
+  scan_lines()
+}
+
+# ── Pass 1: in-file message helpers ──────────────────────────────────────
+# A function is an output command when its body writes one of its own
+# positional parameters VERBATIM through echo/printf. A redactor prints a
+# derived value (a length, a class) and so is deliberately NOT matched.
+function discover_helpers(   i, fn, name, trimmed) {
+  fn = ""
+  for (i = 1; i <= NLINES; i++) {
+    if (LINES[i] ~ /^[[:space:]]*(function[[:space:]]+)?[A-Za-z_][A-Za-z0-9_:.-]*[[:space:]]*\(\)/) {
+      name = LINES[i]
+      sub(/^[[:space:]]*(function[[:space:]]+)?/, "", name)
+      sub(/[[:space:]]*\(\).*$/, "", name)
+      if (writes_own_args(LINES[i])) EMITFN[name] = 1
+      # A one-line definition (`fail() { echo "FAIL: $*" >&2; }` — the
+      # dominant shape in this tree) closes on its own line, so the body
+      # scope must end here and not swallow following top-level code.
+      trimmed = LINES[i]
+      sub(/[[:space:]]+$/, "", trimmed)
+      fn = (trimmed ~ /\}$/) ? "" : name
+      continue
+    }
+    if (LINES[i] ~ /^[[:space:]]*\}/) { fn = ""; continue }
+    if (fn == "") continue
+    if (writes_own_args(LINES[i])) EMITFN[fn] = 1
+  }
+}
+
+# Does this line write one of the enclosing function own positional
+# parameters VERBATIM through echo/printf? A redactor prints a DERIVED
+# value (${#1}, a fixed classification) and so does not match — which is
+# what keeps `$(describe_secret "$PAT")` legal.
+#
+# The positional reference must sit in the emitter own ARGUMENTS, not
+# merely somewhere on the same line: `key_state() { [ -n "$1" ] && printf
+# SET || printf unset; }` tests $1 and prints a constant, and reading the
+# whole line would misclassify that redactor as an emitter.
+function writes_own_args(line,   s, seg) {
+  s = line
+  while (match(s, /(^|[;&|({]|&&|\|\|)[[:space:]]*(echo|printf)[[:space:]]/)) {
+    s = substr(s, RSTART + RLENGTH)
+    seg = s
+    sub(/[;|&].*$/, "", seg)
+    if (seg ~ /\$[{]?[@*1-9]/) return 1
+  }
+  return 0
+}
+
+function is_emitter(w) { return (w in EMITBASE) || (w in EMITFN) }
+
+# ── Pass 2: the scan ─────────────────────────────────────────────────────
+function scan_lines(   i, line, hit, trimmed) {
+  hd_term = ""; hd_scan = 0
+  for (i = 1; i <= NLINES; i++) {
+    line = LINES[i]
+
+    if (hd_term != "") {
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed); sub(/[[:space:]]+$/, "", trimmed)
+      if (trimmed == hd_term) { hd_term = ""; hd_scan = 0; continue }
+      if (!exempt(line) && hd_scan && heredoc_ref(line) != "")
+        report(i, heredoc_ref(line), line, "here-doc body")
+      # A here-doc body is also shell SOURCE when it is written out as a
+      # script (the check_resolve_pr_threads stub shape, #993), so it gets
+      # the ordinary line scan too, quoted delimiter or not.
+      else if (!exempt(line) && !comment(line) && (hit = walk(line)) != "")
+        report(i, hit, line, "output command")
+      note_heredoc(line)
+      continue
+    }
+
+    if (!comment(line) && !exempt(line) && (hit = walk(line)) != "")
+      report(i, hit, line, "output command")
+    note_heredoc(line)
+  }
+}
+
+function comment(line) { return line ~ /^[[:space:]]*#/ }
+function exempt(line)  { return line ~ /TOKEN_OUTPUT_EXEMPT:[[:space:]]*[^[:space:]]/ }
+
+function report(lno, name, line, kind) {
+  printf "%s:%d: %s interpolated into %s\n", CURFILE, lno, name, kind
+  printf "      %s\n", line
+  found = 1
+}
+
+# ── Here-doc bookkeeping ─────────────────────────────────────────────────
+# Track EVERY here-doc so the body is not mistaken for ordinary source when
+# deciding where the next one starts; scan the body as output only when the
+# delimiter is UNQUOTED (the shell expands it) and the opener is cat or an
+# emitter (the expansion goes to a stream or a file).
+function note_heredoc(line,   rest, dash, ch, term, quoted, w) {
+  if (hd_term != "") return
+  if (line !~ /<<-?[[:space:]]*[\\"A-Za-z_]/) return
+  if (line ~ /<<</) return
+  rest = line
+  sub(/^.*<<-?/, "", rest)
+  dash = (line ~ /<<-/)
+  sub(/^[[:space:]]+/, "", rest)
+  ch = substr(rest, 1, 1)
+  quoted = 0
+  if (ch == SQ || ch == "\"" || ch == "\\") { quoted = 1; sub(/^[\\"]|^./, "", rest) }
+  term = rest
+  sub(/[^A-Za-z0-9_].*$/, "", term)
+  if (term == "") return
+  hd_term = term
+  w = first_command_word(line)
+  hd_scan = (!quoted && (w == "cat" || is_emitter(w))) ? 1 : 0
+}
+
+# First command word of a line: leading assignments and pass-through
+# wrappers are stepped over. Returns "" when the line does not start with a
+# plain command (e.g. `x=$(cat <<EOF` — a CAPTURED here-doc, not output).
+function first_command_word(line,   s, w) {
+  s = line
+  sub(/^[[:space:]]+/, "", s)
+  while (s != "") {
+    w = s
+    sub(/[[:space:]].*$/, "", w)
+    if (w == "") return ""
+    if (w ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || (w in PASSTHRU)) {
+      sub(/^[^[:space:]]+[[:space:]]*/, "", s)
+      continue
+    }
+    if (w !~ /^[A-Za-z_][A-Za-z0-9_.\/-]*$/) return ""
+    return w
+  }
+  return ""
+}
+
+# An unprotected reference inside a here-doc body. Quotes are not special
+# there; only a backslash escape protects a dollar sign.
+function heredoc_ref(line,   i, c, n2, esc, j) {
+  n2 = length(line); esc = 0
+  for (i = 1; i <= n2; i++) {
+    c = substr(line, i, 1)
+    if (esc) { esc = 0; continue }
+    if (c == "\\") { esc = 1; continue }
+    if (c != "$") continue
+    j = expansion(line, i)
+    if (EXP_UNSAFE) return EXP_NAME
+    i = j
+  }
+  return ""
+}
+
+# ── The line walk ────────────────────────────────────────────────────────
+# Tracks quote state, command-substitution depth, and whether the current
+# segment at each depth is an output command.
+function walk(line,   i, c, n2, depth, esc, w, hit, nxt, j) {
+  n2 = length(line); depth = 0; esc = 0; w = ""; hit = ""
+  q[0] = ""; emit[0] = 0; cmdpos[0] = 1; bt[0] = 0
+  for (i = 1; i <= n2; i++) {
+    c = substr(line, i, 1)
+
+    if (q[depth] == SQ) { if (c == SQ) q[depth] = ""; continue }
+    if (esc) { esc = 0; continue }
+    if (c == "\\") { esc = 1; continue }
+
+    if (q[depth] == "\"") {
+      if (c == "\"") { q[depth] = ""; continue }
+      if (c == "$") {
+        nxt = substr(line, i + 1, 1)
+        if (nxt == "(") { push(++depth, 0); i++; continue }
+        j = expansion(line, i)
+        if (EXP_UNSAFE && emitted(depth)) hit = EXP_NAME
+        i = j; continue
+      }
+      if (c == "`") { push(++depth, 1); continue }
+      continue
+    }
+
+    if (c == SQ)   { flush_word(w, depth); w = ""; q[depth] = SQ; continue }
+    if (c == "\"") { flush_word(w, depth); w = ""; q[depth] = "\""; continue }
+    if (c == "$") {
+      nxt = substr(line, i + 1, 1)
+      if (nxt == "(") { flush_word(w, depth); w = ""; push(++depth, 0); i++; continue }
+      j = expansion(line, i)
+      if (EXP_UNSAFE && emitted(depth)) hit = EXP_NAME
+      w = w "X"
+      i = j; continue
+    }
+    if (c == "`") {
+      flush_word(w, depth); w = ""
+      if (bt[depth] && depth > 0) { depth--; continue }
+      push(++depth, 1); continue
+    }
+    if (c == ")") { flush_word(w, depth); w = ""; if (depth > 0) depth--; continue }
+    if (c == ";" || c == "|" || c == "&") { flush_word(w, depth); w = ""; cmdpos[depth] = 1; emit[depth] = 0; continue }
+    if (c == "(" || c == "{") { flush_word(w, depth); w = ""; cmdpos[depth] = 1; emit[depth] = 0; continue }
+    if (c == "}") { flush_word(w, depth); w = ""; continue }
+    if (c == "#" && w == "") break
+    if (c == " " || c == "\t") { flush_word(w, depth); w = ""; continue }
+    if (c == "<" || c == ">") { flush_word(w, depth); w = ""; continue }
+    w = w c
+  }
+  return hit
+}
+
+function push(d, backtick) { q[d] = ""; emit[d] = 0; cmdpos[d] = 1; bt[d] = backtick }
+
+# A reference at depth d reaches an uncaptured stream only when the segment
+# at every enclosing level is an output command. `_v=$(printf "$T")` stores
+# the value; `echo "$(printf "$T")"` re-emits it.
+function emitted(d,   k) {
+  for (k = 0; k <= d; k++) if (!emit[k]) return 0
+  return 1
+}
+
+function flush_word(w, depth) {
+  if (w == "") return
+  if (!cmdpos[depth]) return
+  if (w ~ /^[A-Za-z_][A-Za-z0-9_]*=/) return   # assignment prefix
+  if (w in PASSTHRU) return
+  if (is_emitter(w)) emit[depth] = 1
+  cmdpos[depth] = 0
+}
+
+# Classify the expansion whose dollar sign is at position i. Sets
+# EXP_UNSAFE / EXP_NAME; returns the index of the expansion last character.
+function expansion(line, i,   nxt, j, braces, inner, name, rest, c, after) {
+  EXP_UNSAFE = 0; EXP_NAME = ""
+  nxt = substr(line, i + 1, 1)
+  if (nxt == "{") {
+    braces = 1; inner = ""
+    for (j = i + 2; j <= length(line); j++) {
+      c = substr(line, j, 1)
+      if (c == "{") braces++
+      else if (c == "}") { braces--; if (braces == 0) break }
+      inner = inner c
+    }
+    if (braces != 0) return i                  # unterminated; leave it alone
+    if (substr(inner, 1, 1) == "#") return j   # ${#VAR} — length only
+    name = inner
+    sub(/[^A-Za-z0-9_].*$/, "", name)
+    if (!(name in TOK)) return j
+    rest = substr(inner, length(name) + 1)
+    # ${VAR:+word} / ${VAR+word} expand to a CONSTANT alternate — presence,
+    # not value. An alternate carrying its own expansion is not constant.
+    if (rest ~ /^:?\+/ && rest !~ /\$/) return j
+    EXP_UNSAFE = 1; EXP_NAME = name
+    return j
+  }
+  if (nxt ~ /[A-Za-z_]/) {
+    name = substr(line, i + 1)
+    sub(/[^A-Za-z0-9_].*$/, "", name)
+    if (name in TOK) {
+      after = substr(line, i + 1 + length(name), 1)
+      if (after !~ /[A-Za-z0-9_]/) { EXP_UNSAFE = 1; EXP_NAME = name }
+    }
+    return i + length(name)
+  }
+  return i
+}
+AWK_PROGRAM
+
+# ─────────────────────────────────────────────────────────────────────────
+# File selection and scan driver.
+# ─────────────────────────────────────────────────────────────────────────
+collect_shell_files() {
+  local root="$1" dir first interp
+  for dir in scripts tests; do
+    [ -d "$root/$dir" ] || continue
+    while IFS= read -r -d '' file; do
+      case "$file" in
+        */node_modules/*|*/.git/*) continue ;;
+        *.sh|*.bash) printf '%s\0' "$file"; continue ;;
+        *.md|*.json|*.yml|*.yaml|*.js|*.cjs|*.mjs|*.ts|*.py|*.txt) continue ;;
+      esac
+      # Extensionless files (every scripts/ci/check_* is one) are selected
+      # by parsing the shebang's interpreter rather than glob-matching the
+      # whole line: `#!/usr/bin/env bash -e` and `#!/bin/sh` both resolve to
+      # a name, and a `#!/usr/bin/env node` cannot slip in on a substring.
+      first=""
+      IFS= read -r first < "$file" 2>/dev/null || true
+      case "$first" in
+        '#!'*) : ;;
+        *) continue ;;
+      esac
+      interp="${first#\#!}"
+      interp="${interp#"${interp%%[! ]*}"}"      # drop leading spaces
+      case "$interp" in
+        */env\ *|env\ *) interp="${interp#*env }" ;;
+      esac
+      interp="${interp%% *}"
+      case "$interp" in
+        bash|*/bash|sh|*/sh|dash|*/dash|ksh|*/ksh|zsh|*/zsh) printf '%s\0' "$file" ;;
+      esac
+    done < <(find "$root/$dir" -type f -print0 2>/dev/null | LC_ALL=C sort -z)
+  done
+}
+
+# Scan one repo root. Echoes findings; returns 1 when any were found.
+scan_root() {
+  local root="$1"
+  local files=()
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done < <(collect_shell_files "$root")
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    echo "  (no shell files under scripts/ or tests/)"
+    return 0
+  fi
+
+  # No pipeline: awk's own exit status is the finding signal (0 clean,
+  # 1 findings, anything else a scanner error), and a pipe would put it
+  # behind PIPESTATUS, which any intervening assignment clobbers.
+  #
+  # TOKEN_NAMES is flattened to one line first: a literal newline inside an
+  # awk `-v` assignment is a fatal "newline in string" on BSD awk.
+  local out rc=0 tokens
+  tokens="$(printf '%s' "$TOKEN_NAMES" | tr '\n' ' ')"
+  out="$(mktemp "${TMPDIR:-/tmp}/token-output-scan.XXXXXX")"
+  awk -v TOKENS="$tokens" -v EMITTERS="$EMITTER_COMMANDS" \
+      "$SCANNER" "${files[@]}" >"$out" || rc=$?
+  sed "s|^$root/||" "$out"
+  rm -f "$out"
+  return "$rc"
+}
+
+# How many files scan_root would read. Reported on the PASS line so a
+# silently-empty scan (the classic vacuous-gate failure) is visible.
+count_shell_files() {
+  collect_shell_files "$1" | tr '\0' '\n' | grep -c . || true
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# Self-test: both directions, over fixtures written to a temp tree.
+#
+# The fixtures are generated at run time rather than committed, so no file
+# on disk carries a leaking pattern that the tree scan would then have to
+# be taught to ignore — a path exclusion is exactly what design question 2
+# rules out.
+#
+# Every token-shaped literal below is an obviously fake sentinel.
+# ─────────────────────────────────────────────────────────────────────────
+ST_PASS=0
+ST_FAIL=0
+
+# Write $2 as scripts/fixture.sh under a fresh temp root and scan it.
+# Echoes the scan exit code.
+run_fixture() {
+  local content="$1" tmp rc=0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/token-output-fixture.XXXXXX")"
+  mkdir -p "$tmp/scripts"
+  printf '%s\n' "$content" > "$tmp/scripts/fixture.sh"
+  scan_root "$tmp" >/dev/null 2>&1 || rc=$?
+  rm -rf "$tmp"
+  printf '%s' "$rc"
+}
+
+assert_flagged() {
+  local label="$1" content="$2" rc
+  rc="$(run_fixture "$content")"
+  if [ "$rc" -eq 1 ]; then
+    ST_PASS=$((ST_PASS + 1)); echo "  PASS: flagged — $label"
+  else
+    ST_FAIL=$((ST_FAIL + 1)); echo "  FAIL: expected a finding (rc 1), got rc=$rc — $label" >&2
+  fi
+}
+
+assert_clean() {
+  local label="$1" content="$2" rc
+  rc="$(run_fixture "$content")"
+  if [ "$rc" -eq 0 ]; then
+    ST_PASS=$((ST_PASS + 1)); echo "  PASS: clean — $label"
+  else
+    ST_FAIL=$((ST_FAIL + 1)); echo "  FAIL: expected no finding (rc 0), got rc=$rc — $label" >&2
+  fi
+}
+
+self_test() {
+  echo "check_no_token_in_output: self-test"
+
+  # This file is itself under scripts/, so the tree scan reads these
+  # fixtures as source. A SINGLE-LINE fixture is safe as written: the
+  # surrounding single quotes protect its dollar signs on that same line.
+  # A MULTI-LINE fixture is not — the scanner works one line at a time, so
+  # its inner lines are read bare — hence the multi-line fixtures below are
+  # double-quoted with `\$`, which reaches the fixture file as a live `$`
+  # while leaving this file with no leaking line of its own.
+
+  # ── Direction 1: a violating fixture must FAIL ─────────────────────────
+  assert_flagged "bare echo of a token" \
+    'echo "$GH_TOKEN"'
+  assert_flagged "printf of a braced token" \
+    'printf %s "${OP_PREFLIGHT_REVIEWER_PAT}"'
+  assert_flagged "the may-be-unset read still carries the value" \
+    'printf "pat=%s" "${OP_PREFLIGHT_AUTHOR_PAT:-}"'
+  assert_flagged "token in a failure message helper" \
+    "fail() { echo \"FAIL: \$*\" >&2; }
+fail \"merge token was \$AUTHOR_MERGE_TOKEN\""
+  assert_flagged "emitter nested in a command substitution" \
+    'echo "$(printf %s "$GH_TOKEN")"'
+  assert_flagged "interpolating here-doc body" \
+    "cat <<EOF
+authorization: \$GH_TOKEN
+EOF"
+  assert_flagged "echo inside a quoted here-doc is still stub SOURCE" \
+    "cat > \"\$dir/gh\" <<GH_STUB
+echo \"ENV_GH_TOKEN_VALUE=\${GH_TOKEN:-}\" >> \"\$LOG\"
+GH_STUB"
+  assert_flagged "an exemption pragma with no reason does not exempt" \
+    'echo "$GH_TOKEN"  # TOKEN_OUTPUT_EXEMPT:'
+
+  # ── Direction 2: a legitimate fixture must PASS ────────────────────────
+  assert_clean "the documented read-path idiom passes the token to gh" \
+    'GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login'
+  assert_clean "gh output echoed, token only passed in" \
+    'echo "$(GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login)"'
+  assert_clean "the #993 redacted form: length only" \
+    'echo "reviewer PAT len=${#OP_PREFLIGHT_REVIEWER_PAT}"'
+  assert_clean "presence via a constant alternate" \
+    'echo "reviewer PAT ${OP_PREFLIGHT_REVIEWER_PAT:+set}"'
+  assert_clean "a redactor derives, so it is not an output command" \
+    "describe_secret() { printf \"len=%d\" \"\${#1}\"; }
+echo \"saw \$(describe_secret \"\$OP_PREFLIGHT_AUTHOR_PAT\")\""
+  assert_clean "a set/unset redactor tests a positional but emits a constant" \
+    "key_state() { [ -n \"\$1\" ] && printf SET || printf unset; }
+echo \"- token: \$(key_state \"\${ANTHROPIC_AUTH_TOKEN:-}\")\""
+  assert_clean "captured into a variable, not emitted" \
+    '_v=$(printf %s "$GH_TOKEN")'
+  assert_clean "backslash-escaped literal in remediation text" \
+    'echo "run: GH_TOKEN=\$OP_PREFLIGHT_REVIEWER_PAT gh api user"'
+  assert_clean "single-quoted literal in remediation text" \
+    'echo '"'"'export GH_TOKEN=$OP_PREFLIGHT_REVIEWER_PAT'"'"''
+  assert_clean "whole-line comment" \
+    '# echo "$GH_TOKEN"  <- never do this'
+  assert_clean "exemption pragma carrying a reason" \
+    'printf "export OP_PREFLIGHT_REVIEWER_PAT=%q\n" "$OP_PREFLIGHT_REVIEWER_PAT"  # TOKEN_OUTPUT_EXEMPT: cache contract'
+  assert_clean "captured here-doc is not output" \
+    "_v=\$(cat <<EOF
+\$GH_TOKEN
+EOF
+)"
+  assert_clean "quoted here-doc body that is not shell output" \
+    "cat <<\"EOF\"
+Set GH_TOKEN=\$OP_PREFLIGHT_REVIEWER_PAT before running.
+EOF"
+  # The closed-list decision, pinned in both directions: these names would
+  # all match a TOKEN/PAT/SECRET heuristic and none holds a credential.
+  assert_clean "ack-marker and flag names are not credential names" \
+    'echo "$SUMMARY_ACK_TOKEN $ACK_TOKEN $MERGEPATH_EXPECT_READ_GH_TOKEN $REQUIRED_HEAD_CHECK_NAME $CACHE_KEY"'
+
+  if [ "$ST_FAIL" -ne 0 ]; then
+    echo "check_no_token_in_output: FAIL (self-test: $ST_PASS passed, $ST_FAIL failed)" >&2
+    return 1
+  fi
+  echo "  self-test: $ST_PASS passed, 0 failed"
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+main() {
+  local mode="all" root="$REPO_ROOT"
+
+  case "${1:-}" in
+    "")           : ;;
+    --self-test)  mode="self-test"; shift ;;
+    --scan)       mode="scan"; shift; if [ "$#" -gt 0 ]; then root="$1"; shift; fi ;;
+    -h|--help)    sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)            echo "check_no_token_in_output: unknown argument: $1" >&2
+                  echo "usage: check_no_token_in_output [--self-test | --scan [DIR]]" >&2
+                  exit 2 ;;
+  esac
+  if [ "$#" -gt 0 ]; then
+    echo "check_no_token_in_output: unexpected extra argument: $1" >&2
+    echo "usage: check_no_token_in_output [--self-test | --scan [DIR]]" >&2
+    exit 2
+  fi
+
+  if [ "$mode" = "self-test" ] || [ "$mode" = "all" ]; then
+    self_test || exit 1
+  fi
+
+  if [ "$mode" = "scan" ] || [ "$mode" = "all" ]; then
+    if [ ! -d "$root" ]; then
+      echo "check_no_token_in_output: not a directory: $root" >&2
+      exit 2
+    fi
+    local rc=0
+    local out
+    out="$(scan_root "$root")" || rc=$?
+    # Fail closed on a scanner error (awk fatal, unreadable file): a gate
+    # that cannot read the tree has not cleared it.
+    if [ "$rc" -gt 1 ]; then
+      echo "check_no_token_in_output: ERROR (scanner exited $rc; no verdict)" >&2
+      printf '%s\n' "$out" >&2
+      exit "$rc"
+    fi
+    if [ "$rc" -ne 0 ]; then
+      echo "check_no_token_in_output: FAIL" >&2
+      echo "A credential variable value reaches an output stream. Emit a" >&2
+      echo "description instead of the value (\${#VAR} for length," >&2
+      echo "\${VAR:+set} for presence), or, if the site is a legitimate" >&2
+      echo "emitter, mark it in place:" >&2
+      echo "  <the line>  # TOKEN_OUTPUT_EXEMPT: <why this value may be emitted>" >&2
+      echo "" >&2
+      printf '%s\n' "$out" >&2
+      exit 1
+    fi
+    printf '%s\n' "$out"
+    echo "  scanned $(count_shell_files "$root") shell files under scripts/ and tests/"
+  fi
+
+  echo "check_no_token_in_output: PASS"
+}
+
+main "$@"
