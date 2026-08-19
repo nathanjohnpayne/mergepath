@@ -2197,7 +2197,7 @@ _🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
        submitted_at: "2026-06-04T00:01:00Z", body: $b}
     ]'
   }
-  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40" 5501) || rc=$?
   [ "$rc" = "0" ] || bad="$bad clean-run-not-0(rc=$rc)"
   [ "$out" = "5501" ] || bad="$bad clean-run-id($out)"
 
@@ -2212,7 +2212,7 @@ _🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
        submitted_at: "2026-06-04T00:01:00Z", body: $b}
     ]'
   }
-  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  rc=0; crw_head_pinned_clean_review_run "$h40" 5502 >/dev/null || rc=$?
   [ "$rc" = "1" ] || bad="$bad bodyless-ack-not-1(rc=$rc)"
 
   # A run pinned to ANOTHER commit says nothing about this head.
@@ -2222,7 +2222,10 @@ _🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
        submitted_at: "2026-06-04T00:01:00Z", body: $b}
     ]'
   }
-  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  # The graded selection is head-pinned too, so a run on ANOTHER commit leaves
+  # the counter with nothing to grade: the empty-id refusal, reached before the
+  # fetch.
+  rc=0; crw_head_pinned_clean_review_run "$h40" "" >/dev/null || rc=$?
   [ "$rc" = "1" ] || bad="$bad other-commit-not-1(rc=$rc)"
 
   # A head-pinned object whose BODY is a rate-limit notice is not a completed
@@ -2233,7 +2236,7 @@ _🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
        submitted_at: "2026-06-04T00:01:00Z", body: $b}
     ]'
   }
-  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  rc=0; crw_head_pinned_clean_review_run "$h40" 5504 >/dev/null || rc=$?
   [ "$rc" = "1" ] || bad="$bad notice-body-not-1(rc=$rc)"
 
   # A head-pinned run whose body carries a BLOCKING marker is dispositioned by
@@ -2245,7 +2248,7 @@ _🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
        submitted_at: "2026-06-04T00:01:00Z", body: $b}
     ]'
   }
-  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  rc=0; crw_head_pinned_clean_review_run "$h40" 5505 >/dev/null || rc=$?
   [ "$rc" = "1" ] || bad="$bad blocking-marker-body-not-1(rc=$rc)"
 
   # A run body carrying a NON-benign auto-generated stanza — `failure` (#790,
@@ -2262,7 +2265,7 @@ Review failed.
        submitted_at: "2026-06-04T00:01:00Z", body: $b}
     ]'
   }
-  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  rc=0; crw_head_pinned_clean_review_run "$h40" 5508 >/dev/null || rc=$?
   [ "$rc" = "1" ] || bad="$bad failure-stanza-not-1(rc=$rc)"
 
   # The other half of the implication, and it is load-bearing: a run body with
@@ -2285,7 +2288,7 @@ Review failed.
        submitted_at: "2026-06-04T00:01:00Z", body: $b}
     ]'
   }
-  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40" 5509) || rc=$?
   [ "$rc" = "0" ] || bad="$bad benign-stanza-not-0(rc=$rc)"
   [ "$out" = "5509" ] || bad="$bad benign-stanza-id($out)"
 
@@ -2299,13 +2302,13 @@ Review failed.
        submitted_at: "2026-06-04T00:02:00Z", body: $new}
     ]'
   }
-  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40" 5507) || rc=$?
   [ "$rc" = "0" ] || bad="$bad newest-run-not-0(rc=$rc)"
   [ "$out" = "5507" ] || bad="$bad newest-run-id($out)"
 
   # An empty list is a definite "no run on this head", not an unread one.
   fetch_api_array() { printf '[]\n'; }
-  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  rc=0; crw_head_pinned_clean_review_run "$h40" 5501 >/dev/null || rc=$?
   [ "$rc" = "1" ] || bad="$bad empty-list-not-1(rc=$rc)"
 
   # An UNREADABLE reviews list is rc 3, never rc 0. Folding it into 0 would let
@@ -2313,7 +2316,7 @@ Review failed.
   # #936/#959 closed at the neighbouring reads, pointed at the one predicate
   # whose job is to stop a clearance.
   fetch_api_array() { return 3; }
-  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  rc=0; crw_head_pinned_clean_review_run "$h40" 5501 >/dev/null || rc=$?
   [ "$rc" = "3" ] || bad="$bad unread-not-3(rc=$rc)"
 
   # Restore the extracted definitions this case stubbed over.
@@ -2350,6 +2353,7 @@ Review failed.
 test_1031_rung_binds_to_the_graded_run() {
   local snip="$WORKDIR/rung-graded-binding.sh" bad="" rc out
   local h40 run_body ack_body reviews_both reviews_run_only reviews_ack_first
+  local reviews_newer_run
   eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END|SUMMARY_MARKER|RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER)=' \
     "$ROOT/scripts/coderabbit-wait.sh")"
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
@@ -2377,6 +2381,13 @@ test_1031_rung_binds_to_the_graded_run() {
   PR_NUMBER=999
   BOT_LOGIN='coderabbitai[bot]'
   log() { :; }
+
+  # The caller's own selection step, run over an explicit array so each case
+  # states which SNAPSHOT the counter graded. That is the whole point of the
+  # round-2 case below, where that snapshot is older than the rung's.
+  graded_of() {
+    crw_select_head_pinned_graded_review "$1" "$BOT_LOGIN" "$h40" | jq -r '.id // empty'
+  }
 
   # A real findings run announces its count in the body and carries the finding
   # itself INLINE, so nothing in this body is blocking on its own — which is
@@ -2409,7 +2420,7 @@ test_1031_rung_binds_to_the_graded_run() {
   # The two disagree, so the rung has no counted-findings evidence and the
   # demotion decides: rc 1.
   fetch_api_array() { printf '%s\n' "$reviews_both"; }
-  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40" "$(graded_of "$reviews_both")") || rc=$?
   [ "$rc" = "1" ] || bad="$bad ack-newer-not-1(rc=$rc,out=$out)"
 
   # The refusal above must come from the DISAGREEMENT, not from the run body:
@@ -2417,7 +2428,7 @@ test_1031_rung_binds_to_the_graded_run() {
   # control the case above is also passed by a helper that has simply stopped
   # working.
   fetch_api_array() { printf '%s\n' "$reviews_run_only"; }
-  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40" "$(graded_of "$reviews_run_only")") || rc=$?
   [ "$rc" = "0" ] || bad="$bad run-alone-not-0(rc=$rc)"
   [ "$out" = "5601" ] || bad="$bad run-alone-id($out)"
 
@@ -2426,7 +2437,7 @@ test_1031_rung_binds_to_the_graded_run() {
   # the rung is satisfied — so the binding is a co-selection test, not a
   # blanket refusal whenever a reply exists on the head.
   fetch_api_array() { printf '%s\n' "$reviews_ack_first"; }
-  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40" "$(graded_of "$reviews_ack_first")") || rc=$?
   [ "$rc" = "0" ] || bad="$bad ack-older-not-0(rc=$rc)"
   [ "$out" = "5601" ] || bad="$bad ack-older-id($out)"
 
@@ -2437,7 +2448,36 @@ test_1031_rung_binds_to_the_graded_run() {
   out=$(crw_select_head_pinned_review_run "$reviews_both" "$BOT_LOGIN" "$h40" | jq -r '.id')
   [ "$out" = "5601" ] || bad="$bad run-selection($out)"
 
-  unset -f fetch_api_array log
+  # ROUND 2 (Phase 4b P1). Naming one selector is not enough: the counter and
+  # the rung read the live `pulls/{pr}/reviews` endpoint at DIFFERENT times, so
+  # a run published between the two reads makes both selections correct and
+  # different. Here the counter graded 5601 and CodeRabbit then published a
+  # NEWER body-bearing findings run 5603 - every selector inside the helper now
+  # agrees on 5603, whose own body carries no marker because its findings are
+  # inline, so a helper that re-derives the graded id from its own fetch clears
+  # a head with an uncounted finding. Passing the counter's id in makes the
+  # mismatch visible and refuses.
+  reviews_newer_run=$(jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg r "$run_body" '[
+    {id: 5601, user: {login: $bot}, commit_id: $sha,
+     submitted_at: "2026-06-04T00:01:00Z", body: $r},
+    {id: 5603, user: {login: $bot}, commit_id: $sha,
+     submitted_at: "2026-06-04T00:03:00Z", body: $r}
+  ]')
+  fetch_api_array() { printf '%s\n' "$reviews_newer_run"; }
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40" 5601) || rc=$?
+  [ "$rc" = "1" ] || bad="$bad newer-run-after-count-not-1(rc=$rc,out=$out)"
+  # Non-vacuity: the refusal is the STALE id, not the fixture. Grading the same
+  # live array the rung sees clears it.
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40" "$(graded_of "$reviews_newer_run")") || rc=$?
+  [ "$rc" = "0" ] || bad="$bad newer-run-same-snapshot-not-0(rc=$rc)"
+  [ "$out" = "5603" ] || bad="$bad newer-run-same-snapshot-id($out)"
+  # An empty graded id - the counter graded no review object at all - is a
+  # definite refusal, and reached without a fetch.
+  fetch_api_array() { printf '%s\n' "$reviews_run_only"; }
+  rc=0; crw_head_pinned_clean_review_run "$h40" "" >/dev/null || rc=$?
+  [ "$rc" = "1" ] || bad="$bad empty-graded-id-not-1(rc=$rc)"
+
+  unset -f fetch_api_array log graded_of
   # shellcheck disable=SC1090
   . "$snip"
 
