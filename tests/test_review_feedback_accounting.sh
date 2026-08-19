@@ -174,6 +174,20 @@ assert_eq 0 "$RUN_RC" "empty review history clears"
 assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "empty history emits clear status"
 assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "empty history reports zero posted findings"
 
+cat >"$TMP/fixtures/issues.json" <<'JSON'
+[
+  {
+    "id": 2,
+    "created_at": "2026-08-18T19:00:00Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": "<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->"
+  }
+]
+JSON
+run_gate
+assert_eq 2 "$RUN_RC" "failed fork archive relay is a persistent infrastructure block"
+assert_match 'fork feedback archive relay.*12345' "$RUN_ERR" "relay failure names the unrecoverable source run"
+
 # The documented direct invocation runs after op-preflight, which exports the
 # scoped PAT but deliberately leaves GH_TOKEN unset. The helper must bridge the
 # reviewer token itself rather than rejecting that normal environment.
@@ -524,6 +538,24 @@ unset CODEX_FEEDBACK_LEDGER
 printf '[{"user":{"login":"nathanpayne-codex"},"content":"+1","created_at":"2026-08-18T20:06:00Z"}]\n' >"$TMP/fixtures/reactions-10.json"
 run_gate
 assert_eq 1 "$RUN_RC" "post-edit reaction alone does not durably account for the edited finding"
+
+jq '. + [{
+  "id": 13,
+  "in_reply_to_id": 10,
+  "created_at": "2026-08-18T20:05:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "path": "src/a.sh",
+  "line": 12,
+  "body": "This reply cannot be ordered after the same-second edit."
+}]' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "same-second reply cannot prove it followed the finding edit"
+jq '.[-1].created_at = "2026-08-18T20:05:01Z"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "strictly later reply accounts for the edited finding"
 
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'

@@ -1,4 +1,7 @@
 name: Codex P1 Gate
+run-name: >-
+  ${{ github.event_name == 'schedule' && 'Codex P1 Gate scheduled sweep' ||
+  format('Codex P1 Gate relay-v1 PR #{0}', github.event.pull_request.number || github.event.issue.number) }}
 
 # Enforces nathanjohnpayne/mergepath#235: Codex P1 inline-review findings
 # must be resolved (via the GitHub UI's "Resolve conversation" button or
@@ -63,6 +66,7 @@ on:
     - cron: "*/15 * * * *"
 
 permissions:
+  actions: read
   contents: read
   issues: read
   pull-requests: read
@@ -76,14 +80,18 @@ jobs:
   archive-edited-feedback:
     name: Archive edited reviewer feedback
     if: >-
-      ((((github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
-      github.event_name == 'pull_request_review_comment') &&
-      (github.event.action == 'edited' || github.event.action == 'deleted')) ||
-      (github.event_name == 'pull_request_review' && github.event.action == 'edited'))
+      github.event_name != 'schedule' &&
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request)
     runs-on: ubuntu-latest
+    outputs:
+      pr: ${{ steps.prepare.outputs.pr }}
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      is_fork: ${{ steps.prepare.outputs.is_fork }}
+      pr_actor: ${{ steps.prepare.outputs.pr_actor }}
     permissions:
       contents: read
-      # This job alone appends the hidden, immutable history snapshot.
+      # Same-repository events append directly. Fork events can only upload a
+      # handoff artifact; the trusted workflow_run relay owns the write.
       issues: write
       pull-requests: read
     steps:
@@ -94,69 +102,119 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Persist the previous reviewer-comment version
+      - name: Prepare and persist the reviewer-feedback version
+        id: prepare
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_JSON: ${{ toJSON(github.event) }}
+          EVENT_ACTION: ${{ github.event.action }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
+            pull_request|pull_request_review|pull_request_review_comment)
+              pr=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
+              head_sha=$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")
+              is_fork=$(jq -r '.pull_request.head.repo.fork // false' "$GITHUB_EVENT_PATH")
+              pr_actor=$(jq -r '.pull_request.user.login // ""' "$GITHUB_EVENT_PATH")
+              ;;
             issue_comment)
-              pr=$(jq -r '.issue.number' <<<"$EVENT_JSON")
-              source_kind=issue-comment
-              source_id=$(jq -r '.comment.id' <<<"$EVENT_JSON")
-              source_login=$(jq -r '.comment.user.login // ""' <<<"$EVENT_JSON")
-              archived_at=$(jq -r '.comment.updated_at // .comment.created_at // ""' <<<"$EVENT_JSON")
-              ;;
-            pull_request_review_comment)
-              pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
-              source_kind=inline
-              source_id=$(jq -r '.comment.id' <<<"$EVENT_JSON")
-              source_login=$(jq -r '.comment.user.login // ""' <<<"$EVENT_JSON")
-              archived_at=$(jq -r '.comment.updated_at // .comment.created_at // ""' <<<"$EVENT_JSON")
-              ;;
-            pull_request_review)
-              pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
-              source_kind=review-body
-              source_id=$(jq -r '.review.id' <<<"$EVENT_JSON")
-              source_login=$(jq -r '.review.user.login // ""' <<<"$EVENT_JSON")
-              archived_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              pr=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+              pr_json=$(gh api "repos/$REPO/pulls/$pr")
+              head_sha=$(jq -r '.head.sha' <<<"$pr_json")
+              is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
+              pr_actor=$(jq -r '.user.login // ""' <<<"$pr_json")
               ;;
             *)
               echo "::error::Unsupported archive event: $EVENT_NAME"
               exit 1
               ;;
           esac
+          if [ -z "$pr" ] || [ "$pr" = null ] || [ -z "$head_sha" ] || [ "$head_sha" = null ]; then
+            echo "::error::Could not bind feedback archival to a PR and head SHA"
+            exit 1
+          fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "is_fork=$is_fork" >> "$GITHUB_OUTPUT"
+          echo "pr_actor=$pr_actor" >> "$GITHUB_OUTPUT"
+
+          source_kind=""
+          if [ "$EVENT_NAME" = issue_comment ] \
+            && { [ "$EVENT_ACTION" = edited ] || [ "$EVENT_ACTION" = deleted ]; }; then
+            source_kind=issue-comment
+            source_id=$(jq -r '.comment.id' "$GITHUB_EVENT_PATH")
+            source_login=$(jq -r '.comment.user.login // ""' "$GITHUB_EVENT_PATH")
+            archived_at=$(jq -r '.comment.updated_at // .comment.created_at // ""' "$GITHUB_EVENT_PATH")
+          elif [ "$EVENT_NAME" = pull_request_review_comment ] \
+            && { [ "$EVENT_ACTION" = edited ] || [ "$EVENT_ACTION" = deleted ]; }; then
+            source_kind=inline
+            source_id=$(jq -r '.comment.id' "$GITHUB_EVENT_PATH")
+            source_login=$(jq -r '.comment.user.login // ""' "$GITHUB_EVENT_PATH")
+            archived_at=$(jq -r '.comment.updated_at // .comment.created_at // ""' "$GITHUB_EVENT_PATH")
+          elif [ "$EVENT_NAME" = pull_request_review ] && [ "$EVENT_ACTION" = edited ]; then
+            source_kind=review-body
+            source_id=$(jq -r '.review.id' "$GITHUB_EVENT_PATH")
+            source_login=$(jq -r '.review.user.login // ""' "$GITHUB_EVENT_PATH")
+            archived_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          fi
+
           previous_file=$(mktemp "${RUNNER_TEMP}/feedback-previous.XXXXXX")
           payload_file=$(mktemp "${RUNNER_TEMP}/feedback-archive-payload.XXXXXX")
           trap 'rm -f "$previous_file" "$payload_file"' EXIT
 
-          if [ "$(jq -r '.action' <<<"$EVENT_JSON")" = edited ]; then
-            jq -r '.changes.body.from // ""' <<<"$EVENT_JSON" >"$previous_file"
-          else
-            jq -r '.comment.body // ""' <<<"$EVENT_JSON" >"$previous_file"
+          archive_record=""
+          if [ -n "$source_kind" ]; then
+            if [ "$EVENT_ACTION" = edited ]; then
+              jq -r '.changes.body.from // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
+            else
+              jq -r '.comment.body // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
+            fi
+            # The renderer emits one hidden
+            # <!-- mergepath-feedback-archive:v1 ... --> record.
+            archive_record=$(scripts/render-feedback-archive.sh \
+              "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file")
           fi
-          # The renderer emits one hidden
-          # <!-- mergepath-feedback-archive:v1 ... --> record.
-          archive_record=$(scripts/render-feedback-archive.sh \
-            "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file")
-          [ -n "$archive_record" ] || exit 0
 
-          existing=$(gh api --paginate "repos/$REPO/issues/$pr/comments" | jq -s 'add // []')
-          if jq -e --arg body "$archive_record" 'any(.[]; (.body // "") == $body)' \
-            <<<"$existing" >/dev/null; then
-            echo "Feedback version already archived for $source_kind $source_id."
-            exit 0
+          if [ "$is_fork" != true ] && [ -n "$archive_record" ]; then
+            existing=$(gh api --paginate "repos/$REPO/issues/$pr/comments" | jq -s 'add // []')
+            if jq -e --arg body "$archive_record" 'any(.[]; (.body // "") == $body)' \
+              <<<"$existing" >/dev/null; then
+              echo "Feedback version already archived for $source_kind $source_id."
+            else
+              jq -n --arg body "$archive_record" '{body:$body}' >"$payload_file"
+              gh api --method POST "repos/$REPO/issues/$pr/comments" \
+                --input "$payload_file" >/dev/null
+              echo "Archived the prior reviewer-feedback version for $source_kind $source_id."
+            fi
           fi
-          jq -n --arg body "$archive_record" '{body:$body}' >"$payload_file"
-          gh api --method POST "repos/$REPO/issues/$pr/comments" \
-            --input "$payload_file" >/dev/null
-          echo "Archived the prior reviewer-feedback version for $source_kind $source_id."
+
+          if [ "$is_fork" = true ]; then
+            jq -n \
+              --arg repo "$REPO" --argjson pr "$pr" --arg head_sha "$head_sha" \
+              --argjson source_run_id "$SOURCE_RUN_ID" --arg event_name "$EVENT_NAME" \
+              --arg archive_record "$archive_record" \
+              '{version:1,repo:$repo,pr:$pr,head_sha:$head_sha,source_run_id:$source_run_id,event_name:$event_name,is_fork:true,archive_record:$archive_record}' \
+              >"$RUNNER_TEMP/codex-p1-fork-handoff.json"
+          fi
+
+      - name: Upload trusted-relay handoff for a fork PR
+        if: steps.prepare.outputs.is_fork == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: codex-p1-fork-handoff-${{ steps.prepare.outputs.pr }}
+          path: ${{ runner.temp }}/codex-p1-fork-handoff.json
+          if-no-files-found: error
+          retention-days: 1
 
   codex-p1-gate:
-    name: Codex P1 unresolved threads
+    # A fork-triggered run cannot publish the trusted required check. Give its
+    # native job a distinct, non-required name; the workflow_run relay is the
+    # only publisher of "Codex P1 unresolved threads" for that head.
+    name: >-
+      ${{ needs.archive-edited-feedback.outputs.is_fork == 'true' &&
+      'Codex P1 fork archive handoff' || 'Codex P1 unresolved threads' }}
     needs: [archive-edited-feedback]
     runs-on: ubuntu-latest
     # Deliberately no Actions concurrency block. GitHub cancels the queued
@@ -176,36 +234,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_JSON: ${{ toJSON(github.event) }}
           CHECK_NAME: "Codex P1 unresolved threads"
+          PR_NUMBER: ${{ needs.archive-edited-feedback.outputs.pr }}
+          HEAD_SHA: ${{ needs.archive-edited-feedback.outputs.head_sha }}
+          IS_FORK: ${{ needs.archive-edited-feedback.outputs.is_fork }}
+          PR_ACTOR: ${{ needs.archive-edited-feedback.outputs.pr_actor }}
         run: |
           set -uo pipefail
-          case "$EVENT_NAME" in
-            pull_request|pull_request_review|pull_request_review_comment)
-              pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
-              head_sha=$(jq -r '.pull_request.head.sha' <<<"$EVENT_JSON")
-              is_fork=$(jq -r '.pull_request.head.repo.fork // false' <<<"$EVENT_JSON")
-              pr_actor=$(jq -r '.pull_request.user.login // ""' <<<"$EVENT_JSON")
-              ;;
-            issue_comment)
-              pr=$(jq -r '.issue.number' <<<"$EVENT_JSON")
-              pr_json=$(gh api "repos/$REPO/pulls/$pr") || exit 1
-              head_sha=$(jq -r '.head.sha' <<<"$pr_json")
-              is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
-              pr_actor=$(jq -r '.user.login // ""' <<<"$pr_json")
-              ;;
-            *)
-              echo "::error::Unsupported event: $EVENT_NAME"
-              exit 1
-              ;;
-          esac
+          pr="$PR_NUMBER"
+          head_sha="$HEAD_SHA"
+          is_fork="$IS_FORK"
+          pr_actor="$PR_ACTOR"
           if [ -z "$pr" ] || [ "$pr" = null ] || [ -z "$head_sha" ] || [ "$head_sha" = null ]; then
             echo "::error::Could not bind the gate lease to a PR number and head SHA"
             exit 1
           fi
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "is_fork=$is_fork" >> "$GITHUB_OUTPUT"
 
           # POST one in-progress generation before evaluation, then PATCH this
           # exact id in phase 2. An older run can finish after a newer event,
@@ -225,8 +271,12 @@ jobs:
             sleep $((attempt * 5))
           done
           if [ -z "$id" ]; then
-            if [ "$is_fork" = true ] || [ "$pr_actor" = 'dependabot[bot]' ]; then
-              echo "::warning::Restricted token cannot open the PR-head check lease; the native check and scheduled sweep remain the backstop"
+            if [ "$is_fork" = true ]; then
+              echo "::warning::Fork token cannot open the PR-head check lease; the trusted workflow_run relay will publish it"
+              exit 0
+            fi
+            if [ "$pr_actor" = 'dependabot[bot]' ]; then
+              echo "::warning::Dependabot token cannot open the PR-head check lease; the native check and scheduled sweep remain the backstop"
               exit 0
             fi
             echo "::error::Could not open the required PR-head check lease"
@@ -242,7 +292,13 @@ jobs:
           echo "::error::Reviewer-feedback archive did not complete; the prior comment body may be unrecoverable."
           exit 1
 
+      - name: Defer fork evaluation to the trusted archive relay
+        if: steps.open.outputs.is_fork == 'true'
+        run: |
+          echo "Fork handoff uploaded; the trusted workflow_run archive relay exclusively publishes the required PR-head check."
+
       - name: Checkout repo (default branch — trusted gate script)
+        if: steps.open.outputs.is_fork != 'true'
         # Pin to the default branch, NOT the PR HEAD. The gate is a
         # REQUIRED status check: if it ran scripts/codex-p1-gate.sh
         # from the PR's own checkout, a PR could edit that script to
@@ -271,6 +327,7 @@ jobs:
           fetch-depth: 1
 
       - name: Run scripts/codex-p1-gate.sh
+        if: steps.open.outputs.is_fork != 'true'
         id: gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -454,7 +511,9 @@ jobs:
             # Look up the PR's head SHA so the check_run lands on the
             # branch-protection-relevant commit (NOT the schedule's
             # default-branch HEAD).
-            head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+            pr_json=$(gh api "repos/$REPO/pulls/$PR")
+            head_sha=$(jq -r '.head.sha' <<<"$pr_json")
+            is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
             if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
               echo "::error::Could not resolve head SHA for PR #$PR; cannot open a fail-closed lease"
               had_infra_error=1
@@ -481,34 +540,58 @@ jobs:
               continue
             fi
 
-            fingerprint_available=false
-            if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
-              if grep -Fq 'path: scripts/review-feedback-surface-fingerprint.sh' \
-                .mergepath-sync.yml; then
-                echo "::error::Installed feedback-fingerprint helper is missing or not executable"
-                exit 1
+            relay_pending=false
+            if [ "$is_fork" = true ]; then
+              source_runs=$(gh api --paginate \
+                "repos/$REPO/actions/workflows/codex-p1-gate.yml/runs?per_page=100" \
+                | jq -s --arg title "Codex P1 Gate relay-v1 PR #$PR" \
+                  '[.[].workflow_runs[] | select(.display_title == $title) | .id]')
+              relay_comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" | jq -s 'add // []')
+              completed_runs=$(printf '%s' "$relay_comments" | jq -c '[
+                .[] | select(.user.login == "github-actions[bot]") | .body // ""
+                | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=complete -->$").run
+                  catch empty
+                | tonumber
+              ]')
+              if jq -e --argjson complete "$completed_runs" \
+                'any(.[] as $run; ($complete | index($run)) == null)' <<<"$source_runs" >/dev/null; then
+                relay_pending=true
               fi
-              echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the manifest-absent bootstrap window"
-              feedback_fp_before="bootstrap-unavailable"
-            else
-              fingerprint_available=true
-              feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh \
-                "$PR" "$REPO")
             fi
-            set +e
-            output=$(scripts/codex-p1-gate.sh "$PR" "$REPO" 2>&1)
-            rc=$?
-            set -e
-            echo "$output"
 
-            feedback_fp_after="$feedback_fp_before"
-            if [ "$fingerprint_available" = true ]; then
-              feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh \
-                "$PR" "$REPO")
-              if [ "$feedback_fp_after" != "$feedback_fp_before" ]; then
-                output="${output}"$'\n'"Feedback changed while PR #$PR was evaluated; closing this generation as failure."
-                rc=2
-                had_infra_error=1
+            if [ "$relay_pending" = true ]; then
+              output="Trusted fork feedback-archive relay is still pending; refusing scheduled clearance."
+              rc=1
+            else
+              fingerprint_available=false
+              if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
+                if grep -Fq 'path: scripts/review-feedback-surface-fingerprint.sh' \
+                  .mergepath-sync.yml; then
+                  echo "::error::Installed feedback-fingerprint helper is missing or not executable"
+                  exit 1
+                fi
+                echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the manifest-absent bootstrap window"
+                feedback_fp_before="bootstrap-unavailable"
+              else
+                fingerprint_available=true
+                feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh \
+                  "$PR" "$REPO")
+              fi
+              set +e
+              output=$(scripts/codex-p1-gate.sh "$PR" "$REPO" 2>&1)
+              rc=$?
+              set -e
+              echo "$output"
+
+              feedback_fp_after="$feedback_fp_before"
+              if [ "$fingerprint_available" = true ]; then
+                feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh \
+                  "$PR" "$REPO")
+                if [ "$feedback_fp_after" != "$feedback_fp_before" ]; then
+                  output="${output}"$'\n'"Feedback changed while PR #$PR was evaluated; closing this generation as failure."
+                  rc=2
+                  had_infra_error=1
+                fi
               fi
             fi
 

@@ -1,0 +1,205 @@
+name: Codex Feedback Archive Relay
+
+# Fork-triggered pull-request workflows receive a read-only GITHUB_TOKEN. The
+# unprivileged Codex P1 Gate run uploads a small, inert JSON handoff under a
+# distinct non-required check name. This default-branch workflow_run consumer
+# receives a write token, validates the handoff without executing artifact
+# content, persists any prior finding version, and only then publishes the
+# required PR-head gate.
+on:
+  workflow_run:
+    workflows: [Codex P1 Gate]
+    types: [completed]
+
+permissions:
+  actions: write
+  checks: write
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  relay:
+    name: Persist fork feedback archive and publish gate
+    if: startsWith(github.event.workflow_run.display_title, 'Codex P1 Gate relay-v1 PR #')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the source PR and fork boundary
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          title=$(jq -r '.workflow_run.display_title // ""' "$GITHUB_EVENT_PATH")
+          pr=${title#Codex P1 Gate relay-v1 PR #}
+          case "$pr" in
+            ''|*[!0-9]*)
+              echo "::error::Could not recover a PR number from the source run title"
+              exit 1
+              ;;
+          esac
+          if ! pr_json=$(gh api "repos/$REPO/pulls/$pr" 2>/dev/null); then
+            # issue_comment also runs for ordinary issues. Their run title has
+            # the same numeric shape, but there is no pull request to relay.
+            echo "pr=$pr" >> "$GITHUB_OUTPUT"
+            echo "head_sha=" >> "$GITHUB_OUTPUT"
+            echo "is_fork=false" >> "$GITHUB_OUTPUT"
+            echo "source_run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
+          head_sha=$(jq -r '.head.sha // ""' <<<"$pr_json")
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "is_fork=$is_fork" >> "$GITHUB_OUTPUT"
+          echo "source_run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Locate the fork handoff artifact
+        if: steps.source.outputs.is_fork == 'true'
+        id: artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.source.outputs.pr }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          expected="codex-p1-fork-handoff-$PR_NUMBER"
+          artifact_id=$(gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.expired == false and .name == \"$expected\") | .id" \
+            | tail -n 1)
+          if [ -z "$artifact_id" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "id=$artifact_id" >> "$GITHUB_OUTPUT"
+
+      - name: Fail permanently when a fork handoff is missing
+        if: steps.source.outputs.is_fork == 'true' && steps.artifact.outputs.found != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.source.outputs.pr }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          CHECK_NAME: Codex P1 unresolved threads
+        run: |
+          set -euo pipefail
+          marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=failed -->"
+          existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
+          if ! jq -e --arg body "$marker" 'any(.[]; (.body // "") == $body)' \
+            <<<"$existing" >/dev/null; then
+            jq -n --arg body "$marker" '{body:$body}' \
+              | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null
+          fi
+          gh api --method POST "repos/$REPO/check-runs" \
+            -f name="$CHECK_NAME" -f head_sha="$HEAD_SHA" \
+            -f status=completed -f conclusion=failure \
+            -f "output[title]=Codex feedback gate — fork archive handoff missing" \
+            -f "output[summary]=Source run $SOURCE_RUN_ID did not publish its trusted-relay handoff. The prior feedback body may be unrecoverable." \
+            >/dev/null
+          exit 1
+
+      - name: Download the inert fork handoff
+        if: steps.source.outputs.is_fork == 'true' && steps.artifact.outputs.found == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: codex-p1-fork-handoff-${{ steps.source.outputs.pr }}
+          path: ${{ runner.temp }}/codex-p1-fork-handoff
+          run-id: ${{ steps.source.outputs.source_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout repo (default branch — trusted relay scripts)
+        if: steps.source.outputs.is_fork == 'true' && steps.artifact.outputs.found == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Persist archive and publish the exact-head gate
+        if: steps.source.outputs.is_fork == 'true' && steps.artifact.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.source.outputs.pr }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
+          HANDOFF_FILE: ${{ runner.temp }}/codex-p1-fork-handoff/codex-p1-fork-handoff.json
+          CHECK_NAME: Codex P1 unresolved threads
+        run: |
+          set -euo pipefail
+          jq -e \
+            --arg repo "$REPO" --argjson pr "$PR_NUMBER" --argjson run "$SOURCE_RUN_ID" '
+              type == "object" and .version == 1 and .repo == $repo and .pr == $pr
+              and .source_run_id == $run and .is_fork == true
+              and (.head_sha | type == "string" and test("^[0-9a-f]{40}$"))
+              and (.event_name == "pull_request" or .event_name == "pull_request_review"
+                or .event_name == "pull_request_review_comment" or .event_name == "issue_comment")
+              and (.archive_record | type == "string")
+            ' "$HANDOFF_FILE" >/dev/null
+          head_sha=$(jq -r '.head_sha' "$HANDOFF_FILE")
+          archive_record=$(jq -r '.archive_record' "$HANDOFF_FILE")
+          if [ -n "$archive_record" ] \
+            && ! grep -Eq '^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+/=]+ -->$' <<<"$archive_record"; then
+            echo "::error::Fork handoff contains an invalid archive record"
+            exit 1
+          fi
+
+          check_id=$(gh api --method POST "repos/$REPO/check-runs" \
+            -f name="$CHECK_NAME" -f head_sha="$head_sha" -f status=in_progress \
+            -f "output[title]=Codex feedback gate (trusted fork relay in progress)" \
+            -f "output[summary]=Persisting reviewer-feedback history before evaluating $head_sha." \
+            --jq .id)
+
+          if [ -n "$archive_record" ]; then
+            existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
+            if ! jq -e --arg body "$archive_record" 'any(.[]; (.body // "") == $body)' \
+              <<<"$existing" >/dev/null; then
+              jq -n --arg body "$archive_record" '{body:$body}' \
+                | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null
+            fi
+          fi
+
+          rc=2
+          output="Trusted fork relay could not evaluate the requested head."
+          current_head=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')
+          if [ "$current_head" = "$head_sha" ]; then
+            fingerprint_before=$(scripts/review-feedback-surface-fingerprint.sh \
+              "$PR_NUMBER" "$REPO")
+            set +e
+            output=$(CODEX_P1_EXPECTED_HEAD_SHA="$head_sha" \
+              scripts/codex-p1-gate.sh "$PR_NUMBER" "$REPO" 2>&1)
+            rc=$?
+            set -e
+            fingerprint_after=$(scripts/review-feedback-surface-fingerprint.sh \
+              "$PR_NUMBER" "$REPO")
+            if [ "$fingerprint_before" != "$fingerprint_after" ]; then
+              output="${output}"$'\n'"Feedback changed during trusted fork evaluation; refusing the stale result."
+              rc=2
+            fi
+          else
+            output="PR head moved from $head_sha to $current_head before trusted fork evaluation."
+          fi
+
+          conclusion=failure
+          [ "$rc" -eq 0 ] && conclusion=success
+          title="Codex feedback gate (trusted fork relay)"
+          [ "$rc" -le 1 ] || title="Codex feedback gate — trusted fork relay failed closed"
+
+          marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=complete -->"
+          existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
+          if ! jq -e --arg body "$marker" 'any(.[]; (.body // "") == $body)' \
+            <<<"$existing" >/dev/null; then
+            jq -n --arg body "$marker" '{body:$body}' \
+              | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null
+          fi
+
+          gh api --method PATCH "repos/$REPO/check-runs/$check_id" \
+            -f status=completed -f conclusion="$conclusion" \
+            -f "output[title]=$title" -f "output[summary]=${output:0:60000}" \
+            >/dev/null
+          gh api --method DELETE "repos/$REPO/actions/artifacts/$ARTIFACT_ID" >/dev/null

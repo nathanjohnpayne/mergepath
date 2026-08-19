@@ -1219,9 +1219,16 @@ paths:
     # workflow without the script makes the gate fail-closed on
     # `command not found` for every PR in the consumer.
     requires:
+      - ".github/workflows/codex-feedback-archive-relay.yml"   # #1000, privileged fork archive persistence
       - "scripts/codex-p1-gate.sh"
       - "scripts/render-feedback-archive.sh"   # #1000, persist edited/deleted PR-level, inline, and review-body findings
       - "scripts/review-feedback-surface-fingerprint.sh"   # #1000, reject stale publications
+  - path: .github/workflows/codex-feedback-archive-relay.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/codex-p1-gate.sh"
+      - "scripts/review-feedback-surface-fingerprint.sh"
   - path: .github/workflows/coderabbit-severity-gate.yml
     type: canonical
     consumers: all
@@ -1424,6 +1431,7 @@ paths:
       - "scripts/workflow/"                    # check_workflow_parsers
       - ".github/workflows/agent-review.yml"   # check_disagreement_detector structural assertion
       - ".github/workflows/codex-p1-gate.yml"  # check_codex_p1_gate workflow shape
+      - ".github/workflows/codex-feedback-archive-relay.yml"  # check_codex_p1_gate trusted fork relay shape
       - ".github/workflows/coderabbit-severity-gate.yml"  # check_coderabbit_severity_gate workflow shape (#577)
       - ".github/workflows/merge-clearance-gate.yml"  # check_merge_clearance_gate workflow shape
       # check_required_check_publisher's subject (#845 PR 2). The publisher

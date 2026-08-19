@@ -197,6 +197,17 @@ INLINE_COMMENTS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inlin
 REVIEWS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects")
 ISSUE_COMMENTS=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments")
 
+RELAY_FAILURE_RUN=$(printf '%s' "$ISSUE_COMMENTS" | jq -r '
+  first(
+    .[] | select(.user.login == "github-actions[bot]") | .body // ""
+    | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=failed -->$").run
+      catch empty
+  ) // empty
+') || die 2 "could not validate fork feedback archive relay state"
+if [ -n "$RELAY_FAILURE_RUN" ]; then
+  die 2 "fork feedback archive relay failed for source run $RELAY_FAILURE_RUN; prior feedback may be unrecoverable"
+fi
+
 tier_rank() {
   case "$1" in
     p0) echo 0 ;;
@@ -298,7 +309,8 @@ agent_reply_after_finding() {
         (.in_reply_to_id != null)
         and (.in_reply_to_id == $root)
         and (.id != $finding)
-        and ((.created_at // "") >= $floor)
+        and (((.created_at // "") > $floor)
+          or ($confirmed != "" and (.created_at // "") == $floor))
         and ((.user.login // "") as $login | ($agents | index($login)) != null)
         and ($confirmed == "" or (.user.login // "") == $confirmed)
         and (((.body // "") | gsub("\\[mergepath-resolve:[^]]*\\]"; "")
