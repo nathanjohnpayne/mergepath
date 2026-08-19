@@ -5,10 +5,12 @@
 #
 # PART A ONLY. The RECOGNIZER that decides "is this line an output command,
 # and does this reference reach it" is an enumeration of shell spellings,
-# and five direct-form spellings are known to escape it — enumerated with
-# reproductions under "What this check does NOT catch" below. Rebuilding it
-# against an execution oracle instead of an enumeration is #1015. Read that
-# section before relying on this check for anything.
+# and nine direct-form spellings have been MEASURED to escape it — listed
+# with reproductions under "What this check does NOT catch" below, as a
+# sample rather than an inventory, because the set of spellings is unbounded
+# and every review round of #1012 found new members of it. Rebuilding the
+# recognizer against an execution oracle instead of an enumeration is #1015.
+# Read that section before relying on this check for anything.
 #
 # #951 found a live PAT printed in cleartext by a checker's own failure
 # message. #993 fixed the three sites it could find by grepping `scripts/`
@@ -108,14 +110,20 @@
 #   * Any file this check does not scan: non-shell files, and everything
 #     outside scripts/** and tests/**.
 #
-# DIRECT FORMS THAT ALSO ESCAPE — five of them, and they are NOT the
-# indirection limit above. No rename, no capture into another name, no
-# file, no `set -x`: each is a direct interpolation of a listed credential
-# name into an output command by this header's own definition, and the
-# check reports the line as clean. Measured, not inferred — a probe fixture
-# carrying all five plus a plain `echo "$GH_TOKEN"` returns exactly ONE
-# finding, the plain `echo`. The probe used an unassigned variable and no
-# credential material of any kind.
+# DIRECT FORMS THAT ALSO ESCAPE. These are NOT the indirection limit above.
+# No rename, no capture into another name, no file, no `set -x`: each is a
+# direct interpolation of a listed credential name into an output command by
+# this header's own definition, and the check reports the line as clean.
+#
+# READ THIS LIST AS A SAMPLE, NOT AN INVENTORY. It is what has been MEASURED
+# to escape, one probe fixture at a time, with an unassigned variable and no
+# credential material of any kind. It is not the complete set and cannot be:
+# the recognizer models an enumeration of shell spellings, the spellings are
+# unbounded, and every review round of #1012 found new members of exactly
+# this one class — which is why #1015 replaces the enumeration with a
+# differential harness whose oracle is `bash` execution plus sentinel
+# detection on both streams. Everything below is one of its failing cases.
+# Do not read a construct's absence here as coverage.
 #
 #   * A nested word inside a parameter-expansion OPERATOR, when the outer
 #     name is not itself credential-bearing. `${VAR:-$FALLBACK}` is
@@ -141,10 +149,36 @@
 #     and scan_lines, and the join_continuations pre-pass keeps its own copy
 #     of the same state, so the fix is a pending-QUEUE rewrite across two
 #     passes rather than a local patch.
-#
-# All five are tracked on #1015, which replaces the enumeration with a
-# differential harness whose oracle is `bash` execution plus sentinel
-# detection on both stdout and stderr. They are its first failing cases.
+#   * A here-doc OPENER in a later command segment. note_heredoc classifies
+#     the body from `first_command_word(line)`, which reads the FIRST command
+#     on the line, so the `cat` that owns the here-doc is never consulted —
+#     the same segment-ownership bug the here-STRING path already fixes with
+#     `cmdname[depth]`:
+#         true; cat <<EOF
+#   * An ESCAPED command word. bash treats `\echo` as `echo` with alias
+#     expansion suppressed; `walk()` consumes the backslash as an escape and
+#     accumulates `cho`, which is not an emitter:
+#         \echo "$GH_TOKEN"
+#   * A helper whose body contains a NESTED block closing at line start.
+#     discover_helpers ends the body scope on any line matching `^\s*\}`, so
+#     the inner block's brace ends it early and the emitter after it is
+#     never seen:
+#         die() {
+#           {
+#             :
+#           }
+#           echo "fatal: $1" >&2
+#         }
+#         die "$GH_TOKEN"
+#     Formatting decides this one: with the inner block written inline
+#     (`{ :; }`) the helper IS discovered and the call IS flagged.
+#   * A double-quoted argument spanning physical lines with NO backslash.
+#     bash allows it; join_continuations ends a logical line whenever it has
+#     no live trailing backslash, so the emitter and the reference land on
+#     different records:
+#         echo "prefix
+#         $GH_TOKEN
+#         suffix"
 #
 # One limit inside the LOGICAL-line reconstruction, since the unit of
 # analysis is a logical line rather than a physical one (see below): quote
@@ -162,9 +196,11 @@
 #
 # And stated just as plainly, because landing an overstated guarantee is
 # the failure this check exists to prevent: "the direct form cannot come
-# back silently" is NOT a property of this code. Five direct spellings
-# escape it, listed and reproduced above. What holds is bounded by the
-# enumeration — the spellings this check DOES model cannot come back
+# back silently" is NOT a property of this code. Nine direct spellings are
+# measured escaping it above, and that list is a sample of an unbounded set
+# rather than its inventory — an absence from it is not coverage. What holds
+# is bounded by the enumeration — the spellings this check DOES model
+# cannot come back
 # silently, each pinned by a self-test case in both directions: a plain
 # `echo`/`printf`, a message helper in either definition form, a backslash
 # continuation between the emitter and its argument, a path-qualified
