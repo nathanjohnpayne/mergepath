@@ -6,7 +6,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CONFIG="${REVIEW_FEEDBACK_ACCOUNTING_CONFIG:-$REPO_ROOT/.github/review-policy.yml}"
+DEFAULT_CONFIG="$REPO_ROOT/.github/review-policy.yml"
+CONFIG="${REVIEW_FEEDBACK_ACCOUNTING_CONFIG:-}"
+RESOLVED_CONFIG=""
 
 # Read-only helper: use the cached reviewer PAT when the caller followed the
 # normal op-preflight contract but did not export GH_TOKEN explicitly (#282).
@@ -58,6 +60,30 @@ case "$REPO" in
   */*) ;;
   *) die 2 "REPO must be owner/repo; got '$REPO'" ;;
 esac
+
+if [ -z "$CONFIG" ]; then
+  POLICY_RESOLVER="$SCRIPT_DIR/workflow/resolve_base_policy.sh"
+  [ -x "$POLICY_RESOLVER" ] || die 2 "missing executable base-policy resolver: $POLICY_RESOLVER"
+  LOCAL_REPO=""
+  ORIGIN_URL=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null || true)
+  case "$ORIGIN_URL" in
+    *github.com:*) LOCAL_REPO=${ORIGIN_URL##*github.com:} ;;
+    *github.com/*) LOCAL_REPO=${ORIGIN_URL##*github.com/} ;;
+  esac
+  LOCAL_REPO=${LOCAL_REPO%.git}
+  RESOLVER_ARGS=(--repo "$REPO" --pr "$PR_NUMBER" --default-config "$DEFAULT_CONFIG")
+  if [ "$LOCAL_REPO" != "$REPO" ]; then
+    RESOLVER_ARGS+=(--materialize-default)
+  fi
+  CONFIG=$(
+    "$POLICY_RESOLVER" "${RESOLVER_ARGS[@]}"
+  ) || die 2 "could not resolve the review policy governing $REPO#$PR_NUMBER"
+  if [ "$CONFIG" != "$DEFAULT_CONFIG" ]; then
+    RESOLVED_CONFIG="$CONFIG"
+  fi
+fi
+
+trap 'if [ -n "$RESOLVED_CONFIG" ]; then rm -f "$RESOLVED_CONFIG"; fi' EXIT
 
 policy_top_field() {
   local field="$1"
@@ -280,7 +306,8 @@ agent_reply_after_finding() {
   printf '%s' "$INLINE_COMMENTS" | jq -e \
     --argjson root "$root_id" --arg floor "$floor" --argjson agents "$AGENT_LOGINS_JSON" '
       any(.[];
-        ((.in_reply_to_id // .id) == $root)
+        (.in_reply_to_id != null)
+        and (.in_reply_to_id == $root)
         and ((.created_at // "") >= $floor)
         and ((.user.login // "") as $login | ($agents | index($login)) != null)
         and (((.body // "") | gsub("\\[mergepath-resolve:[^]]*\\]"; "")

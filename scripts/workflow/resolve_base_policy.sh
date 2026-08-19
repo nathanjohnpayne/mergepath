@@ -44,6 +44,7 @@ set -euo pipefail
 #
 # Usage:
 #   resolve_base_policy.sh --repo owner/repo --pr N [--default-config PATH]
+#                          [--materialize-default]
 #   resolve_base_policy.sh --repo owner/repo --base-ref REF --base-sha SHA \
 #                          --default-branch BRANCH [--default-config PATH]
 #
@@ -56,10 +57,11 @@ BASE_REF=""
 BASE_SHA=""
 DEFAULT_BRANCH=""
 DEFAULT_CONFIG=".github/review-policy.yml"
+MATERIALIZE_DEFAULT=false
 
 usage() {
   cat >&2 <<'EOF'
-usage: resolve_base_policy.sh --repo owner/repo (--pr N | --base-ref REF --base-sha SHA --default-branch BRANCH) [--default-config PATH]
+usage: resolve_base_policy.sh --repo owner/repo (--pr N | --base-ref REF --base-sha SHA --default-branch BRANCH) [--default-config PATH] [--materialize-default]
 EOF
   exit 2
 }
@@ -72,6 +74,7 @@ while [ $# -gt 0 ]; do
     --base-sha)       [ $# -ge 2 ] || usage; BASE_SHA="$2"; shift 2 ;;
     --default-branch) [ $# -ge 2 ] || usage; DEFAULT_BRANCH="$2"; shift 2 ;;
     --default-config) [ $# -ge 2 ] || usage; DEFAULT_CONFIG="$2"; shift 2 ;;
+    --materialize-default) MATERIALIZE_DEFAULT=true; shift ;;
     -h|--help)        usage ;;
     *) echo "resolve_base_policy.sh: unknown arg: $1" >&2; usage ;;
   esac
@@ -120,8 +123,31 @@ if [ -z "$BASE_REF" ] || [ -z "$DEFAULT_BRANCH" ]; then
   exit 2
 fi
 
+materialize_policy_at_ref() {
+  local ref="$1" label="$2" policy_err policy_rc policy_msg policy tmp
+  policy_err=$(mktemp "${TMPDIR:-/tmp}/resolve-policy-materialize-err.XXXXXX")
+  set +e
+  policy=$(gh api "repos/$REPO/contents/.github/review-policy.yml?ref=$ref" \
+    -H "Accept: application/vnd.github.raw" 2>"$policy_err")
+  policy_rc=$?
+  set -e
+  policy_msg=$(cat "$policy_err" 2>/dev/null || true)
+  rm -f "$policy_err"
+  if [ "$policy_rc" -ne 0 ] || [ -z "$policy" ]; then
+    echo "resolve_base_policy.sh: could not materialize $label policy for $REPO@$ref (rc=$policy_rc): $policy_msg" >&2
+    return 2
+  fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/base-review-policy.XXXXXX")
+  printf '%s\n' "$policy" >"$tmp"
+  printf '%s\n' "$tmp"
+}
+
 # Default base: the caller's config already IS the governing policy.
 if [ "$BASE_REF" = "$DEFAULT_BRANCH" ]; then
+  if [ "$MATERIALIZE_DEFAULT" = true ]; then
+    materialize_policy_at_ref "$BASE_SHA" "default-base" || exit 2
+    exit 0
+  fi
   printf '%s\n' "$DEFAULT_CONFIG"
   exit 0
 fi
@@ -168,6 +194,10 @@ if printf '%s' "$policy_msg" | grep -q 'HTTP 404'; then
   if [ "$commit_rc" -eq 0 ]; then
     # Repo and ref are readable, the file is not there: the base predates the
     # policy file, so no stricter policy can exist to miss.
+    if [ "$MATERIALIZE_DEFAULT" = true ]; then
+      materialize_policy_at_ref "$DEFAULT_BRANCH" "default-branch fallback" || exit 2
+      exit 0
+    fi
     printf '%s\n' "$DEFAULT_CONFIG"
     exit 0
   fi

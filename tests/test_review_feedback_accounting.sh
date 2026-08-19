@@ -58,6 +58,12 @@ if [ -n "${GH_FAIL_ENDPOINT:-}" ] && [ "$endpoint" = "$GH_FAIL_ENDPOINT" ]; then
 fi
 
 case "$endpoint" in
+  repos/acme/widget/pulls/7)
+    cat "$GH_FIXTURE_DIR/pull.json"
+    ;;
+  repos/acme/widget/contents/.github/review-policy.yml\?ref=*)
+    cat "$GH_FIXTURE_DIR/base-review-policy.yml"
+    ;;
   repos/acme/widget/pulls/7/comments)
     cat "$GH_FIXTURE_DIR/inline.json"
     ;;
@@ -100,6 +106,24 @@ reset_fixtures() {
   printf '[]\n' >"$TMP/fixtures/inline.json"
   printf '[]\n' >"$TMP/fixtures/reviews.json"
   printf '[]\n' >"$TMP/fixtures/issues.json"
+  cat >"$TMP/fixtures/pull.json" <<'JSON'
+{
+  "base": {
+    "ref": "release",
+    "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "repo": {"default_branch": "main"}
+  }
+}
+JSON
+  cat >"$TMP/fixtures/base-review-policy.yml" <<'YAML'
+author_identity: nathanjohnpayne
+available_reviewers:
+  - nathanpayne-release
+coderabbit:
+  bot_login: "coderabbitai[bot]"
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+YAML
   rm -f "$TMP/fixtures"/reactions-*.json
   : >"$TMP/gh-calls.log"
 }
@@ -108,16 +132,18 @@ RUN_RC=0
 RUN_JSON=""
 RUN_ERR=""
 run_gate() {
-  local token_mode="${1:-ambient}" out="$TMP/out.json" err="$TMP/err.log"
+  local token_mode="${1:-ambient}" config_mode="${2:-override}" out="$TMP/out.json" err="$TMP/err.log"
   local -a gate_env=(
     "PATH=$TMP/bin:$PATH"
     "GH_FIXTURE_DIR=$TMP/fixtures"
     "GH_CALL_LOG=$TMP/gh-calls.log"
-    "REVIEW_FEEDBACK_ACCOUNTING_CONFIG=$TMP/review-policy.yml"
     "CODEX_FEEDBACK_LEDGER=${CODEX_FEEDBACK_LEDGER:-$TMP/no-codex-ledger}"
     "CODERABBIT_FEEDBACK_LEDGER=${CODERABBIT_FEEDBACK_LEDGER:-$TMP/no-coderabbit-ledger}"
     "GH_FAIL_ENDPOINT=${GH_FAIL_ENDPOINT:-}"
   )
+  if [ "$config_mode" = override ]; then
+    gate_env+=("REVIEW_FEEDBACK_ACCOUNTING_CONFIG=$TMP/review-policy.yml")
+  fi
   set +e
   if [ "$token_mode" = preflight ]; then
     env -u GH_TOKEN \
@@ -152,6 +178,29 @@ assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "empty history report
 reset_fixtures
 run_gate preflight
 assert_eq 0 "$RUN_RC" "reviewer PAT from preflight is accepted without ambient GH_TOKEN"
+
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 9,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T19:50:00Z",
+    "user": {"login": "nathanpayne-release"},
+    "path": "src/release.sh",
+    "line": 3,
+    "body": "**P1** Release-branch reviewer requires this guard."
+  }
+]
+JSON
+run_gate ambient base
+assert_eq 1 "$RUN_RC" "non-default pull request uses its base-branch reviewer policy"
+assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "base-only reviewer finding is inventoried"
+jq '.base.ref = "main"' "$TMP/fixtures/pull.json" >"$TMP/fixtures/pull.next"
+mv "$TMP/fixtures/pull.next" "$TMP/fixtures/pull.json"
+run_gate ambient base
+assert_eq 1 "$RUN_RC" "cross-repository default-base pull request uses the target repository policy"
+assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "target-repository reviewer remains inventoried on its default base"
 
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
@@ -208,6 +257,24 @@ run_gate
 assert_eq 0 "$RUN_RC" "agent reply after inline finding accounts for it"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "agent reply increments accounted count"
 assert_eq thread-reply "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "reply evidence is visible"
+
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 13,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T20:10:00Z",
+    "user": {"login": "nathanpayne-claude"},
+    "path": "src/reviewer.sh",
+    "line": 7,
+    "body": "**P1** Reject the unsafe reviewer path before merge."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "registered reviewer root finding cannot account for itself as a reply"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "reviewer root finding has no reply evidence"
 
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [

@@ -453,6 +453,7 @@ paths:
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/workflow/resolve_base_policy.sh"   # #1000, governing base-branch policy
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
