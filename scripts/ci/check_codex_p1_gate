@@ -107,6 +107,29 @@ if [ -f "$WORKFLOW" ]; then
     echo "      Review-body acknowledgements must refresh the merge-relevant required check immediately."
     FAILED=1
   fi
+
+  # Event publishers for the same PR must serialize, and both the event path
+  # and scheduled publisher must reject a result when any feedback surface
+  # changed while the gate was evaluating. Otherwise an older success can be
+  # posted after a newer failure on the same head (#1000).
+  if ! grep -F 'concurrency:' "$WORKFLOW" >/dev/null \
+     || ! grep -F 'cancel-in-progress: false' "$WORKFLOW" >/dev/null \
+     || [ "$(grep -Fc 'scripts/review-feedback-surface-fingerprint.sh' "$WORKFLOW")" -lt 2 ] \
+     || ! grep -F 'feedback_fp_before' "$WORKFLOW" >/dev/null \
+     || ! grep -F 'feedback_fp_after' "$WORKFLOW" >/dev/null; then
+    echo "FAIL: $WORKFLOW does not serialize and generation-fence feedback check publishers."
+    FAILED=1
+  fi
+
+  # An issue-comment edit carries the only copy of the previous body. Archive
+  # that version before the gate job runs so a CodeRabbit summary rewrite
+  # cannot erase an undispositioned prior-head finding.
+  if ! grep -F 'archive-edited-feedback:' "$WORKFLOW" >/dev/null \
+     || ! grep -F 'scripts/render-feedback-archive.sh' "$WORKFLOW" >/dev/null \
+     || ! grep -F 'mergepath-feedback-archive:v1' "$WORKFLOW" >/dev/null; then
+    echo "FAIL: $WORKFLOW does not persist edited reviewer-summary versions."
+    FAILED=1
+  fi
 fi
 
 if [ "$FAILED" -ne 0 ]; then

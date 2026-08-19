@@ -25,6 +25,7 @@
 #   codex_tiers_of "<comment-body>"        # every p0..p3 marker, in order
 #   coderabbit_tier_of "<comment-body>"    # p0..p3|nitpick or empty
 #   coderabbit_tiers_of "<comment-body>"   # every graded marker, in order
+#   coderabbit_finding_scan "<body>"       # strip fenced/pre-merge regions
 #
 # cfg defaults to $CONFIG (the global the gate scripts set) and then to
 # .github/review-policy.yml, matching scripts/lib/reviewers-helpers.sh.
@@ -162,6 +163,71 @@ codex_tier_of() {
 # callers grade a PR-level summary line by line; four successive framings of
 # that boundary produced four defects on #936. It is [#945](https://github.com/nathanjohnpayne/mergepath/issues/945),
 # with a spec-derived matrix, and #888 stays open for it.
+coderabbit_finding_scan() {
+  local body=${1:-} out
+  out=$(printf '%s\n' "$body" | awk \
+    -v block_start='<!-- pre_merge_checks_walkthrough_start -->' \
+    -v block_end='<!-- pre_merge_checks_walkthrough_end -->' '
+      function fence_info(s, out,   c, n) {
+        sub(/^ ? ? ?/, "", s)
+        c = substr(s, 1, 1)
+        if (c != "`" && c != "~") return 0
+        n = 0
+        while (substr(s, n + 1, 1) == c) n++
+        if (n < 3) return 0
+        out["rest"] = substr(s, n + 1)
+        if (c == "`" && index(out["rest"], "`") > 0) return 0
+        out["char"] = c
+        out["len"] = n
+        return 1
+      }
+      function fence_update(line,   info) {
+        if (!fence_info(line, info)) return 0
+        if (!in_fence) {
+          in_fence = 1
+          fence_char = info["char"]
+          fence_len = info["len"]
+          return 1
+        }
+        if (info["char"] == fence_char && info["len"] >= fence_len \
+            && info["rest"] ~ /^[ \t]*$/) {
+          in_fence = 0
+          fence_char = ""
+          fence_len = 0
+        }
+        return 1
+      }
+      {
+        line = $0
+        sub(/\r$/, "", line)
+        lines[NR] = line
+        delimiter = fence_update(line)
+        visible[NR] = (!delimiter && !in_fence)
+        structural = line
+        sub(/[ \t]+$/, "", structural)
+        if (visible[NR] && structural == block_start && !start_line) {
+          start_line = NR
+        } else if (visible[NR] && structural == block_end \
+                   && start_line && !end_line) {
+          end_line = NR
+        }
+      }
+      END {
+        for (i = 1; i <= NR; i++) {
+          if (!visible[i]) continue
+          if (end_line && i >= start_line && i <= end_line) continue
+          print lines[i]
+        }
+      }
+    ') || {
+      echo "ERROR: could not sanitize a CodeRabbit finding surface" >&2
+      return 2
+    }
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  fi
+}
+
 coderabbit_tiers_of() {
   local body=${1:-} markers marker
   markers=$(printf '%s' "$body" \

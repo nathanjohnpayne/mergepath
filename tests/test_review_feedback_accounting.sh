@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/scripts/review-feedback-accounting.sh"
+RENDER_ARCHIVE="$ROOT/scripts/render-feedback-archive.sh"
+SURFACE_FINGERPRINT="$ROOT/scripts/review-feedback-surface-fingerprint.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -293,6 +295,19 @@ git -C "$AUTHOR_CHECKOUT" symbolic-ref refs/remotes/origin/HEAD refs/remotes/ori
 run_gate ambient base "$AUTHOR_CHECKOUT/scripts/review-feedback-accounting.sh"
 assert_eq 1 "$RUN_RC" "same-repository author worktree does not trust its head policy as the PR base"
 assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "author worktree still inventories the base-only reviewer"
+
+TRUSTED_CHECKOUT="$TMP/trusted-default-checkout"
+mkdir -p "$TRUSTED_CHECKOUT/scripts/workflow" "$TRUSTED_CHECKOUT/.github"
+cp "$SCRIPT" "$TRUSTED_CHECKOUT/scripts/review-feedback-accounting.sh"
+cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$TRUSTED_CHECKOUT/scripts/workflow/resolve_base_policy.sh"
+cp -R "$ROOT/scripts/lib" "$TRUSTED_CHECKOUT/scripts/lib"
+cp "$TMP/review-policy.yml" "$TRUSTED_CHECKOUT/.github/review-policy.yml"
+git -C "$TRUSTED_CHECKOUT" init -q -b main
+git -C "$TRUSTED_CHECKOUT" remote add origin https://github.com/acme/widget.git
+git -C "$TRUSTED_CHECKOUT" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+run_gate ambient base "$TRUSTED_CHECKOUT/scripts/review-feedback-accounting.sh"
+assert_eq 1 "$RUN_RC" "default-branch checkout materializes the exact PR-base policy"
+assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "stale or dirty default checkout cannot omit a base reviewer"
 
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
@@ -693,6 +708,93 @@ mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 1 "$RUN_RC" "editing a PR-level bot finding invalidates its prior acknowledgement"
 
+PREVIOUS_SUMMARY="$TMP/previous-summary.txt"
+cat >"$PREVIOUS_SUMMARY" <<'EOF'
+<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+_🟠 Major_ prior-head summary finding that must survive a rewrite.
+EOF
+ARCHIVE_MARKER=""
+if [ -x "$RENDER_ARCHIVE" ]; then
+  ARCHIVE_MARKER=$("$RENDER_ARCHIVE" 8000 'coderabbitai[bot]' \
+    '2026-08-18T22:23:00Z' "$PREVIOUS_SUMMARY") || true
+fi
+if printf '%s' "$ARCHIVE_MARKER" | grep -Eq '^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+/=]+ -->$'; then
+  pass "edited-summary archive renderer emits a hidden version record"
+else
+  fail "edited-summary archive renderer emits a hidden version record"
+  ARCHIVE_PAYLOAD=$(jq -nc \
+    --argjson source_comment_id 8000 \
+    --arg source_login 'coderabbitai[bot]' \
+    --arg archived_at '2026-08-18T22:23:00Z' \
+    --arg body_fingerprint '0123456789ab' \
+    '{source_comment_id:$source_comment_id,source_login:$source_login,archived_at:$archived_at,body_fingerprint:$body_fingerprint,codex_tiers:[],coderabbit_tiers:["p1"]}')
+  ARCHIVE_MARKER="<!-- mergepath-feedback-archive:v1 $(printf '%s' "$ARCHIVE_PAYLOAD" | jq -Rr '@base64') -->"
+fi
+ARCHIVE_DATA=$(printf '%s' "$ARCHIVE_MARKER" \
+  | sed -E 's/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/' \
+  | jq -Rr '@base64d | fromjson')
+assert_eq 8000 "$(printf '%s' "$ARCHIVE_DATA" | jq -r '.source_comment_id')" "archive record stays bound to the rewritten source comment"
+ARCHIVE_FINGERPRINT=$(printf '%s' "$ARCHIVE_DATA" | jq -r '.body_fingerprint')
+EXPECTED_ARCHIVE_ACK="[mergepath-comment-ack: 8000 $ARCHIVE_FINGERPRINT]"
+
+jq -n --arg archive "$ARCHIVE_MARKER" --arg token "$EXPECTED_ARCHIVE_ACK" '[
+  {
+    "id": 8000,
+    "created_at": "2026-08-18T22:20:00Z",
+    "updated_at": "2026-08-18T22:23:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n**Actionable comments posted: 0**"
+  },
+  {
+    "id": 8001,
+    "created_at": "2026-08-18T22:22:00Z",
+    "updated_at": "2026-08-18T22:22:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": ($token + "\nDisposition posted before the summary rewrite.")
+  },
+  {
+    "id": 8002,
+    "created_at": "2026-08-18T22:23:01Z",
+    "updated_at": "2026-08-18T22:23:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }
+]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "rewritten summary keeps its latest archived finding in inventory"
+assert_eq issue-comment-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "rewritten summary is identified as archived issue-comment feedback"
+assert_eq "$EXPECTED_ARCHIVE_ACK" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')" "archived summary retains a content-pinned acknowledgement path"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "pre-rewrite acknowledgement cannot clear an archived summary finding"
+ARCHIVE_ACK=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
+jq --arg token "$ARCHIVE_ACK" '. + [{
+  "id": 8003,
+  "created_at": "2026-08-18T22:24:00Z",
+  "updated_at": "2026-08-18T22:24:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nDispositioned the archived summary finding after its rewrite.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-rewrite acknowledgement reconciles the archived summary finding"
+
+cat >"$PREVIOUS_SUMMARY" <<'EOF'
+<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+_🟡 Minor_ a second distinct summary finding removed by a later rewrite.
+EOF
+ARCHIVE_MARKER_TWO=$("$RENDER_ARCHIVE" 8000 'coderabbitai[bot]' \
+  '2026-08-18T22:25:00Z' "$PREVIOUS_SUMMARY")
+jq --arg archive "$ARCHIVE_MARKER_TWO" '. + [{
+  "id": 8004,
+  "created_at": "2026-08-18T22:25:01Z",
+  "updated_at": "2026-08-18T22:25:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "distinct removed summary versions remain separate findings"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing_count')" "acknowledging one archived version cannot erase another"
+
 reset_fixtures
 cat >"$TMP/fixtures/reviews.json" <<'JSON'
 [
@@ -848,6 +950,27 @@ for endpoint in \
   fi
 done
 
+reset_fixtures
+FINGERPRINT_ONE=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+jq '. + [{
+  "id": 9900,
+  "created_at": "2026-08-18T23:10:00Z",
+  "updated_at": "2026-08-18T23:10:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": "A new disposition changes the feedback generation."
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+FINGERPRINT_TWO=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+if [ -n "$FINGERPRINT_ONE" ] && [ "$FINGERPRINT_ONE" != "$FINGERPRINT_TWO" ]; then
+  pass "feedback-surface fingerprint changes with PR-level disposition state"
+else
+  fail "feedback-surface fingerprint changes with PR-level disposition state"
+fi
+
 for caller in \
   scripts/codex-review-request.sh \
   scripts/phase-4b-review.sh \
@@ -864,6 +987,11 @@ if grep -Eq -- '--argjson (findings|missing)([[:space:]\\]|$)' "$SCRIPT"; then
   fail "final result must stream finding arrays instead of passing them through argv"
 else
   pass "final result streams finding arrays instead of passing them through argv"
+fi
+if grep -Eq -- '--argjson (inline|reviews|issues)([[:space:]\\]|$)' "$SURFACE_FINGERPRINT"; then
+  fail "surface fingerprint must stream complete histories instead of passing them through argv"
+else
+  pass "surface fingerprint streams complete histories instead of passing them through argv"
 fi
 
 if [ "$FAIL" -ne 0 ]; then

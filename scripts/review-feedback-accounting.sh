@@ -65,20 +65,13 @@ esac
 if [ -z "$CONFIG" ]; then
   POLICY_RESOLVER="$SCRIPT_DIR/workflow/resolve_base_policy.sh"
   [ -x "$POLICY_RESOLVER" ] || die 2 "missing executable base-policy resolver: $POLICY_RESOLVER"
-  LOCAL_REPO=""
-  ORIGIN_URL=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null || true)
-  case "$ORIGIN_URL" in
-    *github.com:*) LOCAL_REPO=${ORIGIN_URL##*github.com:} ;;
-    *github.com/*) LOCAL_REPO=${ORIGIN_URL##*github.com/} ;;
-  esac
-  LOCAL_REPO=${LOCAL_REPO%.git}
-  LOCAL_BRANCH=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-  ORIGIN_DEFAULT=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
-  ORIGIN_DEFAULT=${ORIGIN_DEFAULT#origin/}
-  RESOLVER_ARGS=(--repo "$REPO" --pr "$PR_NUMBER" --default-config "$DEFAULT_CONFIG")
-  if [ "$LOCAL_REPO" != "$REPO" ] || [ -z "$ORIGIN_DEFAULT" ] || [ "$LOCAL_BRANCH" != "$ORIGIN_DEFAULT" ]; then
-    RESOLVER_ARGS+=(--materialize-default)
-  fi
+  # Accounting is a merge-safety decision, so a checkout merely NAMED like
+  # the default branch is not proof that its policy matches the PR base. It
+  # may be behind, ahead, or dirty. Materialize the policy at the exact base
+  # SHA for every invocation; the resolver retains its no-fetch trusted mode
+  # for callers that independently prove content equality.
+  RESOLVER_ARGS=(--repo "$REPO" --pr "$PR_NUMBER" \
+    --default-config "$DEFAULT_CONFIG" --materialize-default)
   CONFIG=$(
     "$POLICY_RESOLVER" "${RESOLVER_ARGS[@]}"
   ) || die 2 "could not resolve the review policy governing $REPO#$PR_NUMBER"
@@ -163,8 +156,6 @@ CODEX_BOT=$(policy_block_field codex bot_login)
 CODEX_BOT=${CODEX_BOT:-chatgpt-codex-connector[bot]}
 CODERABBIT_BOT=$(policy_block_field coderabbit bot_login)
 CODERABBIT_BOT=${CODERABBIT_BOT:-coderabbitai[bot]}
-CR_PRE_MERGE_BLOCK_START='<!-- pre_merge_checks_walkthrough_start -->'
-CR_PRE_MERGE_BLOCK_END='<!-- pre_merge_checks_walkthrough_end -->'
 
 REVIEWER_LOGINS_JSON=$(
   policy_reviewers | awk 'NF && !seen[$0]++' | jq -Rsc 'split("\n") | map(select(. != ""))'
@@ -205,71 +196,6 @@ fetch_api_array() {
 INLINE_COMMENTS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline review comments")
 REVIEWS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects")
 ISSUE_COMMENTS=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments")
-
-coderabbit_finding_scan() {
-  local out
-  out=$(printf '%s\n' "$1" | awk \
-    -v block_start="$CR_PRE_MERGE_BLOCK_START" \
-    -v block_end="$CR_PRE_MERGE_BLOCK_END" '
-      function fence_info(s, out,   c, n) {
-        sub(/^ ? ? ?/, "", s)
-        c = substr(s, 1, 1)
-        if (c != "`" && c != "~") return 0
-        n = 0
-        while (substr(s, n + 1, 1) == c) n++
-        if (n < 3) return 0
-        out["rest"] = substr(s, n + 1)
-        if (c == "`" && index(out["rest"], "`") > 0) return 0
-        out["char"] = c
-        out["len"] = n
-        return 1
-      }
-      function fence_update(line,   info) {
-        if (!fence_info(line, info)) return 0
-        if (!in_fence) {
-          in_fence = 1
-          fence_char = info["char"]
-          fence_len = info["len"]
-          return 1
-        }
-        if (info["char"] == fence_char && info["len"] >= fence_len \
-            && info["rest"] ~ /^[ \t]*$/) {
-          in_fence = 0
-          fence_char = ""
-          fence_len = 0
-        }
-        return 1
-      }
-      {
-        line = $0
-        sub(/\r$/, "", line)
-        lines[NR] = line
-        delimiter = fence_update(line)
-        visible[NR] = (!delimiter && !in_fence)
-        structural = line
-        sub(/[ \t]+$/, "", structural)
-        if (visible[NR] && structural == block_start && !start_line) {
-          start_line = NR
-        } else if (visible[NR] && structural == block_end \
-                   && start_line && !end_line) {
-          end_line = NR
-        }
-      }
-      END {
-        for (i = 1; i <= NR; i++) {
-          if (!visible[i]) continue
-          if (end_line && i >= start_line && i <= end_line) continue
-          print lines[i]
-        }
-      }
-    ') || {
-      echo "[review-feedback-accounting] ERROR: could not sanitize a CodeRabbit finding surface" >&2
-      return 2
-    }
-  if [ -n "$out" ]; then
-    printf '%s\n' "$out"
-  fi
-}
 
 tier_rank() {
   case "$1" in
@@ -465,6 +391,126 @@ ack_present() {
             and (([$rationale | scan("[[:alnum:]][[:alnum:]_-]*")] | length) >= 2))))
     ' >/dev/null 2>&1
 }
+
+archive_payload() {
+  local body="$1" encoded payload
+  encoded=$(printf '%s\n' "$body" | sed -nE \
+    '1s/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/p')
+  [ -n "$encoded" ] || return 1
+  payload=$(printf '%s' "$encoded" | jq -Rer '@base64d | fromjson') || return 1
+  printf '%s' "$payload" | jq -e '
+    type == "object"
+    and (.source_comment_id | type == "number" and . > 0 and floor == .)
+    and (.source_login | type == "string" and length > 0)
+    and (.archived_at | type == "string" and length > 0)
+    and (.body_fingerprint | type == "string" and test("^[0-9a-f]{12}$"))
+    and (.codex_tiers | type == "array"
+      and all(.[]; . == "p0" or . == "p1" or . == "p2" or . == "p3"))
+    and (.coderabbit_tiers | type == "array"
+      and all(.[]; . == "p0" or . == "p1" or . == "p2" or . == "p3" or . == "nitpick"))
+  ' >/dev/null 2>&1 || return 1
+  printf '%s' "$payload"
+}
+
+strongest_nonignored_archive_tier() {
+  local tiers_json="$1" tier best="" best_rank=99 rank
+  while IFS= read -r tier; do
+    [ -n "$tier" ] || continue
+    tier_is_ignored "$tier" && continue
+    rank=$(tier_rank "$tier")
+    if [ "$rank" -lt "$best_rank" ]; then
+      best="$tier"
+      best_rank="$rank"
+    fi
+  done <<EOF
+$(printf '%s' "$tiers_json" | jq -r '.[]')
+EOF
+  printf '%s' "$best"
+}
+
+# GitHub exposes only the current body of an edited issue comment. The
+# trusted workflow snapshots the prior marker set in an append-only comment
+# before it can disappear from the paginated API. Trust only records authored
+# by github-actions[bot], bind them back to the configured source bot, and use
+# every distinct archived finding version when the source is now markerless
+# (or deleted). Identical delivery retries collapse by source + fingerprint;
+# a live re-raise supersedes every archive for that source.
+ARCHIVED_ISSUE_CANDIDATES='[]'
+while IFS= read -r archive_comment; do
+  [ -n "$archive_comment" ] || continue
+  archive_login=$(printf '%s' "$archive_comment" | jq -r '.user.login // ""')
+  [ "$archive_login" = 'github-actions[bot]' ] || continue
+  archive_body=$(printf '%s' "$archive_comment" | jq -r '.body // ""')
+  payload=$(archive_payload "$archive_body" || true)
+  [ -n "$payload" ] || continue
+  source_id=$(printf '%s' "$payload" | jq -r '.source_comment_id')
+  source_login=$(printf '%s' "$payload" | jq -r '.source_login')
+  case "$source_login" in
+    "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+    *) continue ;;
+  esac
+
+  source_comment=$(printf '%s' "$ISSUE_COMMENTS" | jq -c \
+    --argjson id "$source_id" 'first(.[] | select(.id == $id)) // null')
+  if [ "$source_comment" != null ]; then
+    live_source_login=$(printf '%s' "$source_comment" | jq -r '.user.login // ""')
+    [ "$live_source_login" = "$source_login" ] || continue
+    live_source_body=$(printf '%s' "$source_comment" | jq -r '.body // ""')
+    live_source_tier=$(strongest_nonignored_finding_tier "$source_login" "$live_source_body")
+    [ -z "$live_source_tier" ] || continue
+  fi
+
+  if [ "$source_login" = "$CODEX_BOT" ]; then
+    archive_tiers=$(printf '%s' "$payload" | jq -c '.codex_tiers')
+  else
+    archive_tiers=$(printf '%s' "$payload" | jq -c '.coderabbit_tiers')
+  fi
+  tier=$(strongest_nonignored_archive_tier "$archive_tiers")
+  [ -n "$tier" ] || continue
+
+  archive_comment_id=$(printf '%s' "$archive_comment" | jq -r '.id')
+  archived_at=$(printf '%s' "$archive_comment" | jq -r '.created_at // .updated_at // ""')
+  body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
+  ack_token="[mergepath-comment-ack: $source_id $body_fingerprint]"
+  accounted=false
+  evidence=""
+  if ack_present "$ack_token" "$archived_at"; then
+    accounted=true
+    evidence="comment-ack"
+  fi
+  ARCHIVED_ISSUE_CANDIDATES=$(printf '%s' "$ARCHIVED_ISSUE_CANDIDATES" | jq -c \
+    --argjson source_comment_id "$source_id" \
+    --argjson archive_comment_id "$archive_comment_id" \
+    --arg source_login "$source_login" \
+    --arg tier "$tier" --arg archived_at "$archived_at" \
+    --arg fingerprint "$body_fingerprint" --arg token "$ack_token" \
+    --argjson accounted "$accounted" --arg evidence "$evidence" '
+      . + [{
+        kind: "issue-comment-archive",
+        comment_id: $source_comment_id,
+        archive_comment_id: $archive_comment_id,
+        reviewer: $source_login,
+        tier: $tier,
+        created_at: $archived_at,
+        updated_at: $archived_at,
+        body_fingerprint: $fingerprint,
+        ack_token: $token,
+        body: "(archived reviewer issue-comment version)",
+        accounted: $accounted,
+        evidence: (if $evidence == "" then null else $evidence end)
+      }]
+    ')
+done <<EOF
+$(printf '%s' "$ISSUE_COMMENTS" | jq -c '.[]')
+EOF
+
+ARCHIVED_ISSUE_CANDIDATES=$(printf '%s' "$ARCHIVED_ISSUE_CANDIDATES" | jq -c '
+  sort_by(.comment_id, .body_fingerprint, .updated_at, .archive_comment_id)
+  | group_by([.comment_id, .body_fingerprint])
+  | map(last)
+')
+FINDINGS=$(printf '%s' "$FINDINGS" | jq -c \
+  --argjson archived "$ARCHIVED_ISSUE_CANDIDATES" '. + $archived')
 
 while IFS= read -r issue_comment; do
   [ -n "$issue_comment" ] || continue

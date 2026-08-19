@@ -73,13 +73,79 @@ permissions:
   checks: write
 
 jobs:
+  archive-edited-feedback:
+    name: Archive edited reviewer feedback
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      (github.event.action == 'edited' || github.event.action == 'deleted')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # This job alone appends the hidden, immutable history snapshot.
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Checkout repo (default branch — trusted archive renderer)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Persist the previous reviewer-comment version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_JSON: ${{ toJSON(github.event) }}
+        run: |
+          set -euo pipefail
+          pr=$(jq -r '.issue.number' <<<"$EVENT_JSON")
+          source_id=$(jq -r '.comment.id' <<<"$EVENT_JSON")
+          source_login=$(jq -r '.comment.user.login // ""' <<<"$EVENT_JSON")
+          archived_at=$(jq -r '.comment.updated_at // .comment.created_at // ""' <<<"$EVENT_JSON")
+          previous_file=$(mktemp "${RUNNER_TEMP}/feedback-previous.XXXXXX")
+          payload_file=$(mktemp "${RUNNER_TEMP}/feedback-archive-payload.XXXXXX")
+          trap 'rm -f "$previous_file" "$payload_file"' EXIT
+
+          if [ "$(jq -r '.action' <<<"$EVENT_JSON")" = edited ]; then
+            jq -r '.changes.body.from // ""' <<<"$EVENT_JSON" >"$previous_file"
+          else
+            jq -r '.comment.body // ""' <<<"$EVENT_JSON" >"$previous_file"
+          fi
+          # The renderer emits one hidden
+          # <!-- mergepath-feedback-archive:v1 ... --> record.
+          archive_record=$(scripts/render-feedback-archive.sh \
+            "$source_id" "$source_login" "$archived_at" "$previous_file")
+          [ -n "$archive_record" ] || exit 0
+
+          existing=$(gh api --paginate "repos/$REPO/issues/$pr/comments" | jq -s 'add // []')
+          if jq -e --arg body "$archive_record" 'any(.[]; (.body // "") == $body)' \
+            <<<"$existing" >/dev/null; then
+            echo "Feedback version already archived for comment $source_id."
+            exit 0
+          fi
+          jq -n --arg body "$archive_record" '{body:$body}' >"$payload_file"
+          gh api --method POST "repos/$REPO/issues/$pr/comments" \
+            --input "$payload_file" >/dev/null
+          echo "Archived the prior reviewer-feedback version for comment $source_id."
+
   codex-p1-gate:
     name: Codex P1 unresolved threads
+    needs: [archive-edited-feedback]
     runs-on: ubuntu-latest
+    concurrency:
+      group: codex-p1-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      cancel-in-progress: false
     # Event-driven path. The scheduled sweep below runs the same
     # gate but on every open PR via the Checks API; gating this job
     # to non-schedule events avoids paying for an empty no-op run.
-    if: github.event_name != 'schedule' && (github.event_name != 'issue_comment' || github.event.issue.pull_request)
+    if: >-
+      always() &&
+      needs.archive-edited-feedback.result != 'failure' &&
+      needs.archive-edited-feedback.result != 'cancelled' &&
+      github.event_name != 'schedule' &&
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request)
     steps:
       - name: Checkout repo (default branch — trusted gate script)
         # Pin to the default branch, NOT the PR HEAD. The gate is a
@@ -157,12 +223,26 @@ jobs:
               exit 1
             fi
           fi
+          feedback_fp_before="unavailable"
+          if [ -x scripts/review-feedback-surface-fingerprint.sh ]; then
+            feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh \
+              "$PR_NUMBER" "$REPO")
+          fi
           set +e
           output=$(CODEX_P1_EXPECTED_HEAD_SHA="$head_sha_before" \
             scripts/codex-p1-gate.sh "$PR_NUMBER" "$REPO" 2>&1)
           rc=$?
           set -e
           echo "$output"
+          feedback_fp_after="$feedback_fp_before"
+          if [ "$feedback_fp_before" != unavailable ]; then
+            feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh \
+              "$PR_NUMBER" "$REPO")
+            if [ "$feedback_fp_after" != "$feedback_fp_before" ]; then
+              output="${output}"$'\n'"Feedback changed during gate evaluation; refusing the stale result."
+              rc=2
+            fi
+          fi
 
           # `issue_comment` workflows run against the default-branch SHA, so
           # their native Actions check cannot update the required check on the
@@ -289,11 +369,28 @@ jobs:
               continue
             fi
 
+            feedback_fp_before="unavailable"
+            if [ -x scripts/review-feedback-surface-fingerprint.sh ]; then
+              feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh \
+                "$PR" "$REPO")
+            fi
             set +e
             output=$(scripts/codex-p1-gate.sh "$PR" "$REPO" 2>&1)
             rc=$?
             set -e
             echo "$output"
+
+            feedback_fp_after="$feedback_fp_before"
+            if [ "$feedback_fp_before" != unavailable ]; then
+              feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh \
+                "$PR" "$REPO")
+              if [ "$feedback_fp_after" != "$feedback_fp_before" ]; then
+                echo "::error::Feedback changed while PR #$PR was evaluated; refusing stale publication."
+                had_infra_error=1
+                echo "::endgroup::"
+                continue
+              fi
+            fi
 
             case "$rc" in
               0) conclusion="success" ;;
