@@ -394,7 +394,7 @@ chmod +x "$BIN/gh"
 cat > "$BIN/fake-gh-as-reviewer" <<'SH'
 #!/usr/bin/env bash
 {
-  printf 'OP_PREFLIGHT_REVIEWER_PAT=%s\n' "${OP_PREFLIGHT_REVIEWER_PAT:-}"
+  printf 'OP_PREFLIGHT_REVIEWER_PAT=%s\n' "${OP_PREFLIGHT_REVIEWER_PAT:-}"  # TOKEN_OUTPUT_EXEMPT: records the reviewer PAT the orchestrator pinned, asserted against a fixture sentinel (#996)
   printf '%s\n' "$*"
 } > "${P4B_WRAPPER_LOG:?}"
 [ "${1:-}" = "--" ] || { echo "expected wrapper separator" >&2; exit 64; }

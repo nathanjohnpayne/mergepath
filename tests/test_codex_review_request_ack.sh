@@ -92,7 +92,7 @@ printf '%s\n' "$count" >"$state_dir/trigger-count"
 # Record the author-PAT and author-identity env the wrapper sees, so
 # the #438 inline-token bridging tests can assert what (if anything)
 # was bridged in.
-printf '%s\n' "${OP_PREFLIGHT_AUTHOR_PAT:-}" >>"$state_dir/author-pat-env"
+printf '%s\n' "${OP_PREFLIGHT_AUTHOR_PAT:-}" >>"$state_dir/author-pat-env"  # TOKEN_OUTPUT_EXEMPT: run_case unsets both PATs (#993), so this records only what the bridge injected, and the assertions compare it exactly (#996)
 printf '%s\n' "${GH_AS_AUTHOR_IDENTITY:-}" >>"$state_dir/author-identity-env"
 
 comment_id=$((1000 + count))

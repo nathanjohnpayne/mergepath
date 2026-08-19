@@ -424,6 +424,26 @@ jobs:
       - name: check_no_bare_gh_writes
         run: ./scripts/ci/check_no_bare_gh_writes
 
+      - name: check_no_token_in_output
+        # The enforcement half of #951/#993 (#996), rebuilt against an
+        # EXECUTION ORACLE per #1015. Fails when a shell source line under
+        # scripts/** or tests/** interpolates the VALUE of a known credential
+        # variable into an output command. Runs its own differential suite
+        # first — each construct is written to a disposable fixture carrying
+        # an obviously fake sentinel, RUN under bash, and its captured stdout
+        # and stderr grepped, so the scanner's verdict is checked against what
+        # bash actually does rather than against a second hand-written model
+        # of shell. Only the check's OWN fixtures are executed; the gate never
+        # executes repository source. Legitimate emitters carry an inline
+        # `TOKEN_OUTPUT_EXEMPT: <reason>` pragma at the site, and the reason is
+        # mandatory. Needs python3 and bash, both present on ubuntu-latest.
+        #
+        # The `|| { ...; }` tail is the #590-style self-bootstrap guard:
+        # soft-pass when the check script is absent in this tree (a checkout
+        # whose repo_lint.yml arrived ahead of the scripts/ci kit sync — the
+        # #601 skew window); the gate activates the moment the kit lands.
+        run: ./scripts/ci/check_no_token_in_output || { rc=$?; if [ ! -f scripts/ci/check_no_token_in_output ]; then echo "check_no_token_in_output not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
       - name: check_op_preflight_contract
         run: ./scripts/ci/check_op_preflight_contract
 
