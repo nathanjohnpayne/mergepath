@@ -55,6 +55,32 @@ EXECUTABLE.  This file carries both halves:
     refused with an environment error instead of producing a number that
     reads like ground truth and is not.  See the block above `run_oracle`.
 
+    It is NOT independent of WHICH VALUE it samples either, and that one is
+    still open.  Ground truth is established from a SINGLE sentinel, and that
+    sentinel is LETTER-LEADING, so every verdict below was measured at ONE
+    point in the value space rather than across credentials.  At least one
+    construct's verdict is an artefact of that point: `echo $((GH_TOKEN))`
+    reads CLEAN because a LETTER-LEADING operand is a NAME to bash, which
+    finds it unset and evaluates it to `0`.  Hand the same line a
+    DIGIT-LEADING NON-NUMERIC value and bash writes `9Zq7Xf2Lp: value too
+    great for base (error token is "9Zq7Xf2Lp")` to STDERR -- the value,
+    reproduced TWICE -- and `run_oracle` greps stderr.  Measured on this head:
+    the oracle reports leaks=False under the shipped sentinel and leaks=True
+    under a digit-leading one, while the SCANNER reads clean under both.  So
+    the construct is an agreeing pair today and would be an UNDECLARED MISS
+    the moment the sampled shape changed -- and it is not in `CORPUS` at all.
+    (An ALL-DIGIT value reads clean again, because bash evaluates it as a
+    number: one shape surfaces this, the other two do not, which is why the
+    sweep is a sweep.)  So a construct that measures clean here may leak on a
+    value shaped differently, and this corpus would not know.
+    The sampled shape is derived from `SENTINEL` and PRINTS on the
+    `--self-test` summary line beside the interpreter; that print is the
+    record, the same way the registries are.  This is the `ORACLE_BASH_MIN`
+    problem one axis over -- an unstated dependency of the measurement, on the
+    VALUE instead of on the environment -- and unlike that one it is declared
+    rather than closed: sweeping the corpus across letter-leading,
+    digit-leading and all-digit sentinels is #1036.
+
     The suite then asserts the static scanner AGREES with the oracle on every
     construct.  A construct the oracle says leaks and the scanner calls clean
     is a FALSE NEGATIVE; a construct the oracle says is clean and the scanner
@@ -206,7 +232,8 @@ and the scanner really does stay silent, on purpose.
 READ IT AS THE MEASURED SAMPLE IT IS: an absence from this list is NOT
 coverage.  The scanner is a source-text approximation; the oracle is the only
 thing here that knows the truth, and it only knows it about constructs someone
-put in the corpus.
+put in the corpus -- and only under the one sentinel shape that corpus samples
+(#1036, and the oracle paragraph above).
 
 The list below mixes TWO KINDS of gap and says which is which.  Most of it is
 the DESIGN LIMIT: this is a single-hop source-text scanner over one logical line
@@ -314,14 +341,16 @@ gate at their original sites.  All three reached the token under another name
 or through a file.  This gate stops the DIRECT form from coming back; it is
 not a proof that no credential can reach a stream.
 
-And the recall claim is bounded by the CORPUS, not by an argument.  What the
-harness demonstrates is that on ~393 constructs -- generated across line
-spellings, file selection, pipeline consumers and legal-but-unusual precision
-shapes -- the scanner and bash agree except for the declared entries.  The
-run prints the exact count, the interpreter that produced it, and both
-registries; that print is the number of record, not this sentence.  A
-construct nobody wrote into the corpus is not covered by the statement at all.
-Adding one is a three-line edit to `CORPUS`, and the oracle decides it --
+And the recall claim is bounded by the CORPUS and by the SENTINEL, not by an
+argument.  What the harness demonstrates is that on ~393 constructs --
+generated across line spellings, file selection, pipeline consumers and
+legal-but-unusual precision shapes, each measured against ONE letter-leading
+sentinel value -- the scanner and bash agree except for the declared entries.
+The run prints the exact count, the interpreter AND the sentinel shape that
+produced it, and both registries; that print is the number of record, not this
+sentence.  A construct nobody wrote into the corpus is not covered by the
+statement at all, and neither is a value shape nobody sampled (#1036).  Adding
+a construct is a three-line edit to `CORPUS`, and the oracle decides it --
 under an interpreter that can evaluate it, which is what `ORACLE_BASH_MIN`
 is for.
 
@@ -1912,12 +1941,44 @@ def scan_tree(root):
 # collide with ordinary program output -- the oracle looks for windows as well
 # as the whole string, because `${VAR:0:8}` is a partial leak and a
 # whole-string grep would call it clean.
+#
+# It is ONE value, and its SHAPE is load-bearing.  This one is LETTER-LEADING,
+# so `echo $((GH_TOKEN))` resolves the operand as a name, finds it unset and
+# evaluates to 0 -- measuring CLEAN.  A DIGIT-LEADING NON-NUMERIC value on the
+# same line puts the sentinel on STDERR twice, through bash's own `value too
+# great for base` diagnostic, and the oracle greps stderr.  (An all-digit
+# value evaluates as a number and reads clean again -- the shapes are not
+# interchangeable, which is the point of sweeping them.)  Every verdict this
+# records is therefore quantified over this shape and no other; sweeping the
+# corpus across letter-leading, digit-leading and all-digit values is #1036.
+# `sentinel_shape()` below DERIVES the shape from this constant instead of
+# restating it, and `--self-test` prints it, so the limit stated in the header
+# cannot drift away from the value the fixtures actually carry.
 SENTINEL = "Zq7Xf2Lp9Vt4Rk8Nb3Md6Wc1Ys5Hj0Gr"
 SENTINEL_WINDOW = 8
 _SENTINEL_WINDOWS = tuple(
     SENTINEL[i : i + SENTINEL_WINDOW]
     for i in range(len(SENTINEL) - SENTINEL_WINDOW + 1)
 )
+
+
+def sentinel_shape():
+    """Name the ONE value shape the oracle samples, derived from `SENTINEL`.
+
+    Written as a derivation rather than a constant so that changing `SENTINEL`
+    changes what `--self-test` reports, instead of leaving the header's stated
+    limit describing a value the fixtures no longer carry.  The three names
+    are the three shapes #1036 asks the corpus to sweep.
+    """
+    if not SENTINEL:
+        return "empty"
+    if SENTINEL.isdigit():
+        return "all-digit"
+    if SENTINEL[0].isdigit():
+        return "digit-leading non-numeric"
+    if SENTINEL[0].isalpha():
+        return "letter-leading"
+    return "other-leading"
 
 
 def sentinel_reached(*streams):
@@ -2951,6 +3012,15 @@ def self_test():
     print(
         "check_no_token_in_output: oracle interpreter: %s -- %s"
         % (bash_path or "<none>", bash_text)
+    )
+    # WHICH VALUE answered is the other half of the same disclosure (#1036).
+    # Ground truth below was taken at ONE point in the value space, and at
+    # least one construct's verdict is an artefact of that point -- see the
+    # sentinel note above SENTINEL.  Printed beside the interpreter so the
+    # summary records the SAMPLING as well as the environment.
+    print(
+        "check_no_token_in_output: oracle sentinel: 1 shape sampled -- %s, "
+        "%d chars (#1036 sweeps the rest)" % (sentinel_shape(), len(SENTINEL))
     )
     print(
         "check_no_token_in_output: oracle differential over %d constructs "
