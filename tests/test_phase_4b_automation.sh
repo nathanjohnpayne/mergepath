@@ -15,6 +15,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true
 LIB="$ROOT/scripts/phase-4b/lib.sh"
 ORCH="$ROOT/scripts/phase-4b-review.sh"
 AD_CODEX="$ROOT/scripts/phase-4b/adapters/review-via-codex.sh"
@@ -1533,6 +1534,25 @@ set -e
 if [ "$rc" = 5 ] && printf '%s' "$out" | jq -e '.repo == "o/r\nextra"' >/dev/null; then
   pass "automation disabled JSON escapes control characters"
 else fail "disabled path JSON escaping (rc=$rc, out=$out)"; fi
+
+# Undispositioned feedback is a distinct no-dispatch hold, not a manual
+# fallback and not a completed review round.
+FEEDBACK_BLOCK_STUB="$WORK/feedback-accounting-block.sh"
+cat >"$FEEDBACK_BLOCK_STUB" <<'EOF'
+#!/bin/sh
+printf '%s\n' '{"status":"unaccounted","posted":3,"accounted":2}'
+exit 1
+EOF
+chmod +x "$FEEDBACK_BLOCK_STUB"
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$FEEDBACK_BLOCK_STUB" \
+  CODEX_BIN="$BIN/fake-codex-approve" \
+  bash "$ORCH" 122 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>&1)"; rc=$?
+set -e
+if [ "$rc" = 7 ] && printf '%s' "$out" | grep -q 'review feedback is unaccounted'; then
+  pass "feedback accounting miss → exit 7 before Phase 4b adapter dispatch"
+else fail "feedback accounting pre-dispatch gate (rc=$rc, out=$out)"; fi
 
 # Direction A: author=claude → reviewer codex → APPROVED → exit 0
 set +e

@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# Read-only gate that reconciles every bot finding on a pull request with
+# finding-bound, GitHub-visible disposition evidence.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG="${REVIEW_FEEDBACK_ACCOUNTING_CONFIG:-$REPO_ROOT/.github/review-policy.yml}"
+
+# Read-only helper: use the cached reviewer PAT when the caller followed the
+# normal op-preflight contract but did not export GH_TOKEN explicitly (#282).
+if [ -r "$SCRIPT_DIR/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$SCRIPT_DIR/lib/preflight-helpers.sh"
+  preflight_require_token reviewer || true
+fi
+
+if [ ! -r "$SCRIPT_DIR/lib/feedback-policy-helpers.sh" ]; then
+  echo "[review-feedback-accounting] ERROR: missing feedback-policy-helpers.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/feedback-policy-helpers.sh
+. "$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
+
+if [ ! -r "$SCRIPT_DIR/lib/gh-api-array.sh" ]; then
+  echo "[review-feedback-accounting] ERROR: missing gh-api-array.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$SCRIPT_DIR/lib/gh-api-array.sh"
+
+die() {
+  local code="$1"
+  shift
+  echo "[review-feedback-accounting] ERROR: $*" >&2
+  exit "$code"
+}
+
+usage() {
+  echo "Usage: $0 <PR_NUMBER> [REPO]" >&2
+  exit 2
+}
+
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+PR_NUMBER="$1"
+case "$PR_NUMBER" in
+  ''|*[!0-9]*) die 2 "PR_NUMBER must be an integer; got '$PR_NUMBER'" ;;
+esac
+[ -n "${GH_TOKEN:-}" ] || die 2 "GH_TOKEN is required"
+
+REPO="${2:-}"
+if [ -z "$REPO" ]; then
+  REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
+  [ -n "$REPO" ] || die 2 "could not detect repository; pass owner/repo"
+fi
+case "$REPO" in
+  */*) ;;
+  *) die 2 "REPO must be owner/repo; got '$REPO'" ;;
+esac
+
+policy_top_field() {
+  local field="$1"
+  [ -r "$CONFIG" ] || return 0
+  awk -v field="$field" '
+    /^[^[:space:]#]/ && $1 == field":" {
+      sub(/^[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^["\047]|["\047][[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
+    }
+  ' "$CONFIG"
+}
+
+policy_block_field() {
+  local block="$1" field="$2"
+  [ -r "$CONFIG" ] || return 0
+  awk -v block="$block" -v field="$field" '
+    $0 ~ "^" block ":" { in_block=1; next }
+    in_block && /^[^[:space:]#]/ { in_block=0 }
+    in_block && $1 == field":" {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^["\047]|["\047][[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
+    }
+  ' "$CONFIG"
+}
+
+policy_reviewers() {
+  [ -r "$CONFIG" ] || return 0
+  awk '
+    /^available_reviewers:/ { in_list=1; next }
+    in_list && /^[^[:space:]#]/ { in_list=0 }
+    in_list && /^[[:space:]]*-[[:space:]]*/ {
+      sub(/^[[:space:]]*-[[:space:]]*/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      gsub(/^["\047]|["\047][[:space:]]*$/, "", $0)
+      if ($0 != "") print
+    }
+  ' "$CONFIG"
+}
+
+AUTHOR_IDENTITY=$(policy_top_field author_identity)
+AUTHOR_IDENTITY=${AUTHOR_IDENTITY:-nathanjohnpayne}
+CODEX_BOT=$(policy_block_field codex bot_login)
+CODEX_BOT=${CODEX_BOT:-chatgpt-codex-connector[bot]}
+CODERABBIT_BOT=$(policy_block_field coderabbit bot_login)
+CODERABBIT_BOT=${CODERABBIT_BOT:-coderabbitai[bot]}
+
+AGENT_LOGINS_JSON=$(
+  {
+    printf '%s\n' "$AUTHOR_IDENTITY"
+    policy_reviewers
+  } | awk 'NF && !seen[$0]++' | jq -Rsc 'split("\n") | map(select(. != ""))'
+) || die 2 "could not parse available_reviewers from $CONFIG"
+
+fetch_api_array() {
+  gh_api_array "$1" "$2" || die 2 "$GH_API_ARRAY_ERROR"
+}
+
+INLINE_COMMENTS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline review comments")
+REVIEWS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects")
+ISSUE_COMMENTS=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments")
+
+finding_tier() {
+  local login="$1" body="$2" tier="" line
+  if [ "$login" = "$CODEX_BOT" ]; then
+    codex_tier_of "$body"
+    return
+  fi
+  if [ "$login" = "$CODERABBIT_BOT" ]; then
+    while IFS= read -r line; do
+      tier=$(coderabbit_tier_of "$line")
+      if [ -n "$tier" ]; then
+        printf '%s' "$tier"
+        return
+      fi
+    done <<EOF
+$body
+EOF
+  fi
+}
+
+INLINE_CANDIDATES='[]'
+while IFS= read -r comment; do
+  [ -n "$comment" ] || continue
+  login=$(printf '%s' "$comment" | jq -r '.user.login // ""')
+  case "$login" in
+    "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+    *) continue ;;
+  esac
+  body=$(printf '%s' "$comment" | jq -r '.body // ""')
+  tier=$(finding_tier "$login" "$body")
+  [ -n "$tier" ] || continue
+  INLINE_CANDIDATES=$(printf '%s' "$INLINE_CANDIDATES" | jq -c \
+    --argjson c "$comment" --arg tier "$tier" '
+      . + [{
+        kind: "inline",
+        root_id: ($c.in_reply_to_id // $c.id),
+        finding_id: $c.id,
+        reviewer: ($c.user.login // ""),
+        tier: $tier,
+        created_at: ($c.created_at // ""),
+        updated_at: ($c.updated_at // $c.created_at // ""),
+        path: ($c.path // "(unknown)"),
+        line: ($c.line // $c.original_line // null),
+        body: ($c.body // "")
+      }]
+    ')
+done <<EOF
+$(printf '%s' "$INLINE_COMMENTS" | jq -c '.[]')
+EOF
+
+INLINE_CANDIDATES=$(printf '%s' "$INLINE_CANDIDATES" | jq -c '
+  sort_by(.root_id, (.updated_at // .created_at), .created_at, .finding_id)
+  | group_by(.root_id)
+  | map(last)
+')
+
+agent_reply_after_finding() {
+  local root_id="$1" floor="$2"
+  printf '%s' "$INLINE_COMMENTS" | jq -e \
+    --argjson root "$root_id" --arg floor "$floor" --argjson agents "$AGENT_LOGINS_JSON" '
+      any(.[];
+        ((.in_reply_to_id // .id) == $root)
+        and ((.created_at // "") >= $floor)
+        and ((.user.login // "") as $login | ($agents | index($login)) != null)
+        and (((.body // "") | gsub("^[[:space:]]+"; "")) as $body
+          | ($body != "") and ($body | startswith("[mergepath-resolve:") | not)))
+    ' >/dev/null 2>&1
+}
+
+agent_reaction_on_finding() {
+  local finding_id="$1" floor="$2" reactions rc=0
+  reactions=$(fetch_api_array \
+    "repos/$REPO/pulls/comments/$finding_id/reactions" \
+    "reactions for inline finding $finding_id") || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  printf '%s' "$reactions" | jq -e --arg floor "$floor" --argjson agents "$AGENT_LOGINS_JSON" '
+    any(.[];
+      ((.user.login // "") as $login | ($agents | index($login)) != null)
+      and ((.content == "+1") or (.content == "-1"))
+      and ((.created_at // "") >= $floor))
+  ' >/dev/null 2>&1
+}
+
+FINDINGS='[]'
+while IFS= read -r finding; do
+  [ -n "$finding" ] || continue
+  root_id=$(printf '%s' "$finding" | jq -r '.root_id')
+  finding_id=$(printf '%s' "$finding" | jq -r '.finding_id')
+  floor=$(printf '%s' "$finding" | jq -r '.updated_at // .created_at')
+  reviewer=$(printf '%s' "$finding" | jq -r '.reviewer')
+  accounted=false
+  evidence=""
+  if agent_reply_after_finding "$root_id" "$floor"; then
+    accounted=true
+    evidence="thread-reply"
+  elif [ "$reviewer" = "$CODEX_BOT" ]; then
+    reaction_rc=0
+    agent_reaction_on_finding "$finding_id" "$floor" || reaction_rc=$?
+    case "$reaction_rc" in
+      0)
+        accounted=true
+        evidence="reaction"
+        ;;
+      1) ;;
+      *) die 2 "could not verify reactions for inline finding $finding_id" ;;
+    esac
+  fi
+  FINDINGS=$(printf '%s' "$FINDINGS" | jq -c \
+    --argjson f "$finding" --argjson accounted "$accounted" --arg evidence "$evidence" '
+      . + [($f + {
+        accounted: $accounted,
+        evidence: (if $evidence == "" then null else $evidence end)
+      })]
+    ')
+done <<EOF
+$(printf '%s' "$INLINE_CANDIDATES" | jq -c '.[]')
+EOF
+
+fingerprint() {
+  local out
+  if command -v sha256sum >/dev/null 2>&1; then
+    out=$(printf '%s' "$1" | sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then
+    out=$(printf '%s' "$1" | shasum -a 256)
+  else
+    die 2 "neither sha256sum nor shasum is available for acknowledgement fingerprints"
+  fi
+  printf '%s' "$out" | awk '{print substr($1, 1, 12)}'
+}
+
+review_ack_present() {
+  local token="$1" submitted_at="$2"
+  printf '%s' "$ISSUE_COMMENTS" | jq -e \
+    --arg token "$token" --arg submitted "$submitted_at" --argjson agents "$AGENT_LOGINS_JSON" '
+      any(.[];
+        ((.user.login // "") as $login | ($agents | index($login)) != null)
+        and ((.created_at // "") >= $submitted)
+        and (((.body // "") | gsub("\r"; "") | split("\n")) as $lines
+          | (($lines[0] // "") | sub("[ \t]+$"; "")) == $token
+          and (($lines[1:] | map(gsub("^[ \t]+|[ \t]+$"; ""))
+            | map(select(. != "")) | length) > 0)))
+    ' >/dev/null 2>&1
+}
+
+while IFS= read -r review; do
+  [ -n "$review" ] || continue
+  login=$(printf '%s' "$review" | jq -r '.user.login // ""')
+  case "$login" in
+    "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+    *) continue ;;
+  esac
+  # Hash the JSON string encoding rather than a shell command-substitution
+  # rendering. Command substitution strips trailing newlines; the JSON form
+  # preserves every body byte represented by GitHub, so a same-review edit at
+  # the end of the body invalidates the acknowledgement too.
+  body_json=$(printf '%s' "$review" | jq -c '.body // ""')
+  body=$(printf '%s' "$body_json" | jq -r '.')
+  tier=$(finding_tier "$login" "$body")
+  [ -n "$tier" ] || continue
+  review_id=$(printf '%s' "$review" | jq -r '.id')
+  submitted_at=$(printf '%s' "$review" | jq -r '.submitted_at // ""')
+  body_fingerprint=$(fingerprint "$body_json")
+  ack_token="[mergepath-review-ack: $review_id $body_fingerprint]"
+  accounted=false
+  evidence=""
+  if review_ack_present "$ack_token" "$submitted_at"; then
+    accounted=true
+    evidence="review-ack"
+  fi
+  finding=$(printf '%s' "$review" | jq -c \
+    --arg tier "$tier" --arg fingerprint "$body_fingerprint" \
+    --arg token "$ack_token" --argjson accounted "$accounted" --arg evidence "$evidence" '
+      {
+        kind: "review-body",
+        review_id: .id,
+        reviewer: (.user.login // ""),
+        tier: $tier,
+        created_at: (.submitted_at // ""),
+        commit_id: (.commit_id // null),
+        body_fingerprint: $fingerprint,
+        ack_token: $token,
+        body: (.body // ""),
+        accounted: $accounted,
+        evidence: (if $evidence == "" then null else $evidence end)
+      }
+    ')
+  FINDINGS=$(printf '%s' "$FINDINGS" | jq -c --argjson f "$finding" '. + [$f]')
+done <<EOF
+$(printf '%s' "$REVIEWS" | jq -c '.[]')
+EOF
+
+POSTED=$(printf '%s' "$FINDINGS" | jq 'length')
+ACCOUNTED=$(printf '%s' "$FINDINGS" | jq '[.[] | select(.accounted == true)] | length')
+MISSING_COUNT=$((POSTED - ACCOUNTED))
+MISSING=$(printf '%s' "$FINDINGS" | jq -c '[.[] | select(.accounted != true)]')
+STATUS=clear
+[ "$MISSING_COUNT" -eq 0 ] || STATUS=unaccounted
+
+RESULT=$(jq -c -n \
+  --arg status "$STATUS" --arg repo "$REPO" --argjson pr "$PR_NUMBER" \
+  --argjson posted "$POSTED" --argjson accounted "$ACCOUNTED" \
+  --argjson missing_count "$MISSING_COUNT" --argjson findings "$FINDINGS" \
+  --argjson missing "$MISSING" '
+    {
+      status: $status,
+      repo: $repo,
+      pr_number: $pr,
+      posted: $posted,
+      accounted: $accounted,
+      missing_count: $missing_count,
+      findings: $findings,
+      missing: $missing
+    }
+  ')
+
+if [ "$MISSING_COUNT" -gt 0 ]; then
+  echo "[review-feedback-accounting] $ACCOUNTED/$POSTED findings accounted; $MISSING_COUNT still undispositioned." >&2
+  printf '%s' "$MISSING" | jq -r --arg codex "$CODEX_BOT" '
+    .[] |
+    if .kind == "inline" then
+      if .reviewer == $codex then
+        "  - inline \(.reviewer) \(.tier) finding \(.finding_id) at \(.path):\(.line // "?"): reply on the thread or record the validated +1/-1 reaction"
+      else
+        "  - inline \(.reviewer) \(.tier) finding \(.finding_id) at \(.path):\(.line // "?"): post a substantive disposition reply on the thread"
+      end
+    else
+      "  - review-body \(.reviewer) \(.tier) finding in review \(.review_id): post a PR comment whose first line is\n      \(.ack_token)\n    with the fix/rebuttal/deferral rationale below it"
+    end
+  ' >&2
+fi
+
+printf '%s\n' "$RESULT"
+[ "$MISSING_COUNT" -eq 0 ] || exit 1
+exit 0

@@ -62,10 +62,10 @@ fi
 # its presence is misleading (suggests we have UI-resolve coverage
 # when we don't) and is the regression this PR closes.
 if [ -f "$WORKFLOW" ]; then
-  for trigger in pull_request pull_request_review pull_request_review_comment schedule; do
+  for trigger in pull_request pull_request_review pull_request_review_comment issue_comment schedule; do
     if ! grep -qE "^[[:space:]]*${trigger}:" "$WORKFLOW"; then
       echo "FAIL: $WORKFLOW missing required trigger: $trigger"
-      echo "      The gate must fire on push, review submission, inline-comment, AND on a periodic schedule (UI-resolve safety net)."
+      echo "      The gate must fire on push, review submission, inline comments, PR-level disposition comments, AND on a periodic schedule (UI-resolve safety net)."
       FAILED=1
     fi
   done
@@ -92,6 +92,19 @@ if [ -f "$WORKFLOW" ]; then
   ' "$WORKFLOW"; then
     echo "FAIL: $WORKFLOW schedule: block missing a 'cron:' entry."
     echo "      The schedule trigger needs a cron expression (e.g. '*/15 * * * *')."
+    FAILED=1
+  fi
+
+  # issue_comment runs are anchored to the default branch, not the PR head.
+  # The workflow must therefore publish the required check explicitly on the
+  # pull request's live head SHA instead of relying on the native job check.
+  if ! grep -F 'if [ "$EVENT_NAME" = "issue_comment" ]' "$WORKFLOW" >/dev/null \
+     || ! grep -F 'repos/$REPO/check-runs' "$WORKFLOW" >/dev/null \
+     || ! grep -F 'head_sha="$head_sha"' "$WORKFLOW" >/dev/null \
+     || ! grep -F 'CODEX_P1_EXPECTED_HEAD_SHA="$head_sha_before"' "$WORKFLOW" >/dev/null \
+     || ! grep -F 'if [ "$head_sha" != "$head_sha_before" ]' "$WORKFLOW" >/dev/null; then
+    echo "FAIL: $WORKFLOW does not publish issue_comment results on the PR head SHA."
+    echo "      Review-body acknowledgements must refresh the merge-relevant required check immediately."
     FAILED=1
   fi
 fi

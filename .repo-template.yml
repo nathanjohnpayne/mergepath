@@ -17,6 +17,8 @@ spec_test_map:
   coderabbit_review_sensing:
     - tests/test_coderabbit_wait_status_probe.sh
     - tests/test_phase_4b_automation.sh
+  review_feedback_accounting:
+    - tests/test_review_feedback_accounting.sh
   doc_ownership_validation:
     - tests/test_check_doc_ownership.sh
   # The publisher's fence and fixtures live in the merge-clearance suite

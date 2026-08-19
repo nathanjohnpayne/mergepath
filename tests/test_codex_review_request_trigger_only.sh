@@ -23,6 +23,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-trigger-only.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -493,6 +494,33 @@ test_wiring_missing_gate_fails_open() {
   [ "$FAIL" -ne "$before" ] || pass "J: missing gate helper fails open (soft-pass, posts the trigger)"
 }
 
+# O: undispositioned feedback blocks BEFORE the author-attributed trigger.
+test_feedback_accounting_blocks_trigger() {
+  local dir gate rc before=$FAIL
+  dir=$(make_case "feedback-unaccounted")
+  gate="$dir/feedback-accounting-stub.sh"
+  cat >"$gate" <<'EOF'
+#!/bin/sh
+printf '%s\n' '{"status":"unaccounted","posted":2,"accounted":1}'
+exit 1
+EOF
+  chmod +x "$gate"
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" \
+      GH_TOKEN=test-token \
+      CODEX_TEST_STATE_DIR="$dir/state" \
+      CODEX_TEST_SCENARIO=fresh \
+      MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$gate" \
+      ./scripts/codex-review-request.sh --trigger-only 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  rc=${rc:-0}
+  [ "$rc" = "6" ] || fail "O: expected feedback-unaccounted exit 6, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "O: accounting miss must block before @codex post"
+  [ "$FAIL" -ne "$before" ] || pass "O: unaccounted feedback exits 6 before a new @codex trigger"
+}
+
 # K: agent-review.yml marks its CodeRabbit-wait step as the automatic caller.
 # Parsed as YAML, not grepped: the claim is about the step's env binding, and a
 # text match cannot tell one step's env from another's.
@@ -531,6 +559,7 @@ test_gate_requires_boolean_carried
 test_wiring_auto_caller_honors_skip
 test_wiring_manual_caller_ignores_gate
 test_wiring_missing_gate_fails_open
+test_feedback_accounting_blocks_trigger
 test_workflow_declares_auto_trigger_flag
 
 echo "----"

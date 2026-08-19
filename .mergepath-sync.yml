@@ -441,6 +441,18 @@ paths:
       - "scripts/workflow/codex_auto_trigger_gate.sh"   # #798, content-free auto-trigger gate
       - "scripts/lib/gh-api-scalar.sh"   # #799, fail-closed scalar API reads
       - "scripts/lib/gh-api-array.sh"    # #1008, hard-sourced paginated list reads
+      - "scripts/review-feedback-accounting.sh"   # #1000, fail before another review round
+  # Complete-history reviewer-feedback accounting gate (#1000). Reads every
+  # paginated inline comment, review object, and PR-level comment; reconciles
+  # classified findings with finding-bound disposition evidence. It hard-
+  # sources the shared severity classifiers and travels with every caller.
+  - path: scripts/review-feedback-accounting.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/lib/preflight-helpers.sh"
+      - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
@@ -494,6 +506,7 @@ paths:
       # must refuse to ship the caller ahead of its runtime dependencies.
       - "scripts/coderabbit-wait.sh"
       - "scripts/codex-review-check.sh"
+      - "scripts/review-feedback-accounting.sh"   # #1000, no adapter dispatch over unread findings
       # Hard-sourced (#799): all four head resolutions in this orchestrator —
       # the initial --head default and the three drift re-reads around the
       # post-review issue filing and the review POST — route through
@@ -508,6 +521,9 @@ paths:
   - path: scripts/post-phase-4b-handoff.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/review-feedback-accounting.sh"   # #1000, gate manual reviewer dispatch too
+      - "scripts/lib/preflight-helpers.sh"
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all
@@ -519,6 +535,7 @@ paths:
     requires:
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/review-feedback-accounting.sh"   # #1000, top-level review-body CI backstop
   # CodeRabbit twin of codex-p1-gate.sh (#577). Run directly by
   # .github/workflows/coderabbit-severity-gate.yml and by scripts/ci/
   # check_coderabbit_severity_gate; sources the shared feedback-policy lib.
@@ -779,6 +796,12 @@ paths:
   # in pre-flight with `Missing required file`. Same #264/#266 coupling
   # class — surfaced again by the 024e0da propagation wave (#273).
   - path: tests/test_codex_p1_gate.sh
+    type: canonical
+    consumers: all
+  # Complete-history inline + review-body finding inventory, disposition
+  # evidence, pagination, API fail-closed behavior, and the four enforcement
+  # call sites (#1000). Hard-run by check_review_feedback_accounting.
+  - path: tests/test_review_feedback_accounting.sh
     type: canonical
     consumers: all
   # Pairs with scripts/coderabbit-severity-gate.sh + scripts/ci/
@@ -1328,6 +1351,10 @@ paths:
       - "tests/test_coderabbit_wait_codex_failover.sh"  # check_coderabbit_wait (#489/#521)
       - "tests/test_coderabbit_automerge_rate_limit_gate.sh"  # check_coderabbit_wait (#489/#521)
       - "tests/test_codex_p1_gate.sh"          # check_codex_p1_gate
+      - "tests/test_review_feedback_accounting.sh"  # check_review_feedback_accounting (#1000)
+      - "scripts/review-feedback-accounting.sh"  # check_review_feedback_accounting (#1000)
+      - "tests/test_post_phase_4b_handoff.sh"  # manual-dispatch accounting case (#1000)
+      - "scripts/post-phase-4b-handoff.sh"  # manual-dispatch accounting gate (#1000)
       - "tests/test_coderabbit_severity_gate.sh"  # check_coderabbit_severity_gate (#577)
       - "tests/test_feedback_policy_helpers.sh"  # check_feedback_policy_helpers (#576)
       - "tests/test_merge_clearance_gate.sh"   # check_merge_clearance_gate

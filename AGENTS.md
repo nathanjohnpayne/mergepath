@@ -79,6 +79,18 @@ This repository uses a multi-identity AI agent code review system. The full poli
 9. If the external reviewer flags observations or risks while approving, create a GitHub Issue for each one assigned to nathanjohnpayne with labels "post-review" and "observation" or "risk" before merging.
 10. Merge as nathanjohnpayne only after the merge gate and pre-merge review conversation gate are clean. Non-Dependabot auto-merge is opt-in only: it may merge PRs only with an `AUTHOR_MERGE_TOKEN` Actions secret that resolves to `nathanjohnpayne`; absent that secret, use `scripts/gh-as-author.sh -- gh pr merge ...`.
 
+### Review Feedback Accounting (#1000)
+
+Before requesting another Codex review, before dispatching Phase 4b, and immediately before merge, run `scripts/review-feedback-accounting.sh <PR#>` and require exit `0` with `posted == accounted`. The command reads every paginated inline comment and review object across all heads. A resolved thread, a prior-head finding, a `COMMENTED` review that never changes merge state, or a finding carried only in a top-level review body therefore cannot disappear from the checklist.
+
+`scripts/codex-review-request.sh` enforces this immediately before the author-attributed `@codex review` write; exit `6` means feedback is unaccounted and no trigger was posted. `scripts/phase-4b-review.sh` enforces it before the reviewer adapter; exit `7` means feedback is unaccounted, no reviewer round ran, and no manual handoff was rendered. Exit `7` is not one of Phase 4b's manual-fallback exits: disposition the named findings and rerun. `scripts/post-phase-4b-handoff.sh` enforces the same rule for the manual path and exits `4` without rendering when feedback is missing. `scripts/codex-p1-gate.sh` runs accounting default-on in every consumer; `codex.p1_gate.enabled` controls only its legacy current-HEAD thread scan.
+
+An inline finding needs a substantive finding-thread reply or the validated Codex `+1` / `-1` reaction after its latest raise or edit. Repo-local recorder ledgers remain required for analytics, but they are worktree-local and therefore are not standalone accounting evidence across the author, trusted-review, and CI checkouts. A classified top-level review-body finding is independent of that review's inline findings and uses the `[mergepath-review-ack: <review id> <body fingerprint>]` token printed by the accounting command, with the fix, rebuttal, or deferral rationale on following lines. Thread resolution alone does not count as reading or dispositioning a finding.
+
+Post Markdown through the identity-checked wrapper using `--body-file` (or an equivalent structured stdin/JSON payload). Never interpolate shell-sensitive Markdown such as backticks into a double-quoted `--body` argument. Re-read the posted GitHub object and rerun accounting; a command's zero exit or printed success count is not proof that the intended payload landed.
+
+This rule is additive to workflow steps 5–10 above and controls their sequencing: record per-finding evidence before a push can make a HEAD-pinned `--scan` miss the round, require accounting before any later review round, and merge only after accounting, the merge gate, and the zero-unresolved-thread gate are all clean. Full contract: [`specs/review_feedback_accounting.md`](specs/review_feedback_accounting.md).
+
 ### Disagreements
 
 If the internal reviewer and external reviewer disagree on whether code is ready to merge, the human is the tiebreaker. Surface both positions clearly and wait.

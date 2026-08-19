@@ -61,6 +61,9 @@
 #      scripts/wave-audit.sh all treat 4 as a reviewer that will not answer,
 #      and wave-audit proceeds fail-open on it — which would be wrong for a
 #      wait that clears on its own.
+#   7  FEEDBACK_UNACCOUNTED — an earlier reviewer finding has no durable
+#      disposition evidence. No adapter is dispatched and no handoff block is
+#      emitted. Account for every finding, then rerun this command (#1000).
 
 set -euo pipefail
 
@@ -447,6 +450,31 @@ if [ "$DRY_RUN" = true ]; then
 else
   run_same_head_barrier "pre-adapter"
 fi
+
+# Do not spend an external reviewer round while an earlier finding remains
+# unread or undispositioned. Unlike the provider-ordering barrier, this also
+# applies to dry-runs: invoking the reasoning adapter is the scarce action the
+# gate protects. The command override keeps the orchestrator hermetic in tests.
+FEEDBACK_ACCOUNTING_GATE="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-$ROOT/review-feedback-accounting.sh}"
+command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 \
+  || p4b_die 3 "review feedback accounting gate unavailable: $FEEDBACK_ACCOUNTING_GATE"
+FEEDBACK_ACCOUNTING_JSON=""
+FEEDBACK_ACCOUNTING_RC=0
+FEEDBACK_ACCOUNTING_JSON=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO") \
+  || FEEDBACK_ACCOUNTING_RC=$?
+case "$FEEDBACK_ACCOUNTING_RC" in
+  0)
+    p4b_log "review feedback accounting clear"
+    ;;
+  1)
+    printf '%s\n' "$FEEDBACK_ACCOUNTING_JSON" >&2
+    p4b_die 7 "review feedback is unaccounted; disposition every finding before Phase 4b dispatch"
+    ;;
+  *)
+    printf '%s\n' "$FEEDBACK_ACCOUNTING_JSON" >&2
+    p4b_die 3 "review feedback accounting gate failed with exit $FEEDBACK_ACCOUNTING_RC"
+    ;;
+esac
 
 # --- run the adapter (reasoning plane; never posts) ------------------------
 ADAPTER_ARGS=( --pr "$PR" )
