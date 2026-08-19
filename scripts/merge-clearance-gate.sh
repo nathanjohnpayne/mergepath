@@ -154,6 +154,18 @@ fi
 # shellcheck source=lib/reviewers-helpers.sh
 . "$SCRIPT_DIR/lib/reviewers-helpers.sh"
 
+# Shared paginated-list reader (#1008) — the fetch → capture → flatten
+# algorithm fetch_api_array below used to carry inline, alongside seven other
+# copies. Hard-required for the same reason reviewers-helpers is: the reviews
+# and PR-files reads are fail-closed gate inputs, and an undefined reader
+# would surface as `command not found` rather than as a decision.
+if [ ! -r "$SCRIPT_DIR/lib/gh-api-array.sh" ]; then
+  echo "ERROR: gh-api-array helper missing: $SCRIPT_DIR/lib/gh-api-array.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$SCRIPT_DIR/lib/gh-api-array.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --derive-external-requiredness (#620/#630): QUERY mode. Runs the same
@@ -311,11 +323,12 @@ clear_pass() {  # <reason>
   exit 0
 }
 
+# Paginated fetch helper. The algorithm lives in scripts/lib/gh-api-array.sh
+# (#1008); what stays here is this gate's failure ACTION — `die 2`, the
+# documented config/usage code, so an unreadable reviews or files read can
+# never weaken the gate by reading as an empty list.
 fetch_api_array() {  # <endpoint> <label>
-  local endpoint=$1 label=$2 raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || die 2 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
-    || die 2 "failed to flatten $label pagination output"
+  gh_api_array "$1" "$2" || die 2 "$GH_API_ARRAY_ERROR"
 }
 
 # --- merge-clearance required-check enforcement probe (#772) ----------------
