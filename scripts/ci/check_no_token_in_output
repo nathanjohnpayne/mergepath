@@ -334,6 +334,12 @@ EMITTER_COMMANDS="echo printf"
 # Pure awk so this runs before any tool install, on bash 3.2, with no
 # single-quote characters in the program (SQ is built with sprintf) so the
 # whole thing can live inside a single-quoted shell string.
+#
+# One naming constraint that is not obvious and cost a self-test failure:
+# `exp` is an awk BUILT-IN function, so it cannot be a local variable name.
+# BSD awk rejects the program outright ("bailing out"), the check exits 2,
+# and — because it fails closed — the self-test reports it rather than
+# passing a broken scanner. Locals here are named `edepth` and the like.
 # ─────────────────────────────────────────────────────────────────────────
 read -r -d '' SCANNER <<'AWK_PROGRAM' || true
 BEGIN {
@@ -439,8 +445,8 @@ function ends_odd_backslash(s,   n) {
 # run escapes itself (`echo x \\` prints a backslash and ends the command),
 # a backslash inside a single-quoted span is literal, and one after an
 # unquoted `#` is inside a comment, which the shell drops at the newline.
-function ends_continuation(s,   i, n, c, q, esc, prev) {
-  n = length(s); q = ""; esc = 0
+function ends_continuation(s,   i, n, c, q, esc, prev, edepth) {
+  n = length(s); q = ""; esc = 0; edepth = 0
   for (i = 1; i <= n; i++) {
     c = substr(s, i, 1)
     if (q == SQ) { if (c == SQ) q = ""; continue }
@@ -449,7 +455,13 @@ function ends_continuation(s,   i, n, c, q, esc, prev) {
     if (q == "\"") { if (c == "\"") q = ""; continue }
     if (c == SQ)   { q = SQ; continue }
     if (c == "\"") { q = "\""; continue }
-    if (c == "#") {
+    # Same parameter-expansion rule comment_at() applies: a `#` inside
+    # `${...}` is not a comment, so it must not end the logical line either.
+    # Keeping the two walks in step is the point — a divergence would split a
+    # logical line here that the scan reads as whole.
+    if (c == "$" && substr(s, i + 1, 1) == "{") { edepth++; i++; continue }
+    if (c == "}" && edepth > 0) { edepth--; continue }
+    if (c == "#" && edepth == 0) {
       prev = (i == 1) ? " " : substr(s, i - 1, 1)
       if (prev ~ /[[:space:];&|(]/) return 0
     }
@@ -603,8 +615,8 @@ function exempt(line,   c) {
 # walks are kept separate because they answer different questions — this one
 # reports WHERE the comment begins, that one only needs to stop when it
 # meets one.
-function comment_at(s,   i, n, c, q, esc, prev) {
-  n = length(s); q = ""; esc = 0
+function comment_at(s,   i, n, c, q, esc, prev, edepth) {
+  n = length(s); q = ""; esc = 0; edepth = 0
   for (i = 1; i <= n; i++) {
     c = substr(s, i, 1)
     if (q == SQ) { if (c == SQ) q = ""; continue }
@@ -613,7 +625,14 @@ function comment_at(s,   i, n, c, q, esc, prev) {
     if (q == "\"") { if (c == "\"") q = ""; continue }
     if (c == SQ)   { q = SQ; continue }
     if (c == "\"") { q = "\""; continue }
-    if (c == "#") {
+    # `${...}` is a parameter expansion, not a command context: bash does NOT
+    # start a comment at a `#` inside one, so
+    # `echo "$PAT" ${UNSET:+ # TOKEN_OUTPUT_EXEMPT: x}` prints the value while
+    # carrying what LOOKS like a pragma. Reported by CodeRabbit on #1012
+    # against comment_at itself, one round after comment_at was introduced.
+    if (c == "$" && substr(s, i + 1, 1) == "{") { edepth++; i++; continue }
+    if (c == "}" && edepth > 0) { edepth--; continue }
+    if (c == "#" && edepth == 0) {
       prev = (i == 1) ? " " : substr(s, i - 1, 1)
       if (prev ~ /[[:space:];&|(]/) return i
     }
@@ -1093,6 +1112,10 @@ GH_STUB"
   # pragma has to live in, so quote state is load-bearing in exempt() too.
   assert_flagged "a hash inside a quoted argument does not open an exemption comment" \
     'echo "# TOKEN_OUTPUT_EXEMPT: not a comment" "$GH_TOKEN"'
+  # ...nor does one inside a `${...}` expansion, which is not a command
+  # context: bash prints the value and the marker only LOOKS like a pragma.
+  assert_flagged "a hash inside a parameter expansion is not an exemption comment" \
+    'echo "$GH_TOKEN" ${UNSET:+ # TOKEN_OUTPUT_EXEMPT: bypass}'
   # A presence-only helper whose alternate carries its OWN expansion emits
   # the value, so it is an emitter — this pins the constant half of the
   # redactor rule below and stops it widening into any `${1:+...}` at all.
