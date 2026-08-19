@@ -170,6 +170,55 @@ jobs:
       - name: check_ci_scripts_wired
         run: ./scripts/ci/check_ci_scripts_wired || { rc=$?; if [ ! -f scripts/ci/check_ci_scripts_wired ]; then echo "check_ci_scripts_wired not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # The reverse of check_ci_scripts_wired: that one enforces script → wire,
+      # this one enforces wire → script. It is deliberately INLINE rather than
+      # a scripts/ci/ check, and gated on the hub marker rather than on the
+      # kit. Every soft-pass tail above exits 0 when its backing script is
+      # gone, so any assertion that lives inside the kit can be retired by
+      # deleting the very file it was supposed to notice was missing — the
+      # mechanism would then validate its own removal. This step cannot be:
+      # scripts/sync-to-downstream.sh is hub-only and is NOT part of the
+      # scripts/ci/ kit, so on the hub a wired name with no file is a hard
+      # failure even if the whole kit is deleted, while a consumer that
+      # skipped the kit still passes. Pure-bash; the awk is the same
+      # comment-stripping, `run:`-anchored extraction the wired guard uses,
+      # so a check named only in a comment is not mistaken for a wire.
+      - name: check_ci_kit_integrity
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/sync-to-downstream.sh ]; then
+            echo "check_ci_kit_integrity: SKIP (consumer checkout — the scripts/ci kit is optional here)"
+            exit 0
+          fi
+          missing=0
+          wired=$(awk '
+            {
+              sub(/[[:space:]]*#.*$/, "")
+              if (match($0, /^[[:space:]]*run:[[:space:]]*\.\/scripts\/ci\/check_[A-Za-z0-9_]+/)) {
+                line = substr($0, RSTART, RLENGTH)
+                sub(/^[[:space:]]*run:[[:space:]]*\.\/scripts\/ci\//, "", line)
+                print line
+              }
+            }
+          ' .github/workflows/repo_lint.yml | LC_ALL=C sort -u)
+          if [ -z "$wired" ]; then
+            echo "FAIL: no wired scripts/ci checks found in repo_lint.yml (extraction broken?)" >&2
+            exit 1
+          fi
+          # Check names are [A-Za-z0-9_] by construction above, so plain word
+          # splitting is safe and keeps the loop in the current shell (a pipe
+          # would run it in a subshell and lose "missing").
+          for name in $wired; do
+            if [ ! -f "scripts/ci/$name" ]; then
+              echo "FAIL: repo_lint.yml wires $name but scripts/ci/$name does not exist on the hub — the missing-script soft-pass would swallow it silently" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "check_ci_kit_integrity: PASS ($(printf '%s\n' "$wired" | wc -l | tr -d ' ') wired checks all resolve to a file)"
+
       - name: check_required_root_files
         run: ./scripts/ci/check_required_root_files || { rc=$?; if [ ! -f scripts/ci/check_required_root_files ]; then echo "check_required_root_files not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 

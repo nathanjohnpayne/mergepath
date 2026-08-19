@@ -348,33 +348,41 @@ doc = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: false)
 abort('workflow did not parse as a mapping') unless doc.is_a?(Hash)
 bodies = ARGV.fetch(1)
 FileUtils.mkdir_p(bodies)
-idx = 0
+# `pos` is the step's ORDINAL in the job, counted over every step carrying a
+# run: body. It is what lets the caller assert ORDERING — a setup step that
+# makes the kit executable is only useful if it runs BEFORE the first check
+# wire, and Actions runs steps in document order.
+pos = 0
+first_wire = nil
 (doc['jobs'] || {}).each_value do |job|
   next unless job.is_a?(Hash)
   (job['steps'] || []).each do |step|
     next unless step.is_a?(Hash)
     run = step['run']
     next unless run.is_a?(String)
+    pos += 1
     wire = run.match(%r{\A\./scripts/ci/(check_[A-Za-z0-9_]+)})
     if run.include?("\n")
       # A multi-line body invoking a kit check would escape the single-line
       # matcher below and go unguarded. Report it; the caller fails on it.
       puts "MULTILINE\t#{step['name']}\t" if run =~ %r{\./scripts/ci/check_[A-Za-z0-9_]+}
     elsif wire
+      first_wire = pos if first_wire.nil?
       puts "STEP\t#{wire[1]}\t#{run}"
       next
     end
     # Any step that touches the kit path WITHOUT being a check wire is a
     # setup step: it runs ahead of the guarded checks, so if it dies on a
     # kit-less consumer none of their soft-pass tails is ever reached. The
-    # body can be multi-line, so it travels via a file rather than the TSV.
+    # body can be multi-line, so it travels via a file rather than the TSV;
+    # the body file is named by `pos`, so the row carries its own ordinal.
     next if wire
     next unless run.include?('scripts/ci')
-    idx += 1
-    File.write(File.join(bodies, idx.to_s), run)
-    puts "SETUP\t#{step['name']}\t#{idx}"
+    File.write(File.join(bodies, pos.to_s), run)
+    puts "SETUP\t#{step['name']}\t#{pos}"
   end
 end
+puts "FIRSTWIRE\t\t#{first_wire}" unless first_wire.nil?
 RB
 
 if ! ruby "$GUARD_DIR/extract.rb" "$ROOT/.github/workflows/repo_lint.yml" \
@@ -506,24 +514,39 @@ while IFS=$'\t' read -r kind stepname bodyid; do
   fi
 done <"$GUARD_DIR/steps.tsv"
 
+FIRST_WIRE_POS="$(awk -F'\t' '$1 == "FIRSTWIRE" { print $3 }' "$GUARD_DIR/steps.tsv")"
+
 if [ "$SETUP_SEEN" -eq 0 ]; then
   fail "#979 setup: no non-check step referencing scripts/ci/ was found in repo_lint.yml — the kit is made executable somewhere, so this enumeration has gone stale and stopped covering it"
+elif [ -z "$FIRST_WIRE_POS" ]; then
+  fail "#979 setup: the parser found no check wire at all, so step ORDER cannot be established (extraction is stale)"
 else
+  # ORDER matters, not just presence. Actions runs steps in document order, so
+  # a setup step that makes the kit executable is only doing its job if it
+  # runs BEFORE the first check wire — move it below them and production
+  # fails at the first check with rc 126 while a presence-only probe still
+  # goes green. Replay ONLY the setup steps that precede the first wire, and
+  # require the kit to be executable after them.
   rm -rf "$GUARD_DIR/populated"
   mkdir -p "$GUARD_DIR/populated/scripts/ci"
   printf '#!/bin/sh\nexit 0\n' >"$GUARD_DIR/populated/scripts/ci/check_probe"
   chmod 644 "$GUARD_DIR/populated/scripts/ci/check_probe"
   setup_ok=1
+  PRE_WIRE_SETUP=0
   while IFS=$'\t' read -r kind _stepname bodyid; do
     [ "$kind" = "SETUP" ] || continue
+    [ "$bodyid" -lt "$FIRST_WIRE_POS" ] || continue
+    PRE_WIRE_SETUP=$((PRE_WIRE_SETUP + 1))
     if ! guard_run "$GUARD_DIR/populated" "$(cat "$GUARD_DIR/bodies/$bodyid")"; then
       setup_ok=0
     fi
   done <"$GUARD_DIR/steps.tsv"
-  if [ "$setup_ok" -eq 1 ] && [ -x "$GUARD_DIR/populated/scripts/ci/check_probe" ]; then
-    pass "#979 setup: the $SETUP_SEEN kit-touching setup step(s) still make a populated scripts/ci/ executable"
+  if [ "$PRE_WIRE_SETUP" -eq 0 ]; then
+    fail "#979 setup: no kit-touching setup step runs BEFORE the first check wire (first wire is step $FIRST_WIRE_POS) — the checks would execute against a non-executable kit and fail with rc 126"
+  elif [ "$setup_ok" -eq 1 ] && [ -x "$GUARD_DIR/populated/scripts/ci/check_probe" ]; then
+    pass "#979 setup: the $PRE_WIRE_SETUP setup step(s) ahead of the first check wire make a populated scripts/ci/ executable"
   else
-    fail "#979 setup: after running the kit-touching setup step(s) on a POPULATED tree, scripts/ci/check_probe is not executable — the kit-less guard must not cost the step its actual job"
+    fail "#979 setup: after running the pre-wire setup step(s) on a POPULATED tree, scripts/ci/check_probe is not executable — the kit-less guard must not cost the step its actual job"
   fi
 fi
 
