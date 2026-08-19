@@ -407,7 +407,7 @@ ack_present() {
     --arg token "$token" --arg raised "$raised_at" --argjson agents "$AGENT_LOGINS_JSON" '
       any(.[];
         ((.user.login // "") as $login | ($agents | index($login)) != null)
-        and ((.created_at // "") >= $raised)
+        and ((.created_at // "") > $raised)
         and (((.body // "") | gsub("\r"; "") | split("\n")) as $lines
           | (($lines[0] // "") | sub("[ \t]+$"; "")) == $token
           and (($lines[1:] | join(" ")

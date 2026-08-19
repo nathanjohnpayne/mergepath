@@ -878,10 +878,16 @@ COMMENT_ACK_TOKEN="$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')"
 assert_match '^\[mergepath-comment-ack: 8000 [0-9a-f]{12}\]$' "$COMMENT_ACK_TOKEN" "PR-level remediation token is comment and content pinned"
 jq --arg token "$COMMENT_ACK_TOKEN" '. + [{
   "id": 8001,
-  "created_at": "2026-08-18T22:21:00Z",
+  "created_at": "2026-08-18T22:20:00Z",
+  "updated_at": "2026-08-18T22:20:00Z",
   "user": {"login": "nathanpayne-codex"},
   "body": ($token + "\nFixed the summary-only finding in abc1234.")
 }]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "same-second PR-level acknowledgement cannot prove it followed the latest raise"
+jq 'map(if .id == 8001 then .created_at = "2026-08-18T22:21:00Z" | .updated_at = "2026-08-18T22:21:00Z" else . end)' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
 mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 0 "$RUN_RC" "PR-level bot acknowledgement with rationale reconciles"
@@ -930,6 +936,21 @@ printf '%s\n' "$ARCHIVE_MARKER" >"$PREVIOUS_ARCHIVE"
 RESTORED_ARCHIVE=$($RENDER_ARCHIVE issue-comment 8002 'github-actions[bot]' \
   '2026-08-18T22:23:02Z' "$PREVIOUS_ARCHIVE")
 assert_eq "$ARCHIVE_MARKER" "$RESTORED_ARCHIVE" "archive-marker mutation re-emits the immutable history record"
+
+# Relay terminal markers are themselves the durable safety record for a
+# read-only source run. Deleting either status must restore the exact marker;
+# otherwise the relay can evaluate while the failed/pending state is absent.
+for relay_status in failed complete; do
+  RELAY_MARKER="<!-- mergepath-feedback-archive-relay:v1 run=12345 status=$relay_status -->"
+  printf '%s\n' "$RELAY_MARKER" >"$PREVIOUS_ARCHIVE"
+  RESTORED_RELAY_MARKER=$($RENDER_ARCHIVE issue-comment 8002 'github-actions[bot]' \
+    '2026-08-18T22:23:03Z' "$PREVIOUS_ARCHIVE")
+  assert_eq "$RELAY_MARKER" "$RESTORED_RELAY_MARKER" "relay $relay_status marker mutation re-emits the terminal record"
+done
+printf '%s\n' "$RELAY_MARKER" >"$PREVIOUS_ARCHIVE"
+SPOOFED_RELAY_RESTORE=$($RENDER_ARCHIVE issue-comment 8002 nathanjohnpayne \
+  '2026-08-18T22:23:03Z' "$PREVIOUS_ARCHIVE")
+assert_eq "" "$SPOOFED_RELAY_RESTORE" "non-Actions relay marker cannot be promoted into a trusted record"
 
 jq -n --arg archive "$ARCHIVE_MARKER" --arg token "$EXPECTED_ARCHIVE_ACK" '[
   {

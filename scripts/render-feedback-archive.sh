@@ -34,14 +34,18 @@ esac
 [ -n "$ARCHIVED_AT" ] || { echo "render-feedback-archive: archived timestamp is required" >&2; exit 2; }
 [ -r "$PREVIOUS_BODY_FILE" ] || { echo "render-feedback-archive: previous body is unreadable" >&2; exit 2; }
 
-# An archive comment is itself part of the immutable history surface. If that
-# comment is edited or deleted, the issue_comment event gives us its previous
-# exact body. Re-emit a single valid record byte-for-byte so the workflow can
-# restore it instead of silently dropping the only durable copy.
-if awk '
+# Archive and relay-terminal comments are themselves part of the immutable
+# history surface. If github-actions[bot]'s record is edited or deleted, the
+# issue_comment event gives us its previous exact body. Re-emit a single valid
+# record byte-for-byte so the workflow can restore it instead of silently
+# dropping the only durable copy. Never promote a lookalike from another login
+# into a trusted Actions-authored record.
+if [ "$SOURCE_LOGIN" = 'github-actions[bot]' ] && awk '
   NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+\/=]+ -->$/ \
     { record=$0; next }
   NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]{64} part=[0-9]+\/[0-9]+ data=[A-Za-z0-9+\/=]+ -->$/ \
+    { record=$0; next }
+  NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive-relay:v1 run=[0-9]+ status=(complete|failed) -->$/ \
     { record=$0; next }
   { extra=1 }
   END { if (record != "" && !extra) print record; else exit 1 }
