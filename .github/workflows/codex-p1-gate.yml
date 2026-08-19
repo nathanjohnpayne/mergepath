@@ -76,9 +76,10 @@ jobs:
   archive-edited-feedback:
     name: Archive edited reviewer feedback
     if: >-
-      ((github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
+      ((((github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
       github.event_name == 'pull_request_review_comment') &&
-      (github.event.action == 'edited' || github.event.action == 'deleted')
+      (github.event.action == 'edited' || github.event.action == 'deleted')) ||
+      (github.event_name == 'pull_request_review' && github.event.action == 'edited'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -105,19 +106,29 @@ jobs:
             issue_comment)
               pr=$(jq -r '.issue.number' <<<"$EVENT_JSON")
               source_kind=issue-comment
+              source_id=$(jq -r '.comment.id' <<<"$EVENT_JSON")
+              source_login=$(jq -r '.comment.user.login // ""' <<<"$EVENT_JSON")
+              archived_at=$(jq -r '.comment.updated_at // .comment.created_at // ""' <<<"$EVENT_JSON")
               ;;
             pull_request_review_comment)
               pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
               source_kind=inline
+              source_id=$(jq -r '.comment.id' <<<"$EVENT_JSON")
+              source_login=$(jq -r '.comment.user.login // ""' <<<"$EVENT_JSON")
+              archived_at=$(jq -r '.comment.updated_at // .comment.created_at // ""' <<<"$EVENT_JSON")
+              ;;
+            pull_request_review)
+              pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
+              source_kind=review-body
+              source_id=$(jq -r '.review.id' <<<"$EVENT_JSON")
+              source_login=$(jq -r '.review.user.login // ""' <<<"$EVENT_JSON")
+              archived_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
               ;;
             *)
               echo "::error::Unsupported archive event: $EVENT_NAME"
               exit 1
               ;;
           esac
-          source_id=$(jq -r '.comment.id' <<<"$EVENT_JSON")
-          source_login=$(jq -r '.comment.user.login // ""' <<<"$EVENT_JSON")
-          archived_at=$(jq -r '.comment.updated_at // .comment.created_at // ""' <<<"$EVENT_JSON")
           previous_file=$(mktemp "${RUNNER_TEMP}/feedback-previous.XXXXXX")
           payload_file=$(mktemp "${RUNNER_TEMP}/feedback-archive-payload.XXXXXX")
           trap 'rm -f "$previous_file" "$payload_file"' EXIT
@@ -136,13 +147,13 @@ jobs:
           existing=$(gh api --paginate "repos/$REPO/issues/$pr/comments" | jq -s 'add // []')
           if jq -e --arg body "$archive_record" 'any(.[]; (.body // "") == $body)' \
             <<<"$existing" >/dev/null; then
-            echo "Feedback version already archived for comment $source_id."
+            echo "Feedback version already archived for $source_kind $source_id."
             exit 0
           fi
           jq -n --arg body "$archive_record" '{body:$body}' >"$payload_file"
           gh api --method POST "repos/$REPO/issues/$pr/comments" \
             --input "$payload_file" >/dev/null
-          echo "Archived the prior reviewer-feedback version for comment $source_id."
+          echo "Archived the prior reviewer-feedback version for $source_kind $source_id."
 
   codex-p1-gate:
     name: Codex P1 unresolved threads

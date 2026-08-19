@@ -133,17 +133,21 @@ if archive.is_a?(Hash)
   require_shape.call(
     archive_if.include?("github.event_name == 'issue_comment'") &&
       archive_if.include?("github.event_name == 'pull_request_review_comment'") &&
+      archive_if.include?("(github.event_name == 'pull_request_review' && github.event.action == 'edited')") &&
       archive_if.include?("github.event.action == 'edited'") &&
       archive_if.include?("github.event.action == 'deleted'"),
-    "archive-edited-feedback does not cover edited/deleted PR-level and inline comments"
+    "archive-edited-feedback does not cover edited/deleted comments and edited review bodies"
   )
   archive_run = Array(archive["steps"]).map { |step| step["run"] }.compact.find do |run|
     run.include?("scripts/render-feedback-archive.sh")
   end
   require_shape.call(!archive_run.nil?, "archive-edited-feedback does not invoke the archive renderer")
   require_shape.call(
-    archive_run&.include?("mergepath-feedback-archive:v1") && archive_run&.include?("source_kind"),
-    "archive-edited-feedback does not bind source kind and the v1 marker to the renderer step"
+    archive_run&.include?("mergepath-feedback-archive:v1") &&
+      archive_run&.include?("source_kind=review-body") &&
+      archive_run&.include?(".review.id") &&
+      archive_run&.include?(".changes.body.from"),
+    "archive-edited-feedback does not bind comment and review-body sources to the v1 renderer"
   )
 end
 

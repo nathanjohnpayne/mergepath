@@ -1220,7 +1220,7 @@ paths:
     # `command not found` for every PR in the consumer.
     requires:
       - "scripts/codex-p1-gate.sh"
-      - "scripts/render-feedback-archive.sh"   # #1000, persist edited/deleted PR-level and inline findings
+      - "scripts/render-feedback-archive.sh"   # #1000, persist edited/deleted PR-level, inline, and review-body findings
       - "scripts/review-feedback-surface-fingerprint.sh"   # #1000, reject stale publications
   - path: .github/workflows/coderabbit-severity-gate.yml
     type: canonical

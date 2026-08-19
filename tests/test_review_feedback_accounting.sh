@@ -675,6 +675,70 @@ mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
 run_gate
 assert_eq 1 "$RUN_RC" "editing a review body invalidates its prior acknowledgement"
 
+PREVIOUS_REVIEW="$TMP/previous-review.txt"
+cat >"$PREVIOUS_REVIEW" <<'EOF'
+### Codex Review
+
+![P1 Badge] Review-body finding removed by a later edit.
+EOF
+set +e
+REVIEW_ARCHIVE=$("$RENDER_ARCHIVE" review-body 900 'chatgpt-codex-connector[bot]' \
+  '2026-08-18T22:12:00Z' "$PREVIOUS_REVIEW")
+REVIEW_ARCHIVE_RC=$?
+set -e
+assert_eq 0 "$REVIEW_ARCHIVE_RC" "review-body archive renderer accepts an edited review source"
+REVIEW_ARCHIVE_DATA=$(printf '%s' "$REVIEW_ARCHIVE" \
+  | sed -E 's/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/' \
+  | jq -Rr '@base64d | fromjson')
+assert_eq review-body "$(printf '%s' "$REVIEW_ARCHIVE_DATA" | jq -r '.source_kind')" "review archive preserves its source surface"
+REVIEW_ARCHIVE_FINGERPRINT=$(printf '%s' "$REVIEW_ARCHIVE_DATA" | jq -r '.body_fingerprint')
+EXPECTED_REVIEW_ARCHIVE_ACK="[mergepath-review-ack: 900 $REVIEW_ARCHIVE_FINGERPRINT]"
+
+reset_fixtures
+cat >"$TMP/fixtures/reviews.json" <<'JSON'
+[
+  {
+    "id": 900,
+    "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "submitted_at": "2026-08-18T22:00:00Z",
+    "state": "COMMENTED",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "body": "### Codex Review\n\nNo findings remain."
+  }
+]
+JSON
+jq -n --arg archive "$REVIEW_ARCHIVE" --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" '[
+  {
+    "id": 902,
+    "created_at": "2026-08-18T22:11:00Z",
+    "updated_at": "2026-08-18T22:11:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": ($token + "\nDisposition posted before the review-body edit.")
+  },
+  {
+    "id": 903,
+    "created_at": "2026-08-18T22:12:01Z",
+    "updated_at": "2026-08-18T22:12:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }
+]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "edited review-body finding remains in the accounting inventory"
+assert_eq review-body-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "edited review body is identified as archived feedback"
+assert_eq "$EXPECTED_REVIEW_ARCHIVE_ACK" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')" "archived review body retains the review acknowledgement channel"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "pre-edit acknowledgement cannot clear an archived review-body finding"
+jq --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" '. + [{
+  "id": 904,
+  "created_at": "2026-08-18T22:13:00Z",
+  "updated_at": "2026-08-18T22:13:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nDispositioned the archived review-body finding after its edit.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-edit acknowledgement reconciles archived review-body feedback"
+
 reset_fixtures
 cat >"$TMP/fixtures/issues.json" <<'JSON'
 [

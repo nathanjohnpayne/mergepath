@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render a compact, GitHub-visible history record for an edited/deleted
-# PR-level or inline reviewer comment. The workflow owns the write; this
-# helper is pure.
+# PR-level comment, inline comment, or top-level review body. The workflow
+# owns the write; this helper is pure.
 
 set -euo pipefail
 
@@ -12,22 +12,22 @@ HELPERS="$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
 . "$HELPERS"
 
 if [ "$#" -ne 5 ]; then
-  echo "usage: $0 SOURCE_KIND SOURCE_COMMENT_ID SOURCE_LOGIN ARCHIVED_AT PREVIOUS_BODY_FILE" >&2
+  echo "usage: $0 SOURCE_KIND SOURCE_ID SOURCE_LOGIN ARCHIVED_AT PREVIOUS_BODY_FILE" >&2
   exit 2
 fi
 
 SOURCE_KIND="$1"
-SOURCE_COMMENT_ID="$2"
+SOURCE_ID="$2"
 SOURCE_LOGIN="$3"
 ARCHIVED_AT="$4"
 PREVIOUS_BODY_FILE="$5"
 
 case "$SOURCE_KIND" in
-  issue-comment|inline) ;;
-  *) echo "render-feedback-archive: source kind must be issue-comment or inline" >&2; exit 2 ;;
+  issue-comment|inline|review-body) ;;
+  *) echo "render-feedback-archive: source kind must be issue-comment, inline, or review-body" >&2; exit 2 ;;
 esac
-case "$SOURCE_COMMENT_ID" in
-  ''|*[!0-9]*) echo "render-feedback-archive: source comment id must be an integer" >&2; exit 2 ;;
+case "$SOURCE_ID" in
+  ''|*[!0-9]*) echo "render-feedback-archive: source id must be an integer" >&2; exit 2 ;;
 esac
 [ -n "$SOURCE_LOGIN" ] || { echo "render-feedback-archive: source login is required" >&2; exit 2; }
 [ -n "$ARCHIVED_AT" ] || { echo "render-feedback-archive: archived timestamp is required" >&2; exit 2; }
@@ -64,7 +64,7 @@ fi
 
 PAYLOAD=$(jq -nc \
   --arg source_kind "$SOURCE_KIND" \
-  --argjson source_comment_id "$SOURCE_COMMENT_ID" \
+  --argjson source_comment_id "$SOURCE_ID" \
   --arg source_login "$SOURCE_LOGIN" \
   --arg archived_at "$ARCHIVED_AT" \
   --arg body_fingerprint "$BODY_FINGERPRINT" \
