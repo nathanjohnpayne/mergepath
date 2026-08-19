@@ -3452,7 +3452,7 @@ rcp_dir_case native-producer \
 # it is the one an assertion scoped to a job inside the file cannot see.
 rcp_dir_case native-producer-absent \
   'rm -f codex-p1-gate.yml' \
-  fail 'is missing. It is the unconditional'
+  fail 'is missing. It owns a required'
 # A gate workflow that does not parse produces nothing at all; silently
 # skipping it would report a producer the repo does not have.
 rcp_dir_case native-producer-unparseable \
@@ -3469,8 +3469,14 @@ rcp_dir_case native-producer-unparseable \
 # nothing about name drift. Caught only after the needle was sharpened to
 # the branch's own message, which is the argument for sharpening them.
 rcp_dir_case native-producer-name-drift \
-  'perl -0777 -i -pe "s{^(  codex-p1-gate:\n    name: )Codex P1 unresolved threads\$}{\$1Something Else}m" codex-p1-gate.yml' \
+  'perl -0777 -i -pe "s{Codex P1 fork archive handoff}{Something Else}" codex-p1-gate.yml' \
   fail 'reports as'
+# The conditional name reads an output from archive-edited-feedback. Keeping
+# the string while dropping `needs` makes the expression unresolved rather
+# than safely selecting the fork handoff name.
+rcp_dir_case native-producer-needs-drift \
+  'perl -0777 -i -pe "s{needs: \[archive-edited-feedback\]}{needs: []}" codex-p1-gate.yml' \
+  fail 'does not need'
 
 # The A7 observer fixture is REMOVED because the assertion it exercised was
 # wrong, not merely under-powered. GitHub documents the cap as three levels
