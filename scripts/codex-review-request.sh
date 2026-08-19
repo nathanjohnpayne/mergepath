@@ -238,6 +238,19 @@ fi
 # shellcheck source=lib/gh-api-scalar.sh
 . "$__CODEX_REQUEST_DIR/lib/gh-api-scalar.sh"
 
+# --- paginated LIST reads that must fail closed (#1008) ---------------------
+# The array twin of the scalar reader above, and hard-required for the same
+# reason: every signal this script scans for — reviews, inline comments,
+# reactions, issue comments, the timeline — arrives through it, and an
+# undefined reader would surface as `command not found` on all of them.
+# Declared as a `requires:` of this script in .mergepath-sync.yml.
+if [ ! -r "$__CODEX_REQUEST_DIR/lib/gh-api-array.sh" ]; then
+  echo "[codex-review-request] ERROR: missing helper: $__CODEX_REQUEST_DIR/lib/gh-api-array.sh (see #1008)" >&2
+  exit 3
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$__CODEX_REQUEST_DIR/lib/gh-api-array.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # #489: --trigger-only posts (or confirms) the @codex review trigger and
@@ -578,66 +591,20 @@ die() {
 # this contract fix is about, pointed the other way: a swallowed failure
 # lies about a bad read, a merged stderr stream lies about a good one.
 # Only stdout reaches jq; stderr is kept solely for the diagnostic.
+#
+# That separation, and the algorithm around it, now live in
+# scripts/lib/gh-api-array.sh (#1008). This file's copy was the ONLY one of the
+# eight that had it, so extracting it is what finally gives the other seven the
+# same correction. What stays here is this script's failure ACTION: `return`
+# rather than `die`, per the paragraph above. One behaviour changed in the
+# move and is recorded in the lib's header — an unallocatable stderr capture
+# file now degrades to a less detailed diagnostic instead of failing the read,
+# because the read itself is unaffected by it.
 fetch_api_array() {
-  local endpoint=$1
-  local label=$2
-  local raw err errfile rc=0
-
-  errfile=$(mktemp "${TMPDIR:-/tmp}/codex-review-request-api.XXXXXX") || {
-    log "ERROR: failed to allocate a stderr capture file while fetching $label"
+  gh_api_array "$1" "$2" || {
+    log "ERROR: $GH_API_ARRAY_ERROR"
     return 3
   }
-  # `raw=$(…)` on its own would trip errexit before rc could be read; the
-  # `|| rc=$?` form captures the status without aborting.
-  raw=$(gh api --paginate "$endpoint" 2>"$errfile") || rc=$?
-  err=$(cat "$errfile" 2>/dev/null) || err=""
-  rm -f "$errfile"
-
-  if [ "$rc" -ne 0 ]; then
-    log "ERROR: failed to fetch $label: $err"
-    return 3
-  fi
-  local flattened kind shape
-  # #967, ordering half (Codex P2 / Phase 4b P1 on #995). The stream is judged
-  # BEFORE the flatten, because `add // []` manufactures the array the type
-  # assertion below would otherwise judge: a body of `null`, an EMPTY body and
-  # a stream of only `null`s all reduce to `null` under `add` and are rewritten
-  # to `[]`, and a `null` page mixed with real pages is skipped silently. In
-  # scan_codex_state that is a clean Codex verdict manufactured by an
-  # unreadable payload. At least one document, every document an array; a
-  # genuinely empty page (`[]`) is one array document and still passes.
-  shape=$(jq -rs 'if length == 0 then "no JSON documents at all"
-                  elif any(.[]; type != "array") then
-                    "a stream of " + ([.[] | type] | unique | join("+")) + " values"
-                  else "array" end' 2>/dev/null <<<"$raw") || {
-    log "ERROR: failed to read the document shape of the $label ($endpoint) response${err:+ (gh stderr: $err)}"
-    return 3
-  }
-  if [ "$shape" != "array" ]; then
-    log "ERROR: $label ($endpoint) came back as $shape, not a stream of JSON arrays — READ but UNUSABLE as a list, so it fails closed rather than reading as an empty result (#967)"
-    return 3
-  fi
-  flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) || {
-    log "ERROR: failed to flatten $label pagination output${err:+ (gh stderr: $err)}"
-    return 3
-  }
-  # #967: `add` over a one-element stream returns that element unchanged, so a
-  # 200 whose body is a JSON OBJECT survives the flatten unexamined, and every
-  # downstream `.[]` iterates that object's VALUES rather than a list's
-  # elements. In scan_codex_state that is a confident "no Codex reviews, no
-  # findings, no reactions" — a clean verdict manufactured by an unreadable
-  # payload. A read that succeeded but is not a list is a FAILED read (rc 3,
-  # which every scan_codex_state call site already propagates since #966),
-  # never an empty result.
-  kind=$(printf '%s' "$flattened" | jq -r 'type' 2>/dev/null) || {
-    log "ERROR: failed to read the type of the flattened $label payload"
-    return 3
-  }
-  if [ "$kind" != "array" ]; then
-    log "ERROR: $label ($endpoint) came back as a JSON $kind, not a JSON array — the response was READ but is unusable as a list (#967)"
-    return 3
-  fi
-  printf '%s\n' "$flattened"
 }
 
 # --- Phase 4a entry gate (#486) ---------------------------------------------

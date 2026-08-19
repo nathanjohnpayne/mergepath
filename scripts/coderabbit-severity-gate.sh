@@ -153,6 +153,19 @@ __CR_GATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$__CR_GATE_DIR/lib/feedback-policy-helpers.sh"
 
+# Shared paginated-list reader (#1008) — the fetch → capture → flatten
+# algorithm fetch_api_array below used to carry inline, alongside seven other
+# copies. Hard-required: this is a REQUIRED status check, and an undefined
+# reader would surface as `command not found` on the very reads whose
+# fail-closed contract keeps an unreadable surface from being graded as "no
+# findings".
+if [ ! -r "$__CR_GATE_DIR/lib/gh-api-array.sh" ]; then
+  echo "ERROR: gh-api-array helper missing: $__CR_GATE_DIR/lib/gh-api-array.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$__CR_GATE_DIR/lib/gh-api-array.sh"
+
 # Read a scalar field nested inside `coderabbit:` `severity_gate:`
 # `<field>:`. Same state-machine awk pattern as codex_p1_gate_field in
 # scripts/codex-p1-gate.sh, retargeted to the coderabbit: block.
@@ -339,41 +352,12 @@ if tier_is_required nitpick; then
   fi
 fi
 
-# Paginated fetch helper — same shape as codex-p1-gate.sh.
+# Paginated fetch helper. The algorithm lives in scripts/lib/gh-api-array.sh
+# (#1008); what stays here is this gate's failure ACTION — `die 2`, the
+# config/usage code the workflow maps to a hard gate failure, so an unreadable
+# surface can never be graded as "no findings".
 fetch_api_array() {
-  local endpoint=$1
-  local label=$2
-  local raw flattened kind shape
-  raw=$(gh api --paginate "$endpoint" 2>&1) || die 2 "failed to fetch $label: $raw"
-  # #967, ordering half (Codex P2 / Phase 4b P1 on #995). The stream is judged
-  # BEFORE the flatten, because `add // []` manufactures the array the type
-  # assertion below would otherwise judge: a body of `null`, an EMPTY body and
-  # a stream of only `null`s all reduce to `null` under `add` and are rewritten
-  # to `[]`, and a `null` page mixed with real pages is skipped silently. On a
-  # required gate that is zero blocking findings off a payload nobody read. At
-  # least one document, every document an array; a genuinely empty page (`[]`)
-  # is one array document and still passes.
-  shape=$(jq -rs 'if length == 0 then "no JSON documents at all"
-                  elif any(.[]; type != "array") then
-                    "a stream of " + ([.[] | type] | unique | join("+")) + " values"
-                  else "array" end' 2>/dev/null <<<"$raw") \
-    || die 2 "failed to read the document shape of the $label ($endpoint) response"
-  [ "$shape" = "array" ] \
-    || die 2 "$label ($endpoint) came back as $shape, not a stream of JSON arrays — READ but UNUSABLE as a list, so it fails closed rather than reading as an empty result (#967)"
-  flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) \
-    || die 2 "failed to flatten $label pagination output"
-  # #967: `add` over a one-element stream returns that element unchanged, so a
-  # 200 whose body is a JSON OBJECT survives the flatten unexamined, and every
-  # downstream `.[]` then iterates that object's VALUES — none, for `{}`. On
-  # THIS script that is a required gate reporting zero blocking findings off a
-  # payload nobody could read, which is the #942 shape from the other side. A
-  # read that succeeded but is not a list is a FAILED read (die 2 — fail
-  # closed), never an empty result. Same assertion as scripts/coderabbit-wait.sh.
-  kind=$(printf '%s' "$flattened" | jq -r 'type' 2>/dev/null) \
-    || die 2 "failed to read the type of the flattened $label payload"
-  [ "$kind" = "array" ] \
-    || die 2 "$label ($endpoint) came back as a JSON $kind, not a JSON array — the response was READ but is unusable as a list (#967)"
-  printf '%s\n' "$flattened"
+  gh_api_array "$1" "$2" || die 2 "$GH_API_ARRAY_ERROR"
 }
 
 # --- fetch PR metadata ------------------------------------------------------

@@ -271,11 +271,20 @@ fi
 #       `2>&1` capture folded that prose into the JSON handed to jq —
 #       turning a healthy fetch into a spurious "failed to flatten"
 #       error, the false-failure mirror of #966's swallowed failure.
-#       Extract the LIVE function and drive it with a `gh` stub that
-#       writes valid JSON to stdout AND benign text to stderr.
+#
+#       Since #1008 the algorithm lives in scripts/lib/gh-api-array.sh and
+#       this script keeps only the `log` + `return 3` failure action, so the
+#       driver below SOURCES the real lib alongside the extracted wrapper.
+#       That is deliberate: these cases assert the COMPOSITION a caller
+#       actually runs (wrapper over shared reader), which is the thing the
+#       eight hand-written copies could never be tested as.
+ARRAY_LIB="$ROOT/scripts/lib/gh-api-array.sh"
+[ -r "$ARRAY_LIB" ] || fail "missing $ARRAY_LIB (#1008)"
 FETCH_FN="$(sed -n '/^fetch_api_array() {/,/^}/p' "$SCRIPT")"
 if [ -z "$FETCH_FN" ]; then
   fail "could not extract fetch_api_array from $SCRIPT"
+elif [ ! -r "$ARRAY_LIB" ]; then
+  : # already reported above
 else
   fetch_stub_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-fetch-stderr.XXXXXX")"
   cat >"$fetch_stub_dir/gh" <<'STUB'
@@ -290,13 +299,14 @@ STUB
   fetch_ok_output="$(PATH="$fetch_stub_dir:$PATH" bash -c '
     set -eo pipefail
     log() { :; }
+    . "$2"
     eval "$1"
     if out=$(fetch_api_array "repos/o/r/x" "widgets"); then
       printf "rc=0 ids=%s\n" "$(printf "%s" "$out" | jq -c "[.[].id]")"
     else
       printf "rc=%s\n" "$?"
     fi
-  ' _ "$FETCH_FN" 2>/dev/null)"
+  ' _ "$FETCH_FN" "$ARRAY_LIB" 2>/dev/null)"
 
   if [ "$fetch_ok_output" = "rc=0 ids=[1,2]" ]; then
     pass "fetch_api_array: benign gh stderr does not corrupt a successful fetch"
@@ -304,10 +314,44 @@ STUB
     fail "fetch_api_array mishandled stderr on a successful fetch; got: $fetch_ok_output"
   fi
 
-  # The failure path must still return 3 AND surface the stderr text in
-  # the log line, so separating the streams does not cost diagnostics.
+  # #1008: `--paginate` emits one JSON document per page, and the flatten is
+  # what turns them into ONE array. A reader that kept only the first page
+  # would under-report every surface it scans, which on this poller is a
+  # signal it never sees.
   cat >"$fetch_stub_dir/gh" <<'STUB'
 #!/bin/sh
+printf '%s\n' '[{"id":1}]'
+printf '%s\n' '[{"id":2},{"id":3}]'
+STUB
+  chmod +x "$fetch_stub_dir/gh"
+
+  fetch_pages_output="$(PATH="$fetch_stub_dir:$PATH" bash -c '
+    set -eo pipefail
+    log() { :; }
+    . "$2"
+    eval "$1"
+    out=$(fetch_api_array "repos/o/r/x" "widgets") \
+      && printf "ids=%s\n" "$(printf "%s" "$out" | jq -c "[.[].id]")"
+  ' _ "$FETCH_FN" "$ARRAY_LIB" 2>/dev/null)"
+
+  if [ "$fetch_pages_output" = "ids=[1,2,3]" ]; then
+    pass "fetch_api_array: a multi-page --paginate stream is concatenated into one array (#1008)"
+  else
+    fail "fetch_api_array lost or mis-joined pagination pages; got: $fetch_pages_output"
+  fi
+
+  # The failure path must still return 3 AND surface the stderr text in
+  # the log line, so separating the streams does not cost diagnostics.
+  #
+  # #1008 adds the other half of the #831 contract to the same case: a failed
+  # read writes NOTHING to stdout. That is what keeps a residual
+  # `[ -z "$x" ]` guard honest — an outage must leave the variable empty
+  # rather than filling it with gh's HTTP error body.
+  cat >"$fetch_stub_dir/gh" <<'STUB'
+#!/bin/sh
+# gh writes the HTTP error BODY to stdout and the one-line diagnostic to
+# stderr — measured in scripts/lib/gh-api-scalar.sh's header.
+printf '%s\n' '{"message":"Bad Gateway","status":"502"}'
 printf '%s\n' 'gh: HTTP 502 upstream exploded' >&2
 exit 1
 STUB
@@ -316,15 +360,82 @@ STUB
   fetch_err_output="$(PATH="$fetch_stub_dir:$PATH" bash -c '
     set -eo pipefail
     log() { printf "LOG:%s\n" "$*"; }
+    . "$2"
     eval "$1"
     fetch_api_array "repos/o/r/x" "widgets" || printf "rc=%s\n" "$?"
-  ' _ "$FETCH_FN" 2>/dev/null)"
+  ' _ "$FETCH_FN" "$ARRAY_LIB" 2>/dev/null)"
 
   if printf '%s' "$fetch_err_output" | grep -q 'HTTP 502 upstream exploded' \
     && printf '%s' "$fetch_err_output" | grep -q 'rc=3'; then
     pass "fetch_api_array: a failed fetch still returns 3 and logs gh's stderr"
   else
     fail "fetch_api_array lost the failure status or the stderr diagnostic; got: $fetch_err_output"
+  fi
+
+  # Same stub, second driver: this one routes `log` to stderr (where the real
+  # one writes) so the ONLY thing that can reach stdout is the reader's own
+  # output. gh wrote its HTTP error body to stdout above; the value a caller
+  # captures must not contain it.
+  fetch_err_stdout="$(PATH="$fetch_stub_dir:$PATH" bash -c '
+    set -eo pipefail
+    log() { printf "LOG:%s\n" "$*" >&2; }
+    . "$2"
+    eval "$1"
+    out=$(fetch_api_array "repos/o/r/x" "widgets") || true
+    printf "stdout=[%s]\n" "$out"
+  ' _ "$FETCH_FN" "$ARRAY_LIB" 2>/dev/null)"
+
+  if [ "$fetch_err_stdout" = "stdout=[]" ]; then
+    pass "fetch_api_array: a failed fetch writes NOTHING to stdout, so emptiness stays honest (#1008)"
+  else
+    fail "fetch_api_array leaked the HTTP error body to stdout; got: $fetch_err_stdout"
+  fi
+
+  # #1008: the lib reports WHICH step failed. coderabbit-wait.sh's
+  # best-effort variant keeps two distinct messages, one per step, and
+  # GH_API_ARRAY_ERROR_KIND is the only thing that can still tell them apart
+  # now that the algorithm is shared. A kind that collapsed to a single value
+  # would silently relabel every flatten failure as a fetch failure.
+  cat >"$fetch_stub_dir/gh" <<'STUB'
+#!/bin/sh
+# A 200 whose body is not JSON at all: the fetch SUCCEEDS, the flatten fails.
+printf '%s\n' 'this is not json'
+STUB
+  chmod +x "$fetch_stub_dir/gh"
+
+  kind_output="$(PATH="$fetch_stub_dir:$PATH" bash -c '
+    set -eo pipefail
+    . "$1"
+    gh_api_array "repos/o/r/x" "widgets" >/dev/null || true
+    printf "kind=%s msg=%s\n" "$GH_API_ARRAY_ERROR_KIND" "$GH_API_ARRAY_ERROR"
+  ' _ "$ARRAY_LIB" 2>/dev/null)"
+
+  if printf '%s' "$kind_output" | grep -q 'kind=flatten' \
+    && printf '%s' "$kind_output" | grep -q 'failed to flatten widgets pagination output'; then
+    pass "gh_api_array: a parse failure is reported as kind=flatten, distinct from a fetch failure (#1008)"
+  else
+    fail "gh_api_array mislabelled a flatten failure; got: $kind_output"
+  fi
+
+  cat >"$fetch_stub_dir/gh" <<'STUB'
+#!/bin/sh
+printf '%s\n' 'gh: HTTP 502 upstream exploded' >&2
+exit 1
+STUB
+  chmod +x "$fetch_stub_dir/gh"
+
+  kind_fetch_output="$(PATH="$fetch_stub_dir:$PATH" bash -c '
+    set -eo pipefail
+    . "$1"
+    gh_api_array "repos/o/r/x" "widgets" >/dev/null || true
+    printf "kind=%s detail=%s\n" "$GH_API_ARRAY_ERROR_KIND" "$GH_API_ARRAY_DETAIL"
+  ' _ "$ARRAY_LIB" 2>/dev/null)"
+
+  if printf '%s' "$kind_fetch_output" | grep -q 'kind=fetch' \
+    && printf '%s' "$kind_fetch_output" | grep -q 'HTTP 502 upstream exploded'; then
+    pass "gh_api_array: a transport failure is reported as kind=fetch with gh's stderr as the detail (#1008)"
+  else
+    fail "gh_api_array mislabelled a fetch failure; got: $kind_fetch_output"
   fi
 
   rm -rf "$fetch_stub_dir"

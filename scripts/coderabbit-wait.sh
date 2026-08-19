@@ -391,6 +391,19 @@ fi
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh"
 
+# Shared paginated-list reader (#1008). Owns the fetch → capture → flatten
+# algorithm the two wrappers below used to carry inline, so a correctness fix
+# to it lands once instead of eight times. Hard-required for the same reason
+# the three libs above are: every sensing read on this path routes through it,
+# and the degraded mode (an undefined function) is a `command not found` on the
+# very reads whose failure contract #831/#965 exist to keep honest.
+if [ ! -r "$__CODERABBIT_WAIT_DIR/lib/gh-api-array.sh" ]; then
+  echo "ERROR: gh-api-array helper missing: $__CODERABBIT_WAIT_DIR/lib/gh-api-array.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$__CODERABBIT_WAIT_DIR/lib/gh-api-array.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --probe (#814): read-only, zero-budget, single-scan mode.
@@ -863,101 +876,40 @@ die() {
 # caller's context, or use fetch_api_array_best_effort when an unreadable
 # surface genuinely is not fatal.
 #
-# The contract above governs BOTH wrappers below; `crw_flatten_api_array` is
-# the shared half that enforces the "an ARRAY, or a failure" half of it.
-
-# The third response mode (#967). Two of the three ways that contract
-# — "an ARRAY, or a failure" — can break were enforced by #831: a non-zero `gh`
-# exit, and a flatten that jq itself rejects. The third is a SUCCESSFUL read of
-# a 200 whose body is not a list, and it was passed through unexamined, because
-# `add` over a one-element stream returns that element unchanged:
-#
-#     $ printf '{}' | jq -s 'add // []'
-#     {}
-#
-# Nothing downstream is told, and jq's object semantics then decide the
-# outcome. `{}` makes every `[ .[] | select(…) ]` evaluate to `[]` — a
-# confident "no reviews on this head" / "no comments", the identical false
-# negative #831 exists to prevent, arrived at down a different road. A NON-empty
-# object (an error payload such as `{"message":"Bad credentials"}`) makes `.[]`
-# yield its string values, `select(.user.login == …)` index a string, and jq
-# exit non-zero — which on the clearance path surfaced as exit 5,
-# `rate_limit_stalled`, mislabelling an infra fault as a provider state.
-#
-# Asserting the type converts both into the honest infra exit the rest of this
-# file uses. The check is a separate `jq -r 'type'` rather than an `error`
-# inside the flatten so the diagnostic can NAME the type received; a bare
-# `halt_error` would report only that something failed, which is the shape #963
-# already had to correct elsewhere.
-#
-# The array case #936 covers (`[42]`: a real array whose ELEMENTS are not
-# comment objects) is a neighbour of this, not the same thing — that one is
-# caught by the per-comment derive guards, which only run once something has
-# already agreed the value is a list.
-#
-# ORDER IS THE WHOLE POINT (Codex P2 / Phase 4b P1 on #995). Asserting the type
-# of the FLATTENED value is too late, because `add // []` manufactures the very
-# array it would then be asked to judge: a 200 whose body is the JSON value
-# `null`, a 200 with an EMPTY body, and a `--paginate` stream of only `null`s
-# all reduce to `null` under `add` and are rewritten to `[]` by the fallback,
-# after which `type` reports `array` and the caller reads a confident "no
-# reviews on this head". A `null` page MIXED with real pages is worse: `add`
-# skips it silently, so a partially-unreadable pagination looks complete. So
-# the stream is judged first — at least one document, and every document an
-# array — and only then flattened. A genuinely empty page (`[]`) is one array
-# document and still passes, which is the distinction the flattened-value test
-# structurally cannot make.
-crw_flatten_api_array() {  # <raw> <label> <endpoint> — stdout: array; rc 1 on refusal
-  local raw=$1 label=$2 endpoint=$3 flattened kind shape
-  shape=$(jq -rs 'if length == 0 then "no JSON documents at all"
-                  elif any(.[]; type != "array") then
-                    "a stream of " + ([.[] | type] | unique | join("+")) + " values"
-                  else "array" end' 2>/dev/null <<<"$raw") || {
-    log "ERROR: failed to read the document shape of the $label ($endpoint) response"
-    return 1
-  }
-  if [ "$shape" != "array" ]; then
-    log "ERROR: $label ($endpoint) came back as $shape, not a stream of JSON arrays — the response was READ but is UNUSABLE as a list, so it is reported as a failed read rather than as an empty result (#967). The empty-list fallback is deliberately NOT applied here: it would turn an unreadable response into a confident zero."
-    return 1
-  fi
-  flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) || {
-    log "ERROR: failed to flatten $label ($endpoint) pagination output"
-    return 1
-  }
-  kind=$(printf '%s' "$flattened" | jq -r 'type' 2>/dev/null) || {
-    log "ERROR: failed to read the type of the flattened $label ($endpoint) payload"
-    return 1
-  }
-  if [ "$kind" != "array" ]; then
-    log "ERROR: $label ($endpoint) came back as a JSON $kind, not a JSON array — the response was READ but is UNUSABLE as a list, so it is reported as a failed read rather than as an empty result (#967)"
-    return 1
-  fi
-  printf '%s\n' "$flattened"
-}
-
+# The algorithm itself lives in scripts/lib/gh-api-array.sh (#1008); what
+# stays here is this file's failure ACTION, which is the part that genuinely
+# differs between consumers. `gh_api_array` is called DIRECTLY (not in a
+# nested command substitution), which is what lets its diagnostic reach this
+# wrapper through GH_API_ARRAY_* even when the wrapper itself is invoked from
+# inside `VAR=$(fetch_api_array …)`.
 fetch_api_array() {
-  local endpoint=$1
-  local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || {
-    log "ERROR: failed to fetch $label: $raw"
+  gh_api_array "$1" "$2" || {
+    log "ERROR: $GH_API_ARRAY_ERROR"
     return 3
   }
-  crw_flatten_api_array "$raw" "$label" "$endpoint" || return 3
 }
 
+# The best-effort twin. Its contract is deliberately DIFFERENT — rc 1, not
+# rc 3 — because its callers treat an unreadable surface as non-fatal rather
+# than as an infra failure, and collapsing the two statuses would hand those
+# callers the fatal one. It keeps each of its own message forms, which is why
+# gh_api_array reports WHICH step failed rather than only that one did.
+#
+# The `shape` arm (#967) forwards the lib's composed message verbatim rather
+# than re-phrasing it: that diagnostic names the endpoint and the shape
+# received, and neither is reconstructible from GH_API_ARRAY_DETAIL — which is
+# gh's stderr and is EMPTY on this path, because the read itself succeeded.
 fetch_api_array_best_effort() {
-  local endpoint=$1
-  local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || {
-    log "best-effort fetch failed for $label: $raw"
+  gh_api_array "$1" "$2" || {
+    if [ "$GH_API_ARRAY_ERROR_KIND" = "flatten" ]; then
+      log "best-effort fetch failed to flatten $2 pagination output"
+    elif [ "$GH_API_ARRAY_ERROR_KIND" = "shape" ]; then
+      log "best-effort fetch refused $GH_API_ARRAY_ERROR"
+    else
+      log "best-effort fetch failed for $2: $GH_API_ARRAY_DETAIL"
+    fi
     return 1
   }
-  # Same type assertion, same reason. The status differs (1, not 3) because
-  # this variant's callers treat an unreadable surface as non-fatal — but they
-  # must still be told, or "best effort" degrades into "best guess".
-  crw_flatten_api_array "$raw" "$label" "$endpoint" || return 1
 }
 
 # BEGIN coderabbit_status_description_helpers

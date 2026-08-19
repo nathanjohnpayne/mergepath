@@ -154,6 +154,18 @@ fi
 # shellcheck source=lib/reviewers-helpers.sh
 . "$SCRIPT_DIR/lib/reviewers-helpers.sh"
 
+# Shared paginated-list reader (#1008) — the fetch → capture → flatten
+# algorithm fetch_api_array below used to carry inline, alongside seven other
+# copies. Hard-required for the same reason reviewers-helpers is: the reviews
+# and PR-files reads are fail-closed gate inputs, and an undefined reader
+# would surface as `command not found` rather than as a decision.
+if [ ! -r "$SCRIPT_DIR/lib/gh-api-array.sh" ]; then
+  echo "ERROR: gh-api-array helper missing: $SCRIPT_DIR/lib/gh-api-array.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$SCRIPT_DIR/lib/gh-api-array.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --derive-external-requiredness (#620/#630): QUERY mode. Runs the same
@@ -311,39 +323,12 @@ clear_pass() {  # <reason>
   exit 0
 }
 
+# Paginated fetch helper. The algorithm lives in scripts/lib/gh-api-array.sh
+# (#1008); what stays here is this gate's failure ACTION — `die 2`, the
+# documented config/usage code, so an unreadable reviews or files read can
+# never weaken the gate by reading as an empty list.
 fetch_api_array() {  # <endpoint> <label>
-  local endpoint=$1 label=$2 raw flattened kind shape
-  raw=$(gh api --paginate "$endpoint" 2>&1) || die 2 "failed to fetch $label: $raw"
-  # #967, ordering half (Codex P2 / Phase 4b P1 on #995). The stream is judged
-  # BEFORE the flatten, because `add // []` manufactures the array the type
-  # assertion below would otherwise judge: a body of `null`, an EMPTY body and
-  # a stream of only `null`s all reduce to `null` under `add` and are rewritten
-  # to `[]`, and a `null` page mixed with real pages is skipped silently. Here
-  # that is "which protected paths changed" answered from a files read nobody
-  # could parse — an empty list WEAKENS this gate. At least one document, every
-  # document an array; a genuinely empty page (`[]`) still passes.
-  shape=$(jq -rs 'if length == 0 then "no JSON documents at all"
-                  elif any(.[]; type != "array") then
-                    "a stream of " + ([.[] | type] | unique | join("+")) + " values"
-                  else "array" end' 2>/dev/null <<<"$raw") \
-    || die 2 "failed to read the document shape of the $label ($endpoint) response"
-  [ "$shape" = "array" ] \
-    || die 2 "$label ($endpoint) came back as $shape, not a stream of JSON arrays — READ but UNUSABLE as a list, so it fails closed rather than reading as an empty result (#967)"
-  flattened=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) \
-    || die 2 "failed to flatten $label pagination output"
-  # #967: `add` over a one-element stream returns that element unchanged, so a
-  # 200 whose body is a JSON OBJECT survives the flatten unexamined. Every
-  # downstream `.[]` then iterates that object's VALUES — of which an empty
-  # object has none — so an unusable payload reads as a confident empty list.
-  # On this gate that reaches `[.[].filename]`, where an empty list means no
-  # protected path matched. A read that succeeded but is not a list is reported
-  # as a FAILED read, never as an empty result. Same assertion, same reason, as
-  # scripts/coderabbit-wait.sh.
-  kind=$(printf '%s' "$flattened" | jq -r 'type' 2>/dev/null) \
-    || die 2 "failed to read the type of the flattened $label payload"
-  [ "$kind" = "array" ] \
-    || die 2 "$label ($endpoint) came back as a JSON $kind, not a JSON array — the response was READ but is unusable as a list (#967)"
-  printf '%s\n' "$flattened"
+  gh_api_array "$1" "$2" || die 2 "$GH_API_ARRAY_ERROR"
 }
 
 # --- merge-clearance required-check enforcement probe (#772) ----------------
