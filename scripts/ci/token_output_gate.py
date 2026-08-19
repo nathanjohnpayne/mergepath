@@ -675,25 +675,22 @@ class Lexer:
                 if nxt == "{":
                     quotes.append("${")
                     cur_level()["word"].append("${")
-                    # `${NAME...}`: decide here whether the OUTER name is a
-                    # value reference.  `${#NAME}` is a length and `${!NAME}`
-                    # an indirection; `${NAME:+WORD}` / `${NAME+WORD}` is a
-                    # constant alternate.  Anything nested inside the braces
-                    # is found by this same loop on its own `$`.
-                    j = i + 2
-                    if j < n and text[j] not in "#!" and expanding():
-                        m = _IDENT_RE.match(text, j)
-                        if m and m.group(0) in TOKEN_NAME_SET:
-                            op = text[m.end() : m.end() + 2]
-                            if not (op[:2] == ":+" or op[:1] == "+"):
-                                cur_ll.refs.append(
-                                    Ref(
-                                        m.group(0),
-                                        line,
-                                        cur_level()["seg"],
-                                        in_assign_prefix(),
-                                    )
+                    # `${NAME...}`: `braced_ref_at` is the single decider,
+                    # shared with the here-doc body scanner.  Anything nested
+                    # inside the braces is found by this same loop on its
+                    # own `$`, which is what makes `${UNSET:-$GH_TOKEN}` a
+                    # reference to GH_TOKEN.
+                    if expanding():
+                        name = braced_ref_at(text, i)
+                        if name:
+                            cur_ll.refs.append(
+                                Ref(
+                                    name,
+                                    line,
+                                    cur_level()["seg"],
+                                    in_assign_prefix(),
                                 )
+                            )
                     i += 2
                     continue
                 # a plain variable reference
@@ -1024,8 +1021,45 @@ def _skip_balanced_parens(text, start):
     return n
 
 
+def braced_ref_at(text, brace_open):
+    """Decide a `${...}` expansion at `brace_open` (the index of the `$`).
+
+    Returns the credential NAME when the expansion yields that variable's
+    VALUE, and None otherwise:
+
+        ${#NAME}      a length            -> None
+        ${!NAME}      an indirection      -> None
+        ${NAME:+WORD} constant alternate  -> None
+        ${NAME+WORD}  constant alternate  -> None
+        ${NAME}, ${NAME:-}, ${NAME#p}, ${NAME:0:8}, ...  -> NAME
+
+    A nested expansion inside the braces is never this function's business;
+    the caller finds it on its own `$`, which is what makes
+    `${UNSET:-$GH_TOKEN}` a reference to GH_TOKEN.
+
+    THE SINGLE DECIDER, called from both the lexer and the here-doc body
+    scanner.  #1012's two independent walks over the same line disagreed and
+    the divergence became a pragma bypass; there is one of these on purpose.
+    """
+    j = brace_open + 2
+    if j < len(text) and text[j] in "#!":
+        return None
+    m = _IDENT_RE.match(text, j)
+    if not m or m.group(0) not in TOKEN_NAME_SET:
+        return None
+    op = text[m.end() : m.end() + 2]
+    if op[:2] == ":+" or op[:1] == "+":
+        return None
+    return m.group(0)
+
+
 def _iter_refs(s):
-    """Yield credential names referenced for their VALUE in a raw string."""
+    """Credential names referenced for their VALUE in a raw string.
+
+    Used for interpolating here-doc BODIES, which the lexer hands over
+    whole.  Expansion decisions go through `braced_ref_at`, the same
+    function the lexer uses.
+    """
     out = []
     i = 0
     n = len(s)
@@ -1036,23 +1070,10 @@ def _iter_refs(s):
             continue
         if ch == "$":
             if i + 1 < n and s[i + 1] == "{":
-                j = i + 2
-                if j < n and s[j] in "#!":
-                    # ${#NAME} is a length; ${!NAME} is an indirection.
-                    i += 1
-                    continue
-                m = _IDENT_RE.match(s, j)
-                if m and m.group(0) in TOKEN_NAME_SET:
-                    op = s[m.end() : m.end() + 2]
-                    if op.startswith(":+") or op.startswith("+}") or (
-                        op[:1] == "+"
-                    ):
-                        # constant alternate: not a value reference.  A nested
-                        # expansion inside the alternate is found on its own.
-                        i = m.end()
-                        continue
-                    out.append(m.group(0))
-                i = j
+                name = braced_ref_at(s, i)
+                if name:
+                    out.append(name)
+                i += 2
                 continue
             m = _IDENT_RE.match(s, i + 1)
             if m and m.group(0) in TOKEN_NAME_SET:
@@ -1759,6 +1780,19 @@ CORPUS = [
         "cat <<FIRST <<SECOND\nplain\nFIRST\ntoken=$GH_TOKEN\nSECOND\n",
     ),
     ("heredoc-numeric-delim", MUST_FLAG, "cat <<1\n$GH_TOKEN\n1\n"),
+    (
+        # The here-doc body scanner and the lexer must agree on what a
+        # `${...}` expansion yields; these are the same three forms the
+        # clean-direction cases pin on ordinary lines.
+        "heredoc-expansion-operators",
+        MUST_FLAG,
+        "cat <<EOF\nvalue=${GH_TOKEN:-}\nEOF\n",
+    ),
+    (
+        "heredoc-redactors-only",
+        MUST_NOT_FLAG,
+        "cat <<EOF\nlen=${#GH_TOKEN} state=${GH_TOKEN:+set}\nEOF\n",
+    ),
     ("heredoc-tab-strip", MUST_FLAG, "cat <<-EOF\n\t$GH_TOKEN\n\tEOF\n"),
     ("heredoc-tee", MUST_FLAG, "tee /dev/null <<EOF\n$GH_TOKEN\nEOF\n"),
     # --- helpers ---------------------------------------------------------
