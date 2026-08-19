@@ -111,17 +111,39 @@ CODEX_BOT=$(policy_block_field codex bot_login)
 CODEX_BOT=${CODEX_BOT:-chatgpt-codex-connector[bot]}
 CODERABBIT_BOT=$(policy_block_field coderabbit bot_login)
 CODERABBIT_BOT=${CODERABBIT_BOT:-coderabbitai[bot]}
-CODEX_SOLICITATION='Useful? React with 👍 / 👎.'
-NBSP=$(printf '\302\240')
 CR_PRE_MERGE_BLOCK_START='<!-- pre_merge_checks_walkthrough_start -->'
 CR_PRE_MERGE_BLOCK_END='<!-- pre_merge_checks_walkthrough_end -->'
 
+REVIEWER_LOGINS_JSON=$(
+  policy_reviewers | awk 'NF && !seen[$0]++' | jq -Rsc 'split("\n") | map(select(. != ""))'
+) || die 2 "could not parse available_reviewers from $CONFIG"
 AGENT_LOGINS_JSON=$(
   {
     printf '%s\n' "$AUTHOR_IDENTITY"
     policy_reviewers
   } | awk 'NF && !seen[$0]++' | jq -Rsc 'split("\n") | map(select(. != ""))'
 ) || die 2 "could not parse available_reviewers from $CONFIG"
+
+registered_reviewer_login() {
+  printf '%s' "$REVIEWER_LOGINS_JSON" | jq -e --arg login "$1" 'index($login) != null' >/dev/null 2>&1
+}
+
+tier_is_ignored() {
+  local tier="$1" mode disposition
+  mode=$(feedback_policy_field mode "$CONFIG")
+  mode=${mode:-by-priority}
+  case "$mode" in
+    address-all) return 1 ;;
+    by-priority) ;;
+    *) die 2 "feedback_policy.mode must be by-priority|address-all; got '$mode'" ;;
+  esac
+  disposition=$(feedback_policy_field "$tier" "$CONFIG")
+  case "$disposition" in
+    ""|required|discretionary) return 1 ;;
+    ignore) return 0 ;;
+    *) die 2 "feedback_policy.priorities.$tier must be required|discretionary|ignore; got '$disposition'" ;;
+  esac
+}
 
 fetch_api_array() {
   gh_api_array "$1" "$2" || die 2 "$GH_API_ARRAY_ERROR"
@@ -198,7 +220,7 @@ coderabbit_finding_scan() {
 
 finding_tier() {
   local login="$1" body="$2" tier="" line sanitized
-  if [ "$login" = "$CODEX_BOT" ]; then
+  if [ "$login" = "$CODEX_BOT" ] || registered_reviewer_login "$login"; then
     codex_tier_of "$body"
     return
   fi
@@ -222,11 +244,12 @@ while IFS= read -r comment; do
   login=$(printf '%s' "$comment" | jq -r '.user.login // ""')
   case "$login" in
     "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-    *) continue ;;
+    *) registered_reviewer_login "$login" || continue ;;
   esac
   body=$(printf '%s' "$comment" | jq -r '.body // ""')
   tier=$(finding_tier "$login" "$body")
   [ -n "$tier" ] || continue
+  tier_is_ignored "$tier" && continue
   INLINE_CANDIDATES=$(printf '%s' "$INLINE_CANDIDATES" | jq -c \
     --argjson c "$comment" --arg tier "$tier" '
       . + [{
@@ -260,54 +283,24 @@ agent_reply_after_finding() {
         ((.in_reply_to_id // .id) == $root)
         and ((.created_at // "") >= $floor)
         and ((.user.login // "") as $login | ($agents | index($login)) != null)
-        and (((.body // "") | gsub("^[[:space:]]+"; "")) as $body
-          | ($body != "") and ($body | startswith("[mergepath-resolve:") | not)))
+        and (((.body // "") | gsub("^[[:space:]]+|[[:space:]]+$"; "")
+          | gsub("[[:space:]]+"; " ")) as $body
+          | ($body | startswith("[mergepath-resolve:") | not)
+          and (($body | length) >= 12)
+          and (([$body | scan("[[:alnum:]][[:alnum:]_-]*")] | length) >= 2)))
     ' >/dev/null 2>&1
-}
-
-agent_reaction_on_finding() {
-  local finding_id="$1" floor="$2" finding_body="$3" reactions rc=0
-  finding_body=${finding_body//$NBSP/ }
-  case "$finding_body" in
-    *"$CODEX_SOLICITATION"*) ;;
-    *) return 1 ;;
-  esac
-  reactions=$(fetch_api_array \
-    "repos/$REPO/pulls/comments/$finding_id/reactions" \
-    "reactions for inline finding $finding_id") || rc=$?
-  [ "$rc" -eq 0 ] || return "$rc"
-  printf '%s' "$reactions" | jq -e --arg floor "$floor" --argjson agents "$AGENT_LOGINS_JSON" '
-    any(.[];
-      ((.user.login // "") as $login | ($agents | index($login)) != null)
-      and ((.content == "+1") or (.content == "-1"))
-      and ((.created_at // "") >= $floor))
-  ' >/dev/null 2>&1
 }
 
 FINDINGS='[]'
 while IFS= read -r finding; do
   [ -n "$finding" ] || continue
   root_id=$(printf '%s' "$finding" | jq -r '.root_id')
-  finding_id=$(printf '%s' "$finding" | jq -r '.finding_id')
   floor=$(printf '%s' "$finding" | jq -r '.updated_at // .created_at')
-  reviewer=$(printf '%s' "$finding" | jq -r '.reviewer')
-  finding_body=$(printf '%s' "$finding" | jq -r '.body // ""')
   accounted=false
   evidence=""
   if agent_reply_after_finding "$root_id" "$floor"; then
     accounted=true
     evidence="thread-reply"
-  elif [ "$reviewer" = "$CODEX_BOT" ]; then
-    reaction_rc=0
-    agent_reaction_on_finding "$finding_id" "$floor" "$finding_body" || reaction_rc=$?
-    case "$reaction_rc" in
-      0)
-        accounted=true
-        evidence="reaction"
-        ;;
-      1) ;;
-      *) die 2 "could not verify reactions for inline finding $finding_id" ;;
-    esac
   fi
   FINDINGS=$(printf '%s' "$FINDINGS" | jq -c \
     --argjson f "$finding" --argjson accounted "$accounted" --arg evidence "$evidence" '
@@ -357,6 +350,7 @@ while IFS= read -r issue_comment; do
   body=$(printf '%s' "$body_json" | jq -r '.')
   tier=$(finding_tier "$login" "$body")
   [ -n "$tier" ] || continue
+  tier_is_ignored "$tier" && continue
   comment_id=$(printf '%s' "$issue_comment" | jq -r '.id')
   raised_at=$(printf '%s' "$issue_comment" | jq -r '.updated_at // .created_at // ""')
   body_fingerprint=$(fingerprint "$body_json")
@@ -394,7 +388,7 @@ while IFS= read -r review; do
   login=$(printf '%s' "$review" | jq -r '.user.login // ""')
   case "$login" in
     "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-    *) continue ;;
+    *) registered_reviewer_login "$login" || continue ;;
   esac
   # Hash the JSON string encoding rather than a shell command-substitution
   # rendering. Command substitution strips trailing newlines; the JSON form
@@ -404,6 +398,7 @@ while IFS= read -r review; do
   body=$(printf '%s' "$body_json" | jq -r '.')
   tier=$(finding_tier "$login" "$body")
   [ -n "$tier" ] || continue
+  tier_is_ignored "$tier" && continue
   review_id=$(printf '%s' "$review" | jq -r '.id')
   submitted_at=$(printf '%s' "$review" | jq -r '.submitted_at // ""')
   body_fingerprint=$(fingerprint "$body_json")
@@ -443,11 +438,11 @@ MISSING=$(printf '%s' "$FINDINGS" | jq -c '[.[] | select(.accounted != true)]')
 STATUS=clear
 [ "$MISSING_COUNT" -eq 0 ] || STATUS=unaccounted
 
-RESULT=$(jq -c -n \
+RESULT=$(printf '%s\n%s\n' "$FINDINGS" "$MISSING" | jq -c -s \
   --arg status "$STATUS" --arg repo "$REPO" --argjson pr "$PR_NUMBER" \
   --argjson posted "$POSTED" --argjson accounted "$ACCOUNTED" \
-  --argjson missing_count "$MISSING_COUNT" --argjson findings "$FINDINGS" \
-  --argjson missing "$MISSING" '
+  --argjson missing_count "$MISSING_COUNT" '
+    .[0] as $findings | .[1] as $missing |
     {
       status: $status,
       repo: $repo,
@@ -458,7 +453,7 @@ RESULT=$(jq -c -n \
       findings: $findings,
       missing: $missing
     }
-  ')
+  ') || die 2 "could not render accounting result"
 
 if [ "$MISSING_COUNT" -gt 0 ]; then
   echo "[review-feedback-accounting] $ACCOUNTED/$POSTED findings accounted; $MISSING_COUNT still undispositioned." >&2
@@ -466,7 +461,7 @@ if [ "$MISSING_COUNT" -gt 0 ]; then
     .[] |
     if .kind == "inline" then
       if .reviewer == $codex then
-        "  - inline \(.reviewer) \(.tier) finding \(.finding_id) at \(.path):\(.line // "?"): reply on the thread or record the validated +1/-1 reaction"
+        "  - inline \(.reviewer) \(.tier) finding \(.finding_id) at \(.path):\(.line // "?"): post a substantive disposition reply on the thread"
       else
         "  - inline \(.reviewer) \(.tier) finding \(.finding_id) at \(.path):\(.line // "?"): post a substantive disposition reply on the thread"
       end

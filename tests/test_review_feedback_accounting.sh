@@ -196,6 +196,14 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
   }
 ]
 JSON
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-with-substantive-reply.json"
+jq '.[1].body = "."' "$TMP/fixtures/inline-with-substantive-reply.json" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "punctuation-only reply is not substantive disposition evidence"
+jq '.[1].body = "👍"' "$TMP/fixtures/inline-with-substantive-reply.json" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "emoji-only reply is not substantive disposition evidence"
+mv "$TMP/fixtures/inline-with-substantive-reply.json" "$TMP/fixtures/inline.json"
 run_gate
 assert_eq 0 "$RUN_RC" "agent reply after inline finding accounts for it"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "agent reply increments accounted count"
@@ -235,15 +243,9 @@ assert_eq 1 "$RUN_RC" "worktree-local ledger alone is not cross-checkout disposi
 unset CODEX_FEEDBACK_LEDGER
 
 printf '[{"user":{"login":"nathanpayne-codex"},"content":"+1","created_at":"2026-08-18T20:04:00Z"}]\n' >"$TMP/fixtures/reactions-10.json"
-cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-with-solicitation.json"
-jq 'map(if .id == 10 then .body = "![P1 Badge] Missing guard" else . end)' \
-  "$TMP/fixtures/inline-with-solicitation.json" >"$TMP/fixtures/inline.json"
 run_gate
-assert_eq 1 "$RUN_RC" "unrelated reaction does not account for a Codex finding without the solicitation"
-mv "$TMP/fixtures/inline-with-solicitation.json" "$TMP/fixtures/inline.json"
-run_gate
-assert_eq 0 "$RUN_RC" "reviewer reaction accounts for a Codex inline finding"
-assert_eq reaction "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "reaction evidence is visible"
+assert_eq 1 "$RUN_RC" "reviewer reaction alone is not durable disposition evidence"
+assert_eq null "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "reaction-only finding remains unaccounted"
 
 printf '[{"user":{"login":"nathanpayne-codex"},"content":"eyes"}]\n' >"$TMP/fixtures/reactions-10.json"
 run_gate
@@ -251,8 +253,12 @@ assert_eq 1 "$RUN_RC" "non-verdict reaction does not account for a Codex finding
 
 GH_FAIL_ENDPOINT="repos/acme/widget/pulls/comments/10/reactions"
 run_gate
-assert_eq 2 "$RUN_RC" "reaction API failure is an infrastructure error, not an unaccounted verdict"
-assert_match 'could not verify reactions for inline finding 10' "$RUN_ERR" "reaction API failure names the unverifiable finding"
+assert_eq 1 "$RUN_RC" "accounting does not depend on the deletable reaction surface"
+if grep -F 'pulls/comments/10/reactions' "$TMP/gh-calls.log" >/dev/null; then
+  fail "reaction endpoint must not be consulted for durable accounting"
+else
+  pass "reaction endpoint is not consulted for durable accounting"
+fi
 unset GH_FAIL_ENDPOINT
 
 cat >"$TMP/fixtures/inline.json" <<'JSON'
@@ -297,7 +303,7 @@ unset CODEX_FEEDBACK_LEDGER
 
 printf '[{"user":{"login":"nathanpayne-codex"},"content":"+1","created_at":"2026-08-18T20:06:00Z"}]\n' >"$TMP/fixtures/reactions-10.json"
 run_gate
-assert_eq 0 "$RUN_RC" "post-edit reaction accounts for the edited inline finding"
+assert_eq 1 "$RUN_RC" "post-edit reaction alone does not durably account for the edited finding"
 
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
@@ -456,6 +462,56 @@ reset_fixtures
 cat >"$TMP/fixtures/reviews.json" <<'JSON'
 [
   {
+    "id": 903,
+    "commit_id": "cccccccccccccccccccccccccccccccccccccccc",
+    "submitted_at": "2026-08-18T22:40:00Z",
+    "state": "CHANGES_REQUESTED",
+    "user": {"login": "nathanpayne-claude"},
+    "body": "## Phase 4b review\n\n- **P1** Registered reviewer finding"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "registered Phase 4b reviewer body finding blocks"
+assert_eq nathanpayne-claude "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "registered reviewer identity is preserved"
+
+reset_fixtures
+cp "$TMP/review-policy.yml" "$TMP/review-policy.default.yml"
+cat >>"$TMP/review-policy.yml" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: discretionary
+    p3: ignore
+    nitpick: ignore
+YAML
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 30,
+    "created_at": "2026-08-18T22:50:00Z",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "path": "src/cosmetic.sh",
+    "line": 2,
+    "body": "![P3 Badge] Cosmetic wording"
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "feedback tier configured ignore is excluded from inventory"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "ignored finding does not contribute to posted count"
+sed -i.bak 's/p3: ignore/p3: discretionary/' "$TMP/review-policy.yml"
+rm -f "$TMP/review-policy.yml.bak"
+run_gate
+assert_eq 1 "$RUN_RC" "discretionary tier remains in the accounting inventory"
+mv "$TMP/review-policy.default.yml" "$TMP/review-policy.yml"
+
+reset_fixtures
+cat >"$TMP/fixtures/reviews.json" <<'JSON'
+[
+  {
     "id": 902,
     "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "submitted_at": "2026-08-18T23:00:00Z",
@@ -472,7 +528,7 @@ reset_fixtures
 GH_FAIL_ENDPOINT="repos/acme/widget/pulls/7/reviews"
 run_gate
 assert_eq 2 "$RUN_RC" "API read failure is an infrastructure error"
-assert_match 'could not read review objects' "$RUN_ERR" "API failure names the unread surface"
+assert_match 'failed to fetch review objects' "$RUN_ERR" "API failure names the unread surface"
 unset GH_FAIL_ENDPOINT
 
 reset_fixtures
@@ -500,6 +556,12 @@ for caller in \
     fail "$caller invokes the accounting gate"
   fi
 done
+
+if grep -Eq -- '--argjson (findings|missing)([[:space:]\\]|$)' "$SCRIPT"; then
+  fail "final result must stream finding arrays instead of passing them through argv"
+else
+  pass "final result streams finding arrays instead of passing them through argv"
+fi
 
 if [ "$FAIL" -ne 0 ]; then
   printf 'review-feedback-accounting: FAIL (%s failed, %s passed)\n' "$FAIL" "$PASS" >&2

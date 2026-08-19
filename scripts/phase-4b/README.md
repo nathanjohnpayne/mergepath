@@ -240,6 +240,7 @@ While disabled (default), `phase-4b-review.sh` exits `5` and the caller
 uses today's manual handoff (`post-phase-4b-handoff.sh`). The handoff renderer
 runs complete-history feedback accounting before emitting the reviewer prompt;
 it exits `4` with no handoff when an earlier finding is unaccounted (#1000).
+Automated-mode fallbacks run that accounting before announcing or rendering a manual handoff; a miss becomes orchestrator exit `7`, not fallback exit `4`.
 
 `max_review_rounds` is a declarative cap for the outer review flow. This
 reference helper performs one exhaustive adapter pass per invocation; callers

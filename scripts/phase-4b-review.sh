@@ -119,8 +119,9 @@ p4b_acct_mark_unposted() {
   return 0
 }
 
-ADAPTER_DIR="$ROOT/phase-4b/adapters"
+ADAPTER_DIR="$(p4b_adapter_dir)"
 HANDOFF="${P4B_HANDOFF:-$ROOT/post-phase-4b-handoff.sh}"
+FEEDBACK_ACCOUNTING_GATE="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-$ROOT/review-feedback-accounting.sh}"
 GH_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$ROOT/gh-as-reviewer.sh}"
 # Author wrapper for the step-9 issue writes (#672/#674): resolves AND
 # identity-verifies the author PAT before each write, replacing manual
@@ -291,11 +292,32 @@ esac
 
 p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  timeout=${ADAPTER_TIMEOUT}s  effort=${EFFECTIVE_EFFORT:-cli-default}  dry_run=$DRY_RUN"
 
+require_feedback_accounted() {
+  local accounting_json="" accounting_rc=0
+  command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 \
+    || p4b_die 3 "review feedback accounting gate unavailable: $FEEDBACK_ACCOUNTING_GATE"
+  accounting_json=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO") \
+    || accounting_rc=$?
+  case "$accounting_rc" in
+    0) p4b_log "review feedback accounting clear" ;;
+    1)
+      printf '%s\n' "$accounting_json" >&2
+      p4b_die 7 "review feedback is unaccounted; disposition every finding before Phase 4b dispatch"
+      ;;
+    *)
+      printf '%s\n' "$accounting_json" >&2
+      p4b_die 3 "review feedback accounting gate failed with exit $accounting_rc"
+      ;;
+  esac
+}
+
 # --- manual-handoff fallback -----------------------------------------------
 fall_back_to_manual() {
   local why="$1"
   local handoff_ref="$PR"
+  local handoff_output="" handoff_rc=0
   [ -n "$REPO" ] && handoff_ref="${REPO}#${PR}"
+  require_feedback_accounted
   p4b_warn "falling back to the manual Phase 4b handoff: $why"
   # Accounting (#602): record the fail-closed loop as positive safety
   # evidence. Advisory — a recording failure never alters this fallback.
@@ -311,8 +333,16 @@ fall_back_to_manual() {
     fi
   fi
   if [ -x "$HANDOFF" ]; then
-    PHASE_4B_REVIEWER_IDENTITY="$REVIEWER" "$HANDOFF" "$handoff_ref" >&2 2>/dev/null \
-      || p4b_warn "could not render chat-side handoff block (needs gh); brief the human manually"
+    handoff_output=$(PHASE_4B_REVIEWER_IDENTITY="$REVIEWER" "$HANDOFF" "$handoff_ref" 2>&1) \
+      || handoff_rc=$?
+    case "$handoff_rc" in
+      0) printf '%s\n' "$handoff_output" >&2 ;;
+      4)
+        printf '%s\n' "$handoff_output" >&2
+        p4b_die 7 "review feedback became unaccounted before manual Phase 4b handoff; no handoff rendered"
+        ;;
+      *) p4b_warn "could not render chat-side handoff block (needs gh); brief the human manually" ;;
+    esac
   fi
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
@@ -455,26 +485,7 @@ fi
 # unread or undispositioned. Unlike the provider-ordering barrier, this also
 # applies to dry-runs: invoking the reasoning adapter is the scarce action the
 # gate protects. The command override keeps the orchestrator hermetic in tests.
-FEEDBACK_ACCOUNTING_GATE="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-$ROOT/review-feedback-accounting.sh}"
-command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 \
-  || p4b_die 3 "review feedback accounting gate unavailable: $FEEDBACK_ACCOUNTING_GATE"
-FEEDBACK_ACCOUNTING_JSON=""
-FEEDBACK_ACCOUNTING_RC=0
-FEEDBACK_ACCOUNTING_JSON=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO") \
-  || FEEDBACK_ACCOUNTING_RC=$?
-case "$FEEDBACK_ACCOUNTING_RC" in
-  0)
-    p4b_log "review feedback accounting clear"
-    ;;
-  1)
-    printf '%s\n' "$FEEDBACK_ACCOUNTING_JSON" >&2
-    p4b_die 7 "review feedback is unaccounted; disposition every finding before Phase 4b dispatch"
-    ;;
-  *)
-    printf '%s\n' "$FEEDBACK_ACCOUNTING_JSON" >&2
-    p4b_die 3 "review feedback accounting gate failed with exit $FEEDBACK_ACCOUNTING_RC"
-    ;;
-esac
+require_feedback_accounted
 
 # --- run the adapter (reasoning plane; never posts) ------------------------
 ADAPTER_ARGS=( --pr "$PR" )

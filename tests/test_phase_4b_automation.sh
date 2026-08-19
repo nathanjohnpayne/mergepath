@@ -1564,6 +1564,18 @@ if [ "$rc" = 7 ] \
   pass "feedback accounting miss → exit 7 before Phase 4b adapter dispatch"
 else fail "feedback accounting pre-dispatch gate (rc=$rc, out=$out)"; fi
 
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$FEEDBACK_BLOCK_STUB" \
+  P4B_ADAPTER_DIR="$WORK/no-adapters" \
+  bash "$ORCH" 122 --repo o/r --author claude --reviewer nathanpayne-codex --head abc123 --diff-file "$DIFF" --dry-run 2>&1)"; rc=$?
+set -e
+if [ "$rc" = 7 ] \
+   && printf '%s' "$out" | grep -q 'review feedback is unaccounted' \
+   && ! printf '%s' "$out" | grep -q 'fell_back_to_manual'; then
+  pass "early adapter fallback propagates feedback hold as exit 7 without manual handoff"
+else fail "early fallback feedback hold propagation (rc=$rc, out=$out)"; fi
+
 # Direction A: author=claude → reviewer codex → APPROVED → exit 0
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
