@@ -1641,6 +1641,11 @@ doc_ownership:
     class: per-repo-owned
   - path: docs/agents/code-modification-rules.md
     class: per-repo-owned
+  - path: docs/agents/cloudflare-mcp-servers.md
+    class: per-repo-owned
+    note: >-
+      A capability note about a plugin installed on this machine
+      (#908), not a fleet-wide convention. Stays per-repo-owned.
 
   # ── hub-only ───────────────────────────────────────────────────────
   - path: docs/agents/bootstrap-runbook.md
