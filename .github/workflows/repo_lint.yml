@@ -35,6 +35,13 @@
 #     assertion in tests/test_repo_lint_consumer_safety.sh fails when a wired
 #     name has no file in scripts/ci/, and that suite also EXECUTES every
 #     `run:` body here against a kit-less fixture to prove the tail works.
+#   - The same kit-less rule binds any OTHER step that touches scripts/ci/,
+#     not just the check wires. A setup step that fails on an absent or empty
+#     kit reds the job BEFORE the guarded checks run, which makes every tail
+#     below it unreachable — the `make_ci_scripts_executable` chmod was
+#     exactly that. The same suite executes each such step against a tree
+#     with no scripts/ci/ at all and against an empty one, and both must
+#     exit 0.
 
 name: repo-lint
 
@@ -55,7 +62,17 @@ jobs:
           persist-credentials: false
 
       - name: make_ci_scripts_executable
-        run: chmod +x scripts/ci/*
+        # Kit-less-safe (#979). `chmod +x scripts/ci/*` fails on a consumer
+        # that skipped the `scripts/ci/` kit: the glob matches nothing, bash
+        # hands `chmod` the literal pattern, and chmod exits nonzero — so the
+        # job reds HERE, before any soft-passing check step below ever runs,
+        # and every soft-pass tail underneath is unreachable. Guard on the
+        # directory and enumerate with `find`, which is a no-op on an empty
+        # kit; a real chmod failure on a populated kit still propagates.
+        run: |
+          if [ -d scripts/ci ]; then
+            find scripts/ci -maxdepth 1 -type f -exec chmod +x {} +
+          fi
 
       # #777 part 1 of 2 — record .git/config BEFORE any step that runs a
       # test suite. The paired verification step at the END of this job

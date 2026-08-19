@@ -343,28 +343,42 @@ mkdir -p "$GUARD_DIR"
 
 cat >"$GUARD_DIR/extract.rb" <<'RB'
 require 'yaml'
+require 'fileutils'
 doc = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: false)
 abort('workflow did not parse as a mapping') unless doc.is_a?(Hash)
+bodies = ARGV.fetch(1)
+FileUtils.mkdir_p(bodies)
+idx = 0
 (doc['jobs'] || {}).each_value do |job|
   next unless job.is_a?(Hash)
   (job['steps'] || []).each do |step|
     next unless step.is_a?(Hash)
     run = step['run']
     next unless run.is_a?(String)
+    wire = run.match(%r{\A\./scripts/ci/(check_[A-Za-z0-9_]+)})
     if run.include?("\n")
       # A multi-line body invoking a kit check would escape the single-line
       # matcher below and go unguarded. Report it; the caller fails on it.
       puts "MULTILINE\t#{step['name']}\t" if run =~ %r{\./scripts/ci/check_[A-Za-z0-9_]+}
+    elsif wire
+      puts "STEP\t#{wire[1]}\t#{run}"
       next
     end
-    m = run.match(%r{\A\./scripts/ci/(check_[A-Za-z0-9_]+)})
-    next unless m
-    puts "STEP\t#{m[1]}\t#{run}"
+    # Any step that touches the kit path WITHOUT being a check wire is a
+    # setup step: it runs ahead of the guarded checks, so if it dies on a
+    # kit-less consumer none of their soft-pass tails is ever reached. The
+    # body can be multi-line, so it travels via a file rather than the TSV.
+    next if wire
+    next unless run.include?('scripts/ci')
+    idx += 1
+    File.write(File.join(bodies, idx.to_s), run)
+    puts "SETUP\t#{step['name']}\t#{idx}"
   end
 end
 RB
 
 if ! ruby "$GUARD_DIR/extract.rb" "$ROOT/.github/workflows/repo_lint.yml" \
+      "$GUARD_DIR/bodies" \
       >"$GUARD_DIR/steps.tsv" 2>"$GUARD_DIR/extract.err"; then
   fail "#979 guard: could not parse repo_lint.yml: $(tail -3 "$GUARD_DIR/extract.err")"
   echo ""
@@ -449,6 +463,68 @@ done <"$GUARD_DIR/steps.tsv"
 
 if [ "$GUARDED" -gt 0 ]; then
   pass "#979 guard: $GUARDED wired steps soft-pass a missing script, pass a passing one, and propagate a real failure"
+fi
+
+# ---------------------------------------------------------------------------
+# #979 round 2 — the SETUP steps ahead of the guarded checks.
+#
+# The block above proves each check wire survives a kit-less consumer. That is
+# necessary and not sufficient: a step that touches scripts/ci/ WITHOUT being
+# a check wire runs first, and if it dies on a kit-less tree the job reds
+# there and no tail below it is ever reached. `make_ci_scripts_executable`
+# was exactly that — `chmod +x scripts/ci/*` hands the unmatched glob to chmod
+# literally, which exits nonzero on a consumer that skipped the kit.
+#
+# Two consumer shapes, because they are not the same file system state:
+#   (a) no scripts/ci/ directory at all — a consumer that skipped the kit;
+#   (b) scripts/ci/ present but EMPTY — the shape the guard loop above uses.
+# Both must exit 0. A third probe keeps the assertion honest: on a POPULATED
+# kit the setup steps must still do their job, so a mode-644 check_* must come
+# out executable. Without it, deleting the step entirely would pass (a) and
+# (b) and silently break every check invocation in CI.
+# ---------------------------------------------------------------------------
+SETUP_SEEN=0
+while IFS=$'\t' read -r kind stepname bodyid; do
+  [ "$kind" = "SETUP" ] || continue
+  SETUP_SEEN=$((SETUP_SEEN + 1))
+  setup_body="$(cat "$GUARD_DIR/bodies/$bodyid")"
+
+  rm -rf "$GUARD_DIR/nokit"
+  mkdir -p "$GUARD_DIR/nokit/scripts"
+  if guard_run "$GUARD_DIR/nokit" "$setup_body"; then
+    pass "#979 setup: '$stepname' exits 0 with no scripts/ci/ directory"
+  else
+    fail "#979 setup: step '$stepname' exits nonzero when scripts/ci/ is ABSENT — it runs before every guarded check, so a consumer that skipped the kit reds repo-lint here and no soft-pass tail below is ever reached. Guard it on the directory existing."
+  fi
+
+  rm -rf "$GUARD_DIR/emptykit"
+  mkdir -p "$GUARD_DIR/emptykit/scripts/ci"
+  if guard_run "$GUARD_DIR/emptykit" "$setup_body"; then
+    pass "#979 setup: '$stepname' exits 0 with an EMPTY scripts/ci/"
+  else
+    fail "#979 setup: step '$stepname' exits nonzero when scripts/ci/ is present but EMPTY (an unmatched glob is passed through literally)"
+  fi
+done <"$GUARD_DIR/steps.tsv"
+
+if [ "$SETUP_SEEN" -eq 0 ]; then
+  fail "#979 setup: no non-check step referencing scripts/ci/ was found in repo_lint.yml — the kit is made executable somewhere, so this enumeration has gone stale and stopped covering it"
+else
+  rm -rf "$GUARD_DIR/populated"
+  mkdir -p "$GUARD_DIR/populated/scripts/ci"
+  printf '#!/bin/sh\nexit 0\n' >"$GUARD_DIR/populated/scripts/ci/check_probe"
+  chmod 644 "$GUARD_DIR/populated/scripts/ci/check_probe"
+  setup_ok=1
+  while IFS=$'\t' read -r kind _stepname bodyid; do
+    [ "$kind" = "SETUP" ] || continue
+    if ! guard_run "$GUARD_DIR/populated" "$(cat "$GUARD_DIR/bodies/$bodyid")"; then
+      setup_ok=0
+    fi
+  done <"$GUARD_DIR/steps.tsv"
+  if [ "$setup_ok" -eq 1 ] && [ -x "$GUARD_DIR/populated/scripts/ci/check_probe" ]; then
+    pass "#979 setup: the $SETUP_SEEN kit-touching setup step(s) still make a populated scripts/ci/ executable"
+  else
+    fail "#979 setup: after running the kit-touching setup step(s) on a POPULATED tree, scripts/ci/check_probe is not executable — the kit-less guard must not cost the step its actual job"
+  fi
 fi
 
 echo ""
