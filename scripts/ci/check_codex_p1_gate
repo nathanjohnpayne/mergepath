@@ -145,14 +145,16 @@ if archive.is_a?(Hash)
   archive_run = archive_step&.fetch("run", nil)
   require_shape.call(!archive_run.nil?, "archive-edited-feedback does not invoke the archive renderer")
   require_shape.call(
-    archive_run&.include?("mergepath-feedback-archive:v1") &&
-      archive_run&.include?("source_kind=review-body") &&
+    archive_run&.include?("source_kind=review-body") &&
       archive_run&.include?(".review.id") &&
       archive_run&.include?(".changes.body.from") &&
       archive_run&.include?("EVENT_ACTION") &&
       archive_run&.include?("is_fork") &&
+      archive_run&.include?("archive_records_file") &&
+      archive_run&.include?('while IFS= read -r archive_record') &&
+      archive_run&.include?("--rawfile archive_records") &&
       archive_run&.include?("codex-p1-fork-handoff.json"),
-    "archive-edited-feedback does not bind comment and review-body sources to the v1 renderer"
+    "archive-edited-feedback does not bind comment and review-body sources to the complete archive renderer"
   )
   archive_env = archive_step&.fetch("env", {}) || {}
   require_shape.call(
@@ -291,9 +293,18 @@ if sweep.is_a?(Hash)
         sweep_run.include?("::warning::"),
       "scheduled-sweep does not fail closed when an installed fingerprint helper is missing"
     )
+    helper_guard = sweep_run.index('if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]')
+    loop_start = sweep_run.index('while IFS= read -r PR; do')
+    require_shape.call(
+      helper_guard && loop_start && helper_guard < loop_start,
+      "scheduled-sweep can discover a missing invariant helper after opening a PR lease"
+    )
     require_shape.call(
       sweep_run.include?("actions/workflows/codex-p1-gate.yml/runs") &&
         sweep_run.include?("mergepath-feedback-archive-relay:v1") &&
+        sweep_run.include?("complete|failed") &&
+        sweep_run.include?("MAX_RELAY_SOURCE_RUNS") &&
+        sweep_run.include?("source run scan exceeded") &&
         sweep_run.include?("relay_pending") &&
         sweep_run.include?('if [ "$relay_pending" = true ]') &&
         sweep_run.include?("rc=1"),
@@ -333,10 +344,17 @@ relay_job = relay_jobs.is_a?(Hash) ? relay_jobs["relay"] : nil
 require_shape.call(relay_job.is_a?(Hash), "#{relay_path} is missing its relay job")
 if relay_job.is_a?(Hash)
   require_shape.call(relay_job["concurrency"].nil?, "fork archive relay must not use cancelling Actions concurrency")
+  require_shape.call(
+    relay_job["if"].to_s.include?("startsWith(github.event.workflow_run.display_title") &&
+      relay_job["if"].to_s.include?("Codex P1 Gate relay-v1 PR #"),
+    "fork archive relay does not gate on the complete Codex P1 Gate run title"
+  )
   relay_steps = Array(relay_job["steps"])
   source_run = relay_steps.find { |step| step["id"].to_s == "source" }&.fetch("run", "").to_s
   require_shape.call(
     source_run.include?('if ! pr_json=$(gh api "repos/$REPO/pulls/$pr"') &&
+      source_run.include?("HTTP 404") && source_run.include?("api_err") &&
+      source_run.match?(/Could not resolve PR.*\n[\s\S]*exit 1/) &&
       source_run.include?('echo "is_fork=false"') &&
       source_run.match?(/(?:^|\n)\s*exit 0(?:\s|$)/),
     "fork archive relay does not ignore ordinary issue_comment source runs safely"
@@ -378,6 +396,9 @@ if relay_job.is_a?(Hash)
     )
     require_shape.call(
       relay_run.include?("mergepath-feedback-archive:v1") &&
+        relay_run.include?("mergepath-feedback-archive:v2") &&
+        relay_run.include?(".archive_records") &&
+        relay_run.include?('while IFS= read -r archive_record') &&
         relay_run.include?("mergepath-feedback-archive-relay:v1") &&
         relay_run.include?('if [ "$fingerprint_before" != "$fingerprint_after" ]'),
       "fork archive relay omits archive validation, completion evidence, or drift rejection"

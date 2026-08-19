@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Render a compact, GitHub-visible history record for an edited/deleted
-# PR-level comment, inline comment, or top-level review body. The workflow
-# owns the write; this helper is pure.
+# Render complete, GitHub-visible history records for an edited/deleted PR-level
+# comment, inline comment, or top-level review body. Near-limit bodies are split
+# across records that accounting must reconstruct completely. The workflow owns
+# the write; this helper is pure.
 
 set -euo pipefail
 
@@ -33,6 +34,21 @@ esac
 [ -n "$ARCHIVED_AT" ] || { echo "render-feedback-archive: archived timestamp is required" >&2; exit 2; }
 [ -r "$PREVIOUS_BODY_FILE" ] || { echo "render-feedback-archive: previous body is unreadable" >&2; exit 2; }
 
+# An archive comment is itself part of the immutable history surface. If that
+# comment is edited or deleted, the issue_comment event gives us its previous
+# exact body. Re-emit a single valid record byte-for-byte so the workflow can
+# restore it instead of silently dropping the only durable copy.
+if awk '
+  NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+\/=]+ -->$/ \
+    { record=$0; next }
+  NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]{64} part=[0-9]+\/[0-9]+ data=[A-Za-z0-9+\/=]+ -->$/ \
+    { record=$0; next }
+  { extra=1 }
+  END { if (record != "" && !extra) print record; else exit 1 }
+' "$PREVIOUS_BODY_FILE"; then
+  exit 0
+fi
+
 BODY_JSON=$(jq -Rs '.' "$PREVIOUS_BODY_FILE") \
   || { echo "render-feedback-archive: could not encode previous body" >&2; exit 2; }
 BODY=$(jq -r '.' <<EOF
@@ -63,6 +79,7 @@ else
 fi
 
 PAYLOAD=$(jq -nc \
+  --rawfile body "$PREVIOUS_BODY_FILE" \
   --arg source_kind "$SOURCE_KIND" \
   --argjson source_comment_id "$SOURCE_ID" \
   --arg source_login "$SOURCE_LOGIN" \
@@ -71,14 +88,40 @@ PAYLOAD=$(jq -nc \
   --argjson codex_tiers "$CODEX_TIERS" \
   --argjson coderabbit_tiers "$CODERABBIT_TIERS" '
     {
+      archive_version: 2,
       source_kind: $source_kind,
       source_comment_id: $source_comment_id,
       source_login: $source_login,
       archived_at: $archived_at,
       body_fingerprint: $body_fingerprint,
+      body: $body,
       codex_tiers: $codex_tiers,
       coderabbit_tiers: $coderabbit_tiers
     }
   ')
 ENCODED=$(printf '%s' "$PAYLOAD" | jq -Rr '@base64')
-printf '<!-- mergepath-feedback-archive:v1 %s -->\n' "$ENCODED"
+if [ "${#ENCODED}" -le 60000 ]; then
+  printf '<!-- mergepath-feedback-archive:v1 %s -->\n' "$ENCODED"
+  exit 0
+fi
+
+# One GitHub comment cannot hold the worst-case JSON/base64 expansion of a
+# near-limit reviewer body. Split the encoded payload into independently
+# restorable comments; accounting reconstructs the complete set and rejects a
+# missing part. The archive id binds every part to this exact payload.
+if command -v sha256sum >/dev/null 2>&1; then
+  ARCHIVE_ID=$(printf '%s' "$PAYLOAD" | sha256sum | awk '{print $1}')
+else
+  ARCHIVE_ID=$(printf '%s' "$PAYLOAD" | shasum -a 256 | awk '{print $1}')
+fi
+CHUNK_SIZE=60000
+TOTAL=$(( (${#ENCODED} + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+PART=1
+OFFSET=0
+while [ "$OFFSET" -lt "${#ENCODED}" ]; do
+  CHUNK=${ENCODED:$OFFSET:$CHUNK_SIZE}
+  printf '<!-- mergepath-feedback-archive:v2 id=%s part=%s/%s data=%s -->\n' \
+    "$ARCHIVE_ID" "$PART" "$TOTAL" "$CHUNK"
+  PART=$((PART + 1))
+  OFFSET=$((OFFSET + CHUNK_SIZE))
+done

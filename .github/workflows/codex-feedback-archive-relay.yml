@@ -21,7 +21,9 @@ permissions:
 jobs:
   relay:
     name: Persist fork feedback archive and publish gate
-    if: startsWith(github.event.workflow_run.display_title, 'Codex P1 Gate relay-v1 PR #')
+    if: >-
+      ${{ startsWith(github.event.workflow_run.display_title,
+      'Codex P1 Gate relay-v1 PR #') }}
     runs-on: ubuntu-latest
     steps:
       - name: Resolve the source PR and fork boundary
@@ -40,9 +42,16 @@ jobs:
               exit 1
               ;;
           esac
-          if ! pr_json=$(gh api "repos/$REPO/pulls/$pr" 2>/dev/null); then
+          api_err=$(mktemp "${RUNNER_TEMP}/relay-pr-read.XXXXXX")
+          trap 'rm -f "$api_err"' EXIT
+          if ! pr_json=$(gh api "repos/$REPO/pulls/$pr" 2>"$api_err"); then
             # issue_comment also runs for ordinary issues. Their run title has
             # the same numeric shape, but there is no pull request to relay.
+            if ! grep -q 'HTTP 404' "$api_err"; then
+              echo "::error::Could not resolve PR #$pr for the trusted relay"
+              cat "$api_err" >&2
+              exit 1
+            fi
             echo "pr=$pr" >> "$GITHUB_OUTPUT"
             echo "head_sha=" >> "$GITHUB_OUTPUT"
             echo "is_fork=false" >> "$GITHUB_OUTPUT"
@@ -139,15 +148,14 @@ jobs:
               and (.head_sha | type == "string" and test("^[0-9a-f]{40}$"))
               and (.event_name == "pull_request" or .event_name == "pull_request_review"
                 or .event_name == "pull_request_review_comment" or .event_name == "issue_comment")
-              and (.archive_record | type == "string")
+              and (.archive_records | type == "array")
+              and all(.archive_records[];
+                type == "string" and (
+                  test("^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+/=]+ -->$") or
+                  test("^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]{64} part=[0-9]+/[0-9]+ data=[A-Za-z0-9+/=]+ -->$")
+                ))
             ' "$HANDOFF_FILE" >/dev/null
           head_sha=$(jq -r '.head_sha' "$HANDOFF_FILE")
-          archive_record=$(jq -r '.archive_record' "$HANDOFF_FILE")
-          if [ -n "$archive_record" ] \
-            && ! grep -Eq '^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+/=]+ -->$' <<<"$archive_record"; then
-            echo "::error::Fork handoff contains an invalid archive record"
-            exit 1
-          fi
 
           check_id=$(gh api --method POST "repos/$REPO/check-runs" \
             -f name="$CHECK_NAME" -f head_sha="$head_sha" -f status=in_progress \
@@ -155,13 +163,21 @@ jobs:
             -f "output[summary]=Persisting reviewer-feedback history before evaluating $head_sha." \
             --jq .id)
 
-          if [ -n "$archive_record" ]; then
+          if [ "$(jq '.archive_records | length' "$HANDOFF_FILE")" -gt 0 ]; then
             existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
-            if ! jq -e --arg body "$archive_record" 'any(.[]; (.body // "") == $body)' \
-              <<<"$existing" >/dev/null; then
+            while IFS= read -r archive_record; do
+              [ -n "$archive_record" ] || continue
+              if jq -e --arg body "$archive_record" 'any(.[]; (.body // "") == $body)' \
+                <<<"$existing" >/dev/null; then
+                continue
+              fi
               jq -n --arg body "$archive_record" '{body:$body}' \
-                | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null
-            fi
+                | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - \
+                >"$RUNNER_TEMP/posted-archive-comment.json"
+              existing=$(printf '%s\n' "$existing" \
+                | jq --slurpfile posted "$RUNNER_TEMP/posted-archive-comment.json" \
+                  '. + $posted')
+            done < <(jq -r '.archive_records[]' "$HANDOFF_FILE")
           fi
 
           rc=2

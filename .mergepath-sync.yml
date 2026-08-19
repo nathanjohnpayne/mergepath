@@ -1226,6 +1226,9 @@ paths:
   - path: .github/workflows/codex-feedback-archive-relay.yml
     type: canonical
     consumers: all
+    # This trusted workflow is the exclusive publisher for fork-originated
+    # feedback archival and the corresponding PR-head check. Its requires
+    # edges keep the evaluator and surface fingerprint on the same wave.
     requires:
       - "scripts/codex-p1-gate.sh"
       - "scripts/review-feedback-surface-fingerprint.sh"

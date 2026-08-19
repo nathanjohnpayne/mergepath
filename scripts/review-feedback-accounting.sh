@@ -275,9 +275,9 @@ while IFS= read -r comment; do
   tier=$(finding_tier "$login" "$body")
   [ -n "$tier" ] || continue
   tier_is_ignored "$tier" && continue
-  INLINE_CANDIDATES=$(printf '%s' "$INLINE_CANDIDATES" | jq -c \
-    --argjson c "$comment" --arg tier "$tier" '
-      . + [{
+  INLINE_CANDIDATES=$(printf '%s\n%s\n' "$INLINE_CANDIDATES" "$comment" | jq -cs \
+    --arg tier "$tier" '
+      .[0] + [(.[1] as $c | {
         kind: "inline",
         root_id: ($c.in_reply_to_id // $c.id),
         finding_id: $c.id,
@@ -288,7 +288,7 @@ while IFS= read -r comment; do
         path: ($c.path // "(unknown)"),
         line: ($c.line // $c.original_line // null),
         body: ($c.body // "")
-      }]
+      })]
     ')
 done <<EOF
 $(printf '%s' "$INLINE_COMMENTS" | jq -c '.[]')
@@ -310,9 +310,10 @@ agent_reply_after_finding() {
         and (.in_reply_to_id == $root)
         and (.id != $finding)
         and (((.created_at // "") > $floor)
-          or ($confirmed != "" and (.created_at // "") == $floor))
+          or ($confirmed != ""
+            and (.user.login // "") == $confirmed
+            and (.created_at // "") == $floor))
         and ((.user.login // "") as $login | ($agents | index($login)) != null)
-        and ($confirmed == "" or (.user.login // "") == $confirmed)
         and (((.body // "") | gsub("\\[mergepath-resolve:[^]]*\\]"; "")
           | gsub("^[[:space:]]+|[[:space:]]+$"; "")
           | gsub("[[:space:]]+"; " ")) as $body
@@ -363,9 +364,9 @@ while IFS= read -r finding; do
     accounted=true
     evidence="thread-reply"
   fi
-  FINDINGS=$(printf '%s' "$FINDINGS" | jq -c \
-    --argjson f "$finding" --argjson accounted "$accounted" --arg evidence "$evidence" '
-      . + [($f + {
+  FINDINGS=$(printf '%s\n%s\n' "$FINDINGS" "$finding" | jq -cs \
+    --argjson accounted "$accounted" --arg evidence "$evidence" '
+      .[0] + [(.[1] + {
         accounted: $accounted,
         evidence: (if $evidence == "" then null else $evidence end)
       })]
@@ -404,25 +405,32 @@ ack_present() {
     ' >/dev/null 2>&1
 }
 
-archive_payload() {
-  local body="$1" encoded payload
-  encoded=$(printf '%s\n' "$body" | sed -nE \
-    '1s/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/p')
-  [ -n "$encoded" ] || return 1
-  payload=$(printf '%s' "$encoded" | jq -Rer '@base64d | fromjson') || return 1
-  printf '%s' "$payload" | jq -e '
+validate_archive_payload() {
+  jq -e '
     type == "object"
+    and ((.archive_version // 1) == 1 or (.archive_version // 1) == 2)
     and ((.source_kind // "issue-comment") as $kind
       | $kind == "issue-comment" or $kind == "inline" or $kind == "review-body")
     and (.source_comment_id | type == "number" and . > 0 and floor == .)
     and (.source_login | type == "string" and length > 0)
     and (.archived_at | type == "string" and length > 0)
     and (.body_fingerprint | type == "string" and test("^[0-9a-f]{12}$"))
+    and (if (.archive_version // 1) == 2 then (.body | type == "string")
+      else ((has("body") | not) or (.body | type == "string")) end)
     and (.codex_tiers | type == "array"
       and all(.[]; . == "p0" or . == "p1" or . == "p2" or . == "p3"))
     and (.coderabbit_tiers | type == "array"
       and all(.[]; . == "p0" or . == "p1" or . == "p2" or . == "p3" or . == "nitpick"))
-  ' >/dev/null 2>&1 || return 1
+  ' >/dev/null 2>&1
+}
+
+archive_payload() {
+  local body="$1" encoded payload
+  encoded=$(printf '%s\n' "$body" | sed -nE \
+    '1s/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/p')
+  [ -n "$encoded" ] || return 1
+  payload=$(printf '%s' "$encoded" | jq -Rer '@base64d | fromjson') || return 1
+  printf '%s' "$payload" | validate_archive_payload || return 1
   printf '%s' "$payload" | jq -c '.source_kind = (.source_kind // "issue-comment")'
 }
 
@@ -450,7 +458,7 @@ EOF
 # use every distinct archived finding version when the source is now markerless
 # (or deleted). Identical delivery retries collapse by source kind + id +
 # fingerprint; a live re-raise supersedes every archive for that source.
-ARCHIVED_CANDIDATES='[]'
+ARCHIVE_ENTRIES='[]'
 while IFS= read -r archive_comment; do
   [ -n "$archive_comment" ] || continue
   archive_login=$(printf '%s' "$archive_comment" | jq -r '.user.login // ""')
@@ -458,6 +466,79 @@ while IFS= read -r archive_comment; do
   archive_body=$(printf '%s' "$archive_comment" | jq -r '.body // ""')
   payload=$(archive_payload "$archive_body" || true)
   [ -n "$payload" ] || continue
+  archive_comment_id=$(printf '%s' "$archive_comment" | jq -r '.id')
+  archived_at=$(printf '%s' "$archive_comment" | jq -r '.created_at // .updated_at // ""')
+  archive_entry=$(printf '%s' "$payload" | jq -c \
+    --argjson archive_comment_id "$archive_comment_id" --arg archived_at "$archived_at" '
+      {archive_comment_id:$archive_comment_id,archived_at:$archived_at,payload:.}
+    ')
+  ARCHIVE_ENTRIES=$(printf '%s\n%s\n' "$ARCHIVE_ENTRIES" "$archive_entry" \
+    | jq -cs '.[0] + [.[1]]')
+done <<EOF
+$(printf '%s' "$ISSUE_COMMENTS" | jq -c '.[]')
+EOF
+
+V2_ARCHIVE_ENTRIES=$(printf '%s' "$ISSUE_COMMENTS" | jq -c '
+  [
+    .[]
+    | select((.user.login // "") == "github-actions[bot]")
+    | . as $comment
+    | ((.body // "")
+      | try capture("^<!-- mergepath-feedback-archive:v2 id=(?<archive_id>[0-9a-f]{64}) part=(?<part>[0-9]+)/(?<total>[0-9]+) data=(?<data>[A-Za-z0-9+/=]+) -->$")
+        catch null) as $marker
+    | select($marker != null)
+    | {
+        archive_id: $marker.archive_id,
+        part: ($marker.part | tonumber),
+        total: ($marker.total | tonumber),
+        data: $marker.data,
+        archive_comment_id: $comment.id,
+        archived_at: ($comment.created_at // $comment.updated_at // "")
+      }
+  ]
+  | sort_by(.archive_id, .part, .archive_comment_id)
+  | group_by(.archive_id)
+  | map(
+      . as $raw_parts
+      | ($raw_parts | group_by(.part)) as $part_groups
+      | (if any($part_groups[]; (map([.total, .data]) | unique | length) != 1) then
+          error("conflicting duplicate v2 archive parts")
+        else ($part_groups | map(last))
+        end) as $parts
+      | ($parts[0].total) as $total
+      | if ($total < 1 or $total > 32)
+          or ($parts | map(.total) | unique) != [$total]
+          or ($parts | map(.part) | sort) != [range(1; $total + 1)]
+          or any($parts[]; (.data | length) < 1 or (.data | length) > 60000)
+        then error("incomplete or invalid v2 archive")
+        else {
+          archive_comment_id: ($parts | map(.archive_comment_id) | max),
+          archived_at: ($parts | sort_by(.archived_at, .archive_comment_id) | last.archived_at),
+          payload: ($parts | sort_by(.part) | map(.data) | join("") | @base64d | fromjson)
+        }
+        end
+    )
+') || die 2 "could not reconstruct chunked feedback archives"
+printf '%s' "$V2_ARCHIVE_ENTRIES" | jq -e 'all(.[]; .payload | type == "object")' \
+  >/dev/null 2>&1 || die 2 "chunked feedback archive payload is malformed"
+ARCHIVE_ENTRIES=$(printf '%s\n%s\n' "$ARCHIVE_ENTRIES" "$V2_ARCHIVE_ENTRIES" \
+  | jq -cs '.[0] + .[1]')
+
+ARCHIVED_CANDIDATES='[]'
+append_archive_candidate() {
+  local payload="$1" archive_comment_id="$2" archived_at="$3"
+  local source_kind source_id source_login source_comments source_comment
+  local live_source_login live_source_body live_source_tier archive_tiers tier
+  local body_fingerprint payload_body_json finding_kind ack_token accounted evidence
+
+  printf '%s' "$payload" | validate_archive_payload \
+    || die 2 "feedback archive payload failed schema validation"
+  if [ "$(printf '%s' "$payload" | jq -r '.archive_version // 1')" -eq 2 ]; then
+    payload_body_json=$(printf '%s' "$payload" | jq -c '.body')
+    [ "$(fingerprint "$payload_body_json")" = \
+      "$(printf '%s' "$payload" | jq -r '.body_fingerprint')" ] \
+      || die 2 "feedback archive body fingerprint mismatch"
+  fi
   source_kind=$(printf '%s' "$payload" | jq -r '.source_kind')
   source_id=$(printf '%s' "$payload" | jq -r '.source_comment_id')
   source_login=$(printf '%s' "$payload" | jq -r '.source_login')
@@ -465,35 +546,35 @@ while IFS= read -r archive_comment; do
     issue-comment)
       case "$source_login" in
         "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-        *) continue ;;
+        *) return 0 ;;
       esac
       source_comments="$ISSUE_COMMENTS"
       ;;
     inline)
       case "$source_login" in
         "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-        *) registered_reviewer_login "$source_login" || continue ;;
+        *) registered_reviewer_login "$source_login" || return 0 ;;
       esac
       source_comments="$INLINE_COMMENTS"
       ;;
     review-body)
       case "$source_login" in
         "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
-        *) registered_reviewer_login "$source_login" || continue ;;
+        *) registered_reviewer_login "$source_login" || return 0 ;;
       esac
       source_comments="$REVIEWS"
       ;;
-    *) continue ;;
+    *) return 0 ;;
   esac
 
   source_comment=$(printf '%s' "$source_comments" | jq -c \
     --argjson id "$source_id" 'first(.[] | select(.id == $id)) // null')
   if [ "$source_comment" != null ]; then
     live_source_login=$(printf '%s' "$source_comment" | jq -r '.user.login // ""')
-    [ "$live_source_login" = "$source_login" ] || continue
+    [ "$live_source_login" = "$source_login" ] || return 0
     live_source_body=$(printf '%s' "$source_comment" | jq -r '.body // ""')
     live_source_tier=$(strongest_nonignored_finding_tier "$source_login" "$live_source_body")
-    [ -z "$live_source_tier" ] || continue
+    [ -z "$live_source_tier" ] || return 0
   fi
 
   if [ "$source_login" = "$CODERABBIT_BOT" ]; then
@@ -502,10 +583,8 @@ while IFS= read -r archive_comment; do
     archive_tiers=$(printf '%s' "$payload" | jq -c '.codex_tiers')
   fi
   tier=$(strongest_nonignored_archive_tier "$archive_tiers")
-  [ -n "$tier" ] || continue
+  [ -n "$tier" ] || return 0
 
-  archive_comment_id=$(printf '%s' "$archive_comment" | jq -r '.id')
-  archived_at=$(printf '%s' "$archive_comment" | jq -r '.created_at // .updated_at // ""')
   body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
   case "$source_kind" in
     issue-comment)
@@ -527,7 +606,7 @@ while IFS= read -r archive_comment; do
     accounted=true
     evidence="comment-ack"
   fi
-  ARCHIVED_CANDIDATES=$(printf '%s' "$ARCHIVED_CANDIDATES" | jq -c \
+  ARCHIVED_CANDIDATES=$(printf '%s\n%s\n' "$ARCHIVED_CANDIDATES" "$payload" | jq -cs \
     --arg source_kind "$source_kind" --arg finding_kind "$finding_kind" \
     --argjson source_id "$source_id" \
     --argjson archive_comment_id "$archive_comment_id" \
@@ -535,7 +614,7 @@ while IFS= read -r archive_comment; do
     --arg tier "$tier" --arg archived_at "$archived_at" \
     --arg fingerprint "$body_fingerprint" --arg token "$ack_token" \
     --argjson accounted "$accounted" --arg evidence "$evidence" '
-      . + [{
+      .[0] + [(.[1] as $payload | {
         kind: $finding_kind,
         source_kind: $source_kind,
         source_id: $source_id,
@@ -548,13 +627,21 @@ while IFS= read -r archive_comment; do
         updated_at: $archived_at,
         body_fingerprint: $fingerprint,
         ack_token: $token,
-        body: ("(archived reviewer " + $source_kind + " version)"),
+        body: ($payload.body // ("(archived reviewer " + $source_kind + " version)")),
         accounted: $accounted,
         evidence: (if $evidence == "" then null else $evidence end)
-      }]
+      })]
     ')
+}
+
+while IFS= read -r archive_entry; do
+  [ -n "$archive_entry" ] || continue
+  payload=$(printf '%s' "$archive_entry" | jq -c '.payload')
+  archive_comment_id=$(printf '%s' "$archive_entry" | jq -r '.archive_comment_id')
+  archived_at=$(printf '%s' "$archive_entry" | jq -r '.archived_at')
+  append_archive_candidate "$payload" "$archive_comment_id" "$archived_at"
 done <<EOF
-$(printf '%s' "$ISSUE_COMMENTS" | jq -c '.[]')
+$(printf '%s' "$ARCHIVE_ENTRIES" | jq -c '.[]')
 EOF
 
 ARCHIVED_CANDIDATES=$(printf '%s' "$ARCHIVED_CANDIDATES" | jq -c '
@@ -562,8 +649,8 @@ ARCHIVED_CANDIDATES=$(printf '%s' "$ARCHIVED_CANDIDATES" | jq -c '
   | group_by([.source_kind, .source_id, .body_fingerprint])
   | map(last)
 ')
-FINDINGS=$(printf '%s' "$FINDINGS" | jq -c \
-  --argjson archived "$ARCHIVED_CANDIDATES" '. + $archived')
+FINDINGS=$(printf '%s\n%s\n' "$FINDINGS" "$ARCHIVED_CANDIDATES" \
+  | jq -cs '.[0] + .[1]')
 
 while IFS= read -r issue_comment; do
   [ -n "$issue_comment" ] || continue
@@ -603,7 +690,7 @@ while IFS= read -r issue_comment; do
         evidence: (if $evidence == "" then null else $evidence end)
       }
     ')
-  FINDINGS=$(printf '%s' "$FINDINGS" | jq -c --argjson f "$finding" '. + [$f]')
+  FINDINGS=$(printf '%s\n%s\n' "$FINDINGS" "$finding" | jq -cs '.[0] + [.[1]]')
 done <<EOF
 $(printf '%s' "$ISSUE_COMMENTS" | jq -c '.[]')
 EOF
@@ -650,7 +737,7 @@ while IFS= read -r review; do
         evidence: (if $evidence == "" then null else $evidence end)
       }
     ')
-  FINDINGS=$(printf '%s' "$FINDINGS" | jq -c --argjson f "$finding" '. + [$f]')
+  FINDINGS=$(printf '%s\n%s\n' "$FINDINGS" "$finding" | jq -cs '.[0] + [.[1]]')
 done <<EOF
 $(printf '%s' "$REVIEWS" | jq -c '.[]')
 EOF

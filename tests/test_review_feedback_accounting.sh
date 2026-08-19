@@ -558,6 +558,26 @@ run_gate
 assert_eq 0 "$RUN_RC" "strictly later reply accounts for the edited finding"
 
 reset_fixtures
+LARGE_INLINE_BODY="$TMP/large-inline-body.txt"
+{
+  printf '**P1** Large escaped inline finding. '
+  awk 'BEGIN { for (i = 0; i < 65500; i++) printf "%c", 92 }'
+} >"$LARGE_INLINE_BODY"
+jq -n --rawfile body "$LARGE_INLINE_BODY" '[{
+  "id": 14,
+  "in_reply_to_id": null,
+  "created_at": "2026-08-18T20:06:00Z",
+  "updated_at": "2026-08-18T20:06:00Z",
+  "user": {"login": "chatgpt-codex-connector[bot]"},
+  "path": "src/large.sh",
+  "line": 14,
+  "body": $body
+}]' >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "near-limit escaped inline finding is streamed without argv overflow"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "large inline finding remains inventoried"
+
+reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [
   {
@@ -599,6 +619,13 @@ jq '.[0].updated_at = "2026-08-18T21:02:00Z"
 mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
 run_gate
 assert_eq 0 "$RUN_RC" "CodeRabbit addressed confirmation preserves the substantive reply it confirms"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-confirmed.json"
+jq '.[1].user.login = "nathanpayne-codex"
+  | .[1].created_at = "2026-08-18T21:03:00Z"' \
+  "$TMP/fixtures/inline-confirmed.json" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "strictly later configured-identity reply remains valid beside a CodeRabbit confirmation"
+mv "$TMP/fixtures/inline-confirmed.json" "$TMP/fixtures/inline.json"
 jq '.[0].body |= sub("✅ Confirmed as addressed by @nathanjohnpayne"; "Address confirmation removed")' \
   "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
 mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
@@ -830,8 +857,15 @@ ARCHIVE_DATA=$(printf '%s' "$ARCHIVE_MARKER" \
   | sed -E 's/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/' \
   | jq -Rr '@base64d | fromjson')
 assert_eq 8000 "$(printf '%s' "$ARCHIVE_DATA" | jq -r '.source_comment_id')" "archive record stays bound to the rewritten source comment"
+assert_eq "$(cat "$PREVIOUS_SUMMARY")" "$(printf '%s' "$ARCHIVE_DATA" | jq -r '.body')" "archive record preserves the complete reviewer finding body"
 ARCHIVE_FINGERPRINT=$(printf '%s' "$ARCHIVE_DATA" | jq -r '.body_fingerprint')
 EXPECTED_ARCHIVE_ACK="[mergepath-comment-ack: 8000 $ARCHIVE_FINGERPRINT]"
+
+PREVIOUS_ARCHIVE="$TMP/previous-archive-marker.txt"
+printf '%s\n' "$ARCHIVE_MARKER" >"$PREVIOUS_ARCHIVE"
+RESTORED_ARCHIVE=$($RENDER_ARCHIVE issue-comment 8002 'github-actions[bot]' \
+  '2026-08-18T22:23:02Z' "$PREVIOUS_ARCHIVE")
+assert_eq "$ARCHIVE_MARKER" "$RESTORED_ARCHIVE" "archive-marker mutation re-emits the immutable history record"
 
 jq -n --arg archive "$ARCHIVE_MARKER" --arg token "$EXPECTED_ARCHIVE_ACK" '[
   {
@@ -890,6 +924,49 @@ mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "distinct removed summary versions remain separate findings"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing_count')" "acknowledging one archived version cannot erase another"
+
+reset_fixtures
+LARGE_ARCHIVE_BODY="$TMP/large-archive-body.txt"
+{
+  printf '**P1** Large archived finding. '
+  awk 'BEGIN { for (i = 0; i < 65500; i++) printf "%c", 92 }'
+} >"$LARGE_ARCHIVE_BODY"
+LARGE_ARCHIVE=$($RENDER_ARCHIVE inline 8600 'chatgpt-codex-connector[bot]' \
+  '2026-08-18T22:25:30Z' "$LARGE_ARCHIVE_BODY")
+assert_match '^<!-- mergepath-feedback-archive:v2 ' "$(printf '%s\n' "$LARGE_ARCHIVE" | sed -n '1p')" "oversized archive uses chunked v2 records"
+if [ "$(printf '%s\n' "$LARGE_ARCHIVE" | awk 'END { print NR }')" -gt 1 ]; then
+  pass "oversized archive spans more than one durable comment"
+else
+  fail "oversized archive spans more than one durable comment"
+fi
+FIRST_LARGE_ARCHIVE=$(printf '%s\n' "$LARGE_ARCHIVE" | sed -n '1p')
+printf '%s\n' "$FIRST_LARGE_ARCHIVE" >"$PREVIOUS_ARCHIVE"
+RESTORED_LARGE_ARCHIVE=$($RENDER_ARCHIVE issue-comment 8601 'github-actions[bot]' \
+  '2026-08-18T22:25:31Z' "$PREVIOUS_ARCHIVE")
+if [ "$RESTORED_LARGE_ARCHIVE" = "$FIRST_LARGE_ARCHIVE" ]; then
+  pass "chunked archive-marker mutation re-emits the exact record"
+else
+  fail "chunked archive-marker mutation re-emits the exact record"
+fi
+printf '%s\n' "$LARGE_ARCHIVE" | jq -Rs '
+  split("\n") | map(select(length > 0)) | to_entries
+  | map({
+      id: (8601 + .key),
+      created_at: "2026-08-18T22:25:31Z",
+      updated_at: "2026-08-18T22:25:31Z",
+      user: {login: "github-actions[bot]"},
+      body: .value
+    })
+' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "complete chunked archive remains an undispositioned finding"
+assert_eq "$(wc -c <"$LARGE_ARCHIVE_BODY" | tr -d ' ')" \
+  "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].body | length')" \
+  "chunked archive reconstructs the complete finding body"
+jq 'del(.[-1])' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "incomplete chunked archive fails closed"
 
 reset_fixtures
 PREVIOUS_INLINE="$TMP/previous-inline.txt"
@@ -1146,6 +1223,11 @@ if grep -Eq -- '--argjson (findings|missing)([[:space:]\\]|$)' "$SCRIPT"; then
   fail "final result must stream finding arrays instead of passing them through argv"
 else
   pass "final result streams finding arrays instead of passing them through argv"
+fi
+if grep -F -- "--argjson c \"\$comment\"" "$SCRIPT" >/dev/null; then
+  fail "inline finding inventory must stream each comment instead of passing it through argv"
+else
+  pass "inline finding inventory streams each comment instead of passing it through argv"
 fi
 if grep -Eq -- '--argjson (inline|reviews|issues)([[:space:]\\]|$)' "$SURFACE_FINGERPRINT"; then
   fail "surface fingerprint must stream complete histories instead of passing them through argv"

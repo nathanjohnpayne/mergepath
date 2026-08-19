@@ -161,41 +161,46 @@ jobs:
           fi
 
           previous_file=$(mktemp "${RUNNER_TEMP}/feedback-previous.XXXXXX")
+          archive_records_file=$(mktemp "${RUNNER_TEMP}/feedback-archive-records.XXXXXX")
           payload_file=$(mktemp "${RUNNER_TEMP}/feedback-archive-payload.XXXXXX")
-          trap 'rm -f "$previous_file" "$payload_file"' EXIT
+          trap 'rm -f "$previous_file" "$archive_records_file" "$payload_file"' EXIT
 
-          archive_record=""
           if [ -n "$source_kind" ]; then
             if [ "$EVENT_ACTION" = edited ]; then
               jq -r '.changes.body.from // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
             else
               jq -r '.comment.body // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
             fi
-            # The renderer emits one hidden
-            # <!-- mergepath-feedback-archive:v1 ... --> record.
-            archive_record=$(scripts/render-feedback-archive.sh \
-              "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file")
+            # The renderer emits one v1 record or a complete set of chunked v2
+            # records when the full prior body cannot fit in one comment.
+            scripts/render-feedback-archive.sh \
+              "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file" \
+              >"$archive_records_file"
           fi
 
-          if [ "$is_fork" != true ] && [ -n "$archive_record" ]; then
+          if [ "$is_fork" != true ] && [ -s "$archive_records_file" ]; then
             existing=$(gh api --paginate "repos/$REPO/issues/$pr/comments" | jq -s 'add // []')
-            if jq -e --arg body "$archive_record" 'any(.[]; (.body // "") == $body)' \
-              <<<"$existing" >/dev/null; then
-              echo "Feedback version already archived for $source_kind $source_id."
-            else
+            while IFS= read -r archive_record; do
+              [ -n "$archive_record" ] || continue
+              if jq -e --arg body "$archive_record" 'any(.[]; (.body // "") == $body)' \
+                <<<"$existing" >/dev/null; then
+                echo "Feedback archive record already persisted for $source_kind $source_id."
+                continue
+              fi
               jq -n --arg body "$archive_record" '{body:$body}' >"$payload_file"
-              gh api --method POST "repos/$REPO/issues/$pr/comments" \
-                --input "$payload_file" >/dev/null
-              echo "Archived the prior reviewer-feedback version for $source_kind $source_id."
-            fi
+              posted=$(gh api --method POST "repos/$REPO/issues/$pr/comments" \
+                --input "$payload_file")
+              existing=$(printf '%s\n%s\n' "$existing" "$posted" | jq -cs '.[0] + [.[1]]')
+              echo "Archived one reviewer-feedback record for $source_kind $source_id."
+            done <"$archive_records_file"
           fi
 
           if [ "$is_fork" = true ]; then
             jq -n \
+              --rawfile archive_records "$archive_records_file" \
               --arg repo "$REPO" --argjson pr "$pr" --arg head_sha "$head_sha" \
               --argjson source_run_id "$SOURCE_RUN_ID" --arg event_name "$EVENT_NAME" \
-              --arg archive_record "$archive_record" \
-              '{version:1,repo:$repo,pr:$pr,head_sha:$head_sha,source_run_id:$source_run_id,event_name:$event_name,is_fork:true,archive_record:$archive_record}' \
+              '{version:1,repo:$repo,pr:$pr,head_sha:$head_sha,source_run_id:$source_run_id,event_name:$event_name,is_fork:true,archive_records:($archive_records | split("\n") | map(select(length > 0)))}' \
               >"$RUNNER_TEMP/codex-p1-fork-handoff.json"
           fi
 
@@ -504,6 +509,18 @@ jobs:
         run: |
           set -euo pipefail
           had_infra_error=0
+          MAX_RELAY_SOURCE_RUNS=1000
+          fingerprint_available=false
+          if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
+            if grep -Fq 'path: scripts/review-feedback-surface-fingerprint.sh' \
+              .mergepath-sync.yml; then
+              echo "::error::Installed feedback-fingerprint helper is missing or not executable"
+              exit 1
+            fi
+            echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the manifest-absent bootstrap window"
+          else
+            fingerprint_available=true
+          fi
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
             echo "::group::Sweep PR #$PR"
@@ -514,6 +531,7 @@ jobs:
             pr_json=$(gh api "repos/$REPO/pulls/$PR")
             head_sha=$(jq -r '.head.sha' <<<"$pr_json")
             is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
+            pr_created_at=$(jq -r '.created_at // ""' <<<"$pr_json")
             if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
               echo "::error::Could not resolve head SHA for PR #$PR; cannot open a fail-closed lease"
               had_infra_error=1
@@ -541,39 +559,61 @@ jobs:
             fi
 
             relay_pending=false
+            relay_scan_error=false
             if [ "$is_fork" = true ]; then
-              source_runs=$(gh api --paginate \
-                "repos/$REPO/actions/workflows/codex-p1-gate.yml/runs?per_page=100" \
-                | jq -s --arg title "Codex P1 Gate relay-v1 PR #$PR" \
-                  '[.[].workflow_runs[] | select(.display_title == $title) | .id]')
-              relay_comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" | jq -s 'add // []')
-              completed_runs=$(printf '%s' "$relay_comments" | jq -c '[
-                .[] | select(.user.login == "github-actions[bot]") | .body // ""
-                | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=complete -->$").run
-                  catch empty
-                | tonumber
-              ]')
-              if jq -e --argjson complete "$completed_runs" \
-                'any(.[] as $run; ($complete | index($run)) == null)' <<<"$source_runs" >/dev/null; then
-                relay_pending=true
+              source_runs='[]'
+              source_page=1
+              while :; do
+                if ! source_page_json=$(gh api --method GET \
+                  "repos/$REPO/actions/workflows/codex-p1-gate.yml/runs" \
+                  -f per_page=100 -f page="$source_page" -f created=">=$pr_created_at"); then
+                  relay_scan_error=true
+                  break
+                fi
+                source_total=$(jq -r '.total_count // 0' <<<"$source_page_json")
+                if [ "$source_total" -gt "$MAX_RELAY_SOURCE_RUNS" ]; then
+                  echo "::error::Fork relay source run scan exceeded the fail-closed bound of $MAX_RELAY_SOURCE_RUNS for PR #$PR"
+                  relay_scan_error=true
+                  break
+                fi
+                page_runs=$(jq -c --arg title "Codex P1 Gate relay-v1 PR #$PR" \
+                  '[.workflow_runs[] | select(.display_title == $title) | .id]' \
+                  <<<"$source_page_json")
+                source_runs=$(printf '%s\n%s\n' "$source_runs" "$page_runs" \
+                  | jq -cs '.[0] + .[1]')
+                [ $((source_page * 100)) -ge "$source_total" ] && break
+                source_page=$((source_page + 1))
+              done
+              if [ "$relay_scan_error" != true ]; then
+                if ! relay_comments=$(gh api --paginate \
+                  "repos/$REPO/issues/$PR/comments" | jq -s 'add // []'); then
+                  relay_scan_error=true
+                else
+                  terminal_runs=$(printf '%s' "$relay_comments" | jq -c '[
+                    .[] | select(.user.login == "github-actions[bot]") | .body // ""
+                    | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=(?<status>complete|failed) -->$").run
+                      catch empty
+                    | tonumber
+                  ]')
+                  if jq -e --argjson terminal "$terminal_runs" \
+                    'any(.[] as $run; ($terminal | index($run)) == null)' \
+                    <<<"$source_runs" >/dev/null; then
+                    relay_pending=true
+                  fi
+                fi
               fi
             fi
 
-            if [ "$relay_pending" = true ]; then
+            if [ "$relay_scan_error" = true ]; then
+              output="Trusted fork feedback-archive source run scan failed closed."
+              rc=2
+              had_infra_error=1
+            elif [ "$relay_pending" = true ]; then
               output="Trusted fork feedback-archive relay is still pending; refusing scheduled clearance."
               rc=1
             else
-              fingerprint_available=false
-              if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
-                if grep -Fq 'path: scripts/review-feedback-surface-fingerprint.sh' \
-                  .mergepath-sync.yml; then
-                  echo "::error::Installed feedback-fingerprint helper is missing or not executable"
-                  exit 1
-                fi
-                echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the manifest-absent bootstrap window"
-                feedback_fp_before="bootstrap-unavailable"
-              else
-                fingerprint_available=true
+              feedback_fp_before="bootstrap-unavailable"
+              if [ "$fingerprint_available" = true ]; then
                 feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh \
                   "$PR" "$REPO")
               fi
