@@ -1351,12 +1351,23 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         # so the two callers are not an optimisation, they are the
         # correctness condition.
         #
-        # Clearing on a line with no marker at all belongs to the caller,
-        # not the step, because only the caller knows a marker was looked
-        # for and not found.
+        # Clearing belongs to the caller, not the step, because only the
+        # caller knows a marker was looked for and not found — and
+        # because the quote ends on a SECOND condition the step cannot
+        # see. A quoted fence ends with the container it was opened in,
+        # exactly as `fence_base` makes a plain fence do: a fenced code
+        # block has no lazy continuation, so a quote marker LEFT of that
+        # container is a different quote in a different block, and the
+        # item holding the first one ended there. Carrying the fence
+        # across blanks that line instead — a bare `#NN` in the new
+        # quote goes unflagged, which is the UNDER-reporting direction —
+        # so `qfence_base` records the container at OPEN time and the
+        # outdent ends the fence with it.
         qmark = (ind < container_base + 4 && substr(rest, 1, 1) == ">")
-        if (qfence && !qmark) { qfence = 0; qfence_char = ""; qfence_len = 0 }
-        if (qmark && quote_fence(rest, ind)) {
+        if (qfence && (!qmark || ind < qfence_base)) {
+          qfence = 0; qfence_char = ""; qfence_len = 0; qfence_base = 0
+        }
+        if (qmark && quote_fence(rest, ind, container_base)) {
           para = 0; quote_para = 0
           print ""; next
         }
@@ -1695,7 +1706,7 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         # first character is a list marker carries no quote marker of its
         # own and therefore ends any quote that was open.
         if (marker_open && substr(item_rest, 1, 1) == ">") {
-          if (quote_fence(item_rest, list_indent)) {
+          if (quote_fence(item_rest, list_indent, list_indent)) {
             para = 0; quote_para = 0
             print ""; next
           }
@@ -1752,10 +1763,19 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
       }
 
       # One step of the quoted-fence state machine, over a BLOCK QUOTE
-      # marker line whose content `s` begins at column `col` inside its
-      # container. Returns 1 when the line is a quoted fence delimiter
-      # or the body of one — blank it — and 0 when it is ordinary quoted
-      # prose the caller should go on scanning.
+      # marker line whose marker sits at column `col` inside the
+      # container whose content indent is `base`. Returns 1 when the
+      # line is a quoted fence delimiter or the body of one — blank it —
+      # and 0 when it is ordinary quoted prose the caller should go on
+      # scanning.
+      #
+      # `col` and `base` differ for the same reason `ind` and
+      # `container_base` do at the top of the rule: the marker may sit
+      # up to three columns past the container it is in and still be
+      # that container. `col` is where the marker actually is, which is
+      # what the blanks after it are measured from; `base` is the
+      # container the fence belongs to, recorded so an outdent can end
+      # it.
       #
       # The marker consumes at most ONE column of the blanks after it;
       # what remains is the quote-relative indent, measured in columns
@@ -1768,7 +1788,7 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
       # Ending the quote is NOT here. Only the caller knows whether it
       # looked for a marker and failed to find one, which is what ends
       # the quote and any fence it holds.
-      function quote_fence(s, col,   gap, text, rel, run) {
+      function quote_fence(s, col, base,   gap, text, rel, run) {
         gap = substr(s, 2)
         sub(/[^ \t].*$/, "", gap)
         text = substr(s, length(gap) + 2)
@@ -1781,9 +1801,10 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
             qfence = 1
             qfence_char = fence_delim_char
             qfence_len = run
+            qfence_base = base
           } else if (fence_delim_char == qfence_char && run >= qfence_len &&
                      substr(text, run + 1) !~ /[^ \t]/) {
-            qfence = 0; qfence_char = ""; qfence_len = 0
+            qfence = 0; qfence_char = ""; qfence_len = 0; qfence_base = 0
           }
           return 1
         }
@@ -3763,9 +3784,18 @@ FGAP_EOF
   # it. Found by CodeRabbit on this PR and confirmed against the
   # renderer before it was fixed.
   #
+  # Lines 34-36 pin the same rule at the other end. A quoted fence ends
+  # with the container it was opened in, the way `fence_base` makes a
+  # plain fence do (case 61): line 36 carries a quote marker, but at
+  # column zero it is a DIFFERENT quote in a different block, and the
+  # item holding the fence ended there. Carrying the fence across it
+  # blanks line 36 and ships `#1313` unflagged, which `main` does not do
+  # — under-reporting introduced by the fix, so the shape is pinned
+  # rather than left to the matrix.
+  #
   # markdown-it-py 4.2.0 in commonmark mode renders lines 3-5, 9-10,
-  # 14-16, 20-21 and 29-31 inside `<pre><code>` and lines 7, 12, 18, 25,
-  # 27 and 32 inside `<p>`.
+  # 14-16, 20-21, 29-31 and 34-35 inside `<pre><code>` and lines 7, 12,
+  # 18, 25, 27, 32 and 36 inside `<p>`.
   QFENCE_DOC="$WORKDIR/consumer-truth-quote-fence.md"
   cat > "$QFENCE_DOC" <<'QFENCE_EOF'
 # Doc
@@ -3800,14 +3830,18 @@ A bare #999 in prose is real.
   > #1010 fenced in a quote inside a list item
   > ```
   > A bare #1111 in that quoted prose is real.
+
+- > ```
+  > #1212 fenced in the item quote
+> #1313 at column zero is a new quote, not more fence
 QFENCE_EOF
   set +e
   qfence_hits=$(md_prose_only "$QFENCE_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
   qfence_lines=$(md_prose_only "$QFENCE_DOC" | wc -l | tr -d ' ')
   qfence_raw=$(wc -l < "$QFENCE_DOC" | tr -d ' ')
   set -e
-  if [ "$qfence_hits" != "7,12,18,21,25,27,32," ]; then
-    fail "Case 66: expected lines 7,12,18,21,25,27,32 flagged (a quoted fence blanks its body and closes wherever the quote starts, a blank line ends both, and quoted indented code on lines 20-21 stays the declared boundary), got '$qfence_hits'"
+  if [ "$qfence_hits" != "7,12,18,21,25,27,32,36," ]; then
+    fail "Case 66: expected lines 7,12,18,21,25,27,32,36 flagged (a quoted fence blanks its body, closes wherever the quote starts, and ends with the container it opened in; a blank line ends both, and quoted indented code on lines 20-21 stays the declared boundary), got '$qfence_hits'"
   elif [ "$qfence_lines" != "$qfence_raw" ]; then
     fail "Case 66: md_prose_only must emit one line per input line, got $qfence_lines for $qfence_raw"
   else
