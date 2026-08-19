@@ -149,6 +149,11 @@ fi
 # Canonical thread-resolution helper (HEAD-freshness guarded, bot-only).
 RESOLVE_THREADS="$SCRIPT_DIR/resolve-pr-threads.sh"
 
+# Complete-history reviewer-feedback accounting gate (#1000). --admin merges
+# past every required check, including the CI backstop that normally reports an
+# unaccounted finding, so this dispatcher has to run the gate itself.
+FEEDBACK_ACCOUNTING_GATE="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-$SCRIPT_DIR/review-feedback-accounting.sh}"
+
 OVERALL_RC=0
 
 for ref in "$@"; do
@@ -429,6 +434,33 @@ for ref in "$@"; do
     OVERALL_RC=1
     continue
   fi
+
+  # Gate 5 — reconcile every reviewer finding in the PR's complete history
+  # with finding-bound disposition evidence (#1000). Gate 4 above only proves
+  # that no review CONVERSATION is open; a finding carried in a top-level
+  # review body or a PR-level comment has no thread at all, and --admin merges
+  # past the required check that would otherwise report it. Fail closed on any
+  # non-zero exit: a miss (1) and an infrastructure error (2) are both reasons
+  # not to force a merge.
+  if [ ! -x "$FEEDBACK_ACCOUNTING_GATE" ]; then
+    printf '  ✗ %s missing — refusing --admin merge (cannot verify feedback accounting)\n' "$FEEDBACK_ACCOUNTING_GATE"
+    OVERALL_RC=1
+    continue
+  fi
+  accounting_rc=0
+  accounting_json=$("$FEEDBACK_ACCOUNTING_GATE" "$num" "$repo") || accounting_rc=$?
+  if [ "$accounting_rc" -ne 0 ]; then
+    printf '%s\n' "$accounting_json" >&2
+    if [ "$accounting_rc" -eq 1 ]; then
+      printf '  ✗ reviewer feedback is unaccounted — refusing --admin merge (disposition every finding first)\n'
+    else
+      printf '  ✗ feedback accounting exited %d — refusing --admin merge (fail closed)\n' "$accounting_rc"
+    fi
+    OVERALL_RC=1
+    continue
+  fi
+  printf '  · reviewer feedback accounted (%s findings)\n' \
+    "$(printf '%s' "$accounting_json" | jq -r '.posted // "?"' 2>/dev/null || echo '?')"
 
   # Pin the merge to the exact HEAD the gates above validated. Without
   # --match-head-commit, a push/force-push landing between gate evaluation

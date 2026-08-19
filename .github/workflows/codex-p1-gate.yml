@@ -90,6 +90,10 @@ jobs:
       requires_relay: ${{ steps.prepare.outputs.requires_relay }}
       pr_actor: ${{ steps.prepare.outputs.pr_actor }}
     permissions:
+      # Read this run's own creation time so a review-edit archive record is
+      # stable across re-runs of the same run id (a wall-clock stamp would
+      # re-archive an unchanged payload and stale a valid acknowledgement).
+      actions: read
       contents: read
       # Same-repository events normally append directly. Fork and Dependabot
       # events can only upload a handoff artifact; the trusted workflow_run
@@ -164,7 +168,17 @@ jobs:
             source_kind=review-body
             source_id=$(jq -r '.review.id' "$GITHUB_EVENT_PATH")
             source_login=$(jq -r '.review.user.login // ""' "$GITHUB_EVENT_PATH")
-            archived_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            # A review-edit webhook carries no edit timestamp — `submitted_at` is
+            # immutable and predates the edit, so it cannot serve as the archive
+            # floor. Wall-clock cannot either: re-running this workflow without a
+            # further edit would render a DIFFERENT record for the identical
+            # payload, advance the evidence floor, and invalidate an
+            # acknowledgement that already dispositioned the finding. The run's
+            # creation time is stable across attempts of the same run id and
+            # still postdates the edit that created the run, so repeated
+            # processing of one edit stays idempotent.
+            archived_at=$(gh api "repos/$REPO/actions/runs/$GITHUB_RUN_ID" \
+              --jq '.created_at')
           fi
 
           previous_file=$(mktemp "${RUNNER_TEMP}/feedback-previous.XXXXXX")
@@ -248,6 +262,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           CHECK_NAME: "Codex P1 unresolved threads"
+          EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ needs.archive-edited-feedback.outputs.pr }}
           HEAD_SHA: ${{ needs.archive-edited-feedback.outputs.head_sha }}
           IS_FORK: ${{ needs.archive-edited-feedback.outputs.is_fork }}
@@ -259,7 +274,67 @@ jobs:
           is_fork="$IS_FORK"
           requires_relay="$REQUIRES_RELAY"
           if [ -z "$pr" ] || [ "$pr" = null ] || [ -z "$head_sha" ] || [ "$head_sha" = null ]; then
+            # The archive job failed before its prepare step published the PR
+            # binding — a checkout failure, or the issue_comment path's PR API
+            # read. Exiting here is not enough: on issue_comment (and the other
+            # default-branch events) this job's NATIVE check attaches to the
+            # default branch, not the PR head, so a bare failure leaves the
+            # older successful "Codex P1 unresolved threads" check authoritative
+            # on an unchanged PR head until the 15-minute sweep. Recover the PR
+            # head from the webhook payload — which is independent of the failed
+            # job's outputs — and publish the PR-head failure ourselves, the same
+            # always-run posture the relay uses for a missing handoff. Publishing
+            # a terminal failure can supersede a newer generation, but failing
+            # closed is the safe direction and the sweep republishes the truth.
             echo "::error::Could not bind the gate lease to a PR number and head SHA"
+            recovered_head=""
+            recovered_fork=false
+            recovered_actor=""
+            case "$EVENT_NAME" in
+              pull_request|pull_request_review|pull_request_review_comment)
+                recovered_head=$(jq -r '.pull_request.head.sha // ""' "$GITHUB_EVENT_PATH")
+                recovered_fork=$(jq -r '.pull_request.head.repo.fork // false' "$GITHUB_EVENT_PATH")
+                recovered_actor=$(jq -r '.pull_request.user.login // ""' "$GITHUB_EVENT_PATH")
+                ;;
+              issue_comment)
+                recovered_pr=$(jq -r '.issue.number // ""' "$GITHUB_EVENT_PATH")
+                recovered_json=""
+                if [ -n "$recovered_pr" ] && [ "$recovered_pr" != null ]; then
+                  recovered_json=$(gh api "repos/$REPO/pulls/$recovered_pr" 2>/dev/null) \
+                    || recovered_json=""
+                fi
+                if [ -n "$recovered_json" ]; then
+                  recovered_head=$(jq -r '.head.sha // ""' <<<"$recovered_json")
+                  recovered_fork=$(jq -r '.head.repo.fork // false' <<<"$recovered_json")
+                  recovered_actor=$(jq -r '.user.login // ""' <<<"$recovered_json")
+                fi
+                ;;
+            esac
+            requires_relay="$recovered_fork"
+            if [ "$recovered_actor" = 'dependabot[bot]' ]; then
+              requires_relay=true
+            fi
+            # Recompute the read-only boundary before writing anything. A fork
+            # or Dependabot run holds a read-only token, and its missing handoff
+            # already publishes the PR-head failure from the trusted relay.
+            if [ "$requires_relay" = true ]; then
+              echo "Read-only PR event: the trusted workflow_run relay publishes the PR-head failure for the missing handoff."
+              exit 0
+            fi
+            case "$recovered_head" in
+              [0-9a-f]*)
+                summary="The reviewer-feedback archive job failed before it could bind this run to a PR head, so the feedback history for $recovered_head was never evaluated. Rerun the Codex P1 Gate workflow; the scheduled sweep also re-evaluates every 15 minutes."
+                gh api --method POST "repos/$REPO/check-runs" \
+                  -f name="$CHECK_NAME" -f head_sha="$recovered_head" \
+                  -f status=completed -f conclusion=failure \
+                  -f "output[title]=Codex feedback gate — reviewer-feedback archive did not publish its PR binding" \
+                  -f "output[summary]=$summary" >/dev/null \
+                  || echo "::error::Could not publish the PR-head failure on $recovered_head"
+                ;;
+              *)
+                echo "::error::Could not recover a PR head from the $EVENT_NAME payload; no PR-head failure published"
+                ;;
+            esac
             exit 1
           fi
           echo "pr=$pr" >> "$GITHUB_OUTPUT"

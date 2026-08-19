@@ -197,6 +197,13 @@ INLINE_COMMENTS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inlin
 REVIEWS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects")
 ISSUE_COMMENTS=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments")
 
+# A source run blocks only when EVERY terminal marker it carries says failed.
+# Recency cannot decide this: restoring an edited or deleted marker reposts the
+# exact prior body under a new comment id and created_at, so the restored copy
+# always sorts last and a stale completion could mask a later failure (or a
+# stale failure could invent a permanent block). Presence of a completion is the
+# durable fact — the archive it records cannot be un-persisted by a later rerun
+# that no longer finds its artifact — and presence is immune to reordering.
 RELAY_FAILURE_RUN=$(printf '%s' "$ISSUE_COMMENTS" | jq -r '
   [
     .[]
@@ -215,8 +222,8 @@ RELAY_FAILURE_RUN=$(printf '%s' "$ISSUE_COMMENTS" | jq -r '
   ]
   | sort_by(.run, .created_at, .id)
   | group_by(.run)
-  | map(last)
-  | first(.[] | select(.status == "failed") | .run) // empty
+  | map(select(all(.[]; .status == "failed")) | .[0].run)
+  | first // empty
 ') || die 2 "could not validate read-only feedback archive relay state"
 if [ -n "$RELAY_FAILURE_RUN" ]; then
   die 2 "read-only feedback archive relay failed for source run $RELAY_FAILURE_RUN; prior feedback may be unrecoverable"

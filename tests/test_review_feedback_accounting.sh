@@ -196,6 +196,13 @@ jq '. + [{
 mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 0 "$RUN_RC" "a successful rerun supersedes the same source run failure marker"
+# A completion is durable in EITHER posting order. Recency cannot decide this:
+# restoring an edited or deleted terminal marker reposts the exact prior body
+# under a new comment id and created_at, so the restored copy always sorts last.
+# Under a latest-wins rule, restoring a stale completion would mask a real
+# failure — the fail-OPEN direction. Presence of a completion is the durable
+# fact (the archive it records cannot be un-persisted by a later rerun that no
+# longer finds its artifact), and presence is immune to that reordering.
 jq '. + [{
   "id": 4,
   "created_at": "2026-08-18T19:02:00Z",
@@ -204,7 +211,20 @@ jq '. + [{
 }]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
 mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
-assert_eq 2 "$RUN_RC" "the latest terminal marker remains authoritative after a later rerun failure"
+assert_eq 0 "$RUN_RC" "a completion marker survives a later spurious rerun failure for the same source run"
+
+# ...and a restored completion cannot launder a DIFFERENT source run that only
+# ever failed, so the presence rule is scoped per run rather than per PR.
+jq '. + [{
+  "id": 5,
+  "created_at": "2026-08-18T19:03:00Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": "<!-- mergepath-feedback-archive-relay:v1 run=67890 status=failed -->"
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "a failure-only source run still blocks alongside a completed one"
+assert_match 'read-only feedback archive relay.*67890' "$RUN_ERR" "the block names the run that never completed"
 
 # The documented direct invocation runs after op-preflight, which exports the
 # scoped PAT but deliberately leaves GH_TOKEN unset. The helper must bridge the
