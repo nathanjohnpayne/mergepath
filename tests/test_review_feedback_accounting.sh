@@ -193,6 +193,29 @@ assert_eq 2 "$RUN_RC" "unreadable governing review policy is an infrastructure e
 assert_match 'governing review policy is unreadable' "$RUN_ERR" "unreadable policy failure names the missing surface"
 mv "$TMP/review-policy.unreadable.yml" "$TMP/review-policy.yml"
 
+cp "$TMP/review-policy.yml" "$TMP/review-policy.block-style.yml"
+cat >"$TMP/review-policy.yml" <<'JSON'
+{"author_identity":"nathanjohnpayne","available_reviewers":["nathanpayne-release"],"coderabbit":{"bot_login":"coderabbitai[bot]"},"codex":{"bot_login":"chatgpt-codex-connector[bot]"},"feedback_policy":{"mode":"by-priority","priorities":{"p1":"required"}}}
+JSON
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 8,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T19:40:00Z",
+    "user": {"login": "nathanpayne-release"},
+    "path": "src/flow-policy.sh",
+    "line": 2,
+    "body": "**P1** Flow-style reviewer policy must be enforced."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "schema-valid flow-style policy preserves registered reviewer findings"
+assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "flow-style reviewer identity is inventoried"
+mv "$TMP/review-policy.block-style.yml" "$TMP/review-policy.yml"
+
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [

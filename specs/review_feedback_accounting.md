@@ -24,6 +24,8 @@ Feature: every bot-authored or registered external-reviewer finding on a pull re
 
 The script emits one compact JSON object with `status`, `repo`, `pr_number`, `posted`, `accounted`, `missing_count`, `findings`, and `missing`. Every finding carries its shape, reviewer, tier, identifier, disposition state, and evidence kind; review-body and issue-comment misses also carry the exact acknowledgement token needed to retire them.
 
+The governing policy is parsed once into JSON and all accounting decisions consume that representation, so block-style and flow-style YAML are equivalent. Runtime validation requires `jq` plus one YAML parser: mikefarah `yq`, Python 3 with PyYAML, or Ruby with its standard YAML library. If none is available, or if parsing/schema validation fails, the gate exits `2` rather than applying layout-dependent defaults.
+
 - Exit `0`: every inventoried finding is accounted (`posted == accounted`).
 - Exit `1`: one or more findings are unaccounted. JSON is still emitted and stderr names the remediation for each missing finding.
 - Exit `2`: usage, configuration, cryptographic-tooling, or GitHub API failure. Callers fail closed.

@@ -9,6 +9,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEFAULT_CONFIG="$REPO_ROOT/.github/review-policy.yml"
 CONFIG="${REVIEW_FEEDBACK_ACCOUNTING_CONFIG:-}"
 RESOLVED_CONFIG=""
+POLICY_JSON=""
 
 # Read-only helper: use the cached reviewer PAT when the caller followed the
 # normal op-preflight contract but did not export GH_TOKEN explicitly (#282).
@@ -132,54 +133,24 @@ puts JSON.generate(value)
         and all((.feedback_policy // {}).priorities[]; type == "string")))
   ' >/dev/null 2>&1 \
     || die 2 "governing review policy has an invalid accounting schema: $CONFIG"
+  POLICY_JSON="$parsed"
 }
 
 validate_governing_policy
 
 policy_top_field() {
   local field="$1"
-  [ -r "$CONFIG" ] || return 0
-  awk -v field="$field" '
-    /^[^[:space:]#]/ && $1 == field":" {
-      sub(/^[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^["\047]|["\047][[:space:]]*(#.*)?$/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
-      sub(/[[:space:]]+$/, "", $0)
-      print
-      exit
-    }
-  ' "$CONFIG"
+  printf '%s' "$POLICY_JSON" | jq -r --arg field "$field" '.[$field] // empty'
 }
 
 policy_block_field() {
   local block="$1" field="$2"
-  [ -r "$CONFIG" ] || return 0
-  awk -v block="$block" -v field="$field" '
-    $0 ~ "^" block ":" { in_block=1; next }
-    in_block && /^[^[:space:]#]/ { in_block=0 }
-    in_block && $1 == field":" {
-      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^["\047]|["\047][[:space:]]*(#.*)?$/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
-      sub(/[[:space:]]+$/, "", $0)
-      print
-      exit
-    }
-  ' "$CONFIG"
+  printf '%s' "$POLICY_JSON" | jq -r --arg block "$block" --arg field "$field" \
+    '.[$block][$field] // empty'
 }
 
 policy_reviewers() {
-  [ -r "$CONFIG" ] || return 0
-  awk '
-    /^available_reviewers:/ { in_list=1; next }
-    in_list && /^[^[:space:]#]/ { in_list=0 }
-    in_list && /^[[:space:]]*-[[:space:]]*/ {
-      sub(/^[[:space:]]*-[[:space:]]*/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
-      gsub(/^["\047]|["\047][[:space:]]*$/, "", $0)
-      if ($0 != "") print
-    }
-  ' "$CONFIG"
+  printf '%s' "$POLICY_JSON" | jq -r '.available_reviewers[]?'
 }
 
 AUTHOR_IDENTITY=$(policy_top_field author_identity)
@@ -207,14 +178,15 @@ registered_reviewer_login() {
 
 tier_is_ignored() {
   local tier="$1" mode disposition
-  mode=$(feedback_policy_field mode "$CONFIG")
+  mode=$(printf '%s' "$POLICY_JSON" | jq -r '.feedback_policy.mode // empty')
   mode=${mode:-by-priority}
   case "$mode" in
     address-all) return 1 ;;
     by-priority) ;;
     *) die 2 "feedback_policy.mode must be by-priority|address-all; got '$mode'" ;;
   esac
-  disposition=$(feedback_policy_field "$tier" "$CONFIG")
+  disposition=$(printf '%s' "$POLICY_JSON" | jq -r --arg tier "$tier" \
+    '.feedback_policy.priorities[$tier] // empty')
   case "$disposition" in
     ""|required|discretionary) return 1 ;;
     ignore) return 0 ;;
