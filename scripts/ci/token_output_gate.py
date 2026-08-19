@@ -164,23 +164,39 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     option-bearing wrapper (`env -i echo ...`) are stepped over -- its
     OPTIONS only, so a wrapper carrying an operand or an option ARGUMENT
     (`timeout 5 echo ...`, `nice -n 5 echo ...`) resolves to that word instead
-    and the emitter behind it is missed.  An escaped command word (`\echo`) is
-    the same emitter.  `printf -v NAME` is NOT output: bash assigns to a
-    variable instead of writing to a stream -- but the `-v` test is
-    position-blind, so a `-v` appearing as DATA after the format operand also
-    reads as an assignment.  Both gaps are declared misses below.
+    and the emitter behind it is missed.  A redirection GLUED to the command
+    word is the word plus an operator, not one token: `printf>&2 '%s' "$PAT"`
+    runs printf with stdout on stderr, and only an IO_NUMBER (`2>&1`) or a
+    `{name}` descriptor stays part of the redirection.  An escaped command
+    word (`\echo`) is the same emitter.  `printf -v NAME` is NOT output: bash
+    assigns to a variable instead of writing to a stream -- but the `-v` test
+    is position-blind, so a `-v` appearing as DATA after the format operand
+    also reads as an assignment.  Both remaining gaps are declared misses
+    below.
   * An in-file message helper: a function whose body writes one of its own
-    positional parameters VERBATIM through an emitter.  Both definition forms
-    count, with the opening `{` on the DECLARATION line; bash also accepts it
-    on the next line and helper discovery does not.  Body extraction is
-    brace-depth counted over lexer state, so a nested block whose closing brace
-    starts its own line does not end it early.  A helper is graded on what its
-    body writes, not on where that write GOES, so a helper whose emitter feeds
-    a pipe is treated as emitting -- declared conservatism below.
+    positional parameters VERBATIM through an emitter, or hands one to
+    `cat`/`tee` on a HERE-STRING -- unless the file redefines that name, in
+    which case the here-string goes to the local function and what a function
+    does with its standard input is the declared limit below.  Both definition
+    forms count, with the opening `{` on the DECLARATION line; bash also
+    accepts it on the next line and helper discovery does not.  Body
+    extraction is brace-depth counted over lexer state, so a nested block whose
+    closing brace starts its own line does not end it early.  Discovery
+    iterates to a FIXED POINT, so a helper that reaches an emitter only
+    through other helpers is found however long the chain is.  A helper is
+    graded on what its body writes, not on where that write GOES, so a helper
+    whose emitter feeds a pipe is treated as emitting -- declared conservatism
+    below.
   * The body of an INTERPOLATING here-doc (unquoted delimiter) owned by `cat`,
     `tee` or an emitter.  ALL here-doc openers on a line are tracked, not just
     the first (#1014), and the owner is the command of the SEGMENT the opener
-    appears in, so `true; cat <<EOF` attributes the body to `cat`.
+    appears in, so `true; cat <<EOF` attributes the body to `cat`.  The
+    delimiter is a WORD and ends at a shell METACHARACTER, so `<<E@F` names
+    `E@F`.  A `$( )` inside the body is not text: it RUNS, and it is graded as
+    a capture under the owner, so a redirection inside it escapes exactly as it
+    does on an ordinary line.  A here-doc whose delimiter never arrives is
+    REPORTED -- the scanner has lost sync with the file, and the remainder must
+    not vanish into a body in silence.
   * The word of a here-STRING given to one of those same commands.
 
 A PIPELINE IS NOT AN EMISSION; ITS CONSUMER DECIDES.  `printf '%s' "$PAT" |`
@@ -194,16 +210,29 @@ as an ARGUMENT.  This is what makes `printf '%s' "$PAT" | gh auth login
 --with-token` and `echo "$PAT" | docker login --password-stdin` -- the
 canonical secure hand-off, and gh's and docker's own documented interface --
 legal without a pragma.  Only a redirection that moves fd 1 escapes the pipe
-(`>&2`, `>file`); `2>/dev/null` does not.  A trailing `|` continues the
-command list onto the next physical line, exactly as a trailing `\` does.
+(`>&2`, `>file`); `2>/dev/null` and `0>/dev/null` do not.  A trailing `|`
+continues the command list onto the next physical line, exactly as a trailing
+`\` does.
+
+A `tee` in the middle of the pipeline is the one hop that is not transparent:
+`tee FILE` writes the file AND passes the value on, so the write is counted
+under the same rule as `printf '%s' "$PAT" > log` even though the pipeline
+carries the value onward to a consumer that discards it.  Only a LITERAL
+operand counts, and `/dev/null` does not: `tee "$LOG"` names a path the source
+text does not fix, and flagging it would red the ordinary logging idiom across
+the fleet.  That residue is a declared miss, pinned by a corpus case, not an
+oversight.
 
 CAPTURE IS NOT EMISSION.  In `_v=$(printf '%s' "$GH_TOKEN")` the value goes
 into a variable.  The shield is conditional, because #1012 measured the escape:
 `_v=$(printf '%s' "$GH_TOKEN" >&2)` redirects past the capture and reaches the
 terminal.  So a captured emitter counts as capture only when the emitting
 segment carries NO redirection at all; any redirection inside the substitution
-is flagged.  A subshell or brace group is not a capture: `( echo "$PAT" )`
-is flagged.
+is flagged.  A subshell does not capture anything ITSELF -- `( echo "$PAT" )`
+at the top level is flagged -- but its standard output goes wherever the
+ENCLOSING context's does, so a subshell written inside `$( )` is shielded
+exactly as a bare command there is.  An array assignment's parenthesised list
+is data, and a `$( )` among its elements is a capture under that assignment.
 
 REDACTION IS NOT EMISSION.  `${#VAR}` is a length and `${VAR:+set}` is a
 constant alternate; neither is a value reference, so both are legal with no
@@ -221,9 +250,16 @@ believes.  Every entry below that names a shell CONSTRUCT is a live corpus case
 whose disagreement with the oracle is declared in `KNOWN_MISSES`, and
 `--self-test` PRINTS that registry on every run, so this prose cannot drift
 away from the measurement -- if the two ever disagree, the printed list is the
-true one.  Exactly two entries are NOT constructs and carry no corpus case, and
-both say so where they appear: what the shell emits on its own (`set -x`, core
-dumps), and files this check does not read at all.  Read the other direction
+true one.  Two entries are NOT constructs and carry no corpus case, and both
+say so where they appear: what the shell emits on its own (`set -x`, core
+dumps), and files this check does not read at all.  Two more ARE constructs
+with live corpus cases that nonetheless carry no `KNOWN_MISSES` entry, because
+the oracle AGREES with the scanner about them -- a `tee` whose operand is not
+literal, and a file that redefines `cat`/`tee`.  Ground truth here is what
+reaches a STREAM, and both of those limits are about a value reaching a FILE or
+a local function, which the oracle has no verdict on; the case pins the
+scanner's answer, and the reason it is the chosen answer is written here.  Read
+the other direction
 too, and it holds with one exception: every `KNOWN_MISSES` entry appears below
 except `pragma-honoured`, which is not a limit -- it is the deliberate
 exemption described above, a declared "miss" because the line really does emit
@@ -293,13 +329,28 @@ does not catch:
   * An in-file helper that writes its STANDARD INPUT rather than one of its
     positional parameters (`relay() { cat; }` behind a pipe).  Helper
     discovery models parameters; nothing at the call site says what a helper
-    reads.
+    reads.  A file that redefines `cat` or `tee` reaches the same limit from
+    the other side, and helper discovery stops treating the name as a
+    stdin-writer rather than guessing at the replacement.
+  * A `tee` whose file operand is not LITERAL (`... | tee "$LOG" | grep -q x`).
+    The file write is what makes a mid-pipeline `tee` visible at all, and the
+    operand is the only thing in the source text that names the file.
+    Deliberate: reading every non-literal operand as a write would red the
+    ordinary logging idiom on a required fleet-wide check.
   * A token reaching an interpreter that then prints it (`bash -c ...`,
     `python3 -c ...`, `awk -v ...`, a `bash <<EOF` here-doc).
-  * Any file this check does not scan: non-shell files, and everything outside
-    scripts/** and tests/**.  Also not a construct: the file-selection axis
-    pins WHICH files are read, not what a leak inside an unread one looks like,
-    so there is no corpus case behind this one either.
+  * Any file this check does not scan: everything outside scripts/** and
+    tests/**, and a non-shell file inside them that no scanned shell file
+    SOURCES by a LITERAL operand.  A sourced fragment IS read whatever it is
+    called -- `. ./lib.env` runs `lib.env` in the sourcing shell -- but the
+    operand is resolved, never the candidate's contents, so `. "$LIB/x.env"`
+    leaves that fragment unread.  Deciding by contents would mean deciding
+    which `.env` files are shell, on a check that publishes the required
+    `lint` context for nine repositories.  Also not a construct: the
+    file-selection axis pins WHICH files are read, not what a leak inside an
+    unread one looks like, so there is no CORPUS case behind this one -- the
+    assertions live in `_source_promotion_cases`, which measures the sourcing
+    script under bash end to end.
 
 CONSERVATISM RUNS THE OTHER WAY IN A SHORT LIST, also measured, and
 `KNOWN_BROADER` -- printed on every `--self-test` run -- is the authoritative
@@ -308,7 +359,11 @@ copy of it; this prose is a description of that registry, not a second source:
   * An emitter redirected to a FILE (`printf '%s\n' "$PAT" > log`) puts
     nothing on a stream, and the gate flags it anyway.  That write is the
     FIRST HOP of the check_resolve_pr_threads leak #993 fixed, and the gate is
-    built so that hop stays visible.
+    built so that hop stays visible.  Three shapes land on this same rule and
+    are declared separately because they arrive by different routes: a
+    redirection glued to the command word (`printf&>out.txt ...`), and a
+    mid-pipeline `tee FILE`, which forks the value into a file while the
+    pipeline carries it on to a consumer that discards it.
   * A pipeline whose consumer is NOT a simple command -- `| { read -r v; }`,
     `| ( read -r v )`, and `|&`, whose consumer segment is recorded empty.
     Which command inside a group reads the pipe is a dataflow question a
@@ -342,7 +397,7 @@ or through a file.  This gate stops the DIRECT form from coming back; it is
 not a proof that no credential can reach a stream.
 
 And the recall claim is bounded by the CORPUS and by the SENTINEL, not by an
-argument.  What the harness demonstrates is that on ~393 constructs --
+argument.  What the harness demonstrates is that on ~418 constructs --
 generated across line spellings, file selection, pipeline consumers and
 legal-but-unusual precision shapes, each measured against ONE letter-leading
 sentinel value -- the scanner and bash agree except for the declared entries.
@@ -381,9 +436,22 @@ READS, and every branch that cannot establish it is FATAL, not skipped:
     `-i`, `-u NAME`, `-C DIR` and `NAME=VALUE` assignments.
   * A file whose interpreter or extension classifies as neither shell nor
     known-non-shell is an ERROR, not a skip.
-  * An unreadable path, or a traversal failure, is an ERROR.
+  * A file a scanned shell file SOURCES by a literal operand is SHELL, whatever
+    the extension table said: `. ./lib.env` runs `lib.env` in the sourcing
+    shell, so a leak inside it is a leak in the sourcing script.  Resolved to
+    a fixed point, because a promoted fragment can source another.
+  * An unreadable path, or a traversal failure, is an ERROR.  That includes an
+    unreadable DIRECTORY, which `os.walk` otherwise swallows: without an
+    `onerror` callback the subtree yields nothing, the walk continues, and the
+    zero-file guard never fires because the sibling files still make the count
+    non-zero.  A green gate over a subtree it could not read is the #951 shape
+    one level down.
   * A scan selecting ZERO shell files is an ERROR.  `scanned 0` can never be
     an advisory count on a PASS line again; a corpus case asserts it directly.
+  * A here-doc whose delimiter never arrives is an ERROR.  It is the same
+    silent shrink INSIDE a file: every line after the opener is read as body
+    text rather than as code, and the scanner reports the loss of sync rather
+    than returning a clean verdict over source it never parsed.
 
 Usage:
     check_no_token_in_output              # self-test, then scan this repo
@@ -576,14 +644,23 @@ class Segment:
 
 
 class Ref:
-    __slots__ = ("name", "line", "seg", "heredoc_owner", "in_assign_prefix")
+    __slots__ = (
+        "name", "line", "seg", "heredoc_owner", "in_assign_prefix",
+        "in_heredoc_body",
+    )
 
     def __init__(self, name, line, seg, in_assign_prefix=False):
         self.name = name
         self.line = line
         self.seg = seg
+        # Set when the reference is body TEXT the here-doc owner writes, so
+        # the owner's segment is where the walk starts.  A reference inside a
+        # COMMAND SUBSTITUTION in that same body leaves this None and carries
+        # `in_heredoc_body` instead: its own segment runs first, and the body
+        # is only where its output lands.
         self.heredoc_owner = None
         self.in_assign_prefix = in_assign_prefix
+        self.in_heredoc_body = False
 
 
 class HereDoc:
@@ -611,26 +688,99 @@ class LogicalLine:
 _WORD_BREAK_BEFORE_COMMENT = set(" \t\n;&|()")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
-_REDIR_RE = re.compile(r"^\{?[A-Za-z0-9_]*\}?(&>>|&>|>>|>\||>&|<&|<>|<|>)")
+# The ONLY things bash lets precede a redirection operator inside the same
+# token are an IO_NUMBER (`2>&1`) and a `{name}` descriptor variable.  Ordinary
+# word characters do NOT glue: `printf>&2 '%s' "$PAT"` is the WORD `printf`
+# followed by the redirection `>&2`, and bash runs printf with its stdout on
+# stderr.  Accepting `[A-Za-z0-9_]*` here read that whole thing as one
+# redirection-only token, so the emitter was never seen and the leak passed
+# (#1032 F1).  The lexer now breaks the word at the operator, which is what
+# makes these anchors correct rather than merely narrower.
+_FD_PREFIX = r"(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[0-9]*)"
+_REDIR_RE = re.compile(r"^" + _FD_PREFIX + r"(&>>|&>|>>|>\||>&|<&|<>|<|>)")
 # OUTPUT redirections only.  Only these can carry a value past a capture --
 # `_v=$(printf %s "$PAT" >&2)` is the escape #1012 measured.  An INPUT
 # redirection (`<`, `<<`, `<<<`) feeds the command and cannot escape anything,
 # so counting it would flag every captured here-string.
-_OUT_REDIR_RE = re.compile(r"^\{?[A-Za-z0-9_]*\}?(&>>|&>|>>|>\||>&|<>|>)")
+_OUT_REDIR_RE = re.compile(r"^" + _FD_PREFIX + r"(&>>|&>|>>|>\||>&|<>|>)")
 # STANDARD OUTPUT redirections only, which is a strictly smaller set.  A
 # pipeline carries fd 1, so only a redirection that moves fd 1 can send the
 # value somewhere the pipe does not reach: `>file`, `1>file`, `>&2`, `&>file`
 # all do; `2>/dev/null` and `2>&1` do not, and reading them as an escape would
 # flag `printf '%s' "$PAT" 2>/dev/null | grep -q x`, which puts nothing on a
-# stream.  A `{fd}>` names a variable fd this scanner cannot resolve, so it
-# counts as an escape and the case fails closed.
-_STDOUT_REDIR_RE = re.compile(r"^(?:\{[A-Za-z0-9_]*\}|[01]?)(&>>|&>|>>|>\||>&|>)")
+# stream.  Descriptor 0 is STANDARD INPUT and belongs with them: `0>/dev/null`
+# moves fd 0, leaves fd 1 on the pipe, and reading it as an escape flagged a
+# line that puts nothing on a stream (#1032 F12).  A `{fd}>` names a variable
+# fd this scanner cannot resolve, so it counts as an escape and the case fails
+# closed.
+_STDOUT_REDIR_RE = re.compile(
+    r"^(?:\{[A-Za-z_][A-Za-z0-9_]*\}|1?)(&>>|&>|>>|>\||>&|>)"
+)
 _PRAGMA_RE = re.compile(r"(?<![A-Za-z0-9_])" + PRAGMA + r":[ \t]*(\S.*)?$")
+
+
+_FD_PREFIX_RE = re.compile(r"^(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[0-9]*)$")
+
+
+def _is_fd_prefix(word):
+    """May this partial word stay glued to a following redirection operator?
+
+    Only an IO_NUMBER or a `{name}` descriptor variable may -- and the empty
+    word, which is the ordinary `cmd >file` spelling.  Everything else is a
+    WORD that the operator terminates.
+    """
+    return bool(_FD_PREFIX_RE.match(word))
 
 
 def redirects_stdout(seg):
     """Does any word in this segment move fd 1 away from where it would go?"""
     return any(_STDOUT_REDIR_RE.match(w) for w in seg.words)
+
+
+def _find_substitutions(s):
+    """Yield (body, start_offset, end_offset) for every COMMAND SUBSTITUTION.
+
+    Used for the two places the main loop hands over a span of text WHOLE
+    rather than lexing it as structure: an array assignment's parenthesised
+    list and an interpolating here-doc BODY.  Both are data as far as the
+    surrounding line is concerned, and bash still RUNS any `$( )` inside them.
+
+    Single quotes suppress expansion; double quotes do not.  Only the
+    outermost span is yielded -- anything nested inside is found when that
+    body is lexed on its own.
+    """
+    out = []
+    i = 0
+    n = len(s)
+    in_single = False
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if in_single:
+            if c == "'":
+                in_single = False
+            i += 1
+            continue
+        if c == "'":
+            in_single = True
+            i += 1
+            continue
+        if c == "$" and s[i + 1 : i + 2] == "(" and s[i + 2 : i + 3] != "(":
+            end = _skip_balanced_parens(s, i + 1)
+            out.append((s[i + 2 : end - 1], i, end))
+            i = end
+            continue
+        if c == "`":
+            close = s.find("`", i + 1)
+            if close == -1:
+                break
+            out.append((s[i + 1 : close], i, close + 1))
+            i = close + 1
+            continue
+        i += 1
+    return out
 
 
 class Lexer:
@@ -641,8 +791,66 @@ class Lexer:
         self.logical = []
         self.heredocs = []
         self.func_defs = []  # (name, body_start_index, body_end_index)
+        # Set when the text ends while a here-doc body is still open.  The
+        # scanner has lost sync with the file at that point, and a silent
+        # loss of the remainder is the failure mode this gate exists to stop.
+        self.unterminated_heredoc = None
         self._sid = 0
         self._run()
+
+    def _absorb_substitutions(
+        self, inner, parent_seg, base_line, cur_ll, in_heredoc_body=False
+    ):
+        """Lex the `$( )` bodies inside `inner`; return `inner` with them masked.
+
+        Each substitution is a CAPTURING child of `parent_seg`: its standard
+        output becomes the surrounding word, so it reaches a stream only
+        through the parent -- or through a redirection that escapes the
+        capture, which is the escape `reaches_output` already measures.
+
+        The masked return value is what the caller then scans for ORDINARY
+        references, so a name inside a substitution is reported once, by the
+        segment that actually runs it.
+        """
+        spans = _find_substitutions(inner)
+        if not spans:
+            return inner
+        pieces = []
+        cursor = 0
+        for body, start, end in spans:
+            pieces.append(inner[cursor:start])
+            pieces.append(re.sub(r"[^\n]", " ", inner[start:end]))
+            cursor = end
+            body_line = base_line + inner[:start].count("\n")
+            sub = Lexer(body)
+            for ll in sub.logical:
+                for seg in ll.segments:
+                    if seg.parent is None:
+                        seg.parent = parent_seg
+                        seg.parent_is_capture = True
+                cur_ll.segments.extend(ll.segments)
+                for r in ll.refs:
+                    r.line = body_line + (r.line - 1)
+                    r.in_heredoc_body = in_heredoc_body
+                    cur_ll.refs.append(r)
+        pieces.append(inner[cursor:])
+        return "".join(pieces)
+
+    def _finish_heredoc(self, hd, cur_ll):
+        """Grade a completed here-doc body: substitutions first, then names."""
+        if not hd.interpolating or not hd.body_lines:
+            return
+        start_line = hd.body_lines[0][0]
+        body = "\n".join(raw for _lno, raw in hd.body_lines)
+        masked = self._absorb_substitutions(
+            body, hd.owner, start_line, cur_ll, in_heredoc_body=True
+        )
+        for offset, raw in enumerate(masked.split("\n")):
+            for name in _iter_refs(raw):
+                r = Ref(name, start_line + offset, hd.owner)
+                r.heredoc_owner = hd.owner
+                r.in_heredoc_body = True
+                cur_ll.refs.append(r)
 
     # -- helpers ---------------------------------------------------------
     def _new_segment(self, parent, capture, line):
@@ -760,14 +968,13 @@ class Lexer:
                 raw = text[i:eol]
                 probe = raw.lstrip("\t") if in_heredoc.strip_tabs else raw
                 if probe == in_heredoc.delim:
+                    # Graded WHOLE, at the terminator, rather than line by
+                    # line: a `$( )` in the body can span lines, and a
+                    # per-line scan can only see names (#1032 F4).
+                    self._finish_heredoc(in_heredoc, cur_ll)
                     in_heredoc = None
                 else:
                     in_heredoc.body_lines.append((line, raw))
-                    if in_heredoc.interpolating:
-                        for m in _iter_refs(raw):
-                            r = Ref(m, line, in_heredoc.owner)
-                            r.heredoc_owner = in_heredoc.owner
-                            cur_ll.refs.append(r)
                 i = eol + 1
                 line += 1
                 if in_heredoc is None:
@@ -985,11 +1192,18 @@ class Lexer:
                             delim_chars.append(text[j])
                             j += 1
                         continue
-                    if ch.isalnum() or ch in "_-.+/":
-                        delim_chars.append(ch)
-                        j += 1
-                        continue
-                    break
+                    # The delimiter is a WORD, and a word ends at a shell
+                    # METACHARACTER -- not at "the next character outside an
+                    # alphanumeric allow-list".  `read x <<E@F` names the
+                    # delimiter `E@F`; stopping at the `@` recorded `E`, no
+                    # line ever matched it, and the scanner stayed inside a
+                    # here-doc body to end of file, missing every later
+                    # emitter (#1032 F3).
+                    if ch in " \t\n;&|()<>":
+                        break
+                    delim_chars.append(ch)
+                    j += 1
+                    continue
                 delim = "".join(delim_chars)
                 if delim:
                     hd = HereDoc(delim, interpolating, strip_tabs, cur_level()["seg"])
@@ -1056,6 +1270,14 @@ class Lexer:
                 continue
 
             if c in "<>":
+                # A redirection operator is a metacharacter: it ENDS the word
+                # in front of it unless that word is a bare IO_NUMBER (`2>&1`)
+                # or a `{name}` descriptor variable.  `printf>&2 '%s' "$PAT"`
+                # is the word `printf` followed by `>&2`, and gluing the two
+                # into one token hid the emitter behind a redirection-only
+                # word (#1032 F1).
+                if not _is_fd_prefix("".join(cur_level()["word"])):
+                    finish_word()
                 j = i + 1
                 if c == ">" and text[j : j + 1] in (">", "|"):
                     j += 1
@@ -1077,6 +1299,10 @@ class Lexer:
                     i += 2
                     continue
                 if text[i + 1 : i + 2] == ">":
+                    # `&>` takes no descriptor prefix at all, and bash still
+                    # reads it as a redirection when it abuts a word:
+                    # `printf&>f '%s' "$PAT"` writes the value to `f`.
+                    finish_word()
                     j = i + 2
                     if text[j : j + 1] == ">":
                         j += 1
@@ -1108,20 +1334,40 @@ class Lexer:
                     # strings and writes nothing; reading the `(` as a command
                     # position is how #1012 round 4 flagged it.  The whole
                     # parenthesised list belongs to the assignment word.
+                    #
+                    # The ELEMENTS are data, but bash still RUNS a `$( )`
+                    # among them, and skipping the span without lexing meant
+                    # `args=($(printf '%s' "$PAT" >&2))` was never looked at
+                    # (#1032 F2).  Each substitution is absorbed as a capture
+                    # under this assignment, so the value it prints lands in
+                    # the array -- and a redirection that escapes the capture
+                    # is flagged exactly as it is anywhere else.
                     j = _skip_balanced_parens(text, i)
-                    cur_level()["word"].append(text[i:j].replace("\n", " "))
-                    line += text[i:j].count("\n")
+                    inner = text[i:j]
+                    self._absorb_substitutions(
+                        inner, cur_level()["seg"], line, cur_ll
+                    )
+                    cur_level()["word"].append(inner.replace("\n", " "))
+                    line += inner.count("\n")
                     i = j
                     continue
                 if not word_so_far:
-                    # subshell / case-pattern parens: a NON-capturing level
+                    # subshell / case-pattern parens.  A subshell does not
+                    # capture anything ITSELF, so `( echo "$PAT" )` at the top
+                    # level reaches the terminal -- but its standard output is
+                    # wherever the ENCLOSING level's output goes, so a subshell
+                    # written inside `$( )` is captured exactly as a bare
+                    # command there is.  Hard-coding False dropped that shield
+                    # and made `v=$( ( printf '%s' "$PAT" ) )` a false positive
+                    # on a required check (#1032 F10).
                     parent_seg = cur_level()["seg"]
-                    seg = self._new_segment(parent_seg, False, line)
+                    enclosing_capture = cur_level()["capture"]
+                    seg = self._new_segment(parent_seg, enclosing_capture, line)
                     cur_ll.segments.append(seg)
                     levels.append(
                         {
                             "seg": seg,
-                            "capture": False,
+                            "capture": enclosing_capture,
                             "kind": "subshell",
                             "word": [],
                             "saved_quotes": quotes,
@@ -1173,6 +1419,14 @@ class Lexer:
 
             cur_level()["word"].append(c)
             i += 1
+
+        if in_heredoc is not None:
+            # End of file with a here-doc still open.  Bash warns and treats
+            # the remainder as the body; the scanner records the delimiter it
+            # never found so `scan_text` can report the loss of sync rather
+            # than let it shrink the scan silently.
+            self._finish_heredoc(in_heredoc, cur_ll)
+            self.unterminated_heredoc = (in_heredoc.delim, in_heredoc.owner.line)
 
         finish_word()
 
@@ -1425,6 +1679,71 @@ ASSIGN = "assign"
 OPAQUE = "opaque"
 
 
+# Operands that provably reach nothing.  `tee /dev/null` is the corpus's own
+# spelling of "a tee with no side effect", and a write to the null device is
+# the one file operand a source-text scanner can settle without guessing.
+_NULL_SINKS = frozenset({"/dev/null", "/dev/zero"})
+
+
+def tee_file_operands(seg):
+    """LITERAL file operands a `tee` in this segment writes.
+
+    `tee FILE` writes FILE **and** stdout, so a `tee` in the middle of a
+    pipeline is not a transparent hop: the value lands in a file even though
+    the pipeline carries it onward.  That is the same act as
+    `printf '%s' "$PAT" > log`, which this gate flags on purpose as the first
+    hop of the #993 leak -- and it was invisible while the walk only followed
+    the pipe (#1032 F7).
+
+    Only LITERAL operands count.  `tee "$LOG"` names a path the source text
+    does not fix, and flagging it would red `lint` fleet-wide on the ordinary
+    logging idiom; that residue is declared rather than guessed at.
+    """
+    cmd, _redir = resolve_command(seg)
+    if cmd != "tee":
+        return []
+    words = list(seg.words)
+    # Step to the command word itself, then read what follows it.
+    idx = 0
+    while idx < len(words):
+        w = words[idx]
+        lit = _unquote_command_word(w)
+        if lit is not None and _basename(lit) == "tee":
+            break
+        idx += 1
+    else:
+        return []
+    files = []
+    end_of_options = False
+    skip_next = False
+    for w in words[idx + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if w in ("{", "}", "<<"):
+            continue
+        if w == "<<<":
+            skip_next = True  # the here-string word, not a file operand
+            continue
+        m = _REDIR_RE.match(w)
+        if m:
+            if m.end() == len(w):
+                skip_next = True  # the redirection's target word
+            continue
+        lit = _unquote_command_word(w)
+        if lit is None:
+            continue  # a variable operand -- declared residue, not a guess
+        if not end_of_options and lit == "--":
+            end_of_options = True
+            continue
+        if not end_of_options and lit.startswith("-") and lit != "-":
+            continue
+        if lit in _NULL_SINKS:
+            continue
+        files.append(lit)
+    return files
+
+
 def classify(seg, emitter_helpers):
     cmd, _redir = resolve_command(seg)
     if cmd is None:
@@ -1465,8 +1784,13 @@ def reaches_output(ref, emitter_helpers):
     # later segment (`true; cat <<EOF`).  From there it walks out exactly like
     # any other reference, so a captured here-doc gets the same shield a
     # captured `printf` does.
+    # A reference that IS body text starts at the owner.  A reference inside a
+    # command substitution WITHIN that body starts at its own segment -- the
+    # substitution runs first, and the body is only where its output lands --
+    # and walks out to the owner through `parent_is_capture`.  Both carry the
+    # here-doc note, which is what makes the owner an emitter on the way out.
     seg = ref.heredoc_owner if ref.heredoc_owner is not None else ref.seg
-    note = "interpolating here-doc body" if ref.heredoc_owner is not None else None
+    note = "interpolating here-doc body" if ref.in_heredoc_body else None
 
     hops = 0
     via_stdin = False
@@ -1531,6 +1855,14 @@ def reaches_output(ref, emitter_helpers):
                     note,
                     "%s whose output redirection escapes the pipeline"
                     % (cmd or "output command"),
+                )
+            tee_files = tee_file_operands(seg)
+            if tee_files:
+                # `tee FILE` is a fork, not a hop: the pipe carries the value
+                # onward AND the file receives it.  Following only the pipe
+                # graded the consumer and never saw the write.
+                return True, _why(
+                    note, "tee, which also writes the value to %s" % tee_files[0]
                 )
             seg = seg.pipe_to
             via_stdin = True
@@ -1623,19 +1955,44 @@ def discover_emitter_helpers(text):
         if body is not None:
             bodies[name] = body
 
+    # Lex each body ONCE.  What a body does never changes between rounds; only
+    # the `helpers` set a call inside it is graded against does, and that is
+    # what the fixed point below iterates.
+    lexed = {name: Lexer(body) for name, body in bodies.items()}
+
     helpers = set()
-    for _ in range(3):
+    # A FIXED POINT, not a fixed number of rounds.  Each round can promote at
+    # most one link of a call chain, so a chain longer than the round budget
+    # left its outermost helper undiscovered -- `a` calls `b` calls `c` calls
+    # `d` calls `echo "$1"` needs four (#1032 F6).  The set only ever grows and
+    # is bounded by the number of functions in the file, so this terminates.
+    while True:
         grew = False
-        for name, body in bodies.items():
+        for name, lx in lexed.items():
             if name in helpers:
                 continue
-            lx = Lexer(body)
             emits = False
             for ll in lx.logical:
                 for seg in ll.segments:
-                    kind = classify(seg, helpers)
-                    if kind not in (EMIT,):
-                        continue
+                    cmd, _redir = resolve_command(seg)
+                    if classify(seg, helpers) != EMIT:
+                        # `cat`/`tee` write their STANDARD INPUT, so a helper
+                        # handing a positional to one on a here-string writes
+                        # it just as surely as `echo "$1"` does.  Only the
+                        # ARGUMENT spelling was graded, so
+                        # `log() { cat <<< "$1"; }` read clean (#1032 F5).
+                        #
+                        # Not when THIS FILE redefines the name: a local
+                        # `cat() { :; }` is what the here-string is handed to,
+                        # and what a function does with its standard input is
+                        # the limit already declared for
+                        # `indirect-pipe-into-stdin-echoing-helper`.
+                        if not (
+                            cmd in STDIN_ECHOERS
+                            and cmd not in bodies
+                            and "<<<" in seg.words
+                        ):
+                            continue
                     for w in seg.words:
                         if _word_has_verbatim_positional(w):
                             emits = True
@@ -1735,6 +2092,17 @@ def scan_text(text, path="<text>"):
     lx = Lexer(text)
     findings = []
     pragma_errors = []
+    if lx.unterminated_heredoc is not None:
+        # The lexer reached end of file with a here-doc still open, so every
+        # line after the opener was read as body text rather than as code.
+        # That is discovery shrinking silently INSIDE a file, and it is
+        # reported for the same reason `scanned 0 shell files` is.
+        delim, opened_at = lx.unterminated_heredoc
+        pragma_errors.append(
+            "%s:%d: here-doc delimited by end of file -- the delimiter %r was "
+            "never found, so the rest of the file was read as body text and "
+            "not as code" % (path, opened_at, delim)
+        )
     for ll in lx.logical:
         if ll.pragma_bare and not ll.pragma_reasons:
             pragma_errors.append(
@@ -1859,21 +2227,92 @@ def classify_file(path):
     return "shell"
 
 
+def source_operands(text):
+    """LITERAL operands of `.` / `source` in this text.
+
+    A sourced file is executed by the sourcing shell, so it is shell no matter
+    what it is called.  The operand is the only thing in the source TEXT that
+    says which file that is, which is why this resolves the OPERAND rather
+    than sniffing the candidate's contents: a content heuristic would have to
+    decide that some `.env` files are shell and others are not, on a check
+    that publishes the required `lint` context for nine consumers.
+
+    An operand carrying an expansion (`. "$LIB_DIR/common.sh"`) is not a
+    literal and is skipped -- a declared residue, not a guess.
+    """
+    out = []
+    lx = Lexer(text)
+    for ll in lx.logical:
+        for seg in ll.segments:
+            cmd, _redir = resolve_command(seg)
+            if cmd not in (".", "source"):
+                continue
+            words = list(seg.words)
+            idx = 0
+            while idx < len(words):
+                lit = _unquote_command_word(words[idx])
+                if lit is not None and _basename(lit) in (".", "source"):
+                    break
+                idx += 1
+            else:
+                continue
+            skip_next = False
+            for w in words[idx + 1 :]:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if w in ("{", "}", "<<"):
+                    continue
+                if w == "<<<":
+                    skip_next = True
+                    continue
+                m = _REDIR_RE.match(w)
+                if m:
+                    if m.end() == len(w):
+                        skip_next = True
+                    continue
+                lit = _unquote_command_word(w)
+                if lit:
+                    out.append(lit)
+                break
+    return out
+
+
+def _read_text(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
 def discover_shell_files(root):
     """Walk the scan roots.  Every failure is fatal; nothing is skipped."""
     shell = []
     errors = []
     present_roots = 0
+    walked = {}  # realpath -> (path, "shell" | "non-shell")
     for rel in SCAN_ROOTS:
         base = os.path.join(root, rel)
         if not os.path.isdir(base):
             continue
         present_roots += 1
+
+        def _walk_error(exc, _base=base):
+            # `os.walk` swallows every OSError it raises unless a callback is
+            # given: an unreadable subdirectory yields NOTHING and the walk
+            # continues as if the subtree were empty.  A gate whose discovery
+            # can shrink in silence is the #951 shape it exists to stop, so
+            # the failure is recorded and the scan reports it (#1032 F9).
+            errors.append(
+                "%s: unreadable directory: %s"
+                % (getattr(exc, "filename", None) or _base, exc)
+            )
+
         # Symlinks ARE followed, because a symlinked shell file is a file bash
         # will execute.  `seen` keeps a directory cycle from looping forever;
         # a gate that hangs is a gate that never reports.
         seen = set()
-        for dirpath, dirnames, filenames in os.walk(base, followlinks=True):
+        for dirpath, dirnames, filenames in os.walk(
+            base, followlinks=True, onerror=_walk_error
+        ):
             try:
                 key = os.path.realpath(dirpath)
             except OSError as exc:
@@ -1900,8 +2339,42 @@ def discover_shell_files(root):
                 except CheckError as exc:
                     errors.append("%s: %s" % (p, exc))
                     continue
+                try:
+                    walked[os.path.realpath(p)] = (p, kind)
+                except OSError:
+                    pass
                 if kind == "shell":
                     shell.append(p)
+
+    # A file this walk called non-shell but a shell file SOURCES is shell:
+    # `. ./lib.env` runs `lib.env` in the sourcing shell, and the extension
+    # table said `.env` was configuration (#1032 F8).  Resolved to a fixed
+    # point, because a promoted fragment can source another.
+    pending = list(shell)
+    promoted = set()
+    while pending:
+        origin = pending.pop()
+        try:
+            text = _read_text(origin)
+        except OSError as exc:
+            errors.append("%s: unreadable: %s" % (origin, exc))
+            continue
+        for operand in source_operands(text):
+            for cand in (
+                os.path.join(os.path.dirname(origin), operand),
+                os.path.join(root, operand),
+            ):
+                try:
+                    key = os.path.realpath(cand)
+                except OSError:
+                    continue
+                entry = walked.get(key)
+                if entry is None or entry[1] == "shell" or key in promoted:
+                    continue
+                promoted.add(key)
+                shell.append(entry[0])
+                pending.append(entry[0])
+                break
     return shell, errors, present_roots
 
 
@@ -2024,6 +2497,23 @@ CORPUS = [
     ("echo-stderr", MUST_FLAG, 'echo "$GH_TOKEN" >&2\n'),
     ("echo-leading-redirection", MUST_FLAG, '2>/dev/null echo "$GH_TOKEN"\n'),
     ("echo-leading-stderr-redirection", MUST_FLAG, '>&2 echo "$GH_TOKEN"\n'),
+    (
+        # A redirection operator ENDS the word in front of it unless that word
+        # is a bare descriptor.  `printf>&2 ...` runs printf with stdout on
+        # stderr; reading the whole thing as one redirection-only token hid
+        # the emitter and the leak passed.
+        "redir-glued-to-command-word",
+        MUST_FLAG,
+        "printf>&2 '%s' \"$GH_TOKEN\"\n",
+    ),
+    (
+        # The `&>` spelling of the same gluing, measured: bash writes the
+        # value to `out.txt`.  Flagged under the emitter-to-file rule, so the
+        # disagreement here is the FILE policy, not the word break.
+        "redir-glued-ampersand-to-file",
+        MUST_FLAG,
+        "printf&>out.txt '%s\\n' \"$GH_TOKEN\"\n",
+    ),
     ("env-wrapper", MUST_FLAG, 'env echo "$GH_TOKEN"\n'),
     ("env-i-wrapper", MUST_FLAG, 'env -i echo "$GH_TOKEN"\n'),
     ("env-assign-wrapper", MUST_FLAG, 'env FOO=1 echo "$GH_TOKEN"\n'),
@@ -2037,7 +2527,7 @@ CORPUS = [
     ("brace-group-echo", MUST_FLAG, '{ echo "$GH_TOKEN"; }\n'),
     ("case-body-echo", MUST_FLAG, 'case x in x) echo "$GH_TOKEN";; esac\n'),
     ("and-list-echo", MUST_FLAG, 'true && echo "$GH_TOKEN"\n'),
-    ("pipe-into-cat", MUST_FLAG, "printf '%s' \"$GH_TOKEN\" | cat\n"),
+    ("pipe-into-cat-no-newline", MUST_FLAG, "printf '%s' \"$GH_TOKEN\" | cat\n"),
     # --- parameter-expansion operators ----------------------------------
     ("expansion-dash", MUST_FLAG, 'echo "${UNSET_VALUE:-$GH_TOKEN}"\n'),
     ("expansion-plus", MUST_FLAG, 'SET_VALUE=x; echo "${SET_VALUE:+$GH_TOKEN}"\n'),
@@ -2049,6 +2539,54 @@ CORPUS = [
     # --- command substitution -------------------------------------------
     ("capture-redirected-stderr", MUST_FLAG, "_v=$(printf '%s' \"$GH_TOKEN\" >&2)\n"),
     ("nested-emitter", MUST_FLAG, "echo \"$(printf '%s' \"$GH_TOKEN\")\"\n"),
+    (
+        # A SUBSHELL inside a command substitution.  The subshell captures
+        # nothing itself, but its standard output is the substitution's, so
+        # the value lands in `v` -- reading the subshell as un-captured made
+        # this a false positive on a required check.
+        "subshell-inside-capture",
+        MUST_NOT_FLAG,
+        'v=$( ( printf \'%s\' "$GH_TOKEN" ) )\necho "len=${#v}"\n',
+    ),
+    (
+        # The escape survives the shield, exactly as it does without the
+        # subshell: `>&2` moves fd 1 off the captured stream.
+        "subshell-inside-capture-redirected",
+        MUST_FLAG,
+        'v=$( ( printf \'%s\' "$GH_TOKEN" >&2 ) )\necho "len=${#v}"\n',
+    ),
+    (
+        # An ARRAY ASSIGNMENT is data, but bash still RUNS a `$( )` among its
+        # elements.  Skipping the parenthesised span without lexing it meant
+        # the redirection that escapes the capture was never looked at.
+        "array-cmdsub-redirected",
+        MUST_FLAG,
+        'args=($(printf \'%s\' "$GH_TOKEN" >&2))\necho ok\n',
+    ),
+    (
+        "array-cmdsub-captured",
+        MUST_NOT_FLAG,
+        'args=($(printf \'%s\' "$GH_TOKEN"))\necho "n=${#args[@]}"\n',
+    ),
+    (
+        # `+=` is an array assignment too, and the elements can span lines.
+        "array-append-cmdsub-redirected",
+        MUST_FLAG,
+        'args=()\nargs+=(\n  one\n  $(printf \'%s\' "$GH_TOKEN" >&2)\n)\necho ok\n',
+    ),
+    (
+        # Nested subshells inherit the capture through every level.
+        "subshell-nested-twice-in-capture",
+        MUST_NOT_FLAG,
+        'v=$( ( ( printf \'%s\' "$GH_TOKEN" ) ) )\necho "len=${#v}"\n',
+    ),
+    (
+        # ... and a pipeline INSIDE the capture is graded by its consumer, as
+        # it is anywhere else.
+        "subshell-piped-inside-capture",
+        MUST_NOT_FLAG,
+        'v=$( ( printf \'%s\' "$GH_TOKEN" ) | cat )\necho "len=${#v}"\n',
+    ),
     ("backtick-emitter", MUST_FLAG, 'echo "`echo "$GH_TOKEN"`"\n'),
     ("eval-opaque", MUST_FLAG, 'eval echo "$GH_TOKEN"\n'),
     ("unresolvable-command", MUST_FLAG, 'c=echo; "$c" "$GH_TOKEN"\n'),
@@ -2067,6 +2605,55 @@ CORPUS = [
         "cat <<FIRST <<SECOND\nplain\nFIRST\ntoken=$GH_TOKEN\nSECOND\n",
     ),
     ("heredoc-numeric-delim", MUST_FLAG, "cat <<1\n$GH_TOKEN\n1\n"),
+    (
+        # The delimiter is a WORD, and a word ends at a METACHARACTER.  An
+        # alphanumeric allow-list recorded `E` for `<<E@F`, so the body ran on
+        # past the real terminator and the `echo` inside it was read as
+        # here-doc TEXT owned by `read`, which stores rather than writes.
+        #
+        # The trailing lone `E` is what makes this case discriminate the
+        # CHARSET rather than the unterminated-here-doc net below: under the
+        # old rule the scanner finds its truncated delimiter and resumes
+        # cleanly, so nothing is ever reported.
+        "heredoc-delim-metachar",
+        MUST_FLAG,
+        'read x <<E@F\nplain\nE@F\necho "$GH_TOKEN"\nE\n',
+    ),
+    (
+        # And when the delimiter genuinely never arrives, the loss of sync is
+        # REPORTED rather than silently swallowing the remainder.  Bash warns
+        # and hands the body to `cat`, which writes it, so the oracle agrees.
+        "heredoc-unterminated",
+        MUST_FLAG,
+        "cat <<NOPE\n$GH_TOKEN\n",
+    ),
+    (
+        # An interpolating body is TEXT, and bash still runs a `$( )` inside
+        # it.  Grading the body for NAMES only attributed the reference to
+        # `read`, which stores it -- and never looked at the redirection that
+        # takes the substitution's output straight to the terminal.
+        "heredoc-body-cmdsub-redirected",
+        MUST_FLAG,
+        "read x <<EOF\n$(printf '%s' \"$GH_TOKEN\" >&2)\nEOF\necho ok\n",
+    ),
+    (
+        "heredoc-body-cmdsub-captured",
+        MUST_NOT_FLAG,
+        "read x <<EOF\n$(printf '%s' \"$GH_TOKEN\")\nEOF\necho ok\n",
+    ),
+    (
+        # The SECOND opener's body carries the substitution, so the body is
+        # graded per here-doc rather than per line.
+        "heredoc-second-opener-cmdsub",
+        MUST_FLAG,
+        "read x <<A <<B\na\nA\n$(printf '%s' \"$GH_TOKEN\" >&2)\nB\necho ok\n",
+    ),
+    (
+        # The same substitution under an owner that WRITES its body.
+        "heredoc-body-cmdsub-into-cat",
+        MUST_FLAG,
+        "cat <<EOF\n$(printf '%s' \"$GH_TOKEN\")\nEOF\n",
+    ),
     (
         # The here-doc body scanner and the lexer must agree on what a
         # `${...}` expansion yields; these are the same three forms the
@@ -2126,6 +2713,37 @@ CORPUS = [
         "helper-heredoc",
         MUST_FLAG,
         'usage() {\n  cat <<EOF\ntoken=$1\nEOF\n}\nusage "$GH_TOKEN"\n',
+    ),
+    (
+        # `cat`/`tee` write their STANDARD INPUT, so a helper handing a
+        # positional to one on a HERE-STRING writes it just as surely as
+        # `echo "$1"` does.  Only the ARGUMENT spelling was graded.
+        "helper-herestring",
+        MUST_FLAG,
+        'log() { cat <<< "$1"; }\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-herestring-tee",
+        MUST_FLAG,
+        'log() { tee /dev/null <<< "$1"; }\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        # ... but not when THIS FILE redefines the name.  The here-string goes
+        # to the local function, and what a function does with its standard
+        # input is the limit `indirect-pipe-into-stdin-echoing-helper`
+        # already declares.
+        "helper-herestring-shadowed",
+        MUST_NOT_FLAG,
+        'cat() { :; }\nlog() { cat <<< "$1"; }\nlog "$GH_TOKEN"\necho ok\n',
+    ),
+    (
+        # Helper discovery is a FIXED POINT, not three rounds: each round
+        # promotes at most one link, so a four-deep call chain left its
+        # outermost helper undiscovered and the call site read clean.
+        "helper-chain-four-deep",
+        MUST_FLAG,
+        'a() { b "$1"; }\nb() { c "$1"; }\nc() { d "$1"; }\n'
+        'd() { echo "$1"; }\na "$GH_TOKEN"\n',
     ),
     # --- multi-physical-line constructs ----------------------------------
     (
@@ -2289,9 +2907,45 @@ CORPUS = [
     ("heredoc-piped-into-cat", MUST_FLAG, "cat <<EOF | cat\n$GH_TOKEN\nEOF\n"),
     (
         # `tee FILE` writes the file AND stdout, and stdout is the pipe here.
+        # The null device is the one file operand a source-text scanner can
+        # settle, so this hop is transparent.
         "pipe-through-tee-into-filter",
         MUST_NOT_FLAG,
         "printf '%s\\n' \"$GH_TOKEN\" | tee /dev/null | grep -qF zz || echo ok\n",
+    ),
+    (
+        # A REAL file operand is not a transparent hop: the pipe carries the
+        # value onward AND the file receives it.  Following only the pipe
+        # graded the consumer and never saw the write.  Flagged under the same
+        # emitter-to-file rule as `printf '%s\n' "$PAT" > log`.
+        "pipe-through-tee-into-file",
+        MUST_FLAG,
+        "printf '%s\\n' \"$GH_TOKEN\" | tee leaked.log | grep -qF zz || echo ok\n",
+    ),
+    (
+        # An OPTION is not a file operand: reading `-a` as one would flag a
+        # transparent hop.
+        "pipe-through-tee-append-devnull",
+        MUST_NOT_FLAG,
+        "printf '%s\\n' \"$GH_TOKEN\" | tee -a /dev/null | "
+        "grep -qF zz || echo ok\n",
+    ),
+    (
+        # ... and only a LITERAL operand counts.  `tee "$LOG"` names a path the
+        # source text does not fix, and flagging it would red the ordinary
+        # logging idiom fleet-wide; the residue is pinned here rather than
+        # guessed at.
+        "pipe-through-tee-variable-target",
+        MUST_NOT_FLAG,
+        "log=leaked.log\nprintf '%s\\n' \"$GH_TOKEN\" | tee \"$log\" | "
+        "grep -qF zz || echo ok\n",
+    ),
+    (
+        # Descriptor 0 is STANDARD INPUT: `0>/dev/null` leaves fd 1 on the
+        # pipe, so it is not an escape.
+        "pipe-stdin-redirected-away",
+        MUST_NOT_FLAG,
+        "printf '%s\\n' \"$GH_TOKEN\" 0>/dev/null | grep -qF zz || echo ok\n",
     ),
     (
         # Wrapper resolution still applies to the consumer.
@@ -2739,6 +3393,20 @@ KNOWN_BROADER = {
         "check_resolve_pr_threads leak #993 fixed, and the gate is built so "
         "that hop is visible"
     ),
+    "redir-glued-ampersand-to-file": (
+        "the same emitter-to-file rule reached through a redirection GLUED to "
+        "the command word: `printf&>out.txt ...` writes the value to a file "
+        "and nothing to a stream.  The word break itself is measured by "
+        "`redir-glued-to-command-word`, which the oracle confirms leaks"
+    ),
+    "pipe-through-tee-into-file": (
+        "`tee FILE` mid-pipeline writes the value to a FILE and passes it on; "
+        "the file write is counted for the same reason `emitter-to-file` is, "
+        "and the oracle -- which grades STREAMS -- sees nothing.  "
+        "`pipe-through-tee-into-filter` pins that a `/dev/null` operand stays "
+        "transparent, and `pipe-through-tee-variable-target` pins that a "
+        "non-literal operand is not guessed at"
+    ),
     "pipe-into-brace-group": (
         "a pipeline into a `{ ...; }` group.  WHICH command inside the group "
         "reads the pipe is a dataflow question a single-line source-text "
@@ -2945,10 +3613,45 @@ def _oracle_interpreter_cases():
     return failures
 
 
+def _corpus_id_cases():
+    """Every corpus id is UNIQUE, and every declared id names a real case.
+
+    The id is not a label: `self_test` uses it as the fixture's DIRECTORY, and
+    the oracle runs the corpus concurrently -- so two entries sharing an id
+    write and execute the same path from two threads at once, and which body
+    each one measured depends on the interleaving.  A duplicate also lets one
+    entry's `KNOWN_MISSES` / `KNOWN_BROADER` declaration silently stand in for
+    the other's.  Renaming the collision fixed one instance; this assertion is
+    what keeps the next one from landing (#1032 F11).
+    """
+    failures = []
+    seen = {}
+    for cid, _disposition, body in CORPUS:
+        if cid in seen:
+            failures.append(
+                "duplicate CORPUS id %r -- ids are fixture DIRECTORIES and the "
+                "oracle runs concurrently, so the two bodies race for the same "
+                "path (%r vs %r)"
+                % (cid, seen[cid].strip(), body.strip())
+            )
+        seen[cid] = body
+    for registry, label in ((KNOWN_MISSES, "KNOWN_MISSES"),
+                            (KNOWN_BROADER, "KNOWN_BROADER")):
+        for cid in sorted(registry):
+            if cid not in seen:
+                failures.append(
+                    "%s declares %r, which is not a corpus id -- a declaration "
+                    "with no case behind it can never be measured" % (label, cid)
+                )
+    return failures
+
+
 def self_test():
     failures = []
     passed = 0
     tp = fn = fp = tn = 0
+
+    failures.extend(_corpus_id_cases())
 
     with tempfile.TemporaryDirectory(prefix="token-output-oracle.") as tmp:
 
@@ -3039,6 +3742,7 @@ def self_test():
         failures.extend(_pragma_cases())
         failures.extend(_file_selection_cases(tmp))
         failures.extend(_discovery_failure_cases(tmp))
+        failures.extend(_source_promotion_cases(tmp))
         failures.extend(_path_independence_case(tmp))
 
     failures.extend(_residue_and_quoted_tmpdir_case())
@@ -3408,6 +4112,143 @@ def _discovery_failure_cases(tmp):
                 )
         finally:
             os.chmod(bad, 0o644)
+
+    # 6. an unreadable DIRECTORY.  `os.walk` swallows the OSError unless an
+    #    `onerror` callback is given: the subtree yields nothing, the walk
+    #    continues, and a live leak inside it is skipped in SILENCE.  The
+    #    zero-file guard cannot fire either, because the sibling files still
+    #    make the count non-zero -- which is the #951 shape (a green gate
+    #    saying nothing was wrong) reproduced one level down.
+    if os.geteuid() != 0:
+        root = os.path.join(tmp, "disc-unreadable-dir")
+        locked = os.path.join(root, "scripts", "locked")
+        os.makedirs(locked, exist_ok=True)
+        with open(os.path.join(root, "scripts", "ok.sh"), "w") as fh:
+            fh.write("#!/usr/bin/env bash\ntrue\n")
+        with open(os.path.join(locked, "leak.sh"), "w") as fh:
+            fh.write('#!/usr/bin/env bash\necho "$GH_TOKEN"\n')
+        os.chmod(locked, 0o000)
+        try:
+            _f, errors, count = scan_tree(root)
+            if not any("locked" in e for e in errors):
+                failures.append(
+                    "discovery: an unreadable DIRECTORY must ERROR rather than "
+                    "shrink the scan in silence (scanned %d, errors=%s)"
+                    % (count, errors)
+                )
+        finally:
+            os.chmod(locked, 0o755)
+    return failures
+
+
+def _source_promotion_cases(tmp):
+    """A file a shell file SOURCES is shell, whatever it is called.
+
+    `. ./lib.env` runs `lib.env` in the sourcing shell, so a leak inside it is
+    a leak in the sourcing script.  The extension table called `.env`
+    configuration and the fragment was never read -- measured here END TO END:
+    the oracle runs the sourcing script through its own shebang and the
+    sentinel reaches stdout, while the scanner had reported a clean tree.
+
+    Resolution is over the source OPERAND, never over the candidate's
+    contents: the operand is the only thing in the source text that says which
+    file is executed, and a content heuristic on a required fleet-wide check
+    would have to decide which `.env` files are shell.  An operand carrying an
+    expansion is therefore NOT resolved, and the last case pins that residue
+    rather than leaving it to be discovered.
+    """
+    failures = []
+
+    def _tree(name, files):
+        root = os.path.join(tmp, "src-" + name)
+        for rel, body in files.items():
+            path = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.chmod(path, 0o755)
+        return root
+
+    leak = 'echo "$GH_TOKEN"\n'
+
+    # 1. the sourced fragment is read, and the leak inside it is reported
+    root = _tree(
+        "dot-env",
+        {
+            "scripts/main.sh": "#!/usr/bin/env bash\n. ./lib.env\n",
+            "scripts/lib.env": leak,
+        },
+    )
+    findings, errors, count = scan_tree(root)
+    if count != 2 or not any("lib.env" in f.path for f in findings):
+        failures.append(
+            "source promotion: a sourced `.env` fragment must be READ as "
+            "shell (scanned %d, findings %s, errors %s)"
+            % (count, [str(f) for f in findings], errors)
+        )
+    leaked, _out, err = run_oracle(
+        "", root, os.path.join("scripts", "main.sh"),
+        shebang="#!/usr/bin/env bash\nGH_TOKEN='" + SENTINEL + "'\n. ./lib.env\n",
+        run_via=[],
+    )
+    if leaked is not True:
+        failures.append(
+            "source promotion: the fixture does not measure what it claims -- "
+            "running scripts/main.sh put no sentinel on a stream (%s)"
+            % ((err or "").strip() or "no stderr")
+        )
+
+    # 2. `source` spells it too, and the promotion is a FIXED POINT: a
+    #    promoted fragment can source another.
+    root = _tree(
+        "chained",
+        {
+            "scripts/main.sh": "#!/usr/bin/env bash\nsource scripts/one.env\n",
+            "scripts/one.env": ". ./two.env\n",
+            "scripts/two.env": leak,
+        },
+    )
+    findings, errors, count = scan_tree(root)
+    if count != 3 or not any("two.env" in f.path for f in findings):
+        failures.append(
+            "source promotion: a fragment sourced BY a promoted fragment must "
+            "be read too (scanned %d, findings %s, errors %s)"
+            % (count, [str(f) for f in findings], errors)
+        )
+
+    # 3. an UNSOURCED fragment keeps its classification.  Promotion is what
+    #    the source operand licenses; nothing here reads file contents to
+    #    decide, so a `.env` nobody sources stays out of the scan.
+    root = _tree(
+        "unsourced",
+        {
+            "scripts/main.sh": "#!/usr/bin/env bash\ntrue\n",
+            "scripts/lib.env": leak,
+        },
+    )
+    _findings, _errors, count = scan_tree(root)
+    if count != 1:
+        failures.append(
+            "source promotion: an UNSOURCED `.env` must keep its "
+            "classification (scanned %d)" % count
+        )
+
+    # 4. the declared residue: an operand carrying an expansion is not a
+    #    literal, so the fragment behind it is not resolved.
+    root = _tree(
+        "variable-operand",
+        {
+            "scripts/main.sh": '#!/usr/bin/env bash\nd=.\n. "$d/lib.env"\n',
+            "scripts/lib.env": leak,
+        },
+    )
+    findings, _errors, count = scan_tree(root)
+    if count != 1 or findings:
+        failures.append(
+            "source promotion: a NON-literal source operand must be left "
+            "unresolved rather than guessed at (scanned %d, findings %s)"
+            % (count, [str(f) for f in findings])
+        )
     return failures
 
 
