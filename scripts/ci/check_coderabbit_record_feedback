@@ -53,6 +53,11 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_coderabbit_record_feedback: ERROR (jq is required — the wrapped suite would self-skip with exit 0 and report a green check over zero assertions)" >&2
+  exit 1
+fi
+
 echo "check_coderabbit_record_feedback: running coderabbit-record-feedback tests (#584)"
 if ! bash "$TEST"; then
   echo "check_coderabbit_record_feedback: FAIL (test suite)"
