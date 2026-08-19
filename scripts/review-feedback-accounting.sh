@@ -400,6 +400,8 @@ archive_payload() {
   payload=$(printf '%s' "$encoded" | jq -Rer '@base64d | fromjson') || return 1
   printf '%s' "$payload" | jq -e '
     type == "object"
+    and ((.source_kind // "issue-comment") as $kind
+      | $kind == "issue-comment" or $kind == "inline")
     and (.source_comment_id | type == "number" and . > 0 and floor == .)
     and (.source_login | type == "string" and length > 0)
     and (.archived_at | type == "string" and length > 0)
@@ -409,7 +411,7 @@ archive_payload() {
     and (.coderabbit_tiers | type == "array"
       and all(.[]; . == "p0" or . == "p1" or . == "p2" or . == "p3" or . == "nitpick"))
   ' >/dev/null 2>&1 || return 1
-  printf '%s' "$payload"
+  printf '%s' "$payload" | jq -c '.source_kind = (.source_kind // "issue-comment")'
 }
 
 strongest_nonignored_archive_tier() {
@@ -428,14 +430,15 @@ EOF
   printf '%s' "$best"
 }
 
-# GitHub exposes only the current body of an edited issue comment. The
-# trusted workflow snapshots the prior marker set in an append-only comment
-# before it can disappear from the paginated API. Trust only records authored
-# by github-actions[bot], bind them back to the configured source bot, and use
-# every distinct archived finding version when the source is now markerless
-# (or deleted). Identical delivery retries collapse by source + fingerprint;
-# a live re-raise supersedes every archive for that source.
-ARCHIVED_ISSUE_CANDIDATES='[]'
+# GitHub exposes only the current body of an edited PR-level or inline comment,
+# and removes a deleted comment from its original endpoint. The trusted
+# workflow snapshots the prior marker set in an append-only issue comment
+# before it can disappear. Trust only records authored by github-actions[bot],
+# bind them back to a configured source identity, and use every distinct
+# archived finding version when the source is now markerless (or deleted).
+# Identical delivery retries collapse by source kind + id + fingerprint; a live
+# re-raise supersedes every archive for that source.
+ARCHIVED_CANDIDATES='[]'
 while IFS= read -r archive_comment; do
   [ -n "$archive_comment" ] || continue
   archive_login=$(printf '%s' "$archive_comment" | jq -r '.user.login // ""')
@@ -443,14 +446,28 @@ while IFS= read -r archive_comment; do
   archive_body=$(printf '%s' "$archive_comment" | jq -r '.body // ""')
   payload=$(archive_payload "$archive_body" || true)
   [ -n "$payload" ] || continue
+  source_kind=$(printf '%s' "$payload" | jq -r '.source_kind')
   source_id=$(printf '%s' "$payload" | jq -r '.source_comment_id')
   source_login=$(printf '%s' "$payload" | jq -r '.source_login')
-  case "$source_login" in
-    "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+  case "$source_kind" in
+    issue-comment)
+      case "$source_login" in
+        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+        *) continue ;;
+      esac
+      source_comments="$ISSUE_COMMENTS"
+      ;;
+    inline)
+      case "$source_login" in
+        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+        *) registered_reviewer_login "$source_login" || continue ;;
+      esac
+      source_comments="$INLINE_COMMENTS"
+      ;;
     *) continue ;;
   esac
 
-  source_comment=$(printf '%s' "$ISSUE_COMMENTS" | jq -c \
+  source_comment=$(printf '%s' "$source_comments" | jq -c \
     --argjson id "$source_id" 'first(.[] | select(.id == $id)) // null')
   if [ "$source_comment" != null ]; then
     live_source_login=$(printf '%s' "$source_comment" | jq -r '.user.login // ""')
@@ -460,10 +477,10 @@ while IFS= read -r archive_comment; do
     [ -z "$live_source_tier" ] || continue
   fi
 
-  if [ "$source_login" = "$CODEX_BOT" ]; then
-    archive_tiers=$(printf '%s' "$payload" | jq -c '.codex_tiers')
-  else
+  if [ "$source_login" = "$CODERABBIT_BOT" ]; then
     archive_tiers=$(printf '%s' "$payload" | jq -c '.coderabbit_tiers')
+  else
+    archive_tiers=$(printf '%s' "$payload" | jq -c '.codex_tiers')
   fi
   tier=$(strongest_nonignored_archive_tier "$archive_tiers")
   [ -n "$tier" ] || continue
@@ -471,14 +488,24 @@ while IFS= read -r archive_comment; do
   archive_comment_id=$(printf '%s' "$archive_comment" | jq -r '.id')
   archived_at=$(printf '%s' "$archive_comment" | jq -r '.created_at // .updated_at // ""')
   body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
-  ack_token="[mergepath-comment-ack: $source_id $body_fingerprint]"
+  case "$source_kind" in
+    issue-comment)
+      finding_kind="issue-comment-archive"
+      ack_token="[mergepath-comment-ack: $source_id $body_fingerprint]"
+      ;;
+    inline)
+      finding_kind="inline-archive"
+      ack_token="[mergepath-inline-ack: $source_id $body_fingerprint]"
+      ;;
+  esac
   accounted=false
   evidence=""
   if ack_present "$ack_token" "$archived_at"; then
     accounted=true
     evidence="comment-ack"
   fi
-  ARCHIVED_ISSUE_CANDIDATES=$(printf '%s' "$ARCHIVED_ISSUE_CANDIDATES" | jq -c \
+  ARCHIVED_CANDIDATES=$(printf '%s' "$ARCHIVED_CANDIDATES" | jq -c \
+    --arg source_kind "$source_kind" --arg finding_kind "$finding_kind" \
     --argjson source_comment_id "$source_id" \
     --argjson archive_comment_id "$archive_comment_id" \
     --arg source_login "$source_login" \
@@ -486,7 +513,8 @@ while IFS= read -r archive_comment; do
     --arg fingerprint "$body_fingerprint" --arg token "$ack_token" \
     --argjson accounted "$accounted" --arg evidence "$evidence" '
       . + [{
-        kind: "issue-comment-archive",
+        kind: $finding_kind,
+        source_kind: $source_kind,
         comment_id: $source_comment_id,
         archive_comment_id: $archive_comment_id,
         reviewer: $source_login,
@@ -495,7 +523,7 @@ while IFS= read -r archive_comment; do
         updated_at: $archived_at,
         body_fingerprint: $fingerprint,
         ack_token: $token,
-        body: "(archived reviewer issue-comment version)",
+        body: ("(archived reviewer " + $source_kind + " version)"),
         accounted: $accounted,
         evidence: (if $evidence == "" then null else $evidence end)
       }]
@@ -504,13 +532,13 @@ done <<EOF
 $(printf '%s' "$ISSUE_COMMENTS" | jq -c '.[]')
 EOF
 
-ARCHIVED_ISSUE_CANDIDATES=$(printf '%s' "$ARCHIVED_ISSUE_CANDIDATES" | jq -c '
-  sort_by(.comment_id, .body_fingerprint, .updated_at, .archive_comment_id)
-  | group_by([.comment_id, .body_fingerprint])
+ARCHIVED_CANDIDATES=$(printf '%s' "$ARCHIVED_CANDIDATES" | jq -c '
+  sort_by(.source_kind, .comment_id, .body_fingerprint, .updated_at, .archive_comment_id)
+  | group_by([.source_kind, .comment_id, .body_fingerprint])
   | map(last)
 ')
 FINDINGS=$(printf '%s' "$FINDINGS" | jq -c \
-  --argjson archived "$ARCHIVED_ISSUE_CANDIDATES" '. + $archived')
+  --argjson archived "$ARCHIVED_CANDIDATES" '. + $archived')
 
 while IFS= read -r issue_comment; do
   [ -n "$issue_comment" ] || continue
@@ -632,6 +660,8 @@ if [ "$MISSING_COUNT" -gt 0 ]; then
     .[] |
     if .kind == "inline" then
       "  - inline \(.reviewer) \(.tier) finding \(.finding_id) at \(.path):\(.line // "?"): post a substantive disposition reply on the thread"
+    elif .kind == "inline-archive" then
+      "  - archived inline \(.reviewer) \(.tier) finding from comment \(.comment_id): post a PR comment whose first line is\n      \(.ack_token)\n    with the fix/rebuttal/deferral rationale below it"
     elif .kind == "review-body" then
       "  - review-body \(.reviewer) \(.tier) finding in review \(.review_id): post a PR comment whose first line is\n      \(.ack_token)\n    with the fix/rebuttal/deferral rationale below it"
     else

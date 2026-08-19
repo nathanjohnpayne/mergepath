@@ -76,8 +76,8 @@ jobs:
   archive-edited-feedback:
     name: Archive edited reviewer feedback
     if: >-
-      github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request &&
+      ((github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
+      github.event_name == 'pull_request_review_comment') &&
       (github.event.action == 'edited' || github.event.action == 'deleted')
     runs-on: ubuntu-latest
     permissions:
@@ -97,10 +97,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
           EVENT_JSON: ${{ toJSON(github.event) }}
         run: |
           set -euo pipefail
-          pr=$(jq -r '.issue.number' <<<"$EVENT_JSON")
+          case "$EVENT_NAME" in
+            issue_comment)
+              pr=$(jq -r '.issue.number' <<<"$EVENT_JSON")
+              source_kind=issue-comment
+              ;;
+            pull_request_review_comment)
+              pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
+              source_kind=inline
+              ;;
+            *)
+              echo "::error::Unsupported archive event: $EVENT_NAME"
+              exit 1
+              ;;
+          esac
           source_id=$(jq -r '.comment.id' <<<"$EVENT_JSON")
           source_login=$(jq -r '.comment.user.login // ""' <<<"$EVENT_JSON")
           archived_at=$(jq -r '.comment.updated_at // .comment.created_at // ""' <<<"$EVENT_JSON")
@@ -116,7 +130,7 @@ jobs:
           # The renderer emits one hidden
           # <!-- mergepath-feedback-archive:v1 ... --> record.
           archive_record=$(scripts/render-feedback-archive.sh \
-            "$source_id" "$source_login" "$archived_at" "$previous_file")
+            "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file")
           [ -n "$archive_record" ] || exit 0
 
           existing=$(gh api --paginate "repos/$REPO/issues/$pr/comments" | jq -s 'add // []')
@@ -134,19 +148,89 @@ jobs:
     name: Codex P1 unresolved threads
     needs: [archive-edited-feedback]
     runs-on: ubuntu-latest
-    concurrency:
-      group: codex-p1-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
-      cancel-in-progress: false
+    # Deliberately no Actions concurrency block. GitHub cancels the queued
+    # member when a third event arrives even with cancel-in-progress:false,
+    # leaving a cancelled native required check that no API write can retire
+    # (#843). Ordered publication comes from the two-phase check lease below.
     # Event-driven path. The scheduled sweep below runs the same
     # gate but on every open PR via the Checks API; gating this job
     # to non-schedule events avoids paying for an empty no-op run.
     if: >-
       always() &&
-      needs.archive-edited-feedback.result != 'failure' &&
-      needs.archive-edited-feedback.result != 'cancelled' &&
       github.event_name != 'schedule' &&
       (github.event_name != 'issue_comment' || github.event.issue.pull_request)
     steps:
+      - name: Open the PR-head check lease
+        id: open
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_JSON: ${{ toJSON(github.event) }}
+          CHECK_NAME: "Codex P1 unresolved threads"
+        run: |
+          set -uo pipefail
+          case "$EVENT_NAME" in
+            pull_request|pull_request_review|pull_request_review_comment)
+              pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
+              head_sha=$(jq -r '.pull_request.head.sha' <<<"$EVENT_JSON")
+              is_fork=$(jq -r '.pull_request.head.repo.fork // false' <<<"$EVENT_JSON")
+              pr_actor=$(jq -r '.pull_request.user.login // ""' <<<"$EVENT_JSON")
+              ;;
+            issue_comment)
+              pr=$(jq -r '.issue.number' <<<"$EVENT_JSON")
+              pr_json=$(gh api "repos/$REPO/pulls/$pr") || exit 1
+              head_sha=$(jq -r '.head.sha' <<<"$pr_json")
+              is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
+              pr_actor=$(jq -r '.user.login // ""' <<<"$pr_json")
+              ;;
+            *)
+              echo "::error::Unsupported event: $EVENT_NAME"
+              exit 1
+              ;;
+          esac
+          if [ -z "$pr" ] || [ "$pr" = null ] || [ -z "$head_sha" ] || [ "$head_sha" = null ]; then
+            echo "::error::Could not bind the gate lease to a PR number and head SHA"
+            exit 1
+          fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+          # POST one in-progress generation before evaluation, then PATCH this
+          # exact id in phase 2. An older run can finish after a newer event,
+          # but updating its older generation cannot supersede the newer
+          # generation the event opened. This is the lease/fence that plain
+          # job concurrency cannot safely provide for a required check.
+          id=""
+          for attempt in 1 2 3; do
+            id=$(gh api -X POST "repos/$REPO/check-runs" \
+              -f name="$CHECK_NAME" \
+              -f head_sha="$head_sha" \
+              -f status="in_progress" \
+              -f "output[title]=Codex feedback gate (re-evaluation in progress)" \
+              -f "output[summary]=Evaluating complete reviewer-feedback history on $head_sha." \
+              --jq .id 2>/dev/null) && [ -n "$id" ] && break
+            id=""
+            sleep $((attempt * 5))
+          done
+          if [ -z "$id" ]; then
+            if [ "$is_fork" = true ] || [ "$pr_actor" = 'dependabot[bot]' ]; then
+              echo "::warning::Restricted token cannot open the PR-head check lease; the native check and scheduled sweep remain the backstop"
+              exit 0
+            fi
+            echo "::error::Could not open the required PR-head check lease"
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+      - name: Fail closed when the feedback archive did not complete
+        if: >-
+          needs.archive-edited-feedback.result == 'failure' ||
+          needs.archive-edited-feedback.result == 'cancelled'
+        run: |
+          echo "::error::Reviewer-feedback archive did not complete; the prior comment body may be unrecoverable."
+          exit 1
+
       - name: Checkout repo (default branch — trusted gate script)
         # Pin to the default branch, NOT the PR HEAD. The gate is a
         # REQUIRED status check: if it ran scripts/codex-p1-gate.sh
@@ -175,38 +259,13 @@ jobs:
           # trusted gate script.
           fetch-depth: 1
 
-      - name: Resolve PR number
-        id: pr
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_JSON: ${{ toJSON(github.event) }}
-        run: |
-          set -euo pipefail
-          case "$EVENT_NAME" in
-            pull_request|pull_request_review|pull_request_review_comment)
-              pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
-              ;;
-            issue_comment)
-              pr=$(jq -r '.issue.number' <<<"$EVENT_JSON")
-              ;;
-            *)
-              echo "Unsupported event: $EVENT_NAME" >&2
-              exit 1
-              ;;
-          esac
-          if [ -z "$pr" ] || [ "$pr" = "null" ]; then
-            echo "Could not resolve PR number from event payload." >&2
-            exit 1
-          fi
-          echo "number=$pr" >> "$GITHUB_OUTPUT"
-
       - name: Run scripts/codex-p1-gate.sh
+        id: gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_NUMBER: ${{ steps.open.outputs.pr }}
           REPO: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          CHECK_NAME: "Codex P1 unresolved threads"
+          EXPECTED_HEAD_SHA: ${{ steps.open.outputs.head_sha }}
         run: |
           set -euo pipefail
           # The script is the source of truth for what blocks merge.
@@ -215,27 +274,32 @@ jobs:
           #       threads on HEAD (or the legacy thread scan is disabled)
           #   1 = feedback unaccounted or unresolved required-tier threads
           #   2 = config / usage error (CI failure, not a gate block)
-          head_sha_before=""
-          if [ "$EVENT_NAME" = "issue_comment" ]; then
-            head_sha_before=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')
-            if [ -z "$head_sha_before" ] || [ "$head_sha_before" = "null" ]; then
-              echo "::error::Could not resolve head SHA for PR #$PR_NUMBER before gate evaluation"
+          fingerprint_available=false
+          if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
+            # One bootstrap exception is required while the introducing PR's
+            # trusted default branch predates both the helper and its manifest
+            # entry. Once the manifest declares the helper, absence is an
+            # infrastructure failure rather than a silent fence downgrade.
+            if grep -Fq 'path: scripts/review-feedback-surface-fingerprint.sh' \
+              .mergepath-sync.yml; then
+              echo "::error::Installed feedback-fingerprint helper is missing or not executable"
               exit 1
             fi
-          fi
-          feedback_fp_before="unavailable"
-          if [ -x scripts/review-feedback-surface-fingerprint.sh ]; then
+            echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the manifest-absent bootstrap window"
+            feedback_fp_before="bootstrap-unavailable"
+          else
+            fingerprint_available=true
             feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh \
               "$PR_NUMBER" "$REPO")
           fi
           set +e
-          output=$(CODEX_P1_EXPECTED_HEAD_SHA="$head_sha_before" \
+          output=$(CODEX_P1_EXPECTED_HEAD_SHA="$EXPECTED_HEAD_SHA" \
             scripts/codex-p1-gate.sh "$PR_NUMBER" "$REPO" 2>&1)
           rc=$?
           set -e
           echo "$output"
           feedback_fp_after="$feedback_fp_before"
-          if [ "$feedback_fp_before" != unavailable ]; then
+          if [ "$fingerprint_available" = true ]; then
             feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh \
               "$PR_NUMBER" "$REPO")
             if [ "$feedback_fp_after" != "$feedback_fp_before" ]; then
@@ -244,41 +308,55 @@ jobs:
             fi
           fi
 
-          # `issue_comment` workflows run against the default-branch SHA, so
-          # their native Actions check cannot update the required check on the
-          # PR head. Publish the same named check_run explicitly, mirroring the
-          # scheduled sweep, so a review-body acknowledgement clears (or
-          # re-fails) the actual merge-relevant commit immediately (#1000).
-          if [ "$EVENT_NAME" = "issue_comment" ]; then
-            head_sha=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')
-            if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
-              echo "::error::Could not resolve head SHA for PR #$PR_NUMBER"
-              exit 1
-            fi
-            if [ "$head_sha" != "$head_sha_before" ]; then
-              output="${output}"$'\n'"PR head drifted during gate evaluation: ${head_sha_before} -> ${head_sha}"
-              rc=2
-            fi
-            if [ "$rc" -eq 0 ]; then conclusion="success"; else conclusion="failure"; fi
-            summary="${output:0:60000}"
-            if ! gh api -X POST "repos/$REPO/check-runs" \
-              -f name="$CHECK_NAME" \
-              -f head_sha="$head_sha" \
-              -f status="completed" \
-              -f conclusion="$conclusion" \
-              -f "output[title]=Codex feedback gate (PR-comment re-evaluation)" \
-              -f "output[summary]=$summary" \
-              >/dev/null; then
-              echo "::error::Failed to post check_run for PR #$PR_NUMBER"
-              exit 1
-            fi
-          fi
-
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          printf '%s' "${output:0:60000}" > "$RUNNER_TEMP/codex-p1-summary.txt"
           if [ "$rc" -eq 2 ]; then
             echo "::error::codex-p1-gate.sh exited 2 (config/usage error)"
             exit 1
           fi
           exit "$rc"
+
+      - name: Close the PR-head check lease
+        if: ${{ !cancelled() && steps.open.outputs.id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.open.outputs.pr }}
+          HEAD_SHA: ${{ steps.open.outputs.head_sha }}
+          CHECK_ID: ${{ steps.open.outputs.id }}
+          ARCHIVE_RESULT: ${{ needs.archive-edited-feedback.result }}
+          GATE_RC: ${{ steps.gate.outputs.rc }}
+        run: |
+          set -uo pipefail
+          conclusion=failure
+          title="Codex feedback gate — evaluation failed closed"
+          if [ "$ARCHIVE_RESULT" = failure ] || [ "$ARCHIVE_RESULT" = cancelled ]; then
+            title="Codex feedback gate — reviewer-feedback archive failed"
+          elif [ "$GATE_RC" = 0 ]; then
+            conclusion=success
+            title="Codex feedback gate (leased re-evaluation)"
+          elif [ "$GATE_RC" = 1 ]; then
+            title="Codex feedback gate (leased re-evaluation)"
+          elif [ -n "$GATE_RC" ]; then
+            title="Codex feedback gate — infra/config error (rc=$GATE_RC)"
+          fi
+
+          current=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null || true)
+          if [ "$current" != "$HEAD_SHA" ]; then
+            conclusion=failure
+            title="Codex feedback gate — head moved during evaluation"
+          fi
+          summary=$(cat "$RUNNER_TEMP/codex-p1-summary.txt" 2>/dev/null || printf '%s' "$title")
+          for attempt in 1 2 3; do
+            gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" \
+              -f status="completed" \
+              -f conclusion="$conclusion" \
+              -f "output[title]=$title" \
+              -f "output[summary]=$summary" >/dev/null && exit 0
+            sleep $((attempt * 5))
+          done
+          echo "::warning::Could not close check lease $CHECK_ID; it remains pending until a newer event or sweep supersedes it"
+          exit 0
 
   scheduled-sweep:
     name: Codex P1 scheduled sweep
@@ -296,6 +374,9 @@ jobs:
     # the gate result is unchanged.
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    # No Actions concurrency here either. Each PR gets its own in-progress
+    # check generation and this sweep PATCHes only that generation, so an
+    # overlapping newer sweep or event remains newer regardless of finish order.
     steps:
       - name: Checkout repo (default branch — trusted scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -364,13 +445,42 @@ jobs:
             # default-branch HEAD).
             head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
             if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
-              echo "::warning::Could not resolve head SHA for PR #$PR; skipping"
+              echo "::error::Could not resolve head SHA for PR #$PR; cannot open a fail-closed lease"
+              had_infra_error=1
               echo "::endgroup::"
               continue
             fi
 
-            feedback_fp_before="unavailable"
-            if [ -x scripts/review-feedback-surface-fingerprint.sh ]; then
+            check_id=""
+            for attempt in 1 2 3; do
+              check_id=$(gh api -X POST "repos/$REPO/check-runs" \
+                -f name="$CHECK_NAME" \
+                -f head_sha="$head_sha" \
+                -f status="in_progress" \
+                -f "output[title]=Codex P1 gate (scheduled re-evaluation in progress)" \
+                -f "output[summary]=Evaluating complete reviewer-feedback history on $head_sha." \
+                --jq .id 2>/dev/null) && [ -n "$check_id" ] && break
+              check_id=""
+              sleep $((attempt * 5))
+            done
+            if [ -z "$check_id" ]; then
+              echo "::error::Could not open the scheduled check lease for PR #$PR"
+              had_infra_error=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            fingerprint_available=false
+            if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
+              if grep -Fq 'path: scripts/review-feedback-surface-fingerprint.sh' \
+                .mergepath-sync.yml; then
+                echo "::error::Installed feedback-fingerprint helper is missing or not executable"
+                exit 1
+              fi
+              echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the manifest-absent bootstrap window"
+              feedback_fp_before="bootstrap-unavailable"
+            else
+              fingerprint_available=true
               feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh \
                 "$PR" "$REPO")
             fi
@@ -381,27 +491,34 @@ jobs:
             echo "$output"
 
             feedback_fp_after="$feedback_fp_before"
-            if [ "$feedback_fp_before" != unavailable ]; then
+            if [ "$fingerprint_available" = true ]; then
               feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh \
                 "$PR" "$REPO")
               if [ "$feedback_fp_after" != "$feedback_fp_before" ]; then
-                echo "::error::Feedback changed while PR #$PR was evaluated; refusing stale publication."
+                output="${output}"$'\n'"Feedback changed while PR #$PR was evaluated; closing this generation as failure."
+                rc=2
                 had_infra_error=1
-                echo "::endgroup::"
-                continue
               fi
             fi
 
+            check_title="Codex P1 gate (scheduled leased re-evaluation)"
             case "$rc" in
               0) conclusion="success" ;;
               1) conclusion="failure" ;;
               *)
                 echo "::error::codex-p1-gate.sh rc=$rc on PR #$PR (config/usage error)"
                 had_infra_error=1
-                echo "::endgroup::"
-                continue
+                conclusion="failure"
+                check_title="Codex P1 gate — infra/config error (rc=$rc)"
                 ;;
             esac
+
+            current_head=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)
+            if [ "$current_head" != "$head_sha" ]; then
+              conclusion="failure"
+              check_title="Codex P1 gate — head moved during scheduled evaluation"
+              had_infra_error=1
+            fi
 
             # Truncate to stay under GitHub's 65535-char summary limit.
             # Bash slice, NOT `printf | head -c`: under `set -euo pipefail`
@@ -413,21 +530,17 @@ jobs:
             # Codex P2 on the b10671e propagation wave).
             summary="${output:0:60000}"
 
-            # Posting the check_run IS the sweep's whole purpose —
-            # it's what supersedes the stale red required-check after
-            # a UI thread-resolve. If the POST fails, the sweep did
-            # not do its job; that's an infra error, not a warning.
-            # Swallowing it let the sweep finish green while the
-            # stale check stayed red. (CodeRabbit Major, #271.)
-            if ! gh api -X POST "repos/$REPO/check-runs" \
-              -f name="$CHECK_NAME" \
-              -f head_sha="$head_sha" \
+            # Close only the generation opened above. PATCH preserves its
+            # creation order: if a newer event or sweep opened another lease
+            # while this evaluation ran, this older completion cannot become
+            # the newest required-check generation even when it finishes last.
+            if ! gh api -X PATCH "repos/$REPO/check-runs/$check_id" \
               -f status="completed" \
               -f conclusion="$conclusion" \
-              -f "output[title]=Codex P1 gate (scheduled re-evaluation)" \
+              -f "output[title]=$check_title" \
               -f "output[summary]=$summary" \
               >/dev/null; then
-              echo "::error::Failed to post check_run for PR #$PR — stale required check not refreshed."
+              echo "::error::Failed to close check lease $check_id for PR #$PR; it remains pending"
               had_infra_error=1
             fi
             echo "::endgroup::"

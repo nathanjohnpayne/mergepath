@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Render a compact, GitHub-visible history record for an edited/deleted
-# PR-level reviewer comment. The workflow owns the write; this helper is pure.
+# PR-level or inline reviewer comment. The workflow owns the write; this
+# helper is pure.
 
 set -euo pipefail
 
@@ -10,24 +11,25 @@ HELPERS="$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$HELPERS"
 
-if [ "$#" -ne 4 ]; then
-  echo "usage: $0 SOURCE_COMMENT_ID SOURCE_LOGIN ARCHIVED_AT PREVIOUS_BODY_FILE" >&2
+if [ "$#" -ne 5 ]; then
+  echo "usage: $0 SOURCE_KIND SOURCE_COMMENT_ID SOURCE_LOGIN ARCHIVED_AT PREVIOUS_BODY_FILE" >&2
   exit 2
 fi
 
-SOURCE_COMMENT_ID="$1"
-SOURCE_LOGIN="$2"
-ARCHIVED_AT="$3"
-PREVIOUS_BODY_FILE="$4"
+SOURCE_KIND="$1"
+SOURCE_COMMENT_ID="$2"
+SOURCE_LOGIN="$3"
+ARCHIVED_AT="$4"
+PREVIOUS_BODY_FILE="$5"
 
+case "$SOURCE_KIND" in
+  issue-comment|inline) ;;
+  *) echo "render-feedback-archive: source kind must be issue-comment or inline" >&2; exit 2 ;;
+esac
 case "$SOURCE_COMMENT_ID" in
   ''|*[!0-9]*) echo "render-feedback-archive: source comment id must be an integer" >&2; exit 2 ;;
 esac
 [ -n "$SOURCE_LOGIN" ] || { echo "render-feedback-archive: source login is required" >&2; exit 2; }
-case "$SOURCE_LOGIN" in
-  *'[bot]') ;;
-  *) exit 0 ;;
-esac
 [ -n "$ARCHIVED_AT" ] || { echo "render-feedback-archive: archived timestamp is required" >&2; exit 2; }
 [ -r "$PREVIOUS_BODY_FILE" ] || { echo "render-feedback-archive: previous body is unreadable" >&2; exit 2; }
 
@@ -61,6 +63,7 @@ else
 fi
 
 PAYLOAD=$(jq -nc \
+  --arg source_kind "$SOURCE_KIND" \
   --argjson source_comment_id "$SOURCE_COMMENT_ID" \
   --arg source_login "$SOURCE_LOGIN" \
   --arg archived_at "$ARCHIVED_AT" \
@@ -68,6 +71,7 @@ PAYLOAD=$(jq -nc \
   --argjson codex_tiers "$CODEX_TIERS" \
   --argjson coderabbit_tiers "$CODERABBIT_TIERS" '
     {
+      source_kind: $source_kind,
       source_comment_id: $source_comment_id,
       source_login: $source_login,
       archived_at: $archived_at,

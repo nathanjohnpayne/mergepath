@@ -715,7 +715,7 @@ _🟠 Major_ prior-head summary finding that must survive a rewrite.
 EOF
 ARCHIVE_MARKER=""
 if [ -x "$RENDER_ARCHIVE" ]; then
-  ARCHIVE_MARKER=$("$RENDER_ARCHIVE" 8000 'coderabbitai[bot]' \
+  ARCHIVE_MARKER=$("$RENDER_ARCHIVE" issue-comment 8000 'coderabbitai[bot]' \
     '2026-08-18T22:23:00Z' "$PREVIOUS_SUMMARY") || true
 fi
 if printf '%s' "$ARCHIVE_MARKER" | grep -Eq '^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+/=]+ -->$'; then
@@ -781,7 +781,7 @@ cat >"$PREVIOUS_SUMMARY" <<'EOF'
 <!-- This is an auto-generated comment: summarize by coderabbit.ai -->
 _🟡 Minor_ a second distinct summary finding removed by a later rewrite.
 EOF
-ARCHIVE_MARKER_TWO=$("$RENDER_ARCHIVE" 8000 'coderabbitai[bot]' \
+ARCHIVE_MARKER_TWO=$("$RENDER_ARCHIVE" issue-comment 8000 'coderabbitai[bot]' \
   '2026-08-18T22:25:00Z' "$PREVIOUS_SUMMARY")
 jq --arg archive "$ARCHIVE_MARKER_TWO" '. + [{
   "id": 8004,
@@ -794,6 +794,69 @@ mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "distinct removed summary versions remain separate findings"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing_count')" "acknowledging one archived version cannot erase another"
+
+reset_fixtures
+PREVIOUS_INLINE="$TMP/previous-inline.txt"
+cat >"$PREVIOUS_INLINE" <<'EOF'
+**P1** Inline finding deleted before it received a disposition.
+EOF
+INLINE_ARCHIVE=$("$RENDER_ARCHIVE" inline 8500 'chatgpt-codex-connector[bot]' \
+  '2026-08-18T22:26:00Z' "$PREVIOUS_INLINE")
+jq -n --arg archive "$INLINE_ARCHIVE" '[{
+  "id": 8501,
+  "created_at": "2026-08-18T22:26:01Z",
+  "updated_at": "2026-08-18T22:26:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "deleted inline finding remains in the accounting inventory"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "deleted inline feedback retains its source kind"
+INLINE_ARCHIVE_ACK=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
+assert_match '^\[mergepath-inline-ack: 8500 [0-9a-f]{12}\]$' "$INLINE_ARCHIVE_ACK" "deleted inline finding gets a content-pinned acknowledgement path"
+assert_match 'archived inline .* finding' "$RUN_ERR" "deleted inline remediation names the archived source surface"
+jq --arg token "$INLINE_ARCHIVE_ACK" '. + [{
+  "id": 8502,
+  "created_at": "2026-08-18T22:27:00Z",
+  "updated_at": "2026-08-18T22:27:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nDispositioned the deleted inline finding after archival.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-deletion acknowledgement reconciles archived inline feedback"
+
+reset_fixtures
+cat >"$PREVIOUS_INLINE" <<'EOF'
+**P1** Registered reviewer inline finding deleted before disposition.
+EOF
+REGISTERED_INLINE_ARCHIVE=$("$RENDER_ARCHIVE" inline 8510 'nathanpayne-claude' \
+  '2026-08-18T22:28:00Z' "$PREVIOUS_INLINE")
+jq -n --arg archive "$REGISTERED_INLINE_ARCHIVE" '[{
+  "id": 8511,
+  "created_at": "2026-08-18T22:28:01Z",
+  "updated_at": "2026-08-18T22:28:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "deleted registered-reviewer inline finding remains in inventory"
+assert_eq nathanpayne-claude "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "archived inline finding stays bound to the registered reviewer"
+
+# A live finding is inventoried directly; its archive must not duplicate it.
+jq -n '[{
+  "id": 8510,
+  "in_reply_to_id": null,
+  "created_at": "2026-08-18T22:28:00Z",
+  "updated_at": "2026-08-18T22:29:00Z",
+  "user": {"login": "nathanpayne-claude"},
+  "path": "src/live.ts",
+  "line": 12,
+  "body": "**P1** Registered reviewer inline finding re-raised live."
+}]' >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "live inline re-raise supersedes its archived version"
+assert_eq inline "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].kind')" "live inline finding keeps the direct inventory path"
 
 reset_fixtures
 cat >"$TMP/fixtures/reviews.json" <<'JSON'

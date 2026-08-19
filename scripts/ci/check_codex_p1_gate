@@ -95,39 +95,174 @@ if [ -f "$WORKFLOW" ]; then
     FAILED=1
   fi
 
-  # issue_comment runs are anchored to the default branch, not the PR head.
-  # The workflow must therefore publish the required check explicitly on the
-  # pull request's live head SHA instead of relying on the native job check.
-  if ! grep -F 'if [ "$EVENT_NAME" = "issue_comment" ]' "$WORKFLOW" >/dev/null \
-     || ! grep -F 'repos/$REPO/check-runs' "$WORKFLOW" >/dev/null \
-     || ! grep -F 'head_sha="$head_sha"' "$WORKFLOW" >/dev/null \
-     || ! grep -F 'CODEX_P1_EXPECTED_HEAD_SHA="$head_sha_before"' "$WORKFLOW" >/dev/null \
-     || ! grep -F 'if [ "$head_sha" != "$head_sha_before" ]' "$WORKFLOW" >/dev/null; then
-    echo "FAIL: $WORKFLOW does not publish issue_comment results on the PR head SHA."
-    echo "      Review-body acknowledgements must refresh the merge-relevant required check immediately."
+  # Parse the actual job/step structure for the archive and generation fence.
+  # Loose token greps can be satisfied by comments or unrelated jobs while the
+  # publishing job omits the load-bearing ordering or failure path (#1000).
+  if ! command -v ruby >/dev/null 2>&1; then
+    echo "FAIL: ruby is required to validate $WORKFLOW structurally."
     FAILED=1
-  fi
+  elif ! ruby -ryaml - "$WORKFLOW" <<'RUBY'
+path = ARGV.fetch(0)
+failed = false
 
-  # Event publishers for the same PR must serialize, and both the event path
-  # and scheduled publisher must reject a result when any feedback surface
-  # changed while the gate was evaluating. Otherwise an older success can be
-  # posted after a newer failure on the same head (#1000).
-  if ! grep -F 'concurrency:' "$WORKFLOW" >/dev/null \
-     || ! grep -F 'cancel-in-progress: false' "$WORKFLOW" >/dev/null \
-     || [ "$(grep -Fc 'scripts/review-feedback-surface-fingerprint.sh' "$WORKFLOW")" -lt 2 ] \
-     || ! grep -F 'feedback_fp_before' "$WORKFLOW" >/dev/null \
-     || ! grep -F 'feedback_fp_after' "$WORKFLOW" >/dev/null; then
-    echo "FAIL: $WORKFLOW does not serialize and generation-fence feedback check publishers."
-    FAILED=1
-  fi
+require_shape = lambda do |condition, message|
+  next if condition
+  warn "FAIL: #{message}"
+  failed = true
+end
 
-  # An issue-comment edit carries the only copy of the previous body. Archive
-  # that version before the gate job runs so a CodeRabbit summary rewrite
-  # cannot erase an undispositioned prior-head finding.
-  if ! grep -F 'archive-edited-feedback:' "$WORKFLOW" >/dev/null \
-     || ! grep -F 'scripts/render-feedback-archive.sh' "$WORKFLOW" >/dev/null \
-     || ! grep -F 'mergepath-feedback-archive:v1' "$WORKFLOW" >/dev/null; then
-    echo "FAIL: $WORKFLOW does not persist edited reviewer-summary versions."
+begin
+  document = YAML.safe_load(File.read(path), aliases: false)
+rescue Psych::Exception => error
+  warn "FAIL: #{path} is not valid YAML: #{error.message}"
+  exit 1
+end
+
+jobs = document.is_a?(Hash) ? document["jobs"] : nil
+require_shape.call(jobs.is_a?(Hash), "#{path} has no jobs mapping")
+jobs ||= {}
+archive = jobs["archive-edited-feedback"]
+gate = jobs["codex-p1-gate"]
+sweep = jobs["scheduled-sweep"]
+require_shape.call(archive.is_a?(Hash), "#{path} is missing archive-edited-feedback")
+require_shape.call(gate.is_a?(Hash), "#{path} is missing codex-p1-gate")
+require_shape.call(sweep.is_a?(Hash), "#{path} is missing scheduled-sweep")
+
+if archive.is_a?(Hash)
+  archive_if = archive["if"].to_s
+  require_shape.call(
+    archive_if.include?("github.event_name == 'issue_comment'") &&
+      archive_if.include?("github.event_name == 'pull_request_review_comment'") &&
+      archive_if.include?("github.event.action == 'edited'") &&
+      archive_if.include?("github.event.action == 'deleted'"),
+    "archive-edited-feedback does not cover edited/deleted PR-level and inline comments"
+  )
+  archive_run = Array(archive["steps"]).map { |step| step["run"] }.compact.find do |run|
+    run.include?("scripts/render-feedback-archive.sh")
+  end
+  require_shape.call(!archive_run.nil?, "archive-edited-feedback does not invoke the archive renderer")
+  require_shape.call(
+    archive_run&.include?("mergepath-feedback-archive:v1") && archive_run&.include?("source_kind"),
+    "archive-edited-feedback does not bind source kind and the v1 marker to the renderer step"
+  )
+end
+
+if gate.is_a?(Hash)
+  needs = gate["needs"].is_a?(Array) ? gate["needs"] : [gate["needs"]]
+  require_shape.call(
+    needs.include?("archive-edited-feedback"),
+    "codex-p1-gate does not depend on archive-edited-feedback"
+  )
+  gate_if = gate["if"].to_s
+  require_shape.call(gate_if.include?("always()"), "codex-p1-gate must run after every archive result")
+  require_shape.call(
+    !gate_if.include?("needs.archive-edited-feedback.result != 'failure'") &&
+      !gate_if.include?("needs.archive-edited-feedback.result != 'cancelled'"),
+    "codex-p1-gate silently skips when feedback archiving fails or is cancelled"
+  )
+  require_shape.call(
+    gate["concurrency"].nil?,
+    "codex-p1-gate must not use Actions concurrency for a required native check"
+  )
+
+  steps = Array(gate["steps"])
+  open_index = steps.index do |step|
+    run = step["run"].to_s
+    step["id"].to_s == "open" && run.include?('repos/$REPO/check-runs') &&
+      run.include?('-f status="in_progress"') && run.include?('echo "id=$id"') &&
+      run.include?("pull_request_review_comment") && run.include?("issue_comment") &&
+      run.include?(".pull_request.head.sha") && run.include?(".head.sha") &&
+      run.include?('-f head_sha="$head_sha"')
+  end
+  archive_failure_index = steps.index do |step|
+    condition = step["if"].to_s
+    condition.include?("needs.archive-edited-feedback.result == 'failure'") &&
+      condition.include?("needs.archive-edited-feedback.result == 'cancelled'")
+  end
+  checkout_index = steps.index { |step| step["uses"].to_s.start_with?("actions/checkout@") }
+  require_shape.call(!open_index.nil?, "codex-p1-gate does not open a PR-head check lease before evaluation")
+  require_shape.call(!archive_failure_index.nil?, "codex-p1-gate has no explicit archive-failure step")
+  if archive_failure_index
+    failure_run = steps.fetch(archive_failure_index)["run"].to_s
+    require_shape.call(
+      failure_run.include?("::error::") && failure_run.match(/(?:^|\n)\s*exit 1(?:\s|$)/),
+      "codex-p1-gate archive-failure step does not fail closed"
+    )
+    require_shape.call(
+      open_index && open_index < archive_failure_index &&
+        (checkout_index.nil? || archive_failure_index < checkout_index),
+      "codex-p1-gate checks archive failure only after executable steps"
+    )
+  end
+
+  gate_run = steps.map { |step| step["run"] }.compact.find do |run|
+    run.include?("CODEX_P1_EXPECTED_HEAD_SHA") && run.include?("scripts/codex-p1-gate.sh")
+  end
+  require_shape.call(!gate_run.nil?, "codex-p1-gate has no gate publisher step")
+  if gate_run
+    require_shape.call(
+      gate_run.include?("if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]") &&
+        gate_run.include?(".mergepath-sync.yml") && gate_run.include?("::error::") &&
+        gate_run.include?("::warning::"),
+      "codex-p1-gate does not fail closed when an installed fingerprint helper is missing"
+    )
+    before = gate_run.index("feedback_fp_before=")
+    evaluate = gate_run.index("scripts/codex-p1-gate.sh")
+    after = gate_run.index("feedback_fp_after=")
+    compare = gate_run.index('if [ "$feedback_fp_after" != "$feedback_fp_before" ]')
+    reject = compare && gate_run.index("rc=2", compare)
+    require_shape.call(
+      [before, evaluate, after, compare, reject].all? && before < evaluate && evaluate < after && after < compare && compare < reject,
+      "codex-p1-gate does not fingerprint before evaluation and reject drift before publication"
+    )
+  end
+  close_index = steps.index do |step|
+    run = step["run"].to_s
+    step["if"].to_s.include?("!cancelled()") && run.include?('repos/$REPO/check-runs/$CHECK_ID') &&
+      run.include?('-X PATCH') && run.include?('-f status="completed"')
+  end
+  gate_index = gate_run && steps.index { |step| step["run"] == gate_run }
+  require_shape.call(
+    close_index && gate_index && gate_index < close_index,
+    "codex-p1-gate does not close its own check lease after evaluation"
+  )
+end
+
+if sweep.is_a?(Hash)
+  require_shape.call(
+    sweep["concurrency"].nil?,
+    "scheduled-sweep must not use Actions concurrency for a required native check"
+  )
+  sweep_run = Array(sweep["steps"]).map { |step| step["run"] }.compact.find do |run|
+    run.include?("scripts/codex-p1-gate.sh") && run.include?("repos/$REPO/check-runs")
+  end
+  require_shape.call(!sweep_run.nil?, "scheduled-sweep has no gate publisher step")
+  if sweep_run
+    require_shape.call(
+      sweep_run.include?("if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]") &&
+        sweep_run.include?(".mergepath-sync.yml") && sweep_run.include?("::error::") &&
+        sweep_run.include?("::warning::"),
+      "scheduled-sweep does not fail closed when an installed fingerprint helper is missing"
+    )
+    before = sweep_run.index("feedback_fp_before=")
+    lease = sweep_run.index('-f status="in_progress"')
+    evaluate = sweep_run.index("scripts/codex-p1-gate.sh")
+    after = sweep_run.index("feedback_fp_after=")
+    compare = sweep_run.index('if [ "$feedback_fp_after" != "$feedback_fp_before" ]')
+    reject = compare && sweep_run.index("rc=2", compare)
+    close = reject && sweep_run.index('-X PATCH "repos/$REPO/check-runs/$check_id"', reject)
+    require_shape.call(
+      [lease, before, evaluate, after, compare, reject, close].all? &&
+        lease < before && before < evaluate && evaluate < after && after < compare &&
+        compare < reject && reject < close,
+      "scheduled-sweep does not lease, evaluate, reject drift, and close the same check generation"
+    )
+  end
+end
+
+exit(failed ? 1 : 0)
+RUBY
+  then
     FAILED=1
   fi
 fi
