@@ -2272,9 +2272,24 @@ jobs:
             # #1024 (a): progressive backoff, replacing the flat
             # `sleep "$poll_seconds"`. Never sleep past the deadline, so
             # widening the cadence cannot extend the configured wait budget.
+            # The remainder is recomputed here rather than reused from the
+            # deadline check above, and a NON-POSITIVE remainder is treated
+            # as "the budget is already spent" rather than falling through
+            # unclamped (Codex P2, round 1): `SECONDS` can tick over between
+            # that check and this line, and skipping the clamp on a zero or
+            # negative remainder would sleep a whole interval -- up to
+            # poll_max_seconds -- past the configured bound before the next
+            # iteration notices. Timing out one interval late mattered less
+            # when the cadence was a flat 15s; it is the one way a WIDER
+            # cadence could stretch the wait, which is exactly what this
+            # change promises it cannot do.
             sleep_seconds=$current_poll_seconds
             remaining_seconds=$((deadline - SECONDS))
-            if [ "$remaining_seconds" -gt 0 ] && [ "$sleep_seconds" -gt "$remaining_seconds" ]; then
+            if [ "$remaining_seconds" -le 0 ]; then
+              echo "::error::Required check run(s) did not all complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
+              exit 1
+            fi
+            if [ "$sleep_seconds" -gt "$remaining_seconds" ]; then
               sleep_seconds=$remaining_seconds
             fi
             sleep "$sleep_seconds"
