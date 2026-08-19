@@ -2113,6 +2113,7 @@ test_1003_head_run_evidence_unit() {
   # integration fixtures reach only two of them.
   local snip="$WORKDIR/head-run-evidence.sh" bad="" rc out
   local h40 b40 clean_body ack_body notice_body marker_body
+  local failure_body benign_stanza_body
   eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END|SUMMARY_MARKER|RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER)=' \
     "$ROOT/scripts/coderabbit-wait.sh")"
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
@@ -2213,6 +2214,47 @@ _🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
   rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
   [ "$rc" = "1" ] || bad="$bad blocking-marker-body-not-1(rc=$rc)"
 
+  # A run body carrying a NON-benign auto-generated stanza — `failure` (#790,
+  # #783), `skip review` (#797), or any KIND CodeRabbit ships next — is an
+  # attempt, not a report, so it must not satisfy the rung either.
+  failure_body="**Actionable comments posted: 0**
+
+<!-- This is an auto-generated comment: failure by coderabbit.ai -->
+Review failed.
+<!-- end of auto-generated comment: failure by coderabbit.ai -->"
+  fetch_api_array() {
+    jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg b "$failure_body" '[
+      {id: 5508, user: {login: $bot}, commit_id: $sha,
+       submitted_at: "2026-06-04T00:01:00Z", body: $b}
+    ]'
+  }
+  rc=0; crw_head_pinned_clean_review_run "$h40" >/dev/null || rc=$?
+  [ "$rc" = "1" ] || bad="$bad failure-stanza-not-1(rc=$rc)"
+
+  # The other half of the implication, and it is load-bearing: a run body with
+  # ZERO stanzas must still satisfy the rung. `summary_stanzas_all_benign` is
+  # vacuously FALSE on zero stanzas by design (#794/#518), and the repository's
+  # own model of a review-object body — `**Actionable comments posted: 0**` —
+  # carries none, so a bare call to that predicate would make this rung
+  # unreachable and silently restore the inverted ladder. Covered by the first
+  # case above; asserted again here with a BENIGN stanza present so both sides
+  # of the implication are pinned.
+  benign_stanza_body="**Actionable comments posted: 0**
+
+<!-- This is an auto-generated comment: release notes by coderabbit.ai -->
+## Summary by CodeRabbit
+- Fixes
+<!-- end of auto-generated comment: release notes by coderabbit.ai -->"
+  fetch_api_array() {
+    jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg b "$benign_stanza_body" '[
+      {id: 5509, user: {login: $bot}, commit_id: $sha,
+       submitted_at: "2026-06-04T00:01:00Z", body: $b}
+    ]'
+  }
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  [ "$rc" = "0" ] || bad="$bad benign-stanza-not-0(rc=$rc)"
+  [ "$out" = "5509" ] || bad="$bad benign-stanza-id($out)"
+
   # Newest-by-submitted_at wins, and the full body is read from the ARRAY
   # rather than from the selector's 200-char excerpt.
   fetch_api_array() {
@@ -2246,7 +2288,7 @@ _🔒 Security & Privacy_ | _🟠 Major_ | _⚡ Quick win_
   . "$snip"
 
   if [ -z "$bad" ]; then
-    pass "#1003/#1022: the exact-SHA rung is satisfied only by a body-bearing, review-class, marker-free head-pinned run, and an unreadable reviews list is rc 3 rather than 'the rung is satisfied'"
+    pass "#1003/#1022: the exact-SHA rung is satisfied only by a body-bearing, review-class, marker-free, benign-stanza head-pinned run, and an unreadable reviews list is rc 3 rather than 'the rung is satisfied'"
   else
     fail "#1003 head run evidence:$bad"
   fi

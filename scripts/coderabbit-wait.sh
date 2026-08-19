@@ -3455,7 +3455,7 @@ crw_summary_names_only_other_head() {
 # `crw_select_head_pinned_review_run` exists precisely to filter that: it
 # requires a NON-EMPTY review body, the discriminator measured on #889.
 #
-# Two further conjuncts beyond the selector, both fail-closed:
+# Three further conjuncts beyond the selector, all fail-closed:
 #   - the run body must classify `review`. A head-pinned object whose body is a
 #     rate-limit / pause / in-progress notice is not a completed report, and
 #     `classify_comment` is the same ladder every other surface is graded with.
@@ -3463,6 +3463,15 @@ crw_summary_names_only_other_head() {
 #     graded the inline findings and the SUMMARY body; a marker carried solely
 #     by the run body is dispositioned by neither, so it must not unlock a
 #     clearance route here.
+#   - if the run body carries auto-generated STANZAS at all, they must all be
+#     benign — the same refusal the probe's summary site makes for `failure`
+#     (#790, #783), `skip review` (#797) and any KIND CodeRabbit ships next. It
+#     is written as an implication rather than as a bare
+#     `summary_stanzas_all_benign` call because that predicate is vacuously
+#     FALSE on zero stanzas by design (#794/#518), and a review-OBJECT body
+#     carries none: this repository's own model of one is the bare
+#     `**Actionable comments posted: 0**`. Requiring a stanza would make this
+#     rung unreachable and silently restore the inverted ladder.
 #
 # Direction is preserved: this can only ever WITHDRAW a refusal that rests on a
 # mutable comment, in favour of GitHub-owned immutable head identity. It never
@@ -3501,6 +3510,12 @@ crw_head_pinned_clean_review_run() {
   [ -n "$rbody" ] || return 3
   [ "$(classify_comment "$rbody")" = "review" ] || return 1
   summary_blocking_marker_present "$rbody" && return 1
+  # The stanza implication. The literal is the one summary_stanzas_all_benign
+  # counts as its TOTAL, so the two cannot disagree about what a stanza is.
+  if grep -qiE 'auto-generated comment: ' <<<"$rbody" \
+     && ! summary_stanzas_all_benign "$rbody"; then
+    return 1
+  fi
   printf '%s\n' "$run_id"
   return 0
 }
