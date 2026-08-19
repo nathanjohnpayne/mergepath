@@ -135,13 +135,22 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     BASENAME, so `/bin/echo` and `./1/echo` are the same emitter.  A shell
     reserved word is not the command -- the command follows it -- so
     `if echo "$PAT"; then` is the same emitter.  A leading redirection and an
-    option-bearing wrapper (`env -i echo ...`) are stepped over.  An escaped
-    command word (`\echo`) is the same emitter.  `printf -v NAME` is NOT
-    output: bash assigns to a variable instead of writing to a stream.
+    option-bearing wrapper (`env -i echo ...`) are stepped over -- its
+    OPTIONS only, so a wrapper carrying an operand or an option ARGUMENT
+    (`timeout 5 echo ...`, `nice -n 5 echo ...`) resolves to that word instead
+    and the emitter behind it is missed.  An escaped command word (`\echo`) is
+    the same emitter.  `printf -v NAME` is NOT output: bash assigns to a
+    variable instead of writing to a stream -- but the `-v` test is
+    position-blind, so a `-v` appearing as DATA after the format operand also
+    reads as an assignment.  Both gaps are declared misses below.
   * An in-file message helper: a function whose body writes one of its own
     positional parameters VERBATIM through an emitter.  Both definition forms
-    count.  Body extraction is brace-depth counted over lexer state, so a
-    nested block whose closing brace starts its own line does not end it early.
+    count, with the opening `{` on the DECLARATION line; bash also accepts it
+    on the next line and helper discovery does not.  Body extraction is
+    brace-depth counted over lexer state, so a nested block whose closing brace
+    starts its own line does not end it early.  A helper is graded on what its
+    body writes, not on where that write GOES, so a helper whose emitter feeds
+    a pipe is treated as emitting -- declared conservatism below.
   * The body of an INTERPOLATING here-doc (unquoted delimiter) owned by `cat`,
     `tee` or an emitter.  ALL here-doc openers on a line are tracked, not just
     the first (#1014), and the owner is the command of the SEGMENT the opener
@@ -182,10 +191,17 @@ WHAT THIS CHECK DOES NOT CATCH
 =========================================================================
 
 Re-derived from what the harness ACTUALLY shows, not from what the author
-believes.  Every entry below is a live corpus case whose disagreement with the
-oracle is declared in `KNOWN_MISSES`, and `--self-test` PRINTS that registry on
-every run, so this prose cannot drift away from the measurement -- if the two
-ever disagree, the printed list is the true one.
+believes.  Every entry below that names a shell CONSTRUCT is a live corpus case
+whose disagreement with the oracle is declared in `KNOWN_MISSES`, and
+`--self-test` PRINTS that registry on every run, so this prose cannot drift
+away from the measurement -- if the two ever disagree, the printed list is the
+true one.  Exactly two entries are NOT constructs and carry no corpus case, and
+both say so where they appear: what the shell emits on its own (`set -x`, core
+dumps), and files this check does not read at all.  Read the other direction
+too, and it holds with one exception: every `KNOWN_MISSES` entry appears below
+except `pragma-honoured`, which is not a limit -- it is the deliberate
+exemption described above, a declared "miss" because the line really does emit
+and the scanner really does stay silent, on purpose.
 
 READ IT AS THE MEASURED SAMPLE IT IS: an absence from this list is NOT
 coverage.  The scanner is a source-text approximation; the oracle is the only
@@ -204,10 +220,34 @@ knowledge of what a variable holds at runtime.  It does not catch:
     (`cat "$LOG"`).  It DOES catch the line that puts the value into the log,
     when that line names the variable; it cannot connect that line to the `cat`
     that prints it.
-  * `set -x` traces, core dumps, or anything the shell emits on its own.  An
-    `env`/`printenv`/`set` reached through a LITERAL command word IS caught,
-    including behind an env-prefix assignment; one reached through a variable
-    is not, because nothing in the source text says what it is.
+  * `set -x` traces, core dumps, or anything the shell emits on its own.  Not
+    a construct in a line, so there is no corpus case behind this one -- it is
+    a statement about the shell, and the harness has nothing to say about it.
+  * A SHELL-STATE DUMPER on a segment that names no credential variable.  The
+    boundary here is the REFERENCE, not the command word, and the earlier
+    wording of this bullet had it the other way round.  This scanner asks
+    "does this reference reach a stream?", so `classify()` -- which is where
+    `env`/`printenv`/`set`/`compgen` are known to be dumpers at all -- is
+    consulted only for a segment carrying a `$`-reference.  Measured, on this
+    head: `set`, `set -o posix; set`, `declare -p GH_TOKEN` and
+    `export GH_TOKEN; env` each put the value on a stream and each reads
+    CLEAN, and all four are live corpus cases in `KNOWN_MISSES`.  What IS
+    caught is `FOO="$GH_TOKEN" env` and `env FOO="$GH_TOKEN"` -- both corpus
+    cases, both measured true positives -- and they are caught because the
+    segment carries a reference, which is what makes the walk run and then ask
+    whether the command dumps the environment it was handed.  A dumper reached
+    through a variable is not caught either, because nothing in the source text
+    says what it is.
+  * A WRAPPER whose real command word sits behind an operand or an option
+    ARGUMENT: `timeout 5 echo "$PAT"` and `nice -n 5 echo "$PAT"` both resolve
+    to `5` and read clean.  Wrapper OPTIONS are stepped over; wrapper operands
+    are not parsed.
+  * `printf '%s\n' -v "$PAT"`, where `-v` is DATA after the format operand.
+    The `printf -v` assignment test scans every word rather than only option
+    position, so the segment reads as an assignment and not an emission.
+  * A message helper whose opening `{` starts the line AFTER the declaration
+    (`log()` then `{ echo "$1"; }`).  The one-line spelling of the same helper
+    is found and flagged, so this is a spelling gap in discovery.
   * A token handed to an EXTERNAL command -- as an ARGUMENT
     (`curl -H "Authorization: Bearer $CF_API_TOKEN"`), on a HERE-STRING
     (`grep . <<< "$PAT"`), or through a PIPE (`printf '%s' "$PAT" | grep .`).
@@ -225,7 +265,9 @@ knowledge of what a variable holds at runtime.  It does not catch:
   * A token reaching an interpreter that then prints it (`bash -c ...`,
     `python3 -c ...`, `awk -v ...`, a `bash <<EOF` here-doc).
   * Any file this check does not scan: non-shell files, and everything outside
-    scripts/** and tests/**.
+    scripts/** and tests/**.  Also not a construct: the file-selection axis
+    pins WHICH files are read, not what a leak inside an unread one looks like,
+    so there is no corpus case behind this one either.
 
 CONSERVATISM RUNS THE OTHER WAY IN A SHORT LIST, also measured, and
 `KNOWN_BROADER` -- printed on every `--self-test` run -- is the authoritative
@@ -241,6 +283,25 @@ copy of it; this prose is a description of that registry, not a second source:
     single-line source-text scanner cannot answer, so the consumer counts as
     unresolved and the case fails CLOSED.  The named-command form of the same
     idiom (`| gh auth login --with-token`) is clean.
+  * A MESSAGE HELPER whose emitter feeds a pipe:
+    `login() { printf %s "$1" | gh auth login --with-token; }` plus
+    `login "$PAT"`.  Helper discovery grades what the body writes without
+    asking where that write goes, so it does not run the pipeline-consumer
+    analysis the direct form gets.  Nothing reaches a stream and the gate reds.
+  * An INPUT PROCESS SUBSTITUTION: `grep -qF x <(printf '%s' "$PAT")`.  Every
+    `<(...)` body is graded as a standalone output path with no model of what
+    consumes the fd, so this reds while emitting nothing.  `cat <(...)` really
+    does leak and is flagged by the same undiscriminating rule, which is why
+    the two are not currently told apart.
+
+The last two are LIVE false positives on a check that publishes the required
+`lint` context, not conservatism anyone chose; both are declared in
+`KNOWN_BROADER` and both are #1035's to repair.  Neither fires on any of the
+ten trees measured today.  Until the repair lands, A FALSE POSITIVE IS
+ESCAPABLE AT THE SITE: add `# TOKEN_OUTPUT_EXEMPT: <reason>` to the line, with
+a reason (the reason is mandatory).  That is the same inline pragma a
+legitimate emitter uses, it needs no change to this file and no path
+allow-list, and it leaves the decision greppable.
 
 STATED PLAINLY, because #993's lesson was that an unstated limit reads as a
 guarantee: NONE of the three leaks #993 fixed would have been caught by this
@@ -249,7 +310,7 @@ or through a file.  This gate stops the DIRECT form from coming back; it is
 not a proof that no credential can reach a stream.
 
 And the recall claim is bounded by the CORPUS, not by an argument.  What the
-harness demonstrates is that on ~375 constructs -- generated across line
+harness demonstrates is that on ~393 constructs -- generated across line
 spellings, file selection, pipeline consumers and legal-but-unusual precision
 shapes -- the scanner and bash agree except for the declared entries.  The
 run prints the exact count, the interpreter that produced it, and both
@@ -2249,6 +2310,128 @@ CORPUS = [
         MUST_NOT_FLAG,
         "relay() { cat; }\nprintf '%s\\n' \"$GH_TOKEN\" | relay\n",
     ),
+    # --- command resolution: measured disagreements, split out to #1035 ---
+    #
+    # Every case below was MEASURED on this head -- the oracle ran it, bash
+    # answered, and the scanner disagreed -- and every one of them lands in the
+    # same seam: `resolve_command` / `classify`, deciding what command a
+    # segment runs and what that command does with what it is handed.
+    #
+    # They are pinned here, and declared in `KNOWN_MISSES` / `KNOWN_BROADER`,
+    # so that the printed registry reports the gate's ACTUAL reach rather than
+    # an aspiration.  Repairing the seam is deliberately NOT part of this
+    # change (#1035): each entry below becomes a failing STALE assertion the
+    # moment the recognizer learns the construct, which is the signal the fix
+    # landed.
+    (
+        # `timeout` takes a required non-option OPERAND.  The wrapper loop in
+        # `resolve_command` steps over wrapper OPTIONS only, so `5` becomes the
+        # command word, matches nothing, and falls through to the
+        # external-command `return SAFE` default.
+        #
+        # The fixture builds its own minimal `timeout` on PATH: GNU coreutils
+        # is not present on a stock macOS, and a case that measured CLEAN
+        # because the tool was missing would read as a repaired miss.  The shim
+        # is `shift; exec "$@"` -- `timeout DURATION COMMAND...` minus the
+        # timer, which is the whole of what this construct is measuring.
+        "wrapper-operand-timeout",
+        MUST_NOT_FLAG,
+        "mkdir -p ./tw\n"
+        "printf '%s\\n' '#!/bin/sh' 'shift' 'exec \"$@\"' > ./tw/timeout\n"
+        "chmod +x ./tw/timeout\n"
+        'PATH="$PWD/tw:$PATH"\n'
+        'timeout 5 echo "$GH_TOKEN"\n',
+    ),
+    (
+        # `-n` takes an argument and the wrapper loop does not know it, so `5`
+        # becomes the command word.  Same defect reached by the other route:
+        # an option's argument rather than a bare operand.
+        "wrapper-operand-nice",
+        MUST_NOT_FLAG,
+        'nice -n 5 echo "$GH_TOKEN"\n',
+    ),
+    (
+        # `if "-v" in lits: return ASSIGN` scans EVERY word of the segment.
+        # Here `-v` is ordinary data AFTER the format operand, and printf
+        # writes it -- and the token -- to stdout.  `printf -v dest ...`, the
+        # real assignment form, is `printf-v-helper` above and is correctly
+        # clean.
+        "printf-v-in-operand-position",
+        MUST_NOT_FLAG,
+        "printf '%s\\n' -v \"$GH_TOKEN\"\n",
+    ),
+    (
+        # Bash accepts the opening brace on the line AFTER the declaration;
+        # helper discovery requires it on the declaration line.  The one-line
+        # spelling of this same helper is `helper-star` above, and IS flagged,
+        # so this is a spelling gap rather than a design gap.
+        "helper-brace-on-next-line",
+        MUST_NOT_FLAG,
+        'log()\n{ echo "$1"; }\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        # `set` with no operands prints every shell variable, the credential
+        # one included.  `ENV_DUMPERS -> EMIT` lives in `classify()`, and
+        # `classify()` is consulted only for a segment carrying a
+        # `$`-reference.  This segment carries none, so the dumper branch is
+        # never reached for it.  The next three are the same mechanism.
+        "dumper-bare-set",
+        MUST_NOT_FLAG,
+        "set\n",
+    ),
+    (
+        "dumper-set-after-option",
+        MUST_NOT_FLAG,
+        "set -o posix; set\n",
+    ),
+    (
+        "dumper-declare-p",
+        MUST_NOT_FLAG,
+        "declare -p GH_TOKEN\n",
+    ),
+    (
+        "dumper-env-after-export",
+        MUST_NOT_FLAG,
+        "export GH_TOKEN; env\n",
+    ),
+    (
+        # The counterpart, and the reason the header sentence had to be
+        # rewritten rather than deleted: this form IS caught, because the
+        # assignment carries a REFERENCE, so the walk runs at all and then asks
+        # whether the command dumps the environment it was handed.  Caught
+        # because a reference is present, not because the command is a dumper.
+        "dumper-env-assign-argument",
+        MUST_FLAG,
+        'env FOO="$GH_TOKEN"\n',
+    ),
+    (
+        # Helper discovery marks `login` an emitter without asking where the
+        # emitting segment's stdout GOES.  `reaches_output` learned to follow
+        # `pipe_to` and grade the consumer; `discover_emitter_helpers` did not,
+        # so the same defect class survives at a second call site.  Nothing
+        # reaches a stream here and the gate reds.
+        #
+        # This is the canonical `printf %s "$1" | gh auth login --with-token`
+        # wrapper; the fixture pipes into `cat >/dev/null` instead so the case
+        # makes no network call and needs no `gh` on the runner.
+        "helper-piped-into-consumer",
+        MUST_FLAG,
+        'login() { printf %s "$1" | cat >/dev/null; }\nlogin "$GH_TOKEN"\n',
+    ),
+    (
+        # An INPUT process substitution is judged a standalone output path: the
+        # body's `printf` is flagged with no regard for what consumes the fd.
+        # `procsub-input-into-cat` below genuinely leaks and is flagged for the
+        # same reason, which is the point -- the two are not distinguished.
+        "procsub-input-into-filter",
+        MUST_FLAG,
+        "grep -qF expected <(printf '%s' \"$GH_TOKEN\") || echo ok\n",
+    ),
+    (
+        "procsub-input-into-cat",
+        MUST_FLAG,
+        "cat <(printf '%s' \"$GH_TOKEN\")\n",
+    ),
 ]
 
 # --------------------------------------------------------------------------
@@ -2426,6 +2609,46 @@ KNOWN_MISSES = {
         "its positional parameters; helper discovery models parameters, and "
         "nothing in the source text of the call says what the helper reads"
     ),
+    # -- command resolution (#1035).  Measured on this head; the seam is out
+    #    of scope here and each entry goes STALE when #1035 lands.
+    "wrapper-operand-timeout": (
+        "wrapper OPERANDS are not parsed -- `resolve_command` steps over a "
+        "wrapper's OPTIONS, so `timeout`'s required duration operand becomes "
+        "the command word and the real `echo` is never reached"
+    ),
+    "wrapper-operand-nice": (
+        "the same wrapper gap reached through an option's ARGUMENT: `-n` is "
+        "stepped over as a lone option, so `5` becomes the command word"
+    ),
+    "printf-v-in-operand-position": (
+        "the `printf -v` test is position-blind -- it scans every word of the "
+        "segment, so a `-v` appearing as DATA after the format operand reads "
+        "as an assignment and the segment is not an emission"
+    ),
+    "helper-brace-on-next-line": (
+        "helper discovery requires the opening `{` on the declaration line; "
+        "bash accepts it on the next one.  The one-line spelling of the same "
+        "helper IS found, so this is a spelling gap, not a design gap"
+    ),
+    "dumper-bare-set": (
+        "`ENV_DUMPERS -> EMIT` lives in `classify()`, and `classify()` is "
+        "consulted only for a segment carrying a `$`-reference; a bare `set` "
+        "carries none, so the dumper branch is dead for it"
+    ),
+    "dumper-set-after-option": (
+        "the same dead dumper branch, with the dumper in a later segment of "
+        "the same logical line"
+    ),
+    "dumper-declare-p": (
+        "the same dead dumper branch; `declare` is additionally a "
+        "SAFE_COMMANDS binding form, so even a referencing segment would not "
+        "reach the dumper test through it"
+    ),
+    "dumper-env-after-export": (
+        "the same dead dumper branch -- the value reaches the environment on "
+        "the first segment and a bare `env` dumps it on the second, and "
+        "neither segment names a `$`-reference"
+    ),
 }
 
 KNOWN_BROADER = {
@@ -2445,6 +2668,28 @@ KNOWN_BROADER = {
         "a pipeline into a `( ... )` subshell -- the same unresolved consumer "
         "as the brace-group entry above.  `|&` lands here too: its consumer "
         "segment is recorded empty, so it is unresolved by the same rule"
+    ),
+    # -- command resolution (#1035).  These two are LIVE false positives on a
+    #    required fleet-wide check, not conservatism anyone chose.  Neither
+    #    fires on any of the ten trees today -- the fleet hit set is unchanged
+    #    -- but a consumer that writes either shape reds `lint` with no
+    #    break-glass.  The escape until #1035 lands is the inline
+    #    `# TOKEN_OUTPUT_EXEMPT: <reason>` pragma at the site.
+    "helper-piped-into-consumer": (
+        "helper discovery marks a function an emitter without asking where "
+        "the emitting segment's stdout GOES, so it does not run the "
+        "pipeline-consumer analysis `reaches_output` has.  "
+        "`login() { printf %s \"$1\" | gh auth login --with-token; }` writes "
+        "nothing to a stream and is flagged anyway -- the same defect class "
+        "the pipeline fix closed, surviving at a second call site"
+    ),
+    "procsub-input-into-filter": (
+        "an INPUT process substitution is judged a standalone output path: "
+        "the `<(...)` body is graded on its own with no model of the fd's "
+        "consumer, so `grep -qF x <(printf '%s' \"$PAT\")` reds even though "
+        "nothing reaches a stream.  `cat <(...)` genuinely leaks and is "
+        "flagged by the same undiscriminating rule, which is why the two are "
+        "not currently distinguishable"
     ),
 }
 
