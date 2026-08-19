@@ -1282,6 +1282,26 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         if (is_delim) {
           indented_code = 0
           para = 0
+          # A DOCUMENT-level fence delimiter carries no quote marker —
+          # `rest` begins with the delimiter run — so the quote, and any
+          # fence it holds, ends HERE. The clearing below cannot do it:
+          # this branch returns before reaching it, and so does the
+          # `if (fence)` body under it, which is how a `qfence` left open
+          # by an unclosed quoted fence survived a whole document-level
+          # fenced block. The first quoted line after that block was then
+          # blanked as quoted-fence body and a bare `#NN` on it shipped
+          # unflagged — the UNDER-reporting direction, and a regression
+          # against `main`, which models no quoted fence at all.
+          #
+          # The `if (fence)` body needs no counterpart: `qfence` and
+          # `fence` are never both set. The only two lines that set
+          # `fence` are this one and the list-marker opener below, and
+          # both clear `qfence` first — this one here, the marker line at
+          # the clearing below, since a line whose content starts with a
+          # marker carries no quote marker of its own. Nothing can set
+          # `qfence` while `fence` is open either: both `quote_fence`
+          # callers sit after the `if (fence)` return.
+          qfence = 0; qfence_char = ""; qfence_len = 0; qfence_base = 0
           if (!fence) {
             # A fence is not a lazy continuation either, so an OPENER
             # closes every container it is not indented into, here rather
@@ -3848,8 +3868,81 @@ QFENCE_EOF
     pass "Case 66: a fenced code block inside a block quote is code, and quoted indented code remains the declared boundary (#890)"
   fi
 
+  # Case 67: a DOCUMENT-level fence ends the quote, and the fence it
+  # holds (#890).
+  #
+  # Case 66 pinned the two boundaries the quoted-fence flag has inside a
+  # quote — a blank or unquoted line ends it, and an outdented marker
+  # ends it with the container it opened in. Both are reached through the
+  # clearing that runs on an ordinary line. A document-level fence
+  # DELIMITER never reaches it: that branch prints and returns above it,
+  # and so does the branch that blanks the body of an open fence. So a
+  # `qfence` left set by an unclosed quoted fence survived a whole
+  # document-level fenced block, and the first quoted line after that
+  # block was blanked as quoted-fence body with its `#NN` inside — the
+  # UNDER-reporting direction, and a regression against `main`, which
+  # models no quoted fence at all and prints that line.
+  #
+  # Lines 3-8 are the shape. The quoted fence opened on line 3 is never
+  # closed inside the quote; line 5 carries no marker, so the quote ends
+  # there and the document fence CommonMark opens on that line runs to
+  # line 7. Line 8 is a paragraph in a NEW quote and must be scanned:
+  # `#333` is a bare ref that `main` flags.
+  #
+  # Lines 10-15 and 17-22 pin that the clearing belongs to the delimiter
+  # branch itself rather than to any one delimiter shape: a tilde fence
+  # and a fence indented three columns take the same branch, and an
+  # implementation that clears only on a backtick opener at column zero
+  # ships `#666` and `#999` unflagged.
+  #
+  # `#222`, `#555` and `#888` are the other half of the pin. They sit in
+  # the document fence, so an over-correction that stops blanking the
+  # fence body — or that clears the flag by scanning the line instead of
+  # returning — surfaces them as prose and fails the case from the
+  # false-positive side.
+  #
+  # markdown-it-py 4.2.0 in commonmark mode renders lines 4, 6, 11, 13,
+  # 18 and 20 inside `<pre><code>` and lines 8, 15 and 22 inside `<p>`.
+  DFENCE_DOC="$WORKDIR/consumer-truth-doc-fence-ends-quote.md"
+  cat > "$DFENCE_DOC" <<'DFENCE_EOF'
+# Doc
+
+> ```sh
+> echo "closes #111"
+```
+#222 sits in the document fence that ended the quote
+```
+> A bare #333 in quoted prose is real.
+
+> ~~~sh
+> echo "closes #444"
+~~~
+#555 sits in the document fence that ended the quote
+~~~
+> A bare #666 in quoted prose is real.
+
+> ```sh
+> echo "closes #777"
+   ```
+#888 sits in the document fence that ended the quote
+  ```
+> A bare #999 in quoted prose is real.
+DFENCE_EOF
+  set +e
+  dfence_hits=$(md_prose_only "$DFENCE_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  dfence_lines=$(md_prose_only "$DFENCE_DOC" | wc -l | tr -d ' ')
+  dfence_raw=$(wc -l < "$DFENCE_DOC" | tr -d ' ')
+  set -e
+  if [ "$dfence_hits" != "8,15,22," ]; then
+    fail "Case 67: expected lines 8,15,22 flagged (a document-level fence delimiter ends the quote and the fence it holds, so the quoted prose after the fence is still scanned), got '$dfence_hits'"
+  elif [ "$dfence_lines" != "$dfence_raw" ]; then
+    fail "Case 67: md_prose_only must emit one line per input line, got $dfence_lines for $dfence_raw"
+  else
+    pass "Case 67: a document-level fence ends the quote and any quoted fence it holds, so the prose after it is not swallowed (#890)"
+  fi
+
 else
-  echo "SKIP: Cases 36-66 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-67 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
