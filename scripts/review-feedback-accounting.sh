@@ -113,6 +113,8 @@ CODERABBIT_BOT=$(policy_block_field coderabbit bot_login)
 CODERABBIT_BOT=${CODERABBIT_BOT:-coderabbitai[bot]}
 CODEX_SOLICITATION='Useful? React with 👍 / 👎.'
 NBSP=$(printf '\302\240')
+CR_PRE_MERGE_BLOCK_START='<!-- pre_merge_checks_walkthrough_start -->'
+CR_PRE_MERGE_BLOCK_END='<!-- pre_merge_checks_walkthrough_end -->'
 
 AGENT_LOGINS_JSON=$(
   {
@@ -129,13 +131,79 @@ INLINE_COMMENTS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inlin
 REVIEWS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects")
 ISSUE_COMMENTS=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments")
 
+coderabbit_finding_scan() {
+  local out
+  out=$(printf '%s\n' "$1" | awk \
+    -v block_start="$CR_PRE_MERGE_BLOCK_START" \
+    -v block_end="$CR_PRE_MERGE_BLOCK_END" '
+      function fence_info(s, out,   c, n) {
+        sub(/^ ? ? ?/, "", s)
+        c = substr(s, 1, 1)
+        if (c != "`" && c != "~") return 0
+        n = 0
+        while (substr(s, n + 1, 1) == c) n++
+        if (n < 3) return 0
+        out["rest"] = substr(s, n + 1)
+        if (c == "`" && index(out["rest"], "`") > 0) return 0
+        out["char"] = c
+        out["len"] = n
+        return 1
+      }
+      function fence_update(line,   info) {
+        if (!fence_info(line, info)) return 0
+        if (!in_fence) {
+          in_fence = 1
+          fence_char = info["char"]
+          fence_len = info["len"]
+          return 1
+        }
+        if (info["char"] == fence_char && info["len"] >= fence_len \
+            && info["rest"] ~ /^[ \t]*$/) {
+          in_fence = 0
+          fence_char = ""
+          fence_len = 0
+        }
+        return 1
+      }
+      {
+        line = $0
+        sub(/\r$/, "", line)
+        lines[NR] = line
+        delimiter = fence_update(line)
+        visible[NR] = (!delimiter && !in_fence)
+        structural = line
+        sub(/[ \t]+$/, "", structural)
+        if (visible[NR] && structural == block_start && !start_line) {
+          start_line = NR
+        } else if (visible[NR] && structural == block_end \
+                   && start_line && !end_line) {
+          end_line = NR
+        }
+      }
+      END {
+        for (i = 1; i <= NR; i++) {
+          if (!visible[i]) continue
+          if (end_line && i >= start_line && i <= end_line) continue
+          print lines[i]
+        }
+      }
+    ') || {
+      echo "[review-feedback-accounting] ERROR: could not sanitize a CodeRabbit finding surface" >&2
+      return 2
+    }
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  fi
+}
+
 finding_tier() {
-  local login="$1" body="$2" tier="" line
+  local login="$1" body="$2" tier="" line sanitized
   if [ "$login" = "$CODEX_BOT" ]; then
     codex_tier_of "$body"
     return
   fi
   if [ "$login" = "$CODERABBIT_BOT" ]; then
+    sanitized=$(coderabbit_finding_scan "$body") || return 2
     while IFS= read -r line; do
       tier=$(coderabbit_tier_of "$line")
       if [ -n "$tier" ]; then
@@ -143,7 +211,7 @@ finding_tier() {
         return
       fi
     done <<EOF
-$body
+$sanitized
 EOF
   fi
 }
@@ -264,19 +332,62 @@ fingerprint() {
   printf '%s' "$out" | awk '{print substr($1, 1, 12)}'
 }
 
-review_ack_present() {
-  local token="$1" submitted_at="$2"
+ack_present() {
+  local token="$1" raised_at="$2"
   printf '%s' "$ISSUE_COMMENTS" | jq -e \
-    --arg token "$token" --arg submitted "$submitted_at" --argjson agents "$AGENT_LOGINS_JSON" '
+    --arg token "$token" --arg raised "$raised_at" --argjson agents "$AGENT_LOGINS_JSON" '
       any(.[];
         ((.user.login // "") as $login | ($agents | index($login)) != null)
-        and ((.created_at // "") >= $submitted)
+        and ((.created_at // "") >= $raised)
         and (((.body // "") | gsub("\r"; "") | split("\n")) as $lines
           | (($lines[0] // "") | sub("[ \t]+$"; "")) == $token
           and (($lines[1:] | map(gsub("^[ \t]+|[ \t]+$"; ""))
             | map(select(. != "")) | length) > 0)))
     ' >/dev/null 2>&1
 }
+
+while IFS= read -r issue_comment; do
+  [ -n "$issue_comment" ] || continue
+  login=$(printf '%s' "$issue_comment" | jq -r '.user.login // ""')
+  case "$login" in
+    "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+    *) continue ;;
+  esac
+  body_json=$(printf '%s' "$issue_comment" | jq -c '.body // ""')
+  body=$(printf '%s' "$body_json" | jq -r '.')
+  tier=$(finding_tier "$login" "$body")
+  [ -n "$tier" ] || continue
+  comment_id=$(printf '%s' "$issue_comment" | jq -r '.id')
+  raised_at=$(printf '%s' "$issue_comment" | jq -r '.updated_at // .created_at // ""')
+  body_fingerprint=$(fingerprint "$body_json")
+  ack_token="[mergepath-comment-ack: $comment_id $body_fingerprint]"
+  accounted=false
+  evidence=""
+  if ack_present "$ack_token" "$raised_at"; then
+    accounted=true
+    evidence="comment-ack"
+  fi
+  finding=$(printf '%s' "$issue_comment" | jq -c \
+    --arg tier "$tier" --arg fingerprint "$body_fingerprint" \
+    --arg token "$ack_token" --argjson accounted "$accounted" --arg evidence "$evidence" '
+      {
+        kind: "issue-comment",
+        comment_id: .id,
+        reviewer: (.user.login // ""),
+        tier: $tier,
+        created_at: (.created_at // ""),
+        updated_at: (.updated_at // .created_at // ""),
+        body_fingerprint: $fingerprint,
+        ack_token: $token,
+        body: (.body // ""),
+        accounted: $accounted,
+        evidence: (if $evidence == "" then null else $evidence end)
+      }
+    ')
+  FINDINGS=$(printf '%s' "$FINDINGS" | jq -c --argjson f "$finding" '. + [$f]')
+done <<EOF
+$(printf '%s' "$ISSUE_COMMENTS" | jq -c '.[]')
+EOF
 
 while IFS= read -r review; do
   [ -n "$review" ] || continue
@@ -299,7 +410,7 @@ while IFS= read -r review; do
   ack_token="[mergepath-review-ack: $review_id $body_fingerprint]"
   accounted=false
   evidence=""
-  if review_ack_present "$ack_token" "$submitted_at"; then
+  if ack_present "$ack_token" "$submitted_at"; then
     accounted=true
     evidence="review-ack"
   fi
@@ -359,8 +470,10 @@ if [ "$MISSING_COUNT" -gt 0 ]; then
       else
         "  - inline \(.reviewer) \(.tier) finding \(.finding_id) at \(.path):\(.line // "?"): post a substantive disposition reply on the thread"
       end
-    else
+    elif .kind == "review-body" then
       "  - review-body \(.reviewer) \(.tier) finding in review \(.review_id): post a PR comment whose first line is\n      \(.ack_token)\n    with the fix/rebuttal/deferral rationale below it"
+    else
+      "  - PR-level \(.reviewer) \(.tier) finding in comment \(.comment_id): post a PR comment whose first line is\n      \(.ack_token)\n    with the fix/rebuttal/deferral rationale below it"
     end
   ' >&2
 fi

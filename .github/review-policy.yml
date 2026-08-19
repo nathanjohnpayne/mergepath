@@ -353,8 +353,9 @@ coderabbit:
 #      comment and poll for the Codex review.
 #   2. Parse the returned JSON. Address each P0/P1 finding with a fix OR
 #      a reply explaining why the finding does not apply.
-#      Before another review round, reconcile every classified inline and
-#      top-level review-body finding with `scripts/review-feedback-accounting.sh`.
+#      Before another review round, reconcile every classified inline,
+#      top-level review-body, and PR-level finding with
+#      `scripts/review-feedback-accounting.sh`.
 #      The request helper runs this automatically before its trigger write;
 #      exit 6 means feedback remains unaccounted and no trigger was posted.
 #   3. Repeat up to `max_review_rounds`. On runaway (round > max), escalate

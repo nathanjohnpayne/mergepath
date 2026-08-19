@@ -398,6 +398,61 @@ run_gate
 assert_eq 1 "$RUN_RC" "editing a review body invalidates its prior acknowledgement"
 
 reset_fixtures
+cat >"$TMP/fixtures/issues.json" <<'JSON'
+[
+  {
+    "id": 8000,
+    "created_at": "2026-08-18T22:20:00Z",
+    "updated_at": "2026-08-18T22:20:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n_⚠️ Potential issue_ carried only by this PR-level summary.\n\n<!-- pre_merge_checks_walkthrough_start -->\n| Docstring Coverage | ⚠️ Warning |\n<!-- pre_merge_checks_walkthrough_end -->"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "unacknowledged PR-level bot finding blocks"
+assert_eq issue-comment "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "PR-level bot miss is identified by shape"
+COMMENT_ACK_TOKEN="$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')"
+assert_match '^\[mergepath-comment-ack: 8000 [0-9a-f]{12}\]$' "$COMMENT_ACK_TOKEN" "PR-level remediation token is comment and content pinned"
+jq --arg token "$COMMENT_ACK_TOKEN" '. + [{
+  "id": 8001,
+  "created_at": "2026-08-18T22:21:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nFixed the summary-only finding in abc1234.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "PR-level bot acknowledgement with rationale reconciles"
+assert_eq comment-ack "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "PR-level acknowledgement evidence is visible"
+jq '.[0].body += " (edited)" | .[0].updated_at = "2026-08-18T22:22:00Z"' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "editing a PR-level bot finding invalidates its prior acknowledgement"
+
+reset_fixtures
+cat >"$TMP/fixtures/reviews.json" <<'JSON'
+[
+  {
+    "id": 901,
+    "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "submitted_at": "2026-08-18T22:30:00Z",
+    "state": "COMMENTED",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "**Actionable comments posted: 0**\n\n```text\n_🟠 Major_ quoted source text\n```\n\n<!-- pre_merge_checks_walkthrough_start -->\n| Docstring Coverage | ⚠️ Warning |\n<!-- pre_merge_checks_walkthrough_end -->"
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "CodeRabbit fenced markers and pre-merge warnings are not invented into review-body findings"
+jq '.[0].body = "**Actionable comments posted: 1**\n\n_🟠 Major_ real review-body finding\n\n```text\n_⚠️ Potential issue_ quoted source text\n```\n\n<!-- pre_merge_checks_walkthrough_start -->\n| Docstring Coverage | ⚠️ Warning |\n<!-- pre_merge_checks_walkthrough_end -->"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "CodeRabbit finding outside sanitized regions still blocks"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "sanitized CodeRabbit body preserves the real finding tier"
+
+reset_fixtures
 cat >"$TMP/fixtures/reviews.json" <<'JSON'
 [
   {
