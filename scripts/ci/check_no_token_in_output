@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # check_no_token_in_output
 #
-# Standing guard for #996 — the enforcement half of #951 / #993.
+# Part A of #996 — the policy and the mechanism behind #951 / #993.
+#
+# PART A ONLY. The RECOGNIZER that decides "is this line an output command,
+# and does this reference reach it" is an enumeration of shell spellings,
+# and five direct-form spellings are known to escape it — enumerated with
+# reproductions under "What this check does NOT catch" below. Rebuilding it
+# against an execution oracle instead of an enumeration is #1015. Read that
+# section before relying on this check for anything.
 #
 # #951 found a live PAT printed in cleartext by a checker's own failure
 # message. #993 fixed the three sites it could find by grepping `scripts/`
@@ -85,17 +92,50 @@
 #     variable; it cannot connect that line to the `cat` that prints it.
 #   * `set -x` traces, `env` dumps, core dumps, or anything the shell emits
 #     on its own.
-#   * The second and later bodies of a multi-here-doc command
-#     (`cat <<FIRST <<SECOND`): only the first opener on a line is tracked.
-#     No occurrence exists in this tree; tracked as a follow-up rather than
-#     rebuilt here, because the fix is a pending-queue rewrite of the
-#     here-doc bookkeeping and deserves its own review round.
 #   * A command that prints something the token names but does not
 #     interpolate: `cat "$LOGFILE"`, `grep "$PAT" file`, an editor, a
 #     pager. Only the commands listed under "What counts as output" above
 #     are output commands.
 #   * Any file this check does not scan: non-shell files, and everything
 #     outside scripts/** and tests/**.
+#
+# DIRECT FORMS THAT ALSO ESCAPE — five of them, and they are NOT the
+# indirection limit above. No rename, no capture into another name, no
+# file, no `set -x`: each is a direct interpolation of a listed credential
+# name into an output command by this header's own definition, and the
+# check reports the line as clean. Measured, not inferred — a probe fixture
+# carrying all five plus a plain `echo "$GH_TOKEN"` returns exactly ONE
+# finding, the plain `echo`. The probe used an unassigned variable and no
+# credential material of any kind.
+#
+#   * A nested word inside a parameter-expansion OPERATOR, when the outer
+#     name is not itself credential-bearing. `${VAR:-$FALLBACK}` is
+#     ordinary shell, and the fallback word is never inspected:
+#         echo "${UNSET_VALUE:-$GH_TOKEN}"
+#   * An emitter inside a command substitution whose stream is redirected
+#     away from the capture. `emitted()` treats any enclosing `$(...)` as a
+#     store, but `>&2` means the capture never takes the value and it
+#     reaches the terminal:
+#         _v=$(printf '%s' "$GH_TOKEN" >&2)
+#   * A wrapper carrying options or assignments ahead of the command word.
+#     PASSTHRU lists bare `env`, so the option consumes the command
+#     position and the emitter behind it is never seen:
+#         env -i echo "$GH_TOKEN"
+#   * A LEADING redirection ahead of the command word, which the walk reads
+#     as the command itself:
+#         2>/dev/null echo "$GH_TOKEN"
+#   * The second and later bodies of a multi-here-doc command: only the
+#     FIRST `<<` opener on a line is tracked (#1014):
+#         cat <<FIRST <<SECOND
+#     No occurrence exists in this tree or in any of the nine consumers.
+#     Not fixed here: `hd_term` is a single scalar shared by note_heredoc
+#     and scan_lines, and the join_continuations pre-pass keeps its own copy
+#     of the same state, so the fix is a pending-QUEUE rewrite across two
+#     passes rather than a local patch.
+#
+# All five are tracked on #1015, which replaces the enumeration with a
+# differential harness whose oracle is `bash` execution plus sentinel
+# detection on both stdout and stderr. They are its first failing cases.
 #
 # One limit inside the LOGICAL-line reconstruction, since the unit of
 # analysis is a logical line rather than a physical one (see below): quote
@@ -109,12 +149,31 @@
 # Stated plainly because #993's lesson was that an unstated limit reads as
 # a guarantee: NONE of the three leaks #993 fixed would have been caught by
 # this gate at their original sites, because all three reached the token
-# under another name or through a file. What this gate guarantees is
-# narrower and permanent — the direct form cannot come back silently. That
-# holds across the near-misses that are re-wrappings rather than
-# indirections, each pinned by a self-test case: a backslash continuation
-# between the emitter and its argument, a path-qualified emitter
-# (`/bin/echo`), a here-string (`cat <<< "$PAT"`), and a `tee` here-doc.
+# under another name or through a file.
+#
+# And stated just as plainly, because landing an overstated guarantee is
+# the failure this check exists to prevent: "the direct form cannot come
+# back silently" is NOT a property of this code. Five direct spellings
+# escape it, listed and reproduced above. What holds is bounded by the
+# enumeration — the spellings this check DOES model cannot come back
+# silently, each pinned by a self-test case in both directions: a plain
+# `echo`/`printf`, a message helper in either definition form, a backslash
+# continuation between the emitter and its argument, a path-qualified
+# emitter (`/bin/echo`), a reserved word in front of the emitter, an
+# interpolating here-doc body, a `tee` here-doc, and a here-string
+# (`cat <<< "$PAT"`). Closing the general claim needs an oracle rather than
+# a longer list, which is #1015.
+#
+# ── Known defect, tracked on #1015 ───────────────────────────────────────
+#
+# `scan_root` installs two `trap ... RETURN` handlers and the second
+# REPLACES the first, so the file-list temp file is never removed: one
+# `token-output-list.*` survives every `--scan`. A single quote in `TMPDIR`
+# would also inject into the trap string. Recorded as an acceptance
+# criterion on #1015 — one fixed cleanup action per function plus a `--`
+# guard, with a case pinning that a single `--scan` leaves nothing behind —
+# rather than patched here, because it sits in the same bookkeeping that
+# produced this scanner's last three regressions.
 #
 # ── What counts as "output" ──────────────────────────────────────────────
 #
@@ -932,7 +991,11 @@ authorization: ${DS}GH_TOKEN
 EOF"
   # ── Emitters reached without an `echo`/`printf` word at the head of the
   # line. None of these is indirection — no rename, no capture, no file —
-  # so each belongs to the direct form this gate claims to hold.
+  # so each is a spelling of the direct form, and each is one this
+  # recognizer does model. The five it does NOT are in the header's
+  # escape list and belong to #1015, deliberately without cases here:
+  # a case asserting the current (wrong) verdict would have to be
+  # deleted by the fix instead of flipped by it.
   assert_flagged "a here-string writes its word to a stream" \
     'cat <<< "$GH_TOKEN"'
   assert_flagged "a path-qualified emitter is the same emitter" \
