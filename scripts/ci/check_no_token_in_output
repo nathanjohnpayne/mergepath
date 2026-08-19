@@ -178,7 +178,7 @@ FNR == 1 {
 { LINES[++NLINES] = $0 }
 END { if (NR > 0) process(); exit found ? 1 : 0 }
 
-function process(   i) {
+function process() {
   discover_helpers()
   scan_lines()
 }
