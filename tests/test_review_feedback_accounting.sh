@@ -187,6 +187,24 @@ JSON
 run_gate
 assert_eq 2 "$RUN_RC" "failed fork archive relay is a persistent infrastructure block"
 assert_match 'read-only feedback archive relay.*12345' "$RUN_ERR" "relay failure names the unrecoverable source run"
+jq '. + [{
+  "id": 3,
+  "created_at": "2026-08-18T19:01:00Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": "<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->"
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "a successful rerun supersedes the same source run failure marker"
+jq '. + [{
+  "id": 4,
+  "created_at": "2026-08-18T19:02:00Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": "<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->"
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "the latest terminal marker remains authoritative after a later rerun failure"
 
 # The documented direct invocation runs after op-preflight, which exports the
 # scoped PAT but deliberately leaves GH_TOKEN unset. The helper must bridge the
@@ -858,6 +876,9 @@ ARCHIVE_DATA=$(printf '%s' "$ARCHIVE_MARKER" \
   | jq -Rr '@base64d | fromjson')
 assert_eq 8000 "$(printf '%s' "$ARCHIVE_DATA" | jq -r '.source_comment_id')" "archive record stays bound to the rewritten source comment"
 assert_eq "$(cat "$PREVIOUS_SUMMARY")" "$(printf '%s' "$ARCHIVE_DATA" | jq -r '.body')" "archive record preserves the complete reviewer finding body"
+assert_eq "$(wc -c <"$PREVIOUS_SUMMARY" | tr -d ' ')" \
+  "$(printf '%s' "$ARCHIVE_DATA" | jq -j '.body' | wc -c | tr -d ' ')" \
+  "archive record preserves the exact reviewer finding byte length"
 ARCHIVE_FINGERPRINT=$(printf '%s' "$ARCHIVE_DATA" | jq -r '.body_fingerprint')
 EXPECTED_ARCHIVE_ACK="[mergepath-comment-ack: 8000 $ARCHIVE_FINGERPRINT]"
 
@@ -967,6 +988,19 @@ jq 'del(.[-1])' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
 mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 2 "$RUN_RC" "incomplete chunked archive fails closed"
+
+OVERSIZED_ARCHIVE_BODY="$TMP/oversized-archive-body.txt"
+awk 'BEGIN { printf "**P1** "; for (i = 0; i < 1600000; i++) printf "x" }' \
+  >"$OVERSIZED_ARCHIVE_BODY"
+set +e
+"$RENDER_ARCHIVE" inline 8499 'chatgpt-codex-connector[bot]' \
+  '2026-08-18T22:25:59Z' "$OVERSIZED_ARCHIVE_BODY" \
+  >"$TMP/oversized-archive-records" 2>"$TMP/oversized-archive-error"
+OVERSIZED_ARCHIVE_RC=$?
+set -e
+assert_eq 2 "$OVERSIZED_ARCHIVE_RC" "archive producer rejects a payload beyond the consumer chunk limit"
+assert_eq 0 "$(wc -c <"$TMP/oversized-archive-records" | tr -d ' ')" "oversized archive emits no partial record set"
+assert_match '32' "$(cat "$TMP/oversized-archive-error")" "oversized archive names the shared chunk limit"
 
 reset_fixtures
 PREVIOUS_INLINE="$TMP/previous-inline.txt"

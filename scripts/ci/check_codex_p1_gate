@@ -322,13 +322,15 @@ if sweep.is_a?(Hash)
         sweep_run.include?("rc=1"),
       "scheduled-sweep can clear a read-only PR while an archive relay run is pending"
     )
+    api_ceiling = sweep_run.index('if [ "$source_total" -ge "$MAX_RELAY_SOURCE_RUNS" ]')
+    window_split = sweep_run.index('scan_source_window "$source_event" "$window_start" "$midpoint"')
     page_filter = sweep_run.index('page_runs=$(jq -c --arg title')
     source_count = sweep_run.index('source_count=$(jq')
-    source_bound = sweep_run.index('if [ "$source_count" -gt "$MAX_RELAY_SOURCE_RUNS" ]')
+    source_bound = sweep_run.index('if [ "$source_count" -ge "$MAX_RELAY_SOURCE_RUNS" ]')
     require_shape.call(
-      [page_filter, source_count, source_bound].all? &&
-        page_filter < source_count && source_count < source_bound,
-      "scheduled-sweep applies the relay bound before filtering to the target PR"
+      [api_ceiling, window_split, page_filter, source_count, source_bound].all? &&
+        api_ceiling < window_split && page_filter < source_count && source_count < source_bound,
+      "scheduled-sweep does not split API-ceiling windows and bound the filtered target-PR inventory"
     )
     before = sweep_run.index("feedback_fp_before=")
     lease = sweep_run.index('-f status="in_progress"')
@@ -428,6 +430,25 @@ if relay_job.is_a?(Hash)
         relay_run.include?("mergepath-feedback-archive-relay:v1") &&
         relay_run.include?('if [ "$fingerprint_before" != "$fingerprint_after" ]'),
       "read-only archive relay omits archive validation, completion evidence, or drift rejection"
+    )
+    persist_step = relay_steps.find { |step| step["run"] == relay_run }
+    persist_index = relay_steps.index(persist_step)
+    cleanup_step = relay_steps.find do |step|
+      condition = step["if"].to_s
+      run = step["run"].to_s
+      env = step["env"].is_a?(Hash) ? step["env"] : {}
+      condition.include?("failure()") && condition.include?("requires_relay") &&
+        env.fetch("CHECK_ID", "").to_s.include?("steps.persist.outputs.check_id") &&
+        run.include?("mergepath-feedback-archive-relay:v1") &&
+        run.include?('check-runs/$CHECK_ID') && run.include?("status=completed") &&
+        run.include?("conclusion=failure")
+    end
+    cleanup_index = relay_steps.index(cleanup_step)
+    require_shape.call(
+      persist_step&.fetch("id", "").to_s == "persist" &&
+        relay_run.include?('echo "check_id=$check_id" >> "$GITHUB_OUTPUT"') &&
+        persist_index && cleanup_index && persist_index < cleanup_index,
+      "read-only archive relay can abandon an in-progress check lease after persistence failure"
     )
   end
 end

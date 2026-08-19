@@ -116,6 +116,11 @@ else
 fi
 CHUNK_SIZE=60000
 TOTAL=$(( (${#ENCODED} + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+MAX_CHUNKS=32
+if [ "$TOTAL" -gt "$MAX_CHUNKS" ]; then
+  echo "render-feedback-archive: encoded archive requires $TOTAL chunks; maximum is $MAX_CHUNKS" >&2
+  exit 2
+fi
 PART=1
 OFFSET=0
 while [ "$OFFSET" -lt "${#ENCODED}" ]; do

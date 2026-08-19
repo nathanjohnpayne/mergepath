@@ -198,11 +198,25 @@ REVIEWS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects
 ISSUE_COMMENTS=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments")
 
 RELAY_FAILURE_RUN=$(printf '%s' "$ISSUE_COMMENTS" | jq -r '
-  first(
-    .[] | select(.user.login == "github-actions[bot]") | .body // ""
-    | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=failed -->$").run
-      catch empty
-  ) // empty
+  [
+    .[]
+    | select(.user.login == "github-actions[bot]")
+    | . as $comment
+    | ((.body // "")
+      | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=(?<status>complete|failed) -->$")
+        catch null) as $marker
+    | select($marker != null)
+    | {
+        run: ($marker.run | tonumber),
+        status: $marker.status,
+        created_at: ($comment.created_at // ""),
+        id: $comment.id
+      }
+  ]
+  | sort_by(.run, .created_at, .id)
+  | group_by(.run)
+  | map(last)
+  | first(.[] | select(.status == "failed") | .run) // empty
 ') || die 2 "could not validate read-only feedback archive relay state"
 if [ -n "$RELAY_FAILURE_RUN" ]; then
   die 2 "read-only feedback archive relay failed for source run $RELAY_FAILURE_RUN; prior feedback may be unrecoverable"

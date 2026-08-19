@@ -579,33 +579,73 @@ jobs:
               # Scheduled runs and other PRs share this workflow. Query only
               # event kinds that can produce this PR's relay handoff, then
               # apply the fail-closed bound after filtering to its exact run
-              # title. Unrelated schedule traffic must not exhaust the bound.
-              for source_event in pull_request pull_request_review pull_request_review_comment issue_comment; do
+              # title. GitHub caps any filtered workflow-run query at 1,000
+              # results, so recursively split a saturated time window before
+              # accepting it as complete. Unrelated traffic never consumes
+              # the final matching-run bound.
+              scan_source_window() {
+                local source_event="$1" window_start="$2" window_end="$3"
+                local start_iso end_iso source_page source_page_json source_total
+                local midpoint page_runs source_count
+                [ "$relay_scan_error" != true ] || return 0
+                start_iso=$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ)
+                end_iso=$(date -u -d "@$window_end" +%Y-%m-%dT%H:%M:%SZ)
+                if ! source_page_json=$(gh api --method GET \
+                  "repos/$REPO/actions/workflows/codex-p1-gate.yml/runs" \
+                  -f per_page=100 -f page=1 -f event="$source_event" \
+                  -f created="$start_iso..$end_iso"); then
+                  relay_scan_error=true
+                  return 0
+                fi
+                source_total=$(jq -r '.total_count // 0' <<<"$source_page_json")
+                if [ "$source_total" -ge "$MAX_RELAY_SOURCE_RUNS" ]; then
+                  if [ "$window_start" -ge "$window_end" ]; then
+                    echo "::error::Read-only relay source scan saturated the GitHub API ceiling within one second for PR #$PR"
+                    relay_scan_error=true
+                    return 0
+                  fi
+                  midpoint=$((window_start + (window_end - window_start) / 2))
+                  scan_source_window "$source_event" "$window_start" "$midpoint"
+                  scan_source_window "$source_event" "$((midpoint + 1))" "$window_end"
+                  return 0
+                fi
+
                 source_page=1
                 while :; do
-                  if ! source_page_json=$(gh api --method GET \
-                    "repos/$REPO/actions/workflows/codex-p1-gate.yml/runs" \
-                    -f per_page=100 -f page="$source_page" -f event="$source_event" \
-                    -f created=">=$pr_created_at"); then
-                    relay_scan_error=true
-                    break 2
+                  if [ "$source_page" -gt 1 ]; then
+                    if ! source_page_json=$(gh api --method GET \
+                      "repos/$REPO/actions/workflows/codex-p1-gate.yml/runs" \
+                      -f per_page=100 -f page="$source_page" -f event="$source_event" \
+                      -f created="$start_iso..$end_iso"); then
+                      relay_scan_error=true
+                      return 0
+                    fi
                   fi
-                  source_total=$(jq -r '.total_count // 0' <<<"$source_page_json")
                   page_runs=$(jq -c --arg title "Codex P1 Gate relay-v1 PR #$PR" \
                     '[.workflow_runs[] | select(.display_title == $title) | .id]' \
                     <<<"$source_page_json")
                   source_runs=$(printf '%s\n%s\n' "$source_runs" "$page_runs" \
                     | jq -cs '.[0] + .[1]')
                   source_count=$(jq 'length' <<<"$source_runs")
-                  if [ "$source_count" -gt "$MAX_RELAY_SOURCE_RUNS" ]; then
+                  if [ "$source_count" -ge "$MAX_RELAY_SOURCE_RUNS" ]; then
                     echo "::error::Read-only relay matching source run scan exceeded the fail-closed bound of $MAX_RELAY_SOURCE_RUNS for PR #$PR"
                     relay_scan_error=true
-                    break 2
+                    return 0
                   fi
                   [ $((source_page * 100)) -ge "$source_total" ] && break
                   source_page=$((source_page + 1))
                 done
-              done
+              }
+
+              if ! scan_start_epoch=$(date -u -d "$pr_created_at" +%s) \
+                || ! scan_end_epoch=$(date -u +%s); then
+                relay_scan_error=true
+              else
+                for source_event in pull_request pull_request_review pull_request_review_comment issue_comment; do
+                  scan_source_window "$source_event" "$scan_start_epoch" "$scan_end_epoch"
+                  [ "$relay_scan_error" != true ] || break
+                done
+              fi
               if [ "$relay_scan_error" != true ]; then
                 if ! relay_comments=$(gh api --paginate \
                   "repos/$REPO/issues/$PR/comments" | jq -s 'add // []'); then

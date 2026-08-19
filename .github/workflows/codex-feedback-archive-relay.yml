@@ -139,6 +139,7 @@ jobs:
           fetch-depth: 1
 
       - name: Persist archive and publish the exact-head gate
+        id: persist
         if: steps.source.outputs.requires_relay == 'true' && steps.artifact.outputs.found == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -175,6 +176,7 @@ jobs:
             -f "output[title]=Codex feedback gate (trusted read-only relay in progress)" \
             -f "output[summary]=Persisting reviewer-feedback history before evaluating $head_sha." \
             --jq .id)
+          echo "check_id=$check_id" >> "$GITHUB_OUTPUT"
 
           if [ "$(jq '.archive_records | length' "$HANDOFF_FILE")" -gt 0 ]; then
             existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
@@ -211,7 +213,7 @@ jobs:
               rc=2
             fi
           else
-            output="PR head moved from $head_sha to $current_head before trusted fork evaluation."
+            output="PR head moved from $head_sha to $current_head before trusted read-only evaluation."
           fi
 
           conclusion=failure
@@ -232,3 +234,69 @@ jobs:
             -f "output[title]=$title" -f "output[summary]=${output:0:60000}" \
             >/dev/null
           gh api --method DELETE "repos/$REPO/actions/artifacts/$ARTIFACT_ID" >/dev/null
+
+      - name: Close an abandoned read-only relay lease
+        if: >-
+          ${{ failure() && steps.source.outputs.requires_relay == 'true' &&
+          steps.artifact.outputs.found == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.source.outputs.pr }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          CHECK_ID: ${{ steps.persist.outputs.check_id }}
+        run: |
+          set -uo pipefail
+          marker_rc=0
+          comments='[]'
+          if ! comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            | jq -s 'add // []'); then
+            marker_rc=1
+          fi
+          latest_status=""
+          if [ "$marker_rc" -eq 0 ]; then
+            latest_status=$(printf '%s' "$comments" | jq -r --argjson run "$SOURCE_RUN_ID" '
+              [
+                .[]
+                | select(.user.login == "github-actions[bot]")
+                | . as $comment
+                | ((.body // "")
+                  | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=(?<status>complete|failed) -->$")
+                    catch null) as $marker
+                | select($marker != null and ($marker.run | tonumber) == $run)
+                | {status:$marker.status,created_at:($comment.created_at // ""),id:$comment.id}
+              ]
+              | sort_by(.created_at, .id)
+              | (last.status // "")
+            ') || marker_rc=$?
+          fi
+          if [ "$marker_rc" -eq 0 ] && [ "$latest_status" != complete ] \
+            && [ "$latest_status" != failed ]; then
+            marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=failed -->"
+            jq -n --arg body "$marker" '{body:$body}' \
+              | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - \
+                >/dev/null || marker_rc=$?
+          fi
+
+          close_rc=0
+          if [ -n "$CHECK_ID" ]; then
+            close_rc=1
+            for attempt in 1 2 3; do
+              if gh api --method PATCH "repos/$REPO/check-runs/$CHECK_ID" \
+                -f status=completed -f conclusion=failure \
+                -f "output[title]=Codex feedback gate — trusted read-only relay failed closed" \
+                -f "output[summary]=The trusted relay run did not complete. Rerun it before merge." \
+                >/dev/null; then
+                close_rc=0
+                break
+              fi
+              sleep $((attempt * 5))
+            done
+          fi
+          if [ "$marker_rc" -ne 0 ]; then
+            echo "::error::Could not persist the failed relay marker for source run $SOURCE_RUN_ID"
+          fi
+          if [ "$close_rc" -ne 0 ]; then
+            echo "::error::Could not close abandoned relay check lease $CHECK_ID"
+          fi
+          [ "$marker_rc" -eq 0 ] && [ "$close_rc" -eq 0 ]
