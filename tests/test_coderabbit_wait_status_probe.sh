@@ -333,6 +333,19 @@ case "$endpoint" in
         # surface it without the explicit anchor-free pause read below.
         printf '[{"id":9965,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
+      bodyless_ack_over_findings_run)
+        # #1031: ONE head, two CodeRabbit review objects. 9401 is the findings
+        # RUN — it carries the report body, and its blocking finding is inline
+        # (pulls endpoint below), not in that body. 9402 is the body-LESS
+        # object GitHub wraps around CodeRabbit's acknowledgement of the
+        # `[mergepath-resolve:…]` tag reply the review loop posts on every
+        # finding thread (#919/#900), and it is NEWER. The two head-pinned
+        # selections part company exactly here: the counter's
+        # (latest_head_pinned_review) has no body filter and picks the ACK,
+        # while the evidence helper's keeps body-bearing objects and picks the
+        # RUN.
+        printf '[{"id":9401,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"**Actionable comments posted: 1**"},{"id":9402,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":""}]\n' "$bot" "$head_time" "$bot" "$reply_time"
+        ;;
       intermediate_review_head_pin)
         # #535.2: a NEWER review (later submitted_at) references an
         # intermediate commit, while the HEAD review is older. The
@@ -383,6 +396,16 @@ case "$endpoint" in
         # the commit_id ties it to this head.
         printf '[{"id":9732,"user":{"login":"%s"},"created_at":"2026-06-03T00:00:00Z","updated_at":"2026-06-03T00:00:00Z","commit_id":"head-sha","pull_request_review_id":9731,"in_reply_to_id":null,"body":"_⚠️ Potential issue_\\n\\nFinding on the SHA-matched review."}]\n' "$bot"
         ;;
+      bodyless_ack_over_findings_run)
+        # #1031: the live blocking finding hangs off the findings run (9401) as
+        # a ROOT comment; the ack (9402) owns only a REPLY to it, which every
+        # counter drops as a non-root. So scoping the count to the ack yields
+        # zero while the head still carries a Major potential issue. The reply
+        # deliberately does NOT carry `review_comment_addressed` — this is
+        # CodeRabbit acknowledging our resolve tag, not CodeRabbit retiring its
+        # own finding.
+        printf '[{"id":9403,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","commit_id":"head-sha","pull_request_review_id":9401,"in_reply_to_id":null,"body":"_🟠 Major_\\n\\n**Potential issue**: the merge gate can be bypassed here."},{"id":9404,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","commit_id":"head-sha","pull_request_review_id":9402,"in_reply_to_id":9403,"body":"🐇 ✅ Acknowledged the resolve tag."}]\n' "$bot" "$head_time" "$head_time" "$bot" "$reply_time" "$reply_time"
+        ;;
       intermediate_review_head_pin)
         # #535.2: the ⚠️ inline finding is tied to the HEAD review (9931).
         # The newer intermediate review (9932) has no inline findings, so
@@ -409,6 +432,15 @@ case "$endpoint" in
         ;;
       existing_status_probe_reply)
         printf '[{"id":8802,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- CodeRabbit review command invocation: prior -->\\n`@nathanjohnpayne`: Here is a summary of where things stand.\\n\\n### Open CodeRabbit Threads\\nStill checking."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      bodyless_ack_over_findings_run)
+        # #1031: the #968 shape the rung was added to outrank — CodeRabbit's
+        # walkthrough, edited in place after the push (updated_at moves) while
+        # its machine-readable commits range still names the PREVIOUS head. It
+        # is the newest bot comment, so the poll loop grades it `review`, and
+        # it carries no blocking marker of its own: the head's only blocking
+        # evidence is the inline finding on run 9401.
+        printf '[{"id":8901,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n\\n## Walkthrough\\n\\nReviewed the changes between 1111111111111111111111111111111111111111 and 2222222222222222222222222222222222222222."}]\n' "$bot" "$head_time" "$reply_time"
         ;;
       rate_limit)
         printf '[{"id":7701,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"Rate limit exceeded. Please wait 10 seconds before requesting another review."}]\n' "$bot" "$head_time" "$head_time"
@@ -2125,6 +2157,8 @@ test_1003_head_run_evidence_unit() {
       "$ROOT/scripts/coderabbit-wait.sh"
     awk '/^# BEGIN coderabbit_review_run_selector$/{f=1;next} /^# END coderabbit_review_run_selector$/{f=0} f' \
       "$ROOT/scripts/coderabbit-wait.sh"
+    awk '/^# BEGIN coderabbit_graded_review_selector$/{f=1;next} /^# END coderabbit_graded_review_selector$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
     awk '/^# BEGIN coderabbit_head_run_evidence$/{f=1;next} /^# END coderabbit_head_run_evidence$/{f=0} f' \
       "$ROOT/scripts/coderabbit-wait.sh"
   } >"$snip"
@@ -2291,6 +2325,151 @@ Review failed.
     pass "#1003/#1022: the exact-SHA rung is satisfied only by a body-bearing, review-class, marker-free, benign-stanza head-pinned run, and an unreadable reviews list is rc 3 rather than 'the rung is satisfied'"
   else
     fail "#1003 head run evidence:$bad"
+  fi
+}
+
+# #1031: the exact-SHA rung must credit the run the finding COUNTER graded,
+# not merely the newest run that carries a body.
+#
+# The two head-pinned selections read ONE reviews array through different
+# filters — `crw_select_head_pinned_review_run` keeps only body-BEARING
+# objects (#900), `latest_head_pinned_review` (which count_potential_issues
+# scopes its inline findings to) keeps every head-pinned object — so they part
+# company the moment the newest object carries no body. That is not an exotic
+# shape: it is the #919 wrapper GitHub puts around CodeRabbit's `🐇 ✅`
+# acknowledgement of the `[mergepath-resolve:…]` tag reply the review loop
+# posts on EVERY finding thread. The counter then reports 0 for the ack while
+# the rung credits the findings run underneath, whose own body carries no
+# marker because its findings are inline — and the #968 demotion is withdrawn
+# on a head with a live Major.
+#
+# Driven directly because the disagreement is a property of the two selectors,
+# and the id-binding conjunct is the whole of the fix; the end-to-end verdict
+# it changes is asserted by
+# test_1031_bodyless_ack_over_findings_run_does_not_clear below.
+test_1031_rung_binds_to_the_graded_run() {
+  local snip="$WORKDIR/rung-graded-binding.sh" bad="" rc out
+  local h40 run_body ack_body reviews_both reviews_run_only reviews_ack_first
+  eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END|SUMMARY_MARKER|RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER)=' \
+    "$ROOT/scripts/coderabbit-wait.sh")"
+  # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+  . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  {
+    awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+    awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+    awk '/^# BEGIN coderabbit_review_run_selector$/{f=1;next} /^# END coderabbit_review_run_selector$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+    awk '/^# BEGIN coderabbit_graded_review_selector$/{f=1;next} /^# END coderabbit_graded_review_selector$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+    awk '/^# BEGIN coderabbit_head_run_evidence$/{f=1;next} /^# END coderabbit_head_run_evidence$/{f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh"
+  } >"$snip"
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  h40='0123456789abcdef0123456789abcdef01234567'
+  # Read by the extracted helpers through dynamic scope.
+  # shellcheck disable=SC2034
+  REPO=owner/repo
+  # shellcheck disable=SC2034
+  PR_NUMBER=999
+  BOT_LOGIN='coderabbitai[bot]'
+  log() { :; }
+
+  # A real findings run announces its count in the body and carries the finding
+  # itself INLINE, so nothing in this body is blocking on its own — which is
+  # precisely why the rung's marker conjunct cannot catch this case.
+  run_body='**Actionable comments posted: 1**
+
+<details><summary>scripts/merge-clearance-gate.sh (1)</summary></details>'
+  ack_body=''
+
+  reviews_both=$(jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg r "$run_body" --arg a "$ack_body" '[
+    {id: 5601, user: {login: $bot}, commit_id: $sha,
+     submitted_at: "2026-06-04T00:01:00Z", body: $r},
+    {id: 5602, user: {login: $bot}, commit_id: $sha,
+     submitted_at: "2026-06-04T00:02:30Z", body: $a}
+  ]')
+  reviews_run_only=$(jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg r "$run_body" '[
+    {id: 5601, user: {login: $bot}, commit_id: $sha,
+     submitted_at: "2026-06-04T00:01:00Z", body: $r}
+  ]')
+  reviews_ack_first=$(jq -nc --arg bot "$BOT_LOGIN" --arg sha "$h40" --arg r "$run_body" --arg a "$ack_body" '[
+    {id: 5602, user: {login: $bot}, commit_id: $sha,
+     submitted_at: "2026-06-04T00:00:30Z", body: $a},
+    {id: 5601, user: {login: $bot}, commit_id: $sha,
+     submitted_at: "2026-06-04T00:01:00Z", body: $r}
+  ]')
+
+  # THE REGRESSION. The body-less ack is the newest head-pinned object, so the
+  # counter grades IT (id 5602) and finds no root comments beneath it; the rung
+  # would otherwise credit the findings run (5601) and withdraw the demotion.
+  # The two disagree, so the rung has no counted-findings evidence and the
+  # demotion decides: rc 1.
+  fetch_api_array() { printf '%s\n' "$reviews_both"; }
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  [ "$rc" = "1" ] || bad="$bad ack-newer-not-1(rc=$rc,out=$out)"
+
+  # The refusal above must come from the DISAGREEMENT, not from the run body:
+  # remove the ack and the same run satisfies the rung outright. Without this
+  # control the case above is also passed by a helper that has simply stopped
+  # working.
+  fetch_api_array() { printf '%s\n' "$reviews_run_only"; }
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  [ "$rc" = "0" ] || bad="$bad run-alone-not-0(rc=$rc)"
+  [ "$out" = "5601" ] || bad="$bad run-alone-id($out)"
+
+  # Direction check: a body-less object is not itself disqualifying. When the
+  # ack PRECEDES the run, the counter grades the run too, the two agree, and
+  # the rung is satisfied — so the binding is a co-selection test, not a
+  # blanket refusal whenever a reply exists on the head.
+  fetch_api_array() { printf '%s\n' "$reviews_ack_first"; }
+  rc=0; out=$(crw_head_pinned_clean_review_run "$h40") || rc=$?
+  [ "$rc" = "0" ] || bad="$bad ack-older-not-0(rc=$rc)"
+  [ "$out" = "5601" ] || bad="$bad ack-older-id($out)"
+
+  # The two selectors must agree about the graded object on the plain shape as
+  # well, or the binding above would be comparing look-alikes.
+  out=$(crw_select_head_pinned_graded_review "$reviews_both" "$BOT_LOGIN" "$h40" | jq -r '.id')
+  [ "$out" = "5602" ] || bad="$bad graded-selection($out)"
+  out=$(crw_select_head_pinned_review_run "$reviews_both" "$BOT_LOGIN" "$h40" | jq -r '.id')
+  [ "$out" = "5601" ] || bad="$bad run-selection($out)"
+
+  unset -f fetch_api_array log
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  if [ -z "$bad" ]; then
+    pass "#1031: the exact-SHA rung is satisfied only when the body-bearing run it credits IS the head-pinned object the finding counter graded"
+  else
+    fail "#1031 rung/counter binding:$bad"
+  fi
+}
+
+# #1031 end-to-end: the same fixture through the real script. Pre-fix this
+# emitted `cleared` (exit 0) with potential_issue_count 0 on a head carrying a
+# live `_🟠 Major_ / **Potential issue**` — the counter graded the body-less
+# ack, the rung credited the findings run, and between them the #968 demotion
+# was withdrawn with nobody having looked at the finding. Post-fix the rung
+# declines, the demotion stands, and the wait holds to its advisory timeout.
+test_1031_bodyless_ack_over_findings_run_does_not_clear() {
+  local dir rc status
+  dir=$(make_case "bodyless-ack-over-findings-run" 60 false 0 2)
+  rc=$(run_case "$dir" bodyless_ack_over_findings_run)
+  status=""
+  if [ -s "$dir/out.json" ]; then
+    status=$(jq -r '.status' "$dir/out.json")
+  fi
+  if [ "$rc" = "0" ] || [ "$status" = "cleared" ]; then
+    fail "#1031 end-to-end: exit $rc status=$status — a body-less ack must not let the exact-SHA rung clear a head whose findings nothing counted; stderr=$(tail -5 "$dir/err.log")"
+  elif [ "$rc" != "4" ] || [ "$status" != "timeout" ]; then
+    fail "#1031 end-to-end: exit $rc status=$status, expected the advisory timeout (4/timeout) the #968 demotion produces; stderr=$(tail -5 "$dir/err.log")"
+  elif ! grep -q 'commits range names a different commit' "$dir/err.log"; then
+    fail "#1031 end-to-end: the #968 demotion never fired, so the verdict was reached some other way; stderr=$(tail -5 "$dir/err.log")"
+  else
+    pass "#1031: a body-less resolve-tag ack newer than the findings run leaves the #968 demotion standing instead of clearing the head"
   fi
 }
 
@@ -2871,6 +3050,8 @@ test_851_summary_helpers_unit
 test_968_summary_head_claim_unit
 test_1005_classifier_pipe_buffer_unit
 test_1003_head_run_evidence_unit
+test_1031_rung_binds_to_the_graded_run
+test_1031_bodyless_ack_over_findings_run_does_not_clear
 test_837_badge_only_inline_finding_is_counted
 test_837_badge_only_summary_finding_probe_is_findings
 test_824_sha_matched_review_is_honored_regardless_of_timestamp

@@ -1745,6 +1745,36 @@ scan_latest_comment_best_effort() {
   latest_comment_from_issue_comments "$issue_comments"
 }
 
+# BEGIN coderabbit_graded_review_selector
+# The head-pinned CodeRabbit review object whose inline findings the counters
+# GRADE, as `{id, submitted_at}`, or nothing.
+#
+# Extracted (#1031) because two readers now have to agree about which object
+# that is. `latest_head_pinned_review` below feeds head_review_finding_bodies
+# and therefore count_potential_issues; `crw_head_pinned_clean_review_run`
+# credits a run as clean and has to name the run the counter actually graded.
+# They read the SAME `reviews` array through DIFFERENT filters — the evidence
+# helper keeps only body-BEARING objects (#900), this selection keeps every
+# head-pinned one — so leaving the second reader with a private copy of the
+# selection is exactly how the two came to disagree about one head. One
+# definition, so "the run the counter graded" cannot answer differently
+# depending on who asks.
+#
+# Pure: jq over the passed strings only, no globals and no I/O.
+#
+# crw_select_head_pinned_graded_review <reviews-json> <bot-login> <head-sha>
+crw_select_head_pinned_graded_review() {
+  printf '%s' "${1:-}" | jq -c --arg bot "${2:-}" --arg head_sha "${3:-}" '
+    [ .[]
+      | select(.user.login == $bot)
+      | select(.commit_id == $head_sha)
+    ]
+    | sort_by(.submitted_at) | last
+    | if . == null then empty else {id, submitted_at} end
+  '
+}
+# END coderabbit_graded_review_selector
+
 # CodeRabbit may later reply to a finding thread with its hidden
 # `review_comment_addressed` marker after an agent fixes/rebuts the
 # finding. Treat that bot-authored marker as authoritative for the counting
@@ -1784,14 +1814,7 @@ latest_head_pinned_review() {
   # into a confident "no review on this head". Whether errexit fires depends on
   # the caller's context, so it cannot be relied on — check here.
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return 3
-  echo "$reviews" | jq -c --arg bot "$BOT_LOGIN" --arg head_sha "$HEAD_SHA" '
-    [ .[]
-      | select(.user.login == $bot)
-      | select(.commit_id == $head_sha)
-    ]
-    | sort_by(.submitted_at) | last
-    | if . == null then empty else {id, submitted_at} end
-  '
+  crw_select_head_pinned_graded_review "$reviews" "$BOT_LOGIN" "$HEAD_SHA"
 }
 
 latest_head_pinned_review_id() {
@@ -3455,7 +3478,7 @@ crw_summary_names_only_other_head() {
 # `crw_select_head_pinned_review_run` exists precisely to filter that: it
 # requires a NON-EMPTY review body, the discriminator measured on #889.
 #
-# Three further conjuncts beyond the selector, all fail-closed:
+# Four further conjuncts beyond the selector, all fail-closed:
 #   - the run body must classify `review`. A head-pinned object whose body is a
 #     rate-limit / pause / in-progress notice is not a completed report, and
 #     `classify_comment` is the same ladder every other surface is graded with.
@@ -3472,6 +3495,23 @@ crw_summary_names_only_other_head() {
 #     carries none: this repository's own model of one is the bare
 #     `**Actionable comments posted: 0**`. Requiring a stanza would make this
 #     rung unreachable and silently restore the inverted ladder.
+#   - the run must be the SAME object the finding counter graded (#1031). The
+#     selector and `latest_head_pinned_review` read one array through different
+#     filters, so they answer differently the moment the newest head-pinned
+#     object carries no body — which is the #919 shape this comment block
+#     already documents, and the review-loop rules make it the COMMON shape:
+#     we post a `[mergepath-resolve:…]` tag reply on every finding thread, and
+#     GitHub wraps a body-less review object around CodeRabbit's `🐇 ✅`
+#     acknowledgement of it. The counter then scopes `pull_request_review_id`
+#     to that ACK, finds no root comments beneath it and reports 0 blocking
+#     findings, while this rung would credit the FINDINGS run underneath —
+#     whose findings are inline, so the marker conjunct above never sees them
+#     either. The demotion is withdrawn and the wait emits `cleared` on a head
+#     carrying a live `_🟠 Major_ / **Potential issue**`. Binding the two makes
+#     the rung mean what it claims: THIS run's findings were counted, and there
+#     were none. When they differ the counter graded some other object, so the
+#     rung has no counted-findings evidence to outrank a summary with and the
+#     demotion decides — the same answer as "no body-bearing run at all".
 #
 # Direction is preserved: this can only ever WITHDRAW a refusal that rests on a
 # mutable comment, in favour of GitHub-owned immutable head identity. It never
@@ -3491,7 +3531,7 @@ crw_summary_names_only_other_head() {
 # crw_head_pinned_clean_review_run <head-sha>
 crw_head_pinned_clean_review_run() {
   local head_sha=${1:?}
-  local reviews run run_id rbody
+  local reviews run run_id rbody graded graded_id
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return 3
   run=$(crw_select_head_pinned_review_run "$reviews" "$BOT_LOGIN" "$head_sha") || return 3
   # No body-bearing review object pinned to this head is a definite answer, not
@@ -3499,6 +3539,21 @@ crw_head_pinned_clean_review_run() {
   [ -n "$run" ] || return 1
   run_id=$(printf '%s' "$run" | jq -r '.id // empty') || return 3
   [ -n "$run_id" ] || return 3
+  # #1031: the counter-binding conjunct, argued in the block comment above.
+  # Derived from the SAME `$reviews` array the run came from, not from a second
+  # fetch — a re-read could land on a later state and compare two different
+  # snapshots. Both call sites pass HEAD_SHA, which is the head
+  # `latest_head_pinned_review` selects for, so this is the counter's own
+  # selection rather than a look-alike.
+  graded=$(crw_select_head_pinned_graded_review "$reviews" "$BOT_LOGIN" "$head_sha") \
+    || return 3
+  graded_id=$(printf '%s' "$graded" | jq -r '.id // empty') || return 3
+  # Unreachable by construction: the graded selection is a SUPERSET of the
+  # body-bearing one, so a selected run guarantees a graded one. Reaching it
+  # means the derive did not really happen, and a broken read must not withdraw
+  # the refusal (#936/#959).
+  [ -n "$graded_id" ] || return 3
+  [ "$run_id" = "$graded_id" ] || return 1
   # Re-read the FULL body from the same array. The selector emits a 200-char
   # `body_excerpt` for logging, and classifying an excerpt would grade a
   # truncated document — the marker a run carries need not be in the first 200
