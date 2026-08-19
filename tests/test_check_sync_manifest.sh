@@ -1150,20 +1150,22 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   #
   # A fence does not only begin at the start of a line. It also begins
   # on a LIST MARKER line, whose content is the first block of the item
-  # rather than paragraph text of the enclosing document, and inside a
-  # BLOCK QUOTE, whose marker this parser strips for that one purpose
-  # (#890). Both were read as prose, so the body of the block was
-  # scanned with its `#NN` inside — the false-positive direction. The
-  # same marker line carries the other half of the CommonMark gap rule:
-  # a gap past four columns does not merely cap the content indent at
-  # the marker width plus one, it says the item STARTS with an indented
-  # code block, of which the marker line is the first line.
+  # rather than paragraph text of the enclosing document (#890). That
+  # was read as prose, so the body of the block was scanned with its
+  # `#NN` inside — the false-positive direction. The same marker line
+  # carries the other half of the CommonMark gap rule: a gap past four
+  # columns does not merely cap the content indent at the marker width
+  # plus one, it says the item STARTS with an indented code block, of
+  # which the marker line is the first line.
   #
-  # The block quote stays otherwise unmodelled, and the boundary is
-  # declared rather than hidden: quoted INDENTED code, and a fence
-  # inside a NESTED quote, are still emitted as prose. Both over-scan,
-  # which is the safe direction, and case 66 pins them so the day
-  # either is modelled is a deliberate edit rather than a surprise.
+  # A BLOCK QUOTE is not a container this parser models, and a fence
+  # inside one is therefore still emitted as prose, exactly as it was
+  # before #890. That over-scans — a `#NN` inside quoted fenced code
+  # fails the check with a misleading diagnostic — which is the safe
+  # direction, and it is tracked in #1039 rather than patched here,
+  # because closing it correctly needs the quote to be a real entry in
+  # the container stack rather than a flag beside it. #1033 is the same
+  # missing model reached from the other direction.
   #
   # Inline code spans are matched by delimiter RUN LENGTH for the same
   # reason fences are, but note the closing rule DIFFERS by design and
@@ -1267,13 +1269,13 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
 
         # The delimiter SHAPE — the run length, and the rule barring a
         # backtick opener from carrying a backtick in its info string —
-        # lives in `fence_delim` because a fence can begin in three
-        # places, not one: at the start of a line, in the content of a
-        # LIST MARKER line, and in the content of a BLOCK QUOTE line
-        # (#890). Restating the shape at each of them is how the three
-        # drifted apart in the first place. The four-column allowance is
-        # deliberately NOT part of it: every caller measures that from a
-        # different origin, and folding it in would hide the difference.
+        # lives in `fence_delim` because a fence can begin in two
+        # places, not one: at the start of a line, and in the content of
+        # a LIST MARKER line (#890). Restating the shape at both of them
+        # is how they drifted apart in the first place. The four-column
+        # allowance is deliberately NOT part of it: each caller measures
+        # that from a different origin, and folding it in would hide the
+        # difference.
         is_delim = 0
         run = 0
         if (ind < container_base + 4) run = fence_delim(rest, fence)
@@ -1282,26 +1284,6 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         if (is_delim) {
           indented_code = 0
           para = 0
-          # A DOCUMENT-level fence delimiter carries no quote marker —
-          # `rest` begins with the delimiter run — so the quote, and any
-          # fence it holds, ends HERE. The clearing below cannot do it:
-          # this branch returns before reaching it, and so does the
-          # `if (fence)` body under it, which is how a `qfence` left open
-          # by an unclosed quoted fence survived a whole document-level
-          # fenced block. The first quoted line after that block was then
-          # blanked as quoted-fence body and a bare `#NN` on it shipped
-          # unflagged — the UNDER-reporting direction, and a regression
-          # against `main`, which models no quoted fence at all.
-          #
-          # The `if (fence)` body needs no counterpart: `qfence` and
-          # `fence` are never both set. The only two lines that set
-          # `fence` are this one and the list-marker opener below, and
-          # both clear `qfence` first — this one here, the marker line at
-          # the clearing below, since a line whose content starts with a
-          # marker carries no quote marker of its own. Nothing can set
-          # `qfence` while `fence` is open either: both `quote_fence`
-          # callers sit after the `if (fence)` return.
-          qfence = 0; qfence_char = ""; qfence_len = 0; qfence_base = 0
           if (!fence) {
             # A fence is not a lazy continuation either, so an OPENER
             # closes every container it is not indented into, here rather
@@ -1332,65 +1314,6 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
           print ""; next
         }
         if (fence) { para = 0; print ""; next }
-
-        # A FENCE INSIDE A BLOCK QUOTE. The quote itself is not a
-        # container this parser models, and modelling it is not what this
-        # does: `qfence` tracks one thing — whether the quote currently
-        # holds an open fenced code block — because without it the body
-        # of `> ```sh` / `> echo "closes #NN"` / `> ``` ` is emitted as
-        # prose and the `#NN` inside fails a required check (#890). That
-        # is the false-positive direction, on a shape a doc that quotes a
-        # command reaches for readily.
-        #
-        # It is deliberately the smallest model that closes that shape,
-        # and everything it does is bounded by the quote:
-        #
-        #   * a quote marker exists only within four columns of the
-        #     container the line is inside — the same bound `quote_para`
-        #     and the leaf blocks below use. Past it the `>` is
-        #     indented-code text, so a quote-shaped line inside a code
-        #     block never opens anything;
-        #   * a DOCUMENT-level fence wins, because the branch above
-        #     returns first: inside one, `> ``` ` is content;
-        #   * the quote — and with it any fence it holds — ends at the
-        #     first line without a marker. A fenced code block has no
-        #     lazy continuation, so a blank line or an unquoted line
-        #     really does end both, and clearing the flag there is what
-        #     keeps an unclosed quoted fence from swallowing the rest of
-        #     the file. That is the UNDER-reporting direction, and it is
-        #     the one this must not take.
-        #
-        # The step itself is `quote_fence`, called from HERE for a quote
-        # that starts the line and from the LIST MARKER branch below for
-        # one that starts the item — `- > ```sh` is the same quote, one
-        # container in, and recognising it in only one of the two places
-        # inverts the parity: the body is scanned as prose (harmless on
-        # its own), then the `> ``` ` meant to CLOSE the quoted fence
-        # opens one instead, and the quoted prose after it is blanked
-        # with its `#NN` inside. That is the UNDER-reporting direction,
-        # so the two callers are not an optimisation, they are the
-        # correctness condition.
-        #
-        # Clearing belongs to the caller, not the step, because only the
-        # caller knows a marker was looked for and not found — and
-        # because the quote ends on a SECOND condition the step cannot
-        # see. A quoted fence ends with the container it was opened in,
-        # exactly as `fence_base` makes a plain fence do: a fenced code
-        # block has no lazy continuation, so a quote marker LEFT of that
-        # container is a different quote in a different block, and the
-        # item holding the first one ended there. Carrying the fence
-        # across blanks that line instead — a bare `#NN` in the new
-        # quote goes unflagged, which is the UNDER-reporting direction —
-        # so `qfence_base` records the container at OPEN time and the
-        # outdent ends the fence with it.
-        qmark = (ind < container_base + 4 && substr(rest, 1, 1) == ">")
-        if (qfence && (!qmark || ind < qfence_base)) {
-          qfence = 0; qfence_char = ""; qfence_len = 0; qfence_base = 0
-        }
-        if (qmark && quote_fence(rest, ind, container_base)) {
-          para = 0; quote_para = 0
-          print ""; next
-        }
 
         # A blank line closes an open paragraph but NOT an indented code
         # block: a blank inside one is part of the block.
@@ -1713,24 +1636,6 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
           para = 0
           print ""; next
         }
-        # A BLOCK QUOTE on the marker line. `- > ```sh` opens the quote
-        # in the item, so the quoted-fence step runs on the item content
-        # at the content indent the marker installed, exactly as it runs
-        # on a line that starts with the marker. Recognising it only at
-        # the start of a line lets the quoted body be scanned as prose
-        # and then reads the closing `> ``` ` as an OPENER, which blanks
-        # the quoted prose after it — the UNDER-reporting direction.
-        #
-        # No clearing counterpart is needed here: the caller above
-        # already cleared `qfence` on this line, because a line whose
-        # first character is a list marker carries no quote marker of its
-        # own and therefore ends any quote that was open.
-        if (marker_open && substr(item_rest, 1, 1) == ">") {
-          if (quote_fence(item_rest, list_indent, list_indent)) {
-            para = 0; quote_para = 0
-            print ""; next
-          }
-        }
         # A fence OPENER on the marker line. It needs no allowance test
         # of its own: the gap swallowed every blank between the marker
         # and the content, so a delimiter here always sits exactly AT the
@@ -1782,55 +1687,6 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         print line
       }
 
-      # One step of the quoted-fence state machine, over a BLOCK QUOTE
-      # marker line whose marker sits at column `col` inside the
-      # container whose content indent is `base`. Returns 1 when the
-      # line is a quoted fence delimiter or the body of one — blank it —
-      # and 0 when it is ordinary quoted prose the caller should go on
-      # scanning.
-      #
-      # `col` and `base` differ for the same reason `ind` and
-      # `container_base` do at the top of the rule: the marker may sit
-      # up to three columns past the container it is in and still be
-      # that container. `col` is where the marker actually is, which is
-      # what the blanks after it are measured from; `base` is the
-      # container the fence belongs to, recorded so an outdent can end
-      # it.
-      #
-      # The marker consumes at most ONE column of the blanks after it;
-      # what remains is the quote-relative indent, measured in columns
-      # so a tab counts as the distance to its next four-column stop
-      # (`>\t``` ` is two columns in, not one and not four). Four or
-      # more columns of it is indented code INSIDE the quote — a shape
-      # this still does not model, and one the tests pin as a known
-      # boundary rather than a fixed case.
-      #
-      # Ending the quote is NOT here. Only the caller knows whether it
-      # looked for a marker and failed to find one, which is what ends
-      # the quote and any fence it holds.
-      function quote_fence(s, col, base,   gap, text, rel, run) {
-        gap = substr(s, 2)
-        sub(/[^ \t].*$/, "", gap)
-        text = substr(s, length(gap) + 2)
-        rel = visual_span(col + 1, gap)
-        if (rel > 0) rel--
-        run = 0
-        if (rel < 4) run = fence_delim(text, qfence)
-        if (run > 0) {
-          if (!qfence) {
-            qfence = 1
-            qfence_char = fence_delim_char
-            qfence_len = run
-            qfence_base = base
-          } else if (fence_delim_char == qfence_char && run >= qfence_len &&
-                     substr(text, run + 1) !~ /[^ \t]/) {
-            qfence = 0; qfence_char = ""; qfence_len = 0; qfence_base = 0
-          }
-          return 1
-        }
-        return (qfence != 0)
-      }
-
       # The length of the fence-delimiter RUN that `s` begins with, or
       # zero if `s` does not begin with one at all. The delimiter
       # character is carried out in `fence_delim_char`, which is set
@@ -1846,10 +1702,9 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
       # a run at least as long, nothing but blanks after — lives,
       # since only the caller knows what it is closing).
       #
-      # The four-column allowance is NOT here. Each of the three
-      # callers measures it from a different origin: the container the
-      # line is inside, the content indent a list marker just installed,
-      # or the column a block quote marker leaves off at.
+      # The four-column allowance is NOT here. The two callers measure
+      # it from different origins: the container the line is inside, and
+      # the content indent a list marker just installed.
       function fence_delim(s, open,   c, run) {
         c = substr(s, 1, 1)
         if (c != "`" && c != "~") return 0
@@ -3627,10 +3482,35 @@ FNEST_EOF
   #     closes the fence, and it ends with the item at the outdent on
   #     line 22. Recording the document instead of the item as the base
   #     reads line 19 as the closer and surfaces line 20.
+  #   * lines 24-28 and 30-34 pin the delimiter the marker line records.
+  #     A four-backtick opener is not closed by the three-backtick line
+  #     inside it, and a tilde opener is not closed by a backtick line
+  #     at all — so an implementation that records a fixed length or a
+  #     fixed character rather than the run it actually found closes the
+  #     block early and surfaces `#1010`/`#1212`. These are the two
+  #     halves of the same omission, and each fails on its own mutation
+  #     rather than both failing together.
+  #   * lines 36-38 pin the paragraph the opener CLOSES. A bullet with
+  #     content may interrupt a paragraph, so line 37 opens its item
+  #     under one; the fence never gets a body line to clear `para` for
+  #     it, because line 38 outdents out of both the fence and the item
+  #     on the very next line. Leaving that paragraph open then
+  #     suppresses the code branch and emits the document-level indented
+  #     code block as prose with `#1414` inside it — the false-positive
+  #     direction, and the reason the branch clears `para` explicitly
+  #     rather than relying on the assignment at the bottom of the rule.
+  #   * lines 40-41 are the CONTROL for the extracted `fence_delim`
+  #     helper itself, which is what both openers now share. A run of
+  #     two is not a delimiter and neither is a run of three of anything
+  #     but a backtick or a tilde, so both lines are ordinary paragraphs
+  #     and their refs are real. An implementation that loosens either
+  #     rule opens a fence on them and swallows the rest of the file,
+  #     which is the UNDER-reporting direction.
   #
   # Every expected hit is a line markdown-it-py 4.2.0 in commonmark mode
   # renders inside `<p>`, and every unflagged `#NN` above sits inside
-  # `<pre><code>`.
+  # `<pre><code>`. On this fixture the scanner agrees with the renderer
+  # on all 41 lines.
   FMARK_DOC="$WORKDIR/consumer-truth-marker-fence.md"
   cat > "$FMARK_DOC" <<'FMARK_EOF'
 # Doc
@@ -3655,14 +3535,33 @@ A bare #777 in prose is real.
   #888 is still fence content
 
 A bare #999 in prose is real.
+
+- ````sh
+  ```
+  #1010 is still fence content
+  ````
+- A bare #1111 in prose is real.
+
+- ~~~sh
+  ```
+  #1212 is still fence content
+  ~~~
+- A bare #1313 in prose is real.
+
+Paragraph text.
+   -    ```sh
+    #1414 is indented code once the item ends
+
+`` #1515 opens no fence, so this line is prose
++++ #1616 opens no fence either
 FMARK_EOF
   set +e
   fmark_hits=$(md_prose_only "$FMARK_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
   fmark_lines=$(md_prose_only "$FMARK_DOC" | wc -l | tr -d ' ')
   fmark_raw=$(wc -l < "$FMARK_DOC" | tr -d ' ')
   set -e
-  if [ "$fmark_hits" != "6,11,13,14,16,22," ]; then
-    fail "Case 64: expected lines 6,11,13,14,16,22 flagged (a fence opens on the marker line at the content indent the marker installs, and a backtick info string still bars one), got '$fmark_hits'"
+  if [ "$fmark_hits" != "6,11,13,14,16,22,28,34,40,41," ]; then
+    fail "Case 64: expected lines 6,11,13,14,16,22,28,34,40,41 flagged (a fence opens on the marker line at the content indent the marker installs, with the run and character it actually found, and closes the paragraph it interrupted; a backtick info string, a two-character run and a non-fence character each still bar one), got '$fmark_hits'"
   elif [ "$fmark_lines" != "$fmark_raw" ]; then
     fail "Case 64: md_prose_only must emit one line per input line, got $fmark_lines for $fmark_raw"
   else
@@ -3744,205 +3643,8 @@ FGAP_EOF
     pass "Case 65: a marker gap past four columns starts the item with indented code, so the marker line and its block are code (#890)"
   fi
 
-  # Case 66: a fence inside a BLOCK QUOTE, and the boundary that stays
-  # around it (#890).
-  #
-  # The block quote is not a container this parser models — case 59 takes
-  # only what the lazy-continuation rules need from it — and this does
-  # not change that. It adds one fact: whether the quote currently holds
-  # an open fenced code block. Without it `> ```sh` / `> echo "closes
-  # #NN"` / `> ``` ` was emitted as prose and the `#NN` failed a required
-  # check, which is the false-positive direction on a shape a doc that
-  # quotes a command reaches for readily.
-  #
-  # Lines 3-7 are the shape itself, and line 7 is what keeps the fix from
-  # being "blank every quoted line": the fence closes on line 5, so the
-  # quoted prose after it is still scanned. Lines 9-12 pin the other end.
-  # A fenced code block has no lazy continuation, so the blank line 11
-  # ends the quote and the unclosed fence with it — an implementation
-  # that leaves the fence open swallows line 12 and every line after it,
-  # the UNDER-reporting direction this parser must never take.
-  #
-  # Lines 14-18 pin the quote-relative measure. The marker consumes at
-  # most ONE column of the blanks after it, so the delimiter on line 14
-  # sits three columns into the quote and is a fence; counting the whole
-  # gap instead puts it at four, where a delimiter is indented code, and
-  # `#555` on line 15 surfaces as prose.
-  #
-  # Lines 20-21 are the DECLARED BOUNDARY, pinned as a hit rather than
-  # fixed. A quote whose content is indented four columns holds an
-  # INDENTED code block, which needs the container model this
-  # deliberately does not build; a fence inside a NESTED quote is the
-  # same story one level further in. Both over-scan — a `#NN` inside
-  # quoted indented code still fails the check — and both behave here
-  # exactly as they did before #890, so line 21 fails the moment either
-  # becomes modelled and the expectation is meant to be updated then,
-  # deliberately.
-  #
-  # The delimiter on line 20 is what makes that boundary pinned rather
-  # than merely described. It is five columns past the marker, so the
-  # quote holds indented code and NOT a fence; dropping the four-column
-  # allowance on the quoted-fence test opens one there instead, blanks
-  # line 21, and takes `#777` with it — the UNDER-reporting direction,
-  # reached by over-modelling rather than under-modelling.
-  #
-  # Lines 23-25 pin the other bound on the marker itself. Four or more
-  # columns past the container the line is inside, a `>` is text and not
-  # a marker — the same bound `quote_para` and the leaf blocks use. Both
-  # lines are lazy continuation of the paragraph opened on line 23, so
-  # reading line 24 as a quoted fence blanks line 25 and ships `#888`
-  # unflagged.
-  #
-  # Lines 29-32 are the quote that starts on a LIST MARKER line, and
-  # they are the reason the quoted-fence step is called from two places
-  # rather than one. Recognising `- > ``` ` only at the start of a line
-  # leaves line 30 scanned as prose — the harmless half — and then reads
-  # the `> ``` ` on line 31, which CommonMark makes the CLOSER, as an
-  # OPENER instead. The parity inverts from there and line 32 is blanked
-  # with `#1111` inside it: a bare ref that `main` itself flagged,
-  # shipped past a required check by the very change meant to tighten
-  # it. Found by CodeRabbit on this PR and confirmed against the
-  # renderer before it was fixed.
-  #
-  # Lines 34-36 pin the same rule at the other end. A quoted fence ends
-  # with the container it was opened in, the way `fence_base` makes a
-  # plain fence do (case 61): line 36 carries a quote marker, but at
-  # column zero it is a DIFFERENT quote in a different block, and the
-  # item holding the fence ended there. Carrying the fence across it
-  # blanks line 36 and ships `#1313` unflagged, which `main` does not do
-  # — under-reporting introduced by the fix, so the shape is pinned
-  # rather than left to the matrix.
-  #
-  # markdown-it-py 4.2.0 in commonmark mode renders lines 3-5, 9-10,
-  # 14-16, 20-21, 29-31 and 34-35 inside `<pre><code>` and lines 7, 12,
-  # 18, 25, 27, 32 and 36 inside `<p>`.
-  QFENCE_DOC="$WORKDIR/consumer-truth-quote-fence.md"
-  cat > "$QFENCE_DOC" <<'QFENCE_EOF'
-# Doc
-
-> ```sh
-> echo "closes #111"
-> ```
->
-> A bare #222 in quoted prose is real.
-
-> ```
-> #333 fenced, and the quote ends at the blank below
-
-A bare #444 in prose is real.
-
->    ```
->    #555 fenced three columns past the quote content column
->    ```
->
-> A bare #666 in quoted prose is real.
-
->     ```
->     #777 sits in indented code inside the quote
-
-- item text
-      > ```
-      > a lazy #888 continuation line
-
-A bare #999 in prose is real.
-
-- > ```
-  > #1010 fenced in a quote inside a list item
-  > ```
-  > A bare #1111 in that quoted prose is real.
-
-- > ```
-  > #1212 fenced in the item quote
-> #1313 at column zero is a new quote, not more fence
-QFENCE_EOF
-  set +e
-  qfence_hits=$(md_prose_only "$QFENCE_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
-  qfence_lines=$(md_prose_only "$QFENCE_DOC" | wc -l | tr -d ' ')
-  qfence_raw=$(wc -l < "$QFENCE_DOC" | tr -d ' ')
-  set -e
-  if [ "$qfence_hits" != "7,12,18,21,25,27,32,36," ]; then
-    fail "Case 66: expected lines 7,12,18,21,25,27,32,36 flagged (a quoted fence blanks its body, closes wherever the quote starts, and ends with the container it opened in; a blank line ends both, and quoted indented code on lines 20-21 stays the declared boundary), got '$qfence_hits'"
-  elif [ "$qfence_lines" != "$qfence_raw" ]; then
-    fail "Case 66: md_prose_only must emit one line per input line, got $qfence_lines for $qfence_raw"
-  else
-    pass "Case 66: a fenced code block inside a block quote is code, and quoted indented code remains the declared boundary (#890)"
-  fi
-
-  # Case 67: a DOCUMENT-level fence ends the quote, and the fence it
-  # holds (#890).
-  #
-  # Case 66 pinned the two boundaries the quoted-fence flag has inside a
-  # quote — a blank or unquoted line ends it, and an outdented marker
-  # ends it with the container it opened in. Both are reached through the
-  # clearing that runs on an ordinary line. A document-level fence
-  # DELIMITER never reaches it: that branch prints and returns above it,
-  # and so does the branch that blanks the body of an open fence. So a
-  # `qfence` left set by an unclosed quoted fence survived a whole
-  # document-level fenced block, and the first quoted line after that
-  # block was blanked as quoted-fence body with its `#NN` inside — the
-  # UNDER-reporting direction, and a regression against `main`, which
-  # models no quoted fence at all and prints that line.
-  #
-  # Lines 3-8 are the shape. The quoted fence opened on line 3 is never
-  # closed inside the quote; line 5 carries no marker, so the quote ends
-  # there and the document fence CommonMark opens on that line runs to
-  # line 7. Line 8 is a paragraph in a NEW quote and must be scanned:
-  # `#333` is a bare ref that `main` flags.
-  #
-  # Lines 10-15 and 17-22 pin that the clearing belongs to the delimiter
-  # branch itself rather than to any one delimiter shape: a tilde fence
-  # and a fence indented three columns take the same branch, and an
-  # implementation that clears only on a backtick opener at column zero
-  # ships `#666` and `#999` unflagged.
-  #
-  # `#222`, `#555` and `#888` are the other half of the pin. They sit in
-  # the document fence, so an over-correction that stops blanking the
-  # fence body — or that clears the flag by scanning the line instead of
-  # returning — surfaces them as prose and fails the case from the
-  # false-positive side.
-  #
-  # markdown-it-py 4.2.0 in commonmark mode renders lines 4, 6, 11, 13,
-  # 18 and 20 inside `<pre><code>` and lines 8, 15 and 22 inside `<p>`.
-  DFENCE_DOC="$WORKDIR/consumer-truth-doc-fence-ends-quote.md"
-  cat > "$DFENCE_DOC" <<'DFENCE_EOF'
-# Doc
-
-> ```sh
-> echo "closes #111"
-```
-#222 sits in the document fence that ended the quote
-```
-> A bare #333 in quoted prose is real.
-
-> ~~~sh
-> echo "closes #444"
-~~~
-#555 sits in the document fence that ended the quote
-~~~
-> A bare #666 in quoted prose is real.
-
-> ```sh
-> echo "closes #777"
-   ```
-#888 sits in the document fence that ended the quote
-  ```
-> A bare #999 in quoted prose is real.
-DFENCE_EOF
-  set +e
-  dfence_hits=$(md_prose_only "$DFENCE_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
-  dfence_lines=$(md_prose_only "$DFENCE_DOC" | wc -l | tr -d ' ')
-  dfence_raw=$(wc -l < "$DFENCE_DOC" | tr -d ' ')
-  set -e
-  if [ "$dfence_hits" != "8,15,22," ]; then
-    fail "Case 67: expected lines 8,15,22 flagged (a document-level fence delimiter ends the quote and the fence it holds, so the quoted prose after the fence is still scanned), got '$dfence_hits'"
-  elif [ "$dfence_lines" != "$dfence_raw" ]; then
-    fail "Case 67: md_prose_only must emit one line per input line, got $dfence_lines for $dfence_raw"
-  else
-    pass "Case 67: a document-level fence ends the quote and any quoted fence it holds, so the prose after it is not swallowed (#890)"
-  fi
-
 else
-  echo "SKIP: Cases 36-67 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-65 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
