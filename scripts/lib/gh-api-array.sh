@@ -65,9 +65,9 @@
 # function call inside that subshell shares its variables.
 #
 #   GH_API_ARRAY_ERROR       the composed, caller-facing message.
-#   GH_API_ARRAY_ERROR_KIND  `fetch` or `flatten` — which step failed, so a
-#                            caller with two different messages (the
-#                            best-effort variant) can keep both.
+#   GH_API_ARRAY_ERROR_KIND  `fetch`, `flatten` or `shape` — which step
+#                            failed, so a caller with more than one message
+#                            (the best-effort variant) can keep them all.
 #   GH_API_ARRAY_DETAIL      gh's stderr text, or empty. Kept separate so a
 #                            caller can compose its own message without
 #                            string-surgery on GH_API_ARRAY_ERROR.
@@ -119,14 +119,58 @@
 # invocation, the two failure points and their message wording are carried
 # over verbatim.
 #
-# NOT reconciled here, deliberately: the empty-list fallback still runs
-# BEFORE any judgement of the flattened value's type (#967, #1006). That is a
-# BEHAVIOUR change with its own measured evidence and its own regressions,
-# in flight on PR #995 at the time of writing; this change is a pure
-# extraction, so it preserves the behaviour exactly rather than inventing a
-# second version of a fix already under review. The point of the extraction
-# is that when that judgement lands, it lands HERE, once, instead of eight
-# times.
+# ─────────────────────────────────────────────────────────────────────
+# The third response mode — a 200 that was READ but is not a list (#967)
+# ─────────────────────────────────────────────────────────────────────
+#
+# This is the judgement the extraction commit deliberately left for PR #995,
+# and it lands here once instead of in eight copies.
+#
+# #831 enforced two of the three ways "an ARRAY, or a failure" can break: a
+# non-zero `gh` exit, and a stream jq itself rejects. The third is a
+# SUCCESSFUL read of a 200 whose body is not a list, and it was passed through
+# unexamined, because `add` over a one-element stream returns that element:
+#
+#     $ printf '{}' | jq -s 'add // []'
+#     {}
+#
+# Nothing downstream is told, and jq's object semantics then decide the
+# outcome. `{}` makes every `[ .[] | select(…) ]` evaluate to `[]` — a
+# confident "no reviews on this head" / "no blocking comments", the identical
+# false negative #831 exists to prevent, reached down a different road. A
+# NON-empty object (an error payload such as `{"message":"Bad credentials"}`)
+# makes `.[]` yield its string VALUES, `select(.user.login == …)` index a
+# string, and jq exit non-zero — which on coderabbit-wait's clearance path
+# surfaced as exit 5, `rate_limit_stalled`, mislabelling an infra fault as a
+# provider state.
+#
+# ORDER IS THE WHOLE POINT. Judging the FLATTENED value is too late, because
+# `add // []` manufactures the very array it would then be asked to judge: a
+# body of the JSON value `null`, an EMPTY body, and a `--paginate` stream of
+# only `null`s all reduce to `null` under `add` and are rewritten to `[]` by
+# the fallback, after which `type` reports `array` and the caller reads a
+# confident zero. A `null` page MIXED with real pages is worse — `add` skips
+# it in silence, so a partially unreadable pagination looks complete. The RAW
+# stream is therefore judged first: at least one document, and every document
+# an array. A genuinely empty page (`[]`) is one array document and still
+# passes, which is the distinction a test on the flattened value structurally
+# cannot make.
+#
+# Only the raw-stream judgement exists, and that is deliberate: once every
+# document is known to be an array, `add` over a non-empty list of arrays is
+# an array, the `// []` fallback cannot fire, and a second assertion on the
+# flattened value would be unreachable by construction rather than a
+# belt-and-braces check.
+#
+# An unparseable stream keeps the FLATTEN wording it has always had, because
+# it is the same condition the flatten would have reported; the new #967
+# message is emitted only when the stream parses and its documents are not
+# arrays, so the diagnostic can NAME the shape received.
+#
+# The array case #936 covers (`[42]`: a real array whose ELEMENTS are not
+# comment objects) is a neighbour of this, not the same thing — that one is
+# caught by the per-item derive guards, which only run once something has
+# already agreed the value is a list.
 #
 # Sourcing contract: NO top-level side effects, only function definitions. No
 # shell options are set — a sourced file must not change its caller's `set`
@@ -175,6 +219,26 @@ gh_api_array() {
     # see "Reconciled drift" note 1 above.
     GH_API_ARRAY_ERROR="failed to fetch $label: $GH_API_ARRAY_DETAIL"
     GH_API_ARRAY_ERROR_KIND="fetch"
+    return 3
+  fi
+
+  # #967: judge the RAW stream before the empty-list fallback can manufacture
+  # an array out of it — see "The third response mode" above. A probe failure
+  # here is a PARSE failure, i.e. exactly what the flatten below would have
+  # reported, so it keeps the flatten wording and kind rather than inventing a
+  # second name for one condition.
+  local shape=""
+  shape=$(printf '%s\n' "$raw" | jq -rs 'if length == 0 then "no JSON documents at all"
+                                         elif any(.[]; type != "array") then
+                                           "a stream of " + ([.[] | type] | unique | join("+")) + " values"
+                                         else "array" end' 2>/dev/null) || {
+    GH_API_ARRAY_ERROR="failed to flatten $label pagination output${GH_API_ARRAY_DETAIL:+ (gh stderr: $GH_API_ARRAY_DETAIL)}"
+    GH_API_ARRAY_ERROR_KIND="flatten"
+    return 3
+  }
+  if [ "$shape" != "array" ]; then
+    GH_API_ARRAY_ERROR="$label ($endpoint) came back as $shape, not a stream of JSON arrays — the response was READ but is UNUSABLE as a list, so it is reported as a failed read rather than as an empty result (#967). The empty-list fallback is deliberately NOT applied here: it would turn an unreadable response into a confident zero."
+    GH_API_ARRAY_ERROR_KIND="shape"
     return 3
   fi
 
