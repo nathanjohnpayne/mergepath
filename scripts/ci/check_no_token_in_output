@@ -85,6 +85,10 @@
 #     variable; it cannot connect that line to the `cat` that prints it.
 #   * `set -x` traces, `env` dumps, core dumps, or anything the shell emits
 #     on its own.
+#   * A command that prints something the token names but does not
+#     interpolate: `cat "$LOGFILE"`, `grep "$PAT" file`, an editor, a
+#     pager. Only the commands listed under "What counts as output" above
+#     are output commands.
 #   * Any file this check does not scan: non-shell files, and everything
 #     outside scripts/** and tests/**.
 #
@@ -101,16 +105,26 @@
 # a guarantee: NONE of the three leaks #993 fixed would have been caught by
 # this gate at their original sites, because all three reached the token
 # under another name or through a file. What this gate guarantees is
-# narrower and permanent — the direct form cannot come back silently,
-# including when it is wrapped across a backslash continuation.
+# narrower and permanent — the direct form cannot come back silently. That
+# holds across the near-misses that are re-wrappings rather than
+# indirections, each pinned by a self-test case: a backslash continuation
+# between the emitter and its argument, a path-qualified emitter
+# (`/bin/echo`), a here-string (`cat <<< "$PAT"`), and a `tee` here-doc.
 #
 # ── What counts as "output" ──────────────────────────────────────────────
 #
-#   * `echo` / `printf` at a command position.
+#   * `echo` / `printf` at a command position. Command words are matched by
+#     BASENAME, so `/bin/echo` is the same emitter — the rule
+#     scripts/hooks/gh-pr-guard.sh adopted in #611 r10.
 #   * An in-file message helper: a function whose body writes one of its
 #     own positional parameters verbatim through echo/printf.
 #   * The body of an INTERPOLATING here-doc (unquoted delimiter) opened by
-#     `cat` or an emitter — the shell expands those lines at write time.
+#     `cat`, `tee` or an emitter — the shell expands those lines at write
+#     time, and `tee` puts them on stdout as well as in the file.
+#   * The word of a here-STRING given to one of those same commands:
+#     `cat <<< "$GH_TOKEN"` reaches a stream exactly as `echo` does. A
+#     here-string handed to anything else (`grep -q x <<< "$V"`) is not
+#     output and is not flagged.
 #
 # A value captured by a command substitution is NOT output: in
 # `_v=$(printf '%s' "$GH_TOKEN")` the value goes into a variable, not onto
@@ -345,6 +359,12 @@ function writes_own_args(line,   s, seg) {
 
 function is_emitter(w) { return (w in EMITBASE) || (w in EMITFN) }
 
+# Command words are matched by BASENAME, the same rule scripts/hooks/
+# gh-pr-guard.sh adopted in #611 r10: `/bin/echo "$GH_TOKEN"` runs the same
+# emitter as `echo "$GH_TOKEN"`, and a path prefix is not indirection — no
+# rename, no capture, no file.
+function basename(w) { sub(/^.*\//, "", w); return w }
+
 # ── Pass 2: the scan ─────────────────────────────────────────────────────
 function scan_lines(   i, line, hit, trimmed, href) {
   hd_term = ""; hd_scan = 0
@@ -363,12 +383,16 @@ function scan_lines(   i, line, hit, trimmed, href) {
       # the ordinary line scan too, quoted delimiter or not.
       else if (!exempt(line) && !comment(line) && (hit = walk(line)) != "")
         report(i, hit, line, "output command")
+      else if (!exempt(line) && !comment(line) && (hit = herestring_hit(line)) != "")
+        report(i, hit, line, "here-string")
       note_heredoc(line)
       continue
     }
 
     if (!comment(line) && !exempt(line) && (hit = walk(line)) != "")
       report(i, hit, line, "output command")
+    else if (!comment(line) && !exempt(line) && (hit = herestring_hit(line)) != "")
+      report(i, hit, line, "here-string")
     note_heredoc(line)
   }
 }
@@ -395,7 +419,7 @@ function note_heredoc(line,   w) {
   if (!heredoc_open(line)) return
   hd_term = HD_NEW_TERM
   w = first_command_word(line)
-  hd_scan = (!HD_NEW_QUOTED && (w == "cat" || is_emitter(w))) ? 1 : 0
+  hd_scan = (!HD_NEW_QUOTED && (w == "cat" || w == "tee" || is_emitter(w))) ? 1 : 0
 }
 
 # Parse a here-doc opener: sets HD_NEW_TERM / HD_NEW_QUOTED and returns 1
@@ -437,8 +461,8 @@ function first_command_word(line,   s, w) {
       sub(/^[^[:space:]]+[[:space:]]*/, "", s)
       continue
     }
-    if (w !~ /^[A-Za-z_][A-Za-z0-9_.\/-]*$/) return ""
-    return w
+    if (w !~ /^\/?[A-Za-z_][A-Za-z0-9_.\/-]*$/) return ""
+    return basename(w)
   }
   return ""
 }
@@ -457,6 +481,27 @@ function heredoc_ref(line,   i, c, n2, esc, j) {
     i = j
   }
   return ""
+}
+
+# ── Here-strings ─────────────────────────────────────────────────────────
+# `cat <<< "$GH_TOKEN"` puts the word on a stream exactly as
+# `echo "$GH_TOKEN"` does, but the word sits after a redirection operator,
+# so the ordinary walk reads it at argument position under a command it
+# does not classify as an emitter. The here-doc parser deliberately skips
+# any line carrying `<<<` (a here-string is not a here-doc), so the word is
+# checked here instead — only when the command word is itself an output
+# command, and by re-reading the word through the ordinary walk so the
+# quoting, `${#VAR}` and `${VAR:+set}` rules stay identical.
+#
+# A CAPTURED here-string (`v=$(cat <<< "$PAT")`) has no command word at the
+# top level, so first_command_word returns "" and it stays legal — the same
+# capture-versus-emit rule the walk applies.
+function herestring_hit(line,   p, cmd) {
+  p = index(line, "<<<")
+  if (p == 0) return ""
+  cmd = first_command_word(line)
+  if (cmd != "cat" && cmd != "tee" && !is_emitter(cmd)) return ""
+  return walk("echo " substr(line, p + 3))
 }
 
 # ── The line walk ────────────────────────────────────────────────────────
@@ -527,7 +572,7 @@ function flush_word(w, depth) {
   if (!cmdpos[depth]) return
   if (w ~ /^[A-Za-z_][A-Za-z0-9_]*=/) return   # assignment prefix
   if (w in PASSTHRU) return
-  if (is_emitter(w)) emit[depth] = 1
+  if (is_emitter(basename(w))) emit[depth] = 1
   cmdpos[depth] = 0
 }
 
@@ -793,6 +838,21 @@ prefix \\
 EOF
 authorization: ${DS}GH_TOKEN
 EOF"
+  # ── Emitters reached without an `echo`/`printf` word at the head of the
+  # line. None of these is indirection — no rename, no capture, no file —
+  # so each belongs to the direct form this gate claims to hold.
+  assert_flagged "a here-string writes its word to a stream" \
+    'cat <<< "$GH_TOKEN"'
+  assert_flagged "a path-qualified emitter is the same emitter" \
+    '/bin/echo "$GH_TOKEN"'
+  assert_flagged "a path-qualified here-doc opener is the same opener" \
+    "/bin/cat <<EOF
+authorization: \$GH_TOKEN
+EOF"
+  assert_flagged "tee writes an interpolating here-doc body to stdout" \
+    "tee /dev/null <<EOF
+authorization: \$GH_TOKEN
+EOF"
   assert_flagged "a quoted here-doc still closes after a continued body line" \
     "cat > \"\$dir/gh\" <<\"GH_STUB\"
 printf stub \\
@@ -831,6 +891,12 @@ echo \"- token: \$(key_state \"\${ANTHROPIC_AUTH_TOKEN:-}\")\""
 \$GH_TOKEN
 EOF
 )"
+  assert_clean "a captured here-string stores the value, it does not emit it" \
+    '_v=$(cat <<< "$GH_TOKEN")'
+  assert_clean "a here-string consumed by a non-output command is out of scope" \
+    'grep -Fq needle <<< "$GH_TOKEN"'
+  assert_clean "a here-string carrying only a length" \
+    'cat <<< "len=${#GH_TOKEN}"'
   assert_clean "quoted here-doc body that is not shell output" \
     "cat <<\"EOF\"
 Set GH_TOKEN=\$OP_PREFLIGHT_REVIEWER_PAT before running.
