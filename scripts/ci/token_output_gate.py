@@ -2156,6 +2156,21 @@ CORPUS = [
     ),
     # --- redirection to a file is still an emission ----------------------
     ("emitter-to-file", MUST_FLAG, "printf '%s\\n' \"$GH_TOKEN\" > out.txt\n"),
+    # The capture shield asks "does a redirection escape the $( )?" with
+    # `_OUT_REDIR_RE`, which matches ANY descriptor -- so a redirection that
+    # moves only fd 2 counts, and neither of these two puts anything on a
+    # stream.  Both are declared in KNOWN_BROADER; the pipeline branch of the
+    # same function already asks the fd-aware question (`redirects_stdout`).
+    (
+        "capture-stderr-only-redirection",
+        MUST_FLAG,
+        "v=$(printf '%s' \"$GH_TOKEN\" 2>/dev/null)\necho ok\n",
+    ),
+    (
+        "capture-stderr-onto-stdout",
+        MUST_FLAG,
+        "v=$(printf '%s' \"$GH_TOKEN\" 2>&1)\necho ok\n",
+    ),
     # ======================================================================
     # Clean direction
     # ======================================================================
@@ -2749,6 +2764,24 @@ KNOWN_BROADER = {
         "nothing to a stream and is flagged anyway -- the same defect class "
         "the pipeline fix closed, surviving at a second call site"
     ),
+    # -- the capture shield's descriptor blindness (#1042).  `reaches_output`
+    #    asks "does a redirection escape?" twice and answers it two ways: the
+    #    PIPELINE branch uses `redirects_stdout`, which is anchored on an
+    #    optional 0/1 descriptor, and the CAPTURE branch uses the
+    #    `_OUT_REDIR_RE` result, which matches any descriptor.  Both entries
+    #    go STALE when #1042 lands.
+    "capture-stderr-only-redirection": (
+        "`$( )` captures STANDARD OUTPUT and `2>/dev/null` discards standard "
+        "error, so nothing reaches a stream -- but the capture branch counts "
+        "any output redirection, not only one that moves fd 1.  The pipeline "
+        "spelling of the same line is already clean, which is what makes this "
+        "an inconsistency rather than a chosen conservatism"
+    ),
+    "capture-stderr-onto-stdout": (
+        "the same descriptor blindness reached the other way: `2>&1` folds "
+        "standard error INTO the captured standard output, so the capture "
+        "swallows both streams and the redirection escapes nothing"
+    ),
     "procsub-input-into-filter": (
         "an INPUT process substitution is judged a standalone output path: "
         "the `<(...)` body is graded on its own with no model of the fd's "
@@ -2838,11 +2871,18 @@ def run_oracle(body, workdir, name, shebang=None, run_via=None):
         "LC_ALL": "C",
         "TMPDIR": workdir,
     }
-    # Construct fixtures are handed to `bash` by name.  Executing the freshly
+    # Construct fixtures are handed to `bash` BY NAME.  Executing the freshly
     # written file through its own shebang costs ~200ms per fixture on macOS
     # (the first exec of a new file goes through a security check), and the
-    # shebang is not what a construct case is measuring; the file-selection
-    # axis passes run_via=None precisely so the shebang IS exercised.
+    # shebang is not what a construct case is measuring.
+    #
+    # An EMPTY `run_via` is what runs the file ITSELF, so the kernel picks the
+    # interpreter out of the shebang; the file-selection axis passes
+    # `run_via=[]` for exactly that reason.  `run_via=None` means "not
+    # specified" and takes the resolved bash, so a shebang fixture handed the
+    # default would be measured under bash no matter what its own first line
+    # says -- which is what it WAS doing before #1032, under a comment here
+    # claiming the opposite.
     argv = (run_via if run_via is not None else [oracle_bash()[0] or "bash"]) + [path]
     try:
         proc = subprocess.run(
@@ -3176,7 +3216,11 @@ def _file_selection_cases(tmp):
 
     The oracle here runs the file THROUGH ITS OWN SHEBANG, so the axis under
     test is the file-selection one: whichever interpreter the kernel picks is
-    the one whose verdict the discovery has to match.
+    the one whose verdict the discovery has to match.  When the named
+    interpreter is not installed on the machine running the suite the launch
+    fails, and the case falls back to the resolved bash and says so in any
+    failure it reports -- a fixture that could not be launched is never scored
+    as a clean one.
     """
     failures = []
     body = 'echo "$GH_TOKEN"\n'
@@ -3204,16 +3248,38 @@ def _file_selection_cases(tmp):
                     "reported" % cid
                 )
             # Ground truth: does the kernel actually run this file, and does
-            # the sentinel reach a stream when it does?
+            # the sentinel reach a stream when it does?  `run_via=[]` runs the
+            # file ITSELF, so the interpreter is whichever one the shebang
+            # names -- which is the whole axis this case is about.
             leaked, _out, _err = run_oracle(
                 "", root, os.path.join("scripts", filename),
-                shebang=header + body, run_via=None,
+                shebang=header + body, run_via=[],
             )
-            if leaked is False:
+            ran_as = "its own shebang"
+            if leaked is not True:
+                # The shebang did not carry the file to a working interpreter
+                # HERE, in one of the two ways that shows up: the launch
+                # raised (the named interpreter is absent -- `dash`, `ksh`
+                # and `zsh` are not on every runner, and a no-shebang fixture
+                # is ENOEXEC by construction), or something ran and wrote
+                # nothing (macOS `env` rejects GNU's `--split-string`).
+                #
+                # That is an environment fact rather than a verdict about
+                # file selection, so the case falls back to the resolved bash
+                # and RECORDS which interpreter answered.  What it must not
+                # do is score the non-answer as clean, which is what testing
+                # only `is False` -- and never `is None` -- quietly did.
+                leaked, _out, _err = run_oracle(
+                    "", root, os.path.join("scripts", filename),
+                    shebang=header + body,
+                )
+                ran_as = "the resolved bash (its shebang did not run it here)"
+            if leaked is not True:
                 failures.append(
-                    "file-selection %s: the interpreter ran the file and the "
-                    "sentinel did NOT reach a stream -- the fixture is not "
-                    "measuring what it claims" % cid
+                    "file-selection %s: ran under %s and the sentinel did NOT "
+                    "reach a stream -- the fixture is not measuring what it "
+                    "claims (%s)"
+                    % (cid, ran_as, (_err or "").strip() or "no stderr")
                 )
         else:
             if count != 0:
