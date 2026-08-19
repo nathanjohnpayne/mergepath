@@ -2050,6 +2050,21 @@ else
   fail "escaped protected key missed: rc=$RC out=$OUT"
 fi
 
+# Case 65l: the escape may stand INSIDE the key, not just before it
+# (CodeRabbit, #1011). The shell removes an unquoted backslash escape at
+# any position in the word, so `git config us\er.email x` hands Git
+# `user.email` too — a rule that only stripped a single LEADING
+# backslash missed this one.
+run_on_fixture "tests/internally-escaped-key.sh" '#!/usr/bin/env bash
+git config us\er.email "leak@example.com"
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/internally-escaped-key.sh:2:"; then
+  pass "internally-escaped protected key: reported"
+else
+  fail "internally-escaped protected key missed: rc=$RC out=$OUT"
+fi
+
 # ── Linked worktrees: identity lives in every one of them (#806) ───────
 
 # Case 66: `git config --worktree` reads the INVOKING worktree's

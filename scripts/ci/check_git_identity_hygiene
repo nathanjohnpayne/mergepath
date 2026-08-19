@@ -1394,20 +1394,33 @@ else
     # receives — does not match.
     #
     # A key quoted in PART (`user.\047email\047`, `"user".email`,
-    # `us"er".email`) is handled by working on WORDS rather than a single
-    # regular expression: the piece is split on whitespace into its
-    # command-line words (the same boundary the comment above already
-    # relies on), and each word has every quote character removed —
-    # wherever in the word it falls, however many there are — before the
-    # comparison against the five protected keys. Comparing the DEQUOTED
-    # WORD for exact equality is what keeps the subsection class shut: a
-    # quote is only ever stripped from within an already-bounded word, so
-    # `foo.bar/user.email` and `"foo.bar/user".email` both dequote to a
-    # string carrying the `foo.bar/` prefix, which is never equal to
-    # `user.email`. Stripping characters out of the middle of a string
-    # and then substring-searching it was the earlier half-rule that let
-    # the subsection cases back in twice (see #917); exact equality
-    # against the whole word is what this rewrite adds to make that safe.
+    # `us"er".email`) or escaped in part (`us\\er.email`) is handled by
+    # working on WORDS rather than a single regular expression: the piece
+    # is split on whitespace into its command-line words (the same
+    # boundary the comment above already relies on), and each word has
+    # every quote character AND every backslash removed — wherever in the
+    # word either falls, however many there are — before the comparison
+    # against the five protected keys. The shell removes an unquoted
+    # backslash escape at ANY position, not only at the start of a word
+    # (`git config us\er.email x` hands Git `user.email`), so a rule that
+    # stripped only a single leading backslash missed every internal
+    # escape (CodeRabbit, #1011). Stripping every backslash is safe here
+    # specifically because none of the five protected keys ever legitimately
+    # contains one: the comparison below is EXACT-equality against those
+    # fixed alnum-and-dot strings, so a word that dequotes to one of them
+    # after backslash removal really did hand Git that key, and a word
+    # that still carries extra characters afterward (an actual literal
+    # backslash from a doubled escape included) still fails the equality
+    # check exactly as before. Comparing the DEQUOTED WORD for exact
+    # equality is what keeps the subsection class shut: a quote or
+    # backslash is only ever stripped from within an already-bounded
+    # word, so `foo.bar/user.email` and `"foo.bar/user".email` both
+    # dequote to a string carrying the `foo.bar/` prefix, which is never
+    # equal to `user.email`. Stripping characters out of the middle of a
+    # string and then substring-searching it was the earlier half-rule
+    # that let the subsection cases back in twice (see #917); exact
+    # equality against the whole word is what this rewrite adds to make
+    # that safe.
     function key_assign_pos(s,   n, i, start, end, word, dq, rest) {
       n = length(s)
       i = 1
@@ -1419,8 +1432,7 @@ else
         end = i - 1
         word = substr(s, start, end - start + 1)
         dq = tolower(word)
-        gsub(/["\047]/, "", dq)
-        sub(/^\\/, "", dq)
+        gsub(/["\047\\]/, "", dq)
         if (dq ~ /^(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)$/) {
           # The key must be followed by a value token: `$(git config
           # user.email)` has nothing after the key and never matches.
