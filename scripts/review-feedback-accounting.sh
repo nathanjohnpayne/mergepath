@@ -283,10 +283,10 @@ agent_reply_after_finding() {
         ((.in_reply_to_id // .id) == $root)
         and ((.created_at // "") >= $floor)
         and ((.user.login // "") as $login | ($agents | index($login)) != null)
-        and (((.body // "") | gsub("^[[:space:]]+|[[:space:]]+$"; "")
+        and (((.body // "") | gsub("\\[mergepath-resolve:[^]]*\\]"; "")
+          | gsub("^[[:space:]]+|[[:space:]]+$"; "")
           | gsub("[[:space:]]+"; " ")) as $body
-          | ($body | startswith("[mergepath-resolve:") | not)
-          and (($body | length) >= 12)
+          | (($body | length) >= 12)
           and (([$body | scan("[[:alnum:]][[:alnum:]_-]*")] | length) >= 2)))
     ' >/dev/null 2>&1
 }
@@ -457,14 +457,10 @@ RESULT=$(printf '%s\n%s\n' "$FINDINGS" "$MISSING" | jq -c -s \
 
 if [ "$MISSING_COUNT" -gt 0 ]; then
   echo "[review-feedback-accounting] $ACCOUNTED/$POSTED findings accounted; $MISSING_COUNT still undispositioned." >&2
-  printf '%s' "$MISSING" | jq -r --arg codex "$CODEX_BOT" '
+  printf '%s' "$MISSING" | jq -r '
     .[] |
     if .kind == "inline" then
-      if .reviewer == $codex then
-        "  - inline \(.reviewer) \(.tier) finding \(.finding_id) at \(.path):\(.line // "?"): post a substantive disposition reply on the thread"
-      else
-        "  - inline \(.reviewer) \(.tier) finding \(.finding_id) at \(.path):\(.line // "?"): post a substantive disposition reply on the thread"
-      end
+      "  - inline \(.reviewer) \(.tier) finding \(.finding_id) at \(.path):\(.line // "?"): post a substantive disposition reply on the thread"
     elif .kind == "review-body" then
       "  - review-body \(.reviewer) \(.tier) finding in review \(.review_id): post a PR comment whose first line is\n      \(.ack_token)\n    with the fix/rebuttal/deferral rationale below it"
     else

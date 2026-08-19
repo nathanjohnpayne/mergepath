@@ -132,6 +132,17 @@ fi
 # shellcheck source=lib/gh-api-array.sh
 . "$__P1_GATE_DIR/lib/gh-api-array.sh"
 
+# The issue-comment head-drift fence reads one SHA. Keep gh's stderr separate
+# from that machine-readable value through the shared scalar contract (#799,
+# #1008); benign retry/deprecation chatter on a successful request must not
+# turn this required check into a false hard failure.
+if [ ! -r "$__P1_GATE_DIR/lib/gh-api-scalar.sh" ]; then
+  echo "ERROR: gh-api-scalar helper missing: $__P1_GATE_DIR/lib/gh-api-scalar.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-api-scalar.sh
+. "$__P1_GATE_DIR/lib/gh-api-scalar.sh"
+
 # Read a scalar field nested inside `codex:` `<sub_block>:` `<field>:`.
 # Same state-machine awk pattern as codex-review-check.sh, but tracks
 # nesting one level deeper for the `p1_gate` sub-block.
@@ -302,10 +313,9 @@ run_feedback_accounting_gate
 # it here. Refuse an evaluation that crossed a synchronize boundary; otherwise
 # an old-head success could be published against the new head commit (#1000).
 if [ -n "${CODEX_P1_EXPECTED_HEAD_SHA:-}" ]; then
-  EXPECTED_HEAD_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) \
-    || die 2 "failed to re-read PR head for drift check: $EXPECTED_HEAD_JSON"
-  OBSERVED_HEAD_SHA=$(printf '%s' "$EXPECTED_HEAD_JSON" | jq -r '.head.sha // empty' 2>/dev/null) \
-    || die 2 "failed to parse PR head for drift check"
+  OBSERVED_HEAD_SHA=$(gh_api_scalar --shape sha "PR head for drift check" \
+    "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha // empty') \
+    || die 2 "failed to re-read PR head for drift check"
   [ -n "$OBSERVED_HEAD_SHA" ] || die 2 "PR head was empty during drift check"
   [ "$OBSERVED_HEAD_SHA" = "$CODEX_P1_EXPECTED_HEAD_SHA" ] \
     || die 2 "PR head drifted during gate evaluation (expected $CODEX_P1_EXPECTED_HEAD_SHA, observed $OBSERVED_HEAD_SHA)"

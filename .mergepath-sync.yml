@@ -535,6 +535,7 @@ paths:
     requires:
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/lib/gh-api-scalar.sh"   # #1008, head-drift SHA read keeps stderr separate
       - "scripts/review-feedback-accounting.sh"   # #1000, top-level review-body CI backstop
   # CodeRabbit twin of codex-p1-gate.sh (#577). Run directly by
   # .github/workflows/coderabbit-severity-gate.yml and by scripts/ci/

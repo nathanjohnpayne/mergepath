@@ -109,12 +109,14 @@ if [ "$1" = "api" ]; then
   # reviewThreads query and a per-thread `node(id:...)` comments query; each
   # can page via -f cursor=<value>.
   q=""
+  jq_filter=""
   cursor="__none__"
   node_id="__none__"
   prev=""
   for a in "$@"; do
     case "$prev" in
       query=*) : ;;  # handled below via the value directly
+      --jq) jq_filter="$a" ;;
     esac
     case "$a" in
       query=*) q="${a#query=}" ;;
@@ -153,7 +155,12 @@ if [ "$1" = "api" ]; then
       exit 0
       ;;
     repos/*/pulls/*)
-      cat "${FIXTURE_PR:-/dev/null}"
+      [ -n "${GH_SUCCESS_STDERR:-}" ] && printf '%s\n' "$GH_SUCCESS_STDERR" >&2
+      if [ -n "$jq_filter" ]; then
+        jq -r "$jq_filter" "${FIXTURE_PR:-/dev/null}"
+      else
+        cat "${FIXTURE_PR:-/dev/null}"
+      fi
       exit 0
       ;;
   esac
@@ -372,6 +379,7 @@ run_gate() {
     PATH="$STUB_DIR:$PATH" \
       GH_TOKEN="dummy-token" \
       GH_CALLS_LOG="$WORKDIR/gh-calls.log" \
+      GH_SUCCESS_STDERR="${GH_SUCCESS_STDERR:-}" \
       "$SCRIPT" "$@"
   )
 }
@@ -449,9 +457,9 @@ fi
 echo
 echo "--- Test 1e (#1000): expected-head mutation fails closed before publication"
 SCRATCH=$(make_scratch_with_config false)
-FIXTURE_PR=$(make_pr_fixture "new-head-sha")
+FIXTURE_PR=$(make_pr_fixture "bbbb2222")
 set +e
-OUT=$(CODEX_P1_EXPECTED_HEAD_SHA="old-head-sha" FIXTURE_PR="$FIXTURE_PR" \
+OUT=$(CODEX_P1_EXPECTED_HEAD_SHA="aaaa1111" FIXTURE_PR="$FIXTURE_PR" \
   run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
@@ -459,6 +467,22 @@ if [ "$RC" = 2 ] && echo "$OUT" | grep -q 'PR head drifted during gate evaluatio
   pass "#1000: a synchronize during issue-comment evaluation fails closed"
 else
   fail "#1000 expected-head drift guard (rc=$RC, out=$OUT)"
+fi
+
+echo
+echo "--- Test 1f (#1008): drift read keeps successful stderr out of the SHA payload"
+SCRATCH=$(make_scratch_with_config false)
+FIXTURE_PR=$(make_pr_fixture "cafe1234")
+set +e
+OUT=$(CODEX_P1_EXPECTED_HEAD_SHA="cafe1234" FIXTURE_PR="$FIXTURE_PR" \
+  GH_SUCCESS_STDERR="benign gh retry notice" \
+  run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q 'Codex blocking-tier unresolved: 0'; then
+  pass "#1008: successful drift read ignores gh stderr chatter"
+else
+  fail "#1008 drift-read stream isolation (rc=$RC, out=$OUT)"
 fi
 
 # Control: enabled legacy scan + no env errors for the same reason.

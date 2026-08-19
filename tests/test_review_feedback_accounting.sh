@@ -227,12 +227,20 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
     "user": {"login": "nathanpayne-codex"},
     "path": "src/a.sh",
     "line": 12,
-    "body": "[mergepath-resolve: addressed-elsewhere] addressed by abc1234"
+    "body": "[mergepath-resolve: addressed-elsewhere]"
   }
 ]
 JSON
 run_gate
 assert_eq 1 "$RUN_RC" "generated resolve marker is not disposition evidence"
+jq '.[1].body = "[mergepath-resolve: addressed-elsewhere] Fixed by the validated guard change."' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline-with-resolve-rationale.json"
+mv "$TMP/fixtures/inline-with-resolve-rationale.json" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "substantive rationale beside a resolve marker remains disposition evidence"
+jq '.[1].body = "[mergepath-resolve: addressed-elsewhere]"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline-marker-only.json"
+mv "$TMP/fixtures/inline-marker-only.json" "$TMP/fixtures/inline.json"
 
 cat >"$TMP/codex-ledger.jsonl" <<'JSON'
 {"repo":"acme/widget","comment_id":10,"verdict":"fixed","recorded_at":"2026-08-18T20:03:00Z"}
