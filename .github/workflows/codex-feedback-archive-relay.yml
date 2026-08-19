@@ -281,7 +281,7 @@ jobs:
           fi
 
           close_rc=0
-          if [ -n "$CHECK_ID" ]; then
+          if [ -n "$CHECK_ID" ] && [ "$latest_status" != complete ]; then
             close_rc=1
             for attempt in 1 2 3; do
               if gh api --method PATCH "repos/$REPO/check-runs/$CHECK_ID" \

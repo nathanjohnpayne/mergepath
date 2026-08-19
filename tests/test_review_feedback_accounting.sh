@@ -859,6 +859,52 @@ mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 0 "$RUN_RC" "post-edit acknowledgement reconciles a reverted review-body finding"
 
+# A second edit can archive an intermediate body after the acknowledgement
+# above. The live body has returned to the same A fingerprint, but the latest
+# edit of this review source is now the B -> A transition. The A acknowledgement
+# must not clear that later re-raise merely because the intermediate B archive
+# has a different fingerprint.
+INTERMEDIATE_REVIEW="$TMP/intermediate-review.txt"
+printf '%s\n' '### Codex Review' '' \
+  '![P2 Badge] Different finding while the original A finding is removed.' \
+  >"$INTERMEDIATE_REVIEW"
+INTERMEDIATE_REVIEW_ARCHIVE=$("$RENDER_ARCHIVE" review-body 900 \
+  'chatgpt-codex-connector[bot]' '2026-08-18T22:14:00Z' "$INTERMEDIATE_REVIEW")
+INTERMEDIATE_REVIEW_ARCHIVE_DATA=$(printf '%s' "$INTERMEDIATE_REVIEW_ARCHIVE" \
+  | sed -E 's/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/' \
+  | jq -Rr '@base64d | fromjson')
+INTERMEDIATE_REVIEW_ACK="[mergepath-review-ack: 900 $(printf '%s' \
+  "$INTERMEDIATE_REVIEW_ARCHIVE_DATA" | jq -r '.body_fingerprint')]"
+jq --arg archive "$INTERMEDIATE_REVIEW_ARCHIVE" '. + [{
+  "id": 908,
+  "created_at": "2026-08-18T22:14:01Z",
+  "updated_at": "2026-08-18T22:14:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "A to B to A review re-raise rejects acknowledgement before the latest source edit"
+assert_eq "2026-08-18T22:14:00Z" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].updated_at')" \
+  "re-raised review body uses the latest archive timestamp for the review source"
+jq --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" \
+  --arg intermediate_token "$INTERMEDIATE_REVIEW_ACK" '. + [{
+  "id": 909,
+  "created_at": "2026-08-18T22:15:00Z",
+  "updated_at": "2026-08-18T22:15:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nDispositioned the re-raised review after its latest source edit.")
+}, {
+  "id": 910,
+  "created_at": "2026-08-18T22:15:00Z",
+  "updated_at": "2026-08-18T22:15:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($intermediate_token + "\nDispositioned the archived intermediate review finding too.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "strictly later acknowledgement reconciles an A to B to A review re-raise"
+
 reset_fixtures
 cat >"$TMP/fixtures/issues.json" <<'JSON'
 [
@@ -933,7 +979,7 @@ EXPECTED_ARCHIVE_ACK="[mergepath-comment-ack: 8000 $ARCHIVE_FINGERPRINT]"
 
 PREVIOUS_ARCHIVE="$TMP/previous-archive-marker.txt"
 printf '%s\n' "$ARCHIVE_MARKER" >"$PREVIOUS_ARCHIVE"
-RESTORED_ARCHIVE=$($RENDER_ARCHIVE issue-comment 8002 'github-actions[bot]' \
+RESTORED_ARCHIVE=$("$RENDER_ARCHIVE" issue-comment 8002 'github-actions[bot]' \
   '2026-08-18T22:23:02Z' "$PREVIOUS_ARCHIVE")
 assert_eq "$ARCHIVE_MARKER" "$RESTORED_ARCHIVE" "archive-marker mutation re-emits the immutable history record"
 
@@ -943,12 +989,12 @@ assert_eq "$ARCHIVE_MARKER" "$RESTORED_ARCHIVE" "archive-marker mutation re-emit
 for relay_status in failed complete; do
   RELAY_MARKER="<!-- mergepath-feedback-archive-relay:v1 run=12345 status=$relay_status -->"
   printf '%s\n' "$RELAY_MARKER" >"$PREVIOUS_ARCHIVE"
-  RESTORED_RELAY_MARKER=$($RENDER_ARCHIVE issue-comment 8002 'github-actions[bot]' \
+  RESTORED_RELAY_MARKER=$("$RENDER_ARCHIVE" issue-comment 8002 'github-actions[bot]' \
     '2026-08-18T22:23:03Z' "$PREVIOUS_ARCHIVE")
   assert_eq "$RELAY_MARKER" "$RESTORED_RELAY_MARKER" "relay $relay_status marker mutation re-emits the terminal record"
 done
 printf '%s\n' "$RELAY_MARKER" >"$PREVIOUS_ARCHIVE"
-SPOOFED_RELAY_RESTORE=$($RENDER_ARCHIVE issue-comment 8002 nathanjohnpayne \
+SPOOFED_RELAY_RESTORE=$("$RENDER_ARCHIVE" issue-comment 8002 nathanjohnpayne \
   '2026-08-18T22:23:03Z' "$PREVIOUS_ARCHIVE")
 assert_eq "" "$SPOOFED_RELAY_RESTORE" "non-Actions relay marker cannot be promoted into a trusted record"
 
@@ -1033,7 +1079,7 @@ LARGE_ARCHIVE_BODY="$TMP/large-archive-body.txt"
   printf '**P1** Large archived finding. '
   awk 'BEGIN { for (i = 0; i < 65500; i++) printf "%c", 92 }'
 } >"$LARGE_ARCHIVE_BODY"
-LARGE_ARCHIVE=$($RENDER_ARCHIVE inline 8600 'chatgpt-codex-connector[bot]' \
+LARGE_ARCHIVE=$("$RENDER_ARCHIVE" inline 8600 'chatgpt-codex-connector[bot]' \
   '2026-08-18T22:25:30Z' "$LARGE_ARCHIVE_BODY")
 assert_match '^<!-- mergepath-feedback-archive:v2 ' "$(printf '%s\n' "$LARGE_ARCHIVE" | sed -n '1p')" "oversized archive uses chunked v2 records"
 if [ "$(printf '%s\n' "$LARGE_ARCHIVE" | awk 'END { print NR }')" -gt 1 ]; then
@@ -1043,7 +1089,7 @@ else
 fi
 FIRST_LARGE_ARCHIVE=$(printf '%s\n' "$LARGE_ARCHIVE" | sed -n '1p')
 printf '%s\n' "$FIRST_LARGE_ARCHIVE" >"$PREVIOUS_ARCHIVE"
-RESTORED_LARGE_ARCHIVE=$($RENDER_ARCHIVE issue-comment 8601 'github-actions[bot]' \
+RESTORED_LARGE_ARCHIVE=$("$RENDER_ARCHIVE" issue-comment 8601 'github-actions[bot]' \
   '2026-08-18T22:25:31Z' "$PREVIOUS_ARCHIVE")
 if [ "$RESTORED_LARGE_ARCHIVE" = "$FIRST_LARGE_ARCHIVE" ]; then
   pass "chunked archive-marker mutation re-emits the exact record"

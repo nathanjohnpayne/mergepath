@@ -457,11 +457,16 @@ if relay_job.is_a?(Hash)
         run.include?("conclusion=failure")
     end
     cleanup_index = relay_steps.index(cleanup_step)
+    cleanup_run = cleanup_step&.fetch("run", "").to_s
     require_shape.call(
       persist_step&.fetch("id", "").to_s == "persist" &&
         relay_run.include?('echo "check_id=$check_id" >> "$GITHUB_OUTPUT"') &&
         persist_index && cleanup_index && persist_index < cleanup_index,
       "read-only archive relay can abandon an in-progress check lease after persistence failure"
+    )
+    require_shape.call(
+      cleanup_run.match?(/if \[ -n "\$CHECK_ID" \] && \[ "\$latest_status" != complete \]; then/),
+      "read-only relay cleanup can overwrite a completed check after a later artifact cleanup failure"
     )
   end
 end

@@ -733,14 +733,13 @@ while IFS= read -r review; do
   review_id=$(printf '%s' "$review" | jq -r '.id')
   submitted_at=$(printf '%s' "$review" | jq -r '.submitted_at // ""')
   body_fingerprint=$(fingerprint "$body_json")
-  # Review submitted_at is immutable across edits. If the current body returns
-  # to a finding version that was archived earlier, that archive proves a later
-  # raise than submission and invalidates acknowledgements from before the
-  # edit. Matching the source identity as well as id/fingerprint prevents an
-  # unrelated archive from advancing this finding's floor.
+  # Review submitted_at is immutable across edits. Every trusted archive for
+  # this review source proves a later edit, including an intermediate body with
+  # a different fingerprint in an A -> B -> A re-raise. Matching the source
+  # identity and id prevents an unrelated archive from advancing the floor.
   raised_at=$(printf '%s' "$ARCHIVE_ENTRIES" | jq -r \
     --argjson id "$review_id" --arg login "$login" \
-    --arg fingerprint "$body_fingerprint" --arg submitted "$submitted_at" '
+    --arg submitted "$submitted_at" '
       [
         $submitted,
         (
@@ -748,7 +747,6 @@ while IFS= read -r review; do
           | select((.payload.source_kind // "issue-comment") == "review-body")
           | select(.payload.source_comment_id == $id)
           | select(.payload.source_login == $login)
-          | select(.payload.body_fingerprint == $fingerprint)
           | .payload.archived_at
         )
       ]
