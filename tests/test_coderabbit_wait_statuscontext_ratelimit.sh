@@ -1708,17 +1708,30 @@ test_quoted_range_in_chat_reply_does_not_veto_current_head() {
 # `rate_limit` into the `review` default — the one class whose arm clears.
 # Measured on the pre-fix idiom at 245894 bytes: rc 141, class `review`.
 #
-# The fixture is test 1's exactly, with a 200 KiB tail appended. Two assertions
+# The fixture is test 1's exactly, with a ~98 KiB tail appended. Two assertions
 # beyond the exit code, because two predicates on this route share the idiom:
 # the class must be `rate_limit` (classify_comment) AND the notice must be seen
 # to reference HEAD (the fast-path's own `grep -Fq "$HEAD_SHA"`).
+#
+# The size sits inside a WINDOW, and both ends are asserted below. The lower
+# bound is the 64 KiB pipe buffer, without which the case proves nothing. The
+# upper bound is Linux's per-argument `MAX_ARG_STRLEN` — 32 pages, 131072 bytes
+# — because the gh STUB hands this body to `jq --arg body`, which is an exec:
+# a 200 KiB fixture passed on macOS and died on Linux CI with
+# `/usr/bin/jq: Argument list too long`, turning a portability limit of the
+# harness into three product-looking failures. It is the stub's marshalling
+# that is bounded, not the predicate under test; the pure classifier unit in
+# tests/test_coderabbit_wait_status_probe.sh drives 200 KiB through bash
+# builtins and a here-string, where no exec boundary applies.
 test_large_rate_limit_body_still_suppresses_status() {
   local dir rc before=$FAIL pad big
-  pad=$(printf '%*s' 204800 '' | tr ' ' 'x')
+  pad=$(printf '%*s' 100000 '' | tr ' ' 'x')
   big="$RATE_LIMIT_BODY_HEADREF
 
 $pad"
   [ "${#big}" -gt 65536 ] || fail "38: the fixture body is not past the pipe buffer (${#big} bytes)"
+  [ "${#big}" -lt 131072 ] \
+    || fail "38: the fixture body exceeds Linux MAX_ARG_STRLEN (${#big} bytes) — the gh stub's jq exec would die with 'Argument list too long' before the predicate is reached"
   dir=$(make_case "headref-rl-large" "$big")
   rc=$(run_case "$dir")
   [ "$rc" != "0" ] \
@@ -1727,7 +1740,7 @@ $pad"
   [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "38: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
   grep -q 'class=rate_limit references current HEAD' "$dir/err.log" \
     || fail "38: the large notice was not classified rate_limit AND seen to reference HEAD; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
-  [ "$FAIL" -ne "$before" ] || pass "38: #1005 — a 200 KiB rate-limit notice still classifies rate_limit and still suppresses the StatusContext fast path"
+  [ "$FAIL" -ne "$before" ] || pass "38: #1005 — a rate-limit notice past the 64 KiB pipe buffer still classifies rate_limit and still suppresses the StatusContext fast path"
 }
 
 test_headref_ratelimit_suppresses_status
