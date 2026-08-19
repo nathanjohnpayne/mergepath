@@ -242,10 +242,29 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # ── The closed credential-variable list ──────────────────────────────────
-# Every name here holds live credential material at runtime somewhere in
-# this fleet. Names that merely *mention* a credential (an Actions secret
-# name in a string, a "which token should I use" flag) are deliberately
-# absent — see the header.
+# Every name here DENOTES credential material that this fleet either handles
+# at runtime or asserts about in its own secret-hygiene fixtures. Names that
+# merely *mention* a credential (an Actions secret name in a string, a
+# "which token should I use" flag) are deliberately absent — see the header.
+#
+# The invariant reads "denotes credential material", not "is live here",
+# because the first is a property of the NAME and the second is a property
+# of today's integrations. An earlier round of #1012 declined
+# AZURE_CLIENT_SECRET on the "not live here" reading and was wrong on its
+# own terms: tests/test_phase_4b_automation.sh drives the reviewer-adapter
+# env allow-list with AZURE_CLIENT_SECRET set, so the fleet does assert
+# about it, and a script printing it would have walked past this gate.
+#
+# Four names from that same fixture are still absent, and for a reason that
+# is not "we forgot": GOOGLE_APPLICATION_CREDENTIALS, OP_PREFLIGHT_ADC_TMPFILE
+# and OP_PREFLIGHT_FIREBASE_SA_TMPFILE are FILE PATHS and SSH_AUTH_SOCK is a
+# socket path — printing one leaks no secret, and op-preflight.sh prints
+# GOOGLE_APPLICATION_CREDENTIALS deliberately and without a pragma, so
+# admitting it would red a required check over a legitimate line.
+# AWS_ACCESS_KEY_ID is a public identifier; the paired secret
+# (AWS_SECRET_ACCESS_KEY) appears nowhere in this fleet, in a fixture or
+# otherwise, so adding it would break the invariant above in the other
+# direction.
 TOKEN_NAMES="
 GH_TOKEN
 GITHUB_TOKEN
@@ -262,6 +281,7 @@ LABEL_REMOVAL_TOKEN
 CF_API_TOKEN
 CLOUDFLARE_API_TOKEN
 FIREBASE_TOKEN
+AZURE_CLIENT_SECRET
 ANTHROPIC_AUTH_TOKEN
 CLAUDE_CODE_OAUTH_TOKEN
 OPENAI_API_KEY
@@ -1236,6 +1256,14 @@ printf 'export TOKEN=%q\\n' \\
   # all match a TOKEN/PAT/SECRET heuristic and none holds a credential.
   assert_clean "ack-marker and flag names are not credential names" \
     'echo "$SUMMARY_ACK_TOKEN $ACK_TOKEN $MERGEPATH_EXPECT_READ_GH_TOKEN $REQUIRED_HEAD_CHECK_NAME $CACHE_KEY"'
+  # The list covers the cloud secret the phase-4b env allow-list fixture
+  # asserts about, not only the git-forge tokens.
+  assert_flagged "the cloud client secret the 4b fixture asserts about is on the list" \
+    'echo "$AZURE_CLIENT_SECRET"'
+  # ...and the PATH-valued names from that same fixture stay off it: a path
+  # is not a secret, and op-preflight prints one deliberately.
+  assert_clean "credential FILE PATHS are not credential values" \
+    'echo "$GOOGLE_APPLICATION_CREDENTIALS $OP_PREFLIGHT_ADC_TMPFILE $SSH_AUTH_SOCK $AWS_ACCESS_KEY_ID"'
 
   # An empty file list reads exactly like a clean tree, so a discovery
   # failure must not be silent. Codex measured this on #1012 by shadowing
