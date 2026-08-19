@@ -2005,6 +2005,36 @@ else
   fail "quoted subsection keys falsely flagged: rc=$RC out=$OUT"
 fi
 
+# Case 65j: the key may be quoted in PART, not just as a whole word or
+# not at all (#921). The shell still delivers the protected key to Git
+# once its quote characters are removed, in any of these three shapes:
+# a quote around a trailing segment, a quote around a leading segment,
+# and a quote that splits a single segment in two.
+run_on_fixture "tests/partially-quoted-key.sh" '#!/usr/bin/env bash
+git config user.'"'"'email'"'"' "leak@example.com"
+git config "user".email "leak2@example.com"
+git config us"er".email "leak3@example.com"
+'
+N_PARTIAL_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/partially-quoted-key\.sh:' || true)"
+if [ "$RC" = "1" ] && [ "$N_PARTIAL_HITS" -eq 3 ]; then
+  pass "partially-quoted protected key: reported in all three shapes"
+else
+  fail "partially-quoted protected key missed: hits=$N_PARTIAL_HITS rc=$RC out=$OUT"
+fi
+
+# Case 65k: the converse of 65j — a subsection-qualified key must not
+# start over-matching just because dequoting now happens per-word. The
+# quotes here still fall inside a word whose dequoted form carries the
+# `foo.bar/` subsection prefix, so it never equals the bare protected key.
+run_on_fixture "tests/partially-quoted-subsection.sh" '#!/usr/bin/env bash
+git config foo.bar/us"er".email "not-protected@example.com"
+'
+if [ "$RC" = "0" ]; then
+  pass "partially-quoted subsection-qualified key: still not reported"
+else
+  fail "partially-quoted subsection key falsely flagged: rc=$RC out=$OUT"
+fi
+
 # Case 65g: a shell escape may stand between the boundary and the key.
 # `git config \user.email x` writes the identity — the shell drops the
 # backslash and Git is handed `user.email` — while the word as written does

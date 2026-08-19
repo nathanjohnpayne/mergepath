@@ -1393,30 +1393,45 @@ else
     # single one, so `"user.email` — an unterminated word Git never
     # receives — does not match.
     #
-    # A key quoted in PART (`user.\047email\047`, `"user".email`) is not
-    # covered: recovering it means applying the word rules of the shell to
-    # the text, which is a different scanner from this one. Tracked as a
-    # follow-up rather than approximated here, because a half-rule that
-    # strips quotes anywhere in the word is exactly how the subsection
-    # false positives came back the last two times.
-    function key_assign_pos(s,   lower, pos, rest) {
-      lower = tolower(s)
-      if (!match(lower, /(^|[[:space:]])\\?(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign|"(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)"|\047(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)\047)[[:space:]]+/))
-        return 0
-      # Step over the boundary character: it is not part of the key, and
-      # this position is what the caller cuts the option region at. Every
-      # suppressor is read from that region as a whole token, so keeping a
-      # separator on its end or dropping it come out the same today; the
-      # step is here so the returned value keeps meaning what the function
-      # is named for rather than "one byte before the key, usually". A
-      # matched boundary is never a letter (the class above is whitespace),
-      # which is what tells one apart from a match that began at `^`.
-      pos = RSTART
-      if (substr(lower, pos, 1) !~ /[a-z]/) pos++
-      rest = substr(s, RSTART + RLENGTH)
-      if (rest == "" || rest ~ /^[#`)<>]/) return 0
-      if (rest ~ /^\\[[:space:]]*$/) return 0
-      return pos
+    # A key quoted in PART (`user.\047email\047`, `"user".email`,
+    # `us"er".email`) is handled by working on WORDS rather than a single
+    # regular expression: the piece is split on whitespace into its
+    # command-line words (the same boundary the comment above already
+    # relies on), and each word has every quote character removed —
+    # wherever in the word it falls, however many there are — before the
+    # comparison against the five protected keys. Comparing the DEQUOTED
+    # WORD for exact equality is what keeps the subsection class shut: a
+    # quote is only ever stripped from within an already-bounded word, so
+    # `foo.bar/user.email` and `"foo.bar/user".email` both dequote to a
+    # string carrying the `foo.bar/` prefix, which is never equal to
+    # `user.email`. Stripping characters out of the middle of a string
+    # and then substring-searching it was the earlier half-rule that let
+    # the subsection cases back in twice (see #917); exact equality
+    # against the whole word is what this rewrite adds to make that safe.
+    function key_assign_pos(s,   n, i, start, end, word, dq, rest) {
+      n = length(s)
+      i = 1
+      while (i <= n) {
+        while (i <= n && substr(s, i, 1) ~ /[[:space:]]/) i++
+        if (i > n) break
+        start = i
+        while (i <= n && substr(s, i, 1) !~ /[[:space:]]/) i++
+        end = i - 1
+        word = substr(s, start, end - start + 1)
+        dq = tolower(word)
+        gsub(/["\047]/, "", dq)
+        sub(/^\\/, "", dq)
+        if (dq ~ /^(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)$/) {
+          # The key must be followed by a value token: `$(git config
+          # user.email)` has nothing after the key and never matches.
+          rest = substr(s, end + 1)
+          sub(/^[[:space:]]+/, "", rest)
+          if (rest == "" || rest ~ /^[#`)<>]/) return 0
+          if (rest ~ /^\\[[:space:]]*$/) return 0
+          return start
+        }
+      }
+      return 0
     }
     # The OPTION REGION of the invocation that performs the write: the
     # text from the `git` word that opens the command up to the identity
