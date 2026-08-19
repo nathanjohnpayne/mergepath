@@ -899,6 +899,10 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-192.** On a sign-in error, stop immediately: no retries, no workarounds, no fallback credential paths. ○ — docs/agents/shared-operating-rules.md
 
+### MCP tool call confirmation
+
+**G-384.** A tool call that creates, modifies, or deletes a live resource needs explicit human confirmation; read-only calls do not, and indeterminate effect counts as mutating. ○ — docs/agents/shared-operating-rules.md
+
 **G-193.** With no preflight marker set, suggest preflight rather than individual reads. ○ — docs/agents/operating-rules.md
 
 **G-194.** Wait for confirmed human presence before re-running preflight; never substitute individual reads. ○ — docs/agents/operating-rules.md

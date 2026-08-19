@@ -1148,6 +1148,25 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   # followed by a blank ends the list and the base indent returns to the
   # ENCLOSING container — one level, not all the way to column zero.
   #
+  # A fence does not only begin at the start of a line. It also begins
+  # on a LIST MARKER line, whose content is the first block of the item
+  # rather than paragraph text of the enclosing document (#890). That
+  # was read as prose, so the body of the block was scanned with its
+  # `#NN` inside — the false-positive direction. The same marker line
+  # carries the other half of the CommonMark gap rule: a gap past four
+  # columns does not merely cap the content indent at the marker width
+  # plus one, it says the item STARTS with an indented code block, of
+  # which the marker line is the first line.
+  #
+  # A BLOCK QUOTE is not a container this parser models, and a fence
+  # inside one is therefore still emitted as prose, exactly as it was
+  # before #890. That over-scans — a `#NN` inside quoted fenced code
+  # fails the check with a misleading diagnostic — which is the safe
+  # direction, and it is tracked in #1039 rather than patched here,
+  # because closing it correctly needs the quote to be a real entry in
+  # the container stack rather than a flag beside it. #1033 is the same
+  # missing model reached from the other direction.
+  #
   # Inline code spans are matched by delimiter RUN LENGTH for the same
   # reason fences are, but note the closing rule DIFFERS by design and
   # the two must not be "unified": a fence closes on a run at least as
@@ -1248,23 +1267,19 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         opened_empty_item = empty_item
         empty_item = 0
 
+        # The delimiter SHAPE — the run length, and the rule barring a
+        # backtick opener from carrying a backtick in its info string —
+        # lives in `fence_delim` because a fence can begin in two
+        # places, not one: at the start of a line, and in the content of
+        # a LIST MARKER line (#890). Restating the shape at both of them
+        # is how they drifted apart in the first place. The four-column
+        # allowance is deliberately NOT part of it: each caller measures
+        # that from a different origin, and folding it in would hide the
+        # difference.
         is_delim = 0
-        if (ind < container_base + 4) {
-          ch = substr(rest, 1, 1)
-          if (ch == "`" || ch == "~") {
-            run = 0
-            while (substr(rest, run + 1, 1) == ch) run++
-            if (run >= 3) is_delim = 1
-          }
-        }
-        # A backtick fence OPENER may not carry a backtick in its info
-        # string; such a line is a paragraph, not a delimiter. Closers
-        # are already covered by the whitespace-only remainder rule
-        # below, and a tilde opener may hold backticks.
-        if (is_delim && !fence && ch == "`" &&
-            index(substr(rest, run + 1), "`") > 0) {
-          is_delim = 0
-        }
+        run = 0
+        if (ind < container_base + 4) run = fence_delim(rest, fence)
+        if (run > 0) { ch = fence_delim_char; is_delim = 1 }
 
         if (is_delim) {
           indented_code = 0
@@ -1512,6 +1527,14 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         # gap invents an item at indent 2 that nothing ever closes, and
         # the code block belonging to the real enclosing container is
         # then measured against the phantom and emitted as prose.
+        #
+        # `marker_open` and `marker_code` are the two verdicts this
+        # branch hands to the rule below it, and they are cleared here
+        # rather than left to the branch because awk variables outlive
+        # the line: a marker line three lines up would otherwise still
+        # be opening fences on a line that holds no marker at all.
+        marker_open = 0
+        marker_code = 0
         if (ind < container_base + 4 && !tbreak &&
             match(rest, /^([-*+]|[0-9]+[.)])/)) {
           marker = substr(rest, 1, RLENGTH)
@@ -1575,7 +1598,16 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
             empty_item = 1
           } else {
             gap_cols = visual_span(ind + marker_width, gap)
-            if (gap_cols > 4) gap_cols = 1
+            # Five or more columns of gap does not merely CAP the
+            # content indent at the marker width plus one — it says
+            # WHY the cap exists: the item begins with an indented
+            # code block, whose first line is this one. `marker_code`
+            # carries that verdict to the branch below, because
+            # forgetting it leaves the marker line emitted as prose
+            # with whatever it holds — a ``` opener, a `#NN`, or both
+            # — and the paragraph it wrongly opens then suppresses the
+            # code branch for every line of the block after it (#890).
+            if (gap_cols > 4) { gap_cols = 1; marker_code = 1 }
             marker_width = marker_width + gap_cols
           }
           if (marker_width > 0) {
@@ -1583,6 +1615,44 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
             depth++
             stack[depth] = ind + marker_width
             list_indent = stack[depth]
+            marker_open = 1
+            item_rest = substr(tail, length(gap) + 1)
+          }
+        }
+
+        # The marker line is the FIRST line of the item, so what follows
+        # the marker and its gap is the start of a block inside the item
+        # — measured from the content indent the marker just installed,
+        # not paragraph text of the enclosing document. Two shapes there
+        # are code, and both used to be emitted as prose (#890).
+        #
+        # An item that starts with indented code, from the wide gap
+        # above. `para` is cleared explicitly because such a marker can
+        # still interrupt a paragraph, and the line returns before the
+        # assignment at the bottom that would otherwise clear it.
+        if (marker_code) {
+          indented_code = 1
+          indented_code_min = list_indent + 4
+          para = 0
+          print ""; next
+        }
+        # A fence OPENER on the marker line. It needs no allowance test
+        # of its own: the gap swallowed every blank between the marker
+        # and the content, so a delimiter here always sits exactly AT the
+        # content indent, and the wide-gap case that would put it four
+        # columns past has already returned above. `fence_base` is that
+        # content indent, so the closer is measured from the item the
+        # fence really opened in — the same contract the top-level opener
+        # keeps.
+        if (marker_open) {
+          run = fence_delim(item_rest, 0)
+          if (run > 0) {
+            fence = 1
+            fence_char = fence_delim_char
+            fence_len = run
+            fence_base = list_indent
+            para = 0
+            print ""; next
           }
         }
 
@@ -1615,6 +1685,35 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         line = strip_code_spans(line)
         gsub(/\]\(#[^)]*\)/, "]()", line)
         print line
+      }
+
+      # The length of the fence-delimiter RUN that `s` begins with, or
+      # zero if `s` does not begin with one at all. The delimiter
+      # character is carried out in `fence_delim_char`, which is set
+      # only on a non-zero return.
+      #
+      # `open` says whether a fence is already open, because the one
+      # rule that differs between the two ends keys on it: a BACKTICK
+      # OPENER may not carry a backtick in its info string, so
+      # ```js `x` is an ordinary paragraph line rather than a
+      # delimiter, while the info string of a tilde opener may hold
+      # backticks and the remainder of a CLOSER is checked by the caller
+      # (which is where the rest of the closing rule — same character,
+      # a run at least as long, nothing but blanks after — lives,
+      # since only the caller knows what it is closing).
+      #
+      # The four-column allowance is NOT here. The two callers measure
+      # it from different origins: the container the line is inside, and
+      # the content indent a list marker just installed.
+      function fence_delim(s, open,   c, run) {
+        c = substr(s, 1, 1)
+        if (c != "`" && c != "~") return 0
+        run = 0
+        while (substr(s, run + 1, 1) == c) run++
+        if (run < 3) return 0
+        if (!open && c == "`" && index(substr(s, run + 1), "`") > 0) return 0
+        fence_delim_char = c
+        return run
       }
 
       # An ATX heading opener: one to six `#`, then a space, a tab, or
@@ -3349,8 +3448,203 @@ FNEST_EOF
     pass "Case 63: the fence-delimiter allowance stays relative to the CURRENT container three levels into a nested list, not just the outermost one (#802)"
   fi
 
+  # Case 64: a fence OPENER that begins on the list-marker line (#890).
+  #
+  # Cases 60-63 pin the fence rules against a delimiter that starts its
+  # own line. `- ```sh` is the same opener one construct earlier: the
+  # marker line is the FIRST line of the item, so what follows the marker
+  # and its gap is the start of a block inside the item, not paragraph
+  # text of the enclosing document. Reading it as text opened no fence at
+  # all, so the whole body of the block was emitted as prose with its
+  # `#NN` inside — the false-positive direction, on a shape any doc that
+  # bullets a command reaches for.
+  #
+  # The lines are chosen so each half fails on a different mutation
+  # rather than all of them failing together:
+  #
+  #   * lines 3-6 are the plain shape. Dropping the rule surfaces line 4.
+  #   * lines 8-11 put FOUR columns of gap after the marker, so the
+  #     content indent is 5 and the delimiter sits there rather than at
+  #     the usual 2. An implementation that looks for the delimiter at a
+  #     fixed offset past the marker, instead of at whatever the gap
+  #     leaves, misses this one and surfaces line 9 while lines 3-6 stay
+  #     clean.
+  #   * lines 13-14 are the CONTROL, and the reason the opener cannot
+  #     simply be "three backticks somewhere after the marker": a
+  #     backtick opener may not carry a backtick in its info string, so
+  #     line 13 is an ordinary paragraph line and line 14 is its lazy
+  #     continuation. Both are prose, and an implementation that opens a
+  #     fence there blanks them and ships `#555`/`#666` unflagged — the
+  #     UNDER-reporting direction.
+  #   * lines 18-22 pin `fence_base`. The fence opens in the item, whose
+  #     content indent is 2, so the six-column delimiter on line 19 is
+  #     four columns past it and is CONTENT, not the closer; nothing
+  #     closes the fence, and it ends with the item at the outdent on
+  #     line 22. Recording the document instead of the item as the base
+  #     reads line 19 as the closer and surfaces line 20.
+  #   * lines 24-28 and 30-34 pin the delimiter the marker line records.
+  #     A four-backtick opener is not closed by the three-backtick line
+  #     inside it, and a tilde opener is not closed by a backtick line
+  #     at all — so an implementation that records a fixed length or a
+  #     fixed character rather than the run it actually found closes the
+  #     block early and surfaces `#1010`/`#1212`. These are the two
+  #     halves of the same omission, and each fails on its own mutation
+  #     rather than both failing together.
+  #   * lines 36-38 pin the paragraph the opener CLOSES. A bullet with
+  #     content may interrupt a paragraph, so line 37 opens its item
+  #     under one; the fence never gets a body line to clear `para` for
+  #     it, because line 38 outdents out of both the fence and the item
+  #     on the very next line. Leaving that paragraph open then
+  #     suppresses the code branch and emits the document-level indented
+  #     code block as prose with `#1414` inside it — the false-positive
+  #     direction, and the reason the branch clears `para` explicitly
+  #     rather than relying on the assignment at the bottom of the rule.
+  #   * lines 40-41 are the CONTROL for the extracted `fence_delim`
+  #     helper itself, which is what both openers now share. A run of
+  #     two is not a delimiter and neither is a run of three of anything
+  #     but a backtick or a tilde, so both lines are ordinary paragraphs
+  #     and their refs are real. An implementation that loosens either
+  #     rule opens a fence on them and swallows the rest of the file,
+  #     which is the UNDER-reporting direction.
+  #
+  # Every expected hit is a line markdown-it-py 4.2.0 in commonmark mode
+  # renders inside `<p>`, and every unflagged `#NN` above sits inside
+  # `<pre><code>`. On this fixture the scanner agrees with the renderer
+  # on all 41 lines.
+  FMARK_DOC="$WORKDIR/consumer-truth-marker-fence.md"
+  cat > "$FMARK_DOC" <<'FMARK_EOF'
+# Doc
+
+- ```sh
+  echo "closes #111"
+  ```
+- A bare #222 in prose is real.
+
+-    ```
+     #333 is fenced at the four-column content indent
+     ```
+- A bare #444 in prose is real.
+
+- ```js `x` #555
+  #666 is ordinary paragraph text
+
+A bare #777 in prose is real.
+
+- ```sh
+      ```
+  #888 is still fence content
+
+A bare #999 in prose is real.
+
+- ````sh
+  ```
+  #1010 is still fence content
+  ````
+- A bare #1111 in prose is real.
+
+- ~~~sh
+  ```
+  #1212 is still fence content
+  ~~~
+- A bare #1313 in prose is real.
+
+Paragraph text.
+   -    ```sh
+    #1414 is indented code once the item ends
+
+`` #1515 opens no fence, so this line is prose
++++ #1616 opens no fence either
+FMARK_EOF
+  set +e
+  fmark_hits=$(md_prose_only "$FMARK_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  fmark_lines=$(md_prose_only "$FMARK_DOC" | wc -l | tr -d ' ')
+  fmark_raw=$(wc -l < "$FMARK_DOC" | tr -d ' ')
+  set -e
+  if [ "$fmark_hits" != "6,11,13,14,16,22,28,34,40,41," ]; then
+    fail "Case 64: expected lines 6,11,13,14,16,22,28,34,40,41 flagged (a fence opens on the marker line at the content indent the marker installs, with the run and character it actually found, and closes the paragraph it interrupted; a backtick info string, a two-character run and a non-fence character each still bar one), got '$fmark_hits'"
+  elif [ "$fmark_lines" != "$fmark_raw" ]; then
+    fail "Case 64: md_prose_only must emit one line per input line, got $fmark_lines for $fmark_raw"
+  else
+    pass "Case 64: a fence opener on the list-marker line opens the fence in that item, so its body is code rather than prose (#890)"
+  fi
+
+  # Case 65: a marker gap of five or more columns means the item STARTS
+  # with an indented code block (#890).
+  #
+  # Case 55 already caps the gap at four columns so the CONTAINER is not
+  # placed too deep. The cap was only half the rule. CommonMark caps the
+  # gap because five or more columns means the item begins with indented
+  # code, and the marker line is that code block's first line — so the
+  # cap has to carry that verdict with it, not just the number. Applying
+  # the number alone still emitted the marker line as prose, and the
+  # paragraph it wrongly opened then suppressed the code branch (indented
+  # code cannot interrupt a paragraph) for every line of the block after
+  # it. Both are the false-positive direction.
+  #
+  # The two halves separate the two failures:
+  #
+  #   * lines 3-7 are the boundary, and they straddle it. FOUR columns of
+  #     gap puts the content indent at 5 and line 3 is prose in the item;
+  #     FIVE columns puts it at 2 and line 5 is four columns past that,
+  #     which is code. An implementation that reports the marker line as
+  #     code on both sides blanks line 3 and ships `#111` unflagged — the
+  #     UNDER-reporting direction — so this half fails in both
+  #     directions, not just one.
+  #   * lines 9-13 are the suppressed continuation. Line 10 is code only
+  #     because line 9 left no paragraph open; line 11 returns to the
+  #     content indent and is prose again, which is what stops the fix
+  #     from being "blank everything after a wide marker".
+  #   * lines 15-21 are why the verdict has to CLOSE the paragraph and
+  #     not merely blank the line. A bullet with content may interrupt a
+  #     paragraph, so line 16 opens its item under one; leaving that
+  #     paragraph open outlives the code block, because line 17 then
+  #     skips the container pop and line 19 is measured against the item
+  #     at 2 rather than against the document — four columns in is short
+  #     of that stale threshold, so the document-level code block is
+  #     emitted as prose with `#999` inside it.
+  #
+  # markdown-it-py 4.2.0 in commonmark mode renders lines 5, 9, 10, 16
+  # and 19 inside `<pre><code>` and lines 3, 7, 11, 13, 17 and 21 inside
+  # `<p>`.
+  FGAP_DOC="$WORKDIR/consumer-truth-marker-gap.md"
+  cat > "$FGAP_DOC" <<'FGAP_EOF'
+# Doc
+
+-    #111 four columns of gap is prose in the item
+
+-     #222 five columns of gap is indented code
+
+A bare #333 in prose is real.
+
+-     ```
+      #444 stays in that code block
+  Prose about #555 back at the content indent.
+
+A bare #666 in prose is real.
+
+Paragraph text.
+-     #777 code in the item that interrupted it
+A bare #888 line at column zero ends the list.
+
+    #999 is indented code at the document level
+
+A bare #1010 in prose is real.
+FGAP_EOF
+  set +e
+  fgap_hits=$(md_prose_only "$FGAP_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  fgap_lines=$(md_prose_only "$FGAP_DOC" | wc -l | tr -d ' ')
+  fgap_raw=$(wc -l < "$FGAP_DOC" | tr -d ' ')
+  set -e
+  if [ "$fgap_hits" != "3,7,11,13,17,21," ]; then
+    fail "Case 65: expected lines 3,7,11,13,17,21 flagged (a five-column gap starts an indented code block on the marker line itself and closes the paragraph it interrupted, a four-column gap does neither), got '$fgap_hits'"
+  elif [ "$fgap_lines" != "$fgap_raw" ]; then
+    fail "Case 65: md_prose_only must emit one line per input line, got $fgap_lines for $fgap_raw"
+  else
+    pass "Case 65: a marker gap past four columns starts the item with indented code, so the marker line and its block are code (#890)"
+  fi
+
 else
-  echo "SKIP: Cases 36-63 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-65 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo

@@ -1132,6 +1132,11 @@ if [ "${MCG_PREFLIGHT_ONLY:-}" = "1" ]; then
   echo "check_merge_clearance_gate: PASS (preflight only)"
   exit 0
 fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_merge_clearance_gate: ERROR (jq is required — the wrapped suite would self-skip with exit 0 and report a green check over zero assertions)" >&2
+  exit 1
+fi
+
 if ! bash "$TEST"; then
   echo "check_merge_clearance_gate: FAIL (test suite)"
   exit 1

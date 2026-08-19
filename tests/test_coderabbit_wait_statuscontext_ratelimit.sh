@@ -191,6 +191,16 @@ SUMMARY_NAMES_NO_SHA='<!-- This is an auto-generated comment: summarize by coder
 
 No actionable comments were generated in the recent review.'
 
+# A benign CodeRabbit chat reply that QUOTES a commits range belonging to the
+# PREVIOUS round — the shape a rebuttal takes when it cites what the earlier
+# summary said, and the shape any reply quoting a diff hunk of this repository
+# takes. The range is not CodeRabbit's own head claim about anything; it is
+# text inside someone else's sentence. #1023: read as a claim, it vetoed a
+# valid current-head summary and forced the advisory timeout.
+CHAT_REPLY_QUOTING_OLD_RANGE="🧩 Analysis chain
+
+You are right that the previous round said \"Reviewing files that changed from the base of the PR and between $BASE_SHA_40 and $PREV_HEAD_SHA_40.\" — that round is superseded."
+
 # The live #891 / #912 notice: a 59-minute published window, longer than the
 # 1800s wallclock freshness floor, so it ages out of the anchored comment scan
 # while the rate limit it announces is still in force. No HEAD reference — the
@@ -1585,6 +1595,154 @@ test_later_chat_reply_over_current_head_summary_still_clears() {
   [ "$FAIL" -ne "$before" ] || pass "34: #968 AC1 escape — a chat reply above a CURRENT-head summary still clears, so the summary read adds refusals without adding stalls"
 }
 
+# --- Test 35: #1003/#1022 — the exact-SHA rung outranks the #968 demotion ----
+# Test 29's fixture exactly — a summary edited after the push whose commits
+# range ends at the PREVIOUS head — with ONE addition: a CodeRabbit review
+# OBJECT pinned to this head by `commit_id`, carrying a clean report body. That
+# is the ladder's first rung, and `commit_id` is immutable head identity that
+# no in-place edit can move.
+#
+# Before the fix the third rung was evaluated unconditionally, so the demotion
+# fired anyway and the run polled to the advisory exit 4 — the published order
+# inverted, and a head CodeRabbit had demonstrably reviewed left unclearable
+# for the whole `coderabbit.max_wait_seconds` budget.
+test_head_pinned_run_outranks_stale_summary() {
+  local dir rc=0 before=$FAIL reviews
+  dir=$(make_case "head-run-outranks" "$SUMMARY_NAMES_PREVIOUS_HEAD" "$STATUS_TIME" \
+    "Review rate limited" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 "" "$HEAD_TIME" \
+    "$HEAD_SHA_40" "$SUMMARY_EDITED_AFTER_HEAD")
+  reviews=$(jq -nc --arg sha "$HEAD_SHA_40" '[
+    {id: 5501, user: {login: "coderabbitai[bot]"}, commit_id: $sha,
+     submitted_at: "2026-06-04T00:01:00Z",
+     body: "**Actionable comments posted: 0**\n\nReviewed everything up to the head."}
+  ]')
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_REVIEWS_RAW="$reviews" \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  [ "$rc" = "0" ] \
+    || fail "35: expected exit 0 (cleared) — an immutable head-pinned review run outranks a stale summary, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "35: status=$(jqf "$dir" '.status'), expected cleared"
+  grep -q 'exact-SHA rung wins outright' "$dir/err.log" \
+    || fail "35: the clearance is not attributed to the head-pinned run; err=$(tail -4 "$dir/err.log")"
+  grep -q 'names a different commit' "$dir/err.log" \
+    && fail "35: the #968 demotion still fired despite a head-pinned clean review run"
+  [ "$FAIL" -ne "$before" ] || pass "35: #1003/#1022 — a head-pinned clean review run satisfies the exact-SHA rung, so a stale summary no longer inverts the published ladder"
+}
+
+# --- Test 36: #1003 negative — the #919 body-less ack must NOT outrank -------
+# The control that keeps test 35 from having widened the gate to CodeRabbit
+# ACTIVITY. Same fixture, but the only head-pinned review object is the
+# body-LESS one GitHub wraps around a single inline reply — CodeRabbit's
+# `🐇 ✅` acknowledgement of the `[mergepath-resolve:…]` tag reply the
+# review-loop rules make us post on every finding thread. A reply starts no
+# run, so the demotion must still decide and the run must still refuse.
+test_bodyless_ack_does_not_outrank_stale_summary() {
+  local dir rc=0 before=$FAIL reviews
+  dir=$(make_case "bodyless-ack-no-outrank" "$SUMMARY_NAMES_PREVIOUS_HEAD" "$STATUS_TIME" \
+    "Review rate limited" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 "" "$HEAD_TIME" \
+    "$HEAD_SHA_40" "$SUMMARY_EDITED_AFTER_HEAD")
+  reviews=$(jq -nc --arg sha "$HEAD_SHA_40" '[
+    {id: 5502, user: {login: "coderabbitai[bot]"}, commit_id: $sha,
+     submitted_at: "2026-06-04T00:01:00Z", body: ""}
+  ]')
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_REVIEWS_RAW="$reviews" \
+      CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+      CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      ./scripts/coderabbit-wait.sh 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  [ "$rc" != "0" ] \
+    || fail "36: FALSE-CLEARED (exit 0) — a body-less inline-reply review object was taken as a review run; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "36: status=cleared on a verdict about a different commit"
+  [ "$rc" = "4" ] || fail "36: expected exit 4 (timeout), got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'names a different commit' "$dir/err.log" \
+    || fail "36: expected the #968 demotion to still decide; err=$(tail -4 "$dir/err.log")"
+  grep -q 'exact-SHA rung wins outright' "$dir/err.log" \
+    && fail "36: a body-less acknowledgement was credited as satisfying the exact-SHA rung"
+  [ "$FAIL" -ne "$before" ] || pass "36: #1003 negative — the #919 body-less acknowledgement still does not outrank the summary demotion"
+}
+
+# --- Test 37: #1023 — a QUOTED commits range is not CodeRabbit's head claim --
+# The summary names THIS head, so the ladder says clear. Above it sits a benign
+# chat reply that quotes the previous round's commits range. The removed second
+# carrier applied the demotion predicate to `$COMMENT_BODY` — merely the newest
+# bot comment — so that quotation vetoed a valid current-head summary and the
+# run polled to the advisory exit 4.
+#
+# Non-vacuity is asserted the way test 33 does it: the poll arm must really be
+# grading the reply (id=7702), or the fixture has collapsed into test 30.
+test_quoted_range_in_chat_reply_does_not_veto_current_head() {
+  local dir rc before=$FAIL
+  dir=$(make_case "quoted-range-chat" "$SUMMARY_NAMES_CURRENT_HEAD" "$STATUS_TIME" \
+    "Review rate limited" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 \
+    "$CHAT_REPLY_QUOTING_OLD_RANGE" "$CHAT_REPLY_TIME" "$HEAD_SHA_40" "$SUMMARY_EDITED_AFTER_HEAD")
+  rc=$(run_case "$dir")
+  grep -q 'latest CodeRabbit comment id=7702' "$dir/err.log" \
+    || fail "37: the poll arm did not grade the quoting reply, so the fixture no longer models #1023; err=$(grep -i 'latest CodeRabbit comment' "$dir/err.log" | tail -2)"
+  [ "$rc" = "0" ] \
+    || fail "37: expected exit 0 (cleared) — a quoted range in a chat reply is not CodeRabbit's own head claim, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "37: status=$(jqf "$dir" '.status'), expected cleared"
+  grep -q 'names a different commit' "$dir/err.log" \
+    && fail "37: the demotion fired on a range quoted by a comment that is not the summary"
+  [ "$FAIL" -ne "$before" ] || pass "37: #1023 — the demotion reads the marker-selected summary's OWN commits range, so a reply quoting an old range no longer forces a timeout"
+}
+
+# --- Test 38: #1005 — a rate-limit notice past the pipe buffer still suppresses
+# The end-to-end half of the classifier sweep. `classify_comment` fed its body
+# to `grep -q` through a producer pipe under `set -o pipefail`: once the body
+# outran the 64 KiB pipe buffer and the marker sat near the start, the producer
+# took SIGPIPE, the pipeline reported 141, and the notice fell out of
+# `rate_limit` into the `review` default — the one class whose arm clears.
+# Measured on the pre-fix idiom at 245894 bytes: rc 141, class `review`.
+#
+# The fixture is test 1's exactly, with a ~98 KiB tail appended. Two assertions
+# beyond the exit code, because two predicates on this route share the idiom:
+# the class must be `rate_limit` (classify_comment) AND the notice must be seen
+# to reference HEAD (the fast-path's own `grep -Fq "$HEAD_SHA"`).
+#
+# The size sits inside a WINDOW, and both ends are asserted below. The lower
+# bound is the 64 KiB pipe buffer, without which the case proves nothing. The
+# upper bound is Linux's per-argument `MAX_ARG_STRLEN` — 32 pages, 131072 bytes
+# — because the gh STUB hands this body to `jq --arg body`, which is an exec:
+# a 200 KiB fixture passed on macOS and died on Linux CI with
+# `/usr/bin/jq: Argument list too long`, turning a portability limit of the
+# harness into three product-looking failures. It is the stub's marshalling
+# that is bounded, not the predicate under test; the pure classifier unit in
+# tests/test_coderabbit_wait_status_probe.sh drives 200 KiB through bash
+# builtins and a here-string, where no exec boundary applies.
+test_large_rate_limit_body_still_suppresses_status() {
+  local dir rc before=$FAIL pad big
+  pad=$(printf '%*s' 100000 '' | tr ' ' 'x')
+  big="$RATE_LIMIT_BODY_HEADREF
+
+$pad"
+  [ "${#big}" -gt 65536 ] || fail "38: the fixture body is not past the pipe buffer (${#big} bytes)"
+  [ "${#big}" -lt 131072 ] \
+    || fail "38: the fixture body exceeds Linux MAX_ARG_STRLEN (${#big} bytes) — the gh stub's jq exec would die with 'Argument list too long' before the predicate is reached"
+  dir=$(make_case "headref-rl-large" "$big")
+  rc=$(run_case "$dir")
+  [ "$rc" != "0" ] \
+    || fail "38: FALSE-CLEARED (exit 0) — a HEAD-referencing rate-limit notice past the pipe buffer graded as a completed review; err=$(tail -4 "$dir/err.log")"
+  [ "$rc" = "5" ] || fail "38: expected exit 5 (rate_limit_stalled after suppression), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "38: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+  grep -q 'class=rate_limit references current HEAD' "$dir/err.log" \
+    || fail "38: the large notice was not classified rate_limit AND seen to reference HEAD; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  [ "$FAIL" -ne "$before" ] || pass "38: #1005 — a rate-limit notice past the 64 KiB pipe buffer still classifies rate_limit and still suppresses the StatusContext fast path"
+}
+
 test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
 test_headref_later_success_clears
@@ -1619,6 +1777,10 @@ test_summary_naming_current_head_still_clears
 test_summary_naming_no_sha_falls_through_to_floor
 test_later_chat_reply_does_not_restore_other_head_clear
 test_later_chat_reply_over_current_head_summary_still_clears
+test_head_pinned_run_outranks_stale_summary
+test_bodyless_ack_does_not_outrank_stale_summary
+test_quoted_range_in_chat_reply_does_not_veto_current_head
+test_large_rate_limit_body_still_suppresses_status
 test_emit_json_invariant_unit
 test_fetch_wrapper_contracts_unit
 
