@@ -49,6 +49,12 @@
 # #466. `scripts/op-preflight.sh` is the canonical legitimate emitter:
 # writing those values to its cache IS its contract.
 #
+# The pragma is a REVIEW MARKER, not a security boundary. Anyone editing
+# the file can silence this check — by adding the pragma, by renaming the
+# variable, by any of the indirections listed below. What the marker buys
+# is that every deliberate emission is greppable and carries a written
+# reason, so the decision shows up in review instead of nowhere.
+#
 # Two forms are legal without any pragma because they emit a description
 # rather than the value — they are the #993 remediation, and the check is
 # built so that adopting it never trips the gate:
@@ -226,7 +232,7 @@ function writes_own_args(line,   s, seg) {
 function is_emitter(w) { return (w in EMITBASE) || (w in EMITFN) }
 
 # ── Pass 2: the scan ─────────────────────────────────────────────────────
-function scan_lines(   i, line, hit, trimmed) {
+function scan_lines(   i, line, hit, trimmed, href) {
   hd_term = ""; hd_scan = 0
   for (i = 1; i <= NLINES; i++) {
     line = LINES[i]
@@ -235,8 +241,9 @@ function scan_lines(   i, line, hit, trimmed) {
       trimmed = line
       sub(/^[[:space:]]+/, "", trimmed); sub(/[[:space:]]+$/, "", trimmed)
       if (trimmed == hd_term) { hd_term = ""; hd_scan = 0; continue }
-      if (!exempt(line) && hd_scan && heredoc_ref(line) != "")
-        report(i, heredoc_ref(line), line, "here-doc body")
+      href = hd_scan ? heredoc_ref(line) : ""
+      if (!exempt(line) && href != "")
+        report(i, href, line, "here-doc body")
       # A here-doc body is also shell SOURCE when it is written out as a
       # script (the check_resolve_pr_threads stub shape, #993), so it gets
       # the ordinary line scan too, quoted delimiter or not.
@@ -266,13 +273,18 @@ function report(lno, name, line, kind) {
 # deciding where the next one starts; scan the body as output only when the
 # delimiter is UNQUOTED (the shell expands it) and the opener is cat or an
 # emitter (the expansion goes to a stream or a file).
-function note_heredoc(line,   rest, dash, ch, term, quoted, w) {
+function note_heredoc(line,   rest, ch, term, quoted, w, p) {
   if (hd_term != "") return
   if (line !~ /<<-?[[:space:]]*[\\"A-Za-z_]/) return
+  # A here-STRING is not a here-doc. Skipping the whole line when one is
+  # present is conservative in the safe direction: it can only make the
+  # check miss a body, never invent one.
   if (line ~ /<<</) return
-  rest = line
-  sub(/^.*<<-?/, "", rest)
-  dash = (line ~ /<<-/)
+  # Parse from the FIRST `<<` on the line — a greedy strip would take the
+  # last, and `cmd <<A <<B` opens A first.
+  p = index(line, "<<")
+  rest = substr(line, p + 2)
+  sub(/^-/, "", rest)
   sub(/^[[:space:]]+/, "", rest)
   ch = substr(rest, 1, 1)
   quoted = 0
