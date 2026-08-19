@@ -192,6 +192,20 @@ run_gate
 assert_eq 2 "$RUN_RC" "unreadable governing review policy is an infrastructure error"
 assert_match 'governing review policy is unreadable' "$RUN_ERR" "unreadable policy failure names the missing surface"
 mv "$TMP/review-policy.unreadable.yml" "$TMP/review-policy.yml"
+cp "$TMP/review-policy.yml" "$TMP/review-policy.valid-enums.yml"
+cat >"$TMP/review-policy.yml" <<'JSON'
+{"feedback_policy":{"mode":"typo"}}
+JSON
+reset_fixtures
+run_gate
+assert_eq 2 "$RUN_RC" "invalid feedback policy mode fails before an empty history can clear"
+cat >"$TMP/review-policy.yml" <<'JSON'
+{"feedback_policy":{"mode":"by-priority","priorities":{"p1":"typo"}}}
+JSON
+reset_fixtures
+run_gate
+assert_eq 2 "$RUN_RC" "invalid feedback priority disposition fails before an empty history can clear"
+mv "$TMP/review-policy.valid-enums.yml" "$TMP/review-policy.yml"
 
 cp "$TMP/review-policy.yml" "$TMP/review-policy.block-style.yml"
 cat >"$TMP/review-policy.yml" <<'JSON'

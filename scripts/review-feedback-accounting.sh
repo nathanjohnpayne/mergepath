@@ -128,9 +128,12 @@ puts JSON.generate(value)
     and ((.coderabbit // {}) | optional_string("bot_login"))
     and optional_object("feedback_policy")
     and ((.feedback_policy // {}) | optional_string("mode"))
+    and (((.feedback_policy // {}).mode // "by-priority") as $mode
+      | ($mode == "by-priority" or $mode == "address-all"))
     and (((.feedback_policy // {}) | has("priorities") | not)
       or (((.feedback_policy // {}).priorities | type == "object")
-        and all((.feedback_policy // {}).priorities[]; type == "string")))
+        and all((.feedback_policy // {}).priorities[];
+          . == "required" or . == "discretionary" or . == "ignore")))
   ' >/dev/null 2>&1 \
     || die 2 "governing review policy has an invalid accounting schema: $CONFIG"
   POLICY_JSON="$parsed"
