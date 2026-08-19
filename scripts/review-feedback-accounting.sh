@@ -270,6 +270,17 @@ coderabbit_finding_scan() {
   fi
 }
 
+tier_rank() {
+  case "$1" in
+    p0) echo 0 ;;
+    p1) echo 1 ;;
+    p2) echo 2 ;;
+    p3) echo 3 ;;
+    nitpick) echo 4 ;;
+    *) echo 99 ;;
+  esac
+}
+
 finding_tier() {
   local login="$1" body="$2" tier="" line sanitized
   if [ "$login" = "$CODEX_BOT" ] || registered_reviewer_login "$login"; then
@@ -288,6 +299,29 @@ finding_tier() {
 $sanitized
 EOF
   fi
+}
+
+strongest_nonignored_finding_tier() {
+  local login="$1" body="$2" tier="" tiers="" sanitized
+  local best="" best_rank=99 rank
+  sanitized=$(coderabbit_finding_scan "$body") || return 2
+  if [ "$login" = "$CODEX_BOT" ] || registered_reviewer_login "$login"; then
+    tiers=$(codex_tiers_of "$sanitized")
+  elif [ "$login" = "$CODERABBIT_BOT" ]; then
+    tiers=$(coderabbit_tiers_of "$sanitized")
+  fi
+  while IFS= read -r tier; do
+    [ -n "$tier" ] || continue
+    tier_is_ignored "$tier" && continue
+    rank=$(tier_rank "$tier")
+    if [ "$rank" -lt "$best_rank" ]; then
+      best="$tier"
+      best_rank="$rank"
+    fi
+  done <<EOF
+$tiers
+EOF
+  printf '%s' "$best"
 }
 
 INLINE_CANDIDATES='[]'
@@ -328,12 +362,14 @@ INLINE_CANDIDATES=$(printf '%s' "$INLINE_CANDIDATES" | jq -c '
 ')
 
 agent_reply_after_finding() {
-  local root_id="$1" floor="$2"
+  local root_id="$1" floor="$2" finding_id="$3"
   printf '%s' "$INLINE_COMMENTS" | jq -e \
-    --argjson root "$root_id" --arg floor "$floor" --argjson agents "$AGENT_LOGINS_JSON" '
+    --argjson root "$root_id" --arg floor "$floor" --argjson finding "$finding_id" \
+    --argjson agents "$AGENT_LOGINS_JSON" '
       any(.[];
         (.in_reply_to_id != null)
         and (.in_reply_to_id == $root)
+        and (.id != $finding)
         and ((.created_at // "") >= $floor)
         and ((.user.login // "") as $login | ($agents | index($login)) != null)
         and (((.body // "") | gsub("\\[mergepath-resolve:[^]]*\\]"; "")
@@ -348,10 +384,11 @@ FINDINGS='[]'
 while IFS= read -r finding; do
   [ -n "$finding" ] || continue
   root_id=$(printf '%s' "$finding" | jq -r '.root_id')
+  finding_id=$(printf '%s' "$finding" | jq -r '.finding_id')
   floor=$(printf '%s' "$finding" | jq -r '.updated_at // .created_at')
   accounted=false
   evidence=""
-  if agent_reply_after_finding "$root_id" "$floor"; then
+  if agent_reply_after_finding "$root_id" "$floor" "$finding_id"; then
     accounted=true
     evidence="thread-reply"
   fi
@@ -387,8 +424,12 @@ ack_present() {
         and ((.created_at // "") >= $raised)
         and (((.body // "") | gsub("\r"; "") | split("\n")) as $lines
           | (($lines[0] // "") | sub("[ \t]+$"; "")) == $token
-          and (($lines[1:] | map(gsub("^[ \t]+|[ \t]+$"; ""))
-            | map(select(. != "")) | length) > 0)))
+          and (($lines[1:] | join(" ")
+            | gsub("\\[mergepath-resolve:[^]]*\\]"; "")
+            | gsub("^[[:space:]]+|[[:space:]]+$"; "")
+            | gsub("[[:space:]]+"; " ")) as $rationale
+            | (($rationale | length) >= 12)
+            and (([$rationale | scan("[[:alnum:]][[:alnum:]_-]*")] | length) >= 2))))
     ' >/dev/null 2>&1
 }
 
@@ -401,9 +442,8 @@ while IFS= read -r issue_comment; do
   esac
   body_json=$(printf '%s' "$issue_comment" | jq -c '.body // ""')
   body=$(printf '%s' "$body_json" | jq -r '.')
-  tier=$(finding_tier "$login" "$body")
+  tier=$(strongest_nonignored_finding_tier "$login" "$body")
   [ -n "$tier" ] || continue
-  tier_is_ignored "$tier" && continue
   comment_id=$(printf '%s' "$issue_comment" | jq -r '.id')
   raised_at=$(printf '%s' "$issue_comment" | jq -r '.updated_at // .created_at // ""')
   body_fingerprint=$(fingerprint "$body_json")
@@ -449,9 +489,8 @@ while IFS= read -r review; do
   # the end of the body invalidates the acknowledgement too.
   body_json=$(printf '%s' "$review" | jq -c '.body // ""')
   body=$(printf '%s' "$body_json" | jq -r '.')
-  tier=$(finding_tier "$login" "$body")
+  tier=$(strongest_nonignored_finding_tier "$login" "$body")
   [ -n "$tier" ] || continue
-  tier_is_ignored "$tier" && continue
   review_id=$(printf '%s' "$review" | jq -r '.id')
   submitted_at=$(printf '%s' "$review" | jq -r '.submitted_at // ""')
   body_fingerprint=$(fingerprint "$body_json")

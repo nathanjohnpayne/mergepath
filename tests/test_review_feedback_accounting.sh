@@ -343,6 +343,44 @@ assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "reviewer root fin
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [
   {
+    "id": 13,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T20:10:00Z",
+    "user": {"login": "nathanpayne-claude"},
+    "path": "src/reviewer.sh",
+    "line": 7,
+    "body": "**P1** Reject the unsafe reviewer path before merge."
+  },
+  {
+    "id": 14,
+    "in_reply_to_id": 13,
+    "created_at": "2026-08-18T20:12:00Z",
+    "user": {"login": "nathanpayne-claude"},
+    "path": "src/reviewer.sh",
+    "line": 7,
+    "body": "**P1** The unsafe reviewer path remains reachable."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "registered reviewer re-raise cannot account for itself as a reply"
+assert_eq 14 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].finding_id')" "latest registered reviewer re-raise remains unaccounted"
+jq '. + [{
+  "id": 15,
+  "in_reply_to_id": 13,
+  "created_at": "2026-08-18T20:14:00Z",
+  "user": {"login": "nathanjohnpayne"},
+  "path": "src/reviewer.sh",
+  "line": 7,
+  "body": "Fixed the re-raised path in commit abc1234."
+}]' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "distinct later reply accounts for a registered reviewer re-raise"
+
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
     "id": 10,
     "in_reply_to_id": null,
     "created_at": "2026-08-18T20:00:00Z",
@@ -533,6 +571,32 @@ cat >"$TMP/fixtures/issues.json" <<JSON
     "id": 901,
     "created_at": "2026-08-18T22:10:00Z",
     "user": {"login": "nathanpayne-codex"},
+    "body": "$ACK_TOKEN\n."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "punctuation-only acknowledgement rationale does not reconcile"
+
+cat >"$TMP/fixtures/issues.json" <<JSON
+[
+  {
+    "id": 901,
+    "created_at": "2026-08-18T22:10:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": "$ACK_TOKEN\n👍"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "emoji-only acknowledgement rationale does not reconcile"
+
+cat >"$TMP/fixtures/issues.json" <<JSON
+[
+  {
+    "id": 901,
+    "created_at": "2026-08-18T22:10:00Z",
+    "user": {"login": "nathanpayne-codex"},
     "body": "$ACK_TOKEN\nFixed in commit abc1234."
   }
 ]
@@ -641,6 +705,46 @@ JSON
 run_gate
 assert_eq 0 "$RUN_RC" "feedback tier configured ignore is excluded from inventory"
 assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "ignored finding does not contribute to posted count"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/ignored-inline.json"
+reset_fixtures
+cat >"$TMP/fixtures/reviews.json" <<'JSON'
+[
+  {
+    "id": 904,
+    "commit_id": "dddddddddddddddddddddddddddddddddddddddd",
+    "submitted_at": "2026-08-18T22:55:00Z",
+    "state": "COMMENTED",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "body": "### Codex Review\n\n- **P3** Cosmetic wording\n- **P1** Required safety guard"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "ignored marker before required marker does not hide the review-body finding"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "mixed-severity review body keeps its strongest tier"
+jq '.[0].id = 905
+  | .[0].user.login = "coderabbitai[bot]"
+  | .[0].body = "**Actionable comments posted: 2**\n\n🔵 Trivial cosmetic wording\n\n🟠 Major required safety guard"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "ignored CodeRabbit marker before required marker does not hide the review-body finding"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "mixed-severity CodeRabbit review body keeps its strongest tier"
+cp "$TMP/review-policy.yml" "$TMP/review-policy.mixed.yml"
+sed -e 's/p1: required/p1: ignore/' -e 's/p2: discretionary/p2: required/' \
+  "$TMP/review-policy.yml" >"$TMP/review-policy.next"
+mv "$TMP/review-policy.next" "$TMP/review-policy.yml"
+jq '.[0].id = 906
+  | .[0].user.login = "chatgpt-codex-connector[bot]"
+  | .[0].body = "### Codex Review\n\n- **P1** Ignored urgent marker\n- **P2** Required lower-tier guard"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "ignored strongest marker does not hide a required lower-tier finding"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "mixed-severity body keeps the strongest non-ignored tier"
+mv "$TMP/review-policy.mixed.yml" "$TMP/review-policy.yml"
+reset_fixtures
+mv "$TMP/fixtures/ignored-inline.json" "$TMP/fixtures/inline.json"
 sed -i.bak 's/p3: ignore/p3: discretionary/' "$TMP/review-policy.yml"
 rm -f "$TMP/review-policy.yml.bak"
 run_gate

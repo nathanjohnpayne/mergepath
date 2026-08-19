@@ -162,6 +162,7 @@ eq "p1" "$(codex_tier_of '**P1**: stop retrying endlessly')"     "codex_tier_of:
 eq ""   "$(codex_tier_of 'just a normal comment')"               "codex_tier_of: none -> empty"
 eq "p1" "$(codex_tier_of 'first ![P1 Badge] then later ![P2 Badge]')" "codex_tier_of: first badge wins over later (#581 4b F3)"
 eq "p1" "$(codex_tier_of '**P1** first, then **P3** later')"          "codex_tier_of: first text marker wins over later (#581 4b F3)"
+eq "p3 p1 p2" "$(codex_tiers_of '**P3** first, then ![P1 Badge], then **P2**')" "codex_tiers_of: emits every canonical marker in document order"
 
 # --- coderabbit_tier_of ----------------------------------------------------
 eq "nitpick" "$(coderabbit_tier_of '🧹 Nitpick: rename this var')"                         "cr_tier_of: nitpick"
@@ -175,6 +176,7 @@ eq ""        "$(coderabbit_tier_of '📝 Note: verified the change')"           
 eq ""        "$(coderabbit_tier_of 'This is a Minor cleanup note, not a CodeRabbit badge.')" "cr_tier_of: bare titlecase Minor prose -> empty (#581 4b F2)"
 eq ""        "$(coderabbit_tier_of 'This is Trivial, no finding badge.')"                    "cr_tier_of: bare titlecase Trivial prose -> empty (#581 4b F2)"
 eq "p2"      "$(coderabbit_tier_of '_📐 Maintainability_ | _🟡 Minor_: This cleanup is Trivial but visible')" "cr_tier_of: Minor badge beats Trivial-in-prose -> p2 (#581 4b F2)"
+eq "p3 p1 p2" "$(coderabbit_tiers_of '🔵 Trivial first, 🟠 Major second, 🟡 Minor third')" "cr_tiers_of: emits every canonical marker in document order"
 
 # --- rc-safety under set -euo pipefail (#581 4b F1) ------------------------
 # A markerless / unclassified call must return rc 0 + empty output, NOT abort a
