@@ -179,6 +179,34 @@ reset_fixtures
 run_gate preflight
 assert_eq 0 "$RUN_RC" "reviewer PAT from preflight is accepted without ambient GH_TOKEN"
 
+cat >"$TMP/bin/yq" <<'SH'
+#!/bin/sh
+if [ "${1:-}" = --version ]; then
+  echo "yq 2.0.0 (unrelated implementation)"
+  exit 0
+fi
+echo "unsupported yq interface" >&2
+exit 64
+SH
+chmod +x "$TMP/bin/yq"
+reset_fixtures
+run_gate
+assert_eq 0 "$RUN_RC" "unrelated yq executable falls through to a supported YAML parser"
+cat >"$TMP/bin/yq" <<'SH'
+#!/bin/sh
+if [ "${1:-}" = --version ]; then
+  echo "yq (https://github.com/mikefarah/yq/) version v4.47.2"
+  exit 0
+fi
+echo "synthetic mikefarah parse failure" >&2
+exit 1
+SH
+chmod +x "$TMP/bin/yq"
+reset_fixtures
+run_gate
+assert_eq 2 "$RUN_RC" "validated mikefarah yq parse failure remains an infrastructure error"
+rm -f "$TMP/bin/yq"
+
 cp "$TMP/review-policy.yml" "$TMP/review-policy.valid.yml"
 printf 'available_reviewers: [unterminated\n' >"$TMP/review-policy.yml"
 reset_fixtures

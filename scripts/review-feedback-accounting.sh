@@ -92,7 +92,8 @@ trap 'if [ -n "$RESOLVED_CONFIG" ]; then rm -f "$RESOLVED_CONFIG"; fi' EXIT
 validate_governing_policy() {
   local parsed=""
   [ -r "$CONFIG" ] || die 2 "governing review policy is unreadable: $CONFIG"
-  if command -v yq >/dev/null 2>&1; then
+  if command -v yq >/dev/null 2>&1 \
+     && yq --version 2>/dev/null | grep -qi 'mikefarah'; then
     parsed=$(yq eval -o=json '.' "$CONFIG" 2>/dev/null) \
       || die 2 "governing review policy did not parse as YAML: $CONFIG"
   elif command -v python3 >/dev/null 2>&1 \
