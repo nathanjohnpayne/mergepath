@@ -343,9 +343,14 @@ STDIN_ECHOERS = frozenset({"cat", "tee"})
 # stops here.
 SAFE_COMMANDS = frozenset(
     {
-        "[", "[[", "test", "case", "for", "select", "local", "export",
-        "readonly", "declare", "typeset", "unset", "read", "let", "eval_safe",
-        ":", "true", "false", "shift", "return", "exit", "((",
+        # conditionals and word-consuming keywords -- these read the value,
+        # they never write it
+        "[", "[[", "test", "case", "for", "select", "((",
+        # binding forms
+        "local", "export", "readonly", "declare", "typeset", "unset", "read",
+        "let",
+        # no-ops and control
+        ":", "true", "false", "shift", "return", "exit",
     }
 )
 # Commands that dump the environment they were given, so an env-prefix
@@ -462,6 +467,11 @@ _WORD_BREAK_BEFORE_COMMENT = set(" \t\n;&|()")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
 _REDIR_RE = re.compile(r"^\{?[A-Za-z0-9_]*\}?(&>>|&>|>>|>\||>&|<&|<>|<|>)")
+# OUTPUT redirections only.  Only these can carry a value past a capture --
+# `_v=$(printf %s "$PAT" >&2)` is the escape #1012 measured.  An INPUT
+# redirection (`<`, `<<`, `<<<`) feeds the command and cannot escape anything,
+# so counting it would flag every captured here-string.
+_OUT_REDIR_RE = re.compile(r"^\{?[A-Za-z0-9_]*\}?(&>>|&>|>>|>\||>&|<>|>)")
 _PRAGMA_RE = re.compile(r"(?<![A-Za-z0-9_])" + PRAGMA + r":[ \t]*(\S.*)?$")
 
 
@@ -594,6 +604,12 @@ class Lexer:
                 if in_heredoc is None:
                     if pending_heredocs:
                         in_heredoc = pending_heredocs.pop(0)
+                    elif len(levels) > 1:
+                        # A here-doc inside `$( ... )`: the substitution is
+                        # still open, so this is a segment break, not the end
+                        # of the logical line.  Ending the line here would
+                        # reset only the OUTER level and strand the open one.
+                        start_segment()
                     else:
                         end_logical_line(line)
                 continue
@@ -1148,13 +1164,11 @@ def resolve_command(seg):
         return seg._cmd
     seg._resolved = True
     words = list(seg.words)
-    # Redirections are collected over the WHOLE segment, not just the words
-    # ahead of the command.  `_v=$(printf '%s' "$PAT" >&2)` puts the
+    # Output redirections are collected over the WHOLE segment, not just the
+    # words ahead of the command.  `_v=$(printf '%s' "$PAT" >&2)` puts the
     # redirection AFTER the command word, and stopping at the command word is
     # how #1012 let that one escape the capture.
-    has_redir = any(
-        w in ("<<", "<<<") or _REDIR_RE.match(w) for w in words
-    )
+    has_redir = any(_OUT_REDIR_RE.match(w) for w in words)
     idx = 0
     passthru_budget = 6
     while idx < len(words):
@@ -1256,46 +1270,57 @@ def classify(seg, emitter_helpers):
 
 
 def reaches_output(ref, emitter_helpers):
-    if ref.heredoc_owner is not None:
-        owner = ref.heredoc_owner
-        cmd, _ = resolve_command(owner)
-        if cmd is UNRESOLVED or cmd in OPAQUE_COMMANDS:
-            return True, "here-doc body owned by an unresolvable command"
-        if cmd in STDIN_ECHOERS:
-            return True, "interpolating here-doc body written by %s" % cmd
-        if classify(owner, emitter_helpers) == EMIT:
-            return True, "interpolating here-doc body written by %s" % cmd
-        return False, ""
+    """Does this reference reach a stream?  Returns (bool, reason)."""
     if ref.in_assign_prefix:
+        # `GH_TOKEN="$PAT" cmd ...` puts the value in the child's ENVIRONMENT.
         cmd, _ = resolve_command(ref.seg)
         if cmd in ENV_DUMPERS:
-            return True, "an env-prefix assignment handed to %s, which dumps "\
-                "the environment it was given" % cmd
+            return True, (
+                "an env-prefix assignment handed to %s, which dumps the "
+                "environment it was given" % cmd
+            )
         return False, ""
-    seg = ref.seg
+
+    # A here-doc body belongs to the command that OPENED it, which may be in a
+    # later segment (`true; cat <<EOF`).  From there it walks out exactly like
+    # any other reference, so a captured here-doc gets the same shield a
+    # captured `printf` does.
+    seg = ref.heredoc_owner if ref.heredoc_owner is not None else ref.seg
+    note = "interpolating here-doc body" if ref.heredoc_owner is not None else None
+
     hops = 0
     while seg is not None and hops < 16:
         hops += 1
+        cmd, has_out_redir = resolve_command(seg)
         kind = classify(seg, emitter_helpers)
-        cmd, has_redir = resolve_command(seg)
         if kind == OPAQUE:
             return True, "command word could not be resolved (%s)" % (
                 "unresolvable" if cmd is UNRESOLVED else cmd
             )
+        # `cat`/`tee` write their standard input, so a here-doc body or a
+        # here-string handed to one is an emission by the same rule.
+        if kind != EMIT and cmd in STDIN_ECHOERS:
+            if note is not None or "<<<" in seg.words:
+                kind = EMIT
+                if note is None:
+                    note = "here-string"
         if kind != EMIT:
-            if "<<<" in seg.words and cmd in STDIN_ECHOERS:
-                return True, "here-string written by %s" % cmd
             return False, ""
         if seg.parent_is_capture and seg.parent is not None:
-            if has_redir:
-                return True, (
-                    "%s inside $( ), where a redirection escapes the capture"
-                    % cmd
+            if has_out_redir:
+                return True, _why(
+                    note, "%s inside $( ), where an output redirection "
+                    "escapes the capture" % cmd
                 )
             seg = seg.parent
+            note = note  # the note travels out with the reference
             continue
-        return True, cmd or "output command"
+        return True, _why(note, cmd or "output command")
     return True, "expansion nesting too deep to resolve"
+
+
+def _why(note, base):
+    return "%s written by %s" % (note, base) if note else base
 
 
 # ==========================================================================
@@ -1795,6 +1820,20 @@ CORPUS = [
     ),
     ("heredoc-tab-strip", MUST_FLAG, "cat <<-EOF\n\t$GH_TOKEN\n\tEOF\n"),
     ("heredoc-tee", MUST_FLAG, "tee /dev/null <<EOF\n$GH_TOKEN\nEOF\n"),
+    ("herestring-to-stderr", MUST_FLAG, 'cat <<< "$GH_TOKEN" >&2\n'),
+    (
+        # An INPUT redirection cannot escape a capture, so a captured
+        # here-string stores rather than emits -- counting `<<<` as a
+        # redirection would flag every one of these.
+        "capture-herestring",
+        MUST_NOT_FLAG,
+        'v=$(cat <<< "$GH_TOKEN")\necho "len=${#v}"\n',
+    ),
+    (
+        "capture-heredoc",
+        MUST_NOT_FLAG,
+        "v=$(cat <<EOF\n$GH_TOKEN\nEOF\n)\necho \"len=${#v}\"\n",
+    ),
     # --- helpers ---------------------------------------------------------
     (
         "helper-echo",
