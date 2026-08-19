@@ -226,13 +226,28 @@ oversight.
 CAPTURE IS NOT EMISSION.  In `_v=$(printf '%s' "$GH_TOKEN")` the value goes
 into a variable.  The shield is conditional, because #1012 measured the escape:
 `_v=$(printf '%s' "$GH_TOKEN" >&2)` redirects past the capture and reaches the
-terminal.  So a captured emitter counts as capture only when the emitting
-segment carries NO redirection at all; any redirection inside the substitution
-is flagged.  A subshell does not capture anything ITSELF -- `( echo "$PAT" )`
-at the top level is flagged -- but its standard output goes wherever the
-ENCLOSING context's does, so a subshell written inside `$( )` is shielded
-exactly as a bare command there is.  An array assignment's parenthesised list
-is data, and a `$( )` among its elements is a capture under that assignment.
+terminal.  So a captured emitter counts as capture only when NO output
+redirection stands between the emitter and the capture; any output redirection
+the value passes through on its way out of the substitution is flagged.
+
+A subshell does not capture anything ITSELF -- `( echo "$PAT" )` at the top
+level is flagged -- but its standard output goes wherever the ENCLOSING
+COMMAND's does, so the walk out of one is TRANSPARENT: it lands on the segment
+the `( )` was written in and reads that segment's redirection, pipe and
+capture, because those are the subshell's own.  Written inside `$( )` a
+subshell is therefore shielded exactly as a bare command is, and every
+spelling of the escape is flagged exactly as the bare one is -- `>&2` written
+inside the parens, after the `)`, or on a `( )` nested one level in.  Piped,
+it is graded by its CONSUMER, again exactly as a bare emitter is:
+`( printf '%s' "$PAT" ) | gh auth login --with-token` is legal.  Reading the
+relationship as "captured BY the enclosing segment" instead of "inside a
+subshell written in it" made the parens change the answer, in both directions
+at once -- the redirection after the `)` went unread while the same construct
+under an array assignment's `$( )` was flagged with no capture at all
+(#1032 round 2).
+
+An array assignment's parenthesised list is data, and a `$( )` among its
+elements is a capture under that assignment.
 
 REDACTION IS NOT EMISSION.  `${#VAR}` is a length and `${VAR:+set}` is a
 constant alternate; neither is a value reference, so both are legal with no
@@ -370,6 +385,14 @@ copy of it; this prose is a description of that registry, not a second source:
     single-line source-text scanner cannot answer, so the consumer counts as
     unresolved and the case fails CLOSED.  The named-command form of the same
     idiom (`| gh auth login --with-token`) is clean.
+  * (#1042) A redirection inside `$( )` that moves a descriptor OTHER than
+    fd 1: `v=$(printf '%s' "$PAT" 2>/dev/null)` and `v=$(... 2>&1)` reach no
+    stream, and the capture hop counts any output redirection rather than
+    only one that moves fd 1 -- while the PIPELINE hop of the same function
+    already asks the fd-aware question.  `v=$( ( ... ) 2>/dev/null )` is the
+    third spelling and is deliberately graded by that same reading: one wrong
+    answer #1042 corrects in one place beats two spellings of a line
+    disagreeing.  All three entries go stale together when #1042 lands.
   * (#1035) A MESSAGE HELPER whose emitter feeds a pipe:
     `login() { printf %s "$1" | gh auth login --with-token; }` plus
     `login "$PAT"`.  Helper discovery grades what the body writes without
@@ -397,7 +420,7 @@ or through a file.  This gate stops the DIRECT form from coming back; it is
 not a proof that no credential can reach a stream.
 
 And the recall claim is bounded by the CORPUS and by the SENTINEL, not by an
-argument.  What the harness demonstrates is that on ~419 constructs --
+argument.  What the harness demonstrates is that on ~429 constructs --
 generated across line spellings, file selection, pipeline consumers and
 legal-but-unusual precision shapes, each measured against ONE letter-leading
 sentinel value -- the scanner and bash agree except for the declared entries.
@@ -624,14 +647,28 @@ class CheckError(Exception):
 
 class Segment:
     __slots__ = (
-        "sid", "parent", "parent_is_capture", "words", "line",
-        "pipe_to", "_cmd", "_resolved",
+        "sid", "parent", "parent_is_capture", "parent_is_subshell", "words",
+        "line", "pipe_to", "_cmd", "_resolved",
     )
 
     def __init__(self, sid, parent, parent_is_capture, line):
         self.sid = sid
         self.parent = parent
         self.parent_is_capture = parent_is_capture
+        # Set when this segment is one of the commands INSIDE a `( ... )`
+        # subshell, in which case `parent` is the segment the subshell was
+        # written in -- the segment that carries any redirection written
+        # after the `)`, because that redirection is the subshell's own.
+        #
+        # It is a DIFFERENT relationship from `parent_is_capture`, and
+        # conflating the two is what made `v=$( ( printf %s "$PAT" ) >&2 )`
+        # read clean (#1032 round 2 F10): the walk graded the wrapper as if
+        # the subshell's stdout had been captured BY it, so the `>&2` the
+        # wrapper carries was never consulted.  A subshell captures
+        # nothing; its standard output IS the enclosing command's, so the
+        # hop out of one is transparent and the wrapper is asked only
+        # where its own output goes.
+        self.parent_is_subshell = False
         self.words = []  # list of (text, is_quoted_start)
         self.line = line
         # The segment this one's STDOUT is piped into, when a `|` separates
@@ -941,6 +978,10 @@ class Lexer:
             prev = lv["seg"]
             seg = self._new_segment(lv["seg"].parent, lv["capture"], line)
             seg.parent = lv["seg"].parent
+            # `( echo a; printf '%s' "$PAT" ) >&2` -- every command in the
+            # subshell shares the subshell's fate, so the flag travels with
+            # the level, not just with its first segment.
+            seg.parent_is_subshell = lv.get("subshell", False)
             if pipe:
                 prev.pipe_to = seg
             lv["seg"] = seg
@@ -1147,11 +1188,20 @@ class Lexer:
                 parent_seg = cur_level()["seg"]
                 sub = Lexer(inner)
                 for ll in sub.logical:
+                    # Re-parent the segments the sub-lexer left PARENTLESS,
+                    # the same rule `_absorb_substitutions` uses.  Re-parenting
+                    # the segment each REFERENCE sits in instead cut the link
+                    # to whatever ran between it and the substitution: a
+                    # `( ... )` writes to its enclosing command, and pointing
+                    # the inner command straight at the outer word made
+                    # ``v=`( printf '%s' "$PAT" )` `` read as an emission that
+                    # nothing captured.
+                    for seg2 in ll.segments:
+                        if seg2.parent is None:
+                            seg2.parent = parent_seg
+                            seg2.parent_is_capture = True
                     for r in ll.refs:
-                        rr = Ref(r.name, line, r.seg)
-                        rr.seg.parent = parent_seg
-                        rr.seg.parent_is_capture = True
-                        cur_ll.refs.append(rr)
+                        cur_ll.refs.append(Ref(r.name, line, r.seg))
                     cur_ll.segments.extend(ll.segments)
                 line += inner.count("\n")
                 cur_level()["word"].append("`sub`")
@@ -1355,19 +1405,32 @@ class Lexer:
                     # subshell / case-pattern parens.  A subshell does not
                     # capture anything ITSELF, so `( echo "$PAT" )` at the top
                     # level reaches the terminal -- but its standard output is
-                    # wherever the ENCLOSING level's output goes, so a subshell
-                    # written inside `$( )` is captured exactly as a bare
-                    # command there is.  Hard-coding False dropped that shield
-                    # and made `v=$( ( printf '%s' "$PAT" ) )` a false positive
-                    # on a required check (#1032 F10).
+                    # wherever the ENCLOSING command's output goes, so a
+                    # subshell written inside `$( )` is captured exactly as a
+                    # bare command there is.  Hard-coding a False parent
+                    # dropped that shield and made `v=$( ( printf '%s' "$PAT"
+                    # ) )` a false positive on a required check (#1032 F10).
+                    #
+                    # The link recorded is STRUCTURAL -- "these commands are
+                    # inside a subshell written in THAT segment" -- rather
+                    # than a copy of the enclosing level's capture flag.
+                    # Copying the flag answered "captured?" correctly only
+                    # where the enclosing level knew, and it lost the two
+                    # things the wrapper segment holds: the redirection
+                    # written after the `)` (missed) and the re-parenting
+                    # `_absorb_substitutions` performs on an array
+                    # assignment's `$( )` (missed the other way, so the
+                    # same subshell read clean in one context and leaked
+                    # in the other) -- #1032 round 2, F10 and F2 x F10.
                     parent_seg = cur_level()["seg"]
-                    enclosing_capture = cur_level()["capture"]
-                    seg = self._new_segment(parent_seg, enclosing_capture, line)
+                    seg = self._new_segment(parent_seg, False, line)
+                    seg.parent_is_subshell = True
                     cur_ll.segments.append(seg)
                     levels.append(
                         {
                             "seg": seg,
-                            "capture": enclosing_capture,
+                            "capture": False,
+                            "subshell": True,
                             "kind": "subshell",
                             "word": [],
                             "saved_quotes": quotes,
@@ -1794,6 +1857,22 @@ def reaches_output(ref, emitter_helpers):
 
     hops = 0
     via_stdin = False
+    # Set while the walk is standing on the segment a `( ... )` SUBSHELL was
+    # written in.  The value is already on that segment's standard output -- a
+    # subshell's standard output IS the enclosing command's -- so it is not
+    # re-graded as an emitter; it is asked only where its own output goes.
+    # `emitter` keeps the command that put the value there, for the message.
+    from_subshell = False
+    # Redirections the value has ALREADY passed through inside a `( )`, kept
+    # in the two shapes the two hops ask for: `escaped_any` is what the
+    # capture hop tests (any output redirection, the `_OUT_REDIR_RE` reading
+    # #1042 tracks), `escaped_fd1` what the pipeline hop tests (fd 1 only).
+    # In `v=$( ( printf '%s' "$PAT" >&2 ) )` the redirection sits on the
+    # printf and the capture it escapes is two segments further out, so
+    # without this the hop out of the subshell would drop it.
+    escaped_any = False
+    escaped_fd1 = False
+    emitter = None
     while seg is not None and hops < 32:
         hops += 1
         cmd, has_out_redir = resolve_command(seg)
@@ -1802,6 +1881,18 @@ def reaches_output(ref, emitter_helpers):
             return True, "command word could not be resolved (%s)" % (
                 "unresolvable" if cmd is UNRESOLVED else cmd
             )
+        # A redirection the value passed through inside a `( )` counts here
+        # exactly as one written on this segment would: when this segment is
+        # a subshell's WRAPPER, the redirection in `( ... ) >&2` is parked on
+        # it by the lexer and is the subshell's own.  Each hop below keeps its
+        # own reading -- `_OUT_REDIR_RE` for the capture, fd 1 for the
+        # pipeline -- so the subshell spelling and the bare spelling of a line
+        # get the same verdict rather than a third one.
+        has_out_redir = has_out_redir or escaped_any
+        stdout_moved = redirects_stdout(seg) or escaped_fd1
+        # `via_stdin` and `from_subshell` are exclusive by construction: each
+        # hop below clears the other, because a value cannot arrive on a
+        # segment's standard input AND already be on its standard output.
         if via_stdin:
             # The value arrived on THIS segment's standard input, through a
             # pipe.  `echo` and `printf` write their ARGUMENTS and discard
@@ -1842,19 +1933,28 @@ def reaches_output(ref, emitter_helpers):
                 kind = EMIT
                 if note is None:
                     note = "here-string"
-        if kind != EMIT:
+        if from_subshell:
+            # Not re-graded: `( ... )` is the command here, and the value is
+            # on its standard output already.  The wrapper segment holds only
+            # the subshell's redirections (and, in front of the `(`, a
+            # reserved word such as `then`), so asking whether IT is an
+            # emitter would answer about a segment that runs nothing.
+            pass
+        elif kind != EMIT:
             return False, ""
+        else:
+            emitter = cmd or emitter
         if seg.pipe_to is not None:
             # The value goes into the next segment's stdin rather than to a
             # terminal -- unless a redirection moves fd 1 somewhere the pipe
             # does not reach, which is the same escape the capture shield
             # below measures (`printf '%s' "$PAT" >&2 | grep -q x` reaches
             # the terminal on stderr).
-            if redirects_stdout(seg):
+            if stdout_moved:
                 return True, _why(
                     note,
                     "%s whose output redirection escapes the pipeline"
-                    % (cmd or "output command"),
+                    % (cmd or emitter or "output command"),
                 )
             tee_files = tee_file_operands(seg)
             if tee_files:
@@ -1866,18 +1966,42 @@ def reaches_output(ref, emitter_helpers):
                 )
             seg = seg.pipe_to
             via_stdin = True
+            from_subshell = False
+            escaped_any = False
+            escaped_fd1 = False
+            continue
+        if seg.parent_is_subshell and seg.parent is not None:
+            # Out of the subshell and onto the ENCLOSING command's stdout.
+            # Nothing is captured here and nothing is decided here: the
+            # wrapper segment is where the subshell's own redirection, pipe
+            # and capture status live, so the next turn of this loop reads
+            # them off it -- which is what keeps `( ... ) >&2` inside `$( )`
+            # an escape and `( ... )` inside `$( )` a capture, from the same
+            # rule rather than from two.  A redirection ALREADY passed --
+            # inside the parens, or on a nested `( )` -- travels out with the
+            # value, because the parens do not undo it: dropping it here is
+            # what let `v=$( ( printf '%s' "$PAT" >&2 ) )` read clean.
+            seg = seg.parent
+            via_stdin = False
+            from_subshell = True
+            escaped_any = has_out_redir
+            escaped_fd1 = stdout_moved
             continue
         if seg.parent_is_capture and seg.parent is not None:
             if has_out_redir:
                 return True, _why(
                     note, "%s inside $( ), where an output redirection "
-                    "escapes the capture" % cmd
+                    "escapes the capture"
+                    % (cmd or emitter or "output command"),
                 )
             seg = seg.parent
             via_stdin = False
+            from_subshell = False
+            escaped_any = False
+            escaped_fd1 = False
             note = note  # the note travels out with the reference
             continue
-        return True, _why(note, cmd or "output command")
+        return True, _why(note, cmd or emitter or "output command")
     return True, "expansion nesting too deep to resolve"
 
 
@@ -2556,6 +2680,50 @@ CORPUS = [
         'v=$( ( printf \'%s\' "$GH_TOKEN" >&2 ) )\necho "len=${#v}"\n',
     ),
     (
+        # The SAME escape written OUTSIDE the parens, which is where bash
+        # parks the redirection of `( ... ) >&2` -- on the segment the
+        # subshell was written in, not on the printf.  The pair above pins
+        # only the inside spelling, and while the shield read the enclosing
+        # level's capture flag instead of the structure, this one walked past
+        # the `>&2` it never looked at and the exact #1012 capture escape came
+        # back as a silent false negative (#1032 round 2 F10).
+        "subshell-inside-capture-redirected-outside",
+        MUST_FLAG,
+        'v=$( ( printf \'%s\' "$GH_TOKEN" ) >&2 )\necho "len=${#v}"\n',
+    ),
+    (
+        # ... and one level in, so the redirection is carried out through a
+        # subshell rather than straight to the substitution.
+        "subshell-nested-redirected-in-capture",
+        MUST_FLAG,
+        'v=$( ( ( printf \'%s\' "$GH_TOKEN" ) >&2 ) )\necho "len=${#v}"\n',
+    ),
+    (
+        # A subshell whose redirection does not move fd 1 sends nothing off
+        # the captured stream.  The parens change nothing about the verdict:
+        # it is the one `capture-stderr-only-redirection` records for the bare
+        # spelling, because the hop out of the subshell hands the capture the
+        # same `_OUT_REDIR_RE` reading rather than a second, narrower one.
+        # Both entries go stale together when #1042 lands.
+        "subshell-inside-capture-stderr-only",
+        MUST_FLAG,
+        'v=$( ( printf \'%s\' "$GH_TOKEN" ) 2>/dev/null )\necho "len=${#v}"\n',
+    ),
+    (
+        # `( ... )` piped into a filter is graded by its CONSUMER, exactly as
+        # the bare emitter is -- the hop out of the subshell reaches the
+        # segment the pipe hangs off, and grep is not a stdin echoer.
+        "subshell-piped-into-filter",
+        MUST_NOT_FLAG,
+        '( printf \'%s\' "$GH_TOKEN" ) | grep -qF zz || echo ok\n',
+    ),
+    (
+        # ... and into one that DOES write its standard input.
+        "subshell-piped-into-cat",
+        MUST_FLAG,
+        '( printf \'%s\' "$GH_TOKEN" ) | cat\n',
+    ),
+    (
         # An ARRAY ASSIGNMENT is data, but bash still RUNS a `$( )` among its
         # elements.  Skipping the parenthesised span without lexing it meant
         # the redirection that escapes the capture was never looked at.
@@ -2567,6 +2735,23 @@ CORPUS = [
         "array-cmdsub-captured",
         MUST_NOT_FLAG,
         'args=($(printf \'%s\' "$GH_TOKEN"))\necho "n=${#args[@]}"\n',
+    ),
+    (
+        # A SUBSHELL inside an array assignment's absorbed `$( )`.  The same
+        # construct as `subshell-inside-capture`, and it must get the same
+        # verdict: `_absorb_substitutions` re-parents only the segments the
+        # sub-lexer left parentless, so while the shield rode on a copied
+        # capture flag this shape was the mirror image of the miss above -- a
+        # false positive on a required fleet check, from the same construct
+        # that read clean one context over (#1032 round 2 F2 x F10).
+        "array-cmdsub-subshell-captured",
+        MUST_NOT_FLAG,
+        'args=($( ( printf \'%s\' "$GH_TOKEN" ) ))\necho "n=${#args[@]}"\n',
+    ),
+    (
+        "array-cmdsub-subshell-redirected",
+        MUST_FLAG,
+        'args=($( ( printf \'%s\' "$GH_TOKEN" ) >&2 ))\necho ok\n',
     ),
     (
         # `+=` is an array assignment too, and the elements can span lines.
@@ -2588,6 +2773,27 @@ CORPUS = [
         'v=$( ( printf \'%s\' "$GH_TOKEN" ) | cat )\necho "len=${#v}"\n',
     ),
     ("backtick-emitter", MUST_FLAG, 'echo "`echo "$GH_TOKEN"`"\n'),
+    (
+        # The backtick spelling of the capture re-parents the sub-lexer's
+        # PARENTLESS segments, the same rule the `$( )` spelling uses.  While
+        # it re-parented the segment each REFERENCE sat in instead, whatever
+        # stood between that segment and the substitution was cut out of the
+        # walk: a subshell was read as an emission nothing captured, and the
+        # consumer of a pipeline kept no capture at all.
+        "backtick-subshell-captured",
+        MUST_NOT_FLAG,
+        'v=`( printf \'%s\' "$GH_TOKEN" )`\necho "len=${#v}"\n',
+    ),
+    (
+        "backtick-subshell-redirected",
+        MUST_FLAG,
+        'v=`( printf \'%s\' "$GH_TOKEN" ) >&2`\necho "len=${#v}"\n',
+    ),
+    (
+        "backtick-pipe-into-cat-captured",
+        MUST_NOT_FLAG,
+        'v=`printf \'%s\' "$GH_TOKEN" | cat`\necho "len=${#v}"\n',
+    ),
     ("eval-opaque", MUST_FLAG, 'eval echo "$GH_TOKEN"\n'),
     ("unresolvable-command", MUST_FLAG, 'c=echo; "$c" "$GH_TOKEN"\n'),
     # --- here-docs and here-strings -------------------------------------
@@ -2789,6 +2995,9 @@ CORPUS = [
     # moves only fd 2 counts, and neither of these two puts anything on a
     # stream.  Both are declared in KNOWN_BROADER; the pipeline branch of the
     # same function already asks the fd-aware question (`redirects_stdout`).
+    # `subshell-inside-capture-stderr-only` is the third spelling, and it is
+    # deliberately graded by this same reading rather than by a narrower one
+    # of its own: all three go stale together when #1042 lands.
     (
         "capture-stderr-only-redirection",
         MUST_FLAG,
@@ -3459,6 +3668,15 @@ KNOWN_BROADER = {
         "the same descriptor blindness reached the other way: `2>&1` folds "
         "standard error INTO the captured standard output, so the capture "
         "swallows both streams and the redirection escapes nothing"
+    ),
+    "subshell-inside-capture-stderr-only": (
+        "the same descriptor blindness reached through a `( )` -- the hop out "
+        "of a subshell hands the capture the redirection it passed, in the "
+        "reading the capture already uses, so `v=$( ( printf ... ) "
+        "2>/dev/null )` gets the verdict `capture-stderr-only-redirection` "
+        "records for the bare spelling instead of a second, narrower one.  "
+        "Deliberate: one wrong answer that #1042 corrects everywhere beats "
+        "two spellings of the same line disagreeing"
     ),
     "procsub-input-into-filter": (
         "an INPUT process substitution is judged a standalone output path: "
