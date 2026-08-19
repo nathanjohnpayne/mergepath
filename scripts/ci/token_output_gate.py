@@ -208,9 +208,14 @@ coverage.  The scanner is a source-text approximation; the oracle is the only
 thing here that knows the truth, and it only knows it about constructs someone
 put in the corpus.
 
-INDIRECTION IS NOT COVERED.  This is a single-hop source-text scanner over one
-logical line at a time, with no dataflow, no cross-file analysis, and no
-knowledge of what a variable holds at runtime.  It does not catch:
+The list below mixes TWO KINDS of gap and says which is which.  Most of it is
+the DESIGN LIMIT: this is a single-hop source-text scanner over one logical line
+at a time, with no dataflow, no cross-file analysis, and no knowledge of what a
+variable holds at runtime, so indirection, external commands, interpreters and
+unscanned files are permanently out of reach.  Four bullets are marked (#1035)
+instead: those are `resolve_command` / `classify` mis-deciding what a segment
+RUNS, a repairable seam with an open issue, not a property of the design.  It
+does not catch:
 
   * A token copied into a differently-named variable and then printed
     (`pat=$OP_PREFLIGHT_AUTHOR_PAT; echo "$pat"`), or reached through a
@@ -223,9 +228,9 @@ knowledge of what a variable holds at runtime.  It does not catch:
   * `set -x` traces, core dumps, or anything the shell emits on its own.  Not
     a construct in a line, so there is no corpus case behind this one -- it is
     a statement about the shell, and the harness has nothing to say about it.
-  * A SHELL-STATE DUMPER on a segment that names no credential variable.  The
-    boundary here is the REFERENCE, not the command word, and the earlier
-    wording of this bullet had it the other way round.  This scanner asks
+  * (#1035) A SHELL-STATE DUMPER on a segment that names no credential
+    variable.  The boundary here is the REFERENCE, not the command word, and
+    the earlier wording of this bullet had it the other way round.  This scanner asks
     "does this reference reach a stream?", so `classify()` -- which is where
     `env`/`printenv`/`set`/`compgen` are known to be dumpers at all -- is
     consulted only for a segment carrying a `$`-reference.  Measured, on this
@@ -238,16 +243,16 @@ knowledge of what a variable holds at runtime.  It does not catch:
     whether the command dumps the environment it was handed.  A dumper reached
     through a variable is not caught either, because nothing in the source text
     says what it is.
-  * A WRAPPER whose real command word sits behind an operand or an option
-    ARGUMENT: `timeout 5 echo "$PAT"` and `nice -n 5 echo "$PAT"` both resolve
-    to `5` and read clean.  Wrapper OPTIONS are stepped over; wrapper operands
-    are not parsed.
-  * `printf '%s\n' -v "$PAT"`, where `-v` is DATA after the format operand.
-    The `printf -v` assignment test scans every word rather than only option
-    position, so the segment reads as an assignment and not an emission.
-  * A message helper whose opening `{` starts the line AFTER the declaration
-    (`log()` then `{ echo "$1"; }`).  The one-line spelling of the same helper
-    is found and flagged, so this is a spelling gap in discovery.
+  * (#1035) A WRAPPER whose real command word sits behind an operand or an
+    option ARGUMENT: `timeout 5 echo "$PAT"` and `nice -n 5 echo "$PAT"` both
+    resolve to `5` and read clean.  Wrapper OPTIONS are stepped over; wrapper
+    operands are not parsed.
+  * (#1035) `printf '%s\n' -v "$PAT"`, where `-v` is DATA after the format
+    operand.  The `printf -v` assignment test scans every word rather than only
+    option position, so the segment reads as an assignment, not an emission.
+  * (#1035) A message helper whose opening `{` starts the line AFTER the
+    declaration (`log()` then `{ echo "$1"; }`).  The one-line spelling of the
+    same helper is found and flagged, so this is a spelling gap in discovery.
   * A token handed to an EXTERNAL command -- as an ARGUMENT
     (`curl -H "Authorization: Bearer $CF_API_TOKEN"`), on a HERE-STRING
     (`grep . <<< "$PAT"`), or through a PIPE (`printf '%s' "$PAT" | grep .`).
@@ -283,14 +288,14 @@ copy of it; this prose is a description of that registry, not a second source:
     single-line source-text scanner cannot answer, so the consumer counts as
     unresolved and the case fails CLOSED.  The named-command form of the same
     idiom (`| gh auth login --with-token`) is clean.
-  * A MESSAGE HELPER whose emitter feeds a pipe:
+  * (#1035) A MESSAGE HELPER whose emitter feeds a pipe:
     `login() { printf %s "$1" | gh auth login --with-token; }` plus
     `login "$PAT"`.  Helper discovery grades what the body writes without
     asking where that write goes, so it does not run the pipeline-consumer
     analysis the direct form gets.  Nothing reaches a stream and the gate reds.
-  * An INPUT PROCESS SUBSTITUTION: `grep -qF x <(printf '%s' "$PAT")`.  Every
-    `<(...)` body is graded as a standalone output path with no model of what
-    consumes the fd, so this reds while emitting nothing.  `cat <(...)` really
+  * (#1035) An INPUT PROCESS SUBSTITUTION: `grep -qF x <(printf '%s'
+    "$PAT")`.  Every `<(...)` body is graded as a standalone output path with
+    no model of what consumes the fd, so this reds while emitting nothing.  `cat <(...)` really
     does leak and is flagged by the same undiscriminating rule, which is why
     the two are not currently told apart.
 
