@@ -56,6 +56,11 @@
 # #466. `scripts/op-preflight.sh` is the canonical legitimate emitter:
 # writing those values to its cache IS its contract.
 #
+# The marker counts only inside a real, UNQUOTED shell COMMENT. A command
+# that carries the same text as quoted DATA still runs and still writes the
+# value, so a fixture that merely mentions the marker cannot silence the
+# gate on a live emitter.
+#
 # The pragma is a REVIEW MARKER, not a security boundary. Anyone editing
 # the file can silence this check — by adding the pragma, by renaming the
 # variable, by any of the indirections listed below. What the marker buys
@@ -74,7 +79,11 @@
 # parameters VERBATIM through echo/printf (`fail() { echo "FAIL: $*"; }`).
 # A redactor derives a length or a class and prints that, so by
 # construction it is not such a function and `$(describe_secret "$PAT")`
-# stays legal.
+# stays legal. "Verbatim" reads the two carve-outs above at the positional
+# too, since a helper is entitled to use the forms the check documents:
+# `${1:+set}` is a constant alternate and `${#1}` a length, so
+# `key_state() { printf %s "${1:+set}"; }` is a redactor, while
+# `${1:+$1}` carries its own expansion and is not.
 #
 # ── What this check does NOT catch (design question 3) ───────────────────
 #
@@ -437,7 +446,47 @@ function writes_own_args(line,   s, seg) {
     s = substr(s, RSTART + RLENGTH)
     seg = s
     sub(/[;|&].*$/, "", seg)
-    if (seg ~ /\$[{]?[@*1-9]/) return 1
+    if (positional_verbatim(seg)) return 1
+  }
+  return 0
+}
+
+# Does this emitter argument list carry a positional parameter as its VALUE?
+#
+# `${1:+set}` and `${1+set}` expand to the CONSTANT alternate — presence, not
+# the value — which is the very form this check documents as the legal way to
+# report a credential (`${VAR:+set}`). A helper built from it is therefore a
+# REDACTOR, and reading `$1` out of it classified `key_state() { printf %s
+# "${1:+set}"; }` as an emitter, so every `key_state "$GH_TOKEN"` call site
+# false-positived. Reported by Codex on #1012 and reproduced on a fixture.
+# `${#1}` is a length and was already out, since `#` is not a positional.
+# An alternate carrying its own expansion (`${1:+$1}`) is not constant, the
+# same qualification expansion() applies to a named credential.
+function positional_verbatim(seg,   i, n, c, nxt, inner, braces, j, name, rest) {
+  n = length(seg)
+  for (i = 1; i <= n; i++) {
+    c = substr(seg, i, 1)
+    if (c != "$") continue
+    nxt = substr(seg, i + 1, 1)
+    if (nxt == "{") {
+      braces = 1; inner = ""
+      for (j = i + 2; j <= n; j++) {
+        c = substr(seg, j, 1)
+        if (c == "{") braces++
+        else if (c == "}") { braces--; if (braces == 0) break }
+        inner = inner c
+      }
+      # Unterminated: fall back to the pre-#1012 verdict rather than
+      # inventing one, so malformed text cannot quietly widen what passes.
+      if (braces != 0) return (substr(seg, i + 2, 1) ~ /[0-9@*]/)
+      name = inner
+      sub(/[^0-9@*].*$/, "", name)
+      if (name == "") { i = j; continue }        # not a positional at all
+      rest = substr(inner, length(name) + 1)
+      if (rest ~ /^:?\+/ && rest !~ /\$/) { i = j; continue }   # constant
+      return 1
+    }
+    if (nxt ~ /[@*1-9]/) return 1
   }
   return 0
 }
@@ -479,7 +528,42 @@ function scan_lines(   i, line, hit, trimmed, href) {
 }
 
 function comment(line) { return line ~ /^[[:space:]]*#/ }
-function exempt(line)  { return line ~ /TOKEN_OUTPUT_EXEMPT:[[:space:]]*[^[:space:]]/ }
+
+# The pragma exempts only when it sits in a real, UNQUOTED shell COMMENT.
+# A command carrying the marker as quoted DATA still executes and still
+# emits — `printf "%s %s\n" "$GH_TOKEN" SQ-TOKEN_OUTPUT_EXEMPT: text-SQ`
+# prints the value — so matching the marker anywhere on the line let a
+# fixture that merely mentions it silence the gate on a live emitter.
+# Reported by Codex on #1012 and reproduced before this rule was written.
+function exempt(line,   c) {
+  c = comment_at(line)
+  if (c == 0) return 0
+  return substr(line, c) ~ /TOKEN_OUTPUT_EXEMPT:[[:space:]]*[^[:space:]]/
+}
+
+# Index of the character that opens an unquoted `#` comment, or 0 when the
+# line has none. Same rule ends_continuation() applies mid-walk: a `#` opens
+# a comment only where it is unquoted, unescaped, and starts a word. The two
+# walks are kept separate because they answer different questions — this one
+# reports WHERE the comment begins, that one only needs to stop when it
+# meets one.
+function comment_at(s,   i, n, c, q, esc, prev) {
+  n = length(s); q = ""; esc = 0
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (q == SQ) { if (c == SQ) q = ""; continue }
+    if (esc) { esc = 0; continue }
+    if (c == "\\") { esc = 1; continue }
+    if (q == "\"") { if (c == "\"") q = ""; continue }
+    if (c == SQ)   { q = SQ; continue }
+    if (c == "\"") { q = "\""; continue }
+    if (c == "#") {
+      prev = (i == 1) ? " " : substr(s, i - 1, 1)
+      if (prev ~ /[[:space:];&|(]/) return i
+    }
+  }
+  return 0
+}
 
 # `idx` indexes the LOGICAL line; the number printed is the first PHYSICAL
 # line it was built from, so it points at the emitter and not at whichever
@@ -944,6 +1028,21 @@ echo \"ENV_GH_TOKEN_VALUE=\${GH_TOKEN:-}\" >> \"\$LOG\"
 GH_STUB"
   assert_flagged "an exemption pragma with no reason does not exempt" \
     'echo "$GH_TOKEN"  # TOKEN_OUTPUT_EXEMPT:'
+  # The pragma is only a pragma in a COMMENT. Carried as quoted DATA the
+  # command still runs and still prints the value, so matching the marker
+  # anywhere on the line let a fixture mentioning it silence a live emitter.
+  assert_flagged "the marker as quoted data is not an exemption" \
+    "printf ${SQ}%s %s\\n${SQ} \"\$GH_TOKEN\" ${SQ}TOKEN_OUTPUT_EXEMPT: fixture text${SQ}"
+  # ...and a `#` inside a quoted argument does not open the comment the
+  # pragma has to live in, so quote state is load-bearing in exempt() too.
+  assert_flagged "a hash inside a quoted argument does not open an exemption comment" \
+    'echo "# TOKEN_OUTPUT_EXEMPT: not a comment" "$GH_TOKEN"'
+  # A presence-only helper whose alternate carries its OWN expansion emits
+  # the value, so it is an emitter — this pins the constant half of the
+  # redactor rule below and stops it widening into any `${1:+...}` at all.
+  assert_flagged "an alternate carrying its own expansion is not constant" \
+    "note() { printf %s \"\${1:+\$1}\"; }
+note \"\$GH_TOKEN\""
   # ── Backslash continuations: the emitter and its argument are ONE
   # command. Re-wrapping a covered direct emitter across a continuation is
   # a cosmetic edit; it must not move the site out of coverage.
@@ -1053,6 +1152,12 @@ echo \"saw \$(describe_secret \"\$OP_PREFLIGHT_AUTHOR_PAT\")\""
   assert_clean "a set/unset redactor tests a positional but emits a constant" \
     "key_state() { [ -n \"\$1\" ] && printf SET || printf unset; }
 echo \"- token: \$(key_state \"\${ANTHROPIC_AUTH_TOKEN:-}\")\""
+  # The SAME redactor written with the constant alternate this check
+  # documents as the legal presence form. Reading `$1` out of `${1:+set}`
+  # classified the helper as an emitter and false-positived every call site.
+  assert_clean "a constant-alternate presence helper is a redactor, not an emitter" \
+    "key_state() { printf %s \"\${1:+set}\"; }
+echo \"- token: \$(key_state \"\$GH_TOKEN\")\""
   assert_clean "captured into a variable, not emitted" \
     '_v=$(printf %s "$GH_TOKEN")'
   assert_clean "backslash-escaped literal in remediation text" \
