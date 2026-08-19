@@ -1327,10 +1327,40 @@ jobs:
           REQUIRED_HEAD_CHECK_NAME: lint
           TEST_CHECK_WAIT_SECONDS: 1200
           TEST_CHECK_POLL_SECONDS: 15
+          TEST_CHECK_POLL_MAX_SECONDS: 60
+          TEST_CHECK_POLL_BACKOFF_AFTER_SECONDS: 120
         run: |
           required_check_name=${REQUIRED_HEAD_CHECK_NAME:-lint}
           wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
           poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
+          # #1024: this loop runs under AUTHOR_MERGE_TOKEN (nathanjohnpayne,
+          # user id 23488723) and re-queried the whole statusCheckRollup on a
+          # FLAT poll_seconds cadence, so a full 1200s wait cost up to 80
+          # GraphQL queries per run -- per push, per PR. That is the measured
+          # spender behind the recurring "API rate limit already exceeded for
+          # user ID 23488723" merge failures, and it is billed against the
+          # same identity CI needs for every other author-attributed call.
+          # Widen the cadence progressively instead: the first polls stay at
+          # poll_seconds (that is where a fast-green check actually lands),
+          # and once poll_backoff_after_seconds of waiting has accumulated the
+          # interval doubles per poll up to poll_max_seconds. With the
+          # defaults (15s, widen after 120s, ceiling 60s) a full 1200s wait
+          # costs ~28 polls instead of 80, and the worst case a green check
+          # goes unnoticed is one ceiling interval.
+          poll_max_seconds=${TEST_CHECK_POLL_MAX_SECONDS:-60}
+          poll_backoff_after_seconds=${TEST_CHECK_POLL_BACKOFF_AFTER_SECONDS:-120}
+          # A ceiling below the initial cadence would mean "back off to
+          # something faster", which is not a thing; clamp rather than
+          # letting a misconfigured consumer poll harder than configured.
+          if [ "$poll_max_seconds" -lt "$poll_seconds" ]; then
+            poll_max_seconds=$poll_seconds
+          fi
+          current_poll_seconds=$poll_seconds
+          # Accumulated SLEEP time drives the backoff schedule (wall-clock
+          # SECONDS still drives the deadline below). The two are within a
+          # few seconds of each other in practice, and the accumulator is
+          # deterministic, which is what makes the schedule assertable.
+          waited_seconds=0
           deadline=$((SECONDS + wait_seconds))
           pr_view_json=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,isCrossRepository,baseRefName,headRefName)
           sha=$(echo "$pr_view_json" | jq -r .headRefOid)
@@ -1868,6 +1898,11 @@ jobs:
             # later page.
             rollup_contexts="[]"
             cursor=""
+            # #1024 (b): rollup_complete records whether this iteration
+            # actually walked every page. It is only ever cleared by the
+            # short-circuit below, which fires exclusively toward the
+            # "keep waiting" verdict -- never toward "green".
+            rollup_complete=1
             while :; do
               cursor_args=(-F cursor=null)
               if [ -n "$cursor" ]; then
@@ -1927,7 +1962,73 @@ jobs:
               has_next=$(echo "$page_json" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage // false)')
               cursor=$(echo "$page_json" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor // "")')
               [ "$has_next" = "true" ] || break
+              # #1024 (b): the pages walked so far can already SETTLE this
+              # iteration's verdict as "keep waiting", and when they do,
+              # the remaining pages cannot change it -- so stop paying for
+              # them. The predicate below is deliberately one-directional:
+              # it only ever short-circuits toward waiting, never toward
+              # concluding green, because a cheaper loop that can miss a
+              # pending required check is far worse than an expensive one.
+              #
+              # Soundness (this is the whole safety argument, so it is
+              # spelled out rather than asserted): the predicate fires only
+              # on an entry that (1) matches a configured required check
+              # name, (2) for the canonical workflow=="" requirement, also
+              # reports isRequired==true for THIS pull request, and (3) is
+              # non-terminal by the same CheckRun/StatusContext rule the
+              # winner-selection query below uses. Given such an entry, the
+              # full-pagination evaluation below is GUARANTEED to reach
+              # all_done=0 for that check name no matter what the unfetched
+              # pages hold: isRequired==true makes $required_matches
+              # non-empty, so the workflow=="" branch keeps this entry in
+              # $matches; its workflow group therefore has a non-empty
+              # $pending list; and a non-empty $pending makes that group's
+              # winner the pending entry, which is exactly the
+              # pending_count>0 branch. A name-scoped ($workflow != "")
+              # requirement skips the isRequired filter entirely and lands
+              # on the same branch. An absent or null isRequired never
+              # fires the short-circuit, so an ambiguous rollup keeps
+              # paging as before.
+              pending_required=$(printf '%s' "$rollup_contexts" | jq --argjson required "$required_checks_json" '
+                . as $ctx
+                | [ $required[]
+                    | . as $req
+                    | ($ctx | map(select(
+                          ((.name // .context // "") == $req.name)
+                          and ($req.workflow == "" or ((.checkSuite.workflowRun.workflow.name // "") == $req.workflow))
+                          and (if $req.workflow == "" then (.isRequired == true) else true end)
+                          and (if (.status != null)
+                               then (.status != "COMPLETED")
+                               else ((.state // "") as $sc_state | ["PENDING","EXPECTED"] | index($sc_state))
+                               end)
+                      )) | length)
+                  ]
+                | add // 0')
+              if [ "$pending_required" -gt 0 ]; then
+                rollup_complete=0
+                break
+              fi
             done
+            # #1024 (b): a short-circuited iteration holds only a PREFIX of
+            # the rollup, so nothing below may draw a conclusion from it.
+            # The verdict is already settled ("keep waiting", per the
+            # soundness argument above), so skip this iteration's
+            # evaluation entirely and fall through to the deadline check
+            # and the backoff sleep. Zeroing the loop bound (rather than
+            # re-indenting ~200 lines of evaluation into an else-branch)
+            # keeps the diff on a propagated required-gate workflow small
+            # enough to review line by line. Skipping matters: on a partial
+            # rollup a stale FAILED entry whose superseding success sits on
+            # an unfetched page would lose winner-selection and wrongly
+            # refuse auto-merge. Nothing is lost by deferring -- a red
+            # sibling check cannot change a verdict that is already "wait",
+            # and it is still caught on the first iteration that completes
+            # pagination, or at the deadline.
+            if [ "$rollup_complete" -ne 1 ]; then
+              echo "::notice::A required check is still pending on the first $(echo "$rollup_contexts" | jq 'length') statusCheckRollup context(s) for HEAD $sha; skipping the remaining pages this poll (#1024)."
+              all_done=0
+              check_count=0
+            fi
             # workflowPath (#655 round 13, "disambiguate annex workflows
             # beyond display name", found on the codex-review-check.sh copy
             # and mirrored here): derived from the workflow FILE's
@@ -2070,7 +2171,13 @@ jobs:
               echo "Required check run '$check_name' is $conclusion_summary on current HEAD $sha."
             done
 
-            if [ -n "$annex_workflow" ]; then
+            # #1024 (b): `rollup_complete` guards the annex scan for the
+            # same reason the required-check loop is skipped above -- its
+            # group-by-name winner selection over a PREFIX of the rollup
+            # could pick a stale FAILURE whose green rerun sits on an
+            # unfetched page and exit 1 on it. The scan runs unchanged on
+            # every iteration that completed pagination.
+            if [ -n "$annex_workflow" ] && [ "$rollup_complete" -eq 1 ]; then
               # #655 Codex round 6 (P1 "wait for annex checks before
               # clearing the label", P1 "observe matrix annex jobs before
               # auto-merge", P2 "avoid forcing path-filtered annex jobs to
@@ -2162,7 +2269,22 @@ jobs:
               echo "::error::Required check run(s) did not all complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
               exit 1
             fi
-            sleep "$poll_seconds"
+            # #1024 (a): progressive backoff, replacing the flat
+            # `sleep "$poll_seconds"`. Never sleep past the deadline, so
+            # widening the cadence cannot extend the configured wait budget.
+            sleep_seconds=$current_poll_seconds
+            remaining_seconds=$((deadline - SECONDS))
+            if [ "$remaining_seconds" -gt 0 ] && [ "$sleep_seconds" -gt "$remaining_seconds" ]; then
+              sleep_seconds=$remaining_seconds
+            fi
+            sleep "$sleep_seconds"
+            waited_seconds=$((waited_seconds + sleep_seconds))
+            if [ "$waited_seconds" -ge "$poll_backoff_after_seconds" ] && [ "$current_poll_seconds" -lt "$poll_max_seconds" ]; then
+              current_poll_seconds=$((current_poll_seconds * 2))
+              if [ "$current_poll_seconds" -gt "$poll_max_seconds" ]; then
+                current_poll_seconds=$poll_max_seconds
+              fi
+            fi
           done
           echo "::error::Required check run wait loop ended unexpectedly; refusing auto-merge."
           exit 1
