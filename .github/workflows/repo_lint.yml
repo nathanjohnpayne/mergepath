@@ -16,6 +16,32 @@
 #     depend only on manifest-propagated files, or soft-pass when the
 #     backing script is absent (the #590-style
 #     `[ -f scripts/<gate>.sh ] || exit 0` one-liner).
+#   - EVERY `run: ./scripts/ci/check_X` step carries the #590 missing-file
+#     soft-pass tail (#979), without exception:
+#
+#       run: ./scripts/ci/check_X || { rc=$?; if [ ! -f scripts/ci/check_X ];
+#         then echo "..."; exit 0; fi; exit "$rc"; }   # (one physical line)
+#
+#     The tail exits 0 ONLY when the backing script is absent; a script that
+#     is present and fails still propagates its exit code, so a real
+#     violation still reds the job. It must stay on ONE line so
+#     check_ci_scripts_wired still sees the literal `run: ./scripts/ci/check_X`
+#     wire. Rationale: `requires: ["scripts/ci/"]` makes the kit travel with
+#     this file, but a consumer may skip the kit in its `.sync-overrides.yml`
+#     (gaycruisebingo does today) and then receives this workflow WITHOUT the
+#     script it invokes — a bare `run:` reds that consumer's lint on rc 127,
+#     forever, and the consumer cannot fix it because the hub owns the kit.
+#     A hub-side script that goes missing is still caught: the paired
+#     assertion in tests/test_repo_lint_consumer_safety.sh fails when a wired
+#     name has no file in scripts/ci/, and that suite also EXECUTES every
+#     `run:` body here against a kit-less fixture to prove the tail works.
+#   - The same kit-less rule binds any OTHER step that touches scripts/ci/,
+#     not just the check wires. A setup step that fails on an absent or empty
+#     kit reds the job BEFORE the guarded checks run, which makes every tail
+#     below it unreachable — the `make_ci_scripts_executable` chmod was
+#     exactly that. The same suite executes each such step against a tree
+#     with no scripts/ci/ at all and against an empty one, and both must
+#     exit 0.
 
 name: repo-lint
 
@@ -36,7 +62,17 @@ jobs:
           persist-credentials: false
 
       - name: make_ci_scripts_executable
-        run: chmod +x scripts/ci/*
+        # Kit-less-safe (#979). `chmod +x scripts/ci/*` fails on a consumer
+        # that skipped the `scripts/ci/` kit: the glob matches nothing, bash
+        # hands `chmod` the literal pattern, and chmod exits nonzero — so the
+        # job reds HERE, before any soft-passing check step below ever runs,
+        # and every soft-pass tail underneath is unreachable. Guard on the
+        # directory and enumerate with `find`, which is a no-op on an empty
+        # kit; a real chmod failure on a populated kit still propagates.
+        run: |
+          if [ -d scripts/ci ]; then
+            find scripts/ci -maxdepth 1 -type f -exec chmod +x {} +
+          fi
 
       # #777 part 1 of 2 — record .git/config BEFORE any step that runs a
       # test suite. The paired verification step at the END of this job
@@ -132,25 +168,74 @@ jobs:
       # remembered to add the matching workflow step. Pure-bash so it
       # can run before any tooling install (yq, etc.).
       - name: check_ci_scripts_wired
-        run: ./scripts/ci/check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired || { rc=$?; if [ ! -f scripts/ci/check_ci_scripts_wired ]; then echo "check_ci_scripts_wired not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      # The reverse of check_ci_scripts_wired: that one enforces script → wire,
+      # this one enforces wire → script. It is deliberately INLINE rather than
+      # a scripts/ci/ check, and gated on the hub marker rather than on the
+      # kit. Every soft-pass tail above exits 0 when its backing script is
+      # gone, so any assertion that lives inside the kit can be retired by
+      # deleting the very file it was supposed to notice was missing — the
+      # mechanism would then validate its own removal. This step cannot be:
+      # scripts/sync-to-downstream.sh is hub-only and is NOT part of the
+      # scripts/ci/ kit, so on the hub a wired name with no file is a hard
+      # failure even if the whole kit is deleted, while a consumer that
+      # skipped the kit still passes. Pure-bash; the awk is the same
+      # comment-stripping, `run:`-anchored extraction the wired guard uses,
+      # so a check named only in a comment is not mistaken for a wire.
+      - name: check_ci_kit_integrity
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/sync-to-downstream.sh ]; then
+            echo "check_ci_kit_integrity: SKIP (consumer checkout — the scripts/ci kit is optional here)"
+            exit 0
+          fi
+          missing=0
+          wired=$(awk '
+            {
+              sub(/[[:space:]]*#.*$/, "")
+              if (match($0, /^[[:space:]]*run:[[:space:]]*\.\/scripts\/ci\/check_[A-Za-z0-9_]+/)) {
+                line = substr($0, RSTART, RLENGTH)
+                sub(/^[[:space:]]*run:[[:space:]]*\.\/scripts\/ci\//, "", line)
+                print line
+              }
+            }
+          ' .github/workflows/repo_lint.yml | LC_ALL=C sort -u)
+          if [ -z "$wired" ]; then
+            echo "FAIL: no wired scripts/ci checks found in repo_lint.yml (extraction broken?)" >&2
+            exit 1
+          fi
+          # Check names are [A-Za-z0-9_] by construction above, so plain word
+          # splitting is safe and keeps the loop in the current shell (a pipe
+          # would run it in a subshell and lose "missing").
+          for name in $wired; do
+            if [ ! -f "scripts/ci/$name" ]; then
+              echo "FAIL: repo_lint.yml wires $name but scripts/ci/$name does not exist on the hub — the missing-script soft-pass would swallow it silently" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "check_ci_kit_integrity: PASS ($(printf '%s\n' "$wired" | wc -l | tr -d ' ') wired checks all resolve to a file)"
 
       - name: check_required_root_files
-        run: ./scripts/ci/check_required_root_files
+        run: ./scripts/ci/check_required_root_files || { rc=$?; if [ ! -f scripts/ci/check_required_root_files ]; then echo "check_required_root_files not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_no_tool_folder_instructions
-        run: ./scripts/ci/check_no_tool_folder_instructions
+        run: ./scripts/ci/check_no_tool_folder_instructions || { rc=$?; if [ ! -f scripts/ci/check_no_tool_folder_instructions ]; then echo "check_no_tool_folder_instructions not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_no_forbidden_top_level_dirs
-        run: ./scripts/ci/check_no_forbidden_top_level_dirs
+        run: ./scripts/ci/check_no_forbidden_top_level_dirs || { rc=$?; if [ ! -f scripts/ci/check_no_forbidden_top_level_dirs ]; then echo "check_no_forbidden_top_level_dirs not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_dist_not_modified
-        run: ./scripts/ci/check_dist_not_modified
+        run: ./scripts/ci/check_dist_not_modified || { rc=$?; if [ ! -f scripts/ci/check_dist_not_modified ]; then echo "check_dist_not_modified not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_spec_test_alignment
-        run: ./scripts/ci/check_spec_test_alignment
+        run: ./scripts/ci/check_spec_test_alignment || { rc=$?; if [ ! -f scripts/ci/check_spec_test_alignment ]; then echo "check_spec_test_alignment not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_duplicate_docs
-        run: ./scripts/ci/check_duplicate_docs
+        run: ./scripts/ci/check_duplicate_docs || { rc=$?; if [ ! -f scripts/ci/check_duplicate_docs ]; then echo "check_duplicate_docs not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # Bootstrap-wizard test suites (#156). Each check_bootstrap_*
       # script wraps the matching tests/test_bootstrap_*.sh suite
@@ -161,33 +246,33 @@ jobs:
       - name: check_bootstrap_sh
         # Runtime-secret bootstrap helper: restore-only op inject path
         # and retired Secure Note / notesPlain sync path.
-        run: ./scripts/ci/check_bootstrap_sh
+        run: ./scripts/ci/check_bootstrap_sh || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_sh ]; then echo "check_bootstrap_sh not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_bootstrap_wizard
         # Sub-A: top-level bootstrap wizard scaffolding + flow.
-        run: ./scripts/ci/check_bootstrap_wizard
+        run: ./scripts/ci/check_bootstrap_wizard || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_wizard ]; then echo "check_bootstrap_wizard not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_bootstrap_template_mirror
         # Sub-B: template-mirror bootstrap that seeds a downstream
         # repo with the canonical mergepath template files.
-        run: ./scripts/ci/check_bootstrap_template_mirror
+        run: ./scripts/ci/check_bootstrap_template_mirror || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_template_mirror ]; then echo "check_bootstrap_template_mirror not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_bootstrap_github_infra
         # Sub-C: GitHub infrastructure bootstrap (labels, branch
         # protection, required workflows) for a fresh consumer repo.
-        run: ./scripts/ci/check_bootstrap_github_infra
+        run: ./scripts/ci/check_bootstrap_github_infra || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_github_infra ]; then echo "check_bootstrap_github_infra not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_bootstrap_firebase_and_codereview
         # Sub-D: Firebase + code-review configuration bootstrap.
         # Validates the wizard correctly disables CodeRabbit for
         # private consumer repos (free tier is public-only).
-        run: ./scripts/ci/check_bootstrap_firebase_and_codereview
+        run: ./scripts/ci/check_bootstrap_firebase_and_codereview || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_firebase_and_codereview ]; then echo "check_bootstrap_firebase_and_codereview not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_bootstrap_board_and_summary
         # Sub-E: Project board + bootstrap-summary generation.
         # Ensures the wizard's end-state artifacts stay in sync with
         # the canonical templates.
-        run: ./scripts/ci/check_bootstrap_board_and_summary
+        run: ./scripts/ci/check_bootstrap_board_and_summary || { rc=$?; if [ ! -f scripts/ci/check_bootstrap_board_and_summary ]; then echo "check_bootstrap_board_and_summary not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_review_policy_exists
         run: |
@@ -212,7 +297,7 @@ jobs:
       # See #289 r4 / #290 / #269 — nathanpayne-codex Phase 4b finding.
 
       - name: check_codex_scripts
-        run: ./scripts/ci/check_codex_scripts
+        run: ./scripts/ci/check_codex_scripts || { rc=$?; if [ ! -f scripts/ci/check_codex_scripts ]; then echo "check_codex_scripts not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_daily_feedback_rollup
         # Pure-function helpers + a 3-case shimmed --dry-run smoke
@@ -221,7 +306,7 @@ jobs:
         # network. The full rollup integration (actually firing the
         # workflow against live PRs) is exercised once daily via
         # the cron in .github/workflows/daily-feedback-rollup.yml.
-        run: ./scripts/ci/check_daily_feedback_rollup
+        run: ./scripts/ci/check_daily_feedback_rollup || { rc=$?; if [ ! -f scripts/ci/check_daily_feedback_rollup ]; then echo "check_daily_feedback_rollup not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_canonical_bugs_263caf3
         # Regression coverage for nathanpayne-codex findings on the
@@ -232,20 +317,20 @@ jobs:
         #     exclusion in gate (b) + gate (c) Phase 4b substitute
         #   - codex-review-check.sh treating Codex bot signals as
         #     live clearance even when codex.enabled=false (#362)
-        run: ./scripts/ci/check_canonical_bugs_263caf3
+        run: ./scripts/ci/check_canonical_bugs_263caf3 || { rc=$?; if [ ! -f scripts/ci/check_canonical_bugs_263caf3 ]; then echo "check_canonical_bugs_263caf3 not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_workflow_parsers
-        run: ./scripts/ci/check_workflow_parsers
+        run: ./scripts/ci/check_workflow_parsers || { rc=$?; if [ ! -f scripts/ci/check_workflow_parsers ]; then echo "check_workflow_parsers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_session_finalization
-        run: ./scripts/ci/check_session_finalization
+        run: ./scripts/ci/check_session_finalization || { rc=$?; if [ ! -f scripts/ci/check_session_finalization ]; then echo "check_session_finalization not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # Offline fixture suite for the #623 Codex-latency audit script —
       # guards the published, replayable analysis (normalize + pairing +
       # events-only replay). Hub-only; SKIPs on consumer checkouts via
       # the standard sync-to-downstream marker idiom.
       - name: check_audit_codex_latency
-        run: ./scripts/ci/check_audit_codex_latency
+        run: ./scripts/ci/check_audit_codex_latency || { rc=$?; if [ ! -f scripts/ci/check_audit_codex_latency ]; then echo "check_audit_codex_latency not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # Offline fixture suite for the #623 CodeRabbit + phase-4b latency
       # retune audit (scripts/audit-review-latency.sh) — guards its
@@ -253,7 +338,7 @@ jobs:
       # check_audit_codex_latency guards the Codex half. Hub-only; SKIPs on
       # consumer checkouts via the standard sync-to-downstream marker idiom.
       - name: check_audit_review_latency
-        run: ./scripts/ci/check_audit_review_latency
+        run: ./scripts/ci/check_audit_review_latency || { rc=$?; if [ ! -f scripts/ci/check_audit_review_latency ]; then echo "check_audit_review_latency not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # Hermetic regression suite for the #739 canonical-mirror drift
       # triage aid (scripts/audit-canonical-mirrors.sh) — guards the
@@ -265,7 +350,7 @@ jobs:
       # SKIPs on consumer checkouts via the standard sync-to-downstream
       # marker idiom.
       - name: check_audit_canonical_mirrors
-        run: ./scripts/ci/check_audit_canonical_mirrors
+        run: ./scripts/ci/check_audit_canonical_mirrors || { rc=$?; if [ ! -f scripts/ci/check_audit_canonical_mirrors ]; then echo "check_audit_canonical_mirrors not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # Offline PATH-shim suite for the #691 statusCheckRollup pagination in
       # scripts/admin-merge-codeowners-blocked.sh's Gate 2 — guards against a
@@ -275,7 +360,7 @@ jobs:
       # check. Hub-only; SKIPs on consumer checkouts via the standard
       # sync-to-downstream marker idiom.
       - name: check_admin_merge_codeowners_blocked
-        run: ./scripts/ci/check_admin_merge_codeowners_blocked
+        run: ./scripts/ci/check_admin_merge_codeowners_blocked || { rc=$?; if [ ! -f scripts/ci/check_admin_merge_codeowners_blocked ]; then echo "check_admin_merge_codeowners_blocked not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # check_verify_propagation_pr exercises the faithful-mirror
       # verifier (scripts/workflow/verify-propagation-pr.sh) that is
@@ -286,7 +371,7 @@ jobs:
       # step wires the verifier suite in so it cannot rot or vanish
       # silently. Codex CHANGES_REQUESTED on #268 caught the gap.
       - name: check_verify_propagation_pr
-        run: ./scripts/ci/check_verify_propagation_pr
+        run: ./scripts/ci/check_verify_propagation_pr || { rc=$?; if [ ! -f scripts/ci/check_verify_propagation_pr ]; then echo "check_verify_propagation_pr not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # check_propagation_lane_audit exercises the #434 lane regression
       # net (scripts/audit-propagation-lane.sh): the lane's per-consumer
@@ -294,7 +379,7 @@ jobs:
       # and the audit's default-ON marker is pinned to the literal in
       # pr-review-policy.yml so the two cannot silently diverge.
       - name: check_propagation_lane_audit
-        run: ./scripts/ci/check_propagation_lane_audit
+        run: ./scripts/ci/check_propagation_lane_audit || { rc=$?; if [ ! -f scripts/ci/check_propagation_lane_audit ]; then echo "check_propagation_lane_audit not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       # check_workflow_verify_propagation_templated exercises the
       # templated-surface arm of verify-propagation-pr.sh (#323) —
@@ -304,13 +389,13 @@ jobs:
       # alongside it so a regression in either surface lights up CI
       # independently.
       - name: check_workflow_verify_propagation_templated
-        run: ./scripts/ci/check_workflow_verify_propagation_templated
+        run: ./scripts/ci/check_workflow_verify_propagation_templated || { rc=$?; if [ ! -f scripts/ci/check_workflow_verify_propagation_templated ]; then echo "check_workflow_verify_propagation_templated not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_classifier
-        run: ./scripts/ci/check_phase_4b_classifier
+        run: ./scripts/ci/check_phase_4b_classifier || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_classifier ]; then echo "check_phase_4b_classifier not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_automation
-        run: ./scripts/ci/check_phase_4b_automation
+        run: ./scripts/ci/check_phase_4b_automation || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_automation ]; then echo "check_phase_4b_automation not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_accounting
         # Phase 4b approval-loop accounting (#602), wired like
@@ -325,17 +410,17 @@ jobs:
         run: ./scripts/ci/check_phase_4b_accounting || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_accounting ]; then echo "check_phase_4b_accounting not on this tree yet — soft pass (self-bootstrap)"; exit 0; fi; exit "$rc"; }
 
       - name: check_lint_tooling
-        run: ./scripts/ci/check_lint_tooling
+        run: ./scripts/ci/check_lint_tooling || { rc=$?; if [ ! -f scripts/ci/check_lint_tooling ]; then echo "check_lint_tooling not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_codex_p1_gate
-        run: ./scripts/ci/check_codex_p1_gate
+        run: ./scripts/ci/check_codex_p1_gate || { rc=$?; if [ ! -f scripts/ci/check_codex_p1_gate ]; then echo "check_codex_p1_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_wave_audit
         # Hub-only wave-audit regression suite (#662/#663): watermark/tag
         # rules, curated-diff scope (incl. newly-manifested paths), canary
         # lane precondition, config fail-closed validation. Consumer
         # checkouts SKIP inside the wrapper (script + suite are hub-only).
-        run: ./scripts/ci/check_wave_audit
+        run: ./scripts/ci/check_wave_audit || { rc=$?; if [ ! -f scripts/ci/check_wave_audit ]; then echo "check_wave_audit not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_external_review_helpers
         # Hub-only regression suite for the external-review helpers
@@ -345,7 +430,7 @@ jobs:
         # wired in #763. Consumer checkouts SKIP inside the wrapper (the
         # suite is hub-only; the helpers themselves travel under the
         # scripts/workflow/ kit entry).
-        run: ./scripts/ci/check_external_review_helpers
+        run: ./scripts/ci/check_external_review_helpers || { rc=$?; if [ ! -f scripts/ci/check_external_review_helpers ]; then echo "check_external_review_helpers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_coderabbit_severity_gate
         # CodeRabbit twin of check_codex_p1_gate (#577). Verifies
@@ -353,13 +438,13 @@ jobs:
         # .github/workflows/coderabbit-severity-gate.yml +
         # tests/test_coderabbit_severity_gate.sh exist, checks the
         # workflow trigger shape, then runs the fixture-driven suite.
-        run: ./scripts/ci/check_coderabbit_severity_gate
+        run: ./scripts/ci/check_coderabbit_severity_gate || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_severity_gate ]; then echo "check_coderabbit_severity_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_feedback_policy_helpers
-        run: ./scripts/ci/check_feedback_policy_helpers
+        run: ./scripts/ci/check_feedback_policy_helpers || { rc=$?; if [ ! -f scripts/ci/check_feedback_policy_helpers ]; then echo "check_feedback_policy_helpers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_merge_clearance_gate
-        run: ./scripts/ci/check_merge_clearance_gate
+        run: ./scripts/ci/check_merge_clearance_gate || { rc=$?; if [ ! -f scripts/ci/check_merge_clearance_gate ]; then echo "check_merge_clearance_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_required_check_publisher
         # Regression fence for .github/workflows/required-check-publisher.yml
@@ -378,7 +463,7 @@ jobs:
         # here; they need a parsed shell AST and are tracked in #977.
         #
         # A consumer that has this wrapper but not yet the workflow SKIPs.
-        run: ./scripts/ci/check_required_check_publisher
+        run: ./scripts/ci/check_required_check_publisher || { rc=$?; if [ ! -f scripts/ci/check_required_check_publisher ]; then echo "check_required_check_publisher not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: install_yq_for_sync_manifest
         # mikefarah/yq is needed by check_sync_manifest and by
@@ -416,37 +501,37 @@ jobs:
         # Requires yq via the delegated verified-propagation suite —
         # runs after install_yq_for_sync_manifest above (Codex P2 on
         # #616, finding 3509567286).
-        run: ./scripts/ci/check_resolve_pr_threads
+        run: ./scripts/ci/check_resolve_pr_threads || { rc=$?; if [ ! -f scripts/ci/check_resolve_pr_threads ]; then echo "check_resolve_pr_threads not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_gh_as_author
-        run: ./scripts/ci/check_gh_as_author
+        run: ./scripts/ci/check_gh_as_author || { rc=$?; if [ ! -f scripts/ci/check_gh_as_author ]; then echo "check_gh_as_author not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_no_bare_gh_writes
-        run: ./scripts/ci/check_no_bare_gh_writes
+        run: ./scripts/ci/check_no_bare_gh_writes || { rc=$?; if [ ! -f scripts/ci/check_no_bare_gh_writes ]; then echo "check_no_bare_gh_writes not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_op_preflight_contract
-        run: ./scripts/ci/check_op_preflight_contract
+        run: ./scripts/ci/check_op_preflight_contract || { rc=$?; if [ ! -f scripts/ci/check_op_preflight_contract ]; then echo "check_op_preflight_contract not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_onepassword_headless_proof_workflow
-        run: ./scripts/ci/check_onepassword_headless_proof_workflow
+        run: ./scripts/ci/check_onepassword_headless_proof_workflow || { rc=$?; if [ ! -f scripts/ci/check_onepassword_headless_proof_workflow ]; then echo "check_onepassword_headless_proof_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_eslint_config_present
-        run: ./scripts/ci/check_eslint_config_present
+        run: ./scripts/ci/check_eslint_config_present || { rc=$?; if [ ! -f scripts/ci/check_eslint_config_present ]; then echo "check_eslint_config_present not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_eslint_config_policy
-        run: ./scripts/ci/check_eslint_config_policy
+        run: ./scripts/ci/check_eslint_config_policy || { rc=$?; if [ ! -f scripts/ci/check_eslint_config_policy ]; then echo "check_eslint_config_policy not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_auto_clear_workflow
-        run: ./scripts/ci/check_auto_clear_workflow
+        run: ./scripts/ci/check_auto_clear_workflow || { rc=$?; if [ ! -f scripts/ci/check_auto_clear_workflow ]; then echo "check_auto_clear_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_pr_audit_codex_clearance
-        run: ./scripts/ci/check_pr_audit_codex_clearance
+        run: ./scripts/ci/check_pr_audit_codex_clearance || { rc=$?; if [ ! -f scripts/ci/check_pr_audit_codex_clearance ]; then echo "check_pr_audit_codex_clearance not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_pr_audit_sync_exemption
-        run: ./scripts/ci/check_pr_audit_sync_exemption
+        run: ./scripts/ci/check_pr_audit_sync_exemption || { rc=$?; if [ ! -f scripts/ci/check_pr_audit_sync_exemption ]; then echo "check_pr_audit_sync_exemption not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_sweep_unresolved_feedback
-        run: ./scripts/ci/check_sweep_unresolved_feedback
+        run: ./scripts/ci/check_sweep_unresolved_feedback || { rc=$?; if [ ! -f scripts/ci/check_sweep_unresolved_feedback ]; then echo "check_sweep_unresolved_feedback not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_consumer_residue_safety
         # Residue-invariance net — the direction the #601 net structurally
@@ -473,19 +558,19 @@ jobs:
         # Hub-only (needs the full hub tree); SKIPs on consumers. The
         # longest check in this job (a few minutes) — keep it late in the
         # step list so cheap checks fail fast first.
-        run: ./scripts/ci/check_repo_lint_consumer_safety
+        run: ./scripts/ci/check_repo_lint_consumer_safety || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_consumer_safety ]; then echo "check_repo_lint_consumer_safety not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_disagreement_detector
-        run: ./scripts/ci/check_disagreement_detector
+        run: ./scripts/ci/check_disagreement_detector || { rc=$?; if [ ! -f scripts/ci/check_disagreement_detector ]; then echo "check_disagreement_detector not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_agent_review_triage_defers
-        run: ./scripts/ci/check_agent_review_triage_defers
+        run: ./scripts/ci/check_agent_review_triage_defers || { rc=$?; if [ ! -f scripts/ci/check_agent_review_triage_defers ]; then echo "check_agent_review_triage_defers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_sync_manifest
         # Requires mikefarah/yq — installed by install_yq_for_sync_manifest,
         # which now runs earlier (before check_resolve_pr_threads, the
         # first yq-dependent step; see that step for the pin rationale).
-        run: ./scripts/ci/check_sync_manifest
+        run: ./scripts/ci/check_sync_manifest || { rc=$?; if [ ! -f scripts/ci/check_sync_manifest ]; then echo "check_sync_manifest not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_propagation_closure
         # Systemic closure-completeness guard — the INVERSE of
@@ -495,7 +580,7 @@ jobs:
         # any on-disk tests/+scripts/ reference is undeclared (would not
         # travel to consumers → the referencing tool fails closed there).
         # Shares the yq install with check_sync_manifest above.
-        run: ./scripts/ci/check_propagation_closure
+        run: ./scripts/ci/check_propagation_closure || { rc=$?; if [ ! -f scripts/ci/check_propagation_closure ]; then echo "check_propagation_closure not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_doc_ownership
         # Validates the manifest's doc_ownership: inventory (#780) —
@@ -506,7 +591,7 @@ jobs:
         # Reads the same manifest as the two checks above and shares
         # their yq install; consumer checkouts SKIP inside the wrapper
         # via the sync-to-downstream.sh marker idiom.
-        run: ./scripts/ci/check_doc_ownership
+        run: ./scripts/ci/check_doc_ownership || { rc=$?; if [ ! -f scripts/ci/check_doc_ownership ]; then echo "check_doc_ownership not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_branch_protection_audit
         # Hub-only fleet branch-protection audit suite (#774): the
@@ -537,14 +622,14 @@ jobs:
         # instead of silently SKIPping on a fresh runner (Codex P2 on
         # PR #680, the same #616-style ordering hazard already fixed for
         # check_resolve_pr_threads / check_sync_manifest above).
-        run: ./scripts/ci/check_project_doc_sync
+        run: ./scripts/ci/check_project_doc_sync || { rc=$?; if [ ! -f scripts/ci/check_project_doc_sync ]; then echo "check_project_doc_sync not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_sync_overrides
         # Exercises tests/test_sync_overrides.sh — verifies the
         # per-consumer sync override semantics (#200) so a downstream
         # repo can opt files out of the propagation lane without the
         # mirror lane silently re-overwriting them.
-        run: ./scripts/ci/check_sync_overrides
+        run: ./scripts/ci/check_sync_overrides || { rc=$?; if [ ! -f scripts/ci/check_sync_overrides ]; then echo "check_sync_overrides not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_sync_to_downstream
         # Exercises tests/test_sync_to_downstream.sh — the propagation
@@ -554,7 +639,7 @@ jobs:
         # propagation core.filemode-robust (templated #475, canonical/kit
         # #476). Ordered after install_yq_for_sync_manifest so the suite
         # runs rather than self-skipping on a missing yq. Wired in #488.
-        run: ./scripts/ci/check_sync_to_downstream
+        run: ./scripts/ci/check_sync_to_downstream || { rc=$?; if [ ! -f scripts/ci/check_sync_to_downstream ]; then echo "check_sync_to_downstream not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_template_substitution
         # Exercises tests/test_template_substitution.sh — verifies the
@@ -565,7 +650,7 @@ jobs:
         # `type: templated` manifest entries (activated in a follow-up
         # PR); the check is wired now so the lib's contract is guarded
         # independently of integration.
-        run: ./scripts/ci/check_template_substitution
+        run: ./scripts/ci/check_template_substitution || { rc=$?; if [ ! -f scripts/ci/check_template_substitution ]; then echo "check_template_substitution not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_export_consumer_facts
         # Exercises tests/test_export_consumer_facts.sh — regression-
@@ -575,7 +660,7 @@ jobs:
         # broke Phase D's first real-frameworks consumer (every
         # templated render fell through to the "no frameworks"
         # baseline because MERGEPATH_FACT_* was never exported).
-        run: ./scripts/ci/check_export_consumer_facts
+        run: ./scripts/ci/check_export_consumer_facts || { rc=$?; if [ ! -f scripts/ci/check_export_consumer_facts ]; then echo "check_export_consumer_facts not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_coderabbit_config
         # Validates the template-level .coderabbit.yml stays on the
@@ -589,19 +674,19 @@ jobs:
         # mirror bootstrap still get the YAML parse + file-existence
         # checks but are free to set reviews.profile: assertive locally
         # without their CI failing.
-        run: ./scripts/ci/check_coderabbit_config
+        run: ./scripts/ci/check_coderabbit_config || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_config ]; then echo "check_coderabbit_config not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_coderabbit_config_tests
         # Unit tests for check_coderabbit_config itself — covers the
         # template-vs-consumer detection logic and the assertion paths
         # added by #256 P2.
-        run: ./scripts/ci/check_coderabbit_config_tests
+        run: ./scripts/ci/check_coderabbit_config_tests || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_config_tests ]; then echo "check_coderabbit_config_tests not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_coderabbit_wait
         # Unit tests for coderabbit-wait.sh's timeout status probe.
         # Verifies exit-4 status probing stays advisory, surfaces the
         # reply in JSON, and never counts the reply as clearance.
-        run: ./scripts/ci/check_coderabbit_wait
+        run: ./scripts/ci/check_coderabbit_wait || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_wait ]; then echo "check_coderabbit_wait not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_coderabbit_record_feedback
         # CodeRabbit disposition-verdict ledger (#584) — the disposition-only
@@ -621,7 +706,7 @@ jobs:
         # form, which GNU coreutils mktemp rejects (XXXXXX required).
         # Closes the re-introduction surface that the closed-review
         # backlog sweep on #286 caught.
-        run: ./scripts/ci/check_mktemp_portability
+        run: ./scripts/ci/check_mktemp_portability || { rc=$?; if [ ! -f scripts/ci/check_mktemp_portability ]; then echo "check_mktemp_portability not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_governance_files
         run: |
