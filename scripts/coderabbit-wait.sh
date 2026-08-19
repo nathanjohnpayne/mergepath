@@ -391,6 +391,19 @@ fi
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh"
 
+# Shared paginated-list reader (#1008). Owns the fetch → capture → flatten
+# algorithm the two wrappers below used to carry inline, so a correctness fix
+# to it lands once instead of eight times. Hard-required for the same reason
+# the three libs above are: every sensing read on this path routes through it,
+# and the degraded mode (an undefined function) is a `command not found` on the
+# very reads whose failure contract #831/#965 exist to keep honest.
+if [ ! -r "$__CODERABBIT_WAIT_DIR/lib/gh-api-array.sh" ]; then
+  echo "ERROR: gh-api-array helper missing: $__CODERABBIT_WAIT_DIR/lib/gh-api-array.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$__CODERABBIT_WAIT_DIR/lib/gh-api-array.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --probe (#814): read-only, zero-budget, single-scan mode.
@@ -862,30 +875,32 @@ die() {
 # reached. Use `|| return`/`|| die` explicitly rather than relying on the
 # caller's context, or use fetch_api_array_best_effort when an unreadable
 # surface genuinely is not fatal.
+#
+# The algorithm itself lives in scripts/lib/gh-api-array.sh (#1008); what
+# stays here is this file's failure ACTION, which is the part that genuinely
+# differs between consumers. `gh_api_array` is called DIRECTLY (not in a
+# nested command substitution), which is what lets its diagnostic reach this
+# wrapper through GH_API_ARRAY_* even when the wrapper itself is invoked from
+# inside `VAR=$(fetch_api_array …)`.
 fetch_api_array() {
-  local endpoint=$1
-  local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || {
-    log "ERROR: failed to fetch $label: $raw"
-    return 3
-  }
-  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
-    log "ERROR: failed to flatten $label pagination output"
+  gh_api_array "$1" "$2" || {
+    log "ERROR: $GH_API_ARRAY_ERROR"
     return 3
   }
 }
 
+# The best-effort twin. Its contract is deliberately DIFFERENT — rc 1, not
+# rc 3 — because its callers treat an unreadable surface as non-fatal rather
+# than as an infra failure, and collapsing the two statuses would hand those
+# callers the fatal one. It keeps both of its own message forms, which is why
+# gh_api_array reports WHICH step failed rather than only that one did.
 fetch_api_array_best_effort() {
-  local endpoint=$1
-  local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || {
-    log "best-effort fetch failed for $label: $raw"
-    return 1
-  }
-  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
-    log "best-effort fetch failed to flatten $label pagination output"
+  gh_api_array "$1" "$2" || {
+    if [ "$GH_API_ARRAY_ERROR_KIND" = "flatten" ]; then
+      log "best-effort fetch failed to flatten $2 pagination output"
+    else
+      log "best-effort fetch failed for $2: $GH_API_ARRAY_DETAIL"
+    fi
     return 1
   }
 }

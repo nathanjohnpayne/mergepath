@@ -185,6 +185,14 @@ if [ "$1" = "api" ]; then
         echo "gh: HTTP 502 Bad Gateway (issues/comments)" >&2
         exit 1
       fi
+      # #1008: `gh api` writes diagnostics to stderr on calls that SUCCEED —
+      # deprecation notices, retry/backoff chatter, token-scope warnings.
+      # This knob reproduces that so test 28b can assert the read still
+      # succeeds. It could not, while this gate's own copy of fetch_api_array
+      # captured with `2>&1` and fed the prose to the jq slurp.
+      if [ -n "${FIXTURE_ISSUE_COMMENTS_STDERR_NOISE:-}" ]; then
+        echo "gh: warning: this endpoint is deprecated and will be removed" >&2
+      fi
       cat "${FIXTURE_ISSUE_COMMENTS:-/dev/null}"
       exit 0
       ;;
@@ -1603,6 +1611,50 @@ if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "failed to fetch PR-level issue comme
   pass "unreadable issues endpoint → exit 2 (fail closed)"
 else
   fail "expected rc=2 + a fetch-failure message; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 28b (#1008): the OTHER direction — a read that SUCCEEDS while `gh api`
+# writes benign chatter to stderr is a good read, and must be graded, not
+# reported as unreadable.
+#
+# This gate's own copy of fetch_api_array captured with `gh api … 2>&1`, so
+# every deprecation notice / retry line landed in the JSON handed to
+# `jq -s`, the slurp failed, and `die 2` reported a healthy fetch as an
+# infra failure. Only codex-review-request.sh's copy had the separated-stream
+# form (#966); routing all eight through scripts/lib/gh-api-array.sh is what
+# gives this gate that correction.
+#
+# Asserted on the summary-only blocking fixture from test 18 rather than on a
+# clean one: an EMPTY result would also exit 0, so "did not fail closed" is
+# not enough — the payload has to arrive intact enough to still be CLASSIFIED,
+# which only a correctly-parsed read can do.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 28b (#1008): benign gh stderr on a SUCCESSFUL read → still parsed and graded"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING")")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_ISSUE_COMMENTS_STDERR_NOISE=1 \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && ! echo "$OUT" | grep -qi "failed to flatten PR-level issue comments"; then
+  pass "#1008: benign gh stderr on a successful read does not become a flatten failure"
+else
+  fail "expected rc=1 with 'unresolved: 1' and no flatten error; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 

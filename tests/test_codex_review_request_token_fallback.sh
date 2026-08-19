@@ -42,6 +42,7 @@ make_case() {
   cp "$ROOT/scripts/codex-review-request.sh" "$dir/scripts/codex-review-request.sh"
   chmod +x "$dir/scripts/codex-review-request.sh"
   cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
+  cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 author_identity: nathanjohnpayne
