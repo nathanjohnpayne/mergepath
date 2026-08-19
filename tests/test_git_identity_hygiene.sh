@@ -2065,6 +2065,28 @@ else
   fail "internally-escaped protected key missed: rc=$RC out=$OUT"
 fi
 
+# Case 65m: dequoting follows the shell, so an UNMATCHED quote is not
+# removed (Codex P2 on #1011). `git config "user.email leak@example.com`
+# never reaches Git — the shell is still waiting for the closing quote —
+# so reporting it reds repo_lint over a fragment nothing can run. The
+# fixture asserts BOTH directions at once: the two unterminated lines are
+# not reported, while the genuine partially-quoted write below them,
+# which this scanner exists to catch, still is. Exactly one hit, on the
+# genuine line.
+run_on_fixture "tests/unmatched-quote-key.sh" '#!/usr/bin/env bash
+git config "user.email leak@example.com
+git config '"'"'user.email leak2@example.com
+git config "user".email "leak3@example.com"
+'
+N_UNMATCHED_HITS="$(printf '%s\n' "$OUT" | grep -cE '^  - tests/unmatched-quote-key\.sh:' || true)"
+if [ "$RC" = "1" ] \
+  && [ "$N_UNMATCHED_HITS" -eq 1 ] \
+  && printf '%s' "$OUT" | grep -q "tests/unmatched-quote-key.sh:4:"; then
+  pass "unmatched quote: not reported; paired quote on the same fixture still is"
+else
+  fail "unmatched-quote dequoting wrong: hits=$N_UNMATCHED_HITS rc=$RC out=$OUT"
+fi
+
 # ── Linked worktrees: identity lives in every one of them (#806) ───────
 
 # Case 66: `git config --worktree` reads the INVOKING worktree's
