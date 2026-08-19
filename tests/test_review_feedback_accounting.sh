@@ -186,7 +186,7 @@ cat >"$TMP/fixtures/issues.json" <<'JSON'
 JSON
 run_gate
 assert_eq 2 "$RUN_RC" "failed fork archive relay is a persistent infrastructure block"
-assert_match 'fork feedback archive relay.*12345' "$RUN_ERR" "relay failure names the unrecoverable source run"
+assert_match 'read-only feedback archive relay.*12345' "$RUN_ERR" "relay failure names the unrecoverable source run"
 
 # The documented direct invocation runs after op-preflight, which exports the
 # scoped PAT but deliberately leaves GH_TOKEN unset. The helper must bridge the
@@ -1016,7 +1016,8 @@ run_gate
 assert_eq 1 "$RUN_RC" "deleted registered-reviewer inline finding remains in inventory"
 assert_eq nathanpayne-claude "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "archived inline finding stays bound to the registered reviewer"
 
-# A live finding is inventoried directly; its archive must not duplicate it.
+# A distinct live rewrite and its archived predecessor are separate finding
+# versions. Neither may hide the other merely because they reuse a source id.
 jq -n '[{
   "id": 8510,
   "in_reply_to_id": null,
@@ -1028,8 +1029,60 @@ jq -n '[{
   "body": "**P1** Registered reviewer inline finding re-raised live."
 }]' >"$TMP/fixtures/inline.json"
 run_gate
-assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "live inline re-raise supersedes its archived version"
-assert_eq inline "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].kind')" "live inline finding keeps the direct inventory path"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "live inline rewrite retains its distinct archived predecessor"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.findings[] | select(.kind == "inline")] | length')" "live inline finding keeps the direct inventory path"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.findings[] | select(.kind == "inline-archive")] | length')" "distinct archived inline finding remains independently dispositionable"
+
+reset_fixtures
+EXACT_INLINE_BODY='**P1** Identical live and archived inline finding.'
+printf '%s' "$EXACT_INLINE_BODY" >"$PREVIOUS_INLINE"
+EXACT_INLINE_ARCHIVE=$("$RENDER_ARCHIVE" inline 8520 'nathanpayne-claude' \
+  '2026-08-18T22:31:00Z' "$PREVIOUS_INLINE")
+jq -n --arg archive "$EXACT_INLINE_ARCHIVE" '[{
+  "id": 8521,
+  "created_at": "2026-08-18T22:31:01Z",
+  "updated_at": "2026-08-18T22:31:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+jq -n --arg body "$EXACT_INLINE_BODY" '[{
+  "id": 8520,
+  "in_reply_to_id": null,
+  "created_at": "2026-08-18T22:31:00Z",
+  "updated_at": "2026-08-18T22:31:00Z",
+  "user": {"login": "nathanpayne-claude"},
+  "path": "src/live.ts",
+  "line": 12,
+  "body": $body
+}]' >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "identical live and archived bodies collapse to one logical finding"
+assert_eq inline "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].kind')" "identical archive retry defers to the direct inventory path"
+
+reset_fixtures
+PREVIOUS_SUMMARY="$TMP/previous-summary.txt"
+printf '%s' '_⚠️ Potential issue_ Original CodeRabbit summary finding.' >"$PREVIOUS_SUMMARY"
+SUMMARY_ARCHIVE=$("$RENDER_ARCHIVE" issue-comment 8530 'coderabbitai[bot]' \
+  '2026-08-18T22:32:00Z' "$PREVIOUS_SUMMARY")
+jq -n --arg archive "$SUMMARY_ARCHIVE" '[
+  {
+    "id": 8530,
+    "created_at": "2026-08-18T22:30:00Z",
+    "updated_at": "2026-08-18T22:33:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "_🟠 Major_ Replacement CodeRabbit summary finding."
+  },
+  {
+    "id": 8531,
+    "created_at": "2026-08-18T22:32:01Z",
+    "updated_at": "2026-08-18T22:32:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }
+]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "CodeRabbit summary rewrite preserves both distinct finding versions"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.findings[] | select(.kind == "issue-comment-archive")] | length')" "rewritten CodeRabbit summary retains the archived predecessor"
 
 reset_fixtures
 cat >"$TMP/fixtures/reviews.json" <<'JSON'

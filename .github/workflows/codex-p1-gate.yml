@@ -87,11 +87,13 @@ jobs:
       pr: ${{ steps.prepare.outputs.pr }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
       is_fork: ${{ steps.prepare.outputs.is_fork }}
+      requires_relay: ${{ steps.prepare.outputs.requires_relay }}
       pr_actor: ${{ steps.prepare.outputs.pr_actor }}
     permissions:
       contents: read
-      # Same-repository events append directly. Fork events can only upload a
-      # handoff artifact; the trusted workflow_run relay owns the write.
+      # Same-repository events normally append directly. Fork and Dependabot
+      # events can only upload a handoff artifact; the trusted workflow_run
+      # relay owns the write.
       issues: write
       pull-requests: read
     steps:
@@ -135,9 +137,14 @@ jobs:
             echo "::error::Could not bind feedback archival to a PR and head SHA"
             exit 1
           fi
+          requires_relay="$is_fork"
+          if [ "$pr_actor" = 'dependabot[bot]' ]; then
+            requires_relay=true
+          fi
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "is_fork=$is_fork" >> "$GITHUB_OUTPUT"
+          echo "requires_relay=$requires_relay" >> "$GITHUB_OUTPUT"
           echo "pr_actor=$pr_actor" >> "$GITHUB_OUTPUT"
 
           source_kind=""
@@ -178,7 +185,7 @@ jobs:
               >"$archive_records_file"
           fi
 
-          if [ "$is_fork" != true ] && [ -s "$archive_records_file" ]; then
+          if [ "$requires_relay" != true ] && [ -s "$archive_records_file" ]; then
             existing=$(gh api --paginate "repos/$REPO/issues/$pr/comments" | jq -s 'add // []')
             while IFS= read -r archive_record; do
               [ -n "$archive_record" ] || continue
@@ -195,31 +202,32 @@ jobs:
             done <"$archive_records_file"
           fi
 
-          if [ "$is_fork" = true ]; then
+          if [ "$requires_relay" = true ]; then
             jq -n \
               --rawfile archive_records "$archive_records_file" \
               --arg repo "$REPO" --argjson pr "$pr" --arg head_sha "$head_sha" \
               --argjson source_run_id "$SOURCE_RUN_ID" --arg event_name "$EVENT_NAME" \
-              '{version:1,repo:$repo,pr:$pr,head_sha:$head_sha,source_run_id:$source_run_id,event_name:$event_name,is_fork:true,archive_records:($archive_records | split("\n") | map(select(length > 0)))}' \
-              >"$RUNNER_TEMP/codex-p1-fork-handoff.json"
+              --argjson is_fork "$is_fork" --arg pr_actor "$pr_actor" \
+              '{version:1,repo:$repo,pr:$pr,head_sha:$head_sha,source_run_id:$source_run_id,event_name:$event_name,is_fork:$is_fork,requires_relay:true,pr_actor:$pr_actor,archive_records:($archive_records | split("\n") | map(select(length > 0)))}' \
+              >"$RUNNER_TEMP/codex-p1-read-only-handoff.json"
           fi
 
-      - name: Upload trusted-relay handoff for a fork PR
-        if: steps.prepare.outputs.is_fork == 'true'
+      - name: Upload trusted-relay handoff for a read-only PR event
+        if: steps.prepare.outputs.requires_relay == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: codex-p1-fork-handoff-${{ steps.prepare.outputs.pr }}
-          path: ${{ runner.temp }}/codex-p1-fork-handoff.json
+          name: codex-p1-read-only-handoff-${{ steps.prepare.outputs.pr }}
+          path: ${{ runner.temp }}/codex-p1-read-only-handoff.json
           if-no-files-found: error
           retention-days: 1
 
   codex-p1-gate:
-    # A fork-triggered run cannot publish the trusted required check. Give its
-    # native job a distinct, non-required name; the workflow_run relay is the
-    # only publisher of "Codex P1 unresolved threads" for that head.
+    # A fork- or Dependabot-triggered run cannot publish the trusted required
+    # check. Give its native job a distinct, non-required name; the
+    # workflow_run relay is the only publisher of the required context.
     name: >-
-      ${{ needs.archive-edited-feedback.outputs.is_fork == 'true' &&
-      'Codex P1 fork archive handoff' || 'Codex P1 unresolved threads' }}
+      ${{ needs.archive-edited-feedback.outputs.requires_relay == 'true' &&
+      'Codex P1 read-only archive handoff' || 'Codex P1 unresolved threads' }}
     needs: [archive-edited-feedback]
     runs-on: ubuntu-latest
     # Deliberately no Actions concurrency block. GitHub cancels the queued
@@ -243,13 +251,13 @@ jobs:
           PR_NUMBER: ${{ needs.archive-edited-feedback.outputs.pr }}
           HEAD_SHA: ${{ needs.archive-edited-feedback.outputs.head_sha }}
           IS_FORK: ${{ needs.archive-edited-feedback.outputs.is_fork }}
-          PR_ACTOR: ${{ needs.archive-edited-feedback.outputs.pr_actor }}
+          REQUIRES_RELAY: ${{ needs.archive-edited-feedback.outputs.requires_relay }}
         run: |
           set -uo pipefail
           pr="$PR_NUMBER"
           head_sha="$HEAD_SHA"
           is_fork="$IS_FORK"
-          pr_actor="$PR_ACTOR"
+          requires_relay="$REQUIRES_RELAY"
           if [ -z "$pr" ] || [ "$pr" = null ] || [ -z "$head_sha" ] || [ "$head_sha" = null ]; then
             echo "::error::Could not bind the gate lease to a PR number and head SHA"
             exit 1
@@ -257,6 +265,15 @@ jobs:
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "is_fork=$is_fork" >> "$GITHUB_OUTPUT"
+          echo "requires_relay=$requires_relay" >> "$GITHUB_OUTPUT"
+
+          # The native job deliberately carries a non-required name on this
+          # path. Do not even attempt a privileged lease with a token whose
+          # trust boundary requires the default-branch workflow_run relay.
+          if [ "$requires_relay" = true ]; then
+            echo "Read-only PR event will publish through the trusted workflow_run relay."
+            exit 0
+          fi
 
           # POST one in-progress generation before evaluation, then PATCH this
           # exact id in phase 2. An older run can finish after a newer event,
@@ -276,14 +293,6 @@ jobs:
             sleep $((attempt * 5))
           done
           if [ -z "$id" ]; then
-            if [ "$is_fork" = true ]; then
-              echo "::warning::Fork token cannot open the PR-head check lease; the trusted workflow_run relay will publish it"
-              exit 0
-            fi
-            if [ "$pr_actor" = 'dependabot[bot]' ]; then
-              echo "::warning::Dependabot token cannot open the PR-head check lease; the native check and scheduled sweep remain the backstop"
-              exit 0
-            fi
             echo "::error::Could not open the required PR-head check lease"
             exit 1
           fi
@@ -297,13 +306,13 @@ jobs:
           echo "::error::Reviewer-feedback archive did not complete; the prior comment body may be unrecoverable."
           exit 1
 
-      - name: Defer fork evaluation to the trusted archive relay
-        if: steps.open.outputs.is_fork == 'true'
+      - name: Defer read-only evaluation to the trusted archive relay
+        if: steps.open.outputs.requires_relay == 'true'
         run: |
-          echo "Fork handoff uploaded; the trusted workflow_run archive relay exclusively publishes the required PR-head check."
+          echo "Read-only handoff uploaded; the trusted workflow_run archive relay exclusively publishes the required PR-head check."
 
       - name: Checkout repo (default branch — trusted gate script)
-        if: steps.open.outputs.is_fork != 'true'
+        if: steps.open.outputs.requires_relay != 'true'
         # Pin to the default branch, NOT the PR HEAD. The gate is a
         # REQUIRED status check: if it ran scripts/codex-p1-gate.sh
         # from the PR's own checkout, a PR could edit that script to
@@ -332,7 +341,7 @@ jobs:
           fetch-depth: 1
 
       - name: Run scripts/codex-p1-gate.sh
-        if: steps.open.outputs.is_fork != 'true'
+        if: steps.open.outputs.requires_relay != 'true'
         id: gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -531,6 +540,11 @@ jobs:
             pr_json=$(gh api "repos/$REPO/pulls/$PR")
             head_sha=$(jq -r '.head.sha' <<<"$pr_json")
             is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
+            pr_actor=$(jq -r '.user.login // ""' <<<"$pr_json")
+            requires_relay="$is_fork"
+            if [ "$pr_actor" = 'dependabot[bot]' ]; then
+              requires_relay=true
+            fi
             pr_created_at=$(jq -r '.created_at // ""' <<<"$pr_json")
             if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
               echo "::error::Could not resolve head SHA for PR #$PR; cannot open a fail-closed lease"
@@ -560,29 +574,37 @@ jobs:
 
             relay_pending=false
             relay_scan_error=false
-            if [ "$is_fork" = true ]; then
+            if [ "$requires_relay" = true ]; then
               source_runs='[]'
-              source_page=1
-              while :; do
-                if ! source_page_json=$(gh api --method GET \
-                  "repos/$REPO/actions/workflows/codex-p1-gate.yml/runs" \
-                  -f per_page=100 -f page="$source_page" -f created=">=$pr_created_at"); then
-                  relay_scan_error=true
-                  break
-                fi
-                source_total=$(jq -r '.total_count // 0' <<<"$source_page_json")
-                if [ "$source_total" -gt "$MAX_RELAY_SOURCE_RUNS" ]; then
-                  echo "::error::Fork relay source run scan exceeded the fail-closed bound of $MAX_RELAY_SOURCE_RUNS for PR #$PR"
-                  relay_scan_error=true
-                  break
-                fi
-                page_runs=$(jq -c --arg title "Codex P1 Gate relay-v1 PR #$PR" \
-                  '[.workflow_runs[] | select(.display_title == $title) | .id]' \
-                  <<<"$source_page_json")
-                source_runs=$(printf '%s\n%s\n' "$source_runs" "$page_runs" \
-                  | jq -cs '.[0] + .[1]')
-                [ $((source_page * 100)) -ge "$source_total" ] && break
-                source_page=$((source_page + 1))
+              # Scheduled runs and other PRs share this workflow. Query only
+              # event kinds that can produce this PR's relay handoff, then
+              # apply the fail-closed bound after filtering to its exact run
+              # title. Unrelated schedule traffic must not exhaust the bound.
+              for source_event in pull_request pull_request_review pull_request_review_comment issue_comment; do
+                source_page=1
+                while :; do
+                  if ! source_page_json=$(gh api --method GET \
+                    "repos/$REPO/actions/workflows/codex-p1-gate.yml/runs" \
+                    -f per_page=100 -f page="$source_page" -f event="$source_event" \
+                    -f created=">=$pr_created_at"); then
+                    relay_scan_error=true
+                    break 2
+                  fi
+                  source_total=$(jq -r '.total_count // 0' <<<"$source_page_json")
+                  page_runs=$(jq -c --arg title "Codex P1 Gate relay-v1 PR #$PR" \
+                    '[.workflow_runs[] | select(.display_title == $title) | .id]' \
+                    <<<"$source_page_json")
+                  source_runs=$(printf '%s\n%s\n' "$source_runs" "$page_runs" \
+                    | jq -cs '.[0] + .[1]')
+                  source_count=$(jq 'length' <<<"$source_runs")
+                  if [ "$source_count" -gt "$MAX_RELAY_SOURCE_RUNS" ]; then
+                    echo "::error::Read-only relay matching source run scan exceeded the fail-closed bound of $MAX_RELAY_SOURCE_RUNS for PR #$PR"
+                    relay_scan_error=true
+                    break 2
+                  fi
+                  [ $((source_page * 100)) -ge "$source_total" ] && break
+                  source_page=$((source_page + 1))
+                done
               done
               if [ "$relay_scan_error" != true ]; then
                 if ! relay_comments=$(gh api --paginate \
@@ -605,11 +627,11 @@ jobs:
             fi
 
             if [ "$relay_scan_error" = true ]; then
-              output="Trusted fork feedback-archive source run scan failed closed."
+              output="Trusted read-only feedback-archive source run scan failed closed."
               rc=2
               had_infra_error=1
             elif [ "$relay_pending" = true ]; then
-              output="Trusted fork feedback-archive relay is still pending; refusing scheduled clearance."
+              output="Trusted read-only feedback-archive relay is still pending; refusing scheduled clearance."
               rc=1
             else
               feedback_fp_before="bootstrap-unavailable"

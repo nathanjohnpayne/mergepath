@@ -3469,11 +3469,11 @@ rcp_dir_case native-producer-unparseable \
 # nothing about name drift. Caught only after the needle was sharpened to
 # the branch's own message, which is the argument for sharpening them.
 rcp_dir_case native-producer-name-drift \
-  'perl -0777 -i -pe "s{Codex P1 fork archive handoff}{Something Else}" codex-p1-gate.yml' \
+  'perl -0777 -i -pe "s{Codex P1 read-only archive handoff}{Something Else}" codex-p1-gate.yml' \
   fail 'reports as'
 # The conditional name reads an output from archive-edited-feedback. Keeping
 # the string while dropping `needs` makes the expression unresolved rather
-# than safely selecting the fork handoff name.
+# than safely selecting the read-only handoff name.
 rcp_dir_case native-producer-needs-drift \
   'perl -0777 -i -pe "s{needs: \[archive-edited-feedback\]}{needs: []}" codex-p1-gate.yml' \
   fail 'does not need'

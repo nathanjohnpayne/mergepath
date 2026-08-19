@@ -203,9 +203,9 @@ RELAY_FAILURE_RUN=$(printf '%s' "$ISSUE_COMMENTS" | jq -r '
     | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=failed -->$").run
       catch empty
   ) // empty
-') || die 2 "could not validate fork feedback archive relay state"
+') || die 2 "could not validate read-only feedback archive relay state"
 if [ -n "$RELAY_FAILURE_RUN" ]; then
-  die 2 "fork feedback archive relay failed for source run $RELAY_FAILURE_RUN; prior feedback may be unrecoverable"
+  die 2 "read-only feedback archive relay failed for source run $RELAY_FAILURE_RUN; prior feedback may be unrecoverable"
 fi
 
 tier_rank() {
@@ -455,9 +455,10 @@ EOF
 # original endpoint. The trusted workflow snapshots the prior marker set in an
 # append-only issue comment before it can disappear. Trust only records authored
 # by github-actions[bot], bind them back to a configured source identity, and
-# use every distinct archived finding version when the source is now markerless
-# (or deleted). Identical delivery retries collapse by source kind + id +
-# fingerprint; a live re-raise supersedes every archive for that source.
+# use every distinct archived finding version even when the live source was
+# rewritten into another finding. Identical live/archive deliveries collapse
+# by source kind + id + fingerprint; a distinct body remains independently
+# dispositionable.
 ARCHIVE_ENTRIES='[]'
 while IFS= read -r archive_comment; do
   [ -n "$archive_comment" ] || continue
@@ -528,7 +529,7 @@ ARCHIVED_CANDIDATES='[]'
 append_archive_candidate() {
   local payload="$1" archive_comment_id="$2" archived_at="$3"
   local source_kind source_id source_login source_comments source_comment
-  local live_source_login live_source_body live_source_tier archive_tiers tier
+  local live_source_login live_source_body_json live_source_fingerprint archive_tiers tier
   local body_fingerprint payload_body_json finding_kind ack_token accounted evidence
 
   printf '%s' "$payload" | validate_archive_payload \
@@ -542,6 +543,7 @@ append_archive_candidate() {
   source_kind=$(printf '%s' "$payload" | jq -r '.source_kind')
   source_id=$(printf '%s' "$payload" | jq -r '.source_comment_id')
   source_login=$(printf '%s' "$payload" | jq -r '.source_login')
+  body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
   case "$source_kind" in
     issue-comment)
       case "$source_login" in
@@ -572,9 +574,9 @@ append_archive_candidate() {
   if [ "$source_comment" != null ]; then
     live_source_login=$(printf '%s' "$source_comment" | jq -r '.user.login // ""')
     [ "$live_source_login" = "$source_login" ] || return 0
-    live_source_body=$(printf '%s' "$source_comment" | jq -r '.body // ""')
-    live_source_tier=$(strongest_nonignored_finding_tier "$source_login" "$live_source_body")
-    [ -z "$live_source_tier" ] || return 0
+    live_source_body_json=$(printf '%s' "$source_comment" | jq -c '.body // ""')
+    live_source_fingerprint=$(fingerprint "$live_source_body_json")
+    [ "$live_source_fingerprint" != "$body_fingerprint" ] || return 0
   fi
 
   if [ "$source_login" = "$CODERABBIT_BOT" ]; then
@@ -585,7 +587,6 @@ append_archive_candidate() {
   tier=$(strongest_nonignored_archive_tier "$archive_tiers")
   [ -n "$tier" ] || return 0
 
-  body_fingerprint=$(printf '%s' "$payload" | jq -r '.body_fingerprint')
   case "$source_kind" in
     issue-comment)
       finding_kind="issue-comment-archive"

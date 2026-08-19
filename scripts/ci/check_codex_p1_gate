@@ -137,7 +137,7 @@ if archive.is_a?(Hash)
   require_shape.call(
     archive_if.include?("github.event_name != 'schedule'") &&
       archive_if.include?("github.event.issue.pull_request"),
-    "archive-edited-feedback does not prepare every event-driven PR run for a fork relay"
+    "archive-edited-feedback does not prepare every event-driven PR run for the read-only relay"
   )
   archive_step = Array(archive["steps"]).find do |step|
     step["run"].to_s.include?("scripts/render-feedback-archive.sh")
@@ -150,10 +150,12 @@ if archive.is_a?(Hash)
       archive_run&.include?(".changes.body.from") &&
       archive_run&.include?("EVENT_ACTION") &&
       archive_run&.include?("is_fork") &&
+      archive_run&.include?('requires_relay="$is_fork"') &&
+      archive_run&.match?(/if \[ "\$pr_actor" = 'dependabot\[bot\]' \]; then\n\s+requires_relay=true/) &&
       archive_run&.include?("archive_records_file") &&
       archive_run&.include?('while IFS= read -r archive_record') &&
       archive_run&.include?("--rawfile archive_records") &&
-      archive_run&.include?("codex-p1-fork-handoff.json"),
+      archive_run&.include?("codex-p1-read-only-handoff.json"),
     "archive-edited-feedback does not bind comment and review-body sources to the complete archive renderer"
   )
   archive_env = archive_step&.fetch("env", {}) || {}
@@ -166,19 +168,19 @@ if archive.is_a?(Hash)
     step["uses"].to_s.start_with?("actions/upload-artifact@")
   end
   require_shape.call(
-    upload_step && upload_step["if"].to_s.include?("is_fork") &&
-      upload_step.dig("with", "name").to_s.include?("codex-p1-fork-handoff-") &&
+    upload_step && upload_step["if"].to_s.include?("requires_relay") &&
+      upload_step.dig("with", "name").to_s.include?("codex-p1-read-only-handoff-") &&
       upload_step.dig("with", "if-no-files-found").to_s == "error",
-    "archive-edited-feedback does not fail closed while uploading the fork relay handoff"
+    "archive-edited-feedback does not fail closed while uploading the read-only relay handoff"
   )
 end
 
 if gate.is_a?(Hash)
   require_shape.call(
-    gate["name"].to_s.include?("needs.archive-edited-feedback.outputs.is_fork") &&
-      gate["name"].to_s.include?("Codex P1 fork archive handoff") &&
+    gate["name"].to_s.include?("needs.archive-edited-feedback.outputs.requires_relay") &&
+      gate["name"].to_s.include?("Codex P1 read-only archive handoff") &&
       gate["name"].to_s.include?("Codex P1 unresolved threads"),
-    "codex-p1-gate does not give the unprivileged fork handoff a non-required check name"
+    "codex-p1-gate does not give the unprivileged read-only handoff a non-required check name"
   )
   needs = gate["needs"].is_a?(Array) ? gate["needs"] : [gate["needs"]]
   require_shape.call(
@@ -213,14 +215,22 @@ if gate.is_a?(Hash)
       open_env.values.none? { |value| value.to_s.include?("toJSON(github.event)") },
     "codex-p1-gate passes the webhook through an environment value instead of archive-job outputs"
   )
+  open_run = open_step&.fetch("run", "").to_s
+  relay_short_circuit = open_run.index('if [ "$requires_relay" = true ]')
+  lease_post = open_run.index('repos/$REPO/check-runs')
+  require_shape.call(
+    open_run.match?(/if \[ "\$requires_relay" = true \]; then\n[\s\S]*?exit 0/) &&
+      relay_short_circuit && lease_post && relay_short_circuit < lease_post,
+    "codex-p1-gate attempts a privileged lease before deferring a read-only event"
+  )
   fork_defer_index = steps.index do |step|
-    step["if"].to_s.include?("steps.open.outputs.is_fork == 'true'") &&
+    step["if"].to_s.include?("steps.open.outputs.requires_relay == 'true'") &&
       step["run"].to_s.include?("trusted workflow_run archive relay") &&
       !step["run"].to_s.match?(/(?:^|\n)\s*exit 1(?:\s|$)/)
   end
   require_shape.call(
     !fork_defer_index.nil?,
-    "codex-p1-gate does not leave fork clearance exclusively to the trusted relay"
+    "codex-p1-gate does not leave read-only clearance exclusively to the trusted relay"
   )
   archive_failure_index = steps.index do |step|
     condition = step["if"].to_s
@@ -304,11 +314,21 @@ if sweep.is_a?(Hash)
         sweep_run.include?("mergepath-feedback-archive-relay:v1") &&
         sweep_run.include?("complete|failed") &&
         sweep_run.include?("MAX_RELAY_SOURCE_RUNS") &&
-        sweep_run.include?("source run scan exceeded") &&
+        sweep_run.include?('for source_event in pull_request pull_request_review pull_request_review_comment issue_comment') &&
+        sweep_run.include?('-f event="$source_event"') &&
+        sweep_run.include?("matching source run scan exceeded") &&
         sweep_run.include?("relay_pending") &&
         sweep_run.include?('if [ "$relay_pending" = true ]') &&
         sweep_run.include?("rc=1"),
-      "scheduled-sweep can clear a fork while an archive relay run is pending"
+      "scheduled-sweep can clear a read-only PR while an archive relay run is pending"
+    )
+    page_filter = sweep_run.index('page_runs=$(jq -c --arg title')
+    source_count = sweep_run.index('source_count=$(jq')
+    source_bound = sweep_run.index('if [ "$source_count" -gt "$MAX_RELAY_SOURCE_RUNS" ]')
+    require_shape.call(
+      [page_filter, source_count, source_bound].all? &&
+        page_filter < source_count && source_count < source_bound,
+      "scheduled-sweep applies the relay bound before filtering to the target PR"
     )
     before = sweep_run.index("feedback_fp_before=")
     lease = sweep_run.index('-f status="in_progress"')
@@ -343,11 +363,11 @@ relay_jobs = relay_document.is_a?(Hash) ? relay_document["jobs"] : nil
 relay_job = relay_jobs.is_a?(Hash) ? relay_jobs["relay"] : nil
 require_shape.call(relay_job.is_a?(Hash), "#{relay_path} is missing its relay job")
 if relay_job.is_a?(Hash)
-  require_shape.call(relay_job["concurrency"].nil?, "fork archive relay must not use cancelling Actions concurrency")
+  require_shape.call(relay_job["concurrency"].nil?, "read-only archive relay must not use cancelling Actions concurrency")
   require_shape.call(
     relay_job["if"].to_s.include?("startsWith(github.event.workflow_run.display_title") &&
       relay_job["if"].to_s.include?("Codex P1 Gate relay-v1 PR #"),
-    "fork archive relay does not gate on the complete Codex P1 Gate run title"
+    "read-only archive relay does not gate on the complete Codex P1 Gate run title"
   )
   relay_steps = Array(relay_job["steps"])
   source_run = relay_steps.find { |step| step["id"].to_s == "source" }&.fetch("run", "").to_s
@@ -356,28 +376,31 @@ if relay_job.is_a?(Hash)
       source_run.include?("HTTP 404") && source_run.include?("api_err") &&
       source_run.match?(/Could not resolve PR.*\n[\s\S]*exit 1/) &&
       source_run.include?('echo "is_fork=false"') &&
+      source_run.include?('echo "requires_relay=false"') &&
+      source_run.include?('requires_relay="$is_fork"') &&
+      source_run.match?(/if \[ "\$pr_actor" = 'dependabot\[bot\]' \]; then\n\s+requires_relay=true/) &&
       source_run.match?(/(?:^|\n)\s*exit 0(?:\s|$)/),
-    "fork archive relay does not ignore ordinary issue_comment source runs safely"
+    "read-only archive relay does not ignore ordinary issue_comment source runs safely"
   )
   download_step = relay_steps.find { |step| step["uses"].to_s.start_with?("actions/download-artifact@") }
   require_shape.call(
     download_step && download_step.dig("with", "run-id").to_s.include?("source_run_id") &&
       download_step.dig("with", "path").to_s.include?("runner.temp"),
-    "fork archive relay does not download the source-run artifact into runner.temp"
+    "read-only archive relay does not download the source-run artifact into runner.temp"
   )
   missing_run = relay_steps.map { |step| step["run"] }.compact.find do |run|
-    run.include?("status=failed") && run.include?("fork archive handoff missing")
+    run.include?("status=failed") && run.include?("read-only archive handoff missing")
   end
   require_shape.call(
     missing_run&.include?("mergepath-feedback-archive-relay:v1") &&
       missing_run&.include?("repos/$REPO/check-runs") &&
       missing_run&.include?("conclusion=failure"),
-    "fork archive relay does not persist and publish a missing-handoff failure"
+    "read-only archive relay does not persist and publish a missing-handoff failure"
   )
   relay_run = relay_steps.map { |step| step["run"] }.compact.find do |run|
     run.include?("HANDOFF_FILE") && run.include?("scripts/codex-p1-gate.sh")
   end
-  require_shape.call(!relay_run.nil?, "fork archive relay has no trusted persistence/evaluation step")
+  require_shape.call(!relay_run.nil?, "read-only archive relay has no trusted persistence/evaluation step")
   if relay_run
     validate = relay_run.index("jq -e")
     lease = relay_run.index("status=in_progress")
@@ -392,16 +415,19 @@ if relay_job.is_a?(Hash)
       [validate, lease, persist, before, evaluate, after, complete, close, delete].all? &&
         validate < lease && lease < persist && persist < before && before < evaluate &&
         evaluate < after && after < complete && complete < close && close < delete,
-      "fork archive relay does not validate, persist, evaluate, publish, and retire in fail-closed order"
+      "read-only archive relay does not validate, persist, evaluate, publish, and retire in fail-closed order"
     )
     require_shape.call(
       relay_run.include?("mergepath-feedback-archive:v1") &&
         relay_run.include?("mergepath-feedback-archive:v2") &&
+        relay_run.include?(".requires_relay == true") &&
+        relay_run.include?("EXPECTED_IS_FORK") &&
+        relay_run.include?("EXPECTED_PR_ACTOR") &&
         relay_run.include?(".archive_records") &&
         relay_run.include?('while IFS= read -r archive_record') &&
         relay_run.include?("mergepath-feedback-archive-relay:v1") &&
         relay_run.include?('if [ "$fingerprint_before" != "$fingerprint_after" ]'),
-      "fork archive relay omits archive validation, completion evidence, or drift rejection"
+      "read-only archive relay omits archive validation, completion evidence, or drift rejection"
     )
   end
 end

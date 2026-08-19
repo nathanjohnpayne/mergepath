@@ -1,11 +1,11 @@
 name: Codex Feedback Archive Relay
 
-# Fork-triggered pull-request workflows receive a read-only GITHUB_TOKEN. The
-# unprivileged Codex P1 Gate run uploads a small, inert JSON handoff under a
-# distinct non-required check name. This default-branch workflow_run consumer
-# receives a write token, validates the handoff without executing artifact
-# content, persists any prior finding version, and only then publishes the
-# required PR-head gate.
+# Fork- and Dependabot-triggered pull-request workflows receive a read-only
+# GITHUB_TOKEN. The unprivileged Codex P1 Gate run uploads a small, inert JSON
+# handoff under a distinct non-required check name. This default-branch
+# workflow_run consumer receives a write token, validates the handoff without
+# executing artifact content, persists any prior finding version, and only
+# then publishes the required PR-head gate.
 on:
   workflow_run:
     workflows: [Codex P1 Gate]
@@ -20,13 +20,13 @@ permissions:
 
 jobs:
   relay:
-    name: Persist fork feedback archive and publish gate
+    name: Persist read-only feedback archive and publish gate
     if: >-
       ${{ startsWith(github.event.workflow_run.display_title,
       'Codex P1 Gate relay-v1 PR #') }}
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve the source PR and fork boundary
+      - name: Resolve the source PR and read-only boundary
         id: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -55,18 +55,27 @@ jobs:
             echo "pr=$pr" >> "$GITHUB_OUTPUT"
             echo "head_sha=" >> "$GITHUB_OUTPUT"
             echo "is_fork=false" >> "$GITHUB_OUTPUT"
+            echo "requires_relay=false" >> "$GITHUB_OUTPUT"
+            echo "pr_actor=" >> "$GITHUB_OUTPUT"
             echo "source_run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
+          pr_actor=$(jq -r '.user.login // ""' <<<"$pr_json")
+          requires_relay="$is_fork"
+          if [ "$pr_actor" = 'dependabot[bot]' ]; then
+            requires_relay=true
+          fi
           head_sha=$(jq -r '.head.sha // ""' <<<"$pr_json")
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "is_fork=$is_fork" >> "$GITHUB_OUTPUT"
+          echo "requires_relay=$requires_relay" >> "$GITHUB_OUTPUT"
+          echo "pr_actor=$pr_actor" >> "$GITHUB_OUTPUT"
           echo "source_run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Locate the fork handoff artifact
-        if: steps.source.outputs.is_fork == 'true'
+      - name: Locate the read-only handoff artifact
+        if: steps.source.outputs.requires_relay == 'true'
         id: artifact
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -75,7 +84,7 @@ jobs:
           SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
         run: |
           set -euo pipefail
-          expected="codex-p1-fork-handoff-$PR_NUMBER"
+          expected="codex-p1-read-only-handoff-$PR_NUMBER"
           artifact_id=$(gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
             --jq ".artifacts[] | select(.expired == false and .name == \"$expected\") | .id" \
             | tail -n 1)
@@ -86,8 +95,8 @@ jobs:
           echo "found=true" >> "$GITHUB_OUTPUT"
           echo "id=$artifact_id" >> "$GITHUB_OUTPUT"
 
-      - name: Fail permanently when a fork handoff is missing
-        if: steps.source.outputs.is_fork == 'true' && steps.artifact.outputs.found != 'true'
+      - name: Fail permanently when a read-only handoff is missing
+        if: steps.source.outputs.requires_relay == 'true' && steps.artifact.outputs.found != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -107,22 +116,22 @@ jobs:
           gh api --method POST "repos/$REPO/check-runs" \
             -f name="$CHECK_NAME" -f head_sha="$HEAD_SHA" \
             -f status=completed -f conclusion=failure \
-            -f "output[title]=Codex feedback gate — fork archive handoff missing" \
+            -f "output[title]=Codex feedback gate — read-only archive handoff missing" \
             -f "output[summary]=Source run $SOURCE_RUN_ID did not publish its trusted-relay handoff. The prior feedback body may be unrecoverable." \
             >/dev/null
           exit 1
 
-      - name: Download the inert fork handoff
-        if: steps.source.outputs.is_fork == 'true' && steps.artifact.outputs.found == 'true'
+      - name: Download the inert read-only handoff
+        if: steps.source.outputs.requires_relay == 'true' && steps.artifact.outputs.found == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          name: codex-p1-fork-handoff-${{ steps.source.outputs.pr }}
-          path: ${{ runner.temp }}/codex-p1-fork-handoff
+          name: codex-p1-read-only-handoff-${{ steps.source.outputs.pr }}
+          path: ${{ runner.temp }}/codex-p1-read-only-handoff
           run-id: ${{ steps.source.outputs.source_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout repo (default branch — trusted relay scripts)
-        if: steps.source.outputs.is_fork == 'true' && steps.artifact.outputs.found == 'true'
+        if: steps.source.outputs.requires_relay == 'true' && steps.artifact.outputs.found == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -130,21 +139,25 @@ jobs:
           fetch-depth: 1
 
       - name: Persist archive and publish the exact-head gate
-        if: steps.source.outputs.is_fork == 'true' && steps.artifact.outputs.found == 'true'
+        if: steps.source.outputs.requires_relay == 'true' && steps.artifact.outputs.found == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.source.outputs.pr }}
           SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
           ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
-          HANDOFF_FILE: ${{ runner.temp }}/codex-p1-fork-handoff/codex-p1-fork-handoff.json
+          EXPECTED_IS_FORK: ${{ steps.source.outputs.is_fork }}
+          EXPECTED_PR_ACTOR: ${{ steps.source.outputs.pr_actor }}
+          HANDOFF_FILE: ${{ runner.temp }}/codex-p1-read-only-handoff/codex-p1-read-only-handoff.json
           CHECK_NAME: Codex P1 unresolved threads
         run: |
           set -euo pipefail
           jq -e \
-            --arg repo "$REPO" --argjson pr "$PR_NUMBER" --argjson run "$SOURCE_RUN_ID" '
+            --arg repo "$REPO" --argjson pr "$PR_NUMBER" --argjson run "$SOURCE_RUN_ID" \
+            --argjson expected_is_fork "$EXPECTED_IS_FORK" --arg expected_pr_actor "$EXPECTED_PR_ACTOR" '
               type == "object" and .version == 1 and .repo == $repo and .pr == $pr
-              and .source_run_id == $run and .is_fork == true
+              and .source_run_id == $run and .requires_relay == true
+              and .is_fork == $expected_is_fork and .pr_actor == $expected_pr_actor
               and (.head_sha | type == "string" and test("^[0-9a-f]{40}$"))
               and (.event_name == "pull_request" or .event_name == "pull_request_review"
                 or .event_name == "pull_request_review_comment" or .event_name == "issue_comment")
@@ -159,7 +172,7 @@ jobs:
 
           check_id=$(gh api --method POST "repos/$REPO/check-runs" \
             -f name="$CHECK_NAME" -f head_sha="$head_sha" -f status=in_progress \
-            -f "output[title]=Codex feedback gate (trusted fork relay in progress)" \
+            -f "output[title]=Codex feedback gate (trusted read-only relay in progress)" \
             -f "output[summary]=Persisting reviewer-feedback history before evaluating $head_sha." \
             --jq .id)
 
@@ -181,7 +194,7 @@ jobs:
           fi
 
           rc=2
-          output="Trusted fork relay could not evaluate the requested head."
+          output="Trusted read-only relay could not evaluate the requested head."
           current_head=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')
           if [ "$current_head" = "$head_sha" ]; then
             fingerprint_before=$(scripts/review-feedback-surface-fingerprint.sh \
@@ -194,7 +207,7 @@ jobs:
             fingerprint_after=$(scripts/review-feedback-surface-fingerprint.sh \
               "$PR_NUMBER" "$REPO")
             if [ "$fingerprint_before" != "$fingerprint_after" ]; then
-              output="${output}"$'\n'"Feedback changed during trusted fork evaluation; refusing the stale result."
+              output="${output}"$'\n'"Feedback changed during trusted read-only evaluation; refusing the stale result."
               rc=2
             fi
           else
@@ -203,8 +216,8 @@ jobs:
 
           conclusion=failure
           [ "$rc" -eq 0 ] && conclusion=success
-          title="Codex feedback gate (trusted fork relay)"
-          [ "$rc" -le 1 ] || title="Codex feedback gate — trusted fork relay failed closed"
+          title="Codex feedback gate (trusted read-only relay)"
+          [ "$rc" -le 1 ] || title="Codex feedback gate — trusted read-only relay failed closed"
 
           marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=complete -->"
           existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')

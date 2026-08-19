@@ -81,7 +81,7 @@
 #     control flow);
 #   * job reachability beyond the existence of the known producer jobs;
 #     their parsed display-name contracts ARE pinned below, including the
-#     exact fork-aware Codex expression introduced by #1000;
+#     exact read-only-aware Codex expression introduced by #1000;
 #   * the all-jobs sweep for `checks: write` (the two known jobs ARE
 #     checked below; a third job added later is not).
 # Also tracked, in #976: the dataflow residual behind the head-binding
@@ -200,8 +200,8 @@ PUBLISH_JOB = "publish"
 # The three gate workflows and the display-name contract each producer job
 # must retain (A5). Merge clearance and CodeRabbit are static. Codex selects
 # the required context for same-repository heads and a non-required handoff
-# name for fork heads, whose required context belongs exclusively to the
-# trusted archive relay (#1000). Deleting or drifting one of these jobs can
+# name for fork and Dependabot heads, whose required context belongs
+# exclusively to the trusted archive relay (#1000). Deleting or drifting one of these jobs can
 # either remove a required producer or let an untrusted fork run occupy the
 # required context.
 #
@@ -209,8 +209,8 @@ PUBLISH_JOB = "publish"
 # be aimed at a fixture directory, the same way the publisher and its
 # parent are aimed at fixture files.
 CODEX_FORK_AWARE_JOB_NAME = (
-    "${{ needs.archive-edited-feedback.outputs.is_fork == 'true' && "
-    "'Codex P1 fork archive handoff' || 'Codex P1 unresolved threads' }}"
+    "${{ needs.archive-edited-feedback.outputs.requires_relay == 'true' && "
+    "'Codex P1 read-only archive handoff' || 'Codex P1 unresolved threads' }}"
 )
 
 NATIVE_PRODUCERS = {
@@ -921,8 +921,8 @@ for basename, (job_key, context, expected_display) in NATIVE_PRODUCERS.items():
         if not isinstance(needs_list, list) or "archive-edited-feedback" not in needs_list:
             bad("FAIL: [rcp native producer] %s job %r does not need"
                 % (path, job_key),
-                "      'archive-edited-feedback'. Its fork-aware display name reads",
-                "      that job's is_fork output; without the dependency the expression",
+                "      'archive-edited-feedback'. Its read-only-aware display name reads",
+                "      that job's requires_relay output; without the dependency the expression",
                 "      cannot reliably select the non-required handoff name.")
 
 if failures:
