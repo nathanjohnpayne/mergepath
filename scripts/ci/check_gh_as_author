@@ -22,6 +22,11 @@ TESTS=(
   "tests/test_check_no_bare_gh_writes.sh"
 )
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_gh_as_author: ERROR (jq is required — the wrapped suites would self-skip with exit 0 and report a green check over zero assertions)" >&2
+  exit 1
+fi
+
 FAILED=0
 for rel in "${TESTS[@]}"; do
   full="$REPO_ROOT/$rel"
