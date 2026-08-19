@@ -1141,8 +1141,19 @@ STUB
   # (c) the success escape: a genuinely empty page is a READ, not a failure,
   #     and both wrappers must hand it back as `[]` with status 0. Without
   #     this the two cases above would pass on a reader that failed always.
+  #
+  #     The stub writes benign stderr chatter on that SUCCESSFUL call — the
+  #     deprecation / retry / token-scope prose real `gh` emits on healthy
+  #     calls — because that is the drift reconciliation this extraction
+  #     carries (#966 reaching the other seven copies). Under the old `2>&1`
+  #     capture the chatter reached the `jq -s` slurp, the flatten failed, and
+  #     a healthy read was reported as unreadable; here it must not reach the
+  #     payload at all. Asserting `v`/`w` are exactly `[]` is what detects a
+  #     regression back to the merged-stream form: rc 0 alone would not,
+  #     since a contaminated payload could still be graded as a value.
   cat >"$dir/bin/gh" <<'STUB'
 #!/bin/sh
+printf '%s\n' 'gh: warning: this endpoint is deprecated; retrying (1/3)' >&2
 printf '%s\n' '[]'
 STUB
   chmod +x "$dir/bin/gh"
@@ -1156,12 +1167,19 @@ STUB
     strict=0; v=$(fetch_api_array "repos/o/r/x" "reviews") || strict=$?
     best=0;   w=$(fetch_api_array_best_effort "repos/o/r/x" "reviews") || best=$?
     printf "strict=%s best=%s v=[%s] w=[%s]\n" "$strict" "$best" "$v" "$w"
-  ' _ "$ROOT/scripts/lib/gh-api-array.sh" "$fn_strict" "$fn_best" 2>/dev/null)
+  ' _ "$ROOT/scripts/lib/gh-api-array.sh" "$fn_strict" "$fn_best" 2>"$dir/err3.log")
 
   [ "$out" = "strict=0 best=0 v=[[]] w=[[]]" ] \
-    || fail "27c: an empty page must read as [] with status 0 on both wrappers; got: $out"
+    || fail "27c: an empty page with benign gh stderr must still read as [] with status 0 on both wrappers; got: $out"
+  err=$(cat "$dir/err3.log")
+  if printf '%s' "$err" | grep -q 'failed to fetch reviews'; then
+    fail "27c: benign stderr on a SUCCESSFUL read was graded as a fetch failure; err=$err"
+  fi
+  if printf '%s' "$err" | grep -q 'failed to flatten reviews'; then
+    fail "27c: benign stderr on a SUCCESSFUL read reached the jq slurp; err=$err"
+  fi
 
-  [ "$FAIL" -ne "$before" ] || pass "27: #1008 — both wrappers share one algorithm while keeping their own statuses (3 vs 1), their own wordings, and the empty-page escape"
+  [ "$FAIL" -ne "$before" ] || pass "27: #1008 — both wrappers share one algorithm while keeping their own statuses (3 vs 1), their own wordings, the empty-page escape, and stderr isolation on a successful read"
 }
 
 # --- Test 20: #936 — 'No review completed' is a refusal, end to end ---------
