@@ -71,8 +71,11 @@ if [ -z "$CONFIG" ]; then
     *github.com/*) LOCAL_REPO=${ORIGIN_URL##*github.com/} ;;
   esac
   LOCAL_REPO=${LOCAL_REPO%.git}
+  LOCAL_BRANCH=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  ORIGIN_DEFAULT=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  ORIGIN_DEFAULT=${ORIGIN_DEFAULT#origin/}
   RESOLVER_ARGS=(--repo "$REPO" --pr "$PR_NUMBER" --default-config "$DEFAULT_CONFIG")
-  if [ "$LOCAL_REPO" != "$REPO" ]; then
+  if [ "$LOCAL_REPO" != "$REPO" ] || [ -z "$ORIGIN_DEFAULT" ] || [ "$LOCAL_BRANCH" != "$ORIGIN_DEFAULT" ]; then
     RESOLVER_ARGS+=(--materialize-default)
   fi
   CONFIG=$(

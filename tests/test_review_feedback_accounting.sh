@@ -132,7 +132,7 @@ RUN_RC=0
 RUN_JSON=""
 RUN_ERR=""
 run_gate() {
-  local token_mode="${1:-ambient}" config_mode="${2:-override}" out="$TMP/out.json" err="$TMP/err.log"
+  local token_mode="${1:-ambient}" config_mode="${2:-override}" gate_script="${3:-$SCRIPT}" out="$TMP/out.json" err="$TMP/err.log"
   local -a gate_env=(
     "PATH=$TMP/bin:$PATH"
     "GH_FIXTURE_DIR=$TMP/fixtures"
@@ -150,10 +150,10 @@ run_gate() {
       "${gate_env[@]}" \
       OP_PREFLIGHT_REVIEWER_PAT=test-token \
       OP_PREFLIGHT_CACHE_DIR="$TMP/no-cache" \
-      "$SCRIPT" 7 acme/widget >"$out" 2>"$err"
+      "$gate_script" 7 acme/widget >"$out" 2>"$err"
   else
     env "${gate_env[@]}" GH_TOKEN=test-token \
-      "$SCRIPT" 7 acme/widget >"$out" 2>"$err"
+      "$gate_script" 7 acme/widget >"$out" 2>"$err"
   fi
   RUN_RC=$?
   set -e
@@ -201,6 +201,19 @@ mv "$TMP/fixtures/pull.next" "$TMP/fixtures/pull.json"
 run_gate ambient base
 assert_eq 1 "$RUN_RC" "cross-repository default-base pull request uses the target repository policy"
 assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "target-repository reviewer remains inventoried on its default base"
+
+AUTHOR_CHECKOUT="$TMP/author-checkout"
+mkdir -p "$AUTHOR_CHECKOUT/scripts/workflow" "$AUTHOR_CHECKOUT/.github"
+cp "$SCRIPT" "$AUTHOR_CHECKOUT/scripts/review-feedback-accounting.sh"
+cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$AUTHOR_CHECKOUT/scripts/workflow/resolve_base_policy.sh"
+cp -R "$ROOT/scripts/lib" "$AUTHOR_CHECKOUT/scripts/lib"
+cp "$TMP/review-policy.yml" "$AUTHOR_CHECKOUT/.github/review-policy.yml"
+git -C "$AUTHOR_CHECKOUT" init -q -b feature
+git -C "$AUTHOR_CHECKOUT" remote add origin https://github.com/acme/widget.git
+git -C "$AUTHOR_CHECKOUT" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+run_gate ambient base "$AUTHOR_CHECKOUT/scripts/review-feedback-accounting.sh"
+assert_eq 1 "$RUN_RC" "same-repository author worktree does not trust its head policy as the PR base"
+assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "author worktree still inventories the base-only reviewer"
 
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
