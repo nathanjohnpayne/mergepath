@@ -101,6 +101,11 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_coderabbit_severity_gate: ERROR (jq is required — the wrapped suite would self-skip with exit 0 and report a green check over zero assertions)" >&2
+  exit 1
+fi
+
 # Run the fixture-driven test suite.
 if ! bash "$TEST"; then
   echo "check_coderabbit_severity_gate: FAIL (test suite)"

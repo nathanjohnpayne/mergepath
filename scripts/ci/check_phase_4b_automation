@@ -103,6 +103,11 @@ if [ ! -f "$REPO_ROOT/$TEST" ]; then
   exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_phase_4b_automation: ERROR (jq is required — the wrapped suite would self-skip with exit 0 and report a green check over zero assertions)" >&2
+  exit 1
+fi
+
 echo "check_phase_4b_automation: running $TEST"
 "$REPO_ROOT/$TEST"
 

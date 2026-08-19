@@ -48,6 +48,11 @@ if [[ $FAILED -eq 1 ]]; then
   exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_codex_scripts: ERROR (jq is required — the wrapped suites would self-skip with exit 0 and report a green check over zero assertions)" >&2
+  exit 1
+fi
+
 echo "check_codex_scripts: running codex-review-request ack tests"
 "$REPO_ROOT/tests/test_codex_review_request_ack.sh"
 
