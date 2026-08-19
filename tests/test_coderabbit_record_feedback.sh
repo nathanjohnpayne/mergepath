@@ -55,6 +55,7 @@ make_case() {
   cp "$SCRIPT" "$dir/scripts/coderabbit-record-feedback.sh"
   chmod +x "$dir/scripts/coderabbit-record-feedback.sh"
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 coderabbit:

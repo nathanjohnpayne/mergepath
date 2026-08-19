@@ -165,6 +165,19 @@ fi
 # shellcheck source=lib/reviewers-helpers.sh
 . "$__CODEX_CHECK_DIR/lib/reviewers-helpers.sh"
 
+# Shared paginated-list reader (#1008) — the fetch → capture → flatten
+# algorithm fetch_api_array below used to carry inline, alongside seven other
+# copies. Hard-required for the same reason reviewers-helpers is: the changed-
+# files, reviews and reactions reads are fail-closed gate inputs, and an
+# undefined reader would surface as `command not found` rather than as a
+# decision.
+if [ ! -r "$__CODEX_CHECK_DIR/lib/gh-api-array.sh" ]; then
+  echo "ERROR: gh-api-array helper missing: $__CODEX_CHECK_DIR/lib/gh-api-array.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$__CODEX_CHECK_DIR/lib/gh-api-array.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --diagnostic-signal-only (#814) — a FLAG, deliberately not an environment
@@ -502,15 +515,11 @@ die() {
 }
 
 # Fetch a paginated GitHub REST API endpoint and return the flattened JSON
-# array on stdout. See the identical helper in codex-review-request.sh for
-# the rationale; both scripts need the same fix (#64 review finding 3).
+# array on stdout. The algorithm lives in scripts/lib/gh-api-array.sh (#1008);
+# what stays here is this checker's failure ACTION — `die 3`, the infra status
+# every caller of this script reads as "could not decide".
 fetch_api_array() {
-  local endpoint=$1
-  local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
-    || die 3 "failed to flatten $label pagination output"
+  gh_api_array "$1" "$2" || die 3 "$GH_API_ARRAY_ERROR"
 }
 
 # --- fetch PR metadata ------------------------------------------------------

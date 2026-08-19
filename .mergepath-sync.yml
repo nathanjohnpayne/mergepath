@@ -368,6 +368,20 @@ paths:
   - path: scripts/lib/gh-api-scalar.sh
     type: canonical
     consumers: all
+  # Paginated LIST reader (#1008) — the array twin of gh-api-scalar.sh above,
+  # and the one definition of `fetch → capture → flatten` that eight review
+  # sensing scripts each used to carry inline. The duplication is what
+  # regenerated the fixes: #831/#965 corrected the failure contract one helper
+  # at a time across four PRs, and #966's stream-separation correction reached
+  # only ONE of the eight. HARD-sourced by every consumer below, because the
+  # degraded mode is `command not found` on the reads whose fail-closed
+  # contract keeps an unreadable surface from being graded as "no findings":
+  # declared in each of their requires: so the lib can never ship behind its
+  # callers. Each caller keeps only its own failure ACTION (die 2 / die 3 /
+  # return 3 / return 1), which is the part that genuinely differs.
+  - path: scripts/lib/gh-api-array.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
@@ -380,6 +394,7 @@ paths:
     requires:
       - "scripts/lib/reviewers-helpers.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced by both fetch wrappers
   # #489 CodeRabbit-rate-limit auto-merge disposition gate. agent-review.yml's
   # exit-5 (rate-limited) branch calls this script to decide whether the
   # Codex-failover path may auto-merge. Absent on a consumer it exits 127 and
@@ -425,6 +440,7 @@ paths:
       - "scripts/lib/codex-failure-markers.sh"
       - "scripts/workflow/codex_auto_trigger_gate.sh"   # #798, content-free auto-trigger gate
       - "scripts/lib/gh-api-scalar.sh"   # #799, fail-closed scalar API reads
+      - "scripts/lib/gh-api-array.sh"    # #1008, hard-sourced paginated list reads
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
@@ -438,6 +454,7 @@ paths:
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/reviewers-helpers.sh"   # #453, hard-sourced for the gate (b)/(c) reviewer allow-list
       - "scripts/lib/codex-failure-markers.sh"   # #722, sourced for the gate (c) usage-limit/not-connected diagnostic
+      - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
   # Phase 4a feedback loop (#487): records the validated 👍/👎 reaction
   # Codex solicits on each finding. WRITE path — every reaction POST goes
   # through scripts/gh-as-reviewer.sh under the reviewer identity, so the
@@ -450,6 +467,7 @@ paths:
     requires:
       - "scripts/gh-as-reviewer.sh"
       - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
   - path: scripts/phase-4b-classifier.sh
     type: canonical
     consumers: all
@@ -496,9 +514,11 @@ paths:
     # Generalized in #577 to source scripts/lib/feedback-policy-helpers.sh
     # and enforce the resolved feedback_policy `required` tier set. Without
     # the lib propagated, the gate fails-closed on a missing-source error for
-    # every PR in the consumer.
+    # every PR in the consumer. Since #1008 it also hard-sources the shared
+    # paginated-list reader for its inline-comment fetch, on the same terms.
     requires:
       - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
   # CodeRabbit twin of codex-p1-gate.sh (#577). Run directly by
   # .github/workflows/coderabbit-severity-gate.yml and by scripts/ci/
   # check_coderabbit_severity_gate; sources the shared feedback-policy lib.
@@ -507,6 +527,7 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
   # CodeRabbit disposition-verdict ledger (#584) — the DISPOSITION-ONLY twin
   # of scripts/codex-record-feedback.sh (#487). By-nature asymmetry (#574):
   # CodeRabbit does not solicit per-finding reactions, so this helper never
@@ -518,6 +539,7 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/feedback-policy-helpers.sh"
+      - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
   # Shared reader + tier classifiers for the feedback_policy block (#576).
   # Sourced by scripts/ci/check_feedback_policy_helpers (via its test); once
   # #577 lands, both severity gates source it too. First-class entry so the
@@ -570,6 +592,7 @@ paths:
       - "scripts/codex-review-check.sh"
       - "scripts/workflow/"
       - "scripts/lib/reviewers-helpers.sh"   # #817, hard-sourced for the Dependabot reviewer allow-list
+      - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
   - path: scripts/daily-feedback-rollup.sh
     # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.
     # Sources scripts/lib/daily-feedback-rollup-helpers.sh. The

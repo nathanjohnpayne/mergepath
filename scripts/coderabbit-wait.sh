@@ -391,6 +391,19 @@ fi
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh"
 
+# Shared paginated-list reader (#1008). Owns the fetch → capture → flatten
+# algorithm the two wrappers below used to carry inline, so a correctness fix
+# to it lands once instead of eight times. Hard-required for the same reason
+# the three libs above are: every sensing read on this path routes through it,
+# and the degraded mode (an undefined function) is a `command not found` on the
+# very reads whose failure contract #831/#965 exist to keep honest.
+if [ ! -r "$__CODERABBIT_WAIT_DIR/lib/gh-api-array.sh" ]; then
+  echo "ERROR: gh-api-array helper missing: $__CODERABBIT_WAIT_DIR/lib/gh-api-array.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$__CODERABBIT_WAIT_DIR/lib/gh-api-array.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --probe (#814): read-only, zero-budget, single-scan mode.
@@ -862,30 +875,39 @@ die() {
 # reached. Use `|| return`/`|| die` explicitly rather than relying on the
 # caller's context, or use fetch_api_array_best_effort when an unreadable
 # surface genuinely is not fatal.
+#
+# The algorithm itself lives in scripts/lib/gh-api-array.sh (#1008); what
+# stays here is this file's failure ACTION, which is the part that genuinely
+# differs between consumers. `gh_api_array` is called DIRECTLY (not in a
+# nested command substitution), which is what lets its diagnostic reach this
+# wrapper through GH_API_ARRAY_* even when the wrapper itself is invoked from
+# inside `VAR=$(fetch_api_array …)`.
 fetch_api_array() {
-  local endpoint=$1
-  local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || {
-    log "ERROR: failed to fetch $label: $raw"
-    return 3
-  }
-  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
-    log "ERROR: failed to flatten $label pagination output"
+  gh_api_array "$1" "$2" || {
+    log "ERROR: $GH_API_ARRAY_ERROR"
     return 3
   }
 }
 
+# The best-effort twin. Its contract is deliberately DIFFERENT — rc 1, not
+# rc 3 — because its callers treat an unreadable surface as non-fatal rather
+# than as an infra failure, and collapsing the two statuses would hand those
+# callers the fatal one. It keeps each of its own message forms, which is why
+# gh_api_array reports WHICH step failed rather than only that one did.
+#
+# The `shape` arm (#967) forwards the lib's composed message verbatim rather
+# than re-phrasing it: that diagnostic names the endpoint and the shape
+# received, and neither is reconstructible from GH_API_ARRAY_DETAIL — which is
+# gh's stderr and is EMPTY on this path, because the read itself succeeded.
 fetch_api_array_best_effort() {
-  local endpoint=$1
-  local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || {
-    log "best-effort fetch failed for $label: $raw"
-    return 1
-  }
-  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
-    log "best-effort fetch failed to flatten $label pagination output"
+  gh_api_array "$1" "$2" || {
+    if [ "$GH_API_ARRAY_ERROR_KIND" = "flatten" ]; then
+      log "best-effort fetch failed to flatten $2 pagination output"
+    elif [ "$GH_API_ARRAY_ERROR_KIND" = "shape" ]; then
+      log "best-effort fetch refused $GH_API_ARRAY_ERROR"
+    else
+      log "best-effort fetch failed for $2: $GH_API_ARRAY_DETAIL"
+    fi
     return 1
   }
 }
@@ -1477,8 +1499,68 @@ summary_stanzas_all_benign() {
 # names the abandoned NEW head in refusal prose ("changed during the review
 # from X to Y"), which a position-blind token match accepts. The boundary
 # class keeps a longer digest containing the head from matching.
+#
+# The body is fed to grep by HERE-STRING, never through a pipe (Codex P1 on
+# #995). `set -o pipefail` is on, and `grep -q` exits the instant it matches:
+# on a body larger than the platform's pipe buffer whose range line is near
+# the start, the producer is still writing when grep leaves, takes SIGPIPE,
+# and the pipeline reports 141. Reproduced at 200 KiB: the predicate answers
+# "no match" on a body that plainly matches. Its two callers both take that
+# answer in the SAFE direction — this one only ever declines to clear — but
+# `summary_names_only_other_head` below does not, so the idiom is corrected in
+# both rather than left to be re-derived from which caller happens to read it.
 summary_names_head() {
-  printf '%s' "$1" | grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)"
+  grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)" <<<"$1"
+}
+
+# True when the body carries a machine-readable commits range AND none of its
+# ranges ends at this head — i.e. the body is a verdict about a DIFFERENT
+# commit (#968).
+#
+# The defect it closes: `fresh_at` is `max(created_at, updated_at)` because
+# CodeRabbit edits its summary in place and #824 records that reading
+# `created_at` alone rejects a genuine re-review. That is right as far as it
+# goes, and the other direction was missing — an EDIT IS NOT A RE-REVIEW.
+# CodeRabbit rewrites that comment for reasons unrelated to reviewing the new
+# head (the Review Change Stack widget, the walkthrough, the release-note
+# block), and each rewrite bumps `updated_at`, at which point a verdict about
+# commit N reads as current for commit N+1. Measured live on #965: push at
+# 04:58:00Z, the PREVIOUS head's summary edited at 04:58:53Z, `cleared` in two
+# seconds, and no CodeRabbit comment ever named the pushed head.
+#
+# The published freshness contract has two rungs — an exact SHA match wins
+# outright, and only a review with NO matching SHA falls to the
+# HEAD-committer-date floor. Such a body DOES carry a SHA; it is simply the
+# wrong one, and nothing looked at it, so the case fell to the floor rung as
+# though the body were silent.
+#
+# Direction matters. This predicate can only ever REFUSE a clearance, never
+# make one — the same posture the file already takes for the per-SHA
+# StatusContext at the probe's terminal emits. That is what makes a MUTABLE
+# comment body acceptable evidence here: a CodeRabbit-side rewrite that dropped
+# the range costs liveness (the wait keeps polling and eventually times out
+# advisory), never correctness.
+#
+# Both conjuncts are anchored in the SAME shape summary_names_head reads, so
+# the two cannot drift: a range is 40-hex on both ends, `between <base> and
+# <head>`. A body whose range is unparseable — a format drift, or a body that
+# never carried one — yields NO ranges and is therefore not a mismatch, which
+# keeps the `fresh_at >= HEAD_ANCHOR` floor the only test for silent bodies
+# exactly as before (#968 AC3). Failing the other way would stall every PR on
+# CodeRabbit's next wording change.
+#
+# HERE-STRING, not a pipe, and the direction is why (Codex P1 on #995). With
+# `set -o pipefail` on, `printf … | grep -q` reports 141 when grep matches and
+# leaves before the producer has finished writing — which happens once the body
+# exceeds the pipe buffer and the range line sits near its start. `|| return 1`
+# then reads that as "this body makes no head claim", the demotion never fires,
+# and the previous head's summary clears this head: the exact #968 false clear
+# this predicate exists to close, restored on the large summaries most likely
+# to carry one. Reproduced at 200 KiB before the fix.
+summary_names_only_other_head() {  # <body> <head_sha>
+  grep -qiE "between [0-9a-f]{40} and [0-9a-f]{40}([^0-9a-fA-F]|\$)" <<<"$1" || return 1
+  summary_names_head "$1" "$2" && return 1
+  return 0
 }
 
 # True when the body carries a blocking finding marker OUTSIDE the pre-merge
@@ -2554,7 +2636,8 @@ find_status_probe_reply() {
 }
 
 emit_terminal_review_after_probe_if_present() {
-  local latest class potential_issues review_json summary_marker_rc
+  local latest body class potential_issues review_json summary_marker_rc
+  local summary_head_claim_rc
   # Status-checked (#957/#959). "Best effort" governs the FETCH — an
   # unreadable surface is not fatal on the timeout path — but the DECODE now
   # reports rc 3, and an unchecked assignment would leave `latest` empty, skip
@@ -2571,7 +2654,16 @@ emit_terminal_review_after_probe_if_present() {
     return 0
   fi
 
-  class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
+  # Derived ONCE and reused. The body feeds two predicates now (the class
+  # ladder and the #968 head-claim check), and a second `$(… | jq -r '.body')`
+  # inside an `if` condition would run with errexit suspended: a jq failure
+  # there yields the empty string, which reads as "makes no head claim" and
+  # falls through to the clearance. One read, status-checked, cannot.
+  body=$(echo "$latest" | jq -r '.body') || {
+    log "post-probe terminal-review check: the selected comment body could not be derived — leaving the advisory timeout in place rather than grading an unread comment"
+    return 0
+  }
+  class=$(classify_comment "$body")
   case "$class" in
     review)
       potential_issues=$(count_potential_issues)
@@ -2599,6 +2691,32 @@ emit_terminal_review_after_probe_if_present() {
           emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
           ;;
         1)
+          # #968, mirroring the polling `review` arm — including its AC1
+          # correction: the head claim is read off the SUMMARY, because `$body`
+          # is only the newest bot comment and a later benign chat reply makes
+          # no head claim at all.
+          #
+          # rc 3 is not fatal HERE, unlike at the polling arm. This helper only
+          # ever UPGRADES the advisory timeout into a verdict, so declining to
+          # emit leaves exit 4 in place — the same conservative answer it
+          # already gives when the comment list cannot be read.
+          summary_head_claim_rc=0
+          crw_summary_names_only_other_head "$HEAD_SHA" || summary_head_claim_rc=$?
+          case "$summary_head_claim_rc" in
+            0)
+              log "post-probe terminal-review check: the PR's CodeRabbit summary has no blocking markers, but its commits range names a different commit than $HEAD_SHA — leaving the advisory timeout in place rather than clearing on another commit's verdict (#968)"
+              return 0
+              ;;
+            1) : ;;
+            *)
+              log "post-probe terminal-review check: the CodeRabbit summary comment could not be read, so a verdict about another commit cannot be ruled out — leaving the advisory timeout in place"
+              return 0
+              ;;
+          esac
+          if summary_names_only_other_head "$body" "$HEAD_SHA"; then
+            log "post-probe terminal-review check: the newest comment has no blocking markers, but its commits range names a different commit than $HEAD_SHA — leaving the advisory timeout in place rather than clearing on another commit's verdict (#968)"
+            return 0
+          fi
           log "CodeRabbit review landed during status-probe wait with no high-severity markers — emitting cleared (exit 0)"
           emit_json_and_exit "cleared" 0 "$review_json" 0
           ;;
@@ -2790,9 +2908,61 @@ STATUS_PROBE_JSON=$(jq -nc \
   --argjson enabled "$([ "$STATUS_PROBE_ENABLED" = "true" ] && echo true || echo false)" \
   '{enabled:$enabled, posted:false, reply_present:false, reply:null, waited_seconds:0}')
 
+# BEGIN coderabbit_emit_json
+# Sentinel-delimited so tests/test_coderabbit_wait_statuscontext_ratelimit.sh
+# can extract and drive the emitter directly. There is deliberately no live
+# route left that reaches it with an unusable review object — the reader guards
+# are what close those — so the invariant below is only assertable this way.
 emit_json_and_exit() {
   local status=$1 exit_code=$2 review_json=$3 potential_issues=$4
   local now_epoch waited skip_reason_json
+
+  # #985. `--argjson review "$review_json"` at the bottom of this function
+  # rejects an empty or unparseable value by DYING INSIDE jq: the process exits
+  # 2 with nothing on stdout. Both halves of that are wrong.
+  #
+  #   - rc 2 is the code callers read as `findings` (blocking review feedback),
+  #     so a run that died in the emitter reported the same status as a run that
+  #     found a real Major, and neither agent-review.yml nor the Phase 4b
+  #     barrier could tell the two apart.
+  #   - no JSON reaches stdout at all, so every consumer that parses the emitted
+  #     object gets a parse error instead of a status, on the one path where the
+  #     cause matters most.
+  #
+  # That crash is also what #957 measured standing between a false clearance and
+  # a real exit 0 on mergepath#936 head d361075 — `emit_json_and_exit "cleared"
+  # 0` WAS called, and jq killed the run. #957 was explicit that the emitter must
+  # not be hardened until the READS fail closed first; that ordering is now
+  # satisfied (#831/#965, #942/#957/#959/#963), so the accidental guard can be
+  # replaced by an honest one.
+  #
+  # `--argjson review "${review_json:-null}"` would be the WRONG fix: it papers
+  # over the invariant by silently emitting `review: null`, which is the
+  # "cannot decide reads as nothing to decide" shape this whole family exists to
+  # close. An unusable value here is an INTERNAL invariant violation — a caller
+  # bug, not a provider state — so it takes the infra exit and names its caller.
+  #
+  # The literal string `null` is NOT a violation: `timeout`, `paused` and
+  # `skipped` legitimately emit `review: null`, and a parse test accepts it.
+  # `jq -e` would not — it exits 1 on a `null` output — so the check is a parse
+  # test and not a truthiness test.
+  #
+  # The parse test is `jq -s 'length' == 1`, not `jq empty` (Codex P2 on #995).
+  # `jq empty` asks only "does every value here parse", which is a WEAKER
+  # question than the one `--argjson` asks: it exits 0 on a whitespace-only
+  # string (zero values) and on two concatenated documents (`{} {}`), both of
+  # which `--argjson` rejects — so the guard passed and the run still died
+  # inside jq with rc 2 and no stdout, which is precisely the
+  # findings/infra misclassification this change exists to remove. Slurping
+  # counts values instead: 0 for empty-or-whitespace, 2 for the double
+  # document, exactly 1 for `null` and for any single object, and a parse
+  # failure makes jq exit non-zero with no count at all.
+  local review_json_values
+  review_json_values=$(jq -s 'length' 2>/dev/null <<<"$review_json") || review_json_values=""
+  if [ -z "$review_json" ] || [ "$review_json_values" != "1" ]; then
+    die 3 "internal invariant violated: emit_json_and_exit was called from ${FUNCNAME[1]:-<top-level>} (line ${BASH_LINENO[0]:-?}) with a review object jq cannot accept for status '$status' — refusing to emit rather than dying inside jq with the findings exit code (#985)"
+  fi
+
   now_epoch=$(date +%s)
   waited=$((now_epoch - START_EPOCH))
 
@@ -2892,6 +3062,7 @@ emit_json_and_exit() {
 
   exit "$exit_code"
 }
+# END coderabbit_emit_json
 
 # Sleep for up to `requested` seconds, clamped to the remaining
 # max_wait_seconds budget. Without this guard, fixed 15s polling
@@ -3132,6 +3303,56 @@ crw_select_summary_comment() {
   '
 }
 # END coderabbit_summary_selector
+
+# BEGIN coderabbit_summary_head_claim
+# #968 AC1. The other-head demotion is a statement about the review SUMMARY,
+# and the two clearance sites evaluated it against whatever body the poll loop
+# happened to be holding instead. Those two coincide only while the summary IS
+# the newest bot comment. A CodeRabbit CHAT REPLY posted after it does not
+# coincide: it classifies `review`, carries no commits range, and therefore
+# makes no head claim at all, so the predicate answered "no claim" and the
+# exact #968 false clear returned. That shape is live, not hypothetical —
+# replies #794 and #518 are the two the SUMMARY_MARKER comment above already
+# records — and it reproduces on the stub-gh fixture below: a summary edited
+# after the push whose range ends at the PREVIOUS head, one benign reply above
+# it, verdict `cleared` with `waited_seconds: 0`.
+#
+# So the head claim is read from the comment the SUMMARY_MARKER selects, which
+# is the same anchor-free marker-led selection `--probe` already uses and the
+# reason a chat reply is STRUCTURALLY unable to supply this evidence: it does
+# not start with the marker at byte zero.
+#
+# Direction is unchanged from the predicate it wraps — this can only ever
+# REFUSE a clearance, never manufacture one — which is what makes reading a
+# mutable comment body acceptable evidence here.
+#
+# Return codes, and both call sites honour all three:
+#   0  a summary exists and every commits range in it ends at some OTHER
+#      commit. Refuse the clearance.
+#   1  no refusal: there is no summary comment, or its body carries no
+#      machine-readable range, or one of its ranges ends at this head. Those
+#      are #968 AC2/AC3 and stay exactly as they were.
+#   3  the issue-comment list could not be READ, or the selected body could not
+#      be derived. Never folded into 1 — "the surface is unreadable" reading as
+#      "the surface says nothing to refuse on" is the same failed-read-as-clean
+#      confusion #936/#959 closed at the neighbouring reads.
+#
+# crw_summary_names_only_other_head <head-sha>
+crw_summary_names_only_other_head() {
+  local head_sha=${1:?}
+  local issue_comments summary sbody
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
+    || return 3
+  summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
+    || return 3
+  # No summary comment on the PR at all is a definite answer, not an unread
+  # one: there is no verdict here about any commit, so there is nothing to
+  # demote and the caller's other freshness tests keep deciding.
+  [ -n "$summary" ] || return 1
+  sbody=$(printf '%s' "$summary" | base64 --decode | jq -r '.body') || return 3
+  summary_names_only_other_head "$sbody" "$head_sha"
+}
+# END coderabbit_summary_head_claim
 
 # #919: both of the probe's terminal conjuncts are satisfiable by artifacts of
 # CodeRabbit ACTIVITY rather than by a finished review.
@@ -3968,6 +4189,40 @@ while :; do
           emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
           ;;
         1)
+          # #968, and ONLY the clearance. A summary whose commits range ends at
+          # a commit that is not this head is evidence about that other commit,
+          # however recently an in-place edit bumped its updated_at. The
+          # findings arms above are untouched on purpose: they are decided by
+          # `commit_id`-pinned inline comments and by the head-anchored summary
+          # scan, and blocking is the safe direction anyway. It is the `cleared`
+          # emit — the one a caller reads as "go" — that must not be reachable
+          # from a verdict about another commit.
+          # Read the head claim off the SUMMARY (#968 AC1), not off the body
+          # this arm happens to be grading. Three-way for the same reason the
+          # marker read above is: an unreadable comment list is not a body that
+          # declines to make a claim.
+          SUMMARY_HEAD_CLAIM_RC=0
+          crw_summary_names_only_other_head "$HEAD_SHA" || SUMMARY_HEAD_CLAIM_RC=$?
+          case "$SUMMARY_HEAD_CLAIM_RC" in
+            0)
+              log "the PR's CodeRabbit summary comment has no blocking markers, but its commits range names a different commit than $HEAD_SHA — an in-place EDIT is not a re-review, so this is not clearance for this head (#968); sleeping ${POLL_INTERVAL_SECONDS}s"
+              sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+              continue
+              ;;
+            1) : ;;
+            *)
+              die 3 "could not read the CodeRabbit summary comment to rule out a verdict about another commit on $HEAD_SHA — refusing to report a clearance"
+              ;;
+          esac
+          # Kept as a second, independent carrier. The check can only REFUSE,
+          # so consulting the graded body as well is monotone: every refusal
+          # that fires today still fires, and the summary read above adds the
+          # ones a later chat reply used to hide.
+          if summary_names_only_other_head "$COMMENT_BODY" "$HEAD_SHA"; then
+            log "CodeRabbit comment id=$COMMENT_ID has no blocking markers, but its commits range names a different commit than $HEAD_SHA — an in-place EDIT is not a re-review, so this is not clearance for this head (#968); sleeping ${POLL_INTERVAL_SECONDS}s"
+            sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+            continue
+          fi
           log "CodeRabbit review posted with no high-severity markers — cleared"
           emit_json_and_exit "cleared" 0 "$REVIEW_JSON" 0
           ;;

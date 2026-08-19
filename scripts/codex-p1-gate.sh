@@ -116,6 +116,19 @@ __P1_GATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$__P1_GATE_DIR/lib/feedback-policy-helpers.sh"
 
+# Shared paginated-list reader (#1008) — the fetch → capture → flatten
+# algorithm fetch_api_array below used to carry inline, alongside seven other
+# copies. Hard-required: this is a REQUIRED status check, and an undefined
+# reader would surface as `command not found` on the read whose fail-closed
+# contract keeps an unreadable inline surface from being graded as "no
+# findings".
+if [ ! -r "$__P1_GATE_DIR/lib/gh-api-array.sh" ]; then
+  echo "ERROR: gh-api-array helper missing: $__P1_GATE_DIR/lib/gh-api-array.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$__P1_GATE_DIR/lib/gh-api-array.sh"
+
 # Read a scalar field nested inside `codex:` `<sub_block>:` `<field>:`.
 # Same state-machine awk pattern as codex-review-check.sh, but tracks
 # nesting one level deeper for the `p1_gate` sub-block.
@@ -273,14 +286,11 @@ die() {
   exit "$code"
 }
 
-# Paginated fetch helper — same shape as codex-review-check.sh.
+# Paginated fetch helper. The algorithm lives in scripts/lib/gh-api-array.sh
+# (#1008); what stays here is this gate's failure ACTION — `die 2`, the
+# config/usage code the workflow maps to a hard gate failure.
 fetch_api_array() {
-  local endpoint=$1
-  local label=$2
-  local raw
-  raw=$(gh api --paginate "$endpoint" 2>&1) || die 2 "failed to fetch $label: $raw"
-  echo "$raw" | jq -s 'add // []' 2>/dev/null \
-    || die 2 "failed to flatten $label pagination output"
+  gh_api_array "$1" "$2" || die 2 "$GH_API_ARRAY_ERROR"
 }
 
 # --- fetch PR metadata ------------------------------------------------------

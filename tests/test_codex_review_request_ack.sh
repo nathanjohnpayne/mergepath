@@ -54,6 +54,9 @@ make_case() {
   # because the read it guards anchors every freshness comparison in the poll
   # loop. Fixture trees must stage the real one.
   cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"
+  # #1008: the array twin, hard-sourced for the same reason — every signal
+  # the poll loop scans for arrives through it.
+  cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
 codex:
