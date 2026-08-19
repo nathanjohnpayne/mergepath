@@ -546,6 +546,32 @@ fi
 mv "$TMP/fixtures/inline-with-reply.json" "$TMP/fixtures/inline.json"
 run_gate
 assert_eq 0 "$RUN_RC" "CodeRabbit finding and author reply reconcile"
+jq '.[0].updated_at = "2026-08-18T21:02:00Z"
+  | .[0].body += "\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "CodeRabbit addressed confirmation preserves the substantive reply it confirms"
+jq '.[0].body |= sub("✅ Confirmed as addressed by @nathanjohnpayne"; "Address confirmation removed")' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "ordinary CodeRabbit edit after a reply invalidates the earlier evidence"
+jq '.[0].body += "\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\nordinary trailing content"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "CodeRabbit confirmation pair before trailing content is not a trusted suffix"
+jq '.[0].body += "\n\n```text\n✅ Confirmed as addressed by @nathanjohnpayne\n<!-- This is an auto-generated reply by CodeRabbit -->\n```"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "quoted CodeRabbit confirmation pair is not a trusted suffix"
+jq '.[0].body += "\n\n```text\n✅ Confirmed as addressed by @nathanjohnpayne\n<!-- This is an auto-generated reply by CodeRabbit -->"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "unclosed fenced CodeRabbit confirmation pair is not a trusted suffix"
 
 reset_fixtures
 cat >"$TMP/fixtures/reviews.json" <<'JSON'
@@ -794,6 +820,12 @@ cat >"$TMP/fixtures/reviews.json" <<'JSON'
 JSON
 run_gate
 assert_eq 0 "$RUN_RC" "markerless COMMENTED review is not invented into a finding"
+jq '.[0].body = "### Codex Review\n\n```text\n**P1** Preserve the exact registered-reviewer body contract\n```"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "CodeRabbit-only sanitization does not suppress a Codex marker"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "Codex top-level body uses the unsanitized canonical ladder"
 
 reset_fixtures
 GH_FAIL_ENDPOINT="repos/acme/widget/pulls/7/reviews"

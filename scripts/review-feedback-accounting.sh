@@ -305,10 +305,11 @@ EOF
 strongest_nonignored_finding_tier() {
   local login="$1" body="$2" tier="" tiers="" sanitized
   local best="" best_rank=99 rank
-  sanitized=$(coderabbit_finding_scan "$body") || return 2
+  sanitized="$body"
   if [ "$login" = "$CODEX_BOT" ] || registered_reviewer_login "$login"; then
     tiers=$(codex_tiers_of "$sanitized")
   elif [ "$login" = "$CODERABBIT_BOT" ]; then
+    sanitized=$(coderabbit_finding_scan "$body") || return 2
     tiers=$(coderabbit_tiers_of "$sanitized")
   fi
   while IFS= read -r tier; do
@@ -363,16 +364,17 @@ INLINE_CANDIDATES=$(printf '%s' "$INLINE_CANDIDATES" | jq -c '
 ')
 
 agent_reply_after_finding() {
-  local root_id="$1" floor="$2" finding_id="$3"
+  local root_id="$1" floor="$2" finding_id="$3" confirmed_login="$4"
   printf '%s' "$INLINE_COMMENTS" | jq -e \
     --argjson root "$root_id" --arg floor "$floor" --argjson finding "$finding_id" \
-    --argjson agents "$AGENT_LOGINS_JSON" '
+    --arg confirmed "$confirmed_login" --argjson agents "$AGENT_LOGINS_JSON" '
       any(.[];
         (.in_reply_to_id != null)
         and (.in_reply_to_id == $root)
         and (.id != $finding)
         and ((.created_at // "") >= $floor)
         and ((.user.login // "") as $login | ($agents | index($login)) != null)
+        and ($confirmed == "" or (.user.login // "") == $confirmed)
         and (((.body // "") | gsub("\\[mergepath-resolve:[^]]*\\]"; "")
           | gsub("^[[:space:]]+|[[:space:]]+$"; "")
           | gsub("[[:space:]]+"; " ")) as $body
@@ -381,15 +383,45 @@ agent_reply_after_finding() {
     ' >/dev/null 2>&1
 }
 
+coderabbit_confirmation_login() {
+  local body="$1" login visible
+  visible=$(coderabbit_finding_scan "$body") || return 1
+  login=$(printf '%s\n' "$visible" | awk '
+    /^[[:space:]]*$/ {next}
+    {penultimate=last; last=$0}
+    END {
+      if (last ~ /^<!-- This is an auto-generated (comment|reply) by CodeRabbit -->$/ \
+          && penultimate ~ /^✅ Confirmed as addressed by @[A-Za-z0-9-]+$/) {
+        sub(/^✅ Confirmed as addressed by @/, "", penultimate)
+        print penultimate
+      }
+    }
+  ' | tail -n 1)
+  [ -n "$login" ] || return 1
+  printf '%s' "$AGENT_LOGINS_JSON" \
+    | jq -e --arg login "$login" 'index($login) != null' >/dev/null 2>&1 \
+    || return 1
+  printf '%s' "$login"
+}
+
 FINDINGS='[]'
 while IFS= read -r finding; do
   [ -n "$finding" ] || continue
   root_id=$(printf '%s' "$finding" | jq -r '.root_id')
   finding_id=$(printf '%s' "$finding" | jq -r '.finding_id')
+  reviewer=$(printf '%s' "$finding" | jq -r '.reviewer')
+  body=$(printf '%s' "$finding" | jq -r '.body // ""')
   floor=$(printf '%s' "$finding" | jq -r '.updated_at // .created_at')
+  confirmed_login=""
+  if [ "$reviewer" = "$CODERABBIT_BOT" ]; then
+    confirmed_login=$(coderabbit_confirmation_login "$body" || true)
+    if [ -n "$confirmed_login" ]; then
+      floor=$(printf '%s' "$finding" | jq -r '.created_at')
+    fi
+  fi
   accounted=false
   evidence=""
-  if agent_reply_after_finding "$root_id" "$floor" "$finding_id"; then
+  if agent_reply_after_finding "$root_id" "$floor" "$finding_id" "$confirmed_login"; then
     accounted=true
     evidence="thread-reply"
   fi
