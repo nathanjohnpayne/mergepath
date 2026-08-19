@@ -397,7 +397,7 @@ or through a file.  This gate stops the DIRECT form from coming back; it is
 not a proof that no credential can reach a stream.
 
 And the recall claim is bounded by the CORPUS and by the SENTINEL, not by an
-argument.  What the harness demonstrates is that on ~418 constructs --
+argument.  What the harness demonstrates is that on ~419 constructs --
 generated across line spellings, file selection, pipeline consumers and
 legal-but-unusual precision shapes, each measured against ONE letter-leading
 sentinel value -- the scanner and bash agree except for the declared entries.
@@ -2737,13 +2737,23 @@ CORPUS = [
         'cat() { :; }\nlog() { cat <<< "$1"; }\nlog "$GH_TOKEN"\necho ok\n',
     ),
     (
-        # Helper discovery is a FIXED POINT, not three rounds: each round
-        # promotes at most one link, so a four-deep call chain left its
-        # outermost helper undiscovered and the call site read clean.
+        # Helper discovery is a FIXED POINT, not three rounds.  Declared in
+        # REVERSE dependency order -- the emitter last -- each round promotes
+        # exactly one link, so a four-deep chain left its outermost helper
+        # undiscovered and the call site read clean.
         "helper-chain-four-deep",
         MUST_FLAG,
         'a() { b "$1"; }\nb() { c "$1"; }\nc() { d "$1"; }\n'
         'd() { echo "$1"; }\na "$GH_TOKEN"\n',
+    ),
+    (
+        # The same four helpers declared FORWARD, emitter first.  This
+        # spelling was already found, and it is pinned beside the reverse one
+        # so the order-dependence cannot come back on either side.
+        "helper-chain-four-deep-forward",
+        MUST_FLAG,
+        'd() { echo "$1"; }\nc() { d "$1"; }\nb() { c "$1"; }\n'
+        'a() { b "$1"; }\na "$GH_TOKEN"\n',
     ),
     # --- multi-physical-line constructs ----------------------------------
     (
