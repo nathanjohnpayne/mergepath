@@ -38,6 +38,6 @@ This is a snapshot from the 2026-08-04 verification above, not a live-checked in
 
 Skills (11): `cloudflare`, `workers-best-practices`, `wrangler`, `durable-objects`, `agents-sdk`, `sandbox-sdk`, `cloudflare-one`, `cloudflare-one-migrations`, `cloudflare-email-service`, `turnstile-spin`, `web-perf`.
 
-Commands (2): `/build-mcp` (remote MCP server on Workers via `McpAgent`), `/build-agent` (AI agent via the Agents SDK).
+Commands (2): `/cloudflare:build-mcp` (remote MCP server on Workers via `McpAgent`), `/cloudflare:build-agent` (AI agent via the Agents SDK).
 
 See [nathanjohnpayne/mergepath#908](https://github.com/nathanjohnpayne/mergepath/issues/908) for the capability review that produced this note.
