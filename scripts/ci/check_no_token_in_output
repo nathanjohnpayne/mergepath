@@ -85,6 +85,11 @@
 #     variable; it cannot connect that line to the `cat` that prints it.
 #   * `set -x` traces, `env` dumps, core dumps, or anything the shell emits
 #     on its own.
+#   * The second and later bodies of a multi-here-doc command
+#     (`cat <<FIRST <<SECOND`): only the first opener on a line is tracked.
+#     No occurrence exists in this tree; tracked as a follow-up rather than
+#     rebuilt here, because the fix is a pending-queue rewrite of the
+#     here-doc bookkeeping and deserves its own review round.
 #   * A command that prints something the token names but does not
 #     interpolate: `cat "$LOGFILE"`, `grep "$PAT" file`, an editor, a
 #     pager. Only the commands listed under "What counts as output" above
@@ -116,15 +121,23 @@
 #   * `echo` / `printf` at a command position. Command words are matched by
 #     BASENAME, so `/bin/echo` is the same emitter — the rule
 #     scripts/hooks/gh-pr-guard.sh adopted in #611 r10.
+#     A shell reserved word is not the command — the command follows it —
+#     so `if echo "$PAT"; then`, `while printf ...` and `! echo ...` are the
+#     same emitter. `printf -v NAME` is NOT output: bash assigns to a
+#     variable instead of writing to a stream.
 #   * An in-file message helper: a function whose body writes one of its
-#     own positional parameters verbatim through echo/printf.
+#     own positional parameters verbatim through echo/printf. Both
+#     definition forms count — `name () { ...; }` and `function name
+#     { ...; }`.
 #   * The body of an INTERPOLATING here-doc (unquoted delimiter) opened by
 #     `cat`, `tee` or an emitter — the shell expands those lines at write
 #     time, and `tee` puts them on stdout as well as in the file.
 #   * The word of a here-STRING given to one of those same commands:
-#     `cat <<< "$GH_TOKEN"` reaches a stream exactly as `echo` does. A
-#     here-string handed to anything else (`grep -q x <<< "$V"`) is not
-#     output and is not flagged.
+#     `cat <<< "$GH_TOKEN"` reaches a stream exactly as `echo` does. The
+#     command is the one heading the here-string's OWN segment, so
+#     `true; cat <<< "$PAT"` counts. A here-string handed to anything else
+#     (`grep -q x <<< "$V"`) is not output and is not flagged, and a
+#     captured one (`v=$(cat <<< "$PAT")`) stores rather than emits.
 #
 # A value captured by a command substitution is NOT output: in
 # `_v=$(printf '%s' "$GH_TOKEN")` the value goes into a variable, not onto
@@ -183,6 +196,9 @@ CLOUDFLARE_API_TOKEN
 FIREBASE_TOKEN
 ANTHROPIC_AUTH_TOKEN
 CLAUDE_CODE_OAUTH_TOKEN
+OPENAI_API_KEY
+CODEX_API_KEY
+ANTHROPIC_API_KEY
 "
 
 # Base output commands. In-file message helpers are discovered per file.
@@ -204,6 +220,12 @@ BEGIN {
   # Words that keep the NEXT word in command position.
   n = split("env command builtin exec sudo time nohup stdbuf", p, " ")
   for (i = 1; i <= n; i++) PASSTHRU[p[i]] = 1
+  # Shell RESERVED WORDS are not the command — the command follows them.
+  # `if echo "$GH_TOKEN"; then` runs the same emitter as `echo "$GH_TOKEN"`,
+  # so a reserved word must neither consume the command position nor be
+  # mistaken for the command itself.
+  n = split("if then elif else while until do done ! case esac in select coproc function", p, " ")
+  for (i = 1; i <= n; i++) RESERVED[p[i]] = 1
   SQ = sprintf("%c", 39)
   found = 0
 }
@@ -318,10 +340,14 @@ function ends_continuation(s,   i, n, c, q, esc, prev) {
 function discover_helpers(   i, fn, name, trimmed) {
   fn = ""
   for (i = 1; i <= NLINES; i++) {
-    if (LINES[i] ~ /^[[:space:]]*(function[[:space:]]+)?[A-Za-z_][A-Za-z0-9_:.-]*[[:space:]]*\(\)/) {
+    # Both definition forms bash documents: `name () { ...; }` and the
+    # parenthesis-free `function name { ...; }` (bash `help function`).
+    if (LINES[i] ~ /^[[:space:]]*(function[[:space:]]+)?[A-Za-z_][A-Za-z0-9_:.-]*[[:space:]]*\(\)/ ||
+        LINES[i] ~ /^[[:space:]]*function[[:space:]]+[A-Za-z_][A-Za-z0-9_:.-]*[[:space:]]*(\{|$)/) {
       name = LINES[i]
       sub(/^[[:space:]]*(function[[:space:]]+)?/, "", name)
-      sub(/[[:space:]]*\(\).*$/, "", name)
+      sub(/[[:space:]]*(\(\)|\{).*$/, "", name)
+      sub(/[[:space:]]+$/, "", name)
       if (writes_own_args(LINES[i])) EMITFN[name] = 1
       # A one-line definition (`fail() { echo "FAIL: $*" >&2; }` — the
       # dominant shape in this tree) closes on its own line, so the body
@@ -383,16 +409,12 @@ function scan_lines(   i, line, hit, trimmed, href) {
       # the ordinary line scan too, quoted delimiter or not.
       else if (!exempt(line) && !comment(line) && (hit = walk(line)) != "")
         report(i, hit, line, "output command")
-      else if (!exempt(line) && !comment(line) && (hit = herestring_hit(line)) != "")
-        report(i, hit, line, "here-string")
       note_heredoc(line)
       continue
     }
 
     if (!comment(line) && !exempt(line) && (hit = walk(line)) != "")
       report(i, hit, line, "output command")
-    else if (!comment(line) && !exempt(line) && (hit = herestring_hit(line)) != "")
-      report(i, hit, line, "here-string")
     note_heredoc(line)
   }
 }
@@ -427,7 +449,7 @@ function note_heredoc(line,   w) {
 # note_heredoc so both agree on exactly where a body begins and ends.
 function heredoc_open(line,   rest, ch, term, p) {
   HD_NEW_TERM = ""; HD_NEW_QUOTED = 0
-  if (line !~ /<<-?[[:space:]]*[\\"A-Za-z_]/) return 0
+  if (line !~ "<<-?[[:space:]]*[" SQ "\\\\\"A-Za-z_]") return 0
   # A here-STRING is not a here-doc. Skipping the whole line when one is
   # present is conservative in the safe direction: it can only make the
   # check miss a body, never invent one.
@@ -461,7 +483,7 @@ function first_command_word(line,   s, w) {
       sub(/^[^[:space:]]+[[:space:]]*/, "", s)
       continue
     }
-    if (w !~ /^\/?[A-Za-z_][A-Za-z0-9_.\/-]*$/) return ""
+    if (w !~ /^[.\/]*[A-Za-z_][A-Za-z0-9_.\/-]*$/) return ""
     return basename(w)
   }
   return ""
@@ -496,20 +518,12 @@ function heredoc_ref(line,   i, c, n2, esc, j) {
 # A CAPTURED here-string (`v=$(cat <<< "$PAT")`) has no command word at the
 # top level, so first_command_word returns "" and it stays legal — the same
 # capture-versus-emit rule the walk applies.
-function herestring_hit(line,   p, cmd) {
-  p = index(line, "<<<")
-  if (p == 0) return ""
-  cmd = first_command_word(line)
-  if (cmd != "cat" && cmd != "tee" && !is_emitter(cmd)) return ""
-  return walk("echo " substr(line, p + 3))
-}
-
 # ── The line walk ────────────────────────────────────────────────────────
 # Tracks quote state, command-substitution depth, and whether the current
 # segment at each depth is an output command.
 function walk(line,   i, c, n2, depth, esc, w, hit, nxt, j) {
   n2 = length(line); depth = 0; esc = 0; w = ""; hit = ""
-  q[0] = ""; emit[0] = 0; cmdpos[0] = 1; bt[0] = 0
+  q[0] = ""; emit[0] = 0; cmdpos[0] = 1; bt[0] = 0; pendv[0] = 0; cmdname[0] = ""
   for (i = 1; i <= n2; i++) {
     c = substr(line, i, 1)
 
@@ -546,18 +560,28 @@ function walk(line,   i, c, n2, depth, esc, w, hit, nxt, j) {
       push(++depth, 1); continue
     }
     if (c == ")") { flush_word(w, depth); w = ""; if (depth > 0) depth--; continue }
-    if (c == ";" || c == "|" || c == "&") { flush_word(w, depth); w = ""; cmdpos[depth] = 1; emit[depth] = 0; continue }
-    if (c == "(" || c == "{") { flush_word(w, depth); w = ""; cmdpos[depth] = 1; emit[depth] = 0; continue }
+    if (c == ";" || c == "|" || c == "&") { flush_word(w, depth); w = ""; cmdpos[depth] = 1; emit[depth] = 0; pendv[depth] = 0; cmdname[depth] = ""; continue }
+    if (c == "(" || c == "{") { flush_word(w, depth); w = ""; cmdpos[depth] = 1; emit[depth] = 0; pendv[depth] = 0; cmdname[depth] = ""; continue }
     if (c == "}") { flush_word(w, depth); w = ""; continue }
     if (c == "#" && w == "") break
     if (c == " " || c == "\t") { flush_word(w, depth); w = ""; continue }
+    # A here-STRING feeds its word to the segment command exactly as an
+    # argument would, so `cat <<< "$PAT"` reaches a stream. Handled inside
+    # the walk rather than by re-reading the tail of the line, so the
+    # enclosing quote state still applies: a here-string written inside a
+    # single-quoted fixture string is text, not a command.
+    if (c == "<" && substr(line, i, 3) == "<<<") {
+      flush_word(w, depth); w = ""
+      if (cmdname[depth] == "cat" || cmdname[depth] == "tee") emit[depth] = 1
+      i += 2; continue
+    }
     if (c == "<" || c == ">") { flush_word(w, depth); w = ""; continue }
     w = w c
   }
   return hit
 }
 
-function push(d, backtick) { q[d] = ""; emit[d] = 0; cmdpos[d] = 1; bt[d] = backtick }
+function push(d, backtick) { q[d] = ""; emit[d] = 0; cmdpos[d] = 1; bt[d] = backtick; pendv[d] = 0; cmdname[d] = "" }
 
 # A reference at depth d reaches an uncaptured stream only when the segment
 # at every enclosing level is an output command. `_v=$(printf "$T")` stores
@@ -567,12 +591,22 @@ function emitted(d,   k) {
   return 1
 }
 
-function flush_word(w, depth) {
+function flush_word(w, depth,   b) {
   if (w == "") return
-  if (!cmdpos[depth]) return
+  if (!cmdpos[depth]) {
+    # `printf -v NAME ...` ASSIGNS to a shell variable instead of writing to
+    # a stream (bash `help printf`), so the emitter classification made one
+    # word ago is withdrawn. Only the first argument is inspected, which is
+    # the only place the option is valid.
+    if (pendv[depth]) { if (w == "-v") emit[depth] = 0; pendv[depth] = 0 }
+    return
+  }
   if (w ~ /^[A-Za-z_][A-Za-z0-9_]*=/) return   # assignment prefix
   if (w in PASSTHRU) return
-  if (is_emitter(basename(w))) emit[depth] = 1
+  if (w in RESERVED) return                    # the command follows it
+  b = basename(w)
+  cmdname[depth] = b
+  if (is_emitter(b)) { emit[depth] = 1; pendv[depth] = (b == "printf") ? 1 : 0 }
   cmdpos[depth] = 0
 }
 
@@ -617,10 +651,27 @@ AWK_PROGRAM
 # ─────────────────────────────────────────────────────────────────────────
 # File selection and scan driver.
 # ─────────────────────────────────────────────────────────────────────────
+# Emits a NUL-separated list of shell files. Returns 3 when file discovery
+# itself fails: a `find` or `sort` that errors used to reach the caller as an
+# EMPTY tree, and an empty tree reads as a clean scan — the classic vacuous
+# gate. The pipeline status is read explicitly because a process
+# substitution discards it.
 collect_shell_files() {
-  local root="$1" dir first interp
+  local root="$1" dir first interp raw
+  local -a st
+  raw="$(mktemp "${TMPDIR:-/tmp}/token-output-files.XXXXXX")"
+  # shellcheck disable=SC2064  # expand $raw now, not when the trap fires
+  trap "rm -f '$raw'" RETURN
   for dir in scripts tests; do
     [ -d "$root/$dir" ] || continue
+    find "$root/$dir" -type f -print0 2>/dev/null | LC_ALL=C sort -z >"$raw"
+    # One assignment: any command in between, including another
+    # `${PIPESTATUS[...]}` read, replaces the array.
+    st=("${PIPESTATUS[@]}")
+    if [ "${st[0]}" -ne 0 ] || [ "${st[1]}" -ne 0 ]; then
+      echo "check_no_token_in_output: file discovery failed under $root/$dir (find=${st[0]} sort=${st[1]})" >&2
+      return 3
+    fi
     while IFS= read -r -d '' file; do
       case "$file" in
         */node_modules/*|*/.git/*) continue ;;
@@ -646,17 +697,27 @@ collect_shell_files() {
       case "$interp" in
         bash|*/bash|sh|*/sh|dash|*/dash|ksh|*/ksh|zsh|*/zsh) printf '%s\0' "$file" ;;
       esac
-    done < <(find "$root/$dir" -type f -print0 2>/dev/null | LC_ALL=C sort -z)
+    done <"$raw"
   done
 }
 
 # Scan one repo root. Echoes findings; returns 1 when any were found.
 scan_root() {
   local root="$1"
-  local files=()
+  local files=() list drc=0
+  list="$(mktemp "${TMPDIR:-/tmp}/token-output-list.XXXXXX")"
+  # shellcheck disable=SC2064  # expand $list now, not when the trap fires
+  trap "rm -f '$list'" RETURN
+  # Not a process substitution: its exit status is unobservable, so a failed
+  # discovery would arrive as an empty file list and pass.
+  collect_shell_files "$root" >"$list" || drc=$?
+  if [ "$drc" -ne 0 ]; then
+    echo "check_no_token_in_output: cannot enumerate shell files under $root" >&2
+    return "$drc"
+  fi
   while IFS= read -r -d '' file; do
     files+=("$file")
-  done < <(collect_shell_files "$root")
+  done <"$list"
 
   if [ "${#files[@]}" -eq 0 ]; then
     echo "  (no shell files under scripts/ or tests/)"
@@ -669,12 +730,22 @@ scan_root() {
   #
   # TOKEN_NAMES is flattened to one line first: a literal newline inside an
   # awk `-v` assignment is a fatal "newline in string" on BSD awk.
-  local out rc=0 tokens
+  local out rc=0 tokens line
   tokens="$(printf '%s' "$TOKEN_NAMES" | tr '\n' ' ')"
   out="$(mktemp "${TMPDIR:-/tmp}/token-output-scan.XXXXXX")"
+  # shellcheck disable=SC2064  # expand $out now, not when the trap fires
+  trap "rm -f '$out'" RETURN
   awk -v TOKENS="$tokens" -v EMITTERS="$EMITTER_COMMANDS" \
       "$SCANNER" "${files[@]}" >"$out" || rc=$?
-  sed "s|^$root/||" "$out"
+  # Strip the scan root with a QUOTED parameter expansion, not a sed
+  # expression: `root` is an operator-supplied `--scan` argument, so
+  # interpolating it into `s|^$root/||` lets a `|` break the delimiter and a
+  # `.` or `[` over-match the prefix. Quoting inside `${line#...}` makes the
+  # prefix literal, and dropping sed also removes the `set -e` exit that
+  # would otherwise skip the cleanup below.
+  while IFS= read -r line; do
+    printf '%s\n' "${line#"$root"/}"
+  done < "$out"
   rm -f "$out"
   return "$rc"
 }
@@ -753,6 +824,27 @@ assert_reported_at() {
   fi
 }
 
+# `find | sort` failing must fail the CHECK, not empty the tree: an empty
+# file list is indistinguishable from a clean scan, which is how a required
+# gate goes vacuous without anyone noticing.
+assert_discovery_failure_is_fatal() {
+  local tmp shim rc=0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/token-output-fixture.XXXXXX")"
+  shim="$(mktemp -d "${TMPDIR:-/tmp}/token-output-shim.XXXXXX")"
+  mkdir -p "$tmp/scripts"
+  printf 'echo "$GH_TOKEN"\n' > "$tmp/scripts/fixture.sh"
+  printf '#!/bin/sh\nexit 2\n' > "$shim/sort"
+  chmod +x "$shim/sort"
+  PATH="$shim:$PATH" scan_root "$tmp" >/dev/null 2>&1 || rc=$?
+  rm -rf "$tmp" "$shim"
+  if [ "$rc" -gt 1 ]; then
+    ST_PASS=$((ST_PASS + 1)); echo "  PASS: fail-closed — a failed file discovery is a scanner error, not a clean tree"
+  else
+    ST_FAIL=$((ST_FAIL + 1))
+    echo "  FAIL: expected a scanner error (rc > 1), got rc=$rc — failed file discovery" >&2
+  fi
+}
+
 self_test() {
   echo "check_no_token_in_output: self-test"
   # Two indirections, for the fixtures whose text has to be LIVE on disk
@@ -761,7 +853,7 @@ self_test() {
   # from being one; `$HD` keeps a here-doc opener out of command position,
   # which would otherwise open a scanning here-doc in THIS file and make
   # every clean fixture below it read as a here-doc body.
-  local DS='$' HD='cat'
+  local DS='$' HD='cat' SQ="'"
 
   # This file is itself under scripts/, so the tree scan reads these
   # fixtures as source. A SINGLE-LINE fixture is safe as written: the
@@ -849,6 +941,28 @@ EOF"
     "/bin/cat <<EOF
 authorization: \$GH_TOKEN
 EOF"
+  # A shell RESERVED WORD is not the command — the command follows it, so
+  # conditional and negated logging is the same direct emission.
+  assert_flagged "an emitter under a reserved word is still the emitter" \
+    'if echo "$GH_TOKEN"; then :; fi'
+  assert_flagged "a negated emitter is still the emitter" \
+    "! printf %s \"\$OP_PREFLIGHT_AUTHOR_PAT\""
+  # bash documents two definition forms; the helper discovery must read both.
+  assert_flagged "a parenthesis-free function definition is still a helper" \
+    "function die { echo \"fatal: \$1\" >&2; }
+die \"\$GH_TOKEN\""
+  # The here-string belongs to the command heading ITS segment, not to the
+  # first command on the line.
+  assert_flagged "a here-string in a later command segment" \
+    'true; cat <<< "$GITHUB_TOKEN"'
+  # The closed list carries the fleet API keys too, not only the git forge
+  # tokens: the phase-4b enablement evidence treats these as credentials.
+  assert_flagged "an API-key name on the closed list" \
+    'echo "$OPENAI_API_KEY"'
+  assert_flagged "a relative path-qualified here-doc opener is the same opener" \
+    "./cat <<EOF
+authorization: \$GH_TOKEN
+EOF"
   assert_flagged "tee writes an interpolating here-doc body to stdout" \
     "tee /dev/null <<EOF
 authorization: \$GH_TOKEN
@@ -891,12 +1005,35 @@ echo \"- token: \$(key_state \"\${ANTHROPIC_AUTH_TOKEN:-}\")\""
 \$GH_TOKEN
 EOF
 )"
+  # `printf -v NAME` assigns to a shell variable instead of writing to a
+  # stream (bash `help printf`), so flagging it would be a false positive on
+  # a required fleet-wide check.
+  # The segment command must be re-read at every boundary: an indirect
+  # command word sets no name, so a `cat` earlier on the line must not lend
+  # its classification to a later segment's here-string.
+  assert_clean "a here-string on an indirect command word is not the earlier cat" \
+    'cat /etc/hosts; "$cmd" <<< "$GH_TOKEN"'
+  assert_clean "printf -v assigns, it does not emit" \
+    "printf -v encoded %q \"\$GH_TOKEN\""
+  # ...and a reserved word must not invent an emitter where there is none.
+  assert_clean "a reserved word alone is not an output command" \
+    'if [ -n "${GH_TOKEN:-}" ]; then :; fi'
   assert_clean "a captured here-string stores the value, it does not emit it" \
     '_v=$(cat <<< "$GH_TOKEN")'
   assert_clean "a here-string consumed by a non-output command is out of scope" \
     'grep -Fq needle <<< "$GH_TOKEN"'
   assert_clean "a here-string carrying only a length" \
     'cat <<< "len=${#GH_TOKEN}"'
+  # A SINGLE-quoted delimiter opens a here-doc just as a double-quoted one
+  # does. If the parser does not recognise it, the body is read as ordinary
+  # source and the `<<INNER` line inside it opens a here-doc that never
+  # existed — which makes the line after the terminator read as an
+  # interpolating body and reports a finding that is not there.
+  assert_clean "a single-quoted here-doc body does not open a here-doc of its own" \
+    "${HD} <<${SQ}EOF${SQ}
+${HD} <<INNER
+EOF
+authorization: ${DS}GH_TOKEN"
   assert_clean "quoted here-doc body that is not shell output" \
     "cat <<\"EOF\"
 Set GH_TOKEN=\$OP_PREFLIGHT_REVIEWER_PAT before running.
@@ -931,6 +1068,11 @@ printf 'export TOKEN=%q\\n' \\
   # all match a TOKEN/PAT/SECRET heuristic and none holds a credential.
   assert_clean "ack-marker and flag names are not credential names" \
     'echo "$SUMMARY_ACK_TOKEN $ACK_TOKEN $MERGEPATH_EXPECT_READ_GH_TOKEN $REQUIRED_HEAD_CHECK_NAME $CACHE_KEY"'
+
+  # An empty file list reads exactly like a clean tree, so a discovery
+  # failure must not be silent. Codex measured this on #1012 by shadowing
+  # `sort`; the case pins the fix.
+  assert_discovery_failure_is_fatal
 
   if [ "$ST_FAIL" -ne 0 ]; then
     echo "check_no_token_in_output: FAIL (self-test: $ST_PASS passed, $ST_FAIL failed)" >&2
