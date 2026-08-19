@@ -96,7 +96,9 @@ jobs:
           echo "id=$artifact_id" >> "$GITHUB_OUTPUT"
 
       - name: Fail permanently when a read-only handoff is missing
-        if: steps.source.outputs.requires_relay == 'true' && steps.artifact.outputs.found != 'true'
+        if: >-
+          ${{ always() && steps.source.outputs.requires_relay == 'true' &&
+          steps.artifact.outputs.found != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}

@@ -164,6 +164,11 @@ if archive.is_a?(Hash)
       archive_env.values.none? { |value| value.to_s.include?("toJSON(github.event)") },
     "archive-edited-feedback passes the webhook through an environment value instead of GITHUB_EVENT_PATH"
   )
+  require_shape.call(
+    archive_run&.include?("jq -j '.changes.body.from // \"\"' \"$GITHUB_EVENT_PATH\"") &&
+      archive_run&.include?("jq -j '.comment.body // \"\"' \"$GITHUB_EVENT_PATH\""),
+    "archive-edited-feedback does not preserve webhook body bytes exactly"
+  )
   upload_step = Array(archive["steps"]).find do |step|
     step["uses"].to_s.start_with?("actions/upload-artifact@")
   end
@@ -390,13 +395,21 @@ if relay_job.is_a?(Hash)
       download_step.dig("with", "path").to_s.include?("runner.temp"),
     "read-only archive relay does not download the source-run artifact into runner.temp"
   )
-  missing_run = relay_steps.map { |step| step["run"] }.compact.find do |run|
+  artifact_index = relay_steps.index { |step| step["id"].to_s == "artifact" }
+  missing_step = relay_steps.find do |step|
+    run = step["run"].to_s
     run.include?("status=failed") && run.include?("read-only archive handoff missing")
   end
+  missing_index = relay_steps.index(missing_step)
+  missing_run = missing_step&.fetch("run", nil)
+  missing_condition = missing_step&.fetch("if", "").to_s
   require_shape.call(
     missing_run&.include?("mergepath-feedback-archive-relay:v1") &&
       missing_run&.include?("repos/$REPO/check-runs") &&
-      missing_run&.include?("conclusion=failure"),
+      missing_run&.include?("conclusion=failure") &&
+      missing_condition.include?("always()") &&
+      missing_condition.include?("steps.artifact.outputs.found != 'true'") &&
+      artifact_index && missing_index && artifact_index < missing_index,
     "read-only archive relay does not persist and publish a missing-handoff failure"
   )
   relay_run = relay_steps.map { |step| step["run"] }.compact.find do |run|

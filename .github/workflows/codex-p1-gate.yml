@@ -174,9 +174,9 @@ jobs:
 
           if [ -n "$source_kind" ]; then
             if [ "$EVENT_ACTION" = edited ]; then
-              jq -r '.changes.body.from // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
+              jq -j '.changes.body.from // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
             else
-              jq -r '.comment.body // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
+              jq -j '.comment.body // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
             fi
             # The renderer emits one v1 record or a complete set of chunked v2
             # records when the full prior body cannot fit in one comment.

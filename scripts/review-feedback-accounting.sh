@@ -482,7 +482,10 @@ while IFS= read -r archive_comment; do
   payload=$(archive_payload "$archive_body" || true)
   [ -n "$payload" ] || continue
   archive_comment_id=$(printf '%s' "$archive_comment" | jq -r '.id')
-  archived_at=$(printf '%s' "$archive_comment" | jq -r '.created_at // .updated_at // ""')
+  # A repaired archive comment is a byte-for-byte restoration of the same
+  # history record. Keep its evidence floor tied to the immutable payload,
+  # rather than advancing it to the replacement GitHub comment's created_at.
+  archived_at=$(printf '%s' "$payload" | jq -r '.archived_at')
   archive_entry=$(printf '%s' "$payload" | jq -c \
     --argjson archive_comment_id "$archive_comment_id" --arg archived_at "$archived_at" '
       {archive_comment_id:$archive_comment_id,archived_at:$archived_at,payload:.}
@@ -526,11 +529,13 @@ V2_ARCHIVE_ENTRIES=$(printf '%s' "$ISSUE_COMMENTS" | jq -c '
           or ($parts | map(.part) | sort) != [range(1; $total + 1)]
           or any($parts[]; (.data | length) < 1 or (.data | length) > 60000)
         then error("incomplete or invalid v2 archive")
-        else {
-          archive_comment_id: ($parts | map(.archive_comment_id) | max),
-          archived_at: ($parts | sort_by(.archived_at, .archive_comment_id) | last.archived_at),
-          payload: ($parts | sort_by(.part) | map(.data) | join("") | @base64d | fromjson)
-        }
+        else
+          ($parts | sort_by(.part) | map(.data) | join("") | @base64d | fromjson) as $payload
+          | {
+              archive_comment_id: ($parts | map(.archive_comment_id) | max),
+              archived_at: $payload.archived_at,
+              payload: $payload
+            }
         end
     )
 ') || die 2 "could not reconstruct chunked feedback archives"
@@ -728,22 +733,46 @@ while IFS= read -r review; do
   review_id=$(printf '%s' "$review" | jq -r '.id')
   submitted_at=$(printf '%s' "$review" | jq -r '.submitted_at // ""')
   body_fingerprint=$(fingerprint "$body_json")
+  # Review submitted_at is immutable across edits. If the current body returns
+  # to a finding version that was archived earlier, that archive proves a later
+  # raise than submission and invalidates acknowledgements from before the
+  # edit. Matching the source identity as well as id/fingerprint prevents an
+  # unrelated archive from advancing this finding's floor.
+  raised_at=$(printf '%s' "$ARCHIVE_ENTRIES" | jq -r \
+    --argjson id "$review_id" --arg login "$login" \
+    --arg fingerprint "$body_fingerprint" --arg submitted "$submitted_at" '
+      [
+        $submitted,
+        (
+          .[]
+          | select((.payload.source_kind // "issue-comment") == "review-body")
+          | select(.payload.source_comment_id == $id)
+          | select(.payload.source_login == $login)
+          | select(.payload.body_fingerprint == $fingerprint)
+          | .payload.archived_at
+        )
+      ]
+      | map(select(type == "string" and length > 0))
+      | max // $submitted
+    ')
   ack_token="[mergepath-review-ack: $review_id $body_fingerprint]"
   accounted=false
   evidence=""
-  if ack_present "$ack_token" "$submitted_at"; then
+  if ack_present "$ack_token" "$raised_at"; then
     accounted=true
     evidence="review-ack"
   fi
   finding=$(printf '%s' "$review" | jq -c \
     --arg tier "$tier" --arg fingerprint "$body_fingerprint" \
-    --arg token "$ack_token" --argjson accounted "$accounted" --arg evidence "$evidence" '
+    --arg raised_at "$raised_at" --arg token "$ack_token" \
+    --argjson accounted "$accounted" --arg evidence "$evidence" '
       {
         kind: "review-body",
         review_id: .id,
         reviewer: (.user.login // ""),
         tier: $tier,
         created_at: (.submitted_at // ""),
+        updated_at: $raised_at,
         commit_id: (.commit_id // null),
         body_fingerprint: $fingerprint,
         ack_token: $token,

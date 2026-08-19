@@ -816,6 +816,49 @@ mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 0 "$RUN_RC" "post-edit acknowledgement reconciles archived review-body feedback"
 
+# A top-level review keeps its immutable submitted_at across body edits. When
+# the body later returns to an archived finding version, the matching archive's
+# edit timestamp must become the live finding's evidence floor; otherwise the
+# original acknowledgement token is accepted again after the re-raise.
+reset_fixtures
+jq -n --rawfile body "$PREVIOUS_REVIEW" '[{
+  "id": 900,
+  "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "submitted_at": "2026-08-18T22:00:00Z",
+  "state": "COMMENTED",
+  "user": {"login": "chatgpt-codex-connector[bot]"},
+  "body": $body
+}]' >"$TMP/fixtures/reviews.json"
+jq -n --arg archive "$REVIEW_ARCHIVE" --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" '[
+  {
+    "id": 905,
+    "created_at": "2026-08-18T22:11:00Z",
+    "updated_at": "2026-08-18T22:11:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": ($token + "\nDisposition posted before the review-body finding was removed.")
+  },
+  {
+    "id": 906,
+    "created_at": "2026-08-18T22:12:01Z",
+    "updated_at": "2026-08-18T22:12:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }
+]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "review-body reversion rejects acknowledgement from before the archived edit"
+assert_eq "$EXPECTED_REVIEW_ARCHIVE_ACK" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')" "reverted review body keeps its content-pinned acknowledgement channel"
+jq --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" '. + [{
+  "id": 907,
+  "created_at": "2026-08-18T22:13:00Z",
+  "updated_at": "2026-08-18T22:13:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nDispositioned the review-body finding after its latest archived edit.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-edit acknowledgement reconciles a reverted review-body finding"
+
 reset_fixtures
 cat >"$TMP/fixtures/issues.json" <<'JSON'
 [
@@ -927,6 +970,23 @@ jq --arg token "$ARCHIVE_ACK" '. + [{
 mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 0 "$RUN_RC" "post-rewrite acknowledgement reconciles the archived summary finding"
+
+# Reposting the exact archive marker repairs storage, not the finding itself.
+# The payload's original archived_at remains the evidence floor, so a durable
+# acknowledgement does not become stale merely because the archive comment was
+# restored under a new GitHub comment id and created_at.
+jq --arg archive "$ARCHIVE_MARKER" '
+  map(select(.id != 8002)) + [{
+    "id": 8005,
+    "created_at": "2026-08-18T22:30:00Z",
+    "updated_at": "2026-08-18T22:30:00Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }]
+' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "restored archive retains its original evidence floor"
 
 cat >"$PREVIOUS_SUMMARY" <<'EOF'
 <!-- This is an auto-generated comment: summarize by coderabbit.ai -->
