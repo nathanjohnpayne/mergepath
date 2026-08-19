@@ -15,6 +15,7 @@ Agent instructions are organized into focused sub-files under `docs/agents/`. Re
 9. **[Decision Records](docs/agents/decision-records.md)** --- Recording the path taken when a PR reverses direction, and surfacing a comment-recorded decision from the issue body (synced canonical convention)
 10. **[Prose Line-Wrapping](docs/agents/prose-line-wrapping.md)** --- Soft-wrap Markdown prose, one physical line per paragraph (synced canonical convention); this repo's in-scope path allowlist and gate live in Documentation Rules above
 11. **[Code Review Requirements](docs/agents/code-review-requirements.md)** --- Thin pointer: all review behavior is governed by REVIEW_POLICY.md and `.github/review-policy.yml` (synced canonical pointer)
+12. **[Cloudflare MCP Servers](docs/agents/cloudflare-mcp-servers.md)** --- Capability note: the five remote MCP servers the `cloudflare` plugin ships, their auth model, and the write-capability hazard
 
 Item 2 is the stable entrypoint for shared rules: it is one canonical file mirrored to every repo, so a new fleet-wide rule lands by editing it at the canonical source, not by editing every repo's index again.
 
