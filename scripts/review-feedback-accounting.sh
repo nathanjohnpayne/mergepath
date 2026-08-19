@@ -88,6 +88,54 @@ fi
 
 trap 'if [ -n "$RESOLVED_CONFIG" ]; then rm -f "$RESOLVED_CONFIG"; fi' EXIT
 
+validate_governing_policy() {
+  local parsed=""
+  [ -r "$CONFIG" ] || die 2 "governing review policy is unreadable: $CONFIG"
+  if command -v yq >/dev/null 2>&1; then
+    parsed=$(yq eval -o=json '.' "$CONFIG" 2>/dev/null) \
+      || die 2 "governing review policy did not parse as YAML: $CONFIG"
+  elif command -v python3 >/dev/null 2>&1 \
+       && python3 -c 'import yaml' >/dev/null 2>&1; then
+    parsed=$(python3 -c '
+import json, sys, yaml
+with open(sys.argv[1], encoding="utf-8") as source:
+    print(json.dumps(yaml.safe_load(source)))
+' "$CONFIG" 2>/dev/null) \
+      || die 2 "governing review policy did not parse as YAML: $CONFIG"
+  elif command -v ruby >/dev/null 2>&1; then
+    parsed=$(ruby -ryaml -rjson -e '
+value = YAML.safe_load(File.read(ARGV[0]), permitted_classes: [], permitted_symbols: [], aliases: false)
+puts JSON.generate(value)
+' "$CONFIG" 2>/dev/null) \
+      || die 2 "governing review policy did not parse as YAML: $CONFIG"
+  else
+    die 2 "no YAML parser is available to validate governing review policy: $CONFIG"
+  fi
+  printf '%s' "$parsed" | jq -e '
+    def optional_string($key):
+      (has($key) | not) or (.[$key] | type == "string");
+    def optional_object($key):
+      (has($key) | not) or (.[$key] | type == "object");
+    type == "object"
+    and optional_string("author_identity")
+    and ((has("available_reviewers") | not)
+      or ((.available_reviewers | type == "array")
+        and all(.available_reviewers[]; type == "string" and length > 0)))
+    and optional_object("codex")
+    and optional_object("coderabbit")
+    and ((.codex // {}) | optional_string("bot_login"))
+    and ((.coderabbit // {}) | optional_string("bot_login"))
+    and optional_object("feedback_policy")
+    and ((.feedback_policy // {}) | optional_string("mode"))
+    and (((.feedback_policy // {}) | has("priorities") | not)
+      or (((.feedback_policy // {}).priorities | type == "object")
+        and all((.feedback_policy // {}).priorities[]; type == "string")))
+  ' >/dev/null 2>&1 \
+    || die 2 "governing review policy has an invalid accounting schema: $CONFIG"
+}
+
+validate_governing_policy
+
 policy_top_field() {
   local field="$1"
   [ -r "$CONFIG" ] || return 0

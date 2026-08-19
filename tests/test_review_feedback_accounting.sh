@@ -179,6 +179,20 @@ reset_fixtures
 run_gate preflight
 assert_eq 0 "$RUN_RC" "reviewer PAT from preflight is accepted without ambient GH_TOKEN"
 
+cp "$TMP/review-policy.yml" "$TMP/review-policy.valid.yml"
+printf 'available_reviewers: [unterminated\n' >"$TMP/review-policy.yml"
+reset_fixtures
+run_gate
+assert_eq 2 "$RUN_RC" "malformed governing review policy is an infrastructure error"
+assert_match 'governing review policy.*(parse|valid)' "$RUN_ERR" "malformed policy failure names the policy contract"
+mv "$TMP/review-policy.valid.yml" "$TMP/review-policy.yml"
+mv "$TMP/review-policy.yml" "$TMP/review-policy.unreadable.yml"
+reset_fixtures
+run_gate
+assert_eq 2 "$RUN_RC" "unreadable governing review policy is an infrastructure error"
+assert_match 'governing review policy is unreadable' "$RUN_ERR" "unreadable policy failure names the missing surface"
+mv "$TMP/review-policy.unreadable.yml" "$TMP/review-policy.yml"
+
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [
