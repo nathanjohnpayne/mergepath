@@ -28,5 +28,10 @@ if [ ! -f "$TEST_SCRIPT" ]; then
   exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "check_audit_review_latency: ERROR (jq is required — the wrapped suite would self-skip with exit 0 and report a green check over zero assertions)" >&2
+  exit 1
+fi
+
 bash "$TEST_SCRIPT"
 echo "check_audit_review_latency: PASS"
