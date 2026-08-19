@@ -111,6 +111,8 @@ CODEX_BOT=$(policy_block_field codex bot_login)
 CODEX_BOT=${CODEX_BOT:-chatgpt-codex-connector[bot]}
 CODERABBIT_BOT=$(policy_block_field coderabbit bot_login)
 CODERABBIT_BOT=${CODERABBIT_BOT:-coderabbitai[bot]}
+CODEX_SOLICITATION='Useful? React with 👍 / 👎.'
+NBSP=$(printf '\302\240')
 
 AGENT_LOGINS_JSON=$(
   {
@@ -196,7 +198,12 @@ agent_reply_after_finding() {
 }
 
 agent_reaction_on_finding() {
-  local finding_id="$1" floor="$2" reactions rc=0
+  local finding_id="$1" floor="$2" finding_body="$3" reactions rc=0
+  finding_body=${finding_body//$NBSP/ }
+  case "$finding_body" in
+    *"$CODEX_SOLICITATION"*) ;;
+    *) return 1 ;;
+  esac
   reactions=$(fetch_api_array \
     "repos/$REPO/pulls/comments/$finding_id/reactions" \
     "reactions for inline finding $finding_id") || rc=$?
@@ -216,6 +223,7 @@ while IFS= read -r finding; do
   finding_id=$(printf '%s' "$finding" | jq -r '.finding_id')
   floor=$(printf '%s' "$finding" | jq -r '.updated_at // .created_at')
   reviewer=$(printf '%s' "$finding" | jq -r '.reviewer')
+  finding_body=$(printf '%s' "$finding" | jq -r '.body // ""')
   accounted=false
   evidence=""
   if agent_reply_after_finding "$root_id" "$floor"; then
@@ -223,7 +231,7 @@ while IFS= read -r finding; do
     evidence="thread-reply"
   elif [ "$reviewer" = "$CODEX_BOT" ]; then
     reaction_rc=0
-    agent_reaction_on_finding "$finding_id" "$floor" || reaction_rc=$?
+    agent_reaction_on_finding "$finding_id" "$floor" "$finding_body" || reaction_rc=$?
     case "$reaction_rc" in
       0)
         accounted=true

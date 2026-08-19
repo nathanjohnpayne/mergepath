@@ -1544,13 +1544,23 @@ printf '%s\n' '{"status":"unaccounted","posted":3,"accounted":2}'
 exit 1
 EOF
 chmod +x "$FEEDBACK_BLOCK_STUB"
+ADAPTER_RAN="$WORK/feedback-block-adapter.log"
+FEEDBACK_ADAPTER_PROBE="$WORK/feedback-block-adapter.sh"
+cat >"$FEEDBACK_ADAPTER_PROBE" <<EOF
+#!/bin/sh
+printf 'ran\n' >>"$ADAPTER_RAN"
+exit 0
+EOF
+chmod +x "$FEEDBACK_ADAPTER_PROBE"
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$FEEDBACK_BLOCK_STUB" \
-  CODEX_BIN="$BIN/fake-codex-approve" \
+  CODEX_BIN="$FEEDBACK_ADAPTER_PROBE" \
   bash "$ORCH" 122 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>&1)"; rc=$?
 set -e
-if [ "$rc" = 7 ] && printf '%s' "$out" | grep -q 'review feedback is unaccounted'; then
+if [ "$rc" = 7 ] \
+   && printf '%s' "$out" | grep -q 'review feedback is unaccounted' \
+   && [ ! -e "$ADAPTER_RAN" ]; then
   pass "feedback accounting miss → exit 7 before Phase 4b adapter dispatch"
 else fail "feedback accounting pre-dispatch gate (rc=$rc, out=$out)"; fi
 

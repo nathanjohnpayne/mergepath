@@ -108,17 +108,27 @@ RUN_RC=0
 RUN_JSON=""
 RUN_ERR=""
 run_gate() {
-  local out="$TMP/out.json" err="$TMP/err.log"
+  local token_mode="${1:-ambient}" out="$TMP/out.json" err="$TMP/err.log"
+  local -a gate_env=(
+    "PATH=$TMP/bin:$PATH"
+    "GH_FIXTURE_DIR=$TMP/fixtures"
+    "GH_CALL_LOG=$TMP/gh-calls.log"
+    "REVIEW_FEEDBACK_ACCOUNTING_CONFIG=$TMP/review-policy.yml"
+    "CODEX_FEEDBACK_LEDGER=${CODEX_FEEDBACK_LEDGER:-$TMP/no-codex-ledger}"
+    "CODERABBIT_FEEDBACK_LEDGER=${CODERABBIT_FEEDBACK_LEDGER:-$TMP/no-coderabbit-ledger}"
+    "GH_FAIL_ENDPOINT=${GH_FAIL_ENDPOINT:-}"
+  )
   set +e
-  PATH="$TMP/bin:$PATH" \
-    GH_TOKEN=test-token \
-    GH_FIXTURE_DIR="$TMP/fixtures" \
-    GH_CALL_LOG="$TMP/gh-calls.log" \
-    REVIEW_FEEDBACK_ACCOUNTING_CONFIG="$TMP/review-policy.yml" \
-    CODEX_FEEDBACK_LEDGER="${CODEX_FEEDBACK_LEDGER:-$TMP/no-codex-ledger}" \
-    CODERABBIT_FEEDBACK_LEDGER="${CODERABBIT_FEEDBACK_LEDGER:-$TMP/no-coderabbit-ledger}" \
-    GH_FAIL_ENDPOINT="${GH_FAIL_ENDPOINT:-}" \
-    "$SCRIPT" 7 acme/widget >"$out" 2>"$err"
+  if [ "$token_mode" = preflight ]; then
+    env -u GH_TOKEN \
+      "${gate_env[@]}" \
+      OP_PREFLIGHT_REVIEWER_PAT=test-token \
+      OP_PREFLIGHT_CACHE_DIR="$TMP/no-cache" \
+      "$SCRIPT" 7 acme/widget >"$out" 2>"$err"
+  else
+    env "${gate_env[@]}" GH_TOKEN=test-token \
+      "$SCRIPT" 7 acme/widget >"$out" 2>"$err"
+  fi
   RUN_RC=$?
   set -e
   RUN_JSON="$(cat "$out")"
@@ -139,19 +149,9 @@ assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "empty history report
 # The documented direct invocation runs after op-preflight, which exports the
 # scoped PAT but deliberately leaves GH_TOKEN unset. The helper must bridge the
 # reviewer token itself rather than rejecting that normal environment.
-set +e
-PATH="$TMP/bin:$PATH" \
-  OP_PREFLIGHT_REVIEWER_PAT=test-token \
-  OP_PREFLIGHT_CACHE_DIR="$TMP/no-cache" \
-  GH_FIXTURE_DIR="$TMP/fixtures" \
-  GH_CALL_LOG="$TMP/gh-calls.log" \
-  REVIEW_FEEDBACK_ACCOUNTING_CONFIG="$TMP/review-policy.yml" \
-  CODEX_FEEDBACK_LEDGER="$TMP/no-codex-ledger" \
-  CODERABBIT_FEEDBACK_LEDGER="$TMP/no-coderabbit-ledger" \
-  env -u GH_TOKEN "$SCRIPT" 7 acme/widget >"$TMP/preflight-out.json" 2>"$TMP/preflight-err.log"
-preflight_rc=$?
-set -e
-assert_eq 0 "$preflight_rc" "reviewer PAT from preflight is accepted without ambient GH_TOKEN"
+reset_fixtures
+run_gate preflight
+assert_eq 0 "$RUN_RC" "reviewer PAT from preflight is accepted without ambient GH_TOKEN"
 
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
@@ -163,7 +163,7 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
     "user": {"login": "chatgpt-codex-connector[bot]"},
     "path": "src/a.sh",
     "line": 12,
-    "body": "![P1 Badge] Missing guard"
+    "body": "![P1 Badge] Missing guard\n\nUseful? React with 👍 / 👎."
   }
 ]
 JSON
@@ -183,7 +183,7 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
     "user": {"login": "chatgpt-codex-connector[bot]"},
     "path": "src/a.sh",
     "line": 12,
-    "body": "![P1 Badge] Missing guard"
+    "body": "![P1 Badge] Missing guard\n\nUseful? React with 👍 / 👎."
   },
   {
     "id": 11,
@@ -210,7 +210,7 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
     "user": {"login": "chatgpt-codex-connector[bot]"},
     "path": "src/a.sh",
     "line": 12,
-    "body": "![P1 Badge] Missing guard"
+    "body": "![P1 Badge] Missing guard\n\nUseful? React with 👍 / 👎."
   },
   {
     "id": 11,
@@ -235,6 +235,12 @@ assert_eq 1 "$RUN_RC" "worktree-local ledger alone is not cross-checkout disposi
 unset CODEX_FEEDBACK_LEDGER
 
 printf '[{"user":{"login":"nathanpayne-codex"},"content":"+1","created_at":"2026-08-18T20:04:00Z"}]\n' >"$TMP/fixtures/reactions-10.json"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-with-solicitation.json"
+jq 'map(if .id == 10 then .body = "![P1 Badge] Missing guard" else . end)' \
+  "$TMP/fixtures/inline-with-solicitation.json" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "unrelated reaction does not account for a Codex finding without the solicitation"
+mv "$TMP/fixtures/inline-with-solicitation.json" "$TMP/fixtures/inline.json"
 run_gate
 assert_eq 0 "$RUN_RC" "reviewer reaction accounts for a Codex inline finding"
 assert_eq reaction "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "reaction evidence is visible"
@@ -259,7 +265,7 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
     "user": {"login": "chatgpt-codex-connector[bot]"},
     "path": "src/a.sh",
     "line": 12,
-    "body": "![P1 Badge] Edited guard requirement"
+    "body": "![P1 Badge] Edited guard requirement\n\nUseful? React with 👍 / 👎."
   },
   {
     "id": 11,
