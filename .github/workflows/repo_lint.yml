@@ -442,7 +442,19 @@ jobs:
         # soft-pass when the check script is absent in this tree (a checkout
         # whose repo_lint.yml arrived ahead of the scripts/ci kit sync — the
         # #601 skew window); the gate activates the moment the kit lands.
-        run: ./scripts/ci/check_no_token_in_output || { rc=$?; if [ ! -f scripts/ci/check_no_token_in_output ]; then echo "check_no_token_in_output not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+        #
+        # HUB-SCOPED, unlike the plain #590 tail (CodeRabbit Major on #1032).
+        # A bare "absent ⇒ soft-pass" means deleting the launcher turns this
+        # gate off silently while `lint` stays green, and check_ci_scripts_wired
+        # only enforces on-disk ⇒ wired, never wired ⇒ on-disk. A green gate
+        # that says nothing was wrong is the #951 shape this check exists to
+        # stop, so the soft-pass is conditioned on the standard hub marker
+        # (scripts/sync-to-downstream.sh, deliberately never propagated — the
+        # same disambiguator check_repo_lint_consumer_safety and
+        # check_branch_protection_audit use): absent marker ⇒ consumer
+        # mid-sync ⇒ soft-pass; marker present ⇒ this IS mergepath and a
+        # missing launcher is a deletion, which fails.
+        run: ./scripts/ci/check_no_token_in_output || { rc=$?; if [ ! -f scripts/ci/check_no_token_in_output ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_no_token_in_output not in this tree yet; soft-pass (consumer bootstrap skew)"; elif [ ! -f scripts/ci/check_no_token_in_output ]; then echo "check_no_token_in_output is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; else exit "$rc"; fi; }
 
       - name: check_op_preflight_contract
         run: ./scripts/ci/check_op_preflight_contract
