@@ -1454,6 +1454,24 @@ else
   fail "#1061: the fail-closed warning does not distinguish a scope failure from a transient one"
 fi
 
+
+# #1061 Codex P2 round 6: the DOCUMENTED contract must agree with the log.
+# Fixing the runtime message while the header still promised "PR is mergeable"
+# left the same false claim standing where an operator reading the script would
+# find it — and the assertions above strip comments before searching, so they
+# passed while the public contract lied. Read the header deliberately.
+EXIT_CONTRACT=$(sed -n '/^# Exit codes:$/,/^# Design notes:$/p' "$SCRIPT")
+if grep -q 'PR is mergeable' <<<"$EXIT_CONTRACT"; then
+  fail "#1061: the documented exit-0 contract still says 'PR is mergeable' — the log was corrected but the header an operator actually reads was not"
+else
+  pass "#1061: the documented exit-0 contract no longer promises GitHub-level mergeability"
+fi
+if grep -q 'POLICY' <<<"$EXIT_CONTRACT" && grep -qE 'branch protection|APPROVED review OBJECT' <<<"$EXIT_CONTRACT"; then
+  pass "#1061: the documented exit-0 contract names the policy scope and the separate branch-protection gate"
+else
+  fail "#1061: the documented exit-0 contract does not explain what exit 0 actually establishes"
+fi
+
 echo ""
 echo "test_codex_review_check_required_checks: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

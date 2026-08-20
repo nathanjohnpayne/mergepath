@@ -85,7 +85,13 @@
 #   reply-matching version if false-negatives become a problem.
 #
 # Exit codes:
-#   0   All three gate conditions pass; PR is mergeable.
+#   0   All three Phase 4 POLICY gate conditions pass. This does NOT mean
+#       GitHub will accept the merge: branch protection is evaluated
+#       separately and can still refuse. Most often it wants an APPROVED
+#       review OBJECT, and a Codex 👍 is a reaction, not a review — so a
+#       👍-cleared PR exits 0 here and stays BLOCKED / REVIEW_REQUIRED on
+#       every repo with required_approving_review_count >= 1 (all nine
+#       consumers; the hub is 0). See mergepath#1059.
 #   1   At least one gate condition fails. A one-line reason is
 #       printed to stderr.
 #   3   API / infrastructure error. Error message on stderr.
