@@ -78,7 +78,11 @@ fi
 if ! command -v yq >/dev/null 2>&1; then
   fail "mikefarah/yq is available for parsed workflow assertions"
 else
-  for workflow in "$REPO_LINT" "$MD_WRAP" "$OWL"; do
+  workflows=("$REPO_LINT" "$MD_WRAP")
+  if [ -f "$OWL" ]; then
+    workflows+=("$OWL")
+  fi
+  for workflow in "${workflows[@]}"; do
     label="${workflow##*/}"
     if yq -e '(.on | has("pull_request")) and (.on.push.branches | length == 1) and (.on.push.branches[0] == "main")' "$workflow" >/dev/null; then
       pass "$label runs PR heads once and limits push validation to main"
@@ -197,10 +201,20 @@ PY
   fi
 fi
 
-if grep -Fq 'MERGEPATH_CONSUMER_SAFETY' "$DOC_WRAPPER"; then
-  pass "consumer-safety selects the live doc-ownership assertion without its regression suite"
+if [ -f "$DOC_WRAPPER" ]; then
+  DOC_FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-doc-wrapper.XXXXXX")"
+  doc_result=$(MERGEPATH_CONSUMER_SAFETY=1 MERGEPATH_REPO_ROOT="$DOC_FIXTURE" bash "$DOC_WRAPPER")
+  rm -rf "$DOC_FIXTURE"
+  case "$doc_result" in
+    "check_doc_ownership: SKIP ("*)
+      pass "consumer-safety selects the live doc-ownership assertion without its regression suite"
+      ;;
+    *)
+      fail "consumer-safety doc wrapper should run the live check, got '$doc_result'"
+      ;;
+  esac
 else
-  fail "doc ownership must honor the consumer-safety smoke-mode contract"
+  fail "doc ownership wrapper exists"
 fi
 
 if [ ! -f "$CONSUMER_VERDICT" ]; then
