@@ -8,6 +8,12 @@ WRAPPER="$ROOT/scripts/gh-as-reviewer.sh"
 
 [[ -x "$WRAPPER" ]] || { echo "missing or non-executable $WRAPPER" >&2; exit 1; }
 
+# #996: same scrub as tests/test_gh_as_author.sh — the gh stub records the
+# token the wrapper selected and failure branches print that log, so the
+# ambient OP_PREFLIGHT_REVIEWER_PAT / GH_TOKEN of an agent session must not
+# be a candidate. Per-case `VAR=...` prefixes still apply.
+unset OP_PREFLIGHT_AUTHOR_PAT OP_PREFLIGHT_REVIEWER_PAT GH_TOKEN GITHUB_TOKEN
+
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gh-as-reviewer-test.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
@@ -21,7 +27,7 @@ mkdir -p "$STUB_DIR"
 cat >"$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 LOG="${GH_CALLS_LOG:-/dev/null}"
-printf 'GH_TOKEN=%s GITHUB_TOKEN=%s gh' "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" >> "$LOG"
+printf 'GH_TOKEN=%s GITHUB_TOKEN=%s gh' "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" >> "$LOG"  # TOKEN_OUTPUT_EXEMPT: records the token the wrapper selected, which every case pins inline and asserts on exactly; the ambient credential env is scrubbed above (#996)
 for a in "$@"; do
   printf '\t%s' "$a" >> "$LOG"
 done
