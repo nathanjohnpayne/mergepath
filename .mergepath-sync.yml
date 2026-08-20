@@ -197,8 +197,11 @@ consumers:
   # `testing` renders NO testing globals — verified against
   # examples/eslint.config.js § `>>> if testing contains vitest`), so the
   # fact is REQUIRED here to avoid stripping the block on first sync and
-  # regressing `no-undef` on the test globals. First sync is small (audit:
-  # 100 paths in sync); drive it canary-first per this manifest's header.
+  # regressing `no-undef` on the test globals. Its first ongoing sync is not
+  # small: measured 2026-08-20 against mergepath at
+  # 9943173ca2b532359d619ffeadda93daf9f9cf43, the hub has 115 kit blobs and
+  # this consumer holds 110 hub-known entries. Follow the canonical per-wave
+  # selection and fan-out gates in docs/agents/propagation-ordering.md.
   - name: gaycruisebingo
     repo: nathanjohnpayne/gaycruisebingo
     visibility: public
