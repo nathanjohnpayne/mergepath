@@ -49,6 +49,8 @@ Only fan out (`--sync-all`) once the canary's `lint` is green **and the wave aud
 
 **The payload gap is real, and it is not the dominant risk.** All nine consumers are missing the same kit checks, and #1041 is open on `.sync-overrides.yml` `skip_paths` bypassing the `requires:` closure — both still true, and both are exercised by whichever consumer goes first. What the corrected measurement changes is the ordering question, not the existence of that gap: a uniform gap is uniform, so any canary surfaces it, while the hand-patched files are specific to one repo and only that repo's PR can surface them.
 
+**Prerequisite before this wave runs: migrate the canary's local kit assertions.** `gaycruisebingo`'s `check_workflow_parsers` carries 71 lines of consumer-only `synthetic-uptime.yml` assertions (#768) that the hub does not ship, and a verbatim kit sync **overwrites** them. Neither documented success condition catches that: a green lane marker only proves the mirror matches mergepath, which is exactly what an overwrite produces, and the wave audit below reviews the canonical range rather than the consumer-local lines that were removed. So the wave can pass every gate while silently deleting that coverage. Move those assertions into a consumer-local check wired through the never-propagated `repo_lint_local.yml` annex — the same annex migration the matchline note below describes — or upstream them into the canonical `check_workflow_parsers`, BEFORE the sync PR is opened. This is a hard prerequisite, not a cleanup item: once the mirror lands, the only record of what was there is the consumer's git history.
+
 **This selection expires with this wave.** It is the output of the rule above applied to one change, not a promotion. The next wave re-runs the same question against its own dominant risk and records its own answer here, replacing this block.
 
 ## Wave audit (one scoped review per wave, #662)
@@ -108,6 +110,7 @@ Pin both sides to an **immutable ref**. `origin/main` and a consumer's `HEAD` bo
 HUB_REF=<hub sha>          # the commit you are propagating FROM, not origin/main
 CONSUMER_REF=<sha>         # that consumer's commit, not HEAD
 
+set -o pipefail   # REQUIRED, see the note under the consumer command below
 TAB=$(printf '\t')
 
 # Hub side: mode, type, oid and path for every kit entry at HUB_REF.
@@ -129,6 +132,14 @@ git ls-tree -r "$HUB_REF" scripts/ci/ \
 # reads as ABSENT, which is the bucket that means "uniform payload gap".
 # Fail closed instead; the fleet's trees are far under the cap today, and
 # that is a fact about today.
+#
+# `set -o pipefail` above is LOAD-BEARING and not hygiene. Without it the
+# nonzero status jq raises on a truncated response is swallowed by the
+# trailing `sort`, the pipeline exits 0, and the redirect leaves an EMPTY
+# kit_<consumer>.tsv -- which the comparison then reads as every kit path
+# absent, i.e. the exact "uniform payload gap" verdict the check exists to
+# prevent. Measured: without pipefail the pipeline exits 0 with 0 lines;
+# with it, 5.
 gh api "repos/nathanjohnpayne/<consumer>/git/trees/$CONSUMER_REF?recursive=1" \
   --jq 'if .truncated then error("truncated tree response — refusing to measure a partial listing") else . end
         | .tree[] | select(.type=="blob") | select(.path | startswith("scripts/ci/"))
