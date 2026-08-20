@@ -138,13 +138,33 @@ jobs:
             echo "::error::Could not recover the head SHA for PR #$pr"
             exit 1
           fi
-          gh api --method POST "repos/$REPO/check-runs" \
-            -f name="$CHECK_NAME" -f head_sha="$head_sha" \
-            -f status=completed -f conclusion=failure \
-            -f "output[title]=Codex feedback gate — trusted read-only relay could not resolve its source PR" \
-            -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed before it could bind to PR #$pr. Rerun the relay; the scheduled sweep also re-evaluates every 15 minutes." \
-            >/dev/null \
-            || echo "::error::Could not publish the PR-head failure on $head_sha"
+          # This POST is the one write that retracts a stale successful
+          # required check from the PR head. A single transient API failure
+          # would leave that success standing and open a merge window until
+          # the 15-minute sweep, so retry on the same bounded schedule the
+          # PR re-read above and the lease publisher below already use
+          # (CodeRabbit, review 4978993986). The step still exits 1 either
+          # way — the retry protects the check retraction, not this run.
+          published=false
+          for attempt in 1 2 3; do
+            if gh api --method POST "repos/$REPO/check-runs" \
+              -f name="$CHECK_NAME" -f head_sha="$head_sha" \
+              -f status=completed -f conclusion=failure \
+              -f "output[title]=Codex feedback gate — trusted read-only relay could not resolve its source PR" \
+              -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed before it could bind to PR #$pr. Rerun the relay; the scheduled sweep also re-evaluates every 15 minutes." \
+              >/dev/null; then
+              published=true
+              break
+            fi
+            # Sleep between attempts only; sleeping after the last failure
+            # only delays the diagnostic (same rule as the re-read above).
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          if [ "$published" != true ]; then
+            echo "::error::Could not publish the PR-head failure on $head_sha"
+          fi
           exit 1
 
       - name: Locate the read-only handoff artifact
