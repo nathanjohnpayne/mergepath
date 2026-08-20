@@ -726,6 +726,26 @@ SAFE_COMMANDS = frozenset(
 # deliberately absent, each pinned by a MUST_NOT_FLAG corpus case.  A
 # credential-named operand is what fires this; `exit "$rc"` names no
 # credential and is not a reference at all.
+# `read` OPTIONS that require a numeric operand.  `read` itself stays in
+# SAFE_COMMANDS and stays OUT of NUMERIC_OPERAND_DIAGNOSTIC, and both of those
+# remain correct for the POSITIONAL operand: `read "$GH_TOKEN"` treats the
+# value as a VARIABLE NAME, and bash writes no diagnostic naming it unless the
+# name is invalid -- measured clean, and pinned by `read-path-idiom`.
+#
+# The leak is in a different POSITION.  These four options take a timeout, a
+# character count or a file descriptor, so a credential can never be a valid
+# operand and bash reproduces it verbatim on stderr:
+#
+#     $ read -t "$GH_TOKEN" x </dev/null
+#     bash: read: Zq7Xf2Lp9Vt4Rk8Nb3Md6Wc1Ys5Hj0Gr: invalid timeout specification
+#
+# So this is the `NUMERIC_OPERAND_DIAGNOSTIC` rule reached through an option
+# rather than a command word, and it is decided by the same test -- the
+# operand TYPE is numeric, so a credential is never valid and the diagnostic
+# is certain.  Measured on all four (#1032 round 6 P1); classifying every
+# `read` invocation non-emitting made `--scan` report PASS on a live stderr
+# leak, the same shape `exit`/`return`/`shift` had in round 4.
+READ_NUMERIC_OPTS = frozenset({"-t", "-n", "-N", "-u"})
 NUMERIC_OPERAND_DIAGNOSTIC = frozenset(
     {
         "exit", "return", "shift", "break", "continue", "ulimit", "wait",
@@ -782,6 +802,28 @@ NON_SHELL_INTERPRETERS = frozenset(
     }
 )
 SHELL_EXTS = frozenset({".sh", ".bash", ".ksh", ".zsh", ".dash", ".bats"})
+# Dialects DISCOVERY selects but the EMITTER MODEL cannot read.  `EMITTERS` is
+# `{echo, printf}` and every other command word grades as an unknown external
+# command, i.e. SAFE.  In zsh and ksh `print -r -- "$GH_TOKEN"` is a BUILTIN
+# that writes the value to stdout, so a selected `.zsh` file leaked under a
+# PASS -- measured (#1032 round 6 P1).
+#
+# The answer here is the NARROW one, and it is the same shape as
+# `numeric-operand-boundary-*`: keep SELECTING these files, so a dialect this
+# gate cannot grade can never become a file it silently skipped, and refuse to
+# call the result CLEAN.  The bash model still runs over them -- it catches
+# every construct the dialects share, which is most of them -- and a
+# discovery ERROR is raised alongside, so the tree cannot report clean on a
+# file whose output builtins are outside the model.
+#
+# Modelling `print` instead would open exactly the enumeration this gate has
+# declined everywhere else: `print`, `printf`-alikes, `-` variants, and zsh
+# and ksh each spell them differently.  Worse, none of it could be MEASURED --
+# the oracle runs bash, and `zsh`/`ksh` are not on every runner (the
+# file-selection axis already records that fallback), so each addition would
+# be asserted rather than decided.  A refusal is decidable; a guess is not.
+UNMODELLED_SHELL_DIALECTS = frozenset({"zsh", "ksh", "ksh93", "mksh", "pdksh"})
+UNMODELLED_SHELL_EXTS = frozenset({".zsh", ".ksh"})
 NON_SHELL_EXTS = frozenset(
     {
         ".md", ".markdown", ".json", ".jsonl", ".yml", ".yaml", ".txt", ".py",
@@ -2198,6 +2240,41 @@ def classify(seg, emitter_helpers):
     return SAFE  # an external command: see "does NOT catch" in the header
 
 
+def _read_numeric_option_operand(seg, name):
+    """Is `name` the operand of a numeric `read` option in this segment?
+
+    Handles the SEPARATE spelling (`read -t "$PAT"`) and the ATTACHED one
+    (`read -t"$PAT"`), because bash accepts both.  A bundle (`read -rt "$PAT"`)
+    puts the operand on the LAST option in the bundle, which is why the test
+    is on the final character rather than on the whole word.
+    """
+    words = list(seg.words)[1:]
+    for i, w in enumerate(words):
+        lit = _unquote_command_word(w)
+        # `_unquote_command_word` returns None for a word carrying an
+        # expansion, which is EXACTLY the attached spelling this has to read
+        # (`read -t"$PAT"`).  The option letters are the literal PREFIX of the
+        # word either way, so the raw word is the right probe when the
+        # reduction declines -- dropping it here read the attached spelling as
+        # "not an option" and let it through.
+        probe = lit if lit is not None else w
+        if not probe.startswith("-") or probe.startswith("--"):
+            continue
+        body = probe[1:]
+        if not body:
+            continue
+        # `-t5` / `-tVALUE`: operand attached to this very word.  The literal
+        # loses the expansion, so the reference test runs on the RAW word.
+        if len(body) > 1 and ("-" + body[0]) in READ_NUMERIC_OPTS:
+            if name in _iter_refs(w):
+                return True
+            continue
+        if ("-" + body[-1]) in READ_NUMERIC_OPTS and i + 1 < len(words):
+            if name in _iter_refs(words[i + 1]):
+                return True
+    return False
+
+
 def reaches_output(ref, emitter_helpers):
     """Does this reference reach a stream?  Returns (bool, reason)."""
     if ref.in_error_word:
@@ -2209,6 +2286,13 @@ def reaches_output(ref, emitter_helpers):
             "the error word of a `${...:?...}` expansion, which bash itself "
             "writes to stderr when the variable is unset"
         )
+    if ref.seg is not None and not ref.in_assign_prefix:
+        rcmd, _rredir = resolve_command(ref.seg)
+        if rcmd == "read" and _read_numeric_option_operand(ref.seg, ref.name):
+            return True, (
+                "the operand of a numeric `read` option (-t/-n/-N/-u), which "
+                "bash reproduces verbatim on stderr when it is not a number"
+            )
     if ref.in_assign_prefix:
         # `GH_TOKEN="$PAT" cmd ...` puts the value in the child's ENVIRONMENT.
         cmd, _ = resolve_command(ref.seg)
@@ -2735,7 +2819,17 @@ def _alias_emitters(lx, helpers):
     while True:
         grew = False
         for line, name, target in defs:
-            if name in out or line < enabled_at:
+            # NOT `line < enabled_at`.  `alias` RECORDS the definition whether
+            # or not expansion is on; `expand_aliases` only governs whether a
+            # line being READ expands one.  So a definition that PREDATES the
+            # `shopt` is still in effect at a later call site and does expand
+            # there -- `alias leak=echo`, `shopt -s expand_aliases`,
+            # `leak "$GH_TOKEN"` prints the credential, measured, and the
+            # earlier ordering test discarded the definition and read clean
+            # (#1032 round 6 P1).  `enabled_at is None` above is what keeps
+            # `alias-without-expand-aliases` clean; this ordering test was
+            # never what made the `shopt` gate real.
+            if name in out:
                 continue
             head = _basename(target.split()[0]) if target.split() else ""
             if head in EMITTERS or head in STDIN_ECHOERS or head in helpers \
@@ -2812,6 +2906,28 @@ def _shebang_enables_xtrace(text):
     for w in first[2:].split()[1:]:
         if w.startswith("-") and not w.startswith("--") and "x" in w[1:]:
             return True
+    return False
+
+
+def _text_enables_xtrace(text):
+    """Does this text turn xtrace ON anywhere in it?
+
+    Used on DEFERRED text (`eval`, a trap action, `mapfile -C`), whose effect
+    on the CURRENT shell outlives the deferred command.  Deliberately
+    one-directional: an ENABLE is carried out, a DISABLE is not.  The two are
+    not symmetric in cost -- crediting a disable that never runs is a silent
+    false negative, while carrying an enable that never runs costs a visible
+    finding the author can pragma -- which is the same asymmetry
+    `xtrace-disable-in-called-function` already records.
+    """
+    try:
+        lx = Lexer(text)
+    except Exception:  # pragma: no cover - a text the lexer refuses
+        return True  # unreadable deferred text: fail CLOSED
+    for ll in lx.logical:
+        for seg in ll.segments:
+            if _segment_sets_xtrace(seg) is True:
+                return True
     return False
 
 
@@ -2903,6 +3019,18 @@ def scan_text(text, path="<text>", _depth=0):
                                 "command: %s" % f.reason,
                             )
                         )
+                    # xtrace set by DEFERRED code is a change to THIS shell
+                    # and it outlives the deferred command: `eval 'set -x'`
+                    # leaves tracing on, so every later reference is written
+                    # to stderr expanded.  The recursive scan finds no
+                    # credential in `set -x` itself and its state was
+                    # discarded, so `eval 'set -x'` + `: "$GH_TOKEN"` read
+                    # CLEAN (#1032 round 6 P1).  A `DEBUG` trap and
+                    # `mapfile -C 'set -x'` are the same bypass, which is why
+                    # this rides the deferred-operand walk that already covers
+                    # all three rather than being a rule about `eval`.
+                    if _text_enables_xtrace(inner):
+                        state = True
         xtrace = state
     return findings, pragma_errors
 
@@ -3229,6 +3357,23 @@ def discover_shell_files(root):
     return shell, errors, present_roots
 
 
+def unmodelled_dialect(path, text):
+    """Name this file's shell dialect when the emitter model cannot read it.
+
+    Extension first, then the shebang: both are how discovery SELECTED the
+    file in the first place, so both are how it can say the selection landed
+    on a dialect it grades with the wrong model.  Returns None for bash/sh and
+    everything else the model does read.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in UNMODELLED_SHELL_EXTS:
+        return ext.lstrip(".")
+    interp = resolve_shebang(text.split("\n", 1)[0])
+    if interp in UNMODELLED_SHELL_DIALECTS:
+        return interp
+    return None
+
+
 def scan_tree(root):
     """Scan a tree.  Returns (findings, errors, count-of-shell-files)."""
     shell, errors, present_roots = discover_shell_files(root)
@@ -3245,7 +3390,21 @@ def scan_tree(root):
         except OSError as exc:
             errors.append("%s: unreadable: %s" % (p, exc))
             continue
-        f, pragma_errors = scan_text(text, os.path.relpath(p, root))
+        rel = os.path.relpath(p, root)
+        dialect = unmodelled_dialect(p, text)
+        if dialect is not None:
+            # Still scanned below -- the bash model catches every construct
+            # the dialects share -- but never reported CLEAN, because the
+            # output builtins that differ (`print`) are outside `EMITTERS`.
+            errors.append(
+                "%s: written in %s, a dialect whose output builtins this gate "
+                "does not model -- `print -r -- \"$GH_TOKEN\"` writes the "
+                "value and grades SAFE here, so a clean result over this file "
+                "would not mean what it says.  Rewrite it in bash/sh, or "
+                "extend EMITTERS with cases measured under %s."
+                % (rel, dialect, dialect)
+            )
+        f, pragma_errors = scan_text(text, rel)
         findings.extend(f)
         errors.extend(pragma_errors)
     if not shell and not errors:
@@ -4448,6 +4607,21 @@ CORPUS = [
     ("continued-name-suffix", MUST_FLAG, 'echo "$GH_\\\nTOKEN"\n'),
     ("continued-name-braced", MUST_FLAG, 'echo "${GH_\\\nTOKEN}"\n'),
     ("continued-name-midword", MUST_FLAG, 'echo "$GH\\\n_TOKEN"\n'),
+    # --- xtrace turned on by DEFERRED code -------------------------------
+    #
+    # The deferred text runs in THIS shell, so the state it sets outlives the
+    # command that deferred it.  The recursive scan finds no credential inside
+    # `set -x` and its state was thrown away, so the following line read clean.
+    (
+        "xtrace-enabled-by-eval",
+        MUST_FLAG,
+        "eval 'set -x'\n: \"$GH_TOKEN\"\n",
+    ),
+    (
+        "xtrace-enabled-by-debug-trap",
+        MUST_FLAG,
+        "trap 'set -x' DEBUG\n: \"$GH_TOKEN\"\n",
+    ),
     # --- aliases ---------------------------------------------------------
     (
         "alias-to-emitter",
@@ -4462,12 +4636,63 @@ CORPUS = [
         'alias leak=echo\nleak "$GH_TOKEN" 2>/dev/null || :\necho ok\n',
     ),
     (
+        # The definition PREDATES `shopt -s expand_aliases`.  `alias` records
+        # it regardless; `expand_aliases` only governs the line being READ, so
+        # the alias is live at the call site and this leaks.  Ordering the
+        # definition against the `shopt` discarded it and read clean.
+        "alias-defined-before-expand-aliases",
+        MUST_FLAG,
+        'alias leak=echo\nshopt -s expand_aliases\nleak "$GH_TOKEN"\n',
+    ),
+    (
         # Bash expands aliases when it READS a line, so a definition and a use
         # on the same line do not connect.  The gate does not model that and
         # reds it -- declared.
         "alias-defined-and-used-on-one-line",
         MUST_FLAG,
         'shopt -s expand_aliases\nalias leak=echo; leak "$GH_TOKEN"\necho ok\n',
+    ),
+    # --- `read`, and the OPTION half of the numeric-operand class --------
+    #
+    # `read` is in SAFE_COMMANDS and stays there: its POSITIONAL operand is a
+    # variable NAME and bash writes no diagnostic naming it.  These four
+    # OPTIONS take a number, so the same certainty the command-word class
+    # rests on applies to their operand -- and the credential lands on stderr.
+    (
+        "read-numeric-option-timeout",
+        MUST_FLAG,
+        'read -t "$GH_TOKEN" x </dev/null || :\necho ok\n',
+    ),
+    (
+        "read-numeric-option-nchars",
+        MUST_FLAG,
+        'read -n "$GH_TOKEN" x </dev/null || :\necho ok\n',
+    ),
+    (
+        "read-numeric-option-fd",
+        MUST_FLAG,
+        'read -u "$GH_TOKEN" x || :\necho ok\n',
+    ),
+    # The operand ATTACHED to the option letter, which is how bash also spells
+    # it and the spelling the literal-reduction path drops.
+    (
+        "read-numeric-option-attached",
+        MUST_FLAG,
+        'read -t"$GH_TOKEN" x </dev/null || :\necho ok\n',
+    ),
+    # BUNDLED: the operand belongs to the LAST option in the bundle.
+    (
+        "read-numeric-option-bundled",
+        MUST_FLAG,
+        'read -rt "$GH_TOKEN" x </dev/null || :\necho ok\n',
+    ),
+    # The BOUNDARY of the option class: `-d` takes a DELIMITER, any string is
+    # valid, so there is no diagnostic and no leak.  This is what keeps the
+    # rule "the operand type is numeric" rather than "any `read` option".
+    (
+        "read-non-numeric-option",
+        MUST_NOT_FLAG,
+        'read -d "$GH_TOKEN" v <<< x\necho ok\n',
     ),
     # --- `kill`, and the BOUNDARY of the numeric-operand class -----------
     ("numeric-kill", MUST_FLAG, 'kill "$GH_TOKEN" || :\necho ok\n'),
@@ -5301,6 +5526,7 @@ def self_test():
         failures.extend(_pragma_cases())
         failures.extend(_deferred_shell_cases())
         failures.extend(_file_selection_cases(tmp))
+        failures.extend(_unmodelled_dialect_cases(tmp))
         failures.extend(_discovery_failure_cases(tmp))
         failures.extend(_source_promotion_cases(tmp))
         failures.extend(_path_independence_case(tmp))
@@ -5556,6 +5782,59 @@ def _deferred_shell_cases():
             failures.append(
                 "deferred %s: well-formed deferred text reported a discovery "
                 "error (%s)" % (cid, errors)
+            )
+    return failures
+
+
+def _unmodelled_dialect_cases(tmp):
+    """A dialect the emitter model cannot read must never report CLEAN.
+
+    Discovery SELECTS `.zsh`/`.ksh` files and zsh/ksh shebangs, but `EMITTERS`
+    is `{echo, printf}`: in those dialects `print -r -- "$PAT"` is a builtin
+    that writes the value, and the bash model grades it an unknown external
+    command -- SAFE.  So the file is read, produces no finding, and the tree
+    reports clean over a live leak.
+
+    The assertion is on the ERROR channel rather than on findings, because
+    that is where the fix lives: the gate keeps scanning these files (the
+    shared constructs are still caught) and refuses to call the result clean.
+    The negative half -- a bash file carrying the same word -- is what keeps
+    the rule about the DIALECT and not about the word `print`.
+    """
+    failures = []
+    leak = 'print -r -- "$GH_TOKEN"\n'
+    for cid, filename, header, expect_error in [
+        ("zsh-ext", "leak.zsh", "", True),
+        ("ksh-ext", "leak.ksh", "", True),
+        ("zsh-shebang", "leak", "#!/usr/bin/env zsh\n", True),
+        ("ksh-shebang", "leak", "#!/bin/ksh\n", True),
+        # Same word, a dialect the model DOES read: in bash `print` is not a
+        # builtin, nothing is written, and no dialect error is owed.
+        ("bash-ext-control", "leak.sh", "#!/bin/bash\n", False),
+    ]:
+        root = os.path.join(tmp, "dialect-" + cid)
+        os.makedirs(os.path.join(root, "scripts"), exist_ok=True)
+        with open(os.path.join(root, "scripts", filename), "w",
+                  encoding="utf-8") as fh:
+            fh.write(header + leak)
+        _findings, errors, count = scan_tree(root)
+        if count != 1:
+            failures.append(
+                "dialect %s: discovery did not select the file (scanned %d) "
+                "-- the fix must keep selecting it, never skip it"
+                % (cid, count)
+            )
+            continue
+        got = any("does not model" in e for e in errors)
+        if expect_error and not got:
+            failures.append(
+                "dialect %s: an unmodelled dialect was graded with the bash "
+                "model and reported clean (errors=%s)" % (cid, errors)
+            )
+        if not expect_error and got:
+            failures.append(
+                "dialect %s: a bash file was refused as an unmodelled "
+                "dialect (errors=%s)" % (cid, errors)
             )
     return failures
 
