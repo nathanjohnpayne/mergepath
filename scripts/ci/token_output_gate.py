@@ -241,7 +241,23 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     so `: "$PAT"` -- the safest command word there is -- puts the value on a
     stream.  This is shell STATE, tracked in source order across the file and
     resolved per SEGMENT, so `( set -x; : "$PAT" )` counts and `set +x`,
-    `set +o xtrace` and `set -- -x` are all read correctly.
+    `set +o xtrace` and `set -- -x` are all read correctly.  The two
+    directions are ASYMMETRIC on purpose: enabling is believed wherever it is
+    written, disabling only from a line that is the whole `set` and is not
+    inside a function body.  Crediting a `set +x` bash never runs is a silent
+    false negative and is trivially reachable -- `set -x; f() { set +x; }` --
+    while refusing a real one costs a visible finding a pragma settles.
+  * A credential NAME split by a LINE CONTINUATION.  Bash removes
+    `\\<newline>` before it parses the expansion, so `$GH_\\<newline>TOKEN`
+    names GH_TOKEN and prints its value; matching the raw text stopped at the
+    backslash and saw an unknown prefix.  `ident_at` is the single
+    continuation-aware matcher, shared by the lexer, `braced_ref_at` and the
+    here-doc body scanner, for the same reason `braced_ref_at` is shared.
+  * A command word that is an ALIAS for an emitter, when `shopt -s
+    expand_aliases` is on.  Alias names are folded into the emitter-helper
+    set -- an alias is the relationship a helper already has with its call
+    sites -- with bash's own two gates kept: `expand_aliases` must be
+    enabled, and only a LITERAL target counts.
   * The ERROR WORD of a `${VAR:?word}` / `${VAR?word}` expansion.  BASH
     ITSELF writes that word to stderr when VAR is unset, before the enclosing
     command runs and whatever that command is, so `: "${UNSET:?$PAT}"` and
@@ -1324,10 +1340,10 @@ class Lexer:
                     continue
                 # a plain variable reference
                 if expanding():
-                    m = _IDENT_RE.match(text, i + 1)
-                    if m and m.group(0) in TOKEN_NAME_SET:
+                    nm, _end = ident_at(text, i + 1)
+                    if nm is not None and nm in TOKEN_NAME_SET:
                         r = Ref(
-                            m.group(0),
+                            nm,
                             line,
                             cur_level()["seg"],
                             in_assign_prefix(),
@@ -1746,6 +1762,39 @@ def _skip_balanced_parens(text, start):
     return n
 
 
+def ident_at(text, pos):
+    """Match a shell identifier at `pos`, transparently across `\\<newline>`.
+
+    Bash removes a LINE CONTINUATION before it parses the expansion, so
+    `$GH_\\<newline>TOKEN` names `GH_TOKEN` and prints its value.  Matching
+    `_IDENT_RE` against the raw text stopped at the backslash, saw the unknown
+    prefix `GH_`, and reported nothing -- a bypass in the same family as the
+    forgeable pragma #1012 shipped, since it hides a credential NAME from the
+    only test that looks for one (#1032 round 6 P1).
+
+    Returns (name, end_index), or (None, pos) when no identifier is there.
+    A continuation immediately AFTER the name is consumed too, because bash
+    removes that one as well and the caller reads the expansion OPERATOR from
+    `end_index`.
+    """
+    out = []
+    i = pos
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n and text[i + 1] == "\n":
+            i += 2
+            continue
+        c = text[i]
+        ok = (c.isalpha() or c == "_") if not out else (c.isalnum() or c == "_")
+        if not ok:
+            break
+        out.append(c)
+        i += 1
+    if not out:
+        return None, pos
+    return "".join(out), i
+
+
 def error_word_expansion_at(text, brace_open):
     """Is the `${...}` at `brace_open` the ERROR-WORD form, `:?` or `?`?
 
@@ -1762,10 +1811,10 @@ def error_word_expansion_at(text, brace_open):
     j = brace_open + 2
     if j < len(text) and text[j] in "#!":
         return False
-    m = _IDENT_RE.match(text, j)
-    if not m:
+    name, end = ident_at(text, j)
+    if name is None:
         return False
-    rest = text[m.end() :]
+    rest = text[end:]
     return rest.startswith(":?") or rest.startswith("?")
 
 
@@ -1792,13 +1841,13 @@ def braced_ref_at(text, brace_open):
     j = brace_open + 2
     if j < len(text) and text[j] in "#!":
         return None
-    m = _IDENT_RE.match(text, j)
-    if not m or m.group(0) not in TOKEN_NAME_SET:
+    name, end = ident_at(text, j)
+    if name is None or name not in TOKEN_NAME_SET:
         return None
-    op = text[m.end() : m.end() + 2]
+    op = text[end : end + 2]
     if op[:2] == ":+" or op[:1] == "+":
         return None
-    return m.group(0)
+    return name
 
 
 def _iter_refs(s):
@@ -1823,10 +1872,10 @@ def _iter_refs(s):
                     out.append(name)
                 i += 2
                 continue
-            m = _IDENT_RE.match(s, i + 1)
-            if m and m.group(0) in TOKEN_NAME_SET:
-                out.append(m.group(0))
-                i = m.end()
+            nm, end = ident_at(s, i + 1)
+            if nm is not None and nm in TOKEN_NAME_SET:
+                out.append(nm)
+                i = end
                 continue
         i += 1
     return out
@@ -2614,6 +2663,123 @@ def _segment_sets_xtrace(seg):
     return state
 
 
+_ALIAS_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_:.-]*)=(.*)$", re.S)
+
+
+def _alias_emitters(lx, helpers):
+    """Alias names that resolve to an emitter, when `expand_aliases` is on.
+
+    `shopt -s expand_aliases` + `alias leak=echo` makes `leak "$PAT"` an
+    `echo`, and the classifier read `leak` as an unknown external command and
+    called it safe (#1032 round 6 P1).  An alias is exactly the relationship
+    an emitter HELPER already has with its call sites, so the names are folded
+    into that same set rather than given a second mechanism.
+
+    Two gates, both of them bash's own rules rather than caution:
+
+      * `expand_aliases` must be enabled.  Bash does not expand aliases in a
+        non-interactive shell without it, which is why `alias leak=echo`
+        alone leaves the call a genuine unknown command -- measured, and a
+        MUST_NOT_FLAG case.
+      * the definition must be on an EARLIER logical line than the use.  Bash
+        expands aliases when it READS a line, so a definition and a use on
+        the same line do not connect -- also measured, also a case.
+
+    Only a LITERAL target counts.  `alias leak="$cmd"` names something this
+    scanner cannot read, and it is left to the unknown-command limit rather
+    than guessed at.
+    """
+    enabled_at = None
+    defs = []  # (line, name, target)
+    for ll in lx.logical:
+        for seg in ll.segments:
+            cmd, _redir = resolve_command(seg)
+            lits = [_unquote_command_word(w) for w in seg.words]
+            lits = [l for l in lits if l is not None]
+            if cmd == "shopt" and "-s" in lits and "expand_aliases" in lits:
+                if enabled_at is None:
+                    enabled_at = ll.first_line
+            elif cmd == "alias":
+                for l in lits[1:]:
+                    m = _ALIAS_RE.match(l)
+                    if m:
+                        defs.append((ll.first_line, m.group(1), m.group(2)))
+    if enabled_at is None or not defs:
+        return set()
+    out = set()
+    # A fixed point, so `alias a=b` / `alias b=echo` resolves however long the
+    # chain is -- the same reason `discover_emitter_helpers` iterates.
+    while True:
+        grew = False
+        for line, name, target in defs:
+            if name in out or line < enabled_at:
+                continue
+            head = _basename(target.split()[0]) if target.split() else ""
+            if head in EMITTERS or head in STDIN_ECHOERS or head in helpers \
+                    or head in out:
+                out.add(name)
+                grew = True
+        if not grew:
+            return out
+
+
+def _function_body_line_spans(text):
+    """1-based line spans of every function BODY in this text.
+
+    A `set +x` in a function body runs only if the function is CALLED, and
+    whether it is called is control flow a source-text scanner does not model.
+    Used to refuse an xtrace DISABLE from inside one -- see `_xtrace_delta`.
+    """
+    spans = []
+    for m in re.finditer(
+        r"(?m)^[ \t]*(?:function[ \t]+)?([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
+        r"(?:\([ \t]*\))?[ \t]*\{",
+        text,
+    ):
+        head = text[m.start() : m.end()]
+        if "(" not in head and not head.lstrip().startswith("function"):
+            continue
+        body = _find_body(text, m.end() - 1)
+        if body is None:
+            continue
+        start_line = text.count("\n", 0, m.end()) + 1
+        spans.append((start_line, start_line + body.count("\n")))
+    return spans
+
+
+def _xtrace_delta(ll, in_function):
+    """The xtrace state change this LOGICAL LINE makes, or None.
+
+    ASYMMETRIC on purpose, because the two directions have opposite risk:
+
+      * ENABLING is believed wherever it is written.  A `set -x` the scanner
+        credits that bash never executes costs a false positive on a line the
+        author can pragma.
+      * DISABLING is believed only from a line that is UNCONDITIONALLY
+        executed at the top level -- the whole logical line is the `set` and
+        nothing else, and it is not inside a function body.  A `set +x` the
+        scanner credits that bash never executes costs a silent FALSE
+        NEGATIVE, and it is trivially reachable: `set -x; f() { set +x; }`
+        and `set -x; if false; then set +x; fi` both leave tracing ON at run
+        time while a source-order reading turned it off (#1032 round 6 P1).
+
+    So the rule that closes the bypass is not "model control flow" -- which a
+    source-text scanner cannot do -- but "only an unconditional disable
+    counts".  Anything else leaves tracing on, which is the fail-closed side.
+    """
+    real = [s for s in ll.segments if s.words]
+    deltas = [_segment_sets_xtrace(s) for s in real]
+    deltas = [d for d in deltas if d is not None]
+    if not deltas:
+        return None
+    if True in deltas:
+        return True
+    # Every delta on this line is a disable.
+    if len(real) != 1 or in_function:
+        return None
+    return False
+
+
 def _shebang_enables_xtrace(text):
     first = text.split("\n", 1)[0]
     if not first.startswith("#!"):
@@ -2645,6 +2811,10 @@ def scan_text(text, path="<text>", _depth=0):
             "not as code" % (path, opened_at, delim)
         )
     xtrace = _shebang_enables_xtrace(text)
+    fn_spans = _function_body_line_spans(text)
+    aliases = _alias_emitters(lx, helpers)
+    if aliases:
+        helpers = set(helpers) | aliases
     for ll in lx.logical:
         if ll.pragma_bare and not ll.pragma_reasons:
             pragma_errors.append(
@@ -2657,13 +2827,17 @@ def scan_text(text, path="<text>", _depth=0):
         # in source order, and each reference is graded under the state in
         # effect where it sits -- carrying one flag for the whole line read
         # `set -x` as taking effect only on the NEXT line and missed that one.
+        in_function = any(lo <= ll.first_line <= hi for lo, hi in fn_spans)
+        line_delta = _xtrace_delta(ll, in_function)
         xtrace_at = {}
         state = xtrace
         for seg in ll.segments:
             xtrace_at[seg.sid] = state
             st = _segment_sets_xtrace(seg)
-            if st is not None:
-                state = st
+            if st is True:
+                state = True
+            elif st is False and line_delta is False:
+                state = False
         if ll.pragma_reasons:
             # A pragma'd line is exempt, and so is any xtrace it turns on --
             # the exemption is the author's written statement about THIS line.
@@ -4170,6 +4344,70 @@ CORPUS = [
         MUST_FLAG,
         '( exit "$GH_TOKEN" ) 2>&1 | cat >/dev/null\necho ok\n',
     ),
+    # --- xtrace: only an UNCONDITIONAL disable counts --------------------
+    #
+    # A `set +x` bash never executes is a silent false negative and is
+    # trivially reachable, so a disable is believed only from a line that is
+    # the whole `set` and is not inside a function body.  Enabling stays
+    # believed wherever it is written -- the two directions have opposite
+    # risk, and the asymmetry is the fix.
+    (
+        "xtrace-disable-in-unexecuted-function",
+        MUST_FLAG,
+        'set -x\nf() { set +x; }\n: "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-disable-in-unexecuted-branch",
+        MUST_FLAG,
+        'set -x\nif false; then set +x; fi\n: "$GH_TOKEN"\n',
+    ),
+    (
+        # The MULTI-LINE function body, where the `set +x` IS a logical line
+        # of its own with one segment -- so the one-segment test passes and
+        # only the function-body span refuses it.  The one-line spelling above
+        # is caught by the one-segment test instead, which is why both are
+        # here: each pins a different half of `_xtrace_delta`.
+        "xtrace-disable-in-multiline-function",
+        MUST_FLAG,
+        'set -x\nf() {\n  set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        # The declared cost of that asymmetry: a function that IS called and
+        # does turn tracing off gets no credit for it.
+        "xtrace-disable-in-called-function",
+        MUST_FLAG,
+        'set -x\nf() { set +x; }\nf\n: "$GH_TOKEN"\necho ok\n',
+    ),
+    # --- a credential NAME split by a line continuation ------------------
+    #
+    # Bash removes `\<newline>` before it parses the expansion, so these name
+    # the variable and print its value.  Matching the raw text stopped at the
+    # backslash and saw an unknown prefix -- a bypass in the family of the
+    # forgeable pragma, since it hides the NAME from the only test for one.
+    ("continued-name-suffix", MUST_FLAG, 'echo "$GH_\\\nTOKEN"\n'),
+    ("continued-name-braced", MUST_FLAG, 'echo "${GH_\\\nTOKEN}"\n'),
+    ("continued-name-midword", MUST_FLAG, 'echo "$GH\\\n_TOKEN"\n'),
+    # --- aliases ---------------------------------------------------------
+    (
+        "alias-to-emitter",
+        MUST_FLAG,
+        'shopt -s expand_aliases\nalias leak=echo\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        # Without `expand_aliases` bash does not expand aliases in a
+        # non-interactive shell, so the call really is an unknown command.
+        "alias-without-expand-aliases",
+        MUST_NOT_FLAG,
+        'alias leak=echo\nleak "$GH_TOKEN" 2>/dev/null || :\necho ok\n',
+    ),
+    (
+        # Bash expands aliases when it READS a line, so a definition and a use
+        # on the same line do not connect.  The gate does not model that and
+        # reds it -- declared.
+        "alias-defined-and-used-on-one-line",
+        MUST_FLAG,
+        'shopt -s expand_aliases\nalias leak=echo; leak "$GH_TOKEN"\necho ok\n',
+    ),
     # --- `kill`, and the BOUNDARY of the numeric-operand class -----------
     ("numeric-kill", MUST_FLAG, 'kill "$GH_TOKEN" || :\necho ok\n'),
     (
@@ -4506,6 +4744,23 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "xtrace-disable-in-called-function": (
+        "a function that IS called and turns tracing off gets no credit for "
+        "it, because a source-text scanner cannot tell a called function from "
+        "an uncalled one.  The asymmetry is deliberate and the two directions "
+        "are not symmetric in cost: crediting a disable bash never runs is a "
+        "SILENT FALSE NEGATIVE and is trivially reachable (`set -x; f() { "
+        "set +x; }`), while refusing a real one costs a visible finding the "
+        "author can pragma"
+    ),
+    "alias-defined-and-used-on-one-line": (
+        "bash expands aliases when it READS a line, so `alias leak=echo; "
+        "leak \"$PAT\"` on ONE line does not connect -- the definition is not "
+        "in effect yet.  The gate folds alias names into the emitter-helper "
+        "set, which has no line-of-use granularity, so it reds this.  The "
+        "earlier-line spelling that DOES leak is `alias-to-emitter`, and "
+        "`alias-without-expand-aliases` pins that the `shopt` gate is real"
+    ),
     "error-word-variable-is-set": (
         "`${SET_VALUE:?$PAT}` writes the error word only when the variable is "
         "UNSET, and whether it is set is run-time state a source-text scanner "
