@@ -36,7 +36,7 @@ scripts/sync-to-downstream.sh --sync-all --repos <canary>
 Pick the canary by the **dominant risk of this change**:
 
 - **Uniform manifest/payload gap** (the #264 class — a missing test / fixture / script the kit hard-requires) → cheapest to catch on the **simplest public** repo (`swipewatch`).
-- **Per-consumer config idiosyncrasy** → the **most-divergent** repo, read off the current table rather than from memory (`gaycruisebingo` / `nathanpaynedotcom` / `overridebroadway` as measured 2026-08-19), which then doubles as canary + first wave.
+- **Per-consumer config idiosyncrasy** → the **most-divergent** repo, read off the current table rather than from memory, which then doubles as canary + first wave. Divergence is not one signal, and only one of them is currently measured: the 2026-08-19 measurement below covers **`scripts/ci/` kit divergence only**, and on that signal the ranking is `gaycruisebingo` (two hand-patched kit files) then `nathanpaynedotcom` (one). The tier-1 rationales — overridebroadway's bespoke `path_instructions`, nathanpaynedotcom's `tools.eslint.enabled: false` override and churn — are **config** signals that no dated measurement currently backs; they are carried forward from earlier review rounds. So pick on the kit signal when the change is a kit change, and re-measure the config signal before ranking on it ([§ Measuring tier membership](#measuring-tier-membership) covers the kit axis; the config axis needs its own pass).
 - **A consumer's own first sync** → that consumer, for that wave only. A repo whose enrolment backlog has never been reconciled is the highest-risk repo to exercise on the wave that reconciles it, because its wave PR is the first thing to distinguish real local modifications from missed upstream fixes. This is a per-wave reason like the others; it is **not** a licence to hold the fleet, and the fan-out is gated on the canary going green plus the wave audit, never on any particular repo's membership in a tier.
 
 Only fan out (`--sync-all`) once the canary's `lint` is green **and the wave audit below has cleared (or is recorded as unavailable)**; the remaining consumers re-use the cleared invariant instead of each re-discovering the problem.
@@ -96,16 +96,24 @@ The canary keeps the full advisory CodeRabbit pass — open it **without** `--co
 
 ## Measuring tier membership
 
-The ordering table is a heuristic, but the signals behind it are observable, and a row is only worth trusting while its signal still reproduces. The cheapest full measurement compares each consumer's `scripts/ci/` kit tree against the hub's, by blob sha — identical sha means byte-identical content, so no file needs to be fetched:
+The ordering table is a heuristic, but the signals behind it are observable, and a row is only worth trusting while its signal still reproduces. The cheapest full measurement compares each consumer's `scripts/ci/` kit tree against the hub's without fetching a single file, by comparing the **git tree entry** — `mode`, `type` and object id — exactly as `scripts/workflow/verify-propagation-pr.sh` does. Compare the whole tuple, not the object id alone: an exec-bit flip leaves the blob identical while the propagation verifier rejects it, so a blob-only comparison reports parity on drift the wave will fail on. The kit is genuinely mixed — at `main` it is 67 `100755` entries and 47 `100644` — so "they're all executable anyway" is not available as a shortcut.
+
+Pin both sides to an **immutable ref**. `origin/main` and a consumer's `HEAD` both move, so a measurement taken against them is not re-derivable a day later — which matters here, because the point of the exercise is to check whether a dated claim still holds. Resolve the refs first, then measure:
 
 ```bash
-# Hub side: every kit path and its blob sha at the ref you are propagating from.
-git ls-tree -r origin/main scripts/ci/ | awk '{print $3"\t"$4}' | sort -k2
+HUB_REF=<hub sha>          # the commit you are propagating FROM, not origin/main
+CONSUMER_REF=<sha>         # that consumer's commit, not HEAD
 
-# Consumer side, per repo: the same list, one API call.
-gh api "repos/nathanjohnpayne/<consumer>/git/trees/HEAD?recursive=1" \
-  --jq '.tree[] | select(.type=="blob") | select(.path | startswith("scripts/ci/")) | .sha + "\t" + .path' | sort -k2
+# Hub side: mode, type, oid and path for every kit entry at HUB_REF.
+git ls-tree -r "$HUB_REF" scripts/ci/ | sort -k4
+
+# Consumer side, per repo: the same tuple, one API call.
+gh api "repos/nathanjohnpayne/<consumer>/git/trees/$CONSUMER_REF?recursive=1" \
+  --jq '.tree[] | select(.type=="blob") | select(.path | startswith("scripts/ci/"))
+        | [.mode, .type, .sha, .path] | @tsv' | sort -k4
 ```
+
+**Resolving the last synced hub sha** (the `HUB_REF` for a "has this consumer drifted since its last wave?" comparison): `scripts/sync-to-downstream.sh` records it in two places on every sync PR it opens — the branch name `mergepath-sync/sync-all-<sha7>`, and a `Source: https://github.com/nathanjohnpayne/mergepath/commit/<sha>` line in the PR body. Read it off that consumer's most recent merged sync PR rather than assuming the fleet shares one; they usually do, but a consumer that reached parity through the bootstrap template mirror has **no** sync PR at all, and for that repo the bootstrap commit is the honest baseline.
 
 Comparing the two lists sorts every kit path into three buckets per consumer — byte-identical, differing, and absent — and it is the **shape** of those buckets, not the counts alone, that carries the signal:
 
@@ -113,7 +121,7 @@ Comparing the two lists sorts every kit path into three buckets per consumer —
 - **Differing everywhere, same paths** → the same thing seen from the other side: the fleet is pinned to an older wave payload. Confirm by re-comparing against the last synced hub sha, where those paths should come back byte-identical.
 - **Differing on a path only some consumers differ on** → the real per-consumer idiosyncrasy signal, and the only bucket that justifies a divergence-based tier. Read the diff before ranking on it: a hand-patched kit file (the thing a verbatim mirror clobbers) is a genuine wave risk, while a file that merely lags is not.
 
-The 2026-08-19 measurement is what retired the wave-0 premise. Against hub `main`, all nine consumers produced the **identical** bucket signature — the same 4 kit paths absent, the same 23 differing, 87 byte-identical — so no consumer was individually divergent on the kit at all. Re-comparing against the last synced hub sha resolved the third bucket: seven consumers were byte-exact across all 110 kit paths, `nathanpaynedotcom` differed on one, and `gaycruisebingo` on two. That two-file margin is the entire measured basis for its position in the table, and it is a fraction of what "the largest unaudited accumulated drift" claimed.
+The 2026-08-19 measurement is what retired the wave-0 premise. Against hub `main`, all nine consumers produced the **identical** bucket signature — the same 4 kit paths absent, the same 23 differing, 87 byte-identical — so no consumer was individually divergent on the kit at all. Re-comparing against the last synced hub sha resolved the third bucket: seven consumers were byte-exact across all 110 kit paths, `nathanpaynedotcom` differed on one, and `gaycruisebingo` on two. That two-file margin is the entire measured basis for its position in the table, and it is a fraction of what "the largest unaudited accumulated drift" claimed. Re-run with the full mode+type+oid tuple rather than the object id alone, every number above is unchanged and no consumer carries mode-only drift on any kit path — so the exec-bit hazard the tuple comparison exists to catch is a real failure mode that simply is not firing on this fleet today, which is a thing worth re-checking rather than assuming.
 
 ## Maintenance
 
