@@ -6,11 +6,11 @@ The `repo-lint` workflow preserves one stable required context named `lint` whil
 
 ## Event contract
 
-Pull-request heads run through `pull_request` only. Feature-branch pushes do not start a second copy of `repo-lint`, Markdown prose wrapping, or OWL validation. A `push` run is retained for `main`, and pull-request concurrency cancels an older in-progress head when a newer commit arrives. Scheduled and manually dispatched `repo-lint` runs always execute deep CI.
+Pull-request heads run through `pull_request` only. Feature-branch pushes do not start a second copy of `repo-lint`, Markdown prose wrapping, or OWL validation. A `push` run is retained for `main`, and pull-request concurrency cancels an older in-progress head when a newer commit arrives. Scheduled and manually dispatched `repo-lint` runs execute deep CI in Mergepath and in consumers that carry the canonical `scripts/ci/` kit; kit-less consumers have no deep implementation to execute.
 
 ## Scope classifier
 
-`scripts/ci/repo-lint-scope.sh` is the single scope decision. A pull request enters deep CI when it changes CI workflows, scripts, tests, specifications, rules, agent operating documentation, architecture decisions, either repository manifest, `AGENTS.md`, `REVIEW_POLICY.md`, or `ai_agent_tooling_standard.md`. Other pull requests use the fast lane. An unreadable pull-request diff fails closed to deep CI, and every non-pull-request event is deep once the canonical `scripts/ci/` kit is present. During first-wave consumer bootstrap skew, a checkout without that kit emits `deep=false` because it has no deep check implementation to execute; the hub fails instead of taking this exception.
+`scripts/ci/repo-lint-scope.sh` is the single scope decision. A pull request enters deep CI when it changes CI workflows, scripts, tests, specifications, rules, agent operating documentation, architecture decisions, either repository manifest, `AGENTS.md`, `REVIEW_POLICY.md`, or `ai_agent_tooling_standard.md`. Other pull requests use the fast lane. An unreadable pull-request diff fails closed to deep CI, and every non-pull-request event is deep once the canonical `scripts/ci/` kit is present. A consumer checkout that intentionally or temporarily lacks that kit emits `deep=false` because it has no deep check implementation to execute; the hub fails instead of taking this exception.
 
 This path classifier intentionally begins conservatively. It may run more deep CI than a future machine-readable wrapper dependency graph would require, but it must not skip a regression net after its implementation, fixtures, propagation contract, or governance inputs change.
 
