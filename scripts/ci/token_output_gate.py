@@ -273,8 +273,11 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     non-numeric one in its own stderr diagnostic -- `exit`, `return`, `shift`,
     `break`, `continue`, `ulimit`, `wait`, `history`, `kill`.  Membership is
     oracle-decided; the near neighbours that stay silent (`let`, `umask`,
-    `read`, `getopts`, `fc`) are MUST_NOT_FLAG cases.  The BOUNDARY is the
-    operand's TYPE, not the fact of a diagnostic: `type`, `cd`, `hash`,
+    positional `read`, `getopts`, `fc`) are MUST_NOT_FLAG cases.  Numeric
+    option operands of `read` / `mapfile` / `readarray` and numeric operands
+    of `test` / `[` take the same rule through their parsed positions.  A
+    `read -p` operand is also output when stdin is a terminal.  The BOUNDARY
+    is the operand's TYPE, not the fact of a diagnostic: `type`, `cd`, `hash`,
     `alias`, `pushd`, `dirs`, `shopt` and the external `ls`, `cat`, `rm`,
     `git`, `grep` all reproduce a bad operand too, and all of them take a NAME
     or a PATH whose validity is run-time state.  Those are
@@ -446,20 +449,22 @@ does not catch:
     operand is the only thing in the source text that names the file.
     Deliberate: reading every non-literal operand as a write would red the
     ordinary logging idiom on a required fleet-wide check.
-  * A token reaching an interpreter that then prints it (`bash -c ...`,
-    `python3 -c ...`, `awk -v ...`, a `bash <<EOF` here-doc).
+  * A token reaching an interpreter through SOURCE TEXT that then prints it
+    (`bash -c ...`, `python3 -c ...`, `awk -v ...`, a `bash <<EOF` here-doc).
+    A literal shell SCRIPT operand is different: `bash scripts/leak.py`
+    promotes `leak.py` into discovery and scans it as shell whatever its name.
   * Any file this check does not scan: everything outside scripts/** and
     tests/**, and a non-shell file inside them that no scanned shell file
-    SOURCES by a LITERAL operand.  A sourced fragment IS read whatever it is
-    called -- `. ./lib.env` runs `lib.env` in the sourcing shell -- but the
-    operand is resolved, never the candidate's contents, so `. "$LIB/x.env"`
-    leaves that fragment unread.  Deciding by contents would mean deciding
-    which `.env` files are shell, on a check that publishes the required
-    `lint` context for nine repositories.  Also not a construct: the
-    file-selection axis pins WHICH files are read, not what a leak inside an
-    unread one looks like, so there is no CORPUS case behind this one -- the
-    assertions live in `_source_promotion_cases`, which measures the sourcing
-    script under bash end to end.
+    SOURCES or invokes through a shell interpreter by a LITERAL operand.  A
+    sourced/invoked fragment IS read whatever it is called, but the operand is
+    resolved, never the candidate's contents, so `. "$LIB/x.env"` and
+    `bash "$SCRIPT"` leave that fragment unread.  Deciding by contents would
+    mean deciding which `.env`/`.py` files are shell, on a check that publishes
+    the required `lint` context for nine repositories.  Also not a construct:
+    the file-selection axis pins WHICH files are read, not what a leak inside
+    an unread one looks like, so there is no CORPUS case behind this one -- the
+    assertions live in `_shell_file_promotion_cases`, which measures the
+    executing script under bash end to end.
 
 CONSERVATISM RUNS THE OTHER WAY IN A SHORT LIST, also measured, and
 `KNOWN_BROADER` -- printed on every `--self-test` run -- is the authoritative
@@ -600,7 +605,7 @@ READS, and every branch that cannot establish it is FATAL, not skipped:
 
 Every bullet above is asserted: the shebang one in `_shebang_cases` and
 `_file_selection_cases`, the source-promotion one in
-`_source_promotion_cases`, the rest in `_discovery_failure_cases`.  Each
+`_shell_file_promotion_cases`, the rest in `_discovery_failure_cases`.  Each
 assertion added in #1032 round 3 was checked by DELETING the branch it covers
 and confirming the suite goes red.
 
@@ -624,6 +629,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -702,8 +708,9 @@ STDIN_ECHOERS = frozenset({"cat", "tee"})
 # stops here.
 SAFE_COMMANDS = frozenset(
     {
-        # conditionals and word-consuming keywords -- these read the value,
-        # they never write it
+        # conditionals and word-consuming keywords.  Numeric `test` / `[`
+        # operands are decided before classification; the remaining positions
+        # read the value and do not write it.
         "[", "[[", "test", "case", "for", "((",
         # binding forms
         "local", "export", "readonly", "declare", "typeset", "unset", "read",
@@ -722,20 +729,19 @@ SAFE_COMMANDS = frozenset(
 # universally safe made `--scan` report PASS on a live stderr leak (#1032
 # round 4 P1).  The membership is oracle-DECIDED, not guessed: every builtin
 # below was measured putting the sentinel on a stream, and the near neighbours
-# that do NOT -- `let`, `umask`, `read`, `getopts`, `fc`, and every binding
-# form and conditional in SAFE_COMMANDS -- were measured clean and are
+# that do NOT -- `let`, `umask`, positional `read`, `getopts`, `fc`, binding
+# forms, and non-numeric conditional positions -- were measured clean and are
 # deliberately absent, each pinned by a MUST_NOT_FLAG corpus case.  A
 # credential-named operand is what fires this; `exit "$rc"` names no
 # credential and is not a reference at all.
-# `read` OPTIONS that require a numeric operand.  `read` itself stays in
-# SAFE_COMMANDS and stays OUT of NUMERIC_OPERAND_DIAGNOSTIC, and both of those
-# remain correct for the POSITIONAL operand: `read "$GH_TOKEN"` treats the
-# value as a VARIABLE NAME, and bash writes no diagnostic naming it unless the
-# name is invalid -- measured clean, and pinned by `read-path-idiom`.
+# OPTIONS that require a numeric operand.  The commands themselves stay out of
+# NUMERIC_OPERAND_DIAGNOSTIC because their POSITIONAL operands are not all
+# numeric: `read "$GH_TOKEN"` treats the value as a variable name, while
+# `mapfile values` names an array.  The leak is in these option positions.
 #
-# The leak is in a different POSITION.  These four options take a timeout, a
-# character count or a file descriptor, so a credential can never be a valid
-# operand and bash reproduces it verbatim on stderr:
+# These options take a timeout, count, origin, quantum or file descriptor, so
+# a credential can never be a valid operand and bash reproduces it verbatim on
+# stderr:
 #
 #     $ read -t "$GH_TOKEN" x </dev/null
 #     bash: read: Zq7Xf2Lp9Vt4Rk8Nb3Md6Wc1Ys5Hj0Gr: invalid timeout specification
@@ -743,10 +749,24 @@ SAFE_COMMANDS = frozenset(
 # So this is the `NUMERIC_OPERAND_DIAGNOSTIC` rule reached through an option
 # rather than a command word, and it is decided by the same test -- the
 # operand TYPE is numeric, so a credential is never valid and the diagnostic
-# is certain.  Measured on all four (#1032 round 6 P1); classifying every
-# `read` invocation non-emitting made `--scan` report PASS on a live stderr
-# leak, the same shape `exit`/`return`/`shift` had in round 4.
-READ_NUMERIC_OPTS = frozenset({"-t", "-n", "-N", "-u"})
+# is certain.  Keep the option grammar in one table: `read` landed first and a
+# command-specific parser left the identical `mapfile` / `readarray` path
+# invisible (#1032 fresh Codex P1 after round 9).
+NUMERIC_OPTION_LETTERS = {
+    "read": frozenset({"t", "n", "N", "u"}),
+    "mapfile": frozenset({"n", "O", "s", "c", "u"}),
+    "readarray": frozenset({"n", "O", "s", "c", "u"}),
+}
+# Every short option that consumes an operand for the same builtins.  The
+# scanner must step over non-target operands too: `read -d x -p "$PAT"` and
+# `mapfile -d x -n "$PAT"` are valid, and stopping at `x` would hide the later
+# output/numeric option.
+SHORT_OPTION_OPERAND_LETTERS = {
+    "read": frozenset({"a", "d", "i", "n", "N", "p", "t", "u"}),
+    "mapfile": frozenset({"d", "n", "O", "s", "u", "C", "c"}),
+    "readarray": frozenset({"d", "n", "O", "s", "u", "C", "c"}),
+}
+TEST_NUMERIC_OPERATORS = frozenset({"-eq", "-ne", "-lt", "-le", "-gt", "-ge"})
 NUMERIC_OPERAND_DIAGNOSTIC = frozenset(
     {
         "exit", "return", "shift", "break", "continue", "ulimit", "wait",
@@ -2384,37 +2404,93 @@ def classify(seg, emitter_helpers):
     return SAFE  # an external command: see "does NOT catch" in the header
 
 
-def _read_numeric_option_operand(seg, name):
-    """Is `name` the operand of a numeric `read` option in this segment?
+def _short_option_operand_has_ref(seg, name, option_letters):
+    """Does a short option in `option_letters` receive credential `name`?
 
-    Handles the SEPARATE spelling (`read -t "$PAT"`) and the ATTACHED one
-    (`read -t"$PAT"`), because bash accepts both.  A bundle (`read -rt "$PAT"`)
-    puts the operand on the LAST option in the bundle, which is why the test
-    is on the final character rather than on the whole word.
+    Handles separate, attached and bundled spellings for every builtin that
+    uses the ordinary short-option grammar: `read -rt "$PAT"`,
+    `read -t"$PAT"`, and `mapfile -n"$PAT"`.  The earlier read-only helper
+    both duplicated the command boundary and failed to see attached bundled
+    operands because the expansion made literal reduction return None.
     """
-    words = list(seg.words)[1:]
-    for i, w in enumerate(words):
+    words = list(seg.words)
+    command, _redir = resolve_command(seg)
+    for command_idx, word in enumerate(words):
+        lit = _unquote_command_word(word)
+        if lit is not None and _basename(lit) == command:
+            break
+    else:
+        return False
+    words = words[command_idx + 1 :]
+    all_operand_letters = SHORT_OPTION_OPERAND_LETTERS.get(
+        command, frozenset(option_letters)
+    )
+    i = 0
+    while i < len(words):
+        w = words[i]
         lit = _unquote_command_word(w)
-        # `_unquote_command_word` returns None for a word carrying an
-        # expansion, which is EXACTLY the attached spelling this has to read
-        # (`read -t"$PAT"`).  The option letters are the literal PREFIX of the
-        # word either way, so the raw word is the right probe when the
-        # reduction declines -- dropping it here read the attached spelling as
-        # "not an option" and let it through.
-        probe = lit if lit is not None else w
+        has_ref = name in _iter_refs(w)
+        if lit is None:
+            # Only the literal prefix before the first expansion can contain
+            # option letters.  Quotes around the attached operand are syntax,
+            # not part of the option: `-rt"$PAT"` reduces to prefix `-rt`.
+            cut = len(w)
+            for marker in ("$", "`"):
+                pos = w.find(marker)
+                if pos >= 0:
+                    cut = min(cut, pos)
+            probe = re.sub(r"[\\'\"]", "", w[:cut])
+        else:
+            probe = lit
+        if probe == "--":
+            break
         if not probe.startswith("-") or probe.startswith("--"):
-            continue
-        body = probe[1:]
-        if not body:
-            continue
-        # `-t5` / `-tVALUE`: operand attached to this very word.  The literal
-        # loses the expansion, so the reference test runs on the RAW word.
-        if len(body) > 1 and ("-" + body[0]) in READ_NUMERIC_OPTS:
-            if name in _iter_refs(w):
+            break
+        letters = probe[1:]
+        if not letters:
+            break
+        consumed_operand = False
+        for pos, letter in enumerate(letters):
+            if letter not in all_operand_letters:
+                continue
+            # Everything after an argument-taking option letter is its
+            # attached operand.  If the same word carries the reference, the
+            # credential is part of that operand; otherwise a literal operand
+            # is already attached and later words are not option arguments.
+            if pos + 1 < len(letters):
+                if letter in option_letters and has_ref:
+                    return True
+                consumed_operand = True
+                break
+            if letter in option_letters and has_ref:
                 return True
+            if i + 1 < len(words):
+                if letter in option_letters and name in _iter_refs(words[i + 1]):
+                    return True
+                i += 2
+            else:
+                i += 1
+            consumed_operand = True
+            break
+        if consumed_operand:
+            if pos + 1 < len(letters):
+                i += 1
             continue
-        if ("-" + body[-1]) in READ_NUMERIC_OPTS and i + 1 < len(words):
-            if name in _iter_refs(words[i + 1]):
+        i += 1
+    return False
+
+
+def _test_numeric_operand(seg, name):
+    """Is `name` beside a numeric operator in `test` or `[`?"""
+    words = list(seg.words)
+    for i, word in enumerate(words):
+        if _unquote_command_word(word) not in TEST_NUMERIC_OPERATORS:
+            continue
+        for operand_idx in (i - 1, i + 1):
+            if (
+                0 <= operand_idx < len(words)
+                and name in _iter_refs(words[operand_idx])
+            ):
                 return True
     return False
 
@@ -2432,10 +2508,25 @@ def reaches_output(ref, emitter_helpers):
         )
     if ref.seg is not None and not ref.in_assign_prefix:
         rcmd, _rredir = resolve_command(ref.seg)
-        if rcmd == "read" and _read_numeric_option_operand(ref.seg, ref.name):
+        numeric_options = NUMERIC_OPTION_LETTERS.get(rcmd)
+        if numeric_options and _short_option_operand_has_ref(
+            ref.seg, ref.name, numeric_options
+        ):
             return True, (
-                "the operand of a numeric `read` option (-t/-n/-N/-u), which "
-                "bash reproduces verbatim on stderr when it is not a number"
+                "the operand of a numeric `%s` option, which bash reproduces "
+                "verbatim on stderr when it is not a number" % rcmd
+            )
+        if rcmd == "read" and _short_option_operand_has_ref(
+            ref.seg, ref.name, frozenset({"p"})
+        ):
+            return True, (
+                "the operand of `read -p`, which bash writes verbatim as a "
+                "prompt when standard input is a terminal"
+            )
+        if rcmd in ("test", "[") and _test_numeric_operand(ref.seg, ref.name):
+            return True, (
+                "an operand of a numeric `%s` comparison, which bash "
+                "reproduces verbatim on stderr when it is not an integer" % rcmd
             )
     if ref.in_assign_prefix:
         # `GH_TOKEN="$PAT" cmd ...` puts the value in the child's ENVIRONMENT.
@@ -3123,16 +3214,15 @@ def _xtrace_delta(ll, in_function):
 
 def _shebang_enables_xtrace(text):
     first = text.split("\n", 1)[0]
-    if not first.startswith("#!"):
-        return False
-    if resolve_shebang(first) not in SHELL_INTERPRETERS:
+    argv = _resolved_shebang_argv(first)
+    if not argv or _basename(argv[0]) not in SHELL_INTERPRETERS:
         return False
     # `-o xtrace` is a PAIR, and bash accepts it on a `#!` line through
     # `env -S`.  Scanning only for an `x` inside a short-option word missed
     # `#!/usr/bin/env -S bash -o xtrace`, which starts the script traced, so
     # every later reference went to stderr expanded under a PASS (#1032
     # round 7 P1).
-    words = first[2:].split()[1:]
+    words = argv[1:]
     i = 0
     while i < len(words):
         w = words[i]
@@ -3301,8 +3391,16 @@ def scan_text(text, path="<text>", _depth=0):
 _ENV_OPTS_WITH_ARG = {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
 
 
-def resolve_shebang(first_line):
-    """Return the interpreter basename a `#!` line resolves to, or None.
+def _split_env_string(value):
+    """Split one GNU `env -S` string, including its quote removal."""
+    try:
+        return shlex.split(value, comments=False, posix=True)
+    except ValueError:
+        return None
+
+
+def _resolved_shebang_argv(first_line):
+    """Return the resolved interpreter argv from a `#!` line, or None.
 
     `None` means "this line named no interpreter I can resolve", and the
     caller then falls through to the extension and finally to SCANNING the
@@ -3316,15 +3414,30 @@ def resolve_shebang(first_line):
     line = first_line.rstrip("\n").rstrip("\r")
     if not line.startswith("#!"):
         return None
-    argv = line[2:].strip().split()
+    raw = line[2:].strip()
+    argv = raw.split()
     if not argv:
         return None
+    # Quote removal belongs to `env -S`, not to the kernel's ordinary shebang
+    # parsing.  `#!/bin/bash '-x'` hands bash literal quote bytes and must not
+    # be mistaken for xtrace; `#!/usr/bin/env -S bash '-x'` asks env to remove
+    # them and does enable it.
+    if _basename(argv[0]) == "env" and any(
+        word == "-S"
+        or word.startswith("-S")
+        or word == "--split-string"
+        or word.startswith("--split-string=")
+        for word in argv[1:]
+    ):
+        argv = _split_env_string(raw)
+        if not argv:
+            return None
     guard = 4
     while guard > 0:
         guard -= 1
         base = _basename(argv[0])
         if base != "env":
-            return base
+            return argv
         argv = argv[1:]
         # consume env's own options and assignments
         while argv:
@@ -3346,15 +3459,26 @@ def resolve_shebang(first_line):
             # model still falls to the `-`-prefixed branch below and returns
             # None, which is the fail-safe answer, not a skip.
             if a.startswith("--split-string="):
-                argv = a.split("=", 1)[1].split() + argv[1:]
+                split = _split_env_string(a.split("=", 1)[1])
+                if split is None:
+                    return None
+                argv = split + argv[1:]
                 continue
             if a in ("-S", "--split-string"):
                 if len(argv) < 2:
                     return None
-                argv = argv[1].split() + argv[2:]
+                # The whole shebang was quote-decoded above, so the words
+                # following `-S` are already the arguments GNU env produces.
+                # Keeping the original `.split()` here retained quote bytes:
+                # `bash '-x'` launched traced but the scanner looked for `x`
+                # in the literal word `'-x'` and reported clean.
+                argv = argv[1:]
                 continue
             if a.startswith("-S"):
-                argv = a[2:].split() + argv[1:]
+                split = _split_env_string(a[2:])
+                if split is None:
+                    return None
+                argv = split + argv[1:]
                 continue
             if a in _ENV_OPTS_WITH_ARG:
                 if len(argv) < 2:
@@ -3381,6 +3505,12 @@ def resolve_shebang(first_line):
         if not argv:
             return None
     return None
+
+
+def resolve_shebang(first_line):
+    """Return the interpreter basename a `#!` line resolves to, or None."""
+    argv = _resolved_shebang_argv(first_line)
+    return _basename(argv[0]) if argv else None
 
 
 def classify_file(path):
@@ -3440,15 +3570,79 @@ def classify_file(path):
     return "shell"
 
 
-def source_operands(text):
-    """LITERAL operands of `.` / `source` in this text.
+def _command_index(words, commands):
+    """Index of the resolved command word in `words`, or None."""
+    for idx, word in enumerate(words):
+        lit = _unquote_command_word(word)
+        if lit is not None and _basename(lit) in commands:
+            return idx
+    return None
 
-    A sourced file is executed by the sourcing shell, so it is shell no matter
-    what it is called.  The operand is the only thing in the source TEXT that
-    says which file that is, which is why this resolves the OPERAND rather
-    than sniffing the candidate's contents: a content heuristic would have to
-    decide that some `.env` files are shell and others are not, on a check
-    that publishes the required `lint` context for nine consumers.
+
+def _command_arguments(words, start):
+    """Yield `(raw, literal)` arguments after shell redirections."""
+    skip_next = False
+    for word in words[start:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if word in ("{", "}", "<<"):
+            continue
+        if word == "<<<":
+            skip_next = True
+            continue
+        match = _REDIR_RE.match(word)
+        if match:
+            if match.end() == len(word):
+                skip_next = True
+            continue
+        yield word, _unquote_command_word(word)
+
+
+def _interpreter_script_operand(arguments):
+    """Return a literal script operand from shell-interpreter arguments."""
+    skip_next = False
+    options = True
+    for _raw, lit in arguments:
+        if skip_next:
+            skip_next = False
+            continue
+        if options and lit == "--":
+            options = False
+            continue
+        if options and (
+            lit in ("-c", "-s", "--command", "--stdin")
+            or (
+                lit
+                and lit.startswith("-")
+                and not lit.startswith("--")
+                and ({"c", "s"} & set(lit[1:]))
+            )
+        ):
+            # `-c` takes shell TEXT and `-s` reads stdin.  Later words are $0
+            # / positional parameters, never script paths.
+            return None
+        if options and lit in (
+            "-o", "+o", "-O", "+O", "--rcfile", "--init-file"
+        ):
+            skip_next = True
+            continue
+        if options and lit and (lit.startswith("-") or lit.startswith("+")):
+            continue
+        # The first non-option word is the script.  An expansion is not a
+        # literal path and remains a declared discovery residue.
+        return lit
+    return None
+
+
+def shell_file_operands(text):
+    """Return `(literal path, invoking dialect)` for executed shell files.
+
+    `.` / `source` return dialect None because they inherit the caller.  A
+    literal interpreter invocation returns its named dialect: `bash leak.py`
+    executes shell source even though the extension table calls the operand
+    Python.  Discovery previously promoted only sourced fragments and silently
+    skipped this equivalent execution path (#1032 fresh Codex P1).
 
     An operand carrying an expansion (`. "$LIB_DIR/common.sh"`) is not a
     literal and is skipped -- a declared residue, not a guess.
@@ -3465,44 +3659,32 @@ def source_operands(text):
     for ll in lx.logical:
         for seg in ll.segments:
             cmd, _redir = resolve_command(seg)
-            if cmd not in (".", "source"):
+            if cmd not in (".", "source") and cmd not in SHELL_INTERPRETERS:
                 continue
             words = list(seg.words)
-            idx = 0
-            while idx < len(words):
-                lit = _unquote_command_word(words[idx])
-                if lit is not None and _basename(lit) in (".", "source"):
-                    break
-                idx += 1
-            else:
+            idx = _command_index(words, frozenset({cmd}))
+            if idx is None:
                 continue
-            skip_next = False
-            saw_terminator = False
-            for w in words[idx + 1 :]:
-                if skip_next:
-                    skip_next = False
-                    continue
-                if w in ("{", "}", "<<"):
-                    continue
-                if w == "<<<":
-                    skip_next = True
-                    continue
-                m = _REDIR_RE.match(w)
-                if m:
-                    if m.end() == len(w):
-                        skip_next = True
-                    continue
-                lit = _unquote_command_word(w)
-                if lit == "--" and not saw_terminator:
-                    # The option terminator, not the file.  Quoted spellings
-                    # reach the builtin the same way, which is why the test is
-                    # on the unquoted literal rather than on the raw word.
-                    saw_terminator = True
-                    continue
+            arguments = list(_command_arguments(words, idx + 1))
+            if cmd in (".", "source"):
+                saw_terminator = False
+                for _raw, lit in arguments:
+                    if lit == "--" and not saw_terminator:
+                        saw_terminator = True
+                        continue
+                    if lit:
+                        out.append((lit, None))
+                    break
+            else:
+                lit = _interpreter_script_operand(arguments)
                 if lit:
-                    out.append(lit)
-                break
+                    out.append((lit, cmd))
     return out
+
+
+def source_operands(text):
+    """Compatibility view used by the direct source-operand assertions."""
+    return [path for path, dialect in shell_file_operands(text) if dialect is None]
 
 
 def _read_text(path):
@@ -3586,12 +3768,13 @@ def discover_shell_files(root):
                 if kind == "shell":
                     shell.append(p)
 
-    # A file this walk called non-shell but a shell file SOURCES is shell:
-    # `. ./lib.env` runs `lib.env` in the sourcing shell, and the extension
-    # table said `.env` was configuration (#1032 F8).  Resolved to a fixed
-    # point, because a promoted fragment can source another.
+    # A file this walk called non-shell but a shell file EXECUTES is shell:
+    # `. ./lib.env` and `bash ./lib.py` both run their operand as shell source,
+    # whatever the extension table said.  Resolved to a fixed point, because a
+    # promoted fragment can execute another.
     pending = list(shell)
     promoted = set()
+    unmodelled_promotions = set()
     while pending:
         origin = pending.pop()
         try:
@@ -3599,7 +3782,7 @@ def discover_shell_files(root):
         except OSError as exc:
             errors.append("%s: unreadable: %s" % (origin, exc))
             continue
-        for operand in source_operands(text):
+        for operand, dialect in shell_file_operands(text):
             for cand in (
                 os.path.join(os.path.dirname(origin), operand),
                 os.path.join(root, operand),
@@ -3609,8 +3792,20 @@ def discover_shell_files(root):
                 except OSError:
                     continue
                 entry = walked.get(key)
-                if entry is None or entry[1] == "shell" or key in promoted:
+                if entry is None:
                     continue
+                if dialect in UNMODELLED_SHELL_DIALECTS:
+                    marker = (key, dialect)
+                    if marker not in unmodelled_promotions:
+                        unmodelled_promotions.add(marker)
+                        errors.append(
+                            "%s: executed through %s, a dialect whose output "
+                            "builtins this gate does not model -- refusing to "
+                            "report a clean tree over the promoted file"
+                            % (entry[0], dialect)
+                        )
+                if entry[1] == "shell" or key in promoted:
+                    break
                 promoted.add(key)
                 shell.append(entry[0])
                 pending.append(entry[0])
@@ -5097,6 +5292,25 @@ CORPUS = [
         MUST_NOT_FLAG,
         'read -d "$GH_TOKEN" v <<< x\necho ok\n',
     ),
+    # `read -p` is terminal-conditional output.  The differential oracle runs
+    # without a tty, so these two cases are declared scanner-broader below;
+    # the rule is pinned here in both spellings and the P1 reproduction was
+    # independently measured under a pseudo-terminal on bash 5.2/5.3.
+    (
+        "read-prompt-separate",
+        MUST_FLAG,
+        'read -p "$GH_TOKEN" value </dev/null || :\necho ok\n',
+    ),
+    (
+        "read-prompt-attached",
+        MUST_FLAG,
+        'read -p"$GH_TOKEN" value </dev/null || :\necho ok\n',
+    ),
+    (
+        "read-prompt-after-delimiter",
+        MUST_FLAG,
+        'read -d x -p "$GH_TOKEN" value </dev/null || :\necho ok\n',
+    ),
     # --- `kill`, and the BOUNDARY of the numeric-operand class -----------
     ("numeric-kill", MUST_FLAG, 'kill "$GH_TOKEN" || :\necho ok\n'),
     (
@@ -5303,6 +5517,77 @@ def _generated_corpus():
                 # than padded
                 continue
             out.append(("gen-clean-%s-r%d" % (name, ri), MUST_NOT_FLAG, tmpl % ref))
+    # Numeric option operands on mapfile/readarray and both sides of every
+    # numeric `test`/`[` comparison are one rule each, not ten hand-selected
+    # spellings.  Generate the complete finite option/operator tables so a
+    # later edit cannot make the prose wider than the oracle corpus.
+    for command in ("mapfile", "readarray"):
+        for option in sorted(NUMERIC_OPTION_LETTERS[command]):
+            out.append(
+                (
+                    "gen-%s-numeric-option-%s" % (command, option),
+                    MUST_FLAG,
+                    '%s -%s "$GH_TOKEN" values </dev/null || :\necho ok\n'
+                    % (command, option),
+                )
+            )
+        out.append(
+            (
+                "gen-%s-numeric-option-attached" % command,
+                MUST_FLAG,
+                '%s -n"$GH_TOKEN" values </dev/null || :\necho ok\n' % command,
+            )
+        )
+        out.append(
+            (
+                "gen-%s-numeric-option-after-delimiter" % command,
+                MUST_FLAG,
+                '%s -d x -n "$GH_TOKEN" values </dev/null || :\necho ok\n'
+                % command,
+            )
+        )
+        out.extend(
+            [
+                (
+                    "gen-%s-numeric-option-wrapped" % command,
+                    MUST_FLAG,
+                    'command %s -n "$GH_TOKEN" values </dev/null || :\necho ok\n'
+                    % command,
+                ),
+                (
+                    "gen-%s-nonnumeric-delimiter" % command,
+                    MUST_NOT_FLAG,
+                    '%s -d "$GH_TOKEN" values </dev/null || :\necho ok\n'
+                    % command,
+                ),
+            ]
+        )
+    for command, close in (("test", ""), ("[", " ]")):
+        label = "test" if command == "test" else "bracket"
+        for operator in sorted(TEST_NUMERIC_OPERATORS):
+            out.extend(
+                [
+                    (
+                        "gen-%s-numeric-%s-left" % (label, operator[1:]),
+                        MUST_FLAG,
+                        '%s "$GH_TOKEN" %s 1%s || :\necho ok\n'
+                        % (command, operator, close),
+                    ),
+                    (
+                        "gen-%s-numeric-%s-right" % (label, operator[1:]),
+                        MUST_FLAG,
+                        '%s 1 %s "$GH_TOKEN"%s || :\necho ok\n'
+                        % (command, operator, close),
+                    ),
+                ]
+            )
+        out.append(
+            (
+                "gen-%s-string-test" % label,
+                MUST_NOT_FLAG,
+                '%s -n "$GH_TOKEN"%s || :\necho ok\n' % (command, close),
+            )
+        )
     return out
 
 
@@ -5433,6 +5718,23 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "read-prompt-separate": (
+        "`read -p` writes its prompt only when standard input is a terminal. "
+        "The differential oracle deliberately captures non-interactive "
+        "streams, where bash writes nothing, while an independently measured "
+        "pseudo-terminal run writes the credential verbatim.  The required "
+        "gate therefore flags the source spelling in every environment"
+    ),
+    "read-prompt-attached": (
+        "the attached spelling of the terminal-conditional `read -p` prompt; "
+        "same pseudo-terminal evidence and fail-closed choice as "
+        "`read-prompt-separate`"
+    ),
+    "read-prompt-after-delimiter": (
+        "the terminal-conditional `read -p` prompt after another option's "
+        "operand; same pseudo-terminal evidence and fail-closed choice as "
+        "`read-prompt-separate`"
+    ),
     "shadowed-emitter-noop": (
         "a same-file function can shadow an emitter builtin and write nothing, "
         "but a textual definition is not proof that the definition EXECUTED "
@@ -5941,7 +6243,7 @@ def self_test():
         failures.extend(_unmodelled_dialect_cases(tmp))
         failures.extend(_shebang_xtrace_cases())
         failures.extend(_discovery_failure_cases(tmp))
-        failures.extend(_source_promotion_cases(tmp))
+        failures.extend(_shell_file_promotion_cases(tmp))
         failures.extend(_path_independence_case(tmp))
 
     failures.extend(_residue_and_quoted_tmpdir_case())
@@ -6050,6 +6352,7 @@ SHEBANG_CASES = [
     ("#!/bin/sh", "sh"),
     ("#!/usr/bin/env bash", "bash"),
     ("#!/usr/bin/env -S bash -e", "bash"),
+    ("#!/usr/bin/env -S bash '-x'", "bash"),
     ("#!/usr/bin/env -Sbash -e", "bash"),
     ("#!/usr/bin/env --split-string=bash -e", "bash"),
     ("#!/usr/bin/env --split-string bash -e", "bash"),
@@ -6211,10 +6514,13 @@ def _shebang_xtrace_cases():
     failures = []
     for line, want in [
         ("#!/usr/bin/env -S bash -o xtrace", True),
+        ("#!/usr/bin/env -S bash '-x'", True),
+        ('#!/usr/bin/env --split-string="bash \'-x\'"', True),
         ("#!/bin/bash -o xtrace", True),
         ("#!/bin/bash --xtrace", True),
         ("#!/bin/bash -x", True),
         ("#!/bin/bash -ex", True),
+        ("#!/bin/bash '-x'", False),
         ("#!/usr/bin/env -S bash -e", False),
         ("#!/bin/bash -o errexit", False),
         ("#!/bin/bash +o xtrace", False),
@@ -6225,10 +6531,17 @@ def _shebang_xtrace_cases():
         ("#!/bin/bash -o errexit -e", False),
         ("#!/usr/bin/env python3", False),
     ]:
-        got = _shebang_enables_xtrace(line + "\n: \"$GH_TOKEN\"\n")
+        text = line + "\n: \"$GH_TOKEN\"\n"
+        got = _shebang_enables_xtrace(text)
         if got != want:
             failures.append(
                 "shebang-xtrace %r: expected %s, got %s" % (line, want, got)
+            )
+        findings, errors = scan_text(text, "shebang-xtrace/fixture")
+        if bool(findings) != want or errors:
+            failures.append(
+                "shebang-xtrace %r: scan_text flagged=%s errors=%s, expected %s"
+                % (line, bool(findings), errors, want)
             )
     return failures
 
@@ -6610,8 +6923,8 @@ def _discovery_failure_cases(tmp):
     return failures
 
 
-def _source_promotion_cases(tmp):
-    """A file a shell file SOURCES is shell, whatever it is called.
+def _shell_file_promotion_cases(tmp):
+    """A file shell source executes is shell, whatever it is called.
 
     `. ./lib.env` runs `lib.env` in the sourcing shell, so a leak inside it is
     a leak in the sourcing script.  The extension table called `.env`
@@ -6775,6 +7088,80 @@ def _source_promotion_cases(tmp):
             "source promotion: a NON-literal source operand must be left "
             "unresolved rather than guessed at (scanned %d, findings %s)"
             % (count, [str(f) for f in findings])
+        )
+
+    # 5. A literal shell-interpreter operand is the same execution edge as a
+    #    source operand.  The `.py` extension calls this non-shell, but bash
+    #    executes its contents as shell and prints the sentinel.
+    for label, invocation in (
+        ("bash-py", "bash scripts/leak.py"),
+        ("path-bash-py", "/bin/bash scripts/leak.py"),
+        ("wrapped-bash-py", "env bash scripts/leak.py"),
+        ("bash-options-py", "bash -e scripts/leak.py"),
+    ):
+        root = _tree(
+            label,
+            {
+                "scripts/main.sh": "#!/usr/bin/env bash\n" + invocation + "\n",
+                "scripts/leak.py": leak,
+            },
+        )
+        findings, errors, count = scan_tree(root)
+        if count != 2 or not any("leak.py" in f.path for f in findings):
+            failures.append(
+                "interpreter promotion: `%s` must read its literal script "
+                "operand (scanned %d, findings %s, errors %s)"
+                % (invocation, count, [str(f) for f in findings], errors)
+            )
+
+    # `-c` takes shell TEXT.  Its following words are $0/positionals, not
+    # script paths, so a file named there must keep its original classification.
+    root = _tree(
+        "bash-command-string",
+        {
+            "scripts/main.sh": (
+                "#!/usr/bin/env bash\nbash -c 'echo ok' scripts/leak.py\n"
+            ),
+            "scripts/leak.py": leak,
+        },
+    )
+    findings, errors, count = scan_tree(root)
+    if count != 1 or findings:
+        failures.append(
+            "interpreter promotion: `bash -c` positionals must not be guessed "
+            "as script files (scanned %d, findings %s, errors %s)"
+            % (count, [str(f) for f in findings], errors)
+        )
+
+    root = _tree(
+        "bash-stdin",
+        {
+            "scripts/main.sh": "#!/usr/bin/env bash\nbash -s scripts/leak.py </dev/null\n",
+            "scripts/leak.py": leak,
+        },
+    )
+    findings, errors, count = scan_tree(root)
+    if count != 1 or findings:
+        failures.append(
+            "interpreter promotion: `bash -s` positionals must not be guessed "
+            "as script files (scanned %d, findings %s, errors %s)"
+            % (count, [str(f) for f in findings], errors)
+        )
+
+    # A literal invocation through a dialect the scanner cannot model is
+    # still promoted and scanned, but it must also fail closed on that dialect.
+    root = _tree(
+        "zsh-py",
+        {
+            "scripts/main.sh": "#!/usr/bin/env bash\nzsh scripts/leak.py\n",
+            "scripts/leak.py": 'print -r -- "$GH_TOKEN"\n',
+        },
+    )
+    _findings, errors, count = scan_tree(root)
+    if count != 2 or not any("executed through zsh" in e for e in errors):
+        failures.append(
+            "interpreter promotion: an unmodelled invoking dialect must fail "
+            "closed (scanned %d, errors %s)" % (count, errors)
         )
     return failures
 
