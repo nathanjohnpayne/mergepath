@@ -320,6 +320,8 @@ jobs:
           PR_NUMBER: ${{ steps.source.outputs.pr }}
           SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
           CHECK_ID: ${{ steps.persist.outputs.check_id }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+          CHECK_NAME: Codex P1 unresolved threads
         run: |
           set -uo pipefail
           marker_rc=0
@@ -367,11 +369,42 @@ jobs:
               fi
               sleep $((attempt * 5))
             done
+          elif [ -z "$CHECK_ID" ] && [ "$latest_status" != complete ]; then
+            # The relay failed BEFORE `persist` opened its lease — during the
+            # artifact download, the trusted default-branch checkout, handoff
+            # validation, or the lease POST itself. `steps.persist.outputs.
+            # check_id` is then empty, so the branch above closes nothing and
+            # this job's own native check attaches to the default branch, not
+            # to the PR head. An older successful `Codex P1 unresolved threads`
+            # run stays authoritative on the unchanged head until the 15-minute
+            # sweep, and the durable `status=failed` marker posted above is
+            # written with GITHUB_TOKEN, so it triggers no workflow run to
+            # correct it. Publish the terminal failure directly on the head the
+            # source step bound, the same head every other publisher in this
+            # workflow uses (#1000 Codex P1).
+            if [ -z "$HEAD_SHA" ]; then
+              echo "::error::No bound head SHA to publish the relay failure for PR #$PR_NUMBER"
+              close_rc=1
+            else
+              close_rc=1
+              for attempt in 1 2 3; do
+                if gh api --method POST "repos/$REPO/check-runs" \
+                  -f name="$CHECK_NAME" -f head_sha="$HEAD_SHA" \
+                  -f status=completed -f conclusion=failure \
+                  -f "output[title]=Codex feedback gate — trusted read-only relay failed before it opened its lease" \
+                  -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed before it published a PR-head check lease. Rerun the relay before merge; the scheduled sweep also re-evaluates every 15 minutes." \
+                  >/dev/null; then
+                  close_rc=0
+                  break
+                fi
+                sleep $((attempt * 5))
+              done
+            fi
           fi
           if [ "$marker_rc" -ne 0 ]; then
             echo "::error::Could not persist the failed relay marker for source run $SOURCE_RUN_ID"
           fi
           if [ "$close_rc" -ne 0 ]; then
-            echo "::error::Could not close abandoned relay check lease $CHECK_ID"
+            echo "::error::Could not publish a terminal PR-head relay failure for PR #$PR_NUMBER (lease '$CHECK_ID')"
           fi
           [ "$marker_rc" -eq 0 ] && [ "$close_rc" -eq 0 ]

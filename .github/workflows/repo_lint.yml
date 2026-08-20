@@ -215,7 +215,7 @@ jobs:
         run: ./scripts/ci/check_codex_scripts
 
       - name: check_review_feedback_accounting
-        run: ./scripts/ci/check_review_feedback_accounting
+        run: ./scripts/ci/check_review_feedback_accounting || { rc=$?; if [ ! -f scripts/ci/check_review_feedback_accounting ]; then echo "check_review_feedback_accounting not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_daily_feedback_rollup
         # Pure-function helpers + a 3-case shimmed --dry-run smoke

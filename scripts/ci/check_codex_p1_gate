@@ -468,6 +468,14 @@ if relay_job.is_a?(Hash)
       cleanup_run.match?(/if \[ -n "\$CHECK_ID" \] && \[ "\$latest_status" != complete \]; then/),
       "read-only relay cleanup can overwrite a completed check after a later artifact cleanup failure"
     )
+    cleanup_env = cleanup_step&.fetch("env", {}) || {}
+    require_shape.call(
+      cleanup_env.fetch("HEAD_SHA", "").to_s.include?("steps.source.outputs.head_sha") &&
+        cleanup_run.match?(/elif \[ -z "\$CHECK_ID" \] && \[ "\$latest_status" != complete \]; then/) &&
+        cleanup_run.include?('-f name="$CHECK_NAME" -f head_sha="$HEAD_SHA"') &&
+        cleanup_run.include?("conclusion=failure"),
+      "read-only relay cleanup leaves the PR head unpublished when the relay failed before opening its lease"
+    )
   end
 end
 
