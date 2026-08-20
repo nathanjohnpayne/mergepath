@@ -1197,6 +1197,14 @@ paths:
   - path: .github/workflows/dependabot-auto-merge.yml
     type: canonical
     consumers: all
+    # The immediate-squash fallback (used only where `--auto` is
+    # unavailable, i.e. no branch protection and therefore no required
+    # check to carry the accounting backstop) invokes
+    # scripts/review-feedback-accounting.sh and fails closed when it is
+    # missing. Declaring the closure keeps a consumer from receiving the
+    # workflow ahead of the gate it now depends on (#1000).
+    requires:
+      - "scripts/review-feedback-accounting.sh"
   - path: .github/workflows/auto-clear-blocking-labels.yml
     type: canonical
     consumers: all
