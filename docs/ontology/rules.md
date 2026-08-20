@@ -665,7 +665,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-91.** Fan-out waits for canary lint green and wave-audit clearance (or a recorded unavailability). ○ — docs/agents/propagation-ordering.md
 
-**G-92.** Steady-state tiers wait until a wave-0 consumer's backlog has cleared. ○ — docs/agents/propagation-ordering.md
+**G-92.** A consumer whose own enrolment backlog is being reconciled is the canary for that wave; its tier membership does not hold the fan-out, which is gated on canary lint green plus wave-audit clearance. ○ — docs/agents/propagation-ordering.md
 
 **G-93.** A canary failure stops the fan-out; investigation happens in that one PR. ○ — docs/agents/propagation-ordering.md
 

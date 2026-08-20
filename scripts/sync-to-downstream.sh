@@ -151,8 +151,15 @@
 #
 #   The fix is a one-consumer canary BEFORE the full fan-out:
 #
-#     # 1. Pick one consumer (matchline is the canonical canary).
-#     scripts/sync-to-downstream.sh --sync-all --repos matchline
+#     # 1. Pick ONE consumer as this wave's canary. There is no
+#     #    standing canary: choose by the dominant risk of the change
+#     #    being propagated, per the selection rules and the recorded
+#     #    per-wave choice in docs/agents/propagation-ordering.md
+#     #    (uniform payload gap -> simplest repo; per-consumer
+#     #    idiosyncrasy -> most-divergent repo; a consumer's own first
+#     #    sync -> that consumer). Do not default to a repo named in
+#     #    an example.
+#     scripts/sync-to-downstream.sh --sync-all --repos <canary>
 #
 #     # 2. Wait for that consumer's `lint` workflow to pass on the
 #     #    opened PR. If it fails, fix the manifest gap in mergepath
