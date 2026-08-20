@@ -1,0 +1,544 @@
+name: Codex Feedback Archive Relay
+
+# Fork- and Dependabot-triggered pull-request workflows receive a read-only
+# GITHUB_TOKEN. The unprivileged Codex P1 Gate run uploads a small, inert JSON
+# handoff under a distinct non-required check name. This default-branch
+# workflow_run consumer receives a write token, validates the handoff without
+# executing artifact content, persists any prior finding version, and only
+# then publishes the required PR-head gate.
+on:
+  workflow_run:
+    workflows: [Codex P1 Gate]
+    types: [completed]
+
+permissions:
+  actions: write
+  checks: write
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  relay:
+    name: Persist read-only feedback archive and publish gate
+    if: >-
+      ${{ startsWith(github.event.workflow_run.display_title,
+      'Codex P1 Gate relay-v1 PR #') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the source PR and read-only boundary
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          title=$(jq -r '.workflow_run.display_title // ""' "$GITHUB_EVENT_PATH")
+          pr=${title#Codex P1 Gate relay-v1 PR #}
+          case "$pr" in
+            ''|*[!0-9]*)
+              echo "::error::Could not recover a PR number from the source run title"
+              exit 1
+              ;;
+          esac
+          api_err=$(mktemp "${RUNNER_TEMP}/relay-pr-read.XXXXXX")
+          trap 'rm -f "$api_err"' EXIT
+          if ! pr_json=$(gh api "repos/$REPO/pulls/$pr" 2>"$api_err"); then
+            # issue_comment also runs for ordinary issues. Their run title has
+            # the same numeric shape, but there is no pull request to relay.
+            if ! grep -q 'HTTP 404' "$api_err"; then
+              echo "::error::Could not resolve PR #$pr for the trusted relay"
+              cat "$api_err" >&2
+              exit 1
+            fi
+            echo "pr=$pr" >> "$GITHUB_OUTPUT"
+            echo "head_sha=" >> "$GITHUB_OUTPUT"
+            echo "is_fork=false" >> "$GITHUB_OUTPUT"
+            echo "requires_relay=false" >> "$GITHUB_OUTPUT"
+            echo "pr_actor=" >> "$GITHUB_OUTPUT"
+            echo "source_run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
+          pr_actor=$(jq -r '.user.login // ""' <<<"$pr_json")
+          requires_relay="$is_fork"
+          if [ "$pr_actor" = 'dependabot[bot]' ]; then
+            requires_relay=true
+          fi
+          head_sha=$(jq -r '.head.sha // ""' <<<"$pr_json")
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "is_fork=$is_fork" >> "$GITHUB_OUTPUT"
+          echo "requires_relay=$requires_relay" >> "$GITHUB_OUTPUT"
+          echo "pr_actor=$pr_actor" >> "$GITHUB_OUTPUT"
+          echo "source_run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Publish a PR-head failure when source resolution errors
+        # Every other failure publisher in this job is conditioned on
+        # steps.source.outputs.requires_relay, so a transient PR API read in the
+        # step above leaves NO publisher armed: the workflow_run job's native
+        # check attaches to the default branch, and an older successful required
+        # check stays authoritative on the unchanged PR head until the 15-minute
+        # sweep. Recover the PR from the source run's display title — the same
+        # binding the job condition already trusts — and re-read the PR to
+        # confirm the read-only boundary before publishing. Deliberately no
+        # terminal marker: a `failed` marker on a run that never needed the relay
+        # would wedge accounting permanently, while a failing check is bounded by
+        # the sweep that republishes the truth.
+        if: ${{ always() && steps.source.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          CHECK_NAME: Codex P1 unresolved threads
+        run: |
+          set -uo pipefail
+          title=$(jq -r '.workflow_run.display_title // ""' "$GITHUB_EVENT_PATH")
+          pr=${title#Codex P1 Gate relay-v1 PR #}
+          case "$pr" in
+            ''|*[!0-9]*)
+              echo "::error::Could not recover a PR number from the source run title"
+              exit 1
+              ;;
+          esac
+          # Keep stdout as the machine-readable payload and capture stderr
+          # separately: this is the one publisher that recovers a lost required
+          # check, so when all three attempts fail the operator needs the status
+          # code, rate-limit note or token error, not just "could not re-read".
+          # The retry sleep is between attempts only; sleeping after the last
+          # failure only delays the diagnostic (CodeRabbit, review 4978115789).
+          pr_json=""
+          api_err="$RUNNER_TEMP/relay-recover-read.err"
+          : >"$api_err"
+          for attempt in 1 2 3; do
+            pr_json=$(gh api "repos/$REPO/pulls/$pr" 2>"$api_err") && [ -n "$pr_json" ] && break
+            pr_json=""
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          if [ -z "$pr_json" ]; then
+            echo "::error::Could not re-read PR #$pr to publish a PR-head failure"
+            cat "$api_err" >&2
+            exit 1
+          fi
+          head_sha=$(jq -r '.head.sha // ""' <<<"$pr_json")
+          is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
+          pr_actor=$(jq -r '.user.login // ""' <<<"$pr_json")
+          requires_relay="$is_fork"
+          if [ "$pr_actor" = 'dependabot[bot]' ]; then
+            requires_relay=true
+          fi
+          if [ "$requires_relay" != true ]; then
+            echo "PR #$pr does not use the read-only relay; its native gate job owns the PR-head check."
+            exit 1
+          fi
+          if [ -z "$head_sha" ]; then
+            echo "::error::Could not recover the head SHA for PR #$pr"
+            exit 1
+          fi
+          # This POST is the one write that retracts a stale successful
+          # required check from the PR head. A single transient API failure
+          # would leave that success standing and open a merge window until
+          # the 15-minute sweep, so retry on the same bounded schedule the
+          # PR re-read above and the lease publisher below already use
+          # (CodeRabbit, review 4978993986). The step still exits 1 either
+          # way — the retry protects the check retraction, not this run.
+          published=false
+          for attempt in 1 2 3; do
+            if gh api --method POST "repos/$REPO/check-runs" \
+              -f name="$CHECK_NAME" -f head_sha="$head_sha" \
+              -f status=completed -f conclusion=failure \
+              -f "output[title]=Codex feedback gate — trusted read-only relay could not resolve its source PR" \
+              -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed before it could bind to PR #$pr. Rerun the relay; the scheduled sweep also re-evaluates every 15 minutes." \
+              >/dev/null; then
+              published=true
+              break
+            fi
+            # Sleep between attempts only; sleeping after the last failure
+            # only delays the diagnostic (same rule as the re-read above).
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          if [ "$published" != true ]; then
+            echo "::error::Could not publish the PR-head failure on $head_sha"
+          fi
+          exit 1
+
+      - name: Locate the read-only handoff artifact
+        if: steps.source.outputs.requires_relay == 'true'
+        id: artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.source.outputs.pr }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          expected="codex-p1-read-only-handoff-$PR_NUMBER"
+          artifact_id=$(gh api "repos/$REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.expired == false and .name == \"$expected\") | .id" \
+            | tail -n 1)
+          if [ -z "$artifact_id" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "id=$artifact_id" >> "$GITHUB_OUTPUT"
+
+      - name: Fail permanently when a read-only handoff is missing
+        if: >-
+          ${{ always() && steps.source.outputs.requires_relay == 'true' &&
+          steps.artifact.outputs.found != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.source.outputs.pr }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          CHECK_NAME: Codex P1 unresolved threads
+        run: |
+          set -euo pipefail
+          marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=failed -->"
+          complete="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=complete -->"
+          existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
+          # Completion dominates for a source run, and the successful relay
+          # RETIRES the artifact it consumed. So a rerun of this trusted
+          # workflow for an already-archived source run finds no artifact and
+          # lands here — where it would publish a failing required check over a
+          # generation that was archived and published correctly, blocking the
+          # PR until the 15-minute sweep undoes it (#1000 Codex P2). A durable
+          # completion marker for THIS run is proof the archive was persisted,
+          # so honour it and publish nothing. The marker is only evidence when
+          # `github-actions[bot]` wrote it: an unauthenticated author check
+          # would let a fork PR post a lookalike and suppress this publisher,
+          # which is the same identity binding render-feedback-archive.sh
+          # applies before it will promote a relay-terminal record.
+          # The marker alone is not sufficient evidence. The relay-terminal
+          # record form is one of the three shapes a fork-supplied handoff may
+          # carry, so a fork PR can make this workflow post that exact comment
+          # as `github-actions[bot]` -- the author check cannot separate a
+          # forged marker from a genuine one. The unforgeable half is the check
+          # run: only a privileged token can publish `$CHECK_NAME` on the PR
+          # head, the fork PR's own native gate job never publishes one, and
+          # the artifact this step is missing was retired by the very relay
+          # that did. Requiring BOTH means suppression needs a real published
+          # generation on this head as well as a marker naming this run.
+          published_lease=false
+          if gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+            >"$RUNNER_TEMP/relay-head-checks.json" 2>/dev/null; then
+            if jq -e -s --arg name "$CHECK_NAME" \
+              '[ .[].check_runs[]? | select(.name == $name and .status == "completed") ] | length > 0' \
+              <"$RUNNER_TEMP/relay-head-checks.json" >/dev/null; then
+              published_lease=true
+            fi
+          fi
+          if [ "$published_lease" = true ] && jq -e --arg body "$complete" \
+            'any(.[]; (.user.login // "") == "github-actions[bot]" and (.body // "") == $body)' \
+            <<<"$existing" >/dev/null; then
+            echo "Source run $SOURCE_RUN_ID already carries an Actions-authored relay completion marker and $HEAD_SHA already carries a completed $CHECK_NAME generation; its handoff artifact was retired by that successful relay. Not publishing a failure over an archived generation."
+            exit 0
+          fi
+          if ! jq -e --arg body "$marker" 'any(.[]; (.body // "") == $body)' \
+            <<<"$existing" >/dev/null; then
+            jq -n --arg body "$marker" '{body:$body}' \
+              | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null
+          fi
+          gh api --method POST "repos/$REPO/check-runs" \
+            -f name="$CHECK_NAME" -f head_sha="$HEAD_SHA" \
+            -f status=completed -f conclusion=failure \
+            -f "output[title]=Codex feedback gate — read-only archive handoff missing" \
+            -f "output[summary]=Source run $SOURCE_RUN_ID did not publish its trusted-relay handoff. The prior feedback body may be unrecoverable." \
+            >/dev/null
+          exit 1
+
+      - name: Download the inert read-only handoff
+        if: steps.source.outputs.requires_relay == 'true' && steps.artifact.outputs.found == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: codex-p1-read-only-handoff-${{ steps.source.outputs.pr }}
+          path: ${{ runner.temp }}/codex-p1-read-only-handoff
+          run-id: ${{ steps.source.outputs.source_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout repo (default branch — trusted relay scripts)
+        if: steps.source.outputs.requires_relay == 'true' && steps.artifact.outputs.found == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Persist archive and publish the exact-head gate
+        id: persist
+        if: steps.source.outputs.requires_relay == 'true' && steps.artifact.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.source.outputs.pr }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
+          EXPECTED_IS_FORK: ${{ steps.source.outputs.is_fork }}
+          EXPECTED_PR_ACTOR: ${{ steps.source.outputs.pr_actor }}
+          HANDOFF_FILE: ${{ runner.temp }}/codex-p1-read-only-handoff/codex-p1-read-only-handoff.json
+          CHECK_NAME: Codex P1 unresolved threads
+        run: |
+          set -euo pipefail
+          jq -e \
+            --arg repo "$REPO" --argjson pr "$PR_NUMBER" --argjson run "$SOURCE_RUN_ID" \
+            --argjson expected_is_fork "$EXPECTED_IS_FORK" --arg expected_pr_actor "$EXPECTED_PR_ACTOR" '
+              type == "object" and .version == 1 and .repo == $repo and .pr == $pr
+              and .source_run_id == $run and .requires_relay == true
+              and .is_fork == $expected_is_fork and .pr_actor == $expected_pr_actor
+              and (.head_sha | type == "string" and test("^[0-9a-f]{40}$"))
+              and (.event_name == "pull_request" or .event_name == "pull_request_review"
+                or .event_name == "pull_request_review_comment" or .event_name == "issue_comment")
+              and (.archive_records | type == "array")
+              and all(.archive_records[];
+                type == "string" and (
+                  test("^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+/=]+ -->$") or
+                  test("^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]{64} part=[0-9]+/[0-9]+ data=[A-Za-z0-9+/=]+ -->$") or
+                  # A relay-terminal marker is the third record form the trusted
+                  # renderer emits: editing or deleting an Actions-authored
+                  # `mergepath-feedback-archive-relay` comment re-emits its exact
+                  # prior body so the history surface repairs itself. Rejecting
+                  # it here failed the relay closed on the very event that was
+                  # supposed to restore the record, and the cleanup then wrote a
+                  # permanent failure marker instead. Only `github-actions[bot]`
+                  # bodies reach this form (render-feedback-archive.sh refuses to
+                  # promote a lookalike from any other login), so accepting it
+                  # restores a genuine record rather than trusting fork input.
+                  test("^<!-- mergepath-feedback-archive-relay:v1 run=[0-9]+ status=(complete|failed) -->$")
+                ))
+            ' "$HANDOFF_FILE" >/dev/null
+          head_sha=$(jq -r '.head_sha' "$HANDOFF_FILE")
+
+          check_id=$(gh api --method POST "repos/$REPO/check-runs" \
+            -f name="$CHECK_NAME" -f head_sha="$head_sha" -f status=in_progress \
+            -f "output[title]=Codex feedback gate (trusted read-only relay in progress)" \
+            -f "output[summary]=Persisting reviewer-feedback history before evaluating $head_sha." \
+            --jq .id)
+          echo "check_id=$check_id" >> "$GITHUB_OUTPUT"
+
+          if [ "$(jq '.archive_records | length' "$HANDOFF_FILE")" -gt 0 ]; then
+            existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
+            while IFS= read -r archive_record; do
+              [ -n "$archive_record" ] || continue
+              if jq -e --arg body "$archive_record" 'any(.[]; (.body // "") == $body)' \
+                <<<"$existing" >/dev/null; then
+                continue
+              fi
+              jq -n --arg body "$archive_record" '{body:$body}' \
+                | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - \
+                >"$RUNNER_TEMP/posted-archive-comment.json"
+              existing=$(printf '%s\n' "$existing" \
+                | jq --slurpfile posted "$RUNNER_TEMP/posted-archive-comment.json" \
+                  '. + $posted')
+            done < <(jq -r '.archive_records[]' "$HANDOFF_FILE")
+          fi
+
+          rc=2
+          output="Trusted read-only relay could not evaluate the requested head."
+          current_head=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')
+          if [ "$current_head" = "$head_sha" ]; then
+            fingerprint_before=$(scripts/review-feedback-surface-fingerprint.sh \
+              "$PR_NUMBER" "$REPO")
+            set +e
+            output=$(CODEX_P1_EXPECTED_HEAD_SHA="$head_sha" \
+              scripts/codex-p1-gate.sh "$PR_NUMBER" "$REPO" 2>&1)
+            rc=$?
+            set -e
+            fingerprint_after=$(scripts/review-feedback-surface-fingerprint.sh \
+              "$PR_NUMBER" "$REPO")
+            if [ "$fingerprint_before" != "$fingerprint_after" ]; then
+              output="${output}"$'\n'"Feedback changed during trusted read-only evaluation; refusing the stale result."
+              rc=2
+            fi
+          else
+            output="PR head moved from $head_sha to $current_head before trusted read-only evaluation."
+          fi
+
+          conclusion=failure
+          [ "$rc" -eq 0 ] && conclusion=success
+          title="Codex feedback gate (trusted read-only relay)"
+          [ "$rc" -le 1 ] || title="Codex feedback gate — trusted read-only relay failed closed"
+
+          # Revalidate the feedback surface immediately before this publisher
+          # writes, the same fence the event-driven and scheduled publishers
+          # carry. `fingerprint_after` above fences the gate SCRIPT; a bot
+          # PR-level finding that lands after it moves no SHA, so nothing
+          # between here and the PATCH below would notice it and the relay
+          # would publish a success computed without it. The finding's own run
+          # cannot re-protect the head either: it has to travel through a fresh
+          # `workflow_run` relay before it can open the next lease, and the
+          # required context is green for that whole window (#1000 Codex P1).
+          #
+          # This read is the LAST read before the writes, and it deliberately
+          # precedes the completion marker rather than following it. The marker
+          # is a PR-level comment, so the fingerprint covers it: re-reading
+          # after the POST could not tell this relay's own write apart from a
+          # reviewer's, which is why the earlier round declined the guard here
+          # instead of adding a check that fails on its own footprint. Moving
+          # the marker after the PATCH was declined for its own reasons — it
+          # retracts a published success on a single marker-post failure, and a
+          # relay cancelled between the two writes looks permanently in flight
+          # to the sweep. Reading first, then writing, satisfies both: the only
+          # events inside the residual window are this relay's own listing and
+          # marker POST. Only a success needs the re-read; a failure conclusion
+          # cannot be made less safe by drift.
+          if [ "$conclusion" = success ]; then
+            fingerprint_publish=$(scripts/review-feedback-surface-fingerprint.sh \
+              "$PR_NUMBER" "$REPO" 2>/dev/null || true)
+            if [ -z "$fingerprint_publish" ] \
+              || [ "$fingerprint_publish" != "${fingerprint_after:-}" ]; then
+              conclusion=failure
+              title="Codex feedback gate — feedback changed before trusted read-only publication"
+              output="${output}"$'\n'"Feedback changed between trusted read-only evaluation and publication, or the surface could not be re-read; refusing the stale clearance. The next event or the 15-minute sweep re-evaluates $head_sha."
+            fi
+          fi
+
+          marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=complete -->"
+          existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
+          if ! jq -e --arg body "$marker" 'any(.[]; (.body // "") == $body)' \
+            <<<"$existing" >/dev/null; then
+            jq -n --arg body "$marker" '{body:$body}' \
+              | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null
+          fi
+
+          gh api --method PATCH "repos/$REPO/check-runs/$check_id" \
+            -f status=completed -f conclusion="$conclusion" \
+            -f "output[title]=$title" -f "output[summary]=${output:0:60000}" \
+            >/dev/null
+          gh api --method DELETE "repos/$REPO/actions/artifacts/$ARTIFACT_ID" >/dev/null
+
+      - name: Close an abandoned read-only relay lease
+        if: >-
+          ${{ failure() && steps.source.outputs.requires_relay == 'true' &&
+          steps.artifact.outputs.found == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.source.outputs.pr }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          CHECK_ID: ${{ steps.persist.outputs.check_id }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+          CHECK_NAME: Codex P1 unresolved threads
+        run: |
+          set -uo pipefail
+          marker_rc=0
+          comments='[]'
+          if ! comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            | jq -s 'add // []'); then
+            marker_rc=1
+          fi
+          latest_status=""
+          if [ "$marker_rc" -eq 0 ]; then
+            latest_status=$(printf '%s' "$comments" | jq -r --argjson run "$SOURCE_RUN_ID" '
+              [
+                .[]
+                | select(.user.login == "github-actions[bot]")
+                | . as $comment
+                | ((.body // "")
+                  | try capture("^<!-- mergepath-feedback-archive-relay:v1 run=(?<run>[0-9]+) status=(?<status>complete|failed) -->$")
+                    catch null) as $marker
+                | select($marker != null and ($marker.run | tonumber) == $run)
+                | {status:$marker.status,created_at:($comment.created_at // ""),id:$comment.id}
+              ]
+              | sort_by(.created_at, .id)
+              | (last.status // "")
+            ') || marker_rc=$?
+          fi
+          if [ "$marker_rc" -eq 0 ] && [ "$latest_status" != complete ] \
+            && [ "$latest_status" != failed ]; then
+            marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=failed -->"
+            jq -n --arg body "$marker" '{body:$body}' \
+              | gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - \
+                >/dev/null || marker_rc=$?
+          fi
+
+          # Whether this lease still needs closing is a fact about the check
+          # run, so read the check run. The relay marker was standing in for it
+          # and got the answer wrong in BOTH directions. A `complete` marker
+          # with a failed publication PATCH read as "already concluded", so the
+          # still-`in_progress` required check was left pending until another
+          # event or the 15-minute sweep superseded it, blocking the PR for no
+          # reason (#1000 Codex P2). And an unreadable comment listing left
+          # `latest_status` empty, which read as "not concluded" and overwrote
+          # an already-PUBLISHED success with failure (#1049). One proxy, two
+          # opposite misreadings; the lease's own status answers both. An
+          # unreadable answer is not an answer: unknown state must never
+          # authorise a write over state that may already be published.
+          lease_state=unknown
+          if [ -n "$CHECK_ID" ]; then
+            for attempt in 1 2 3; do
+              lease_state=$(gh api "repos/$REPO/check-runs/$CHECK_ID" --jq '.status' 2>/dev/null) \
+                && [ -n "$lease_state" ] && break
+              lease_state=unknown
+              # Sleep only while an attempt remains. The third sleep would
+              # delay the unknown-state error path by 15s with no retry left
+              # to use it, which is the convention the recovery publisher in
+              # this file already follows.
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
+            done
+          fi
+
+          close_rc=0
+          if [ -n "$CHECK_ID" ] && [ "$lease_state" = unknown ]; then
+            echo "::error::Could not read the state of check lease $CHECK_ID; leaving it untouched rather than overwriting a possibly-published relay result"
+            close_rc=1
+          elif [ -n "$CHECK_ID" ] && [ "$lease_state" != completed ]; then
+            close_rc=1
+            for attempt in 1 2 3; do
+              if gh api --method PATCH "repos/$REPO/check-runs/$CHECK_ID" \
+                -f status=completed -f conclusion=failure \
+                -f "output[title]=Codex feedback gate — trusted read-only relay failed closed" \
+                -f "output[summary]=The trusted relay run did not complete. Rerun it before merge." \
+                >/dev/null; then
+                close_rc=0
+                break
+              fi
+              sleep $((attempt * 5))
+            done
+          elif [ -z "$CHECK_ID" ] && [ "$latest_status" != complete ]; then
+            # The relay failed BEFORE `persist` opened its lease — during the
+            # artifact download, the trusted default-branch checkout, handoff
+            # validation, or the lease POST itself. `steps.persist.outputs.
+            # check_id` is then empty, so the branch above closes nothing and
+            # this job's own native check attaches to the default branch, not
+            # to the PR head. An older successful `Codex P1 unresolved threads`
+            # run stays authoritative on the unchanged head until the 15-minute
+            # sweep, and the durable `status=failed` marker posted above is
+            # written with GITHUB_TOKEN, so it triggers no workflow run to
+            # correct it. Publish the terminal failure directly on the head the
+            # source step bound, the same head every other publisher in this
+            # workflow uses (#1000 Codex P1).
+            if [ -z "$HEAD_SHA" ]; then
+              echo "::error::No bound head SHA to publish the relay failure for PR #$PR_NUMBER"
+              close_rc=1
+            else
+              close_rc=1
+              for attempt in 1 2 3; do
+                if gh api --method POST "repos/$REPO/check-runs" \
+                  -f name="$CHECK_NAME" -f head_sha="$HEAD_SHA" \
+                  -f status=completed -f conclusion=failure \
+                  -f "output[title]=Codex feedback gate — trusted read-only relay failed before it opened its lease" \
+                  -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed before it published a PR-head check lease. Rerun the relay before merge; the scheduled sweep also re-evaluates every 15 minutes." \
+                  >/dev/null; then
+                  close_rc=0
+                  break
+                fi
+                sleep $((attempt * 5))
+              done
+            fi
+          fi
+          if [ "$marker_rc" -ne 0 ]; then
+            echo "::error::Could not persist the failed relay marker for source run $SOURCE_RUN_ID"
+          fi
+          if [ "$close_rc" -ne 0 ]; then
+            echo "::error::Could not publish a terminal PR-head relay failure for PR #$PR_NUMBER (lease '$CHECK_ID')"
+          fi
+          [ "$marker_rc" -eq 0 ] && [ "$close_rc" -eq 0 ]

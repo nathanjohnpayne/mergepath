@@ -401,6 +401,43 @@ jobs:
             # approval" gate is satisfied either way.
             if [ "$UPDATE_TYPE" = "version-update:semver-patch" ] || \
                [ "$UPDATE_TYPE" = "version-update:semver-minor" ]; then
+              # Reviewer-feedback accounting immediately before the squash
+              # (#1000). The `--auto` path above hands the merge to GitHub,
+              # which releases it only after the repository's required checks
+              # pass — and the Codex P1 gate carries the accounting backstop
+              # for top-level review-body, PR-level, and prior-head findings.
+              # This fallback runs precisely when that machinery is absent:
+              # `--auto` is unavailable because the repo has no branch
+              # protection, so there are no required checks to release
+              # against and the squash below would merge past an
+              # unacknowledged bot finding. Run the gate here instead, and
+              # fail closed on any non-zero exit — an accounting miss (1) and
+              # an infrastructure error (2) are both reasons not to merge.
+              # Same posture, and the same reason, as
+              # scripts/admin-merge-codeowners-blocked.sh: that is the other
+              # merge path that cannot rely on the required-check backstop.
+              # The PR stays approved-but-unmerged, so the weekly audit's "no
+              # reviewer approval" gate is still satisfied and a human (or a
+              # rerun after the findings are dispositioned) completes it.
+              FEEDBACK_ACCOUNTING_GATE="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-scripts/review-feedback-accounting.sh}"
+              if [ ! -x "$FEEDBACK_ACCOUNTING_GATE" ]; then
+                echo "::error::$FEEDBACK_ACCOUNTING_GATE is missing or not executable in the base checkout; refusing the fallback squash because feedback accounting cannot be verified. Propagate the scripts/ kit, then rerun."
+                exit 1
+              fi
+              set +e
+              ACCOUNTING_JSON=$("$FEEDBACK_ACCOUNTING_GATE" "$PR_NUMBER" "$GITHUB_REPOSITORY")
+              ACCOUNTING_RC=$?
+              set -e
+              if [ "$ACCOUNTING_RC" -ne 0 ]; then
+                printf '%s\n' "$ACCOUNTING_JSON" >&2
+                if [ "$ACCOUNTING_RC" -eq 1 ]; then
+                  echo "::error::reviewer feedback is unaccounted on this PR; refusing the fallback squash. Disposition every finding named above, then rerun this workflow."
+                else
+                  echo "::error::reviewer feedback accounting exited $ACCOUNTING_RC (infrastructure error); refusing the fallback squash. Failing closed."
+                fi
+                exit 1
+              fi
+              echo "::notice::reviewer feedback accounted; proceeding with the fallback squash."
               GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL"
             else
               echo "::notice::update-type='$UPDATE_TYPE' (dependency-group='$DEPENDENCY_GROUP') is not patch/minor and --auto is unavailable; leaving the PR approved-but-unmerged to preserve the CI-green safety case. Configure branch protection/auto-merge or merge manually after CI."
@@ -418,6 +455,10 @@ jobs:
           # Dependabot PR is never `nathanjohnpayne`). (CodeRabbit
           # Major, #271.)
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          # Passed to scripts/review-feedback-accounting.sh in the
+          # immediate-squash fallback; the script takes a PR number, and
+          # PR_URL above is a URL.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           # Dependabot metadata — used by the immediate-squash fallback to
           # keep major dev-group bumps behind CI (#374 / Codex P2 on #405).
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}

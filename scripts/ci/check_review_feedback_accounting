@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# CI wrapper for the complete-history reviewer-feedback accounting gate (#1000).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT="$REPO_ROOT/scripts/review-feedback-accounting.sh"
+TEST="$REPO_ROOT/tests/test_review_feedback_accounting.sh"
+HANDOFF_TEST="$REPO_ROOT/tests/test_post_phase_4b_handoff.sh"
+HANDOFF_SCRIPT="$REPO_ROOT/scripts/post-phase-4b-handoff.sh"
+ARCHIVE_RENDERER="$REPO_ROOT/scripts/render-feedback-archive.sh"
+SURFACE_FINGERPRINT="$REPO_ROOT/scripts/review-feedback-surface-fingerprint.sh"
+FAILED=0
+
+for file in "$SCRIPT" "$TEST" "$HANDOFF_SCRIPT" "$HANDOFF_TEST" \
+  "$ARCHIVE_RENDERER" "$SURFACE_FINGERPRINT"; do
+  if [ ! -f "$file" ]; then
+    echo "FAIL: missing required file: ${file#"$REPO_ROOT/"}"
+    FAILED=1
+  elif [ ! -x "$file" ]; then
+    echo "FAIL: required file is not executable: ${file#"$REPO_ROOT/"}"
+    FAILED=1
+  fi
+done
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_review_feedback_accounting: FAIL (pre-flight)"
+  exit 1
+fi
+
+LINT_TOOLING_LIB="$REPO_ROOT/scripts/lib/lint-tooling.sh"
+if [ ! -f "$LINT_TOOLING_LIB" ]; then
+  echo "FAIL: missing required library: scripts/lib/lint-tooling.sh"
+  exit 1
+fi
+# shellcheck source=../lib/lint-tooling.sh
+. "$LINT_TOOLING_LIB"
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck --severity=warning "$SCRIPT" "$TEST" \
+    "$ARCHIVE_RENDERER" "$SURFACE_FINGERPRINT" \
+    || FAILED=1
+else
+  lint_tooling_require_shellcheck || FAILED=1
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_review_feedback_accounting: FAIL (static analysis)"
+  exit 1
+fi
+
+bash "$TEST"
+bash "$HANDOFF_TEST"
+echo "check_review_feedback_accounting: PASS"

@@ -24,6 +24,7 @@
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true
 LIB="$ROOT/scripts/lib/codex-failure-markers.sh"
 REQUEST="$ROOT/scripts/codex-review-request.sh"
 CHECK="$ROOT/scripts/codex-review-check.sh"

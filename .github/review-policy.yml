@@ -353,6 +353,11 @@ coderabbit:
 #      comment and poll for the Codex review.
 #   2. Parse the returned JSON. Address each P0/P1 finding with a fix OR
 #      a reply explaining why the finding does not apply.
+#      Before another review round, reconcile every classified inline,
+#      top-level review-body, and PR-level finding with
+#      `scripts/review-feedback-accounting.sh`.
+#      The request helper runs this automatically before its trigger write;
+#      exit 6 means feedback remains unaccounted and no trigger was posted.
 #   3. Repeat up to `max_review_rounds`. On runaway (round > max), escalate
 #      to the human per REVIEW_POLICY.md § Disagreements and Tiebreaking.
 #   4. On timeout (silence within `review_timeout_seconds`), the script
@@ -535,10 +540,12 @@ codex:
 
   # Codex P1 merge gate (nathanjohnpayne/mergepath#235).
   #
-  # When enabled, scripts/codex-p1-gate.sh runs as the required CI check
-  # `Codex P1 Gate / Codex P1 unresolved threads` and blocks merge if
-  # any Codex P1 inline-finding thread on the current HEAD is
-  # unresolved. The override path is the standard GitHub UI "Resolve
+  # scripts/codex-p1-gate.sh always runs complete-history feedback
+  # accounting as the required CI check `Codex P1 Gate / Codex P1 unresolved
+  # threads`; that #1000 pass is default-on in every consumer. When this
+  # legacy toggle is enabled, the same check additionally blocks merge if any
+  # Codex P1 inline-finding thread on the current HEAD is unresolved. The
+  # override path is the standard GitHub UI "Resolve
   # conversation" button (or the GraphQL `resolveReviewThread`
   # mutation) — same mechanism the author or any collaborator already
   # uses to clear other review threads. Resolving a thread that
@@ -668,8 +675,11 @@ phase_4b_automation:
   # Master switch. true ⇒ scripts/phase-4b-review.sh runs the reviewer CLI
   # locally (mode: local below) instead of the manual handoff; every
   # fail-closed path (non-conformant verdict, timeout, head drift,
-  # same-head required-finding gate) still falls back to the manual
-  # handoff. Enabled 2026-07-02 per operator request, together with xhigh
+  # same-head required-finding gate) still falls back to the manual handoff.
+  # Exit 7 is different: complete-history feedback accounting blocked before
+  # adapter dispatch, so the caller dispositions the findings and reruns — it
+  # does not spend a manual reviewer round. Enabled 2026-07-02 per operator
+  # request, together with xhigh
   # reviewer effort and the (already-default) accounting sub-toggle.
   # Trusted-path rule (#628 Codex P1): the orchestrator + adapters +
   # gh-as-reviewer MUST be executed from a trusted main-ref checkout,
