@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# check_no_token_in_output
+#
+# The enforcement half of #951 / #993 (#996), rebuilt against an EXECUTION
+# ORACLE per #1015. Fails when a shell source line under scripts/** or tests/**
+# interpolates the VALUE of a known credential variable into an output command.
+#
+# THIS FILE IS A LAUNCHER. The rule, the closed credential-name list, the
+# TOKEN_OUTPUT_EXEMPT pragma contract, the measured "does NOT catch" list and
+# the differential test suite all live in scripts/ci/token_output_gate.py --
+# read that file's header before relying on this gate for anything.
+#
+# Why the implementation is Python and this wrapper is shell: the gate needs a
+# single quoting/segmentation walk that everything downstream reads off, and
+# #1012 measured what happens when two hand-written awk walks over the same
+# line disagree. The wrapper exists because tests/test_repo_lint_consumer_safety.sh
+# invokes every wired scripts/ci/check_* with `bash`, and because a missing
+# interpreter must be a loud error rather than a silent skip (#899).
+#
+# Usage:
+#   check_no_token_in_output              # self-test, then scan this repo
+#   check_no_token_in_output --self-test  # differential suite only
+#   check_no_token_in_output --scan [DIR] # scan only (default: this repo)
+
+set -euo pipefail
+
+CI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE="$CI_DIR/token_output_gate.py"
+
+if [ ! -f "$GATE" ]; then
+  echo "check_no_token_in_output: ERROR (missing $GATE) — the launcher and its module travel together in the scripts/ci kit; a tree with one and not the other is a broken sync, not a clean repo." >&2
+  exit 2
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "check_no_token_in_output: ERROR — python3 is required and was not found on PATH. Install it (ubuntu-latest and macOS runners already carry it) rather than letting the gate skip: a token-output gate that silently does not run is the #951 shape it exists to stop." >&2
+  exit 2
+fi
+
+exec python3 "$GATE" "$@"
