@@ -2095,6 +2095,15 @@ def _command_word_expands(w):
     return False
 
 
+# The ANSI-C escapes bash expands inside `$'...'`.  Anything else after the
+# backslash is the character itself, which is bash's own rule.
+_ANSI_C_ESCAPES = {
+    "n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b",
+    "f": "\f", "v": "\v", "e": "\x1b", "E": "\x1b",
+    "\\": "\\", "'": "'", '"': '"', "?": "?", "0": "\0",
+}
+
+
 def _unquote_command_word(w):
     """Reduce a command word to a literal, or return None if it is not one."""
     out = []
@@ -2123,6 +2132,27 @@ def _unquote_command_word(w):
                     continue
                 if w[j] in "$`":
                     return None
+                buf.append(w[j])
+                j += 1
+            if j >= n:
+                return None
+            out.append("".join(buf))
+            i = j + 1
+            continue
+        # `$'...'` is ANSI-C quoting: bash reduces it to a LITERAL, so it is
+        # a literal here too.  Rejecting it with the rest of `$` meant
+        # `eval $'echo "$GH_TOKEN"'` handed `_deferred_shell_operands` nothing
+        # to recurse into and the deferred text was never scanned -- PASS on a
+        # live leak (#1032 round 7 P1).  Only `$'` is decoded; every other `$`
+        # is still an expansion and still refuses.
+        if c == "$" and i + 1 < n and w[i + 1] == "'":
+            j = i + 2
+            buf = []
+            while j < n and w[j] != "'":
+                if w[j] == "\\" and j + 1 < n:
+                    buf.append(_ANSI_C_ESCAPES.get(w[j + 1], w[j + 1]))
+                    j += 2
+                    continue
                 buf.append(w[j])
                 j += 1
             if j >= n:
@@ -2321,6 +2351,12 @@ def classify(seg, emitter_helpers):
     if cmd in emitter_helpers:
         return EMIT
     if cmd in ENV_DUMPERS:
+        # `set` is the odd member: bare `set` dumps the shell variables, but
+        # `set -- "$PAT"` ASSIGNS the positional parameters and writes nothing.
+        # Grading every `set` a dumper flagged the assignment form (#1032
+        # round 7 P2).  The other dumpers take no operand that changes this.
+        if cmd == "set" and len(seg.words) > 1:
+            return SAFE
         return EMIT
     # Ordered BEFORE SAFE_COMMANDS on purpose: `exit`, `return` and `shift`
     # are listed there as control words, and that listing is what made the
@@ -2623,7 +2659,8 @@ def discover_emitter_helpers(text):
     # (#1032 round 6 P1).  The lookbehind keeps `m.start()` on the NAME, so
     # the `function`-form check below still sees the head it expects.
     for m in re.finditer(
-        r"(?m)(?:^|(?<=[;&|(]))[ \t]*(?:function[ \t]+)?"
+        r"(?m)(?:^|(?<=[;&|(])|(?<=\bthen)|(?<=\bdo)|(?<=\belse)"
+        r"|(?<=\bin))[ \t]*(?:function[ \t]+)?"
         r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
         r"(?:\([ \t]*\))?[ \t]*\{",
         text,
@@ -2897,6 +2934,10 @@ def _alias_emitters(lx, helpers):
     """
     enabled_at = None
     defs = []  # (line, name, target)
+    # Returns {name: earliest definition line}, not a bare set: an alias is in
+    # effect only for lines READ after its definition, and a flat set promoted
+    # every definition file-wide.  A call that PRECEDES its alias definition
+    # was graded as an emission (#1032 round 7 P2).
     for ll in lx.logical:
         for seg in ll.segments:
             cmd, _redir = resolve_command(seg)
@@ -2911,8 +2952,8 @@ def _alias_emitters(lx, helpers):
                     if m:
                         defs.append((ll.first_line, m.group(1), m.group(2)))
     if enabled_at is None or not defs:
-        return set()
-    out = set()
+        return {}
+    out = {}
     # A fixed point, so `alias a=b` / `alias b=echo` resolves however long the
     # chain is -- the same reason `discover_emitter_helpers` iterates.
     while True:
@@ -2930,13 +2971,32 @@ def _alias_emitters(lx, helpers):
             # never what made the `shopt` gate real.
             if name in out:
                 continue
-            head = _basename(target.split()[0]) if target.split() else ""
+            head = _alias_target_command(target)
             if head in EMITTERS or head in STDIN_ECHOERS or head in helpers \
                     or head in out:
-                out.add(name)
+                out[name] = min(out.get(name, line), line)
                 grew = True
         if not grew:
             return out
+
+
+def _alias_target_command(target):
+    """The real command word of an alias TARGET.
+
+    `alias leak='command echo'` is an `echo`: the wrapper is stepped over the
+    same way `resolve_command` steps over one in an ordinary segment.  Reading
+    only `target.split()[0]` compared the WRAPPER against the emitter sets and
+    graded the alias safe, so the call site read clean (#1032 round 7 P1).
+    Env-assignment prefixes are skipped for the same reason.
+    """
+    for w in target.split():
+        base = _basename(w)
+        if base in PASSTHRU:
+            continue
+        if "=" in w and not w.startswith("="):
+            continue
+        return base
+    return ""
 
 
 def _function_body_line_spans(text):
@@ -2953,7 +3013,8 @@ def _function_body_line_spans(text):
     # CREDITED instead of refused -- a silent false negative, which is the
     # direction `xtrace-disable-in-called-function` exists to avoid.
     for m in re.finditer(
-        r"(?m)(?:^|(?<=[;&|(]))[ \t]*(?:function[ \t]+)?"
+        r"(?m)(?:^|(?<=[;&|(])|(?<=\bthen)|(?<=\bdo)|(?<=\belse)"
+        r"|(?<=\bin))[ \t]*(?:function[ \t]+)?"
         r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
         r"(?:\([ \t]*\))?[ \t]*\{",
         text,
@@ -3008,9 +3069,25 @@ def _shebang_enables_xtrace(text):
         return False
     if resolve_shebang(first) not in SHELL_INTERPRETERS:
         return False
-    for w in first[2:].split()[1:]:
+    # `-o xtrace` is a PAIR, and bash accepts it on a `#!` line through
+    # `env -S`.  Scanning only for an `x` inside a short-option word missed
+    # `#!/usr/bin/env -S bash -o xtrace`, which starts the script traced, so
+    # every later reference went to stderr expanded under a PASS (#1032
+    # round 7 P1).
+    words = first[2:].split()[1:]
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w in ("-o", "+o"):
+            if w == "-o" and i + 1 < len(words) and words[i + 1] == "xtrace":
+                return True
+            i += 2
+            continue
+        if w == "--xtrace":
+            return True
         if w.startswith("-") and not w.startswith("--") and "x" in w[1:]:
             return True
+        i += 1
     return False
 
 
@@ -3057,8 +3134,7 @@ def scan_text(text, path="<text>", _depth=0):
     xtrace = _shebang_enables_xtrace(text)
     fn_spans = _function_body_line_spans(text)
     aliases = _alias_emitters(lx, helpers)
-    if aliases:
-        helpers = set(helpers) | aliases
+    base_helpers = set(helpers)
     for ll in lx.logical:
         if ll.pragma_bare and not ll.pragma_reasons:
             pragma_errors.append(
@@ -3071,21 +3147,41 @@ def scan_text(text, path="<text>", _depth=0):
         # in source order, and each reference is graded under the state in
         # effect where it sits -- carrying one flag for the whole line read
         # `set -x` as taking effect only on the NEXT line and missed that one.
+        # An alias is in effect only for a line READ after its definition, so
+        # the helper set is rebuilt per logical line rather than promoted
+        # file-wide.  `<=` and not `<`: a definition and a use on the SAME
+        # line do not connect in bash, and refusing to model that is the
+        # declared `alias-defined-and-used-on-one-line` conservatism, which
+        # this must not silently retire.
+        helpers = base_helpers | {
+            n for n, dl in aliases.items() if dl <= ll.first_line
+        }
         in_function = any(lo <= ll.first_line <= hi for lo, hi in fn_spans)
         line_delta = _xtrace_delta(ll, in_function)
         xtrace_at = {}
         state = xtrace
+        # `state` grades the segments of THIS line, including the ones inside a
+        # subshell -- `( set -x; : "$PAT" )` really is traced.  `outer` is what
+        # survives the line, and a subshell's option state does not: bash
+        # discards it when the subshell exits, so `( set -x )` followed by
+        # `: "$PAT"` emits nothing and the gate reported a finding (#1032
+        # round 7 P2).
+        outer = xtrace
         for seg in ll.segments:
             xtrace_at[seg.sid] = state
             st = _segment_sets_xtrace(seg)
             if st is True:
                 state = True
+                if not seg.parent_is_subshell:
+                    outer = True
             elif st is False and line_delta is False:
                 state = False
+                if not seg.parent_is_subshell:
+                    outer = False
         if ll.pragma_reasons:
             # A pragma'd line is exempt, and so is any xtrace it turns on --
             # the exemption is the author's written statement about THIS line.
-            xtrace = state
+            xtrace = outer
             continue
         for ref in ll.refs:
             hit, why = reaches_output(ref, helpers)
@@ -3136,7 +3232,9 @@ def scan_text(text, path="<text>", _depth=0):
                     # all three rather than being a rule about `eval`.
                     if _text_enables_xtrace(inner):
                         state = True
-        xtrace = state
+                        if not seg.parent_is_subshell:
+                            outer = True
+        xtrace = outer
     return findings, pragma_errors
 
 
@@ -4712,6 +4810,42 @@ CORPUS = [
     ("continued-name-suffix", MUST_FLAG, 'echo "$GH_\\\nTOKEN"\n'),
     ("continued-name-braced", MUST_FLAG, 'echo "${GH_\\\nTOKEN}"\n'),
     ("continued-name-midword", MUST_FLAG, 'echo "$GH\\\n_TOKEN"\n'),
+    # --- round 7: command position, alias targets, lifetimes, subshells ---
+    #
+    # A function definition is valid after a RESERVED WORD too, not only after
+    # the single-character separators round 6 covered.
+    (
+        "helper-after-then",
+        MUST_FLAG,
+        'if true; then log(){ echo "$1"; }; fi\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-after-do",
+        MUST_FLAG,
+        'for i in 1; do log(){ echo "$1"; }; done\nlog "$GH_TOKEN"\n',
+    ),
+    # An alias TARGET gets the same wrapper resolution an ordinary segment
+    # gets; comparing only its first word graded the wrapper, not the emitter.
+    (
+        "alias-target-wrapper",
+        MUST_FLAG,
+        'shopt -s expand_aliases\nalias leak=\'command echo\'\nleak "$GH_TOKEN"\n',
+    ),
+    # `$'...'` is ANSI-C quoting and reduces to a literal, so the deferred
+    # scanner can recurse into it.  Refusing it with the rest of `$` meant the
+    # deferred text was never read.
+    ("deferred-ansi-c-eval", MUST_FLAG, 'eval $\'echo "$GH_TOKEN"\'\n'),
+    # An alias applies only to lines READ after its definition.
+    (
+        "alias-defined-after-use",
+        MUST_NOT_FLAG,
+        'shopt -s expand_aliases\nleak "$GH_TOKEN" || :\nalias leak=echo\necho ok\n',
+    ),
+    # Bash discards a subshell's option state when it exits, so `set -x` there
+    # does not trace the parent's later commands.
+    ("xtrace-set-in-subshell", MUST_NOT_FLAG, '( set -x )\n: "$GH_TOKEN"\necho ok\n'),
+    # `set --` ASSIGNS the positional parameters; only bare `set` dumps.
+    ("set-positional-assign", MUST_NOT_FLAG, 'set -- "$GH_TOKEN"\necho ok\n'),
     # --- round 6: four seams the earlier rounds left open ----------------
     #
     # Bash's parameter-name grammar is ASCII; Python's isalpha/isalnum are not.
@@ -5666,6 +5800,7 @@ def self_test():
         failures.extend(_deferred_shell_cases())
         failures.extend(_file_selection_cases(tmp))
         failures.extend(_unmodelled_dialect_cases(tmp))
+        failures.extend(_shebang_xtrace_cases())
         failures.extend(_discovery_failure_cases(tmp))
         failures.extend(_source_promotion_cases(tmp))
         failures.extend(_path_independence_case(tmp))
@@ -5921,6 +6056,40 @@ def _deferred_shell_cases():
             failures.append(
                 "deferred %s: well-formed deferred text reported a discovery "
                 "error (%s)" % (cid, errors)
+            )
+    return failures
+
+
+def _shebang_xtrace_cases():
+    """`#!` lines that start the shell TRACED.
+
+    Asserted on the helper directly rather than through the corpus, because a
+    corpus body is prefixed with PROLOGUE and a `#!` line only counts on the
+    FIRST line of a file -- so this axis is unreachable from there.  `-o
+    xtrace` is a PAIR and reached the gate through `env -S`, where scanning
+    for an `x` inside a short-option word saw nothing (#1032 round 7 P1).
+    """
+    failures = []
+    for line, want in [
+        ("#!/usr/bin/env -S bash -o xtrace", True),
+        ("#!/bin/bash -o xtrace", True),
+        ("#!/bin/bash --xtrace", True),
+        ("#!/bin/bash -x", True),
+        ("#!/bin/bash -ex", True),
+        ("#!/usr/bin/env -S bash -e", False),
+        ("#!/bin/bash -o errexit", False),
+        ("#!/bin/bash +o xtrace", False),
+        ("#!/bin/bash", False),
+        # `-o` CONSUMES its argument: a following `-x`-less word must not be
+        # read as an option, and an `errexit` operand must not match on the
+        # `x` inside it.
+        ("#!/bin/bash -o errexit -e", False),
+        ("#!/usr/bin/env python3", False),
+    ]:
+        got = _shebang_enables_xtrace(line + "\n: \"$GH_TOKEN\"\n")
+        if got != want:
+            failures.append(
+                "shebang-xtrace %r: expected %s, got %s" % (line, want, got)
             )
     return failures
 

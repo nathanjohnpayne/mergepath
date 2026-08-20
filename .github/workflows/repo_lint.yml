@@ -454,7 +454,19 @@ jobs:
         # check_branch_protection_audit use): absent marker ⇒ consumer
         # mid-sync ⇒ soft-pass; marker present ⇒ this IS mergepath and a
         # missing launcher is a deletion, which fails.
-        run: ./scripts/ci/check_no_token_in_output || { rc=$?; if [ ! -f scripts/ci/check_no_token_in_output ] && [ ! -f scripts/sync-to-downstream.sh ]; then echo "check_no_token_in_output not in this tree yet; soft-pass (consumer bootstrap skew)"; elif [ ! -f scripts/ci/check_no_token_in_output ]; then echo "check_no_token_in_output is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; else exit "$rc"; fi; }
+        #
+        # That closed the HUB half only. On a consumer the marker is always
+        # absent, so deleting the launcher there still soft-passed and `lint`
+        # stayed green with the gate switched off (Codex P1 on #1032 round 7).
+        # The consumer half needs a POSITIVE reading of bootstrap skew, and
+        # the manifest supplies one: the launcher and its payload
+        # (scripts/ci/token_output_gate.py) are both in the scripts/ci/ kit
+        # entry, so a partial sync delivers NEITHER. Both absent ⇒ genuine
+        # skew ⇒ soft-pass. Payload present, launcher gone ⇒ the launcher was
+        # removed after delivery ⇒ fail. A base-ref diff would be the other
+        # way to tell those apart, but this job checks out at depth 1 and has
+        # no base commit to read.
+        run: ./scripts/ci/check_no_token_in_output || { rc=$?; if [ -f scripts/ci/check_no_token_in_output ]; then exit "$rc"; fi; if [ -f scripts/sync-to-downstream.sh ]; then echo "check_no_token_in_output is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; fi; if [ -f scripts/ci/token_output_gate.py ]; then echo "check_no_token_in_output is absent while its gate payload scripts/ci/token_output_gate.py is present — the launcher was deleted, not un-synced"; exit 1; fi; echo "check_no_token_in_output not in this tree yet; soft-pass (consumer bootstrap skew — launcher and payload both absent)"; exit 0; }
 
       - name: check_op_preflight_contract
         run: ./scripts/ci/check_op_preflight_contract
