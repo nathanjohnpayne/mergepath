@@ -205,6 +205,13 @@ PY
 fi
 
 if [ -f "$DOC_WRAPPER" ]; then
+  if grep -Fq 'ci_check_select_mode "$@"' "$DOC_WRAPPER" \
+     && ! grep -Fq 'case "${1:-}" in' "$DOC_WRAPPER"; then
+    pass "doc ownership delegates mode selection to the shared helper"
+  else
+    fail "doc ownership must not duplicate the shared mode selector"
+  fi
+
   DOC_FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-doc-wrapper.XXXXXX")"
   doc_result=$(MERGEPATH_CONSUMER_SAFETY=1 MERGEPATH_REPO_ROOT="$DOC_FIXTURE" bash "$DOC_WRAPPER")
   rm -rf "$DOC_FIXTURE"

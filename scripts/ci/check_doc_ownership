@@ -76,42 +76,26 @@ set -euo pipefail
 #   MERGEPATH_REPO_ROOT     — point at a fixture repo tree (so the
 #                             docs/agents/ scan and the path-existence
 #                             probe read the fixture, not the live repo)
-REPO_ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="${MERGEPATH_REPO_ROOT:-$SCRIPT_ROOT}"
 MANIFEST="${MERGEPATH_MANIFEST_PATH:-$REPO_ROOT/.mergepath-sync.yml}"
 TEST_SUITE="$REPO_ROOT/tests/test_check_doc_ownership.sh"
-RUN_SELF_TEST=1
-
-if [ "${MERGEPATH_CONSUMER_SAFETY:-0}" = "1" ] && [ "$#" -eq 0 ]; then
-  set -- --check
+MODE_HELPER="$SCRIPT_ROOT/scripts/lib/ci-check-modes.sh"
+if [ ! -f "$MODE_HELPER" ]; then
+  echo "check_doc_ownership: ERROR scripts/lib/ci-check-modes.sh missing" >&2
+  exit 1
 fi
-
-case "${1:-}" in
-  "") ;;
-  --check)
-    RUN_SELF_TEST=0
-    shift
-    ;;
-  --self-test)
-    shift
-    if [ "$#" -ne 0 ]; then
-      echo "usage: check_doc_ownership [--check | --self-test]" >&2
-      exit 2
-    fi
-    if [ ! -x "$TEST_SUITE" ]; then
-      echo "check_doc_ownership: ERROR (missing executable $TEST_SUITE)" >&2
-      exit 1
-    fi
-    exec bash "$TEST_SUITE"
-    ;;
-  *)
-    echo "usage: check_doc_ownership [--check | --self-test]" >&2
-    exit 2
-    ;;
-esac
-
-if [ "$#" -ne 0 ]; then
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
   echo "usage: check_doc_ownership [--check | --self-test]" >&2
   exit 2
+fi
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] \
+   && [ -z "${MERGEPATH_MANIFEST_PATH:-}" ] \
+   && [ ! -x "$TEST_SUITE" ]; then
+  echo "check_doc_ownership: ERROR (missing executable $TEST_SUITE)" >&2
+  exit 1
 fi
 
 VALID_CLASSES="canonical per-repo-owned hub-only"
@@ -2800,7 +2784,7 @@ fi
 # check_sync_manifest. Suppressed when this invocation was itself driven
 # by a fixture (MERGEPATH_MANIFEST_PATH set), because that is the test
 # harness calling back into us and re-entering would recurse.
-if [ "$RUN_SELF_TEST" -eq 1 ] && [ -z "${MERGEPATH_MANIFEST_PATH:-}" ] && [ -x "$TEST_SUITE" ]; then
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] && [ -z "${MERGEPATH_MANIFEST_PATH:-}" ]; then
   echo "check_doc_ownership: running regression test suite"
   if ! bash "$TEST_SUITE"; then
     echo "check_doc_ownership: FAIL (regression test suite failed)"

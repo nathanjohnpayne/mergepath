@@ -10,7 +10,7 @@ Pull-request heads run through `pull_request` only. Feature-branch pushes do not
 
 ## Scope classifier
 
-`scripts/ci/repo-lint-scope.sh` is the single scope decision. A pull request enters deep CI when it changes CI workflows, scripts, tests, specifications, rules, agent operating documentation, architecture decisions, either repository manifest, `AGENTS.md`, `REVIEW_POLICY.md`, or `ai_agent_tooling_standard.md`. Other pull requests use the fast lane. An unreadable pull-request diff fails closed to deep CI, and every non-pull-request event is deep.
+`scripts/ci/repo-lint-scope.sh` is the single scope decision. A pull request enters deep CI when it changes CI workflows, scripts, tests, specifications, rules, agent operating documentation, architecture decisions, either repository manifest, `AGENTS.md`, `REVIEW_POLICY.md`, or `ai_agent_tooling_standard.md`. Other pull requests use the fast lane. An unreadable pull-request diff fails closed to deep CI, and every non-pull-request event is deep once the canonical `scripts/ci/` kit is present. During first-wave consumer bootstrap skew, a checkout without that kit emits `deep=false` because it has no deep check implementation to execute; the hub fails instead of taking this exception.
 
 This path classifier intentionally begins conservatively. It may run more deep CI than a future machine-readable wrapper dependency graph would require, but it must not skip a regression net after its implementation, fixtures, propagation contract, or governance inputs change.
 
