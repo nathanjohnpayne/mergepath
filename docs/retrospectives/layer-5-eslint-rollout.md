@@ -48,7 +48,7 @@ The next ESLint policy update (e.g., adopting React Compiler when ready, or upgr
 
 1. **Land the template-gap defaults BEFORE the next ESLint policy change.** Otherwise consumers get a churn-diff that fights their overrides. [mergepath#322](https://github.com/nathanjohnpayne/mergepath/issues/322) is the blocker.
 2. **Lane gate the templated re-render** ([mergepath#323](https://github.com/nathanjohnpayne/mergepath/issues/323)) before adding more templated entries to the manifest.
-3. **Canary first, always.** Pick the smallest consumer; treat its propagation PR as the integration test. Don't fan out until canary clears the full review ceremony.
+3. **Canary first, always.** Follow the canonical [per-wave canary selection](../agents/propagation-ordering.md#canary-selection-always-do-one-first-chosen-per-wave) and [wave-audit gate](../agents/propagation-ordering.md#wave-audit-one-scoped-review-per-wave-662), including its reviewer-unavailable path. The smallest consumer was the right canary for *this* historical rollout because its dominant risk was a uniform templated payload; size is not the standing selection rule.
 4. **Identity discipline.** Always wrap codex-CLI handoffs with a switch-back to claude (the human's machine convention). Codify in `gh-as-author.sh` and similar wrappers (partly done via identity-check.sh from [mergepath#316](https://github.com/nathanjohnpayne/mergepath/issues/316); expand coverage).
 5. **Closure invariant should be a manifest-level invariant, not a wrapper-level one.** Anything that's a wrapper for `tests/test_*.sh` should require the test file in the same manifest entry. Static check, not a Phase 4b catch.
 
