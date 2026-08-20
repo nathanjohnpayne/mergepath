@@ -1413,37 +1413,29 @@ fi
 # there loops the operator forever, so the advisory must branch on whether an
 # approval is actually present (#1061 Codex P1).
 ADVISORY_BLOCK=$(sed -n '/if \[ "\$REVIEW_DECISION" = "REVIEW_REQUIRED" \]; then/,/^fi$/p' "$SCRIPT")
+# The advisory must name BOTH remedies and count nothing. Counting approvals
+# here was wrong three ways (#1061 Codex P2 rounds 4-5): a bare count conflates
+# presence with qualification, `gh api --paginate` with `| length` emits one
+# count PER PAGE so the value becomes "0\n1", and a failed read degraded to ""
+# which then read as a definite zero.
 if grep -q 'HEAD_APPROVALS' <<<"$ADVISORY_BLOCK"; then
-  pass "#1061: the advisory checks whether a non-author APPROVED review already exists"
+  fail "#1061: the advisory counts approvals again — --paginate with '| length' emits one count per page, and a failed read cannot be distinguished from zero"
 else
-  fail "#1061: the advisory prescribes Phase 4b for every REVIEW_REQUIRED — in the CODEOWNERS deadlock an approval already exists and another 4b round cannot clear it"
+  pass "#1061: the advisory counts nothing, so it cannot mis-read a paginated or failed review list"
 fi
-if grep -q 'admin-merge-codeowners-blocked' <<<"$ADVISORY_BLOCK"; then
-  pass "#1061: the approval-exists branch points at the CODEOWNERS escape hatch instead of another 4b round"
+if grep -q 'admin-merge-codeowners-blocked' <<<"$ADVISORY_BLOCK" \
+   && grep -q 'phase-4b-review.sh' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the advisory names both remedies, so neither cause strands the operator"
 else
-  fail "#1061: the approval-exists branch does not name scripts/admin-merge-codeowners-blocked.sh — the operator is left looping"
+  fail "#1061: the advisory names only one remedy — it will send the operator to the wrong one for the other cause"
 fi
-if grep -q 'phase-4b-review.sh' <<<"$ADVISORY_BLOCK"; then
-  pass "#1061: the no-approval branch still prescribes Phase 4b"
+# Strip comments first: the block's own comment EXPLAINS the removed `gh api
+# --paginate` call, and a bare grep matches that explanation.
+ADVISORY_CODE=$(grep -vE '^[[:space:]]*#' <<<"$ADVISORY_BLOCK")
+if grep -qE 'gh api' <<<"$ADVISORY_CODE"; then
+  fail "#1061: the advisory makes a REST call again; the reviewDecision read alone is enough and is failure-tolerant"
 else
-  fail "#1061: the ordinary missing-approval case no longer names its remedy"
-fi
-
-
-# #1061 Codex P2 round 4: the CODEOWNERS hint must not over-claim.
-# Any non-author can approve on a public repo, and an approval on an earlier
-# head produces the same reviewDecision mismatch without being a deadlock. The
-# real deadlock additionally needs a QUALIFYING approval, which
-# admin-merge-codeowners-blocked.sh verifies directly.
-if grep -q 'commit_id == .*HEAD_SHA' <<<"$ADVISORY_BLOCK"; then
-  pass "#1061: the approval count is scoped to the current head"
-else
-  fail "#1061: the approval count is not head-scoped — a stale approval on an older head reads as the CODEOWNERS deadlock"
-fi
-if grep -q 'QUALIFIES' <<<"$ADVISORY_BLOCK" && grep -q 'phase-4b-review.sh' <<<"$ADVISORY_BLOCK"; then
-  pass "#1061: the hint is conditional and still names the ordinary remedy when no approval qualifies"
-else
-  fail "#1061: the advisory asserts the CODEOWNERS deadlock outright — an outside approval on a public repo would send the operator to the wrong remedy"
+  pass "#1061: the advisory adds no REST call beyond the failure-tolerant reviewDecision read"
 fi
 
 # #1061 Codex P2 round 4: the fail-closed WARNING must describe the errors that

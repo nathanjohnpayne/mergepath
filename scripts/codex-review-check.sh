@@ -2411,19 +2411,24 @@ if [ "$REVIEW_DECISION" = "REVIEW_REQUIRED" ]; then
   # evaluates the reviews directly for exactly this reason. Another 4b round
   # cannot clear that one. Distinguish them by looking for the approval
   # (#1061 Codex P1).
-  # Scope to the CURRENT head: an approval on an earlier head produces the same
-  # mismatch without being a deadlock. Even so this is a HINT, not a diagnosis
-  # — on a public repo any non-author can approve, including an outsider with
-  # no write permission, and the real deadlock additionally requires a
-  # QUALIFYING approval (collaborator with write/admin, latest-per-author, no
-  # outstanding CHANGES_REQUESTED). admin-merge-codeowners-blocked.sh checks
-  # all of that; this advisory must not pre-empt its verdict (#1061 Codex P2).
-  HEAD_APPROVALS=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
-    --jq "[.[] | select(.state == \"APPROVED\" and .user.login != \"$PR_AUTHOR\" and .commit_id == \"$HEAD_SHA\")] | length" 2>/dev/null || echo "")
-  if [ "${HEAD_APPROVALS:-0}" -gt 0 ] 2>/dev/null; then
-    log "NOTE: reviewDecision=REVIEW_REQUIRED even though $HEAD_APPROVALS non-author APPROVED review(s) exist on this head. If any of them QUALIFIES (a collaborator with write/admin, no outstanding CHANGES_REQUESTED) this is the CODEOWNERS deadlock, and another Phase 4b round will NOT clear it — check with scripts/admin-merge-codeowners-blocked.sh, which verifies that directly. If none qualifies (an outside approval on a public repo does not), the ordinary remedy applies: scripts/phase-4b-review.sh <PR#> --repo $REPO from a trusted main-ref checkout (mergepath#1059)."
-  else
-    log "NOTE: GitHub still reports reviewDecision=REVIEW_REQUIRED and no non-author APPROVED review exists — branch protection wants an APPROVED review OBJECT, which a Codex 👍 reaction does not provide. This PR will NOT merge until one exists; run scripts/phase-4b-review.sh <PR#> --repo $REPO from a trusted main-ref checkout (mergepath#1059)."
-  fi
+  # Name BOTH causes and count nothing. REVIEW_REQUIRED has two: no APPROVED
+  # review OBJECT exists (a Codex 👍 is a reaction and never satisfies branch
+  # protection), or the CODEOWNERS deadlock, where a qualifying approval DOES
+  # exist and reviewDecision stays REVIEW_REQUIRED anyway — documented in
+  # scripts/admin-merge-codeowners-blocked.sh, which evaluates the reviews
+  # directly for exactly that reason.
+  #
+  # An earlier revision tried to distinguish them here by counting approvals.
+  # That was wrong three separate ways (#1061 Codex P2, rounds 4 and 5): a bare
+  # count conflates an approval's presence with its qualification, `gh api
+  # --paginate` with `| length` emits one count PER PAGE so the value becomes
+  # "0\n1" and the integer test silently fails, and a failed read degraded to
+  # "" which then read as a definite zero. Every one of those sends the
+  # operator to the wrong remedy with full confidence.
+  #
+  # Naming both remedies costs one line and cannot be wrong. The script that
+  # actually checks qualification is one command away, and it does the
+  # permission / latest-per-author / CHANGES_REQUESTED work properly.
+  log "NOTE: GitHub reports reviewDecision=REVIEW_REQUIRED, so this PR will not merge yet — branch protection wants an APPROVED review OBJECT, which a Codex 👍 reaction does not provide. If no qualifying approval exists, run scripts/phase-4b-review.sh <PR#> --repo $REPO from a trusted main-ref checkout. If one already does, this is the CODEOWNERS deadlock and another Phase 4b round will NOT clear it — see scripts/admin-merge-codeowners-blocked.sh, which verifies that directly (mergepath#1059)."
 fi
 exit 0
