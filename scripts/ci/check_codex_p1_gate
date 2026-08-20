@@ -475,6 +475,23 @@ if relay_job.is_a?(Hash)
         relay_run.include?('if [ "$fingerprint_before" != "$fingerprint_after" ]'),
       "read-only archive relay omits archive validation, completion evidence, or drift rejection"
     )
+    # The relay's fingerprint_before/fingerprint_after pair fences the gate
+    # SCRIPT, not the publication. A bot PR-level finding that lands after that
+    # pair moves no SHA, so nothing between it and the PATCH sees the finding
+    # and the relay publishes a success computed without it (#1000 Codex P1).
+    # Require the same pre-publication re-read the event-driven and scheduled
+    # publishers carry, anchored on the live invocation rather than on the
+    # variable name, and require it to sit BEFORE the relay's own completion
+    # marker: the marker is a PR-level comment, so a re-read after that POST
+    # would be comparing against this relay's own footprint.
+    republish = relay_run.index("fingerprint_publish=$(scripts/review-feedback-surface-fingerprint.sh")
+    republish_reject = republish && relay_run.index("conclusion=failure", republish)
+    require_shape.call(
+      [republish, republish_reject].all? && after < republish &&
+        republish < complete && republish_reject < complete &&
+        relay_run.include?(%q{[ "$fingerprint_publish" != "${fingerprint_after:-}" ]}),
+      "read-only archive relay publishes a leased success without re-reading the feedback surface immediately before it writes"
+    )
     persist_step = relay_steps.find { |step| step["run"] == relay_run }
     persist_index = relay_steps.index(persist_step)
     cleanup_step = relay_steps.find do |step|

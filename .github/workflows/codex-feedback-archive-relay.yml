@@ -102,14 +102,25 @@ jobs:
               exit 1
               ;;
           esac
+          # Keep stdout as the machine-readable payload and capture stderr
+          # separately: this is the one publisher that recovers a lost required
+          # check, so when all three attempts fail the operator needs the status
+          # code, rate-limit note or token error, not just "could not re-read".
+          # The retry sleep is between attempts only; sleeping after the last
+          # failure only delays the diagnostic (CodeRabbit, review 4978115789).
           pr_json=""
+          api_err="$RUNNER_TEMP/relay-recover-read.err"
+          : >"$api_err"
           for attempt in 1 2 3; do
-            pr_json=$(gh api "repos/$REPO/pulls/$pr" 2>/dev/null) && [ -n "$pr_json" ] && break
+            pr_json=$(gh api "repos/$REPO/pulls/$pr" 2>"$api_err") && [ -n "$pr_json" ] && break
             pr_json=""
-            sleep $((attempt * 5))
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
           done
           if [ -z "$pr_json" ]; then
             echo "::error::Could not re-read PR #$pr to publish a PR-head failure"
+            cat "$api_err" >&2
             exit 1
           fi
           head_sha=$(jq -r '.head.sha // ""' <<<"$pr_json")
@@ -295,6 +306,40 @@ jobs:
           [ "$rc" -eq 0 ] && conclusion=success
           title="Codex feedback gate (trusted read-only relay)"
           [ "$rc" -le 1 ] || title="Codex feedback gate — trusted read-only relay failed closed"
+
+          # Revalidate the feedback surface immediately before this publisher
+          # writes, the same fence the event-driven and scheduled publishers
+          # carry. `fingerprint_after` above fences the gate SCRIPT; a bot
+          # PR-level finding that lands after it moves no SHA, so nothing
+          # between here and the PATCH below would notice it and the relay
+          # would publish a success computed without it. The finding's own run
+          # cannot re-protect the head either: it has to travel through a fresh
+          # `workflow_run` relay before it can open the next lease, and the
+          # required context is green for that whole window (#1000 Codex P1).
+          #
+          # This read is the LAST read before the writes, and it deliberately
+          # precedes the completion marker rather than following it. The marker
+          # is a PR-level comment, so the fingerprint covers it: re-reading
+          # after the POST could not tell this relay's own write apart from a
+          # reviewer's, which is why the earlier round declined the guard here
+          # instead of adding a check that fails on its own footprint. Moving
+          # the marker after the PATCH was declined for its own reasons — it
+          # retracts a published success on a single marker-post failure, and a
+          # relay cancelled between the two writes looks permanently in flight
+          # to the sweep. Reading first, then writing, satisfies both: the only
+          # events inside the residual window are this relay's own listing and
+          # marker POST. Only a success needs the re-read; a failure conclusion
+          # cannot be made less safe by drift.
+          if [ "$conclusion" = success ]; then
+            fingerprint_publish=$(scripts/review-feedback-surface-fingerprint.sh \
+              "$PR_NUMBER" "$REPO" 2>/dev/null || true)
+            if [ -z "$fingerprint_publish" ] \
+              || [ "$fingerprint_publish" != "${fingerprint_after:-}" ]; then
+              conclusion=failure
+              title="Codex feedback gate — feedback changed before trusted read-only publication"
+              output="${output}"$'\n'"Feedback changed between trusted read-only evaluation and publication, or the surface could not be re-read; refusing the stale clearance. The next event or the 15-minute sweep re-evaluates $head_sha."
+            fi
+          fi
 
           marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=complete -->"
           existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
