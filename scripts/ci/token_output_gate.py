@@ -703,7 +703,7 @@ SAFE_COMMANDS = frozenset(
     {
         # conditionals and word-consuming keywords -- these read the value,
         # they never write it
-        "[", "[[", "test", "case", "for", "select", "((",
+        "[", "[[", "test", "case", "for", "((",
         # binding forms
         "local", "export", "readonly", "declare", "typeset", "unset", "read",
         "let",
@@ -1931,6 +1931,13 @@ def braced_ref_at(text, brace_open):
     op = text[end : end + 2]
     if op[:2] == ":+" or op[:1] == "+":
         return None
+    # `${VAR@a}` expands to the variable's ATTRIBUTES (`x` for an exported
+    # one), never to its value, so it is redacted in the same way `${#VAR}`
+    # and `${VAR:+set}` are.  The other `@` transforms -- `@A`, `@Q`, `@P`,
+    # `@U`, `@u`, `@L`, `@K`, `@k` -- all carry the VALUE through, so only
+    # this one operator is excluded (#1032 round 8 P2).
+    if op == "@a":
+        return None
     return name
 
 
@@ -2333,7 +2340,7 @@ def tee_file_operands(seg):
     return files
 
 
-def classify(seg, emitter_helpers):
+def classify(seg, emitter_helpers, local_functions=frozenset()):
     cmd, _redir = resolve_command(seg)
     if cmd is None:
         return ASSIGN
@@ -2341,6 +2348,14 @@ def classify(seg, emitter_helpers):
         return OPAQUE
     if cmd in OPAQUE_COMMANDS:
         return OPAQUE
+    # A function defined in THIS FILE shadows the builtin of the same name, so
+    # `echo(){ :; }; echo "$PAT"` writes nothing.  Helper discovery already
+    # graded every local body, so a shadowing name that is NOT in
+    # `emitter_helpers` was measured non-emitting and the global EMITTERS rule
+    # must not override that -- it rejected valid shell (#1032 round 8 P2).
+    # Ordered ahead of the `printf` branch because `printf` is shadowable too.
+    if cmd in local_functions and cmd not in emitter_helpers:
+        return SAFE
     if cmd == "printf":
         lits = [_unquote_command_word(w) for w in seg.words]
         if "-v" in lits:
@@ -2362,6 +2377,14 @@ def classify(seg, emitter_helpers):
     # are listed there as control words, and that listing is what made the
     # stderr diagnostic invisible.
     if cmd in NUMERIC_OPERAND_DIAGNOSTIC:
+        return EMIT
+    # `select value in LIST` prints LIST as a NUMBERED MENU on stderr before
+    # it reads anything, so a credential in the list reaches a stream even
+    # when the loop body does nothing and even with stdin closed.  It sat in
+    # SAFE_COMMANDS beside `for` and `case`, which really are word-consuming
+    # -- `select` is the one member of that group that echoes its words
+    # (#1032 round 8 P1).
+    if cmd == "select":
         return EMIT
     if cmd in SAFE_COMMANDS:
         return SAFE
@@ -2403,7 +2426,7 @@ def _read_numeric_option_operand(seg, name):
     return False
 
 
-def reaches_output(ref, emitter_helpers):
+def reaches_output(ref, emitter_helpers, local_functions=frozenset()):
     """Does this reference reach a stream?  Returns (bool, reason)."""
     if ref.in_error_word:
         # Decided BEFORE the command word, and deliberately ahead of the
@@ -2464,7 +2487,7 @@ def reaches_output(ref, emitter_helpers):
     while seg is not None and hops < 32:
         hops += 1
         cmd, has_out_redir = resolve_command(seg)
-        kind = classify(seg, emitter_helpers)
+        kind = classify(seg, emitter_helpers, local_functions)
         if kind == OPAQUE:
             return True, "command word could not be resolved (%s)" % (
                 "unresolvable" if cmd is UNRESOLVED else cmd
@@ -2649,6 +2672,35 @@ def _find_body(text, open_brace_idx):
     return None
 
 
+_FUNC_DEF_RE = re.compile(
+    r"(?m)(?:^|(?<=[;&|(])|(?<=\bthen)|(?<=\bdo)|(?<=\belse)"
+    r"|(?<=\bin))[ \t]*(?:function[ \t]+)?"
+    r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
+    r"(?:\([ \t]*\))?[ \t]*\{"
+)
+
+
+def discover_local_functions(text):
+    """Names this file DEFINES as functions.
+
+    A definition shadows a builtin of the same name for the rest of the file,
+    so `classify` needs the set to know that `echo` here is not bash's `echo`.
+    Separate from `discover_emitter_helpers` -- which answers the narrower
+    "does this body emit a positional" -- because a body that emits NOTHING
+    still shadows, and that is exactly the case being fixed.
+    """
+    out = set()
+    for m in _FUNC_DEF_RE.finditer(text):
+        name = m.group(1)
+        if name in RESERVED_WORDS:
+            continue
+        head = text[m.start() : m.end()]
+        if "(" not in head and not head.lstrip().startswith("function"):
+            continue
+        out.add(name)
+    return frozenset(out)
+
+
 def discover_emitter_helpers(text):
     """Functions whose body writes one of their own positionals VERBATIM."""
     bodies = {}
@@ -2721,6 +2773,22 @@ def discover_emitter_helpers(text):
                         break
                 if emits:
                     break
+            # A helper body can put a positional on a stream without naming
+            # an emitter at all: BASH writes a `${VAR:?WORD}` error word
+            # itself, and under xtrace it writes every expanded command.  This
+            # loop only promoted segments classified EMIT, so
+            # `leak(){ : "${UNSET:?$1}"; }` and `leak(){ set -x; : "$1"; }`
+            # both read clean (#1032 round 8 P1).  Graded on the body TEXT,
+            # which is what those two mechanisms actually act on.
+            if not emits:
+                body_text = bodies.get(name, "")
+                for a, b in _error_word_spans(body_text):
+                    if _POSITIONAL_RE.search(body_text[a:b]):
+                        emits = True
+                        break
+                if not emits and _text_enables_xtrace(body_text) \
+                        and _POSITIONAL_RE.search(body_text):
+                    emits = True
             # a here-doc body inside the helper counts too
             if not emits:
                 for hd in lx.heredocs:
@@ -2971,17 +3039,38 @@ def _alias_emitters(lx, helpers):
             # never what made the `shopt` gate real.
             if name in out:
                 continue
-            head = _alias_target_command(target)
-            if head in EMITTERS or head in STDIN_ECHOERS or head in helpers \
-                    or head in out:
+            heads = _alias_target_commands(target)
+            if any(
+                h in EMITTERS or h in STDIN_ECHOERS or h in helpers or h in out
+                for h in heads
+            ):
                 out[name] = min(out.get(name, line), line)
                 grew = True
         if not grew:
             return out
 
 
+_ALIAS_SEPARATORS = re.compile(r"(?:\|\||&&|[;|&\n])")
+
+
+def _alias_target_commands(target):
+    """Every command word in an alias REPLACEMENT LIST.
+
+    An alias target is a replacement LIST, not a single command: bash splices
+    the whole text in, so `alias leak=':; echo'` runs `:` and then `echo`.
+    Reading only the first command graded the alias on `:` and called it safe
+    while the trailing emitter printed the credential (#1032 round 8 P1).
+    """
+    out = []
+    for part in _ALIAS_SEPARATORS.split(target):
+        head = _alias_target_command(part)
+        if head:
+            out.append(head)
+    return out
+
+
 def _alias_target_command(target):
-    """The real command word of an alias TARGET.
+    """The real command word of ONE command in an alias target.
 
     `alias leak='command echo'` is an `echo`: the wrapper is stepped over the
     same way `resolve_command` steps over one in an ordinary segment.  Reading
@@ -3117,6 +3206,7 @@ def scan_text(text, path="<text>", _depth=0):
     """Return (findings, pragma_errors)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     helpers = discover_emitter_helpers(text)
+    local_functions = discover_local_functions(text)
     lx = Lexer(text)
     findings = []
     pragma_errors = []
@@ -3184,7 +3274,7 @@ def scan_text(text, path="<text>", _depth=0):
             xtrace = outer
             continue
         for ref in ll.refs:
-            hit, why = reaches_output(ref, helpers)
+            hit, why = reaches_output(ref, helpers, local_functions)
             if not hit and xtrace_at.get(
                 ref.seg.sid if ref.seg is not None else None, xtrace
             ):
@@ -4810,6 +4900,39 @@ CORPUS = [
     ("continued-name-suffix", MUST_FLAG, 'echo "$GH_\\\nTOKEN"\n'),
     ("continued-name-braced", MUST_FLAG, 'echo "${GH_\\\nTOKEN}"\n'),
     ("continued-name-midword", MUST_FLAG, 'echo "$GH\\\n_TOKEN"\n'),
+    # --- round 8: menus, replacement lists, helper mechanics, shadowing ---
+    #
+    # `select` echoes its LIST as a numbered menu on stderr before reading.
+    ("select-menu-list", MUST_FLAG, 'select v in "$GH_TOKEN"; do break; done </dev/null\n'),
+    # `for` is the near neighbour that really is word-consuming -- the pin
+    # that keeps `select` a measured exception rather than a class.
+    ("for-list-consumed", MUST_NOT_FLAG, 'for v in "$GH_TOKEN"; do break; done\necho ok\n'),
+    # An alias target is a replacement LIST; a separator before the emitter
+    # hid it from a first-command-only reading.
+    (
+        "alias-target-separator-list",
+        MUST_FLAG,
+        'shopt -s expand_aliases\nalias leak=\':; echo\'\nleak "$GH_TOKEN"\n',
+    ),
+    # A helper body can reach a stream through bash MECHANICS with no emitter
+    # in it at all: the error word bash writes itself, and xtrace.
+    (
+        "helper-error-word-body",
+        MUST_FLAG,
+        'leak(){ : "${UNSET_VALUE:?$1}"; }\nleak "$GH_TOKEN"\n',
+    ),
+    ("helper-xtrace-body", MUST_FLAG, 'leak(){ set -x; : "$1"; }\nleak "$GH_TOKEN"\n'),
+    # A local definition SHADOWS the builtin for the rest of the file.
+    ("shadowed-emitter-noop", MUST_NOT_FLAG, 'echo(){ :; }\necho "$GH_TOKEN"\necho2 ok\n'),
+    # ...and a shadow that DOES emit is still an emitter, which is what keeps
+    # the shadow rule from being a blanket exemption.
+    (
+        "shadowed-emitter-emitting",
+        MUST_FLAG,
+        'echo(){ printf %s "$1"; }\necho "$GH_TOKEN"\n',
+    ),
+    # `${VAR@a}` yields ATTRIBUTES, never the value; `@Q` carries it through.
+    ("attribute-only-expansion", MUST_NOT_FLAG, 'printf \'%s\\n\' "${GH_TOKEN@a}"\n'),
     # --- round 7: command position, alias targets, lifetimes, subshells ---
     #
     # A function definition is valid after a RESERVED WORD too, not only after
