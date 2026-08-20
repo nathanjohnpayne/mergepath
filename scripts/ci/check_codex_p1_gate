@@ -376,8 +376,17 @@ if sweep.is_a?(Hash)
       "scheduled-sweep does not lease, evaluate, reject drift, and close the same check generation"
     )
     republish = sweep_run.index("feedback_fp_publish=$(scripts/review-feedback-surface-fingerprint.sh")
+    # The re-read is only half the requirement. A sweep that reads the live
+    # fingerprint, compares it, and then still PATCHes `success` satisfies
+    # every ordering above while publishing over the finding the re-read
+    # exists to catch. Require the downgrade itself, between the re-read and
+    # the PATCH — the same shape the event-driven and relay assertions carry.
+    # The sweep writes the assignment quoted (`conclusion="failure"`), unlike
+    # the relay's bare form, so match its literal.
+    republish_reject = republish && sweep_run.index('conclusion="failure"', republish)
     require_shape.call(
-      [republish, close].all? && after < republish && republish < close &&
+      [republish, republish_reject, close].all? &&
+        after < republish && republish < close && republish_reject < close &&
         sweep_run.include?('[ "$feedback_fp_publish" != "${feedback_fp_after:-}" ]'),
       "scheduled-sweep publishes a leased success without re-reading the feedback surface immediately before the PATCH"
     )

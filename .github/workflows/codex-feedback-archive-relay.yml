@@ -456,7 +456,13 @@ jobs:
               lease_state=$(gh api "repos/$REPO/check-runs/$CHECK_ID" --jq '.status' 2>/dev/null) \
                 && [ -n "$lease_state" ] && break
               lease_state=unknown
-              sleep $((attempt * 5))
+              # Sleep only while an attempt remains. The third sleep would
+              # delay the unknown-state error path by 15s with no retry left
+              # to use it, which is the convention the recovery publisher in
+              # this file already follows.
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
             done
           fi
 
