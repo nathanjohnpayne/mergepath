@@ -1403,23 +1403,52 @@ elif grep -q 'HTTP 404' "$protection_err"; then
   # entries block gate (a) fleet-wide — a far bigger behaviour change than
   # the misreport it fixes.
   #
-  # If that is unavailable, disambiguate with the branch resource itself,
-  # which needs no admin scope and reports `.protected`:
-  #   .protected == false → genuinely unprotected → none required (pass)
-  #   .protected == true  → protected but unreadable → UNKNOWN (fail closed)
-  # An unreadable probe is itself unknown, so it also fails closed.
+  # Read the FULL protection object under the author PAT, not the
+  # sub-resource. A branch protected only by approving-review (or any other
+  # non-status) rule has NO required_status_checks section, so the
+  # sub-resource 404s for a PRIVILEGED caller too while `.protected` is still
+  # true — an "absent section" that a `.protected` test alone reads as
+  # "unreadable" and fails closed on, treating every optional red or pending
+  # rollup check as required and blocking PRs that satisfy GitHub's actual
+  # requirements (#1061 Codex P1). The full object distinguishes the two:
+  # present-and-empty/absent means none required, and only an unreadable
+  # response is genuinely unknown.
   REQUIRED_CHECK_NAMES=""
   protection_readable=0
-  if [ -n "${OP_PREFLIGHT_AUTHOR_PAT:-}" ] \
-    && author_protection_json=$(GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" \
-      gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" 2>/dev/null); then
-    REQUIRED_CHECK_NAMES=$(printf '%s' "$author_protection_json" \
-      | jq -r '[.contexts[]?, .checks[]?.context] | unique | .[]' 2>/dev/null || true)
-    protection_readable=1
-    log "gate (a): required-check list read under the author PAT (the reviewer PAT gets 404 on this endpoint, not 403 — mergepath#1059)"
-  elif branch_protected=$(gh api "repos/$REPO/branches/$BASE_BRANCH" --jq '.protected' 2>/dev/null) \
-    && [ "$branch_protected" = "false" ]; then
-    protection_readable=1   # branch is genuinely unprotected → none required
+  if [ -n "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]; then
+    author_protection_err=$(mktemp)
+    if author_protection_json=$(GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" \
+      gh api "repos/$REPO/branches/$BASE_BRANCH/protection" 2>"$author_protection_err"); then
+      REQUIRED_CHECK_NAMES=$(printf '%s' "$author_protection_json" \
+        | jq -r '[.required_status_checks.contexts[]?, .required_status_checks.checks[]?.context] | unique | .[]' 2>/dev/null || true)
+      protection_readable=1
+      if [ -z "$REQUIRED_CHECK_NAMES" ]; then
+        log "gate (a): branch protection for $BASE_BRANCH is configured but declares NO required status checks (approving-review or other non-status rules only) — read under the author PAT"
+      else
+        log "gate (a): required-check list read under the author PAT (the reviewer PAT gets 404 on this endpoint, not 403 — mergepath#1059)"
+      fi
+    elif grep -q 'HTTP 404' "$author_protection_err"; then
+      # The privileged caller sees no protection object at all → the branch
+      # is genuinely unprotected → nothing is required.
+      protection_readable=1
+      log "gate (a): branch $BASE_BRANCH is not protected (author-PAT read returned 404) — no required checks"
+    fi
+    rm -f "$author_protection_err"
+  fi
+  if [ "$protection_readable" -eq 0 ]; then
+    # No author PAT, or it could not read. Fall back to the branch resource,
+    # which needs no admin scope and reports `.protected`:
+    #   .protected == false → genuinely unprotected → none required (pass)
+    #   .protected == true  → UNKNOWN → fail closed
+    # The residual is deliberate and unavoidable at this scope: an
+    # unprivileged caller cannot tell "protected with an absent
+    # required_status_checks section" from "protected and unreadable", since
+    # GitHub returns 404 for both. Failing closed is the safe side of that
+    # ambiguity; supply OP_PREFLIGHT_AUTHOR_PAT to resolve it precisely.
+    if branch_protected=$(gh api "repos/$REPO/branches/$BASE_BRANCH" --jq '.protected' 2>/dev/null) \
+      && [ "$branch_protected" = "false" ]; then
+      protection_readable=1
+    fi
   fi
 else
   REQUIRED_CHECK_NAMES=""

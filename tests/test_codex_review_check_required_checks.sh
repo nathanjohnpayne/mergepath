@@ -1345,11 +1345,24 @@ fi
 
 SCRIPT_CODE_1059=$(grep -vE '^[[:space:]]*#' "$SCRIPT")
 
-# Revert-net 1 — the negative. The old form unconditionally trusted the 404.
-if grep -Eq 'protection_readable=1[[:space:]]*$' <<<"$(grep -A2 "grep -q 'HTTP 404'" <<<"$SCRIPT_CODE_1059")"; then
-  fail "#1059: the 404 arm still sets protection_readable=1 unconditionally — a permission-denied 404 is being read as 'no required checks' again"
+# Revert-net 1 — the negative. The old form was:
+#     elif grep -q 'HTTP 404' "$protection_err"; then
+#       REQUIRED_CHECK_NAMES=""
+#       protection_readable=1
+# i.e. the UNPRIVILEGED read's 404 alone marked the list readable. Anchor on
+# that arm specifically ($protection_err), not on "any HTTP 404 grep nearby":
+# the privileged arm keyed on $author_protection_err legitimately DOES set
+# protection_readable=1 (a 404 there means the branch really is unprotected),
+# and a proximity heuristic flags it as a regression. Extract the arm and
+# require that it initialises to 0.
+UNPRIV_404_ARM=$(sed -n '/elif grep -q .HTTP 404. "\$protection_err"; then/,/^  if \[ -n "\${OP_PREFLIGHT_AUTHOR_PAT:-}" \]; then/p' "$SCRIPT")
+if [ -z "$UNPRIV_404_ARM" ]; then
+  fail "#1059: could not locate the unprivileged 404 arm in $SCRIPT — the revert-net is not testing anything"
+elif grep -Eq '^[[:space:]]*protection_readable=0[[:space:]]*$' <<<"$UNPRIV_404_ARM" \
+   && ! grep -Eq '^[[:space:]]*protection_readable=1[[:space:]]*(#.*)?$' <<<"$UNPRIV_404_ARM"; then
+  pass "#1059: the unprivileged 404 arm initialises protection_readable=0 and does not trust the status code alone"
 else
-  pass "#1059: the 404 arm no longer trusts the status code alone"
+  fail "#1059: the unprivileged 404 arm sets protection_readable=1 without further evidence — a permission-denied 404 is being read as 'no required checks' again"
 fi
 
 # Revert-net 2 — the author-PAT retry that RESTORES the precise list. Without
@@ -1416,6 +1429,74 @@ if grep -q '2>/dev/null || true' <<<"$REVIEW_DECISION_BLOCK"; then
   pass "#1059: an unreadable reviewDecision degrades to silence, not to an error"
 else
   fail "#1059: the reviewDecision read is not error-tolerant — a denied GraphQL query would break a gate that has already passed"
+fi
+
+
+# ---------------------------------------------------------------------------
+# #1061 Codex P1: an ABSENT required_status_checks section is "none required",
+# not "unreadable".
+#
+# A branch protected only by approving-review (or any other non-status) rule
+# has no required_status_checks section, so the SUB-RESOURCE 404s even for a
+# privileged caller while `.protected` stays true. Discriminating on
+# `.protected` alone read that as unknown and failed closed, which makes gate
+# (a) treat every optional red or pending rollup check as required and blocks
+# PRs that satisfy GitHub's actual requirements. Read the FULL protection
+# object instead, and derive the list from it.
+# ---------------------------------------------------------------------------
+
+SCRIPT_CODE_1061=$(grep -vE '^[[:space:]]*#' "$SCRIPT")
+
+if grep -q 'branches/\$BASE_BRANCH/protection"' <<<"$SCRIPT_CODE_1061"; then
+  pass "#1061: the privileged retry reads the FULL protection object, not the required_status_checks sub-resource"
+else
+  fail "#1061: the privileged retry still reads the sub-resource — an absent required_status_checks section is indistinguishable from an unreadable one"
+fi
+
+if grep -q 'required_status_checks.contexts\[\]?' <<<"$SCRIPT_CODE_1061" \
+   && grep -q 'required_status_checks.checks\[\]?.context' <<<"$SCRIPT_CODE_1061"; then
+  pass "#1061: the required-name list is derived from the full object's required_status_checks (both contexts[] and checks[])"
+else
+  fail "#1061: the full-object read does not derive names from .required_status_checks — the list will always come back empty"
+fi
+
+# Behavioural: drive the script's OWN derivation expression over each real
+# protection shape. Extracted from the script so it cannot drift from it.
+DERIVE_1061=$(grep -o '\[\.required_status_checks\.contexts\[\]?.*unique | \.\[\]' "$SCRIPT" | head -1)
+if [ -z "$DERIVE_1061" ]; then
+  fail "#1061: could not extract the derivation expression from $SCRIPT"
+else
+  d_approvals=$(echo '{"required_pull_request_reviews":{"required_approving_review_count":1}}' | jq -r "$DERIVE_1061" 2>/dev/null | grep -c . || true)
+  d_empty=$(echo '{"required_status_checks":{"contexts":[],"checks":[]}}' | jq -r "$DERIVE_1061" 2>/dev/null | grep -c . || true)
+  d_ctx=$(echo '{"required_status_checks":{"contexts":["Label Gate","lint"],"checks":[{"context":"Label Gate"}]}}' | jq -r "$DERIVE_1061" 2>/dev/null | grep -c . || true)
+  d_checks=$(echo '{"required_status_checks":{"checks":[{"context":"Merge clearance gate"}]}}' | jq -r "$DERIVE_1061" 2>/dev/null | grep -c . || true)
+
+  if [ "$d_approvals" -eq 0 ]; then
+    pass "#1061: approvals-only protection derives 0 required names → none required, NOT fail-closed"
+  else
+    fail "#1061: approvals-only protection derived $d_approvals names (expected 0)"
+  fi
+  if [ "$d_empty" -eq 0 ]; then
+    pass "#1061: a present-but-empty required_status_checks derives 0 names"
+  else
+    fail "#1061: empty required_status_checks derived $d_empty names (expected 0)"
+  fi
+  if [ "$d_ctx" -eq 2 ] && [ "$d_checks" -eq 1 ]; then
+    pass "#1061: populated protection still derives its names from both contexts[] and checks[] ($d_ctx, $d_checks)"
+  else
+    fail "#1061: populated protection derived $d_ctx / $d_checks names (expected 2 / 1) — the full-object path lost the required list"
+  fi
+fi
+
+# The empty-list case must reach the READABLE arm. If it set
+# protection_readable=0 the fix would be cosmetic: gate (a) would still fail
+# closed on a branch that genuinely requires nothing.
+FULLREAD_BLOCK=$(sed -n '/if \[ -n "\${OP_PREFLIGHT_AUTHOR_PAT:-}" \]; then/,/^  fi$/p' "$SCRIPT")
+if grep -q 'protection_readable=1' <<<"$FULLREAD_BLOCK" \
+   && grep -q 'declares NO required status checks' <<<"$FULLREAD_BLOCK"; then
+  pass "#1061: a successfully-read protection object with no required checks is marked READABLE and logged as such"
+else
+  fail "#1061: the no-required-checks case does not reach the readable arm — gate (a) would still fail closed on approvals-only protection"
 fi
 
 echo ""
