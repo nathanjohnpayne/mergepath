@@ -45,13 +45,65 @@
 
 name: repo-lint
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  lint:
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      deep: ${{ steps.classify.outputs.deep }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: classify repo-lint scope
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          classifier=scripts/ci/repo-lint-scope.sh
+          if [ ! -f "$classifier" ]; then
+            if [ -f scripts/sync-to-downstream.sh ]; then
+              echo "FAIL: $classifier is missing from the hub checkout" >&2
+              exit 1
+            fi
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then
+              echo "deep=false" >> "$GITHUB_OUTPUT"
+            fi
+            echo "repo-lint scope: consumer skipped the scripts/ci kit"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            printf '' | bash "$classifier" --event "$EVENT_NAME"
+          elif git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
+              && git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null \
+              && changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA"); then
+            printf '%s\n' "$changed" | bash "$classifier" --event "$EVENT_NAME"
+          else
+            echo "deep=true" >> "$GITHUB_OUTPUT"
+            echo "repo-lint scope: PR diff unavailable; failing closed to deep CI"
+          fi
+
+  lint_fast:
+    name: lint-fast
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -398,7 +450,7 @@ jobs:
         run: ./scripts/ci/check_phase_4b_classifier || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_classifier ]; then echo "check_phase_4b_classifier not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_automation
-        run: ./scripts/ci/check_phase_4b_automation || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_automation ]; then echo "check_phase_4b_automation not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+        run: ./scripts/ci/check_phase_4b_automation --check || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_automation ]; then echo "check_phase_4b_automation not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_accounting
         # Phase 4b approval-loop accounting (#602), wired like
@@ -410,7 +462,7 @@ jobs:
         # activates as soon as the script lands. (Kept on one line so the
         # check_ci_scripts_wired parser still sees an explicit
         # `run: ./scripts/ci/check_phase_4b_accounting` wire.)
-        run: ./scripts/ci/check_phase_4b_accounting || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_accounting ]; then echo "check_phase_4b_accounting not on this tree yet — soft pass (self-bootstrap)"; exit 0; fi; exit "$rc"; }
+        run: ./scripts/ci/check_phase_4b_accounting --check || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_accounting ]; then echo "check_phase_4b_accounting not on this tree yet — soft pass (self-bootstrap)"; exit 0; fi; exit "$rc"; }
 
       - name: check_lint_tooling
         run: ./scripts/ci/check_lint_tooling || { rc=$?; if [ ! -f scripts/ci/check_lint_tooling ]; then echo "check_lint_tooling not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
@@ -447,7 +499,7 @@ jobs:
         run: ./scripts/ci/check_feedback_policy_helpers || { rc=$?; if [ ! -f scripts/ci/check_feedback_policy_helpers ]; then echo "check_feedback_policy_helpers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_merge_clearance_gate
-        run: ./scripts/ci/check_merge_clearance_gate || { rc=$?; if [ ! -f scripts/ci/check_merge_clearance_gate ]; then echo "check_merge_clearance_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+        run: ./scripts/ci/check_merge_clearance_gate --check || { rc=$?; if [ ! -f scripts/ci/check_merge_clearance_gate ]; then echo "check_merge_clearance_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_required_check_publisher
         # Regression fence for .github/workflows/required-check-publisher.yml
@@ -500,6 +552,10 @@ jobs:
             exit 1
           fi
 
+      - name: check_repo_lint_optimization
+        # The delegated test parses workflow YAML with mikefarah/yq.
+        run: ./scripts/ci/check_repo_lint_optimization || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_optimization ]; then echo "check_repo_lint_optimization not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_resolve_pr_threads
         # Requires yq via the delegated verified-propagation suite —
         # runs after install_yq_for_sync_manifest above (Codex P2 on
@@ -545,7 +601,7 @@ jobs:
         # removed after delivery ⇒ fail. A base-ref diff would be the other
         # way to tell those apart, but this job checks out at depth 1 and has
         # no base commit to read.
-        run: ./scripts/ci/check_no_token_in_output || { rc=$?; if [ -f scripts/ci/check_no_token_in_output ]; then exit "$rc"; fi; if [ -f scripts/sync-to-downstream.sh ]; then echo "check_no_token_in_output is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; fi; if [ -f scripts/ci/token_output_gate.py ]; then echo "check_no_token_in_output is absent while its gate payload scripts/ci/token_output_gate.py is present — the launcher was deleted, not un-synced"; exit 1; fi; echo "check_no_token_in_output not in this tree yet; soft-pass (consumer bootstrap skew — launcher and payload both absent)"; exit 0; }
+        run: ./scripts/ci/check_no_token_in_output --scan || { rc=$?; if [ -f scripts/ci/check_no_token_in_output ]; then exit "$rc"; fi; if [ -f scripts/sync-to-downstream.sh ]; then echo "check_no_token_in_output is missing from the hub checkout — the launcher was deleted, not un-synced"; exit 1; fi; if [ -f scripts/ci/token_output_gate.py ]; then echo "check_no_token_in_output is absent while its gate payload scripts/ci/token_output_gate.py is present — the launcher was deleted, not un-synced"; exit 1; fi; echo "check_no_token_in_output not in this tree yet; soft-pass (consumer bootstrap skew — launcher and payload both absent)"; exit 0; }
 
       - name: check_op_preflight_contract
         run: ./scripts/ci/check_op_preflight_contract || { rc=$?; if [ ! -f scripts/ci/check_op_preflight_contract ]; then echo "check_op_preflight_contract not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
@@ -570,33 +626,6 @@ jobs:
 
       - name: check_sweep_unresolved_feedback
         run: ./scripts/ci/check_sweep_unresolved_feedback || { rc=$?; if [ ! -f scripts/ci/check_sweep_unresolved_feedback ]; then echo "check_sweep_unresolved_feedback not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_consumer_residue_safety
-        # Residue-invariance net — the direction the #601 net structurally
-        # cannot see. That suite models a consumer by STRIPPING a
-        # hand-written list, so it can only test a check against MISSING
-        # files; bootstrap residue is a hub-only file unexpectedly PRESENT
-        # on a consumer (gaycruisebingo carries ~24 such paths). This one
-        # derives the consumer shape from .mergepath-sync.yml and asserts
-        # every check_* wrapper's verdict is invariant under every subset
-        # of the hub-only paths it references. Hub-only (needs the full hub
-        # tree + the manifest); SKIPs on consumers. Runs just ahead of the
-        # #601 net — same failure class, ~3 minutes instead of a few.
-        # Soft-passes if the script has not landed yet (#590 pattern), so a
-        # sync wave that delivers this workflow before the scripts/ci/ kit
-        # does not 127-fail. (One line so check_ci_scripts_wired still sees
-        # the explicit `run: ./scripts/ci/check_consumer_residue_safety`.)
-        run: ./scripts/ci/check_consumer_residue_safety || { rc=$?; if [ ! -f scripts/ci/check_consumer_residue_safety ]; then echo "check_consumer_residue_safety not on this tree yet — soft pass (self-bootstrap)"; exit 0; fi; exit "$rc"; }
-
-      - name: check_repo_lint_consumer_safety
-        # #601 consumer-safety net (Codex P2 on #624: it existed unwired).
-        # Re-runs every check_* wrapper inside a consumer-SHAPED checkout
-        # and fails if any errors instead of skipping/passing — catching a
-        # hub-only check that would red a consumer BEFORE a wave ships it.
-        # Hub-only (needs the full hub tree); SKIPs on consumers. The
-        # longest check in this job (a few minutes) — keep it late in the
-        # step list so cheap checks fail fast first.
-        run: ./scripts/ci/check_repo_lint_consumer_safety || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_consumer_safety ]; then echo "check_repo_lint_consumer_safety not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_disagreement_detector
         run: ./scripts/ci/check_disagreement_detector || { rc=$?; if [ ! -f scripts/ci/check_disagreement_detector ]; then echo "check_disagreement_detector not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
@@ -629,7 +658,7 @@ jobs:
         # Reads the same manifest as the two checks above and shares
         # their yq install; consumer checkouts SKIP inside the wrapper
         # via the sync-to-downstream.sh marker idiom.
-        run: ./scripts/ci/check_doc_ownership || { rc=$?; if [ ! -f scripts/ci/check_doc_ownership ]; then echo "check_doc_ownership not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+        run: ./scripts/ci/check_doc_ownership --check || { rc=$?; if [ ! -f scripts/ci/check_doc_ownership ]; then echo "check_doc_ownership not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_branch_protection_audit
         # Hub-only fleet branch-protection audit suite (#774): the
@@ -724,7 +753,7 @@ jobs:
         # Unit tests for coderabbit-wait.sh's timeout status probe.
         # Verifies exit-4 status probing stays advisory, surfaces the
         # reply in JSON, and never counts the reply as clearance.
-        run: ./scripts/ci/check_coderabbit_wait || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_wait ]; then echo "check_coderabbit_wait not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+        run: ./scripts/ci/check_coderabbit_wait --check || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_wait ]; then echo "check_coderabbit_wait not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_coderabbit_record_feedback
         # CodeRabbit disposition-verdict ledger (#584) — the disposition-only
@@ -767,3 +796,111 @@ jobs:
       # self-bootstrap tail as the snapshot step above.
       - name: check_git_identity_hygiene
         run: ./scripts/ci/check_git_identity_hygiene || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
+  deep_safety:
+    name: deep-safety (${{ matrix.safety }})
+    needs: scope
+    if: needs.scope.outputs.deep == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        safety: [consumer, residue]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: make_ci_scripts_executable
+        run: |
+          if [ -d scripts/ci ]; then
+            find scripts/ci -maxdepth 1 -type f -exec chmod +x {} +
+          fi
+
+      - name: check_git_identity_hygiene --snapshot
+        run: ./scripts/ci/check_git_identity_hygiene --snapshot || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
+      - name: install_python_ci_dependencies
+        if: matrix.safety == 'consumer'
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/ci-pyenv"
+          "$RUNNER_TEMP/ci-pyenv/bin/pip" install --quiet 'PyYAML==6.0.3' 'markdown-it-py==4.2.0'
+          echo "$RUNNER_TEMP/ci-pyenv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/ci-pyenv/bin/python3" -c "import yaml, markdown_it"
+
+      - name: install_yq_for_deep_safety
+        run: |
+          if [ -f scripts/lib/ensure-yq.sh ]; then
+            bash scripts/lib/ensure-yq.sh
+          elif command -v yq >/dev/null 2>&1 \
+              && yq --version 2>&1 | grep -q "mikefarah/yq"; then
+            echo "scripts/lib/ensure-yq.sh not synced yet — using preinstalled $(yq --version)"
+          else
+            echo "FAIL: no mikefarah/yq available for deep safety" >&2
+            exit 1
+          fi
+
+      - name: check_no_token_in_output --self-test
+        if: matrix.safety == 'consumer'
+        run: ./scripts/ci/check_no_token_in_output --self-test || { rc=$?; if [ ! -f scripts/ci/check_no_token_in_output ]; then echo "check_no_token_in_output not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_doc_ownership --self-test
+        if: matrix.safety == 'consumer'
+        run: ./scripts/ci/check_doc_ownership --self-test || { rc=$?; if [ ! -f scripts/ci/check_doc_ownership ]; then echo "check_doc_ownership not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_coderabbit_wait --self-test
+        if: matrix.safety == 'consumer'
+        run: ./scripts/ci/check_coderabbit_wait --self-test || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_wait ]; then echo "check_coderabbit_wait not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_merge_clearance_gate --self-test
+        if: matrix.safety == 'consumer'
+        run: ./scripts/ci/check_merge_clearance_gate --self-test || { rc=$?; if [ ! -f scripts/ci/check_merge_clearance_gate ]; then echo "check_merge_clearance_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_phase_4b_automation --self-test
+        if: matrix.safety == 'consumer'
+        run: ./scripts/ci/check_phase_4b_automation --self-test || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_automation ]; then echo "check_phase_4b_automation not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_phase_4b_accounting --self-test
+        if: matrix.safety == 'consumer'
+        run: ./scripts/ci/check_phase_4b_accounting --self-test || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_accounting ]; then echo "check_phase_4b_accounting not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_repo_lint_consumer_safety
+        if: matrix.safety == 'consumer'
+        run: ./scripts/ci/check_repo_lint_consumer_safety || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_consumer_safety ]; then echo "check_repo_lint_consumer_safety not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_consumer_residue_safety
+        if: matrix.safety == 'residue'
+        run: ./scripts/ci/check_consumer_residue_safety || { rc=$?; if [ ! -f scripts/ci/check_consumer_residue_safety ]; then echo "check_consumer_residue_safety not on this tree yet — soft pass (self-bootstrap)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_git_identity_hygiene
+        run: ./scripts/ci/check_git_identity_hygiene || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
+  lint:
+    name: lint
+    if: always()
+    needs: [scope, lint_fast, deep_safety]
+    runs-on: ubuntu-latest
+    steps:
+      - name: publish aggregate lint result
+        env:
+          DEEP: ${{ needs.scope.outputs.deep }}
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          FAST_RESULT: ${{ needs.lint_fast.result }}
+          DEEP_RESULT: ${{ needs.deep_safety.result }}
+        run: |
+          set -euo pipefail
+          if [ "$SCOPE_RESULT" != "success" ] || [ "$FAST_RESULT" != "success" ]; then
+            echo "FAIL: scope=$SCOPE_RESULT lint-fast=$FAST_RESULT" >&2
+            exit 1
+          fi
+          if [ "$DEEP" = "true" ]; then
+            if [ "$DEEP_RESULT" != "success" ]; then
+              echo "FAIL: deep CI required; deep-safety=$DEEP_RESULT" >&2
+              exit 1
+            fi
+          elif [ "$DEEP_RESULT" != "skipped" ]; then
+            echo "FAIL: fast CI expected deep safety to skip; deep-safety=$DEEP_RESULT" >&2
+            exit 1
+          fi
+          echo "lint: PASS (deep=$DEEP, fast=$FAST_RESULT, deep-safety=$DEEP_RESULT)"

@@ -286,6 +286,7 @@ while IFS= read -r name; do
     cd "$FIX" && \
     env -u GH_TOKEN -u GITHUB_TOKEN \
         -u OP_PREFLIGHT_REVIEWER_PAT -u OP_PREFLIGHT_AUTHOR_PAT \
+        MERGEPATH_CONSUMER_SAFETY=1 \
         GITHUB_REPOSITORY="nathanjohnpayne/consumer-fixture" \
         PATH="$SHIM:$PATH" \
         bash "./scripts/ci/$name" </dev/null 2>&1
@@ -293,9 +294,10 @@ while IFS= read -r name; do
   rc=$?
   set -e
   if [ "$rc" -eq 0 ]; then
-    # Surface whether it PASSed or SKIPped for the log.
-    verdict="exit 0"
-    echo "$out" | grep -q "SKIP" && verdict="SKIP"
+    # Surface the wrapper's OWN verdict. Nested regression suites also print
+    # SKIP for optional fixtures; treating any occurrence as the wrapper's
+    # disposition made fully-executed checks look skipped in timing audits.
+    verdict=$(printf '%s\n' "$out" | bash "$FIX/scripts/ci/repo-lint-consumer-verdict.sh" "$name")
     pass "$name: consumer-safe ($verdict)"
   else
     fail "$name: exit $rc on the consumer fixture — would red every consumer repo-lint. Output tail:"

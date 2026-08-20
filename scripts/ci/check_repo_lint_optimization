@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST="$REPO_ROOT/tests/test_repo_lint_optimization.sh"
+
+if [ ! -f "$TEST" ]; then
+  echo "check_repo_lint_optimization: ERROR (missing $TEST)" >&2
+  exit 1
+fi
+
+bash "$TEST"

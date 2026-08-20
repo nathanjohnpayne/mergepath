@@ -759,9 +759,15 @@ case "$args" in
     exec "$STUB_STATE/page.sh" "$page" "$(cat "$STUB_STATE/polls")"
     ;;
   *repo_lint_local.yml*)
-    # No annex in this fixture: a confirmed 404, the mergepath case.
-    echo 'gh: Not Found (HTTP 404)' >&2
-    exit 1
+    if [ "$FIXTURE_MODE" = "no-annex" ]; then
+      # Confirmed absence exercises the native-auto-merge fast path.
+      echo 'gh: Not Found (HTTP 404)' >&2
+      exit 1
+    fi
+    # A path-filtered annex keeps the explicit wait active without itself
+    # needing to report a check for this fixture's empty changed-file list.
+    printf '%s' 'bmFtZTogUmVwbyBsaW50IGxvY2FsCm9uOgogIHB1bGxfcmVxdWVzdDoKICAgIHBhdGhzOgogICAgICAtIGFubmV4LyoqCmpvYnM6CiAgbG9jYWw6CiAgICBydW5zLW9uOiB1YnVudHUtbGF0ZXN0CiAgICBzdGVwczogW10K'
+    exit 0
     ;;
   *pulls/*files*)
     printf '%s' '[]'
@@ -811,7 +817,8 @@ wrap() {  # nodes-json hasNextPage endCursor
       {contexts: {pageInfo: {hasNextPage: $hasnext, endCursor: $cur}, nodes: $nodes}}}}]}}}}}'
 }
 
-case "${FIXTURE_MODE}" in
+mode="${FIXTURE_MODE#annex-}"
+case "$mode" in
   pending-page1)
     # The required `lint` sits on page 1 and is still queued: the pages
     # beyond it cannot change this poll's verdict.
@@ -880,6 +887,22 @@ WL_PAGE_STUB
     wl_count() { grep -c "^$1\$" "$WL_ROOT/state/gh.log" || true; }
     wl_sleeps() { tr '\n' ' ' <"$WL_ROOT/state/sleeps" | sed 's/ $//'; }
 
+    # ── Case 0: no optional annex ───────────────────────────────────
+    #
+    # Branch protection already owns the canonical required `lint` check.
+    # With no repo_lint_local.yml annex, this job should export the pinned
+    # HEAD and hand waiting to GitHub native auto-merge without polling or
+    # sleeping on a runner.
+    WL_RC0=$(wl_run no-annex 0)
+    WL0_P1=$(wl_count page1); WL0_SLEEPS=$(wl_sleeps)
+    if [ "$WL_RC0" = "0" ] && [ "$WL0_P1" = "0" ] && [ -z "$WL0_SLEEPS" ] \
+       && grep -q '^CURRENT_HEAD_SHA=cafef00dcafef00d$' "$WL_ROOT/state/github_env"; then
+      pass "#1062 case 0: a confirmed-absent annex delegates required-check waiting to GitHub without runner polling"
+    else
+      fail "#1062 case 0: expected rc=0, zero rollup queries/sleeps, and a pinned HEAD export; got rc=$WL_RC0, page1=$WL0_P1, sleeps='$WL0_SLEEPS'"
+      sed 's/^/    /' "$WL_ROOT/state/out" | tail -20 >&2
+    fi
+
     # ── Case 1: a required check pending on page 1 ───────────────────
     #
     # 11 polls see `lint` QUEUED, the 12th sees it green. The old loop
@@ -888,7 +911,7 @@ WL_PAGE_STUB
     # already "wait" (12 page-1 queries, 1 page-2 query on the final,
     # conclusive poll) and widens the interval once 120s of waiting has
     # accumulated.
-    WL_RC=$(wl_run pending-page1 11)
+    WL_RC=$(wl_run annex-pending-page1 11)
     WL_P1=$(wl_count page1); WL_P2=$(wl_count page2); WL_SLEEPS=$(wl_sleeps)
 
     if [ "$WL_RC" = "0" ]; then
@@ -915,7 +938,7 @@ WL_PAGE_STUB
     # further and keep waiting -- 2 queries per poll, no early clearance
     # -- until the page-2 entry completes. Any short-circuit that
     # concludes from page 1 alone reports green here on the first poll.
-    WL_RC2=$(wl_run stale-then-pending-page2 3)
+    WL_RC2=$(wl_run annex-stale-then-pending-page2 3)
     WL2_P1=$(wl_count page1); WL2_P2=$(wl_count page2); WL2_SLEEPS=$(wl_sleeps)
 
     if [ "$WL_RC2" = "0" ] && [ "$WL2_P1" = "4" ] && [ "$WL2_P2" = "4" ]; then

@@ -1354,12 +1354,14 @@ if grep -Fq "Require current-head check success" .github/workflows/agent-review.
    grep -Fq "Re-verify blocking labels after test wait" .github/workflows/agent-review.yml && \
    grep -Fq 'CURRENT_HEAD_SHA=$sha' .github/workflows/agent-review.yml && \
    grep -Fq -- "--match-head-commit" .github/workflows/agent-review.yml && \
+   grep -Fq 'annex_absent="true"' .github/workflows/agent-review.yml && \
+   grep -Fq "GitHub native auto-merge will enforce required checks" .github/workflows/agent-review.yml && \
    grep -Fq "waiting for completion" .github/workflows/agent-review.yml && \
    grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review auto-merge waits for configured current-head check success, rechecks labels, and binds merge to the checked HEAD"
+  echo "  PASS: agent-review delegates required-check waiting when no annex exists, retains annex enforcement, rechecks labels, and binds merge to the checked HEAD"
 else
-  echo "  FAIL: agent-review auto-merge must wait for configured current-head check success, recheck labels, and bind merge to the checked HEAD" >&2
+  echo "  FAIL: agent-review auto-merge must delegate branch-protected waits only when the annex is absent, retain annex enforcement, recheck labels, and bind merge to the checked HEAD" >&2
   fail=$((fail + 1))
 fi
 

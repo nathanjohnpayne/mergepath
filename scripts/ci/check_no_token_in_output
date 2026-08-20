@@ -37,4 +37,12 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 2
 fi
 
+# The consumer-safety lane verifies this gate against a consumer-shaped tree,
+# but replaying the unchanged execution-oracle differential suite there adds
+# no consumer-specific signal. Keep the live repository scan and leave the
+# oracle to the explicit deep-CI self-test step.
+if [ "${MERGEPATH_CONSUMER_SAFETY:-0}" = "1" ] && [ "$#" -eq 0 ]; then
+  set -- --scan
+fi
+
 exec python3 "$GATE" "$@"

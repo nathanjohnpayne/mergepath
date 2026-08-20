@@ -1435,6 +1435,7 @@ jobs:
           required_checks_json=$(jq -n --arg name "$required_check_name" '[{name: $name, workflow: ""}]')
           annex_workflow=""
           annex_unfiltered="false"
+          annex_absent="false"
           annex_probe_err=$(mktemp)
           if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$sha" --jq .content 2>"$annex_probe_err"); then
             # The annex contract (scripts/ci/check_ci_scripts_wired) only requires
@@ -1838,7 +1839,12 @@ jobs:
               fi
             fi
           elif grep -q 'HTTP 404' "$annex_probe_err"; then
-            : # genuinely absent (confirmed 404) — no annex, no-op, unchanged from before.
+            # A confirmed absence is the common case. The canonical `lint`
+            # check is already required by branch protection, so GitHub's
+            # native auto-merge queue can wait for it without keeping this
+            # runner alive. Only a present, non-required annex needs the
+            # explicit polling loop below.
+            annex_absent="true"
           elif grep -q 'HTTP 403' "$annex_probe_err"; then
             # #655 Codex P2 round 4: a 403 (token lacks Contents: read) is
             # USUALLY persistent, not transient -- forcing enforcement here
@@ -1860,6 +1866,12 @@ jobs:
             echo "::warning::Could not determine whether repo_lint_local.yml exists at $sha (API error, not a confirmed 404) — this run cannot enforce it (gate (a) / codex-review-check.sh still will) (#655): $(cat "$annex_probe_err")"
           fi
           rm -f "$annex_probe_err"
+
+          if [ "$annex_absent" = "true" ]; then
+            echo "CURRENT_HEAD_SHA=$sha" >> "$GITHUB_ENV"
+            echo "::notice::repo_lint_local.yml is absent on current HEAD $sha; GitHub native auto-merge will enforce required checks without this runner polling for them."
+            exit 0
+          fi
 
           # #655 Codex P2 round 11 ("restrict the lint wait to the required
           # workflow"): gh pr view --json statusCheckRollup has no field for
