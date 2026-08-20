@@ -1416,9 +1416,8 @@ elif grep -q 'HTTP 404' "$protection_err"; then
   REQUIRED_CHECK_NAMES=""
   protection_readable=0
   if [ -n "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]; then
-    author_protection_err=$(mktemp)
     if author_protection_json=$(GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" \
-      gh api "repos/$REPO/branches/$BASE_BRANCH/protection" 2>"$author_protection_err"); then
+      gh api "repos/$REPO/branches/$BASE_BRANCH/protection" 2>/dev/null); then
       REQUIRED_CHECK_NAMES=$(printf '%s' "$author_protection_json" \
         | jq -r '[.required_status_checks.contexts[]?, .required_status_checks.checks[]?.context] | unique | .[]' 2>/dev/null || true)
       protection_readable=1
@@ -1427,13 +1426,19 @@ elif grep -q 'HTTP 404' "$protection_err"; then
       else
         log "gate (a): required-check list read under the author PAT (the reviewer PAT gets 404 on this endpoint, not 403 — mergepath#1059)"
       fi
-    elif grep -q 'HTTP 404' "$author_protection_err"; then
-      # The privileged caller sees no protection object at all → the branch
-      # is genuinely unprotected → nothing is required.
-      protection_readable=1
-      log "gate (a): branch $BASE_BRANCH is not protected (author-PAT read returned 404) — no required checks"
     fi
-    rm -f "$author_protection_err"
+    # NOTE: a 404 from the privileged read is deliberately NOT handled here.
+    # It is the same permission-ambiguous 404 as the unprivileged one: an
+    # OP_PREFLIGHT_AUTHOR_PAT that has expired, lacks Administration:read, or
+    # cannot reach this repo is concealed behind exactly that status. Treating
+    # it as proof of absence would mark the list readable-and-EMPTY, and the
+    # empty-list branch below discards the rollup — so a genuinely failing
+    # required check would sail through gate (a). That is the fail-OPEN #465
+    # exists to close, reintroduced one level up (#1061 Codex P1, round 2).
+    # Leave it unknown and let the `.protected` probe below supply the only
+    # positive evidence of an unprotected branch that an unprivileged caller
+    # can actually obtain. No stderr capture is kept for that read, because
+    # no status code it can return would be actionable.
   fi
   if [ "$protection_readable" -eq 0 ]; then
     # No author PAT, or it could not read. Fall back to the branch resource,

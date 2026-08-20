@@ -1598,6 +1598,25 @@ else
   run_prot_case "no author PAT, .protected=true (must fail closed)" \
     404 none true no 0 0
 
+
+  # #1061 Codex P1 round 2: a 404 from the PRIVILEGED read is the same
+  # permission-ambiguous 404 as the unprivileged one. An OP_PREFLIGHT_AUTHOR_PAT
+  # that has expired, lacks Administration:read, or cannot reach the repo is
+  # concealed behind exactly that status. Treating it as proof of absence marks
+  # the list readable-and-EMPTY, and the empty-list branch discards the rollup —
+  # so a genuinely failing required check sails through gate (a). That is the
+  # fail-OPEN #465 exists to close, one level up.
+  #
+  # A bad author PAT on a PROTECTED branch must therefore stay UNKNOWN.
+  run_prot_case "bad/expired author PAT on a protected branch (must NOT fail open)" \
+    404 full-404 true yes 0 0
+
+  # ...and the SAME bad PAT on an unprotected branch is still allowed through,
+  # but only because `.protected=false` proves it independently — never because
+  # the privileged 404 was believed.
+  run_prot_case "bad/expired author PAT, but .protected=false proves unprotected" \
+    404 full-404 false yes 1 0
+
   # Unprivileged read succeeds outright — the pre-existing happy path must be
   # untouched by all of the above.
   run_prot_case "unprivileged read succeeds (unchanged happy path)" \
