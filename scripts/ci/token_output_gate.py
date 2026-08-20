@@ -227,6 +227,36 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     sync with the file, and the remainder must not vanish into a body in
     silence.
   * The word of a here-STRING given to one of those same commands.
+  * The LITERAL operand of `trap` or `eval`, re-read AS SHELL.  The operand is
+    source the shell runs later, so quoting inside it quotes the TEXT and not
+    an expansion: `trap 'echo "$PAT"' EXIT` prints the credential when the
+    trap fires.  This is the same relationship an interpolating here-doc body
+    has with its opener and it is handled the same way -- one hop
+    (`_DEFERRED_SHELL_DEPTH`), and a discovery error inside the deferred text
+    is REPORTED rather than dropped, for the reason an unterminated here-doc
+    is.  An operand that does not reduce to a literal is not re-read; `trap`
+    is opaque, so a reference the lexer can see inside one is flagged anyway.
+  * A reference anywhere XTRACE is in effect.  With `set -x` (or `set -o
+    xtrace`, or a `-x` shebang) bash writes every EXPANDED command to stderr,
+    so `: "$PAT"` -- the safest command word there is -- puts the value on a
+    stream.  This is shell STATE, tracked in source order across the file and
+    resolved per SEGMENT, so `( set -x; : "$PAT" )` counts and `set +x`,
+    `set +o xtrace` and `set -- -x` are all read correctly.
+  * The operand of a builtin that requires a NUMBER and REPRODUCES a
+    non-numeric one in its own stderr diagnostic -- `exit`, `return`, `shift`,
+    `break`, `continue`, `ulimit`, `wait`, `history`.  Membership is
+    oracle-decided; the near neighbours that stay silent (`let`, `umask`,
+    `read`, `getopts`, `fc`) are MUST_NOT_FLAG cases.  These write STDERR and
+    the shields are built around stdout emitters, so the capture and pipeline
+    spellings disagree with the oracle in both directions and all three are
+    declared -- the descriptor seam is #1042's.
+  * A command word the shell REWRITES before it names a command fails closed.
+    `ec{h,}o "$PAT"` brace-expands to `echo` and `/bin/e[c]ho "$PAT"`
+    pathname-expands to `/bin/echo`; both print the credential, and reading
+    the unexpanded literal as the command matched no emitter.  The test is
+    narrow enough that `[ -n "$PAT" ]`, `[[ ... ]]`, `{ ...; }` and a quoted
+    `"ec{h,}o"` are untouched, and the cost -- an expansion that resolves to a
+    NON-emitting command reds anyway -- is a declared conservatism.
 
 A PIPELINE IS NOT AN EMISSION; ITS CONSUMER DECIDES.  `printf '%s' "$PAT" |`
 puts the value on the next command's STANDARD INPUT, which is the same act as
@@ -647,6 +677,24 @@ SAFE_COMMANDS = frozenset(
         ":", "true", "false", "shift", "return", "exit",
     }
 )
+# Builtins that require a NUMERIC operand and, when handed a non-numeric one,
+# REPRODUCE THAT OPERAND VERBATIM in their own diagnostic on stderr:
+#
+#     $ exit "$GH_TOKEN"
+#     bash: exit: Zq7Xf2Lp9Vt4Rk8Nb3Md6Wc1Ys5Hj0Gr: numeric argument required
+#
+# So a credential in that position IS an output path, and classifying these
+# universally safe made `--scan` report PASS on a live stderr leak (#1032
+# round 4 P1).  The membership is oracle-DECIDED, not guessed: every builtin
+# below was measured putting the sentinel on a stream, and the near neighbours
+# that do NOT -- `let`, `umask`, `read`, `getopts`, `fc`, and every binding
+# form and conditional in SAFE_COMMANDS -- were measured clean and are
+# deliberately absent, each pinned by a MUST_NOT_FLAG corpus case.  A
+# credential-named operand is what fires this; `exit "$rc"` names no
+# credential and is not a reference at all.
+NUMERIC_OPERAND_DIAGNOSTIC = frozenset(
+    {"exit", "return", "shift", "break", "continue", "ulimit", "wait", "history"}
+)
 # Commands that dump the environment they were given, so an env-prefix
 # assignment feeding one does reach a stream.
 ENV_DUMPERS = frozenset({"env", "printenv", "set", "compgen"})
@@ -659,7 +707,7 @@ PASSTHRU = frozenset(
 )
 # Command words that hand the whole word to a shell/interpreter.  Unresolvable
 # by a source-text scanner, so they are fail-closed rather than assumed safe.
-OPAQUE_COMMANDS = frozenset({"eval", "source", "."})
+OPAQUE_COMMANDS = frozenset({"eval", "source", ".", "trap"})
 
 RESERVED_WORDS = frozenset(
     {
@@ -1719,6 +1767,76 @@ def _iter_refs(s):
 UNRESOLVED = "<unresolved>"
 
 
+def _command_word_expands(w):
+    """Does this command word carry an UNQUOTED expansion the shell performs?
+
+    `_unquote_command_word` reduces a word to its literal text, which is the
+    right answer for `"echo"` and `\\echo` -- quoting suppresses expansion, so
+    the literal IS the command.  It is the WRONG answer for `ec{h,}o` and
+    `/bin/e[c]ho`: bash brace-expands the first into `echo` and pathname-
+    expands the second onto `/bin/echo`, and both printed the credential while
+    the literal (`ec{h,}o`, `/bin/e[c]ho`) matched no known emitter and
+    defaulted to safe, so `--scan` reported PASS (#1032 round 4 P1).
+
+    Returning True routes the word to UNRESOLVED, which classifies OPAQUE --
+    the fail-CLOSED answer, and the same one an unresolvable command word has
+    always taken.  Resolving the expansion is not on the table: it depends on
+    the files present at run time, which a source-text scanner cannot know.
+
+    The test is deliberately narrow, so it fires on words the shell really
+    does rewrite and not on ordinary punctuation:
+
+      * an unquoted `*` or `?` -- always a pathname pattern;
+      * an unquoted `[` with a later unquoted `]` -- a bracket pattern.  `[`
+        and `[[` as command words carry no closing bracket IN THE SAME WORD
+        and so are unaffected, which is what keeps `[ -n "$GH_TOKEN" ]`
+        clean;
+      * an unquoted `{` with a later unquoted `}` and a `,` or `..` between
+        them -- brace expansion needs one of those to expand at all, so
+        `a{b}c` stays the literal command word bash runs.
+
+    A word carrying `$` or a backquote never reaches here: it is UNRESOLVED
+    already.
+    """
+    meta = []  # (char, index) for unquoted metacharacters only
+    i = 0
+    n = len(w)
+    while i < n:
+        c = w[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = w.find("'", i + 1)
+            if j == -1:
+                return False
+            i = j + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n and w[j] != '"':
+                j += 2 if w[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c in "*?[]{}":
+            meta.append((c, i))
+        i += 1
+    kinds = [c for c, _ in meta]
+    if "*" in kinds or "?" in kinds:
+        return True
+    opens = [i for c, i in meta if c == "["]
+    closes = [i for c, i in meta if c == "]"]
+    if opens and closes and max(closes) > min(opens):
+        return True
+    braces_open = [i for c, i in meta if c == "{"]
+    braces_close = [i for c, i in meta if c == "}"]
+    if braces_open and braces_close and max(braces_close) > min(braces_open):
+        inner = w[min(braces_open) + 1 : max(braces_close)]
+        if "," in inner or ".." in inner:
+            return True
+    return False
+
+
 def _unquote_command_word(w):
     """Reduce a command word to a literal, or return None if it is not one."""
     out = []
@@ -1845,6 +1963,11 @@ def resolve_command(seg):
                 seg._cmd = (base, has_redir)
                 return seg._cmd
             continue
+        if _command_word_expands(w):
+            # The shell rewrites this word before it names a command, so the
+            # literal is not the command.  Fail closed.
+            seg._cmd = (UNRESOLVED, has_redir)
+            return seg._cmd
         seg._cmd = (base, has_redir)
         return seg._cmd
     seg._cmd = (None, has_redir)
@@ -1940,6 +2063,11 @@ def classify(seg, emitter_helpers):
     if cmd in emitter_helpers:
         return EMIT
     if cmd in ENV_DUMPERS:
+        return EMIT
+    # Ordered BEFORE SAFE_COMMANDS on purpose: `exit`, `return` and `shift`
+    # are listed there as control words, and that listing is what made the
+    # stderr diagnostic invisible.
+    if cmd in NUMERIC_OPERAND_DIAGNOSTIC:
         return EMIT
     if cmd in SAFE_COMMANDS:
         return SAFE
@@ -2324,7 +2452,100 @@ class Finding:
         )
 
 
-def scan_text(text, path="<text>"):
+# Command words whose LITERAL operand is shell source the shell runs LATER.
+# Quoting inside such an operand is quoting of the TEXT, not of an expansion:
+# `trap 'echo "$GH_TOKEN"' EXIT` stores the single-quoted body and expands
+# `$GH_TOKEN` when the trap fires, so bash prints the credential while the
+# lexer -- correctly, for ordinary text -- reported no reference at all and
+# `--scan` returned PASS (#1032 round 4 P1).  This is the same relationship an
+# interpolating here-doc body has with its opener, and it is handled the same
+# way: the literal is re-read AS SHELL.
+DEFERRED_SHELL_COMMANDS = frozenset({"trap", "eval"})
+# One hop.  A `trap 'eval "..."' EXIT` gets its inner eval graded; a third
+# level is a declared miss rather than an unbounded recursion, and the bound
+# is here rather than implied by the call graph.
+_DEFERRED_SHELL_DEPTH = 1
+
+# Words that turn bash's xtrace on and off.  With xtrace active bash writes
+# EVERY expanded command to stderr, so a credential reference reaches a stream
+# no matter which command holds it -- `set -x; : "$GH_TOKEN"` puts the value
+# on stderr through `+ : <value>` while `:` is the safest command word there
+# is (#1032 round 4 P1).  This is shell STATE, not a property of the line, so
+# it is tracked across the file in source order rather than decided per
+# segment.  `set +x` turns it back off and is tracked too.
+_XTRACE_ON = ("-x", "-o", "--xtrace")
+_XTRACE_OFF = ("+x", "+o")
+
+
+def _deferred_shell_operands(seg):
+    """LITERAL operands of a `trap` / `eval` segment, as shell source text."""
+    cmd, _redir = resolve_command(seg)
+    if cmd not in DEFERRED_SHELL_COMMANDS:
+        return []
+    out = []
+    seen_command_word = False
+    for w in seg.words:
+        lit = _unquote_command_word(w)
+        if lit is None:
+            continue
+        if not seen_command_word:
+            if _basename(lit) == cmd:
+                seen_command_word = True
+            continue
+        # A `trap` signal name (`EXIT`, `USR1`, `2`) is not shell source, but
+        # grading it as such costs nothing: it holds no credential reference.
+        out.append(lit)
+    return out
+
+
+def _segment_sets_xtrace(seg):
+    """Return True / False to set xtrace state, or None to leave it alone."""
+    cmd, _redir = resolve_command(seg)
+    if cmd != "set":
+        return None
+    lits = [_unquote_command_word(w) for w in seg.words]
+    lits = [l for l in lits if l is not None]
+    state = None
+    i = 0
+    while i < len(lits):
+        a = lits[i]
+        if a == "--":
+            # `set -- -x` ENDS option processing: `-x` is a positional
+            # parameter from here on, not the xtrace option, and reading it as
+            # one turned tracing on for the rest of the file over a line that
+            # traces nothing.
+            break
+        if a in ("-o", "+o"):
+            nxt = lits[i + 1] if i + 1 < len(lits) else None
+            if nxt == "xtrace":
+                state = a == "-o"
+                i += 2
+                continue
+            i += 2
+            continue
+        if a == "--xtrace":
+            state = True
+        elif a.startswith("-") and not a.startswith("--") and "x" in a[1:]:
+            state = True
+        elif a.startswith("+") and "x" in a[1:]:
+            state = False
+        i += 1
+    return state
+
+
+def _shebang_enables_xtrace(text):
+    first = text.split("\n", 1)[0]
+    if not first.startswith("#!"):
+        return False
+    if resolve_shebang(first) not in SHELL_INTERPRETERS:
+        return False
+    for w in first[2:].split()[1:]:
+        if w.startswith("-") and not w.startswith("--") and "x" in w[1:]:
+            return True
+    return False
+
+
+def scan_text(text, path="<text>", _depth=0):
     """Return (findings, pragma_errors)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     helpers = discover_emitter_helpers(text)
@@ -2342,18 +2563,69 @@ def scan_text(text, path="<text>"):
             "never found, so the rest of the file was read as body text and "
             "not as code" % (path, opened_at, delim)
         )
+    xtrace = _shebang_enables_xtrace(text)
     for ll in lx.logical:
         if ll.pragma_bare and not ll.pragma_reasons:
             pragma_errors.append(
                 "%s:%d: %s: with no reason -- the reason is mandatory"
                 % (path, ll.first_line, PRAGMA)
             )
+        # xtrace is shell STATE and it changes WITHIN a logical line as well
+        # as between them: `( set -x; : "$GH_TOKEN" )` is one line whose
+        # second segment runs traced.  So the state is resolved per SEGMENT,
+        # in source order, and each reference is graded under the state in
+        # effect where it sits -- carrying one flag for the whole line read
+        # `set -x` as taking effect only on the NEXT line and missed that one.
+        xtrace_at = {}
+        state = xtrace
+        for seg in ll.segments:
+            xtrace_at[seg.sid] = state
+            st = _segment_sets_xtrace(seg)
+            if st is not None:
+                state = st
         if ll.pragma_reasons:
+            # A pragma'd line is exempt, and so is any xtrace it turns on --
+            # the exemption is the author's written statement about THIS line.
+            xtrace = state
             continue
         for ref in ll.refs:
             hit, why = reaches_output(ref, helpers)
+            if not hit and xtrace_at.get(
+                ref.seg.sid if ref.seg is not None else None, xtrace
+            ):
+                hit, why = True, (
+                    "xtrace: `set -x` is in effect, so bash writes this "
+                    "expanded command -- value included -- to stderr"
+                )
             if hit:
                 findings.append(Finding(path, ref.line, ref.name, why))
+        if _depth < _DEFERRED_SHELL_DEPTH:
+            for seg in ll.segments:
+                for inner in _deferred_shell_operands(seg):
+                    sub, sub_errors = scan_text(
+                        inner, path=path, _depth=_depth + 1
+                    )
+                    # A discovery error inside the deferred text is discovery
+                    # shrinking, exactly as it is at file level, so it is
+                    # reported rather than dropped -- dropping it would make
+                    # the one place the scanner admits it cannot read the
+                    # source the one place that admission is invisible.
+                    for e in sub_errors:
+                        pragma_errors.append(
+                            "%s:%d: inside deferred shell text: %s"
+                            % (path, seg.line, e)
+                        )
+                    for f in sub:
+                        findings.append(
+                            Finding(
+                                path,
+                                seg.line,
+                                f.name,
+                                "deferred shell text run later by this "
+                                "command: %s" % f.reason,
+                            )
+                        )
+        xtrace = state
     return findings, pragma_errors
 
 
@@ -2393,17 +2665,30 @@ def resolve_shebang(first_line):
             if a == "--":
                 argv = argv[1:]
                 break
+            # `-S STR` SPLITS STR into separate arguments that `env` itself
+            # then processes -- GNU `env --help`: "process and split S into
+            # separate arguments; used to pass multiple arguments on shebang
+            # lines".  So the split words re-enter THIS loop (`continue`), not
+            # the interpreter position.  Breaking to the outer loop instead
+            # read the first split word as the interpreter, so the valid
+            # `#!/usr/bin/env -S --default-signal=PIPE bash` resolved to
+            # `--default-signal=PIPE`; a `.py` file carrying that shebang then
+            # classified NON-SHELL on its extension and a live
+            # `echo "$GH_TOKEN"` inside it was never read (#1032 round 4 P1).
+            # An option inside the split string that this resolver does not
+            # model still falls to the `-`-prefixed branch below and returns
+            # None, which is the fail-safe answer, not a skip.
             if a.startswith("--split-string="):
                 argv = a.split("=", 1)[1].split() + argv[1:]
-                break
+                continue
             if a in ("-S", "--split-string"):
                 if len(argv) < 2:
                     return None
                 argv = argv[1].split() + argv[2:]
-                break
+                continue
             if a.startswith("-S"):
                 argv = a[2:].split() + argv[1:]
-                break
+                continue
             if a in _ENV_OPTS_WITH_ARG:
                 if len(argv) < 2:
                     return None
@@ -2451,6 +2736,16 @@ def classify_file(path):
         return "non-shell"
     ext = os.path.splitext(path)[1].lower()
     if ext in SHELL_EXTS:
+        return "shell"
+    # A `#!` line is PRESENT but this resolver could not settle it.  The
+    # extension must not decide that case: the kernel obeys the shebang and
+    # ignores the name, so trusting `.py` over an unresolved `#!` is the one
+    # combination that can skip a file bash actually executes.  `resolve_
+    # shebang` returning None for an unmodelled `env` option is the fail-SAFE
+    # answer only if the caller then READS the file, which is what this does
+    # (#1032 round 4 P1).  A file with no `#!` at all is unaffected -- the
+    # extension keeps deciding it.
+    if first.startswith("#!"):
         return "shell"
     if ext in NON_SHELL_EXTS:
         return "non-shell"
@@ -3651,6 +3946,160 @@ CORPUS = [
         MUST_FLAG,
         "cat <(printf '%s' \"$GH_TOKEN\")\n",
     ),
+    # --- deferred shell text: `trap` and `eval` (#1032 round 4) ----------
+    #
+    # The handler is SOURCE, and the quotes around it quote the text rather
+    # than an expansion, so the credential expands when the trap fires.  Both
+    # spellings are measured leaking; the third pins that a handler naming no
+    # credential is untouched, which is what keeps the fleet's ~600 ordinary
+    # cleanup traps clean.
+    (
+        "trap-single-quoted-handler",
+        MUST_FLAG,
+        "trap 'echo \"$GH_TOKEN\"' EXIT\n",
+    ),
+    (
+        "trap-double-quoted-handler",
+        MUST_FLAG,
+        'trap "echo \\"$GH_TOKEN\\"" EXIT\n',
+    ),
+    (
+        "trap-non-credential-handler",
+        MUST_NOT_FLAG,
+        "trap 'rm -f ./scratch' EXIT\n: \"$GH_TOKEN\"\necho ok\n",
+    ),
+    (
+        "trap-on-signal",
+        MUST_FLAG,
+        "trap 'printf %s \"$GH_TOKEN\"' USR1\nkill -USR1 $$\n",
+    ),
+    (
+        "eval-single-quoted",
+        MUST_FLAG,
+        "eval 'echo \"$GH_TOKEN\"'\n",
+    ),
+    # --- xtrace (#1032 round 4) ------------------------------------------
+    #
+    # With tracing on, bash writes every expanded command to stderr, so the
+    # safest command word there is carries the value out.  The `off` case
+    # pins that `set +x` is tracked too rather than the flag latching on.
+    (
+        "xtrace-set-x",
+        MUST_FLAG,
+        'set -x\n: "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-set-o-xtrace",
+        MUST_FLAG,
+        'set -o xtrace\n: "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-turned-back-off",
+        MUST_NOT_FLAG,
+        'set -x\nset +x\n: "$GH_TOKEN"\necho ok\n',
+    ),
+    (
+        # xtrace changes WITHIN a logical line: the state is resolved per
+        # segment in source order, not once per line.  Reading it once per
+        # line put `set -x` in effect only from the NEXT line and missed this.
+        "xtrace-within-one-logical-line",
+        MUST_FLAG,
+        '( set -x; : "$GH_TOKEN" )\n',
+    ),
+    (
+        # `set -- -x` ENDS option processing, so `-x` is a positional
+        # parameter and tracing stays off.  Reading every `-x`-shaped word as
+        # the option turned tracing on for the rest of the file here.
+        "xtrace-set-double-dash-positional",
+        MUST_NOT_FLAG,
+        'set -- -x\n: "$GH_TOKEN"\necho ok\n',
+    ),
+    # --- numeric-operand builtins (#1032 round 4) ------------------------
+    #
+    # Each reproduces the operand verbatim in its own stderr diagnostic.  The
+    # MUST_NOT_FLAG neighbours are the near misses the oracle cleared, and
+    # they are what stops the fix from being widened by guesswork.
+    ("numeric-exit", MUST_FLAG, '( exit "$GH_TOKEN" )\n'),
+    ("numeric-return", MUST_FLAG, 'f() { return "$GH_TOKEN"; }\nf\n'),
+    ("numeric-shift", MUST_FLAG, 'shift "$GH_TOKEN"\n'),
+    ("numeric-break", MUST_FLAG, 'for i in 1; do break "$GH_TOKEN"; done\n'),
+    ("numeric-continue", MUST_FLAG, 'for i in 1; do continue "$GH_TOKEN"; done\n'),
+    ("numeric-ulimit", MUST_FLAG, 'ulimit "$GH_TOKEN"\n'),
+    ("numeric-wait", MUST_FLAG, 'wait "$GH_TOKEN"\n'),
+    ("numeric-history", MUST_FLAG, 'history "$GH_TOKEN"\n'),
+    ("numeric-let-clean", MUST_NOT_FLAG, 'let "$GH_TOKEN" || :\necho ok\n'),
+    ("numeric-umask-clean", MUST_NOT_FLAG, 'umask "$GH_TOKEN" 2>/dev/null || :\necho ok\n'),
+    ("numeric-getopts-clean", MUST_NOT_FLAG, 'getopts "$GH_TOKEN" v || :\necho ok\n'),
+    # --- command-word expansion (#1032 round 4) --------------------------
+    #
+    # The shell rewrites the word before it names a command, so the literal is
+    # not the command.  Fail closed.  The bracket-builtin cases are the ones
+    # that make the rule narrow enough to keep `[ -n "$GH_TOKEN" ]` clean.
+    ("cmdword-brace-expansion", MUST_FLAG, 'ec{h,}o "$GH_TOKEN"\n'),
+    ("cmdword-glob-bracket", MUST_FLAG, '/bin/e[c]ho "$GH_TOKEN"\n'),
+    ("cmdword-glob-star", MUST_FLAG, '/bin/ech* "$GH_TOKEN"\n'),
+    ("cmdword-glob-question", MUST_FLAG, '/bin/ech? "$GH_TOKEN"\n'),
+    (
+        # Quoting SUPPRESSES the expansion, so the literal really is the
+        # command word and there is nothing to fail closed about.
+        "cmdword-quoted-brace-literal",
+        MUST_NOT_FLAG,
+        '"ec{h,}o" "$GH_TOKEN" 2>/dev/null || :\necho ok\n',
+    ),
+    ("cmdword-test-bracket", MUST_NOT_FLAG, '[ -n "$GH_TOKEN" ] && echo ok\n'),
+    ("cmdword-double-bracket", MUST_NOT_FLAG, '[[ -n "$GH_TOKEN" ]] && echo ok\n'),
+    ("cmdword-brace-group", MUST_NOT_FLAG, '{ : "$GH_TOKEN"; }\necho ok\n'),
+    (
+        # The declared cost of failing closed: a brace expansion that resolves
+        # to a NON-emitting command reds anyway, because which command it
+        # names depends on run-time state a source-text scanner cannot read.
+        "cmdword-brace-expansion-to-safe",
+        MUST_FLAG,
+        'tr{u,}e "$GH_TOKEN"\necho ok\n',
+    ),
+    (
+        # The same cost reached through a PIPELINE CONSUMER: the consumer
+        # decides whether a piped value reaches a stream, and a glob command
+        # word means the scanner cannot say which command that is.
+        "cmdword-glob-pipeline-consumer",
+        MUST_FLAG,
+        "printf %s \"$GH_TOKEN\" | /bin/gre* -qF zz || echo ok\n",
+    ),
+    # --- the numeric-operand class meets the descriptor seam #1042 owns ---
+    #
+    # These builtins write their diagnostic to STDERR, and `reaches_output`'s
+    # shields were built around emitters that write STDOUT.  All three
+    # disagreements below are that one mismatch, in both directions, and they
+    # are instances of the seam #1042 already owns rather than a new class:
+    # the capture branch counts any descriptor, the pipeline branch counts
+    # only a redirection that moves fd 1.  Recording them here is what stops
+    # the numeric-operand fix from quietly importing an undeclared verdict.
+    (
+        "numeric-exit-captured",
+        MUST_NOT_FLAG,
+        'v=$( exit "$GH_TOKEN" ) || :\necho ok\n',
+    ),
+    (
+        "numeric-exit-stderr-discarded",
+        MUST_FLAG,
+        '( exit "$GH_TOKEN" ) 2>/dev/null || :\necho ok\n',
+    ),
+    (
+        "numeric-exit-stderr-piped",
+        MUST_FLAG,
+        '( exit "$GH_TOKEN" ) 2>&1 | cat >/dev/null\necho ok\n',
+    ),
+    (
+        # Deferred shell text nested TWO levels.  The outer operand does not
+        # reduce to a literal, so the re-read cannot reach the inner `eval` --
+        # but the reference is visible inside the DOUBLE-quoted operand and
+        # `trap` is opaque, so the line is flagged for the outer reason.  The
+        # case is here because that is a coincidence worth pinning: it is the
+        # spelling that says which of the two mechanisms is carrying it.
+        "trap-nested-eval-escaped",
+        MUST_FLAG,
+        'trap "eval \'echo \\\\\\"$GH_TOKEN\\\\\\"\'" EXIT\n',
+    ),
 ]
 
 # --------------------------------------------------------------------------
@@ -3785,6 +4234,14 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "numeric-exit-captured": (
+        "a numeric-operand builtin's diagnostic goes to STDERR and `$( )` "
+        "captures STDOUT, so the value reaches a stream and the capture "
+        "shield -- built for stdout emitters -- swallows it anyway.  The "
+        "descriptor seam is #1042's; this is the MISS direction of the same "
+        "mismatch its two conservatisms record, and all three are declared "
+        "together so the numeric-operand class carries no undeclared verdict"
+    ),
     "indirect-rename": (
         "indirection -- the value is copied under a name the closed list does "
         "not carry, and this scanner has no dataflow"
@@ -3871,6 +4328,41 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "cmdword-glob-pipeline-consumer": (
+        "the fail-closed command-word rule reached through a PIPELINE "
+        "CONSUMER: `printf %s \"$PAT\" | /bin/gre* -qF zz` puts nothing on a "
+        "stream, and the gate reds it because a glob command word does not "
+        "say WHICH command reads the pipe -- `cat` and `grep -q` differ, and "
+        "the expansion is decided by the files present at run time.  Same "
+        "choice as `cmdword-brace-expansion-to-safe`, at the consumer end"
+    ),
+    "numeric-exit-stderr-discarded": (
+        "`( exit \"$PAT\" ) 2>/dev/null` discards the very stream the "
+        "diagnostic is written to, so nothing reaches a stream and the gate "
+        "reds it.  This is the descriptor blindness #1042 owns -- the branch "
+        "counts any output redirection rather than one that moves the "
+        "descriptor the value is on -- reached through the numeric-operand "
+        "class rather than a second answer to it"
+    ),
+    "numeric-exit-stderr-piped": (
+        "the same descriptor blindness the other way: `2>&1 | cat >/dev/null` "
+        "folds the diagnostic into a pipeline whose consumer discards it, and "
+        "the escape test does not model which descriptor carries the value.  "
+        "#1042 corrects both spellings at once"
+    ),
+    "cmdword-brace-expansion-to-safe": (
+        "a brace expansion in the COMMAND WORD that resolves to a "
+        "non-emitting command -- `tr{u,}e \"$PAT\"` runs `true` and puts "
+        "nothing on a stream, and the gate reds it anyway.  WHICH command "
+        "the word names is decided by brace and pathname expansion at run "
+        "time, so the only two answers available to a source-text scanner "
+        "are `fail closed on every expanded command word` and `read the "
+        "unexpanded literal as the command`.  The second is what let "
+        "`ec{h,}o \"$PAT\"` and `/bin/e[c]ho \"$PAT\"` print the credential "
+        "under a PASS (#1032 round 4), so this is the chosen cost of the "
+        "first, it is escapable at the site with the pragma, and it fires "
+        "on no line in any of the ten trees"
+    ),
     "emitter-to-file": (
         "an emitter redirected to a FILE puts nothing on a stream, but the "
         "rule counts it: that write is the first hop of the "
@@ -4304,6 +4796,7 @@ def self_test():
 
         failures.extend(_shebang_cases())
         failures.extend(_pragma_cases())
+        failures.extend(_deferred_shell_cases())
         failures.extend(_file_selection_cases(tmp))
         failures.extend(_discovery_failure_cases(tmp))
         failures.extend(_source_promotion_cases(tmp))
@@ -4390,8 +4883,22 @@ FILE_SELECTION_CASES = [
     ("no-shebang-sh-ext", "leak.sh", "", True),
     ("no-shebang-no-ext", "leak", "", True),
     ("bash-ext", "leak.bash", "", True),
+    # A `#!` line naming bash through an `env` option this resolver does not
+    # model, on a file whose EXTENSION says non-shell.  The kernel obeys the
+    # shebang and ignores the name, so the extension must not be allowed to
+    # skip it; before #1032 round 4 this pair reported `scanned 0` for the
+    # file and the live `echo "$GH_TOKEN"` inside it never ran past discovery.
+    (
+        "env-S-unmodelled-option-py-ext",
+        "leak.py",
+        "#!/usr/bin/env -S --default-signal=PIPE bash\n",
+        True,
+    ),
     ("python-shebang", "leak", "#!/usr/bin/env python3\n", False),
     ("node-shebang", "leak", "#!/usr/bin/env node\n", False),
+    # No `#!` at all: the extension still decides, which is what keeps the
+    # rule above from swallowing every `.py`/`.js` in the tree.
+    ("no-shebang-py-ext", "leak.py", "", False),
 ]
 
 
@@ -4416,6 +4923,23 @@ SHEBANG_CASES = [
     ("#!/usr/bin/env -S python3 -u", "python3"),
     ("#!/usr/bin/env tsx", "tsx"),
     ("#!/usr/bin/env -S bash -e\r", "bash"),
+    # `-S` SPLITS its string into arguments `env` itself then processes, so an
+    # env option can appear INSIDE the split string.  Resolving the first
+    # split word as the interpreter read these as `-i`, `--ignore-environment`
+    # and so on; the `--default-signal=PIPE` spelling is the one #1032 round 4
+    # measured turning a live `echo "$GH_TOKEN"` in a `.py` file into a PASS.
+    ("#!/usr/bin/env -S -i bash", "bash"),
+    ("#!/usr/bin/env -S --ignore-environment bash", "bash"),
+    ("#!/usr/bin/env -S-i bash", "bash"),
+    ("#!/usr/bin/env --split-string=-i bash", "bash"),
+    ("#!/usr/bin/env -S FOO=1 bash -e", "bash"),
+    ("#!/usr/bin/env -S -- bash", "bash"),
+    ("#!/usr/bin/env -S -u NOPE bash", "bash"),
+    ("#!/usr/bin/env -S env -S bash", "bash"),
+    # An env option this resolver does not model stays None -- the fail-SAFE
+    # answer, which `classify_file` now turns into "READ the file" rather than
+    # letting the extension decide.
+    ("#!/usr/bin/env -S --default-signal=PIPE bash", None),
     ("not a shebang", None),
     ("#!", None),
 ]
@@ -4482,6 +5006,53 @@ def _pragma_cases():
             failures.append(
                 "pragma %s: a pragma WITH a reason was rejected (%s)"
                 % (cid, pragma_errors)
+            )
+    return failures
+
+
+def _deferred_shell_cases():
+    """Deferred shell text is re-read, and its DISCOVERY ERRORS come back.
+
+    Asserted against `scan_text` directly rather than through the oracle, for
+    the same reason `_pragma_cases` is: "the scanner reported that it could
+    not read this text" is a property of the MECHANISM, and bash has nothing
+    to say about it -- a handler carrying an unterminated here-doc is a parse
+    failure inside a string bash never parses until the trap fires.  Dropping
+    the sub-scan's errors would make the one place the scanner admits it
+    cannot read the source the one place that admission is invisible.
+    """
+    failures = []
+    cases = [
+        (
+            "trap-heredoc-unterminated",
+            "trap 'cat <<EOF\nthe body starts and never ends' EXIT\n",
+            True,
+        ),
+        (
+            "eval-heredoc-unterminated",
+            "eval 'cat <<EOF\nthe body starts and never ends'\n",
+            True,
+        ),
+        ("trap-well-formed", "trap 'rm -f ./scratch' EXIT\n", False),
+        ("eval-well-formed", "eval 'echo ok'\n", False),
+        (
+            "trap-heredoc-terminated",
+            "trap 'cat <<EOF\nbody\nEOF' EXIT\n",
+            False,
+        ),
+    ]
+    for cid, body, expect_error in cases:
+        _findings, errors = scan_text("#!/usr/bin/env bash\n" + body, "deferred/" + cid)
+        got = any("deferred shell text" in e for e in errors)
+        if expect_error and not got:
+            failures.append(
+                "deferred %s: a discovery error inside the deferred text was "
+                "not reported (errors=%s)" % (cid, errors)
+            )
+        if not expect_error and got:
+            failures.append(
+                "deferred %s: well-formed deferred text reported a discovery "
+                "error (%s)" % (cid, errors)
             )
     return failures
 
