@@ -7,9 +7,11 @@
 # The contract under test is an ASYMMETRY that is easy to regress in either
 # direction:
 #
-#   default base            -> print the default config, make NO API call
+#   trusted default base    -> print the default config, make NO API call
+#   materialized default    -> print a temp file holding target BASE policy
 #   non-default + readable  -> print a temp file holding the BASE policy
-#   non-default + 404       -> print the default config (base predates policy)
+#   non-default + 404       -> trusted mode prints default config;
+#                              materialized mode fetches target default policy
 #   non-default + other err -> exit 2 (caller must fail closed)
 #   base undeterminable     -> exit 2. Falling back is allowed ONLY when the
 #                              default base is POSITIVELY PROVEN; "unknown" is
@@ -67,7 +69,14 @@ case "$PATHARG" in
     echo '{"sha":"basesha1"}'
     exit 0 ;;
   repos/*/contents/*)
-    case "${STUB_CONTENTS_MODE:-ok}" in
+    contents_mode="${STUB_CONTENTS_MODE:-ok}"
+    if [ "$contents_mode" = "base404-default-ok" ]; then
+      case "$PATHARG" in
+        *ref=basesha1) contents_mode=404 ;;
+        *) contents_mode=ok ;;
+      esac
+    fi
+    case "$contents_mode" in
       ok)    [ -z "${STUB_CONTENTS_STDERR:-}" ] || echo "$STUB_CONTENTS_STDERR" >&2
              printf 'external_review_threshold: 1\n'; exit 0 ;;
       404)   echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
@@ -228,6 +237,24 @@ if [ "$RC" -eq 0 ] && [ -f "$OUT" ] && grep -q "external_review_threshold: 1" "$
   rm -f "$OUT"
 else
   fail "PR-metadata stderr broke resolution (rc=$RC out=$OUT)"
+fi
+
+# 12. A cross-repository/default-base caller materializes at the exact base
+#     SHA. When that policy file is positively absent but the commit resolves,
+#     the same verified-404 contract falls back to the target default branch.
+reset_env
+export STUB_CONTENTS_MODE=base404-default-ok
+OUT=$(bash "$RESOLVE" --repo "$REPO" --base-ref main --base-sha basesha1 \
+      --default-branch main --default-config "$DEFAULT_CONFIG" \
+      --materialize-default 2>"$WORK/err.txt") && RC=0 || RC=$?
+if [ "$RC" -eq 0 ] && [ "$OUT" != "$DEFAULT_CONFIG" ] && [ -f "$OUT" ] \
+   && grep -q "external_review_threshold: 1" "$OUT" \
+   && grep -q "repos/$REPO/commits/basesha1" "$CALLS_LOG" \
+   && grep -q "ref=main" "$CALLS_LOG"; then
+  pass "materialized default-base 404 verifies the commit and fetches target default policy (#769)"
+  rm -f "$OUT"
+else
+  fail "materialized default-base 404 fallback (rc=$RC out=$OUT calls=$(cat "$CALLS_LOG"))"
 fi
 
 echo

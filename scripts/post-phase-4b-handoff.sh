@@ -34,16 +34,24 @@
 #      instead).
 #   - otherwise → "novel work".
 #
-# `GH_TOKEN` (e.g. `$OP_PREFLIGHT_REVIEWER_PAT`) is honored on the
-# read paths per the Active-account convention; not required for
-# public-repo reads.
+# `GH_TOKEN` (or the cached `$OP_PREFLIGHT_REVIEWER_PAT`) is required for the
+# complete-history accounting read. The helper auto-sources a fresh preflight
+# cache using the standard read-only reviewer scope.
 #
 # Exit codes:
 #   0  rendered to stdout successfully.
 #   2  usage / argument error.
 #   3  `gh` not available or a required field could not be fetched.
+#   4  prior reviewer feedback is unaccounted; no handoff was rendered.
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "$SCRIPT_DIR/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$SCRIPT_DIR/lib/preflight-helpers.sh"
+  preflight_require_token reviewer || true
+fi
 
 usage() {
   cat >&2 <<EOF
@@ -103,6 +111,35 @@ REFS_TSV=""
 for raw in "$@"; do
   REFS_TSV+="$(parse_ref "$raw")"$'\n'
 done
+
+# A manual handoff is a real reviewer dispatch. Reconcile every prior finding
+# before rendering the artifact that starts that round, just as the automated
+# Phase 4b path gates before its adapter call (#1000).
+FEEDBACK_ACCOUNTING_GATE="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-$SCRIPT_DIR/review-feedback-accounting.sh}"
+command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 || {
+  echo "post-phase-4b-handoff.sh: review feedback accounting gate unavailable: $FEEDBACK_ACCOUNTING_GATE" >&2
+  exit 3
+}
+while IFS=$'\t' read -r accounting_repo accounting_pr; do
+  [[ -n "$accounting_repo" && -n "$accounting_pr" ]] || continue
+  accounting_json=""
+  accounting_rc=0
+  accounting_json=$("$FEEDBACK_ACCOUNTING_GATE" "$accounting_pr" "$accounting_repo") \
+    || accounting_rc=$?
+  case "$accounting_rc" in
+    0) ;;
+    1)
+      printf '%s\n' "$accounting_json" >&2
+      echo "post-phase-4b-handoff.sh: feedback is unaccounted on ${accounting_repo}#${accounting_pr}; no handoff rendered" >&2
+      exit 4
+      ;;
+    *)
+      printf '%s\n' "$accounting_json" >&2
+      echo "post-phase-4b-handoff.sh: feedback accounting failed with exit $accounting_rc on ${accounting_repo}#${accounting_pr}" >&2
+      exit 3
+      ;;
+  esac
+done <<<"$REFS_TSV"
 
 # Classify a head ref string into a content note.
 # Inputs: head_ref (branch name), commits_count (int)

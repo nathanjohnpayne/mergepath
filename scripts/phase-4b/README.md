@@ -237,7 +237,10 @@ phase_4b_automation:
 ```
 
 While disabled (default), `phase-4b-review.sh` exits `5` and the caller
-uses today's manual handoff (`post-phase-4b-handoff.sh`).
+uses today's manual handoff (`post-phase-4b-handoff.sh`). The handoff renderer
+runs complete-history feedback accounting before emitting the reviewer prompt;
+it exits `4` with no handoff when an earlier finding is unaccounted (#1000).
+Automated-mode fallbacks run that accounting before announcing or rendering a manual handoff; a miss becomes orchestrator exit `7`, not fallback exit `4`.
 
 `max_review_rounds` is a declarative cap for the outer review flow. This
 reference helper performs one exhaustive adapter pass per invocation; callers
@@ -248,12 +251,16 @@ that re-run it after `CHANGES_REQUESTED` own round counting and escalation.
 ```bash
 printf 'verdict' > /tmp/diff.txt
 CODEX_BIN=/path/to/fake-codex \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true \
   scripts/phase-4b-review.sh 123 --repo nathanjohnpayne/mergepath \
     --author claude --head deadbeef --diff-file /tmp/diff.txt --dry-run
 ```
 
 `--dry-run` performs selection + adapter dispatch + verdict validation and
-prints the intended action without posting. Adapter CLIs are injectable via
+prints the intended action without posting. The offline recipe explicitly
+replaces the live review-feedback accounting read with `true`; real dry-runs
+keep that gate enabled so they cannot spend a reviewer round while older
+feedback is unaccounted. Adapter CLIs are injectable via
 `CODEX_BIN` / `CLAUDE_BIN`, which is how `tests/test_phase_4b_automation.sh`
 exercises the package without network or real model calls.
 
@@ -273,3 +280,4 @@ require network and credentials here. A real run always evaluates it.
 | 4 | fell back to the manual handoff (adapter error, timeout, invalid verdict, head drift, or no adapter) |
 | 5 | automation disabled or `mode != local` — caller uses the manual handoff |
 | 6 | **held** (#814) — an enabled external provider has not reported on the reviewed head. Nothing was posted, no handoff was rendered, no fail-closed loop was recorded. Wait the `retry_after` seconds in the emitted JSON and re-run the same command, **from the same checkout**. Deliberately not `4`: every consumer of `4` reads it as a reviewer that will not answer, and `scripts/wave-audit.sh` proceeds fail-open on it. The wait is bounded by `coderabbit.max_wait_seconds` and escalates to `4` when exhausted — but elapsed time rides an advisory marker in `.mergepath/`, so an unwritable state dir or retries from different checkouts leave it at zero and the hold repeats without escalating. Not every hold clears by waiting either: `paused`, draft, and non-base-branch all read as not-yet and need the cause resolved. |
+| 7 | **feedback unaccounted** (#1000) — an earlier inline, top-level review-body, or PR-level finding lacks disposition evidence. No adapter ran and no handoff was rendered. Complete the named dispositions and re-run; do not route this status to manual fallback. |

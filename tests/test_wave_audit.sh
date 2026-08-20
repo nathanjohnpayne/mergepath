@@ -241,6 +241,12 @@ FAKE_ORCH_EXIT=4 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha
   && fail "unavailable should exit 4" || { [ $? -eq 4 ] && pass "adapter-unavailable passes exit 4 through" || fail "wrong exit for unavailable"; }
 remote_has_tag "$C5" && fail "unavailable advanced the watermark" || pass "no watermark when reviewer unavailable (range chains forward)"
 
+FAKE_ORCH_EXIT=7 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha "$C5" >/dev/null 2>"$WORK/err-feedback" \
+  && fail "feedback-unaccounted should exit 7" || { [ $? -eq 7 ] && pass "feedback-unaccounted passes exit 7 through" || fail "wrong exit for feedback-unaccounted"; }
+grep -q "do NOT fan out" "$WORK/err-feedback" \
+  && pass "feedback-unaccounted messaging blocks fan-out" || fail "feedback-unaccounted fail-closed message missing"
+remote_has_tag "$C5" && fail "feedback-unaccounted advanced the watermark" || pass "no watermark on feedback-unaccounted"
+
 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha "$C5" --dry-run >/dev/null \
   && pass "dry-run APPROVED exits 0" || fail "dry-run exited nonzero"
 grep -q -- "--dry-run" "$CAPTURE/args" && pass "dry-run forwarded to orchestrator" || fail "--dry-run not forwarded"

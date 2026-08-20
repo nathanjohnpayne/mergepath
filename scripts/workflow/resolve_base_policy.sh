@@ -18,32 +18,35 @@ set -euo pipefail
 #
 # WHAT IT PRINTS
 #
-# A path to the policy file the caller should read. Either the caller's default
-# config path (unchanged, no temp file), or a temp file holding the base
-# branch's copy. The caller owns cleanup of a temp file; it is created under
-# TMPDIR and its path is printed on stdout.
+# A path to the policy file the caller should read. Either the caller's trusted
+# default config path (unchanged, no temp file), or a temp file holding the
+# target repository's base/default policy. The caller owns cleanup of a temp
+# file; it is created under TMPDIR and its path is printed on stdout.
 #
 # SCOPING — deliberate, and load-bearing
 #
-# When the PR targets the DEFAULT branch, the base policy IS the default-branch
-# policy the caller already has, so this prints the default path and makes NO
-# API call. That keeps a contents-API dependency off the path that every
-# ordinary PR takes across the fleet: an unconditional fetch would make a
-# required merge gate newly dependent on an endpoint it never needed, and a
-# transient failure, a rate-limit, or a token without `contents:read` would
-# then affect every consumer. The fetch happens only for a non-default base,
-# where it is genuinely load-bearing.
+# When the PR targets the DEFAULT branch and the caller has a trusted checkout
+# of that same repository, the base policy IS the default-branch policy the
+# caller already has, so the ordinary mode prints the default path and makes NO
+# contents API call. That keeps a new endpoint dependency off the fleet's
+# ordinary path. `--materialize-default` is the deliberate exception for a
+# cross-repository or untrusted author-worktree caller: it fetches the target
+# repository's policy at the exact base SHA and returns a temp file. A
+# non-default base is fetched in either mode because it is load-bearing.
 #
 # FAILURE HANDLING — one rule, applied everywhere
 #
 #   confirmed 404  the base predates .github/review-policy.yml; there is no
-#                  stricter policy to miss, so fall back to the default path.
+#                  stricter policy to miss, so fall back to the caller's
+#                  trusted default path, or materialize the target default
+#                  policy when --materialize-default is active.
 #   anything else  exit 2. The base policy is UNKNOWN, and silently
 #                  substituting the default-branch copy is exactly the bypass
 #                  this resolution exists to close. Callers must fail closed.
 #
 # Usage:
 #   resolve_base_policy.sh --repo owner/repo --pr N [--default-config PATH]
+#                          [--materialize-default]
 #   resolve_base_policy.sh --repo owner/repo --base-ref REF --base-sha SHA \
 #                          --default-branch BRANCH [--default-config PATH]
 #
@@ -56,10 +59,11 @@ BASE_REF=""
 BASE_SHA=""
 DEFAULT_BRANCH=""
 DEFAULT_CONFIG=".github/review-policy.yml"
+MATERIALIZE_DEFAULT=false
 
 usage() {
   cat >&2 <<'EOF'
-usage: resolve_base_policy.sh --repo owner/repo (--pr N | --base-ref REF --base-sha SHA --default-branch BRANCH) [--default-config PATH]
+usage: resolve_base_policy.sh --repo owner/repo (--pr N | --base-ref REF --base-sha SHA --default-branch BRANCH) [--default-config PATH] [--materialize-default]
 EOF
   exit 2
 }
@@ -72,6 +76,7 @@ while [ $# -gt 0 ]; do
     --base-sha)       [ $# -ge 2 ] || usage; BASE_SHA="$2"; shift 2 ;;
     --default-branch) [ $# -ge 2 ] || usage; DEFAULT_BRANCH="$2"; shift 2 ;;
     --default-config) [ $# -ge 2 ] || usage; DEFAULT_CONFIG="$2"; shift 2 ;;
+    --materialize-default) MATERIALIZE_DEFAULT=true; shift ;;
     -h|--help)        usage ;;
     *) echo "resolve_base_policy.sh: unknown arg: $1" >&2; usage ;;
   esac
@@ -120,8 +125,44 @@ if [ -z "$BASE_REF" ] || [ -z "$DEFAULT_BRANCH" ]; then
   exit 2
 fi
 
+materialize_policy_at_ref() {
+  local ref="$1" label="$2" fallback_ref="${3:-}" policy_err policy_rc policy_msg policy tmp commit_rc
+  policy_err=$(mktemp "${TMPDIR:-/tmp}/resolve-policy-materialize-err.XXXXXX")
+  set +e
+  policy=$(gh api "repos/$REPO/contents/.github/review-policy.yml?ref=$ref" \
+    -H "Accept: application/vnd.github.raw" 2>"$policy_err")
+  policy_rc=$?
+  set -e
+  policy_msg=$(cat "$policy_err" 2>/dev/null || true)
+  rm -f "$policy_err"
+  if [ "$policy_rc" -eq 0 ] && [ -n "$policy" ]; then
+    tmp=$(mktemp "${TMPDIR:-/tmp}/base-review-policy.XXXXXX")
+    printf '%s\n' "$policy" >"$tmp"
+    printf '%s\n' "$tmp"
+    return 0
+  fi
+  if [ -n "$fallback_ref" ] && printf '%s' "$policy_msg" | grep -q 'HTTP 404'; then
+    set +e
+    gh api "repos/$REPO/commits/$ref" --jq .sha >/dev/null 2>&1
+    commit_rc=$?
+    set -e
+    if [ "$commit_rc" -eq 0 ]; then
+      materialize_policy_at_ref "$fallback_ref" "default-branch fallback"
+      return $?
+    fi
+    echo "resolve_base_policy.sh: contents 404 for $label $ref but the commit does not resolve — treating as unreadable, not as a missing policy file" >&2
+    return 2
+  fi
+  echo "resolve_base_policy.sh: could not materialize $label policy for $REPO@$ref (rc=$policy_rc): $policy_msg" >&2
+  return 2
+}
+
 # Default base: the caller's config already IS the governing policy.
 if [ "$BASE_REF" = "$DEFAULT_BRANCH" ]; then
+  if [ "$MATERIALIZE_DEFAULT" = true ]; then
+    materialize_policy_at_ref "$BASE_SHA" "default-base" "$DEFAULT_BRANCH" || exit 2
+    exit 0
+  fi
   printf '%s\n' "$DEFAULT_CONFIG"
   exit 0
 fi
@@ -168,6 +209,10 @@ if printf '%s' "$policy_msg" | grep -q 'HTTP 404'; then
   if [ "$commit_rc" -eq 0 ]; then
     # Repo and ref are readable, the file is not there: the base predates the
     # policy file, so no stricter policy can exist to miss.
+    if [ "$MATERIALIZE_DEFAULT" = true ]; then
+      materialize_policy_at_ref "$DEFAULT_BRANCH" "default-branch fallback" || exit 2
+      exit 0
+    fi
     printf '%s\n' "$DEFAULT_CONFIG"
     exit 0
   fi

@@ -299,6 +299,9 @@ jobs:
       - name: check_codex_scripts
         run: ./scripts/ci/check_codex_scripts || { rc=$?; if [ ! -f scripts/ci/check_codex_scripts ]; then echo "check_codex_scripts not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      - name: check_review_feedback_accounting
+        run: ./scripts/ci/check_review_feedback_accounting || { rc=$?; if [ ! -f scripts/ci/check_review_feedback_accounting ]; then echo "check_review_feedback_accounting not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_daily_feedback_rollup
         # Pure-function helpers + a 3-case shimmed --dry-run smoke
         # over scripts/daily-feedback-rollup.sh (#299 v1 slice).

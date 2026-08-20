@@ -10,7 +10,8 @@
 # PATH-shimmed gh in tests/test_gh_as_reviewer.sh.
 #
 # Cases covered (per nathanjohnpayne/mergepath#235, generalized in #577):
-#   1. Gate disabled (codex.p1_gate.enabled=false) → exit 0, no API calls.
+#   1. Legacy P1 scan disabled → accounting runs, then exit 0 with no legacy
+#      API calls.
 #   2. No P1 comments on the PR → exit 0, "Codex blocking-tier unresolved: 0".
 #   3. P1 present and resolved (review-thread isResolved=true) → exit 0.
 #   4. P1 present and unresolved → exit 1, count > 0, paths listed.
@@ -57,6 +58,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/scripts/codex-p1-gate.sh"
+export MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true
 
 [[ -x "$SCRIPT" ]] || { echo "missing or non-executable $SCRIPT" >&2; exit 1; }
 
@@ -107,12 +109,14 @@ if [ "$1" = "api" ]; then
   # reviewThreads query and a per-thread `node(id:...)` comments query; each
   # can page via -f cursor=<value>.
   q=""
+  jq_filter=""
   cursor="__none__"
   node_id="__none__"
   prev=""
   for a in "$@"; do
     case "$prev" in
       query=*) : ;;  # handled below via the value directly
+      --jq) jq_filter="$a" ;;
     esac
     case "$a" in
       query=*) q="${a#query=}" ;;
@@ -151,7 +155,12 @@ if [ "$1" = "api" ]; then
       exit 0
       ;;
     repos/*/pulls/*)
-      cat "${FIXTURE_PR:-/dev/null}"
+      [ -n "${GH_SUCCESS_STDERR:-}" ] && printf '%s\n' "$GH_SUCCESS_STDERR" >&2
+      if [ -n "$jq_filter" ]; then
+        jq -r "$jq_filter" "${FIXTURE_PR:-/dev/null}"
+      else
+        cat "${FIXTURE_PR:-/dev/null}"
+      fi
       exit 0
       ;;
   esac
@@ -370,12 +379,24 @@ run_gate() {
     PATH="$STUB_DIR:$PATH" \
       GH_TOKEN="dummy-token" \
       GH_CALLS_LOG="$WORKDIR/gh-calls.log" \
+      GH_SUCCESS_STDERR="${GH_SUCCESS_STDERR:-}" \
       "$SCRIPT" "$@"
   )
 }
 
+# The feedback-accounting gate is independently testable from the legacy
+# current-HEAD thread scan. A missing disposition must block before any of the
+# latter's GitHub reads begin.
+FEEDBACK_GATE_STUB="$WORKDIR/feedback-accounting-block.sh"
+cat >"$FEEDBACK_GATE_STUB" <<'EOF'
+#!/bin/sh
+printf '%s\n' '{"status":"unaccounted","posted":1,"accounted":0}'
+exit 1
+EOF
+chmod +x "$FEEDBACK_GATE_STUB"
+
 # ---------------------------------------------------------------------------
-# Test 1: Gate disabled — exit 0, no API calls.
+# Test 1: Legacy P1 scan disabled — accounting clears, no legacy API calls.
 # ---------------------------------------------------------------------------
 echo
 echo "--- Test 1: gate disabled (enabled=false)"
@@ -387,7 +408,7 @@ RC=$?
 set -e
 if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0" \
     && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
-  pass "gate disabled exits 0 with no API calls"
+  pass "legacy P1 scan disabled exits 0 after accounting with no legacy API calls"
 else
   fail "expected rc=0 + 'unresolved: 0' + no gh calls; got rc=$RC, output:"
   echo "$OUT" | sed 's/^/      /' >&2
@@ -396,13 +417,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 1b (#447): gate disabled + NO env (no PR_NUMBER, REPO, or GH_TOKEN).
-# The enabled=false short-circuit must run BEFORE the PR-context
-# requirements, so a disabled consumer no-ops on a bare/ad-hoc invocation
-# instead of erroring on missing env (the documented step-1 contract).
+# Test 1b (#1000): accounting is default-on even when the legacy P1 scan is
+# disabled, so a bare invocation cannot claim a clean result without PR
+# context.
 # ---------------------------------------------------------------------------
 echo
-echo "--- Test 1b (#447): gate disabled + no PR/REPO/GH_TOKEN env"
+echo "--- Test 1b (#1000): legacy P1 scan disabled + no PR context"
 SCRATCH=$(make_scratch_with_config false)
 : > "$WORKDIR/gh-calls.log"
 set +e
@@ -410,15 +430,62 @@ OUT=$( cd "$SCRATCH" && PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/gh-calls.l
   env -u GH_TOKEN -u PR_NUMBER -u REPO "$SCRIPT" 2>&1 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0" \
+if [ "$RC" = 2 ] && echo "$OUT" | grep -q "PR_NUMBER required" \
     && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
-  pass "#447: disabled gate + no env → exit 0 clean pass (no PR_NUMBER/GH_TOKEN error, no gh calls)"
+  pass "#1000: default-on accounting requires PR context even when the legacy scan is disabled"
 else
-  fail "#447: expected rc=0 + 'unresolved: 0' + no gh calls; got rc=$RC, output:"
+  fail "#1000: expected rc=2 + PR_NUMBER error + no gh calls; got rc=$RC, output:"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
-# Control: gate ENABLED + no env → still errors (env required once enabled).
+echo
+echo "--- Test 1d (#1000): undispositioned feedback blocks even when legacy P1 is disabled"
+SCRATCH=$(make_scratch_with_config false)
+: > "$WORKDIR/gh-calls.log"
+set +e
+OUT=$(MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$FEEDBACK_GATE_STUB" \
+  run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q 'review feedback is unaccounted' \
+    && ! grep -q '^gh' "$WORKDIR/gh-calls.log"; then
+  pass "#1000: feedback accounting miss blocks every consumer before legacy P1 reads"
+else
+  fail "#1000 feedback-accounting integration (rc=$RC, out=$OUT)"
+fi
+
+echo
+echo "--- Test 1e (#1000): expected-head mutation fails closed before publication"
+SCRATCH=$(make_scratch_with_config false)
+FIXTURE_PR=$(make_pr_fixture "bbbb2222")
+set +e
+OUT=$(CODEX_P1_EXPECTED_HEAD_SHA="aaaa1111" FIXTURE_PR="$FIXTURE_PR" \
+  run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -q 'PR head drifted during gate evaluation'; then
+  pass "#1000: a synchronize during issue-comment evaluation fails closed"
+else
+  fail "#1000 expected-head drift guard (rc=$RC, out=$OUT)"
+fi
+
+echo
+echo "--- Test 1f (#1008): drift read keeps successful stderr out of the SHA payload"
+SCRATCH=$(make_scratch_with_config false)
+FIXTURE_PR=$(make_pr_fixture "cafe1234")
+set +e
+OUT=$(CODEX_P1_EXPECTED_HEAD_SHA="cafe1234" FIXTURE_PR="$FIXTURE_PR" \
+  GH_SUCCESS_STDERR="benign gh retry notice" \
+  run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q 'Codex blocking-tier unresolved: 0'; then
+  pass "#1008: successful drift read ignores gh stderr chatter"
+else
+  fail "#1008 drift-read stream isolation (rc=$RC, out=$OUT)"
+fi
+
+# Control: enabled legacy scan + no env errors for the same reason.
 echo "--- Test 1c (#447 control): gate enabled + no PR_NUMBER → exit 2"
 SCRATCH=$(make_scratch_with_config true)
 set +e
@@ -748,7 +815,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 11: enabled knob absent from config → default false → exit 0.
+# Test 11: enabled knob absent → accounting still runs, legacy scan skips.
 # ---------------------------------------------------------------------------
 echo
 echo "--- Test 11: codex.p1_gate block absent → defaults to disabled"
@@ -759,7 +826,7 @@ OUT=$(run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
 if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
-  pass "missing p1_gate block → defaults to disabled → exit 0"
+  pass "missing p1_gate block → accounting clears, legacy scan defaults disabled"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
@@ -841,7 +908,7 @@ else
 fi
 
 echo
-echo "--- Test 11c (#817): single-quoted enabled: 'false' → off-state clean pass"
+echo "--- Test 11c (#817): single-quoted enabled: 'false' → accounting then legacy-scan skip"
 SCRATCH=$(make_scratch_raw_config "codex:
   bot_login: \"chatgpt-codex-connector[bot]\"
   p1_gate:
@@ -853,7 +920,7 @@ RC=$?
 set -e
 if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0" \
     && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
-  pass "#817: enabled: 'false' → off-state clean pass, no API calls"
+  pass "#817: enabled: 'false' → accounting pass then no legacy API calls"
 else
   fail "#817: expected rc=0 + 'unresolved: 0' + no gh calls; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
