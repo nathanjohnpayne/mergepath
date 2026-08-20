@@ -1133,10 +1133,15 @@ class Lexer:
             body, hd.owner, start_line, cur_ll, in_heredoc_body=True
         )
         for offset, raw in enumerate(masked.split("\n")):
-            for name in _iter_refs(raw):
+            for name, in_ew in _iter_refs_ew(raw):
                 r = Ref(name, start_line + offset, hd.owner)
                 r.heredoc_owner = hd.owner
                 r.in_heredoc_body = True
+                # An error word is written by BASH, not by the here-doc's
+                # owner, so it reaches a stream independently of whether that
+                # owner emits.  Without this the reference was attributed to
+                # the safe `read` and graded clean (#1032 round 6 P1).
+                r.in_error_word = in_ew
                 cur_ll.refs.append(r)
 
     # -- helpers ---------------------------------------------------------
@@ -1483,6 +1488,23 @@ class Lexer:
                 interpolating = True
                 while j < n:
                     ch = text[j]
+                    # `<<$'EOF'` and `<<$"EOF"`.  Bash strips the `$` AND the
+                    # quotes and terminates at the bare word, with expansion
+                    # disabled.  Stripping only the quotes recorded the
+                    # delimiter as `$EOF`, no body line ever matched it, and
+                    # the scanner ran to end of file and reported the file as
+                    # carrying an unterminated here-doc -- a FALSE finding on
+                    # valid shell that reds the required lint gate (#1032
+                    # round 6 P2).
+                    if ch == "$" and j + 1 < n and text[j + 1] in "'\"":
+                        interpolating = False
+                        q = text[j + 1]
+                        j += 2
+                        while j < n and text[j] != q:
+                            delim_chars.append(text[j])
+                            j += 1
+                        j += 1
+                        continue
                     if ch in "'\"":
                         interpolating = False
                         q = ch
@@ -1830,7 +1852,16 @@ def ident_at(text, pos):
             i += 2
             continue
         c = text[i]
-        ok = (c.isalpha() or c == "_") if not out else (c.isalnum() or c == "_")
+        # ASCII, not `str.isalpha()`/`str.isalnum()`.  Python accepts Unicode
+        # letters and digits; bash's parameter-name grammar is exactly
+        # `[A-Za-z_][A-Za-z0-9_]*`, so a non-ASCII character ENDS the name in
+        # bash while Python swallowed it into one longer unknown name.
+        # `echo "$GH_TOKEN\u00e9"` expands GH_TOKEN and prints the whole value
+        # followed by the stray character, under both LC_ALL=C and
+        # LC_ALL=C.UTF-8, while the scanner read `GH_TOKEN\u00e9` and reported
+        # clean (#1032 round 6 P1).  Widening a name can only ever HIDE a
+        # credential, so this is a fail-open the grammar itself closes.
+        ok = _ASCII_NAME_START(c) if not out else _ASCII_NAME_CONT(c)
         if not ok:
             break
         out.append(c)
@@ -1838,6 +1869,14 @@ def ident_at(text, pos):
     if not out:
         return None, pos
     return "".join(out), i
+
+
+def _ASCII_NAME_START(c):
+    return ("A" <= c <= "Z") or ("a" <= c <= "z") or c == "_"
+
+
+def _ASCII_NAME_CONT(c):
+    return _ASCII_NAME_START(c) or ("0" <= c <= "9")
 
 
 def error_word_expansion_at(text, brace_open):
@@ -1895,6 +1934,54 @@ def braced_ref_at(text, brace_open):
     return name
 
 
+def _error_word_spans(s):
+    """[start, end) index spans of every `${VAR:?WORD}` / `${VAR?WORD}` WORD.
+
+    BASH ITSELF writes that word to stderr when VAR is unset, before the
+    enclosing command runs -- so a credential there reaches a stream no matter
+    what the command is.  The ordinary-line path already knows this; the
+    here-doc body path reduced its body to bare NAMES and lost it, so
+    `read x <<EOF` / `${UNSET:?$PAT}` / `EOF` attributed the reference to the
+    safe `read` owner and reported clean (#1032 round 6 P1).
+    """
+    spans = []
+    i = 0
+    n = len(s)
+    while i + 1 < n:
+        if s[i] == "$" and s[i + 1] == "{" and error_word_expansion_at(s, i):
+            _name, end = ident_at(s, i + 2)
+            rest = s[end:]
+            start = end + (2 if rest.startswith(":?") else 1)
+            depth = 1
+            k = start
+            while k < n:
+                if s[k] == "\\":
+                    k += 2
+                    continue
+                if s[k] == "{":
+                    depth += 1
+                elif s[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            spans.append((start, k))
+            i = start
+            continue
+        i += 1
+    return spans
+
+
+def _iter_refs_ew(s):
+    """`_iter_refs`, but each name paired with whether it sits in an error word."""
+    spans = _error_word_spans(s)
+
+    def in_ew(pos):
+        return any(a <= pos < b for a, b in spans)
+
+    return [(nm, in_ew(pos)) for nm, pos in _iter_refs_at(s)]
+
+
 def _iter_refs(s):
     """Credential names referenced for their VALUE in a raw string.
 
@@ -1902,6 +1989,11 @@ def _iter_refs(s):
     whole.  Expansion decisions go through `braced_ref_at`, the same
     function the lexer uses.
     """
+    return [nm for nm, _pos in _iter_refs_at(s)]
+
+
+def _iter_refs_at(s):
+    """`_iter_refs`, but each name paired with the index it was found at."""
     out = []
     i = 0
     n = len(s)
@@ -1914,12 +2006,12 @@ def _iter_refs(s):
             if i + 1 < n and s[i + 1] == "{":
                 name = braced_ref_at(s, i)
                 if name:
-                    out.append(name)
+                    out.append((name, i))
                 i += 2
                 continue
             nm, end = ident_at(s, i + 1)
             if nm is not None and nm in TOKEN_NAME_SET:
-                out.append(nm)
+                out.append((nm, i))
                 i = end
                 continue
         i += 1
@@ -2524,8 +2616,15 @@ def _find_body(text, open_brace_idx):
 def discover_emitter_helpers(text):
     """Functions whose body writes one of their own positionals VERBATIM."""
     bodies = {}
+    # NOT `^[ \t]*`.  A function definition is valid at any COMMAND POSITION,
+    # not only at the start of a physical line: `true; log(){ echo "$1"; }`
+    # defines `log`, and the anchored form never discovered it, so the later
+    # `log "$PAT"` graded as an unknown external command and read clean
+    # (#1032 round 6 P1).  The lookbehind keeps `m.start()` on the NAME, so
+    # the `function`-form check below still sees the head it expects.
     for m in re.finditer(
-        r"(?m)^[ \t]*(?:function[ \t]+)?([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
+        r"(?m)(?:^|(?<=[;&|(]))[ \t]*(?:function[ \t]+)?"
+        r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
         r"(?:\([ \t]*\))?[ \t]*\{",
         text,
     ):
@@ -2848,8 +2947,14 @@ def _function_body_line_spans(text):
     Used to refuse an xtrace DISABLE from inside one -- see `_xtrace_delta`.
     """
     spans = []
+    # Same command-position rule as `discover_emitter_helpers` (#1032 round 6
+    # P1).  Here the cost of missing a definition runs the OTHER way: a body
+    # this does not see is not a span, so a `set +x` inside it would be
+    # CREDITED instead of refused -- a silent false negative, which is the
+    # direction `xtrace-disable-in-called-function` exists to avoid.
     for m in re.finditer(
-        r"(?m)^[ \t]*(?:function[ \t]+)?([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
+        r"(?m)(?:^|(?<=[;&|(]))[ \t]*(?:function[ \t]+)?"
+        r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
         r"(?:\([ \t]*\))?[ \t]*\{",
         text,
     ):
@@ -4607,6 +4712,40 @@ CORPUS = [
     ("continued-name-suffix", MUST_FLAG, 'echo "$GH_\\\nTOKEN"\n'),
     ("continued-name-braced", MUST_FLAG, 'echo "${GH_\\\nTOKEN}"\n'),
     ("continued-name-midword", MUST_FLAG, 'echo "$GH\\\n_TOKEN"\n'),
+    # --- round 6: four seams the earlier rounds left open ----------------
+    #
+    # Bash's parameter-name grammar is ASCII; Python's isalpha/isalnum are not.
+    # A non-ASCII character ENDS the name in bash, so the credential expands
+    # and prints -- while the scanner read one longer unknown name.
+    ("ref-adjacent-non-ascii", MUST_FLAG, 'echo "$GH_TOKEN\u00e9"\n'),
+    # A function definition is valid at any COMMAND POSITION, not only at the
+    # start of a line.  Both separators, because the anchor fix covers both.
+    (
+        "helper-after-semicolon",
+        MUST_FLAG,
+        'true; log(){ echo "$1"; }; log "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-after-and-and",
+        MUST_FLAG,
+        'true && log(){ echo "$1"; }\nlog "$GH_TOKEN"\n',
+    ),
+    # BASH writes a `:?` error word to stderr itself, so it reaches a stream
+    # independently of the here-doc owner -- which is `read`, a safe command.
+    (
+        "heredoc-error-word",
+        MUST_FLAG,
+        'read x <<EOF\n${UNSET:?$GH_TOKEN}\nEOF\necho ok\n',
+    ),
+    # A FALSE-POSITIVE pin, not a leak: `<<$'EOF'` is valid shell and bash
+    # terminates it at `EOF`.  Recording the delimiter as `$EOF` ran the
+    # scanner to end of file and reported an unterminated here-doc, reddening
+    # the required lint gate on a clean file.
+    (
+        "heredoc-delim-ansi-c-quoted",
+        MUST_NOT_FLAG,
+        "read x <<$'EOF'\nnothing\nEOF\necho ok\n",
+    ),
     # --- xtrace turned on by DEFERRED code -------------------------------
     #
     # The deferred text runs in THIS shell, so the state it sets outlives the
