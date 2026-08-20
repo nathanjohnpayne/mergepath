@@ -2711,11 +2711,19 @@ def _why(note, base):
 _POSITIONAL_RE = re.compile(r"\$(?:[1-9][0-9]*|[@*]|\{(?:[1-9][0-9]*|[@*])\})")
 
 
-def _find_body(text, open_brace_idx):
-    """Return the body text between matching braces, brace-depth counted over
-    lexer state so a nested block or a brace inside a string cannot end it."""
+def _find_compound_close(text, open_idx):
+    """Return the matching close index for a brace group or subshell body.
+
+    The caller hands this function text whose here-doc body lines have already
+    been blanked.  Counting over the raw source treated braces and parentheses
+    in here-doc DATA as shell structure, which could end a real function body
+    early even after the discovery regex stopped matching fake definitions in
+    that data.
+    """
+    opener = text[open_idx]
+    closer = "}" if opener == "{" else ")"
     depth = 0
-    i = open_brace_idx
+    i = open_idx
     n = len(text)
     quotes = []
     while i < n:
@@ -2746,12 +2754,12 @@ def _find_body(text, open_brace_idx):
         if quotes:
             i += 1
             continue
-        if c == "{":
+        if c == opener:
             depth += 1
-        elif c == "}":
+        elif c == closer:
             depth -= 1
             if depth == 0:
-                return text[open_brace_idx + 1 : i]
+                return i
         i += 1
     return None
 
@@ -2761,8 +2769,23 @@ _FUNC_DEF_RE = re.compile(
     r"|(?<=\buntil)|(?<=\bthen)|(?<=\bdo)|(?<=\belse)|(?<=\bin)"
     r"|(?<=\btime))[ \t]*(?:function[ \t]+)?"
     r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
-    r"(?:\([ \t]*\))?[ \t]*\{"
+    r"(?:\([ \t]*\))?[ \t]*([\{(])"
 )
+
+
+def _mask_heredoc_body_lines(text):
+    """Blank here-doc DATA while preserving every source offset and newline."""
+    lx = Lexer(text)
+    masked = list(text)
+    line_starts = [0]
+    for i, c in enumerate(text):
+        if c == "\n":
+            line_starts.append(i + 1)
+    for hd in lx.heredocs:
+        for line, raw in hd.body_lines:
+            start = line_starts[line - 1]
+            masked[start : start + len(raw)] = " " * len(raw)
+    return "".join(masked)
 
 
 def _iter_function_definitions(text):
@@ -2775,16 +2798,22 @@ def _iter_function_definitions(text):
     letting a positional-emitting helper defined there read as an unknown safe
     command (#1032 external review).
     """
-    for m in _FUNC_DEF_RE.finditer(text):
+    # Function-shaped here-doc DATA is not shell structure.  Discover against
+    # an offset-preserving masked copy, then return the body from the original
+    # source so a genuine function's own here-doc remains available to helper
+    # analysis.
+    structural = _mask_heredoc_body_lines(text)
+    for m in _FUNC_DEF_RE.finditer(structural):
         name = m.group(1)
         if name in RESERVED_WORDS:
             continue
         head = text[m.start() : m.end()]
         if "(" not in head and not head.lstrip().startswith("function"):
             continue
-        body = _find_body(text, m.end() - 1)
-        if body is not None:
-            yield m, name, body
+        open_idx = m.end() - 1
+        close_idx = _find_compound_close(structural, open_idx)
+        if close_idx is not None:
+            yield m, name, text[open_idx + 1 : close_idx]
 
 
 def discover_emitter_helpers(text):
@@ -2855,11 +2884,11 @@ def discover_emitter_helpers(text):
             if not emits:
                 body_text = bodies.get(name, "")
                 for a, b in _error_word_spans(body_text):
-                    if _POSITIONAL_RE.search(body_text[a:b]):
+                    if _word_has_verbatim_positional(body_text[a:b]):
                         emits = True
                         break
                 if not emits and _text_enables_xtrace(body_text) \
-                        and _POSITIONAL_RE.search(body_text):
+                        and _word_has_verbatim_positional(body_text):
                     emits = True
             # a here-doc body inside the helper counts too
             if not emits:
@@ -3122,9 +3151,6 @@ def _alias_emitters(lx, helpers):
             return out
 
 
-_ALIAS_SEPARATORS = re.compile(r"(?:\|\||&&|[;|&\n])")
-
-
 def _alias_target_commands(target):
     """Every command word in an alias REPLACEMENT LIST.
 
@@ -3133,31 +3159,19 @@ def _alias_target_commands(target):
     Reading only the first command graded the alias on `:` and called it safe
     while the trailing emitter printed the credential (#1032 round 8 P1).
     """
+    # Alias replacement text follows the ordinary shell's quote removal and
+    # list-separator rules.  Reusing the lexer plus `resolve_command` handles
+    # both halves together: `command "echo"` resolves to `echo`, while a `;`
+    # inside a quoted argument stays data instead of inventing a second
+    # command.  The previous regex split and `str.split()` did neither.
     out = []
-    for part in _ALIAS_SEPARATORS.split(target):
-        head = _alias_target_command(part)
-        if head:
-            out.append(head)
+    lx = Lexer(target)
+    for ll in lx.logical:
+        for seg in ll.segments:
+            head, _redir = resolve_command(seg)
+            if head and head != UNRESOLVED:
+                out.append(head)
     return out
-
-
-def _alias_target_command(target):
-    """The real command word of ONE command in an alias target.
-
-    `alias leak='command echo'` is an `echo`: the wrapper is stepped over the
-    same way `resolve_command` steps over one in an ordinary segment.  Reading
-    only `target.split()[0]` compared the WRAPPER against the emitter sets and
-    graded the alias safe, so the call site read clean (#1032 round 7 P1).
-    Env-assignment prefixes are skipped for the same reason.
-    """
-    for w in target.split():
-        base = _basename(w)
-        if base in PASSTHRU:
-            continue
-        if "=" in w and not w.startswith("="):
-            continue
-        return base
-    return ""
 
 
 def _function_body_line_spans(text):
@@ -5077,6 +5091,17 @@ CORPUS = [
         MUST_FLAG,
         'shopt -s expand_aliases\nalias leak=\':; echo\'\nleak "$GH_TOKEN"\n',
     ),
+    (
+        "alias-target-quoted-wrapper",
+        MUST_FLAG,
+        'shopt -s expand_aliases\nalias leak=\'command "echo"\'\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        "alias-target-quoted-separator",
+        MUST_NOT_FLAG,
+        'shopt -s expand_aliases\nalias safe=\'true "x; echo"\'\n'
+        'safe "$GH_TOKEN"\necho ok\n',
+    ),
     # A helper body can reach a stream through bash MECHANICS with no emitter
     # in it at all: the error word bash writes itself, and xtrace.
     (
@@ -5085,6 +5110,27 @@ CORPUS = [
         'leak(){ : "${UNSET_VALUE:?$1}"; }\nleak "$GH_TOKEN"\n',
     ),
     ("helper-xtrace-body", MUST_FLAG, 'leak(){ set -x; : "$1"; }\nleak "$GH_TOKEN"\n'),
+    (
+        "helper-subshell-body",
+        MUST_FLAG,
+        'leak() ( printf \'%s\\n\' "$1"; )\nleak "$GH_TOKEN"\n',
+    ),
+    (
+        "heredoc-fake-helper-definition",
+        MUST_NOT_FLAG,
+        'cat <<\'EOF\'\nleak(){ echo "$1"; }\nEOF\n'
+        'leak "$GH_TOKEN" || :\necho ok\n',
+    ),
+    (
+        "helper-xtrace-single-quoted-positional",
+        MUST_NOT_FLAG,
+        "leak(){ set -x; : '$1'; }\nleak \"$GH_TOKEN\"\necho ok\n",
+    ),
+    (
+        "helper-error-word-single-quoted-positional",
+        MUST_NOT_FLAG,
+        "leak(){ : ${UNSET_VALUE:?'$1'}; }\nleak \"$GH_TOKEN\"\necho ok\n",
+    ),
     # A local definition can shadow the builtin, but proving that it executed
     # before a call is control-flow and scope analysis.  The scanner therefore
     # fails closed on the no-op shadow and declares that conservatism below,
