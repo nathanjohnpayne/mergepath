@@ -1499,6 +1499,111 @@ else
   fail "#1061: the no-required-checks case does not reach the readable arm — gate (a) would still fail closed on approvals-only protection"
 fi
 
+
+# ---------------------------------------------------------------------------
+# #1061 CodeRabbit: the #1059/#1061 assertions above inspect source text. Drive
+# the REAL resolution block instead, with a PATH-shim `gh`, and assert the
+# resolved (protection_readable, REQUIRED_CHECK_NAMES) pair for every branch.
+#
+# The block is EXTRACTED from the script between its own `protection_err=$(
+# mktemp)` and `rm -f "$protection_err"` lines rather than restated here, so it
+# cannot drift from the code it covers — the same technique the #750 gate (a)
+# accumulator test above uses.
+# ---------------------------------------------------------------------------
+
+PROT_START=$(grep -n '^protection_err=\$(mktemp)$' "$SCRIPT" | head -1 | cut -d: -f1)
+PROT_END=$(grep -n '^rm -f "\$protection_err"$' "$SCRIPT" | head -1 | cut -d: -f1)
+
+if [ -z "$PROT_START" ] || [ -z "$PROT_END" ] || [ "$PROT_END" -le "$PROT_START" ]; then
+  fail "#1061 exec: could not extract the protection-resolution block from $SCRIPT (start=$PROT_START end=$PROT_END)"
+else
+  PROT_BLOCK=$(sed -n "${PROT_START},${PROT_END}p" "$SCRIPT")
+
+  # Drive the extracted block with a shim gh.
+  #   $1 label, $2 unprivileged-response mode, $3 privileged-response mode,
+  #   $4 .protected value, $5 whether OP_PREFLIGHT_AUTHOR_PAT is set,
+  #   $6 expected protection_readable, $7 expected required-name count
+  run_prot_case() {
+    local label=$1 unpriv=$2 priv=$3 protected=$4 have_pat=$5 exp_readable=$6 exp_names=$7
+    local scratch; scratch=$(mktemp -d "${TMPDIR:-/tmp}/prot-case.XXXXXX")
+    mkdir -p "$scratch/bin"
+
+    # Shim gh: decides purely from the requested path + whether the caller
+    # exported the author PAT, mirroring GitHub's real behaviour (404 — not
+    # 403 — when a token may not see protection).
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'url=""; for a in "$@"; do case "$a" in repos/*) url="$a";; esac; done'
+      echo 'priv=0; [ -n "${GH_TOKEN:-}" ] && [ "$GH_TOKEN" = "AUTHOR" ] && priv=1'
+      echo 'case "$url" in'
+      echo '  */protection/required_status_checks)'
+      echo "    if [ \$priv -eq 1 ] && [ '$priv' = sub-ok ]; then echo '{\"contexts\":[\"ctx-a\"],\"checks\":[]}'; exit 0; fi"
+      echo "    if [ \$priv -eq 0 ] && [ '$unpriv' = ok ]; then echo '{\"contexts\":[\"ctx-a\"],\"checks\":[]}'; exit 0; fi"
+      echo '    echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;'
+      echo '  */protection)'
+      echo "    case '$priv' in"
+      echo '      full-with-checks) [ $priv -eq 1 ] && { echo "{\"required_status_checks\":{\"contexts\":[\"Label Gate\",\"lint\"],\"checks\":[{\"context\":\"Label Gate\"}]}}"; exit 0; } ;;'
+      echo '      full-approvals-only) [ $priv -eq 1 ] && { echo "{\"required_pull_request_reviews\":{\"required_approving_review_count\":1}}"; exit 0; } ;;'
+      echo '      full-404) [ $priv -eq 1 ] && { echo "gh: Not Found (HTTP 404)" >&2; exit 1; } ;;'
+      echo '    esac'
+      echo '    echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;'
+      echo '  */branches/*)'
+      echo "    echo '$protected'; exit 0 ;;"
+      echo 'esac'
+      echo 'echo "gh: unexpected shim url: $url" >&2; exit 1'
+    } > "$scratch/bin/gh"
+    chmod +x "$scratch/bin/gh"
+
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'set -uo pipefail'
+      echo 'REPO="owner/repo"; BASE_BRANCH="main"'
+      echo 'log() { :; }'
+      [ "$have_pat" = yes ] && echo 'export OP_PREFLIGHT_AUTHOR_PAT=AUTHOR' \
+                            || echo 'unset OP_PREFLIGHT_AUTHOR_PAT || true'
+      echo "$PROT_BLOCK"
+      echo 'printf "%s|%s\n" "$protection_readable" "$(printf "%s" "$REQUIRED_CHECK_NAMES" | grep -c . || true)"'
+    } > "$scratch/case.sh"
+
+    local out
+    out=$(cd "$scratch" && PATH="$scratch/bin:$PATH" bash "$scratch/case.sh" 2>/dev/null | tail -1)
+    rm -rf "$scratch"
+
+    if [ "$out" = "${exp_readable}|${exp_names}" ]; then
+      pass "#1061 exec: $label → readable=${exp_readable}, ${exp_names} required name(s)"
+    else
+      fail "#1061 exec: $label → got '$out', expected '${exp_readable}|${exp_names}'"
+    fi
+  }
+
+  # The #1059 case: unprivileged 404, author PAT resolves the real list.
+  run_prot_case "reviewer 404 + author PAT reads protection with required checks" \
+    404 full-with-checks true yes 1 2
+
+  # The #1061 P1 case: protected by approvals only. Both callers 404 on the
+  # sub-resource; the full object shows no required_status_checks section.
+  # MUST be readable-with-zero, NOT fail-closed.
+  run_prot_case "approvals-only protection (the #1061 P1 regression)" \
+    404 full-approvals-only true yes 1 0
+
+  # Branch genuinely unprotected — privileged caller 404s on the full object.
+  run_prot_case "unprotected branch, author PAT present" \
+    404 full-404 false yes 1 0
+
+  # No author PAT + unprotected branch → .protected=false fallback passes.
+  run_prot_case "no author PAT, .protected=false" \
+    404 none false no 1 0
+
+  # No author PAT + protected branch → genuinely unknown → FAIL CLOSED.
+  run_prot_case "no author PAT, .protected=true (must fail closed)" \
+    404 none true no 0 0
+
+  # Unprivileged read succeeds outright — the pre-existing happy path must be
+  # untouched by all of the above.
+  run_prot_case "unprivileged read succeeds (unchanged happy path)" \
+    ok none true no 1 1
+fi
+
 echo ""
 echo "test_codex_review_check_required_checks: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
