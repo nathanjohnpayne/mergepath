@@ -22,8 +22,8 @@ The token-output gate uses `--scan` in the fast lane and `--self-test` in deep C
 
 ## Approval coordination
 
-The agent-review workflow pins the current pull-request head before enabling auto-merge. When `.github/workflows/repo_lint_local.yml` is confirmed absent at that head, GitHub native auto-merge and branch protection wait for required checks without holding the approval runner open. If the optional annex is present, the workflow retains its explicit bounded polling because that annex is deliberately outside branch protection. An indeterminate annex lookup does not take the no-wait fast path.
+The agent-review workflow continues to wait for current-head checks before its final blocking-label recheck. Native auto-merge cannot replace that ordering because repository policy labels are not branch-protection requirements; arming it while checks are pending would allow a late `human-hold` or other blocking label to be missed. Replacing the approval runner wait therefore requires a separate event-driven continuation that rechecks labels after required checks complete and is outside this execution-model change.
 
 ## Regression contract
 
-`tests/test_repo_lint_optimization.sh` validates triggers, concurrency, scope selection, the stable aggregator, split gate modes, consumer verdict classification, and the native-auto-merge fast path. `tests/test_655_repo_lint_local_observed.sh` behaviorally proves that a confirmed-absent annex makes no rollup queries or sleeps and that a present annex retains the current-head wait semantics.
+`tests/test_repo_lint_optimization.sh` validates triggers, concurrency, scope selection, the stable aggregator, split gate modes, consumer verdict classification, and the required-check-before-label ordering. `tests/test_655_repo_lint_local_observed.sh` retains the current-head wait semantics for the canonical required check and optional annex.

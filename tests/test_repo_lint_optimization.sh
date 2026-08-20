@@ -78,7 +78,10 @@ fi
 if ! command -v yq >/dev/null 2>&1; then
   fail "mikefarah/yq is available for parsed workflow assertions"
 else
-  workflows=("$REPO_LINT" "$MD_WRAP")
+  workflows=("$REPO_LINT")
+  if [ -f "$MD_WRAP" ]; then
+    workflows+=("$MD_WRAP")
+  fi
   if [ -f "$OWL" ]; then
     workflows+=("$OWL")
   fi
@@ -148,15 +151,15 @@ else
   fi
 
   agent_review_wait=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Require current-head check success") | .run' "$AGENT_REVIEW")
-  if printf '%s' "$agent_review_wait" | grep -Fq 'annex_absent="true"' \
-     && printf '%s' "$agent_review_wait" | grep -Fq 'GitHub native auto-merge will enforce required checks'; then
-    pass "agent-review delegates required-check waiting to GitHub when the optional annex is confirmed absent"
+  if ! grep -Fq 'annex_absent="true"' <<<"$agent_review_wait" \
+     && grep -Fq 'while :; do' <<<"$agent_review_wait"; then
+    pass "agent-review retains the required-check wait before its final blocking-label recheck"
   else
-    fail "agent-review must not hold a runner polling branch-protected checks when no annex exists"
+    fail "agent-review must not arm native auto-merge before late blocking labels can be rechecked"
   fi
 
-  if printf '%s' "$agent_review_wait" | grep -Fq 'repo_lint_local.yml annex present' \
-     && printf '%s' "$agent_review_wait" | grep -Fq 'while :; do'; then
+  if grep -Fq 'repo_lint_local.yml annex present' <<<"$agent_review_wait" \
+     && grep -Fq 'while :; do' <<<"$agent_review_wait"; then
     pass "agent-review retains explicit polling for the optional non-required annex"
   else
     fail "agent-review must continue to enforce a present repo_lint_local.yml annex"
