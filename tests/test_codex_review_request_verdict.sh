@@ -25,6 +25,7 @@
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true
 SCRIPT="$ROOT/scripts/codex-review-request.sh"
 [ -r "$SCRIPT" ] || { echo "missing $SCRIPT" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }

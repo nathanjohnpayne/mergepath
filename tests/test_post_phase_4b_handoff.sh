@@ -17,6 +17,7 @@
 #   4. Batch render — mixed mirror + novel → "mixed — see table above".
 #   5. Usage (no args) → exit 2.
 #   6. Invalid ref format → exit 2.
+#   7. Unaccounted feedback → exit 4 before handoff metadata/rendering.
 #
 # Bash 3.2 portable.
 
@@ -24,6 +25,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/scripts/post-phase-4b-handoff.sh"
+export MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true
+export GH_TOKEN=test-token
 
 [[ -x "$SCRIPT" ]] || { echo "missing or non-executable $SCRIPT" >&2; exit 1; }
 
@@ -305,6 +308,31 @@ if [ "$rc" -eq 2 ]; then
   pass "invalid ref format exits 2"
 else
   fail "invalid ref returned rc=$rc (expected 2)"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 7: The manual handoff path is a reviewer dispatch too. It must stop on
+# unaccounted feedback before reading PR metadata or rendering a paste prompt.
+# ---------------------------------------------------------------------------
+BLOCK_GATE="$WORKDIR/block-feedback.sh"
+cat >"$BLOCK_GATE" <<'EOF'
+#!/bin/sh
+printf '%s\n' '{"status":"unaccounted","posted":2,"accounted":1}'
+exit 1
+EOF
+chmod +x "$BLOCK_GATE"
+set +e
+OUT=$(MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$BLOCK_GATE" \
+  "$SCRIPT" nathanjohnpayne/mergepath#281 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 4 ] \
+   && printf '%s' "$OUT" | grep -q "no handoff rendered" \
+   && ! printf '%s' "$OUT" | grep -q "PR ready for external review"; then
+  pass "unaccounted feedback blocks the manual Phase 4b handoff"
+else
+  fail "unaccounted feedback returned rc=$rc or rendered a handoff"
+  printf '%s\n' "$OUT" >&2
 fi
 
 echo

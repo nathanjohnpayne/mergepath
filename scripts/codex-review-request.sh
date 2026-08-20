@@ -178,6 +178,9 @@
 #       path). JSON on stdout with trigger_requested:false and all Codex
 #       signals null. This is a deliberate skip, not an error or a
 #       timeout.
+#   6   FEEDBACK_UNACCOUNTED — at least one earlier reviewer finding has no
+#       durable disposition evidence. No new trigger is posted. Account for
+#       every reported finding, then rerun this script (#1000).
 #
 # Design notes:
 #   - Read-only against the PR except for the one `@codex review` trigger
@@ -1087,7 +1090,36 @@ reset_review_wait_clock() {
   ELAPSED=0
 }
 
+run_feedback_accounting_gate() {
+  local gate output rc=0 posted accounted
+  gate="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-$__CODEX_REQUEST_DIR/review-feedback-accounting.sh}"
+  command -v "$gate" >/dev/null 2>&1 \
+    || die 3 "review feedback accounting gate unavailable: $gate"
+
+  output=$("$gate" "$PR_NUMBER" "$REPO") || rc=$?
+  case "$rc" in
+    0)
+      posted=$(printf '%s' "$output" | jq -r '.posted // "?"' 2>/dev/null || printf '?')
+      accounted=$(printf '%s' "$output" | jq -r '.accounted // "?"' 2>/dev/null || printf '?')
+      log "review feedback accounting clear ($accounted/$posted accounted)"
+      ;;
+    1)
+      printf '%s\n' "$output" >&2
+      die 6 "review feedback is unaccounted; disposition every finding before requesting another Codex review"
+      ;;
+    *)
+      printf '%s\n' "$output" >&2
+      die 3 "review feedback accounting gate failed with exit $rc"
+      ;;
+  esac
+}
+
 post_codex_trigger() {
+  # A new review round must not hide findings from an earlier round. This
+  # enumerates both inline and top-level review-body findings and fails before
+  # the author-attributed write when posted != dispositioned (#1000).
+  run_feedback_accounting_gate
+
   # The Codex GitHub App ONLY monitors '@codex review' comments authored
   # by the repo's AUTHOR/human identity (nathanjohnpayne). A trigger
   # posted by a reviewer/bot identity (nathanpayne-claude/-codex/-cursor)

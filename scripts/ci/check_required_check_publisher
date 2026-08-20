@@ -79,12 +79,9 @@
 #   * the read-then-write ordering of the freshness read and the head
 #     revalidation against the verdict POST (substring position is not
 #     control flow);
-#   * a job natively named for a required context, because `name:` may
-#     carry a `${{ }}` expression that Actions evaluates and a literal
-#     comparison cannot (this also retires the pinned required-context
-#     list and its hub-only reconciliation, which existed only to feed
-#     that comparison), plus the job-reachability half of the same
-#     property;
+#   * job reachability beyond the existence of the known producer jobs;
+#     their parsed display-name contracts ARE pinned below, including the
+#     exact read-only-aware Codex expression introduced by #1000;
 #   * the all-jobs sweep for `checks: write` (the two known jobs ARE
 #     checked below; a third job added later is not).
 # Also tracked, in #976: the dataflow residual behind the head-binding
@@ -200,27 +197,36 @@ PUBLISHER, PARENT_WORKFLOW, WORKFLOW_DIR = sys.argv[1], sys.argv[2], sys.argv[3]
 OPEN_JOB = "open"
 PUBLISH_JOB = "publish"
 
-# The three gate workflows and the job each must keep natively named for
-# its required context (A5). Deleting one of these jobs does NOT merge the
-# two lineages, it DELETES one — leaving the synthetic lineage as the sole
-# producer of a required context, so a renamed/disabled/absent publisher
-# means the context has no producer at all and every PR blocks forever
-# with no partial degradation (#845 decision document, section 0).
+# The three gate workflows and the display-name contract each producer job
+# must retain (A5). Merge clearance and CodeRabbit are static. Codex selects
+# the required context for same-repository heads and a non-required handoff
+# name for fork and Dependabot heads, whose required context belongs
+# exclusively to the trusted archive relay (#1000). Deleting or drifting one of these jobs can
+# either remove a required producer or let an untrusted fork run occupy the
+# required context.
 #
 # Keyed by BASENAME and resolved against WORKFLOW_DIR so the assertion can
 # be aimed at a fixture directory, the same way the publisher and its
 # parent are aimed at fixture files.
+CODEX_FORK_AWARE_JOB_NAME = (
+    "${{ needs.archive-edited-feedback.outputs.requires_relay == 'true' && "
+    "'Codex P1 read-only archive handoff' || 'Codex P1 unresolved threads' }}"
+)
+
 NATIVE_PRODUCERS = {
     "merge-clearance-gate.yml": (
         "merge-clearance-gate",
+        "Merge clearance gate",
         "Merge clearance gate",
     ),
     "codex-p1-gate.yml": (
         "codex-p1-gate",
         "Codex P1 unresolved threads",
+        CODEX_FORK_AWARE_JOB_NAME,
     ),
     "coderabbit-severity-gate.yml": (
         "coderabbit-severity-gate",
+        "CodeRabbit unresolved blocking findings",
         "CodeRabbit unresolved blocking findings",
     ),
 }
@@ -877,15 +883,14 @@ if GITHUB_SHA_REF.search(raw_text):
 # actually asserted.
 
 # ── A5 — the native producers are RETAINED ─────────────────────────────
-for basename, (job_key, context) in NATIVE_PRODUCERS.items():
+for basename, (job_key, context, expected_display) in NATIVE_PRODUCERS.items():
     path = os.path.join(WORKFLOW_DIR, basename)
     if not os.path.exists(path):
-        bad("FAIL: [rcp native producer] %s is missing. It is the unconditional" % path,
-            "      producer of the %r context; without it that context's only" % context,
-            "      producer is the synthetic lineage this publisher writes, and a",
-            "      publisher that is absent, renamed, disabled or whose workflow_run",
-            "      delivery drops leaves the context with NO producer at all — every",
-            "      PR blocked forever, with no partial degradation (#845 section 0).")
+        bad("FAIL: [rcp native producer] %s is missing. It owns a required" % path,
+            "      production contract for %r; without it that context loses" % context,
+            "      its native same-repository lineage. A publisher or trusted fork",
+            "      relay that is absent, renamed, disabled, or misses a workflow_run",
+            "      delivery can then leave the context with no producer at all.")
         continue
     try:
         gate_doc = load(path)
@@ -903,12 +908,22 @@ for basename, (job_key, context) in NATIVE_PRODUCERS.items():
     gate_job = gate_jobs[job_key]
     display = gate_job.get("name") if isinstance(gate_job, dict) else None
     effective = display if display is not None else job_key
-    if str(effective) != context:
+    if str(effective) != expected_display:
         bad("FAIL: [rcp native producer] %s job %r reports as %r, not the required"
             % (path, job_key, effective),
-            "      context %r. Branch protection keys on that display name, so a" % context,
-            "      drift here de-wires the native lineage while every other check",
-            "      stays green.")
+            "      producer name %r. Branch protection keys on the evaluated display" % expected_display,
+            "      name, so a drift can either de-wire the native lineage or let an",
+            "      untrusted fork run occupy the required context while every other",
+            "      check stays green.")
+    if basename == "codex-p1-gate.yml" and isinstance(gate_job, dict):
+        needs = gate_job.get("needs")
+        needs_list = [needs] if isinstance(needs, str) else needs
+        if not isinstance(needs_list, list) or "archive-edited-feedback" not in needs_list:
+            bad("FAIL: [rcp native producer] %s job %r does not need"
+                % (path, job_key),
+                "      'archive-edited-feedback'. Its read-only-aware display name reads",
+                "      that job's requires_relay output; without the dependency the expression",
+                "      cannot reliably select the non-required handoff name.")
 
 if failures:
     print("\n".join(failures))

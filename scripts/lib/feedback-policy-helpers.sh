@@ -22,7 +22,10 @@
 #   feedback_policy_field <key> [cfg]      # scalar under feedback_policy:
 #   resolve_required_tiers [cfg]           # one blocking tier per line
 #   codex_tier_of "<comment-body>"         # p0..p3 or empty
+#   codex_tiers_of "<comment-body>"        # every p0..p3 marker, in order
 #   coderabbit_tier_of "<comment-body>"    # p0..p3|nitpick or empty
+#   coderabbit_tiers_of "<comment-body>"   # every graded marker, in order
+#   coderabbit_finding_scan "<body>"       # strip fenced/pre-merge regions
 #
 # cfg defaults to $CONFIG (the global the gate scripts set) and then to
 # .github/review-policy.yml, matching scripts/lib/reviewers-helpers.sh.
@@ -107,20 +110,28 @@ resolve_required_tiers() {
 # and the text fallback `**P0`..`**P3` Codex emits when the badge image is
 # absent. The FIRST marker in document order wins across BOTH forms — a
 # blocking P1 must not be downgraded by a later P2/P3 in quoted/example text
-# (nathanpayne-codex Phase 4b on #581). grep -oE emits matches in position
-# order; head -n1 takes the earliest.
+# (nathanpayne-codex Phase 4b on #581). `codex_tiers_of` exposes the same
+# canonical markers in document order for callers that intentionally model a
+# compound top-level body.
+codex_tiers_of() {
+  local body=${1:-} markers marker n
+  markers=$(printf '%s' "$body" | grep -oE '!\[P[0-3] Badge\]|\*\*P[0-3]' || true)
+  while IFS= read -r marker; do
+    [ -n "$marker" ] || continue
+    n=$(printf '%s' "$marker" | sed -E 's/.*P([0-3]).*/\1/')
+    echo "p$n"
+  done <<EOF
+$markers
+EOF
+}
+
 codex_tier_of() {
-  local body=${1:-} marker n
-  # Status-safe under `set -euo pipefail`: grep exits 1 on no match (and can
-  # take SIGPIPE from `head`), which with pipefail would fail the assignment
-  # and abort a caller doing `tier=$(codex_tier_of "$b")` before this function
-  # returns. `|| true` keeps a markerless body as a clean empty result, rc 0
-  # (nathanpayne-codex Phase 4b P1 on #581). Split into extract-then-parse so
-  # the failable grep is isolated from the always-succeeding sed.
-  marker=$(printf '%s' "$body" | grep -oE '!\[P[0-3] Badge\]|\*\*P[0-3]' | head -n1 || true)
-  [ -n "$marker" ] || return 0
-  n=$(printf '%s' "$marker" | sed -E 's/.*P([0-3]).*/\1/')
-  echo "p$n"
+  local tiers
+  # Keep the single-finding contract: the first marker wins. The all-marker
+  # primitive above exists for compound top-level review surfaces.
+  tiers=$(codex_tiers_of "${1:-}")
+  [ -n "$tiers" ] || return 0
+  printf '%s\n' "$tiers" | sed -n '1p'
 }
 
 # Map a CodeRabbit finding body to a tier, or empty if it is not a gradeable
@@ -152,18 +163,112 @@ codex_tier_of() {
 # callers grade a PR-level summary line by line; four successive framings of
 # that boundary produced four defects on #936. It is [#945](https://github.com/nathanjohnpayne/mergepath/issues/945),
 # with a spec-derived matrix, and #888 stays open for it.
+coderabbit_finding_scan() {
+  local body=${1:-} out
+  out=$(printf '%s\n' "$body" | awk \
+    -v block_start='<!-- pre_merge_checks_walkthrough_start -->' \
+    -v block_end='<!-- pre_merge_checks_walkthrough_end -->' '
+      function fence_info(s, out,   c, n) {
+        sub(/^ ? ? ?/, "", s)
+        c = substr(s, 1, 1)
+        if (c != "`" && c != "~") return 0
+        n = 0
+        while (substr(s, n + 1, 1) == c) n++
+        if (n < 3) return 0
+        out["rest"] = substr(s, n + 1)
+        if (c == "`" && index(out["rest"], "`") > 0) return 0
+        out["char"] = c
+        out["len"] = n
+        return 1
+      }
+      function fence_update(line,   info) {
+        if (!fence_info(line, info)) return 0
+        if (!in_fence) {
+          in_fence = 1
+          fence_char = info["char"]
+          fence_len = info["len"]
+          return 1
+        }
+        if (info["char"] == fence_char && info["len"] >= fence_len \
+            && info["rest"] ~ /^[ \t]*$/) {
+          in_fence = 0
+          fence_char = ""
+          fence_len = 0
+        }
+        return 1
+      }
+      {
+        line = $0
+        sub(/\r$/, "", line)
+        lines[NR] = line
+        delimiter = fence_update(line)
+        visible[NR] = (!delimiter && !in_fence)
+        structural = line
+        sub(/[ \t]+$/, "", structural)
+        # Pair the block on the NEWEST start seen before the end, not the
+        # oldest. Anchoring on the first start (the old "&& !start_line")
+        # let an unmatched start earlier in the body swallow everything up to
+        # a LATER, properly paired block: a real Major badge sitting between
+        # the two was suppressed, and the inventory then reported clear with
+        # nothing to disposition (#1000 Codex P1). An unpaired start is not a
+        # block, so it must not extend one; re-anchoring keeps the intervening
+        # text classified. Still at most one suppressed region per body -- only
+        # the first properly closed pair is dropped -- so this can never
+        # suppress more than the previous rule did.
+        if (visible[NR] && structural == block_start && !end_line) {
+          pending_start = NR
+        } else if (visible[NR] && structural == block_end \
+                   && pending_start && !end_line) {
+          start_line = pending_start
+          end_line = NR
+          pending_start = 0
+        }
+      }
+      END {
+        for (i = 1; i <= NR; i++) {
+          if (!visible[i]) continue
+          if (end_line && i >= start_line && i <= end_line) continue
+          print lines[i]
+        }
+      }
+    ') || {
+      echo "ERROR: could not sanitize a CodeRabbit finding surface" >&2
+      return 2
+    }
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  fi
+}
+
+coderabbit_tiers_of() {
+  local body=${1:-} markers marker
+  markers=$(printf '%s' "$body" \
+    | grep -oE '🟠 Major|Potential issue|⚠️|🧹 Nitpick|🔵 Trivial|Outside diff range|🟡 Minor' || true)
+  while IFS= read -r marker; do
+    case "$marker" in
+      "🟠 Major"|"Potential issue"|"⚠️") echo p1 ;;
+      "🟡 Minor") echo p2 ;;
+      "🔵 Trivial"|"Outside diff range") echo p3 ;;
+      "🧹 Nitpick") echo nitpick ;;
+    esac
+  done <<EOF
+$markers
+EOF
+}
+
 coderabbit_tier_of() {
-  local head
+  local head tiers wanted
   # Truncate via parameter expansion (not `printf | head -c`): under
   # `set -euo pipefail` a large body makes head close the pipe early and
   # printf exits 141 (SIGPIPE), which aborts every caller. The badge markers
   # matched below are near the start, so a 600-char cut is more than enough.
   head="${1:-}"; head="${head:0:600}"
-  case "$head" in
-    *"🟠 Major"*|*"Potential issue"*|*"⚠️"*)  echo p1; return 0 ;;
-    *"🧹 Nitpick"*)                            echo nitpick; return 0 ;;
-    *"🔵 Trivial"*|*"Outside diff range"*)     echo p3; return 0 ;;
-    *"🟡 Minor"*)                              echo p2; return 0 ;;
-  esac
+  tiers=$(coderabbit_tiers_of "$head")
+  for wanted in p1 nitpick p3 p2; do
+    if printf '%s\n' "$tiers" | grep -Fxq "$wanted"; then
+      echo "$wanted"
+      return 0
+    fi
+  done
   return 0
 }

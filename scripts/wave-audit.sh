@@ -42,6 +42,9 @@
 #           APPROVED is only sound over a byte-verified mirror), or an
 #           orchestrator infrastructure failure (its exit 3, which includes
 #           a failed review POST — no reliable verdict exists).
+#   exit 7  feedback unaccounted. No reviewer ran and no tag is written.
+#           Never fan out: disposition the canary's earlier findings and
+#           rerun the same audit.
 #
 # Usage:
 #   scripts/wave-audit.sh <canary-pr> --repo <owner/repo>
@@ -468,6 +471,14 @@ case "$orc" in
     # that arm would fire on the ordinary path and fan the wave out unaudited.
     emit_json 6 false null
     log "external review has not reached ${REPO}#${PR} yet (orchestrator exit 6) — no watermark; do NOT fan out, retry the audit after the retry_after in the orchestrator JSON above"
+    ;;
+  7)
+    # #1000 feedback-accounting hold: an earlier canary finding has no
+    # disposition evidence. Treat it like the fail-closed/no-fan-out states,
+    # never like reviewer unavailability; spending or bypassing another review
+    # round is exactly what this status prevents.
+    emit_json 7 false null
+    log "review feedback is unaccounted on ${REPO}#${PR} (orchestrator exit 7) — no watermark; do NOT fan out, disposition every finding and rerun the audit"
     ;;
   *)
     emit_json "$orc" false null
