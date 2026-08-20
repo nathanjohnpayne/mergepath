@@ -1421,7 +1421,7 @@ if [ "$protection_readable" -eq 0 ]; then
   # ACTUAL failures (a narrower reversal of the swipewatch #33 skip than a
   # blanket exit-3). To restore the precise required-check filter, grant the
   # token Administration:read.
-  log "gate (a): WARNING — could not read branch-protection required checks for $BASE_BRANCH (token lacks Administration:read scope, or API error; note GitHub reports this as 404, not 403 — mergepath#1059). Failing closed: every non-skipped rollup check must be green (#465). For the precise required-check filter, re-run with GH_TOKEN=\"\$OP_PREFLIGHT_AUTHOR_PAT\"."
+  log "gate (a): WARNING — the branch-protection read for $BASE_BRANCH failed with a real error (403 forbidden, 5xx, or network). A permission-hiding 404 is handled by the branch above and does NOT reach here, so this is a genuine failure: a 403 means the token lacks Administration:read, while a 5xx or network error is usually transient and worth retrying before touching credentials. Failing closed: every non-skipped rollup check must be green (#465)."
   REQUIRED_JSON='[]'
 elif [ -z "$REQUIRED_CHECK_NAMES" ]; then
   # Read succeeded; branch protection lists NO required checks (404 or empty
@@ -2411,10 +2411,17 @@ if [ "$REVIEW_DECISION" = "REVIEW_REQUIRED" ]; then
   # evaluates the reviews directly for exactly this reason. Another 4b round
   # cannot clear that one. Distinguish them by looking for the approval
   # (#1061 Codex P1).
+  # Scope to the CURRENT head: an approval on an earlier head produces the same
+  # mismatch without being a deadlock. Even so this is a HINT, not a diagnosis
+  # — on a public repo any non-author can approve, including an outsider with
+  # no write permission, and the real deadlock additionally requires a
+  # QUALIFYING approval (collaborator with write/admin, latest-per-author, no
+  # outstanding CHANGES_REQUESTED). admin-merge-codeowners-blocked.sh checks
+  # all of that; this advisory must not pre-empt its verdict (#1061 Codex P2).
   HEAD_APPROVALS=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
-    --jq "[.[] | select(.state == \"APPROVED\" and .user.login != \"$PR_AUTHOR\")] | length" 2>/dev/null || echo "")
+    --jq "[.[] | select(.state == \"APPROVED\" and .user.login != \"$PR_AUTHOR\" and .commit_id == \"$HEAD_SHA\")] | length" 2>/dev/null || echo "")
   if [ "${HEAD_APPROVALS:-0}" -gt 0 ] 2>/dev/null; then
-    log "NOTE: GitHub reports reviewDecision=REVIEW_REQUIRED even though $HEAD_APPROVALS non-author APPROVED review(s) exist. That is the CODEOWNERS-deadlock shape, not a missing approval — another Phase 4b round will NOT clear it. See scripts/admin-merge-codeowners-blocked.sh, which evaluates the reviews directly for this case (mergepath#1059)."
+    log "NOTE: reviewDecision=REVIEW_REQUIRED even though $HEAD_APPROVALS non-author APPROVED review(s) exist on this head. If any of them QUALIFIES (a collaborator with write/admin, no outstanding CHANGES_REQUESTED) this is the CODEOWNERS deadlock, and another Phase 4b round will NOT clear it — check with scripts/admin-merge-codeowners-blocked.sh, which verifies that directly. If none qualifies (an outside approval on a public repo does not), the ordinary remedy applies: scripts/phase-4b-review.sh <PR#> --repo $REPO from a trusted main-ref checkout (mergepath#1059)."
   else
     log "NOTE: GitHub still reports reviewDecision=REVIEW_REQUIRED and no non-author APPROVED review exists — branch protection wants an APPROVED review OBJECT, which a Codex 👍 reaction does not provide. This PR will NOT merge until one exists; run scripts/phase-4b-review.sh <PR#> --repo $REPO from a trusted main-ref checkout (mergepath#1059)."
   fi

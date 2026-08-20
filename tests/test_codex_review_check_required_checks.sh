@@ -1429,6 +1429,39 @@ else
   fail "#1061: the ordinary missing-approval case no longer names its remedy"
 fi
 
+
+# #1061 Codex P2 round 4: the CODEOWNERS hint must not over-claim.
+# Any non-author can approve on a public repo, and an approval on an earlier
+# head produces the same reviewDecision mismatch without being a deadlock. The
+# real deadlock additionally needs a QUALIFYING approval, which
+# admin-merge-codeowners-blocked.sh verifies directly.
+if grep -q 'commit_id == .*HEAD_SHA' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the approval count is scoped to the current head"
+else
+  fail "#1061: the approval count is not head-scoped — a stale approval on an older head reads as the CODEOWNERS deadlock"
+fi
+if grep -q 'QUALIFIES' <<<"$ADVISORY_BLOCK" && grep -q 'phase-4b-review.sh' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the hint is conditional and still names the ordinary remedy when no approval qualifies"
+else
+  fail "#1061: the advisory asserts the CODEOWNERS deadlock outright — an outside approval on a public repo would send the operator to the wrong remedy"
+fi
+
+# #1061 Codex P2 round 4: the fail-closed WARNING must describe the errors that
+# can actually reach it. A permission-hiding 404 is handled by the arm above, so
+# telling the operator "GitHub reports this as 404" during a 403 or a transient
+# 5xx is false and misdirects them toward credential remediation.
+FAILCLOSED_WARN=$(sed -n '/if \[ "\$protection_readable" -eq 0 \]; then/,/REQUIRED_JSON=/p' "$SCRIPT")
+if grep -q 'reports this as 404' <<<"$FAILCLOSED_WARN"; then
+  fail "#1061: the fail-closed warning still claims a 404 reached it — that arm only sees 403/5xx/network"
+else
+  pass "#1061: the fail-closed warning no longer misattributes the failure to a 404"
+fi
+if grep -qE '403|5xx' <<<"$FAILCLOSED_WARN" && grep -q 'transient' <<<"$FAILCLOSED_WARN"; then
+  pass "#1061: the fail-closed warning names the errors that actually reach it and flags 5xx as retryable"
+else
+  fail "#1061: the fail-closed warning does not distinguish a scope failure from a transient one"
+fi
+
 echo ""
 echo "test_codex_review_check_required_checks: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
