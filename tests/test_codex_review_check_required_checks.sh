@@ -1327,65 +1327,7 @@ else
 fi
 
 
-# ---------------------------------------------------------------------------
-# #1059: a 404 on the required_status_checks sub-resource is AMBIGUOUS.
-#
-# GitHub returns 404 — not 403 — when a token cannot see branch protection,
-# because it hides the resource's existence rather than admitting a permission
-# denial. The #465 fail-closed arm keys on 403/5xx, so it never fired for the
-# single most common cause: a reviewer PAT (no Administration:read) took the
-# "404 → legitimately no required checks" arm and gate (a) reported
-# "lists no required checks" on a repo with five of them.
-#
-# Measured 2026-08-20 on nathanjohnpayne/gaycruisebingo: reviewer PAT → 404,
-# author PAT → 5 contexts. The three arms below were exercised live against
-# gaycruisebingo (protected) and Clawdmeter (.protected=false); these are the
-# portable revert-nets that pin each arm on any machine.
-# ---------------------------------------------------------------------------
-
 SCRIPT_CODE_1059=$(grep -vE '^[[:space:]]*#' "$SCRIPT")
-
-# Revert-net 1 — the negative. The old form was:
-#     elif grep -q 'HTTP 404' "$protection_err"; then
-#       REQUIRED_CHECK_NAMES=""
-#       protection_readable=1
-# i.e. the UNPRIVILEGED read's 404 alone marked the list readable. Anchor on
-# that arm specifically ($protection_err), not on "any HTTP 404 grep nearby":
-# the privileged arm keyed on $author_protection_err legitimately DOES set
-# protection_readable=1 (a 404 there means the branch really is unprotected),
-# and a proximity heuristic flags it as a regression. Extract the arm and
-# require that it initialises to 0.
-UNPRIV_404_ARM=$(sed -n '/elif grep -q .HTTP 404. "\$protection_err"; then/,/^  if \[ -n "\${OP_PREFLIGHT_AUTHOR_PAT:-}" \]; then/p' "$SCRIPT")
-if [ -z "$UNPRIV_404_ARM" ]; then
-  fail "#1059: could not locate the unprivileged 404 arm in $SCRIPT — the revert-net is not testing anything"
-elif grep -Eq '^[[:space:]]*protection_readable=0[[:space:]]*$' <<<"$UNPRIV_404_ARM" \
-   && ! grep -Eq '^[[:space:]]*protection_readable=1[[:space:]]*(#.*)?$' <<<"$UNPRIV_404_ARM"; then
-  pass "#1059: the unprivileged 404 arm initialises protection_readable=0 and does not trust the status code alone"
-else
-  fail "#1059: the unprivileged 404 arm sets protection_readable=1 without further evidence — a permission-denied 404 is being read as 'no required checks' again"
-fi
-
-# Revert-net 2 — the author-PAT retry that RESTORES the precise list. Without
-# it the fix degrades to failing closed on every consumer for every agent
-# invocation, which would make stale-red rollup entries block gate (a)
-# fleet-wide — a much larger behaviour change than the misreport it fixes.
-if grep -q 'OP_PREFLIGHT_AUTHOR_PAT' <<<"$SCRIPT_CODE_1059" \
-   && grep -q 'author_protection_json' <<<"$SCRIPT_CODE_1059"; then
-  pass "#1059: the 404 arm retries the protection read under the author PAT before giving up"
-else
-  fail "#1059: the author-PAT retry is gone — gate (a) will fail closed on every consumer instead of reading the real required-check list"
-fi
-
-# Revert-net 3 — the .protected disambiguation, which separates "genuinely
-# unprotected" (pass, none required) from "protected but unreadable" (unknown,
-# fail closed). Needs no admin scope, so it works under the reviewer PAT.
-if grep -q 'branches/\$BASE_BRANCH"' <<<"$SCRIPT_CODE_1059" \
-   && grep -q "branch_protected" <<<"$SCRIPT_CODE_1059" \
-   && grep -q 'branch_protected" = "false"' <<<"$SCRIPT_CODE_1059"; then
-  pass "#1059: an unreadable 404 is disambiguated by the branch's own .protected field"
-else
-  fail "#1059: the .protected probe is missing — an unprotected branch and a permission-denied read are indistinguishable again"
-fi
 
 # ---------------------------------------------------------------------------
 # #1059: the success line must not claim GitHub-level mergeability.
@@ -1432,208 +1374,59 @@ else
 fi
 
 
+
 # ---------------------------------------------------------------------------
-# #1061 Codex P1: an ABSENT required_status_checks section is "none required",
-# not "unreadable".
+# #1059: the ambiguous-404 REPORT is fixed; the DECISION is deliberately not.
 #
-# A branch protected only by approving-review (or any other non-status) rule
-# has no required_status_checks section, so the SUB-RESOURCE 404s even for a
-# privileged caller while `.protected` stays true. Discriminating on
-# `.protected` alone read that as unknown and failed closed, which makes gate
-# (a) treat every optional red or pending rollup check as required and blocks
-# PRs that satisfy GitHub's actual requirements. Read the FULL protection
-# object instead, and derive the list from it.
+# Resolving the ambiguity for real needs ruleset support, URI-segment encoding,
+# and a privileged read that auto-clear CI can actually reach (it runs this
+# script with only GH_TOKEN). Attempting it here shipped a fleet-wide gate (a)
+# regression, so it is deferred whole to #1064 and only the log is corrected.
+# These assertions pin that the BEHAVIOUR stayed put.
 # ---------------------------------------------------------------------------
 
-SCRIPT_CODE_1061=$(grep -vE '^[[:space:]]*#' "$SCRIPT")
-
-if grep -q 'branches/\$BASE_BRANCH/protection"' <<<"$SCRIPT_CODE_1061"; then
-  pass "#1061: the privileged retry reads the FULL protection object, not the required_status_checks sub-resource"
+UNPRIV_404_ARM=$(sed -n '/elif grep -q .HTTP 404. "\$protection_err"; then/,/^else$/p' "$SCRIPT")
+if [ -z "$UNPRIV_404_ARM" ]; then
+  fail "#1059: could not locate the unprivileged 404 arm in $SCRIPT"
 else
-  fail "#1061: the privileged retry still reads the sub-resource — an absent required_status_checks section is indistinguishable from an unreadable one"
-fi
-
-if grep -q 'required_status_checks.contexts\[\]?' <<<"$SCRIPT_CODE_1061" \
-   && grep -q 'required_status_checks.checks\[\]?.context' <<<"$SCRIPT_CODE_1061"; then
-  pass "#1061: the required-name list is derived from the full object's required_status_checks (both contexts[] and checks[])"
-else
-  fail "#1061: the full-object read does not derive names from .required_status_checks — the list will always come back empty"
-fi
-
-# Behavioural: drive the script's OWN derivation expression over each real
-# protection shape. Extracted from the script so it cannot drift from it.
-DERIVE_1061=$(grep -o '\[\.required_status_checks\.contexts\[\]?.*unique | \.\[\]' "$SCRIPT" | head -1)
-if [ -z "$DERIVE_1061" ]; then
-  fail "#1061: could not extract the derivation expression from $SCRIPT"
-else
-  d_approvals=$(echo '{"required_pull_request_reviews":{"required_approving_review_count":1}}' | jq -r "$DERIVE_1061" 2>/dev/null | grep -c . || true)
-  d_empty=$(echo '{"required_status_checks":{"contexts":[],"checks":[]}}' | jq -r "$DERIVE_1061" 2>/dev/null | grep -c . || true)
-  d_ctx=$(echo '{"required_status_checks":{"contexts":["Label Gate","lint"],"checks":[{"context":"Label Gate"}]}}' | jq -r "$DERIVE_1061" 2>/dev/null | grep -c . || true)
-  d_checks=$(echo '{"required_status_checks":{"checks":[{"context":"Merge clearance gate"}]}}' | jq -r "$DERIVE_1061" 2>/dev/null | grep -c . || true)
-
-  if [ "$d_approvals" -eq 0 ]; then
-    pass "#1061: approvals-only protection derives 0 required names → none required, NOT fail-closed"
+  if grep -Eq '^[[:space:]]*protection_readable=1[[:space:]]*$' <<<"$UNPRIV_404_ARM"; then
+    pass "#1059: the 404 arm still marks the list readable — behaviour unchanged, as intended for this PR"
   else
-    fail "#1061: approvals-only protection derived $d_approvals names (expected 0)"
+    fail "#1059: the 404 arm changed the gate (a) DECISION. That belongs in #1064: auto-clear CI runs this script with only GH_TOKEN, so a privileged retry is unreachable there and failing closed reds gate (a) on every protected consumer"
   fi
-  if [ "$d_empty" -eq 0 ]; then
-    pass "#1061: a present-but-empty required_status_checks derives 0 names"
+  if grep -q 'PROTECTION_404_AMBIGUOUS=1' <<<"$UNPRIV_404_ARM"; then
+    pass "#1059: the 404 arm records that the required-check list is UNVERIFIED"
   else
-    fail "#1061: empty required_status_checks derived $d_empty names (expected 0)"
-  fi
-  if [ "$d_ctx" -eq 2 ] && [ "$d_checks" -eq 1 ]; then
-    pass "#1061: populated protection still derives its names from both contexts[] and checks[] ($d_ctx, $d_checks)"
-  else
-    fail "#1061: populated protection derived $d_ctx / $d_checks names (expected 2 / 1) — the full-object path lost the required list"
+    fail "#1059: the ambiguity flag is gone — gate (a) will again assert 'lists no required checks' as established fact"
   fi
 fi
 
-# The empty-list case must reach the READABLE arm. If it set
-# protection_readable=0 the fix would be cosmetic: gate (a) would still fail
-# closed on a branch that genuinely requires nothing.
-FULLREAD_BLOCK=$(sed -n '/if \[ -n "\${OP_PREFLIGHT_AUTHOR_PAT:-}" \]; then/,/^  fi$/p' "$SCRIPT")
-if grep -q 'protection_readable=1' <<<"$FULLREAD_BLOCK" \
-   && grep -q 'declares NO required status checks' <<<"$FULLREAD_BLOCK"; then
-  pass "#1061: a successfully-read protection object with no required checks is marked READABLE and logged as such"
+if grep -q 'could not VERIFY the required-check list' <<<"$SCRIPT_CODE_1059"; then
+  pass "#1059: the ambiguous case reports the list as unverified, not absent"
 else
-  fail "#1061: the no-required-checks case does not reach the readable arm — gate (a) would still fail closed on approvals-only protection"
+  fail "#1059: nothing distinguishes 'no required checks configured' from 'this token may not see protection'"
 fi
 
-
-# ---------------------------------------------------------------------------
-# #1061 CodeRabbit: the #1059/#1061 assertions above inspect source text. Drive
-# the REAL resolution block instead, with a PATH-shim `gh`, and assert the
-# resolved (protection_readable, REQUIRED_CHECK_NAMES) pair for every branch.
-#
-# The block is EXTRACTED from the script between its own `protection_err=$(
-# mktemp)` and `rm -f "$protection_err"` lines rather than restated here, so it
-# cannot drift from the code it covers — the same technique the #750 gate (a)
-# accumulator test above uses.
-# ---------------------------------------------------------------------------
-
-PROT_START=$(grep -n '^protection_err=\$(mktemp)$' "$SCRIPT" | head -1 | cut -d: -f1)
-PROT_END=$(grep -n '^rm -f "\$protection_err"$' "$SCRIPT" | head -1 | cut -d: -f1)
-
-if [ -z "$PROT_START" ] || [ -z "$PROT_END" ] || [ "$PROT_END" -le "$PROT_START" ]; then
-  fail "#1061 exec: could not extract the protection-resolution block from $SCRIPT (start=$PROT_START end=$PROT_END)"
+# The CODEOWNERS deadlock: reviewDecision stays REVIEW_REQUIRED even though a
+# qualifying approval exists (scripts/admin-merge-codeowners-blocked.sh
+# evaluates reviews directly for exactly this reason). Prescribing Phase 4b
+# there loops the operator forever, so the advisory must branch on whether an
+# approval is actually present (#1061 Codex P1).
+ADVISORY_BLOCK=$(sed -n '/if \[ "\$REVIEW_DECISION" = "REVIEW_REQUIRED" \]; then/,/^fi$/p' "$SCRIPT")
+if grep -q 'HEAD_APPROVALS' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the advisory checks whether a non-author APPROVED review already exists"
 else
-  PROT_BLOCK=$(sed -n "${PROT_START},${PROT_END}p" "$SCRIPT")
-
-  # Drive the extracted block with a shim gh.
-  #   $1 label, $2 unprivileged-response mode, $3 privileged-response mode,
-  #   $4 .protected value, $5 whether OP_PREFLIGHT_AUTHOR_PAT is set,
-  #   $6 expected protection_readable, $7 expected required-name count
-  run_prot_case() {
-    local label=$1 unpriv=$2 priv_mode=$3 protected=$4 have_pat=$5 exp_readable=$6 exp_names=$7
-    local scratch; scratch=$(mktemp -d "${TMPDIR:-/tmp}/prot-case.XXXXXX")
-    mkdir -p "$scratch/bin"
-
-    # Shim gh: decides purely from the requested path + whether the caller
-    # exported the author PAT, mirroring GitHub's real behaviour (404 — not
-    # 403 — when a token may not see protection).
-    {
-      echo '#!/usr/bin/env bash'
-      echo 'url=""; for a in "$@"; do case "$a" in repos/*) url="$a";; esac; done'
-      echo 'is_priv=0; [ -n "${GH_TOKEN:-}" ] && [ "$GH_TOKEN" = "AUTHOR" ] && is_priv=1'
-      echo 'case "$url" in'
-      echo '  */protection/required_status_checks)'
-      echo "    if [ \$is_priv -eq 1 ] && [ '$priv_mode' = sub-ok ]; then echo '{\"contexts\":[\"ctx-a\"],\"checks\":[]}'; exit 0; fi"
-      echo "    if [ \$is_priv -eq 0 ] && [ '$unpriv' = ok ]; then echo '{\"contexts\":[\"ctx-a\"],\"checks\":[]}'; exit 0; fi"
-      echo '    echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;'
-      echo '  */protection)'
-      echo "    case '$priv_mode' in"
-      echo '      full-with-checks) [ $is_priv -eq 1 ] && { echo "{\"required_status_checks\":{\"contexts\":[\"Label Gate\",\"lint\"],\"checks\":[{\"context\":\"Label Gate\"}]}}"; exit 0; } ;;'
-      echo '      full-approvals-only) [ $is_priv -eq 1 ] && { echo "{\"required_pull_request_reviews\":{\"required_approving_review_count\":1}}"; exit 0; } ;;'
-      echo '      full-404) [ $is_priv -eq 1 ] && { echo "gh: Not Found (HTTP 404)" >&2; exit 1; } ;;'
-      echo '      full-403) [ $is_priv -eq 1 ] && { echo "gh: Forbidden (HTTP 403)" >&2; exit 1; } ;;'
-      echo '      full-500) [ $is_priv -eq 1 ] && { echo "gh: Internal Server Error (HTTP 500)" >&2; exit 1; } ;;'
-      echo '    esac'
-      echo '    echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;'
-      echo '  */branches/*)'
-      echo "    echo '$protected'; exit 0 ;;"
-      echo 'esac'
-      echo 'echo "gh: unexpected shim url: $url" >&2; exit 1'
-    } > "$scratch/bin/gh"
-    chmod +x "$scratch/bin/gh"
-
-    {
-      echo '#!/usr/bin/env bash'
-      echo 'set -uo pipefail'
-      echo 'REPO="owner/repo"; BASE_BRANCH="main"'
-      echo 'log() { :; }'
-      [ "$have_pat" = yes ] && echo 'export OP_PREFLIGHT_AUTHOR_PAT=AUTHOR' \
-                            || echo 'unset OP_PREFLIGHT_AUTHOR_PAT || true'
-      echo "$PROT_BLOCK"
-      echo 'printf "%s|%s\n" "$protection_readable" "$(printf "%s" "$REQUIRED_CHECK_NAMES" | grep -c . || true)"'
-    } > "$scratch/case.sh"
-
-    local out
-    out=$(cd "$scratch" && PATH="$scratch/bin:$PATH" bash "$scratch/case.sh" 2>/dev/null | tail -1)
-    rm -rf "$scratch"
-
-    if [ "$out" = "${exp_readable}|${exp_names}" ]; then
-      pass "#1061 exec: $label → readable=${exp_readable}, ${exp_names} required name(s)"
-    else
-      fail "#1061 exec: $label → got '$out', expected '${exp_readable}|${exp_names}'"
-    fi
-  }
-
-  # The #1059 case: unprivileged 404, author PAT resolves the real list.
-  run_prot_case "reviewer 404 + author PAT reads protection with required checks" \
-    404 full-with-checks true yes 1 2
-
-  # The #1061 P1 case: protected by approvals only. Both callers 404 on the
-  # sub-resource; the full object shows no required_status_checks section.
-  # MUST be readable-with-zero, NOT fail-closed.
-  run_prot_case "approvals-only protection (the #1061 P1 regression)" \
-    404 full-approvals-only true yes 1 0
-
-  # Branch genuinely unprotected — privileged caller 404s on the full object.
-  run_prot_case "unprotected branch, author PAT present" \
-    404 full-404 false yes 1 0
-
-  # No author PAT + unprotected branch → .protected=false fallback passes.
-  run_prot_case "no author PAT, .protected=false" \
-    404 none false no 1 0
-
-  # No author PAT + protected branch → genuinely unknown → FAIL CLOSED.
-  run_prot_case "no author PAT, .protected=true (must fail closed)" \
-    404 none true no 0 0
-
-
-  # #1061 Codex P1 round 2: a 404 from the PRIVILEGED read is the same
-  # permission-ambiguous 404 as the unprivileged one. An OP_PREFLIGHT_AUTHOR_PAT
-  # that has expired, lacks Administration:read, or cannot reach the repo is
-  # concealed behind exactly that status. Treating it as proof of absence marks
-  # the list readable-and-EMPTY, and the empty-list branch discards the rollup —
-  # so a genuinely failing required check sails through gate (a). That is the
-  # fail-OPEN #465 exists to close, one level up.
-  #
-  # A bad author PAT on a PROTECTED branch must therefore stay UNKNOWN.
-  run_prot_case "bad/expired author PAT on a protected branch (must NOT fail open)" \
-    404 full-404 true yes 0 0
-
-  # ...and the SAME bad PAT on an unprotected branch is still allowed through,
-  # but only because `.protected=false` proves it independently — never because
-  # the privileged 404 was believed.
-  run_prot_case "bad/expired author PAT, but .protected=false proves unprotected" \
-    404 full-404 false yes 1 0
-
-  # A privileged read that fails with 403 or 5xx is unknown for the same
-  # reason a 404 is: no status code from that endpoint is evidence of absence.
-  # Both must fall through to the .protected probe and fail closed on a
-  # protected branch (CodeRabbit nitpick on #1061).
-  run_prot_case "author PAT forbidden (403) on a protected branch" \
-    404 full-403 true yes 0 0
-  run_prot_case "author PAT hits a 5xx on a protected branch" \
-    404 full-500 true yes 0 0
-  run_prot_case "author PAT forbidden (403), .protected=false still passes" \
-    404 full-403 false yes 1 0
-
-  # Unprivileged read succeeds outright — the pre-existing happy path must be
-  # untouched by all of the above.
-  run_prot_case "unprivileged read succeeds (unchanged happy path)" \
-    ok none true no 1 1
+  fail "#1061: the advisory prescribes Phase 4b for every REVIEW_REQUIRED — in the CODEOWNERS deadlock an approval already exists and another 4b round cannot clear it"
+fi
+if grep -q 'admin-merge-codeowners-blocked' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the approval-exists branch points at the CODEOWNERS escape hatch instead of another 4b round"
+else
+  fail "#1061: the approval-exists branch does not name scripts/admin-merge-codeowners-blocked.sh — the operator is left looping"
+fi
+if grep -q 'phase-4b-review.sh' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the no-approval branch still prescribes Phase 4b"
+else
+  fail "#1061: the ordinary missing-approval case no longer names its remedy"
 fi
 
 echo ""

@@ -1380,81 +1380,30 @@ BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref')
 # required_status_checks sub-resource is not configured → legitimately NO
 # required checks) apart from 403 (token lacks Administration:read scope) or
 # 5xx/network (transient) — the latter leave the required list UNKNOWN.
+PROTECTION_404_AMBIGUOUS=0
 protection_err=$(mktemp)
 if protection_json=$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" 2>"$protection_err"); then
   REQUIRED_CHECK_NAMES=$(printf '%s' "$protection_json" | jq -r '[.contexts[]?, .checks[]?.context] | unique | .[]' 2>/dev/null || true)
   protection_readable=1
 elif grep -q 'HTTP 404' "$protection_err"; then
-  # A 404 here is AMBIGUOUS, and reading it as "none required" is what
-  # defeated the #465 fail-closed logic in practice. GitHub returns 404 —
-  # not 403 — when the token cannot see branch protection, because it hides
-  # the resource's existence rather than admitting a permission denial. So
-  # the 403 arm below never fires for the single most common cause, and a
-  # reviewer PAT (no Administration:read) silently took this branch on a
-  # repo with five required checks (mergepath#1059, measured on
-  # gaycruisebingo: reviewer PAT → 404, author PAT → 5 contexts).
+  # Behaviour here is UNCHANGED and deliberately so; only the reporting is
+  # fixed. This 404 is AMBIGUOUS: GitHub returns it both when no required
+  # status checks are configured AND when the token simply may not see branch
+  # protection — it hides the resource's existence rather than admitting a
+  # permission denial (which is why the 403 arm below never fires for the most
+  # common cause). A reviewer PAT therefore lands here on a repo with five
+  # required checks, and the old log line asserted "lists no required checks"
+  # as if that were established fact.
   #
-  # Prefer RESTORING the precise list over failing closed. The author PAT
-  # has Administration:read, and this is a read-only GET with no byline, so
-  # retrying under it is the pattern REVIEW_POLICY.md already prescribes for
-  # audit-branch-protection.sh ("To run a full audit, use an author/admin
-  # PAT"). Failing closed instead would widen #465 from a rare 403/5xx to
-  # EVERY consumer on every agent invocation, making stale-red rollup
-  # entries block gate (a) fleet-wide — a far bigger behaviour change than
-  # the misreport it fixes.
-  #
-  # Read the FULL protection object under the author PAT, not the
-  # sub-resource. A branch protected only by approving-review (or any other
-  # non-status) rule has NO required_status_checks section, so the
-  # sub-resource 404s for a PRIVILEGED caller too while `.protected` is still
-  # true — an "absent section" that a `.protected` test alone reads as
-  # "unreadable" and fails closed on, treating every optional red or pending
-  # rollup check as required and blocking PRs that satisfy GitHub's actual
-  # requirements (#1061 Codex P1). The full object distinguishes the two:
-  # present-and-empty/absent means none required, and only an unreadable
-  # response is genuinely unknown.
+  # Resolving the ambiguity for real needs more than a second read: classic
+  # protection 404s on a ruleset-governed branch, `#`/`%` in a ref name corrupt
+  # the path, and the privileged retry is unreachable from auto-clear CI, which
+  # runs this script with only GH_TOKEN. Attempting it here shipped a
+  # fleet-wide gate (a) regression, so it is deferred whole to #1064. What
+  # remains is the honest log: say the list is unverified rather than absent.
   REQUIRED_CHECK_NAMES=""
-  protection_readable=0
-  if [ -n "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]; then
-    if author_protection_json=$(GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" \
-      gh api "repos/$REPO/branches/$BASE_BRANCH/protection" 2>/dev/null); then
-      REQUIRED_CHECK_NAMES=$(printf '%s' "$author_protection_json" \
-        | jq -r '[.required_status_checks.contexts[]?, .required_status_checks.checks[]?.context] | unique | .[]' 2>/dev/null || true)
-      protection_readable=1
-      if [ -z "$REQUIRED_CHECK_NAMES" ]; then
-        log "gate (a): branch protection for $BASE_BRANCH is configured but declares NO required status checks (approving-review or other non-status rules only) — read under the author PAT"
-      else
-        log "gate (a): required-check list read under the author PAT (the reviewer PAT gets 404 on this endpoint, not 403 — mergepath#1059)"
-      fi
-    fi
-    # NOTE: a 404 from the privileged read is deliberately NOT handled here.
-    # It is the same permission-ambiguous 404 as the unprivileged one: an
-    # OP_PREFLIGHT_AUTHOR_PAT that has expired, lacks Administration:read, or
-    # cannot reach this repo is concealed behind exactly that status. Treating
-    # it as proof of absence would mark the list readable-and-EMPTY, and the
-    # empty-list branch below discards the rollup — so a genuinely failing
-    # required check would sail through gate (a). That is the fail-OPEN #465
-    # exists to close, reintroduced one level up (#1061 Codex P1, round 2).
-    # Leave it unknown and let the `.protected` probe below supply the only
-    # positive evidence of an unprotected branch that an unprivileged caller
-    # can actually obtain. No stderr capture is kept for that read, because
-    # no status code it can return would be actionable.
-  fi
-  if [ "$protection_readable" -eq 0 ]; then
-    # No author PAT, or it could not read. Fall back to the branch resource,
-    # which needs no admin scope and reports `.protected`:
-    #   .protected == false → genuinely unprotected → none required (pass)
-    #   .protected == true  → UNKNOWN → fail closed
-    # The residual is deliberate and unavoidable at this scope: an
-    # unprivileged caller cannot tell "protected with an absent
-    # required_status_checks section" from "protected and unreadable", since
-    # GitHub returns 404 for both. Failing closed is the safe side of that
-    # ambiguity; supply OP_PREFLIGHT_AUTHOR_PAT to resolve it precisely.
-    if branch_protected=$(gh api "repos/$REPO/branches/$BASE_BRANCH" --jq '.protected' 2>/dev/null) \
-      && [ "$branch_protected" = "false" ]; then
-      protection_readable=1
-    fi
-  fi
+  protection_readable=1
+  PROTECTION_404_AMBIGUOUS=1
 else
   REQUIRED_CHECK_NAMES=""
   protection_readable=0   # 403 token scope / 5xx / network → could not read
@@ -1483,7 +1432,11 @@ elif [ -z "$REQUIRED_CHECK_NAMES" ]; then
   # copy frozen BEFORE this branch's own wipe, #655 round 7) -- so wiping
   # ROLLUP_JSON here unconditionally does NOT hide the annex the way it used
   # to before that scan existed (#655 round 1's original problem).
-  log "gate (a): branch protection for $BASE_BRANCH lists no required checks; gate (a) imposes no required-check filter beyond the independent annex workflow-wide scan."
+  if [ "${PROTECTION_404_AMBIGUOUS:-0}" -eq 1 ]; then
+    log "gate (a): could not VERIFY the required-check list for $BASE_BRANCH — the protection endpoint returned 404, which GitHub uses both for \"no required checks configured\" and for \"this token may not see protection\" (it is 404, not 403 — mergepath#1059). Proceeding with no required-check filter, which is the long-standing behaviour on this path; re-run with GH_TOKEN=\"\$OP_PREFLIGHT_AUTHOR_PAT\" to read the real list. Resolving this automatically is #1064."
+  else
+    log "gate (a): branch protection for $BASE_BRANCH lists no required checks; gate (a) imposes no required-check filter beyond the independent annex workflow-wide scan."
+  fi
   ROLLUP_JSON='{"statusCheckRollup":[]}'
   REQUIRED_JSON='[]'
 else
@@ -2449,6 +2402,21 @@ REVIEW_DECISION=$(gh api graphql -f query='
 
 log "all Phase 4 POLICY gates pass for PR $REPO#$PR_NUMBER — GitHub's own merge requirements are evaluated separately"
 if [ "$REVIEW_DECISION" = "REVIEW_REQUIRED" ]; then
-  log "NOTE: GitHub still reports reviewDecision=REVIEW_REQUIRED — branch protection wants an APPROVED review OBJECT, which a Codex 👍 reaction does not provide. This PR will NOT merge until one exists; run scripts/phase-4b-review.sh <PR#> --repo $REPO from a trusted main-ref checkout (mergepath#1059)."
+  # REVIEW_REQUIRED has two very different causes and prescribing Phase 4b for
+  # both sends the operator into a futile loop. The ordinary cause is that no
+  # APPROVED review OBJECT exists (a Codex 👍 is a reaction and never
+  # satisfies branch protection). The other is the CODEOWNERS deadlock, where
+  # a qualifying approval DOES exist and reviewDecision stays REVIEW_REQUIRED
+  # anyway — documented in scripts/admin-merge-codeowners-blocked.sh, which
+  # evaluates the reviews directly for exactly this reason. Another 4b round
+  # cannot clear that one. Distinguish them by looking for the approval
+  # (#1061 Codex P1).
+  HEAD_APPROVALS=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+    --jq "[.[] | select(.state == \"APPROVED\" and .user.login != \"$PR_AUTHOR\")] | length" 2>/dev/null || echo "")
+  if [ "${HEAD_APPROVALS:-0}" -gt 0 ] 2>/dev/null; then
+    log "NOTE: GitHub reports reviewDecision=REVIEW_REQUIRED even though $HEAD_APPROVALS non-author APPROVED review(s) exist. That is the CODEOWNERS-deadlock shape, not a missing approval — another Phase 4b round will NOT clear it. See scripts/admin-merge-codeowners-blocked.sh, which evaluates the reviews directly for this case (mergepath#1059)."
+  else
+    log "NOTE: GitHub still reports reviewDecision=REVIEW_REQUIRED and no non-author APPROVED review exists — branch protection wants an APPROVED review OBJECT, which a Codex 👍 reaction does not provide. This PR will NOT merge until one exists; run scripts/phase-4b-review.sh <PR#> --repo $REPO from a trusted main-ref checkout (mergepath#1059)."
+  fi
 fi
 exit 0
