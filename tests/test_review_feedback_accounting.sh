@@ -1287,6 +1287,25 @@ run_gate
 assert_eq 1 "$RUN_RC" "CodeRabbit finding outside sanitized regions still blocks"
 assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "sanitized CodeRabbit body preserves the real finding tier"
 
+# An unmatched pre-merge-check START earlier in the body must not extend the
+# later, properly paired block back over the intervening text. Pairing on the
+# FIRST start swallowed a real Major badge sitting between the two markers and
+# the inventory reported clear with nothing to disposition (#1000 Codex P1).
+jq '.[0].body = "**Actionable comments posted: 1**\n\n<!-- pre_merge_checks_walkthrough_start -->\n\n_🟠 Major_ real finding between an unpaired start and a paired block\n\n<!-- pre_merge_checks_walkthrough_start -->\n| Docstring Coverage | ⚠️ Warning |\n<!-- pre_merge_checks_walkthrough_end -->"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "an unpaired pre-merge-check start does not suppress a later real finding"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the re-anchored block leaves the intervening finding at its real tier"
+
+# The properly paired block itself is still suppressed: re-anchoring must not
+# start classifying pre-merge-check hygiene warnings as findings.
+jq '.[0].body = "**Actionable comments posted: 0**\n\n<!-- pre_merge_checks_walkthrough_start -->\n\n<!-- pre_merge_checks_walkthrough_start -->\n_🟠 Major_ hygiene warning inside the paired block\n<!-- pre_merge_checks_walkthrough_end -->"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 0 "$RUN_RC" "re-anchoring still suppresses the properly paired pre-merge-check block"
+
 reset_fixtures
 cat >"$TMP/fixtures/reviews.json" <<'JSON'
 [

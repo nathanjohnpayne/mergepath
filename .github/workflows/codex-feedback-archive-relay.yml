@@ -182,7 +182,45 @@ jobs:
         run: |
           set -euo pipefail
           marker="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=failed -->"
+          complete="<!-- mergepath-feedback-archive-relay:v1 run=$SOURCE_RUN_ID status=complete -->"
           existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" | jq -s 'add // []')
+          # Completion dominates for a source run, and the successful relay
+          # RETIRES the artifact it consumed. So a rerun of this trusted
+          # workflow for an already-archived source run finds no artifact and
+          # lands here — where it would publish a failing required check over a
+          # generation that was archived and published correctly, blocking the
+          # PR until the 15-minute sweep undoes it (#1000 Codex P2). A durable
+          # completion marker for THIS run is proof the archive was persisted,
+          # so honour it and publish nothing. The marker is only evidence when
+          # `github-actions[bot]` wrote it: an unauthenticated author check
+          # would let a fork PR post a lookalike and suppress this publisher,
+          # which is the same identity binding render-feedback-archive.sh
+          # applies before it will promote a relay-terminal record.
+          # The marker alone is not sufficient evidence. The relay-terminal
+          # record form is one of the three shapes a fork-supplied handoff may
+          # carry, so a fork PR can make this workflow post that exact comment
+          # as `github-actions[bot]` -- the author check cannot separate a
+          # forged marker from a genuine one. The unforgeable half is the check
+          # run: only a privileged token can publish `$CHECK_NAME` on the PR
+          # head, the fork PR's own native gate job never publishes one, and
+          # the artifact this step is missing was retired by the very relay
+          # that did. Requiring BOTH means suppression needs a real published
+          # generation on this head as well as a marker naming this run.
+          published_lease=false
+          if gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+            >"$RUNNER_TEMP/relay-head-checks.json" 2>/dev/null; then
+            if jq -e -s --arg name "$CHECK_NAME" \
+              '[ .[].check_runs[]? | select(.name == $name and .status == "completed") ] | length > 0' \
+              <"$RUNNER_TEMP/relay-head-checks.json" >/dev/null; then
+              published_lease=true
+            fi
+          fi
+          if [ "$published_lease" = true ] && jq -e --arg body "$complete" \
+            'any(.[]; (.user.login // "") == "github-actions[bot]" and (.body // "") == $body)' \
+            <<<"$existing" >/dev/null; then
+            echo "Source run $SOURCE_RUN_ID already carries an Actions-authored relay completion marker and $HEAD_SHA already carries a completed $CHECK_NAME generation; its handoff artifact was retired by that successful relay. Not publishing a failure over an archived generation."
+            exit 0
+          fi
           if ! jq -e --arg body "$marker" 'any(.[]; (.body // "") == $body)' \
             <<<"$existing" >/dev/null; then
             jq -n --arg body "$marker" '{body:$body}' \

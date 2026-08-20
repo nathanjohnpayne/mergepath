@@ -443,6 +443,36 @@ if relay_job.is_a?(Hash)
       artifact_index && missing_index && artifact_index < missing_index,
     "read-only archive relay does not persist and publish a missing-handoff failure"
   )
+  # A successful relay RETIRES the handoff artifact it consumed, so rerunning
+  # this trusted workflow for an already-archived source run finds no artifact
+  # and lands in the publisher above -- failing a head that was archived and
+  # published correctly (#1000 Codex P2). Require the completion-dominates
+  # short-circuit, require it to precede the failing POST, and require it to be
+  # bound to github-actions[bot] so a fork PR cannot post a lookalike
+  # completion marker and suppress the publisher outright.
+  missing_body = missing_run.to_s
+  # Anchor on the live guard head, not on the marker string: `if false && jq -e
+  # --arg body "$complete"` keeps every token and every ordering a name-based
+  # assertion looks at while deleting the branch entirely.
+  # The marker is forgeable: the relay-terminal record is one of the three
+  # shapes a fork-supplied handoff may carry, so a fork can make this workflow
+  # post it as github-actions[bot]. Require the unforgeable half too -- a
+  # completed CHECK_NAME generation already on the bound head, which only a
+  # privileged token can publish -- and require the two to be conjoined in one
+  # condition rather than merely both present somewhere in the step.
+  missing_probe = missing_body.index(%q{repos/$REPO/commits/$HEAD_SHA/check-runs})
+  missing_complete = missing_body.index(%q{if [ "$published_lease" = true ] && jq -e --arg body "$complete"})
+  missing_identity = missing_complete &&
+    missing_body.index(%q{(.user.login // "") == "github-actions[bot]"}, missing_complete)
+  missing_skip = missing_identity ? missing_body.index("exit 0", missing_identity) : nil
+  missing_publish = missing_body.index(%q{--method POST "repos/$REPO/check-runs"})
+  require_shape.call(
+    [missing_probe, missing_complete, missing_identity, missing_skip, missing_publish].all? &&
+      missing_probe < missing_complete && missing_complete < missing_identity &&
+      missing_identity < missing_skip && missing_skip < missing_publish &&
+      missing_body.include?(%q{select(.name == $name and .status == "completed")}),
+    "missing-handoff publisher fails an already-archived source run, or suppresses itself on a forgeable marker alone, instead of requiring an Actions-authored completion marker AND a published head generation"
+  )
   relay_run = relay_steps.map { |step| step["run"] }.compact.find do |run|
     run.include?("HANDOFF_FILE") && run.include?("scripts/codex-p1-gate.sh")
   end

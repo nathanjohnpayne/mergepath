@@ -205,11 +205,23 @@ coderabbit_finding_scan() {
         visible[NR] = (!delimiter && !in_fence)
         structural = line
         sub(/[ \t]+$/, "", structural)
-        if (visible[NR] && structural == block_start && !start_line) {
-          start_line = NR
+        # Pair the block on the NEWEST start seen before the end, not the
+        # oldest. Anchoring on the first start (the old "&& !start_line")
+        # let an unmatched start earlier in the body swallow everything up to
+        # a LATER, properly paired block: a real Major badge sitting between
+        # the two was suppressed, and the inventory then reported clear with
+        # nothing to disposition (#1000 Codex P1). An unpaired start is not a
+        # block, so it must not extend one; re-anchoring keeps the intervening
+        # text classified. Still at most one suppressed region per body -- only
+        # the first properly closed pair is dropped -- so this can never
+        # suppress more than the previous rule did.
+        if (visible[NR] && structural == block_start && !end_line) {
+          pending_start = NR
         } else if (visible[NR] && structural == block_end \
-                   && start_line && !end_line) {
+                   && pending_start && !end_line) {
+          start_line = pending_start
           end_line = NR
+          pending_start = 0
         }
       }
       END {
