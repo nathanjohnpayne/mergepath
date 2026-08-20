@@ -1326,6 +1326,98 @@ else
   fail "oversized rollup: gate (a)'s accumulator is not the stdin-slurp form — an argv --argjson accumulator reintroduces #750"
 fi
 
+
+# ---------------------------------------------------------------------------
+# #1059: a 404 on the required_status_checks sub-resource is AMBIGUOUS.
+#
+# GitHub returns 404 — not 403 — when a token cannot see branch protection,
+# because it hides the resource's existence rather than admitting a permission
+# denial. The #465 fail-closed arm keys on 403/5xx, so it never fired for the
+# single most common cause: a reviewer PAT (no Administration:read) took the
+# "404 → legitimately no required checks" arm and gate (a) reported
+# "lists no required checks" on a repo with five of them.
+#
+# Measured 2026-08-20 on nathanjohnpayne/gaycruisebingo: reviewer PAT → 404,
+# author PAT → 5 contexts. The three arms below were exercised live against
+# gaycruisebingo (protected) and Clawdmeter (.protected=false); these are the
+# portable revert-nets that pin each arm on any machine.
+# ---------------------------------------------------------------------------
+
+SCRIPT_CODE_1059=$(grep -vE '^[[:space:]]*#' "$SCRIPT")
+
+# Revert-net 1 — the negative. The old form unconditionally trusted the 404.
+if grep -Eq 'protection_readable=1[[:space:]]*$' <<<"$(grep -A2 "grep -q 'HTTP 404'" <<<"$SCRIPT_CODE_1059")"; then
+  fail "#1059: the 404 arm still sets protection_readable=1 unconditionally — a permission-denied 404 is being read as 'no required checks' again"
+else
+  pass "#1059: the 404 arm no longer trusts the status code alone"
+fi
+
+# Revert-net 2 — the author-PAT retry that RESTORES the precise list. Without
+# it the fix degrades to failing closed on every consumer for every agent
+# invocation, which would make stale-red rollup entries block gate (a)
+# fleet-wide — a much larger behaviour change than the misreport it fixes.
+if grep -q 'OP_PREFLIGHT_AUTHOR_PAT' <<<"$SCRIPT_CODE_1059" \
+   && grep -q 'author_protection_json' <<<"$SCRIPT_CODE_1059"; then
+  pass "#1059: the 404 arm retries the protection read under the author PAT before giving up"
+else
+  fail "#1059: the author-PAT retry is gone — gate (a) will fail closed on every consumer instead of reading the real required-check list"
+fi
+
+# Revert-net 3 — the .protected disambiguation, which separates "genuinely
+# unprotected" (pass, none required) from "protected but unreadable" (unknown,
+# fail closed). Needs no admin scope, so it works under the reviewer PAT.
+if grep -q 'branches/\$BASE_BRANCH"' <<<"$SCRIPT_CODE_1059" \
+   && grep -q "branch_protected" <<<"$SCRIPT_CODE_1059" \
+   && grep -q 'branch_protected" = "false"' <<<"$SCRIPT_CODE_1059"; then
+  pass "#1059: an unreadable 404 is disambiguated by the branch's own .protected field"
+else
+  fail "#1059: the .protected probe is missing — an unprotected branch and a permission-denied read are indistinguishable again"
+fi
+
+# ---------------------------------------------------------------------------
+# #1059: the success line must not claim GitHub-level mergeability.
+#
+# Gate (b) branch 2 accepts a Codex 👍, but a 👍 is a REACTION and GitHub's
+# required_approving_review_count counts only APPROVED REVIEW OBJECTS. Every
+# consumer requires 1 (the hub requires 0), so a 👍-cleared consumer PR passes
+# every gate here and stays BLOCKED / REVIEW_REQUIRED indefinitely.
+# ---------------------------------------------------------------------------
+
+if grep -q 'is mergeable under Phase 4 external review' <<<"$SCRIPT_CODE_1059"; then
+  fail "#1059: the success line claims the PR 'is mergeable' — it cleared the POLICY gate, and GitHub can still refuse the merge for want of an APPROVED review object"
+else
+  pass "#1059: the success line no longer claims GitHub-level mergeability"
+fi
+
+if grep -q 'POLICY gates pass' <<<"$SCRIPT_CODE_1059"; then
+  pass "#1059: the success line names the scope of what cleared"
+else
+  fail "#1059: the success line does not identify itself as a policy-gate clearance"
+fi
+
+# The advisory must stay ADVISORY — a policy gate must not start failing on a
+# branch-protection condition it does not own, and an unreadable reviewDecision
+# must print nothing rather than block.
+if grep -q 'REVIEW_REQUIRED' <<<"$SCRIPT_CODE_1059" \
+   && grep -q 'reviewDecision' <<<"$SCRIPT_CODE_1059"; then
+  pass "#1059: the outstanding-approval advisory is present"
+else
+  fail "#1059: nothing warns that an APPROVED review object is still outstanding — the stall is left to be rediscovered per PR"
+fi
+
+REVIEW_DECISION_BLOCK=$(sed -n '/REVIEW_DECISION=\$(gh api graphql/,/^exit 0$/p' "$SCRIPT")
+if grep -Eq 'fail_gate|die |exit 1' <<<"$REVIEW_DECISION_BLOCK"; then
+  fail "#1059: the reviewDecision advisory can fail the gate — it must stay advisory, since branch protection is not this gate's to enforce"
+else
+  pass "#1059: the reviewDecision advisory cannot fail the gate"
+fi
+
+if grep -q '2>/dev/null || true' <<<"$REVIEW_DECISION_BLOCK"; then
+  pass "#1059: an unreadable reviewDecision degrades to silence, not to an error"
+else
+  fail "#1059: the reviewDecision read is not error-tolerant — a denied GraphQL query would break a gate that has already passed"
+fi
+
 echo ""
 echo "test_codex_review_check_required_checks: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
