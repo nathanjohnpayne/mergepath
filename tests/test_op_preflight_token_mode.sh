@@ -695,7 +695,7 @@ test_token_mode_helper_scope() {
       exit 1
     fi
     if [[ "${GH_TOKEN:-}" != "reviewer-pat-codex" ]]; then
-      echo "reviewer scope loaded wrong token: '${GH_TOKEN:-}'" >&2
+      echo "reviewer scope loaded wrong token: '${GH_TOKEN:-}'" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
     unset GH_TOKEN

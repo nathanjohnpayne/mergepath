@@ -125,11 +125,11 @@ test_lib_auto_source_basic() {
     . "$LIB"
     auto_source_preflight
     if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "rev-1" ]; then
-      echo "auto_source did not populate REVIEWER_PAT (got '${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2
+      echo "auto_source did not populate REVIEWER_PAT (got '${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
     if [ "${OP_PREFLIGHT_AUTHOR_PAT:-}" != "auth-1" ]; then
-      echo "auto_source did not populate AUTHOR_PAT (got '${OP_PREFLIGHT_AUTHOR_PAT:-}')" >&2
+      echo "auto_source did not populate AUTHOR_PAT (got '${OP_PREFLIGHT_AUTHOR_PAT:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
   ) >"$WORKDIR/lib1.out" 2>"$WORKDIR/lib1.err"
@@ -230,7 +230,7 @@ test_lib_default_ttl_is_ten_hours() {
     . "$LIB"
     auto_source_preflight
     if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "rev-3c" ]; then
-      echo "5h-old cache did not auto-source under the 10h default (REVIEWER_PAT='${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2
+      echo "5h-old cache did not auto-source under the 10h default (REVIEWER_PAT='${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
     if ! preflight_require_token reviewer; then
@@ -238,7 +238,7 @@ test_lib_default_ttl_is_ten_hours() {
       exit 1
     fi
     if [ "${GH_TOKEN:-}" != "rev-3c" ]; then
-      echo "require_token did not export the cached reviewer PAT (got '${GH_TOKEN:-}')" >&2
+      echo "require_token did not export the cached reviewer PAT (got '${GH_TOKEN:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
     # load_preflight_env_vars gates on the same freshness check, so it must
@@ -318,18 +318,18 @@ test_lib_auto_source_scrubs_ambient_github_token() {
     . "$LIB"
     auto_source_preflight
     if [ "${GITHUB_TOKEN:-}" != "ambient-caller-github-token" ]; then
-      echo "auto_source did not restore the ambient GITHUB_TOKEN fallback (got '${GITHUB_TOKEN:-}')" >&2
+      echo "auto_source did not restore the ambient GITHUB_TOKEN fallback (got '${GITHUB_TOKEN:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
     if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "rev-3b" ]; then
-      echo "auto_source did not load the cache (REVIEWER_PAT='${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2
+      echo "auto_source did not load the cache (REVIEWER_PAT='${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
     # r10: a review-mode cache leaves GH_TOKEN UNSET — it must NOT impose the
     # reviewer PAT; callers pin $OP_PREFLIGHT_*_PAT per command, which wins
     # over the restored GITHUB_TOKEN by gh precedence.
     if [ -n "${GH_TOKEN:-}" ]; then
-      echo "auto_source imposed a GH_TOKEN from a review cache (got '${GH_TOKEN:-}')" >&2
+      echo "auto_source imposed a GH_TOKEN from a review cache (got '${GH_TOKEN:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
   ) >"$WORKDIR/lib3b.out" 2>"$WORKDIR/lib3b.err" && local rc=0 || local rc=$?
@@ -368,7 +368,7 @@ EOF
     . "$LIB"
     auto_source_preflight
     if [ "${GITHUB_TOKEN:-}" != "caller-ci-github-token" ]; then
-      echo "PAT-less cache destroyed ambient GITHUB_TOKEN (got '${GITHUB_TOKEN:-}')" >&2
+      echo "PAT-less cache destroyed ambient GITHUB_TOKEN (got '${GITHUB_TOKEN:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
   ) >"$WORKDIR/lib3d.out" 2>"$WORKDIR/lib3d.err" && local rc=0 || local rc=$?
@@ -408,7 +408,7 @@ EOF
     . "$LIB"
     auto_source_preflight
     if [ "${GITHUB_TOKEN:-}" != "caller-fallback-github-token" ]; then
-      echo "reviewer-only cache destroyed ambient GITHUB_TOKEN fallback (got '${GITHUB_TOKEN:-}')" >&2
+      echo "reviewer-only cache destroyed ambient GITHUB_TOKEN fallback (got '${GITHUB_TOKEN:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
     if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "rev-3f" ]; then
@@ -452,7 +452,7 @@ EOF
     . "$LIB"
     auto_source_preflight
     if [ "${GITHUB_TOKEN:-}" != "caller-ci-github-token" ]; then
-      echo "stale PAT vars suppressed the ambient restore (got '${GITHUB_TOKEN:-}')" >&2
+      echo "stale PAT vars suppressed the ambient restore (got '${GITHUB_TOKEN:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
   ) >"$WORKDIR/lib3e.out" 2>"$WORKDIR/lib3e.err" && local rc=0 || local rc=$?
@@ -492,17 +492,17 @@ test_lib_load_env_vars_scrubs_ambient_token() {
       exit 1
     fi
     if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "cache-rev" ]; then
-      echo "REVIEWER_PAT did not resolve to the scrubbed cache sentinel (got '${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2
+      echo "REVIEWER_PAT did not resolve to the scrubbed cache sentinel (got '${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
     if [ "${OP_PREFLIGHT_AUTHOR_PAT:-}" != "cache-auth" ]; then
-      echo "AUTHOR_PAT did not resolve to the scrubbed cache sentinel (got '${OP_PREFLIGHT_AUTHOR_PAT:-}')" >&2
+      echo "AUTHOR_PAT did not resolve to the scrubbed cache sentinel (got '${OP_PREFLIGHT_AUTHOR_PAT:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
     # The caller's ambient GH_TOKEN must be restored (not scrubbed in the
     # caller's own process).
     if [ "${GH_TOKEN:-}" != "ambient-leaked-gh-token" ]; then
-      echo "caller GH_TOKEN not restored after load_preflight_env_vars (got '${GH_TOKEN:-}')" >&2
+      echo "caller GH_TOKEN not restored after load_preflight_env_vars (got '${GH_TOKEN:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
   ) >"$WORKDIR/lib3c.out" 2>"$WORKDIR/lib3c.err" && local rc=0 || local rc=$?
@@ -530,7 +530,7 @@ test_lib_require_token_reviewer() {
       exit 1
     fi
     if [ "${GH_TOKEN:-}" != "rev-4" ]; then
-      echo "GH_TOKEN not exported with reviewer PAT (got '${GH_TOKEN:-}')" >&2
+      echo "GH_TOKEN not exported with reviewer PAT (got '${GH_TOKEN:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
   ) >"$WORKDIR/lib4.out" 2>"$WORKDIR/lib4.err"
@@ -559,7 +559,7 @@ test_lib_require_token_author() {
       exit 1
     fi
     if [ "${GH_TOKEN:-}" != "auth-5" ]; then
-      echo "GH_TOKEN not exported with author PAT (got '${GH_TOKEN:-}')" >&2
+      echo "GH_TOKEN not exported with author PAT (got '${GH_TOKEN:-}')" >&2  # TOKEN_OUTPUT_EXEMPT: fixture sentinel — the case pins OP_PREFLIGHT_CACHE_DIR and sets the token vars itself; a redaction cannot separate two equal-length sentinels (#996)
       exit 1
     fi
   ) >"$WORKDIR/lib5.out" 2>"$WORKDIR/lib5.err"

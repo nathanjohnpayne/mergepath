@@ -773,9 +773,9 @@ emit_from_session_file() (
   fi
 
   [[ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]] && \
-    printf 'export OP_PREFLIGHT_REVIEWER_PAT=%q\n' "$OP_PREFLIGHT_REVIEWER_PAT"
+    printf 'export OP_PREFLIGHT_REVIEWER_PAT=%q\n' "$OP_PREFLIGHT_REVIEWER_PAT"  # TOKEN_OUTPUT_EXEMPT: writing these values to the cache IS op-preflight's contract (#996)
   [[ -n "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]] && \
-    printf 'export OP_PREFLIGHT_AUTHOR_PAT=%q\n' "$OP_PREFLIGHT_AUTHOR_PAT"
+    printf 'export OP_PREFLIGHT_AUTHOR_PAT=%q\n' "$OP_PREFLIGHT_AUTHOR_PAT"  # TOKEN_OUTPUT_EXEMPT: writing these values to the cache IS op-preflight's contract (#996)
   [[ "${OP_PREFLIGHT_TOKEN_MODE:-0}" == "1" ]] && \
     printf 'export OP_PREFLIGHT_TOKEN_MODE=1\n'
   # Mode-scope the deploy-credential emission (#466): a review-mode (or
@@ -795,7 +795,7 @@ emit_from_session_file() (
     [[ -n "${OP_PREFLIGHT_FIREBASE_PROJECT:-}" ]] && \
       printf 'export OP_PREFLIGHT_FIREBASE_PROJECT=%q\n' "$OP_PREFLIGHT_FIREBASE_PROJECT"
     [[ -n "${CF_API_TOKEN:-}" ]] && \
-      printf 'export CF_API_TOKEN=%q\n' "$CF_API_TOKEN"
+      printf 'export CF_API_TOKEN=%q\n' "$CF_API_TOKEN"  # TOKEN_OUTPUT_EXEMPT: writing these values to the cache IS op-preflight's contract (#996)
   else
     # Review-only request (#466 r2): actively clear any deploy credentials a
     # prior --mode deploy / --mode all eval exported into the caller's

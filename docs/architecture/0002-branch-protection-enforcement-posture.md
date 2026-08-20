@@ -52,7 +52,7 @@ The posture is uniform, but the *reasons* differ by class, and so does the blast
 
 **Consumers.** A consumer receives the gate workflows through propagation whether or not it has enabled the corresponding knobs, so the workflows are already running there. The only thing the protection change adds is that their verdicts count. Two consumer-specific notes:
 
-- `swipewatch` is the propagation-wave canary. Its verdict is what a whole wave's audit rides on, so it has the strongest case of any consumer for being gated, not the weakest.
+- Whichever consumer is the **canary for a given wave** carries that wave's audit on its verdict, so it has the strongest case of any consumer for being gated, not the weakest — and since the canary is chosen per wave by the dominant risk of the change ([propagation-ordering.md](../agents/propagation-ordering.md)), any consumer can hold that role. That is an argument for gating **all** consumers rather than for gating one named repo. (`swipewatch` is the documented **ESLint** canary specifically; that is one axis, not a standing propagation-wave appointment.)
 - `matchline` additionally requires zero approving reviews. That is orthogonal to the five checks and is not decided here; #774 tracks confirming it is intentional.
 
 **Ordering constraint, not an exception.** GitHub only offers a check name in the required-checks dropdown once that workflow has run at least once in the repo. The three repos with no protection therefore need a PR to land first before their checks can be required. That is a sequencing constraint on *how* the posture is adopted, not a class of repo that is exempt from it.
