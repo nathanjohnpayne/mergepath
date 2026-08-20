@@ -1472,6 +1472,36 @@ else
   fail "#1061: the documented exit-0 contract does not explain what exit 0 actually establishes"
 fi
 
+
+# #1061 Codex P2 round 7: the advisory must be COPY-PASTEABLE and must not
+# assert the CODEOWNERS deadlock from a single approval.
+#
+# `<PR#>` is a shell redirection, so a copied command tries to read a file
+# named `PR#` and leaves phase-4b-review.sh without its required argument.
+# And one qualifying approval can coexist with REVIEW_REQUIRED without any
+# deadlock when protection wants MORE approvals or one from a specific
+# CODEOWNER — in which case another Phase 4b round DOES clear it.
+if grep -q 'phase-4b-review.sh <PR#>' <<<"$ADVISORY_BLOCK"; then
+  fail "#1061: the advisory prints the literal placeholder <PR#> — bash reads that as a redirection, so the prescribed command fails immediately"
+else
+  pass "#1061: the advisory prints no literal <PR#> placeholder"
+fi
+if grep -q 'phase-4b-review.sh \$PR_NUMBER' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the advisory interpolates the validated PR number, so the command is runnable as printed"
+else
+  fail "#1061: the advisory does not interpolate \$PR_NUMBER into the phase-4b command"
+fi
+if grep -qE 'this is the CODEOWNERS deadlock and another' <<<"$ADVISORY_BLOCK"; then
+  fail "#1061: the advisory still asserts the CODEOWNERS deadlock from the mere existence of an approval — multi-approval and specific-CODEOWNER rules produce the same state and ARE cleared by another 4b round"
+else
+  pass "#1061: the advisory no longer treats one approval as proof of the CODEOWNERS deadlock"
+fi
+if grep -qE 'MORE of them|specific CODEOWNER' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the advisory names the multi-approval / specific-CODEOWNER cases that another 4b round does clear"
+else
+  fail "#1061: the advisory does not mention the states where a further Phase 4b round is the correct remedy"
+fi
+
 echo ""
 echo "test_codex_review_check_required_checks: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

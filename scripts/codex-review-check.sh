@@ -2417,7 +2417,8 @@ if [ "$REVIEW_DECISION" = "REVIEW_REQUIRED" ]; then
   # evaluates the reviews directly for exactly this reason. Another 4b round
   # cannot clear that one. Distinguish them by looking for the approval
   # (#1061 Codex P1).
-  # Name BOTH causes and count nothing. REVIEW_REQUIRED has two: no APPROVED
+  # Lead with the remedy that almost always applies, and count nothing.
+  # REVIEW_REQUIRED does not have two neat causes: no APPROVED
   # review OBJECT exists (a Codex 👍 is a reaction and never satisfies branch
   # protection), or the CODEOWNERS deadlock, where a qualifying approval DOES
   # exist and reviewDecision stays REVIEW_REQUIRED anyway — documented in
@@ -2435,6 +2436,6 @@ if [ "$REVIEW_DECISION" = "REVIEW_REQUIRED" ]; then
   # Naming both remedies costs one line and cannot be wrong. The script that
   # actually checks qualification is one command away, and it does the
   # permission / latest-per-author / CHANGES_REQUESTED work properly.
-  log "NOTE: GitHub reports reviewDecision=REVIEW_REQUIRED, so this PR will not merge yet — branch protection wants an APPROVED review OBJECT, which a Codex 👍 reaction does not provide. If no qualifying approval exists, run scripts/phase-4b-review.sh <PR#> --repo $REPO from a trusted main-ref checkout. If one already does, this is the CODEOWNERS deadlock and another Phase 4b round will NOT clear it — see scripts/admin-merge-codeowners-blocked.sh, which verifies that directly (mergepath#1059)."
+  log "NOTE: GitHub reports reviewDecision=REVIEW_REQUIRED, so this PR will not merge yet — branch protection wants an APPROVED review OBJECT, which a Codex 👍 reaction does not provide. Usual remedy: scripts/phase-4b-review.sh $PR_NUMBER --repo $REPO from a trusted main-ref checkout. That also applies when an approval already exists but protection wants MORE of them, or one from a specific CODEOWNER — another round from a different eligible identity clears those. Only if a qualifying approval exists AND no further eligible reviewer can satisfy the rule is this the self-author CODEOWNERS deadlock, which no Phase 4b round can clear; scripts/admin-merge-codeowners-blocked.sh verifies that case directly rather than inferring it (mergepath#1059)."
 fi
 exit 0
