@@ -242,11 +242,26 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     stream.  This is shell STATE, tracked in source order across the file and
     resolved per SEGMENT, so `( set -x; : "$PAT" )` counts and `set +x`,
     `set +o xtrace` and `set -- -x` are all read correctly.
+  * The ERROR WORD of a `${VAR:?word}` / `${VAR?word}` expansion.  BASH
+    ITSELF writes that word to stderr when VAR is unset, before the enclosing
+    command runs and whatever that command is, so `: "${UNSET:?$PAT}"` and
+    `x=${UNSET:?$PAT}` both print the credential.  Grading it against the
+    command word answered the wrong question.  The neighbouring operators
+    (`:-`, `:=`, `:+`) substitute rather than write and are MUST_NOT_FLAG
+    cases; the cost is that a SET variable never reaches its error word and
+    the rule cannot know that, which is a declared conservatism.
   * The operand of a builtin that requires a NUMBER and REPRODUCES a
     non-numeric one in its own stderr diagnostic -- `exit`, `return`, `shift`,
-    `break`, `continue`, `ulimit`, `wait`, `history`.  Membership is
+    `break`, `continue`, `ulimit`, `wait`, `history`, `kill`.  Membership is
     oracle-decided; the near neighbours that stay silent (`let`, `umask`,
-    `read`, `getopts`, `fc`) are MUST_NOT_FLAG cases.  These write STDERR and
+    `read`, `getopts`, `fc`) are MUST_NOT_FLAG cases.  The BOUNDARY is the
+    operand's TYPE, not the fact of a diagnostic: `type`, `cd`, `hash`,
+    `alias`, `pushd`, `dirs`, `shopt` and the external `ls`, `cat`, `rm`,
+    `git`, `grep` all reproduce a bad operand too, and all of them take a NAME
+    or a PATH whose validity is run-time state.  Those are
+    `indirect-external-command`, the limit declared from the start, and three
+    of them are pinned as corpus cases so the boundary is measured rather than
+    asserted.  These write STDERR and
     the shields are built around stdout emitters, so the capture and pipeline
     spellings disagree with the oracle in both directions and all three are
     declared -- the descriptor seam is #1042's.
@@ -693,8 +708,27 @@ SAFE_COMMANDS = frozenset(
 # credential-named operand is what fires this; `exit "$rc"` names no
 # credential and is not a reference at all.
 NUMERIC_OPERAND_DIAGNOSTIC = frozenset(
-    {"exit", "return", "shift", "break", "continue", "ulimit", "wait", "history"}
+    {
+        "exit", "return", "shift", "break", "continue", "ulimit", "wait",
+        "history",
+        # `kill` takes a PID or a jobspec, so a credential can never be a
+        # valid operand and the diagnostic is as deterministic as the rest of
+        # this set (#1032 round 5 P1).
+        "kill",
+    }
 )
+# The BOUNDARY of the set above, stated because it is the difference between a
+# closed rule and an open enumeration.  Membership is "the operand's TYPE is
+# numeric, so a credential can NEVER be valid and the diagnostic is certain".
+# It is NOT "any command that reproduces a bad operand", because that is very
+# nearly every command there is: `type`, `hash`, `cd`, `alias`, `pushd`,
+# `dirs`, `shopt`, `bind`, `caller`, `enable`, `unalias`, `jobs`, `disown`
+# all do it, and so do `ls`, `cat`, `rm`, `git` and `grep` -- all measured.
+# Those take a NAME or a PATH, their diagnostic depends on what exists at run
+# time, and they are the `indirect-external-command` limit this gate has
+# declared from the start rather than a list waiting to be completed.
+# `numeric-operand-boundary-*` are the corpus cases that keep the distinction
+# measured instead of asserted.
 # Commands that dump the environment they were given, so an env-prefix
 # assignment feeding one does reach a stream.
 ENV_DUMPERS = frozenset({"env", "printenv", "set", "compgen"})
@@ -794,13 +828,21 @@ class Segment:
 class Ref:
     __slots__ = (
         "name", "line", "seg", "heredoc_owner", "in_assign_prefix",
-        "in_heredoc_body",
+        "in_heredoc_body", "in_error_word",
     )
 
     def __init__(self, name, line, seg, in_assign_prefix=False):
         self.name = name
         self.line = line
         self.seg = seg
+        # Set when the reference sits in the ERROR WORD of a `${VAR:?word}` /
+        # `${VAR?word}` expansion.  THE EXPANSION writes that word to stderr
+        # itself, before the enclosing command runs and whatever that command
+        # is, so the reference reaches a stream even under `:` or a bare
+        # assignment -- `x=${UNSET:?$PAT}` prints the credential and exits.
+        # Grading it against the command word answered a question that is not
+        # the one being asked (#1032 round 5 P1).
+        self.in_error_word = False
         # Set when the reference is body TEXT the here-doc owner writes, so
         # the owner's segment is where the walk starts.  A reference inside a
         # COMMAND SUBSTITUTION in that same body leaves this None and carries
@@ -1253,7 +1295,14 @@ class Lexer:
                     i += 2
                     continue
                 if nxt == "{":
-                    quotes.append("${")
+                    # `${?` is the SAME brace level as `${`, marked so that a
+                    # reference found later inside it knows it is in an error
+                    # WORD the expansion itself writes.  It is a distinct
+                    # marker rather than a parallel counter because the pop on
+                    # `}` has to stay exactly symmetric with the push.
+                    quotes.append(
+                        "${?" if error_word_expansion_at(text, i) else "${"
+                    )
                     cur_level()["word"].append("${")
                     # `${NAME...}`: `braced_ref_at` is the single decider,
                     # shared with the here-doc body scanner.  Anything nested
@@ -1263,33 +1312,33 @@ class Lexer:
                     if expanding():
                         name = braced_ref_at(text, i)
                         if name:
-                            cur_ll.refs.append(
-                                Ref(
-                                    name,
-                                    line,
-                                    cur_level()["seg"],
-                                    in_assign_prefix(),
-                                )
+                            r = Ref(
+                                name,
+                                line,
+                                cur_level()["seg"],
+                                in_assign_prefix(),
                             )
+                            r.in_error_word = "${?" in quotes[:-1]
+                            cur_ll.refs.append(r)
                     i += 2
                     continue
                 # a plain variable reference
                 if expanding():
                     m = _IDENT_RE.match(text, i + 1)
                     if m and m.group(0) in TOKEN_NAME_SET:
-                        cur_ll.refs.append(
-                            Ref(
-                                m.group(0),
-                                line,
-                                cur_level()["seg"],
-                                in_assign_prefix(),
-                            )
+                        r = Ref(
+                            m.group(0),
+                            line,
+                            cur_level()["seg"],
+                            in_assign_prefix(),
                         )
+                        r.in_error_word = "${?" in quotes
+                        cur_ll.refs.append(r)
                 cur_level()["word"].append(c)
                 i += 1
                 continue
 
-            if c == "}" and quotes and quotes[-1] == "${":
+            if c == "}" and quotes and quotes[-1] in ("${", "${?"):
                 quotes.pop()
                 cur_level()["word"].append(c)
                 i += 1
@@ -1302,7 +1351,7 @@ class Lexer:
                     i += 2
                     continue
 
-            if c == "'" and (not quotes or quotes[-1] in ("${", "$((")):
+            if c == "'" and (not quotes or quotes[-1] in ("${", "${?", "$((")):
                 quotes.append("'")
                 cur_level()["word"].append(c)
                 i += 1
@@ -1697,6 +1746,29 @@ def _skip_balanced_parens(text, start):
     return n
 
 
+def error_word_expansion_at(text, brace_open):
+    """Is the `${...}` at `brace_open` the ERROR-WORD form, `:?` or `?`?
+
+    `${VAR:?word}` and `${VAR?word}` make BASH ITSELF write `word` to stderr
+    when VAR is unset (or unset/empty), before the enclosing command runs.
+    So a credential in that word reaches a stream no matter what the command
+    is -- `: "${UNSET:?$PAT}"` and `x=${UNSET:?$PAT}` both print it.
+
+    The operator is matched immediately after the NAME, so the `?` of a
+    pattern operator (`${VAR%?}`, `${VAR/?/x}`) is not this.  The name is a
+    plain identifier and NOT required to be a credential name: the credential
+    is in the WORD, and the variable being tested is usually something else.
+    """
+    j = brace_open + 2
+    if j < len(text) and text[j] in "#!":
+        return False
+    m = _IDENT_RE.match(text, j)
+    if not m:
+        return False
+    rest = text[m.end() :]
+    return rest.startswith(":?") or rest.startswith("?")
+
+
 def braced_ref_at(text, brace_open):
     """Decide a `${...}` expansion at `brace_open` (the index of the `$`).
 
@@ -2076,6 +2148,15 @@ def classify(seg, emitter_helpers):
 
 def reaches_output(ref, emitter_helpers):
     """Does this reference reach a stream?  Returns (bool, reason)."""
+    if ref.in_error_word:
+        # Decided BEFORE the command word, and deliberately ahead of the
+        # assign-prefix branch too: `x=${UNSET:?$PAT}` is an assignment whose
+        # EXPANSION writes to stderr and then exits, so asking what the
+        # command does with the value is asking the wrong question.
+        return True, (
+            "the error word of a `${...:?...}` expansion, which bash itself "
+            "writes to stderr when the variable is unset"
+        )
     if ref.in_assign_prefix:
         # `GH_TOKEN="$PAT" cmd ...` puts the value in the child's ENVIRONMENT.
         cmd, _ = resolve_command(ref.seg)
@@ -4089,6 +4170,77 @@ CORPUS = [
         MUST_FLAG,
         '( exit "$GH_TOKEN" ) 2>&1 | cat >/dev/null\necho ok\n',
     ),
+    # --- `kill`, and the BOUNDARY of the numeric-operand class -----------
+    ("numeric-kill", MUST_FLAG, 'kill "$GH_TOKEN" || :\necho ok\n'),
+    (
+        "numeric-kill-with-signal",
+        MUST_FLAG,
+        'kill -s TERM "$GH_TOKEN" || :\necho ok\n',
+    ),
+    # These reproduce the operand too, and they are deliberately NOT in the
+    # class: their operand is a NAME or a PATH, so whether the diagnostic
+    # appears depends on what exists at run time.  They are the
+    # `indirect-external-command` limit, and the builtin/external split makes
+    # no difference to it -- which is the whole point of pinning all three.
+    ("numeric-operand-boundary-type", MUST_NOT_FLAG, 'type "$GH_TOKEN" || :\necho ok\n'),
+    ("numeric-operand-boundary-cd", MUST_NOT_FLAG, 'cd "$GH_TOKEN" || :\necho ok\n'),
+    (
+        "numeric-operand-boundary-external",
+        MUST_NOT_FLAG,
+        'ls "$GH_TOKEN" || :\necho ok\n',
+    ),
+    # --- the error word of a `${...:?...}` expansion ---------------------
+    #
+    # BASH writes the word to stderr, before the command runs and whatever the
+    # command is.  The corpus previously covered this operator only behind
+    # `echo`, which is already an emitter and so could not tell the two
+    # mechanisms apart.  These put it behind the safest commands there are.
+    (
+        "error-word-colon-question",
+        MUST_FLAG,
+        ': "${UNSET_VALUE:?$GH_TOKEN}" || :\necho ok\n',
+    ),
+    (
+        "error-word-question",
+        MUST_FLAG,
+        ': "${UNSET_VALUE?$GH_TOKEN}" || :\necho ok\n',
+    ),
+    (
+        "error-word-in-assignment",
+        MUST_FLAG,
+        '( x=${UNSET_VALUE:?$GH_TOKEN} ) || :\necho ok\n',
+    ),
+    (
+        # The BRACED spelling of the reference inside the error word.  It is
+        # a separate code path in the lexer -- `${NAME}` is decided by
+        # `braced_ref_at` at the opening `$`, one level deeper than the plain
+        # `$NAME` walk -- so it needs its own case or the depth arithmetic
+        # that reads the enclosing marker is untested.
+        "error-word-braced-reference",
+        MUST_FLAG,
+        ': "${UNSET_VALUE:?${GH_TOKEN}}" || :\necho ok\n',
+    ),
+    (
+        "error-word-in-test",
+        MUST_FLAG,
+        '( [ -n "${UNSET_VALUE:?$GH_TOKEN}" ] ) || :\necho ok\n',
+    ),
+    (
+        # The scanner cannot know whether the variable is set at run time, so
+        # it fails closed on the spelling where the error word is never
+        # reached.  Declared conservatism.
+        "error-word-variable-is-set",
+        MUST_FLAG,
+        'SET_VALUE=x\n: "${SET_VALUE:?$GH_TOKEN}"\necho ok\n',
+    ),
+    (
+        # The neighbouring operators do NOT write: `:-` and `:=` substitute,
+        # `:+` yields a constant.  Pinned so the error-word rule cannot widen
+        # into them.
+        "error-word-neighbour-assign-operator",
+        MUST_NOT_FLAG,
+        ': "${UNSET_VALUE:=$GH_TOKEN}"\necho ok\n',
+    ),
     (
         # Deferred shell text nested TWO levels.  The outer operand does not
         # reduce to a literal, so the re-read cannot reach the inner `eval` --
@@ -4234,6 +4386,32 @@ CORPUS.extend(_generated_corpus())
 # fails when an undeclared disagreement appears AND when a declared entry stops
 # disagreeing, so neither list can quietly rot.
 KNOWN_MISSES = {
+    "numeric-operand-boundary-type": (
+        "a builtin whose operand is a NAME reproduces it in its diagnostic "
+        "(`type: <value>: not found`) and reads clean -- the same boundary "
+        "`numeric-operand-boundary-cd` records, on the name rather than the "
+        "path half of it"
+    ),
+    "numeric-operand-boundary-cd": (
+        "a builtin whose operand is a PATH reproduces it in its diagnostic "
+        "(`cd: <value>: No such file or directory`) and reads clean.  This is "
+        "the BOUNDARY of `NUMERIC_OPERAND_DIAGNOSTIC` and it is declared "
+        "rather than closed: membership there is `the operand's TYPE is "
+        "numeric, so a credential can never be valid`, and `cd` takes a name "
+        "that may or may not exist.  Extending the set to every command that "
+        "reproduces a bad operand would mean enumerating a set with no "
+        "boundary -- measured: `type`, `hash`, `alias`, `pushd`, `dirs`, "
+        "`shopt`, `bind`, `caller`, `enable`, `unalias`, `jobs` and `disown` "
+        "all do it, and so do the external commands below"
+    ),
+    "numeric-operand-boundary-external": (
+        "the same thing from an EXTERNAL command: `ls: <value>: No such file "
+        "or directory`.  `cat`, `rm`, `git` and `grep` were all measured "
+        "doing it too.  This is `indirect-external-command` -- the limit this "
+        "gate has declared from the start -- and the builtin/external split "
+        "makes no difference to it, which is why both spellings are pinned "
+        "beside each other"
+    ),
     "numeric-exit-captured": (
         "a numeric-operand builtin's diagnostic goes to STDERR and `$( )` "
         "captures STDOUT, so the value reaches a stream and the capture "
@@ -4328,6 +4506,15 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "error-word-variable-is-set": (
+        "`${SET_VALUE:?$PAT}` writes the error word only when the variable is "
+        "UNSET, and whether it is set is run-time state a source-text scanner "
+        "cannot read.  So the error-word rule fails closed on the spelling "
+        "where nothing is written.  The alternative -- tracking assignments "
+        "to decide it -- is the dataflow this gate does not have, and it "
+        "would fail on the case that matters: a variable set in another file "
+        "or by the environment.  Escapable at the site with the pragma"
+    ),
     "cmdword-glob-pipeline-consumer": (
         "the fail-closed command-word rule reached through a PIPELINE "
         "CONSUMER: `printf %s \"$PAT\" | /bin/gre* -qF zz` puts nothing on a "
