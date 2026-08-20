@@ -236,6 +236,9 @@ WHAT COUNTS AS OUTPUT, AND WHAT COUNTS AS CAPTURE
     is REPORTED rather than dropped, for the reason an unterminated here-doc
     is.  An operand that does not reduce to a literal is not re-read; `trap`
     is opaque, so a reference the lexer can see inside one is flagged anyway.
+    A `mapfile -C CALLBACK` / `readarray -C CALLBACK` argument is the same
+    thing in a NAMED OPTION -- bash evaluates the callback -- and is re-read
+    the same way, without treating the array name beside it as shell.
   * A reference anywhere XTRACE is in effect.  With `set -x` (or `set -o
     xtrace`, or a `-x` shebang) bash writes every EXPANDED command to stderr,
     so `: "$PAT"` -- the safest command word there is -- puts the value on a
@@ -2591,6 +2594,16 @@ class Finding:
 # interpolating here-doc body has with its opener, and it is handled the same
 # way: the literal is re-read AS SHELL.
 DEFERRED_SHELL_COMMANDS = frozenset({"trap", "eval"})
+# Commands that take deferred shell in a NAMED OPTION rather than in every
+# operand.  `mapfile -C CALLBACK` / `readarray -C CALLBACK` EVALUATE the
+# callback, so `mapfile -C 'echo "$PAT"' -c 1 v < <(...)` prints the
+# credential (#1032 round 7 P1).  Only the option's own argument is shell --
+# the array name and the other operands are not -- so these are kept apart
+# from DEFERRED_SHELL_COMMANDS, whose operands are all shell.
+DEFERRED_SHELL_OPTIONS = {
+    "mapfile": "-C",
+    "readarray": "-C",
+}
 # One hop.  A `trap 'eval "..."' EXIT` gets its inner eval graded; a third
 # level is a declared miss rather than an unbounded recursion, and the bound
 # is here rather than implied by the call graph.
@@ -2610,6 +2623,16 @@ _XTRACE_OFF = ("+x", "+o")
 def _deferred_shell_operands(seg):
     """LITERAL operands of a `trap` / `eval` segment, as shell source text."""
     cmd, _redir = resolve_command(seg)
+    if cmd in DEFERRED_SHELL_OPTIONS:
+        opt = DEFERRED_SHELL_OPTIONS[cmd]
+        lits = [_unquote_command_word(w) for w in seg.words]
+        out = []
+        for k, l in enumerate(lits):
+            if l == opt and k + 1 < len(lits) and lits[k + 1] is not None:
+                out.append(lits[k + 1])
+            elif l is not None and l.startswith(opt) and len(l) > len(opt):
+                out.append(l[len(opt) :])
+        return out
     if cmd not in DEFERRED_SHELL_COMMANDS:
         return []
     out = []
@@ -2978,13 +3001,25 @@ def classify_file(path):
             head = fh.read(8192)
     except OSError as exc:
         raise CheckError("unreadable: %s" % exc)
-    if b"\x00" in head:
-        return "non-shell"
     try:
         first = head.split(b"\n", 1)[0].decode("utf-8", "replace")
     except Exception as exc:  # pragma: no cover - decode never raises here
         raise CheckError("undecodable head: %s" % exc)
     interp = resolve_shebang(first)
+    if b"\x00" in head:
+        # A NUL is strong evidence of a binary, but it is EVIDENCE, not an
+        # override: bash happily executes a `.sh` file with a stray NUL in it,
+        # and letting the heuristic win meant `echo "$GH_TOKEN"` followed by a
+        # NUL byte was skipped before its extension or shebang was ever
+        # consulted, and `--scan` reported PASS (#1032 round 7 P1).  An
+        # EXPLICIT declaration of shell -- a shell extension or a resolved
+        # shell shebang -- outranks it; everything else (a real PNG, a `.txt`
+        # with a NUL) is still non-shell on the same heuristic as before.
+        if interp in SHELL_INTERPRETERS:
+            return "shell"
+        if os.path.splitext(path)[1].lower() in SHELL_EXTS:
+            return "shell"
+        return "non-shell"
     if interp in SHELL_INTERPRETERS:
         return "shell"
     if interp in NON_SHELL_INTERPRETERS:
@@ -4344,6 +4379,32 @@ CORPUS = [
         MUST_FLAG,
         '( exit "$GH_TOKEN" ) 2>&1 | cat >/dev/null\necho ok\n',
     ),
+    # --- deferred shell in a NAMED OPTION --------------------------------
+    #
+    # `mapfile -C CALLBACK` EVALUATES the callback.  Only the option's own
+    # argument is shell, which is why this is a separate table from
+    # DEFERRED_SHELL_COMMANDS and why the no-callback and safe-callback
+    # spellings are pinned beside it.
+    (
+        "mapfile-callback",
+        MUST_FLAG,
+        'mapfile -C \'echo "$GH_TOKEN"\' -c 1 values < <(printf \'x\\n\')\n',
+    ),
+    (
+        "readarray-callback",
+        MUST_FLAG,
+        'readarray -C \'echo "$GH_TOKEN"\' -c 1 v < <(printf \'x\\n\')\n',
+    ),
+    (
+        "mapfile-callback-non-emitting",
+        MUST_NOT_FLAG,
+        'mapfile -C \'true\' -c 1 v < <(printf \'x\\n\')\n: "$GH_TOKEN"\necho ok\n',
+    ),
+    (
+        "mapfile-without-callback",
+        MUST_NOT_FLAG,
+        'mapfile v < <(printf \'x\\n\')\n: "$GH_TOKEN"\necho ok\n',
+    ),
     # --- xtrace: only an UNCONDITIONAL disable counts --------------------
     #
     # A `set +x` bash never executes is a silent false negative and is
@@ -5588,6 +5649,42 @@ def _file_selection_cases(tmp):
     findings, _errors, count = scan_tree(root)
     if count != 1 or not findings:
         failures.append("file-selection crlf: CRLF file not read or not reported")
+
+    # NUL bytes.  A NUL is evidence of a binary, not an override: bash runs a
+    # `.sh` file with a stray NUL in it, and letting the heuristic win skipped
+    # the file before its extension or shebang was consulted.  The negative
+    # cases are what keep the exception from swallowing real binaries.
+    for cid, filename, data, expect_count in (
+        (
+            "nul-trailing",
+            "leak.sh",
+            b'#!/usr/bin/env bash\nGH_TOKEN=x\necho "$GH_TOKEN"\n\x00',
+            1,
+        ),
+        (
+            "nul-no-shebang",
+            "leak.sh",
+            b'GH_TOKEN=x\necho "$GH_TOKEN"\n\x00',
+            1,
+        ),
+        ("nul-real-binary", "image.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00", 0),
+        ("nul-plain-text", "notes.txt", b"\x00 not a script at all\n", 0),
+    ):
+        root = os.path.join(tmp, "fs-" + cid)
+        os.makedirs(os.path.join(root, "scripts"), exist_ok=True)
+        with open(os.path.join(root, "scripts", filename), "wb") as fh:
+            fh.write(data)
+        findings, _errors, count = scan_tree(root)
+        if count != expect_count:
+            failures.append(
+                "file-selection %s: scanned %d shell file(s), expected %d"
+                % (cid, count, expect_count)
+            )
+        elif expect_count and not findings:
+            failures.append(
+                "file-selection %s: file was read but the leak was not "
+                "reported" % cid
+            )
 
     # symlink
     root = os.path.join(tmp, "fs-symlink")
