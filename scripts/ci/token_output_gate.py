@@ -396,9 +396,10 @@ does not catch:
     (`cat "$LOG"`).  It DOES catch the line that puts the value into the log,
     when that line names the variable; it cannot connect that line to the `cat`
     that prints it.
-  * `set -x` traces, core dumps, or anything the shell emits on its own.  Not
-    a construct in a line, so there is no corpus case behind this one -- it is
-    a statement about the shell, and the harness has nothing to say about it.
+  * Core dumps or other shell/runtime output whose triggering value is not a
+    credential reference the scanner can see.  Xtrace is NOT in this gap:
+    `set -x`, `set -o xtrace`, xtrace shebangs and deferred code that enables
+    tracing are live corpus cases and are tracked as shell state below.
   * (#1035) A SHELL-STATE DUMPER on a segment that names no credential
     variable.  The boundary here is the REFERENCE, not the command word, and
     the earlier wording of this bullet had it the other way round.  This scanner asks
@@ -2340,7 +2341,7 @@ def tee_file_operands(seg):
     return files
 
 
-def classify(seg, emitter_helpers, local_functions=frozenset()):
+def classify(seg, emitter_helpers):
     cmd, _redir = resolve_command(seg)
     if cmd is None:
         return ASSIGN
@@ -2348,14 +2349,6 @@ def classify(seg, emitter_helpers, local_functions=frozenset()):
         return OPAQUE
     if cmd in OPAQUE_COMMANDS:
         return OPAQUE
-    # A function defined in THIS FILE shadows the builtin of the same name, so
-    # `echo(){ :; }; echo "$PAT"` writes nothing.  Helper discovery already
-    # graded every local body, so a shadowing name that is NOT in
-    # `emitter_helpers` was measured non-emitting and the global EMITTERS rule
-    # must not override that -- it rejected valid shell (#1032 round 8 P2).
-    # Ordered ahead of the `printf` branch because `printf` is shadowable too.
-    if cmd in local_functions and cmd not in emitter_helpers:
-        return SAFE
     if cmd == "printf":
         lits = [_unquote_command_word(w) for w in seg.words]
         if "-v" in lits:
@@ -2426,7 +2419,7 @@ def _read_numeric_option_operand(seg, name):
     return False
 
 
-def reaches_output(ref, emitter_helpers, local_functions=frozenset()):
+def reaches_output(ref, emitter_helpers):
     """Does this reference reach a stream?  Returns (bool, reason)."""
     if ref.in_error_word:
         # Decided BEFORE the command word, and deliberately ahead of the
@@ -2487,7 +2480,7 @@ def reaches_output(ref, emitter_helpers, local_functions=frozenset()):
     while seg is not None and hops < 32:
         hops += 1
         cmd, has_out_redir = resolve_command(seg)
-        kind = classify(seg, emitter_helpers, local_functions)
+        kind = classify(seg, emitter_helpers)
         if kind == OPAQUE:
             return True, "command word could not be resolved (%s)" % (
                 "unresolvable" if cmd is UNRESOLVED else cmd
@@ -2673,23 +2666,24 @@ def _find_body(text, open_brace_idx):
 
 
 _FUNC_DEF_RE = re.compile(
-    r"(?m)(?:^|(?<=[;&|(])|(?<=\bthen)|(?<=\bdo)|(?<=\belse)"
-    r"|(?<=\bin))[ \t]*(?:function[ \t]+)?"
+    r"(?m)(?:^|(?<=[;&|(){}!])|(?<=\bif)|(?<=\belif)|(?<=\bwhile)"
+    r"|(?<=\buntil)|(?<=\bthen)|(?<=\bdo)|(?<=\belse)|(?<=\bin)"
+    r"|(?<=\btime))[ \t]*(?:function[ \t]+)?"
     r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
     r"(?:\([ \t]*\))?[ \t]*\{"
 )
 
 
-def discover_local_functions(text):
-    """Names this file DEFINES as functions.
+def _iter_function_definitions(text):
+    """Yield each recognized function definition as (match, name, body).
 
-    A definition shadows a builtin of the same name for the rest of the file,
-    so `classify` needs the set to know that `echo` here is not bash's `echo`.
-    Separate from `discover_emitter_helpers` -- which answers the narrower
-    "does this body emit a positional" -- because a body that emits NOTHING
-    still shadows, and that is exactly the case being fixed.
+    Function definitions are valid at every command position, including a
+    case arm after `)`, a brace group after `{`, and condition positions after
+    `if` / `while` / `until` / `!` / `time`.  Keep that grammar in one place:
+    three copied regexes drifted together and still omitted those positions,
+    letting a positional-emitting helper defined there read as an unknown safe
+    command (#1032 external review).
     """
-    out = set()
     for m in _FUNC_DEF_RE.finditer(text):
         name = m.group(1)
         if name in RESERVED_WORDS:
@@ -2697,8 +2691,9 @@ def discover_local_functions(text):
         head = text[m.start() : m.end()]
         if "(" not in head and not head.lstrip().startswith("function"):
             continue
-        out.add(name)
-    return frozenset(out)
+        body = _find_body(text, m.end() - 1)
+        if body is not None:
+            yield m, name, body
 
 
 def discover_emitter_helpers(text):
@@ -2710,22 +2705,8 @@ def discover_emitter_helpers(text):
     # `log "$PAT"` graded as an unknown external command and read clean
     # (#1032 round 6 P1).  The lookbehind keeps `m.start()` on the NAME, so
     # the `function`-form check below still sees the head it expects.
-    for m in re.finditer(
-        r"(?m)(?:^|(?<=[;&|(])|(?<=\bthen)|(?<=\bdo)|(?<=\belse)"
-        r"|(?<=\bin))[ \t]*(?:function[ \t]+)?"
-        r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
-        r"(?:\([ \t]*\))?[ \t]*\{",
-        text,
-    ):
-        name = m.group(1)
-        if name in RESERVED_WORDS:
-            continue
-        head = text[m.start() : m.end()]
-        if "(" not in head and not head.lstrip().startswith("function"):
-            continue
-        body = _find_body(text, m.end() - 1)
-        if body is not None:
-            bodies[name] = body
+    for _match, name, body in _iter_function_definitions(text):
+        bodies[name] = body
 
     # Lex each body ONCE.  What a body does never changes between rounds; only
     # the `helpers` set a call inside it is graded against does, and that is
@@ -3101,19 +3082,7 @@ def _function_body_line_spans(text):
     # this does not see is not a span, so a `set +x` inside it would be
     # CREDITED instead of refused -- a silent false negative, which is the
     # direction `xtrace-disable-in-called-function` exists to avoid.
-    for m in re.finditer(
-        r"(?m)(?:^|(?<=[;&|(])|(?<=\bthen)|(?<=\bdo)|(?<=\belse)"
-        r"|(?<=\bin))[ \t]*(?:function[ \t]+)?"
-        r"([A-Za-z_][A-Za-z0-9_:.-]*)[ \t]*"
-        r"(?:\([ \t]*\))?[ \t]*\{",
-        text,
-    ):
-        head = text[m.start() : m.end()]
-        if "(" not in head and not head.lstrip().startswith("function"):
-            continue
-        body = _find_body(text, m.end() - 1)
-        if body is None:
-            continue
+    for m, _name, body in _iter_function_definitions(text):
         start_line = text.count("\n", 0, m.end()) + 1
         spans.append((start_line, start_line + body.count("\n")))
     return spans
@@ -3206,7 +3175,6 @@ def scan_text(text, path="<text>", _depth=0):
     """Return (findings, pragma_errors)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     helpers = discover_emitter_helpers(text)
-    local_functions = discover_local_functions(text)
     lx = Lexer(text)
     findings = []
     pragma_errors = []
@@ -3274,7 +3242,7 @@ def scan_text(text, path="<text>", _depth=0):
             xtrace = outer
             continue
         for ref in ll.refs:
-            hit, why = reaches_output(ref, helpers, local_functions)
+            hit, why = reaches_output(ref, helpers)
             if not hit and xtrace_at.get(
                 ref.seg.sid if ref.seg is not None else None, xtrace
             ):
@@ -4922,8 +4890,26 @@ CORPUS = [
         'leak(){ : "${UNSET_VALUE:?$1}"; }\nleak "$GH_TOKEN"\n',
     ),
     ("helper-xtrace-body", MUST_FLAG, 'leak(){ set -x; : "$1"; }\nleak "$GH_TOKEN"\n'),
-    # A local definition SHADOWS the builtin for the rest of the file.
-    ("shadowed-emitter-noop", MUST_NOT_FLAG, 'echo(){ :; }\necho "$GH_TOKEN"\necho2 ok\n'),
+    # A local definition can shadow the builtin, but proving that it executed
+    # before a call is control-flow and scope analysis.  The scanner therefore
+    # fails closed on the no-op shadow and declares that conservatism below,
+    # rather than letting any textual definition suppress a real emitter.
+    ("shadowed-emitter-noop", MUST_FLAG, 'echo(){ :; }\necho "$GH_TOKEN"\necho2 ok\n'),
+    (
+        "shadowed-emitter-defined-after-use",
+        MUST_FLAG,
+        'echo "$GH_TOKEN"\necho(){ :; }\n',
+    ),
+    (
+        "shadowed-emitter-in-false-branch",
+        MUST_FLAG,
+        'if false; then echo(){ :; }; fi\necho "$GH_TOKEN"\n',
+    ),
+    (
+        "shadowed-emitter-in-subshell",
+        MUST_FLAG,
+        '( echo(){ :; } )\necho "$GH_TOKEN"\n',
+    ),
     # ...and a shadow that DOES emit is still an emitter, which is what keeps
     # the shadow rule from being a blanket exemption.
     (
@@ -4946,6 +4932,27 @@ CORPUS = [
         "helper-after-do",
         MUST_FLAG,
         'for i in 1; do log(){ echo "$1"; }; done\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        # A case pattern's closing `)` is a command position.  Omitting it
+        # from the copied function-definition regexes left this helper
+        # undiscovered and its later call read as an unknown safe command.
+        "helper-after-case-pattern",
+        MUST_FLAG,
+        'case x in x) log(){ echo "$1"; };; esac\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        # Function definitions are compound commands and are valid directly
+        # in an `if` condition, not only in the body after `then`.
+        "helper-after-if",
+        MUST_FLAG,
+        'if log(){ echo "$1"; }; then :; fi\nlog "$GH_TOKEN"\n',
+    ),
+    (
+        # A brace group opens another command position too.
+        "helper-after-brace-open",
+        MUST_FLAG,
+        '{ log(){ echo "$1"; }; }\nlog "$GH_TOKEN"\n',
     ),
     # An alias TARGET gets the same wrapper resolution an ordinary segment
     # gets; comparing only its first word graded the wrapper, not the emitter.
@@ -5426,6 +5433,15 @@ KNOWN_MISSES = {
 }
 
 KNOWN_BROADER = {
+    "shadowed-emitter-noop": (
+        "a same-file function can shadow an emitter builtin and write nothing, "
+        "but a textual definition is not proof that the definition EXECUTED "
+        "before this call or in this shell.  Definitions after the call, in a "
+        "false branch, and in a subshell all leave the builtin live; treating "
+        "any definition file-wide as a shadow made each of those real leaks "
+        "read clean.  The gate therefore fails closed on the uncommon no-op "
+        "shadow, which is escapable at the call site with the pragma"
+    ),
     "xtrace-disable-in-called-function": (
         "a function that IS called and turns tracing off gets no credit for "
         "it, because a source-text scanner cannot tell a called function from "

@@ -513,18 +513,9 @@ jobs:
         run: ./scripts/ci/check_no_bare_gh_writes || { rc=$?; if [ ! -f scripts/ci/check_no_bare_gh_writes ]; then echo "check_no_bare_gh_writes not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_no_token_in_output
-        # The enforcement half of #951/#993 (#996), rebuilt against an
-        # EXECUTION ORACLE per #1015. Fails when a shell source line under
-        # scripts/** or tests/** interpolates the VALUE of a known credential
-        # variable into an output command. Runs its own differential suite
-        # first — each construct is written to a disposable fixture carrying
-        # an obviously fake sentinel, RUN under bash, and its captured stdout
-        # and stderr grepped, so the scanner's verdict is checked against what
-        # bash actually does rather than against a second hand-written model
-        # of shell. Only the check's OWN fixtures are executed; the gate never
-        # executes repository source. Legitimate emitters carry an inline
-        # `TOKEN_OUTPUT_EXEMPT: <reason>` pragma at the site, and the reason is
-        # mandatory. Needs python3 and bash, both present on ubuntu-latest.
+        # Canonical rule, oracle, safety and exemption contracts live in
+        # scripts/ci/token_output_gate.py. This wire runs that file's self-test
+        # and repository scan; ubuntu-latest supplies its Python and bash.
         #
         # The `|| { ...; }` tail is the #590-style self-bootstrap guard:
         # soft-pass when the check script is absent in this tree (a checkout
