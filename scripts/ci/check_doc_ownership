@@ -81,6 +81,10 @@ MANIFEST="${MERGEPATH_MANIFEST_PATH:-$REPO_ROOT/.mergepath-sync.yml}"
 TEST_SUITE="$REPO_ROOT/tests/test_check_doc_ownership.sh"
 RUN_SELF_TEST=1
 
+if [ "${MERGEPATH_CONSUMER_SAFETY:-0}" = "1" ] && [ "$#" -eq 0 ]; then
+  set -- --check
+fi
+
 case "${1:-}" in
   "") ;;
   --check)

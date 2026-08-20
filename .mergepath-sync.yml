@@ -1378,6 +1378,7 @@ paths:
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
       - "scripts/lib/ci-check-modes.sh"          # shared --check/--self-test selector (#1062)
+      - "tests/test_repo_lint_optimization.sh"   # check_repo_lint_optimization
       - "tests/test_gh_pr_guard.sh"            # check_gh_as_author
       - "tests/test_gh_as_author.sh"           # check_gh_as_author
       - "tests/test_gh_as_reviewer.sh"         # check_gh_as_author

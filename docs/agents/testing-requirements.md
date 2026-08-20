@@ -4,8 +4,6 @@
 - Do not delete tests to make a build pass.
 - Every spec file should have a corresponding test file or a documented exception explaining why one does not exist.
 
-Replace this section with project-specific coverage requirements.
-
 ## Repo-lint execution
 
 The required `lint` context is an aggregator over a fast live-assertion lane and a change-aware deep-safety matrix. Pull requests that change CI, governance, propagation, tests, or their specifications run both isolated deep-safety matrix legs; other pull requests keep those exhaustive consumer and residue regression nets off the required critical path. Main pushes, the daily schedule, and manual runs always select deep CI. Do not add path filters to the aggregator itself: every pull-request head must publish exactly one stable `lint` result.

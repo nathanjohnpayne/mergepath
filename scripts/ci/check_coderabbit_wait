@@ -30,6 +30,10 @@ if [ ! -x "$REPO_ROOT/scripts/coderabbit-wait.sh" ]; then
   echo "check_coderabbit_wait: ERROR scripts/coderabbit-wait.sh missing or not executable" >&2
   exit 1
 fi
+if ! bash -n "$REPO_ROOT/scripts/coderabbit-wait.sh"; then
+  echo "check_coderabbit_wait: ERROR scripts/coderabbit-wait.sh has invalid shell syntax" >&2
+  exit 1
+fi
 
 if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
   for TEST in "${TESTS[@]}"; do
@@ -46,7 +50,7 @@ if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] && ! command -v jq >/dev/null 2>&1; then
 fi
 
 if [ "$CI_CHECK_RUN_SELF_TEST" -eq 0 ]; then
-  echo "check_coderabbit_wait: PASS (live structure)"
+  echo "check_coderabbit_wait: PASS (live structure and syntax)"
   exit 0
 fi
 

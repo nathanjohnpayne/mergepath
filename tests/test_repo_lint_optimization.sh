@@ -9,6 +9,7 @@ MD_WRAP="$ROOT/.github/workflows/md-prose-wrap.yml"
 OWL="$ROOT/.github/workflows/owl-rules-check.yml"
 AGENT_REVIEW="$ROOT/.github/workflows/agent-review.yml"
 TOKEN_WRAPPER="$ROOT/scripts/ci/check_no_token_in_output"
+DOC_WRAPPER="$ROOT/scripts/ci/check_doc_ownership"
 CONSUMER_VERDICT="$ROOT/scripts/ci/repo-lint-consumer-verdict.sh"
 MODE_HELPER="$ROOT/scripts/lib/ci-check-modes.sh"
 
@@ -49,6 +50,7 @@ else
     docs/agents/operating-rules.md \
     docs/architecture/0002-branch-protection-enforcement-posture.md \
     .mergepath-sync.yml \
+    .repo-template.yml \
     REVIEW_POLICY.md \
     ai_agent_tooling_standard.md; do
     if [ "$(classify pull_request "$path")" = "deep=true" ]; then
@@ -108,7 +110,12 @@ else
     fail "consumer and residue safety must be isolated matrix legs selected only by deep CI"
   fi
 
-  if yq -e '.jobs.lint.name == "lint" and .jobs.lint.if == "always()" and (.jobs.lint.needs | contains(["scope", "lint_fast", "deep_safety"]))' "$REPO_LINT" >/dev/null; then
+  aggregator_run=$(yq -r '.jobs.lint.steps[] | select(.name == "publish aggregate lint result") | .run' "$REPO_LINT")
+  if yq -e '.jobs.lint.name == "lint" and .jobs.lint.if == "always()" and (.jobs.lint.needs | contains(["scope", "lint_fast", "deep_safety"]))' "$REPO_LINT" >/dev/null \
+     && printf '%s' "$aggregator_run" | grep -Fq 'FAST_RESULT' \
+     && printf '%s' "$aggregator_run" | grep -Fq 'DEEP_RESULT' \
+     && printf '%s' "$aggregator_run" | grep -Fq 'SCOPE_RESULT' \
+     && printf '%s' "$aggregator_run" | grep -Fq 'exit 1'; then
     pass "a stable lint aggregator preserves the required status context"
   else
     fail "repo-lint must retain one always-running lint aggregator over every lane"
@@ -188,6 +195,12 @@ PY
   else
     fail "consumer-safety token wrapper should dispatch --scan, got '$token_args'"
   fi
+fi
+
+if grep -Fq 'MERGEPATH_CONSUMER_SAFETY' "$DOC_WRAPPER"; then
+  pass "consumer-safety selects the live doc-ownership assertion without its regression suite"
+else
+  fail "doc ownership must honor the consumer-safety smoke-mode contract"
 fi
 
 if [ ! -f "$CONSUMER_VERDICT" ]; then
