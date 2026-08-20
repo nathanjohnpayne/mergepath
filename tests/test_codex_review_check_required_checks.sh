@@ -1524,7 +1524,7 @@ else
   #   $4 .protected value, $5 whether OP_PREFLIGHT_AUTHOR_PAT is set,
   #   $6 expected protection_readable, $7 expected required-name count
   run_prot_case() {
-    local label=$1 unpriv=$2 priv=$3 protected=$4 have_pat=$5 exp_readable=$6 exp_names=$7
+    local label=$1 unpriv=$2 priv_mode=$3 protected=$4 have_pat=$5 exp_readable=$6 exp_names=$7
     local scratch; scratch=$(mktemp -d "${TMPDIR:-/tmp}/prot-case.XXXXXX")
     mkdir -p "$scratch/bin"
 
@@ -1534,17 +1534,19 @@ else
     {
       echo '#!/usr/bin/env bash'
       echo 'url=""; for a in "$@"; do case "$a" in repos/*) url="$a";; esac; done'
-      echo 'priv=0; [ -n "${GH_TOKEN:-}" ] && [ "$GH_TOKEN" = "AUTHOR" ] && priv=1'
+      echo 'is_priv=0; [ -n "${GH_TOKEN:-}" ] && [ "$GH_TOKEN" = "AUTHOR" ] && is_priv=1'
       echo 'case "$url" in'
       echo '  */protection/required_status_checks)'
-      echo "    if [ \$priv -eq 1 ] && [ '$priv' = sub-ok ]; then echo '{\"contexts\":[\"ctx-a\"],\"checks\":[]}'; exit 0; fi"
-      echo "    if [ \$priv -eq 0 ] && [ '$unpriv' = ok ]; then echo '{\"contexts\":[\"ctx-a\"],\"checks\":[]}'; exit 0; fi"
+      echo "    if [ \$is_priv -eq 1 ] && [ '$priv_mode' = sub-ok ]; then echo '{\"contexts\":[\"ctx-a\"],\"checks\":[]}'; exit 0; fi"
+      echo "    if [ \$is_priv -eq 0 ] && [ '$unpriv' = ok ]; then echo '{\"contexts\":[\"ctx-a\"],\"checks\":[]}'; exit 0; fi"
       echo '    echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;'
       echo '  */protection)'
-      echo "    case '$priv' in"
-      echo '      full-with-checks) [ $priv -eq 1 ] && { echo "{\"required_status_checks\":{\"contexts\":[\"Label Gate\",\"lint\"],\"checks\":[{\"context\":\"Label Gate\"}]}}"; exit 0; } ;;'
-      echo '      full-approvals-only) [ $priv -eq 1 ] && { echo "{\"required_pull_request_reviews\":{\"required_approving_review_count\":1}}"; exit 0; } ;;'
-      echo '      full-404) [ $priv -eq 1 ] && { echo "gh: Not Found (HTTP 404)" >&2; exit 1; } ;;'
+      echo "    case '$priv_mode' in"
+      echo '      full-with-checks) [ $is_priv -eq 1 ] && { echo "{\"required_status_checks\":{\"contexts\":[\"Label Gate\",\"lint\"],\"checks\":[{\"context\":\"Label Gate\"}]}}"; exit 0; } ;;'
+      echo '      full-approvals-only) [ $is_priv -eq 1 ] && { echo "{\"required_pull_request_reviews\":{\"required_approving_review_count\":1}}"; exit 0; } ;;'
+      echo '      full-404) [ $is_priv -eq 1 ] && { echo "gh: Not Found (HTTP 404)" >&2; exit 1; } ;;'
+      echo '      full-403) [ $is_priv -eq 1 ] && { echo "gh: Forbidden (HTTP 403)" >&2; exit 1; } ;;'
+      echo '      full-500) [ $is_priv -eq 1 ] && { echo "gh: Internal Server Error (HTTP 500)" >&2; exit 1; } ;;'
       echo '    esac'
       echo '    echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;'
       echo '  */branches/*)'
@@ -1616,6 +1618,17 @@ else
   # the privileged 404 was believed.
   run_prot_case "bad/expired author PAT, but .protected=false proves unprotected" \
     404 full-404 false yes 1 0
+
+  # A privileged read that fails with 403 or 5xx is unknown for the same
+  # reason a 404 is: no status code from that endpoint is evidence of absence.
+  # Both must fall through to the .protected probe and fail closed on a
+  # protected branch (CodeRabbit nitpick on #1061).
+  run_prot_case "author PAT forbidden (403) on a protected branch" \
+    404 full-403 true yes 0 0
+  run_prot_case "author PAT hits a 5xx on a protected branch" \
+    404 full-500 true yes 0 0
+  run_prot_case "author PAT forbidden (403), .protected=false still passes" \
+    404 full-403 false yes 1 0
 
   # Unprivileged read succeeds outright — the pre-existing happy path must be
   # untouched by all of the above.
