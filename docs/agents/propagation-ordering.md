@@ -100,7 +100,7 @@ The canary keeps the full advisory CodeRabbit pass — open it **without** `--co
 
 ## Measuring tier membership
 
-The ordering table is a heuristic, but the signals behind it are observable, and a row is only worth trusting while its signal still reproduces. The cheapest full measurement compares each consumer's `scripts/ci/` kit tree against the hub's without fetching a single file, by comparing the **git tree entry** — `mode`, `type` and object id — exactly as `scripts/workflow/verify-propagation-pr.sh` does. Compare the whole tuple, not the object id alone: an exec-bit flip leaves the blob identical while the propagation verifier rejects it, so a blob-only comparison reports parity on drift the wave will fail on. The kit is genuinely mixed — at `main` it is 67 `100755` entries and 47 `100644` — so "they're all executable anyway" is not available as a shortcut.
+The ordering table is a heuristic, but the signals behind it are observable, and a row is only worth trusting while its signal still reproduces. The cheapest full measurement compares each consumer's `scripts/ci/` kit tree against the hub's without fetching a single file, by comparing the **git tree entry** — `mode`, `type` and object id — exactly as `scripts/workflow/verify-propagation-pr.sh` does. Compare the whole tuple, not the object id alone: an exec-bit flip leaves the blob identical while the propagation verifier rejects it, so a blob-only comparison reports parity on drift the wave will fail on. The kit is genuinely mixed — at `main` (`9943173c`) it is 68 `100755` entries and 47 `100644`, 115 blobs in total — so "they're all executable anyway" is not available as a shortcut. That total is the one every measurement below is quoted against, and it moves whenever a check is added: the 67/47 split recorded here before 2026-08-20 predated #1018 adding `check_review_feedback_accounting`. Re-read it at the commit you are actually propagating FROM rather than trusting the number written here, which is exactly the discipline the rest of this section asks for.
 
 Pin both sides to an **immutable ref**. `origin/main` and a consumer's `HEAD` both move, so a measurement taken against them is not re-derivable a day later — which matters here, because the point of the exercise is to check whether a dated claim still holds. Resolve the refs first, then measure:
 
@@ -123,8 +123,15 @@ git ls-tree -r "$HUB_REF" scripts/ci/ \
   | sed "s/ /$TAB/; s/ /$TAB/" | sort -t"$TAB" -k4
 
 # Consumer side, per repo: the same tuple, one API call.
+# `.truncated` FIRST: the recursive Trees API silently caps a large tree and
+# still returns 200, so filtering `.tree` without checking it measures a
+# partial listing as though it were the whole one -- every capped-off path
+# reads as ABSENT, which is the bucket that means "uniform payload gap".
+# Fail closed instead; the fleet's trees are far under the cap today, and
+# that is a fact about today.
 gh api "repos/nathanjohnpayne/<consumer>/git/trees/$CONSUMER_REF?recursive=1" \
-  --jq '.tree[] | select(.type=="blob") | select(.path | startswith("scripts/ci/"))
+  --jq 'if .truncated then error("truncated tree response — refusing to measure a partial listing") else . end
+        | .tree[] | select(.type=="blob") | select(.path | startswith("scripts/ci/"))
         | [.mode, .type, .sha, .path] | @tsv' | sort -t"$TAB" -k4
 ```
 
