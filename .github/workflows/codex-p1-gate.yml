@@ -466,6 +466,12 @@ jobs:
           fi
 
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # Hand the closing step the exact feedback surface this decision was
+          # computed over. That step re-reads the fingerprint immediately before
+          # it publishes, so a finding landing in the gap between this step and
+          # that PATCH cannot be published over (#1000 Codex P1).
+          echo "fingerprint_available=$fingerprint_available" >> "$GITHUB_OUTPUT"
+          echo "feedback_fp=$feedback_fp_after" >> "$GITHUB_OUTPUT"
           printf '%s' "${output:0:60000}" > "$RUNNER_TEMP/codex-p1-summary.txt"
           if [ "$rc" -eq 2 ]; then
             echo "::error::codex-p1-gate.sh exited 2 (config/usage error)"
@@ -483,6 +489,8 @@ jobs:
           CHECK_ID: ${{ steps.open.outputs.id }}
           ARCHIVE_RESULT: ${{ needs.archive-edited-feedback.result }}
           GATE_RC: ${{ steps.gate.outputs.rc }}
+          FINGERPRINT_AVAILABLE: ${{ steps.gate.outputs.fingerprint_available }}
+          FEEDBACK_FP: ${{ steps.gate.outputs.feedback_fp }}
         run: |
           set -uo pipefail
           conclusion=failure
@@ -503,7 +511,31 @@ jobs:
             conclusion=failure
             title="Codex feedback gate — head moved during evaluation"
           fi
+
+          # Revalidate the feedback surface INSIDE the publishing step. The
+          # gate step's final fingerprint read happens a step earlier, and the
+          # head re-read above cannot stand in for it: a bot PR-level finding
+          # moves no SHA, so it lands in that gap invisibly and this PATCH
+          # publishes success over it. The run that finding triggers cannot
+          # re-protect the head in time either — on issue_comment (and every
+          # other default-branch event) this job's native check attaches to the
+          # default branch, so the head is unprotected until the new run's
+          # archive dependency finishes and opens the next lease. The required
+          # context is green for that whole window and auto-merge can fire with
+          # the finding unaccounted (#1000 Codex P1). Only a success needs the
+          # re-read; a failure conclusion cannot be made less safe by drift.
+          drift_note=""
+          if [ "$conclusion" = success ] && [ "$FINGERPRINT_AVAILABLE" = true ]; then
+            feedback_fp_publish=$(scripts/review-feedback-surface-fingerprint.sh \
+              "$PR_NUMBER" "$REPO" 2>/dev/null || true)
+            if [ -z "$feedback_fp_publish" ] || [ "$feedback_fp_publish" != "$FEEDBACK_FP" ]; then
+              conclusion=failure
+              title="Codex feedback gate — feedback changed before publication"
+              drift_note=$'\n'"Feedback changed between gate evaluation and publication, or the surface could not be re-read; refusing the stale clearance. The next event or the 15-minute sweep re-evaluates $HEAD_SHA."
+            fi
+          fi
           summary=$(cat "$RUNNER_TEMP/codex-p1-summary.txt" 2>/dev/null || printf '%s' "$title")
+          summary="${summary}${drift_note}"
           for attempt in 1 2 3; do
             gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" \
               -f status="completed" \
@@ -789,6 +821,25 @@ jobs:
               conclusion="failure"
               check_title="Codex P1 gate — head moved during scheduled evaluation"
               had_infra_error=1
+            fi
+
+            # Same revalidation the event-driven publisher performs, for the
+            # same reason: the post-evaluation fingerprint above is separated
+            # from the PATCH below by the head re-read, and a PR-level finding
+            # that lands in that gap moves no SHA. Re-read the surface with the
+            # publication rather than with the evaluation, so a success is
+            # never published over a finding this generation never saw
+            # (#1000 Codex P1).
+            if [ "$conclusion" = success ] && [ "$fingerprint_available" = true ]; then
+              feedback_fp_publish=$(scripts/review-feedback-surface-fingerprint.sh \
+                "$PR" "$REPO" 2>/dev/null || true)
+              if [ -z "$feedback_fp_publish" ] \
+                || [ "$feedback_fp_publish" != "${feedback_fp_after:-}" ]; then
+                conclusion="failure"
+                check_title="Codex P1 gate — feedback changed before scheduled publication"
+                output="${output}"$'\n'"Feedback changed before scheduled publication, or the surface could not be re-read; refusing the stale clearance."
+                had_infra_error=1
+              fi
             fi
 
             # Truncate to stay under GitHub's 65535-char summary limit.

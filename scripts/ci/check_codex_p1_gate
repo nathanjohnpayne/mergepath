@@ -290,6 +290,31 @@ if gate.is_a?(Hash)
     close_index && gate_index && gate_index < close_index,
     "codex-p1-gate does not close its own check lease after evaluation"
   )
+
+  # The evaluation step's fingerprint pair fences the gate script, not the
+  # publication. A PR-level finding that lands after that pair and before the
+  # closing PATCH moves no SHA, so the head re-read in the closing step cannot
+  # see it and success is published over it. Require the closing step to carry
+  # the evaluated surface and re-read it against the live one before it writes.
+  close_step = close_index ? steps.fetch(close_index) : nil
+  close_run = close_step&.fetch("run", "").to_s
+  close_env = close_step&.fetch("env", {}) || {}
+  # Anchor on the invocation, not on the variable: assigning the evaluated
+  # fingerprint to the publish-time variable satisfies every name-based test
+  # while deleting the live re-read this assertion exists to require.
+  close_revalidate = close_run.index("feedback_fp_publish=$(scripts/review-feedback-surface-fingerprint.sh")
+  close_publish = close_run.index('-X PATCH "repos/$REPO/check-runs/$CHECK_ID"')
+  close_reject = close_revalidate && close_run.index("conclusion=failure", close_revalidate)
+  require_shape.call(
+    gate_run.to_s.include?('echo "fingerprint_available=$fingerprint_available" >> "$GITHUB_OUTPUT"') &&
+      gate_run.to_s.include?('echo "feedback_fp=$feedback_fp_after" >> "$GITHUB_OUTPUT"') &&
+      close_env.fetch("FINGERPRINT_AVAILABLE", "").to_s.include?("steps.gate.outputs.fingerprint_available") &&
+      close_env.fetch("FEEDBACK_FP", "").to_s.include?("steps.gate.outputs.feedback_fp") &&
+      close_run.include?('[ "$feedback_fp_publish" != "$FEEDBACK_FP" ]') &&
+      [close_revalidate, close_publish, close_reject].all? &&
+      close_revalidate < close_publish && close_reject < close_publish,
+    "codex-p1-gate publishes a leased success without re-reading the feedback surface inside the publishing step"
+  )
 end
 
 if sweep.is_a?(Hash)
@@ -349,6 +374,12 @@ if sweep.is_a?(Hash)
         lease < before && before < evaluate && evaluate < after && after < compare &&
         compare < reject && reject < close,
       "scheduled-sweep does not lease, evaluate, reject drift, and close the same check generation"
+    )
+    republish = sweep_run.index("feedback_fp_publish=$(scripts/review-feedback-surface-fingerprint.sh")
+    require_shape.call(
+      [republish, close].all? && after < republish && republish < close &&
+        sweep_run.include?('[ "$feedback_fp_publish" != "${feedback_fp_after:-}" ]'),
+      "scheduled-sweep publishes a leased success without re-reading the feedback surface immediately before the PATCH"
     )
   end
 end
@@ -464,9 +495,20 @@ if relay_job.is_a?(Hash)
         persist_index && cleanup_index && persist_index < cleanup_index,
       "read-only archive relay can abandon an in-progress check lease after persistence failure"
     )
+    # The relay marker is a proxy for "was this lease concluded?" and it is
+    # wrong in both directions: `complete` with a failed publication PATCH
+    # leaves the required check pending, and an unreadable comment listing
+    # leaves the marker empty, which overwrites an already-published success
+    # with failure (#1049). Require the cleanup to read the lease's own status
+    # and to leave it alone when that read fails.
+    lease_probe = cleanup_run.index(%q{lease_state=$(gh api "repos/$REPO/check-runs/$CHECK_ID" --jq '.status'})
+    lease_branch = cleanup_run.index(%q{[ "$lease_state" != completed ]})
     require_shape.call(
-      cleanup_run.match?(/if \[ -n "\$CHECK_ID" \] && \[ "\$latest_status" != complete \]; then/),
-      "read-only relay cleanup can overwrite a completed check after a later artifact cleanup failure"
+      [lease_probe, lease_branch].all? && lease_probe < lease_branch &&
+        cleanup_run.match?(/if \[ -n "\$CHECK_ID" \] && \[ "\$lease_state" = unknown \]; then/) &&
+        cleanup_run.match?(/elif \[ -n "\$CHECK_ID" \] && \[ "\$lease_state" != completed \]; then/) &&
+        !cleanup_run.match?(/\[ -n "\$CHECK_ID" \] && \[ "\$latest_status" != complete \]/),
+      "read-only relay cleanup decides an already-published lease from the relay marker instead of the lease's own state"
     )
     cleanup_env = cleanup_step&.fetch("env", {}) || {}
     require_shape.call(

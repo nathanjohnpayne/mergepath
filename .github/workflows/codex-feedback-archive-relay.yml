@@ -355,8 +355,33 @@ jobs:
                 >/dev/null || marker_rc=$?
           fi
 
+          # Whether this lease still needs closing is a fact about the check
+          # run, so read the check run. The relay marker was standing in for it
+          # and got the answer wrong in BOTH directions. A `complete` marker
+          # with a failed publication PATCH read as "already concluded", so the
+          # still-`in_progress` required check was left pending until another
+          # event or the 15-minute sweep superseded it, blocking the PR for no
+          # reason (#1000 Codex P2). And an unreadable comment listing left
+          # `latest_status` empty, which read as "not concluded" and overwrote
+          # an already-PUBLISHED success with failure (#1049). One proxy, two
+          # opposite misreadings; the lease's own status answers both. An
+          # unreadable answer is not an answer: unknown state must never
+          # authorise a write over state that may already be published.
+          lease_state=unknown
+          if [ -n "$CHECK_ID" ]; then
+            for attempt in 1 2 3; do
+              lease_state=$(gh api "repos/$REPO/check-runs/$CHECK_ID" --jq '.status' 2>/dev/null) \
+                && [ -n "$lease_state" ] && break
+              lease_state=unknown
+              sleep $((attempt * 5))
+            done
+          fi
+
           close_rc=0
-          if [ -n "$CHECK_ID" ] && [ "$latest_status" != complete ]; then
+          if [ -n "$CHECK_ID" ] && [ "$lease_state" = unknown ]; then
+            echo "::error::Could not read the state of check lease $CHECK_ID; leaving it untouched rather than overwriting a possibly-published relay result"
+            close_rc=1
+          elif [ -n "$CHECK_ID" ] && [ "$lease_state" != completed ]; then
             close_rc=1
             for attempt in 1 2 3; do
               if gh api --method PATCH "repos/$REPO/check-runs/$CHECK_ID" \
