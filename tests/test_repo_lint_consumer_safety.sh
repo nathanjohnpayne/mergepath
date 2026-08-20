@@ -303,6 +303,253 @@ while IFS= read -r name; do
   fi
 done <<< "$WIRED"
 
+# ---------------------------------------------------------------------------
+# #979 — KIT-LESS consumer safety.
+#
+# The fixture above models a consumer that received the whole manifest
+# (`.github/workflows/repo_lint.yml` carries `requires: ["scripts/ci/"]`, so
+# the kit travels with it). That model has a hole: a consumer may SKIP the kit
+# in its `.sync-overrides.yml` — gaycruisebingo does today, for the whole
+# `scripts/ci/` directory — and then receive this workflow WITHOUT the scripts
+# it invokes. A bare `run: ./scripts/ci/check_X` reds that consumer's lint on
+# rc 127 forever, and the consumer cannot fix it: the hub owns the kit.
+#
+# So every `run: ./scripts/ci/check_X` step must carry the #590 missing-file
+# soft-pass tail. This block asserts that BEHAVIOURALLY, by executing each
+# step's actual `run:` body under the Actions default shell against three
+# throwaway trees, rather than by grepping for one blessed spelling of the
+# idiom (two spellings are in use) or by hand-listing the check names — a
+# check added tomorrow is covered the moment its step lands:
+#
+#   (a) kit-less   — scripts/ci/ exists but is EMPTY  → must exit 0
+#   (b) stub PASS  — scripts/ci/check_X exits 0       → must exit 0
+#   (c) stub FAIL  — scripts/ci/check_X exits 3       → must exit 3
+#
+# (c) is the load-bearing half: a soft-pass that swallowed a real violation
+# would be worse than the 127 it replaces.
+#
+# Steps are enumerated by PARSING the workflow document (ruby -ryaml), not by
+# scanning lines, so a `run:` body is read exactly as Actions reads it. Two
+# fences keep that enumeration honest: a multi-line `run: |` body that invokes
+# a kit check is a hard failure (it would slip past the single-line matcher),
+# and the parsed name set must equal the awk-derived $WIRED set used above.
+#
+# Paired hub-side assertion: because the tail exits 0 on an ABSENT script, it
+# would also mask a script deleted from the hub while its wire stayed. Every
+# wired name must therefore resolve to a file in the hub's scripts/ci/.
+# ---------------------------------------------------------------------------
+GUARD_DIR="$WORKDIR/guard"
+mkdir -p "$GUARD_DIR"
+
+cat >"$GUARD_DIR/extract.rb" <<'RB'
+require 'yaml'
+require 'fileutils'
+doc = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: false)
+abort('workflow did not parse as a mapping') unless doc.is_a?(Hash)
+bodies = ARGV.fetch(1)
+FileUtils.mkdir_p(bodies)
+# `pos` is the step's ORDINAL in the job, counted over every step carrying a
+# run: body. It is what lets the caller assert ORDERING — a setup step that
+# makes the kit executable is only useful if it runs BEFORE the first check
+# wire, and Actions runs steps in document order.
+pos = 0
+first_wire = nil
+(doc['jobs'] || {}).each_value do |job|
+  next unless job.is_a?(Hash)
+  (job['steps'] || []).each do |step|
+    next unless step.is_a?(Hash)
+    run = step['run']
+    next unless run.is_a?(String)
+    pos += 1
+    wire = run.match(%r{\A\./scripts/ci/(check_[A-Za-z0-9_]+)})
+    if run.include?("\n")
+      # A multi-line body invoking a kit check would escape the single-line
+      # matcher below and go unguarded. Report it; the caller fails on it.
+      puts "MULTILINE\t#{step['name']}\t" if run =~ %r{\./scripts/ci/check_[A-Za-z0-9_]+}
+    elsif wire
+      first_wire = pos if first_wire.nil?
+      puts "STEP\t#{wire[1]}\t#{run}"
+      next
+    end
+    # Any step that touches the kit path WITHOUT being a check wire is a
+    # setup step: it runs ahead of the guarded checks, so if it dies on a
+    # kit-less consumer none of their soft-pass tails is ever reached. The
+    # body can be multi-line, so it travels via a file rather than the TSV;
+    # the body file is named by `pos`, so the row carries its own ordinal.
+    next if wire
+    next unless run.include?('scripts/ci')
+    File.write(File.join(bodies, pos.to_s), run)
+    puts "SETUP\t#{step['name']}\t#{pos}"
+  end
+end
+puts "FIRSTWIRE\t\t#{first_wire}" unless first_wire.nil?
+RB
+
+if ! ruby "$GUARD_DIR/extract.rb" "$ROOT/.github/workflows/repo_lint.yml" \
+      "$GUARD_DIR/bodies" \
+      >"$GUARD_DIR/steps.tsv" 2>"$GUARD_DIR/extract.err"; then
+  fail "#979 guard: could not parse repo_lint.yml: $(tail -3 "$GUARD_DIR/extract.err")"
+  echo ""
+  echo "test_repo_lint_consumer_safety: $PASS passed, $FAIL failed"
+  exit 1
+fi
+
+if grep -q '^MULTILINE' "$GUARD_DIR/steps.tsv"; then
+  while IFS=$'\t' read -r _ stepname _; do
+    fail "#979 guard: step '$stepname' invokes a scripts/ci check from a multi-line run: body — it cannot carry the one-line soft-pass tail and escapes this assertion; make it a single-line run:"
+  done < <(grep '^MULTILINE' "$GUARD_DIR/steps.tsv")
+fi
+
+awk -F'\t' '$1 == "STEP" { print $2 }' "$GUARD_DIR/steps.tsv" \
+  | LC_ALL=C sort -u >"$GUARD_DIR/parsed_names.txt"
+printf '%s\n' "$WIRED" >"$GUARD_DIR/awk_names.txt"
+if ! diff -u "$GUARD_DIR/awk_names.txt" "$GUARD_DIR/parsed_names.txt" >"$GUARD_DIR/names.diff" 2>&1; then
+  fail "#979 guard: the parsed step set disagrees with the awk-derived wired set (one enumeration is stale):"
+  head -20 "$GUARD_DIR/names.diff" >&2
+else
+  pass "#979 guard: parsed step set matches the awk-derived wired set ($(wc -l <"$GUARD_DIR/parsed_names.txt" | tr -d ' ') checks)"
+fi
+
+# Actions' default shell for a `run:` body, so the tail is exercised under the
+# same `-e -o pipefail` semantics it runs under in CI.
+guard_run() {  # $1 = tree, $2 = command
+  ( cd "$1" && bash --noprofile --norc -e -o pipefail -c "$2" ) >/dev/null 2>&1
+}
+
+guard_tree() {  # $1 = dir, $2 = check name, $3 = stub exit code ("" for none)
+  rm -rf "$1"
+  mkdir -p "$1/scripts/ci"
+  if [ -n "$3" ]; then
+    printf '#!/bin/sh\nexit %s\n' "$3" >"$1/scripts/ci/$2"
+    chmod +x "$1/scripts/ci/$2"
+  fi
+}
+
+GUARDED=0
+while IFS=$'\t' read -r kind name cmd; do
+  [ "$kind" = "STEP" ] || continue
+
+  # Hub-side pairing: the tail exits 0 when the script is absent, so a wire
+  # whose script vanished from the hub must be caught here instead.
+  if [ ! -f "$ROOT/scripts/ci/$name" ]; then
+    fail "#979 guard: repo_lint.yml wires $name but scripts/ci/$name does not exist on the hub (the soft-pass tail would silently swallow this)"
+    continue
+  fi
+
+  ok=1
+
+  guard_tree "$GUARD_DIR/kitless" "$name" ""
+  if ! guard_run "$GUARD_DIR/kitless" "$cmd"; then
+    ok=0
+    fail "#979 guard: $name — the run: body exits nonzero when scripts/ci/ is EMPTY; a consumer that skips the kit (gaycruisebingo) reds its repo-lint on rc 127. Add the #590 soft-pass tail: || { rc=\$?; if [ ! -f scripts/ci/$name ]; then echo '...'; exit 0; fi; exit \"\$rc\"; }"
+  fi
+
+  guard_tree "$GUARD_DIR/stubpass" "$name" 0
+  if ! guard_run "$GUARD_DIR/stubpass" "$cmd"; then
+    ok=0
+    fail "#979 guard: $name — the run: body exits nonzero when the script is PRESENT and passing"
+  fi
+
+  guard_tree "$GUARD_DIR/stubfail" "$name" 3
+  set +e
+  guard_run "$GUARD_DIR/stubfail" "$cmd"
+  frc=$?
+  set -e
+  if [ "$frc" -ne 3 ]; then
+    ok=0
+    fail "#979 guard: $name — the run: body exits $frc (expected 3) when the script is PRESENT and FAILING; the soft-pass must never swallow a real violation"
+  fi
+
+  # NB: an `[ ... ] && GUARDED=$((...))` one-liner here would abort the whole
+  # suite under `set -e` on the first failing step (a failing AND-list as the
+  # last command of a loop body is fatal), reporting one finding instead of
+  # all of them. Keep the explicit `if`.
+  if [ "$ok" -eq 1 ]; then
+    GUARDED=$((GUARDED + 1))
+  fi
+done <"$GUARD_DIR/steps.tsv"
+
+if [ "$GUARDED" -gt 0 ]; then
+  pass "#979 guard: $GUARDED wired steps soft-pass a missing script, pass a passing one, and propagate a real failure"
+fi
+
+# ---------------------------------------------------------------------------
+# #979 round 2 — the SETUP steps ahead of the guarded checks.
+#
+# The block above proves each check wire survives a kit-less consumer. That is
+# necessary and not sufficient: a step that touches scripts/ci/ WITHOUT being
+# a check wire runs first, and if it dies on a kit-less tree the job reds
+# there and no tail below it is ever reached. `make_ci_scripts_executable`
+# was exactly that — `chmod +x scripts/ci/*` hands the unmatched glob to chmod
+# literally, which exits nonzero on a consumer that skipped the kit.
+#
+# Two consumer shapes, because they are not the same file system state:
+#   (a) no scripts/ci/ directory at all — a consumer that skipped the kit;
+#   (b) scripts/ci/ present but EMPTY — the shape the guard loop above uses.
+# Both must exit 0. A third probe keeps the assertion honest: on a POPULATED
+# kit the setup steps must still do their job, so a mode-644 check_* must come
+# out executable. Without it, deleting the step entirely would pass (a) and
+# (b) and silently break every check invocation in CI.
+# ---------------------------------------------------------------------------
+SETUP_SEEN=0
+while IFS=$'\t' read -r kind stepname bodyid; do
+  [ "$kind" = "SETUP" ] || continue
+  SETUP_SEEN=$((SETUP_SEEN + 1))
+  setup_body="$(cat "$GUARD_DIR/bodies/$bodyid")"
+
+  rm -rf "$GUARD_DIR/nokit"
+  mkdir -p "$GUARD_DIR/nokit/scripts"
+  if guard_run "$GUARD_DIR/nokit" "$setup_body"; then
+    pass "#979 setup: '$stepname' exits 0 with no scripts/ci/ directory"
+  else
+    fail "#979 setup: step '$stepname' exits nonzero when scripts/ci/ is ABSENT — it runs before every guarded check, so a consumer that skipped the kit reds repo-lint here and no soft-pass tail below is ever reached. Guard it on the directory existing."
+  fi
+
+  rm -rf "$GUARD_DIR/emptykit"
+  mkdir -p "$GUARD_DIR/emptykit/scripts/ci"
+  if guard_run "$GUARD_DIR/emptykit" "$setup_body"; then
+    pass "#979 setup: '$stepname' exits 0 with an EMPTY scripts/ci/"
+  else
+    fail "#979 setup: step '$stepname' exits nonzero when scripts/ci/ is present but EMPTY (an unmatched glob is passed through literally)"
+  fi
+done <"$GUARD_DIR/steps.tsv"
+
+FIRST_WIRE_POS="$(awk -F'\t' '$1 == "FIRSTWIRE" { print $3 }' "$GUARD_DIR/steps.tsv")"
+
+if [ "$SETUP_SEEN" -eq 0 ]; then
+  fail "#979 setup: no non-check step referencing scripts/ci/ was found in repo_lint.yml — the kit is made executable somewhere, so this enumeration has gone stale and stopped covering it"
+elif [ -z "$FIRST_WIRE_POS" ]; then
+  fail "#979 setup: the parser found no check wire at all, so step ORDER cannot be established (extraction is stale)"
+else
+  # ORDER matters, not just presence. Actions runs steps in document order, so
+  # a setup step that makes the kit executable is only doing its job if it
+  # runs BEFORE the first check wire — move it below them and production
+  # fails at the first check with rc 126 while a presence-only probe still
+  # goes green. Replay ONLY the setup steps that precede the first wire, and
+  # require the kit to be executable after them.
+  rm -rf "$GUARD_DIR/populated"
+  mkdir -p "$GUARD_DIR/populated/scripts/ci"
+  printf '#!/bin/sh\nexit 0\n' >"$GUARD_DIR/populated/scripts/ci/check_probe"
+  chmod 644 "$GUARD_DIR/populated/scripts/ci/check_probe"
+  setup_ok=1
+  PRE_WIRE_SETUP=0
+  while IFS=$'\t' read -r kind _stepname bodyid; do
+    [ "$kind" = "SETUP" ] || continue
+    [ "$bodyid" -lt "$FIRST_WIRE_POS" ] || continue
+    PRE_WIRE_SETUP=$((PRE_WIRE_SETUP + 1))
+    if ! guard_run "$GUARD_DIR/populated" "$(cat "$GUARD_DIR/bodies/$bodyid")"; then
+      setup_ok=0
+    fi
+  done <"$GUARD_DIR/steps.tsv"
+  if [ "$PRE_WIRE_SETUP" -eq 0 ]; then
+    fail "#979 setup: no kit-touching setup step runs BEFORE the first check wire (first wire is step $FIRST_WIRE_POS) — the checks would execute against a non-executable kit and fail with rc 126"
+  elif [ "$setup_ok" -eq 1 ] && [ -x "$GUARD_DIR/populated/scripts/ci/check_probe" ]; then
+    pass "#979 setup: the $PRE_WIRE_SETUP setup step(s) ahead of the first check wire make a populated scripts/ci/ executable"
+  else
+    fail "#979 setup: after running the pre-wire setup step(s) on a POPULATED tree, scripts/ci/check_probe is not executable — the kit-less guard must not cost the step its actual job"
+  fi
+fi
+
 echo ""
 echo "test_repo_lint_consumer_safety: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
