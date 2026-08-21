@@ -1815,6 +1815,32 @@ fi
 # post-suite re-assertion below is itself tested.
 if { [ -n "${MERGEPATH_GIT_IDENTITY_SUITE:-}" ] || [ -z "$FIXTURE_ROOT" ]; } \
   && [ -f "$TEST_SUITE" ]; then
+  # Consumer guard, marker-FIRST and ahead of any test of the suite's own
+  # artifacts (docs/agents/propagation-ordering.md § repo_lint.yml travels
+  # in waves). tests/test_git_identity_hygiene.sh is a canonical manifest
+  # path, so it lands on every consumer -- but it is a hub SELF-TEST, and
+  # its cases 26b/26c assert hub-maintained policy prose against
+  # $ROOT/REVIEW_POLICY.md, which is NOT a manifest path: a consumer
+  # carries a bootstrap-era snapshot that never receives hub updates.
+  # Presence is the wrong signal -- the consumer HAS REVIEW_POLICY.md, it
+  # is simply frozen -- so the decision is a function of the marker ALONE.
+  # Measured on gaycruisebingo#1024: 3 of those 4 assertions failed and
+  # the fourth (a negative assertion) passed vacuously.
+  #
+  # The MERGEPATH_GIT_IDENTITY_SUITE exemption keeps this off the suite's
+  # OWN post-suite cases, which name a stub suite and deliberately build
+  # fixture trees with no marker in order to exercise Part C's skip. Left
+  # unexempted, this guard short-circuits those five cases and the
+  # post-suite re-assertion silently stops being tested.
+  #
+  # Parts A, B and C above still run on a consumer: the live identity
+  # assertion is exactly the #777 protection a consumer needs, and this
+  # leaves it untouched.
+  if [ -z "${MERGEPATH_GIT_IDENTITY_SUITE:-}" ] && [ ! -f "$HUB_MARKER" ]; then
+    echo "check_git_identity_hygiene: regression test suite skipped (consumer checkout: scripts/sync-to-downstream.sh absent)"
+    echo "check_git_identity_hygiene: PASS"
+    exit 0
+  fi
   # Taken BEFORE the suite runs, and kept outside `.git`, so the
   # post-suite phase can tell "this repository is clean" apart from "this
   # repository is gone".
