@@ -19,8 +19,7 @@ TEST="$REPO_ROOT/tests/test_repo_lint_optimization.sh"
 # The decision is a function of the marker ALONE, never of the wrapped
 # test's presence: the older both-absent idiom reads an artifact a stale
 # bootstrap may have left behind. Measured on gaycruisebingo#1024, where
-# the suite reported 47 passed / 6 failed against exactly those three
-# hub-only surfaces.
+# the suite reported 47 passed / 6 failed across the surfaces listed above.
 if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
   echo "check_repo_lint_optimization: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent)"
   exit 0
