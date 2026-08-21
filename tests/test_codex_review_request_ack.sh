@@ -603,7 +603,25 @@ test_missing_identity_checker_skips_bridge() {
 # Obviously-fake sentinel. Never substitute a real token here, or
 # anywhere else in this file --- the point of the case is that whatever
 # is in this variable gets printed if the redaction regresses.
-CREDENTIAL_SENTINEL='ghp_FAKEFAKEFAKE951NOTAREALTOKEN'
+# Assembled from two pieces so the literal token shape never appears in a
+# tracked line. This is NOT obfuscation of a real credential -- the value is
+# a deliberate fake, and the point of the case is that it gets printed if
+# redaction regresses. It is split because this file is a canonical manifest
+# path: it propagates into consumer repos, several of which run their own
+# tracked-file secret scanner over `git ls-files`
+# (/\bgh[pousr]_[A-Za-z0-9]{20,255}\b/, no allowlist mechanism), and a
+# contiguous `ghp_...` here reds their CI on content they did not write.
+# Measured on the wave-0 fan-out: device-source-of-truth#167 and
+# friends-and-family-billing#416 both failed on exactly this line, and it was
+# the ONLY finding in the whole hub tree.
+#
+# The runtime VALUE is unchanged, so every assertion below still sees the
+# same string -- including `${CREDENTIAL_SENTINEL#ghp_}`, which needs the
+# real `ghp_` prefix, and `${#CREDENTIAL_SENTINEL}`, which needs the length.
+# Never inline this back into one literal, and never substitute a real token
+# here or anywhere else in this file.
+CREDENTIAL_SENTINEL_TAIL='FAKEFAKEFAKE951NOTAREALTOKEN'
+CREDENTIAL_SENTINEL="ghp_${CREDENTIAL_SENTINEL_TAIL}"
 
 test_ambient_author_pat_is_not_inherited_or_echoed() {
   local dir rc pat leaked
