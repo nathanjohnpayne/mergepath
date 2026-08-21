@@ -22,9 +22,15 @@ The token-output gate uses `--scan` in the fast lane and `--self-test` in deep C
 
 ## Approval coordination
 
-An approval records merge readiness in GitHub's review state; it does not reserve a runner while required checks execute. The approval workflow performs a one-shot current-head check probe and exits successfully when work is still pending. The trusted default-branch continuation listens for approval, canonical repo-lint, optional local-annex, and policy-gate completion events. Each event resolves the live open pull request by number or exact head SHA, reruns the canonical merge-clearance predicate, and immediately before arming native auto-merge re-reads the current head, all blocking labels, feedback accounting, and unresolved conversations. It passes the re-read head to `--match-head-commit`. A pending or failed prerequisite is a no-op for that event and is reconsidered by a later event or the bounded scheduled backstop.
+An approval records merge readiness in GitHub's review state; it does not reserve a runner while required checks execute. The approval workflow performs a one-shot current-head check probe and exits successfully when work is still pending. The trusted default-branch continuation listens for approval, canonical repo-lint, optional local-annex, and policy-gate completion events. Each event resolves the live open pull request by number or exact head SHA, reruns the canonical merge-clearance predicate, and immediately before arming native auto-merge re-reads the current head, all blocking labels, feedback accounting, and unresolved conversations. It passes the re-read head to `--match-head-commit`. A pending or failed prerequisite is a no-op for that event and is reconsidered by a later completed-workflow event.
 
 This event-driven path does not treat CodeRabbit as an additional merge requirement after a registered reviewer has approved. CodeRabbit's required-severity and conversation state remain represented by their existing required gates; advisory review arrival is not polled by a runner.
+
+## Latency telemetry
+
+`.github/workflows/repo-lint-latency.yml` runs daily and on manual dispatch from the trusted default branch. `scripts/repo-lint-latency-report.sh` reads the most recent completed `repo-lint` workflow runs and their job/step timing records through the Actions API, writes normalized run data plus JSON and Markdown summaries, publishes the Markdown to the Actions job summary, and uploads the complete evidence as a retained artifact.
+
+An ordinary pull-request sample is a successful `pull_request` run with no active `deep-safety` job. The report uses nearest-rank percentiles and requires at least 20 ordinary samples before enforcing p50 <= 5 minutes and p95 <= 8 minutes. A smaller sample is visible as `insufficient-sample`, not a false regression. Distinct workflow run IDs on the same head SHA are a duplicate-execution alert. Threshold or duplication alerts fail the scheduled audit while preserving the summary and artifact.
 
 ## Regression contract
 

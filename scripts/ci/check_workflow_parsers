@@ -1361,18 +1361,19 @@ else
   echo "  FAIL: Dependabot auto-merge must call the configured check gate, wait for success, and bind merges to the checked HEAD" >&2
   fail=$((fail + 1))
 fi
-if grep -Fq "Require current-head check success" .github/workflows/agent-review.yml && \
+if grep -Fq "Probe current-head check readiness once" .github/workflows/agent-review.yml && \
    grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" .github/workflows/agent-review.yml && \
    grep -Fq 'select((.name // .context // "") == $name)' .github/workflows/agent-review.yml && \
-   grep -Fq "Re-verify blocking labels after test wait" .github/workflows/agent-review.yml && \
+   grep -Fq "Re-verify blocking labels after readiness probe" .github/workflows/agent-review.yml && \
    grep -Fq 'CURRENT_HEAD_SHA=$sha' .github/workflows/agent-review.yml && \
    grep -Fq -- "--match-head-commit" .github/workflows/agent-review.yml && \
-   grep -Fq "waiting for completion" .github/workflows/agent-review.yml && \
-   grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/agent-review.yml; then
+   grep -Fq 'steps.check_readiness.outputs.ready == '\''true'\''' .github/workflows/agent-review.yml && \
+   grep -Fq 'approval-merge-continuation.sh' .github/workflows/auto-clear-blocking-labels.yml && \
+   ! grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review auto-merge waits for configured current-head check success, rechecks labels, and binds merge to the checked HEAD"
+  echo "  PASS: agent-review probes current-head readiness once; completed workflows re-enter an exact-head guarded continuation"
 else
-  echo "  FAIL: agent-review auto-merge must wait for configured current-head check success, recheck labels, and bind merge to the checked HEAD" >&2
+  echo "  FAIL: agent-review must avoid runner polling and defer pending checks to the exact-head continuation" >&2
   fail=$((fail + 1))
 fi
 

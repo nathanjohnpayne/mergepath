@@ -594,6 +594,9 @@ paths:
   - path: scripts/lib/blocking-labels.sh
     type: canonical
     consumers: all
+  - path: scripts/lib/repo-lint-check-selection.sh
+    type: canonical
+    consumers: all
   # Hub-side fleet audit for the propagation lane (#434); consumers
   # receive it because the scripts/ci kit's check_propagation_lane_audit
   # hard-requires it (and its offline test) on every lint run.
@@ -614,6 +617,14 @@ paths:
     type: canonical
     consumers: all
   - path: tests/test_repo_lint_optimization.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/repo-lint-check-selection.sh"
+  - path: tests/test_approval_merge_continuation.sh
+    type: canonical
+    consumers: all
+  - path: tests/test_repo_lint_latency_report.sh
     type: canonical
     consumers: all
   - path: tests/test_check_doc_ownership.sh
@@ -1231,6 +1242,18 @@ paths:
     # above.
     requires:
       - "scripts/lib/gh-retry-helpers.sh"
+      - "scripts/workflow/approval-merge-continuation.sh"
+      - "scripts/codex-review-check.sh"
+      - "scripts/review-feedback-accounting.sh"
+      - "scripts/resolve-pr-threads.sh"
+  - path: .github/workflows/repo-lint-latency.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/repo-lint-latency-report.sh"
+  - path: scripts/repo-lint-latency-report.sh
+    type: canonical
+    consumers: all
   - path: .github/workflows/pr-audit.yml
     type: canonical
     consumers: all
@@ -1435,6 +1458,8 @@ paths:
       - "tests/test_codex_review_check_required_checks.sh"  # check_codex_scripts (#655)
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)
       - "tests/test_655_repo_lint_local_observed.sh"  # check_codex_scripts (#655)
+      - "tests/test_approval_merge_continuation.sh"  # check_auto_clear_workflow (#1062)
+      - "tests/test_repo_lint_latency_report.sh"  # check_repo_lint_latency_report (#1062)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
       - "tests/test_codex_usage_limit_marker.sh"  # check_codex_scripts (#722)
       - "tests/test_coderabbit_record_feedback.sh"  # check_coderabbit_record_feedback (#584)

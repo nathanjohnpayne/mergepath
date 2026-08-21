@@ -698,6 +698,13 @@ fi
 echo ""
 echo "agent-review.yml required-check wait loop — poll cadence and rollup request shape (#1024)"
 
+if grep -Fq 'name: Probe current-head check readiness once' "$W/agent-review.yml" \
+   && grep -Fq 'for readiness_probe in 1; do' "$W/agent-review.yml" \
+   && grep -Fq 'echo "ready=false" >> "$GITHUB_OUTPUT"' "$W/agent-review.yml" \
+   && grep -Fq 'completed-workflow continuation' "$W/agent-review.yml" \
+   && ! grep -Fq 'TEST_CHECK_WAIT_SECONDS' "$W/agent-review.yml"; then
+  pass "#1062: approval readiness probes once, records pending state, and never sleeps"
+else
 WL_STEP_NAME="Require current-head check success"
 
 if [ ! -f "$W/agent-review.yml" ]; then
@@ -943,6 +950,7 @@ WL_PAGE_STUB
     fi
   fi
   rm -rf "$WL_ROOT"
+fi
 fi
 
 echo ""

@@ -1275,7 +1275,7 @@ jobs:
               ;;
           esac
 
-      - name: Re-verify blocking labels before test wait
+      - name: Re-verify blocking labels before readiness probe
         if: steps.author_merge_token.outputs.enabled == 'true'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -1302,7 +1302,8 @@ jobs:
           #      job would still merge because the `if:` already evaluated.
           #
           # Re-fetch the authoritative label state from the GitHub API before
-          # entering the test wait. The same check repeats after the wait,
+          # entering the readiness probe. The same check repeats after a
+          # successful probe,
           # immediately before merge. Abort if any blocking label is now
           # present. Also check `policy-violation`, which is applied by the
           # block-self-approval job earlier in this same workflow run (and
@@ -1318,50 +1319,21 @@ jobs:
           echo "No blocking labels present — proceeding to merge."
 
 
-      - name: Require current-head check success
+      - name: Probe current-head check readiness once
+        id: check_readiness
         if: steps.author_merge_token.outputs.enabled == 'true'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           REPO: ${{ github.repository }}
           REQUIRED_HEAD_CHECK_NAME: lint
-          TEST_CHECK_WAIT_SECONDS: 1200
-          TEST_CHECK_POLL_SECONDS: 15
-          TEST_CHECK_POLL_MAX_SECONDS: 60
-          TEST_CHECK_POLL_BACKOFF_AFTER_SECONDS: 120
         run: |
           required_check_name=${REQUIRED_HEAD_CHECK_NAME:-lint}
-          wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
-          poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
-          # #1024: this loop runs under AUTHOR_MERGE_TOKEN (nathanjohnpayne,
-          # user id 23488723) and re-queried the whole statusCheckRollup on a
-          # FLAT poll_seconds cadence, so a full 1200s wait cost up to 80
-          # GraphQL queries per run -- per push, per PR. That is the measured
-          # spender behind the recurring "API rate limit already exceeded for
-          # user ID 23488723" merge failures, and it is billed against the
-          # same identity CI needs for every other author-attributed call.
-          # Widen the cadence progressively instead: the first polls stay at
-          # poll_seconds (that is where a fast-green check actually lands),
-          # and once poll_backoff_after_seconds of waiting has accumulated the
-          # interval doubles per poll up to poll_max_seconds. With the
-          # defaults (15s, widen after 120s, ceiling 60s) a full 1200s wait
-          # costs ~28 polls instead of 80, and the worst case a green check
-          # goes unnoticed is one ceiling interval.
-          poll_max_seconds=${TEST_CHECK_POLL_MAX_SECONDS:-60}
-          poll_backoff_after_seconds=${TEST_CHECK_POLL_BACKOFF_AFTER_SECONDS:-120}
-          # A ceiling below the initial cadence would mean "back off to
-          # something faster", which is not a thing; clamp rather than
-          # letting a misconfigured consumer poll harder than configured.
-          if [ "$poll_max_seconds" -lt "$poll_seconds" ]; then
-            poll_max_seconds=$poll_seconds
-          fi
-          current_poll_seconds=$poll_seconds
-          # Accumulated SLEEP time drives the backoff schedule (wall-clock
-          # SECONDS still drives the deadline below). The two are within a
-          # few seconds of each other in practice, and the accumulator is
-          # deterministic, which is what makes the schedule assertable.
-          waited_seconds=0
-          deadline=$((SECONDS + wait_seconds))
+          # Approval is durable readiness state. This job probes current-head
+          # checks exactly once; it never reserves a runner while CI executes.
+          # A successful repo-lint / annex / policy workflow later wakes the
+          # trusted continuation in auto-clear-blocking-labels.yml, which
+          # reruns the complete merge gate and final mutable-state readback.
           pr_view_json=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,isCrossRepository,baseRefName,headRefName)
           sha=$(echo "$pr_view_json" | jq -r .headRefOid)
           # #655 Codex P2 round 9 ("wait for valid push-only annex
@@ -1881,7 +1853,7 @@ jobs:
           # loop already expects, adding isRequired as an extra field.
           repo_owner="${REPO%%/*}"
           repo_name="${REPO#*/}"
-          while :; do
+          for readiness_probe in 1; do
             all_done=1
             check_count=$(echo "$required_checks_json" | jq 'length')
             # #655 Codex P1 round 12 ("paginate the status check rollup"):
@@ -2262,50 +2234,19 @@ jobs:
             fi
             if [ "$all_done" -eq 1 ]; then
               echo "CURRENT_HEAD_SHA=$sha" >> "$GITHUB_ENV"
+              echo "ready=true" >> "$GITHUB_OUTPUT"
               echo "All required check run(s) are successful on current HEAD $sha."
               exit 0
             fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::Required check run(s) did not all complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
-              exit 1
-            fi
-            # #1024 (a): progressive backoff, replacing the flat
-            # `sleep "$poll_seconds"`. Never sleep past the deadline, so
-            # widening the cadence cannot extend the configured wait budget.
-            # The remainder is recomputed here rather than reused from the
-            # deadline check above, and a NON-POSITIVE remainder is treated
-            # as "the budget is already spent" rather than falling through
-            # unclamped (Codex P2, round 1): `SECONDS` can tick over between
-            # that check and this line, and skipping the clamp on a zero or
-            # negative remainder would sleep a whole interval -- up to
-            # poll_max_seconds -- past the configured bound before the next
-            # iteration notices. Timing out one interval late mattered less
-            # when the cadence was a flat 15s; it is the one way a WIDER
-            # cadence could stretch the wait, which is exactly what this
-            # change promises it cannot do.
-            sleep_seconds=$current_poll_seconds
-            remaining_seconds=$((deadline - SECONDS))
-            if [ "$remaining_seconds" -le 0 ]; then
-              echo "::error::Required check run(s) did not all complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
-              exit 1
-            fi
-            if [ "$sleep_seconds" -gt "$remaining_seconds" ]; then
-              sleep_seconds=$remaining_seconds
-            fi
-            sleep "$sleep_seconds"
-            waited_seconds=$((waited_seconds + sleep_seconds))
-            if [ "$waited_seconds" -ge "$poll_backoff_after_seconds" ] && [ "$current_poll_seconds" -lt "$poll_max_seconds" ]; then
-              current_poll_seconds=$((current_poll_seconds * 2))
-              if [ "$current_poll_seconds" -gt "$poll_max_seconds" ]; then
-                current_poll_seconds=$poll_max_seconds
-              fi
-            fi
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Required current-head checks are still pending. Approval readiness is recorded; the completed-workflow continuation will re-evaluate without holding this runner."
+            exit 0
           done
-          echo "::error::Required check run wait loop ended unexpectedly; refusing auto-merge."
+          echo "::error::Required check readiness probe ended unexpectedly; refusing auto-merge."
           exit 1
 
-      - name: Re-verify blocking labels after test wait
-        if: steps.author_merge_token.outputs.enabled == 'true'
+      - name: Re-verify blocking labels after readiness probe
+        if: steps.author_merge_token.outputs.enabled == 'true' && steps.check_readiness.outputs.ready == 'true'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
@@ -2313,10 +2254,10 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           LABELS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name')
-          printf 'Labels after test wait:\n%s\n' "$LABELS"
+          printf 'Labels after readiness probe:\n%s\n' "$LABELS"
           for blocking_label in needs-external-review needs-human-review policy-violation human-hold; do
             if printf '%s\n' "$LABELS" | grep -Fxq "$blocking_label"; then
-              echo "::error::Blocking label present after test wait: $blocking_label. Aborting auto-merge."
+              echo "::error::Blocking label present after readiness probe: $blocking_label. Aborting auto-merge."
               exit 1
             fi
           done
@@ -2382,10 +2323,10 @@ jobs:
               exit 1
             fi
           fi
-          echo "No blocking labels present after test wait — proceeding to merge."
+          echo "No blocking labels present after readiness probe — proceeding to merge."
 
       - name: Enable auto-merge
-        if: steps.author_merge_token.outputs.enabled == 'true'
+        if: steps.author_merge_token.outputs.enabled == 'true' && steps.check_readiness.outputs.ready == 'true'
         run: |
           # Do NOT fall back to an unconditional "gh pr merge --squash" when
           # --auto is unavailable (#465): an immediate merge bypasses the

@@ -47,6 +47,10 @@
       "scripts/phase-4b/accounting.schema.json",
       "scripts/phase-4b/prices.json",
       "tests/test_phase_4b_accounting.sh"
+    ],
+    "check_repo_lint_latency_report": [
+      "scripts/repo-lint-latency-report.sh",
+      "tests/test_repo_lint_latency_report.sh"
     ]
   }
 }

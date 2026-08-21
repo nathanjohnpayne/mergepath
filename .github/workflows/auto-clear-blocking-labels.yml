@@ -243,6 +243,7 @@ jobs:
           fi
 
       - name: Re-evaluate gate per PR + remove label on pass
+        id: clear
         if: steps.pr.outputs.numbers != ''
         env:
           # PAT-driven label removal (#315/#324). GITHUB_TOKEN-driven
@@ -280,6 +281,7 @@ jobs:
           # evaluation was actually impossible.
           had_infra_error=0
           failing_prs=""
+          cleared_prs=""
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
             echo "::group::Evaluating PR #$PR"
@@ -350,6 +352,7 @@ jobs:
                 # already cleared it, and the desired end state holds either way.
                 case "$del_status" in
                   200|204)
+                    cleared_prs="$cleared_prs $PR"
                     # Direct string body (NOT a heredoc — heredoc closing
                     # delimiter must be column-0 unless using `<<-` with
                     # tabs; YAML run blocks make that brittle).
@@ -404,6 +407,48 @@ jobs:
           echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"
           # shellcheck disable=SC2086  # intentional word-splitting to trim
           echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"
+          # A PR whose external-review label was removed in THIS pass must
+          # wait for the label-policy workflow to publish its new verdict.
+          # The continuation step skips it until that later workflow_run.
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "cleared_prs=$(echo $cleared_prs)" >> "$GITHUB_OUTPUT"
+          exit "$had_infra_error"
+
+      - name: Continue approved PRs after completed checks
+        if: github.event_name == 'workflow_run' && steps.pr.outputs.numbers != ''
+        env:
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
+          CLEARED_PRS: ${{ steps.clear.outputs.cleared_prs }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; approval continuation is disabled."
+            exit 0
+          fi
+          had_infra_error=0
+          while IFS= read -r PR; do
+            [ -n "$PR" ] || continue
+            case " $CLEARED_PRS " in
+              *" $PR "*)
+                echo "PR #$PR had needs-external-review removed in this pass; waiting for the resulting policy workflow completion."
+                continue
+                ;;
+            esac
+            set +e
+            bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
+            rc=$?
+            set -e
+            case "$rc" in
+              0) ;;
+              4) echo "PR #$PR is not merge-ready on this event; a later completion event will re-evaluate it." ;;
+              *)
+                echo "::error::Approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
+                had_infra_error=1
+                ;;
+            esac
+          done <<<"$PR_NUMBERS"
           exit "$had_infra_error"
 
       - name: Surface infra failure as per-PR check-runs

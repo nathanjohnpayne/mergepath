@@ -9,6 +9,7 @@ REPO_LINT="$ROOT/.github/workflows/repo_lint.yml"
 MD_WRAP="$ROOT/.github/workflows/md-prose-wrap.yml"
 OWL="$ROOT/.github/workflows/owl-rules-check.yml"
 AGENT_REVIEW="$ROOT/.github/workflows/agent-review.yml"
+AUTO_CLEAR="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
 TOKEN_WRAPPER="$ROOT/scripts/ci/check_no_token_in_output"
 DOC_WRAPPER="$ROOT/scripts/ci/check_doc_ownership"
 CONSUMER_VERDICT="$ROOT/scripts/ci/repo-lint-consumer-verdict.sh"
@@ -188,32 +189,39 @@ else
     fail "CodeRabbit, merge-clearance, and Phase 4b wrappers must split live and self-test modes"
   fi
 
-  agent_review_wait=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Require current-head check success") | .run' "$AGENT_REVIEW")
-  if ! grep -Fq 'annex_absent="true"' <<<"$agent_review_wait" \
-     && grep -Fq 'while :; do' <<<"$agent_review_wait"; then
-    pass "agent-review retains the required-check wait before its final blocking-label recheck"
+  agent_review_probe=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Probe current-head check readiness once") | .run' "$AGENT_REVIEW")
+  if grep -Fq 'for readiness_probe in 1; do' <<<"$agent_review_probe" \
+     && grep -Fq 'ready=false' <<<"$agent_review_probe" \
+     && ! grep -Fq 'sleep ' <<<"$agent_review_probe"; then
+    pass "agent-review probes check readiness once without reserving a runner"
   else
-    fail "agent-review must not arm native auto-merge before late blocking labels can be rechecked"
+    fail "agent-review must record pending readiness and exit without polling"
   fi
 
-  wait_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Require current-head check success") | .key' "$AGENT_REVIEW")
-  label_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Re-verify blocking labels after test wait") | .key' "$AGENT_REVIEW")
-  label_recheck=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Re-verify blocking labels after test wait") | .run' "$AGENT_REVIEW")
+  wait_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Probe current-head check readiness once") | .key' "$AGENT_REVIEW")
+  label_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Re-verify blocking labels after readiness probe") | .key' "$AGENT_REVIEW")
+  label_recheck=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Re-verify blocking labels after readiness probe") | .run' "$AGENT_REVIEW")
   if [[ "$wait_step_index" =~ ^[0-9]+$ ]] \
      && [[ "$label_step_index" =~ ^[0-9]+$ ]] \
      && [ "$label_step_index" -gt "$wait_step_index" ] \
      && grep -Fq 'LABELS=$(gh pr view "$PR_NUMBER"' <<<"$label_recheck" \
      && grep -Fq -- "--json labels --jq '.labels[].name')" <<<"$label_recheck"; then
-    pass "the exact final blocking-label query follows the required-check wait"
+    pass "the immediate-green path retains an exact final blocking-label query"
   else
-    fail "the final blocking-label query must follow the required-check wait"
+    fail "the immediate-green path must re-read labels after its readiness probe"
   fi
 
-  if grep -Fq 'repo_lint_local.yml annex present' <<<"$agent_review_wait" \
-     && grep -Fq 'while :; do' <<<"$agent_review_wait"; then
-    pass "agent-review retains explicit polling for the optional non-required annex"
+  if grep -Fq 'repo_lint_local.yml annex present' <<<"$agent_review_probe" \
+     && grep -Fq 'workflowPath // "") == "repo_lint_local.yml"' <<<"$agent_review_probe"; then
+    pass "the one-shot probe still observes the optional non-required annex"
   else
-    fail "agent-review must continue to enforce a present repo_lint_local.yml annex"
+    fail "the one-shot probe must continue to enforce a present repo_lint_local.yml annex"
+  fi
+
+  if yq -e '(.on.workflow_run.workflows | contains(["repo-lint", "repo-lint-local", ".github/workflows/repo_lint_local.yml"])) and ([.jobs."evaluate-and-clear".steps[] | select(.name == "Continue approved PRs after completed checks") | select(.if | contains("workflow_run")) | .run | contains("approval-merge-continuation.sh")] | any)' "$AUTO_CLEAR" >/dev/null; then
+    pass "completed canonical or annex CI re-enters the trusted approval continuation"
+  else
+    fail "auto-clear must re-enter approval continuation on completed CI workflows"
   fi
 fi
 
@@ -248,6 +256,13 @@ for harness in "$CONSUMER_HARNESS" "$RESIDUE_HARNESS"; do
     fail "${harness##*/} must filter expensive probes through the shared selector"
   fi
 done
+
+if sed -n '/Stale-ratchet sweep/,/Same ratchet/p' "$RESIDUE_HARNESS" \
+     | grep -Fq 'repo_lint_check_is_selected "$n"'; then
+  pass "partial residue selection audits only the selected wrappers' exception records"
+else
+  fail "partial residue selection must not report unselected legacy exceptions as stale"
+fi
 
 if yq -e '.jobs.deep_safety.env.REPO_LINT_FULL == "${{ needs.scope.outputs.full }}" and .jobs.deep_safety.env.REPO_LINT_CHECKS_JSON == "${{ needs.scope.outputs.checks }}"' "$REPO_LINT" >/dev/null; then
   pass "deep-safety passes the classifier selection to both harness legs"

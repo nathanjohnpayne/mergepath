@@ -11,6 +11,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
+CONTINUATION_TEST="$ROOT/tests/test_approval_merge_continuation.sh"
 
 pass=0
 fail=0
@@ -588,6 +589,10 @@ fi
 
 echo
 if [ "$fail" -eq 0 ]; then
+  if ! bash "$CONTINUATION_TEST"; then
+    echo "check_auto_clear_workflow: FAIL (approval continuation contract)" >&2
+    exit 1
+  fi
   echo "check_auto_clear_workflow: PASS ($pass tests)"
   exit 0
 else

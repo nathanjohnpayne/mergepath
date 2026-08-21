@@ -564,6 +564,9 @@ jobs:
         # The delegated test parses workflow YAML with mikefarah/yq.
         run: ./scripts/ci/check_repo_lint_optimization || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_optimization ]; then echo "check_repo_lint_optimization not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      - name: check_repo_lint_latency_report
+        run: ./scripts/ci/check_repo_lint_latency_report || { rc=$?; if [ ! -f scripts/ci/check_repo_lint_latency_report ]; then echo "check_repo_lint_latency_report not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_resolve_pr_threads
         # Requires yq via the delegated verified-propagation suite —
         # runs after install_yq_for_sync_manifest above (Codex P2 on

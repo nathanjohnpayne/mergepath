@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# CI entry point for the rolling repo-lint latency report contract.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SUBJECT="$ROOT/scripts/repo-lint-latency-report.sh"
+
+if [ "${MERGEPATH_CONSUMER_SAFETY:-0}" = "1" ]; then
+  bash -n "$SUBJECT"
+  echo "check_repo_lint_latency_report: PASS (consumer syntax smoke)"
+  exit 0
+fi
+
+bash "$ROOT/tests/test_repo_lint_latency_report.sh"

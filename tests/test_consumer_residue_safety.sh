@@ -1556,6 +1556,9 @@ $2
 
 for e in "${KNOWN_RESIDUE_VIOLATIONS[@]}"; do
   n="${e%%|*}"
+  if ! repo_lint_check_is_selected "$n"; then
+    continue
+  fi
   if ! seen_contains "$SEEN_VIOLATORS" "$n"; then
     if [ -f "$ROOT/scripts/ci/$n" ]; then
       fail "KNOWN_RESIDUE_VIOLATIONS names '$n' but no violation was observed for it — delete the stale entry"
