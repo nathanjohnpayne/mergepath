@@ -124,7 +124,7 @@ reviewer_pat_item_for() {
   case "$1" in
     claude) echo "pvbq24vl2h6gl7yjclxy2hbote" ;;
     cursor) echo "bslrih4spwxgookzfy6zedz5g4" ;;
-    codex)  echo "o6ekjxjjl5gq6rmcneomrjahpu" ;;
+    codex)  echo "etak327mpz4drd4byxszfex4vm" ;;
     *)      return 1 ;;
   esac
 }

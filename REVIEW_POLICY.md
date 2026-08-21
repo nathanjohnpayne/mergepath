@@ -57,14 +57,17 @@ For repo work, `GH_TOKEN` is now the per-command attribution source for the guar
 
 #### PAT lookup table
 
-> This is the **canonical source** for PAT lookups across the mergepath ecosystem. `CLAUDE.md` (project), `AGENTS.md`, and `DEPLOYMENT.md` all reference this section instead of duplicating the table. Machine-level `~/GitHub/CLAUDE.md` mirrors the same rows for cross-repo work. The same four identities also have SSH signing keys uploaded to GitHub — see the [SSH Signing Keys](#ssh-signing-keys) section below for the inventory + verify/re-upload commands.
+> This is the **canonical source** for PAT lookups across the mergepath ecosystem. `CLAUDE.md` (project), `AGENTS.md`, and `DEPLOYMENT.md` all reference this section instead of duplicating the table. Machine-level `~/GitHub/CLAUDE.md` mirrors the same rows for cross-repo work. The last row is a **CI service account, not a reviewer**: `nathanpayne-robot` holds no reviewer standing, is deliberately absent from `reviewer_pat_item_for()` in `scripts/op-preflight.sh` so `--agent robot` cannot resolve a reviewer PAT, and must never post a review — review state is what the no-self-approve and same-agent gates read. All five identities have SSH signing keys uploaded to GitHub — see the [SSH Signing Keys](#ssh-signing-keys) section below for the inventory + verify/re-upload commands.
 
 | Agent | Reviewer Identity | 1Password Item ID | Cached env var (primary) | `op read` path (setup-only fallback) |
 |-------|-------------------|-------------------|--------------------------|--------------------------------------|
 | Claude | `nathanpayne-claude` | `pvbq24vl2h6gl7yjclxy2hbote` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/pvbq24vl2h6gl7yjclxy2hbote/token` |
 | Cursor | `nathanpayne-cursor` | `bslrih4spwxgookzfy6zedz5g4` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/bslrih4spwxgookzfy6zedz5g4/token` |
-| Codex | `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
+| Codex | `nathanpayne-codex` | `etak327mpz4drd4byxszfex4vm` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/etak327mpz4drd4byxszfex4vm/token` |
 | Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `$OP_PREFLIGHT_AUTHOR_PAT` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
+| CI (not a reviewer) | `nathanpayne-robot` | `o6ekjxjjl5gq6rmcneomrjahpu` | *(none — CI only)* | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
+
+> **A 1Password item ID is not a stable identity.** On 2026-08-21 the item `o6ekjxjjl5gq6rmcneomrjahpu` was repurposed from Codex to the robot and Codex was recreated at `etak327mpz4drd4byxszfex4vm`; every row above still pointed at the old ID, so `--agent codex` silently resolved a **robot** token. Nothing in the table can catch that on its own — after any PAT rotation or item edit, re-verify each row with `scripts/identity-check.sh --expect-token-identity <login>`, which is what fails closed when a row goes stale.
 
 **Cached-variable usage is the primary pattern.** After a single `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"` at session start, all subsequent API calls use the env var directly — no biometric burned per call:
 
