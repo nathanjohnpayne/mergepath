@@ -274,10 +274,11 @@ else
   if [[ "$wait_step_index" =~ ^[0-9]+$ ]] \
      && [[ "$merge_step_index" =~ ^[0-9]+$ ]] \
      && [ "$merge_step_index" -gt "$wait_step_index" ] \
+     && grep -Fq 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$merge_step" \
      && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$merge_step"; then
-    pass "the immediate-green path uses the shared final safety continuation"
+    pass "the immediate-green path guards first-rollout skew and uses the shared final safety continuation"
   else
-    fail "the immediate-green path must route through the shared final safety continuation after its readiness probe"
+    fail "the immediate-green path must guard the helper and route through the shared final safety continuation"
   fi
 
   if grep -Fq 'repo_lint_local.yml annex present' <<<"$agent_review_probe" \

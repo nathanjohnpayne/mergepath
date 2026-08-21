@@ -1255,10 +1255,16 @@ paths:
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/approval-merge-continuation.sh"
+      - "scripts/workflow/report-approval-continuation-failures.sh"
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-review-check.sh"
       - "scripts/review-feedback-accounting.sh"
       - "scripts/resolve-pr-threads.sh"
+  - path: scripts/workflow/report-approval-continuation-failures.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-retry-helpers.sh"
   - path: .github/workflows/repo-lint-latency.yml
     type: canonical
     consumers: all

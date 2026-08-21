@@ -1997,6 +1997,10 @@ jobs:
           # revalidates the live head, approval, checks, blocking labels,
           # feedback accounting, and unresolved conversations before arming
           # native auto-merge with --match-head-commit.
+          if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then
+            echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout approval event."
+            exit 0
+          fi
           set +e
           bash scripts/workflow/approval-merge-continuation.sh "$PR_NUMBER" "$REPO"
           rc=$?

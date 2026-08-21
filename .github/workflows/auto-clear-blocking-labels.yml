@@ -433,8 +433,8 @@ jobs:
             echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout event."
             exit 0
           fi
-          had_infra_error=0
-          failing_prs=""
+          continuation_infra_error=0
+          continuation_failing_prs=""
           while IFS= read -r PR; do
             [ -n "$PR" ] || continue
             case " $CLEARED_PRS " in
@@ -452,15 +452,30 @@ jobs:
               4) echo "PR #$PR is not merge-ready on this event; a later completion event will re-evaluate it." ;;
               *)
                 echo "::error::Approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
-                had_infra_error=1
-                failing_prs="$failing_prs $PR"
+                continuation_infra_error=1
+                continuation_failing_prs="$continuation_failing_prs $PR"
                 ;;
             esac
           done <<<"$PR_NUMBERS"
-          echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"
+          echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITHUB_ENV"
           # shellcheck disable=SC2086  # intentional word-splitting to trim
-          echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"
-          exit "$had_infra_error"
+          echo "CONTINUATION_INFRA_ERROR_PRS=$(echo $continuation_failing_prs)" >> "$GITHUB_ENV"
+          exit "$continuation_infra_error"
+
+      - name: Surface approval continuation failures as per-PR check-runs
+        if: always() && env.CONTINUATION_INFRA_ERROR == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/workflow/report-approval-continuation-failures.sh ]; then
+            echo "::notice::Continuation failure reporter is not on the trusted default branch yet; the workflow log remains authoritative for this first rollout."
+            exit 0
+          fi
+          bash scripts/workflow/report-approval-continuation-failures.sh \
+            "$REPO" "$RUN_URL" "${CONTINUATION_INFRA_ERROR_PRS:-}"
 
       - name: Surface infra failure as per-PR check-runs
         # Run even when the prior step failed — `if: always()` + the
@@ -790,8 +805,8 @@ jobs:
             echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout sweep."
             exit 0
           fi
-          had_infra_error=0
-          failing_prs=""
+          continuation_infra_error=0
+          continuation_failing_prs=""
           while IFS= read -r PR; do
             [ -n "$PR" ] || continue
             set +e
@@ -803,15 +818,30 @@ jobs:
               4) echo "PR #$PR is not merge-ready; a later event or sweep will re-evaluate it." ;;
               *)
                 echo "::error::Scheduled approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
-                had_infra_error=1
-                failing_prs="$failing_prs $PR"
+                continuation_infra_error=1
+                continuation_failing_prs="$continuation_failing_prs $PR"
                 ;;
             esac
           done <<<"$PRS"
-          echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"
+          echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITHUB_ENV"
           # shellcheck disable=SC2086  # intentional word-splitting to trim
-          echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"
-          exit "$had_infra_error"
+          echo "CONTINUATION_INFRA_ERROR_PRS=$(echo $continuation_failing_prs)" >> "$GITHUB_ENV"
+          exit "$continuation_infra_error"
+
+      - name: Surface approval continuation failures as per-PR check-runs
+        if: always() && env.CONTINUATION_INFRA_ERROR == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/workflow/report-approval-continuation-failures.sh ]; then
+            echo "::notice::Continuation failure reporter is not on the trusted default branch yet; the workflow log remains authoritative for this first rollout."
+            exit 0
+          fi
+          bash scripts/workflow/report-approval-continuation-failures.sh \
+            "$REPO" "$RUN_URL" "${CONTINUATION_INFRA_ERROR_PRS:-}"
 
       - name: Surface infra failure as per-PR check-runs
         # Mirrors evaluate-and-clear's surfacing step. See that step's
