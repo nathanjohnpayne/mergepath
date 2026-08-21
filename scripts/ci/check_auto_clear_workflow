@@ -197,6 +197,33 @@ else
   echo "  FAIL: scheduled sweep must continue approved PRs whose custom annex name cannot appear in workflow_run.workflows, while honoring scheduled_sweep_enabled:false (#1062)" >&2
 fi
 
+# Both approval-continuation loops have their own failure-surfacing step. An
+# infrastructure/config failure must therefore export both the sentinel and
+# the affected PR list before exiting nonzero; shell-local variables disappear
+# at the step boundary and cannot drive the following check-run publisher.
+event_continuation_block=$(awk '
+  /- name: Continue approved PRs after completed checks/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Continue approved PRs after completed checks/ {exit}
+  in_block {print}
+' "$WORKFLOW")
+scheduled_continuation_block=$(awk '
+  /- name: Continue approved PRs after custom-workflow completions/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Continue approved PRs after custom-workflow completions/ {exit}
+  in_block {print}
+' "$WORKFLOW")
+if grep -qF 'echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"' <<<"$event_continuation_block" \
+   && grep -qF 'echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"' <<<"$event_continuation_block" \
+   && grep -qF 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$event_continuation_block" \
+   && grep -qF 'echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$scheduled_continuation_block"; then
+  pass=$((pass + 1))
+  echo "  PASS: both approval-continuation loops guard first-rollout skew and export failure state for per-PR check-run surfacing"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: each approval-continuation loop must guard the helper and export HAD_INFRA_ERROR plus HAD_INFRA_ERROR_PRS" >&2
+fi
+
 # #730: the pull_request_target trigger must include `edited` so a body-edit
 # nudge (the reliable re-fire for a claude-authored Phase-4 PR after a late
 # Codex clearance) re-evaluates auto-clear on the PR head. Anchor to the

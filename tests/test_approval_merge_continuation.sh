@@ -96,16 +96,38 @@ assert_not_ready() {
   if [ "$rc" -eq 4 ] && [ ! -s "$TMP/merge.log" ]; then pass "$label"; else fail "$label (rc=$rc)"; fi
 }
 
-STUB_READINESS_RC=1 assert_not_ready "missing registered approval or incomplete current-head CI/annex defers without arming"
-STUB_READINESS_RC=0 STUB_GATE_RC=1 assert_not_ready "pending threshold-aware external gate defers without arming"
-STUB_GATE_RC=0 STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"human-hold"}]}' assert_not_ready "blocking label defers before gate work"
-STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"documentation"}]}' STUB_FINAL="$BASE"
+reset_fixtures() {
+  unset STUB_INITIAL STUB_FINAL STUB_READINESS_RC STUB_GATE_RC
+  unset STUB_ACCOUNTING_RC STUB_THREADS_RC STUB_LOGIN STUB_LOGIN_RC
+  unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR
+}
+
+reset_fixtures
+STUB_READINESS_RC=1
+assert_not_ready "missing registered approval or incomplete current-head CI/annex defers without arming"
+
+reset_fixtures
+STUB_GATE_RC=1
+assert_not_ready "pending threshold-aware external gate defers without arming"
+
+reset_fixtures
+STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"human-hold"}]}'
+assert_not_ready "blocking label defers before gate work"
+
+reset_fixtures
+STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"documentation"}]}'
+STUB_FINAL="$BASE"
 if run_case && [ -s "$TMP/merge.log" ]; then
   pass "non-blocking labels remain merge-eligible"
 else
   fail "shared blocking-label policy must not reject unrelated labels"
 fi
-STUB_INITIAL="$BASE" STUB_ACCOUNTING_RC=1 assert_not_ready "unaccounted feedback defers without arming"
+
+reset_fixtures
+STUB_ACCOUNTING_RC=1
+assert_not_ready "unaccounted feedback defers without arming"
+
+reset_fixtures
 STUB_ACCOUNTING_RC=2
 set +e
 run_case
@@ -116,10 +138,16 @@ if [ "$rc" -eq 3 ] && [ ! -s "$TMP/merge.log" ]; then
 else
   fail "feedback-accounting infrastructure failure must exit 3 (rc=$rc)"
 fi
-STUB_ACCOUNTING_RC=0
-STUB_ACCOUNTING_RC=0 STUB_THREADS_RC=3 assert_not_ready "unresolved conversations defer without arming"
-STUB_THREADS_RC=0 STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"def456","url":"https://example.test/pr/7","labels":[]}' assert_not_ready "head drift during evaluation defers without arming"
 
+reset_fixtures
+STUB_THREADS_RC=3
+assert_not_ready "unresolved conversations defer without arming"
+
+reset_fixtures
+STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"def456","url":"https://example.test/pr/7","labels":[]}'
+assert_not_ready "head drift during evaluation defers without arming"
+
+reset_fixtures
 STUB_FINAL="$BASE"
 if run_case \
    && grep -Fq 'head_pin=1 args=[--approval-readiness-only 7 owner/repo]' "$TMP/readiness.log" \
@@ -129,14 +157,16 @@ else
   fail "under-threshold clearance must require exact-head registered approval/CI readiness and arm exact-head auto-merge (readiness: $(cat "$TMP/readiness.log" 2>/dev/null || true); merge: $(cat "$TMP/merge.log" 2>/dev/null || true); output: $(cat "$TMP/subject.out" 2>/dev/null || true))"
 fi
 
-STUB_EXPECTED_AUTHOR=consumer-author STUB_LOGIN=consumer-author
+reset_fixtures
+STUB_EXPECTED_AUTHOR=consumer-author
+STUB_LOGIN=consumer-author
 if run_case && [ -s "$TMP/merge.log" ]; then
   pass "governing base policy supplies the authorized merge identity"
 else
   fail "continuation must accept the author identity from the governing base policy"
 fi
-unset STUB_EXPECTED_AUTHOR STUB_LOGIN
 
+reset_fixtures
 STUB_MERGE_RC=1
 set +e
 run_case
@@ -147,8 +177,8 @@ if [ "$rc" -eq 3 ] && [ -s "$TMP/merge.log" ]; then
 else
   fail "failed exact-head merge arming must exit 3 (rc=$rc)"
 fi
-STUB_MERGE_RC=0
 
+reset_fixtures
 STUB_LOGIN_RC=7
 set +e
 run_case
@@ -159,8 +189,8 @@ if [ "$rc" -eq 3 ] && grep -Fq 'stub identity lookup failed' "$TMP/subject.out";
 else
   fail "identity API failure must exit 3 with its diagnostic (rc=$rc)"
 fi
-STUB_LOGIN_RC=0
 
+reset_fixtures
 STUB_LOGIN=wrong
 set +e
 run_case

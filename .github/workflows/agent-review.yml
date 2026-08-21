@@ -1039,16 +1039,26 @@ jobs:
           #      The trigger payload does not reflect that later mutation.
           #
           # Re-fetch the authoritative label state from the GitHub API before
-          # entering the readiness probe. The same check repeats after a
-          # successful probe,
-          # immediately before merge. Abort if any blocking label is now
-          # present. Also check `policy-violation`, which is applied by the
+          # entering the readiness probe. The shared continuation repeats this
+          # check, along with feedback-accounting and conversation-resolution
+          # gates, immediately before arming auto-merge. Abort if any blocking
+          # label is now present. Also check `policy-violation`, which is applied by the
           # block-self-approval job earlier in this same workflow run (and
           # again, the `if:` at job start wouldn't have seen it).
-          # The workflow and its required helper propagate as one manifest
-          # closure, so the security-sensitive label predicate has one owner.
-          # shellcheck source=scripts/lib/blocking-labels.sh
-          source scripts/lib/blocking-labels.sh
+          # The trusted default-branch checkout intentionally lags an atomic
+          # workflow+helper rollout by one merge. Source the shared helper when
+          # it is present; retain the exact bootstrap predicate for the first
+          # mergepath or consumer rollout so approval does not fail before the
+          # helper has landed on that repository's default branch.
+          if [ -f scripts/lib/blocking-labels.sh ]; then
+            # shellcheck source=scripts/lib/blocking-labels.sh
+            source scripts/lib/blocking-labels.sh
+          else
+            mergepath_blocking_labels_csv() {
+              awk '$0 == "needs-external-review" || $0 == "needs-human-review" || $0 == "policy-violation" || $0 == "human-hold"' \
+                | paste -sd, -
+            }
+          fi
           LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')
           printf 'Labels at merge time:\n%s\n' "$LABELS"
           blocking_labels=$(printf '%s\n' "$LABELS" | mergepath_blocking_labels_csv)
@@ -1979,39 +1989,24 @@ jobs:
             echo "::notice::Required current-head checks are still pending. Approval readiness is recorded; the completed-workflow continuation will re-evaluate without holding this runner."
             exit 0
 
-      - name: Re-verify blocking labels after readiness probe
-        if: steps.author_merge_token.outputs.enabled == 'true' && steps.check_readiness.outputs.ready == 'true'
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          # shellcheck source=scripts/lib/blocking-labels.sh
-          source scripts/lib/blocking-labels.sh
-          LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')
-          printf 'Labels after readiness probe:\n%s\n' "$LABELS"
-          blocking_labels=$(printf '%s\n' "$LABELS" | mergepath_blocking_labels_csv)
-          if [ -n "$blocking_labels" ]; then
-            echo "::error::Blocking label(s) present after readiness probe: $blocking_labels. Aborting auto-merge."
-            exit 1
-          fi
-          echo "No blocking labels present after readiness probe — proceeding to merge."
-
       - name: Enable auto-merge
         if: steps.author_merge_token.outputs.enabled == 'true' && steps.check_readiness.outputs.ready == 'true'
         run: |
-          # Do NOT fall back to an unconditional "gh pr merge --squash" when
-          # --auto is unavailable (#465): an immediate merge bypasses the
-          # status-check and label guards re-verified above. A sibling job
-          # could apply a blocking label between that re-verify and this step,
-          # and the unconditional fallback would merge it anyway. Fail closed:
-          # if auto-merge cannot be enabled, surface the error and let a human
-          # or a re-run handle it.
-          if ! gh pr merge --squash --auto --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL"; then
-            echo "::error::Could not enable auto-merge for $PR_URL; refusing to merge unconditionally (#465)."
-            exit 1
-          fi
+          # Route the immediate-green case through the same trusted final
+          # safety path used by later workflow completions and the sweep. It
+          # revalidates the live head, approval, checks, blocking labels,
+          # feedback accounting, and unresolved conversations before arming
+          # native auto-merge with --match-head-commit.
+          set +e
+          bash scripts/workflow/approval-merge-continuation.sh "$PR_NUMBER" "$REPO"
+          rc=$?
+          set -e
+          case "$rc" in
+            0) ;;
+            4) echo "::notice::PR #$PR_NUMBER is no longer merge-ready; a later completion event or sweep will re-evaluate it." ;;
+            *) echo "::error::Approval continuation hit infrastructure/config error rc=$rc on PR #$PR_NUMBER."; exit "$rc" ;;
+          esac
         env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}

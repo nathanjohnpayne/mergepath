@@ -83,8 +83,7 @@ set -euo pipefail
 # --output defaults to $GITHUB_OUTPUT. Exit 2 on usage error.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../lib/review-policy-scalar.sh
-source "$SCRIPT_DIR/../lib/review-policy-scalar.sh"
+SCALAR_HELPER="$SCRIPT_DIR/../lib/review-policy-scalar.sh"
 
 REPO=""
 BASE_REF=""
@@ -124,6 +123,17 @@ command -v jq >/dev/null 2>&1 || { echo "load_review_config.sh: jq is required" 
 
 emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 
+if [ ! -f "$SCALAR_HELPER" ]; then
+  echo "::warning::$SCALAR_HELPER is not available in this trusted checkout; emitting fail-closed load-config outputs — empty reviewer allow-list, threshold 0."
+  emit threshold "0"
+  emit paths "[]"
+  emit reviewers "[]"
+  emit author_identity ""
+  exit 0
+fi
+# shellcheck source=../lib/review-policy-scalar.sh
+source "$SCALAR_HELPER"
+
 # Read one TOP-LEVEL scalar out of a policy file.
 #
 # This is the parser `.github/workflows/agent-review.yml`'s auto-merge job used
@@ -153,19 +163,11 @@ emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 #
 # KNOWN LIMIT — tracked in #978, deliberately not fixed here. These are a LINE
 # parser's semantics, not YAML's, and on a malformed or adversarial policy the
-# two diverge: an unterminated quote is stripped into a clean value; a `#` with
-# no separating space opens a comment here where YAML reads it as part of the
-# scalar; a repeated key (in this or any other spelling) resolves first-wins
-# where YAML consumers resolve last-wins or reject the document. All three are
-# inherited verbatim — this script RELOCATES the expression above, it neither
-# sharpens nor weakens it, and `agent-review.yml` ran exactly these semantics
-# in exactly this authorization role before #788 moved the source. All three
-# also require the policy on the PR's BASE branch to be malformed, which is
-# protected content, where the defect #788 names was reachable from any PR by
-# editing policy on its own branch. #978 carries the design of the parsing
-# contract — including whether this scalar should come from a real YAML parser
-# at all — because three review rounds each found one more spelling, which is
-# the shape that says stop patching and go design.
+# two diverge: an unterminated quote is accepted as a value, and a repeated key
+# resolves first-wins where YAML consumers resolve last-wins or reject the
+# document. Both require malformed protected base-policy content. #978 carries
+# the design of the parsing contract, including whether this scalar should come
+# from a real YAML parser at all.
 # Resolve the governing policy. stderr is left attached to the caller so the
 # resolver's diagnostics land in the job log; only stdout is captured, because
 # stdout is the policy PATH and merging the streams would turn a warning into a

@@ -998,19 +998,22 @@ else
 fi
 
 # 2e-bis. This privileged job sources merge helpers, so its checkout must be
-# pinned to the trusted default branch and both label readbacks must consume
-# the shared blocking-label predicate. The manifest makes the helper a hard
-# workflow dependency, so inline fallbacks would create a second source of
-# truth for a security-sensitive decision.
+# pinned to the trusted default branch. Its early label read uses the shared
+# predicate when available and preserves the exact bootstrap predicate for the
+# first atomic consumer rollout, when the trusted default branch necessarily
+# lacks the helper. The final label read and all other safety gates belong to
+# the shared approval continuation for both immediate and deferred paths.
 if grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$auto_merge_job_block" \
-  && [ "$(grep -c 'source scripts/lib/blocking-labels.sh' <<<"$auto_merge_job_block")" -eq 2 ] \
-  && ! grep -Fq 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block" \
-  && [ "$(grep -c 'blocking_labels=$(printf' <<<"$auto_merge_job_block")" -eq 2 ]; then
+  && [ "$(grep -c 'source scripts/lib/blocking-labels.sh' <<<"$auto_merge_job_block")" -eq 1 ] \
+  && grep -Fq 'if [ -f scripts/lib/blocking-labels.sh ]; then' <<<"$auto_merge_job_block" \
+  && grep -Fq 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block" \
+  && [ "$(grep -c 'blocking_labels=$(printf' <<<"$auto_merge_job_block")" -eq 1 ] \
+  && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: privileged approval arming uses the trusted shared blocking-label policy as its single source of truth"
+  echo "  PASS: privileged approval arming uses the trusted helper with a first-rollout bootstrap and routes final safety through the shared continuation"
 else
   fail=$((fail + 1))
-  echo "  FAIL: approval arming must pin its checkout and hard-source scripts/lib/blocking-labels.sh without duplicating its predicate" >&2
+  echo "  FAIL: approval arming must pin its checkout, preserve the first-rollout helper fallback, and use the shared final continuation" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that
@@ -1333,11 +1336,10 @@ fi
 if grep -Fq "Probe current-head check readiness once" .github/workflows/agent-review.yml && \
    grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" .github/workflows/agent-review.yml && \
    grep -Fq 'select((.name // .context // "") == $name)' .github/workflows/agent-review.yml && \
-   grep -Fq "Re-verify blocking labels after readiness probe" .github/workflows/agent-review.yml && \
-   grep -Fq 'CURRENT_HEAD_SHA=$sha' .github/workflows/agent-review.yml && \
-   grep -Fq -- "--match-head-commit" .github/workflows/agent-review.yml && \
    grep -Fq 'steps.check_readiness.outputs.ready == '\''true'\''' .github/workflows/agent-review.yml && \
+   grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' .github/workflows/agent-review.yml && \
    grep -Fq 'approval-merge-continuation.sh' .github/workflows/auto-clear-blocking-labels.yml && \
+   grep -Fq -- '--match-head-commit "$final_head"' scripts/workflow/approval-merge-continuation.sh && \
    ! grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
   echo "  PASS: agent-review probes current-head readiness once; completed workflows re-enter an exact-head guarded continuation"

@@ -635,6 +635,7 @@ paths:
     consumers: all
     requires:
       - "scripts/repo-lint-latency-report.sh"
+      - "scripts/ci/check_repo_lint_latency_report"
       - ".github/workflows/repo-lint-latency.yml"
   - path: tests/test_check_doc_ownership.sh
     type: canonical

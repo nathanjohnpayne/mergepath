@@ -158,6 +158,22 @@ STUB
   else
     fail "a later jq failure must not continue with incomplete wrapper patterns (got $parse_failure)"
   fi
+
+  malformed_root=$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-malformed.XXXXXX")
+  mkdir -p "$malformed_root/scripts/ci"
+  cp "$SCOPE" "$malformed_root/scripts/ci/repo-lint-scope.sh"
+  cat > "$malformed_root/scripts/ci/repo-lint-dependencies.json" <<'JSON'
+{"version":1,"full_triggers":[".github/**",null],"wrappers":{"check_example":["scripts/example.sh",7]}}
+JSON
+  malformed_members=$(printf '%s\n' docs/README.md | bash "$malformed_root/scripts/ci/repo-lint-scope.sh" --event pull_request 2>/dev/null)
+  rm -rf "$malformed_root"
+  if grep -Fxq 'deep=true' <<<"$malformed_members" \
+     && grep -Fxq 'full=true' <<<"$malformed_members" \
+     && grep -Fxq 'checks=[]' <<<"$malformed_members"; then
+    pass "non-string dependency graph members fail closed to the full deep surface"
+  else
+    fail "dependency graph arrays must contain only strings (got $malformed_members)"
+  fi
 fi
 
 if ! command -v yq >/dev/null 2>&1; then
@@ -253,16 +269,15 @@ else
   fi
 
   wait_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Probe current-head check readiness once") | .key' "$AGENT_REVIEW")
-  label_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Re-verify blocking labels after readiness probe") | .key' "$AGENT_REVIEW")
-  label_recheck=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Re-verify blocking labels after readiness probe") | .run' "$AGENT_REVIEW")
+  merge_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Enable auto-merge") | .key' "$AGENT_REVIEW")
+  merge_step=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Enable auto-merge") | .run' "$AGENT_REVIEW")
   if [[ "$wait_step_index" =~ ^[0-9]+$ ]] \
-     && [[ "$label_step_index" =~ ^[0-9]+$ ]] \
-     && [ "$label_step_index" -gt "$wait_step_index" ] \
-     && grep -Fq 'LABELS=$(gh pr view "$PR_NUMBER"' <<<"$label_recheck" \
-     && grep -Fq -- "--json labels --jq '.labels[].name')" <<<"$label_recheck"; then
-    pass "the immediate-green path retains an exact final blocking-label query"
+     && [[ "$merge_step_index" =~ ^[0-9]+$ ]] \
+     && [ "$merge_step_index" -gt "$wait_step_index" ] \
+     && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$merge_step"; then
+    pass "the immediate-green path uses the shared final safety continuation"
   else
-    fail "the immediate-green path must re-read labels after its readiness probe"
+    fail "the immediate-green path must route through the shared final safety continuation after its readiness probe"
   fi
 
   if grep -Fq 'repo_lint_local.yml annex present' <<<"$agent_review_probe" \

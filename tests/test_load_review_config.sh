@@ -42,12 +42,32 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-if grep -Fq 'source "$SCRIPT_DIR/../lib/review-policy-scalar.sh"' "$LOADER" \
+if grep -Fq 'SCALAR_HELPER="$SCRIPT_DIR/../lib/review-policy-scalar.sh"' "$LOADER" \
+   && grep -Fq 'source "$SCALAR_HELPER"' "$LOADER" \
+   && grep -Fq 'if [ ! -f "$SCALAR_HELPER" ]; then' "$LOADER" \
    && ! grep -Fq 'review_policy_scalar()' "$LOADER"; then
-  pass "the loader hard-sources the shared policy scalar parser without duplicating it"
+  pass "the loader guards and sources the shared policy scalar parser without duplicating it"
 else
-  fail "the loader must use scripts/lib/review-policy-scalar.sh as its single parser implementation"
+  fail "the loader must fail closed when its shared scalar parser is absent and use it as the single parser implementation"
 fi
+
+SCALAR_HELPER="$ROOT/scripts/lib/review-policy-scalar.sh"
+HASH_POLICY=$(mktemp "${TMPDIR:-/tmp}/review-policy-hash.XXXXXX")
+trap 'rm -f "$HASH_POLICY"' EXIT
+printf '%s\n' 'author_identity: team#ops' > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = 'team#ops' ] && pass "an unquoted hash without a separator remains scalar data" || fail "unquoted hash scalar parsed as '$got'"
+printf '%s\n' 'author_identity: "team #ops" # comment' > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = 'team #ops' ] && pass "a hash inside double quotes remains scalar data" || fail "double-quoted hash scalar parsed as '$got'"
+printf '%s\n' "author_identity: 'team #ops' # comment" > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = 'team #ops' ] && pass "a hash inside single quotes remains scalar data" || fail "single-quoted hash scalar parsed as '$got'"
+printf '%s\n' 'author_identity: team # comment' > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = 'team' ] && pass "a separated unquoted hash still starts a YAML comment" || fail "separated comment scalar parsed as '$got'"
+rm -f "$HASH_POLICY"
+trap - EXIT
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/load-review-config-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -448,6 +468,25 @@ if [ "$(grep -c '' "$STEP_OUT" | tr -d ' ')" = "4" ]; then
   pass "the bootstrap soft-pass emits exactly the four load-config outputs"
 else
   fail "bootstrap soft-pass output shape: $(cat "$STEP_OUT")"
+fi
+
+# 5a-bis. A partially propagated trusted tree can carry the loader before its
+# scalar helper. The loader itself must soft-pass with the same fail-closed
+# values; checking only the loader path in the workflow is insufficient.
+HELPER_SKEW_TREE="$WORK/helper-skew-tree"
+mkdir -p "$HELPER_SKEW_TREE/.github" "$HELPER_SKEW_TREE/scripts"
+cp "$DEFAULT_CONFIG" "$HELPER_SKEW_TREE/.github/review-policy.yml"
+cp -R "$ROOT/scripts/workflow" "$HELPER_SKEW_TREE/scripts/workflow"
+
+run_step "$HELPER_SKEW_TREE" main main
+if [ "$SRC" -eq 0 ] \
+   && [ "$(val_in "$STEP_OUT" reviewers)" = "[]" ] \
+   && [ "$(val_in "$STEP_OUT" paths)" = "[]" ] \
+   && [ "$(val_in "$STEP_OUT" threshold)" = "0" ] \
+   && [ "$(val_in "$STEP_OUT" author_identity)" = "" ]; then
+  pass "a trusted tree with the loader but without its scalar helper soft-passes fail closed"
+else
+  fail "scalar-helper skew (rc=$SRC): $STEP_LOG"
 fi
 
 # 5b. Positive control. The same lifted step against a tree that DOES carry the

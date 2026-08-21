@@ -21,7 +21,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GRAPH="$ROOT/scripts/ci/repo-lint-dependencies.json"
 
 if [ ! -f "$GRAPH" ] || ! command -v jq >/dev/null 2>&1 \
-   || ! jq -e '.version == 1 and (.full_triggers | type == "array") and (.wrappers | type == "object")' "$GRAPH" >/dev/null 2>&1; then
+   || ! jq -e '
+     .version == 1
+     and (.full_triggers | type == "array")
+     and all(.full_triggers[]; type == "string")
+     and (.wrappers | type == "object")
+     and all(.wrappers | to_entries[];
+       (.value | type == "array")
+       and all(.value[]; type == "string"))
+   ' "$GRAPH" >/dev/null 2>&1; then
   echo "repo-lint scope: dependency graph unavailable or invalid; failing closed" >&2
   deep=true
   full=true
