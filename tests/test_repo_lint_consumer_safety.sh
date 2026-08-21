@@ -67,6 +67,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../scripts/lib/repo-lint-check-selection.sh
+source "$ROOT/scripts/lib/repo-lint-check-selection.sh"
 
 for tool in yq node ruby rsync git python3; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -281,6 +283,9 @@ echo "test_repo_lint_consumer_safety: running $WIRED_COUNT wired checks against 
 # ---------------------------------------------------------------------------
 while IFS= read -r name; do
   [ -z "$name" ] && continue
+  if ! repo_lint_check_is_selected "$name"; then
+    continue
+  fi
   set +e
   out=$(
     cd "$FIX" && \

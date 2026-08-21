@@ -160,6 +160,8 @@ if [ "${MERGEPATH_RESIDUE_SANDBOX:-0}" = "1" ]; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../scripts/lib/repo-lint-check-selection.sh
+source "$ROOT/scripts/lib/repo-lint-check-selection.sh"
 
 for tool in yq git rsync timeout; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -1122,6 +1124,10 @@ while IFS= read -r f; do
     fail "$name: STALE MARKER_ONLY_CONSUMER_GATES entry — H is non-empty now ($(printf '%s' "$H" | tr '\n' ' ')), so the wrapper IS enrolled in the lattice. Delete its entry."
   fi
 
+  if ! repo_lint_check_is_selected "$name"; then
+    continue
+  fi
+
   ENTANGLED=$((ENTANGLED + 1))
 
   # ALLOW_LIST bookkeeping cross-check — NOT an independent derivation.
@@ -1186,7 +1192,7 @@ done <<EOF
 $(find "$ROOT/scripts/ci" -maxdepth 1 -type f -name 'check_*' | LC_ALL=C sort)
 EOF
 
-if [ "$ENTANGLED" -eq 0 ]; then
+if [ "$ENTANGLED" -eq 0 ] && [ "$REPO_LINT_SELECTION_FULL" = "true" ]; then
   fail "zero hub-entangled wrappers found — the H(W) derivation is broken (it should find ~25)"
 fi
 

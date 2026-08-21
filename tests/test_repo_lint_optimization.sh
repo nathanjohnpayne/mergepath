@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCOPE="$ROOT/scripts/ci/repo-lint-scope.sh"
+DEPENDENCIES="$ROOT/scripts/ci/repo-lint-dependencies.json"
 REPO_LINT="$ROOT/.github/workflows/repo_lint.yml"
 MD_WRAP="$ROOT/.github/workflows/md-prose-wrap.yml"
 OWL="$ROOT/.github/workflows/owl-rules-check.yml"
@@ -12,6 +13,9 @@ TOKEN_WRAPPER="$ROOT/scripts/ci/check_no_token_in_output"
 DOC_WRAPPER="$ROOT/scripts/ci/check_doc_ownership"
 CONSUMER_VERDICT="$ROOT/scripts/ci/repo-lint-consumer-verdict.sh"
 MODE_HELPER="$ROOT/scripts/lib/ci-check-modes.sh"
+SELECTION_HELPER="$ROOT/scripts/lib/repo-lint-check-selection.sh"
+CONSUMER_HARNESS="$ROOT/tests/test_repo_lint_consumer_safety.sh"
+RESIDUE_HARNESS="$ROOT/tests/test_consumer_residue_safety.sh"
 
 PASS=0
 FAIL=0
@@ -32,10 +36,16 @@ classify() {
   printf '%s\n' "$@" | bash "$SCOPE" --event "$event"
 }
 
+scope_value() {
+  local key="$1" event="$2"
+  shift 2
+  classify "$event" "$@" | sed -n "s/^${key}=//p"
+}
+
 if [ ! -f "$SCOPE" ]; then
   fail "repo-lint scope classifier exists"
 else
-  if [ "$(classify pull_request docs/README.md plans/example.md)" = "deep=false" ]; then
+  if [ "$(scope_value deep pull_request docs/README.md plans/example.md)" = "false" ]; then
     pass "ordinary documentation changes stay on the fast required lane"
   else
     fail "ordinary documentation changes should not request deep CI"
@@ -53,25 +63,53 @@ else
     .repo-template.yml \
     REVIEW_POLICY.md \
     ai_agent_tooling_standard.md; do
-    if [ "$(classify pull_request "$path")" = "deep=true" ]; then
+    if [ "$(scope_value deep pull_request "$path")" = "true" ]; then
       pass "$path requests deep CI"
     else
       fail "$path must request deep CI"
     fi
   done
 
-  if [ "$(classify push docs/README.md)" = "deep=true" ] \
-     && [ "$(classify schedule docs/README.md)" = "deep=true" ] \
-     && [ "$(classify workflow_dispatch docs/README.md)" = "deep=true" ]; then
+  if [ "$(scope_value full push docs/README.md)" = "true" ] \
+     && [ "$(scope_value full schedule docs/README.md)" = "true" ] \
+     && [ "$(scope_value full workflow_dispatch docs/README.md)" = "true" ]; then
     pass "main pushes, schedules, and manual runs execute the full regression surface"
   else
     fail "non-PR events must fail closed to deep CI"
   fi
 
-  if [ "$(printf '' | bash "$SCOPE" --event pull_request)" = "deep=false" ]; then
+  if [ "$(printf '' | bash "$SCOPE" --event pull_request | sed -n 's/^deep=//p')" = "false" ]; then
     pass "an empty PR diff does not invent deep work"
   else
     fail "an empty PR diff should stay fast"
+  fi
+
+  if [ ! -f "$DEPENDENCIES" ] || ! jq -e '.version == 1 and (.wrappers | type == "object") and (.full_triggers | type == "array")' "$DEPENDENCIES" >/dev/null 2>&1; then
+    fail "repo-lint exposes a versioned machine-readable wrapper dependency graph"
+  else
+    pass "repo-lint exposes a versioned machine-readable wrapper dependency graph"
+  fi
+
+  selected=$(scope_value checks pull_request scripts/ci/check_no_token_in_output)
+  if jq -e 'index("check_no_token_in_output") != null and length == 1' <<<"$selected" >/dev/null 2>&1 \
+     && [ "$(scope_value full pull_request scripts/ci/check_no_token_in_output)" = "false" ]; then
+    pass "a direct wrapper change selects only that wrapper's expensive checks"
+  else
+    fail "a direct wrapper change must produce a partial affected-wrapper selection (got $selected)"
+  fi
+
+  selected=$(scope_value checks pull_request scripts/ci/token_output_gate.py)
+  if jq -e 'index("check_no_token_in_output") != null' <<<"$selected" >/dev/null 2>&1; then
+    pass "a declared dependency change selects its owning wrapper"
+  else
+    fail "declared dependencies must select their owning wrappers (got $selected)"
+  fi
+
+  if [ "$(scope_value full pull_request scripts/ci/repo-lint-scope.sh)" = "true" ] \
+     && [ "$(scope_value checks pull_request scripts/ci/repo-lint-scope.sh)" = '[]' ]; then
+    pass "classifier and graph changes fail closed to the full deep surface"
+  else
+    fail "scope infrastructure changes must select the full deep surface"
   fi
 fi
 
@@ -105,10 +143,10 @@ else
     fail "repo-lint must expose the daily deep-CI schedule and manual trigger"
   fi
 
-  if yq -e '.jobs.scope.outputs.deep == "${{ steps.classify.outputs.deep }}" and (.jobs.scope.steps[] | select(.id == "classify") | .run | contains("repo-lint-scope.sh"))' "$REPO_LINT" >/dev/null; then
-    pass "repo-lint publishes one parsed deep-CI scope decision"
+  if yq -e '.jobs.scope.outputs.deep == "${{ steps.classify.outputs.deep }}" and .jobs.scope.outputs.full == "${{ steps.classify.outputs.full }}" and .jobs.scope.outputs.checks == "${{ steps.classify.outputs.checks }}" and (.jobs.scope.steps[] | select(.id == "classify") | .run | contains("repo-lint-scope.sh"))' "$REPO_LINT" >/dev/null; then
+    pass "repo-lint publishes one parsed affected-wrapper scope decision"
   else
-    fail "repo-lint must classify and publish the deep-CI scope once"
+    fail "repo-lint must classify and publish deep/full/check scope once"
   fi
 
   if yq -e '.jobs.deep_safety.needs == "scope" and .jobs.deep_safety.if == "needs.scope.outputs.deep == '\''true'\''" and (.jobs.deep_safety.strategy.matrix.safety | contains(["consumer", "residue"]))' "$REPO_LINT" >/dev/null; then
@@ -142,7 +180,7 @@ else
 
   governance_modes_ok=1
   for name in check_coderabbit_wait check_merge_clearance_gate check_phase_4b_automation check_phase_4b_accounting; do
-    name="$name" yq -e '([.jobs.lint_fast.steps[] | select(.name == strenv(name)) | .run | contains("--check")] | any) and ([.jobs.deep_safety.steps[] | select(.name == (strenv(name) + " --self-test")) | .run | contains("--self-test")] | any)' "$REPO_LINT" >/dev/null || governance_modes_ok=0
+    name="$name" yq -e '([.jobs.lint_fast.steps[] | select(.name == strenv(name)) | .run | contains("--check")] | any) and ([.jobs.deep_safety.steps[] | select(.name == (strenv(name) + " --self-test")) | select((.if | contains("needs.scope.outputs.full")) and (.if | contains("needs.scope.outputs.checks"))) | .run | contains("--self-test")] | any)' "$REPO_LINT" >/dev/null || governance_modes_ok=0
   done
   if [ "$governance_modes_ok" -eq 1 ]; then
     pass "governance wrappers keep live structure fast and move regression suites to deep CI"
@@ -177,6 +215,44 @@ else
   else
     fail "agent-review must continue to enforce a present repo_lint_local.yml annex"
   fi
+fi
+
+if [ ! -f "$SELECTION_HELPER" ]; then
+  fail "shared affected-wrapper selector exists"
+else
+  if REPO_LINT_FULL=false REPO_LINT_CHECKS_JSON='["check_doc_ownership"]' \
+       bash -c '. "$1"; repo_lint_check_is_selected check_doc_ownership && ! repo_lint_check_is_selected check_no_token_in_output' _ "$SELECTION_HELPER"; then
+    pass "shared selector admits only wrappers named by a partial selection"
+  else
+    fail "shared selector must filter a partial wrapper selection"
+  fi
+  if REPO_LINT_FULL=true REPO_LINT_CHECKS_JSON='[]' \
+       bash -c '. "$1"; repo_lint_check_is_selected check_anything' _ "$SELECTION_HELPER"; then
+    pass "shared selector admits every wrapper for a full selection"
+  else
+    fail "shared selector must admit every wrapper for a full selection"
+  fi
+  if REPO_LINT_FULL=false REPO_LINT_CHECKS_JSON='not-json' \
+       bash -c '. "$1"' _ "$SELECTION_HELPER" >/dev/null 2>&1; then
+    fail "shared selector must fail closed on malformed selection JSON"
+  else
+    pass "shared selector rejects malformed selection JSON"
+  fi
+fi
+
+for harness in "$CONSUMER_HARNESS" "$RESIDUE_HARNESS"; do
+  if grep -Fq 'repo-lint-check-selection.sh' "$harness" \
+     && grep -Fq 'repo_lint_check_is_selected' "$harness"; then
+    pass "${harness##*/} applies the shared affected-wrapper selection"
+  else
+    fail "${harness##*/} must filter expensive probes through the shared selector"
+  fi
+done
+
+if yq -e '.jobs.deep_safety.env.REPO_LINT_FULL == "${{ needs.scope.outputs.full }}" and .jobs.deep_safety.env.REPO_LINT_CHECKS_JSON == "${{ needs.scope.outputs.checks }}"' "$REPO_LINT" >/dev/null; then
+  pass "deep-safety passes the classifier selection to both harness legs"
+else
+  fail "deep-safety must consume the classifier full/check outputs"
 fi
 
 if [ -f "$MODE_HELPER" ]; then

@@ -65,6 +65,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       deep: ${{ steps.classify.outputs.deep }}
+      full: ${{ steps.classify.outputs.full }}
+      checks: ${{ steps.classify.outputs.checks }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -87,6 +89,8 @@ jobs:
             fi
             if [ -n "${GITHUB_OUTPUT:-}" ]; then
               echo "deep=false" >> "$GITHUB_OUTPUT"
+              echo "full=false" >> "$GITHUB_OUTPUT"
+              echo "checks=[]" >> "$GITHUB_OUTPUT"
             fi
             echo "repo-lint scope: consumer skipped the scripts/ci kit"
             exit 0
@@ -98,7 +102,11 @@ jobs:
               && changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA"); then
             printf '%s\n' "$changed" | bash "$classifier" --event "$EVENT_NAME"
           else
-            echo "deep=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "deep=true"
+              echo "full=true"
+              echo "checks=[]"
+            } >> "$GITHUB_OUTPUT"
             echo "repo-lint scope: PR diff unavailable; failing closed to deep CI"
           fi
 
@@ -802,6 +810,9 @@ jobs:
     needs: scope
     if: needs.scope.outputs.deep == 'true'
     runs-on: ubuntu-latest
+    env:
+      REPO_LINT_FULL: ${{ needs.scope.outputs.full }}
+      REPO_LINT_CHECKS_JSON: ${{ needs.scope.outputs.checks }}
     strategy:
       fail-fast: false
       matrix:
@@ -842,27 +853,27 @@ jobs:
           fi
 
       - name: check_no_token_in_output --self-test
-        if: matrix.safety == 'consumer'
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_no_token_in_output'))
         run: ./scripts/ci/check_no_token_in_output --self-test || { rc=$?; if [ ! -f scripts/ci/check_no_token_in_output ]; then echo "check_no_token_in_output not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_doc_ownership --self-test
-        if: matrix.safety == 'consumer'
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_doc_ownership'))
         run: ./scripts/ci/check_doc_ownership --self-test || { rc=$?; if [ ! -f scripts/ci/check_doc_ownership ]; then echo "check_doc_ownership not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_coderabbit_wait --self-test
-        if: matrix.safety == 'consumer'
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_coderabbit_wait'))
         run: ./scripts/ci/check_coderabbit_wait --self-test || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_wait ]; then echo "check_coderabbit_wait not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_merge_clearance_gate --self-test
-        if: matrix.safety == 'consumer'
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_merge_clearance_gate'))
         run: ./scripts/ci/check_merge_clearance_gate --self-test || { rc=$?; if [ ! -f scripts/ci/check_merge_clearance_gate ]; then echo "check_merge_clearance_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_automation --self-test
-        if: matrix.safety == 'consumer'
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_phase_4b_automation'))
         run: ./scripts/ci/check_phase_4b_automation --self-test || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_automation ]; then echo "check_phase_4b_automation not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_accounting --self-test
-        if: matrix.safety == 'consumer'
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_phase_4b_accounting'))
         run: ./scripts/ci/check_phase_4b_accounting --self-test || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_accounting ]; then echo "check_phase_4b_accounting not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_repo_lint_consumer_safety
