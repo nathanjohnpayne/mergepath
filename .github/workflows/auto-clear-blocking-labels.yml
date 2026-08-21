@@ -590,6 +590,7 @@ jobs:
             ' "$CONFIG")
             [ "$val" = "false" ] && enabled=false
           fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
           if [ "$enabled" = "false" ]; then
             echo "Scheduled sweep disabled for $REPO via review-policy.yml; skipping."
             echo "prs=" >> "$GITHUB_OUTPUT"
@@ -736,6 +737,7 @@ jobs:
 
       - name: Find open approved PRs for the continuation backstop
         id: approved
+        if: steps.find.outputs.enabled != 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -764,7 +766,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Continue approved PRs after custom-workflow completions
-        if: steps.approved.outputs.prs != ''
+        if: steps.find.outputs.enabled != 'false' && steps.approved.outputs.prs != ''
         env:
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           PRS: ${{ steps.approved.outputs.prs }}

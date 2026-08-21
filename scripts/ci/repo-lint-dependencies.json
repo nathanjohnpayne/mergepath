@@ -28,21 +28,27 @@
       "tests/test_check_doc_ownership.sh"
     ],
     "check_coderabbit_wait": [
+      "scripts/lib/ci-check-modes.sh",
       "scripts/coderabbit-wait.sh",
       "tests/test_coderabbit_wait_*.sh",
       "tests/test_coderabbit_automerge_rate_limit_gate.sh"
     ],
     "check_merge_clearance_gate": [
+      "scripts/lib/ci-check-modes.sh",
       "scripts/merge-clearance-gate.sh",
       "tests/test_merge_clearance_gate.sh",
       "tests/test_465_fail_closed.sh"
     ],
     "check_phase_4b_automation": [
+      "scripts/lib/ci-check-modes.sh",
       "scripts/phase-4b-review.sh",
       "scripts/phase-4b/*",
       "tests/test_phase_4b_automation.sh"
     ],
     "check_phase_4b_accounting": [
+      "scripts/lib/ci-check-modes.sh",
+      "scripts/phase-4b-review.sh",
+      "scripts/phase-4b/*",
       "scripts/phase-4b/accounting.sh",
       "scripts/phase-4b/accounting.schema.json",
       "scripts/phase-4b/prices.json",

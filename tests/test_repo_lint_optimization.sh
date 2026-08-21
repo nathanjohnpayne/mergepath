@@ -106,6 +106,30 @@ else
     fail "declared dependencies must select their owning wrappers (got $selected)"
   fi
 
+  selected=$(scope_value checks pull_request scripts/lib/ci-check-modes.sh)
+  if jq -e '
+      length == 5
+      and (index("check_doc_ownership") != null)
+      and (index("check_coderabbit_wait") != null)
+      and (index("check_merge_clearance_gate") != null)
+      and (index("check_phase_4b_automation") != null)
+      and (index("check_phase_4b_accounting") != null)
+    ' <<<"$selected" >/dev/null 2>&1; then
+    pass "the shared mode selector selects every wrapper that sources it"
+  else
+    fail "ci-check-modes.sh must select every sourcing wrapper (got $selected)"
+  fi
+
+  selected=$(scope_value checks pull_request scripts/phase-4b-review.sh)
+  if jq -e '
+      index("check_phase_4b_automation") != null
+      and index("check_phase_4b_accounting") != null
+    ' <<<"$selected" >/dev/null 2>&1; then
+    pass "Phase 4b orchestrator changes select automation and accounting regressions"
+  else
+    fail "phase-4b-review.sh must select both Phase 4b wrappers (got $selected)"
+  fi
+
   if [ "$(scope_value full pull_request scripts/ci/repo-lint-scope.sh)" = "true" ] \
      && [ "$(scope_value checks pull_request scripts/ci/repo-lint-scope.sh)" = '[]' ]; then
     pass "classifier and graph changes fail closed to the full deep surface"

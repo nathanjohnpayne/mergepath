@@ -187,12 +187,14 @@ done
 # PRs as a bounded general backstop (#1062).
 if grep -qF -- "--search 'review:approved'" "$WORKFLOW" \
    && grep -qF -- 'Continue approved PRs after custom-workflow completions' "$WORKFLOW" \
-   && grep -qF -- 'scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"' "$WORKFLOW"; then
+   && grep -qF -- 'scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"' "$WORKFLOW" \
+   && grep -qF -- 'echo "enabled=$enabled" >> "$GITHUB_OUTPUT"' "$WORKFLOW" \
+   && [ "$(grep -cF "steps.find.outputs.enabled != 'false'" "$WORKFLOW")" -eq 2 ]; then
   pass=$((pass + 1))
-  echo "  PASS: scheduled sweep backstops custom annex workflow names (#1062)"
+  echo "  PASS: enabled scheduled sweep backstops custom annex workflow names and preserves the opt-out (#1062)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: scheduled sweep must continue approved PRs whose custom annex name cannot appear in workflow_run.workflows (#1062)" >&2
+  echo "  FAIL: scheduled sweep must continue approved PRs whose custom annex name cannot appear in workflow_run.workflows, while honoring scheduled_sweep_enabled:false (#1062)" >&2
 fi
 
 # #730: the pull_request_target trigger must include `edited` so a body-edit
