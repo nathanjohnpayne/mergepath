@@ -83,8 +83,25 @@ chmod +x "$STUB_DIR/gh"
 # else its own default) — the OP_PREFLIGHT_TTL_SECONDS line written into
 # the file is inert for that comparison, so fixtures elsewhere in this file
 # that still carry a 14400 line are unaffected by the #765 default bump.
+# Resolve the op:// reference the SCRIPT maps this agent to, by reading the
+# script rather than restating its table here. A fixture that hardcoded the
+# item would silently stop matching the moment the map changed -- which is the
+# exact failure this field exists to catch, so the fixture must not be able to
+# reproduce it.
+source_ref_for_agent() {
+  local agent="$1" item
+  item=$(sed -n "s/^[[:space:]]*${agent})[[:space:]]*echo \"\([a-z0-9]\{26\}\)\".*/\1/p" "$SCRIPT" | head -1)
+  if [ -z "$item" ]; then
+    echo "FIXTURE ERROR: cannot derive the 1Password item for agent '$agent' from $SCRIPT" >&2
+    echo "(reviewer_pat_item_for's shape changed; update source_ref_for_agent)" >&2
+    exit 1
+  fi
+  printf 'op://Private/%s/token' "$item"
+}
+
 make_aged_cache() {
   local dir="$1" agent="$2" age_seconds="$3" reviewer_pat="$4" author_pat="$5"
+  local source_ref="${6:-$(source_ref_for_agent "$agent")}"
   mkdir -p "$dir"
   chmod 700 "$dir"
   local epoch
@@ -98,14 +115,66 @@ OP_PREFLIGHT_MODE=review
 OP_PREFLIGHT_DONE=1
 OP_PREFLIGHT_REVIEWER_PAT=$reviewer_pat
 OP_PREFLIGHT_AUTHOR_PAT=$author_pat
+OP_PREFLIGHT_REVIEWER_PAT_SOURCE_REF=$source_ref
 EOF
   chmod 600 "$dir/op-preflight-$agent.env"
+}
+
+# A cached token is opaque: it records the VALUE, not which 1Password item it
+# came from. So remapping an agent to a different item leaves every warm cache
+# happily serving a token minted from the OLD item until the TTL expires.
+# Measured on 2026-08-21: item o6ekjxjjl5gq6rmcneomrjahpu was repurposed from
+# codex to the nathanpayne-robot CI account, and warm codex caches kept
+# emitting a robot token after the map was corrected. Service-account token
+# mode already compared the source ref; the interactive path did not.
+test_check_rejects_cache_from_a_different_pat_item() {
+  local case_dir="$WORKDIR/case-srcref"
+  local out rc
+
+  # 1. Correct source ref -> cache is honoured.
+  make_fresh_cache "$case_dir" claude "rev-srcref-ok" "auth-srcref-ok"
+  rc=0
+  out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
+    "$SCRIPT" --agent claude --check 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "source-ref: a cache from the CURRENT item should be honoured; rc=$rc out=$out"
+    return
+  fi
+
+  # 2. Ref naming a DIFFERENT item -> refuse, so a remap takes effect at once
+  #    instead of after the TTL.
+  make_fresh_cache "$case_dir" claude "rev-srcref-old" "auth-srcref-old" \
+    "op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token"
+  rc=0
+  out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
+    "$SCRIPT" --agent claude --check 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    fail "source-ref: a cache minted from a DIFFERENT item was accepted; the remap would not take effect until the TTL expired"
+    return
+  fi
+
+  # 3. Field absent (a cache written before the field existed) -> also refuse.
+  #    Trusting an unattributable token is the same bug with less evidence.
+  make_fresh_cache "$case_dir" claude "rev-srcref-none" "auth-srcref-none"
+  grep -v '^OP_PREFLIGHT_REVIEWER_PAT_SOURCE_REF=' \
+    "$case_dir/op-preflight-claude.env" > "$case_dir/tmp.env"
+  mv "$case_dir/tmp.env" "$case_dir/op-preflight-claude.env"
+  chmod 600 "$case_dir/op-preflight-claude.env"
+  rc=0
+  out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
+    "$SCRIPT" --agent claude --check 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    fail "source-ref: a pre-change cache carrying no source ref was accepted"
+    return
+  fi
+
+  pass "a cached reviewer PAT is refused unless it names the item the agent currently maps to"
 }
 
 # Helper: synthesize a fresh cache file.
 make_fresh_cache() {
   local dir="$1" agent="$2" reviewer_pat="$3" author_pat="$4"
-  make_aged_cache "$dir" "$agent" 0 "$reviewer_pat" "$author_pat"
+  make_aged_cache "$dir" "$agent" 0 "$reviewer_pat" "$author_pat" "${5:-}"
 }
 
 # Helper: synthesize a STALE cache file — one hour older than the script's
@@ -1364,6 +1433,7 @@ test_source_gcp_adc_stale_forces_refresh
 test_deploy_mode_requires_agent
 test_deploy_full_fetch_fails_closed_on_unreadable_adc
 test_deploy_full_fetch_fail_closed_structural
+test_check_rejects_cache_from_a_different_pat_item
 test_preflight_mode_is_exported
 
 echo
