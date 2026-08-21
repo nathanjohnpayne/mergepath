@@ -841,7 +841,12 @@ while :; do
                         conclusion
                         startedAt
                         completedAt
-                        checkSuite { workflowRun { workflow { name resourcePath } } }
+                        checkSuite {
+                          workflowRun {
+                            databaseId
+                            workflow { name resourcePath }
+                          }
+                        }
                       }
                       ... on StatusContext {
                         context
@@ -879,6 +884,7 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       context: .context,
       workflowName: (.checkSuite.workflowRun.workflow.name // null),
       workflowPath: (((.checkSuite.workflowRun.workflow.resourcePath // "") | split("/") | last) // ""),
+      runId: ((.checkSuite.workflowRun.databaseId // "") | tostring),
       status: .status,
       conclusion: .conclusion,
       state: .state,
@@ -1484,13 +1490,35 @@ else
   REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s .)
 fi
 
-BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:-[]}" '
+CURRENT_RUN_ID=""
+if [ "$APPROVAL_READINESS_ONLY" = "1" ] && [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]]; then
+  CURRENT_RUN_ID="$GITHUB_RUN_ID"
+  log "gate (a): approval readiness will ignore only non-completed checks from its own trusted workflow run $CURRENT_RUN_ID"
+fi
+
+BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
+  --argjson required_names "${REQUIRED_JSON:-[]}" \
+  --arg approval_readiness_only "$APPROVAL_READINESS_ONLY" \
+  --arg current_run_id "$CURRENT_RUN_ID" '
   [.statusCheckRollup[]
     | {
         label: (.name // .context // "?"),
         workflow: (.workflowName // ""),
+        runId: (.runId // ""),
+        status: (.status // ""),
         result: (.conclusion // .state // "")
       }
+    # Approval readiness runs inside a check on the same HEAD. If branch
+    # protection is unreadable, the fail-closed full-rollup fallback would
+    # otherwise block forever on the caller itself. Exclude only non-completed
+    # checks from this exact trusted run; completed failures in this run and
+    # active checks in every other run remain blocking.
+    | select(
+        ($approval_readiness_only != "1")
+        or ($current_run_id == "")
+        or (.runId != $current_run_id)
+        or (.status == "COMPLETED")
+      )
     # Filter out the known "expected to fail during Phase 4a" check.
     # Label Gate lives in the "PR Review Policy" workflow and fails by
     # design whenever needs-external-review / needs-human-review /

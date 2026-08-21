@@ -112,10 +112,11 @@ fi
 if grep -q -- '--approval-readiness-only' "$SCRIPT" \
    && grep -q 'APPROVAL_READINESS_ONLY=1' "$SCRIPT" \
    && grep -q 'GATE_B_SAME_AGENT_REVIEWER=""' "$SCRIPT" \
+   && grep -q 'CURRENT_RUN_ID="\$GITHUB_RUN_ID"' "$SCRIPT" \
    && grep -q 'external clearance intentionally delegated to the threshold-aware merge-clearance gate' "$SCRIPT"; then
-  pass "approval-readiness mode reuses current-head CI/annex plus registered approval without imposing Phase 4 (#1062)"
+  pass "approval-readiness mode reuses current-head CI/annex plus registered approval without imposing Phase 4 or self-deadlocking (#1062)"
 else
-  fail "approval-readiness mode is missing its explicit flag, under-threshold reviewer semantics, or pre-gate-(c) return (#1062)"
+  fail "approval-readiness mode is missing its explicit flag, reviewer semantics, self-run guard, or pre-gate-(c) return (#1062)"
 fi
 
 # ── 4. Inline logic: the verdict-matching jq filter. KEEP IN SYNC with

@@ -659,10 +659,12 @@ if grep -qF 'contexts(first: 100, after: $cursor)' "$SCRIPT" \
    && grep -qF 'statusCheckRollup.contexts.pageInfo.hasNextPage // false' "$SCRIPT" \
    && grep -qF 'statusCheckRollup.contexts.pageInfo.endCursor // ""' "$SCRIPT" \
    && grep -qF 'workflow { name resourcePath }' "$SCRIPT" \
+   && grep -qF 'databaseId' "$SCRIPT" \
+   && grep -qF 'runId: ((.checkSuite.workflowRun.databaseId // "") | tostring)' "$SCRIPT" \
    && grep -qF 'workflowPath: (((.checkSuite.workflowRun.workflow.resourcePath // "") | split("/") | last) // "")' "$SCRIPT"; then
-  pass "codex-review-check.sh paginates statusCheckRollup via the Relay cursor, passes null on page 1, null-coalesces empty rollup pages, and derives workflowPath from resourcePath (#655 round 13)"
+  pass "codex-review-check.sh paginates statusCheckRollup and retains workflow path/run identity"
 else
-  fail "codex-review-check.sh does not paginate the rollup, pass a null first-page cursor, null-coalesce empty pages, or derive workflowPath as expected (#655 round 13)"
+  fail "codex-review-check.sh does not paginate the rollup or retain the expected workflow path/run identity"
 fi
 NULL_ROLLUP_PAGE='{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}}}}'
 PAGE_NODES=$(printf '%s' "$NULL_ROLLUP_PAGE" | jq -c '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // [])')
@@ -672,6 +674,39 @@ if [ "$PAGE_NODES" = "[]" ] && [ "$HAS_NEXT" = "false" ] && [ -z "$END_CURSOR" ]
   pass "rollup pagination extraction treats a null statusCheckRollup as an empty final page"
 else
   fail "rollup pagination extraction should normalize null statusCheckRollup to []/false/empty, got nodes=$PAGE_NODES has_next=$HAS_NEXT cursor=$END_CURSOR"
+fi
+
+# #1062 follow-up: approval readiness executes inside Agent Review or the
+# auto-clear continuation. When protection is unreadable, the full rollup is
+# fail-closed; the caller must exclude only its own active check or it can never
+# finish. Completed failures from that same run and active checks from every
+# other run must remain visible.
+SELF_FILTER_INPUT='{"statusCheckRollup":[
+  {"name":"current-active","runId":"123","status":"IN_PROGRESS","conclusion":null},
+  {"name":"current-failed","runId":"123","status":"COMPLETED","conclusion":"FAILURE"},
+  {"name":"other-active","runId":"456","status":"IN_PROGRESS","conclusion":null},
+  {"name":"green","runId":"789","status":"COMPLETED","conclusion":"SUCCESS"}
+]}'
+SELF_FILTERED=$(printf '%s' "$SELF_FILTER_INPUT" | jq -c \
+  --arg approval_readiness_only "1" \
+  --arg current_run_id "123" '
+    [.statusCheckRollup[]
+      | {label: .name, runId: (.runId // ""), status: (.status // ""), result: (.conclusion // .state // "")}
+      | select(
+          ($approval_readiness_only != "1")
+          or ($current_run_id == "")
+          or (.runId != $current_run_id)
+          or (.status == "COMPLETED")
+        )
+      | select(.result != "SUCCESS" and .result != "SKIPPED" and .result != "NEUTRAL")
+      | .label
+    ]')
+if [ "$SELF_FILTERED" = '["current-failed","other-active"]' ] \
+   && grep -qF 'CURRENT_RUN_ID="$GITHUB_RUN_ID"' "$SCRIPT" \
+   && grep -qF 'or (.status == "COMPLETED")' "$SCRIPT"; then
+  pass "approval readiness excludes only its current run's active checks while preserving completed and cross-run blockers"
+else
+  fail "approval-readiness self-run filter is too broad or missing (got $SELF_FILTERED)"
 fi
 
 # Self-caught while writing the round-13 winner-selection below: piping a
