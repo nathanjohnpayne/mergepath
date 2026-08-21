@@ -15,11 +15,11 @@
 #
 # Round 6 (Codex P1/P2) rewrote how agent-review.yml enforces the annex:
 # rather than forcing its derived check name(s) into the hard-required
-# required_checks_json list (which deadlocked the wait loop forever on a
+# required_checks_json list (which deadlocked the old runner-held wait on a
 # path-filtered or all-matrix annex that would never report under any
 # derivable name), it now captures the annex's own workflow name
-# (annex_workflow) and runs a separate workflow-wide bad/pending scan each
-# poll iteration — the same design codex-review-check.sh gate (a) already
+# (annex_workflow) and runs a separate workflow-wide bad/pending scan in each
+# readiness evaluation — the same design codex-review-check.sh gate (a) already
 # uses for the identical reason.
 #
 # The workflow files here cannot be unit-executed without a full Actions
@@ -53,19 +53,19 @@ assert_not_grep() {  # <label> <file> <fixed-string>
 
 W=.github/workflows
 
-# agent-review.yml: the required-check wait probes the PR HEAD commit for
+# agent-review.yml: the required-check readiness probe reads the PR HEAD for
 # the annex file via the Contents API (not the job's own checkout) and
 # conditionally scans its check run(s) alongside lint.
 assert_grep "agent-review: probes for the repo_lint_local.yml annex at the PR HEAD commit (#655)" \
   "$W/agent-review.yml" 'repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$sha'
-assert_grep "agent-review: the wait loop iterates over the required_checks_json array, not one hardcoded name" \
+assert_grep "agent-review: the readiness probe evaluates the required_checks_json array, not one hardcoded name" \
   "$W/agent-review.yml" 'for ((i = 0; i < check_count; i++)); do'
 
 # Codex P2 (#655 round 6, "avoid forcing path-filtered annex jobs to
 # start"): a consumer annex scoped by workflow-level paths/paths-ignore
 # legitimately never reports under ANY derived name for an out-of-scope
 # PR, so forcing one into required_checks_json (rounds 4-5's approach)
-# made this loop wait out the full deadline and refuse auto-merge forever.
+# made the former wait refuse auto-merge forever.
 # required_checks_json must stay scoped to only the canonical check;
 # annex enforcement moves to a name-free workflow-wide scan instead.
 assert_grep "agent-review: required_checks_json stays scoped to only the canonical check (#655 round 6)" \
@@ -138,8 +138,8 @@ assert_grep "agent-review: workflow-wide annex scan matches by the stable .workf
   "$W/agent-review.yml" '[.statusCheckRollup[] | select((.workflowPath // "") == "repo_lint_local.yml")]'
 assert_grep "agent-review: a bad conclusion reported anywhere in the annex's workflow refuses auto-merge immediately (#655 round 6)" \
   "$W/agent-review.yml" 'non-passing reported check-run(s) after winner-selection on current HEAD $sha (conclusion=$annex_bad_summary); refusing auto-merge (#655)'
-assert_grep "agent-review: a still-in-progress annex entry is treated as pending (keeps polling), not as a failure (#655 round 6)" \
-  "$W/agent-review.yml" 'check-run(s) still in progress on current HEAD $sha; waiting for completion (#655)'
+assert_grep "agent-review: a still-in-progress annex entry is treated as not-ready, not as a failure (#655 round 6)" \
+  "$W/agent-review.yml" 'check-run(s) still in progress on current HEAD $sha; not ready (#655)'
 assert_grep "agent-review: workflow query requests resourcePath alongside name to derive the stable workflowPath (#655 round 13)" \
   "$W/agent-review.yml" 'checkSuite { workflowRun { workflow { name resourcePath } } }'
 assert_grep "agent-review: rollup_json derives workflowPath from resourcePath's final path segment (#655 round 13)" \
@@ -198,8 +198,8 @@ assert_grep "agent-review: requires every matched workflow group to be green, no
 # literally "PENDING" -- round 7 added "EXPECTED" (GitHub's "waiting for a
 # status to be reported" state, distinct from PENDING but equally
 # non-terminal): without it, a required external status context sitting in
-# EXPECTED aborted the wait loop as a failure instead of continuing to
-# poll. A CheckRun is non-terminal whenever .status is present and not
+# EXPECTED made the old wait abort as a failure instead of treating the
+# check as not ready. A CheckRun is non-terminal whenever .status is present and not
 # "COMPLETED". This predicate is shared by the winner selection, the
 # pending-count check, and the annex workflow-wide scan.
 assert_grep "agent-review: a status-context entry is pending when .state is PENDING or EXPECTED, not merely lacking .status (#655 rounds 6-7)" \
@@ -261,7 +261,7 @@ assert_grep "agent-review: alias token-count guard requires a line-anchored dash
 # optional.
 assert_grep "agent-review: reads the on: trigger via the true-key fallback (YAML 1.1 Norway-problem coercion) (#655 round 7)" \
   "$W/agent-review.yml" 'on = doc.key?("on") ? doc["on"] : doc[true]'
-assert_grep "agent-review: keeps polling (does not silently pass) when an unfiltered annex has zero reported entries (#655 round 7)" \
+assert_grep "agent-review: reports not-ready when an unfiltered annex has zero reported entries (#655 round 7)" \
   "$W/agent-review.yml" 'if [ "$annex_match_count" -eq 0 ] && [ "$annex_unfiltered" = "true" ]; then'
 assert_grep "agent-review: a path-filtered annex with zero reported entries still does not block (Finding O, round 6, preserved)" \
   "$W/agent-review.yml" 'has not reported yet (unfiltered trigger, so it is expected to)'
@@ -515,7 +515,7 @@ assert_not_grep "agent-review: does not accumulate the rollup through an unbound
 # behavioral half cannot fail — the explicit two-net lesson recorded in
 # the #750 test comments.
 echo ""
-echo "agent-review.yml oversized rollup accumulation — the wait loop survives a >128KB running total (#752/#754)"
+echo "agent-review.yml oversized rollup accumulation — the readiness probe survives a >128KB running total (#752/#754)"
 
 if [ ! -f "$W/agent-review.yml" ]; then
   echo "SKIP: agent-review.yml oversized rollup behavioral test (file absent)"; SKIP=$((SKIP + 1))
@@ -625,6 +625,14 @@ assert_grep "auto-clear: workflow_run trigger list includes repo-lint-local (#65
 assert_grep "auto-clear: workflow_run trigger list also includes the unnamed-annex file-path fallback name (#655 round 11)" \
   "$W/auto-clear-blocking-labels.yml" '- ".github/workflows/repo_lint_local.yml"'
 
+# A named annex is intentionally unconstrained, while workflow_run accepts
+# only literal display names. The existing scheduled sweep therefore needs a
+# general approved-PR continuation backstop for custom annex names (#1062).
+assert_grep "auto-clear: scheduled sweep finds approved PRs that a custom annex name cannot wake" \
+  "$W/auto-clear-blocking-labels.yml" "--search 'review:approved'"
+assert_grep "auto-clear: scheduled sweep re-enters the trusted approval continuation for custom annex names" \
+  "$W/auto-clear-blocking-labels.yml" 'Continue approved PRs after custom-workflow completions'
+
 # ── Bash syntax check on every agent-review.yml `run:` block. Catches
 #    heredoc/subshell/loop errors the grep assertions above cannot (mirrors
 #    check_auto_clear_workflow's equivalent check for its own file — no
@@ -674,275 +682,18 @@ else
   echo "SKIP: agent-review.yml bash syntax test (file absent)"; SKIP=$((SKIP + 1))
 fi
 
-# ── #1024: the required-check wait loop's API cost shape ───────────────
-#
-# The "Require current-head check success" step runs under
-# AUTHOR_MERGE_TOKEN (nathanjohnpayne, user id 23488723). Before #1024 it
-# polled on a FLAT 15s cadence for up to 1200s (80 iterations) and
-# re-walked the ENTIRE paginated statusCheckRollup on every one of them --
-# 2 GraphQL queries per poll on a PR with >100 contexts, so up to 160 per
-# run, per push, per PR. That is the measured source of the "API rate
-# limit already exceeded for user ID 23488723" failures that repeatedly
-# broke merges.
-#
-# These cases EXECUTE the real step script against a stubbed `gh` and a
-# stubbed `sleep`, so they assert behavior (how many requests a fixture
-# run actually issues, and how long it actually waits between polls)
-# rather than the shape of a YAML line. The script and its cadence
-# defaults are lifted out of the workflow through a YAML PARSE, not a
-# grep, so the numbers under test are the shipped ones.
-#
-# The safety half matters more than the cheap half: case 2 pins that the
-# loop still refuses to call a PR green while a required context is
-# pending on a page it would have to fetch to see.
-echo ""
-echo "agent-review.yml required-check wait loop — poll cadence and rollup request shape (#1024)"
-
-WL_STEP_NAME="Require current-head check success"
-
+# ── #1024/#1062: approval readiness is a one-shot probe ──────────
 if [ ! -f "$W/agent-review.yml" ]; then
-  echo "SKIP: #1024 wait-loop behavioral tests (agent-review.yml absent)"; SKIP=$((SKIP + 1))
-elif ! command -v ruby >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-  echo "SKIP: #1024 wait-loop behavioral tests (ruby or jq unavailable)"; SKIP=$((SKIP + 1))
+  echo "SKIP: #1062 approval readiness contract (agent-review.yml absent)"; SKIP=$((SKIP + 1))
+elif grep -Fq "name: Probe current-head check readiness once" "$W/agent-review.yml" \
+     && grep -Fq 'echo "ready=false" >> "$GITHUB_OUTPUT"' "$W/agent-review.yml" \
+     && grep -Fq "completed-workflow continuation" "$W/agent-review.yml" \
+     && ! grep -Fq "for readiness_probe in 1; do" "$W/agent-review.yml" \
+     && ! grep -Fq "TEST_CHECK_WAIT_SECONDS" "$W/agent-review.yml" \
+     && ! grep -Fq 'sleep "$poll_seconds"' "$W/agent-review.yml"; then
+  pass "#1062: approval readiness probes once, records pending state, and never polls"
 else
-  WL_ROOT=$(mktemp -d)
-  mkdir -p "$WL_ROOT/bin" "$WL_ROOT/state"
-
-  # Parse-the-document extraction: the step's `run:` body and its literal
-  # `env:` defaults come out of a real YAML load keyed on the step NAME.
-  # Entries carrying a `${{ }}` expression are dropped (the harness
-  # supplies those); everything else -- the cadence knobs this change is
-  # about -- is used exactly as shipped.
-  WL_EXTRACT_RC=0
-  ruby -ryaml -e '
-    doc = YAML.safe_load(File.read(ARGV[0]), aliases: true)
-    step = nil
-    (doc["jobs"] || {}).each_value do |job|
-      next unless job.is_a?(Hash)
-      (job["steps"] || []).each { |s| step = s if s.is_a?(Hash) && s["name"] == ARGV[1] }
-    end
-    abort("step not found or has no run: body") if step.nil? || step["run"].nil?
-    File.write(ARGV[2], step["run"])
-    env = (step["env"] || {}).reject { |_k, v| v.to_s.include?("${{") }
-    File.write(ARGV[3], env.map { |k, v| "#{k}=#{v}" }.join("\n") + "\n")
-  ' "$W/agent-review.yml" "$WL_STEP_NAME" "$WL_ROOT/step.sh" "$WL_ROOT/step.env" \
-    2>"$WL_ROOT/extract.err" || WL_EXTRACT_RC=$?
-
-  if [ "$WL_EXTRACT_RC" -ne 0 ]; then
-    fail "#1024 wait loop: could not extract the '$WL_STEP_NAME' step from agent-review.yml ($(tr '\n' ' ' <"$WL_ROOT/extract.err"))"
-  else
-    # ── stub gh ──────────────────────────────────────────────────────
-    cat >"$WL_ROOT/bin/gh" <<'WL_GH_STUB'
-#!/usr/bin/env bash
-set -uo pipefail
-sub="${1:-}"; shift || true
-case "$sub" in
-  pr)
-    printf '%s' '{"headRefOid":"cafef00dcafef00d","isCrossRepository":false,"baseRefName":"main","headRefName":"feature"}'
-    exit 0
-    ;;
-  api) : ;;
-  *) echo "stub gh: unexpected subcommand '$sub'" >&2; exit 90 ;;
-esac
-args="$*"
-case "$args" in
-  graphql*)
-    page=2
-    for a in "$@"; do
-      if [ "$a" = "cursor=null" ]; then page=1; fi
-    done
-    if [ "$page" = "1" ]; then
-      polls=$(( $(cat "$STUB_STATE/polls") + 1 ))
-      printf '%s' "$polls" > "$STUB_STATE/polls"
-    fi
-    echo "page$page" >> "$STUB_STATE/gh.log"
-    exec "$STUB_STATE/page.sh" "$page" "$(cat "$STUB_STATE/polls")"
-    ;;
-  *repo_lint_local.yml*)
-    # No annex in this fixture: a confirmed 404, the mergepath case.
-    echo 'gh: Not Found (HTTP 404)' >&2
-    exit 1
-    ;;
-  *pulls/*files*)
-    printf '%s' '[]'
-    exit 0
-    ;;
-esac
-echo "stub gh: unexpected api call: $args" >&2
-exit 91
-WL_GH_STUB
-
-    # ── stub sleep: instant, records the requested duration, and trips a
-    #    circuit breaker so a non-terminating loop fails the test rather
-    #    than hanging the suite.
-    cat >"$WL_ROOT/bin/sleep" <<'WL_SLEEP_STUB'
-#!/usr/bin/env bash
-set -uo pipefail
-echo "$1" >> "$STUB_STATE/sleeps"
-if [ "$(wc -l <"$STUB_STATE/sleeps")" -gt 60 ]; then
-  echo "stub sleep: circuit breaker (>60 polls)" >&2
-  exit 1
-fi
-exit 0
-WL_SLEEP_STUB
-
-    # ── rollup page fixtures ─────────────────────────────────────────
-    cat >"$WL_ROOT/state/page.sh" <<'WL_PAGE_STUB'
-#!/usr/bin/env bash
-set -euo pipefail
-page="$1"; poll="$2"
-if [ "$poll" -gt "${FLIP_AFTER:-0}" ]; then green=1; else green=0; fi
-
-mk() {  # name status conclusion isRequired workflow completedAt
-  jq -cn --arg name "$1" --arg status "$2" --arg concl "$3" \
-         --argjson req "$4" --arg wf "$5" --arg done_at "$6" '
-    {__typename: "CheckRun",
-     name: $name,
-     status: $status,
-     conclusion: (if $concl == "" then null else $concl end),
-     startedAt: "2026-01-01T00:00:00Z",
-     completedAt: (if $done_at == "" then null else $done_at end),
-     isRequired: $req,
-     checkSuite: {workflowRun: {workflow: {name: $wf, resourcePath: ("/o/r/workflows/" + $wf + ".yml")}}}}'
-}
-wrap() {  # nodes-json hasNextPage endCursor
-  jq -cn --argjson nodes "$1" --argjson hasnext "$2" --arg cur "$3" '
-    {data: {repository: {pullRequest: {commits: {nodes: [{commit: {statusCheckRollup:
-      {contexts: {pageInfo: {hasNextPage: $hasnext, endCursor: $cur}, nodes: $nodes}}}}]}}}}}'
-}
-
-case "${FIXTURE_MODE}" in
-  pending-page1)
-    # The required `lint` sits on page 1 and is still queued: the pages
-    # beyond it cannot change this poll's verdict.
-    if [ "$page" = "1" ]; then
-      if [ "$green" = "1" ]; then
-        lint=$(mk lint COMPLETED SUCCESS true agent-review "2026-01-01T00:05:00Z")
-      else
-        lint=$(mk lint QUEUED "" true agent-review "")
-      fi
-      other=$(mk docs COMPLETED SUCCESS false docs "2026-01-01T00:04:00Z")
-      wrap "$(jq -cn --argjson a "$lint" --argjson b "$other" '[$a, $b]')" true "CURSOR1"
-    else
-      pad=$(mk codeql COMPLETED SUCCESS false codeql "2026-01-01T00:04:00Z")
-      wrap "$(jq -cn --argjson a "$pad" '[$a]')" false ""
-    fi
-    ;;
-  stale-then-pending-page2)
-    # The #655-round-5 stale-vs-pending shape, split across pages: page 1
-    # holds a COMPLETED/SUCCESS `lint` from an earlier trigger, page 2 the
-    # still-QUEUED rerun. Concluding from page 1 alone reports green while
-    # a required check is pending -- the exact failure a cheaper loop must
-    # not introduce.
-    if [ "$page" = "1" ]; then
-      stale=$(mk lint COMPLETED SUCCESS true agent-review "2026-01-01T00:01:00Z")
-      wrap "$(jq -cn --argjson a "$stale" '[$a]')" true "CURSOR1"
-    else
-      if [ "$green" = "1" ]; then
-        rerun=$(mk lint COMPLETED SUCCESS true agent-review "2026-01-01T00:09:00Z")
-      else
-        rerun=$(mk lint QUEUED "" true agent-review "")
-      fi
-      wrap "$(jq -cn --argjson a "$rerun" '[$a]')" false ""
-    fi
-    ;;
-  *)
-    echo "page.sh: unknown FIXTURE_MODE '${FIXTURE_MODE}'" >&2
-    exit 92
-    ;;
-esac
-WL_PAGE_STUB
-
-    chmod +x "$WL_ROOT/bin/gh" "$WL_ROOT/bin/sleep" "$WL_ROOT/state/page.sh"
-
-    # Runs the extracted step end to end. Echoes the exit code; leaves the
-    # request log, the sleep log and the poll counter in $WL_ROOT/state.
-    wl_run() {  # <fixture-mode> <flip-after-poll>
-      : > "$WL_ROOT/state/gh.log"
-      : > "$WL_ROOT/state/sleeps"
-      printf '0' > "$WL_ROOT/state/polls"
-      : > "$WL_ROOT/state/github_env"
-      local rc=0
-      (
-        set -a
-        # shellcheck disable=SC1090
-        . "$WL_ROOT/step.env"
-        set +a
-        export PATH="$WL_ROOT/bin:$PATH"
-        export STUB_STATE="$WL_ROOT/state"
-        export FIXTURE_MODE="$1" FLIP_AFTER="$2"
-        export PR_NUMBER=999 REPO="o/r" GH_TOKEN=stub
-        export GITHUB_ENV="$WL_ROOT/state/github_env"
-        bash -e "$WL_ROOT/step.sh"
-      ) >"$WL_ROOT/state/out" 2>&1 || rc=$?
-      echo "$rc"
-    }
-    wl_count() { grep -c "^$1\$" "$WL_ROOT/state/gh.log" || true; }
-    wl_sleeps() { tr '\n' ' ' <"$WL_ROOT/state/sleeps" | sed 's/ $//'; }
-
-    # ── Case 1: a required check pending on page 1 ───────────────────
-    #
-    # 11 polls see `lint` QUEUED, the 12th sees it green. The old loop
-    # walked both pages on every poll (24 queries) and slept a flat 15s
-    # each time; the retuned loop stops after page 1 while the verdict is
-    # already "wait" (12 page-1 queries, 1 page-2 query on the final,
-    # conclusive poll) and widens the interval once 120s of waiting has
-    # accumulated.
-    WL_RC=$(wl_run pending-page1 11)
-    WL_P1=$(wl_count page1); WL_P2=$(wl_count page2); WL_SLEEPS=$(wl_sleeps)
-
-    if [ "$WL_RC" = "0" ]; then
-      pass "#1024 case 1: the loop clears once the pending required check goes green"
-    else
-      fail "#1024 case 1: the loop did not clear on a green required check (rc=$WL_RC)"
-      sed 's/^/    /' "$WL_ROOT/state/out" | tail -20 >&2
-    fi
-    if [ "$WL_P1" = "12" ] && [ "$WL_P2" = "1" ]; then
-      pass "#1024 case 1: 12 rollup page-1 queries + 1 page-2 query (a flat re-paginating loop issues 24)"
-    else
-      fail "#1024 case 1: expected 12 page-1 / 1 page-2 rollup queries, got $WL_P1 / $WL_P2 — the loop is still re-paginating the whole rollup every poll"
-    fi
-    if [ "$WL_SLEEPS" = "15 15 15 15 15 15 15 15 30 60 60" ]; then
-      pass "#1024 case 1: poll cadence widens 15 -> 30 -> 60 after 120s of accumulated waiting"
-    else
-      fail "#1024 case 1: expected the backoff sequence '15 15 15 15 15 15 15 15 30 60 60', got '$WL_SLEEPS'"
-    fi
-
-    # ── Case 2 (the safety half): a required check pending on page 2 ──
-    #
-    # Page 1 shows only a stale COMPLETED/SUCCESS `lint`; the QUEUED rerun
-    # of that same required check is on page 2. The loop MUST page
-    # further and keep waiting -- 2 queries per poll, no early clearance
-    # -- until the page-2 entry completes. Any short-circuit that
-    # concludes from page 1 alone reports green here on the first poll.
-    WL_RC2=$(wl_run stale-then-pending-page2 3)
-    WL2_P1=$(wl_count page1); WL2_P2=$(wl_count page2); WL2_SLEEPS=$(wl_sleeps)
-
-    if [ "$WL_RC2" = "0" ] && [ "$WL2_P1" = "4" ] && [ "$WL2_P2" = "4" ]; then
-      pass "#1024 case 2: a required check pending on page 2 still blocks clearance — the loop paged further and waited 3 polls"
-    else
-      fail "#1024 case 2: expected rc=0 after 4 polls with both pages fetched each time, got rc=$WL_RC2, page1=$WL2_P1, page2=$WL2_P2 — a page-1-only loop would clear on poll 1"
-      sed 's/^/    /' "$WL_ROOT/state/out" | tail -20 >&2
-    fi
-    if [ "$WL2_SLEEPS" = "15 15 15" ]; then
-      pass "#1024 case 2: the first polls keep the fast cadence, where a fast-green check lands"
-    else
-      fail "#1024 case 2: expected the first three polls at 15s, got '$WL2_SLEEPS'"
-    fi
-
-    # The deadline stays wall-clock and unchanged; assert the shipped
-    # budget knobs are the ones this suite exercised, so a future retune
-    # that also changes the budget cannot pass on stale expectations.
-    if grep -q '^TEST_CHECK_WAIT_SECONDS=1200$' "$WL_ROOT/step.env" \
-       && grep -q '^TEST_CHECK_POLL_SECONDS=15$' "$WL_ROOT/step.env" \
-       && grep -q '^TEST_CHECK_POLL_MAX_SECONDS=60$' "$WL_ROOT/step.env" \
-       && grep -q '^TEST_CHECK_POLL_BACKOFF_AFTER_SECONDS=120$' "$WL_ROOT/step.env"; then
-      pass "#1024: the shipped step env keeps the 1200s budget and declares the 15/120/60 backoff schedule"
-    else
-      fail "#1024: the step's env: block no longer declares the expected wait budget and backoff schedule ($(tr '\n' ' ' <"$WL_ROOT/step.env"))"
-    fi
-  fi
-  rm -rf "$WL_ROOT"
+  fail "#1062: approval readiness must not retain a wait loop, poll budget, or sleep"
 fi
 
 echo ""

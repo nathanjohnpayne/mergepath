@@ -112,7 +112,9 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Auto-clear**: The sanctioned automated removal of `needs-external-review` once the clearance gate passes — one of exactly two automation exceptions to the label prohibition, both running as workflows, not agents.
 
-**Auto-merge arming**: Enabling the auto-merge path, which happens only on a qualifying approval event (with re-arm on push and settle re-arm on unlabel) — never spontaneously.
+**Auto-merge arming**: Enabling the exact-head auto-merge path after a qualifying approval. It may happen immediately when the approval event's one-shot readiness probe is green, or in the trusted approval continuation awakened by a later canonical lint, local-annex, or policy workflow completion. Every continuation reruns clearance, accounting, unresolved-conversation, head, and blocking-label checks immediately before arming. _Avoid_: runner-held polling or treating workflow completion alone as merge authority.
+
+**Approval continuation**: The trusted default-branch, event-driven merge path that treats a registered reviewer's durable approval as recorded readiness, resolves a completed workflow to the still-open PR at the exact head, and re-evaluates every mutable merge guard before arming. _Avoid_: native auto-merge armed while checks are pending, or a workflow-run SHA applied to a different live head.
 
 **Edit-nudge**: A deliberate PR body edit used purely as an event source, because a bot's issue-comment verdict fires no workflow run on its own.
 
@@ -263,6 +265,8 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 ### Testing and enforcement vocabulary
 
 **CI enforcement check**: A validation of one invariant on every commit via the repo-lint workflow — usually an executable under `scripts/ci/`, occasionally a deliberately inline workflow step. _Avoid_: "test" — many checks wrap tests but are not tests; also distinguish from required status checks and the reserved Checks surface.
+
+**Affected-wrapper selection**: The machine-readable repo-lint scope result that names the expensive `check_*` wrappers whose declared dependencies changed. Direct wrapper changes select themselves; unknown governance changes and non-PR backstops select the full surface. _Avoid_: reconstructing dependencies with source-text greps inside consumer or residue harnesses.
 
 **Repo lint**: The propagated workflow that runs the CI-check kit; its never-propagated annex holds a consumer's local steps so the canonical overwrite cannot clobber them.
 

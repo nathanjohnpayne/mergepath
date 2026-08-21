@@ -83,6 +83,7 @@ set -euo pipefail
 # --output defaults to $GITHUB_OUTPUT. Exit 2 on usage error.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCALAR_HELPER="$SCRIPT_DIR/../lib/review-policy-scalar.sh"
 
 REPO=""
 BASE_REF=""
@@ -122,6 +123,17 @@ command -v jq >/dev/null 2>&1 || { echo "load_review_config.sh: jq is required" 
 
 emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 
+if [ ! -f "$SCALAR_HELPER" ]; then
+  echo "::warning::$SCALAR_HELPER is not available in this trusted checkout; emitting fail-closed load-config outputs — empty reviewer allow-list, threshold 0."
+  emit threshold "0"
+  emit paths "[]"
+  emit reviewers "[]"
+  emit author_identity ""
+  exit 0
+fi
+# shellcheck source=../lib/review-policy-scalar.sh
+source "$SCALAR_HELPER"
+
 # Read one TOP-LEVEL scalar out of a policy file.
 #
 # This is the parser `.github/workflows/agent-review.yml`'s auto-merge job used
@@ -151,35 +163,11 @@ emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 #
 # KNOWN LIMIT — tracked in #978, deliberately not fixed here. These are a LINE
 # parser's semantics, not YAML's, and on a malformed or adversarial policy the
-# two diverge: an unterminated quote is stripped into a clean value; a `#` with
-# no separating space opens a comment here where YAML reads it as part of the
-# scalar; a repeated key (in this or any other spelling) resolves first-wins
-# where YAML consumers resolve last-wins or reject the document. All three are
-# inherited verbatim — this script RELOCATES the expression above, it neither
-# sharpens nor weakens it, and `agent-review.yml` ran exactly these semantics
-# in exactly this authorization role before #788 moved the source. All three
-# also require the policy on the PR's BASE branch to be malformed, which is
-# protected content, where the defect #788 names was reachable from any PR by
-# editing policy on its own branch. #978 carries the design of the parsing
-# contract — including whether this scalar should come from a real YAML parser
-# at all — because three review rounds each found one more spelling, which is
-# the shape that says stop patching and go design.
-policy_scalar() {  # <file> <key>
-  awk -v key="$2:" '
-    /^[^[:space:]]/ && $1 == key {
-      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/^\047/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
-      gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
-      sub(/[[:space:]]+$/, "", $0)
-      print
-      exit
-    }
-  ' "$1"
-}
-
+# two diverge: an unterminated quote is accepted as a value, and a repeated key
+# resolves first-wins where YAML consumers resolve last-wins or reject the
+# document. Both require malformed protected base-policy content. #978 carries
+# the design of the parsing contract, including whether this scalar should come
+# from a real YAML parser at all.
 # Resolve the governing policy. stderr is left attached to the caller so the
 # resolver's diagnostics land in the job log; only stdout is captured, because
 # stdout is the policy PATH and merging the streams would turn a warning into a
@@ -221,7 +209,7 @@ fi
 # `jq -c` (compact) is required: multi-line JSON cannot be written through the
 # `key=value` GITHUB_OUTPUT format (#30/#58).
 #
-# The scalars go through `policy_scalar` above rather than `grep key: | awk
+# The scalars go through shared `review_policy_scalar` rather than `grep key: | awk
 # '{print $2}'`. A missing key is not an error there either — awk simply prints
 # nothing, so a policy without the key yields the empty value the callers
 # already handle, without a `|| true` guard against `pipefail` aborting the
@@ -230,10 +218,10 @@ PATHS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" external_review_paths 
   | jq -R -s -c 'split("\n") | map(select(length > 0))')
 REVIEWERS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" available_reviewers \
   | jq -R -s -c 'split("\n") | map(select(length > 0))')
-THRESHOLD=$(policy_scalar "$CONFIG" external_review_threshold)
-AUTHOR=$(policy_scalar "$CONFIG" author_identity)
+THRESHOLD=$(review_policy_scalar "$CONFIG" external_review_threshold)
+AUTHOR=$(review_policy_scalar "$CONFIG" author_identity)
 
-# Every emitted value is a single GITHUB_OUTPUT line: `policy_scalar` stops at
+# Every emitted value is a single GITHUB_OUTPUT line: `review_policy_scalar` stops at
 # the first match (see its first-wins note), and PATHS/REVIEWERS are single-line
 # by construction because `jq -c` compacts them.
 
@@ -250,7 +238,7 @@ emit reviewers "$REVIEWERS"
 # that is readable but carries no top-level `author_identity` proves no identity
 # either — the same state the resolver-failure branch above emits empty — and it
 # is the more reachable of the two, because a policy can simply omit the key (or
-# nest it under a block, which `policy_scalar` correctly declines to match)
+# nest it under a block, which `review_policy_scalar` correctly declines to match)
 # without anything failing. Substituting a hard-coded login here would hand the
 # auto-merge step a non-empty EXPECTED_AUTHOR, skip its `[ -z ]` fail-closed
 # branch, and let AUTHOR_MERGE_TOKEN merge under an identity the governing

@@ -7,6 +7,7 @@
 #
 # Usage:
 #   scripts/codex-review-check.sh <PR_NUMBER> [REPO]
+#   scripts/codex-review-check.sh --approval-readiness-only <PR_NUMBER> [REPO]
 #
 # Arguments:
 #   PR_NUMBER  Required. The pull request number (integer).
@@ -186,8 +187,8 @@ fi
 
 # --- argument parsing -------------------------------------------------------
 
-# --diagnostic-signal-only (#814) — a FLAG, deliberately not an environment
-# variable (CodeRabbit Major on #835).
+# --diagnostic-signal-only (#814) and --approval-readiness-only (#1062) are
+# FLAGS, deliberately not environment variables (CodeRabbit Major on #835).
 #
 # It skips gate (b) and disables the #705 carry-forward so the run reports
 # purely on "did Codex speak on THIS head", which is what the same-head
@@ -199,25 +200,32 @@ fi
 # variable, or a workflow-level `env:` block, and the required gate would stop
 # checking for reviewer approval without anyone asking it to.
 #
-# A flag cannot be inherited. Callers that want the diagnostic pass it
-# explicitly; callers that do not, cannot get it by accident.
+# A flag cannot be inherited. Callers that want a narrowed read-only answer
+# pass it explicitly; callers that do not, cannot get it by accident.
 #
 # The three pre-existing env knobs are left as-is on purpose: SKIP_CI narrows
 # scope, and REQUIRE_APPROVAL_ON_HEAD=1 / ALLOW_PHASE_4B_SUBSTITUTE=false both
 # make the gate STRICTER. Inheriting those is safe in a way inheriting this
 # one is not.
 DIAGNOSTIC_SIGNAL_ONLY=0
+APPROVAL_READINESS_ONLY=0
 _crc_positional=()
 for _arg in "$@"; do
   case "$_arg" in
     --diagnostic-signal-only) DIAGNOSTIC_SIGNAL_ONLY=1 ;;
+    --approval-readiness-only) APPROVAL_READINESS_ONLY=1 ;;
     *) _crc_positional+=("$_arg") ;;
   esac
 done
 set -- ${_crc_positional[@]+"${_crc_positional[@]}"}
 
+if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ] && [ "$APPROVAL_READINESS_ONLY" = "1" ]; then
+  echo "ERROR: choose only one diagnostic mode" >&2
+  exit 3
+fi
+
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 [--diagnostic-signal-only] <PR_NUMBER> [REPO]" >&2
+  echo "Usage: $0 [--diagnostic-signal-only|--approval-readiness-only] <PR_NUMBER> [REPO]" >&2
   exit 3
 fi
 
@@ -613,6 +621,19 @@ if grep -qiE '^Authoring-Agent:' <<<"$PR_BODY"; then
   fi
 fi
 
+# The trusted completed-workflow continuation needs the shared answers to
+# gates (a) and (b) without imposing Phase 4 on an under-threshold PR. In this
+# mode, a registered reviewer approval is the durable readiness signal, so the
+# authoring agent's own reviewer identity is allowed exactly as it is on the
+# normal under-threshold path. No Codex reaction/verdict may substitute for
+# that APPROVED review. The continuation separately invokes the threshold-aware
+# merge-clearance gate immediately after this check; this mode alone is not an
+# external-review clearance decision.
+GATE_B_SAME_AGENT_REVIEWER="$SAME_AGENT_REVIEWER"
+if [ "$APPROVAL_READINESS_ONLY" = "1" ]; then
+  GATE_B_SAME_AGENT_REVIEWER=""
+fi
+
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
 
@@ -820,7 +841,12 @@ while :; do
                         conclusion
                         startedAt
                         completedAt
-                        checkSuite { workflowRun { workflow { name resourcePath } } }
+                        checkSuite {
+                          workflowRun {
+                            databaseId
+                            workflow { name resourcePath }
+                          }
+                        }
                       }
                       ... on StatusContext {
                         context
@@ -858,6 +884,7 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       context: .context,
       workflowName: (.checkSuite.workflowRun.workflow.name // null),
       workflowPath: (((.checkSuite.workflowRun.workflow.resourcePath // "") | split("/") | last) // ""),
+      runId: ((.checkSuite.workflowRun.databaseId // "") | tostring),
       status: .status,
       conclusion: .conclusion,
       state: .state,
@@ -1463,13 +1490,35 @@ else
   REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s .)
 fi
 
-BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:-[]}" '
+CURRENT_RUN_ID=""
+if [ "$APPROVAL_READINESS_ONLY" = "1" ] && [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]]; then
+  CURRENT_RUN_ID="$GITHUB_RUN_ID"
+  log "gate (a): approval readiness will ignore only non-completed checks from its own trusted workflow run $CURRENT_RUN_ID"
+fi
+
+BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
+  --argjson required_names "${REQUIRED_JSON:-[]}" \
+  --arg approval_readiness_only "$APPROVAL_READINESS_ONLY" \
+  --arg current_run_id "$CURRENT_RUN_ID" '
   [.statusCheckRollup[]
     | {
         label: (.name // .context // "?"),
         workflow: (.workflowName // ""),
+        runId: (.runId // ""),
+        status: (.status // ""),
         result: (.conclusion // .state // "")
       }
+    # Approval readiness runs inside a check on the same HEAD. If branch
+    # protection is unreadable, the fail-closed full-rollup fallback would
+    # otherwise block forever on the caller itself. Exclude only non-completed
+    # checks from this exact trusted run; completed failures in this run and
+    # active checks in every other run remain blocking.
+    | select(
+        ($approval_readiness_only != "1")
+        or ($current_run_id == "")
+        or (.runId != $current_run_id)
+        or (.status == "COMPLETED")
+      )
     # Filter out the known "expected to fail during Phase 4a" check.
     # Label Gate lives in the "PR Review Policy" workflow and fails by
     # design whenever needs-external-review / needs-human-review /
@@ -1904,7 +1953,7 @@ REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
 APPROVING_REVIEWER=$(echo "$REVIEWS_JSON" | jq -r \
   --argjson reviewers "$REVIEWERS_JSON" \
   --arg author "$PR_AUTHOR" \
-  --arg same_agent_reviewer "$SAME_AGENT_REVIEWER" \
+  --arg same_agent_reviewer "$GATE_B_SAME_AGENT_REVIEWER" \
   --arg sha "$HEAD_SHA" \
   --arg require_head "$REQUIRE_APPROVAL_ON_HEAD" '
     [ .[]
@@ -1927,6 +1976,7 @@ APPROVING_REVIEWER=$(echo "$REVIEWS_JSON" | jq -r \
 ')
 
 if [ -z "$APPROVING_REVIEWER" ]; then
+  if [ "$APPROVAL_READINESS_ONLY" != "1" ]; then
   # Branch 2 (#170): same-agent author/reviewer fallback. For Phase 4
   # PRs, the no-self-approve scoping rule (REVIEW_POLICY.md § No-self-
   # approve scoping; #220) prohibits the agent that authored the PR from
@@ -2000,12 +2050,21 @@ if [ -z "$APPROVING_REVIEWER" ]; then
     log "gate (b): SKIPPED (--diagnostic-signal-only — diagnostic invocation, not a merge decision)"
     APPROVING_REVIEWER="(skipped: reviewer-approval check disabled for this invocation)"
   fi
+  fi
 
   if [ -z "$APPROVING_REVIEWER" ]; then
+    if [ "$APPROVAL_READINESS_ONLY" = "1" ]; then
+      fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review on current HEAD $HEAD_SHA"
+    fi
     fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review, and same-agent + Codex 👍 fallback (branch 2) did not apply (codex.enabled=$CODEX_ENABLED; Authoring-Agent: ${AUTHORING_AGENT:-not set}; matched reviewer: ${SAME_AGENT_REVIEWER:-none}; threshold: $REACTION_THRESHOLD)"
   fi
 else
   log "gate (b): latest-state APPROVED by $APPROVING_REVIEWER"
+fi
+
+if [ "$APPROVAL_READINESS_ONLY" = "1" ]; then
+  log "approval readiness: gates (a) and (b) cleared; external clearance intentionally delegated to the threshold-aware merge-clearance gate"
+  exit 0
 fi
 
 # --- gate (c): Codex / Phase 4b cleared on current HEAD --------------------

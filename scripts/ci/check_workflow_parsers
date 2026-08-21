@@ -794,13 +794,13 @@ else
   echo "$legacy_csv_join" | sed 's/^/    /' >&2
 fi
 
-exact_label_match=$(grep -F 'grep -Fxq "$blocking_label"' ".github/workflows/agent-review.yml" || true)
-if [ -n "$exact_label_match" ]; then
+if grep -Fq 'source scripts/lib/blocking-labels.sh' ".github/workflows/agent-review.yml" \
+  && grep -Fq 'needs-external-review|needs-human-review|policy-violation|human-hold)' scripts/lib/blocking-labels.sh; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review pre-merge recheck uses fixed-string whole-line label matching"
+  echo "  PASS: agent-review pre-merge recheck uses the exact shared blocking-label predicate"
 else
   fail=$((fail + 1))
-  echo "  FAIL: agent-review pre-merge recheck must use grep -Fxq for exact label names" >&2
+  echo "  FAIL: agent-review pre-merge recheck must source the exact shared blocking-label predicate" >&2
 fi
 
 echo
@@ -824,8 +824,9 @@ else
 fi
 
 # The semantics below are the contract for reading `author_identity` out of a
-# policy file. Since #788 the shipping implementation is `policy_scalar` in
-# scripts/workflow/load_review_config.sh — the auto-merge step no longer parses
+# policy file. Since #1062 the shipping implementation is
+# `review_policy_scalar` in scripts/lib/review-policy-scalar.sh — the
+# auto-merge step no longer parses
 # the file itself, it compares against `load-config`'s output, which is resolved
 # from the PR BASE's policy rather than from that job's unpinned checkout. These
 # cases stay here as the spelling contract they always were; the live parser is
@@ -983,64 +984,37 @@ else
   echo "  PASS: triage's action filter excludes unlabeled (no label flap) (#620)"
 fi
 
-# 2e. The rc=5 CodeRabbit rate-limit branch derives external-review
-# protection for coderabbit-automerge-rate-limit-gate.sh by asking
-# merge-clearance-gate.sh ITSELF (--derive-rate-limit-protection): the same
-# intrinsic threshold/protected-paths computation the required check runs,
-# plus current-head Codex/Phase-4b clearance when the active required check is
-# disabled (#713). Label-event proxies (current-label reads,
-# unlabeled-removal overrides, workflow-local marker greps) were rejected — a
-# label event is not head-pinned proof of a downstream gate or clearance.
-# ext_protected initializes false and only a clean `true`/`false` from the
-# query is accepted (fail-closed on error or garbage).
-if grep -Fq 'ext_protected=false' <<<"$auto_merge_job_block" \
-  && grep -Fq -- 'merge-clearance-gate.sh --derive-rate-limit-protection' <<<"$auto_merge_job_block" \
-  && grep -A2 -F 'if req=$(bash scripts/merge-clearance-gate.sh --derive-rate-limit-protection "$PR_NUMBER" "$REPO"); then' <<<"$auto_merge_job_block" | grep -Fq 'true|false) ext_protected=$req' \
-  && ! grep -Fq "any(.labels[]; .name==\"needs-external-review\")" <<<"$auto_merge_job_block" \
-  && ! grep -Fq 'EVENT_ACTION' <<<"$auto_merge_job_block" \
-  && ! grep -Fq 'mergepath-propagation-lane verified-head=' <<<"$auto_merge_job_block"; then
+# 2e. A registered reviewer approval is the merge-readiness signal. Advisory
+# CodeRabbit arrival must not add another runner-held wait after that approval;
+# its required severity and conversation state remain represented by their
+# dedicated required checks.
+if ! grep -Fq 'coderabbit-wait.sh' <<<"$auto_merge_job_block" \
+  && ! grep -Fq 'Wait for CodeRabbit review' <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: rc=5 derives ext_protected from merge-clearance-gate.sh rate-limit protection (live head, fail-closed), with no label/marker proxies left (#713)"
+  echo "  PASS: approval arming does not wait for advisory CodeRabbit arrival (#1062)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 branch must derive ext_protected via scripts/merge-clearance-gate.sh --derive-rate-limit-protection (init false, accept only literal true/false) and must not read labels, unlabeled events, or lane markers directly (#713)" >&2
+  echo "  FAIL: auto-merge-on-approval must not invoke coderabbit-wait.sh or hold a runner for CodeRabbit after a registered approval (#1062)" >&2
 fi
 
-# 2e-ter (#825). The rate-limit gate's under-threshold arm can only run if the
-# workflow hands it the PR coordinates: an under-threshold head has no
-# external-review protection to derive, so the gate's ONLY remaining question
-# is whether the failover's own Codex review cleared this head — and it cannot
-# ask it without PR_NUMBER and REPO. Dropping the arguments silently restores
-# the #825 deadlock (the gate blocks fail-closed, so the regression is a stall,
-# not a hole, and would go unnoticed until the next rate-limited PR).
-if grep -Fq 'bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_protected" "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block"; then
+# 2e-bis. This privileged job sources merge helpers, so its checkout must be
+# pinned to the trusted default branch. Its early label read uses the shared
+# predicate when available and preserves the exact bootstrap predicate for the
+# first atomic consumer rollout, when the trusted default branch necessarily
+# lacks the helper. The final label read and all other safety gates belong to
+# the shared approval continuation for both immediate and deferred paths.
+if grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$auto_merge_job_block" \
+  && [ "$(grep -c 'source scripts/lib/blocking-labels.sh' <<<"$auto_merge_job_block")" -eq 1 ] \
+  && grep -Fq 'if [ -f scripts/lib/blocking-labels.sh ]; then' <<<"$auto_merge_job_block" \
+  && grep -Fq 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block" \
+  && [ "$(grep -c 'blocking_labels=$(printf' <<<"$auto_merge_job_block")" -eq 1 ] \
+  && grep -Fq 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$auto_merge_job_block" \
+  && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: rc=5 passes the PR coordinates to the rate-limit gate so its current-head Codex clearance arm can run (#825)"
+  echo "  PASS: privileged approval arming uses the trusted helper with a first-rollout bootstrap and routes final safety through the shared continuation"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 branch must invoke scripts/coderabbit-automerge-rate-limit-gate.sh with \"\$WAIT_JSON\" \"\$ext_protected\" \"\$PR_NUMBER\" \"\$REPO\" — without the coordinates the gate cannot verify current-head Codex clearance and every under-threshold rate-limit stall deadlocks again (#825)" >&2
-fi
-
-# 2e-bis. The rc=5-time derivation runs minutes before the merge and state
-# can change during the waits (a push, a propagation-lane verification
-# landing): the downgrade path must record itself (CR_RATE_LIMIT_DOWNGRADED
-# via GITHUB_ENV) and the FINAL blocking-label re-verify must abort on head
-# drift (the downgrade anchored the event head; the merge pins
-# CURRENT_HEAD_SHA via --match-head-commit) and RE-RUN the rate-limit
-# protection derivation, requiring literal `true` (#713).
-if grep -Fq 'echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"' <<<"$auto_merge_job_block" \
-  && grep -Fq '"${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true"' <<<"$auto_merge_job_block" \
-  && grep -Fq '"$CURRENT_HEAD_SHA" != "$HEAD_SHA"' <<<"$auto_merge_job_block" \
-  && grep -A2 -F '"$CURRENT_HEAD_SHA" != "$HEAD_SHA"' <<<"$auto_merge_job_block" | grep -Fq 'exit 1' \
-  && grep -Fq 're_protected=false' <<<"$auto_merge_job_block" \
-  && grep -A2 -F 'true) re_protected=true' <<<"$auto_merge_job_block" | grep -Fq 'esac' \
-  && grep -A2 -F 'if [ "$re_protected" != "true" ]' <<<"$auto_merge_job_block" | grep -Fq 'exit 1' \
-  && [ "$(grep -c -- 'merge-clearance-gate.sh --derive-rate-limit-protection' <<<"$auto_merge_job_block")" -ge 2 ]; then
-  pass=$((pass + 1))
-  echo "  PASS: rc=5 downgrade records itself; the final re-verify aborts on head drift and re-derives rate-limit protection, requiring true (#713)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: the rc=5 downgrade must set CR_RATE_LIMIT_DOWNGRADED in GITHUB_ENV, and the final re-verify must abort on head drift and re-run merge-clearance-gate.sh --derive-rate-limit-protection, exiting 1 unless it prints true (#713)" >&2
+  echo "  FAIL: approval arming must pin its checkout, preserve the first-rollout helper fallback, and use the shared final continuation" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that
@@ -1063,10 +1037,9 @@ fi
 
 # 2f-bis. Within the propagation lane step, the verified-head marker MUST be
 # posted BEFORE the label removal (Codex r9): the removal fires the unlabeled
-# re-arm, whose rc=5 branch derives requiredness via merge-clearance-gate.sh's
-# lane_verified() marker read — marker-after-removal opens a window where the
-# derivation treats the exemption as an ordinary above-threshold arm and
-# downgrades a CodeRabbit rate-limit stall with neither bot having reviewed.
+# re-arm and trusted continuation, both of which read the marker as the
+# HEAD-pinned propagation-lane clearance. Marker-after-removal opens a window
+# where the continuation evaluates an approved PR without that clearance.
 if awk '
   /- name: Propagation PR review lane/ {f=1}
   f && /gh pr comment/ && !m {m=NR}
@@ -1078,7 +1051,7 @@ if awk '
   echo "  PASS: propagation lane posts the verified-head marker before removing the label (#620)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the propagation lane must post the verified-head marker BEFORE the needs-external-review removal — the removal-fired re-arm reads the marker, so marker-after-removal races the rc=5 exemption exclusion (#620)" >&2
+  echo "  FAIL: the propagation lane must post the verified-head marker BEFORE the needs-external-review removal — the removal-fired continuation reads the marker, so marker-after-removal races the propagation clearance (#620)" >&2
 fi
 
 # 3. A dedicated approval gate runs on the pull_request (re-arm) path and,
@@ -1361,18 +1334,18 @@ else
   echo "  FAIL: Dependabot auto-merge must call the configured check gate, wait for success, and bind merges to the checked HEAD" >&2
   fail=$((fail + 1))
 fi
-if grep -Fq "Require current-head check success" .github/workflows/agent-review.yml && \
+if grep -Fq "Probe current-head check readiness once" .github/workflows/agent-review.yml && \
    grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" .github/workflows/agent-review.yml && \
    grep -Fq 'select((.name // .context // "") == $name)' .github/workflows/agent-review.yml && \
-   grep -Fq "Re-verify blocking labels after test wait" .github/workflows/agent-review.yml && \
-   grep -Fq 'CURRENT_HEAD_SHA=$sha' .github/workflows/agent-review.yml && \
-   grep -Fq -- "--match-head-commit" .github/workflows/agent-review.yml && \
-   grep -Fq "waiting for completion" .github/workflows/agent-review.yml && \
-   grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/agent-review.yml; then
+   grep -Fq 'steps.check_readiness.outputs.ready == '\''true'\''' .github/workflows/agent-review.yml && \
+   grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' .github/workflows/agent-review.yml && \
+   grep -Fq 'approval-merge-continuation.sh' .github/workflows/auto-clear-blocking-labels.yml && \
+   grep -Fq -- '--match-head-commit "$final_head"' scripts/workflow/approval-merge-continuation.sh && \
+   ! grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review auto-merge waits for configured current-head check success, rechecks labels, and binds merge to the checked HEAD"
+  echo "  PASS: agent-review probes current-head readiness once; completed workflows re-enter an exact-head guarded continuation"
 else
-  echo "  FAIL: agent-review auto-merge must wait for configured current-head check success, recheck labels, and bind merge to the checked HEAD" >&2
+  echo "  FAIL: agent-review must avoid runner polling and defer pending checks to the exact-head continuation" >&2
   fail=$((fail + 1))
 fi
 
@@ -1387,15 +1360,15 @@ else
 fi
 
 echo
-echo "agent-review.yml required-check wait: workflow-disambiguated check matching (#655 Codex P2 rounds 4-5, 11)"
+echo "agent-review.yml readiness probe: workflow-disambiguated check matching (#655 Codex P2 rounds 4-5, 11)"
 if grep -Fq 'select($workflow == "" or (.workflowName // "") == $workflow)' .github/workflows/agent-review.yml && \
    grep -Fq 'group_by(.workflowName // "")' .github/workflows/agent-review.yml && \
    grep -Fq 'sort_by(.completedAt // .startedAt // "")' .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review required-check wait matches by (name, workflow) via statusCheckRollup, grouping by workflow and picking the latest completed run per group when nothing is pending (#655)"
+  echo "  PASS: agent-review readiness probe matches by (name, workflow) via statusCheckRollup, grouping by workflow and picking the latest completed run per group when nothing is pending (#655)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: agent-review required-check wait must disambiguate by workflow via statusCheckRollup and pick the latest run per check (#655)" >&2
+  echo "  FAIL: agent-review readiness probe must disambiguate by workflow via statusCheckRollup and pick the latest run per check (#655)" >&2
 fi
 
 # #655 Codex P2 round 11 ("restrict the lint wait to the required
@@ -1409,18 +1382,18 @@ fi
 # additionally scope the workflow=="" match to only entries branch
 # protection actually requires when GitHub reports at least one such
 # entry. If no same-name entry reports required=true, keep the configured
-# check wait instead of treating branch-protection metadata as mandatory.
+# configured check instead of treating branch-protection metadata as mandatory.
 echo
-echo "agent-review.yml required-check wait: isRequired-preferred canonical match (#655 Codex P2 round 11/15)"
+echo "agent-review.yml readiness probe: isRequired-preferred canonical match (#655 Codex P2 round 11/15)"
 if grep -Fq 'gh api graphql -f query=' .github/workflows/agent-review.yml && \
    grep -Fq 'isRequired(pullRequestNumber: $number)' .github/workflows/agent-review.yml && \
    grep -Fq '([$name_matches[] | select(.isRequired == true)]) as $required_matches' .github/workflows/agent-review.yml && \
    grep -Fq 'if $workflow == "" and ($required_matches | length) > 0' .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review required-check wait fetches statusCheckRollup via graphql and prefers isRequired==true entries when present (#655 round 11/15)"
+  echo "  PASS: agent-review readiness probe fetches statusCheckRollup via graphql and prefers isRequired==true entries when present (#655 round 11/15)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: agent-review required-check wait does not fetch isRequired or prefer required matches with a configured-check fallback (#655 round 11/15)" >&2
+  echo "  FAIL: agent-review readiness probe does not fetch isRequired or prefer required matches with a configured-check fallback (#655 round 11/15)" >&2
 fi
 
 echo "dependabot-auto-merge.yml author-token equality regression (#426)"

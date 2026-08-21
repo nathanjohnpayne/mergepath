@@ -93,7 +93,9 @@ on:
   # after Codex cleared). 3× the API quota cost, but a meaningfully
   # shorter blocker window. The PAT-driven label removal added in
   # #324 also helps — but the sweep is still the only backstop for
-  # the no-event path.
+  # the no-event path. It also re-enters the approval continuation for open
+  # approved PRs. That backstop covers a consumer annex with a custom display
+  # name, which cannot be enumerated in workflow_run.workflows.
   schedule:
     - cron: '*/5 * * * *'
 
@@ -243,6 +245,7 @@ jobs:
           fi
 
       - name: Re-evaluate gate per PR + remove label on pass
+        id: clear
         if: steps.pr.outputs.numbers != ''
         env:
           # PAT-driven label removal (#315/#324). GITHUB_TOKEN-driven
@@ -280,6 +283,7 @@ jobs:
           # evaluation was actually impossible.
           had_infra_error=0
           failing_prs=""
+          cleared_prs=""
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
             echo "::group::Evaluating PR #$PR"
@@ -350,6 +354,7 @@ jobs:
                 # already cleared it, and the desired end state holds either way.
                 case "$del_status" in
                   200|204)
+                    cleared_prs="$cleared_prs $PR"
                     # Direct string body (NOT a heredoc — heredoc closing
                     # delimiter must be column-0 unless using `<<-` with
                     # tabs; YAML run blocks make that brittle).
@@ -404,7 +409,73 @@ jobs:
           echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"
           # shellcheck disable=SC2086  # intentional word-splitting to trim
           echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"
+          # A PR whose external-review label was removed in THIS pass must
+          # wait for the label-policy workflow to publish its new verdict.
+          # The continuation step skips it until that later workflow_run.
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "cleared_prs=$(echo $cleared_prs)" >> "$GITHUB_OUTPUT"
           exit "$had_infra_error"
+
+      - name: Continue approved PRs after completed checks
+        if: github.event_name == 'workflow_run' && steps.pr.outputs.numbers != ''
+        env:
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
+          CLEARED_PRS: ${{ steps.clear.outputs.cleared_prs }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; approval continuation is disabled."
+            exit 0
+          fi
+          if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then
+            echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout event."
+            exit 0
+          fi
+          continuation_infra_error=0
+          continuation_failing_prs=""
+          while IFS= read -r PR; do
+            [ -n "$PR" ] || continue
+            case " $CLEARED_PRS " in
+              *" $PR "*)
+                echo "PR #$PR had needs-external-review removed in this pass; waiting for the resulting policy workflow completion."
+                continue
+                ;;
+            esac
+            set +e
+            bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
+            rc=$?
+            set -e
+            case "$rc" in
+              0) ;;
+              4) echo "PR #$PR is not merge-ready on this event; a later completion event will re-evaluate it." ;;
+              *)
+                echo "::error::Approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
+                continuation_infra_error=1
+                continuation_failing_prs="$continuation_failing_prs $PR"
+                ;;
+            esac
+          done <<<"$PR_NUMBERS"
+          echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITHUB_ENV"
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "CONTINUATION_INFRA_ERROR_PRS=$(echo $continuation_failing_prs)" >> "$GITHUB_ENV"
+          exit "$continuation_infra_error"
+
+      - name: Surface approval continuation failures as per-PR check-runs
+        if: always() && env.CONTINUATION_INFRA_ERROR == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/workflow/report-approval-continuation-failures.sh ]; then
+            echo "::notice::Continuation failure reporter is not on the trusted default branch yet; the workflow log remains authoritative for this first rollout."
+            exit 0
+          fi
+          bash scripts/workflow/report-approval-continuation-failures.sh \
+            "$REPO" "$RUN_URL" "${CONTINUATION_INFRA_ERROR_PRS:-}"
 
       - name: Surface infra failure as per-PR check-runs
         # Run even when the prior step failed — `if: always()` + the
@@ -543,6 +614,7 @@ jobs:
             ' "$CONFIG")
             [ "$val" = "false" ] && enabled=false
           fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
           if [ "$enabled" = "false" ]; then
             echo "Scheduled sweep disabled for $REPO via review-policy.yml; skipping."
             echo "prs=" >> "$GITHUB_OUTPUT"
@@ -686,6 +758,90 @@ jobs:
           # shellcheck disable=SC2086  # intentional word-splitting to trim
           echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"
           exit "$had_infra_error"
+
+      - name: Find open approved PRs for the continuation backstop
+        id: approved
+        if: steps.find.outputs.enabled != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          source scripts/lib/gh-retry-helpers.sh
+          # workflow_run accepts only literal workflow display names. A valid
+          # consumer repo_lint_local.yml may choose any name, so its completion
+          # cannot always wake the event-driven continuation above. The existing
+          # five-minute sweep is the bounded backstop; search narrows it to PRs
+          # GitHub considers approved, and the continuation re-verifies the
+          # registered reviewer's latest state authoritatively.
+          if ! prs=$(with_gh_retry gh pr list --repo "$REPO" --state open \
+            --search 'review:approved' --limit 500 --json number --jq '.[].number'); then
+            echo "::error::Failed to list open approved PRs on $REPO"
+            exit 1
+          fi
+          if [ -z "$prs" ]; then
+            echo "prs=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'prs<<EOF'
+            echo "$prs"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Continue approved PRs after custom-workflow completions
+        if: steps.find.outputs.enabled != 'false' && steps.approved.outputs.prs != ''
+        env:
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          PRS: ${{ steps.approved.outputs.prs }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; scheduled approval continuation is disabled."
+            exit 0
+          fi
+          if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then
+            echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout sweep."
+            exit 0
+          fi
+          continuation_infra_error=0
+          continuation_failing_prs=""
+          while IFS= read -r PR; do
+            [ -n "$PR" ] || continue
+            set +e
+            bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
+            rc=$?
+            set -e
+            case "$rc" in
+              0) ;;
+              4) echo "PR #$PR is not merge-ready; a later event or sweep will re-evaluate it." ;;
+              *)
+                echo "::error::Scheduled approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
+                continuation_infra_error=1
+                continuation_failing_prs="$continuation_failing_prs $PR"
+                ;;
+            esac
+          done <<<"$PRS"
+          echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITHUB_ENV"
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "CONTINUATION_INFRA_ERROR_PRS=$(echo $continuation_failing_prs)" >> "$GITHUB_ENV"
+          exit "$continuation_infra_error"
+
+      - name: Surface approval continuation failures as per-PR check-runs
+        if: always() && env.CONTINUATION_INFRA_ERROR == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/workflow/report-approval-continuation-failures.sh ]; then
+            echo "::notice::Continuation failure reporter is not on the trusted default branch yet; the workflow log remains authoritative for this first rollout."
+            exit 0
+          fi
+          bash scripts/workflow/report-approval-continuation-failures.sh \
+            "$REPO" "$RUN_URL" "${CONTINUATION_INFRA_ERROR_PRS:-}"
 
       - name: Surface infra failure as per-PR check-runs
         # Mirrors evaluate-and-clear's surfacing step. See that step's

@@ -521,9 +521,9 @@ EOF
   [ "$FAIL" -ne "$before" ] || pass "O: unaccounted feedback exits 6 before a new @codex trigger"
 }
 
-# K: agent-review.yml marks its CodeRabbit-wait step as the automatic caller.
-# Parsed as YAML, not grepped: the claim is about the step's env binding, and a
-# text match cannot tell one step's env from another's.
+# K: a registered approval routes straight to the shared continuation helper.
+# Parsed as YAML, not grepped: the claim is about executable step wiring, and a
+# text match cannot distinguish a step body from comments elsewhere in the file.
 test_workflow_declares_auto_trigger_flag() {
   local wf="$ROOT/.github/workflows/agent-review.yml" before=$FAIL
   if [ ! -f "$wf" ]; then
@@ -535,15 +535,18 @@ test_workflow_declares_auto_trigger_flag() {
   if ! ruby -ryaml -e '
     wf = YAML.unsafe_load_file(ARGV[0]) rescue YAML.load_file(ARGV[0])
     job = (wf["jobs"] || {})["auto-merge-on-approval"] or abort("job auto-merge-on-approval not found")
-    step = (job["steps"] || []).find { |s| s.is_a?(Hash) && s["name"] == "Wait for CodeRabbit review" } \
-      or abort("step \"Wait for CodeRabbit review\" not found")
-    v = ((step["env"] || {})["MERGEPATH_CODEX_AUTO_TRIGGER"]).to_s
-    abort("MERGEPATH_CODEX_AUTO_TRIGGER on that step is #{v.inspect}, expected a truthy literal") \
-      unless %w[true 1 True TRUE].include?(v)
+    steps = job["steps"] || []
+    abort("approval job must not wait for CodeRabbit") \
+      if steps.any? { |s| s.is_a?(Hash) && s["name"].to_s.include?("CodeRabbit") }
+    step = steps.find { |s| s.is_a?(Hash) && s["name"] == "Enable auto-merge" } \
+      or abort("step \"Enable auto-merge\" not found")
+    run = step["run"].to_s
+    abort("Enable auto-merge must route through approval-merge-continuation.sh") \
+      unless run.include?("scripts/workflow/approval-merge-continuation.sh")
   ' "$wf" 2>"$WORKDIR/k.err"; then
     fail "K: $(cat "$WORKDIR/k.err")"
   fi
-  [ "$FAIL" -ne "$before" ] || pass "K: agent-review.yml's CodeRabbit-wait step declares MERGEPATH_CODEX_AUTO_TRIGGER"
+  [ "$FAIL" -ne "$before" ] || pass "K: registered approval routes directly through the shared continuation helper"
 }
 
 test_fresh_posts_once_no_poll

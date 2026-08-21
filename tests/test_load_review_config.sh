@@ -42,6 +42,39 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
+if grep -Fq 'SCALAR_HELPER="$SCRIPT_DIR/../lib/review-policy-scalar.sh"' "$LOADER" \
+   && grep -Fq 'source "$SCALAR_HELPER"' "$LOADER" \
+   && grep -Fq 'if [ ! -f "$SCALAR_HELPER" ]; then' "$LOADER" \
+   && ! grep -Fq 'review_policy_scalar()' "$LOADER"; then
+  pass "the loader guards and sources the shared policy scalar parser without duplicating it"
+else
+  fail "the loader must fail closed when its shared scalar parser is absent and use it as the single parser implementation"
+fi
+
+SCALAR_HELPER="$ROOT/scripts/lib/review-policy-scalar.sh"
+HASH_POLICY=$(mktemp "${TMPDIR:-/tmp}/review-policy-hash.XXXXXX")
+trap 'rm -f "$HASH_POLICY"' EXIT
+printf '%s\n' 'author_identity: team#ops' > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = 'team#ops' ] && pass "an unquoted hash without a separator remains scalar data" || fail "unquoted hash scalar parsed as '$got'"
+printf '%s\n' 'author_identity: "team #ops" # comment' > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = 'team #ops' ] && pass "a hash inside double quotes remains scalar data" || fail "double-quoted hash scalar parsed as '$got'"
+printf '%s\n' "author_identity: 'team #ops' # comment" > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = 'team #ops' ] && pass "a hash inside single quotes remains scalar data" || fail "single-quoted hash scalar parsed as '$got'"
+printf '%s\n' 'author_identity: team # comment' > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = 'team' ] && pass "a separated unquoted hash still starts a YAML comment" || fail "separated comment scalar parsed as '$got'"
+printf '%s\n' 'author_identity: team" # comment' > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = 'team"' ] && pass "an interior double quote in a plain scalar does not swallow its trailing comment" || fail "interior double-quote scalar parsed as '$got'"
+printf '%s\n' "author_identity: team' # comment" > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = "team'" ] && pass "an interior single quote in a plain scalar does not swallow its trailing comment" || fail "interior single-quote scalar parsed as '$got'"
+rm -f "$HASH_POLICY"
+trap - EXIT
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/load-review-config-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -310,7 +343,7 @@ fi
 #     readable, its threshold and reviewer list are exported normally — it just
 #     authorizes nobody to merge. It is also the more reachable of the two
 #     states, needing no outage: a policy can omit the key, or nest it under a
-#     block, which `policy_scalar` deliberately declines to match.
+#     block, which `review_policy_scalar` deliberately declines to match.
 #
 #     Emitting a hard-coded login here instead would make EXPECTED_AUTHOR
 #     non-empty in the auto-merge step, skipping the `[ -z ]` fail-closed branch
@@ -381,9 +414,10 @@ fi
 #    The step's `actions/checkout` is pinned to the DEFAULT branch so the
 #    helper code is trusted. That makes the helper's own absence a reachable
 #    state twice: on the PR that introduces it, and on each consumer's first
-#    sync wave (.mergepath-sync.yml makes agent-review.yml and
-#    scripts/workflow/ travel together, but they land IN that PR, not on the
-#    consumer's default branch before it runs). An unguarded `bash <missing
+#    sync wave (.mergepath-sync.yml makes agent-review.yml, scripts/workflow/,
+#    and its hard-required scalar helper travel together, but they land IN
+#    that PR, not on the consumer's default branch before it runs). An
+#    unguarded `bash <missing
 #    file>` exits 127 and hard-fails the job, which SKIPS `triage`
 #    (`needs: [load-config]`, no `always()`) and `auto-merge-on-approval` —
 #    the fail-OPEN outcome the loader's own fail-closed handling exists to
@@ -442,13 +476,33 @@ else
   fail "bootstrap soft-pass output shape: $(cat "$STEP_OUT")"
 fi
 
+# 5a-bis. A partially propagated trusted tree can carry the loader before its
+# scalar helper. The loader itself must soft-pass with the same fail-closed
+# values; checking only the loader path in the workflow is insufficient.
+HELPER_SKEW_TREE="$WORK/helper-skew-tree"
+mkdir -p "$HELPER_SKEW_TREE/.github" "$HELPER_SKEW_TREE/scripts"
+cp "$DEFAULT_CONFIG" "$HELPER_SKEW_TREE/.github/review-policy.yml"
+cp -R "$ROOT/scripts/workflow" "$HELPER_SKEW_TREE/scripts/workflow"
+
+run_step "$HELPER_SKEW_TREE" main main
+if [ "$SRC" -eq 0 ] \
+   && [ "$(val_in "$STEP_OUT" reviewers)" = "[]" ] \
+   && [ "$(val_in "$STEP_OUT" paths)" = "[]" ] \
+   && [ "$(val_in "$STEP_OUT" threshold)" = "0" ] \
+   && [ "$(val_in "$STEP_OUT" author_identity)" = "" ]; then
+  pass "a trusted tree with the loader but without its scalar helper soft-passes fail closed"
+else
+  fail "scalar-helper skew (rc=$SRC): $STEP_LOG"
+fi
+
 # 5b. Positive control. The same lifted step against a tree that DOES carry the
 #     helper must run it and export the real policy values — otherwise 5a would
 #     pass just as well against a step that always short-circuits.
 LIVE_TREE="$WORK/live-tree"
-mkdir -p "$LIVE_TREE/.github" "$LIVE_TREE/scripts"
+mkdir -p "$LIVE_TREE/.github" "$LIVE_TREE/scripts" "$LIVE_TREE/scripts/lib"
 cp "$DEFAULT_CONFIG" "$LIVE_TREE/.github/review-policy.yml"
 cp -R "$ROOT/scripts/workflow" "$LIVE_TREE/scripts/workflow"
+cp "$ROOT/scripts/lib/review-policy-scalar.sh" "$LIVE_TREE/scripts/lib/review-policy-scalar.sh"
 
 run_step "$LIVE_TREE" main main
 if [ "$SRC" -eq 0 ] \

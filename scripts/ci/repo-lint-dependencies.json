@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "full_triggers": [
+    ".github/workflows/repo_lint.yml",
+    "scripts/ci/repo-lint-scope.sh",
+    "scripts/ci/repo-lint-dependencies.json",
+    "scripts/ci/check_repo_lint_consumer_safety",
+    "scripts/ci/check_consumer_residue_safety",
+    "tests/test_repo_lint_consumer_safety.sh",
+    "tests/test_consumer_residue_safety.sh",
+    "tests/test_repo_lint_optimization.sh",
+    ".mergepath-sync.yml",
+    ".repo-template.yml",
+    "AGENTS.md",
+    "REVIEW_POLICY.md",
+    "ai_agent_tooling_standard.md",
+    "specs/*",
+    "rules/*",
+    "docs/agents/*",
+    "docs/architecture/*"
+  ],
+  "wrappers": {
+    "check_no_token_in_output": [
+      "scripts/ci/token_output_gate.py"
+    ],
+    "check_doc_ownership": [
+      "scripts/lib/ci-check-modes.sh",
+      "tests/test_check_doc_ownership.sh"
+    ],
+    "check_coderabbit_wait": [
+      "scripts/lib/ci-check-modes.sh",
+      "scripts/coderabbit-wait.sh",
+      "tests/test_coderabbit_wait_*.sh",
+      "tests/test_coderabbit_automerge_rate_limit_gate.sh"
+    ],
+    "check_merge_clearance_gate": [
+      "scripts/lib/ci-check-modes.sh",
+      "scripts/merge-clearance-gate.sh",
+      "tests/test_merge_clearance_gate.sh",
+      "tests/test_465_fail_closed.sh"
+    ],
+    "check_phase_4b_automation": [
+      "scripts/lib/ci-check-modes.sh",
+      "scripts/phase-4b-review.sh",
+      "scripts/phase-4b/*",
+      "tests/test_phase_4b_automation.sh"
+    ],
+    "check_phase_4b_accounting": [
+      "scripts/lib/ci-check-modes.sh",
+      "scripts/phase-4b-review.sh",
+      "scripts/phase-4b/*",
+      "scripts/phase-4b/accounting.sh",
+      "scripts/phase-4b/accounting.schema.json",
+      "scripts/phase-4b/prices.json",
+      "tests/test_phase_4b_accounting.sh"
+    ]
+  }
+}

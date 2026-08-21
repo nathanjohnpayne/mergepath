@@ -1,0 +1,75 @@
+name: Repo-lint Latency Audit
+
+on:
+  schedule:
+    - cron: "47 8 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: repo-lint-latency-audit
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Collect rolling repo-lint timing
+        id: latency
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUT_DIR: ${{ runner.temp }}/repo-lint-latency
+        run: |
+          set +e
+          scripts/repo-lint-latency-report.sh \
+            --repo "${{ github.repository }}" \
+            --out-dir "$OUT_DIR" \
+            --limit 100 \
+            --min-sample 20 \
+            --p50-max 300 \
+            --p95-max 480 \
+            --deep-p95-max 720
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Publish timing summary
+        if: always()
+        env:
+          OUT_DIR: ${{ runner.temp }}/repo-lint-latency
+        run: |
+          if [ -f "$OUT_DIR/summary.md" ]; then
+            cat "$OUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Repo-lint latency report did not produce a summary." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload timing evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: repo-lint-latency-${{ github.run_id }}
+          path: ${{ runner.temp }}/repo-lint-latency
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Enforce latency and duplication alerts
+        if: steps.latency.outputs.rc == '1'
+        run: |
+          echo "::error::Repo-lint latency or duplicate-execution audit raised an alert."
+          exit 1
+
+      - name: Report latency collection failure
+        if: steps.latency.outputs.rc != '0' && steps.latency.outputs.rc != '1'
+        run: |
+          echo "::error::Repo-lint latency collection failed (exit ${{ steps.latency.outputs.rc }}); no audit verdict was produced."
+          exit 1

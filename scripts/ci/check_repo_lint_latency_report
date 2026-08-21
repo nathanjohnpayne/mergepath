@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# CI entry point for the rolling repo-lint latency report contract.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SUBJECT="$ROOT/scripts/repo-lint-latency-report.sh"
+ENSURE_YQ="$ROOT/scripts/lib/ensure-yq.sh"
+
+if [ -f "$ENSURE_YQ" ] && ! bash "$ENSURE_YQ" --ci-only; then
+  echo "check_repo_lint_latency_report: FAIL — yq bootstrap failed" >&2
+  exit 1
+fi
+
+if ! command -v yq >/dev/null 2>&1; then
+  echo "check_repo_lint_latency_report: SKIP (mikefarah/yq is required for workflow assertions)"
+  exit 0
+fi
+
+if [ "${MERGEPATH_CONSUMER_SAFETY:-0}" = "1" ]; then
+  bash -n "$SUBJECT"
+  echo "check_repo_lint_latency_report: PASS (consumer syntax smoke)"
+  exit 0
+fi
+
+bash "$ROOT/tests/test_repo_lint_latency_report.sh"
