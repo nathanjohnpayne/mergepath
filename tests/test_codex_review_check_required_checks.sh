@@ -1326,6 +1326,182 @@ else
   fail "oversized rollup: gate (a)'s accumulator is not the stdin-slurp form — an argv --argjson accumulator reintroduces #750"
 fi
 
+
+SCRIPT_CODE_1059=$(grep -vE '^[[:space:]]*#' "$SCRIPT")
+
+# ---------------------------------------------------------------------------
+# #1059: the success line must not claim GitHub-level mergeability.
+#
+# Gate (b) branch 2 accepts a Codex 👍, but a 👍 is a REACTION and GitHub's
+# required_approving_review_count counts only APPROVED REVIEW OBJECTS. Every
+# consumer requires 1 (the hub requires 0), so a 👍-cleared consumer PR passes
+# every gate here and stays BLOCKED / REVIEW_REQUIRED indefinitely.
+# ---------------------------------------------------------------------------
+
+if grep -q 'is mergeable under Phase 4 external review' <<<"$SCRIPT_CODE_1059"; then
+  fail "#1059: the success line claims the PR 'is mergeable' — it cleared the POLICY gate, and GitHub can still refuse the merge for want of an APPROVED review object"
+else
+  pass "#1059: the success line no longer claims GitHub-level mergeability"
+fi
+
+if grep -q 'POLICY gates pass' <<<"$SCRIPT_CODE_1059"; then
+  pass "#1059: the success line names the scope of what cleared"
+else
+  fail "#1059: the success line does not identify itself as a policy-gate clearance"
+fi
+
+# The advisory must stay ADVISORY — a policy gate must not start failing on a
+# branch-protection condition it does not own, and an unreadable reviewDecision
+# must print nothing rather than block.
+if grep -q 'REVIEW_REQUIRED' <<<"$SCRIPT_CODE_1059" \
+   && grep -q 'reviewDecision' <<<"$SCRIPT_CODE_1059"; then
+  pass "#1059: the outstanding-approval advisory is present"
+else
+  fail "#1059: nothing warns that an APPROVED review object is still outstanding — the stall is left to be rediscovered per PR"
+fi
+
+REVIEW_DECISION_BLOCK=$(sed -n '/REVIEW_DECISION=\$(gh api graphql/,/^exit 0$/p' "$SCRIPT")
+if grep -Eq 'fail_gate|die |exit 1' <<<"$REVIEW_DECISION_BLOCK"; then
+  fail "#1059: the reviewDecision advisory can fail the gate — it must stay advisory, since branch protection is not this gate's to enforce"
+else
+  pass "#1059: the reviewDecision advisory cannot fail the gate"
+fi
+
+if grep -q '2>/dev/null || true' <<<"$REVIEW_DECISION_BLOCK"; then
+  pass "#1059: an unreadable reviewDecision degrades to silence, not to an error"
+else
+  fail "#1059: the reviewDecision read is not error-tolerant — a denied GraphQL query would break a gate that has already passed"
+fi
+
+
+
+# ---------------------------------------------------------------------------
+# #1059: the ambiguous-404 REPORT is fixed; the DECISION is deliberately not.
+#
+# Resolving the ambiguity for real needs ruleset support, URI-segment encoding,
+# and a privileged read that auto-clear CI can actually reach (it runs this
+# script with only GH_TOKEN). Attempting it here shipped a fleet-wide gate (a)
+# regression, so it is deferred whole to #1064 and only the log is corrected.
+# These assertions pin that the BEHAVIOUR stayed put.
+# ---------------------------------------------------------------------------
+
+UNPRIV_404_ARM=$(sed -n '/elif grep -q .HTTP 404. "\$protection_err"; then/,/^else$/p' "$SCRIPT")
+if [ -z "$UNPRIV_404_ARM" ]; then
+  fail "#1059: could not locate the unprivileged 404 arm in $SCRIPT"
+else
+  if grep -Eq '^[[:space:]]*protection_readable=1[[:space:]]*$' <<<"$UNPRIV_404_ARM"; then
+    pass "#1059: the 404 arm still marks the list readable — behaviour unchanged, as intended for this PR"
+  else
+    fail "#1059: the 404 arm changed the gate (a) DECISION. That belongs in #1064: auto-clear CI runs this script with only GH_TOKEN, so a privileged retry is unreachable there and failing closed reds gate (a) on every protected consumer"
+  fi
+  if grep -q 'PROTECTION_404_AMBIGUOUS=1' <<<"$UNPRIV_404_ARM"; then
+    pass "#1059: the 404 arm records that the required-check list is UNVERIFIED"
+  else
+    fail "#1059: the ambiguity flag is gone — gate (a) will again assert 'lists no required checks' as established fact"
+  fi
+fi
+
+if grep -q 'could not VERIFY the required-check list' <<<"$SCRIPT_CODE_1059"; then
+  pass "#1059: the ambiguous case reports the list as unverified, not absent"
+else
+  fail "#1059: nothing distinguishes 'no required checks configured' from 'this token may not see protection'"
+fi
+
+# The CODEOWNERS deadlock: reviewDecision stays REVIEW_REQUIRED even though a
+# qualifying approval exists (scripts/admin-merge-codeowners-blocked.sh
+# evaluates reviews directly for exactly this reason). Prescribing Phase 4b
+# there loops the operator forever, so the advisory must branch on whether an
+# approval is actually present (#1061 Codex P1).
+ADVISORY_BLOCK=$(sed -n '/if \[ "\$REVIEW_DECISION" = "REVIEW_REQUIRED" \]; then/,/^fi$/p' "$SCRIPT")
+# The advisory must name BOTH remedies and count nothing. Counting approvals
+# here was wrong three ways (#1061 Codex P2 rounds 4-5): a bare count conflates
+# presence with qualification, `gh api --paginate` with `| length` emits one
+# count PER PAGE so the value becomes "0\n1", and a failed read degraded to ""
+# which then read as a definite zero.
+if grep -q 'HEAD_APPROVALS' <<<"$ADVISORY_BLOCK"; then
+  fail "#1061: the advisory counts approvals again — --paginate with '| length' emits one count per page, and a failed read cannot be distinguished from zero"
+else
+  pass "#1061: the advisory counts nothing, so it cannot mis-read a paginated or failed review list"
+fi
+if grep -q 'admin-merge-codeowners-blocked' <<<"$ADVISORY_BLOCK" \
+   && grep -q 'phase-4b-review.sh' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the advisory names both remedies, so neither cause strands the operator"
+else
+  fail "#1061: the advisory names only one remedy — it will send the operator to the wrong one for the other cause"
+fi
+# Strip comments first: the block's own comment EXPLAINS the removed `gh api
+# --paginate` call, and a bare grep matches that explanation.
+ADVISORY_CODE=$(grep -vE '^[[:space:]]*#' <<<"$ADVISORY_BLOCK")
+if grep -qE 'gh api' <<<"$ADVISORY_CODE"; then
+  fail "#1061: the advisory makes a REST call again; the reviewDecision read alone is enough and is failure-tolerant"
+else
+  pass "#1061: the advisory adds no REST call beyond the failure-tolerant reviewDecision read"
+fi
+
+# #1061 Codex P2 round 4: the fail-closed WARNING must describe the errors that
+# can actually reach it. A permission-hiding 404 is handled by the arm above, so
+# telling the operator "GitHub reports this as 404" during a 403 or a transient
+# 5xx is false and misdirects them toward credential remediation.
+FAILCLOSED_WARN=$(sed -n '/if \[ "\$protection_readable" -eq 0 \]; then/,/REQUIRED_JSON=/p' "$SCRIPT")
+if grep -q 'reports this as 404' <<<"$FAILCLOSED_WARN"; then
+  fail "#1061: the fail-closed warning still claims a 404 reached it — that arm only sees 403/5xx/network"
+else
+  pass "#1061: the fail-closed warning no longer misattributes the failure to a 404"
+fi
+if grep -qE '403|5xx' <<<"$FAILCLOSED_WARN" && grep -q 'transient' <<<"$FAILCLOSED_WARN"; then
+  pass "#1061: the fail-closed warning names the errors that actually reach it and flags 5xx as retryable"
+else
+  fail "#1061: the fail-closed warning does not distinguish a scope failure from a transient one"
+fi
+
+
+# #1061 Codex P2 round 6: the DOCUMENTED contract must agree with the log.
+# Fixing the runtime message while the header still promised "PR is mergeable"
+# left the same false claim standing where an operator reading the script would
+# find it — and the assertions above strip comments before searching, so they
+# passed while the public contract lied. Read the header deliberately.
+EXIT_CONTRACT=$(sed -n '/^# Exit codes:$/,/^# Design notes:$/p' "$SCRIPT")
+if grep -q 'PR is mergeable' <<<"$EXIT_CONTRACT"; then
+  fail "#1061: the documented exit-0 contract still says 'PR is mergeable' — the log was corrected but the header an operator actually reads was not"
+else
+  pass "#1061: the documented exit-0 contract no longer promises GitHub-level mergeability"
+fi
+if grep -q 'POLICY' <<<"$EXIT_CONTRACT" && grep -qE 'branch protection|APPROVED review OBJECT' <<<"$EXIT_CONTRACT"; then
+  pass "#1061: the documented exit-0 contract names the policy scope and the separate branch-protection gate"
+else
+  fail "#1061: the documented exit-0 contract does not explain what exit 0 actually establishes"
+fi
+
+
+# #1061 Codex P2 round 7: the advisory must be COPY-PASTEABLE and must not
+# assert the CODEOWNERS deadlock from a single approval.
+#
+# `<PR#>` is a shell redirection, so a copied command tries to read a file
+# named `PR#` and leaves phase-4b-review.sh without its required argument.
+# And one qualifying approval can coexist with REVIEW_REQUIRED without any
+# deadlock when protection wants MORE approvals or one from a specific
+# CODEOWNER — in which case another Phase 4b round DOES clear it.
+if grep -q 'phase-4b-review.sh <PR#>' <<<"$ADVISORY_BLOCK"; then
+  fail "#1061: the advisory prints the literal placeholder <PR#> — bash reads that as a redirection, so the prescribed command fails immediately"
+else
+  pass "#1061: the advisory prints no literal <PR#> placeholder"
+fi
+if grep -q 'phase-4b-review.sh \$PR_NUMBER' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the advisory interpolates the validated PR number, so the command is runnable as printed"
+else
+  fail "#1061: the advisory does not interpolate \$PR_NUMBER into the phase-4b command"
+fi
+if grep -qE 'this is the CODEOWNERS deadlock and another' <<<"$ADVISORY_BLOCK"; then
+  fail "#1061: the advisory still asserts the CODEOWNERS deadlock from the mere existence of an approval — multi-approval and specific-CODEOWNER rules produce the same state and ARE cleared by another 4b round"
+else
+  pass "#1061: the advisory no longer treats one approval as proof of the CODEOWNERS deadlock"
+fi
+if grep -qE 'MORE of them|specific CODEOWNER' <<<"$ADVISORY_BLOCK"; then
+  pass "#1061: the advisory names the multi-approval / specific-CODEOWNER cases that another 4b round does clear"
+else
+  fail "#1061: the advisory does not mention the states where a further Phase 4b round is the correct remedy"
+fi
+
 echo ""
 echo "test_codex_review_check_required_checks: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
