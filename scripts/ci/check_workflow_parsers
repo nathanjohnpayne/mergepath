@@ -794,6 +794,18 @@ else
   echo "$legacy_csv_join" | sed 's/^/    /' >&2
 fi
 
+# shellcheck source=scripts/lib/blocking-labels.sh
+source scripts/lib/blocking-labels.sh
+assert_eq "blocking-label helper preserves a lone unterminated final record" \
+  "human-hold" \
+  "$(printf '%s' 'human-hold' | mergepath_blocking_labels_csv)"
+assert_eq "blocking-label helper preserves the final unterminated record after other labels" \
+  "needs-human-review,human-hold" \
+  "$(printf 'other\nneeds-human-review\nhuman-hold' | mergepath_blocking_labels_csv)"
+assert_eq "blocking-label helper ignores non-blocking unterminated records" \
+  "" \
+  "$(printf '%s' 'observation' | mergepath_blocking_labels_csv)"
+
 if grep -Fq 'source scripts/lib/blocking-labels.sh' ".github/workflows/agent-review.yml" \
   && grep -Fq 'needs-external-review|needs-human-review|policy-violation|human-hold)' scripts/lib/blocking-labels.sh; then
   pass=$((pass + 1))
