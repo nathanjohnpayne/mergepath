@@ -104,6 +104,20 @@ else
   fail "codex-review-check.sh does not let CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE override the policy value (#727)"
 fi
 
+# ── 3d. Structural (#1062): the completed-workflow continuation can reuse
+#      gates (a) and (b) without imposing gate (c) on an under-threshold PR.
+#      The mode is an explicit non-inheritable flag, requires a real registered
+#      APPROVED review (no same-agent exclusion and no Codex branch-2
+#      substitution), and returns before gate (c).
+if grep -q -- '--approval-readiness-only' "$SCRIPT" \
+   && grep -q 'APPROVAL_READINESS_ONLY=1' "$SCRIPT" \
+   && grep -q 'GATE_B_SAME_AGENT_REVIEWER=""' "$SCRIPT" \
+   && grep -q 'external clearance intentionally delegated to the threshold-aware merge-clearance gate' "$SCRIPT"; then
+  pass "approval-readiness mode reuses current-head CI/annex plus registered approval without imposing Phase 4 (#1062)"
+else
+  fail "approval-readiness mode is missing its explicit flag, under-threshold reviewer semantics, or pre-gate-(c) return (#1062)"
+fi
+
 # ── 4. Inline logic: the verdict-matching jq filter. KEEP IN SYNC with
 #      scripts/codex-review-check.sh CODEX_VERDICT_JSON. The filter selects the
 #      LATEST HEAD-anchored verdict FIRST (any disposition), then requires that

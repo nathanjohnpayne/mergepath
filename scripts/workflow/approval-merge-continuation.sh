@@ -69,6 +69,17 @@ labels=$(blocking_labels <<<"$initial")
 [ -z "$labels" ] || not_ready "blocking labels present: $labels"
 
 set +e
+CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+  bash "$ROOT/scripts/codex-review-check.sh" --approval-readiness-only "$PR_NUMBER" "$REPO"
+readiness_rc=$?
+set -e
+case "$readiness_rc" in
+  0) ;;
+  1) not_ready "registered approval or current-head CI/annex readiness is not satisfied" ;;
+  *) infra_error "approval-readiness predicate returned rc=$readiness_rc" ;;
+esac
+
+set +e
 bash "$ROOT/scripts/merge-clearance-gate.sh" "$PR_NUMBER" "$REPO"
 gate_rc=$?
 set -e

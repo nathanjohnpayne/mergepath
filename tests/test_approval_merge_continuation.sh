@@ -42,11 +42,15 @@ exit 90
 STUB
 chmod +x "$TMP/bin/gh"
 
-for script in merge-clearance-gate.sh review-feedback-accounting.sh resolve-pr-threads.sh; do
+for script in codex-review-check.sh merge-clearance-gate.sh review-feedback-accounting.sh resolve-pr-threads.sh; do
   cat > "$TMP/root/scripts/$script" <<'STUB'
 #!/usr/bin/env bash
 name="${0##*/}"
 case "$name" in
+  codex-review-check.sh)
+    printf 'head_pin=%s args=[%s]\n' "${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-unset}" "$*" >> "${STUB_DIR:?}/readiness.log"
+    exit "${STUB_READINESS_RC:-0}"
+    ;;
   merge-clearance-gate.sh) exit "${STUB_GATE_RC:-0}" ;;
   review-feedback-accounting.sh) exit "${STUB_ACCOUNTING_RC:-0}" ;;
   resolve-pr-threads.sh) exit "${STUB_THREADS_RC:-0}" ;;
@@ -72,10 +76,12 @@ run_case() {
   : > "$TMP/read-count"
   echo 0 > "$TMP/read-count"
   : > "$TMP/merge.log"
+  : > "$TMP/readiness.log"
   printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}" > "$TMP/root/policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
     STUB_INITIAL="${STUB_INITIAL:-$BASE}" STUB_FINAL="${STUB_FINAL:-${STUB_INITIAL:-$BASE}}" \
-    STUB_GATE_RC="${STUB_GATE_RC:-0}" STUB_ACCOUNTING_RC="${STUB_ACCOUNTING_RC:-0}" \
+    STUB_READINESS_RC="${STUB_READINESS_RC:-0}" STUB_GATE_RC="${STUB_GATE_RC:-0}" \
+    STUB_ACCOUNTING_RC="${STUB_ACCOUNTING_RC:-0}" \
     STUB_THREADS_RC="${STUB_THREADS_RC:-0}" STUB_LOGIN="${STUB_LOGIN:-nathanjohnpayne}" \
     STUB_LOGIN_RC="${STUB_LOGIN_RC:-0}" STUB_MERGE_RC="${STUB_MERGE_RC:-0}" \
     bash "$TMP/subject.sh" 7 owner/repo >"$TMP/subject.out" 2>&1
@@ -90,7 +96,8 @@ assert_not_ready() {
   if [ "$rc" -eq 4 ] && [ ! -s "$TMP/merge.log" ]; then pass "$label"; else fail "$label (rc=$rc)"; fi
 }
 
-STUB_GATE_RC=1 assert_not_ready "pending threshold-aware gate defers without arming"
+STUB_READINESS_RC=1 assert_not_ready "missing registered approval or incomplete current-head CI/annex defers without arming"
+STUB_READINESS_RC=0 STUB_GATE_RC=1 assert_not_ready "pending threshold-aware external gate defers without arming"
 STUB_GATE_RC=0 STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"human-hold"}]}' assert_not_ready "blocking label defers before gate work"
 STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"documentation"}]}' STUB_FINAL="$BASE"
 if run_case && [ -s "$TMP/merge.log" ]; then
@@ -114,10 +121,12 @@ STUB_ACCOUNTING_RC=0 STUB_THREADS_RC=3 assert_not_ready "unresolved conversation
 STUB_THREADS_RC=0 STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"def456","url":"https://example.test/pr/7","labels":[]}' assert_not_ready "head drift during evaluation defers without arming"
 
 STUB_FINAL="$BASE"
-if run_case && grep -Fq 'pr merge https://example.test/pr/7 --repo owner/repo --squash --auto --match-head-commit abc123' "$TMP/merge.log"; then
+if run_case \
+   && grep -Fq 'head_pin=1 args=[--approval-readiness-only 7 owner/repo]' "$TMP/readiness.log" \
+   && grep -Fq 'pr merge https://example.test/pr/7 --repo owner/repo --squash --auto --match-head-commit abc123' "$TMP/merge.log"; then
   pass "under-threshold clearance arms auto-merge against the exact re-read head"
 else
-  fail "under-threshold clearance must arm exact-head auto-merge (log: $(cat "$TMP/merge.log" 2>/dev/null || true); output: $(cat "$TMP/subject.out" 2>/dev/null || true))"
+  fail "under-threshold clearance must require exact-head registered approval/CI readiness and arm exact-head auto-merge (readiness: $(cat "$TMP/readiness.log" 2>/dev/null || true); merge: $(cat "$TMP/merge.log" 2>/dev/null || true); output: $(cat "$TMP/subject.out" 2>/dev/null || true))"
 fi
 
 STUB_EXPECTED_AUTHOR=consumer-author STUB_LOGIN=consumer-author
