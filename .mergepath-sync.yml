@@ -591,6 +591,9 @@ paths:
   - path: scripts/lib/ci-check-modes.sh
     type: canonical
     consumers: all
+  - path: scripts/lib/blocking-labels.sh
+    type: canonical
+    consumers: all
   # Hub-side fleet audit for the propagation lane (#434); consumers
   # receive it because the scripts/ci kit's check_propagation_lane_audit
   # hard-requires it (and its offline test) on every lint run.
@@ -1381,6 +1384,7 @@ paths:
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
       - "scripts/lib/ci-check-modes.sh"          # shared --check/--self-test selector (#1062)
+      - "scripts/lib/blocking-labels.sh"         # check_workflow_parsers shared exact-label predicate (#1062)
       - "tests/test_repo_lint_optimization.sh"   # check_repo_lint_optimization
       - "tests/test_check_doc_ownership.sh"      # check_doc_ownership
       - "tests/test_gh_pr_guard.sh"            # check_gh_as_author

@@ -22,8 +22,9 @@ cd "$ROOT"
 FIXTURE="scripts/ci/fixtures/workflow-parsers/review-policy.sample.yml"
 PARSE="scripts/workflow/parse_policy_list.sh"
 MATCH="scripts/workflow/match_protected_paths.sh"
+BLOCKING_LABELS="scripts/lib/blocking-labels.sh"
 
-for f in "$FIXTURE" "$PARSE" "$MATCH"; do
+for f in "$FIXTURE" "$PARSE" "$MATCH" "$BLOCKING_LABELS"; do
   if [ ! -f "$f" ]; then
     echo "check_workflow_parsers: missing required file: $f" >&2
     exit 1
@@ -758,6 +759,18 @@ fi
 
 echo
 echo "agent-review.yml blocking-label exact-match regression (#370)"
+
+# shellcheck source=scripts/lib/blocking-labels.sh
+source "$BLOCKING_LABELS"
+assert_eq "blocking-label helper preserves a lone unterminated final record" \
+  "human-hold" \
+  "$(printf '%s' 'human-hold' | mergepath_blocking_labels_csv)"
+assert_eq "blocking-label helper preserves the final unterminated record after other labels" \
+  "needs-human-review,human-hold" \
+  "$(printf 'other\nneeds-human-review\nhuman-hold' | mergepath_blocking_labels_csv)"
+assert_eq "blocking-label helper ignores non-blocking unterminated records" \
+  "" \
+  "$(printf '%s' 'observation' | mergepath_blocking_labels_csv)"
 
 # The pre-merge recheck must treat GitHub labels as an array of exact
 # names. A CSV join plus `case "*,human-hold,*"` false-matches a legal
