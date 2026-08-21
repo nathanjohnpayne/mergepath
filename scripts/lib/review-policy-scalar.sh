@@ -22,7 +22,7 @@ review_policy_scalar() {  # <file> <key>
           } else if (c == sq) {
             quote = ""
           }
-        } else if (c == "\"" || c == sq) {
+        } else if (i == 1 && (c == "\"" || c == sq)) {
           quote = c
         } else if (c == "#" && (i == 1 || substr(value, i - 1, 1) ~ /[[:space:]]/)) {
           return substr(value, 1, i - 1)

@@ -66,6 +66,12 @@ got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALA
 printf '%s\n' 'author_identity: team # comment' > "$HASH_POLICY"
 got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
 [ "$got" = 'team' ] && pass "a separated unquoted hash still starts a YAML comment" || fail "separated comment scalar parsed as '$got'"
+printf '%s\n' 'author_identity: team" # comment' > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = 'team"' ] && pass "an interior double quote in a plain scalar does not swallow its trailing comment" || fail "interior double-quote scalar parsed as '$got'"
+printf '%s\n' "author_identity: team' # comment" > "$HASH_POLICY"
+got=$(bash -c 'source "$1"; review_policy_scalar "$2" author_identity' _ "$SCALAR_HELPER" "$HASH_POLICY")
+[ "$got" = "team'" ] && pass "an interior single quote in a plain scalar does not swallow its trailing comment" || fail "interior single-quote scalar parsed as '$got'"
 rm -f "$HASH_POLICY"
 trap - EXIT
 

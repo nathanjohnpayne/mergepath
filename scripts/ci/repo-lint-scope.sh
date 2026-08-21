@@ -26,6 +26,7 @@ if [ ! -f "$GRAPH" ] || ! command -v jq >/dev/null 2>&1 \
      and (.full_triggers | type == "array")
      and all(.full_triggers[]; type == "string")
      and (.wrappers | type == "object")
+     and all(.wrappers | keys[]; test("^check_[A-Za-z0-9_]+$"))
      and all(.wrappers | to_entries[];
        (.value | type == "array")
        and all(.value[]; type == "string"))

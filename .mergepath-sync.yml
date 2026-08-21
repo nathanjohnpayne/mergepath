@@ -630,6 +630,7 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/blocking-labels.sh"
+      - "scripts/lib/review-policy-scalar.sh"
   - path: tests/test_repo_lint_latency_report.sh
     type: canonical
     consumers: all

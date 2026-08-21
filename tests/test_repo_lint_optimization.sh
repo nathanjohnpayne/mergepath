@@ -174,6 +174,22 @@ JSON
   else
     fail "dependency graph arrays must contain only strings (got $malformed_members)"
   fi
+
+  invalid_name_root=$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-invalid-name.XXXXXX")
+  mkdir -p "$invalid_name_root/scripts/ci"
+  cp "$SCOPE" "$invalid_name_root/scripts/ci/repo-lint-scope.sh"
+  cat > "$invalid_name_root/scripts/ci/repo-lint-dependencies.json" <<'JSON'
+{"version":1,"full_triggers":[".github/**"],"wrappers":{"lint_wrapper":["scripts/example.sh"]}}
+JSON
+  invalid_name=$(printf '%s\n' scripts/example.sh | bash "$invalid_name_root/scripts/ci/repo-lint-scope.sh" --event pull_request 2>/dev/null)
+  rm -rf "$invalid_name_root"
+  if grep -Fxq 'deep=true' <<<"$invalid_name" \
+     && grep -Fxq 'full=true' <<<"$invalid_name" \
+     && grep -Fxq 'checks=[]' <<<"$invalid_name"; then
+    pass "invalid wrapper names fail closed before reaching the shared selector"
+  else
+    fail "dependency graph wrapper keys must match the selector contract (got $invalid_name)"
+  fi
 fi
 
 if ! command -v yq >/dev/null 2>&1; then
