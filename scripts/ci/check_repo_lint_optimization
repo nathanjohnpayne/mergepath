@@ -5,6 +5,27 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST="$REPO_ROOT/tests/test_repo_lint_optimization.sh"
 
+# Consumer guard, marker-FIRST (docs/agents/propagation-ordering.md
+# § repo_lint.yml travels in waves). tests/test_repo_lint_optimization.sh
+# is a canonical manifest path, so it lands on every consumer -- but it is
+# a hub SELF-TEST: it asserts on hub-only artifacts the manifest never
+# delivers (tests/test_consumer_residue_safety.sh), on hub-only artifacts a
+# stale bootstrap left behind at a different revision
+# (tests/test_repo_lint_consumer_safety.sh), and on a non-manifest workflow
+# frozen at bootstrap (.github/workflows/md-prose-wrap.yml). None of those
+# are facts about the consumer, so the suite cannot pass there and its
+# failure says nothing about the consumer's own lint wiring.
+#
+# The decision is a function of the marker ALONE, never of the wrapped
+# test's presence: the older both-absent idiom reads an artifact a stale
+# bootstrap may have left behind. Measured on gaycruisebingo#1024, where
+# the suite reported 47 passed / 6 failed against exactly those three
+# hub-only surfaces.
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_repo_lint_optimization: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent)"
+  exit 0
+fi
+
 if [ ! -f "$TEST" ]; then
   echo "check_repo_lint_optimization: ERROR (missing $TEST)" >&2
   exit 1
