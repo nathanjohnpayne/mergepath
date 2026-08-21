@@ -359,6 +359,10 @@ MARKER_ONLY_CONSUMER_GATES=(
   # only. tests/test_check_doc_ownership.sh is manifest-delivered with
   # the wrapper, so no bootstrap-residue path remains to enumerate.
   "check_doc_ownership"
+  # Gate: .github/workflows/auto-clear-blocking-labels.yml plus the
+  # continuation contract and reporter. All three are manifest-delivered,
+  # so their absence can only be first-rollout skew, never hub-only residue.
+  "check_auto_clear_workflow"
 )
 
 is_marker_only_gate() {

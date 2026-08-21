@@ -16,6 +16,7 @@ CONTINUATION_REPORTER="$ROOT/scripts/workflow/report-approval-continuation-failu
 
 pass=0
 fail=0
+skip_reason=""
 
 # ── Test 1: workflow file exists and is valid YAML
 echo "auto-clear-blocking-labels.yml structural tests"
@@ -49,7 +50,8 @@ elif python3 -c "import yaml" >/dev/null 2>&1; then
     echo "  FAIL: workflow YAML invalid (per python+PyYAML)" >&2
   fi
 else
-  echo "  SKIP: no YAML parser available (install yq or PyYAML for this check)"
+  skip_reason="no YAML parser available; install yq or PyYAML for the parse assertion"
+  echo "  INFO: $skip_reason"
 fi
 
 # ── Test 2: required triggers present
@@ -676,12 +678,16 @@ fi
 echo
 if [ "$fail" -eq 0 ]; then
   if [ ! -f "$CONTINUATION_TEST" ]; then
-    echo "check_auto_clear_workflow: SKIP (approval continuation test not present in this consumer checkout)"
+    skip_reason="approval continuation test not present in this consumer checkout"
   elif ! bash "$CONTINUATION_TEST"; then
     echo "check_auto_clear_workflow: FAIL (approval continuation contract)" >&2
     exit 1
   fi
-  echo "check_auto_clear_workflow: PASS ($pass tests)"
+  if [ -n "$skip_reason" ]; then
+    echo "check_auto_clear_workflow: SKIP ($skip_reason)"
+  else
+    echo "check_auto_clear_workflow: PASS ($pass tests)"
+  fi
   exit 0
 else
   echo "check_auto_clear_workflow: FAIL ($fail of $((pass + fail)) tests)" >&2

@@ -121,7 +121,7 @@ final_labels=$(blocking_labels <<<"$final")
 [ "$final_head" = "$head" ] || not_ready "head changed during evaluation"
 [ -z "$final_labels" ] || not_ready "blocking labels appeared: $final_labels"
 
-if ! gh pr merge "$url" --repo "$REPO" --squash --auto --match-head-commit "$final_head"; then
+if ! gh pr merge "$url" --repo "$REPO" --squash --auto --match-head-commit "$final_head"; then # NO_BARE_GH_WRITE_EXEMPT: the effective token was verified above against the governing author_identity before this exact-head merge write
   infra_error "could not enable exact-head auto-merge"
 fi
 echo "approval continuation: armed exact-head auto-merge for $REPO#$PR_NUMBER at $final_head"

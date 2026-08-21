@@ -325,6 +325,11 @@ else
 fi
 
 for harness in "$CONSUMER_HARNESS" "$RESIDUE_HARNESS"; do
+  if [ ! -f "$harness" ] && [ "$harness" = "$CONSUMER_HARNESS" ]; then
+    # The production consumer fixture deliberately omits this hub-only replay
+    # harness; the explicit assertion below verifies that omission.
+    continue
+  fi
   if grep -Fq 'repo-lint-check-selection.sh' "$harness" \
      && grep -Fq 'repo_lint_check_is_selected' "$harness"; then
     pass "${harness##*/} applies the shared affected-wrapper selection"
