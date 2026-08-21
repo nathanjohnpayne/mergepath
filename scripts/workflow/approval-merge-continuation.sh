@@ -69,13 +69,13 @@ labels=$(blocking_labels <<<"$initial")
 [ -z "$labels" ] || not_ready "blocking labels present: $labels"
 
 set +e
-bash "$ROOT/scripts/codex-review-check.sh" "$PR_NUMBER" "$REPO"
+bash "$ROOT/scripts/merge-clearance-gate.sh" "$PR_NUMBER" "$REPO"
 gate_rc=$?
 set -e
 case "$gate_rc" in
   0) ;;
-  1) not_ready "merge-clearance predicate is not satisfied" ;;
-  *) infra_error "merge-clearance predicate returned rc=$gate_rc" ;;
+  1) not_ready "threshold-aware merge-clearance predicate is not satisfied" ;;
+  *) infra_error "threshold-aware merge-clearance predicate returned rc=$gate_rc" ;;
 esac
 
 set +e

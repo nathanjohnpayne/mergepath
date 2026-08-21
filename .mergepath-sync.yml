@@ -1254,6 +1254,7 @@ paths:
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/approval-merge-continuation.sh"
+      - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-review-check.sh"
       - "scripts/review-feedback-accounting.sh"
       - "scripts/resolve-pr-threads.sh"

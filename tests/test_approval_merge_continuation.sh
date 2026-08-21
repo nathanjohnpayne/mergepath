@@ -42,12 +42,12 @@ exit 90
 STUB
 chmod +x "$TMP/bin/gh"
 
-for script in codex-review-check.sh review-feedback-accounting.sh resolve-pr-threads.sh; do
+for script in merge-clearance-gate.sh review-feedback-accounting.sh resolve-pr-threads.sh; do
   cat > "$TMP/root/scripts/$script" <<'STUB'
 #!/usr/bin/env bash
 name="${0##*/}"
 case "$name" in
-  codex-review-check.sh) exit "${STUB_GATE_RC:-0}" ;;
+  merge-clearance-gate.sh) exit "${STUB_GATE_RC:-0}" ;;
   review-feedback-accounting.sh) exit "${STUB_ACCOUNTING_RC:-0}" ;;
   resolve-pr-threads.sh) exit "${STUB_THREADS_RC:-0}" ;;
 esac
@@ -90,7 +90,7 @@ assert_not_ready() {
   if [ "$rc" -eq 4 ] && [ ! -s "$TMP/merge.log" ]; then pass "$label"; else fail "$label (rc=$rc)"; fi
 }
 
-STUB_GATE_RC=1 assert_not_ready "pending canonical gate defers without arming"
+STUB_GATE_RC=1 assert_not_ready "pending threshold-aware gate defers without arming"
 STUB_GATE_RC=0 STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"human-hold"}]}' assert_not_ready "blocking label defers before gate work"
 STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"documentation"}]}' STUB_FINAL="$BASE"
 if run_case && [ -s "$TMP/merge.log" ]; then
@@ -115,9 +115,9 @@ STUB_THREADS_RC=0 STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"def4
 
 STUB_FINAL="$BASE"
 if run_case && grep -Fq 'pr merge https://example.test/pr/7 --repo owner/repo --squash --auto --match-head-commit abc123' "$TMP/merge.log"; then
-  pass "clean continuation arms auto-merge against the exact re-read head"
+  pass "under-threshold clearance arms auto-merge against the exact re-read head"
 else
-  fail "clean continuation must arm exact-head auto-merge (log: $(cat "$TMP/merge.log" 2>/dev/null || true); output: $(cat "$TMP/subject.out" 2>/dev/null || true))"
+  fail "under-threshold clearance must arm exact-head auto-merge (log: $(cat "$TMP/merge.log" 2>/dev/null || true); output: $(cat "$TMP/subject.out" 2>/dev/null || true))"
 fi
 
 STUB_EXPECTED_AUTHOR=consumer-author STUB_LOGIN=consumer-author
