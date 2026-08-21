@@ -1029,10 +1029,9 @@ fi
 
 # 2f-bis. Within the propagation lane step, the verified-head marker MUST be
 # posted BEFORE the label removal (Codex r9): the removal fires the unlabeled
-# re-arm, whose rc=5 branch derives requiredness via merge-clearance-gate.sh's
-# lane_verified() marker read — marker-after-removal opens a window where the
-# derivation treats the exemption as an ordinary above-threshold arm and
-# downgrades a CodeRabbit rate-limit stall with neither bot having reviewed.
+# re-arm and trusted continuation, both of which read the marker as the
+# HEAD-pinned propagation-lane clearance. Marker-after-removal opens a window
+# where the continuation evaluates an approved PR without that clearance.
 if awk '
   /- name: Propagation PR review lane/ {f=1}
   f && /gh pr comment/ && !m {m=NR}
@@ -1044,7 +1043,7 @@ if awk '
   echo "  PASS: propagation lane posts the verified-head marker before removing the label (#620)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the propagation lane must post the verified-head marker BEFORE the needs-external-review removal — the removal-fired re-arm reads the marker, so marker-after-removal races the rc=5 exemption exclusion (#620)" >&2
+  echo "  FAIL: the propagation lane must post the verified-head marker BEFORE the needs-external-review removal — the removal-fired continuation reads the marker, so marker-after-removal races the propagation clearance (#620)" >&2
 fi
 
 # 3. A dedicated approval gate runs on the pull_request (re-arm) path and,
@@ -1354,15 +1353,15 @@ else
 fi
 
 echo
-echo "agent-review.yml required-check wait: workflow-disambiguated check matching (#655 Codex P2 rounds 4-5, 11)"
+echo "agent-review.yml readiness probe: workflow-disambiguated check matching (#655 Codex P2 rounds 4-5, 11)"
 if grep -Fq 'select($workflow == "" or (.workflowName // "") == $workflow)' .github/workflows/agent-review.yml && \
    grep -Fq 'group_by(.workflowName // "")' .github/workflows/agent-review.yml && \
    grep -Fq 'sort_by(.completedAt // .startedAt // "")' .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review required-check wait matches by (name, workflow) via statusCheckRollup, grouping by workflow and picking the latest completed run per group when nothing is pending (#655)"
+  echo "  PASS: agent-review readiness probe matches by (name, workflow) via statusCheckRollup, grouping by workflow and picking the latest completed run per group when nothing is pending (#655)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: agent-review required-check wait must disambiguate by workflow via statusCheckRollup and pick the latest run per check (#655)" >&2
+  echo "  FAIL: agent-review readiness probe must disambiguate by workflow via statusCheckRollup and pick the latest run per check (#655)" >&2
 fi
 
 # #655 Codex P2 round 11 ("restrict the lint wait to the required
@@ -1376,18 +1375,18 @@ fi
 # additionally scope the workflow=="" match to only entries branch
 # protection actually requires when GitHub reports at least one such
 # entry. If no same-name entry reports required=true, keep the configured
-# check wait instead of treating branch-protection metadata as mandatory.
+# configured check instead of treating branch-protection metadata as mandatory.
 echo
-echo "agent-review.yml required-check wait: isRequired-preferred canonical match (#655 Codex P2 round 11/15)"
+echo "agent-review.yml readiness probe: isRequired-preferred canonical match (#655 Codex P2 round 11/15)"
 if grep -Fq 'gh api graphql -f query=' .github/workflows/agent-review.yml && \
    grep -Fq 'isRequired(pullRequestNumber: $number)' .github/workflows/agent-review.yml && \
    grep -Fq '([$name_matches[] | select(.isRequired == true)]) as $required_matches' .github/workflows/agent-review.yml && \
    grep -Fq 'if $workflow == "" and ($required_matches | length) > 0' .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review required-check wait fetches statusCheckRollup via graphql and prefers isRequired==true entries when present (#655 round 11/15)"
+  echo "  PASS: agent-review readiness probe fetches statusCheckRollup via graphql and prefers isRequired==true entries when present (#655 round 11/15)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: agent-review required-check wait does not fetch isRequired or prefer required matches with a configured-check fallback (#655 round 11/15)" >&2
+  echo "  FAIL: agent-review readiness probe does not fetch isRequired or prefer required matches with a configured-check fallback (#655 round 11/15)" >&2
 fi
 
 echo "dependabot-auto-merge.yml author-token equality regression (#426)"

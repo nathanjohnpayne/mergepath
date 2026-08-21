@@ -28,10 +28,11 @@ else
 fi
 
 if grep -Fq 'runs?per_page=$LIMIT' "$SUBJECT" \
-   && ! grep -Fq -- '--paginate "repos/$REPO/actions/workflows/repo_lint.yml/runs' "$SUBJECT"; then
-  pass "live collection bounds the workflow-runs API request before download"
+   && ! grep -Fq -- '--paginate "repos/$REPO/actions/workflows/repo_lint.yml/runs' "$SUBJECT" \
+   && grep -Fq 'jobs-$run_id.json' "$SUBJECT"; then
+  pass "live collection is bounded and retains raw per-run job evidence"
 else
-  fail "live collection must not paginate all history before applying its limit"
+  fail "live collection must bound run history and preserve raw job responses"
 fi
 
 jq -n '{runs:[range(0;20) as $i | {

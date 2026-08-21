@@ -28,7 +28,7 @@ This event-driven path does not treat CodeRabbit as an additional merge requirem
 
 ## Latency telemetry
 
-`.github/workflows/repo-lint-latency.yml` runs daily and on manual dispatch from the trusted default branch. `scripts/repo-lint-latency-report.sh` reads the most recent completed `repo-lint` workflow runs and their job/step timing records through the Actions API, writes normalized run data plus JSON and Markdown summaries, publishes the Markdown to the Actions job summary, and uploads the complete evidence as a retained artifact.
+`.github/workflows/repo-lint-latency.yml` runs daily and on manual dispatch from the trusted default branch. `scripts/repo-lint-latency-report.sh` reads the most recent completed `repo-lint` workflow runs and their job/step timing records through the Actions API, retains the selected raw workflow-run list and complete per-run job responses, writes normalized run data plus JSON and Markdown summaries, publishes the Markdown to the Actions job summary, and uploads that evidence as a retained artifact.
 
 An ordinary pull-request sample is a successful `pull_request` run with no active `deep-safety` job. A deep/governance sample is a successful `pull_request` run with at least one active `deep-safety` job. The report uses nearest-rank percentiles and requires at least 20 samples in a segment before enforcing ordinary p50 <= 5 minutes, ordinary p95 <= 8 minutes, and deep/governance p95 <= 12 minutes. A smaller sample is visible as `insufficient-sample`, not a false regression. Distinct workflow run IDs on the same head SHA are a duplicate-execution alert even when one duplicate failed or was cancelled. Threshold or duplication alerts fail the scheduled audit while preserving the summary and artifact.
 

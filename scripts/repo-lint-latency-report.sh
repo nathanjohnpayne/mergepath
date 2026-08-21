@@ -64,10 +64,16 @@ else
   while IFS= read -r run; do
     [ -n "$run" ] || continue
     run_id=$(jq -r '.id' <<<"$run")
-    if ! jobs=$(gh api --paginate "repos/$REPO/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs[]' | jq -s '.'); then
+    jobs_file="$OUT_DIR/jobs-$run_id.json"
+    # Retain the complete job objects (including IDs, timestamps, URLs, and
+    # raw step records) beside the normalized report so the artifact can
+    # support a later audit without re-querying mutable Actions history.
+    if ! gh api --paginate "repos/$REPO/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs[]' \
+        | jq -s '.' > "$jobs_file"; then
       echo "repo-lint latency: could not fetch jobs for run $run_id" >&2
       exit 3
     fi
+    jobs=$(<"$jobs_file")
     jq -cn --argjson run "$run" --argjson jobs "$jobs" '
       def seconds($start; $end):
         if ($start == null or $end == null) then null

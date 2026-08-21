@@ -15,11 +15,11 @@
 #
 # Round 6 (Codex P1/P2) rewrote how agent-review.yml enforces the annex:
 # rather than forcing its derived check name(s) into the hard-required
-# required_checks_json list (which deadlocked the wait loop forever on a
+# required_checks_json list (which deadlocked the old runner-held wait on a
 # path-filtered or all-matrix annex that would never report under any
 # derivable name), it now captures the annex's own workflow name
-# (annex_workflow) and runs a separate workflow-wide bad/pending scan each
-# poll iteration — the same design codex-review-check.sh gate (a) already
+# (annex_workflow) and runs a separate workflow-wide bad/pending scan in each
+# readiness evaluation — the same design codex-review-check.sh gate (a) already
 # uses for the identical reason.
 #
 # The workflow files here cannot be unit-executed without a full Actions
@@ -53,19 +53,19 @@ assert_not_grep() {  # <label> <file> <fixed-string>
 
 W=.github/workflows
 
-# agent-review.yml: the required-check wait probes the PR HEAD commit for
+# agent-review.yml: the required-check readiness probe reads the PR HEAD for
 # the annex file via the Contents API (not the job's own checkout) and
 # conditionally scans its check run(s) alongside lint.
 assert_grep "agent-review: probes for the repo_lint_local.yml annex at the PR HEAD commit (#655)" \
   "$W/agent-review.yml" 'repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$sha'
-assert_grep "agent-review: the wait loop iterates over the required_checks_json array, not one hardcoded name" \
+assert_grep "agent-review: the readiness probe evaluates the required_checks_json array, not one hardcoded name" \
   "$W/agent-review.yml" 'for ((i = 0; i < check_count; i++)); do'
 
 # Codex P2 (#655 round 6, "avoid forcing path-filtered annex jobs to
 # start"): a consumer annex scoped by workflow-level paths/paths-ignore
 # legitimately never reports under ANY derived name for an out-of-scope
 # PR, so forcing one into required_checks_json (rounds 4-5's approach)
-# made this loop wait out the full deadline and refuse auto-merge forever.
+# made the former wait refuse auto-merge forever.
 # required_checks_json must stay scoped to only the canonical check;
 # annex enforcement moves to a name-free workflow-wide scan instead.
 assert_grep "agent-review: required_checks_json stays scoped to only the canonical check (#655 round 6)" \
@@ -198,8 +198,8 @@ assert_grep "agent-review: requires every matched workflow group to be green, no
 # literally "PENDING" -- round 7 added "EXPECTED" (GitHub's "waiting for a
 # status to be reported" state, distinct from PENDING but equally
 # non-terminal): without it, a required external status context sitting in
-# EXPECTED aborted the wait loop as a failure instead of continuing to
-# poll. A CheckRun is non-terminal whenever .status is present and not
+# EXPECTED made the old wait abort as a failure instead of treating the
+# check as not ready. A CheckRun is non-terminal whenever .status is present and not
 # "COMPLETED". This predicate is shared by the winner selection, the
 # pending-count check, and the annex workflow-wide scan.
 assert_grep "agent-review: a status-context entry is pending when .state is PENDING or EXPECTED, not merely lacking .status (#655 rounds 6-7)" \
@@ -261,7 +261,7 @@ assert_grep "agent-review: alias token-count guard requires a line-anchored dash
 # optional.
 assert_grep "agent-review: reads the on: trigger via the true-key fallback (YAML 1.1 Norway-problem coercion) (#655 round 7)" \
   "$W/agent-review.yml" 'on = doc.key?("on") ? doc["on"] : doc[true]'
-assert_grep "agent-review: keeps polling (does not silently pass) when an unfiltered annex has zero reported entries (#655 round 7)" \
+assert_grep "agent-review: reports not-ready when an unfiltered annex has zero reported entries (#655 round 7)" \
   "$W/agent-review.yml" 'if [ "$annex_match_count" -eq 0 ] && [ "$annex_unfiltered" = "true" ]; then'
 assert_grep "agent-review: a path-filtered annex with zero reported entries still does not block (Finding O, round 6, preserved)" \
   "$W/agent-review.yml" 'has not reported yet (unfiltered trigger, so it is expected to)'
@@ -515,7 +515,7 @@ assert_not_grep "agent-review: does not accumulate the rollup through an unbound
 # behavioral half cannot fail — the explicit two-net lesson recorded in
 # the #750 test comments.
 echo ""
-echo "agent-review.yml oversized rollup accumulation — the wait loop survives a >128KB running total (#752/#754)"
+echo "agent-review.yml oversized rollup accumulation — the readiness probe survives a >128KB running total (#752/#754)"
 
 if [ ! -f "$W/agent-review.yml" ]; then
   echo "SKIP: agent-review.yml oversized rollup behavioral test (file absent)"; SKIP=$((SKIP + 1))
