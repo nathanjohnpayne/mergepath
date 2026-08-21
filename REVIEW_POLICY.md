@@ -57,14 +57,17 @@ For repo work, `GH_TOKEN` is now the per-command attribution source for the guar
 
 #### PAT lookup table
 
-> This is the **canonical source** for PAT lookups across the mergepath ecosystem. `CLAUDE.md` (project), `AGENTS.md`, and `DEPLOYMENT.md` all reference this section instead of duplicating the table. Machine-level `~/GitHub/CLAUDE.md` mirrors the same rows for cross-repo work. The same four identities also have SSH signing keys uploaded to GitHub — see the [SSH Signing Keys](#ssh-signing-keys) section below for the inventory + verify/re-upload commands.
+> This is the **canonical source** for PAT lookups across the mergepath ecosystem. `CLAUDE.md` (project), `AGENTS.md`, and `DEPLOYMENT.md` all reference this section instead of duplicating the table. Machine-level `~/GitHub/CLAUDE.md` mirrors the same rows for cross-repo work. The last row is a **CI service account, not a reviewer**: `nathanpayne-robot` holds no reviewer standing, is deliberately absent from `reviewer_pat_item_for()` in `scripts/op-preflight.sh` so `--agent robot` cannot resolve a reviewer PAT, and must never post a review — review state is what the no-self-approve and same-agent gates read. All five identities have SSH signing keys uploaded to GitHub — see the [SSH Signing Keys](#ssh-signing-keys) section below for the inventory + verify/re-upload commands.
 
 | Agent | Reviewer Identity | 1Password Item ID | Cached env var (primary) | `op read` path (setup-only fallback) |
 |-------|-------------------|-------------------|--------------------------|--------------------------------------|
 | Claude | `nathanpayne-claude` | `pvbq24vl2h6gl7yjclxy2hbote` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/pvbq24vl2h6gl7yjclxy2hbote/token` |
 | Cursor | `nathanpayne-cursor` | `bslrih4spwxgookzfy6zedz5g4` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/bslrih4spwxgookzfy6zedz5g4/token` |
-| Codex | `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
+| Codex | `nathanpayne-codex` | `etak327mpz4drd4byxszfex4vm` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/etak327mpz4drd4byxszfex4vm/token` |
 | Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `$OP_PREFLIGHT_AUTHOR_PAT` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
+| CI (not a reviewer) | `nathanpayne-robot` | `o6ekjxjjl5gq6rmcneomrjahpu` | *(none — CI only)* | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
+
+> **A 1Password item ID is not a stable identity.** On 2026-08-21 the item `o6ekjxjjl5gq6rmcneomrjahpu` was repurposed from Codex to the robot and Codex was recreated at `etak327mpz4drd4byxszfex4vm`; every row above still pointed at the old ID, so `--agent codex` silently resolved a **robot** token. Nothing in the table can catch that on its own — after any PAT rotation or item edit, re-verify each row by resolving **that row's** `op://` reference into `GH_TOKEN` and checking it — `GH_TOKEN="$(op read 'op://Private/<item-id>/token')" scripts/identity-check.sh --expect-token-identity <login>`. The bare `scripts/identity-check.sh --expect-token-identity <login>` form does **not** verify a table row: it checks whatever is already in `$GH_TOKEN`, so it exits 3 with no token set and otherwise validates a cached token rather than the newly edited item.
 
 **Cached-variable usage is the primary pattern.** After a single `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"` at session start, all subsequent API calls use the env var directly — no biometric burned per call:
 
@@ -101,7 +104,7 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 
 ### SSH Signing Keys
 
-> This is the **canonical source** for SSH signing key inventory across the mergepath ecosystem. Machine-level `~/GitHub/CLAUDE.md` mirrors the same rows for cross-repo work. Sister-table to the [PAT lookup table](#pat-lookup-table) above: both inventory the same four identities, just for different per-identity artifacts.
+> This is the **canonical source** for SSH signing key inventory across the mergepath ecosystem. Machine-level `~/GitHub/CLAUDE.md` mirrors the same rows for cross-repo work. Sister-table to the [PAT lookup table](#pat-lookup-table) above: both inventory the same five identities, just for different per-identity artifacts.
 
 Every identity in the [PAT lookup table](#pat-lookup-table) above also has an SSH signing key uploaded to its GitHub account so commits and tags attributed to that login render as **Verified** instead of the "this user has not yet uploaded their public signing key" notice. By convention every key on a given machine shares the title `<machine-name>-signing-key` (currently `mergepath-mac signing key` for the first Mac in the rotation; titles get per-machine suffixes once a second machine joins). The local pub keys live in `~/.ssh/keys/` and are referenced (for auth, not signing) by `~/.ssh/config`.
 
@@ -111,13 +114,14 @@ Every identity in the [PAT lookup table](#pat-lookup-table) above also has an SS
 | nathanpayne-claude  | `~/.ssh/keys/github_claude.pub`          | 949665                                |
 | nathanpayne-cursor  | `~/.ssh/keys/github_cursor.pub`          | 949666                                |
 | nathanpayne-codex   | `~/.ssh/keys/github_codex.pub`           | 949667                                |
+| nathanpayne-robot   | `~/.ssh/keys/github_robot.pub`           | 1128521                               |
 
-**Why all four — including the bot accounts.** Local `git commit` only ever signs as `nathanjohnpayne` (`git config --global user.signingkey` is the human identity per the active-account convention above), so the human's key is the one git invokes day-to-day. The bot accounts need keys uploaded so that GitHub-attributed activity verifies correctly under their logins: web-flow commits a bot makes via the GitHub UI, future API-authored commits via `PUT /repos/:owner/:repo/contents/:path`, or any other surface where GitHub does the signing on behalf of the bot identity. Without the upload, every such commit renders with the "this user has not yet uploaded their public signing key" notice and a yellow "Partial Verified" badge.
+**Why all five — including the bot and CI accounts.** Local `git commit` only ever signs as `nathanjohnpayne` (`git config --global user.signingkey` is the human identity per the active-account convention above), so the human's key is the one git invokes day-to-day. The bot accounts need keys uploaded so that GitHub-attributed activity verifies correctly under their logins: web-flow commits a bot makes via the GitHub UI, future API-authored commits via `PUT /repos/:owner/:repo/contents/:path`, or any other surface where GitHub does the signing on behalf of the bot identity. Without the upload, every such commit renders with the "this user has not yet uploaded their public signing key" notice and a yellow "Partial Verified" badge.
 
 **Verify** — read-only check, should return exactly one entry per account (titled `mergepath-mac signing key` on this Mac):
 
 ```bash
-for acct in nathanpayne-claude nathanpayne-cursor nathanpayne-codex nathanjohnpayne; do
+for acct in nathanpayne-claude nathanpayne-cursor nathanpayne-codex nathanpayne-robot nathanjohnpayne; do
   echo "=== $acct ==="
   GH_TOKEN="$(gh auth token --user "$acct")" \
     gh api /user/ssh_signing_keys --jq '.[] | {id, title, key: (.key[0:60])}'
@@ -127,7 +131,7 @@ done
 **Re-upload (missing key, revoked, or new machine bootstrap):**
 
 ```bash
-acct="nathanpayne-<bot>"          # claude | cursor | codex
+acct="nathanpayne-<bot>"          # claude | cursor | codex | robot
 pub="$HOME/.ssh/keys/github_<bot>.pub"
 GH_TOKEN="$(gh auth token --user "$acct")" gh api -X POST /user/ssh_signing_keys \
   -f "title=mergepath-mac signing key" \
