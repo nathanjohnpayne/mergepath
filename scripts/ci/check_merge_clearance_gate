@@ -19,6 +19,18 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+MODE_HELPER="scripts/lib/ci-check-modes.sh"
+if [ ! -f "$MODE_HELPER" ]; then
+  echo "check_merge_clearance_gate: ERROR $MODE_HELPER missing" >&2
+  exit 1
+fi
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: check_merge_clearance_gate [--check | --self-test]" >&2
+  exit 2
+fi
+
 SCRIPT="scripts/merge-clearance-gate.sh"
 # WORKFLOW path is overridable so the test suite can point the workflow-shape
 # assertions (in particular the job-name contract below) at a fixture without
@@ -1130,6 +1142,10 @@ fi
 # of already-covered fixtures on every repo_lint run.
 if [ "${MCG_PREFLIGHT_ONLY:-}" = "1" ]; then
   echo "check_merge_clearance_gate: PASS (preflight only)"
+  exit 0
+fi
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 0 ]; then
+  echo "check_merge_clearance_gate: PASS (live structure)"
   exit 0
 fi
 if ! command -v jq >/dev/null 2>&1; then

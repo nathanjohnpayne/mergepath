@@ -4,6 +4,17 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MODE_HELPER="$REPO_ROOT/scripts/lib/ci-check-modes.sh"
+if [ ! -f "$MODE_HELPER" ]; then
+  echo "check_coderabbit_wait: ERROR scripts/lib/ci-check-modes.sh missing" >&2
+  exit 1
+fi
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: check_coderabbit_wait [--check | --self-test]" >&2
+  exit 2
+fi
 TESTS=(
   "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh"
   "$REPO_ROOT/tests/test_coderabbit_wait_identity_derivation.sh"
@@ -19,17 +30,28 @@ if [ ! -x "$REPO_ROOT/scripts/coderabbit-wait.sh" ]; then
   echo "check_coderabbit_wait: ERROR scripts/coderabbit-wait.sh missing or not executable" >&2
   exit 1
 fi
+if ! bash -n "$REPO_ROOT/scripts/coderabbit-wait.sh"; then
+  echo "check_coderabbit_wait: ERROR scripts/coderabbit-wait.sh has invalid shell syntax" >&2
+  exit 1
+fi
 
-for TEST in "${TESTS[@]}"; do
-  if [ ! -x "$TEST" ]; then
-    echo "check_coderabbit_wait: ERROR $TEST missing or not executable" >&2
-    exit 1
-  fi
-done
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+  for TEST in "${TESTS[@]}"; do
+    if [ ! -x "$TEST" ]; then
+      echo "check_coderabbit_wait: ERROR $TEST missing or not executable" >&2
+      exit 1
+    fi
+  done
+fi
 
-if ! command -v jq >/dev/null 2>&1; then
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] && ! command -v jq >/dev/null 2>&1; then
   echo "check_coderabbit_wait: ERROR (jq is required — the wrapped suite would self-skip with exit 0 and report a green check over zero assertions)" >&2
   exit 1
+fi
+
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 0 ]; then
+  echo "check_coderabbit_wait: PASS (live structure and syntax)"
+  exit 0
 fi
 
 echo "check_coderabbit_wait: running coderabbit-wait status-probe tests"

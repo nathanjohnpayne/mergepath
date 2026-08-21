@@ -588,6 +588,9 @@ paths:
   - path: scripts/lib/lint-tooling.sh
     type: canonical
     consumers: all
+  - path: scripts/lib/ci-check-modes.sh
+    type: canonical
+    consumers: all
   # Hub-side fleet audit for the propagation lane (#434); consumers
   # receive it because the scripts/ci kit's check_propagation_lane_audit
   # hard-requires it (and its offline test) on every lint run.
@@ -605,6 +608,12 @@ paths:
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/gh-api-scalar.sh"
   - path: tests/test_audit_propagation_lane.sh
+    type: canonical
+    consumers: all
+  - path: tests/test_repo_lint_optimization.sh
+    type: canonical
+    consumers: all
+  - path: tests/test_check_doc_ownership.sh
     type: canonical
     consumers: all
   - path: scripts/merge-clearance-gate.sh
@@ -1325,6 +1334,7 @@ paths:
     consumers: all
     requires:
       - "scripts/ci/"   # every run: step executes a kit check — must travel together (#601)
+      - "tests/test_repo_lint_optimization.sh"  # parsed trigger/lane/aggregator contract (#1062)
 
   # NOTE: `.mergepath-sync.yml` is deliberately NOT propagated.
   # #268 briefly made it a canonical path on the theory the lane
@@ -1370,6 +1380,9 @@ paths:
     # closure gap that surfaced as #264 on the original propagation
     # wave (check_gh_as_author missing its tests on every consumer).
     requires:
+      - "scripts/lib/ci-check-modes.sh"          # shared --check/--self-test selector (#1062)
+      - "tests/test_repo_lint_optimization.sh"   # check_repo_lint_optimization
+      - "tests/test_check_doc_ownership.sh"      # check_doc_ownership
       - "tests/test_gh_pr_guard.sh"            # check_gh_as_author
       - "tests/test_gh_as_author.sh"           # check_gh_as_author
       - "tests/test_gh_as_reviewer.sh"         # check_gh_as_author

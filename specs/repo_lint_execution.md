@@ -1,0 +1,29 @@
+# Repo-lint execution model
+
+## Purpose
+
+The `repo-lint` workflow preserves one stable required context named `lint` while avoiding duplicate work and keeping exhaustive regression nets off unrelated pull requests' critical path.
+
+## Event contract
+
+Pull-request heads run through `pull_request` only. Feature-branch pushes do not start a second copy of `repo-lint`, Markdown prose wrapping, or OWL validation. A `push` run is retained for `main`, and pull-request concurrency cancels an older in-progress head when a newer commit arrives. Scheduled and manually dispatched `repo-lint` runs execute deep CI in Mergepath and in consumers that carry the canonical `scripts/ci/` kit; kit-less consumers have no deep implementation to execute.
+
+## Scope classifier
+
+`scripts/ci/repo-lint-scope.sh` is the single scope decision. A pull request enters deep CI when it changes CI workflows, scripts, tests, specifications, rules, agent operating documentation, architecture decisions, either repository manifest, `AGENTS.md`, `REVIEW_POLICY.md`, or `ai_agent_tooling_standard.md`. Other pull requests use the fast lane. An unreadable pull-request diff fails closed to deep CI, and every non-pull-request event is deep once the canonical `scripts/ci/` kit is present. A consumer checkout that intentionally or temporarily lacks that kit emits `deep=false` because it has no deep check implementation to execute; the hub fails instead of taking this exception.
+
+This path classifier intentionally begins conservatively. It may run more deep CI than a future machine-readable wrapper dependency graph would require, but it must not skip a regression net after its implementation, fixtures, propagation contract, or governance inputs change.
+
+## Required result
+
+`lint-fast` always runs the live repository assertions. The consumer and residue legs of the `deep-safety` matrix run in parallel only when the scope output is `deep=true`; the single matrix declaration keeps their isolated fixtures from duplicating workflow setup logic. An always-running aggregator publishes the required `lint` result and fails unless the fast lane succeeds and the matrix has the result appropriate to the selected scope. Path filtering therefore never leaves branch protection waiting for a missing required context.
+
+The token-output gate uses `--scan` in the fast lane and `--self-test` in deep CI. Documentation ownership uses `--check` in the fast lane and `--self-test` in deep CI. The complete consumer simulation and residue lattice remain deep-CI checks. Consumer simulation recognizes only a wrapper's canonical `<check>: SKIP (...)` line as a skipped verdict; nested test output containing `SKIP` does not change the wrapper result.
+
+## Approval coordination
+
+The agent-review workflow continues to wait for current-head checks before its final blocking-label recheck. Native auto-merge cannot replace that ordering because repository policy labels are not branch-protection requirements; arming it while checks are pending would allow a late `human-hold` or other blocking label to be missed. Replacing the approval runner wait therefore requires a separate event-driven continuation that rechecks labels after required checks complete and is outside this execution-model change.
+
+## Regression contract
+
+`tests/test_repo_lint_optimization.sh` validates triggers, concurrency, scope selection, the stable aggregator, split gate modes, consumer verdict classification, and the required-check-before-label ordering. `tests/test_655_repo_lint_local_observed.sh` retains the current-head wait semantics for the canonical required check and optional annex.

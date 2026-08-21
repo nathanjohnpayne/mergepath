@@ -9,7 +9,7 @@ Agent instructions are organized into focused sub-files under `docs/agents/`. Re
 3. **[Agent Operating Rules](docs/agents/operating-rules.md)** --- This repo's local overlay: reading order, conflict resolution, and anything true only here
 4. **[Code Modification Rules](docs/agents/code-modification-rules.md)** --- File creation, duplication, directory constraints
 5. **[Documentation Rules](docs/agents/documentation-rules.md)** --- When and what to update; which `docs/**` paths are directly editable vs generated mirrors
-6. **[Testing Requirements](docs/agents/testing-requirements.md)** --- Coverage expectations, test deletion policy
+6. **[Testing Requirements](docs/agents/testing-requirements.md)** --- Coverage expectations, test deletion policy, repo-lint fast/deep execution modes
 7. **[Deployment Process](docs/agents/deployment-process.md)** --- Build/deploy flow, 1Password-backed auth
 8. **[Worktree Placement](docs/agents/worktree-placement.md)** --- Where agent-created worktrees/checkouts live on disk (synced canonical convention)
 9. **[Decision Records](docs/agents/decision-records.md)** --- Recording the path taken when a PR reverses direction, and surfacing a comment-recorded decision from the issue body (synced canonical convention)

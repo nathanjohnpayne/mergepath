@@ -18,6 +18,17 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MODE_HELPER="$REPO_ROOT/scripts/lib/ci-check-modes.sh"
+if [ ! -f "$MODE_HELPER" ]; then
+  echo "check_phase_4b_automation: ERROR scripts/lib/ci-check-modes.sh missing" >&2
+  exit 1
+fi
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: check_phase_4b_automation [--check | --self-test]" >&2
+  exit 2
+fi
 
 REQUIRED_EXEC=(
   "scripts/phase-4b-review.sh"
@@ -101,6 +112,11 @@ if [ ! -f "$REPO_ROOT/$TEST" ]; then
   echo "FAIL: missing required test: $TEST (fail-closed — no silent skip)"
   echo "check_phase_4b_automation: FAIL"
   exit 1
+fi
+
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 0 ]; then
+  echo "check_phase_4b_automation: PASS (live structure)"
+  exit 0
 fi
 
 if ! command -v jq >/dev/null 2>&1; then

@@ -353,6 +353,10 @@ MARKER_ONLY_CONSUMER_GATES=(
   # tests/test_git_identity_hygiene.sh is manifest-delivered, so it is
   # never bootstrap residue and correctly contributes no H member.
   "check_git_identity_hygiene"
+  # Gate: scripts/sync-to-downstream.sh (marker) + .mergepath-sync.yml
+  # only. tests/test_check_doc_ownership.sh is manifest-delivered with
+  # the wrapper, so no bootstrap-residue path remains to enumerate.
+  "check_doc_ownership"
 )
 
 is_marker_only_gate() {

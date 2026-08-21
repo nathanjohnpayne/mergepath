@@ -12,7 +12,14 @@ name: Markdown prose wrap
 # scripts/lib/md_reflow.py. See docs/agents/documentation-rules.md
 # § Prose line-wrapping.
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
