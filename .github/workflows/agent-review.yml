@@ -1045,20 +1045,10 @@ jobs:
           # present. Also check `policy-violation`, which is applied by the
           # block-self-approval job earlier in this same workflow run (and
           # again, the `if:` at job start wouldn't have seen it).
-          # The trusted default-branch checkout intentionally lags an atomic
-          # workflow+helper rollout by one merge. Source the shared helper when
-          # it is present; retain the exact bootstrap predicate for the first
-          # mergepath or consumer rollout so approval does not fail before the
-          # helper has landed on that repository's default branch.
-          if [ -f scripts/lib/blocking-labels.sh ]; then
-            # shellcheck source=scripts/lib/blocking-labels.sh
-            source scripts/lib/blocking-labels.sh
-          else
-            mergepath_blocking_labels_csv() {
-              awk '$0 == "needs-external-review" || $0 == "needs-human-review" || $0 == "policy-violation" || $0 == "human-hold"' \
-                | paste -sd, -
-            }
-          fi
+          # The workflow and its required helper propagate as one manifest
+          # closure, so the security-sensitive label predicate has one owner.
+          # shellcheck source=scripts/lib/blocking-labels.sh
+          source scripts/lib/blocking-labels.sh
           LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')
           printf 'Labels at merge time:\n%s\n' "$LABELS"
           blocking_labels=$(printf '%s\n' "$LABELS" | mergepath_blocking_labels_csv)
@@ -1997,16 +1987,8 @@ jobs:
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # Keep the same first-rollout bootstrap as the pre-probe label read.
-          if [ -f scripts/lib/blocking-labels.sh ]; then
-            # shellcheck source=scripts/lib/blocking-labels.sh
-            source scripts/lib/blocking-labels.sh
-          else
-            mergepath_blocking_labels_csv() {
-              awk '$0 == "needs-external-review" || $0 == "needs-human-review" || $0 == "policy-violation" || $0 == "human-hold"' \
-                | paste -sd, -
-            }
-          fi
+          # shellcheck source=scripts/lib/blocking-labels.sh
+          source scripts/lib/blocking-labels.sh
           LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')
           printf 'Labels after readiness probe:\n%s\n' "$LABELS"
           blocking_labels=$(printf '%s\n' "$LABELS" | mergepath_blocking_labels_csv)

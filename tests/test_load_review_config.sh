@@ -42,6 +42,13 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
+if grep -Fq 'source "$SCRIPT_DIR/../lib/review-policy-scalar.sh"' "$LOADER" \
+   && ! grep -Fq 'review_policy_scalar()' "$LOADER"; then
+  pass "the loader hard-sources the shared policy scalar parser without duplicating it"
+else
+  fail "the loader must use scripts/lib/review-policy-scalar.sh as its single parser implementation"
+fi
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/load-review-config-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -381,9 +388,10 @@ fi
 #    The step's `actions/checkout` is pinned to the DEFAULT branch so the
 #    helper code is trusted. That makes the helper's own absence a reachable
 #    state twice: on the PR that introduces it, and on each consumer's first
-#    sync wave (.mergepath-sync.yml makes agent-review.yml and
-#    scripts/workflow/ travel together, but they land IN that PR, not on the
-#    consumer's default branch before it runs). An unguarded `bash <missing
+#    sync wave (.mergepath-sync.yml makes agent-review.yml, scripts/workflow/,
+#    and its hard-required scalar helper travel together, but they land IN
+#    that PR, not on the consumer's default branch before it runs). An
+#    unguarded `bash <missing
 #    file>` exits 127 and hard-fails the job, which SKIPS `triage`
 #    (`needs: [load-config]`, no `always()`) and `auto-merge-on-approval` —
 #    the fail-OPEN outcome the loader's own fail-closed handling exists to
@@ -446,9 +454,10 @@ fi
 #     helper must run it and export the real policy values — otherwise 5a would
 #     pass just as well against a step that always short-circuits.
 LIVE_TREE="$WORK/live-tree"
-mkdir -p "$LIVE_TREE/.github" "$LIVE_TREE/scripts"
+mkdir -p "$LIVE_TREE/.github" "$LIVE_TREE/scripts" "$LIVE_TREE/scripts/lib"
 cp "$DEFAULT_CONFIG" "$LIVE_TREE/.github/review-policy.yml"
 cp -R "$ROOT/scripts/workflow" "$LIVE_TREE/scripts/workflow"
+cp "$ROOT/scripts/lib/review-policy-scalar.sh" "$LIVE_TREE/scripts/lib/review-policy-scalar.sh"
 
 run_step "$LIVE_TREE" main main
 if [ "$SRC" -eq 0 ] \

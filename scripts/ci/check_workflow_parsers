@@ -999,19 +999,18 @@ fi
 
 # 2e-bis. This privileged job sources merge helpers, so its checkout must be
 # pinned to the trusted default branch and both label readbacks must consume
-# the shared blocking-label predicate. The default-branch checkout lags an
-# atomic workflow+helper rollout by one merge, so each read also needs the
-# exact bootstrap fallback until the helper is present there.
+# the shared blocking-label predicate. The manifest makes the helper a hard
+# workflow dependency, so inline fallbacks would create a second source of
+# truth for a security-sensitive decision.
 if grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'source scripts/lib/blocking-labels.sh' <<<"$auto_merge_job_block")" -eq 2 ] \
-  && [ "$(grep -c 'if \[ -f scripts/lib/blocking-labels.sh \]' <<<"$auto_merge_job_block")" -eq 2 ] \
-  && [ "$(grep -c 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block")" -eq 2 ] \
+  && ! grep -Fq 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'blocking_labels=$(printf' <<<"$auto_merge_job_block")" -eq 2 ]; then
   pass=$((pass + 1))
-  echo "  PASS: privileged approval arming uses trusted shared blocking-label policy with a first-rollout bootstrap"
+  echo "  PASS: privileged approval arming uses the trusted shared blocking-label policy as its single source of truth"
 else
   fail=$((fail + 1))
-  echo "  FAIL: approval arming must pin its checkout, source scripts/lib/blocking-labels.sh when present, and retain the exact first-rollout fallback for both mutable label readbacks" >&2
+  echo "  FAIL: approval arming must pin its checkout and hard-source scripts/lib/blocking-labels.sh without duplicating its predicate" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that

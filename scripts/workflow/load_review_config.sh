@@ -83,29 +83,8 @@ set -euo pipefail
 # --output defaults to $GITHUB_OUTPUT. Exit 2 on usage error.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/../lib/review-policy-scalar.sh" ]; then
-  # shellcheck source=../lib/review-policy-scalar.sh
-  source "$SCRIPT_DIR/../lib/review-policy-scalar.sh"
-else
-  # Atomic workflow-kit rollouts can execute the new loader from a PR merge
-  # tree while its trusted default-branch helper is one commit behind. Keep the
-  # exact shared contract as a bootstrap fallback; normal runs source the lib.
-  review_policy_scalar() {  # <file> <key>
-    awk -v key="$2:" '
-      /^[^[:space:]]/ && $1 == key {
-        sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-        gsub(/^"/, "", $0)
-        gsub(/^\047/, "", $0)
-        gsub(/"[[:space:]]*(#.*)?$/, "", $0)
-        gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
-        gsub(/[[:space:]]*#.*$/, "", $0)
-        sub(/[[:space:]]+$/, "", $0)
-        print
-        exit
-      }
-    ' "$1"
-  }
-fi
+# shellcheck source=../lib/review-policy-scalar.sh
+source "$SCRIPT_DIR/../lib/review-policy-scalar.sh"
 
 REPO=""
 BASE_REF=""
