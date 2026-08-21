@@ -158,6 +158,19 @@ else
     fail "agent-review must not arm native auto-merge before late blocking labels can be rechecked"
   fi
 
+  wait_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Require current-head check success") | .key' "$AGENT_REVIEW")
+  label_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Re-verify blocking labels after test wait") | .key' "$AGENT_REVIEW")
+  label_recheck=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Re-verify blocking labels after test wait") | .run' "$AGENT_REVIEW")
+  if [[ "$wait_step_index" =~ ^[0-9]+$ ]] \
+     && [[ "$label_step_index" =~ ^[0-9]+$ ]] \
+     && [ "$label_step_index" -gt "$wait_step_index" ] \
+     && grep -Fq 'LABELS=$(gh pr view "$PR_NUMBER"' <<<"$label_recheck" \
+     && grep -Fq -- "--json labels --jq '.labels[].name')" <<<"$label_recheck"; then
+    pass "the exact final blocking-label query follows the required-check wait"
+  else
+    fail "the final blocking-label query must follow the required-check wait"
+  fi
+
   if grep -Fq 'repo_lint_local.yml annex present' <<<"$agent_review_wait" \
      && grep -Fq 'while :; do' <<<"$agent_review_wait"; then
     pass "agent-review retains explicit polling for the optional non-required annex"
