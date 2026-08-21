@@ -625,6 +625,14 @@ assert_grep "auto-clear: workflow_run trigger list includes repo-lint-local (#65
 assert_grep "auto-clear: workflow_run trigger list also includes the unnamed-annex file-path fallback name (#655 round 11)" \
   "$W/auto-clear-blocking-labels.yml" '- ".github/workflows/repo_lint_local.yml"'
 
+# A named annex is intentionally unconstrained, while workflow_run accepts
+# only literal display names. The existing scheduled sweep therefore needs a
+# general approved-PR continuation backstop for custom annex names (#1062).
+assert_grep "auto-clear: scheduled sweep finds approved PRs that a custom annex name cannot wake" \
+  "$W/auto-clear-blocking-labels.yml" "--search 'review:approved'"
+assert_grep "auto-clear: scheduled sweep re-enters the trusted approval continuation for custom annex names" \
+  "$W/auto-clear-blocking-labels.yml" 'Continue approved PRs after custom-workflow completions'
+
 # ── Bash syntax check on every agent-review.yml `run:` block. Catches
 #    heredoc/subshell/loop errors the grep assertions above cannot (mirrors
 #    check_auto_clear_workflow's equivalent check for its own file — no
@@ -675,12 +683,14 @@ else
 fi
 
 # ── #1024/#1062: approval readiness is a one-shot probe ──────────
-if grep -Fq "name: Probe current-head check readiness once" "$W/agent-review.yml" \
-   && grep -Fq 'echo "ready=false" >> "$GITHUB_OUTPUT"' "$W/agent-review.yml" \
-   && grep -Fq "completed-workflow continuation" "$W/agent-review.yml" \
-   && ! grep -Fq "for readiness_probe in 1; do" "$W/agent-review.yml" \
-   && ! grep -Fq "TEST_CHECK_WAIT_SECONDS" "$W/agent-review.yml" \
-   && ! grep -Fq 'sleep "$poll_seconds"' "$W/agent-review.yml"; then
+if [ ! -f "$W/agent-review.yml" ]; then
+  echo "SKIP: #1062 approval readiness contract (agent-review.yml absent)"; SKIP=$((SKIP + 1))
+elif grep -Fq "name: Probe current-head check readiness once" "$W/agent-review.yml" \
+     && grep -Fq 'echo "ready=false" >> "$GITHUB_OUTPUT"' "$W/agent-review.yml" \
+     && grep -Fq "completed-workflow continuation" "$W/agent-review.yml" \
+     && ! grep -Fq "for readiness_probe in 1; do" "$W/agent-review.yml" \
+     && ! grep -Fq "TEST_CHECK_WAIT_SECONDS" "$W/agent-review.yml" \
+     && ! grep -Fq 'sleep "$poll_seconds"' "$W/agent-review.yml"; then
   pass "#1062: approval readiness probes once, records pending state, and never polls"
 else
   fail "#1062: approval readiness must not retain a wait loop, poll budget, or sleep"

@@ -20,19 +20,20 @@ if [ ! -x "$SUBJECT" ]; then
 fi
 
 if command -v yq >/dev/null 2>&1 \
-   && yq -e '.on.schedule[0].cron == "47 8 * * *" and .on.workflow_dispatch == null and .permissions.actions == "read" and ([.jobs.report.steps[] | select(.name == "Collect rolling repo-lint timing") | (.run | contains("repo-lint-latency-report.sh"))] | any) and ([.jobs.report.steps[] | select(.name == "Collect rolling repo-lint timing") | (.run | contains("--deep-p95-max 720"))] | any) and ([.jobs.report.steps[] | select(.name == "Upload timing evidence") | .uses | contains("actions/upload-artifact@")] | any)' "$WORKFLOW" >/dev/null \
+   && yq -e '.on.schedule[0].cron == "47 8 * * *" and .on.workflow_dispatch == null and .permissions.actions == "read" and ([.jobs.report.steps[] | select(.name == "Collect rolling repo-lint timing") | select((.run | contains("repo-lint-latency-report.sh")) and (.run | contains("rc=$?")) and (.run | contains("rc=$rc")))] | any) and ([.jobs.report.steps[] | select(.name == "Collect rolling repo-lint timing") | (.run | contains("--deep-p95-max 720"))] | any) and ([.jobs.report.steps[] | select(.name == "Upload timing evidence") | .uses | contains("actions/upload-artifact@")] | any) and ([.jobs.report.steps[] | select(.name == "Enforce latency and duplication alerts") | .if == "steps.latency.outputs.rc == '\''1'\''"] | any) and ([.jobs.report.steps[] | select(.name == "Report latency collection failure") | .if | contains("steps.latency.outputs.rc != '\''1'\''")] | any)' "$WORKFLOW" >/dev/null \
    && grep -Fq 'tests/test_repo_lint_latency_report.sh' "$WRAPPER"; then
   pass "scheduled workflow publishes summaries/artifacts and the CI wrapper owns this contract"
 else
   fail "latency workflow or CI wrapper is not wired to the report contract"
 fi
 
-if grep -Fq 'runs?per_page=$LIMIT' "$SUBJECT" \
+if grep -Fq 'runs?status=completed&per_page=$LIMIT' "$SUBJECT" \
    && ! grep -Fq -- '--paginate "repos/$REPO/actions/workflows/repo_lint.yml/runs' "$SUBJECT" \
-   && grep -Fq 'jobs-$run_id.json' "$SUBJECT"; then
-  pass "live collection is bounded and retains raw per-run job evidence"
+   && grep -Fq 'jobs-$run_id.json' "$SUBJECT" \
+   && [ "$(grep -c 'with_gh_retry gh api' "$SUBJECT")" -eq 2 ]; then
+  pass "live collection is completed-only, bounded, retried, and retains raw per-run job evidence"
 else
-  fail "live collection must bound run history and preserve raw job responses"
+  fail "live collection must select completed runs, bound history, retry Actions reads, and preserve raw job responses"
 fi
 
 jq -n '{runs:[range(0;20) as $i | {

@@ -33,6 +33,19 @@ if [ ! -f "$GRAPH" ] || ! command -v jq >/dev/null 2>&1 \
   exit 0
 fi
 
+if ! full_patterns=$(jq -r '.full_triggers[]' "$GRAPH") \
+   || ! wrapper_patterns=$(jq -r '.wrappers | to_entries[] | .key as $wrapper | .value[] | [$wrapper, .] | @tsv' "$GRAPH"); then
+  echo "repo-lint scope: dependency graph parsing failed; failing closed" >&2
+  deep=true
+  full=true
+  checks='[]'
+  printf 'deep=%s\nfull=%s\nchecks=%s\n' "$deep" "$full" "$checks"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    printf 'deep=%s\nfull=%s\nchecks=%s\n' "$deep" "$full" "$checks" >> "$GITHUB_OUTPUT"
+  fi
+  exit 0
+fi
+
 matches_pattern() {
   local candidate="$1" pattern="$2"
   case "$candidate" in
@@ -70,9 +83,7 @@ else
         full=true
         break
       fi
-    done <<EOF
-$(jq -r '.full_triggers[]' "$GRAPH")
-EOF
+    done <<<"$full_patterns"
     [ "$full" = "false" ] || break
 
     matched=false
@@ -91,9 +102,7 @@ EOF
         deep=true
         matched=true
       fi
-    done <<EOF
-$(jq -r '.wrappers | to_entries[] | .key as $wrapper | .value[] | [$wrapper, .] | @tsv' "$GRAPH")
-EOF
+    done <<<"$wrapper_patterns"
 
     # CI implementation is fail-closed. A path that is neither a direct
     # wrapper nor an explicitly declared dependency receives the full net.

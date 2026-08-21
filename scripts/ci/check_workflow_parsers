@@ -824,8 +824,9 @@ else
 fi
 
 # The semantics below are the contract for reading `author_identity` out of a
-# policy file. Since #788 the shipping implementation is `policy_scalar` in
-# scripts/workflow/load_review_config.sh — the auto-merge step no longer parses
+# policy file. Since #1062 the shipping implementation is
+# `review_policy_scalar` in scripts/lib/review-policy-scalar.sh — the
+# auto-merge step no longer parses
 # the file itself, it compares against `load-config`'s output, which is resolved
 # from the PR BASE's policy rather than from that job's unpinned checkout. These
 # cases stay here as the spelling contract they always were; the live parser is
@@ -998,15 +999,19 @@ fi
 
 # 2e-bis. This privileged job sources merge helpers, so its checkout must be
 # pinned to the trusted default branch and both label readbacks must consume
-# the shared blocking-label predicate.
+# the shared blocking-label predicate. The default-branch checkout lags an
+# atomic workflow+helper rollout by one merge, so each read also needs the
+# exact bootstrap fallback until the helper is present there.
 if grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'source scripts/lib/blocking-labels.sh' <<<"$auto_merge_job_block")" -eq 2 ] \
-  && [ "$(grep -c 'mergepath_blocking_labels_csv' <<<"$auto_merge_job_block")" -eq 2 ]; then
+  && [ "$(grep -c 'if \[ -f scripts/lib/blocking-labels.sh \]' <<<"$auto_merge_job_block")" -eq 2 ] \
+  && [ "$(grep -c 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block")" -eq 2 ] \
+  && [ "$(grep -c 'blocking_labels=$(printf' <<<"$auto_merge_job_block")" -eq 2 ]; then
   pass=$((pass + 1))
-  echo "  PASS: privileged approval arming uses trusted shared blocking-label policy"
+  echo "  PASS: privileged approval arming uses trusted shared blocking-label policy with a first-rollout bootstrap"
 else
   fail=$((fail + 1))
-  echo "  FAIL: approval arming must pin its checkout to the default branch and use scripts/lib/blocking-labels.sh for both mutable label readbacks" >&2
+  echo "  FAIL: approval arming must pin its checkout, source scripts/lib/blocking-labels.sh when present, and retain the exact first-rollout fallback for both mutable label readbacks" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that

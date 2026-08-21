@@ -112,6 +112,28 @@ else
   else
     fail "scope infrastructure changes must select the full deep surface"
   fi
+
+  jq_stub_dir=$(mktemp -d "${TMPDIR:-/tmp}/repo-lint-jq.XXXXXX")
+  jq_real=$(command -v jq)
+  cat > "$jq_stub_dir/jq" <<'STUB'
+#!/usr/bin/env bash
+count=$(cat "$JQ_STUB_COUNT")
+count=$((count + 1))
+echo "$count" > "$JQ_STUB_COUNT"
+if [ "$count" -eq 2 ]; then exit 7; fi
+exec "$JQ_REAL" "$@"
+STUB
+  chmod +x "$jq_stub_dir/jq"
+  echo 0 > "$jq_stub_dir/count"
+  parse_failure=$(printf '%s\n' docs/README.md | PATH="$jq_stub_dir:$PATH" JQ_REAL="$jq_real" JQ_STUB_COUNT="$jq_stub_dir/count" bash "$SCOPE" --event pull_request 2>/dev/null)
+  rm -rf "$jq_stub_dir"
+  if grep -Fxq 'deep=true' <<<"$parse_failure" \
+     && grep -Fxq 'full=true' <<<"$parse_failure" \
+     && grep -Fxq 'checks=[]' <<<"$parse_failure"; then
+    pass "dependency graph parse failures fail closed to the full deep surface"
+  else
+    fail "a later jq failure must not continue with incomplete wrapper patterns (got $parse_failure)"
+  fi
 fi
 
 if ! command -v yq >/dev/null 2>&1; then
@@ -230,6 +252,12 @@ else
     pass "completed canonical or annex CI re-enters the trusted approval continuation"
   else
     fail "auto-clear must re-enter approval continuation on completed CI workflows"
+  fi
+
+  if yq -e '([.jobs."scheduled-sweep".steps[] | select(.name == "Find open approved PRs for the continuation backstop") | .run | contains("review:approved")] | any) and ([.jobs."scheduled-sweep".steps[] | select(.name == "Continue approved PRs after custom-workflow completions") | .run | contains("approval-merge-continuation.sh")] | any)' "$AUTO_CLEAR" >/dev/null; then
+    pass "the existing sweep backstops custom annex workflow names"
+  else
+    fail "custom annex names need a scheduled approval-continuation backstop"
   fi
 fi
 

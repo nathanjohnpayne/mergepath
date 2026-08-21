@@ -93,7 +93,9 @@ on:
   # after Codex cleared). 3× the API quota cost, but a meaningfully
   # shorter blocker window. The PAT-driven label removal added in
   # #324 also helps — but the sweep is still the only backstop for
-  # the no-event path.
+  # the no-event path. It also re-enters the approval continuation for open
+  # approved PRs. That backstop covers a consumer annex with a custom display
+  # name, which cannot be enumerated in workflow_run.workflows.
   schedule:
     - cron: '*/5 * * * *'
 
@@ -730,6 +732,65 @@ jobs:
           echo "HAD_INFRA_ERROR=$had_infra_error" >> "$GITHUB_ENV"
           # shellcheck disable=SC2086  # intentional word-splitting to trim
           echo "HAD_INFRA_ERROR_PRS=$(echo $failing_prs)" >> "$GITHUB_ENV"
+          exit "$had_infra_error"
+
+      - name: Find open approved PRs for the continuation backstop
+        id: approved
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          source scripts/lib/gh-retry-helpers.sh
+          # workflow_run accepts only literal workflow display names. A valid
+          # consumer repo_lint_local.yml may choose any name, so its completion
+          # cannot always wake the event-driven continuation above. The existing
+          # five-minute sweep is the bounded backstop; search narrows it to PRs
+          # GitHub considers approved, and the continuation re-verifies the
+          # registered reviewer's latest state authoritatively.
+          if ! prs=$(with_gh_retry gh pr list --repo "$REPO" --state open \
+            --search 'review:approved' --limit 500 --json number --jq '.[].number'); then
+            echo "::error::Failed to list open approved PRs on $REPO"
+            exit 1
+          fi
+          if [ -z "$prs" ]; then
+            echo "prs=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'prs<<EOF'
+            echo "$prs"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Continue approved PRs after custom-workflow completions
+        if: steps.approved.outputs.prs != ''
+        env:
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          PRS: ${{ steps.approved.outputs.prs }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; scheduled approval continuation is disabled."
+            exit 0
+          fi
+          had_infra_error=0
+          while IFS= read -r PR; do
+            [ -n "$PR" ] || continue
+            set +e
+            bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
+            rc=$?
+            set -e
+            case "$rc" in
+              0) ;;
+              4) echo "PR #$PR is not merge-ready; a later event or sweep will re-evaluate it." ;;
+              *)
+                echo "::error::Scheduled approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
+                had_infra_error=1
+                ;;
+            esac
+          done <<<"$PRS"
           exit "$had_infra_error"
 
       - name: Surface infra failure as per-PR check-runs

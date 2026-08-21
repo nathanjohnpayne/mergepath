@@ -83,6 +83,29 @@ set -euo pipefail
 # --output defaults to $GITHUB_OUTPUT. Exit 2 on usage error.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/../lib/review-policy-scalar.sh" ]; then
+  # shellcheck source=../lib/review-policy-scalar.sh
+  source "$SCRIPT_DIR/../lib/review-policy-scalar.sh"
+else
+  # Atomic workflow-kit rollouts can execute the new loader from a PR merge
+  # tree while its trusted default-branch helper is one commit behind. Keep the
+  # exact shared contract as a bootstrap fallback; normal runs source the lib.
+  review_policy_scalar() {  # <file> <key>
+    awk -v key="$2:" '
+      /^[^[:space:]]/ && $1 == key {
+        sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+        gsub(/^"/, "", $0)
+        gsub(/^\047/, "", $0)
+        gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+        gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
+        gsub(/[[:space:]]*#.*$/, "", $0)
+        sub(/[[:space:]]+$/, "", $0)
+        print
+        exit
+      }
+    ' "$1"
+  }
+fi
 
 REPO=""
 BASE_REF=""
@@ -164,22 +187,6 @@ emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
 # contract — including whether this scalar should come from a real YAML parser
 # at all — because three review rounds each found one more spelling, which is
 # the shape that says stop patching and go design.
-policy_scalar() {  # <file> <key>
-  awk -v key="$2:" '
-    /^[^[:space:]]/ && $1 == key {
-      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/^\047/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
-      gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
-      sub(/[[:space:]]+$/, "", $0)
-      print
-      exit
-    }
-  ' "$1"
-}
-
 # Resolve the governing policy. stderr is left attached to the caller so the
 # resolver's diagnostics land in the job log; only stdout is captured, because
 # stdout is the policy PATH and merging the streams would turn a warning into a
@@ -221,7 +228,7 @@ fi
 # `jq -c` (compact) is required: multi-line JSON cannot be written through the
 # `key=value` GITHUB_OUTPUT format (#30/#58).
 #
-# The scalars go through `policy_scalar` above rather than `grep key: | awk
+# The scalars go through shared `review_policy_scalar` rather than `grep key: | awk
 # '{print $2}'`. A missing key is not an error there either — awk simply prints
 # nothing, so a policy without the key yields the empty value the callers
 # already handle, without a `|| true` guard against `pipefail` aborting the
@@ -230,10 +237,10 @@ PATHS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" external_review_paths 
   | jq -R -s -c 'split("\n") | map(select(length > 0))')
 REVIEWERS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" available_reviewers \
   | jq -R -s -c 'split("\n") | map(select(length > 0))')
-THRESHOLD=$(policy_scalar "$CONFIG" external_review_threshold)
-AUTHOR=$(policy_scalar "$CONFIG" author_identity)
+THRESHOLD=$(review_policy_scalar "$CONFIG" external_review_threshold)
+AUTHOR=$(review_policy_scalar "$CONFIG" author_identity)
 
-# Every emitted value is a single GITHUB_OUTPUT line: `policy_scalar` stops at
+# Every emitted value is a single GITHUB_OUTPUT line: `review_policy_scalar` stops at
 # the first match (see its first-wins note), and PATHS/REVIEWERS are single-line
 # by construction because `jq -c` compacts them.
 
@@ -250,7 +257,7 @@ emit reviewers "$REVIEWERS"
 # that is readable but carries no top-level `author_identity` proves no identity
 # either — the same state the resolver-failure branch above emits empty — and it
 # is the more reachable of the two, because a policy can simply omit the key (or
-# nest it under a block, which `policy_scalar` correctly declines to match)
+# nest it under a block, which `review_policy_scalar` correctly declines to match)
 # without anything failing. Substituting a hard-coded login here would hand the
 # auto-merge step a non-empty EXPECTED_AUTHOR, skip its `[ -z ]` fail-closed
 # branch, and let AUTHOR_MERGE_TOKEN merge under an identity the governing

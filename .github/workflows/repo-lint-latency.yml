@@ -29,6 +29,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OUT_DIR: ${{ runner.temp }}/repo-lint-latency
         run: |
+          set +e
           scripts/repo-lint-latency-report.sh \
             --repo "${{ github.repository }}" \
             --out-dir "$OUT_DIR" \
@@ -37,6 +38,9 @@ jobs:
             --p50-max 300 \
             --p95-max 480 \
             --deep-p95-max 720
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Publish timing summary
         if: always()
@@ -59,7 +63,13 @@ jobs:
           if-no-files-found: error
 
       - name: Enforce latency and duplication alerts
-        if: steps.latency.outcome == 'failure'
+        if: steps.latency.outputs.rc == '1'
         run: |
           echo "::error::Repo-lint latency or duplicate-execution audit raised an alert."
+          exit 1
+
+      - name: Report latency collection failure
+        if: steps.latency.outputs.rc != '0' && steps.latency.outputs.rc != '1'
+        run: |
+          echo "::error::Repo-lint latency collection failed (exit ${{ steps.latency.outputs.rc }}); no audit verdict was produced."
           exit 1

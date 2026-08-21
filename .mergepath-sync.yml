@@ -349,6 +349,10 @@ paths:
   - path: scripts/lib/ensure-yq.sh
     type: canonical
     consumers: all
+  # Shared top-level policy scalar reader used by the trusted workflow kit.
+  - path: scripts/lib/review-policy-scalar.sh
+    type: canonical
+    consumers: all
   # Single source of truth for the Codex App failure-marker regexes (#722):
   # the usage-limit / not-connected patterns audit-codex-latency.sh classifies
   # retrospectively, factored out so the live Phase 4a scripts test the SAME
@@ -629,6 +633,9 @@ paths:
   - path: tests/test_repo_lint_latency_report.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/repo-lint-latency-report.sh"
+      - ".github/workflows/repo-lint-latency.yml"
   - path: tests/test_check_doc_ownership.sh
     type: canonical
     consumers: all
@@ -1258,6 +1265,8 @@ paths:
   - path: scripts/repo-lint-latency-report.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/gh-retry-helpers.sh"
   - path: .github/workflows/pr-audit.yml
     type: canonical
     consumers: all
@@ -1531,6 +1540,7 @@ paths:
       # decide whether a prior external-review clearance carries forward, so
       # they exit 2 rather than run with the pre-#799 emptiness inference.
       - "scripts/lib/gh-api-scalar.sh"           # #799, fail-closed scalar API reads
+      - "scripts/lib/review-policy-scalar.sh"    # #1062, shared governing-policy identity parse
 
   # Templated entries — rendered per consumer via scripts/lib/
   # template-substitution.sh using the consumer's facts.* from the

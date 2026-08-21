@@ -50,11 +50,19 @@ else
   command -v gh >/dev/null 2>&1 || { echo "repo-lint latency: gh is required for live collection" >&2; exit 2; }
   [ -n "${GH_TOKEN:-}" ] || { echo "repo-lint latency: GH_TOKEN is required for live collection" >&2; exit 2; }
 
+  RETRY_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/gh-retry-helpers.sh"
+  if [ -f "$RETRY_HELPER" ]; then
+    # shellcheck source=scripts/lib/gh-retry-helpers.sh
+    source "$RETRY_HELPER"
+  else
+    with_gh_retry() { "$@"; }
+  fi
+
   RUN_LIST="$OUT_DIR/workflow-runs.json"
   # The report is intentionally bounded to one Actions page. Using
   # --paginate and slicing afterward still downloads the repository's entire
   # workflow history before jq can apply LIMIT — minutes of needless API work.
-  if ! gh api "repos/$REPO/actions/workflows/repo_lint.yml/runs?per_page=$LIMIT" --jq '.workflow_runs[]' \
+  if ! with_gh_retry gh api "repos/$REPO/actions/workflows/repo_lint.yml/runs?status=completed&per_page=$LIMIT" --jq '.workflow_runs[]' \
       | jq -s --argjson limit "$LIMIT" '.[0:$limit]' > "$RUN_LIST"; then
     echo "repo-lint latency: could not fetch workflow runs" >&2
     exit 3
@@ -68,7 +76,7 @@ else
     # Retain the complete job objects (including IDs, timestamps, URLs, and
     # raw step records) beside the normalized report so the artifact can
     # support a later audit without re-querying mutable Actions history.
-    if ! gh api --paginate "repos/$REPO/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs[]' \
+    if ! with_gh_retry gh api --paginate "repos/$REPO/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs[]' \
         | jq -s '.' > "$jobs_file"; then
       echo "repo-lint latency: could not fetch jobs for run $run_id" >&2
       exit 3

@@ -310,7 +310,7 @@ fi
 #     readable, its threshold and reviewer list are exported normally — it just
 #     authorizes nobody to merge. It is also the more reachable of the two
 #     states, needing no outage: a policy can omit the key, or nest it under a
-#     block, which `policy_scalar` deliberately declines to match.
+#     block, which `review_policy_scalar` deliberately declines to match.
 #
 #     Emitting a hard-coded login here instead would make EXPECTED_AUTHOR
 #     non-empty in the auto-merge step, skipping the `[ -z ]` fail-closed branch

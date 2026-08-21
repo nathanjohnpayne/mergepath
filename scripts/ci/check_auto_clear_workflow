@@ -181,6 +181,20 @@ for wf in 'PR Review Policy' 'Agent Review Pipeline' 'Merge Clearance Gate' 'rep
   fi
 done
 
+# A consumer annex may use any top-level workflow name, which cannot be
+# enumerated in workflow_run.workflows. The existing five-minute sweep must
+# therefore re-enter the exact-head approval continuation for open approved
+# PRs as a bounded general backstop (#1062).
+if grep -qF -- "--search 'review:approved'" "$WORKFLOW" \
+   && grep -qF -- 'Continue approved PRs after custom-workflow completions' "$WORKFLOW" \
+   && grep -qF -- 'scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: scheduled sweep backstops custom annex workflow names (#1062)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: scheduled sweep must continue approved PRs whose custom annex name cannot appear in workflow_run.workflows (#1062)" >&2
+fi
+
 # #730: the pull_request_target trigger must include `edited` so a body-edit
 # nudge (the reliable re-fire for a claude-authored Phase-4 PR after a late
 # Codex clearance) re-evaluates auto-clear on the PR head. Anchor to the
@@ -589,7 +603,9 @@ fi
 
 echo
 if [ "$fail" -eq 0 ]; then
-  if ! bash "$CONTINUATION_TEST"; then
+  if [ ! -f "$CONTINUATION_TEST" ]; then
+    echo "check_auto_clear_workflow: SKIP (approval continuation test not present in this consumer checkout)"
+  elif ! bash "$CONTINUATION_TEST"; then
     echo "check_auto_clear_workflow: FAIL (approval continuation contract)" >&2
     exit 1
   fi

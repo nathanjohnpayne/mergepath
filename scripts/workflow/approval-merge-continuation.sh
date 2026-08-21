@@ -17,6 +17,8 @@ case "$PR_NUMBER" in *[!0-9]*|'') usage ;; esac
 ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 # shellcheck source=../lib/blocking-labels.sh
 source "$ROOT/scripts/lib/blocking-labels.sh"
+# shellcheck source=../lib/review-policy-scalar.sh
+source "$ROOT/scripts/lib/review-policy-scalar.sh"
 
 not_ready() {
   echo "approval continuation: not ready — $*"
@@ -37,8 +39,23 @@ blocking_labels() {
   jq -r '.labels[]?.name' | mergepath_blocking_labels_csv
 }
 
-login=$(gh api user --jq .login 2>/dev/null) || infra_error "could not verify merge token identity"
-[ "$login" = "nathanjohnpayne" ] || infra_error "merge token resolves to $login, expected nathanjohnpayne"
+policy=$(bash "$ROOT/scripts/workflow/resolve_base_policy.sh" \
+  --repo "$REPO" --pr "$PR_NUMBER" --materialize-default) \
+  || infra_error "could not resolve the governing base policy"
+[ -f "$policy" ] || infra_error "governing base policy was not materialized"
+expected_author=$(review_policy_scalar "$policy" author_identity)
+rm -f "$policy"
+[ -n "$expected_author" ] || infra_error "governing base policy names no author_identity"
+
+identity_err=$(mktemp "${TMPDIR:-/tmp}/approval-continuation-identity.XXXXXX")
+set +e
+login=$(gh api user --jq .login 2>"$identity_err")
+identity_rc=$?
+set -e
+identity_msg=$(cat "$identity_err" 2>/dev/null || true)
+rm -f "$identity_err"
+[ "$identity_rc" -eq 0 ] || infra_error "could not verify merge token identity: ${identity_msg:-unknown API error}"
+[ "$login" = "$expected_author" ] || infra_error "merge token resolves to $login, expected $expected_author"
 
 initial=$(read_pr) || infra_error "could not read PR #$PR_NUMBER"
 state=$(jq -r '.state // ""' <<<"$initial")
@@ -61,9 +78,15 @@ case "$gate_rc" in
   *) infra_error "merge-clearance predicate returned rc=$gate_rc" ;;
 esac
 
-if ! bash "$ROOT/scripts/review-feedback-accounting.sh" "$PR_NUMBER" "$REPO"; then
-  not_ready "review feedback is not fully accounted"
-fi
+set +e
+bash "$ROOT/scripts/review-feedback-accounting.sh" "$PR_NUMBER" "$REPO"
+accounting_rc=$?
+set -e
+case "$accounting_rc" in
+  0) ;;
+  1) not_ready "review feedback is not fully accounted" ;;
+  *) infra_error "review feedback accounting returned rc=$accounting_rc" ;;
+esac
 
 set +e
 bash "$ROOT/scripts/resolve-pr-threads.sh" "$PR_NUMBER" --repo "$REPO" --list
