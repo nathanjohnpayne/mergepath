@@ -624,6 +624,8 @@ paths:
   - path: tests/test_approval_merge_continuation.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/blocking-labels.sh"
   - path: tests/test_repo_lint_latency_report.sh
     type: canonical
     consumers: all
@@ -1208,6 +1210,7 @@ paths:
     # consumer's load-config step.
     requires:
       - "scripts/disagreement-detector.cjs"
+      - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/"
   - path: .github/workflows/pr-review-policy.yml
     type: canonical
@@ -1242,6 +1245,7 @@ paths:
     # above.
     requires:
       - "scripts/lib/gh-retry-helpers.sh"
+      - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/approval-merge-continuation.sh"
       - "scripts/codex-review-check.sh"
       - "scripts/review-feedback-accounting.sh"

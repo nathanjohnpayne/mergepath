@@ -35,7 +35,8 @@ jobs:
             --limit 100 \
             --min-sample 20 \
             --p50-max 300 \
-            --p95-max 480
+            --p95-max 480 \
+            --deep-p95-max 720
 
       - name: Publish timing summary
         if: always()

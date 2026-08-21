@@ -794,13 +794,13 @@ else
   echo "$legacy_csv_join" | sed 's/^/    /' >&2
 fi
 
-exact_label_match=$(grep -F 'grep -Fxq "$blocking_label"' ".github/workflows/agent-review.yml" || true)
-if [ -n "$exact_label_match" ]; then
+if grep -Fq 'source scripts/lib/blocking-labels.sh' ".github/workflows/agent-review.yml" \
+  && grep -Fq 'needs-external-review|needs-human-review|policy-violation|human-hold)' scripts/lib/blocking-labels.sh; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review pre-merge recheck uses fixed-string whole-line label matching"
+  echo "  PASS: agent-review pre-merge recheck uses the exact shared blocking-label predicate"
 else
   fail=$((fail + 1))
-  echo "  FAIL: agent-review pre-merge recheck must use grep -Fxq for exact label names" >&2
+  echo "  FAIL: agent-review pre-merge recheck must source the exact shared blocking-label predicate" >&2
 fi
 
 echo
@@ -983,64 +983,30 @@ else
   echo "  PASS: triage's action filter excludes unlabeled (no label flap) (#620)"
 fi
 
-# 2e. The rc=5 CodeRabbit rate-limit branch derives external-review
-# protection for coderabbit-automerge-rate-limit-gate.sh by asking
-# merge-clearance-gate.sh ITSELF (--derive-rate-limit-protection): the same
-# intrinsic threshold/protected-paths computation the required check runs,
-# plus current-head Codex/Phase-4b clearance when the active required check is
-# disabled (#713). Label-event proxies (current-label reads,
-# unlabeled-removal overrides, workflow-local marker greps) were rejected — a
-# label event is not head-pinned proof of a downstream gate or clearance.
-# ext_protected initializes false and only a clean `true`/`false` from the
-# query is accepted (fail-closed on error or garbage).
-if grep -Fq 'ext_protected=false' <<<"$auto_merge_job_block" \
-  && grep -Fq -- 'merge-clearance-gate.sh --derive-rate-limit-protection' <<<"$auto_merge_job_block" \
-  && grep -A2 -F 'if req=$(bash scripts/merge-clearance-gate.sh --derive-rate-limit-protection "$PR_NUMBER" "$REPO"); then' <<<"$auto_merge_job_block" | grep -Fq 'true|false) ext_protected=$req' \
-  && ! grep -Fq "any(.labels[]; .name==\"needs-external-review\")" <<<"$auto_merge_job_block" \
-  && ! grep -Fq 'EVENT_ACTION' <<<"$auto_merge_job_block" \
-  && ! grep -Fq 'mergepath-propagation-lane verified-head=' <<<"$auto_merge_job_block"; then
+# 2e. A registered reviewer approval is the merge-readiness signal. Advisory
+# CodeRabbit arrival must not add another runner-held wait after that approval;
+# its required severity and conversation state remain represented by their
+# dedicated required checks.
+if ! grep -Fq 'coderabbit-wait.sh' <<<"$auto_merge_job_block" \
+  && ! grep -Fq 'Wait for CodeRabbit review' <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: rc=5 derives ext_protected from merge-clearance-gate.sh rate-limit protection (live head, fail-closed), with no label/marker proxies left (#713)"
+  echo "  PASS: approval arming does not wait for advisory CodeRabbit arrival (#1062)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 branch must derive ext_protected via scripts/merge-clearance-gate.sh --derive-rate-limit-protection (init false, accept only literal true/false) and must not read labels, unlabeled events, or lane markers directly (#713)" >&2
+  echo "  FAIL: auto-merge-on-approval must not invoke coderabbit-wait.sh or hold a runner for CodeRabbit after a registered approval (#1062)" >&2
 fi
 
-# 2e-ter (#825). The rate-limit gate's under-threshold arm can only run if the
-# workflow hands it the PR coordinates: an under-threshold head has no
-# external-review protection to derive, so the gate's ONLY remaining question
-# is whether the failover's own Codex review cleared this head — and it cannot
-# ask it without PR_NUMBER and REPO. Dropping the arguments silently restores
-# the #825 deadlock (the gate blocks fail-closed, so the regression is a stall,
-# not a hole, and would go unnoticed until the next rate-limited PR).
-if grep -Fq 'bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_protected" "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block"; then
+# 2e-bis. This privileged job sources merge helpers, so its checkout must be
+# pinned to the trusted default branch and both label readbacks must consume
+# the shared blocking-label predicate.
+if grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$auto_merge_job_block" \
+  && [ "$(grep -c 'source scripts/lib/blocking-labels.sh' <<<"$auto_merge_job_block")" -eq 2 ] \
+  && [ "$(grep -c 'mergepath_blocking_labels_csv' <<<"$auto_merge_job_block")" -eq 2 ]; then
   pass=$((pass + 1))
-  echo "  PASS: rc=5 passes the PR coordinates to the rate-limit gate so its current-head Codex clearance arm can run (#825)"
+  echo "  PASS: privileged approval arming uses trusted shared blocking-label policy"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 branch must invoke scripts/coderabbit-automerge-rate-limit-gate.sh with \"\$WAIT_JSON\" \"\$ext_protected\" \"\$PR_NUMBER\" \"\$REPO\" — without the coordinates the gate cannot verify current-head Codex clearance and every under-threshold rate-limit stall deadlocks again (#825)" >&2
-fi
-
-# 2e-bis. The rc=5-time derivation runs minutes before the merge and state
-# can change during the waits (a push, a propagation-lane verification
-# landing): the downgrade path must record itself (CR_RATE_LIMIT_DOWNGRADED
-# via GITHUB_ENV) and the FINAL blocking-label re-verify must abort on head
-# drift (the downgrade anchored the event head; the merge pins
-# CURRENT_HEAD_SHA via --match-head-commit) and RE-RUN the rate-limit
-# protection derivation, requiring literal `true` (#713).
-if grep -Fq 'echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"' <<<"$auto_merge_job_block" \
-  && grep -Fq '"${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true"' <<<"$auto_merge_job_block" \
-  && grep -Fq '"$CURRENT_HEAD_SHA" != "$HEAD_SHA"' <<<"$auto_merge_job_block" \
-  && grep -A2 -F '"$CURRENT_HEAD_SHA" != "$HEAD_SHA"' <<<"$auto_merge_job_block" | grep -Fq 'exit 1' \
-  && grep -Fq 're_protected=false' <<<"$auto_merge_job_block" \
-  && grep -A2 -F 'true) re_protected=true' <<<"$auto_merge_job_block" | grep -Fq 'esac' \
-  && grep -A2 -F 'if [ "$re_protected" != "true" ]' <<<"$auto_merge_job_block" | grep -Fq 'exit 1' \
-  && [ "$(grep -c -- 'merge-clearance-gate.sh --derive-rate-limit-protection' <<<"$auto_merge_job_block")" -ge 2 ]; then
-  pass=$((pass + 1))
-  echo "  PASS: rc=5 downgrade records itself; the final re-verify aborts on head drift and re-derives rate-limit protection, requiring true (#713)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: the rc=5 downgrade must set CR_RATE_LIMIT_DOWNGRADED in GITHUB_ENV, and the final re-verify must abort on head drift and re-run merge-clearance-gate.sh --derive-rate-limit-protection, exiting 1 unless it prints true (#713)" >&2
+  echo "  FAIL: approval arming must pin its checkout to the default branch and use scripts/lib/blocking-labels.sh for both mutable label readbacks" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that

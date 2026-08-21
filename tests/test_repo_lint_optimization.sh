@@ -190,12 +190,20 @@ else
   fi
 
   agent_review_probe=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Probe current-head check readiness once") | .run' "$AGENT_REVIEW")
-  if grep -Fq 'for readiness_probe in 1; do' <<<"$agent_review_probe" \
+  if ! grep -Fq 'for readiness_probe in 1; do' <<<"$agent_review_probe" \
      && grep -Fq 'ready=false' <<<"$agent_review_probe" \
      && ! grep -Fq 'sleep ' <<<"$agent_review_probe"; then
     pass "agent-review probes check readiness once without reserving a runner"
   else
     fail "agent-review must record pending readiness and exit without polling"
+  fi
+
+  agent_auto_merge=$(yq -r '.jobs."auto-merge-on-approval"' "$AGENT_REVIEW")
+  if ! grep -Fq 'coderabbit-wait.sh' <<<"$agent_auto_merge" \
+     && ! grep -Fq 'Wait for CodeRabbit review' <<<"$agent_auto_merge"; then
+    pass "registered approval does not wait for advisory CodeRabbit arrival"
+  else
+    fail "CodeRabbit must not be an additional runner-held requirement after approval"
   fi
 
   wait_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Probe current-head check readiness once") | .key' "$AGENT_REVIEW")

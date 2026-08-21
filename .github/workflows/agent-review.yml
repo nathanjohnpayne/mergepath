@@ -772,8 +772,8 @@ jobs:
   #      exists on the PR (`dismiss_stale_reviews` is OFF, so the
   #      approval carries across the fix-push — see the BEHIND-PR
   #      carryover behavior). A push with NO existing approval does NOT
-  #      arm. Every other gate (coderabbit-wait, AUTHOR_MERGE_TOKEN
-  #      identity, blocking-label re-verify) re-applies on the NEW HEAD,
+  #      arm. Every load-bearing gate (AUTHOR_MERGE_TOKEN identity,
+  #      blocking-label re-verify, required checks) re-applies on the NEW HEAD,
   #      and `gh pr merge --auto` is idempotent when --auto is already
   #      enabled.
   #   3. `pull_request` + `unlabeled` for a BLOCKING label (#620) — the
@@ -823,6 +823,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # This job holds the author merge token. Its helper scripts must
+          # come from the trusted default branch, never the PR checkout.
+          ref: ${{ github.event.repository.default_branch }}
           # Explicit-token gh merge path only, no authenticated git, so don't
           # leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
@@ -1010,271 +1013,6 @@ jobs:
           echo "Automatic merge token verified for author identity: $actual_author"
           echo "enabled=true" >> "$GITHUB_OUTPUT"
 
-      - name: Check if CodeRabbit is enabled
-        if: steps.author_merge_token.outputs.enabled == 'true'
-        id: cr
-        run: |
-          CONFIG=".github/review-policy.yml"
-          # Parse only the `coderabbit:` block — stop at the next top-level key.
-          # The previous `sed -n '/^coderabbit:/,$ p'` was scope-unsafe: it
-          # captured everything from `coderabbit:` to EOF, so a later top-level
-          # block with `enabled: true` (e.g., the `codex:` block added in #31)
-          # produced a false positive and triggered the CodeRabbit wait loop.
-          #
-          # The end-of-block test is "a new line whose first character is
-          # neither whitespace nor `#`" — which catches the next top-level YAML
-          # key while still permitting column-0 comments (`# ...`) and blank
-          # lines inside the block. The earlier `^[^[:space:]]` regex was
-          # too strict: a YAML-valid column-0 comment prematurely exited the
-          # block and produced a false negative. Fix surfaced by nathanpayne-codex
-          # external review on PR #53.
-          if awk '
-            /^coderabbit:/ {in_block=1; next}
-            in_block && /^[^[:space:]#]/ {in_block=0}
-            in_block && /^[[:space:]]*enabled:[[:space:]]*true([[:space:]]*#.*)?$/ {found=1}
-            END {exit found ? 0 : 1}
-          ' "$CONFIG"; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Wait for CodeRabbit review
-        if: steps.author_merge_token.outputs.enabled == 'true' && steps.cr.outputs.enabled == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
-          # #489: author token for the rate-limit→Codex failover. coderabbit-wait.sh
-          # runs as the reviewer (GH_TOKEN above) for its own retry comments, but its
-          # failover posts the author-attributed `@codex review` via
-          # codex-review-request.sh → gh-as-author.sh, which resolves the author token
-          # from OP_PREFLIGHT_AUTHOR_PAT and verifies it as author_identity. This step
-          # only runs when author_merge_token is enabled, so the secret is present;
-          # preflight_require_token is a no-op here (GH_TOKEN is set), so this value is
-          # not clobbered, and coderabbit-wait.sh itself reads only the reviewer PAT.
-          OP_PREFLIGHT_AUTHOR_PAT: ${{ secrets.AUTHOR_MERGE_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          # #798: mark every `@codex review` that originates from THIS step as
-          # machine-initiated. It is the only automatic trigger path in the
-          # repo — this step runs on `synchronize`, and `gh pr update-branch`
-          # makes `synchronize` fire on a head that changes no file in the PR's
-          # own diff, so coderabbit-wait.sh's #489 rate-limit failover
-          # re-requested a full Codex review for content Codex had already
-          # read. With `required_status_checks.strict: true` forcing an
-          # update-branch on every open PR after every merge, and `Codex P1
-          # unresolved threads` required, a batch of N concurrent PRs cost
-          # O(N²) rounds that answered no code change.
-          #
-          # The flag is INERT on its own: it makes codex-review-request.sh
-          # consult scripts/workflow/codex_auto_trigger_gate.sh, which suppresses
-          # the trigger ONLY when this head's `external-review:v2` fingerprint —
-          # the same #705 fingerprint that carries a Codex verdict across an
-          # update-branch — already matches a commit Codex reviewed. A push that
-          # changes PR content changes the fingerprint and still triggers, and an
-          # agent's own `codex-review-request.sh --trigger-only` never sets this
-          # variable, so the #631/#648 explicit-invocation requirement holds.
-          #
-          # It travels as an env var rather than an argument because this step
-          # does not call codex-review-request.sh directly — coderabbit-wait.sh
-          # does, as its failover child, and a child process inherits the
-          # environment. The token that posts the trigger is unchanged
-          # (OP_PREFLIGHT_AUTHOR_PAT above → gh-as-author.sh), so the trigger
-          # keeps its author attribution and its workflow-triggering effect.
-          MERGEPATH_CODEX_AUTO_TRIGGER: 'true'
-        run: |
-          # Delegate to scripts/coderabbit-wait.sh so auto-merge honors the
-          # same semantics the agent-driven flow uses: HEAD-anchored
-          # freshness (#136 — do not merge on a stale review from a prior
-          # HEAD), rate-limit retry (#138 — CodeRabbit does not auto-retry
-          # after its published window elapses), and the coderabbit.*
-          # knobs in .github/review-policy.yml. Exit-code translation:
-          #   0 — cleared on current HEAD, no high-severity markers.
-          #   2 — cleared but findings present (Potential issue / ⚠️).
-          #       Blocks auto-merge per REVIEW_POLICY.md § Phase 2.5,
-          #       which requires every Potential issue / ⚠️ finding to
-          #       be explicitly addressed (fixed or dismissed with
-          #       reasoning) before moving on. The agent-driven flow
-          #       does that in-session; the auto-merge workflow has
-          #       no way to address a finding, so it stops here and
-          #       lets the author push a fix (or post a dismissal
-          #       reply). A new approving review after the fix
-          #       re-triggers this job.
-          #   3 — API / infra error. Block and surface.
-          #   4 — max_wait_seconds grace window elapsed without a review.
-          #       CodeRabbit is advisory; log a warning and proceed.
-          #   5 — rate-limit retry budget exhausted. Non-blocking IFF the #489
-          #       Codex failover engaged (codex_failover_requested:true in the
-          #       JSON) — Codex was requested, so the PR advances via the Codex
-          #       gates; otherwise block and let the human intervene.
-          # #727 post-clearance fast path. If the current HEAD already carries an
-          # ACTUAL Codex/Phase-4b clearance AND a reviewer-identity APPROVED, the
-          # real blocking bot-review signal is already in and CodeRabbit is
-          # advisory on top of it — so cap coderabbit-wait.sh's poll budget to
-          # coderabbit.post_clearance_max_wait_seconds instead of the full
-          # max_wait_seconds. Read-only probe; fail SAFE — any non-zero rc leaves
-          # the fast path DISARMED so the full budget is used.
-          #
-          # CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false is load-bearing
-          # (#727, Codex P2 on #729): WITHOUT it, gate (c) accepts the same
-          # reviewer APPROVED that clears gate (b) as a Phase-4b substitute, so an
-          # ordinary under-threshold approval with NO Codex review would arm the
-          # cap and reopen the pre-review merge race. With it, gate (c) requires
-          # an actual Codex bot signal (👍 / affirmative verdict / clean review).
-          # SKIP_CI keeps the probe independent of CI; REQUIRE_APPROVAL_ON_HEAD
-          # HEAD-pins gate (b).
-          #
-          # PROBE_HEAD pins the clearance to the head we evaluated (#727, Codex P2
-          # on #729): a push landing between here and coderabbit-wait.sh's own
-          # head fetch would otherwise let the shortened budget apply to a head
-          # that was never cleared. coderabbit-wait.sh disarms if its live head
-          # differs from this SHA.
-          PROBE_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha 2>/dev/null || echo "")
-          CODEX_CLEARED=false
-          set +e
-          CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
-            CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
-            bash scripts/codex-review-check.sh "$PR_NUMBER" "$REPO" >&2
-          crc=$?
-          set -e
-          case "$crc" in
-            0)
-              CODEX_CLEARED=true
-              echo "::notice::Post-clearance fast path armed (#727): HEAD $PROBE_HEAD has an actual Codex/Phase-4b clearance + reviewer APPROVED — CodeRabbit wait capped to coderabbit.post_clearance_max_wait_seconds."
-              ;;
-            1)
-              echo "::notice::Post-clearance fast path not armed: no actual Codex/Phase-4b clearance (or no reviewer APPROVED) on HEAD — using the full CodeRabbit budget."
-              ;;
-            *)
-              echo "::warning::codex-review-check.sh returned rc=$crc while deriving post-clearance state; failing safe to the full CodeRabbit budget."
-              ;;
-          esac
-
-          # Fail closed if the head could not be resolved (Codex P2 r-comment on
-          # #729): without a non-empty PROBE_HEAD there is nothing to pin the
-          # clearance to, so a push landing before coderabbit-wait.sh resolves
-          # its own head could get the shortened budget on an un-reviewed head.
-          # coderabbit-wait.sh also fails closed on an empty pin, but disarm here
-          # too so the intent is explicit and logged.
-          if [ "$CODEX_CLEARED" = "true" ] && [ -n "$PROBE_HEAD" ]; then
-            POST_CLEARANCE_FLAG=1
-          else
-            POST_CLEARANCE_FLAG=0
-            if [ "$CODEX_CLEARED" = "true" ] && [ -z "$PROBE_HEAD" ]; then
-              echo "::warning::Post-clearance clearance derived but the head SHA could not be resolved for the pin — failing closed to the full CodeRabbit budget (#727)."
-            fi
-          fi
-
-          set +e
-          # Capture the helper's JSON (stdout) so the rc=5 branch can read the
-          # #489 codex_failover_requested flag. Its human-readable diagnostics —
-          # and the failover child's own JSON — go to stderr and stream to the log.
-          WAIT_JSON=$(CODERABBIT_WAIT_POST_CLEARANCE="$POST_CLEARANCE_FLAG" CODERABBIT_WAIT_POST_CLEARANCE_SHA="$PROBE_HEAD" bash scripts/coderabbit-wait.sh "$PR_NUMBER" "$REPO")
-          rc=$?
-          set -e
-          printf '%s\n' "$WAIT_JSON"
-          case "$rc" in
-            0)
-              echo "CodeRabbit cleared on current HEAD — proceeding to merge."
-              ;;
-            2)
-              echo "::error::CodeRabbit flagged Potential issue / ⚠️ findings on the current HEAD. Per REVIEW_POLICY.md § Phase 2.5, each must be explicitly addressed (fixed or dismissed with reasoning) before merge. Blocking auto-merge; address the findings and request a new approval to re-trigger."
-              exit 1
-              ;;
-            4)
-              echo "::warning::CodeRabbit grace window elapsed without a review. CodeRabbit is advisory — proceeding to merge. Check coderabbit-wait.sh JSON above for status_probe details, if present."
-              ;;
-            5)
-              # #489/#713: a rate_limit_stalled is non-blocking ONLY when
-              # the Codex failover engaged AND this head is protected from
-              # bot-unreviewed auto-merge. Protection means either
-              # merge-clearance-gate.sh's external arm applies
-              # NON-vacuously, or the PR is intrinsically external-review
-              # and current-head Codex/Phase-4b clearance is already
-              # satisfied. For PRs where both are false, --trigger-only
-              # does not wait for Codex, so proceeding on the stall alone
-              # would let a rate-limited PR merge with neither bot having
-              # reviewed it (Codex P2 on #512 r3). Since #825 the gate
-              # answers that by WAITING for the failover's Codex review to
-              # clear the head rather than by assuming it did: an
-              # unprotected head still blocks unless codex-review-check.sh
-              # confirms clearance on it. The disposition lives in the
-              # unit-tested, fail-closed
-              # scripts/coderabbit-automerge-rate-limit-gate.sh.
-              #
-              # #713: ask merge-clearance-gate.sh itself for the rc=5
-              # protection predicate. It uses the same intrinsic threshold
-              # + protected-paths computation as the required check, with
-              # the label as a force-on signal and the propagation lane's
-              # HEAD-pinned verified marker as the exemption, all evaluated
-              # on the LIVE head. It returns true on the strength of the
-              # merge-clearance gate only when that gate is ENFORCED —
-              # enabled in the governing policy AND observably a required
-              # status check on the PR's base branch (#772; config-enabled
-              # alone is not evidence the gate can hold a merge). Otherwise
-              # — including when enforcement is undeterminable — it requires
-              # codex-review-check.sh to confirm current-head Codex/Phase-4b
-              # clearance before returning true. Label-event proxies (current-label reads,
-              # unlabeled-removal overrides) remain rejected: a label event
-              # is not head-pinned proof of a downstream gate or clearance.
-              # Fail closed: any nonzero exit or unexpected output from the
-              # query reads as false (block). stderr streams to the step log
-              # for diagnosability; only stdout (exactly `true` or `false`)
-              # is consumed.
-              ext_protected=false
-              if req=$(bash scripts/merge-clearance-gate.sh --derive-rate-limit-protection "$PR_NUMBER" "$REPO"); then
-                case "$req" in
-                  true|false) ext_protected=$req ;;
-                esac
-              fi
-              # #727: the post-clearance derivation above (CODEX_CLEARED) is the
-              # threshold-INDEPENDENT counterpart of --derive-rate-limit-protection,
-              # which only asserts protection when external review APPLIES (it
-              # returns false for an under-threshold PR even when Codex has
-              # cleared HEAD). A verified Codex/Phase-4b clearance + reviewer
-              # APPROVED on HEAD is exactly the "a real bot reviewed this head"
-              # signal the rate-limit gate protects against merging without — so
-              # fold it in. This lets a rate-limit stall inside the shortened
-              # post-clearance window resolve as advisory (proceed) rather than
-              # blocking an already-cleared PR, matching the #489/#713 intent
-              # that only bot-UNREVIEWED heads stay blocked.
-              if [ "$CODEX_CLEARED" = "true" ]; then
-                ext_protected=true
-                echo "::notice::rc=5 protection folds in the #727 post-clearance signal: HEAD has verified Codex/Phase-4b clearance + reviewer APPROVED — the CodeRabbit rate-limit stall is advisory here."
-              fi
-              # #825: pass the PR coordinates so the gate can run its arm 2b —
-              # a bounded wait for the failover's OWN Codex review to clear this
-              # head, verified by codex-review-check.sh (SKIP_CI,
-              # REQUIRE_APPROVAL_ON_HEAD, ALLOW_PHASE_4B_SUBSTITUTE=false: the
-              # same predicate the fast-path probe and the final re-verify use).
-              # The CODEX_CLEARED probe above cannot cover this: it runs BEFORE
-              # coderabbit-wait.sh, so on an under-threshold PR whose only Codex
-              # trigger is the failover itself, it necessarily reads "no
-              # clearance" — the trigger is posted seconds later, inside the
-              # wait. That is the #825 deadlock: `--derive-rate-limit-protection`
-              # is false by construction under threshold, the pre-wait probe is
-              # false by timing, and the stall is immediate because the Fair
-              # Usage window (2109s/2398s observed) exceeds the whole CodeRabbit
-              # budget. Arm 2b spends that unspendable budget on the Codex
-              # verdict instead, and still blocks unless a real one arrives.
-              if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_protected" "$PR_NUMBER" "$REPO"; then
-                echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged and this head has active or already-satisfied external-review protection, or the failover's own Codex review cleared it (#825) — proceeding."
-                # Record the downgrade for the final re-verify step: the
-                # protection derivation is re-run there against the live
-                # merge head, so state that changes during the waits (for
-                # example, a push or propagation-lane verification landing)
-                # aborts the merge.
-                echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"
-              else
-                echo "::error::CodeRabbit rate-limit retry budget exhausted — blocking auto-merge. Either the failover did not engage, or this head has no active merge-clearance external gate and the failover's Codex review did not clear it within the clearance budget (#825). Human must re-trigger or merge manually."
-                exit 1
-              fi
-              ;;
-            *)
-              echo "::error::coderabbit-wait.sh failed with exit code $rc. Blocking auto-merge."
-              exit 1
-              ;;
-          esac
-
       - name: Re-verify blocking labels before readiness probe
         if: steps.author_merge_token.outputs.enabled == 'true'
         env:
@@ -1295,11 +1033,9 @@ jobs:
           #      `if:` check evaluated to true anyway, merging the PR before
           #      any external review could happen. See #61.
           #
-          #   2. The "Wait for CodeRabbit review" step above can sleep for
-          #      up to 5 minutes on a coderabbit-enabled repo. During that
-          #      window, an agent can legitimately apply a blocking label
-          #      (e.g., a human spotting something after approval) and the
-          #      job would still merge because the `if:` already evaluated.
+          #   2. Other jobs can legitimately apply a blocking label after
+          #      approval while this job is evaluating current-head checks.
+          #      The trigger payload does not reflect that later mutation.
           #
           # Re-fetch the authoritative label state from the GitHub API before
           # entering the readiness probe. The same check repeats after a
@@ -1308,14 +1044,15 @@ jobs:
           # present. Also check `policy-violation`, which is applied by the
           # block-self-approval job earlier in this same workflow run (and
           # again, the `if:` at job start wouldn't have seen it).
+          # shellcheck source=scripts/lib/blocking-labels.sh
+          source scripts/lib/blocking-labels.sh
           LABELS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name')
           printf 'Labels at merge time:\n%s\n' "$LABELS"
-          for blocking_label in needs-external-review needs-human-review policy-violation human-hold; do
-            if printf '%s\n' "$LABELS" | grep -Fxq "$blocking_label"; then
-              echo "::error::Blocking label present at merge time: $blocking_label. Aborting auto-merge."
-              exit 1
-            fi
-          done
+          blocking_labels=$(printf '%s\n' "$LABELS" | mergepath_blocking_labels_csv)
+          if [ -n "$blocking_labels" ]; then
+            echo "::error::Blocking label(s) present at merge time: $blocking_labels. Aborting auto-merge."
+            exit 1
+          fi
           echo "No blocking labels present — proceeding to merge."
 
 
@@ -1387,21 +1124,20 @@ jobs:
           #
           # required_checks_json stays scoped to ONLY the canonical
           # `required_check_name` entry -- it is a hard requirement this
-          # loop waits for, up to the shared deadline, and fails closed on
-          # timeout. The repo_lint_local.yml annex must NOT be enforced the
+          # one-shot readiness probe evaluates. The repo_lint_local.yml annex
+          # must NOT be enforced the
           # same way (#655 Codex P2 round 6, "avoid forcing path-filtered
           # annex jobs to start"): a consumer annex scoped by workflow-level
           # `paths`/`paths-ignore` legitimately produces NO check run at all
           # for a PR outside those paths, and earlier rounds forcing its
-          # derived name(s) into this hard-required list made this loop
-          # wait out the full deadline and refuse auto-merge on every such
-          # PR, forever. Annex enforcement instead runs as a separate
-          # workflow-wide scan below (annex_workflow), each poll iteration,
-          # mirroring codex-review-check.sh gate (a): match by
-          # .workflowName rather than by a specific name, block immediately
-          # on any REPORTED bad conclusion, keep polling (bounded by this
-          # same shared deadline) while anything for that workflow is still
-          # in flight, and treat "nothing reported for this workflow at all"
+          # derived name(s) into this hard-required list made the old wait
+          # loop refuse auto-merge on every such PR. Annex enforcement instead
+          # runs as a separate workflow-wide scan below (annex_workflow),
+          # mirroring codex-review-check.sh gate (a): match by the stable
+          # .workflowPath rather than by a specific job name, block immediately
+          # on any REPORTED bad conclusion, report not-ready while anything
+          # for that workflow is still in flight, and treat "nothing reported
+          # for this workflow at all"
           # as non-blocking -- the same trade-off gate (a) already made and
           # validated across #655 rounds 2-5.
           required_checks_json=$(jq -n --arg name "$required_check_name" '[{name: $name, workflow: ""}]')
@@ -1850,11 +1586,10 @@ jobs:
           # required" -- confirmed empirically), so this switches from
           # `gh pr view --json` to a raw graphql call and reshapes the result
           # into the same {statusCheckRollup: [...]} shape the rest of this
-          # loop already expects, adding isRequired as an extra field.
+          # evaluation below expects, adding isRequired as an extra field.
           repo_owner="${REPO%%/*}"
           repo_name="${REPO#*/}"
-          for readiness_probe in 1; do
-            all_done=1
+          all_done=1
             check_count=$(echo "$required_checks_json" | jq 'length')
             # #655 Codex P1 round 12 ("paginate the status check rollup"):
             # a PR with more than 100 statusCheckRollup contexts (this PR
@@ -1870,10 +1605,10 @@ jobs:
             # later page.
             rollup_contexts="[]"
             cursor=""
-            # #1024 (b): rollup_complete records whether this iteration
+            # #1024 (b): rollup_complete records whether this probe
             # actually walked every page. It is only ever cleared by the
             # short-circuit below, which fires exclusively toward the
-            # "keep waiting" verdict -- never toward "green".
+            # "not ready" verdict -- never toward "green".
             rollup_complete=1
             while :; do
               cursor_args=(-F cursor=null)
@@ -1935,11 +1670,11 @@ jobs:
               cursor=$(echo "$page_json" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor // "")')
               [ "$has_next" = "true" ] || break
               # #1024 (b): the pages walked so far can already SETTLE this
-              # iteration's verdict as "keep waiting", and when they do,
+              # probe's verdict as "not ready", and when they do,
               # the remaining pages cannot change it -- so stop paying for
               # them. The predicate below is deliberately one-directional:
-              # it only ever short-circuits toward waiting, never toward
-              # concluding green, because a cheaper loop that can miss a
+              # it only ever short-circuits toward not-ready, never toward
+              # concluding green, because cheaper pagination that can miss a
               # pending required check is far worse than an expensive one.
               #
               # Soundness (this is the whole safety argument, so it is
@@ -1981,12 +1716,12 @@ jobs:
                 break
               fi
             done
-            # #1024 (b): a short-circuited iteration holds only a PREFIX of
+            # #1024 (b): a short-circuited probe holds only a PREFIX of
             # the rollup, so nothing below may draw a conclusion from it.
-            # The verdict is already settled ("keep waiting", per the
-            # soundness argument above), so skip this iteration's
-            # evaluation entirely and fall through to the deadline check
-            # and the backoff sleep. Zeroing the loop bound (rather than
+            # The verdict is already settled ("not ready", per the
+            # soundness argument above), so skip this probe's remaining
+            # evaluation and emit the durable readiness result. Zeroing the
+            # check-loop bound (rather than
             # re-indenting ~200 lines of evaluation into an else-branch)
             # keeps the diff on a propagated required-gate workflow small
             # enough to review line by line. Skipping matters: on a partial
@@ -1994,10 +1729,10 @@ jobs:
             # an unfetched page would lose winner-selection and wrongly
             # refuse auto-merge. Nothing is lost by deferring -- a red
             # sibling check cannot change a verdict that is already "wait",
-            # and it is still caught on the first iteration that completes
-            # pagination, or at the deadline.
+            # and it is still caught by the later completed-workflow event
+            # whose probe completes pagination.
             if [ "$rollup_complete" -ne 1 ]; then
-              echo "::notice::A required check is still pending on the first $(echo "$rollup_contexts" | jq 'length') statusCheckRollup context(s) for HEAD $sha; skipping the remaining pages this poll (#1024)."
+              echo "::notice::A required check is still pending on the first $(echo "$rollup_contexts" | jq 'length') statusCheckRollup context(s) for HEAD $sha; skipping the remaining pages in this readiness probe (#1024)."
               all_done=0
               check_count=0
             fi
@@ -2114,14 +1849,14 @@ jobs:
                   ]')
               winner_count=$(echo "$winners" | jq 'length')
               if [ "$winner_count" -eq 0 ]; then
-                echo "::notice::Required check run '$check_name' is absent on current HEAD $sha; waiting for it to start."
+                echo "::notice::Required check run '$check_name' is absent on current HEAD $sha; not ready."
                 all_done=0
                 continue
               fi
               pending_count=$(echo "$winners" | jq '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end)] | length')
               if [ "$pending_count" -gt 0 ]; then
                 pending_status=$(echo "$winners" | jq -r '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end)][0].status // .state // ""')
-                echo "::notice::Required check run '$check_name' is $pending_status on current HEAD $sha; waiting for completion."
+                echo "::notice::Required check run '$check_name' is $pending_status on current HEAD $sha; not ready."
                 all_done=0
                 continue
               fi
@@ -2144,11 +1879,11 @@ jobs:
             done
 
             # #1024 (b): `rollup_complete` guards the annex scan for the
-            # same reason the required-check loop is skipped above -- its
+            # same reason the required-check evaluation is skipped above -- its
             # group-by-name winner selection over a PREFIX of the rollup
             # could pick a stale FAILURE whose green rerun sits on an
             # unfetched page and exit 1 on it. The scan runs unchanged on
-            # every iteration that completed pagination.
+            # a probe whose pagination completed.
             if [ -n "$annex_workflow" ] && [ "$rollup_complete" -eq 1 ]; then
               # #655 Codex round 6 (P1 "wait for annex checks before
               # clearing the label", P1 "observe matrix annex jobs before
@@ -2159,9 +1894,9 @@ jobs:
               # ANNEX_WORKFLOW_BAD scan. A still-in-progress entry is
               # deliberately treated as pending (not bad) here -- unlike
               # gate (a) (a repeatedly re-evaluated snapshot, where
-              # in-progress correctly counts as "not yet clean"), this loop
-              # can just keep polling for it, bounded by the same shared
-              # deadline as every other required check. Zero reported
+              # in-progress correctly counts as "not yet clean"), this probe
+              # reports not-ready and lets the completion event re-enter.
+              # Zero reported
               # entries for this workflow is non-blocking: forcing a wait
               # for one that may legitimately never exist (a path-filtered
               # annex outside this PR's diff) would time out and refuse
@@ -2190,17 +1925,16 @@ jobs:
                 # means Actions has not scheduled it yet, not that it never
                 # will (unlike a path-filtered annex, where zero entries is
                 # genuinely ambiguous between "not yet" and "never for this
-                # diff"). Keep polling instead of treating this the same as
-                # the path-filtered case; bounded by the same shared
-                # deadline as every other required check, so this cannot
-                # deadlock forever if something is actually wrong.
-                echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has not reported yet (unfiltered trigger, so it is expected to); waiting for it to start on current HEAD $sha (#655)."
+                # diff"). Report not-ready instead of treating this the same
+                # as the path-filtered case; the annex completion event will
+                # re-enter the trusted continuation.
+                echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has not reported yet (unfiltered trigger, so it is expected to); current HEAD $sha is not ready (#655)."
                 all_done=0
               else
                 annex_pending=$(echo "$annex_matches" | jq -c '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end)]')
                 annex_pending_count=$(echo "$annex_pending" | jq 'length')
                 if [ "$annex_pending_count" -gt 0 ]; then
-                  echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_pending_count check-run(s) still in progress on current HEAD $sha; waiting for completion (#655)."
+                  echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_pending_count check-run(s) still in progress on current HEAD $sha; not ready (#655)."
                   all_done=0
                 else
                   # #655 Codex P2 round 13 ("ignore stale annex runs after a
@@ -2241,9 +1975,6 @@ jobs:
             echo "ready=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Required current-head checks are still pending. Approval readiness is recorded; the completed-workflow continuation will re-evaluate without holding this runner."
             exit 0
-          done
-          echo "::error::Required check readiness probe ended unexpectedly; refusing auto-merge."
-          exit 1
 
       - name: Re-verify blocking labels after readiness probe
         if: steps.author_merge_token.outputs.enabled == 'true' && steps.check_readiness.outputs.ready == 'true'
@@ -2253,75 +1984,14 @@ jobs:
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          # shellcheck source=scripts/lib/blocking-labels.sh
+          source scripts/lib/blocking-labels.sh
           LABELS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name')
           printf 'Labels after readiness probe:\n%s\n' "$LABELS"
-          for blocking_label in needs-external-review needs-human-review policy-violation human-hold; do
-            if printf '%s\n' "$LABELS" | grep -Fxq "$blocking_label"; then
-              echo "::error::Blocking label present after readiness probe: $blocking_label. Aborting auto-merge."
-              exit 1
-            fi
-          done
-          # #620 (automated 4b P1, rounds 1+2): if this run downgraded a
-          # CodeRabbit rate-limit stall (rc=5), re-validate the downgrade's
-          # premise at the last verify point. The rc=5-time derivation ran
-          # minutes earlier; state can change during the waits (a push, a
-          # propagation-lane verification landing), and merge-clearance
-          # passing vacuously for the head being merged would mean neither
-          # bot reviewed it.
-          #
-          # Two fail-closed checks, scoped to downgraded runs only:
-          # 1. Head drift: the downgrade anchored the event head, and the
-          #    merge pins CURRENT_HEAD_SHA (the live head the required-check
-          #    wait exported) via --match-head-commit — if they differ, the
-          #    CodeRabbit disposition is stale for the merge head. Abort.
-          # 2. Re-run merge-clearance-gate.sh --derive-rate-limit-protection
-          #    against the (now-pinned) live head and require `true`: the
-          #    same enforced-gate-or-already-satisfied external-review
-          #    protection predicate used at rc=5 time (#772 — an ENFORCED
-          #    required check on the base branch, not merely one enabled in
-          #    config). Any error or non-true output aborts.
-          if [ "${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true" ]; then
-            if [ -z "${CURRENT_HEAD_SHA:-}" ] || [ "$CURRENT_HEAD_SHA" != "$HEAD_SHA" ]; then
-              echo "::error::Head drifted after the rc=5 rate-limit downgrade (event=$HEAD_SHA live=${CURRENT_HEAD_SHA:-unset}) — the CodeRabbit disposition is stale for the merge head. Aborting auto-merge."
-              exit 1
-            fi
-            re_protected=false
-            if req=$(bash scripts/merge-clearance-gate.sh --derive-rate-limit-protection "$PR_NUMBER" "$REPO"); then
-              case "$req" in
-                true) re_protected=true ;;
-              esac
-            fi
-            # #727 (Codex P2 on #729): the rc=5 downgrade can be granted via the
-            # post-clearance signal (CODEX_CLEARED folded into ext_protected),
-            # but --derive-rate-limit-protection returns false for an
-            # under-threshold PR even when Codex cleared HEAD — so re-deriving
-            # only that predicate here would abort a VALID under-threshold
-            # post-clearance downgrade at the last step. Re-evaluate the SAME
-            # post-clearance predicate on the (now head-pinned) live head:
-            # codex-review-check.sh gate (b)+(c), SKIP_CI + REQUIRE_APPROVAL_ON_HEAD,
-            # and ALLOW_PHASE_4B_SUBSTITUTE=false (require an actual Codex bot
-            # signal, not the arming approval — same as the fast-path probe,
-            # Codex P2 on #729). Re-run (not a persisted flag) so state that
-            # changed during the waits is caught, matching this block's
-            # fail-closed intent. Either predicate holding upholds the downgrade.
-            if [ "$re_protected" != "true" ]; then
-              set +e
-              CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
-                CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
-                bash scripts/codex-review-check.sh "$PR_NUMBER" "$REPO" >&2
-              crc=$?
-              set -e
-              if [ "$crc" = "0" ]; then
-                re_protected=true
-                echo "::notice::rc=5 re-verify: post-clearance predicate still holds on $CURRENT_HEAD_SHA (verified Codex/Phase-4b clearance + reviewer APPROVED) — downgrade upheld (#727)."
-              elif [ "$crc" != "1" ]; then
-                echo "::warning::codex-review-check.sh returned rc=$crc re-deriving the post-clearance predicate at final re-verify; treating as not-protected (fail closed)."
-              fi
-            fi
-            if [ "$re_protected" != "true" ]; then
-              echo "::error::external-review protection is no longer true (or underivable) for $CURRENT_HEAD_SHA after an rc=5 rate-limit downgrade — this head has neither an active external gate nor already-satisfied Codex/Phase-4b clearance. Aborting auto-merge."
-              exit 1
-            fi
+          blocking_labels=$(printf '%s\n' "$LABELS" | mergepath_blocking_labels_csv)
+          if [ -n "$blocking_labels" ]; then
+            echo "::error::Blocking label(s) present after readiness probe: $blocking_labels. Aborting auto-merge."
+            exit 1
           fi
           echo "No blocking labels present after readiness probe — proceeding to merge."
 

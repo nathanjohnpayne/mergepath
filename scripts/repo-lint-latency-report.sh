@@ -10,9 +10,10 @@ LIMIT=100
 MIN_SAMPLE=20
 P50_MAX=300
 P95_MAX=480
+DEEP_P95_MAX=720
 
 usage() {
-  echo "usage: repo-lint-latency-report.sh [--input FILE] [--repo owner/repo] [--out-dir DIR] [--limit N] [--min-sample N] [--p50-max SECONDS] [--p95-max SECONDS]" >&2
+  echo "usage: repo-lint-latency-report.sh [--input FILE] [--repo owner/repo] [--out-dir DIR] [--limit N] [--min-sample N] [--p50-max SECONDS] [--p95-max SECONDS] [--deep-p95-max SECONDS]" >&2
   exit 2
 }
 
@@ -25,12 +26,13 @@ while [ "$#" -gt 0 ]; do
     --min-sample) [ "$#" -ge 2 ] || usage; MIN_SAMPLE="$2"; shift 2 ;;
     --p50-max) [ "$#" -ge 2 ] || usage; P50_MAX="$2"; shift 2 ;;
     --p95-max) [ "$#" -ge 2 ] || usage; P95_MAX="$2"; shift 2 ;;
+    --deep-p95-max) [ "$#" -ge 2 ] || usage; DEEP_P95_MAX="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
 done
 
-for value in "$LIMIT" "$MIN_SAMPLE" "$P50_MAX" "$P95_MAX"; do
+for value in "$LIMIT" "$MIN_SAMPLE" "$P50_MAX" "$P95_MAX" "$DEEP_P95_MAX"; do
   case "$value" in ''|*[!0-9]*) usage ;; esac
 done
 [ "$LIMIT" -ge 1 ] && [ "$LIMIT" -le 100 ] || usage
@@ -95,7 +97,8 @@ fi
 jq -c \
   --argjson min_sample "$MIN_SAMPLE" \
   --argjson p50_max "$P50_MAX" \
-  --argjson p95_max "$P95_MAX" '
+  --argjson p95_max "$P95_MAX" \
+  --argjson deep_p95_max "$DEEP_P95_MAX" '
   def percentile($p):
     sort as $values
     | if ($values|length) == 0 then null
@@ -109,7 +112,12 @@ jq -c \
       .event == "pull_request"
       and ([.jobs[]? | select((.name | startswith("deep-safety")) and .conclusion != "skipped")] | length) == 0
     ))) as $ordinary
+  | ($completed | map(select(
+      .event == "pull_request"
+      and ([.jobs[]? | select((.name | startswith("deep-safety")) and .conclusion != "skipped")] | length) > 0
+    ))) as $deep
   | (distribution([$ordinary[].duration_seconds])) as $ordinary_dist
+  | (distribution([$deep[].duration_seconds])) as $deep_dist
   | (.runs
       | map(select((.event == "pull_request" or .event == "push") and (.head_sha // "") != ""))
       | group_by(.head_sha)
@@ -135,12 +143,14 @@ jq -c \
     ) as $steps
   | ([if ($ordinary_dist.n >= $min_sample and $ordinary_dist.p50_seconds > $p50_max) then "ordinary_pr_p50_regression" else empty end,
       if ($ordinary_dist.n >= $min_sample and $ordinary_dist.p95_seconds > $p95_max) then "ordinary_pr_p95_regression" else empty end,
+      if ($deep_dist.n >= $min_sample and $deep_dist.p95_seconds > $deep_p95_max) then "deep_pr_p95_regression" else empty end,
       if ($duplicates|length) > 0 then "same_sha_duplicate_execution" else empty end]) as $alerts
   | {
       schema:"repo-lint-latency/v1",
-      status:(if ($alerts|length)>0 then "alert" elif $ordinary_dist.n < $min_sample then "insufficient-sample" else "healthy" end),
-      thresholds:{min_sample:$min_sample,p50_max_seconds:$p50_max,p95_max_seconds:$p95_max},
+      status:(if ($alerts|length)>0 then "alert" elif ($ordinary_dist.n < $min_sample or $deep_dist.n < $min_sample) then "insufficient-sample" else "healthy" end),
+      thresholds:{min_sample:$min_sample,p50_max_seconds:$p50_max,p95_max_seconds:$p95_max,deep_p95_max_seconds:$deep_p95_max},
       ordinary_pr:$ordinary_dist,
+      deep_pr:$deep_dist,
       alerts:$alerts,
       duplicate_heads:$duplicates,
       timings:{jobs:$jobs,steps:$steps}
@@ -155,8 +165,9 @@ jq -r '
   "# Repo-lint latency\n\n" +
   "Status: **" + .status + "**\n\n" +
   "| segment | n | p50 | p95 |\n|---|---:|---:|---:|\n" +
-  "| ordinary PR | " + (.ordinary_pr.n|tostring) + " | " + (.ordinary_pr.p50_seconds|duration) + " | " + (.ordinary_pr.p95_seconds|duration) + " |\n\n" +
-  "Thresholds: p50 <= " + (.thresholds.p50_max_seconds|duration) + ", p95 <= " + (.thresholds.p95_max_seconds|duration) + ", minimum sample " + (.thresholds.min_sample|tostring) + ".\n\n" +
+  "| ordinary PR | " + (.ordinary_pr.n|tostring) + " | " + (.ordinary_pr.p50_seconds|duration) + " | " + (.ordinary_pr.p95_seconds|duration) + " |\n" +
+  "| deep/governance PR | " + (.deep_pr.n|tostring) + " | " + (.deep_pr.p50_seconds|duration) + " | " + (.deep_pr.p95_seconds|duration) + " |\n\n" +
+  "Thresholds: ordinary p50 <= " + (.thresholds.p50_max_seconds|duration) + ", ordinary p95 <= " + (.thresholds.p95_max_seconds|duration) + ", deep p95 <= " + (.thresholds.deep_p95_max_seconds|duration) + ", minimum sample per segment " + (.thresholds.min_sample|tostring) + ".\n\n" +
   "Duplicate heads: " + (.duplicate_heads|length|tostring) + ".\n\n" +
   (if (.alerts|length)>0 then "Alerts: " + (.alerts|join(", ")) + ".\n" else "Alerts: none.\n" end)
 ' "$OUT_DIR/summary.json" > "$OUT_DIR/summary.md"

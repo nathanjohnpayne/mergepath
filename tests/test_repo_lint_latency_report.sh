@@ -20,7 +20,7 @@ if [ ! -x "$SUBJECT" ]; then
 fi
 
 if command -v yq >/dev/null 2>&1 \
-   && yq -e '.on.schedule[0].cron == "47 8 * * *" and .on.workflow_dispatch == null and .permissions.actions == "read" and ([.jobs.report.steps[] | select(.name == "Collect rolling repo-lint timing") | .run | contains("repo-lint-latency-report.sh")] | any) and ([.jobs.report.steps[] | select(.name == "Upload timing evidence") | .uses | contains("actions/upload-artifact@")] | any)' "$WORKFLOW" >/dev/null \
+   && yq -e '.on.schedule[0].cron == "47 8 * * *" and .on.workflow_dispatch == null and .permissions.actions == "read" and ([.jobs.report.steps[] | select(.name == "Collect rolling repo-lint timing") | (.run | contains("repo-lint-latency-report.sh"))] | any) and ([.jobs.report.steps[] | select(.name == "Collect rolling repo-lint timing") | (.run | contains("--deep-p95-max 720"))] | any) and ([.jobs.report.steps[] | select(.name == "Upload timing evidence") | .uses | contains("actions/upload-artifact@")] | any)' "$WORKFLOW" >/dev/null \
    && grep -Fq 'tests/test_repo_lint_latency_report.sh' "$WRAPPER"; then
   pass "scheduled workflow publishes summaries/artifacts and the CI wrapper owns this contract"
 else
@@ -46,10 +46,23 @@ jq -n '{runs:[range(0;20) as $i | {
   ]
 }]}' > "$TMP/healthy.json"
 
+jq '.runs += [range(0;20) as $i | {
+  id: ($i + 101), head_sha:("deep-sha" + ($i|tostring)), event:"pull_request",
+  conclusion:"success",
+  duration_seconds:(500 + 10*$i),
+  jobs:[
+    {name:"lint-fast", conclusion:"success", duration_seconds:(80 + $i), steps:[]},
+    {name:"deep-safety (consumer)", conclusion:"success", duration_seconds:(450 + 10*$i), steps:[]},
+    {name:"lint", conclusion:"success", duration_seconds:5}
+  ]
+}]' "$TMP/healthy.json" > "$TMP/healthy-with-deep.json"
+mv "$TMP/healthy-with-deep.json" "$TMP/healthy.json"
+
 if bash "$SUBJECT" --input "$TMP/healthy.json" --out-dir "$TMP/healthy" --min-sample 20; then
-  if jq -e '.ordinary_pr.n == 20 and .ordinary_pr.p50_seconds == 190 and .ordinary_pr.p95_seconds == 280 and .status == "healthy" and (.timings.jobs[] | select(.name == "lint-fast") | .n == 20)' "$TMP/healthy/summary.json" >/dev/null \
-     && grep -Fq '| ordinary PR | 20 | 3m 10s | 4m 40s |' "$TMP/healthy/summary.md"; then
-    pass "healthy sample reports exact p50/p95 plus job timing distributions"
+  if jq -e '.ordinary_pr.n == 20 and .ordinary_pr.p50_seconds == 190 and .ordinary_pr.p95_seconds == 280 and .deep_pr.n == 20 and .deep_pr.p95_seconds == 680 and .status == "healthy" and (.timings.jobs[] | select(.name == "lint-fast") | .n == 20)' "$TMP/healthy/summary.json" >/dev/null \
+     && grep -Fq '| ordinary PR | 20 | 3m 10s | 4m 40s |' "$TMP/healthy/summary.md" \
+     && grep -Fq '| deep/governance PR | 20 | 9m 50s | 11m 20s |' "$TMP/healthy/summary.md"; then
+    pass "healthy sample reports ordinary and deep acceptance percentiles"
   else
     fail "healthy sample summary is incorrect"
   fi
@@ -92,8 +105,8 @@ set +e
 bash "$SUBJECT" --input "$TMP/slow.json" --out-dir "$TMP/slow" --min-sample 20 >/dev/null 2>&1
 rc=$?
 set -e
-if [ "$rc" -eq 1 ] && jq -e '.status == "alert" and (.alerts | index("ordinary_pr_p50_regression")) != null' "$TMP/slow/summary.json" >/dev/null; then
-  pass "p50/p95 threshold regressions fail the audit"
+if [ "$rc" -eq 1 ] && jq -e '.status == "alert" and (.alerts | index("ordinary_pr_p50_regression")) != null and (.alerts | index("deep_pr_p95_regression")) != null' "$TMP/slow/summary.json" >/dev/null; then
+  pass "ordinary and deep threshold regressions fail the audit"
 else
   fail "latency regression must alert (rc=$rc)"
 fi

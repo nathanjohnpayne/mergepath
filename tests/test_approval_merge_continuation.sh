@@ -6,8 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUBJECT="$ROOT/scripts/workflow/approval-merge-continuation.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/approval-continuation.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/bin" "$TMP/root/scripts"
+mkdir -p "$TMP/bin" "$TMP/root/scripts/lib"
 cp "$SUBJECT" "$TMP/subject.sh"
+cp "$ROOT/scripts/lib/blocking-labels.sh" "$TMP/root/scripts/lib/blocking-labels.sh"
 
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -78,6 +79,12 @@ assert_not_ready() {
 
 STUB_GATE_RC=1 assert_not_ready "pending canonical gate defers without arming"
 STUB_GATE_RC=0 STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"human-hold"}]}' assert_not_ready "blocking label defers before gate work"
+STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"documentation"}]}' STUB_FINAL="$BASE"
+if run_case && [ -s "$TMP/merge.log" ]; then
+  pass "non-blocking labels remain merge-eligible"
+else
+  fail "shared blocking-label policy must not reject unrelated labels"
+fi
 STUB_INITIAL="$BASE" STUB_ACCOUNTING_RC=1 assert_not_ready "unaccounted feedback defers without arming"
 STUB_ACCOUNTING_RC=0 STUB_THREADS_RC=3 assert_not_ready "unresolved conversations defer without arming"
 STUB_THREADS_RC=0 STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"def456","url":"https://example.test/pr/7","labels":[]}' assert_not_ready "head drift during evaluation defers without arming"

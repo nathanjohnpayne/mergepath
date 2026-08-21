@@ -15,6 +15,8 @@ case "$PR_NUMBER" in *[!0-9]*|'') usage ;; esac
 [ -n "$REPO" ] || usage
 
 ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+# shellcheck source=../lib/blocking-labels.sh
+source "$ROOT/scripts/lib/blocking-labels.sh"
 
 not_ready() {
   echo "approval continuation: not ready — $*"
@@ -32,7 +34,7 @@ read_pr() {
 }
 
 blocking_labels() {
-  jq -r '[.labels[]?.name] | map(select(. == "needs-external-review" or . == "needs-human-review" or . == "policy-violation" or . == "human-hold")) | join(",")'
+  jq -r '.labels[]?.name' | mergepath_blocking_labels_csv
 }
 
 login=$(gh api user --jq .login 2>/dev/null) || infra_error "could not verify merge token identity"
