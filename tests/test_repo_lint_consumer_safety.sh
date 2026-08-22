@@ -168,6 +168,11 @@ CONSUMER_ABSENT=(
   # not in the manifest, so consumers do not have them.
   "tests/test_ci_scripts_wired.sh"
   "tests/test_repo_lint_consumer_safety.sh"
+  # Same rationale as the line above, and its omission is why this net
+  # passed on the hub while check_repo_lint_optimization hard-failed on a
+  # real consumer (#1068): the fixture kept the file, so the wrapper found
+  # it present and the assertions that read it never fired. #1069.
+  "tests/test_consumer_residue_safety.sh"
 )
 
 # Hub-only STALE RESIDUE: excluded from the template mirror NOW, but still
@@ -191,6 +196,46 @@ CONSUMER_RESIDUE_PRESENT=(
   "tests/test_audit_branch_protection.sh"
 )
 
+# Hub-only content FROZEN AT BOOTSTRAP: the path is PRESENT on every
+# consumer, but it is not a manifest entry, so it was seeded once by the
+# template mirror and has never received a hub update. Neither existing
+# list can express this — CONSUMER_ABSENT models "missing" and
+# CONSUMER_RESIDUE_PRESENT models "a hub-only file an old bootstrap left
+# behind", and this is neither: the file is present, expected, and simply
+# stale.
+#
+# It is the class that produced the second half of #1068.
+# check_git_identity_hygiene cases 26b/26c assert hub-CURRENT policy prose
+# against $ROOT/REVIEW_POLICY.md; gaycruisebingo carries a 1181-line
+# snapshot from its 2026-07-07 bootstrap, so three of those four assertions
+# failed on the consumer and the fourth — a negative assertion — passed
+# VACUOUSLY, which is the more dangerous half. A presence test cannot see
+# any of it, because the file is there.
+#
+# The fixture models the PROPERTY (present, parseable, but not carrying the
+# hub's current content), not one consumer's exact bytes: the net is
+# hermetic and cannot fetch live consumers, and pinning real bytes would
+# rot on the next edit. Each stub stays structurally valid so a check that
+# parses the file fails on its ASSERTIONS rather than on a parse error,
+# which would be a different bug than the one being modelled.
+CONSUMER_FROZEN_CONTENT=(
+  "REVIEW_POLICY.md"
+  ".github/workflows/md-prose-wrap.yml"
+)
+
+# Mutual exclusivity with the other two lists, mirroring the residue guard
+# below: a frozen path that also appears as absent or residue would model
+# two contradictory consumer states at once.
+for frozen in "${CONSUMER_FROZEN_CONTENT[@]}"; do
+  for pat in "${CONSUMER_ABSENT[@]}"; do
+    if [ "$frozen" = "$pat" ]; then
+      echo "FATAL: '$frozen' is in BOTH CONSUMER_FROZEN_CONTENT and CONSUMER_ABSENT." >&2
+      echo "       A path cannot be simultaneously missing and present-but-stale." >&2
+      exit 1
+    fi
+  done
+done
+
 for pat in "${CONSUMER_ABSENT[@]}"; do
   # Expand the glob inside the fixture; nullglob-style via compgen.
   while IFS= read -r hit; do
@@ -199,6 +244,45 @@ for pat in "${CONSUMER_ABSENT[@]}"; do
   done <<EOF
 $(compgen -G "$FIX/$pat" || true)
 EOF
+done
+
+# Apply the frozen-content model. The path must already exist in the hub
+# tree — if it does not, the entry is stale and the fixture would silently
+# model nothing, so fail loudly instead.
+for frozen in "${CONSUMER_FROZEN_CONTENT[@]}"; do
+  if [ ! -f "$FIX/$frozen" ]; then
+    echo "FATAL: frozen-content path '$frozen' is not a file in the fixture." >&2
+    echo "       It is PRESENT on live consumers; if it moved or was deleted" >&2
+    echo "       upstream, update CONSUMER_FROZEN_CONTENT rather than leaving a" >&2
+    echo "       stale entry that models nothing." >&2
+    exit 1
+  fi
+  case "$frozen" in
+    *.yml|*.yaml)
+      cat > "$FIX/$frozen" <<'FROZEN_YML'
+# Bootstrap-era stand-in (tests/test_repo_lint_consumer_safety.sh).
+# Structurally valid, deliberately missing every hub-current assertion.
+name: frozen-bootstrap-stand-in
+on:
+  pull_request:
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
+FROZEN_YML
+      ;;
+    *)
+      cat > "$FIX/$frozen" <<'FROZEN_MD'
+# Bootstrap-era stand-in
+
+This file is PRESENT on every consumer but is not a manifest entry, so it
+was seeded once at bootstrap and never updated. It deliberately carries
+none of the hub's current prose, which is exactly the consumer state that
+made check_git_identity_hygiene cases 26b/26c fail on gaycruisebingo.
+FROZEN_MD
+      ;;
+  esac
 done
 
 # Guard the residue model against a future author "tidying" a residue path
