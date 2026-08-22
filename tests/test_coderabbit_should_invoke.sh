@@ -31,7 +31,8 @@ scratch() {  # <coderabbit_block_body> <cls_rc|absent|nonexec>
   cp "$SCRIPT" "$dir/scripts/coderabbit-should-invoke.sh"
   chmod +x "$dir/scripts/coderabbit-should-invoke.sh"
   if [ "$cls" != "absent" ]; then
-    printf '#!/usr/bin/env bash\nexit %s\n' "${cls#nonexec:}" >"$dir/scripts/phase-4b-classifier.sh"
+    printf '#!/usr/bin/env bash\necho "{\\"match\\": false, \\"phase_4b_default\\": \\"%s\\"}"\nexit %s\n' \
+      "${CLS_POLICY_FIXTURE:-complex-changes}" "${cls#nonexec:}" >"$dir/scripts/phase-4b-classifier.sh"
     if [ "${cls%%:*}" = "nonexec" ]; then chmod -x "$dir/scripts/phase-4b-classifier.sh"; else chmod +x "$dir/scripts/phase-4b-classifier.sh"; fi
   fi
   echo "$dir"
@@ -85,6 +86,34 @@ if printf '%s' "$out" | jq -e '.decision == "skip" and .invoke_mode == "never" a
 else
   fail "--json shape wrong: $out"
 fi
+
+echo "--- #1084 r1: the classifier is a DISPOSITION function, not a detector ---"
+# With phase_4b_default: fallback-only the classifier short-circuits and exits 0
+# WITHOUT inspecting the diff. Reading that as "routine" would skip CodeRabbit on
+# every PR in such a repo, silently, including state-machine changes.
+CLS_POLICY_FIXTURE=fallback-only case_is "fallback-only short-circuit invokes (not skip)" "$CX" 0 0
+CLS_POLICY_FIXTURE=complex-changes case_is "an inspecting policy still skips on no-match" "$CX" 0 1
+
+echo "--- #1084 r1: a flag with a missing value must not loop forever ---"
+d=$(scratch "$ON" 0)
+( cd "$d" && timeout 5 ./scripts/coderabbit-should-invoke.sh 99 --repo >/dev/null 2>&1 )
+rc=$?
+if [ "$rc" = 3 ]; then pass "--repo with no value is rc=3 (no infinite loop)"
+elif [ "$rc" = 124 ]; then fail "--repo with no value HUNG (shift 2 failed and the loop re-read it)"
+else fail "--repo with no value: expected rc=3, got rc=$rc"; fi
+
+echo "--- #1084 r1: a hash inside a quoted scalar is content, not a comment ---"
+# Stripping it unconditionally turned a malformed value into a bare `never`,
+# so bad input suppressed CodeRabbit -- inverting the fail-toward-invoke contract.
+case_is 'quoted hash does not become a valid mode' "$ON"$'\n''  invoke: "never # temporary"' 0 0
+case_is 'unquoted hash without space stays one token' "$ON"$'\n'"  invoke: never#temporary"    0 0
+case_is 'genuine trailing comment still parses'      "$ON"$'\n'"  invoke: never   # why"       0 1
+
+echo "--- #1084 r1: the policy is resolved from the SCRIPT checkout, not \$PWD ---"
+d=$(scratch "$ON"$'\n'"  invoke: never" 0)
+( cd / && "$d/scripts/coderabbit-should-invoke.sh" 99 >/dev/null 2>&1 )
+[ $? = 1 ] && pass "explicit never is honoured when run from a foreign cwd" \
+             || fail "running from a foreign cwd lost the config and did not skip"
 
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"

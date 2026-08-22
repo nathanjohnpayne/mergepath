@@ -2,12 +2,27 @@
 # coderabbit-should-invoke.sh — decide whether Phase 2.5 (CodeRabbit) runs
 # for a given PR.
 #
+# SCOPE -- read this before assuming what the knob buys you (#1084 r1).
+#
+# This governs PHASE 2.5, the AGENT's wait-and-disposition phase. It does NOT
+# stop the CodeRabbit App from reviewing: the shipped `.coderabbit.yml` sets
+# `auto_review.enabled: true`, so the App starts on PR open, before this script
+# ever runs. Skipping therefore:
+#
+#   * DOES save the agent the Phase 2.5 wait (bounded by
+#     `coderabbit.max_wait_seconds`, 1245s here).
+#   * Does NOT reduce provider invocations, and so does NOT reduce rate-limit
+#     pressure. Reading this as a rate-limit remedy is reading it wrong.
+#   * Leaves findings the App posts later UNWATCHED. Those are still
+#     unresolved review conversations, and the pre-merge conversation gate
+#     still blocks on them, so a skipped PR can still need thread triage.
+#
+# Actually reducing invocations needs an App-side opt-out (auto_review off, or
+# path filters in `.coderabbit.yml`) and is deliberately not attempted here.
+#
 # CodeRabbit is advisory: it never carries the merge gate, and its severity
 # gate is a clean no-op wherever `coderabbit.severity_gate.enabled` is false
-# (the default on every consumer). What it does cost is wall-clock — the
-# Phase 2.5 wait is bounded by `coderabbit.max_wait_seconds` (1245s here) and
-# the provider rate-limits under sustained use. Spending that on every
-# one-line docs PR is the waste this script exists to remove.
+# (the default on every consumer).
 #
 # The decision is deliberately a SCRIPT rather than agent judgement: "is this
 # PR complex enough for CodeRabbit" must be reproducible across sessions and
@@ -44,14 +59,26 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG=".github/review-policy.yml"
+# Resolve the policy relative to the SCRIPT's checkout, not $PWD (#1084 r1).
+# Launched from a subdirectory, or by absolute path from another working
+# directory, a relative CONFIG reads the wrong checkout or no file at all --
+# and an explicit `enabled: false` / `invoke: never` would then be silently
+# ignored. Mirrors how phase-4b-classifier.sh locates the repo.
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG="$REPO_ROOT/.github/review-policy.yml"
 
 PR_NUM=""
 REPO=""
 JSON=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --repo) REPO="${2:-}"; shift 2 ;;
+    --repo)
+      # `shift 2` with only one argument left FAILS and shifts NOTHING; with
+      # errexit off the loop then re-reads `--repo` forever (#1084 r1).
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "Error: --repo requires a value" >&2; exit 3
+      fi
+      REPO="$2"; shift 2 ;;
     --json) JSON=true; shift ;;
     --help|-h) sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "Error: unknown flag '$1'" >&2; exit 3 ;;
@@ -79,9 +106,20 @@ coderabbit_field() {  # <field>
     in_block && /^[^[:space:]#]/ { in_block=0 }
     in_block && $1 == fld":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^["\047]/, "", $0)
-      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
-      gsub(/[[:space:]]*#.*$/, "", $0)
+      # Quote-aware. A `#` INSIDE a quoted scalar is literal YAML content, not
+      # a comment: stripping it unconditionally turned `invoke: "never # tmp"`
+      # into a bare `never`, so a malformed value suppressed CodeRabbit --
+      # the exact inversion of the fail-toward-invoking contract
+      # (#1084 r1). Outside quotes, `#` only opens a comment when preceded by
+      # whitespace, per YAML.
+      if ($0 ~ /^["\047]/) {
+        q = substr($0, 1, 1)
+        rest = substr($0, 2)
+        idx = index(rest, q)
+        if (idx > 0) { print substr(rest, 1, idx - 1); exit }
+        print rest; exit
+      }
+      sub(/[[:space:]]+#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print
       exit
@@ -110,6 +148,7 @@ fi
 INVOKE_MODE=$(coderabbit_field invoke)
 INVOKE_MODE=${INVOKE_MODE:-always}
 
+# Exact-match only. Anything that is not one of the three literals invokes.
 case "$INVOKE_MODE" in
   never)   emit skip   "coderabbit.invoke=never" ;;
   always)  emit invoke "coderabbit.invoke=always" ;;
@@ -141,6 +180,19 @@ else
 fi
 CLS_RC=$?
 set -e
+
+# The classifier is a DISPOSITION function, not purely a complexity detector,
+# and the difference matters here (#1084 r1). With `phase_4b_default:
+# fallback-only` -- the documented default for existing repos -- it
+# short-circuits and exits 0 WITHOUT inspecting the diff at all. Read as
+# "routine", that would skip CodeRabbit on every PR in such a repo, including
+# state-machine and concurrency changes, and would do it silently. Exit 0 is
+# therefore only trustworthy as "no trigger matched" when the classifier
+# actually looked.
+CLS_POLICY=$(printf '%s' "$CLS_OUT" | sed -n 's/.*"phase_4b_default"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+if [ "$CLS_POLICY" = "fallback-only" ]; then
+  emit invoke "classifier short-circuits under phase_4b_default=fallback-only without inspecting the diff — complexity unassessed, defaulting to invoke"
+fi
 
 case "$CLS_RC" in
   1) emit invoke "classifier matched a Phase 4b trigger (complex change)" ;;

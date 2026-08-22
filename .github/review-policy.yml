@@ -187,12 +187,16 @@ feedback_policy:
 # CodeRabbit GitHub App. All agent instructions use conditional language
 # and will skip Phase 2.5 automatically.
 coderabbit:
-  # When Phase 2.5 runs at all (#1084). CodeRabbit is advisory -- it never
-  # carries the merge gate, and its severity gate is a clean no-op wherever
-  # coderabbit.severity_gate.enabled is false. What it costs is wall-clock:
-  # the Phase 2.5 wait is bounded by max_wait_seconds below, and the provider
-  # rate-limits under sustained use (three windows hit in one day on
-  # 2026-08-22). Spending that on every one-line docs PR is pure waste.
+  # When PHASE 2.5 runs at all (#1084) -- whether the AGENT waits for
+  # CodeRabbit and dispositions its findings.
+  #
+  # It does NOT stop the App from reviewing. .coderabbit.yml sets
+  # auto_review.enabled: true, so the App starts on PR open, before this
+  # decision is made. Skipping saves the agent's wait; it does NOT reduce
+  # provider invocations or rate-limit pressure, and findings the App posts
+  # later are left unwatched -- still unresolved conversations that the
+  # pre-merge gate blocks on. Reducing invocations needs an App-side opt-out
+  # in .coderabbit.yml and is not what this knob does.
   #
   #   always           -- invoke on every PR (the pre-#1084 behaviour, and the
   #                       default when this key is absent, so a repo that has
@@ -480,7 +484,7 @@ codex:
   cli_login: nathanpayne-codex
 
   # Maximum number of `@codex review` rounds before escalating as runaway.
-  # The 3rd round trips the guard. Normal termination is either approval,
+  # The 11th round trips the guard (10 since #1084). Normal termination is either approval,
   # disagreement (repeat-after-rebuttal), or timeout → Phase 4b fallback.
   # Raised 2 -> 10 (#1084). Codex is now the primary reviewer on every PR,
   # so the budget has to cover a real convergence run rather than two

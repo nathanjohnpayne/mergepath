@@ -27,16 +27,27 @@ TESTS=(
   "$REPO_ROOT/tests/test_coderabbit_should_invoke.sh"
 )
 
-# The suites below are invoked by POSITIONAL INDEX. That is fragile in a
-# specific way, learned the hard way in #1084: appending to TESTS without
-# adding a matching "${TESTS[n]}" line leaves the new suite silently unrun,
-# and INSERTING mid-array shifts every label and drops the last suite off the
-# end of the invocation list. Neither failure is visible in the check's own
-# output — it still prints PASS. This assertion makes both loud.
-EXPECTED_INVOCATIONS=$(grep -c '^"\${TESTS\[[0-9]\+\]}"$' "${BASH_SOURCE[0]}")
-if [ "$EXPECTED_INVOCATIONS" -ne "${#TESTS[@]}" ]; then
-  echo "check_coderabbit_wait: FAIL — ${#TESTS[@]} suites declared in TESTS but $EXPECTED_INVOCATIONS invoked." >&2
-  echo "  Every entry needs a matching \"\${TESTS[n]}\" line; append rather than insert." >&2
+# The suites below are invoked by POSITIONAL INDEX. That is fragile in two
+# ways, both learned on #1084. Appending to TESTS without adding a matching
+# "${TESTS[n]}" line leaves the new suite silently unrun; INSERTING mid-array
+# shifts every label and drops the last suite off the end. Neither shows up in
+# this check's output -- it still prints PASS.
+#
+# Counting invocations is NOT sufficient to catch that, which the first version
+# of this guard got wrong (Codex P2 on #1084): invoking one index twice while
+# omitting another keeps the count equal and the guard green while a suite goes
+# unrun -- exactly the regression it exists to prevent. Compare the SET of
+# indices actually invoked against 0..n-1.
+invoked_idx=$(grep -oE '^"\$\{TESTS\[[0-9]+\]\}"$' "${BASH_SOURCE[0]}" \
+  | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+expected_idx=""
+_i=0
+while [ "$_i" -lt "${#TESTS[@]}" ]; do expected_idx="$expected_idx$_i "; _i=$((_i + 1)); done
+if [ "$invoked_idx" != "$expected_idx" ]; then
+  echo "check_coderabbit_wait: FAIL — invoked test indices do not match the TESTS array." >&2
+  echo "  declared ${#TESTS[@]} suite(s), expecting indices: $expected_idx" >&2
+  echo "  actually invoked (deduped):                        $invoked_idx" >&2
+  echo "  Every entry needs exactly one matching \"\${TESTS[n]}\" line; append rather than insert." >&2
   exit 1
 fi
 

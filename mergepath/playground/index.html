@@ -940,7 +940,7 @@
         </div>
         <div class="nested shown" id="codexNested">
           <div class="slider-row">
-            <input type="range" id="codexRounds" min="1" max="5" step="1" value="2" aria-label="Codex maximum review rounds" />
+            <input type="range" id="codexRounds" min="1" max="15" step="1" value="10" aria-label="Codex maximum review rounds" />
             <span class="val">max <span id="codexRoundsVal">2</span> rounds</span>
           </div>
           <p class="hint">Beyond this, Mergepath stops the loop and pings a human.</p>
@@ -1121,7 +1121,7 @@
     // instead of the full max_wait_seconds. The owner-decided default is 240.
     postClearanceWait: 240,
     codex: true,
-    codexRounds: 2,
+    codexRounds: 10,
     // Request `@codex review` on every PR, not only above-threshold ones
     // (#486). Mirrors codex.request_by_default in review-policy.yml; the
     // owner-decided default is on (#483).
@@ -1136,9 +1136,9 @@
   };
 
   const PRESETS = {
-    strict:   { threshold: 100, coderabbit: true,  postClearanceWait: 240, codex: true,  codexRounds: 3, codexRequestByDefault: true,  feedbackMode: 'address-all', feedbackPriorities: { p0: true, p1: true, p2: true,  p3: true  } },
-    standard: { threshold: 300, coderabbit: true,  postClearanceWait: 240, codex: true,  codexRounds: 2, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
-    loose:    { threshold: 800, coderabbit: false, postClearanceWait: 240, codex: false, codexRounds: 1, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: false, p2: false, p3: false } },
+    strict:   { threshold: 100, coderabbit: true,  postClearanceWait: 240, codex: true,  codexRounds: 12, codexRequestByDefault: true,  feedbackMode: 'address-all', feedbackPriorities: { p0: true, p1: true, p2: true,  p3: true  } },
+    standard: { threshold: 300, coderabbit: true,  postClearanceWait: 240, codex: true,  codexRounds: 10, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
+    loose:    { threshold: 800, coderabbit: false, postClearanceWait: 240, codex: false, codexRounds: 5, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: false, p2: false, p3: false } },
   };
 
   const LIMITS = {
