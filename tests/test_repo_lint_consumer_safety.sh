@@ -266,7 +266,11 @@ done
 # this model describes a consumer state that no longer exists — silently, and
 # in the direction of validating marker guards that are no longer needed.
 # Derive the closure from the manifest rather than restating it.
-frozen_manifest_paths=$(yq -r '.paths[] | (.path // .)' "$ROOT/.mergepath-sync.yml" 2>/dev/null | sed '/^null$/d' || true)
+# BOTH .path and .dest: templated entries carry source/dest instead of path,
+# so a .path-only extractor (with a null-drop that silently discards exactly
+# those entries) would let a frozen path delivered as a templated dest slip
+# through and model a consumer state that no longer exists.
+frozen_manifest_paths=$(yq -r '.paths[] | (.path, .dest) | select(. != null)' "$ROOT/.mergepath-sync.yml" 2>/dev/null || true)
 if [ -z "$frozen_manifest_paths" ]; then
   echo "FATAL: could not read paths[] from .mergepath-sync.yml." >&2
   echo "       CONSUMER_FROZEN_CONTENT cannot be validated against the delivery" >&2
@@ -344,8 +348,9 @@ FROZEN_YML
 
 PRESENT on every consumer but not a manifest entry, so it was seeded once
 at bootstrap and never updated. It carries none of the hub's current prose
--- notably not "verified machine setup" -- so required-current assertions
-fail here exactly as they do on a real consumer.
+-- in particular it omits the machine-setup phrase case 26b greps for, which
+is deliberately NOT reproduced anywhere in this file's heredoc, because
+naming it here would satisfy the very assertion the stub must fail.
 
 It also still publishes the runnable placeholder identity write that newer
 policy forbids, so the NEGATIVE half of case 26b is exercised too:
