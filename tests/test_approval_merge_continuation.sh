@@ -42,7 +42,7 @@ exit 90
 STUB
 chmod +x "$TMP/bin/gh"
 
-for script in codex-review-check.sh merge-clearance-gate.sh review-feedback-accounting.sh resolve-pr-threads.sh; do
+for script in codex-review-check.sh merge-clearance-gate.sh review-feedback-accounting.sh resolve-pr-threads.sh required-head-checks.sh; do
   cat > "$TMP/root/scripts/$script" <<'STUB'
 #!/usr/bin/env bash
 name="${0##*/}"
@@ -54,6 +54,10 @@ case "$name" in
   merge-clearance-gate.sh) exit "${STUB_GATE_RC:-0}" ;;
   review-feedback-accounting.sh) exit "${STUB_ACCOUNTING_RC:-0}" ;;
   resolve-pr-threads.sh) exit "${STUB_THREADS_RC:-0}" ;;
+  required-head-checks.sh)
+    printf '%s\n' "$*" >> "${STUB_DIR:?}/required-checks.log"
+    exit "${STUB_REQUIRED_CHECKS_RC:-0}"
+    ;;
 esac
 STUB
   chmod +x "$TMP/root/scripts/$script"
@@ -77,12 +81,14 @@ run_case() {
   echo 0 > "$TMP/read-count"
   : > "$TMP/merge.log"
   : > "$TMP/readiness.log"
+  : > "$TMP/required-checks.log"
   printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}" > "$TMP/root/policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
     STUB_INITIAL="${STUB_INITIAL:-$BASE}" STUB_FINAL="${STUB_FINAL:-${STUB_INITIAL:-$BASE}}" \
     STUB_READINESS_RC="${STUB_READINESS_RC:-0}" STUB_GATE_RC="${STUB_GATE_RC:-0}" \
     STUB_ACCOUNTING_RC="${STUB_ACCOUNTING_RC:-0}" \
     STUB_THREADS_RC="${STUB_THREADS_RC:-0}" STUB_LOGIN="${STUB_LOGIN:-nathanjohnpayne}" \
+    STUB_REQUIRED_CHECKS_RC="${STUB_REQUIRED_CHECKS_RC:-0}" \
     STUB_LOGIN_RC="${STUB_LOGIN_RC:-0}" STUB_MERGE_RC="${STUB_MERGE_RC:-0}" \
     bash "$TMP/subject.sh" 7 owner/repo >"$TMP/subject.out" 2>&1
 }
@@ -99,12 +105,40 @@ assert_not_ready() {
 reset_fixtures() {
   unset STUB_INITIAL STUB_FINAL STUB_READINESS_RC STUB_GATE_RC
   unset STUB_ACCOUNTING_RC STUB_THREADS_RC STUB_LOGIN STUB_LOGIN_RC
-  unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR
+  unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR STUB_REQUIRED_CHECKS_RC
 }
 
 reset_fixtures
 STUB_READINESS_RC=1
 assert_not_ready "missing registered approval or incomplete current-head CI/annex defers without arming"
+
+# #1070: every continuation re-entry must enforce the CONFIGURED required
+# head-check list, not just the branch-protection-derived readiness above.
+# The premise of that list is that the extra check is NOT branch-protected,
+# so without this a repo-lint completion could arm auto-merge before the
+# configured check appears or completes.
+reset_fixtures
+STUB_REQUIRED_CHECKS_RC=1
+assert_not_ready "a configured required head check that is not green defers without arming"
+
+reset_fixtures
+STUB_REQUIRED_CHECKS_RC=3
+set +e
+run_case
+rhc_rc=$?
+set -e
+if [ "$rhc_rc" -eq 3 ] && [ ! -s "$TMP/merge.log" ]; then
+  pass "an indeterminate required-head-check read is an infra error, not a pass"
+else
+  fail "indeterminate required-head-check read must exit 3 without arming (rc=$rhc_rc)"
+fi
+
+reset_fixtures
+if run_case && grep -q -- "--verify --sha abc123" "$TMP/required-checks.log"; then
+  pass "the configured list is verified against the pinned head sha"
+else
+  fail "continuation must verify the configured list against the evaluated head (log: $(cat "$TMP/required-checks.log" 2>/dev/null))"
+fi
 
 reset_fixtures
 STUB_GATE_RC=1

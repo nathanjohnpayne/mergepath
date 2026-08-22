@@ -641,6 +641,19 @@ paths:
   - path: tests/test_check_doc_ownership.sh
     type: canonical
     consumers: all
+  - path: scripts/required-head-checks.sh
+    # Per-consumer required head-check list (#1070). MUST travel: the
+    # propagated agent-review.yml and dependabot-auto-merge.yml both invoke
+    # it, and scripts/workflow/approval-merge-continuation.sh calls it on
+    # every continuation re-entry, so a consumer without it would have three
+    # merge gates referencing a missing script.
+    #
+    # The script is canonical and identical everywhere; only its INPUT is
+    # per-consumer, and that input lives in the never-propagated
+    # .github/required-head-checks file so both workflows stay byte-identical
+    # and the propagation lane keeps byte-verifying them verbatim.
+    type: canonical
+    consumers: all
   - path: scripts/merge-clearance-gate.sh
     # HEAD-pinned merge-clearance gate (#427/#428). The external-review
     # path delegates to scripts/codex-review-check.sh (with CI checking
