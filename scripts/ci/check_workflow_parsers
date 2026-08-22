@@ -1333,16 +1333,18 @@ rhc="scripts/required-head-checks.sh"
 if [ -x "$rhc" ] && \
    grep -Fq 'indeterminate, not a 404' "$rhc" && \
    grep -Fq 'yields no check names' "$rhc" && \
-   grep -Fq 'group_by(.suite)' "$rhc" && \
+   grep -Fq 'group_by(.wf)' "$rhc" && \
+   grep -Fq 'actions/runs?head_sha=' "$rhc" && \
+   grep -Fq -- '--paginate' "$rhc" && \
    grep -Fq 'required-head-checks.sh --repo' .github/workflows/agent-review.yml && \
    grep -Fq 'required-head-checks.sh --repo' .github/workflows/dependabot-auto-merge.yml && \
    grep -Fq 'required-head-checks.sh" --repo' scripts/workflow/approval-merge-continuation.sh && \
    grep -Fq 'PR head moved during verification' .github/workflows/dependabot-auto-merge.yml; then
   pass=$((pass + 1))
-  echo "  PASS: all three merge gates share the required head-check resolver, which fails closed and pins one head"
+  echo "  PASS: all three merge gates share the required head-check resolver, which fails closed, paginates, groups by workflow identity and pins one head"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the required head-check list must be resolved by the shared script at all three call sites, fail closed on indeterminate reads, group by workflow suite, and pin a single head across the wait" >&2
+  echo "  FAIL: the required head-check list must be resolved by the shared script at all three call sites, fail closed on indeterminate reads, group by STABLE WORKFLOW IDENTITY (not check suite -- repeated dispatches of one workflow create separate suites), paginate the check-run listing, and pin a single head across the wait" >&2
 fi
 
 echo

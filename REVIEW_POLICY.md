@@ -786,7 +786,7 @@ Both auto-merge paths — `agent-review.yml`'s readiness probe and `dependabot-a
 .github/required-head-checks
 ```
 
-Space- or newline-separated check-run names; `#` starts a comment, so the file can carry its own rationale.
+**One check-run name per line.** `#` starts a comment, so the file can carry its own rationale. Newline-delimited specifically because GitHub check-run names contain spaces — this repo emits `Merge clearance gate`, `Label Gate`, `Re-evaluate codex-review-check gate` — so a space-separated value would be split into names that do not exist and the gate would wait until timeout. Writing `lint build-and-test` on one line means a single check literally named `lint build-and-test`, not two checks.
 
 **It is deliberately NOT a propagation manifest entry.** The value is per-consumer — `nathanpaynedotcom` gates on its own `build-and-test`, and no other repo has that workflow, so naming it canonically would make the other eight wait forever on a check that never runs. Keeping the value out of the manifest lets both workflows stay byte-identical across the fleet, so the propagation lane keeps byte-verifying them verbatim.
 

@@ -86,22 +86,47 @@ if [ "$MODE" = "list" ]; then
 fi
 
 # ── Verify ────────────────────────────────────────────────────────────
+# Grouped by STABLE WORKFLOW IDENTITY, not by check suite. Two groupings are
+# wrong in opposite directions:
+#
+#   * collapsing all same-name runs and taking the latest lets a later
+#     success from an UNRELATED workflow mask a pending or failing run of the
+#     intended one;
+#   * grouping by check SUITE splits repeated dispatches of the SAME workflow
+#     into separate groups, so requiring every group green would let one stale
+#     failed re-run block the PR forever. Measured: "Merge clearance gate"
+#     appears in three suites from ONE workflow (databaseId 291775158) on a
+#     single commit.
+#
+# So: group by workflow, reduce each to its LATEST run for that name, and
+# require every distinct workflow to be green.
+#
+# REST + --paginate rather than GraphQL: a busy commit exceeds a single
+# GraphQL page, and a first:100 query with a fail-closed truncation guard
+# blocks every merge on exactly the repos that run the most CI. Workflow
+# identity comes from joining the Actions runs API on check_suite_id; a check
+# run with no matching workflow run (an external app such as CodeRabbit)
+# falls back to its suite id, which is its stable identity.
 runs=$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate \
   --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started: .started_at}' 2>/dev/null) \
   || infra "could not read check runs for $SHA"
 
+suite_map=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
+  --jq '.workflow_runs[] | {suite: .check_suite_id, wf: .workflow_id}' 2>/dev/null) \
+  || infra "could not read workflow runs for $SHA"
+
+flat=$(jq -n -c --slurpfile r <(printf '%s\n' "$runs") --slurpfile m <(printf '%s\n' "$suite_map") '
+  ($m | map({key: (.suite|tostring), value: (.wf|tostring)}) | from_entries) as $bysuite
+  | $r | map(. + {wf: ($bysuite[(.suite|tostring)] // ("suite:" + (.suite|tostring)))})')
+
 rc=0
 while IFS= read -r name; do
   [ -n "$name" ] || continue
-  # Group by check SUITE and require EVERY suite that produced this name to
-  # have a successful LATEST run. Collapsing same-name runs and taking
-  # whichever started last lets a later success from an unrelated workflow
-  # mask the intended workflow's pending or failing run.
-  verdict=$(printf '%s\n' "$runs" | jq -rs --arg n "$name" '
+  verdict=$(printf '%s' "$flat" | jq -r --arg n "$name" '
     [ .[] | select(.name == $n) ]
     | if length == 0 then "absent"
       else
-        group_by(.suite)
+        group_by(.wf)
         | map(sort_by(.started) | last)
         | if any(.status != "completed") then "pending"
           elif all(.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") then "green"

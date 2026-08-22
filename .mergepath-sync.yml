@@ -1234,6 +1234,10 @@ paths:
       - "scripts/disagreement-detector.cjs"
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/"
+      # Invoked by both merge gates in this workflow; a path-scoped sync
+      # that shipped the workflow without it would leave the gate
+      # referencing a missing script (#1070).
+      - "scripts/required-head-checks.sh"
   - path: .github/workflows/pr-review-policy.yml
     type: canonical
     consumers: all
@@ -1256,6 +1260,10 @@ paths:
     # workflow ahead of the gate it now depends on (#1000).
     requires:
       - "scripts/review-feedback-accounting.sh"
+      # Invoked by both merge gates in this workflow; a path-scoped sync
+      # that shipped the workflow without it would leave the gate
+      # referencing a missing script (#1070).
+      - "scripts/required-head-checks.sh"
   - path: .github/workflows/auto-clear-blocking-labels.yml
     type: canonical
     consumers: all

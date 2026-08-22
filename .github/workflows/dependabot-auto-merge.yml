@@ -242,10 +242,23 @@ jobs:
               fi
               deadline=$((SECONDS + wait_seconds))
               while :; do
-                if bash scripts/required-head-checks.sh --repo "$GITHUB_REPOSITORY" --verify --sha "$pinned"; then
+                # Capture the verifier's OWN status. `rc=$?` after a failed
+                # `if` reads the compound statement's status (0), not the
+                # command's -- which would take the fail-closed branch on the
+                # first not-ready poll and never wait at all.
+                rc=0
+                if [ ! -f scripts/required-head-checks.sh ]; then
+                  # First-rollout guard (#1070); see agent-review.yml for why
+                  # this falls back rather than failing closed.
+                  echo "::notice::scripts/required-head-checks.sh absent (pre-#1070 checkout); falling back to the singular waiter."
+                  require_current_head_check_success
+                  CURRENT_HEAD_SHA="$pinned"
+                  return 0
+                fi
+                bash scripts/required-head-checks.sh --repo "$GITHUB_REPOSITORY" --verify --sha "$pinned" || rc=$?
+                if [ "$rc" -eq 0 ]; then
                   break
                 fi
-                rc=$?
                 if [ "$rc" -ne 1 ]; then
                   echo "::error::required-head-checks failed closed (rc=$rc); refusing auto-merge."
                   exit 1

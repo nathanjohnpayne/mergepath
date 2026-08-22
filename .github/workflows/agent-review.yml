@@ -1083,7 +1083,17 @@ jobs:
           # continuation so all three enforce ONE list with one
           # implementation; see scripts/required-head-checks.sh for why the
           # value is per-consumer and read from the default branch.
-          if ! required_check_names=$(bash scripts/required-head-checks.sh --repo "$REPO" --list); then
+          # First-rollout guard (#1070). On the PR introducing this helper,
+          # and on each consumer's first propagation PR, the checkout can
+          # predate the script. Fall back to the PRE-#1070 behaviour --
+          # `lint` alone -- rather than failing closed: a repo without the
+          # script cannot have received the config file either, so there is
+          # no configured gate to drop. This is NOT the indeterminate-read
+          # case, which stays fail-closed inside the script.
+          if [ ! -f scripts/required-head-checks.sh ]; then
+            echo "::notice::scripts/required-head-checks.sh absent (pre-#1070 checkout); using the default required head check."
+            required_check_names="lint"
+          elif ! required_check_names=$(bash scripts/required-head-checks.sh --repo "$REPO" --list); then
             echo "::error::could not resolve the required head-check list; refusing to report merge readiness."
             exit 1
           fi
