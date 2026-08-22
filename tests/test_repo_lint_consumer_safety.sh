@@ -70,7 +70,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../scripts/lib/repo-lint-check-selection.sh
 source "$ROOT/scripts/lib/repo-lint-check-selection.sh"
 
-for tool in yq node ruby rsync git python3; do
+for tool in yq node ruby rsync git python3 jq; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "SKIP: $tool not available" >&2
     exit 0
@@ -278,81 +278,59 @@ done
 # fixture out while the consumers it models still need the coverage. Scoped
 # entries are reported and allowed; the frozen state retires only once the
 # modeled population is fully covered.
-# Effective delivery is aggregated BY DESTINATION, not per entry. A
-# destination can be delivered by several consumer-scoped entries whose
-# union covers the whole fleet -- eslint.config.js is exactly that today,
-# written by two scoped entries (ESM and CJS) whose consumer lists together
-# name all nine consumers. Checking `consumers` per entry would call that
-# destination "scoped" and only print a note, so a frozen fixture for it
-# would never retire even though every consumer receives current content.
+# Effective delivery is resolved PER FROZEN PATH by unioning every covering
+# manifest entry -- the exact destination AND any containing kit directory.
+#
+# Grouping on the literal destination alone repeats the first-match bug that
+# #467 already fixed in the closure check: tests/test_check_sync_manifest.sh
+# Case 20 documents that coverage is UNIONED across every covering entry,
+# because a path can be delivered to complementary consumer sets by a narrow
+# exact entry and a broad kit at the same time. Taking either in isolation
+# understates coverage and preserves a stale stub that every consumer has
+# already moved past.
 #
 # `(.dest // .path)` is the DELIVERED path, matching how
-# scripts/sync-to-downstream.sh resolves it. Emitting both fields instead
-# would treat a templated entry's SOURCE as consumer-delivered, which it
-# never is: examples/eslint.config.js is only ever read.
-# yq converts YAML to JSON; every transformation is jq, whose object
-# construction and set comparison this needs.
-frozen_fleet_json=$(yq -o=json '.' "$ROOT/.mergepath-sync.yml" 2>/dev/null | jq -c '
-  ([.consumers[].name] | unique) as $fleet
-  | [ .paths[] | {d: (.dest // .path), c: .consumers} | select(.d != null) ]
-  | group_by(.d)
-  | map({
-      d: .[0].d,
-      fleetwide: (
-        if any(.[]; .c == "all") then true
-        else (([.[] | select(.c != "all") | .c[]] | unique) == $fleet)
-        end)
-    })' 2>/dev/null || true)
-if [ -z "$frozen_fleet_json" ] || [ "$frozen_fleet_json" = "null" ]; then
-  echo "FATAL: could not derive effective delivery from .mergepath-sync.yml." >&2
-  echo "       CONSUMER_FROZEN_CONTENT cannot be validated, and an entry the" >&2
-  echo "       manifest now delivers would model a consumer state that does" >&2
-  echo "       not exist. Failing closed." >&2
-  exit 1
-fi
-frozen_manifest_paths=$(printf '%s' "$frozen_fleet_json" | jq -r '.[] | select(.fleetwide) | .d' | sort -u)
-frozen_scoped_paths=$(printf '%s' "$frozen_fleet_json" | jq -r '.[] | select(.fleetwide | not) | .d' | sort -u)
-if [ -z "$frozen_manifest_paths" ]; then
-  echo "FATAL: could not read paths[] from .mergepath-sync.yml." >&2
-  echo "       CONSUMER_FROZEN_CONTENT cannot be validated against the delivery" >&2
-  echo "       closure, and an entry the manifest now delivers would model a" >&2
+# scripts/sync-to-downstream.sh resolves it; emitting both fields would treat
+# a templated entry's SOURCE as consumer-delivered, which it never is.
+frozen_manifest_json=$(yq -o=json '.' "$ROOT/.mergepath-sync.yml" 2>/dev/null)
+if [ -z "$frozen_manifest_json" ]; then
+  echo "FATAL: could not read .mergepath-sync.yml as JSON." >&2
+  echo "       CONSUMER_FROZEN_CONTENT cannot be validated against effective" >&2
+  echo "       delivery, and an entry the manifest now delivers would model a" >&2
   echo "       consumer state that does not exist. Failing closed." >&2
   exit 1
 fi
+
+# "fleetwide" | "partial" | "none" for one path.
+frozen_delivery_for() {
+  printf '%s' "$frozen_manifest_json" | jq -r --arg p "$1" '
+    ([.consumers[].name] | unique) as $fleet
+    | [ .paths[]
+        | (.dest // .path) as $d
+        | select($d != null)
+        | select($d == $p or (($d | endswith("/")) and ($p | startswith($d))))
+      ] as $covering
+    | if ($covering | length) == 0 then "none"
+      elif any($covering[]; .consumers == "all") then "fleetwide"
+      elif (([$covering[] | select(.consumers != "all") | .consumers[]] | unique) == $fleet) then "fleetwide"
+      else "partial" end'
+}
 for frozen in "${CONSUMER_FROZEN_CONTENT[@]}"; do
-  while IFS= read -r mp; do
-    [ -z "$mp" ] && continue
-    case "$mp" in
-      */)
-        case "$frozen" in
-          "$mp"*)
-            echo "FATAL: frozen-content path '$frozen' is delivered by the manifest" >&2
-            echo "       via kit entry '$mp'. Consumers receive its current contents," >&2
-            echo "       so it is not frozen — remove it from CONSUMER_FROZEN_CONTENT." >&2
-            exit 1
-            ;;
-        esac
-        ;;
-      *)
-        if [ "$frozen" = "$mp" ]; then
-          echo "FATAL: frozen-content path '$frozen' is a manifest paths[] entry." >&2
-          echo "       Consumers receive its current contents, so it is not frozen —" >&2
-          echo "       remove it from CONSUMER_FROZEN_CONTENT." >&2
-          exit 1
-        fi
-        ;;
-    esac
-  done <<< "$frozen_manifest_paths"
-  while IFS= read -r sp; do
-    [ -z "$sp" ] && continue
-    if [ "$frozen" = "$sp" ]; then
-      echo "NOTE: frozen-content path '$frozen' is delivered by a CONSUMER-SCOPED manifest entry."
+  case "$(frozen_delivery_for "$frozen")" in
+    fleetwide)
+      echo "FATAL: frozen-content path '$frozen' is delivered to EVERY consumer" >&2
+      echo "       by the manifest (exact entry, containing kit, or the union of" >&2
+      echo "       consumer-scoped entries). Consumers receive its current" >&2
+      echo "       contents, so it is not frozen -- remove it from" >&2
+      echo "       CONSUMER_FROZEN_CONTENT." >&2
+      exit 1
+      ;;
+    partial)
+      echo "NOTE: frozen-content path '$frozen' is delivered to SOME consumers only."
       echo "      Still frozen on every non-enrolled consumer, so the fixture stays."
       echo "      Retire it from CONSUMER_FROZEN_CONTENT once delivery covers all consumers."
-    fi
-  done <<EOF
-$frozen_scoped_paths
-EOF
+      ;;
+  esac
   if [ ! -f "$FIX/$frozen" ]; then
     echo "FATAL: frozen-content path '$frozen' is not a file in the fixture." >&2
     echo "       It is PRESENT on live consumers; if it moved or was deleted" >&2
