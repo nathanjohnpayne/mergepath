@@ -3693,6 +3693,28 @@ else
   printf '%s\n' "$OUT" | sed 's/^/      /' | head -4 >&2
 fi
 
+# 26j — an EMPTY flow list is the documented inert configuration, not an
+# unsupported value. Treating `non_reviewer_identities: []` as unparseable
+# would exit 2 on EVERY PR in a repo that wrote the legitimate empty form —
+# a required gate permanently red. (Codex #1080, round 3.)
+for _empty in "[]" "[ ]"; do
+  SCRATCH=$(make_scratch_nonrev "")
+  printf '\nnon_reviewer_identities: %s\n' "$_empty" >>"$SCRATCH/.github/review-policy.yml"
+  FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne")
+  FIXTURE_REVIEWS=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')")
+  set +e
+  OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+  RC=$?
+  set -e
+  if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "PASS"; then
+    pass "#1080: empty flow list '$_empty' is inert, not a fail-closed error"
+  else
+    fail "#1080: empty flow list '$_empty' expected rc=0 PASS; got rc=$RC"
+    printf '%s\n' "$OUT" | sed 's/^/      /' | head -4 >&2
+  fi
+done
+
 # 26i — the inverse control: a correctly-written block list must NOT trip the
 # fail-closed path, or every repo breaks.
 nonrev_case "block-list key parses and gates normally" "$DENY" \

@@ -54,7 +54,7 @@ read_available_reviewers() {
   read_policy_list available_reviewers "$@"
 }
 
-# True when <key> is present but carries a non-empty INLINE value that
+# True when <key> is present and carries an INLINE value that
 # read_policy_list cannot consume -- a YAML flow list
 # (`key: [a, b]`) or a bare scalar (`key: name`). The block reader only
 # collects following dash-prefixed lines, so both forms parse to NOTHING and
@@ -71,7 +71,11 @@ policy_list_has_unconsumed_inline_value() {  # <key> [config_path]
       rest = substr($0, length(key) + 2)
       sub(/[[:space:]]*#.*$/, "", rest)
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", rest)
-      if (rest != "") { found = 1 }
+      # An EMPTY flow list is the documented inert configuration, not an
+      # unsupported value: `key: []` says "no such identity here" as clearly
+      # as omitting the key. Treating it as unparseable would exit 2 on every
+      # PR in a repo that wrote the legitimate empty form (Codex #1080).
+      if (rest != "" && rest !~ /^\[[[:space:]]*\]$/) { found = 1 }
       exit
     }
     END { exit(found ? 0 : 1) }

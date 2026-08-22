@@ -101,11 +101,18 @@ available_reviewers:
 # to be declared here.
 #
 # scripts/merge-clearance-gate.sh fails closed when any identity listed below
-# has a latest-state APPROVED review on the current HEAD. This runs on every
-# lane, including ordinary under-threshold PRs, which the reviewer-identity
-# arms of that gate do not otherwise examine.
+# has a latest-state APPROVED review ANYWHERE on the PR -- deliberately not
+# only on the current HEAD, because whether an older approval still counts is
+# decided by dismiss_stale_reviews, which the gate cannot read. HEAD-pinning
+# would let a non-reviewer approve and then push to slip past the check. A push
+# that dismisses the approval flips its latest state to DISMISSED and clears
+# the gate. This runs on every lane, including ordinary under-threshold PRs,
+# which the reviewer-identity arms of that gate do not otherwise examine.
 #
-# Absent or empty is legitimate and makes the check inert.
+# Absent, empty, or the empty flow list `[]` is legitimate and makes the check
+# inert. An inline value the block reader cannot consume -- a NON-empty flow
+# list or a bare scalar -- exits 2 rather than silently passing, because that
+# shape is otherwise indistinguishable from an absent key.
 non_reviewer_identities:
   - nathanpayne-robot
 
