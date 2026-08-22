@@ -187,6 +187,25 @@ feedback_policy:
 # CodeRabbit GitHub App. All agent instructions use conditional language
 # and will skip Phase 2.5 automatically.
 coderabbit:
+  # When Phase 2.5 runs at all (#1084). CodeRabbit is advisory -- it never
+  # carries the merge gate, and its severity gate is a clean no-op wherever
+  # coderabbit.severity_gate.enabled is false. What it costs is wall-clock:
+  # the Phase 2.5 wait is bounded by max_wait_seconds below, and the provider
+  # rate-limits under sustained use (three windows hit in one day on
+  # 2026-08-22). Spending that on every one-line docs PR is pure waste.
+  #
+  #   always           -- invoke on every PR (the pre-#1084 behaviour, and the
+  #                       default when this key is absent, so a repo that has
+  #                       not adopted the knob is unaffected)
+  #   complex-changes  -- invoke only when scripts/phase-4b-classifier.sh
+  #                       matches a Phase 4b trigger
+  #   never            -- never invoke
+  #
+  # scripts/coderabbit-should-invoke.sh is the decision procedure. It resolves
+  # every ambiguous input -- unreadable config, unknown mode, missing or
+  # failing classifier -- to INVOKE, because skipping wrongly silently drops a
+  # review round while invoking wrongly only costs time.
+  invoke: complex-changes
   enabled: true
 
   # GitHub login of the CodeRabbit bot. Comments by this login are what
@@ -463,7 +482,13 @@ codex:
   # Maximum number of `@codex review` rounds before escalating as runaway.
   # The 3rd round trips the guard. Normal termination is either approval,
   # disagreement (repeat-after-rebuttal), or timeout → Phase 4b fallback.
-  max_review_rounds: 2
+  # Raised 2 -> 10 (#1084). Codex is now the primary reviewer on every PR,
+  # so the budget has to cover a real convergence run rather than two
+  # courtesy rounds: #1080 took four rounds, and rounds 2 and 3 each found a
+  # defect the previous round's fix introduced. Exhausting the budget escalates
+  # to the automated Phase 4b leg (or the manual handoff when that is
+  # unavailable) rather than merging on an unconverged review.
+  max_review_rounds: 10
 
   # Poll timeout per round, in seconds, for `codex-review-request.sh`.
   # If Codex has not posted a review within this window, treat as timeout

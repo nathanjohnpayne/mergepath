@@ -24,7 +24,21 @@ TESTS=(
   "$REPO_ROOT/tests/test_coderabbit_wait_statuscontext_ratelimit.sh"
   "$REPO_ROOT/tests/test_coderabbit_wait_ratelimit_window.sh"
   "$REPO_ROOT/tests/test_coderabbit_wait_post_clearance.sh"
+  "$REPO_ROOT/tests/test_coderabbit_should_invoke.sh"
 )
+
+# The suites below are invoked by POSITIONAL INDEX. That is fragile in a
+# specific way, learned the hard way in #1084: appending to TESTS without
+# adding a matching "${TESTS[n]}" line leaves the new suite silently unrun,
+# and INSERTING mid-array shifts every label and drops the last suite off the
+# end of the invocation list. Neither failure is visible in the check's own
+# output — it still prints PASS. This assertion makes both loud.
+EXPECTED_INVOCATIONS=$(grep -c '^"\${TESTS\[[0-9]\+\]}"$' "${BASH_SOURCE[0]}")
+if [ "$EXPECTED_INVOCATIONS" -ne "${#TESTS[@]}" ]; then
+  echo "check_coderabbit_wait: FAIL — ${#TESTS[@]} suites declared in TESTS but $EXPECTED_INVOCATIONS invoked." >&2
+  echo "  Every entry needs a matching \"\${TESTS[n]}\" line; append rather than insert." >&2
+  exit 1
+fi
 
 if [ ! -x "$REPO_ROOT/scripts/coderabbit-wait.sh" ]; then
   echo "check_coderabbit_wait: ERROR scripts/coderabbit-wait.sh missing or not executable" >&2
@@ -70,4 +84,6 @@ echo "check_coderabbit_wait: running rate-limit remaining-window sleep tests (#7
 "${TESTS[6]}"
 echo "check_coderabbit_wait: running post-clearance fast-path cap tests (#727)"
 "${TESTS[7]}"
+echo "check_coderabbit_wait: running Phase 2.5 invocation-decision tests (#1084)"
+"${TESTS[8]}"
 echo "check_coderabbit_wait: PASS"

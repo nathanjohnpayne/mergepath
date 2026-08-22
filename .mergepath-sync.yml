@@ -389,6 +389,21 @@ paths:
   - path: scripts/lib/gh-api-array.sh
     type: canonical
     consumers: all
+  # The Phase 2.5 invocation decision (#1084). Reads coderabbit.invoke and,
+  # for `complex-changes`, defers to scripts/phase-4b-classifier.sh rather
+  # than inventing a second notion of "complex" that would drift from the
+  # REVIEW_POLICY.md trigger taxonomy. Travels with coderabbit-wait.sh: a
+  # consumer that has the waiter but not the decider has no way to honour its
+  # own `invoke` knob and silently reverts to invoking on every PR.
+  - path: scripts/coderabbit-should-invoke.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/phase-4b-classifier.sh"          # consulted for complex-changes
+      - "tests/test_coderabbit_should_invoke.sh"  # check_coderabbit_wait
+  - path: tests/test_coderabbit_should_invoke.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
