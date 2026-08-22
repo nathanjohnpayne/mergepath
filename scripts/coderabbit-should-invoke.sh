@@ -128,48 +128,57 @@ coderabbit_field() {  # <field>
   local fld=$1
   [ -f "$CONFIG" ] || return 0
   awk -v fld="$fld" '
-    # Count the block headers too, not just the fields inside them. Two
-    # top-level `coderabbit:` blocks aggregate into one logical block here, so
-    # `enabled: false` in the first and `invoke: always` in the second each
-    # occur exactly once and the field-level guard never fires -- the file is
-    # ambiguous and the reader returned a confident, suppressing answer
-    # (#1084 r6). YAML forbids duplicate keys at the same level; a file that
-    # has them is malformed, not a file with a resolvable value.
-    index($0, "coderabbit:") == 1 { in_block=1; blocks++; next }
+    function keyname(line,   k) {
+      # Leading token up to the colon, with surrounding quotes stripped.
+      # `"invoke": always` is the same key as `invoke: always` to any YAML
+      # reader, and counting only the bare spelling let a quoted duplicate
+      # slip past the ambiguity guard (#1084 r8).
+      k = line
+      sub(/^[[:space:]]+/, "", k)
+      sub(/:.*$/, "", k)
+      sub(/[[:space:]]+$/, "", k)
+      gsub(/^["\047]|["\047]$/, "", k)
+      return k
+    }
+    function indentof(line,   m) { match(line, /^[[:space:]]*/); return RLENGTH }
+
+    index($0, "coderabbit:") == 1 { in_block=1; blocks++; child_indent=-1; next }
     in_block && /^[^[:space:]#]/ { in_block=0 }
-    # Depth matters: `severity_gate:` is a nested map that also has an
-    # `enabled:` key, and matching on the key name alone returned whichever
-    # came FIRST -- so reordering two keys flipped the answer, and YAML mapping
-    # order is not semantic (#1084 r3). Direct children only.
-    in_block && $1 == fld":" && $0 ~ /^  [^ ]/ { n++; last = $0 }
+    in_block && /^[[:space:]]*$/ { next }
+    in_block && /^[[:space:]]*#/ { next }
+    in_block {
+      ind = indentof($0)
+      # Derive the block child indentation from its first child rather than
+      # assuming two spaces. A policy indented with four spaces had every
+      # direct child ignored, so an explicit `invoke: never` silently became
+      # the `always` default and forced the wait it was set to avoid
+      # (#1084 r8).
+      if (child_indent < 0) child_indent = ind
+      if (ind != child_indent) next          # nested map, not a direct child
+      if (keyname($0) != fld) next
+      n++; last = $0
+    }
     END {
-      # Ambiguous configuration must NOT resolve to a usable value. Accepting
-      # the first of `invoke: never` / `invoke: always` returned a confident
-      # answer to a question the file does not actually answer, and the answer
-      # it picked suppressed review (#1084 r5). Emitting the raw text fails the
-      # exact-literal match downstream, which routes to invoke.
       if (blocks > 1) { print "<<ambiguous:" blocks " coderabbit blocks>>"; exit }
       if (n != 1) { if (n > 1) print "<<ambiguous:" n " duplicate " fld " keys>>"; exit }
       $0 = last
-      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      sub(/^[[:space:]]*[^:]*:[[:space:]]*/, "", $0)
       if ($0 ~ /^["\047]/) {
         q = substr($0, 1, 1)
         rest = substr($0, 2)
         idx = index(rest, q)
         if (idx > 0) {
           after = substr(rest, idx + 1)
-          # Only whitespace or a comment may follow the closing quote; printing
-          # just the quoted part turned `invoke: "never" junk` into a valid
-          # mode (#1084 r4).
-          if (after ~ /^[[:space:]]*$/ || after ~ /^[[:space:]]*#/) {
+          # YAML needs WHITESPACE before a `#` for it to open a comment, so
+          # `"never"#junk` is malformed rather than a commented value; the
+          # zero-whitespace alternative accepted it and produced a clean
+          # `never` (#1084 r8).
+          if (after ~ /^[[:space:]]*$/ || after ~ /^[[:space:]]+#/) {
             print substr(rest, 1, idx - 1); exit
           }
           print last; exit
         }
-        # Unterminated scalar. Stripping the opening quote and returning the
-        # remainder manufactured a valid suppressing value out of malformed
-        # YAML (#1084 r5). Emit the raw line so the enum match fails.
-        print last; exit
+        print last; exit          # unterminated scalar -> raw, fails the enum
       }
       sub(/[[:space:]]+#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)

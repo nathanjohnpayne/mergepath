@@ -28,6 +28,12 @@ The reader answers only from an unambiguous file. Each of the following invokes 
 - A quoted scalar followed by anything other than whitespace or a comment (`invoke: "never" junk`).
 - An unreadable or absent config file.
 
+The reader accepts ordinary YAML spellings rather than one fixed shape, and must not treat a legal spelling as absent:
+
+- Block child indentation is **derived from the block's first child**, not assumed. A four-space-indented policy must be read, not silently defaulted.
+- A quoted key (`"invoke": …`) is the same key as its bare spelling, for both value lookup and duplicate detection.
+- A `#` opens a comment only when preceded by whitespace, so `invoke: "never"#junk` is malformed rather than a commented value.
+
 And the reader must answer from the right place:
 
 - Only **direct children** of `coderabbit:` are eligible. A nested map that shares a key name — `severity_gate.enabled` versus `coderabbit.enabled` — must never answer for its parent, in either document order. YAML mapping order is not semantic, so reordering two keys may not change the decision.

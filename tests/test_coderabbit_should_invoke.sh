@@ -226,6 +226,18 @@ case_is 'enabled:false cannot mask a duplicate invoke' "  enabled: false"$'\n'" 
 case_is 'genuine enabled:false alone still skips'      "  enabled: false"                                                0 1
 case_is 'enabled:false with a clean invoke still skips' "  enabled: false"$'\n'"  invoke: always"                       0 1
 
+echo "--- #1084 r8: the reader accepts real YAML spellings, not one hard-coded shape ---"
+# Indentation is derived from the block's first child, not assumed to be two
+# spaces: a four-space policy previously had every direct child ignored, so an
+# explicit `invoke: never` silently became the `always` default.
+case_is 'four-space indentation is honoured'   "    enabled: true"$'\n'"    invoke: never"          0 1
+# A quoted key is the same key to any YAML reader; counting only the bare
+# spelling let a quoted duplicate slip past the ambiguity guard.
+case_is 'quoted duplicate key is ambiguous'    "$ON"$'\n'"  invoke: never"$'\n''  "invoke": always' 0 0
+# YAML needs whitespace before a `#` for it to open a comment.
+case_is 'no space before # is malformed'       "$ON"$'\n''  invoke: "never"#junk'                    0 0
+case_is 'space before # is a real comment'     "$ON"$'\n''  invoke: "never" # ok'                    0 1
+
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"
 [ "$FAIL" -gt 0 ] && exit 1

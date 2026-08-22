@@ -927,7 +927,12 @@
           </div>
           <select id="coderabbitInvoke" aria-label="CodeRabbit Phase 2.5 invocation mode">
             <option value="always">always</option>
-            <option value="complex-changes">complex-changes</option>
+            <!-- selected must match the default state.coderabbitInvoke: the browser
+                 picks the FIRST option otherwise, so the control would read
+                 `always` while the generated YAML said `complex-changes`, and a
+                 user could copy a policy different from the visible selection
+                 (#1084 r8). renderAll() does not synchronize form controls. -->
+            <option value="complex-changes" selected>complex-changes</option>
             <option value="never">never</option>
           </select>
         </div>
