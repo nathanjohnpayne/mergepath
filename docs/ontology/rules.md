@@ -105,7 +105,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 ### CodeRabbit (Phase 2.5)
 
-**R-39.** When CodeRabbit is enabled, the agent must wait for its review on the current HEAD before proceeding past Phase 2.5. ○ — REVIEW_POLICY.md § Phase 2.5
+**R-39.** The agent must wait for CodeRabbit's review on the current HEAD before proceeding past Phase 2.5 exactly when `scripts/coderabbit-should-invoke.sh <PR#>` exits 0. `coderabbit.enabled: true` is necessary but not sufficient — the `coderabbit.invoke` mode (`always` / `complex-changes` / `never`) decides whether THIS PR gets the wait, and the decider resolves every ambiguous policy to invoking. ○ — REVIEW_POLICY.md § Phase 2.5
 
 **R-40.** The agent must not hand-wait a folkloric interval and escalate early; the wait helper's measured windows govern. ○ — review-policy.yml § CodeRabbit
 

@@ -238,6 +238,35 @@ case_is 'quoted duplicate key is ambiguous'    "$ON"$'\n'"  invoke: never"$'\n''
 case_is 'no space before # is malformed'       "$ON"$'\n''  invoke: "never"#junk'                    0 0
 case_is 'space before # is a real comment'     "$ON"$'\n''  invoke: "never" # ok'                    0 1
 
+echo "--- #1084 r12: tabs are not YAML indentation ---"
+# `%b` so the tabs are visible as \t in this source rather than as invisible
+# literal whitespace an editor or a lint pass could silently convert.
+_mkb() {  # <policy-text-with-escapes> <expect_rc> <name>
+  local dir; dir=$(mktemp -d "$WORKDIR/s.XXXXXX"); mkdir -p "$dir/.github" "$dir/scripts"
+  cp "$SCRIPT" "$dir/scripts/coderabbit-should-invoke.sh"; chmod +x "$dir/scripts/coderabbit-should-invoke.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/scripts/phase-4b-classifier.sh"; chmod +x "$dir/scripts/phase-4b-classifier.sh"
+  printf '%b' "$1" >"$dir/.github/review-policy.yml"
+  ( cd "$dir" && ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
+  [ $? = "$2" ] && pass "$3" || fail "$3 (expected rc=$2)"
+}
+# Every REJECT case below was measured against yq/go-yaml, the parser this
+# fleet actually uses -- not inferred from the YAML spec. The comment and
+# blank-line cases are why: both look like they should be exempt from
+# indentation rules, and both are rejected.
+_mkb 'coderabbit:\n\tinvoke: never\n'            0 'a tab-indented child is ambiguous, not a suppressing never'
+_mkb 'coderabbit:\n  \tinvoke: never\n'           0 'a tab after leading spaces is ambiguous'
+_mkb 'coderabbit:\n\t# c\n  invoke: never\n'      0 'a tab-indented comment line is ambiguous'
+_mkb 'coderabbit:\n\t\n  invoke: never\n'         0 'a tab-only blank line is ambiguous'
+_mkb 'coderabbit:\n\tenabled: false\n'            0 'a tab-indented enabled: false does not skip either'
+# Document-scoped, not block-scoped: a tab under any other top-level key
+# rejects the whole file, so a readable `invoke: never` next to it must not win.
+_mkb 'other:\n\tx: 1\ncoderabbit:\n  invoke: never\n' 0 'a tab under an earlier top-level key is ambiguous'
+_mkb 'coderabbit:\n  invoke: never\nother:\n\tx: 1\n' 0 'a tab under a later top-level key is ambiguous'
+# The converse: a tab that is NOT indentation parses fine, so flagging it
+# would make every such policy invoke and quietly undo the knob.
+_mkb 'coderabbit:\n  invoke: never\t\n'           1 'a trailing tab after a value is not an indentation tab'
+_mkb 'coderabbit:\n  invoke: never\n'              1 'baseline: space-indented never still skips'
+
 echo "--- #1084 r9: the block header is a key and a type, not a literal prefix ---"
 _mk() {  # <policy-text> <expect_rc> <name>
   local dir; dir=$(mktemp -d "$WORKDIR/s.XXXXXX"); mkdir -p "$dir/.github" "$dir/scripts"

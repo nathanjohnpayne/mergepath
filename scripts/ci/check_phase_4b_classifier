@@ -166,6 +166,49 @@ else
   echo "$out" | sed 's/^/      /' >&2
 fi
 
+# --detect-only bypasses BOTH short-circuits, exercised against the REAL
+# classifier (#1084 r12). The only other coverage lives in
+# test_coderabbit_should_invoke.sh, which substitutes a stub classifier that
+# ignores its arguments -- so if either short-circuit stopped honoring
+# DETECT_ONLY, every `complex-changes` consumer would silently lose Phase 2.5
+# selectivity with all suites still green.
+#
+# Each mode is paired with the fixture whose REAL answer is the opposite of
+# that mode's short-circuit, so rc, match and files_inspected all flip if the
+# flag is ignored -- asserting a shape both branches already produce would
+# have no teeth.
+echo "phase_4b_default: fallback-only" > "$SCRATCH/.github/review-policy.yml"
+set +e
+out=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH/.github/review-policy.yml" bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/state-machine.json" --detect-only 2>/dev/null)
+rc=$?
+set -e
+jq_get match; got_match=$got_VAL; match_rc=$got_rc
+jq_get files_inspected; got_files=$got_VAL; files_rc=$got_rc
+if [ "$match_rc" = 0 ] && [ "$files_rc" = 0 ] && [ "$rc" = "1" ] && [ "$got_match" = "true" ] && [ "$got_files" != "0" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: --detect-only bypasses the fallback-only short-circuit (real classifier: match=true, files=$got_files)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --detect-only under fallback-only (rc=$rc, match=$got_match [jq_rc=$match_rc], files=$got_files [jq_rc=$files_rc]); expected rc=1, match=true, files>0" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+echo "phase_4b_default: always" > "$SCRATCH/.github/review-policy.yml"
+set +e
+out=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH/.github/review-policy.yml" bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/no-trigger.json" --detect-only 2>/dev/null)
+rc=$?
+set -e
+jq_get match; got_match=$got_VAL; match_rc=$got_rc
+jq_get files_inspected; got_files=$got_VAL; files_rc=$got_rc
+if [ "$match_rc" = 0 ] && [ "$files_rc" = 0 ] && [ "$rc" = "0" ] && [ "$got_match" = "false" ] && [ "$got_files" != "0" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: --detect-only bypasses the always short-circuit (real classifier: match=false, files=$got_files)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --detect-only under always (rc=$rc, match=$got_match [jq_rc=$match_rc], files=$got_files [jq_rc=$files_rc]); expected rc=0, match=false, files>0" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
 # Unknown phase_4b_default value rejected with exit 2.
 echo "phase_4b_default: bogus-mode" > "$SCRATCH/.github/review-policy.yml"
 set +e

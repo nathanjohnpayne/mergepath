@@ -156,6 +156,21 @@ coderabbit_field() {  # <field>
     }
     function indentof(line,   m) { match(line, /^[[:space:]]*/); return RLENGTH }
 
+    # YAML forbids TAB characters in indentation, and go-yaml (the parser this
+    # fleet uses, via scripts/lib/ensure-yq.sh) rejects the whole DOCUMENT when it
+    # finds one -- measured, not inferred: a tab-indented child, a tab after
+    # leading spaces, a tab-indented comment, and a tab-only blank line all
+    # fail to load, while a tab AFTER a value parses fine. `[[:space:]]`
+    # matched the tab as ordinary indentation, so `coderabbit:<TAB>invoke:
+    # never` read as a valid `never` and suppressed Phase 2.5 on a file no
+    # parser would accept (#1084 r12).
+    #
+    # Scoped to the document, not to the block: a tab under ANY top-level key
+    # -- before or after `coderabbit:` -- rejects the file just the same, which
+    # would otherwise leave a readable `invoke: never` next to an unreadable
+    # document.
+    { lead = $0; sub(/[^[:space:]].*$/, "", lead); if (lead ~ /\t/) tabindent++ }
+
     # A top-level key at column 0 ends any block and, when it names coderabbit,
     # opens one. The header is normalized the same way child keys are, so
     # `"coderabbit":` counts as a duplicate of `coderabbit:` (#1084 r9).
@@ -211,6 +226,7 @@ coderabbit_field() {  # <field>
       n++; last = $0
     }
     END {
+      if (tabindent > 0) { print "<<ambiguous:tab in indentation>>"; exit }
       if (badindent > 0) { print "<<ambiguous:inconsistent child indentation>>"; exit }
       if (nonmap > 0) { print "<<ambiguous:coderabbit is not a block mapping>>"; exit }
       if (blocks > 1) { print "<<ambiguous:" blocks " coderabbit blocks>>"; exit }
