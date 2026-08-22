@@ -137,13 +137,38 @@ coderabbit_field() {  # <field>
       sub(/^[[:space:]]+/, "", k)
       sub(/:.*$/, "", k)
       sub(/[[:space:]]+$/, "", k)
-      gsub(/^["\047]|["\047]$/, "", k)
+      # Strip quotes only as a MATCHED pair. Removing boundary quotes
+      # unconditionally turned the mistyped key `invoke": never` -- whose real
+      # key is `invoke"` -- into `invoke`, so a key that is absent produced a
+      # suppressing value (#1084 r9).
+      if (length(k) >= 2) {
+        f = substr(k, 1, 1); l = substr(k, length(k), 1)
+        if ((f == "\"" || f == "\047") && f == l) k = substr(k, 2, length(k) - 2)
+      }
       return k
     }
     function indentof(line,   m) { match(line, /^[[:space:]]*/); return RLENGTH }
 
-    index($0, "coderabbit:") == 1 { in_block=1; blocks++; child_indent=-1; next }
-    in_block && /^[^[:space:]#]/ { in_block=0 }
+    # A top-level key at column 0 ends any block and, when it names coderabbit,
+    # opens one. The header is normalized the same way child keys are, so
+    # `"coderabbit":` counts as a duplicate of `coderabbit:` (#1084 r9).
+    /^[^[:space:]#]/ {
+      hdr = keyname($0)
+      in_block = 0
+      if (hdr == "coderabbit") {
+        # Only a block MAPPING is a policy. `coderabbit: |` is a string, and
+        # its indented text is scalar content, not direct children -- parsing
+        # it as a mapping read `invoke: never` out of a string (#1084 r9).
+        rest = $0
+        sub(/^[^:]*:/, "", rest)
+        sub(/[[:space:]]+#.*$/, "", rest)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", rest)
+        blocks++
+        if (rest != "") { nonmap++; next }
+        in_block = 1; child_indent = -1
+      }
+      next
+    }
     in_block && /^[[:space:]]*$/ { next }
     in_block && /^[[:space:]]*#/ { next }
     in_block {
@@ -159,6 +184,7 @@ coderabbit_field() {  # <field>
       n++; last = $0
     }
     END {
+      if (nonmap > 0) { print "<<ambiguous:coderabbit is not a block mapping>>"; exit }
       if (blocks > 1) { print "<<ambiguous:" blocks " coderabbit blocks>>"; exit }
       if (n != 1) { if (n > 1) print "<<ambiguous:" n " duplicate " fld " keys>>"; exit }
       $0 = last

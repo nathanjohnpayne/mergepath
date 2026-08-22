@@ -238,6 +238,31 @@ case_is 'quoted duplicate key is ambiguous'    "$ON"$'\n'"  invoke: never"$'\n''
 case_is 'no space before # is malformed'       "$ON"$'\n''  invoke: "never"#junk'                    0 0
 case_is 'space before # is a real comment'     "$ON"$'\n''  invoke: "never" # ok'                    0 1
 
+echo "--- #1084 r9: the block header is a key and a type, not a literal prefix ---"
+_mk() {  # <policy-text> <expect_rc> <name>
+  local dir; dir=$(mktemp -d "$WORKDIR/s.XXXXXX"); mkdir -p "$dir/.github" "$dir/scripts"
+  cp "$SCRIPT" "$dir/scripts/coderabbit-should-invoke.sh"; chmod +x "$dir/scripts/coderabbit-should-invoke.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/scripts/phase-4b-classifier.sh"; chmod +x "$dir/scripts/phase-4b-classifier.sh"
+  printf '%s\n' "$1" >"$dir/.github/review-policy.yml"
+  ( cd "$dir" && ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
+  [ $? = "$2" ] && pass "$3" || fail "$3 (expected rc=$2)"
+}
+_mk 'coderabbit:
+  invoke: never
+"coderabbit":
+  invoke: always' 0 'a quoted duplicate block header is ambiguous'
+_mk 'coderabbit: |
+  invoke: never' 0 'a scalar coderabbit block is not a policy mapping'
+_mk 'coderabbit:
+  enabled: true
+  invoke": never' 0 'an unmatched boundary quote does not manufacture a key'
+_mk 'coderabbit:   # trailing comment
+  enabled: true
+  invoke: never' 1 'a commented block header is still a mapping'
+_mk 'coderabbit:
+  enabled: true
+  invoke: never' 1 'baseline single block still skips'
+
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"
 [ "$FAIL" -gt 0 ] && exit 1
