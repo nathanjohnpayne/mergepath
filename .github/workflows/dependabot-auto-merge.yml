@@ -163,7 +163,10 @@ jobs:
           # Repos can already override via REQUIRED_HEAD_CHECK_NAME.
           require_current_head_check_success() {
             local sha runs conclusion status wait_seconds poll_seconds deadline required_check_name ever_seen
-            required_check_name=${REQUIRED_HEAD_CHECK_NAME:-lint}
+            # Optional explicit name so the plural wrapper below can loop
+            # this unchanged; with no argument the previous env behaviour is
+            # exactly preserved.
+            required_check_name=${1:-${REQUIRED_HEAD_CHECK_NAME:-lint}}
             wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
             poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
             deadline=$((SECONDS + wait_seconds))
@@ -209,6 +212,77 @@ jobs:
             done
             echo "::error::Required check run '$required_check_name' wait loop ended unexpectedly; refusing auto-merge."
             exit 1
+          }
+
+          # Resolve the per-consumer required head-check names.
+          #
+          # The VALUE is per-consumer (only nathanpaynedotcom has a
+          # `build-and-test` workflow; naming it canonically would make every
+          # other repo wait forever on a check that never runs). The MECHANISM
+          # is fleet-wide, so this workflow stays byte-identical everywhere and
+          # the propagation lane keeps verifying it verbatim.
+          #
+          # Read from the DEFAULT BRANCH, never the PR head: on a Dependabot PR
+          # the head is bot-authored but still not the trusted config surface,
+          # and a gate that reads its own requirements from the ref it is
+          # gating can be weakened by that ref.
+          #
+          # Only list checks that run on EVERY PR — this list is hard-required,
+          # so a `paths`-filtered workflow that produces no check run for some
+          # PRs would block them forever.
+          resolve_required_head_check_names() {
+            local default_branch encoded raw names count name file_present
+            default_branch=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch 2>/dev/null || true)
+            file_present=0
+            raw=""
+            if [ -n "$default_branch" ]; then
+              if encoded=$(gh api \
+                "repos/${GITHUB_REPOSITORY}/contents/.github/required-head-checks?ref=$default_branch" \
+                --jq .content 2>/dev/null); then
+                file_present=1
+                raw=$(printf '%s' "$encoded" | tr -d '\n' | base64 -d 2>/dev/null || true)
+              fi
+            fi
+            if [ "$file_present" -eq 1 ]; then
+              # Present: it must yield at least one name. Defaulting here
+              # would let an emptied or corrupted file silently drop a
+              # configured gate — which is exactly the #635 regression this
+              # mechanism exists to prevent. To stop requiring extra checks,
+              # DELETE the file.
+              names=$(printf '%s\n' "$raw" | sed 's/#.*//' | tr '\n' ' ')
+              count=0
+              for name in $names; do
+                count=$((count + 1))
+              done
+              if [ "$count" -eq 0 ]; then
+                echo "::error::.github/required-head-checks exists on the default branch but yields no check names. Refusing auto-merge: this gate would verify nothing. Delete the file to fall back to the default." >&2
+                return 1
+              fi
+            else
+              # Absent -> fleet default. `lint` IS correct for every repo
+              # without its own build workflow, so absence must not fail
+              # closed.
+              names=${REQUIRED_HEAD_CHECK_NAMES:-${REQUIRED_HEAD_CHECK_NAME:-lint}}
+              count=0
+              for name in $names; do
+                count=$((count + 1))
+              done
+              if [ "$count" -eq 0 ]; then
+                echo "::error::required head-check list ('$names') split into zero names. Refusing auto-merge: this gate would verify nothing." >&2
+                return 1
+              fi
+            fi
+            printf '%s' "$names"
+          }
+
+          # Wait on EVERY configured check, not just the first.
+          require_current_head_checks_success() {
+            local names name
+            names=$(resolve_required_head_check_names) || exit 1
+            echo "::notice::required head checks: $names"
+            for name in $names; do
+              require_current_head_check_success "$name"
+            done
           }
 
           has_human_hold() {
@@ -348,7 +422,7 @@ jobs:
             exit 0
           fi
 
-          require_current_head_check_success
+          require_current_head_checks_success
 
           # Try GitHub-side auto-merge first (fires when required
           # checks pass). Fall back to an immediate squash ONLY when
@@ -382,7 +456,7 @@ jobs:
               echo "::notice::PR carries human-hold immediately before fallback squash; skipping Dependabot auto-merge until the human removes the label."
               exit 0
             fi
-            require_current_head_check_success
+            require_current_head_checks_success
             if has_human_hold; then
               echo "::notice::PR carries human-hold after test wait; skipping Dependabot auto-merge until the human removes the label."
               exit 0

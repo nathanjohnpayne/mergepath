@@ -1320,10 +1320,24 @@ fi
 
 echo
 echo "auto-merge workflows require current-head check success (#516)"
-dependabot_check_gate_calls=$(grep -Ec '^[[:space:]]*require_current_head_check_success[[:space:]]*$' .github/workflows/dependabot-auto-merge.yml || true)
+# The gate is a LIST now (#1070): the per-name waiter is still the unit of
+# work, but both merge paths go through the plural looper so every configured
+# check is waited on, not just the first.
+#
+# These assertions deliberately name NO specific check beyond the `lint`
+# default. The extra names are per-consumer — only nathanpaynedotcom has a
+# `build-and-test` workflow — and hard-coding one here is exactly what made
+# its local copy impossible to upstream. Assert the MECHANISM: the waiter,
+# the looper, the looper being called on both paths, the resolver, and both
+# of its fail-closed branches.
+dependabot_check_gate_calls=$(grep -Ec '^[[:space:]]*require_current_head_checks_success[[:space:]]*$' .github/workflows/dependabot-auto-merge.yml || true)
 if grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" .github/workflows/dependabot-auto-merge.yml && \
    grep -Fq 'select(.name == $check)' .github/workflows/dependabot-auto-merge.yml && \
    grep -Eq '^[[:space:]]*require_current_head_check_success\(\)[[:space:]]*\{' .github/workflows/dependabot-auto-merge.yml && \
+   grep -Eq '^[[:space:]]*require_current_head_checks_success\(\)[[:space:]]*\{' .github/workflows/dependabot-auto-merge.yml && \
+   grep -Eq '^[[:space:]]*resolve_required_head_check_names\(\)[[:space:]]*\{' .github/workflows/dependabot-auto-merge.yml && \
+   grep -Fq 'required-head-checks?ref=' .github/workflows/dependabot-auto-merge.yml && \
+   grep -Fq 'yields no check names' .github/workflows/dependabot-auto-merge.yml && \
    [ "$dependabot_check_gate_calls" -ge 2 ] && \
    grep -Fq -- "--match-head-commit" .github/workflows/dependabot-auto-merge.yml && \
    grep -Fq "waiting for completion" .github/workflows/dependabot-auto-merge.yml && \

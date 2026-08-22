@@ -1078,7 +1078,65 @@ jobs:
           REPO: ${{ github.repository }}
           REQUIRED_HEAD_CHECK_NAME: lint
         run: |
-          required_check_name=${REQUIRED_HEAD_CHECK_NAME:-lint}
+          # Resolve the check-run names that must be green on the PR head.
+          #
+          # The VALUE is per-consumer (nathanpaynedotcom gates on its own
+          # `build-and-test`; nobody else has that workflow, and naming it
+          # canonically would make every other repo wait forever on a check
+          # that never runs). The MECHANISM is fleet-wide, so this file stays
+          # byte-identical everywhere and the propagation lane keeps
+          # verifying it verbatim.
+          #
+          # Read from the repo's DEFAULT BRANCH, never from the PR head or a
+          # workspace checkout: on `pull_request` the head is contributor
+          # controlled, so a PR could otherwise empty its own merge gate and
+          # then merge. Same trusted-config rule the rest of this workflow
+          # follows.
+          #
+          # Only list checks that run on EVERY PR. A workflow scoped by
+          # `paths` / `paths-ignore` legitimately produces NO check run for a
+          # PR outside its filter, and this list is hard-required — see the
+          # annex discussion below, which is the same deadlock (#655 round 6).
+          required_head_checks_default_branch=$(gh api "repos/$REPO" --jq .default_branch 2>/dev/null || true)
+          required_head_checks_present=0
+          required_head_checks_raw=""
+          if [ -n "$required_head_checks_default_branch" ]; then
+            if required_head_checks_encoded=$(gh api \
+              "repos/$REPO/contents/.github/required-head-checks?ref=$required_head_checks_default_branch" \
+              --jq .content 2>/dev/null); then
+              required_head_checks_present=1
+              required_head_checks_raw=$(printf '%s' "$required_head_checks_encoded" \
+                | tr -d '\n' | base64 -d 2>/dev/null || true)
+            fi
+          fi
+          if [ "$required_head_checks_present" -eq 1 ]; then
+            # Present: it must yield at least one name. Defaulting here would
+            # let an emptied or corrupted file silently drop a configured
+            # gate, which is the #635 regression this exists to prevent. To
+            # stop requiring extra checks, DELETE the file.
+            # Comments are stripped so the file can carry its rationale.
+            required_check_names=$(printf '%s\n' "$required_head_checks_raw" | sed 's/#.*//' | tr '\n' ' ')
+            if [ -z "$(printf '%s' "$required_check_names" | tr -d '[:space:]')" ]; then
+              echo "::error::.github/required-head-checks exists on the default branch but yields no check names. Refusing to report merge readiness: this probe would verify nothing. Delete the file to fall back to the default."
+              exit 1
+            fi
+          else
+            # Absent -> fleet default. `lint` IS the correct value for every
+            # repo without its own build workflow, so absence must not fail
+            # closed here.
+            required_check_names=${REQUIRED_HEAD_CHECK_NAMES:-${REQUIRED_HEAD_CHECK_NAME:-lint}}
+          fi
+          required_check_names_count=0
+          for _rc_name in $required_check_names; do
+            required_check_names_count=$((required_check_names_count + 1))
+          done
+          if [ "$required_check_names_count" -eq 0 ]; then
+            echo "::error::required head-check list ('$required_check_names') split into zero names. Refusing to report merge readiness: this probe would verify nothing."
+            exit 1
+          fi
+          echo "::notice::required head checks: $required_check_names"
+          # Retained for the diagnostics below, which name a single check.
+          required_check_name=$(printf '%s' "$required_check_names" | awk '{print $1}')
           # Approval is durable readiness state. This job probes current-head
           # checks exactly once; it never reserves a runner while CI executes.
           # A successful repo-lint / annex / policy workflow later wakes the
@@ -1153,7 +1211,14 @@ jobs:
           # for this workflow at all"
           # as non-blocking -- the same trade-off gate (a) already made and
           # validated across #655 rounds 2-5.
-          required_checks_json=$(jq -n --arg name "$required_check_name" '[{name: $name, workflow: ""}]')
+          # Built from the resolved LIST. The consumers of this array below
+          # (check_count, .[$i].name, the rollup filter) already iterate it
+          # generically, so widening one name to several needs no change
+          # there. The scoping rule in the comment above is unchanged: only
+          # explicitly-configured hard requirements land here, never the
+          # path-filtered annex.
+          required_checks_json=$(printf '%s\n' $required_check_names \
+            | jq -R . | jq -s -c '[.[] | select(length > 0) | {name: ., workflow: ""}]')
           annex_workflow=""
           annex_unfiltered="false"
           annex_probe_err=$(mktemp)

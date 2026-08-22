@@ -778,6 +778,32 @@ Threads: see "Unresolved threads" column (resolve addressed bot or
 
 The chat-side block is **additive** to the existing PR-side comment template above. Agents emit both: the PR-side comment is the durable record on the PR; the chat-side block is the human-facing summary that flows into the external CLI session. Neither replaces the other.
 
+## Per-consumer required head checks
+
+Both auto-merge paths — `agent-review.yml`'s readiness probe and `dependabot-auto-merge.yml`'s wait — require a set of check-run names to be green on the PR head before merging. That set defaults to `lint` and is configured per repository by an optional file:
+
+```
+.github/required-head-checks
+```
+
+Space- or newline-separated check-run names; `#` starts a comment, so the file can carry its own rationale.
+
+**It is deliberately NOT a propagation manifest entry.** The value is per-consumer — `nathanpaynedotcom` gates on its own `build-and-test`, and no other repo has that workflow, so naming it canonically would make the other eight wait forever on a check that never runs. Keeping the value out of the manifest lets both workflows stay byte-identical across the fleet, so the propagation lane keeps byte-verifying them verbatim.
+
+Resolution, in both workflows:
+
+| State on the default branch | Behavior |
+|---|---|
+| file absent | default to `lint` |
+| file present, yields ≥1 name | use those names |
+| file present, yields 0 names (empty or comment-only) | **hard error, refuse to merge** |
+
+The last row is the important one. Defaulting there would let an emptied or corrupted file silently drop a configured gate, which is the #635 regression this mechanism exists to prevent. To stop requiring extra checks, **delete the file** rather than emptying it.
+
+**The list is read from the repository's DEFAULT BRANCH, never from the PR head.** A gate that read its requirements from the ref it is gating could be weakened by that ref — on `pull_request` the head is contributor-controlled, so a PR could otherwise empty its own merge gate and then merge.
+
+**Only list checks that run on every PR.** This list is hard-required, so a workflow scoped by `paths` / `paths-ignore` legitimately produces no check run for PRs outside its filter and would block them forever. That is the same deadlock the `repo_lint_local.yml` annex is deliberately kept out of the hard-required set to avoid (#655 round 6); the annex is enforced separately by a workflow-wide scan.
+
 ## Post-Merge Issue Creation
 
 When an external reviewer approves a PR but flags observations or risks, the merging agent creates a GitHub Issue for each item before or immediately after merging:
