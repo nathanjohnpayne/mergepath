@@ -817,7 +817,16 @@ materialize_templated_targets() {
     # mode (verified under core.filemode=false). Mirrors the same lesson
     # tests/test_verify_propagation_pr_templated.sh applies to its fixture.
     if [ "$tpl_src_mode" = "100755" ]; then tpl_idx_chmod="+x"; else tpl_idx_chmod="-x"; fi
-    if ! git -C "$workspace/repo" add -- "$tpl_dest" \
+    # -f is load-bearing (#1080). A manifest-declared target may be hidden by
+    # the CONSUMER's ignore rules -- a repo-local .gitignore, or the machine's
+    # global core.excludesfile when the sync is cut locally rather than in CI.
+    # For a brand-new such path git refuses the path-scoped add and this
+    # consumer aborts; the later blanket `git add -A` does not rescue it either,
+    # because -A skips untracked ignored files silently. Measured on
+    # .codex/hooks.json under a global `.codex/` exclusion: path-scoped add
+    # fails, `add -A` stages nothing. The manifest is the authority on what
+    # ships, not the destination's ignore file, so force the add.
+    if ! git -C "$workspace/repo" add -f -- "$tpl_dest" \
        || ! git -C "$workspace/repo" update-index --chmod="$tpl_idx_chmod" -- "$tpl_dest"; then
       err "$consumer_name: failed to stage templated dest mode ($tpl_idx_chmod) for $tpl_dest"
       return 1
@@ -1635,7 +1644,16 @@ sync_open_pr() {
     # already-staged index mode (verified under core.filemode=false).
     local idx_chmod
     if [ "$src_mode" = "100755" ]; then idx_chmod="+x"; else idx_chmod="-x"; fi
-    if ! git -C "$workspace/repo" add -- "$target" \
+    # -f is load-bearing (#1080). A manifest-declared target may be hidden by
+    # the CONSUMER's ignore rules -- a repo-local .gitignore, or the machine's
+    # global core.excludesfile when the sync is cut locally rather than in CI.
+    # For a brand-new such path git refuses the path-scoped add and this
+    # consumer aborts; the later blanket `git add -A` does not rescue it either,
+    # because -A skips untracked ignored files silently. Measured on
+    # .codex/hooks.json under a global `.codex/` exclusion: path-scoped add
+    # fails, `add -A` stages nothing. The manifest is the authority on what
+    # ships, not the destination's ignore file, so force the add.
+    if ! git -C "$workspace/repo" add -f -- "$target" \
        || ! git -C "$workspace/repo" update-index --chmod="$idx_chmod" -- "$target"; then
       err "$consumer_name: failed to stage dest mode ($idx_chmod) for $target"
       return 1
@@ -2098,7 +2116,16 @@ sync_all_open_pr() {
     # would propagate non-executable (#476).
     local idx_chmod
     if [ "$src_mode" = "100755" ]; then idx_chmod="+x"; else idx_chmod="-x"; fi
-    if ! git -C "$workspace/repo" add -- "$target" \
+    # -f is load-bearing (#1080). A manifest-declared target may be hidden by
+    # the CONSUMER's ignore rules -- a repo-local .gitignore, or the machine's
+    # global core.excludesfile when the sync is cut locally rather than in CI.
+    # For a brand-new such path git refuses the path-scoped add and this
+    # consumer aborts; the later blanket `git add -A` does not rescue it either,
+    # because -A skips untracked ignored files silently. Measured on
+    # .codex/hooks.json under a global `.codex/` exclusion: path-scoped add
+    # fails, `add -A` stages nothing. The manifest is the authority on what
+    # ships, not the destination's ignore file, so force the add.
+    if ! git -C "$workspace/repo" add -f -- "$target" \
        || ! git -C "$workspace/repo" update-index --chmod="$idx_chmod" -- "$target"; then
       err "$consumer_name: failed to stage dest mode ($idx_chmod) for $target"
       return 1
@@ -2151,7 +2178,16 @@ sync_all_open_pr() {
       # file would propagate non-executable (#476).
       local kit_idx_chmod
       if [ "$kit_mode" = "100755" ]; then kit_idx_chmod="+x"; else kit_idx_chmod="-x"; fi
-      if ! git -C "$workspace/repo" add -- "$kit_file" \
+      # -f is load-bearing (#1080). A manifest-declared target may be hidden by
+      # the CONSUMER's ignore rules -- a repo-local .gitignore, or the machine's
+      # global core.excludesfile when the sync is cut locally rather than in CI.
+      # For a brand-new such path git refuses the path-scoped add and this
+      # consumer aborts; the later blanket `git add -A` does not rescue it either,
+      # because -A skips untracked ignored files silently. Measured on
+      # .codex/hooks.json under a global `.codex/` exclusion: path-scoped add
+      # fails, `add -A` stages nothing. The manifest is the authority on what
+      # ships, not the destination's ignore file, so force the add.
+      if ! git -C "$workspace/repo" add -f -- "$kit_file" \
          || ! git -C "$workspace/repo" update-index --chmod="$kit_idx_chmod" -- "$kit_file"; then
         err "$consumer_name: failed to stage kit dest mode ($kit_idx_chmod) for $kit_file"
         return 1

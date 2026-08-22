@@ -54,6 +54,30 @@ read_available_reviewers() {
   read_policy_list available_reviewers "$@"
 }
 
+# True when <key> is present but carries a non-empty INLINE value that
+# read_policy_list cannot consume -- a YAML flow list
+# (`key: [a, b]`) or a bare scalar (`key: name`). The block reader only
+# collects following dash-prefixed lines, so both forms parse to NOTHING and
+# are indistinguishable from an absent key. For a deny-list that difference is
+# a silent fail-OPEN: the repo looks like it declared its service account and
+# receives no protection at all. Callers use this to fail closed instead.
+policy_list_has_unconsumed_inline_value() {  # <key> [config_path]
+  local key=$1
+  local cfg="${2:-${CONFIG:-.github/review-policy.yml}}"
+  [ -n "$key" ] || return 1
+  [ -f "$cfg" ] || return 1
+  awk -v key="$key" '
+    index($0, key ":") == 1 {
+      rest = substr($0, length(key) + 2)
+      sub(/[[:space:]]*#.*$/, "", rest)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", rest)
+      if (rest != "") { found = 1 }
+      exit
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$cfg"
+}
+
 # Identities that must NEVER carry reviewer standing — CI service accounts.
 # Absent or empty is a legitimate configuration and means "no such identity
 # on this repo"; callers treat that as an inert check, not as an error, so a

@@ -992,21 +992,48 @@ log "HEAD = $HEAD_SHA    author = $PR_AUTHOR    needs-external-review = $HAS_EXT
 # verdict into that boolean would change what its callers think they asked.
 if [ "$DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
   NON_REVIEWERS=$(read_non_reviewer_identities "$POLICY_CONFIG")
+  # A key present with an inline value the block reader cannot consume -- a
+  # YAML flow list or a bare scalar -- parses to NOTHING and is otherwise
+  # indistinguishable from an absent key. Treating it as absent is a silent
+  # fail-OPEN: the repo looks like it declared its service account and gets no
+  # protection. Refuse to run rather than pretend the key is not there.
+  if [ -z "$NON_REVIEWERS" ] \
+     && policy_list_has_unconsumed_inline_value non_reviewer_identities "$POLICY_CONFIG"; then
+    die 2 "non_reviewer_identities in $POLICY_CONFIG carries an inline value this reader cannot parse (use a dash-prefixed block list, one identity per line). Refusing to run a gate that would silently pass."
+  fi
   if [ -n "$NON_REVIEWERS" ]; then
     NON_REVIEWERS_JSON=$(echo "$NON_REVIEWERS" | jq -R . | jq -s .)
     NR_REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
 
     # Same latest-state-per-reviewer collapse the Dependabot arm uses, with the
-    # membership test inverted. Filtering to the opinionated states before the
-    # collapse is load-bearing and mirrors GitHub: a COMMENTED review does not
-    # supersede an APPROVED one, so a naive "most recent review" would let a
-    # later comment mask a standing approval.
+    # membership test inverted -- and deliberately WITHOUT that arm's
+    # commit_id == HEAD pin.
+    #
+    # HEAD-pinning here was a bug, caught by Codex on #1080. Whether an
+    # approval from an earlier commit still counts is decided by
+    # `dismiss_stale_reviews`, which this script cannot see and must not
+    # assume: with it OFF, GitHub keeps counting the older approval, so a
+    # HEAD-pinned check passes while the merge bypass this gate exists to close
+    # is still open -- the non-reviewer only has to approve, then push. The
+    # repo does not even agree with itself about that setting: the live API
+    # reports dismiss_stale_reviews=true on mergepath and three consumers,
+    # while .github/workflows/agent-review.yml's auto-merge arming path
+    # documents it as OFF and relies on the approval carrying across a push.
+    #
+    # A deny-list pays nothing for the wider scope. A declared non-reviewer
+    # should hold no standing approval on this PR at ANY commit, so there is no
+    # false positive to trade against -- unlike the Dependabot arm, where the
+    # pin exists to reject a STALE approval as insufficient (#427).
+    #
+    # Filtering to the opinionated states before the collapse is still
+    # load-bearing and mirrors GitHub: a COMMENTED review does not supersede an
+    # APPROVED one, so a naive "most recent review" would let a later comment
+    # mask a standing approval. A push that dismisses the approval flips the
+    # latest state to DISMISSED, which correctly clears this gate.
     NR_APPROVERS=$(echo "$NR_REVIEWS_JSON" | jq -r \
-      --argjson deny "$NON_REVIEWERS_JSON" \
-      --arg sha "$HEAD_SHA" '
+      --argjson deny "$NON_REVIEWERS_JSON" '
         [ .[]
           | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
-          | select(.commit_id == $sha)
           | select(.user.login as $u | $deny | index($u))
         ]
         | group_by(.user.login)
@@ -1018,9 +1045,9 @@ if [ "$DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; 
       ')
 
     if [ -n "$NR_APPROVERS" ]; then
-      block "APPROVED review on HEAD $HEAD_SHA from an identity this repo declares a non-reviewer: $NR_APPROVERS. Such an account holds no reviewer standing and its approval must not satisfy branch protection (see REVIEW_POLICY.md, non_reviewer_identities). Dismiss the review, then find out which process is holding that token."
+      block "standing APPROVED review on this PR from an identity this repo declares a non-reviewer: $NR_APPROVERS. Such an account holds no reviewer standing and its approval must not satisfy branch protection (see REVIEW_POLICY.md, non_reviewer_identities). Dismiss the review, then find out which process is holding that token."
     fi
-    log "non-reviewer check: no standing approval on HEAD from [$(echo "$NON_REVIEWERS" | tr '\n' ' ' | sed 's/ $//')]"
+    log "non-reviewer check: no standing approval anywhere on this PR from [$(echo "$NON_REVIEWERS" | tr '\n' ' ' | sed 's/ $//')]"
   fi
 fi
 

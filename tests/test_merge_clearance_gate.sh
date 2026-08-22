@@ -3610,10 +3610,29 @@ nonrev_case "ordinary PR, robot APPROVED on HEAD" "$DENY" \
   "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
     [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" block
 
-# 26b — HEAD-pinned: an approval on a superseded commit carries no standing.
-nonrev_case "robot APPROVED on an OLD sha" "$DENY" \
+# 26b — NOT HEAD-pinned, and this case previously asserted the opposite.
+# Whether an older approval still counts is decided by dismiss_stale_reviews,
+# which the gate cannot see; with it OFF the non-reviewer only has to approve
+# and then push to slip past a HEAD-pinned check. Codex caught this on #1080 —
+# the original 26b encoded the bug, and the mutation test dutifully proved the
+# bug was load-bearing.
+nonrev_case "robot APPROVED on an OLD sha (survives a push)" "$DENY" \
   "$(jq -n --arg old "$OLD_SHA" --arg who "$ROBOT" '
-    [{user:{login:$who},state:"APPROVED",commit_id:$old,submitted_at:"2026-08-22T04:46:19Z"}]')" pass
+    [{user:{login:$who},state:"APPROVED",commit_id:$old,submitted_at:"2026-08-22T04:46:19Z"}]')" block
+
+# 26b2 — the remediation path: a push under dismiss_stale_reviews flips the
+# older approval to DISMISSED, which must clear the gate even though the
+# dismissal is recorded against the earlier commit.
+nonrev_case "robot approval DISMISSED on an OLD sha" "$DENY" \
+  "$(jq -n --arg old "$OLD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"DISMISSED",commit_id:$old,submitted_at:"2026-08-22T04:46:19Z"}]')" pass
+
+# 26b3 — a later CHANGES_REQUESTED on a newer commit supersedes an older
+# approval, so nothing stands.
+nonrev_case "robot APPROVED old, CHANGES_REQUESTED newer" "$DENY" \
+  "$(jq -n --arg old "$OLD_SHA" --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$old,submitted_at:"2026-08-22T04:46:19Z"},
+     {user:{login:$who},state:"CHANGES_REQUESTED",commit_id:$sha,submitted_at:"2026-08-22T05:10:00Z"}]')" pass
 
 # 26c — dismissing the approval is the remediation, so it must clear the gate.
 nonrev_case "robot APPROVED then DISMISSED on HEAD" "$DENY" \
@@ -3653,6 +3672,32 @@ if [ "$RC" = 0 ] && { [ "$OUT" = "true" ] || [ "$OUT" = "false" ]; }; then
 else
   fail "#1080: query mode expected rc=0 and a bare true/false; got rc=$RC out='$OUT'"
 fi
+
+# 26h — a key present with a YAML FLOW list parses to nothing under the block
+# reader, which is indistinguishable from an absent key. Treating it as absent
+# is a silent fail-OPEN: the repo looks like it declared its service account
+# and gets no protection. The gate must refuse to run instead. (Codex #1080.)
+SCRATCH=$(make_scratch_nonrev "")
+printf '\nnon_reviewer_identities: [%s]\n' "$ROBOT" >>"$SCRATCH/.github/review-policy.yml"
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+  [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q "cannot parse"; then
+  pass "#1080: flow-list non_reviewer_identities fails closed (rc=2) instead of silently passing"
+else
+  fail "#1080: flow-list key expected rc=2 naming the parse failure; got rc=$RC"
+  printf '%s\n' "$OUT" | sed 's/^/      /' | head -4 >&2
+fi
+
+# 26i — the inverse control: a correctly-written block list must NOT trip the
+# fail-closed path, or every repo breaks.
+nonrev_case "block-list key parses and gates normally" "$DENY" \
+  "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" block
 
 # ---------------------------------------------------------------------------
 echo
