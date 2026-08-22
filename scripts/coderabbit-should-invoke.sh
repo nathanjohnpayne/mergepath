@@ -116,7 +116,14 @@ if ! [[ "$PR_NUM" =~ ^[1-9][0-9]*$ ]]; then
   echo "Error: PR# must be a positive integer; got '${PR_NUM:-}'" >&2
   exit 3
 fi
-if [ -n "$REPO" ] && ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+# Owner must start alphanumeric (GitHub forbids a leading dot or dash on a
+# user/org); a REPO NAME may start with a dot -- `owner/.github` is a real and
+# common repository. Neither existing validator in scripts/ encodes both: this
+# one was permissive on the owner, the classifier strict on the repo name, so
+# `owner/.github` passed here and was rejected there, making every routine PR
+# invoke (#1084 r11). Aligning to either existing pattern would keep a
+# divergence; this is the intersection of the two correct halves.
+if [ -n "$REPO" ] && ! [[ "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$ ]]; then
   echo "Error: invalid --repo value: '$REPO' (expected owner/name)" >&2
   exit 3
 fi
@@ -185,7 +192,21 @@ coderabbit_field() {  # <field>
       # suppressing field win while the later, shallower line was silently
       # dropped (#1084 r10).
       if (ind < child_indent) { badindent++; next }
-      if (ind != child_indent) next          # nested map, not a direct child
+      if (ind > child_indent) {
+        # Deeper lines are nested content ONLY under a mapping key. A key with
+        # a scalar value cannot have children, and YAML rejects the file --
+        # ignoring them let `enabled: false` win while an indented
+        # `invoke: never` was silently dropped (#1084 r11).
+        if (prev_scalar) { badindent++ }
+        next
+      }
+      # Remember whether THIS direct child is a mapping key (empty value) or a
+      # scalar, so the next deeper line can be judged.
+      val = $0
+      sub(/^[^:]*:/, "", val)
+      sub(/[[:space:]]+#.*$/, "", val)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+      prev_scalar = (val != "")
       if (keyname($0) != fld) next
       n++; last = $0
     }
@@ -209,9 +230,9 @@ coderabbit_field() {  # <field>
           if (after ~ /^[[:space:]]*$/ || after ~ /^[[:space:]]+#/) {
             print substr(rest, 1, idx - 1); exit
           }
-          print last; exit
+          print "<<ambiguous:malformed quoting on " fld ">>"; exit
         }
-        print last; exit          # unterminated scalar -> raw, fails the enum
+        print "<<ambiguous:unterminated quoted scalar for " fld ">>"; exit
       }
       sub(/[[:space:]]+#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
@@ -328,8 +349,31 @@ set -e
 # the `fallback-only` half, leaving `always` reporting a phantom trigger match
 # on every routine PR (#1084 r2). Keying on whether it inspected anything
 # covers both, plus the empty-diff case, without string-matching a rationale.
+# Three diagnoses, deliberately, and in this order. Every branch invokes, so
+# the DECISION was always fail-safe; what was wrong is the reason a machine
+# reader is handed (#1084 r11). Coercing an empty CLS_FILES to zero reported an
+# infrastructure failure as "the classifier looked and found nothing", discarded
+# the classifier stderr, and made the dedicated failure branch below unreachable
+# for the ordinary error shape.
+#
+#   1. non-0/1 exit  -> the classifier failed (API, config, arguments)
+#   2. no parseable files_inspected -> it produced no usable document
+#   3. files_inspected == 0 -> it genuinely inspected nothing (short-circuit
+#                              or empty diff)
+case "$CLS_RC" in
+  0|1) ;;
+  *)
+    printf '%s\n' "$CLS_OUT" | tail -3 >&2
+    emit invoke "classifier failed (exit $CLS_RC) — complexity unassessed, defaulting to invoke"
+    ;;
+esac
+
 CLS_FILES=$(printf '%s' "$CLS_OUT" | sed -n 's/.*"files_inspected"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
-if [ "${CLS_FILES:-0}" = "0" ]; then
+if [ -z "$CLS_FILES" ]; then
+  printf '%s\n' "$CLS_OUT" | tail -3 >&2
+  emit invoke "classifier emitted no parseable files_inspected — complexity unassessed, defaulting to invoke"
+fi
+if [ "$CLS_FILES" = "0" ]; then
   emit invoke "classifier inspected no files (phase_4b_default short-circuit or empty diff) — complexity unassessed, defaulting to invoke"
 fi
 

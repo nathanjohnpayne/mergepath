@@ -129,7 +129,10 @@ if ! [[ "$PR_NUM" =~ ^[1-9][0-9]*$ ]]; then
   echo "Error: PR# must be a positive integer; got '$PR_NUM'" >&2; exit 3
 fi
 
-if [ -n "$REPO" ] && ! [[ "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+# Repo NAMES may start with a dot -- `owner/.github` is a real repository --
+# while the OWNER may not. This validator was strict on both, so a caller that
+# accepted the dot-prefixed form had its call rejected here (#1084 r11).
+if [ -n "$REPO" ] && ! [[ "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+$ ]]; then
   echo "Error: invalid --repo value: '$REPO' (expected owner/name)" >&2; exit 3
 fi
 

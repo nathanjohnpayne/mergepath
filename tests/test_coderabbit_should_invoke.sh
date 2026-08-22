@@ -273,6 +273,51 @@ _mk 'coderabbit:
     enabled: true
     invoke: never' 1 'consistent four-space indentation still skips'
 
+echo "--- #1084 r11: malformed quoting is ambiguous for EVERY field ---"
+# Returning the raw line only worked for `invoke`, where an unmatched literal
+# fails the enum. For `enabled` a raw line simply is not "false", so the field
+# defaulted to true and a valid `invoke: never` was still free to skip.
+case_is 'unterminated enabled + valid never invokes' '  enabled: "false'$'\n'"  invoke: never" 0 0
+case_is 'unterminated invoke still invokes'          "$ON"$'\n''  invoke: "never'            0 0
+
+echo "--- #1084 r11: a scalar key cannot have children ---"
+_mk 'coderabbit:
+  enabled: false
+    invoke: never' 0 'a mapping nested under a scalar is malformed'
+_mk 'coderabbit:
+  enabled: true
+  severity_gate:
+    enabled: false
+  invoke: never' 1 'a real nested map under a mapping key is fine'
+
+echo "--- #1084 r11: repo validators agree, and both halves are right ---"
+_d=$(scratch "$ON" 0)
+( cd "$_d" && ./scripts/coderabbit-should-invoke.sh 99 --repo "owner/.github" >/dev/null 2>&1 )
+[ $? != 3 ] && pass "a dot-prefixed repo NAME is accepted (owner/.github)" || fail "owner/.github rejected"
+( cd "$_d" && ./scripts/coderabbit-should-invoke.sh 99 --repo ".bad/x" >/dev/null 2>&1 )
+[ $? = 3 ] && pass "a dot-prefixed OWNER is still rejected" || fail ".bad/x should be rc=3"
+
+echo "--- #1084 r11: three diagnoses, not two ---"
+# Every branch invokes, so the DECISION was always fail-safe; the defect was the
+# reason handed to a machine reader. An infra failure and an empty diff must not
+# land in the same bucket, and neither must an unparseable document.
+_diag() {  # <classifier-body> <expected-substring> <name>
+  local dir; dir=$(mktemp -d "$WORKDIR/s.XXXXXX"); mkdir -p "$dir/.github" "$dir/scripts"
+  cp "$SCRIPT" "$dir/scripts/coderabbit-should-invoke.sh"; chmod +x "$dir/scripts/coderabbit-should-invoke.sh"
+  printf '%s\n' "$1" >"$dir/scripts/phase-4b-classifier.sh"; chmod +x "$dir/scripts/phase-4b-classifier.sh"
+  printf 'coderabbit:\n  enabled: true\n  invoke: complex-changes\n' >"$dir/.github/review-policy.yml"
+  local out; out=$( cd "$dir" && ./scripts/coderabbit-should-invoke.sh 99 2>/dev/null )
+  printf '%s' "$out" | grep -q "$2" && pass "$3" || fail "$3 (got: $out)"
+}
+_diag '#!/usr/bin/env bash
+exit 2' 'classifier failed (exit 2)' 'an API failure reports as a failure'
+_diag '#!/usr/bin/env bash
+echo "not json"
+exit 0' 'no parseable files_inspected' 'an unparseable document reports as unparseable'
+_diag '#!/usr/bin/env bash
+echo "{\"files_inspected\": 0}"
+exit 0' 'inspected no files' 'a genuine empty inspection reports as such'
+
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"
 [ "$FAIL" -gt 0 ] && exit 1
