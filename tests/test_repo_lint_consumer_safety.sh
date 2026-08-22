@@ -278,11 +278,17 @@ done
 # fixture out while the consumers it models still need the coverage. Scoped
 # entries are reported and allowed; the frozen state retires only once the
 # modeled population is fully covered.
-frozen_manifest_paths=$(yq -r '.paths[] | select((.consumers // "all") == "all") | (.path, .dest) | select(. != null)' "$ROOT/.mergepath-sync.yml" 2>/dev/null || true)
+# `(.dest // .path)` -- the DELIVERED path, matching how
+# scripts/sync-to-downstream.sh resolves it. Emitting both fields treats a
+# templated entry's SOURCE as consumer-delivered, which it is not:
+# examples/eslint.config.js is only ever read, while eslint.config.js is what
+# lands on a consumer. A frozen bootstrap file that later became a template
+# source would then be wrongly retired.
+frozen_manifest_paths=$(yq -r '.paths[] | select((.consumers // "all") == "all") | (.dest // .path) | select(. != null)' "$ROOT/.mergepath-sync.yml" 2>/dev/null || true)
 # sort -u: one entry contributes both .path and .dest, and eslint.config.js
 # is the dest of two entries, so an undeduped list reports the same path
 # several times.
-frozen_scoped_paths=$(yq -r '.paths[] | select((.consumers // "all") != "all") | (.path, .dest) | select(. != null)' "$ROOT/.mergepath-sync.yml" 2>/dev/null | sort -u || true)
+frozen_scoped_paths=$(yq -r '.paths[] | select((.consumers // "all") != "all") | (.dest // .path) | select(. != null)' "$ROOT/.mergepath-sync.yml" 2>/dev/null | sort -u || true)
 if [ -z "$frozen_manifest_paths" ]; then
   echo "FATAL: could not read paths[] from .mergepath-sync.yml." >&2
   echo "       CONSUMER_FROZEN_CONTENT cannot be validated against the delivery" >&2
