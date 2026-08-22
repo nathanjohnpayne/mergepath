@@ -31,8 +31,11 @@ scratch() {  # <coderabbit_block_body> <cls_rc|absent|nonexec>
   cp "$SCRIPT" "$dir/scripts/coderabbit-should-invoke.sh"
   chmod +x "$dir/scripts/coderabbit-should-invoke.sh"
   if [ "$cls" != "absent" ]; then
-    printf '#!/usr/bin/env bash\necho "{\\"match\\": false, \\"phase_4b_default\\": \\"%s\\"}"\nexit %s\n' \
-      "${CLS_POLICY_FIXTURE:-complex-changes}" "${cls#nonexec:}" >"$dir/scripts/phase-4b-classifier.sh"
+    {
+      echo "#!/usr/bin/env bash"
+      echo "echo '{\"match\": false, \"phase_4b_default\": \"${CLS_POLICY_FIXTURE:-complex-changes}\", \"files_inspected\": ${CLS_FILES_FIXTURE:-4}}'"
+      echo "exit ${cls#nonexec:}"
+    } >"$dir/scripts/phase-4b-classifier.sh"
     if [ "${cls%%:*}" = "nonexec" ]; then chmod -x "$dir/scripts/phase-4b-classifier.sh"; else chmod +x "$dir/scripts/phase-4b-classifier.sh"; fi
   fi
   echo "$dir"
@@ -91,7 +94,7 @@ echo "--- #1084 r1: the classifier is a DISPOSITION function, not a detector ---
 # With phase_4b_default: fallback-only the classifier short-circuits and exits 0
 # WITHOUT inspecting the diff. Reading that as "routine" would skip CodeRabbit on
 # every PR in such a repo, silently, including state-machine changes.
-CLS_POLICY_FIXTURE=fallback-only case_is "fallback-only short-circuit invokes (not skip)" "$CX" 0 0
+CLS_FILES_FIXTURE=0 CLS_POLICY_FIXTURE=fallback-only case_is "fallback-only short-circuit invokes (not skip)" "$CX" 0 0
 CLS_POLICY_FIXTURE=complex-changes case_is "an inspecting policy still skips on no-match" "$CX" 0 1
 
 echo "--- #1084 r1: a flag with a missing value must not loop forever ---"
@@ -114,6 +117,30 @@ d=$(scratch "$ON"$'\n'"  invoke: never" 0)
 ( cd / && "$d/scripts/coderabbit-should-invoke.sh" 99 >/dev/null 2>&1 )
 [ $? = 1 ] && pass "explicit never is honoured when run from a foreign cwd" \
              || fail "running from a foreign cwd lost the config and did not skip"
+
+echo "--- #1084 r2: BOTH phase_4b short-circuits are unassessed, not verdicts ---"
+# fallback-only exits 0 (reads as "routine"); always exits 1 (reads as "trigger
+# matched"). Keying on the policy NAME caught only the first half. files_inspected
+# == 0 is the policy-agnostic "did not look" signal and covers both.
+CLS_FILES_FIXTURE=0 case_is "always short-circuit (exit 1, 0 files) invokes as unassessed" "$CX" 1 0
+CLS_FILES_FIXTURE=8 case_is "genuine trigger match (files inspected) invokes"              "$CX" 1 0
+CLS_FILES_FIXTURE=3 case_is "genuine no-match (files inspected) skips"                     "$CX" 0 1
+
+echo "--- #1084 r2: --json must stay parseable on the fail-safe path ---"
+_d=$(scratch "$ON"$'\n'"  invoke: 'bogus\"mode'" 0)
+_out=$( cd "$_d" && ./scripts/coderabbit-should-invoke.sh 99 --json 2>/dev/null )
+if printf '%s' "$_out" | jq -e '.decision == "invoke"' >/dev/null 2>&1; then
+  pass "a JSON-special char in the policy value still yields parseable --json"
+else
+  fail "--json malformed when the policy value contains a quote: $_out"
+fi
+
+echo "--- #1084 r2: resolve through a symlink ---"
+_d=$(scratch "$ON"$'\n'"  invoke: never" 0)
+ln -sf "$_d/scripts/coderabbit-should-invoke.sh" "$WORKDIR/via-link.sh"
+( cd / && "$WORKDIR/via-link.sh" 99 >/dev/null 2>&1 )
+[ $? = 1 ] && pass "explicit never honoured when invoked through a symlink" \
+             || fail "symlink invocation lost the config and did not skip"
 
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"

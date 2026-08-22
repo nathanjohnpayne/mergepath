@@ -58,7 +58,21 @@
 
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Follow symlinks before deriving anything from the script location. Invoked
+# through a PATH symlink, `dirname "${BASH_SOURCE[0]}"` names the symlink's
+# directory, so both the policy and the classifier would be looked up beside
+# the link and an explicit `enabled: false` / `invoke: never` would be silently
+# ignored (#1084 r2). Same bash-3.2 portable loop phase-4b-classifier.sh uses;
+# BSD readlink has no portable `-f`.
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _target="$(readlink "$_src")"
+  case "$_target" in
+    /*) _src="$_target" ;;
+    *)  _src="$(cd -P "$(dirname "$_src")" && pwd)/$_target" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 # Resolve the policy relative to the SCRIPT's checkout, not $PWD (#1084 r1).
 # Launched from a subdirectory, or by absolute path from another working
 # directory, a relative CONFIG reads the wrong checkout or no file at all --
@@ -131,8 +145,14 @@ emit() {  # <decision> <reason>
   local decision=$1 reason=$2 code
   [ "$decision" = "invoke" ] && code=0 || code=1
   if [ "$JSON" = true ]; then
-    printf '{\n  "pr_number": %s,\n  "decision": "%s",\n  "reason": "%s",\n  "invoke_mode": "%s",\n  "coderabbit_enabled": "%s"\n}\n' \
-      "$PR_NUM" "$decision" "$reason" "${INVOKE_MODE:-}" "${CR_ENABLED:-}"
+    # Built by jq, not printf. A policy value is arbitrary YAML text and can
+    # contain JSON-special characters -- `invoke: '"'"'bogus"mode'"'"'` produced
+    # malformed output that jq itself then rejected, on the fail-safe path
+    # where a machine reader most needs a parseable answer (#1084 r2).
+    jq -n --arg pr "$PR_NUM" --arg d "$decision" --arg r "$reason" \
+          --arg m "${INVOKE_MODE:-}" --arg e "${CR_ENABLED:-}" \
+      '{pr_number: ($pr|tonumber), decision: $d, reason: $r,
+        invoke_mode: $m, coderabbit_enabled: $e}'
   else
     echo "[coderabbit-should-invoke] $decision — $reason"
   fi
@@ -189,9 +209,17 @@ set -e
 # state-machine and concurrency changes, and would do it silently. Exit 0 is
 # therefore only trustworthy as "no trigger matched" when the classifier
 # actually looked.
-CLS_POLICY=$(printf '%s' "$CLS_OUT" | sed -n 's/.*"phase_4b_default"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-if [ "$CLS_POLICY" = "fallback-only" ]; then
-  emit invoke "classifier short-circuits under phase_4b_default=fallback-only without inspecting the diff — complexity unassessed, defaulting to invoke"
+# `files_inspected == 0` is the single, policy-agnostic signal that the
+# classifier did not look at this diff. Both short-circuits emit it: the
+# `fallback-only` arm (exit 0, which would read as "routine") AND the
+# symmetric `always` arm (exit 1, which would read as "a trigger matched").
+# The first version of this fix keyed on the policy NAME and so caught only
+# the `fallback-only` half, leaving `always` reporting a phantom trigger match
+# on every routine PR (#1084 r2). Keying on whether it inspected anything
+# covers both, plus the empty-diff case, without string-matching a rationale.
+CLS_FILES=$(printf '%s' "$CLS_OUT" | sed -n 's/.*"files_inspected"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+if [ "${CLS_FILES:-0}" = "0" ]; then
+  emit invoke "classifier inspected no files (phase_4b_default short-circuit or empty diff) — complexity unassessed, defaulting to invoke"
 fi
 
 case "$CLS_RC" in
