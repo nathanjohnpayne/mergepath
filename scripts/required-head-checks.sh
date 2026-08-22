@@ -107,29 +107,47 @@ fi
 # identity comes from joining the Actions runs API on check_suite_id; a check
 # run with no matching workflow run (an external app such as CodeRabbit)
 # falls back to its suite id, which is its stable identity.
-runs=$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate \
-  --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started: .started_at}' 2>/dev/null) \
-  || infra "could not read check runs for $SHA"
-
+# Workflow identity is not in the check-runs payload, so it comes from the
+# Actions runs API keyed on check_suite_id. Fetched ONCE per verification,
+# not per name.
 suite_map=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
   --jq '.workflow_runs[] | {suite: .check_suite_id, wf: .workflow_id}' 2>/dev/null) \
   || infra "could not read workflow runs for $SHA"
 
-flat=$(jq -n -c --slurpfile r <(printf '%s\n' "$runs") --slurpfile m <(printf '%s\n' "$suite_map") '
-  ($m | map({key: (.suite|tostring), value: (.wf|tostring)}) | from_entries) as $bysuite
-  | $r | map(. + {wf: ($bysuite[(.suite|tostring)] // ("suite:" + (.suite|tostring)))})')
-
 rc=0
 while IFS= read -r name; do
   [ -n "$name" ] || continue
-  verdict=$(printf '%s' "$flat" | jq -r --arg n "$name" '
-    [ .[] | select(.name == $n) ]
+  # Filtered per NAME rather than refetching every run on the SHA. This runs
+  # inside a poll loop of up to 20 minutes at 15s intervals, and a busy
+  # commit carries ~1100 check runs -- refetching all of them ~80 times per
+  # PR is how a verifier walks into a secondary rate limit, which this
+  # script correctly treats as indeterminate and fails closed on. The
+  # cheaper query keeps the gate from breaking the merge it protects.
+  runs=$(gh api --method GET "repos/$REPO/commits/$SHA/check-runs" \
+    -f check_name="$name" --paginate \
+    --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id, started: .started_at}' 2>/dev/null) \
+    || infra "could not read check runs named '$name' for $SHA"
+
+  verdict=$(jq -n -r --arg n "$name" \
+    --slurpfile r <(printf '%s\n' "$runs") \
+    --slurpfile m <(printf '%s\n' "$suite_map") '
+    ($m | map({key: (.suite|tostring), value: (.wf|tostring)}) | from_entries) as $bysuite
+    | [ $r[] | select(.name == $n)
+        | . + {wf: ($bysuite[(.suite|tostring)] // ("suite:" + (.suite|tostring)))} ]
     | if length == 0 then "absent"
       else
         group_by(.wf)
-        | map(sort_by(.started) | last)
-        | if any(.status != "completed") then "pending"
-          elif all(.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") then "green"
+        # Any non-completed run in a group means that workflow is still
+        # working, regardless of ordering. Reducing to the latest FIRST
+        # would miss a queued re-run whose started_at is null and therefore
+        # does not sort last -- reporting green while a re-run is pending.
+        | map(if any(.status != "completed") then "pending"
+              else (sort_by(.started) | last
+                    | if (.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped")
+                      then "green" else "failed" end)
+              end)
+        | if any(. == "pending") then "pending"
+          elif all(. == "green") then "green"
           else "failed" end
       end')
   case "$verdict" in
