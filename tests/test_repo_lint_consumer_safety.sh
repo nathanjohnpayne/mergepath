@@ -278,17 +278,40 @@ done
 # fixture out while the consumers it models still need the coverage. Scoped
 # entries are reported and allowed; the frozen state retires only once the
 # modeled population is fully covered.
-# `(.dest // .path)` -- the DELIVERED path, matching how
-# scripts/sync-to-downstream.sh resolves it. Emitting both fields treats a
-# templated entry's SOURCE as consumer-delivered, which it is not:
-# examples/eslint.config.js is only ever read, while eslint.config.js is what
-# lands on a consumer. A frozen bootstrap file that later became a template
-# source would then be wrongly retired.
-frozen_manifest_paths=$(yq -r '.paths[] | select((.consumers // "all") == "all") | (.dest // .path) | select(. != null)' "$ROOT/.mergepath-sync.yml" 2>/dev/null || true)
-# sort -u: one entry contributes both .path and .dest, and eslint.config.js
-# is the dest of two entries, so an undeduped list reports the same path
-# several times.
-frozen_scoped_paths=$(yq -r '.paths[] | select((.consumers // "all") != "all") | (.dest // .path) | select(. != null)' "$ROOT/.mergepath-sync.yml" 2>/dev/null | sort -u || true)
+# Effective delivery is aggregated BY DESTINATION, not per entry. A
+# destination can be delivered by several consumer-scoped entries whose
+# union covers the whole fleet -- eslint.config.js is exactly that today,
+# written by two scoped entries (ESM and CJS) whose consumer lists together
+# name all nine consumers. Checking `consumers` per entry would call that
+# destination "scoped" and only print a note, so a frozen fixture for it
+# would never retire even though every consumer receives current content.
+#
+# `(.dest // .path)` is the DELIVERED path, matching how
+# scripts/sync-to-downstream.sh resolves it. Emitting both fields instead
+# would treat a templated entry's SOURCE as consumer-delivered, which it
+# never is: examples/eslint.config.js is only ever read.
+# yq converts YAML to JSON; every transformation is jq, whose object
+# construction and set comparison this needs.
+frozen_fleet_json=$(yq -o=json '.' "$ROOT/.mergepath-sync.yml" 2>/dev/null | jq -c '
+  ([.consumers[].name] | unique) as $fleet
+  | [ .paths[] | {d: (.dest // .path), c: .consumers} | select(.d != null) ]
+  | group_by(.d)
+  | map({
+      d: .[0].d,
+      fleetwide: (
+        if any(.[]; .c == "all") then true
+        else (([.[] | select(.c != "all") | .c[]] | unique) == $fleet)
+        end)
+    })' 2>/dev/null || true)
+if [ -z "$frozen_fleet_json" ] || [ "$frozen_fleet_json" = "null" ]; then
+  echo "FATAL: could not derive effective delivery from .mergepath-sync.yml." >&2
+  echo "       CONSUMER_FROZEN_CONTENT cannot be validated, and an entry the" >&2
+  echo "       manifest now delivers would model a consumer state that does" >&2
+  echo "       not exist. Failing closed." >&2
+  exit 1
+fi
+frozen_manifest_paths=$(printf '%s' "$frozen_fleet_json" | jq -r '.[] | select(.fleetwide) | .d' | sort -u)
+frozen_scoped_paths=$(printf '%s' "$frozen_fleet_json" | jq -r '.[] | select(.fleetwide | not) | .d' | sort -u)
 if [ -z "$frozen_manifest_paths" ]; then
   echo "FATAL: could not read paths[] from .mergepath-sync.yml." >&2
   echo "       CONSUMER_FROZEN_CONTENT cannot be validated against the delivery" >&2
