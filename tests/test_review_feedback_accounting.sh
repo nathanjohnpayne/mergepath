@@ -1443,6 +1443,27 @@ reset_fixtures
 FINGERPRINT_ONE=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
   GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
   "$SURFACE_FINGERPRINT" 7 acme/widget)
+
+# An unreadable surface must reach the caller as BOTH a status and a
+# diagnostic. The parent-side handler removed in #1089 delivered neither:
+# GH_API_ARRAY_ERROR is set inside the command-substitution SUBSHELL, so by
+# the time the parent referenced it the variable was unset, and under `set -u`
+# the handler itself died on the unbound variable -- exiting 1 rather than the
+# 2 it was written to return. Assert the MESSAGE and not only the code: a
+# code-only assertion is satisfied by any nonzero exit, which the broken form
+# already produced, and that gap is what let this survive since #1018.
+set +e
+FINGERPRINT_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  GH_FAIL_ENDPOINT="repos/acme/widget/pulls/7/reviews" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_RC" "feedback-surface fingerprint preserves API failure status"
+assert_match 'failed to fetch review objects' "$FINGERPRINT_ERROR" \
+  "feedback-surface fingerprint preserves API failure detail"
+
+reset_fixtures
 jq '. + [{
   "id": 9900,
   "created_at": "2026-08-18T23:10:00Z",
