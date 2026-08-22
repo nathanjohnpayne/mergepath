@@ -91,6 +91,25 @@ available_reviewers:
   - nathanpayne-codex
 
 # ---------------------------------------------------------------------------
+# Non-Reviewer Identities
+# ---------------------------------------------------------------------------
+# Accounts that must NEVER carry reviewer standing. These are service
+# accounts: they hold repo write access because CI needs it, which means
+# GitHub's branch protection will happily count an approval from one of them
+# toward required_approving_review_count. Nothing in GitHub distinguishes such
+# an account from a person -- both are `type: "User"` -- so the distinction has
+# to be declared here.
+#
+# scripts/merge-clearance-gate.sh fails closed when any identity listed below
+# has a latest-state APPROVED review on the current HEAD. This runs on every
+# lane, including ordinary under-threshold PRs, which the reviewer-identity
+# arms of that gate do not otherwise examine.
+#
+# Absent or empty is legitimate and makes the check inert.
+non_reviewer_identities:
+  - nathanpayne-robot
+
+# ---------------------------------------------------------------------------
 # Default External Reviewer
 # ---------------------------------------------------------------------------
 # When the agent needs to suggest an external reviewer in a handoff message,

@@ -734,6 +734,38 @@ paths:
   - path: scripts/hooks/label-removal-guard.sh
     type: canonical
     consumers: all
+  # The Codex-side wiring for the two hooks above (#1080). Claude Code reads
+  # its hook config from .claude/settings.json; Codex reads .codex/hooks.json.
+  # Without this file a Codex session runs entirely UNGUARDED — which is not
+  # theoretical: on 2026-08-22 six of ten repos had no Codex wiring at all, and
+  # the four that had it invoked the guard through $CLAUDE_PROJECT_DIR, a
+  # variable Codex does not set, so the path resolved to /scripts/hooks/... and
+  # bash exited 127. A non-2 exit is not a block, so the guard failed OPEN and a
+  # CI service account posted approvals on nathanpaynedotcom#668.
+  #
+  # Canonical because the failure is invisible per-repo: nothing reports a hook
+  # that cannot find its script. Propagating it makes the wiring one reviewed
+  # artifact instead of ten hand-made ones.
+  #
+  # Propagation needs no consumer-side .gitignore change, measured rather than
+  # assumed: the exclusion that hid this file is a MACHINE-global
+  # core.excludesfile, which CI does not have, and no consumer's repo
+  # .gitignore carries a `.codex/` rule. The hub carries a re-include stanza
+  # only because the first commit of this path had to be made from a machine
+  # where that global exclusion was active.
+  #
+  # One local papercut is worth knowing on such a machine, because git's
+  # behaviour here is not the obvious one. Once the file is TRACKED it stops
+  # being reported as ignored and its edits do show in `git status` -- but
+  # `git add -- .codex/hooks.json` still FAILS, because the excluded thing is
+  # the DIRECTORY. `git add -A` and `git commit -a` both stage it fine; a
+  # path-scoped add needs `-f` or the same re-include stanza.
+  - path: .codex/hooks.json
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/hooks/gh-pr-guard.sh"          # the file names it; a missing guard makes it exit 2
+      - "scripts/hooks/label-removal-guard.sh"  # same
 
   # Canonical tests — the suites that exercise the canonical
   # scripts/hooks above. These MUST travel with the scripts they

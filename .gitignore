@@ -54,3 +54,24 @@ test-results/
 # Misc
 tmp/
 .cache/
+
+# Codex CLI per-repo config (#1080)
+#
+# `.codex/` is commonly excluded machine-globally as "Codex CLI state" — this
+# machine's ~/.gitignore_global does exactly that. The premise is wrong: real
+# Codex state lives in ~/.codex (global-state json, migrations, tmp). What sits
+# in the REPO's .codex/ is hooks.json, which wires the PreToolUse guards that
+# force agent `gh` writes through the identity-verifying wrappers.
+#
+# Leaving that untracked made the guard machine-local: invisible to CI and to
+# propagation, absent on a fresh clone, and free to drift per machine. It did
+# drift — every copy invoked the guard through $CLAUDE_PROJECT_DIR, which Codex
+# does not set, so the guard failed open (nathanpaynedotcom#668).
+#
+# The three lines are all required, in this order. A bare `!.codex/hooks.json`
+# does not work: git never descends into an excluded DIRECTORY, so the negation
+# is never consulted. Re-include the directory, re-exclude its contents, then
+# re-include the one tracked file.
+!.codex/
+.codex/*
+!.codex/hooks.json

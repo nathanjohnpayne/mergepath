@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'r=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}\"; g=\"$r/scripts/hooks/gh-pr-guard.sh\"; [ -r \"$g\" ] || { echo \"BLOCKED: gh-pr-guard.sh not resolvable (root=${r:-unset}); refusing the tool call.\" >&2; exit 2; }; exec bash \"$g\"'",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash -c 'r=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}\"; g=\"$r/scripts/hooks/label-removal-guard.sh\"; [ -r \"$g\" ] || { echo \"BLOCKED: label-removal-guard.sh not resolvable (root=${r:-unset}); refusing the tool call.\" >&2; exit 2; }; exec bash \"$g\"'",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
