@@ -70,7 +70,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../scripts/lib/repo-lint-check-selection.sh
 source "$ROOT/scripts/lib/repo-lint-check-selection.sh"
 
-for tool in yq node ruby rsync git python3; do
+for tool in yq node ruby rsync git python3 jq; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "SKIP: $tool not available" >&2
     exit 0
@@ -168,6 +168,11 @@ CONSUMER_ABSENT=(
   # not in the manifest, so consumers do not have them.
   "tests/test_ci_scripts_wired.sh"
   "tests/test_repo_lint_consumer_safety.sh"
+  # Same rationale as the line above, and its omission is why this net
+  # passed on the hub while check_repo_lint_optimization hard-failed on a
+  # real consumer (#1068): the fixture kept the file, so the wrapper found
+  # it present and the assertions that read it never fired. #1069.
+  "tests/test_consumer_residue_safety.sh"
 )
 
 # Hub-only STALE RESIDUE: excluded from the template mirror NOW, but still
@@ -191,6 +196,57 @@ CONSUMER_RESIDUE_PRESENT=(
   "tests/test_audit_branch_protection.sh"
 )
 
+# Hub-only content FROZEN AT BOOTSTRAP: the path is PRESENT on every
+# consumer, but it is not a manifest entry, so it was seeded once by the
+# template mirror and has never received a hub update. Neither existing
+# list can express this — CONSUMER_ABSENT models "missing" and
+# CONSUMER_RESIDUE_PRESENT models "a hub-only file an old bootstrap left
+# behind", and this is neither: the file is present, expected, and simply
+# stale.
+#
+# It is the class that produced the second half of #1068.
+# check_git_identity_hygiene cases 26b/26c assert hub-CURRENT policy prose
+# against $ROOT/REVIEW_POLICY.md; gaycruisebingo carries a 1181-line
+# snapshot from its 2026-07-07 bootstrap, so three of those four assertions
+# failed on the consumer and the fourth — a negative assertion — passed
+# VACUOUSLY, which is the more dangerous half. A presence test cannot see
+# any of it, because the file is there.
+#
+# The fixture models the PROPERTY (present, parseable, but not carrying the
+# hub's current content), not one consumer's exact bytes: the net is
+# hermetic and cannot fetch live consumers, and pinning real bytes would
+# rot on the next edit. Each stub stays structurally valid so a check that
+# parses the file fails on its ASSERTIONS rather than on a parse error,
+# which would be a different bug than the one being modelled.
+CONSUMER_FROZEN_CONTENT=(
+  "REVIEW_POLICY.md"
+  ".github/workflows/md-prose-wrap.yml"
+)
+
+# Mutual exclusivity with BOTH other lists. The comment previously claimed
+# "absent or residue" while the loop only walked CONSUMER_ABSENT; a path in
+# both frozen and residue would then pass silently, and because the
+# frozen rewrite leaves the file present the later residue guard would pass
+# too — so the modelled state would depend on which transformation ran last.
+for frozen in "${CONSUMER_FROZEN_CONTENT[@]}"; do
+  for pat in "${CONSUMER_ABSENT[@]}"; do
+    if [ "$frozen" = "$pat" ]; then
+      echo "FATAL: '$frozen' is in BOTH CONSUMER_FROZEN_CONTENT and CONSUMER_ABSENT." >&2
+      echo "       A path cannot be simultaneously missing and present-but-stale." >&2
+      exit 1
+    fi
+  done
+  for res in "${CONSUMER_RESIDUE_PRESENT[@]}"; do
+    if [ "$frozen" = "$res" ]; then
+      echo "FATAL: '$frozen' is in BOTH CONSUMER_FROZEN_CONTENT and CONSUMER_RESIDUE_PRESENT." >&2
+      echo "       Those model different things: residue is a HUB-ONLY file an old" >&2
+      echo "       bootstrap left behind, frozen is a NON-MANIFEST file every" >&2
+      echo "       consumer has at bootstrap-era content. Pick one." >&2
+      exit 1
+    fi
+  done
+done
+
 for pat in "${CONSUMER_ABSENT[@]}"; do
   # Expand the glob inside the fixture; nullglob-style via compgen.
   while IFS= read -r hit; do
@@ -199,6 +255,189 @@ for pat in "${CONSUMER_ABSENT[@]}"; do
   done <<EOF
 $(compgen -G "$FIX/$pat" || true)
 EOF
+done
+
+# Apply the frozen-content model. The path must already exist in the hub
+# tree — if it does not, the entry is stale and the fixture would silently
+# model nothing, so fail loudly instead.
+# A frozen entry is only meaningful while the manifest does NOT deliver the
+# path. The moment one is added to .mergepath-sync.yml as a canonical entry
+# or lands inside a kit directory, consumers receive its CURRENT contents and
+# this model describes a consumer state that no longer exists — silently, and
+# in the direction of validating marker guards that are no longer needed.
+# Derive the closure from the manifest rather than restating it.
+# BOTH .path and .dest: templated entries carry source/dest instead of path,
+# so a .path-only extractor (with a null-drop that silently discards exactly
+# those entries) would let a frozen path delivered as a templated dest slip
+# through and model a consumer state that no longer exists.
+#
+# Only FLEET-WIDE entries retire a frozen fixture. The manifest supports
+# consumer-scoped delivery (`consumers:` as a list rather than `all`), and
+# two entries already use it. A frozen path added to such an entry is still
+# frozen on every NON-enrolled consumer, so fataling there would force the
+# fixture out while the consumers it models still need the coverage. Scoped
+# entries are reported and allowed; the frozen state retires only once the
+# modeled population is fully covered.
+# Effective delivery is resolved PER FROZEN PATH by unioning every covering
+# manifest entry -- the exact destination AND any containing kit directory.
+#
+# Grouping on the literal destination alone repeats the first-match bug that
+# #467 already fixed in the closure check: tests/test_check_sync_manifest.sh
+# Case 20 documents that coverage is UNIONED across every covering entry,
+# because a path can be delivered to complementary consumer sets by a narrow
+# exact entry and a broad kit at the same time. Taking either in isolation
+# understates coverage and preserves a stale stub that every consumer has
+# already moved past.
+#
+# `(.dest // .path)` is the DELIVERED path, matching how
+# scripts/sync-to-downstream.sh resolves it; emitting both fields would treat
+# a templated entry's SOURCE as consumer-delivered, which it never is.
+frozen_manifest_json=$(yq -o=json '.' "$ROOT/.mergepath-sync.yml" 2>/dev/null)
+if [ -z "$frozen_manifest_json" ]; then
+  echo "FATAL: could not read .mergepath-sync.yml as JSON." >&2
+  echo "       CONSUMER_FROZEN_CONTENT cannot be validated against effective" >&2
+  echo "       delivery, and an entry the manifest now delivers would model a" >&2
+  echo "       consumer state that does not exist. Failing closed." >&2
+  exit 1
+fi
+
+# "fleetwide" | "partial" | "none" for one path.
+#
+# Containment is decided by `.type == "kit"` with the destination normalized,
+# NOT by a trailing slash: scripts/ci/check_sync_manifest accepts kit entries
+# spelled with or without one and appends the slash itself, so inferring
+# kit-ness from the spelling misses a validly-written entry and would let the
+# fixture overwrite content sync actually delivers.
+#
+# `consumers` is normalized because a scalar scope (`consumers: matchline`)
+# is an accepted shape -- check_sync_manifest extracts string-typed and
+# sequence-typed scopes in two passes precisely for that. Left unnormalized,
+# `.consumers[]` raises "Cannot iterate over string", and since the caller
+# reads this through a command substitution the nonzero status is invisible
+# and the empty output would fall through as "none" -- silently losing
+# coverage. The status is propagated explicitly below for the same reason.
+frozen_delivery_for() {
+  local out rc
+  out=$(printf '%s' "$frozen_manifest_json" | jq -r --arg p "$1" '
+    def scopes: if (.consumers | type) == "string"
+                then (if .consumers == "all" then "all" else [.consumers] end)
+                else .consumers end;
+    ([.consumers[].name] | unique) as $fleet
+    | [ .paths[]
+        | . as $e
+        | (($e.dest // $e.path) // "") as $d
+        | select($d != "")
+        | (if ($e.type == "kit") and ($d | endswith("/") | not) then $d + "/" else $d end) as $nd
+        | select($nd == $p or (($e.type == "kit") and ($p | startswith($nd))))
+        | {c: ($e | scopes)}
+      ] as $covering
+    | if ($covering | length) == 0 then "none"
+      elif any($covering[]; .c == "all") then "fleetwide"
+      elif (([$covering[] | select(.c != "all") | .c[]] | unique) == $fleet) then "fleetwide"
+      else "partial" end') ; rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    echo "FATAL: could not resolve effective delivery for '$1' (jq rc=$rc)." >&2
+    echo "       Refusing to model a frozen fixture on an unresolved answer." >&2
+    # `return`, never `exit`: this runs inside a command substitution, whose
+    # subshell is the only thing `exit` would end. The caller MUST check the
+    # status before branching -- see the assignment below.
+    return 1
+  fi
+  printf '%s' "$out"
+}
+for frozen in "${CONSUMER_FROZEN_CONTENT[@]}"; do
+  # Assign first and check the status. `case "$(f)" in` expands the
+  # substitution in a subshell and DISCARDS its exit status, so a helper that
+  # aborts there prints its FATAL and the parent walks straight on into the
+  # default branch -- a false pass wearing an error message.
+  frozen_delivery=""
+  frozen_delivery_rc=0
+  frozen_delivery=$(frozen_delivery_for "$frozen") || frozen_delivery_rc=$?
+  if [ "$frozen_delivery_rc" -ne 0 ] || [ -z "$frozen_delivery" ]; then
+    echo "FATAL: effective-delivery resolution failed for '$frozen'; refusing to continue." >&2
+    exit 1
+  fi
+  case "$frozen_delivery" in
+    fleetwide)
+      echo "FATAL: frozen-content path '$frozen' is delivered to EVERY consumer" >&2
+      echo "       by the manifest (exact entry, containing kit, or the union of" >&2
+      echo "       consumer-scoped entries). Consumers receive its current" >&2
+      echo "       contents, so it is not frozen -- remove it from" >&2
+      echo "       CONSUMER_FROZEN_CONTENT." >&2
+      exit 1
+      ;;
+    partial)
+      echo "NOTE: frozen-content path '$frozen' is delivered to SOME consumers only."
+      echo "      Still frozen on every non-enrolled consumer, so the fixture stays."
+      echo "      Retire it from CONSUMER_FROZEN_CONTENT once delivery covers all consumers."
+      ;;
+  esac
+  if [ ! -f "$FIX/$frozen" ]; then
+    echo "FATAL: frozen-content path '$frozen' is not a file in the fixture." >&2
+    echo "       It is PRESENT on live consumers; if it moved or was deleted" >&2
+    echo "       upstream, update CONSUMER_FROZEN_CONTENT rather than leaving a" >&2
+    echo "       stale entry that models nothing." >&2
+    exit 1
+  fi
+  case "$frozen" in
+    *.yml|*.yaml)
+      cat > "$FIX/$frozen" <<'FROZEN_YML'
+# Bootstrap-era stand-in (tests/test_repo_lint_consumer_safety.sh).
+# Structurally valid, deliberately missing every hub-current assertion.
+name: frozen-bootstrap-stand-in
+on:
+  pull_request:
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
+FROZEN_YML
+      ;;
+    REVIEW_POLICY.md)
+      # Path-specific, because a generic stub LAUNDERS the file: an
+      # assertion that a check makes NEGATIVELY (this text must NOT be
+      # here) passes vacuously once the offending text is gone, so the
+      # fixture reports green on a consumer state that really fails.
+      # That is the same vacuous-pass this whole model exists to catch,
+      # reproduced one level up.
+      #
+      # A frozen file therefore has to carry BOTH shapes: it must LACK the
+      # hub's current prose (so required-current assertions fail) and it
+      # must STILL CARRY the obsolete text newer checks forbid (so
+      # forbidden-stale assertions fail too). check_git_identity_hygiene
+      # case 26b is exactly that pair: it rejects a runnable
+      # `git config --global` placeholder AND requires the string
+      # "verified machine setup".
+      #
+      # The placeholder below is inert fixture data, and the marker on its
+      # line is what keeps this file's own tracked bytes from tripping the
+      # static scan the placeholder is modelling.
+      cat > "$FIX/$frozen" <<'FROZEN_REVIEW_POLICY'
+# Bootstrap-era stand-in
+
+PRESENT on every consumer but not a manifest entry, so it was seeded once
+at bootstrap and never updated. It carries none of the hub's current prose
+-- in particular it omits the machine-setup phrase case 26b greps for, which
+is deliberately NOT reproduced anywhere in this file's heredoc, because
+naming it here would satisfy the very assertion the stub must fail.
+
+It also still publishes the runnable placeholder identity write that newer
+policy forbids, so the NEGATIVE half of case 26b is exercised too:
+
+    git config --global user.email you@example.com  # GIT_IDENTITY_SCOPE_EXEMPT: inert fixture stand-in, never executed
+FROZEN_REVIEW_POLICY
+      ;;
+    *)
+      cat > "$FIX/$frozen" <<'FROZEN_MD'
+# Bootstrap-era stand-in
+
+This file is PRESENT on every consumer but is not a manifest entry, so it
+was seeded once at bootstrap and never updated. It deliberately carries
+none of the hub's current prose.
+FROZEN_MD
+      ;;
+  esac
 done
 
 # Guard the residue model against a future author "tidying" a residue path
