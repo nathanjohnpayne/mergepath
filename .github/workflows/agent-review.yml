@@ -769,10 +769,36 @@ jobs:
   #      re-runs the arming logic on every push, BUT only proceeds when
   #      the `Gate: require existing non-author approval` step below
   #      confirms a valid non-author latest-state APPROVED review already
-  #      exists on the PR (`dismiss_stale_reviews` is OFF, so the
-  #      approval carries across the fix-push — see the BEHIND-PR
-  #      carryover behavior). A push with NO existing approval does NOT
-  #      arm. Every load-bearing gate (AUTHOR_MERGE_TOKEN identity,
+  #      exists on the PR. A push with NO existing approval does NOT
+  #      arm.
+  #
+  #      This comment used to justify that by asserting
+  #      `dismiss_stale_reviews` is OFF. It is not, and was not: measured
+  #      2026-08-22, the branch-protection API reports
+  #      dismiss_stale_reviews=true on ALL TEN fleet repos, with no
+  #      ruleset overriding classic protection. The step is nonetheless
+  #      correct, for a different reason than the old note claimed --
+  #      which is why the note is corrected rather than the code.
+  #
+  #      What actually makes it safe: the step never trusts the setting.
+  #      It re-reads the reviews API and recomputes the latest opinionated
+  #      state per registered non-author reviewer, so it observes whatever
+  #      the configuration produced instead of assuming it. If a push DID
+  #      dismiss the approval, the latest state is DISMISSED, no approver
+  #      is found, and the re-arm correctly does not fire -- a dismissed
+  #      approval means the PR is no longer approved. If the approval
+  #      survived, it re-arms. Both branches are right, under either
+  #      setting.
+  #
+  #      The carryover this path actually serves is `update-branch`, not
+  #      the ordinary fix-push. GitHub does not dismiss on an
+  #      update-branch merge and re-anchors the surviving review to the
+  #      new head: on #1080 the nathanpayne-codex APPROVED moved from
+  #      c0ee461 to a738d223 and stayed APPROVED. Sampling the last 25
+  #      merged hub PRs, every review_dismissed event was agent-initiated
+  #      (actor=nathanpayne-claude), not an automatic stale dismissal.
+  #
+  #      Do not "restore" a dependence on dismiss_stale_reviews here. Every load-bearing gate (AUTHOR_MERGE_TOKEN identity,
   #      blocking-label re-verify, required checks) re-applies on the NEW HEAD,
   #      and `gh pr merge --auto` is idempotent when --auto is already
   #      enabled.
