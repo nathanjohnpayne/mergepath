@@ -30,8 +30,11 @@ run_bounded() {  # <seconds> <cmd...>
     perl -e 'my $s=shift; my $p=fork; if(!$p){exec @ARGV or exit 127} local $SIG{ALRM}=sub{kill 9,$p; waitpid $p,0; exit 124}; alarm $s; waitpid $p,0; my $rc=$?>>8; alarm 0; exit $rc' "$secs" "$@"
     return $?
   fi
-  WATCHDOG_UNAVAILABLE=1
-  return 0
+  # 125 is the sentinel for "no watchdog available". Setting a variable would
+  # be lost whenever run_bounded runs inside a subshell -- which is how the
+  # caller below invokes it -- so the parent would read the fallback's success
+  # as a real result and FAIL instead of skipping (#1084 r4).
+  return 125
 }
 
 pass() { PASS=$((PASS+1)); echo "PASS: $*"; }
@@ -116,10 +119,9 @@ CLS_POLICY_FIXTURE=complex-changes case_is "an inspecting policy still skips on 
 
 echo "--- #1084 r1: a flag with a missing value must not loop forever ---"
 d=$(scratch "$ON" 0)
-WATCHDOG_UNAVAILABLE=0
 ( cd "$d" && run_bounded 5 ./scripts/coderabbit-should-invoke.sh 99 --repo >/dev/null 2>&1 )
 rc=$?
-if [ "${WATCHDOG_UNAVAILABLE:-0}" = 1 ]; then
+if [ "$rc" = 125 ]; then
   echo "SKIP: no timeout/gtimeout/perl available — cannot bound the hang check"
 elif [ "$rc" = 3 ]; then pass "--repo with no value is rc=3 (no infinite loop)"
 elif [ "$rc" = 124 ]; then fail "--repo with no value HUNG (shift 2 failed and the loop re-read it)"
@@ -161,6 +163,36 @@ ln -sf "$_d/scripts/coderabbit-should-invoke.sh" "$WORKDIR/via-link.sh"
 ( cd / && "$WORKDIR/via-link.sh" 99 >/dev/null 2>&1 )
 [ $? = 1 ] && pass "explicit never honoured when invoked through a symlink" \
              || fail "symlink invocation lost the config and did not skip"
+
+echo "--- #1084 r4: a quoted scalar must own the whole value ---"
+# Printing only the text before the closing quote turned `invoke: "never" junk`
+# into a VALID mode and suppressed review. Only whitespace or a comment may
+# follow the closing quote; anything else is unparseable and must invoke.
+case_is 'trailing junk after a quoted scalar invokes' "$ON"$'\n''  invoke: "never" trailing-junk' 0 0
+case_is 'clean quoted scalar still parses'            "$ON"$'\n''  invoke: "never"'               0 1
+case_is 'comment after a quoted scalar still parses'  "$ON"$'\n''  invoke: "never"   # ok'        0 1
+
+echo "--- #1084 r4: --json requires jq and must say so ---"
+_d=$(scratch "$ON" 0)
+_shim=$(mktemp -d "$WORKDIR/shim.XXXXXX")
+for _t in bash awk sed grep env readlink; do
+  _r=$(command -v "$_t" 2>/dev/null) && ln -sf "$_r" "$_shim/$_t"
+done
+( cd "$_d" && env PATH="$_shim" bash ./scripts/coderabbit-should-invoke.sh 99 --json >/dev/null 2>&1 )
+[ $? = 3 ] && pass "--json without jq exits 3 instead of returning an empty success" \
+             || fail "--json without jq did not exit 3"
+( cd "$_d" && env PATH="$_shim" bash ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
+[ $? = 0 ] && pass "the non-json path still works without jq" \
+             || fail "the non-json path broke without jq"
+
+echo "--- #1084 r4: the watchdog reports unavailability by exit status ---"
+# A variable set inside run_bounded is lost when the caller wraps it in a
+# subshell, so the parent would read the fallback as a real result.
+if run_bounded 1 true >/dev/null 2>&1; then
+  pass "run_bounded returns the command status when a watchdog exists"
+else
+  [ $? = 125 ] && pass "run_bounded signals unavailability with 125" || fail "run_bounded returned an unexpected status"
+fi
 
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"

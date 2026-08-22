@@ -1122,6 +1122,7 @@
     postClearanceWait: 240,
     codex: true,
     codexRounds: 10,
+    coderabbitInvoke: 'complex-changes',
     // Request `@codex review` on every PR, not only above-threshold ones
     // (#486). Mirrors codex.request_by_default in review-policy.yml; the
     // owner-decided default is on (#483).
@@ -1136,9 +1137,9 @@
   };
 
   const PRESETS = {
-    strict:   { threshold: 100, coderabbit: true,  postClearanceWait: 240, codex: true,  codexRounds: 12, codexRequestByDefault: true,  feedbackMode: 'address-all', feedbackPriorities: { p0: true, p1: true, p2: true,  p3: true  } },
-    standard: { threshold: 300, coderabbit: true,  postClearanceWait: 240, codex: true,  codexRounds: 10, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
-    loose:    { threshold: 800, coderabbit: false, postClearanceWait: 240, codex: false, codexRounds: 5, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: false, p2: false, p3: false } },
+    strict:   { threshold: 100, coderabbit: true,  coderabbitInvoke: 'always',          postClearanceWait: 240, codex: true,  codexRounds: 12, codexRequestByDefault: true,  feedbackMode: 'address-all', feedbackPriorities: { p0: true, p1: true, p2: true,  p3: true  } },
+    standard: { threshold: 300, coderabbit: true,  coderabbitInvoke: 'complex-changes', postClearanceWait: 240, codex: true,  codexRounds: 10, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
+    loose:    { threshold: 800, coderabbit: false, coderabbitInvoke: 'never',           postClearanceWait: 240, codex: false, codexRounds: 5, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: false, p2: false, p3: false } },
   };
 
   const LIMITS = {
@@ -1421,6 +1422,16 @@
     yaml.appendChild(document.createTextNode('  '));
     add('k', 'post_clearance_max_wait_seconds'); yaml.appendChild(document.createTextNode(': '));
     add('v', String(state.postClearanceWait)); nl();
+    // Phase 2.5 invocation mode (#1084). Omitting it made a generated policy
+    // fall back to the documented absent-key default of `always`, silently
+    // replacing the repo's `complex-changes` setting with a wait on every PR.
+    // Emitted AFTER severity_gate for the same reason post_clearance is: the
+    // YAML-preview test asserts the enabled -> severity_gate adjacency. Order
+    // is safe because the reader in coderabbit-should-invoke.sh is depth-
+    // scoped (#1084 r3) rather than name-matching at any nesting.
+    yaml.appendChild(document.createTextNode('  '));
+    add('k', 'invoke'); yaml.appendChild(document.createTextNode(': '));
+    add('v', String(state.coderabbitInvoke)); nl();
     add('k', 'codex'); yaml.appendChild(document.createTextNode(':')); nl();
     yaml.appendChild(document.createTextNode('  '));
     add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));

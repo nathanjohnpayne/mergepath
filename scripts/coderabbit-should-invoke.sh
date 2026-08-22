@@ -103,6 +103,15 @@ done
 # Leading digit 1-9: `0` is not a PR number, and accepting it sent callers to
 # the wait/API path for a PR that cannot exist (#1084 r3). Matches the
 # constraint phase-4b-classifier.sh already applies.
+# --json is assembled with jq. Without it, `emit` would fail while the script
+# carries on and exits with the DECISION code -- for `always` that is exit 0
+# with empty stdout, so a machine caller reads success and gets no document
+# (#1084 r4). Check the dependency before any decision path can be taken.
+if [ "$JSON" = true ] && ! command -v jq >/dev/null 2>&1; then
+  echo "Error: --json requires jq, which is not on PATH" >&2
+  exit 3
+fi
+
 if ! [[ "$PR_NUM" =~ ^[1-9][0-9]*$ ]]; then
   echo "Error: PR# must be a positive integer; got '${PR_NUM:-}'" >&2
   exit 3
@@ -140,7 +149,18 @@ coderabbit_field() {  # <field>
         q = substr($0, 1, 1)
         rest = substr($0, 2)
         idx = index(rest, q)
-        if (idx > 0) { print substr(rest, 1, idx - 1); exit }
+        if (idx > 0) {
+          after = substr(rest, idx + 1)
+          # Only whitespace or a comment may follow the closing quote. Printing
+          # just the quoted part of `invoke: "never" trailing-junk` turned a
+          # malformed line into a VALID mode and suppressed review (#1084 r4).
+          # Emitting the raw line instead fails the exact-literal match, which
+          # routes to invoke -- the direction the contract requires.
+          if (after ~ /^[[:space:]]*$/ || after ~ /^[[:space:]]*#/) {
+            print substr(rest, 1, idx - 1); exit
+          }
+          print $0; exit
+        }
         print rest; exit
       }
       sub(/[[:space:]]+#.*$/, "", $0)
@@ -202,13 +222,31 @@ if [ ! -x "$CLASSIFIER" ]; then
   emit invoke "phase-4b-classifier.sh missing or not executable — cannot assess complexity, defaulting to invoke"
 fi
 
+# --detect-only makes the classifier run its trigger detectors regardless of
+# phase_4b_default (#1084 r4). Without it, a repo on `fallback-only` or
+# `always` got a policy answer instead of a complexity answer, and the safe
+# reading of that -- invoke -- meant `complex-changes` could never actually
+# skip on those repos. Selectivity now works independently of the 4b mode,
+# which is what the knob advertises.
 set +e
 if [ -n "$REPO" ]; then
-  CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --repo "$REPO" 2>&1)
+  CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --detect-only --repo "$REPO" 2>&1)
 else
-  CLS_OUT=$("$CLASSIFIER" "$PR_NUM" 2>&1)
+  CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --detect-only 2>&1)
 fi
 CLS_RC=$?
+# An older classifier on a not-yet-synced consumer does not know the flag and
+# exits 3 (bad arguments). Retry without it rather than turning a propagation
+# lag into a permanent invoke-everything; the files_inspected guard below still
+# catches the short-circuits in that degraded mode.
+if [ "$CLS_RC" = 3 ]; then
+  if [ -n "$REPO" ]; then
+    CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --repo "$REPO" 2>&1)
+  else
+    CLS_OUT=$("$CLASSIFIER" "$PR_NUM" 2>&1)
+  fi
+  CLS_RC=$?
+fi
 set -e
 
 # The classifier is a DISPOSITION function, not purely a complexity detector,

@@ -70,6 +70,7 @@ fi
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
+DETECT_ONLY=false
 PR_NUM=""
 REPO=""
 FIXTURE=""
@@ -98,6 +99,15 @@ while [ $# -gt 0 ]; do
         echo "Error: --repo requires a non-empty value (owner/name)" >&2; usage
       fi
       REPO="$2"; shift 2 ;;
+    --detect-only)
+      # Run the trigger detectors regardless of phase_4b_default (#1084 r4).
+      # The two policy short-circuits below exist to answer "should 4b run",
+      # which is a DISPOSITION question. A caller asking the different question
+      # "is this diff complex" -- scripts/coderabbit-should-invoke.sh does --
+      # gets no answer from them: fallback-only exits 0 without looking, always
+      # exits 1 without looking. This flag suppresses both so the detectors
+      # actually run. It does not change the exit-code contract.
+      DETECT_ONLY=true; shift ;;
     --fixture)
       if [ $# -lt 2 ] || [ -z "$2" ]; then
         echo "Error: --fixture requires a non-empty value (path)" >&2; usage
@@ -190,12 +200,12 @@ emit_json() {
       files_inspected: $files_inspected}'
 }
 
-if [ "$PHASE_4B_DEFAULT" = "fallback-only" ]; then
+if [ "$DETECT_ONLY" != "true" ] && [ "$PHASE_4B_DEFAULT" = "fallback-only" ]; then
   emit_json false '[]' "fallback-only" "policy is fallback-only; classifier short-circuits without inspecting diff" 0
   exit 0
 fi
 
-if [ "$PHASE_4B_DEFAULT" = "always" ]; then
+if [ "$DETECT_ONLY" != "true" ] && [ "$PHASE_4B_DEFAULT" = "always" ]; then
   emit_json true '[]' "invoke-4b" "policy is always; 4b handoff is required for every threshold-PR regardless of trigger match" 0
   exit 1
 fi
