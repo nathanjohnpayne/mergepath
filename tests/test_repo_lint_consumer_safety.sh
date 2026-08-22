@@ -270,7 +270,19 @@ done
 # so a .path-only extractor (with a null-drop that silently discards exactly
 # those entries) would let a frozen path delivered as a templated dest slip
 # through and model a consumer state that no longer exists.
-frozen_manifest_paths=$(yq -r '.paths[] | (.path, .dest) | select(. != null)' "$ROOT/.mergepath-sync.yml" 2>/dev/null || true)
+#
+# Only FLEET-WIDE entries retire a frozen fixture. The manifest supports
+# consumer-scoped delivery (`consumers:` as a list rather than `all`), and
+# two entries already use it. A frozen path added to such an entry is still
+# frozen on every NON-enrolled consumer, so fataling there would force the
+# fixture out while the consumers it models still need the coverage. Scoped
+# entries are reported and allowed; the frozen state retires only once the
+# modeled population is fully covered.
+frozen_manifest_paths=$(yq -r '.paths[] | select((.consumers // "all") == "all") | (.path, .dest) | select(. != null)' "$ROOT/.mergepath-sync.yml" 2>/dev/null || true)
+# sort -u: one entry contributes both .path and .dest, and eslint.config.js
+# is the dest of two entries, so an undeduped list reports the same path
+# several times.
+frozen_scoped_paths=$(yq -r '.paths[] | select((.consumers // "all") != "all") | (.path, .dest) | select(. != null)' "$ROOT/.mergepath-sync.yml" 2>/dev/null | sort -u || true)
 if [ -z "$frozen_manifest_paths" ]; then
   echo "FATAL: could not read paths[] from .mergepath-sync.yml." >&2
   echo "       CONSUMER_FROZEN_CONTENT cannot be validated against the delivery" >&2
@@ -302,6 +314,16 @@ for frozen in "${CONSUMER_FROZEN_CONTENT[@]}"; do
         ;;
     esac
   done <<< "$frozen_manifest_paths"
+  while IFS= read -r sp; do
+    [ -z "$sp" ] && continue
+    if [ "$frozen" = "$sp" ]; then
+      echo "NOTE: frozen-content path '$frozen' is delivered by a CONSUMER-SCOPED manifest entry."
+      echo "      Still frozen on every non-enrolled consumer, so the fixture stays."
+      echo "      Retire it from CONSUMER_FROZEN_CONTENT once delivery covers all consumers."
+    fi
+  done <<EOF
+$frozen_scoped_paths
+EOF
   if [ ! -f "$FIX/$frozen" ]; then
     echo "FATAL: frozen-content path '$frozen' is not a file in the fixture." >&2
     echo "       It is PRESENT on live consumers; if it moved or was deleted" >&2
