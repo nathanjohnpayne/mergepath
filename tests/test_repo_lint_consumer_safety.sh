@@ -223,14 +223,25 @@ CONSUMER_FROZEN_CONTENT=(
   ".github/workflows/md-prose-wrap.yml"
 )
 
-# Mutual exclusivity with the other two lists, mirroring the residue guard
-# below: a frozen path that also appears as absent or residue would model
-# two contradictory consumer states at once.
+# Mutual exclusivity with BOTH other lists. The comment previously claimed
+# "absent or residue" while the loop only walked CONSUMER_ABSENT; a path in
+# both frozen and residue would then pass silently, and because the
+# frozen rewrite leaves the file present the later residue guard would pass
+# too — so the modelled state would depend on which transformation ran last.
 for frozen in "${CONSUMER_FROZEN_CONTENT[@]}"; do
   for pat in "${CONSUMER_ABSENT[@]}"; do
     if [ "$frozen" = "$pat" ]; then
       echo "FATAL: '$frozen' is in BOTH CONSUMER_FROZEN_CONTENT and CONSUMER_ABSENT." >&2
       echo "       A path cannot be simultaneously missing and present-but-stale." >&2
+      exit 1
+    fi
+  done
+  for res in "${CONSUMER_RESIDUE_PRESENT[@]}"; do
+    if [ "$frozen" = "$res" ]; then
+      echo "FATAL: '$frozen' is in BOTH CONSUMER_FROZEN_CONTENT and CONSUMER_RESIDUE_PRESENT." >&2
+      echo "       Those model different things: residue is a HUB-ONLY file an old" >&2
+      echo "       bootstrap left behind, frozen is a NON-MANIFEST file every" >&2
+      echo "       consumer has at bootstrap-era content. Pick one." >&2
       exit 1
     fi
   done
@@ -249,7 +260,44 @@ done
 # Apply the frozen-content model. The path must already exist in the hub
 # tree — if it does not, the entry is stale and the fixture would silently
 # model nothing, so fail loudly instead.
+# A frozen entry is only meaningful while the manifest does NOT deliver the
+# path. The moment one is added to .mergepath-sync.yml as a canonical entry
+# or lands inside a kit directory, consumers receive its CURRENT contents and
+# this model describes a consumer state that no longer exists — silently, and
+# in the direction of validating marker guards that are no longer needed.
+# Derive the closure from the manifest rather than restating it.
+frozen_manifest_paths=$(yq -r '.paths[] | (.path // .)' "$ROOT/.mergepath-sync.yml" 2>/dev/null | sed '/^null$/d' || true)
+if [ -z "$frozen_manifest_paths" ]; then
+  echo "FATAL: could not read paths[] from .mergepath-sync.yml." >&2
+  echo "       CONSUMER_FROZEN_CONTENT cannot be validated against the delivery" >&2
+  echo "       closure, and an entry the manifest now delivers would model a" >&2
+  echo "       consumer state that does not exist. Failing closed." >&2
+  exit 1
+fi
 for frozen in "${CONSUMER_FROZEN_CONTENT[@]}"; do
+  while IFS= read -r mp; do
+    [ -z "$mp" ] && continue
+    case "$mp" in
+      */)
+        case "$frozen" in
+          "$mp"*)
+            echo "FATAL: frozen-content path '$frozen' is delivered by the manifest" >&2
+            echo "       via kit entry '$mp'. Consumers receive its current contents," >&2
+            echo "       so it is not frozen — remove it from CONSUMER_FROZEN_CONTENT." >&2
+            exit 1
+            ;;
+        esac
+        ;;
+      *)
+        if [ "$frozen" = "$mp" ]; then
+          echo "FATAL: frozen-content path '$frozen' is a manifest paths[] entry." >&2
+          echo "       Consumers receive its current contents, so it is not frozen —" >&2
+          echo "       remove it from CONSUMER_FROZEN_CONTENT." >&2
+          exit 1
+        fi
+        ;;
+    esac
+  done <<< "$frozen_manifest_paths"
   if [ ! -f "$FIX/$frozen" ]; then
     echo "FATAL: frozen-content path '$frozen' is not a file in the fixture." >&2
     echo "       It is PRESENT on live consumers; if it moved or was deleted" >&2
@@ -272,14 +320,46 @@ jobs:
       - run: 'true'
 FROZEN_YML
       ;;
+    REVIEW_POLICY.md)
+      # Path-specific, because a generic stub LAUNDERS the file: an
+      # assertion that a check makes NEGATIVELY (this text must NOT be
+      # here) passes vacuously once the offending text is gone, so the
+      # fixture reports green on a consumer state that really fails.
+      # That is the same vacuous-pass this whole model exists to catch,
+      # reproduced one level up.
+      #
+      # A frozen file therefore has to carry BOTH shapes: it must LACK the
+      # hub's current prose (so required-current assertions fail) and it
+      # must STILL CARRY the obsolete text newer checks forbid (so
+      # forbidden-stale assertions fail too). check_git_identity_hygiene
+      # case 26b is exactly that pair: it rejects a runnable
+      # `git config --global` placeholder AND requires the string
+      # "verified machine setup".
+      #
+      # The placeholder below is inert fixture data, and the marker on its
+      # line is what keeps this file's own tracked bytes from tripping the
+      # static scan the placeholder is modelling.
+      cat > "$FIX/$frozen" <<'FROZEN_REVIEW_POLICY'
+# Bootstrap-era stand-in
+
+PRESENT on every consumer but not a manifest entry, so it was seeded once
+at bootstrap and never updated. It carries none of the hub's current prose
+-- notably not "verified machine setup" -- so required-current assertions
+fail here exactly as they do on a real consumer.
+
+It also still publishes the runnable placeholder identity write that newer
+policy forbids, so the NEGATIVE half of case 26b is exercised too:
+
+    git config --global user.email you@example.com  # GIT_IDENTITY_SCOPE_EXEMPT: inert fixture stand-in, never executed
+FROZEN_REVIEW_POLICY
+      ;;
     *)
       cat > "$FIX/$frozen" <<'FROZEN_MD'
 # Bootstrap-era stand-in
 
 This file is PRESENT on every consumer but is not a manifest entry, so it
 was seeded once at bootstrap and never updated. It deliberately carries
-none of the hub's current prose, which is exactly the consumer state that
-made check_git_identity_hygiene cases 26b/26c fail on gaycruisebingo.
+none of the hub's current prose.
 FROZEN_MD
       ;;
   esac
