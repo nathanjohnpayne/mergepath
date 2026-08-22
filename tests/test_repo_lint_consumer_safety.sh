@@ -338,12 +338,26 @@ frozen_delivery_for() {
   if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
     echo "FATAL: could not resolve effective delivery for '$1' (jq rc=$rc)." >&2
     echo "       Refusing to model a frozen fixture on an unresolved answer." >&2
-    exit 1
+    # `return`, never `exit`: this runs inside a command substitution, whose
+    # subshell is the only thing `exit` would end. The caller MUST check the
+    # status before branching -- see the assignment below.
+    return 1
   fi
   printf '%s' "$out"
 }
 for frozen in "${CONSUMER_FROZEN_CONTENT[@]}"; do
-  case "$(frozen_delivery_for "$frozen")" in
+  # Assign first and check the status. `case "$(f)" in` expands the
+  # substitution in a subshell and DISCARDS its exit status, so a helper that
+  # aborts there prints its FATAL and the parent walks straight on into the
+  # default branch -- a false pass wearing an error message.
+  frozen_delivery=""
+  frozen_delivery_rc=0
+  frozen_delivery=$(frozen_delivery_for "$frozen") || frozen_delivery_rc=$?
+  if [ "$frozen_delivery_rc" -ne 0 ] || [ -z "$frozen_delivery" ]; then
+    echo "FATAL: effective-delivery resolution failed for '$frozen'; refusing to continue." >&2
+    exit 1
+  fi
+  case "$frozen_delivery" in
     fleetwide)
       echo "FATAL: frozen-content path '$frozen' is delivered to EVERY consumer" >&2
       echo "       by the manifest (exact entry, containing kit, or the union of" >&2
