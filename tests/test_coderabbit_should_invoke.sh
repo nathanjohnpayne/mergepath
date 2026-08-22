@@ -17,6 +17,23 @@ PASS=0; FAIL=0
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/cri-test.XXXXXX")
 trap 'rm -rf "$WORKDIR"' EXIT
 
+# Portable watchdog. `timeout` is GNU coreutils and is NOT on a stock macOS
+# box, where it exits 127 and would fail this suite for the wrong reason
+# (#1084 r3). This is a PROPAGATED self-test, so it has to run wherever a
+# consumer runs it. Same selection strategy as
+# tests/test_phase_4b_accounting.sh:1254-1283.
+run_bounded() {  # <seconds> <cmd...>
+  local secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return $?; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"; return $?; fi
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'my $s=shift; my $p=fork; if(!$p){exec @ARGV or exit 127} local $SIG{ALRM}=sub{kill 9,$p; waitpid $p,0; exit 124}; alarm $s; waitpid $p,0; my $rc=$?>>8; alarm 0; exit $rc' "$secs" "$@"
+    return $?
+  fi
+  WATCHDOG_UNAVAILABLE=1
+  return 0
+}
+
 pass() { PASS=$((PASS+1)); echo "PASS: $*"; }
 fail() { FAIL=$((FAIL+1)); echo "FAIL: $*" >&2; }
 
@@ -99,9 +116,12 @@ CLS_POLICY_FIXTURE=complex-changes case_is "an inspecting policy still skips on 
 
 echo "--- #1084 r1: a flag with a missing value must not loop forever ---"
 d=$(scratch "$ON" 0)
-( cd "$d" && timeout 5 ./scripts/coderabbit-should-invoke.sh 99 --repo >/dev/null 2>&1 )
+WATCHDOG_UNAVAILABLE=0
+( cd "$d" && run_bounded 5 ./scripts/coderabbit-should-invoke.sh 99 --repo >/dev/null 2>&1 )
 rc=$?
-if [ "$rc" = 3 ]; then pass "--repo with no value is rc=3 (no infinite loop)"
+if [ "${WATCHDOG_UNAVAILABLE:-0}" = 1 ]; then
+  echo "SKIP: no timeout/gtimeout/perl available — cannot bound the hang check"
+elif [ "$rc" = 3 ]; then pass "--repo with no value is rc=3 (no infinite loop)"
 elif [ "$rc" = 124 ]; then fail "--repo with no value HUNG (shift 2 failed and the loop re-read it)"
 else fail "--repo with no value: expected rc=3, got rc=$rc"; fi
 

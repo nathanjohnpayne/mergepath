@@ -100,7 +100,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if ! [[ "$PR_NUM" =~ ^[0-9]+$ ]]; then
+# Leading digit 1-9: `0` is not a PR number, and accepting it sent callers to
+# the wait/API path for a PR that cannot exist (#1084 r3). Matches the
+# constraint phase-4b-classifier.sh already applies.
+if ! [[ "$PR_NUM" =~ ^[1-9][0-9]*$ ]]; then
   echo "Error: PR# must be a positive integer; got '${PR_NUM:-}'" >&2
   exit 3
 fi
@@ -118,7 +121,14 @@ coderabbit_field() {  # <field>
   awk -v fld="$fld" '
     index($0, "coderabbit:") == 1 { in_block=1; next }
     in_block && /^[^[:space:]#]/ { in_block=0 }
-    in_block && $1 == fld":" {
+    # Depth matters: `severity_gate:` is a nested map that also has an
+    # `enabled:` key. Matching on the key name alone returned whichever came
+    # FIRST in the file, so merely reordering `severity_gate` above the
+    # top-level fields flipped `coderabbit.enabled` to the nested value and
+    # silently skipped Phase 2.5 -- and YAML mapping order is not semantic, so
+    # that reordering is legal (#1084 r3). Accept only direct children, which
+    # at this nesting level means exactly two leading spaces.
+    in_block && $1 == fld":" && $0 ~ /^  [^ ]/ {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
       # Quote-aware. A `#` INSIDE a quoted scalar is literal YAML content, not
       # a comment: stripping it unconditionally turned `invoke: "never # tmp"`
