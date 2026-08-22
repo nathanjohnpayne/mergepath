@@ -754,12 +754,18 @@ paths:
   # only because the first commit of this path had to be made from a machine
   # where that global exclusion was active.
   #
-  # One local papercut is worth knowing on such a machine, because git's
-  # behaviour here is not the obvious one. Once the file is TRACKED it stops
-  # being reported as ignored and its edits do show in `git status` -- but
-  # `git add -- .codex/hooks.json` still FAILS, because the excluded thing is
-  # the DIRECTORY. `git add -A` and `git commit -a` both stage it fine; a
-  # path-scoped add needs `-f` or the same re-include stanza.
+  # In THIS repo the stanza settles it: measured here, `git check-ignore` reports
+  # the path as not ignored and a path-scoped `git add -- .codex/hooks.json`
+  # succeeds. It behaves like any other tracked file.
+  #
+  # The papercut belongs to a repo that does NOT carry the stanza, on a machine
+  # whose global excludes hide `.codex/` -- every consumer, until it adopts one.
+  # There git's behaviour is not the obvious one: once the file is TRACKED it
+  # stops being reported as ignored and its edits DO show in `git status`, but
+  # `git add -- .codex/hooks.json` still fails, because the excluded thing is
+  # the DIRECTORY. `git add -A` and `git commit -a` stage it fine; a path-scoped
+  # add there needs `-f` or the stanza. None of this affects CI, which has no
+  # global excludes file.
   - path: .codex/hooks.json
     type: canonical
     consumers: all
