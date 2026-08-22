@@ -263,6 +263,16 @@ _mk 'coderabbit:
   enabled: true
   invoke: never' 1 'baseline single block still skips'
 
+echo "--- #1084 r10: inconsistent child indentation is a parse failure ---"
+# An over-indented suppressing field fixed child_indent deeper, so the later,
+# shallower line was silently dropped and the malformed file yielded skip.
+_mk 'coderabbit:
+    invoke: never
+  enabled: true' 0 'inconsistent child indentation invokes'
+_mk 'coderabbit:
+    enabled: true
+    invoke: never' 1 'consistent four-space indentation still skips'
+
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"
 [ "$FAIL" -gt 0 ] && exit 1

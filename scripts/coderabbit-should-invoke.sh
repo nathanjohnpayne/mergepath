@@ -179,11 +179,18 @@ coderabbit_field() {  # <field>
       # the `always` default and forced the wait it was set to avoid
       # (#1084 r8).
       if (child_indent < 0) child_indent = ind
+      # A line indented LESS than the established child depth cannot be
+      # a nested value and cannot be a sibling -- the file is malformed and a
+      # real YAML parser rejects it. Skipping it let an over-indented
+      # suppressing field win while the later, shallower line was silently
+      # dropped (#1084 r10).
+      if (ind < child_indent) { badindent++; next }
       if (ind != child_indent) next          # nested map, not a direct child
       if (keyname($0) != fld) next
       n++; last = $0
     }
     END {
+      if (badindent > 0) { print "<<ambiguous:inconsistent child indentation>>"; exit }
       if (nonmap > 0) { print "<<ambiguous:coderabbit is not a block mapping>>"; exit }
       if (blocks > 1) { print "<<ambiguous:" blocks " coderabbit blocks>>"; exit }
       if (n != 1) { if (n > 1) print "<<ambiguous:" n " duplicate " fld " keys>>"; exit }
