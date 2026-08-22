@@ -641,6 +641,19 @@ paths:
   - path: tests/test_check_doc_ownership.sh
     type: canonical
     consumers: all
+  - path: scripts/required-head-checks.sh
+    # Per-consumer required head-check list (#1070). MUST travel: the
+    # propagated agent-review.yml and dependabot-auto-merge.yml both invoke
+    # it, and scripts/workflow/approval-merge-continuation.sh calls it on
+    # every continuation re-entry, so a consumer without it would have three
+    # merge gates referencing a missing script.
+    #
+    # The script is canonical and identical everywhere; only its INPUT is
+    # per-consumer, and that input lives in the never-propagated
+    # .github/required-head-checks file so both workflows stay byte-identical
+    # and the propagation lane keeps byte-verifying them verbatim.
+    type: canonical
+    consumers: all
   - path: scripts/merge-clearance-gate.sh
     # HEAD-pinned merge-clearance gate (#427/#428). The external-review
     # path delegates to scripts/codex-review-check.sh (with CI checking
@@ -1221,6 +1234,10 @@ paths:
       - "scripts/disagreement-detector.cjs"
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/"
+      # Invoked by both merge gates in this workflow; a path-scoped sync
+      # that shipped the workflow without it would leave the gate
+      # referencing a missing script (#1070).
+      - "scripts/required-head-checks.sh"
   - path: .github/workflows/pr-review-policy.yml
     type: canonical
     consumers: all
@@ -1243,6 +1260,10 @@ paths:
     # workflow ahead of the gate it now depends on (#1000).
     requires:
       - "scripts/review-feedback-accounting.sh"
+      # Invoked by both merge gates in this workflow; a path-scoped sync
+      # that shipped the workflow without it would leave the gate
+      # referencing a missing script (#1070).
+      - "scripts/required-head-checks.sh"
   - path: .github/workflows/auto-clear-blocking-labels.yml
     type: canonical
     consumers: all

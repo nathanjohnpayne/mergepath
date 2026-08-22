@@ -1319,11 +1319,54 @@ else
 fi
 
 echo
+echo "per-consumer required head-check list (#1070)"
+# The three merge gates must share ONE implementation. Three copies is how
+# the fleet ended up with npdc's un-upstreamable local fork in the first
+# place. Assert the shared script exists, that all three call sites use it,
+# that the dependabot wait pins ONE sha across the whole set, and that the
+# resolver fails closed on an indeterminate read.
+#
+# Deliberately asserts NO specific check name beyond the `lint` default: the
+# extra names are per-consumer, and hard-coding one here is exactly what made
+# npdc's copy impossible to upstream.
+rhc="scripts/required-head-checks.sh"
+if [ -x "$rhc" ] && \
+   grep -Fq 'indeterminate, not a 404' "$rhc" && \
+   grep -Fq 'yields no check names' "$rhc" && \
+   grep -Fq 'group_by(.wf)' "$rhc" && \
+   grep -Fq 'actions/runs?head_sha=' "$rhc" && \
+   grep -Fq -- '--paginate' "$rhc" && \
+   grep -Fq -- '-f check_name=' "$rhc" && \
+   grep -Fq 'if any(.status != "completed") then "pending"' "$rhc" && \
+   grep -Fq 'required-head-checks.sh --repo' .github/workflows/agent-review.yml && \
+   grep -Fq 'required-head-checks.sh --repo' .github/workflows/dependabot-auto-merge.yml && \
+   grep -Fq 'required-head-checks.sh" --repo' scripts/workflow/approval-merge-continuation.sh && \
+   grep -Fq 'PR head moved during verification' .github/workflows/dependabot-auto-merge.yml; then
+  pass=$((pass + 1))
+  echo "  PASS: all three merge gates share the required head-check resolver, which fails closed, filters per check name, treats any in-flight run in a workflow group as pending, groups by workflow identity and pins one head"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the required head-check list must be resolved by the shared script at all three call sites, fail closed on indeterminate reads, group by STABLE WORKFLOW IDENTITY (not check suite -- repeated dispatches of one workflow create separate suites), paginate the check-run listing, and pin a single head across the wait" >&2
+fi
+
+echo
 echo "auto-merge workflows require current-head check success (#516)"
-dependabot_check_gate_calls=$(grep -Ec '^[[:space:]]*require_current_head_check_success[[:space:]]*$' .github/workflows/dependabot-auto-merge.yml || true)
+# The gate is a LIST now (#1070): the per-name waiter is still the unit of
+# work, but both merge paths go through the plural looper so every configured
+# check is waited on, not just the first.
+#
+# These assertions deliberately name NO specific check beyond the `lint`
+# default. The extra names are per-consumer — only nathanpaynedotcom has a
+# `build-and-test` workflow — and hard-coding one here is exactly what made
+# its local copy impossible to upstream. Assert the MECHANISM: the waiter,
+# the looper, the looper being called on both paths, the resolver, and both
+# of its fail-closed branches.
+dependabot_check_gate_calls=$(grep -Ec '^[[:space:]]*require_current_head_checks_success[[:space:]]*$' .github/workflows/dependabot-auto-merge.yml || true)
 if grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" .github/workflows/dependabot-auto-merge.yml && \
    grep -Fq 'select(.name == $check)' .github/workflows/dependabot-auto-merge.yml && \
    grep -Eq '^[[:space:]]*require_current_head_check_success\(\)[[:space:]]*\{' .github/workflows/dependabot-auto-merge.yml && \
+   grep -Eq '^[[:space:]]*require_current_head_checks_success\(\)[[:space:]]*\{' .github/workflows/dependabot-auto-merge.yml && \
+   grep -Fq 'required-head-checks.sh --repo' .github/workflows/dependabot-auto-merge.yml && \
    [ "$dependabot_check_gate_calls" -ge 2 ] && \
    grep -Fq -- "--match-head-commit" .github/workflows/dependabot-auto-merge.yml && \
    grep -Fq "waiting for completion" .github/workflows/dependabot-auto-merge.yml && \

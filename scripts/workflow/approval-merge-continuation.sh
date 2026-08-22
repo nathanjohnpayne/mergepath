@@ -109,6 +109,24 @@ case "$threads_rc" in
   *) infra_error "conversation readback returned rc=$threads_rc" ;;
 esac
 
+# Enforce the SAME configured required head-check list the initial readiness
+# probe used (#1070). Without this, every continuation re-entry --
+# workflow_run completions and the scheduled sweep -- decides readiness from
+# codex-review-check.sh, which filters CI by BRANCH-PROTECTION requirements.
+# The whole premise of the configured list is that the extra check is NOT
+# branch-protected, so a repo-lint completion could otherwise arm auto-merge
+# before that check even appears. Pinned to $head, which the final re-read
+# below confirms has not moved.
+set +e
+bash "$ROOT/scripts/required-head-checks.sh" --repo "$REPO" --verify --sha "$head"
+required_checks_rc=$?
+set -e
+case "$required_checks_rc" in
+  0) ;;
+  1) not_ready "configured required head checks are not all green on $head" ;;
+  *) infra_error "required head-check verification returned rc=$required_checks_rc" ;;
+esac
+
 # Re-read all mutable safety state immediately before arming. The first read
 # prevents needless gate work; this read is the authority for the write.
 final=$(read_pr) || infra_error "could not re-read PR #$PR_NUMBER"

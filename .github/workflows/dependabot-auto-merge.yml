@@ -163,7 +163,10 @@ jobs:
           # Repos can already override via REQUIRED_HEAD_CHECK_NAME.
           require_current_head_check_success() {
             local sha runs conclusion status wait_seconds poll_seconds deadline required_check_name ever_seen
-            required_check_name=${REQUIRED_HEAD_CHECK_NAME:-lint}
+            # Optional explicit name so the plural wrapper below can loop
+            # this unchanged; with no argument the previous env behaviour is
+            # exactly preserved.
+            required_check_name=${1:-${REQUIRED_HEAD_CHECK_NAME:-lint}}
             wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
             poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
             deadline=$((SECONDS + wait_seconds))
@@ -209,6 +212,76 @@ jobs:
             done
             echo "::error::Required check run '$required_check_name' wait loop ended unexpectedly; refusing auto-merge."
             exit 1
+          }
+
+          # Wait until EVERY configured required head check is green, with
+          # the whole set pinned to ONE head SHA.
+          #
+          # Pinning matters: an earlier per-name wait could otherwise succeed
+          # against SHA1 while a later one advanced CURRENT_HEAD_SHA to SHA2,
+          # and both merge commands bind to CURRENT_HEAD_SHA -- so a check
+          # that is NOT branch-protected (the entire reason this list exists)
+          # could be pending or failing on the merged head. Re-pin and
+          # re-verify on drift instead of accepting a mixed-SHA verdict.
+          #
+          # Resolution, name splitting and per-workflow grouping all live in
+          # scripts/required-head-checks.sh so the three call sites share one
+          # implementation rather than three drifting copies.
+          require_current_head_checks_success() {
+            local wait_seconds poll_seconds deadline pinned attempts max_attempts
+            wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
+            poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
+            max_attempts=${HEAD_DRIFT_MAX_RESTARTS:-3}
+            attempts=0
+            while :; do
+              attempts=$((attempts + 1))
+              pinned=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)
+              if [ -z "$pinned" ]; then
+                echo "::error::Could not resolve the PR head SHA; refusing auto-merge."
+                exit 1
+              fi
+              deadline=$((SECONDS + wait_seconds))
+              while :; do
+                # Capture the verifier's OWN status. `rc=$?` after a failed
+                # `if` reads the compound statement's status (0), not the
+                # command's -- which would take the fail-closed branch on the
+                # first not-ready poll and never wait at all.
+                rc=0
+                if [ ! -f scripts/required-head-checks.sh ]; then
+                  # First-rollout guard (#1070); see agent-review.yml for why
+                  # this falls back rather than failing closed.
+                  echo "::notice::scripts/required-head-checks.sh absent (pre-#1070 checkout); falling back to the singular waiter."
+                  require_current_head_check_success
+                  CURRENT_HEAD_SHA="$pinned"
+                  return 0
+                fi
+                bash scripts/required-head-checks.sh --repo "$GITHUB_REPOSITORY" --verify --sha "$pinned" || rc=$?
+                if [ "$rc" -eq 0 ]; then
+                  break
+                fi
+                if [ "$rc" -ne 1 ]; then
+                  echo "::error::required-head-checks failed closed (rc=$rc); refusing auto-merge."
+                  exit 1
+                fi
+                if [ "$SECONDS" -ge "$deadline" ]; then
+                  echo "::error::Timed out waiting for the configured required head checks on $pinned."
+                  exit 1
+                fi
+                sleep "$poll_seconds"
+              done
+              # Every configured check is green on $pinned. Accept only if the
+              # head has not moved underneath the verdict.
+              if [ "$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)" = "$pinned" ]; then
+                CURRENT_HEAD_SHA="$pinned"
+                echo "::notice::All configured required head checks are successful on $CURRENT_HEAD_SHA."
+                return 0
+              fi
+              if [ "$attempts" -ge "$max_attempts" ]; then
+                echo "::error::PR head kept moving during check verification; refusing auto-merge."
+                exit 1
+              fi
+              echo "::notice::PR head moved during verification; re-pinning and re-verifying."
+            done
           }
 
           has_human_hold() {
@@ -348,7 +421,7 @@ jobs:
             exit 0
           fi
 
-          require_current_head_check_success
+          require_current_head_checks_success
 
           # Try GitHub-side auto-merge first (fires when required
           # checks pass). Fall back to an immediate squash ONLY when
@@ -382,7 +455,7 @@ jobs:
               echo "::notice::PR carries human-hold immediately before fallback squash; skipping Dependabot auto-merge until the human removes the label."
               exit 0
             fi
-            require_current_head_check_success
+            require_current_head_checks_success
             if has_human_hold; then
               echo "::notice::PR carries human-hold after test wait; skipping Dependabot auto-merge until the human removes the label."
               exit 0

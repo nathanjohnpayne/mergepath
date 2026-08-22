@@ -67,7 +67,7 @@ For repo work, `GH_TOKEN` is now the per-command attribution source for the guar
 | Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `$OP_PREFLIGHT_AUTHOR_PAT` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
 | CI (not a reviewer) | `nathanpayne-robot` | `o6ekjxjjl5gq6rmcneomrjahpu` | *(none — CI only)* | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
 
-> **A 1Password item ID is not a stable identity.** On 2026-08-21 the item `o6ekjxjjl5gq6rmcneomrjahpu` was repurposed from Codex to the robot and Codex was recreated at `etak327mpz4drd4byxszfex4vm`; every row above still pointed at the old ID, so `--agent codex` silently resolved a **robot** token. Nothing in the table can catch that on its own — after any PAT rotation or item edit, re-verify each row by resolving **that row's** `op://` reference into `GH_TOKEN` and checking it — `GH_TOKEN="$(op read 'op://Private/<item-id>/token')" scripts/identity-check.sh --expect-token-identity <login>`. The bare `scripts/identity-check.sh --expect-token-identity <login>` form does **not** verify a table row: it checks whatever is already in `$GH_TOKEN`, so it exits 3 with no token set and otherwise validates a cached token rather than the newly edited item.
+> **A 1Password item ID is not a stable identity.** On 2026-08-21 the item `o6ekjxjjl5gq6rmcneomrjahpu` was repurposed from Codex to the robot and Codex was recreated at `etak327mpz4drd4byxszfex4vm`; every row above still pointed at the old ID, so `--agent codex` silently resolved a **robot** token. Nothing in the table can catch that on its own — after any PAT rotation or item edit, re-verify each row by resolving **that row's** `op://` reference into `GH_TOKEN` and checking it — `GH_TOKEN="$(op read 'op://Private/<item-id>/token')" scripts/identity-check.sh --expect-token-identity <login>`. The bare `scripts/identity-check.sh --expect-token-identity <login>` form does **not** verify a table row: it checks whatever is already in `$GH_TOKEN`, so it exits 3 with no token set and otherwise validates a cached token rather than the newly edited item. **Origin:** the robot PAT was created that day by repurposing the existing Codex 1Password item rather than minting a fresh one, so the id every doc and lookup already named silently changed identity while nothing referencing it changed — mint a new item for a new identity, never repurpose one. The correction landed here the same day, but `scripts/op-preflight.sh` is a canonical manifest path and no consumer had synced it when a Codex session resolved the robot token roughly five and a half hours later and posted approvals under the CI byline on nathanjohnpayne/nathanpaynedotcom#668: a canonical fix is not shipped until it reaches the consumers.
 
 **Cached-variable usage is the primary pattern.** After a single `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"` at session start, all subsequent API calls use the env var directly — no biometric burned per call:
 
@@ -777,6 +777,32 @@ Threads: see "Unresolved threads" column (resolve addressed bot or
 ```
 
 The chat-side block is **additive** to the existing PR-side comment template above. Agents emit both: the PR-side comment is the durable record on the PR; the chat-side block is the human-facing summary that flows into the external CLI session. Neither replaces the other.
+
+## Per-consumer required head checks
+
+Both auto-merge paths — `agent-review.yml`'s readiness probe and `dependabot-auto-merge.yml`'s wait — require a set of check-run names to be green on the PR head before merging. That set defaults to `lint` and is configured per repository by an optional file:
+
+```
+.github/required-head-checks
+```
+
+**One check-run name per line.** `#` starts a comment, so the file can carry its own rationale. Newline-delimited specifically because GitHub check-run names contain spaces — this repo emits `Merge clearance gate`, `Label Gate`, `Re-evaluate codex-review-check gate` — so a space-separated value would be split into names that do not exist and the gate would wait until timeout. Writing `lint build-and-test` on one line means a single check literally named `lint build-and-test`, not two checks.
+
+**It is deliberately NOT a propagation manifest entry.** The value is per-consumer — `nathanpaynedotcom` gates on its own `build-and-test`, and no other repo has that workflow, so naming it canonically would make the other eight wait forever on a check that never runs. Keeping the value out of the manifest lets both workflows stay byte-identical across the fleet, so the propagation lane keeps byte-verifying them verbatim.
+
+Resolution, in both workflows:
+
+| State on the default branch | Behavior |
+|---|---|
+| file absent | default to `lint` |
+| file present, yields ≥1 name | use those names |
+| file present, yields 0 names (empty or comment-only) | **hard error, refuse to merge** |
+
+The last row is the important one. Defaulting there would let an emptied or corrupted file silently drop a configured gate, which is the #635 regression this mechanism exists to prevent. To stop requiring extra checks, **delete the file** rather than emptying it.
+
+**The list is read from the repository's DEFAULT BRANCH, never from the PR head.** A gate that read its requirements from the ref it is gating could be weakened by that ref — on `pull_request` the head is contributor-controlled, so a PR could otherwise empty its own merge gate and then merge.
+
+**Only list checks that run on every PR.** This list is hard-required, so a workflow scoped by `paths` / `paths-ignore` legitimately produces no check run for PRs outside its filter and would block them forever. That is the same deadlock the `repo_lint_local.yml` annex is deliberately kept out of the hard-required set to avoid (#655 round 6); the annex is enforced separately by a workflow-wide scan.
 
 ## Post-Merge Issue Creation
 
