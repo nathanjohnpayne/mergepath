@@ -28,6 +28,8 @@ The reader answers only from an unambiguous file. Each of the following invokes 
 - A quoted scalar followed by anything other than whitespace or a comment (`invoke: "never" junk`).
 - An unreadable or absent config file.
 
+> The subset below exists because the reader is hand-rolled. Delegating to `yq` would handle all of it by construction and is tracked in #1090; the open question there is what a host without `yq` should do, which is a behaviour change rather than a refactor.
+
 The reader accepts ordinary YAML spellings rather than one fixed shape, and must not treat a legal spelling as absent:
 
 - Block child indentation is **derived from the block's first child**, not assumed. A four-space-indented policy must be read, not silently defaulted.
