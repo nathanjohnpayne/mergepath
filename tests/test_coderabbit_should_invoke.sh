@@ -219,6 +219,13 @@ printf 'coderabbit:\n  enabled: true\n  invoke: never\n' >"$_d/.github/review-po
 ( cd "$_d" && ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
 [ $? = 1 ] && pass "a single block is still honoured" || fail "single-block control broke"
 
+echo "--- #1084 r7: ambiguity is a property of the FILE, not of the field read first ---"
+# Honouring `enabled: false` before reading `invoke` let one well-formed field
+# mask the other's ambiguity, producing a confident skip from a malformed file.
+case_is 'enabled:false cannot mask a duplicate invoke' "  enabled: false"$'\n'"  invoke: never"$'\n'"  invoke: always" 0 0
+case_is 'genuine enabled:false alone still skips'      "  enabled: false"                                                0 1
+case_is 'enabled:false with a clean invoke still skips' "  enabled: false"$'\n'"  invoke: always"                       0 1
+
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"
 [ "$FAIL" -gt 0 ] && exit 1

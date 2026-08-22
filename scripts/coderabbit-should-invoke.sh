@@ -196,13 +196,27 @@ emit() {  # <decision> <reason>
   exit "$code"
 }
 
+# Read BOTH fields before acting on either. Honouring `enabled: false` first
+# let one well-formed field mask the other field's ambiguity: a policy with
+# `enabled: false` and two `invoke:` keys exited skip without the duplicate
+# ever being examined (#1084 r7). Ambiguity is a property of the FILE, not of
+# whichever key happened to be read first, and a malformed file must not
+# produce a confident suppressing answer through any path.
 CR_ENABLED=$(coderabbit_field enabled)
+INVOKE_MODE=$(coderabbit_field invoke)
+
+case "${CR_ENABLED}${INVOKE_MODE}" in
+  *"<<ambiguous:"*)
+    echo "[coderabbit-should-invoke] WARN: ambiguous coderabbit policy — enabled='${CR_ENABLED}' invoke='${INVOKE_MODE}'" >&2
+    emit invoke "ambiguous coderabbit policy block (duplicate blocks or duplicate direct keys)"
+    ;;
+esac
+
 CR_ENABLED=${CR_ENABLED:-true}
 if [ "$CR_ENABLED" = "false" ]; then
   emit skip "coderabbit.enabled=false"
 fi
 
-INVOKE_MODE=$(coderabbit_field invoke)
 INVOKE_MODE=${INVOKE_MODE:-always}
 
 # Exact-match only. Anything that is not one of the three literals invokes.

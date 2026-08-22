@@ -1597,6 +1597,8 @@ paths:
       - ".github/workflows/required-check-publisher.yml"  # check_required_check_publisher subject
       - ".github/workflows/pr-audit.yml"       # check_pr_audit_codex_clearance
       - ".github/workflows/repo_lint.yml"      # check_ci_scripts_wired scans it; bidirectional with its requires: scripts/ci/ (#601)
+      - "scripts/coderabbit-should-invoke.sh"   # check_coderabbit_wait (#1084)
+      - "tests/test_coderabbit_should_invoke.sh"  # check_coderabbit_wait (#1084)
   - path: scripts/gh-projects/
     type: kit
     consumers: all
