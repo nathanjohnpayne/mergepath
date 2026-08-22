@@ -23,6 +23,7 @@ Item 2 is the stable entrypoint for shared rules: it is one canonical file mirro
 
 Most top-level directories are described by the `docs/agents/` files above or are self-evident. One carries its justification out-of-line, per the [Code Modification Rules](docs/agents/code-modification-rules.md) requirement that new top-level directories document their justification here or in a `plans/` entry:
 
+- **`.codex/`** --- Codex CLI per-repo configuration; currently just `hooks.json`, which wires the `PreToolUse` guards (`scripts/hooks/gh-pr-guard.sh`, `scripts/hooks/label-removal-guard.sh`) for Codex sessions, the way `.claude/settings.json` does for Claude Code. Tracked deliberately: left untracked it is invisible to CI and to propagation, absent on a fresh clone, and free to drift per machine — and it did drift, into a form that resolved the guard through a variable Codex does not set, so the guard failed open (see the `.gitignore` stanza that re-includes it, and the manifest entry that propagates it). Real Codex *state* lives in `~/.codex`, not here, so nothing machine-local is committed.
 - **`packaging/`** --- placeholder package scaffolds that reserve the `mergepath` name on the npm and PyPI registries (name-squatting prevention). Rationale and publish steps live in [`packaging/README.md`](packaging/README.md); see issues [#92](https://github.com/nathanjohnpayne/mergepath/issues/92) (npm) and [#93](https://github.com/nathanjohnpayne/mergepath/issues/93) (PyPI). The directory is whitelisted in `.repo-template.yml`.
 
 ## Code Review Policy

@@ -39,6 +39,18 @@ Each agent has a dedicated reviewer identity used exclusively for code review:
 
 To add a new agent, register a GitHub account following the pattern `nathanpayne-{agent}` and add it to the `available_reviewers` list in the repo's `review-policy.yml`.
 
+### Non-reviewer identities (#1080)
+
+Service accounts hold repo write access because CI needs it. GitHub counts an approval from **any** account with write access toward `required_approving_review_count`, and it offers nothing to tell a service account from a person — both are `type: "User"`. So an account that exists to run CI can satisfy branch protection, and no GitHub-side setting prevents it.
+
+Repos declare those accounts in `non_reviewer_identities` in `.github/review-policy.yml`. `scripts/merge-clearance-gate.sh` fails closed when any listed identity holds a latest-state `APPROVED` review **anywhere on the PR** — deliberately not just on the current HEAD. Whether an approval from an earlier commit still counts toward branch protection is decided by `dismiss_stale_reviews`, which the gate cannot read; HEAD-pinning the check would let a non-reviewer approve and then push to slip past it. A deny-list pays nothing for the wider scope, because such an account should hold no standing approval at any commit. A push that dismisses the approval flips its latest state to `DISMISSED`, which correctly clears the gate. Unlike the reviewer-identity arms of that gate, which only run on the Dependabot and external-review lanes, this assertion runs on **every** lane — an ordinary under-threshold PR included, because that is the lane no identity check previously examined.
+
+It is a deny-list rather than an allow-list on purpose. An allow-list would have to answer "is this login a human?" to avoid blocking legitimate human approvals, and that question has no reliable answer from the API; a deny-list of accounts the repo has explicitly declared has no false positives.
+
+An absent or empty key is a legitimate configuration meaning "no such identity here", and makes the check inert. The protection is therefore opt-in per repo: a repo that has not adopted the key is unaffected rather than broken, and also unprotected.
+
+The current CI service account is `nathanpayne-robot`. It holds no reviewer standing and must never post a review — review state is what the no-self-approve and same-agent gates read. It is deliberately absent from `reviewer_pat_item_for()` in `scripts/op-preflight.sh` so `--agent robot` cannot resolve a reviewer PAT.
+
 ### Identity Rules
 
 - An agent **never** reviews its own code under the same identity that authored it.

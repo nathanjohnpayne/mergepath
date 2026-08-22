@@ -3530,6 +3530,198 @@ rcp_case positive-control '' pass
 fi  # end Test 25 gating
 
 # ---------------------------------------------------------------------------
+# Test 26 (#1080): non_reviewer_identities — an approval from a declared
+# non-reviewer must not satisfy branch protection, on EVERY lane.
+#
+# Regression origin: nathanpaynedotcom#668. A stale agent->1Password-item map
+# handed a local Codex session the nathanpayne-robot CI token, which posted two
+# APPROVED reviews on a one-approval repo. The PR read APPROVED/CLEAN and this
+# gate passed, because it was an ordinary under-threshold PR and the existing
+# identity arms only run on the Dependabot and external-review lanes.
+# ---------------------------------------------------------------------------
+ROBOT=nathanpayne-robot
+
+make_scratch_nonrev() {  # <non_reviewer_block_body_or_empty>
+  local denied=$1 dir
+  dir=$(mktemp -d "$WORKDIR/scratch.XXXXXX")
+  mkdir -p "$dir/.github"
+  cat >"$dir/.github/review-policy.yml" <<EOF
+author_identity: nathanjohnpayne
+external_review_threshold: 300
+
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-cursor
+  - nathanpayne-codex
+EOF
+  [ -z "$denied" ] || printf '\nnon_reviewer_identities:\n%s\n' "$denied" >>"$dir/.github/review-policy.yml"
+  cat >>"$dir/.github/review-policy.yml" <<EOF
+
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+  external_review_gate:
+    enabled: false
+
+dependabot:
+  reviewer_gate:
+    enabled: false
+EOF
+  echo "$dir"
+}
+
+nonrev_case() {  # <name> <denied_block> <reviews_json> <expect: block|pass>
+  local name=$1 denied=$2 reviews=$3 expect=$4
+  local scratch fpr frev out rc
+  scratch=$(make_scratch_nonrev "$denied")
+  fpr=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne")
+  frev=$(make_reviews_fixture "$reviews")
+  set +e
+  out=$(FIXTURE_PR="$fpr" FIXTURE_REVIEWS="$frev" run_gate "$scratch" 99 owner/repo 2>&1)
+  rc=$?
+  set -e
+  case "$expect" in
+    block|pass) ;;
+    *) fail "#1080: $name -> test bug: unknown expectation '$expect'"; return ;;
+  esac
+  if [ "$expect" = block ]; then
+    if [ "$rc" = 1 ] && printf '%s' "$out" | grep -q "non-reviewer"; then
+      pass "#1080: $name -> BLOCKED"
+    else
+      fail "#1080: $name -> expected rc=1 naming a non-reviewer; got rc=$rc"
+      printf '%s\n' "$out" | sed 's/^/      /' | head -4 >&2
+    fi
+  else
+    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "PASS"; then
+      pass "#1080: $name -> PASS"
+    else
+      fail "#1080: $name -> expected rc=0 PASS; got rc=$rc"
+      printf '%s\n' "$out" | sed 's/^/      /' | head -4 >&2
+    fi
+  fi
+}
+
+DENY="  - $ROBOT"
+
+echo
+echo "--- Test 26 (#1080): non-reviewer approvals"
+
+# 26a — the #668 shape itself, on the lane that had no identity check at all.
+nonrev_case "ordinary PR, robot APPROVED on HEAD" "$DENY" \
+  "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" block
+
+# 26b — NOT HEAD-pinned, and this case previously asserted the opposite.
+# Whether an older approval still counts is decided by dismiss_stale_reviews,
+# which the gate cannot see; with it OFF the non-reviewer only has to approve
+# and then push to slip past a HEAD-pinned check. Codex caught this on #1080 —
+# the original 26b encoded the bug, and the mutation test dutifully proved the
+# bug was load-bearing.
+nonrev_case "robot APPROVED on an OLD sha (survives a push)" "$DENY" \
+  "$(jq -n --arg old "$OLD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$old,submitted_at:"2026-08-22T04:46:19Z"}]')" block
+
+# 26b2 — the remediation path: a push under dismiss_stale_reviews flips the
+# older approval to DISMISSED, which must clear the gate even though the
+# dismissal is recorded against the earlier commit.
+nonrev_case "robot approval DISMISSED on an OLD sha" "$DENY" \
+  "$(jq -n --arg old "$OLD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"DISMISSED",commit_id:$old,submitted_at:"2026-08-22T04:46:19Z"}]')" pass
+
+# 26b3 — a later CHANGES_REQUESTED on a newer commit supersedes an older
+# approval, so nothing stands.
+nonrev_case "robot APPROVED old, CHANGES_REQUESTED newer" "$DENY" \
+  "$(jq -n --arg old "$OLD_SHA" --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$old,submitted_at:"2026-08-22T04:46:19Z"},
+     {user:{login:$who},state:"CHANGES_REQUESTED",commit_id:$sha,submitted_at:"2026-08-22T05:10:00Z"}]')" pass
+
+# 26c — dismissing the approval is the remediation, so it must clear the gate.
+nonrev_case "robot APPROVED then DISMISSED on HEAD" "$DENY" \
+  "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"DISMISSED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" pass
+
+# 26d — a later COMMENTED review must NOT mask a standing approval. GitHub does
+# not let a comment supersede an approval, and neither may the collapse here.
+nonrev_case "robot APPROVED then later COMMENTED on HEAD" "$DENY" \
+  "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"},
+     {user:{login:$who},state:"COMMENTED",commit_id:$sha,submitted_at:"2026-08-22T05:00:00Z"}]')" block
+
+# 26e — an allow-listed reviewer is untouched by the deny-list.
+nonrev_case "allow-listed reviewer APPROVED on HEAD" "$DENY" \
+  "$(jq -n --arg sha "$HEAD_SHA" '
+    [{user:{login:"nathanpayne-claude"},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" pass
+
+# 26f — a repo that has not adopted the key is unaffected, not broken.
+nonrev_case "key absent, robot APPROVED on HEAD" "" \
+  "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" pass
+
+# 26g — the query mode must keep answering its own narrow question. Folding an
+# identity verdict into that boolean would change what its callers asked.
+SCRATCH=$(make_scratch_nonrev "$DENY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+  [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+  run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && { [ "$OUT" = "true" ] || [ "$OUT" = "false" ]; }; then
+  pass "#1080: query mode still prints a bare boolean despite a non-reviewer approval"
+else
+  fail "#1080: query mode expected rc=0 and a bare true/false; got rc=$RC out='$OUT'"
+fi
+
+# 26h — a key present with a YAML FLOW list parses to nothing under the block
+# reader, which is indistinguishable from an absent key. Treating it as absent
+# is a silent fail-OPEN: the repo looks like it declared its service account
+# and gets no protection. The gate must refuse to run instead. (Codex #1080.)
+SCRATCH=$(make_scratch_nonrev "")
+printf '\nnon_reviewer_identities: [%s]\n' "$ROBOT" >>"$SCRATCH/.github/review-policy.yml"
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+  [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q "cannot parse"; then
+  pass "#1080: flow-list non_reviewer_identities fails closed (rc=2) instead of silently passing"
+else
+  fail "#1080: flow-list key expected rc=2 naming the parse failure; got rc=$RC"
+  printf '%s\n' "$OUT" | sed 's/^/      /' | head -4 >&2
+fi
+
+# 26j — an EMPTY flow list is the documented inert configuration, not an
+# unsupported value. Treating `non_reviewer_identities: []` as unparseable
+# would exit 2 on EVERY PR in a repo that wrote the legitimate empty form —
+# a required gate permanently red. (Codex #1080, round 3.)
+for _empty in "[]" "[ ]"; do
+  SCRATCH=$(make_scratch_nonrev "")
+  printf '\nnon_reviewer_identities: %s\n' "$_empty" >>"$SCRATCH/.github/review-policy.yml"
+  FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne")
+  FIXTURE_REVIEWS=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')")
+  set +e
+  OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+  RC=$?
+  set -e
+  if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "PASS"; then
+    pass "#1080: empty flow list '$_empty' is inert, not a fail-closed error"
+  else
+    fail "#1080: empty flow list '$_empty' expected rc=0 PASS; got rc=$RC"
+    printf '%s\n' "$OUT" | sed 's/^/      /' | head -4 >&2
+  fi
+done
+
+# 26i — the inverse control: a correctly-written block list must NOT trip the
+# fail-closed path, or every repo breaks.
+nonrev_case "block-list key parses and gates normally" "$DENY" \
+  "$(jq -n --arg sha "$HEAD_SHA" --arg who "$ROBOT" '
+    [{user:{login:$who},state:"APPROVED",commit_id:$sha,submitted_at:"2026-08-22T04:46:19Z"}]')" block
+
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_merge_clearance_gate.sh: $PASS passed, $FAIL failed"

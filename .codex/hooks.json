@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'r=\"$(git rev-parse --show-toplevel 2>/dev/null)\"; [ -n \"$r\" ] || { echo \"BLOCKED: cannot resolve the repo root; refusing the tool call.\" >&2; exit 2; }; g=\"$r/scripts/hooks/gh-pr-guard.sh\"; [ -r \"$g\" ] || { echo \"BLOCKED: gh-pr-guard.sh not readable at $g; refusing the tool call.\" >&2; exit 2; }; if bash \"$g\"; then exit 0; fi; exit 2'",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash -c 'r=\"$(git rev-parse --show-toplevel 2>/dev/null)\"; [ -n \"$r\" ] || { echo \"BLOCKED: cannot resolve the repo root; refusing the tool call.\" >&2; exit 2; }; g=\"$r/scripts/hooks/label-removal-guard.sh\"; [ -r \"$g\" ] || { echo \"BLOCKED: label-removal-guard.sh not readable at $g; refusing the tool call.\" >&2; exit 2; }; if bash \"$g\"; then exit 0; fi; exit 2'",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

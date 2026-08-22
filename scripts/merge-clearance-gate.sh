@@ -958,6 +958,99 @@ HAS_EXTERNAL_LABEL=$(echo "$PR_JSON" \
 
 log "HEAD = $HEAD_SHA    author = $PR_AUTHOR    needs-external-review = $HAS_EXTERNAL_LABEL"
 
+# --- non-reviewer approval assertion (#1080) --------------------------------
+#
+# Runs on EVERY lane, ahead of the class dispatch, because the lanes below are
+# the gap it closes. The Dependabot and external-review arms already validate
+# the approving identity against `available_reviewers`; an ORDINARY
+# under-threshold PR is judged by neither, so no gate has ever examined WHO
+# approved it. GitHub's own branch protection counts an approval from any
+# account with write access, which includes a CI service account.
+#
+# That is not hypothetical. On 2026-08-22 a stale agent->1Password-item map
+# handed a local Codex session the nathanpayne-robot CI token; it posted two
+# APPROVED reviews on nathanjohnpayne/nathanpaynedotcom#668, a one-approval
+# repo. The PR read APPROVED/CLEAN and this gate passed, because the PR was
+# ordinary and the identity arms never ran. The local PreToolUse hook that was
+# supposed to refuse the write had failed open on an unset variable, so the
+# only surviving defence was a layer that was not looking.
+#
+# Deny-list, not allow-list, and that asymmetry is deliberate. An allow-list of
+# `available_reviewers` would have to answer "is this login a human?" to avoid
+# blocking legitimate human approvals, and GitHub gives no such signal — a
+# service account and a person are both `type: "User"`. A deny-list of the
+# identities this repo has DECLARED to be non-reviewers has no false positives
+# and encodes a claim REVIEW_POLICY.md already makes in prose.
+#
+# An absent or empty `non_reviewer_identities` is a legitimate configuration
+# meaning "no such identity here" and makes this check inert. That keeps a repo
+# that has not adopted the key working exactly as before rather than failing on
+# a key it does not carry; the cost is that the protection is opt-in per repo.
+#
+# Query modes are deliberately exempt: --derive-rate-limit-protection answers a
+# narrow question about bot review coverage, and folding an unrelated identity
+# verdict into that boolean would change what its callers think they asked.
+if [ "$DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
+  NON_REVIEWERS=$(read_non_reviewer_identities "$POLICY_CONFIG")
+  # A key present with an inline value the block reader cannot consume -- a
+  # YAML flow list or a bare scalar -- parses to NOTHING and is otherwise
+  # indistinguishable from an absent key. Treating it as absent is a silent
+  # fail-OPEN: the repo looks like it declared its service account and gets no
+  # protection. Refuse to run rather than pretend the key is not there.
+  if [ -z "$NON_REVIEWERS" ] \
+     && policy_list_has_unconsumed_inline_value non_reviewer_identities "$POLICY_CONFIG"; then
+    die 2 "non_reviewer_identities in $POLICY_CONFIG carries an inline value this reader cannot parse (use a dash-prefixed block list, one identity per line). Refusing to run a gate that would silently pass."
+  fi
+  if [ -n "$NON_REVIEWERS" ]; then
+    NON_REVIEWERS_JSON=$(echo "$NON_REVIEWERS" | jq -R . | jq -s .)
+    NR_REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
+
+    # Same latest-state-per-reviewer collapse the Dependabot arm uses, with the
+    # membership test inverted -- and deliberately WITHOUT that arm's
+    # commit_id == HEAD pin.
+    #
+    # HEAD-pinning here was a bug, caught by Codex on #1080. Whether an
+    # approval from an earlier commit still counts is decided by
+    # `dismiss_stale_reviews`, which this script cannot see and must not
+    # assume: with it OFF, GitHub keeps counting the older approval, so a
+    # HEAD-pinned check passes while the merge bypass this gate exists to close
+    # is still open -- the non-reviewer only has to approve, then push. The
+    # repo does not even agree with itself about that setting: the live API
+    # reports dismiss_stale_reviews=true on mergepath and three consumers,
+    # while .github/workflows/agent-review.yml's auto-merge arming path
+    # documents it as OFF and relies on the approval carrying across a push.
+    #
+    # A deny-list pays nothing for the wider scope. A declared non-reviewer
+    # should hold no standing approval on this PR at ANY commit, so there is no
+    # false positive to trade against -- unlike the Dependabot arm, where the
+    # pin exists to reject a STALE approval as insufficient (#427).
+    #
+    # Filtering to the opinionated states before the collapse is still
+    # load-bearing and mirrors GitHub: a COMMENTED review does not supersede an
+    # APPROVED one, so a naive "most recent review" would let a later comment
+    # mask a standing approval. A push that dismisses the approval flips the
+    # latest state to DISMISSED, which correctly clears this gate.
+    NR_APPROVERS=$(echo "$NR_REVIEWS_JSON" | jq -r \
+      --argjson deny "$NON_REVIEWERS_JSON" '
+        [ .[]
+          | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+          | select(.user.login as $u | $deny | index($u))
+        ]
+        | group_by(.user.login)
+        | map(max_by(.submitted_at))
+        | map(select(.state == "APPROVED"))
+        | map(.user.login)
+        | unique
+        | join(", ")
+      ')
+
+    if [ -n "$NR_APPROVERS" ]; then
+      block "standing APPROVED review on this PR from an identity this repo declares a non-reviewer: $NR_APPROVERS. Such an account holds no reviewer standing and its approval must not satisfy branch protection (see REVIEW_POLICY.md, non_reviewer_identities). Dismiss the review, then find out which process is holding that token."
+    fi
+    log "non-reviewer check: no standing approval anywhere on this PR from [$(echo "$NON_REVIEWERS" | tr '\n' ' ' | sed 's/ $//')]"
+  fi
+fi
+
 # --- class dispatch ---------------------------------------------------------
 #
 # Dependabot is checked FIRST and uses the narrower rule (CLI reviewer
