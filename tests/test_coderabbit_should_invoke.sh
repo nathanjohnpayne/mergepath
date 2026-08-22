@@ -205,6 +205,20 @@ case_is 'unterminated quoted scalar invokes'  "$ON"$'\n''  invoke: "never'      
 case_is 'single clean never still skips'      "$ON"$'\n'"  invoke: never"                         0 1
 case_is 'nested enabled does not shadow'      "$ON"$'\n'"  severity_gate:"$'\n'"    enabled: false"$'\n'"  invoke: never" 0 1
 
+echo "--- #1084 r6: duplicate top-level coderabbit blocks are ambiguous too ---"
+# Two blocks aggregate into one logical block, so every field still occurs
+# exactly once and the field-level guard never fires. The BLOCK count is the
+# missing half of that check.
+_d=$(mktemp -d "$WORKDIR/s.XXXXXX"); mkdir -p "$_d/.github" "$_d/scripts"
+cp "$SCRIPT" "$_d/scripts/coderabbit-should-invoke.sh"; chmod +x "$_d/scripts/coderabbit-should-invoke.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$_d/scripts/phase-4b-classifier.sh"; chmod +x "$_d/scripts/phase-4b-classifier.sh"
+printf 'coderabbit:\n  enabled: false\ncodex:\n  enabled: true\ncoderabbit:\n  invoke: always\n' >"$_d/.github/review-policy.yml"
+( cd "$_d" && ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
+[ $? = 0 ] && pass "two top-level coderabbit blocks invoke" || fail "two top-level coderabbit blocks did not invoke"
+printf 'coderabbit:\n  enabled: true\n  invoke: never\n' >"$_d/.github/review-policy.yml"
+( cd "$_d" && ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
+[ $? = 1 ] && pass "a single block is still honoured" || fail "single-block control broke"
+
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"
 [ "$FAIL" -gt 0 ] && exit 1

@@ -128,7 +128,14 @@ coderabbit_field() {  # <field>
   local fld=$1
   [ -f "$CONFIG" ] || return 0
   awk -v fld="$fld" '
-    index($0, "coderabbit:") == 1 { in_block=1; next }
+    # Count the block headers too, not just the fields inside them. Two
+    # top-level `coderabbit:` blocks aggregate into one logical block here, so
+    # `enabled: false` in the first and `invoke: always` in the second each
+    # occur exactly once and the field-level guard never fires -- the file is
+    # ambiguous and the reader returned a confident, suppressing answer
+    # (#1084 r6). YAML forbids duplicate keys at the same level; a file that
+    # has them is malformed, not a file with a resolvable value.
+    index($0, "coderabbit:") == 1 { in_block=1; blocks++; next }
     in_block && /^[^[:space:]#]/ { in_block=0 }
     # Depth matters: `severity_gate:` is a nested map that also has an
     # `enabled:` key, and matching on the key name alone returned whichever
@@ -141,6 +148,7 @@ coderabbit_field() {  # <field>
       # answer to a question the file does not actually answer, and the answer
       # it picked suppressed review (#1084 r5). Emitting the raw text fails the
       # exact-literal match downstream, which routes to invoke.
+      if (blocks > 1) { print "<<ambiguous:" blocks " coderabbit blocks>>"; exit }
       if (n != 1) { if (n > 1) print "<<ambiguous:" n " duplicate " fld " keys>>"; exit }
       $0 = last
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)

@@ -920,6 +920,17 @@
             <span class="track"></span>
           </label>
         </div>
+        <div class="row">
+          <div>
+            <div class="lbl">Phase 2.5 invocation</div>
+            <div class="hint">When the agent waits for CodeRabbit. Does not stop the App auto-reviewing.</div>
+          </div>
+          <select id="coderabbitInvoke" aria-label="CodeRabbit Phase 2.5 invocation mode">
+            <option value="always">always</option>
+            <option value="complex-changes">complex-changes</option>
+            <option value="never">never</option>
+          </select>
+        </div>
         <div class="nested shown" id="coderabbitNested">
           <div class="slider-row">
             <input type="range" id="postClearanceWait" min="60" max="1245" step="30" value="240" aria-label="Post-clearance CodeRabbit wait cap (seconds)" />
@@ -1669,6 +1680,10 @@
     renderAll();
   });
 
+  $('coderabbitInvoke').addEventListener('change', e => {
+    state.coderabbitInvoke = e.target.value;
+    renderAll();
+  });
   $('codexRounds').addEventListener('input', e => {
     state.codexRounds = +e.target.value;
     $('codexRoundsVal').textContent = state.codexRounds;
@@ -1802,6 +1817,7 @@
     $('postClearanceWait').value = state.postClearanceWait;
     $('postClearanceWaitVal').textContent = state.postClearanceWait;
     document.querySelector('[data-toggle="coderabbit"]').checked = state.coderabbit;
+    $('coderabbitInvoke').value = state.coderabbitInvoke;
     document.querySelector('[data-toggle="codex"]').checked = state.codex;
     document.querySelector('[data-toggle="codexRequestByDefault"]').checked = state.codexRequestByDefault;
     $('codexNested').classList.toggle('shown', state.codex);
