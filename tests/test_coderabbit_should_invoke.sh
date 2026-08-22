@@ -194,6 +194,17 @@ else
   [ $? = 125 ] && pass "run_bounded signals unavailability with 125" || fail "run_bounded returned an unexpected status"
 fi
 
+echo "--- #1084 r5: ambiguous or malformed config must never resolve to skip ---"
+# Three separate ways the parser previously manufactured a suppressing value
+# out of input that does not actually say "never".
+case_is 'duplicate invoke keys invoke'        "$ON"$'\n'"  invoke: never"$'\n'"  invoke: always" 0 0
+case_is 'duplicate enabled keys invoke'       "  enabled: false"$'\n'"  enabled: true"$'\n'"  invoke: always" 0 0
+case_is 'unterminated quoted scalar invokes'  "$ON"$'\n''  invoke: "never'                        0 0
+# Controls: the single well-formed forms must still be honoured, or the
+# fail-open guard would have eaten the feature.
+case_is 'single clean never still skips'      "$ON"$'\n'"  invoke: never"                         0 1
+case_is 'nested enabled does not shadow'      "$ON"$'\n'"  severity_gate:"$'\n'"    enabled: false"$'\n'"  invoke: never" 0 1
+
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"
 [ "$FAIL" -gt 0 ] && exit 1

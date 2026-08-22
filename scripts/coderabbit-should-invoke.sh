@@ -131,42 +131,41 @@ coderabbit_field() {  # <field>
     index($0, "coderabbit:") == 1 { in_block=1; next }
     in_block && /^[^[:space:]#]/ { in_block=0 }
     # Depth matters: `severity_gate:` is a nested map that also has an
-    # `enabled:` key. Matching on the key name alone returned whichever came
-    # FIRST in the file, so merely reordering `severity_gate` above the
-    # top-level fields flipped `coderabbit.enabled` to the nested value and
-    # silently skipped Phase 2.5 -- and YAML mapping order is not semantic, so
-    # that reordering is legal (#1084 r3). Accept only direct children, which
-    # at this nesting level means exactly two leading spaces.
-    in_block && $1 == fld":" && $0 ~ /^  [^ ]/ {
+    # `enabled:` key, and matching on the key name alone returned whichever
+    # came FIRST -- so reordering two keys flipped the answer, and YAML mapping
+    # order is not semantic (#1084 r3). Direct children only.
+    in_block && $1 == fld":" && $0 ~ /^  [^ ]/ { n++; last = $0 }
+    END {
+      # Ambiguous configuration must NOT resolve to a usable value. Accepting
+      # the first of `invoke: never` / `invoke: always` returned a confident
+      # answer to a question the file does not actually answer, and the answer
+      # it picked suppressed review (#1084 r5). Emitting the raw text fails the
+      # exact-literal match downstream, which routes to invoke.
+      if (n != 1) { if (n > 1) print "<<ambiguous:" n " duplicate " fld " keys>>"; exit }
+      $0 = last
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      # Quote-aware. A `#` INSIDE a quoted scalar is literal YAML content, not
-      # a comment: stripping it unconditionally turned `invoke: "never # tmp"`
-      # into a bare `never`, so a malformed value suppressed CodeRabbit --
-      # the exact inversion of the fail-toward-invoking contract
-      # (#1084 r1). Outside quotes, `#` only opens a comment when preceded by
-      # whitespace, per YAML.
       if ($0 ~ /^["\047]/) {
         q = substr($0, 1, 1)
         rest = substr($0, 2)
         idx = index(rest, q)
         if (idx > 0) {
           after = substr(rest, idx + 1)
-          # Only whitespace or a comment may follow the closing quote. Printing
-          # just the quoted part of `invoke: "never" trailing-junk` turned a
-          # malformed line into a VALID mode and suppressed review (#1084 r4).
-          # Emitting the raw line instead fails the exact-literal match, which
-          # routes to invoke -- the direction the contract requires.
+          # Only whitespace or a comment may follow the closing quote; printing
+          # just the quoted part turned `invoke: "never" junk` into a valid
+          # mode (#1084 r4).
           if (after ~ /^[[:space:]]*$/ || after ~ /^[[:space:]]*#/) {
             print substr(rest, 1, idx - 1); exit
           }
-          print $0; exit
+          print last; exit
         }
-        print rest; exit
+        # Unterminated scalar. Stripping the opening quote and returning the
+        # remainder manufactured a valid suppressing value out of malformed
+        # YAML (#1084 r5). Emit the raw line so the enum match fails.
+        print last; exit
       }
       sub(/[[:space:]]+#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print
-      exit
     }
   ' "$CONFIG"
 }

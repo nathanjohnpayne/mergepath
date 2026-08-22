@@ -165,7 +165,13 @@ feedback_policy:
 # to read and address substantive CodeRabbit findings before proceeding past
 # Phase 2.5.
 #
-# When enabled, the agent MUST:
+# Phase 2.5 runs only when scripts/coderabbit-should-invoke.sh <PR#> exits 0
+# (#1084). `coderabbit.enabled: true` is necessary but NOT sufficient: the
+# `invoke` mode below decides whether THIS PR gets the wait. Run the decider
+# rather than reading `enabled` directly, or a repo set to `never` or to a
+# routine `complex-changes` result still gets waited on.
+#
+# When the decider says invoke, the agent MUST:
 #   1. Wait for CodeRabbit to post before proceeding — prefer
 #      scripts/coderabbit-wait.sh, whose max_wait_seconds ceiling (1245s,
 #      the measured full-fleet max + one poll interval; #623) covers the real latency
@@ -489,9 +495,13 @@ codex:
   # Raised 2 -> 10 (#1084). Codex is now the primary reviewer on every PR,
   # so the budget has to cover a real convergence run rather than two
   # courtesy rounds: #1080 took four rounds, and rounds 2 and 3 each found a
-  # defect the previous round's fix introduced. Exhausting the budget escalates
-  # to the automated Phase 4b leg (or the manual handoff when that is
-  # unavailable) rather than merging on an unconverged review.
+  # defect the previous round's fix introduced. Exhausting the budget takes the
+  # HUMAN-TIEBREAKER route, not the automated Phase 4b leg: stop the loop, post
+  # a comment summarizing both positions with links to the rounds, alert the
+  # human, do not merge (AGENTS.md, Disagreements and Tiebreaking). Automated
+  # 4b is the wrong destination for THIS trigger because that leg can post an
+  # APPROVED, which would let a review that never converged merge with nobody
+  # adjudicating it.
   max_review_rounds: 10
 
   # Poll timeout per round, in seconds, for `codex-review-request.sh`.
