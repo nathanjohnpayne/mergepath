@@ -21,12 +21,23 @@ case "$PR_NUMBER" in ''|*[!0-9]*) echo "invalid PR number" >&2; exit 2 ;; esac
 case "$REPO" in */*) ;; *) echo "invalid repository" >&2; exit 2 ;; esac
 [ -n "${GH_TOKEN:-}" ] || { echo "GH_TOKEN is required" >&2; exit 2; }
 
-INLINE=$(gh_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline review comments") \
-  || { echo "$GH_API_ARRAY_ERROR" >&2; exit 2; }
-REVIEWS=$(gh_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects") \
-  || { echo "$GH_API_ARRAY_ERROR" >&2; exit 2; }
-ISSUES=$(gh_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments") \
-  || { echo "$GH_API_ARRAY_ERROR" >&2; exit 2; }
+# `gh_api_array` reports WHY a read failed through the GH_API_ARRAY_* shell
+# variables, so it has to be called DIRECTLY by whatever consumes them — the
+# same constraint scripts/coderabbit-wait.sh records on its own wrapper. Read
+# in the parent instead, as `VAR=$(gh_api_array …) || { echo "$GH_API_ARRAY_ERROR"; }`
+# did until #1089, the assignment runs the function in a command-substitution
+# SUBSHELL: the variables are set on the subshell and are gone by the time the
+# parent's handler runs. Under `set -u` that handler then died on the unbound
+# variable rather than printing anything, so an unreadable surface surfaced as
+# an unbound-variable trace and exit 1 -- not the exit 2 the handler intended,
+# and never the message naming which surface could not be read.
+fetch_api_array() {
+  gh_api_array "$1" "$2" || { echo "$GH_API_ARRAY_ERROR" >&2; return 2; }
+}
+
+INLINE=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline review comments") || exit 2
+REVIEWS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects") || exit 2
+ISSUES=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments") || exit 2
 
 FINGERPRINT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/feedback-surface-fingerprint.XXXXXX")
 trap 'rm -rf "$FINGERPRINT_TMP"' EXIT
