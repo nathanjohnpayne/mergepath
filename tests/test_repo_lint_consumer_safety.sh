@@ -302,18 +302,45 @@ if [ -z "$frozen_manifest_json" ]; then
 fi
 
 # "fleetwide" | "partial" | "none" for one path.
+#
+# Containment is decided by `.type == "kit"` with the destination normalized,
+# NOT by a trailing slash: scripts/ci/check_sync_manifest accepts kit entries
+# spelled with or without one and appends the slash itself, so inferring
+# kit-ness from the spelling misses a validly-written entry and would let the
+# fixture overwrite content sync actually delivers.
+#
+# `consumers` is normalized because a scalar scope (`consumers: matchline`)
+# is an accepted shape -- check_sync_manifest extracts string-typed and
+# sequence-typed scopes in two passes precisely for that. Left unnormalized,
+# `.consumers[]` raises "Cannot iterate over string", and since the caller
+# reads this through a command substitution the nonzero status is invisible
+# and the empty output would fall through as "none" -- silently losing
+# coverage. The status is propagated explicitly below for the same reason.
 frozen_delivery_for() {
-  printf '%s' "$frozen_manifest_json" | jq -r --arg p "$1" '
+  local out rc
+  out=$(printf '%s' "$frozen_manifest_json" | jq -r --arg p "$1" '
+    def scopes: if (.consumers | type) == "string"
+                then (if .consumers == "all" then "all" else [.consumers] end)
+                else .consumers end;
     ([.consumers[].name] | unique) as $fleet
     | [ .paths[]
-        | (.dest // .path) as $d
-        | select($d != null)
-        | select($d == $p or (($d | endswith("/")) and ($p | startswith($d))))
+        | . as $e
+        | (($e.dest // $e.path) // "") as $d
+        | select($d != "")
+        | (if ($e.type == "kit") and ($d | endswith("/") | not) then $d + "/" else $d end) as $nd
+        | select($nd == $p or (($e.type == "kit") and ($p | startswith($nd))))
+        | {c: ($e | scopes)}
       ] as $covering
     | if ($covering | length) == 0 then "none"
-      elif any($covering[]; .consumers == "all") then "fleetwide"
-      elif (([$covering[] | select(.consumers != "all") | .consumers[]] | unique) == $fleet) then "fleetwide"
-      else "partial" end'
+      elif any($covering[]; .c == "all") then "fleetwide"
+      elif (([$covering[] | select(.c != "all") | .c[]] | unique) == $fleet) then "fleetwide"
+      else "partial" end') ; rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    echo "FATAL: could not resolve effective delivery for '$1' (jq rc=$rc)." >&2
+    echo "       Refusing to model a frozen fixture on an unresolved answer." >&2
+    exit 1
+  fi
+  printf '%s' "$out"
 }
 for frozen in "${CONSUMER_FROZEN_CONTENT[@]}"; do
   case "$(frozen_delivery_for "$frozen")" in
