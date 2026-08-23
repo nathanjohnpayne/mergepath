@@ -40,6 +40,26 @@ run_bounded() {  # <seconds> <cmd...>
 pass() { PASS=$((PASS+1)); echo "PASS: $*"; }
 fail() { FAIL=$((FAIL+1)); echo "FAIL: $*" >&2; }
 
+# A case block placed above the helper it calls does not fail -- it does not
+# RUN, contributing neither a pass nor a fail, so the suite still reports
+# "N passed, 0 failed" while a whole block silently vanishes. Caught exactly
+# that way while adding the r13 cases. Turning an unknown command into a
+# recorded FAIL makes the omission visible instead of invisible.
+#
+# bash 4.0+; on bash 3.2 the hook does not exist and behaviour is simply
+# todays, so this is safe to carry to consumers.
+command_not_found_handle() {
+  # bash runs this hook in a SUBSHELL, so incrementing FAIL here does nothing
+  # in the parent -- the first version of this guard printed a failure line
+  # and still let the suite exit 0, which is precisely the toothless-check
+  # shape this suite exists to catch. Record to a file instead and fold it
+  # into the count at the end, where the exit code is decided.
+  echo "FAIL: test helper '$1' was called before it was defined (block did not run)" >&2
+  echo "$1" >>"$WORKDIR/.unrun"
+  return 127
+}
+
+
 # Build a scratch repo whose .github/review-policy.yml carries <body>, and
 # whose scripts/ dir holds a stub classifier exiting <cls_rc> (or no
 # classifier at all when cls_rc is "absent").
@@ -273,6 +293,59 @@ _mkr 'coderabbit:\n  url: http://x.example\n  invoke: never\n' 1 'never'        
 _mkr 'coderabbit:\n\tinvoke: never\n'                        0 'tab in indentation'          'the reported reason names the tab, not duplicate keys'
 _mkr 'coderabbit:\n  invoke: never\n  invoke: always\n'      0 'duplicate invoke keys'       'the reported reason still names duplicate keys when that is the cause'
 
+echo "--- #1084 r14: document validity comes from a real parser ---"
+# <policy> <expect_rc> <expect_reason_substr> <name> — runs with yq available.
+# A document that go-yaml REJECTS must invoke even though the `coderabbit`
+# block itself is intact: enumeration of malformed shapes does not terminate,
+# so validity is delegated rather than hand-detected.
+_mkr 'other:\n  [bad\ncoderabbit:\n  invoke: never\n'        0 'not valid YAML' 'an unclosed flow sequence elsewhere invokes'
+_mkr 'other: {bad\ncoderabbit:\n  invoke: never\n'           0 'not valid YAML' 'an unclosed flow mapping elsewhere invokes'
+_mkr 'other: *nosuchanchor\ncoderabbit:\n  invoke: never\n'  0 'not valid YAML' 'an undefined anchor elsewhere invokes'
+# A consistently indented root mapping is VALID, and its explicit opt-out must
+# be honoured -- the column-zero matcher never opened the block and defaulted
+# to `always`, forcing the very wait the policy disabled.
+_mkr '  coderabbit:\n    invoke: never\n'                    1 'never'          'an indented root mapping still honours never'
+# yq resolves duplicates last-wins and SILENTLY, so delegating wholesale would
+# regress exactly the shape this script defends. The duplicate detector runs
+# first and stays authoritative.
+_mkr 'coderabbit:\n  invoke: always\n  invoke: never\n'      0 'duplicate invoke keys'  'duplicate keys stay ambiguous even though yq would answer never'
+_mkr 'coderabbit:\n  invoke: always\ncoderabbit:\n  invoke: never\n' 0 'coderabbit blocks' 'duplicate blocks stay ambiguous even though yq would answer never'
+
+echo "--- #1084 r14: the yq-absent fallback still stands on its own ---"
+# Unreachable on any machine that has yq, so it would never be exercised
+# without this seam -- an untested fallback is a fallback that has stopped
+# working without anyone noticing.
+_mkn() {  # <policy-text> <expect_rc> <name>
+  local dir; dir=$(mktemp -d "$WORKDIR/s.XXXXXX"); mkdir -p "$dir/.github" "$dir/scripts"
+  cp "$SCRIPT" "$dir/scripts/coderabbit-should-invoke.sh"; chmod +x "$dir/scripts/coderabbit-should-invoke.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/scripts/phase-4b-classifier.sh"; chmod +x "$dir/scripts/phase-4b-classifier.sh"
+  printf '%b' "$1" >"$dir/.github/review-policy.yml"
+  ( cd "$dir" && MERGEPATH_YQ_BIN=__absent_yq__ ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
+  [ $? = "$2" ] && pass "$3" || fail "$3 (expected rc=$2)"
+}
+_mkn 'coderabbit:\n  invoke: never\n'          1 'without yq: a plain never still skips'
+_mkn 'coderabbit:\n  invoke: always\n'         0 'without yq: a plain always still invokes'
+_mkn 'coderabbit:\n\tinvoke: never\n'          0 'without yq: the awk tab detection still invokes'
+_mkn 'coderabbit:\n  enabled true\n  invoke: never\n' 0 'without yq: the awk colonless detection still invokes'
+_mkn 'coderabbit:\n  invoke: never\n  invoke: always\n' 0 'without yq: duplicate keys still invoke'
+# The honest limit of the fallback, pinned so it is not mistaken for coverage:
+# without a parser these two are NOT detected, and both fail SAFE (invoke).
+_mkn 'other:\n  [bad\ncoderabbit:\n  invoke: always\n' 0 'without yq: an invalid document is undetected but still invokes'
+_mkn '  coderabbit:\n    invoke: never\n'      0 'without yq: an indented root is unread, defaulting to invoke'
+
+echo "--- #1084 r13: trailing content after a closing quote ---"
+# Measured against go-yaml, recorded here because the behaviour is not what
+# the YAML whitespace-before-hash rule suggests and the r8 comment got it
+# wrong: `"never"#junk` PARSES to a clean `never` (a comment opens straight
+# after a closing quote), while `"never" junk` and `"never"junk` both REJECT.
+#
+# The first case is therefore a DELIBERATE divergence, not agreement with the
+# parser -- pinned so it cannot be quietly "corrected" into a skip.
+_mkr 'coderabbit:\n  invoke: "never" junk\n'  0 'malformed quoting' 'trailing bare word after a closing quote invokes (go-yaml rejects it)'
+_mkr 'coderabbit:\n  invoke: "never"junk\n'   0 'malformed quoting' 'unspaced trailing word after a closing quote invokes (go-yaml rejects it)'
+_mkr 'coderabbit:\n  invoke: "never"#junk\n'  0 'malformed quoting' 'DELIBERATE divergence: go-yaml reads this as never, we invoke anyway'
+_mkr 'coderabbit:\n  invoke: "never" # ok\n'  1 'never'             'a properly spaced trailing comment still honours never'
+
 echo "--- #1084 r12: tabs are not YAML indentation ---"
 # `%b` so the tabs are visible as \t in this source rather than as invisible
 # literal whitespace an editor or a lint pass could silently convert.
@@ -381,6 +454,11 @@ exit 0' 'no parseable files_inspected' 'an unparseable document reports as unpar
 _diag '#!/usr/bin/env bash
 echo "{\"files_inspected\": 0}"
 exit 0' 'inspected no files' 'a genuine empty inspection reports as such'
+
+# Fold in anything the command-not-found hook recorded from its subshell.
+if [ -s "$WORKDIR/.unrun" ]; then
+  FAIL=$((FAIL + $(wc -l <"$WORKDIR/.unrun" | tr -d ' ')))
+fi
 
 echo
 echo "test_coderabbit_should_invoke: $PASS passed, $FAIL failed"

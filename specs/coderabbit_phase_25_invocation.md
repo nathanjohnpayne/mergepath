@@ -28,13 +28,17 @@ The reader answers only from an unambiguous file. Each of the following invokes 
 - A quoted scalar followed by anything other than whitespace or a comment (`invoke: "never" junk`).
 - An unreadable or absent config file.
 
-> The subset below exists because the reader is hand-rolled. Delegating to `yq` would handle all of it by construction and is tracked in #1090; the open question there is what a host without `yq` should do, which is a behaviour change rather than a refactor.
+**Document validity is decided by a real parser, not by this list.** When `yq` is on `PATH` it rules on whether the file parses, and a document it rejects invokes. Enumerating malformed shapes does not terminate — review found tab indentation, then colonless children, then unclosed flow collections and undefined anchors, each a document no parser accepts and each reached only after the previous was patched — and deciding whether an arbitrary document parses *is* parsing YAML. `scripts/lib/ensure-yq.sh` is canonical to every consumer with a pinned version, so this adds no dependency.
+
+Delegation is **partial by design, and the split is measured**: go-yaml resolves duplicate keys and duplicate blocks last-wins and silently, so `invoke: always` followed by `invoke: never` reads as a clean `never` to `yq` while the ambiguity rules above correctly reject it. Handing `yq` the whole job would regress exactly the shape this decider defends. The duplicate and quoting rules therefore run **first** and stay authoritative; `yq` rules on validity and on reading a well-formed file. Reordering the two is a behaviour change, not a refactor.
+
+When `yq` is absent the hand-rolled reader stands alone, unchanged. It detects strictly less — an invalid document elsewhere in the file is simply not seen — and every ambiguity it cannot see still resolves toward invoking. #1090 tracks replacing the field reader outright; the duplicate detection has to survive it.
 
 The reader accepts ordinary YAML spellings rather than one fixed shape, and must not treat a legal spelling as absent:
 
-- Block child indentation is **derived from the block's first child**, not assumed. A four-space-indented policy must be read, not silently defaulted.
+- Block child indentation is **derived from the block's first child**, not assumed. A four-space-indented policy must be read, not silently defaulted. A consistently indented *root* mapping is likewise legal and must be read; with `yq` present this follows from the parser rather than from indentation arithmetic.
 - A quoted key (`"invoke": …`) is the same key as its bare spelling, for both value lookup and duplicate detection.
-- A `#` opens a comment only when preceded by whitespace, so `invoke: "never"#junk` is malformed rather than a commented value.
+- `invoke: "never"#junk` invokes. This is a **deliberate divergence** from go-yaml, which opens a comment straight after a closing quote and yields a clean `never`; the whitespace-before-`#` rule governs plain scalars, not that position. A value wearing unintended trailing junk is a typo, and the asymmetry holds — the cost of being wrong here is one unnecessary wait, the cost the other way is a silently skipped round.
 
 And the reader must answer from the right place:
 

@@ -264,10 +264,20 @@ coderabbit_field() {  # <field>
         idx = index(rest, q)
         if (idx > 0) {
           after = substr(rest, idx + 1)
-          # YAML needs WHITESPACE before a `#` for it to open a comment, so
-          # `"never"#junk` is malformed rather than a commented value; the
-          # zero-whitespace alternative accepted it and produced a clean
-          # `never` (#1084 r8).
+          # Trailing content after the closing quote is not a value. Measured
+          # against go-yaml, `"never" junk` and `"never"junk` both REJECT, so
+          # invoking on them agrees with the parser.
+          #
+          # `"never"#junk` is the deliberate divergence: the r8 rationale here
+          # claimed the missing whitespace makes it malformed, and that is
+          # WRONG about go-yaml -- it opens a comment straight after a closing
+          # quote and yields a clean `never`. The whitespace rule governs plain
+          # scalars, not the position after a closing quote. This stays strict
+          # anyway, because the contract is to resolve toward invoking and a
+          # value wearing unintended trailing junk is a typo, not an
+          # instruction to skip review. The cost of being wrong here is one
+          # unnecessary wait; the cost the other way is a silently skipped
+          # round (#1084 r8, corrected r13).
           if (after ~ /^[[:space:]]*$/ || after ~ /^[[:space:]]+#/) {
             print substr(rest, 1, idx - 1); exit
           }
@@ -323,6 +333,50 @@ case "${CR_ENABLED}${INVOKE_MODE}" in
     emit invoke "ambiguous coderabbit policy block ($AMB)"
     ;;
 esac
+
+# ── Delegate document validity to a real parser ─────────────────────────────
+#
+# The awk reader above can only reject the malformations it enumerates, and
+# review kept finding shapes it had not: tabs (r12), colonless children (r13),
+# then unclosed flow collections, unclosed flow mappings and undefined anchors
+# (r14) -- each one a document go-yaml rejects while the reader happily
+# returned a suppressing `never` from the intact `coderabbit` block. That list
+# does not terminate; deciding whether an arbitrary document parses IS parsing
+# YAML, so enumeration is the wrong instrument.
+#
+# yq is already a fleet dependency (scripts/lib/ensure-yq.sh is canonical to
+# every consumer with a pinned version), so when it is on PATH it decides
+# validity. This is NOT a full delegation, and the split is deliberate and
+# measured: go-yaml resolves DUPLICATE keys and duplicate blocks last-wins,
+# silently, so `invoke: always` followed by `invoke: never` reads as a clean
+# `never` to yq while the awk detector correctly calls it ambiguous. Handing
+# yq the whole job would therefore be a REGRESSION on exactly the shape this
+# script exists to defend. The duplicate detector stays authoritative and runs
+# first; yq only rules on validity and on reading a well-formed file.
+#
+# yq absent is not an error: the awk path stands on its own as it did before,
+# and every ambiguity it cannot see still resolves toward invoking.
+# MERGEPATH_YQ_BIN is a test seam: pointing it at a name that does not exist
+# exercises the yq-absent fallback, which is otherwise unreachable on any
+# machine that has yq installed -- and therefore never covered by CI.
+YQ_BIN=${MERGEPATH_YQ_BIN:-yq}
+if command -v "$YQ_BIN" >/dev/null 2>&1 && [ -f "$CONFIG" ]; then
+  if ! "$YQ_BIN" '.' "$CONFIG" >/dev/null 2>&1; then
+    emit invoke "policy file is not valid YAML (rejected by yq); ambiguity resolves toward invoking"
+  fi
+  # A valid document may still have a root mapping the column-zero matcher
+  # never opened -- a consistently indented root parses fine but left the awk
+  # reader defaulting to `always`, so an explicit opt-out silently triggered
+  # the wait it was set to avoid (#1084 r14). Re-read from the parser, which
+  # has no such blind spot. The duplicate check above already ran, so this
+  # cannot resurrect a suppressing value out of an ambiguous file.
+  YQ_ENABLED=$("$YQ_BIN" -r '.coderabbit.enabled // ""' "$CONFIG" 2>/dev/null) || YQ_ENABLED=""
+  YQ_INVOKE=$("$YQ_BIN" -r '.coderabbit.invoke // ""' "$CONFIG" 2>/dev/null) || YQ_INVOKE=""
+  case "$YQ_ENABLED" in null) YQ_ENABLED="" ;; esac
+  case "$YQ_INVOKE" in null) YQ_INVOKE="" ;; esac
+  [ -n "$YQ_ENABLED" ] && CR_ENABLED=$YQ_ENABLED
+  [ -n "$YQ_INVOKE" ] && INVOKE_MODE=$YQ_INVOKE
+fi
 
 CR_ENABLED=${CR_ENABLED:-true}
 if [ "$CR_ENABLED" = "false" ]; then
