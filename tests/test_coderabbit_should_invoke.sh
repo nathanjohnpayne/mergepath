@@ -238,6 +238,41 @@ case_is 'quoted duplicate key is ambiguous'    "$ON"$'\n'"  invoke: never"$'\n''
 case_is 'no space before # is malformed'       "$ON"$'\n''  invoke: "never"#junk'                    0 0
 case_is 'space before # is a real comment'     "$ON"$'\n''  invoke: "never" # ok'                    0 1
 
+echo "--- #1084 r13: a direct child must be a mapping entry ---"
+# Split by what go-yaml actually does, measured per case: the first four
+# REJECT at parse time, the last two PARSE but leave `coderabbit` as a string
+# or a list rather than a policy mapping. Both groups must invoke; only the
+# reported REASON differs, so each case asserts the reason too.
+_mkr() {  # <policy-text-with-escapes> <expect_rc> <expect_reason_substr> <name>
+  local dir; dir=$(mktemp -d "$WORKDIR/s.XXXXXX"); mkdir -p "$dir/.github" "$dir/scripts"
+  cp "$SCRIPT" "$dir/scripts/coderabbit-should-invoke.sh"; chmod +x "$dir/scripts/coderabbit-should-invoke.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/scripts/phase-4b-classifier.sh"; chmod +x "$dir/scripts/phase-4b-classifier.sh"
+  printf '%b' "$1" >"$dir/.github/review-policy.yml"
+  local out rc
+  out=$( cd "$dir" && ./scripts/coderabbit-should-invoke.sh 99 --json 2>/dev/null ); rc=$?
+  local got; got=$(printf '%s' "$out" | jq -r '.reason' 2>/dev/null)
+  if [ "$rc" = "$2" ] && case "$got" in *"$3"*) true ;; *) false ;; esac; then
+    pass "$4"
+  else
+    fail "$4 (expected rc=$2 reason~'$3', got rc=$rc reason='$got')"
+  fi
+}
+# go-yaml PARSE-REJECT: a colonless line among mapping entries.
+_mkr 'coderabbit:\n  enabled true\n  invoke: never\n'        0 'child is not a mapping entry' 'a colonless child BEFORE never does not let never win'
+_mkr 'coderabbit:\n  invoke: never\n  enabled true\n'        0 'child is not a mapping entry' 'a colonless child AFTER never does not let never win'
+_mkr 'coderabbit:\n  enabled true # a: b\n  invoke: never\n' 0 'child is not a mapping entry' 'a colonless child cannot borrow the colon from its own comment'
+_mkr 'coderabbit:\n  - item\n  invoke: never\n'              0 'child is not a mapping entry' 'a sequence entry mixed into the mapping is malformed'
+# go-yaml PARSES, but coderabbit is not a policy mapping.
+_mkr 'coderabbit:\n  justaword\n'                            0 'not a block mapping'         'colonless children ALONE are a plain scalar, not a parse error'
+_mkr 'coderabbit:\n  - invoke: never\n'                      0 'invoke=always'               'a list of mappings has no invoke scalar to honour'
+# go-yaml PARSES with a readable never: the knob must still work.
+_mkr 'coderabbit:\n  "a: b": 1\n  invoke: never\n'          1 'never'                       'a quoted key containing a colon is still a mapping entry'
+_mkr 'coderabbit:\n  url: http://x.example\n  invoke: never\n' 1 'never'                     'a colon inside a value does not make the child colonless'
+# The ambiguity reason must name the diagnosis the parser reached, not a
+# fixed list of causes (#1084 r13).
+_mkr 'coderabbit:\n\tinvoke: never\n'                        0 'tab in indentation'          'the reported reason names the tab, not duplicate keys'
+_mkr 'coderabbit:\n  invoke: never\n  invoke: always\n'      0 'duplicate invoke keys'       'the reported reason still names duplicate keys when that is the cause'
+
 echo "--- #1084 r12: tabs are not YAML indentation ---"
 # `%b` so the tabs are visible as \t in this source rather than as invisible
 # literal whitespace an editor or a lint pass could silently convert.

@@ -215,6 +215,23 @@ coderabbit_field() {  # <field>
         if (prev_scalar) { badindent++ }
         next
       }
+      # A direct child has to be a mapping ENTRY. go-yaml rejects a colonless
+      # line sitting among mapping entries -- `enabled true` next to
+      # `invoke: never` fails to load -- but the value extraction below left
+      # such a line looking like an ordinary scalar child, so the suppressing
+      # `invoke: never` was still honoured on a document no parser reads
+      # (#1084 r13). Order does not matter: the colonless line rejects from
+      # either side of the valid one, and a bare `- item` mixed into the
+      # mapping rejects the same way.
+      #
+      # The trailing comment is stripped BEFORE the colon test, or
+      # `enabled true # a: b` borrows the colon out of its own comment and
+      # reads as well-formed.
+      probe = $0
+      sub(/^[[:space:]]+/, "", probe)
+      sub(/[[:space:]]+#.*$/, "", probe)
+      if (index(probe, ":") == 0) { nokey++; next }
+      haskey++
       # Remember whether THIS direct child is a mapping key (empty value) or a
       # scalar, so the next deeper line can be judged.
       val = $0
@@ -227,6 +244,14 @@ coderabbit_field() {  # <field>
     }
     END {
       if (tabindent > 0) { print "<<ambiguous:tab in indentation>>"; exit }
+      # Colonless children split by what the document actually IS. Mixed with
+      # real entries it is a parse error; on their own they are a multi-line
+      # plain scalar, which go-yaml accepts and which makes `coderabbit` a
+      # string rather than a policy -- the same shape as `coderabbit: |`, and
+      # it earns the same diagnosis. Both roads lead to invoke, but a machine
+      # reader gets the true reason.
+      if (nokey > 0 && haskey > 0) { print "<<ambiguous:child is not a mapping entry>>"; exit }
+      if (nokey > 0) { print "<<ambiguous:coderabbit is not a block mapping>>"; exit }
       if (badindent > 0) { print "<<ambiguous:inconsistent child indentation>>"; exit }
       if (nonmap > 0) { print "<<ambiguous:coderabbit is not a block mapping>>"; exit }
       if (blocks > 1) { print "<<ambiguous:" blocks " coderabbit blocks>>"; exit }
@@ -287,7 +312,15 @@ INVOKE_MODE=$(coderabbit_field invoke)
 case "${CR_ENABLED}${INVOKE_MODE}" in
   *"<<ambiguous:"*)
     echo "[coderabbit-should-invoke] WARN: ambiguous coderabbit policy — enabled='${CR_ENABLED}' invoke='${INVOKE_MODE}'" >&2
-    emit invoke "ambiguous coderabbit policy block (duplicate blocks or duplicate direct keys)"
+    # Report the diagnosis the parser actually reached, not a fixed list of
+    # causes. The marker already carries it, and the wording predates most of
+    # the shapes that can now set one -- a tab-indented policy was being
+    # reported as "duplicate blocks or duplicate direct keys", which is a
+    # false statement about the file for a machine reader to act on (#1084
+    # r13, same class as the r11 diagnosis split).
+    case "$CR_ENABLED" in *"<<ambiguous:"*) AMB=$CR_ENABLED ;; *) AMB=$INVOKE_MODE ;; esac
+    AMB=${AMB#*<<ambiguous:}; AMB=${AMB%%>>*}
+    emit invoke "ambiguous coderabbit policy block ($AMB)"
     ;;
 esac
 
