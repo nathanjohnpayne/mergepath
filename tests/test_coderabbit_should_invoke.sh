@@ -294,6 +294,11 @@ _mkr 'coderabbit:\n\tinvoke: never\n'                        0 'tab in indentati
 _mkr 'coderabbit:\n  invoke: never\n  invoke: always\n'      0 'duplicate invoke keys'       'the reported reason still names duplicate keys when that is the cause'
 
 echo "--- #1084 r14: document validity comes from a real parser ---"
+# yq is OPTIONAL for the production script, so it must be optional for the
+# suite too. Without this gate a host lacking yq fails four cases for a reason
+# that is not a defect -- and this file is canonical to all nine consumers,
+# so that would red every consumer that has not bootstrapped yq (#1084 r15).
+if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -q mikefarah; then
 # <policy> <expect_rc> <expect_reason_substr> <name> — runs with yq available.
 # A document that go-yaml REJECTS must invoke even though the `coderabbit`
 # block itself is intact: enumeration of malformed shapes does not terminate,
@@ -301,15 +306,24 @@ echo "--- #1084 r14: document validity comes from a real parser ---"
 _mkr 'other:\n  [bad\ncoderabbit:\n  invoke: never\n'        0 'not valid YAML' 'an unclosed flow sequence elsewhere invokes'
 _mkr 'other: {bad\ncoderabbit:\n  invoke: never\n'           0 'not valid YAML' 'an unclosed flow mapping elsewhere invokes'
 _mkr 'other: *nosuchanchor\ncoderabbit:\n  invoke: never\n'  0 'not valid YAML' 'an undefined anchor elsewhere invokes'
-# A consistently indented root mapping is VALID, and its explicit opt-out must
-# be honoured -- the column-zero matcher never opened the block and defaulted
-# to `always`, forcing the very wait the policy disabled.
-_mkr '  coderabbit:\n    invoke: never\n'                    1 'never'          'an indented root mapping still honours never'
+# A consistently indented root mapping is VALID YAML that the column-zero
+# matcher does not open, so it defaults to `always` and INVOKES. That is a
+# known limitation, not the desired end state (#1090) -- but it fails SAFE,
+# and the alternative was worse: re-reading fields through yq to honour it
+# handed duplicate-key policies to yq's silent last-wins, which SKIPPED review
+# (#1084 r15). These three pin the fail-safe answer for all of it.
+_mkr '  coderabbit:\n    invoke: never\n'                    0 'invoke=always' 'an indented root is not read, defaulting to invoke (known limit, fail-safe)'
+_mkr '  coderabbit:\n    enabled: false\n'                   0 'invoke=always' 'an indented root enabled:false also defaults to invoke, never to skip'
+_mkr '  coderabbit:\n    invoke: always\n    invoke: never\n' 0 'invoke=always' 'an indented root with duplicate keys must never resolve to skip'
 # yq resolves duplicates last-wins and SILENTLY, so delegating wholesale would
 # regress exactly the shape this script defends. The duplicate detector runs
 # first and stays authoritative.
 _mkr 'coderabbit:\n  invoke: always\n  invoke: never\n'      0 'duplicate invoke keys'  'duplicate keys stay ambiguous even though yq would answer never'
 _mkr 'coderabbit:\n  invoke: always\ncoderabbit:\n  invoke: never\n' 0 'coderabbit blocks' 'duplicate blocks stay ambiguous even though yq would answer never'
+
+else
+  echo "SKIP: parser-validity cases (mikefarah yq not on PATH; the script falls back to awk here)"
+fi
 
 echo "--- #1084 r14: the yq-absent fallback still stands on its own ---"
 # Unreachable on any machine that has yq, so it would never be exercised

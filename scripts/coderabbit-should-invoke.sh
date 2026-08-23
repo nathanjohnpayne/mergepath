@@ -364,18 +364,26 @@ if command -v "$YQ_BIN" >/dev/null 2>&1 && [ -f "$CONFIG" ]; then
   if ! "$YQ_BIN" '.' "$CONFIG" >/dev/null 2>&1; then
     emit invoke "policy file is not valid YAML (rejected by yq); ambiguity resolves toward invoking"
   fi
-  # A valid document may still have a root mapping the column-zero matcher
-  # never opened -- a consistently indented root parses fine but left the awk
-  # reader defaulting to `always`, so an explicit opt-out silently triggered
-  # the wait it was set to avoid (#1084 r14). Re-read from the parser, which
-  # has no such blind spot. The duplicate check above already ran, so this
-  # cannot resurrect a suppressing value out of an ambiguous file.
-  YQ_ENABLED=$("$YQ_BIN" -r '.coderabbit.enabled // ""' "$CONFIG" 2>/dev/null) || YQ_ENABLED=""
-  YQ_INVOKE=$("$YQ_BIN" -r '.coderabbit.invoke // ""' "$CONFIG" 2>/dev/null) || YQ_INVOKE=""
-  case "$YQ_ENABLED" in null) YQ_ENABLED="" ;; esac
-  case "$YQ_INVOKE" in null) YQ_INVOKE="" ;; esac
-  [ -n "$YQ_ENABLED" ] && CR_ENABLED=$YQ_ENABLED
-  [ -n "$YQ_INVOKE" ] && INVOKE_MODE=$YQ_INVOKE
+  # NOTE: yq rules on VALIDITY ONLY. An earlier revision also re-read the two
+  # fields through yq, to honour a consistently indented root mapping the
+  # column-zero matcher never opens. That was wrong twice over, and review
+  # caught both (#1084 r15):
+  #
+  #   - `.coderabbit.enabled // ""` coalesces boolean FALSE to the alternative
+  #     in mikefarah yq, so an explicit `enabled: false` read back as unset and
+  #     defaulted to true.
+  #   - Worse, the awk duplicate detector cannot see an indented root AT ALL,
+  #     so for that shape it never ran and yq applied its silent last-wins:
+  #     `invoke: always` followed by `invoke: never` SKIPPED review. The claim
+  #     that the duplicate detector "runs first and stays authoritative" was
+  #     therefore false precisely where it mattered, and the mutation test that
+  #     was supposed to pin it used column-zero fixtures, so it passed.
+  #
+  # Reading fields through the parser needs duplicate detection that also sees
+  # parser-discovered roots. Until that exists (#1090), yq does not supply
+  # values. An indented root is simply not read, which defaults to `always` and
+  # INVOKES -- the fail-safe direction, and the same answer this script gave
+  # before yq was involved at all.
 fi
 
 CR_ENABLED=${CR_ENABLED:-true}

@@ -117,7 +117,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-44.** Advisory status never overrides the conversation-resolution gate: an unresolved CodeRabbit thread still blocks merge until fixed-or-rebutted and resolved. ● — REVIEW_POLICY.md § Phase 2.5
 
-**R-45.** CodeRabbit runs on all PRs in enabled repos regardless of size (wave fan-out mirrors, opened with the ignore marker, are the exception — R-201). ● — REVIEW_POLICY.md § Phase 2.5
+**R-45.** The CodeRabbit **App** reviews all PRs in enabled repos regardless of size — `.coderabbit.yml` governs it and `coderabbit.invoke` does not, so a skipped Phase 2.5 still accrues App findings as unresolved threads (wave fan-out mirrors, opened with the ignore marker, are the exception — R-201). What is now selective is the **agent's wait**, which R-39 keys to the decider; the two must not be conflated. ● — REVIEW_POLICY.md § Phase 2.5
 
 **R-46.** A wait exit `6` (skip: paused / non-base-branch / draft) must have its named cause resolved and is never a clean clearance. ● — REVIEW_POLICY.md § Phase 2.5
 

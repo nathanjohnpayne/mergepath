@@ -409,9 +409,11 @@ Worked example: in a `--sync-all` wave, the pure-mirror consumer PRs verify clea
 Phase 4 has two sub-phases that together cover the two ways external review can run:
 
 - **Phase 4a — Automated external review** via the ChatGPT Codex Connector GitHub App. This is the default happy path. The authoring agent drives the review loop without human intervention until Codex signals clearance, then runs a merge-gate check and merges.
-- **Phase 4b — Manual CLI fallback** via a different agent's CLI session (e.g., Codex CLI as `nathanpayne-codex`, or Cursor, or Claude Code). This is the escape hatch when 4a escalates (disagreement or runaway), times out, or is unavailable because `codex.enabled: false`. The human mediates the handoff.
+- **Phase 4b — Manual CLI fallback** via a different agent's CLI session (e.g., Codex CLI as `nathanpayne-codex`, or Cursor, or Claude Code). This is the escape hatch when 4a **times out** or is **unavailable** because `codex.enabled: false` — cases where review did not happen and a substitute reviewer is the right answer. The human mediates the handoff.
 
-An agent proceeds to 4a first. If 4a escalates, times out, or is disabled, the agent falls back to 4b and surfaces the handoff to the human per [Handoff Message Format](#handoff-message-format).
+  **Disagreement and runaway do NOT route here.** They mean review *did* happen and did not converge, which only a human can adjudicate. Dispatching the automated 4b leg for them is unsound: that leg can post an `APPROVED`, letting an unconverged PR merge with nobody having adjudicated it. See § Disagreements and Tiebreaking.
+
+An agent proceeds to 4a first. If 4a **times out or is disabled**, the agent falls back to 4b and surfaces the handoff to the human per [Handoff Message Format](#handoff-message-format). If 4a instead **escalates to disagreement or runaway**, the agent stops the loop, posts a comment summarizing both positions with links to the rounds, alerts the human, and does not merge — it does not dispatch 4b.
 
 #### Phase 4a: Automated External Review (Codex GitHub App)
 
@@ -489,7 +491,9 @@ Arming is not one-shot on the approval event. The approval job arms on three tri
 
 #### Phase 4b: Manual CLI Fallback (Human Handoff)
 
-Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times out (single timeout, exit code `4` from `codex-review-request.sh`), or when `codex.enabled: false` in the repo. It preserves the cross-agent review flow that existed before the Codex GitHub App integration and provides a human-mediated escape hatch.
+Phase 4b is invoked when Phase 4a **times out** (single timeout, exit code `4` from `codex-review-request.sh`) or when `codex.enabled: false` in the repo. It preserves the cross-agent review flow that existed before the Codex GitHub App integration and provides a human-mediated escape hatch.
+
+It is **not** the destination for disagreement or runaway. Those are review-did-not-converge outcomes and take the human-tiebreaker route instead; routing them here would let the automated leg approve a review that never converged.
 
 11b. The authoring agent posts the handoff message (see [Handoff Message Format](#handoff-message-format)) as a PR comment and alerts the human.
 
