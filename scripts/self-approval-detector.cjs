@@ -21,6 +21,7 @@
 
 'use strict';
 
+// BEGIN SELF-APPROVAL DETECTOR IMPLEMENTATION
 function normalized(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
@@ -169,5 +170,6 @@ function latestApprovedReviews(input) {
     .map(reviewer => latestByReviewer.get(reviewer))
     .filter(review => review && normalized(review.state).toUpperCase() === 'APPROVED');
 }
+// END SELF-APPROVAL DETECTOR IMPLEMENTATION
 
 module.exports = { decide, latestApprovedReviews };

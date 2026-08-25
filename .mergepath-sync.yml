@@ -698,6 +698,15 @@ paths:
     # used by both the live workflow and its adversarial CI suite.
     type: canonical
     consumers: all
+  - path: scripts/render-self-approval-bootstrap.cjs
+    # Generates the bounded first-rollout copy in agent-review.yml from the
+    # canonical detector implementation. The check wrapper runs --check so
+    # the workflow never becomes a separately maintained implementation.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/self-approval-detector.cjs"
+      - ".github/workflows/agent-review.yml"
   - path: scripts/resolve-pr-threads.sh
     type: canonical
     consumers: all
@@ -1062,6 +1071,7 @@ paths:
     consumers: all
     requires:
       - "scripts/self-approval-detector.cjs"
+      - ".github/workflows/agent-review.yml"
   # Pairs with scripts/post-phase-4b-handoff.sh (#281). PATH-shimmed
   # gh; no live GitHub network. Travels with the helper so consumers
   # exercise the same renderer they propagate.
@@ -1572,6 +1582,7 @@ paths:
       - "scripts/phase-4b/"                    # check_phase_4b_automation (#579)
       - "scripts/disagreement-detector.cjs"    # check_disagreement_detector
       - "scripts/self-approval-detector.cjs"   # check_self_approval_detector (#1094)
+      - "scripts/render-self-approval-bootstrap.cjs"  # generated first-rollout mirror (#1094)
       - "scripts/request-label-removal.sh"     # check_canonical_bugs_263caf3
       - "scripts/resolve-pr-threads.sh"        # check_resolve_pr_threads
       - "scripts/lib/ensure-yq.sh"             # check_resolve_pr_threads CI-only yq bootstrap (#616)

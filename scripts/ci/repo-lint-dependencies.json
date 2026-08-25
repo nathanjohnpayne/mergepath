@@ -53,6 +53,12 @@
       "scripts/phase-4b/accounting.schema.json",
       "scripts/phase-4b/prices.json",
       "tests/test_phase_4b_accounting.sh"
+    ],
+    "check_self_approval_detector": [
+      ".github/workflows/agent-review.yml",
+      "scripts/self-approval-detector.cjs",
+      "scripts/render-self-approval-bootstrap.cjs",
+      "tests/test_self_approval_detector.sh"
     ]
   }
 }

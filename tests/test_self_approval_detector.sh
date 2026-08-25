@@ -16,6 +16,8 @@ trap 'rm -f "$BOOTSTRAP_MODULE"' EXIT
 awk '
   /BEGIN SELF-APPROVAL BOOTSTRAP/ { capture=1; next }
   /END SELF-APPROVAL BOOTSTRAP/   { capture=0 }
+  /BEGIN SELF-APPROVAL RESOLVER/  { capture=1; next }
+  /END SELF-APPROVAL RESOLVER/    { capture=0 }
   capture {
     sub(/^            /, "")
     print
@@ -25,11 +27,11 @@ if [ ! -s "$BOOTSTRAP_MODULE" ]; then
   echo "FAIL: could not extract the first-rollout bootstrap detector from $WORKFLOW" >&2
   exit 1
 fi
-printf '\nmodule.exports = { bootstrapDetector };\n' >> "$BOOTSTRAP_MODULE"
+printf '\nmodule.exports = { bootstrapDetector, selectDetector };\n' >> "$BOOTSTRAP_MODULE"
 
 DETECTOR_PATH="$DETECTOR" BOOTSTRAP_PATH="$BOOTSTRAP_MODULE" node <<'NODE'
 const canonical = require(process.env.DETECTOR_PATH);
-const { bootstrapDetector } = require(process.env.BOOTSTRAP_PATH);
+const { bootstrapDetector, selectDetector } = require(process.env.BOOTSTRAP_PATH);
 const implementations = [
   ['canonical', canonical],
   ['bootstrap', bootstrapDetector()],
@@ -167,6 +169,70 @@ for (const [implementationName, { decide, latestApprovedReviews }] of implementa
   if (phase3.action !== 'allow' || phase4.action !== 'block') {
     throw new Error(`${implementationName}: persisted approval transition was not reproduced: ${JSON.stringify({phase3, phase4})}`);
   }
+
+  const beforeEdit = decide({
+    ...shared,
+    reviewer: 'nathanpayne-claude',
+    prBody: 'Authoring-Agent: codex',
+    requiresExternalReview: true,
+  });
+  const afterEdit = decide({
+    ...shared,
+    reviewer: 'nathanpayne-claude',
+    prBody: 'Authoring-Agent: claude',
+    requiresExternalReview: true,
+  });
+  if (beforeEdit.action !== 'allow' || afterEdit.action !== 'block') {
+    throw new Error(`${implementationName}: PR-body edit did not invalidate the carried approval: ${JSON.stringify({beforeEdit, afterEdit})}`);
+  }
+}
+
+const canonicalSentinel = {name: 'canonical'};
+const bootstrapSentinel = {name: 'bootstrap'};
+let canonicalLoads = 0;
+let bootstrapLoads = 0;
+const modulePresent = selectDetector({
+  modulePresent: true,
+  trustedWorkflow: 'SELF_APPROVAL_DETECTOR_REQUIRED_V1',
+  loadCanonical: () => {
+    canonicalLoads += 1;
+    return canonicalSentinel;
+  },
+  loadBootstrap: () => {
+    bootstrapLoads += 1;
+    return bootstrapSentinel;
+  },
+});
+if (modulePresent !== canonicalSentinel || canonicalLoads !== 1 || bootstrapLoads !== 0) {
+  throw new Error('module-present resolver did not select only the canonical detector');
+}
+
+const legacyTrustedWorkflow = selectDetector({
+  modulePresent: false,
+  trustedWorkflow: 'name: Agent Review Pipeline\n# legacy workflow',
+  loadCanonical: () => canonicalSentinel,
+  loadBootstrap: () => {
+    bootstrapLoads += 1;
+    return bootstrapSentinel;
+  },
+});
+if (legacyTrustedWorkflow !== bootstrapSentinel || bootstrapLoads !== 1) {
+  throw new Error('legacy trusted workflow did not select the bounded bootstrap');
+}
+
+let markerMissingModuleFailed = false;
+try {
+  selectDetector({
+    modulePresent: false,
+    trustedWorkflow: 'SELF_APPROVAL_DETECTOR_REQUIRED_V1',
+    loadCanonical: () => canonicalSentinel,
+    loadBootstrap: () => bootstrapSentinel,
+  });
+} catch (error) {
+  markerMissingModuleFailed = /already requires the detector/.test(String(error));
+}
+if (!markerMissingModuleFailed) {
+  throw new Error('marker-bearing trusted workflow with a missing module did not fail closed');
 }
 NODE
 
