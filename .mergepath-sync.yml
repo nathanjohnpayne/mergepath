@@ -631,6 +631,18 @@ paths:
     requires:
       - "scripts/lib/blocking-labels.sh"
       - "scripts/lib/review-policy-scalar.sh"
+  - path: tests/test_approval_independence_check.sh
+    # Adversarial public-seam coverage for the #1094 last-moment live body,
+    # latest-state review pagination, exact-head, and fail-closed contracts.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/"
+      - "scripts/self-approval-detector.cjs"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/review-policy-scalar.sh"
+      - "scripts/lib/blocking-labels.sh"
   - path: tests/test_repo_lint_latency_report.sh
     type: canonical
     consumers: all
@@ -694,8 +706,9 @@ paths:
     consumers: all
   - path: scripts/self-approval-detector.cjs
     # Runtime dependency of .github/workflows/agent-review.yml's
-    # block-self-approval job. It holds the #1094 Phase-3/Phase-4 boundary
-    # used by both the live workflow and its adversarial CI suite.
+    # block-self-approval job and the shared final approval continuation. It
+    # holds the #1094 Phase-3/Phase-4 boundary used by both live paths and the
+    # adversarial CI suite.
     type: canonical
     consumers: all
   - path: scripts/render-self-approval-bootstrap.cjs
@@ -1294,6 +1307,7 @@ paths:
       - "scripts/self-approval-detector.cjs"
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/"
+      - "scripts/merge-clearance-gate.sh"
       # Invoked by both merge gates in this workflow; a path-scoped sync
       # that shipped the workflow without it would leave the gate
       # referencing a missing script (#1070).
@@ -1634,6 +1648,11 @@ paths:
       # they exit 2 rather than run with the pre-#799 emptiness inference.
       - "scripts/lib/gh-api-scalar.sh"           # #799, fail-closed scalar API reads
       - "scripts/lib/review-policy-scalar.sh"    # #1062, shared governing-policy identity parse
+      - "scripts/lib/gh-api-array.sh"             # #1094, final live review pagination
+      - "scripts/lib/reviewers-helpers.sh"        # #1094, governing reviewer allow-list
+      - "scripts/lib/blocking-labels.sh"          # #1094, final mutable label recheck
+      - "scripts/self-approval-detector.cjs"      # #1094, canonical final independence decision
+      - "scripts/merge-clearance-gate.sh"         # #1094, shared Phase 4 requiredness query
 
   # Templated entries — rendered per consumer via scripts/lib/
   # template-substitution.sh using the consumer's facts.* from the

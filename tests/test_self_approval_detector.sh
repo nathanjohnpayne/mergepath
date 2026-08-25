@@ -187,6 +187,45 @@ for (const [implementationName, { decide, latestApprovedReviews }] of implementa
   }
 }
 
+if (typeof canonical.evaluateLatestApprovals !== 'function') {
+  throw new Error('canonical detector does not expose final live approval evaluation');
+}
+
+const liveReviews = [
+  {id: 20, user: {login: 'nathanpayne-codex'}, state: 'APPROVED', commit_id: 'head123', submitted_at: '2026-01-07T00:00:00Z'},
+];
+const beforeLiveEdit = canonical.evaluateLatestApprovals({
+  ...shared,
+  reviews: liveReviews,
+  headSha: 'head123',
+  requireHead: true,
+  prBody: 'Authoring-Agent: claude',
+  requiresExternalReview: true,
+});
+const afterLiveEdit = canonical.evaluateLatestApprovals({
+  ...shared,
+  reviews: liveReviews,
+  headSha: 'head123',
+  requireHead: true,
+  prBody: 'Authoring-Agent: codex',
+  requiresExternalReview: true,
+});
+if (!beforeLiveEdit.eligibleApproval || afterLiveEdit.eligibleApproval) {
+  throw new Error(`live PR-body edit did not revoke the final approval decision: ${JSON.stringify({beforeLiveEdit, afterLiveEdit})}`);
+}
+
+const staleHead = canonical.evaluateLatestApprovals({
+  ...shared,
+  reviews: liveReviews,
+  headSha: 'new-head',
+  requireHead: true,
+  prBody: 'Authoring-Agent: claude',
+  requiresExternalReview: true,
+});
+if (staleHead.eligibleApproval || staleHead.approvals.length !== 0) {
+  throw new Error(`stale-head approval survived the final exact-head filter: ${JSON.stringify(staleHead)}`);
+}
+
 const canonicalSentinel = {name: 'canonical'};
 const bootstrapSentinel = {name: 'bootstrap'};
 let canonicalLoads = 0;

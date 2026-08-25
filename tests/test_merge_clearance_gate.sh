@@ -2054,6 +2054,61 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# --derive-phase-4-requiredness query mode (#1094): the policy scope used by
+# final approval independence. Unlike --derive-external-requiredness, this is
+# intentionally independent of the optional merge-gate enablement knob.
+# ---------------------------------------------------------------------------
+
+echo; echo "--- Phase 4 Query 1: disabled external gate + over threshold → true"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"big.txt","additions":400,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-phase-4-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "Phase 4 query: threshold policy remains active when the optional external gate is disabled"
+else
+  fail "Phase 4 query: disabled-gate over-threshold expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Phase 4 Query 2: exact-head verified propagation lane → false"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $sha + " -->") }]
+')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-phase-4-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "Phase 4 query: exact-head verified propagation keeps under-threshold-equivalent standing"
+else
+  fail "Phase 4 query: verified propagation expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Phase 4 Query 3: indeterminate lane read fails closed"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS_FAIL=1 \
+  run_gate "$SCRATCH" --derive-phase-4-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" != 0 ] && [ "$OUT" != "false" ]; then
+  pass "Phase 4 query: an unreadable propagation marker cannot grant exemption"
+else
+  fail "Phase 4 query: indeterminate marker expected nonzero/no false; got rc=$RC out='$OUT'"
+fi
+
+# ---------------------------------------------------------------------------
 # --derive-rate-limit-protection query mode (#713, tightened by #772): prints
 # exactly true/false. `true` means the auto-merge rc=5 path is protected either
 # by an ENFORCED merge-clearance external gate — enabled in policy AND observably

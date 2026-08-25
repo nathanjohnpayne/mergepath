@@ -137,6 +137,8 @@ function latestApprovedReviews(input) {
     ? input.reviewerAccounts.map(normalized).filter(Boolean)
     : [];
   const prAuthor = normalized(input && input.prAuthor);
+  const headSha = normalized(input && input.headSha);
+  const requireHead = Boolean(input && input.requireHead);
   const reviews = Array.isArray(input && input.reviews) ? input.reviews : [];
   const latestByReviewer = new Map();
 
@@ -168,8 +170,35 @@ function latestApprovedReviews(input) {
 
   return reviewerAccounts
     .map(reviewer => latestByReviewer.get(reviewer))
-    .filter(review => review && normalized(review.state).toUpperCase() === 'APPROVED');
+    .filter(review =>
+      review &&
+      normalized(review.state).toUpperCase() === 'APPROVED' &&
+      (!requireHead || (headSha && normalized(review.commit_id) === headSha)),
+    );
 }
 // END SELF-APPROVAL DETECTOR IMPLEMENTATION
 
-module.exports = { decide, latestApprovedReviews };
+// Evaluate the complete latest-state approval set for a final live merge
+// decision. The workflow still owns dismissal/comment mutations, while the
+// shared continuation consumes this pure summary immediately before arming.
+function evaluateLatestApprovals(input) {
+  const approvals = latestApprovedReviews(input);
+  const classified = approvals.map(review => {
+    const reviewer = normalized(review && review.user && review.user.login);
+    return {
+      id: Number((review && review.id) || 0),
+      reviewer,
+      commitId: normalized(review && review.commit_id),
+      decision: decide({...input, reviewer}),
+    };
+  });
+
+  return {
+    eligibleApproval: classified.some(
+      approval => approval.decision.action === 'allow',
+    ),
+    approvals: classified,
+  };
+}
+
+module.exports = { decide, latestApprovedReviews, evaluateLatestApprovals };

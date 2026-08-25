@@ -43,8 +43,8 @@ policy=$(bash "$ROOT/scripts/workflow/resolve_base_policy.sh" \
   --repo "$REPO" --pr "$PR_NUMBER" --materialize-default) \
   || infra_error "could not resolve the governing base policy"
 [ -f "$policy" ] || infra_error "governing base policy was not materialized"
+trap 'rm -f "$policy"' EXIT
 expected_author=$(review_policy_scalar "$policy" author_identity)
-rm -f "$policy"
 [ -n "$expected_author" ] || infra_error "governing base policy names no author_identity"
 
 identity_err=$(mktemp "${TMPDIR:-/tmp}/approval-continuation-identity.XXXXXX")
@@ -138,6 +138,24 @@ final_labels=$(blocking_labels <<<"$final")
 [ "$final_draft" = "false" ] || not_ready "PR became draft"
 [ "$final_head" = "$head" ] || not_ready "head changed during evaluation"
 [ -z "$final_labels" ] || not_ready "blocking labels appeared: $final_labels"
+
+# #1094: the approval event's pull_request body is an immutable webhook
+# snapshot. An `edited` event can change Authoring-Agent while an older
+# approval-triggered run is still evaluating, without changing the head SHA.
+# Re-fetch live metadata and paginated latest-state reviews here, after every
+# expensive predicate and immediately before the write, then classify them
+# with the canonical detector against the same governing policy. This shared
+# continuation is used by the immediate, completion, and scheduled paths.
+set +e
+independence_output=$(bash "$ROOT/scripts/workflow/approval-independence-check.sh" \
+  --repo "$REPO" --pr "$PR_NUMBER" --head "$final_head" --policy "$policy" 2>&1)
+independence_rc=$?
+set -e
+case "$independence_rc" in
+  0) ;;
+  1) not_ready "live approval independence is not satisfied: $independence_output" ;;
+  *) infra_error "live approval-independence predicate returned rc=$independence_rc: $independence_output" ;;
+esac
 
 if ! gh pr merge "$url" --repo "$REPO" --squash --auto --match-head-commit "$final_head"; then # NO_BARE_GH_WRITE_EXEMPT: the effective token was verified above against the governing author_identity before this exact-head merge write
   infra_error "could not enable exact-head auto-merge"

@@ -9,12 +9,14 @@ cd "$ROOT"
 DETECTOR="scripts/self-approval-detector.cjs"
 RENDERER="scripts/render-self-approval-bootstrap.cjs"
 TEST_SCRIPT="tests/test_self_approval_detector.sh"
+INDEPENDENCE_TEST="tests/test_approval_independence_check.sh"
 WORKFLOW=".github/workflows/agent-review.yml"
 
 for file in \
   "$DETECTOR" \
   "$RENDERER" \
   "$TEST_SCRIPT" \
+  "$INDEPENDENCE_TEST" \
   "$WORKFLOW" \
   scripts/workflow/resolve_base_policy.sh \
   scripts/workflow/external_review_fingerprint.sh; do
@@ -111,6 +113,16 @@ if ! grep -Eq 'types: \[[^]]*edited' "$WORKFLOW"; then
   exit 1
 fi
 
+# Approval and metadata-edit events for the same PR mutate one shared approval
+# state machine. An older approval run must be cancelled when a newer edit run
+# starts, otherwise its immutable webhook body can race the live invalidation.
+concurrency_block=$(sed -n '/^concurrency:/,/^[^ ]/p' "$WORKFLOW")
+if ! printf '%s\n' "$concurrency_block" | grep -qF '  group: agent-review-${{ github.event.pull_request.number }}' ||
+  ! printf '%s\n' "$concurrency_block" | grep -qF '  cancel-in-progress: true'; then
+  echo "check_self_approval_detector: Agent Review runs must be serialized per PR with newer metadata/review events cancelling older runs" >&2
+  exit 1
+fi
+
 if printf '%s\n' "$auto_merge_job" | grep -qF "github.event.action == 'edited'"; then
   echo "check_self_approval_detector: edited events must invalidate approvals without arming auto-merge" >&2
   exit 1
@@ -122,5 +134,6 @@ if ! grep -qF '#1094' "$WORKFLOW"; then
 fi
 
 bash "$TEST_SCRIPT"
+bash "$INDEPENDENCE_TEST"
 
 echo "check_self_approval_detector: PASS"

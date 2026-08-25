@@ -63,6 +63,13 @@ STUB
   chmod +x "$TMP/root/scripts/$script"
 done
 
+cat > "$TMP/root/scripts/workflow/approval-independence-check.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'read_count=%s args=[%s]\n' "$(cat "${STUB_DIR:?}/read-count")" "$*" >> "$STUB_DIR/independence.log"
+exit "${STUB_INDEPENDENCE_RC:-0}"
+STUB
+chmod +x "$TMP/root/scripts/workflow/approval-independence-check.sh"
+
 cat > "$TMP/root/scripts/workflow/resolve_base_policy.sh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$MERGEPATH_REPO_ROOT/policy.yml"
@@ -82,6 +89,7 @@ run_case() {
   : > "$TMP/merge.log"
   : > "$TMP/readiness.log"
   : > "$TMP/required-checks.log"
+  : > "$TMP/independence.log"
   printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}" > "$TMP/root/policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
     STUB_INITIAL="${STUB_INITIAL:-$BASE}" STUB_FINAL="${STUB_FINAL:-${STUB_INITIAL:-$BASE}}" \
@@ -89,6 +97,7 @@ run_case() {
     STUB_ACCOUNTING_RC="${STUB_ACCOUNTING_RC:-0}" \
     STUB_THREADS_RC="${STUB_THREADS_RC:-0}" STUB_LOGIN="${STUB_LOGIN:-nathanjohnpayne}" \
     STUB_REQUIRED_CHECKS_RC="${STUB_REQUIRED_CHECKS_RC:-0}" \
+    STUB_INDEPENDENCE_RC="${STUB_INDEPENDENCE_RC:-0}" \
     STUB_LOGIN_RC="${STUB_LOGIN_RC:-0}" STUB_MERGE_RC="${STUB_MERGE_RC:-0}" \
     bash "$TMP/subject.sh" 7 owner/repo >"$TMP/subject.out" 2>&1
 }
@@ -106,6 +115,7 @@ reset_fixtures() {
   unset STUB_INITIAL STUB_FINAL STUB_READINESS_RC STUB_GATE_RC
   unset STUB_ACCOUNTING_RC STUB_THREADS_RC STUB_LOGIN STUB_LOGIN_RC
   unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR STUB_REQUIRED_CHECKS_RC
+  unset STUB_INDEPENDENCE_RC
 }
 
 reset_fixtures
@@ -181,14 +191,35 @@ reset_fixtures
 STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"def456","url":"https://example.test/pr/7","labels":[]}'
 assert_not_ready "head drift during evaluation defers without arming"
 
+# #1094: the final continuation must not trust the approval event's immutable
+# body snapshot. Revalidate live approval independence after the authoritative
+# PR re-read, and distinguish a definitive ineligible approval from an
+# indeterminate API/config result.
+reset_fixtures
+STUB_INDEPENDENCE_RC=1
+assert_not_ready "a live same-agent approval after a PR-body edit defers without arming"
+
+reset_fixtures
+STUB_INDEPENDENCE_RC=3
+set +e
+run_case
+independence_rc=$?
+set -e
+if [ "$independence_rc" -eq 3 ] && [ ! -s "$TMP/merge.log" ]; then
+  pass "an indeterminate live approval-independence read fails closed"
+else
+  fail "indeterminate approval independence must exit 3 without arming (rc=$independence_rc)"
+fi
+
 reset_fixtures
 STUB_FINAL="$BASE"
 if run_case \
    && grep -Fq 'head_pin=1 args=[--approval-readiness-only 7 owner/repo]' "$TMP/readiness.log" \
+   && grep -Fq 'read_count=2 args=[--repo owner/repo --pr 7 --head abc123 --policy ' "$TMP/independence.log" \
    && grep -Fq 'pr merge https://example.test/pr/7 --repo owner/repo --squash --auto --match-head-commit abc123' "$TMP/merge.log"; then
-  pass "under-threshold clearance arms auto-merge against the exact re-read head"
+  pass "live approval independence is rechecked after the final read before exact-head auto-merge"
 else
-  fail "under-threshold clearance must require exact-head registered approval/CI readiness and arm exact-head auto-merge (readiness: $(cat "$TMP/readiness.log" 2>/dev/null || true); merge: $(cat "$TMP/merge.log" 2>/dev/null || true); output: $(cat "$TMP/subject.out" 2>/dev/null || true))"
+  fail "continuation must recheck live approval independence after its final read (readiness: $(cat "$TMP/readiness.log" 2>/dev/null || true); independence: $(cat "$TMP/independence.log" 2>/dev/null || true); merge: $(cat "$TMP/merge.log" 2>/dev/null || true); output: $(cat "$TMP/subject.out" 2>/dev/null || true))"
 fi
 
 reset_fixtures

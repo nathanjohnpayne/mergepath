@@ -30,6 +30,14 @@ permissions:
   pull-requests: write
   issues: write
 
+# #1094: approval and PR-body edit events mutate one shared eligibility state.
+# Keep one run per PR so a newer metadata/review event cancels an older run
+# whose webhook body snapshot can no longer be authoritative. The final shared
+# continuation still performs a live recheck immediately before its write.
+concurrency:
+  group: agent-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   # ──────────────────────────────────────────────
   # Job 1: Read review-policy.yml configuration
@@ -861,6 +869,8 @@ jobs:
                   ? input.reviewerAccounts.map(normalized).filter(Boolean)
                   : [];
                 const prAuthor = normalized(input && input.prAuthor);
+                const headSha = normalized(input && input.headSha);
+                const requireHead = Boolean(input && input.requireHead);
                 const reviews = Array.isArray(input && input.reviews) ? input.reviews : [];
                 const latestByReviewer = new Map();
 
@@ -892,7 +902,11 @@ jobs:
 
                 return reviewerAccounts
                   .map(reviewer => latestByReviewer.get(reviewer))
-                  .filter(review => review && normalized(review.state).toUpperCase() === 'APPROVED');
+                  .filter(review =>
+                    review &&
+                    normalized(review.state).toUpperCase() === 'APPROVED' &&
+                    (!requireHead || (headSha && normalized(review.commit_id) === headSha)),
+                  );
               }
               return {decide, latestApprovedReviews};
             }
