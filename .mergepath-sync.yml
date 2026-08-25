@@ -692,6 +692,12 @@ paths:
     # Must sync in lockstep with the workflow. See #259.
     type: canonical
     consumers: all
+  - path: scripts/self-approval-detector.cjs
+    # Runtime dependency of .github/workflows/agent-review.yml's
+    # block-self-approval job. It holds the #1094 Phase-3/Phase-4 boundary
+    # used by both the live workflow and its adversarial CI suite.
+    type: canonical
+    consumers: all
   - path: scripts/resolve-pr-threads.sh
     type: canonical
     consumers: all
@@ -1051,6 +1057,11 @@ paths:
   - path: tests/test_disagreement_detector.sh
     type: canonical
     consumers: all
+  - path: tests/test_self_approval_detector.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/self-approval-detector.cjs"
   # Pairs with scripts/post-phase-4b-handoff.sh (#281). PATH-shimmed
   # gh; no live GitHub network. Travels with the helper so consumers
   # exercise the same renderer they propagate.
@@ -1270,6 +1281,7 @@ paths:
     # consumer's load-config step.
     requires:
       - "scripts/disagreement-detector.cjs"
+      - "scripts/self-approval-detector.cjs"
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/"
       # Invoked by both merge gates in this workflow; a path-scoped sync
@@ -1518,6 +1530,7 @@ paths:
       - "tests/test_feedback_policy_helpers.sh"  # check_feedback_policy_helpers (#576)
       - "tests/test_merge_clearance_gate.sh"   # check_merge_clearance_gate
       - "tests/test_disagreement_detector.sh"  # check_disagreement_detector
+      - "tests/test_self_approval_detector.sh"  # check_self_approval_detector (#1094)
       - "tests/test_verify_propagation_pr.sh"  # check_verify_propagation_pr
       - "tests/test_match_protected_paths.sh"  # check_verify_propagation_pr (#471)
       - "tests/test_resolve_pr_threads_rationale_tag.sh"  # check_resolve_pr_threads (delegated test)
@@ -1558,6 +1571,7 @@ paths:
       - "scripts/phase-4b-review.sh"           # check_phase_4b_automation (#579)
       - "scripts/phase-4b/"                    # check_phase_4b_automation (#579)
       - "scripts/disagreement-detector.cjs"    # check_disagreement_detector
+      - "scripts/self-approval-detector.cjs"   # check_self_approval_detector (#1094)
       - "scripts/request-label-removal.sh"     # check_canonical_bugs_263caf3
       - "scripts/resolve-pr-threads.sh"        # check_resolve_pr_threads
       - "scripts/lib/ensure-yq.sh"             # check_resolve_pr_threads CI-only yq bootstrap (#616)
@@ -1566,7 +1580,7 @@ paths:
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
       - "scripts/coderabbit-automerge-rate-limit-gate.sh"  # tests/test_coderabbit_automerge_rate_limit_gate.sh runs it (#489/#521)
       - "scripts/workflow/"                    # check_workflow_parsers
-      - ".github/workflows/agent-review.yml"   # check_disagreement_detector structural assertion
+      - ".github/workflows/agent-review.yml"   # disagreement + self-approval detector structural assertions
       - ".github/workflows/codex-p1-gate.yml"  # check_codex_p1_gate workflow shape
       - ".github/workflows/codex-feedback-archive-relay.yml"  # check_codex_p1_gate trusted read-only relay shape
       - ".github/workflows/coderabbit-severity-gate.yml"  # check_coderabbit_severity_gate workflow shape (#577)

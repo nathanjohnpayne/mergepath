@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# check_self_approval_detector — lockstep CI for the #1094 approval guard.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+DETECTOR="scripts/self-approval-detector.cjs"
+TEST_SCRIPT="tests/test_self_approval_detector.sh"
+WORKFLOW=".github/workflows/agent-review.yml"
+
+for file in \
+  "$DETECTOR" \
+  "$TEST_SCRIPT" \
+  "$WORKFLOW" \
+  scripts/workflow/resolve_base_policy.sh \
+  scripts/workflow/external_review_fingerprint.sh; do
+  if [ ! -f "$file" ]; then
+    echo "check_self_approval_detector: missing required file: $file" >&2
+    exit 1
+  fi
+done
+
+if [ ! -x "$TEST_SCRIPT" ]; then
+  echo "check_self_approval_detector: $TEST_SCRIPT is not executable" >&2
+  exit 1
+fi
+
+if ! grep -A2 -E 'require\(' "$WORKFLOW" | grep -qF "$DETECTOR"; then
+  echo "check_self_approval_detector: $WORKFLOW no longer require()s $DETECTOR" >&2
+  exit 1
+fi
+
+for required_fragment in \
+  'github.event.repository.default_branch' \
+  'scripts/workflow/resolve_base_policy.sh' \
+  'scripts/workflow/external_review_fingerprint.sh' \
+  'github.paginate' \
+  'phase_4_required' \
+  'const phase4Required = needsExternal && !laneVerifiedHead;' \
+  "core.setOutput('phase_4_required', phase4Required.toString());" \
+  'needs: [load-config, triage]' \
+  'AUTHOR_IDENTITY'; do
+  if ! grep -qF "$required_fragment" "$WORKFLOW"; then
+    echo "check_self_approval_detector: $WORKFLOW is missing $required_fragment" >&2
+    exit 1
+  fi
+done
+
+phase_line=$(grep -nF 'const phase4Required = needsExternal && !laneVerifiedHead;' "$WORKFLOW" | head -1 | cut -d: -f1)
+carry_line=$(grep -nF "'scripts/workflow/external_review_carryforward.sh'," "$WORKFLOW" | head -1 | cut -d: -f1)
+if [ -z "$phase_line" ] || [ -z "$carry_line" ] || [ "$phase_line" -ge "$carry_line" ]; then
+  echo "check_self_approval_detector: Phase 4 applicability must be captured before carry-forward clearance" >&2
+  exit 1
+fi
+
+auto_merge_job=$(sed -n '/^  auto-merge-on-approval:/,/^    runs-on:/p' "$WORKFLOW")
+review_success_gate=$(
+  printf '%s\n' "$auto_merge_job" \
+    | grep -A3 -F "github.event_name != 'pull_request_review'"
+)
+for success_requirement in \
+  "needs.triage.result == 'success'" \
+  "needs.block-self-approval.result == 'success'"; do
+  if ! printf '%s\n' "$review_success_gate" | grep -qF "$success_requirement"; then
+    echo "check_self_approval_detector: approved-review auto-merge must require successful triage and self-approval guard jobs" >&2
+    exit 1
+  fi
+done
+
+if ! grep -qF '#1094' "$WORKFLOW"; then
+  echo "check_self_approval_detector: $WORKFLOW must reference #1094 for traceability" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
+
+echo "check_self_approval_detector: PASS"

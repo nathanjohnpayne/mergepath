@@ -185,17 +185,22 @@ jobs:
     # change crossed the threshold (or touched a protected path) could
     # re-arm on a stale/missing label snapshot. Mirrors load-config, which
     # also handles synchronize/reopened so this job's threshold/paths inputs
-    # are freshly parsed.
+    # are freshly parsed. Approved review events also run this same decision
+    # path so block-self-approval consumes one authoritative Phase 4 result
+    # rather than a second threshold/path implementation (#1094).
     if: >
-      github.event_name == 'pull_request' &&
       github.event.pull_request.user.login != 'dependabot[bot]' &&
-      (github.event.action == 'opened' ||
-       github.event.action == 'ready_for_review' ||
-       github.event.action == 'synchronize' ||
-       github.event.action == 'reopened')
+      ((github.event_name == 'pull_request' &&
+        (github.event.action == 'opened' ||
+         github.event.action == 'ready_for_review' ||
+         github.event.action == 'synchronize' ||
+         github.event.action == 'reopened')) ||
+       (github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved'))
     runs-on: ubuntu-latest
     outputs:
       needs_external: ${{ steps.check.outputs.needs_external }}
+      phase_4_required: ${{ steps.check.outputs.phase_4_required }}
     steps:
       - name: Checkout trusted workflow helpers
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -416,6 +421,13 @@ jobs:
               }
             }
 
+            // Phase 4 applicability is the pre-clearance policy result. A
+            // carry-forward below can clear already-reviewed bytes, but does
+            // not turn the PR into Phase 3. Only the exact-head, byte-verified
+            // propagation lane has the policy's under-threshold-equivalent
+            // standing. Preserve this literal output for the #1094 guard.
+            const phase4Required = needsExternal && !laneVerifiedHead;
+
             if (needsExternal && laneVerifiedHead) {
               console.log(
                 `Propagation lane already byte-verified head ${pr.head.sha} ` +
@@ -468,6 +480,7 @@ jobs:
             }
 
             core.setOutput('needs_external', needsExternal.toString());
+            core.setOutput('phase_4_required', phase4Required.toString());
 
   # ──────────────────────────────────────────────
   # Job 3: Assign reviewer (internal self-peer review)
@@ -669,7 +682,9 @@ jobs:
   # Job 5: Block self-approval
   # ──────────────────────────────────────────────
   block-self-approval:
+    needs: [load-config, triage]
     if: >
+      always() &&
       github.event_name == 'pull_request_review' &&
       github.event.review.state == 'approved'
     runs-on: ubuntu-latest
@@ -677,59 +692,79 @@ jobs:
       - name: Dismiss self-approval from reviewer bot accounts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The review event can target untrusted PR code. Load the detector
+          # only from the trusted default branch.
+          ref: ${{ github.event.repository.default_branch }}
           # Explicit-token github-script only, no authenticated git, so don't
           # leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
 
-      - name: Install js-yaml
-        run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
-
       - name: Check and dismiss
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}
+          REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
+          PHASE_4_REQUIRED: ${{ needs.triage.outputs.phase_4_required }}
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
-            const fs = require('fs');
-            const yaml = require('js-yaml');
+            const path = require('path');
+            const { decide } = require(
+              path.resolve(process.env.GITHUB_WORKSPACE,
+                           'scripts/self-approval-detector.cjs'));
 
-            const prAuthor = context.payload.pull_request.user.login;
+            const pr = context.payload.pull_request;
+            const prAuthor = pr.user.login;
             const reviewer = context.payload.review.user.login;
-
-            // Only block self-approval from reviewer bot accounts.
-            // The human (nathanjohnpayne) IS the PR author under the shared
-            // identity model, but must be allowed to approve for tiebreaker
-            // and human-escalated reviews per REVIEW_POLICY.md.
-            let reviewerAccounts;
-            try {
-              const config = yaml.load(fs.readFileSync('.github/review-policy.yml', 'utf8'));
-              reviewerAccounts = config.available_reviewers || [];
-            } catch (e) {
-              reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
+            const reviewerAccounts = JSON.parse(
+              process.env.REVIEWERS_JSON || '[]',
+            );
+            if (!Array.isArray(reviewerAccounts) || reviewerAccounts.length === 0) {
+              throw new Error(
+                'governing policy reviewer allow-list is unavailable; refusing to classify approval',
+              );
             }
 
-            // A reviewer bot account cannot approve a PR it authored.
-            // Since all PRs are authored by nathanjohnpayne, this only fires
-            // if a bot account somehow ends up as the PR author (shouldn't
-            // happen under the policy, but guard against it).
-            const isReviewerBot = reviewerAccounts.includes(reviewer);
-            if (prAuthor === reviewer && isReviewerBot) {
-              await github.rest.pulls.dismissReview({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: context.payload.pull_request.number,
-                review_id: context.payload.review.id,
-                message: 'Self-approval is not permitted. This review has been dismissed automatically.',
-              });
+            const phase4Raw = process.env.PHASE_4_REQUIRED;
+            const requiresExternalReview = phase4Raw === 'true'
+              ? true
+              : phase4Raw === 'false'
+                ? false
+                : undefined;
 
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                labels: ['policy-violation'],
-              });
+            const decision = decide({
+              prAuthor,
+              authorIdentity: process.env.AUTHOR_IDENTITY,
+              reviewer,
+              reviewerAccounts,
+              prBody: pr.body || '',
+              requiresExternalReview,
+            });
 
-              core.setFailed('Self-approval detected and dismissed.');
-            }
+            core.info(
+              `Self-approval decision: ${decision.action} (${decision.reason})`,
+            );
+
+            if (decision.action !== 'block') return;
+
+            await github.rest.pulls.dismissReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              review_id: context.payload.review.id,
+              message: `Approval violates the agent-independence policy (${decision.reason}). This review has been dismissed automatically.`,
+            });
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              labels: ['policy-violation'],
+            });
+
+            core.setFailed(
+              `Agent-independence violation detected and dismissed (${decision.reason}).`,
+            );
 
   # ──────────────────────────────────────────────
   # Job 6: Auto-merge on approval (if no external review required)
@@ -746,14 +781,19 @@ jobs:
   # path: a PR changed after an approval, or while closed and then
   # reopened, must have `needs-external-review` re-applied by triage BEFORE
   # the re-verify step reads labels, or the re-arm would arm on a stale
-  # snapshot. `always()` is still needed because event-mismatched sibling
-  # jobs are expected to skip (`detect-disagreement` / `block-self-approval`
-  # on pull_request events; `triage` on pull_request_review events). The
-  # pull_request re-arm path additionally requires `needs.triage.result ==
+  # snapshot. Triage now also runs on approved review events so the #1094
+  # guard receives its Phase 4 applicability output. `always()` is still
+  # needed because event-mismatched sibling jobs are expected to skip
+  # (`detect-disagreement` / `block-self-approval` on pull_request events;
+  # `triage` on the unlabeled settle event). The pull_request re-arm path
+  # additionally requires `needs.triage.result ==
   # 'success'`: ordering alone is not enough, because a failed/skipped triage
   # could otherwise leave the old no-label snapshot in place and still let
-  # auto-merge arm. See #61 for the cross-event race and this PR for the
-  # same-workflow races nathanpayne-codex caught during review.
+  # auto-merge arm. The approved-review path likewise requires both triage and
+  # block-self-approval to succeed: `always()` must not turn an exception that
+  # occurs before either job applies its blocking label into permission to
+  # continue. See #61 for the cross-event race and #1094 for this fail-closed
+  # review-event boundary.
   #
   # Three triggers arm auto-merge (#495, #620):
   #
@@ -838,6 +878,9 @@ jobs:
          github.event.action == 'reopened' ||
          (github.event.action == 'unlabeled' &&
           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))))) &&
+      (github.event_name != 'pull_request_review' ||
+       (needs.triage.result == 'success' &&
+        needs.block-self-approval.result == 'success')) &&
       (github.event_name != 'pull_request' ||
        needs.triage.result == 'success' ||
        (github.event.action == 'unlabeled' &&
