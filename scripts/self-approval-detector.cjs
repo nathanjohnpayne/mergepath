@@ -68,20 +68,46 @@ function decide(input) {
     ).split(/\r?\n|\r/).filter(
       line => /^[ \t]*Authoring-Agent:/i.test(line),
     );
-    if (declarationAttempts.length !== 1) {
-      return { action: 'block', reason: 'indeterminate-phase-4-author' };
+    if (declarationAttempts.length === 0) {
+      return {
+        action: 'block',
+        reason: 'indeterminate-phase-4-author',
+        detail: 'missing-authoring-agent-declaration',
+      };
+    }
+    if (declarationAttempts.length > 1) {
+      return {
+        action: 'block',
+        reason: 'indeterminate-phase-4-author',
+        detail: 'multiple-authoring-agent-declarations',
+      };
     }
     const declaration = /^Authoring-Agent:[ \t]*([A-Za-z0-9_-]+)[ \t]*$/i
       .exec(declarationAttempts[0]);
     if (!declaration) {
-      return { action: 'block', reason: 'indeterminate-phase-4-author' };
+      return {
+        action: 'block',
+        reason: 'indeterminate-phase-4-author',
+        detail: 'malformed-authoring-agent-declaration',
+      };
     }
     const authoringAgent = normalized(declaration[1]);
     const authoringReviewers = reviewerAccounts.filter(
       account => account.endsWith(`-${authoringAgent}`),
     );
-    if (authoringReviewers.length !== 1) {
-      return { action: 'block', reason: 'indeterminate-phase-4-author' };
+    if (authoringReviewers.length === 0) {
+      return {
+        action: 'block',
+        reason: 'indeterminate-phase-4-author',
+        detail: 'unknown-authoring-agent',
+      };
+    }
+    if (authoringReviewers.length > 1) {
+      return {
+        action: 'block',
+        reason: 'indeterminate-phase-4-author',
+        detail: 'ambiguous-authoring-agent-mapping',
+      };
     }
     const [authoringReviewer] = authoringReviewers;
 

@@ -41,7 +41,9 @@ for required_fragment in \
   'const phase4Required = needsExternal && !laneVerifiedHead;' \
   "core.setOutput('phase_4_required', phase4Required.toString());" \
   'needs: [load-config, triage]' \
-  'AUTHOR_IDENTITY'; do
+  'AUTHOR_IDENTITY' \
+  'decision.detail' \
+  'Checkout trusted self-approval detector'; do
   if ! grep -qF "$required_fragment" "$WORKFLOW"; then
     echo "check_self_approval_detector: $WORKFLOW is missing $required_fragment" >&2
     exit 1

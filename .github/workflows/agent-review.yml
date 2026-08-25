@@ -689,7 +689,7 @@ jobs:
       github.event.review.state == 'approved'
     runs-on: ubuntu-latest
     steps:
-      - name: Dismiss self-approval from reviewer bot accounts
+      - name: Checkout trusted self-approval detector
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The review event can target untrusted PR code. Load the detector
@@ -740,9 +740,12 @@ jobs:
               prBody: pr.body || '',
               requiresExternalReview,
             });
+            const decisionDiagnostic = decision.detail
+              ? `${decision.reason}: ${decision.detail}`
+              : decision.reason;
 
             core.info(
-              `Self-approval decision: ${decision.action} (${decision.reason})`,
+              `Self-approval decision: ${decision.action} (${decisionDiagnostic})`,
             );
 
             if (decision.action !== 'block') return;
@@ -752,7 +755,7 @@ jobs:
               repo: context.repo.repo,
               pull_number: pr.number,
               review_id: context.payload.review.id,
-              message: `Approval violates the agent-independence policy (${decision.reason}). This review has been dismissed automatically.`,
+              message: `Approval violates the agent-independence policy (${decisionDiagnostic}). This review has been dismissed automatically.`,
             });
 
             await github.rest.issues.addLabels({
@@ -763,7 +766,7 @@ jobs:
             });
 
             core.setFailed(
-              `Agent-independence violation detected and dismissed (${decision.reason}).`,
+              `Agent-independence violation detected and dismissed (${decisionDiagnostic}).`,
             );
 
   # ──────────────────────────────────────────────
