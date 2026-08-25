@@ -114,12 +114,16 @@ if ! grep -Eq 'types: \[[^]]*edited' "$WORKFLOW"; then
 fi
 
 # Approval and metadata-edit events for the same PR mutate one shared approval
-# state machine. An older approval run must be cancelled when a newer edit run
-# starts, otherwise its immutable webhook body can race the live invalidation.
+# state machine. An older run is cancelled only when its replacement executes
+# equivalent enforcement. COMMENTED/CHANGES_REQUESTED reviews and `labeled`
+# events skip the guard, so allowing them to cancel would suppress rather than
+# supersede the authoritative run (and triage can emit its own labeled event).
 concurrency_block=$(sed -n '/^concurrency:/,/^[^ ]/p' "$WORKFLOW")
 if ! printf '%s\n' "$concurrency_block" | grep -qF '  group: agent-review-${{ github.event.pull_request.number }}' ||
-  ! printf '%s\n' "$concurrency_block" | grep -qF '  cancel-in-progress: true'; then
-  echo "check_self_approval_detector: Agent Review runs must be serialized per PR with newer metadata/review events cancelling older runs" >&2
+  ! printf '%s\n' "$concurrency_block" | grep -qF "github.event.action != 'labeled'" ||
+  ! printf '%s\n' "$concurrency_block" | grep -qF "github.event.review.state == 'approved'" ||
+  printf '%s\n' "$concurrency_block" | grep -qF '  cancel-in-progress: true'; then
+  echo "check_self_approval_detector: per-PR cancellation must retain labeled/COMMENTED producers and supersede them only with authoritative PR or approved-review runs" >&2
   exit 1
 fi
 

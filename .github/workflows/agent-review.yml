@@ -31,12 +31,16 @@ permissions:
   issues: write
 
 # #1094: approval and PR-body edit events mutate one shared eligibility state.
-# Keep one run per PR so a newer metadata/review event cancels an older run
-# whose webhook body snapshot can no longer be authoritative. The final shared
+# Keep one run per PR, but cancel only when the replacement event reruns the
+# same enforcement. A COMMENTED review and triage's own PAT-authored `labeled`
+# event intentionally skip that work, so either one cancelling its producer
+# would strand reviewer assignment or same-agent invalidation. The final shared
 # continuation still performs a live recheck immediately before its write.
 concurrency:
   group: agent-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: >-
+    ${{ (github.event_name == 'pull_request' && github.event.action != 'labeled') ||
+        (github.event_name == 'pull_request_review' && github.event.review.state == 'approved') }}
 
 jobs:
   # ──────────────────────────────────────────────

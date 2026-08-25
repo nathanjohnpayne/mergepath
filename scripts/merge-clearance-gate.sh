@@ -849,6 +849,14 @@ PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) \
 
 HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
 BASE_SHA=$(echo "$PR_JSON" | jq -r '.base.sha // ""')
+EXPECTED_HEAD_SHA=${MERGE_CLEARANCE_EXPECTED_HEAD_SHA:-}
+EXPECTED_BASE_REF=${MERGE_CLEARANCE_EXPECTED_BASE_REF:-}
+EXPECTED_BASE_SHA=${MERGE_CLEARANCE_EXPECTED_BASE_SHA:-}
+MATERIALIZE_BASE_POLICY=${MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY:-false}
+case "$MATERIALIZE_BASE_POLICY" in
+  true|false) ;;
+  *) die 2 "MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY must be true|false" ;;
+esac
 
 # --- PR-base review policy (#763) -------------------------------------------
 #
@@ -876,6 +884,15 @@ BASE_SHA=$(echo "$PR_JSON" | jq -r '.base.sha // ""')
 # Silently substituting the default-branch policy there is the bypass itself.
 BASE_REF=$(echo "$PR_JSON" | jq -r '.base.ref // ""')
 DEFAULT_BRANCH=$(echo "$PR_JSON" | jq -r '.base.repo.default_branch // ""')
+if [ -n "$EXPECTED_HEAD_SHA" ] && [ "$HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+  die 2 "PR head changed from expected $EXPECTED_HEAD_SHA to ${HEAD_SHA:-unknown} before requiredness evaluation"
+fi
+if [ -n "$EXPECTED_BASE_REF" ] && [ "$BASE_REF" != "$EXPECTED_BASE_REF" ]; then
+  die 2 "PR base ref changed from expected $EXPECTED_BASE_REF to ${BASE_REF:-unknown} before requiredness evaluation"
+fi
+if [ -n "$EXPECTED_BASE_SHA" ] && [ "$BASE_SHA" != "$EXPECTED_BASE_SHA" ]; then
+  die 2 "PR base sha changed from expected $EXPECTED_BASE_SHA to ${BASE_SHA:-unknown} before requiredness evaluation"
+fi
 RESOLVE_POLICY_BIN="${MERGE_CLEARANCE_WORKFLOW_DIR:-$SCRIPT_DIR/workflow}/resolve_base_policy.sh"
 if [ ! -f "$RESOLVE_POLICY_BIN" ]; then
   # Broken install (the resolver ships with this gate via .mergepath-sync.yml).
@@ -896,6 +913,10 @@ if [ ! -f "$RESOLVE_POLICY_BIN" ]; then
   # undeterminable base — fell through to the degrade branch, which is an
   # assumption, not proof (CodeRabbit Major on #768). Same rule the resolver
   # applies: "unknown" is not proof.
+  if [ "$MATERIALIZE_BASE_POLICY" = "true" ]; then
+    echo "ERROR: policy resolver missing ($RESOLVE_POLICY_BIN) while exact-base policy materialization is required — refusing checkout-policy fallback" >&2
+    exit 2
+  fi
   if [ -z "$BASE_REF" ] || [ -z "$DEFAULT_BRANCH" ] || [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
     echo "ERROR: policy resolver missing ($RESOLVE_POLICY_BIN) and this PR is not provably against the default branch (base='$BASE_REF' default='$DEFAULT_BRANCH') — refusing to evaluate it against the default-branch policy" >&2
     exit 2
@@ -907,10 +928,13 @@ else
 # stdout is the policy PATH, stderr is diagnostics — keep them separate so a
 # warning cannot be concatenated into the path (#715/#716 class).
 RESOLVE_ERR=$(mktemp "${TMPDIR:-/tmp}/mcg-resolve-err.XXXXXX")
+MATERIALIZE_ARG=""
+[ "$MATERIALIZE_BASE_POLICY" = "true" ] && MATERIALIZE_ARG="--materialize-default"
 set +e
 RESOLVED_POLICY=$(bash "$RESOLVE_POLICY_BIN" \
   --repo "$REPO" --base-ref "$BASE_REF" --base-sha "$BASE_SHA" \
-  --default-branch "$DEFAULT_BRANCH" --default-config "$CONFIG" 2>"$RESOLVE_ERR")
+  --default-branch "$DEFAULT_BRANCH" --default-config "$CONFIG" \
+  ${MATERIALIZE_ARG:+"$MATERIALIZE_ARG"} 2>"$RESOLVE_ERR")
 resolve_rc=$?
 set -e
 RESOLVE_MSG=$(cat "$RESOLVE_ERR" 2>/dev/null || true)

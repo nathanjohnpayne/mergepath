@@ -32,7 +32,7 @@ infra_error() {
 
 read_pr() {
   gh pr view "$PR_NUMBER" --repo "$REPO" \
-    --json state,isDraft,headRefOid,url,labels
+    --json state,isDraft,headRefOid,baseRefName,baseRefOid,url,labels
 }
 
 blocking_labels() {
@@ -43,8 +43,8 @@ policy=$(bash "$ROOT/scripts/workflow/resolve_base_policy.sh" \
   --repo "$REPO" --pr "$PR_NUMBER" --materialize-default) \
   || infra_error "could not resolve the governing base policy"
 [ -f "$policy" ] || infra_error "governing base policy was not materialized"
-trap 'rm -f "$policy"' EXIT
 expected_author=$(review_policy_scalar "$policy" author_identity)
+[ "$policy" = "$ROOT/.github/review-policy.yml" ] || rm -f "$policy"
 [ -n "$expected_author" ] || infra_error "governing base policy names no author_identity"
 
 identity_err=$(mktemp "${TMPDIR:-/tmp}/approval-continuation-identity.XXXXXX")
@@ -61,11 +61,14 @@ initial=$(read_pr) || infra_error "could not read PR #$PR_NUMBER"
 state=$(jq -r '.state // ""' <<<"$initial")
 draft=$(jq -r 'if has("isDraft") then .isDraft else true end' <<<"$initial")
 head=$(jq -r '.headRefOid // ""' <<<"$initial")
+base_ref=$(jq -r '.baseRefName // ""' <<<"$initial")
+base_sha=$(jq -r '.baseRefOid // ""' <<<"$initial")
 url=$(jq -r '.url // ""' <<<"$initial")
 labels=$(blocking_labels <<<"$initial")
 [ "$state" = "OPEN" ] || not_ready "PR is $state"
 [ "$draft" = "false" ] || not_ready "PR is draft"
-[ -n "$head" ] && [ -n "$url" ] || infra_error "PR response lacks head or URL"
+[ -n "$head" ] && [ -n "$base_ref" ] && [ -n "$base_sha" ] && [ -n "$url" ] \
+  || infra_error "PR response lacks head, base, or URL"
 [ -z "$labels" ] || not_ready "blocking labels present: $labels"
 
 set +e
@@ -133,10 +136,14 @@ final=$(read_pr) || infra_error "could not re-read PR #$PR_NUMBER"
 final_state=$(jq -r '.state // ""' <<<"$final")
 final_draft=$(jq -r 'if has("isDraft") then .isDraft else true end' <<<"$final")
 final_head=$(jq -r '.headRefOid // ""' <<<"$final")
+final_base_ref=$(jq -r '.baseRefName // ""' <<<"$final")
+final_base_sha=$(jq -r '.baseRefOid // ""' <<<"$final")
 final_labels=$(blocking_labels <<<"$final")
 [ "$final_state" = "OPEN" ] || not_ready "PR changed state to $final_state"
 [ "$final_draft" = "false" ] || not_ready "PR became draft"
 [ "$final_head" = "$head" ] || not_ready "head changed during evaluation"
+[ "$final_base_ref" = "$base_ref" ] || not_ready "base ref changed during evaluation"
+[ "$final_base_sha" = "$base_sha" ] || not_ready "base branch advanced during evaluation"
 [ -z "$final_labels" ] || not_ready "blocking labels appeared: $final_labels"
 
 # #1094: the approval event's pull_request body is an immutable webhook
@@ -148,7 +155,9 @@ final_labels=$(blocking_labels <<<"$final")
 # continuation is used by the immediate, completion, and scheduled paths.
 set +e
 independence_output=$(bash "$ROOT/scripts/workflow/approval-independence-check.sh" \
-  --repo "$REPO" --pr "$PR_NUMBER" --head "$final_head" --policy "$policy" 2>&1)
+  --repo "$REPO" --pr "$PR_NUMBER" --head "$final_head" \
+  --base-ref "$final_base_ref" --base-sha "$final_base_sha" \
+  --merge-login "$login" 2>&1)
 independence_rc=$?
 set -e
 case "$independence_rc" in

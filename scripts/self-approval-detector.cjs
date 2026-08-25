@@ -192,11 +192,19 @@ function evaluateLatestApprovals(input) {
       decision: decide({...input, reviewer}),
     };
   });
+  const allowed = classified.filter(approval => approval.decision.action === 'allow');
+  const blocking = classified.filter(approval => approval.decision.action !== 'allow');
 
   return {
-    eligibleApproval: classified.some(
-      approval => approval.decision.action === 'allow',
-    ),
+    // The final merge seam must not leave a same-agent Phase 4 approval in
+    // GitHub's native approval set, even when an independent approval also
+    // exists. Otherwise the independent approval can be dismissed after this
+    // read and the disallowed approval alone can still satisfy one-approval
+    // branch protection. Wait for the guard to dismiss every blocking approval
+    // before consuming the independent one.
+    eligibleApproval: allowed.length > 0 && blocking.length === 0,
+    independentApproval: allowed.length > 0,
+    blockingApprovals: blocking,
     approvals: classified,
   };
 }

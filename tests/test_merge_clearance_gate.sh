@@ -2108,6 +2108,53 @@ else
   fail "Phase 4 query: indeterminate marker expected nonzero/no false; got rc=$RC out='$OUT'"
 fi
 
+echo; echo "--- Phase 4 Query 4: expected head/base pins bind requiredness to one PR snapshot"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"big.txt","additions":400,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(MERGE_CLEARANCE_EXPECTED_HEAD_SHA="$HEAD_SHA" \
+  MERGE_CLEARANCE_EXPECTED_BASE_REF=main \
+  MERGE_CLEARANCE_EXPECTED_BASE_SHA=base000aaa \
+  MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY=true \
+  FIXTURE_BASE_POLICY="$SCRATCH/.github/review-policy.yml" \
+  FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-phase-4-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "Phase 4 query: matching expected head/base pins preserve the requiredness result"
+else
+  fail "Phase 4 query: matching expected pins should pass; got rc=$RC out='$OUT'"
+fi
+
+for pin_case in head base-ref base-sha; do
+  expected_head=$HEAD_SHA
+  expected_base_ref=main
+  expected_base_sha=base000aaa
+  case "$pin_case" in
+    head) expected_head=unexpected-head ;;
+    base-ref) expected_base_ref=release ;;
+    base-sha) expected_base_sha=unexpected-base ;;
+  esac
+  set +e
+  OUT=$(MERGE_CLEARANCE_EXPECTED_HEAD_SHA="$expected_head" \
+    MERGE_CLEARANCE_EXPECTED_BASE_REF="$expected_base_ref" \
+    MERGE_CLEARANCE_EXPECTED_BASE_SHA="$expected_base_sha" \
+    MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY=true \
+    FIXTURE_BASE_POLICY="$SCRATCH/.github/review-policy.yml" \
+    FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+    run_gate "$SCRATCH" --derive-phase-4-requiredness 99 owner/repo 2>/dev/null)
+  RC=$?
+  set -e
+  if [ "$RC" != 0 ]; then
+    pass "Phase 4 query: mismatched expected $pin_case fails closed"
+  else
+    fail "Phase 4 query: mismatched expected $pin_case unexpectedly passed with '$OUT'"
+  fi
+done
+
 # ---------------------------------------------------------------------------
 # --derive-rate-limit-protection query mode (#713, tightened by #772): prints
 # exactly true/false. `true` means the auto-merge rc=5 path is protected either

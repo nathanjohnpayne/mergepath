@@ -26,6 +26,7 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   count=$(cat "$STUB_DIR/read-count")
   count=$((count + 1))
   echo "$count" > "$STUB_DIR/read-count"
+  printf 'pr-view-%s\n' "$count" >> "$STUB_DIR/events.log"
   if [ "$count" -eq 1 ]; then
     printf '%s\n' "$STUB_INITIAL"
   else
@@ -34,6 +35,7 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  printf 'merge\n' >> "$STUB_DIR/events.log"
   printf '%s\n' "$*" >> "$STUB_DIR/merge.log"
   exit "${STUB_MERGE_RC:-0}"
 fi
@@ -65,6 +67,7 @@ done
 
 cat > "$TMP/root/scripts/workflow/approval-independence-check.sh" <<'STUB'
 #!/usr/bin/env bash
+printf 'independence\n' >> "${STUB_DIR:?}/events.log"
 printf 'read_count=%s args=[%s]\n' "$(cat "${STUB_DIR:?}/read-count")" "$*" >> "$STUB_DIR/independence.log"
 exit "${STUB_INDEPENDENCE_RC:-0}"
 STUB
@@ -81,7 +84,7 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-BASE='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[]}'
+BASE='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","labels":[]}'
 
 run_case() {
   : > "$TMP/read-count"
@@ -90,6 +93,7 @@ run_case() {
   : > "$TMP/readiness.log"
   : > "$TMP/required-checks.log"
   : > "$TMP/independence.log"
+  : > "$TMP/events.log"
   printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}" > "$TMP/root/policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
     STUB_INITIAL="${STUB_INITIAL:-$BASE}" STUB_FINAL="${STUB_FINAL:-${STUB_INITIAL:-$BASE}}" \
@@ -155,11 +159,11 @@ STUB_GATE_RC=1
 assert_not_ready "pending threshold-aware external gate defers without arming"
 
 reset_fixtures
-STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"human-hold"}]}'
+STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","labels":[{"name":"human-hold"}]}'
 assert_not_ready "blocking label defers before gate work"
 
 reset_fixtures
-STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","url":"https://example.test/pr/7","labels":[{"name":"documentation"}]}'
+STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","labels":[{"name":"documentation"}]}'
 STUB_FINAL="$BASE"
 if run_case && [ -s "$TMP/merge.log" ]; then
   pass "non-blocking labels remain merge-eligible"
@@ -188,8 +192,16 @@ STUB_THREADS_RC=3
 assert_not_ready "unresolved conversations defer without arming"
 
 reset_fixtures
-STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"def456","url":"https://example.test/pr/7","labels":[]}'
+STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"def456","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","labels":[]}'
 assert_not_ready "head drift during evaluation defers without arming"
+
+reset_fixtures
+STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"release","baseRefOid":"base456","url":"https://example.test/pr/7","labels":[]}'
+assert_not_ready "same-head base retarget during evaluation defers without arming"
+
+reset_fixtures
+STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base456","url":"https://example.test/pr/7","labels":[]}'
+assert_not_ready "same-head base advance during evaluation defers without arming"
 
 # #1094: the final continuation must not trust the approval event's immutable
 # body snapshot. Revalidate live approval independence after the authoritative
@@ -215,11 +227,12 @@ reset_fixtures
 STUB_FINAL="$BASE"
 if run_case \
    && grep -Fq 'head_pin=1 args=[--approval-readiness-only 7 owner/repo]' "$TMP/readiness.log" \
-   && grep -Fq 'read_count=2 args=[--repo owner/repo --pr 7 --head abc123 --policy ' "$TMP/independence.log" \
-   && grep -Fq 'pr merge https://example.test/pr/7 --repo owner/repo --squash --auto --match-head-commit abc123' "$TMP/merge.log"; then
-  pass "live approval independence is rechecked after the final read before exact-head auto-merge"
+   && grep -Fq 'read_count=2 args=[--repo owner/repo --pr 7 --head abc123 --base-ref main --base-sha base123 --merge-login nathanjohnpayne]' "$TMP/independence.log" \
+   && grep -Fq 'pr merge https://example.test/pr/7 --repo owner/repo --squash --auto --match-head-commit abc123' "$TMP/merge.log" \
+   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 pr-view-2 independence merge " ]; then
+  pass "final metadata, pinned live independence, and exact-head auto-merge run in that order"
 else
-  fail "continuation must recheck live approval independence after its final read (readiness: $(cat "$TMP/readiness.log" 2>/dev/null || true); independence: $(cat "$TMP/independence.log" 2>/dev/null || true); merge: $(cat "$TMP/merge.log" 2>/dev/null || true); output: $(cat "$TMP/subject.out" 2>/dev/null || true))"
+  fail "continuation safety order drifted (events: $(tr '\n' ' ' < "$TMP/events.log"); readiness: $(cat "$TMP/readiness.log" 2>/dev/null || true); independence: $(cat "$TMP/independence.log" 2>/dev/null || true); merge: $(cat "$TMP/merge.log" 2>/dev/null || true); output: $(cat "$TMP/subject.out" 2>/dev/null || true))"
 fi
 
 reset_fixtures
