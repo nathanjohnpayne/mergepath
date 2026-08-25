@@ -38,7 +38,11 @@ function decide(input) {
   // This catches a reviewer approving a PR authored by that same GitHub
   // account even when external review would otherwise not be required.
   if (reviewer && reviewerIsAgent && prAuthor === reviewer) {
-    return { action: 'block', reason: 'same-native-account-approval' };
+    return {
+      action: 'block',
+      reason: 'same-native-account-approval',
+      persistentViolation: true,
+    };
   }
 
   // Human reviews are the documented tiebreaker and reviewer accounts not in
@@ -115,6 +119,7 @@ function decide(input) {
       return {
         action: 'block',
         reason: 'same-agent-phase-4-approval',
+        persistentViolation: true,
         authoringAgent,
         authoringReviewer,
       };
@@ -126,4 +131,43 @@ function decide(input) {
   return { action: 'allow', reason: 'different-agent-phase-4-approval' };
 }
 
-module.exports = { decide };
+function latestApprovedReviews(input) {
+  const reviewerAccounts = Array.isArray(input && input.reviewerAccounts)
+    ? input.reviewerAccounts.map(normalized).filter(Boolean)
+    : [];
+  const prAuthor = normalized(input && input.prAuthor);
+  const reviews = Array.isArray(input && input.reviews) ? input.reviews : [];
+  const latestByReviewer = new Map();
+
+  for (const review of reviews) {
+    const reviewer = normalized(review && review.user && review.user.login);
+    const state = normalized(review && review.state).toUpperCase();
+    if (
+      !reviewer ||
+      reviewer === prAuthor ||
+      !reviewerAccounts.includes(reviewer) ||
+      !['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(state)
+    ) {
+      continue;
+    }
+
+    const current = latestByReviewer.get(reviewer);
+    const submittedAt = String((review && review.submitted_at) || '');
+    const currentSubmittedAt = String((current && current.submitted_at) || '');
+    const id = Number((review && review.id) || 0);
+    const currentId = Number((current && current.id) || 0);
+    if (
+      !current ||
+      submittedAt > currentSubmittedAt ||
+      (submittedAt === currentSubmittedAt && id > currentId)
+    ) {
+      latestByReviewer.set(reviewer, review);
+    }
+  }
+
+  return reviewerAccounts
+    .map(reviewer => latestByReviewer.get(reviewer))
+    .filter(review => review && normalized(review.state).toUpperCase() === 'APPROVED');
+}
+
+module.exports = { decide, latestApprovedReviews };

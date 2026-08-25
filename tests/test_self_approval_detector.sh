@@ -4,14 +4,36 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DETECTOR="$ROOT/scripts/self-approval-detector.cjs"
+WORKFLOW="$ROOT/.github/workflows/agent-review.yml"
 
 if ! command -v node >/dev/null 2>&1; then
   echo "SKIP: node not available" >&2
   exit 0
 fi
 
-DETECTOR_PATH="$DETECTOR" node <<'NODE'
-const { decide } = require(process.env.DETECTOR_PATH);
+BOOTSTRAP_MODULE="$(mktemp "${TMPDIR:-/tmp}/self-approval-bootstrap.XXXXXX.cjs")"
+trap 'rm -f "$BOOTSTRAP_MODULE"' EXIT
+awk '
+  /BEGIN SELF-APPROVAL BOOTSTRAP/ { capture=1; next }
+  /END SELF-APPROVAL BOOTSTRAP/   { capture=0 }
+  capture {
+    sub(/^            /, "")
+    print
+  }
+' "$WORKFLOW" > "$BOOTSTRAP_MODULE"
+if [ ! -s "$BOOTSTRAP_MODULE" ]; then
+  echo "FAIL: could not extract the first-rollout bootstrap detector from $WORKFLOW" >&2
+  exit 1
+fi
+printf '\nmodule.exports = { bootstrapDetector };\n' >> "$BOOTSTRAP_MODULE"
+
+DETECTOR_PATH="$DETECTOR" BOOTSTRAP_PATH="$BOOTSTRAP_MODULE" node <<'NODE'
+const canonical = require(process.env.DETECTOR_PATH);
+const { bootstrapDetector } = require(process.env.BOOTSTRAP_PATH);
+const implementations = [
+  ['canonical', canonical],
+  ['bootstrap', bootstrapDetector()],
+];
 
 const reviewerAccounts = [
   'nathanpayne-claude',
@@ -63,16 +85,87 @@ for (const body of [
   ]);
 }
 
-for (const [name, input, expectedAction, expectedReason, expectedDetail] of cases) {
-  const actual = decide(input);
+for (const [implementationName, { decide }] of implementations) {
+  for (const [name, input, expectedAction, expectedReason, expectedDetail] of cases) {
+    const actual = decide(input);
+    const expectedPersistentViolation = [
+      'same-native-account-approval',
+      'same-agent-phase-4-approval',
+    ].includes(expectedReason);
+    if (
+      actual.action !== expectedAction ||
+      actual.reason !== expectedReason ||
+      actual.detail !== expectedDetail ||
+      Boolean(actual.persistentViolation) !== expectedPersistentViolation
+    ) {
+      throw new Error(
+        `${implementationName}/${name}: expected ${expectedAction}/${expectedReason}/${expectedDetail}/persistent=${expectedPersistentViolation}, got ${JSON.stringify(actual)}`,
+      );
+    }
+  }
+}
+
+const repaired = {
+  ...shared,
+  reviewer: 'nathanpayne-cursor',
+  requiresExternalReview: true,
+};
+for (const [implementationName, { decide }] of implementations) {
+  const invalid = decide({...repaired, prBody: 'Authoring-Agent:'});
+  const fixed = decide({...repaired, prBody: 'Authoring-Agent: codex'});
+  if (invalid.action !== 'block' || invalid.persistentViolation || fixed.action !== 'allow') {
+    throw new Error(`${implementationName}: declaration repair is not recoverable: ${JSON.stringify({invalid, fixed})}`);
+  }
+}
+
+const reviews = [
+  {id: 1, user: {login: 'nathanpayne-codex'}, state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z'},
+  {id: 2, user: {login: 'nathanpayne-codex'}, state: 'COMMENTED', submitted_at: '2026-01-02T00:00:00Z'},
+  {id: 3, user: {login: 'nathanpayne-cursor'}, state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z'},
+  {id: 4, user: {login: 'nathanpayne-cursor'}, state: 'CHANGES_REQUESTED', submitted_at: '2026-01-03T00:00:00Z'},
+  {id: 5, user: {login: 'nathanpayne-claude'}, state: 'APPROVED', submitted_at: '2026-01-04T00:00:00Z'},
+  {id: 6, user: {login: 'outside-reviewer'}, state: 'APPROVED', submitted_at: '2026-01-05T00:00:00Z'},
+  {id: 7, user: {login: 'nathanjohnpayne'}, state: 'APPROVED', submitted_at: '2026-01-06T00:00:00Z'},
+];
+
+for (const [implementationName, { decide, latestApprovedReviews }] of implementations) {
+  if (typeof latestApprovedReviews !== 'function') {
+    throw new Error(`${implementationName}: latestApprovedReviews is unavailable`);
+  }
+  const latest = latestApprovedReviews({reviews, reviewerAccounts, prAuthor: shared.prAuthor});
+  const logins = latest.map(review => review.user.login).sort();
+  const expected = ['nathanpayne-claude', 'nathanpayne-codex'];
+  if (JSON.stringify(logins) !== JSON.stringify(expected)) {
+    throw new Error(`${implementationName}: latest approval collapse mismatch: ${JSON.stringify(logins)}`);
+  }
+
+  const decisions = latest.map(review => decide({
+    ...shared,
+    reviewer: review.user.login,
+    prBody: 'Authoring-Agent: codex',
+    requiresExternalReview: true,
+  }));
   if (
-    actual.action !== expectedAction ||
-    actual.reason !== expectedReason ||
-    actual.detail !== expectedDetail
+    decisions.filter(decision => decision.action === 'block').length !== 1 ||
+    decisions.filter(decision => decision.action === 'allow').length !== 1
   ) {
-    throw new Error(
-      `${name}: expected ${expectedAction}/${expectedReason}/${expectedDetail}, got ${JSON.stringify(actual)}`,
-    );
+    throw new Error(`${implementationName}: mixed same/different approvals were not classified independently: ${JSON.stringify(decisions)}`);
+  }
+
+  const phase3 = decide({
+    ...shared,
+    reviewer: 'nathanpayne-codex',
+    prBody: 'Authoring-Agent: codex',
+    requiresExternalReview: false,
+  });
+  const phase4 = decide({
+    ...shared,
+    reviewer: 'nathanpayne-codex',
+    prBody: 'Authoring-Agent: codex',
+    requiresExternalReview: true,
+  });
+  if (phase3.action !== 'allow' || phase4.action !== 'block') {
+    throw new Error(`${implementationName}: persisted approval transition was not reproduced: ${JSON.stringify({phase3, phase4})}`);
   }
 }
 NODE

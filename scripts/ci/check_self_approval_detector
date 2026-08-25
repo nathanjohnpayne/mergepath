@@ -27,8 +27,9 @@ if [ ! -x "$TEST_SCRIPT" ]; then
   exit 1
 fi
 
-if ! grep -A2 -E 'require\(' "$WORKFLOW" | grep -qF "$DETECTOR"; then
-  echo "check_self_approval_detector: $WORKFLOW no longer require()s $DETECTOR" >&2
+if ! grep -qF "'scripts/self-approval-detector.cjs'" "$WORKFLOW" ||
+  ! grep -qF 'require(detectorPath)' "$WORKFLOW"; then
+  echo "check_self_approval_detector: $WORKFLOW no longer loads $DETECTOR" >&2
   exit 1
 fi
 
@@ -43,6 +44,13 @@ for required_fragment in \
   'needs: [load-config, triage]' \
   'AUTHOR_IDENTITY' \
   'decision.detail' \
+  'decision.persistentViolation' \
+  'latestApprovedReviews' \
+  "core.setOutput('eligible_approval'" \
+  'BEGIN SELF-APPROVAL BOOTSTRAP' \
+  'trusted workflow already requires the detector' \
+  "context.payload.action === 'unlabeled'" \
+  'const mayMutateLabels' \
   'Checkout trusted self-approval detector'; do
   if ! grep -qF "$required_fragment" "$WORKFLOW"; then
     echo "check_self_approval_detector: $WORKFLOW is missing $required_fragment" >&2
@@ -58,15 +66,20 @@ if [ -z "$phase_line" ] || [ -z "$carry_line" ] || [ "$phase_line" -ge "$carry_l
 fi
 
 auto_merge_job=$(sed -n '/^  auto-merge-on-approval:/,/^    runs-on:/p' "$WORKFLOW")
-review_success_gate=$(
-  printf '%s\n' "$auto_merge_job" \
-    | grep -A3 -F "github.event_name != 'pull_request_review'"
-)
 for success_requirement in \
   "needs.triage.result == 'success'" \
-  "needs.block-self-approval.result == 'success'"; do
-  if ! printf '%s\n' "$review_success_gate" | grep -qF "$success_requirement"; then
-    echo "check_self_approval_detector: approved-review auto-merge must require successful triage and self-approval guard jobs" >&2
+  "needs.block-self-approval.result == 'success'" \
+  "needs.block-self-approval.outputs.eligible_approval == 'true'"; do
+  if ! printf '%s\n' "$auto_merge_job" | grep -qF "$success_requirement"; then
+    echo "check_self_approval_detector: every auto-merge trigger must require successful triage and an eligible approval from the self-approval guard" >&2
+    exit 1
+  fi
+done
+
+block_job=$(sed -n '/^  block-self-approval:/,/^    runs-on:/p' "$WORKFLOW")
+for rearm_action in synchronize reopened unlabeled; do
+  if ! printf '%s\n' "$block_job" | grep -qF "$rearm_action"; then
+    echo "check_self_approval_detector: block-self-approval does not cover the $rearm_action re-arm" >&2
     exit 1
   fi
 done

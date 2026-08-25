@@ -187,14 +187,19 @@ jobs:
     # also handles synchronize/reopened so this job's threshold/paths inputs
     # are freshly parsed. Approved review events also run this same decision
     # path so block-self-approval consumes one authoritative Phase 4 result
-    # rather than a second threshold/path implementation (#1094).
+    # rather than a second threshold/path implementation. Blocking-label
+    # `unlabeled` events run it in classification-only mode: the independence
+    # guard needs current Phase 4 scope, but triage must not re-add the label
+    # that the settle event says was just removed (#620/#1094).
     if: >
       github.event.pull_request.user.login != 'dependabot[bot]' &&
       ((github.event_name == 'pull_request' &&
         (github.event.action == 'opened' ||
          github.event.action == 'ready_for_review' ||
          github.event.action == 'synchronize' ||
-         github.event.action == 'reopened')) ||
+         github.event.action == 'reopened' ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))) ||
        (github.event_name == 'pull_request_review' &&
         github.event.review.state == 'approved'))
     runs-on: ubuntu-latest
@@ -225,6 +230,10 @@ jobs:
             const os = require('os');
             const path = require('path');
             const pr = context.payload.pull_request;
+            const mayMutateLabels = !(
+              context.eventName === 'pull_request' &&
+              context.payload.action === 'unlabeled'
+            );
             const threshold = parseInt(process.env.THRESHOLD, 10);
             const protectedPaths = JSON.parse(process.env.PROTECTED_PATHS);
 
@@ -469,13 +478,18 @@ jobs:
                 );
               }
 
-              if (!carried && needsExternal) {
+              if (!carried && mayMutateLabels && needsExternal) {
                 await github.rest.issues.addLabels({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: pr.number,
                   labels: ['needs-external-review'],
                 });
+              } else if (!mayMutateLabels && needsExternal) {
+                console.log(
+                  'Computed Phase 4 applicability for an unlabeled settle ' +
+                  'event without re-adding needs-external-review (#620/#1094).'
+                );
               }
             }
 
@@ -679,15 +693,22 @@ jobs:
             // decision === 'noop' — nothing to do.
 
   # ──────────────────────────────────────────────
-  # Job 5: Block self-approval
+  # Job 5: Enforce approval independence
   # ──────────────────────────────────────────────
   block-self-approval:
     needs: [load-config, triage]
     if: >
       always() &&
-      github.event_name == 'pull_request_review' &&
-      github.event.review.state == 'approved'
+      ((github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved') ||
+       (github.event_name == 'pull_request' &&
+        (github.event.action == 'synchronize' ||
+         github.event.action == 'reopened' ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))))
     runs-on: ubuntu-latest
+    outputs:
+      eligible_approval: ${{ steps.check.outputs.eligible_approval }}
     steps:
       - name: Checkout trusted self-approval detector
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -699,23 +720,213 @@ jobs:
           # leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
 
-      - name: Check and dismiss
+      - name: Classify and dismiss ineligible approvals
+        id: check
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}
           REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
           PHASE_4_REQUIRED: ${{ needs.triage.outputs.phase_4_required }}
+          TRIAGE_RESULT: ${{ needs.triage.result }}
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
+            const fs = require('fs');
             const path = require('path');
-            const { decide } = require(
-              path.resolve(process.env.GITHUB_WORKSPACE,
-                           'scripts/self-approval-detector.cjs'));
+
+            // BEGIN SELF-APPROVAL BOOTSTRAP
+            function bootstrapDetector() {
+              const normalized = value =>
+                typeof value === 'string' ? value.trim().toLowerCase() : '';
+
+              function decide(input) {
+                const prAuthor = normalized(input && input.prAuthor);
+                const authorIdentity = normalized(input && input.authorIdentity);
+                const reviewer = normalized(input && input.reviewer);
+                const reviewerAccounts = Array.isArray(input && input.reviewerAccounts)
+                  ? input.reviewerAccounts.map(normalized).filter(Boolean)
+                  : [];
+                const reviewerIsAgent = reviewerAccounts.includes(reviewer);
+
+                if (reviewer && reviewerIsAgent && prAuthor === reviewer) {
+                  return {
+                    action: 'block',
+                    reason: 'same-native-account-approval',
+                    persistentViolation: true,
+                  };
+                }
+                if (!reviewerIsAgent) {
+                  return {action: 'allow', reason: 'human-or-unregistered-reviewer'};
+                }
+                if (!prAuthor || !authorIdentity) {
+                  return {action: 'block', reason: 'indeterminate-native-author'};
+                }
+                if (prAuthor !== authorIdentity) {
+                  return {action: 'allow', reason: 'non-shared-author-pr'};
+                }
+                if (!input || typeof input.requiresExternalReview !== 'boolean') {
+                  return {action: 'block', reason: 'indeterminate-review-requirement'};
+                }
+                if (input.requiresExternalReview === false) {
+                  return {action: 'allow', reason: 'under-threshold-agent-approval'};
+                }
+
+                const declarationAttempts = (
+                  typeof input.prBody === 'string' ? input.prBody : ''
+                ).split(/\r?\n|\r/).filter(
+                  line => /^[ \t]*Authoring-Agent:/i.test(line),
+                );
+                if (declarationAttempts.length === 0) {
+                  return {
+                    action: 'block',
+                    reason: 'indeterminate-phase-4-author',
+                    detail: 'missing-authoring-agent-declaration',
+                  };
+                }
+                if (declarationAttempts.length > 1) {
+                  return {
+                    action: 'block',
+                    reason: 'indeterminate-phase-4-author',
+                    detail: 'multiple-authoring-agent-declarations',
+                  };
+                }
+                const declaration =
+                  /^Authoring-Agent:[ \t]*([A-Za-z0-9_-]+)[ \t]*$/i
+                    .exec(declarationAttempts[0]);
+                if (!declaration) {
+                  return {
+                    action: 'block',
+                    reason: 'indeterminate-phase-4-author',
+                    detail: 'malformed-authoring-agent-declaration',
+                  };
+                }
+                const authoringAgent = normalized(declaration[1]);
+                const authoringReviewers = reviewerAccounts.filter(
+                  account => account.endsWith(`-${authoringAgent}`),
+                );
+                if (authoringReviewers.length === 0) {
+                  return {
+                    action: 'block',
+                    reason: 'indeterminate-phase-4-author',
+                    detail: 'unknown-authoring-agent',
+                  };
+                }
+                if (authoringReviewers.length > 1) {
+                  return {
+                    action: 'block',
+                    reason: 'indeterminate-phase-4-author',
+                    detail: 'ambiguous-authoring-agent-mapping',
+                  };
+                }
+                const [authoringReviewer] = authoringReviewers;
+                if (authoringReviewer === reviewer) {
+                  return {
+                    action: 'block',
+                    reason: 'same-agent-phase-4-approval',
+                    persistentViolation: true,
+                    authoringAgent,
+                    authoringReviewer,
+                  };
+                }
+                return {action: 'allow', reason: 'different-agent-phase-4-approval'};
+              }
+
+              function latestApprovedReviews(input) {
+                const reviewerAccounts = Array.isArray(input && input.reviewerAccounts)
+                  ? input.reviewerAccounts.map(normalized).filter(Boolean)
+                  : [];
+                const prAuthor = normalized(input && input.prAuthor);
+                const reviews = Array.isArray(input && input.reviews)
+                  ? input.reviews
+                  : [];
+                const latestByReviewer = new Map();
+
+                for (const review of reviews) {
+                  const reviewer = normalized(
+                    review && review.user && review.user.login,
+                  );
+                  const state = normalized(review && review.state).toUpperCase();
+                  if (
+                    !reviewer ||
+                    reviewer === prAuthor ||
+                    !reviewerAccounts.includes(reviewer) ||
+                    !['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(state)
+                  ) {
+                    continue;
+                  }
+                  const current = latestByReviewer.get(reviewer);
+                  const submittedAt = String((review && review.submitted_at) || '');
+                  const currentSubmittedAt = String(
+                    (current && current.submitted_at) || '',
+                  );
+                  const id = Number((review && review.id) || 0);
+                  const currentId = Number((current && current.id) || 0);
+                  if (
+                    !current ||
+                    submittedAt > currentSubmittedAt ||
+                    (submittedAt === currentSubmittedAt && id > currentId)
+                  ) {
+                    latestByReviewer.set(reviewer, review);
+                  }
+                }
+
+                return reviewerAccounts
+                  .map(reviewer => latestByReviewer.get(reviewer))
+                  .filter(review =>
+                    review && normalized(review.state).toUpperCase() === 'APPROVED'
+                  );
+              }
+
+              return {decide, latestApprovedReviews};
+            }
+            // END SELF-APPROVAL BOOTSTRAP
+
+            const detectorPath = path.resolve(
+              process.env.GITHUB_WORKSPACE,
+              'scripts/self-approval-detector.cjs',
+            );
+            const trustedWorkflowPath = path.resolve(
+              process.env.GITHUB_WORKSPACE,
+              '.github/workflows/agent-review.yml',
+            );
+            const detectorRequiredMarker = 'SELF_APPROVAL_DETECTOR_REQUIRED_V1';
+            let detector;
+            if (fs.existsSync(detectorPath)) {
+              detector = require(detectorPath);
+            } else {
+              const trustedWorkflow = fs.readFileSync(trustedWorkflowPath, 'utf8');
+              if (trustedWorkflow.includes(detectorRequiredMarker)) {
+                throw new Error(
+                  'trusted workflow already requires the detector, but ' +
+                  'scripts/self-approval-detector.cjs is missing; failing closed',
+                );
+              }
+              core.notice(
+                'The trusted default branch predates the self-approval ' +
+                'detector; using the parity-tested strict bootstrap for this ' +
+                'atomic workflow/module rollout only.',
+              );
+              detector = bootstrapDetector();
+            }
+            const {decide, latestApprovedReviews} = detector;
+            if (
+              typeof decide !== 'function' ||
+              typeof latestApprovedReviews !== 'function'
+            ) {
+              throw new Error('self-approval detector exports are unavailable');
+            }
+
+            core.setOutput('eligible_approval', 'false');
+            if (process.env.TRIAGE_RESULT !== 'success') {
+              core.setFailed(
+                'Phase 4 classification did not complete; refusing to ' +
+                'classify or consume approvals.',
+              );
+              return;
+            }
 
             const pr = context.payload.pull_request;
             const prAuthor = pr.user.login;
-            const reviewer = context.payload.review.user.login;
             const reviewerAccounts = JSON.parse(
               process.env.REVIEWERS_JSON || '[]',
             );
@@ -726,48 +937,112 @@ jobs:
             }
 
             const phase4Raw = process.env.PHASE_4_REQUIRED;
-            const requiresExternalReview = phase4Raw === 'true'
-              ? true
-              : phase4Raw === 'false'
-                ? false
-                : undefined;
+            if (phase4Raw !== 'true' && phase4Raw !== 'false') {
+              core.setFailed(
+                'Phase 4 applicability is unavailable; refusing to consume approvals.',
+              );
+              return;
+            }
+            const requiresExternalReview = phase4Raw === 'true';
+            const isDirectApproval =
+              context.eventName === 'pull_request_review' &&
+              context.payload.review &&
+              context.payload.review.state === 'approved';
+            const isUnlabeledRearm =
+              context.eventName === 'pull_request' &&
+              context.payload.action === 'unlabeled';
+            let approvals;
+            if (isDirectApproval) {
+              approvals = [context.payload.review];
+            } else {
+              const reviews = await github.paginate(
+                github.rest.pulls.listReviews,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  per_page: 100,
+                },
+              );
+              approvals = latestApprovedReviews({
+                reviews,
+                reviewerAccounts,
+                prAuthor,
+              });
+            }
 
-            const decision = decide({
-              prAuthor,
-              authorIdentity: process.env.AUTHOR_IDENTITY,
-              reviewer,
-              reviewerAccounts,
-              prBody: pr.body || '',
-              requiresExternalReview,
-            });
-            const decisionDiagnostic = decision.detail
-              ? `${decision.reason}: ${decision.detail}`
-              : decision.reason;
+            if (approvals.length === 0) {
+              core.info('No eligible registered approval exists for this re-arm.');
+              return;
+            }
 
-            core.info(
-              `Self-approval decision: ${decision.action} (${decisionDiagnostic})`,
-            );
+            let eligibleApproval = false;
+            let persistentDirectViolation = false;
+            const blockedDiagnostics = [];
+            for (const approval of approvals) {
+              const reviewer = approval.user && approval.user.login;
+              const decision = decide({
+                prAuthor,
+                authorIdentity: process.env.AUTHOR_IDENTITY,
+                reviewer,
+                reviewerAccounts,
+                prBody: pr.body || '',
+                requiresExternalReview,
+              });
+              const decisionDiagnostic = decision.detail
+                ? `${decision.reason}: ${decision.detail}`
+                : decision.reason;
+              core.info(
+                `Approval ${approval.id} by ${reviewer}: ` +
+                `${decision.action} (${decisionDiagnostic})`,
+              );
 
-            if (decision.action !== 'block') return;
+              if (decision.action !== 'block') {
+                eligibleApproval = true;
+                continue;
+              }
 
-            await github.rest.pulls.dismissReview({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pr.number,
-              review_id: context.payload.review.id,
-              message: `Approval violates the agent-independence policy (${decisionDiagnostic}). This review has been dismissed automatically.`,
-            });
+              const persistentViolation =
+                isDirectApproval && Boolean(decision.persistentViolation);
+              persistentDirectViolation =
+                persistentDirectViolation || persistentViolation;
+              const dismissalPrefix = persistentViolation
+                ? 'Approval violates the agent-independence policy'
+                : isDirectApproval
+                  ? 'Approval independence could not be verified'
+                  : 'Approval is no longer eligible under the current agent-independence policy';
+              await github.rest.pulls.dismissReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                review_id: approval.id,
+                message: `${dismissalPrefix} (${decisionDiagnostic}). ` +
+                  'This review has been dismissed automatically.',
+              });
+              blockedDiagnostics.push(decisionDiagnostic);
+            }
 
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
-              labels: ['policy-violation'],
-            });
+            if (persistentDirectViolation) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: ['policy-violation'],
+              });
+            }
 
-            core.setFailed(
-              `Agent-independence violation detected and dismissed (${decisionDiagnostic}).`,
-            );
+            core.setOutput('eligible_approval', eligibleApproval.toString());
+            if (isDirectApproval && blockedDiagnostics.length > 0) {
+              core.setFailed(
+                `Approval dismissed by the agent-independence guard ` +
+                `(${blockedDiagnostics.join('; ')}).`,
+              );
+            } else if (blockedDiagnostics.length > 0) {
+              core.notice(
+                `Dismissed ${blockedDiagnostics.length} approval(s) that ` +
+                `became ineligible before the ${isUnlabeledRearm ? 'unlabeled' : 'update'} re-arm.`,
+              );
+            }
 
   # ──────────────────────────────────────────────
   # Job 6: Auto-merge on approval (if no external review required)
@@ -785,18 +1060,17 @@ jobs:
   # reopened, must have `needs-external-review` re-applied by triage BEFORE
   # the re-verify step reads labels, or the re-arm would arm on a stale
   # snapshot. Triage now also runs on approved review events so the #1094
-  # guard receives its Phase 4 applicability output. `always()` is still
-  # needed because event-mismatched sibling jobs are expected to skip
-  # (`detect-disagreement` / `block-self-approval` on pull_request events;
-  # `triage` on the unlabeled settle event). The pull_request re-arm path
-  # additionally requires `needs.triage.result ==
-  # 'success'`: ordering alone is not enough, because a failed/skipped triage
-  # could otherwise leave the old no-label snapshot in place and still let
-  # auto-merge arm. The approved-review path likewise requires both triage and
-  # block-self-approval to succeed: `always()` must not turn an exception that
-  # occurs before either job applies its blocking label into permission to
-  # continue. See #61 for the cross-event race and #1094 for this fail-closed
-  # review-event boundary.
+  # guard receives its Phase 4 applicability output. On `unlabeled`, triage is
+  # classification-only: it computes Phase 4 applicability without mutating
+  # labels, so it cannot flap against auto-clear. `always()` is still needed
+  # because detect-disagreement is intentionally event-mismatched on the
+  # pull_request re-arm paths, but triage and block-self-approval must both
+  # succeed on every arming event. The guard also exports whether at least one
+  # surviving approval remains eligible for the current policy phase. This
+  # prevents `always()` from turning an exception, an indeterminate identity,
+  # or a newly ineligible carried approval into permission to continue. See
+  # #61 for the cross-event race and #1094 for this fail-closed identity
+  # boundary across approval and re-arm events.
   #
   # Three triggers arm auto-merge (#495, #620):
   #
@@ -859,12 +1133,12 @@ jobs:
   #      The job `if:` additionally requires the REMOVED label to be one
   #      of the four blocking names (the full Label Gate blocking set,
   #      including policy-violation - Codex P2 on the #620 PR), so unrelated label churn does not spend
-  #      runner minutes. triage deliberately does NOT run on `unlabeled`
-  #      (its action filter excludes it — re-applying labels here would
-  #      flap against auto-clear), so the triage-success requirement
-  #      accepts `skipped` on this path: no sibling job can apply a
-  #      label in an unlabeled run, and the two in-job label re-verifies
-  #      still read the live API state fail-closed before any merge.
+  #      runner minutes. Triage runs in classification-only mode on
+  #      `unlabeled`: it must recompute Phase 4 applicability for the
+  #      independence guard, but suppresses all label mutation so it cannot
+  #      flap against auto-clear. The guard independently collapses the live,
+  #      paginated review history, dismisses approvals that are no longer
+  #      eligible, and requires a surviving eligible approval before re-arm.
   #
   # The job body references only `github.event.pull_request.*` (number,
   # html_url, labels) — all trigger shapes carry that object — so the
@@ -881,13 +1155,9 @@ jobs:
          github.event.action == 'reopened' ||
          (github.event.action == 'unlabeled' &&
           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))))) &&
-      (github.event_name != 'pull_request_review' ||
-       (needs.triage.result == 'success' &&
-        needs.block-self-approval.result == 'success')) &&
-      (github.event_name != 'pull_request' ||
-       needs.triage.result == 'success' ||
-       (github.event.action == 'unlabeled' &&
-        needs.triage.result == 'skipped')) &&
+      needs.triage.result == 'success' &&
+      needs.block-self-approval.result == 'success' &&
+      needs.block-self-approval.outputs.eligible_approval == 'true' &&
       !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
       !contains(github.event.pull_request.labels.*.name, 'needs-human-review') &&
       !contains(github.event.pull_request.labels.*.name, 'human-hold')

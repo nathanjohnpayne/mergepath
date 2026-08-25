@@ -944,9 +944,9 @@ fi
 #   - the trigger list must subscribe `unlabeled` (else the if: is dead);
 #   - the job if: must scope unlabeled to the BLOCKING label names via
 #     github.event.label.name (else every label removal spends a runner);
-#   - the triage-success requirement must accept `skipped` ONLY on the
-#     unlabeled path (triage's action filter excludes unlabeled — it must
-#     not run there, or it would flap labels against auto-clear).
+#   - triage must classify unlabeled without mutating labels, so the
+#     independence guard sees current Phase 4 scope without flapping the
+#     label that auto-clear just removed.
 if grep -Fq "unlabeled" <<<"$pr_trigger_types"; then
   pass=$((pass + 1))
   echo "  PASS: on.pull_request.types subscribes unlabeled so the settle re-arm fires (#620)"
@@ -963,25 +963,26 @@ else
   fail=$((fail + 1))
   echo "  FAIL: auto-merge must re-arm on unlabeled ONLY for the blocking labels (github.event.label.name against the four blocking names incl. policy-violation) (#620)" >&2
 fi
-if grep -Fq "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block" \
-  && grep -B1 "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block" | grep -Fq "github.event.action == 'unlabeled'"; then
+if ! grep -Fq "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block" \
+  && grep -Fq "needs.triage.result == 'success'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: triage-skipped is accepted only on the unlabeled path (#620)"
+  echo "  PASS: every re-arm requires a successful Phase 4 classification (#620/#1094)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the triage-success requirement may accept skipped ONLY when github.event.action == 'unlabeled' (triage does not run on unlabeled by design) (#620)" >&2
+  echo "  FAIL: auto-merge must not accept skipped triage on unlabeled; the independence guard needs current Phase 4 scope (#620/#1094)" >&2
 fi
 
-# 2d. triage must NOT run on unlabeled: its action filter is the only thing
-# preventing a label flap (triage re-applies needs-external-review moments
-# after auto-clear removed it, in the very run the removal triggered).
+# 2d. Triage classifies unlabeled but must not mutate labels: re-applying
+# needs-external-review moments after auto-clear removed it would flap.
 triage_job_block=$(awk '/^  triage:/{f=1} f && /^  [a-z-]+:$/ && !/^  triage:/{exit} f{print}' "$agent_review_workflow")
-if grep -Fq "github.event.action == 'unlabeled'" <<<"$triage_job_block"; then
-  fail=$((fail + 1))
-  echo "  FAIL: triage must not run on unlabeled — it would re-apply the label auto-clear just removed (flap) (#620)" >&2
-else
+if grep -Fq "github.event.action == 'unlabeled'" <<<"$triage_job_block" \
+  && grep -Fq 'const mayMutateLabels' <<<"$triage_job_block" \
+  && grep -Fq 'mayMutateLabels && needsExternal' <<<"$triage_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: triage's action filter excludes unlabeled (no label flap) (#620)"
+  echo "  PASS: triage classifies unlabeled without mutating labels (#620/#1094)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: triage must classify unlabeled and guard needs-external-review mutation with mayMutateLabels (#620/#1094)" >&2
 fi
 
 # 2e. A registered reviewer approval is the merge-readiness signal. Advisory
@@ -1208,8 +1209,8 @@ fi
 #     because event-mismatched sibling jobs are expected to skip, but a
 #     synchronize/reopened re-arm cannot proceed unless triage succeeded and
 #     had the chance to refresh needs-external-review.
-if grep -Fq "github.event_name != 'pull_request'" <<<"$auto_merge_job_block" \
-  && grep -Fq "needs.triage.result == 'success'" <<<"$auto_merge_job_block"; then
+if grep -Fq "needs.triage.result == 'success'" <<<"$auto_merge_job_block" \
+  && ! grep -Fq "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
   echo "  PASS: pull_request re-arm fails closed unless triage succeeds (#495)"
 else
