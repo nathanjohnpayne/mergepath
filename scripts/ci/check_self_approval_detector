@@ -97,19 +97,28 @@ done
 
 shared_author_retraction=$(awk '
   /- name: Retract shared-author auto-merge/ {in_step=1}
+  in_step && /^  # ─/ {exit}
+  in_step && /^  [A-Za-z0-9_-]+:/ {exit}
   in_step && /- name:/ && $0 !~ /- name: Retract shared-author auto-merge/ {exit}
   in_step {print}
 ' "$WORKFLOW")
 for required_fragment in \
   'if: ${{ always() }}' \
-  'GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' \
-  'approval-merge-continuation.sh' \
-  '--disarm-shared-author-only "$PR_NUMBER" "$REPO"'; do
+  'SHARED_AUTHOR_DISARM_REQUIRED_V1' \
+  'GH_TOKEN: ${{ github.token }}' \
+  'AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}' \
+  '--json author,autoMergeRequest,url' \
+  '--disable-auto' \
+  '.autoMergeRequest == null'; do
   if ! printf '%s\n' "$shared_author_retraction" | grep -qF -- "$required_fragment"; then
-    echo "check_self_approval_detector: shared-author approval invalidation must always invoke the author-token retraction path ($required_fragment)" >&2
+    echo "check_self_approval_detector: shared-author approval invalidation must carry its self-contained workflow-token retraction path ($required_fragment)" >&2
     exit 1
   fi
 done
+if printf '%s\n' "$shared_author_retraction" | grep -qF 'AUTHOR_MERGE_TOKEN'; then
+  echo "check_self_approval_detector: protective retraction must not depend on the optional auto-merge token" >&2
+  exit 1
+fi
 
 load_config_job=$(sed -n '/^  load-config:/,/^    runs-on:/p' "$WORKFLOW")
 triage_job=$(sed -n '/^  triage:/,/^    runs-on:/p' "$WORKFLOW")

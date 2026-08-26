@@ -1114,20 +1114,60 @@ jobs:
       - name: Retract shared-author auto-merge
         if: ${{ always() }}
         env:
-          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          # SHARED_AUTHOR_DISARM_REQUIRED_V1. This protective workflow write
+          # only disables auto-merge; it can never arm or merge the PR.
+          GH_TOKEN: ${{ github.token }}
+          AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::AUTHOR_MERGE_TOKEN is not configured; cannot prove or retract a pre-existing shared-author auto-merge arm."
+          if ! pr_state=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json author,autoMergeRequest,url); then
+            echo "::error::Could not read live PR author or auto-merge state."
             exit 1
           fi
-          if [ ! -x scripts/workflow/approval-merge-continuation.sh ]; then
-            echo "::error::Trusted approval continuation helper is unavailable; cannot enforce shared-author auto-merge invalidation."
+          if ! jq -e '
+            type == "object" and
+            (.author.login | type == "string" and length > 0) and
+            (.url | type == "string" and length > 0) and
+            has("autoMergeRequest") and
+            ((.autoMergeRequest == null) or (.autoMergeRequest | type == "object"))
+          ' >/dev/null 2>&1 <<<"$pr_state"; then
+            echo "::error::Live PR author or auto-merge metadata is malformed."
             exit 1
           fi
-          bash scripts/workflow/approval-merge-continuation.sh \
-            --disarm-shared-author-only "$PR_NUMBER" "$REPO"
+          if jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
+            echo "PR has no auto-merge request to retract."
+            exit 0
+          fi
+          if [ -z "${AUTHOR_IDENTITY:-}" ]; then
+            echo "::error::An auto-merge request exists but governing author_identity is unavailable; refusing to leave an unclassified arm."
+            exit 1
+          fi
+          native_author=$(jq -r '.author.login' <<<"$pr_state")
+          if [ "$native_author" != "$AUTHOR_IDENTITY" ]; then
+            echo "Native non-shared PR requires no auto-merge invalidation."
+            exit 0
+          fi
+          pr_url=$(jq -r '.url' <<<"$pr_state")
+          if ! gh pr merge "$pr_url" --repo "$REPO" --disable-auto; then # NO_BARE_GH_WRITE_EXEMPT: github.token is write-scoped by this trusted workflow and this command can only retract auto-merge
+            echo "::error::Could not retract shared-author auto-merge."
+            exit 1
+          fi
+          if ! readback=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json author,autoMergeRequest); then
+            echo "::error::Could not verify shared-author auto-merge retraction."
+            exit 1
+          fi
+          if ! jq -e --arg author "$AUTHOR_IDENTITY" '
+            (.author.login == $author) and
+            has("autoMergeRequest") and
+            .autoMergeRequest == null
+          ' >/dev/null 2>&1 <<<"$readback"; then
+            echo "::error::Shared-author auto-merge retraction did not persist."
+            exit 1
+          fi
+          echo "Shared-author auto-merge retraction verified."
 
   # ──────────────────────────────────────────────
   # Job 6: Auto-merge on approval (if no external review required)

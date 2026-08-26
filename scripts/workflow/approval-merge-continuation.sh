@@ -20,10 +20,6 @@ case "$PR_NUMBER" in *[!0-9]*|'') usage ;; esac
 [ -n "$REPO" ] || usage
 
 ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-# shellcheck source=../lib/blocking-labels.sh
-source "$ROOT/scripts/lib/blocking-labels.sh"
-# shellcheck source=../lib/review-policy-scalar.sh
-source "$ROOT/scripts/lib/review-policy-scalar.sh"
 
 not_ready() {
   echo "approval continuation: not ready — $*"
@@ -40,18 +36,6 @@ read_pr() {
     --json state,isDraft,headRefOid,baseRefName,baseRefOid,url,labels,author,autoMergeRequest
 }
 
-blocking_labels() {
-  jq -r '.labels[]?.name' | mergepath_blocking_labels_csv
-}
-
-policy=$(bash "$ROOT/scripts/workflow/resolve_base_policy.sh" \
-  --repo "$REPO" --pr "$PR_NUMBER" --materialize-default) \
-  || infra_error "could not resolve the governing base policy"
-[ -f "$policy" ] || infra_error "governing base policy was not materialized"
-expected_author=$(review_policy_scalar "$policy" author_identity)
-[ "$policy" = "$ROOT/.github/review-policy.yml" ] || rm -f "$policy"
-[ -n "$expected_author" ] || infra_error "governing base policy names no author_identity"
-
 identity_err=$(mktemp "${TMPDIR:-/tmp}/approval-continuation-identity.XXXXXX")
 set +e
 login=$(gh api user --jq .login 2>"$identity_err")
@@ -60,7 +44,7 @@ set -e
 identity_msg=$(cat "$identity_err" 2>/dev/null || true)
 rm -f "$identity_err"
 [ "$identity_rc" -eq 0 ] || infra_error "could not verify merge token identity: ${identity_msg:-unknown API error}"
-[ "$login" = "$expected_author" ] || infra_error "merge token resolves to $login, expected $expected_author"
+[ -n "$login" ] || infra_error "merge token identity is empty"
 
 initial=$(read_pr) || infra_error "could not read PR #$PR_NUMBER"
 if ! jq -e '
@@ -78,10 +62,7 @@ base_ref=$(jq -r '.baseRefName // ""' <<<"$initial")
 base_sha=$(jq -r '.baseRefOid // ""' <<<"$initial")
 url=$(jq -r '.url // ""' <<<"$initial")
 native_author=$(jq -r '.author.login' <<<"$initial")
-labels=$(blocking_labels <<<"$initial")
-[ "$state" = "OPEN" ] || not_ready "PR is $state"
-[ -n "$head" ] && [ -n "$base_ref" ] && [ -n "$base_sha" ] && [ -n "$url" ] \
-  || infra_error "PR response lacks head, base, or URL"
+[ -n "$head" ] && [ -n "$url" ] || infra_error "PR response lacks head or URL"
 
 # A durable native auto-merge arm is unsafe for every PR whose native author
 # is the fleet's shared author identity. The approval is intentionally valid
@@ -89,7 +70,9 @@ labels=$(blocking_labels <<<"$initial")
 # advance, retarget, or blocking label; GitHub's head CAS cannot bind those
 # mutable facts. Keep self-review scope unchanged and make only the merge a
 # one-shot action. This runs before every readiness/error exit and also exposes
-# a disarm-only invalidation mode for the approval workflow.
+# a policy-independent disarm-only mode for trusted invalidation callers. The
+# author token identity and native PR author are sufficient for this protective
+# write; governing base-policy resolution remains mandatory before any arm.
 if [ "$native_author" = "$login" ]; then
   if [ "$(jq -r 'if .autoMergeRequest == null then "false" else "true" end' <<<"$initial")" = "true" ]; then
     if ! gh pr merge "$url" --repo "$REPO" --disable-auto --match-head-commit "$head"; then # NO_BARE_GH_WRITE_EXEMPT: the effective token was verified above; this only retracts a shared-author arm
@@ -114,6 +97,30 @@ if [ "$MODE" = "disarm-only" ]; then
   exit 0
 fi
 
+# No merge-arming prerequisite may run until the protective shared-author
+# branch above has retracted an existing arm. In particular, an unreadable or
+# malformed governing base policy must not strand an already-armed shared PR.
+# shellcheck source=../lib/blocking-labels.sh
+source "$ROOT/scripts/lib/blocking-labels.sh"
+# shellcheck source=../lib/review-policy-scalar.sh
+source "$ROOT/scripts/lib/review-policy-scalar.sh"
+
+blocking_labels() {
+  jq -r '.labels[]?.name' | mergepath_blocking_labels_csv
+}
+
+policy=$(bash "$ROOT/scripts/workflow/resolve_base_policy.sh" \
+  --repo "$REPO" --pr "$PR_NUMBER" --materialize-default) \
+  || infra_error "could not resolve the governing base policy"
+[ -f "$policy" ] || infra_error "governing base policy was not materialized"
+expected_author=$(review_policy_scalar "$policy" author_identity)
+[ "$policy" = "$ROOT/.github/review-policy.yml" ] || rm -f "$policy"
+[ -n "$expected_author" ] || infra_error "governing base policy names no author_identity"
+[ "$login" = "$expected_author" ] || infra_error "merge token resolves to $login, expected $expected_author"
+
+labels=$(blocking_labels <<<"$initial")
+[ "$state" = "OPEN" ] || not_ready "PR is $state"
+[ -n "$base_ref" ] && [ -n "$base_sha" ] || infra_error "PR response lacks base metadata"
 [ "$draft" = "false" ] || not_ready "PR is draft"
 [ -z "$labels" ] || not_ready "blocking labels present: $labels"
 

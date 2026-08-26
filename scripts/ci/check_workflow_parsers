@@ -817,19 +817,30 @@ fi
 
 shared_author_retraction_block=$(awk '
   /- name: Retract shared-author auto-merge/ {in_block=1}
+  in_block && /^  # ─/ {exit}
+  in_block && /^  [A-Za-z0-9_-]+:/ {exit}
   in_block && /- name:/ && $0 !~ /- name: Retract shared-author auto-merge/ {exit}
   in_block {print}
 ' "$agent_review_workflow")
+retraction_no_arm_line=$(grep -nF '.autoMergeRequest == null' <<<"$shared_author_retraction_block" | head -1 | cut -d: -f1)
+retraction_identity_line=$(grep -nF 'if [ -z "${AUTHOR_IDENTITY:-}" ]; then' <<<"$shared_author_retraction_block" | head -1 | cut -d: -f1)
 if grep -Fq 'if: ${{ always() }}' <<<"$shared_author_retraction_block" \
-  && grep -Fq 'GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$shared_author_retraction_block" \
-  && grep -Fq 'AUTHOR_MERGE_TOKEN is not configured; cannot prove or retract' <<<"$shared_author_retraction_block" \
-  && grep -Fq 'exit 1' <<<"$shared_author_retraction_block" \
-  && grep -Fq -- '--disarm-shared-author-only "$PR_NUMBER" "$REPO"' <<<"$shared_author_retraction_block"; then
+  && grep -Fq 'SHARED_AUTHOR_DISARM_REQUIRED_V1' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}' <<<"$shared_author_retraction_block" \
+  && ! grep -Fq 'AUTHOR_MERGE_TOKEN' <<<"$shared_author_retraction_block" \
+  && grep -Fq -- '--json author,autoMergeRequest,url' <<<"$shared_author_retraction_block" \
+  && grep -Fq -- '--disable-auto' <<<"$shared_author_retraction_block" \
+  && ! grep -Eq -- '--(auto|merge|rebase|squash)([[:space:]]|$)' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'Shared-author auto-merge retraction did not persist.' <<<"$shared_author_retraction_block" \
+  && [ -n "$retraction_no_arm_line" ] \
+  && [ -n "$retraction_identity_line" ] \
+  && [ "$retraction_no_arm_line" -lt "$retraction_identity_line" ]; then
   pass=$((pass + 1))
-  echo "  PASS: approval invalidation always retracts shared-author auto-merge under the author token (#1094)"
+  echo "  PASS: approval invalidation uses an atomic workflow-token retraction that is optional-token and first-rollout safe (#1094)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: block-self-approval must always invoke the author-token shared-author retraction path (#1094)" >&2
+  echo "  FAIL: block-self-approval must read arm state first, avoid AUTHOR_MERGE_TOKEN/helper skew, and only disable + verify shared-author auto-merge (#1094)" >&2
 fi
 
 if grep -Fq "AUTHOR_MERGE_TOKEN resolves to" "$agent_review_workflow"; then
