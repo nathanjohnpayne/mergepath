@@ -132,13 +132,11 @@ function decide(input) {
   return { action: 'allow', reason: 'different-agent-phase-4-approval' };
 }
 
-function latestApprovedReviews(input) {
+function latestOpinionatedReviews(input) {
   const reviewerAccounts = Array.isArray(input && input.reviewerAccounts)
     ? input.reviewerAccounts.map(normalized).filter(Boolean)
     : [];
   const prAuthor = normalized(input && input.prAuthor);
-  const headSha = normalized(input && input.headSha);
-  const requireHead = Boolean(input && input.requireHead);
   const reviews = Array.isArray(input && input.reviews) ? input.reviews : [];
   const latestByReviewer = new Map();
 
@@ -170,11 +168,16 @@ function latestApprovedReviews(input) {
 
   return reviewerAccounts
     .map(reviewer => latestByReviewer.get(reviewer))
-    .filter(review =>
-      review &&
-      normalized(review.state).toUpperCase() === 'APPROVED' &&
-      (!requireHead || (headSha && normalized(review.commit_id) === headSha)),
-    );
+    .filter(Boolean);
+}
+
+function latestApprovedReviews(input) {
+  const headSha = normalized(input && input.headSha);
+  const requireHead = Boolean(input && input.requireHead);
+  return latestOpinionatedReviews(input).filter(review =>
+    normalized(review.state).toUpperCase() === 'APPROVED' &&
+    (!requireHead || (headSha && normalized(review.commit_id) === headSha)),
+  );
 }
 // END SELF-APPROVAL DETECTOR IMPLEMENTATION
 
@@ -182,8 +185,13 @@ function latestApprovedReviews(input) {
 // decision. The workflow still owns dismissal/comment mutations, while the
 // shared continuation consumes this pure summary immediately before arming.
 function evaluateLatestApprovals(input) {
-  const approvals = latestApprovedReviews(input);
-  const classified = approvals.map(review => {
+  const headSha = normalized(input && input.headSha);
+  const requireHead = Boolean(input && input.requireHead);
+  const opinions = latestOpinionatedReviews(input);
+  const standingApprovals = opinions.filter(
+    review => normalized(review && review.state).toUpperCase() === 'APPROVED',
+  );
+  const classified = standingApprovals.map(review => {
     const reviewer = normalized(review && review.user && review.user.login);
     return {
       id: Number((review && review.id) || 0),
@@ -192,8 +200,15 @@ function evaluateLatestApprovals(input) {
       decision: decide({...input, reviewer}),
     };
   });
-  const allowed = classified.filter(approval => approval.decision.action === 'allow');
+  const allowed = classified.filter(approval =>
+    approval.decision.action === 'allow' &&
+    (!requireHead || (headSha && approval.commitId === headSha)),
+  );
   const blocking = classified.filter(approval => approval.decision.action !== 'allow');
+  const relevant = classified.filter(approval =>
+    approval.decision.action !== 'allow' ||
+    (!requireHead || (headSha && approval.commitId === headSha)),
+  );
 
   return {
     // The final merge seam must not leave a same-agent Phase 4 approval in
@@ -205,7 +220,14 @@ function evaluateLatestApprovals(input) {
     eligibleApproval: allowed.length > 0 && blocking.length === 0,
     independentApproval: allowed.length > 0,
     blockingApprovals: blocking,
-    approvals: classified,
+    approvals: relevant,
+    opinionatedReviews: opinions.map(review => ({
+      id: Number((review && review.id) || 0),
+      reviewer: normalized(review && review.user && review.user.login),
+      state: normalized(review && review.state).toUpperCase(),
+      commitId: normalized(review && review.commit_id),
+      submittedAt: String((review && review.submitted_at) || ''),
+    })),
   };
 }
 

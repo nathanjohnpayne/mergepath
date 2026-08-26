@@ -144,7 +144,13 @@ run_case() {
 }
 
 reset_fixtures
-if run_case && jq -e '.stable == true and .after.eligibleApproval == true and .after.approvals[0].reviewer == "nathanpayne-codex"' "$TMP/out" >/dev/null; then
+if run_case && jq -e '
+  .stable == true and
+  .sharedAuthor == true and
+  .requiresExternalReview == true and
+  .after.eligibleApproval == true and
+  .after.approvals[0].reviewer == "nathanpayne-codex"
+' "$TMP/out" >/dev/null; then
   pass "a stable different-agent current-head Phase 4 approval remains eligible"
 else
   fail "different-agent current-head approval should be eligible: $(cat "$TMP/err" 2>/dev/null)"
@@ -202,6 +208,18 @@ set +e; run_case; rc=$?; set -e
 if [ "$rc" -eq 1 ]; then pass "an older-head approval cannot satisfy final independence"; else fail "stale-head approval passed (rc=$rc)"; fi
 
 reset_fixtures
+STUB_PR='{"state":"open","draft":false,"head":{"sha":"abc123"},"base":{"ref":"main","sha":"base123","repo":{"default_branch":"main"}},"user":{"login":"nathanjohnpayne"},"body":"Authoring-Agent: codex","labels":[]}'
+STUB_PR_AFTER="$STUB_PR"
+STUB_REVIEWS_PAGE_1='[{"id":19,"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"old","submitted_at":"2026-01-06T00:00:00Z"},{"id":20,"user":{"login":"nathanpayne-claude"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-01-07T00:00:00Z"}]'
+STUB_REVIEWS_AFTER_PAGE_1="$STUB_REVIEWS_PAGE_1"
+set +e; run_case; rc=$?; set -e
+if [ "$rc" -eq 1 ] && jq -e '(.after.blockingApprovals | map(.id) | index(19)) != null and .after.independentApproval == true' "$TMP/out" >/dev/null; then
+  pass "a standing old-head same-agent approval blocks beside a current-head independent approval"
+else
+  fail "old-head same-agent approval remained as a native fallback (rc=$rc)"
+fi
+
+reset_fixtures
 STUB_REVIEWS_PAGE_1='[{"id":20,"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-01-07T00:00:00Z"}]'
 STUB_REVIEWS_PAGE_2='[{"id":21,"user":{"login":"nathanpayne-codex"},"state":"CHANGES_REQUESTED","commit_id":"abc123","submitted_at":"2026-01-08T00:00:00Z"}]'
 STUB_REVIEWS_AFTER_PAGE_1="$STUB_REVIEWS_PAGE_1"
@@ -223,7 +241,24 @@ if [ "$rc" -eq 1 ]; then pass "equal review timestamps resolve by larger numeric
 reset_fixtures
 STUB_REVIEWS_AFTER_PAGE_1='[{"id":20,"user":{"login":"nathanpayne-codex"},"state":"DISMISSED","commit_id":"abc123","submitted_at":"2026-01-07T00:00:00Z"}]'
 set +e; run_case; rc=$?; set -e
-if [ "$rc" -eq 1 ] && grep -q 'approval state changed' "$TMP/err"; then pass "an approval dismissed between paginated snapshots defers"; else fail "mid-read dismissal was consumed (rc=$rc)"; fi
+if [ "$rc" -eq 1 ] && grep -q 'opinionated review state changed' "$TMP/err"; then pass "an approval dismissed between paginated snapshots defers"; else fail "mid-read dismissal was consumed (rc=$rc)"; fi
+
+reset_fixtures
+STUB_REVIEWS_AFTER_PAGE_1='[{"id":20,"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-01-07T00:00:00Z"},{"id":21,"user":{"login":"nathanpayne-claude"},"state":"CHANGES_REQUESTED","commit_id":"abc123","submitted_at":"2026-01-08T00:00:00Z"}]'
+set +e; run_case; rc=$?; set -e
+if [ "$rc" -eq 1 ] && grep -q 'opinionated review state changed' "$TMP/err"; then
+  pass "a second reviewer's new changes-requested opinion between snapshots defers"
+else
+  fail "cross-reviewer opinion change was not detected (rc=$rc)"
+fi
+
+reset_fixtures
+STUB_REVIEWS_AFTER_PAGE_1='[{"id":20,"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-01-07T00:00:00Z"},{"id":21,"user":{"login":"nathanpayne-claude"},"state":"COMMENTED","commit_id":"abc123","submitted_at":"2026-01-08T00:00:00Z"}]'
+if run_case; then
+  pass "a second reviewer's COMMENTED noise between snapshots does not revoke approval"
+else
+  fail "COMMENTED noise changed the opinionated snapshot"
+fi
 
 reset_fixtures
 STUB_PR_AFTER='{"state":"open","draft":false,"head":{"sha":"abc123"},"base":{"ref":"release","sha":"base456","repo":{"default_branch":"main"}},"user":{"login":"nathanjohnpayne"},"body":"Authoring-Agent: claude","labels":[]}'
@@ -255,6 +290,11 @@ STUB_REVIEWS_PAGE_1='{}'
 STUB_REVIEWS_AFTER_PAGE_1='{}'
 set +e; run_case; rc=$?; set -e
 if [ "$rc" -eq 3 ]; then pass "a non-array paginated response fails closed"; else fail "malformed pagination passed (rc=$rc)"; fi
+
+reset_fixtures
+STUB_REVIEWS_AFTER_PAGE_1='[{"id":20,"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-01-07T00:00:00Z"},{"id":21,"user":{"login":"nathanpayne-claude"},"state":"CHANGES_REQUESTED","commit_id":"abc123"}]'
+set +e; run_case; rc=$?; set -e
+if [ "$rc" -eq 3 ]; then pass "a malformed opinionated review object fails closed"; else fail "malformed review object passed (rc=$rc)"; fi
 
 reset_fixtures
 STUB_PR_RC=8

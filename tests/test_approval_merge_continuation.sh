@@ -69,6 +69,8 @@ cat > "$TMP/root/scripts/workflow/approval-independence-check.sh" <<'STUB'
 #!/usr/bin/env bash
 printf 'independence\n' >> "${STUB_DIR:?}/events.log"
 printf 'read_count=%s args=[%s]\n' "$(cat "${STUB_DIR:?}/read-count")" "$*" >> "$STUB_DIR/independence.log"
+printf '{"sharedAuthor":%s,"requiresExternalReview":%s}\n' \
+  "${STUB_SHARED_AUTHOR:-false}" "${STUB_REQUIRES_EXTERNAL:-false}"
 exit "${STUB_INDEPENDENCE_RC:-0}"
 STUB
 chmod +x "$TMP/root/scripts/workflow/approval-independence-check.sh"
@@ -102,6 +104,8 @@ run_case() {
     STUB_THREADS_RC="${STUB_THREADS_RC:-0}" STUB_LOGIN="${STUB_LOGIN:-nathanjohnpayne}" \
     STUB_REQUIRED_CHECKS_RC="${STUB_REQUIRED_CHECKS_RC:-0}" \
     STUB_INDEPENDENCE_RC="${STUB_INDEPENDENCE_RC:-0}" \
+    STUB_SHARED_AUTHOR="${STUB_SHARED_AUTHOR:-false}" \
+    STUB_REQUIRES_EXTERNAL="${STUB_REQUIRES_EXTERNAL:-false}" \
     STUB_LOGIN_RC="${STUB_LOGIN_RC:-0}" STUB_MERGE_RC="${STUB_MERGE_RC:-0}" \
     bash "$TMP/subject.sh" 7 owner/repo >"$TMP/subject.out" 2>&1
 }
@@ -119,7 +123,7 @@ reset_fixtures() {
   unset STUB_INITIAL STUB_FINAL STUB_READINESS_RC STUB_GATE_RC
   unset STUB_ACCOUNTING_RC STUB_THREADS_RC STUB_LOGIN STUB_LOGIN_RC
   unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR STUB_REQUIRED_CHECKS_RC
-  unset STUB_INDEPENDENCE_RC
+  unset STUB_INDEPENDENCE_RC STUB_SHARED_AUTHOR STUB_REQUIRES_EXTERNAL
 }
 
 reset_fixtures
@@ -233,6 +237,54 @@ if run_case \
   pass "final metadata, pinned live independence, and exact-head auto-merge run in that order"
 else
   fail "continuation safety order drifted (events: $(tr '\n' ' ' < "$TMP/events.log"); readiness: $(cat "$TMP/readiness.log" 2>/dev/null || true); independence: $(cat "$TMP/independence.log" 2>/dev/null || true); merge: $(cat "$TMP/merge.log" 2>/dev/null || true); output: $(cat "$TMP/subject.out" 2>/dev/null || true))"
+fi
+
+reset_fixtures
+STUB_SHARED_AUTHOR=true
+STUB_REQUIRES_EXTERNAL=true
+set +e
+run_case
+shared_phase4_rc=$?
+set -e
+if [ "$shared_phase4_rc" -eq 4 ] && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'shared-author Phase 4 PR requires a separately authorized manual merge' "$TMP/subject.out"; then
+  pass "shared-author Phase 4 approval cannot arm mutable-state auto-merge"
+else
+  fail "shared-author Phase 4 path must stop before gh pr merge (rc=$shared_phase4_rc)"
+fi
+
+reset_fixtures
+STUB_SHARED_AUTHOR=true
+STUB_REQUIRES_EXTERNAL=true
+STUB_FINAL=$(jq -c '.autoMergeRequest = {enabledAt: "2026-01-09T00:00:00Z"}' <<<"$BASE")
+set +e
+run_case
+armed_shared_phase4_rc=$?
+set -e
+if [ "$armed_shared_phase4_rc" -eq 4 ] \
+   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && ! grep -Fq -- '--auto' "$TMP/merge.log"; then
+  pass "shared-author Phase 4 re-entry retracts a pre-existing auto-merge arm"
+else
+  fail "pre-existing shared-author Phase 4 auto-merge arm was not retracted (rc=$armed_shared_phase4_rc)"
+fi
+
+reset_fixtures
+STUB_SHARED_AUTHOR=true
+STUB_REQUIRES_EXTERNAL=false
+if run_case && [ -s "$TMP/merge.log" ]; then
+  pass "under-threshold shared-author approvals retain the documented auto-merge path"
+else
+  fail "under-threshold shared-author approval was over-blocked"
+fi
+
+reset_fixtures
+STUB_SHARED_AUTHOR=false
+STUB_REQUIRES_EXTERNAL=true
+if run_case && [ -s "$TMP/merge.log" ]; then
+  pass "native non-shared Phase 4 authors retain GitHub's author-independent auto-merge path"
+else
+  fail "native non-shared Phase 4 approval was over-blocked"
 fi
 
 reset_fixtures

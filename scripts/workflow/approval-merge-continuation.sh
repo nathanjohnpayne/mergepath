@@ -32,7 +32,7 @@ infra_error() {
 
 read_pr() {
   gh pr view "$PR_NUMBER" --repo "$REPO" \
-    --json state,isDraft,headRefOid,baseRefName,baseRefOid,url,labels
+    --json state,isDraft,headRefOid,baseRefName,baseRefOid,url,labels,autoMergeRequest
 }
 
 blocking_labels() {
@@ -161,10 +161,38 @@ independence_output=$(bash "$ROOT/scripts/workflow/approval-independence-check.s
 independence_rc=$?
 set -e
 case "$independence_rc" in
-  0) ;;
+  0)
+    if ! jq -e '
+      type == "object" and
+      (.sharedAuthor | type == "boolean") and
+      (.requiresExternalReview | type == "boolean")
+    ' >/dev/null 2>&1 <<<"$independence_output"; then
+      infra_error "live approval-independence predicate returned malformed success output"
+    fi
+    ;;
   1) not_ready "live approval independence is not satisfied: $independence_output" ;;
   *) infra_error "live approval-independence predicate returned rc=$independence_rc: $independence_output" ;;
 esac
+
+# #1094 / #928 boundary: GitHub can compare a native PR author with a reviewer
+# atomically, but the fleet's Authoring-Agent declaration and review history
+# are mutable same-head metadata. No merge API precondition binds either one;
+# --match-head-commit only binds the Git commit. Therefore a shared-author
+# Phase 4 PR must not leave this automated seam armed: a declaration edit,
+# approval dismissal, or same-agent approval can race after the last API read
+# while native auto-merge still sees the same head. Under-threshold shared
+# authors remain eligible by policy, and non-shared native authors retain
+# GitHub's native author/reviewer independence.
+if [ "$(jq -r '.sharedAuthor' <<<"$independence_output")" = "true" ] \
+   && [ "$(jq -r '.requiresExternalReview' <<<"$independence_output")" = "true" ]; then
+  auto_merge_enabled=$(jq -r 'if .autoMergeRequest == null then "false" else "true" end' <<<"$final")
+  if [ "$auto_merge_enabled" = "true" ]; then
+    if ! gh pr merge "$url" --repo "$REPO" --disable-auto --match-head-commit "$final_head"; then # NO_BARE_GH_WRITE_EXEMPT: the effective token was verified above; this only retracts an unsafe pre-existing arm
+      infra_error "could not disable pre-existing auto-merge on shared-author Phase 4 PR"
+    fi
+  fi
+  not_ready "shared-author Phase 4 PR requires a separately authorized manual merge because mutable approval independence cannot be bound atomically to native auto-merge"
+fi
 
 if ! gh pr merge "$url" --repo "$REPO" --squash --auto --match-head-commit "$final_head"; then # NO_BARE_GH_WRITE_EXEMPT: the effective token was verified above against the governing author_identity before this exact-head merge write
   infra_error "could not enable exact-head auto-merge"

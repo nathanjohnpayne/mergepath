@@ -115,17 +115,36 @@ fi
 
 # Approval and metadata-edit events for the same PR mutate one shared approval
 # state machine. An older run is cancelled only when its replacement executes
-# equivalent enforcement. COMMENTED/CHANGES_REQUESTED reviews and `labeled`
-# events skip the guard, so allowing them to cancel would suppress rather than
-# supersede the authoritative run (and triage can emit its own labeled event).
+# equivalent enforcement. GitHub replaces an older pending member of a shared
+# group regardless of cancel-in-progress, so COMMENTED/CHANGES_REQUESTED
+# reviews, opened/ready, `labeled`, and unrelated `unlabeled` events also need a
+# run-unique fallback group instead of merely setting cancellation false.
 concurrency_block=$(sed -n '/^concurrency:/,/^[^ ]/p' "$WORKFLOW")
-if ! printf '%s\n' "$concurrency_block" | grep -qF '  group: agent-review-${{ github.event.pull_request.number }}' ||
-  ! printf '%s\n' "$concurrency_block" | grep -qF "github.event.action != 'labeled'" ||
-  ! printf '%s\n' "$concurrency_block" | grep -qF "github.event.review.state == 'approved'" ||
+concurrency_group=$(sed -n '/^  group:/,/^  cancel-in-progress:/p' <<<"$concurrency_block")
+concurrency_cancel=$(sed -n '/^  cancel-in-progress:/,$p' <<<"$concurrency_block")
+if ! printf '%s\n' "$concurrency_group" | grep -qF 'agent-review-${{ github.event.pull_request.number }}-${{' ||
+  ! printf '%s\n' "$concurrency_group" | grep -qF "'approval-enforcement'" ||
+  ! printf '%s\n' "$concurrency_group" | grep -qF 'github.run_id' ||
+  printf '%s\n' "$concurrency_block" | grep -qF "github.event.action != 'labeled'" ||
+  printf '%s\n' "$concurrency_block" | grep -qF "github.event.action == 'opened'" ||
+  printf '%s\n' "$concurrency_block" | grep -qF "github.event.action == 'ready_for_review'" ||
   printf '%s\n' "$concurrency_block" | grep -qF '  cancel-in-progress: true'; then
-  echo "check_self_approval_detector: per-PR cancellation must retain labeled/COMMENTED producers and supersede them only with authoritative PR or approved-review runs" >&2
+  echo "check_self_approval_detector: per-PR concurrency must isolate non-enforcing events and cancel only equivalent enforcement runs" >&2
   exit 1
 fi
+for enforcement_fragment in \
+  "github.event.action == 'synchronize'" \
+  "github.event.action == 'reopened'" \
+  "github.event.action == 'edited'" \
+  "github.event.action == 'unlabeled'" \
+  '["needs-external-review","needs-human-review","policy-violation","human-hold"]' \
+  "github.event.review.state == 'approved'"; do
+  if ! printf '%s\n' "$concurrency_group" | grep -qF "$enforcement_fragment" ||
+    ! printf '%s\n' "$concurrency_cancel" | grep -qF "$enforcement_fragment"; then
+    echo "check_self_approval_detector: group and cancellation predicates must both carry $enforcement_fragment" >&2
+    exit 1
+  fi
+done
 
 if printf '%s\n' "$auto_merge_job" | grep -qF "github.event.action == 'edited'"; then
   echo "check_self_approval_detector: edited events must invalidate approvals without arming auto-merge" >&2

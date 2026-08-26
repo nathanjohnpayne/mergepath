@@ -31,15 +31,29 @@ permissions:
   issues: write
 
 # #1094: approval and PR-body edit events mutate one shared eligibility state.
-# Keep one run per PR, but cancel only when the replacement event reruns the
-# same enforcement. A COMMENTED review and triage's own PAT-authored `labeled`
-# event intentionally skip that work, so either one cancelling its producer
-# would strand reviewer assignment or same-agent invalidation. The final shared
-# continuation still performs a live recheck immediately before its write.
+# Keep one enforcement run per PR, but cancel only when the replacement event
+# reruns the same enforcement. GitHub also evicts an older PENDING member of a
+# concurrency group even when cancel-in-progress is false, so events that skip
+# the guard use a run-unique group; a COMMENTED review or triage's own labeled
+# event can then neither cancel nor replace an approval/body invalidation.
 concurrency:
-  group: agent-review-${{ github.event.pull_request.number }}
+  group: >-
+    agent-review-${{ github.event.pull_request.number }}-${{
+      (((github.event_name == 'pull_request' &&
+         (github.event.action == 'synchronize' ||
+          github.event.action == 'reopened' ||
+          github.event.action == 'edited' ||
+          (github.event.action == 'unlabeled' &&
+           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))) ||
+        (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')) &&
+       'approval-enforcement') || github.run_id }}
   cancel-in-progress: >-
-    ${{ (github.event_name == 'pull_request' && github.event.action != 'labeled') ||
+    ${{ (github.event_name == 'pull_request' &&
+         (github.event.action == 'synchronize' ||
+          github.event.action == 'reopened' ||
+          github.event.action == 'edited' ||
+          (github.event.action == 'unlabeled' &&
+           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))) ||
         (github.event_name == 'pull_request_review' && github.event.review.state == 'approved') }}
 
 jobs:
@@ -868,13 +882,11 @@ jobs:
                 return { action: 'allow', reason: 'different-agent-phase-4-approval' };
               }
 
-              function latestApprovedReviews(input) {
+              function latestOpinionatedReviews(input) {
                 const reviewerAccounts = Array.isArray(input && input.reviewerAccounts)
                   ? input.reviewerAccounts.map(normalized).filter(Boolean)
                   : [];
                 const prAuthor = normalized(input && input.prAuthor);
-                const headSha = normalized(input && input.headSha);
-                const requireHead = Boolean(input && input.requireHead);
                 const reviews = Array.isArray(input && input.reviews) ? input.reviews : [];
                 const latestByReviewer = new Map();
 
@@ -906,11 +918,16 @@ jobs:
 
                 return reviewerAccounts
                   .map(reviewer => latestByReviewer.get(reviewer))
-                  .filter(review =>
-                    review &&
-                    normalized(review.state).toUpperCase() === 'APPROVED' &&
-                    (!requireHead || (headSha && normalized(review.commit_id) === headSha)),
-                  );
+                  .filter(Boolean);
+              }
+
+              function latestApprovedReviews(input) {
+                const headSha = normalized(input && input.headSha);
+                const requireHead = Boolean(input && input.requireHead);
+                return latestOpinionatedReviews(input).filter(review =>
+                  normalized(review.state).toUpperCase() === 'APPROVED' &&
+                  (!requireHead || (headSha && normalized(review.commit_id) === headSha)),
+                );
               }
               return {decide, latestApprovedReviews};
             }

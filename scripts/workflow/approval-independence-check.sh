@@ -91,6 +91,31 @@ fetch_reviews() {
   gh_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews"
 }
 
+validate_reviews_shape() {
+  local label="$1" value="$2"
+  if ! jq -e '
+    type == "array" and
+    all(.[];
+      type == "object" and
+      (.id | type == "number" and . > 0 and floor == .) and
+      (.user | type == "object") and
+      (.user.login | type == "string" and length > 0) and
+      (.state | type == "string") and
+      (.state as $state |
+        (["APPROVED","CHANGES_REQUESTED","COMMENTED","DISMISSED","PENDING"] | index($state)) != null) and
+      ((.commit_id == null) or (.commit_id | type == "string" and length > 0)) and
+      ((.submitted_at == null) or (.submitted_at | type == "string" and length > 0)) and
+      (.state as $state |
+       if (["APPROVED","CHANGES_REQUESTED","DISMISSED"] | index($state)) != null
+       then (.commit_id | type == "string" and length > 0) and
+            (.submitted_at | type == "string" and length > 0)
+       else true end)
+    )
+  ' >/dev/null 2>&1 <<<"$value"; then
+    infra_error "$label review history has an invalid or incomplete safety shape"
+  fi
+}
+
 fetch_pr() {
   local err rc body msg
   err=$(mktemp "${TMPDIR:-/tmp}/approval-independence-pr.XXXXXX") \
@@ -156,6 +181,7 @@ reviews_before=$(fetch_reviews)
 reviews_before_rc=$?
 set -e
 [ "$reviews_before_rc" -eq 0 ] || infra_error "failed to fetch the first complete review snapshot"
+validate_reviews_shape "first" "$reviews_before"
 
 pr_before=$(fetch_pr)
 validate_pr_shape "$pr_before"
@@ -190,6 +216,7 @@ reviews_after=$(fetch_reviews)
 reviews_after_rc=$?
 set -e
 [ "$reviews_after_rc" -eq 0 ] || infra_error "failed to fetch the second complete review snapshot"
+validate_reviews_shape "second" "$reviews_after"
 
 pr_after=$(fetch_pr)
 validate_pr_shape "$pr_after"
@@ -226,8 +253,11 @@ evaluation=$(printf '%s' "$payload" | node -e '
   }
   const before = detector.evaluateLatestApprovals({...payload.input, reviews: payload.before});
   const after = detector.evaluateLatestApprovals({...payload.input, reviews: payload.after});
+  const normalized = value => String(value || "").trim().toLowerCase();
   process.stdout.write(JSON.stringify({
-    stable: JSON.stringify(before.approvals) === JSON.stringify(after.approvals),
+    stable: JSON.stringify(before.opinionatedReviews) === JSON.stringify(after.opinionatedReviews),
+    sharedAuthor: normalized(payload.input.prAuthor) === normalized(payload.input.authorIdentity),
+    requiresExternalReview: payload.input.requiresExternalReview,
     before,
     after,
   }));
@@ -237,18 +267,21 @@ set -e
 [ "$evaluation_rc" -eq 0 ] || infra_error "canonical detector failed: $evaluation"
 if ! jq -e '
   type == "object" and (.stable | type == "boolean") and
+  (.sharedAuthor | type == "boolean") and
+  (.requiresExternalReview | type == "boolean") and
   (.after.eligibleApproval | type == "boolean") and
   (.after.independentApproval | type == "boolean") and
   (.after.blockingApprovals | type == "array") and
-  (.after.approvals | type == "array")
+  (.after.approvals | type == "array") and
+  (.after.opinionatedReviews | type == "array")
 ' >/dev/null 2>&1 <<<"$evaluation"; then
   infra_error "canonical detector returned an invalid result"
 fi
 
 printf '%s\n' "$evaluation"
 [ "$(jq -r '.stable' <<<"$evaluation")" = "true" ] \
-  || not_ready "latest opinionated approval state changed during evaluation"
+  || not_ready "latest opinionated review state changed during evaluation"
 [ "$(jq -r '.after.blockingApprovals | length' <<<"$evaluation")" -eq 0 ] \
-  || not_ready "a disallowed current-head approval remains in GitHub's native approval set"
+  || not_ready "a standing disallowed approval remains in GitHub's native approval set"
 [ "$(jq -r '.after.eligibleApproval' <<<"$evaluation")" = "true" ] \
   || not_ready "no independent latest-state registered approval exists on $EXPECTED_HEAD"
