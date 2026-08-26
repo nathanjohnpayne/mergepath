@@ -46,7 +46,7 @@ const implementation = between(detector, sourceBegin, sourceEnd, detectorPath);
 const factory = [
   'function bootstrapDetector() {',
   ...implementation.split(/\r?\n/).map(line => (line ? `  ${line}` : '')),
-  '  return {decide, latestApprovedReviews, reviewsWithDirectFallback, planApprovalEnforcement};',
+  '  return {decide, latestApprovedReviews, reviewsWithDirectFallback, prepareDirectApproval, planApprovalEnforcement};',
   '}',
 ].join('\n');
 const generated = [

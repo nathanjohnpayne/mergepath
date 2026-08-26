@@ -52,8 +52,10 @@ refute_grep "D2: agent-review dropped the '|| gh pr merge --squash' immediate fa
   "$W/agent-review.yml" '--auto "$PR_URL" || gh pr merge --squash "$PR_URL"'
 assert_grep "D2: agent-review delegates merge arming to the shared continuation" \
   "$W/agent-review.yml" 'scripts/workflow/approval-merge-continuation.sh'
-assert_grep "D2: shared continuation fails closed when auto-merge cannot be enabled" \
-  scripts/workflow/approval-merge-continuation.sh 'could not enable exact-head auto-merge'
+refute_grep "D2: shared continuation does not recreate a head-only durable arm" \
+  scripts/workflow/approval-merge-continuation.sh '--squash --auto'
+assert_grep "D2: shared continuation fails closed when durable-arm cleanup cannot be verified" \
+  scripts/workflow/approval-merge-continuation.sh 'could not retract and verify a post-independence auto-merge request'
 
 # Defect 3: label removal verifies end-state instead of retrying the non-idempotent write.
 assert_grep "D3: auto-clear verifies label end-state (still_present)" \

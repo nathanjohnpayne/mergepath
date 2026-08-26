@@ -253,17 +253,17 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 ### Auto-merge and Dependabot
 
-**R-106.** Non-Dependabot auto-merge is opt-in only: it may merge solely under an `AUTHOR_MERGE_TOKEN` secret verified to resolve to the author identity immediately before the merge. ● — REVIEW_POLICY.md § Agent prohibitions
+**R-106.** Non-Dependabot unattended merging is disabled pending #1058's merge-group boundary; Agent Review never arms, enqueues, or merges those PRs. ● — REVIEW_POLICY.md § Agent prohibitions
 
-**R-107.** Absent that secret, the workflow stops after validation and manual author merge remains the path. ● — REVIEW_POLICY.md § Agent prohibitions
+**R-107.** `AUTHOR_MERGE_TOKEN` may authenticate privileged readiness evaluation, but it does not authorize a non-Dependabot merge mutation; ordinary one-shot author merge remains the path. ● — REVIEW_POLICY.md § Agent prohibitions
 
 **R-108.** Reviewer tokens are never used for merges. ● — REVIEW_POLICY.md § Phase 4a
 
 **R-109.** Automatic merge is not a sanctioned reviewer-identity exception. ○ — REVIEW_POLICY.md § Agent prohibitions
 
-**R-110.** Every auto-merge arm and re-arm path requires an existing non-author latest-state approval; a push with no approval never arms. ● — REVIEW_POLICY.md § Phase 4a
+**R-110.** Every approval-readiness evaluation requires an existing non-author latest-state approval; a push with no approval never becomes ready, and no evaluation creates a durable arm. ● — REVIEW_POLICY.md § Phase 4a
 
-**R-111.** Every gate re-applies on the new HEAD, and downgraded runs re-derive protection just before merge and abort on head drift. ● — REVIEW_POLICY.md § Phase 4a
+**R-111.** Every readiness gate re-applies on the new HEAD and governing base, and every exit performs workflow-token arm cleanup; ambiguous cleanup fails closed. ● — REVIEW_POLICY.md § Phase 4a
 
 **R-112.** Rate-limit protection is never derived from label events; it uses the intrinsic threshold and protected-path computation on the live head. ● — REVIEW_POLICY.md § Phase 2.5
 

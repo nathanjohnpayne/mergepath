@@ -257,6 +257,25 @@ else
   fail "materialized default-base 404 fallback (rc=$RC out=$OUT calls=$(cat "$CALLS_LOG"))"
 fi
 
+# 13. A readable default-base policy is fetched at the exact supplied SHA in
+#     materialized mode. Triage uses this only when its trusted checkout does
+#     not byte-identify the stabilized live base; fetching the branch tip here
+#     would recreate the mixed B1-policy/B2-output snapshot from #1094.
+reset_env
+export STUB_CONTENTS_MODE=ok
+OUT=$(bash "$RESOLVE" --repo "$REPO" --base-ref main --base-sha basesha1 \
+      --default-branch main --default-config "$DEFAULT_CONFIG" \
+      --materialize-default 2>"$WORK/err.txt") && RC=0 || RC=$?
+if [ "$RC" -eq 0 ] && [ "$OUT" != "$DEFAULT_CONFIG" ] && [ -f "$OUT" ] \
+   && grep -q "external_review_threshold: 1" "$OUT" \
+   && grep -qF "repos/$REPO/contents/.github/review-policy.yml?ref=basesha1" "$CALLS_LOG" \
+   && ! grep -qF 'ref=main' "$CALLS_LOG"; then
+  pass "materialized readable default base is pinned to the supplied base SHA (#1094)"
+  rm -f "$OUT"
+else
+  fail "materialized readable default base was not SHA-pinned (rc=$RC out=$OUT calls=$(cat "$CALLS_LOG"))"
+fi
+
 echo
 echo "== resolve_base_policy (#769) tests: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

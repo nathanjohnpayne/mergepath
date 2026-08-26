@@ -315,9 +315,9 @@ fi
 # ---------------------------------------------------------------------------
 # 3c. Scalar spellings. The emitted `author_identity` is no longer just an
 #     input to a string comparison inside a script — since #788 it IS the
-#     identity the auto-merge job requires AUTHOR_MERGE_TOKEN to resolve to, so
-#     a value carrying its YAML quotes refuses every merge, and a nested key of
-#     the same name (matched first by an unanchored grep) authorizes the wrong
+#     identity the readiness job requires AUTHOR_MERGE_TOKEN to resolve to, so
+#     a value carrying its YAML quotes refuses every evaluation, and a nested
+#     key of the same name (matched first by an unanchored grep) authorizes the wrong
 #     one. Both spellings are legal YAML.
 # ---------------------------------------------------------------------------
 export STUB_CONTENTS_MODE=quirk
@@ -523,7 +523,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # 6. The CONSUMER of `author_identity` that gates a real merge: the auto-merge
-#    job's `Check author merge token` step, as the runner executes it.
+#    job's `Check author readiness token` step, as the runner executes it.
 #
 #    Exporting the identity from the governing policy is only half of #788. The
 #    step that decides whether AUTHOR_MERGE_TOKEN may call `gh pr merge` parsed
@@ -545,7 +545,7 @@ fi
 STEP2="$WORK/author-token-step.sh"
 
 awk '
-  /^      - name: Check author merge token$/ { instep = 1; next }
+  /^      - name: Check author readiness token$/ { instep = 1; next }
   instep && /^      - name: /                { instep = 0 }
   instep && /^        run: \|$/              { inrun = 1; next }
   inrun && /^          /                     { print substr($0, 11); next }
@@ -569,7 +569,7 @@ fi
 # declaration that feeds it yields an empty string, which 6b pins as
 # fail-closed.
 AUTH_STEP_ENV=$(awk '
-  /^      - name: Check author merge token$/ { instep = 1; next }
+  /^      - name: Check author readiness token$/ { instep = 1; next }
   instep && /^      - name: /                { instep = 0 }
   instep                                     { print }
 ' "$WORKFLOW")

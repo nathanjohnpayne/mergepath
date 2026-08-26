@@ -137,7 +137,7 @@ assert_grep "agent-review: skips matrix-strategy annex jobs during derivation in
 assert_grep "agent-review: workflow-wide annex scan matches by the stable .workflowPath, not the collision-prone display name (#655 round 13)" \
   "$W/agent-review.yml" '[.statusCheckRollup[] | select((.workflowPath // "") == "repo_lint_local.yml")]'
 assert_grep "agent-review: a bad conclusion reported anywhere in the annex's workflow refuses auto-merge immediately (#655 round 6)" \
-  "$W/agent-review.yml" 'non-passing reported check-run(s) after winner-selection on current HEAD $sha (conclusion=$annex_bad_summary); refusing auto-merge (#655)'
+  "$W/agent-review.yml" 'non-passing reported check-run(s) after winner-selection on current HEAD $sha (conclusion=$annex_bad_summary); readiness denied (#655)'
 assert_grep "agent-review: a still-in-progress annex entry is treated as not-ready, not as a failure (#655 round 6)" \
   "$W/agent-review.yml" 'check-run(s) still in progress on current HEAD $sha; not ready (#655)'
 assert_grep "agent-review: workflow query requests resourcePath alongside name to derive the stable workflowPath (#655 round 13)" \

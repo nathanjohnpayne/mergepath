@@ -137,6 +137,7 @@ function latestOpinionatedReviews(input) {
     ? input.reviewerAccounts.map(normalized).filter(Boolean)
     : [];
   const prAuthor = normalized(input && input.prAuthor);
+  const includePrAuthor = Boolean(input && input.includePrAuthor);
   const reviews = Array.isArray(input && input.reviews) ? input.reviews : [];
   const latestByReviewer = new Map();
 
@@ -145,7 +146,7 @@ function latestOpinionatedReviews(input) {
     const state = normalized(review && review.state).toUpperCase();
     if (
       !reviewer ||
-      reviewer === prAuthor ||
+      (!includePrAuthor && reviewer === prAuthor) ||
       !reviewerAccounts.includes(reviewer) ||
       !['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(state)
     ) {
@@ -196,12 +197,38 @@ function reviewsWithDirectFallback(reviews, directReview) {
   return combined;
 }
 
+// Bind the webhook-only fallback to live PR state without letting event
+// freshness decide whether the fallback is retained. A delayed durable
+// APPROVED event must still carry its exact review object when listReviews
+// lags; staleness suppresses only direct-event attribution (red run and
+// persistent label), not classification or dismissal.
+function prepareDirectApproval(input) {
+  const directReview = input && input.directReview;
+  const liveHeadSha = normalized(input && input.liveHeadSha);
+  const directCommit = normalized(directReview && directReview.commit_id);
+  const directAttributionCurrent = !directReview || (
+    input && input.eventEnforcementCurrent === true &&
+    liveHeadSha &&
+    directCommit === liveHeadSha
+  );
+
+  return {
+    reviews: reviewsWithDirectFallback(input && input.liveReviews, directReview),
+    directAttributionCurrent,
+  };
+}
+
 // Plan the complete standing-approval enforcement for one workflow event.
 // Event identity controls only attribution (red run / persistent label); it
 // never narrows the standing set that must be classified and dismissed.
 function planApprovalEnforcement(input) {
   const directReviewId = Number((input && input.directReviewId) || 0);
-  const approvals = latestApprovedReviews(input);
+  const directAttributionCurrent = !input || input.directAttributionCurrent !== false;
+  // Enforcement must retain a registered reviewer whose native account is
+  // also the PR author so decide() can apply the explicit native-account
+  // defense. Ordinary approval-readiness callers keep excluding PR-author
+  // reviews through latestApprovedReviews()'s default.
+  const approvals = latestApprovedReviews({...input, includePrAuthor: true});
   let eligibleApproval = false;
   let persistentDirectViolation = false;
   const directBlockedDiagnostics = [];
@@ -214,7 +241,8 @@ function planApprovalEnforcement(input) {
       ? `${decision.reason}: ${decision.detail}`
       : decision.reason;
     const reviewId = Number((review && review.id) || 0);
-    const isDirectReview = directReviewId > 0 && reviewId === directReviewId;
+    const isDirectReview =
+      directAttributionCurrent && directReviewId > 0 && reviewId === directReviewId;
 
     if (decision.action === 'allow') {
       eligibleApproval = true;
@@ -245,7 +273,7 @@ function planApprovalEnforcement(input) {
 function evaluateLatestApprovals(input) {
   const headSha = normalized(input && input.headSha);
   const requireHead = Boolean(input && input.requireHead);
-  const opinions = latestOpinionatedReviews(input);
+  const opinions = latestOpinionatedReviews({...input, includePrAuthor: true});
   const standingApprovals = opinions.filter(
     review => normalized(review && review.state).toUpperCase() === 'APPROVED',
   );
@@ -293,6 +321,7 @@ module.exports = {
   decide,
   latestApprovedReviews,
   reviewsWithDirectFallback,
+  prepareDirectApproval,
   planApprovalEnforcement,
   evaluateLatestApprovals,
 };

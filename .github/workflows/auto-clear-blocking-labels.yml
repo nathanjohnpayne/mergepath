@@ -419,18 +419,19 @@ jobs:
       - name: Continue approved PRs after completed checks
         if: github.event_name == 'workflow_run' && steps.pr.outputs.numbers != ''
         env:
-          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          WORKFLOW_TOKEN: ${{ github.token }}
           PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
           CLEARED_PRS: ${{ steps.clear.outputs.cleared_prs }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; approval continuation is disabled."
-            exit 0
-          fi
           if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then
             echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout event."
+            exit 0
+          fi
+          if ! grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' scripts/workflow/approval-merge-continuation.sh; then
+            echo "::notice::Approval continuation predates governing-policy protective retraction; skipping this first-rollout event."
             exit 0
           fi
           continuation_infra_error=0
@@ -444,8 +445,20 @@ jobs:
                 ;;
             esac
             set +e
-            bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
-            rc=$?
+            GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+              --retract-unsafe-only "$PR" "$REPO"
+            protective_rc=$?
+            if [ "$protective_rc" -eq 0 ] && [ -z "${AUTHOR_TOKEN:-}" ]; then
+              echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but author-token continuation remains disabled."
+              rc=0
+            elif [ "$protective_rc" -eq 0 ]; then
+              GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
+                MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
+                bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
+              rc=$?
+            else
+              rc=$protective_rc
+            fi
             set -e
             case "$rc" in
               0) ;;
@@ -792,17 +805,18 @@ jobs:
       - name: Continue approved PRs after custom-workflow completions
         if: steps.find.outputs.enabled != 'false' && steps.approved.outputs.prs != ''
         env:
-          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          WORKFLOW_TOKEN: ${{ github.token }}
           PRS: ${{ steps.approved.outputs.prs }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; scheduled approval continuation is disabled."
-            exit 0
-          fi
           if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then
             echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout sweep."
+            exit 0
+          fi
+          if ! grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' scripts/workflow/approval-merge-continuation.sh; then
+            echo "::notice::Approval continuation predates governing-policy protective retraction; skipping this first-rollout sweep."
             exit 0
           fi
           continuation_infra_error=0
@@ -810,8 +824,20 @@ jobs:
           while IFS= read -r PR; do
             [ -n "$PR" ] || continue
             set +e
-            bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
-            rc=$?
+            GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+              --retract-unsafe-only "$PR" "$REPO"
+            protective_rc=$?
+            if [ "$protective_rc" -eq 0 ] && [ -z "${AUTHOR_TOKEN:-}" ]; then
+              echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but scheduled author-token continuation remains disabled."
+              rc=0
+            elif [ "$protective_rc" -eq 0 ]; then
+              GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
+                MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
+                bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
+              rc=$?
+            else
+              rc=$protective_rc
+            fi
             set -e
             case "$rc" in
               0) ;;

@@ -47,17 +47,31 @@ for required_fragment in \
   'phase_4_required' \
   'const phase4Required = needsExternal && !laneVerifiedHead;' \
   "core.setOutput('phase_4_required', phase4Required.toString());" \
+  "core.setOutput('classified_head', pr.head.sha);" \
+  'JSON.stringify(governingIdentities.reviewers)' \
   'needs: [load-config, triage]' \
-  'AUTHOR_IDENTITY' \
+  'AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}' \
+  'REVIEWERS_JSON: ${{ needs.triage.outputs.reviewers }}' \
+  'EVENT_REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}' \
   'decision.detail' \
   'decision.persistentViolation' \
   'latestApprovedReviews' \
   'reviewsWithDirectFallback' \
+  'prepareDirectApproval' \
   'planApprovalEnforcement' \
+  'github.rest.pulls.getReview' \
+  "String(currentReview.state || '').toUpperCase() !== 'DISMISSED'" \
+  'BEGIN DISMISS REVIEW FAIL-CLOSED' \
+  'BEGIN DURABLE APPROVAL PROTECTION' \
+  'BEGIN STABLE REVIEW SNAPSHOT' \
+  'protectCurrentDirectReview' \
+  'readStableReviewSnapshot' \
   'selectDetector' \
+  'detectorSupportsDurableFallback' \
+  'SELF_APPROVAL_DETECTOR_DURABLE_FALLBACK_V2' \
   "core.setOutput('eligible_approval'" \
   'BEGIN SELF-APPROVAL BOOTSTRAP' \
-  'trusted workflow already requires the detector' \
+  'trusted workflow already requires the durable approval' \
   "context.payload.action === 'unlabeled'" \
   'const mayMutateLabels' \
   'Checkout trusted self-approval detector'; do
@@ -66,6 +80,61 @@ for required_fragment in \
     exit 1
   fi
 done
+
+policy_resolve_line=$(grep -nF '              const policyResolverArgs = [' "$WORKFLOW" | head -1 | cut -d: -f1)
+identity_load_line=$(grep -nF '                governingIdentities = loadGoverningIdentities(' "$WORKFLOW" | head -1 | cut -d: -f1)
+if [ -z "$policy_resolve_line" ] || [ -z "$identity_load_line" ] ||
+  [ "$policy_resolve_line" -ge "$identity_load_line" ]; then
+  echo "check_self_approval_detector: triage must materialize its exact base policy before loading identities from it" >&2
+  exit 1
+fi
+
+triage_job=$(sed -n '/^  triage:/,/^  assign:/p' "$WORKFLOW")
+if ! printf '%s\n' "$triage_job" | grep -qF "policyResolverArgs.push('--materialize-default');" ||
+  ! printf '%s\n' "$triage_job" | grep -qF 'checkoutSha !== baseSha' ||
+  ! printf '%s\n' "$triage_job" | grep -qF "function loadGoverningIdentities(pr, policyConfigPath)" ||
+  ! printf '%s\n' "$triage_job" | grep -qF "'--default-config', policyConfigPath"; then
+  echo "check_self_approval_detector: triage must feed one exact materialized policy to both applicability and identity decisions" >&2
+  exit 1
+fi
+
+# A delayed APPROVED webhook may outlive the head/base snapshot that emitted
+# it. Staleness may suppress persistent direct attribution, but it must never
+# return before the workflow feeds the exact webhook review through the
+# missing-ID fallback. The executable detector test pairs this workflow-seam
+# assertion with an empty listReviews response.
+stale_fallback_block=$(awk '
+  /const eventPolicyCurrent =/ {in_block=1}
+  in_block && /let reviewerAccounts;/ {exit}
+  in_block {print}
+' "$WORKFLOW")
+if [ -z "$stale_fallback_block" ] ||
+  printf '%s\n' "$stale_fallback_block" | grep -qF 'return;' ||
+  ! grep -qF 'const preparedApproval = prepareDirectApproval({' "$WORKFLOW"; then
+  echo "check_self_approval_detector: stale durable approval events must reach the exact-review fallback" >&2
+  exit 1
+fi
+
+pre_fallback_block=$(awk '
+  /core.setOutput\(.*eligible_approval.*false/ {in_block=1}
+  in_block && /const preparedApproval = prepareDirectApproval/ {exit}
+  in_block {print}
+' "$WORKFLOW")
+pre_fallback_returns=$(printf '%s\n' "$pre_fallback_block" | grep -cF 'return;' || true)
+pre_fallback_protections=$(printf '%s\n' "$pre_fallback_block" | grep -cF 'await failClosedBeforeClassification(' || true)
+if [ "$pre_fallback_returns" -eq 0 ] ||
+  [ "$pre_fallback_returns" -ne "$pre_fallback_protections" ]; then
+  echo "check_self_approval_detector: every pre-fallback stop must conservatively protect the durable direct approval" >&2
+  exit 1
+fi
+
+stable_pr_line=$(grep -nF '            pr = stableReviewSnapshot.pr;' "$WORKFLOW" | head -1 | cut -d: -f1)
+live_author_line=$(grep -nF '            const prAuthor = pr.user.login;' "$WORKFLOW" | head -1 | cut -d: -f1)
+if [ -z "$stable_pr_line" ] || [ -z "$live_author_line" ] ||
+  [ "$live_author_line" -le "$stable_pr_line" ]; then
+  echo "check_self_approval_detector: PR author classification must use the stabilized live snapshot" >&2
+  exit 1
+fi
 
 phase_line=$(grep -nF 'const phase4Required = needsExternal && !laneVerifiedHead;' "$WORKFLOW" | head -1 | cut -d: -f1)
 carry_line=$(grep -nF "'scripts/workflow/external_review_carryforward.sh'," "$WORKFLOW" | head -1 | cut -d: -f1)
@@ -87,7 +156,7 @@ for success_requirement in \
 done
 
 if grep -qF 'approvals = [context.payload.review]' "$WORKFLOW" ||
-  ! grep -qF 'const liveReviews = await github.paginate(' "$WORKFLOW"; then
+  ! grep -qF 'listReviews: currentPr => github.paginate(' "$WORKFLOW"; then
   echo "check_self_approval_detector: direct approval events must paginate and enforce the complete standing approval set" >&2
   exit 1
 fi
@@ -105,10 +174,10 @@ for rearm_action in synchronize reopened edited unlabeled; do
 done
 
 shared_author_retraction=$(awk '
-  /- name: Retract shared-author auto-merge/ {in_step=1}
+  /- name: Retract durable auto-merge/ {in_step=1}
   in_step && /^  # ─/ {exit}
   in_step && /^  [A-Za-z0-9_-]+:/ {exit}
-  in_step && /- name:/ && $0 !~ /- name: Retract shared-author auto-merge/ {exit}
+  in_step && /- name:/ && $0 !~ /- name: Retract durable auto-merge/ {exit}
   in_step {print}
 ' "$WORKFLOW")
 for required_fragment in \
@@ -116,9 +185,12 @@ for required_fragment in \
   'if: ${{ always() }}' \
   'SHARED_AUTHOR_DISARM_REQUIRED_V1' \
   'GH_TOKEN: ${{ github.token }}' \
-  'AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}' \
-  '--json author,autoMergeRequest,url' \
+  'AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}' \
+  '--json author,autoMergeRequest,url,headRefOid,baseRefName,baseRefOid' \
+  'EVENT_HEAD: ${{ github.event.pull_request.head.sha }}' \
+  'EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}' \
   '--disable-auto' \
+  '--match-head-commit "$live_head"' \
   'auto_arm_allowed=false' \
   'auto_arm_allowed=true' \
   'retracting the existing unclassified auto-merge request fail closed' \
@@ -155,23 +227,24 @@ if ! grep -Eq 'types: \[[^]]*edited' "$WORKFLOW"; then
   exit 1
 fi
 
-# Approval and metadata-edit events for the same PR mutate one shared approval
-# state machine. An older run is cancelled only when its replacement executes
-# equivalent enforcement. GitHub replaces an older pending member of a shared
-# group regardless of cancel-in-progress, so COMMENTED/CHANGES_REQUESTED
-# reviews, opened/ready, `labeled`, and unrelated `unlabeled` events also need a
-# run-unique fallback group instead of merely setting cancellation false.
+# Mutable PR events share latest-state enforcement, but every APPROVED webhook
+# needs a review-ID group and must not be cancelled: the reviews API can lag,
+# and its successor has no fallback payload for the omitted predecessor.
+# Events that skip the guard remain run-unique because GitHub evicts an older
+# pending member of a shared group even when cancellation is false.
 concurrency_block=$(sed -n '/^concurrency:/,/^[^ ]/p' "$WORKFLOW")
 concurrency_group=$(sed -n '/^  group:/,/^  cancel-in-progress:/p' <<<"$concurrency_block")
 concurrency_cancel=$(sed -n '/^  cancel-in-progress:/,$p' <<<"$concurrency_block")
 if ! printf '%s\n' "$concurrency_group" | grep -qF 'agent-review-${{ github.event.pull_request.number }}-${{' ||
   ! printf '%s\n' "$concurrency_group" | grep -qF "'approval-enforcement'" ||
+  ! printf '%s\n' "$concurrency_group" | grep -qF "format('approval-{0}', github.event.review.id)" ||
   ! printf '%s\n' "$concurrency_group" | grep -qF 'github.run_id' ||
   printf '%s\n' "$concurrency_block" | grep -qF "github.event.action != 'labeled'" ||
   printf '%s\n' "$concurrency_block" | grep -qF "github.event.action == 'opened'" ||
   printf '%s\n' "$concurrency_block" | grep -qF "github.event.action == 'ready_for_review'" ||
-  printf '%s\n' "$concurrency_block" | grep -qF '  cancel-in-progress: true'; then
-  echo "check_self_approval_detector: per-PR concurrency must isolate non-enforcing events and cancel only equivalent enforcement runs" >&2
+  printf '%s\n' "$concurrency_block" | grep -qF '  cancel-in-progress: true' ||
+  printf '%s\n' "$concurrency_cancel" | grep -qF "github.event_name == 'pull_request_review'"; then
+  echo "check_self_approval_detector: per-PR concurrency must keep every approved webhook durable and isolate non-enforcing events" >&2
   exit 1
 fi
 for enforcement_fragment in \
@@ -179,14 +252,17 @@ for enforcement_fragment in \
   "github.event.action == 'reopened'" \
   "github.event.action == 'edited'" \
   "github.event.action == 'unlabeled'" \
-  '["needs-external-review","needs-human-review","policy-violation","human-hold"]' \
-  "github.event.review.state == 'approved'"; do
+  '["needs-external-review","needs-human-review","policy-violation","human-hold"]'; do
   if ! printf '%s\n' "$concurrency_group" | grep -qF "$enforcement_fragment" ||
     ! printf '%s\n' "$concurrency_cancel" | grep -qF "$enforcement_fragment"; then
     echo "check_self_approval_detector: group and cancellation predicates must both carry $enforcement_fragment" >&2
     exit 1
   fi
 done
+if ! printf '%s\n' "$concurrency_group" | grep -qF "github.event.review.state == 'approved'"; then
+  echo "check_self_approval_detector: approved events must use their durable review-ID concurrency group" >&2
+  exit 1
+fi
 
 if printf '%s\n' "$auto_merge_job" | grep -qF "github.event.action == 'edited'"; then
   echo "check_self_approval_detector: edited events must invalidate approvals without arming auto-merge" >&2

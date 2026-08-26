@@ -12,7 +12,11 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 BOOTSTRAP_MODULE="$(mktemp "${TMPDIR:-/tmp}/self-approval-bootstrap.XXXXXX.cjs")"
-trap 'rm -f "$BOOTSTRAP_MODULE"' EXIT
+DISMISS_MODULE="$(mktemp "${TMPDIR:-/tmp}/dismiss-review-fail-closed.XXXXXX.cjs")"
+PROTECTION_MODULE="$(mktemp "${TMPDIR:-/tmp}/durable-approval-protection.XXXXXX.cjs")"
+SNAPSHOT_MODULE="$(mktemp "${TMPDIR:-/tmp}/stable-review-snapshot.XXXXXX.cjs")"
+TRIAGE_POLICY_MODULE="$(mktemp "${TMPDIR:-/tmp}/triage-policy-materialization.XXXXXX.cjs")"
+trap 'rm -f "$BOOTSTRAP_MODULE" "$DISMISS_MODULE" "$PROTECTION_MODULE" "$SNAPSHOT_MODULE" "$TRIAGE_POLICY_MODULE"' EXIT
 awk '
   /BEGIN SELF-APPROVAL BOOTSTRAP/ { capture=1; next }
   /END SELF-APPROVAL BOOTSTRAP/   { capture=0 }
@@ -27,11 +31,97 @@ if [ ! -s "$BOOTSTRAP_MODULE" ]; then
   echo "FAIL: could not extract the first-rollout bootstrap detector from $WORKFLOW" >&2
   exit 1
 fi
-printf '\nmodule.exports = { bootstrapDetector, selectDetector };\n' >> "$BOOTSTRAP_MODULE"
+printf '\nmodule.exports = { bootstrapDetector, detectorSupportsDurableFallback, selectDetector };\n' >> "$BOOTSTRAP_MODULE"
+
+awk '
+  /BEGIN DISMISS REVIEW FAIL-CLOSED/ { capture=1; next }
+  /END DISMISS REVIEW FAIL-CLOSED/   { capture=0 }
+  capture {
+    sub(/^            /, "")
+    print
+  }
+' "$WORKFLOW" > "$DISMISS_MODULE"
+if [ ! -s "$DISMISS_MODULE" ]; then
+  echo "FAIL: could not extract the workflow dismissal helper from $WORKFLOW" >&2
+  exit 1
+fi
+printf '\nmodule.exports = { dismissReviewFailClosed };\n' >> "$DISMISS_MODULE"
+
+awk '
+  /BEGIN DURABLE APPROVAL PROTECTION/ { capture=1; next }
+  /END DURABLE APPROVAL PROTECTION/   { capture=0 }
+  capture {
+    sub(/^            /, "")
+    print
+  }
+' "$WORKFLOW" > "$PROTECTION_MODULE"
+if [ ! -s "$PROTECTION_MODULE" ]; then
+  echo "FAIL: could not extract the durable approval protection helper from $WORKFLOW" >&2
+  exit 1
+fi
+printf '\nmodule.exports = { registeredReviewerUnion, protectDurableApproval };\n' >> "$PROTECTION_MODULE"
+
+awk '
+  /BEGIN STABLE REVIEW SNAPSHOT/ { capture=1; next }
+  /END STABLE REVIEW SNAPSHOT/   { capture=0 }
+  capture {
+    sub(/^            /, "")
+    print
+  }
+' "$WORKFLOW" > "$SNAPSHOT_MODULE"
+if [ ! -s "$SNAPSHOT_MODULE" ]; then
+  echo "FAIL: could not extract the stable review snapshot helper from $WORKFLOW" >&2
+  exit 1
+fi
+printf '\nmodule.exports = { readStableReviewSnapshot };\n' >> "$SNAPSHOT_MODULE"
+
+awk '
+  /BEGIN TRIAGE POLICY MATERIALIZATION DECISION/ { capture=1; next }
+  /END TRIAGE POLICY MATERIALIZATION DECISION/   { capture=0 }
+  capture {
+    sub(/^            /, "")
+    print
+  }
+' "$WORKFLOW" > "$TRIAGE_POLICY_MODULE"
+if [ ! -s "$TRIAGE_POLICY_MODULE" ]; then
+  echo "FAIL: could not extract the triage policy materialization decision from $WORKFLOW" >&2
+  exit 1
+fi
+printf '\nmodule.exports = { shouldMaterializeDefaultPolicy };\n' >> "$TRIAGE_POLICY_MODULE"
+
+TRIAGE_POLICY_PATH="$TRIAGE_POLICY_MODULE" node <<'NODE'
+const {shouldMaterializeDefaultPolicy} = require(process.env.TRIAGE_POLICY_PATH);
+const base = {
+  baseRef: 'main',
+  baseSha: 'base-current',
+  defaultBranch: 'main',
+};
+const cases = [
+  ['equal trusted checkout', {...base, checkoutSha: 'base-current'}, false],
+  ['checkout behind live base', {...base, checkoutSha: 'base-older'}, true],
+  ['checkout ahead of live base', {...base, checkoutSha: 'base-newer'}, true],
+  ['unprovable checkout', {...base, checkoutSha: ''}, true],
+  ['non-default exact-base fetch', {
+    ...base,
+    baseRef: 'release/1.x',
+    checkoutSha: 'main-any',
+  }, false],
+];
+for (const [name, input, expected] of cases) {
+  const actual = shouldMaterializeDefaultPolicy(input);
+  if (actual !== expected) {
+    throw new Error(`${name}: expected ${expected}, got ${actual}`);
+  }
+}
+NODE
 
 DETECTOR_PATH="$DETECTOR" BOOTSTRAP_PATH="$BOOTSTRAP_MODULE" node <<'NODE'
 const canonical = require(process.env.DETECTOR_PATH);
-const { bootstrapDetector, selectDetector } = require(process.env.BOOTSTRAP_PATH);
+const {
+  bootstrapDetector,
+  detectorSupportsDurableFallback,
+  selectDetector,
+} = require(process.env.BOOTSTRAP_PATH);
 const implementations = [
   ['canonical', canonical],
   ['bootstrap', bootstrapDetector()],
@@ -187,14 +277,20 @@ for (const [implementationName, { decide, latestApprovedReviews }] of implementa
   }
 }
 
-// #1094 cancellation ordering: every direct approval event must enforce the
-// complete standing set. A later independent approval can replace/cancel the
-// earlier same-agent run, but it must still dismiss the carried blocker while
-// remaining green and eligible itself.
+// #1094 cancellation ordering: every direct approval event has a durable,
+// review-ID-specific run and must enforce the complete standing set. A later
+// independent approval cannot cancel the earlier same-agent run; each run uses
+// only its own webhook as a missing-ID fallback while classifying all live
+// standing approvals.
 for (const [implementationName, implementation] of implementations) {
-  const {reviewsWithDirectFallback, planApprovalEnforcement} = implementation;
+  const {
+    reviewsWithDirectFallback,
+    prepareDirectApproval,
+    planApprovalEnforcement,
+  } = implementation;
   if (
     typeof reviewsWithDirectFallback !== 'function' ||
+    typeof prepareDirectApproval !== 'function' ||
     typeof planApprovalEnforcement !== 'function'
   ) {
     throw new Error(`${implementationName}: direct-event enforcement helpers are unavailable`);
@@ -204,12 +300,14 @@ for (const [implementationName, implementation] of implementations) {
     id: 101,
     user: {login: 'nathanpayne-codex'},
     state: 'APPROVED',
+    commit_id: 'old-head',
     submitted_at: '2026-01-08T00:00:00Z',
   };
   const independent = {
     id: 102,
     user: {login: 'nathanpayne-cursor'},
     state: 'APPROVED',
+    commit_id: 'old-head',
     submitted_at: '2026-01-08T00:00:01Z',
   };
   const approvalInput = {
@@ -247,6 +345,27 @@ for (const [implementationName, implementation] of implementations) {
     throw new Error(`${implementationName}: direct same-agent violation lost red-run/persistent attribution: ${JSON.stringify(violatingRun)}`);
   }
 
+  const nativeAccountApproval = {
+    id: 103,
+    user: {login: 'nathanpayne-codex'},
+    state: 'APPROVED',
+    submitted_at: '2026-01-08T00:00:02Z',
+  };
+  const nativeAccountRun = planApprovalEnforcement({
+    ...approvalInput,
+    prAuthor: 'nathanpayne-codex',
+    reviews: [nativeAccountApproval],
+    directReviewId: nativeAccountApproval.id,
+  });
+  if (
+    nativeAccountRun.eligibleApproval ||
+    !nativeAccountRun.persistentDirectViolation ||
+    nativeAccountRun.directBlockedDiagnostics.length !== 1 ||
+    nativeAccountRun.approvals[0]?.decision.reason !== 'same-native-account-approval'
+  ) {
+    throw new Error(`${implementationName}: native-account direct approval bypassed enforcement: ${JSON.stringify(nativeAccountRun)}`);
+  }
+
   const dismissedLive = {...independent, state: 'DISMISSED'};
   const liveWins = reviewsWithDirectFallback([dismissedLive], independent);
   const dismissedPlan = planApprovalEnforcement({
@@ -266,6 +385,60 @@ for (const [implementationName, implementation] of implementations) {
   const laggingApi = reviewsWithDirectFallback([sameAgent], independent);
   if (laggingApi.length !== 2 || !laggingApi.some(review => review.id === independent.id)) {
     throw new Error(`${implementationName}: eventual-consistency fallback lost the direct approval`);
+  }
+
+  const emptyLaggingApi = reviewsWithDirectFallback([], independent);
+  const emptyLaggingPlan = planApprovalEnforcement({
+    ...approvalInput,
+    reviews: emptyLaggingApi,
+    directReviewId: independent.id,
+  });
+  if (
+    emptyLaggingApi.length !== 1 ||
+    emptyLaggingApi[0]?.id !== independent.id ||
+    !emptyLaggingPlan.eligibleApproval ||
+    emptyLaggingPlan.persistentDirectViolation
+  ) {
+    throw new Error(`${implementationName}: an empty lagging reviews API lost the durable webhook's own approval: ${JSON.stringify({emptyLaggingApi, emptyLaggingPlan})}`);
+  }
+
+  const emptyBlockingApi = reviewsWithDirectFallback([], sameAgent);
+  const emptyBlockingPlan = planApprovalEnforcement({
+    ...approvalInput,
+    reviews: emptyBlockingApi,
+    directReviewId: sameAgent.id,
+  });
+  if (
+    emptyBlockingApi.length !== 1 ||
+    emptyBlockingPlan.eligibleApproval ||
+    !emptyBlockingPlan.persistentDirectViolation ||
+    emptyBlockingPlan.directBlockedDiagnostics.length !== 1
+  ) {
+    throw new Error(`${implementationName}: an empty lagging reviews API lost the durable webhook's blocking attribution: ${JSON.stringify({emptyBlockingApi, emptyBlockingPlan})}`);
+  }
+
+  const stalePrepared = prepareDirectApproval({
+    liveReviews: [],
+    directReview: sameAgent,
+    eventEnforcementCurrent: false,
+    liveHeadSha: 'new-head',
+  });
+  const transitionedPlan = planApprovalEnforcement({
+    ...approvalInput,
+    reviews: stalePrepared.reviews,
+    directReviewId: sameAgent.id,
+    directAttributionCurrent: stalePrepared.directAttributionCurrent,
+  });
+  if (
+    stalePrepared.reviews.length !== 1 ||
+    stalePrepared.reviews[0]?.id !== sameAgent.id ||
+    stalePrepared.directAttributionCurrent ||
+    transitionedPlan.eligibleApproval ||
+    transitionedPlan.persistentDirectViolation ||
+    transitionedPlan.directBlockedDiagnostics.length !== 0 ||
+    transitionedPlan.blockedDiagnostics.length !== 1
+  ) {
+    throw new Error(`${implementationName}: a stale direct webhook retained persistent attribution after live PR transition: ${JSON.stringify(transitionedPlan)}`);
   }
 }
 
@@ -308,13 +481,20 @@ if (staleHead.eligibleApproval || staleHead.approvals.length !== 0) {
   throw new Error(`stale-head approval survived the final exact-head filter: ${JSON.stringify(staleHead)}`);
 }
 
-const canonicalSentinel = {name: 'canonical'};
+const canonicalSentinel = {
+  name: 'canonical',
+  decide() {},
+  latestApprovedReviews() {},
+  reviewsWithDirectFallback() {},
+  prepareDirectApproval() {},
+  planApprovalEnforcement() {},
+};
 const bootstrapSentinel = {name: 'bootstrap'};
 let canonicalLoads = 0;
 let bootstrapLoads = 0;
 const modulePresent = selectDetector({
   modulePresent: true,
-  trustedWorkflow: 'SELF_APPROVAL_DETECTOR_REQUIRED_V1',
+  trustedWorkflow: 'SELF_APPROVAL_DETECTOR_DURABLE_FALLBACK_V2',
   loadCanonical: () => {
     canonicalLoads += 1;
     return canonicalSentinel;
@@ -328,6 +508,31 @@ if (modulePresent !== canonicalSentinel || canonicalLoads !== 1 || bootstrapLoad
   throw new Error('module-present resolver did not select only the canonical detector');
 }
 
+const oldCanonical = {
+  decide() {},
+  latestApprovedReviews() {},
+  reviewsWithDirectFallback() {},
+  planApprovalEnforcement() {},
+};
+if (detectorSupportsDurableFallback(oldCanonical)) {
+  throw new Error('a pre-durable-fallback canonical detector was accepted');
+}
+const capabilitySkew = selectDetector({
+  modulePresent: true,
+  trustedWorkflow: 'name: Agent Review Pipeline\n# legacy workflow',
+  loadCanonical: () => {
+    canonicalLoads += 1;
+    return oldCanonical;
+  },
+  loadBootstrap: () => {
+    bootstrapLoads += 1;
+    return bootstrapSentinel;
+  },
+});
+if (capabilitySkew !== bootstrapSentinel || canonicalLoads !== 2 || bootstrapLoads !== 1) {
+  throw new Error('present-but-pre-capability detector did not use the bounded bootstrap');
+}
+
 const legacyTrustedWorkflow = selectDetector({
   modulePresent: false,
   trustedWorkflow: 'name: Agent Review Pipeline\n# legacy workflow',
@@ -337,7 +542,7 @@ const legacyTrustedWorkflow = selectDetector({
     return bootstrapSentinel;
   },
 });
-if (legacyTrustedWorkflow !== bootstrapSentinel || bootstrapLoads !== 1) {
+if (legacyTrustedWorkflow !== bootstrapSentinel || bootstrapLoads !== 2) {
   throw new Error('legacy trusted workflow did not select the bounded bootstrap');
 }
 
@@ -345,16 +550,201 @@ let markerMissingModuleFailed = false;
 try {
   selectDetector({
     modulePresent: false,
-    trustedWorkflow: 'SELF_APPROVAL_DETECTOR_REQUIRED_V1',
+    trustedWorkflow: 'SELF_APPROVAL_DETECTOR_DURABLE_FALLBACK_V2',
     loadCanonical: () => canonicalSentinel,
     loadBootstrap: () => bootstrapSentinel,
   });
 } catch (error) {
-  markerMissingModuleFailed = /already requires the detector/.test(String(error));
+  markerMissingModuleFailed = /requires the durable approval detector capability/.test(String(error));
 }
 if (!markerMissingModuleFailed) {
   throw new Error('marker-bearing trusted workflow with a missing module did not fail closed');
 }
+
+let markerIncompatibleModuleFailed = false;
+try {
+  selectDetector({
+    modulePresent: true,
+    trustedWorkflow: 'SELF_APPROVAL_DETECTOR_DURABLE_FALLBACK_V2',
+    loadCanonical: () => oldCanonical,
+    loadBootstrap: () => bootstrapSentinel,
+  });
+} catch (error) {
+  markerIncompatibleModuleFailed = /missing or incompatible/.test(String(error));
+}
+if (!markerIncompatibleModuleFailed) {
+  throw new Error('marker-bearing trusted workflow accepted an incompatible module');
+}
+NODE
+
+DISMISS_PATH="$DISMISS_MODULE" \
+  PROTECTION_PATH="$PROTECTION_MODULE" \
+  SNAPSHOT_PATH="$SNAPSHOT_MODULE" \
+  DETECTOR_PATH="$DETECTOR" \
+  node <<'NODE'
+const {dismissReviewFailClosed} = require(process.env.DISMISS_PATH);
+const {protectDurableApproval} = require(process.env.PROTECTION_PATH);
+const {readStableReviewSnapshot} = require(process.env.SNAPSHOT_PATH);
+const {prepareDirectApproval} = require(process.env.DETECTOR_PATH);
+
+async function expectOriginalWriteError(name, read) {
+  const writeError = new Error(`${name}-write`);
+  let noticeCount = 0;
+  try {
+    await dismissReviewFailClosed({
+      reviewId: 701,
+      dismiss: async () => { throw writeError; },
+      read,
+      notice: () => { noticeCount += 1; },
+    });
+  } catch (error) {
+    if (error !== writeError || noticeCount !== 0) {
+      throw new Error(`${name}: did not rethrow the original dismissal error`);
+    }
+    return;
+  }
+  throw new Error(`${name}: unsafe dismissal readback was accepted`);
+}
+
+async function main() {
+  let notices = 0;
+  const overlapped = await dismissReviewFailClosed({
+    reviewId: 701,
+    dismiss: async () => { throw new Error('overlap'); },
+    read: async () => ({id: 701, state: 'DISMISSED'}),
+    notice: () => { notices += 1; },
+  });
+  if (overlapped !== 'already-dismissed' || notices !== 1) {
+    throw new Error('exact-ID DISMISSED overlap was not accepted');
+  }
+
+  await expectOriginalWriteError(
+    'wrong-id',
+    async () => ({id: 702, state: 'DISMISSED'}),
+  );
+  await expectOriginalWriteError(
+    'still-approved',
+    async () => ({id: 701, state: 'APPROVED'}),
+  );
+  await expectOriginalWriteError(
+    'read-failure',
+    async () => { throw new Error('read failed'); },
+  );
+
+  const directReview = {
+    id: 801,
+    state: 'APPROVED',
+    commit_id: 'old-head',
+    user: {login: 'nathanpayne-codex'},
+  };
+  let protectiveDismissals = 0;
+  const protectedApproval = await protectDurableApproval({
+    directReview,
+    reviewerLists: ['not-json', '["nathanpayne-codex"]'],
+    dismiss: async approval => {
+      if (approval !== directReview) {
+        throw new Error('protective dismissal lost exact webhook object');
+      }
+      protectiveDismissals += 1;
+    },
+  });
+  if (!protectedApproval || protectiveDismissals !== 1) {
+    throw new Error('registered durable approval was not protected on uncertainty');
+  }
+  const humanProtected = await protectDurableApproval({
+    directReview: {...directReview, user: {login: 'human-reviewer'}},
+    reviewerLists: ['["nathanpayne-codex"]'],
+    dismiss: async () => { protectiveDismissals += 1; },
+  });
+  if (humanProtected || protectiveDismissals !== 1) {
+    throw new Error('unregistered human approval was dismissed protectively');
+  }
+
+  const initialPr = {
+    number: 99,
+    head: {sha: 'new-head'},
+    base: {ref: 'main', sha: 'base-head'},
+    user: {login: 'nathanjohnpayne'},
+    body: 'Authoring-Agent: cursor',
+  };
+  const editedPr = {
+    ...initialPr,
+    user: {login: 'renamed-author'},
+    body: 'Authoring-Agent: codex',
+  };
+  const policySnapshot = pr => JSON.stringify({
+    head: pr.head.sha,
+    baseRef: pr.base.ref,
+    baseSha: pr.base.sha,
+  });
+  const enforcementSnapshot = pr => JSON.stringify({
+    policy: policySnapshot(pr),
+    author: pr.user.login,
+    body: pr.body,
+  });
+  let listCalls = 0;
+  let readCalls = 0;
+  let retryNotices = 0;
+  const stable = await readStableReviewSnapshot({
+    pr: initialPr,
+    triageSnapshot: policySnapshot(initialPr),
+    policySnapshot,
+    enforcementSnapshot,
+    listReviews: async () => {
+      listCalls += 1;
+      return [];
+    },
+    readPr: async () => {
+      readCalls += 1;
+      return editedPr;
+    },
+    notice: () => { retryNotices += 1; },
+  });
+  const prepared = prepareDirectApproval({
+    liveReviews: stable.reviews,
+    directReview,
+    eventEnforcementCurrent: false,
+    liveHeadSha: stable.pr.head.sha,
+  });
+  if (
+    stable.pr !== editedPr ||
+    stable.attempts !== 2 ||
+    listCalls !== 2 ||
+    readCalls !== 2 ||
+    retryNotices !== 1 ||
+    prepared.reviews.length !== 1 ||
+    prepared.reviews[0] !== directReview ||
+    prepared.directAttributionCurrent
+  ) {
+    throw new Error('mid-read mutation abandoned the empty-list durable fallback');
+  }
+
+  let headDriftRejected = false;
+  try {
+    await readStableReviewSnapshot({
+      pr: initialPr,
+      triageSnapshot: policySnapshot(initialPr),
+      policySnapshot,
+      enforcementSnapshot,
+      listReviews: async () => [],
+      readPr: async () => ({
+        ...editedPr,
+        head: {sha: 'later-head'},
+      }),
+      notice: () => {},
+    });
+  } catch (error) {
+    headDriftRejected = /head\/base changed/.test(String(error));
+  }
+  if (!headDriftRejected) {
+    throw new Error('head drift after triage did not fail closed');
+  }
+}
+
+main().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
 NODE
 
 echo "test_self_approval_detector: PASS"
