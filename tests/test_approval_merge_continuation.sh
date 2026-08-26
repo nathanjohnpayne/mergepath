@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUBJECT="$ROOT/scripts/workflow/approval-merge-continuation.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/approval-continuation.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/bin" "$TMP/root/scripts/lib" "$TMP/root/scripts/workflow"
+mkdir -p "$TMP/bin" "$TMP/root/.github" "$TMP/root/scripts/lib" "$TMP/root/scripts/workflow"
 cp "$SUBJECT" "$TMP/subject.sh"
 cp "$ROOT/scripts/lib/blocking-labels.sh" "$TMP/root/scripts/lib/blocking-labels.sh"
 cp "$ROOT/scripts/lib/review-policy-scalar.sh" "$TMP/root/scripts/lib/review-policy-scalar.sh"
@@ -104,6 +104,17 @@ awk '
 }
 chmod +x "$WORKFLOW_RETRACTION"
 
+# Execute the literal workflow block from a checkout that deliberately carries
+# an old/poison continuation helper. The first-rollout test must fail if the
+# self-contained retraction ever starts depending on the new helper again.
+mkdir -p "$TMP/old-trusted-checkout/scripts/workflow"
+cat > "$TMP/old-trusted-checkout/scripts/workflow/approval-merge-continuation.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "poison old helper invoked" >&2
+exit 99
+STUB
+chmod +x "$TMP/old-trusted-checkout/scripts/workflow/approval-merge-continuation.sh"
+
 PASS=0
 FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
@@ -128,6 +139,7 @@ run_case() {
   : > "$TMP/independence.log"
   : > "$TMP/events.log"
   printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}" > "$TMP/root/policy.yml"
+  printf 'author_identity: %s\n' "${STUB_TRUSTED_AUTHOR:-${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}}" > "$TMP/root/.github/review-policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
     STUB_INITIAL="$stub_initial" STUB_FINAL="$stub_final" \
     STUB_READINESS_RC="${STUB_READINESS_RC:-0}" STUB_GATE_RC="${STUB_GATE_RC:-0}" \
@@ -149,12 +161,17 @@ run_workflow_retraction_case() {
   echo 0 > "$TMP/read-count"
   : > "$TMP/merge.log"
   : > "$TMP/events.log"
-  PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" \
-    STUB_INITIAL="$stub_initial" STUB_FINAL="$stub_final" \
-    STUB_MERGE_RC="${STUB_MERGE_RC:-0}" \
-    AUTHOR_IDENTITY="${STUB_WORKFLOW_AUTHOR_IDENTITY-}" \
-    PR_NUMBER=7 REPO=owner/repo \
-    bash "$WORKFLOW_RETRACTION" >"$TMP/workflow.out" 2>&1
+  : > "$TMP/workflow-output"
+  (
+    cd "$TMP/old-trusted-checkout"
+    PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" \
+      STUB_INITIAL="$stub_initial" STUB_FINAL="$stub_final" \
+      STUB_MERGE_RC="${STUB_MERGE_RC:-0}" \
+      AUTHOR_IDENTITY="${STUB_WORKFLOW_AUTHOR_IDENTITY-}" \
+      GITHUB_OUTPUT="$TMP/workflow-output" \
+      PR_NUMBER=7 REPO=owner/repo \
+      bash "$WORKFLOW_RETRACTION" >"$TMP/workflow.out" 2>&1
+  )
 }
 
 assert_not_ready() {
@@ -172,6 +189,7 @@ reset_fixtures() {
   unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR STUB_REQUIRED_CHECKS_RC
   unset STUB_INDEPENDENCE_RC STUB_SHARED_AUTHOR STUB_REQUIRES_EXTERNAL
   unset STUB_SUBJECT_MODE STUB_POLICY_RC STUB_WORKFLOW_AUTHOR_IDENTITY
+  unset STUB_TRUSTED_AUTHOR
 }
 
 reset_fixtures
@@ -421,6 +439,22 @@ else
 fi
 
 reset_fixtures
+STUB_LOGIN=outside-contributor
+STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
+set +e
+run_case
+misconfigured_contributor_token_rc=$?
+set -e
+if [ "$misconfigured_contributor_token_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/events.log" ] \
+   && grep -Fq 'expected trusted author identity nathanjohnpayne' "$TMP/subject.out"; then
+  pass "a token matching an external PR author cannot retract that contributor's arm"
+else
+  fail "misconfigured contributor token wrote before trusted identity verification (rc=$misconfigured_contributor_token_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
+fi
+
+reset_fixtures
 STUB_POLICY_RC=9
 set +e
 run_case
@@ -439,7 +473,8 @@ fi
 # non-shared arms, shared arms, and a failed retraction readback.
 reset_fixtures
 if run_workflow_retraction_case && [ ! -s "$TMP/merge.log" ] \
-   && grep -Fq 'no auto-merge request to retract' "$TMP/workflow.out"; then
+   && grep -Fq 'automated arming remains disabled' "$TMP/workflow.out" \
+   && grep -Fxq 'auto_arm_allowed=false' "$TMP/workflow-output"; then
   pass "workflow retraction leaves an unarmed no-token repository green"
 else
   fail "workflow retraction made an unarmed no-token repository fail"
@@ -449,7 +484,8 @@ reset_fixtures
 STUB_WORKFLOW_AUTHOR_IDENTITY=nathanjohnpayne
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
 if run_workflow_retraction_case && [ ! -s "$TMP/merge.log" ] \
-   && grep -Fq 'Native non-shared PR requires no auto-merge invalidation' "$TMP/workflow.out"; then
+   && grep -Fq 'Native non-shared PR requires no auto-merge invalidation' "$TMP/workflow.out" \
+   && grep -Fxq 'auto_arm_allowed=true' "$TMP/workflow-output"; then
   pass "workflow retraction leaves a native non-shared arm untouched"
 else
   fail "workflow retraction disrupted a native non-shared arm"
@@ -461,7 +497,8 @@ STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' 
 STUB_FINAL="$SHARED_BASE"
 if run_workflow_retraction_case \
    && grep -Fq 'pr merge https://example.test/pr/7 --repo owner/repo --disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'Shared-author auto-merge retraction verified' "$TMP/workflow.out"; then
+   && grep -Fq 'Shared-author or unclassified auto-merge retraction verified' "$TMP/workflow.out" \
+   && ! grep -Fxq 'auto_arm_allowed=true' "$TMP/workflow-output"; then
   pass "workflow retraction is self-contained for the first consumer rollout"
 else
   fail "workflow retraction could not disable and verify a shared-author arm"
@@ -469,15 +506,18 @@ fi
 
 reset_fixtures
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
+STUB_FINAL="$SHARED_BASE"
 set +e
 run_workflow_retraction_case
 workflow_missing_identity_rc=$?
 set -e
-if [ "$workflow_missing_identity_rc" -eq 1 ] && [ ! -s "$TMP/merge.log" ] \
-   && grep -Fq 'author_identity is unavailable' "$TMP/workflow.out"; then
-  pass "workflow retraction fails closed only when an existing arm cannot be classified"
+if [ "$workflow_missing_identity_rc" -eq 0 ] \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
+   && grep -Fq 'retracting the existing unclassified auto-merge request fail closed' "$TMP/workflow.out" \
+   && ! grep -Fxq 'auto_arm_allowed=true' "$TMP/workflow-output"; then
+  pass "workflow retraction removes an existing arm even when policy identity is unavailable"
 else
-  fail "workflow retraction accepted an unclassified existing arm (rc=$workflow_missing_identity_rc)"
+  fail "workflow retraction stranded an unclassified existing arm (rc=$workflow_missing_identity_rc)"
 fi
 
 reset_fixtures

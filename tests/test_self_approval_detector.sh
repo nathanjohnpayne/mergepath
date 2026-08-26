@@ -187,6 +187,88 @@ for (const [implementationName, { decide, latestApprovedReviews }] of implementa
   }
 }
 
+// #1094 cancellation ordering: every direct approval event must enforce the
+// complete standing set. A later independent approval can replace/cancel the
+// earlier same-agent run, but it must still dismiss the carried blocker while
+// remaining green and eligible itself.
+for (const [implementationName, implementation] of implementations) {
+  const {reviewsWithDirectFallback, planApprovalEnforcement} = implementation;
+  if (
+    typeof reviewsWithDirectFallback !== 'function' ||
+    typeof planApprovalEnforcement !== 'function'
+  ) {
+    throw new Error(`${implementationName}: direct-event enforcement helpers are unavailable`);
+  }
+
+  const sameAgent = {
+    id: 101,
+    user: {login: 'nathanpayne-codex'},
+    state: 'APPROVED',
+    submitted_at: '2026-01-08T00:00:00Z',
+  };
+  const independent = {
+    id: 102,
+    user: {login: 'nathanpayne-cursor'},
+    state: 'APPROVED',
+    submitted_at: '2026-01-08T00:00:01Z',
+  };
+  const approvalInput = {
+    ...shared,
+    prBody: 'Authoring-Agent: codex',
+    requiresExternalReview: true,
+  };
+
+  const replacementRun = planApprovalEnforcement({
+    ...approvalInput,
+    reviews: reviewsWithDirectFallback([sameAgent, independent], independent),
+    directReviewId: independent.id,
+  });
+  if (
+    !replacementRun.eligibleApproval ||
+    replacementRun.persistentDirectViolation ||
+    replacementRun.directBlockedDiagnostics.length !== 0 ||
+    replacementRun.blockedDiagnostics.length !== 1 ||
+    replacementRun.approvals.find(item => item.review.id === sameAgent.id)?.decision.action !== 'block' ||
+    replacementRun.approvals.find(item => item.review.id === independent.id)?.decision.action !== 'allow'
+  ) {
+    throw new Error(`${implementationName}: replacement direct approval did not enforce the carried blocker: ${JSON.stringify(replacementRun)}`);
+  }
+
+  const violatingRun = planApprovalEnforcement({
+    ...approvalInput,
+    reviews: [sameAgent, independent],
+    directReviewId: sameAgent.id,
+  });
+  if (
+    !violatingRun.eligibleApproval ||
+    !violatingRun.persistentDirectViolation ||
+    violatingRun.directBlockedDiagnostics.length !== 1
+  ) {
+    throw new Error(`${implementationName}: direct same-agent violation lost red-run/persistent attribution: ${JSON.stringify(violatingRun)}`);
+  }
+
+  const dismissedLive = {...independent, state: 'DISMISSED'};
+  const liveWins = reviewsWithDirectFallback([dismissedLive], independent);
+  const dismissedPlan = planApprovalEnforcement({
+    ...approvalInput,
+    reviews: liveWins,
+    directReviewId: independent.id,
+  });
+  if (
+    liveWins.length !== 1 ||
+    liveWins[0].state !== 'DISMISSED' ||
+    dismissedPlan.approvals.length !== 0 ||
+    dismissedPlan.eligibleApproval
+  ) {
+    throw new Error(`${implementationName}: stale APPROVED webhook overrode the live dismissed state: ${JSON.stringify({liveWins, dismissedPlan})}`);
+  }
+
+  const laggingApi = reviewsWithDirectFallback([sameAgent], independent);
+  if (laggingApi.length !== 2 || !laggingApi.some(review => review.id === independent.id)) {
+    throw new Error(`${implementationName}: eventual-consistency fallback lost the direct approval`);
+  }
+}
+
 if (typeof canonical.evaluateLatestApprovals !== 'function') {
   throw new Error('canonical detector does not expose final live approval evaluation');
 }

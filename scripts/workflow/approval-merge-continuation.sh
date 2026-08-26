@@ -21,6 +21,26 @@ case "$PR_NUMBER" in *[!0-9]*|'') usage ;; esac
 
 ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
+# The helper itself is loaded from the trusted default branch. Verify the
+# effective author token against that trusted policy before any protective
+# write. Governing base-policy resolution still happens below before arming,
+# but it is intentionally not a prerequisite for retracting an unsafe arm: a
+# broken or transient base-policy lookup must not strand shared-author
+# auto-merge, while a misconfigured token must never retract an external
+# contributor's arm merely because its login happens to match the PR author.
+# shellcheck source=../lib/review-policy-scalar.sh
+source "$ROOT/scripts/lib/review-policy-scalar.sh"
+trusted_policy="$ROOT/.github/review-policy.yml"
+[ -f "$trusted_policy" ] || {
+  echo "approval continuation: ERROR — trusted default-branch review policy is unavailable" >&2
+  exit 3
+}
+trusted_author=$(review_policy_scalar "$trusted_policy" author_identity)
+[ -n "$trusted_author" ] || {
+  echo "approval continuation: ERROR — trusted default-branch review policy names no author_identity" >&2
+  exit 3
+}
+
 not_ready() {
   echo "approval continuation: not ready — $*"
   exit 4
@@ -45,6 +65,7 @@ identity_msg=$(cat "$identity_err" 2>/dev/null || true)
 rm -f "$identity_err"
 [ "$identity_rc" -eq 0 ] || infra_error "could not verify merge token identity: ${identity_msg:-unknown API error}"
 [ -n "$login" ] || infra_error "merge token identity is empty"
+[ "$login" = "$trusted_author" ] || infra_error "merge token resolves to $login, expected trusted author identity $trusted_author"
 
 initial=$(read_pr) || infra_error "could not read PR #$PR_NUMBER"
 if ! jq -e '
@@ -71,9 +92,11 @@ native_author=$(jq -r '.author.login' <<<"$initial")
 # mutable facts. Keep self-review scope unchanged and make only the merge a
 # one-shot action. This runs before every readiness/error exit and also exposes
 # a policy-independent disarm-only mode for trusted invalidation callers. The
-# author token identity and native PR author are sufficient for this protective
-# write; governing base-policy resolution remains mandatory before any arm.
-if [ "$native_author" = "$login" ]; then
+# The token was verified against the trusted default-branch policy before the
+# first PR read. That trusted identity plus the native PR author is sufficient
+# for this protective write; governing base-policy resolution remains
+# mandatory before any arm.
+if [ "$native_author" = "$trusted_author" ]; then
   if [ "$(jq -r 'if .autoMergeRequest == null then "false" else "true" end' <<<"$initial")" = "true" ]; then
     if ! gh pr merge "$url" --repo "$REPO" --disable-auto --match-head-commit "$head"; then # NO_BARE_GH_WRITE_EXEMPT: the effective token was verified above; this only retracts a shared-author arm
       infra_error "could not disable pre-existing auto-merge on shared-author PR"
@@ -102,8 +125,6 @@ fi
 # malformed governing base policy must not strand an already-armed shared PR.
 # shellcheck source=../lib/blocking-labels.sh
 source "$ROOT/scripts/lib/blocking-labels.sh"
-# shellcheck source=../lib/review-policy-scalar.sh
-source "$ROOT/scripts/lib/review-policy-scalar.sh"
 
 blocking_labels() {
   jq -r '.labels[]?.name' | mergepath_blocking_labels_csv

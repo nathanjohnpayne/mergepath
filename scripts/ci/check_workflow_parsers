@@ -825,6 +825,7 @@ shared_author_retraction_block=$(awk '
 retraction_no_arm_line=$(grep -nF '.autoMergeRequest == null' <<<"$shared_author_retraction_block" | head -1 | cut -d: -f1)
 retraction_identity_line=$(grep -nF 'if [ -z "${AUTHOR_IDENTITY:-}" ]; then' <<<"$shared_author_retraction_block" | head -1 | cut -d: -f1)
 if grep -Fq 'if: ${{ always() }}' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'id: retract_shared_author' <<<"$shared_author_retraction_block" \
   && grep -Fq 'SHARED_AUTHOR_DISARM_REQUIRED_V1' <<<"$shared_author_retraction_block" \
   && grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$shared_author_retraction_block" \
   && grep -Fq 'AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}' <<<"$shared_author_retraction_block" \
@@ -833,6 +834,10 @@ if grep -Fq 'if: ${{ always() }}' <<<"$shared_author_retraction_block" \
   && grep -Fq -- '--disable-auto' <<<"$shared_author_retraction_block" \
   && ! grep -Eq -- '--(auto|merge|rebase|squash)([[:space:]]|$)' <<<"$shared_author_retraction_block" \
   && grep -Fq 'Shared-author auto-merge retraction did not persist.' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'auto_arm_allowed=false' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'auto_arm_allowed=true' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'retracting the existing unclassified auto-merge request fail closed' <<<"$shared_author_retraction_block" \
+  && ! grep -Fq 'approval-merge-continuation.sh' <<<"$shared_author_retraction_block" \
   && [ -n "$retraction_no_arm_line" ] \
   && [ -n "$retraction_identity_line" ] \
   && [ "$retraction_no_arm_line" -lt "$retraction_identity_line" ]; then
@@ -1038,7 +1043,8 @@ if grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$auto_merge
   && grep -Fq 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'blocking_labels=$(printf' <<<"$auto_merge_job_block")" -eq 1 ] \
   && grep -Fq 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$auto_merge_job_block" \
-  && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block"; then
+  && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block" \
+  && grep -Fq "needs.block-self-approval.outputs.auto_arm_allowed == 'true'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
   echo "  PASS: privileged approval arming uses the trusted helper with a first-rollout bootstrap and routes final safety through the shared continuation"
 else

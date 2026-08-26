@@ -52,6 +52,8 @@ for required_fragment in \
   'decision.detail' \
   'decision.persistentViolation' \
   'latestApprovedReviews' \
+  'reviewsWithDirectFallback' \
+  'planApprovalEnforcement' \
   'selectDetector' \
   "core.setOutput('eligible_approval'" \
   'BEGIN SELF-APPROVAL BOOTSTRAP' \
@@ -76,12 +78,19 @@ auto_merge_job=$(sed -n '/^  auto-merge-on-approval:/,/^    runs-on:/p' "$WORKFL
 for success_requirement in \
   "needs.triage.result == 'success'" \
   "needs.block-self-approval.result == 'success'" \
-  "needs.block-self-approval.outputs.eligible_approval == 'true'"; do
+  "needs.block-self-approval.outputs.eligible_approval == 'true'" \
+  "needs.block-self-approval.outputs.auto_arm_allowed == 'true'"; do
   if ! printf '%s\n' "$auto_merge_job" | grep -qF "$success_requirement"; then
     echo "check_self_approval_detector: every auto-merge trigger must require successful triage and an eligible approval from the self-approval guard" >&2
     exit 1
   fi
 done
+
+if grep -qF 'approvals = [context.payload.review]' "$WORKFLOW" ||
+  ! grep -qF 'const liveReviews = await github.paginate(' "$WORKFLOW"; then
+  echo "check_self_approval_detector: direct approval events must paginate and enforce the complete standing approval set" >&2
+  exit 1
+fi
 
 block_job=$(sed -n '/^  block-self-approval:/,/^    runs-on:/p' "$WORKFLOW")
 if ! printf '%s\n' "$block_job" | grep -qF "github.event.pull_request.user.login != 'dependabot[bot]'"; then
@@ -103,12 +112,16 @@ shared_author_retraction=$(awk '
   in_step {print}
 ' "$WORKFLOW")
 for required_fragment in \
+  'id: retract_shared_author' \
   'if: ${{ always() }}' \
   'SHARED_AUTHOR_DISARM_REQUIRED_V1' \
   'GH_TOKEN: ${{ github.token }}' \
   'AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}' \
   '--json author,autoMergeRequest,url' \
   '--disable-auto' \
+  'auto_arm_allowed=false' \
+  'auto_arm_allowed=true' \
+  'retracting the existing unclassified auto-merge request fail closed' \
   '.autoMergeRequest == null'; do
   if ! printf '%s\n' "$shared_author_retraction" | grep -qF -- "$required_fragment"; then
     echo "check_self_approval_detector: shared-author approval invalidation must carry its self-contained workflow-token retraction path ($required_fragment)" >&2
@@ -117,6 +130,10 @@ for required_fragment in \
 done
 if printf '%s\n' "$shared_author_retraction" | grep -qF 'AUTHOR_MERGE_TOKEN'; then
   echo "check_self_approval_detector: protective retraction must not depend on the optional auto-merge token" >&2
+  exit 1
+fi
+if printf '%s\n' "$shared_author_retraction" | grep -qF 'approval-merge-continuation.sh'; then
+  echo "check_self_approval_detector: first-rollout retraction must remain self-contained and helper-independent" >&2
   exit 1
 fi
 

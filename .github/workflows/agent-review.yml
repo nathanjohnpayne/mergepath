@@ -744,6 +744,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       eligible_approval: ${{ steps.check.outputs.eligible_approval }}
+      auto_arm_allowed: ${{ steps.retract_shared_author.outputs.auto_arm_allowed }}
     steps:
       - name: Checkout trusted self-approval detector
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -929,7 +930,65 @@ jobs:
                   (!requireHead || (headSha && normalized(review.commit_id) === headSha)),
                 );
               }
-              return {decide, latestApprovedReviews};
+
+              // A direct review webhook can arrive before the list-reviews endpoint exposes
+              // that review. Add it only when the live list has no object with the same ID;
+              // if the API already reports that ID as DISMISSED or CHANGES_REQUESTED, the
+              // live state wins over the older APPROVED webhook payload.
+              function reviewsWithDirectFallback(reviews, directReview) {
+                const combined = Array.isArray(reviews) ? [...reviews] : [];
+                const directId = Number((directReview && directReview.id) || 0);
+                if (
+                  directId > 0 &&
+                  !combined.some(review => Number((review && review.id) || 0) === directId)
+                ) {
+                  combined.push(directReview);
+                }
+                return combined;
+              }
+
+              // Plan the complete standing-approval enforcement for one workflow event.
+              // Event identity controls only attribution (red run / persistent label); it
+              // never narrows the standing set that must be classified and dismissed.
+              function planApprovalEnforcement(input) {
+                const directReviewId = Number((input && input.directReviewId) || 0);
+                const approvals = latestApprovedReviews(input);
+                let eligibleApproval = false;
+                let persistentDirectViolation = false;
+                const directBlockedDiagnostics = [];
+                const blockedDiagnostics = [];
+
+                const classifiedApprovals = approvals.map(review => {
+                  const reviewer = review && review.user && review.user.login;
+                  const decision = decide({...input, reviewer});
+                  const diagnostic = decision.detail
+                    ? `${decision.reason}: ${decision.detail}`
+                    : decision.reason;
+                  const reviewId = Number((review && review.id) || 0);
+                  const isDirectReview = directReviewId > 0 && reviewId === directReviewId;
+
+                  if (decision.action === 'allow') {
+                    eligibleApproval = true;
+                  } else {
+                    blockedDiagnostics.push(diagnostic);
+                    if (isDirectReview) {
+                      directBlockedDiagnostics.push(diagnostic);
+                      persistentDirectViolation = Boolean(decision.persistentViolation);
+                    }
+                  }
+
+                  return {review, reviewer, decision, diagnostic, isDirectReview};
+                });
+
+                return {
+                  approvals: classifiedApprovals,
+                  eligibleApproval,
+                  persistentDirectViolation,
+                  directBlockedDiagnostics,
+                  blockedDiagnostics,
+                };
+              }
+              return {decide, latestApprovedReviews, reviewsWithDirectFallback, planApprovalEnforcement};
             }
             // END SELF-APPROVAL BOOTSTRAP
 
@@ -975,10 +1034,17 @@ jobs:
               loadBootstrap: bootstrapDetector,
               notice: message => core.notice(message),
             });
-            const {decide, latestApprovedReviews} = detector;
+            const {
+              decide,
+              latestApprovedReviews,
+              reviewsWithDirectFallback,
+              planApprovalEnforcement,
+            } = detector;
             if (
               typeof decide !== 'function' ||
-              typeof latestApprovedReviews !== 'function'
+              typeof latestApprovedReviews !== 'function' ||
+              typeof reviewsWithDirectFallback !== 'function' ||
+              typeof planApprovalEnforcement !== 'function'
             ) {
               throw new Error('self-approval detector exports are unavailable');
             }
@@ -1018,64 +1084,59 @@ jobs:
             const isUnlabeledRearm =
               context.eventName === 'pull_request' &&
               context.payload.action === 'unlabeled';
-            let approvals;
-            if (isDirectApproval) {
-              approvals = [context.payload.review];
-            } else {
-              const reviews = await github.paginate(
-                github.rest.pulls.listReviews,
-                {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: pr.number,
-                  per_page: 100,
-                },
-              );
-              approvals = latestApprovedReviews({
-                reviews,
-                reviewerAccounts,
-                prAuthor,
-              });
-            }
+            const liveReviews = await github.paginate(
+              github.rest.pulls.listReviews,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              },
+            );
+            const directReview = isDirectApproval
+              ? context.payload.review
+              : null;
+            const reviews = reviewsWithDirectFallback(
+              liveReviews,
+              directReview,
+            );
+            const enforcement = planApprovalEnforcement({
+              reviews,
+              directReviewId: directReview && directReview.id,
+              reviewerAccounts,
+              prAuthor,
+              authorIdentity: process.env.AUTHOR_IDENTITY,
+              prBody: pr.body || '',
+              requiresExternalReview,
+            });
 
-            if (approvals.length === 0) {
+            if (enforcement.approvals.length === 0) {
               core.info('No eligible registered approval exists for this re-arm.');
               return;
             }
 
-            let eligibleApproval = false;
-            let persistentDirectViolation = false;
-            const blockedDiagnostics = [];
-            for (const approval of approvals) {
-              const reviewer = approval.user && approval.user.login;
-              const decision = decide({
-                prAuthor,
-                authorIdentity: process.env.AUTHOR_IDENTITY,
+            for (const classification of enforcement.approvals) {
+              const {
+                review: approval,
                 reviewer,
-                reviewerAccounts,
-                prBody: pr.body || '',
-                requiresExternalReview,
-              });
-              const decisionDiagnostic = decision.detail
-                ? `${decision.reason}: ${decision.detail}`
-                : decision.reason;
+                decision,
+                diagnostic: decisionDiagnostic,
+                isDirectReview,
+              } = classification;
               core.info(
                 `Approval ${approval.id} by ${reviewer}: ` +
                 `${decision.action} (${decisionDiagnostic})`,
               );
 
               if (decision.action !== 'block') {
-                eligibleApproval = true;
                 continue;
               }
 
-              const persistentViolation =
-                isDirectApproval && Boolean(decision.persistentViolation);
-              persistentDirectViolation =
-                persistentDirectViolation || persistentViolation;
-              const dismissalPrefix = persistentViolation
+              const persistentDirectViolation =
+                isDirectReview && Boolean(decision.persistentViolation);
+              const dismissalPrefix = persistentDirectViolation
                 ? 'Approval violates the agent-independence policy'
-                : isDirectApproval
+                : isDirectReview
                   ? 'Approval independence could not be verified'
                   : 'Approval is no longer eligible under the current agent-independence policy';
               await github.rest.pulls.dismissReview({
@@ -1086,10 +1147,9 @@ jobs:
                 message: `${dismissalPrefix} (${decisionDiagnostic}). ` +
                   'This review has been dismissed automatically.',
               });
-              blockedDiagnostics.push(decisionDiagnostic);
             }
 
-            if (persistentDirectViolation) {
+            if (enforcement.persistentDirectViolation) {
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -1098,20 +1158,24 @@ jobs:
               });
             }
 
-            core.setOutput('eligible_approval', eligibleApproval.toString());
-            if (isDirectApproval && blockedDiagnostics.length > 0) {
+            core.setOutput(
+              'eligible_approval',
+              enforcement.eligibleApproval.toString(),
+            );
+            if (enforcement.directBlockedDiagnostics.length > 0) {
               core.setFailed(
                 `Approval dismissed by the agent-independence guard ` +
-                `(${blockedDiagnostics.join('; ')}).`,
+                `(${enforcement.directBlockedDiagnostics.join('; ')}).`,
               );
-            } else if (blockedDiagnostics.length > 0) {
+            } else if (enforcement.blockedDiagnostics.length > 0) {
               core.notice(
-                `Dismissed ${blockedDiagnostics.length} approval(s) that ` +
+                `Dismissed ${enforcement.blockedDiagnostics.length} approval(s) that ` +
                 `became ineligible before the ${isUnlabeledRearm ? 'unlabeled' : 'update'} re-arm.`,
               );
             }
 
       - name: Retract shared-author auto-merge
+        id: retract_shared_author
         if: ${{ always() }}
         env:
           # SHARED_AUTHOR_DISARM_REQUIRED_V1. This protective workflow write
@@ -1121,6 +1185,10 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
+          # Default closed. The later privileged arming job consumes this
+          # live classification, so an old helper from the trusted default
+          # branch cannot undo this step during the first rollout.
+          echo "auto_arm_allowed=false" >> "$GITHUB_OUTPUT"
           if ! pr_state=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
             --json author,autoMergeRequest,url); then
             echo "::error::Could not read live PR author or auto-merge state."
@@ -1136,17 +1204,19 @@ jobs:
             echo "::error::Live PR author or auto-merge metadata is malformed."
             exit 1
           fi
-          if jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
-            echo "PR has no auto-merge request to retract."
-            exit 0
-          fi
-          if [ -z "${AUTHOR_IDENTITY:-}" ]; then
-            echo "::error::An auto-merge request exists but governing author_identity is unavailable; refusing to leave an unclassified arm."
-            exit 1
-          fi
           native_author=$(jq -r '.author.login' <<<"$pr_state")
-          if [ "$native_author" != "$AUTHOR_IDENTITY" ]; then
+          if [ -z "${AUTHOR_IDENTITY:-}" ]; then
+            if jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
+              echo "Governing author_identity is unavailable, but no auto-merge request exists; automated arming remains disabled."
+              exit 0
+            fi
+            echo "::warning::Governing author_identity is unavailable; retracting the existing unclassified auto-merge request fail closed."
+          elif [ "$native_author" != "$AUTHOR_IDENTITY" ]; then
+            echo "auto_arm_allowed=true" >> "$GITHUB_OUTPUT"
             echo "Native non-shared PR requires no auto-merge invalidation."
+            exit 0
+          elif jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
+            echo "Shared-author PR has no auto-merge request to retract; automated arming remains disabled."
             exit 0
           fi
           pr_url=$(jq -r '.url' <<<"$pr_state")
@@ -1159,7 +1229,7 @@ jobs:
             echo "::error::Could not verify shared-author auto-merge retraction."
             exit 1
           fi
-          if ! jq -e --arg author "$AUTHOR_IDENTITY" '
+          if ! jq -e --arg author "$native_author" '
             (.author.login == $author) and
             has("autoMergeRequest") and
             .autoMergeRequest == null
@@ -1167,7 +1237,7 @@ jobs:
             echo "::error::Shared-author auto-merge retraction did not persist."
             exit 1
           fi
-          echo "Shared-author auto-merge retraction verified."
+          echo "Shared-author or unclassified auto-merge retraction verified."
 
   # ──────────────────────────────────────────────
   # Job 6: Auto-merge on approval (if no external review required)
@@ -1284,6 +1354,7 @@ jobs:
       needs.triage.result == 'success' &&
       needs.block-self-approval.result == 'success' &&
       needs.block-self-approval.outputs.eligible_approval == 'true' &&
+      needs.block-self-approval.outputs.auto_arm_allowed == 'true' &&
       !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
       !contains(github.event.pull_request.labels.*.name, 'needs-human-review') &&
       !contains(github.event.pull_request.labels.*.name, 'human-hold')

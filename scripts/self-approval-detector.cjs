@@ -179,6 +179,64 @@ function latestApprovedReviews(input) {
     (!requireHead || (headSha && normalized(review.commit_id) === headSha)),
   );
 }
+
+// A direct review webhook can arrive before the list-reviews endpoint exposes
+// that review. Add it only when the live list has no object with the same ID;
+// if the API already reports that ID as DISMISSED or CHANGES_REQUESTED, the
+// live state wins over the older APPROVED webhook payload.
+function reviewsWithDirectFallback(reviews, directReview) {
+  const combined = Array.isArray(reviews) ? [...reviews] : [];
+  const directId = Number((directReview && directReview.id) || 0);
+  if (
+    directId > 0 &&
+    !combined.some(review => Number((review && review.id) || 0) === directId)
+  ) {
+    combined.push(directReview);
+  }
+  return combined;
+}
+
+// Plan the complete standing-approval enforcement for one workflow event.
+// Event identity controls only attribution (red run / persistent label); it
+// never narrows the standing set that must be classified and dismissed.
+function planApprovalEnforcement(input) {
+  const directReviewId = Number((input && input.directReviewId) || 0);
+  const approvals = latestApprovedReviews(input);
+  let eligibleApproval = false;
+  let persistentDirectViolation = false;
+  const directBlockedDiagnostics = [];
+  const blockedDiagnostics = [];
+
+  const classifiedApprovals = approvals.map(review => {
+    const reviewer = review && review.user && review.user.login;
+    const decision = decide({...input, reviewer});
+    const diagnostic = decision.detail
+      ? `${decision.reason}: ${decision.detail}`
+      : decision.reason;
+    const reviewId = Number((review && review.id) || 0);
+    const isDirectReview = directReviewId > 0 && reviewId === directReviewId;
+
+    if (decision.action === 'allow') {
+      eligibleApproval = true;
+    } else {
+      blockedDiagnostics.push(diagnostic);
+      if (isDirectReview) {
+        directBlockedDiagnostics.push(diagnostic);
+        persistentDirectViolation = Boolean(decision.persistentViolation);
+      }
+    }
+
+    return {review, reviewer, decision, diagnostic, isDirectReview};
+  });
+
+  return {
+    approvals: classifiedApprovals,
+    eligibleApproval,
+    persistentDirectViolation,
+    directBlockedDiagnostics,
+    blockedDiagnostics,
+  };
+}
 // END SELF-APPROVAL DETECTOR IMPLEMENTATION
 
 // Evaluate the complete latest-state approval set for a final live merge
@@ -231,4 +289,10 @@ function evaluateLatestApprovals(input) {
   };
 }
 
-module.exports = { decide, latestApprovedReviews, evaluateLatestApprovals };
+module.exports = {
+  decide,
+  latestApprovedReviews,
+  reviewsWithDirectFallback,
+  planApprovalEnforcement,
+  evaluateLatestApprovals,
+};
