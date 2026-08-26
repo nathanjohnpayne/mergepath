@@ -86,9 +86,17 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-BASE='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","labels":[]}'
+BASE='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","labels":[],"author":{"login":"outside-contributor"},"autoMergeRequest":null}'
+SHARED_BASE=$(jq -c '.author.login = "nathanjohnpayne"' <<<"$BASE")
 
 run_case() {
+  local -a subject_args=(7 owner/repo)
+  local stub_initial stub_final
+  if [ -n "${STUB_SUBJECT_MODE:-}" ]; then
+    subject_args=(--disarm-shared-author-only 7 owner/repo)
+  fi
+  stub_initial="${STUB_INITIAL:-$BASE}"
+  stub_final="${STUB_FINAL:-$stub_initial}"
   : > "$TMP/read-count"
   echo 0 > "$TMP/read-count"
   : > "$TMP/merge.log"
@@ -98,7 +106,7 @@ run_case() {
   : > "$TMP/events.log"
   printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}" > "$TMP/root/policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
-    STUB_INITIAL="${STUB_INITIAL:-$BASE}" STUB_FINAL="${STUB_FINAL:-${STUB_INITIAL:-$BASE}}" \
+    STUB_INITIAL="$stub_initial" STUB_FINAL="$stub_final" \
     STUB_READINESS_RC="${STUB_READINESS_RC:-0}" STUB_GATE_RC="${STUB_GATE_RC:-0}" \
     STUB_ACCOUNTING_RC="${STUB_ACCOUNTING_RC:-0}" \
     STUB_THREADS_RC="${STUB_THREADS_RC:-0}" STUB_LOGIN="${STUB_LOGIN:-nathanjohnpayne}" \
@@ -107,7 +115,7 @@ run_case() {
     STUB_SHARED_AUTHOR="${STUB_SHARED_AUTHOR:-false}" \
     STUB_REQUIRES_EXTERNAL="${STUB_REQUIRES_EXTERNAL:-false}" \
     STUB_LOGIN_RC="${STUB_LOGIN_RC:-0}" STUB_MERGE_RC="${STUB_MERGE_RC:-0}" \
-    bash "$TMP/subject.sh" 7 owner/repo >"$TMP/subject.out" 2>&1
+    bash "$TMP/subject.sh" "${subject_args[@]}" >"$TMP/subject.out" 2>&1
 }
 
 assert_not_ready() {
@@ -124,6 +132,7 @@ reset_fixtures() {
   unset STUB_ACCOUNTING_RC STUB_THREADS_RC STUB_LOGIN STUB_LOGIN_RC
   unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR STUB_REQUIRED_CHECKS_RC
   unset STUB_INDEPENDENCE_RC STUB_SHARED_AUTHOR STUB_REQUIRES_EXTERNAL
+  unset STUB_SUBJECT_MODE
 }
 
 reset_fixtures
@@ -163,11 +172,11 @@ STUB_GATE_RC=1
 assert_not_ready "pending threshold-aware external gate defers without arming"
 
 reset_fixtures
-STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","labels":[{"name":"human-hold"}]}'
+STUB_INITIAL=$(jq -c '.labels = [{"name":"human-hold"}]' <<<"$BASE")
 assert_not_ready "blocking label defers before gate work"
 
 reset_fixtures
-STUB_INITIAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","labels":[{"name":"documentation"}]}'
+STUB_INITIAL=$(jq -c '.labels = [{"name":"documentation"}]' <<<"$BASE")
 STUB_FINAL="$BASE"
 if run_case && [ -s "$TMP/merge.log" ]; then
   pass "non-blocking labels remain merge-eligible"
@@ -196,15 +205,15 @@ STUB_THREADS_RC=3
 assert_not_ready "unresolved conversations defer without arming"
 
 reset_fixtures
-STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"def456","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","labels":[]}'
+STUB_FINAL=$(jq -c '.headRefOid = "def456"' <<<"$BASE")
 assert_not_ready "head drift during evaluation defers without arming"
 
 reset_fixtures
-STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"release","baseRefOid":"base456","url":"https://example.test/pr/7","labels":[]}'
+STUB_FINAL=$(jq -c '.baseRefName = "release" | .baseRefOid = "base456"' <<<"$BASE")
 assert_not_ready "same-head base retarget during evaluation defers without arming"
 
 reset_fixtures
-STUB_FINAL='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base456","url":"https://example.test/pr/7","labels":[]}'
+STUB_FINAL=$(jq -c '.baseRefOid = "base456"' <<<"$BASE")
 assert_not_ready "same-head base advance during evaluation defers without arming"
 
 # #1094: the final continuation must not trust the approval event's immutable
@@ -240,42 +249,44 @@ else
 fi
 
 reset_fixtures
-STUB_SHARED_AUTHOR=true
-STUB_REQUIRES_EXTERNAL=true
+STUB_INITIAL="$SHARED_BASE"
 set +e
 run_case
 shared_phase4_rc=$?
 set -e
 if [ "$shared_phase4_rc" -eq 4 ] && [ ! -s "$TMP/merge.log" ] \
-   && grep -Fq 'shared-author Phase 4 PR requires a separately authorized manual merge' "$TMP/subject.out"; then
-  pass "shared-author Phase 4 approval cannot arm mutable-state auto-merge"
+   && grep -Fq 'shared-author PR requires a one-shot author merge' "$TMP/subject.out"; then
+  pass "shared-author approval cannot leave mutable-state auto-merge armed"
 else
-  fail "shared-author Phase 4 path must stop before gh pr merge (rc=$shared_phase4_rc)"
+  fail "shared-author path must stop before gh pr merge (rc=$shared_phase4_rc)"
 fi
 
 reset_fixtures
-STUB_SHARED_AUTHOR=true
-STUB_REQUIRES_EXTERNAL=true
-STUB_FINAL=$(jq -c '.autoMergeRequest = {enabledAt: "2026-01-09T00:00:00Z"}' <<<"$BASE")
+STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
+STUB_FINAL="$SHARED_BASE"
 set +e
 run_case
 armed_shared_phase4_rc=$?
 set -e
 if [ "$armed_shared_phase4_rc" -eq 4 ] \
    && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
-   && ! grep -Fq -- '--auto' "$TMP/merge.log"; then
-  pass "shared-author Phase 4 re-entry retracts a pre-existing auto-merge arm"
+   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 merge pr-view-2 " ] \
+   && [ ! -s "$TMP/readiness.log" ]; then
+  pass "shared-author re-entry retracts a pre-existing arm before readiness work"
 else
-  fail "pre-existing shared-author Phase 4 auto-merge arm was not retracted (rc=$armed_shared_phase4_rc)"
+  fail "pre-existing shared-author auto-merge arm was not retracted first (rc=$armed_shared_phase4_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
 fi
 
 reset_fixtures
-STUB_SHARED_AUTHOR=true
-STUB_REQUIRES_EXTERNAL=false
-if run_case && [ -s "$TMP/merge.log" ]; then
-  pass "under-threshold shared-author approvals retain the documented auto-merge path"
+STUB_INITIAL="$SHARED_BASE"
+set +e
+run_case
+shared_under_threshold_rc=$?
+set -e
+if [ "$shared_under_threshold_rc" -eq 4 ] && [ ! -s "$TMP/merge.log" ]; then
+  pass "under-threshold shared-author approval remains valid but uses a one-shot merge"
 else
-  fail "under-threshold shared-author approval was over-blocked"
+  fail "under-threshold shared-author PR left a durable auto-merge path (rc=$shared_under_threshold_rc)"
 fi
 
 reset_fixtures
@@ -286,6 +297,90 @@ if run_case && [ -s "$TMP/merge.log" ]; then
 else
   fail "native non-shared Phase 4 approval was over-blocked"
 fi
+
+# An invalidated shared-author run must retract an old arm before any early
+# readiness exit. This is the same-head under-threshold -> Phase 4 transition
+# that an approval-triggered auto-merge job otherwise skips as ineligible.
+for early_failure in draft readiness independence; do
+  reset_fixtures
+  STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
+  STUB_FINAL="$SHARED_BASE"
+  case "$early_failure" in
+    draft) STUB_INITIAL=$(jq -c '.isDraft = true' <<<"$STUB_INITIAL") ;;
+    readiness) STUB_READINESS_RC=1 ;;
+    independence) STUB_INDEPENDENCE_RC=1 ;;
+  esac
+  set +e
+  run_case
+  early_failure_rc=$?
+  set -e
+  if [ "$early_failure_rc" -eq 4 ] \
+     && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+     && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 merge pr-view-2 " ]; then
+    pass "shared-author $early_failure invalidation retracts the existing arm before exiting"
+  else
+    fail "shared-author $early_failure invalidation did not retract first (rc=$early_failure_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
+  fi
+done
+
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
+STUB_FINAL="$SHARED_BASE"
+if run_case \
+   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq 'shared-author auto-merge is disarmed' "$TMP/subject.out"; then
+  pass "the approval guard can invoke the shared-author-only retraction mode"
+else
+  fail "shared-author-only retraction mode did not verify the disarm"
+fi
+
+for failed_readback in still_armed moved_head; do
+  reset_fixtures
+  STUB_SUBJECT_MODE=disarm
+  STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
+  case "$failed_readback" in
+    still_armed) STUB_FINAL="$STUB_INITIAL" ;;
+    moved_head) STUB_FINAL=$(jq -c '.headRefOid = "def456"' <<<"$SHARED_BASE") ;;
+  esac
+  set +e
+  run_case
+  failed_readback_rc=$?
+  set -e
+  if [ "$failed_readback_rc" -eq 3 ] \
+     && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log"; then
+    pass "a $failed_readback disarm readback fails closed after the retraction write"
+  else
+    fail "a $failed_readback disarm readback was accepted (rc=$failed_readback_rc)"
+  fi
+done
+
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+if run_case && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'native non-shared PR requires no auto-merge invalidation' "$TMP/subject.out"; then
+  pass "shared-author-only retraction is a no-op for a native non-shared PR"
+else
+  fail "shared-author-only retraction affected a native non-shared PR"
+fi
+
+for invalid_field in author auto_merge_absent auto_merge_scalar; do
+  reset_fixtures
+  case "$invalid_field" in
+    author) STUB_INITIAL=$(jq -c 'del(.author)' <<<"$BASE") ;;
+    auto_merge_absent) STUB_INITIAL=$(jq -c 'del(.autoMergeRequest)' <<<"$BASE") ;;
+    auto_merge_scalar) STUB_INITIAL=$(jq -c '.autoMergeRequest = true' <<<"$BASE") ;;
+  esac
+  set +e
+  run_case
+  invalid_shape_rc=$?
+  set -e
+  if [ "$invalid_shape_rc" -eq 3 ] && [ ! -s "$TMP/merge.log" ]; then
+    pass "$invalid_field PR metadata fails closed before any merge write"
+  else
+    fail "$invalid_field PR metadata passed or wrote (rc=$invalid_shape_rc)"
+  fi
+done
 
 reset_fixtures
 STUB_EXPECTED_AUTHOR=consumer-author

@@ -95,6 +95,22 @@ for rearm_action in synchronize reopened edited unlabeled; do
   fi
 done
 
+shared_author_retraction=$(awk '
+  /- name: Retract shared-author auto-merge/ {in_step=1}
+  in_step && /- name:/ && $0 !~ /- name: Retract shared-author auto-merge/ {exit}
+  in_step {print}
+' "$WORKFLOW")
+for required_fragment in \
+  'if: ${{ always() }}' \
+  'GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' \
+  'approval-merge-continuation.sh' \
+  '--disarm-shared-author-only "$PR_NUMBER" "$REPO"'; do
+  if ! printf '%s\n' "$shared_author_retraction" | grep -qF -- "$required_fragment"; then
+    echo "check_self_approval_detector: shared-author approval invalidation must always invoke the author-token retraction path ($required_fragment)" >&2
+    exit 1
+  fi
+done
+
 load_config_job=$(sed -n '/^  load-config:/,/^    runs-on:/p' "$WORKFLOW")
 triage_job=$(sed -n '/^  triage:/,/^    runs-on:/p' "$WORKFLOW")
 for job_and_name in \

@@ -297,6 +297,18 @@ set +e; run_case; rc=$?; set -e
 if [ "$rc" -eq 3 ]; then pass "a malformed opinionated review object fails closed"; else fail "malformed review object passed (rc=$rc)"; fi
 
 reset_fixtures
+STUB_REVIEWS_PAGE_1='[{"id":20,"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"z"}]'
+STUB_REVIEWS_AFTER_PAGE_1="$STUB_REVIEWS_PAGE_1"
+set +e; run_case; rc=$?; set -e
+if [ "$rc" -eq 3 ]; then pass "a non-canonical review timestamp fails closed"; else fail "non-canonical timestamp passed (rc=$rc)"; fi
+
+reset_fixtures
+STUB_REVIEWS_PAGE_1='[{"id":20,"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-01-07T00:00:00Z"},{"id":20,"user":{"login":"nathanpayne-codex"},"state":"CHANGES_REQUESTED","commit_id":"abc123","submitted_at":"2026-01-08T00:00:00Z"}]'
+STUB_REVIEWS_AFTER_PAGE_1="$STUB_REVIEWS_PAGE_1"
+set +e; run_case; rc=$?; set -e
+if [ "$rc" -eq 3 ]; then pass "duplicate review ids fail closed before state reduction"; else fail "duplicate review ids passed (rc=$rc)"; fi
+
+reset_fixtures
 STUB_PR_RC=8
 set +e; run_case; rc=$?; set -e
 if [ "$rc" -eq 3 ]; then pass "an unreadable PR response fails closed"; else fail "PR API error passed (rc=$rc)"; fi

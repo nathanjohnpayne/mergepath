@@ -104,13 +104,18 @@ validate_reviews_shape() {
       (.state as $state |
         (["APPROVED","CHANGES_REQUESTED","COMMENTED","DISMISSED","PENDING"] | index($state)) != null) and
       ((.commit_id == null) or (.commit_id | type == "string" and length > 0)) and
-      ((.submitted_at == null) or (.submitted_at | type == "string" and length > 0)) and
+      ((.submitted_at == null) or
+       (.submitted_at |
+        type == "string" and
+        test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and
+        (try (fromdateiso8601 | type == "number") catch false))) and
       (.state as $state |
        if (["APPROVED","CHANGES_REQUESTED","DISMISSED"] | index($state)) != null
        then (.commit_id | type == "string" and length > 0) and
             (.submitted_at | type == "string" and length > 0)
        else true end)
-    )
+    ) and
+    ((map(.id) | length) == (map(.id) | unique | length))
   ' >/dev/null 2>&1 <<<"$value"; then
     infra_error "$label review history has an invalid or incomplete safety shape"
   fi

@@ -1111,6 +1111,24 @@ jobs:
               );
             }
 
+      - name: Retract shared-author auto-merge
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::AUTHOR_MERGE_TOKEN is not configured; cannot prove or retract a pre-existing shared-author auto-merge arm."
+            exit 1
+          fi
+          if [ ! -x scripts/workflow/approval-merge-continuation.sh ]; then
+            echo "::error::Trusted approval continuation helper is unavailable; cannot enforce shared-author auto-merge invalidation."
+            exit 1
+          fi
+          bash scripts/workflow/approval-merge-continuation.sh \
+            --disarm-shared-author-only "$PR_NUMBER" "$REPO"
+
   # ──────────────────────────────────────────────
   # Job 6: Auto-merge on approval (if no external review required)
   # ──────────────────────────────────────────────

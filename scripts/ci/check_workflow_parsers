@@ -815,6 +815,23 @@ else
   echo "  FAIL: agent-review auto-merge must use an author-owned AUTHOR_MERGE_TOKEN, not the reviewer assignment token" >&2
 fi
 
+shared_author_retraction_block=$(awk '
+  /- name: Retract shared-author auto-merge/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Retract shared-author auto-merge/ {exit}
+  in_block {print}
+' "$agent_review_workflow")
+if grep -Fq 'if: ${{ always() }}' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'AUTHOR_MERGE_TOKEN is not configured; cannot prove or retract' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'exit 1' <<<"$shared_author_retraction_block" \
+  && grep -Fq -- '--disarm-shared-author-only "$PR_NUMBER" "$REPO"' <<<"$shared_author_retraction_block"; then
+  pass=$((pass + 1))
+  echo "  PASS: approval invalidation always retracts shared-author auto-merge under the author token (#1094)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: block-self-approval must always invoke the author-token shared-author retraction path (#1094)" >&2
+fi
+
 if grep -Fq "AUTHOR_MERGE_TOKEN resolves to" "$agent_review_workflow"; then
   pass=$((pass + 1))
   echo "  PASS: agent-review verifies AUTHOR_MERGE_TOKEN identity before merge"
