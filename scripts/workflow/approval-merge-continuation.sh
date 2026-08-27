@@ -137,6 +137,14 @@ retract_snapshot_arm() {
   target_base_ref=$(jq -r '.baseRefName' <<<"$snapshot")
   target_base_sha=$(jq -r '.baseRefOid' <<<"$snapshot")
   target_author=$(jq -r '.author.login' <<<"$snapshot")
+  # The dedicated Dependabot workflow owns its durable arm. Keep this exact
+  # native-login boundary at the mutation site as well as at normal entry:
+  # EXIT cleanup can reach here after the first PR read failed, before the
+  # top-level author classification ever ran.
+  if [ "$target_author" = "dependabot[bot]" ]; then
+    echo "approval continuation: $reason snapshot belongs to Dependabot's dedicated auto-merge lane; leaving its durable request unchanged"
+    return 0
+  fi
   if ! gh pr merge "$target_url" --repo "$REPO" --disable-auto --match-head-commit "$target_head"; then # NO_BARE_GH_WRITE_EXEMPT: both caller modes are bounded to exact-head protective retraction
     echo "approval continuation: could not disable $reason auto-merge request" >&2
     return 1
@@ -181,6 +189,18 @@ url=$(jq -r '.url // ""' <<<"$initial")
 native_author=$(jq -r '.author.login' <<<"$initial")
 [ -n "$head" ] && [ -n "$url" ] || infra_error "PR response lacks head or URL"
 arm_enabled=$(jq -r 'if .autoMergeRequest == null then "false" else "true" end' <<<"$initial")
+
+# Dependabot owns a separate, purpose-built durable auto-merge lane. The
+# workflow-run and scheduled approval sweeps enumerate every approved PR, so
+# this helper is the authoritative author-class boundary: neither protective
+# mode nor a mistakenly-entered normal continuation may disable Dependabot's
+# request. The login comes from the live PR object and cannot be supplied by
+# PR-authored content.
+if [ "$native_author" = "dependabot[bot]" ]; then
+  RETRACT_ON_EXIT=0
+  echo "approval continuation: Dependabot PR is owned by the dedicated auto-merge lane; leaving its durable request unchanged"
+  exit 0
+fi
 
 # Resolve the policy that governs this exact PR base before classifying its
 # shared author. The default-branch copy is not an identity authority for a
@@ -337,7 +357,16 @@ case "$gate_rc" in
 esac
 
 set +e
-bash "$ROOT/scripts/review-feedback-accounting.sh" "$PR_NUMBER" "$REPO"
+# Prefer ACCOUNTING_GH_TOKEN when the caller sets it (#1101, CodeRabbit on
+# PR #1106): every caller of this script runs it under GH_TOKEN=
+# AUTHOR_MERGE_TOKEN, an external PAT secret this repo's workflow
+# `permissions:` blocks cannot grant Code Scanning alerts access to.
+# Accounting is read-only and needs no author attribution, so it runs
+# under GITHUB_TOKEN (scoped by the calling workflow's own permissions)
+# instead when that's supplied; falls back to the ambient GH_TOKEN
+# otherwise, unchanged for CLI/test callers that don't set it.
+GH_TOKEN="${ACCOUNTING_GH_TOKEN:-${GH_TOKEN:-}}" \
+  bash "$ROOT/scripts/review-feedback-accounting.sh" "$PR_NUMBER" "$REPO"
 accounting_rc=$?
 set -e
 case "$accounting_rc" in

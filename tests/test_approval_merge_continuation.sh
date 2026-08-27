@@ -37,6 +37,10 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   echo "$count" > "$STUB_DIR/read-count"
   printf 'pr-view-%s\n' "$count" >> "$STUB_DIR/events.log"
   if [ "$count" -eq 1 ]; then
+    if [ "${STUB_INITIAL_RC:-0}" -ne 0 ]; then
+      echo "stub initial PR read failed" >&2
+      exit "$STUB_INITIAL_RC"
+    fi
     printf '%s\n' "$STUB_INITIAL"
   elif [ "$count" -eq 2 ]; then
     printf '%s\n' "${STUB_SECOND:-$STUB_INITIAL}"
@@ -70,7 +74,10 @@ case "$name" in
     exit "${STUB_READINESS_RC:-0}"
     ;;
   merge-clearance-gate.sh) exit "${STUB_GATE_RC:-0}" ;;
-  review-feedback-accounting.sh) exit "${STUB_ACCOUNTING_RC:-0}" ;;
+  review-feedback-accounting.sh)
+    printf '%s\n' "${GH_TOKEN:-unset}" >> "${STUB_DIR:?}/accounting-token.log"
+    exit "${STUB_ACCOUNTING_RC:-0}"
+    ;;
   resolve-pr-threads.sh) exit "${STUB_THREADS_RC:-0}" ;;
   required-head-checks.sh)
     printf '%s\n' "$*" >> "${STUB_DIR:?}/required-checks.log"
@@ -139,6 +146,10 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
 BASE='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","body":"Authoring-Agent: codex","labels":[],"author":{"login":"outside-contributor"},"autoMergeRequest":null}'
 SHARED_BASE=$(jq -c '.author.login = "nathanjohnpayne"' <<<"$BASE")
+DEPENDABOT_BASE=$(jq -c '
+  .author.login = "dependabot[bot]" |
+  .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}
+' <<<"$BASE")
 
 run_case() {
   local -a subject_args=(7 owner/repo)
@@ -160,14 +171,17 @@ run_case() {
   : > "$TMP/independence.log"
   : > "$TMP/policy.log"
   : > "$TMP/events.log"
+  : > "$TMP/accounting-token.log"
   printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}" > "$TMP/root/policy.yml"
   printf 'author_identity: %s\n' "${STUB_TRUSTED_AUTHOR:-${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}}" > "$TMP/root/.github/review-policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
-    GH_TOKEN="${STUB_SUBJECT_TOKEN:-author-token}" \
+    GH_TOKEN="${TEST_AMBIENT_GH_TOKEN:-${STUB_SUBJECT_TOKEN:-author-token}}" \
+    ACCOUNTING_GH_TOKEN="${TEST_ACCOUNTING_GH_TOKEN:-}" \
     MERGEPATH_PROTECTIVE_TOKEN="${STUB_PROTECTIVE_TOKEN-workflow-token}" \
     MERGEPATH_PROTECTIVE_RETRACTION_DONE="${STUB_PROTECTIVE_DONE:-1}" \
     STUB_INITIAL="$stub_initial" STUB_SECOND="$stub_second" \
     STUB_THIRD="$stub_third" STUB_FOURTH="$stub_fourth" STUB_FINAL="$stub_final" \
+    STUB_INITIAL_RC="${STUB_INITIAL_RC:-0}" \
     STUB_READINESS_RC="${STUB_READINESS_RC:-0}" STUB_GATE_RC="${STUB_GATE_RC:-0}" \
     STUB_ACCOUNTING_RC="${STUB_ACCOUNTING_RC:-0}" \
     STUB_THREADS_RC="${STUB_THREADS_RC:-0}" STUB_LOGIN="${STUB_LOGIN:-nathanjohnpayne}" \
@@ -217,7 +231,7 @@ assert_not_ready() {
 }
 
 reset_fixtures() {
-  unset STUB_INITIAL STUB_FINAL STUB_READINESS_RC STUB_GATE_RC
+  unset STUB_INITIAL STUB_FINAL STUB_INITIAL_RC STUB_READINESS_RC STUB_GATE_RC
   unset STUB_ACCOUNTING_RC STUB_THREADS_RC STUB_LOGIN STUB_LOGIN_RC
   unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR STUB_REQUIRED_CHECKS_RC
   unset STUB_INDEPENDENCE_RC STUB_SHARED_AUTHOR STUB_REQUIRES_EXTERNAL
@@ -227,6 +241,7 @@ reset_fixtures() {
   unset STUB_WORKFLOW_EVENT_BASE_REF STUB_WORKFLOW_EVENT_BASE_SHA STUB_TRUSTED_AUTHOR
   unset STUB_SUBJECT_TOKEN STUB_PROTECTIVE_TOKEN
   unset STUB_PROTECTIVE_DONE
+  unset TEST_AMBIENT_GH_TOKEN TEST_ACCOUNTING_GH_TOKEN
 }
 
 reset_fixtures
@@ -257,6 +272,80 @@ if [ "$missing_protective_pass_rc" -eq 3 ] \
   pass "normal continuation rejects a missing protective pass before live work"
 else
   fail "normal continuation ran without its prerequisite protective pass (rc=$missing_protective_pass_rc)"
+fi
+
+# #1094 / Codex round 4: approval continuation is the non-Dependabot lane.
+# Its scheduled and workflow-run callers enumerate every approved PR, so the
+# helper itself must preserve Dependabot's dedicated durable auto-merge request
+# even when a caller forgets to pre-filter the author class.
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_INITIAL="$DEPENDABOT_BASE"
+STUB_FINAL="$DEPENDABOT_BASE"
+if run_case \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'Dependabot PR is owned by the dedicated auto-merge lane' "$TMP/subject.out"; then
+  pass "protective-only continuation preserves Dependabot's dedicated durable arm"
+else
+  fail "protective-only continuation disabled or reclassified Dependabot auto-merge"
+fi
+
+reset_fixtures
+STUB_INITIAL="$DEPENDABOT_BASE"
+STUB_FINAL="$DEPENDABOT_BASE"
+if run_case \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/readiness.log" ] \
+   && grep -Fq 'Dependabot PR is owned by the dedicated auto-merge lane' "$TMP/subject.out"; then
+  pass "normal approval continuation defers Dependabot to its dedicated lane"
+else
+  fail "normal approval continuation interfered with Dependabot's dedicated lane"
+fi
+
+reset_fixtures
+STUB_INITIAL_RC=1
+STUB_SECOND="$DEPENDABOT_BASE"
+set +e
+run_case
+dependabot_failed_read_rc=$?
+set -e
+if [ "$dependabot_failed_read_rc" -eq 3 ] \
+   && [ "$(cat "$TMP/read-count")" -eq 2 ] \
+   && [ ! -s "$TMP/merge.log" ]; then
+  pass "failed initial read cannot make exit cleanup disable a later Dependabot snapshot"
+else
+  fail "exit cleanup disabled Dependabot after an initial read failure (rc=$dependabot_failed_read_rc)"
+fi
+
+reset_fixtures
+STUB_INITIAL='{}'
+STUB_SECOND="$DEPENDABOT_BASE"
+set +e
+run_case
+dependabot_malformed_read_rc=$?
+set -e
+if [ "$dependabot_malformed_read_rc" -eq 3 ] \
+   && [ "$(cat "$TMP/read-count")" -eq 2 ] \
+   && [ ! -s "$TMP/merge.log" ]; then
+  pass "malformed initial metadata cannot make exit cleanup disable Dependabot"
+else
+  fail "exit cleanup disabled Dependabot after malformed initial metadata (rc=$dependabot_malformed_read_rc)"
+fi
+
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_INITIAL=$(jq -c '
+  .author.login = "dependabot[bot]-lookalike" |
+  .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}
+' <<<"$BASE")
+STUB_SECOND="$STUB_INITIAL"
+STUB_THIRD=$(jq -c '.autoMergeRequest = null' <<<"$STUB_INITIAL")
+if run_case \
+   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
+  pass "Dependabot lookalike logins remain inside protective retraction"
+else
+  fail "Dependabot exemption matched more than the exact native bot login"
 fi
 
 reset_fixtures
@@ -1012,6 +1101,31 @@ if [ "$rc" -eq 3 ] && [ ! -s "$TMP/merge.log" ]; then
   pass "non-author token fails closed before merge"
 else
   fail "non-author token must fail closed (rc=$rc)"
+fi
+
+# #1101 (CodeRabbit on PR #1106): every caller of this script runs it under
+# GH_TOKEN=AUTHOR_MERGE_TOKEN, an external PAT this repo's workflow
+# `permissions:` blocks cannot grant Code Scanning alerts access to.
+# review-feedback-accounting.sh must run under the caller-supplied
+# ACCOUNTING_GH_TOKEN instead when one is set, so a workflow can route just
+# that read-only call through GITHUB_TOKEN (whose scope its `permissions:`
+# block DOES control) without touching the ambient author-attributed token
+# used for the merge itself.
+reset_fixtures
+TEST_AMBIENT_GH_TOKEN="author-merge-token"
+TEST_ACCOUNTING_GH_TOKEN="github-actions-token"
+if run_case && [ "$(cat "$TMP/accounting-token.log" 2>/dev/null)" = "github-actions-token" ]; then
+  pass "review-feedback-accounting.sh runs under ACCOUNTING_GH_TOKEN when the caller supplies one"
+else
+  fail "expected accounting to run under ACCOUNTING_GH_TOKEN (got: $(cat "$TMP/accounting-token.log" 2>/dev/null || echo '<missing>'))"
+fi
+
+reset_fixtures
+TEST_AMBIENT_GH_TOKEN="author-merge-token"
+if run_case && [ "$(cat "$TMP/accounting-token.log" 2>/dev/null)" = "author-merge-token" ]; then
+  pass "review-feedback-accounting.sh falls back to the ambient GH_TOKEN when ACCOUNTING_GH_TOKEN is unset"
+else
+  fail "expected accounting to fall back to the ambient GH_TOKEN (got: $(cat "$TMP/accounting-token.log" 2>/dev/null || echo '<missing>'))"
 fi
 
 echo "test_approval_merge_continuation: $PASS passed, $FAIL failed"

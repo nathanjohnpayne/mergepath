@@ -16,7 +16,8 @@ DISMISS_MODULE="$(mktemp "${TMPDIR:-/tmp}/dismiss-review-fail-closed.XXXXXX.cjs"
 PROTECTION_MODULE="$(mktemp "${TMPDIR:-/tmp}/durable-approval-protection.XXXXXX.cjs")"
 SNAPSHOT_MODULE="$(mktemp "${TMPDIR:-/tmp}/stable-review-snapshot.XXXXXX.cjs")"
 TRIAGE_POLICY_MODULE="$(mktemp "${TMPDIR:-/tmp}/triage-policy-materialization.XXXXXX.cjs")"
-trap 'rm -f "$BOOTSTRAP_MODULE" "$DISMISS_MODULE" "$PROTECTION_MODULE" "$SNAPSHOT_MODULE" "$TRIAGE_POLICY_MODULE"' EXIT
+APPROVAL_PHASE4_MODULE="$(mktemp "${TMPDIR:-/tmp}/approval-phase4-decision.XXXXXX.cjs")"
+trap 'rm -f "$BOOTSTRAP_MODULE" "$DISMISS_MODULE" "$PROTECTION_MODULE" "$SNAPSHOT_MODULE" "$TRIAGE_POLICY_MODULE" "$APPROVAL_PHASE4_MODULE"' EXIT
 awk '
   /BEGIN SELF-APPROVAL BOOTSTRAP/ { capture=1; next }
   /END SELF-APPROVAL BOOTSTRAP/   { capture=0 }
@@ -76,8 +77,29 @@ fi
 printf '\nmodule.exports = { readStableReviewSnapshot };\n' >> "$SNAPSHOT_MODULE"
 
 awk '
+  /BEGIN STABLE PR LABEL NAMES/ { capture=1; next }
+  /END STABLE PR LABEL NAMES/   { capture=0 }
+  capture { print }
+' "$DETECTOR" > "$APPROVAL_PHASE4_MODULE"
+awk '
+  /BEGIN APPROVAL PHASE 4 DECISION/ { capture=1; next }
+  /END APPROVAL PHASE 4 DECISION/   { capture=0 }
+  capture {
+    sub(/^            /, "")
+    print
+  }
+' "$WORKFLOW" >> "$APPROVAL_PHASE4_MODULE"
+if [ ! -s "$APPROVAL_PHASE4_MODULE" ]; then
+  echo "FAIL: could not extract the live approval Phase 4 decision from $WORKFLOW" >&2
+  exit 1
+fi
+printf '\nmodule.exports = { stablePrLabelNames, approvalEnforcementSnapshot, phase4RequiredForApprovalGuard };\n' >> "$APPROVAL_PHASE4_MODULE"
+
+awk '
   /BEGIN TRIAGE POLICY MATERIALIZATION DECISION/ { capture=1; next }
   /END TRIAGE POLICY MATERIALIZATION DECISION/   { capture=0 }
+  /BEGIN TRIAGE PHASE 4 DECISION/ { capture=1; next }
+  /END TRIAGE PHASE 4 DECISION/   { capture=0 }
   capture {
     sub(/^            /, "")
     print
@@ -87,10 +109,16 @@ if [ ! -s "$TRIAGE_POLICY_MODULE" ]; then
   echo "FAIL: could not extract the triage policy materialization decision from $WORKFLOW" >&2
   exit 1
 fi
-printf '\nmodule.exports = { shouldMaterializeDefaultPolicy };\n' >> "$TRIAGE_POLICY_MODULE"
+printf '\nmodule.exports = { shouldMaterializeDefaultPolicy, stablePrLabelNames, phase4IntrinsicRequiredForTriage, phase4RequiredForTriage, triageMayMutateLabels };\n' >> "$TRIAGE_POLICY_MODULE"
 
 TRIAGE_POLICY_PATH="$TRIAGE_POLICY_MODULE" node <<'NODE'
-const {shouldMaterializeDefaultPolicy} = require(process.env.TRIAGE_POLICY_PATH);
+const {
+  shouldMaterializeDefaultPolicy,
+  stablePrLabelNames,
+  phase4IntrinsicRequiredForTriage,
+  phase4RequiredForTriage,
+  triageMayMutateLabels,
+} = require(process.env.TRIAGE_POLICY_PATH);
 const base = {
   baseRef: 'main',
   baseSha: 'base-current',
@@ -113,6 +141,189 @@ for (const [name, input, expected] of cases) {
     throw new Error(`${name}: expected ${expected}, got ${actual}`);
   }
 }
+
+const phase4Cases = [
+  ['diff requires review', {
+    requiresReview: true,
+    laneVerifiedHead: false,
+    pr: {labels: []},
+  }, true],
+  ['plain under-threshold PR', {
+    requiresReview: false,
+    laneVerifiedHead: false,
+    pr: {labels: []},
+  }, false],
+  ['verified propagation lane', {
+    requiresReview: true,
+    laneVerifiedHead: true,
+    pr: {labels: []},
+  }, false],
+  ['human force-on label under threshold', {
+    requiresReview: false,
+    laneVerifiedHead: false,
+    pr: {labels: [{name: 'needs-external-review'}]},
+  }, true],
+  ['human force-on label outranks propagation exemption', {
+    requiresReview: false,
+    laneVerifiedHead: true,
+    pr: {labels: [{name: 'documentation'}, {name: 'needs-external-review'}]},
+  }, true],
+];
+for (const [name, input, expected] of phase4Cases) {
+  const actual = phase4RequiredForTriage(input);
+  if (actual !== expected) {
+    throw new Error(`${name}: expected ${expected}, got ${actual}`);
+  }
+}
+
+const intrinsicCases = [
+  ['threshold or path requires review', {
+    requiresReview: true,
+    laneVerifiedHead: false,
+  }, true],
+  ['plain under-threshold PR', {
+    requiresReview: false,
+    laneVerifiedHead: false,
+  }, false],
+  ['verified propagation lane', {
+    requiresReview: true,
+    laneVerifiedHead: true,
+  }, false],
+];
+for (const [name, input, expected] of intrinsicCases) {
+  const actual = phase4IntrinsicRequiredForTriage(input);
+  if (actual !== expected) {
+    throw new Error(`${name}: expected ${expected}, got ${actual}`);
+  }
+}
+
+const sorted = stablePrLabelNames({
+  labels: [{name: 'zeta'}, {name: 'needs-external-review'}, {name: 'alpha'}],
+});
+if (JSON.stringify(sorted) !== JSON.stringify(['alpha', 'needs-external-review', 'zeta'])) {
+  throw new Error(`stable label snapshot is not sorted: ${JSON.stringify(sorted)}`);
+}
+for (const malformed of [
+  {},
+  {labels: null},
+  {labels: {}},
+  {labels: [{name: ''}]},
+  {labels: [{}]},
+]) {
+  let threw = false;
+  try {
+    stablePrLabelNames(malformed);
+  } catch (_) {
+    threw = true;
+  }
+  if (!threw) {
+    throw new Error(`malformed live labels did not fail closed: ${JSON.stringify(malformed)}`);
+  }
+}
+
+const mutationCases = [
+  ['force-on label addition is classification-only', {
+    eventName: 'pull_request',
+    action: 'labeled',
+    labelName: 'needs-external-review',
+  }, false],
+  ['unrelated label addition remains outside classification-only mode', {
+    eventName: 'pull_request',
+    action: 'labeled',
+    labelName: 'documentation',
+  }, true],
+  ['blocking-label removal is classification-only', {
+    eventName: 'pull_request',
+    action: 'unlabeled',
+    labelName: 'human-hold',
+  }, false],
+  ['synchronize may refresh a required label', {
+    eventName: 'pull_request',
+    action: 'synchronize',
+    labelName: undefined,
+  }, true],
+  ['approved review may refresh a required label', {
+    eventName: 'pull_request_review',
+    action: 'submitted',
+    labelName: undefined,
+  }, true],
+];
+for (const [name, input, expected] of mutationCases) {
+  const actual = triageMayMutateLabels(input);
+  if (actual !== expected) {
+    throw new Error(`${name}: expected ${expected}, got ${actual}`);
+  }
+}
+NODE
+
+APPROVAL_PHASE4_PATH="$APPROVAL_PHASE4_MODULE" DETECTOR_PATH="$DETECTOR" node <<'NODE'
+const {
+  stablePrLabelNames,
+  approvalEnforcementSnapshot,
+  phase4RequiredForApprovalGuard,
+} = require(process.env.APPROVAL_PHASE4_PATH);
+const {decide} = require(process.env.DETECTOR_PATH);
+
+const unlabeled = {
+  head: {sha: 'head'},
+  base: {ref: 'main', sha: 'base'},
+  user: {login: 'nathanjohnpayne'},
+  body: 'Authoring-Agent: codex',
+  labels: [],
+};
+const labeled = {
+  ...unlabeled,
+  labels: [{name: 'documentation'}, {name: 'needs-external-review'}],
+};
+const policySnapshot = pr => JSON.stringify({
+  head: pr.head.sha,
+  baseRef: pr.base.ref,
+  baseSha: pr.base.sha,
+});
+
+if (phase4RequiredForApprovalGuard('false', unlabeled)) {
+  throw new Error('plain under-threshold live PR became Phase 4');
+}
+if (!phase4RequiredForApprovalGuard('true', unlabeled)) {
+  throw new Error('triage-required Phase 4 was lost');
+}
+if (!phase4RequiredForApprovalGuard('false', labeled)) {
+  throw new Error('live force-on label did not override stale Phase 3 triage');
+}
+if (
+  approvalEnforcementSnapshot(unlabeled, policySnapshot) ===
+  approvalEnforcementSnapshot(labeled, policySnapshot)
+) {
+  throw new Error('approval snapshot omitted live label state');
+}
+if (JSON.stringify(stablePrLabelNames(labeled)) !==
+    JSON.stringify(['documentation', 'needs-external-review'])) {
+  throw new Error('approval label snapshot is not stable and sorted');
+}
+
+const decision = decide({
+  prAuthor: 'nathanjohnpayne',
+  authorIdentity: 'nathanjohnpayne',
+  prBody: labeled.body,
+  reviewer: 'nathanpayne-codex',
+  reviewerAccounts: ['nathanpayne-codex', 'nathanpayne-cursor'],
+  requiresExternalReview: phase4RequiredForApprovalGuard('false', labeled),
+});
+if (decision.action !== 'block' || decision.reason !== 'same-agent-phase-4-approval') {
+  throw new Error(`force-on labeled event did not invalidate the standing same-agent approval: ${JSON.stringify(decision)}`);
+}
+
+for (const malformed of [{}, {labels: null}, {labels: [{}]}]) {
+  let threw = false;
+  try {
+    phase4RequiredForApprovalGuard('false', malformed);
+  } catch (_) {
+    threw = true;
+  }
+  if (!threw) {
+    throw new Error(`malformed live approval labels did not fail closed: ${JSON.stringify(malformed)}`);
+  }
+}
 NODE
 
 DETECTOR_PATH="$DETECTOR" BOOTSTRAP_PATH="$BOOTSTRAP_MODULE" node <<'NODE'
@@ -126,6 +337,11 @@ const implementations = [
   ['canonical', canonical],
   ['bootstrap', bootstrapDetector()],
 ];
+for (const [implementationName, implementation] of implementations) {
+  if (!detectorSupportsDurableFallback(implementation)) {
+    throw new Error(`${implementationName}: complete detector capability was rejected`);
+  }
+}
 
 const reviewerAccounts = [
   'nathanpayne-claude',
@@ -180,10 +396,8 @@ for (const body of [
 for (const [implementationName, { decide }] of implementations) {
   for (const [name, input, expectedAction, expectedReason, expectedDetail] of cases) {
     const actual = decide(input);
-    const expectedPersistentViolation = [
-      'same-native-account-approval',
-      'same-agent-phase-4-approval',
-    ].includes(expectedReason);
+    const expectedPersistentViolation =
+      expectedReason === 'same-native-account-approval';
     if (
       actual.action !== expectedAction ||
       actual.reason !== expectedReason ||
@@ -339,10 +553,10 @@ for (const [implementationName, implementation] of implementations) {
   });
   if (
     !violatingRun.eligibleApproval ||
-    !violatingRun.persistentDirectViolation ||
+    violatingRun.persistentDirectViolation ||
     violatingRun.directBlockedDiagnostics.length !== 1
   ) {
-    throw new Error(`${implementationName}: direct same-agent violation lost red-run/persistent attribution: ${JSON.stringify(violatingRun)}`);
+    throw new Error(`${implementationName}: mutable same-agent violation did not remain dismiss-only: ${JSON.stringify(violatingRun)}`);
   }
 
   const nativeAccountApproval = {
@@ -411,10 +625,10 @@ for (const [implementationName, implementation] of implementations) {
   if (
     emptyBlockingApi.length !== 1 ||
     emptyBlockingPlan.eligibleApproval ||
-    !emptyBlockingPlan.persistentDirectViolation ||
+    emptyBlockingPlan.persistentDirectViolation ||
     emptyBlockingPlan.directBlockedDiagnostics.length !== 1
   ) {
-    throw new Error(`${implementationName}: an empty lagging reviews API lost the durable webhook's blocking attribution: ${JSON.stringify({emptyBlockingApi, emptyBlockingPlan})}`);
+    throw new Error(`${implementationName}: an empty lagging reviews API lost the durable webhook's dismiss-only block: ${JSON.stringify({emptyBlockingApi, emptyBlockingPlan})}`);
   }
 
   const stalePrepared = prepareDirectApproval({
@@ -483,6 +697,7 @@ if (staleHead.eligibleApproval || staleHead.approvals.length !== 0) {
 
 const canonicalSentinel = {
   name: 'canonical',
+  stablePrLabelNames() {},
   decide() {},
   latestApprovedReviews() {},
   reviewsWithDirectFallback() {},
@@ -512,10 +727,11 @@ const oldCanonical = {
   decide() {},
   latestApprovedReviews() {},
   reviewsWithDirectFallback() {},
+  prepareDirectApproval() {},
   planApprovalEnforcement() {},
 };
 if (detectorSupportsDurableFallback(oldCanonical)) {
-  throw new Error('a pre-durable-fallback canonical detector was accepted');
+  throw new Error('a canonical detector without stable label normalization was accepted');
 }
 const capabilitySkew = selectDetector({
   modulePresent: true,
@@ -580,11 +796,16 @@ NODE
 DISMISS_PATH="$DISMISS_MODULE" \
   PROTECTION_PATH="$PROTECTION_MODULE" \
   SNAPSHOT_PATH="$SNAPSHOT_MODULE" \
+  APPROVAL_PHASE4_PATH="$APPROVAL_PHASE4_MODULE" \
   DETECTOR_PATH="$DETECTOR" \
   node <<'NODE'
 const {dismissReviewFailClosed} = require(process.env.DISMISS_PATH);
 const {protectDurableApproval} = require(process.env.PROTECTION_PATH);
 const {readStableReviewSnapshot} = require(process.env.SNAPSHOT_PATH);
+const {
+  approvalEnforcementSnapshot,
+  phase4RequiredForApprovalGuard,
+} = require(process.env.APPROVAL_PHASE4_PATH);
 const {prepareDirectApproval} = require(process.env.DETECTOR_PATH);
 
 async function expectOriginalWriteError(name, read) {
@@ -666,6 +887,7 @@ async function main() {
     base: {ref: 'main', sha: 'base-head'},
     user: {login: 'nathanjohnpayne'},
     body: 'Authoring-Agent: cursor',
+    labels: [],
   };
   const editedPr = {
     ...initialPr,
@@ -677,11 +899,8 @@ async function main() {
     baseRef: pr.base.ref,
     baseSha: pr.base.sha,
   });
-  const enforcementSnapshot = pr => JSON.stringify({
-    policy: policySnapshot(pr),
-    author: pr.user.login,
-    body: pr.body,
-  });
+  const enforcementSnapshot = pr =>
+    approvalEnforcementSnapshot(pr, policySnapshot);
   let listCalls = 0;
   let readCalls = 0;
   let retryNotices = 0;
@@ -738,6 +957,52 @@ async function main() {
   }
   if (!headDriftRejected) {
     throw new Error('head drift after triage did not fail closed');
+  }
+
+  const forceOnPr = {
+    ...initialPr,
+    labels: [{name: 'needs-external-review'}],
+  };
+  let forceOnReads = 0;
+  const forceOnStable = await readStableReviewSnapshot({
+    pr: initialPr,
+    triageSnapshot: policySnapshot(initialPr),
+    policySnapshot,
+    enforcementSnapshot,
+    listReviews: async () => [],
+    readPr: async () => {
+      forceOnReads += 1;
+      return forceOnPr;
+    },
+    notice: () => {},
+  });
+  if (
+    forceOnStable.attempts !== 2 ||
+    forceOnReads !== 2 ||
+    !phase4RequiredForApprovalGuard('false', forceOnStable.pr)
+  ) {
+    throw new Error('force-on label overlap was not retried and applied to live requiredness');
+  }
+
+  let removalReads = 0;
+  const removalStable = await readStableReviewSnapshot({
+    pr: forceOnPr,
+    triageSnapshot: policySnapshot(forceOnPr),
+    policySnapshot,
+    enforcementSnapshot,
+    listReviews: async () => [],
+    readPr: async () => {
+      removalReads += 1;
+      return initialPr;
+    },
+    notice: () => {},
+  });
+  if (
+    removalStable.attempts !== 2 ||
+    removalReads !== 2 ||
+    phase4RequiredForApprovalGuard('false', removalStable.pr)
+  ) {
+    throw new Error('force-on label removal was not retried and cleared from live requiredness');
   }
 }
 

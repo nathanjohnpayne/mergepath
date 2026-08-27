@@ -60,6 +60,17 @@ mkdir -p "$FIXTURES"
 #   reply → classify as addressed-via-reply, skip.
 # Thread C: chatgpt-codex-connector P3 with a `[mergepath-resolve:
 #   nitpick-noted]` reply → tagged, route to polish.
+# (Threads D/E and Thread F below extend this fixture; see their own
+# inline comments for what each locks in.)
+# Thread F: github-advanced-security[bot] (GHAS/CodeQL) finding, no fix,
+#   no reply, unclassifiable severity (no Codex/CodeRabbit badge) →
+#   Unknown severity, routed substantive per severity_to_track's
+#   err-on-surface default. Locks in #1101: before it, this thread's
+#   original_author would have failed the bot-login allowlist entirely
+#   and never reached classification at all. Uses the UN-suffixed GraphQL
+#   login form ("github-advanced-security", not "...[bot]") deliberately
+#   (Codex on PR #1106): this query is GraphQL, and the allowlist's
+#   suffixed-only entry never matched it.
 
 cat >"$FIXTURES/prs.json" <<'JSON'
 [
@@ -200,6 +211,26 @@ cat >"$FIXTURES/threads.json" <<'JSON'
                     "createdAt": "2026-05-15T05:00:00Z",
                     "originalCommit": { "oid": "commit_early_xxxxxxxxxxxxxxxxxxx" },
                     "url": "https://github.com/owner/repo/pull/999#discussion_r7"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRT_thread_f",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "scripts/f.sh",
+              "line": 60,
+              "originalLine": 60,
+              "comments": {
+                "nodes": [
+                  {
+                    "databaseId": 8,
+                    "author": { "login": "github-advanced-security" },
+                    "body": "## CodeQL / Inefficient regular expression\n\nThis part of the regular expression may cause exponential backtracking.\n\n[Show more details](https://github.com/owner/repo/security/code-scanning/1)",
+                    "createdAt": "2026-05-15T08:40:00Z",
+                    "originalCommit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx" },
+                    "url": "https://github.com/owner/repo/pull/999#discussion_r8"
                   }
                 ]
               }
@@ -358,13 +389,32 @@ fi
 # polish; B reply-skipped, D stale-skipped, E fix-skipped). With the
 # #304 dedupe pass active and prior rollups in the gh shim containing
 # Thread A's mp-id as `[x]` and Thread C's mp-id on a line with `#888`,
-# BOTH should now be dedupe-skipped — so the expected line count is 0.
+# BOTH should now be dedupe-skipped. Thread F (#1101) is a
+# github-advanced-security[bot] finding with no prior-rollup mp-id, no
+# agent reply, and no post-comment agent fix-commit, so nothing filters
+# it — it is the one surviving line, proving the bot-author allowlist
+# now recognizes GHAS instead of silently excluding it pre-classification.
 LINES=$(wc -l < "$OUT_FILE" | tr -d ' ')
-if [ "$LINES" -ne 0 ]; then
-  echo "FAIL: expected 0 NDJSON lines after #304 dedupe pass (A + C both triaged on prior rollups), got $LINES" >&2
+if [ "$LINES" -ne 1 ]; then
+  echo "FAIL: expected 1 NDJSON line (Thread F, GHAS, unfiltered) after #304 dedupe pass, got $LINES" >&2
   cat "$OUT_FILE" >&2
   echo "  stderr:" >&2
   sed 's/^/    /' "$ERR_FILE" >&2
+  exit 1
+fi
+
+# Thread F (#1101) must SURVIVE — github-advanced-security (the un-suffixed
+# GraphQL login form) is now a recognized original-author login, and this
+# thread trips none of the other filters (fresh mp-id, no reply, no
+# post-comment fix-commit).
+if ! grep -q '"thread_id":"PRT_thread_f"' "$OUT_FILE"; then
+  echo "FAIL: thread F (github-advanced-security) should surface in the rollup, not be silently excluded (#1101)" >&2
+  cat "$OUT_FILE" >&2
+  exit 1
+fi
+if ! grep -q '"author":"github-advanced-security"' "$OUT_FILE"; then
+  echo "FAIL: thread F's rollup item should record its GHAS author login (un-suffixed GraphQL form)" >&2
+  cat "$OUT_FILE" >&2
   exit 1
 fi
 
@@ -429,5 +479,5 @@ if ! grep -qE 'dedupe: [0-9]+ prior-triaged mp-id' "$ERR_FILE"; then
   exit 1
 fi
 
-echo "check_daily_feedback_rollup: PASS (unit tests + 5-case --dry-run smoke + #304 dedupe)"
+echo "check_daily_feedback_rollup: PASS (unit tests + 6-case --dry-run smoke + #304 dedupe)"
 exit 0

@@ -36,8 +36,9 @@ permissions:
 # therefore let B's replacement run miss A entirely. A's durable run keeps its
 # own payload fallback and will classify/dismiss it. GitHub also evicts an
 # older PENDING member of a shared group even when cancel-in-progress is false,
-# so events that skip the guard use a run-unique group; COMMENTED reviews and
-# triage's own labeled events can neither cancel nor replace enforcement.
+# so events that skip the guard use a run-unique group. COMMENTED reviews and
+# unrelated label events can neither cancel nor replace enforcement; only the
+# needs-external-review force-on label joins mutable approval enforcement.
 concurrency:
   group: >-
     agent-review-${{ github.event.pull_request.number }}-${{
@@ -48,6 +49,8 @@ concurrency:
          (github.event.action == 'synchronize' ||
           github.event.action == 'reopened' ||
           github.event.action == 'edited' ||
+          (github.event.action == 'labeled' &&
+           github.event.label.name == 'needs-external-review') ||
           (github.event.action == 'unlabeled' &&
            contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))) &&
         'approval-enforcement') || github.run_id }}
@@ -56,6 +59,8 @@ concurrency:
         (github.event.action == 'synchronize' ||
          github.event.action == 'reopened' ||
          github.event.action == 'edited' ||
+         (github.event.action == 'labeled' &&
+          github.event.label.name == 'needs-external-review') ||
          (github.event.action == 'unlabeled' &&
           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))) }}
 
@@ -71,16 +76,12 @@ jobs:
     # must have its policy
     # re-parsed here BEFORE approval readiness evaluates, so the
     # threshold/paths feeding triage reflect the changed diff rather than
-    # a stale snapshot. Explicitly excludes `labeled`: the `assign` job
-    # allows `labeled` as a trigger, and it depends on this job's
-    # outputs — letting load-config run on labeled would cause
-    # assign to re-fire on every label edit and re-request
-    # reviewers who have already reviewed. Downstream jobs keep
-    # their own action-specific guards; triage intentionally runs on
-    # synchronize/reopened for the approval-readiness path while assign
-    # stays scoped to opened/ready/labeled. See #59 for the
-    # SKIPPED-as-SUCCESS miss this
-    # closes and Codex's P2 on PR #131 for why labeled is excluded.
+    # a stale snapshot. Ordinary `labeled` events remain excluded so reviewer
+    # assignment cannot re-fire on every label edit. The single force-on label
+    # is admitted for invalidation only; `assign` has its own narrower guard
+    # and remains scoped to opened/ready. See #59 for the SKIPPED-as-SUCCESS
+    # miss this closes and Codex's P2 on PR #131 for why generic labeled
+    # events are excluded.
     # #557: ALSO run on approved pull_request_review events. The
     # legacy-named auto-merge-on-approval registered-reviewer gate
     # reads needs.load-config.outputs.reviewers on the direct-approval
@@ -96,6 +97,8 @@ jobs:
         github.event.action == 'synchronize' ||
         github.event.action == 'reopened' ||
         github.event.action == 'edited' ||
+        (github.event.action == 'labeled' &&
+         github.event.label.name == 'needs-external-review') ||
         github.event.action == 'unlabeled')) ||
       (github.event_name == 'pull_request_review' &&
        github.event.review.state == 'approved')
@@ -132,7 +135,7 @@ jobs:
           # the fleet today — makes no API call at all, so an unset secret is
           # harmless there and fails closed (empty reviewer allow-list)
           # everywhere else. Mirrors the triage job's resolver invocation.
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           REPO: ${{ github.repository }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -221,10 +224,11 @@ jobs:
     # path so block-self-approval consumes one authoritative Phase 4 result
     # rather than a second threshold/path implementation. Blocking-label
     # `edited` re-evaluates the mutable body/base inputs before a carried
-    # approval can survive them. Blocking-label `unlabeled` events run it in
-    # classification-only mode: the independence
-    # guard needs current Phase 4 scope, but triage must not re-add the label
-    # that the settle event says was just removed (#620/#1094).
+    # approval can survive them. The force-on `labeled` event and blocking-label
+    # `unlabeled` events run in classification-only mode: the independence
+    # guard needs current Phase 4 scope, while triage must neither re-add the
+    # label already added nor undo the settle event that just removed it
+    # (#620/#1094).
     if: >
       github.event.pull_request.user.login != 'dependabot[bot]' &&
       ((github.event_name == 'pull_request' &&
@@ -233,6 +237,8 @@ jobs:
          github.event.action == 'synchronize' ||
          github.event.action == 'reopened' ||
          github.event.action == 'edited' ||
+         (github.event.action == 'labeled' &&
+          github.event.label.name == 'needs-external-review') ||
          (github.event.action == 'unlabeled' &&
           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))) ||
        (github.event_name == 'pull_request_review' &&
@@ -241,6 +247,7 @@ jobs:
     outputs:
       needs_external: ${{ steps.check.outputs.needs_external }}
       phase_4_required: ${{ steps.check.outputs.phase_4_required }}
+      phase_4_intrinsic_required: ${{ steps.check.outputs.phase_4_intrinsic_required }}
       classified_head: ${{ steps.check.outputs.classified_head }}
       classified_base_ref: ${{ steps.check.outputs.classified_base_ref }}
       classified_base_sha: ${{ steps.check.outputs.classified_base_sha }}
@@ -261,9 +268,9 @@ jobs:
         env:
           THRESHOLD: ${{ needs.load-config.outputs.threshold }}
           PROTECTED_PATHS: ${{ needs.load-config.outputs.paths }}
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
         with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const childProcess = require('child_process');
             const fs = require('fs');
@@ -299,6 +306,52 @@ jobs:
                 (!checkoutSha || checkoutSha !== baseSha);
             }
             // END TRIAGE POLICY MATERIALIZATION DECISION
+
+            // BEGIN TRIAGE PHASE 4 DECISION
+            // BEGIN STABLE PR LABEL NAMES BOOTSTRAP
+            // Generated from scripts/self-approval-detector.cjs. Do not edit.
+            function stablePrLabelNames(candidate) {
+              const labels = candidate && candidate.labels;
+              if (
+                !Array.isArray(labels) ||
+                labels.some(label =>
+                  !label || typeof label.name !== 'string' || !label.name.trim()
+                )
+              ) {
+                throw new Error('live PR labels are unavailable or malformed');
+              }
+              return labels.map(label => label.name).sort();
+            }
+            // END STABLE PR LABEL NAMES BOOTSTRAP
+
+            function phase4RequiredForTriage({
+              requiresReview,
+              laneVerifiedHead,
+              pr,
+            }) {
+              const forceOn = stablePrLabelNames(pr)
+                .includes('needs-external-review');
+              return forceOn || phase4IntrinsicRequiredForTriage({
+                requiresReview,
+                laneVerifiedHead,
+              });
+            }
+
+            function phase4IntrinsicRequiredForTriage({
+              requiresReview,
+              laneVerifiedHead,
+            }) {
+              return Boolean(requiresReview) && !laneVerifiedHead;
+            }
+
+            function triageMayMutateLabels({eventName, action, labelName}) {
+              if (eventName !== 'pull_request') return true;
+              return action !== 'unlabeled' && !(
+                action === 'labeled' &&
+                labelName === 'needs-external-review'
+              );
+            }
+            // END TRIAGE PHASE 4 DECISION
 
             function loadGoverningIdentities(pr, policyConfigPath) {
               const outputPath = path.join(
@@ -357,6 +410,7 @@ jobs:
               head: candidate && candidate.head && candidate.head.sha,
               baseRef: candidate && candidate.base && candidate.base.ref,
               baseSha: candidate && candidate.base && candidate.base.sha,
+              labels: stablePrLabelNames(candidate),
             });
             const {data: pr} = await github.rest.pulls.get({
               owner: context.repo.owner,
@@ -371,10 +425,20 @@ jobs:
                 'direct-event violation attribution for the stale webhook.',
               );
             }
-            const mayMutateLabels = !(
+            const eventLabelName = context.payload.label &&
+              context.payload.label.name;
+            const isForceOnLabelEvent =
               context.eventName === 'pull_request' &&
-              context.payload.action === 'unlabeled'
-            );
+              context.payload.action === 'labeled' &&
+              eventLabelName === 'needs-external-review';
+            const isUnlabeledSettleEvent =
+              context.eventName === 'pull_request' &&
+              context.payload.action === 'unlabeled';
+            const mayMutateLabels = triageMayMutateLabels({
+              eventName: context.eventName,
+              action: context.payload.action,
+              labelName: eventLabelName,
+            });
             const threshold = parseInt(process.env.THRESHOLD, 10);
             const protectedPaths = JSON.parse(process.env.PROTECTED_PATHS);
 
@@ -620,12 +684,24 @@ jobs:
               }
             }
 
-            // Phase 4 applicability is the pre-clearance policy result. A
-            // carry-forward below can clear already-reviewed bytes, but does
-            // not turn the PR into Phase 3. Only the exact-head, byte-verified
-            // propagation lane has the policy's under-threshold-equivalent
-            // standing. Preserve this literal output for the #1094 guard.
-            const phase4Required = needsExternal && !laneVerifiedHead;
+            // Export intrinsic threshold/path requiredness separately from
+            // the then-live force-on result. A carry-forward below can clear
+            // already-reviewed bytes, but does not turn the PR into Phase 3.
+            // Only the exact-head, byte-verified propagation lane has the
+            // policy's under-threshold-equivalent standing. The approval
+            // guard recombines the intrinsic output with its own stabilized
+            // live labels so overlapping add/remove events cannot latch this
+            // snapshot's mutable force-on state (#1094).
+            const phase4IntrinsicRequired =
+              phase4IntrinsicRequiredForTriage({
+                requiresReview: needsExternal,
+                laneVerifiedHead,
+              });
+            const phase4Required = phase4RequiredForTriage({
+              requiresReview: needsExternal,
+              laneVerifiedHead,
+              pr,
+            });
 
             if (needsExternal && laneVerifiedHead) {
               console.log(
@@ -677,14 +753,19 @@ jobs:
                 });
               } else if (!mayMutateLabels && needsExternal) {
                 console.log(
-                  'Computed Phase 4 applicability for an unlabeled settle ' +
-                  'event without re-adding needs-external-review (#620/#1094).'
+                  `Computed Phase 4 applicability for the ` +
+                  `${isForceOnLabelEvent ? 'force-on labeled' : 'unlabeled settle'} ` +
+                  `event without mutating needs-external-review (#620/#1094).`
                 );
               }
             }
 
             core.setOutput('needs_external', needsExternal.toString());
             core.setOutput('phase_4_required', phase4Required.toString());
+            core.setOutput(
+              'phase_4_intrinsic_required',
+              phase4IntrinsicRequired.toString(),
+            );
             core.setOutput('classified_head', pr.head.sha);
             core.setOutput('classified_base_ref', pr.base.ref);
             core.setOutput('classified_base_sha', pr.base.sha);
@@ -713,7 +794,7 @@ jobs:
       always() &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.user.login != 'dependabot[bot]' &&
-      (github.event.action == 'opened' || github.event.action == 'ready_for_review' || github.event.action == 'labeled')
+      (github.event.action == 'opened' || github.event.action == 'ready_for_review')
     runs-on: ubuntu-latest
     steps:
       - name: Assign reviewer identity based on Authoring-Agent
@@ -722,7 +803,7 @@ jobs:
           AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}
           REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
         with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const pr = context.payload.pull_request;
             const author = pr.user.login;
@@ -811,7 +892,7 @@ jobs:
       - name: Check for conflicting reviews
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const fs = require('fs');
             const path = require('path');
@@ -914,6 +995,8 @@ jobs:
         (github.event.action == 'synchronize' ||
          github.event.action == 'reopened' ||
          github.event.action == 'edited' ||
+         (github.event.action == 'labeled' &&
+          github.event.label.name == 'needs-external-review') ||
          (github.event.action == 'unlabeled' &&
           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))))
     runs-on: ubuntu-latest
@@ -938,13 +1021,13 @@ jobs:
           AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}
           REVIEWERS_JSON: ${{ needs.triage.outputs.reviewers }}
           EVENT_REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
-          PHASE_4_REQUIRED: ${{ needs.triage.outputs.phase_4_required }}
+          PHASE_4_INTRINSIC_REQUIRED: ${{ needs.triage.outputs.phase_4_intrinsic_required }}
           TRIAGE_HEAD: ${{ needs.triage.outputs.classified_head }}
           TRIAGE_BASE_REF: ${{ needs.triage.outputs.classified_base_ref }}
           TRIAGE_BASE_SHA: ${{ needs.triage.outputs.classified_base_sha }}
           TRIAGE_RESULT: ${{ needs.triage.result }}
         with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const fs = require('fs');
             const path = require('path');
@@ -955,6 +1038,21 @@ jobs:
               function normalized(value) {
                 return typeof value === 'string' ? value.trim().toLowerCase() : '';
               }
+
+              // BEGIN STABLE PR LABEL NAMES
+              function stablePrLabelNames(candidate) {
+                const labels = candidate && candidate.labels;
+                if (
+                  !Array.isArray(labels) ||
+                  labels.some(label =>
+                    !label || typeof label.name !== 'string' || !label.name.trim()
+                  )
+                ) {
+                  throw new Error('live PR labels are unavailable or malformed');
+                }
+                return labels.map(label => label.name).sort();
+              }
+              // END STABLE PR LABEL NAMES
 
               function decide(input) {
                 const prAuthor = normalized(input && input.prAuthor);
@@ -1050,7 +1148,9 @@ jobs:
                     return {
                       action: 'block',
                       reason: 'same-agent-phase-4-approval',
-                      persistentViolation: true,
+                      // The declaration is mutable and GitHub exposes no conditional label
+                      // write bound to the body snapshot. Dismiss the approval, but reserve
+                      // the human-only persistent label for immutable native-author proof.
                       authoringAgent,
                       authoringReviewer,
                     };
@@ -1195,13 +1295,14 @@ jobs:
                   blockedDiagnostics,
                 };
               }
-              return {decide, latestApprovedReviews, reviewsWithDirectFallback, prepareDirectApproval, planApprovalEnforcement};
+              return {stablePrLabelNames, decide, latestApprovedReviews, reviewsWithDirectFallback, prepareDirectApproval, planApprovalEnforcement};
             }
             // END SELF-APPROVAL BOOTSTRAP
 
             // BEGIN SELF-APPROVAL RESOLVER
             function detectorSupportsDurableFallback(detector) {
               return detector &&
+                typeof detector.stablePrLabelNames === 'function' &&
                 typeof detector.decide === 'function' &&
                 typeof detector.latestApprovedReviews === 'function' &&
                 typeof detector.reviewsWithDirectFallback === 'function' &&
@@ -1254,6 +1355,7 @@ jobs:
               notice: message => core.notice(message),
             });
             const {
+              stablePrLabelNames,
               decide,
               latestApprovedReviews,
               reviewsWithDirectFallback,
@@ -1261,6 +1363,7 @@ jobs:
               planApprovalEnforcement,
             } = detector;
             if (
+              typeof stablePrLabelNames !== 'function' ||
               typeof decide !== 'function' ||
               typeof latestApprovedReviews !== 'function' ||
               typeof reviewsWithDirectFallback !== 'function' ||
@@ -1361,6 +1464,32 @@ jobs:
             }
             // END STABLE REVIEW SNAPSHOT
 
+            // BEGIN APPROVAL PHASE 4 DECISION
+            function approvalEnforcementSnapshot(candidate, policySnapshotFn) {
+              return JSON.stringify({
+                policy: policySnapshotFn(candidate),
+                author: candidate && candidate.user && candidate.user.login,
+                body: (candidate && candidate.body) || '',
+                labels: stablePrLabelNames(candidate),
+              });
+            }
+
+            function phase4RequiredForApprovalGuard(
+              phase4IntrinsicRaw,
+              candidate,
+            ) {
+              if (
+                phase4IntrinsicRaw !== 'true' &&
+                phase4IntrinsicRaw !== 'false'
+              ) {
+                throw new Error('Phase 4 applicability is unavailable');
+              }
+              return phase4IntrinsicRaw === 'true' ||
+                stablePrLabelNames(candidate)
+                  .includes('needs-external-review');
+            }
+            // END APPROVAL PHASE 4 DECISION
+
             async function protectCurrentDirectReview(reason) {
               const directReview =
                 context.eventName === 'pull_request_review' &&
@@ -1431,11 +1560,8 @@ jobs:
               baseRef: candidate && candidate.base && candidate.base.ref,
               baseSha: candidate && candidate.base && candidate.base.sha,
             });
-            const enforcementSnapshot = candidate => JSON.stringify({
-              policy: policySnapshot(candidate),
-              author: candidate && candidate.user && candidate.user.login,
-              body: (candidate && candidate.body) || '',
-            });
+            const enforcementSnapshot = candidate =>
+              approvalEnforcementSnapshot(candidate, policySnapshot);
             const triageSnapshot = JSON.stringify({
               head: process.env.TRIAGE_HEAD || '',
               baseRef: process.env.TRIAGE_BASE_REF || '',
@@ -1496,15 +1622,18 @@ jobs:
               return;
             }
 
-            const phase4Raw = process.env.PHASE_4_REQUIRED;
-            if (phase4Raw !== 'true' && phase4Raw !== 'false') {
+            const phase4IntrinsicRaw =
+              process.env.PHASE_4_INTRINSIC_REQUIRED;
+            if (
+              phase4IntrinsicRaw !== 'true' &&
+              phase4IntrinsicRaw !== 'false'
+            ) {
               await failClosedBeforeClassification(
                 'Phase 4 applicability is unavailable',
                 'Phase 4 applicability is unavailable; refusing to consume approvals.',
               );
               return;
             }
-            const requiresExternalReview = phase4Raw === 'true';
             const isDirectApproval =
               context.eventName === 'pull_request_review' &&
               context.payload.review &&
@@ -1537,7 +1666,7 @@ jobs:
                   return response.data;
                 },
                 notice: attempt => core.notice(
-                  `The PR body or author changed during review read attempt ` +
+                  `The PR body, author, or labels changed during review read attempt ` +
                   `${attempt}; retrying the durable approval fallback against ` +
                   `one stable live snapshot.`,
                 ),
@@ -1553,15 +1682,39 @@ jobs:
             pr = stableReviewSnapshot.pr;
             const liveReviews = stableReviewSnapshot.reviews;
             const prAuthor = pr.user.login;
+            let requiresExternalReview;
+            try {
+              requiresExternalReview = phase4RequiredForApprovalGuard(
+                phase4IntrinsicRaw,
+                pr,
+              );
+            } catch (error) {
+              await failClosedBeforeClassification(
+                `live Phase 4 applicability is unavailable: ${error.message}`,
+                `Could not classify live Phase 4 applicability ` +
+                `(${error.message}); refusing to consume approvals.`,
+              );
+              return;
+            }
             core.setOutput('snapshot_current', eventPolicyCurrent.toString());
             const directReview = isDirectApproval
               ? context.payload.review
               : null;
+            let eventEnforcementCurrent = false;
+            try {
+              eventEnforcementCurrent =
+                enforcementSnapshot(eventPr) === enforcementSnapshot(pr);
+            } catch (error) {
+              core.notice(
+                `The event enforcement snapshot is unavailable ` +
+                `(${error.message}); direct-event violation attribution is ` +
+                `disabled for this webhook.`,
+              );
+            }
             const preparedApproval = prepareDirectApproval({
               liveReviews,
               directReview,
-              eventEnforcementCurrent:
-                enforcementSnapshot(eventPr) === enforcementSnapshot(pr),
+              eventEnforcementCurrent,
               liveHeadSha: pr.head.sha,
             });
             const enforcement = planApprovalEnforcement({
@@ -1764,6 +1917,19 @@ jobs:
   # reports stable unarmed readiness. #1058 owns the future merge-group boundary.
   auto-merge-on-approval:
     needs: [load-config, detect-disagreement, block-self-approval, triage]
+    # Job-level override (replaces rather than merges with the workflow
+    # default above): adds security-events: read, required for
+    # scripts/workflow/approval-merge-continuation.sh's
+    # review-feedback-accounting.sh call, which reads code-scanning/alerts
+    # to grade a github-advanced-security[bot] finding's severity (#1101).
+    # That call runs under ACCOUNTING_GH_TOKEN (this job's GITHUB_TOKEN,
+    # not the AUTHOR_MERGE_TOKEN this job otherwise uses) specifically so
+    # this permissions block can reach it — CodeRabbit on PR #1106.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      security-events: read
     if: >
       always() &&
       ((github.event_name == 'pull_request_review' &&
@@ -1812,7 +1978,7 @@ jobs:
           github.event_name == 'pull_request' ||
           github.event_name == 'pull_request_review'
         env:
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           REPO: ${{ github.repository }}
@@ -1850,7 +2016,7 @@ jobs:
           fi
           # --- synchronize / reopened readiness path (existing API check) ---
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::REVIEWER_ASSIGNMENT_TOKEN is not configured; cannot confirm an existing approval for the synchronize readiness retry."
+            echo "::notice::Neither CI_ACTOR_TOKEN nor REVIEWER_ASSIGNMENT_TOKEN is configured; cannot confirm an existing approval for the synchronize readiness retry."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -3025,3 +3191,8 @@ jobs:
           REPO: ${{ github.repository }}
           AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           WORKFLOW_TOKEN: ${{ github.token }}
+          # Routes ONLY the review-feedback-accounting.sh call inside
+          # approval-merge-continuation.sh through GITHUB_TOKEN instead of the
+          # author token used by normal continuation (#1101, CodeRabbit on PR
+          # #1106). See this job's permissions block for why.
+          ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

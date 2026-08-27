@@ -458,7 +458,13 @@ NO_TAG_REPLY=false
 # either form so the auto-resolve mode works with the GraphQL data
 # this script reads. Caught on PR #180 review when every CR thread
 # was skipped as a non-bot author — see #182.
-BOT_LOGINS_RE='^(coderabbitai|chatgpt-codex-connector|dependabot)(\[bot\])?$'
+#
+# github-advanced-security added for #1101: without it, every GHAS
+# code-scanning (CodeQL) thread fell through this gate as a "non-bot
+# author" and was never eligible for --resolve-actioned / --auto-
+# resolve-bots, so a disposed CodeQL finding's thread could only be
+# closed by hand.
+BOT_LOGINS_RE='^(coderabbitai|chatgpt-codex-connector|dependabot|github-advanced-security)(\[bot\])?$'
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -2603,24 +2609,40 @@ ledger_paths() {
 # before the bot's latest re-raise dispositioned the earlier round, not the
 # live one. FAIL CLOSED throughout: an absent ledger, a malformed line (jq -s
 # errors on the whole file), or an unusable id all read as "no evidence".
+#
+# The fail-closed status is deliberately the same either way — no evidence
+# means the thread stays unresolved regardless of WHY. But "the ledger has no
+# row for this finding" and "the ledger could not be read at all" are not the
+# same operator problem (#1002): the append-only logs are written by two
+# scripts across many sessions, so one interrupted write or one partial line
+# from a killed process silently loses every row in the file to a single `jq
+# -s` parse failure. `jq -e -s` distinguishes the two on exit status alone —
+# 1 is "parsed fine, no row matched"; anything else is jq itself failing to
+# read the file — so a WARN naming the file is cheap and, unlike the SKIP
+# reason printed by callers, tells the operator something they can fix in a
+# second.
 ledger_verdict_for_finding() {
-  local cid="$1" floor="$2" f
+  local cid="$1" floor="$2" f rc
   case "$cid" in
     ''|null|*[!0-9]*) return 1 ;;
   esac
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     [ -f "$f" ] || continue
-    if jq -e -s --argjson cid "$cid" --arg repo "$REPO" --arg floor "$floor" '
+    rc=0
+    jq -e -s --argjson cid "$cid" --arg repo "$REPO" --arg floor "$floor" '
           any(.[];
             (.comment_id == $cid)
             and (.repo == $repo)
             and (((.verdict // "") | tostring) != "")
             and (((.recorded_at // "") | tostring) != "")
             and ($floor == "" or (.recorded_at > $floor)))
-        ' "$f" >/dev/null 2>&1; then
+        ' "$f" >/dev/null 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
       printf '%s' "$f"
       return 0
+    elif [ "$rc" -ne 1 ]; then
+      echo "WARN: ledger $f could not be parsed (jq exit $rc); treating finding $cid as having no recorded verdict there" >&2
     fi
   done <<EOF
 $(ledger_paths)
@@ -2708,10 +2730,18 @@ finding_dispositioned() {
 # thread_is_actioned <class> <thread_json> — THE actioned predicate (#990).
 # Exit 0 only when the class proves action AND the evidence is bound to this
 # finding. Replaces bare class_is_actioned at every decision site.
+#
+# Only stdout (the evidence description this caller has no use for) is
+# discarded. Stderr is left connected to the caller's, because
+# finding_dispositioned's ledger read can print an unparseable-ledger WARN
+# (#1002) that every caller needs to see — swallowing it here silently
+# downgraded that diagnostic to invisible on the --auto-resolve-bots and
+# --resolve-verified-propagation paths, the only two callers that route
+# through this wrapper instead of calling finding_dispositioned directly.
 thread_is_actioned() {
   local class="$1" tj="$2"
   class_is_actioned "$class" || return 1
-  finding_dispositioned "$tj" >/dev/null 2>&1
+  finding_dispositioned "$tj" >/dev/null
 }
 
 # synth_rationale <class> <thread_json> → one-line free-form rationale

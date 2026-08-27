@@ -75,6 +75,15 @@ permissions:
   # native workflow checks are attached elsewhere (schedule/default-branch
   # events); pull_request* events still produce the head check natively.
   checks: write
+  # `security-events: read` is required for scripts/codex-p1-gate.sh's
+  # scripts/review-feedback-accounting.sh call, which reads
+  # code-scanning/alerts to resolve a github-advanced-security[bot]
+  # finding's severity (#1101). Without it, this job's GITHUB_TOKEN 403s on
+  # that read the first time a PR carries a real CodeQL comment, turning
+  # the required `Codex P1 unresolved threads` check into a hard
+  # infrastructure failure (accounting fails closed) rather than grading
+  # the finding — caught by Codex review on #1106.
+  security-events: read
 
 jobs:
   archive-edited-feedback:
@@ -100,6 +109,11 @@ jobs:
       # relay owns the write.
       issues: write
       pull-requests: read
+      # See the workflow-level permissions block above (#1101): this job
+      # calls scripts/codex-p1-gate.sh too, so it needs the same grant —
+      # a job-level permissions block replaces rather than merges with the
+      # workflow default.
+      security-events: read
     steps:
       - name: Checkout repo (default branch — trusted archive renderer)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -454,7 +468,6 @@ jobs:
             scripts/codex-p1-gate.sh "$PR_NUMBER" "$REPO" 2>&1)
           rc=$?
           set -e
-          echo "$output"
           feedback_fp_after="$feedback_fp_before"
           if [ "$fingerprint_available" = true ]; then
             feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh \
@@ -464,6 +477,7 @@ jobs:
               rc=2
             fi
           fi
+          echo "$output"
 
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           # Hand the closing step the exact feedback surface this decision was
@@ -790,7 +804,6 @@ jobs:
               output=$(scripts/codex-p1-gate.sh "$PR" "$REPO" 2>&1)
               rc=$?
               set -e
-              echo "$output"
 
               feedback_fp_after="$feedback_fp_before"
               if [ "$fingerprint_available" = true ]; then
@@ -802,6 +815,7 @@ jobs:
                   had_infra_error=1
                 fi
               fi
+              echo "$output"
             fi
 
             check_title="Codex P1 gate (scheduled leased re-evaluation)"

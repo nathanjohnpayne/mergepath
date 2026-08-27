@@ -164,16 +164,6 @@ consumers:
       # misses them; jsx_in_js: true adds a second React rule entry
       # that covers `.js` too. See mergepath#322.
       jsx_in_js: true
-  - name: device-platform-reporting
-    repo: nathanjohnpayne/device-platform-reporting
-    visibility: public
-    facts:
-      frameworks: [react]
-      # dpr uses Jest (not vitest); same template gap as ffb above.
-      testing: jest
-      # dpr is JS-only and uses babel-loader to transpile JSX inside
-      # `.js` files. Same opt-in as ffb. See mergepath#322.
-      jsx_in_js: true
   # swipewatch has minimal Node + vitest code, no frameworks. The
   # empty `frameworks: []` list opts it into the JS baseline only.
   - name: swipewatch
@@ -202,8 +192,8 @@ consumers:
   # 9943173ca2b532359d619ffeadda93daf9f9cf43, the hub has 115 kit blobs and
   # this consumer holds 110 hub-known entries. Follow the canonical per-wave
   # selection and fan-out gates in docs/agents/propagation-ordering.md.
-  - name: gaycruisebingo
-    repo: nathanjohnpayne/gaycruisebingo
+  - name: fiveacross
+    repo: nathanjohnpayne/fiveacross
     visibility: public
     facts:
       frameworks: [react, typescript]
@@ -1682,9 +1672,8 @@ paths:
   #   nathanpaynedotcom (ESM)          → JS + TS + Astro
   #   tadlockpsychiatry (ESM)          → JS + TS + React + react-hooks
   #   device-source-of-truth (ESM)     → JS + TS + React + react-hooks
-  #   gaycruisebingo (ESM)             → JS + TS + React + react-hooks
+  #   fiveacross (ESM)                 → JS + TS + React + react-hooks
   #   friends-and-family-billing (CJS) → JS + React + react-hooks
-  #   device-platform-reporting (CJS)  → JS + React + react-hooks
   #   overridebroadway (CJS)           → JS + TS + React + react-hooks
   #   swipewatch (CJS)                 → JS baseline only
 
@@ -1698,7 +1687,7 @@ paths:
       - nathanpaynedotcom
       - tadlockpsychiatry
       - device-source-of-truth
-      - gaycruisebingo
+      - fiveacross
 
   # CJS variant — consumers without `"type": "module"` (default
   # CJS resolution). Same body as the ESM variant; only the
@@ -1709,7 +1698,6 @@ paths:
     type: templated
     consumers:
       - friends-and-family-billing
-      - device-platform-reporting
       - overridebroadway
       - swipewatch
 

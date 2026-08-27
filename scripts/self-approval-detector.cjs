@@ -26,6 +26,21 @@ function normalized(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
+// BEGIN STABLE PR LABEL NAMES
+function stablePrLabelNames(candidate) {
+  const labels = candidate && candidate.labels;
+  if (
+    !Array.isArray(labels) ||
+    labels.some(label =>
+      !label || typeof label.name !== 'string' || !label.name.trim()
+    )
+  ) {
+    throw new Error('live PR labels are unavailable or malformed');
+  }
+  return labels.map(label => label.name).sort();
+}
+// END STABLE PR LABEL NAMES
+
 function decide(input) {
   const prAuthor = normalized(input && input.prAuthor);
   const authorIdentity = normalized(input && input.authorIdentity);
@@ -120,7 +135,9 @@ function decide(input) {
       return {
         action: 'block',
         reason: 'same-agent-phase-4-approval',
-        persistentViolation: true,
+        // The declaration is mutable and GitHub exposes no conditional label
+        // write bound to the body snapshot. Dismiss the approval, but reserve
+        // the human-only persistent label for immutable native-author proof.
         authoringAgent,
         authoringReviewer,
       };
@@ -267,9 +284,10 @@ function planApprovalEnforcement(input) {
 }
 // END SELF-APPROVAL DETECTOR IMPLEMENTATION
 
-// Evaluate the complete latest-state approval set for a final live merge
+// Evaluate the complete latest-state approval set for a final live readiness
 // decision. The workflow still owns dismissal/comment mutations, while the
-// shared continuation consumes this pure summary immediately before arming.
+// shared continuation consumes this pure summary before reporting stable,
+// unarmed readiness.
 function evaluateLatestApprovals(input) {
   const headSha = normalized(input && input.headSha);
   const requireHead = Boolean(input && input.requireHead);
@@ -318,6 +336,7 @@ function evaluateLatestApprovals(input) {
 }
 
 module.exports = {
+  stablePrLabelNames,
   decide,
   latestApprovedReviews,
   reviewsWithDirectFallback,

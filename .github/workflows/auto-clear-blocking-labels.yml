@@ -134,6 +134,14 @@ permissions:
   # trigger produced a zero-job failed run, so the label never
   # auto-cleared).
   checks: write
+  # Required for scripts/workflow/approval-merge-continuation.sh's
+  # review-feedback-accounting.sh call (both jobs below reach it), which
+  # reads code-scanning/alerts to grade a github-advanced-security[bot]
+  # finding's severity (#1101). That call runs under ACCOUNTING_GH_TOKEN
+  # (this workflow's GITHUB_TOKEN, not the ambient AUTHOR_MERGE_TOKEN the
+  # continuation steps otherwise use) specifically so this block can reach
+  # it — CodeRabbit on PR #1106.
+  security-events: read
 
 jobs:
   evaluate-and-clear:
@@ -256,10 +264,13 @@ jobs:
           # downstream workflows normally, so Label Gate re-fires and
           # mergeStateStatus flips to CLEAN within seconds rather
           # than stalling until something else fires the policy
-          # workflow. Closes mergepath#315. Token is the same
-          # REVIEWER_ASSIGNMENT_TOKEN used by
-          # .github/workflows/daily-feedback-rollup.yml.
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          # workflow. Closes mergepath#315. Prefers the CI-actor
+          # service account (CI_ACTOR_TOKEN, nathanpayne-robot),
+          # falling back to REVIEWER_ASSIGNMENT_TOKEN where that
+          # secret is not provisioned. Either way it must be a PAT,
+          # not GITHUB_TOKEN, or the label write fires no re-arm.
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          WORKFLOW_TOKEN: ${{ github.token }}
           PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
           REPO: ${{ github.repository }}
         run: |
@@ -317,6 +328,31 @@ jobs:
 
             case "$rc" in
               0)
+                # Retract any durable request while needs-external-review is
+                # still a blocker. Deleting the last blocking label first can
+                # let GitHub consume an older arm before the continuation step
+                # gets a chance to clean it up. Dependabot is preserved inside
+                # the helper because its dedicated workflow owns that lane.
+                if [ ! -f scripts/workflow/approval-merge-continuation.sh ] \
+                   || ! grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' scripts/workflow/approval-merge-continuation.sh; then
+                  echo "::error::Protective retraction helper is unavailable; refusing to remove needs-external-review from PR #$PR."
+                  had_infra_error=1
+                  failing_prs="$failing_prs $PR"
+                  echo "::endgroup::"
+                  continue
+                fi
+                set +e
+                GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+                  --retract-unsafe-only "$PR" "$REPO"
+                protective_rc=$?
+                set -e
+                if [ "$protective_rc" -ne 0 ]; then
+                  echo "::error::Protective retraction failed rc=$protective_rc; refusing to remove needs-external-review from PR #$PR."
+                  had_infra_error=1
+                  failing_prs="$failing_prs $PR"
+                  echo "::endgroup::"
+                  continue
+                fi
                 echo "Gate passes — removing needs-external-review label."
                 # Single (non-retried) removal, then verify end state with a
                 # retried READ (#465): retrying the removal can double-fire
@@ -421,6 +457,11 @@ jobs:
         env:
           AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           WORKFLOW_TOKEN: ${{ github.token }}
+          # Routes ONLY the review-feedback-accounting.sh call inside
+          # approval-merge-continuation.sh through GITHUB_TOKEN instead of the
+          # author token used by normal continuation (#1101, CodeRabbit on PR
+          # #1106). See this job's permissions block for why.
+          ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
           CLEARED_PRS: ${{ steps.clear.outputs.cleared_prs }}
           REPO: ${{ github.repository }}
@@ -678,7 +719,8 @@ jobs:
           # would not re-fire — so mergeStateStatus would stay
           # BLOCKED until the next push or manual nudge, defeating
           # the sweep's purpose.
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          WORKFLOW_TOKEN: ${{ github.token }}
           PRS: ${{ steps.find.outputs.prs }}
           REPO: ${{ github.repository }}
         run: |
@@ -721,6 +763,29 @@ jobs:
             set -e
             case "$rc" in
               0)
+                # Match the event-driven clear path: remove any unsafe durable
+                # request while the label still blocks GitHub from consuming
+                # it. The helper preserves Dependabot's dedicated lane.
+                if [ ! -f scripts/workflow/approval-merge-continuation.sh ] \
+                   || ! grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' scripts/workflow/approval-merge-continuation.sh; then
+                  echo "::error::Protective retraction helper is unavailable; refusing to remove needs-external-review from PR #$PR."
+                  had_infra_error=1
+                  failing_prs="$failing_prs $PR"
+                  echo "::endgroup::"
+                  continue
+                fi
+                set +e
+                GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+                  --retract-unsafe-only "$PR" "$REPO"
+                protective_rc=$?
+                set -e
+                if [ "$protective_rc" -ne 0 ]; then
+                  echo "::error::Protective retraction failed rc=$protective_rc; refusing to remove needs-external-review from PR #$PR."
+                  had_infra_error=1
+                  failing_prs="$failing_prs $PR"
+                  echo "::endgroup::"
+                  continue
+                fi
                 echo "Gate passes — removing needs-external-review label."
                 # Single (non-retried) REST DELETE + retried verify (#465/#827)
                 # — see the evaluate-and-clear job above for the full rationale
@@ -807,6 +872,11 @@ jobs:
         env:
           AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           WORKFLOW_TOKEN: ${{ github.token }}
+          # Routes ONLY the review-feedback-accounting.sh call inside
+          # approval-merge-continuation.sh through GITHUB_TOKEN instead of the
+          # author token used by normal continuation (#1101, CodeRabbit on PR
+          # #1106). See this job's permissions block for why.
+          ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRS: ${{ steps.approved.outputs.prs }}
           REPO: ${{ github.repository }}
         run: |

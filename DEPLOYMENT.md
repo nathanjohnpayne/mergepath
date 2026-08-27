@@ -64,7 +64,7 @@ The full bootstrap loop runs across each repo the bootstrap wizard has provision
 - swipewatch
 - nathanpaynedotcom
 - overridebroadway
-- gaycruisebingo
+- fiveacross
 <!-- bootstrap-loop-list-end -->
 
 Run the bootstrap script across all of them:
@@ -298,8 +298,11 @@ Go to the new repo → Settings → Secrets and variables → Actions → New re
 |---|---|---|
 | `REVIEWER_ASSIGNMENT_TOKEN` | PAT for a **reviewer identity** (e.g., `nathanpayne-claude`) — NOT `nathanjohnpayne` | Classic with `repo` scope (collaborator account) |
 | `AUTHOR_MERGE_TOKEN` | PAT for the **author identity** (`nathanjohnpayne`) — NOT a reviewer identity | Classic with `repo` scope (author account) |
+| `CI_ACTOR_TOKEN` | PAT for the **CI service account** (`nathanpayne-robot`) — holds no reviewer standing | Classic with `repo` scope (service account) |
 
 The `dependabot-auto-merge.yml` workflow uses `REVIEWER_ASSIGNMENT_TOKEN` to post the reviewer-identity `--approve`. It MUST be a reviewer-identity PAT (`nathanpayne-claude` / `-cursor` / `-codex`), not `nathanjohnpayne` — GitHub rejects self-approval, and the workflow's preflight guards hard-fail if the token resolves to the author identity OR to any login not in `.github/review-policy.yml` `available_reviewers`. The `gh pr merge` itself runs under `AUTHOR_MERGE_TOKEN` (see below) so the merge is recorded under `author_identity`. See nathanjohnpayne/mergepath#179 and #426 for the audit-trail rationale.
+
+`CI_ACTOR_TOKEN` carries the CI-actor half of what `REVIEWER_ASSIGNMENT_TOKEN` used to do alone: reviewer assignment, gate-label writes, dispatches, and review reads in `agent-review.yml`, `auto-clear-blocking-labels.yml`, and `pr-review-policy.yml`. Those workflows read it as `${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}`, so it is **optional**: leave it unset and the workflows fall back to the reviewer PAT exactly as before. Setting it moves that repo's routine CI activity onto the service account, which separates the audit trail from agent judgment and — because rate limits are per-account — stops scheduled CI competing with interactive agent sessions for one 5,000 req/hr bucket. `auto-clear-blocking-labels.yml` alone runs on a `*/5` cron, so it is the largest single draw. The service account needs write access on the repo. It must **never** hold reviewer standing: `dependabot-auto-merge.yml` deliberately stays on `REVIEWER_ASSIGNMENT_TOKEN` because it posts an approving review, and a service-account `APPROVED` would trip the `non_reviewer_identities` block in `scripts/merge-clearance-gate.sh`. See nathanjohnpayne/mergepath#1097 and #1071.
 
 Or use the CLI (faster):
 
@@ -309,6 +312,7 @@ Or use the CLI (faster):
 # The full lookup table is in REVIEW_POLICY.md § PAT lookup table.
 gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')"   # nathanpayne-claude
 gh secret set AUTHOR_MERGE_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/sm5kopwk6t6p3xmu2igesndzhe/token')"   # nathanjohnpayne (author identity)
+gh secret set CI_ACTOR_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')"   # nathanpayne-robot (CI service account; optional)
 ```
 
 `AUTHOR_MERGE_TOKEN` is **required** wherever Dependabot auto-merge is enabled: as of nathanjohnpayne/mergepath#426 the workflow uses it for the `gh pr merge` step (recording `mergedBy` as `author_identity`) and hard-fails if it is empty or resolves to anything other than `author_identity`. It is the author-identity counterpart to `REVIEWER_ASSIGNMENT_TOKEN`. The Agent Review Pipeline also verifies it before privileged readiness evaluation, but cannot use it to arm, enqueue, or merge a non-Dependabot PR pending #1058.
@@ -450,7 +454,7 @@ The current PATs are set to never expire. If you ever need to rotate a reviewer 
 
 Note: reviewer identity PATs are NOT stored as repo CI secrets. They are read from 1Password per-session by the authoring agent for the in-session identity switch, so rotation does not require updating any repo secrets.
 
-The `REVIEWER_ASSIGNMENT_TOKEN` repo secret (a **reviewer-identity** PAT used by the Dependabot auto-merge approval + Agent Review Pipeline workflows; see "Add `REVIEWER_ASSIGNMENT_TOKEN` to repo secrets" above) follows a similar process but also needs a `gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo}` call on every repo after rotating the 1Password item. The `AUTHOR_MERGE_TOKEN` repo secret (an **author-identity** PAT used by the Dependabot auto-merge `gh pr merge` step and by Agent Review Pipeline readiness authentication) follows the same process with a `gh secret set AUTHOR_MERGE_TOKEN --repo {owner}/{repo}` call after rotating its 1Password item. Agent Review never arms, enqueues, or merges a non-Dependabot PR pending #1058.
+The `REVIEWER_ASSIGNMENT_TOKEN` repo secret (a **reviewer-identity** PAT used by the Dependabot auto-merge approval + Agent Review Pipeline workflows; see "Add `REVIEWER_ASSIGNMENT_TOKEN` to repo secrets" above) follows a similar process but also needs a `gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo}` call on every repo after rotating the 1Password item. The `AUTHOR_MERGE_TOKEN` repo secret (an **author-identity** PAT used by the Dependabot auto-merge `gh pr merge` step and by Agent Review Pipeline readiness authentication) follows the same process with a `gh secret set AUTHOR_MERGE_TOKEN --repo {owner}/{repo}` call after rotating its 1Password item. Agent Review never arms, enqueues, or merges a non-Dependabot PR pending #1058. The `CI_ACTOR_TOKEN` repo secret (the **CI service account** PAT, `nathanpayne-robot`) follows the same process with a `gh secret set CI_ACTOR_TOKEN --repo {owner}/{repo}` call. Because it rotates on its own schedule for one purpose, rotating it cannot break a reviewer byline, and rotating a reviewer PAT cannot break CI — the coupling that caused the 2026-08-21 fleet outage (#1071).
 
 ---
 

@@ -2093,6 +2093,24 @@ else
   fail "Phase 4 query: verified propagation expected false/0; got rc=$RC out='$OUT'"
 fi
 
+echo; echo "--- Phase 4 Query 2b: force-on label outranks exact-head propagation lane"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone" "$EXT_LABEL")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"small.txt","additions":1,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $sha + " -->") }]
+')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-phase-4-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "Phase 4 query: needs-external-review remains force-on despite a propagation marker"
+else
+  fail "Phase 4 query: force-on label plus propagation marker expected true/0; got rc=$RC out='$OUT'"
+fi
+
 echo; echo "--- Phase 4 Query 3: indeterminate lane read fails closed"
 SCRATCH=$(make_scratch false false)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")

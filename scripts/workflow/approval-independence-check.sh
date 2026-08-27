@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Revalidate live approval independence immediately before a merge write.
+# Revalidate live approval independence at the final stable-readiness boundary.
 
 set -euo pipefail
 
