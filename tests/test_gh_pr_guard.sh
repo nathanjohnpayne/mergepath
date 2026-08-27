@@ -132,6 +132,32 @@ assert_rc_contains "wrapper substring spoof still blocked" 2 "token-verifying wr
 ## Self-Review
 - ok"'
 
+# --- `gh pr new` is a working alias for `gh pr create` -----------------------
+# gh 2.97: `gh pr new --help` prints the create help and lists `new` under
+# ALIASES. Before the alias was canonicalized, PR_SUBCOMMAND="new" matched no
+# guarded branch, so the "Not a covered command? Allow." path exited 0 and the
+# create guard never ran -- no Authoring-Agent check, no ## Self-Review check,
+# no byline verification. A complete bypass reachable by typing a documented
+# alias, so these cases are the regression fence around it.
+assert_rc_contains "gh pr new is guarded like gh pr create" 2 "guarded GitHub write" \
+  'gh pr new --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+# The diagnostic must name the CANONICAL command, or an operator reading it
+# goes looking for a `gh pr new` rule that does not exist.
+assert_rc_contains "blocked gh pr new reports itself as gh pr create" 2 "gh pr create" \
+  'gh pr new --title "t" --body "b"'
+
+# Global flags may precede the subcommand; the alias must still resolve.
+assert_rc_contains "gh --repo o/r pr new is guarded" 2 "guarded GitHub write" \
+  'gh --repo owner/repo pr new --title "t" --body "b"'
+
+# Non-write pr subcommands must stay allowed: canonicalizing `new` must not
+# widen the guard onto reads.
+assert_rc_contains "gh pr view stays allowed" 0 "" 'gh pr view 123'
+
 # #466: a path-qualified gh (e.g. /usr/bin/gh) must NOT bypass the guard.
 # Before the fix the quick-exit grep only matched bare `gh`, so a
 # path-qualified write skipped the hook entirely (exit 0).
