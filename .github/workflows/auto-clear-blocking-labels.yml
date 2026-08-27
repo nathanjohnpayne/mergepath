@@ -264,10 +264,12 @@ jobs:
           # downstream workflows normally, so Label Gate re-fires and
           # mergeStateStatus flips to CLEAN within seconds rather
           # than stalling until something else fires the policy
-          # workflow. Closes mergepath#315. Token is the same
-          # REVIEWER_ASSIGNMENT_TOKEN used by
-          # .github/workflows/daily-feedback-rollup.yml.
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          # workflow. Closes mergepath#315. Prefers the CI-actor
+          # service account (CI_ACTOR_TOKEN, nathanpayne-robot),
+          # falling back to REVIEWER_ASSIGNMENT_TOKEN where that
+          # secret is not provisioned. Either way it must be a PAT,
+          # not GITHUB_TOKEN, or the label write fires no re-arm.
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
           REPO: ${{ github.repository }}
         run: |
@@ -678,7 +680,7 @@ jobs:
           # would not re-fire — so mergeStateStatus would stay
           # BLOCKED until the next push or manual nudge, defeating
           # the sweep's purpose.
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PRS: ${{ steps.find.outputs.prs }}
           REPO: ${{ github.repository }}
         run: |

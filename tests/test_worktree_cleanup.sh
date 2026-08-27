@@ -2931,6 +2931,598 @@ else
   fail "#1103 DATA LOSS: --orphan-clean acted on a truncated canonical path"
   echo "$OUT_NLTAIL_APPLY" >&2
 fi
+# ── Case 44 (#992 crit 1): an unreadable remote is not a clean audit ─────
+# stale_unpruned_branches() takes exactly one remote read. When that read
+# failed it returned silently, leaving STALE_UNPRUNED_FILE empty — and the
+# audit then printed `gone (stale remote ref, unpruned): 0`, wrote nothing to
+# stderr, and exited 0. A failed snapshot was byte-identical to a clean tree.
+#
+# That is the dangerous direction rather than the merely noisy one: the
+# preview claims agreement with an --apply it was never able to model, and a
+# later --apply with working network reclassifies branches as gone and
+# removes worktrees the preview never listed.
+#
+# The remote is broken by pointing origin at a path that does not exist, so
+# the case needs no network and cannot flake on one.
+UNK_ROOT="$WORKDIR/unreachable-remote"
+UNK_REMOTE="$UNK_ROOT/remote.git"
+UNK_MAIN="$UNK_ROOT/main"
+mkdir -p "$UNK_ROOT"
+git init -q --bare "$UNK_REMOTE"
+git init -q -b main "$UNK_MAIN"
+(
+  cd "$UNK_MAIN"
+  git -C "$UNK_MAIN" config user.email "test@example.com"
+  git -C "$UNK_MAIN" config user.name "Test"
+  git -C "$UNK_MAIN" config commit.gpgsign false
+  git -C "$UNK_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$UNK_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b topic
+  git push -q -u origin topic
+  git checkout -q main
+) >/dev/null 2>&1
+git -C "$UNK_MAIN" remote set-url origin "$UNK_ROOT/vanished.git"
+
+# Premise 1: the refspec is still the conventional one, so the probe REACHES
+# the remote read rather than declining before it. Without this the case
+# would assert exit 3 on a path that never runs — and `declined` must not
+# exit 3, which is the distinction the whole change rests on.
+if ! git -C "$UNK_MAIN" config --get-all remote.origin.fetch \
+     | grep -Fqx -- '+refs/heads/*:refs/remotes/origin/*'; then
+  fail "fixture setup: remote.origin.fetch is not conventional — case 44 would exercise the declined path, not the unknown one"
+fi
+# Premise 2: the read really does fail.
+if git -C "$UNK_MAIN" ls-remote --heads origin >/dev/null 2>&1; then
+  fail "fixture setup: ls-remote still succeeds against the vanished remote — case 44 has no failure to detect"
+fi
+# Premise 3: there is a branch the probe WOULD have evaluated, so the count
+# of 0 is genuinely an absence of measurement and not an absence of subjects.
+if [ "$(git -C "$UNK_MAIN" for-each-ref --format='%(upstream)' refs/heads/topic)" \
+     != "refs/remotes/origin/topic" ]; then
+  fail "fixture setup: topic does not track origin/topic — the probe would have had nothing to evaluate anyway"
+fi
+
+set +e
+OUT_UNK=$( cd "$UNK_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_UNK=$?
+set -e
+if [ "$RC_UNK" -eq 3 ]; then
+  pass "#992 an unreadable remote snapshot exits 3 rather than reporting a clean audit"
+else
+  fail "#992 an unreadable remote snapshot exited $RC_UNK (expected 3)"
+  echo "$OUT_UNK" >&2
+fi
+if echo "$OUT_UNK" | grep -Fq -- "NOT MEASURED"; then
+  pass "#992 the zero count is annotated as not-measured rather than left to read as clean"
+else
+  fail "#992 the summary presented an unmeasured count as a measurement"
+  echo "$OUT_UNK" >&2
+fi
+# The count itself must still be 0 — the fix adds a qualifier, it does not
+# invent a number the run could not obtain.
+if echo "$OUT_UNK" | grep -qE "gone \(stale remote ref, unpruned\): +0$"; then
+  pass "#992 the unmeasured counter still reports 0 rather than a fabricated figure"
+else
+  fail "#992 the stale-unpruned counter changed value on an unreadable remote"
+  echo "$OUT_UNK" >&2
+fi
+
+# Precedence: an incomplete audit outranks a complete one with findings. Add
+# an orphan so total_candidates is non-zero, which without the ordering rule
+# would exit 2 and hide the hole behind an ordinary findings status.
+mkdir -p "$UNK_MAIN/.claude/worktrees/leftover"
+echo residue > "$UNK_MAIN/.claude/worktrees/leftover/residue.txt"
+set +e
+OUT_UNK2=$( cd "$UNK_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_UNK2=$?
+set -e
+if echo "$OUT_UNK2" | grep -qE "orphan dirs: +1$"; then
+  pass "#992 precedence fixture: the run really did find a candidate"
+else
+  fail "fixture setup: the orphan was not detected, so the precedence assertion below is vacuous"
+  echo "$OUT_UNK2" >&2
+fi
+if [ "$RC_UNK2" -eq 3 ]; then
+  pass "#992 an incomplete audit outranks findings — exit 3, not 2"
+else
+  fail "#992 an incomplete audit with findings exited $RC_UNK2 (expected 3)"
+  echo "$OUT_UNK2" >&2
+fi
+# Raising the status must not cost the operator the hint or the findings.
+if echo "$OUT_UNK2" | grep -Fq -- "Re-run with --apply"; then
+  pass "#992 the --apply hint survives the raised exit status"
+else
+  fail "#992 raising the exit status suppressed the dry-run hint"
+  echo "$OUT_UNK2" >&2
+fi
+
+# The other half of the distinction: `declined` is NOT `unknown`. Case 24's
+# renamed-refspec repo reaches origin_fetch_is_conventional() and stops
+# there, and must keep exiting 0 — folding a standing, documented limitation
+# into the unknown state would put every non-conventional checkout at a
+# permanent exit 3.
+if [ "$RC_MAPPED_DRY" -eq 0 ]; then
+  pass "#992 a declined (non-conventional refspec) probe does not exit 3"
+else
+  fail "#992 the declined path was conflated with the unknown one (rc=$RC_MAPPED_DRY)"
+fi
+if ! echo "$OUT_MAPPED_DRY" | grep -Fq -- "NOT MEASURED"; then
+  pass "#992 a declined probe is not annotated as an unmeasured failure"
+else
+  fail "#992 a documented limitation was reported as a failed read"
+  echo "$OUT_MAPPED_DRY" >&2
+fi
+
+# ── Case 44b (#1105, Codex P2): an irrelevant remote read is not a hole ──
+# A repository can carry a conventional refspec and an `origin` while no
+# local branch tracks refs/remotes/origin/* at all — an origin added to a
+# local-only checkout is the ordinary case. The stale-unpruned set is then
+# provably empty from local reads alone, and the remote has no say in it.
+#
+# Taking the snapshot unconditionally made an unreachable origin turn such a
+# run into an INCOMPLETE audit (exit 3) on the strength of a read nobody
+# needed. Eligibility is decided first, so this stays a clean exit 0.
+#
+# This is the boundary of Case 44: same broken remote, same conventional
+# refspec — the ONLY difference is whether any branch tracks origin.
+NOELIG_ROOT="$WORKDIR/unreachable-but-irrelevant"
+NOELIG_MAIN="$NOELIG_ROOT/main"
+mkdir -p "$NOELIG_ROOT"
+git init -q -b main "$NOELIG_MAIN"
+(
+  cd "$NOELIG_MAIN"
+  git -C "$NOELIG_MAIN" config user.email "test@example.com"
+  git -C "$NOELIG_MAIN" config user.name "Test"
+  git -C "$NOELIG_MAIN" config commit.gpgsign false
+  git -C "$NOELIG_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  # An origin that does not exist, and nothing ever pushed to it.
+  git remote add origin "$NOELIG_ROOT/never-existed.git"
+) >/dev/null 2>&1
+NOELIG_MAIN=$(cd "$NOELIG_MAIN" && pwd -P)
+
+# Premise 1: the refspec is conventional, so the probe gets past
+# origin_fetch_is_conventional() and would reach the snapshot.
+if ! git -C "$NOELIG_MAIN" config --get-all remote.origin.fetch \
+     | grep -Fqx -- '+refs/heads/*:refs/remotes/origin/*'; then
+  fail "fixture setup: remote.origin.fetch is not conventional — case 44b would exercise the declined path"
+fi
+# Premise 2: the remote really is unreachable, so this differs from case 44
+# in exactly one respect.
+if git -C "$NOELIG_MAIN" ls-remote --heads origin >/dev/null 2>&1; then
+  fail "fixture setup: ls-remote succeeds — case 44b no longer isolates the eligibility question"
+fi
+# Premise 3: and nothing tracks origin. That is the whole difference.
+if [ -n "$(git -C "$NOELIG_MAIN" for-each-ref --format='%(upstream)' refs/heads/)" ]; then
+  fail "fixture setup: a branch tracks an upstream — case 44b needs the no-eligible-branch shape"
+fi
+
+set +e
+OUT_NOELIG=$( cd "$NOELIG_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_NOELIG=$?
+set -e
+if [ "$RC_NOELIG" -eq 0 ]; then
+  pass "#1105 an unreachable remote no branch depends on leaves the audit complete (exit 0)"
+else
+  fail "#1105 an irrelevant remote read made the audit incomplete (rc=$RC_NOELIG, expected 0)"
+  echo "$OUT_NOELIG" >&2
+fi
+if ! echo "$OUT_NOELIG" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1105 a provably-empty stale set is not annotated as unmeasured"
+else
+  fail "#1105 the audit claimed a hole where the answer was known locally"
+  echo "$OUT_NOELIG" >&2
+fi
+
+# ── Case 44c (#1105, Codex P2): a LOCAL failure is not a remote one ──────
+# Four paths set STALE_SNAPSHOT_STATE=unknown and only ONE of them involves
+# the remote. The other three are local: an unenterable worktree, and two
+# `mktemp` failures from an unwritable or full TMPDIR — one of which happens
+# AFTER the remote has been read successfully.
+#
+# The summary used to print "the remote could not be read" for all of them,
+# and the agent documentation told the operator to restore remote
+# reachability. On a full /tmp that sends them to fix a network that was
+# never broken.
+#
+# The fixture makes the point sharply: the remote here is REACHABLE, and the
+# failure is injected into the eligible-list allocation, which runs BEFORE
+# any remote contact. A message blaming the remote would be provably wrong.
+TMPFAIL_ROOT="$WORKDIR/local-tmp-failure"
+TMPFAIL_REMOTE="$TMPFAIL_ROOT/remote.git"
+TMPFAIL_MAIN="$TMPFAIL_ROOT/main"
+TMPFAIL_BIN="$TMPFAIL_ROOT/bin"
+TMPFAIL_LOG="$TMPFAIL_ROOT/mktemp-calls.log"
+mkdir -p "$TMPFAIL_ROOT" "$TMPFAIL_BIN"
+git init -q --bare "$TMPFAIL_REMOTE"
+git init -q -b main "$TMPFAIL_MAIN"
+(
+  cd "$TMPFAIL_MAIN"
+  git -C "$TMPFAIL_MAIN" config user.email "test@example.com"
+  git -C "$TMPFAIL_MAIN" config user.name "Test"
+  git -C "$TMPFAIL_MAIN" config commit.gpgsign false
+  git -C "$TMPFAIL_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$TMPFAIL_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+TMPFAIL_MAIN=$(cd "$TMPFAIL_MAIN" && pwd -P)
+# Resolve the real mktemp NOW, before the shim shadows it on PATH.
+TMPFAIL_REAL_MKTEMP=$(command -v mktemp)
+if [ -z "$TMPFAIL_REAL_MKTEMP" ]; then
+  fail "fixture setup: no mktemp on PATH — case 44c cannot build its shim"
+fi
+# Fail ONLY the eligible-list allocation. Shimming mktemp wholesale would
+# break the audit long before the probe and would prove nothing about which
+# failure the message describes.
+cat > "$TMPFAIL_BIN/mktemp" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *wcleanup-eligible*) printf '%s\n' "\$a" >> "$TMPFAIL_LOG"; exit 1 ;;
+  esac
+done
+exec "$TMPFAIL_REAL_MKTEMP" "\$@"
+SHIM
+chmod +x "$TMPFAIL_BIN/mktemp"
+
+# Premise: the remote really IS reachable, so any message blaming it is
+# false rather than merely imprecise.
+if ! git -C "$TMPFAIL_MAIN" ls-remote --heads origin >/dev/null 2>&1; then
+  fail "fixture setup: the remote is unreachable — case 44c cannot distinguish a local cause from a remote one"
+fi
+# Premise: a branch tracks origin, so the probe is eligible and reaches the
+# allocation the shim fails (case 44b proves it is skipped otherwise).
+if [ "$(git -C "$TMPFAIL_MAIN" for-each-ref --format='%(upstream)' refs/heads/main)" \
+     != "refs/remotes/origin/main" ]; then
+  fail "fixture setup: main does not track origin/main — the eligible-list allocation would never run"
+fi
+
+set +e
+OUT_TMPFAIL=$( cd "$TMPFAIL_MAIN" && PATH="$TMPFAIL_BIN:$STUB_DIR:$PATH" \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_TMPFAIL=$?
+set -e
+
+# Premise: the shim actually fired. Without this every assertion below could
+# pass on a run that never attempted the allocation.
+if [ ! -s "$TMPFAIL_LOG" ]; then
+  fail "fixture setup: the eligible-list allocation was never attempted, so case 44c asserts nothing"
+  echo "$OUT_TMPFAIL" >&2
+fi
+if [ "$RC_TMPFAIL" -eq 3 ] && echo "$OUT_TMPFAIL" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1105 a local allocation failure is still an incomplete audit (exit 3)"
+else
+  fail "#1105 a local allocation failure did not surface as exit 3 + NOT MEASURED (rc=$RC_TMPFAIL)"
+  echo "$OUT_TMPFAIL" >&2
+fi
+if echo "$OUT_TMPFAIL" | grep -Fq -- "LOCAL failure"; then
+  pass "#1105 the remedy names the local cause rather than the remote"
+else
+  fail "#1105 a local failure was not identified as local"
+  echo "$OUT_TMPFAIL" >&2
+fi
+# The half that actually misled: the remote was reachable throughout, so
+# telling the operator to go fix it is a false statement, not a vague one.
+# Case-INSENSITIVE and phrase-level on purpose: an earlier draft matched the
+# exact capitalised string, and a mutation that restored the old lowercase
+# wording slipped straight past it. The claim being guarded is "no wording
+# that blames the remote", not "not this one spelling".
+if ! echo "$OUT_TMPFAIL" | grep -Fqi -- "remote could not be read"; then
+  pass "#1105 a reachable remote is not blamed for a local failure"
+else
+  fail "#1105 the audit blamed a remote it had never even contacted"
+  echo "$OUT_TMPFAIL" >&2
+fi
+
+# ── Case 44d (#1105, Codex P2): a failed snapshot WRITE still reports ────
+# `mktemp` succeeding says the remote-heads file was CREATED, not that it can
+# be written — TMPDIR can fill, or a quota can be exhausted, in between. The
+# extraction pipeline was unchecked, so under `set -eo pipefail` that failure
+# killed the run with exit 1 BEFORE the summary printed: no records, no NOT
+# MEASURED line, no exit 3. That is this PR's own silent-failure shape
+# reappearing one line further down, which is why it ships here.
+#
+# The failure is injected with an `awk` shim matched to the snapshot
+# extraction only, so the rest of the script (and the harness) keeps the real
+# awk. The remote is REACHABLE, so this is unambiguously the write path.
+AWKFAIL_ROOT="$WORKDIR/snapshot-write-failure"
+AWKFAIL_REMOTE="$AWKFAIL_ROOT/remote.git"
+AWKFAIL_MAIN="$AWKFAIL_ROOT/main"
+AWKFAIL_BIN="$AWKFAIL_ROOT/bin"
+AWKFAIL_LOG="$AWKFAIL_ROOT/awk-hits.log"
+mkdir -p "$AWKFAIL_ROOT" "$AWKFAIL_BIN"
+git init -q --bare "$AWKFAIL_REMOTE"
+git init -q -b main "$AWKFAIL_MAIN"
+(
+  cd "$AWKFAIL_MAIN"
+  git -C "$AWKFAIL_MAIN" config user.email "test@example.com"
+  git -C "$AWKFAIL_MAIN" config user.name "Test"
+  git -C "$AWKFAIL_MAIN" config commit.gpgsign false
+  git -C "$AWKFAIL_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$AWKFAIL_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+AWKFAIL_MAIN=$(cd "$AWKFAIL_MAIN" && pwd -P)
+AWKFAIL_REAL_AWK=$(command -v awk)
+if [ -z "$AWKFAIL_REAL_AWK" ]; then
+  fail "fixture setup: no awk on PATH — case 44d cannot build its shim"
+fi
+cat > "$AWKFAIL_BIN/awk" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *'NF > 1'*) printf 'hit\n' >> "$AWKFAIL_LOG"; exit 3 ;;
+  esac
+done
+exec "$AWKFAIL_REAL_AWK" "\$@"
+SHIM
+chmod +x "$AWKFAIL_BIN/awk"
+
+# Premise: the remote is reachable, so the snapshot READ succeeds and the run
+# genuinely reaches the write.
+if ! git -C "$AWKFAIL_MAIN" ls-remote --heads origin >/dev/null 2>&1; then
+  fail "fixture setup: the remote is unreachable — case 44d would exercise the read path, not the write"
+fi
+# Premise: a branch tracks origin, so the probe is eligible.
+if [ "$(git -C "$AWKFAIL_MAIN" for-each-ref --format='%(upstream)' refs/heads/main)" \
+     != "refs/remotes/origin/main" ]; then
+  fail "fixture setup: main does not track origin/main — the snapshot would never be taken"
+fi
+
+set +e
+OUT_AWKFAIL=$( cd "$AWKFAIL_MAIN" && PATH="$AWKFAIL_BIN:$STUB_DIR:$PATH" \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_AWKFAIL=$?
+set -e
+
+# Premise: the shim fired. An unhit shim would make everything below vacuous.
+if [ ! -s "$AWKFAIL_LOG" ]; then
+  fail "fixture setup: the snapshot extraction was never reached, so case 44d asserts nothing"
+  echo "$OUT_AWKFAIL" >&2
+fi
+# The headline claim: the run COMPLETES and reports, rather than dying at the
+# pipeline.
+#
+# The exit code alone CANNOT carry that claim, and measuring it proved so: an
+# unchecked pipeline returns 3 from awk, `set -e` propagates it, and the run
+# dies with exit 3 as well. Identical status, opposite behaviour. So this
+# assertion is conjunctive — exit 3 AND the summary present — because
+# reaching the summary is the only thing that distinguishes "reported an
+# incomplete audit" from "was killed mid-audit and happened to exit 3".
+if [ "$RC_AWKFAIL" -eq 3 ] && echo "$OUT_AWKFAIL" | grep -qE "orphan dirs: +[0-9]"; then
+  pass "#1105 a failed snapshot write reports an incomplete audit instead of dying"
+else
+  fail "#1105 a failed snapshot write exited $RC_AWKFAIL without completing the audit"
+  echo "$OUT_AWKFAIL" >&2
+fi
+# The summary must actually have been emitted — the pre-fix failure killed the
+# run BEFORE this point, so its presence is the proof the run survived.
+if echo "$OUT_AWKFAIL" | grep -qE "orphan dirs: +[0-9]"; then
+  pass "#1105 the summary is still emitted after a failed snapshot write"
+else
+  fail "#1105 the run died before printing its summary"
+  echo "$OUT_AWKFAIL" >&2
+fi
+if echo "$OUT_AWKFAIL" | grep -Fq -- "NOT MEASURED" \
+   && echo "$OUT_AWKFAIL" | grep -Fq -- "LOCAL failure"; then
+  pass "#1105 a failed snapshot write is attributed to local storage, not the remote"
+else
+  fail "#1105 a failed snapshot write was not reported as an unmeasured local failure"
+  echo "$OUT_AWKFAIL" >&2
+fi
+
+# ── Case 44e (#1105, Codex P2): the eligible-list write is checked too ───
+# The direct twin of case 44d. Guarding only the snapshot write left the
+# eligible-list pipeline with the identical failure mode, one function
+# earlier — and it is the pipeline THIS PR added, so shipping 44d without
+# 44e would have fixed the instance and left the class.
+#
+# The failure is injected by shimming `mktemp` to hand back a FIXTURE-OWNED
+# path whose PARENT DIRECTORY DOES NOT EXIST, for the eligible-list
+# allocation only. Allocation "succeeds" (the shim returns a name), and every
+# write to it fails with ENOENT — so it exercises the create-then-write gap
+# rather than the create, which is the property under test.
+#
+# Deliberately NOT /dev/full, which was this case's first draft (Codex P1).
+# The production failure handler runs `rm -f "$ELIGIBLE_FILE"`, so handing it
+# a real device path means the suite DELETES /dev/full when run as root — as
+# it commonly is in a dev container — after which the node is gone and later
+# runs silently stop exercising the condition at all. A test must not damage
+# the host it runs on, and must not disarm itself by doing so.
+#
+# A missing parent is strictly better than an unwritable file for this job:
+#   - the open fails with ENOENT even as ROOT, which permission bits do not
+#     (root bypasses mode 000), so the case cannot pass vacuously for the
+#     privileged runner it was hardest to reason about;
+#   - `rm -f` on a path with a missing parent returns 0 and touches nothing,
+#     so the production cleanup is exercised for real without collateral;
+#   - nothing outside the fixture directory is referenced at all.
+FULLWRITE_ROOT="$WORKDIR/eligible-write-failure"
+FULLWRITE_REMOTE="$FULLWRITE_ROOT/remote.git"
+FULLWRITE_MAIN="$FULLWRITE_ROOT/main"
+FULLWRITE_BIN="$FULLWRITE_ROOT/bin"
+FULLWRITE_LOG="$FULLWRITE_ROOT/mktemp-hits.log"
+mkdir -p "$FULLWRITE_ROOT" "$FULLWRITE_BIN"
+git init -q --bare "$FULLWRITE_REMOTE"
+git init -q -b main "$FULLWRITE_MAIN"
+(
+  cd "$FULLWRITE_MAIN"
+  git -C "$FULLWRITE_MAIN" config user.email "test@example.com"
+  git -C "$FULLWRITE_MAIN" config user.name "Test"
+  git -C "$FULLWRITE_MAIN" config commit.gpgsign false
+  git -C "$FULLWRITE_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$FULLWRITE_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+FULLWRITE_MAIN=$(cd "$FULLWRITE_MAIN" && pwd -P)
+FULLWRITE_REAL_MKTEMP=$(command -v mktemp)
+# Parent deliberately never created.
+FULLWRITE_TARGET="$FULLWRITE_ROOT/absent-parent/eligible.txt"
+cat > "$FULLWRITE_BIN/mktemp" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *wcleanup-eligible*) printf 'hit\n' >> "$FULLWRITE_LOG"; printf '%s\n' "$FULLWRITE_TARGET"; exit 0 ;;
+  esac
+done
+exec "$FULLWRITE_REAL_MKTEMP" "\$@"
+SHIM
+chmod +x "$FULLWRITE_BIN/mktemp"
+
+# Premise: the injected target really cannot be written, and its parent
+# really is absent. Both halves matter — a fixture that accidentally created
+# the parent would test an ordinary successful write and pass for the wrong
+# reason.
+if [ -e "$FULLWRITE_ROOT/absent-parent" ]; then
+  fail "fixture setup: the parent directory exists — case 44e would exercise a successful write"
+fi
+if printf 'x\n' > "$FULLWRITE_TARGET" 2>/dev/null; then
+  fail "fixture setup: the injected target is writable — case 44e cannot model a failed write"
+fi
+# And the production cleanup path must be harmless against it, which is the
+# property the /dev/full draft violated.
+if ! rm -f "$FULLWRITE_TARGET" 2>/dev/null; then
+  fail "fixture setup: rm -f on the injected target fails — the production cleanup would trip set -e"
+fi
+# Premise: a branch tracks origin, so the eligible-list write is reached.
+if [ "$(git -C "$FULLWRITE_MAIN" for-each-ref --format='%(upstream)' refs/heads/main)" \
+     != "refs/remotes/origin/main" ]; then
+  fail "fixture setup: main does not track origin/main — the eligible-list write would never run"
+fi
+
+set +e
+OUT_FULLWRITE=$( cd "$FULLWRITE_MAIN" && PATH="$FULLWRITE_BIN:$STUB_DIR:$PATH" \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_FULLWRITE=$?
+set -e
+
+if [ ! -s "$FULLWRITE_LOG" ]; then
+  fail "fixture setup: the eligible-list allocation was never attempted, so case 44e asserts nothing"
+  echo "$OUT_FULLWRITE" >&2
+fi
+# Conjunctive for the same reason as 44d: an unchecked pipeline can exit with
+# a status that looks right while the run never reached its summary.
+if [ "$RC_FULLWRITE" -eq 3 ] && echo "$OUT_FULLWRITE" | grep -qE "orphan dirs: +[0-9]"; then
+  pass "#1105 a failed eligible-list write reports an incomplete audit instead of dying"
+else
+  fail "#1105 a failed eligible-list write exited $RC_FULLWRITE without completing the audit"
+  echo "$OUT_FULLWRITE" >&2
+fi
+if echo "$OUT_FULLWRITE" | grep -Fq -- "NOT MEASURED" \
+   && echo "$OUT_FULLWRITE" | grep -Fq -- "LOCAL failure"; then
+  pass "#1105 a failed eligible-list write is attributed to local storage"
+else
+  fail "#1105 a failed eligible-list write was not reported as an unmeasured local failure"
+  echo "$OUT_FULLWRITE" >&2
+fi
+
+# ── Case 44f (#1105, Codex P2): a ref-read failure is not a storage one ──
+# The eligibility list is built from a git READ piped into a WRITE. While
+# both sat in one pipeline, `pipefail` made an unreadable local ref database
+# surface as "temporary storage unavailable", sending the operator to check
+# TMPDIR for a problem in the repository. That is the cause-specific-remedy
+# rule this PR added, broken inside the guard that introduced it.
+#
+# The read is now taken on its own, so its failure is attributable. This case
+# fails ONLY the eligibility read — via a git shim matched to that exact
+# format string — leaving TMPDIR perfectly healthy, so a storage remedy would
+# be provably wrong rather than merely imprecise.
+REFFAIL_ROOT="$WORKDIR/ref-read-failure"
+REFFAIL_REMOTE="$REFFAIL_ROOT/remote.git"
+REFFAIL_MAIN="$REFFAIL_ROOT/main"
+REFFAIL_BIN="$REFFAIL_ROOT/bin"
+REFFAIL_LOG="$REFFAIL_ROOT/git-hits.log"
+mkdir -p "$REFFAIL_ROOT" "$REFFAIL_BIN"
+git init -q --bare "$REFFAIL_REMOTE"
+git init -q -b main "$REFFAIL_MAIN"
+(
+  cd "$REFFAIL_MAIN"
+  git -C "$REFFAIL_MAIN" config user.email "test@example.com"
+  git -C "$REFFAIL_MAIN" config user.name "Test"
+  git -C "$REFFAIL_MAIN" config commit.gpgsign false
+  git -C "$REFFAIL_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$REFFAIL_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+REFFAIL_MAIN=$(cd "$REFFAIL_MAIN" && pwd -P)
+REFFAIL_REAL_GIT=$(command -v git)
+# Matched on `%09`, which appears ONLY in the eligibility read's format.
+# gone_branches() uses `%(refname:lstrip=2) %(upstream:track)` — space
+# separated, no %09 — so it and every other git call still run for real. A
+# blanket git shim would break the fixture long before the probe.
+#
+# The match is a SUBSTRING of one argument, not an exact one: git receives
+# `--format=%(...)%09%(...)` as a single argv entry, so an exact-string case
+# never fires. The first draft did exactly that and the shim was never hit —
+# caught only by the premise assertion below.
+cat > "$REFFAIL_BIN/git" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *%09*) printf 'hit\n' >> "$REFFAIL_LOG"; exit 128 ;;
+  esac
+done
+exec "$REFFAIL_REAL_GIT" "\$@"
+SHIM
+chmod +x "$REFFAIL_BIN/git"
+
+# Premise: TMPDIR is healthy, so a storage remedy would be a FALSE statement
+# rather than a vague one. This is the whole point of the case.
+REFFAIL_PROBE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-reffail-probe.XXXXXX") || \
+  fail "fixture setup: cannot create a temp file — case 44f cannot claim TMPDIR is healthy"
+if ! printf 'ok\n' > "$REFFAIL_PROBE" 2>/dev/null; then
+  fail "fixture setup: TMPDIR is not writable — case 44f cannot distinguish a ref failure from a storage one"
+fi
+rm -f "$REFFAIL_PROBE"
+
+set +e
+OUT_REFFAIL=$( cd "$REFFAIL_MAIN" && PATH="$REFFAIL_BIN:$STUB_DIR:$PATH" \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_REFFAIL=$?
+set -e
+
+if [ ! -s "$REFFAIL_LOG" ]; then
+  fail "fixture setup: the eligibility read was never attempted, so case 44f asserts nothing"
+  echo "$OUT_REFFAIL" >&2
+fi
+if [ "$RC_REFFAIL" -eq 3 ] && echo "$OUT_REFFAIL" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1105 an unreadable ref database is an incomplete audit"
+else
+  fail "#1105 an unreadable ref database exited $RC_REFFAIL without reporting NOT MEASURED"
+  echo "$OUT_REFFAIL" >&2
+fi
+# The claim under test: the remedy names the REPOSITORY, not TMPDIR.
+if echo "$OUT_REFFAIL" | grep -Fq -- "refs could"; then
+  pass "#1105 a ref-read failure directs the operator at the repository"
+else
+  fail "#1105 a ref-read failure did not name the repository as the cause"
+  echo "$OUT_REFFAIL" >&2
+fi
+# And must NOT send them to TMPDIR, which is demonstrably fine here.
+if ! echo "$OUT_REFFAIL" | grep -Fq -- "is writable and has free"; then
+  pass "#1105 a ref-read failure is not misattributed to temporary storage"
+else
+  fail "#1105 a healthy TMPDIR was blamed for a ref-read failure"
+  echo "$OUT_REFFAIL" >&2
+fi
 
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
