@@ -1248,12 +1248,30 @@ bootstrap::_reconcile_excluded_residue() {
   shift
   local pattern protected root_only_protect match_arg
 
+  # Codex P1 on #1112 round 18: `find -path` always does GLOB matching, not
+  # literal string comparison -- a target containing a glob metacharacter
+  # (`[`, `]`, `*`, `?`, e.g. an operator's own `/tmp/target[1]`) is
+  # embedded verbatim into every -path pattern built from it below, so it
+  # is interpreted as a PATTERN rather than the literal target path.
+  # Reproduced: `find "target[1]" -path "target[1]/.git"` matches nothing,
+  # because `[1]` is a character class, not literal brackets -- silently
+  # defeating root_only_protect and prune_expr for such a target. Escape
+  # find's own glob metacharacters in $target ONCE here, and use the
+  # escaped form everywhere $target feeds into a -path pattern; find's
+  # OWN starting-point argument (the unescaped "$target") is unaffected,
+  # since that argument is a literal path, never a pattern.
+  local target_escaped=$target
+  target_escaped=${target_escaped//\\/\\\\}
+  target_escaped=${target_escaped//\*/\\*}
+  target_escaped=${target_escaped//\?/\\?}
+  target_escaped=${target_escaped//\[/\\[}
+
   local prune_expr=()
   for protected in "${BOOTSTRAP_MIRROR_RECONCILE_PROTECTED[@]}"; do
     case "$protected" in
       */)
         [ "${#prune_expr[@]}" -eq 0 ] || prune_expr+=(-o)
-        prune_expr+=(-path "$target/${protected%/}")
+        prune_expr+=(-path "$target_escaped/${protected%/}")
         ;;
     esac
   done
@@ -1262,7 +1280,7 @@ bootstrap::_reconcile_excluded_residue() {
     root_only_protect=""
     for protected in "${BOOTSTRAP_MIRROR_RECONCILE_PROTECTED[@]}"; do
       if [ "$pattern" = "$protected" ]; then
-        root_only_protect="$target/${protected%/}"
+        root_only_protect="$target_escaped/${protected%/}"
         break
       fi
     done
@@ -1635,8 +1653,17 @@ bootstrap::_resolve_canonical_source_sha() {
   # rsync -a still preserves the physical (now-755) mode into the target --
   # a mismatch against HEAD's recorded (644) mode that has nothing to do
   # with content.
+  #
+  # Codex P2 on #1112 round 18: pin -c core.autocrlf=false too. With
+  # core.autocrlf=true, checkout converts a tracked LF blob to CRLF on
+  # disk, and git status's OWN default comparison re-applies the SAME
+  # conversion when comparing disk to blob, so it reads clean even though
+  # rsync copies the CRLF bytes physically on disk -- a real content
+  # mismatch against HEAD's LF blob. Confirmed empirically: -c
+  # core.autocrlf=false forces the comparison to use the raw disk bytes,
+  # correctly reporting the file as modified.
   local status_output
-  status_output=$(git -c core.filemode=true -C "$source_root" status --porcelain --ignored \
+  status_output=$(git -c core.filemode=true -c core.autocrlf=false -C "$source_root" status --porcelain --ignored \
     --untracked-files=all --ignore-submodules=none 2>/dev/null) || return 1
   if [ -n "$status_output" ]; then
     # Codex P2 on #1112 round 9: the static BOOTSTRAP_MIRROR_EXCLUDES array

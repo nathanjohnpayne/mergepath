@@ -3451,6 +3451,93 @@ else
   pass "bootstrap::_rsync_template preserves a linked git worktree's .git FILE, not just a .git directory (#1056 Codex P1 round 17)"
 fi
 
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 18: `find -path` always does GLOB matching, not
+# literal string comparison -- a target containing a glob metacharacter
+# (confirmed empirically with `[`) is embedded verbatim into every -path
+# pattern built from it, so it is interpreted as a PATTERN, not the literal
+# target path -- silently defeating root_only_protect and prune_expr.
+# Name the target root with a bracket and confirm real .git / .bootstrap-state
+# content still survives.
+# ---------------------------------------------------------------------------
+globchar_src="$(mktemp -d "$WORKDIR/rsync-globchar-src.XXXXXX")"
+mkdir -p "$globchar_src/docs/agents"
+printf 'readme\n' > "$globchar_src/README.md"
+printf 'canonical\n' > "$globchar_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$globchar_src/docs/agents/bootstrap-runbook.md"
+cat >"$globchar_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+globchar_dst="$WORKDIR/rsync-globchar-dst[1]"
+mkdir -p "$globchar_dst/.git"
+printf 'must survive -- this IS the targets own repository\n' > "$globchar_dst/.git/HEAD"
+printf 'real wizard state, must survive\n' > "$globchar_dst/.bootstrap-state"
+set +e
+globchar_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$globchar_src" "$globchar_dst" 2>&1)
+globchar_rc=$?
+set -e
+if [ "$globchar_rc" != "0" ]; then
+  fail "rsync with a glob-metacharacter target name failed (rc=$globchar_rc): $globchar_out"
+elif [ ! -f "$globchar_dst/.git/HEAD" ]; then
+  fail "the target's own root .git was deleted for a target name containing '[' -- glob-escaping is not wired in"
+elif [ ! -f "$globchar_dst/.bootstrap-state" ]; then
+  fail "the target's own .bootstrap-state was deleted for a target name containing '[' -- glob-escaping is not wired in"
+else
+  pass "bootstrap::_reconcile_excluded_residue escapes glob metacharacters in the target path (#1056 Codex P1 round 18)"
+fi
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 18: with core.autocrlf=true, checkout converts a
+# tracked LF blob to CRLF on disk, and git status's default comparison
+# re-applies the SAME conversion, reading clean even though rsync copies
+# the CRLF bytes physically -- a real content mismatch against HEAD's LF
+# blob. Verify the fixture actually reproduces an empty `git status
+# --porcelain` under the repo's own core.autocrlf=true before asserting
+# the fix, so this test cannot pass vacuously.
+# ---------------------------------------------------------------------------
+AUTOCRLF_DIRTY_SOURCE="$WORKDIR/autocrlf-dirty-repo"
+mkdir -p "$AUTOCRLF_DIRTY_SOURCE"
+git -C "$AUTOCRLF_DIRTY_SOURCE" init -q -b main
+git -C "$AUTOCRLF_DIRTY_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+printf 'line1\nline2\n' >"$AUTOCRLF_DIRTY_SOURCE/f.txt"
+git -C "$AUTOCRLF_DIRTY_SOURCE" add -A
+git -C "$AUTOCRLF_DIRTY_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "autocrlf-dirty-repo seed"
+git -C "$AUTOCRLF_DIRTY_SOURCE" update-ref refs/remotes/origin/main HEAD
+git -C "$AUTOCRLF_DIRTY_SOURCE" config core.autocrlf true
+rm -f "$AUTOCRLF_DIRTY_SOURCE/f.txt"
+git -C "$AUTOCRLF_DIRTY_SOURCE" checkout -q -- f.txt
+if [ -n "$(git -C "$AUTOCRLF_DIRTY_SOURCE" status --porcelain)" ]; then
+  fail "autocrlf-dirty fixture did not reproduce the core.autocrlf=true blind spot: $(git -C "$AUTOCRLF_DIRTY_SOURCE" status --porcelain)"
+fi
+AUTOCRLF_DIRTY_TARGET="$WORKDIR/autocrlf-dirty-target"
+mkdir -p "$AUTOCRLF_DIRTY_TARGET"
+echo seed >"$AUTOCRLF_DIRTY_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$AUTOCRLF_DIRTY_TARGET" "$AUTOCRLF_DIRTY_SOURCE" >/dev/null
+
+autocrlf_dirty_subject=$(git -C "$AUTOCRLF_DIRTY_TARGET" log -1 --format=%s)
+[ "$autocrlf_dirty_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a line-ending mismatch hidden by core.autocrlf=true blocks attribution (#1056 Codex P2 round 18)" \
+  || fail "autocrlf-dirty source_root wrongly got attribution: $autocrlf_dirty_subject"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"
