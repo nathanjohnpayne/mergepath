@@ -2,7 +2,7 @@
 
 Status: **canonical, in-repo source of truth.** The order below is reviewed monthly; the dated review log lives on the repo wiki page [Propagation-Wave-Order-Review-Log](https://github.com/nathanjohnpayne/mergepath/wiki/Propagation-Wave-Order-Review-Log). See [§ Maintenance](#maintenance) for how the doc and that log stay in sync.
 
-This is a **hub-only** doc — it governs how a canonical change is fanned out *from* mergepath *to* the 9 consumers via `scripts/sync-to-downstream.sh`. It is intentionally **not** in `.mergepath-sync.yml` (consumers don't run propagation waves). It complements [templated-propagation.md](templated-propagation.md) (the rendering engine) and the canary-first note in `.mergepath-sync.yml`.
+This is a **hub-only** doc — it governs how a canonical change is fanned out *from* mergepath *to* the 8 consumers via `scripts/sync-to-downstream.sh`. It is intentionally **not** in `.mergepath-sync.yml` (consumers don't run propagation waves). It complements [templated-propagation.md](templated-propagation.md) (the rendering engine) and the canary-first note in `.mergepath-sync.yml`.
 
 Treat this as the default for every propagation wave unless a specific wave documents a reason to deviate in its own tracking issue.
 
@@ -16,9 +16,9 @@ This is the **fan-out** order — the sequence in which consumer PRs are opened 
 | **1 (riskiest)** | `overridebroadway` + `nathanpaynedotcom` | overridebroadway: historically special-cased ("CodeRabbit disabled" era), most bespoke `path_instructions`. nathanpaynedotcom: only consumer with a `tools.eslint.enabled: false` override (Astro) + highest churn. |
 | **2** | `matchline` + `tadlockpsychiatry` | Both React+TS. matchline = well-trodden reference (deepest bot history); tadlockpsychiatry = quietest / least-observed. |
 | **3** | `device-source-of-truth` + `friends-and-family-billing` | Recently touched by the ESLint-floor work. |
-| **4 (safest)** | `device-platform-reporting` + `swipewatch` | Simplest surfaces; swipewatch is the documented ESLint canary. |
+| **4 (safest)** | `swipewatch` (single) | Simplest surface; swipewatch is the documented ESLint canary. Paired with `device-platform-reporting` until 2026-08-26, when that repo was archived and dropped as a consumer. |
 
-**Rationale:** the dominant failure mode for a wave is **usually** per-consumer idiosyncrasy (config divergence, local adaptations) rather than a uniform payload break. Front-loading the most divergent repos surfaces any check-vs-config interaction while attention is full; fixes land once at the source and later pairs become verification. Simplest repos last = cheap confirmation. (All 9 consumers are **public** — visibility was once an ordering factor, since a private repo's CI failures aren't readable without auth, but it no longer distinguishes the tiers; the axis is now divergence and churn.) "Usually" is doing real work in that sentence: it is a claim about the typical wave, not about every wave, and the canary rule below asks which mode dominates *this* change rather than assuming the usual one.
+**Rationale:** the dominant failure mode for a wave is **usually** per-consumer idiosyncrasy (config divergence, local adaptations) rather than a uniform payload break. Front-loading the most divergent repos surfaces any check-vs-config interaction while attention is full; fixes land once at the source and later pairs become verification. Simplest repos last = cheap confirmation. (All 8 consumers are **public** — visibility was once an ordering factor, since a private repo's CI failures aren't readable without auth, but it no longer distinguishes the tiers; the axis is now divergence and churn.) "Usually" is doing real work in that sentence: it is a claim about the typical wave, not about every wave, and the canary rule below asks which mode dominates *this* change rather than assuming the usual one.
 
 **Tier membership is a claim about current state, not a permanent label.** Every "Why this tier" cell above **should** carry a date, and a consumer occupies its tier only for as long as its stated signal still reproduces. That is a requirement, and most rows do not yet meet it: only the wave-0 row is dated. Rows 1–4 are undated, and the tier-1 config signals in particular have no dated measurement behind them at all — read an undated row as an inherited claim awaiting its first measurement, never as a freshly verified one. A rationale that was true when it was written keeps being repeated long after the condition it described has been reconciled, and re-measuring is the only thing that tells the two apart. Before relying on any row, check that its stated signal is still observable ([§ Measuring tier membership](#measuring-tier-membership)); a tier whose justification no longer reproduces is stale prose, not a standing fact about the repo.
 
@@ -55,7 +55,7 @@ Only fan out (`--sync-all`) once the canary's `lint` is green **and the wave aud
 
 ## Wave audit (one scoped review per wave, #662)
 
-A verified mirror carries nothing unreviewed: every line already passed review on its upstream mergepath PR, and the propagation lane byte-verifies the mirror. So the wave's external review runs **once**, against the canary PR, scoped to the canonical range that has not been audited before — instead of CodeRabbit + Codex re-reading the same bytes on all 9 consumers:
+A verified mirror carries nothing unreviewed: every line already passed review on its upstream mergepath PR, and the propagation lane byte-verifies the mirror. So the wave's external review runs **once**, against the canary PR, scoped to the canonical range that has not been audited before — instead of CodeRabbit + Codex re-reading the same bytes on all 8 consumers:
 
 ```bash
 # After the canary PR is open and lane-verified:
