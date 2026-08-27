@@ -1461,8 +1461,14 @@ printf "  merged+extra (review): %d\n" "${#SUMMARY_DIVERGED_KEPT[@]}"
 printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
 # Branches whose remote-tracking ref is stale rather than genuinely gone —
 # a `git branch -vv` false-negative this run would otherwise retain silently
-# (#822). Dry-run only; --apply prunes before classification so this is
-# always 0 there. Each of these ALSO appears in exactly one bucket above
+# (#822). Dry-run only, so this counter is always 0 under --apply — but the
+# reason is that the PROBE is dry-run-gated, NOT that --apply pruned the
+# class away before classification. NOTHING in this script prunes: see the
+# rule-4 header block and the `if [ "$MODE" = "dry-run" ]` guard on
+# stale_unpruned_branches(). Teaching --apply to act on this class is #932.
+# An earlier revision of this comment asserted the prune, describing
+# apply-mode behaviour that has never existed and that a future author could
+# have built on (#934). Each of these ALSO appears in exactly one bucket above
 # (merged branches / gone kept / merged+extra / gone unverified) by its
 # actual merged-PR status — this counter exists so the unpruned-ref CLASS
 # itself is never invisible, even though it is not a distinct disposition.
