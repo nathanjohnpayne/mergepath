@@ -1186,6 +1186,15 @@ bootstrap::_path_matches_any() {
 # doc list too (Codex P2 on #1112 round 12) -- those paths are excluded
 # from the transfer dynamically, at mirror time, so they need the same
 # treatment as the static array's entries, not a separate root-only `rm`.
+#
+# Codex P1 on #1112 round 13: -mindepth 1 is required. `find "$target" ...
+# -path "*/packaging" ...` matches find's OWN STARTING NODE too when
+# $target's path string itself ends in "/packaging" (e.g. an operator's
+# default ~/GitHub/packaging as the bootstrap target for a repo literally
+# named packaging) -- reproduced: the whole target, including .git and
+# resume state, was recursively removed. -mindepth 1 excludes depth 0 (the
+# starting argument) from ever being a candidate, without affecting any
+# genuine descendant match at depth 1+.
 bootstrap::_reconcile_excluded_residue() {
   local target=$1
   shift
@@ -1219,11 +1228,11 @@ bootstrap::_reconcile_excluded_residue() {
 
     if [ -n "$match_arg" ]; then
       bootstrap::run "reconcile excluded residue $pattern" \
-        find "$target" \( "${prune_expr[@]}" \) -prune -o -path "$match_arg" -exec rm -rf -- {} + \
+        find "$target" -mindepth 1 \( "${prune_expr[@]}" \) -prune -o -path "$match_arg" -exec rm -rf -- {} + \
         || return $?
     else
       bootstrap::run "reconcile excluded residue $pattern" \
-        find "$target" \( "${prune_expr[@]}" \) -prune -o -name "$pattern" -exec rm -rf -- {} + \
+        find "$target" -mindepth 1 \( "${prune_expr[@]}" \) -prune -o -name "$pattern" -exec rm -rf -- {} + \
         || return $?
     fi
   done

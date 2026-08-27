@@ -2942,6 +2942,51 @@ else
   pass "bootstrap::_rsync_template reconciles a NESTED occurrence of a derived hub-only doc (#1056 Codex P2 round 12)"
 fi
 
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 13: `find "$target" ... -path "*/<pattern>" ...`
+# matches find's own STARTING NODE too when $target's path string itself
+# ends in "/<pattern>" -- e.g. an operator's bootstrap target for a repo
+# literally named "packaging" (a directory-prefix exclude entry). Without
+# -mindepth 1 the whole target, including .git and resume state, is
+# recursively removed. Name the target root after a real exclude pattern
+# and assert it survives with its content intact.
+# ---------------------------------------------------------------------------
+selfmatch_src="$(mktemp -d "$WORKDIR/rsync-selfmatch-src.XXXXXX")"
+selfmatch_parent="$(mktemp -d "$WORKDIR/rsync-selfmatch-parent.XXXXXX")"
+selfmatch_dst="$selfmatch_parent/packaging"
+mkdir -p "$selfmatch_src/docs/agents"
+printf 'readme\n' > "$selfmatch_src/README.md"
+printf 'canonical\n' > "$selfmatch_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$selfmatch_src/docs/agents/bootstrap-runbook.md"
+cat >"$selfmatch_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+mkdir -p "$selfmatch_dst/.git"
+printf 'must survive -- this IS the targets own repository\n' > "$selfmatch_dst/.git/HEAD"
+printf 'resume state, must survive\n' > "$selfmatch_dst/.bootstrap-state"
+set +e
+selfmatch_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$selfmatch_src" "$selfmatch_dst" 2>&1)
+selfmatch_rc=$?
+set -e
+if [ "$selfmatch_rc" != "0" ]; then
+  fail "rsync with a target root named after an exclude pattern failed (rc=$selfmatch_rc): $selfmatch_out"
+elif [ ! -d "$selfmatch_dst" ] || [ ! -f "$selfmatch_dst/.git/HEAD" ] || [ ! -f "$selfmatch_dst/.bootstrap-state" ]; then
+  fail "a target root named after an exclude pattern (packaging/) was deleted by excluded-residue reconciliation -- -mindepth 1 is not wired in"
+else
+  pass "excluded-residue reconciliation never matches find's own starting node (#1056 Codex P1 round 13)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"
