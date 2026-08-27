@@ -166,19 +166,24 @@
 # Exit codes:
 #   0  success (audit clean OR all requested removals succeeded)
 #   1  generic error (bad invocation, git failure, unsupported state)
-#   2  candidates listed but --apply was not passed (dry-run with findings).
-#      Lets callers wire this into "audit fails CI" style checks even
-#      though we explicitly do NOT wire this into PR CI per #288.
-#   3  the audit could not be fully evaluated: a read it depends on FAILED,
-#      so the report is incomplete and its silences are not evidence (#992).
-#      Deliberately NOT folded into 2. Exit 2 carries a specific promise —
-#      "re-run with --apply and it will act" — and an unevaluable read is
-#      the one case where that promise is false: --apply cannot resolve a
-#      remote it also cannot reach. Callers that only branch on 2 are
-#      unaffected; callers that treat any non-zero as actionable still see
-#      it. Today the only such read is the remote-heads snapshot behind
-#      stale_unpruned_branches(), which is dry-run only, so --apply never
-#      exits 3.
+#   2  a COMPLETE audit with actionable findings (dry-run). Lets callers
+#      wire this into "audit fails CI" style checks even though we
+#      explicitly do NOT wire this into PR CI per #288.
+#      Note what 2 does NOT promise: that a plain --apply clears it. Several
+#      buckets exit 2 and are deliberately never cleared by the default
+#      apply mode — SUMMARY_DIVERGED_KEPT and SUMMARY_UNCLEAN_KEPT need a
+#      HUMAN decision and --apply never touches them, and locked entries and
+#      orphans need --force-locked / --orphan-clean. 2 means "everything
+#      that could be checked was checked, and some of it wants attention";
+#      the per-record lines say what kind (Codex P2 on #1105).
+#   3  an INCOMPLETE audit: a read it depends on FAILED, so the report has a
+#      hole in it and its silences are not evidence (#992).
+#      The 2-versus-3 axis is COMPLETENESS, not who can act. A 2 may still
+#      need a human; a 3 says the run does not know what it is looking at.
+#      Callers that only branch on 2 are unaffected; callers that treat any
+#      non-zero as actionable still see it. Today the only such read is the
+#      remote-heads snapshot behind stale_unpruned_branches(), which is
+#      dry-run only, so --apply never exits 3.
 #
 # Notes:
 #   - Always invoked from within a git repo (the main one or a worktree).
@@ -667,11 +672,63 @@ stale_unpruned_branches() {
   # A non-default refspec makes the tracking-ref → remote-head mapping
   # unknowable here; decline rather than guess (origin_fetch_is_conventional).
   origin_fetch_is_conventional || { STALE_SNAPSHOT_STATE="declined"; return 0; }
+  # Decide ELIGIBILITY before touching the network (Codex P2 on #1105).
+  #
+  # A repository can have a conventional refspec and an `origin` while no
+  # local branch tracks `refs/remotes/origin/*` at all — an origin added to a
+  # local-only checkout is the ordinary case. The stale set is then provably
+  # empty from local reads alone, and consulting the remote can only fail for
+  # a question nobody asked. Taking the snapshot first made an unreachable
+  # origin turn such a run into an incomplete audit (exit 3) on the strength
+  # of an irrelevant read.
+  #
+  # So: build the eligible list from `for-each-ref` and $GONE_FILE, both
+  # purely local, and consult the remote only if that list is non-empty. An
+  # empty list is `ok` and not `unknown` — the answer IS known, and it is
+  # "nothing", established without the remote having any say.
+  ELIGIBLE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-eligible.XXXXXX") || {
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_REASON="could not create the eligible-branch list"
+    return 0
+  }
+  local branch upstream
+  # Tab-separated: a git ref name may contain `|` but never a tab, so the
+  # pair round-trips losslessly (the same reasoning as the merged-branch
+  # sweep records).
+  #
+  # `refname:lstrip=2` expands an ambiguous local branch name to
+  # `heads/<name>` when a tag shares its short name. The input is already
+  # constrained to refs/heads, so strip that namespace directly and retain
+  # the canonical branch name for the gone/PR lookups downstream.
+  #
+  # Derive the remote head from the FULL %(upstream) ref, never from
+  # %(upstream:short) — when a local branch literally named `origin/foo`
+  # exists, `:short` renders foo's upstream as `remotes/origin/foo` and the
+  # derived head name comes out wrong.
+  git for-each-ref --format='%(refname:lstrip=2)%09%(upstream)' refs/heads/ 2>/dev/null |
+  while IFS=$'\t' read -r branch upstream; do
+    [ -n "$branch" ] || continue
+    case "$upstream" in
+      refs/remotes/origin/*) ;;
+      *) continue ;;
+    esac
+    is_gone_branch "$branch" && continue
+    printf '%s\t%s\n' "$branch" "refs/heads/${upstream#refs/remotes/origin/}"
+  done >"$ELIGIBLE_FILE"
+  if [ ! -s "$ELIGIBLE_FILE" ]; then
+    STALE_SNAPSHOT_STATE="ok"
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
+    return 0
+  fi
+
   local snapshot snapshot_rc=0
   snapshot=$(git ls-remote --heads origin 2>/dev/null) || snapshot_rc=$?
   if [ "$snapshot_rc" -ne 0 ]; then
     STALE_SNAPSHOT_STATE="unknown"
     STALE_SNAPSHOT_REASON="git ls-remote --heads origin exited $snapshot_rc"
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
     return 0
   fi
   STALE_SNAPSHOT_STATE="ok"
@@ -689,33 +746,18 @@ stale_unpruned_branches() {
   }
   # `<sha>\t<refname>` per line; keep the refname column only.
   printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$HEADS_FILE"
-  local branch upstream remote_head
-  # Git ref names may contain `|`, but cannot contain a tab. Use a tab record
-  # separator so every branch/upstream pair round-trips losslessly.
-  # `refname:short` expands an ambiguous local branch name to `heads/<name>`
-  # when a tag shares its short name. The input is already constrained to
-  # refs/heads, so strip that namespace directly and retain the canonical
-  # branch name for the gone/PR lookups below.
-  git for-each-ref --format='%(refname:lstrip=2)%09%(upstream)' refs/heads/ 2>/dev/null |
-  while IFS=$'\t' read -r branch upstream; do
-    [ -n "$branch" ] || continue
-    case "$upstream" in
-      refs/remotes/origin/*) ;;
-      *) continue ;;
-    esac
-    is_gone_branch "$branch" && continue
-    # Conventional mapping, guaranteed by origin_fetch_is_conventional above:
-    # refs/remotes/origin/<name> is populated by the remote's
-    # refs/heads/<name>. Derive it from the FULL %(upstream) ref, never from
-    # %(upstream:short) — when a local branch literally named `origin/foo`
-    # exists, `:short` renders foo's upstream as `remotes/origin/foo` and the
-    # derived head name comes out wrong.
-    remote_head="refs/heads/${upstream#refs/remotes/origin/}"
+  # The eligible list was already resolved above; each record carries the
+  # branch and the remote head that populates its tracking ref, so this pass
+  # is a pure membership test against the snapshot.
+  local remote_head
+  while IFS=$'\t' read -r branch remote_head; do
     # Exact full-path match: `-Fx` so a branch named `feat` is never
     # satisfied by the remote having `feature`.
     grep -Fxq -- "$remote_head" "$HEADS_FILE" && continue
     echo "$branch"
-  done
+  done <"$ELIGIBLE_FILE"
+  rm -f "$ELIGIBLE_FILE"
+  ELIGIBLE_FILE=""
   rm -f "$HEADS_FILE"
   HEADS_FILE=""
 }
@@ -786,17 +828,18 @@ GONE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-gone.XXXXXX")
 REC_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-rec.XXXXXX")
 STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
 # EVERY mktemp site in this script is registered here (#920 finding 2). The
-# four later ones — HEADS_FILE and RECORDS_FILE inside the helpers above,
-# MERGE_SWEEP_FILE and KNOWN_FILE further down — used to rely solely on an
+# five later ones — HEADS_FILE, ELIGIBLE_FILE and RECORDS_FILE inside the
+# helpers above, MERGE_SWEEP_FILE and KNOWN_FILE further down — used to rely
+# solely on an
 # inline `rm -f` placed after their work. Under `set -e` any failure in
 # between (a failed `git` call, a closed pipe, SIGINT) exits before that line
 # and leaks the file into TMPDIR. The inline removals stay — they keep TMPDIR
 # tidy during a long run and they blank the variable so this trap has nothing
 # left to do — and the `${VAR:-}` expansions make the trap safe to fire before
-# any of the four has been assigned. `rm -f ''` is a silent no-op on both GNU
+# any of them has been assigned. `rm -f ''` is a silent no-op on both GNU
 # and BSD rm, so the empty slots cost nothing.
 #
-# The four names are initialised to the empty string FIRST, and that line is
+# The five names are initialised to the empty string FIRST, and that line is
 # load-bearing rather than defensive tidiness. This script runs under
 # `set -eo pipefail` with NO `set -u`, so `${HEADS_FILE:-}` does not mean
 # "unset unless this script assigned it" — it means "whatever is in scope",
@@ -818,10 +861,11 @@ STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
 STALE_SNAPSHOT_STATE=""
 STALE_SNAPSHOT_REASON=""
 HEADS_FILE=""
+ELIGIBLE_FILE=""
 RECORDS_FILE=""
 MERGE_SWEEP_FILE=""
 KNOWN_FILE=""
-trap 'rm -f "$GONE_FILE" "$REC_FILE" "$STALE_UNPRUNED_FILE" "${HEADS_FILE:-}" "${RECORDS_FILE:-}" "${MERGE_SWEEP_FILE:-}" "${KNOWN_FILE:-}"' EXIT
+trap 'rm -f "$GONE_FILE" "$REC_FILE" "$STALE_UNPRUNED_FILE" "${HEADS_FILE:-}" "${ELIGIBLE_FILE:-}" "${RECORDS_FILE:-}" "${MERGE_SWEEP_FILE:-}" "${KNOWN_FILE:-}"' EXIT
 
 gone_branches >"$GONE_FILE"
 worktree_records >"$REC_FILE"
@@ -1538,9 +1582,9 @@ fi
 # report has a hole in it, because the alternative is a preview that reports
 # clean and an --apply that then acts on branches the preview never listed.
 #
-# Ordering: 3 wins over 2 when both hold. Exit 2 promises that --apply
-# resolves what was listed, and that promise cannot be honoured for the part
-# of the tree this run could not read.
+# Ordering: 3 wins over 2 when both hold. 2 asserts the audit was COMPLETE,
+# and that assertion is the one thing an unreadable remote makes false; the
+# findings themselves are equally real either way.
 #
 # Only `unknown` reaches here, never `declined`: see stale_unpruned_branches().
 if [ "$STALE_SNAPSHOT_STATE" = "unknown" ]; then

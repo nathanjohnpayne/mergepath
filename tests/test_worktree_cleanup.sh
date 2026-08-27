@@ -2830,6 +2830,69 @@ else
   echo "$OUT_MAPPED_DRY" >&2
 fi
 
+# ── Case 44b (#1105, Codex P2): an irrelevant remote read is not a hole ──
+# A repository can carry a conventional refspec and an `origin` while no
+# local branch tracks refs/remotes/origin/* at all — an origin added to a
+# local-only checkout is the ordinary case. The stale-unpruned set is then
+# provably empty from local reads alone, and the remote has no say in it.
+#
+# Taking the snapshot unconditionally made an unreachable origin turn such a
+# run into an INCOMPLETE audit (exit 3) on the strength of a read nobody
+# needed. Eligibility is decided first, so this stays a clean exit 0.
+#
+# This is the boundary of Case 44: same broken remote, same conventional
+# refspec — the ONLY difference is whether any branch tracks origin.
+NOELIG_ROOT="$WORKDIR/unreachable-but-irrelevant"
+NOELIG_MAIN="$NOELIG_ROOT/main"
+mkdir -p "$NOELIG_ROOT"
+git init -q -b main "$NOELIG_MAIN"
+(
+  cd "$NOELIG_MAIN"
+  git -C "$NOELIG_MAIN" config user.email "test@example.com"
+  git -C "$NOELIG_MAIN" config user.name "Test"
+  git -C "$NOELIG_MAIN" config commit.gpgsign false
+  git -C "$NOELIG_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  # An origin that does not exist, and nothing ever pushed to it.
+  git remote add origin "$NOELIG_ROOT/never-existed.git"
+) >/dev/null 2>&1
+NOELIG_MAIN=$(cd "$NOELIG_MAIN" && pwd -P)
+
+# Premise 1: the refspec is conventional, so the probe gets past
+# origin_fetch_is_conventional() and would reach the snapshot.
+if ! git -C "$NOELIG_MAIN" config --get-all remote.origin.fetch \
+     | grep -Fqx -- '+refs/heads/*:refs/remotes/origin/*'; then
+  fail "fixture setup: remote.origin.fetch is not conventional — case 44b would exercise the declined path"
+fi
+# Premise 2: the remote really is unreachable, so this differs from case 44
+# in exactly one respect.
+if git -C "$NOELIG_MAIN" ls-remote --heads origin >/dev/null 2>&1; then
+  fail "fixture setup: ls-remote succeeds — case 44b no longer isolates the eligibility question"
+fi
+# Premise 3: and nothing tracks origin. That is the whole difference.
+if [ -n "$(git -C "$NOELIG_MAIN" for-each-ref --format='%(upstream)' refs/heads/)" ]; then
+  fail "fixture setup: a branch tracks an upstream — case 44b needs the no-eligible-branch shape"
+fi
+
+set +e
+OUT_NOELIG=$( cd "$NOELIG_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_NOELIG=$?
+set -e
+if [ "$RC_NOELIG" -eq 0 ]; then
+  pass "#1105 an unreachable remote no branch depends on leaves the audit complete (exit 0)"
+else
+  fail "#1105 an irrelevant remote read made the audit incomplete (rc=$RC_NOELIG, expected 0)"
+  echo "$OUT_NOELIG" >&2
+fi
+if ! echo "$OUT_NOELIG" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1105 a provably-empty stale set is not annotated as unmeasured"
+else
+  fail "#1105 the audit claimed a hole where the answer was known locally"
+  echo "$OUT_NOELIG" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

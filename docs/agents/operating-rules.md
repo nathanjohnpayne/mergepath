@@ -136,6 +136,10 @@ scripts/worktree-cleanup.sh --apply --orphan-clean
 
 Locked worktrees and orphan dirs are listed in dry-run but require explicit `--force-locked` / `--orphan-clean` opt-in under `--apply`, because locked worktrees may correspond to in-progress agent sessions and orphan dirs may hold partial work the user wants to keep. Verified-merged local branches are deleted only after `gh pr list --head <branch> --state merged` confirms the PR merged; checked-out local branches are listed but skipped.
 
+**Exit status.** `0` is a clean audit. `1` is a generic error (bad invocation, git failure, unsupported state). `2` is a **complete** audit that found something actionable — note that `2` does not promise a plain `--apply` clears it: diverged-but-merged branches and dirty closed-PR worktrees need a human decision and `--apply` deliberately never touches them, and locked entries and orphans need `--force-locked` / `--orphan-clean`. `3` is an **incomplete** audit (#992): a read the run depends on failed, so the report has a hole in it and its silences are not evidence. The `2`-versus-`3` axis is completeness, not who can act.
+
+Today the only read that produces `3` is the single `git ls-remote --heads origin` snapshot behind the stale-unpruned probe, which is dry-run only — `--apply` never exits `3`. The remedy is to re-run once the remote is reachable, not to re-run with `--apply`: the summary names the failure on a `NOT MEASURED` line directly under the affected counter, because that counter reads `0` when nothing was checked exactly as it does when nothing is stale. Do not treat a `3` as a clean tree, and do not treat it as an error to be retried blindly. An unreachable remote is also not the same thing as a non-conventional `remote.origin.fetch`, which the probe declines to evaluate as a standing documented limitation and which keeps exiting `0`.
+
 This helper is intentionally local-only — worktree state is machine-local and should not gate repository CI (see #288).
 
 ## Feedback-rollup cadence model
