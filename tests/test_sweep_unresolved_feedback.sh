@@ -570,10 +570,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 7: target-repos.txt file shipped with the repo lists exactly
-# the 9 repos from the 2026-05-13 sweep plus fiveacross (added in #740
-# as gaycruisebingo, renamed 2026-08-27, so its under-threshold PRs
-# stop going untracked by the sweep).
+# Test 7: target-repos.txt file shipped with the repo lists exactly the
+# 9 repos currently swept. That count is the 2026-05-13 seed of 9, PLUS
+# fiveacross (added in #740 as gaycruisebingo, renamed 2026-08-27, so its
+# under-threshold PRs stop going untracked), MINUS device-platform-reporting
+# (removed 2026-08-26 when that repo was archived). Net 9, not 10 — the
+# same arithmetic target-repos.txt's own header records.
 # ---------------------------------------------------------------------------
 SHIPPED_TARGETS="$ROOT/scripts/sweep-unresolved-feedback/target-repos.txt"
 if [ ! -f "$SHIPPED_TARGETS" ]; then
