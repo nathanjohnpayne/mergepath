@@ -90,7 +90,19 @@ ghas_severity_cache_init() {
 }
 
 ghas_severity_cache_cleanup() {
-  [ -n "${GHAS_SEVERITY_CACHE:-}" ] && rm -f "$GHAS_SEVERITY_CACHE"
+  # Documented usage is `trap 'ghas_severity_cache_cleanup' EXIT` (possibly
+  # combined with further commands in the same trap string). Under `set -e`
+  # a failing command inside a trap aborts the REST of that trap early and
+  # overrides the caller's exit status with its own -- so an empty/unset
+  # GHAS_SEVERITY_CACHE (e.g. ghas_severity_cache_init itself failed) must
+  # never make this return non-zero, or a cleanup helper would get to
+  # decide the gate's verdict (CodeRabbit, PR #1124). Also remove the
+  # `.tmp` sibling the write path in ghas_alert_severity can leave behind
+  # if jq or mv fails mid-write.
+  if [ -n "${GHAS_SEVERITY_CACHE:-}" ]; then
+    rm -f "$GHAS_SEVERITY_CACHE" "$GHAS_SEVERITY_CACHE.tmp"
+  fi
+  return 0
 }
 
 ghas_alert_severity() {

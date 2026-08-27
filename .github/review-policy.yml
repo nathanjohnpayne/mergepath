@@ -635,9 +635,14 @@ codex:
 # (`.../security/code-scanning/<number>`). Accounting resolves severity by
 # reading `repos/{owner}/{repo}/code-scanning/alerts/{number}` — the alert's
 # permanent identity, not a ref-scoped list (`scripts/lib/ghas-alert-severity.sh`,
-# #1113; fetched lazily and memoized, only when a `github-advanced-security[bot]`
-# inline comment is present, so a repo without code scanning enabled never
-# pays this API call) — and mapping the alert's `rule.security_severity_level`
+# #1113; fetched lazily, only when a `github-advanced-security[bot]` inline
+# comment is present, so a repo without code scanning enabled never pays
+# this API call). Memoized per (repo, alert number) via a FILE named by
+# `GHAS_SEVERITY_CACHE` — not a plain shell variable, which a value read
+# back through `severity=$(ghas_alert_severity ...)` would silently lose
+# to that command substitution's subshell — created and removed once per
+# caller invocation (`ghas_severity_cache_init` / `_cleanup`). Mapping the
+# alert's `rule.security_severity_level`
 # onto the SAME p0–p3 ladder Codex/CodeRabbit use:
 #
 #   critical -> p0   high -> p1   medium -> p2   low -> p3
@@ -667,6 +672,12 @@ codex:
 # resolves the alert's severity before the comment can disappear and hands
 # it to `scripts/render-feedback-archive.sh` as an explicit tier, so the
 # finding stays in accounting's inventory instead of silently vanishing.
+# Archive-time resolution deliberately does NOT share live evaluation's
+# fail-loudly posture: a failed read there WARNS and falls back to `p2`
+# rather than failing the archive job, because archival is a one-shot
+# capture of a disappearing comment with no scheduled retry — losing the
+# only surviving record entirely would be worse than archiving it under a
+# possibly-too-low tier with a visible warning.
 # `scripts/review-feedback-surface-fingerprint.sh`'s before/after
 # consistency hash also includes every referenced alert's current severity,
 # so a same-window severity change or newly-resolvable alert is detected

@@ -1693,6 +1693,39 @@ else
   pass "GHAS severity resolution stays alert-number-scoped, not ref-scoped (#1113)"
 fi
 
+# CodeRabbit, PR #1124: ghas_severity_cache_cleanup must never itself decide
+# the caller's exit status. Under `set -e`, a command inside an EXIT trap
+# that returns non-zero aborts the rest of that trap AND overrides the
+# script's real exit code with its own -- so an empty/unset
+# GHAS_SEVERITY_CACHE (the state right after a failed
+# ghas_severity_cache_init) must not make cleanup fail.
+CLEANUP_RC=0
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE=""
+  trap "ghas_severity_cache_cleanup" EXIT
+  exit 0
+' || CLEANUP_RC=$?
+assert_eq 0 "$CLEANUP_RC" "ghas_severity_cache_cleanup with an empty cache var does not override the caller's exit status (#1124)"
+
+CLEANUP_TMP_RC=0
+CLEANUP_TMP_FILE="$TMP/ghas-cleanup-check"
+: >"$CLEANUP_TMP_FILE"
+: >"$CLEANUP_TMP_FILE.tmp"
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$CLEANUP_TMP_FILE"'"
+  ghas_severity_cache_cleanup
+' || CLEANUP_TMP_RC=$?
+assert_eq 0 "$CLEANUP_TMP_RC" "ghas_severity_cache_cleanup with a set cache var succeeds"
+if [ -f "$CLEANUP_TMP_FILE" ] || [ -f "$CLEANUP_TMP_FILE.tmp" ]; then
+  fail "ghas_severity_cache_cleanup removes both the cache file and its .tmp sibling (#1124)"
+else
+  pass "ghas_severity_cache_cleanup removes both the cache file and its .tmp sibling (#1124)"
+fi
+
 # --- github-advanced-security / code scanning (#1101) ----------------------
 #
 # Before #1101, a github-advanced-security[bot] inline comment (the form
