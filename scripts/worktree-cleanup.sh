@@ -169,6 +169,16 @@
 #   2  candidates listed but --apply was not passed (dry-run with findings).
 #      Lets callers wire this into "audit fails CI" style checks even
 #      though we explicitly do NOT wire this into PR CI per #288.
+#   3  the audit could not be fully evaluated: a read it depends on FAILED,
+#      so the report is incomplete and its silences are not evidence (#992).
+#      Deliberately NOT folded into 2. Exit 2 carries a specific promise —
+#      "re-run with --apply and it will act" — and an unevaluable read is
+#      the one case where that promise is false: --apply cannot resolve a
+#      remote it also cannot reach. Callers that only branch on 2 are
+#      unaffected; callers that treat any non-zero as actionable still see
+#      it. Today the only such read is the remote-heads snapshot behind
+#      stale_unpruned_branches(), which is dry-run only, so --apply never
+#      exits 3.
 #
 # Notes:
 #   - Always invoked from within a git repo (the main one or a worktree).
@@ -629,20 +639,54 @@ origin_fetch_is_conventional() {
 #                        remote with no heads at all — unusual but real, and
 #                        it correctly makes every tracking branch stale.
 #   any other exit     → the query FAILED (no network, auth failure, unknown
-#                        remote). Not evidence any branch was deleted: fail
-#                        closed and report nothing.
+#                        remote). Not evidence any branch was deleted: report
+#                        nothing, AND record the state as `unknown` (#992).
+#
+# Reporting nothing is fail-closed for CLASSIFICATION but fail-OPEN for the
+# AUDIT, and the second half is what #992 is about. With the failure
+# unrecorded, an unreachable remote rendered identically to a clean tree:
+# `gone (stale remote ref, unpruned): 0`, nothing on stderr, exit 0. The
+# preview then claimed an agreement with --apply that it had never been able
+# to model — and --apply, run later with working network, acts on a
+# classification the preview never showed. That is the same class as the
+# gone_branches() defect #991 fixed for the LOCAL branch inventory (an
+# unreadable read reported as an empty one), applied to the remote read.
+#
+# $STALE_SNAPSHOT_STATE tells the caller which of three things happened:
+#   ok        the snapshot was taken; the reported set is authoritative
+#   declined  a non-conventional remote.origin.fetch — deliberately not
+#             evaluated, a documented limitation with a stable answer
+#   unknown   the read failed; nothing is known either way
+#
+# `declined` is deliberately NOT `unknown`. It is a standing, documented
+# limitation rather than a transient failure, and collapsing the two would
+# put every non-conventional checkout at a permanent exit 3 — repeating the
+# mistake the SUMMARY_LOOKUP_UNKNOWN carve-out below exists to avoid.
 stale_unpruned_branches() {
-  cd "$MAIN_WORKTREE" || return 0
+  cd "$MAIN_WORKTREE" || { STALE_SNAPSHOT_STATE="unknown"; STALE_SNAPSHOT_REASON="cannot enter the main worktree"; return 0; }
   # A non-default refspec makes the tracking-ref → remote-head mapping
   # unknowable here; decline rather than guess (origin_fetch_is_conventional).
-  origin_fetch_is_conventional || return 0
+  origin_fetch_is_conventional || { STALE_SNAPSHOT_STATE="declined"; return 0; }
   local snapshot snapshot_rc=0
   snapshot=$(git ls-remote --heads origin 2>/dev/null) || snapshot_rc=$?
-  [ "$snapshot_rc" -eq 0 ] || return 0
+  if [ "$snapshot_rc" -ne 0 ]; then
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_REASON="git ls-remote --heads origin exited $snapshot_rc"
+    return 0
+  fi
+  STALE_SNAPSHOT_STATE="ok"
   # Trap-visible global, not a `local` (#920 finding 2): under `set -e` any
   # failure between mktemp and the inline `rm -f` below — a broken pipe, a
   # SIGINT — exits without ever reaching the removal and leaks the file.
-  HEADS_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-remoteheads.XXXXXX") || return 0
+  HEADS_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-remoteheads.XXXXXX") || {
+    # The snapshot was taken but cannot be held, and the observable result is
+    # the same as a failed query: nothing reported. It must therefore carry
+    # the same state, or it becomes this issue's silent-clean case one level
+    # further down.
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_REASON="could not create the remote-heads snapshot file"
+    return 0
+  }
   # `<sha>\t<refname>` per line; keep the refname column only.
   printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$HEADS_FILE"
   local branch upstream remote_head
@@ -767,6 +811,12 @@ STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
 # collision in the environment. Assigning here shadows any inherited value
 # before the trap is installed and keeps the trap's reach to this script's
 # own `mktemp` files.
+# Whether the one remote read this audit performs actually happened. Empty
+# until stale_unpruned_branches() runs, which is dry-run only: under --apply
+# the probe never runs, the state stays empty, and the exit-3 arm at the
+# bottom is unreachable there by construction.
+STALE_SNAPSHOT_STATE=""
+STALE_SNAPSHOT_REASON=""
 HEADS_FILE=""
 RECORDS_FILE=""
 MERGE_SWEEP_FILE=""
@@ -1409,6 +1459,16 @@ printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
 # stale_unpruned_branches() skips anything already in GONE_FILE. So the array
 # length IS the branch count; nothing here needs de-duplicating.
 printf "  gone (stale remote ref, unpruned): %d\n" "${#SUMMARY_STALE_UNPRUNED[@]}"
+# ...and, when that counter is not a measurement at all, say so on the line
+# after it (#992). Without this the number 0 carries two incompatible
+# meanings — "no branch is in this state" and "this could not be checked" —
+# and only the first is what a reader takes from it.
+if [ "$STALE_SNAPSHOT_STATE" = "unknown" ]; then
+  printf "    ^ NOT MEASURED: %s\n" "$STALE_SNAPSHOT_REASON"
+  printf "      The remote could not be read, so the count above is 0 because\n"
+  printf "      nothing was checked — not because nothing is stale. Re-run once\n"
+  printf "      the remote is reachable before trusting this audit (exit 3).\n"
+fi
 printf "  open-PR retained: %d\n" "${#SUMMARY_OPEN_PR[@]}"
 printf "  orphan dirs:      %d\n" "${#SUMMARY_ORPHAN[@]}"
 
@@ -1471,6 +1531,22 @@ if [ "$total_candidates" -gt 0 ]; then
   echo "${C_DIM}Dry run. Re-run with --apply to remove safe candidates.${C_RESET}"
   echo "${C_DIM}  --force-locked   also remove LOCKED entries (#288)${C_RESET}"
   echo "${C_DIM}  --orphan-clean   also rm -rf orphans under .claude/worktrees/${C_RESET}"
+fi
+# An incomplete audit outranks a complete one with findings (#992). Both the
+# hint above and the candidate list stay exactly as they were — the operator
+# still gets everything the run DID establish — but the status says the
+# report has a hole in it, because the alternative is a preview that reports
+# clean and an --apply that then acts on branches the preview never listed.
+#
+# Ordering: 3 wins over 2 when both hold. Exit 2 promises that --apply
+# resolves what was listed, and that promise cannot be honoured for the part
+# of the tree this run could not read.
+#
+# Only `unknown` reaches here, never `declined`: see stale_unpruned_branches().
+if [ "$STALE_SNAPSHOT_STATE" = "unknown" ]; then
+  exit 3
+fi
+if [ "$total_candidates" -gt 0 ]; then
   exit 2
 fi
 exit 0

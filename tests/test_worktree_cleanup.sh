@@ -2704,6 +2704,132 @@ if [ "$TRAPENV_RC" -eq 0 ]; then
 fi
 trapenv_assert
 
+# ── Case 44 (#992 crit 1): an unreadable remote is not a clean audit ─────
+# stale_unpruned_branches() takes exactly one remote read. When that read
+# failed it returned silently, leaving STALE_UNPRUNED_FILE empty — and the
+# audit then printed `gone (stale remote ref, unpruned): 0`, wrote nothing to
+# stderr, and exited 0. A failed snapshot was byte-identical to a clean tree.
+#
+# That is the dangerous direction rather than the merely noisy one: the
+# preview claims agreement with an --apply it was never able to model, and a
+# later --apply with working network reclassifies branches as gone and
+# removes worktrees the preview never listed.
+#
+# The remote is broken by pointing origin at a path that does not exist, so
+# the case needs no network and cannot flake on one.
+UNK_ROOT="$WORKDIR/unreachable-remote"
+UNK_REMOTE="$UNK_ROOT/remote.git"
+UNK_MAIN="$UNK_ROOT/main"
+mkdir -p "$UNK_ROOT"
+git init -q --bare "$UNK_REMOTE"
+git init -q -b main "$UNK_MAIN"
+(
+  cd "$UNK_MAIN"
+  git -C "$UNK_MAIN" config user.email "test@example.com"
+  git -C "$UNK_MAIN" config user.name "Test"
+  git -C "$UNK_MAIN" config commit.gpgsign false
+  git -C "$UNK_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$UNK_REMOTE"
+  git push -q -u origin main
+  git checkout -q -b topic
+  git push -q -u origin topic
+  git checkout -q main
+) >/dev/null 2>&1
+git -C "$UNK_MAIN" remote set-url origin "$UNK_ROOT/vanished.git"
+
+# Premise 1: the refspec is still the conventional one, so the probe REACHES
+# the remote read rather than declining before it. Without this the case
+# would assert exit 3 on a path that never runs — and `declined` must not
+# exit 3, which is the distinction the whole change rests on.
+if ! git -C "$UNK_MAIN" config --get-all remote.origin.fetch \
+     | grep -Fqx -- '+refs/heads/*:refs/remotes/origin/*'; then
+  fail "fixture setup: remote.origin.fetch is not conventional — case 44 would exercise the declined path, not the unknown one"
+fi
+# Premise 2: the read really does fail.
+if git -C "$UNK_MAIN" ls-remote --heads origin >/dev/null 2>&1; then
+  fail "fixture setup: ls-remote still succeeds against the vanished remote — case 44 has no failure to detect"
+fi
+# Premise 3: there is a branch the probe WOULD have evaluated, so the count
+# of 0 is genuinely an absence of measurement and not an absence of subjects.
+if [ "$(git -C "$UNK_MAIN" for-each-ref --format='%(upstream)' refs/heads/topic)" \
+     != "refs/remotes/origin/topic" ]; then
+  fail "fixture setup: topic does not track origin/topic — the probe would have had nothing to evaluate anyway"
+fi
+
+set +e
+OUT_UNK=$( cd "$UNK_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_UNK=$?
+set -e
+if [ "$RC_UNK" -eq 3 ]; then
+  pass "#992 an unreadable remote snapshot exits 3 rather than reporting a clean audit"
+else
+  fail "#992 an unreadable remote snapshot exited $RC_UNK (expected 3)"
+  echo "$OUT_UNK" >&2
+fi
+if echo "$OUT_UNK" | grep -Fq -- "NOT MEASURED"; then
+  pass "#992 the zero count is annotated as not-measured rather than left to read as clean"
+else
+  fail "#992 the summary presented an unmeasured count as a measurement"
+  echo "$OUT_UNK" >&2
+fi
+# The count itself must still be 0 — the fix adds a qualifier, it does not
+# invent a number the run could not obtain.
+if echo "$OUT_UNK" | grep -qE "gone \(stale remote ref, unpruned\): +0$"; then
+  pass "#992 the unmeasured counter still reports 0 rather than a fabricated figure"
+else
+  fail "#992 the stale-unpruned counter changed value on an unreadable remote"
+  echo "$OUT_UNK" >&2
+fi
+
+# Precedence: an incomplete audit outranks a complete one with findings. Add
+# an orphan so total_candidates is non-zero, which without the ordering rule
+# would exit 2 and hide the hole behind an ordinary findings status.
+mkdir -p "$UNK_MAIN/.claude/worktrees/leftover"
+echo residue > "$UNK_MAIN/.claude/worktrees/leftover/residue.txt"
+set +e
+OUT_UNK2=$( cd "$UNK_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_UNK2=$?
+set -e
+if echo "$OUT_UNK2" | grep -qE "orphan dirs: +1$"; then
+  pass "#992 precedence fixture: the run really did find a candidate"
+else
+  fail "fixture setup: the orphan was not detected, so the precedence assertion below is vacuous"
+  echo "$OUT_UNK2" >&2
+fi
+if [ "$RC_UNK2" -eq 3 ]; then
+  pass "#992 an incomplete audit outranks findings — exit 3, not 2"
+else
+  fail "#992 an incomplete audit with findings exited $RC_UNK2 (expected 3)"
+  echo "$OUT_UNK2" >&2
+fi
+# Raising the status must not cost the operator the hint or the findings.
+if echo "$OUT_UNK2" | grep -Fq -- "Re-run with --apply"; then
+  pass "#992 the --apply hint survives the raised exit status"
+else
+  fail "#992 raising the exit status suppressed the dry-run hint"
+  echo "$OUT_UNK2" >&2
+fi
+
+# The other half of the distinction: `declined` is NOT `unknown`. Case 24's
+# renamed-refspec repo reaches origin_fetch_is_conventional() and stops
+# there, and must keep exiting 0 — folding a standing, documented limitation
+# into the unknown state would put every non-conventional checkout at a
+# permanent exit 3.
+if [ "$RC_MAPPED_DRY" -eq 0 ]; then
+  pass "#992 a declined (non-conventional refspec) probe does not exit 3"
+else
+  fail "#992 the declined path was conflated with the unknown one (rc=$RC_MAPPED_DRY)"
+fi
+if ! echo "$OUT_MAPPED_DRY" | grep -Fq -- "NOT MEASURED"; then
+  pass "#992 a declined probe is not annotated as an unmeasured failure"
+else
+  fail "#992 a documented limitation was reported as a failed read"
+  echo "$OUT_MAPPED_DRY" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
