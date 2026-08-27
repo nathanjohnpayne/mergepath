@@ -166,6 +166,13 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   # check_spec_test_alignment.
   'specs/bootstrap_consumer_identity.md'
 
+  # Bootstrap source-SHA attribution spec (#1056): same rationale as the
+  # consumer-identity spec above, and it links two hub-only agent docs
+  # (docs/agents/propagation-ordering.md, docs/agents/bootstrap-runbook.md)
+  # that are themselves excluded — shipping it into a consumer would leave
+  # both links dangling (Codex P2 on #1112).
+  'specs/bootstrap_source_attribution.md'
+
   # Mergepath-internal policy simulation tool
   'scripts/policy-sim.sh'
 
@@ -1187,6 +1194,10 @@ bootstrap::_yq_clean_repo_template() {
   # a surviving map entry is stale hub metadata in the consumer (and
   # this key is not name-bearing, so it survives substitution as-is).
   yq -i 'del(.spec_test_map.bootstrap_consumer_identity)' "$f"
+  # Same rationale for the source-SHA-attribution spec (#1056, Codex P2
+  # round 4 on #1112): it too is mirror-excluded (both it and the doc
+  # ownership) alongside the hub-only test it maps to.
+  yq -i 'del(.spec_test_map.bootstrap_source_attribution)' "$f"
   # Drop extra_top_level_dirs entirely — the new repo has no
   # mergepath/ or packaging/ dirs.
   yq -i 'del(.extra_top_level_dirs)' "$f"
@@ -1196,8 +1207,7 @@ bootstrap::_yq_clean_repo_template() {
 # sha, exit 0, ONLY when source_root is verifiably a checkout of canonical
 # mergepath (nathanjohnpayne/mergepath) whose HEAD is reachable from that
 # repo's own remote history; prints nothing and exits 1 otherwise. Canonical
-# behavior contract: specs/bootstrap_consumer_identity.md § Source SHA
-# attribution (#1056/#1112).
+# behavior contract: specs/bootstrap_source_attribution.md (#1056/#1112).
 #
 # Three independent checks, each closing a gap the previous round found:
 #
@@ -1220,6 +1230,23 @@ bootstrap::_yq_clean_repo_template() {
 #      carry an unpushed local commit on `main`; checks 1+2 alone would
 #      attribute a sha that the canonical remote (and therefore
 #      `git ls-tree -r "$HUB_REF"` run elsewhere) has never heard of.
+#   4. source_root's working tree is clean (Codex P2 round 4). Wizard
+#      preflight only validates the checkout at $SCRIPT_DIR/.. is clean —
+#      if BOOTSTRAP_MERGEPATH_ROOT points at a DIFFERENT canonical-origin
+#      checkout that preflight never saw, checks 1-3 alone would still
+#      accept it. Stage B's rsync mirrors that checkout's WORKING-TREE
+#      bytes (tracked edits and untracked files alike, not the committed
+#      tree), so a dirty source_root would attribute a HEAD whose tree
+#      does not match what was actually mirrored.
+#
+# `for-each-ref --count=1` (not a bare `for-each-ref | grep -q .`) is
+# deliberate: under this file's `set -o pipefail`, a `grep -q` that exits
+# after its first match while for-each-ref is still writing sends git
+# SIGPIPE, which pipefail then surfaces as a failure — turning a REAL
+# match into a false negative once the ref list is large enough to
+# overflow the pipe buffer before grep exits (Codex P2 round 4, reproduced
+# at ~5000 refs). Limiting the producer to one match removes the race
+# instead of racing grep against it.
 bootstrap::_resolve_canonical_source_sha() {
   local source_root=${1:-}
   [ -n "$source_root" ] && [ -d "$source_root" ] || return 1
@@ -1239,8 +1266,10 @@ bootstrap::_resolve_canonical_source_sha() {
     *) return 1 ;;
   esac
 
-  git -C "$source_root" for-each-ref --format='%(refname)' --contains HEAD refs/remotes/origin \
+  git -C "$source_root" for-each-ref --count=1 --format='%(refname)' --contains HEAD refs/remotes/origin \
     | grep -q . || return 1
+
+  [ -z "$(git -C "$source_root" status --porcelain 2>/dev/null)" ] || return 1
 
   git -C "$source_root" rev-parse HEAD 2>/dev/null
 }

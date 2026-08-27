@@ -150,6 +150,8 @@ spec_test_map:
     - tests/test_mergepath_playground.sh
   bootstrap_consumer_identity:
     - tests/test_bootstrap_template_mirror.sh
+  bootstrap_source_attribution:
+    - tests/test_bootstrap_template_mirror.sh
   some_other_spec:
     - tests/test_some_other.sh
 test_globs:
@@ -238,6 +240,9 @@ echo "# CodeRabbit configuration audit (hub-only)" >"$FAKE_MP/docs/agents/codera
 echo "playground spec" >"$FAKE_MP/specs/mergepath_playground.md"
 echo "playground plan" >"$FAKE_MP/plans/mergepath-playground.md"
 echo "playground test" >"$FAKE_MP/tests/test_mergepath_playground.sh"
+# source-SHA-attribution spec (#1056): must NOT propagate either, since it
+# links two hub-only docs/agents/ docs excluded below.
+echo "source attribution spec" >"$FAKE_MP/specs/bootstrap_source_attribution.md"
 echo "screenshot bug"  >"$FAKE_MP/bugs/screenshots/foo.png"
 echo "workflow screen" >"$FAKE_MP/.github/screenshots/bar.png"
 echo "claude worktree state" >"$FAKE_MP/.claude/worktrees/foo.json"
@@ -1581,6 +1586,18 @@ if yq '.spec_test_map.bootstrap_consumer_identity' "$TARGET/.repo-template.yml" 
 else
   pass "bootstrap_consumer_identity spec_test_map entry removed"
 fi
+# Same for the source-SHA-attribution spec (#1056, Codex P2 round 4 on
+# #1112): its spec file is mirror-excluded too, so a surviving map entry
+# would be equally stale.
+if yq '.spec_test_map.bootstrap_source_attribution' "$TARGET/.repo-template.yml" 2>/dev/null \
+     | grep -q "tests/test_bootstrap_template_mirror"; then
+  fail "bootstrap_source_attribution spec_test_map entry not removed"
+else
+  pass "bootstrap_source_attribution spec_test_map entry removed"
+fi
+[ -f "$TARGET/specs/bootstrap_source_attribution.md" ] \
+  && fail "specs/bootstrap_source_attribution.md leaked into the consumer (its links to hub-only docs would 404)" \
+  || pass "specs/bootstrap_source_attribution.md excluded from the consumer mirror"
 # But some_other_spec entry should remain (we only dropped the hub-only ones).
 yq '.spec_test_map.some_other_spec' "$TARGET/.repo-template.yml" 2>/dev/null \
   | grep -q "tests/test_some_other" \
@@ -2245,6 +2262,44 @@ unpushed_subject=$(git -C "$UNPUSHED_TARGET" log -1 --format=%s)
 [ "$unpushed_subject" = "Initial commit (bootstrapped from mergepath)" ] \
   && pass "an unpushed local HEAD (not in any remote-tracking ref) does not get its sha recorded (#1056 Codex P1 round 3)" \
   || fail "unpushed-commit source_root leaked a sha: $unpushed_subject (had ${UNPUSHED_SHA:0:7} available)"
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 4: wizard preflight only validates the checkout at
+# $SCRIPT_DIR/.. is clean. If BOOTSTRAP_MERGEPATH_ROOT points at a DIFFERENT
+# canonical-origin checkout preflight never saw, checks 1-3 alone would still
+# accept it -- but Stage B's rsync mirrors that checkout's WORKING-TREE
+# bytes (tracked edits included), so a dirty source_root would attribute a
+# HEAD whose tree does not match what was actually mirrored. Same origin +
+# remote-tracking ref as the successful FAKE_MP path, but with an uncommitted
+# tracked edit left in the working tree.
+# ---------------------------------------------------------------------------
+DIRTY_SOURCE="$WORKDIR/dirty-working-tree-repo"
+mkdir -p "$DIRTY_SOURCE"
+git -C "$DIRTY_SOURCE" init -q -b main
+git -C "$DIRTY_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo seed >"$DIRTY_SOURCE/f"
+git -C "$DIRTY_SOURCE" add -A
+git -C "$DIRTY_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "dirty-tree seed"
+git -C "$DIRTY_SOURCE" update-ref refs/remotes/origin/main HEAD
+DIRTY_SHA=$(git -C "$DIRTY_SOURCE" rev-parse HEAD)
+echo "uncommitted edit" >>"$DIRTY_SOURCE/f"
+DIRTY_TARGET="$WORKDIR/dirty-target"
+mkdir -p "$DIRTY_TARGET"
+echo seed >"$DIRTY_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$DIRTY_TARGET" "$DIRTY_SOURCE" >/dev/null
+
+dirty_subject=$(git -C "$DIRTY_TARGET" log -1 --format=%s)
+[ "$dirty_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a dirty working tree (uncommitted tracked edit) does not get its sha recorded (#1056 Codex P2 round 4)" \
+  || fail "dirty-working-tree source_root leaked a sha: $dirty_subject (had ${DIRTY_SHA:0:7} available)"
 
 # --- summary --------------------------------------------------------------
 echo
