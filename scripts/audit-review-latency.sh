@@ -99,7 +99,7 @@ fi
 # derive p50/p99 from a partial fleet and miss slower reviews in the omitted
 # repos (Codex P2 on #688). Keep this in step with the coderabbit-audit.md
 # roster if the fleet changes.
-REPOS="nathanjohnpayne/swipewatch,nathanjohnpayne/matchline,nathanjohnpayne/nathanpaynedotcom,nathanjohnpayne/overridebroadway,nathanjohnpayne/tadlockpsychiatry,nathanjohnpayne/device-source-of-truth,nathanjohnpayne/friends-and-family-billing,nathanjohnpayne/gaycruisebingo"
+REPOS="nathanjohnpayne/swipewatch,nathanjohnpayne/matchline,nathanjohnpayne/nathanpaynedotcom,nathanjohnpayne/overridebroadway,nathanjohnpayne/tadlockpsychiatry,nathanjohnpayne/device-source-of-truth,nathanjohnpayne/friends-and-family-billing,nathanjohnpayne/fiveacross"
 SINCE=""
 LOOPS_DIR=".mergepath/phase-4b-loops"
 OUT_DIR=".mergepath/review-latency-audit"
