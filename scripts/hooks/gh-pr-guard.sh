@@ -1307,7 +1307,7 @@ except ValueError as e:
   if ! printf '%s\n' "$STRIPPED_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(sh|bash|dash|zsh|ksh|eval|source)([^A-Za-z0-9_]|$)|(^|[[:space:]])\.[[:space:]]'; then
     EVIDENCE_TEXT="$STRIPPED_TEXT"
   fi
-  if ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|new|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
+  if ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
      && ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
      && ! printf '%s\n' "$EVIDENCE_TEXT" | grep -qE '\\(147|150|107|110|x67|x68|x47|x48)'; then
     exit 0
@@ -1527,7 +1527,7 @@ guarded_gh_invocation_label() {
     esac
 
     case "$parent:$tok" in
-      pr:create|pr:merge|pr:comment|pr:review|pr:edit)
+      pr:new|pr:create|pr:merge|pr:comment|pr:review|pr:edit)
         printf 'gh pr %s\n' "$tok"
         return 0
         ;;

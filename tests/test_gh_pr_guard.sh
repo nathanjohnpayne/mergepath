@@ -158,6 +158,21 @@ assert_rc_contains "gh --repo o/r pr new is guarded" 2 "guarded GitHub write" \
 # widen the guard onto reads.
 assert_rc_contains "gh pr view stays allowed" 0 "" 'gh pr view 123'
 
+# The compound-command scan runs BEFORE the main token walk and dispatches on
+# `parent:tok`. Canonicalizing the alias in the walk alone left `pr:new`
+# unlabelled there, so a compound counted two gh commands and zero guarded
+# writes: the scan passed, the walk classified only the leading read, and the
+# whole tool call was allowed. Found independently by CodeRabbit and Codex.
+assert_rc_contains "gh pr new in a compound is guarded" 2 "compound gh command contains a guarded write" \
+  'gh pr view 1 && gh pr new --title "t" --body "b"'
+
+assert_rc_contains "gh pr new after an issue write is guarded" 2 "compound gh command contains a guarded write" \
+  'gh issue close 1 && gh pr new --title "t" --body "b"'
+
+# Control: a compound of pure reads must still be allowed, or the fix above
+# would be over-blocking rather than closing a hole.
+assert_rc_contains "compound of reads stays allowed" 0 "" 'gh pr view 1 && gh pr view 2'
+
 # #466: a path-qualified gh (e.g. /usr/bin/gh) must NOT bypass the guard.
 # Before the fix the quick-exit grep only matched bare `gh`, so a
 # path-qualified write skipped the hook entirely (exit 0).
