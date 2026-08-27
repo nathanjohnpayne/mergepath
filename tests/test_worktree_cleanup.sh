@@ -3222,6 +3222,103 @@ else
   fail "#1105 the audit blamed a remote it had never even contacted"
   echo "$OUT_TMPFAIL" >&2
 fi
+# ── Case 45 (#933): the remote probe cannot block on a prompt ────────────
+# Every dry run invokes `git ls-remote`, and the caller hides its stderr. On
+# an SSH remote needing a host-key confirmation or a passphrase, or an HTTPS
+# remote with no cached credential, an unattended audit would sit forever
+# with nothing on screen to explain why.
+#
+# Asserting "it does not hang" directly would mean writing a test that hangs
+# when it fails, which is the worst shape a suite can have. Instead the
+# fixture points `origin` at an ssh:// URL and supplies a recording
+# GIT_SSH_COMMAND shim, then asserts the options git actually invoked ssh
+# with. That is the mechanism by which the hang is prevented, it is
+# observable, and it fails fast.
+SSHPROBE_ROOT="$WORKDIR/ssh-probe"
+SSHPROBE_MAIN="$SSHPROBE_ROOT/main"
+SSHPROBE_LOG="$SSHPROBE_ROOT/ssh-args.log"
+mkdir -p "$SSHPROBE_ROOT"
+git init -q -b main "$SSHPROBE_MAIN"
+(
+  cd "$SSHPROBE_MAIN"
+  git -C "$SSHPROBE_MAIN" config user.email "test@example.com"
+  git -C "$SSHPROBE_MAIN" config user.name "Test"
+  git -C "$SSHPROBE_MAIN" config commit.gpgsign false
+  git -C "$SSHPROBE_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "ssh://git@invalid.invalid/repo.git"
+  # A branch that TRACKS origin, so the probe is eligible and actually runs
+  # (case 44b proves it is skipped otherwise).
+  git update-ref refs/remotes/origin/main HEAD
+  git branch --set-upstream-to=origin/main main
+) >/dev/null 2>&1
+SSHPROBE_MAIN=$(cd "$SSHPROBE_MAIN" && pwd -P)
+# The shim records the argv git handed ssh, then fails. Failing is the point:
+# a real prompt is what we are replacing, and a fast non-zero exit is the
+# behaviour under test.
+cat > "$SSHPROBE_ROOT/fake-ssh" <<SHIM
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$SSHPROBE_LOG"
+exit 255
+SHIM
+chmod +x "$SSHPROBE_ROOT/fake-ssh"
+
+# Premise: the branch really does track origin, so the probe is eligible.
+if [ "$(git -C "$SSHPROBE_MAIN" for-each-ref --format='%(upstream)' refs/heads/main)" \
+     != "refs/remotes/origin/main" ]; then
+  fail "fixture setup: main does not track origin/main — the probe would be skipped and case 45 would assert nothing"
+fi
+
+set +e
+OUT_SSHPROBE=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh" \
+  WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_SSHPROBE=$?
+set -e
+
+# Premise: the probe was actually reached. Without this, every assertion
+# below would pass vacuously on an empty log.
+if [ ! -s "$SSHPROBE_LOG" ]; then
+  fail "fixture setup: git never invoked ssh, so case 45 asserts nothing about the options it was given"
+  echo "$OUT_SSHPROBE" >&2
+fi
+if grep -Fq -- "BatchMode=yes" "$SSHPROBE_LOG"; then
+  pass "#933 the probe forces ssh BatchMode, so an unknown host key or passphrase fails instead of prompting"
+else
+  fail "#933 ssh was invoked without BatchMode — an unattended audit can still block on a prompt"
+  cat "$SSHPROBE_LOG" >&2
+fi
+# Derived from WORKTREE_CLEANUP_PROBE_TIMEOUT=8, so this also pins that the
+# knob reaches the transport rather than only the wall-clock ceiling.
+if grep -Fq -- "ConnectTimeout=4" "$SSHPROBE_LOG"; then
+  pass "#933 ConnectTimeout is bounded and derived from WORKTREE_CLEANUP_PROBE_TIMEOUT"
+else
+  fail "#933 ssh was invoked without a ConnectTimeout derived from the configured probe timeout"
+  cat "$SSHPROBE_LOG" >&2
+fi
+# An operator's own GIT_SSH_COMMAND must survive: the hardening is APPENDED
+# to it, not substituted for it. The shim itself running is half the proof
+# (the premise above); the other half is that it was handed the real
+# destination alongside our options, rather than our options replacing the
+# work. Asserted on ONE line so a run that happened to log both facts
+# separately cannot satisfy it.
+if grep -F -- "BatchMode=yes" "$SSHPROBE_LOG" | grep -Fq -- "invalid.invalid"; then
+  pass "#933 the operator's GIT_SSH_COMMAND is preserved and the hardening is appended to it"
+else
+  fail "#933 the hardening replaced the operator's command rather than extending it"
+  cat "$SSHPROBE_LOG" >&2
+fi
+# And the failed probe still lands as an incomplete audit rather than a clean
+# one — the #992 contract must not regress under the new wrapper.
+if [ "$RC_SSHPROBE" -eq 3 ] && echo "$OUT_SSHPROBE" | grep -Fq -- "NOT MEASURED"; then
+  pass "#933 a refused probe is reported as an incomplete audit, not a clean one"
+else
+  fail "#933 a refused probe did not surface as exit 3 + NOT MEASURED (rc=$RC_SSHPROBE)"
+  echo "$OUT_SSHPROBE" >&2
+fi
 
 # ── Case 44d (#1105, Codex P2): a failed snapshot WRITE still reports ────
 # `mktemp` succeeding says the remote-heads file was CREATED, not that it can
