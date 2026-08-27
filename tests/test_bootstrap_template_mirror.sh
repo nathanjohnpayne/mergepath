@@ -370,16 +370,19 @@ cp "$ROOT/scripts/ci/check_audit_canonical_mirrors" "$FAKE_MP/scripts/ci/check_a
 cp "$ROOT/scripts/ci/check_branch_protection_audit" "$FAKE_MP/scripts/ci/check_branch_protection_audit"
 
 # git init so preflight check 6 (clean mergepath) passes. The origin remote
-# is required for #1056's canonical-origin check (bootstrap::_init_target_git
-# only trusts a source_root's sha when its own `origin` names
-# nathanjohnpayne/mergepath) -- without it this fixture would exercise the
-# unattributed fallback instead of the sha-attribution path it's meant to
-# cover.
+# and remote-tracking ref are required for #1056's canonical-source checks
+# (bootstrap::_resolve_canonical_source_sha only trusts a source_root's sha
+# when its own `origin` names nathanjohnpayne/mergepath AND HEAD is
+# contained in a refs/remotes/origin/* ref) -- without both, this fixture
+# would exercise the unattributed fallback instead of the sha-attribution
+# path it's meant to cover. update-ref stands in for a real fetch/push,
+# which this offline fixture never performs.
 git -C "$FAKE_MP" init -q
 git -C "$FAKE_MP" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
 git -C "$FAKE_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false add -A
 git -C "$FAKE_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "fixture: initial"
 git -C "$FAKE_MP" branch -M main 2>/dev/null || true
+git -C "$FAKE_MP" update-ref refs/remotes/origin/main HEAD
 FAKE_MP_SHA=$(git -C "$FAKE_MP" rev-parse HEAD)
 
 # --- runners --------------------------------------------------------------
@@ -2173,6 +2176,75 @@ fi
 [ "$fork_subject" = "Initial commit (bootstrapped from mergepath)" ] \
   && pass "fork-origin source_root falls back to the un-attributed subject" \
   || fail "fork-origin source_root subject wrong: $fork_subject"
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 3: the round-2 origin check was an unanchored
+# suffix glob (`*github.com[:/]nathanjohnpayne/mergepath`), which
+# `https://evilgithub.com/nathanjohnpayne/mergepath.git` also satisfies --
+# the `*` absorbs "evil" and the rest of the pattern still lines up.
+# bootstrap::_resolve_canonical_source_sha now enumerates exact remote
+# forms instead, so no prefix can smuggle in an extra hostname segment.
+# ---------------------------------------------------------------------------
+SPOOF_SOURCE="$WORKDIR/spoofed-hostname-repo"
+mkdir -p "$SPOOF_SOURCE"
+git -C "$SPOOF_SOURCE" init -q -b main
+git -C "$SPOOF_SOURCE" remote add origin "https://evilgithub.com/nathanjohnpayne/mergepath.git"
+echo seed >"$SPOOF_SOURCE/f"
+git -C "$SPOOF_SOURCE" add -A
+git -C "$SPOOF_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "spoofed-hostname seed"
+git -C "$SPOOF_SOURCE" update-ref refs/remotes/origin/main HEAD
+SPOOF_SHA=$(git -C "$SPOOF_SOURCE" rev-parse HEAD)
+SPOOF_TARGET="$WORKDIR/spoof-target"
+mkdir -p "$SPOOF_TARGET"
+echo seed >"$SPOOF_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$SPOOF_TARGET" "$SPOOF_SOURCE" >/dev/null
+
+spoof_subject=$(git -C "$SPOOF_TARGET" log -1 --format=%s)
+[ "$spoof_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a spoofed hostname suffix-matching 'github.com' does not get its sha recorded (#1056 Codex P2 round 3)" \
+  || fail "spoofed-hostname source_root leaked a sha: $spoof_subject (had ${SPOOF_SHA:0:7} available)"
+
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 3: a correctly-origined checkout can still carry
+# an unpushed local commit on `main` -- checks 1+2 alone would attribute a
+# sha the canonical remote (and therefore `git ls-tree -r "$HUB_REF"` run
+# elsewhere) has never heard of. Same origin as the successful FAKE_MP path,
+# but with NO refs/remotes/origin/* ref created, so HEAD is not contained in
+# any remote-tracking ref.
+# ---------------------------------------------------------------------------
+UNPUSHED_SOURCE="$WORKDIR/unpushed-commit-repo"
+mkdir -p "$UNPUSHED_SOURCE"
+git -C "$UNPUSHED_SOURCE" init -q -b main
+git -C "$UNPUSHED_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo seed >"$UNPUSHED_SOURCE/f"
+git -C "$UNPUSHED_SOURCE" add -A
+git -C "$UNPUSHED_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "unpushed local commit"
+UNPUSHED_SHA=$(git -C "$UNPUSHED_SOURCE" rev-parse HEAD)
+UNPUSHED_TARGET="$WORKDIR/unpushed-target"
+mkdir -p "$UNPUSHED_TARGET"
+echo seed >"$UNPUSHED_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$UNPUSHED_TARGET" "$UNPUSHED_SOURCE" >/dev/null
+
+unpushed_subject=$(git -C "$UNPUSHED_TARGET" log -1 --format=%s)
+[ "$unpushed_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "an unpushed local HEAD (not in any remote-tracking ref) does not get its sha recorded (#1056 Codex P1 round 3)" \
+  || fail "unpushed-commit source_root leaked a sha: $unpushed_subject (had ${UNPUSHED_SHA:0:7} available)"
 
 # --- summary --------------------------------------------------------------
 echo

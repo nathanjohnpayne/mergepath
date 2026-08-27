@@ -1192,6 +1192,59 @@ bootstrap::_yq_clean_repo_template() {
   yq -i 'del(.extra_top_level_dirs)' "$f"
 }
 
+# bootstrap::_resolve_canonical_source_sha <source_root> — prints the HEAD
+# sha, exit 0, ONLY when source_root is verifiably a checkout of canonical
+# mergepath (nathanjohnpayne/mergepath) whose HEAD is reachable from that
+# repo's own remote history; prints nothing and exits 1 otherwise. Canonical
+# behavior contract: specs/bootstrap_consumer_identity.md § Source SHA
+# attribution (#1056/#1112).
+#
+# Three independent checks, each closing a gap the previous round found:
+#
+#   1. source_root IS the git toplevel (Codex P1 round 1). `git -C
+#      "$source_root" rev-parse HEAD` alone is not a valid "is this a git
+#      repo" test — Git's own repository discovery walks UP from a non-git
+#      source_root and happily resolves against an ENCLOSING checkout's
+#      .git, so a plain non-git directory nested inside an unrelated repo
+#      would silently record that ancestor's HEAD. Canonicalized via
+#      `pwd -P` so a symlinked path still matches.
+#   2. origin names canonical mergepath, by an EXACT host+path match, not a
+#      substring/suffix glob (Codex P1 + P2 round 2/3). A clean checkout of
+#      a fork, or BOOTSTRAP_MERGEPATH_ROOT pointed at any other repo, passes
+#      check 1 just as validly as canonical mergepath does — and an
+#      unanchored `*github.com/...` suffix match is satisfied by
+#      `evilgithub.com/...` too. Enumerate the exact accepted remote forms
+#      instead of pattern-matching a suffix.
+#   3. HEAD is contained in a remote-tracking ref under refs/remotes/origin
+#      (Codex P1 round 3). A clean, correctly-origined checkout can still
+#      carry an unpushed local commit on `main`; checks 1+2 alone would
+#      attribute a sha that the canonical remote (and therefore
+#      `git ls-tree -r "$HUB_REF"` run elsewhere) has never heard of.
+bootstrap::_resolve_canonical_source_sha() {
+  local source_root=${1:-}
+  [ -n "$source_root" ] && [ -d "$source_root" ] || return 1
+
+  local toplevel
+  toplevel=$(git -C "$source_root" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -n "$toplevel" ] || return 1
+  [ "$(cd "$toplevel" && pwd -P)" = "$(cd "$source_root" && pwd -P)" ] || return 1
+
+  local origin
+  origin=$(git -C "$source_root" remote get-url origin 2>/dev/null) || return 1
+  case "$origin" in
+    https://github.com/nathanjohnpayne/mergepath | https://github.com/nathanjohnpayne/mergepath.git | \
+    http://github.com/nathanjohnpayne/mergepath | http://github.com/nathanjohnpayne/mergepath.git | \
+    git@github.com:nathanjohnpayne/mergepath | git@github.com:nathanjohnpayne/mergepath.git | \
+    ssh://git@github.com/nathanjohnpayne/mergepath | ssh://git@github.com/nathanjohnpayne/mergepath.git) ;;
+    *) return 1 ;;
+  esac
+
+  git -C "$source_root" for-each-ref --format='%(refname)' --contains HEAD refs/remotes/origin \
+    | grep -q . || return 1
+
+  git -C "$source_root" rev-parse HEAD 2>/dev/null
+}
+
 bootstrap::_init_target_git() {
   local target=$1
   local source_root=${2:-}
@@ -1212,45 +1265,12 @@ bootstrap::_init_target_git() {
   # Source:/branch-name provenance scripts/sync-to-downstream.sh writes on
   # every sync PR) still leaves a recoverable HUB_REF for the drift
   # measurement in docs/agents/propagation-ordering.md § Measuring tier
-  # membership. Best-effort: an unreadable source_root (a non-git checkout,
-  # or a caller that never passes one) falls back to the un-attributed
-  # subject rather than blocking the bootstrap over a diagnostic.
-  #
-  # Codex P1 on #1056/#1112: `git -C "$source_root" rev-parse HEAD` alone
-  # is not a valid "is this a git repo" test — Git's own repository
-  # discovery walks UP from a non-git source_root and happily resolves
-  # against an ENCLOSING checkout's .git, so a plain non-git directory
-  # nested inside an unrelated repo would silently record that ancestor's
-  # HEAD as the HUB_REF. Require source_root itself to BE the discovered
-  # toplevel (canonicalized, so a symlinked path still matches) before
-  # trusting the sha; anything else — no repo, or a repo whose toplevel is
-  # an ancestor — falls back to the un-attributed subject exactly like an
-  # unreadable source_root always has.
-  # Codex P1 round 2 on #1056/#1112: the toplevel check above only proves
-  # source_root IS a git repo's own root — it says nothing about WHICH repo.
-  # A clean checkout of a fork, or BOOTSTRAP_MERGEPATH_ROOT pointed at any
-  # other repo (a scratch clone, a test fixture), passes the toplevel
-  # equality just as validly as canonical mergepath does, and the trailer
-  # below hardcodes nathanjohnpayne/mergepath regardless — so a fork-only
-  # commit would be attributed to a canonical URL that cannot resolve it via
-  # `git ls-tree -r "$HUB_REF"`. Require the repo's own `origin` remote to
-  # actually name nathanjohnpayne/mergepath (https, ssh, or scp-like form,
-  # with or without a `.git` suffix) before trusting the sha for that URL.
-  local source_sha="" source_toplevel="" source_root_canon="" source_origin=""
-  if [ -n "$source_root" ] && [ -d "$source_root" ]; then
-    source_toplevel=$(git -C "$source_root" rev-parse --show-toplevel 2>/dev/null) || source_toplevel=""
-    if [ -n "$source_toplevel" ]; then
-      source_root_canon=$(cd "$source_root" && pwd -P)
-      if [ "$(cd "$source_toplevel" && pwd -P)" = "$source_root_canon" ]; then
-        source_origin=$(git -C "$source_root" remote get-url origin 2>/dev/null) || source_origin=""
-        case "$source_origin" in
-          *github.com[:/]nathanjohnpayne/mergepath | *github.com[:/]nathanjohnpayne/mergepath.git)
-            source_sha=$(git -C "$source_root" rev-parse HEAD 2>/dev/null) || source_sha=""
-            ;;
-        esac
-      fi
-    fi
-  fi
+  # membership. Best-effort: an unreadable or non-canonical source_root
+  # falls back to the un-attributed subject rather than blocking the
+  # bootstrap over a diagnostic — see
+  # bootstrap::_resolve_canonical_source_sha for what "canonical" requires.
+  local source_sha=""
+  source_sha=$(bootstrap::_resolve_canonical_source_sha "$source_root") || source_sha=""
 
   local commit_message
   if [ -n "$source_sha" ]; then

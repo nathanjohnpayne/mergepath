@@ -14,6 +14,8 @@ spec_test_map:
     - tests/test_mergepath_playground.sh
   bootstrap_consumer_identity:
     - tests/test_bootstrap_template_mirror.sh
+  bootstrap_source_attribution:
+    - tests/test_bootstrap_template_mirror.sh
   coderabbit_review_sensing:
     - tests/test_coderabbit_wait_status_probe.sh
     - tests/test_phase_4b_automation.sh
