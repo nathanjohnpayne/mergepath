@@ -98,11 +98,16 @@ projects:
       - source: specs/
         mirror: projects/swipewatch/specs/
 
+  # Product namespace, NOT the repo name: this value becomes $project in
+  # scripts/project-doc-sync.sh, which builds docs/projects/$project/prds and
+  # writes `project:` into every generated header. The repo renamed to
+  # fiveacross (2026-08-27); the product namespace and its mirror directory
+  # deliberately did not. See owner.repo below for the renamed repository.
   - slug: gaycruisebingo
     owner:
-      name: gaycruisebingo
-      repo: nathanjohnpayne/gaycruisebingo
-      path_hint: ../gaycruisebingo
+      name: fiveacross
+      repo: nathanjohnpayne/fiveacross
+      path_hint: ../fiveacross
     prds:
       - slug: gaycruisebingo
         source: projects/gaycruisebingo/prds/gaycruisebingo.md

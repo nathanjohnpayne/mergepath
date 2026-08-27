@@ -1162,7 +1162,7 @@ The SSH-remote-switch covers every repo on the operator's machine (template, con
 - overridebroadway
 - friends-and-family-billing
 - docs
-- gaycruisebingo
+- fiveacross
 <!-- bootstrap-loop-list-end -->
 
 ```bash
