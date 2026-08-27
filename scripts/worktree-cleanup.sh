@@ -913,12 +913,16 @@ GONE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-gone.XXXXXX")
 REC_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-rec.XXXXXX")
 STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
 # WRITE failures to these files are a separate concern from their creation,
-# and only the two inside stale_unpruned_branches() are guarded (Codex P2 on
-# #1105, twice). The five top-level writes — GONE_FILE, REC_FILE (x2),
-# MERGE_SWEEP_FILE, KNOWN_FILE — still die on a full TMPDIR with a bare
-# `printf: write error` and exit 1, before any summary. That is loud rather
-# than silent, and those sites carry no exit-3 contract, so it is left as
-# pre-existing behaviour rather than widened here; tracked in #1115.
+# and only the ones inside stale_unpruned_branches() that the probe EVALUATES
+# through are guarded (Codex P2 on #1105, twice). Six writes are not:
+# GONE_FILE, REC_FILE (x2), MERGE_SWEEP_FILE, KNOWN_FILE, and the probe's own
+# result write `stale_unpruned_branches >"$STALE_UNPRUNED_FILE"`. All six die
+# on a full TMPDIR with a bare `printf: write error` and exit 1, before any
+# summary. That is LOUD rather than silent — nobody reads it as a clean audit,
+# which is the property exit 3 protects — so they carry no exit-3 contract and
+# are left as pre-existing behaviour rather than widened here. The spec says
+# the same thing, deliberately: the contract covers evaluation, not
+# persistence. Tracked together in #1115.
 #
 # EVERY mktemp site in this script is registered here (#920 finding 2). The
 # five later ones — HEADS_FILE, ELIGIBLE_FILE and RECORDS_FILE inside the

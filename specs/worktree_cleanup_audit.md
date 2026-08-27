@@ -4,7 +4,7 @@ Feature: `scripts/worktree-cleanup.sh` reports the machine-local state of git wo
 
 ## Exit contract
 
-- Exit `0`: the audit completed and found nothing actionable.
+- Exit `0`: **in a dry run**, the audit completed and found nothing actionable. **Under `--apply`** it means only that no attempted removal failed, which is a different claim: `--apply` exits `0` with locked entries, orphans, dirty closed-PR worktrees and diverged branches still present, because it deliberately never touches them without their opt-in flags or a human decision. A successful apply is not a clean audit. To learn whether the tree is clean, run the dry run.
 - Exit `1`: a generic error — bad invocation, an unsupported state, or a git failure the script does not model.
 - Exit `2`: the audit **completed** and found something actionable. `2` does not promise that a plain `--apply` clears it. `SUMMARY_DIVERGED_KEPT` and `SUMMARY_UNCLEAN_KEPT` need a human decision and `--apply` deliberately never touches them; locked entries and orphans require `--force-locked` / `--orphan-clean`. The per-record lines state which class each candidate belongs to.
 - Exit `3`: the audit is **incomplete**. A read it depends on failed in a way that would otherwise be invisible, so one of the report's silences is not evidence.
@@ -13,7 +13,11 @@ The `2`-versus-`3` axis is **completeness**, not who can act. A `2` may still re
 
 ## What produces an incomplete audit
 
-Only a failure whose absence of output is indistinguishable from a real answer. Today that is the **stale-unpruned probe as a whole**, which is dry-run only — `--apply` never exits `3`. Every step the probe depends on qualifies, not just its network read: entering the main worktree, reading the local branch list, allocating and writing the eligible-branch list, taking the remote-heads snapshot, and allocating and writing that snapshot. Each of them ends with the probe reporting nothing, and reporting nothing is exactly what a clean tree looks like.
+Only a failure whose absence of output is indistinguishable from a real answer, and only in the steps by which the stale-unpruned probe **evaluates**. The probe is dry-run only, so `--apply` never exits `3`.
+
+The qualifying steps are entering the main worktree, reading the local branch list, allocating and writing the eligible-branch list, taking the remote-heads snapshot, and allocating and writing that snapshot. Each ends with the probe reporting nothing, and reporting nothing is exactly what a clean tree looks like — that indistinguishability is the whole criterion.
+
+Persisting the probe's **result** is deliberately outside this contract. The `stale_unpruned_branches >"$STALE_UNPRUNED_FILE"` write, like the five other top-level temp-file writes, aborts the run loudly on failure: a visible error, a non-zero status, and no summary at all. Nobody mistakes that for a clean audit, which is the property exit `3` exists to protect. Widening the contract to cover it would trade a loud failure for a quiet one and, on the evidence of this document's own history, invite the next unguarded write to be discovered as a contract violation rather than as the pre-existing behaviour it is. Those six sites are tracked together in #1115.
 
 - The probe reports one of three states. `ok`: every step it depends on succeeded and the reported set is authoritative. `declined`: `remote.origin.fetch` is not the conventional `+refs/heads/*:refs/remotes/origin/*`, so the tracking-ref-to-remote-head mapping is unknowable and the probe does not guess. `unknown`: one of those steps failed and nothing is known either way. The cause is recorded alongside it so the remedy can match, because the failing step is not always the remote one.
 - `declined` is not `unknown`. It is a standing, documented limitation with a stable answer, and collapsing the two would put every non-conventional checkout at a permanent exit `3`.
@@ -46,4 +50,4 @@ The probe is **not** yet non-interactive or time-bounded. It invokes `git ls-rem
 ## Non-goals
 
 - This helper is local-only. Worktree state is machine-local and does not gate repository CI (#288).
-- Exit `3` is not a health check for the whole script. Five top-level temp-file write sites still fail loudly rather than reporting, which is a different failure shape and is tracked in #1115.
+- Exit `3` is not a health check for the whole script. Six temp-file write sites — the five top-level ones and the probe's own result write — still fail loudly rather than reporting. That is a different failure shape, not a gap in this contract, and it is tracked in #1115.
