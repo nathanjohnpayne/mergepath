@@ -1277,6 +1277,45 @@ done <"$MERGE_SWEEP_FILE"
 rm -f "$MERGE_SWEEP_FILE"
 MERGE_SWEEP_FILE=""
 
+# Is $1 one of the worktree paths git currently has registered?
+#
+# The membership set ($KNOWN_FILE) is NUL-delimited, and this comparison is
+# what keeps it that way end to end (#992). The previous spelling
+# re-serialised the set with `printf %s\\n` and tested it with `grep -Fxq`,
+# which silently undid the reason worktree_records() emits NUL at all: a
+# worktree path may contain any byte git allows, INCLUDING a literal newline,
+# and such a path landed in the set as two independent LINE records.
+#
+# Both directions of that break are wrong, in opposite ways:
+#
+#   ineffective  a genuine orphan whose name equals one of the split
+#                fragments matches the fragment, is read as registered, and
+#                is never reported or cleaned. Reproduced on #991 head with
+#                registered `<root>/foo\nbar` beside orphan `<root>/foo`.
+#   DESTRUCTIVE  a registered worktree whose own path contains a newline
+#                fails its own membership test, is classified an orphan, and
+#                under --orphan-clean is `rm -rf`d. This is the direction
+#                that loses data, and it is why the fix is a whole-record
+#                comparison rather than a better pattern.
+#
+# A shell-level loop, not `grep -z -Fxq`: `grep -z` is a GNU extension and
+# BSD/macOS grep has no equivalent, so a pattern-based NUL comparison would
+# be portable only where the audit is least likely to run. The path counts
+# here are worktree counts — tens, not thousands — so the quadratic shape is
+# irrelevant next to the `pwd -P` and `git` calls surrounding it.
+#
+# Reads $KNOWN_FILE from the caller rather than taking it as an argument, to
+# match is_gone_branch()/branch_checked_out() above, which read $GONE_FILE
+# and $REC_FILE the same way.
+known_path_registered() {
+  local target="$1" known
+  [ -n "${KNOWN_FILE:-}" ] || return 1
+  while IFS= read -r -d '' known; do
+    [ "$known" = "$target" ] && return 0
+  done <"$KNOWN_FILE"
+  return 1
+}
+
 # ── Orphan scan ───────────────────────────────────────────────────────
 ORPHAN_ROOT="$MAIN_WORKTREE/.claude/worktrees"
 if [ -d "$ORPHAN_ROOT" ]; then
@@ -1290,8 +1329,8 @@ if [ -d "$ORPHAN_ROOT" ]; then
   # not match a sibling path `/foobar`.
   ORPHAN_ROOT_PHYS_TS="${ORPHAN_ROOT_PHYS%/}/"
 
-  # Collect known worktree paths into a set (one per line) and check each
-  # subdir against it. REC_FILE is NUL-delimited: parsing it with awk or grep
+  # Collect known worktree paths into a NUL-delimited set and check each
+  # subdir against it with known_path_registered() above. REC_FILE is NUL-delimited: parsing it with awk or grep
   # treats it as binary on some platforms and silently drops registered paths,
   # which can turn an active .claude/worktrees checkout into an orphan-clean
   # deletion candidate. Consume all six fields so the next record stays
@@ -1306,7 +1345,7 @@ if [ -d "$ORPHAN_ROOT" ]; then
     && IFS= read -r -d '' known_head \
     && IFS= read -r -d '' known_locked \
     && IFS= read -r -d '' known_lock_reason; do
-    printf '%s\n' "$known_path"
+    printf '%s\0' "$known_path"
   done <"$REC_FILE" >"$KNOWN_FILE"
   for d in "$ORPHAN_ROOT"/*; do
     [ -d "$d" ] || continue
@@ -1346,7 +1385,7 @@ if [ -d "$ORPHAN_ROOT" ]; then
         ;;
     esac
 
-    if ! grep -Fxq -- "$abs" "$KNOWN_FILE"; then
+    if ! known_path_registered "$abs"; then
       print_record "[ORPHAN .claude/worktrees]" "$C_RED" \
         "$abs" "" "" "[orphan]" "" ""
       SUMMARY_ORPHAN+=("$abs")
