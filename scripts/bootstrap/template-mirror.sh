@@ -1273,8 +1273,14 @@ bootstrap::_resolve_canonical_source_sha() {
   # output — the bare form below let a FAILED `git status` (permissions,
   # corruption) read as "empty output, therefore clean" and attribute a sha
   # anyway. A failed read must fall back same as everything else here.
+  #
+  # CodeRabbit round 5: --ignored, not the default porcelain. rsync mirrors
+  # whatever is physically present in source_root regardless of .gitignore,
+  # so a gitignored-but-present file (a build artifact, a stray .env) is
+  # invisible to the bare form and would still get copied into the target
+  # while HEAD (the attributed sha) carries no record of it.
   local status_output
-  status_output=$(git -C "$source_root" status --porcelain 2>/dev/null) || return 1
+  status_output=$(git -C "$source_root" status --porcelain --ignored 2>/dev/null) || return 1
   [ -z "$status_output" ] || return 1
 
   git -C "$source_root" rev-parse HEAD 2>/dev/null

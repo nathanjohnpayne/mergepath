@@ -2301,6 +2301,43 @@ dirty_subject=$(git -C "$DIRTY_TARGET" log -1 --format=%s)
   && pass "a dirty working tree (uncommitted tracked edit) does not get its sha recorded (#1056 Codex P2 round 4)" \
   || fail "dirty-working-tree source_root leaked a sha: $dirty_subject (had ${DIRTY_SHA:0:7} available)"
 
+# ---------------------------------------------------------------------------
+# CodeRabbit on #1112 round 5: rsync mirrors whatever is physically present
+# in source_root regardless of .gitignore, but a bare `git status
+# --porcelain` (no --ignored) does not report a gitignored-but-present file
+# as dirty. Same origin + remote-tracking ref as the successful FAKE_MP
+# path, tracked tree otherwise clean, but with a gitignored file physically
+# present that rsync would still copy.
+# ---------------------------------------------------------------------------
+IGNORED_SOURCE="$WORKDIR/ignored-file-repo"
+mkdir -p "$IGNORED_SOURCE"
+git -C "$IGNORED_SOURCE" init -q -b main
+git -C "$IGNORED_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo seed >"$IGNORED_SOURCE/f"
+echo "stray.artifact" >"$IGNORED_SOURCE/.gitignore"
+git -C "$IGNORED_SOURCE" add -A
+git -C "$IGNORED_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "ignored-file-repo seed"
+git -C "$IGNORED_SOURCE" update-ref refs/remotes/origin/main HEAD
+IGNORED_SHA=$(git -C "$IGNORED_SOURCE" rev-parse HEAD)
+echo "physically present but gitignored" >"$IGNORED_SOURCE/stray.artifact"
+IGNORED_TARGET="$WORKDIR/ignored-target"
+mkdir -p "$IGNORED_TARGET"
+echo seed >"$IGNORED_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$IGNORED_TARGET" "$IGNORED_SOURCE" >/dev/null
+
+ignored_subject=$(git -C "$IGNORED_TARGET" log -1 --format=%s)
+[ "$ignored_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a gitignored-but-present file does not get its sha recorded (#1056 CodeRabbit round 5)" \
+  || fail "ignored-file source_root leaked a sha: $ignored_subject (had ${IGNORED_SHA:0:7} available)"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"
