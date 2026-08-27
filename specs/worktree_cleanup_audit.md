@@ -37,7 +37,9 @@ A failed merged-PR lookup (`gh` missing, unauthenticated, or an API error) carri
 
 ## Read-only by default
 
-Dry run performs no ref mutation. The stale-unpruned probe is a network **read** (`git ls-remote`), never a local ref write, and nothing in the script prunes; teaching `--apply` to act on the stale-unpruned class is tracked in #932. The probe runs non-interactively and under a bounded wait so an unattended audit cannot block on an SSH host-key confirmation, a passphrase, or a credential prompt (#933).
+Dry run performs no ref mutation. The stale-unpruned probe is a network **read** (`git ls-remote`), never a local ref write, and nothing in the script prunes; teaching `--apply` to act on the stale-unpruned class is tracked in #932.
+
+The probe is **not** yet non-interactive or time-bounded. It invokes `git ls-remote` directly, so on an SSH origin needing a host-key confirmation or a passphrase, or an HTTPS origin with no cached credential, an unattended audit can still prompt or stall — and the caller hides stderr, so the prompt is invisible. `git ls-remote` offers no option that would change this; it requires environment and transport controls the invocation does not yet set. That work is #933 and this section is updated when it lands, not before.
 
 ## Non-goals
 
