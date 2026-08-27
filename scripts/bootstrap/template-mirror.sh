@@ -1416,6 +1416,20 @@ bootstrap::_remove_orphans() {
     fi
   done
 
+  # Codex P2 on #1112 round 16: the loop above is root-relative only, but
+  # BOOTSTRAP_POST_MIRROR_REMOVE entries are ALSO in combined_excludes for
+  # the cleanliness check (bootstrap::_resolve_canonical_source_sha), which
+  # since round 13 matches an exact-path pattern at any depth -- a dirty
+  # NESTED occurrence (e.g. nested/tests/test_mergepath_playground.sh) is
+  # excused there on the assumption that no BOOTSTRAP_POST_MIRROR_REMOVE
+  # entry ever reaches the target's committed tree, but rsync (no --exclude
+  # names these) copies it and this loop never looked past the root. Reuse
+  # the same nested-match-aware removal the excluded-residue path already
+  # has, layered after the root-level pass above so its stricter failure
+  # semantics (a survivor is a failure even when `rm` itself exits 0) are
+  # unchanged for the common case.
+  bootstrap::_reconcile_excluded_residue "$target" "${BOOTSTRAP_POST_MIRROR_REMOVE[@]}" || rc=$?
+
   local empty_dir
   for empty_dir in "${BOOTSTRAP_POST_MIRROR_RMDIR_IF_EMPTY[@]}"; do
     local dir_path="$target/$empty_dir"

@@ -3297,6 +3297,33 @@ else
   pass "bootstrap::_rsync_template normalizes ALL trailing slashes, not just one (#1056 Codex P1 round 16)"
 fi
 
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 16: BOOTSTRAP_POST_MIRROR_REMOVE entries are also
+# in combined_excludes for the cleanliness check, which since round 13
+# matches an exact-path pattern at any depth -- a dirty NESTED occurrence
+# of tests/test_mergepath_playground.sh is excused there on the assumption
+# no such entry ever reaches the target, but no rsync --exclude names
+# these (they're removed post-mirror, not filtered from the transfer) and
+# the removal loop above is root-relative only. Reusing run_remove_orphans
+# from the earlier resumed-mirror block: assert a NESTED occurrence is
+# also removed, alongside the existing root-level one.
+# ---------------------------------------------------------------------------
+NESTED_ORPHAN_DIR="$WORKDIR/nested-orphan-target"
+mkdir -p "$NESTED_ORPHAN_DIR/tests" "$NESTED_ORPHAN_DIR/nested/tests"
+printf 'root orphan\n' >"$NESTED_ORPHAN_DIR/tests/test_mergepath_playground.sh"
+printf 'nested orphan, not filtered by any rsync exclude\n' \
+  >"$NESTED_ORPHAN_DIR/nested/tests/test_mergepath_playground.sh"
+rc="$(run_remove_orphans "$NESTED_ORPHAN_DIR")"
+if [ "$rc" -ne 0 ]; then
+  fail "nested-orphan cleanup returned rc=$rc"
+elif [ -e "$NESTED_ORPHAN_DIR/tests/test_mergepath_playground.sh" ]; then
+  fail "root-level orphan survived nested-orphan cleanup"
+elif [ -e "$NESTED_ORPHAN_DIR/nested/tests/test_mergepath_playground.sh" ]; then
+  fail "a NESTED occurrence of a post-mirror orphan survived cleanup -- nested-match removal is not wired into _remove_orphans"
+else
+  pass "bootstrap::_remove_orphans reconciles a NESTED occurrence of a post-mirror orphan, not just the root one (#1056 Codex P2 round 16)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"
