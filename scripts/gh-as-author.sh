@@ -74,8 +74,13 @@ fi
 TOKEN="$GH_RESOLVED_TOKEN"
 
 IS_PR_CREATE=0
-if [ "${1:-}" = "gh" ] && [ "${2:-}" = "pr" ] && [ "${3:-}" = "create" ]; then
-  IS_PR_CREATE=1
+# `new` is a gh alias for `create`, and the hook now canonicalizes it. Without
+# the same canonicalization here the alias reaches the generic path and skips
+# the post-create PR-URL capture and author readback.
+if [ "${1:-}" = "gh" ] && [ "${2:-}" = "pr" ]; then
+  case "${3:-}" in
+    create|new) IS_PR_CREATE=1 ;;
+  esac
 fi
 
 run_with_author_token() {
