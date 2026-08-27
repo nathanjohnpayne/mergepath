@@ -48,16 +48,44 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$GH_CALL_LOG"
 
 endpoint=""
+jq_expr=""
+prev=""
 for arg in "$@"; do
+  if [ "$prev" = "--jq" ]; then
+    jq_expr="$arg"
+  fi
   case "$arg" in
     repos/*) endpoint="$arg" ;;
   esac
+  prev="$arg"
 done
 
 if [ -n "${GH_FAIL_ENDPOINT:-}" ] && [ "$endpoint" = "$GH_FAIL_ENDPOINT" ]; then
   echo "synthetic API failure for $endpoint" >&2
   exit 1
 fi
+
+# Alert-number GET (#1113): mimics real gh's client-side --jq filtering,
+# which none of the other fixture endpoints below need (they're consumed
+# by fetch_api_array, whose callers apply their own jq on the captured
+# JSON). A missing fixture file is a genuine 404 — gh_alert_severity's
+# rc=3 contract, exercised by the "fetch itself fails" test cases.
+case "$endpoint" in
+  repos/acme/widget/code-scanning/alerts/[0-9]*)
+    number="${endpoint##*/}"
+    fixture="$GH_FIXTURE_DIR/code-scanning-alert-$number.json"
+    if [ ! -f "$fixture" ]; then
+      echo "gh: Not Found (HTTP 404)" >&2
+      exit 1
+    fi
+    if [ -n "$jq_expr" ]; then
+      jq -r "$jq_expr" "$fixture"
+    else
+      cat "$fixture"
+    fi
+    exit 0
+    ;;
+esac
 
 case "$endpoint" in
   repos/acme/widget/pulls/7)
@@ -74,13 +102,6 @@ case "$endpoint" in
     ;;
   repos/acme/widget/issues/7/comments)
     cat "$GH_FIXTURE_DIR/issues.json"
-    ;;
-  repos/acme/widget/code-scanning/alerts\?ref=refs/pull/7/head)
-    if [ -f "$GH_FIXTURE_DIR/code-scanning-alerts.json" ]; then
-      cat "$GH_FIXTURE_DIR/code-scanning-alerts.json"
-    else
-      printf '[]\n'
-    fi
     ;;
   repos/acme/widget/pulls/comments/*/reactions)
     id="${endpoint#repos/acme/widget/pulls/comments/}"
@@ -117,7 +138,7 @@ reset_fixtures() {
   printf '[]\n' >"$TMP/fixtures/inline.json"
   printf '[]\n' >"$TMP/fixtures/reviews.json"
   printf '[]\n' >"$TMP/fixtures/issues.json"
-  printf '[]\n' >"$TMP/fixtures/code-scanning-alerts.json"
+  rm -f "$TMP/fixtures"/code-scanning-alert-*.json
   cat >"$TMP/fixtures/pull.json" <<'JSON'
 {
   "base": {
@@ -1521,6 +1542,77 @@ else
   fail "feedback-surface fingerprint changes with PR-level disposition state"
 fi
 
+# #1113 item 2: a code-scanning alert's severity is a FOURTH mutable input
+# this fingerprint must cover. Before this, two evaluations straddling a
+# same-window severity retriage (or a newly-resolvable alert) would hash
+# identically even though accounting's own tier for that finding changed
+# underneath them -- a race the fingerprint exists specifically to catch.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 60,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/e.js",
+    "line": 1,
+    "body": "## CodeQL / Rule\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/60)"
+  }
+]
+JSON
+cat >"$TMP/fixtures/code-scanning-alert-60.json" <<'JSON'
+{"number": 60, "rule": {"security_severity_level": "medium"}}
+JSON
+FINGERPRINT_GHAS_BEFORE=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+
+cat >"$TMP/fixtures/code-scanning-alert-60.json" <<'JSON'
+{"number": 60, "rule": {"security_severity_level": "critical"}}
+JSON
+FINGERPRINT_GHAS_AFTER=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+if [ -n "$FINGERPRINT_GHAS_BEFORE" ] && [ "$FINGERPRINT_GHAS_BEFORE" != "$FINGERPRINT_GHAS_AFTER" ]; then
+  pass "feedback-surface fingerprint changes when a referenced alert's severity changes (#1113)"
+else
+  fail "feedback-surface fingerprint changes when a referenced alert's severity changes (#1113)"
+fi
+
+FINGERPRINT_GHAS_REPEAT=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+assert_eq "$FINGERPRINT_GHAS_AFTER" "$FINGERPRINT_GHAS_REPEAT" \
+  "feedback-surface fingerprint is stable when nothing (including alert severity) changed"
+
+# An unresolvable code-scanning alert must fail the fingerprint just as
+# loudly as the live accounting gate -- a silently stale fingerprint would
+# defeat the whole point of a before/after consistency check.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 61,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/f.js",
+    "line": 1,
+    "body": "## CodeQL / Rule\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/61)"
+  }
+]
+JSON
+set +e
+FINGERPRINT_GHAS_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_GHAS_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_GHAS_RC" "feedback-surface fingerprint fails closed on an unreadable code-scanning alert (#1113)"
+assert_match 'could not read code-scanning alert' "$FINGERPRINT_GHAS_ERROR" \
+  "feedback-surface fingerprint names the unreadable alert"
+
 for caller in \
   scripts/codex-review-request.sh \
   scripts/phase-4b-review.sh \
@@ -1549,6 +1641,18 @@ else
   pass "surface fingerprint streams complete histories instead of passing them through argv"
 fi
 
+# GHAS severity must stay resolved by alert NUMBER (code-scanning/alerts/N),
+# never by a ref-scoped list -- that shape (?ref=refs/pull/{pr}/head) is
+# exactly the #1101 mechanism that couldn't see a finding raised on a
+# superseded head (#1113 item 3). A regression back to it would reopen
+# that gap silently, since every unit test above exercises the CURRENT
+# head only and would not itself catch the reintroduction.
+if grep -F 'ref=refs/pull' "$SCRIPT" >/dev/null; then
+  fail "GHAS severity resolution must not reintroduce ref-scoped list fetching (#1113)"
+else
+  pass "GHAS severity resolution stays alert-number-scoped, not ref-scoped (#1113)"
+fi
+
 # --- github-advanced-security / code scanning (#1101) ----------------------
 #
 # Before #1101, a github-advanced-security[bot] inline comment (the form
@@ -1556,6 +1660,11 @@ fi
 # even counted in `posted` — so a real finding could ride through repeated
 # "fully accounted" rounds unread (observed on nathanpaynedotcom#809).
 
+# Severity is resolved BY ALERT NUMBER (a direct
+# code-scanning/alerts/{number} GET), not by a ref-scoped list (#1113) --
+# see scripts/lib/ghas-alert-severity.sh for why. A missing fixture file
+# for a referenced number is therefore a genuine 404 in this harness, same
+# as a real unreadable alert.
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [
@@ -1570,39 +1679,48 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
   }
 ]
 JSON
+
+# A FAILED alert read (no fixture -> 404) is a hard infrastructure
+# failure, not a silent p2 downgrade -- unlike "no severity data", it
+# must not look like a confident low-severity verdict. This is the
+# #1113 redesign's deliberate asymmetry: a systemic security-events
+# permission gap (Codex's #1106 finding) must surface loudly here too.
+run_gate
+assert_eq 2 "$RUN_RC" "a failed alert read is an infrastructure error, not a p2 downgrade (#1113)"
+
+if grep -F 'repos/acme/widget/code-scanning/alerts/25' "$TMP/gh-calls.log" >/dev/null; then
+  pass "a CodeQL comment on the PR triggers the code-scanning alert-by-number lookup"
+else
+  fail "a CodeQL comment on the PR triggers the code-scanning alert-by-number lookup"
+fi
+
+# Alert successfully read, but its rule carries no security_severity_level
+# (a non-security CodeQL quality query) -- THIS is the legitimate p2
+# fallback, distinct from a failed read above.
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {}}
+JSON
 run_gate
 assert_eq 1 "$RUN_RC" "undispositioned CodeQL finding blocks (#1101)"
 assert_eq unaccounted "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "CodeQL miss emits unaccounted status"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "CodeQL finding contributes to posted count"
 assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "CodeQL finding is inventoried under its bot login"
-assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "unresolvable severity (no matching alert) falls back to p2, not dropped"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "alert with no assigned severity falls back to p2, not dropped"
 
-if grep -F 'repos/acme/widget/code-scanning/alerts' "$TMP/gh-calls.log" >/dev/null; then
-  pass "a CodeQL comment on the PR triggers the code-scanning/alerts lookup"
-else
-  fail "a CodeQL comment on the PR triggers the code-scanning/alerts lookup"
-fi
-
-cat >"$TMP/fixtures/code-scanning-alerts.json" <<'JSON'
-[
-  {"number": 25, "rule": {"security_severity_level": "medium"}}
-]
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {"security_severity_level": "medium"}}
 JSON
 run_gate
 assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "medium security_severity_level maps to p2"
 
-cat >"$TMP/fixtures/code-scanning-alerts.json" <<'JSON'
-[
-  {"number": 25, "rule": {"security_severity_level": "critical"}}
-]
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {"security_severity_level": "critical"}}
 JSON
 run_gate
 assert_eq p0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "critical security_severity_level maps to p0"
 
-cat >"$TMP/fixtures/code-scanning-alerts.json" <<'JSON'
-[
-  {"number": 25, "rule": {"security_severity_level": "high"}}
-]
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {"security_severity_level": "high"}}
 JSON
 cat >"$TMP/fixtures/inline-with-reply.json" <<'JSON'
 [
@@ -1634,8 +1752,8 @@ assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "high secu
 assert_eq thread-reply "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "CodeQL reply evidence is visible"
 
 # feedback_policy tiers apply uniformly across reviewers: a repo that
-# marks p2 `ignore` must drop an unresolvable-severity CodeQL finding
-# from inventory exactly as it would a CodeRabbit or Codex one.
+# marks p2 `ignore` must drop a no-severity CodeQL finding from inventory
+# exactly as it would a CodeRabbit or Codex one.
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [
@@ -1650,6 +1768,9 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
   }
 ]
 JSON
+cat >"$TMP/fixtures/code-scanning-alert-99.json" <<'JSON'
+{"number": 99, "rule": {}}
+JSON
 cp "$TMP/review-policy.yml" "$TMP/review-policy.ignore-p2.yml"
 cat >>"$TMP/review-policy.yml" <<'YAML'
 feedback_policy:
@@ -1658,7 +1779,7 @@ feedback_policy:
     p2: ignore
 YAML
 run_gate
-assert_eq 0 "$RUN_RC" "feedback_policy p2:ignore excludes an unresolvable-severity CodeQL finding"
+assert_eq 0 "$RUN_RC" "feedback_policy p2:ignore excludes a no-severity CodeQL finding"
 assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "ignored CodeQL tier contributes nothing to posted count"
 mv "$TMP/review-policy.ignore-p2.yml" "$TMP/review-policy.yml"
 
@@ -1695,6 +1816,108 @@ JSON
 run_gate
 assert_eq 1 "$RUN_RC" "CodeQL comment with no alert link still blocks (does not abort)"
 assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "no parseable alert link falls back to p2"
+
+# --- GHAS archive coverage (#1113 item 1) -----------------------------------
+#
+# Before #1113, render-feedback-archive.sh recognized only Codex/CodeRabbit
+# body-text markers, so an edited/deleted github-advanced-security[bot]
+# inline comment left NO history record at all -- the finding vanished from
+# accounting exactly like the pre-#1101 defect this whole mechanism exists
+# to close, just for GHAS instead of Codex/CodeRabbit. The calling workflow
+# (codex-p1-gate.yml) now resolves the alert's severity BEFORE the comment
+# disappears and hands it to render-feedback-archive.sh as an explicit
+# GHAS_TIER argument, which validate_archive_payload accepts as the
+# optional `ghas_tiers` array.
+reset_fixtures
+PREVIOUS_GHAS="$TMP/previous-ghas.txt"
+cat >"$PREVIOUS_GHAS" <<'EOF'
+## CodeQL / Hardcoded credential
+
+This stores a credential directly in source.
+
+[Show more details](https://github.com/acme/widget/security/code-scanning/50)
+EOF
+GHAS_ARCHIVE=$("$RENDER_ARCHIVE" inline 8600 'github-advanced-security[bot]' \
+  '2026-08-26T22:00:00Z' "$PREVIOUS_GHAS" p1)
+jq -n --arg archive "$GHAS_ARCHIVE" '[{
+  "id": 8601,
+  "created_at": "2026-08-26T22:00:01Z",
+  "updated_at": "2026-08-26T22:00:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "deleted GHAS inline finding remains in the accounting inventory (#1113)"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "archived GHAS finding retains inline source kind"
+assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "archived GHAS finding is inventoried under its bot login"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "archived GHAS finding preserves the workflow-resolved tier"
+GHAS_ARCHIVE_ACK=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
+assert_match '^\[mergepath-inline-ack: 8600 [0-9a-f]{12}\]$' "$GHAS_ARCHIVE_ACK" "archived GHAS finding gets a content-pinned acknowledgement path"
+
+jq --arg token "$GHAS_ARCHIVE_ACK" '. + [{
+  "id": 8602,
+  "created_at": "2026-08-26T22:05:00Z",
+  "updated_at": "2026-08-26T22:05:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nRemoved the hardcoded credential in commit def5678.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-deletion acknowledgement reconciles the archived GHAS finding"
+assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "acknowledged archived GHAS finding clears the gate"
+
+# A GHAS comment body with NO parseable alert-number link cannot be
+# resolved to a tier at archive time (render-feedback-archive.sh has no
+# network access -- the workflow could not populate GHAS_TIER either), so
+# no record is emitted. This matches -- not regresses -- the established
+# "markerless edits have nothing to preserve" behavior every other
+# reviewer already gets: an unclassifiable body was never archived before
+# #1113 and still is not, whether or not it happens to name GHAS.
+reset_fixtures
+PREVIOUS_GHAS_NO_LINK="$TMP/previous-ghas-no-link.txt"
+cat >"$PREVIOUS_GHAS_NO_LINK" <<'EOF'
+## CodeQL / Some rule
+
+No alert link in this body at all.
+EOF
+GHAS_ARCHIVE_NO_LINK=$("$RENDER_ARCHIVE" inline 8610 'github-advanced-security[bot]' \
+  '2026-08-26T22:10:00Z' "$PREVIOUS_GHAS_NO_LINK")
+assert_eq "" "$GHAS_ARCHIVE_NO_LINK" "an unresolvable GHAS body with no GHAS_TIER argument emits no archive record"
+
+# Two comments linking the SAME alert number must fetch it only ONCE
+# (scripts/lib/ghas-alert-severity.sh's GHAS_SEVERITY_CACHE) -- without
+# memoization a PR with several comments on one finding would re-read the
+# same alert per comment, needlessly spending the reviewer PAT's rate
+# limit budget.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 30,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/c.js",
+    "line": 1,
+    "body": "## CodeQL / Rule one\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/40)"
+  },
+  {
+    "id": 31,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:50:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/d.js",
+    "line": 1,
+    "body": "## CodeQL / Rule one, again\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/40)"
+  }
+]
+JSON
+cat >"$TMP/fixtures/code-scanning-alert-40.json" <<'JSON'
+{"number": 40, "rule": {"security_severity_level": "high"}}
+JSON
+run_gate
+CALLS=$(grep -cF 'repos/acme/widget/code-scanning/alerts/40' "$TMP/gh-calls.log" || true)
+assert_eq 1 "$CALLS" "same alert number referenced by two comments is fetched only once (memoized)"
 
 if [ "$FAIL" -ne 0 ]; then
   printf 'review-feedback-accounting: FAIL (%s failed, %s passed)\n' "$FAIL" "$PASS" >&2

@@ -27,6 +27,7 @@
 #   coderabbit_tiers_of "<comment-body>"   # every graded marker, in order
 #   coderabbit_finding_scan "<body>"       # strip fenced/pre-merge regions
 #   ghas_severity_tier "<security_severity_level>"  # p0..p3 or empty (#1101)
+#   ghas_alert_number_from_body "<comment-body>"     # alert number or empty (#1113)
 #
 # cfg defaults to $CONFIG (the global the gate scripts set) and then to
 # .github/review-policy.yml, matching scripts/lib/reviewers-helpers.sh.
@@ -299,4 +300,16 @@ ghas_severity_tier() {
     low) echo p3 ;;
     *) return 0 ;;
   esac
+}
+
+# Pure regex extraction of the code-scanning alert number a
+# github-advanced-security[bot] comment body links to (the
+# "[Show more details](.../security/code-scanning/<number>)" line every such
+# comment carries), or empty if none is found. No I/O — the caller resolves
+# the number to a severity via scripts/lib/ghas-alert-severity.sh
+# (nathanjohnpayne/mergepath#1113), which needs the network access this file's
+# sourcing contract excludes.
+ghas_alert_number_from_body() {
+  printf '%s' "${1:-}" \
+    | grep -oE '/security/code-scanning/[0-9]+' | head -n1 | grep -oE '[0-9]+$' || true
 }

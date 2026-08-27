@@ -206,10 +206,61 @@ jobs:
             else
               jq -j '.comment.body // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
             fi
+
+            # #1113: a github-advanced-security[bot] body carries no severity
+            # marker render-feedback-archive.sh's text-only classifiers can
+            # find -- only a link to the alert. That script stays pure (no
+            # network calls, per its documented sourcing contract), so THIS
+            # step resolves the tier and hands it in as a 6th argument,
+            # matching how it already hands in the previous body. Matched by
+            # BODY PATTERN, not by comparing source_login against a
+            # configured bot login: render-feedback-archive.sh's own
+            # codex_tiers_of/coderabbit_tiers_of already classify purely by
+            # body content regardless of author, and this keeps the archive
+            # step free of a review-policy.yml dependency.
+            #
+            # Sources the SAME functions review-feedback-accounting.sh and
+            # the surface fingerprint use for this, rather than a third
+            # independent copy of the alert-number regex and severity-tier
+            # mapping.
+            #
+            # Best-effort on a failed read: WARN and fall back to p2 rather
+            # than failing the whole archival. Unlike live accounting (which
+            # re-evaluates every round and should fail loudly on a systemic
+            # permissions gap), this is a one-shot capture of a
+            # disappearing comment -- if the alert read fails here, there is
+            # no scheduled retry, and losing the archive record entirely
+            # would be worse than archiving it under a possibly-too-low
+            # tier with a visible warning.
+            ghas_tier=""
+            # shellcheck source=scripts/lib/feedback-policy-helpers.sh
+            . scripts/lib/feedback-policy-helpers.sh
+            # shellcheck source=scripts/lib/gh-api-scalar.sh
+            . scripts/lib/gh-api-scalar.sh
+            # shellcheck source=scripts/lib/ghas-alert-severity.sh
+            . scripts/lib/ghas-alert-severity.sh
+            alert_number=$(ghas_alert_number_from_body "$(cat "$previous_file")")
+            if [ -n "$alert_number" ]; then
+              # A failed cache_init (disk/permissions) leaves
+              # GHAS_SEVERITY_CACHE unset, which ghas_alert_severity below
+              # already treats as an rc-3 read failure -- same WARN+p2
+              # fallback as a failed live fetch, so no separate handling
+              # is needed here.
+              ghas_severity_cache_init || true
+              trap 'ghas_severity_cache_cleanup; rm -f "$previous_file" "$archive_records_file" "$payload_file"' EXIT
+              ghas_severity=""
+              if ! ghas_severity=$(ghas_alert_severity "$REPO" "$alert_number"); then
+                echo "::warning::could not resolve code-scanning alert #$alert_number severity for archival ($source_kind $source_id); archiving at the accountable-but-non-blocking default (p2)."
+                ghas_severity=""
+              fi
+              ghas_tier=$(ghas_severity_tier "$ghas_severity")
+              ghas_tier="${ghas_tier:-p2}"
+            fi
+
             # The renderer emits one v1 record or a complete set of chunked v2
             # records when the full prior body cannot fit in one comment.
             scripts/render-feedback-archive.sh \
-              "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file" \
+              "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file" "$ghas_tier" \
               >"$archive_records_file"
           fi
 
