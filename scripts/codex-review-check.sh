@@ -1791,9 +1791,10 @@ crc_select_codex_block_marker() {
           elif ((.body // "") | test($nc_re; "i")) then "not_connected"
           else null end ) as $reason
       | select($reason != null)
-      | { reason: $reason, created_at: .created_at }
+      | { reason: $reason, created_at: .created_at, id: .id }
     ]
-    | max_by(.created_at) // null
+    | max_by([.created_at, .id]) // null
+    | if . != null then del(.id) else . end
   '
 }
 # END codex_block_marker_selector
