@@ -865,7 +865,7 @@ scan_codex_state() {
         | select($reason != null)
         | { reason: $reason, created_at: .created_at, comment_id: .id }
       ]
-      | max_by(.created_at) // null
+      | max_by([.created_at, .comment_id]) // null
     ')
   else
     blocked='null'
