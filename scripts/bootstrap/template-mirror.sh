@@ -279,9 +279,17 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   '.github/screenshots/'
 
   # State files from prior wizard runs (when re-running into the
-  # same target dir)
+  # same target dir). The sidecars are separate on-disk files, not part of
+  # .bootstrap-state's own bytes (Codex P1 on #1112 round 12): plain
+  # `rsync --delete` (round 9) protects only paths matching an active
+  # --exclude, so without their own entries here it deletes them as
+  # ordinary receiver-only residue -- losing .warnings drops the final
+  # warning summary, and losing .checkpoints makes a later GitHub-infra
+  # retry forget it already performed an irreversible `gh repo create`.
   '.bootstrap-log'
   '.bootstrap-state'
+  '.bootstrap-state.warnings'
+  '.bootstrap-state.checkpoints'
 )
 
 # Entries of BOOTSTRAP_MIRROR_EXCLUDES that bootstrap::_reconcile_excluded_residue
@@ -296,6 +304,8 @@ BOOTSTRAP_MIRROR_RECONCILE_PROTECTED=(
   '.git/'
   '.bootstrap-log'
   '.bootstrap-state'
+  '.bootstrap-state.warnings'
+  '.bootstrap-state.checkpoints'
   '.claude/worktrees/'
   '.claude/settings.local.json'
   '.claude/launch.json'
@@ -1158,13 +1168,40 @@ bootstrap::_path_matches_any() {
 # absorbs zero or more leading path segments, so it matches both a
 # top-level and a nested occurrence in one predicate). `find` never
 # descends into a symlinked directory without -L, so none of this can be
-# tricked into deleting outside target through a symlink swap, and .git/ is
-# pruned from traversal outright regardless of pattern shape.
+# tricked into deleting outside target through a symlink swap.
+#
+# Codex P1 on #1112 round 12: pruning only `.git` from traversal was not
+# enough. Skipping a BOOTSTRAP_MIRROR_RECONCILE_PROTECTED entry's OWN
+# reconciliation pass does not stop find from DESCENDING into it on every
+# OTHER pattern's pass -- an active .claude/worktrees/ checkout (itself
+# potentially a full clone carrying scripts/sync-to-downstream.sh or
+# packaging/) had its nested matches deleted anyway, destroying uncommitted
+# operator work. Every protected DIRECTORY entry is now pruned from every
+# reconciliation traversal, not merely excused from having its own pattern
+# reconciled.
+#
+# Takes the pattern list as arguments (rather than reading
+# BOOTSTRAP_MIRROR_EXCLUDES directly) so bootstrap::_rsync_template can
+# reuse the exact same nested-match-aware removal for the DERIVED hub-only
+# doc list too (Codex P2 on #1112 round 12) -- those paths are excluded
+# from the transfer dynamically, at mirror time, so they need the same
+# treatment as the static array's entries, not a separate root-only `rm`.
 bootstrap::_reconcile_excluded_residue() {
   local target=$1
+  shift
   local pattern protected is_protected match_arg
 
-  for pattern in "${BOOTSTRAP_MIRROR_EXCLUDES[@]}"; do
+  local prune_expr=()
+  for protected in "${BOOTSTRAP_MIRROR_RECONCILE_PROTECTED[@]}"; do
+    case "$protected" in
+      */)
+        [ "${#prune_expr[@]}" -eq 0 ] || prune_expr+=(-o)
+        prune_expr+=(-path "*/${protected%/}")
+        ;;
+    esac
+  done
+
+  for pattern in "$@"; do
     is_protected=false
     for protected in "${BOOTSTRAP_MIRROR_RECONCILE_PROTECTED[@]}"; do
       if [ "$pattern" = "$protected" ]; then
@@ -1182,11 +1219,11 @@ bootstrap::_reconcile_excluded_residue() {
 
     if [ -n "$match_arg" ]; then
       bootstrap::run "reconcile excluded residue $pattern" \
-        find "$target" -name '.git' -prune -o -path "$match_arg" -exec rm -rf -- {} + \
+        find "$target" \( "${prune_expr[@]}" \) -prune -o -path "$match_arg" -exec rm -rf -- {} + \
         || return $?
     else
       bootstrap::run "reconcile excluded residue $pattern" \
-        find "$target" -name '.git' -prune -o -name "$pattern" -exec rm -rf -- {} + \
+        find "$target" \( "${prune_expr[@]}" \) -prune -o -name "$pattern" -exec rm -rf -- {} + \
         || return $?
     fi
   done
@@ -1233,17 +1270,32 @@ bootstrap::_rsync_template() {
 
   mkdir -p "$target"
 
-  bootstrap::_reconcile_excluded_residue "$target" || return $?
+  bootstrap::_reconcile_excluded_residue "$target" "${BOOTSTRAP_MIRROR_EXCLUDES[@]}" || return $?
 
   # Exclusion prevents a new transfer but does not delete receiver residue.
   # A resumed Stage B may already carry a doc copied before its ownership was
-  # changed to hub-only, so remove every validated derived path explicitly.
+  # changed to hub-only, so remove every validated derived path explicitly
+  # at its root-relative location (this exact-path, symlink-ancestor-guarded
+  # removal is what makes a failure here propagate rather than continue to
+  # an excluding rsync that would then run against a still-populated,
+  # partially-writable target).
+  local derived_docs=()
   while IFS= read -r exc; do
     [ -n "$exc" ] || continue
+    derived_docs+=("$exc")
     bootstrap::_reject_symlink_ancestors "$target" "$exc" || return $?
     bootstrap::run "remove stale hub-only doc $exc" rm -f -- "$target/$exc" \
       || return $?
   done <<< "$derived"
+
+  # Codex P2 on #1112 round 12: the removal above is root-relative only,
+  # and the derived exclusion matches at any depth in rsync's own filter
+  # (same as the static array, round 11) -- reconcile nested occurrences
+  # too. Safe to run unconditionally after the root-level pass above: a
+  # path already removed there simply matches nothing here.
+  if [ "${#derived_docs[@]}" -gt 0 ]; then
+    bootstrap::_reconcile_excluded_residue "$target" "${derived_docs[@]}" || return $?
+  fi
 
   bootstrap::run "rsync $source_root -> $target" \
     rsync "${rsync_args[@]}" "$source_root/" "$target/"

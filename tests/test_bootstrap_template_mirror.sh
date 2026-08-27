@@ -2806,6 +2806,142 @@ filemode_dirty_subject=$(git -C "$FILEMODE_DIRTY_TARGET" log -1 --format=%s)
   && pass "a mode-only change hidden by core.filemode=false blocks attribution (#1056 Codex P2 round 11)" \
   || fail "filemode-dirty source_root wrongly got attribution: $filemode_dirty_subject"
 
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 12: .bootstrap-state's sidecars
+# (.bootstrap-state.warnings, .bootstrap-state.checkpoints) are separate
+# on-disk files, not part of .bootstrap-state's own bytes, so plain
+# `rsync --delete` (round 9) deleted them as ordinary receiver-only residue
+# -- neither name matched an --exclude on its own. Drive _rsync_template
+# directly against a target already carrying all three state files
+# (simulating mid-wizard resume state) and assert every one of them
+# survives the mirror.
+# ---------------------------------------------------------------------------
+sidecar_src="$(mktemp -d "$WORKDIR/rsync-sidecar-src.XXXXXX")"
+sidecar_dst="$(mktemp -d "$WORKDIR/rsync-sidecar-dst.XXXXXX")"
+mkdir -p "$sidecar_src/docs/agents"
+printf 'readme\n' > "$sidecar_src/README.md"
+printf 'canonical\n' > "$sidecar_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$sidecar_src/docs/agents/bootstrap-runbook.md"
+cat >"$sidecar_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+printf 'template-mirror\n' > "$sidecar_dst/.bootstrap-state"
+printf '@github-infra\talready ran gh repo create\n' > "$sidecar_dst/.bootstrap-state.warnings"
+printf 'template-mirror\n' > "$sidecar_dst/.bootstrap-state.checkpoints"
+set +e
+sidecar_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$sidecar_src" "$sidecar_dst" 2>&1)
+sidecar_rc=$?
+set -e
+if [ "$sidecar_rc" != "0" ]; then
+  fail "rsync with resume-state sidecars present failed (rc=$sidecar_rc): $sidecar_out"
+elif [ ! -f "$sidecar_dst/.bootstrap-state" ] \
+  || [ ! -f "$sidecar_dst/.bootstrap-state.warnings" ] \
+  || [ ! -f "$sidecar_dst/.bootstrap-state.checkpoints" ]; then
+  fail "a bootstrap resume state file or sidecar was deleted by --delete: $(ls "$sidecar_dst" | grep bootstrap-state || echo none)"
+else
+  pass "bootstrap::_rsync_template preserves .bootstrap-state and both sidecars across --delete (#1056 Codex P1 round 12)"
+fi
+
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 12: skipping a protected directory's OWN pattern
+# does not stop find from DESCENDING into it while reconciling every OTHER
+# pattern -- an active .claude/worktrees/ checkout (itself potentially a
+# full clone carrying scripts/sync-to-downstream.sh or packaging/) had its
+# nested matches deleted anyway. Drive _rsync_template against a target
+# with such content inside a protected worktree and assert it survives.
+# ---------------------------------------------------------------------------
+worktree_src="$(mktemp -d "$WORKDIR/rsync-worktree-src.XXXXXX")"
+worktree_dst="$(mktemp -d "$WORKDIR/rsync-worktree-dst.XXXXXX")"
+mkdir -p "$worktree_src/docs/agents"
+printf 'readme\n' > "$worktree_src/README.md"
+printf 'canonical\n' > "$worktree_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$worktree_src/docs/agents/bootstrap-runbook.md"
+cat >"$worktree_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+mkdir -p "$worktree_dst/.claude/worktrees/some-branch/scripts" \
+  "$worktree_dst/.claude/worktrees/some-branch/packaging"
+printf 'uncommitted operator work, must survive\n' \
+  > "$worktree_dst/.claude/worktrees/some-branch/scripts/sync-to-downstream.sh"
+printf 'uncommitted operator work, must survive\n' \
+  > "$worktree_dst/.claude/worktrees/some-branch/packaging/f.txt"
+set +e
+worktree_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$worktree_src" "$worktree_dst" 2>&1)
+worktree_rc=$?
+set -e
+if [ "$worktree_rc" != "0" ]; then
+  fail "rsync with an active .claude/worktrees/ checkout present failed (rc=$worktree_rc): $worktree_out"
+elif [ ! -f "$worktree_dst/.claude/worktrees/some-branch/scripts/sync-to-downstream.sh" ] \
+  || [ ! -f "$worktree_dst/.claude/worktrees/some-branch/packaging/f.txt" ]; then
+  fail "content inside a protected .claude/worktrees/ checkout was deleted by excluded-residue reconciliation"
+else
+  pass "excluded-residue reconciliation prunes protected directories from traversal, not just their own pattern (#1056 Codex P1 round 12)"
+fi
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 12: the derived hub-only-doc removal was
+# root-relative only; the SAME nested-match gap round 11 fixed for the
+# static array also applies to the derived exclusion list. Drive
+# _rsync_template against a target carrying a NESTED occurrence of a
+# derived hub-only doc and assert it is removed too.
+# ---------------------------------------------------------------------------
+nested_derived_src="$(mktemp -d "$WORKDIR/rsync-nested-derived-src.XXXXXX")"
+nested_derived_dst="$(mktemp -d "$WORKDIR/rsync-nested-derived-dst.XXXXXX")"
+mkdir -p "$nested_derived_src/docs/agents"
+printf 'readme\n' > "$nested_derived_src/README.md"
+printf 'canonical\n' > "$nested_derived_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$nested_derived_src/docs/agents/bootstrap-runbook.md"
+cat >"$nested_derived_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+mkdir -p "$nested_derived_dst/nested/docs/agents"
+printf 'stale nested hub-only doc from an earlier mirror\n' \
+  > "$nested_derived_dst/nested/docs/agents/bootstrap-runbook.md"
+set +e
+nested_derived_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$nested_derived_src" "$nested_derived_dst" 2>&1)
+nested_derived_rc=$?
+set -e
+if [ "$nested_derived_rc" != "0" ]; then
+  fail "rsync with a nested derived hub-only doc present failed (rc=$nested_derived_rc): $nested_derived_out"
+elif [ -e "$nested_derived_dst/nested/docs/agents/bootstrap-runbook.md" ]; then
+  fail "a nested occurrence of a DERIVED hub-only doc survived the mirror -- nested-match reconciliation is not applied to the derived list"
+else
+  pass "bootstrap::_rsync_template reconciles a NESTED occurrence of a derived hub-only doc (#1056 Codex P2 round 12)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"
