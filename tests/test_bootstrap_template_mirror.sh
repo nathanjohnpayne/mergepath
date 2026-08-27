@@ -1051,6 +1051,56 @@ else
     || fail "the derived exclude over-matched — canonical/ordinary files missing from the mirror"
 fi
 
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 9: a --resume re-enters this stage from the top
+# against a target that may already carry a PRIOR attempt's output. rsync
+# without --delete only adds/updates — a path present in that prior output
+# but absent from source by the time the stage re-runs (removed upstream,
+# or simply never a real mirror candidate) survives untouched, and the
+# later `git add -A` commit records it even though
+# bootstrap::_resolve_canonical_source_sha still attributes the CURRENT
+# source HEAD, which has no such file. Reproduce the residue directly
+# (a file rsync alone would never touch because source no longer has it
+# and it matches no exclude) and assert --delete removes it while leaving
+# genuinely-mirrored content untouched.
+# ---------------------------------------------------------------------------
+delete_src="$(mktemp -d "$WORKDIR/rsync-delete-src.XXXXXX")"
+delete_dst="$(mktemp -d "$WORKDIR/rsync-delete-dst.XXXXXX")"
+mkdir -p "$delete_src/docs/agents"
+printf 'readme\n' > "$delete_src/README.md"
+printf 'canonical\n' > "$delete_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$delete_src/docs/agents/bootstrap-runbook.md"
+cat >"$delete_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+printf 'residue from an earlier, interrupted Stage B attempt\n' > "$delete_dst/stale-from-prior-attempt.txt"
+printf 'readme (prior attempt copy, now superseded)\n' > "$delete_dst/README.md"
+set +e
+delete_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$delete_src" "$delete_dst" 2>&1)
+delete_rc=$?
+set -e
+if [ "$delete_rc" != "0" ]; then
+  fail "rsync with --delete failed against a resumed-looking target (rc=$delete_rc): $delete_out"
+elif [ -e "$delete_dst/stale-from-prior-attempt.txt" ]; then
+  fail "a prior attempt's residue (absent from source, excluded by nothing) survived the mirror -- --delete is not wired in"
+else
+  pass "bootstrap::_rsync_template removes residue from an earlier attempt that source no longer has (#1056 Codex P1 round 9)"
+fi
+[ "$(cat "$delete_dst/README.md" 2>/dev/null)" = "readme" ] \
+  && pass "--delete does not disturb a path that genuinely still mirrors from source" \
+  || fail "README.md was not refreshed to the current source content"
+
 # A target subdirectory may be a symlink even when the target root itself is
 # legitimate. Removing receiver residue through that path would unlink a file
 # outside the bootstrap target before rsync has a chance to replace the link.
@@ -2441,6 +2491,86 @@ show_untracked_no_subject=$(git -C "$SHOW_UNTRACKED_NO_TARGET" log -1 --format=%
 [ "$show_untracked_no_subject" = "Initial commit (bootstrapped from mergepath)" ] \
   && pass "status.showUntrackedFiles=no in the source repo's own config does not hide a genuinely stray file from the cleanliness check (#1056 CodeRabbit round 8)" \
   || fail "show-untracked-no source_root wrongly got attribution despite a stray file hidden by ambient config: $show_untracked_no_subject"
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 9: the cleanliness check's exclude filter only
+# consulted the static BOOTSTRAP_MIRROR_EXCLUDES array. A dirty
+# docs/agents/*.md doc classified `class: hub-only` in .mergepath-sync.yml
+# is excluded dynamically (bootstrap::_derive_hub_only_excludes), not via
+# that static array, so it can never reach the target either -- but the
+# resolver rejected attribution on it anyway. Same source shape as the
+# real-noise case (canonical origin, pushed HEAD), but with a committed
+# hub-only doc that is then dirtied by an uncommitted edit.
+# ---------------------------------------------------------------------------
+HUB_DOC_DIRTY_SOURCE="$WORKDIR/hub-doc-dirty-repo"
+mkdir -p "$HUB_DOC_DIRTY_SOURCE/docs/agents"
+git -C "$HUB_DOC_DIRTY_SOURCE" init -q -b main
+git -C "$HUB_DOC_DIRTY_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo seed >"$HUB_DOC_DIRTY_SOURCE/f"
+printf '# Bootstrap runbook (hub-only)\n' >"$HUB_DOC_DIRTY_SOURCE/docs/agents/bootstrap-runbook.md"
+cat >"$HUB_DOC_DIRTY_SOURCE/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+git -C "$HUB_DOC_DIRTY_SOURCE" add -A
+git -C "$HUB_DOC_DIRTY_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "hub-doc-dirty-repo seed"
+git -C "$HUB_DOC_DIRTY_SOURCE" update-ref refs/remotes/origin/main HEAD
+HUB_DOC_DIRTY_SHA=$(git -C "$HUB_DOC_DIRTY_SOURCE" rev-parse HEAD)
+printf '# Bootstrap runbook (hub-only, locally edited)\n' >"$HUB_DOC_DIRTY_SOURCE/docs/agents/bootstrap-runbook.md"
+HUB_DOC_DIRTY_TARGET="$WORKDIR/hub-doc-dirty-target"
+mkdir -p "$HUB_DOC_DIRTY_TARGET"
+echo seed >"$HUB_DOC_DIRTY_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$HUB_DOC_DIRTY_TARGET" "$HUB_DOC_DIRTY_SOURCE" >/dev/null
+
+hub_doc_dirty_subject=$(git -C "$HUB_DOC_DIRTY_TARGET" log -1 --format=%s)
+[ "$hub_doc_dirty_subject" = "Initial commit (bootstrapped from mergepath@${HUB_DOC_DIRTY_SHA:0:7})" ] \
+  && pass "an uncommitted edit to a class:hub-only doc does not block attribution (#1056 Codex P2 round 9)" \
+  || fail "hub-doc-dirty source_root wrongly blocked attribution: $hub_doc_dirty_subject (expected sha ${HUB_DOC_DIRTY_SHA:0:7})"
+
+# ---------------------------------------------------------------------------
+# Same round-9 finding, the other named path: tests/test_mergepath_playground.sh
+# is rsynced (no static exclude names it) and then deleted post-mirror via
+# BOOTSTRAP_POST_MIRROR_REMOVE, so it too can never survive into the
+# target's committed tree regardless of its dirtiness in source.
+# ---------------------------------------------------------------------------
+PLAYGROUND_DIRTY_SOURCE="$WORKDIR/playground-dirty-repo"
+mkdir -p "$PLAYGROUND_DIRTY_SOURCE/tests"
+git -C "$PLAYGROUND_DIRTY_SOURCE" init -q -b main
+git -C "$PLAYGROUND_DIRTY_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo seed >"$PLAYGROUND_DIRTY_SOURCE/f"
+printf 'playground test (mergepath-only sandbox)\n' >"$PLAYGROUND_DIRTY_SOURCE/tests/test_mergepath_playground.sh"
+git -C "$PLAYGROUND_DIRTY_SOURCE" add -A
+git -C "$PLAYGROUND_DIRTY_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "playground-dirty-repo seed"
+git -C "$PLAYGROUND_DIRTY_SOURCE" update-ref refs/remotes/origin/main HEAD
+PLAYGROUND_DIRTY_SHA=$(git -C "$PLAYGROUND_DIRTY_SOURCE" rev-parse HEAD)
+printf 'playground test (locally edited)\n' >"$PLAYGROUND_DIRTY_SOURCE/tests/test_mergepath_playground.sh"
+PLAYGROUND_DIRTY_TARGET="$WORKDIR/playground-dirty-target"
+mkdir -p "$PLAYGROUND_DIRTY_TARGET"
+echo seed >"$PLAYGROUND_DIRTY_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$PLAYGROUND_DIRTY_TARGET" "$PLAYGROUND_DIRTY_SOURCE" >/dev/null
+
+playground_dirty_subject=$(git -C "$PLAYGROUND_DIRTY_TARGET" log -1 --format=%s)
+[ "$playground_dirty_subject" = "Initial commit (bootstrapped from mergepath@${PLAYGROUND_DIRTY_SHA:0:7})" ] \
+  && pass "an uncommitted edit to tests/test_mergepath_playground.sh does not block attribution (#1056 Codex P2 round 9)" \
+  || fail "playground-dirty source_root wrongly blocked attribution: $playground_dirty_subject (expected sha ${PLAYGROUND_DIRTY_SHA:0:7})"
 
 # --- summary --------------------------------------------------------------
 echo

@@ -1079,8 +1079,19 @@ bootstrap::_rsync_template() {
   local source_root=$1
   local target=$2
 
-  # Build the rsync arg list.
-  local rsync_args=(-a)
+  # Codex P1 on #1112 round 9: --delete, not a bare mirror. A --resume
+  # re-enters this stage from the top against a target that may already
+  # carry a prior attempt's output — a path present then but removed from
+  # source since, or any file rsync alone would never touch because it
+  # only ever ADDS/UPDATES. Without --delete that residue survives into
+  # the `git add -A` commit while _resolve_canonical_source_sha still
+  # attributes the CURRENT source HEAD, so the recorded Source: trailer
+  # would name a tree the target's actual bytes don't match. --delete
+  # reconciles the target to exactly what a fresh mirror of source_root
+  # would produce; it does not touch excluded destination paths (.git/,
+  # hub-only docs, ...) by rsync's own default, so it cannot undo the
+  # explicit hub-only-doc removal a few lines below or delete .git.
+  local rsync_args=(-a --delete)
   local exc
   for exc in "${BOOTSTRAP_MIRROR_EXCLUDES[@]}"; do
     rsync_args+=(--exclude="$exc")
@@ -1299,13 +1310,35 @@ bootstrap::_resolve_canonical_source_sha() {
   status_output=$(git -C "$source_root" status --porcelain --ignored \
     --untracked-files=all --ignore-submodules=none 2>/dev/null) || return 1
   if [ -n "$status_output" ]; then
+    # Codex P2 on #1112 round 9: the static BOOTSTRAP_MIRROR_EXCLUDES array
+    # is not the complete set of paths a mirror never lands in the target.
+    # A dirty docs/agents/*.md hub-only doc (excluded dynamically via
+    # bootstrap::_derive_hub_only_excludes, not this static array) or a
+    # dirty tests/test_mergepath_playground.sh / CONTEXT.md (rsynced, then
+    # deleted by bootstrap::_remove_orphans' BOOTSTRAP_POST_MIRROR_REMOVE
+    # pass) can never survive into the target's committed tree either, so
+    # judging cleanliness against the static array alone rejects
+    # attribution on a checkout that is, for mirroring purposes, clean.
+    # Failure to derive the hub-only set is NOT propagated as an error
+    # here (unlike bootstrap::_rsync_template, which must refuse to mirror
+    # rather than risk shipping hub-only content) -- an empty derived set
+    # only makes this check MORE conservative, same as before this round.
+    local derived_hub_only=""
+    derived_hub_only=$(bootstrap::_derive_hub_only_excludes "$source_root" 2>/dev/null) || derived_hub_only=""
+    local combined_excludes=("${BOOTSTRAP_MIRROR_EXCLUDES[@]}" "${BOOTSTRAP_POST_MIRROR_REMOVE[@]}")
+    local hub_doc
+    while IFS= read -r hub_doc; do
+      [ -n "$hub_doc" ] || continue
+      combined_excludes+=("$hub_doc")
+    done <<<"$derived_hub_only"
+
     local line path base pattern excluded is_dirty=false
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       path="${line:3}"
       base="${path##*/}"
       excluded=false
-      for pattern in "${BOOTSTRAP_MIRROR_EXCLUDES[@]}"; do
+      for pattern in "${combined_excludes[@]}"; do
         case "$pattern" in
           */)
             case "$path" in
