@@ -626,9 +626,10 @@ codex:
 # and merge unread (observed on nathanpaynedotcom#809: a real defect, not a
 # false positive, sat unanswered across four rounds).
 #
-# `enabled: true` makes accounting track these comments the same way it
-# already tracks Codex/CodeRabbit findings: each one needs a substantive
-# on-thread reply from an agent identity before the PR is `clear`.
+# Accounting tracks these comments the same way it already tracks
+# Codex/CodeRabbit findings: each one needs a substantive on-thread reply
+# from an agent identity before the PR is `clear`. (`enabled` below does
+# NOT gate this — see the note near the end of this block.)
 #
 # The comment body carries no severity — only a link to the alert
 # (`.../security/code-scanning/<number>`). Accounting resolves severity by
