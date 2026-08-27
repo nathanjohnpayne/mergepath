@@ -67,7 +67,10 @@ mkdir -p "$FIXTURES"
 #   Unknown severity, routed substantive per severity_to_track's
 #   err-on-surface default. Locks in #1101: before it, this thread's
 #   original_author would have failed the bot-login allowlist entirely
-#   and never reached classification at all.
+#   and never reached classification at all. Uses the UN-suffixed GraphQL
+#   login form ("github-advanced-security", not "...[bot]") deliberately
+#   (Codex on PR #1106): this query is GraphQL, and the allowlist's
+#   suffixed-only entry never matched it.
 
 cat >"$FIXTURES/prs.json" <<'JSON'
 [
@@ -223,7 +226,7 @@ cat >"$FIXTURES/threads.json" <<'JSON'
                 "nodes": [
                   {
                     "databaseId": 8,
-                    "author": { "login": "github-advanced-security[bot]" },
+                    "author": { "login": "github-advanced-security" },
                     "body": "## CodeQL / Inefficient regular expression\n\nThis part of the regular expression may cause exponential backtracking.\n\n[Show more details](https://github.com/owner/repo/security/code-scanning/1)",
                     "createdAt": "2026-05-15T08:40:00Z",
                     "originalCommit": { "oid": "head_sha_xxxxxxxxxxxxxxxxxxxxxx" },
@@ -400,16 +403,17 @@ if [ "$LINES" -ne 1 ]; then
   exit 1
 fi
 
-# Thread F (#1101) must SURVIVE — github-advanced-security[bot] is now
-# a recognized original-author login, and this thread trips none of the
-# other filters (fresh mp-id, no reply, no post-comment fix-commit).
+# Thread F (#1101) must SURVIVE — github-advanced-security (the un-suffixed
+# GraphQL login form) is now a recognized original-author login, and this
+# thread trips none of the other filters (fresh mp-id, no reply, no
+# post-comment fix-commit).
 if ! grep -q '"thread_id":"PRT_thread_f"' "$OUT_FILE"; then
-  echo "FAIL: thread F (github-advanced-security[bot]) should surface in the rollup, not be silently excluded (#1101)" >&2
+  echo "FAIL: thread F (github-advanced-security) should surface in the rollup, not be silently excluded (#1101)" >&2
   cat "$OUT_FILE" >&2
   exit 1
 fi
-if ! grep -q '"author":"github-advanced-security\[bot\]"' "$OUT_FILE"; then
-  echo "FAIL: thread F's rollup item should record its GHAS author login" >&2
+if ! grep -q '"author":"github-advanced-security"' "$OUT_FILE"; then
+  echo "FAIL: thread F's rollup item should record its GHAS author login (un-suffixed GraphQL form)" >&2
   cat "$OUT_FILE" >&2
   exit 1
 fi
