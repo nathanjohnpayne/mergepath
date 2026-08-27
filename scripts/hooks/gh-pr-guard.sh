@@ -1480,7 +1480,7 @@ guarded_gh_invocation_label() {
           parent="$tok"
           continue
           ;;
-        create|merge|comment|review|edit)
+        create|new|merge|comment|review|edit)
           if [ "$saw_ph" -eq 1 ]; then
             # Guarded verb reached across a placeholder run with no literal
             # noun: the noun (and possibly the exe) was synthesized —
@@ -1527,7 +1527,7 @@ guarded_gh_invocation_label() {
     esac
 
     case "$parent:$tok" in
-      pr:create|pr:merge|pr:comment|pr:review|pr:edit)
+      pr:new|pr:create|pr:merge|pr:comment|pr:review|pr:edit)
         printf 'gh pr %s\n' "$tok"
         return 0
         ;;
@@ -1596,7 +1596,7 @@ synth_cmdsub_write_label() {
     # and `gh issue comment`; either way it is a guarded write, so blocking
     # is the fail-closed answer.
     case "$tok" in
-      create|merge|comment|review|edit)
+      create|new|merge|comment|review|edit)
         printf 'gh <synthesized> %s\n' "$tok"
         return 0
         ;;
@@ -2024,7 +2024,16 @@ for i in "${!TOKENS[@]}"; do
       # whatever the substitution yields as the subcommand. Fail closed.
       block_cmdsub_in_gh_stream
     fi
-    PR_SUBCOMMAND="$tok"
+    # `gh pr new` is a working alias for `gh pr create` (gh 2.97: `gh pr new
+    # --help` prints the create help and lists `new` under ALIASES). Resolving
+    # it verbatim left PR_SUBCOMMAND="new", which matched no guarded branch, so
+    # the "Not a covered command? Allow." path exited 0 and the create guard --
+    # Authoring-Agent, ## Self-Review, byline verification -- never ran.
+    if [ "$SAW_PR" -eq 1 ] && [ "$tok" = "new" ]; then
+      PR_SUBCOMMAND="create"
+    else
+      PR_SUBCOMMAND="$tok"
+    fi
     PR_SUBCOMMAND_INDEX=$i
     break
   fi
