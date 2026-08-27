@@ -20,14 +20,24 @@ export function parsePrBodyContract(body) {
     }, inComment);
     if (line == null) continue;
 
-    const fenceLine = stripContainerPrefix(line).trimStart();
+    const container = stripContainerPrefix(line);
+    // Four spaces (or a tab) means an indented code block, and an indented
+    // backtick run is CODE, not a fence delimiter. trimStart() erased that
+    // distinction, so `    \u0060\u0060\u0060` opened a fence that never closed and the
+    // rest of the body -- including valid top-level markers -- was discarded.
+    // A fence delimiter may be indented at most three spaces.
+    const indentedCode = /^(?: {4}|\t)/.test(container);
+    const fenceLine = container.trimStart();
     if (fence != null) {
-      const closing = fenceLine.match(/^(`{3,}|~{3,})\s*$/);
-      if (closing && closing[1][0] === fence.marker && closing[1].length >= fence.length) {
-        fence = null;
+      if (!indentedCode) {
+        const closing = fenceLine.match(/^(`{3,}|~{3,})\s*$/);
+        if (closing && closing[1][0] === fence.marker && closing[1].length >= fence.length) {
+          fence = null;
+        }
       }
       continue;
     }
+    if (indentedCode) continue;
 
     const opening = fenceLine.match(/^(`{3,}|~{3,})(.*)$/);
     if (opening) {

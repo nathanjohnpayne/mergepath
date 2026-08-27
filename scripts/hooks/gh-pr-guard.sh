@@ -3025,8 +3025,23 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
         echo "BLOCKED: gh-pr-guard could not parse the PR body for the self-approve check." >&2
         exit 2
       fi
-      PR_AUTHORING_AGENT_COUNT=$(pr_body_authoring_agent_count "$REVIEW_PR_BODY")
-      PR_AUTHORING_AGENT=$(pr_body_authoring_agent "$REVIEW_PR_BODY")
+      # Catch BOTH helper calls explicitly. Letting `set -e` propagate the
+      # helper's own status would exit non-2, and a non-2 hook exit is a
+      # nonblocking error -- i.e. fail OPEN on the self-approve check.
+      if ! PR_AUTHORING_AGENT_COUNT=$(pr_body_authoring_agent_count "$REVIEW_PR_BODY"); then
+        echo "BLOCKED: gh-pr-guard could not run the shared PR-body parser (count); refusing to evaluate self-approval." >&2
+        exit 2
+      fi
+      if ! PR_AUTHORING_AGENT=$(pr_body_authoring_agent "$REVIEW_PR_BODY"); then
+        echo "BLOCKED: gh-pr-guard could not run the shared PR-body parser (author); refusing to evaluate self-approval." >&2
+        exit 2
+      fi
+      case "$PR_AUTHORING_AGENT_COUNT" in
+        ''|*[!0-9]*)
+          echo "BLOCKED: gh-pr-guard got a non-numeric Authoring-Agent count from the shared parser." >&2
+          exit 2
+          ;;
+      esac
       if [ "$PR_AUTHORING_AGENT_COUNT" -ne 1 ] || [ -z "$PR_AUTHORING_AGENT" ]; then
         echo "BLOCKED: gh-pr-guard could not identify exactly one visible Authoring-Agent in the PR body." >&2
         exit 2

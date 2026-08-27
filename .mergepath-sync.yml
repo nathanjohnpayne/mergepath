@@ -1540,6 +1540,7 @@ paths:
       - "tests/test_repo_lint_optimization.sh"   # check_repo_lint_optimization
       - "tests/test_check_doc_ownership.sh"      # check_doc_ownership
       - "tests/test_gh_pr_guard.sh"            # check_gh_as_author
+      - "tests/test_pr_body_contract_parity.sh"  # check_gh_as_author (#1121) — invoked by the wrapper, so a path-scoped kit sync without it reds the consumer lint
       - "tests/test_gh_as_author.sh"           # check_gh_as_author
       - "tests/test_gh_as_reviewer.sh"         # check_gh_as_author
       - "tests/test_gh_wrapper_parallel.sh"    # check_gh_as_author

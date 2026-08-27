@@ -82,6 +82,30 @@ is_pr_create_command() {
   # that recognized only bare `gh` fell through to the generic path -- skipping
   # body validation AND the post-create author readback -- while the guard
   # believed this function had taken responsibility for both.
+  # Skip prefix executables the GUARD also sees through. `env FOO=x gh pr
+  # create` and `command gh pr create` both reach gh, and the guard recognises
+  # the nested create and delegates here on the promise that this validator
+  # runs -- so rejecting the prefix silently skipped body validation AND the
+  # post-create author readback. Only the shapes the guard accepts are
+  # normalised; anything else still fails closed below.
+  while :; do
+    case "${1:-}" in
+      env|*/env)
+        shift
+        # env takes options and VAR=value assignments before the command.
+        while :; do
+          case "${1:-}" in
+            -i|--ignore-environment|-0|--null) shift ;;
+            -u|--unset) shift 2 ;;
+            *=*) shift ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      command) shift ;;
+      *) break ;;
+    esac
+  done
   case "${1:-}" in
     gh|*/gh) ;;
     *) return 1 ;;
@@ -181,6 +205,14 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
         fi
         NORMALIZED_COMMAND+=("$argument" "$1")
         shift
+        ;;
+      # ATTACHED value for another value-taking short option. `-tbug` is
+      # `-t bug`, not a clustered `-b`; the catch-all below would otherwise
+      # reject valid creates whose title/label/head merely contains b or F.
+      # Letters are gh's value-taking pr-create shorthands EXCEPT -b/-F, which
+      # are body flags handled above.
+      -[talpmBHr]?*)
+        NORMALIZED_COMMAND+=("$argument")
         ;;
       -[^-]*[bF]*)
         echo "gh-as-author: ambiguous clustered short option '$argument' contains a PR body flag; pass -b or -F separately." >&2

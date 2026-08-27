@@ -183,6 +183,55 @@ else
   bad "codex-review-check still lets a non-1 marker count fall through to the empty sentinel"
 fi
 
+# --- 9. prefix executables the GUARD sees through -----------------------------
+# `env FOO=x gh pr create` and `command gh pr create` both reach gh, and the
+# guard recognises the nested create and delegates here. A wrapper that rejects
+# the prefix takes its generic path, skipping body validation AND the
+# post-create author readback while the guard believes it delegated.
+check_shape create "env with an assignment"      env FOO=x gh pr create --title t
+check_shape create "absolute env"                /usr/bin/env gh pr new --title t
+check_shape create "command builtin prefix"      command gh pr create --title t
+check_shape other  "prefixed non-create"         env FOO=x gh pr merge 1
+check_shape other  "prefixed non-gh executable"  env FOO=x notgh pr create --title t
+
+# --- 10. an indented backtick run is code, not a fence ------------------------
+# `    \u0060\u0060\u0060` was trimmed to a fence opener that never closed, so the rest of
+# the body -- including valid top-level markers -- was discarded and a correct
+# PR body was rejected as having no author.
+INDENTED_FENCE=$'    ```\nAuthoring-Agent: claude\n\n## Self-Review\nok'
+got_count="$(pr_body_authoring_agent_count "$INDENTED_FENCE")"
+got_agent="$(pr_body_authoring_agent "$INDENTED_FENCE")"
+if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ]; then
+  ok "an indented backtick line does not open a fence (count=1, agent=claude)"
+else
+  bad "indented-fence body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
+fi
+if pr_body_has_self_review "$INDENTED_FENCE"; then
+  ok "an indented backtick line does not hide a following ## Self-Review"
+else
+  bad "indented-fence body: ## Self-Review was suppressed"
+fi
+
+# The narrowing must not cost real fence suppression.
+REAL_FENCE=$'```\nAuthoring-Agent: codex\n```\n\nAuthoring-Agent: claude\n\n## Self-Review\nok'
+got_agent="$(pr_body_authoring_agent "$REAL_FENCE")"
+if [ "$got_agent" = "claude" ]; then
+  ok "a real top-level fence still suppresses its contents"
+else
+  bad "real fence: expected agent=claude, got $got_agent"
+fi
+
+# --- 11. the HOOK must fail closed on parser trouble --------------------------
+# A non-2 hook exit is a NONBLOCKING error in the hook wiring, so letting `set
+# -e` propagate the helper status would fail OPEN on the self-approve check --
+# the opposite of the intent. Both helper calls must be caught explicitly.
+guard_exit2=$(grep -c "refusing to evaluate self-approval" "$ROOT/scripts/hooks/gh-pr-guard.sh")
+if [ "$guard_exit2" -ge 2 ]; then
+  ok "gh-pr-guard catches BOTH parser calls and exits 2 (blocking)"
+else
+  bad "gh-pr-guard has $guard_exit2 explicit parser exit-2 guards, expected 2"
+fi
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
