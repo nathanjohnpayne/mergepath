@@ -2838,6 +2838,100 @@ else
   echo "$OUT_NULORPH_APPLY" >&2
 fi
 
+# ── Case 43b (#1103, Codex P2): a TRAILING newline survives canonicalization ──
+# Case 43 covers a newline in the MIDDLE of a registered path. A newline at
+# the END is a separate failure, and it is one the NUL-safe set INTRODUCES
+# rather than fixes: command substitution strips every trailing newline, so
+# `abs=$(cd "$d" && pwd -P)` truncates the path, while the NUL-delimited
+# membership set keeps the byte. The registered checkout then fails its own
+# membership test and is classified an ORPHAN — and under --orphan-clean the
+# rm -rf targets the TRUNCATED path, which is either a no-op recorded as a
+# successful removal (so every later audit repeats the false finding) or, if
+# a sibling occupies that name, the deletion of an unrelated directory.
+#
+# With the previous line-delimited set this could not happen: grep -Fxq
+# matched the truncated value against the record's first line, so the entry
+# was accidentally treated as registered. That is why this case ships with
+# the NUL change rather than separately.
+NLTAIL_ROOT="$WORKDIR/orphan-nl-trailing"
+NLTAIL_REMOTE="$NLTAIL_ROOT/remote.git"
+NLTAIL_MAIN="$NLTAIL_ROOT/main"
+mkdir -p "$NLTAIL_ROOT"
+git init -q --bare "$NLTAIL_REMOTE"
+git init -q -b main "$NLTAIL_MAIN"
+(
+  cd "$NLTAIL_MAIN"
+  git -C "$NLTAIL_MAIN" config user.email "test@example.com"
+  git -C "$NLTAIL_MAIN" config user.name "Test"
+  git -C "$NLTAIL_MAIN" config commit.gpgsign false
+  git -C "$NLTAIL_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$NLTAIL_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+NLTAIL_MAIN=$(cd "$NLTAIL_MAIN" && pwd -P)
+NLTAIL_WTROOT="$NLTAIL_MAIN/.claude/worktrees"
+mkdir -p "$NLTAIL_WTROOT"
+# ANSI-C quoting, NOT $(printf 'trail\n'): command substitution would strip
+# the very trailing newline this case exists to exercise, and the fixture
+# would silently build an ordinary path. The premise assertion below is what
+# caught that when this case was first written.
+NLTAIL_NAME=$'trail\n'
+NLTAIL_REG="$NLTAIL_WTROOT/$NLTAIL_NAME"
+git -C "$NLTAIL_MAIN" worktree add -q -b trailbranch "$NLTAIL_REG" >/dev/null 2>&1 || true
+
+# Premise 1: the filesystem and git both accepted a path whose final
+# component ends in a newline. If either refused, this case asserts nothing
+# and must say so rather than passing quietly.
+if [ ! -d "$NLTAIL_REG" ]; then
+  fail "fixture setup: could not create a worktree whose path ends in a newline — case 43b asserts nothing"
+fi
+nltail_registered() {
+  local field found=1
+  while IFS= read -r -d '' field; do
+    [ "$field" = "worktree $NLTAIL_REG" ] && found=0
+  done < <(git -C "$NLTAIL_MAIN" worktree list --porcelain -z)
+  return "$found"
+}
+if ! nltail_registered; then
+  fail "fixture setup: git did not register the trailing-newline worktree path verbatim"
+fi
+# Premise 2: the truncation this case is about is real — the naive
+# canonicalization genuinely loses the byte. Asserting the premise keeps the
+# case honest if a future shell stops stripping trailing newlines.
+NLTAIL_NAIVE=$(cd "$NLTAIL_REG" 2>/dev/null && pwd -P)
+if [ "$NLTAIL_NAIVE" = "$NLTAIL_REG" ]; then
+  fail "fixture setup: command substitution did not strip the trailing newline — case 43b no longer models the defect"
+fi
+
+set +e
+OUT_NLTAIL=$( cd "$NLTAIL_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_NLTAIL=$?
+set -e
+if echo "$OUT_NLTAIL" | grep -qE "orphan dirs: +0$"; then
+  pass "#1103 a registered worktree whose path ends in a newline is not misread as an orphan"
+else
+  fail "#1103 the trailing newline was truncated and the registered worktree was classified an orphan (rc=$RC_NLTAIL)"
+  echo "$OUT_NLTAIL" >&2
+fi
+
+set +e
+OUT_NLTAIL_APPLY=$( cd "$NLTAIL_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply --orphan-clean 2>&1 )
+RC_NLTAIL_APPLY=$?
+set -e
+if [ "$RC_NLTAIL_APPLY" -ne 0 ]; then
+  fail "fixture setup: the trailing-newline --apply --orphan-clean run exited $RC_NLTAIL_APPLY"
+  echo "$OUT_NLTAIL_APPLY" >&2
+fi
+if [ -d "$NLTAIL_REG" ] && [ -e "$NLTAIL_REG/seed.txt" ] && nltail_registered; then
+  pass "#1103 DATA SAFETY: the trailing-newline worktree survives --orphan-clean and stays registered"
+else
+  fail "#1103 DATA LOSS: --orphan-clean acted on a truncated canonical path"
+  echo "$OUT_NLTAIL_APPLY" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

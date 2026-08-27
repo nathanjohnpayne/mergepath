@@ -1365,7 +1365,31 @@ if [ -d "$ORPHAN_ROOT" ]; then
     # Resolve to physical path so the orphan comparison aligns with how
     # git records worktree paths in `git worktree list` (it canonicalizes
     # symlinked roots like /var/folders → /private/var/folders on macOS).
-    abs=$(cd "$d" 2>/dev/null && pwd -P) || continue
+    #
+    # The `printf X` sentinel is load-bearing, not a flourish. Command
+    # substitution strips EVERY trailing newline from its output, so a plain
+    # `abs=$(cd "$d" && pwd -P)` silently truncates a path whose own final
+    # component ends in a newline — a name git and the filesystem both allow.
+    # The membership set is NUL-delimited and keeps that byte, so the
+    # truncated value would fail to match its own registered record, and the
+    # registered checkout would be classified an ORPHAN. Under
+    # --orphan-clean the `rm -rf` below then targets the TRUNCATED path:
+    # either a no-op recorded as a successful removal, so every later audit
+    # repeats the false finding, or — if a sibling happens to occupy that
+    # exact name — the deletion of an unrelated directory.
+    #
+    # `pwd -P` emits `<path>\n`, so with the sentinel the substitution sees
+    # `<path>\nX`, has no trailing newline to strip, and both removals below
+    # are exact: strip the sentinel, then strip the single newline `pwd`
+    # itself added. Whatever trailing newlines belong to the PATH survive.
+    #
+    # Found by Codex on #1103. It is a regression this PR would otherwise
+    # have introduced: with the previous line-delimited set, `grep -Fxq`
+    # matched the truncated value against the record`s first line and the
+    # entry was (accidentally) treated as registered.
+    abs=$(cd "$d" 2>/dev/null && pwd -P && printf X) || continue
+    abs="${abs%X}"
+    abs="${abs%$'\n'}"
 
     # Defense in depth #2: even though $d itself isn't a symlink, its
     # physical path MIGHT be outside ORPHAN_ROOT_PHYS if a parent in
