@@ -346,7 +346,15 @@ perm_block=$(
 # GITHUB_TOKEN repos an omitted scope is `none`, those reads 403,
 # and the gate aborts rc=3 with `needs-external-review` stuck. Same
 # class as the merge-clearance-gate.yml `issues: read` fix (#429).
-expected_perms=$'actions: read\nchecks: write\ncontents: read\nissues: read\npull-requests: write'
+# `security-events: read` added in #1101 (CodeRabbit on PR #1106) —
+# scripts/workflow/approval-merge-continuation.sh's review-feedback-
+# accounting.sh call (both evaluate-and-clear's and scheduled-sweep's
+# "Continue approved PRs..." steps reach it) reads code-scanning/alerts
+# to grade a github-advanced-security[bot] finding's severity. That
+# call runs under ACCOUNTING_GH_TOKEN (this workflow's GITHUB_TOKEN),
+# not the ambient AUTHOR_MERGE_TOKEN the continuation steps otherwise
+# use, specifically so this permissions block can reach it.
+expected_perms=$'actions: read\nchecks: write\ncontents: read\nissues: read\npull-requests: write\nsecurity-events: read'
 if [ "$perm_block" = "$expected_perms" ]; then
   pass=$((pass + 1))
   echo "  PASS: workflow permissions exactly match the least-privilege set"

@@ -134,6 +134,14 @@ permissions:
   # trigger produced a zero-job failed run, so the label never
   # auto-cleared).
   checks: write
+  # Required for scripts/workflow/approval-merge-continuation.sh's
+  # review-feedback-accounting.sh call (both jobs below reach it), which
+  # reads code-scanning/alerts to grade a github-advanced-security[bot]
+  # finding's severity (#1101). That call runs under ACCOUNTING_GH_TOKEN
+  # (this workflow's GITHUB_TOKEN, not the ambient AUTHOR_MERGE_TOKEN the
+  # continuation steps otherwise use) specifically so this block can reach
+  # it — CodeRabbit on PR #1106.
+  security-events: read
 
 jobs:
   evaluate-and-clear:
@@ -420,6 +428,11 @@ jobs:
         if: github.event_name == 'workflow_run' && steps.pr.outputs.numbers != ''
         env:
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          # Routes ONLY the review-feedback-accounting.sh call inside
+          # approval-merge-continuation.sh through GITHUB_TOKEN instead of
+          # the ambient AUTHOR_MERGE_TOKEN above (#1101, CodeRabbit on PR
+          # #1106) — see this job's permissions block for why.
+          ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
           CLEARED_PRS: ${{ steps.clear.outputs.cleared_prs }}
           REPO: ${{ github.repository }}
@@ -793,6 +806,11 @@ jobs:
         if: steps.find.outputs.enabled != 'false' && steps.approved.outputs.prs != ''
         env:
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          # Routes ONLY the review-feedback-accounting.sh call inside
+          # approval-merge-continuation.sh through GITHUB_TOKEN instead of
+          # the ambient AUTHOR_MERGE_TOKEN above (#1101, CodeRabbit on PR
+          # #1106) — see this job's permissions block for why.
+          ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRS: ${{ steps.approved.outputs.prs }}
           REPO: ${{ github.repository }}
         run: |
