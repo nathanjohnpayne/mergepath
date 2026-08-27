@@ -3069,6 +3069,139 @@ else
   pass "bootstrap::_reconcile_excluded_residue protects only the root-level .bootstrap-state, reconciling a coincidental nested one (#1056 Codex P2 round 13)"
 fi
 
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 14: if $target is itself a symlink to a
+# populated directory, `mkdir -p` on it is a no-op, and the final
+# `rsync -a --delete ... "$target/"` follows a trailing-slash symlink
+# destination just like a real directory -- confirmed empirically against
+# this host's rsync that --delete removes a pre-existing file in the
+# referent directory. Assert _rsync_template refuses outright and the
+# referent's pre-existing content survives untouched.
+# ---------------------------------------------------------------------------
+symlinkroot_src="$(mktemp -d "$WORKDIR/rsync-symlinkroot-src.XXXXXX")"
+symlinkroot_referent="$(mktemp -d "$WORKDIR/rsync-symlinkroot-referent.XXXXXX")"
+symlinkroot_parent="$(mktemp -d "$WORKDIR/rsync-symlinkroot-parent.XXXXXX")"
+symlinkroot_dst="$symlinkroot_parent/target-symlink"
+mkdir -p "$symlinkroot_src/docs/agents"
+printf 'readme\n' > "$symlinkroot_src/README.md"
+printf 'canonical\n' > "$symlinkroot_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$symlinkroot_src/docs/agents/bootstrap-runbook.md"
+cat >"$symlinkroot_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+printf 'pre-existing content in the symlinks referent, must survive\n' \
+  > "$symlinkroot_referent/preexisting.txt"
+ln -s "$symlinkroot_referent" "$symlinkroot_dst"
+set +e
+symlinkroot_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$symlinkroot_src" "$symlinkroot_dst" 2>&1)
+symlinkroot_rc=$?
+set -e
+if [ "$symlinkroot_rc" = "0" ]; then
+  fail "rsync into a symlinked target root should have been refused but succeeded"
+elif [ ! -f "$symlinkroot_referent/preexisting.txt" ]; then
+  fail "a symlinked target root's referent lost pre-existing content -- the guard is not wired in"
+elif ! printf '%s' "$symlinkroot_out" | grep -q "symbolic link"; then
+  fail "rsync into a symlinked target root failed for an unrelated reason: $symlinkroot_out"
+else
+  pass "bootstrap::_rsync_template refuses a symlinked target root before any destructive operation (#1056 Codex P1 round 14)"
+fi
+
+# ---------------------------------------------------------------------------
+# The scenario above is ALSO caught by the pre-existing per-doc
+# bootstrap::_reject_symlink_ancestors check further down (it tests
+# [ -L "$target" ] unconditionally, on its first invocation, for ANY
+# non-empty derived-doc list -- and bootstrap::_derive_hub_only_excludes
+# never validly returns empty). That makes the new guard's own necessity
+# untestable via the ordinary path: removing it doesn't change the
+# outcome, since the downstream check still fires. Isolate the new guard
+# specifically by stubbing bootstrap::_derive_hub_only_excludes to
+# (artificially) succeed with an EMPTY list, so the per-doc loop never
+# runs at all -- proving the new guard, not the coincidental redundancy,
+# is what closes this gap.
+# ---------------------------------------------------------------------------
+symlinkroot_isolated_referent="$(mktemp -d "$WORKDIR/rsync-symlinkroot-isolated-referent.XXXXXX")"
+symlinkroot_isolated_parent="$(mktemp -d "$WORKDIR/rsync-symlinkroot-isolated-parent.XXXXXX")"
+symlinkroot_isolated_dst="$symlinkroot_isolated_parent/target-symlink"
+printf 'pre-existing content, must survive\n' > "$symlinkroot_isolated_referent/preexisting.txt"
+ln -s "$symlinkroot_isolated_referent" "$symlinkroot_isolated_dst"
+set +e
+symlinkroot_isolated_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_derive_hub_only_excludes() { printf ""; return 0; }
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$symlinkroot_src" "$symlinkroot_isolated_dst" 2>&1)
+symlinkroot_isolated_rc=$?
+set -e
+if [ "$symlinkroot_isolated_rc" = "0" ]; then
+  fail "rsync into a symlinked target root (isolated, no derived docs) should have been refused but succeeded"
+elif [ ! -f "$symlinkroot_isolated_referent/preexisting.txt" ]; then
+  fail "isolated symlinked-target-root case lost pre-existing content -- the new guard alone does not close this gap"
+elif ! printf '%s' "$symlinkroot_isolated_out" | grep -q "target root is a symbolic link"; then
+  fail "isolated symlinked-target-root case failed for the wrong reason: $symlinkroot_isolated_out"
+else
+  pass "the new symlinked-target-root guard alone (no derived docs to fall back on) refuses before any destructive operation (#1056 Codex P1 round 14)"
+fi
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 14: .git protection via prune_expr matched ANY
+# depth ("*/.git"), so a resumed target's receiver-only NESTED repo (e.g.
+# stale/.git, left by some earlier interrupted operation) was ALSO pruned
+# from every traversal as if it were the target's own repository -- git
+# then treats stale/ as a gitlink (mode 160000) on a later `git add -A`.
+# Assert the root .git survives while a nested one is reconciled away.
+# ---------------------------------------------------------------------------
+nestedgit_src="$(mktemp -d "$WORKDIR/rsync-nestedgit-src.XXXXXX")"
+nestedgit_dst="$(mktemp -d "$WORKDIR/rsync-nestedgit-dst.XXXXXX")"
+mkdir -p "$nestedgit_src/docs/agents"
+printf 'readme\n' > "$nestedgit_src/README.md"
+printf 'canonical\n' > "$nestedgit_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$nestedgit_src/docs/agents/bootstrap-runbook.md"
+cat >"$nestedgit_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+mkdir -p "$nestedgit_dst/.git" "$nestedgit_dst/stale/.git"
+printf 'must survive -- this IS the targets own repository\n' > "$nestedgit_dst/.git/HEAD"
+printf 'stale nested repo, not the targets own -- must be reconciled\n' \
+  > "$nestedgit_dst/stale/.git/HEAD"
+set +e
+nestedgit_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$nestedgit_src" "$nestedgit_dst" 2>&1)
+nestedgit_rc=$?
+set -e
+if [ "$nestedgit_rc" != "0" ]; then
+  fail "rsync with a root and a nested .git failed (rc=$nestedgit_rc): $nestedgit_out"
+elif [ ! -f "$nestedgit_dst/.git/HEAD" ]; then
+  fail "the target's own root .git was deleted -- root-anchored .git protection over-corrected"
+elif [ -e "$nestedgit_dst/stale/.git" ]; then
+  fail "a stale NESTED .git survived reconciliation -- .git protection is not scoped to the target root"
+else
+  pass "bootstrap::_reconcile_excluded_residue protects only the root .git, reconciling a stale nested repo (#1056 Codex P2 round 14)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

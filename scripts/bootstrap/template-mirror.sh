@@ -1215,38 +1215,47 @@ bootstrap::_path_matches_any() {
 # "$TARGET_DIR/.bootstrap-state"), so blanket-skipping the whole pattern
 # from reconciliation also protected a coincidentally-named NESTED file
 # that is not wizard state at all, letting it survive under a falsely
-# attributed source SHA. A protected DIRECTORY entry (trailing `/`) stays
-# fully protected via prune_expr above -- everything inside it is meant to
-# persist regardless of depth -- but a protected bare FILE pattern is now
-# reconciled normally everywhere EXCEPT the literal root-level path.
+# attributed source SHA.
+#
+# Codex P2 on #1112 round 14: the SAME class of bug applied to protected
+# DIRECTORY entries too. `.git/` (and `.claude/worktrees/`) is anywhere-
+# matching (`-path "*/.git"`), so a resumed target's receiver-only NESTED
+# repo (e.g. stale/.git, left by some earlier interrupted operation) was
+# ALSO pruned from every traversal as if it were the target's own repo --
+# git then treats `stale/` as a gitlink (mode 160000) on `git add -A`,
+# committing that residue under the source SHA. prune_expr is now
+# root-anchored ($target/<dir>, not */<dir>): the root occurrence is still
+# excluded automatically (prune claims it before the -o branch is ever
+# reached for that exact node), but a nested occurrence of the same
+# basename now falls through to ordinary reconciliation like any other
+# pattern. This also lets every protected entry -- directory or file --
+# share the SAME root_only_protect mechanism below, since a directory's
+# own reconciliation pass never needs it to fire (prune already excludes
+# the root node before -o is evaluated) but the two mechanisms agreeing is
+# what makes them safe to unify rather than special-cased.
 bootstrap::_reconcile_excluded_residue() {
   local target=$1
   shift
-  local pattern protected is_protected root_only_protect match_arg
+  local pattern protected root_only_protect match_arg
 
   local prune_expr=()
   for protected in "${BOOTSTRAP_MIRROR_RECONCILE_PROTECTED[@]}"; do
     case "$protected" in
       */)
         [ "${#prune_expr[@]}" -eq 0 ] || prune_expr+=(-o)
-        prune_expr+=(-path "*/${protected%/}")
+        prune_expr+=(-path "$target/${protected%/}")
         ;;
     esac
   done
 
   for pattern in "$@"; do
-    is_protected=false
     root_only_protect=""
     for protected in "${BOOTSTRAP_MIRROR_RECONCILE_PROTECTED[@]}"; do
       if [ "$pattern" = "$protected" ]; then
-        case "$protected" in
-          */) is_protected=true ;;
-          *) root_only_protect="$target/$protected" ;;
-        esac
+        root_only_protect="$target/${protected%/}"
         break
       fi
     done
-    [ "$is_protected" = true ] && continue
 
     case "$pattern" in
       */) match_arg="*/${pattern%/}" ;;
@@ -1318,6 +1327,20 @@ bootstrap::_rsync_template() {
   done <<< "$derived"
 
   mkdir -p "$target"
+
+  # Codex P1 on #1112 round 14: an explicit, unconditional guard, checked
+  # BEFORE any destructive operation below -- not relying on the derived
+  # hub-only-doc loop's bootstrap::_reject_symlink_ancestors call further
+  # down to catch this as a side effect of iterating a non-empty $derived
+  # list. If $target is itself a symlink to a populated directory, `mkdir
+  # -p` on it is a no-op (the path "exists" via the link), and the FINAL
+  # `rsync -a --delete ... "$target/"` below follows a trailing-slash
+  # symlink destination just like a real directory -- reproduced: a
+  # pre-existing file in the referent directory was deleted by --delete.
+  if [ -L "$target" ]; then
+    bootstrap::err "template-mirror: refusing to rsync into '$target': target root is a symbolic link and escapes the selected target tree"
+    return 1
+  fi
 
   bootstrap::_reconcile_excluded_residue "$target" "${BOOTSTRAP_MIRROR_EXCLUDES[@]}" || return $?
 
