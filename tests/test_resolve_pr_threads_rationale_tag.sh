@@ -2085,6 +2085,63 @@ else
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 36 (#1002, Codex P2 on #1110): the malformed-ledger WARN must
+# survive thread_is_actioned, not just the direct finding_dispositioned
+# call path Test 35 exercises. --resolve-actioned calls
+# finding_dispositioned directly; --auto-resolve-bots and
+# --resolve-verified-propagation route through thread_is_actioned, whose
+# `finding_dispositioned "$tj" >/dev/null 2>&1` discarded stderr along
+# with the stdout evidence description it has no use for — silently
+# downgrading the diagnostic to invisible on exactly those two paths.
+# Exercises --auto-resolve-bots, modeled on Test 32's invocation, with a
+# malformed ledger for the thread's finding id. The blunt --auto-
+# resolve-bots contract is unchanged (still resolves; Test 32 already
+# locks that), so this only needs to add the WARN assertion.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 36: the malformed-ledger WARN survives thread_is_actioned (--auto-resolve-bots), not only finding_dispositioned direct callers (#1002)"
+
+THREADS_T36='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_36","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"path":"wireframes/app.md","body":"P1: the retry loop has no backoff","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99301,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+
+T36_LEDGER="$SCRATCH/t36-codex-ledger.jsonl"
+{
+  jq -nc '{pr_number:778,repo:"test/repo",comment_id:99999,priority:"P1",verdict:"+1",
+           reaction:"+1",location:"pull_request_review_comment",action:"posted",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+  echo 'not a json line at all'
+} > "$T36_LEDGER"
+
+GH_ARGV_LOG="$SCRATCH/t36.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T36" "$FILES_T990" "$COMMITS_T990" "$CFILES_T990"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  CODEX_FEEDBACK_LEDGER="$T36_LEDGER" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo --auto-resolve-bots 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -qF "WARN: ledger $T36_LEDGER could not be parsed" <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: --auto-resolve-bots still resolves AND surfaces the malformed-ledger WARN"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: thread_is_actioned still swallows the malformed-ledger WARN (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"

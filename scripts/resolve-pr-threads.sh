@@ -2724,10 +2724,18 @@ finding_dispositioned() {
 # thread_is_actioned <class> <thread_json> — THE actioned predicate (#990).
 # Exit 0 only when the class proves action AND the evidence is bound to this
 # finding. Replaces bare class_is_actioned at every decision site.
+#
+# Only stdout (the evidence description this caller has no use for) is
+# discarded. Stderr is left connected to the caller's, because
+# finding_dispositioned's ledger read can print an unparseable-ledger WARN
+# (#1002) that every caller needs to see — swallowing it here silently
+# downgraded that diagnostic to invisible on the --auto-resolve-bots and
+# --resolve-verified-propagation paths, the only two callers that route
+# through this wrapper instead of calling finding_dispositioned directly.
 thread_is_actioned() {
   local class="$1" tj="$2"
   class_is_actioned "$class" || return 1
-  finding_dispositioned "$tj" >/dev/null 2>&1
+  finding_dispositioned "$tj" >/dev/null
 }
 
 # synth_rationale <class> <thread_json> → one-line free-form rationale
