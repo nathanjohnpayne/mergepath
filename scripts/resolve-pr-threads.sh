@@ -635,11 +635,18 @@ trap 'rm -rf "$COMMIT_FILES_CACHE_DIR"' EXIT
 #      A distinct code lets a caller tell "checked, nothing to do" from
 #      "never managed to check" -- the distinction whose absence is the bug.
 HEAD_READ_ERR=$(mktemp "${TMPDIR:-/tmp}/resolve-pr-headread.XXXXXX")
-if HEAD_OID=$(gh_pat_read api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha 2>"$HEAD_READ_ERR"); then
-  rm -f "$HEAD_READ_ERR"
+HEAD_READ_OUT=$(mktemp "${TMPDIR:-/tmp}/resolve-pr-headout.XXXXXX")
+# BOTH streams are captured because `gh api` writes its HTTP error body to
+# STDOUT, not stderr (#799). Reading only stderr would discard the very text
+# that distinguishes a 403 rate limit from a 404 -- the discard this change
+# exists to stop, reintroduced one path over.
+if gh_pat_read api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha \
+     >"$HEAD_READ_OUT" 2>"$HEAD_READ_ERR"; then
+  HEAD_OID=$(cat "$HEAD_READ_OUT" 2>/dev/null || true)
+  rm -f "$HEAD_READ_ERR" "$HEAD_READ_OUT"
 else
-  HEAD_READ_MSG=$(cat "$HEAD_READ_ERR" 2>/dev/null || true)
-  rm -f "$HEAD_READ_ERR"
+  HEAD_READ_MSG=$(cat "$HEAD_READ_ERR" "$HEAD_READ_OUT" 2>/dev/null || true)
+  rm -f "$HEAD_READ_ERR" "$HEAD_READ_OUT"
   case "$HEAD_READ_MSG" in
     *"rate limit exceeded"*|*"secondary rate limit"*|*"abuse detection"*)
       # Name the exhausted account and when it recovers. `/rate_limit` is NOT
