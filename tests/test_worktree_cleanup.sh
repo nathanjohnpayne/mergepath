@@ -3223,6 +3223,106 @@ else
   echo "$OUT_TMPFAIL" >&2
 fi
 
+# ── Case 44d (#1105, Codex P2): a failed snapshot WRITE still reports ────
+# `mktemp` succeeding says the remote-heads file was CREATED, not that it can
+# be written — TMPDIR can fill, or a quota can be exhausted, in between. The
+# extraction pipeline was unchecked, so under `set -eo pipefail` that failure
+# killed the run with exit 1 BEFORE the summary printed: no records, no NOT
+# MEASURED line, no exit 3. That is this PR's own silent-failure shape
+# reappearing one line further down, which is why it ships here.
+#
+# The failure is injected with an `awk` shim matched to the snapshot
+# extraction only, so the rest of the script (and the harness) keeps the real
+# awk. The remote is REACHABLE, so this is unambiguously the write path.
+AWKFAIL_ROOT="$WORKDIR/snapshot-write-failure"
+AWKFAIL_REMOTE="$AWKFAIL_ROOT/remote.git"
+AWKFAIL_MAIN="$AWKFAIL_ROOT/main"
+AWKFAIL_BIN="$AWKFAIL_ROOT/bin"
+AWKFAIL_LOG="$AWKFAIL_ROOT/awk-hits.log"
+mkdir -p "$AWKFAIL_ROOT" "$AWKFAIL_BIN"
+git init -q --bare "$AWKFAIL_REMOTE"
+git init -q -b main "$AWKFAIL_MAIN"
+(
+  cd "$AWKFAIL_MAIN"
+  git -C "$AWKFAIL_MAIN" config user.email "test@example.com"
+  git -C "$AWKFAIL_MAIN" config user.name "Test"
+  git -C "$AWKFAIL_MAIN" config commit.gpgsign false
+  git -C "$AWKFAIL_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$AWKFAIL_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+AWKFAIL_MAIN=$(cd "$AWKFAIL_MAIN" && pwd -P)
+AWKFAIL_REAL_AWK=$(command -v awk)
+if [ -z "$AWKFAIL_REAL_AWK" ]; then
+  fail "fixture setup: no awk on PATH — case 44d cannot build its shim"
+fi
+cat > "$AWKFAIL_BIN/awk" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *'NF > 1'*) printf 'hit\n' >> "$AWKFAIL_LOG"; exit 3 ;;
+  esac
+done
+exec "$AWKFAIL_REAL_AWK" "\$@"
+SHIM
+chmod +x "$AWKFAIL_BIN/awk"
+
+# Premise: the remote is reachable, so the snapshot READ succeeds and the run
+# genuinely reaches the write.
+if ! git -C "$AWKFAIL_MAIN" ls-remote --heads origin >/dev/null 2>&1; then
+  fail "fixture setup: the remote is unreachable — case 44d would exercise the read path, not the write"
+fi
+# Premise: a branch tracks origin, so the probe is eligible.
+if [ "$(git -C "$AWKFAIL_MAIN" for-each-ref --format='%(upstream)' refs/heads/main)" \
+     != "refs/remotes/origin/main" ]; then
+  fail "fixture setup: main does not track origin/main — the snapshot would never be taken"
+fi
+
+set +e
+OUT_AWKFAIL=$( cd "$AWKFAIL_MAIN" && PATH="$AWKFAIL_BIN:$STUB_DIR:$PATH" \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_AWKFAIL=$?
+set -e
+
+# Premise: the shim fired. An unhit shim would make everything below vacuous.
+if [ ! -s "$AWKFAIL_LOG" ]; then
+  fail "fixture setup: the snapshot extraction was never reached, so case 44d asserts nothing"
+  echo "$OUT_AWKFAIL" >&2
+fi
+# The headline claim: the run COMPLETES and reports, rather than dying at the
+# pipeline.
+#
+# The exit code alone CANNOT carry that claim, and measuring it proved so: an
+# unchecked pipeline returns 3 from awk, `set -e` propagates it, and the run
+# dies with exit 3 as well. Identical status, opposite behaviour. So this
+# assertion is conjunctive — exit 3 AND the summary present — because
+# reaching the summary is the only thing that distinguishes "reported an
+# incomplete audit" from "was killed mid-audit and happened to exit 3".
+if [ "$RC_AWKFAIL" -eq 3 ] && echo "$OUT_AWKFAIL" | grep -qE "orphan dirs: +[0-9]"; then
+  pass "#1105 a failed snapshot write reports an incomplete audit instead of dying"
+else
+  fail "#1105 a failed snapshot write exited $RC_AWKFAIL without completing the audit"
+  echo "$OUT_AWKFAIL" >&2
+fi
+# The summary must actually have been emitted — the pre-fix failure killed the
+# run BEFORE this point, so its presence is the proof the run survived.
+if echo "$OUT_AWKFAIL" | grep -qE "orphan dirs: +[0-9]"; then
+  pass "#1105 the summary is still emitted after a failed snapshot write"
+else
+  fail "#1105 the run died before printing its summary"
+  echo "$OUT_AWKFAIL" >&2
+fi
+if echo "$OUT_AWKFAIL" | grep -Fq -- "NOT MEASURED" \
+   && echo "$OUT_AWKFAIL" | grep -Fq -- "LOCAL failure"; then
+  pass "#1105 a failed snapshot write is attributed to local storage, not the remote"
+else
+  fail "#1105 a failed snapshot write was not reported as an unmeasured local failure"
+  echo "$OUT_AWKFAIL" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

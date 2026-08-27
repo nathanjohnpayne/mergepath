@@ -753,7 +753,23 @@ stale_unpruned_branches() {
     return 0
   }
   # `<sha>\t<refname>` per line; keep the refname column only.
-  printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$HEADS_FILE"
+  # Checked, not bare (Codex P2 on #1105). mktemp succeeding says the file
+  # was CREATED, not that it can be written: TMPDIR can fill, or a quota can
+  # be exhausted, between the two. Left unchecked this pipeline trips
+  # `set -eo pipefail` and kills the run with exit 1 BEFORE the summary is
+  # printed — no records, no NOT MEASURED line, no exit 3, which is precisely
+  # the silent-failure shape this PR exists to remove, reappearing one line
+  # further down.
+  if ! printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$HEADS_FILE"; then
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="local"
+    STALE_SNAPSHOT_REASON="could not write the remote-heads snapshot (temporary storage unavailable)"
+    rm -f "$HEADS_FILE"
+    HEADS_FILE=""
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
+    return 0
+  fi
   # The eligible list was already resolved above; each record carries the
   # branch and the remote head that populates its tracking ref, so this pass
   # is a pure membership test against the snapshot.
@@ -1566,6 +1582,14 @@ printf "  merged+extra (review): %d\n" "${#SUMMARY_DIVERGED_KEPT[@]}"
 # Branches whose merged-PR lookup FAILED — not evaluated (gh missing /
 # unauthenticated / API error). Distinct from "gone kept (unmerged)".
 printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
+if [ "${#SUMMARY_LOOKUP_UNKNOWN[@]}" -gt 0 ]; then
+  printf "    ^ NOT MEASURED: the merged-PR lookup failed for these branches\n"
+  printf "      (gh missing, unauthenticated, or an API error). They are not\n"
+  printf "      known to be unmerged — they were not evaluated. Restore gh and\n"
+  printf "      re-run before treating them as examined. This class does not\n"
+  printf "      change the exit status: it is reported rather than silent, and\n"
+  printf "      a gh-less machine would otherwise never exit anything else.\n"
+fi
 # Branches whose remote-tracking ref is stale rather than genuinely gone —
 # a `git branch -vv` false-negative this run would otherwise retain silently
 # (#822). Dry-run only, so this counter is always 0 under --apply — but the
@@ -1687,6 +1711,27 @@ fi
 # findings themselves are equally real either way.
 #
 # Only `unknown` reaches here, never `declined`: see stale_unpruned_branches().
+#
+# SUMMARY_LOOKUP_UNKNOWN deliberately does NOT reach exit 3 either, and the
+# reason is the distinction this whole change turns on (Codex P2 on #1105
+# raised the apparent inconsistency; this is the answer).
+#
+# #992 is about SILENCE, not about incompleteness as such. The snapshot
+# failure was silent: the counter read `0`, which is byte-identical to a
+# genuinely clean tree, so the report asserted something it had not measured.
+# A failed merged-PR lookup is the opposite — it has its own counter, its own
+# per-branch records, and now its own NOT MEASURED annotation. It announces
+# itself. Nothing about it is mistakable for a clean result.
+#
+# Folding it in would also silently reverse the deliberate carve-out argued
+# one block up: on a gh-less or unauthenticated machine EVERY gone branch is
+# unknown, and that machine would then never see anything but exit 3 — the
+# same unusability the carve-out exists to prevent, re-entered through a
+# different code. Reversing a recorded decision as a side effect of a PR
+# about a different read is not something to do quietly.
+#
+# Whether an announced-but-unevaluated branch DESERVES its own status is a
+# real question, and it is tracked separately rather than settled here.
 if [ "$STALE_SNAPSHOT_STATE" = "unknown" ]; then
   exit 3
 fi
