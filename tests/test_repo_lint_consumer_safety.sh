@@ -127,6 +127,7 @@ CONSUMER_ABSENT=(
   "plans/mergepath-playground.md"
   "tests/test_mergepath_playground.sh"
   "specs/bootstrap_consumer_identity.md"
+  "specs/bootstrap_source_attribution.md"
   "bugs/screenshots"
   ".github/screenshots"
   # #774 fleet branch-protection audit — the two paths NO consumer has.
