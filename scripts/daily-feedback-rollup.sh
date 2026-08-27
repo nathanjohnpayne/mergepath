@@ -325,7 +325,14 @@ while [ "$i" -lt "$pr_count" ]; do
     # finding.)
     original_author=$(printf '%s' "$t" | jq -r '.comments.nodes[0].author.login // "unknown"')
     case "$original_author" in
-      coderabbitai\[bot\]|chatgpt-codex-connector\[bot\]) : ;;
+      # github-advanced-security[bot] added for #1101: resolve-pr-threads.sh's
+      # BOT_LOGINS_RE now recognizes GHAS code-scanning threads for
+      # --auto-resolve-bots / --resolve-actioned, so a GHAS thread resolved
+      # deferred-to-followup needs to surface here too — otherwise the
+      # rollup this mechanism exists to populate silently excludes exactly
+      # the deferred security findings it's supposed to keep from being
+      # forgotten.
+      coderabbitai\[bot\]|chatgpt-codex-connector\[bot\]|github-advanced-security\[bot\]) : ;;
       *) continue ;;
     esac
 
