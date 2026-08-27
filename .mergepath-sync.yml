@@ -701,8 +701,19 @@ paths:
     consumers: all
     # Sources scripts/lib/gh-token-resolver.sh at startup; without it the
     # wrapper aborts under `set -euo pipefail`. Closure-tracked (#264).
+    #
+    # It also owns the RUNTIME half of the PR-body contract: gh-pr-guard.sh
+    # exits 0 for an author-wrapped `gh pr create`/`gh pr new` on the promise
+    # that this wrapper parses and validates the effective body first. That
+    # delegation spans two files and is invisible to a source-reference scan,
+    # which is exactly how it shipped broken once: the guard was propagated
+    # with the escape while this wrapper still had no validator, leaving the
+    # `--body-file` path with no Authoring-Agent or Self-Review check at all.
+    # Declaring the contract libs here keeps the two halves inseparable.
     requires:
       - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
   - path: scripts/gh-as-reviewer.sh
     type: canonical
     consumers: all

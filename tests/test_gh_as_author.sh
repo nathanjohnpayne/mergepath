@@ -72,7 +72,7 @@ if [ "${1:-}" = "api" ] && [ "${2:-}" = "user" ]; then
   exit 0
 fi
 
-if [ "${1:-}" = "pr" ] && [ "${2:-}" = "create" ]; then
+if [ "${1:-}" = "pr" ] && { [ "${2:-}" = "create" ] || [ "${2:-}" = "new" ]; }; then
   echo "${GH_CREATE_PR_URL:-https://github.com/example/repo/pull/42}"
   exit "${GH_CREATE_PR_RC:-0}"
 fi
@@ -113,7 +113,7 @@ fi
 
 reset_log
 OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/77" GH_VIEW_AUTHOR="nathanjohnpayne" \
-  run_wrapper -- gh pr create --title "t" --body "b" >/dev/null 2>&1
+  run_wrapper -- gh pr create --title "t" --body $'Authoring-Agent: codex\n\n## Self-Review\n\n- Correctness: verified.' >/dev/null 2>&1
 rc=$?
 if [ "$rc" -ne 0 ]; then
   fail "pr create verification: rc=$rc"
@@ -126,8 +126,177 @@ fi
 
 reset_log
 set +e
+stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+  run_wrapper -- gh pr create --title "t" --body "## Self-Review" 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "pr create contract: rc=$rc expected 1"
+elif ! echo "$stderr_capture" | grep -q "Authoring-Agent"; then
+  fail "pr create contract: missing actionable Authoring-Agent diagnostic"
+elif grep -q $'gh\tpr\tcreate' "$WORKDIR/calls.log"; then
+  fail "pr create contract: create ran despite invalid body"
+else
+  pass "pr create contract: invalid inline body blocked before write"
+fi
+
+reset_log
+set +e
+stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+  run_wrapper -- gh pr new --title "t" --body "INVALID" 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "pr new alias contract: rc=$rc expected 1"
+elif grep -q $'gh\tpr\tnew' "$WORKDIR/calls.log"; then
+  fail "pr new alias contract: create alias ran despite invalid body"
+else
+  pass "pr new alias contract: invalid body blocked before write"
+fi
+
+reset_log
+set +e
+stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+  run_wrapper -- gh pr create --title "t" \
+    --body $'Authoring-Agent: codex\n\n## Self-Review\n\n- Correctness: verified.' \
+    -bINVALID 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "pr create contract: attached -b form rc=$rc expected 1"
+elif grep -q $'gh\tpr\tcreate' "$WORKDIR/calls.log"; then
+  fail "pr create contract: attached invalid -b body bypassed validation"
+else
+  pass "pr create contract: attached -b body is validated as the effective body"
+fi
+
+reset_log
+set +e
+stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+  run_wrapper -- gh pr create --title "t" -dbINVALID \
+    --body $'Authoring-Agent: codex\n\n## Self-Review\n\n- Correctness: verified.' 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "pr create contract: clustered body flag rc=$rc expected 1"
+elif ! echo "$stderr_capture" | grep -q "ambiguous clustered short option"; then
+  fail "pr create contract: clustered body flag missing actionable diagnostic"
+elif grep -q $'gh\tpr\tcreate' "$WORKDIR/calls.log"; then
+  fail "pr create contract: clustered body flag reached the write"
+else
+  pass "pr create contract: clustered short body flags are rejected before write"
+fi
+
+reset_log
+VALID_INLINE_BODY=$'Authoring-Agent: codex\n\n## Self-Review\n\n- Correctness: verified.'
+OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/76" GH_VIEW_AUTHOR="nathanjohnpayne" \
+  run_wrapper -- gh pr create --title "t" "-b=$VALID_INLINE_BODY" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "pr create contract: equals-separated -b body should pass; rc=$rc"
+else
+  pass "pr create contract: equals-separated -b strips its optional equals sign"
+fi
+
+reset_log
+INVALID_BODY_FILE="$WORKDIR/invalid-pr-body.md"
+printf '%s\n' 'INVALID' >"$INVALID_BODY_FILE"
+set +e
+stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+  run_wrapper -- gh pr create --title "t" \
+    --body $'Authoring-Agent: codex\n\n## Self-Review\n\n- Correctness: verified.' \
+    "-F$INVALID_BODY_FILE" 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "pr create contract: attached -F form rc=$rc expected 1"
+elif grep -q $'gh\tpr\tcreate' "$WORKDIR/calls.log"; then
+  fail "pr create contract: attached invalid -F body file bypassed validation"
+else
+  pass "pr create contract: attached -F body file is validated as the effective body"
+fi
+
+reset_log
+VALID_EQUALS_BODY_FILE="$WORKDIR/valid-equals-pr-body.md"
+printf '%s\n' 'Authoring-Agent: codex' '' '## Self-Review' '' '- Correctness: verified.' >"$VALID_EQUALS_BODY_FILE"
+OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/77" GH_VIEW_AUTHOR="nathanjohnpayne" \
+  run_wrapper -- gh pr create --title "t" "-F=$VALID_EQUALS_BODY_FILE" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "pr create contract: equals-separated -F body file should pass; rc=$rc"
+else
+  pass "pr create contract: equals-separated -F strips its optional equals sign"
+fi
+
+reset_log
+set +e
+stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+  run_wrapper -- gh pr create --body INVALID --title \
+    $'-bAuthoring-Agent: codex\n\n## Self-Review\n\n- Correctness: verified.' 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "pr create contract: title value beginning -b rc=$rc expected 1"
+elif grep -q $'gh\tpr\tcreate' "$WORKDIR/calls.log"; then
+  fail "pr create contract: title value beginning -b bypassed invalid body validation"
+else
+  pass "pr create contract: values consumed by non-body flags cannot masquerade as body flags"
+fi
+
+reset_log
+BODY_FILE="$WORKDIR/pr-body.md"
+printf '%s\n' 'Authoring-Agent: codex' '' '## Self-Review' '' '- Correctness: verified.' >"$BODY_FILE"
+OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/78" GH_VIEW_AUTHOR="nathanjohnpayne" \
+  run_wrapper -- gh pr create --title "t" --body-file "$BODY_FILE" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "pr create contract: valid body file should pass; rc=$rc"
+elif grep -q -- "--body-file\|$BODY_FILE" "$WORKDIR/calls.log"; then
+  fail "pr create contract: body file path was read again by the wrapped command"
+  cat "$WORKDIR/calls.log" >&2
+elif ! grep -q $'gh\tpr\tcreate\t--title\tt\t--body\tAuthoring-Agent: codex' "$WORKDIR/calls.log"; then
+  fail "pr create contract: captured body file snapshot was not passed inline"
+  cat "$WORKDIR/calls.log" >&2
+else
+  pass "pr create contract: body file is validated once and passed as the captured snapshot"
+fi
+
+reset_log
+VALID_STDIN_BODY=$'Authoring-Agent: codex\n\n## Self-Review\n\n- Correctness: verified.'
+printf '%s' "$VALID_STDIN_BODY" | \
+  OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/79" GH_VIEW_AUTHOR="nathanjohnpayne" \
+  run_wrapper -- gh pr create --title "t" -F /dev/stdin >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "pr create contract: /dev/stdin body snapshot should pass; rc=$rc"
+elif grep -q -- "/dev/stdin\|\t-F\t" "$WORKDIR/calls.log"; then
+  fail "pr create contract: /dev/stdin was passed to the wrapped command for a second read"
+  cat "$WORKDIR/calls.log" >&2
+elif ! grep -q $'gh\tpr\tcreate\t--title\tt\t--body\tAuthoring-Agent: codex' "$WORKDIR/calls.log"; then
+  fail "pr create contract: captured stdin snapshot was not passed inline"
+  cat "$WORKDIR/calls.log" >&2
+else
+  pass "pr create contract: stdin is validated once and passed as the captured snapshot"
+fi
+
+reset_log
+set +e
+stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+  run_wrapper -- gh --repo example/repo pr create --title "t" --body "## Self-Review" 2>&1 >/dev/null)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "pr create contract: global --repo form rc=$rc expected 1"
+elif grep -q $'gh\t--repo\texample/repo\tpr\tcreate' "$WORKDIR/calls.log"; then
+  fail "pr create contract: global --repo create ran despite invalid body"
+else
+  pass "pr create contract: global --repo form cannot bypass validation"
+fi
+
+reset_log
+set +e
 stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/88" GH_VIEW_AUTHOR="nathanpayne-claude" \
-  run_wrapper -- gh pr create --title "t" --body "b" 2>&1 >/dev/null)
+  run_wrapper -- gh pr create --title "t" --body $'Authoring-Agent: codex\n\n## Self-Review\n\n- Correctness: verified.' 2>&1 >/dev/null)
 rc=$?
 set -e
 if [ "$rc" -ne 5 ]; then
@@ -187,6 +356,7 @@ install_wrapper_copy() {
   mkdir -p "$dir/scripts/lib" "$dir/.github"
   cp "$ROOT/scripts/gh-as-author.sh" "$dir/scripts/gh-as-author.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
+  cp "$ROOT/scripts/lib/pr-body-contract.sh" "$dir/scripts/lib/pr-body-contract.sh"
   cp "$ROOT/scripts/identity-check.sh" "$dir/scripts/identity-check.sh"
   chmod +x "$dir/scripts/gh-as-author.sh" "$dir/scripts/identity-check.sh"
 }
