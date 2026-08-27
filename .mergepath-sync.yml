@@ -164,16 +164,6 @@ consumers:
       # misses them; jsx_in_js: true adds a second React rule entry
       # that covers `.js` too. See mergepath#322.
       jsx_in_js: true
-  - name: device-platform-reporting
-    repo: nathanjohnpayne/device-platform-reporting
-    visibility: public
-    facts:
-      frameworks: [react]
-      # dpr uses Jest (not vitest); same template gap as ffb above.
-      testing: jest
-      # dpr is JS-only and uses babel-loader to transpile JSX inside
-      # `.js` files. Same opt-in as ffb. See mergepath#322.
-      jsx_in_js: true
   # swipewatch has minimal Node + vitest code, no frameworks. The
   # empty `frameworks: []` list opts it into the JS baseline only.
   - name: swipewatch
@@ -1640,7 +1630,6 @@ paths:
   #   device-source-of-truth (ESM)     → JS + TS + React + react-hooks
   #   gaycruisebingo (ESM)             → JS + TS + React + react-hooks
   #   friends-and-family-billing (CJS) → JS + React + react-hooks
-  #   device-platform-reporting (CJS)  → JS + React + react-hooks
   #   overridebroadway (CJS)           → JS + TS + React + react-hooks
   #   swipewatch (CJS)                 → JS baseline only
 
@@ -1665,7 +1654,6 @@ paths:
     type: templated
     consumers:
       - friends-and-family-billing
-      - device-platform-reporting
       - overridebroadway
       - swipewatch
 
