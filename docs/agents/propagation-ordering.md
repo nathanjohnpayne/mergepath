@@ -55,7 +55,7 @@ Only fan out (`--sync-all`) once the canary's `lint` is green **and the wave aud
 
 ## Wave audit (one scoped review per wave, #662)
 
-A verified mirror carries nothing unreviewed: every line already passed review on its upstream mergepath PR, and the propagation lane byte-verifies the mirror. So the wave's external review runs **once**, against the canary PR, scoped to the canonical range that has not been audited before — instead of CodeRabbit + Codex re-reading the same bytes on all 9 consumers:
+A verified mirror carries nothing unreviewed: every line already passed review on its upstream mergepath PR, and the propagation lane byte-verifies the mirror. So the wave's external review runs **once**, against the canary PR, scoped to the canonical range that has not been audited before — instead of CodeRabbit + Codex re-reading the same bytes on all 8 consumers:
 
 ```bash
 # After the canary PR is open and lane-verified:
