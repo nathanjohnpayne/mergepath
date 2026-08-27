@@ -3329,10 +3329,26 @@ fi
 # earlier — and it is the pipeline THIS PR added, so shipping 44d without
 # 44e would have fixed the instance and left the class.
 #
-# The failure is injected by shimming `mktemp` to hand back /dev/full for the
-# eligible-list allocation only: creation succeeds, every write fails. That
-# is Codex's own reproduction, and it is more faithful than failing mktemp
-# because it exercises the create-then-write gap rather than the create.
+# The failure is injected by shimming `mktemp` to hand back a FIXTURE-OWNED
+# path whose PARENT DIRECTORY DOES NOT EXIST, for the eligible-list
+# allocation only. Allocation "succeeds" (the shim returns a name), and every
+# write to it fails with ENOENT — so it exercises the create-then-write gap
+# rather than the create, which is the property under test.
+#
+# Deliberately NOT /dev/full, which was this case's first draft (Codex P1).
+# The production failure handler runs `rm -f "$ELIGIBLE_FILE"`, so handing it
+# a real device path means the suite DELETES /dev/full when run as root — as
+# it commonly is in a dev container — after which the node is gone and later
+# runs silently stop exercising the condition at all. A test must not damage
+# the host it runs on, and must not disarm itself by doing so.
+#
+# A missing parent is strictly better than an unwritable file for this job:
+#   - the open fails with ENOENT even as ROOT, which permission bits do not
+#     (root bypasses mode 000), so the case cannot pass vacuously for the
+#     privileged runner it was hardest to reason about;
+#   - `rm -f` on a path with a missing parent returns 0 and touches nothing,
+#     so the production cleanup is exercised for real without collateral;
+#   - nothing outside the fixture directory is referenced at all.
 FULLWRITE_ROOT="$WORKDIR/eligible-write-failure"
 FULLWRITE_REMOTE="$FULLWRITE_ROOT/remote.git"
 FULLWRITE_MAIN="$FULLWRITE_ROOT/main"
@@ -3355,23 +3371,33 @@ git init -q -b main "$FULLWRITE_MAIN"
 ) >/dev/null 2>&1
 FULLWRITE_MAIN=$(cd "$FULLWRITE_MAIN" && pwd -P)
 FULLWRITE_REAL_MKTEMP=$(command -v mktemp)
+# Parent deliberately never created.
+FULLWRITE_TARGET="$FULLWRITE_ROOT/absent-parent/eligible.txt"
 cat > "$FULLWRITE_BIN/mktemp" <<SHIM
 #!/usr/bin/env bash
 for a in "\$@"; do
   case "\$a" in
-    *wcleanup-eligible*) printf 'hit\n' >> "$FULLWRITE_LOG"; printf '/dev/full\n'; exit 0 ;;
+    *wcleanup-eligible*) printf 'hit\n' >> "$FULLWRITE_LOG"; printf '%s\n' "$FULLWRITE_TARGET"; exit 0 ;;
   esac
 done
 exec "$FULLWRITE_REAL_MKTEMP" "\$@"
 SHIM
 chmod +x "$FULLWRITE_BIN/mktemp"
 
-# Premise: the injected target really is unwritable on this host. It models a
-# write that cannot land, whatever the errno — ENOSPC on Linux where
-# /dev/full is the full-disk device, EPERM on macOS where it does not exist
-# at all. Either way the open fails, which is the condition under test.
-if printf 'x\n' > /dev/full 2>/dev/null; then
-  fail "fixture setup: writes to /dev/full succeed on this host — case 44e cannot model an unwritable target"
+# Premise: the injected target really cannot be written, and its parent
+# really is absent. Both halves matter — a fixture that accidentally created
+# the parent would test an ordinary successful write and pass for the wrong
+# reason.
+if [ -e "$FULLWRITE_ROOT/absent-parent" ]; then
+  fail "fixture setup: the parent directory exists — case 44e would exercise a successful write"
+fi
+if printf 'x\n' > "$FULLWRITE_TARGET" 2>/dev/null; then
+  fail "fixture setup: the injected target is writable — case 44e cannot model a failed write"
+fi
+# And the production cleanup path must be harmless against it, which is the
+# property the /dev/full draft violated.
+if ! rm -f "$FULLWRITE_TARGET" 2>/dev/null; then
+  fail "fixture setup: rm -f on the injected target fails — the production cleanup would trip set -e"
 fi
 # Premise: a branch tracks origin, so the eligible-list write is reached.
 if [ "$(git -C "$FULLWRITE_MAIN" for-each-ref --format='%(upstream)' refs/heads/main)" \
