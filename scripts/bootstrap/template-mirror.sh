@@ -1269,7 +1269,13 @@ bootstrap::_resolve_canonical_source_sha() {
   git -C "$source_root" for-each-ref --count=1 --format='%(refname)' --contains HEAD refs/remotes/origin \
     | grep -q . || return 1
 
-  [ -z "$(git -C "$source_root" status --porcelain 2>/dev/null)" ] || return 1
+  # Codex P2 round 5: capture the command's own exit status, not just its
+  # output — the bare form below let a FAILED `git status` (permissions,
+  # corruption) read as "empty output, therefore clean" and attribute a sha
+  # anyway. A failed read must fall back same as everything else here.
+  local status_output
+  status_output=$(git -C "$source_root" status --porcelain 2>/dev/null) || return 1
+  [ -z "$status_output" ] || return 1
 
   git -C "$source_root" rev-parse HEAD 2>/dev/null
 }
