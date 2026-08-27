@@ -465,6 +465,12 @@ paths:
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
+    # Hard-sources the shared Authoring-Agent parser (#1121): this script
+    # decides gate (b), so a divergent local regex here is what makes the
+    # same-agent Codex-reaction fallback wrongly eligible.
+    requires:
+      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
     # Sources scripts/lib/gh-retry-helpers.sh on startup to wrap the
     # statusCheckRollup read in 3×30s retry on transient gh failures
     # (#324). Without the helper present in the consumer, the
@@ -502,6 +508,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/phase-4b/"
       - "scripts/gh-as-reviewer.sh"
       - "scripts/post-phase-4b-handoff.sh"
@@ -756,6 +764,15 @@ paths:
   - path: scripts/lib/pr-body-contract.mjs
     type: canonical
     consumers: all
+  # Parity suite: asserts every identity consumer reads through the shared
+  # parser and that none reintroduces a first-raw-line matcher. The property is
+  # AGREEMENT between consumers, which no single consumer's own suite can test.
+  - path: tests/test_pr_body_contract_parity.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
   - path: scripts/hooks/label-removal-guard.sh
     type: canonical
     consumers: all
@@ -1280,6 +1297,14 @@ paths:
   - path: .github/workflows/agent-review.yml
     type: canonical
     consumers: all
+    # The assign job runs scripts/lib/pr-body-contract.mjs from a checkout to
+    # resolve Authoring-Agent, instead of a local regex, so reviewer assignment
+    # cannot disagree with the guard or the merge gate about who authored a PR
+    # (#1121). Propagating this workflow without the parser leaves the node
+    # call failing, which falls through to the default reviewer.
+    requires:
+      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
     # The detect-disagreement job runs `require('scripts/disagreement-
     # detector.cjs')`. Without the module file, the job aborts on
     # MODULE_NOT_FOUND. Same lockstep coupling as #259 — propagate the

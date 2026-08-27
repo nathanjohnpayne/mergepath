@@ -185,6 +185,20 @@ fi
 # shellcheck source=lib/gh-api-array.sh
 . "$__CODEX_CHECK_DIR/lib/gh-api-array.sh"
 
+# Shared PR-body identity parser (#1121). Every consumer that reads
+# `Authoring-Agent:` MUST go through this, because the answer decides which
+# reviewer identity may clear gate (b) and whether the same-agent Codex-reaction
+# fallback is even eligible. A local regex here and a stricter parser in the
+# guard can disagree on the same body -- a marker inside an HTML comment is not
+# a declaration, and only a markdown-aware parser can tell. Hard-required for
+# the same reason as the two helpers above: this is a fail-closed gate input.
+if [ ! -r "$__CODEX_CHECK_DIR/lib/pr-body-contract.sh" ]; then
+  echo "ERROR: pr-body-contract helper missing: $__CODEX_CHECK_DIR/lib/pr-body-contract.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/pr-body-contract.sh
+. "$__CODEX_CHECK_DIR/lib/pr-body-contract.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --diagnostic-signal-only (#814) and --approval-readiness-only (#1062) are
@@ -605,12 +619,17 @@ fi
 #   (extract from canonical). Works for every case-permutation of
 #   the header without per-letter character classing.
 #   (nathanpayne-codex Phase 4b r4 on PR #283.)
+#   SUPERSEDED by the shared parser (#1121). The pipeline described above was
+#   correct about case but still read the first RAW line, so a marker inside an
+#   HTML comment counted as a declaration here while the guard ignored it. The
+#   two then disagreed on the same body, and this side decides gate (b). The
+#   shared parser is markdown-aware and returns only a visible marker; it also
+#   returns empty when the body carries anything other than exactly one, which
+#   leaves SAME_AGENT_REVIEWER empty and keeps the same-agent exclusion armed.
 AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
-if grep -qiE '^Authoring-Agent:' <<<"$PR_BODY"; then
-  AUTHORING_AGENT=$(grep -i -m1 -E '^Authoring-Agent:' <<<"$PR_BODY" \
-    | tr '[:upper:]' '[:lower:]' \
-    | sed -E 's/^authoring-agent:[[:space:]]*([a-z0-9_-]+).*/\1/')
+if [ "$(pr_body_authoring_agent_count "$PR_BODY")" -eq 1 ]; then
+  AUTHORING_AGENT="$(pr_body_authoring_agent "$PR_BODY")"
   if [ -n "$AUTHORING_AGENT" ]; then
     # Match against available_reviewers via suffix (e.g., "claude"
     # matches "nathanpayne-claude"). Empty if no match — also
