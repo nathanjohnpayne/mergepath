@@ -1121,6 +1121,17 @@ bootstrap::_reject_symlink_ancestors() {
 # bootstrap::_resolve_canonical_source_sha (#1112 round 10) so a rename
 # record's two sides can each be checked against the same pattern set
 # without duplicating the match logic.
+#
+# Codex P2 on #1112 round 13: the exact-path branch required full string
+# equality, but rsync's own --exclude for a slash-containing, non-trailing-
+# slash pattern is NOT anchored to the transfer root either (round 11
+# confirmed this for bootstrap::_reconcile_excluded_residue) -- a NESTED
+# occurrence (e.g. nested/scripts/sync-to-downstream.sh) is excluded from
+# the mirror by rsync just as the top-level one is, but this matcher only
+# recognized the top-level form, so the cleanliness check flagged an
+# otherwise-canonical checkout as dirty over a path that could never reach
+# the target anyway. Now accepts a path ending in "/<pattern>" too, mirroring
+# the directory-prefix branch's existing top-level-OR-nested shape.
 bootstrap::_path_matches_any() {
   local check_path=$1
   shift
@@ -1134,7 +1145,9 @@ bootstrap::_path_matches_any() {
         esac
         ;;
       */*)
-        [ "$check_path" = "$check_pattern" ] && return 0
+        case "$check_path" in
+          "$check_pattern" | */"$check_pattern") return 0 ;;
+        esac
         ;;
       *)
         [ "$check_base" = "$check_pattern" ] && return 0
@@ -1195,10 +1208,21 @@ bootstrap::_path_matches_any() {
 # resume state, was recursively removed. -mindepth 1 excludes depth 0 (the
 # starting argument) from ever being a candidate, without affecting any
 # genuine descendant match at depth 1+.
+# Codex P2 on #1112 round 13: a bare (no `/`) protected entry like
+# .bootstrap-state matches rsync's own --exclude at ANY depth by basename,
+# same as any other bare pattern -- but the wizard's bookkeeping only ever
+# lives at the target ROOT (scripts/bootstrap-new-repo.sh always writes
+# "$TARGET_DIR/.bootstrap-state"), so blanket-skipping the whole pattern
+# from reconciliation also protected a coincidentally-named NESTED file
+# that is not wizard state at all, letting it survive under a falsely
+# attributed source SHA. A protected DIRECTORY entry (trailing `/`) stays
+# fully protected via prune_expr above -- everything inside it is meant to
+# persist regardless of depth -- but a protected bare FILE pattern is now
+# reconciled normally everywhere EXCEPT the literal root-level path.
 bootstrap::_reconcile_excluded_residue() {
   local target=$1
   shift
-  local pattern protected is_protected match_arg
+  local pattern protected is_protected root_only_protect match_arg
 
   local prune_expr=()
   for protected in "${BOOTSTRAP_MIRROR_RECONCILE_PROTECTED[@]}"; do
@@ -1212,9 +1236,13 @@ bootstrap::_reconcile_excluded_residue() {
 
   for pattern in "$@"; do
     is_protected=false
+    root_only_protect=""
     for protected in "${BOOTSTRAP_MIRROR_RECONCILE_PROTECTED[@]}"; do
       if [ "$pattern" = "$protected" ]; then
-        is_protected=true
+        case "$protected" in
+          */) is_protected=true ;;
+          *) root_only_protect="$target/$protected" ;;
+        esac
         break
       fi
     done
@@ -1227,13 +1255,25 @@ bootstrap::_reconcile_excluded_residue() {
     esac
 
     if [ -n "$match_arg" ]; then
-      bootstrap::run "reconcile excluded residue $pattern" \
-        find "$target" -mindepth 1 \( "${prune_expr[@]}" \) -prune -o -path "$match_arg" -exec rm -rf -- {} + \
-        || return $?
+      if [ -n "$root_only_protect" ]; then
+        bootstrap::run "reconcile excluded residue $pattern" \
+          find "$target" -mindepth 1 \( "${prune_expr[@]}" \) -prune -o -path "$match_arg" ! -path "$root_only_protect" -exec rm -rf -- {} + \
+          || return $?
+      else
+        bootstrap::run "reconcile excluded residue $pattern" \
+          find "$target" -mindepth 1 \( "${prune_expr[@]}" \) -prune -o -path "$match_arg" -exec rm -rf -- {} + \
+          || return $?
+      fi
     else
-      bootstrap::run "reconcile excluded residue $pattern" \
-        find "$target" -mindepth 1 \( "${prune_expr[@]}" \) -prune -o -name "$pattern" -exec rm -rf -- {} + \
-        || return $?
+      if [ -n "$root_only_protect" ]; then
+        bootstrap::run "reconcile excluded residue $pattern" \
+          find "$target" -mindepth 1 \( "${prune_expr[@]}" \) -prune -o -name "$pattern" ! -path "$root_only_protect" -exec rm -rf -- {} + \
+          || return $?
+      else
+        bootstrap::run "reconcile excluded residue $pattern" \
+          find "$target" -mindepth 1 \( "${prune_expr[@]}" \) -prune -o -name "$pattern" -exec rm -rf -- {} + \
+          || return $?
+      fi
     fi
   done
 }

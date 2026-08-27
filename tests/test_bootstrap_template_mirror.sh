@@ -2987,6 +2987,88 @@ else
   pass "excluded-residue reconciliation never matches find's own starting node (#1056 Codex P1 round 13)"
 fi
 
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 13: the cleanliness check's exact-path branch
+# required full string equality, but rsync's own --exclude for a
+# slash-containing, non-trailing-slash pattern matches a NESTED occurrence
+# too (round 11 confirmed this for bootstrap::_reconcile_excluded_residue).
+# An untracked nested/scripts/sync-to-downstream.sh can never reach the
+# mirror either way, so it must not block attribution.
+# ---------------------------------------------------------------------------
+NESTED_CLEAN_SOURCE="$WORKDIR/nested-clean-repo"
+mkdir -p "$NESTED_CLEAN_SOURCE/nested/scripts"
+git -C "$NESTED_CLEAN_SOURCE" init -q -b main
+git -C "$NESTED_CLEAN_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo seed >"$NESTED_CLEAN_SOURCE/f"
+git -C "$NESTED_CLEAN_SOURCE" add -A
+git -C "$NESTED_CLEAN_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "nested-clean-repo seed"
+git -C "$NESTED_CLEAN_SOURCE" update-ref refs/remotes/origin/main HEAD
+NESTED_CLEAN_SHA=$(git -C "$NESTED_CLEAN_SOURCE" rev-parse HEAD)
+printf 'never reaches the mirror -- nested match of an exact-path exclude\n' \
+  >"$NESTED_CLEAN_SOURCE/nested/scripts/sync-to-downstream.sh"
+NESTED_CLEAN_TARGET="$WORKDIR/nested-clean-target"
+mkdir -p "$NESTED_CLEAN_TARGET"
+echo seed >"$NESTED_CLEAN_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$NESTED_CLEAN_TARGET" "$NESTED_CLEAN_SOURCE" >/dev/null
+
+nested_clean_subject=$(git -C "$NESTED_CLEAN_TARGET" log -1 --format=%s)
+[ "$nested_clean_subject" = "Initial commit (bootstrapped from mergepath@${NESTED_CLEAN_SHA:0:7})" ] \
+  && pass "an untracked NESTED occurrence of an exact-path exclude does not block attribution (#1056 Codex P2 round 13)" \
+  || fail "nested-clean source_root wrongly blocked attribution: $nested_clean_subject (expected sha ${NESTED_CLEAN_SHA:0:7})"
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 13: a bare protected entry like .bootstrap-state
+# matches ANY depth by basename (same as rsync's own semantics), but the
+# wizard's bookkeeping only ever lives at the target ROOT -- a coincidental
+# nested file of the same name is not wizard state and must still be
+# reconciled, while the real root-level file must still survive.
+# ---------------------------------------------------------------------------
+rootonly_src="$(mktemp -d "$WORKDIR/rsync-rootonly-src.XXXXXX")"
+rootonly_dst="$(mktemp -d "$WORKDIR/rsync-rootonly-dst.XXXXXX")"
+mkdir -p "$rootonly_src/docs/agents"
+printf 'readme\n' > "$rootonly_src/README.md"
+printf 'canonical\n' > "$rootonly_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$rootonly_src/docs/agents/bootstrap-runbook.md"
+cat >"$rootonly_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+mkdir -p "$rootonly_dst/nested"
+printf 'real wizard state, must survive\n' > "$rootonly_dst/.bootstrap-state"
+printf 'coincidental nested file, not wizard state, must be reconciled\n' \
+  > "$rootonly_dst/nested/.bootstrap-state"
+set +e
+rootonly_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$rootonly_src" "$rootonly_dst" 2>&1)
+rootonly_rc=$?
+set -e
+if [ "$rootonly_rc" != "0" ]; then
+  fail "rsync with a root-level and a nested .bootstrap-state failed (rc=$rootonly_rc): $rootonly_out"
+elif [ ! -f "$rootonly_dst/.bootstrap-state" ]; then
+  fail "the real root-level .bootstrap-state was deleted -- root-only protection over-corrected"
+elif [ -e "$rootonly_dst/nested/.bootstrap-state" ]; then
+  fail "a coincidental NESTED .bootstrap-state survived reconciliation -- protection is not scoped to root-level"
+else
+  pass "bootstrap::_reconcile_excluded_residue protects only the root-level .bootstrap-state, reconciling a coincidental nested one (#1056 Codex P2 round 13)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"
