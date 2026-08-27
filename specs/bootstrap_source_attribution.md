@@ -16,13 +16,14 @@ A bootstrapped repo has no sync PR, so it carries none of the `Source:`/branch-n
 - The commit subject reads the un-attributed `Initial commit (bootstrapped from mergepath)`, with no `Source:` trailer, identical to the commit this feature did not exist to produce.
 - Fallback is fail-open with respect to the BOOTSTRAP itself: an unverifiable source never blocks or errors the bootstrap, it only omits the attribution.
 
-### What "canonical" requires — three independent, all-required checks
+### What "canonical" requires — four independent, all-required checks
 
 A `source_root` earns SHA attribution only when ALL of the following hold; any one failing falls back per above.
 
 1. **`source_root` IS the git toplevel**, not merely inside a git repo. Git's own repository discovery walks UP from a non-git directory and resolves against an ENCLOSING checkout's `.git` — a plain non-git directory nested inside an unrelated repo must NOT record that ancestor's HEAD. Compared canonicalized (`pwd -P`), so a symlinked path still matches.
 2. **`origin` names canonical mergepath by an exact host+path match** — one of the enumerated forms (`https://`, `http://`, `git@host:path` scp-like, `ssh://`) naming exactly `github.com` and exactly `nathanjohnpayne/mergepath` (with or without a `.git` suffix). An unanchored substring/suffix match is insufficient: a origin such as `https://evilgithub.com/nathanjohnpayne/mergepath.git` must NOT pass — the check must not be satisfiable by an origin carrying `github.com` as a suffix of some other hostname.
 3. **HEAD is contained in a remote-tracking ref under `refs/remotes/origin`** — a clean, correctly-origined checkout can still carry an unpushed local commit on `main`; such a commit must NOT be attributed, since the canonical remote (and therefore `git ls-tree -r "$HUB_REF"` run elsewhere) has never heard of it.
+4. **The working tree is clean** (`git status --porcelain` empty) — Stage B's rsync mirrors `source_root`'s working-tree bytes, not its committed tree; a source_root passing checks 1-3 can still carry uncommitted tracked edits that rsync would copy but HEAD does not reflect.
 
 ### Scope
 
