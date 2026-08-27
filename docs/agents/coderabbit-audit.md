@@ -62,7 +62,7 @@ We keep `auto`. As of **2026-07-06 the entire fleet is public** — matchline, o
 
 | Visibility | Consumers | `auto` resolves to |
 |---|---|---|
-| Public (all 8) | matchline, overridebroadway, tadlockpsychiatry, device-source-of-truth, friends-and-family-billing, swipewatch, nathanpaynedotcom, gaycruisebingo | `local` |
+| Public (all 8) | matchline, overridebroadway, tadlockpsychiatry, device-source-of-truth, friends-and-family-billing, swipewatch, nathanpaynedotcom, fiveacross | `local` |
 
 So no consumer currently shares learnings org-wide — each repo's learnings stay local to that repo. (Historically, while three consumers were private, `auto` gave *those* repos `global`, and the single-owner `nathanjohnpayne` fleet shared review conventions across them; that was deliberate, not a leak — learnings stay within one account's org boundary and CodeRabbit does not use code for model training, FAQ § Data Security — but it no longer applies now the fleet is uniformly public.) If cross-repo convention sharing is later wanted across the public fleet, it would take an explicit `scope: global` override — `auto` will not grant `global` to a public repo. We keep `auto` because it is the correct low-surprise default that needs no per-repo maintenance as visibility changes.
 
@@ -111,7 +111,7 @@ Our entire fleet authors as the single shared identity **`nathanjohnpayne`**. So
    command -v brew >/dev/null 2>&1 && eval "$(brew shellenv)"
    for r in matchline nathanpaynedotcom overridebroadway tadlockpsychiatry \
             device-source-of-truth friends-and-family-billing \
-            swipewatch gaycruisebingo; do
+            swipewatch fiveacross; do
      echo "=== $r ==="
      GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api \
        "repos/nathanjohnpayne/$r/issues/comments?per_page=100&sort=created&direction=desc" \

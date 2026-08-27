@@ -98,11 +98,11 @@ projects:
       - source: specs/
         mirror: projects/swipewatch/specs/
 
-  - slug: gaycruisebingo
+  - slug: fiveacross
     owner:
-      name: gaycruisebingo
-      repo: nathanjohnpayne/gaycruisebingo
-      path_hint: ../gaycruisebingo
+      name: fiveacross
+      repo: nathanjohnpayne/fiveacross
+      path_hint: ../fiveacross
     prds:
       - slug: gaycruisebingo
         source: projects/gaycruisebingo/prds/gaycruisebingo.md
