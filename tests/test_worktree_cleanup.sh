@@ -3120,6 +3120,109 @@ else
   echo "$OUT_NOELIG" >&2
 fi
 
+# ── Case 44c (#1105, Codex P2): a LOCAL failure is not a remote one ──────
+# Four paths set STALE_SNAPSHOT_STATE=unknown and only ONE of them involves
+# the remote. The other three are local: an unenterable worktree, and two
+# `mktemp` failures from an unwritable or full TMPDIR — one of which happens
+# AFTER the remote has been read successfully.
+#
+# The summary used to print "the remote could not be read" for all of them,
+# and the agent documentation told the operator to restore remote
+# reachability. On a full /tmp that sends them to fix a network that was
+# never broken.
+#
+# The fixture makes the point sharply: the remote here is REACHABLE, and the
+# failure is injected into the eligible-list allocation, which runs BEFORE
+# any remote contact. A message blaming the remote would be provably wrong.
+TMPFAIL_ROOT="$WORKDIR/local-tmp-failure"
+TMPFAIL_REMOTE="$TMPFAIL_ROOT/remote.git"
+TMPFAIL_MAIN="$TMPFAIL_ROOT/main"
+TMPFAIL_BIN="$TMPFAIL_ROOT/bin"
+TMPFAIL_LOG="$TMPFAIL_ROOT/mktemp-calls.log"
+mkdir -p "$TMPFAIL_ROOT" "$TMPFAIL_BIN"
+git init -q --bare "$TMPFAIL_REMOTE"
+git init -q -b main "$TMPFAIL_MAIN"
+(
+  cd "$TMPFAIL_MAIN"
+  git -C "$TMPFAIL_MAIN" config user.email "test@example.com"
+  git -C "$TMPFAIL_MAIN" config user.name "Test"
+  git -C "$TMPFAIL_MAIN" config commit.gpgsign false
+  git -C "$TMPFAIL_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$TMPFAIL_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+TMPFAIL_MAIN=$(cd "$TMPFAIL_MAIN" && pwd -P)
+# Resolve the real mktemp NOW, before the shim shadows it on PATH.
+TMPFAIL_REAL_MKTEMP=$(command -v mktemp)
+if [ -z "$TMPFAIL_REAL_MKTEMP" ]; then
+  fail "fixture setup: no mktemp on PATH — case 44c cannot build its shim"
+fi
+# Fail ONLY the eligible-list allocation. Shimming mktemp wholesale would
+# break the audit long before the probe and would prove nothing about which
+# failure the message describes.
+cat > "$TMPFAIL_BIN/mktemp" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *wcleanup-eligible*) printf '%s\n' "\$a" >> "$TMPFAIL_LOG"; exit 1 ;;
+  esac
+done
+exec "$TMPFAIL_REAL_MKTEMP" "\$@"
+SHIM
+chmod +x "$TMPFAIL_BIN/mktemp"
+
+# Premise: the remote really IS reachable, so any message blaming it is
+# false rather than merely imprecise.
+if ! git -C "$TMPFAIL_MAIN" ls-remote --heads origin >/dev/null 2>&1; then
+  fail "fixture setup: the remote is unreachable — case 44c cannot distinguish a local cause from a remote one"
+fi
+# Premise: a branch tracks origin, so the probe is eligible and reaches the
+# allocation the shim fails (case 44b proves it is skipped otherwise).
+if [ "$(git -C "$TMPFAIL_MAIN" for-each-ref --format='%(upstream)' refs/heads/main)" \
+     != "refs/remotes/origin/main" ]; then
+  fail "fixture setup: main does not track origin/main — the eligible-list allocation would never run"
+fi
+
+set +e
+OUT_TMPFAIL=$( cd "$TMPFAIL_MAIN" && PATH="$TMPFAIL_BIN:$STUB_DIR:$PATH" \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_TMPFAIL=$?
+set -e
+
+# Premise: the shim actually fired. Without this every assertion below could
+# pass on a run that never attempted the allocation.
+if [ ! -s "$TMPFAIL_LOG" ]; then
+  fail "fixture setup: the eligible-list allocation was never attempted, so case 44c asserts nothing"
+  echo "$OUT_TMPFAIL" >&2
+fi
+if [ "$RC_TMPFAIL" -eq 3 ] && echo "$OUT_TMPFAIL" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1105 a local allocation failure is still an incomplete audit (exit 3)"
+else
+  fail "#1105 a local allocation failure did not surface as exit 3 + NOT MEASURED (rc=$RC_TMPFAIL)"
+  echo "$OUT_TMPFAIL" >&2
+fi
+if echo "$OUT_TMPFAIL" | grep -Fq -- "LOCAL failure"; then
+  pass "#1105 the remedy names the local cause rather than the remote"
+else
+  fail "#1105 a local failure was not identified as local"
+  echo "$OUT_TMPFAIL" >&2
+fi
+# The half that actually misled: the remote was reachable throughout, so
+# telling the operator to go fix it is a false statement, not a vague one.
+# Case-INSENSITIVE and phrase-level on purpose: an earlier draft matched the
+# exact capitalised string, and a mutation that restored the old lowercase
+# wording slipped straight past it. The claim being guarded is "no wording
+# that blames the remote", not "not this one spelling".
+if ! echo "$OUT_TMPFAIL" | grep -Fqi -- "remote could not be read"; then
+  pass "#1105 a reachable remote is not blamed for a local failure"
+else
+  fail "#1105 the audit blamed a remote it had never even contacted"
+  echo "$OUT_TMPFAIL" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

@@ -668,7 +668,12 @@ origin_fetch_is_conventional() {
 # put every non-conventional checkout at a permanent exit 3 — repeating the
 # mistake the SUMMARY_LOOKUP_UNKNOWN carve-out below exists to avoid.
 stale_unpruned_branches() {
-  cd "$MAIN_WORKTREE" || { STALE_SNAPSHOT_STATE="unknown"; STALE_SNAPSHOT_REASON="cannot enter the main worktree"; return 0; }
+  cd "$MAIN_WORKTREE" || {
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="local"
+    STALE_SNAPSHOT_REASON="cannot enter the main worktree"
+    return 0
+  }
   # A non-default refspec makes the tracking-ref → remote-head mapping
   # unknowable here; decline rather than guess (origin_fetch_is_conventional).
   origin_fetch_is_conventional || { STALE_SNAPSHOT_STATE="declined"; return 0; }
@@ -688,7 +693,8 @@ stale_unpruned_branches() {
   # "nothing", established without the remote having any say.
   ELIGIBLE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-eligible.XXXXXX") || {
     STALE_SNAPSHOT_STATE="unknown"
-    STALE_SNAPSHOT_REASON="could not create the eligible-branch list"
+    STALE_SNAPSHOT_CAUSE="local"
+    STALE_SNAPSHOT_REASON="could not create the eligible-branch list (temporary storage unavailable)"
     return 0
   }
   local branch upstream
@@ -726,6 +732,7 @@ stale_unpruned_branches() {
   snapshot=$(git ls-remote --heads origin 2>/dev/null) || snapshot_rc=$?
   if [ "$snapshot_rc" -ne 0 ]; then
     STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="remote"
     STALE_SNAPSHOT_REASON="git ls-remote --heads origin exited $snapshot_rc"
     rm -f "$ELIGIBLE_FILE"
     ELIGIBLE_FILE=""
@@ -741,7 +748,8 @@ stale_unpruned_branches() {
     # the same state, or it becomes this issue's silent-clean case one level
     # further down.
     STALE_SNAPSHOT_STATE="unknown"
-    STALE_SNAPSHOT_REASON="could not create the remote-heads snapshot file"
+    STALE_SNAPSHOT_CAUSE="local"
+    STALE_SNAPSHOT_REASON="could not create the remote-heads snapshot file (temporary storage unavailable)"
     return 0
   }
   # `<sha>\t<refname>` per line; keep the refname column only.
@@ -860,6 +868,11 @@ STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
 # bottom is unreachable there by construction.
 STALE_SNAPSHOT_STATE=""
 STALE_SNAPSHOT_REASON=""
+# WHERE the failed read was, so the remedy printed with it is the right one:
+# `remote` (the network read) or `local` (this machine's temporary storage).
+# Only two of the four unknown paths involve the remote at all, and one of
+# them fails AFTER a successful remote read (Codex P2 on #1105).
+STALE_SNAPSHOT_CAUSE=""
 HEADS_FILE=""
 ELIGIBLE_FILE=""
 RECORDS_FILE=""
@@ -1578,9 +1591,27 @@ printf "  gone (stale remote ref, unpruned): %d\n" "${#SUMMARY_STALE_UNPRUNED[@]
 # and only the first is what a reader takes from it.
 if [ "$STALE_SNAPSHOT_STATE" = "unknown" ]; then
   printf "    ^ NOT MEASURED: %s\n" "$STALE_SNAPSHOT_REASON"
-  printf "      The remote could not be read, so the count above is 0 because\n"
-  printf "      nothing was checked — not because nothing is stale. Re-run once\n"
-  printf "      the remote is reachable before trusting this audit (exit 3).\n"
+  printf "      The count above is 0 because nothing was checked — not because\n"
+  printf "      nothing is stale.\n"
+  # The remedy has to match the failure. Three of the four unknown paths are
+  # LOCAL (an unenterable worktree, or a `mktemp` that failed because TMPDIR
+  # is unwritable or full), and one of those fails AFTER the remote has been
+  # read successfully. Printing "re-run once the remote is reachable" for a
+  # full /tmp sends the operator to fix a network that was never broken
+  # (Codex P2 on #1105).
+  case "$STALE_SNAPSHOT_CAUSE" in
+    remote)
+      printf "      The REMOTE could not be read. Re-run once it is reachable\n"
+      printf "      before trusting this audit (exit 3).\n" ;;
+    local)
+      printf "      This is a LOCAL failure, not a remote one — the audit could\n"
+      printf "      not allocate its own working state. Check that TMPDIR\n"
+      printf "      (%s) is writable and has free space, then\n" "${TMPDIR:-/tmp}"
+      printf "      re-run before trusting this audit (exit 3).\n" ;;
+    *)
+      printf "      The audit could not complete this check. Resolve the cause\n"
+      printf "      named above, then re-run before trusting it (exit 3).\n" ;;
+  esac
 fi
 printf "  open-PR retained: %d\n" "${#SUMMARY_OPEN_PR[@]}"
 printf "  orphan dirs:      %d\n" "${#SUMMARY_ORPHAN[@]}"
