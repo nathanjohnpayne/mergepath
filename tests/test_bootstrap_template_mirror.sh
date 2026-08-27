@@ -2669,6 +2669,143 @@ fi
   && pass "excluded-residue reconciliation never touches the target's own .git/ (BOOTSTRAP_MIRROR_RECONCILE_PROTECTED)" \
   || fail ".git/HEAD was modified or removed by excluded-residue reconciliation -- BOOTSTRAP_MIRROR_RECONCILE_PROTECTED is not honored"
 
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 11: .mergepath-sync.yml is in BOOTSTRAP_MIRROR_EXCLUDES
+# (its own bytes never reach the target), so the combined_excludes filter
+# excused a dirty copy of it -- but Stage B READS it at mirror time
+# (bootstrap::_derive_hub_only_excludes) to decide what to exclude, so an
+# uncommitted edit changes what actually gets mirrored even though the file
+# itself is never copied. Same source shape as the real-noise case, but the
+# dirty path is .mergepath-sync.yml itself.
+# ---------------------------------------------------------------------------
+CONTROL_DIRTY_SOURCE="$WORKDIR/control-dirty-repo"
+mkdir -p "$CONTROL_DIRTY_SOURCE/docs/agents"
+git -C "$CONTROL_DIRTY_SOURCE" init -q -b main
+git -C "$CONTROL_DIRTY_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo seed >"$CONTROL_DIRTY_SOURCE/f"
+printf 'canonical\n' >"$CONTROL_DIRTY_SOURCE/docs/agents/decision-records.md"
+cat >"$CONTROL_DIRTY_SOURCE/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+YAML
+git -C "$CONTROL_DIRTY_SOURCE" add -A
+git -C "$CONTROL_DIRTY_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "control-dirty-repo seed"
+git -C "$CONTROL_DIRTY_SOURCE" update-ref refs/remotes/origin/main HEAD
+cat >"$CONTROL_DIRTY_SOURCE/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: hub-only
+YAML
+CONTROL_DIRTY_TARGET="$WORKDIR/control-dirty-target"
+mkdir -p "$CONTROL_DIRTY_TARGET"
+echo seed >"$CONTROL_DIRTY_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$CONTROL_DIRTY_TARGET" "$CONTROL_DIRTY_SOURCE" >/dev/null
+
+control_dirty_subject=$(git -C "$CONTROL_DIRTY_TARGET" log -1 --format=%s)
+[ "$control_dirty_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "an uncommitted edit to .mergepath-sync.yml itself blocks attribution (#1056 Codex P2 round 11)" \
+  || fail "control-dirty source_root wrongly got attribution: $control_dirty_subject"
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 11: a slash-containing exclude pattern is not
+# anchored to the transfer root -- rsync matches it at any depth, so
+# residue at a NESTED occurrence (nested/scripts/sync-to-downstream.sh)
+# survives --delete exactly like the round-10 top-level case, for the same
+# reason. Drive _rsync_template directly against a target carrying that
+# nested residue and assert it is removed too.
+# ---------------------------------------------------------------------------
+nested_reconcile_src="$(mktemp -d "$WORKDIR/rsync-nested-reconcile-src.XXXXXX")"
+nested_reconcile_dst="$(mktemp -d "$WORKDIR/rsync-nested-reconcile-dst.XXXXXX")"
+mkdir -p "$nested_reconcile_src/docs/agents"
+printf 'readme\n' > "$nested_reconcile_src/README.md"
+printf 'canonical\n' > "$nested_reconcile_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$nested_reconcile_src/docs/agents/bootstrap-runbook.md"
+cat >"$nested_reconcile_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+mkdir -p "$nested_reconcile_dst/nested/scripts" "$nested_reconcile_dst/.git"
+printf 'stale nested leftover, same class as the round-10 top-level case\n' \
+  > "$nested_reconcile_dst/nested/scripts/sync-to-downstream.sh"
+printf 'must survive -- this IS the targets own repository\n' \
+  > "$nested_reconcile_dst/.git/HEAD"
+set +e
+nested_reconcile_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$nested_reconcile_src" "$nested_reconcile_dst" 2>&1)
+nested_reconcile_rc=$?
+set -e
+if [ "$nested_reconcile_rc" != "0" ]; then
+  fail "rsync with nested excluded-residue reconciliation failed (rc=$nested_reconcile_rc): $nested_reconcile_out"
+elif [ -e "$nested_reconcile_dst/nested/scripts/sync-to-downstream.sh" ]; then
+  fail "residue at a NESTED excluded path (nested/scripts/sync-to-downstream.sh) survived a resumed mirror -- nested-match reconciliation is not wired in"
+else
+  pass "bootstrap::_rsync_template reconciles residue at a NESTED excluded path (#1056 Codex P2 round 11)"
+fi
+[ "$(cat "$nested_reconcile_dst/.git/HEAD" 2>/dev/null)" = "must survive -- this IS the targets own repository" ] \
+  && pass "nested-match reconciliation still never touches the target's own .git/" \
+  || fail ".git/HEAD was modified or removed by nested-match reconciliation"
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 11: with core.filemode=false in the source repo's
+# own config, flipping a tracked file executable leaves `git status`
+# reading clean, but rsync -a still preserves the physical (now-755) mode
+# into the target -- a mismatch against HEAD's recorded (644) mode.
+# ---------------------------------------------------------------------------
+FILEMODE_DIRTY_SOURCE="$WORKDIR/filemode-dirty-repo"
+mkdir -p "$FILEMODE_DIRTY_SOURCE"
+git -C "$FILEMODE_DIRTY_SOURCE" init -q -b main
+git -C "$FILEMODE_DIRTY_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+printf '#!/bin/sh\necho hi\n' >"$FILEMODE_DIRTY_SOURCE/f.sh"
+chmod 644 "$FILEMODE_DIRTY_SOURCE/f.sh"
+git -C "$FILEMODE_DIRTY_SOURCE" add -A
+git -C "$FILEMODE_DIRTY_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "filemode-dirty-repo seed"
+git -C "$FILEMODE_DIRTY_SOURCE" update-ref refs/remotes/origin/main HEAD
+git -C "$FILEMODE_DIRTY_SOURCE" config core.filemode false
+chmod 755 "$FILEMODE_DIRTY_SOURCE/f.sh"
+# Confirm the fixture actually produces an empty `git status --porcelain`
+# under the repo's own core.filemode=false -- otherwise this test would
+# pass even without the fix, proving nothing.
+if [ -n "$(git -C "$FILEMODE_DIRTY_SOURCE" status --porcelain)" ]; then
+  fail "filemode-dirty fixture did not reproduce the core.filemode=false blind spot: $(git -C "$FILEMODE_DIRTY_SOURCE" status --porcelain)"
+fi
+FILEMODE_DIRTY_TARGET="$WORKDIR/filemode-dirty-target"
+mkdir -p "$FILEMODE_DIRTY_TARGET"
+echo seed >"$FILEMODE_DIRTY_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$FILEMODE_DIRTY_TARGET" "$FILEMODE_DIRTY_SOURCE" >/dev/null
+
+filemode_dirty_subject=$(git -C "$FILEMODE_DIRTY_TARGET" log -1 --format=%s)
+[ "$filemode_dirty_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a mode-only change hidden by core.filemode=false blocks attribution (#1056 Codex P2 round 11)" \
+  || fail "filemode-dirty source_root wrongly got attribution: $filemode_dirty_subject"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

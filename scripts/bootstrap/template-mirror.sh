@@ -301,6 +301,18 @@ BOOTSTRAP_MIRROR_RECONCILE_PROTECTED=(
   '.claude/launch.json'
 )
 
+# Entries of BOOTSTRAP_MIRROR_EXCLUDES that bootstrap::_resolve_canonical_source_sha
+# (#1112 round 11) must NEVER excuse from the cleanliness check, even though
+# they are excluded from the rsync transfer: an uncommitted edit to one of
+# these changes what Stage B actually MIRRORS (bootstrap::_derive_hub_only_excludes
+# reads .mergepath-sync.yml's doc_ownership at mirror time), so an attributed
+# HEAD would not match the tree that was actually produced. This is narrower
+# than "is a file ever read by bootstrap" -- only files whose CONTENT decides
+# what gets mirrored, not the file's own bytes reaching the target, qualify.
+BOOTSTRAP_MIRROR_CONTROL_FILES=(
+  '.mergepath-sync.yml'
+)
+
 # Files that rsync leaves behind because they don't match an exclude
 # pattern but shouldn't ship to a new repo. Post-mirror cleanup.
 BOOTSTRAP_POST_MIRROR_REMOVE=(
@@ -1131,14 +1143,26 @@ bootstrap::_path_matches_any() {
 # the later `git add -A` commits it while attribution still names a clean
 # source HEAD. Remove it explicitly, skipping BOOTSTRAP_MIRROR_RECONCILE_PROTECTED
 # -- target-local state that must persist across resumes regardless of what
-# the exclude array says. Bare-basename patterns are found via `find`,
-# which never descends into a symlinked directory without -L, so this
-# cannot be tricked into deleting outside target through a symlink swap;
-# directory/exact-path patterns reuse the same ancestor-symlink guard the
-# hub-only-doc removal below already relies on.
+# the exclude array says.
+#
+# Codex P2 on #1112 round 11: a slash-containing rsync --exclude pattern
+# (directory-prefix OR exact-path) is NOT anchored to the transfer root --
+# rsync matches it at ANY depth (confirmed against this host's rsync:
+# --exclude='scripts/sync-to-downstream.sh' also excludes
+# nested/scripts/sync-to-downstream.sh, and --exclude='packaging/' also
+# excludes nested/packaging/). Checking only "$target/$pattern" therefore
+# missed nested matches that --delete equally protects. Every pattern shape
+# is now reconciled the same way, via `find`: a bare basename by -name (any
+# depth, matching rsync's own slash-less semantics), a directory-prefix or
+# exact-path pattern by -path "*/<pattern-without-trailing-slash>" (the `*`
+# absorbs zero or more leading path segments, so it matches both a
+# top-level and a nested occurrence in one predicate). `find` never
+# descends into a symlinked directory without -L, so none of this can be
+# tricked into deleting outside target through a symlink swap, and .git/ is
+# pruned from traversal outright regardless of pattern shape.
 bootstrap::_reconcile_excluded_residue() {
   local target=$1
-  local pattern protected is_protected
+  local pattern protected is_protected match_arg
 
   for pattern in "${BOOTSTRAP_MIRROR_EXCLUDES[@]}"; do
     is_protected=false
@@ -1151,27 +1175,20 @@ bootstrap::_reconcile_excluded_residue() {
     [ "$is_protected" = true ] && continue
 
     case "$pattern" in
-      */)
-        local dir="${pattern%/}"
-        if [ -e "$target/$dir" ] || [ -L "$target/$dir" ]; then
-          bootstrap::_reject_symlink_ancestors "$target" "$dir" || return $?
-          bootstrap::run "reconcile excluded residue $pattern" rm -rf -- "$target/$dir" \
-            || return $?
-        fi
-        ;;
-      */*)
-        if [ -e "$target/$pattern" ] || [ -L "$target/$pattern" ]; then
-          bootstrap::_reject_symlink_ancestors "$target" "$pattern" || return $?
-          bootstrap::run "reconcile excluded residue $pattern" rm -f -- "$target/$pattern" \
-            || return $?
-        fi
-        ;;
-      *)
-        bootstrap::run "reconcile excluded residue $pattern" \
-          find "$target" -name '.git' -prune -o -name "$pattern" -exec rm -rf -- {} + \
-          || return $?
-        ;;
+      */) match_arg="*/${pattern%/}" ;;
+      */*) match_arg="*/$pattern" ;;
+      *) match_arg="" ;;
     esac
+
+    if [ -n "$match_arg" ]; then
+      bootstrap::run "reconcile excluded residue $pattern" \
+        find "$target" -name '.git' -prune -o -path "$match_arg" -exec rm -rf -- {} + \
+        || return $?
+    else
+      bootstrap::run "reconcile excluded residue $pattern" \
+        find "$target" -name '.git' -prune -o -name "$pattern" -exec rm -rf -- {} + \
+        || return $?
+    fi
   done
 }
 
@@ -1408,8 +1425,16 @@ bootstrap::_resolve_canonical_source_sha() {
   # diff.ignoreSubmodules=all in the operator's ambient gitconfig would
   # otherwise suppress exactly the entries this check exists to catch, while
   # rsync still copies the bytes those settings hid from `git status`.
+  #
+  # Codex P2 on #1112 round 11: pin -c core.filemode=true too. With
+  # core.filemode=false (common on macOS/exotic checkouts, or set
+  # deliberately) git status does not report a mode-only change at all, so
+  # flipping a tracked file executable leaves this check reading clean while
+  # rsync -a still preserves the physical (now-755) mode into the target --
+  # a mismatch against HEAD's recorded (644) mode that has nothing to do
+  # with content.
   local status_output
-  status_output=$(git -C "$source_root" status --porcelain --ignored \
+  status_output=$(git -c core.filemode=true -C "$source_root" status --porcelain --ignored \
     --untracked-files=all --ignore-submodules=none 2>/dev/null) || return 1
   if [ -n "$status_output" ]; then
     # Codex P2 on #1112 round 9: the static BOOTSTRAP_MIRROR_EXCLUDES array
@@ -1427,7 +1452,19 @@ bootstrap::_resolve_canonical_source_sha() {
     # only makes this check MORE conservative, same as before this round.
     local derived_hub_only=""
     derived_hub_only=$(bootstrap::_derive_hub_only_excludes "$source_root" 2>/dev/null) || derived_hub_only=""
-    local combined_excludes=("${BOOTSTRAP_MIRROR_EXCLUDES[@]}" "${BOOTSTRAP_POST_MIRROR_REMOVE[@]}")
+    # Codex P2 on #1112 round 11: BOOTSTRAP_MIRROR_CONTROL_FILES (currently
+    # just .mergepath-sync.yml) must NEVER be added to combined_excludes --
+    # its own content decides what bootstrap::_derive_hub_only_excludes
+    # excludes, so a dirty copy changes the mirror's actual output even
+    # though the file itself never reaches the target.
+    local combined_excludes=() candidate is_control control
+    for candidate in "${BOOTSTRAP_MIRROR_EXCLUDES[@]}" "${BOOTSTRAP_POST_MIRROR_REMOVE[@]}"; do
+      is_control=false
+      for control in "${BOOTSTRAP_MIRROR_CONTROL_FILES[@]}"; do
+        [ "$candidate" = "$control" ] && is_control=true && break
+      done
+      [ "$is_control" = true ] || combined_excludes+=("$candidate")
+    done
     local hub_doc
     while IFS= read -r hub_doc; do
       [ -n "$hub_doc" ] || continue
