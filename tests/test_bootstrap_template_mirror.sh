@@ -369,8 +369,14 @@ cp "$ROOT/scripts/ci/check_export_consumer_facts" "$FAKE_MP/scripts/ci/check_exp
 cp "$ROOT/scripts/ci/check_audit_canonical_mirrors" "$FAKE_MP/scripts/ci/check_audit_canonical_mirrors"
 cp "$ROOT/scripts/ci/check_branch_protection_audit" "$FAKE_MP/scripts/ci/check_branch_protection_audit"
 
-# git init so preflight check 6 (clean mergepath) passes.
+# git init so preflight check 6 (clean mergepath) passes. The origin remote
+# is required for #1056's canonical-origin check (bootstrap::_init_target_git
+# only trusts a source_root's sha when its own `origin` names
+# nathanjohnpayne/mergepath) -- without it this fixture would exercise the
+# unattributed fallback instead of the sha-attribution path it's meant to
+# cover.
 git -C "$FAKE_MP" init -q
+git -C "$FAKE_MP" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
 git -C "$FAKE_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false add -A
 git -C "$FAKE_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "fixture: initial"
 git -C "$FAKE_MP" branch -M main 2>/dev/null || true
@@ -2108,7 +2114,7 @@ NESTED_SOURCE="$NESTED_ENCLOSING/nested/not-a-repo"
 NESTED_TARGET="$WORKDIR/nested-target"
 mkdir -p "$NESTED_TARGET"
 echo seed >"$NESTED_TARGET/README.md"
-bash -c '
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
   set -euo pipefail
   # shellcheck disable=SC1091
   . "$1/scripts/bootstrap/_lib.sh"
@@ -2126,6 +2132,47 @@ fi
 [ "$nested_subject" = "Initial commit (bootstrapped from mergepath)" ] \
   && pass "nested non-git source_root falls back to the un-attributed subject" \
   || fail "nested non-git source_root subject wrong: $nested_subject"
+
+# ---------------------------------------------------------------------------
+# Codex P1 round 2 on #1056/#1112: the toplevel check alone proves source_root
+# IS a git repo's own root, not WHICH repo. A clean checkout of a FORK is
+# just as validly its own toplevel as canonical mergepath, and the Source:
+# trailer hardcodes nathanjohnpayne/mergepath regardless -- so without an
+# origin-remote check, a fork-only commit would be attributed to a canonical
+# URL that cannot resolve it via `git ls-tree -r "$HUB_REF"`. Asserts a
+# source_root that IS its own toplevel but whose origin names a fork does
+# NOT get its sha recorded.
+# ---------------------------------------------------------------------------
+FORK_SOURCE="$WORKDIR/fork-of-mergepath"
+mkdir -p "$FORK_SOURCE"
+git -C "$FORK_SOURCE" init -q -b main
+git -C "$FORK_SOURCE" remote add origin "https://github.com/someone-else/mergepath.git"
+echo seed >"$FORK_SOURCE/f"
+git -C "$FORK_SOURCE" add -A
+git -C "$FORK_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "fork seed"
+FORK_SHA=$(git -C "$FORK_SOURCE" rev-parse HEAD)
+FORK_TARGET="$WORKDIR/fork-target"
+mkdir -p "$FORK_TARGET"
+echo seed >"$FORK_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$FORK_TARGET" "$FORK_SOURCE" >/dev/null
+
+fork_subject=$(git -C "$FORK_TARGET" log -1 --format=%s)
+if echo "$fork_subject" | grep -qF "${FORK_SHA:0:7}"; then
+  fail "a fork's own sha (non-canonical origin) was recorded as HUB_REF: $fork_subject"
+else
+  pass "a source_root whose origin is a fork does not get its sha recorded as HUB_REF (#1056 Codex P1 round 2)"
+fi
+[ "$fork_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "fork-origin source_root falls back to the un-attributed subject" \
+  || fail "fork-origin source_root subject wrong: $fork_subject"
 
 # --- summary --------------------------------------------------------------
 echo

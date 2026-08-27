@@ -32,8 +32,13 @@
 #      "Step 5b").
 #   6. Reset opt-in policy defaults the hub flipped for itself
 #      (phase_4b_automation.enabled → false, #628).
-#   7. Initialize the new repo's git history with a single
-#      "Initial commit (bootstrapped from mergepath)" commit.
+#   7. Initialize the new repo's git history with a single commit. When
+#      source_root resolves to a canonical mergepath checkout (its own git
+#      toplevel, with an `origin` remote naming nathanjohnpayne/mergepath),
+#      the subject is "Initial commit (bootstrapped from mergepath@<sha7>)"
+#      and the body carries a "Source: .../commit/<sha>" trailer (#1056).
+#      Otherwise it falls back to the un-attributed
+#      "Initial commit (bootstrapped from mergepath)".
 #
 # The cross-repo loop update (open a Mergepath-side PR adding the
 # new repo to the loop docs in DEPLOYMENT.md + REVIEW_POLICY.md) is
@@ -1221,13 +1226,28 @@ bootstrap::_init_target_git() {
   # trusting the sha; anything else — no repo, or a repo whose toplevel is
   # an ancestor — falls back to the un-attributed subject exactly like an
   # unreadable source_root always has.
-  local source_sha="" source_toplevel="" source_root_canon=""
+  # Codex P1 round 2 on #1056/#1112: the toplevel check above only proves
+  # source_root IS a git repo's own root — it says nothing about WHICH repo.
+  # A clean checkout of a fork, or BOOTSTRAP_MERGEPATH_ROOT pointed at any
+  # other repo (a scratch clone, a test fixture), passes the toplevel
+  # equality just as validly as canonical mergepath does, and the trailer
+  # below hardcodes nathanjohnpayne/mergepath regardless — so a fork-only
+  # commit would be attributed to a canonical URL that cannot resolve it via
+  # `git ls-tree -r "$HUB_REF"`. Require the repo's own `origin` remote to
+  # actually name nathanjohnpayne/mergepath (https, ssh, or scp-like form,
+  # with or without a `.git` suffix) before trusting the sha for that URL.
+  local source_sha="" source_toplevel="" source_root_canon="" source_origin=""
   if [ -n "$source_root" ] && [ -d "$source_root" ]; then
     source_toplevel=$(git -C "$source_root" rev-parse --show-toplevel 2>/dev/null) || source_toplevel=""
     if [ -n "$source_toplevel" ]; then
       source_root_canon=$(cd "$source_root" && pwd -P)
       if [ "$(cd "$source_toplevel" && pwd -P)" = "$source_root_canon" ]; then
-        source_sha=$(git -C "$source_root" rev-parse HEAD 2>/dev/null) || source_sha=""
+        source_origin=$(git -C "$source_root" remote get-url origin 2>/dev/null) || source_origin=""
+        case "$source_origin" in
+          *github.com[:/]nathanjohnpayne/mergepath | *github.com[:/]nathanjohnpayne/mergepath.git)
+            source_sha=$(git -C "$source_root" rev-parse HEAD 2>/dev/null) || source_sha=""
+            ;;
+        esac
       fi
     fi
   fi
