@@ -164,11 +164,42 @@
 # and removing.
 #
 # Exit codes:
-#   0  success (audit clean OR all requested removals succeeded)
+#   0  in a DRY RUN, the audit completed and found nothing actionable.
+#      Under --apply it means only that no attempted removal FAILED — locked
+#      entries, orphans, dirty closed-PR worktrees and diverged branches can
+#      all still be present, because --apply deliberately never touches them
+#      without their opt-in flags or a human decision. A successful apply is
+#      NOT a clean audit; run the dry run to learn whether the tree is clean
+#      (Codex P2 on #1105).
 #   1  generic error (bad invocation, git failure, unsupported state)
-#   2  candidates listed but --apply was not passed (dry-run with findings).
-#      Lets callers wire this into "audit fails CI" style checks even
-#      though we explicitly do NOT wire this into PR CI per #288.
+#   2  a COMPLETE audit with actionable findings (dry-run). Lets callers
+#      wire this into "audit fails CI" style checks even though we
+#      explicitly do NOT wire this into PR CI per #288.
+#      Note what 2 does NOT promise: that a plain --apply clears it. Several
+#      buckets exit 2 and are deliberately never cleared by the default
+#      apply mode — SUMMARY_DIVERGED_KEPT and SUMMARY_UNCLEAN_KEPT need a
+#      HUMAN decision and --apply never touches them, and locked entries and
+#      orphans need --force-locked / --orphan-clean. 2 means "everything
+#      that could be checked was checked, and some of it wants attention";
+#      the per-record lines say what kind (Codex P2 on #1105).
+#   3  an INCOMPLETE audit: a step it depends on FAILED in a way that would
+#      otherwise be INVISIBLE, so one of the report's silences is not
+#      evidence (#992).
+#      The 2-versus-3 axis is COMPLETENESS, not who can act. A 2 may still
+#      need a human; a 3 says the run does not know what it is looking at.
+#      Callers that only branch on 2 are unaffected; callers that treat any
+#      non-zero as actionable still see it.
+#      The qualifying steps are the ones by which stale_unpruned_branches()
+#      EVALUATES — entering the main worktree, reading the local branch list,
+#      allocating and writing the eligible-branch list, taking the
+#      remote-heads snapshot, and allocating and writing that snapshot. It is
+#      NOT only the network read: a full TMPDIR or an unreadable ref database
+#      reaches the same arm, and the NOT MEASURED line names which. The probe
+#      is dry-run only, so --apply never exits 3.
+#      Persisting the probe's RESULT is deliberately outside this contract;
+#      that write fails loudly rather than silently (#1115). The canonical
+#      statement is specs/worktree_cleanup_audit.md — keep it, this block and
+#      docs/agents/operating-rules.md in step.
 #
 # Notes:
 #   - Always invoked from within a git repo (the main one or a worktree).
@@ -629,49 +660,205 @@ origin_fetch_is_conventional() {
 #                        remote with no heads at all — unusual but real, and
 #                        it correctly makes every tracking branch stale.
 #   any other exit     → the query FAILED (no network, auth failure, unknown
-#                        remote). Not evidence any branch was deleted: fail
-#                        closed and report nothing.
+#                        remote). Not evidence any branch was deleted: report
+#                        nothing, AND record the state as `unknown` (#992).
+#
+# Reporting nothing is fail-closed for CLASSIFICATION but fail-OPEN for the
+# AUDIT, and the second half is what #992 is about. With the failure
+# unrecorded, an unreachable remote rendered identically to a clean tree:
+# `gone (stale remote ref, unpruned): 0`, nothing on stderr, exit 0. The
+# preview then claimed an agreement with --apply that it had never been able
+# to model — and --apply, run later with working network, acts on a
+# classification the preview never showed. That is the same class as the
+# gone_branches() defect #991 fixed for the LOCAL branch inventory (an
+# unreadable read reported as an empty one), applied to the remote read.
+#
+# $STALE_SNAPSHOT_STATE tells the caller which of three things happened:
+#   ok        the snapshot was taken; the reported set is authoritative
+#   declined  a non-conventional remote.origin.fetch — deliberately not
+#             evaluated, a documented limitation with a stable answer
+#   unknown   the read failed; nothing is known either way
+#
+# `declined` is deliberately NOT `unknown`. It is a standing, documented
+# limitation rather than a transient failure, and collapsing the two would
+# put every non-conventional checkout at a permanent exit 3 — repeating the
+# mistake the SUMMARY_LOOKUP_UNKNOWN carve-out below exists to avoid.
 stale_unpruned_branches() {
-  cd "$MAIN_WORKTREE" || return 0
+  cd "$MAIN_WORKTREE" || {
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="refs"
+    STALE_SNAPSHOT_REASON="cannot enter the main worktree"
+    return 0
+  }
   # A non-default refspec makes the tracking-ref → remote-head mapping
   # unknowable here; decline rather than guess (origin_fetch_is_conventional).
-  origin_fetch_is_conventional || return 0
+  origin_fetch_is_conventional || { STALE_SNAPSHOT_STATE="declined"; return 0; }
+  # Decide ELIGIBILITY before touching the network (Codex P2 on #1105).
+  #
+  # A repository can have a conventional refspec and an `origin` while no
+  # local branch tracks `refs/remotes/origin/*` at all — an origin added to a
+  # local-only checkout is the ordinary case. The stale set is then provably
+  # empty from local reads alone, and consulting the remote can only fail for
+  # a question nobody asked. Taking the snapshot first made an unreachable
+  # origin turn such a run into an incomplete audit (exit 3) on the strength
+  # of an irrelevant read.
+  #
+  # So: build the eligible list from `for-each-ref` and $GONE_FILE, both
+  # purely local, and consult the remote only if that list is non-empty. An
+  # empty list is `ok` and not `unknown` — the answer IS known, and it is
+  # "nothing", established without the remote having any say.
+  ELIGIBLE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-eligible.XXXXXX") || {
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="storage"
+    STALE_SNAPSHOT_REASON="could not create the eligible-branch list (temporary storage unavailable)"
+    return 0
+  }
+  local branch upstream
+  # Tab-separated: a git ref name may contain `|` but never a tab, so the
+  # pair round-trips losslessly (the same reasoning as the merged-branch
+  # sweep records).
+  #
+  # `refname:lstrip=2` expands an ambiguous local branch name to
+  # `heads/<name>` when a tag shares its short name. The input is already
+  # constrained to refs/heads, so strip that namespace directly and retain
+  # the canonical branch name for the gone/PR lookups downstream.
+  #
+  # Derive the remote head from the FULL %(upstream) ref, never from
+  # %(upstream:short) — when a local branch literally named `origin/foo`
+  # exists, `:short` renders foo's upstream as `remotes/origin/foo` and the
+  # derived head name comes out wrong.
+  # Checked for the same reason the snapshot write below is (Codex P2 on
+  # #1105, the direct twin of that one): `mktemp` created the file, it did
+  # not promise the write will land. Unchecked, a full TMPDIR trips
+  # `set -eo pipefail` here and the run dies with a bare `printf: write
+  # error` and exit 1 — before any summary, so the documented local
+  # NOT MEASURED / exit 3 path never runs.
+  #
+  # The redirect is owned by a trailing `cat`, NOT by the brace group, and
+  # that detail is load-bearing. Measured on bash 3.2 and 5.x:
+  #
+  #   if ! { ...; } >BAD          -> status 0   (the failure is MISSED)
+  #   if ! { ...; } | cat >BAD    -> status 1   (caught)
+  #   if ! printf | awk >BAD      -> status 1   (caught — the snapshot shape)
+  #
+  # A redirection failure on a COMPOUND command does not make the `if`
+  # condition false: bash reports the error, skips the group, and the
+  # condition evaluates as success. The first draft of this guard was written
+  # that way and never fired — the run printed a clean summary and exit 0
+  # while its own eligible list had gone nowhere. Routing the write through a
+  # simple command makes the status reflect it.
+  # The git READ is taken first, on its own, so its failure is attributable
+  # (Codex P2 on #1105). Folding it into the write pipeline made `pipefail`
+  # surface an unreadable local ref database as `temporary storage
+  # unavailable`, which sent the operator to check TMPDIR for a problem in
+  # the repository. That is the cause-specific-remedy rule this PR added,
+  # broken inside the guard that introduced it: a wrong remedy is worse than
+  # a vague one because it looks actionable.
+  local branch_pairs
+  if ! branch_pairs=$(git for-each-ref \
+       --format='%(refname:lstrip=2)%09%(upstream)' refs/heads/ 2>/dev/null); then
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="refs"
+    STALE_SNAPSHOT_REASON="could not read the local branch list (git for-each-ref failed)"
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
+    return 0
+  fi
+  # Now only the WRITE can fail here, so the temp-storage reason is accurate.
+  #
+  # The redirect is owned by a trailing `cat`, NOT by the brace group, and
+  # that detail is load-bearing. Measured on bash 3.2 and 5.x:
+  #
+  #   if ! { ...; } >BAD          -> status 0   (the failure is MISSED)
+  #   if ! { ...; } | cat >BAD    -> status 1   (caught)
+  #   if ! printf | awk >BAD      -> status 1   (caught — the snapshot shape)
+  #
+  # A redirection failure on a COMPOUND command does not make the `if`
+  # condition false: bash reports the error, skips the group, and the
+  # condition evaluates as success. An earlier draft of this guard was
+  # written that way and never fired — the run printed a clean summary and
+  # exit 0 while its own eligible list had gone nowhere. Routing the write
+  # through a simple command makes the status reflect it.
+  if ! {
+    printf '%s\n' "$branch_pairs" |
+    while IFS=$'\t' read -r branch upstream; do
+      [ -n "$branch" ] || continue
+      case "$upstream" in
+        refs/remotes/origin/*) ;;
+        *) continue ;;
+      esac
+      is_gone_branch "$branch" && continue
+      printf '%s\t%s\n' "$branch" "refs/heads/${upstream#refs/remotes/origin/}"
+    done
+  } | cat >"$ELIGIBLE_FILE"; then
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="storage"
+    STALE_SNAPSHOT_REASON="could not write the eligible-branch list (temporary storage unavailable)"
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
+    return 0
+  fi
+  if [ ! -s "$ELIGIBLE_FILE" ]; then
+    STALE_SNAPSHOT_STATE="ok"
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
+    return 0
+  fi
+
   local snapshot snapshot_rc=0
   snapshot=$(git ls-remote --heads origin 2>/dev/null) || snapshot_rc=$?
-  [ "$snapshot_rc" -eq 0 ] || return 0
+  if [ "$snapshot_rc" -ne 0 ]; then
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="remote"
+    STALE_SNAPSHOT_REASON="git ls-remote --heads origin exited $snapshot_rc"
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
+    return 0
+  fi
+  STALE_SNAPSHOT_STATE="ok"
   # Trap-visible global, not a `local` (#920 finding 2): under `set -e` any
   # failure between mktemp and the inline `rm -f` below — a broken pipe, a
   # SIGINT — exits without ever reaching the removal and leaks the file.
-  HEADS_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-remoteheads.XXXXXX") || return 0
+  HEADS_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-remoteheads.XXXXXX") || {
+    # The snapshot was taken but cannot be held, and the observable result is
+    # the same as a failed query: nothing reported. It must therefore carry
+    # the same state, or it becomes this issue's silent-clean case one level
+    # further down.
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="storage"
+    STALE_SNAPSHOT_REASON="could not create the remote-heads snapshot file (temporary storage unavailable)"
+    return 0
+  }
   # `<sha>\t<refname>` per line; keep the refname column only.
-  printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$HEADS_FILE"
-  local branch upstream remote_head
-  # Git ref names may contain `|`, but cannot contain a tab. Use a tab record
-  # separator so every branch/upstream pair round-trips losslessly.
-  # `refname:short` expands an ambiguous local branch name to `heads/<name>`
-  # when a tag shares its short name. The input is already constrained to
-  # refs/heads, so strip that namespace directly and retain the canonical
-  # branch name for the gone/PR lookups below.
-  git for-each-ref --format='%(refname:lstrip=2)%09%(upstream)' refs/heads/ 2>/dev/null |
-  while IFS=$'\t' read -r branch upstream; do
-    [ -n "$branch" ] || continue
-    case "$upstream" in
-      refs/remotes/origin/*) ;;
-      *) continue ;;
-    esac
-    is_gone_branch "$branch" && continue
-    # Conventional mapping, guaranteed by origin_fetch_is_conventional above:
-    # refs/remotes/origin/<name> is populated by the remote's
-    # refs/heads/<name>. Derive it from the FULL %(upstream) ref, never from
-    # %(upstream:short) — when a local branch literally named `origin/foo`
-    # exists, `:short` renders foo's upstream as `remotes/origin/foo` and the
-    # derived head name comes out wrong.
-    remote_head="refs/heads/${upstream#refs/remotes/origin/}"
+  # Checked, not bare (Codex P2 on #1105). mktemp succeeding says the file
+  # was CREATED, not that it can be written: TMPDIR can fill, or a quota can
+  # be exhausted, between the two. Left unchecked this pipeline trips
+  # `set -eo pipefail` and kills the run with exit 1 BEFORE the summary is
+  # printed — no records, no NOT MEASURED line, no exit 3, which is precisely
+  # the silent-failure shape this PR exists to remove, reappearing one line
+  # further down.
+  if ! printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$HEADS_FILE"; then
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="storage"
+    STALE_SNAPSHOT_REASON="could not write the remote-heads snapshot (temporary storage unavailable)"
+    rm -f "$HEADS_FILE"
+    HEADS_FILE=""
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
+    return 0
+  fi
+  # The eligible list was already resolved above; each record carries the
+  # branch and the remote head that populates its tracking ref, so this pass
+  # is a pure membership test against the snapshot.
+  local remote_head
+  while IFS=$'\t' read -r branch remote_head; do
     # Exact full-path match: `-Fx` so a branch named `feat` is never
     # satisfied by the remote having `feature`.
     grep -Fxq -- "$remote_head" "$HEADS_FILE" && continue
     echo "$branch"
-  done
+  done <"$ELIGIBLE_FILE"
+  rm -f "$ELIGIBLE_FILE"
+  ELIGIBLE_FILE=""
   rm -f "$HEADS_FILE"
   HEADS_FILE=""
 }
@@ -741,18 +928,31 @@ worktree_records() {
 GONE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-gone.XXXXXX")
 REC_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-rec.XXXXXX")
 STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
+# WRITE failures to these files are a separate concern from their creation,
+# and only the ones inside stale_unpruned_branches() that the probe EVALUATES
+# through are guarded (Codex P2 on #1105, twice). Six writes are not:
+# GONE_FILE, REC_FILE (x2), MERGE_SWEEP_FILE, KNOWN_FILE, and the probe's own
+# result write `stale_unpruned_branches >"$STALE_UNPRUNED_FILE"`. All six die
+# on a full TMPDIR with a bare `printf: write error` and exit 1, before any
+# summary. That is LOUD rather than silent — nobody reads it as a clean audit,
+# which is the property exit 3 protects — so they carry no exit-3 contract and
+# are left as pre-existing behaviour rather than widened here. The spec says
+# the same thing, deliberately: the contract covers evaluation, not
+# persistence. Tracked together in #1115.
+#
 # EVERY mktemp site in this script is registered here (#920 finding 2). The
-# four later ones — HEADS_FILE and RECORDS_FILE inside the helpers above,
-# MERGE_SWEEP_FILE and KNOWN_FILE further down — used to rely solely on an
+# five later ones — HEADS_FILE, ELIGIBLE_FILE and RECORDS_FILE inside the
+# helpers above, MERGE_SWEEP_FILE and KNOWN_FILE further down — used to rely
+# solely on an
 # inline `rm -f` placed after their work. Under `set -e` any failure in
 # between (a failed `git` call, a closed pipe, SIGINT) exits before that line
 # and leaks the file into TMPDIR. The inline removals stay — they keep TMPDIR
 # tidy during a long run and they blank the variable so this trap has nothing
 # left to do — and the `${VAR:-}` expansions make the trap safe to fire before
-# any of the four has been assigned. `rm -f ''` is a silent no-op on both GNU
+# any of them has been assigned. `rm -f ''` is a silent no-op on both GNU
 # and BSD rm, so the empty slots cost nothing.
 #
-# The four names are initialised to the empty string FIRST, and that line is
+# The five names are initialised to the empty string FIRST, and that line is
 # load-bearing rather than defensive tidiness. This script runs under
 # `set -eo pipefail` with NO `set -u`, so `${HEADS_FILE:-}` does not mean
 # "unset unless this script assigned it" — it means "whatever is in scope",
@@ -767,11 +967,23 @@ STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
 # collision in the environment. Assigning here shadows any inherited value
 # before the trap is installed and keeps the trap's reach to this script's
 # own `mktemp` files.
+# Whether the one remote read this audit performs actually happened. Empty
+# until stale_unpruned_branches() runs, which is dry-run only: under --apply
+# the probe never runs, the state stays empty, and the exit-3 arm at the
+# bottom is unreachable there by construction.
+STALE_SNAPSHOT_STATE=""
+STALE_SNAPSHOT_REASON=""
+# WHERE the failed read was, so the remedy printed with it is the right one:
+# `remote` (the network read) or `local` (this machine's temporary storage).
+# Only two of the four unknown paths involve the remote at all, and one of
+# them fails AFTER a successful remote read (Codex P2 on #1105).
+STALE_SNAPSHOT_CAUSE=""
 HEADS_FILE=""
+ELIGIBLE_FILE=""
 RECORDS_FILE=""
 MERGE_SWEEP_FILE=""
 KNOWN_FILE=""
-trap 'rm -f "$GONE_FILE" "$REC_FILE" "$STALE_UNPRUNED_FILE" "${HEADS_FILE:-}" "${RECORDS_FILE:-}" "${MERGE_SWEEP_FILE:-}" "${KNOWN_FILE:-}"' EXIT
+trap 'rm -f "$GONE_FILE" "$REC_FILE" "$STALE_UNPRUNED_FILE" "${HEADS_FILE:-}" "${ELIGIBLE_FILE:-}" "${RECORDS_FILE:-}" "${MERGE_SWEEP_FILE:-}" "${KNOWN_FILE:-}"' EXIT
 
 gone_branches >"$GONE_FILE"
 worktree_records >"$REC_FILE"
@@ -1459,6 +1671,22 @@ printf "  merged+extra (review): %d\n" "${#SUMMARY_DIVERGED_KEPT[@]}"
 # Branches whose merged-PR lookup FAILED — not evaluated (gh missing /
 # unauthenticated / API error). Distinct from "gone kept (unmerged)".
 printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
+if [ "${#SUMMARY_LOOKUP_UNKNOWN[@]}" -gt 0 ]; then
+  # Deliberately does NOT name gh as the cause (Codex P2 on #1105).
+  # gh_branch_merged_pr_status() returns `unknown` for an unresolvable local
+  # ref as well — from its `rev-parse --verify` check, BEFORE gh is invoked —
+  # so "restore gh" is the wrong remedy for a branch that vanished during the
+  # sweep. Its own docstring says as much: unknown covers a missing gh, an
+  # unresolvable ref, or a failed API call. Name the possibilities and let the
+  # operator pick, rather than asserting one.
+  printf "    ^ NOT MEASURED: the merged-PR lookup did not complete for these\n"
+  printf "      branches — gh missing or unauthenticated, an API error, or a\n"
+  printf "      local ref that could not be resolved. They are not known to be\n"
+  printf "      unmerged; they were not evaluated. Resolve the cause and re-run\n"
+  printf "      before treating them as examined. This class does not change\n"
+  printf "      the exit status: it is reported rather than silent, and a\n"
+  printf "      gh-less machine would otherwise never exit anything else.\n"
+fi
 # Branches whose remote-tracking ref is stale rather than genuinely gone —
 # a `git branch -vv` false-negative this run would otherwise retain silently
 # (#822). Dry-run only, so this counter is always 0 under --apply — but the
@@ -1478,6 +1706,40 @@ printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
 # stale_unpruned_branches() skips anything already in GONE_FILE. So the array
 # length IS the branch count; nothing here needs de-duplicating.
 printf "  gone (stale remote ref, unpruned): %d\n" "${#SUMMARY_STALE_UNPRUNED[@]}"
+# ...and, when that counter is not a measurement at all, say so on the line
+# after it (#992). Without this the number 0 carries two incompatible
+# meanings — "no branch is in this state" and "this could not be checked" —
+# and only the first is what a reader takes from it.
+if [ "$STALE_SNAPSHOT_STATE" = "unknown" ]; then
+  printf "    ^ NOT MEASURED: %s\n" "$STALE_SNAPSHOT_REASON"
+  printf "      The count above is 0 because nothing was checked — not because\n"
+  printf "      nothing is stale.\n"
+  # The remedy has to match the failure. Three of the four unknown paths are
+  # LOCAL (an unenterable worktree, or a `mktemp` that failed because TMPDIR
+  # is unwritable or full), and one of those fails AFTER the remote has been
+  # read successfully. Printing "re-run once the remote is reachable" for a
+  # full /tmp sends the operator to fix a network that was never broken
+  # (Codex P2 on #1105).
+  case "$STALE_SNAPSHOT_CAUSE" in
+    remote)
+      printf "      The REMOTE could not be read. Re-run once it is reachable\n"
+      printf "      before trusting this audit (exit 3).\n" ;;
+    storage)
+      printf "      This is a LOCAL failure, not a remote one — the audit could\n"
+      printf "      not allocate or write its own working state. Check that\n"
+      printf "      TMPDIR (%s) is writable and has free\n" "${TMPDIR:-/tmp}"
+      printf "      space, then re-run before trusting this audit (exit 3).\n" ;;
+    refs)
+      printf "      This is a LOCAL failure, not a remote one, and NOT a\n"
+      printf "      temporary-storage one — this repository's own refs could\n"
+      printf "      not be read. Check the repository (git for-each-ref\n"
+      printf "      refs/heads/) rather than TMPDIR or the network, then\n"
+      printf "      re-run before trusting this audit (exit 3).\n" ;;
+    *)
+      printf "      The audit could not complete this check. Resolve the cause\n"
+      printf "      named above, then re-run before trusting it (exit 3).\n" ;;
+  esac
+fi
 printf "  open-PR retained: %d\n" "${#SUMMARY_OPEN_PR[@]}"
 printf "  orphan dirs:      %d\n" "${#SUMMARY_ORPHAN[@]}"
 
@@ -1540,6 +1802,43 @@ if [ "$total_candidates" -gt 0 ]; then
   echo "${C_DIM}Dry run. Re-run with --apply to remove safe candidates.${C_RESET}"
   echo "${C_DIM}  --force-locked   also remove LOCKED entries (#288)${C_RESET}"
   echo "${C_DIM}  --orphan-clean   also rm -rf orphans under .claude/worktrees/${C_RESET}"
+fi
+# An incomplete audit outranks a complete one with findings (#992). Both the
+# hint above and the candidate list stay exactly as they were — the operator
+# still gets everything the run DID establish — but the status says the
+# report has a hole in it, because the alternative is a preview that reports
+# clean and an --apply that then acts on branches the preview never listed.
+#
+# Ordering: 3 wins over 2 when both hold. 2 asserts the audit was COMPLETE,
+# and that assertion is the one thing an unreadable remote makes false; the
+# findings themselves are equally real either way.
+#
+# Only `unknown` reaches here, never `declined`: see stale_unpruned_branches().
+#
+# SUMMARY_LOOKUP_UNKNOWN deliberately does NOT reach exit 3 either, and the
+# reason is the distinction this whole change turns on (Codex P2 on #1105
+# raised the apparent inconsistency; this is the answer).
+#
+# #992 is about SILENCE, not about incompleteness as such. The snapshot
+# failure was silent: the counter read `0`, which is byte-identical to a
+# genuinely clean tree, so the report asserted something it had not measured.
+# A failed merged-PR lookup is the opposite — it has its own counter, its own
+# per-branch records, and now its own NOT MEASURED annotation. It announces
+# itself. Nothing about it is mistakable for a clean result.
+#
+# Folding it in would also silently reverse the deliberate carve-out argued
+# one block up: on a gh-less or unauthenticated machine EVERY gone branch is
+# unknown, and that machine would then never see anything but exit 3 — the
+# same unusability the carve-out exists to prevent, re-entered through a
+# different code. Reversing a recorded decision as a side effect of a PR
+# about a different read is not something to do quietly.
+#
+# Whether an announced-but-unevaluated branch DESERVES its own status is a
+# real question, and it is tracked separately rather than settled here.
+if [ "$STALE_SNAPSHOT_STATE" = "unknown" ]; then
+  exit 3
+fi
+if [ "$total_candidates" -gt 0 ]; then
   exit 2
 fi
 exit 0
