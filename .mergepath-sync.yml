@@ -192,8 +192,8 @@ consumers:
   # 9943173ca2b532359d619ffeadda93daf9f9cf43, the hub has 115 kit blobs and
   # this consumer holds 110 hub-known entries. Follow the canonical per-wave
   # selection and fan-out gates in docs/agents/propagation-ordering.md.
-  - name: gaycruisebingo
-    repo: nathanjohnpayne/gaycruisebingo
+  - name: fiveacross
+    repo: nathanjohnpayne/fiveacross
     visibility: public
     facts:
       frameworks: [react, typescript]
@@ -1688,7 +1688,7 @@ paths:
   #   nathanpaynedotcom (ESM)          → JS + TS + Astro
   #   tadlockpsychiatry (ESM)          → JS + TS + React + react-hooks
   #   device-source-of-truth (ESM)     → JS + TS + React + react-hooks
-  #   gaycruisebingo (ESM)             → JS + TS + React + react-hooks
+  #   fiveacross (ESM)                 → JS + TS + React + react-hooks
   #   friends-and-family-billing (CJS) → JS + React + react-hooks
   #   overridebroadway (CJS)           → JS + TS + React + react-hooks
   #   swipewatch (CJS)                 → JS baseline only
@@ -1703,7 +1703,7 @@ paths:
       - nathanpaynedotcom
       - tadlockpsychiatry
       - device-source-of-truth
-      - gaycruisebingo
+      - fiveacross
 
   # CJS variant — consumers without `"type": "module"` (default
   # CJS resolution). Same body as the ESM variant; only the

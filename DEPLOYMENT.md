@@ -64,7 +64,7 @@ The full bootstrap loop runs across each repo the bootstrap wizard has provision
 - swipewatch
 - nathanpaynedotcom
 - overridebroadway
-- gaycruisebingo
+- fiveacross
 <!-- bootstrap-loop-list-end -->
 
 Run the bootstrap script across all of them:
