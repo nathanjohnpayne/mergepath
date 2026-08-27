@@ -2603,24 +2603,40 @@ ledger_paths() {
 # before the bot's latest re-raise dispositioned the earlier round, not the
 # live one. FAIL CLOSED throughout: an absent ledger, a malformed line (jq -s
 # errors on the whole file), or an unusable id all read as "no evidence".
+#
+# The fail-closed status is deliberately the same either way — no evidence
+# means the thread stays unresolved regardless of WHY. But "the ledger has no
+# row for this finding" and "the ledger could not be read at all" are not the
+# same operator problem (#1002): the append-only logs are written by two
+# scripts across many sessions, so one interrupted write or one partial line
+# from a killed process silently loses every row in the file to a single `jq
+# -s` parse failure. `jq -e -s` distinguishes the two on exit status alone —
+# 1 is "parsed fine, no row matched"; anything else is jq itself failing to
+# read the file — so a WARN naming the file is cheap and, unlike the SKIP
+# reason printed by callers, tells the operator something they can fix in a
+# second.
 ledger_verdict_for_finding() {
-  local cid="$1" floor="$2" f
+  local cid="$1" floor="$2" f rc
   case "$cid" in
     ''|null|*[!0-9]*) return 1 ;;
   esac
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     [ -f "$f" ] || continue
-    if jq -e -s --argjson cid "$cid" --arg repo "$REPO" --arg floor "$floor" '
+    rc=0
+    jq -e -s --argjson cid "$cid" --arg repo "$REPO" --arg floor "$floor" '
           any(.[];
             (.comment_id == $cid)
             and (.repo == $repo)
             and (((.verdict // "") | tostring) != "")
             and (((.recorded_at // "") | tostring) != "")
             and ($floor == "" or (.recorded_at > $floor)))
-        ' "$f" >/dev/null 2>&1; then
+        ' "$f" >/dev/null 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
       printf '%s' "$f"
       return 0
+    elif [ "$rc" -ne 1 ]; then
+      echo "WARN: ledger $f could not be parsed (jq exit $rc); treating finding $cid as having no recorded verdict there" >&2
     fi
   done <<EOF
 $(ledger_paths)

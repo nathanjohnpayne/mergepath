@@ -2042,6 +2042,49 @@ else
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 35 (#1002): a malformed ledger line reads as "no evidence" (fail
+# closed, unchanged) but now WARNS naming the file, instead of looking
+# identical to "the ledger simply has no row for this finding".
+#
+# `jq -e -s` slurps the WHOLE file before the predicate runs, so one bad
+# line anywhere in an append-only, multi-writer JSONL log costs every row
+# in it, not just the malformed one. The ledger below carries one VALID
+# row for a different finding (99999, proving the file is otherwise
+# readable data, not just empty) plus one line that is not JSON at all.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 35: an unparseable ledger WARNs naming the file, instead of reading as silent no-evidence (#1002)"
+
+T35_LEDGER="$SCRATCH/t35-codex-ledger.jsonl"
+{
+  jq -nc '{pr_number:778,repo:"test/repo",comment_id:99999,priority:"P1",verdict:"+1",
+           reaction:"+1",location:"pull_request_review_comment",action:"posted",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+  echo 'not a json line at all'
+} > "$T35_LEDGER"
+
+set +e
+out=$(run_t990 "$SCRATCH/t35.log" "$(t990_threads "$T990_B_BARE")" \
+        CODEX_FEEDBACK_LEDGER="$T35_LEDGER")
+rc=$?
+set -e
+
+t35_resolved=$(resolved_threads "$SCRATCH/t35.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 3 ] \
+   && [ "$t35_resolved" = "PRT_990A " ] \
+   && grep -qF "WARN: ledger $T35_LEDGER could not be parsed" <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out" \
+   && ! grep -q 'verdict for finding' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: malformed ledger fails closed AND warns naming the file"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: malformed ledger did not warn or did not fail closed correctly (rc=$rc, resolved='$t35_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"
