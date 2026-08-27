@@ -3324,6 +3324,66 @@ else
   pass "bootstrap::_remove_orphans reconciles a NESTED occurrence of a post-mirror orphan, not just the root one (#1056 Codex P2 round 16)"
 fi
 
+# ---------------------------------------------------------------------------
+# CodeRabbit on #1112 round 16: a target of "/" (or "//", "///", ...)
+# normalizes to the EMPTY STRING by the trailing-slash-strip loop above.
+# Nothing else catches that: `mkdir -p ""` fails but isn't checked,
+# `[ -L "" ]` is false, and the final `rsync -a --delete ... "$target/"`
+# would become `rsync -a --delete ... "/"` -- mirroring over the
+# filesystem root. SAFETY: this test stubs `rsync` itself as a harmless
+# no-op recorder before sourcing the lib, so even if the guard being
+# tested were broken, no real rsync invocation -- let alone one against
+# "/" -- can ever actually run; the assertion is on whether the stub was
+# invoked, not on trusting the guard to have already worked.
+# ---------------------------------------------------------------------------
+rootguard_src="$(mktemp -d "$WORKDIR/rsync-rootguard-src.XXXXXX")"
+mkdir -p "$rootguard_src/docs/agents"
+printf 'readme\n' > "$rootguard_src/README.md"
+printf 'canonical\n' > "$rootguard_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$rootguard_src/docs/agents/bootstrap-runbook.md"
+cat >"$rootguard_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+# Invoked as `bootstrap::_rsync_template ... || step_rc=$?`, matching the
+# real call site (bootstrap::stage_template_mirror) exactly: per bash's own
+# errexit semantics, a command tested by `||` runs with `set -e` disabled
+# for its own duration, so an unchecked `mkdir -p ""` failure inside the
+# function does NOT abort it there -- only an explicit guard does. A plain
+# non-`||` invocation (as this test used originally) would stop at that
+# mkdir failure for an unrelated reason, masking whether the guard itself
+# is what's protecting the real call path.
+set +e
+rootguard_step_rc=0
+rootguard_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  rsync() { echo "RSYNC-STUB-CALLED: $*" >&2; return 0; }
+  source "$1"
+  step_rc=0
+  bootstrap::_rsync_template "$2" "$3" || step_rc=$?
+  echo "STEP_RC=$step_rc"
+' _ "$MIRROR_LIB" "$rootguard_src" "///" 2>&1)
+rootguard_rc=$?
+set -e
+rootguard_step_rc=$(printf '%s' "$rootguard_out" | sed -n 's/^STEP_RC=//p')
+if [ "$rootguard_rc" != "0" ]; then
+  fail "the test harness itself failed (rc=$rootguard_rc), not bootstrap::_rsync_template: $rootguard_out"
+elif [ "$rootguard_step_rc" = "0" ]; then
+  fail "rsync with a target normalizing to the filesystem root should have been refused but succeeded (step_rc=0)"
+elif printf '%s' "$rootguard_out" | grep -q "RSYNC-STUB-CALLED"; then
+  fail "the rsync stub was invoked despite a target normalizing to the filesystem root -- the guard did not prevent it: $rootguard_out"
+elif ! printf '%s' "$rootguard_out" | grep -q "filesystem root"; then
+  fail "rsync with a root-normalizing target (step_rc=$rootguard_step_rc) failed for an unrelated reason: $rootguard_out"
+else
+  pass "bootstrap::_rsync_template refuses a target that normalizes to the filesystem root, even under the real || step_rc=\$? call site convention (#1056 CodeRabbit round 16)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

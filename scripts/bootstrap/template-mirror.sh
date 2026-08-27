@@ -1315,6 +1315,21 @@ bootstrap::_rsync_template() {
     target="${target%/}"
   done
 
+  # CodeRabbit on #1112 round 16: a target of "/" (or "//", "///", ...)
+  # normalizes to the EMPTY STRING by the loop above. `mkdir -p ""` fails
+  # but isn't checked, and `[ -L "" ]` is false -- bootstrap::_reconcile_excluded_residue's
+  # own `find "" ...` failure (caught by its `|| return $?` call below)
+  # happens to already stop this before the final `rsync -a --delete
+  # "$source_root/" "$target/"` (which would become `... "/"`, mirroring
+  # over the filesystem root) is ever reached, but that is an accidental
+  # side effect of find's own behavior on an empty path, not an explicit
+  # invariant of this function. Refuse outright, with an actionable error
+  # message, before anything else runs.
+  if [ -z "$target" ]; then
+    bootstrap::err "template-mirror: refusing to rsync into the filesystem root (target normalized to an empty path)"
+    return 1
+  fi
+
   # Codex P1 on #1112 round 9: --delete, not a bare mirror. A --resume
   # re-enters this stage from the top against a target that may already
   # carry a prior attempt's output — a path present then but removed from
