@@ -284,6 +284,23 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   '.bootstrap-state'
 )
 
+# Entries of BOOTSTRAP_MIRROR_EXCLUDES that bootstrap::_reconcile_excluded_residue
+# (#1112 round 10) must never remove from the target, even though they are
+# excluded from the rsync transfer: the target's own repository, the
+# wizard's own resume bookkeeping, and operator-local .claude/ config the
+# OPERATOR may have set up for the target itself between a stage failure
+# and --resume. Everything else in BOOTSTRAP_MIRROR_EXCLUDES is mergepath-
+# hub-only content that must never exist in a consumer under any
+# circumstance, so stale residue at those paths is always safe to remove.
+BOOTSTRAP_MIRROR_RECONCILE_PROTECTED=(
+  '.git/'
+  '.bootstrap-log'
+  '.bootstrap-state'
+  '.claude/worktrees/'
+  '.claude/settings.local.json'
+  '.claude/launch.json'
+)
+
 # Files that rsync leaves behind because they don't match an exclude
 # pattern but shouldn't ship to a new repo. Post-mirror cleanup.
 BOOTSTRAP_POST_MIRROR_REMOVE=(
@@ -1075,6 +1092,89 @@ bootstrap::_reject_symlink_ancestors() {
   done
 }
 
+# bootstrap::_path_matches_any <path> <pattern...> — true when <path>
+# matches one of the given BOOTSTRAP_MIRROR_EXCLUDES-style patterns (a
+# trailing `/` = directory prefix, a bare basename with no `/` = matches
+# anywhere by basename, anything else = exact path). Factored out of
+# bootstrap::_resolve_canonical_source_sha (#1112 round 10) so a rename
+# record's two sides can each be checked against the same pattern set
+# without duplicating the match logic.
+bootstrap::_path_matches_any() {
+  local check_path=$1
+  shift
+  local check_base="${check_path##*/}"
+  local check_pattern
+  for check_pattern in "$@"; do
+    case "$check_pattern" in
+      */)
+        case "$check_path" in
+          "$check_pattern"* | *"/$check_pattern"*) return 0 ;;
+        esac
+        ;;
+      */*)
+        [ "$check_path" = "$check_pattern" ] && return 0
+        ;;
+      *)
+        [ "$check_base" = "$check_pattern" ] && return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+# bootstrap::_reconcile_excluded_residue <target> — a resumed Stage B may
+# already carry receiver-only content at a path BOOTSTRAP_MIRROR_EXCLUDES
+# names (Codex P2 on #1112 round 10): rsync's --delete (round 9) does not
+# touch a destination path matching an active --exclude, by rsync's own
+# default, so residue at an excluded path (e.g. a stale packaging/leftover
+# from a mirror run before that path was excluded) survives untouched and
+# the later `git add -A` commits it while attribution still names a clean
+# source HEAD. Remove it explicitly, skipping BOOTSTRAP_MIRROR_RECONCILE_PROTECTED
+# -- target-local state that must persist across resumes regardless of what
+# the exclude array says. Bare-basename patterns are found via `find`,
+# which never descends into a symlinked directory without -L, so this
+# cannot be tricked into deleting outside target through a symlink swap;
+# directory/exact-path patterns reuse the same ancestor-symlink guard the
+# hub-only-doc removal below already relies on.
+bootstrap::_reconcile_excluded_residue() {
+  local target=$1
+  local pattern protected is_protected
+
+  for pattern in "${BOOTSTRAP_MIRROR_EXCLUDES[@]}"; do
+    is_protected=false
+    for protected in "${BOOTSTRAP_MIRROR_RECONCILE_PROTECTED[@]}"; do
+      if [ "$pattern" = "$protected" ]; then
+        is_protected=true
+        break
+      fi
+    done
+    [ "$is_protected" = true ] && continue
+
+    case "$pattern" in
+      */)
+        local dir="${pattern%/}"
+        if [ -e "$target/$dir" ] || [ -L "$target/$dir" ]; then
+          bootstrap::_reject_symlink_ancestors "$target" "$dir" || return $?
+          bootstrap::run "reconcile excluded residue $pattern" rm -rf -- "$target/$dir" \
+            || return $?
+        fi
+        ;;
+      */*)
+        if [ -e "$target/$pattern" ] || [ -L "$target/$pattern" ]; then
+          bootstrap::_reject_symlink_ancestors "$target" "$pattern" || return $?
+          bootstrap::run "reconcile excluded residue $pattern" rm -f -- "$target/$pattern" \
+            || return $?
+        fi
+        ;;
+      *)
+        bootstrap::run "reconcile excluded residue $pattern" \
+          find "$target" -name '.git' -prune -o -name "$pattern" -exec rm -rf -- {} + \
+          || return $?
+        ;;
+    esac
+  done
+}
+
 bootstrap::_rsync_template() {
   local source_root=$1
   local target=$2
@@ -1115,6 +1215,8 @@ bootstrap::_rsync_template() {
   done <<< "$derived"
 
   mkdir -p "$target"
+
+  bootstrap::_reconcile_excluded_residue "$target" || return $?
 
   # Exclusion prevents a new transfer but does not delete receiver residue.
   # A resumed Stage B may already carry a doc copied before its ownership was
@@ -1332,29 +1434,40 @@ bootstrap::_resolve_canonical_source_sha() {
       combined_excludes+=("$hub_doc")
     done <<<"$derived_hub_only"
 
-    local line path base pattern excluded is_dirty=false
+    # Codex P2 on #1112 round 10: a rename/copy record's porcelain line is
+    # "XY old -> new" on ONE line, not a single path. Slicing off the 3-char
+    # status prefix and taking "${path##*/}" for basename matching then
+    # reduces the WHOLE "old -> new" string to new's basename -- so a
+    # tracked rename whose destination basename happens to match a bare
+    # exclude pattern (e.g. `README.md -> x/.DS_Store`) was excused
+    # entirely, even though the source path (README.md, real tracked
+    # content) is gone from the mirror and the destination is excluded from
+    # it too: the content simply vanishes from the target while HEAD still
+    # has it. Check the OLD and NEW sides independently on a rename/copy
+    # record (status code contains R or C) and require BOTH excluded before
+    # excusing the record; a non-rename line checks the same single path
+    # twice, unchanged from before this round.
+    local line code rest old_path new_path is_dirty=false
     while IFS= read -r line; do
       [ -n "$line" ] || continue
-      path="${line:3}"
-      base="${path##*/}"
-      excluded=false
-      for pattern in "${combined_excludes[@]}"; do
-        case "$pattern" in
-          */)
-            case "$path" in
-              "$pattern"* | *"/$pattern"*) excluded=true ;;
-            esac
-            ;;
-          */*)
-            [ "$path" = "$pattern" ] && excluded=true
-            ;;
-          *)
-            [ "$base" = "$pattern" ] && excluded=true
-            ;;
-        esac
-        [ "$excluded" = true ] && break
-      done
-      [ "$excluded" = true ] || is_dirty=true
+      code="${line:0:2}"
+      rest="${line:3}"
+      case "$code" in
+        *R*|*C*)
+          old_path="${rest%% -> *}"
+          new_path="${rest#* -> }"
+          ;;
+        *)
+          old_path="$rest"
+          new_path="$rest"
+          ;;
+      esac
+      if bootstrap::_path_matches_any "$old_path" "${combined_excludes[@]}" \
+        && bootstrap::_path_matches_any "$new_path" "${combined_excludes[@]}"; then
+        :
+      else
+        is_dirty=true
+      fi
     done <<<"$status_output"
     [ "$is_dirty" = false ] || return 1
   fi

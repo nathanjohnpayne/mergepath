@@ -2572,6 +2572,103 @@ playground_dirty_subject=$(git -C "$PLAYGROUND_DIRTY_TARGET" log -1 --format=%s)
   && pass "an uncommitted edit to tests/test_mergepath_playground.sh does not block attribution (#1056 Codex P2 round 9)" \
   || fail "playground-dirty source_root wrongly blocked attribution: $playground_dirty_subject (expected sha ${PLAYGROUND_DIRTY_SHA:0:7})"
 
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 10: a git rename record's porcelain line is
+# "R  old -> new" on ONE line. Slicing off the 3-char status prefix and
+# taking the basename of the WHOLE remainder reduces a rename whose
+# destination basename matches a bare exclude pattern to that basename
+# alone, excusing the record even though the source path is real tracked
+# content the mirror now has nowhere to put: a `README.md -> subdir/.DS_Store`
+# rename leaves the mirror with NEITHER README.md (renamed away) NOR
+# subdir/.DS_Store (excluded), silently dropping tracked content from a
+# target the resolver still attributes to the clean HEAD. Reproduce the
+# exact case Codex named: stage that rename, assert attribution falls back.
+# ---------------------------------------------------------------------------
+RENAME_DIRTY_SOURCE="$WORKDIR/rename-dirty-repo"
+mkdir -p "$RENAME_DIRTY_SOURCE/subdir"
+git -C "$RENAME_DIRTY_SOURCE" init -q -b main
+git -C "$RENAME_DIRTY_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+printf 'hello world content for rename detection padding padding padding\n' >"$RENAME_DIRTY_SOURCE/README.md"
+git -C "$RENAME_DIRTY_SOURCE" add -A
+git -C "$RENAME_DIRTY_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "rename-dirty-repo seed"
+git -C "$RENAME_DIRTY_SOURCE" update-ref refs/remotes/origin/main HEAD
+git -C "$RENAME_DIRTY_SOURCE" mv README.md subdir/.DS_Store
+# Confirm the fixture actually produces the rename-record shape this test
+# depends on -- a same-content rename below git's similarity threshold
+# would show as a plain add+delete pair instead, silently changing what
+# the test exercises.
+if ! git -C "$RENAME_DIRTY_SOURCE" status --porcelain | grep -q '^R  README.md -> subdir/\.DS_Store$'; then
+  fail "rename-dirty fixture did not stage as a single R record: $(git -C "$RENAME_DIRTY_SOURCE" status --porcelain)"
+fi
+RENAME_DIRTY_TARGET="$WORKDIR/rename-dirty-target"
+mkdir -p "$RENAME_DIRTY_TARGET"
+echo seed >"$RENAME_DIRTY_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$RENAME_DIRTY_TARGET" "$RENAME_DIRTY_SOURCE" >/dev/null
+
+rename_dirty_subject=$(git -C "$RENAME_DIRTY_TARGET" log -1 --format=%s)
+[ "$rename_dirty_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a staged rename to an excluded basename (README.md -> subdir/.DS_Store) blocks attribution (#1056 Codex P2 round 10)" \
+  || fail "rename-dirty source_root wrongly got attribution: $rename_dirty_subject"
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 10: --delete (round 9) does not touch a
+# destination path matching an active --exclude, by rsync's own default, so
+# residue at an EXCLUDED path from an older mirror survives a resumed
+# _rsync_template untouched and the later commit records it. Drive
+# _rsync_template directly against a target carrying stale residue at a
+# mergepath-only excluded path (packaging/) and assert it is removed, while
+# a paired target carrying a live .git/ (simulating a resume AFTER
+# _init_target_git already ran once) proves BOOTSTRAP_MIRROR_RECONCILE_PROTECTED
+# holds -- the reconciliation must never delete the target's own repo.
+# ---------------------------------------------------------------------------
+reconcile_src="$(mktemp -d "$WORKDIR/rsync-reconcile-src.XXXXXX")"
+reconcile_dst="$(mktemp -d "$WORKDIR/rsync-reconcile-dst.XXXXXX")"
+mkdir -p "$reconcile_src/docs/agents"
+printf 'readme\n' > "$reconcile_src/README.md"
+printf 'canonical\n' > "$reconcile_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$reconcile_src/docs/agents/bootstrap-runbook.md"
+cat >"$reconcile_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+mkdir -p "$reconcile_dst/packaging" "$reconcile_dst/.git"
+printf 'stale leftover from a mirror run before packaging/ was excluded\n' \
+  > "$reconcile_dst/packaging/stale.txt"
+printf 'must survive -- this IS the targets own repository\n' \
+  > "$reconcile_dst/.git/HEAD"
+set +e
+reconcile_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$reconcile_src" "$reconcile_dst" 2>&1)
+reconcile_rc=$?
+set -e
+if [ "$reconcile_rc" != "0" ]; then
+  fail "rsync with excluded-residue reconciliation failed (rc=$reconcile_rc): $reconcile_out"
+elif [ -e "$reconcile_dst/packaging/stale.txt" ]; then
+  fail "residue at an excluded path (packaging/stale.txt) survived a resumed mirror -- excluded-path reconciliation is not wired in"
+else
+  pass "bootstrap::_rsync_template reconciles residue at an excluded path from an older mirror (#1056 Codex P2 round 10)"
+fi
+[ "$(cat "$reconcile_dst/.git/HEAD" 2>/dev/null)" = "must survive -- this IS the targets own repository" ] \
+  && pass "excluded-residue reconciliation never touches the target's own .git/ (BOOTSTRAP_MIRROR_RECONCILE_PROTECTED)" \
+  || fail ".git/HEAD was modified or removed by excluded-residue reconciliation -- BOOTSTRAP_MIRROR_RECONCILE_PROTECTED is not honored"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"
