@@ -1277,6 +1277,45 @@ done <"$MERGE_SWEEP_FILE"
 rm -f "$MERGE_SWEEP_FILE"
 MERGE_SWEEP_FILE=""
 
+# Is $1 one of the worktree paths git currently has registered?
+#
+# The membership set ($KNOWN_FILE) is NUL-delimited, and this comparison is
+# what keeps it that way end to end (#992). The previous spelling
+# re-serialised the set with `printf %s\\n` and tested it with `grep -Fxq`,
+# which silently undid the reason worktree_records() emits NUL at all: a
+# worktree path may contain any byte git allows, INCLUDING a literal newline,
+# and such a path landed in the set as two independent LINE records.
+#
+# Both directions of that break are wrong, in opposite ways:
+#
+#   ineffective  a genuine orphan whose name equals one of the split
+#                fragments matches the fragment, is read as registered, and
+#                is never reported or cleaned. Reproduced on #991 head with
+#                registered `<root>/foo\nbar` beside orphan `<root>/foo`.
+#   DESTRUCTIVE  a registered worktree whose own path contains a newline
+#                fails its own membership test, is classified an orphan, and
+#                under --orphan-clean is `rm -rf`d. This is the direction
+#                that loses data, and it is why the fix is a whole-record
+#                comparison rather than a better pattern.
+#
+# A shell-level loop, not `grep -z -Fxq`: `grep -z` is a GNU extension and
+# BSD/macOS grep has no equivalent, so a pattern-based NUL comparison would
+# be portable only where the audit is least likely to run. The path counts
+# here are worktree counts — tens, not thousands — so the quadratic shape is
+# irrelevant next to the `pwd -P` and `git` calls surrounding it.
+#
+# Reads $KNOWN_FILE from the caller rather than taking it as an argument, to
+# match is_gone_branch()/branch_checked_out() above, which read $GONE_FILE
+# and $REC_FILE the same way.
+known_path_registered() {
+  local target="$1" known
+  [ -n "${KNOWN_FILE:-}" ] || return 1
+  while IFS= read -r -d '' known; do
+    [ "$known" = "$target" ] && return 0
+  done <"$KNOWN_FILE"
+  return 1
+}
+
 # ── Orphan scan ───────────────────────────────────────────────────────
 ORPHAN_ROOT="$MAIN_WORKTREE/.claude/worktrees"
 if [ -d "$ORPHAN_ROOT" ]; then
@@ -1290,8 +1329,8 @@ if [ -d "$ORPHAN_ROOT" ]; then
   # not match a sibling path `/foobar`.
   ORPHAN_ROOT_PHYS_TS="${ORPHAN_ROOT_PHYS%/}/"
 
-  # Collect known worktree paths into a set (one per line) and check each
-  # subdir against it. REC_FILE is NUL-delimited: parsing it with awk or grep
+  # Collect known worktree paths into a NUL-delimited set and check each
+  # subdir against it with known_path_registered() above. REC_FILE is NUL-delimited: parsing it with awk or grep
   # treats it as binary on some platforms and silently drops registered paths,
   # which can turn an active .claude/worktrees checkout into an orphan-clean
   # deletion candidate. Consume all six fields so the next record stays
@@ -1306,7 +1345,7 @@ if [ -d "$ORPHAN_ROOT" ]; then
     && IFS= read -r -d '' known_head \
     && IFS= read -r -d '' known_locked \
     && IFS= read -r -d '' known_lock_reason; do
-    printf '%s\n' "$known_path"
+    printf '%s\0' "$known_path"
   done <"$REC_FILE" >"$KNOWN_FILE"
   for d in "$ORPHAN_ROOT"/*; do
     [ -d "$d" ] || continue
@@ -1326,7 +1365,31 @@ if [ -d "$ORPHAN_ROOT" ]; then
     # Resolve to physical path so the orphan comparison aligns with how
     # git records worktree paths in `git worktree list` (it canonicalizes
     # symlinked roots like /var/folders → /private/var/folders on macOS).
-    abs=$(cd "$d" 2>/dev/null && pwd -P) || continue
+    #
+    # The `printf X` sentinel is load-bearing, not a flourish. Command
+    # substitution strips EVERY trailing newline from its output, so a plain
+    # `abs=$(cd "$d" && pwd -P)` silently truncates a path whose own final
+    # component ends in a newline — a name git and the filesystem both allow.
+    # The membership set is NUL-delimited and keeps that byte, so the
+    # truncated value would fail to match its own registered record, and the
+    # registered checkout would be classified an ORPHAN. Under
+    # --orphan-clean the `rm -rf` below then targets the TRUNCATED path:
+    # either a no-op recorded as a successful removal, so every later audit
+    # repeats the false finding, or — if a sibling happens to occupy that
+    # exact name — the deletion of an unrelated directory.
+    #
+    # `pwd -P` emits `<path>\n`, so with the sentinel the substitution sees
+    # `<path>\nX`, has no trailing newline to strip, and both removals below
+    # are exact: strip the sentinel, then strip the single newline `pwd`
+    # itself added. Whatever trailing newlines belong to the PATH survive.
+    #
+    # Found by Codex on #1103. It is a regression this PR would otherwise
+    # have introduced: with the previous line-delimited set, `grep -Fxq`
+    # matched the truncated value against the record`s first line and the
+    # entry was (accidentally) treated as registered.
+    abs=$(cd "$d" 2>/dev/null && pwd -P && printf X) || continue
+    abs="${abs%X}"
+    abs="${abs%$'\n'}"
 
     # Defense in depth #2: even though $d itself isn't a symlink, its
     # physical path MIGHT be outside ORPHAN_ROOT_PHYS if a parent in
@@ -1346,7 +1409,7 @@ if [ -d "$ORPHAN_ROOT" ]; then
         ;;
     esac
 
-    if ! grep -Fxq -- "$abs" "$KNOWN_FILE"; then
+    if ! known_path_registered "$abs"; then
       print_record "[ORPHAN .claude/worktrees]" "$C_RED" \
         "$abs" "" "" "[orphan]" "" ""
       SUMMARY_ORPHAN+=("$abs")
@@ -1398,8 +1461,14 @@ printf "  merged+extra (review): %d\n" "${#SUMMARY_DIVERGED_KEPT[@]}"
 printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
 # Branches whose remote-tracking ref is stale rather than genuinely gone —
 # a `git branch -vv` false-negative this run would otherwise retain silently
-# (#822). Dry-run only; --apply prunes before classification so this is
-# always 0 there. Each of these ALSO appears in exactly one bucket above
+# (#822). Dry-run only, so this counter is always 0 under --apply — but the
+# reason is that the PROBE is dry-run-gated, NOT that --apply pruned the
+# class away before classification. NOTHING in this script prunes: see the
+# rule-4 header block and the `if [ "$MODE" = "dry-run" ]` guard on
+# stale_unpruned_branches(). Teaching --apply to act on this class is #932.
+# An earlier revision of this comment asserted the prune, describing
+# apply-mode behaviour that has never existed and that a future author could
+# have built on (#934). Each of these ALSO appears in exactly one bucket above
 # (merged branches / gone kept / merged+extra / gone unverified) by its
 # actual merged-PR status — this counter exists so the unpruned-ref CLASS
 # itself is never invisible, even though it is not a distinct disposition.

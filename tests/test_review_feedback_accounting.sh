@@ -1475,6 +1475,34 @@ assert_eq 2 "$FINGERPRINT_RC" "feedback-surface fingerprint preserves API failur
 assert_match 'failed to fetch review objects' "$FINGERPRINT_ERROR" \
   "feedback-surface fingerprint preserves API failure detail"
 
+# #1088: the fetch case above is one of THREE gh_api_array failure kinds
+# (fetch, flatten, shape — scripts/lib/gh-api-array.sh). A fix scoped to only
+# the fetch path would leave the other two free to regress back into the
+# unbound-variable trace #1089 removed.
+reset_fixtures
+printf 'not valid json\n' >"$TMP/fixtures/reviews.json"
+set +e
+FINGERPRINT_FLATTEN_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_FLATTEN_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_FLATTEN_RC" "feedback-surface fingerprint preserves flatten failure status"
+assert_match 'failed to flatten review objects pagination output' "$FINGERPRINT_FLATTEN_ERROR" \
+  "feedback-surface fingerprint preserves flatten failure detail"
+
+reset_fixtures
+printf '{"message":"Bad credentials"}\n' >"$TMP/fixtures/reviews.json"
+set +e
+FINGERPRINT_SHAPE_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_SHAPE_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_SHAPE_RC" "feedback-surface fingerprint preserves shape failure status"
+assert_match 'came back as .*not a stream of JSON arrays' "$FINGERPRINT_SHAPE_ERROR" \
+  "feedback-surface fingerprint preserves shape failure detail"
+
 reset_fixtures
 jq '. + [{
   "id": 9900,
