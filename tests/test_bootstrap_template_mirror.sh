@@ -374,6 +374,7 @@ git -C "$FAKE_MP" init -q
 git -C "$FAKE_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false add -A
 git -C "$FAKE_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "fixture: initial"
 git -C "$FAKE_MP" branch -M main 2>/dev/null || true
+FAKE_MP_SHA=$(git -C "$FAKE_MP" rev-parse HEAD)
 
 # --- runners --------------------------------------------------------------
 
@@ -1585,9 +1586,12 @@ commit_count=$(git -C "$TARGET" rev-list --count HEAD 2>/dev/null || echo 0)
 [ "$commit_count" = "1" ] \
   && pass "target has exactly 1 initial commit" \
   || fail "expected 1 commit, got $commit_count"
-git -C "$TARGET" log -1 --format=%s | grep -q "Initial commit (bootstrapped from mergepath)" \
-  && pass "initial commit subject matches" \
+git -C "$TARGET" log -1 --format=%s | grep -q "Initial commit (bootstrapped from mergepath@${FAKE_MP_SHA:0:7})" \
+  && pass "initial commit subject names the mergepath source sha (#1056)" \
   || fail "initial commit subject wrong: $(git -C "$TARGET" log -1 --format=%s)"
+git -C "$TARGET" log -1 --format=%b | grep -qF "Source: https://github.com/nathanjohnpayne/mergepath/commit/${FAKE_MP_SHA}" \
+  && pass "initial commit carries a Source: trailer naming the full mergepath sha (#1056)" \
+  || fail "initial commit missing Source: trailer: $(git -C "$TARGET" log -1 --format=%b)"
 
 # --- assertion 7: cross-repo loop step skipped (no anchors) ---
 # The fixture has no DEPLOYMENT.md, and its REVIEW_POLICY.md carries no

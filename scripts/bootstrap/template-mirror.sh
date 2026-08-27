@@ -389,7 +389,7 @@ bootstrap::stage_template_mirror() {
   fi
 
   # Step 5: initialize git history.
-  bootstrap::_init_target_git "$target" || step_rc=$?
+  bootstrap::_init_target_git "$target" "$source_root" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "template-mirror: git-init step failed (rc=$step_rc); aborting stage"
     return "$step_rc"
@@ -1189,6 +1189,7 @@ bootstrap::_yq_clean_repo_template() {
 
 bootstrap::_init_target_git() {
   local target=$1
+  local source_root=${2:-}
 
   if [ -d "$target/.git" ]; then
     bootstrap::log "target already has .git, skipping init"
@@ -1200,6 +1201,31 @@ bootstrap::_init_target_git() {
 
   bootstrap::run "stage initial files" \
     git -C "$target" add -A
+
+  # #1056: name the mergepath tree this consumer was mirrored from, so a
+  # bootstrapped repo (which has no sync PR, and therefore none of the
+  # Source:/branch-name provenance scripts/sync-to-downstream.sh writes on
+  # every sync PR) still leaves a recoverable HUB_REF for the drift
+  # measurement in docs/agents/propagation-ordering.md § Measuring tier
+  # membership. Best-effort: an unreadable source_root (a non-git checkout,
+  # or a caller that never passes one) falls back to the un-attributed
+  # subject rather than blocking the bootstrap over a diagnostic.
+  local source_sha=""
+  if [ -n "$source_root" ]; then
+    source_sha=$(git -C "$source_root" rev-parse HEAD 2>/dev/null) || source_sha=""
+  fi
+
+  local commit_message
+  if [ -n "$source_sha" ]; then
+    # Subject carries the short sha (greppable, survives a squash); the
+    # trailer carries the full sha as a clickable URL, matching the
+    # Source: convention scripts/sync-to-downstream.sh already writes.
+    commit_message="Initial commit (bootstrapped from mergepath@${source_sha:0:7})
+
+Source: https://github.com/nathanjohnpayne/mergepath/commit/${source_sha}"
+  else
+    commit_message="Initial commit (bootstrapped from mergepath)"
+  fi
 
   # Use the operator's git config for the commit identity. Tests
   # can override via BOOTSTRAP_AUTHOR_NAME / BOOTSTRAP_AUTHOR_EMAIL
@@ -1213,12 +1239,12 @@ bootstrap::_init_target_git() {
         -c "user.name=$author_name" \
         -c "user.email=$author_email" \
         -c commit.gpgsign=false \
-        commit -q -m "Initial commit (bootstrapped from mergepath)"
+        commit -q -m "$commit_message"
   else
     bootstrap::run "initial commit" \
       git -C "$target" \
         -c commit.gpgsign=false \
-        commit -q -m "Initial commit (bootstrapped from mergepath)"
+        commit -q -m "$commit_message"
   fi
 }
 
