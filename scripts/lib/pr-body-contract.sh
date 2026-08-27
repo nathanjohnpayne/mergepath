@@ -24,7 +24,12 @@ pr_body_available_authoring_agents() {
       value = $0
       sub(/^[[:space:]]*-[[:space:]]*/, "", value)
       sub(/[[:space:]]*#.*$/, "", value)
+      # Trailing whitespace FIRST: the closing-quote anchor below is $-anchored,
+      # so padding after the quote (a supported YAML form) left the quote in
+      # place and the slug regex then dropped an otherwise valid reviewer.
+      sub(/[[:space:]]+$/, "", value)
       gsub(/^["\047]|["\047]$/, "", value)
+      sub(/[[:space:]]+$/, "", value)
       value = tolower(value)
       sub(/^nathanpayne-/, "", value)
       if (value ~ /^[a-z0-9_-]+$/) print value

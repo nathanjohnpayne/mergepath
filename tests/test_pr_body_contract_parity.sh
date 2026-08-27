@@ -136,6 +136,53 @@ else
 fi
 rm -rf "$BROKEN_DIR"
 
+# --- 6. an autolink is inline content, not a raw HTML block ------------------
+# `<https://example.com>` begins with a letter inside angle brackets, so a
+# generic tag matcher classified it as a raw HTML block and discarded every
+# following line until a blank one -- hiding the very markers this parser
+# exists to find, so a valid body was rejected as having no author.
+AUTOLINK_BODY=$'<https://example.com>\nAuthoring-Agent: claude\n\n## Self-Review\nok'
+got_count="$(pr_body_authoring_agent_count "$AUTOLINK_BODY")"
+got_agent="$(pr_body_authoring_agent "$AUTOLINK_BODY")"
+if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ]; then
+  ok "an autolink before a marker does not suppress it (count=1, agent=claude)"
+else
+  bad "autolink body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
+fi
+
+# The narrowing must NOT cost the real behaviour: a genuine HTML comment still
+# suppresses, which is the property finding #1121 originally turned on.
+REAL_HTML=$'<!-- Authoring-Agent: codex -->\n\nAuthoring-Agent: claude\n\n## Self-Review\nok'
+got_agent="$(pr_body_authoring_agent "$REAL_HTML")"
+if [ "$got_agent" = "claude" ]; then
+  ok "a real HTML comment still suppresses its marker after the narrowing"
+else
+  bad "real HTML comment: expected agent=claude, got $got_agent"
+fi
+
+# --- 7. reviewer entries with YAML padding after the closing quote -----------
+# `- "nathanpayne-codex"   ` is a supported form. Stripping the closing quote
+# before trimming the padding left the value malformed and dropped the
+# reviewer, so the merge gate accepted an agent that gh-as-author.sh then
+# called unknown -- two parsers disagreeing, the same shape as the rest.
+PADDED_POLICY="$(mktemp "${TMPDIR:-/tmp}/parity-policy.XXXXXX")"
+printf 'available_reviewers:\n  - "nathanpayne-codex"   \n  - nathanpayne-claude\n' > "$PADDED_POLICY"
+slugs="$(pr_body_available_authoring_agents "$PADDED_POLICY" | tr '\n' ' ')"
+rm -f "$PADDED_POLICY"
+case "$slugs" in
+  *codex*claude*|*claude*codex*) ok "reviewer entry padded after its closing quote is still parsed ($slugs)" ;;
+  *) bad "padded reviewer entry was dropped; got [$slugs]" ;;
+esac
+
+# --- 8. an ambiguous author marker must ABORT the gate, not blank it ---------
+# An empty same-agent reviewer is read downstream as "accept any registered
+# reviewer", so converting an ambiguous body into that sentinel is fail-open.
+if grep -q "refusing to evaluate gate (b) with an ambiguous authoring agent" "$ROOT/scripts/codex-review-check.sh"; then
+  ok "codex-review-check aborts on an ambiguous Authoring-Agent count"
+else
+  bad "codex-review-check still lets a non-1 marker count fall through to the empty sentinel"
+fi
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

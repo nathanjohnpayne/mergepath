@@ -642,6 +642,13 @@ case "$AGENT_COUNT" in
     die 3 "shared PR-body parser returned a non-numeric Authoring-Agent count (${AGENT_COUNT:-empty}); refusing to evaluate gate (b)"
     ;;
 esac
+if [ "$AGENT_COUNT" -ne 1 ]; then
+  # NOT a fall-through: an ambiguous or absent marker leaves
+  # SAME_AGENT_REVIEWER empty, which the gate-(b) and Phase-4b filters read as
+  # "any registered reviewer is acceptable". That is precisely the fail-open
+  # this gate exists to prevent, so an unknown authoring agent must abort.
+  die 3 "PR body declares $AGENT_COUNT visible Authoring-Agent markers, expected exactly 1; refusing to evaluate gate (b) with an ambiguous authoring agent (an empty same-agent reviewer is read downstream as 'accept any reviewer')"
+fi
 if [ "$AGENT_COUNT" -eq 1 ]; then
   if ! AUTHORING_AGENT="$(pr_body_authoring_agent "$PR_BODY")"; then
     die 3 "shared PR-body parser failed while reading the Authoring-Agent value; refusing to evaluate gate (b)"

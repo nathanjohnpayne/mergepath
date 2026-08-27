@@ -69,7 +69,11 @@ export function parsePrBodyContract(body) {
       if (!line.includes('>')) htmlBlock = 'declaration';
       continue;
     }
-    if (/^ {0,3}<\/?[A-Za-z][^>]*(?:>|$)/.test(line)) {
+    // Tag NAME then a boundary, not any angle-bracketed token: an autolink
+    // such as <https://example.com> is inline content, and treating it as a
+    // raw HTML block swallowed every line up to the next blank one -- hiding
+    // the very markers this parser exists to find.
+    if (/^ {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t\/>]|$)/.test(line)) {
       htmlBlock = line.trim() === '' ? null : 'blank';
       continue;
     }
