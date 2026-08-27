@@ -684,25 +684,82 @@ origin_fetch_is_conventional() {
 # is derived from it so one knob moves both. A non-numeric or zero value
 # falls back to the default rather than disabling the bound.
 probe_remote_heads() {
-  local secs="${WORKTREE_CLEANUP_PROBE_TIMEOUT:-20}" connect_secs timeout_bin=""
+  local secs="${WORKTREE_CLEANUP_PROBE_TIMEOUT:-20}" connect_secs timeout_bin="" \
+        kill_opt="" ssh_base="" ssh_cmd_set=1
+  # Base 10 EXPLICITLY (Codex P2 on #1120). The digits-only test admits a
+  # zero-padded value, and `$(( 08 / 2 ))` is an octal arithmetic ERROR that
+  # would make a perfectly reachable remote report NOT MEASURED. `00` passes
+  # the same test, is not the literal `0` the old guard rejected, and would
+  # reach GNU timeout as a zero duration — which DISABLES its ceiling rather
+  # than taking the documented fallback. Normalize first, then judge the
+  # numeric value.
   case "$secs" in
-    ''|*[!0-9]*|0) secs=20 ;;
+    ''|*[!0-9]*) secs=20 ;;
+    *) secs=$(( 10#$secs )) ;;
   esac
+  [ "$secs" -ge 1 ] || secs=20
   connect_secs=$(( secs / 2 ))
   [ "$connect_secs" -ge 1 ] || connect_secs=1
+
   if command -v timeout >/dev/null 2>&1; then
     timeout_bin="timeout"
   elif command -v gtimeout >/dev/null 2>&1; then
     timeout_bin="gtimeout"
   fi
-  GIT_TERMINAL_PROMPT=0 \
-  GIT_ASKPASS=echo \
-  SSH_ASKPASS=echo \
-  SSH_ASKPASS_REQUIRE=never \
-  GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o ConnectTimeout=$connect_secs" \
-  ${timeout_bin:+$timeout_bin "$secs"} \
-    git -c "http.lowSpeedLimit=1000" -c "http.lowSpeedTime=$secs" \
-        ls-remote --heads origin 2>/dev/null
+  # A plain `timeout N` sends SIGTERM and then waits FOREVER for a child that
+  # catches or ignores it — git, ssh, or a credential helper may (Codex P2 on
+  # #1120), so the promised wall-clock ceiling is not actually a ceiling.
+  # `--kill-after` adds the bounded SIGKILL. It is GNU-only, and `timeout` on
+  # PATH is not guaranteed to be GNU (busybox ships one), so the support is
+  # PROBED rather than assumed: without it the plain form still bounds the
+  # common case.
+  if [ -n "$timeout_bin" ] && "$timeout_bin" --kill-after=1 1 true >/dev/null 2>&1; then
+    kill_opt="--kill-after=$connect_secs"
+  fi
+
+  # Resolve the ssh command the repository would ACTUALLY have used, and
+  # extend it — never replace it (Codex P2 on #1120). GIT_SSH_COMMAND
+  # overrides core.sshCommand, so defaulting straight to plain `ssh` silently
+  # discards a configured identity file, proxy or wrapper, and turns a
+  # working private remote into a permanent exit 3.
+  #
+  # Legacy GIT_SSH is deliberately NOT folded in: it names a PROGRAM with a
+  # different argument convention, not a shell command, so constructing a
+  # GIT_SSH_COMMAND from it would change how git invokes it. When only
+  # GIT_SSH is set the transport is left completely alone and the probe
+  # relies on the environment controls below, which are transport-agnostic.
+  # Hardening must not break a working configuration to protect it.
+  if [ -n "${GIT_SSH_COMMAND:-}" ]; then
+    ssh_base="$GIT_SSH_COMMAND"
+  else
+    ssh_base="$(git config --get core.sshCommand 2>/dev/null || true)"
+    if [ -z "$ssh_base" ]; then
+      if [ -n "${GIT_SSH:-}" ]; then
+        ssh_cmd_set=0
+      else
+        ssh_base="ssh"
+      fi
+    fi
+  fi
+
+  if [ "$ssh_cmd_set" -eq 1 ]; then
+    GIT_TERMINAL_PROMPT=0 \
+    GIT_ASKPASS=echo \
+    SSH_ASKPASS=echo \
+    SSH_ASKPASS_REQUIRE=never \
+    GIT_SSH_COMMAND="$ssh_base -o BatchMode=yes -o ConnectTimeout=$connect_secs" \
+    ${timeout_bin:+$timeout_bin $kill_opt "$secs"} \
+      git -c "http.lowSpeedLimit=1000" -c "http.lowSpeedTime=$secs" \
+          ls-remote --heads origin 2>/dev/null
+  else
+    GIT_TERMINAL_PROMPT=0 \
+    GIT_ASKPASS=echo \
+    SSH_ASKPASS=echo \
+    SSH_ASKPASS_REQUIRE=never \
+    ${timeout_bin:+$timeout_bin $kill_opt "$secs"} \
+      git -c "http.lowSpeedLimit=1000" -c "http.lowSpeedTime=$secs" \
+          ls-remote --heads origin 2>/dev/null
+  fi
 }
 
 # Detect local branches whose upstream tracks `origin/<name>` but which

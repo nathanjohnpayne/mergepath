@@ -3621,6 +3621,139 @@ else
   echo "$OUT_REFFAIL" >&2
 fi
 
+# ── Case 45b (#1120, Codex P2): the timeout override is base 10 ──────────
+# The digits-only test admits a ZERO-PADDED value. `$(( 08 / 2 ))` is an
+# octal arithmetic ERROR, which would make a perfectly reachable remote
+# report NOT MEASURED; `00` is not the literal `0` the old guard rejected and
+# would reach GNU timeout as a zero duration, DISABLING the ceiling rather
+# than taking the fallback. Reuses case 45's recording ssh shim: the recorded
+# ConnectTimeout is the observable proof of how the value was parsed.
+# Truncate FIRST. Case 45 already ran with timeout 8 and logged
+# ConnectTimeout=4 to this same file, so without this the assertion below
+# passes on residue from a different run — it did exactly that on the first
+# draft, and only the mutation pass caught it.
+: > "$SSHPROBE_LOG"
+set +e
+OUT_OCTAL=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh" \
+  WORKTREE_CLEANUP_PROBE_TIMEOUT=08 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_OCTAL=$?
+set -e
+# 08 parsed base 10 is 8, so ConnectTimeout is 4. Parsed as octal it is an
+# error and no ssh invocation is recorded at all.
+if grep -Fq -- "ConnectTimeout=4" "$SSHPROBE_LOG"; then
+  pass "#1120 a zero-padded timeout override is parsed base 10, not octal"
+else
+  fail "#1120 WORKTREE_CLEANUP_PROBE_TIMEOUT=08 did not yield ConnectTimeout=4 (rc=$RC_OCTAL)"
+  echo "$OUT_OCTAL" >&2
+  cat "$SSHPROBE_LOG" >&2
+fi
+: > "$SSHPROBE_LOG"
+set +e
+OUT_ZEROS=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh" \
+  WORKTREE_CLEANUP_PROBE_TIMEOUT=00 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+set -e
+# 00 must take the 20s fallback, so ConnectTimeout is 10 — NOT 0, which would
+# hand GNU timeout a duration that disables its own ceiling.
+if grep -Fq -- "ConnectTimeout=10" "$SSHPROBE_LOG"; then
+  pass "#1120 an all-zero timeout override falls back rather than disabling the ceiling"
+else
+  fail "#1120 WORKTREE_CLEANUP_PROBE_TIMEOUT=00 did not take the documented fallback"
+  echo "$OUT_ZEROS" >&2
+  cat "$SSHPROBE_LOG" >&2
+fi
+
+# ── Case 45c (#1120, Codex P2): core.sshCommand is extended, not replaced ──
+# GIT_SSH_COMMAND overrides core.sshCommand, so building one from plain `ssh`
+# silently discards a configured identity file, proxy or wrapper and turns a
+# working private remote into a permanent exit 3. The fixture configures
+# core.sshCommand and sets NO environment override, which is the shape that
+# regressed.
+CORESSH_LOG="$SSHPROBE_ROOT/core-ssh-args.log"
+cat > "$SSHPROBE_ROOT/core-ssh" <<SHIM
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CORESSH_LOG"
+exit 255
+SHIM
+chmod +x "$SSHPROBE_ROOT/core-ssh"
+git -C "$SSHPROBE_MAIN" config core.sshCommand "$SSHPROBE_ROOT/core-ssh"
+# Premise: the config really is set, and no environment override is present
+# in the child — otherwise the case tests the branch it is not about.
+if [ "$(git -C "$SSHPROBE_MAIN" config --get core.sshCommand)" != "$SSHPROBE_ROOT/core-ssh" ]; then
+  fail "fixture setup: core.sshCommand was not stored — case 45c asserts nothing"
+fi
+set +e
+OUT_CORESSH=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  env -u GIT_SSH_COMMAND -u GIT_SSH WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_CORESSH=$?
+set -e
+if [ -s "$CORESSH_LOG" ]; then
+  pass "#1120 the repository's configured core.sshCommand is still used"
+else
+  fail "#1120 core.sshCommand was discarded — a configured identity/proxy would be lost (rc=$RC_CORESSH)"
+  echo "$OUT_CORESSH" >&2
+fi
+if grep -F -- "BatchMode=yes" "$CORESSH_LOG" | grep -Fq -- "invalid.invalid"; then
+  pass "#1120 the hardening is appended to core.sshCommand rather than replacing it"
+else
+  fail "#1120 the hardening did not extend the configured ssh command"
+  cat "$CORESSH_LOG" >&2
+fi
+git -C "$SSHPROBE_MAIN" config --unset core.sshCommand
+
+# ── Case 45d (#1120, Codex P2): the ceiling has a KILL grace period ───────
+# `timeout N` sends SIGTERM and then waits FOREVER for a child that catches
+# or ignores it — git, ssh or a credential helper may — so without
+# --kill-after the promised wall-clock ceiling is not a ceiling. Support is
+# probed rather than assumed (a non-GNU timeout on PATH would not have it),
+# so this case asserts the flag IS passed on a host whose timeout supports it
+# and skips loudly where it does not.
+TIMEOUT_BIN_FOUND=""
+command -v timeout >/dev/null 2>&1 && TIMEOUT_BIN_FOUND=timeout
+[ -z "$TIMEOUT_BIN_FOUND" ] && command -v gtimeout >/dev/null 2>&1 && TIMEOUT_BIN_FOUND=gtimeout
+if [ -z "$TIMEOUT_BIN_FOUND" ]; then
+  pass "#1120 no timeout implementation on this host — kill-grace case not applicable (portable floor still applies)"
+elif ! "$TIMEOUT_BIN_FOUND" --kill-after=1 1 true >/dev/null 2>&1; then
+  pass "#1120 this host's timeout lacks --kill-after — probe correctly omits it"
+else
+  TMOUT_LOG="$SSHPROBE_ROOT/timeout-args.log"
+  mkdir -p "$SSHPROBE_ROOT/tbin"
+  TIMEOUT_REAL=$(command -v "$TIMEOUT_BIN_FOUND")
+  cat > "$SSHPROBE_ROOT/tbin/$TIMEOUT_BIN_FOUND" <<SHIM
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMOUT_LOG"
+exec "$TIMEOUT_REAL" "\$@"
+SHIM
+  chmod +x "$SSHPROBE_ROOT/tbin/$TIMEOUT_BIN_FOUND"
+  set +e
+  ( cd "$SSHPROBE_MAIN" && PATH="$SSHPROBE_ROOT/tbin:$STUB_DIR:$PATH" \
+    GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh" WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+    bash "$HELPER" --no-color --dry-run >/dev/null 2>&1 )
+  set -e
+  # Premise: the shim ran at all. The capability probe inside the script also
+  # invokes timeout, so an empty log means the probe never reached it.
+  if [ ! -s "$TMOUT_LOG" ]; then
+    fail "fixture setup: timeout was never invoked, so case 45d asserts nothing"
+  fi
+  # Anchored on the REAL invocation, not merely on the flag appearing
+  # somewhere in the log. The script's own capability probe runs
+  # `timeout --kill-after=1 1 true` through this same shim, so a bare
+  # `grep -- "--kill-after="` matches the probe and passes even when the
+  # ls-remote call carries no grace period at all — the first draft did
+  # exactly that and survived a targeted mutation. Requiring the flag and
+  # `ls-remote` on ONE line pins the invocation under test.
+  if grep -F -- "--kill-after=" "$TMOUT_LOG" | grep -Fq -- "ls-remote"; then
+    pass "#1120 the wall-clock ceiling carries a bounded KILL grace period"
+  else
+    fail "#1120 timeout was invoked without --kill-after — a SIGTERM-ignoring child can still hang the audit"
+    cat "$TMOUT_LOG" >&2
+  fi
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
