@@ -94,7 +94,7 @@ BLOCKED_FILTER='
         | select($reason != null)
         | { reason: $reason, created_at: .created_at, comment_id: .id }
       ]
-      | max_by(.created_at) // null'
+      | max_by([.created_at, .comment_id]) // null'
 
 mk() { jq -n --arg login "$1" --arg body "$2" --arg t "$3" --argjson id "$4" \
   '[{user:{login:$login},body:$body,created_at:$t,id:$id}]'; }
@@ -127,6 +127,31 @@ newer_ul="$(mk "$BOT" "$QUOTA_BODY" "2026-07-07T02:00:00Z" 905)"
 check_blocked "newest marker wins (usage_limit @ 02:00 over not_connected @ 01:00)" \
   '{"reason":"usage_limit","created_at":"2026-07-07T02:00:00Z","comment_id":905}' \
   "$(jq -s 'add' <(printf '%s' "$older_nc") <(printf '%s' "$newer_ul"))"
+# #953: a same-second tie must resolve by the explicit [.created_at, .id] key,
+# not by whichever order the API happened to list the two comments in. Assert
+# BOTH input orders — non-vacuous by mutation, since reverting the filter to
+# max_by(.created_at) alone still passes the ascending order (jq's max_by
+# already keeps the LAST maximal element) and only fails the reversed one.
+tie_low="$(mk "$BOT" "$NOT_CONNECTED_BODY" "2026-07-07T03:00:00Z" 910)"
+tie_high="$(mk "$BOT" "$QUOTA_BODY" "2026-07-07T03:00:00Z" 911)"
+check_blocked "same-second tie (ascending id order) selects the higher id" \
+  '{"reason":"usage_limit","created_at":"2026-07-07T03:00:00Z","comment_id":911}' \
+  "$(jq -s 'add' <(printf '%s' "$tie_low") <(printf '%s' "$tie_high"))"
+check_blocked "same-second tie (descending id order) selects the higher id" \
+  '{"reason":"usage_limit","created_at":"2026-07-07T03:00:00Z","comment_id":911}' \
+  "$(jq -s 'add' <(printf '%s' "$tie_high") <(printf '%s' "$tie_low"))"
+
+# ── 2b. Structural: BLOCKED_FILTER above is a literal copy ("KEEP IN SYNC"),
+#      not extracted from codex-review-request.sh, so the check_blocked
+#      assertions above cannot catch the REAL script regressing to
+#      max_by(.created_at) alone. Assert the tie-break key is present in the
+#      file itself, the same way section 4/5/6 below structurally pin other
+#      behavior this suite cannot drive end-to-end line-for-line.
+if grep -q 'max_by(\[\.created_at, \.comment_id\]) // null' "$REQUEST"; then
+  pass "codex-review-request.sh's blocked filter breaks same-second ties by [.created_at, .comment_id] (#953)"
+else
+  fail "codex-review-request.sh's blocked filter still resolves same-second ties by max_by(.created_at) alone"
+fi
 
 # ── 3. current_blocked_reason's post-trigger anchoring (codex-review-request.sh).
 #      KEEP IN SYNC with the TRIGGER_POSTED=true branch of current_blocked_reason.
@@ -239,6 +264,19 @@ Quoting the note about Codex usage limits for code reviews here.")")" = "none" ]
       '[{user:{login:$l},created_at:"2026-07-01T10:05:00Z",body:$q},
         {user:{login:$l},created_at:"2026-07-01T10:09:00Z",body:$n}]')")" = "not_connected" ] \
   || sel_bad="$sel_bad latest-wins-broken"
+# 5. A same-second tie resolves by an explicit [.created_at, .id] key, in
+#    both input orders (#953) — codex-review-check.sh's copy has no
+#    comment_id in its OUTPUT contract, so this only asserts via `reason`,
+#    but the fixture still forces the tie-break to matter: the two ids carry
+#    opposite reasons, so a wrong id winning is observable as a wrong reason.
+tie_asc="$(jq -nc --arg q "$QUOTA_BODY" --arg n "$NOT_CONNECTED_BODY" --arg l "$BOT" \
+  '[{id:920,user:{login:$l},created_at:"2026-07-01T10:05:00Z",body:$n},
+    {id:921,user:{login:$l},created_at:"2026-07-01T10:05:00Z",body:$q}]')"
+tie_desc="$(jq -nc --arg q "$QUOTA_BODY" --arg n "$NOT_CONNECTED_BODY" --arg l "$BOT" \
+  '[{id:921,user:{login:$l},created_at:"2026-07-01T10:05:00Z",body:$q},
+    {id:920,user:{login:$l},created_at:"2026-07-01T10:05:00Z",body:$n}]')"
+[ "$(sel_reason "$tie_asc")" = "usage_limit" ] || sel_bad="$sel_bad tie-ascending-broken"
+[ "$(sel_reason "$tie_desc")" = "usage_limit" ] || sel_bad="$sel_bad tie-descending-broken"
 
 if [ -z "$sel_bad" ]; then
   pass "#839: the block selector finds a fresh quota/not-connected marker and rejects stale, non-bot, verdict-quoted and absent ones"
