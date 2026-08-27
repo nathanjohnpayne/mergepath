@@ -2704,6 +2704,234 @@ if [ "$TRAPENV_RC" -eq 0 ]; then
 fi
 trapenv_assert
 
+# ── Case 43 (#992 crit 2): the orphan membership set is NUL-safe ─────────
+# worktree_records() emits NUL-delimited records because a worktree path may
+# contain any byte git permits, INCLUDING a literal newline. The orphan scan
+# re-serialised that set one-path-per-LINE and tested membership with
+# `grep -Fxq`, which splits such a path into two independent records.
+#
+# Fixture, one repo covering BOTH directions the criterion names:
+#   registered  <wtroot>/reg<LF>split   a real, git-registered worktree
+#   orphan      <wtroot>/reg            an unregistered directory whose name
+#                                       is exactly the registered path's
+#                                       first LINE fragment
+#
+# Direction A (ineffective, and the one that reproduces on the pre-fix
+# script): the orphan matches the split fragment, is read as registered, and
+# is never reported or cleaned — `orphan dirs: 0` on a tree that has one.
+#
+# Direction B (destructive): a registered path failing its own membership
+# test would be classified an orphan and `rm -rf`d under --orphan-clean.
+# #992 records that this direction does NOT reproduce on the pre-fix script
+# — `grep -F` treats the newline in the PATTERN as a pattern separator, so
+# the registered path matches on either fragment — so B is a guard on the
+# fix rather than a reproduction of the bug. It is asserted because the fix
+# moves both sides of the comparison, which is exactly when a
+# not-currently-reachable direction becomes reachable.
+NULORPH_ROOT="$WORKDIR/orphan-nul"
+NULORPH_REMOTE="$NULORPH_ROOT/remote.git"
+NULORPH_MAIN="$NULORPH_ROOT/main"
+mkdir -p "$NULORPH_ROOT"
+git init -q --bare "$NULORPH_REMOTE"
+git init -q -b main "$NULORPH_MAIN"
+(
+  cd "$NULORPH_MAIN"
+  git -C "$NULORPH_MAIN" config user.email "test@example.com"
+  git -C "$NULORPH_MAIN" config user.name "Test"
+  git -C "$NULORPH_MAIN" config commit.gpgsign false
+  git -C "$NULORPH_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$NULORPH_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+# Resolve to the physical path before deriving any child path: the helper
+# compares against `pwd -P` output, and on macOS $TMPDIR is a symlink.
+NULORPH_MAIN=$(cd "$NULORPH_MAIN" && pwd -P)
+NULORPH_WTROOT="$NULORPH_MAIN/.claude/worktrees"
+mkdir -p "$NULORPH_WTROOT"
+NULORPH_REG="$NULORPH_WTROOT/$(printf 'reg\nsplit')"
+NULORPH_ORPH="$NULORPH_WTROOT/reg"
+git -C "$NULORPH_MAIN" worktree add -q -b nlbranch "$NULORPH_REG" >/dev/null 2>&1 || true
+mkdir -p "$NULORPH_ORPH"
+echo "residue that exists nowhere else" > "$NULORPH_ORPH/residue.txt"
+
+# Premise 1: git really did register the newline-bearing path, and really
+# does emit it as ONE porcelain record. Read the -z stream with the shell
+# rather than awk/tr: `awk -v RS='\0'` is not portable (BSD awk truncates the
+# assignment at the NUL and falls into paragraph mode), which would make this
+# premise silently untested on the audit's primary host.
+nulorph_registered() {
+  local field found=1
+  while IFS= read -r -d '' field; do
+    [ "$field" = "worktree $NULORPH_REG" ] && found=0
+  done < <(git -C "$NULORPH_MAIN" worktree list --porcelain -z)
+  return "$found"
+}
+if ! nulorph_registered; then
+  fail "fixture setup: git did not register the newline-bearing worktree path as one record — case 43 asserts nothing"
+fi
+# Premise 2: the orphan's name really is the registered path's first line
+# fragment. If it were not, direction A could pass for the wrong reason.
+if [ "$NULORPH_ORPH" != "${NULORPH_REG%%$'\n'*}" ]; then
+  fail "fixture setup: the orphan is not the registered path's first line fragment — case 43 does not model the defect"
+fi
+# Premise 3: both directories exist on disk, so the orphan scan has two
+# entries to iterate and cannot pass by finding nothing at all.
+if [ ! -d "$NULORPH_REG" ] || [ ! -d "$NULORPH_ORPH" ]; then
+  fail "fixture setup: expected both the registered worktree and the orphan directory to exist"
+fi
+
+set +e
+OUT_NULORPH=$( cd "$NULORPH_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_NULORPH=$?
+set -e
+
+# Direction A. Assert on the SUMMARY COUNTER, not on a `path:` record line:
+# $NULORPH_ORPH is a proper prefix of $NULORPH_REG *and* equals its first
+# line, so no line-oriented grep over the records can tell the two apart —
+# the #920 finding-3 prefix hazard in its sharpest form. The counter is
+# unambiguous.
+if echo "$OUT_NULORPH" | grep -qE "orphan dirs: +1$"; then
+  pass "#992 an orphan matching a registered path's newline fragment is reported"
+else
+  fail "#992 the orphan was swallowed by a split registered path (rc=$RC_NULORPH)"
+  echo "$OUT_NULORPH" >&2
+fi
+# The registered worktree must not ALSO be counted, which the single-digit
+# match above already pins: 1, not 2.
+if echo "$OUT_NULORPH" | grep -Fq -- "[ORPHAN .claude/worktrees]"; then
+  pass "#992 the orphan is emitted with the ORPHAN label"
+else
+  fail "#992 no ORPHAN record was emitted despite an unregistered directory"
+  echo "$OUT_NULORPH" >&2
+fi
+
+# Direction B: the destructive one. --apply --orphan-clean must remove the
+# orphan and leave the registered worktree, its checkout and its content
+# untouched.
+set +e
+OUT_NULORPH_APPLY=$( cd "$NULORPH_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply --orphan-clean 2>&1 )
+RC_NULORPH_APPLY=$?
+set -e
+if [ "$RC_NULORPH_APPLY" -ne 0 ]; then
+  fail "fixture setup: the --apply --orphan-clean run exited $RC_NULORPH_APPLY — the assertions below describe a run that completed"
+  echo "$OUT_NULORPH_APPLY" >&2
+fi
+if [ ! -e "$NULORPH_ORPH" ]; then
+  pass "#992 --orphan-clean removes an orphan the split-fragment match used to hide"
+else
+  fail "#992 --orphan-clean left the orphan in place"
+  echo "$OUT_NULORPH_APPLY" >&2
+fi
+if [ -d "$NULORPH_REG" ] && [ -e "$NULORPH_REG/seed.txt" ]; then
+  pass "#992 DATA SAFETY: the registered newline-bearing worktree survives --orphan-clean"
+else
+  fail "#992 DATA LOSS: --orphan-clean deleted the registered newline-bearing worktree"
+  echo "$OUT_NULORPH_APPLY" >&2
+fi
+if nulorph_registered; then
+  pass "#992 the registered newline-bearing worktree is still registered after --apply"
+else
+  fail "#992 --apply deregistered the newline-bearing worktree"
+  echo "$OUT_NULORPH_APPLY" >&2
+fi
+
+# ── Case 43b (#1103, Codex P2): a TRAILING newline survives canonicalization ──
+# Case 43 covers a newline in the MIDDLE of a registered path. A newline at
+# the END is a separate failure, and it is one the NUL-safe set INTRODUCES
+# rather than fixes: command substitution strips every trailing newline, so
+# `abs=$(cd "$d" && pwd -P)` truncates the path, while the NUL-delimited
+# membership set keeps the byte. The registered checkout then fails its own
+# membership test and is classified an ORPHAN — and under --orphan-clean the
+# rm -rf targets the TRUNCATED path, which is either a no-op recorded as a
+# successful removal (so every later audit repeats the false finding) or, if
+# a sibling occupies that name, the deletion of an unrelated directory.
+#
+# With the previous line-delimited set this could not happen: grep -Fxq
+# matched the truncated value against the record's first line, so the entry
+# was accidentally treated as registered. That is why this case ships with
+# the NUL change rather than separately.
+NLTAIL_ROOT="$WORKDIR/orphan-nl-trailing"
+NLTAIL_REMOTE="$NLTAIL_ROOT/remote.git"
+NLTAIL_MAIN="$NLTAIL_ROOT/main"
+mkdir -p "$NLTAIL_ROOT"
+git init -q --bare "$NLTAIL_REMOTE"
+git init -q -b main "$NLTAIL_MAIN"
+(
+  cd "$NLTAIL_MAIN"
+  git -C "$NLTAIL_MAIN" config user.email "test@example.com"
+  git -C "$NLTAIL_MAIN" config user.name "Test"
+  git -C "$NLTAIL_MAIN" config commit.gpgsign false
+  git -C "$NLTAIL_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$NLTAIL_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+NLTAIL_MAIN=$(cd "$NLTAIL_MAIN" && pwd -P)
+NLTAIL_WTROOT="$NLTAIL_MAIN/.claude/worktrees"
+mkdir -p "$NLTAIL_WTROOT"
+# ANSI-C quoting, NOT $(printf 'trail\n'): command substitution would strip
+# the very trailing newline this case exists to exercise, and the fixture
+# would silently build an ordinary path. The premise assertion below is what
+# caught that when this case was first written.
+NLTAIL_NAME=$'trail\n'
+NLTAIL_REG="$NLTAIL_WTROOT/$NLTAIL_NAME"
+git -C "$NLTAIL_MAIN" worktree add -q -b trailbranch "$NLTAIL_REG" >/dev/null 2>&1 || true
+
+# Premise 1: the filesystem and git both accepted a path whose final
+# component ends in a newline. If either refused, this case asserts nothing
+# and must say so rather than passing quietly.
+if [ ! -d "$NLTAIL_REG" ]; then
+  fail "fixture setup: could not create a worktree whose path ends in a newline — case 43b asserts nothing"
+fi
+nltail_registered() {
+  local field found=1
+  while IFS= read -r -d '' field; do
+    [ "$field" = "worktree $NLTAIL_REG" ] && found=0
+  done < <(git -C "$NLTAIL_MAIN" worktree list --porcelain -z)
+  return "$found"
+}
+if ! nltail_registered; then
+  fail "fixture setup: git did not register the trailing-newline worktree path verbatim"
+fi
+# Premise 2: the truncation this case is about is real — the naive
+# canonicalization genuinely loses the byte. Asserting the premise keeps the
+# case honest if a future shell stops stripping trailing newlines.
+NLTAIL_NAIVE=$(cd "$NLTAIL_REG" 2>/dev/null && pwd -P)
+if [ "$NLTAIL_NAIVE" = "$NLTAIL_REG" ]; then
+  fail "fixture setup: command substitution did not strip the trailing newline — case 43b no longer models the defect"
+fi
+
+set +e
+OUT_NLTAIL=$( cd "$NLTAIL_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_NLTAIL=$?
+set -e
+if echo "$OUT_NLTAIL" | grep -qE "orphan dirs: +0$"; then
+  pass "#1103 a registered worktree whose path ends in a newline is not misread as an orphan"
+else
+  fail "#1103 the trailing newline was truncated and the registered worktree was classified an orphan (rc=$RC_NLTAIL)"
+  echo "$OUT_NLTAIL" >&2
+fi
+
+set +e
+OUT_NLTAIL_APPLY=$( cd "$NLTAIL_MAIN" && PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply --orphan-clean 2>&1 )
+RC_NLTAIL_APPLY=$?
+set -e
+if [ "$RC_NLTAIL_APPLY" -ne 0 ]; then
+  fail "fixture setup: the trailing-newline --apply --orphan-clean run exited $RC_NLTAIL_APPLY"
+  echo "$OUT_NLTAIL_APPLY" >&2
+fi
+if [ -d "$NLTAIL_REG" ] && [ -e "$NLTAIL_REG/seed.txt" ] && nltail_registered; then
+  pass "#1103 DATA SAFETY: the trailing-newline worktree survives --orphan-clean and stays registered"
+else
+  fail "#1103 DATA LOSS: --orphan-clean acted on a truncated canonical path"
+  echo "$OUT_NLTAIL_APPLY" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
