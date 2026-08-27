@@ -279,6 +279,20 @@ if gate.is_a?(Hash)
       [before, evaluate, after, compare, reject].all? && before < evaluate && evaluate < after && after < compare && compare < reject,
       "codex-p1-gate does not fingerprint before evaluation and reject drift before publication"
     )
+    # #1091: printing the raw evaluation output BEFORE the drift comparison
+    # appends its refusal sentence means a stale-surface refusal (rc=2 set by
+    # THIS step, not by codex-p1-gate.sh) logs only the generic "exited 2
+    # (config/usage error)" line -- the actual explanation lands solely in
+    # $RUNNER_TEMP/codex-p1-summary.txt, sending a debugger on a log dig for a
+    # benign fresh-PR race. Require the echo strictly after the drift
+    # rejection this fixed, not merely after `compare` -- an echo placed
+    # between `compare` and `reject` would still miss an append that happens
+    # only inside the `rc=2` branch.
+    echo_output = gate_run.index('echo "$output"')
+    require_shape.call(
+      echo_output && reject && echo_output > reject,
+      "codex-p1-gate echoes the evaluated output before the fingerprint drift rejection can append its refusal reason"
+    )
   end
   close_index = steps.index do |step|
     run = step["run"].to_s
@@ -374,6 +388,16 @@ if sweep.is_a?(Hash)
         lease < before && before < evaluate && evaluate < after && after < compare &&
         compare < reject && reject < close,
       "scheduled-sweep does not lease, evaluate, reject drift, and close the same check generation"
+    )
+    # #1091: same reordering as the event-driven gate above, in the scheduled
+    # re-evaluation's own copy of the fence. The pre-fix form echoed the raw
+    # evaluation output before this comparison could append its own refusal
+    # sentence, so a stale-surface rc=2 here logged as an unexplained
+    # "infra/config error" instead.
+    echo_output = sweep_run.index('echo "$output"')
+    require_shape.call(
+      echo_output && reject && close && echo_output > reject && echo_output < close,
+      "scheduled-sweep echoes the evaluated output before the fingerprint drift rejection can append its refusal reason"
     )
     republish = sweep_run.index("feedback_fp_publish=$(scripts/review-feedback-surface-fingerprint.sh")
     # The re-read is only half the requirement. A sweep that reads the live
