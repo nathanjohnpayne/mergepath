@@ -3431,6 +3431,99 @@ else
   echo "$OUT_FULLWRITE" >&2
 fi
 
+# ── Case 44f (#1105, Codex P2): a ref-read failure is not a storage one ──
+# The eligibility list is built from a git READ piped into a WRITE. While
+# both sat in one pipeline, `pipefail` made an unreadable local ref database
+# surface as "temporary storage unavailable", sending the operator to check
+# TMPDIR for a problem in the repository. That is the cause-specific-remedy
+# rule this PR added, broken inside the guard that introduced it.
+#
+# The read is now taken on its own, so its failure is attributable. This case
+# fails ONLY the eligibility read — via a git shim matched to that exact
+# format string — leaving TMPDIR perfectly healthy, so a storage remedy would
+# be provably wrong rather than merely imprecise.
+REFFAIL_ROOT="$WORKDIR/ref-read-failure"
+REFFAIL_REMOTE="$REFFAIL_ROOT/remote.git"
+REFFAIL_MAIN="$REFFAIL_ROOT/main"
+REFFAIL_BIN="$REFFAIL_ROOT/bin"
+REFFAIL_LOG="$REFFAIL_ROOT/git-hits.log"
+mkdir -p "$REFFAIL_ROOT" "$REFFAIL_BIN"
+git init -q --bare "$REFFAIL_REMOTE"
+git init -q -b main "$REFFAIL_MAIN"
+(
+  cd "$REFFAIL_MAIN"
+  git -C "$REFFAIL_MAIN" config user.email "test@example.com"
+  git -C "$REFFAIL_MAIN" config user.name "Test"
+  git -C "$REFFAIL_MAIN" config commit.gpgsign false
+  git -C "$REFFAIL_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$REFFAIL_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+REFFAIL_MAIN=$(cd "$REFFAIL_MAIN" && pwd -P)
+REFFAIL_REAL_GIT=$(command -v git)
+# Matched on `%09`, which appears ONLY in the eligibility read's format.
+# gone_branches() uses `%(refname:lstrip=2) %(upstream:track)` — space
+# separated, no %09 — so it and every other git call still run for real. A
+# blanket git shim would break the fixture long before the probe.
+#
+# The match is a SUBSTRING of one argument, not an exact one: git receives
+# `--format=%(...)%09%(...)` as a single argv entry, so an exact-string case
+# never fires. The first draft did exactly that and the shim was never hit —
+# caught only by the premise assertion below.
+cat > "$REFFAIL_BIN/git" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *%09*) printf 'hit\n' >> "$REFFAIL_LOG"; exit 128 ;;
+  esac
+done
+exec "$REFFAIL_REAL_GIT" "\$@"
+SHIM
+chmod +x "$REFFAIL_BIN/git"
+
+# Premise: TMPDIR is healthy, so a storage remedy would be a FALSE statement
+# rather than a vague one. This is the whole point of the case.
+REFFAIL_PROBE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-reffail-probe.XXXXXX") || \
+  fail "fixture setup: cannot create a temp file — case 44f cannot claim TMPDIR is healthy"
+if ! printf 'ok\n' > "$REFFAIL_PROBE" 2>/dev/null; then
+  fail "fixture setup: TMPDIR is not writable — case 44f cannot distinguish a ref failure from a storage one"
+fi
+rm -f "$REFFAIL_PROBE"
+
+set +e
+OUT_REFFAIL=$( cd "$REFFAIL_MAIN" && PATH="$REFFAIL_BIN:$STUB_DIR:$PATH" \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_REFFAIL=$?
+set -e
+
+if [ ! -s "$REFFAIL_LOG" ]; then
+  fail "fixture setup: the eligibility read was never attempted, so case 44f asserts nothing"
+  echo "$OUT_REFFAIL" >&2
+fi
+if [ "$RC_REFFAIL" -eq 3 ] && echo "$OUT_REFFAIL" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1105 an unreadable ref database is an incomplete audit"
+else
+  fail "#1105 an unreadable ref database exited $RC_REFFAIL without reporting NOT MEASURED"
+  echo "$OUT_REFFAIL" >&2
+fi
+# The claim under test: the remedy names the REPOSITORY, not TMPDIR.
+if echo "$OUT_REFFAIL" | grep -Fq -- "refs could"; then
+  pass "#1105 a ref-read failure directs the operator at the repository"
+else
+  fail "#1105 a ref-read failure did not name the repository as the cause"
+  echo "$OUT_REFFAIL" >&2
+fi
+# And must NOT send them to TMPDIR, which is demonstrably fine here.
+if ! echo "$OUT_REFFAIL" | grep -Fq -- "is writable and has free"; then
+  pass "#1105 a ref-read failure is not misattributed to temporary storage"
+else
+  fail "#1105 a healthy TMPDIR was blamed for a ref-read failure"
+  echo "$OUT_REFFAIL" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

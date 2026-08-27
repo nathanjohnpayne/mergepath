@@ -670,7 +670,7 @@ origin_fetch_is_conventional() {
 stale_unpruned_branches() {
   cd "$MAIN_WORKTREE" || {
     STALE_SNAPSHOT_STATE="unknown"
-    STALE_SNAPSHOT_CAUSE="local"
+    STALE_SNAPSHOT_CAUSE="refs"
     STALE_SNAPSHOT_REASON="cannot enter the main worktree"
     return 0
   }
@@ -693,7 +693,7 @@ stale_unpruned_branches() {
   # "nothing", established without the remote having any say.
   ELIGIBLE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-eligible.XXXXXX") || {
     STALE_SNAPSHOT_STATE="unknown"
-    STALE_SNAPSHOT_CAUSE="local"
+    STALE_SNAPSHOT_CAUSE="storage"
     STALE_SNAPSHOT_REASON="could not create the eligible-branch list (temporary storage unavailable)"
     return 0
   }
@@ -731,8 +731,40 @@ stale_unpruned_branches() {
   # that way and never fired — the run printed a clean summary and exit 0
   # while its own eligible list had gone nowhere. Routing the write through a
   # simple command makes the status reflect it.
+  # The git READ is taken first, on its own, so its failure is attributable
+  # (Codex P2 on #1105). Folding it into the write pipeline made `pipefail`
+  # surface an unreadable local ref database as `temporary storage
+  # unavailable`, which sent the operator to check TMPDIR for a problem in
+  # the repository. That is the cause-specific-remedy rule this PR added,
+  # broken inside the guard that introduced it: a wrong remedy is worse than
+  # a vague one because it looks actionable.
+  local branch_pairs
+  if ! branch_pairs=$(git for-each-ref \
+       --format='%(refname:lstrip=2)%09%(upstream)' refs/heads/ 2>/dev/null); then
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="refs"
+    STALE_SNAPSHOT_REASON="could not read the local branch list (git for-each-ref failed)"
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
+    return 0
+  fi
+  # Now only the WRITE can fail here, so the temp-storage reason is accurate.
+  #
+  # The redirect is owned by a trailing `cat`, NOT by the brace group, and
+  # that detail is load-bearing. Measured on bash 3.2 and 5.x:
+  #
+  #   if ! { ...; } >BAD          -> status 0   (the failure is MISSED)
+  #   if ! { ...; } | cat >BAD    -> status 1   (caught)
+  #   if ! printf | awk >BAD      -> status 1   (caught — the snapshot shape)
+  #
+  # A redirection failure on a COMPOUND command does not make the `if`
+  # condition false: bash reports the error, skips the group, and the
+  # condition evaluates as success. An earlier draft of this guard was
+  # written that way and never fired — the run printed a clean summary and
+  # exit 0 while its own eligible list had gone nowhere. Routing the write
+  # through a simple command makes the status reflect it.
   if ! {
-    git for-each-ref --format='%(refname:lstrip=2)%09%(upstream)' refs/heads/ 2>/dev/null |
+    printf '%s\n' "$branch_pairs" |
     while IFS=$'\t' read -r branch upstream; do
       [ -n "$branch" ] || continue
       case "$upstream" in
@@ -744,7 +776,7 @@ stale_unpruned_branches() {
     done
   } | cat >"$ELIGIBLE_FILE"; then
     STALE_SNAPSHOT_STATE="unknown"
-    STALE_SNAPSHOT_CAUSE="local"
+    STALE_SNAPSHOT_CAUSE="storage"
     STALE_SNAPSHOT_REASON="could not write the eligible-branch list (temporary storage unavailable)"
     rm -f "$ELIGIBLE_FILE"
     ELIGIBLE_FILE=""
@@ -777,7 +809,7 @@ stale_unpruned_branches() {
     # the same state, or it becomes this issue's silent-clean case one level
     # further down.
     STALE_SNAPSHOT_STATE="unknown"
-    STALE_SNAPSHOT_CAUSE="local"
+    STALE_SNAPSHOT_CAUSE="storage"
     STALE_SNAPSHOT_REASON="could not create the remote-heads snapshot file (temporary storage unavailable)"
     return 0
   }
@@ -791,7 +823,7 @@ stale_unpruned_branches() {
   # further down.
   if ! printf '%s\n' "$snapshot" | awk -F'\t' 'NF > 1 { print $2 }' >"$HEADS_FILE"; then
     STALE_SNAPSHOT_STATE="unknown"
-    STALE_SNAPSHOT_CAUSE="local"
+    STALE_SNAPSHOT_CAUSE="storage"
     STALE_SNAPSHOT_REASON="could not write the remote-heads snapshot (temporary storage unavailable)"
     rm -f "$HEADS_FILE"
     HEADS_FILE=""
@@ -1664,10 +1696,16 @@ if [ "$STALE_SNAPSHOT_STATE" = "unknown" ]; then
     remote)
       printf "      The REMOTE could not be read. Re-run once it is reachable\n"
       printf "      before trusting this audit (exit 3).\n" ;;
-    local)
+    storage)
       printf "      This is a LOCAL failure, not a remote one — the audit could\n"
-      printf "      not allocate its own working state. Check that TMPDIR\n"
-      printf "      (%s) is writable and has free space, then\n" "${TMPDIR:-/tmp}"
+      printf "      not allocate or write its own working state. Check that\n"
+      printf "      TMPDIR (%s) is writable and has free\n" "${TMPDIR:-/tmp}"
+      printf "      space, then re-run before trusting this audit (exit 3).\n" ;;
+    refs)
+      printf "      This is a LOCAL failure, not a remote one, and NOT a\n"
+      printf "      temporary-storage one — this repository's own refs could\n"
+      printf "      not be read. Check the repository (git for-each-ref\n"
+      printf "      refs/heads/) rather than TMPDIR or the network, then\n"
       printf "      re-run before trusting this audit (exit 3).\n" ;;
     *)
       printf "      The audit could not complete this check. Resolve the cause\n"

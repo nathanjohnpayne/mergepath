@@ -25,9 +25,11 @@ Only a failure whose absence of output is indistinguishable from a real answer. 
 The remedy printed with an incomplete audit must match the failure, because a wrong remedy is more expensive than a vague one — it looks actionable.
 
 - A `remote` cause means the `git ls-remote --heads origin` snapshot failed. Re-run once the remote is reachable.
-- A `local` cause means the audit could not allocate or write its own working state, almost always a `TMPDIR` that is unwritable or full. Fix the temporary storage. The remote may have been perfectly reachable; one of these paths fails *after* a successful remote read.
+- A `storage` cause means the audit could not allocate or write its own working state, almost always a `TMPDIR` that is unwritable or full. Fix the temporary storage. The remote may have been perfectly reachable; one of these paths fails *after* a successful remote read.
+- A `refs` cause means this repository's own refs could not be read, or its main worktree could not be entered. Check the repository, not the network and not temporary storage.
+- The three are distinguished at the point of failure rather than inferred afterwards. A git read and a temp-file write must not share one guarded pipeline: under `pipefail` an unreadable ref database would surface as a storage failure and send the operator to check `TMPDIR` for a problem in the repository.
 - An unrecognised cause renders a generic incomplete-audit line rather than guessing, so a future failure path cannot silently inherit the wrong advice.
-- In no case is re-running with `--apply` the remedy.
+- In no case is re-running with `--apply` the remedy. A wrong remedy is more expensive than a vague one, because it looks actionable.
 
 ## What does not change the exit status
 
