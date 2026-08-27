@@ -3202,6 +3202,57 @@ else
   pass "bootstrap::_reconcile_excluded_residue protects only the root .git, reconciling a stale nested repo (#1056 Codex P2 round 14)"
 fi
 
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 15: every root-anchored protection this function
+# relies on (the symlinked-target-root guard, and
+# bootstrap::_reconcile_excluded_residue's prune_expr / root_only_protect
+# from rounds 13-14) is built by string-concatenating "$target/<suffix>".
+# A caller-supplied target ending in "/" (a common CLI convention) turns
+# that into a DOUBLE slash that matches neither find's normalized output
+# nor [ -L ]'s own path handling -- reproduced: [ -L "path/" ] fails to
+# detect a symlink at all, and root_only_protect's exclusion silently
+# stops matching. Pass the SAME target used by the round-14 nested-.git
+# test, but with a trailing slash appended, and assert the root .git still
+# survives (the nested stale/.git reconciliation is already covered there;
+# this test isolates the normalization gap specifically).
+# ---------------------------------------------------------------------------
+trailingslash_src="$(mktemp -d "$WORKDIR/rsync-trailingslash-src.XXXXXX")"
+trailingslash_dst="$(mktemp -d "$WORKDIR/rsync-trailingslash-dst.XXXXXX")"
+mkdir -p "$trailingslash_src/docs/agents"
+printf 'readme\n' > "$trailingslash_src/README.md"
+printf 'canonical\n' > "$trailingslash_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$trailingslash_src/docs/agents/bootstrap-runbook.md"
+cat >"$trailingslash_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+mkdir -p "$trailingslash_dst/.git"
+printf 'must survive -- this IS the targets own repository\n' > "$trailingslash_dst/.git/HEAD"
+printf 'real wizard state, must survive\n' > "$trailingslash_dst/.bootstrap-state"
+set +e
+trailingslash_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$trailingslash_src" "$trailingslash_dst/" 2>&1)
+trailingslash_rc=$?
+set -e
+if [ "$trailingslash_rc" != "0" ]; then
+  fail "rsync with a trailing-slash target failed (rc=$trailingslash_rc): $trailingslash_out"
+elif [ ! -f "$trailingslash_dst/.git/HEAD" ]; then
+  fail "the target's own root .git was deleted when \$target had a trailing slash -- normalization is not wired in"
+elif [ ! -f "$trailingslash_dst/.bootstrap-state" ]; then
+  fail "the target's own .bootstrap-state was deleted when \$target had a trailing slash -- normalization is not wired in"
+else
+  pass "bootstrap::_rsync_template normalizes a trailing-slash target before any root-anchored protection check (#1056 Codex P1 round 15)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

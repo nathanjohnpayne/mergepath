@@ -1291,6 +1291,24 @@ bootstrap::_rsync_template() {
   local source_root=$1
   local target=$2
 
+  # Codex P1 on #1112 round 15: normalize away a trailing slash on $target
+  # BEFORE any string-based path construction or comparison below. Every
+  # root-anchored protection this function relies on -- the symlinked-
+  # target-root guard just below, bootstrap::_reject_symlink_ancestors
+  # further down, and bootstrap::_reconcile_excluded_residue's prune_expr
+  # and root_only_protect (rounds 13-14) -- is built by string-concatenating
+  # "$target/<suffix>". If the caller passed a target ending in "/" (a
+  # common CLI convention), that concatenation produces a DOUBLE slash
+  # ("$target//.git") that matches neither find's single-slash-normalized
+  # output nor [ -L ]'s own path handling -- reproduced: [ -L "path/" ]
+  # fails to detect a symlink at all, and every root_only_protect exclusion
+  # silently stops matching, defeating both the symlink guard and the
+  # root/.git, root/.bootstrap-state, root/.claude/worktrees protections in
+  # one stroke. A single trailing-slash strip is sufficient for the
+  # realistic case (one trailing slash); nothing downstream re-appends one
+  # before the next use.
+  target="${target%/}"
+
   # Codex P1 on #1112 round 9: --delete, not a bare mirror. A --resume
   # re-enters this stage from the top against a target that may already
   # carry a prior attempt's output — a path present then but removed from
