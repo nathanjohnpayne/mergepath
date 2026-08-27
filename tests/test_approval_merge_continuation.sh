@@ -52,7 +52,10 @@ case "$name" in
     exit "${STUB_READINESS_RC:-0}"
     ;;
   merge-clearance-gate.sh) exit "${STUB_GATE_RC:-0}" ;;
-  review-feedback-accounting.sh) exit "${STUB_ACCOUNTING_RC:-0}" ;;
+  review-feedback-accounting.sh)
+    printf '%s\n' "${GH_TOKEN:-unset}" >> "${STUB_DIR:?}/accounting-token.log"
+    exit "${STUB_ACCOUNTING_RC:-0}"
+    ;;
   resolve-pr-threads.sh) exit "${STUB_THREADS_RC:-0}" ;;
   required-head-checks.sh)
     printf '%s\n' "$*" >> "${STUB_DIR:?}/required-checks.log"
@@ -82,8 +85,11 @@ run_case() {
   : > "$TMP/merge.log"
   : > "$TMP/readiness.log"
   : > "$TMP/required-checks.log"
+  : > "$TMP/accounting-token.log"
   printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}" > "$TMP/root/policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
+    GH_TOKEN="${TEST_AMBIENT_GH_TOKEN:-ambient-token}" \
+    ACCOUNTING_GH_TOKEN="${TEST_ACCOUNTING_GH_TOKEN:-}" \
     STUB_INITIAL="${STUB_INITIAL:-$BASE}" STUB_FINAL="${STUB_FINAL:-${STUB_INITIAL:-$BASE}}" \
     STUB_READINESS_RC="${STUB_READINESS_RC:-0}" STUB_GATE_RC="${STUB_GATE_RC:-0}" \
     STUB_ACCOUNTING_RC="${STUB_ACCOUNTING_RC:-0}" \
@@ -106,6 +112,7 @@ reset_fixtures() {
   unset STUB_INITIAL STUB_FINAL STUB_READINESS_RC STUB_GATE_RC
   unset STUB_ACCOUNTING_RC STUB_THREADS_RC STUB_LOGIN STUB_LOGIN_RC
   unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR STUB_REQUIRED_CHECKS_RC
+  unset TEST_AMBIENT_GH_TOKEN TEST_ACCOUNTING_GH_TOKEN
 }
 
 reset_fixtures
@@ -234,6 +241,31 @@ if [ "$rc" -eq 3 ] && [ ! -s "$TMP/merge.log" ]; then
   pass "non-author token fails closed before merge"
 else
   fail "non-author token must fail closed (rc=$rc)"
+fi
+
+# #1101 (CodeRabbit on PR #1106): every caller of this script runs it under
+# GH_TOKEN=AUTHOR_MERGE_TOKEN, an external PAT this repo's workflow
+# `permissions:` blocks cannot grant Code Scanning alerts access to.
+# review-feedback-accounting.sh must run under the caller-supplied
+# ACCOUNTING_GH_TOKEN instead when one is set, so a workflow can route just
+# that read-only call through GITHUB_TOKEN (whose scope its `permissions:`
+# block DOES control) without touching the ambient author-attributed token
+# used for the merge itself.
+reset_fixtures
+TEST_AMBIENT_GH_TOKEN="author-merge-token"
+TEST_ACCOUNTING_GH_TOKEN="github-actions-token"
+if run_case && [ "$(cat "$TMP/accounting-token.log" 2>/dev/null)" = "github-actions-token" ]; then
+  pass "review-feedback-accounting.sh runs under ACCOUNTING_GH_TOKEN when the caller supplies one"
+else
+  fail "expected accounting to run under ACCOUNTING_GH_TOKEN (got: $(cat "$TMP/accounting-token.log" 2>/dev/null || echo '<missing>'))"
+fi
+
+reset_fixtures
+TEST_AMBIENT_GH_TOKEN="author-merge-token"
+if run_case && [ "$(cat "$TMP/accounting-token.log" 2>/dev/null)" = "author-merge-token" ]; then
+  pass "review-feedback-accounting.sh falls back to the ambient GH_TOKEN when ACCOUNTING_GH_TOKEN is unset"
+else
+  fail "expected accounting to fall back to the ambient GH_TOKEN (got: $(cat "$TMP/accounting-token.log" 2>/dev/null || echo '<missing>'))"
 fi
 
 echo "test_approval_merge_continuation: $PASS passed, $FAIL failed"
