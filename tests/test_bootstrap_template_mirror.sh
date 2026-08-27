@@ -2085,6 +2085,48 @@ chmod 755 "$LOCKED_DIR"
   && pass "unremovable stale CONTEXT.md fails the cleanup (rc=$rc)" \
   || fail "cleanup swallowed the removal failure"
 
+# ---------------------------------------------------------------------------
+# Codex P1 on #1056/#1112: `git -C "$source_root" rev-parse HEAD` alone is
+# not a valid "source_root is a git repo" test — Git's own repository
+# discovery walks UP from a non-git directory and happily resolves against
+# an ENCLOSING checkout's .git, so a plain directory nested inside an
+# unrelated repo would silently record that ancestor's HEAD as the
+# consumer's HUB_REF. Drives bootstrap::_init_target_git directly (same
+# sourcing pattern as the live _anchor_insert test above) against a
+# source_root that is a non-git dir nested inside an otherwise-unrelated
+# git repo, and asserts the ancestor's sha is NOT recorded.
+# ---------------------------------------------------------------------------
+NESTED_ENCLOSING="$WORKDIR/nested-enclosing-repo"
+mkdir -p "$NESTED_ENCLOSING/nested/not-a-repo"
+git -C "$NESTED_ENCLOSING" init -q -b main
+echo seed >"$NESTED_ENCLOSING/f"
+git -C "$NESTED_ENCLOSING" add -A
+git -C "$NESTED_ENCLOSING" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "enclosing repo seed"
+ENCLOSING_SHA=$(git -C "$NESTED_ENCLOSING" rev-parse HEAD)
+NESTED_SOURCE="$NESTED_ENCLOSING/nested/not-a-repo"
+NESTED_TARGET="$WORKDIR/nested-target"
+mkdir -p "$NESTED_TARGET"
+echo seed >"$NESTED_TARGET/README.md"
+bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$NESTED_TARGET" "$NESTED_SOURCE" >/dev/null
+
+nested_subject=$(git -C "$NESTED_TARGET" log -1 --format=%s)
+if echo "$nested_subject" | grep -qF "${ENCLOSING_SHA:0:7}"; then
+  fail "non-git source_root nested inside an unrelated repo leaked the ancestor's sha: $nested_subject"
+else
+  pass "non-git source_root nested inside an unrelated repo does not leak the ancestor's sha (#1056 Codex P1)"
+fi
+[ "$nested_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "nested non-git source_root falls back to the un-attributed subject" \
+  || fail "nested non-git source_root subject wrong: $nested_subject"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

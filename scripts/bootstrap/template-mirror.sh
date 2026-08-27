@@ -1210,9 +1210,26 @@ bootstrap::_init_target_git() {
   # membership. Best-effort: an unreadable source_root (a non-git checkout,
   # or a caller that never passes one) falls back to the un-attributed
   # subject rather than blocking the bootstrap over a diagnostic.
-  local source_sha=""
-  if [ -n "$source_root" ]; then
-    source_sha=$(git -C "$source_root" rev-parse HEAD 2>/dev/null) || source_sha=""
+  #
+  # Codex P1 on #1056/#1112: `git -C "$source_root" rev-parse HEAD` alone
+  # is not a valid "is this a git repo" test — Git's own repository
+  # discovery walks UP from a non-git source_root and happily resolves
+  # against an ENCLOSING checkout's .git, so a plain non-git directory
+  # nested inside an unrelated repo would silently record that ancestor's
+  # HEAD as the HUB_REF. Require source_root itself to BE the discovered
+  # toplevel (canonicalized, so a symlinked path still matches) before
+  # trusting the sha; anything else — no repo, or a repo whose toplevel is
+  # an ancestor — falls back to the un-attributed subject exactly like an
+  # unreadable source_root always has.
+  local source_sha="" source_toplevel="" source_root_canon=""
+  if [ -n "$source_root" ] && [ -d "$source_root" ]; then
+    source_toplevel=$(git -C "$source_root" rev-parse --show-toplevel 2>/dev/null) || source_toplevel=""
+    if [ -n "$source_toplevel" ]; then
+      source_root_canon=$(cd "$source_root" && pwd -P)
+      if [ "$(cd "$source_toplevel" && pwd -P)" = "$source_root_canon" ]; then
+        source_sha=$(git -C "$source_root" rev-parse HEAD 2>/dev/null) || source_sha=""
+      fi
+    fi
   fi
 
   local commit_message
