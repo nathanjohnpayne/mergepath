@@ -3538,6 +3538,49 @@ autocrlf_dirty_subject=$(git -C "$AUTOCRLF_DIRTY_TARGET" log -1 --format=%s)
   && pass "a line-ending mismatch hidden by core.autocrlf=true blocks attribution (#1056 Codex P2 round 18)" \
   || fail "autocrlf-dirty source_root wrongly got attribution: $autocrlf_dirty_subject"
 
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 19: with core.symlinks=false, a tracked symlink
+# is materialized as an ordinary text file (containing the link target
+# string) rather than a real symlink, and git status does not report the
+# type change against HEAD's recorded mode 120000. rsync -a still copies
+# that regular file's physical bytes and type, so the target commits mode
+# 100644 where HEAD has 120000. Verify the fixture actually reproduces an
+# empty `git status --porcelain` under the repo's own core.symlinks=false
+# before asserting the fix, so this test cannot pass vacuously.
+# ---------------------------------------------------------------------------
+SYMLINKS_DIRTY_SOURCE="$WORKDIR/symlinks-dirty-repo"
+mkdir -p "$SYMLINKS_DIRTY_SOURCE"
+git -C "$SYMLINKS_DIRTY_SOURCE" init -q -b main
+git -C "$SYMLINKS_DIRTY_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+(cd "$SYMLINKS_DIRTY_SOURCE" && ln -s target.txt link.txt)
+printf 'target content\n' >"$SYMLINKS_DIRTY_SOURCE/target.txt"
+git -C "$SYMLINKS_DIRTY_SOURCE" add -A
+git -C "$SYMLINKS_DIRTY_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "symlinks-dirty-repo seed"
+git -C "$SYMLINKS_DIRTY_SOURCE" update-ref refs/remotes/origin/main HEAD
+git -C "$SYMLINKS_DIRTY_SOURCE" config core.symlinks false
+rm -f "$SYMLINKS_DIRTY_SOURCE/link.txt"
+git -C "$SYMLINKS_DIRTY_SOURCE" checkout -q -- link.txt
+if [ -n "$(git -C "$SYMLINKS_DIRTY_SOURCE" status --porcelain)" ]; then
+  fail "symlinks-dirty fixture did not reproduce the core.symlinks=false blind spot: $(git -C "$SYMLINKS_DIRTY_SOURCE" status --porcelain)"
+fi
+SYMLINKS_DIRTY_TARGET="$WORKDIR/symlinks-dirty-target"
+mkdir -p "$SYMLINKS_DIRTY_TARGET"
+echo seed >"$SYMLINKS_DIRTY_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$SYMLINKS_DIRTY_TARGET" "$SYMLINKS_DIRTY_SOURCE" >/dev/null
+
+symlinks_dirty_subject=$(git -C "$SYMLINKS_DIRTY_TARGET" log -1 --format=%s)
+[ "$symlinks_dirty_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a symlink-to-file type change hidden by core.symlinks=false blocks attribution (#1056 Codex P2 round 19)" \
+  || fail "symlinks-dirty source_root wrongly blocked attribution: $symlinks_dirty_subject"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

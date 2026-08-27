@@ -1662,8 +1662,18 @@ bootstrap::_resolve_canonical_source_sha() {
   # mismatch against HEAD's LF blob. Confirmed empirically: -c
   # core.autocrlf=false forces the comparison to use the raw disk bytes,
   # correctly reporting the file as modified.
+  #
+  # Codex P2 on #1112 round 19: pin -c core.symlinks=true too. With
+  # core.symlinks=false (common on some Windows/exotic checkouts), a
+  # tracked symlink is materialized as an ordinary text file containing
+  # the link target string, and git status does not report the type
+  # change against HEAD's recorded mode 120000. rsync -a still copies
+  # that regular file's physical bytes and type, so the target commits
+  # mode 100644 where HEAD has 120000 -- a mismatch git status alone
+  # never surfaces. Confirmed empirically: -c core.symlinks=true forces
+  # the comparison to detect the type change (a `T` status line).
   local status_output
-  status_output=$(git -c core.filemode=true -c core.autocrlf=false -C "$source_root" status --porcelain --ignored \
+  status_output=$(git -c core.filemode=true -c core.autocrlf=false -c core.symlinks=true -C "$source_root" status --porcelain --ignored \
     --untracked-files=all --ignore-submodules=none 2>/dev/null) || return 1
   if [ -n "$status_output" ]; then
     # Codex P2 on #1112 round 9: the static BOOTSTRAP_MIRROR_EXCLUDES array
