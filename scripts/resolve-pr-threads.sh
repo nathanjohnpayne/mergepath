@@ -458,7 +458,13 @@ NO_TAG_REPLY=false
 # either form so the auto-resolve mode works with the GraphQL data
 # this script reads. Caught on PR #180 review when every CR thread
 # was skipped as a non-bot author — see #182.
-BOT_LOGINS_RE='^(coderabbitai|chatgpt-codex-connector|dependabot)(\[bot\])?$'
+#
+# github-advanced-security added for #1101: without it, every GHAS
+# code-scanning (CodeQL) thread fell through this gate as a "non-bot
+# author" and was never eligible for --resolve-actioned / --auto-
+# resolve-bots, so a disposed CodeQL finding's thread could only be
+# closed by hand.
+BOT_LOGINS_RE='^(coderabbitai|chatgpt-codex-connector|dependabot|github-advanced-security)(\[bot\])?$'
 
 while [ $# -gt 0 ]; do
   case "$1" in

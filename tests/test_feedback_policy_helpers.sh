@@ -24,6 +24,9 @@
 #   coderabbit_tier_of
 #     14. nitpick / potential-issue default / minor / major /
 #         refactor / plain-note
+#   ghas_severity_tier (#1101)
+#     15. critical/high/medium/low -> p0/p1/p2/p3; none/empty/unrecognized
+#         -> empty (rc0, caller decides the fallback)
 #
 # Bash 3.2 portable.
 
@@ -193,6 +196,18 @@ if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "coderabbit_tier_of: markerless i
 # head closed the pipe early).
 rc=0; big=$(head -c 100000 /dev/zero | tr '\0' 'x'); out=$(coderabbit_tier_of "🟠 Major $big") || rc=$?
 if [ "$rc" -eq 0 ] && [ "$out" = "p1" ]; then pass "coderabbit_tier_of: large body classifies without SIGPIPE abort (#652)"; else fail "coderabbit_tier_of: large body rc=$rc out=[$out]"; fi
+
+# --- ghas_severity_tier (#1101) ---------------------------------------------
+eq "p0" "$(ghas_severity_tier critical)" "ghas_severity_tier: critical -> p0"
+eq "p1" "$(ghas_severity_tier high)"     "ghas_severity_tier: high -> p1"
+eq "p2" "$(ghas_severity_tier medium)"   "ghas_severity_tier: medium -> p2"
+eq "p3" "$(ghas_severity_tier low)"      "ghas_severity_tier: low -> p3"
+eq ""   "$(ghas_severity_tier none)"     "ghas_severity_tier: none -> empty (caller decides the fallback)"
+eq ""   "$(ghas_severity_tier '')"       "ghas_severity_tier: empty input -> empty"
+eq ""   "$(ghas_severity_tier warning)"  "ghas_severity_tier: unrecognized value -> empty"
+
+rc=0; out=$(ghas_severity_tier bogus) || rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "ghas_severity_tier: unrecognized is rc0+empty under set -e"; else fail "ghas_severity_tier: unrecognized rc=$rc out=[$out]"; fi
 
 # ---------------------------------------------------------------------------
 echo

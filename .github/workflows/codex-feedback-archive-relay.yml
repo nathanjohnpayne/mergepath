@@ -17,6 +17,12 @@ permissions:
   contents: read
   issues: write
   pull-requests: read
+  # Required for scripts/codex-p1-gate.sh's scripts/review-feedback-
+  # accounting.sh call, which reads code-scanning/alerts to grade a
+  # github-advanced-security[bot] finding's severity (#1101). Without it,
+  # this job's GITHUB_TOKEN 403s on that read once a PR carries a real
+  # CodeQL comment.
+  security-events: read
 
 jobs:
   relay:

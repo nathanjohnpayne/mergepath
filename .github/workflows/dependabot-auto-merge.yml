@@ -12,6 +12,20 @@ on:
 permissions:
   pull-requests: write
   contents: write
+  # Required for the immediate-squash fallback's scripts/review-feedback-
+  # accounting.sh call, which reads code-scanning/alerts to grade a
+  # github-advanced-security[bot] finding's severity (#1101). Without it,
+  # this job's GITHUB_TOKEN 403s on that read once a PR carries a real
+  # CodeQL comment. This job runs accounting under GITHUB_TOKEN specifically
+  # (not the step's default REVIEWER_ASSIGNMENT_TOKEN, an external PAT this
+  # workflow can't grant scopes to — CodeRabbit on PR #1106), so
+  # security-events: read here is what actually reaches that call.
+  security-events: read
+  # Same reasoning: accounting's issues/{pr}/comments read (PR-level
+  # findings) needs issues read under GITHUB_TOKEN. REVIEWER_ASSIGNMENT_TOKEN
+  # (a full-scope PAT) never needed this declared, so it was absent until
+  # accounting started running under GITHUB_TOKEN for the code-scanning call.
+  issues: read
 
 jobs:
   auto-merge:
@@ -497,8 +511,15 @@ jobs:
                 echo "::error::$FEEDBACK_ACCOUNTING_GATE is missing or not executable in the base checkout; refusing the fallback squash because feedback accounting cannot be verified. Propagate the scripts/ kit, then rerun."
                 exit 1
               fi
+              # Run under GITHUB_TOKEN, not this step's default GH_TOKEN
+              # (REVIEWER_ASSIGNMENT_TOKEN). Accounting is read-only and
+              # needs no reviewer attribution, and REVIEWER_ASSIGNMENT_TOKEN
+              # is an external PAT this workflow's `permissions:` block
+              # cannot grant code-scanning-alerts access to (#1101, CodeRabbit
+              # Major on PR #1106) -- GITHUB_TOKEN is the one token whose
+              # scope this workflow actually controls.
               set +e
-              ACCOUNTING_JSON=$("$FEEDBACK_ACCOUNTING_GATE" "$PR_NUMBER" "$GITHUB_REPOSITORY")
+              ACCOUNTING_JSON=$(GH_TOKEN="$ACCOUNTING_GH_TOKEN" "$FEEDBACK_ACCOUNTING_GATE" "$PR_NUMBER" "$GITHUB_REPOSITORY")
               ACCOUNTING_RC=$?
               set -e
               if [ "$ACCOUNTING_RC" -ne 0 ]; then
@@ -548,3 +569,12 @@ jobs:
           # audit trail was correct for the approval and wrong for
           # the merge.
           AUTHOR_MERGE_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          # GITHUB_TOKEN, scoped by this workflow's own `permissions:`
+          # block (including security-events: read and issues: read added
+          # for #1101) — used ONLY for the immediate-squash fallback's
+          # review-feedback-accounting.sh call above, never for the
+          # reviewer --approve or author-merge calls, which stay on their
+          # own PATs. REVIEWER_ASSIGNMENT_TOKEN is an external secret this
+          # workflow cannot grant Code Scanning alerts access to (CodeRabbit
+          # Major on PR #1106).
+          ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
