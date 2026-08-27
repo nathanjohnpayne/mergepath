@@ -3323,6 +3323,88 @@ else
   echo "$OUT_AWKFAIL" >&2
 fi
 
+# ── Case 44e (#1105, Codex P2): the eligible-list write is checked too ───
+# The direct twin of case 44d. Guarding only the snapshot write left the
+# eligible-list pipeline with the identical failure mode, one function
+# earlier — and it is the pipeline THIS PR added, so shipping 44d without
+# 44e would have fixed the instance and left the class.
+#
+# The failure is injected by shimming `mktemp` to hand back /dev/full for the
+# eligible-list allocation only: creation succeeds, every write fails. That
+# is Codex's own reproduction, and it is more faithful than failing mktemp
+# because it exercises the create-then-write gap rather than the create.
+FULLWRITE_ROOT="$WORKDIR/eligible-write-failure"
+FULLWRITE_REMOTE="$FULLWRITE_ROOT/remote.git"
+FULLWRITE_MAIN="$FULLWRITE_ROOT/main"
+FULLWRITE_BIN="$FULLWRITE_ROOT/bin"
+FULLWRITE_LOG="$FULLWRITE_ROOT/mktemp-hits.log"
+mkdir -p "$FULLWRITE_ROOT" "$FULLWRITE_BIN"
+git init -q --bare "$FULLWRITE_REMOTE"
+git init -q -b main "$FULLWRITE_MAIN"
+(
+  cd "$FULLWRITE_MAIN"
+  git -C "$FULLWRITE_MAIN" config user.email "test@example.com"
+  git -C "$FULLWRITE_MAIN" config user.name "Test"
+  git -C "$FULLWRITE_MAIN" config commit.gpgsign false
+  git -C "$FULLWRITE_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$FULLWRITE_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+FULLWRITE_MAIN=$(cd "$FULLWRITE_MAIN" && pwd -P)
+FULLWRITE_REAL_MKTEMP=$(command -v mktemp)
+cat > "$FULLWRITE_BIN/mktemp" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *wcleanup-eligible*) printf 'hit\n' >> "$FULLWRITE_LOG"; printf '/dev/full\n'; exit 0 ;;
+  esac
+done
+exec "$FULLWRITE_REAL_MKTEMP" "\$@"
+SHIM
+chmod +x "$FULLWRITE_BIN/mktemp"
+
+# Premise: the injected target really is unwritable on this host. It models a
+# write that cannot land, whatever the errno — ENOSPC on Linux where
+# /dev/full is the full-disk device, EPERM on macOS where it does not exist
+# at all. Either way the open fails, which is the condition under test.
+if printf 'x\n' > /dev/full 2>/dev/null; then
+  fail "fixture setup: writes to /dev/full succeed on this host — case 44e cannot model an unwritable target"
+fi
+# Premise: a branch tracks origin, so the eligible-list write is reached.
+if [ "$(git -C "$FULLWRITE_MAIN" for-each-ref --format='%(upstream)' refs/heads/main)" \
+     != "refs/remotes/origin/main" ]; then
+  fail "fixture setup: main does not track origin/main — the eligible-list write would never run"
+fi
+
+set +e
+OUT_FULLWRITE=$( cd "$FULLWRITE_MAIN" && PATH="$FULLWRITE_BIN:$STUB_DIR:$PATH" \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_FULLWRITE=$?
+set -e
+
+if [ ! -s "$FULLWRITE_LOG" ]; then
+  fail "fixture setup: the eligible-list allocation was never attempted, so case 44e asserts nothing"
+  echo "$OUT_FULLWRITE" >&2
+fi
+# Conjunctive for the same reason as 44d: an unchecked pipeline can exit with
+# a status that looks right while the run never reached its summary.
+if [ "$RC_FULLWRITE" -eq 3 ] && echo "$OUT_FULLWRITE" | grep -qE "orphan dirs: +[0-9]"; then
+  pass "#1105 a failed eligible-list write reports an incomplete audit instead of dying"
+else
+  fail "#1105 a failed eligible-list write exited $RC_FULLWRITE without completing the audit"
+  echo "$OUT_FULLWRITE" >&2
+fi
+if echo "$OUT_FULLWRITE" | grep -Fq -- "NOT MEASURED" \
+   && echo "$OUT_FULLWRITE" | grep -Fq -- "LOCAL failure"; then
+  pass "#1105 a failed eligible-list write is attributed to local storage"
+else
+  fail "#1105 a failed eligible-list write was not reported as an unmeasured local failure"
+  echo "$OUT_FULLWRITE" >&2
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

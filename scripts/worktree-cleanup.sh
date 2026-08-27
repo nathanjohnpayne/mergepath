@@ -711,16 +711,45 @@ stale_unpruned_branches() {
   # %(upstream:short) — when a local branch literally named `origin/foo`
   # exists, `:short` renders foo's upstream as `remotes/origin/foo` and the
   # derived head name comes out wrong.
-  git for-each-ref --format='%(refname:lstrip=2)%09%(upstream)' refs/heads/ 2>/dev/null |
-  while IFS=$'\t' read -r branch upstream; do
-    [ -n "$branch" ] || continue
-    case "$upstream" in
-      refs/remotes/origin/*) ;;
-      *) continue ;;
-    esac
-    is_gone_branch "$branch" && continue
-    printf '%s\t%s\n' "$branch" "refs/heads/${upstream#refs/remotes/origin/}"
-  done >"$ELIGIBLE_FILE"
+  # Checked for the same reason the snapshot write below is (Codex P2 on
+  # #1105, the direct twin of that one): `mktemp` created the file, it did
+  # not promise the write will land. Unchecked, a full TMPDIR trips
+  # `set -eo pipefail` here and the run dies with a bare `printf: write
+  # error` and exit 1 — before any summary, so the documented local
+  # NOT MEASURED / exit 3 path never runs.
+  #
+  # The redirect is owned by a trailing `cat`, NOT by the brace group, and
+  # that detail is load-bearing. Measured on bash 3.2 and 5.x:
+  #
+  #   if ! { ...; } >BAD          -> status 0   (the failure is MISSED)
+  #   if ! { ...; } | cat >BAD    -> status 1   (caught)
+  #   if ! printf | awk >BAD      -> status 1   (caught — the snapshot shape)
+  #
+  # A redirection failure on a COMPOUND command does not make the `if`
+  # condition false: bash reports the error, skips the group, and the
+  # condition evaluates as success. The first draft of this guard was written
+  # that way and never fired — the run printed a clean summary and exit 0
+  # while its own eligible list had gone nowhere. Routing the write through a
+  # simple command makes the status reflect it.
+  if ! {
+    git for-each-ref --format='%(refname:lstrip=2)%09%(upstream)' refs/heads/ 2>/dev/null |
+    while IFS=$'\t' read -r branch upstream; do
+      [ -n "$branch" ] || continue
+      case "$upstream" in
+        refs/remotes/origin/*) ;;
+        *) continue ;;
+      esac
+      is_gone_branch "$branch" && continue
+      printf '%s\t%s\n' "$branch" "refs/heads/${upstream#refs/remotes/origin/}"
+    done
+  } | cat >"$ELIGIBLE_FILE"; then
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="local"
+    STALE_SNAPSHOT_REASON="could not write the eligible-branch list (temporary storage unavailable)"
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
+    return 0
+  fi
   if [ ! -s "$ELIGIBLE_FILE" ]; then
     STALE_SNAPSHOT_STATE="ok"
     rm -f "$ELIGIBLE_FILE"
@@ -851,6 +880,14 @@ worktree_records() {
 GONE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-gone.XXXXXX")
 REC_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-rec.XXXXXX")
 STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
+# WRITE failures to these files are a separate concern from their creation,
+# and only the two inside stale_unpruned_branches() are guarded (Codex P2 on
+# #1105, twice). The five top-level writes — GONE_FILE, REC_FILE (x2),
+# MERGE_SWEEP_FILE, KNOWN_FILE — still die on a full TMPDIR with a bare
+# `printf: write error` and exit 1, before any summary. That is loud rather
+# than silent, and those sites carry no exit-3 contract, so it is left as
+# pre-existing behaviour rather than widened here; tracked in #1115.
+#
 # EVERY mktemp site in this script is registered here (#920 finding 2). The
 # five later ones — HEADS_FILE, ELIGIBLE_FILE and RECORDS_FILE inside the
 # helpers above, MERGE_SWEEP_FILE and KNOWN_FILE further down — used to rely
