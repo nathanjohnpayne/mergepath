@@ -325,7 +325,22 @@ while [ "$i" -lt "$pr_count" ]; do
     # finding.)
     original_author=$(printf '%s' "$t" | jq -r '.comments.nodes[0].author.login // "unknown"')
     case "$original_author" in
-      coderabbitai\[bot\]|chatgpt-codex-connector\[bot\]) : ;;
+      # github-advanced-security[bot] added for #1101: resolve-pr-threads.sh's
+      # BOT_LOGINS_RE now recognizes GHAS code-scanning threads for
+      # --auto-resolve-bots / --resolve-actioned, so a GHAS thread resolved
+      # deferred-to-followup needs to surface here too — otherwise the
+      # rollup this mechanism exists to populate silently excludes exactly
+      # the deferred security findings it's supposed to keep from being
+      # forgotten. Both login forms: this query is GraphQL (line ~244), and
+      # unlike coderabbitai/chatgpt-codex-connector (documented elsewhere as
+      # returning the un-suffixed User-type login over GraphQL),
+      # github-advanced-security is a genuine Bot-type actor whose GraphQL
+      # `login` may or may not carry the `[bot]` suffix depending on
+      # context — matching resolve-pr-threads.sh's BOT_LOGINS_RE, which
+      # already accepts both forms defensively rather than asserting one
+      # (Codex on PR #1106: the suffixed-only form here never matched the
+      # unsuffixed GraphQL response).
+      coderabbitai\[bot\]|chatgpt-codex-connector\[bot\]|github-advanced-security|github-advanced-security\[bot\]) : ;;
       *) continue ;;
     esac
 
