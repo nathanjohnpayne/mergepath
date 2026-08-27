@@ -1307,7 +1307,7 @@ except ValueError as e:
   if ! printf '%s\n' "$STRIPPED_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(sh|bash|dash|zsh|ksh|eval|source)([^A-Za-z0-9_]|$)|(^|[[:space:]])\.[[:space:]]'; then
     EVIDENCE_TEXT="$STRIPPED_TEXT"
   fi
-  if ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
+  if ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|new|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
      && ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
      && ! printf '%s\n' "$EVIDENCE_TEXT" | grep -qE '\\(147|150|107|110|x67|x68|x47|x48)'; then
     exit 0
@@ -1372,6 +1372,8 @@ prefix_flag_takes_value() {
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARD_REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
+# shellcheck source=../lib/pr-body-contract.sh
+. "$GUARD_REPO_ROOT/scripts/lib/pr-body-contract.sh"
 
 # Locate the governing review-policy.yml without trusting the caller's
 # cwd to BE the repo root (Codex P2 on PR #442 r21): walk upward from
@@ -1480,7 +1482,7 @@ guarded_gh_invocation_label() {
           parent="$tok"
           continue
           ;;
-        create|merge|comment|review|edit)
+        create|new|merge|comment|review|edit)
           if [ "$saw_ph" -eq 1 ]; then
             # Guarded verb reached across a placeholder run with no literal
             # noun: the noun (and possibly the exe) was synthesized —
@@ -1529,6 +1531,10 @@ guarded_gh_invocation_label() {
     case "$parent:$tok" in
       pr:create|pr:merge|pr:comment|pr:review|pr:edit)
         printf 'gh pr %s\n' "$tok"
+        return 0
+        ;;
+      pr:new)
+        printf 'gh pr create\n'
         return 0
         ;;
       issue:comment)
@@ -1596,7 +1602,7 @@ synth_cmdsub_write_label() {
     # and `gh issue comment`; either way it is a guarded write, so blocking
     # is the fail-closed answer.
     case "$tok" in
-      create|merge|comment|review|edit)
+      create|new|merge|comment|review|edit)
         printf 'gh <synthesized> %s\n' "$tok"
         return 0
         ;;
@@ -2024,7 +2030,11 @@ for i in "${!TOKENS[@]}"; do
       # whatever the substitution yields as the subcommand. Fail closed.
       block_cmdsub_in_gh_stream
     fi
-    PR_SUBCOMMAND="$tok"
+    if [ "$SAW_PR" -eq 1 ] && [ "$tok" = "new" ]; then
+      PR_SUBCOMMAND="create"
+    else
+      PR_SUBCOMMAND="$tok"
+    fi
     PR_SUBCOMMAND_INDEX=$i
     break
   fi
@@ -3011,7 +3021,16 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
         exit 0
       fi
 
-      PR_AUTHORING_AGENT=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oiE 'Authoring-Agent:[[:space:]]*[A-Za-z0-9_-]+' | head -1 | sed -E 's/Authoring-Agent:[[:space:]]*//I' | tr '[:upper:]' '[:lower:]' || true)
+      if ! REVIEW_PR_BODY=$(printf '%s\n' "$REVIEW_PR_JSON" | jq -r '.body // ""'); then
+        echo "BLOCKED: gh-pr-guard could not parse the PR body for the self-approve check." >&2
+        exit 2
+      fi
+      PR_AUTHORING_AGENT_COUNT=$(pr_body_authoring_agent_count "$REVIEW_PR_BODY")
+      PR_AUTHORING_AGENT=$(pr_body_authoring_agent "$REVIEW_PR_BODY")
+      if [ "$PR_AUTHORING_AGENT_COUNT" -ne 1 ] || [ -z "$PR_AUTHORING_AGENT" ]; then
+        echo "BLOCKED: gh-pr-guard could not identify exactly one visible Authoring-Agent in the PR body." >&2
+        exit 2
+      fi
 
       if [ -n "$PR_AUTHORING_AGENT" ] && [ "$PR_AUTHORING_AGENT" = "$REVIEWER_AGENT" ]; then
         # Same-agent author + reviewer. Decide over/under-threshold.
@@ -3073,11 +3092,17 @@ fi
 
 # --- gh pr create ---
 #
-# Substring grep on the raw command is fine here — the body markers
-# `Authoring-Agent:` and `## Self-Review` are content checks, not
-# structural ones, and they don't depend on argument positions or
-# global flags.
+# The canonical author wrapper validates the effective `--body` or
+# `--body-file` content inside the runtime process before the write. Let it own
+# that check so a file-backed body is not rejected merely because its contents
+# are absent from the raw command string. A direct invocation never reaches
+# the wrapper's runtime validator, so retain the static defense-in-depth check
+# for that unsupported path.
 if [ "$PR_SUBCOMMAND" = "create" ]; then
+  if [ "$WRAPPER_KIND" = "author" ]; then
+    exit 0
+  fi
+
   MISSING=""
 
   if ! echo "$COMMAND" | grep -qi 'Authoring-Agent:'; then

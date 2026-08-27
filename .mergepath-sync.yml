@@ -718,7 +718,31 @@ paths:
   - path: scripts/identity-check.sh
     type: canonical
     consumers: all
+  # The guard sources scripts/lib/pr-body-contract.sh, which in turn shells out
+  # to scripts/lib/pr-body-contract.mjs. Both are declared below and named in
+  # `requires:` here, because the coupling is lockstep and fails LOUDLY but
+  # late: without the lib the guard aborts at its `.` source line under `set -u`,
+  # and without the .mjs every contract helper returns empty, which the
+  # self-approve check reads as "no Authoring-Agent" and blocks. Shipping the
+  # guard ahead of either one breaks every guarded write in the consumer.
   - path: scripts/hooks/gh-pr-guard.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/pr-body-contract.sh"   # sourced directly; missing = guard aborts
+      - "scripts/lib/pr-body-contract.mjs"  # invoked by the lib; missing = helpers return empty
+  # The PR-body parsing contract, extracted so the guard and the author wrapper
+  # read identity fields the same way. The .mjs does the parsing because the
+  # markers must be recognised in RENDERED markdown terms — a marker inside an
+  # HTML comment is not a declaration, and a grep cannot tell the difference.
+  # That distinction is what makes the self-approve check fail closed rather
+  # than silently accepting a hidden or duplicated Authoring-Agent line.
+  - path: scripts/lib/pr-body-contract.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/pr-body-contract.mjs"  # every helper shells out to it
+  - path: scripts/lib/pr-body-contract.mjs
     type: canonical
     consumers: all
   - path: scripts/hooks/label-removal-guard.sh
