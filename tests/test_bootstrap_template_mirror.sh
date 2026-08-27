@@ -2338,6 +2338,72 @@ ignored_subject=$(git -C "$IGNORED_TARGET" log -1 --format=%s)
   && pass "a gitignored-but-present file does not get its sha recorded (#1056 CodeRabbit round 5)" \
   || fail "ignored-file source_root leaked a sha: $ignored_subject (had ${IGNORED_SHA:0:7} available)"
 
+# ---------------------------------------------------------------------------
+# Codex P2 on #1112 round 8: --ignored alone over-corrects. A path
+# BOOTSTRAP_MIRROR_EXCLUDES already keeps out of the mirror (.DS_Store here)
+# can never reach the target regardless of its git status, so treating its
+# mere presence as dirty rejects attribution on completely ordinary
+# operator checkouts (every macOS Finder-visited directory grows a stray
+# .DS_Store). Same source shape as the successful FAKE_MP path, but with a
+# mirror-excluded stray file present -- must still get its sha recorded.
+# Paired with a second case proving the filter isn't a blanket bypass: a
+# stray file that is NOT in the exclude list still blocks attribution.
+# ---------------------------------------------------------------------------
+EXCLUDED_NOISE_SOURCE="$WORKDIR/excluded-noise-repo"
+mkdir -p "$EXCLUDED_NOISE_SOURCE"
+git -C "$EXCLUDED_NOISE_SOURCE" init -q -b main
+git -C "$EXCLUDED_NOISE_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo seed >"$EXCLUDED_NOISE_SOURCE/f"
+git -C "$EXCLUDED_NOISE_SOURCE" add -A
+git -C "$EXCLUDED_NOISE_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "excluded-noise-repo seed"
+git -C "$EXCLUDED_NOISE_SOURCE" update-ref refs/remotes/origin/main HEAD
+EXCLUDED_NOISE_SHA=$(git -C "$EXCLUDED_NOISE_SOURCE" rev-parse HEAD)
+echo "finder metadata, never mirrored" >"$EXCLUDED_NOISE_SOURCE/.DS_Store"
+EXCLUDED_NOISE_TARGET="$WORKDIR/excluded-noise-target"
+mkdir -p "$EXCLUDED_NOISE_TARGET"
+echo seed >"$EXCLUDED_NOISE_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$EXCLUDED_NOISE_TARGET" "$EXCLUDED_NOISE_SOURCE" >/dev/null
+
+excluded_noise_subject=$(git -C "$EXCLUDED_NOISE_TARGET" log -1 --format=%s)
+[ "$excluded_noise_subject" = "Initial commit (bootstrapped from mergepath@${EXCLUDED_NOISE_SHA:0:7})" ] \
+  && pass "a mirror-excluded stray file (.DS_Store) does not block attribution (#1056 Codex P2 round 8)" \
+  || fail "excluded-noise source_root wrongly blocked attribution: $excluded_noise_subject (expected sha ${EXCLUDED_NOISE_SHA:0:7})"
+
+REAL_NOISE_SOURCE="$WORKDIR/real-noise-repo"
+mkdir -p "$REAL_NOISE_SOURCE"
+git -C "$REAL_NOISE_SOURCE" init -q -b main
+git -C "$REAL_NOISE_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo seed >"$REAL_NOISE_SOURCE/f"
+git -C "$REAL_NOISE_SOURCE" add -A
+git -C "$REAL_NOISE_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "real-noise-repo seed"
+git -C "$REAL_NOISE_SOURCE" update-ref refs/remotes/origin/main HEAD
+echo "not in any exclude list" >"$REAL_NOISE_SOURCE/genuinely-stray-file.txt"
+REAL_NOISE_TARGET="$WORKDIR/real-noise-target"
+mkdir -p "$REAL_NOISE_TARGET"
+echo seed >"$REAL_NOISE_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$REAL_NOISE_TARGET" "$REAL_NOISE_SOURCE" >/dev/null
+
+real_noise_subject=$(git -C "$REAL_NOISE_TARGET" log -1 --format=%s)
+[ "$real_noise_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "the mirror-exclude filter is not a blanket bypass -- a genuinely stray file still blocks attribution" \
+  || fail "real-noise source_root wrongly got attribution: $real_noise_subject"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

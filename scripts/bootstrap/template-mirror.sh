@@ -1279,9 +1279,45 @@ bootstrap::_resolve_canonical_source_sha() {
   # so a gitignored-but-present file (a build artifact, a stray .env) is
   # invisible to the bare form and would still get copied into the target
   # while HEAD (the attributed sha) carries no record of it.
+  #
+  # Codex P2 round 8: --ignored alone over-corrects. A path that
+  # BOOTSTRAP_MIRROR_EXCLUDES already keeps out of the mirror (.DS_Store,
+  # .claude/worktrees/, ...) can never reach the target regardless of its
+  # git status, so treating its mere presence as "dirty" rejects attribution
+  # on completely ordinary operator checkouts (every macOS Finder-visited
+  # directory grows a stray .DS_Store) for no integrity benefit — the exact
+  # gap #1 exists to prevent, pointed the other way. Filter status lines
+  # against the SAME exclude list the mirror itself uses before judging
+  # cleanliness, so only bytes that would ACTUALLY be copied count.
   local status_output
   status_output=$(git -C "$source_root" status --porcelain --ignored 2>/dev/null) || return 1
-  [ -z "$status_output" ] || return 1
+  if [ -n "$status_output" ]; then
+    local line path base pattern excluded is_dirty=false
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      path="${line:3}"
+      base="${path##*/}"
+      excluded=false
+      for pattern in "${BOOTSTRAP_MIRROR_EXCLUDES[@]}"; do
+        case "$pattern" in
+          */)
+            case "$path" in
+              "$pattern"* | *"/$pattern"*) excluded=true ;;
+            esac
+            ;;
+          */*)
+            [ "$path" = "$pattern" ] && excluded=true
+            ;;
+          *)
+            [ "$base" = "$pattern" ] && excluded=true
+            ;;
+        esac
+        [ "$excluded" = true ] && break
+      done
+      [ "$excluded" = true ] || is_dirty=true
+    done <<<"$status_output"
+    [ "$is_dirty" = false ] || return 1
+  fi
 
   git -C "$source_root" rev-parse HEAD 2>/dev/null
 }
