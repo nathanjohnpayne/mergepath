@@ -829,6 +829,19 @@ jobs:
   # step branch on event name.
   auto-merge-on-approval:
     needs: [load-config, detect-disagreement, block-self-approval, triage]
+    # Job-level override (replaces rather than merges with the workflow
+    # default above): adds security-events: read, required for
+    # scripts/workflow/approval-merge-continuation.sh's
+    # review-feedback-accounting.sh call, which reads code-scanning/alerts
+    # to grade a github-advanced-security[bot] finding's severity (#1101).
+    # That call runs under ACCOUNTING_GH_TOKEN (this job's GITHUB_TOKEN,
+    # not the AUTHOR_MERGE_TOKEN this job otherwise uses) specifically so
+    # this permissions block can reach it — CodeRabbit on PR #1106.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      security-events: read
     if: >
       always() &&
       ((github.event_name == 'pull_request_review' &&
@@ -2076,3 +2089,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          # Routes ONLY the review-feedback-accounting.sh call inside
+          # approval-merge-continuation.sh through GITHUB_TOKEN instead of
+          # the ambient AUTHOR_MERGE_TOKEN above (#1101, CodeRabbit on PR
+          # #1106) — see this job's permissions block for why.
+          ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

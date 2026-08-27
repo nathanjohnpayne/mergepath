@@ -90,7 +90,16 @@ case "$gate_rc" in
 esac
 
 set +e
-bash "$ROOT/scripts/review-feedback-accounting.sh" "$PR_NUMBER" "$REPO"
+# Prefer ACCOUNTING_GH_TOKEN when the caller sets it (#1101, CodeRabbit on
+# PR #1106): every caller of this script runs it under GH_TOKEN=
+# AUTHOR_MERGE_TOKEN, an external PAT secret this repo's workflow
+# `permissions:` blocks cannot grant Code Scanning alerts access to.
+# Accounting is read-only and needs no author attribution, so it runs
+# under GITHUB_TOKEN (scoped by the calling workflow's own permissions)
+# instead when that's supplied; falls back to the ambient GH_TOKEN
+# otherwise, unchanged for CLI/test callers that don't set it.
+GH_TOKEN="${ACCOUNTING_GH_TOKEN:-${GH_TOKEN:-}}" \
+  bash "$ROOT/scripts/review-feedback-accounting.sh" "$PR_NUMBER" "$REPO"
 accounting_rc=$?
 set -e
 case "$accounting_rc" in

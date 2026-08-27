@@ -350,6 +350,70 @@ else
   echo "$out" | sed 's/^/      /' >&2
 fi
 
+# ── Test 5b: github-advanced-security recognized as a bot author (#1101)
+# Before #1101, BOT_LOGINS_RE did not include github-advanced-security, so
+# every CodeQL code-scanning thread fell through the loop's bot-author gate
+# as "non-bot author" and --resolve-actioned / --auto-resolve-bots could
+# never touch it — a disposed CodeQL finding's thread could only be
+# resolved by hand. Same fixture shape as Test 5, GraphQL's un-suffixed
+# login form (author{login} returns "github-advanced-security", not
+# "github-advanced-security[bot]").
+echo
+echo "resolve-pr-threads.sh github-advanced-security recognized as bot author (#1101)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"github-advanced-security"},"path":"src/foo.ts","body":"## CodeQL / Some rule","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"NEWOIDcurrent"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "NEWOIDcurrent"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo --auto-resolve-bots --dry-run 2>&1)
+rc=$?
+set -e
+
+## CodeRabbit (PR #1106) suggested requiring rc=0, modeled on the concern
+## that a failed run could print "WOULD RESOLVE" before exiting non-zero.
+## That doesn't fit THIS mode: --dry-run deliberately exits 3 whenever any
+## actionable item remains (would-resolve/human/stale/etc. > 0) — see the
+## "Fix: dry-run exits 3 if ANY actionable items remain" comment in
+## resolve-pr-threads.sh, added on PR #172 for the same reason (a caller
+## reading rc=0 as "nothing to do" must not be lied to by a dry-run that
+## found real work). Checking rc=3 is the actual fail-closed contract:
+## dry-run's only two reachable exits after the per-thread loop are 0 (no
+## unresolved threads at all) and 3 (found actionable items), so a
+## genuinely broken run never reaches this "WOULD RESOLVE" text with any
+## other code.
+if [ "$rc" -eq 3 ] \
+   && echo "$out" | grep -qE "WOULD RESOLVE|would-resolve: [1-9]" \
+   && ! echo "$out" | grep -q "non-bot author"; then
+  pass=$((pass + 1))
+  echo "  PASS: github-advanced-security thread is treated as bot-authored, not skipped (#1101)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: expected rc=3 (dry-run actionable-items contract) and would-resolve output with no non-bot skip (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
 # ── Test 6: two-page pagination + cursor accumulation
 # CR Major on PR #194 r3 — without exercising the multi-page path,
 # a paginator regression on the happy path stays green. Stub returns
