@@ -631,6 +631,80 @@ origin_fetch_is_conventional() {
   [ "$count" -eq 1 ]
 }
 
+# The single remote read this script performs, wrapped so an UNATTENDED audit
+# can never block on an interactive prompt (#933).
+#
+# `git ls-remote` inherits the operator's transport configuration, and three
+# of its prompt paths will sit forever on a machine with no human at the
+# keyboard: an SSH host-key confirmation or passphrase, a GUI askpass
+# credential dialog, and git's own terminal credential prompt. This audit is
+# documented as read-only and is run from scripts and after every merge, so a
+# HANG is a worse failure than a refusal — and it is a specifically nasty one
+# here, because the caller redirects stderr, so the prompt is invisible and
+# the run simply appears to stop.
+#
+# Every prompt path is therefore turned into an immediate non-zero exit,
+# which stale_unpruned_branches() records as `unknown` — visible in the
+# summary and exit 3, never as a silent clean audit.
+#
+#   GIT_TERMINAL_PROMPT=0     git's own terminal prompt → fail instead
+#   GIT_ASKPASS / SSH_ASKPASS both set to `echo`, which answers empty and
+#                             returns immediately rather than blocking
+#   SSH_ASKPASS_REQUIRE=never forbids the askpass path outright on OpenSSH
+#                             8.4+, where SSH_ASKPASS alone is not enough
+#   ssh -o BatchMode=yes      no passphrase prompt, and an UNKNOWN HOST KEY
+#                             fails rather than asking
+#   ssh -o ConnectTimeout     bounds the TCP/handshake stall
+#   http.lowSpeed*            bounds an HTTPS transfer that stalls mid-read
+#
+# BatchMode is deliberately NOT paired with StrictHostKeyChecking=accept-new.
+# Silently trusting an unknown host key to keep an audit quiet trades a
+# visible stall for an invisible trust decision, which is the wrong direction
+# for a script whose other mode deletes things.
+#
+# The ssh options are APPENDED to any operator GIT_SSH_COMMAND. ssh honours
+# the FIRST occurrence of a repeated -o, so an operator who has explicitly
+# set one of these keeps their value. That is deliberate: this hardens a
+# default, it does not overrule a stated intent.
+#
+# Credential HELPERS are left alone. Disabling them would break the audit on
+# every private remote where it works today; the goal is to block PROMPTS,
+# not cached credentials.
+#
+# The wall-clock ceiling is applied only when a `timeout` implementation is
+# present, and that is not a compromise to apologise for: `timeout(1)` is GNU
+# coreutils and a stock macOS has neither it nor `gtimeout`, so REQUIRING it
+# would disable the probe on this audit's primary host. The env-var and
+# ssh/http bounds above are the portable floor and already close every prompt
+# path; `timeout` adds the total-runtime ceiling that a slow-but-alive remote
+# would otherwise escape. Its exit 124 is just another non-zero exit here, so
+# no caller needs to know which layer stopped the read.
+#
+# WORKTREE_CLEANUP_PROBE_TIMEOUT (seconds) moves the ceiling; ConnectTimeout
+# is derived from it so one knob moves both. A non-numeric or zero value
+# falls back to the default rather than disabling the bound.
+probe_remote_heads() {
+  local secs="${WORKTREE_CLEANUP_PROBE_TIMEOUT:-20}" connect_secs timeout_bin=""
+  case "$secs" in
+    ''|*[!0-9]*|0) secs=20 ;;
+  esac
+  connect_secs=$(( secs / 2 ))
+  [ "$connect_secs" -ge 1 ] || connect_secs=1
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_bin="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    timeout_bin="gtimeout"
+  fi
+  GIT_TERMINAL_PROMPT=0 \
+  GIT_ASKPASS=echo \
+  SSH_ASKPASS=echo \
+  SSH_ASKPASS_REQUIRE=never \
+  GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o ConnectTimeout=$connect_secs" \
+  ${timeout_bin:+$timeout_bin "$secs"} \
+    git -c "http.lowSpeedLimit=1000" -c "http.lowSpeedTime=$secs" \
+        ls-remote --heads origin 2>/dev/null
+}
+
 # Detect local branches whose upstream tracks `origin/<name>` but which
 # `%(upstream:track)` does NOT (yet) mark `gone` — because the remote-tracking
 # ref refs/remotes/origin/<name> is stale, not because the remote branch
@@ -806,11 +880,11 @@ stale_unpruned_branches() {
   fi
 
   local snapshot snapshot_rc=0
-  snapshot=$(git ls-remote --heads origin 2>/dev/null) || snapshot_rc=$?
+  snapshot=$(probe_remote_heads) || snapshot_rc=$?
   if [ "$snapshot_rc" -ne 0 ]; then
     STALE_SNAPSHOT_STATE="unknown"
     STALE_SNAPSHOT_CAUSE="remote"
-    STALE_SNAPSHOT_REASON="git ls-remote --heads origin exited $snapshot_rc"
+    STALE_SNAPSHOT_REASON="the remote-heads probe exited $snapshot_rc (git ls-remote --heads origin; 124 is the probe timeout)"
     rm -f "$ELIGIBLE_FILE"
     ELIGIBLE_FILE=""
     return 0
