@@ -195,7 +195,9 @@
 #      remote-heads snapshot, and allocating and writing that snapshot. It is
 #      NOT only the network read: a full TMPDIR or an unreadable ref database
 #      reaches the same arm, and the NOT MEASURED line names which. The probe
-#      is dry-run only, so --apply never exits 3.
+#      is dry-run only, so --apply never exits 3. A `transport` cause is the
+#      probe REFUSING to run at all, because the configured ssh command could
+#      still prompt; see probe_remote_heads().
 #      Persisting the probe's RESULT is deliberately outside this contract;
 #      that write fails loudly rather than silently (#1115). The canonical
 #      statement is specs/worktree_cleanup_audit.md — keep it, this block and
@@ -631,6 +633,56 @@ origin_fetch_is_conventional() {
   [ "$count" -eq 1 ]
 }
 
+# Why the probe must sometimes REFUSE to run, printed as a reason, or empty
+# when the transport can be hardened (CodeRabbit Major on #1120).
+#
+# Two shapes defeat the hardening:
+#
+#   1. Only GIT_SSH is set. It names a PROGRAM, not a shell command, so there
+#      is nowhere to inject -o BatchMode=yes without changing how git invokes
+#      it.
+#   2. The resolved command already pins BatchMode to something other than
+#      yes. OpenSSH keeps the FIRST value of a repeated option, so an
+#      APPENDED -o BatchMode=yes loses. Measured:
+#        ssh -G -o BatchMode=no  -o BatchMode=yes host  ->  batchmode no
+#        ssh -G -o BatchMode=yes -o BatchMode=no  host  ->  batchmode yes
+#      The append-not-replace rule that protects an operator's settings is
+#      exactly what makes this reachable, so the two are one decision seen
+#      from opposite sides.
+#
+# In both cases the caller reports `unknown` instead of running. A visible
+# incomplete audit is strictly better than an invisible stall: this runs
+# unattended with stderr hidden, which is the failure #933 exists to remove.
+#
+# Textual and therefore conservative — it cannot see inside a wrapper script
+# that sets BatchMode itself, and errs toward refusing.
+#
+# This is a SEPARATE helper called from the caller's own shell, NOT a branch
+# inside probe_remote_heads. probe_remote_heads runs under command
+# substitution, so a global assigned in it dies with the subshell — the #1088
+# defect, which this reproduced on its first draft: the refusal state was set
+# and silently lost, and the audit reported a remote failure instead.
+ssh_transport_refusal() {
+  local base=""
+  if [ -n "${GIT_SSH_COMMAND:-}" ]; then
+    base="$GIT_SSH_COMMAND"
+  else
+    base="$(git config --get core.sshCommand 2>/dev/null || true)"
+    if [ -z "$base" ] && [ -n "${GIT_SSH:-}" ]; then
+      printf '%s' "GIT_SSH names a program, so the probe cannot enforce a non-interactive ssh"
+      return 0
+    fi
+  fi
+  case "$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')" in
+    *batchmode=yes*|*"batchmode yes"*) ;;
+    *batchmode*)
+      printf '%s' "the configured ssh command pins BatchMode to a non-yes value, which an appended option cannot override"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 # The single remote read this script performs, wrapped so an UNATTENDED audit
 # can never block on an interactive prompt (#933).
 #
@@ -685,7 +737,7 @@ origin_fetch_is_conventional() {
 # falls back to the default rather than disabling the bound.
 probe_remote_heads() {
   local secs="${WORKTREE_CLEANUP_PROBE_TIMEOUT:-20}" connect_secs timeout_bin="" \
-        kill_opt="" ssh_base="" ssh_cmd_set=1
+        kill_opt="" ssh_base=""
   # Base 10 EXPLICITLY (Codex P2 on #1120). The digits-only test admits a
   # zero-padded value, and `$(( 08 / 2 ))` is an octal arithmetic ERROR that
   # would make a perfectly reachable remote report NOT MEASURED. `00` passes
@@ -733,33 +785,17 @@ probe_remote_heads() {
     ssh_base="$GIT_SSH_COMMAND"
   else
     ssh_base="$(git config --get core.sshCommand 2>/dev/null || true)"
-    if [ -z "$ssh_base" ]; then
-      if [ -n "${GIT_SSH:-}" ]; then
-        ssh_cmd_set=0
-      else
-        ssh_base="ssh"
-      fi
-    fi
+    [ -n "$ssh_base" ] || ssh_base="ssh"
   fi
 
-  if [ "$ssh_cmd_set" -eq 1 ]; then
-    GIT_TERMINAL_PROMPT=0 \
-    GIT_ASKPASS=echo \
-    SSH_ASKPASS=echo \
-    SSH_ASKPASS_REQUIRE=never \
-    GIT_SSH_COMMAND="$ssh_base -o BatchMode=yes -o ConnectTimeout=$connect_secs" \
-    ${timeout_bin:+$timeout_bin $kill_opt "$secs"} \
-      git -c "http.lowSpeedLimit=1000" -c "http.lowSpeedTime=$secs" \
-          ls-remote --heads origin 2>/dev/null
-  else
-    GIT_TERMINAL_PROMPT=0 \
-    GIT_ASKPASS=echo \
-    SSH_ASKPASS=echo \
-    SSH_ASKPASS_REQUIRE=never \
-    ${timeout_bin:+$timeout_bin $kill_opt "$secs"} \
-      git -c "http.lowSpeedLimit=1000" -c "http.lowSpeedTime=$secs" \
-          ls-remote --heads origin 2>/dev/null
-  fi
+  GIT_TERMINAL_PROMPT=0 \
+  GIT_ASKPASS=echo \
+  SSH_ASKPASS=echo \
+  SSH_ASKPASS_REQUIRE=never \
+  GIT_SSH_COMMAND="$ssh_base -o BatchMode=yes -o ConnectTimeout=$connect_secs" \
+  ${timeout_bin:+$timeout_bin $kill_opt "$secs"} \
+    git -c "http.lowSpeedLimit=1000" -c "http.lowSpeedTime=$secs" \
+        ls-remote --heads origin 2>/dev/null
 }
 
 # Detect local branches whose upstream tracks `origin/<name>` but which
@@ -936,6 +972,17 @@ stale_unpruned_branches() {
     return 0
   fi
 
+  # Checked HERE, not inside probe_remote_heads: that runs under command
+  # substitution, so state assigned in it would be lost (#1088).
+  local refusal=""
+  if refusal="$(ssh_transport_refusal)"; then
+    STALE_SNAPSHOT_STATE="unknown"
+    STALE_SNAPSHOT_CAUSE="transport"
+    STALE_SNAPSHOT_REASON="$refusal"
+    rm -f "$ELIGIBLE_FILE"
+    ELIGIBLE_FILE=""
+    return 0
+  fi
   local snapshot snapshot_rc=0
   snapshot=$(probe_remote_heads) || snapshot_rc=$?
   if [ "$snapshot_rc" -ne 0 ]; then
@@ -1860,6 +1907,14 @@ if [ "$STALE_SNAPSHOT_STATE" = "unknown" ]; then
       printf "      not allocate or write its own working state. Check that\n"
       printf "      TMPDIR (%s) is writable and has free\n" "${TMPDIR:-/tmp}"
       printf "      space, then re-run before trusting this audit (exit 3).\n" ;;
+    transport)
+      printf "      The configured SSH transport cannot be made\n"
+      printf "      non-interactive, so the probe REFUSED to run rather than\n"
+      printf "      risk stalling an unattended audit on a prompt. Either set\n"
+      printf "      GIT_SSH_COMMAND (or core.sshCommand) instead of GIT_SSH, or\n"
+      printf "      stop pinning BatchMode to a non-yes value there — ssh keeps\n"
+      printf "      the FIRST value of a repeated option, so the probe cannot\n"
+      printf "      override it. Then re-run (exit 3).\n" ;;
     refs)
       printf "      This is a LOCAL failure, not a remote one, and NOT a\n"
       printf "      temporary-storage one — this repository's own refs could\n"

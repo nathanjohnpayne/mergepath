@@ -3754,6 +3754,77 @@ SHIM
   fi
 fi
 
+# ── Case 45e (#1120, CodeRabbit Major): refuse an interactive transport ──
+# The append-not-replace rule that protects an operator's ssh settings is
+# exactly what makes this reachable: OpenSSH keeps the FIRST value of a
+# repeated option, so an operator's `-o BatchMode=no` survives the probe's
+# appended `-o BatchMode=yes` and the "hardened" invocation can still prompt.
+# Measured directly rather than assumed:
+#   ssh -G -o BatchMode=no  -o BatchMode=yes host -> batchmode no
+#   ssh -G -o BatchMode=yes -o BatchMode=no  host -> batchmode yes
+#
+# Same hole via GIT_SSH, which names a program with nowhere to inject an
+# option. Both must REFUSE rather than run: a visible incomplete audit beats
+# an invisible stall, which is the whole point of #933.
+
+# Premise: this host's ssh really does keep the first value. If a future
+# OpenSSH changed that, the defect would be gone and the case should say so
+# rather than assert a stale hazard.
+if command -v ssh >/dev/null 2>&1; then
+  if ! ssh -G -o BatchMode=no -o BatchMode=yes example.invalid 2>/dev/null \
+       | grep -Eiq '^batchmode no$'; then
+    fail "fixture setup: ssh no longer keeps the first -o value — case 45e's hazard premise no longer holds"
+  fi
+fi
+
+set +e
+OUT_BMNO=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh -o BatchMode=no" \
+  WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_BMNO=$?
+set -e
+if [ "$RC_BMNO" -eq 3 ] && echo "$OUT_BMNO" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1120 a BatchMode=no transport is refused rather than run"
+else
+  fail "#1120 a BatchMode=no transport was not refused (rc=$RC_BMNO)"
+  echo "$OUT_BMNO" >&2
+fi
+if echo "$OUT_BMNO" | grep -Fq -- "cannot be made"; then
+  pass "#1120 the refusal names the transport, not the network or storage"
+else
+  fail "#1120 an interactive-transport refusal was misattributed"
+  echo "$OUT_BMNO" >&2
+fi
+
+set +e
+OUT_GITSSH=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  env -u GIT_SSH_COMMAND GIT_SSH="$SSHPROBE_ROOT/fake-ssh" \
+  WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_GITSSH=$?
+set -e
+if [ "$RC_GITSSH" -eq 3 ] && echo "$OUT_GITSSH" | grep -Fq -- "GIT_SSH names a program"; then
+  pass "#1120 a GIT_SSH-only transport is refused rather than run unhardened"
+else
+  fail "#1120 a GIT_SSH-only transport was not refused (rc=$RC_GITSSH)"
+  echo "$OUT_GITSSH" >&2
+fi
+# And an explicit BatchMode=yes must still be ACCEPTED — the refusal must not
+# swallow a transport that is already correct.
+: > "$SSHPROBE_LOG"
+set +e
+( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh -o BatchMode=yes" \
+  WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+  bash "$HELPER" --no-color --dry-run >/dev/null 2>&1 )
+set -e
+if [ -s "$SSHPROBE_LOG" ]; then
+  pass "#1120 an already-correct BatchMode=yes transport is still used"
+else
+  fail "#1120 the refusal also rejected a transport that was already non-interactive"
+fi
+
 echo ""
 echo "RESULTS: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]
