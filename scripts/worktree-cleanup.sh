@@ -164,7 +164,13 @@
 # and removing.
 #
 # Exit codes:
-#   0  success (audit clean OR all requested removals succeeded)
+#   0  in a DRY RUN, the audit completed and found nothing actionable.
+#      Under --apply it means only that no attempted removal FAILED — locked
+#      entries, orphans, dirty closed-PR worktrees and diverged branches can
+#      all still be present, because --apply deliberately never touches them
+#      without their opt-in flags or a human decision. A successful apply is
+#      NOT a clean audit; run the dry run to learn whether the tree is clean
+#      (Codex P2 on #1105).
 #   1  generic error (bad invocation, git failure, unsupported state)
 #   2  a COMPLETE audit with actionable findings (dry-run). Lets callers
 #      wire this into "audit fails CI" style checks even though we
@@ -176,14 +182,24 @@
 #      orphans need --force-locked / --orphan-clean. 2 means "everything
 #      that could be checked was checked, and some of it wants attention";
 #      the per-record lines say what kind (Codex P2 on #1105).
-#   3  an INCOMPLETE audit: a read it depends on FAILED, so the report has a
-#      hole in it and its silences are not evidence (#992).
+#   3  an INCOMPLETE audit: a step it depends on FAILED in a way that would
+#      otherwise be INVISIBLE, so one of the report's silences is not
+#      evidence (#992).
 #      The 2-versus-3 axis is COMPLETENESS, not who can act. A 2 may still
 #      need a human; a 3 says the run does not know what it is looking at.
 #      Callers that only branch on 2 are unaffected; callers that treat any
-#      non-zero as actionable still see it. Today the only such read is the
-#      remote-heads snapshot behind stale_unpruned_branches(), which is
-#      dry-run only, so --apply never exits 3.
+#      non-zero as actionable still see it.
+#      The qualifying steps are the ones by which stale_unpruned_branches()
+#      EVALUATES — entering the main worktree, reading the local branch list,
+#      allocating and writing the eligible-branch list, taking the
+#      remote-heads snapshot, and allocating and writing that snapshot. It is
+#      NOT only the network read: a full TMPDIR or an unreadable ref database
+#      reaches the same arm, and the NOT MEASURED line names which. The probe
+#      is dry-run only, so --apply never exits 3.
+#      Persisting the probe's RESULT is deliberately outside this contract;
+#      that write fails loudly rather than silently (#1115). The canonical
+#      statement is specs/worktree_cleanup_audit.md — keep it, this block and
+#      docs/agents/operating-rules.md in step.
 #
 # Notes:
 #   - Always invoked from within a git repo (the main one or a worktree).
@@ -1656,12 +1672,20 @@ printf "  merged+extra (review): %d\n" "${#SUMMARY_DIVERGED_KEPT[@]}"
 # unauthenticated / API error). Distinct from "gone kept (unmerged)".
 printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
 if [ "${#SUMMARY_LOOKUP_UNKNOWN[@]}" -gt 0 ]; then
-  printf "    ^ NOT MEASURED: the merged-PR lookup failed for these branches\n"
-  printf "      (gh missing, unauthenticated, or an API error). They are not\n"
-  printf "      known to be unmerged — they were not evaluated. Restore gh and\n"
-  printf "      re-run before treating them as examined. This class does not\n"
-  printf "      change the exit status: it is reported rather than silent, and\n"
-  printf "      a gh-less machine would otherwise never exit anything else.\n"
+  # Deliberately does NOT name gh as the cause (Codex P2 on #1105).
+  # gh_branch_merged_pr_status() returns `unknown` for an unresolvable local
+  # ref as well — from its `rev-parse --verify` check, BEFORE gh is invoked —
+  # so "restore gh" is the wrong remedy for a branch that vanished during the
+  # sweep. Its own docstring says as much: unknown covers a missing gh, an
+  # unresolvable ref, or a failed API call. Name the possibilities and let the
+  # operator pick, rather than asserting one.
+  printf "    ^ NOT MEASURED: the merged-PR lookup did not complete for these\n"
+  printf "      branches — gh missing or unauthenticated, an API error, or a\n"
+  printf "      local ref that could not be resolved. They are not known to be\n"
+  printf "      unmerged; they were not evaluated. Resolve the cause and re-run\n"
+  printf "      before treating them as examined. This class does not change\n"
+  printf "      the exit status: it is reported rather than silent, and a\n"
+  printf "      gh-less machine would otherwise never exit anything else.\n"
 fi
 # Branches whose remote-tracking ref is stale rather than genuinely gone —
 # a `git branch -vv` false-negative this run would otherwise retain silently
