@@ -22,6 +22,18 @@ spec_test_map:
     - tests/test_coderabbit_wait_statuscontext_ratelimit.sh
   review_feedback_accounting:
     - tests/test_review_feedback_accounting.sh
+  # NOTE - avoid a colon followed by a space anywhere in a comment inside this
+  # block. check_spec_test_alignment parses it line by line and treats any
+  # line containing one as a key, silently rebinding the current spec and
+  # attaching the entries below it to the wrong name. A mapping written with
+  # such a comment reads correctly and does not work.
+  worktree_cleanup_audit:
+    # Covered by the helper's own suite rather than a spec-named file. The
+    # cases that assert the exit contract (unreadable and unwritable snapshot
+    # paths, the eligibility short-circuit, the cause-specific remedy) are
+    # inseparable from the classification fixtures they run against, so a
+    # separate file would duplicate the whole fixture repo.
+    - tests/test_worktree_cleanup.sh
   doc_ownership_validation:
     - tests/test_check_doc_ownership.sh
   repo_lint_execution:
