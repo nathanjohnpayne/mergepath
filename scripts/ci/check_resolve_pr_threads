@@ -350,6 +350,56 @@ else
   echo "$out" | sed 's/^/      /' >&2
 fi
 
+# ── Test 5b: github-advanced-security recognized as a bot author (#1101)
+# Before #1101, BOT_LOGINS_RE did not include github-advanced-security, so
+# every CodeQL code-scanning thread fell through the loop's bot-author gate
+# as "non-bot author" and --resolve-actioned / --auto-resolve-bots could
+# never touch it — a disposed CodeQL finding's thread could only be
+# resolved by hand. Same fixture shape as Test 5, GraphQL's un-suffixed
+# login form (author{login} returns "github-advanced-security", not
+# "github-advanced-security[bot]").
+echo
+echo "resolve-pr-threads.sh github-advanced-security recognized as bot author (#1101)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"github-advanced-security"},"path":"src/foo.ts","body":"## CodeQL / Some rule","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"NEWOIDcurrent"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "NEWOIDcurrent"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo --auto-resolve-bots --dry-run 2>&1)
+rc=$?
+set -e
+
+if echo "$out" | grep -qE "WOULD RESOLVE|would-resolve: [1-9]" && ! echo "$out" | grep -q "non-bot author"; then
+  pass=$((pass + 1))
+  echo "  PASS: github-advanced-security thread is treated as bot-authored, not skipped (#1101)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: expected would-resolve output with no non-bot skip (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
 # ── Test 6: two-page pagination + cursor accumulation
 # CR Major on PR #194 r3 — without exercising the multi-page path,
 # a paginator regression on the happy path stays green. Stub returns

@@ -26,6 +26,7 @@
 #   coderabbit_tier_of "<comment-body>"    # p0..p3|nitpick or empty
 #   coderabbit_tiers_of "<comment-body>"   # every graded marker, in order
 #   coderabbit_finding_scan "<body>"       # strip fenced/pre-merge regions
+#   ghas_severity_tier "<security_severity_level>"  # p0..p3 or empty (#1101)
 #
 # cfg defaults to $CONFIG (the global the gate scripts set) and then to
 # .github/review-policy.yml, matching scripts/lib/reviewers-helpers.sh.
@@ -271,4 +272,31 @@ coderabbit_tier_of() {
     fi
   done
   return 0
+}
+
+# Map a GitHub code-scanning alert's `rule.security_severity_level` value
+# (nathanjohnpayne/mergepath#1101) to the shared p0-p3 ladder, or empty for
+# an unrecognized/absent value. A code-scanning inline PR comment carries no
+# severity of its own — only a link to the alert — so unlike codex_tier_of /
+# coderabbit_tier_of (which parse a comment BODY), the caller resolves the
+# severity STRING itself via the `code-scanning/alerts` API and hands it
+# here. This keeps the network fetch in the caller (review-feedback-
+# accounting.sh already talks to the GitHub API) and this file's "no gh, no
+# network" sourcing contract intact — this function only maps a value it is
+# given.
+#
+#   critical -> p0   high -> p1   medium -> p2   low -> p3
+#
+# GHAS never maps to `nitpick` (that tier is CodeRabbit-only) and an
+# unrecognized level (including `none`, which GitHub uses for rules with no
+# CVSS-derived severity) returns empty; the caller decides the fail-open-vs-
+# closed default for that case, matching every other classifier in this file.
+ghas_severity_tier() {
+  case "${1:-}" in
+    critical) echo p0 ;;
+    high) echo p1 ;;
+    medium) echo p2 ;;
+    low) echo p3 ;;
+    *) return 0 ;;
+  esac
 }
