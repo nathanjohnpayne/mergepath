@@ -454,7 +454,6 @@ jobs:
             scripts/codex-p1-gate.sh "$PR_NUMBER" "$REPO" 2>&1)
           rc=$?
           set -e
-          echo "$output"
           feedback_fp_after="$feedback_fp_before"
           if [ "$fingerprint_available" = true ]; then
             feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh \
@@ -464,6 +463,7 @@ jobs:
               rc=2
             fi
           fi
+          echo "$output"
 
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           # Hand the closing step the exact feedback surface this decision was
@@ -790,7 +790,6 @@ jobs:
               output=$(scripts/codex-p1-gate.sh "$PR" "$REPO" 2>&1)
               rc=$?
               set -e
-              echo "$output"
 
               feedback_fp_after="$feedback_fp_before"
               if [ "$fingerprint_available" = true ]; then
@@ -802,6 +801,7 @@ jobs:
                   had_infra_error=1
                 fi
               fi
+              echo "$output"
             fi
 
             check_title="Codex P1 gate (scheduled leased re-evaluation)"
