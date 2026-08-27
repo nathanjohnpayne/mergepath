@@ -92,8 +92,17 @@ set -euo pipefail
 # tests/test_bootstrap_template_mirror.sh verifies the derivation stays
 # complete and fail-closed (#797 review).
 BOOTSTRAP_MIRROR_EXCLUDES=(
-  # Repo metadata that should never propagate
+  # Repo metadata that should never propagate. Both forms of `.git` are
+  # named deliberately (Codex P1 on #1112 round 17): the trailing-slash
+  # form matches only a DIRECTORY, so a linked worktree target -- whose
+  # `.git` is a regular FILE holding a `gitdir: <path>` pointer -- is not
+  # covered by it alone. rsync's own --delete does not touch a destination
+  # path matching an active --exclude of EITHER form, so both are required
+  # to protect a normal repo's .git/ and a linked worktree's .git file.
+  # Reproduced: rsync -a --delete --exclude='.git/' alone deletes a linked
+  # worktree's .git file; adding a bare .git exclude preserves it.
   '.git/'
+  '.git'
   '.DS_Store'
   'dist/'
 
@@ -302,6 +311,7 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
 # circumstance, so stale residue at those paths is always safe to remove.
 BOOTSTRAP_MIRROR_RECONCILE_PROTECTED=(
   '.git/'
+  '.git'
   '.bootstrap-log'
   '.bootstrap-state'
   '.bootstrap-state.warnings'
@@ -1415,6 +1425,21 @@ bootstrap::_rsync_template() {
 bootstrap::_remove_orphans() {
   local target=$1
   local rc=0
+
+  # Codex P1 on #1112 round 17: bootstrap::_rsync_template normalizes a
+  # trailing-slash target on its OWN local copy (rounds 15-16); that never
+  # propagates back to the caller, and bootstrap::stage_template_mirror
+  # passes the SAME unnormalized $target to this function separately. The
+  # nested-match reconciliation this function calls into (round 16) builds
+  # the identical doubled-slash root_only_protect/prune_expr paths a
+  # trailing-slash target already broke there -- so a target ending in "/"
+  # defeats THIS function's root protections too, descending into
+  # .claude/worktrees/ or .git/ and deleting nested orphans. Normalize
+  # here as well, rather than relying on the caller (or _rsync_template's
+  # separate, non-propagating normalization) to have already done it.
+  while [ "${target%/}" != "$target" ]; do
+    target="${target%/}"
+  done
 
   local orphan
   for orphan in "${BOOTSTRAP_POST_MIRROR_REMOVE[@]}"; do

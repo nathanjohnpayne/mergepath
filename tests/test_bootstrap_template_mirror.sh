@@ -3384,6 +3384,73 @@ else
   pass "bootstrap::_rsync_template refuses a target that normalizes to the filesystem root, even under the real || step_rc=\$? call site convention (#1056 CodeRabbit round 16)"
 fi
 
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 17: bootstrap::_rsync_template normalizes a
+# trailing-slash target on its OWN local copy (rounds 15-16), which never
+# propagates back to the caller; bootstrap::stage_template_mirror passes
+# the SAME unnormalized $target to bootstrap::_remove_orphans separately.
+# The doubled-slash root_only_protect/prune_expr paths that broke there
+# break here too -- descending into a protected .claude/worktrees/
+# checkout and deleting nested content. Reuse run_remove_orphans, but
+# call it with a trailing slash appended to the target.
+# ---------------------------------------------------------------------------
+TRAILING_ORPHAN_DIR="$WORKDIR/trailing-orphan-target"
+mkdir -p "$TRAILING_ORPHAN_DIR/.claude/worktrees/some-branch/tests"
+printf 'uncommitted operator work inside a protected worktree, must survive\n' \
+  >"$TRAILING_ORPHAN_DIR/.claude/worktrees/some-branch/tests/test_mergepath_playground.sh"
+trailing_rc="$(run_remove_orphans "$TRAILING_ORPHAN_DIR/")"
+if [ "$trailing_rc" -ne 0 ]; then
+  fail "trailing-slash orphan cleanup returned rc=$trailing_rc"
+elif [ ! -e "$TRAILING_ORPHAN_DIR/.claude/worktrees/some-branch/tests/test_mergepath_playground.sh" ]; then
+  fail "content inside a protected .claude/worktrees/ checkout was deleted when \$target had a trailing slash -- normalization is not wired into _remove_orphans"
+else
+  pass "bootstrap::_remove_orphans normalizes a trailing-slash target, protecting .claude/worktrees/ content (#1056 Codex P1 round 17)"
+fi
+
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 17: a linked git worktree's root .git is a
+# REGULAR FILE holding a `gitdir: <path>` pointer, not a directory. The
+# --exclude='.git/' pattern (trailing slash) matches directories only, so
+# rsync's own --delete removed that file -- confirmed empirically against
+# this host's rsync, both with a synthetic file and a real `git worktree
+# add` checkout. Added a bare '.git' exclude (no trailing slash, matches
+# any type) alongside the existing directory-only one.
+# ---------------------------------------------------------------------------
+gitfile_src="$(mktemp -d "$WORKDIR/rsync-gitfile-src.XXXXXX")"
+gitfile_dst="$(mktemp -d "$WORKDIR/rsync-gitfile-dst.XXXXXX")"
+mkdir -p "$gitfile_src/docs/agents"
+printf 'readme\n' > "$gitfile_src/README.md"
+printf 'canonical\n' > "$gitfile_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$gitfile_src/docs/agents/bootstrap-runbook.md"
+cat >"$gitfile_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+printf 'gitdir: /some/real/repo/.git/worktrees/linked\n' > "$gitfile_dst/.git"
+set +e
+gitfile_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$gitfile_src" "$gitfile_dst" 2>&1)
+gitfile_rc=$?
+set -e
+if [ "$gitfile_rc" != "0" ]; then
+  fail "rsync with a linked-worktree .git file present failed (rc=$gitfile_rc): $gitfile_out"
+elif [ ! -f "$gitfile_dst/.git" ] || [ -d "$gitfile_dst/.git" ]; then
+  fail "a linked git worktree's .git FILE was deleted (or replaced by a directory) by --delete -- the bare .git exclude is not wired in"
+elif [ "$(cat "$gitfile_dst/.git")" != "gitdir: /some/real/repo/.git/worktrees/linked" ]; then
+  fail "a linked git worktree's .git file content was altered: $(cat "$gitfile_dst/.git" 2>/dev/null)"
+else
+  pass "bootstrap::_rsync_template preserves a linked git worktree's .git FILE, not just a .git directory (#1056 Codex P1 round 17)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"
