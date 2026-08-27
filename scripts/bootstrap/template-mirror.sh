@@ -1304,10 +1304,16 @@ bootstrap::_rsync_template() {
   # fails to detect a symlink at all, and every root_only_protect exclusion
   # silently stops matching, defeating both the symlink guard and the
   # root/.git, root/.bootstrap-state, root/.claude/worktrees protections in
-  # one stroke. A single trailing-slash strip is sufficient for the
-  # realistic case (one trailing slash); nothing downstream re-appends one
-  # before the next use.
-  target="${target%/}"
+  # one stroke.
+  #
+  # Codex P1 on #1112 round 16: a single strip is NOT sufficient --
+  # `--target-dir /tmp/repo//` (two trailing separators) leaves one behind
+  # after one `${target%/}` pass, reproducing the identical bug. Loop until
+  # no trailing slash remains, so any number of trailing separators is
+  # normalized away, not just exactly one.
+  while [ "${target%/}" != "$target" ]; do
+    target="${target%/}"
+  done
 
   # Codex P1 on #1112 round 9: --delete, not a bare mirror. A --resume
   # re-enters this stage from the top against a target that may already

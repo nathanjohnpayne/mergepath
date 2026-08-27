@@ -3253,6 +3253,50 @@ else
   pass "bootstrap::_rsync_template normalizes a trailing-slash target before any root-anchored protection check (#1056 Codex P1 round 15)"
 fi
 
+# ---------------------------------------------------------------------------
+# Codex P1 on #1112 round 16: a single ${target%/} strip removes only ONE
+# trailing separator. --target-dir /tmp/repo// (two trailing slashes)
+# leaves one behind after a single pass, reproducing the identical
+# root-anchored-protection bypass round 15 just fixed. Same fixture as
+# round 15's test, but with TWO trailing slashes appended.
+# ---------------------------------------------------------------------------
+doubleslash_src="$(mktemp -d "$WORKDIR/rsync-doubleslash-src.XXXXXX")"
+doubleslash_dst="$(mktemp -d "$WORKDIR/rsync-doubleslash-dst.XXXXXX")"
+mkdir -p "$doubleslash_src/docs/agents"
+printf 'readme\n' > "$doubleslash_src/README.md"
+printf 'canonical\n' > "$doubleslash_src/docs/agents/decision-records.md"
+printf 'hub only\n' > "$doubleslash_src/docs/agents/bootstrap-runbook.md"
+cat >"$doubleslash_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+YAML
+mkdir -p "$doubleslash_dst/.git"
+printf 'must survive -- this IS the targets own repository\n' > "$doubleslash_dst/.git/HEAD"
+printf 'real wizard state, must survive\n' > "$doubleslash_dst/.bootstrap-state"
+set +e
+doubleslash_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$doubleslash_src" "$doubleslash_dst//" 2>&1)
+doubleslash_rc=$?
+set -e
+if [ "$doubleslash_rc" != "0" ]; then
+  fail "rsync with a double-trailing-slash target failed (rc=$doubleslash_rc): $doubleslash_out"
+elif [ ! -f "$doubleslash_dst/.git/HEAD" ]; then
+  fail "the target's own root .git was deleted when \$target had TWO trailing slashes -- normalization only strips one"
+elif [ ! -f "$doubleslash_dst/.bootstrap-state" ]; then
+  fail "the target's own .bootstrap-state was deleted when \$target had TWO trailing slashes -- normalization only strips one"
+else
+  pass "bootstrap::_rsync_template normalizes ALL trailing slashes, not just one (#1056 Codex P1 round 16)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"
