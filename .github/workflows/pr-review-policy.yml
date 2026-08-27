@@ -483,7 +483,7 @@ jobs:
           # exactly why it fires no run, hence the PAT dispatch that nudges
           # merge-clearance-gate. Every other command keeps the restricted
           # default token.
-          LABEL_REMOVAL_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          LABEL_REMOVAL_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           # Embedded in the lane marker so the signal is HEAD-PINNED — a
           # consumer (merge-clearance-gate.sh's propagation exemption, #429)
