@@ -65,15 +65,28 @@ ISSUES=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comm
 # fingerprint — a race where the alert's severity changes between
 # accounting's two reads within one evaluation window (a newly posted
 # alert becomes resolvable, or an existing one's severity is retriaged)
-# went undetected. Scanned by BODY PATTERN across every inline comment
-# regardless of author, matching render-feedback-archive.sh's own
-# author-agnostic classifiers: being MORE inclusive than accounting's
-# login-gated membership test only makes the fingerprint more sensitive to
-# a real change, never less, which is the safe direction for a
-# before/after consistency check. Lazy: zero alert-number links found
-# means zero fetches, so a repo without code scanning enabled pays
-# nothing extra.
-GHAS_ALERT_NUMBERS=$(printf '%s' "$INLINE" | jq -r '.[].body // ""' | while IFS= read -r body; do
+# went undetected.
+#
+# Scanned only across github-advanced-security[bot]-authored comments —
+# the same provider/root-finding scope accounting's own login-gated
+# ghas_finding_tier uses — not every inline comment regardless of author
+# (Codex review, PR #1124). Scanning every body was over-inclusive in a
+# way that is NOT safely conservative: a human or bot commenting with an
+# unrelated `/security/code-scanning/<number>` link (e.g. quoting a link
+# into a DIFFERENT repository) has no author/repo qualifier in the
+# extracted number, so it would be looked up against THIS repo and, on a
+# 404, hard-fail the whole fingerprint (and the required Codex P1 check
+# it feeds) over a link accounting itself never resolves severity for.
+# The well-known default bot login is used directly rather than adding a
+# review-policy.yml dependency this script didn't previously have — the
+# override in .github/review-policy.yml is documented as an escape hatch
+# for a GitHub-side rename, not real per-repo customization, matching the
+# same simplification codex-p1-gate.yml's archive job already makes for
+# this exact tradeoff. Lazy: zero alert-number links found means zero
+# fetches, so a repo without code scanning enabled pays nothing extra.
+GHAS_ALERT_NUMBERS=$(printf '%s' "$INLINE" \
+  | jq -r '.[] | select((.user.login // "") == "github-advanced-security[bot]") | .body // ""' \
+  | while IFS= read -r body; do
   ghas_alert_number_from_body "$body"
 done | awk 'NF && !seen[$0]++' | sort -n)
 GHAS_SEVERITIES='{}'

@@ -1613,6 +1613,46 @@ assert_eq 2 "$FINGERPRINT_GHAS_RC" "feedback-surface fingerprint fails closed on
 assert_match 'could not read code-scanning alert' "$FINGERPRINT_GHAS_ERROR" \
   "feedback-surface fingerprint names the unreadable alert"
 
+# Codex review, PR #1124: a NON-GHAS comment happening to contain a
+# `/security/code-scanning/<number>` link (e.g. a human or Codex quoting a
+# link into a different repository) must not be treated as this repo's
+# own alert -- accounting itself never resolves severity for a comment
+# outside github-advanced-security[bot]'s own login, so the fingerprint
+# scanning it too would hard-fail the required check on a lookup nothing
+# else in this codebase performs. No fixture is created for alert #62
+# deliberately: if the scan incorrectly included this comment, the
+# missing fixture would 404 and the assertion below would catch it.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 63,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "nathanpayne-codex"},
+    "path": "src/g.js",
+    "line": 1,
+    "body": "See https://github.com/other-org/other-repo/security/code-scanning/62 for a similar issue in that repo."
+  }
+]
+JSON
+FINGERPRINT_UNRELATED_LINK_RC=0
+FINGERPRINT_UNRELATED_LINK=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget) || FINGERPRINT_UNRELATED_LINK_RC=$?
+assert_eq 0 "$FINGERPRINT_UNRELATED_LINK_RC" \
+  "a non-GHAS comment's unrelated alert-shaped link does not fail the fingerprint (#1124)"
+if [ -n "$FINGERPRINT_UNRELATED_LINK" ]; then
+  pass "fingerprint still produces a real hash despite the unrelated link"
+else
+  fail "fingerprint still produces a real hash despite the unrelated link"
+fi
+if grep -F 'repos/acme/widget/code-scanning/alerts/62' "$TMP/gh-calls.log" >/dev/null; then
+  fail "a non-GHAS comment's alert-shaped link is not looked up (#1124)"
+else
+  pass "a non-GHAS comment's alert-shaped link is not looked up (#1124)"
+fi
+
 for caller in \
   scripts/codex-review-request.sh \
   scripts/phase-4b-review.sh \
