@@ -626,10 +626,29 @@ fi
 #   shared parser is markdown-aware and returns only a visible marker; it also
 #   returns empty when the body carries anything other than exactly one, which
 #   leaves SAME_AGENT_REVIEWER empty and keeps the same-agent exclusion armed.
+#   FAIL CLOSED on parser trouble. An empty SAME_AGENT_REVIEWER does not mean
+#   "no same-agent risk" -- downstream it DISABLES the authoring-agent
+#   exclusion, so a parser that cannot run (missing node, absent or broken
+#   .mjs) would silently permit exactly the same-agent APPROVED this gate
+#   exists to refuse. Distinguish "parsed, and there is no marker" from "could
+#   not parse", and treat the latter as a gate error.
 AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
-if [ "$(pr_body_authoring_agent_count "$PR_BODY")" -eq 1 ]; then
-  AUTHORING_AGENT="$(pr_body_authoring_agent "$PR_BODY")"
+if ! AGENT_COUNT="$(pr_body_authoring_agent_count "$PR_BODY")"; then
+  die 3 "shared PR-body parser failed while counting Authoring-Agent markers; refusing to evaluate gate (b) with an unknown authoring agent"
+fi
+case "$AGENT_COUNT" in
+  ''|*[!0-9]*)
+    die 3 "shared PR-body parser returned a non-numeric Authoring-Agent count (${AGENT_COUNT:-empty}); refusing to evaluate gate (b)"
+    ;;
+esac
+if [ "$AGENT_COUNT" -eq 1 ]; then
+  if ! AUTHORING_AGENT="$(pr_body_authoring_agent "$PR_BODY")"; then
+    die 3 "shared PR-body parser failed while reading the Authoring-Agent value; refusing to evaluate gate (b)"
+  fi
+  if [ -z "$AUTHORING_AGENT" ]; then
+    die 3 "shared PR-body parser reported exactly one Authoring-Agent marker but returned an empty value; refusing to evaluate gate (b)"
+  fi
   if [ -n "$AUTHORING_AGENT" ]; then
     # Match against available_reviewers via suffix (e.g., "claude"
     # matches "nathanpayne-claude"). Empty if no match — also

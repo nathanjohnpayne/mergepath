@@ -489,6 +489,16 @@ jobs:
       - name: Check out the shared PR-body parser
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # TRUSTED default-branch checkout, not the PR merge ref (#788, and
+          # the same rule load-config uses above). This job hands a
+          # write-capable token to github-script and then EXECUTES
+          # scripts/lib/pr-body-contract.mjs from this checkout. On
+          # `pull_request` the default ref is the PR merge ref, so an
+          # unpinned checkout would run PR-authored JavaScript with that
+          # token in scope. `persist-credentials: false` removes the
+          # checkout credential; it does NOT make the checked-out code
+          # trusted, and the parser must be the canonical one regardless.
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
       - name: Assign reviewer identity based on Authoring-Agent

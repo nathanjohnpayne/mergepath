@@ -76,7 +76,16 @@ fi
 TOKEN="$GH_RESOLVED_TOKEN"
 
 is_pr_create_command() {
-  [ "${1:-}" = "gh" ] || return 1
+  # Match on the executable BASENAME, not the literal argv token. gh-pr-guard
+  # canonicalizes path-qualified invocations (`/opt/homebrew/bin/gh`, `./gh`)
+  # and then delegates author-wrapped creates to this validator, so a wrapper
+  # that recognized only bare `gh` fell through to the generic path -- skipping
+  # body validation AND the post-create author readback -- while the guard
+  # believed this function had taken responsibility for both.
+  case "${1:-}" in
+    gh|*/gh) ;;
+    *) return 1 ;;
+  esac
   shift
 
   local saw_pr=0

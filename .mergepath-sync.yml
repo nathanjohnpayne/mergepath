@@ -468,9 +468,6 @@ paths:
     # Hard-sources the shared Authoring-Agent parser (#1121): this script
     # decides gate (b), so a divergent local regex here is what makes the
     # same-agent Codex-reaction fallback wrongly eligible.
-    requires:
-      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
-      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
     # Sources scripts/lib/gh-retry-helpers.sh on startup to wrap the
     # statusCheckRollup read in 3×30s retry on transient gh failures
     # (#324). Without the helper present in the consumer, the
@@ -478,6 +475,8 @@ paths:
     # retry semantics are lost — every transient failure becomes a
     # hard rc=3 and the auto-clear stalls.
     requires:
+      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/reviewers-helpers.sh"   # #453, hard-sourced for the gate (b)/(c) reviewer allow-list
       - "scripts/lib/codex-failure-markers.sh"   # #722, sourced for the gate (c) usage-limit/not-connected diagnostic
@@ -1302,9 +1301,6 @@ paths:
     # cannot disagree with the guard or the merge gate about who authored a PR
     # (#1121). Propagating this workflow without the parser leaves the node
     # call failing, which falls through to the default reviewer.
-    requires:
-      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
-      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
     # The detect-disagreement job runs `require('scripts/disagreement-
     # detector.cjs')`. Without the module file, the job aborts on
     # MODULE_NOT_FOUND. Same lockstep coupling as #259 — propagate the
@@ -1319,6 +1315,8 @@ paths:
     # wave that moved the workflow without the kit would break every
     # consumer's load-config step.
     requires:
+      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/disagreement-detector.cjs"
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/"

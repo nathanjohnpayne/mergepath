@@ -19,6 +19,9 @@ pass=0; fail=0
 ok()   { pass=$((pass+1)); echo "PASS: $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL: $1" >&2; }
 
+TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
+trap 'rm -f "$TMP_DETECTOR"' EXIT
+
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 
 # --- 1. every consumer routes through the shared parser ----------------------
@@ -79,6 +82,59 @@ if [ "$got_count" -gt 1 ]; then
 else
   bad "duplicate markers: expected >1, got $got_count"
 fi
+
+# --- 4. the guard/wrapper delegation must agree on WHICH commands it covers ---
+# gh-pr-guard exits 0 for an author-wrapped create on the promise that the
+# wrapper validates the body. That promise is only kept if BOTH sides recognise
+# the same command shapes. The guard canonicalises path-qualified executables
+# and the `new` alias; a wrapper matching only the literal token `gh` would take
+# its generic path and skip validation AND the post-create author readback,
+# while the guard believed it had delegated. Reproduced as hook rc 0 for
+# `gh-as-author.sh -- /opt/homebrew/bin/gh pr create --body INVALID`.
+sed -n '/^is_pr_create_command()/,/^}/p' "$ROOT/scripts/gh-as-author.sh" > "$TMP_DETECTOR"
+# shellcheck source=/dev/null
+. "$TMP_DETECTOR"
+
+check_shape() {
+  local expect="$1"; shift
+  local desc="$1"; shift
+  if is_pr_create_command "$@"; then got=create; else got=other; fi
+  if [ "$got" = "$expect" ]; then ok "wrapper: $desc -> $expect"; else bad "wrapper: $desc -> $got, expected $expect"; fi
+}
+
+check_shape create "bare gh create"              gh pr create --title x
+check_shape create "path-qualified gh create"    /opt/homebrew/bin/gh pr create --title x
+check_shape create "relative-path gh new"        ./gh pr new --title x
+check_shape create "global flag before pr"       gh --repo o/r pr new --title x
+check_shape other  "path-qualified gh merge"     /usr/bin/gh pr merge 1
+check_shape other  "gh edit"                     gh pr edit 1
+# `notgh` must NOT match: the basename rule is */gh or gh exactly, not a suffix.
+check_shape other  "executable merely ending in gh" notgh pr create --title x
+
+# --- 5. a parser that cannot run must FAIL CLOSED, not read as "no marker" ----
+# An empty authoring agent does not mean "no same-agent risk": downstream it
+# DISABLES the authoring-agent exclusion, so a broken parser would permit the
+# same-agent APPROVED that gate (b) exists to refuse. codex-review-check.sh must
+# therefore treat parser trouble as a gate error rather than an answer.
+if grep -q "refusing to evaluate gate (b)" "$ROOT/scripts/codex-review-check.sh"; then
+  ok "codex-review-check refuses to evaluate gate (b) on parser trouble"
+else
+  bad "codex-review-check has no fail-closed guard around the shared parser"
+fi
+
+# And prove the helper really does signal failure when the .mjs is missing --
+# the guard clause above is only load-bearing if this returns non-zero.
+BROKEN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/parity-broken.XXXXXX")"
+mkdir -p "$BROKEN_DIR/lib"
+cp "$ROOT/scripts/lib/pr-body-contract.sh" "$BROKEN_DIR/lib/"
+# .mjs deliberately NOT copied
+if ( . "$BROKEN_DIR/lib/pr-body-contract.sh" >/dev/null 2>&1
+     pr_body_authoring_agent_count "Authoring-Agent: claude" >/dev/null 2>&1 ); then
+  bad "parser helper returned SUCCESS with the .mjs absent (fail-open)"
+else
+  ok "parser helper signals failure when the .mjs is absent (so the guard can fire)"
+fi
+rm -rf "$BROKEN_DIR"
 
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
