@@ -2404,6 +2404,44 @@ real_noise_subject=$(git -C "$REAL_NOISE_TARGET" log -1 --format=%s)
   && pass "the mirror-exclude filter is not a blanket bypass -- a genuinely stray file still blocks attribution" \
   || fail "real-noise source_root wrongly got attribution: $real_noise_subject"
 
+# ---------------------------------------------------------------------------
+# CodeRabbit round 8 (re-raise of the round 5 exotic-git-config class): the
+# cleanliness check must not trust status.showUntrackedFiles from the
+# operator's own gitconfig -- rsync copies whatever is physically present in
+# source_root regardless of what `git status` is configured to report, so a
+# config that suppresses untracked entries must not make a genuinely stray,
+# non-excluded file read as "clean." Same source shape as the real-noise
+# case above, but with status.showUntrackedFiles=no set in the source
+# repo's own local config.
+# ---------------------------------------------------------------------------
+SHOW_UNTRACKED_NO_SOURCE="$WORKDIR/show-untracked-no-repo"
+mkdir -p "$SHOW_UNTRACKED_NO_SOURCE"
+git -C "$SHOW_UNTRACKED_NO_SOURCE" init -q -b main
+git -C "$SHOW_UNTRACKED_NO_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo seed >"$SHOW_UNTRACKED_NO_SOURCE/f"
+git -C "$SHOW_UNTRACKED_NO_SOURCE" add -A
+git -C "$SHOW_UNTRACKED_NO_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "show-untracked-no-repo seed"
+git -C "$SHOW_UNTRACKED_NO_SOURCE" update-ref refs/remotes/origin/main HEAD
+git -C "$SHOW_UNTRACKED_NO_SOURCE" config status.showUntrackedFiles no
+echo "not in any exclude list" >"$SHOW_UNTRACKED_NO_SOURCE/genuinely-stray-file.txt"
+SHOW_UNTRACKED_NO_TARGET="$WORKDIR/show-untracked-no-target"
+mkdir -p "$SHOW_UNTRACKED_NO_TARGET"
+echo seed >"$SHOW_UNTRACKED_NO_TARGET/README.md"
+BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+  set -euo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_init_target_git "$2" "$3"
+' _ "$ROOT" "$SHOW_UNTRACKED_NO_TARGET" "$SHOW_UNTRACKED_NO_SOURCE" >/dev/null
+
+show_untracked_no_subject=$(git -C "$SHOW_UNTRACKED_NO_TARGET" log -1 --format=%s)
+[ "$show_untracked_no_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "status.showUntrackedFiles=no in the source repo's own config does not hide a genuinely stray file from the cleanliness check (#1056 CodeRabbit round 8)" \
+  || fail "show-untracked-no source_root wrongly got attribution despite a stray file hidden by ambient config: $show_untracked_no_subject"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

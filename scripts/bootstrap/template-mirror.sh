@@ -1289,8 +1289,15 @@ bootstrap::_resolve_canonical_source_sha() {
   # gap #1 exists to prevent, pointed the other way. Filter status lines
   # against the SAME exclude list the mirror itself uses before judging
   # cleanliness, so only bytes that would ACTUALLY be copied count.
+  #
+  # CodeRabbit round 8: pin --untracked-files=all and --ignore-submodules=none
+  # on the command line. status.showUntrackedFiles=no or
+  # diff.ignoreSubmodules=all in the operator's ambient gitconfig would
+  # otherwise suppress exactly the entries this check exists to catch, while
+  # rsync still copies the bytes those settings hid from `git status`.
   local status_output
-  status_output=$(git -C "$source_root" status --porcelain --ignored 2>/dev/null) || return 1
+  status_output=$(git -C "$source_root" status --porcelain --ignored \
+    --untracked-files=all --ignore-submodules=none 2>/dev/null) || return 1
   if [ -n "$status_output" ]; then
     local line path base pattern excluded is_dirty=false
     while IFS= read -r line; do
