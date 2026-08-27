@@ -1024,15 +1024,21 @@ fi
 # The PAT must stay scoped to the removal command: the step's default token
 # remains GITHUB_TOKEN so the lane-marker comment stays
 # github-actions-authored for its #429 consumers.
+#
+# What matters here is that LABEL_REMOVAL_TOKEN resolves to a PAT, not WHICH
+# PAT: the re-arm fires for any non-GITHUB_TOKEN actor. Since #1097 the
+# CI-actor role prefers CI_ACTOR_TOKEN (nathanpayne-robot) and falls back to
+# REVIEWER_ASSIGNMENT_TOKEN where that secret is not provisioned, so this
+# asserts the fallback expression rather than one literal secret name.
 prp_workflow=".github/workflows/pr-review-policy.yml"
-if grep -Fq 'LABEL_REMOVAL_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}' "$prp_workflow" \
+if grep -Fq 'LABEL_REMOVAL_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}' "$prp_workflow" \
   && grep -Fq 'GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh pr edit' "$prp_workflow" \
   && awk '/- name: Propagation PR review lane/{f=1} f && /GH_TOKEN: \$\{\{ secrets\.GITHUB_TOKEN \}\}/{found=1} f && /- name:/ && !/Propagation PR review lane/{exit} END{exit found ? 0 : 1}' "$prp_workflow"; then
   pass=$((pass + 1))
   echo "  PASS: propagation-lane label removal is PAT-driven (fires the settle re-arm) while the step default stays GITHUB_TOKEN (#620)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: pr-review-policy's needs-external-review removal must run under LABEL_REMOVAL_TOKEN (REVIEWER_ASSIGNMENT_TOKEN) with the step default left as GITHUB_TOKEN — a GITHUB_TOKEN removal fires no unlabeled re-arm (#620)" >&2
+  echo "  FAIL: pr-review-policy's needs-external-review removal must run under LABEL_REMOVAL_TOKEN (CI_ACTOR_TOKEN, falling back to REVIEWER_ASSIGNMENT_TOKEN) with the step default left as GITHUB_TOKEN — a GITHUB_TOKEN removal fires no unlabeled re-arm (#620)" >&2
 fi
 
 # 2f-bis. Within the propagation lane step, the verified-head marker MUST be
