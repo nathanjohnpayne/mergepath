@@ -1529,7 +1529,7 @@ guarded_gh_invocation_label() {
     esac
 
     case "$parent:$tok" in
-      pr:create|pr:merge|pr:comment|pr:review|pr:edit)
+      pr:new|pr:create|pr:merge|pr:comment|pr:review|pr:edit)
         printf 'gh pr %s\n' "$tok"
         return 0
         ;;
@@ -2030,6 +2030,11 @@ for i in "${!TOKENS[@]}"; do
       # whatever the substitution yields as the subcommand. Fail closed.
       block_cmdsub_in_gh_stream
     fi
+    # `gh pr new` is a working alias for `gh pr create` (gh 2.97: `gh pr new
+    # --help` prints the create help and lists `new` under ALIASES). Resolving
+    # it verbatim left PR_SUBCOMMAND="new", which matched no guarded branch, so
+    # the "Not a covered command? Allow." path exited 0 and the create guard --
+    # Authoring-Agent, ## Self-Review, byline verification -- never ran.
     if [ "$SAW_PR" -eq 1 ] && [ "$tok" = "new" ]; then
       PR_SUBCOMMAND="create"
     else
