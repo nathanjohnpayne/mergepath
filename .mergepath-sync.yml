@@ -176,22 +176,11 @@ consumers:
     visibility: public
     facts:
       frameworks: [react, typescript]
-  # gaycruisebingo was bootstrapped from mergepath (byte-identical
-  # gh-as-author.sh, registered in the loop docs) but was never enrolled
-  # as an ongoing sync consumer, so it missed every post-bootstrap fix
-  # (#741). React 18 + TypeScript + Vite SPA, `"type": "module"` (ESM),
-  # root package.json. No JSX in `.js` files (pure `.tsx`), so no
-  # `jsx_in_js`. It runs vitest with globals (its test files use bare
-  # `describe`/`it`/`expect`/`vi`), and the eslint template emits the
-  # vitest globals block ONLY when `testing: vitest` is set (an unset
-  # `testing` renders NO testing globals — verified against
-  # examples/eslint.config.js § `>>> if testing contains vitest`), so the
-  # fact is REQUIRED here to avoid stripping the block on first sync and
-  # regressing `no-undef` on the test globals. Its first ongoing sync is not
-  # small: measured 2026-08-20 against mergepath at
-  # 9943173ca2b532359d619ffeadda93daf9f9cf43, the hub has 115 kit blobs and
-  # this consumer holds 110 hub-known entries. Follow the canonical per-wave
-  # selection and fan-out gates in docs/agents/propagation-ordering.md.
+  # fiveacross uses React + TypeScript and runs Vitest (verified from its root
+  # package.json). The `testing: vitest` fact keeps the generated ESLint
+  # configuration's Vitest globals block; without it, bare test globals would
+  # be reported as undefined. Follow the canonical per-wave selection and
+  # fan-out gates in docs/agents/propagation-ordering.md.
   - name: fiveacross
     repo: nathanjohnpayne/fiveacross
     visibility: public
@@ -377,6 +366,21 @@ paths:
   # callers. Each caller keeps only its own failure ACTION (die 2 / die 3 /
   # return 3 / return 1), which is the part that genuinely differs.
   - path: scripts/lib/gh-api-array.sh
+    type: canonical
+    consumers: all
+  # The Phase 2.5 invocation decision (#1084). Reads coderabbit.invoke and,
+  # for `complex-changes`, defers to scripts/phase-4b-classifier.sh rather
+  # than inventing a second notion of "complex" that would drift from the
+  # REVIEW_POLICY.md trigger taxonomy. Travels with coderabbit-wait.sh: a
+  # consumer that has the waiter but not the decider has no way to honour its
+  # own `invoke` knob and silently reverts to invoking on every PR.
+  - path: scripts/coderabbit-should-invoke.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/phase-4b-classifier.sh"          # consulted for complex-changes
+      - "tests/test_coderabbit_should_invoke.sh"  # check_coderabbit_wait
+  - path: tests/test_coderabbit_should_invoke.sh
     type: canonical
     consumers: all
   - path: scripts/coderabbit-wait.sh
@@ -1658,6 +1662,8 @@ paths:
       - ".github/workflows/required-check-publisher.yml"  # check_required_check_publisher subject
       - ".github/workflows/pr-audit.yml"       # check_pr_audit_codex_clearance
       - ".github/workflows/repo_lint.yml"      # check_ci_scripts_wired scans it; bidirectional with its requires: scripts/ci/ (#601)
+      - "scripts/coderabbit-should-invoke.sh"   # check_coderabbit_wait (#1084)
+      - "tests/test_coderabbit_should_invoke.sh"  # check_coderabbit_wait (#1084)
   - path: scripts/gh-projects/
     type: kit
     consumers: all

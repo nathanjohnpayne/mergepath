@@ -920,6 +920,22 @@
             <span class="track"></span>
           </label>
         </div>
+        <div class="row">
+          <div>
+            <div class="lbl">Phase 2.5 invocation</div>
+            <div class="hint">When the agent waits for CodeRabbit. Does not stop the App auto-reviewing.</div>
+          </div>
+          <select id="coderabbitInvoke" aria-label="CodeRabbit Phase 2.5 invocation mode">
+            <option value="always">always</option>
+            <!-- selected must match the default state.coderabbitInvoke: the browser
+                 picks the FIRST option otherwise, so the control would read
+                 `always` while the generated YAML said `complex-changes`, and a
+                 user could copy a policy different from the visible selection
+                 (#1084 r8). renderAll() does not synchronize form controls. -->
+            <option value="complex-changes" selected>complex-changes</option>
+            <option value="never">never</option>
+          </select>
+        </div>
         <div class="nested shown" id="coderabbitNested">
           <div class="slider-row">
             <input type="range" id="postClearanceWait" min="60" max="1245" step="30" value="240" aria-label="Post-clearance CodeRabbit wait cap (seconds)" />
@@ -940,8 +956,8 @@
         </div>
         <div class="nested shown" id="codexNested">
           <div class="slider-row">
-            <input type="range" id="codexRounds" min="1" max="5" step="1" value="2" aria-label="Codex maximum review rounds" />
-            <span class="val">max <span id="codexRoundsVal">2</span> rounds</span>
+            <input type="range" id="codexRounds" min="1" max="15" step="1" value="10" aria-label="Codex maximum review rounds" />
+            <span class="val">max <span id="codexRoundsVal">10</span> rounds</span>
           </div>
           <p class="hint">Beyond this, Mergepath stops the loop and pings a human.</p>
           <label class="check-row" for="codexRequestByDefault">
@@ -1121,7 +1137,8 @@
     // instead of the full max_wait_seconds. The owner-decided default is 240.
     postClearanceWait: 240,
     codex: true,
-    codexRounds: 2,
+    codexRounds: 10,
+    coderabbitInvoke: 'complex-changes',
     // Request `@codex review` on every PR, not only above-threshold ones
     // (#486). Mirrors codex.request_by_default in review-policy.yml; the
     // owner-decided default is on (#483).
@@ -1136,9 +1153,9 @@
   };
 
   const PRESETS = {
-    strict:   { threshold: 100, coderabbit: true,  postClearanceWait: 240, codex: true,  codexRounds: 3, codexRequestByDefault: true,  feedbackMode: 'address-all', feedbackPriorities: { p0: true, p1: true, p2: true,  p3: true  } },
-    standard: { threshold: 300, coderabbit: true,  postClearanceWait: 240, codex: true,  codexRounds: 2, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
-    loose:    { threshold: 800, coderabbit: false, postClearanceWait: 240, codex: false, codexRounds: 1, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: false, p2: false, p3: false } },
+    strict:   { threshold: 100, coderabbit: true,  coderabbitInvoke: 'always',          postClearanceWait: 240, codex: true,  codexRounds: 12, codexRequestByDefault: true,  feedbackMode: 'address-all', feedbackPriorities: { p0: true, p1: true, p2: true,  p3: true  } },
+    standard: { threshold: 300, coderabbit: true,  coderabbitInvoke: 'complex-changes', postClearanceWait: 240, codex: true,  codexRounds: 10, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
+    loose:    { threshold: 800, coderabbit: false, coderabbitInvoke: 'never',           postClearanceWait: 240, codex: false, codexRounds: 5, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: false, p2: false, p3: false } },
   };
 
   const LIMITS = {
@@ -1268,7 +1285,19 @@
       { key: 'p1', label: 'Phase 1', note: 'Author' },
       { key: 'p2', label: 'Phase 2', note: 'Internal review' },
     ];
-    if (state.coderabbit) phases.push({ key: 'p25', label: 'Phase 2.5', note: 'CodeRabbit' });
+    // Phase 2.5 is conditional on coderabbit.invoke (#1084). Showing the leg
+    // whenever `enabled` is true made the simulation contradict the policy it
+    // generates: the default `complex-changes` skips routine PRs, so a routine
+    // PR was drawn taking a path the copied YAML would not take. `never` is
+    // unconditional; `complex-changes` depends on the same trigger taxonomy
+    // Phase 4b uses, which this simulation cannot evaluate from the PR knobs
+    // alone, so it is rendered as conditional rather than guessed.
+    if (state.coderabbit && state.coderabbitInvoke !== 'never') {
+      var p25note = state.coderabbitInvoke === 'complex-changes'
+        ? 'CodeRabbit — only if the change is complex (invoke: complex-changes)'
+        : 'CodeRabbit';
+      phases.push({ key: 'p25', label: 'Phase 2.5', note: p25note });
+    }
 
     const overThreshold = pr.lines >= state.threshold;
     const protectedHit = pr.paths.some(p => state.protectedPaths.some(pat => matchGlob(p, pat)));
@@ -1421,6 +1450,16 @@
     yaml.appendChild(document.createTextNode('  '));
     add('k', 'post_clearance_max_wait_seconds'); yaml.appendChild(document.createTextNode(': '));
     add('v', String(state.postClearanceWait)); nl();
+    // Phase 2.5 invocation mode (#1084). Omitting it made a generated policy
+    // fall back to the documented absent-key default of `always`, silently
+    // replacing the repo's `complex-changes` setting with a wait on every PR.
+    // Emitted AFTER severity_gate for the same reason post_clearance is: the
+    // YAML-preview test asserts the enabled -> severity_gate adjacency. Order
+    // is safe because the reader in coderabbit-should-invoke.sh is depth-
+    // scoped (#1084 r3) rather than name-matching at any nesting.
+    yaml.appendChild(document.createTextNode('  '));
+    add('k', 'invoke'); yaml.appendChild(document.createTextNode(': '));
+    add('v', String(state.coderabbitInvoke)); nl();
     add('k', 'codex'); yaml.appendChild(document.createTextNode(':')); nl();
     yaml.appendChild(document.createTextNode('  '));
     add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));
@@ -1646,6 +1685,10 @@
     renderAll();
   });
 
+  $('coderabbitInvoke').addEventListener('change', e => {
+    state.coderabbitInvoke = e.target.value;
+    renderAll();
+  });
   $('codexRounds').addEventListener('input', e => {
     state.codexRounds = +e.target.value;
     $('codexRoundsVal').textContent = state.codexRounds;
@@ -1779,6 +1822,7 @@
     $('postClearanceWait').value = state.postClearanceWait;
     $('postClearanceWaitVal').textContent = state.postClearanceWait;
     document.querySelector('[data-toggle="coderabbit"]').checked = state.coderabbit;
+    $('coderabbitInvoke').value = state.coderabbitInvoke;
     document.querySelector('[data-toggle="codex"]').checked = state.codex;
     document.querySelector('[data-toggle="codexRequestByDefault"]').checked = state.codexRequestByDefault;
     $('codexNested').classList.toggle('shown', state.codex);

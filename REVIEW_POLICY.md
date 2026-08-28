@@ -252,7 +252,13 @@ If any `op` command fails mid-session (rare — only if 1Password locks or the 1
 
 ### Phase 2.5: Automated External Review (CodeRabbit)
 
-> **Applies only to repos with `coderabbit.enabled: true` in `.github/review-policy.yml`.** Skip this phase for repos where CodeRabbit is not enabled.
+> **Applies only when `scripts/coderabbit-should-invoke.sh <PR#>` exits 0.** That script is the decision procedure for whether Phase 2.5 runs at all (#1084): it honours `coderabbit.enabled` and the `coderabbit.invoke` mode — `always`, `complex-changes` (defer to the Phase 4b trigger classifier), or `never`. An absent `invoke` key means `always`, so a repo that has not adopted the knob behaves exactly as before.
+>
+> The script fails toward **invoking**, deliberately and asymmetrically: an unreadable config, an unrecognized mode, or a missing/failing classifier all resolve to invoke, because a wrong skip silently drops a review round while a wrong invoke only costs wall-clock. Only an explicit, well-formed instruction may suppress a reviewer.
+>
+> **What this does not do.** It gates Phase 2.5 — the agent's wait and disposition — not the App's review. `.coderabbit.yml` sets `auto_review.enabled: true`, so the App starts on PR open regardless. Skipping saves the agent's wait; it does **not** reduce provider invocations or rate-limit pressure, and findings the App posts afterwards remain unresolved conversations that the pre-merge gate blocks on, so a skipped PR can still need thread triage. Reducing invocations requires an App-side opt-out and is not attempted here.
+>
+> Reusing the Phase 4b classifier rather than defining a second notion of "complex" is intentional — that taxonomy is already this repo's definition of a change warranting more eyes, and a second threshold would drift from it.
 
 > **Config posture & runbook:** the `.coderabbit.yml` posture audit (why we run `profile: chill`, the `base_branches`/`learnings.scope`/`auto_pause_after_reviewed_commits` decisions), the `@coderabbitai rate limit` diagnostic, and the author-seat coverage procedure live in mergepath's [`docs/agents/coderabbit-audit.md`](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/coderabbit-audit.md) (#491). Consult it before changing `.coderabbit.yml` or debugging a "CodeRabbit never ran" case. That audit is hub-only — it records the template repo's own posture and the fleet-wide seat-coverage sweep — so the link is absolute and stays resolvable from a consumer repo, which does not carry the file.
 
@@ -403,9 +409,11 @@ Worked example: in a `--sync-all` wave, the pure-mirror consumer PRs verify clea
 Phase 4 has two sub-phases that together cover the two ways external review can run:
 
 - **Phase 4a — Automated external review** via the ChatGPT Codex Connector GitHub App. This is the default happy path. The authoring agent drives the review loop without human intervention until Codex signals clearance, then runs a merge-gate check and merges.
-- **Phase 4b — Manual CLI fallback** via a different agent's CLI session (e.g., Codex CLI as `nathanpayne-codex`, or Cursor, or Claude Code). This is the escape hatch when 4a escalates (disagreement or runaway), times out, or is unavailable because `codex.enabled: false`. The human mediates the handoff.
+- **Phase 4b — Manual CLI fallback** via a different agent's CLI session (e.g., Codex CLI as `nathanpayne-codex`, or Cursor, or Claude Code). This is the escape hatch when 4a **times out** or is **unavailable** because `codex.enabled: false` — cases where review did not happen and a substitute reviewer is the right answer. The human mediates the handoff.
 
-An agent proceeds to 4a first. If 4a escalates, times out, or is disabled, the agent falls back to 4b and surfaces the handoff to the human per [Handoff Message Format](#handoff-message-format).
+  **Disagreement and runaway do NOT route here.** They mean review *did* happen and did not converge, which only a human can adjudicate. Dispatching the automated 4b leg for them is unsound: that leg can post an `APPROVED`, letting an unconverged PR merge with nobody having adjudicated it. See § Disagreements and Tiebreaking.
+
+An agent proceeds to 4a first. If 4a **times out or is disabled**, the agent falls back to 4b and surfaces the handoff to the human per [Handoff Message Format](#handoff-message-format). If 4a instead **escalates to disagreement or runaway**, the agent stops the loop, posts a comment summarizing both positions with links to the rounds, alerts the human, and does not merge — it does not dispatch 4b.
 
 #### Phase 4a: Automated External Review (Codex GitHub App)
 
@@ -457,7 +465,7 @@ After posting a trigger, `codex-review-request.sh` waits a short, bounded window
 
      - **Clearance (happy path).** Codex posts a review with no unaddressed **`required`-tier** inline findings (P0/P1 by default; see [§ Feedback Disposition Policy](#feedback-disposition-policy)) on the current HEAD, OR reacts 👍 on or after the current HEAD commit, OR posts a HEAD-anchored affirmative issue-comment verdict (`Didn't find any major issues` + a `Reviewed commit: <sha>` line whose sha prefixes HEAD) with no unaddressed required-tier findings on HEAD (#600/#567). Proceed to step 16a. A verdict-only response is recognized by both the request poll (step 12a) and the merge-gate check (step 16a, `codex-review-check.sh` as of #600) — `codex-review-request.sh`'s poll terminates on it rather than reaching `review_timeout_seconds` (#609).
      - **Disagreement (escalate).** Codex re-flags the same finding after the agent posted a rebuttal. This is "repeat-after-rebuttal." See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
-     - **Runaway (escalate).** The round counter exceeds `codex.max_review_rounds` (default: 2). The 3rd round trips this guard. See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
+     - **Runaway (escalate).** The round counter exceeds `codex.max_review_rounds` (10 since #1084). The 11th round trips this guard. See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
      - **Timeout or account block (fall back).** `codex-review-request.sh` exits with code `4` (`FALLBACK_REQUIRED`) for the current round — either a genuine timeout (`blocked_reason: null`) or a detected account-/connection-level block (`blocked_reason: "usage_limit" | "not_connected"`, #722; short-circuited immediately rather than waited out). The agent falls back to Phase 4b either way. There is no "second timeout" escalation — a single timeout already routes to human mediation via the 4b handoff — but on a non-null `blocked_reason` the handoff should name the account action required, since re-triggering cannot help until a human resolves it.
      - **Feedback unaccounted (stop and disposition).** `codex-review-request.sh` exits with code `6` before posting a trigger. This is not a timeout or Phase 4b fallback: read the accounting JSON, complete every missing disposition, and rerun the same round.
 
@@ -483,7 +491,9 @@ Arming is not one-shot on the approval event. The approval job arms on three tri
 
 #### Phase 4b: Manual CLI Fallback (Human Handoff)
 
-Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times out (single timeout, exit code `4` from `codex-review-request.sh`), or when `codex.enabled: false` in the repo. It preserves the cross-agent review flow that existed before the Codex GitHub App integration and provides a human-mediated escape hatch.
+Phase 4b is invoked when Phase 4a **times out** (single timeout, exit code `4` from `codex-review-request.sh`) or when `codex.enabled: false` in the repo. It preserves the cross-agent review flow that existed before the Codex GitHub App integration and provides a human-mediated escape hatch.
+
+It is **not** the destination for disagreement or runaway. Those are review-did-not-converge outcomes and take the human-tiebreaker route instead; routing them here would let the automated leg approve a review that never converged.
 
 11b. The authoring agent posts the handoff message (see [Handoff Message Format](#handoff-message-format)) as a PR comment and alerts the human.
 
@@ -523,7 +533,7 @@ The `phase_4b_default` field in `.github/review-policy.yml` controls when 4b fir
 
 | Value | Behavior (intended; full wiring lands in #186 + #187) |
 |-------|---------|
-| `fallback-only` | Current behavior. 4b only on 4a unavailability/escalation/timeout. |
+| `fallback-only` | Current behavior. 4b only on 4a unavailability or timeout; disagreement/runaway stays on the human-tiebreaker path. |
 | `complex-changes` | Run `scripts/phase-4b-classifier.sh` AFTER 4a clears; if any trigger matches, post the 4b handoff before merging. |
 | `always` | Skip the classifier; post the 4b handoff for every external-review-threshold PR. |
 
@@ -839,7 +849,7 @@ In Phase 4a, the agent escalates to the human when either of the following fires
 
 1. **Repeat-after-rebuttal.** The agent posted a reply to a Codex inline finding explaining why the finding does not apply. Codex's next review re-flags the same or substantively-equivalent finding. The agent treats this as a disagreement: Codex is not convinced by the rebuttal, and the agent stops trying to change Codex's mind autonomously. Continuing the loop past this point is rude to the reviewer and wastes API calls.
 
-2. **Runaway rounds.** The round counter exceeds `codex.max_review_rounds` (default: 2). The 3rd `@codex review` request trips this guard. This catches cases where Codex keeps finding new, distinct issues on each pass without the review converging. Even if each individual finding is valid, three rounds of novel issues is a signal that the PR scope is too broad and a human should weigh in.
+2. **Runaway rounds.** The round counter exceeds `codex.max_review_rounds` (10 since #1084; it was 2). This catches a review that keeps surfacing new, distinct issues without converging. The budget was raised because two rounds is below the observed convergence length of a real review, not above it: #1080 took four rounds, and rounds 2 and 3 each found a genuine defect that the previous round's fix had introduced. Escalating at the 3rd round would have stopped that review while it was still finding P1s. Ten rounds is a ceiling on non-convergence, not a target — a review still running at round 10 has stopped being a review of this PR and become evidence that its scope is too broad. On exhaustion the agent takes the **human-tiebreaker** route, not the automated Phase 4b leg: it stops the loop, posts a comment summarizing both positions with links to the review rounds, alerts the human, and does not merge. Routing a runaway to automated 4b would be wrong in a specific way — that leg can post an APPROVED and let the flow continue, so a review that never converged would merge with no human ever adjudicating it. Non-convergence is exactly the condition the human tiebreaker exists for. See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
 
 **Timeout is NOT a disagreement signal.** A Codex response timeout (`codex-review-request.sh` exit code `4` = `FALLBACK_REQUIRED`) routes the PR directly to Phase 4b per step 15a above. It is a fallback trigger, not a tiebreaker trigger. Phase 4b itself mediates via the human through the manual handoff, so there is nothing for the disagreement detector to add on top.
 
@@ -975,7 +985,7 @@ codex:
   request_by_default: true                    # post `@codex review` on EVERY PR, not just above-threshold (#486)
   bot_login: "chatgpt-codex-connector[bot]"   # REST API form, with [bot] suffix
   cli_login: nathanpayne-codex                # manual CLI fallback (Phase 4b)
-  max_review_rounds: 2                        # runaway guard; 3rd round escalates
+  max_review_rounds: 10                       # runaway guard; 11th round escalates to the human tiebreaker
   review_timeout_seconds: 840                 # per-round poll timeout (measured verdict p99/max, #623)
   require_ci_green: true                      # merge gate
   allow_phase_4b_substitute: true             # accept Phase 4b APPROVED on HEAD as gate (c) clearance (#218)
@@ -1283,5 +1293,5 @@ To reverse the CodeRabbit integration (e.g., if the trial ends):
 
 1. Uninstall the CodeRabbit GitHub App from the `nathanjohnpayne` GitHub account.
 2. In each repo where CodeRabbit was enabled: set `coderabbit.enabled: false` in `.github/review-policy.yml` and delete `.coderabbit.yml`.
-3. No documentation changes are needed — all agent instructions use conditional language (`"if coderabbit.enabled: true"`) and will skip Phase 2.5 automatically.
+3. No documentation changes are needed — all agent instructions route Phase 2.5 through `scripts/coderabbit-should-invoke.sh`, whose decision skips when `coderabbit.enabled: false`.
 4. Optionally remove `.coderabbit.yml` from the template if CodeRabbit will not be used for future repos.
