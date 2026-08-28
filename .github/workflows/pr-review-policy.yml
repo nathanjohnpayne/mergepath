@@ -38,11 +38,20 @@ jobs:
         with:
           node-version: '24'
 
-      # --self-review-only enforces exactly the pre-existing contract — a real
-      # `## Self-Review` heading — using the markdown-aware parser, so a
-      # heading inside a fenced code block no longer satisfies it. It reads no
-      # policy and makes no claim about `Authoring-Agent:`; widening this
-      # required check to the identity contract is a separate change.
+      # Asks the markdown-aware parser ONE question, through an interface that
+      # already exists on the default branch: is there a real `## Self-Review`
+      # heading? A heading inside a fenced code block answers no, which is the
+      # bypass this fixes. No policy is read and no claim is made about
+      # `Authoring-Agent:` — widening this required check to the identity
+      # contract is a separate change, tracked in #1137.
+      #
+      # Calling `--has-self-review` rather than adding a flag to
+      # scripts/validate-pr-body.sh is deliberate. The validator is loaded from
+      # the DEFAULT BRANCH, so a flag introduced in the same PR that uses it
+      # does not exist yet when the gate runs, and the required check fails
+      # `usage:` on its own PR — the identical bootstrap trap that splitting
+      # #1134 out was meant to remove, one level deeper. Using an interface the
+      # default branch already provides has no such window.
       #
       # The body goes in on STDIN via env, so it is never interpolated into the
       # shell and never appears in argv.
@@ -50,7 +59,14 @@ jobs:
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          printf '%s\n' "$PR_BODY" | scripts/validate-pr-body.sh --self-review-only
+          if printf '%s\n' "$PR_BODY" | node scripts/lib/pr-body-contract.mjs --has-self-review; then
+            echo "Self-Review section found."
+            exit 0
+          fi
+          echo "PR description must contain a '## Self-Review' section." >&2
+          echo "A heading inside a fenced code block does not count." >&2
+          echo "Required items: correctness, regression risk, style/conventions, test coverage, security/dependency hygiene." >&2
+          exit 1
 
   label-gate:
     name: Label Gate
