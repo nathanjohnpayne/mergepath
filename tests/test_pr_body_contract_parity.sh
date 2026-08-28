@@ -514,21 +514,41 @@ done
 # reviewer login must end in `-<canonical>`; the non-reviewer identities must
 # deliberately match none, which is what tells codex-review-check.sh there is
 # no same-agent restriction rather than an unknown writer.
+# Both rosters are DERIVED from the policy, never listed here. Hard-coding them
+# would mean a newly added reviewer is silently unverified — the same
+# hard-code-what-should-be-derived defect this suite exists to catch, and the
+# one that produced the original roster bug.
 reviewers="$(read_available_reviewers "$POLICY")"
-for agent in claude codex cursor; do
+[ -n "$reviewers" ] || bad "no reviewers derived from $POLICY; the coverage loops below would vacuously pass"
+while IFS= read -r reviewer; do
+  [ -n "$reviewer" ] || continue
+  agent="${reviewer#nathanpayne-}"
   if printf '%s\n' "$reviewers" | grep -q -- "-${agent}$"; then
-    ok "canonical '$agent' suffix-matches exactly the reviewer consumers look for"
+    ok "reviewer '$reviewer' canonicalizes to '$agent', which suffix-matches as consumers expect"
   else
-    bad "canonical '$agent' matches no reviewer login; codex-review-check would die 3"
+    bad "reviewer '$reviewer' canonicalizes to '$agent', which matches no reviewer login; codex-review-check would die 3"
   fi
-done
-for agent in nathanjohnpayne robot; do
+done <<< "$reviewers"
+
+# The declared writers that are deliberately NOT reviewers: author_identity and
+# non_reviewer_identities. These must match no reviewer suffix — that is
+# precisely what tells codex-review-check.sh "no same-agent restriction" apart
+# from "unknown writer".
+non_reviewers="$(
+  read_non_reviewer_identities "$POLICY" 2>/dev/null || true
+  grep -m1 '^author_identity:' "$POLICY" 2>/dev/null \
+    | sed -E 's/^author_identity:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^["\x27]//; s/["\x27]$//'
+)"
+[ -n "$non_reviewers" ] || bad "no non-reviewer identities derived from $POLICY; the loop below would vacuously pass"
+while IFS= read -r identity; do
+  [ -n "$identity" ] || continue
+  agent="${identity#nathanpayne-}"
   if printf '%s\n' "$reviewers" | grep -q -- "-${agent}$"; then
-    bad "'$agent' unexpectedly matches a reviewer login; the non-reviewer case is not exercised"
+    bad "non-reviewer '$identity' matches a reviewer login; the no-same-agent case is not exercised"
   else
-    ok "declared non-reviewer '$agent' matches no reviewer, as intended"
+    ok "declared non-reviewer '$identity' matches no reviewer, as intended"
   fi
-done
+done <<< "$non_reviewers"
 
 # --- 14. the policy argument's failure modes must be honest ------------------
 # Before #1132 an unreadable policy rejected EVERY body while reporting
