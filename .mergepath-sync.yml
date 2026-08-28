@@ -176,22 +176,11 @@ consumers:
     visibility: public
     facts:
       frameworks: [react, typescript]
-  # gaycruisebingo was bootstrapped from mergepath (byte-identical
-  # gh-as-author.sh, registered in the loop docs) but was never enrolled
-  # as an ongoing sync consumer, so it missed every post-bootstrap fix
-  # (#741). React 18 + TypeScript + Vite SPA, `"type": "module"` (ESM),
-  # root package.json. No JSX in `.js` files (pure `.tsx`), so no
-  # `jsx_in_js`. It runs vitest with globals (its test files use bare
-  # `describe`/`it`/`expect`/`vi`), and the eslint template emits the
-  # vitest globals block ONLY when `testing: vitest` is set (an unset
-  # `testing` renders NO testing globals — verified against
-  # examples/eslint.config.js § `>>> if testing contains vitest`), so the
-  # fact is REQUIRED here to avoid stripping the block on first sync and
-  # regressing `no-undef` on the test globals. Its first ongoing sync is not
-  # small: measured 2026-08-20 against mergepath at
-  # 9943173ca2b532359d619ffeadda93daf9f9cf43, the hub has 115 kit blobs and
-  # this consumer holds 110 hub-known entries. Follow the canonical per-wave
-  # selection and fan-out gates in docs/agents/propagation-ordering.md.
+  # fiveacross uses React + TypeScript and runs Vitest (verified from its root
+  # package.json). The `testing: vitest` fact keeps the generated ESLint
+  # configuration's Vitest globals block; without it, bare test globals would
+  # be reported as undefined. Follow the canonical per-wave selection and
+  # fan-out gates in docs/agents/propagation-ordering.md.
   - name: fiveacross
     repo: nathanjohnpayne/fiveacross
     visibility: public

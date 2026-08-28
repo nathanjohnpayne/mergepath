@@ -375,13 +375,22 @@ esac
 # script exists to defend. The duplicate detector stays authoritative and runs
 # first; yq only rules on validity and on reading a well-formed file.
 #
-# yq absent is not an error: the awk path stands on its own as it did before,
-# and every ambiguity it cannot see still resolves toward invoking.
-# MERGEPATH_YQ_BIN is a test seam: pointing it at a name that does not exist
-# exercises the yq-absent fallback, which is otherwise unreachable on any
-# machine that has yq installed -- and therefore never covered by CI.
+# A suppressing decision requires the real parser. The local reader deliberately
+# does not try to recognize every invalid YAML shape, so accepting `never`,
+# `enabled: false`, or a routine `complex-changes` result without yq could turn
+# malformed input elsewhere in the document into a skipped review. CI gets one
+# chance to bootstrap the pinned fleet parser; if it is still unavailable, the
+# only safe answer is INVOKE. MERGEPATH_YQ_BIN remains a test seam for that path.
 YQ_BIN=${MERGEPATH_YQ_BIN:-yq}
-if command -v "$YQ_BIN" >/dev/null 2>&1 && [ -f "$CONFIG" ]; then
+if ! command -v "$YQ_BIN" >/dev/null 2>&1 \
+   && [ "$YQ_BIN" = "yq" ] \
+   && [ -x "$SCRIPT_DIR/lib/ensure-yq.sh" ]; then
+  bash "$SCRIPT_DIR/lib/ensure-yq.sh" --ci-only >/dev/null 2>&1 || true
+fi
+if [ -f "$CONFIG" ] && ! command -v "$YQ_BIN" >/dev/null 2>&1; then
+  emit invoke "YAML parser unavailable — policy cannot safely suppress review"
+fi
+if [ -f "$CONFIG" ]; then
   if ! "$YQ_BIN" '.' "$CONFIG" >/dev/null 2>&1; then
     emit invoke "policy file is not valid YAML (rejected by yq); ambiguity resolves toward invoking"
   fi
@@ -448,7 +457,11 @@ set +e
 if [ -n "$REPO" ]; then
   CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --detect-only --repo "$REPO" 2>&1)
 else
-  CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --detect-only 2>&1)
+  # Keep the classifier's implicit `gh repo view` anchored to this script's
+  # checkout. A caller may run the decider by absolute path or symlink while
+  # standing in another repository; inheriting that cwd can classify the same
+  # PR number in the wrong repo and incorrectly suppress review.
+  CLS_OUT=$(cd "$REPO_ROOT" && "$CLASSIFIER" "$PR_NUM" --detect-only 2>&1)
 fi
 CLS_RC=$?
 # An older classifier on a not-yet-synced consumer does not know the flag and
@@ -459,7 +472,7 @@ if [ "$CLS_RC" = 3 ]; then
   if [ -n "$REPO" ]; then
     CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --repo "$REPO" 2>&1)
   else
-    CLS_OUT=$("$CLASSIFIER" "$PR_NUM" 2>&1)
+    CLS_OUT=$(cd "$REPO_ROOT" && "$CLASSIFIER" "$PR_NUM" 2>&1)
   fi
   CLS_RC=$?
 fi

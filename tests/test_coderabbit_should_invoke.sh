@@ -160,6 +160,22 @@ d=$(scratch "$ON"$'\n'"  invoke: never" 0)
 [ $? = 1 ] && pass "explicit never is honoured when run from a foreign cwd" \
              || fail "running from a foreign cwd lost the config and did not skip"
 
+# The same checkout anchoring must carry through to the classifier. A decider
+# reached by absolute path while the caller stands in another repo must not let
+# the classifier's implicit `gh repo view` inherit that foreign cwd.
+_d=$(scratch "$CX" 0)
+_expected_cwd=$(cd "$_d" && pwd -P)
+{
+  echo '#!/usr/bin/env bash'
+  echo "[ \"\$(pwd -P)\" = \"$_expected_cwd\" ] || exit 2"
+  echo 'echo '\''{"match": false, "phase_4b_default": "complex-changes", "files_inspected": 4}'\'''
+  echo 'exit 0'
+} >"$_d/scripts/phase-4b-classifier.sh"
+chmod +x "$_d/scripts/phase-4b-classifier.sh"
+( cd / && "$_d/scripts/coderabbit-should-invoke.sh" 99 >/dev/null 2>&1 )
+[ $? = 1 ] && pass "classifier runs from the script checkout, not the caller cwd" \
+             || fail "classifier inherited the caller cwd and could resolve the wrong repo"
+
 echo "--- #1084 r2: BOTH phase_4b short-circuits are unassessed, not verdicts ---"
 # fallback-only exits 0 (reads as "routine"); always exits 1 (reads as "trigger
 # matched"). Keying on the policy NAME caught only the first half. files_inspected
@@ -322,13 +338,13 @@ _mkr 'coderabbit:\n  invoke: always\n  invoke: never\n'      0 'duplicate invoke
 _mkr 'coderabbit:\n  invoke: always\ncoderabbit:\n  invoke: never\n' 0 'coderabbit blocks' 'duplicate blocks stay ambiguous even though yq would answer never'
 
 else
-  echo "SKIP: parser-validity cases (mikefarah yq not on PATH; the script falls back to awk here)"
+  echo "SKIP: parser-validity cases (mikefarah yq not on PATH; production fails toward invoking here)"
 fi
 
-echo "--- #1084 r14: the yq-absent fallback still stands on its own ---"
-# Unreachable on any machine that has yq, so it would never be exercised
-# without this seam -- an untested fallback is a fallback that has stopped
-# working without anyone noticing.
+echo "--- #1084 r16: a suppressing policy requires the real parser ---"
+# Unreachable on any machine that has yq, so exercise it through the seam. The
+# local reader cannot prove whole-document validity; without the parser even a
+# clean-looking suppressing value must fail toward invoking.
 _mkn() {  # <policy-text> <expect_rc> <name>
   local dir; dir=$(mktemp -d "$WORKDIR/s.XXXXXX"); mkdir -p "$dir/.github" "$dir/scripts"
   cp "$SCRIPT" "$dir/scripts/coderabbit-should-invoke.sh"; chmod +x "$dir/scripts/coderabbit-should-invoke.sh"
@@ -337,13 +353,14 @@ _mkn() {  # <policy-text> <expect_rc> <name>
   ( cd "$dir" && MERGEPATH_YQ_BIN=__absent_yq__ ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
   [ $? = "$2" ] && pass "$3" || fail "$3 (expected rc=$2)"
 }
-_mkn 'coderabbit:\n  invoke: never\n'          1 'without yq: a plain never still skips'
+_mkn 'coderabbit:\n  invoke: never\n'          0 'without yq: a plain never invokes rather than suppressing'
+_mkn 'coderabbit:\n  enabled: false\n'         0 'without yq: enabled false invokes rather than suppressing'
+_mkn 'coderabbit:\n  invoke: complex-changes\n' 0 'without yq: a routine classifier result cannot suppress'
 _mkn 'coderabbit:\n  invoke: always\n'         0 'without yq: a plain always still invokes'
 _mkn 'coderabbit:\n\tinvoke: never\n'          0 'without yq: the awk tab detection still invokes'
 _mkn 'coderabbit:\n  enabled true\n  invoke: never\n' 0 'without yq: the awk colonless detection still invokes'
 _mkn 'coderabbit:\n  invoke: never\n  invoke: always\n' 0 'without yq: duplicate keys still invoke'
-# The honest limit of the fallback, pinned so it is not mistaken for coverage:
-# without a parser these two are NOT detected, and both fail SAFE (invoke).
+# Without a parser these two are not inspected further; both still fail safe.
 _mkn 'other:\n  [bad\ncoderabbit:\n  invoke: always\n' 0 'without yq: an invalid document is undetected but still invokes'
 _mkn '  coderabbit:\n    invoke: never\n'      0 'without yq: an indented root is unread, defaulting to invoke'
 

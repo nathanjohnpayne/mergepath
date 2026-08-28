@@ -303,6 +303,25 @@ if [ "$FILES_COUNT" -eq 0 ]; then
   exit 0
 fi
 
+# Content-based detectors cannot classify a file whose GitHub changed-files
+# entry omits its patch (common for binary or truncated diffs). Counting that
+# entry as "inspected" can turn an incomplete one-file diff into a confident
+# no-match and suppress a review. Treat missing, null, non-string, or empty
+# patches as an incomplete API/fixture payload; callers already fail toward
+# invoking on this documented exit-2 path.
+PATCHLESS_FILES=$(echo "$FILES_JSON" | jq -r '
+  .[]
+  | select((has("patch") | not) or .patch == null or (.patch | type) != "string" or .patch == "")
+  | .filename // "<unknown>"
+' 2>/dev/null) || {
+  echo "Error: failed to validate changed-file patches" >&2; exit 2
+}
+if [ -n "$PATCHLESS_FILES" ]; then
+  echo "Error: changed-files payload is incomplete; patch unavailable for:" >&2
+  echo "$PATCHLESS_FILES" | sed 's/^/  - /' >&2
+  exit 2
+fi
+
 # Pre-extract for the detectors:
 #   FILE_PATHS — newline-separated filenames
 #   PATCH_TEXT — concatenated patch hunks for keyword scanning

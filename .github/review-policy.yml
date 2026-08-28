@@ -702,19 +702,14 @@ codex:
 # is tracked as a narrow-start follow-up, consistent with how those two
 # gates themselves shipped disabled-by-default and were enabled here first.
 #
-# `enabled` governs AGENT behavior only (whether accounting tracks GHAS
-# findings), same semantics as `codex.enabled` / `coderabbit.enabled` — see
-# the "Note on `enabled` flags" in REVIEW_POLICY.md. It is NOT an opt-out
-# that suppresses GHAS comments: code scanning itself is controlled at the
-# repo settings level, independent of this file, so GitHub keeps posting
-# `github-advanced-security[bot]` comments regardless of what this flag
-# says. review-feedback-accounting.sh does not read it for exactly that
-# reason — deliberately, matching precedent: it has never read
-# `codex.enabled` / `coderabbit.enabled` either, because gating tracking on
-# a flag the agent didn't consult when the finding was posted would
-# recreate this whole change's own bug one layer down (a real, still-
-# arriving comment goes untracked because the config disagrees with what
-# GitHub is actually showing). To fully disable GHAS, disable code
+# `enabled` is informational for agent-facing configuration; it does NOT gate
+# feedback accounting and it does NOT suppress GHAS comments. Code scanning is
+# controlled at the repo settings level, independent of this file, so GitHub
+# can keep posting `github-advanced-security[bot]` comments regardless of this
+# value. review-feedback-accounting.sh therefore always tracks those findings:
+# gating on a flag the agent did not consult when a comment arrived would let a
+# real finding disappear from the completeness check. See the "Note on
+# `enabled` flags" in REVIEW_POLICY.md. To fully disable GHAS, disable code
 # scanning in the repo's Security settings — not this flag.
 code_scanning:
   enabled: true

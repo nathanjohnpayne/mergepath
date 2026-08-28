@@ -3,9 +3,9 @@ set -euo pipefail
 
 # Unit-level coverage for scripts/phase-4b-classifier.sh.
 #
-# Runs the classifier against six fixture PRs (one per trigger class
-# plus a no-trigger negative case) and asserts the output triggers
-# array. Fixture inputs live in scripts/ci/fixtures/phase-4b/.
+# Runs the classifier against fixture PRs covering every trigger class,
+# negative cases, and incomplete-payload handling. Fixture inputs live in
+# scripts/ci/fixtures/phase-4b/.
 #
 # Each fixture is a JSON object: {body: string, files: [{filename,
 # patch}, ...]}. The classifier's --fixture flag reads this shape
@@ -110,6 +110,24 @@ assert_triggers "no-trigger fixture (README + LICENSE only) matches nothing" \
 # a distinct top-level dir, spuriously triggering 4b on docs-only PRs.
 assert_triggers "3 root-only files do not trigger cross-cutting-refactor (regression)" \
   "root-files-only.json" "" "0"
+
+# A changed file with no patch was previously counted as inspected even though
+# the content-based detectors saw nothing. That let an incomplete one-file diff
+# return a confident no-match and suppress review. The classifier must report
+# the payload as unassessed via its documented exit-2 path.
+set +e
+patchless_err=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_TRIGGERS/.github/review-policy.yml" \
+  bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/patchless.json" 2>&1 >/dev/null)
+patchless_rc=$?
+set -e
+if [ "$patchless_rc" = "2" ] && echo "$patchless_err" | grep -q "patch unavailable for"; then
+  pass=$((pass + 1))
+  echo "  PASS: a patchless changed-file entry is unassessed (exit 2)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: patchless changed-file entry should exit 2 as unassessed (rc=$patchless_rc)" >&2
+  echo "$patchless_err" | sed 's/^/      /' >&2
+fi
 
 echo
 echo "phase-4b-classifier.sh policy short-circuit tests"

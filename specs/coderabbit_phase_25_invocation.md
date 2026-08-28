@@ -36,7 +36,7 @@ Reading fields through a parser therefore requires duplicate detection that also
 
 **Known limitation, deliberately fail-safe.** A consistently indented root mapping is legal YAML that the reader does not open, so it defaults to `always` and invokes — an explicit `invoke: never` there is not honoured. Flow-style (`coderabbit: {…}`) and anchored (`coderabbit: &policy`) block headers are classified as non-mappings and likewise invoke. A double-quoted block or direct key containing a YAML escape is conservatively treated as ambiguous rather than decoded; otherwise a semantic duplicate such as `"invo\u006be"` could sit beside `invoke: never` and suppress review. These shapes cost an unnecessary wait; none can suppress a review, which is the asymmetry that governs every choice in this file. #1090 tracks replacing the field reader with parser-aware duplicate detection.
 
-When `yq` is absent the hand-rolled reader stands alone, unchanged. It detects strictly less — an invalid document elsewhere in the file is simply not seen — and every ambiguity it cannot see still resolves toward invoking. #1090 tracks replacing the field reader outright; the duplicate detection has to survive it.
+When `yq` is absent, the decider may not suppress review. CI first asks the canonical pinned bootstrap to provide the parser; if no parser is then available, the decision is `invoke` even when the local reader found `enabled: false`, `never`, or a routine `complex-changes` result. The hand-rolled reader detects strictly less, so accepting its suppressing answer alone would let malformed YAML elsewhere in the document skip a review. #1090 tracks replacing the field reader outright; parser-aware duplicate detection has to survive that migration.
 
 The reader accepts ordinary YAML spellings rather than one fixed shape, and must not treat a legal spelling as absent:
 
@@ -55,8 +55,9 @@ And the reader must answer from the right place:
 - `complex-changes` defers to `scripts/phase-4b-classifier.sh` rather than defining a second notion of complexity. The Phase 4b trigger taxonomy is the repository's existing definition of a change warranting more eyes, and a second threshold would drift from it.
 - The classifier is invoked with `--detect-only`, which suppresses its `phase_4b_default` short-circuits so the trigger detectors actually run. Those short-circuits answer "should 4b run" — a disposition question — and return no complexity signal: `fallback-only` exits 0 without inspecting, `always` exits 1 without inspecting.
 - Selectivity is therefore independent of `phase_4b_default`. A routine PR skips under any 4b mode; a complex PR invokes under any 4b mode.
-- If the classifier rejects `--detect-only` (exit `3`, an older copy on a not-yet-synced consumer), the call retries without it, so propagation lag degrades to the previous behaviour instead of invoking on everything.
+- If the classifier rejects `--detect-only` (exit `3`, an older copy on a not-yet-synced consumer), the call retries without it. An older classifier may then short-circuit with `files_inspected: 0`, which deliberately invokes CodeRabbit for every such unassessed PR until propagation catches up; compatibility does not preserve selectivity at the cost of silently skipping review.
 - A classifier result reporting `files_inspected: 0` means the diff was not assessed — a short-circuit on an older copy, or an empty diff — and invokes.
+- A changed-file entry with a missing, null, non-string, or empty `patch` makes the classifier exit as unassessed; content-based detectors did not inspect that file, so a no-match cannot safely suppress review.
 - Any other classifier failure invokes.
 
 ### Consumer parity
