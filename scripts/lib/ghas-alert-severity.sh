@@ -100,12 +100,26 @@ ghas_severity_cache_cleanup() {
   # `.tmp` sibling the write path in ghas_alert_severity can leave behind
   # if jq or mv fails mid-write.
   if [ -n "${GHAS_SEVERITY_CACHE:-}" ]; then
-    rm -f "$GHAS_SEVERITY_CACHE" "$GHAS_SEVERITY_CACHE.tmp"
+    # `|| :` is load-bearing, not cosmetic (CodeRabbit, PR #1124): under
+    # `set -e`, `rm -f` FAILING (a real removal failure -- permissions, a
+    # read-only filesystem -- `-f` only silences "already gone") would
+    # itself abort this function before reaching `return 0` below, the
+    # exact bug this rewrite exists to close, just moved one line down.
+    rm -f "$GHAS_SEVERITY_CACHE" "$GHAS_SEVERITY_CACHE.tmp" || :
   fi
   return 0
 }
 
 ghas_alert_severity() {
+  # Check $# BEFORE touching $1/$2 (CodeRabbit, PR #1124): this function is
+  # sourced by scripts that run under `set -u`, and `local x="$1"` with no
+  # $1 at all is an unbound-variable abort, not the graceful rc=3 usage
+  # error below -- matching gh_api_scalar's own `[ $# -lt N ]`-first
+  # pattern in scripts/lib/gh-api-scalar.sh.
+  if [ $# -lt 2 ]; then
+    printf '[ghas-alert-severity] ERROR: usage: ghas_alert_severity <owner/repo> <alert_number>\n' >&2
+    return 3
+  fi
   local repo="$1" number="$2" cache_key value rc
 
   if [ -z "$repo" ] || [ -z "$number" ]; then
@@ -137,7 +151,19 @@ ghas_alert_severity() {
   # Read-modify-write via a sibling temp file + rename: safe for this
   # library's actual (sequential) callers, and an atomic rename means a
   # reader never observes a half-written cache file even if it did race.
-  jq -c --arg k "$cache_key" --arg v "$value" '.[$k] = $v' "$GHAS_SEVERITY_CACHE" \
-    >"$GHAS_SEVERITY_CACHE.tmp" && mv "$GHAS_SEVERITY_CACHE.tmp" "$GHAS_SEVERITY_CACHE"
+  #
+  # A failed commit here is NOT folded into this function's own rc=3 "read
+  # failed" contract (CodeRabbit, PR #1124, suggested returning 3): the
+  # READ already succeeded and $value is correct, so failing the call over
+  # a cache-write hiccup would make live accounting exit 2 -- treating a
+  # transient temp-file write as equivalent to "could not determine
+  # severity", which it is not. Warn instead: a caller that hits this
+  # simply re-fetches next time for the same alert number, which is a
+  # missed-memoization cost, not a correctness one.
+  if ! { jq -c --arg k "$cache_key" --arg v "$value" '.[$k] = $v' "$GHAS_SEVERITY_CACHE" \
+    >"$GHAS_SEVERITY_CACHE.tmp" && mv "$GHAS_SEVERITY_CACHE.tmp" "$GHAS_SEVERITY_CACHE"; }; then
+    printf '[ghas-alert-severity] WARN: could not write severity cache for %s — will re-fetch next time\n' \
+      "$cache_key" >&2
+  fi
   printf '%s' "$value"
 }

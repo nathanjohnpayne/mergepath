@@ -1726,6 +1726,69 @@ else
   pass "ghas_severity_cache_cleanup removes both the cache file and its .tmp sibling (#1124)"
 fi
 
+# CodeRabbit round 2, PR #1124: a genuinely FAILING `rm -f` (not just an
+# empty cache var) inside the EXIT trap must also not override the
+# caller's exit status -- the same class of bug one line down from the
+# one just fixed above. Shadows `rm` to fail unconditionally, matching
+# CodeRabbit's own PoC.
+CLEANUP_RM_FAIL_RC=0
+bash -c '
+  set -euo pipefail
+  rm() { return 1; }
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$TMP"'/ghas-cleanup-rm-fail"
+  : >"$GHAS_SEVERITY_CACHE"
+  trap "ghas_severity_cache_cleanup" EXIT
+  exit 0
+' || CLEANUP_RM_FAIL_RC=$?
+assert_eq 0 "$CLEANUP_RM_FAIL_RC" "ghas_severity_cache_cleanup survives a genuinely failing rm without overriding the caller's exit status (#1124 round 2)"
+
+# CodeRabbit round 2, PR #1124: this library is sourced by scripts that run
+# under `set -u`. Calling ghas_alert_severity with too few arguments must
+# hit the documented rc=3 usage error, not an unbound-variable abort from
+# `local repo="$1"` evaluating a $1 that was never passed.
+ARGCOUNT_RC=0
+ARGCOUNT_ERR=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  ghas_alert_severity
+' 2>&1) || ARGCOUNT_RC=$?
+assert_eq 3 "$ARGCOUNT_RC" "ghas_alert_severity with zero arguments returns rc=3, not an unbound-variable abort (#1124 round 2)"
+assert_match 'usage: ghas_alert_severity' "$ARGCOUNT_ERR" "missing-argument error names correct usage"
+
+ARGCOUNT_ONE_RC=0
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  ghas_alert_severity acme/widget
+' >/dev/null 2>&1 || ARGCOUNT_ONE_RC=$?
+assert_eq 3 "$ARGCOUNT_ONE_RC" "ghas_alert_severity with only one argument returns rc=3, not an unbound-variable abort (#1124 round 2)"
+
+# CodeRabbit round 2, PR #1124: a failed cache COMMIT (jq or mv failing) must
+# not be folded into the "could not read" rc=3 contract -- the read already
+# succeeded and the correct value must still be returned. The cache file is
+# properly initialized (so ghas_alert_severity's own not-initialized guard
+# doesn't fire), but its directory is read-only, so the `.tmp` sibling
+# write fails every time; the correct severity must still come back, and a
+# WARN must land on stderr instead of the failure being silent.
+COMMIT_FAIL_DIR="$TMP/ghas-commit-fail-dir"
+mkdir -p "$COMMIT_FAIL_DIR"
+printf '{}' >"$COMMIT_FAIL_DIR/cache"
+chmod 0500 "$COMMIT_FAIL_DIR"
+COMMIT_FAIL_RC=0
+COMMIT_FAIL_OUT=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  gh_api_scalar() { printf "high"; }
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$COMMIT_FAIL_DIR"'/cache"
+  ghas_alert_severity acme/widget 99
+' 2>"$TMP/commit-fail-stderr.txt") || COMMIT_FAIL_RC=$?
+chmod 0700 "$COMMIT_FAIL_DIR"
+assert_eq 0 "$COMMIT_FAIL_RC" "a failed cache commit does not fail the read (#1124 round 2)"
+assert_eq high "$COMMIT_FAIL_OUT" "a failed cache commit still returns the correctly-resolved severity"
+assert_match 'WARN.*could not write severity cache' "$(cat "$TMP/commit-fail-stderr.txt")" "a failed cache commit is not silent"
+
 # --- github-advanced-security / code scanning (#1101) ----------------------
 #
 # Before #1101, a github-advanced-security[bot] inline comment (the form
