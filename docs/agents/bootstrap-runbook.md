@@ -105,7 +105,7 @@ Implementation: `scripts/bootstrap/github-infra.sh`.
 4. Provision the `REVIEWER_ASSIGNMENT_TOKEN` repo secret. Path order: inline (`BOOTSTRAP_REVIEWER_PAT_VALUE` env, tests only) → session-cached `$OP_PREFLIGHT_REVIEWER_PAT` → 1Password item-UUID reference (`op://Private/pvbq24vl2h6gl7yjclxy2hbote/token`; never a title path, per #734) → interactive prompt for a fine-grained PAT.
 5. Prompt for and provision optional LLM secrets (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) with skip option.
 
-The wizard does not provision `AUTHOR_MERGE_TOKEN` by default, but `dependabot-auto-merge.yml` **requires it** as of nathanjohnpayne/mergepath#426: the Dependabot auto-merge workflow uses `AUTHOR_MERGE_TOKEN` for the `gh pr merge` step (so the merge is recorded under `author_identity`) and hard-fails if it is unset or resolves to anything other than `author_identity`. Provision it on any repo where Dependabot auto-merge is enabled. The same secret independently gates non-Dependabot auto-merge, which otherwise stays disabled with PRs merged manually as `nathanjohnpayne`. In both cases the workflow verifies the token resolves to the configured `author_identity` before calling `gh pr merge`.
+The wizard does not provision `AUTHOR_MERGE_TOKEN` by default, but `dependabot-auto-merge.yml` **requires it** as of nathanjohnpayne/mergepath#426: the Dependabot auto-merge workflow uses `AUTHOR_MERGE_TOKEN` for the `gh pr merge` step (so the merge is recorded under `author_identity`) and hard-fails if it is unset or resolves to anything other than `author_identity`. Provision it on any repo where Dependabot auto-merge is enabled. Agent Review may also verify this secret before privileged readiness evaluation, but it never arms, enqueues, or merges a non-Dependabot PR pending #1058; those PRs use an ordinary one-shot author merge.
 
 For runtime application secrets in newly bootstrapped repos, do not add Secure Note / `notesPlain` bootstrap entries. The shared model is: use Environments and `op run` for runtime variable sets, use the 1Password MCP Server only for attended Codex Environment workflows, use the 1Password local `.env` validation hook for supported non-Codex agents that read mounted Environment files, and use `.env.tpl` + `op inject` only when the repo truly needs a generated config file on disk. Adoption decisions for these adapters belong to the 1Password audit ADR workstream; this runbook records the current compatibility guidance.
 
@@ -280,7 +280,7 @@ And on GitHub:
 - 12 canonical labels.
 - Reviewer-identity collaborators invited.
 - `REVIEWER_ASSIGNMENT_TOKEN` repo secret set.
-- `AUTHOR_MERGE_TOKEN` unset by default (the wizard does not provision it). Required wherever Dependabot auto-merge is enabled (#426) — `dependabot-auto-merge.yml` hard-fails without it — and also gates non-Dependabot auto-merge, which stays disabled until a human provisions the author-owned token.
+- `AUTHOR_MERGE_TOKEN` unset by default (the wizard does not provision it). Required wherever Dependabot auto-merge is enabled (#426) — `dependabot-auto-merge.yml` hard-fails without it. Agent Review can use it only for author-identity readiness authentication; non-Dependabot unattended merging remains disabled pending #1058.
 - (When Firebase is enabled) per-project deployer SA keys minted + workflows wired.
 - Project v2 board (#N) with Status single-select field configured.
 

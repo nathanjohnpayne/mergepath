@@ -355,7 +355,11 @@ trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR"' EXIT
 # (CodeRabbit #551), and env -S/--split-string is NOT a value either — it runs
 # its argument as a SPLIT command with exotic dynamic semantics, so it FAILS
 # CLOSED in expand_wrappers (Codex #551) rather than being skipped here.
-PREFIX_VALUE_OPTS_SPEC="sudo=-u,--user,-g,--group,-p,--prompt,-h,--host,-t,--type,-r,--role,-C,--close-from,-D,--chdir,-R,--chroot,-U,--other-user,-T,--command-timeout;nice=-n,--adjustment;ionice=-c,--class,-n,--classdata,-p,--pid;env=-u,--unset,-C,--chdir;exec=-a;time=-f,--format,-o,--output"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GUARD_REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
+# shellcheck source=../lib/gh-command-classifier.sh
+. "$GUARD_REPO_ROOT/scripts/lib/gh-command-classifier.sh"
+PREFIX_VALUE_OPTS_SPEC="$GH_PREFIX_VALUE_OPTS_SPEC"
 export PREFIX_VALUE_OPTS_SPEC
 if ! printf '%s' "$COMMAND" | python3 -c '
 import sys, shlex, re, os
@@ -1307,7 +1311,7 @@ except ValueError as e:
   if ! printf '%s\n' "$STRIPPED_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(sh|bash|dash|zsh|ksh|eval|source)([^A-Za-z0-9_]|$)|(^|[[:space:]])\.[[:space:]]'; then
     EVIDENCE_TEXT="$STRIPPED_TEXT"
   fi
-  if ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
+  if ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|new|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
      && ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
      && ! printf '%s\n' "$EVIDENCE_TEXT" | grep -qE '\\(147|150|107|110|x67|x68|x47|x48)'; then
     exit 0
@@ -1370,8 +1374,8 @@ prefix_flag_takes_value() {
   return 1
 }
 
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GUARD_REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
+# shellcheck source=../lib/pr-body-contract.sh
+. "$GUARD_REPO_ROOT/scripts/lib/pr-body-contract.sh"
 
 # Locate the governing review-policy.yml without trusting the caller's
 # cwd to BE the repo root (Codex P2 on PR #442 r21): walk upward from
@@ -1480,7 +1484,7 @@ guarded_gh_invocation_label() {
           parent="$tok"
           continue
           ;;
-        create|merge|comment|review|edit)
+        create|new|merge|comment|review|edit)
           if [ "$saw_ph" -eq 1 ]; then
             # Guarded verb reached across a placeholder run with no literal
             # noun: the noun (and possibly the exe) was synthesized —
@@ -1527,8 +1531,12 @@ guarded_gh_invocation_label() {
     esac
 
     case "$parent:$tok" in
-      pr:create|pr:merge|pr:comment|pr:review|pr:edit)
+      pr:new|pr:create|pr:merge|pr:comment|pr:review|pr:edit)
         printf 'gh pr %s\n' "$tok"
+        return 0
+        ;;
+      pr:new)
+        printf 'gh pr create\n'
         return 0
         ;;
       issue:comment)
@@ -1596,7 +1604,7 @@ synth_cmdsub_write_label() {
     # and `gh issue comment`; either way it is a guarded write, so blocking
     # is the fail-closed answer.
     case "$tok" in
-      create|merge|comment|review|edit)
+      create|new|merge|comment|review|edit)
         printf 'gh <synthesized> %s\n' "$tok"
         return 0
         ;;
@@ -1903,6 +1911,7 @@ GLOBAL_REPO=""
 PR_SUBCOMMAND=""
 PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
 WRAPPER_KIND=""           # "" | "author" | "reviewer"
+WRAPPER_TOKEN_INDEX=-1
 SAW_GH=0
 SAW_PR=0
 SAW_ISSUE=0
@@ -2024,7 +2033,16 @@ for i in "${!TOKENS[@]}"; do
       # whatever the substitution yields as the subcommand. Fail closed.
       block_cmdsub_in_gh_stream
     fi
-    PR_SUBCOMMAND="$tok"
+    # `gh pr new` is a working alias for `gh pr create` (gh 2.97: `gh pr new
+    # --help` prints the create help and lists `new` under ALIASES). Resolving
+    # it verbatim left PR_SUBCOMMAND="new", which matched no guarded branch, so
+    # the "Not a covered command? Allow." path exited 0 and the create guard --
+    # Authoring-Agent, ## Self-Review, byline verification -- never ran.
+    if [ "$SAW_PR" -eq 1 ] && [ "$tok" = "new" ]; then
+      PR_SUBCOMMAND="create"
+    else
+      PR_SUBCOMMAND="$tok"
+    fi
     PR_SUBCOMMAND_INDEX=$i
     break
   fi
@@ -2317,11 +2335,13 @@ for i in "${!TOKENS[@]}"; do
   if is_any_wrapper_named_token "$tok"; then
     if is_author_wrapper_token "$tok"; then
       WRAPPER_KIND="author"
+      WRAPPER_TOKEN_INDEX=$i
       CURRENT_PREFIX="$tok"
       continue
     fi
     if is_reviewer_wrapper_token "$tok"; then
       WRAPPER_KIND="reviewer"
+      WRAPPER_TOKEN_INDEX=$i
       CURRENT_PREFIX="$tok"
       continue
     fi
@@ -2971,7 +2991,12 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
       PR_HEAD_REF=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oE '"head":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"head":[[:space:]]*"([^"]*)".*/\1/' || true)
       PR_AUTHOR=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oE '"author":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"author":[[:space:]]*"([^"]*)".*/\1/' || true)
       LANE_BRANCH_PREFIX="${GH_PR_GUARD_PROPAGATION_BRANCH_PREFIX:-mergepath-sync/}"
-      LANE_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-nathanjohnpayne}"
+      LANE_POLICY_PATH="$(guard_policy_file || true)"
+      LANE_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-}"
+      if [ -z "$LANE_AUTHOR" ] && [ -f "$LANE_POLICY_PATH" ]; then
+        LANE_AUTHOR=$(grep -m1 '^author_identity:' "$LANE_POLICY_PATH" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
+      fi
+      LANE_AUTHOR="${LANE_AUTHOR:-nathanjohnpayne}"
 
       # #533 item 2: honor propagation_prs.enabled before granting the
       # lane bypass. A repo that explicitly opts out
@@ -2988,7 +3013,6 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
       # the pre-write hook). The block scoping keeps a sibling block's
       # `enabled:` (coderabbit/codex/...) from being read by mistake.
       LANE_ENABLED=1
-      LANE_POLICY_PATH="$(guard_policy_file || true)"
       if [ -f "$LANE_POLICY_PATH" ]; then
         LANE_PROP_ENABLED=$(awk '
           # Accept a trailing comment / text after the key (propagation_prs: # opt-out),
@@ -3011,7 +3035,39 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
         exit 0
       fi
 
-      PR_AUTHORING_AGENT=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oiE 'Authoring-Agent:[[:space:]]*[A-Za-z0-9_-]+' | head -1 | sed -E 's/Authoring-Agent:[[:space:]]*//I' | tr '[:upper:]' '[:lower:]' || true)
+      # Only PRs authored through the shared author lane carry the strict body
+      # contract. Dependabot and external contributors have no Authoring-Agent
+      # marker, and their approvals cannot be same-agent self-approvals under
+      # the shared author identity.
+      if [ "$PR_AUTHOR" != "$LANE_AUTHOR" ]; then
+        exit 0
+      fi
+
+      if ! REVIEW_PR_BODY=$(printf '%s\n' "$REVIEW_PR_JSON" | jq -r '.body // ""'); then
+        echo "BLOCKED: gh-pr-guard could not parse the PR body for the self-approve check." >&2
+        exit 2
+      fi
+      # Catch BOTH helper calls explicitly. Letting `set -e` propagate the
+      # helper's own status would exit non-2, and a non-2 hook exit is a
+      # nonblocking error -- i.e. fail OPEN on the self-approve check.
+      if ! PR_AUTHORING_AGENT_COUNT=$(pr_body_authoring_agent_count "$REVIEW_PR_BODY"); then
+        echo "BLOCKED: gh-pr-guard could not run the shared PR-body parser (count); refusing to evaluate self-approval." >&2
+        exit 2
+      fi
+      if ! PR_AUTHORING_AGENT=$(pr_body_authoring_agent "$REVIEW_PR_BODY"); then
+        echo "BLOCKED: gh-pr-guard could not run the shared PR-body parser (author); refusing to evaluate self-approval." >&2
+        exit 2
+      fi
+      case "$PR_AUTHORING_AGENT_COUNT" in
+        ''|*[!0-9]*)
+          echo "BLOCKED: gh-pr-guard got a non-numeric Authoring-Agent count from the shared parser." >&2
+          exit 2
+          ;;
+      esac
+      if [ "$PR_AUTHORING_AGENT_COUNT" -ne 1 ] || [ -z "$PR_AUTHORING_AGENT" ]; then
+        echo "BLOCKED: gh-pr-guard could not identify exactly one visible Authoring-Agent in the PR body." >&2
+        exit 2
+      fi
 
       if [ -n "$PR_AUTHORING_AGENT" ] && [ "$PR_AUTHORING_AGENT" = "$REVIEWER_AGENT" ]; then
         # Same-agent author + reviewer. Decide over/under-threshold.
@@ -3073,11 +3129,31 @@ fi
 
 # --- gh pr create ---
 #
-# Substring grep on the raw command is fine here — the body markers
-# `Authoring-Agent:` and `## Self-Review` are content checks, not
-# structural ones, and they don't depend on argument positions or
-# global flags.
+# The canonical author wrapper validates the effective `--body` or
+# `--body-file` content inside the runtime process before the write. Let it own
+# that check so a file-backed body is not rejected merely because its contents
+# are absent from the raw command string. A direct invocation never reaches
+# the wrapper's runtime validator, so retain the static defense-in-depth check
+# for that unsupported path.
 if [ "$PR_SUBCOMMAND" = "create" ]; then
+  if [ "$WRAPPER_KIND" = "author" ]; then
+    if printf '%s\n' "$COMMAND" | grep -qE 'gh-as-author\.sh[^;&|]*--[[:space:]]+(ba|da|z|k)?sh([[:space:]]|$)|gh-as-author\.sh[^;&|]*--[[:space:]]+eval([[:space:]]|$)'; then
+      echo "BLOCKED: gh-as-author.sh must receive a direct gh pr create command that its runtime validator can inspect." >&2
+      echo "  Shell/eval-wrapped create payloads are not supported." >&2
+      exit 2
+    fi
+    WRAPPED_CREATE_ARGS=("${TOKENS[@]:$((WRAPPER_TOKEN_INDEX + 1))}")
+    if [ "${WRAPPED_CREATE_ARGS[0]:-}" = "--" ]; then
+      WRAPPED_CREATE_ARGS=("${WRAPPED_CREATE_ARGS[@]:1}")
+    fi
+    if ! gh_is_pr_create_command "${WRAPPED_CREATE_ARGS[@]}"; then
+      echo "BLOCKED: gh-as-author.sh must receive a direct gh pr create command that its runtime validator can inspect." >&2
+      echo "  Shell/eval-wrapped create payloads are not supported." >&2
+      exit 2
+    fi
+    exit 0
+  fi
+
   MISSING=""
 
   if ! echo "$COMMAND" | grep -qi 'Authoring-Agent:'; then

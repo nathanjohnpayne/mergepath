@@ -488,7 +488,8 @@ fi
 # cross-agent-plus1-rejected fixture exercises the runtime path; this canary
 # guards the workflow source.
 if grep -qF 'sameAgentContext' "$WORKFLOW" && \
-   grep -qF 'Authoring-Agent:' "$WORKFLOW" && \
+   grep -qF 'scripts/lib/pr-body-contract.mjs' "$WORKFLOW" && \
+   ! grep -qE '\.match\([^)]*Authoring-Agent:|match\([[:space:]]*$' "$WORKFLOW" && \
    grep -qF 'const gateBSatisfied = sameAgentContext || cliApprovedReviews.length > 0;' "$WORKFLOW" && \
    grep -qF "codexCleared = gateBSatisfied;" "$WORKFLOW"; then
   pass=$((pass + 1))

@@ -221,6 +221,9 @@ CONSUMER_RESIDUE_PRESENT=(
 CONSUMER_FROZEN_CONTENT=(
   "REVIEW_POLICY.md"
   ".github/workflows/md-prose-wrap.yml"
+  # Consumer repositories own this policy file. All live consumers carry a
+  # valid local copy, but none carries Mergepath's new #1094 wording.
+  "rules/repo_rules.md"
 )
 
 # Mutual exclusivity with BOTH other lists. The comment previously claimed

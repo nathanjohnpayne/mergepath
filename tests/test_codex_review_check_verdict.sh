@@ -338,6 +338,82 @@ else
   fail "#814: the gate bypass lost one of its non-inheritability guarantees"
 fi
 
+# Diagnostic mode asks only whether Codex produced a current-head signal for
+# the Phase 4b barrier. Its caller supplies the author explicitly, so a legacy
+# or external-contributor PR without an Authoring-Agent marker must not abort
+# before that signal check runs. Execute the real script with fixture PR bodies
+# and stop it at the immediately-following commit read: this proves the parser
+# branch was bypassed, rather than merely proving that expected source text
+# exists somewhere in the file.
+BEHAVIOR_TMP="$(mktemp -d "${TMPDIR:-/tmp}/codex-check-body.XXXXXX")"
+trap 'rm -rf "$BEHAVIOR_TMP"' EXIT
+mkdir -p "$BEHAVIOR_TMP/bin"
+cat >"$BEHAVIOR_TMP/policy.yml" <<'POLICY'
+author_identity: nathanjohnpayne
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+codex:
+  enabled: true
+  require_ci_green: false
+POLICY
+cat >"$BEHAVIOR_TMP/bin/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+if [ "$1" = api ] && [[ "$2" == repos/*/pulls/7 ]]; then
+  jq -n --arg author "${FIXTURE_PR_AUTHOR:?}" --arg body "${FIXTURE_PR_BODY-}" \
+    '{head:{sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},user:{login:$author},body:$body}'
+  exit 0
+fi
+echo "fixture commit stop" >&2
+exit 1
+GHSTUB
+chmod +x "$BEHAVIOR_TMP/bin/gh"
+
+run_body_fixture() {
+  local author=$1 mode=$2 body=${3:-} output rc
+  set +e
+  output=$(PATH="$BEHAVIOR_TMP/bin:$PATH" GH_TOKEN=fixture \
+    MERGEPATH_REVIEW_POLICY_PATH="$BEHAVIOR_TMP/policy.yml" \
+    FIXTURE_PR_AUTHOR="$author" FIXTURE_PR_BODY="$body" \
+    "$SCRIPT" $mode 7 owner/repo 2>&1)
+  rc=$?
+  set -e
+  printf '%s\n%s\n' "$rc" "$output"
+}
+
+fixture_result="$(run_body_fixture nathanjohnpayne --diagnostic-signal-only)"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] \
+   && grep -q 'diagnostic-signal-only: skipping Authoring-Agent' <<<"$fixture_output" \
+   && grep -q 'failed to fetch commit date' <<<"$fixture_output" \
+   && ! grep -q 'PR body declares' <<<"$fixture_output"; then
+  pass "#1121: diagnostic-signal-only executes past a markerless PR body"
+else
+  fail "#1121: diagnostic markerless fixture did not bypass identity parsing (rc=$fixture_rc output=$fixture_output)"
+fi
+
+fixture_result="$(run_body_fixture external-contributor '')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] \
+   && grep -q 'non-shared-author PR: skipping Authoring-Agent' <<<"$fixture_output" \
+   && grep -q 'failed to fetch commit date' <<<"$fixture_output" \
+   && ! grep -q 'PR body declares' <<<"$fixture_output"; then
+  pass "#1121: a markerless non-shared-author PR executes past identity parsing"
+else
+  fail "#1121: non-shared-author markerless fixture did not bypass identity parsing (rc=$fixture_rc output=$fixture_output)"
+fi
+
+fixture_result="$(run_body_fixture nathanjohnpayne '' 'Authoring-Agent: unknown')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] && grep -q 'does not map to exactly one configured reviewer' <<<"$fixture_output"; then
+  pass "#1121: an unregistered Authoring-Agent fails closed before gate evaluation"
+else
+  fail "#1121: unregistered Authoring-Agent fixture did not fail closed (rc=$fixture_rc output=$fixture_output)"
+fi
+
 # Positional rather than a text scan — the header documents gate (c) long
 # before it is evaluated, so a "starts matching at the first mention" filter
 # reports a false leak (it did, on the first version of this assertion).

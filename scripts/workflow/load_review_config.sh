@@ -11,13 +11,13 @@ set -euo pipefail
 # available_reviewers, author_identity — and they feed decisions that other
 # tools re-derive from the BASE policy:
 #
-#   reviewers        -> the `assign` job's reviewer lookup, AND the
-#                       auto-merge-on-approval registered-reviewer gate, which
+#   reviewers        -> the `assign` job's reviewer lookup, AND the legacy-named
+#                       approval-readiness gate, which
 #                       mirrors scripts/codex-review-check.sh gate (b) and the
 #                       required merge-clearance-gate.
 #   author_identity  -> the `assign` job's author check, AND the identity the
-#                       auto-merge job requires AUTHOR_MERGE_TOKEN to resolve
-#                       to before it will call `gh pr merge` at all. That step
+#                       readiness job requires AUTHOR_MERGE_TOKEN to resolve
+#                       to before privileged evaluation. That step
 #                       parsed the value out of its own unpinned checkout until
 #                       #788's second half moved it onto this output.
 #   threshold/paths  -> the `triage` job's preliminary requires-review calc.
@@ -27,8 +27,8 @@ set -euo pipefail
 # `load-config` step was the one surface left reading its own checkout, so on a
 # PR targeting a non-default branch whose policy names different identities the
 # pipeline could assign a reviewer who can never satisfy the base-policy gates,
-# or arm auto-merge from an identity the base policy does not permit. That is
-# the partially-threaded policy source #768/#769 set out to remove — the fix
+# or authenticate readiness under an identity the base policy does not permit.
+# That is the partially-threaded policy source #768/#769 set out to remove — the fix
 # here is the one those issues established, not a new mechanism: resolve once
 # through the shared resolver, then parse everything from what it returns.
 #
@@ -56,7 +56,7 @@ set -euo pipefail
 # emits FAIL-CLOSED outputs and exits 0:
 #
 #   reviewers=[]        no account matches the reviewer allow-list, so `assign`
-#                       assigns nobody and the auto-merge arming gate refuses
+#                       assigns nobody and the readiness-admission gate refuses
 #                       every approval (both already default to [] and treat an
 #                       empty list as "no match" — this feeds them the same).
 #   threshold=0         every PR is at or over threshold, so `triage`'s
@@ -73,7 +73,7 @@ set -euo pipefail
 # Exiting 0 is the point: `triage` declares `needs: [load-config]` without
 # `always()`, so a hard failure here SKIPS triage, and a skipped labeling job
 # is fail-OPEN (#59's SKIPPED-as-SUCCESS class). Staying green with fail-closed
-# values keeps every downstream guard armed.
+# values keeps every downstream guard active.
 #
 # Usage:
 #   load_review_config.sh --repo owner/repo --base-ref REF --base-sha SHA \
@@ -136,7 +136,7 @@ source "$SCALAR_HELPER"
 
 # Read one TOP-LEVEL scalar out of a policy file.
 #
-# This is the parser `.github/workflows/agent-review.yml`'s auto-merge job used
+# This is the parser the legacy-named approval-readiness job used
 # to run inline against its own checkout before #788 routed the identity
 # through this script's output — byte-for-byte, so the value the
 # AUTHOR_MERGE_TOKEN check now compares is the value it computed for itself
@@ -240,10 +240,10 @@ emit reviewers "$REVIEWERS"
 # is the more reachable of the two, because a policy can simply omit the key (or
 # nest it under a block, which `review_policy_scalar` correctly declines to match)
 # without anything failing. Substituting a hard-coded login here would hand the
-# auto-merge step a non-empty EXPECTED_AUTHOR, skip its `[ -z ]` fail-closed
-# branch, and let AUTHOR_MERGE_TOKEN merge under an identity the governing
+# readiness step a non-empty EXPECTED_AUTHOR, skip its `[ -z ]` fail-closed
+# branch, and authenticate privileged evaluation under an identity the governing
 # policy never named — the substitution #768/#769/#788 exist to prevent, moved
 # one file upstream rather than removed. The `assign` job keeps its own
 # `AUTHOR_IDENTITY || 'nathanjohnpayne'` default in JS, so dropping the default
-# here tightens the merge gate and leaves reviewer assignment unchanged.
+# here tightens readiness and leaves reviewer assignment unchanged.
 emit author_identity "$AUTHOR"

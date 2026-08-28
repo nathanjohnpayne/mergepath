@@ -815,6 +815,39 @@ else
   echo "  FAIL: agent-review auto-merge must use an author-owned AUTHOR_MERGE_TOKEN, not the reviewer assignment token" >&2
 fi
 
+shared_author_retraction_block=$(awk '
+  /- name: Retract durable auto-merge/ {in_block=1}
+  in_block && /^  # ─/ {exit}
+  in_block && /^  [A-Za-z0-9_-]+:/ {exit}
+  in_block && /- name:/ && $0 !~ /- name: Retract durable auto-merge/ {exit}
+  in_block {print}
+' "$agent_review_workflow")
+retraction_no_arm_line=$(grep -nF '.autoMergeRequest == null' <<<"$shared_author_retraction_block" | head -1 | cut -d: -f1)
+retraction_identity_line=$(grep -nF 'if [ -z "${AUTHOR_IDENTITY:-}" ]; then' <<<"$shared_author_retraction_block" | head -1 | cut -d: -f1)
+if grep -Fq 'if: ${{ always() }}' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'id: retract_shared_author' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'SHARED_AUTHOR_DISARM_REQUIRED_V1' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}' <<<"$shared_author_retraction_block" \
+  && ! grep -Fq 'AUTHOR_MERGE_TOKEN' <<<"$shared_author_retraction_block" \
+  && grep -Fq -- '--json author,autoMergeRequest,url' <<<"$shared_author_retraction_block" \
+  && grep -Fq -- '--disable-auto' <<<"$shared_author_retraction_block" \
+  && ! grep -Eq -- '--(auto|merge|rebase|squash)([[:space:]]|$)' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'Durable auto-merge retraction did not persist.' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'auto_arm_allowed=false' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'auto_arm_allowed=true' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'retracting the existing unclassified auto-merge request fail closed' <<<"$shared_author_retraction_block" \
+  && ! grep -Fq 'approval-merge-continuation.sh' <<<"$shared_author_retraction_block" \
+  && [ -n "$retraction_no_arm_line" ] \
+  && [ -n "$retraction_identity_line" ] \
+  && [ "$retraction_no_arm_line" -lt "$retraction_identity_line" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: approval invalidation uses an atomic workflow-token retraction that is optional-token and first-rollout safe (#1094)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: block-self-approval must read arm state first, avoid AUTHOR_MERGE_TOKEN/helper skew, and only disable + verify shared-author auto-merge (#1094)" >&2
+fi
+
 if grep -Fq "AUTHOR_MERGE_TOKEN resolves to" "$agent_review_workflow"; then
   pass=$((pass + 1))
   echo "  PASS: agent-review verifies AUTHOR_MERGE_TOKEN identity before merge"
@@ -854,32 +887,34 @@ got=$(printf '%s\n' "author_identity: 'nathanjohnpayne'" | awk "$author_identity
 assert_eq "author_identity parser strips single quotes" "nathanjohnpayne" "$got"
 
 enable_auto_merge_block=$(awk '
-  /- name: Enable auto-merge/ {in_block=1}
-  in_block && /- name:/ && $0 !~ /- name: Enable auto-merge/ {exit}
+  /- name: Report stable readiness/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Report stable readiness/ {exit}
   in_block {print}
 ' "$agent_review_workflow")
-if grep -Fq 'GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$enable_auto_merge_block"; then
+if grep -Fq 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$enable_auto_merge_block" \
+  && grep -Fq 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$enable_auto_merge_block" \
+  && grep -Fq 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$enable_auto_merge_block"; then
   pass=$((pass + 1))
-  echo "  PASS: Enable auto-merge step runs under AUTHOR_MERGE_TOKEN"
+  echo "  PASS: stable-readiness step binds normal continuation explicitly to AUTHOR_MERGE_TOKEN"
 else
   fail=$((fail + 1))
-  echo "  FAIL: Enable auto-merge step must set GH_TOKEN from AUTHOR_MERGE_TOKEN" >&2
+  echo "  FAIL: stable-readiness step must bind the normal helper pass explicitly to AUTHOR_MERGE_TOKEN" >&2
 fi
 
 if grep -Fq 'REVIEWER_ASSIGNMENT_TOKEN' <<<"$enable_auto_merge_block"; then
   fail=$((fail + 1))
-  echo "  FAIL: Enable auto-merge step still references REVIEWER_ASSIGNMENT_TOKEN" >&2
+  echo "  FAIL: stable-readiness step still references REVIEWER_ASSIGNMENT_TOKEN" >&2
 else
   pass=$((pass + 1))
-  echo "  PASS: Enable auto-merge step does not use REVIEWER_ASSIGNMENT_TOKEN"
+  echo "  PASS: stable-readiness step does not use REVIEWER_ASSIGNMENT_TOKEN"
 fi
 
 if grep -Fq '|| true' <<<"$enable_auto_merge_block"; then
   fail=$((fail + 1))
-  echo "  FAIL: Enable auto-merge step must not swallow merge failures with '|| true'" >&2
+  echo "  FAIL: stable-readiness step must not swallow continuation failures with '|| true'" >&2
 else
   pass=$((pass + 1))
-  echo "  PASS: Enable auto-merge step does not swallow merge failures with '|| true'"
+  echo "  PASS: stable-readiness step does not swallow continuation failures with '|| true'"
 fi
 
 echo
@@ -944,9 +979,9 @@ fi
 #   - the trigger list must subscribe `unlabeled` (else the if: is dead);
 #   - the job if: must scope unlabeled to the BLOCKING label names via
 #     github.event.label.name (else every label removal spends a runner);
-#   - the triage-success requirement must accept `skipped` ONLY on the
-#     unlabeled path (triage's action filter excludes unlabeled — it must
-#     not run there, or it would flap labels against auto-clear).
+#   - triage must classify unlabeled without mutating labels, so the
+#     independence guard sees current Phase 4 scope without flapping the
+#     label that auto-clear just removed.
 if grep -Fq "unlabeled" <<<"$pr_trigger_types"; then
   pass=$((pass + 1))
   echo "  PASS: on.pull_request.types subscribes unlabeled so the settle re-arm fires (#620)"
@@ -963,25 +998,26 @@ else
   fail=$((fail + 1))
   echo "  FAIL: auto-merge must re-arm on unlabeled ONLY for the blocking labels (github.event.label.name against the four blocking names incl. policy-violation) (#620)" >&2
 fi
-if grep -Fq "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block" \
-  && grep -B1 "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block" | grep -Fq "github.event.action == 'unlabeled'"; then
+if ! grep -Fq "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block" \
+  && grep -Fq "needs.triage.result == 'success'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: triage-skipped is accepted only on the unlabeled path (#620)"
+  echo "  PASS: every re-arm requires a successful Phase 4 classification (#620/#1094)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the triage-success requirement may accept skipped ONLY when github.event.action == 'unlabeled' (triage does not run on unlabeled by design) (#620)" >&2
+  echo "  FAIL: auto-merge must not accept skipped triage on unlabeled; the independence guard needs current Phase 4 scope (#620/#1094)" >&2
 fi
 
-# 2d. triage must NOT run on unlabeled: its action filter is the only thing
-# preventing a label flap (triage re-applies needs-external-review moments
-# after auto-clear removed it, in the very run the removal triggered).
+# 2d. Triage classifies unlabeled but must not mutate labels: re-applying
+# needs-external-review moments after auto-clear removed it would flap.
 triage_job_block=$(awk '/^  triage:/{f=1} f && /^  [a-z-]+:$/ && !/^  triage:/{exit} f{print}' "$agent_review_workflow")
-if grep -Fq "github.event.action == 'unlabeled'" <<<"$triage_job_block"; then
-  fail=$((fail + 1))
-  echo "  FAIL: triage must not run on unlabeled — it would re-apply the label auto-clear just removed (flap) (#620)" >&2
-else
+if grep -Fq "github.event.action == 'unlabeled'" <<<"$triage_job_block" \
+  && grep -Fq 'const mayMutateLabels' <<<"$triage_job_block" \
+  && grep -Fq 'mayMutateLabels && needsExternal' <<<"$triage_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: triage's action filter excludes unlabeled (no label flap) (#620)"
+  echo "  PASS: triage classifies unlabeled without mutating labels (#620/#1094)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: triage must classify unlabeled and guard needs-external-review mutation with mayMutateLabels (#620/#1094)" >&2
 fi
 
 # 2e. A registered reviewer approval is the merge-readiness signal. Advisory
@@ -1003,18 +1039,29 @@ fi
 # first atomic consumer rollout, when the trusted default branch necessarily
 # lacks the helper. The final label read and all other safety gates belong to
 # the shared approval continuation for both immediate and deferred paths.
+immediate_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block" | head -1 | cut -d: -f1 || true)
+immediate_continue_line=$(grep -nF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$auto_merge_job_block" | head -1 | cut -d: -f1 || true)
 if grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'source scripts/lib/blocking-labels.sh' <<<"$auto_merge_job_block")" -eq 1 ] \
   && grep -Fq 'if [ -f scripts/lib/blocking-labels.sh ]; then' <<<"$auto_merge_job_block" \
   && grep -Fq 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'blocking_labels=$(printf' <<<"$auto_merge_job_block")" -eq 1 ] \
   && grep -Fq 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$auto_merge_job_block" \
-  && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block"; then
+  && grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' <<<"$auto_merge_job_block" \
+  && grep -Fq 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$auto_merge_job_block" \
+  && grep -Fq 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$auto_merge_job_block" \
+  && grep -Fq 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$auto_merge_job_block" \
+  && grep -Fq 'MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$auto_merge_job_block" \
+  && grep -Fq 'if [ "$protective_rc" -eq 0 ]; then' <<<"$auto_merge_job_block" \
+  && [ -n "$immediate_protect_line" ] && [ -n "$immediate_continue_line" ] \
+  && [ "$immediate_protect_line" -lt "$immediate_continue_line" ] \
+  && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block" \
+  && grep -Fq "needs.block-self-approval.outputs.auto_arm_allowed == 'true'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: privileged approval arming uses the trusted helper with a first-rollout bootstrap and routes final safety through the shared continuation"
+  echo "  PASS: privileged approval readiness uses ordered workflow-token protection then author-token continuation from the trusted helper"
 else
   fail=$((fail + 1))
-  echo "  FAIL: approval arming must pin its checkout, preserve the first-rollout helper fallback, and use the shared final continuation" >&2
+  echo "  FAIL: approval readiness must pin its checkout, preserve first-rollout skew, and run ordered workflow-token protection before author-token continuation" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that
@@ -1214,8 +1261,8 @@ fi
 #     because event-mismatched sibling jobs are expected to skip, but a
 #     synchronize/reopened re-arm cannot proceed unless triage succeeded and
 #     had the chance to refresh needs-external-review.
-if grep -Fq "github.event_name != 'pull_request'" <<<"$auto_merge_job_block" \
-  && grep -Fq "needs.triage.result == 'success'" <<<"$auto_merge_job_block"; then
+if grep -Fq "needs.triage.result == 'success'" <<<"$auto_merge_job_block" \
+  && ! grep -Fq "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
   echo "  PASS: pull_request re-arm fails closed unless triage succeeds (#495)"
 else
@@ -1389,12 +1436,16 @@ if grep -Fq "Probe current-head check readiness once" .github/workflows/agent-re
    grep -Fq 'steps.check_readiness.outputs.ready == '\''true'\''' .github/workflows/agent-review.yml && \
    grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' .github/workflows/agent-review.yml && \
    grep -Fq 'approval-merge-continuation.sh' .github/workflows/auto-clear-blocking-labels.yml && \
-   grep -Fq -- '--match-head-commit "$final_head"' scripts/workflow/approval-merge-continuation.sh && \
+   grep -Fq 'post_independence=$(read_pr)' scripts/workflow/approval-merge-continuation.sh && \
+   grep -Fq 'durable auto-merge remains disabled pending the #1058 merge-group boundary' scripts/workflow/approval-merge-continuation.sh && \
+   ! grep -Fq -- '--squash --auto' scripts/workflow/approval-merge-continuation.sh && \
+   ! grep -Eq 'gh pr merge .*--(auto|squash|merge|rebase)([[:space:]]|$)' scripts/workflow/approval-merge-continuation.sh && \
+   ! grep -Eq 'addPullRequestToMergeQueue|enqueuePullRequest' scripts/workflow/approval-merge-continuation.sh && \
    ! grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review probes current-head readiness once; completed workflows re-enter an exact-head guarded continuation"
+  echo "  PASS: agent-review probes once; completed workflows re-enter stable unarmed readiness pending a merge-group boundary"
 else
-  echo "  FAIL: agent-review must avoid runner polling and defer pending checks to the exact-head continuation" >&2
+  echo "  FAIL: agent-review must avoid runner polling and keep readiness unarmed without a base-bound merge boundary" >&2
   fail=$((fail + 1))
 fi
 

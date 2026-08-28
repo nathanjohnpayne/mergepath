@@ -10,6 +10,8 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  coderabbit_phase_25_invocation:
+    - tests/test_coderabbit_should_invoke.sh
   mergepath_playground:
     - tests/test_mergepath_playground.sh
   bootstrap_consumer_identity:

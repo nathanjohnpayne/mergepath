@@ -616,6 +616,31 @@ else
   bash "$PAGINATION_TEST" 2>&1 | sed 's/^/      /' >&2 || true
 fi
 
+# ── Test 9b: delegate to tests/test_resolve_pr_threads_read_failure.sh
+# Exercises the #1104 HEAD-read classification: a rate-limited read exits 4
+# (could-not-look) and names the exhausted account, a genuine 404 exits 2, and
+# the underlying gh error body -- which gh writes to STDOUT -- reaches the
+# operator instead of being discarded. Without a CI entrypoint that behaviour
+# can regress while the required lint stays green, which is precisely the
+# silent-failure class the suite was written to fence. Same delegation pattern
+# as Tests 8 and 9 above.
+echo
+echo "resolve-pr-threads.sh HEAD-read failure classification (#1104)"
+
+READFAIL_TEST="$ROOT/tests/test_resolve_pr_threads_read_failure.sh"
+if [ ! -f "$READFAIL_TEST" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: missing $READFAIL_TEST" >&2
+elif bash "$READFAIL_TEST" >/dev/null 2>&1; then
+  pass=$((pass + 1))
+  echo "  PASS: tests/test_resolve_pr_threads_read_failure.sh"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tests/test_resolve_pr_threads_read_failure.sh exited non-zero" >&2
+  echo "    re-running with output:" >&2
+  bash "$READFAIL_TEST" 2>&1 | sed 's/^/      /' >&2 || true
+fi
+
 # ── Test 10: delegate to tests/test_resolve_pr_threads_verified_propagation.sh
 # Exercises the #572 --resolve-verified-propagation mode: canonical/templated
 # routing-class threads resolve ONLY on a byte-verified propagation match

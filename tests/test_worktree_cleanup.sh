@@ -3222,6 +3222,103 @@ else
   fail "#1105 the audit blamed a remote it had never even contacted"
   echo "$OUT_TMPFAIL" >&2
 fi
+# ── Case 45 (#933): the remote probe cannot block on a prompt ────────────
+# Every dry run invokes `git ls-remote`, and the caller hides its stderr. On
+# an SSH remote needing a host-key confirmation or a passphrase, or an HTTPS
+# remote with no cached credential, an unattended audit would sit forever
+# with nothing on screen to explain why.
+#
+# Asserting "it does not hang" directly would mean writing a test that hangs
+# when it fails, which is the worst shape a suite can have. Instead the
+# fixture points `origin` at an ssh:// URL and supplies a recording
+# GIT_SSH_COMMAND shim, then asserts the options git actually invoked ssh
+# with. That is the mechanism by which the hang is prevented, it is
+# observable, and it fails fast.
+SSHPROBE_ROOT="$WORKDIR/ssh-probe"
+SSHPROBE_MAIN="$SSHPROBE_ROOT/main"
+SSHPROBE_LOG="$SSHPROBE_ROOT/ssh-args.log"
+mkdir -p "$SSHPROBE_ROOT"
+git init -q -b main "$SSHPROBE_MAIN"
+(
+  cd "$SSHPROBE_MAIN"
+  git -C "$SSHPROBE_MAIN" config user.email "test@example.com"
+  git -C "$SSHPROBE_MAIN" config user.name "Test"
+  git -C "$SSHPROBE_MAIN" config commit.gpgsign false
+  git -C "$SSHPROBE_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "ssh://git@invalid.invalid/repo.git"
+  # A branch that TRACKS origin, so the probe is eligible and actually runs
+  # (case 44b proves it is skipped otherwise).
+  git update-ref refs/remotes/origin/main HEAD
+  git branch --set-upstream-to=origin/main main
+) >/dev/null 2>&1
+SSHPROBE_MAIN=$(cd "$SSHPROBE_MAIN" && pwd -P)
+# The shim records the argv git handed ssh, then fails. Failing is the point:
+# a real prompt is what we are replacing, and a fast non-zero exit is the
+# behaviour under test.
+cat > "$SSHPROBE_ROOT/fake-ssh" <<SHIM
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$SSHPROBE_LOG"
+exit 255
+SHIM
+chmod +x "$SSHPROBE_ROOT/fake-ssh"
+
+# Premise: the branch really does track origin, so the probe is eligible.
+if [ "$(git -C "$SSHPROBE_MAIN" for-each-ref --format='%(upstream)' refs/heads/main)" \
+     != "refs/remotes/origin/main" ]; then
+  fail "fixture setup: main does not track origin/main — the probe would be skipped and case 45 would assert nothing"
+fi
+
+set +e
+OUT_SSHPROBE=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh" \
+  WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_SSHPROBE=$?
+set -e
+
+# Premise: the probe was actually reached. Without this, every assertion
+# below would pass vacuously on an empty log.
+if [ ! -s "$SSHPROBE_LOG" ]; then
+  fail "fixture setup: git never invoked ssh, so case 45 asserts nothing about the options it was given"
+  echo "$OUT_SSHPROBE" >&2
+fi
+if grep -Fq -- "BatchMode=yes" "$SSHPROBE_LOG"; then
+  pass "#933 the probe forces ssh BatchMode, so an unknown host key or passphrase fails instead of prompting"
+else
+  fail "#933 ssh was invoked without BatchMode — an unattended audit can still block on a prompt"
+  cat "$SSHPROBE_LOG" >&2
+fi
+# Derived from WORKTREE_CLEANUP_PROBE_TIMEOUT=8, so this also pins that the
+# knob reaches the transport rather than only the wall-clock ceiling.
+if grep -Fq -- "ConnectTimeout=4" "$SSHPROBE_LOG"; then
+  pass "#933 ConnectTimeout is bounded and derived from WORKTREE_CLEANUP_PROBE_TIMEOUT"
+else
+  fail "#933 ssh was invoked without a ConnectTimeout derived from the configured probe timeout"
+  cat "$SSHPROBE_LOG" >&2
+fi
+# An operator's own GIT_SSH_COMMAND must survive: the hardening is APPENDED
+# to it, not substituted for it. The shim itself running is half the proof
+# (the premise above); the other half is that it was handed the real
+# destination alongside our options, rather than our options replacing the
+# work. Asserted on ONE line so a run that happened to log both facts
+# separately cannot satisfy it.
+if grep -F -- "BatchMode=yes" "$SSHPROBE_LOG" | grep -Fq -- "invalid.invalid"; then
+  pass "#933 the operator's GIT_SSH_COMMAND is preserved and the hardening is appended to it"
+else
+  fail "#933 the hardening replaced the operator's command rather than extending it"
+  cat "$SSHPROBE_LOG" >&2
+fi
+# And the failed probe still lands as an incomplete audit rather than a clean
+# one — the #992 contract must not regress under the new wrapper.
+if [ "$RC_SSHPROBE" -eq 3 ] && echo "$OUT_SSHPROBE" | grep -Fq -- "NOT MEASURED"; then
+  pass "#933 a refused probe is reported as an incomplete audit, not a clean one"
+else
+  fail "#933 a refused probe did not surface as exit 3 + NOT MEASURED (rc=$RC_SSHPROBE)"
+  echo "$OUT_SSHPROBE" >&2
+fi
 
 # ── Case 44d (#1105, Codex P2): a failed snapshot WRITE still reports ────
 # `mktemp` succeeding says the remote-heads file was CREATED, not that it can
@@ -3522,6 +3619,294 @@ if ! echo "$OUT_REFFAIL" | grep -Fq -- "is writable and has free"; then
 else
   fail "#1105 a healthy TMPDIR was blamed for a ref-read failure"
   echo "$OUT_REFFAIL" >&2
+fi
+
+# ── Case 45b (#1120, Codex P2): the timeout override is base 10 ──────────
+# The digits-only test admits a ZERO-PADDED value. `$(( 08 / 2 ))` is an
+# octal arithmetic ERROR, which would make a perfectly reachable remote
+# report NOT MEASURED; `00` is not the literal `0` the old guard rejected and
+# would reach GNU timeout as a zero duration, DISABLING the ceiling rather
+# than taking the fallback. Reuses case 45's recording ssh shim: the recorded
+# ConnectTimeout is the observable proof of how the value was parsed.
+# Truncate FIRST. Case 45 already ran with timeout 8 and logged
+# ConnectTimeout=4 to this same file, so without this the assertion below
+# passes on residue from a different run — it did exactly that on the first
+# draft, and only the mutation pass caught it.
+: > "$SSHPROBE_LOG"
+set +e
+OUT_OCTAL=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh" \
+  WORKTREE_CLEANUP_PROBE_TIMEOUT=08 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_OCTAL=$?
+set -e
+# 08 parsed base 10 is 8, so ConnectTimeout is 4. Parsed as octal it is an
+# error and no ssh invocation is recorded at all.
+if grep -Fq -- "ConnectTimeout=4" "$SSHPROBE_LOG"; then
+  pass "#1120 a zero-padded timeout override is parsed base 10, not octal"
+else
+  fail "#1120 WORKTREE_CLEANUP_PROBE_TIMEOUT=08 did not yield ConnectTimeout=4 (rc=$RC_OCTAL)"
+  echo "$OUT_OCTAL" >&2
+  cat "$SSHPROBE_LOG" >&2
+fi
+: > "$SSHPROBE_LOG"
+set +e
+OUT_ZEROS=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh" \
+  WORKTREE_CLEANUP_PROBE_TIMEOUT=00 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+set -e
+# 00 must take the 20s fallback, so ConnectTimeout is 10 — NOT 0, which would
+# hand GNU timeout a duration that disables its own ceiling.
+if grep -Fq -- "ConnectTimeout=10" "$SSHPROBE_LOG"; then
+  pass "#1120 an all-zero timeout override falls back rather than disabling the ceiling"
+else
+  fail "#1120 WORKTREE_CLEANUP_PROBE_TIMEOUT=00 did not take the documented fallback"
+  echo "$OUT_ZEROS" >&2
+  cat "$SSHPROBE_LOG" >&2
+fi
+
+# ── Case 45c (#1120, Codex P2): core.sshCommand is extended, not replaced ──
+# GIT_SSH_COMMAND overrides core.sshCommand, so building one from plain `ssh`
+# silently discards a configured identity file, proxy or wrapper and turns a
+# working private remote into a permanent exit 3. The fixture configures
+# core.sshCommand and sets NO environment override, which is the shape that
+# regressed.
+CORESSH_LOG="$SSHPROBE_ROOT/core-ssh-args.log"
+cat > "$SSHPROBE_ROOT/core-ssh" <<SHIM
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CORESSH_LOG"
+exit 255
+SHIM
+chmod +x "$SSHPROBE_ROOT/core-ssh"
+git -C "$SSHPROBE_MAIN" config core.sshCommand "$SSHPROBE_ROOT/core-ssh"
+# Premise: the config really is set, and no environment override is present
+# in the child — otherwise the case tests the branch it is not about.
+if [ "$(git -C "$SSHPROBE_MAIN" config --get core.sshCommand)" != "$SSHPROBE_ROOT/core-ssh" ]; then
+  fail "fixture setup: core.sshCommand was not stored — case 45c asserts nothing"
+fi
+set +e
+OUT_CORESSH=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  env -u GIT_SSH_COMMAND -u GIT_SSH WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_CORESSH=$?
+set -e
+if [ -s "$CORESSH_LOG" ]; then
+  pass "#1120 the repository's configured core.sshCommand is still used"
+else
+  fail "#1120 core.sshCommand was discarded — a configured identity/proxy would be lost (rc=$RC_CORESSH)"
+  echo "$OUT_CORESSH" >&2
+fi
+if grep -F -- "BatchMode=yes" "$CORESSH_LOG" | grep -Fq -- "invalid.invalid"; then
+  pass "#1120 the hardening is appended to core.sshCommand rather than replacing it"
+else
+  fail "#1120 the hardening did not extend the configured ssh command"
+  cat "$CORESSH_LOG" >&2
+fi
+git -C "$SSHPROBE_MAIN" config --unset core.sshCommand
+
+# ── Case 45d (#1120, Codex P2): the ceiling has a KILL grace period ───────
+# `timeout N` sends SIGTERM and then waits FOREVER for a child that catches
+# or ignores it — git, ssh or a credential helper may — so without
+# --kill-after the promised wall-clock ceiling is not a ceiling. Support is
+# probed rather than assumed (a non-GNU timeout on PATH would not have it),
+# so this case asserts the flag IS passed on a host whose timeout supports it
+# and skips loudly where it does not.
+TIMEOUT_BIN_FOUND=""
+command -v timeout >/dev/null 2>&1 && TIMEOUT_BIN_FOUND=timeout
+[ -z "$TIMEOUT_BIN_FOUND" ] && command -v gtimeout >/dev/null 2>&1 && TIMEOUT_BIN_FOUND=gtimeout
+if [ -z "$TIMEOUT_BIN_FOUND" ]; then
+  pass "#1120 no timeout implementation on this host — kill-grace case not applicable (portable floor still applies)"
+elif ! "$TIMEOUT_BIN_FOUND" --kill-after=1 1 true >/dev/null 2>&1; then
+  pass "#1120 this host's timeout lacks --kill-after — probe correctly omits it"
+else
+  TMOUT_LOG="$SSHPROBE_ROOT/timeout-args.log"
+  mkdir -p "$SSHPROBE_ROOT/tbin"
+  TIMEOUT_REAL=$(command -v "$TIMEOUT_BIN_FOUND")
+  cat > "$SSHPROBE_ROOT/tbin/$TIMEOUT_BIN_FOUND" <<SHIM
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMOUT_LOG"
+exec "$TIMEOUT_REAL" "\$@"
+SHIM
+  chmod +x "$SSHPROBE_ROOT/tbin/$TIMEOUT_BIN_FOUND"
+  set +e
+  ( cd "$SSHPROBE_MAIN" && PATH="$SSHPROBE_ROOT/tbin:$STUB_DIR:$PATH" \
+    GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh" WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+    bash "$HELPER" --no-color --dry-run >/dev/null 2>&1 )
+  set -e
+  # Premise: the shim ran at all. The capability probe inside the script also
+  # invokes timeout, so an empty log means the probe never reached it.
+  if [ ! -s "$TMOUT_LOG" ]; then
+    fail "fixture setup: timeout was never invoked, so case 45d asserts nothing"
+  fi
+  # Anchored on the REAL invocation, not merely on the flag appearing
+  # somewhere in the log. The script's own capability probe runs
+  # `timeout --kill-after=1 1 true` through this same shim, so a bare
+  # `grep -- "--kill-after="` matches the probe and passes even when the
+  # ls-remote call carries no grace period at all — the first draft did
+  # exactly that and survived a targeted mutation. Requiring the flag and
+  # `ls-remote` on ONE line pins the invocation under test.
+  if grep -F -- "--kill-after=" "$TMOUT_LOG" | grep -Fq -- "ls-remote"; then
+    pass "#1120 the wall-clock ceiling carries a bounded KILL grace period"
+  else
+    fail "#1120 timeout was invoked without --kill-after — a SIGTERM-ignoring child can still hang the audit"
+    cat "$TMOUT_LOG" >&2
+  fi
+fi
+
+# ── Case 45e (#1120): the probe is BOUNDED, not statically vetted ────────
+# CodeRabbit and Codex both showed the probe could still block: an operator's
+# `-o BatchMode=no` wins under OpenSSH's first-value rule, a mixed-value
+# command defeats a "contains yes" test, a wrapper can set BatchMode itself,
+# an HTTPS credential helper can hang, and GIT_SSH has nowhere to inject
+# options. An earlier revision tried to REFUSE on a textual reading of the
+# config; it could not cover that space, and it wrongly refused HTTPS and
+# local remotes for ssh settings that could not affect them.
+#
+# The guarantee is now a wall-clock bound that always exists, so these cases
+# assert the property that actually matters: the audit COMPLETES and reports,
+# whatever the transport. They deliberately no longer assert a refusal.
+
+# Premise: the first-value rule this whole area exists for is real on this
+# host. If a future OpenSSH changed it the hazard would be gone and the case
+# should say so rather than assert a stale one.
+if command -v ssh >/dev/null 2>&1; then
+  if ! ssh -G -o BatchMode=no -o BatchMode=yes example.invalid 2>/dev/null \
+       | grep -Eiq '^batchmode no$'; then
+    fail "fixture setup: ssh no longer keeps the first -o value — case 45e's premise no longer holds"
+  fi
+fi
+
+for BM in "-o BatchMode=no" "-o BatchMode=no -o BatchMode=yes" ""; do
+  set +e
+  OUT_BM=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+    GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh $BM" \
+    WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+    bash "$HELPER" --no-color --dry-run 2>&1 )
+  RC_BM=$?
+  set -e
+  if [ "$RC_BM" -eq 3 ] && echo "$OUT_BM" | grep -Fq -- "NOT MEASURED"; then
+    pass "#1120 the audit completes and reports with GIT_SSH_COMMAND [${BM:-none}]"
+  else
+    fail "#1120 the audit did not complete with GIT_SSH_COMMAND [${BM:-none}] (rc=$RC_BM)"
+    echo "$OUT_BM" >&2
+  fi
+done
+
+# GIT_SSH alone: nowhere to inject options, and it must still complete.
+set +e
+OUT_GITSSH=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+  env -u GIT_SSH_COMMAND GIT_SSH="$SSHPROBE_ROOT/fake-ssh" \
+  WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_GITSSH=$?
+set -e
+if [ "$RC_GITSSH" -eq 3 ] && echo "$OUT_GITSSH" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1120 a GIT_SSH-only transport completes and reports rather than hanging"
+else
+  fail "#1120 a GIT_SSH-only transport did not complete (rc=$RC_GITSSH)"
+  echo "$OUT_GITSSH" >&2
+fi
+
+# ── Case 45f (#1120, Codex P2): ssh settings must not fail a NON-ssh remote ──
+# The refusal this replaces ran before resolving the transport, so an
+# unrelated exported GIT_SSH turned a perfectly good local/HTTPS audit into
+# exit 3. Reuses case 45's repo with a REACHABLE local origin, which is the
+# shape Codex reproduced.
+NONSSH_ROOT="$WORKDIR/non-ssh-remote"
+NONSSH_REMOTE="$NONSSH_ROOT/remote.git"
+NONSSH_MAIN="$NONSSH_ROOT/main"
+mkdir -p "$NONSSH_ROOT"
+git init -q --bare "$NONSSH_REMOTE"
+git init -q -b main "$NONSSH_MAIN"
+(
+  cd "$NONSSH_MAIN"
+  git -C "$NONSSH_MAIN" config user.email "test@example.com"
+  git -C "$NONSSH_MAIN" config user.name "Test"
+  git -C "$NONSSH_MAIN" config commit.gpgsign false
+  git -C "$NONSSH_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$NONSSH_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+NONSSH_MAIN=$(cd "$NONSSH_MAIN" && pwd -P)
+# Premise: the origin really is reachable and non-ssh, so an exit 3 here
+# could only come from the ssh settings.
+if ! git -C "$NONSSH_MAIN" ls-remote --heads origin >/dev/null 2>&1; then
+  fail "fixture setup: the local origin is unreachable — case 45f cannot isolate the ssh settings"
+fi
+set +e
+OUT_NONSSH=$( cd "$NONSSH_MAIN" && PATH="$STUB_DIR:$PATH" \
+  GIT_SSH=/bin/false WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_NONSSH=$?
+set -e
+if [ "$RC_NONSSH" -ne 3 ] && ! echo "$OUT_NONSSH" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1120 an ssh setting does not make a reachable non-ssh remote incomplete"
+else
+  fail "#1120 GIT_SSH turned a reachable local remote into an incomplete audit (rc=$RC_NONSSH)"
+  echo "$OUT_NONSSH" >&2
+fi
+
+# ── Case 45g (#1120): the SHELL WATCHDOG actually bounds the probe ───────
+# The portable floor is the branch that runs where `timeout` does not exist —
+# a stock macOS, which is this audit's primary host — and it is the one path
+# where a bug means the audit HANGS rather than misreports. It must therefore
+# be exercised, not merely reasoned about.
+#
+# The fixture supplies an ssh that sleeps far longer than the bound, and runs
+# the helper on a PATH with no timeout implementation. The assertion is that
+# the run RETURNS: an unbounded probe would sit for the sleep duration.
+WATCHDOG_SLEEP=45
+WATCHDOG_BOUND=3
+mkdir -p "$SSHPROBE_ROOT/nobin"
+cat > "$SSHPROBE_ROOT/slow-ssh" <<SHIM
+#!/bin/sh
+sleep $WATCHDOG_SLEEP
+exit 255
+SHIM
+chmod +x "$SSHPROBE_ROOT/slow-ssh"
+
+# Premise 1: this PATH really has no timeout implementation, or the case
+# silently exercises the preferred branch instead of the floor it is about.
+if PATH=/usr/bin:/bin command -v timeout >/dev/null 2>&1 \
+   || PATH=/usr/bin:/bin command -v gtimeout >/dev/null 2>&1; then
+  pass "#1120 this host cannot hide timeout from PATH — watchdog floor not exercised here"
+elif ! PATH=/usr/bin:/bin command -v git >/dev/null 2>&1; then
+  pass "#1120 no git on the reduced PATH — watchdog floor not exercisable here"
+else
+  # Premise 2: the shim really does outlast the bound, so returning early
+  # cannot happen by accident.
+  if [ "$WATCHDOG_SLEEP" -le "$WATCHDOG_BOUND" ]; then
+    fail "fixture setup: the slow ssh does not outlast the bound — case 45g proves nothing"
+  fi
+  WD_START=$(date +%s)
+  set +e
+  OUT_WD=$( cd "$SSHPROBE_MAIN" && PATH="/usr/bin:/bin" \
+    GIT_SSH_COMMAND="$SSHPROBE_ROOT/slow-ssh" \
+    WORKTREE_CLEANUP_PROBE_TIMEOUT=$WATCHDOG_BOUND \
+    bash "$HELPER" --no-color --dry-run 2>&1 )
+  RC_WD=$?
+  set -e
+  WD_ELAPSED=$(( $(date +%s) - WD_START ))
+  # Generous margin: the bound is 3s and the shim sleeps 45s, so anything
+  # under 30s proves the watchdog fired without making this a tight timing
+  # assertion that could flake on a loaded machine.
+  if [ "$WD_ELAPSED" -lt 30 ]; then
+    pass "#1120 the shell watchdog bounds the probe with no timeout(1) present (${WD_ELAPSED}s < ${WATCHDOG_SLEEP}s)"
+  else
+    fail "#1120 the probe was NOT bounded without timeout(1) — took ${WD_ELAPSED}s (rc=$RC_WD)"
+    echo "$OUT_WD" >&2
+  fi
+  # And it must still REPORT rather than merely return.
+  if [ "$RC_WD" -eq 3 ] && echo "$OUT_WD" | grep -Fq -- "NOT MEASURED"; then
+    pass "#1120 a watchdog-bounded probe reports an incomplete audit"
+  else
+    fail "#1120 a watchdog-bounded probe did not report NOT MEASURED (rc=$RC_WD)"
+    echo "$OUT_WD" >&2
+  fi
 fi
 
 echo ""

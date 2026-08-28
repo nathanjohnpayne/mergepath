@@ -641,6 +641,9 @@ jobs:
       - name: check_disagreement_detector
         run: ./scripts/ci/check_disagreement_detector || { rc=$?; if [ ! -f scripts/ci/check_disagreement_detector ]; then echo "check_disagreement_detector not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      - name: check_self_approval_detector
+        run: ./scripts/ci/check_self_approval_detector || { rc=$?; if [ ! -f scripts/ci/check_self_approval_detector ]; then echo "check_self_approval_detector not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_agent_review_triage_defers
         run: ./scripts/ci/check_agent_review_triage_defers || { rc=$?; if [ ! -f scripts/ci/check_agent_review_triage_defers ]; then echo "check_agent_review_triage_defers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 

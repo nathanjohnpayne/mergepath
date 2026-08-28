@@ -16,6 +16,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 TESTS=(
   "tests/test_gh_as_author.sh"
+  # The cross-consumer identity contract (#1121). Belongs with the wrapper and
+  # guard suites because it tests the property NEITHER of them can: that every
+  # consumer resolves Authoring-Agent to the SAME answer. Without a CI
+  # entrypoint the guarantee regresses silently the moment someone reintroduces
+  # a local regex, which is exactly how the divergence arose.
+  "tests/test_pr_body_contract_parity.sh"
   "tests/test_gh_as_reviewer.sh"
   "tests/test_gh_wrapper_parallel.sh"
   "tests/test_gh_pr_guard.sh"

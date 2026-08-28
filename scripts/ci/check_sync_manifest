@@ -98,6 +98,40 @@ fi
 
 FAILED=0
 
+# 1b. duplicate entry-level keys (#1121).
+# A YAML mapping carrying the same key twice is not a parse error: the LAST
+# occurrence silently wins and the earlier one is discarded. That is invisible
+# to every check reading the PARSED manifest -- including the closure check in
+# this repo, which passed while two `requires:` keys on one entry quietly
+# dropped a real dependency, so a wave would have shipped a script without the
+# lib it had just been made to hard-source. Only a check reading the SOURCE
+# can catch it.
+#
+# Scoped to entry-level keys (4-space indent) inside `- path:` blocks, which is
+# where the manifest expresses per-path coupling.
+dup_keys=$(awk '
+  function flush(   k) {
+    if (path == "") return
+    for (k in seen) if (seen[k] > 1) printf "%s|%s|%d\n", path, k, seen[k]
+  }
+  # Seed with the path key the list-item line itself declares. Without this a
+  # repeated `path:` INSIDE an entry was never counted -- YAML keeps the later
+  # value, so the first canonical target vanishes while this check reports
+  # clean, which is the same silent-discard class the check exists to catch.
+  /^  - path: / { flush(); path = $3; delete seen; seen["path"] = 1; next }
+  /^    [a-zA-Z_][a-zA-Z0-9_-]*:/ { key = $1; sub(/:$/, "", key); seen[key]++ }
+  END { flush() }
+' "$MANIFEST")
+
+if [ -n "$dup_keys" ]; then
+  while IFS='|' read -r dpath dkey dcount; do
+    [ -n "$dpath" ] || continue
+    echo "FAIL: entry '$dpath' declares key '$dkey' $dcount times; YAML keeps only the last, silently discarding the others"
+  done <<<"$dup_keys"
+  echo "      Merge each pair into a single key. Parsed-manifest checks cannot see this."
+  FAILED=1
+fi
+
 # 2. version
 version=$(yq '.version' "$MANIFEST")
 if [ "$version" != "$SUPPORTED_VERSION" ]; then

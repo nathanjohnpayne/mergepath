@@ -71,6 +71,13 @@ else
     fi
   done
 
+  if [ "$(scope_value full pull_request rules/repo_rules.md)" = "true" ] \
+     && [ "$(scope_value checks pull_request rules/repo_rules.md)" = '[]' ]; then
+    pass "rules/repo_rules.md fails closed to the full deep surface"
+  else
+    fail "rules/repo_rules.md must not bypass the full self-approval policy checker"
+  fi
+
   if [ "$(scope_value full push docs/README.md)" = "true" ] \
      && [ "$(scope_value full schedule docs/README.md)" = "true" ] \
      && [ "$(scope_value full workflow_dispatch docs/README.md)" = "true" ]; then
@@ -285,16 +292,24 @@ else
   fi
 
   wait_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Probe current-head check readiness once") | .key' "$AGENT_REVIEW")
-  merge_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Enable auto-merge") | .key' "$AGENT_REVIEW")
-  merge_step=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Enable auto-merge") | .run' "$AGENT_REVIEW")
+  merge_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Report stable readiness") | .key' "$AGENT_REVIEW")
+  merge_step=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Report stable readiness") | .run' "$AGENT_REVIEW")
+  merge_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR_NUMBER" "$REPO"' <<<"$merge_step" | head -1 | cut -d: -f1 || true)
+  merge_continue_line=$(grep -nF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$merge_step" | head -1 | cut -d: -f1 || true)
   if [[ "$wait_step_index" =~ ^[0-9]+$ ]] \
      && [[ "$merge_step_index" =~ ^[0-9]+$ ]] \
      && [ "$merge_step_index" -gt "$wait_step_index" ] \
      && grep -Fq 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$merge_step" \
+     && grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' <<<"$merge_step" \
+     && grep -Fq 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$merge_step" \
+     && grep -Fq 'MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$merge_step" \
+     && grep -Fq 'if [ "$protective_rc" -eq 0 ]; then' <<<"$merge_step" \
+     && [ -n "$merge_protect_line" ] && [ -n "$merge_continue_line" ] \
+     && [ "$merge_protect_line" -lt "$merge_continue_line" ] \
      && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$merge_step"; then
-    pass "the immediate-green path guards first-rollout skew and uses the shared final safety continuation"
+    pass "the immediate-green path protects with the workflow token before author-token continuation"
   else
-    fail "the immediate-green path must guard the helper and route through the shared final safety continuation"
+    fail "the immediate-green path must guard helper skew and preserve the ordered two-token continuation"
   fi
 
   if grep -Fq 'repo_lint_local.yml annex present' <<<"$agent_review_probe" \

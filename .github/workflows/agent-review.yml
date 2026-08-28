@@ -10,16 +10,18 @@ on:
     # commit, not just on `opened` / `ready_for_review`. Without it,
     # a shell-parser regression can land on main and only surface
     # weeks later when the next PR happens to be opened. See #59.
-    # `reopened` is included so the auto-merge re-arm path (#495) actually
+    # `reopened` is included so the approval-readiness path (#495) actually
     # fires: the job `if:` matches `synchronize || reopened`, but a reopened
-    # event only reaches this workflow if it is subscribed here.
-    # `unlabeled` is the #620 re-arm: on an over-threshold PR with a
+    # event reaches this workflow only when subscribed here.
+    # `unlabeled` is the #620 readiness retry: on an over-threshold PR with a
     # carried-over approval, update-branch makes triage re-apply
-    # needs-external-review, the label re-verify inside auto-merge sees it
+    # needs-external-review, the live label re-verify sees it
     # and hard-fails (correctly), and auto-clear removes the label moments
     # later once the clearance gate passes — with no trigger on the removal,
     # the PR sat CLEAN-but-unmerged until a human reran the failed job.
-    types: [opened, ready_for_review, labeled, synchronize, reopened, unlabeled]
+    # `edited` re-evaluates carried approvals after mutable PR metadata or the
+    # base branch changes, but it does not itself report readiness (#1094).
+    types: [opened, ready_for_review, labeled, synchronize, reopened, edited, unlabeled]
   pull_request_review:
     types: [submitted]
 
@@ -28,35 +30,65 @@ permissions:
   pull-requests: write
   issues: write
 
+# #1094: mutable PR events share one latest-state enforcement group, but every
+# APPROVED webhook gets a review-ID group and is never cancelled. The reviews
+# API can lag a webhook; cancelling approval A when approval B arrives could
+# therefore let B's replacement run miss A entirely. A's durable run keeps its
+# own payload fallback and will classify/dismiss it. GitHub also evicts an
+# older PENDING member of a shared group even when cancel-in-progress is false,
+# so events that skip the guard use a run-unique group. COMMENTED reviews and
+# unrelated label events can neither cancel nor replace enforcement; only the
+# needs-external-review force-on label joins mutable approval enforcement.
+concurrency:
+  group: >-
+    agent-review-${{ github.event.pull_request.number }}-${{
+      ((github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved' &&
+        format('approval-{0}', github.event.review.id)) ||
+       ((github.event_name == 'pull_request' &&
+         (github.event.action == 'synchronize' ||
+          github.event.action == 'reopened' ||
+          github.event.action == 'edited' ||
+          (github.event.action == 'labeled' &&
+           github.event.label.name == 'needs-external-review') ||
+          (github.event.action == 'unlabeled' &&
+           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))) &&
+        'approval-enforcement') || github.run_id }}
+  cancel-in-progress: >-
+    ${{ github.event_name == 'pull_request' &&
+        (github.event.action == 'synchronize' ||
+         github.event.action == 'reopened' ||
+         github.event.action == 'edited' ||
+         (github.event.action == 'labeled' &&
+          github.event.label.name == 'needs-external-review') ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))) }}
+
 jobs:
   # ──────────────────────────────────────────────
   # Job 1: Read review-policy.yml configuration
   # ──────────────────────────────────────────────
   load-config:
-    # Runs on opened, ready_for_review, synchronize, and reopened so the
+    # Runs on opened, ready_for_review, synchronize, reopened, and edited so the
     # parser exercises every commit pushed to an open PR, not just
-    # initial open. `reopened` is included for the #495 re-arm path: a PR
-    # changed while closed and then reopened must have its policy
-    # re-parsed here BEFORE the auto-merge re-arm evaluates, so the
+    # initial open. `reopened` is included for the #495 readiness path: a PR
+    # changed while closed and then reopened, or retargeted through an edit,
+    # must have its policy
+    # re-parsed here BEFORE approval readiness evaluates, so the
     # threshold/paths feeding triage reflect the changed diff rather than
-    # a stale snapshot. Explicitly excludes `labeled`: the `assign` job
-    # allows `labeled` as a trigger, and it depends on this job's
-    # outputs — letting load-config run on labeled would cause
-    # assign to re-fire on every label edit and re-request
-    # reviewers who have already reviewed. Downstream jobs keep
-    # their own action-specific guards; triage intentionally runs on
-    # synchronize/reopened for the auto-merge re-arm path while assign
-    # stays scoped to opened/ready/labeled. See #59 for the
-    # SKIPPED-as-SUCCESS miss this
-    # closes and Codex's P2 on PR #131 for why labeled is excluded.
+    # a stale snapshot. Ordinary `labeled` events remain excluded so reviewer
+    # assignment cannot re-fire on every label edit. The single force-on label
+    # is admitted for invalidation only; `assign` has its own narrower guard
+    # and remains scoped to opened/ready. See #59 for the SKIPPED-as-SUCCESS
+    # miss this closes and Codex's P2 on PR #131 for why generic labeled
+    # events are excluded.
     # #557: ALSO run on approved pull_request_review events. The
-    # auto-merge-on-approval registered-reviewer gate (require_approval)
+    # legacy-named auto-merge-on-approval registered-reviewer gate
     # reads needs.load-config.outputs.reviewers on the direct-approval
     # path; if load-config is skipped on review events that list is empty,
     # the gate defaults REVIEWERS_JSON to [], rejects every approver as
-    # "not a registered reviewer", and never arms auto-merge (the merge
-    # still backstops via merge-clearance-gate, but the convenience #544
-    # added — and the one-shot-arming gap #495 closed — regress). This job
+    # "not a registered reviewer", and never reaches readiness validation.
+    # The merge still backstops via merge-clearance-gate. This job
     # only reads the static review-policy.yml, so it is event-shape-agnostic.
     if: >
       (github.event_name == 'pull_request' &&
@@ -64,6 +96,9 @@ jobs:
         github.event.action == 'ready_for_review' ||
         github.event.action == 'synchronize' ||
         github.event.action == 'reopened' ||
+        github.event.action == 'edited' ||
+        (github.event.action == 'labeled' &&
+         github.event.label.name == 'needs-external-review') ||
         github.event.action == 'unlabeled')) ||
       (github.event_name == 'pull_request_review' &&
        github.event.review.state == 'approved')
@@ -120,11 +155,11 @@ jobs:
           # exists to avoid: `triage` declares `needs: [load-config]` with no
           # `always()`, so it would be SKIPPED and never apply or refresh
           # `needs-external-review` (#59's SKIPPED-as-SUCCESS class), and
-          # `auto-merge-on-approval` would be skipped with it.
+          # the legacy-named approval-readiness job would be skipped with it.
           #
           # So emit the SAME fail-closed outputs load_review_config.sh emits
           # when it cannot resolve the governing policy, and exit 0:
-          # `reviewers=[]` (assign assigns nobody; the auto-merge arming gate
+          # `reviewers=[]` (assign assigns nobody; the readiness-admission gate
           # already defaults `REVIEWERS_JSON` to `[]` and rejects every
           # approver as unregistered), `threshold=0` (triage's preliminary
           # calculation requires external review), `paths=[]`,
@@ -178,24 +213,46 @@ jobs:
   triage:
     needs: [load-config]
     # `synchronize` / `reopened` are included alongside
-    # opened/ready_for_review so any push-triggered auto-merge re-arm gets
+    # opened/ready_for_review so any push-triggered readiness retry gets
     # threshold and protected-path labels (`needs-external-review`)
     # REFRESHED against the changed diff before it evaluates. Without this,
     # an originally-under-threshold PR whose later push or closed-state
     # change crossed the threshold (or touched a protected path) could
-    # re-arm on a stale/missing label snapshot. Mirrors load-config, which
+    # proceed on a stale/missing label snapshot. Mirrors load-config, which
     # also handles synchronize/reopened so this job's threshold/paths inputs
-    # are freshly parsed.
+    # are freshly parsed. Approved review events also run this same decision
+    # path so block-self-approval consumes one authoritative Phase 4 result
+    # rather than a second threshold/path implementation. Blocking-label
+    # `edited` re-evaluates the mutable body/base inputs before a carried
+    # approval can survive them. The force-on `labeled` event and blocking-label
+    # `unlabeled` events run in classification-only mode: the independence
+    # guard needs current Phase 4 scope, while triage must neither re-add the
+    # label already added nor undo the settle event that just removed it
+    # (#620/#1094).
     if: >
-      github.event_name == 'pull_request' &&
       github.event.pull_request.user.login != 'dependabot[bot]' &&
-      (github.event.action == 'opened' ||
-       github.event.action == 'ready_for_review' ||
-       github.event.action == 'synchronize' ||
-       github.event.action == 'reopened')
+      ((github.event_name == 'pull_request' &&
+        (github.event.action == 'opened' ||
+         github.event.action == 'ready_for_review' ||
+         github.event.action == 'synchronize' ||
+         github.event.action == 'reopened' ||
+         github.event.action == 'edited' ||
+         (github.event.action == 'labeled' &&
+          github.event.label.name == 'needs-external-review') ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))) ||
+       (github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved'))
     runs-on: ubuntu-latest
     outputs:
       needs_external: ${{ steps.check.outputs.needs_external }}
+      phase_4_required: ${{ steps.check.outputs.phase_4_required }}
+      phase_4_intrinsic_required: ${{ steps.check.outputs.phase_4_intrinsic_required }}
+      classified_head: ${{ steps.check.outputs.classified_head }}
+      classified_base_ref: ${{ steps.check.outputs.classified_base_ref }}
+      classified_base_sha: ${{ steps.check.outputs.classified_base_sha }}
+      reviewers: ${{ steps.check.outputs.reviewers }}
+      author_identity: ${{ steps.check.outputs.author_identity }}
     steps:
       - name: Checkout trusted workflow helpers
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -219,7 +276,169 @@ jobs:
             const fs = require('fs');
             const os = require('os');
             const path = require('path');
-            const pr = context.payload.pull_request;
+
+            function parseReviewerList(raw, label) {
+              let reviewers;
+              try {
+                reviewers = JSON.parse(raw || '[]');
+              } catch (error) {
+                throw new Error(`${label} reviewer allow-list is malformed`);
+              }
+              if (
+                !Array.isArray(reviewers) ||
+                reviewers.some(reviewer =>
+                  typeof reviewer !== 'string' || reviewer.trim().length === 0
+                )
+              ) {
+                throw new Error(`${label} reviewer allow-list is malformed`);
+              }
+              return reviewers;
+            }
+
+            // BEGIN TRIAGE POLICY MATERIALIZATION DECISION
+            function shouldMaterializeDefaultPolicy({
+              baseRef,
+              baseSha,
+              defaultBranch,
+              checkoutSha,
+            }) {
+              return baseRef === defaultBranch &&
+                (!checkoutSha || checkoutSha !== baseSha);
+            }
+            // END TRIAGE POLICY MATERIALIZATION DECISION
+
+            // BEGIN TRIAGE PHASE 4 DECISION
+            // BEGIN STABLE PR LABEL NAMES BOOTSTRAP
+            // Generated from scripts/self-approval-detector.cjs. Do not edit.
+            function stablePrLabelNames(candidate) {
+              const labels = candidate && candidate.labels;
+              if (
+                !Array.isArray(labels) ||
+                labels.some(label =>
+                  !label || typeof label.name !== 'string' || !label.name.trim()
+                )
+              ) {
+                throw new Error('live PR labels are unavailable or malformed');
+              }
+              return labels.map(label => label.name).sort();
+            }
+            // END STABLE PR LABEL NAMES BOOTSTRAP
+
+            function phase4RequiredForTriage({
+              requiresReview,
+              laneVerifiedHead,
+              pr,
+            }) {
+              const forceOn = stablePrLabelNames(pr)
+                .includes('needs-external-review');
+              return forceOn || phase4IntrinsicRequiredForTriage({
+                requiresReview,
+                laneVerifiedHead,
+              });
+            }
+
+            function phase4IntrinsicRequiredForTriage({
+              requiresReview,
+              laneVerifiedHead,
+            }) {
+              return Boolean(requiresReview) && !laneVerifiedHead;
+            }
+
+            function triageMayMutateLabels({eventName, action, labelName}) {
+              if (eventName !== 'pull_request') return true;
+              return action !== 'unlabeled' && !(
+                action === 'labeled' &&
+                labelName === 'needs-external-review'
+              );
+            }
+            // END TRIAGE PHASE 4 DECISION
+
+            function loadGoverningIdentities(pr, policyConfigPath) {
+              const outputPath = path.join(
+                os.tmpdir(),
+                `mergepath-live-policy-${process.pid}-${Date.now()}.out`,
+              );
+              try {
+                fs.writeFileSync(outputPath, '');
+                childProcess.execFileSync(
+                  'bash',
+                  [
+                    'scripts/workflow/load_review_config.sh',
+                    '--repo', `${context.repo.owner}/${context.repo.repo}`,
+                    '--base-ref', pr.base.ref,
+                    '--base-sha', pr.base.sha,
+                    '--default-branch', context.payload.repository.default_branch,
+                    '--default-config', policyConfigPath,
+                    '--output', outputPath,
+                  ],
+                  {encoding: 'utf8', env: process.env},
+                );
+                const outputs = new Map();
+                for (const line of fs.readFileSync(outputPath, 'utf8').split(/\r?\n/)) {
+                  if (!line) continue;
+                  const separator = line.indexOf('=');
+                  if (separator <= 0) {
+                    throw new Error('governing policy output is malformed');
+                  }
+                  const key = line.slice(0, separator);
+                  if (outputs.has(key)) {
+                    throw new Error(`governing policy output repeats ${key}`);
+                  }
+                  outputs.set(key, line.slice(separator + 1));
+                }
+                const reviewers = parseReviewerList(
+                  outputs.get('reviewers'),
+                  'governing policy',
+                );
+                const authorIdentity = outputs.get('author_identity') || '';
+                if (reviewers.length === 0 || !authorIdentity.trim()) {
+                  throw new Error(
+                    'governing policy identities are unavailable; refusing to classify approval',
+                  );
+                }
+                return {reviewers, authorIdentity};
+              } finally {
+                try {
+                  fs.unlinkSync(outputPath);
+                } catch (error) {
+                  if (error && error.code !== 'ENOENT') throw error;
+                }
+              }
+            }
+            const eventPr = context.payload.pull_request;
+            const snapshotKey = candidate => JSON.stringify({
+              head: candidate && candidate.head && candidate.head.sha,
+              baseRef: candidate && candidate.base && candidate.base.ref,
+              baseSha: candidate && candidate.base && candidate.base.sha,
+              labels: stablePrLabelNames(candidate),
+            });
+            const {data: pr} = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: eventPr.number,
+            });
+            const triageSnapshot = snapshotKey(pr);
+            if (snapshotKey(eventPr) !== triageSnapshot) {
+              core.notice(
+                'The event PR snapshot is stale; triage is evaluating the ' +
+                'current live head/base and the approval guard will suppress ' +
+                'direct-event violation attribution for the stale webhook.',
+              );
+            }
+            const eventLabelName = context.payload.label &&
+              context.payload.label.name;
+            const isForceOnLabelEvent =
+              context.eventName === 'pull_request' &&
+              context.payload.action === 'labeled' &&
+              eventLabelName === 'needs-external-review';
+            const isUnlabeledSettleEvent =
+              context.eventName === 'pull_request' &&
+              context.payload.action === 'unlabeled';
+            const mayMutateLabels = triageMayMutateLabels({
+              eventName: context.eventName,
+              action: context.payload.action,
+              labelName: eventLabelName,
+            });
             const threshold = parseInt(process.env.THRESHOLD, 10);
             const protectedPaths = JSON.parse(process.env.PROTECTED_PATHS);
 
@@ -231,6 +450,17 @@ jobs:
                 pull_number: pr.number,
               }
             );
+            const {data: prAfterFiles} = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: eventPr.number,
+            });
+            if (snapshotKey(prAfterFiles) !== triageSnapshot) {
+              throw new Error(
+                'PR head/base changed while triage read the live file list; ' +
+                'refusing to classify a mixed snapshot. A newer event will retry.',
+              );
+            }
 
             // Config must come from the PR BASE, not this default-branch
             // checkout (#763/#769). This job checks out the default branch so
@@ -252,16 +482,38 @@ jobs:
             let policyConfigPath = '.github/review-policy.yml';
             let policyReadFailed = false;
             try {
+              let checkoutSha = '';
+              try {
+                checkoutSha = childProcess.execFileSync(
+                  'git',
+                  ['rev-parse', 'HEAD'],
+                  {encoding: 'utf8'},
+                ).trim();
+              } catch (error) {
+                core.warning(
+                  `Could not prove the trusted checkout SHA (${error.message}); ` +
+                  `materializing the exact live default-base policy instead.`,
+                );
+              }
+              const policyResolverArgs = [
+                'scripts/workflow/resolve_base_policy.sh',
+                '--repo', `${context.repo.owner}/${context.repo.repo}`,
+                '--base-ref', pr.base.ref,
+                '--base-sha', pr.base.sha,
+                '--default-branch', context.payload.repository.default_branch,
+                '--default-config', '.github/review-policy.yml',
+              ];
+              if (shouldMaterializeDefaultPolicy({
+                baseRef: pr.base.ref,
+                baseSha: pr.base.sha,
+                defaultBranch: context.payload.repository.default_branch,
+                checkoutSha,
+              })) {
+                policyResolverArgs.push('--materialize-default');
+              }
               policyConfigPath = childProcess.execFileSync(
                 'bash',
-                [
-                  'scripts/workflow/resolve_base_policy.sh',
-                  '--repo', `${context.repo.owner}/${context.repo.repo}`,
-                  '--base-ref', pr.base.ref,
-                  '--base-sha', pr.base.sha,
-                  '--default-branch', context.payload.repository.default_branch,
-                  '--default-config', '.github/review-policy.yml',
-                ],
+                policyResolverArgs,
                 {encoding: 'utf8', env: process.env}
               ).trim();
               console.log(`Governing review policy: ${policyConfigPath}`);
@@ -272,6 +524,22 @@ jobs:
                 `(${e.message}); requiring external review fail-closed rather ` +
                 `than judging this PR by the default-branch policy.`
               );
+            }
+
+            let governingIdentities = {reviewers: [], authorIdentity: ''};
+            if (!policyReadFailed) {
+              try {
+                governingIdentities = loadGoverningIdentities(
+                  pr,
+                  policyConfigPath,
+                );
+              } catch (error) {
+                core.warning(
+                  `Could not load live governing identities (${error.message}); ` +
+                  `exporting an empty reviewer allow-list so approval ` +
+                  `enforcement fails closed.`,
+                );
+              }
             }
 
             // Exclude lockfiles, minified, and generated files from line count
@@ -372,7 +640,7 @@ jobs:
             // hand-edit, reopened-with-new-head) is labeled here exactly as
             // before, and the lane later removes the label if and only if the
             // byte-compare passes. This preserves the PAT-driven label
-            // add/remove events that re-arm the downstream gates, and it
+            // add/remove events that retrigger the downstream gates, and it
             // grants no exemption this job derives itself — the lane's
             // byte-verify remains the sole teeth. (The naive alternative —
             // skipping by branch name — was rejected as fail-OPEN in the
@@ -416,6 +684,25 @@ jobs:
               }
             }
 
+            // Export intrinsic threshold/path requiredness separately from
+            // the then-live force-on result. A carry-forward below can clear
+            // already-reviewed bytes, but does not turn the PR into Phase 3.
+            // Only the exact-head, byte-verified propagation lane has the
+            // policy's under-threshold-equivalent standing. The approval
+            // guard recombines the intrinsic output with its own stabilized
+            // live labels so overlapping add/remove events cannot latch this
+            // snapshot's mutable force-on state (#1094).
+            const phase4IntrinsicRequired =
+              phase4IntrinsicRequiredForTriage({
+                requiresReview: needsExternal,
+                laneVerifiedHead,
+              });
+            const phase4Required = phase4RequiredForTriage({
+              requiresReview: needsExternal,
+              laneVerifiedHead,
+              pr,
+            });
+
             if (needsExternal && laneVerifiedHead) {
               console.log(
                 `Propagation lane already byte-verified head ${pr.head.sha} ` +
@@ -457,17 +744,46 @@ jobs:
                 );
               }
 
-              if (!carried && needsExternal) {
+              if (!carried && mayMutateLabels && needsExternal) {
                 await github.rest.issues.addLabels({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: pr.number,
                   labels: ['needs-external-review'],
                 });
+              } else if (!mayMutateLabels && needsExternal) {
+                console.log(
+                  `Computed Phase 4 applicability for the ` +
+                  `${isForceOnLabelEvent ? 'force-on labeled' : 'unlabeled settle'} ` +
+                  `event without mutating needs-external-review (#620/#1094).`
+                );
               }
             }
 
             core.setOutput('needs_external', needsExternal.toString());
+            core.setOutput('phase_4_required', phase4Required.toString());
+            core.setOutput(
+              'phase_4_intrinsic_required',
+              phase4IntrinsicRequired.toString(),
+            );
+            core.setOutput('classified_head', pr.head.sha);
+            core.setOutput('classified_base_ref', pr.base.ref);
+            core.setOutput('classified_base_sha', pr.base.sha);
+            core.setOutput(
+              'reviewers',
+              JSON.stringify(governingIdentities.reviewers),
+            );
+            core.setOutput(
+              'author_identity',
+              governingIdentities.authorIdentity,
+            );
+            if (policyConfigPath !== '.github/review-policy.yml') {
+              try {
+                fs.unlinkSync(policyConfigPath);
+              } catch (error) {
+                if (error && error.code !== 'ENOENT') throw error;
+              }
+            }
 
   # ──────────────────────────────────────────────
   # Job 3: Assign reviewer (internal self-peer review)
@@ -478,9 +794,29 @@ jobs:
       always() &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.user.login != 'dependabot[bot]' &&
-      (github.event.action == 'opened' || github.event.action == 'ready_for_review' || github.event.action == 'labeled')
+      (github.event.action == 'opened' || github.event.action == 'ready_for_review')
     runs-on: ubuntu-latest
     steps:
+      # The reviewer-assignment parse below runs the SHARED PR-body parser
+      # (scripts/lib/pr-body-contract.mjs) rather than a local regex, so this
+      # job needs the repo on disk. Explicit-token github-script only, no
+      # authenticated git, so don't leave the checkout token in .git/config
+      # (#548 / Codex #550).
+      - name: Check out the shared PR-body parser
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # TRUSTED default-branch checkout, not the PR merge ref (#788, and
+          # the same rule load-config uses above). This job hands a
+          # write-capable token to github-script and then EXECUTES
+          # scripts/lib/pr-body-contract.mjs from this checkout. On
+          # `pull_request` the default ref is the PR merge ref, so an
+          # unpinned checkout would run PR-authored JavaScript with that
+          # token in scope. Disabling checkout credential persistence removes the
+          # checkout credential; it does NOT make the checked-out code
+          # trusted, and the parser must be the canonical one regardless.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
       - name: Assign reviewer identity based on Authoring-Agent
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -508,12 +844,35 @@ jobs:
             // Read the Authoring-Agent line from the PR body to determine which
             // agent wrote the code. Per REVIEW_POLICY.md, the same agent reviews
             // under its own reviewer identity (e.g., claude → nathanpayne-claude).
+            //
+            // This MUST use the shared parser, not a local regex (#1121). The
+            // previous `body.match(/^Authoring-Agent:.../mi)` took the first RAW
+            // line, so a marker inside an HTML comment counted as a declaration
+            // here while gh-pr-guard.sh ignored it. The same PR could then be
+            // assigned to one reviewer while the guard attributed it to another,
+            // and merge-clearance could wrongly consider the same-agent Codex
+            // fallback eligible. One parser, one answer, everywhere.
+            const { execFileSync } = require('child_process');
             const body = pr.body || '';
-            const agentMatch = body.match(/^Authoring-Agent:\s*(\w+)/mi);
+            const runParser = (flag) => {
+              try {
+                return execFileSync('node', ['scripts/lib/pr-body-contract.mjs', flag],
+                  { input: body, encoding: 'utf8' }).trim();
+              } catch (e) {
+                console.log(`shared PR-body parser failed for ${flag}: ${e.message}`);
+                return '';
+              }
+            };
+
+            // Exactly one VISIBLE marker, matching the guard and the merge gate.
+            // Zero, or more than one, is not a declaration and must not resolve
+            // to a reviewer — falling through to the default keeps assignment
+            // conservative instead of guessing from an ambiguous body.
+            const agentCount = runParser('--author-count');
+            const agentName = agentCount === '1' ? runParser('--author').toLowerCase() : '';
             let reviewer;
 
-            if (agentMatch) {
-              const agentName = agentMatch[1].toLowerCase();
+            if (agentName) {
               const matchingReviewer = reviewers.find(
                 r => r.endsWith(`-${agentName}`)
               );
@@ -666,167 +1025,938 @@ jobs:
             // decision === 'noop' — nothing to do.
 
   # ──────────────────────────────────────────────
-  # Job 5: Block self-approval
+  # Job 5: Enforce approval independence
   # ──────────────────────────────────────────────
   block-self-approval:
+    needs: [load-config, triage]
     if: >
-      github.event_name == 'pull_request_review' &&
-      github.event.review.state == 'approved'
+      always() &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      ((github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved') ||
+       (github.event_name == 'pull_request' &&
+        (github.event.action == 'synchronize' ||
+         github.event.action == 'reopened' ||
+         github.event.action == 'edited' ||
+         (github.event.action == 'labeled' &&
+          github.event.label.name == 'needs-external-review') ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))))
     runs-on: ubuntu-latest
+    outputs:
+      eligible_approval: ${{ steps.check.outputs.eligible_approval }}
+      auto_arm_allowed: ${{ steps.retract_shared_author.outputs.auto_arm_allowed }}
     steps:
-      - name: Dismiss self-approval from reviewer bot accounts
+      - name: Checkout trusted self-approval detector
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The review event can target untrusted PR code. Load the detector
+          # only from the trusted default branch.
+          ref: ${{ github.event.repository.default_branch }}
           # Explicit-token github-script only, no authenticated git, so don't
           # leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
 
-      - name: Install js-yaml
-        run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
-
-      - name: Check and dismiss
+      - name: Classify and dismiss ineligible approvals
+        id: check
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}
+          REVIEWERS_JSON: ${{ needs.triage.outputs.reviewers }}
+          EVENT_REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
+          PHASE_4_INTRINSIC_REQUIRED: ${{ needs.triage.outputs.phase_4_intrinsic_required }}
+          TRIAGE_HEAD: ${{ needs.triage.outputs.classified_head }}
+          TRIAGE_BASE_REF: ${{ needs.triage.outputs.classified_base_ref }}
+          TRIAGE_BASE_SHA: ${{ needs.triage.outputs.classified_base_sha }}
+          TRIAGE_RESULT: ${{ needs.triage.result }}
         with:
           github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const fs = require('fs');
-            const yaml = require('js-yaml');
+            const path = require('path');
 
-            const prAuthor = context.payload.pull_request.user.login;
-            const reviewer = context.payload.review.user.login;
+            // BEGIN SELF-APPROVAL BOOTSTRAP
+            // Generated from scripts/self-approval-detector.cjs. Do not edit.
+            function bootstrapDetector() {
+              function normalized(value) {
+                return typeof value === 'string' ? value.trim().toLowerCase() : '';
+              }
 
-            // Only block self-approval from reviewer bot accounts.
-            // The human (nathanjohnpayne) IS the PR author under the shared
-            // identity model, but must be allowed to approve for tiebreaker
-            // and human-escalated reviews per REVIEW_POLICY.md.
-            let reviewerAccounts;
-            try {
-              const config = yaml.load(fs.readFileSync('.github/review-policy.yml', 'utf8'));
-              reviewerAccounts = config.available_reviewers || [];
-            } catch (e) {
-              reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
+              // BEGIN STABLE PR LABEL NAMES
+              function stablePrLabelNames(candidate) {
+                const labels = candidate && candidate.labels;
+                if (
+                  !Array.isArray(labels) ||
+                  labels.some(label =>
+                    !label || typeof label.name !== 'string' || !label.name.trim()
+                  )
+                ) {
+                  throw new Error('live PR labels are unavailable or malformed');
+                }
+                return labels.map(label => label.name).sort();
+              }
+              // END STABLE PR LABEL NAMES
+
+              function decide(input) {
+                const prAuthor = normalized(input && input.prAuthor);
+                const authorIdentity = normalized(input && input.authorIdentity);
+                const reviewer = normalized(input && input.reviewer);
+                const reviewerAccounts = Array.isArray(input && input.reviewerAccounts)
+                  ? input.reviewerAccounts.map(normalized).filter(Boolean)
+                  : [];
+                const reviewerIsAgent = reviewerAccounts.includes(reviewer);
+
+                // Keep the native-account defense independent of the PR-body declaration.
+                // This catches a reviewer approving a PR authored by that same GitHub
+                // account even when external review would otherwise not be required.
+                if (reviewer && reviewerIsAgent && prAuthor === reviewer) {
+                  return {
+                    action: 'block',
+                    reason: 'same-native-account-approval',
+                    persistentViolation: true,
+                  };
+                }
+
+                // Human reviews are the documented tiebreaker and reviewer accounts not in
+                // this repository's configured agent allow-list are outside this guard.
+                if (!reviewerIsAgent) {
+                  return { action: 'allow', reason: 'human-or-unregistered-reviewer' };
+                }
+
+                if (!prAuthor || !authorIdentity) {
+                  return { action: 'block', reason: 'indeterminate-native-author' };
+                }
+
+                // External contributors and dependency bots do not use the shared author
+                // identity, so they need no Authoring-Agent declaration. Their registered
+                // agent reviewer is independent by native GitHub identity.
+                if (prAuthor !== authorIdentity) {
+                  return { action: 'allow', reason: 'non-shared-author-pr' };
+                }
+
+                if (!input || typeof input.requiresExternalReview !== 'boolean') {
+                  return { action: 'block', reason: 'indeterminate-review-requirement' };
+                }
+
+                if (input.requiresExternalReview === true) {
+                  const declarationAttempts = (
+                    typeof input.prBody === 'string' ? input.prBody : ''
+                  ).split(/\r?\n|\r/).filter(
+                    line => /^[ \t]*Authoring-Agent:/i.test(line),
+                  );
+                  if (declarationAttempts.length === 0) {
+                    return {
+                      action: 'block',
+                      reason: 'indeterminate-phase-4-author',
+                      detail: 'missing-authoring-agent-declaration',
+                    };
+                  }
+                  if (declarationAttempts.length > 1) {
+                    return {
+                      action: 'block',
+                      reason: 'indeterminate-phase-4-author',
+                      detail: 'multiple-authoring-agent-declarations',
+                    };
+                  }
+                  const declaration = /^Authoring-Agent:[ \t]*([A-Za-z0-9_-]+)[ \t]*$/i
+                    .exec(declarationAttempts[0]);
+                  if (!declaration) {
+                    return {
+                      action: 'block',
+                      reason: 'indeterminate-phase-4-author',
+                      detail: 'malformed-authoring-agent-declaration',
+                    };
+                  }
+                  const authoringAgent = normalized(declaration[1]);
+                  const authoringReviewers = reviewerAccounts.filter(
+                    account => account.endsWith(`-${authoringAgent}`),
+                  );
+                  if (authoringReviewers.length === 0) {
+                    return {
+                      action: 'block',
+                      reason: 'indeterminate-phase-4-author',
+                      detail: 'unknown-authoring-agent',
+                    };
+                  }
+                  if (authoringReviewers.length > 1) {
+                    return {
+                      action: 'block',
+                      reason: 'indeterminate-phase-4-author',
+                      detail: 'ambiguous-authoring-agent-mapping',
+                    };
+                  }
+                  const [authoringReviewer] = authoringReviewers;
+
+                  if (authoringReviewer && authoringReviewer === reviewer) {
+                    return {
+                      action: 'block',
+                      reason: 'same-agent-phase-4-approval',
+                      // The declaration is mutable and GitHub exposes no conditional label
+                      // write bound to the body snapshot. Dismiss the approval, but reserve
+                      // the human-only persistent label for immutable native-author proof.
+                      authoringAgent,
+                      authoringReviewer,
+                    };
+                  }
+                } else {
+                  return { action: 'allow', reason: 'under-threshold-agent-approval' };
+                }
+
+                return { action: 'allow', reason: 'different-agent-phase-4-approval' };
+              }
+
+              function latestOpinionatedReviews(input) {
+                const reviewerAccounts = Array.isArray(input && input.reviewerAccounts)
+                  ? input.reviewerAccounts.map(normalized).filter(Boolean)
+                  : [];
+                const prAuthor = normalized(input && input.prAuthor);
+                const includePrAuthor = Boolean(input && input.includePrAuthor);
+                const reviews = Array.isArray(input && input.reviews) ? input.reviews : [];
+                const latestByReviewer = new Map();
+
+                for (const review of reviews) {
+                  const reviewer = normalized(review && review.user && review.user.login);
+                  const state = normalized(review && review.state).toUpperCase();
+                  if (
+                    !reviewer ||
+                    (!includePrAuthor && reviewer === prAuthor) ||
+                    !reviewerAccounts.includes(reviewer) ||
+                    !['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(state)
+                  ) {
+                    continue;
+                  }
+
+                  const current = latestByReviewer.get(reviewer);
+                  const submittedAt = String((review && review.submitted_at) || '');
+                  const currentSubmittedAt = String((current && current.submitted_at) || '');
+                  const id = Number((review && review.id) || 0);
+                  const currentId = Number((current && current.id) || 0);
+                  if (
+                    !current ||
+                    submittedAt > currentSubmittedAt ||
+                    (submittedAt === currentSubmittedAt && id > currentId)
+                  ) {
+                    latestByReviewer.set(reviewer, review);
+                  }
+                }
+
+                return reviewerAccounts
+                  .map(reviewer => latestByReviewer.get(reviewer))
+                  .filter(Boolean);
+              }
+
+              function latestApprovedReviews(input) {
+                const headSha = normalized(input && input.headSha);
+                const requireHead = Boolean(input && input.requireHead);
+                return latestOpinionatedReviews(input).filter(review =>
+                  normalized(review.state).toUpperCase() === 'APPROVED' &&
+                  (!requireHead || (headSha && normalized(review.commit_id) === headSha)),
+                );
+              }
+
+              // A direct review webhook can arrive before the list-reviews endpoint exposes
+              // that review. Add it only when the live list has no object with the same ID;
+              // if the API already reports that ID as DISMISSED or CHANGES_REQUESTED, the
+              // live state wins over the older APPROVED webhook payload.
+              function reviewsWithDirectFallback(reviews, directReview) {
+                const combined = Array.isArray(reviews) ? [...reviews] : [];
+                const directId = Number((directReview && directReview.id) || 0);
+                if (
+                  directId > 0 &&
+                  !combined.some(review => Number((review && review.id) || 0) === directId)
+                ) {
+                  combined.push(directReview);
+                }
+                return combined;
+              }
+
+              // Bind the webhook-only fallback to live PR state without letting event
+              // freshness decide whether the fallback is retained. A delayed durable
+              // APPROVED event must still carry its exact review object when listReviews
+              // lags; staleness suppresses only direct-event attribution (red run and
+              // persistent label), not classification or dismissal.
+              function prepareDirectApproval(input) {
+                const directReview = input && input.directReview;
+                const liveHeadSha = normalized(input && input.liveHeadSha);
+                const directCommit = normalized(directReview && directReview.commit_id);
+                const directAttributionCurrent = !directReview || (
+                  input && input.eventEnforcementCurrent === true &&
+                  liveHeadSha &&
+                  directCommit === liveHeadSha
+                );
+
+                return {
+                  reviews: reviewsWithDirectFallback(input && input.liveReviews, directReview),
+                  directAttributionCurrent,
+                };
+              }
+
+              // Plan the complete standing-approval enforcement for one workflow event.
+              // Event identity controls only attribution (red run / persistent label); it
+              // never narrows the standing set that must be classified and dismissed.
+              function planApprovalEnforcement(input) {
+                const directReviewId = Number((input && input.directReviewId) || 0);
+                const directAttributionCurrent = !input || input.directAttributionCurrent !== false;
+                // Enforcement must retain a registered reviewer whose native account is
+                // also the PR author so decide() can apply the explicit native-account
+                // defense. Ordinary approval-readiness callers keep excluding PR-author
+                // reviews through latestApprovedReviews()'s default.
+                const approvals = latestApprovedReviews({...input, includePrAuthor: true});
+                let eligibleApproval = false;
+                let persistentDirectViolation = false;
+                const directBlockedDiagnostics = [];
+                const blockedDiagnostics = [];
+
+                const classifiedApprovals = approvals.map(review => {
+                  const reviewer = review && review.user && review.user.login;
+                  const decision = decide({...input, reviewer});
+                  const diagnostic = decision.detail
+                    ? `${decision.reason}: ${decision.detail}`
+                    : decision.reason;
+                  const reviewId = Number((review && review.id) || 0);
+                  const isDirectReview =
+                    directAttributionCurrent && directReviewId > 0 && reviewId === directReviewId;
+
+                  if (decision.action === 'allow') {
+                    eligibleApproval = true;
+                  } else {
+                    blockedDiagnostics.push(diagnostic);
+                    if (isDirectReview) {
+                      directBlockedDiagnostics.push(diagnostic);
+                      persistentDirectViolation = Boolean(decision.persistentViolation);
+                    }
+                  }
+
+                  return {review, reviewer, decision, diagnostic, isDirectReview};
+                });
+
+                return {
+                  approvals: classifiedApprovals,
+                  eligibleApproval,
+                  persistentDirectViolation,
+                  directBlockedDiagnostics,
+                  blockedDiagnostics,
+                };
+              }
+              return {stablePrLabelNames, decide, latestApprovedReviews, reviewsWithDirectFallback, prepareDirectApproval, planApprovalEnforcement};
+            }
+            // END SELF-APPROVAL BOOTSTRAP
+
+            // BEGIN SELF-APPROVAL RESOLVER
+            function detectorSupportsDurableFallback(detector) {
+              return detector &&
+                typeof detector.stablePrLabelNames === 'function' &&
+                typeof detector.decide === 'function' &&
+                typeof detector.latestApprovedReviews === 'function' &&
+                typeof detector.reviewsWithDirectFallback === 'function' &&
+                typeof detector.prepareDirectApproval === 'function' &&
+                typeof detector.planApprovalEnforcement === 'function';
             }
 
-            // A reviewer bot account cannot approve a PR it authored.
-            // Since all PRs are authored by nathanjohnpayne, this only fires
-            // if a bot account somehow ends up as the PR author (shouldn't
-            // happen under the policy, but guard against it).
-            const isReviewerBot = reviewerAccounts.includes(reviewer);
-            if (prAuthor === reviewer && isReviewerBot) {
-              await github.rest.pulls.dismissReview({
+            function selectDetector(input) {
+              const detectorRequiredMarker =
+                'SELF_APPROVAL_DETECTOR_DURABLE_FALLBACK_V2';
+              if (input.modulePresent) {
+                const canonical = input.loadCanonical();
+                if (detectorSupportsDurableFallback(canonical)) {
+                  return canonical;
+                }
+              }
+              if (String(input.trustedWorkflow || '').includes(detectorRequiredMarker)) {
+                throw new Error(
+                  'trusted workflow already requires the durable approval ' +
+                  'detector capability, but the canonical module is missing ' +
+                  'or incompatible; failing closed',
+                );
+              }
+              if (typeof input.notice === 'function') {
+                input.notice(
+                  'The trusted default branch predates the durable approval ' +
+                  'detector; using the generated strict bootstrap for this ' +
+                  'atomic workflow/module rollout only.',
+                );
+              }
+              return input.loadBootstrap();
+            }
+            // END SELF-APPROVAL RESOLVER
+
+            const detectorPath = path.resolve(
+              process.env.GITHUB_WORKSPACE,
+              'scripts/self-approval-detector.cjs',
+            );
+            const trustedWorkflowPath = path.resolve(
+              process.env.GITHUB_WORKSPACE,
+              '.github/workflows/agent-review.yml',
+            );
+            const modulePresent = fs.existsSync(detectorPath);
+            const trustedWorkflow = fs.readFileSync(trustedWorkflowPath, 'utf8');
+            const detector = selectDetector({
+              modulePresent,
+              trustedWorkflow,
+              loadCanonical: () => require(detectorPath),
+              loadBootstrap: bootstrapDetector,
+              notice: message => core.notice(message),
+            });
+            const {
+              stablePrLabelNames,
+              decide,
+              latestApprovedReviews,
+              reviewsWithDirectFallback,
+              prepareDirectApproval,
+              planApprovalEnforcement,
+            } = detector;
+            if (
+              typeof stablePrLabelNames !== 'function' ||
+              typeof decide !== 'function' ||
+              typeof latestApprovedReviews !== 'function' ||
+              typeof reviewsWithDirectFallback !== 'function' ||
+              typeof prepareDirectApproval !== 'function' ||
+              typeof planApprovalEnforcement !== 'function'
+            ) {
+              throw new Error('self-approval detector exports are unavailable');
+            }
+
+            // BEGIN DISMISS REVIEW FAIL-CLOSED
+            async function dismissReviewFailClosed(input) {
+              try {
+                await input.dismiss();
+                return 'dismissed';
+              } catch (writeError) {
+                let currentReview;
+                try {
+                  currentReview = await input.read();
+                } catch (readError) {
+                  throw writeError;
+                }
+                if (
+                  !currentReview ||
+                  Number(currentReview.id || 0) !== Number(input.reviewId) ||
+                  String(currentReview.state || '').toUpperCase() !== 'DISMISSED'
+                ) {
+                  throw writeError;
+                }
+                input.notice();
+                return 'already-dismissed';
+              }
+            }
+            // END DISMISS REVIEW FAIL-CLOSED
+
+            // BEGIN DURABLE APPROVAL PROTECTION
+            function registeredReviewerUnion(rawLists) {
+              const reviewers = new Set();
+              for (const raw of rawLists) {
+                let parsed;
+                try {
+                  parsed = JSON.parse(raw || '[]');
+                } catch (error) {
+                  continue;
+                }
+                if (!Array.isArray(parsed)) continue;
+                for (const reviewer of parsed) {
+                  if (typeof reviewer === 'string' && reviewer.trim()) {
+                    reviewers.add(reviewer.trim().toLowerCase());
+                  }
+                }
+              }
+              return reviewers;
+            }
+
+            async function protectDurableApproval(input) {
+              const directReview = input && input.directReview;
+              const reviewer = String(
+                directReview && directReview.user && directReview.user.login || '',
+              ).trim().toLowerCase();
+              if (
+                !directReview ||
+                String(directReview.state || '').toUpperCase() !== 'APPROVED' ||
+                Number(directReview.id || 0) <= 0 ||
+                !reviewer ||
+                !registeredReviewerUnion(input.reviewerLists || []).has(reviewer)
+              ) {
+                return false;
+              }
+              await input.dismiss(directReview);
+              return true;
+            }
+            // END DURABLE APPROVAL PROTECTION
+
+            // BEGIN STABLE REVIEW SNAPSHOT
+            async function readStableReviewSnapshot(input) {
+              let pr = input.pr;
+              const maxAttempts = Number(input.maxAttempts || 3);
+              for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                const reviews = await input.listReviews(pr);
+                const after = await input.readPr();
+                if (
+                  input.enforcementSnapshot(after) ===
+                  input.enforcementSnapshot(pr)
+                ) {
+                  return {pr: after, reviews, attempts: attempt};
+                }
+                if (input.policySnapshot(after) !== input.triageSnapshot) {
+                  throw new Error(
+                    'PR head/base changed after live triage',
+                  );
+                }
+                input.notice(attempt);
+                pr = after;
+              }
+              throw new Error(
+                `PR metadata did not stabilize after ${maxAttempts} review reads`,
+              );
+            }
+            // END STABLE REVIEW SNAPSHOT
+
+            // BEGIN APPROVAL PHASE 4 DECISION
+            function approvalEnforcementSnapshot(candidate, policySnapshotFn) {
+              return JSON.stringify({
+                policy: policySnapshotFn(candidate),
+                author: candidate && candidate.user && candidate.user.login,
+                body: (candidate && candidate.body) || '',
+                labels: stablePrLabelNames(candidate),
+              });
+            }
+
+            function phase4RequiredForApprovalGuard(
+              phase4IntrinsicRaw,
+              candidate,
+            ) {
+              if (
+                phase4IntrinsicRaw !== 'true' &&
+                phase4IntrinsicRaw !== 'false'
+              ) {
+                throw new Error('Phase 4 applicability is unavailable');
+              }
+              return phase4IntrinsicRaw === 'true' ||
+                stablePrLabelNames(candidate)
+                  .includes('needs-external-review');
+            }
+            // END APPROVAL PHASE 4 DECISION
+
+            async function protectCurrentDirectReview(reason) {
+              const directReview =
+                context.eventName === 'pull_request_review' &&
+                context.payload.review &&
+                context.payload.review.state === 'approved'
+                  ? context.payload.review
+                  : null;
+              return protectDurableApproval({
+                directReview,
+                reviewerLists: [
+                  process.env.REVIEWERS_JSON,
+                  process.env.EVENT_REVIEWERS_JSON,
+                ],
+                dismiss: approval => dismissReviewFailClosed({
+                  reviewId: approval.id,
+                  dismiss: () => github.rest.pulls.dismissReview({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: context.payload.pull_request.number,
+                    review_id: approval.id,
+                    message: `Approval policy snapshot could not stabilize ` +
+                      `(${reason}). This registered-agent approval was ` +
+                      `dismissed conservatively; submit a fresh approval on ` +
+                      `the current PR state.`,
+                  }),
+                  read: async () => {
+                    const response = await github.rest.pulls.getReview({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      pull_number: context.payload.pull_request.number,
+                      review_id: approval.id,
+                    });
+                    return response.data;
+                  },
+                  notice: () => core.notice(
+                    `Approval ${approval.id} was already dismissed by an ` +
+                    `overlapping enforcement run.`,
+                  ),
+                }),
+              });
+            }
+
+            async function failClosedBeforeClassification(reason, message) {
+              const dismissed = await protectCurrentDirectReview(reason);
+              if (dismissed) {
+                core.notice(
+                  'The durable registered-agent approval was dismissed before ' +
+                  'this unstable run stopped.',
+                );
+              }
+              core.setFailed(message);
+            }
+
+            core.setOutput('eligible_approval', 'false');
+            core.setOutput('snapshot_current', 'false');
+            if (process.env.TRIAGE_RESULT !== 'success') {
+              await failClosedBeforeClassification(
+                'live triage did not complete',
+                'Phase 4 classification did not complete; refusing to ' +
+                'classify or consume approvals.',
+              );
+              return;
+            }
+
+            const eventPr = context.payload.pull_request;
+            const policySnapshot = candidate => JSON.stringify({
+              head: candidate && candidate.head && candidate.head.sha,
+              baseRef: candidate && candidate.base && candidate.base.ref,
+              baseSha: candidate && candidate.base && candidate.base.sha,
+            });
+            const enforcementSnapshot = candidate =>
+              approvalEnforcementSnapshot(candidate, policySnapshot);
+            const triageSnapshot = JSON.stringify({
+              head: process.env.TRIAGE_HEAD || '',
+              baseRef: process.env.TRIAGE_BASE_REF || '',
+              baseSha: process.env.TRIAGE_BASE_SHA || '',
+            });
+            let livePrResponse;
+            try {
+              livePrResponse = await github.rest.pulls.get({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: context.payload.pull_request.number,
-                review_id: context.payload.review.id,
-                message: 'Self-approval is not permitted. This review has been dismissed automatically.',
+                pull_number: eventPr.number,
               });
+            } catch (error) {
+              await failClosedBeforeClassification(
+                `live PR read failed: ${error.message}`,
+                `Could not read the live PR (${error.message}); refusing to ` +
+                `consume approvals.`,
+              );
+              return;
+            }
+            let pr = livePrResponse.data;
+            if (policySnapshot(pr) !== triageSnapshot) {
+              await failClosedBeforeClassification(
+                'PR head/base changed after live triage',
+                'The PR changed after live triage; refusing to classify with ' +
+                'stale governing-policy outputs. A current run must retry.',
+              );
+              return;
+            }
+            const eventPolicyCurrent =
+              policySnapshot(pr) === policySnapshot(eventPr);
+            if (!eventPolicyCurrent) {
+              core.notice(
+                'The event head/base is stale; this durable approval run will ' +
+                'still classify its exact webhook review under the live ' +
+                'triage policy, without persistent direct attribution.',
+              );
+            }
+            let reviewerAccounts;
+            try {
+              reviewerAccounts = JSON.parse(
+                process.env.REVIEWERS_JSON || '[]',
+              );
+            } catch (error) {
+              reviewerAccounts = [];
+            }
+            if (
+              !Array.isArray(reviewerAccounts) ||
+              reviewerAccounts.length === 0 ||
+              reviewerAccounts.some(reviewer =>
+                typeof reviewer !== 'string' || reviewer.trim().length === 0
+              )
+            ) {
+              await failClosedBeforeClassification(
+                'governing reviewer allow-list is unavailable',
+                'governing policy reviewer allow-list is unavailable; refusing to classify approval',
+              );
+              return;
+            }
 
+            const phase4IntrinsicRaw =
+              process.env.PHASE_4_INTRINSIC_REQUIRED;
+            if (
+              phase4IntrinsicRaw !== 'true' &&
+              phase4IntrinsicRaw !== 'false'
+            ) {
+              await failClosedBeforeClassification(
+                'Phase 4 applicability is unavailable',
+                'Phase 4 applicability is unavailable; refusing to consume approvals.',
+              );
+              return;
+            }
+            const isDirectApproval =
+              context.eventName === 'pull_request_review' &&
+              context.payload.review &&
+              context.payload.review.state === 'approved';
+            const isUnlabeledRearm =
+              context.eventName === 'pull_request' &&
+              context.payload.action === 'unlabeled';
+            let stableReviewSnapshot;
+            try {
+              stableReviewSnapshot = await readStableReviewSnapshot({
+                pr,
+                triageSnapshot,
+                enforcementSnapshot,
+                policySnapshot,
+                listReviews: currentPr => github.paginate(
+                  github.rest.pulls.listReviews,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: currentPr.number,
+                    per_page: 100,
+                  },
+                ),
+                readPr: async () => {
+                  const response = await github.rest.pulls.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pr.number,
+                  });
+                  return response.data;
+                },
+                notice: attempt => core.notice(
+                  `The PR body, author, or labels changed during review read attempt ` +
+                  `${attempt}; retrying the durable approval fallback against ` +
+                  `one stable live snapshot.`,
+                ),
+              });
+            } catch (error) {
+              await failClosedBeforeClassification(
+                `stable review snapshot unavailable: ${error.message}`,
+                `Could not obtain one stable live review snapshot ` +
+                `(${error.message}); refusing to consume approvals.`,
+              );
+              return;
+            }
+            pr = stableReviewSnapshot.pr;
+            const liveReviews = stableReviewSnapshot.reviews;
+            const prAuthor = pr.user.login;
+            let requiresExternalReview;
+            try {
+              requiresExternalReview = phase4RequiredForApprovalGuard(
+                phase4IntrinsicRaw,
+                pr,
+              );
+            } catch (error) {
+              await failClosedBeforeClassification(
+                `live Phase 4 applicability is unavailable: ${error.message}`,
+                `Could not classify live Phase 4 applicability ` +
+                `(${error.message}); refusing to consume approvals.`,
+              );
+              return;
+            }
+            core.setOutput('snapshot_current', eventPolicyCurrent.toString());
+            const directReview = isDirectApproval
+              ? context.payload.review
+              : null;
+            let eventEnforcementCurrent = false;
+            try {
+              eventEnforcementCurrent =
+                enforcementSnapshot(eventPr) === enforcementSnapshot(pr);
+            } catch (error) {
+              core.notice(
+                `The event enforcement snapshot is unavailable ` +
+                `(${error.message}); direct-event violation attribution is ` +
+                `disabled for this webhook.`,
+              );
+            }
+            const preparedApproval = prepareDirectApproval({
+              liveReviews,
+              directReview,
+              eventEnforcementCurrent,
+              liveHeadSha: pr.head.sha,
+            });
+            const enforcement = planApprovalEnforcement({
+              reviews: preparedApproval.reviews,
+              directReviewId: directReview && directReview.id,
+              directAttributionCurrent:
+                preparedApproval.directAttributionCurrent,
+              reviewerAccounts,
+              prAuthor,
+              authorIdentity: process.env.AUTHOR_IDENTITY,
+              prBody: pr.body || '',
+              requiresExternalReview,
+            });
+
+            if (enforcement.approvals.length === 0) {
+              core.info('No eligible registered approval exists for this readiness retry.');
+              return;
+            }
+
+            for (const classification of enforcement.approvals) {
+              const {
+                review: approval,
+                reviewer,
+                decision,
+                diagnostic: decisionDiagnostic,
+                isDirectReview,
+              } = classification;
+              core.info(
+                `Approval ${approval.id} by ${reviewer}: ` +
+                `${decision.action} (${decisionDiagnostic})`,
+              );
+
+              if (decision.action !== 'block') {
+                continue;
+              }
+
+              const persistentDirectViolation =
+                isDirectReview && Boolean(decision.persistentViolation);
+              const dismissalPrefix = persistentDirectViolation
+                ? 'Approval violates the agent-independence policy'
+                : isDirectReview
+                  ? 'Approval independence could not be verified'
+                  : 'Approval is no longer eligible under the current agent-independence policy';
+              await dismissReviewFailClosed({
+                reviewId: approval.id,
+                dismiss: () => github.rest.pulls.dismissReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  review_id: approval.id,
+                  message: `${dismissalPrefix} (${decisionDiagnostic}). ` +
+                    'This review has been dismissed automatically.',
+                }),
+                read: async () => {
+                  const response = await github.rest.pulls.getReview({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pr.number,
+                    review_id: approval.id,
+                  });
+                  return response.data;
+                },
+                notice: () => core.notice(
+                  `Approval ${approval.id} was already dismissed by an ` +
+                  'overlapping enforcement run; treating the write as complete.',
+                ),
+              });
+            }
+
+            if (enforcement.persistentDirectViolation) {
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
+                issue_number: pr.number,
                 labels: ['policy-violation'],
               });
-
-              core.setFailed('Self-approval detected and dismissed.');
             }
 
+            core.setOutput(
+              'eligible_approval',
+              enforcement.eligibleApproval.toString(),
+            );
+            if (enforcement.directBlockedDiagnostics.length > 0) {
+              core.setFailed(
+                `Approval dismissed by the agent-independence guard ` +
+                `(${enforcement.directBlockedDiagnostics.join('; ')}).`,
+              );
+            } else if (enforcement.blockedDiagnostics.length > 0) {
+              core.notice(
+                `Dismissed ${enforcement.blockedDiagnostics.length} approval(s) that ` +
+                `became ineligible before the ${isUnlabeledRearm ? 'unlabeled' : 'update'} readiness evaluation.`,
+              );
+            }
+
+      - name: Retract durable auto-merge
+        id: retract_shared_author
+        if: ${{ always() }}
+        env:
+          # SHARED_AUTHOR_DISARM_REQUIRED_V1. The marker name is retained for
+          # rollout compatibility. This workflow write only disables
+          # auto-merge; it can never arm or merge the PR.
+          GH_TOKEN: ${{ github.token }}
+          AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}
+          SNAPSHOT_CURRENT: ${{ steps.check.outputs.snapshot_current }}
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Default closed. The legacy output means only "run privileged
+          # readiness validation"; it never authorizes a merge mutation.
+          echo "auto_arm_allowed=false" >> "$GITHUB_OUTPUT"
+          if ! pr_state=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json author,autoMergeRequest,url,headRefOid,baseRefName,baseRefOid); then
+            echo "::error::Could not read live PR author or auto-merge state."
+            exit 1
+          fi
+          if ! jq -e '
+            type == "object" and
+            (.author.login | type == "string" and length > 0) and
+            (.url | type == "string" and length > 0) and
+            (.headRefOid | type == "string" and length > 0) and
+            (.baseRefName | type == "string" and length > 0) and
+            (.baseRefOid | type == "string" and length > 0) and
+            has("autoMergeRequest") and
+            ((.autoMergeRequest == null) or (.autoMergeRequest | type == "object"))
+          ' >/dev/null 2>&1 <<<"$pr_state"; then
+            echo "::error::Live PR author or auto-merge metadata is malformed."
+            exit 1
+          fi
+          native_author=$(jq -r '.author.login' <<<"$pr_state")
+          live_head=$(jq -r '.headRefOid' <<<"$pr_state")
+          live_base_ref=$(jq -r '.baseRefName' <<<"$pr_state")
+          live_base_sha=$(jq -r '.baseRefOid' <<<"$pr_state")
+          if [ "${SNAPSHOT_CURRENT:-}" != "true" ] \
+            || [ "$live_head" != "${EVENT_HEAD:-}" ] \
+            || [ "$live_base_ref" != "${EVENT_BASE_REF:-}" ] \
+            || [ "$live_base_sha" != "${EVENT_BASE_SHA:-}" ]; then
+            echo "::warning::The event head/base is stale or unclassified; treating the live auto-merge arm as unclassified."
+            AUTHOR_IDENTITY=""
+          fi
+          if [ -z "${AUTHOR_IDENTITY:-}" ]; then
+            if jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
+              echo "Governing author_identity is unavailable, but no auto-merge request exists; readiness continuation remains disabled."
+              exit 0
+            fi
+            echo "::warning::Governing author_identity is unavailable; retracting the existing unclassified auto-merge request fail closed."
+          elif [ "$native_author" != "$AUTHOR_IDENTITY" ]; then
+            echo "auto_arm_allowed=true" >> "$GITHUB_OUTPUT"
+            if jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
+              echo "Native non-shared PR is eligible for readiness validation and has no durable arm."
+              exit 0
+            fi
+            echo "::warning::Native non-shared PR has a head-only durable arm; retracting it pending the #1058 merge-group boundary."
+          elif jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
+            echo "Shared-author PR has no auto-merge request to retract; readiness continuation remains disabled."
+            exit 0
+          fi
+          pr_url=$(jq -r '.url' <<<"$pr_state")
+          if ! gh pr merge "$pr_url" --repo "$REPO" --disable-auto; then # NO_BARE_GH_WRITE_EXEMPT: github.token is write-scoped and disable-only cleanup intentionally applies across head drift; tuple readback fails closed
+            echo "::error::Could not retract durable auto-merge."
+            exit 1
+          fi
+          if ! readback=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json author,autoMergeRequest,headRefOid); then
+            echo "::error::Could not verify durable auto-merge retraction."
+            exit 1
+          fi
+          if ! jq -e --arg author "$native_author" --arg head "$live_head" '
+            (.author.login == $author) and
+            (.headRefOid == $head) and
+            has("autoMergeRequest") and
+            .autoMergeRequest == null
+          ' >/dev/null 2>&1 <<<"$readback"; then
+            echo "::error::Durable auto-merge retraction did not persist."
+            exit 1
+          fi
+          echo "Durable or unclassified auto-merge retraction verified."
+
   # ──────────────────────────────────────────────
-  # Job 6: Auto-merge on approval (if no external review required)
+  # Job 6: Approval readiness (legacy job id retained for consumers)
   # ──────────────────────────────────────────────
-  # Must `needs:` on detect-disagreement, block-self-approval, and triage to
-  # force those sibling jobs to COMPLETE before this one starts. All three
-  # can apply blocking labels as a side effect (`needs-human-review` from
-  # detect-disagreement, `policy-violation` from block-self-approval, and
-  # `needs-external-review` from triage), and without the ordering
-  # constraint they run in parallel with auto-merge. A sibling applying a
-  # label 200ms after the runtime re-verify step below fetches labels but
-  # 100ms before `gh pr merge` dispatches would still slip through.
-  # `triage` matters specifically on the #495 synchronize/reopened re-arm
-  # path: a PR changed after an approval, or while closed and then
-  # reopened, must have `needs-external-review` re-applied by triage BEFORE
-  # the re-verify step reads labels, or the re-arm would arm on a stale
-  # snapshot. `always()` is still needed because event-mismatched sibling
-  # jobs are expected to skip (`detect-disagreement` / `block-self-approval`
-  # on pull_request events; `triage` on pull_request_review events). The
-  # pull_request re-arm path additionally requires `needs.triage.result ==
-  # 'success'`: ordering alone is not enough, because a failed/skipped triage
-  # could otherwise leave the old no-label snapshot in place and still let
-  # auto-merge arm. See #61 for the cross-event race and this PR for the
-  # same-workflow races nathanpayne-codex caught during review.
+  # The job must wait for detect-disagreement, block-self-approval, and triage
+  # because each sibling can apply a blocking label or invalidate an approval.
+  # Triage also recomputes Phase 4 applicability for synchronize, reopen,
+  # approved-review, and blocking-label-removal events. The guard exports a
+  # live eligible-approval result and the legacy-named auto_arm_allowed output;
+  # the latter now means only that a native non-shared PR may enter readiness
+  # validation. It is never permission to arm, enqueue, or merge.
   #
-  # Three triggers arm auto-merge (#495, #620):
-  #
-  #   1. `pull_request_review` + `approved` — the original path. The
-  #      approval event IS the signal, so no API approval re-check is
-  #      needed.
-  #   2. `pull_request` + `synchronize` / `reopened` — the RE-ARM path.
-  #      Arming was one-shot on the approval event, so a fix-commit
-  #      pushed AFTER an approval (the common case when Codex's 15–40+
-  #      min review lands a finding at or after the author's approval —
-  #      see #494) never re-attempted `gh pr merge --auto`, and the PR
-  #      sat CLEAN-but-unmerged unless the author re-approved. This path
-  #      re-runs the arming logic on every push, BUT only proceeds when
-  #      the `Gate: require existing non-author approval` step below
-  #      confirms a valid non-author latest-state APPROVED review already
-  #      exists on the PR. A push with NO existing approval does NOT
-  #      arm.
-  #
-  #      This comment used to justify that by asserting
-  #      `dismiss_stale_reviews` is OFF. It is not, and was not: measured
-  #      2026-08-22, the branch-protection API reports
-  #      dismiss_stale_reviews=true on ALL TEN fleet repos, with no
-  #      ruleset overriding classic protection. The step is nonetheless
-  #      correct, for a different reason than the old note claimed --
-  #      which is why the note is corrected rather than the code.
-  #
-  #      What actually makes it safe: the step never trusts the setting.
-  #      It re-reads the reviews API and recomputes the latest opinionated
-  #      state per registered non-author reviewer, so it observes whatever
-  #      the configuration produced instead of assuming it. If a push DID
-  #      dismiss the approval, the latest state is DISMISSED, no approver
-  #      is found, and the re-arm correctly does not fire -- a dismissed
-  #      approval means the PR is no longer approved. If the approval
-  #      survived, it re-arms. Both branches are right, under either
-  #      setting.
-  #
-  #      The carryover this path actually serves is `update-branch`, not
-  #      the ordinary fix-push. GitHub does not dismiss on an
-  #      update-branch merge and re-anchors the surviving review to the
-  #      new head: on #1080 the nathanpayne-codex APPROVED moved from
-  #      c0ee461 to a738d223 and stayed APPROVED. Sampling the last 25
-  #      merged hub PRs, every review_dismissed event was agent-initiated
-  #      (actor=nathanpayne-claude), not an automatic stale dismissal.
-  #
-  #      Do not "restore" a dependence on dismiss_stale_reviews here. Every load-bearing gate (AUTHOR_MERGE_TOKEN identity,
-  #      blocking-label re-verify, required checks) re-applies on the NEW HEAD,
-  #      and `gh pr merge --auto` is idempotent when --auto is already
-  #      enabled.
-  #   3. `pull_request` + `unlabeled` for a BLOCKING label (#620) — the
-  #      settle path. On an over-threshold PR with a carried-over
-  #      approval, update-branch makes triage re-apply
-  #      needs-external-review; the re-verify inside a concurrent arming
-  #      run reads that transient state and hard-fails (correct in
-  #      isolation — anti-#61); auto-clear then removes the label once
-  #      the clearance gate passes on the new head — and nothing
-  #      re-armed. The label REMOVAL is the state-settled signal, so it
-  #      re-runs the same fully-gated arming logic: the approval gate
-  #      re-confirms a registered non-author APPROVED via the API (same
-  #      as path 2), and every downstream guard re-applies unchanged.
-  #      The job `if:` additionally requires the REMOVED label to be one
-  #      of the four blocking names (the full Label Gate blocking set,
-  #      including policy-violation - Codex P2 on the #620 PR), so unrelated label churn does not spend
-  #      runner minutes. triage deliberately does NOT run on `unlabeled`
-  #      (its action filter excludes it — re-applying labels here would
-  #      flap against auto-clear), so the triage-success requirement
-  #      accepts `skipped` on this path: no sibling job can apply a
-  #      label in an unlabeled run, and the two in-job label re-verifies
-  #      still read the live API state fail-closed before any merge.
-  #
-  # The job body references only `github.event.pull_request.*` (number,
-  # html_url, labels) — all trigger shapes carry that object — so the
-  # steps are event-shape-agnostic. Only the `if:` and the approval-gate
-  # step branch on event name.
+  # Three event shapes re-evaluate readiness (#495, #620): a newly submitted
+  # approval; synchronize or reopen with a surviving registered latest-state
+  # approval; and removal of a blocking label after clearance settles. Edited
+  # events only invalidate mutable approval provenance and deliberately do not
+  # enter this job. Every path rechecks the governing author identity, labels,
+  # required checks, clearance, accounting, conversations, and live approval
+  # independence. The trusted continuation then retracts every durable arm and
+  # reports stable unarmed readiness. #1058 owns the future merge-group boundary.
   auto-merge-on-approval:
     needs: [load-config, detect-disagreement, block-self-approval, triage]
     # Job-level override (replaces rather than merges with the workflow
@@ -851,10 +1981,10 @@ jobs:
          github.event.action == 'reopened' ||
          (github.event.action == 'unlabeled' &&
           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))))) &&
-      (github.event_name != 'pull_request' ||
-       needs.triage.result == 'success' ||
-       (github.event.action == 'unlabeled' &&
-        needs.triage.result == 'skipped')) &&
+      needs.triage.result == 'success' &&
+      needs.block-self-approval.result == 'success' &&
+      needs.block-self-approval.outputs.eligible_approval == 'true' &&
+      needs.block-self-approval.outputs.auto_arm_allowed == 'true' &&
       !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
       !contains(github.event.pull_request.labels.*.name, 'needs-human-review') &&
       !contains(github.event.pull_request.labels.*.name, 'human-hold')
@@ -862,17 +1992,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # This job holds the author merge token. Its helper scripts must
+          # This job holds the author readiness token. Its helper scripts must
           # come from the trusted default branch, never the PR checkout.
           ref: ${{ github.event.repository.default_branch }}
-          # Explicit-token gh merge path only, no authenticated git, so don't
+          # Explicit-token API path only, no authenticated git, so don't
           # leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
 
-      # Re-arm gate (#495). On the `synchronize` / `reopened` re-trigger
+      # Readiness retry gate (#495). On a `synchronize` / `reopened` event
       # the approval is NOT in the event payload, so confirm via the API
       # that a valid non-author latest-state APPROVED review already
-      # exists before arming. On the `pull_request_review` approved path
+      # exists before continuing. On the `pull_request_review` approved path
       # the approval IS the trigger, so this step is skipped and `proceed`
       # defaults to true for the downstream guard.
       #
@@ -883,7 +2013,7 @@ jobs:
       # (GitHub blocks reviewer == author for native approval anyway), and
       # require that latest state to be APPROVED. A later
       # CHANGES_REQUESTED or DISMISSED from the same reviewer supersedes an
-      # earlier APPROVED, so a withdrawn approval does NOT re-arm.
+      # earlier APPROVED, so a withdrawn approval does not establish readiness.
       - name: Gate require existing non-author approval
         id: require_approval
         if: >
@@ -894,16 +2024,16 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           REPO: ${{ github.repository }}
-          # #529 / #544: restrict the approval that arms auto-merge to a
+          # #529 / #544: restrict the approval that enters readiness to a
           # REGISTERED agent reviewer identity (available_reviewers), matching
           # scripts/codex-review-check.sh gate (b) and the required
           # merge-clearance-gate. An APPROVED from an account that is NOT a
-          # mapped reviewer identity must not arm auto-merge on EITHER path:
-          # the synchronize re-arm (existing-review API check below) OR the
+          # mapped reviewer identity must not enter readiness on EITHER path:
+          # the synchronize retry (existing-review API check below) OR the
           # direct pull_request_review approved event. #544 review: the gate
           # previously ran only on pull_request, so a direct approval from an
           # unregistered non-author skipped it (the merge-clearance-gate still
-          # backstopped the actual merge, but the arming gate should be
+          # backstopped the actual merge, but the readiness gate should be
           # consistent on both paths).
           EVENT_REVIEWER: ${{ github.event.review.user.login }}
           REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
@@ -913,12 +2043,12 @@ jobs:
           # event reviewer is a registered, non-author reviewer here (#544).
           if [ "${GITHUB_EVENT_NAME:-}" = "pull_request_review" ]; then
             if [ -z "$EVENT_REVIEWER" ] || [ "$EVENT_REVIEWER" = "$PR_AUTHOR" ]; then
-              echo "::notice::Approval reviewer '$EVENT_REVIEWER' is empty or the PR author; not arming auto-merge."
+              echo "::notice::Approval reviewer '$EVENT_REVIEWER' is empty or the PR author; readiness denied."
               echo "proceed=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             if ! printf '%s' "$REVIEWERS_JSON" | jq -e --arg r "$EVENT_REVIEWER" 'index($r) != null' >/dev/null 2>&1; then
-              echo "::notice::Approval reviewer '$EVENT_REVIEWER' is not a registered reviewer (available_reviewers); not arming auto-merge (#544)."
+              echo "::notice::Approval reviewer '$EVENT_REVIEWER' is not a registered reviewer (available_reviewers); readiness denied (#544)."
               echo "proceed=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -926,9 +2056,9 @@ jobs:
             echo "proceed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # --- synchronize / reopened re-arm path (existing API check) ---
+          # --- synchronize / reopened readiness path (existing API check) ---
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::Neither CI_ACTOR_TOKEN nor REVIEWER_ASSIGNMENT_TOKEN is configured; cannot confirm an existing approval for the synchronize re-arm. Skipping auto-merge arming."
+            echo "::notice::Neither CI_ACTOR_TOKEN nor REVIEWER_ASSIGNMENT_TOKEN is configured; cannot confirm an existing approval for the synchronize readiness retry."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -941,7 +2071,7 @@ jobs:
           # the latest-state-per-reviewer collapse over the full array.
           # Mirrors fetch_api_array() in scripts/codex-review-check.sh.
           if ! RAW=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>&1); then
-            echo "::error::Could not read reviews to confirm an existing approval ($RAW). Failing closed — not arming auto-merge."
+            echo "::error::Could not read reviews to confirm an existing approval ($RAW). Failing closed — readiness denied."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -953,7 +2083,7 @@ jobs:
           # array. #529: the `IN($reviewers[])` filter restricts to
           # available_reviewers identities — an approval from a non-reviewer
           # account does NOT count. Default to [] so an empty/failed
-          # load-config fails CLOSED (no reviewer matches → no re-arm).
+          # load-config fails CLOSED (no reviewer matches → no readiness).
           REVIEWERS_JSON="${REVIEWERS_JSON:-[]}"
           if ! APPROVER=$(printf '%s' "$RAW" | jq -r -s \
             --arg author "$PR_AUTHOR" \
@@ -968,24 +2098,24 @@ jobs:
               | map(select(.state == "APPROVED"))
               | first
               | if . == null then "" else .user.login end' 2>/dev/null); then
-            echo "::error::Could not parse review list to confirm an existing approval. Failing closed — not arming auto-merge."
+            echo "::error::Could not parse review list to confirm an existing approval. Failing closed — readiness denied."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if [ -z "$APPROVER" ]; then
-            echo "::notice::No valid non-author APPROVED review from a registered reviewer (available_reviewers) on PR #$PR_NUMBER; a push does not arm auto-merge without one (#495/#529)."
+            echo "::notice::No valid non-author APPROVED review from a registered reviewer (available_reviewers) on PR #$PR_NUMBER; a push does not establish readiness without one (#495/#529)."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "Existing non-author approval found ($APPROVER); proceeding with the synchronize re-arm."
+          echo "Existing non-author approval found ($APPROVER); proceeding with the synchronize readiness retry."
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Check author merge token
+      - name: Check author readiness token
         id: author_merge_token
-        # Skip the entire merge path when the require_approval gate set
-        # proceed=false — either the synchronize re-arm found no existing
+        # Skip privileged readiness when the require_approval gate set
+        # proceed=false — either the synchronize retry found no existing
         # registered-reviewer approval, or (since #544) the direct
         # pull_request_review approver was not a registered reviewer. The
         # `!= 'false'` test still lets a genuine registered-reviewer approval
@@ -1000,12 +2130,12 @@ jobs:
           #
           # This step used to parse `author_identity` out of THIS job's
           # checkout, and that checkout is not pinned: on a `pull_request`
-          # event `actions/checkout` materializes `refs/pull/N/merge`, so the
+          # event checkout materializes `refs/pull/N/merge`, so the
           # expected identity came from the PR's OWN copy of the policy, and on
           # a `pull_request_review` event it came from a different file again.
           # Two answers for one PR, neither of them the governing one — the
           # remaining half of #788, on the surface that issue named explicitly
-          # (the auto-merge approval gate). A PR must not be able to nominate
+          # (the approval-readiness gate). A PR must not be able to nominate
           # the identity that is allowed to merge it by editing policy on its
           # own branch, and on a non-default base the default-branch copy is
           # equally wrong in the other direction: it can name an identity the
@@ -1017,7 +2147,7 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; automatic PR merge is disabled. Merge manually as the author identity."
+            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; privileged readiness evaluation is disabled. Merge manually as the author identity."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -1026,30 +2156,30 @@ jobs:
           # `load-config` could not resolve the governing policy (or was itself
           # skipped — this job runs under `always()`), and it is exactly the
           # fail-closed output scripts/workflow/load_review_config.sh emits in
-          # that case. Defaulting to a hard-coded login here would merge under
-          # an identity no policy we can read has authorized, which is the
-          # substitution #768/#769/#788 exist to prevent. Disabling the merge
+          # that case. Defaulting to a hard-coded login here would evaluate
+          # under an identity no policy we can read has authorized, which is the
+          # substitution #768/#769/#788 exist to prevent. Disabling readiness
           # path costs nothing that is not already lost: the same fail-closed
-          # load-config emits `reviewers=[]`, so the arming gate above has
-          # already rejected every approver. The author merges manually, and
+          # load-config emits `reviewers=[]`, so the readiness-admission gate
+          # above has already rejected every approver. The author merges manually, and
           # the required merge-clearance gate is untouched either way.
           expected_author="${EXPECTED_AUTHOR:-}"
           if [ -z "$expected_author" ]; then
-            echo "::notice::The review policy governing this PR's base branch yielded no author_identity, so the identity permitted to merge here is unproven; automatic PR merge is disabled (#788). Merge manually as the author identity."
+            echo "::notice::The review policy governing this PR's base branch yielded no author_identity, so privileged readiness evaluation is disabled (#788). Merge manually as the author identity."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if ! actual_author=$(gh api user --jq .login); then
-            echo "::error::AUTHOR_MERGE_TOKEN could not authenticate to GitHub. Refusing automatic merge."
+            echo "::error::AUTHOR_MERGE_TOKEN could not authenticate to GitHub. Refusing privileged readiness evaluation."
             exit 1
           fi
           if [ "$actual_author" != "$expected_author" ]; then
-            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$actual_author', expected '$expected_author' (author_identity in the policy governing base branch '${BASE_REF:-?}'). Refusing automatic merge."
+            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$actual_author', expected '$expected_author' (author_identity in the policy governing base branch '${BASE_REF:-?}'). Refusing privileged readiness evaluation."
             exit 1
           fi
 
-          echo "Automatic merge token verified for author identity: $actual_author"
+          echo "Author readiness token verified for identity: $actual_author"
           echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Re-verify blocking labels before readiness probe
@@ -1080,7 +2210,7 @@ jobs:
           # Re-fetch the authoritative label state from the GitHub API before
           # entering the readiness probe. The shared continuation repeats this
           # check, along with feedback-accounting and conversation-resolution
-          # gates, immediately before arming auto-merge. Abort if any blocking
+          # gates before reporting readiness. Abort if any blocking
           # label is now present. Also check `policy-violation`, which is applied by the
           # block-self-approval job earlier in this same workflow run (and
           # again, the `if:` at job start wouldn't have seen it).
@@ -1099,13 +2229,13 @@ jobs:
             }
           fi
           LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')
-          printf 'Labels at merge time:\n%s\n' "$LABELS"
+          printf 'Labels at readiness time:\n%s\n' "$LABELS"
           blocking_labels=$(printf '%s\n' "$LABELS" | mergepath_blocking_labels_csv)
           if [ -n "$blocking_labels" ]; then
-            echo "::error::Blocking label(s) present at merge time: $blocking_labels. Aborting auto-merge."
+            echo "::error::Blocking label(s) present at readiness time: $blocking_labels."
             exit 1
           fi
-          echo "No blocking labels present — proceeding to merge."
+          echo "No blocking labels present — proceeding with readiness validation."
 
 
       - name: Probe current-head check readiness once
@@ -1192,7 +2322,7 @@ jobs:
           # #655: a consumer's optional, never-propagated repo_lint_local.yml
           # annex (#601) produces a check run that branch protection does not
           # require, and this step — before this fix — did not observe either,
-          # so native auto-merge could arm with a red or missing annex check.
+          # so it could report readiness with a red or missing annex check.
           # Probe the PR HEAD commit for the annex file via the Contents API
           # (not this job's own checkout — its ref is not guaranteed to be the
           # PR head on every trigger shape this workflow handles) and require
@@ -1209,7 +2339,7 @@ jobs:
           # `paths`/`paths-ignore` legitimately produces NO check run at all
           # for a PR outside those paths, and earlier rounds forcing its
           # derived name(s) into this hard-required list made the old wait
-          # loop refuse auto-merge on every such PR. Annex enforcement instead
+          # loop refuse readiness on every such PR. Annex enforcement instead
           # runs as a separate workflow-wide scan below (annex_workflow),
           # mirroring codex-review-check.sh gate (a): match by the stable
           # .workflowPath rather than by a specific job name, block immediately
@@ -1684,7 +2814,7 @@ jobs:
             # itself already has 160+, confirmed live while working on
             # this fix) silently hid every entry past the first page from
             # both the required-check and annex workflow-wide scans below
-            # -- auto-merge could arm while an unobserved check past page
+            # -- readiness could be reported while an unobserved check past page
             # 1 was still red. Page through with the Relay cursor
             # (pageInfo.hasNextPage/endCursor) rather than raising the
             # page size, since the rollup can grow without bound as more
@@ -1815,7 +2945,7 @@ jobs:
             # enough to review line by line. Skipping matters: on a partial
             # rollup a stale FAILED entry whose superseding success sits on
             # an unfetched page would lose winner-selection and wrongly
-            # refuse auto-merge. Nothing is lost by deferring -- a red
+            # refuse readiness. Nothing is lost by deferring -- a red
             # sibling check cannot change a verdict that is already "wait",
             # and it is still caught by the later completed-workflow event
             # whose probe completes pagination.
@@ -1866,7 +2996,7 @@ jobs:
               #     the name-only select matches EITHER workflow's "lint"
               #     runs. Without grouping, picking one "winner" by
               #     timestamp could let a newer successful annex "lint"
-              #     mask an older FAILED canonical "lint", arming auto-merge
+              #     mask an older FAILED canonical "lint", reporting readiness
               #     without canonical lint actually being green. Grouping by
               #     workflow and requiring EVERY group's winner to be green
               #     means a same-named annex job can never stand in for the
@@ -1959,7 +3089,7 @@ jobs:
               bad_count=$(echo "$bad" | jq 'length')
               if [ "$bad_count" -gt 0 ]; then
                 bad_summary=$(echo "$bad" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
-                echo "::error::Required check run '$check_name' failed on current HEAD $sha (conclusion=$bad_summary); refusing auto-merge."
+                echo "::error::Required check run '$check_name' failed on current HEAD $sha (conclusion=$bad_summary); readiness denied."
                 exit 1
               fi
               conclusion_summary=$(echo "$winners" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
@@ -1975,7 +3105,7 @@ jobs:
             if [ -n "$annex_workflow" ] && [ "$rollup_complete" -eq 1 ]; then
               # #655 Codex round 6 (P1 "wait for annex checks before
               # clearing the label", P1 "observe matrix annex jobs before
-              # auto-merge", P2 "avoid forcing path-filtered annex jobs to
+              # reporting readiness", P2 "avoid forcing path-filtered annex jobs to
               # start"): scan the annex's own workflow for any REPORTED
               # entry rather than requiring a specific derived name, same
               # design as codex-review-check.sh gate (a)'s
@@ -1988,15 +3118,15 @@ jobs:
               # entries for this workflow is non-blocking: forcing a wait
               # for one that may legitimately never exist (a path-filtered
               # annex outside this PR's diff) would time out and refuse
-              # auto-merge on every such PR, forever.
+              # readiness on every such PR, forever.
               #
               # #655 Codex P2 round 13 ("disambiguate annex workflows beyond
               # display name", found on the codex-review-check.sh copy and
               # mirrored here): matching on .workflowName risked either
               # masking the real annex behind an unrelated same-named
-              # workflow (false clean, auto-merge arms early) or blocking on
-              # an unrelated same-named workflow's failure (false red,
-              # refuses auto-merge forever). .workflowPath is derived from
+              # workflow (false readiness) or blocking on an unrelated
+              # same-named workflow's failure (false red, refuses readiness
+              # forever). .workflowPath is derived from
               # the GraphQL-reported resourcePath of the workflow FILE
               # itself, not its freely-editable display name, so match on
               # the known, fixed annex filename instead. A StatusContext
@@ -2035,7 +3165,7 @@ jobs:
                   # pull_request run, or a failed job manually rerun to a
                   # later success. Without grouping, an old superseded
                   # FAILURE never leaves the rollup and would refuse
-                  # auto-merge forever even after the same-named job went
+                  # readiness forever even after the same-named job went
                   # green. Group by check name and keep only the
                   # latest-completed entry per name (mirrors the required-
                   # check winners query above, minus the pending branch
@@ -2048,7 +3178,7 @@ jobs:
                   annex_bad_count=$(echo "$annex_bad" | jq 'length')
                   if [ "$annex_bad_count" -gt 0 ]; then
                     annex_bad_summary=$(echo "$annex_bad" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
-                    echo "::error::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_bad_count non-passing reported check-run(s) after winner-selection on current HEAD $sha (conclusion=$annex_bad_summary); refusing auto-merge (#655)."
+                    echo "::error::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_bad_count non-passing reported check-run(s) after winner-selection on current HEAD $sha (conclusion=$annex_bad_summary); readiness denied (#655)."
                     exit 1
                   fi
                 fi
@@ -2064,21 +3194,34 @@ jobs:
             echo "::notice::Required current-head checks are still pending. Approval readiness is recorded; the completed-workflow continuation will re-evaluate without holding this runner."
             exit 0
 
-      - name: Enable auto-merge
+      - name: Report stable readiness
         if: steps.author_merge_token.outputs.enabled == 'true' && steps.check_readiness.outputs.ready == 'true'
         run: |
           # Route the immediate-green case through the same trusted final
           # safety path used by later workflow completions and the sweep. It
           # revalidates the live head, approval, checks, blocking labels,
-          # feedback accounting, and unresolved conversations before arming
-          # native auto-merge with --match-head-commit.
+          # feedback accounting, and unresolved conversations before reporting
+          # readiness. The helper leaves the PR unarmed pending #1058.
           if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then
             echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout approval event."
             exit 0
           fi
+          if ! grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' scripts/workflow/approval-merge-continuation.sh; then
+            echo "::notice::Trusted approval continuation predates governing-policy protective retraction; skipping this first-rollout approval event."
+            exit 0
+          fi
           set +e
-          bash scripts/workflow/approval-merge-continuation.sh "$PR_NUMBER" "$REPO"
-          rc=$?
+          GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+            --retract-unsafe-only "$PR_NUMBER" "$REPO"
+          protective_rc=$?
+          if [ "$protective_rc" -eq 0 ]; then
+            GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
+              MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
+              bash scripts/workflow/approval-merge-continuation.sh "$PR_NUMBER" "$REPO"
+            rc=$?
+          else
+            rc=$protective_rc
+          fi
           set -e
           case "$rc" in
             0) ;;
@@ -2088,9 +3231,10 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          WORKFLOW_TOKEN: ${{ github.token }}
           # Routes ONLY the review-feedback-accounting.sh call inside
-          # approval-merge-continuation.sh through GITHUB_TOKEN instead of
-          # the ambient AUTHOR_MERGE_TOKEN above (#1101, CodeRabbit on PR
-          # #1106) — see this job's permissions block for why.
+          # approval-merge-continuation.sh through GITHUB_TOKEN instead of the
+          # author token used by normal continuation (#1101, CodeRabbit on PR
+          # #1106). See this job's permissions block for why.
           ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

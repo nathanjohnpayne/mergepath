@@ -363,6 +363,11 @@ MARKER_ONLY_CONSUMER_GATES=(
   # continuation contract and reporter. All three are manifest-delivered,
   # so their absence can only be first-rollout skew, never hub-only residue.
   "check_auto_clear_workflow"
+  # Gate: scripts/sync-to-downstream.sh (marker) only. The detector,
+  # renderer, workflow and executable tests are manifest-delivered. The
+  # rules/repo_rules.md prose assertion is intentionally inside the hub-only
+  # branch because consumers own that file and carry repository-local prose.
+  "check_self_approval_detector"
 )
 
 is_marker_only_gate() {
