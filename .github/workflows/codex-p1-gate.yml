@@ -239,6 +239,17 @@ jobs:
             . scripts/lib/gh-api-scalar.sh
             # shellcheck source=scripts/lib/ghas-alert-severity.sh
             . scripts/lib/ghas-alert-severity.sh
+            # This job runs on a trusted default-branch checkout, so a
+            # local read_policy_block_field read here carries the same
+            # trust this job already places in every other file it reads
+            # from that checkout -- unlike the surface fingerprint's
+            # non-materialized read, which can run from any ref. Falls
+            # back to the well-known default both when unconfigured and
+            # when the read itself fails, so a config problem never
+            # silently drops the common case.
+            ghas_configured_bot_login=$(read_policy_block_field code_scanning bot_login 2>/dev/null || true)
+            ghas_bot_login="${ghas_configured_bot_login:-github-advanced-security[bot]}"
+
             alert_number=$(ghas_alert_number_from_body "$(cat "$previous_file")")
             if [ -n "$alert_number" ]; then
               # A failed cache_init (disk/permissions) leaves
@@ -255,19 +266,18 @@ jobs:
               fi
               ghas_tier=$(ghas_severity_tier "$ghas_severity")
               ghas_tier="${ghas_tier:-p2}"
-            elif [ "$source_login" = 'github-advanced-security[bot]' ]; then
-              # Codex review, PR #1124: live accounting's ghas_finding_tier
-              # ALSO falls back to p2 when no alert link can be parsed from
-              # a GHAS-authored body -- unlike a Codex/CodeRabbit body with
-              # no classifiable marker at all (which was never a "finding"
-              # even while live), a linkless GHAS comment IS still tracked
-              # as a p2 finding today. Without this branch, archiving such
-              # a comment would silently drop it below the "markerless has
-              # nothing to preserve" check further down, reopening the
-              # exact vanish-on-edit gap #1113 exists to close, just for
-              # this one narrower shape. Scoped to the well-known default
-              # login (not review-policy.yml's overridable one) for the
-              # same reason the alert-link scan above stays policy-free.
+            elif [ "$source_login" = "$ghas_bot_login" ]; then
+              # Codex review, PR #1124 (two rounds): live accounting's
+              # ghas_finding_tier ALSO falls back to p2 when no alert link
+              # can be parsed from a GHAS-authored body -- unlike a
+              # Codex/CodeRabbit body with no classifiable marker at all
+              # (which was never a "finding" even while live), a linkless
+              # GHAS comment IS still tracked as a p2 finding today.
+              # Without this branch, archiving such a comment would
+              # silently drop it below the "markerless has nothing to
+              # preserve" check further down, reopening the exact
+              # vanish-on-edit gap #1113 exists to close, just for this
+              # narrower shape.
               ghas_tier=p2
             fi
 
