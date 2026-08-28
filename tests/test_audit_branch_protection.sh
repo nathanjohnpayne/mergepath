@@ -1762,26 +1762,31 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Fleet test 12: the hub — and only the hub — is audited with
-#                --require-admin-enforcement. ADR 0002 requires
+# Fleet test 12: NO repo — the hub included — is audited with
+#                --require-admin-enforcement. ADR 0002 originally asked for
 #                enforce_admins on the hub (#427/#428 were both admin
-#                merges) and does not require it of consumers, so the loop
-#                must not apply the stricter posture fleet-wide either.
+#                merges); the owner DECLINED that on 2026-08-28 and kept an
+#                admin escape fleet-wide, so a CI or provider outage cannot
+#                strand a fully reviewed PR (#1121). This asserts the new
+#                posture positively: reinstating the hub special case must
+#                fail here, not pass silently.
 # ---------------------------------------------------------------------------
 set +e
 out=$(run_fleet all_pass 2>&1)
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
-  fail "fleet hub admin-enforcement: exit $rc, expected 0; output: $out"
-elif ! echo "$out" | grep -q "repo=testowner/hub admin_enforcement=yes"; then
-  fail "fleet must audit the hub with --require-admin-enforcement (ADR 0002); output: $out"
+  fail "fleet admin-enforcement: exit $rc, expected 0; output: $out"
+elif echo "$out" | grep -q "repo=testowner/hub admin_enforcement=yes"; then
+  fail "fleet must NOT single the hub out for --require-admin-enforcement (ADR 0002 Exceptions, 2026-08-28); output: $out"
 elif echo "$out" | grep -q "repo=testowner/alpha admin_enforcement=yes"; then
   fail "fleet must NOT apply --require-admin-enforcement to consumers; output: $out"
 elif echo "$out" | grep -q "repo=testowner/beta admin_enforcement=yes"; then
   fail "fleet must NOT apply --require-admin-enforcement to consumers; output: $out"
+elif ! echo "$out" | grep -q "repo=testowner/hub admin_enforcement=no"; then
+  fail "fleet must still audit the hub, just without the admin flag; output: $out"
 else
-  pass "fleet audits the hub (and only the hub) for admin enforcement"
+  pass "fleet audits every repo, hub included, WITHOUT admin enforcement"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1797,7 +1802,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ]; then
   fail "--fleet + --require-admin-enforcement: exit $rc, expected 1; output: $out"
-elif ! echo "$out" | grep -q -- "--require-admin-enforcement is decided per repo"; then
+elif ! echo "$out" | grep -q -- "--require-admin-enforcement is not passed by --fleet for any repo"; then
   fail "--fleet + --require-admin-enforcement: diagnostic missing; output: $out"
 else
   pass "--fleet + --require-admin-enforcement: rejected rather than silently ignored"
@@ -1821,8 +1826,8 @@ if [ "$rc" -ne 0 ]; then
   fail "fleet default-branch handoff: exit $rc, expected 0; output: $out"
 elif ! echo "$out" | grep -q "repo=testowner/beta admin_enforcement=no default_branch=trunk"; then
   fail "fleet default-branch handoff: beta's child must receive --default-branch trunk; output: $out"
-elif ! echo "$out" | grep -q "repo=testowner/hub admin_enforcement=yes default_branch=main"; then
-  fail "fleet default-branch handoff: the hub's child must receive it too (alongside the admin flag); output: $out"
+elif ! echo "$out" | grep -q "repo=testowner/hub admin_enforcement=no default_branch=main"; then
+  fail "fleet default-branch handoff: the hub's child must receive it too; output: $out"
 else
   pass "fleet hands each child the default branch it resolved (no redundant metadata read)"
 fi
