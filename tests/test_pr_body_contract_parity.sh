@@ -427,6 +427,7 @@ fi
 # line-based `grep -qE '^## Self-Review'` is satisfied by a heading inside a
 # fenced code block, so the required check passed bodies the parser rejects
 # (#1132).
+trap 'rm -f "${TMP_BASE_ENTRY:-}"' EXIT
 PRP=".github/workflows/pr-review-policy.yml"
 prp_job=$(awk '/^  self-review-check:/{f=1;next} /^  [a-z-]+:$/{f=0} f' "$ROOT/$PRP")
 # Live YAML only: the job's comments explain what it does and does not use, and
@@ -466,20 +467,53 @@ gate_flags="$(printf '%s\n' "$prp_live" \
 if [ -z "$gate_flags" ]; then
   bad "could not extract the flags $PRP passes to validate-pr-body.sh; the bootstrap guard is inert"
 else
-  while IFS= read -r flag; do
-    [ -n "$flag" ] || continue
-    # Output is CAPTURED before matching, never piped straight into grep.
-    # The entrypoint exits 2 on an unknown flag, and under `set -o pipefail`
-    # that exit status poisons the pipeline even when grep matches -- so the
-    # piped form reported "no usage message" for precisely the flags this guard
-    # exists to catch, inverting it silently.
-    _probe="$(printf '' | bash "$ROOT/scripts/validate-pr-body.sh" "$flag" 2>&1 || true)"
-    if printf '%s\n' "$_probe" | grep -q '^usage:'; then
-      bad "$PRP passes '$flag', which scripts/validate-pr-body.sh answers with usage: — it must land on the default branch BEFORE the gate uses it"
-    else
-      ok "the gate flag '$flag' is understood by the entrypoint (no bootstrap window)"
+  # Probe the DEFAULT-BRANCH copy, not this checkout's. The gate loads the
+  # validator from the default branch, so probing the PR head proves nothing
+  # about the case this guard exists for: a change adding a flag to BOTH the
+  # entrypoint and the workflow passes a PR-head probe and still dies on
+  # `usage:` in CI.
+  #
+  # The base copy is written INSIDE scripts/ under a temp name. The entrypoint
+  # resolves $ROOT from its own location, so a copy in /tmp resolves ROOT to /
+  # and dies sourcing //scripts/lib/... -- an error that is not `usage:` and
+  # which an earlier version of this guard read as "flag understood".
+  base_entrypoint=""
+  TMP_BASE_ENTRY="$ROOT/scripts/.base-validate-pr-body.$$.sh"
+  for ref in "origin/${MERGEPATH_DEFAULT_BRANCH:-main}" "${MERGEPATH_DEFAULT_BRANCH:-main}" origin/main main; do
+    if base_sha="$(git -C "$ROOT" merge-base "$ref" HEAD 2>/dev/null)" && [ -n "$base_sha" ]; then
+      if git -C "$ROOT" show "$base_sha:scripts/validate-pr-body.sh" > "$TMP_BASE_ENTRY" 2>/dev/null; then
+        base_entrypoint="$TMP_BASE_ENTRY"; break
+      fi
     fi
-  done <<< "$gate_flags"
+  done
+  if [ -z "$base_entrypoint" ]; then
+    # Loud, never a silent skip. Local runs without a base ref WARN; CI, where
+    # this is the check that matters, fails. Same posture as the shared
+    # lint-tooling helper (#588).
+    if [ -n "${CI:-}" ] && [ "${CI}" != "false" ] && [ "${CI}" != "0" ]; then
+      bad "cannot resolve a default-branch copy of scripts/validate-pr-body.sh; the bootstrap guard cannot verify the flags $PRP passes"
+    else
+      echo "WARN: no default-branch ref available; bootstrap guard not verified locally (enforced in CI)" >&2
+    fi
+  else
+    while IFS= read -r flag; do
+      [ -n "$flag" ] || continue
+      # Output is CAPTURED before matching, never piped straight into grep: the
+      # entrypoint exits 2 on an unknown flag, and under `set -o pipefail` that
+      # status poisons the pipeline even when grep matches, silently inverting
+      # this guard.
+      _probe="$(printf '' | bash "$base_entrypoint" "$flag" 2>&1 || true)"
+      if printf '%s\n' "$_probe" | grep -q '^usage:'; then
+        bad "$PRP passes '$flag', which the DEFAULT-BRANCH scripts/validate-pr-body.sh answers with usage: — land the flag in its own change first"
+      elif printf '%s\n' "$_probe" | grep -qE "^PR description "; then
+        ok "the gate flag '$flag' is understood by the DEFAULT-BRANCH entrypoint (no bootstrap window)"
+      else
+        # A missing library, a sourcing failure, an empty result -- the probe
+        # did not answer the question. Silence is not a pass.
+        bad "bootstrap probe for '$flag' was inconclusive; the base entrypoint neither rejected it as usage nor reached validation. Output: ${_probe:-<empty>}"
+      fi
+    done <<< "$gate_flags"
+  fi
 fi
 if printf '%s\n' "$prp_live" | grep -qF 'uses: actions/checkout@'; then
   if printf '%s\n' "$prp_live" | grep -qF 'ref: ${{ github.event.repository.default_branch }}'; then
