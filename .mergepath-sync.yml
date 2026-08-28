@@ -760,6 +760,18 @@ paths:
       - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
       - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
+  # Single entrypoint for PR-body validation (#1132). The required
+  # Self-Review gate, gh-as-author.sh and local checks all route through it, so
+  # the contract has one tested implementation rather than a shell copy and a
+  # YAML copy that drift apart. Canonical because a consumer running an older
+  # copy would enforce a weaker contract than its own workflow claims.
+  - path: scripts/validate-pr-body.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
+      - "scripts/lib/reviewers-helpers.sh"  # pr-body-contract.sh hard-sources it
   - path: scripts/gh-as-reviewer.sh
     type: canonical
     consumers: all

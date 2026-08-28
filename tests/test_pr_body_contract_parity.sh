@@ -351,6 +351,76 @@ else
   bad "gh-pr-guard has $guard_exit2 explicit parser exit-2 guards, expected 2"
 fi
 
+# --- 12. the contract's own verdicts, including the #1132 bypass -------------
+# A workflow assertion alone cannot see a parser regression, and "rejects the
+# fenced body" alone is satisfied by a gate that rejects everything -- so the
+# valid body is asserted to PASS in the same block.
+POLICY="$ROOT/.github/review-policy.yml"
+FENCED_SR=$'Authoring-Agent: claude\n\nSome PR.\n\n```\n## Self-Review\n```\n'
+VALID_BODY=$'Authoring-Agent: claude\n\n## Self-Review\n\n- Correctness: verified.\n'
+UNKNOWN_AGENT=$'Authoring-Agent: nobody\n\n## Self-Review\n\n- ok.\n'
+TWO_AGENTS=$'Authoring-Agent: claude\nAuthoring-Agent: codex\n\n## Self-Review\n\n- ok.\n'
+
+if pr_body_validate "$FENCED_SR" "$POLICY" >/dev/null 2>&1; then
+  bad "a ## Self-Review heading inside a code fence was ACCEPTED (the #1132 bypass)"
+else
+  ok "a ## Self-Review heading inside a code fence is rejected"
+fi
+
+if pr_body_validate "$VALID_BODY" "$POLICY" >/dev/null 2>&1; then
+  ok "a well-formed body is accepted (the rejections are not blanket)"
+else
+  bad "a well-formed body was rejected — the gate would block every PR"
+fi
+
+if pr_body_validate "$UNKNOWN_AGENT" "$POLICY" >/dev/null 2>&1; then
+  bad "an unknown Authoring-Agent was accepted"
+else
+  ok "an unknown Authoring-Agent is rejected"
+fi
+
+if pr_body_validate "$TWO_AGENTS" "$POLICY" >/dev/null 2>&1; then
+  bad "two Authoring-Agent lines were accepted"
+else
+  ok "two Authoring-Agent lines are rejected"
+fi
+
+# --- 13. the policy argument's failure modes must be honest ------------------
+# Before #1132 an unreadable policy rejected EVERY body while reporting
+# "unknown Authoring-Agent" -- blaming the author for a repo misconfiguration
+# no PR edit could fix. It must still fail closed, but say what actually broke.
+unreadable_out=$(pr_body_validate "$VALID_BODY" "/nonexistent/review-policy.yml" 2>&1 || true)
+if pr_body_validate "$VALID_BODY" "/nonexistent/review-policy.yml" >/dev/null 2>&1; then
+  bad "an unreadable policy file ACCEPTED a body — the gate fails open"
+else
+  ok "an unreadable policy file still fails closed"
+fi
+if printf '%s\n' "$unreadable_out" | grep -qF 'unknown Authoring-Agent'; then
+  bad "an unreadable policy is still reported as 'unknown Authoring-Agent' (blames the author)"
+else
+  ok "an unreadable policy is not misreported as an unknown agent"
+fi
+if printf '%s\n' "$unreadable_out" | grep -qiE 'configuration problem|could be derived'; then
+  ok "an unreadable policy names itself as the cause"
+else
+  bad "an unreadable policy gives no actionable diagnostic: $unreadable_out"
+fi
+
+# The empty-policy case is a DELIBERATE fail-open for callers that want only
+# the structural checks. It is pinned here so it stays a documented choice
+# rather than drifting into an accident, and so any gate that starts passing
+# "" is caught by the assertion below it.
+if pr_body_validate "$UNKNOWN_AGENT" "" >/dev/null 2>&1; then
+  ok "an empty policy arg deliberately skips the agent allow-list (documented fail-open)"
+else
+  bad "the empty-policy contract changed; update the exit-status docs in pr-body-contract.sh"
+fi
+if grep -qF 'pr_body_validate "$BODY" "$ROOT/.github/review-policy.yml"' "$ROOT/scripts/validate-pr-body.sh"; then
+  ok "the gate entrypoint passes a concrete policy path, so the fail-open is unreachable from CI"
+else
+  bad "scripts/validate-pr-body.sh must pass an absolute policy path, or the agent check silently disables"
+fi
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
