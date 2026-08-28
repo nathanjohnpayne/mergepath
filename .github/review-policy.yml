@@ -751,8 +751,8 @@ dependabot:
 # Phase 4b proactive triggers (#158)
 # ---------------------------------------------------------------------------
 # Controls when Phase 4b (manual CLI fallback) fires as a FIRST-CLASS gate,
-# in addition to its existing fallback role on 4a unavailability/timeout/
-# escalation. Empirical evidence in #158: 4b's bug-catch rate is roughly
+# in addition to its existing fallback role on 4a unavailability/timeout.
+# Empirical evidence in #158: 4b's bug-catch rate is roughly
 # proportional to interaction-complexity of the change — state machines,
 # concurrency, transactional code, and prompt design consistently surfaced
 # real bugs that 4a cleared past. Pure-data and pure-helper PRs got nothing
@@ -760,7 +760,8 @@ dependabot:
 #
 # Options:
 #   fallback-only — current behavior. 4b only on 4a unavailability /
-#                   escalation / timeout. Use when 4b's latency cost
+#                   timeout. Disagreement/runaway stays on the human-
+#                   tiebreaker path. Use when 4b's latency cost
 #                   outweighs its catch-rate value (low-risk repo, mostly
 #                   data-plumbing PRs, etc.).
 #   complex-changes — run scripts/phase-4b-classifier.sh AFTER 4a clears

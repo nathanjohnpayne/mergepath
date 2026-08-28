@@ -533,7 +533,7 @@ The `phase_4b_default` field in `.github/review-policy.yml` controls when 4b fir
 
 | Value | Behavior (intended; full wiring lands in #186 + #187) |
 |-------|---------|
-| `fallback-only` | Current behavior. 4b only on 4a unavailability/escalation/timeout. |
+| `fallback-only` | Current behavior. 4b only on 4a unavailability or timeout; disagreement/runaway stays on the human-tiebreaker path. |
 | `complex-changes` | Run `scripts/phase-4b-classifier.sh` AFTER 4a clears; if any trigger matches, post the 4b handoff before merging. |
 | `always` | Skip the classifier; post the 4b handoff for every external-review-threshold PR. |
 
