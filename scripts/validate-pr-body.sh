@@ -22,16 +22,34 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 
 PRINT_AUTHOR=false
-case "${1:-}" in
-  "") ;;
-  --print-author) PRINT_AUTHOR=true ;;
-  *)
-    echo "usage: scripts/validate-pr-body.sh [--print-author] < pr-body.md" >&2
-    exit 2
-    ;;
-esac
+# --self-review-only checks ONLY that a real `## Self-Review` heading is
+# present, using the markdown-aware parser. It reads no policy and makes no
+# claim about `Authoring-Agent:`, so it is exactly the pre-existing contract of
+# the required check, enforced correctly instead of by a line grep (#1132).
+# Widening that required check to the identity contract is a separate policy
+# change and is deliberately NOT bundled here.
+SELF_REVIEW_ONLY=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --print-author) PRINT_AUTHOR=true; shift ;;
+    --self-review-only) SELF_REVIEW_ONLY=true; shift ;;
+    *)
+      echo "usage: scripts/validate-pr-body.sh [--print-author] [--self-review-only] < pr-body.md" >&2
+      exit 2
+      ;;
+  esac
+done
 
 BODY="$(cat)"
+if [ "$SELF_REVIEW_ONLY" = true ]; then
+  if pr_body_has_self_review "$BODY"; then
+    exit 0
+  fi
+  echo "PR description is missing a '## Self-Review' section." >&2
+  echo "A heading inside a fenced code block does not count." >&2
+  echo "Required items: correctness, regression risk, style/conventions, test coverage, security/dependency hygiene." >&2
+  exit 1
+fi
 # A concrete policy path is passed unconditionally. Passing "" here would skip
 # the Authoring-Agent allow-list entirely and fail OPEN — see the exit-status
 # contract on pr_body_agent_is_allowed.
