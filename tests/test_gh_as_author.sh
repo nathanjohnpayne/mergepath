@@ -88,6 +88,19 @@ exit "${GH_GENERIC_RC:-0}"
 STUB
 chmod +x "$STUB_DIR/gh"
 
+cat >"$STUB_DIR/sudo" <<'SUDO_STUB'
+#!/usr/bin/env bash
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -b|--background) shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+SUDO_STUB
+chmod +x "$STUB_DIR/sudo"
+
 run_wrapper() {
   PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$WRAPPER" "$@"
 }
@@ -269,7 +282,7 @@ else
   pass "pr create contract: attached -T is a template value, not an ambiguous -F body flag"
 fi
 
-for boolean_flag in -d -f -w; do
+for boolean_flag in -d -f; do
   reset_log
   OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/77" GH_VIEW_AUTHOR="nathanjohnpayne" \
     run_wrapper -- gh pr create "$boolean_flag" --title "t" --body "$VALID_INLINE_BODY" >/dev/null 2>&1
@@ -280,6 +293,36 @@ for boolean_flag in -d -f -w; do
     pass "pr create contract: unrelated boolean flag $boolean_flag is not a body cluster"
   fi
 done
+
+for interactive_flag in -e --editor -w --web; do
+  reset_log
+  set +e
+  stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+    run_wrapper -- gh pr create "$interactive_flag" --title "t" --body "$VALID_INLINE_BODY" 2>&1 >/dev/null)
+  rc=$?
+  set -e
+  if [ "$rc" -ne 1 ]; then
+    fail "pr create contract: interactive flag $interactive_flag rc=$rc expected 1"
+  elif ! echo "$stderr_capture" | grep -q "interactive PR creation mode"; then
+    fail "pr create contract: interactive flag $interactive_flag missing actionable diagnostic"
+  elif grep -q $'gh\tpr\tcreate' "$WORKDIR/calls.log"; then
+    fail "pr create contract: interactive flag $interactive_flag reached the write"
+  else
+    pass "pr create contract: interactive flag $interactive_flag cannot mutate the validated body"
+  fi
+done
+
+reset_log
+OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/79" GH_VIEW_AUTHOR="nathanjohnpayne" \
+  run_wrapper -- sudo -b gh pr create --title "t" --body "$VALID_INLINE_BODY" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "prefixed pr create contract (sudo -b): valid body should pass; rc=$rc"
+elif ! grep -q $'gh\tpr\tcreate\t--title\tt\t--body\tAuthoring-Agent: codex' "$WORKDIR/calls.log"; then
+  fail "prefixed pr create contract (sudo -b): prefix flag was mistaken for a PR body flag"
+else
+  pass "prefixed pr create contract (sudo -b): prefix flags remain outside PR body parsing"
+fi
 
 reset_log
 set +e

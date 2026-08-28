@@ -206,6 +206,8 @@ fi
 check_shape create "env with an assignment"      env FOO=x gh pr create --title t
 check_shape create "absolute env"                /usr/bin/env gh pr new --title t
 check_shape create "command builtin prefix"      command gh pr create --title t
+check_shape other  "command -v diagnostic"       command -v gh pr create --title t
+check_shape other  "command -V diagnostic"       command -V gh pr create --title t
 check_shape other  "prefixed non-create"         env FOO=x gh pr merge 1
 check_shape other  "prefixed non-gh executable"  env FOO=x notgh pr create --title t
 
@@ -259,6 +261,17 @@ else
   bad "incomplete-tag body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
 fi
 
+# CommonMark condition 6 recognizes a fixed set of block tags even when the
+# opening tag ends immediately after its name. A generic incomplete tag stays
+# prose (the control above), while `<div` opens a blank-terminated HTML block.
+INCOMPLETE_BLOCK_TAG=$'<div\nAuthoring-Agent: claude\n## Self-Review\n\nvisible'
+got_count="$(pr_body_authoring_agent_count "$INCOMPLETE_BLOCK_TAG")"
+if [ "$got_count" = "0" ] && ! pr_body_has_self_review "$INCOMPLETE_BLOCK_TAG"; then
+  ok "an incomplete recognized block tag suppresses markers until a blank line"
+else
+  bad "incomplete block-tag body: raw-HTML declarations were accepted"
+fi
+
 # A fence-looking line inside raw HTML is HTML content, not a Markdown fence.
 # The raw block closes at </script>, after which declarations are visible
 # without an intervening blank line.
@@ -283,6 +296,14 @@ else
   bad "container-fence body: hidden markers escaped their top-level fence"
 fi
 
+UNICODE_FENCE_CLOSE=$'```text\n```\u2003\nAuthoring-Agent: claude\n\n## Self-Review\nok\n```'
+got_count="$(pr_body_authoring_agent_count "$UNICODE_FENCE_CLOSE")"
+if [ "$got_count" = "0" ] && ! pr_body_has_self_review "$UNICODE_FENCE_CLOSE"; then
+  ok "Unicode whitespace cannot close a CommonMark fenced block"
+else
+  bad "Unicode fence-close body: hidden markers escaped their fence"
+fi
+
 # Contract markers are deliberately top-level. Two-space list continuations
 # and explicit blockquotes render inside their containers, so accepting either
 # would let nested prose satisfy the policy.
@@ -300,6 +321,14 @@ if [ "$got_count" = "0" ] && ! pr_body_has_self_review "$BLOCKQUOTE_MARKERS"; th
   ok "blockquote declarations are not top-level contract markers"
 else
   bad "blockquote body: nested declarations were accepted"
+fi
+
+MULTILINE_CODE_SPAN=$'## Self-Review\n\n`example\nAuthoring-Agent: codex\n`'
+got_count="$(pr_body_authoring_agent_count "$MULTILINE_CODE_SPAN")"
+if [ "$got_count" = "0" ]; then
+  ok "a marker inside a multiline code span is not a contract declaration"
+else
+  bad "multiline-code-span body: hidden Authoring-Agent was accepted"
 fi
 
 BACKTICK_INFO=$'```foo`bar\nAuthoring-Agent: claude\n\n## Self-Review\nok'

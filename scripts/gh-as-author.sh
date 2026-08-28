@@ -82,13 +82,16 @@ is_pr_create_command() {
 }
 
 IS_PR_CREATE=0
+PR_CREATE_VERB_INDEX=-1
 if is_pr_create_command "$@"; then
   IS_PR_CREATE=1
+  PR_CREATE_VERB_INDEX=$GH_PR_CREATE_VERB_INDEX
 fi
 
 if [ "$IS_PR_CREATE" -eq 1 ]; then
   PR_BODY=""
   NORMALIZED_COMMAND=()
+  COMMAND_INDEX=0
 
   read_pr_body_file() {
     local body_file="$1"
@@ -107,7 +110,17 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
   while [ "$#" -gt 0 ]; do
     argument="$1"
     shift
+    if [ "$COMMAND_INDEX" -le "$PR_CREATE_VERB_INDEX" ]; then
+      NORMALIZED_COMMAND+=("$argument")
+      COMMAND_INDEX=$((COMMAND_INDEX + 1))
+      continue
+    fi
+    COMMAND_INDEX=$((COMMAND_INDEX + 1))
     case "$argument" in
+      -e|--editor|-w|--web)
+        echo "gh-as-author: interactive PR creation mode '$argument' is unsupported because it can mutate the body after validation." >&2
+        exit 1
+        ;;
       --body|-b)
         if [ "$#" -eq 0 ]; then
           echo "gh-as-author: PR creation flag is missing its body value." >&2

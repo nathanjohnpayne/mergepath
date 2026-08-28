@@ -13,8 +13,11 @@ export function parsePrBodyContract(body) {
   let fence = null;
   let inComment = false;
   let htmlBlock = null;
+  let codeSpanTicks = null;
 
-  for (const rawLine of body.split(/\r?\n/)) {
+  const lines = body.split(/\r?\n/);
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const rawLine = lines[lineIndex];
     // Four spaces (or a tab) means an indented code block, and an indented
     // backtick run is CODE, not a fence delimiter. trimStart() erased that
     // distinction, so `    \u0060\u0060\u0060` opened a fence that never closed and the
@@ -24,11 +27,20 @@ export function parsePrBodyContract(body) {
     const fenceLine = rawLine.trimStart();
     if (fence != null) {
       if (!indentedCode) {
-        const closing = fenceLine.match(/^(`{3,}|~{3,})\s*$/);
+        const closing = fenceLine.match(/^(`{3,}|~{3,})[ \t]*$/);
         if (closing && closing[1][0] === fence.marker && closing[1].length >= fence.length) {
           fence = null;
         }
       }
+      continue;
+    }
+
+    // Inline code spans can cross line endings. While one is open, block
+    // syntax and contract-looking text are literal code, including comment or
+    // HTML delimiters. Unmatched runs remain literal; scanCodeSpanTicks looks
+    // ahead for an exact-length closer before it opens a span.
+    if (codeSpanTicks != null) {
+      codeSpanTicks = scanCodeSpanTicks(rawLine, codeSpanTicks, lines, lineIndex);
       continue;
     }
 
@@ -71,6 +83,12 @@ export function parsePrBodyContract(body) {
     }, false);
     if (line == null) continue;
 
+    const nextCodeSpanTicks = scanCodeSpanTicks(line, null, lines, lineIndex);
+    if (nextCodeSpanTicks != null) {
+      codeSpanTicks = nextCodeSpanTicks;
+      continue;
+    }
+
     const rawTag = line.match(/^ {0,3}<(script|pre|style|textarea)(?:\s|>|$)/i);
     if (rawTag) {
       if (!new RegExp(`</${rawTag[1]}\\s*>`, 'i').test(line)) {
@@ -88,6 +106,14 @@ export function parsePrBodyContract(body) {
     }
     if (/^ {0,3}<![A-Z]/.test(line)) {
       if (!line.includes('>')) htmlBlock = 'declaration';
+      continue;
+    }
+    // CommonMark HTML block condition 6 uses a fixed tag-name list and does
+    // not require a closing `>`: `<div` at end of line starts a raw block that
+    // runs until the next blank line. Keep this distinct from condition 7's
+    // complete generic-tag rule so `<foo` remains ordinary prose.
+    if (/^ {0,3}<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ \t]|\/?>|$)/i.test(line)) {
+      htmlBlock = 'blank';
       continue;
     }
     // Tag NAME then a boundary, not any angle-bracketed token: an autolink
@@ -151,6 +177,39 @@ function stripHtmlComments(line, setState, initialState) {
 
   setState(inComment);
   return discardLine ? null : result;
+}
+
+function scanCodeSpanTicks(line, activeTicks, lines, lineIndex) {
+  let cursor = 0;
+  let ticks = activeTicks;
+  while (cursor < line.length) {
+    if (line[cursor] !== '`') {
+      cursor += 1;
+      continue;
+    }
+    let end = cursor + 1;
+    while (end < line.length && line[end] === '`') end += 1;
+    const runLength = end - cursor;
+    if (ticks == null) {
+      // An unmatched backtick run is literal text, not a code-span opener.
+      // Look ahead before changing state so a malformed fence-info line such
+      // as ```foo`bar cannot suppress otherwise-visible declarations.
+      if (hasMatchingCodeSpanRun(lines, lineIndex, end, runLength)) ticks = runLength;
+    }
+    else if (runLength === ticks) ticks = null;
+    cursor = end;
+  }
+  return ticks;
+}
+
+function hasMatchingCodeSpanRun(lines, lineIndex, column, runLength) {
+  for (let index = lineIndex; index < lines.length; index += 1) {
+    const candidate = index === lineIndex ? lines[index].slice(column) : lines[index];
+    for (const match of candidate.matchAll(/`+/g)) {
+      if (match[0].length === runLength) return true;
+    }
+  }
+  return false;
 }
 
 const mode = process.argv[2];
