@@ -20,7 +20,11 @@ ok()   { pass=$((pass+1)); echo "PASS: $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL: $1" >&2; }
 
 TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
-trap 'rm -f "$TMP_DETECTOR"' EXIT
+# ONE exit handler for every temp this suite creates. A second `trap ... EXIT`
+# later REPLACES this one rather than extending it, which leaked the detector
+# file on every run that reached it.
+TMP_BASE_ENTRY=""
+trap 'rm -f "$TMP_DETECTOR" "${TMP_BASE_ENTRY:-}"' EXIT
 
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
@@ -427,7 +431,6 @@ fi
 # line-based `grep -qE '^## Self-Review'` is satisfied by a heading inside a
 # fenced code block, so the required check passed bodies the parser rejects
 # (#1132).
-trap 'rm -f "${TMP_BASE_ENTRY:-}"' EXIT
 PRP=".github/workflows/pr-review-policy.yml"
 prp_job=$(awk '/^  self-review-check:/{f=1;next} /^  [a-z-]+:$/{f=0} f' "$ROOT/$PRP")
 # Live YAML only: the job's comments explain what it does and does not use, and
@@ -478,7 +481,7 @@ else
   # and dies sourcing //scripts/lib/... -- an error that is not `usage:` and
   # which an earlier version of this guard read as "flag understood".
   base_entrypoint=""
-  TMP_BASE_ENTRY="$ROOT/scripts/.base-validate-pr-body.$$.sh"
+  TMP_BASE_ENTRY="$ROOT/scripts/.base-validate-pr-body.$$.sh"   # cleaned by the single EXIT trap above
   for ref in "origin/${MERGEPATH_DEFAULT_BRANCH:-main}" "${MERGEPATH_DEFAULT_BRANCH:-main}" origin/main main; do
     if base_sha="$(git -C "$ROOT" merge-base "$ref" HEAD 2>/dev/null)" && [ -n "$base_sha" ]; then
       if git -C "$ROOT" show "$base_sha:scripts/validate-pr-body.sh" > "$TMP_BASE_ENTRY" 2>/dev/null; then
@@ -487,14 +490,36 @@ else
     fi
   done
   if [ -z "$base_entrypoint" ]; then
-    # Loud, never a silent skip. Local runs without a base ref WARN; CI, where
-    # this is the check that matters, fails. Same posture as the shared
-    # lint-tooling helper (#588).
-    if [ -n "${CI:-}" ] && [ "${CI}" != "false" ] && [ "${CI}" != "0" ]; then
-      bad "cannot resolve a default-branch copy of scripts/validate-pr-body.sh; the bootstrap guard cannot verify the flags $PRP passes"
-    else
-      echo "WARN: no default-branch ref available; bootstrap guard not verified locally (enforced in CI)" >&2
+    # One shallow fetch attempt, then degrade -- never block.
+    if git -C "$ROOT" fetch --depth=1 -q origin "${MERGEPATH_DEFAULT_BRANCH:-main}" 2>/dev/null; then
+      if base_sha="$(git -C "$ROOT" rev-parse FETCH_HEAD 2>/dev/null)" \
+         && git -C "$ROOT" show "$base_sha:scripts/validate-pr-body.sh" > "$TMP_BASE_ENTRY" 2>/dev/null; then
+        base_entrypoint="$TMP_BASE_ENTRY"
+      fi
     fi
+  fi
+  if [ -z "$base_entrypoint" ]; then
+    # WARN, and deliberately NOT a failure even under CI. repo_lint.yml's
+    # lint_fast job checks out shallow (no fetch-depth) with
+    # persist-credentials:false, so neither `origin/main` nor an authenticated
+    # re-fetch is available there. Failing closed would red the required lint
+    # context on EVERY pull request across the fleet -- an infrastructure
+    # limitation must not masquerade as a policy violation. That is the same
+    # class of self-inflicted breakage this guard exists to prevent.
+    #
+    # The weaker in-tree check below still runs everywhere, so a flag that no
+    # entrypoint understands is caught regardless; only the base-vs-head skew
+    # goes unverified when the ref is unreachable.
+    echo "WARN: no default-branch ref reachable; the base-vs-head half of the bootstrap guard is unverified in this environment" >&2
+    while IFS= read -r flag; do
+      [ -n "$flag" ] || continue
+      _probe="$(printf '' | bash "$ROOT/scripts/validate-pr-body.sh" "$flag" 2>&1 || true)"
+      if printf '%s\n' "$_probe" | grep -q '^usage:'; then
+        bad "$PRP passes '$flag', which scripts/validate-pr-body.sh does not accept at all"
+      else
+        ok "the gate flag '$flag' is accepted by the in-tree entrypoint (base-vs-head skew unverified here)"
+      fi
+    done <<< "$gate_flags"
   else
     while IFS= read -r flag; do
       [ -n "$flag" ] || continue

@@ -1418,6 +1418,13 @@ paths:
       - "scripts/validate-pr-body.sh"
       - "scripts/lib/pr-body-contract.sh"
       - "scripts/lib/pr-body-contract.mjs"
+      # pr-body-contract.sh hard-sources this. The commit-path closure gate
+      # evaluates only the changed workflow's OWN requires, not the nested
+      # requires of the entrypoint, so a consumer could receive the workflow
+      # with a missing or stale copy and fail its required Self-Review job on
+      # every PR. Declared directly, as the manifest already does for the
+      # parity test's same transitive dependency.
+      - "scripts/lib/reviewers-helpers.sh"
   - path: .github/workflows/dependabot-auto-merge.yml
     type: canonical
     consumers: all
