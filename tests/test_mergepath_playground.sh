@@ -39,6 +39,10 @@ grep -q "RUBRIC_INJECT"                          "$PAGE" || { echo "legacy marke
 grep -q 'id="threshold"'                         "$PAGE" || { echo "threshold slider missing"; exit 1; }
 grep -q 'id="pathChips"'                         "$PAGE" || { echo "path chips container missing"; exit 1; }
 grep -q 'id="codexRounds"'                       "$PAGE" || { echo "codex rounds slider missing"; exit 1; }
+grep -q 'id="coderabbitInvoke"'                  "$PAGE" || { echo "CodeRabbit invocation-mode control missing (#1084)"; exit 1; }
+grep -q '<option value="always">always</option>' "$PAGE" || { echo "CodeRabbit always mode missing (#1084)"; exit 1; }
+grep -q '<option value="complex-changes" selected>complex-changes</option>' "$PAGE" || { echo "CodeRabbit complex-changes default missing (#1084)"; exit 1; }
+grep -q '<option value="never">never</option>'   "$PAGE" || { echo "CodeRabbit never mode missing (#1084)"; exit 1; }
 grep -q 'id="postClearanceWait"'                 "$PAGE" || { echo "post-clearance wait slider missing (#727)"; exit 1; }
 grep -q 'data-preset="strict"'                   "$PAGE" || { echo "strict preset missing"; exit 1; }
 grep -q 'data-preset="standard"'                 "$PAGE" || { echo "standard preset missing"; exit 1; }
@@ -265,11 +269,36 @@ footer = r'''
 function emit(){ _store['yaml'] = new FakeNode(); renderYaml(); return _store['yaml'].textContent; }
 function fail(m){ console.error("feedback_policy serialization: " + m); process.exit(1); }
 
+if (DEFAULTS.coderabbitInvoke !== 'complex-changes' || DEFAULTS.codexRounds !== 10)
+  fail('default invocation mode / Codex round budget drifted');
+if (PRESETS.strict.coderabbitInvoke !== 'always' || PRESETS.strict.codexRounds !== 12 ||
+    PRESETS.standard.coderabbitInvoke !== 'complex-changes' || PRESETS.standard.codexRounds !== 10 ||
+    PRESETS.loose.coderabbitInvoke !== 'never' || PRESETS.loose.codexRounds !== 5)
+  fail('preset invocation modes / Codex round budgets drifted');
+
+const routine = { lines: 1, paths: [], forcedRounds: 20 };
+state.coderabbit = true;
+state.coderabbitInvoke = 'never';
+if (simulate(routine).phases.some(p => p.key === 'p25'))
+  fail('invoke=never must remove the Phase 2.5 leg');
+state.coderabbitInvoke = 'complex-changes';
+const conditionalPhase = simulate(routine).phases.find(p => p.key === 'p25');
+if (!conditionalPhase || !/only if the change is complex/.test(conditionalPhase.note))
+  fail('invoke=complex-changes must render a conditional Phase 2.5 leg');
+state.coderabbitInvoke = 'always';
+const alwaysPhase = simulate(routine).phases.find(p => p.key === 'p25');
+if (!alwaysPhase || alwaysPhase.note !== 'CodeRabbit')
+  fail('invoke=always must render an unconditional Phase 2.5 leg');
+
 state.feedbackMode = 'by-priority';
 state.feedbackPriorities = { p0:true, p1:true, p2:false, p3:false };
 const byPriority = emit();
 state.feedbackMode = 'address-all';
 const addressAll = emit();
+state.coderabbitInvoke = 'never';
+const neverYaml = emit();
+state.coderabbitInvoke = 'complex-changes';
+const complexYaml = emit();
 
 if (!/coderabbit:\s*\n\s+enabled:.*\n\s+severity_gate:\s*\n\s+enabled:/.test(byPriority))
   fail("coderabbit.severity_gate.enabled missing or misnested");
@@ -290,6 +319,10 @@ if (fpBlock.includes('priorities:'))
   fail("address-all must OMIT the priorities map");
 if (!/severity_gate:\s*\n\s+enabled:/.test(addressAll) || !/p1_gate:\s*\n\s+enabled:/.test(addressAll))
   fail("both gate keys must be present in address-all mode too");
+if (!/coderabbit:[\s\S]*?\n\s+invoke: never/.test(neverYaml))
+  fail('invoke=never missing from generated YAML');
+if (!/coderabbit:[\s\S]*?\n\s+invoke: complex-changes/.test(complexYaml))
+  fail('invoke=complex-changes missing from generated YAML');
 
 console.error("feedback_policy serialization OK (both modes + both gate keys)");
 '''

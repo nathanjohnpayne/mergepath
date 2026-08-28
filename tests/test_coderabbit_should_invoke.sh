@@ -402,6 +402,13 @@ _mk 'coderabbit:
   invoke: never
 "coderabbit":
   invoke: always' 0 'a quoted duplicate block header is ambiguous'
+_mk 'coderabbit:
+  "invo\u006be": always
+  invoke: never' 0 'an escaped quoted direct key cannot bypass duplicate detection'
+_mk 'coderabbit:
+  invoke: never
+"coder\u0061bbit":
+  invoke: always' 0 'an escaped quoted header cannot hide a duplicate coderabbit block'
 _mk 'coderabbit: |
   invoke: never' 0 'a scalar coderabbit block is not a policy mapping'
 _mk 'coderabbit:

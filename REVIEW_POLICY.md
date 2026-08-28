@@ -1293,5 +1293,5 @@ To reverse the CodeRabbit integration (e.g., if the trial ends):
 
 1. Uninstall the CodeRabbit GitHub App from the `nathanjohnpayne` GitHub account.
 2. In each repo where CodeRabbit was enabled: set `coderabbit.enabled: false` in `.github/review-policy.yml` and delete `.coderabbit.yml`.
-3. No documentation changes are needed — all agent instructions use conditional language (`"if coderabbit.enabled: true"`) and will skip Phase 2.5 automatically.
+3. No documentation changes are needed — all agent instructions route Phase 2.5 through `scripts/coderabbit-should-invoke.sh`, whose decision skips when `coderabbit.enabled: false`.
 4. Optionally remove `.coderabbit.yml` from the template if CodeRabbit will not be used for future repos.

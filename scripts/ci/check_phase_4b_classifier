@@ -133,6 +133,21 @@ jq_get() {
   set -e
 }
 
+is_positive_integer() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -gt 0 ]
+}
+
+if is_positive_integer 1 && ! is_positive_integer 0 && ! is_positive_integer null && ! is_positive_integer ''; then
+  pass=$((pass + 1))
+  echo "  PASS: files_inspected assertions reject missing, null, and zero values"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: positive-integer guard accepted an absent/non-positive files_inspected value" >&2
+fi
+
 # fallback-only short-circuits without inspecting any diff.
 echo "phase_4b_default: fallback-only" > "$SCRATCH/.github/review-policy.yml"
 set +e
@@ -184,7 +199,7 @@ rc=$?
 set -e
 jq_get match; got_match=$got_VAL; match_rc=$got_rc
 jq_get files_inspected; got_files=$got_VAL; files_rc=$got_rc
-if [ "$match_rc" = 0 ] && [ "$files_rc" = 0 ] && [ "$rc" = "1" ] && [ "$got_match" = "true" ] && [ "$got_files" != "0" ]; then
+if [ "$match_rc" = 0 ] && [ "$files_rc" = 0 ] && [ "$rc" = "1" ] && [ "$got_match" = "true" ] && is_positive_integer "$got_files"; then
   pass=$((pass + 1))
   echo "  PASS: --detect-only bypasses the fallback-only short-circuit (real classifier: match=true, files=$got_files)"
 else
@@ -200,7 +215,7 @@ rc=$?
 set -e
 jq_get match; got_match=$got_VAL; match_rc=$got_rc
 jq_get files_inspected; got_files=$got_VAL; files_rc=$got_rc
-if [ "$match_rc" = 0 ] && [ "$files_rc" = 0 ] && [ "$rc" = "0" ] && [ "$got_match" = "false" ] && [ "$got_files" != "0" ]; then
+if [ "$match_rc" = 0 ] && [ "$files_rc" = 0 ] && [ "$rc" = "0" ] && [ "$got_match" = "false" ] && is_positive_integer "$got_files"; then
   pass=$((pass + 1))
   echo "  PASS: --detect-only bypasses the always short-circuit (real classifier: match=false, files=$got_files)"
 else

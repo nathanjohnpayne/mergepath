@@ -155,6 +155,17 @@ coderabbit_field() {  # <field>
       return k
     }
     function indentof(line,   m) { match(line, /^[[:space:]]*/); return RLENGTH }
+    function escaped_double_quoted_key(line,   s, i, c) {
+      s = line
+      sub(/^[[:space:]]+/, "", s)
+      if (substr(s, 1, 1) != "\"") return 0
+      for (i = 2; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\") return 1
+        if (c == "\"") return 0
+      }
+      return 0
+    }
 
     # YAML forbids TAB characters in indentation, and go-yaml (the parser this
     # fleet uses, via scripts/lib/ensure-yq.sh) rejects the whole DOCUMENT when it
@@ -175,6 +186,14 @@ coderabbit_field() {  # <field>
     # opens one. The header is normalized the same way child keys are, so
     # `"coderabbit":` counts as a duplicate of `coderabbit:` (#1084 r9).
     /^[^[:space:]#]/ {
+      # YAML double-quoted keys can spell ordinary characters through escapes:
+      # `"invo\u006be"` is the semantic key `invoke`. The local reader does
+      # not decode the full YAML escape grammar, so treating such a key as a
+      # distinct literal let it sit beside `invoke: never` without tripping the
+      # duplicate guard and suppress Phase 2.5. Any escaped top-level key could
+      # likewise be a second `coderabbit` block. Fail toward invoking until the
+      # parser-aware duplicate migration in #1090 replaces this reader.
+      if (escaped_double_quoted_key($0)) { escapedkey++; in_block = 0; next }
       hdr = keyname($0)
       in_block = 0
       if (hdr == "coderabbit") {
@@ -231,6 +250,7 @@ coderabbit_field() {  # <field>
       sub(/^[[:space:]]+/, "", probe)
       sub(/[[:space:]]+#.*$/, "", probe)
       if (index(probe, ":") == 0) { nokey++; next }
+      if (escaped_double_quoted_key($0)) { escapedkey++; next }
       haskey++
       # Remember whether THIS direct child is a mapping key (empty value) or a
       # scalar, so the next deeper line can be judged.
@@ -244,6 +264,7 @@ coderabbit_field() {  # <field>
     }
     END {
       if (tabindent > 0) { print "<<ambiguous:tab in indentation>>"; exit }
+      if (escapedkey > 0) { print "<<ambiguous:escaped double-quoted key>>"; exit }
       # Colonless children split by what the document actually IS. Mixed with
       # real entries it is a parse error; on their own they are a multi-line
       # plain scalar, which go-yaml accepts and which makes `coderabbit` a
