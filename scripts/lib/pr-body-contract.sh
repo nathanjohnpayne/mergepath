@@ -13,30 +13,50 @@ pr_body_authoring_agent_count() {
   printf '%s\n' "$1" | node "$PR_BODY_CONTRACT_PARSER" --author-count
 }
 
-# Derives the allowed AUTHORING agents from `available_reviewers`. There is no
-# `available_authoring_agents:` key; the two lists are the same list, read
-# through a prefix.
+# Derives the allowed `Authoring-Agent:` values. There is no
+# `available_authoring_agents:` key — the roster is the UNION of the three
+# identity declarations the policy already carries:
 #
-# COUPLING, deliberate and load-bearing: the `nathanpayne-` prefix below is a
-# fleet-specific fact living in a canonical library. Every repo that receives
-# this file inherits it. A consumer whose `available_reviewers` entries do not
-# carry that prefix derives an EMPTY list, and (before #1132) every PR there
-# failed with "unknown Authoring-Agent", which blames the PR author for a
-# configuration mismatch. Callers must distinguish "no agents derived" from
-# "this agent is not in the list" — see pr_body_agent_is_allowed.
+#   author_identity          the human author identity (a scalar)
+#   available_reviewers      the agent reviewer identities
+#   non_reviewer_identities  service accounts (CI), which also open PRs
+#
+# Every PR must name its writer, and the set of possible writers is closed and
+# declared. Deriving from `available_reviewers` ALONE (the pre-#1132 behaviour)
+# recognised only the agent reviewers, so a PR written by the human author
+# identity or by the CI service account could not name itself without being
+# rejected as an "unknown Authoring-Agent".
+#
+# Each identity is accepted in BOTH forms: its full login and its
+# prefix-stripped short form. `nathanpayne-claude` and `claude` both validate;
+# the 38 existing PRs all use the short form. An identity carrying no
+# `nathanpayne-` prefix at all — `nathanjohnpayne` — yields only itself, which
+# is why the prefix is stripped opportunistically here rather than used as a
+# filter. The old `case` DISCARDED every entry without that prefix, so the
+# human identity would have been silently dropped even once listed.
+#
+# Adding an identity to any of the three keys extends this set automatically;
+# no change to this function is needed.
 #
 # Exit status: 2 when the policy file is unreadable, so an infrastructure
 # problem cannot be mistaken for an empty allow-list.
 pr_body_available_authoring_agents() {
   local policy_file=$1
-  local reviewer
+  local identity
   [ -r "$policy_file" ] || return 2
-  while IFS= read -r reviewer; do
-    reviewer="$(printf '%s' "$reviewer" | tr '[:upper:]' '[:lower:]')"
-    case "$reviewer" in
-      nathanpayne-*) printf '%s\n' "${reviewer#nathanpayne-}" ;;
+  {
+    read_available_reviewers "$policy_file"
+    read_non_reviewer_identities "$policy_file" 2>/dev/null || true
+    grep -m1 '^author_identity:' "$policy_file" 2>/dev/null \
+      | sed -E 's/^author_identity:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^["\x27]//; s/["\x27]$//'
+  } | while IFS= read -r identity; do
+    identity="$(printf '%s' "$identity" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    [ -n "$identity" ] || continue
+    printf '%s\n' "$identity"
+    case "$identity" in
+      nathanpayne-*) printf '%s\n' "${identity#nathanpayne-}" ;;
     esac
-  done <<< "$(read_available_reviewers "$policy_file")"
+  done | sort -u
 }
 
 # Exit status is three-valued on purpose; callers must not collapse it:

@@ -457,6 +457,41 @@ else
   ok "two Authoring-Agent lines are rejected"
 fi
 
+# --- 13b. every declared identity can name itself as the writer -------------
+# The roster is the UNION of author_identity, available_reviewers and
+# non_reviewer_identities: every account that can open a PR must be able to
+# declare itself. Deriving from available_reviewers alone (pre-#1132) meant the
+# human author identity and the CI service account could not name themselves
+# and were rejected as "unknown Authoring-Agent" -- on a REQUIRED check.
+roster="$(pr_body_available_authoring_agents "$POLICY" | tr '\n' ' ')"
+for id in claude codex cursor robot nathanjohnpayne nathanpayne-claude nathanpayne-robot; do
+  body=$(printf 'Authoring-Agent: %s\n\n## Self-Review\n\n- ok.\n' "$id")
+  if pr_body_validate "$body" "$POLICY" >/dev/null 2>&1; then
+    ok "declared identity '$id' may author a PR"
+  else
+    bad "declared identity '$id' was rejected as an Authoring-Agent (roster: $roster)"
+  fi
+done
+
+# The prefix strip must be opportunistic, not a filter: author_identity carries
+# no `nathanpayne-` prefix, and the old `case` DISCARDED every entry without
+# one -- so the human identity vanished from the roster entirely.
+if printf '%s\n' "$roster" | grep -qw 'nathanjohnpayne'; then
+  ok "an identity without the nathanpayne- prefix survives roster derivation"
+else
+  bad "roster dropped the unprefixed author_identity: $roster"
+fi
+
+# Closed set: anything not declared is still refused.
+for id in nobody attacker nathanpayne-nobody; do
+  body=$(printf 'Authoring-Agent: %s\n\n## Self-Review\n\n- ok.\n' "$id")
+  if pr_body_validate "$body" "$POLICY" >/dev/null 2>&1; then
+    bad "undeclared identity '$id' was ACCEPTED — the writer set is not closed"
+  else
+    ok "undeclared identity '$id' is rejected"
+  fi
+done
+
 # --- 14. the policy argument's failure modes must be honest ------------------
 # Before #1132 an unreadable policy rejected EVERY body while reporting
 # "unknown Authoring-Agent" -- blaming the author for a repo misconfiguration
@@ -487,10 +522,22 @@ if pr_body_validate "$UNKNOWN_AGENT" "" >/dev/null 2>&1; then
 else
   bad "the empty-policy contract changed; update the exit-status docs in pr-body-contract.sh"
 fi
-if grep -qF 'pr_body_validate "$BODY" "$ROOT/.github/review-policy.yml"' "$ROOT/scripts/validate-pr-body.sh"; then
-  ok "the gate entrypoint passes a concrete policy path, so the fail-open is unreachable from CI"
+# The entrypoint must ALWAYS hand pr_body_validate a concrete path. It now
+# takes --policy (so the caller can supply the PR's governing base policy), so
+# three things have to hold together: the default is absolute, an explicitly
+# EMPTY --policy is refused rather than silently disabling the agent check, and
+# the variable -- not a literal -- is what reaches the validator.
+vpb="$ROOT/scripts/validate-pr-body.sh"
+if grep -qF 'POLICY="$ROOT/.github/review-policy.yml"' "$vpb" \
+   && grep -qF 'pr_body_validate "$BODY" "$POLICY"' "$vpb"; then
+  ok "the gate entrypoint defaults to an absolute policy path and passes it through"
 else
-  bad "scripts/validate-pr-body.sh must pass an absolute policy path, or the agent check silently disables"
+  bad "scripts/validate-pr-body.sh must default POLICY to an absolute path and pass it to pr_body_validate"
+fi
+if printf 'Authoring-Agent: nobody\n\n## Self-Review\nok\n' | bash "$vpb" --policy "" >/dev/null 2>&1; then
+  bad "--policy '' was accepted; an empty policy silently disables the agent allow-list"
+else
+  ok "--policy with an empty value is refused, so the fail-open stays unreachable"
 fi
 
 echo

@@ -50,8 +50,28 @@ jobs:
       - name: Validate the PR body against the contract
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          printf '%s\n' "$PR_BODY" | scripts/validate-pr-body.sh
+          # The VALIDATOR comes from the default branch (trusted, above), but the
+          # POLICY that governs a PR is the policy of the branch it TARGETS. For
+          # a PR onto a non-default branch whose .github/review-policy.yml
+          # differs, reading this checkout's copy would derive the wrong identity
+          # roster — rejecting an author the target branch allows, or accepting
+          # one it does not.
+          #
+          # resolve_base_policy.sh (#769) is the shared implementation of that
+          # rule, already used by the external-review job below. When the PR
+          # targets the default branch it returns this checkout's own path and
+          # makes NO API call, so the ordinary path gains no new dependency; a
+          # non-default base is fetched at the exact base SHA. It exits 2 when
+          # the base policy is UNKNOWN, failing the gate closed rather than
+          # validating against a policy that may not govern.
+          POLICY="$(scripts/workflow/resolve_base_policy.sh \
+            --repo "$REPO" --pr "$PR_NUMBER" \
+            --default-config .github/review-policy.yml)"
+          printf '%s\n' "$PR_BODY" | scripts/validate-pr-body.sh --policy "$POLICY"
 
   label-gate:
     name: Label Gate

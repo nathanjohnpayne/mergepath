@@ -22,20 +22,28 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 
 PRINT_AUTHOR=false
-case "${1:-}" in
-  "") ;;
-  --print-author) PRINT_AUTHOR=true ;;
-  *)
-    echo "usage: scripts/validate-pr-body.sh [--print-author] < pr-body.md" >&2
-    exit 2
-    ;;
-esac
+# Defaults to this checkout's own policy. Callers that know the PR's GOVERNING
+# policy — the policy of the branch the PR TARGETS, which is not necessarily
+# this checkout's — pass it explicitly. See scripts/workflow/resolve_base_policy.sh.
+POLICY="$ROOT/.github/review-policy.yml"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --print-author) PRINT_AUTHOR=true; shift ;;
+    --policy)
+      [ -n "${2:-}" ] || { echo "validate-pr-body.sh: --policy requires a path" >&2; exit 2; }
+      POLICY="$2"; shift 2 ;;
+    *)
+      echo "usage: scripts/validate-pr-body.sh [--print-author] [--policy PATH] < pr-body.md" >&2
+      exit 2
+      ;;
+  esac
+done
 
 BODY="$(cat)"
 # A concrete policy path is passed unconditionally. Passing "" here would skip
 # the Authoring-Agent allow-list entirely and fail OPEN — see the exit-status
 # contract on pr_body_agent_is_allowed.
-pr_body_validate "$BODY" "$ROOT/.github/review-policy.yml"
+pr_body_validate "$BODY" "$POLICY"
 
 if [ "$PRINT_AUTHOR" = true ]; then
   pr_body_authoring_agent "$BODY"
