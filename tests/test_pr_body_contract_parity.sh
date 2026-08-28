@@ -563,6 +563,34 @@ while IFS= read -r identity; do
   fi
 done <<< "$non_reviewers"
 
+# --- 13c2. validation must read the RAW declaration, never the canonical -----
+# Canonicalizing before the allow-list check is LOSSY, and the loss defeats the
+# closed writer set: `evil-claude` reduces to `claude`, which is in the roster,
+# so an undeclared writer would pass a REQUIRED check. The probes are built by
+# prefixing a real roster entry, so they stay meaningful on any consumer, and
+# each is proven absent from the roster before it is used.
+while IFS= read -r real; do
+  [ -n "$real" ] || continue
+  case "$real" in *-*) continue ;; esac   # only the short forms make useful stems
+  forged="evil-${real}"
+  if printf '%s\n' "$roster_lines" | grep -Fqx -- "$forged"; then
+    bad "probe '$forged' is in the roster; it cannot demonstrate the bypass"
+    continue
+  fi
+  body=$(printf 'Authoring-Agent: %s\n\n## Self-Review\n\n- ok.\n' "$forged")
+  if pr_body_validate "$body" "$POLICY" >/dev/null 2>&1; then
+    bad "undeclared '$forged' was ACCEPTED — validation is reading the canonical form, not the raw declaration"
+  else
+    ok "undeclared '$forged' is rejected even though it canonicalizes to the declared '$real'"
+  fi
+  # ...and the canonical form is still what consumers get, so closing the hole
+  # did not cost the mapping.
+  got="$(pr_body_authoring_agent "$(printf 'Authoring-Agent: %s\n\n## Self-Review\nok\n' "$forged")")"
+  [ "$got" = "$real" ] \
+    && ok "'$forged' still canonicalizes to '$real' (validation and canonicalization stayed separate)" \
+    || bad "'$forged' canonicalized to '$got', expected '$real'"
+done <<< "$roster_lines"
+
 # --- 13d. a reviewer must never classify as a NON-reviewer ------------------
 # codex-review-check.sh disables the same-agent restriction on the
 # "declared identity with no reviewer counterpart" path. A REVIEWER reaching

@@ -38,9 +38,19 @@ fi
 # ends in `-nathanpayne-claude`, so an externally reviewed PR would die with an
 # infrastructure error it cannot clear, and the local guard would miss
 # same-agent approval entirely. One representation leaves the consumers alone.
+# The declaration EXACTLY as written, with no canonicalization. Validation must
+# use this: canonicalizing first is lossy, and the loss is a security hole.
+# `evil-claude` reduces to `claude`, which IS in the roster, so an undeclared
+# writer passes the closed-set check (#1132). Validate the raw value against a
+# roster that already carries both the full and short form of every identity,
+# then canonicalize for consumers.
+pr_body_authoring_agent_raw() {
+  printf '%s\n' "$1" | node "$PR_BODY_CONTRACT_PARSER" --author
+}
+
 pr_body_authoring_agent() {
   local agent
-  agent="$(printf '%s\n' "$1" | node "$PR_BODY_CONTRACT_PARSER" --author)" || return $?
+  agent="$(pr_body_authoring_agent_raw "$1")" || return $?
   # Canonical = short form, org prefix removed whatever it is. See
   # pr_body_available_authoring_agents for why the prefix is not hard-coded.
   case "$agent" in
@@ -145,7 +155,9 @@ pr_body_validate() {
   local failed=0
 
   author_count="$(pr_body_authoring_agent_count "$body")"
-  author="$(pr_body_authoring_agent "$body")"
+  # RAW, deliberately. See pr_body_authoring_agent_raw: validating the
+  # canonical form lets `evil-claude` pass as `claude`.
+  author="$(pr_body_authoring_agent_raw "$body")"
   if [ "$author_count" -eq 0 ]; then
     echo "PR description is missing a valid 'Authoring-Agent:' line (expected one agent identifier)." >&2
     failed=1
