@@ -506,6 +506,40 @@ else
   bad "the gate's question rejected a body with no Authoring-Agent; it has silently widened to the identity contract"
 fi
 
+# --- 15. the --self-review-only entrypoint mode ------------------------------
+# Lands BEFORE the gate that will call it: the gate loads this script from the
+# DEFAULT BRANCH, so a flag introduced alongside its caller does not exist when
+# the gate runs (#1132, hit twice). These assertions cover the mode itself; the
+# workflow that uses it follows in a separate change.
+V="$ROOT/scripts/validate-pr-body.sh"
+sro_fenced=$'Authoring-Agent: claude\n\ntext\n\n```\n## Self-Review\n```\n'
+sro_real=$'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n'
+sro_noagent=$'## Self-Review\n\n- no Authoring-Agent line at all.\n'
+sro_none=$'Authoring-Agent: claude\n\nno heading\n'
+
+printf '%s\n' "$sro_fenced" | bash "$V" --self-review-only >/dev/null 2>&1 \
+  && bad "--self-review-only accepted a fenced ## Self-Review heading" \
+  || ok "--self-review-only rejects a fenced ## Self-Review heading"
+printf '%s\n' "$sro_real" | bash "$V" --self-review-only >/dev/null 2>&1 \
+  && ok "--self-review-only accepts a real heading" \
+  || bad "--self-review-only rejected a real heading"
+printf '%s\n' "$sro_none" | bash "$V" --self-review-only >/dev/null 2>&1 \
+  && bad "--self-review-only accepted a body with no heading" \
+  || ok "--self-review-only rejects a body with no heading"
+# Scope: the mode must NOT enforce the identity contract. A body with no
+# Authoring-Agent line has to pass, or the gate that adopts it silently widens
+# into the policy change tracked in #1137.
+printf '%s\n' "$sro_noagent" | bash "$V" --self-review-only >/dev/null 2>&1 \
+  && ok "--self-review-only accepts a body with no Authoring-Agent (heading only)" \
+  || bad "--self-review-only rejected a body with no Authoring-Agent; it has widened to the identity contract"
+# The pre-existing modes must be untouched.
+printf '%s\n' "$sro_real" | bash "$V" >/dev/null 2>&1 \
+  && ok "full validation still accepts a valid body" \
+  || bad "full validation regressed"
+printf '%s\n' "$sro_noagent" | bash "$V" >/dev/null 2>&1 \
+  && bad "full validation accepted a body with no Authoring-Agent; the modes are not distinct" \
+  || ok "full validation still enforces Authoring-Agent (the two modes are distinct)"
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
