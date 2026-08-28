@@ -1875,8 +1875,7 @@ jobs:
             exit 0
           fi
           pr_url=$(jq -r '.url' <<<"$pr_state")
-          if ! gh pr merge "$pr_url" --repo "$REPO" --disable-auto \
-            --match-head-commit "$live_head"; then # NO_BARE_GH_WRITE_EXEMPT: github.token is write-scoped by this trusted workflow and this command can only retract auto-merge
+          if ! gh pr merge "$pr_url" --repo "$REPO" --disable-auto; then # NO_BARE_GH_WRITE_EXEMPT: github.token is write-scoped and disable-only cleanup intentionally applies across head drift; tuple readback fails closed
             echo "::error::Could not retract durable auto-merge."
             exit 1
           fi

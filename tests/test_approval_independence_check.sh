@@ -19,6 +19,14 @@ cp "$ROOT/scripts/lib/gh-api-array.sh" "$TMP/root/scripts/lib/gh-api-array.sh"
 cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$TMP/root/scripts/lib/reviewers-helpers.sh"
 cp "$ROOT/scripts/lib/review-policy-scalar.sh" "$TMP/root/scripts/lib/review-policy-scalar.sh"
 cp "$ROOT/scripts/lib/blocking-labels.sh" "$TMP/root/scripts/lib/blocking-labels.sh"
+cat >> "$TMP/root/scripts/self-approval-detector.cjs" <<'STUB'
+if (process.env.STUB_DETECTOR_STDERR) {
+  process.stderr.write(`${process.env.STUB_DETECTOR_STDERR}\n`);
+}
+if (process.env.STUB_DETECTOR_THROW) {
+  throw new Error(process.env.STUB_DETECTOR_THROW);
+}
+STUB
 
 cat > "$TMP/root/scripts/merge-clearance-gate.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -107,6 +115,7 @@ BASE_PR='{"state":"open","draft":false,"head":{"sha":"abc123"},"base":{"ref":"ma
 BASE_REVIEW='[{"id":20,"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-01-07T00:00:00Z"}]'
 
 reset_fixtures() {
+  unset STUB_DETECTOR_STDERR STUB_DETECTOR_THROW
   STUB_PR="$BASE_PR"
   STUB_PR_AFTER="$BASE_PR"
   STUB_REVIEWS_PAGE_1="$BASE_REVIEW"
@@ -137,6 +146,8 @@ run_case() {
     STUB_PR_RC="$STUB_PR_RC" STUB_REVIEWS_RC="$STUB_REVIEWS_RC" \
     STUB_POLICY_RC="$STUB_POLICY_RC" STUB_POLICY_PATH="$STUB_POLICY_PATH" \
     STUB_PHASE_LOG="$TMP/phase.log" STUB_POLICY_LOG="$TMP/policy.log" \
+    STUB_DETECTOR_STDERR="${STUB_DETECTOR_STDERR:-}" \
+    STUB_DETECTOR_THROW="${STUB_DETECTOR_THROW:-}" \
     bash "$TMP/root/scripts/workflow/approval-independence-check.sh" \
       --repo owner/repo --pr 7 --head abc123 \
       --base-ref main --base-sha base123 --merge-login "$MERGE_LOGIN" \
@@ -155,6 +166,7 @@ if run_case && jq -e '
 else
   fail "different-agent current-head approval should be eligible: $(cat "$TMP/err" 2>/dev/null)"
 fi
+
 if [ "$(tr '\n' ' ' < "$TMP/events.log")" = "reviews-1 pr-1 reviews-2 pr-2 " ] \
    && grep -Fq 'head=abc123 base_ref=main base_sha=base123' "$TMP/phase.log" \
    && grep -Fq 'materialize=true' "$TMP/phase.log" \
@@ -162,6 +174,24 @@ if [ "$(tr '\n' ' ' < "$TMP/events.log")" = "reviews-1 pr-1 reviews-2 pr-2 " ] \
   pass "double snapshots, pinned requiredness, and exact-base policy resolution use the safety order"
 else
   fail "live read/policy order drifted: events=$(tr '\n' ' ' < "$TMP/events.log") phase=$(cat "$TMP/phase.log") policy=$(cat "$TMP/policy.log")"
+fi
+
+reset_fixtures
+STUB_DETECTOR_STDERR="benign detector diagnostic"
+if run_case && jq -e '.stable == true and .after.eligibleApproval == true' "$TMP/out" >/dev/null; then
+  pass "benign detector stderr cannot corrupt the machine-readable result"
+else
+  fail "detector stderr contaminated successful JSON output"
+fi
+
+reset_fixtures
+STUB_DETECTOR_THROW="detector failure diagnostic sentinel"
+set +e; run_case; detector_failure_rc=$?; set -e
+if [ "$detector_failure_rc" -eq 3 ] \
+   && grep -Fq 'detector failure diagnostic sentinel' "$TMP/err"; then
+  pass "detector failures preserve their stderr diagnostic"
+else
+  fail "detector failure stderr was lost (rc=$detector_failure_rc)"
 fi
 
 reset_fixtures

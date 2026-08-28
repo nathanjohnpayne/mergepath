@@ -19,7 +19,6 @@ for file in \
   "$TEST_SCRIPT" \
   "$INDEPENDENCE_TEST" \
   "$WORKFLOW" \
-  "$RULES" \
   scripts/workflow/resolve_base_policy.sh \
   scripts/workflow/external_review_fingerprint.sh; do
   if [ ! -f "$file" ]; then
@@ -27,6 +26,22 @@ for file in \
     exit 1
   fi
 done
+
+# rules/repo_rules.md is a hub-owned binding policy, not a propagated
+# canonical file. Keep its exact prose locked on Mergepath without making the
+# propagated checker reject consumer-owned rule books.
+if [ -f scripts/sync-to-downstream.sh ]; then
+  if [ ! -f "$RULES" ]; then
+    echo "check_self_approval_detector: missing required hub file: $RULES" >&2
+    exit 1
+  fi
+  if ! grep -qF 'Only a direct confirmed native-account violation earns the persistent `policy-violation` label.' "$RULES" ||
+    ! grep -qF 'A same-agent declaration violation is dismissed and fails its direct run without that label' "$RULES" ||
+    grep -qF 'native-account or same-agent violations earn the persistent' "$RULES"; then
+    echo "check_self_approval_detector: $RULES contradicts the mutable-declaration labeling boundary" >&2
+    exit 1
+  fi
+fi
 
 node "$RENDERER" --check
 
@@ -94,13 +109,6 @@ for required_fragment in \
     exit 1
   fi
 done
-
-if ! grep -qF 'Only a direct confirmed native-account violation earns the persistent `policy-violation` label.' "$RULES" ||
-  ! grep -qF 'A same-agent declaration violation is dismissed and fails its direct run without that label' "$RULES" ||
-  grep -qF 'native-account or same-agent violations earn the persistent' "$RULES"; then
-  echo "check_self_approval_detector: $RULES contradicts the mutable-declaration labeling boundary" >&2
-  exit 1
-fi
 
 if grep -qF 'function stableLabelNames' "$WORKFLOW" ||
   grep -qF 'function stableApprovalLabelNames' "$WORKFLOW"; then
@@ -240,7 +248,6 @@ for required_fragment in \
   'EVENT_HEAD: ${{ github.event.pull_request.head.sha }}' \
   'EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}' \
   '--disable-auto' \
-  '--match-head-commit "$live_head"' \
   'auto_arm_allowed=false' \
   'auto_arm_allowed=true' \
   'retracting the existing unclassified auto-merge request fail closed' \
@@ -250,6 +257,10 @@ for required_fragment in \
     exit 1
   fi
 done
+if printf '%s\n' "$shared_author_retraction" | grep -qF -- '--match-head-commit'; then
+  echo "check_self_approval_detector: disable-only retraction must not advertise an ineffective head precondition" >&2
+  exit 1
+fi
 if printf '%s\n' "$shared_author_retraction" | grep -qF 'AUTHOR_MERGE_TOKEN'; then
   echo "check_self_approval_detector: protective retraction must not depend on the optional auto-merge token" >&2
   exit 1

@@ -71,6 +71,13 @@ else
     fi
   done
 
+  if [ "$(scope_value full pull_request rules/repo_rules.md)" = "true" ] \
+     && [ "$(scope_value checks pull_request rules/repo_rules.md)" = '[]' ]; then
+    pass "rules/repo_rules.md fails closed to the full deep surface"
+  else
+    fail "rules/repo_rules.md must not bypass the full self-approval policy checker"
+  fi
+
   if [ "$(scope_value full push docs/README.md)" = "true" ] \
      && [ "$(scope_value full schedule docs/README.md)" = "true" ] \
      && [ "$(scope_value full workflow_dispatch docs/README.md)" = "true" ]; then

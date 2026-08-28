@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DETECTOR="$ROOT/scripts/self-approval-detector.cjs"
+RENDERER="$ROOT/scripts/render-self-approval-bootstrap.cjs"
 WORKFLOW="$ROOT/.github/workflows/agent-review.yml"
 
 if ! command -v node >/dev/null 2>&1; then
@@ -17,7 +18,40 @@ PROTECTION_MODULE="$(mktemp "${TMPDIR:-/tmp}/durable-approval-protection.XXXXXX.
 SNAPSHOT_MODULE="$(mktemp "${TMPDIR:-/tmp}/stable-review-snapshot.XXXXXX.cjs")"
 TRIAGE_POLICY_MODULE="$(mktemp "${TMPDIR:-/tmp}/triage-policy-materialization.XXXXXX.cjs")"
 APPROVAL_PHASE4_MODULE="$(mktemp "${TMPDIR:-/tmp}/approval-phase4-decision.XXXXXX.cjs")"
-trap 'rm -f "$BOOTSTRAP_MODULE" "$DISMISS_MODULE" "$PROTECTION_MODULE" "$SNAPSHOT_MODULE" "$TRIAGE_POLICY_MODULE" "$APPROVAL_PHASE4_MODULE"' EXIT
+RENDER_FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/self-approval-renderer.XXXXXX")"
+trap 'rm -f "$BOOTSTRAP_MODULE" "$DISMISS_MODULE" "$PROTECTION_MODULE" "$SNAPSHOT_MODULE" "$TRIAGE_POLICY_MODULE" "$APPROVAL_PHASE4_MODULE"; rm -rf "$RENDER_FIXTURE"' EXIT
+
+# JavaScript replacement strings interpret $&, $`, $', $1, $<name>, and $$.
+# Canonical detector source is arbitrary text, so the renderer must preserve
+# every such sequence byte-for-byte in both generated workflow mirrors.
+mkdir -p "$RENDER_FIXTURE/scripts" "$RENDER_FIXTURE/.github/workflows"
+cp "$DETECTOR" "$RENDER_FIXTURE/scripts/self-approval-detector.cjs"
+cp "$RENDERER" "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs"
+cp "$WORKFLOW" "$RENDER_FIXTURE/.github/workflows/agent-review.yml"
+RENDER_DETECTOR="$RENDER_FIXTURE/scripts/self-approval-detector.cjs" node <<'NODE'
+const fs = require('fs');
+const file = process.env.RENDER_DETECTOR;
+let source = fs.readFileSync(file, 'utf8');
+source = source.replace(
+  '// BEGIN SELF-APPROVAL DETECTOR IMPLEMENTATION',
+  () => "// BEGIN SELF-APPROVAL DETECTOR IMPLEMENTATION\n// detector-replacement-sentinel:$&|$`|$'|$1|$<name>|$$",
+);
+source = source.replace(
+  '// BEGIN STABLE PR LABEL NAMES',
+  () => "// BEGIN STABLE PR LABEL NAMES\n// label-replacement-sentinel:$&|$`|$'|$1|$<name>|$$",
+);
+fs.writeFileSync(file, source);
+NODE
+if ! node "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs" --write \
+     >"$RENDER_FIXTURE/write.out" 2>"$RENDER_FIXTURE/write.err" \
+   || [ "$(grep -Fc 'detector-replacement-sentinel:$&|$`|$'"'"'|$1|$<name>|$$' "$RENDER_FIXTURE/.github/workflows/agent-review.yml")" -ne 1 ] \
+   || [ "$(grep -Fc 'label-replacement-sentinel:$&|$`|$'"'"'|$1|$<name>|$$' "$RENDER_FIXTURE/.github/workflows/agent-review.yml")" -ne 2 ] \
+   || ! node "$RENDER_FIXTURE/scripts/render-self-approval-bootstrap.cjs" --check \
+        >"$RENDER_FIXTURE/check.out" 2>"$RENDER_FIXTURE/check.err"; then
+  echo "FAIL: renderer did not preserve JavaScript replacement tokens byte-for-byte" >&2
+  cat "$RENDER_FIXTURE/write.err" "$RENDER_FIXTURE/check.err" >&2
+  exit 1
+fi
 awk '
   /BEGIN SELF-APPROVAL BOOTSTRAP/ { capture=1; next }
   /END SELF-APPROVAL BOOTSTRAP/   { capture=0 }

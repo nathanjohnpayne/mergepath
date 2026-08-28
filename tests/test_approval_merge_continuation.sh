@@ -54,6 +54,10 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  if [[ " $* " == *" --match-head-commit "* ]]; then
+    echo "unexpected ineffective --match-head-commit on disable-auto" >&2
+    exit 91
+  fi
   printf 'merge\n' >> "$STUB_DIR/events.log"
   printf '%s\n' "$*" >> "$STUB_DIR/merge.log"
   printf '%s\n' "${GH_TOKEN:-}" >> "$STUB_DIR/merge-token.log"
@@ -94,6 +98,9 @@ printf 'independence\n' >> "${STUB_DIR:?}/events.log"
 printf 'read_count=%s args=[%s]\n' "$(cat "${STUB_DIR:?}/read-count")" "$*" >> "$STUB_DIR/independence.log"
 printf '{"sharedAuthor":%s,"requiresExternalReview":%s}\n' \
   "${STUB_SHARED_AUTHOR:-false}" "${STUB_REQUIRES_EXTERNAL:-false}"
+if [ -n "${STUB_INDEPENDENCE_STDERR:-}" ]; then
+  printf '%s\n' "$STUB_INDEPENDENCE_STDERR" >&2
+fi
 exit "${STUB_INDEPENDENCE_RC:-0}"
 STUB
 chmod +x "$TMP/root/scripts/workflow/approval-independence-check.sh"
@@ -187,6 +194,7 @@ run_case() {
     STUB_THREADS_RC="${STUB_THREADS_RC:-0}" STUB_LOGIN="${STUB_LOGIN:-nathanjohnpayne}" \
     STUB_REQUIRED_CHECKS_RC="${STUB_REQUIRED_CHECKS_RC:-0}" \
     STUB_INDEPENDENCE_RC="${STUB_INDEPENDENCE_RC:-0}" \
+    STUB_INDEPENDENCE_STDERR="${STUB_INDEPENDENCE_STDERR:-}" \
     STUB_SHARED_AUTHOR="${STUB_SHARED_AUTHOR:-false}" \
     STUB_REQUIRES_EXTERNAL="${STUB_REQUIRES_EXTERNAL:-false}" \
     STUB_POLICY_RC="${STUB_POLICY_RC:-0}" \
@@ -235,6 +243,7 @@ reset_fixtures() {
   unset STUB_ACCOUNTING_RC STUB_THREADS_RC STUB_LOGIN STUB_LOGIN_RC
   unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR STUB_REQUIRED_CHECKS_RC
   unset STUB_INDEPENDENCE_RC STUB_SHARED_AUTHOR STUB_REQUIRES_EXTERNAL
+  unset STUB_INDEPENDENCE_STDERR
   unset STUB_SUBJECT_MODE STUB_POLICY_RC STUB_WORKFLOW_AUTHOR_IDENTITY
   unset STUB_SECOND STUB_THIRD STUB_FOURTH STUB_DEFAULT_BRANCH STUB_DEFAULT_BRANCH_RC
   unset STUB_WORKFLOW_SNAPSHOT_CURRENT STUB_WORKFLOW_EVENT_HEAD
@@ -341,7 +350,7 @@ STUB_INITIAL=$(jq -c '
 STUB_SECOND="$STUB_INITIAL"
 STUB_THIRD=$(jq -c '.autoMergeRequest = null' <<<"$STUB_INITIAL")
 if run_case \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
   pass "Dependabot lookalike logins remain inside protective retraction"
 else
@@ -454,6 +463,29 @@ STUB_INDEPENDENCE_RC=1
 assert_not_ready "a live same-agent approval after a PR-body edit defers without arming"
 
 reset_fixtures
+STUB_INDEPENDENCE_STDERR="benign independence diagnostic"
+if run_case \
+   && grep -Fq 'durable auto-merge remains disabled pending the #1058 merge-group boundary' "$TMP/subject.out"; then
+  pass "benign approval-independence stderr cannot corrupt successful JSON"
+else
+  fail "approval-independence stderr contaminated successful JSON"
+fi
+
+reset_fixtures
+STUB_INDEPENDENCE_RC=1
+STUB_INDEPENDENCE_STDERR="independence failure diagnostic sentinel"
+set +e
+run_case
+independence_diagnostic_rc=$?
+set -e
+if [ "$independence_diagnostic_rc" -eq 4 ] \
+   && grep -Fq 'independence failure diagnostic sentinel' "$TMP/subject.out"; then
+  pass "approval-independence failures preserve their stderr diagnostic"
+else
+  fail "approval-independence failure stderr was lost (rc=$independence_diagnostic_rc)"
+fi
+
+reset_fixtures
 STUB_INDEPENDENCE_RC=3
 set +e
 run_case
@@ -499,13 +531,32 @@ STUB_THIRD="$BASE"
 STUB_FOURTH=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:06Z"}' <<<"$BASE")
 STUB_FINAL="$BASE"
 if run_case \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && [ "$(cat "$TMP/merge-token.log")" = "workflow-token" ] \
    && grep -Fq 'post-independence auto-merge retraction verified' "$TMP/subject.out" \
    && grep -Fq 'durable auto-merge remains disabled pending the #1058 merge-group boundary' "$TMP/subject.out"; then
   pass "stable readiness scrubs an arm that appears after independence"
 else
   fail "stable readiness preserved a late durable arm or used the author token"
+fi
+
+# The post-independence snapshot can be clear while an overlapping rollout
+# arms auto-merge immediately afterward. The EXIT pass is the last independent
+# observation and must turn ambiguous cleanup into a fail-closed error.
+reset_fixtures
+STUB_FOURTH="$BASE"
+STUB_FINAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:07Z"}' <<<"$BASE")
+set +e
+run_case
+post_snapshot_arm_rc=$?
+set -e
+if [ "$post_snapshot_arm_rc" -eq 3 ] \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
+   && [ "$(cat "$TMP/merge-token.log")" = "workflow-token" ] \
+   && grep -Fq 'could not retract the latest arm before exit' "$TMP/subject.out"; then
+  pass "EXIT cleanup catches an arm created after the post-independence snapshot"
+else
+  fail "EXIT cleanup stranded or silently accepted a post-snapshot arm (rc=$post_snapshot_arm_rc)"
 fi
 
 # The head-only merge precondition cannot bind a same-head base transition.
@@ -578,7 +629,7 @@ run_case
 armed_shared_phase4_rc=$?
 set -e
 if [ "$armed_shared_phase4_rc" -eq 4 ] \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 pr-view-4 " ] \
    && [ ! -s "$TMP/readiness.log" ]; then
   pass "shared-author re-entry retracts a pre-existing arm before readiness work"
@@ -626,7 +677,7 @@ for early_failure in draft readiness independence; do
   early_failure_rc=$?
   set -e
   if [ "$early_failure_rc" -eq 4 ] \
-     && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+     && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
      && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 pr-view-4 " ]; then
     pass "shared-author $early_failure invalidation retracts the existing arm before exiting"
   else
@@ -647,7 +698,7 @@ run_case
 shared_late_arm_rc=$?
 set -e
 if [ "$shared_late_arm_rc" -eq 4 ] \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 pr-view-3 merge pr-view-4 " ]; then
   pass "a shared-author stop retracts an arm created after pre-evaluation"
 else
@@ -669,7 +720,7 @@ run_case
 late_arm_not_ready_rc=$?
 set -e
 if [ "$late_arm_not_ready_rc" -eq 4 ] \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 pr-view-3 merge pr-view-4 " ]; then
   pass "a late arm is retracted before an early normal-mode not-ready exit"
 else
@@ -702,7 +753,7 @@ for infra_gate in readiness clearance accounting threads required-checks indepen
   late_arm_infra_rc=$?
   set -e
   if [ "$late_arm_infra_rc" -eq 3 ] \
-     && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+     && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
      && [ "$(cat "$TMP/merge-token.log")" = "workflow-token" ]; then
     pass "$infra_gate infrastructure exit retracts a late arm with the workflow token"
   else
@@ -723,7 +774,7 @@ run_case
 final_drift_arm_rc=$?
 set -e
 if [ "$final_drift_arm_rc" -eq 4 ] \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && grep -Fq 'final-snapshot-drift auto-merge retraction verified' "$TMP/subject.out" \
    && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 pr-view-3 merge pr-view-4 pr-view-5 " ]; then
   pass "a final base-drift snapshot is disarmed before the continuation defers"
@@ -740,7 +791,7 @@ run_case
 armed_policy_failure_rc=$?
 set -e
 if [ "$armed_policy_failure_rc" -eq 3 ] \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && [ "$(cat "$TMP/merge-token.log")" = "workflow-token" ] \
    && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 " ]; then
   pass "unreadable governing policy exits through workflow-token protective cleanup"
@@ -754,7 +805,7 @@ STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' 
 STUB_FINAL="$SHARED_BASE"
 STUB_POLICY_RC=9
 if run_case \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
   pass "workflow-token protection retracts an armed PR when governing policy is unreadable"
 else
@@ -767,7 +818,7 @@ STUB_INITIAL="$SHARED_BASE"
 STUB_SECOND=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:01Z"}' <<<"$SHARED_BASE")
 STUB_FINAL="$SHARED_BASE"
 if run_case \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 " ]; then
   pass "protective mode retracts a shared-author arm that appears during policy materialization"
 else
@@ -779,7 +830,7 @@ STUB_SUBJECT_MODE=disarm
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
 STUB_FINAL="$SHARED_BASE"
 if run_case \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
   pass "the approval guard can invoke the bounded protective retraction mode"
 else
@@ -800,7 +851,7 @@ for failed_readback in still_armed moved_head moved_base; do
   failed_readback_rc=$?
   set -e
   if [ "$failed_readback_rc" -eq 3 ] \
-     && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log"; then
+     && grep -Fq -- '--disable-auto' "$TMP/merge.log"; then
     pass "a $failed_readback disarm readback fails closed after the retraction write"
   else
     fail "a $failed_readback disarm readback was accepted (rc=$failed_readback_rc)"
@@ -812,7 +863,7 @@ STUB_SUBJECT_MODE=disarm
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
 STUB_FINAL="$BASE"
 if run_case \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out" \
    && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 " ] \
    && grep -Fq -- '--base-ref main --base-sha base123 --default-branch main --materialize-default' "$TMP/policy.log" \
@@ -839,7 +890,7 @@ STUB_SECOND=$(jq -c '
 ' <<<"$BASE")
 STUB_FINAL=$(jq -c '.autoMergeRequest = null' <<<"$STUB_SECOND")
 if run_case \
-   && grep -Fq -- '--disable-auto --match-head-commit def456' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && grep -Fq 'changed during policy classification; treating the latest armed state as unclassified' "$TMP/subject.out" \
    && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 " ]; then
   pass "base/head drift during non-shared preservation retracts the latest arm as unclassified"
@@ -853,7 +904,7 @@ STUB_DEFAULT_BRANCH_RC=7
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
 STUB_FINAL="$BASE"
 if run_case \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && grep -Fq 'governing policy is unclassified' "$TMP/subject.out"; then
   pass "an unreadable default branch retracts an armed PR instead of guessing its policy identity"
 else
@@ -869,7 +920,7 @@ run_case
 misconfigured_contributor_token_rc=$?
 set -e
 if [ "$misconfigured_contributor_token_rc" -eq 3 ] \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && [ "$(cat "$TMP/merge-token.log")" = "workflow-token" ] \
    && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 " ] \
    && grep -Fq 'expected nathanjohnpayne' "$TMP/subject.out"; then
@@ -1029,7 +1080,7 @@ run_case
 divergent_base_rc=$?
 set -e
 if [ "$divergent_base_rc" -eq 4 ] \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && grep -Fq 'shared-author PR requires a one-shot author merge' "$TMP/subject.out"; then
   pass "non-default governing identity overrides the divergent default policy for retraction"
 else
@@ -1044,7 +1095,7 @@ RELEASE_SHARED=$(jq -c '.author.login = "release-author" | .autoMergeRequest = {
 STUB_INITIAL="$RELEASE_SHARED"
 STUB_FINAL=$(jq -c '.autoMergeRequest = null' <<<"$RELEASE_SHARED")
 if run_case \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
   pass "protective mode uses the divergent governing base identity to retract its shared author"
 else
@@ -1059,7 +1110,7 @@ DEFAULT_SHARED=$(jq -c '.author.login = "nathanjohnpayne" | .autoMergeRequest = 
 STUB_INITIAL="$DEFAULT_SHARED"
 STUB_FINAL=$(jq -c '.autoMergeRequest = null' <<<"$DEFAULT_SHARED")
 if run_case \
-   && grep -Fq -- '--disable-auto --match-head-commit abc123' "$TMP/merge.log" \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
    && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
   pass "protective mode retracts a governing-base non-shared durable arm despite the divergent default identity"
 else

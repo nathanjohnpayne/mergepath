@@ -145,7 +145,7 @@ retract_snapshot_arm() {
     echo "approval continuation: $reason snapshot belongs to Dependabot's dedicated auto-merge lane; leaving its durable request unchanged"
     return 0
   fi
-  if ! gh pr merge "$target_url" --repo "$REPO" --disable-auto --match-head-commit "$target_head"; then # NO_BARE_GH_WRITE_EXEMPT: both caller modes are bounded to exact-head protective retraction
+  if ! gh pr merge "$target_url" --repo "$REPO" --disable-auto; then # NO_BARE_GH_WRITE_EXEMPT: disable-only cleanup is intentionally monotone across head drift; tuple readback below fails closed
     echo "approval continuation: could not disable $reason auto-merge request" >&2
     return 1
   fi
@@ -434,13 +434,17 @@ fi
 # then classify them with the canonical detector against the same governing
 # policy. This shared continuation is used by the immediate, completion, and
 # scheduled paths.
+independence_err=$(mktemp "${TMPDIR:-/tmp}/approval-continuation-independence.XXXXXX") \
+  || infra_error "could not allocate approval-independence diagnostic capture"
 set +e
 independence_output=$(bash "$ROOT/scripts/workflow/approval-independence-check.sh" \
   --repo "$REPO" --pr "$PR_NUMBER" --head "$final_head" \
   --base-ref "$final_base_ref" --base-sha "$final_base_sha" \
-  --merge-login "$login" 2>&1)
+  --merge-login "$login" 2>"$independence_err")
 independence_rc=$?
 set -e
+independence_msg=$(cat "$independence_err" 2>/dev/null || true)
+rm -f "$independence_err"
 case "$independence_rc" in
   0)
     if ! jq -e '
@@ -448,11 +452,11 @@ case "$independence_rc" in
       (.sharedAuthor | type == "boolean") and
       (.requiresExternalReview | type == "boolean")
     ' >/dev/null 2>&1 <<<"$independence_output"; then
-      infra_error "live approval-independence predicate returned malformed success output"
+      infra_error "live approval-independence predicate returned malformed success output${independence_msg:+: $independence_msg}"
     fi
     ;;
-  1) not_ready "live approval independence is not satisfied: $independence_output" ;;
-  *) infra_error "live approval-independence predicate returned rc=$independence_rc: $independence_output" ;;
+  1) not_ready "live approval independence is not satisfied: ${independence_msg:-$independence_output}" ;;
+  *) infra_error "live approval-independence predicate returned rc=$independence_rc: ${independence_msg:-$independence_output}" ;;
 esac
 
 # GitHub exposes a head precondition for merge writes but no base-SHA

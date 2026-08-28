@@ -248,6 +248,8 @@ payload=$(jq -n -c --argjson input "$input" \
   '{input:$input, before:$before, after:$after}') \
   || infra_error "could not construct detector payload"
 
+evaluation_err=$(mktemp "${TMPDIR:-/tmp}/approval-independence-detector.XXXXXX") \
+  || infra_error "could not allocate detector diagnostic capture"
 set +e
 evaluation=$(printf '%s' "$payload" | node -e '
   const fs = require("fs");
@@ -266,10 +268,13 @@ evaluation=$(printf '%s' "$payload" | node -e '
     before,
     after,
   }));
-' "$DETECTOR" 2>&1)
+' "$DETECTOR" 2>"$evaluation_err")
 evaluation_rc=$?
 set -e
-[ "$evaluation_rc" -eq 0 ] || infra_error "canonical detector failed: $evaluation"
+evaluation_msg=$(cat "$evaluation_err" 2>/dev/null || true)
+rm -f "$evaluation_err"
+[ "$evaluation_rc" -eq 0 ] \
+  || infra_error "canonical detector failed: ${evaluation_msg:-no diagnostic}"
 if ! jq -e '
   type == "object" and (.stable | type == "boolean") and
   (.sharedAuthor | type == "boolean") and
@@ -280,7 +285,7 @@ if ! jq -e '
   (.after.approvals | type == "array") and
   (.after.opinionatedReviews | type == "array")
 ' >/dev/null 2>&1 <<<"$evaluation"; then
-  infra_error "canonical detector returned an invalid result"
+  infra_error "canonical detector returned an invalid result${evaluation_msg:+: $evaluation_msg}"
 fi
 
 printf '%s\n' "$evaluation"

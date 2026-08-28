@@ -98,8 +98,8 @@ if (mode === '--check') {
 }
 
 const updated = workflow
-  .replace(current, generated)
-  .replace(labelCurrent, labelGenerated);
+  .replace(current, () => generated)
+  .replace(labelCurrent, () => labelGenerated);
 if (updated === workflow) {
   fail('could not replace the workflow bootstrap blocks');
 }
