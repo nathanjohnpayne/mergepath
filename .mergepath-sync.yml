@@ -632,6 +632,18 @@ paths:
     requires:
       - "scripts/lib/blocking-labels.sh"
       - "scripts/lib/review-policy-scalar.sh"
+  - path: tests/test_approval_independence_check.sh
+    # Adversarial public-seam coverage for the #1094 last-moment live body,
+    # latest-state review pagination, exact-head, and fail-closed contracts.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/"
+      - "scripts/self-approval-detector.cjs"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/review-policy-scalar.sh"
+      - "scripts/lib/blocking-labels.sh"
   - path: tests/test_repo_lint_latency_report.sh
     type: canonical
     consumers: all
@@ -693,6 +705,22 @@ paths:
     # Must sync in lockstep with the workflow. See #259.
     type: canonical
     consumers: all
+  - path: scripts/self-approval-detector.cjs
+    # Runtime dependency of .github/workflows/agent-review.yml's
+    # block-self-approval job and the shared final approval continuation. It
+    # holds the #1094 Phase-3/Phase-4 boundary used by both live paths and the
+    # adversarial CI suite.
+    type: canonical
+    consumers: all
+  - path: scripts/render-self-approval-bootstrap.cjs
+    # Generates the bounded first-rollout copy in agent-review.yml from the
+    # canonical detector implementation. The check wrapper runs --check so
+    # the workflow never becomes a separately maintained implementation.
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/self-approval-detector.cjs"
+      - ".github/workflows/agent-review.yml"
   - path: scripts/resolve-pr-threads.sh
     type: canonical
     consumers: all
@@ -1110,6 +1138,12 @@ paths:
   - path: tests/test_disagreement_detector.sh
     type: canonical
     consumers: all
+  - path: tests/test_self_approval_detector.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/self-approval-detector.cjs"
+      - ".github/workflows/agent-review.yml"
   # Pairs with scripts/post-phase-4b-handoff.sh (#281). PATH-shimmed
   # gh; no live GitHub network. Travels with the helper so consumers
   # exercise the same renderer they propagate.
@@ -1346,8 +1380,10 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/disagreement-detector.cjs"
+      - "scripts/self-approval-detector.cjs"
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/"
+      - "scripts/merge-clearance-gate.sh"
       # Invoked by both merge gates in this workflow; a path-scoped sync
       # that shipped the workflow without it would leave the gate
       # referencing a missing script (#1070).
@@ -1597,6 +1633,7 @@ paths:
       - "tests/test_feedback_policy_helpers.sh"  # check_feedback_policy_helpers (#576)
       - "tests/test_merge_clearance_gate.sh"   # check_merge_clearance_gate
       - "tests/test_disagreement_detector.sh"  # check_disagreement_detector
+      - "tests/test_self_approval_detector.sh"  # check_self_approval_detector (#1094)
       - "tests/test_verify_propagation_pr.sh"  # check_verify_propagation_pr
       - "tests/test_match_protected_paths.sh"  # check_verify_propagation_pr (#471)
       - "tests/test_resolve_pr_threads_read_failure.sh"  # check_resolve_pr_threads (delegated test, #1104) — the wrapper now invokes it, so a kit sync without it reds the consumer lint
@@ -1638,6 +1675,8 @@ paths:
       - "scripts/phase-4b-review.sh"           # check_phase_4b_automation (#579)
       - "scripts/phase-4b/"                    # check_phase_4b_automation (#579)
       - "scripts/disagreement-detector.cjs"    # check_disagreement_detector
+      - "scripts/self-approval-detector.cjs"   # check_self_approval_detector (#1094)
+      - "scripts/render-self-approval-bootstrap.cjs"  # generated first-rollout mirror (#1094)
       - "scripts/request-label-removal.sh"     # check_canonical_bugs_263caf3
       - "scripts/resolve-pr-threads.sh"        # check_resolve_pr_threads
       - "scripts/lib/ensure-yq.sh"             # check_resolve_pr_threads CI-only yq bootstrap (#616)
@@ -1646,7 +1685,7 @@ paths:
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
       - "scripts/coderabbit-automerge-rate-limit-gate.sh"  # tests/test_coderabbit_automerge_rate_limit_gate.sh runs it (#489/#521)
       - "scripts/workflow/"                    # check_workflow_parsers
-      - ".github/workflows/agent-review.yml"   # check_disagreement_detector structural assertion
+      - ".github/workflows/agent-review.yml"   # disagreement + self-approval detector structural assertions
       - ".github/workflows/codex-p1-gate.yml"  # check_codex_p1_gate workflow shape
       - ".github/workflows/codex-feedback-archive-relay.yml"  # check_codex_p1_gate trusted read-only relay shape
       - ".github/workflows/coderabbit-severity-gate.yml"  # check_coderabbit_severity_gate workflow shape (#577)
@@ -1691,6 +1730,11 @@ paths:
       # they exit 2 rather than run with the pre-#799 emptiness inference.
       - "scripts/lib/gh-api-scalar.sh"           # #799, fail-closed scalar API reads
       - "scripts/lib/review-policy-scalar.sh"    # #1062, shared governing-policy identity parse
+      - "scripts/lib/gh-api-array.sh"             # #1094, final live review pagination
+      - "scripts/lib/reviewers-helpers.sh"        # #1094, governing reviewer allow-list
+      - "scripts/lib/blocking-labels.sh"          # #1094, final mutable label recheck
+      - "scripts/self-approval-detector.cjs"      # #1094, canonical final independence decision
+      - "scripts/merge-clearance-gate.sh"         # #1094, shared Phase 4 requiredness query
 
   # Templated entries — rendered per consumer via scripts/lib/
   # template-substitution.sh using the consumer's facts.* from the

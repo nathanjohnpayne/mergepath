@@ -538,10 +538,10 @@ test_workflow_declares_auto_trigger_flag() {
     steps = job["steps"] || []
     abort("approval job must not wait for CodeRabbit") \
       if steps.any? { |s| s.is_a?(Hash) && s["name"].to_s.include?("CodeRabbit") }
-    step = steps.find { |s| s.is_a?(Hash) && s["name"] == "Enable auto-merge" } \
-      or abort("step \"Enable auto-merge\" not found")
+    step = steps.find { |s| s.is_a?(Hash) && s["name"] == "Report stable readiness" } \
+      or abort("step \"Report stable readiness\" not found")
     run = step["run"].to_s
-    abort("Enable auto-merge must route through approval-merge-continuation.sh") \
+    abort("Report stable readiness must route through approval-merge-continuation.sh") \
       unless run.include?("scripts/workflow/approval-merge-continuation.sh")
   ' "$wf" 2>"$WORKDIR/k.err"; then
     fail "K: $(cat "$WORKDIR/k.err")"
