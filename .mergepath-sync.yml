@@ -772,6 +772,7 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/reviewers-helpers.sh"  # pr-body-contract.sh hard-sources it
+      - "scripts/lib/review-policy-scalar.sh"  # pr-body-contract.sh reads author_identity through it (existence-guarded, but a consumer without it silently falls back)
   - path: scripts/gh-as-reviewer.sh
     type: canonical
     consumers: all

@@ -684,7 +684,18 @@ if [ "$AGENT_COUNT" -eq 1 ]; then
       #     avoid, so gate (b) branch 1 applies normally: any reviewer identity
       #     may approve. Proceeding is the correct answer, not a relaxation.
       #   not declared at all -> the writer is unknown. Still fail closed.
-      if printf '%s\n' "$AUTHORING_AGENT_ROSTER" | grep -Fqx -- "$AUTHORING_AGENT"; then
+      # A REVIEWER must never reach the non-reviewer path: that path disables
+      # the same-agent restriction, so misclassifying a reviewer there lets its
+      # own approval satisfy gate (b) — self-approval. The suffix probe above
+      # cannot see a reviewer whose login carries a different org prefix
+      # (`acme-claude` never ends in `-acme-claude`), so match the full login
+      # exactly before concluding "not a reviewer".
+      if printf '%s\n' "$REVIEWERS" | grep -Fqx -- "$AUTHORING_AGENT"; then
+        SAME_AGENT_REVIEWER="$AUTHORING_AGENT"
+        log "gate (b): Authoring-Agent '$AUTHORING_AGENT' matched a configured reviewer by exact login; same-agent restriction applies"
+      elif [ "$MATCHING_REVIEWER_COUNT" -gt 1 ]; then
+        die 3 "Authoring-Agent '$AUTHORING_AGENT' maps to $MATCHING_REVIEWER_COUNT configured reviewers; refusing to evaluate gate (b)"
+      elif printf '%s\n' "$AUTHORING_AGENT_ROSTER" | grep -Fqx -- "$AUTHORING_AGENT"; then
         log "gate (b): Authoring-Agent '$AUTHORING_AGENT' is a declared identity with no reviewer counterpart (human or service account); no same-agent restriction applies"
         SAME_AGENT_REVIEWER=""
       else

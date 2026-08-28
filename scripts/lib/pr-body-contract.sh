@@ -4,6 +4,26 @@
 PR_BODY_CONTRACT_PARSER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pr-body-contract.mjs"
 # shellcheck source=reviewers-helpers.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/reviewers-helpers.sh"
+# Existence-guarded: this library is sourced by fixtures and consumer trees
+# that may not carry every sibling helper, and a hard source turns a missing
+# file into a fatal error in callers that never needed the scalar reader.
+# Declared in this file's manifest `requires:` closure so it does travel.
+if [ -r "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/review-policy-scalar.sh" ]; then
+  # shellcheck source=review-policy-scalar.sh
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/review-policy-scalar.sh"
+fi
+
+# Fallback with the SAME semantics as review_policy_scalar, defined only when
+# the shared reader is absent. Padding is trimmed BEFORE paired quotes are
+# stripped — the reverse order left a trailing quote on
+# `author_identity: "name"   ` and rejected every human-authored PR.
+if ! command -v review_policy_scalar >/dev/null 2>&1; then
+  review_policy_scalar() {  # <file> <key>
+    [ -r "$1" ] || return 1
+    grep -m1 "^$2:" "$1" 2>/dev/null \
+      | sed -E "s/^$2:[[:space:]]*//; s/[[:space:]]*#.*\$//; s/[[:space:]]+\$//; s/^[\"']//; s/[\"']\$//"
+  }
+fi
 
 # Returns the CANONICAL short form of the declared writer: the parsed value
 # with a leading `nathanpayne-` stripped. `nathanpayne-claude` and `claude`
@@ -21,7 +41,12 @@ PR_BODY_CONTRACT_PARSER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pr-body-c
 pr_body_authoring_agent() {
   local agent
   agent="$(printf '%s\n' "$1" | node "$PR_BODY_CONTRACT_PARSER" --author)" || return $?
-  printf '%s\n' "${agent#nathanpayne-}"
+  # Canonical = short form, org prefix removed whatever it is. See
+  # pr_body_available_authoring_agents for why the prefix is not hard-coded.
+  case "$agent" in
+    *-*) printf '%s\n' "${agent#*-}" ;;
+    *)   printf '%s\n' "$agent" ;;
+  esac
 }
 
 pr_body_authoring_agent_count() {
@@ -62,14 +87,23 @@ pr_body_available_authoring_agents() {
   {
     read_available_reviewers "$policy_file"
     read_non_reviewer_identities "$policy_file" 2>/dev/null || true
-    grep -m1 '^author_identity:' "$policy_file" 2>/dev/null \
-      | sed -E 's/^author_identity:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^["\x27]//; s/["\x27]$//'
+    # The shared scalar reader, not a hand-rolled sed. The hand-rolled version
+    # stripped the closing quote BEFORE trimming trailing padding, so valid
+    # YAML spelled `author_identity: "nathanjohnpayne"   ` parsed to
+    # `nathanjohnpayne"` and every human-authored PR was rejected by a REQUIRED
+    # check for a quote the repo's own scalar reader accepts.
+    review_policy_scalar "$policy_file" author_identity 2>/dev/null || true
   } | while IFS= read -r identity; do
     identity="$(printf '%s' "$identity" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
     [ -n "$identity" ] || continue
     printf '%s\n' "$identity"
+    # Short form = the login minus its ORG PREFIX, whatever that prefix is.
+    # Hard-coding `nathanpayne-` made this fleet-specific inside a canonical
+    # library: a consumer whose reviewers are `acme-claude` derived no short
+    # form at all. Splitting on the first `-` is prefix-agnostic and leaves an
+    # unprefixed login (`nathanjohnpayne`) as itself.
     case "$identity" in
-      nathanpayne-*) printf '%s\n' "${identity#nathanpayne-}" ;;
+      *-*) printf '%s\n' "${identity#*-}" ;;
     esac
   done | sort -u
 }

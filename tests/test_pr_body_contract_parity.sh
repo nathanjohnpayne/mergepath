@@ -463,15 +463,22 @@ fi
 # declare itself. Deriving from available_reviewers alone (pre-#1132) meant the
 # human author identity and the CI service account could not name themselves
 # and were rejected as "unknown Authoring-Agent" -- on a REQUIRED check.
-roster="$(pr_body_available_authoring_agents "$POLICY" | tr '\n' ' ')"
-for id in claude codex cursor robot nathanjohnpayne nathanpayne-claude nathanpayne-robot; do
+# Iterates the DERIVED roster. This suite is propagated to every consumer and
+# run by scripts/ci/check_gh_as_author, so embedding the hub's identities here
+# would false-fail any consumer with a legitimately different roster — and
+# would stop covering a new identity the moment one is added.
+roster_lines="$(pr_body_available_authoring_agents "$POLICY")"
+roster="$(printf '%s' "$roster_lines" | tr '\n' ' ')"
+[ -n "$roster_lines" ] || bad "no roster derived from $POLICY; the acceptance loop would pass vacuously"
+while IFS= read -r id; do
+  [ -n "$id" ] || continue
   body=$(printf 'Authoring-Agent: %s\n\n## Self-Review\n\n- ok.\n' "$id")
   if pr_body_validate "$body" "$POLICY" >/dev/null 2>&1; then
     ok "declared identity '$id' may author a PR"
   else
     bad "declared identity '$id' was rejected as an Authoring-Agent (roster: $roster)"
   fi
-done
+done <<< "$roster_lines"
 
 # The prefix strip must be opportunistic, not a filter: author_identity carries
 # no `nathanpayne-` prefix, and the old `case` DISCARDED every entry without
@@ -482,13 +489,19 @@ else
   bad "roster dropped the unprefixed author_identity: $roster"
 fi
 
-# Closed set: anything not declared is still refused.
-for id in nobody attacker nathanpayne-nobody; do
-  body=$(printf 'Authoring-Agent: %s\n\n## Self-Review\n\n- ok.\n' "$id")
+# Closed set: anything not declared is refused. The probe values are PROVEN
+# absent from this repo's roster rather than assumed absent, so the assertion
+# means the same thing on a consumer whose roster differs from the hub's.
+for probe in zzz-undeclared-writer undeclared-writer-zzz; do
+  if printf '%s\n' "$roster_lines" | grep -Fqx -- "$probe"; then
+    bad "probe '$probe' is IN the roster; pick a different probe or this asserts nothing"
+    continue
+  fi
+  body=$(printf 'Authoring-Agent: %s\n\n## Self-Review\n\n- ok.\n' "$probe")
   if pr_body_validate "$body" "$POLICY" >/dev/null 2>&1; then
-    bad "undeclared identity '$id' was ACCEPTED — the writer set is not closed"
+    bad "undeclared identity '$probe' was ACCEPTED — the writer set is not closed"
   else
-    ok "undeclared identity '$id' is rejected"
+    ok "undeclared identity '$probe' (proven absent from the roster) is rejected"
   fi
 done
 
@@ -499,16 +512,16 @@ done
 # gh-pr-guard.sh compares it to the short REVIEWER_AGENT, so a raw full login
 # validates and then breaks both: no reviewer ends in `-nathanpayne-claude`.
 # pr_body_authoring_agent canonicalizes, so the parser has one output form.
-for pair in "claude:claude" "nathanpayne-claude:claude" "nathanpayne-codex:codex" \
-            "nathanpayne-robot:robot" "nathanjohnpayne:nathanjohnpayne"; do
-  declared="${pair%%:*}"; expected="${pair##*:}"
+while IFS= read -r declared; do
+  [ -n "$declared" ] || continue
+  case "$declared" in *-*) expected="${declared#*-}" ;; *) expected="$declared" ;; esac
   got="$(pr_body_authoring_agent "$(printf 'Authoring-Agent: %s\n\n## Self-Review\nok\n' "$declared")")"
   if [ "$got" = "$expected" ]; then
     ok "'$declared' canonicalizes to '$expected'"
   else
     bad "'$declared' canonicalized to '$got', expected '$expected'"
   fi
-done
+done <<< "$roster_lines"
 
 # The canonical form must be what consumers can actually match. Every agent
 # reviewer login must end in `-<canonical>`; the non-reviewer identities must
@@ -549,6 +562,34 @@ while IFS= read -r identity; do
     ok "declared non-reviewer '$identity' matches no reviewer, as intended"
   fi
 done <<< "$non_reviewers"
+
+# --- 13d. a reviewer must never classify as a NON-reviewer ------------------
+# codex-review-check.sh disables the same-agent restriction on the
+# "declared identity with no reviewer counterpart" path. A REVIEWER reaching
+# that path means its own approval satisfies gate (b) — self-approval. The
+# suffix probe alone cannot see a reviewer whose login carries a different org
+# prefix (`acme-claude` never ends in `-acme-claude`) while the roster still
+# contains it, so exact-login membership must be checked first.
+acme_pol="$(mktemp)"
+printf 'available_reviewers:\n  - acme-claude\nauthor_identity: someone\n' > "$acme_pol"
+acme_roster="$(pr_body_available_authoring_agents "$acme_pol")"
+if printf '%s\n' "$acme_roster" | grep -Fqx -- 'acme-claude'; then
+  ok "a differently-prefixed reviewer is in the writer roster (validation accepts it)"
+else
+  bad "a differently-prefixed reviewer is missing from the roster"
+fi
+if printf 'acme-claude\n' | awk -v a="-acme-claude" '$0 ~ a"$"' | grep -q .; then
+  bad "suffix probe unexpectedly matched; this case no longer exercises the gap"
+else
+  ok "the suffix probe alone does NOT see that reviewer — exact-login matching is load-bearing"
+fi
+if grep -Fq 'matched a configured reviewer by exact login' "$ROOT/scripts/codex-review-check.sh" \
+   && grep -Fq 'printf '"'"'%s\n'"'"' "$REVIEWERS" | grep -Fqx -- "$AUTHORING_AGENT"' "$ROOT/scripts/codex-review-check.sh"; then
+  ok "codex-review-check matches the full reviewer login before taking the non-reviewer path"
+else
+  bad "codex-review-check may classify a reviewer as a non-reviewer and disable the same-agent restriction (self-approval)"
+fi
+rm -f "$acme_pol"
 
 # --- 14. the policy argument's failure modes must be honest ------------------
 # Before #1132 an unreadable policy rejected EVERY body while reporting
