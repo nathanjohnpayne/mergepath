@@ -3754,49 +3754,46 @@ SHIM
   fi
 fi
 
-# ── Case 45e (#1120, CodeRabbit Major): refuse an interactive transport ──
-# The append-not-replace rule that protects an operator's ssh settings is
-# exactly what makes this reachable: OpenSSH keeps the FIRST value of a
-# repeated option, so an operator's `-o BatchMode=no` survives the probe's
-# appended `-o BatchMode=yes` and the "hardened" invocation can still prompt.
-# Measured directly rather than assumed:
-#   ssh -G -o BatchMode=no  -o BatchMode=yes host -> batchmode no
-#   ssh -G -o BatchMode=yes -o BatchMode=no  host -> batchmode yes
+# ── Case 45e (#1120): the probe is BOUNDED, not statically vetted ────────
+# CodeRabbit and Codex both showed the probe could still block: an operator's
+# `-o BatchMode=no` wins under OpenSSH's first-value rule, a mixed-value
+# command defeats a "contains yes" test, a wrapper can set BatchMode itself,
+# an HTTPS credential helper can hang, and GIT_SSH has nowhere to inject
+# options. An earlier revision tried to REFUSE on a textual reading of the
+# config; it could not cover that space, and it wrongly refused HTTPS and
+# local remotes for ssh settings that could not affect them.
 #
-# Same hole via GIT_SSH, which names a program with nowhere to inject an
-# option. Both must REFUSE rather than run: a visible incomplete audit beats
-# an invisible stall, which is the whole point of #933.
+# The guarantee is now a wall-clock bound that always exists, so these cases
+# assert the property that actually matters: the audit COMPLETES and reports,
+# whatever the transport. They deliberately no longer assert a refusal.
 
-# Premise: this host's ssh really does keep the first value. If a future
-# OpenSSH changed that, the defect would be gone and the case should say so
-# rather than assert a stale hazard.
+# Premise: the first-value rule this whole area exists for is real on this
+# host. If a future OpenSSH changed it the hazard would be gone and the case
+# should say so rather than assert a stale one.
 if command -v ssh >/dev/null 2>&1; then
   if ! ssh -G -o BatchMode=no -o BatchMode=yes example.invalid 2>/dev/null \
        | grep -Eiq '^batchmode no$'; then
-    fail "fixture setup: ssh no longer keeps the first -o value — case 45e's hazard premise no longer holds"
+    fail "fixture setup: ssh no longer keeps the first -o value — case 45e's premise no longer holds"
   fi
 fi
 
-set +e
-OUT_BMNO=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
-  GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh -o BatchMode=no" \
-  WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
-  bash "$HELPER" --no-color --dry-run 2>&1 )
-RC_BMNO=$?
-set -e
-if [ "$RC_BMNO" -eq 3 ] && echo "$OUT_BMNO" | grep -Fq -- "NOT MEASURED"; then
-  pass "#1120 a BatchMode=no transport is refused rather than run"
-else
-  fail "#1120 a BatchMode=no transport was not refused (rc=$RC_BMNO)"
-  echo "$OUT_BMNO" >&2
-fi
-if echo "$OUT_BMNO" | grep -Fq -- "cannot be made"; then
-  pass "#1120 the refusal names the transport, not the network or storage"
-else
-  fail "#1120 an interactive-transport refusal was misattributed"
-  echo "$OUT_BMNO" >&2
-fi
+for BM in "-o BatchMode=no" "-o BatchMode=no -o BatchMode=yes" ""; do
+  set +e
+  OUT_BM=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
+    GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh $BM" \
+    WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+    bash "$HELPER" --no-color --dry-run 2>&1 )
+  RC_BM=$?
+  set -e
+  if [ "$RC_BM" -eq 3 ] && echo "$OUT_BM" | grep -Fq -- "NOT MEASURED"; then
+    pass "#1120 the audit completes and reports with GIT_SSH_COMMAND [${BM:-none}]"
+  else
+    fail "#1120 the audit did not complete with GIT_SSH_COMMAND [${BM:-none}] (rc=$RC_BM)"
+    echo "$OUT_BM" >&2
+  fi
+done
 
+# GIT_SSH alone: nowhere to inject options, and it must still complete.
 set +e
 OUT_GITSSH=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
   env -u GIT_SSH_COMMAND GIT_SSH="$SSHPROBE_ROOT/fake-ssh" \
@@ -3804,25 +3801,112 @@ OUT_GITSSH=$( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
   bash "$HELPER" --no-color --dry-run 2>&1 )
 RC_GITSSH=$?
 set -e
-if [ "$RC_GITSSH" -eq 3 ] && echo "$OUT_GITSSH" | grep -Fq -- "GIT_SSH names a program"; then
-  pass "#1120 a GIT_SSH-only transport is refused rather than run unhardened"
+if [ "$RC_GITSSH" -eq 3 ] && echo "$OUT_GITSSH" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1120 a GIT_SSH-only transport completes and reports rather than hanging"
 else
-  fail "#1120 a GIT_SSH-only transport was not refused (rc=$RC_GITSSH)"
+  fail "#1120 a GIT_SSH-only transport did not complete (rc=$RC_GITSSH)"
   echo "$OUT_GITSSH" >&2
 fi
-# And an explicit BatchMode=yes must still be ACCEPTED — the refusal must not
-# swallow a transport that is already correct.
-: > "$SSHPROBE_LOG"
+
+# ── Case 45f (#1120, Codex P2): ssh settings must not fail a NON-ssh remote ──
+# The refusal this replaces ran before resolving the transport, so an
+# unrelated exported GIT_SSH turned a perfectly good local/HTTPS audit into
+# exit 3. Reuses case 45's repo with a REACHABLE local origin, which is the
+# shape Codex reproduced.
+NONSSH_ROOT="$WORKDIR/non-ssh-remote"
+NONSSH_REMOTE="$NONSSH_ROOT/remote.git"
+NONSSH_MAIN="$NONSSH_ROOT/main"
+mkdir -p "$NONSSH_ROOT"
+git init -q --bare "$NONSSH_REMOTE"
+git init -q -b main "$NONSSH_MAIN"
+(
+  cd "$NONSSH_MAIN"
+  git -C "$NONSSH_MAIN" config user.email "test@example.com"
+  git -C "$NONSSH_MAIN" config user.name "Test"
+  git -C "$NONSSH_MAIN" config commit.gpgsign false
+  git -C "$NONSSH_MAIN" config tag.gpgsign false
+  echo seed > seed.txt
+  git add seed.txt
+  git commit -q -m seed
+  git remote add origin "$NONSSH_REMOTE"
+  git push -q -u origin main
+) >/dev/null 2>&1
+NONSSH_MAIN=$(cd "$NONSSH_MAIN" && pwd -P)
+# Premise: the origin really is reachable and non-ssh, so an exit 3 here
+# could only come from the ssh settings.
+if ! git -C "$NONSSH_MAIN" ls-remote --heads origin >/dev/null 2>&1; then
+  fail "fixture setup: the local origin is unreachable — case 45f cannot isolate the ssh settings"
+fi
 set +e
-( cd "$SSHPROBE_MAIN" && PATH="$STUB_DIR:$PATH" \
-  GIT_SSH_COMMAND="$SSHPROBE_ROOT/fake-ssh -o BatchMode=yes" \
-  WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
-  bash "$HELPER" --no-color --dry-run >/dev/null 2>&1 )
+OUT_NONSSH=$( cd "$NONSSH_MAIN" && PATH="$STUB_DIR:$PATH" \
+  GIT_SSH=/bin/false WORKTREE_CLEANUP_PROBE_TIMEOUT=8 \
+  bash "$HELPER" --no-color --dry-run 2>&1 )
+RC_NONSSH=$?
 set -e
-if [ -s "$SSHPROBE_LOG" ]; then
-  pass "#1120 an already-correct BatchMode=yes transport is still used"
+if [ "$RC_NONSSH" -ne 3 ] && ! echo "$OUT_NONSSH" | grep -Fq -- "NOT MEASURED"; then
+  pass "#1120 an ssh setting does not make a reachable non-ssh remote incomplete"
 else
-  fail "#1120 the refusal also rejected a transport that was already non-interactive"
+  fail "#1120 GIT_SSH turned a reachable local remote into an incomplete audit (rc=$RC_NONSSH)"
+  echo "$OUT_NONSSH" >&2
+fi
+
+# ── Case 45g (#1120): the SHELL WATCHDOG actually bounds the probe ───────
+# The portable floor is the branch that runs where `timeout` does not exist —
+# a stock macOS, which is this audit's primary host — and it is the one path
+# where a bug means the audit HANGS rather than misreports. It must therefore
+# be exercised, not merely reasoned about.
+#
+# The fixture supplies an ssh that sleeps far longer than the bound, and runs
+# the helper on a PATH with no timeout implementation. The assertion is that
+# the run RETURNS: an unbounded probe would sit for the sleep duration.
+WATCHDOG_SLEEP=45
+WATCHDOG_BOUND=3
+mkdir -p "$SSHPROBE_ROOT/nobin"
+cat > "$SSHPROBE_ROOT/slow-ssh" <<SHIM
+#!/bin/sh
+sleep $WATCHDOG_SLEEP
+exit 255
+SHIM
+chmod +x "$SSHPROBE_ROOT/slow-ssh"
+
+# Premise 1: this PATH really has no timeout implementation, or the case
+# silently exercises the preferred branch instead of the floor it is about.
+if PATH=/usr/bin:/bin command -v timeout >/dev/null 2>&1 \
+   || PATH=/usr/bin:/bin command -v gtimeout >/dev/null 2>&1; then
+  pass "#1120 this host cannot hide timeout from PATH — watchdog floor not exercised here"
+elif ! PATH=/usr/bin:/bin command -v git >/dev/null 2>&1; then
+  pass "#1120 no git on the reduced PATH — watchdog floor not exercisable here"
+else
+  # Premise 2: the shim really does outlast the bound, so returning early
+  # cannot happen by accident.
+  if [ "$WATCHDOG_SLEEP" -le "$WATCHDOG_BOUND" ]; then
+    fail "fixture setup: the slow ssh does not outlast the bound — case 45g proves nothing"
+  fi
+  WD_START=$(date +%s)
+  set +e
+  OUT_WD=$( cd "$SSHPROBE_MAIN" && PATH="/usr/bin:/bin" \
+    GIT_SSH_COMMAND="$SSHPROBE_ROOT/slow-ssh" \
+    WORKTREE_CLEANUP_PROBE_TIMEOUT=$WATCHDOG_BOUND \
+    bash "$HELPER" --no-color --dry-run 2>&1 )
+  RC_WD=$?
+  set -e
+  WD_ELAPSED=$(( $(date +%s) - WD_START ))
+  # Generous margin: the bound is 3s and the shim sleeps 45s, so anything
+  # under 30s proves the watchdog fired without making this a tight timing
+  # assertion that could flake on a loaded machine.
+  if [ "$WD_ELAPSED" -lt 30 ]; then
+    pass "#1120 the shell watchdog bounds the probe with no timeout(1) present (${WD_ELAPSED}s < ${WATCHDOG_SLEEP}s)"
+  else
+    fail "#1120 the probe was NOT bounded without timeout(1) — took ${WD_ELAPSED}s (rc=$RC_WD)"
+    echo "$OUT_WD" >&2
+  fi
+  # And it must still REPORT rather than merely return.
+  if [ "$RC_WD" -eq 3 ] && echo "$OUT_WD" | grep -Fq -- "NOT MEASURED"; then
+    pass "#1120 a watchdog-bounded probe reports an incomplete audit"
+  else
+    fail "#1120 a watchdog-bounded probe did not report NOT MEASURED (rc=$RC_WD)"
+    echo "$OUT_WD" >&2
+  fi
 fi
 
 echo ""
