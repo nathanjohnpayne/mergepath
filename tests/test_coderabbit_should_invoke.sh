@@ -30,7 +30,7 @@ if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -q mikefarah
   REAL_YQ_AVAILABLE=true
 else
   TEST_YQ="$WORKDIR/yq-valid-fixture-shim"
-  printf '#!/usr/bin/env bash\nexit 0\n' >"$TEST_YQ"
+  printf '#!/usr/bin/env bash\nprintf "1\\n"\nexit 0\n' >"$TEST_YQ"
   chmod +x "$TEST_YQ"
   export MERGEPATH_YQ_BIN="$TEST_YQ"
 fi
@@ -82,17 +82,27 @@ command_not_found_handle() {
 # whose scripts/ dir holds a stub classifier exiting <cls_rc> (or no
 # classifier at all when cls_rc is "absent").
 scratch() {  # <coderabbit_block_body> <cls_rc|absent|nonexec>
-  local body=$1 cls=$2 dir
+  local body=$1 cls=$2 dir cls_status cls_match cls_raw
   dir=$(mktemp -d "$WORKDIR/s.XXXXXX")
   mkdir -p "$dir/.github" "$dir/scripts"
   printf 'coderabbit:\n%s\n' "$body" >"$dir/.github/review-policy.yml"
   cp "$SCRIPT" "$dir/scripts/coderabbit-should-invoke.sh"
   chmod +x "$dir/scripts/coderabbit-should-invoke.sh"
   if [ "$cls" != "absent" ]; then
+    cls_status=${cls#nonexec:}
+    cls_match=false
+    [ "$cls_status" = "1" ] && cls_match=true
+    if [ -n "${CLS_RAW_FIXTURE+x}" ]; then
+      cls_raw=$CLS_RAW_FIXTURE
+    else
+      cls_raw="{\"match\": $cls_match, \"phase_4b_default\": \"${CLS_POLICY_FIXTURE:-complex-changes}\", \"files_inspected\": ${CLS_FILES_FIXTURE:-4}}"
+    fi
     {
       echo "#!/usr/bin/env bash"
-      echo "echo '{\"match\": false, \"phase_4b_default\": \"${CLS_POLICY_FIXTURE:-complex-changes}\", \"files_inspected\": ${CLS_FILES_FIXTURE:-4}}'"
-      echo "exit ${cls#nonexec:}"
+      echo "cat <<'MERGEPATH_CLASSIFIER_JSON'"
+      printf '%s\n' "$cls_raw"
+      echo "MERGEPATH_CLASSIFIER_JSON"
+      echo "exit $cls_status"
     } >"$dir/scripts/phase-4b-classifier.sh"
     if [ "${cls%%:*}" = "nonexec" ]; then chmod -x "$dir/scripts/phase-4b-classifier.sh"; else chmod +x "$dir/scripts/phase-4b-classifier.sh"; fi
   fi
@@ -132,6 +142,34 @@ case_is "classifier API failure (rc=2) invokes" "$CX" 2 0
 case_is "classifier bad args (rc=3) invokes"   "$CX" 3 0
 case_is "classifier absent invokes"            "$CX" absent 0
 case_is "classifier non-executable invokes"    "$CX" nonexec:1 0
+
+classifier_reason_is() {  # <name> <raw-output> <classifier-rc> <reason-substring>
+  local name=$1 raw=$2 cls_rc=$3 reason=$4 dir out rc got
+  CLS_RAW_FIXTURE=$raw
+  dir=$(scratch "$CX" "$cls_rc")
+  unset CLS_RAW_FIXTURE
+  out=$(cd "$dir" && ./scripts/coderabbit-should-invoke.sh 99 --json 2>/dev/null); rc=$?
+  got=$(printf '%s' "$out" | jq -r '.reason // ""' 2>/dev/null)
+  if [ "$rc" = "0" ] && case "$got" in *"$reason"*) true ;; *) false ;; esac; then
+    pass "$name"
+  else
+    fail "$name (expected invoke reason~'$reason', got rc=$rc reason='$got')"
+  fi
+}
+
+echo "--- malformed or inconsistent classifier output must NOT skip ---"
+classifier_reason_is "truncated classifier prose invokes" \
+  'garbage {"files_inspected": 4' 0 'no single valid decision object'
+classifier_reason_is "missing classifier match invokes" \
+  '{"files_inspected": 4}' 0 'no single valid decision object'
+classifier_reason_is "fractional files_inspected invokes" \
+  '{"match": false, "files_inspected": 4.5}' 0 'no single valid decision object'
+classifier_reason_is "multiple classifier documents invoke" \
+  $'{"match": false, "files_inspected": 4}\n{"match": false, "files_inspected": 4}' 0 'no single valid decision object'
+classifier_reason_is "exit 0 cannot carry match true" \
+  '{"match": true, "files_inspected": 4}' 0 'match disagrees with exit status'
+classifier_reason_is "exit 1 cannot carry match false" \
+  '{"match": false, "files_inspected": 4}' 1 'match disagrees with exit status'
 
 echo "--- argument validation ---"
 d=$(scratch "$ON" 0)
@@ -353,6 +391,7 @@ if [ "$REAL_YQ_AVAILABLE" = true ]; then
 _mkr 'other:\n  [bad\ncoderabbit:\n  invoke: never\n'        0 'not valid YAML' 'an unclosed flow sequence elsewhere invokes'
 _mkr 'other: {bad\ncoderabbit:\n  invoke: never\n'           0 'not valid YAML' 'an unclosed flow mapping elsewhere invokes'
 _mkr 'other: *nosuchanchor\ncoderabbit:\n  invoke: never\n'  0 'not valid YAML' 'an undefined anchor elsewhere invokes'
+_mkr 'other: 1\n---\ncoderabbit:\n  invoke: never\n'       0 'exactly one YAML document' 'a later-document suppressing block invokes'
 # A consistently indented root mapping is VALID YAML that the column-zero
 # matcher does not open, so it defaults to `always` and INVOKES. That is a
 # known limitation, not the desired end state (#1090) -- but it fails SAFE,
@@ -519,9 +558,9 @@ _diag '#!/usr/bin/env bash
 exit 2' 'classifier failed (exit 2)' 'an API failure reports as a failure'
 _diag '#!/usr/bin/env bash
 echo "not json"
-exit 0' 'no parseable files_inspected' 'an unparseable document reports as unparseable'
+exit 0' 'no single valid decision object' 'an unparseable document reports as unparseable'
 _diag '#!/usr/bin/env bash
-echo "{\"files_inspected\": 0}"
+echo "{\"match\": false, \"files_inspected\": 0}"
 exit 0' 'inspected no files' 'a genuine empty inspection reports as such'
 
 # Fold in anything the command-not-found hook recorded from its subshell.

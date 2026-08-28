@@ -405,8 +405,17 @@ if [ -f "$CONFIG" ] && ! command -v "$YQ_BIN" >/dev/null 2>&1; then
   emit invoke "YAML parser unavailable — policy cannot safely suppress review"
 fi
 if [ -f "$CONFIG" ]; then
-  if ! "$YQ_BIN" '.' "$CONFIG" >/dev/null 2>&1; then
+  # Validate and count the stream in one parse. Plain `yq .` accepts a
+  # multi-document file, while the local reader scans all documents as one
+  # stream and can therefore honor a suppressing block from a later document.
+  # A policy is one unambiguous document; anything else invokes.
+  DOC_COUNT=$("$YQ_BIN" eval-all -o=json \
+    '[.] as $item ireduce ([]; . + $item) | length' "$CONFIG" 2>/dev/null)
+  if [ $? -ne 0 ]; then
     emit invoke "policy file is not valid YAML (rejected by yq); ambiguity resolves toward invoking"
+  fi
+  if [ "$DOC_COUNT" != "1" ]; then
+    emit invoke "policy file must contain exactly one YAML document; ambiguity resolves toward invoking"
   fi
   # NOTE: yq rules on VALIDITY ONLY. An earlier revision also re-read the two
   # fields through yq, to honour a consistently indented root mapping the
@@ -469,13 +478,13 @@ fi
 # which is what the knob advertises.
 set +e
 if [ -n "$REPO" ]; then
-  CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --detect-only --repo "$REPO" 2>&1)
+  CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --detect-only --repo "$REPO")
 else
   # Keep the classifier's implicit `gh repo view` anchored to this script's
   # checkout. A caller may run the decider by absolute path or symlink while
   # standing in another repository; inheriting that cwd can classify the same
   # PR number in the wrong repo and incorrectly suppress review.
-  CLS_OUT=$(cd "$REPO_ROOT" && "$CLASSIFIER" "$PR_NUM" --detect-only 2>&1)
+  CLS_OUT=$(cd "$REPO_ROOT" && "$CLASSIFIER" "$PR_NUM" --detect-only)
 fi
 CLS_RC=$?
 # An older classifier on a not-yet-synced consumer does not know the flag and
@@ -484,9 +493,9 @@ CLS_RC=$?
 # catches the short-circuits in that degraded mode.
 if [ "$CLS_RC" = 3 ]; then
   if [ -n "$REPO" ]; then
-    CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --repo "$REPO" 2>&1)
+    CLS_OUT=$("$CLASSIFIER" "$PR_NUM" --repo "$REPO")
   else
-    CLS_OUT=$(cd "$REPO_ROOT" && "$CLASSIFIER" "$PR_NUM" 2>&1)
+    CLS_OUT=$(cd "$REPO_ROOT" && "$CLASSIFIER" "$PR_NUM")
   fi
   CLS_RC=$?
 fi
@@ -516,7 +525,7 @@ set -e
 # for the ordinary error shape.
 #
 #   1. non-0/1 exit  -> the classifier failed (API, config, arguments)
-#   2. no parseable files_inspected -> it produced no usable document
+#   2. invalid/inconsistent JSON -> it produced no usable document
 #   3. files_inspected == 0 -> it genuinely inspected nothing (short-circuit
 #                              or empty diff)
 case "$CLS_RC" in
@@ -527,13 +536,36 @@ case "$CLS_RC" in
     ;;
 esac
 
-CLS_FILES=$(printf '%s' "$CLS_OUT" | sed -n 's/.*"files_inspected"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
-if [ -z "$CLS_FILES" ]; then
+# Require exactly one JSON value with the fields that carry the decision. A
+# regex over merged stdout/stderr accepted truncated prose containing a
+# files_inspected fragment, ignored a missing .match, and could therefore turn
+# malformed classifier output into SKIP. Normalize the one valid object once,
+# then reason only over its typed fields.
+CLS_PARSE_RC=0
+CLS_PARSED=$(printf '%s' "$CLS_OUT" | jq -s -e '
+  if length == 1
+     and (.[0] | type) == "object"
+     and (.[0].match | type) == "boolean"
+     and (.[0].files_inspected | type) == "number"
+     and (.[0].files_inspected >= 0)
+     and ((.[0].files_inspected | floor) == .[0].files_inspected)
+  then .[0]
+  else empty
+  end
+' 2>/dev/null) || CLS_PARSE_RC=$?
+if [ "$CLS_PARSE_RC" -ne 0 ] || [ -z "$CLS_PARSED" ]; then
   printf '%s\n' "$CLS_OUT" | tail -3 >&2
-  emit invoke "classifier emitted no parseable files_inspected — complexity unassessed, defaulting to invoke"
+  emit invoke "classifier emitted no single valid decision object — complexity unassessed, defaulting to invoke"
 fi
+CLS_FILES=$(printf '%s' "$CLS_PARSED" | jq -r '.files_inspected')
+CLS_MATCH=$(printf '%s' "$CLS_PARSED" | jq -r '.match')
 if [ "$CLS_FILES" = "0" ]; then
   emit invoke "classifier inspected no files (phase_4b_default short-circuit or empty diff) — complexity unassessed, defaulting to invoke"
+fi
+
+if { [ "$CLS_RC" = "0" ] && [ "$CLS_MATCH" != "false" ]; } \
+   || { [ "$CLS_RC" = "1" ] && [ "$CLS_MATCH" != "true" ]; }; then
+  emit invoke "classifier match disagrees with exit status — complexity unassessed, defaulting to invoke"
 fi
 
 case "$CLS_RC" in
