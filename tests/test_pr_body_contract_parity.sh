@@ -492,6 +492,44 @@ for id in nobody attacker nathanpayne-nobody; do
   fi
 done
 
+# --- 13c. the parsed writer reaches consumers in ONE representation ---------
+# Accepting both `nathanpayne-claude` and `claude` at the VALIDATION boundary
+# is fine; emitting both to CONSUMERS is not. codex-review-check.sh matches the
+# author against reviewer logins by suffix (`-$AUTHORING_AGENT`) and
+# gh-pr-guard.sh compares it to the short REVIEWER_AGENT, so a raw full login
+# validates and then breaks both: no reviewer ends in `-nathanpayne-claude`.
+# pr_body_authoring_agent canonicalizes, so the parser has one output form.
+for pair in "claude:claude" "nathanpayne-claude:claude" "nathanpayne-codex:codex" \
+            "nathanpayne-robot:robot" "nathanjohnpayne:nathanjohnpayne"; do
+  declared="${pair%%:*}"; expected="${pair##*:}"
+  got="$(pr_body_authoring_agent "$(printf 'Authoring-Agent: %s\n\n## Self-Review\nok\n' "$declared")")"
+  if [ "$got" = "$expected" ]; then
+    ok "'$declared' canonicalizes to '$expected'"
+  else
+    bad "'$declared' canonicalized to '$got', expected '$expected'"
+  fi
+done
+
+# The canonical form must be what consumers can actually match. Every agent
+# reviewer login must end in `-<canonical>`; the non-reviewer identities must
+# deliberately match none, which is what tells codex-review-check.sh there is
+# no same-agent restriction rather than an unknown writer.
+reviewers="$(read_available_reviewers "$POLICY")"
+for agent in claude codex cursor; do
+  if printf '%s\n' "$reviewers" | grep -q -- "-${agent}$"; then
+    ok "canonical '$agent' suffix-matches exactly the reviewer consumers look for"
+  else
+    bad "canonical '$agent' matches no reviewer login; codex-review-check would die 3"
+  fi
+done
+for agent in nathanjohnpayne robot; do
+  if printf '%s\n' "$reviewers" | grep -q -- "-${agent}$"; then
+    bad "'$agent' unexpectedly matches a reviewer login; the non-reviewer case is not exercised"
+  else
+    ok "declared non-reviewer '$agent' matches no reviewer, as intended"
+  fi
+done
+
 # --- 14. the policy argument's failure modes must be honest ------------------
 # Before #1132 an unreadable policy rejected EVERY body while reporting
 # "unknown Authoring-Agent" -- blaming the author for a repo misconfiguration

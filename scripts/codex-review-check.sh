@@ -519,6 +519,11 @@ esac
 # $CONFIG, so this call site is unchanged — but the allow-list now parses
 # with the strongest normalization (quoted/commented entries included).
 REVIEWERS=$(read_available_reviewers)
+# The full set of identities allowed to AUTHOR a PR: reviewers plus the human
+# author identity plus service accounts. Distinct from REVIEWERS, which is only
+# who may REVIEW. Used to tell an undeclared writer (fail closed) from a
+# declared one with no reviewer counterpart (no same-agent restriction).
+AUTHORING_AGENT_ROSTER=$(pr_body_available_authoring_agents "$CONFIG" 2>/dev/null || true)
 if [ -z "$REVIEWERS" ]; then
   echo "ERROR: no available_reviewers found in $CONFIG" >&2
   exit 3
@@ -668,9 +673,26 @@ if [ "$AGENT_COUNT" -eq 1 ]; then
     MATCHING_REVIEWERS=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print }')
     MATCHING_REVIEWER_COUNT=$(printf '%s\n' "$MATCHING_REVIEWERS" | awk 'NF { count++ } END { print count + 0 }')
     if [ "$MATCHING_REVIEWER_COUNT" -ne 1 ]; then
-      die 3 "Authoring-Agent '$AUTHORING_AGENT' does not map to exactly one configured reviewer; refusing to evaluate gate (b)"
+      # No reviewer corresponds to this writer. Two very different cases, and
+      # collapsing them was a latent gate break once non-reviewer identities
+      # became valid writers (#1132): every PR must name its writer, and the
+      # declared set includes `author_identity` (a human) and
+      # `non_reviewer_identities` (CI) -- neither of which is, or should be, a
+      # reviewer.
+      #
+      #   declared but not a reviewer -> there is NO same-agent conflict to
+      #     avoid, so gate (b) branch 1 applies normally: any reviewer identity
+      #     may approve. Proceeding is the correct answer, not a relaxation.
+      #   not declared at all -> the writer is unknown. Still fail closed.
+      if printf '%s\n' "$AUTHORING_AGENT_ROSTER" | grep -Fqx -- "$AUTHORING_AGENT"; then
+        log "gate (b): Authoring-Agent '$AUTHORING_AGENT' is a declared identity with no reviewer counterpart (human or service account); no same-agent restriction applies"
+        SAME_AGENT_REVIEWER=""
+      else
+        die 3 "Authoring-Agent '$AUTHORING_AGENT' is not a declared identity (expected one of: $(printf '%s' "$AUTHORING_AGENT_ROSTER" | tr '\n' ' ')); refusing to evaluate gate (b)"
+      fi
+    else
+      SAME_AGENT_REVIEWER="$MATCHING_REVIEWERS"
     fi
-    SAME_AGENT_REVIEWER="$MATCHING_REVIEWERS"
   fi
 fi
 elif [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then

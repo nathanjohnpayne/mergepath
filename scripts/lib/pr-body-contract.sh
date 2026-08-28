@@ -5,8 +5,23 @@ PR_BODY_CONTRACT_PARSER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pr-body-c
 # shellcheck source=reviewers-helpers.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/reviewers-helpers.sh"
 
+# Returns the CANONICAL short form of the declared writer: the parsed value
+# with a leading `nathanpayne-` stripped. `nathanpayne-claude` and `claude`
+# both yield `claude`; `nathanjohnpayne`, which carries no such prefix, yields
+# itself.
+#
+# Canonicalizing HERE rather than at each call site is load-bearing (#1132).
+# Consumers match the author against reviewer logins by SUFFIX --
+# codex-review-check.sh looks for a reviewer ending in `-$AUTHORING_AGENT`,
+# gh-pr-guard.sh compares it to the short `REVIEWER_AGENT`. Emitting the raw
+# full login would satisfy pr_body_validate and then fail both: no reviewer
+# ends in `-nathanpayne-claude`, so an externally reviewed PR would die with an
+# infrastructure error it cannot clear, and the local guard would miss
+# same-agent approval entirely. One representation leaves the consumers alone.
 pr_body_authoring_agent() {
-  printf '%s\n' "$1" | node "$PR_BODY_CONTRACT_PARSER" --author
+  local agent
+  agent="$(printf '%s\n' "$1" | node "$PR_BODY_CONTRACT_PARSER" --author)" || return $?
+  printf '%s\n' "${agent#nathanpayne-}"
 }
 
 pr_body_authoring_agent_count() {
