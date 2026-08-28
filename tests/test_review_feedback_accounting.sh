@@ -631,6 +631,32 @@ reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [
   {
+    "id": 19,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T20:50:00Z",
+    "updated_at": "2026-08-18T20:50:01Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/provider-status.sh",
+    "line": 4,
+    "body": "<!-- This is an auto-generated reply by CodeRabbit -->\n<!-- CodeRabbit review command invocation: v2:40695c92071a7774b4a6b4f0e9eb06deacb14b457ca3ec1044886bf8782b8cc7 -->\n<details>\n<summary>⚠️ Action not completed</summary>\n\nReview rate limited.\n\n</details>"
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "inline CodeRabbit command-invocation status is not inventoried"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "inline status-only reply creates no disposition obligation"
+jq '.[0].body += "\n\n_📐 Maintainability & Code Quality_ | _🟡 Minor_\n\n**Keep the retry counter bounded.**"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "inline mixed status plus real finding remains inventoried"
+assert_eq inline "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "inline mixed response keeps the inline finding shape"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "inline mixed response preserves the real finding tier"
+
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
     "id": 20,
     "in_reply_to_id": null,
     "created_at": "2026-08-18T21:00:00Z",
@@ -936,6 +962,51 @@ jq --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" \
 mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
 run_gate
 assert_eq 0 "$RUN_RC" "strictly later acknowledgement reconciles an A to B to A review re-raise"
+
+reset_fixtures
+cat >"$TMP/fixtures/issues.json" <<'JSON'
+[
+  {
+    "id": 7990,
+    "created_at": "2026-08-18T22:19:00Z",
+    "updated_at": "2026-08-18T22:19:01Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "<!-- This is an auto-generated reply by CodeRabbit -->\n<!-- CodeRabbit review command invocation: 209adf6e-339a-46b4-8277-9f715b45ab63 -->\n<details>\n<summary>⚠️ Action not completed</summary>\n\nReview rate limited.\n\n</details>"
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "CodeRabbit command-invocation rate-limit status is not inventoried (#1050)"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "status-only CodeRabbit reply creates no disposition obligation"
+
+jq '.[0].body = "<!-- This is an auto-generated reply by CodeRabbit -->\n<details>\n<summary>⚠️ Action not completed</summary>\nReview rate limited.\n</details>"' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "status summary without the command-invocation marker fails toward classification"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "one-sided status near miss retains its warning tier"
+
+jq '.[0].body = "<!-- CodeRabbit review command invocation: live-id -->\n<details>\n<summary>⚠️ Action not completed</summary>\nReview rate limited.\n</details>\n\n_📐 Maintainability & Code Quality_ | _🟡 Minor_\n\n**Keep the retry counter bounded.**"' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "mixed CodeRabbit status plus real finding remains inventoried"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "mixed status preserves the real finding tier instead of the status warning"
+
+STATUS_ARCHIVE_BODY="$TMP/status-archive-body.txt"
+cat >"$STATUS_ARCHIVE_BODY" <<'EOF'
+<!-- This is an auto-generated reply by CodeRabbit -->
+<!-- CodeRabbit review command invocation: v2:40695c92071a7774b4a6b4f0e9eb06deacb14b457ca3ec1044886bf8782b8cc7 -->
+<details>
+<summary>⚠️ Action not completed</summary>
+
+Review rate limited.
+
+</details>
+EOF
+STATUS_ARCHIVE_MARKER=$("$RENDER_ARCHIVE" issue-comment 7990 'coderabbitai[bot]' \
+  '2026-08-18T22:19:02Z' "$STATUS_ARCHIVE_BODY")
+assert_eq "" "$STATUS_ARCHIVE_MARKER" "archived CodeRabbit command status emits no invented finding record"
 
 reset_fixtures
 cat >"$TMP/fixtures/issues.json" <<'JSON'

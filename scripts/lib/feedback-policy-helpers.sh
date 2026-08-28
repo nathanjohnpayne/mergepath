@@ -226,9 +226,32 @@ coderabbit_finding_scan() {
         }
       }
       END {
+        # A commanded CodeRabbit review can answer with provider state rather
+        # than reviewer feedback. Its exact "Action not completed" summary
+        # carries the same warning glyph the tier ladder grades p1, so omit
+        # only that one line when it follows a visible, nonempty command-
+        # invocation marker (#1050). Find the pair only after resolving the
+        # pre-merge exclusion above: a marker inside any excluded region must
+        # not authorize suppressing a visible line elsewhere. Do not remove
+        # the surrounding details block; a mixed body can still carry a real
+        # severity badge there and must fail toward classification.
         for (i = 1; i <= NR; i++) {
           if (!visible[i]) continue
           if (end_line && i >= start_line && i <= end_line) continue
+          structural = lines[i]
+          sub(/[ \t]+$/, "", structural)
+          if (!invocation_line \
+              && structural ~ /^<!-- CodeRabbit review command invocation: [^[:space:]<>][^<>]* -->$/) {
+            invocation_line = i
+          } else if (invocation_line && !status_summary_line \
+                     && structural == "<summary>⚠️ Action not completed</summary>") {
+            status_summary_line = i
+          }
+        }
+        for (i = 1; i <= NR; i++) {
+          if (!visible[i]) continue
+          if (end_line && i >= start_line && i <= end_line) continue
+          if (status_summary_line && i == status_summary_line) continue
           print lines[i]
         }
       }

@@ -181,6 +181,84 @@ eq ""        "$(coderabbit_tier_of 'This is Trivial, no finding badge.')"       
 eq "p2"      "$(coderabbit_tier_of '_📐 Maintainability_ | _🟡 Minor_: This cleanup is Trivial but visible')" "cr_tier_of: Minor badge beats Trivial-in-prose -> p2 (#581 4b F2)"
 eq "p3 p1 p2" "$(coderabbit_tiers_of '🔵 Trivial first, 🟠 Major second, 🟡 Minor third')" "cr_tiers_of: emits every canonical marker in document order"
 
+# #1050: a CodeRabbit command-invocation reply can use a warning glyph for
+# provider status rather than reviewer feedback. The sanitizer excludes only
+# the exact status-summary line when the same visible body carries the exact
+# invocation marker; all near misses and mixed real findings stay classified.
+coderabbit_scanned_tier() {
+  local sanitized
+  sanitized=$(coderabbit_finding_scan "${1:-}")
+  coderabbit_tier_of "$sanitized"
+}
+
+CR_RATE_LIMIT_STATUS='<!-- This is an auto-generated reply by CodeRabbit -->
+<!-- CodeRabbit review command invocation: v2:40695c92071a7774b4a6b4f0e9eb06deacb14b457ca3ec1044886bf8782b8cc7 -->
+<details>
+<summary>⚠️ Action not completed</summary>
+
+Review rate limited.
+
+</details>'
+eq "" "$(coderabbit_scanned_tier "$CR_RATE_LIMIT_STATUS")" "cr_scan: command-invocation rate-limit status is not a finding (#1050)"
+
+eq "p1" "$(coderabbit_scanned_tier '<!-- This is an auto-generated reply by CodeRabbit -->
+<details>
+<summary>⚠️ Action not completed</summary>
+Review rate limited.
+</details>')" "cr_scan: generic auto-reply marker does not suppress status-shaped warning"
+
+eq "p1" "$(coderabbit_scanned_tier '<!-- CodeRabbit review command invocation: -->
+<details>
+<summary>⚠️ Action not completed</summary>
+Review rate limited.
+</details>')" "cr_scan: empty invocation identifier fails toward classification"
+
+eq "p1" "$(coderabbit_scanned_tier '> <!-- CodeRabbit review command invocation: quoted-example -->
+<details>
+<summary>⚠️ Action not completed</summary>
+Review rate limited.
+</details>')" "cr_scan: quoted invocation marker fails toward classification"
+
+eq "p1" "$(coderabbit_scanned_tier '```text
+<!-- CodeRabbit review command invocation: fenced-example -->
+```
+<details>
+<summary>⚠️ Action not completed</summary>
+Review rate limited.
+</details>')" "cr_scan: fenced invocation marker cannot activate the exclusion"
+
+eq "p1" "$(coderabbit_scanned_tier '<!-- pre_merge_checks_walkthrough_start -->
+<!-- CodeRabbit review command invocation: excluded-example -->
+<!-- pre_merge_checks_walkthrough_end -->
+<details>
+<summary>⚠️ Action not completed</summary>
+Review rate limited.
+</details>')" "cr_scan: invocation inside another excluded region cannot activate the exclusion"
+
+eq "p1" "$(coderabbit_scanned_tier '<details>
+<summary>⚠️ Action not completed</summary>
+Review rate limited.
+</details>
+<!-- CodeRabbit review command invocation: too-late -->')" "cr_scan: reordered status markers fail toward classification"
+
+eq "p1" "$(coderabbit_scanned_tier '<!-- CodeRabbit review command invocation: live-id -->
+<details>
+<summary>⚠️ Action not completed — retry manually</summary>
+Review rate limited.
+</details>')" "cr_scan: non-exact action summary fails toward classification"
+
+eq "p2" "$(coderabbit_scanned_tier "$CR_RATE_LIMIT_STATUS
+
+_📐 Maintainability & Code Quality_ | _🟡 Minor_
+
+**Keep the retry counter bounded.**")" "cr_scan: mixed status plus real Minor preserves the finding"
+
+eq "p1" "$(coderabbit_scanned_tier '<!-- CodeRabbit review command invocation: live-id -->
+<details>
+<summary>⚠️ Action not completed</summary>
+_🟠 Major_ Real finding embedded beside the provider status.
+</details>')" "cr_scan: real finding inside status details remains classified"
+
 # --- rc-safety under set -euo pipefail (#581 4b F1) ------------------------
 # A markerless / unclassified call must return rc 0 + empty output, NOT abort a
 # `tier=$(fn "$body")` caller. Asserted directly: the eq cases above nest the
