@@ -254,6 +254,9 @@ printf 'coderabbit:\n  enabled: false\ncodex:\n  enabled: true\ncoderabbit:\n  i
 printf 'coderabbit:\n  enabled: true\n  invoke: never\n' >"$_d/.github/review-policy.yml"
 ( cd "$_d" && ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
 [ $? = 1 ] && pass "a single block is still honoured" || fail "single-block control broke"
+printf 'coderabbit:\n  enabled: true\n!!str coderabbit:\n  invoke: never\n' >"$_d/.github/review-policy.yml"
+( cd "$_d" && ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
+[ $? = 0 ] && pass "a tagged duplicate block header is ambiguous" || fail "tagged duplicate block header bypassed ambiguity detection"
 
 echo "--- #1084 r7: ambiguity is a property of the FILE, not of the field read first ---"
 # Honouring `enabled: false` before reading `invoke` let one well-formed field
@@ -270,6 +273,10 @@ case_is 'four-space indentation is honoured'   "    enabled: true"$'\n'"    invo
 # A quoted key is the same key to any YAML reader; counting only the bare
 # spelling let a quoted duplicate slip past the ambiguity guard.
 case_is 'quoted duplicate key is ambiguous'    "$ON"$'\n'"  invoke: never"$'\n''  "invoke": always' 0 0
+# An explicit YAML type tag is another semantic spelling of the same string
+# key. The local reader cannot safely normalize the complete tag grammar, so a
+# tagged key must be ambiguous rather than bypassing duplicate detection.
+case_is 'tagged duplicate key is ambiguous'    "$ON"$'\n'"  invoke: never"$'\n''  !!str invoke: always' 0 0
 # YAML needs whitespace before a `#` for it to open a comment.
 case_is 'no space before # is malformed'       "$ON"$'\n''  invoke: "never"#junk'                    0 0
 case_is 'space before # is a real comment'     "$ON"$'\n''  invoke: "never" # ok'                    0 1
