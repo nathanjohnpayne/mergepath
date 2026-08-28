@@ -654,6 +654,76 @@ codex:
     enabled: true
 
 # ---------------------------------------------------------------------------
+# GitHub Advanced Security / code scanning (CodeQL) — (#1101)
+# ---------------------------------------------------------------------------
+# When GitHub Advanced Security's code scanning is enabled on a repo (CodeQL
+# is the built-in analyzer), an alert posts as an inline PR review comment
+# from `github-advanced-security[bot]`. Before this block, that comment was
+# invisible to `scripts/review-feedback-accounting.sh` — every agent review
+# loop keys on that script's `status: clear` to decide a round is finished,
+# so a CodeQL finding could ride through several "fully accounted" rounds
+# and merge unread (observed on nathanpaynedotcom#809: a real defect, not a
+# false positive, sat unanswered across four rounds).
+#
+# Accounting tracks these comments the same way it already tracks
+# Codex/CodeRabbit findings: each one needs a substantive on-thread reply
+# from an agent identity before the PR is `clear`. (`enabled` below does
+# NOT gate this — see the note near the end of this block.)
+#
+# The comment body carries no severity — only a link to the alert
+# (`.../security/code-scanning/<number>`). Accounting resolves severity by
+# reading `repos/{owner}/{repo}/code-scanning/alerts?ref=refs/pull/{pr}/head`
+# (fetched lazily, only when a `github-advanced-security[bot]` inline comment
+# is present, so a repo without code scanning enabled never pays this API
+# call — and `ref` is required: the unscoped list silently omits an alert
+# that exists only on the PR branch, confirmed live on
+# nathanjohnpayne/nathanpaynedotcom#809) and mapping
+# the alert's `rule.security_severity_level` onto the SAME p0–p3 ladder
+# Codex/CodeRabbit use:
+#
+#   critical -> p0   high -> p1   medium -> p2   low -> p3
+#
+# An alert whose severity can't be resolved (no severity assigned to the
+# rule, e.g. a non-security CodeQL quality query, or the alert number
+# couldn't be parsed from the comment) maps to p2 — accountable, but not
+# merge-blocking by the default `feedback_policy` below — rather than being
+# dropped untracked, which is the exact defect this block exists to close.
+#
+# `feedback_policy.priorities` (above) governs blocking exactly as it does
+# for Codex/CodeRabbit: the default P0/P1-required, P2/P3-discretionary
+# split means only `critical`/`high` alerts are required disposition,
+# matching the "medium and below is accountable-but-non-blocking" shape
+# proposed in #1101. No separate severity knob exists here by design — one
+# policy block governs every reviewer's tier requirements.
+#
+# NOTE: this closes the *accounting* gap only — the completeness check the
+# agent loop trusts. It does NOT add a dedicated merge-blocking required CI
+# check (the codex.p1_gate / coderabbit.severity_gate twin for GHAS); that
+# is tracked as a narrow-start follow-up, consistent with how those two
+# gates themselves shipped disabled-by-default and were enabled here first.
+#
+# `enabled` governs AGENT behavior only (whether accounting tracks GHAS
+# findings), same semantics as `codex.enabled` / `coderabbit.enabled` — see
+# the "Note on `enabled` flags" in REVIEW_POLICY.md. It is NOT an opt-out
+# that suppresses GHAS comments: code scanning itself is controlled at the
+# repo settings level, independent of this file, so GitHub keeps posting
+# `github-advanced-security[bot]` comments regardless of what this flag
+# says. review-feedback-accounting.sh does not read it for exactly that
+# reason — deliberately, matching precedent: it has never read
+# `codex.enabled` / `coderabbit.enabled` either, because gating tracking on
+# a flag the agent didn't consult when the finding was posted would
+# recreate this whole change's own bug one layer down (a real, still-
+# arriving comment goes untracked because the config disagrees with what
+# GitHub is actually showing). To fully disable GHAS, disable code
+# scanning in the repo's Security settings — not this flag.
+code_scanning:
+  enabled: true
+
+  # GitHub login of the code-scanning bot that posts inline alert comments.
+  # Do not change unless GitHub renames the integration.
+  bot_login: "github-advanced-security[bot]"
+
+# ---------------------------------------------------------------------------
 # Dependabot reviewer-approval merge gate (#427)
 # ---------------------------------------------------------------------------
 # When reviewer_gate.enabled is true, scripts/merge-clearance-gate.sh runs

@@ -100,7 +100,7 @@ jobs:
           # the fleet today — makes no API call at all, so an unset secret is
           # harmless there and fails closed (empty reviewer allow-list)
           # everywhere else. Mirrors the triage job's resolver invocation.
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           REPO: ${{ github.repository }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -211,9 +211,9 @@ jobs:
         env:
           THRESHOLD: ${{ needs.load-config.outputs.threshold }}
           PROTECTED_PATHS: ${{ needs.load-config.outputs.paths }}
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
         with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const childProcess = require('child_process');
             const fs = require('fs');
@@ -487,7 +487,7 @@ jobs:
           AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}
           REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
         with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const pr = context.payload.pull_request;
             const author = pr.user.login;
@@ -576,7 +576,7 @@ jobs:
       - name: Check for conflicting reviews
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const fs = require('fs');
             const path = require('path');
@@ -687,7 +687,7 @@ jobs:
       - name: Check and dismiss
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const fs = require('fs');
             const yaml = require('js-yaml');
@@ -829,6 +829,19 @@ jobs:
   # step branch on event name.
   auto-merge-on-approval:
     needs: [load-config, detect-disagreement, block-self-approval, triage]
+    # Job-level override (replaces rather than merges with the workflow
+    # default above): adds security-events: read, required for
+    # scripts/workflow/approval-merge-continuation.sh's
+    # review-feedback-accounting.sh call, which reads code-scanning/alerts
+    # to grade a github-advanced-security[bot] finding's severity (#1101).
+    # That call runs under ACCOUNTING_GH_TOKEN (this job's GITHUB_TOKEN,
+    # not the AUTHOR_MERGE_TOKEN this job otherwise uses) specifically so
+    # this permissions block can reach it — CodeRabbit on PR #1106.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      security-events: read
     if: >
       always() &&
       ((github.event_name == 'pull_request_review' &&
@@ -877,7 +890,7 @@ jobs:
           github.event_name == 'pull_request' ||
           github.event_name == 'pull_request_review'
         env:
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           REPO: ${{ github.repository }}
@@ -915,7 +928,7 @@ jobs:
           fi
           # --- synchronize / reopened re-arm path (existing API check) ---
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::REVIEWER_ASSIGNMENT_TOKEN is not configured; cannot confirm an existing approval for the synchronize re-arm. Skipping auto-merge arming."
+            echo "::notice::Neither CI_ACTOR_TOKEN nor REVIEWER_ASSIGNMENT_TOKEN is configured; cannot confirm an existing approval for the synchronize re-arm. Skipping auto-merge arming."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -2076,3 +2089,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          # Routes ONLY the review-feedback-accounting.sh call inside
+          # approval-merge-continuation.sh through GITHUB_TOKEN instead of
+          # the ambient AUTHOR_MERGE_TOKEN above (#1101, CodeRabbit on PR
+          # #1106) — see this job's permissions block for why.
+          ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

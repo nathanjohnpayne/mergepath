@@ -1535,6 +1535,66 @@ if [ "$rc" = 5 ] && printf '%s' "$out" | jq -e '.repo == "o/r\nextra"' >/dev/nul
   pass "automation disabled JSON escapes control characters"
 else fail "disabled path JSON escaping (rc=$rc, out=$out)"; fi
 
+# #1046: the disabled-path skip JSON names its source as "config" so a
+# forced run (below) is distinguishable from an ordinary configured skip.
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" bash "$ORCH" 123 --repo o/r 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 5 ] && [ "$(printf '%s' "$out" | jq -r '.enabled_via')" = "config" ]; then
+  pass "#1046: an ordinary configured-disabled skip reports enabled_via=config"
+else fail "#1046: disabled-skip enabled_via (rc=$rc, out=$out)"; fi
+
+# #1046: --force-enabled runs the automation on a single PR even though
+# phase_4b_automation.enabled is false in the policy file — no repo-wide
+# config edit required. Mirrors the existing "Direction A" dry-run success
+# case below, but starting from POLICY_OFF instead of POLICY_ON.
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" CODEX_BIN="$BIN/fake-codex-approve" \
+  bash "$ORCH" 123 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run --force-enabled 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.automation_enabled')" = "true" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.enabled_via')" = "override" ]; then
+  pass "#1046: --force-enabled runs automation on a disabled repo, enabled_via=override"
+else fail "#1046: --force-enabled dry-run (rc=$rc): $out"; fi
+
+# #1046: P4B_FORCE_ENABLED=1 is the env-var equivalent of --force-enabled.
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" CODEX_BIN="$BIN/fake-codex-approve" \
+  P4B_FORCE_ENABLED=1 \
+  bash "$ORCH" 123 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.enabled_via')" = "override" ]; then
+  pass "#1046: P4B_FORCE_ENABLED=1 is equivalent to --force-enabled"
+else fail "#1046: P4B_FORCE_ENABLED=1 dry-run (rc=$rc): $out"; fi
+
+# #1046: the override touches ONLY `enabled` — a repo whose `mode` is not
+# `local` still defers to the manual handoff, force-enabled or not. Without
+# this, --force-enabled would be a back door around the mode gate too.
+POLICY_OFF_NONLOCAL_MODE="$WORK/policy-off-nonlocal-mode.yml"
+cat > "$POLICY_OFF_NONLOCAL_MODE" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: false
+  mode: cloud
+YAML
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF_NONLOCAL_MODE" \
+  bash "$ORCH" 123 --repo o/r --force-enabled 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 5 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.reason')" = "mode-not-local" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.automation_enabled')" = "true" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.enabled_via')" = "override" ]; then
+  pass "#1046: --force-enabled overrides ONLY enabled; a non-local mode still defers to the manual handoff"
+else fail "#1046: force-enabled + non-local mode (rc=$rc): $out"; fi
+
 # Undispositioned feedback is a distinct no-dispatch hold, not a manual
 # fallback and not a completed review round.
 FEEDBACK_BLOCK_STUB="$WORK/feedback-accounting-block.sh"

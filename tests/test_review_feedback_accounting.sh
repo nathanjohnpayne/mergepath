@@ -75,6 +75,13 @@ case "$endpoint" in
   repos/acme/widget/issues/7/comments)
     cat "$GH_FIXTURE_DIR/issues.json"
     ;;
+  repos/acme/widget/code-scanning/alerts\?ref=refs/pull/7/head)
+    if [ -f "$GH_FIXTURE_DIR/code-scanning-alerts.json" ]; then
+      cat "$GH_FIXTURE_DIR/code-scanning-alerts.json"
+    else
+      printf '[]\n'
+    fi
+    ;;
   repos/acme/widget/pulls/comments/*/reactions)
     id="${endpoint#repos/acme/widget/pulls/comments/}"
     id="${id%/reactions}"
@@ -102,12 +109,15 @@ coderabbit:
   bot_login: "coderabbitai[bot]"
 codex:
   bot_login: "chatgpt-codex-connector[bot]"
+code_scanning:
+  bot_login: "github-advanced-security[bot]"
 YAML
 
 reset_fixtures() {
   printf '[]\n' >"$TMP/fixtures/inline.json"
   printf '[]\n' >"$TMP/fixtures/reviews.json"
   printf '[]\n' >"$TMP/fixtures/issues.json"
+  printf '[]\n' >"$TMP/fixtures/code-scanning-alerts.json"
   cat >"$TMP/fixtures/pull.json" <<'JSON'
 {
   "base": {
@@ -125,6 +135,8 @@ coderabbit:
   bot_login: "coderabbitai[bot]"
 codex:
   bot_login: "chatgpt-codex-connector[bot]"
+code_scanning:
+  bot_login: "github-advanced-security[bot]"
 YAML
   rm -f "$TMP/fixtures"/reactions-*.json
   : >"$TMP/gh-calls.log"
@@ -1463,6 +1475,34 @@ assert_eq 2 "$FINGERPRINT_RC" "feedback-surface fingerprint preserves API failur
 assert_match 'failed to fetch review objects' "$FINGERPRINT_ERROR" \
   "feedback-surface fingerprint preserves API failure detail"
 
+# #1088: the fetch case above is one of THREE gh_api_array failure kinds
+# (fetch, flatten, shape — scripts/lib/gh-api-array.sh). A fix scoped to only
+# the fetch path would leave the other two free to regress back into the
+# unbound-variable trace #1089 removed.
+reset_fixtures
+printf 'not valid json\n' >"$TMP/fixtures/reviews.json"
+set +e
+FINGERPRINT_FLATTEN_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_FLATTEN_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_FLATTEN_RC" "feedback-surface fingerprint preserves flatten failure status"
+assert_match 'failed to flatten review objects pagination output' "$FINGERPRINT_FLATTEN_ERROR" \
+  "feedback-surface fingerprint preserves flatten failure detail"
+
+reset_fixtures
+printf '{"message":"Bad credentials"}\n' >"$TMP/fixtures/reviews.json"
+set +e
+FINGERPRINT_SHAPE_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_SHAPE_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_SHAPE_RC" "feedback-surface fingerprint preserves shape failure status"
+assert_match 'came back as .*not a stream of JSON arrays' "$FINGERPRINT_SHAPE_ERROR" \
+  "feedback-surface fingerprint preserves shape failure detail"
+
 reset_fixtures
 jq '. + [{
   "id": 9900,
@@ -1508,6 +1548,153 @@ if grep -Eq -- '--argjson (inline|reviews|issues)([[:space:]\\]|$)' "$SURFACE_FI
 else
   pass "surface fingerprint streams complete histories instead of passing them through argv"
 fi
+
+# --- github-advanced-security / code scanning (#1101) ----------------------
+#
+# Before #1101, a github-advanced-security[bot] inline comment (the form
+# GitHub's CodeQL code scanning posts) was invisible to this script — not
+# even counted in `posted` — so a real finding could ride through repeated
+# "fully accounted" rounds unread (observed on nathanpaynedotcom#809).
+
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "tests/verify-brevity.test.js",
+    "line": 185,
+    "body": "## CodeQL / Replacement of a substring with itself\n\nThis replaces 'title: \"Signed\"' with itself.\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/25)"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "undispositioned CodeQL finding blocks (#1101)"
+assert_eq unaccounted "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "CodeQL miss emits unaccounted status"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "CodeQL finding contributes to posted count"
+assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "CodeQL finding is inventoried under its bot login"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "unresolvable severity (no matching alert) falls back to p2, not dropped"
+
+if grep -F 'repos/acme/widget/code-scanning/alerts' "$TMP/gh-calls.log" >/dev/null; then
+  pass "a CodeQL comment on the PR triggers the code-scanning/alerts lookup"
+else
+  fail "a CodeQL comment on the PR triggers the code-scanning/alerts lookup"
+fi
+
+cat >"$TMP/fixtures/code-scanning-alerts.json" <<'JSON'
+[
+  {"number": 25, "rule": {"security_severity_level": "medium"}}
+]
+JSON
+run_gate
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "medium security_severity_level maps to p2"
+
+cat >"$TMP/fixtures/code-scanning-alerts.json" <<'JSON'
+[
+  {"number": 25, "rule": {"security_severity_level": "critical"}}
+]
+JSON
+run_gate
+assert_eq p0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "critical security_severity_level maps to p0"
+
+cat >"$TMP/fixtures/code-scanning-alerts.json" <<'JSON'
+[
+  {"number": 25, "rule": {"security_severity_level": "high"}}
+]
+JSON
+cat >"$TMP/fixtures/inline-with-reply.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "tests/verify-brevity.test.js",
+    "line": 185,
+    "body": "## CodeQL / Replacement of a substring with itself\n\nThis replaces 'title: \"Signed\"' with itself.\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/25)"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-26T21:00:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "path": "tests/verify-brevity.test.js",
+    "line": 185,
+    "body": "Confirmed and fixed the self-replace in commit abc1234."
+  }
+]
+JSON
+cp "$TMP/fixtures/inline-with-reply.json" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "agent reply after a CodeQL finding accounts for it"
+assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "disposed CodeQL finding clears the gate"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "high security_severity_level maps to p1"
+assert_eq thread-reply "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "CodeQL reply evidence is visible"
+
+# feedback_policy tiers apply uniformly across reviewers: a repo that
+# marks p2 `ignore` must drop an unresolvable-severity CodeQL finding
+# from inventory exactly as it would a CodeRabbit or Codex one.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 22,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/a.js",
+    "line": 1,
+    "body": "## CodeQL / Some quality rule\n\nNo severity assigned.\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/99)"
+  }
+]
+JSON
+cp "$TMP/review-policy.yml" "$TMP/review-policy.ignore-p2.yml"
+cat >>"$TMP/review-policy.yml" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p2: ignore
+YAML
+run_gate
+assert_eq 0 "$RUN_RC" "feedback_policy p2:ignore excludes an unresolvable-severity CodeQL finding"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "ignored CodeQL tier contributes nothing to posted count"
+mv "$TMP/review-policy.ignore-p2.yml" "$TMP/review-policy.yml"
+
+# The alerts lookup is lazy: a PR with no CodeQL comment must never call
+# code-scanning/alerts, so a repo without code scanning enabled (the
+# common fleet case) never pays the extra API round-trip or risks a
+# permissions failure on an endpoint it has no reason to use.
+reset_fixtures
+run_gate
+if grep -F 'repos/acme/widget/code-scanning/alerts' "$TMP/gh-calls.log" >/dev/null; then
+  fail "code-scanning/alerts must not be fetched when no CodeQL comment is present"
+else
+  pass "code-scanning/alerts is not fetched when no CodeQL comment is present"
+fi
+
+# A CodeQL comment body with no parseable alert-number link at all (not
+# just a link to an alert absent from the fetched set) must fall back to
+# p2 rather than aborting the gate under `set -euo pipefail` — the grep
+# pipeline that extracts the alert number legitimately produces no match.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 23,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/b.js",
+    "line": 1,
+    "body": "## CodeQL / Some rule\n\nNo alert link in this body at all."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "CodeQL comment with no alert link still blocks (does not abort)"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "no parseable alert link falls back to p2"
 
 if [ "$FAIL" -ne 0 ]; then
   printf 'review-feedback-accounting: FAIL (%s failed, %s passed)\n' "$FAIL" "$PASS" >&2

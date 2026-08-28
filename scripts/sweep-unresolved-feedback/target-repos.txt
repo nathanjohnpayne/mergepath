@@ -9,10 +9,13 @@
 # dispositions on an under-threshold PR there going untracked because
 # the repo was absent from this list.
 #
+# device-platform-reporting was removed 2026-08-26 when that repo was
+# archived and made private; it is no longer a sync consumer and can
+# accrue no new review feedback. That is why this list holds 9, not 10.
+#
 # To onboard a new repo: add a line. No code changes required.
 
 nathanjohnpayne/friends-and-family-billing
-nathanjohnpayne/device-platform-reporting
 nathanjohnpayne/device-source-of-truth
 nathanjohnpayne/swipewatch
 nathanjohnpayne/nathanpaynedotcom
@@ -20,4 +23,4 @@ nathanjohnpayne/overridebroadway
 nathanjohnpayne/matchline
 nathanjohnpayne/tadlockpsychiatry
 nathanjohnpayne/mergepath
-nathanjohnpayne/gaycruisebingo
+nathanjohnpayne/fiveacross

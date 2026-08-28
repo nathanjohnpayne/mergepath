@@ -353,6 +353,10 @@
 #       --auto-resolve-bots run, the helper re-reads each thread it
 #       resolved via a `nodes(ids:)` readback and refuses to report success
 #       unless GitHub confirms isResolved:true for all of them.
+#   4 — COULD NOT LOOK (#1104): a read needed to decide anything failed after
+#       retries, most often a rate-limited token. Distinct from 2 on purpose:
+#       2 means "we looked and it went wrong", 4 means "we never got to look",
+#       and a sweep loop must not treat the second as a completed pass.
 #   3 — unresolved threads exist (in --list mode), or a resolve mode left
 #       threads unresolved (human-authored, stale-HEAD, not-actioned,
 #       comments-incomplete, not-propagation-routed, drifted,
@@ -388,6 +392,29 @@ if [ -r "$__RESOLVE_THREADS_DIR/lib/gh-token-resolver.sh" ]; then
   # shellcheck source=lib/gh-token-resolver.sh
   . "$__RESOLVE_THREADS_DIR/lib/gh-token-resolver.sh"
 fi
+
+# Retry helper for the reads below (#1104). Existence-guarded ON PURPOSE, and
+# the distinction matters: retrying a rate-limited read is an IMPROVEMENT, but
+# CLASSIFYING the failure is the actual fix. The #1104 defect was never "we
+# only tried once" -- it was that any failure was reported as though the sweep
+# had completed. So the classification below runs unconditionally and a missing
+# helper costs only the retry, degrading loudly rather than silently.
+HAVE_GH_RETRY=0
+if [ -r "$__RESOLVE_THREADS_DIR/lib/gh-retry-helpers.sh" ]; then
+  # shellcheck source=lib/gh-retry-helpers.sh
+  . "$__RESOLVE_THREADS_DIR/lib/gh-retry-helpers.sh"
+  HAVE_GH_RETRY=1
+fi
+
+# Run a read through the retry helper when it is present, directly otherwise.
+# Either way the caller classifies the failure; only the attempt count changes.
+gh_pat_read() {
+  if [ "$HAVE_GH_RETRY" -eq 1 ]; then
+    with_gh_retry gh_pat "$@"
+  else
+    gh_pat "$@"
+  fi
+}
 
 usage() {
   cat <<'EOF' >&2
@@ -458,7 +485,13 @@ NO_TAG_REPLY=false
 # either form so the auto-resolve mode works with the GraphQL data
 # this script reads. Caught on PR #180 review when every CR thread
 # was skipped as a non-bot author — see #182.
-BOT_LOGINS_RE='^(coderabbitai|chatgpt-codex-connector|dependabot)(\[bot\])?$'
+#
+# github-advanced-security added for #1101: without it, every GHAS
+# code-scanning (CodeQL) thread fell through this gate as a "non-bot
+# author" and was never eligible for --resolve-actioned / --auto-
+# resolve-bots, so a disposed CodeQL finding's thread could only be
+# closed by hand.
+BOT_LOGINS_RE='^(coderabbitai|chatgpt-codex-connector|dependabot|github-advanced-security)(\[bot\])?$'
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -584,10 +617,61 @@ trap 'rm -rf "$COMMIT_FILES_CACHE_DIR"' EXIT
 # to verify each thread's latest comment is on the current HEAD before
 # resolving. Codex P2 on PR #172 caught that the docstring promised
 # this check but the code didn't enforce it.
-HEAD_OID=$(gh_pat api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha 2>/dev/null) || {
-  echo "Could not resolve PR HEAD oid for $REPO#$PR_NUM" >&2
-  exit 2
-}
+# #1104: this is the FIRST call every disposition sweep makes, so whatever it
+# does on failure is what the whole sweep does. It used to discard the error
+# body with `2>/dev/null` and exit 2, which made a rate-limited reviewer PAT
+# indistinguishable from a genuinely missing PR -- and the message named the
+# PR, so it read as "that PR is wrong". Replies still post (an earlier, separate
+# call), so the loop looked healthy while nothing was ever resolved. Threads
+# then accumulated across rounds and the PR could not converge.
+#
+# Three changes, matching the three ways that failed:
+#   1. keep the error body and classify it, rather than discarding it;
+#   2. retry the transient class where the helper is available
+#      (with_gh_retry already distinguishes rate-limit / 5xx from a
+#      permanent 4xx); this is an improvement, not the fix;
+#   3. exit 4, NOT 2, when the answer is "could not look". Exit 2 also means
+#      "gh failure", and a sweep loop reads any known code as a completed pass.
+#      A distinct code lets a caller tell "checked, nothing to do" from
+#      "never managed to check" -- the distinction whose absence is the bug.
+HEAD_READ_ERR=$(mktemp "${TMPDIR:-/tmp}/resolve-pr-headread.XXXXXX")
+HEAD_READ_OUT=$(mktemp "${TMPDIR:-/tmp}/resolve-pr-headout.XXXXXX")
+# BOTH streams are captured because `gh api` writes its HTTP error body to
+# STDOUT, not stderr (#799). Reading only stderr would discard the very text
+# that distinguishes a 403 rate limit from a 404 -- the discard this change
+# exists to stop, reintroduced one path over.
+if gh_pat_read api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha \
+     >"$HEAD_READ_OUT" 2>"$HEAD_READ_ERR"; then
+  HEAD_OID=$(cat "$HEAD_READ_OUT" 2>/dev/null || true)
+  rm -f "$HEAD_READ_ERR" "$HEAD_READ_OUT"
+else
+  HEAD_READ_MSG=$(cat "$HEAD_READ_ERR" "$HEAD_READ_OUT" 2>/dev/null || true)
+  rm -f "$HEAD_READ_ERR" "$HEAD_READ_OUT"
+  case "$HEAD_READ_MSG" in
+    *"rate limit exceeded"*|*"secondary rate limit"*|*"abuse detection"*)
+      # Name the exhausted account and when it recovers. `/rate_limit` is NOT
+      # consulted here on purpose: it is exempt from the limit and reports a
+      # fresh window while real calls 403, so it would contradict this message.
+      RL_USER=$(printf '%s' "$HEAD_READ_MSG" | sed -n 's/.*for user ID \([0-9][0-9]*\).*/\1/p' | head -1)
+      echo "Could not READ the PR HEAD oid for $REPO#$PR_NUM: the token is RATE LIMITED${RL_USER:+ (user ID $RL_USER)}." >&2
+      echo "  This is not a missing PR and not a completed sweep -- nothing was resolved." >&2
+      echo "  Read the failing call's own x-ratelimit-remaining/x-ratelimit-reset headers for the window; do not trust gh api rate_limit, which is exempt and reports a fresh window while real calls fail." >&2
+      echo "  Retry after the reset. The reviewer identity exhausts well before the author identity." >&2
+      echo "  gh said: $HEAD_READ_MSG" >&2
+      exit 4
+      ;;
+    *"Not Found"*|*"404"*)
+      echo "Could not resolve PR HEAD oid for $REPO#$PR_NUM: the PR does not exist or the token cannot see it (HTTP 404)." >&2
+      echo "  gh said: $HEAD_READ_MSG" >&2
+      exit 2
+      ;;
+    *)
+      echo "Could not resolve PR HEAD oid for $REPO#$PR_NUM after retries." >&2
+      echo "  gh said: ${HEAD_READ_MSG:-(no stderr captured)}" >&2
+      exit 4
+      ;;
+  esac
+fi
 
 # Fetch all review threads with isResolved state. Three design
 # choices, all load-bearing:
@@ -2603,24 +2687,40 @@ ledger_paths() {
 # before the bot's latest re-raise dispositioned the earlier round, not the
 # live one. FAIL CLOSED throughout: an absent ledger, a malformed line (jq -s
 # errors on the whole file), or an unusable id all read as "no evidence".
+#
+# The fail-closed status is deliberately the same either way — no evidence
+# means the thread stays unresolved regardless of WHY. But "the ledger has no
+# row for this finding" and "the ledger could not be read at all" are not the
+# same operator problem (#1002): the append-only logs are written by two
+# scripts across many sessions, so one interrupted write or one partial line
+# from a killed process silently loses every row in the file to a single `jq
+# -s` parse failure. `jq -e -s` distinguishes the two on exit status alone —
+# 1 is "parsed fine, no row matched"; anything else is jq itself failing to
+# read the file — so a WARN naming the file is cheap and, unlike the SKIP
+# reason printed by callers, tells the operator something they can fix in a
+# second.
 ledger_verdict_for_finding() {
-  local cid="$1" floor="$2" f
+  local cid="$1" floor="$2" f rc
   case "$cid" in
     ''|null|*[!0-9]*) return 1 ;;
   esac
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     [ -f "$f" ] || continue
-    if jq -e -s --argjson cid "$cid" --arg repo "$REPO" --arg floor "$floor" '
+    rc=0
+    jq -e -s --argjson cid "$cid" --arg repo "$REPO" --arg floor "$floor" '
           any(.[];
             (.comment_id == $cid)
             and (.repo == $repo)
             and (((.verdict // "") | tostring) != "")
             and (((.recorded_at // "") | tostring) != "")
             and ($floor == "" or (.recorded_at > $floor)))
-        ' "$f" >/dev/null 2>&1; then
+        ' "$f" >/dev/null 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
       printf '%s' "$f"
       return 0
+    elif [ "$rc" -ne 1 ]; then
+      echo "WARN: ledger $f could not be parsed (jq exit $rc); treating finding $cid as having no recorded verdict there" >&2
     fi
   done <<EOF
 $(ledger_paths)
@@ -2708,10 +2808,18 @@ finding_dispositioned() {
 # thread_is_actioned <class> <thread_json> — THE actioned predicate (#990).
 # Exit 0 only when the class proves action AND the evidence is bound to this
 # finding. Replaces bare class_is_actioned at every decision site.
+#
+# Only stdout (the evidence description this caller has no use for) is
+# discarded. Stderr is left connected to the caller's, because
+# finding_dispositioned's ledger read can print an unparseable-ledger WARN
+# (#1002) that every caller needs to see — swallowing it here silently
+# downgraded that diagnostic to invisible on the --auto-resolve-bots and
+# --resolve-verified-propagation paths, the only two callers that route
+# through this wrapper instead of calling finding_dispositioned directly.
 thread_is_actioned() {
   local class="$1" tj="$2"
   class_is_actioned "$class" || return 1
-  finding_dispositioned "$tj" >/dev/null 2>&1
+  finding_dispositioned "$tj" >/dev/null
 }
 
 # synth_rationale <class> <thread_json> → one-line free-form rationale

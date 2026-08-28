@@ -118,8 +118,10 @@ puts JSON.generate(value)
         and all(.available_reviewers[]; type == "string" and length > 0)))
     and optional_object("codex")
     and optional_object("coderabbit")
+    and optional_object("code_scanning")
     and ((.codex // {}) | optional_string("bot_login"))
     and ((.coderabbit // {}) | optional_string("bot_login"))
+    and ((.code_scanning // {}) | optional_string("bot_login"))
     and optional_object("feedback_policy")
     and ((.feedback_policy // {}) | optional_string("mode"))
     and (((.feedback_policy // {}).mode // "by-priority") as $mode
@@ -156,6 +158,8 @@ CODEX_BOT=$(policy_block_field codex bot_login)
 CODEX_BOT=${CODEX_BOT:-chatgpt-codex-connector[bot]}
 CODERABBIT_BOT=$(policy_block_field coderabbit bot_login)
 CODERABBIT_BOT=${CODERABBIT_BOT:-coderabbitai[bot]}
+GHAS_BOT=$(policy_block_field code_scanning bot_login)
+GHAS_BOT=${GHAS_BOT:-github-advanced-security[bot]}
 
 REVIEWER_LOGINS_JSON=$(
   policy_reviewers | awk 'NF && !seen[$0]++' | jq -Rsc 'split("\n") | map(select(. != ""))'
@@ -196,6 +200,31 @@ fetch_api_array() {
 INLINE_COMMENTS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline review comments")
 REVIEWS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects")
 ISSUE_COMMENTS=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments")
+
+# code-scanning/alerts (#1101) carries the severity a GHAS inline comment
+# body never does — the comment only links to the alert. Fetched lazily,
+# ONLY when a github-advanced-security[bot] inline comment is actually
+# present, so a repo with code scanning never enabled (the common case
+# fleet-wide) never pays this extra API call or risks a permissions
+# failure on an endpoint it has no reason to use.
+#
+# MUST pass ref=refs/pull/{pr}/head: without it, the list endpoint does
+# NOT reliably include an alert that exists only on the PR branch (an
+# alert not yet merged to the default branch) — confirmed live against
+# nathanjohnpayne/nathanpaynedotcom#809, where the unscoped list omitted a
+# `high`-severity alert #26 found only on the PR ref (it returned only
+# alert numbers up to #18, all default-branch history) while
+# `?ref=refs/pull/809/head` correctly returned both PR-scoped alerts #25
+# and #26. Losing that scope would have silently reintroduced this
+# change's own bug: an unresolvable severity falls back to p2 rather than
+# erroring, so the failure mode is quiet — every PR-branch-only alert
+# under-tiers to p2 instead of its real severity, not a loud API error.
+GHAS_ALERTS='[]'
+if printf '%s' "$INLINE_COMMENTS" \
+    | jq -e --arg login "$GHAS_BOT" 'any(.[]; (.user.login // "") == $login)' \
+    >/dev/null 2>&1; then
+  GHAS_ALERTS=$(fetch_api_array "repos/$REPO/code-scanning/alerts?ref=refs/pull/$PR_NUMBER/head" "code scanning alerts")
+fi
 
 # A source run blocks only when EVERY terminal marker it carries says failed.
 # Recency cannot decide this: restoring an edited or deleted marker reposts the
@@ -240,6 +269,32 @@ tier_rank() {
   esac
 }
 
+# ghas_finding_tier <body> — resolve a github-advanced-security[bot] inline
+# comment to a tier (#1101). The body's only structured signal is a link to
+# the alert (".../security/code-scanning/<number>"); the severity itself
+# lives on GHAS_ALERTS (fetched above), keyed by alert number.
+#
+# Falls back to p2 — accountable, but not required under the default
+# feedback_policy — whenever severity can't be resolved (no alert-number
+# link found in the body, the alert isn't in GHAS_ALERTS, or the rule
+# carries no security_severity_level, e.g. a non-security CodeQL quality
+# query). p2 keeps the finding tracked rather than silently dropped, which
+# is the defect this whole change exists to close, without unilaterally
+# making an unclassifiable finding merge-blocking.
+ghas_finding_tier() {
+  local body="$1" alert_number severity tier
+  alert_number=$(printf '%s' "$body" \
+    | grep -oE '/security/code-scanning/[0-9]+' | head -n1 | grep -oE '[0-9]+$') || true
+  if [ -n "$alert_number" ]; then
+    severity=$(printf '%s' "$GHAS_ALERTS" | jq -r --argjson num "$alert_number" \
+      'first(.[] | select(.number == $num) | .rule.security_severity_level // empty) // empty')
+  else
+    severity=""
+  fi
+  tier=$(ghas_severity_tier "$severity")
+  printf '%s' "${tier:-p2}"
+}
+
 finding_tier() {
   local login="$1" body="$2" tier="" line sanitized
   if [ "$login" = "$CODEX_BOT" ] || registered_reviewer_login "$login"; then
@@ -257,6 +312,10 @@ finding_tier() {
     done <<EOF
 $sanitized
 EOF
+    return
+  fi
+  if [ "$login" = "$GHAS_BOT" ]; then
+    ghas_finding_tier "$body"
   fi
 }
 
@@ -289,7 +348,7 @@ while IFS= read -r comment; do
   [ -n "$comment" ] || continue
   login=$(printf '%s' "$comment" | jq -r '.user.login // ""')
   case "$login" in
-    "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+    "$CODEX_BOT"|"$CODERABBIT_BOT"|"$GHAS_BOT") ;;
     *) registered_reviewer_login "$login" || continue ;;
   esac
   body=$(printf '%s' "$comment" | jq -r '.body // ""')
