@@ -269,6 +269,18 @@ else
   pass "pr create contract: attached -T is a template value, not an ambiguous -F body flag"
 fi
 
+for boolean_flag in -d -f -w; do
+  reset_log
+  OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/77" GH_VIEW_AUTHOR="nathanjohnpayne" \
+    run_wrapper -- gh pr create "$boolean_flag" --title "t" --body "$VALID_INLINE_BODY" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "pr create contract: unrelated boolean flag $boolean_flag should pass; rc=$rc"
+  else
+    pass "pr create contract: unrelated boolean flag $boolean_flag is not a body cluster"
+  fi
+done
+
 reset_log
 set +e
 stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \

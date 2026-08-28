@@ -1911,6 +1911,7 @@ GLOBAL_REPO=""
 PR_SUBCOMMAND=""
 PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
 WRAPPER_KIND=""           # "" | "author" | "reviewer"
+WRAPPER_TOKEN_INDEX=-1
 SAW_GH=0
 SAW_PR=0
 SAW_ISSUE=0
@@ -2334,11 +2335,13 @@ for i in "${!TOKENS[@]}"; do
   if is_any_wrapper_named_token "$tok"; then
     if is_author_wrapper_token "$tok"; then
       WRAPPER_KIND="author"
+      WRAPPER_TOKEN_INDEX=$i
       CURRENT_PREFIX="$tok"
       continue
     fi
     if is_reviewer_wrapper_token "$tok"; then
       WRAPPER_KIND="reviewer"
+      WRAPPER_TOKEN_INDEX=$i
       CURRENT_PREFIX="$tok"
       continue
     fi
@@ -2988,7 +2991,12 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
       PR_HEAD_REF=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oE '"head":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"head":[[:space:]]*"([^"]*)".*/\1/' || true)
       PR_AUTHOR=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oE '"author":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"author":[[:space:]]*"([^"]*)".*/\1/' || true)
       LANE_BRANCH_PREFIX="${GH_PR_GUARD_PROPAGATION_BRANCH_PREFIX:-mergepath-sync/}"
-      LANE_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-nathanjohnpayne}"
+      LANE_POLICY_PATH="$(guard_policy_file || true)"
+      LANE_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-}"
+      if [ -z "$LANE_AUTHOR" ] && [ -f "$LANE_POLICY_PATH" ]; then
+        LANE_AUTHOR=$(grep -m1 '^author_identity:' "$LANE_POLICY_PATH" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
+      fi
+      LANE_AUTHOR="${LANE_AUTHOR:-nathanjohnpayne}"
 
       # #533 item 2: honor propagation_prs.enabled before granting the
       # lane bypass. A repo that explicitly opts out
@@ -3005,7 +3013,6 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
       # the pre-write hook). The block scoping keeps a sibling block's
       # `enabled:` (coderabbit/codex/...) from being read by mistake.
       LANE_ENABLED=1
-      LANE_POLICY_PATH="$(guard_policy_file || true)"
       if [ -f "$LANE_POLICY_PATH" ]; then
         LANE_PROP_ENABLED=$(awk '
           # Accept a trailing comment / text after the key (propagation_prs: # opt-out),
@@ -3130,6 +3137,20 @@ fi
 # for that unsupported path.
 if [ "$PR_SUBCOMMAND" = "create" ]; then
   if [ "$WRAPPER_KIND" = "author" ]; then
+    if printf '%s\n' "$COMMAND" | grep -qE 'gh-as-author\.sh[^;&|]*--[[:space:]]+(ba|da|z|k)?sh([[:space:]]|$)|gh-as-author\.sh[^;&|]*--[[:space:]]+eval([[:space:]]|$)'; then
+      echo "BLOCKED: gh-as-author.sh must receive a direct gh pr create command that its runtime validator can inspect." >&2
+      echo "  Shell/eval-wrapped create payloads are not supported." >&2
+      exit 2
+    fi
+    WRAPPED_CREATE_ARGS=("${TOKENS[@]:$((WRAPPER_TOKEN_INDEX + 1))}")
+    if [ "${WRAPPED_CREATE_ARGS[0]:-}" = "--" ]; then
+      WRAPPED_CREATE_ARGS=("${WRAPPED_CREATE_ARGS[@]:1}")
+    fi
+    if ! gh_is_pr_create_command "${WRAPPED_CREATE_ARGS[@]}"; then
+      echo "BLOCKED: gh-as-author.sh must receive a direct gh pr create command that its runtime validator can inspect." >&2
+      echo "  Shell/eval-wrapped create payloads are not supported." >&2
+      exit 2
+    fi
     exit 0
   fi
 

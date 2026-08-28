@@ -271,6 +271,15 @@ else
   bad "raw-html-fence body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
 fi
 
+BACKTICK_INFO=$'```foo`bar\nAuthoring-Agent: claude\n\n## Self-Review\nok'
+got_count="$(pr_body_authoring_agent_count "$BACKTICK_INFO")"
+got_agent="$(pr_body_authoring_agent "$BACKTICK_INFO")"
+if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ]; then
+  ok "a backtick in a backtick-fence info string prevents fence opening"
+else
+  bad "backtick-info body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
+fi
+
 # --- 11. the HOOK must fail closed on parser trouble --------------------------
 # A non-2 hook exit is a NONBLOCKING error in the hook wiring, so letting `set
 # -e` propagate the helper status would fail OPEN on the self-approve check --

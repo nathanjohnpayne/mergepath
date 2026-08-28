@@ -60,7 +60,8 @@ export function parsePrBodyContract(body) {
 
     if (indentedCode) continue;
 
-    const opening = fenceLine.match(/^(`{3,}|~{3,})(.*)$/);
+    const opening =
+      fenceLine.match(/^(`{3,})([^`]*)$/) ?? fenceLine.match(/^(~{3,})(.*)$/);
     if (opening) {
       fence = { marker: opening[1][0], length: opening[1].length };
       continue;

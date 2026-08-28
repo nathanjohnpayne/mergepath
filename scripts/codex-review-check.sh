@@ -523,6 +523,8 @@ if [ -z "$REVIEWERS" ]; then
   echo "ERROR: no available_reviewers found in $CONFIG" >&2
   exit 3
 fi
+AUTHOR_IDENTITY=$(grep -m1 '^author_identity:' "$CONFIG" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
+AUTHOR_IDENTITY="${AUTHOR_IDENTITY:-nathanjohnpayne}"
 
 # --- logging helpers --------------------------------------------------------
 
@@ -634,7 +636,7 @@ fi
 #   not parse", and treat the latter as a gate error.
 AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
-if [ "$DIAGNOSTIC_SIGNAL_ONLY" != "1" ]; then
+if [ "$DIAGNOSTIC_SIGNAL_ONLY" != "1" ] && [ "$PR_AUTHOR" = "$AUTHOR_IDENTITY" ]; then
 if ! AGENT_COUNT="$(pr_body_authoring_agent_count "$PR_BODY")"; then
   die 3 "shared PR-body parser failed while counting Authoring-Agent markers; refusing to evaluate gate (b) with an unknown authoring agent"
 fi
@@ -666,8 +668,10 @@ if [ "$AGENT_COUNT" -eq 1 ]; then
     SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
   fi
 fi
-else
+elif [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
   log "diagnostic-signal-only: skipping Authoring-Agent validation; gate (b) is outside this probe"
+else
+  log "non-shared-author PR: skipping Authoring-Agent validation (PR author $PR_AUTHOR; configured author $AUTHOR_IDENTITY)"
 fi
 
 # The trusted completed-workflow continuation needs the shared answers to

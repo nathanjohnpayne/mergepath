@@ -232,6 +232,9 @@ assert_rc_contains "author wrapper pr new alias allowed" 0 "" \
 ## Self-Review
 - ok"'
 
+assert_rc_contains "author wrapper shell-wrapped pr create blocked" 2 "direct gh pr create" \
+  'scripts/gh-as-author.sh -- bash -c "gh pr create --title t --body INVALID"'
+
 assert_rc_contains "author wrapper defers inline body validation to runtime wrapper" 0 "" \
   'scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude"'
 
@@ -440,6 +443,16 @@ assert_rc_contains "inline MERGEPATH_AGENT before env -i does not unlock approve
   'MERGEPATH_AGENT=codex env -i scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
 
 ORIG_DIR="$(pwd)"
+mkdir -p "$WORKDIR/repo-custom-shared-author/.github"
+cat >"$WORKDIR/repo-custom-shared-author/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+external_review_threshold: 300
+YML
+cd "$WORKDIR/repo-custom-shared-author"
+assert_rc_contains "policy-defined custom shared author is not treated as external" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "feature/fix" "custom-owner"
+cd "$ORIG_DIR"
+
 mkdir -p "$WORKDIR/repo-with-policy/.github"
 cat >"$WORKDIR/repo-with-policy/.github/review-policy.yml" <<'YML'
 external_review_threshold: 500

@@ -342,11 +342,18 @@ fi
 # the Phase 4b barrier. Its caller supplies the author explicitly, so a legacy
 # or external-contributor PR without an Authoring-Agent marker must not abort
 # before that signal check runs.
-if grep -q 'if \[ "$DIAGNOSTIC_SIGNAL_ONLY" != "1" \]; then' "$SCRIPT" && \
+if grep -q 'if \[ "$DIAGNOSTIC_SIGNAL_ONLY" != "1" \].*PR_AUTHOR.*AUTHOR_IDENTITY' "$SCRIPT" && \
    grep -q 'diagnostic-signal-only: skipping Authoring-Agent' "$SCRIPT"; then
   pass "#1121: diagnostic-signal-only bypasses the unrelated Authoring-Agent gate"
 else
   fail "#1121: diagnostic-signal-only still requires an Authoring-Agent marker"
+fi
+
+if grep -q 'PR_AUTHOR.*AUTHOR_IDENTITY' "$SCRIPT" && \
+   grep -q 'non-shared-author PR: skipping Authoring-Agent' "$SCRIPT"; then
+  pass "#1121: markerless non-shared-author PRs bypass shared-author identity parsing"
+else
+  fail "#1121: shared Authoring-Agent parsing is not scoped to the configured author identity"
 fi
 
 # Positional rather than a text scan — the header documents gate (c) long

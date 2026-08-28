@@ -154,7 +154,7 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
       -[TtalpmBHr]?*)
         NORMALIZED_COMMAND+=("$argument")
         ;;
-      -[^-]*[bF]*)
+      -[^-]*[bF][^-]*)
         echo "gh-as-author: ambiguous clustered short option '$argument' contains a PR body flag; pass -b or -F separately." >&2
         exit 1
         ;;
