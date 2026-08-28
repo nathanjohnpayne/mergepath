@@ -241,6 +241,9 @@ command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
 [ -r "$ROOT/lib/gh-api-scalar.sh" ] || p4b_die 3 "missing helper: $ROOT/lib/gh-api-scalar.sh (see #799)"
 # shellcheck source=lib/gh-api-scalar.sh
 . "$ROOT/lib/gh-api-scalar.sh"
+# Shared PR-body identity parser (#1121) -- same contract as the guard and the
+# merge gate. A local regex here would pick a marker out of an HTML comment.
+. "$ROOT/lib/pr-body-contract.sh"
 
 # Auto-source the op-preflight reviewer PAT only after the disabled/mode checks.
 # The default disabled path must stay credential-free and exit 5 without
@@ -285,7 +288,7 @@ if [ -z "$AUTHOR" ]; then
   # a JSON error body for an agent name.
   body="$(gh_api_scalar "PR body for $REPO#$PR" \
     "repos/$REPO/pulls/$PR" --jq '.body // ""')" || body=""
-  AUTHOR="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*Authoring-Agent:[[:space:]]*\([A-Za-z0-9_-]*\).*/\1/p' | head -n1)"
+  AUTHOR="$(pr_body_authoring_agent "$body")"
   [ -n "$AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body; pass --author"
 fi
 

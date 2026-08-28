@@ -6,7 +6,7 @@
 # public API while selecting attribution per command through GH_TOKEN.
 #
 # Usage:
-#   scripts/gh-as-author.sh -- gh pr create --title ...
+#   scripts/gh-as-author.sh -- gh pr create --title ... --body-file pr-body.md
 #   scripts/gh-as-author.sh -- gh pr merge 123 --squash --delete-branch
 #   scripts/gh-as-author.sh -- gh pr edit 123 --add-label foo
 #
@@ -30,6 +30,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/gh-token-resolver.sh
 . "$ROOT/scripts/lib/gh-token-resolver.sh"
+# shellcheck source=lib/pr-body-contract.sh
+. "$ROOT/scripts/lib/pr-body-contract.sh"
+# shellcheck source=lib/gh-command-classifier.sh
+. "$ROOT/scripts/lib/gh-command-classifier.sh"
 
 AUTHOR="${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
 
@@ -73,9 +77,113 @@ if [ "$RESOLVE_RC" -ne 0 ]; then
 fi
 TOKEN="$GH_RESOLVED_TOKEN"
 
+is_pr_create_command() {
+  gh_is_pr_create_command "$@"
+}
+
 IS_PR_CREATE=0
-if [ "${1:-}" = "gh" ] && [ "${2:-}" = "pr" ] && [ "${3:-}" = "create" ]; then
+PR_CREATE_VERB_INDEX=-1
+if is_pr_create_command "$@"; then
   IS_PR_CREATE=1
+  PR_CREATE_VERB_INDEX=$GH_PR_CREATE_VERB_INDEX
+fi
+
+if [ "$IS_PR_CREATE" -eq 1 ]; then
+  PR_BODY=""
+  NORMALIZED_COMMAND=()
+  COMMAND_INDEX=0
+
+  read_pr_body_file() {
+    local body_file="$1"
+    local spelling="$2"
+    if [ "$body_file" = "-" ]; then
+      echo "gh-as-author: $spelling is unsupported because the body must be validated before the write; use /dev/stdin when stdin is intentional." >&2
+      exit 1
+    fi
+    if [ ! -r "$body_file" ]; then
+      echo "gh-as-author: PR body file is not readable: $body_file" >&2
+      exit 1
+    fi
+    PR_BODY="$(cat "$body_file")"
+  }
+
+  while [ "$#" -gt 0 ]; do
+    argument="$1"
+    shift
+    if [ "$COMMAND_INDEX" -le "$PR_CREATE_VERB_INDEX" ]; then
+      NORMALIZED_COMMAND+=("$argument")
+      COMMAND_INDEX=$((COMMAND_INDEX + 1))
+      continue
+    fi
+    COMMAND_INDEX=$((COMMAND_INDEX + 1))
+    case "$argument" in
+      -e|--editor|-w|--web)
+        echo "gh-as-author: interactive PR creation mode '$argument' is unsupported because it can mutate the body after validation." >&2
+        exit 1
+        ;;
+      --body|-b)
+        if [ "$#" -eq 0 ]; then
+          echo "gh-as-author: PR creation flag is missing its body value." >&2
+          exit 1
+        fi
+        PR_BODY="$1"
+        shift
+        ;;
+      --body-file|-F)
+        if [ "$#" -eq 0 ]; then
+          echo "gh-as-author: PR creation flag is missing its body-file value." >&2
+          exit 1
+        fi
+        read_pr_body_file "$1" "$argument -"
+        shift
+        ;;
+      --body=*) PR_BODY="${argument#--body=}" ;;
+      -b?*)
+        PR_BODY="${argument#-b}"
+        PR_BODY="${PR_BODY#=}"
+        ;;
+      --body-file=*)
+        body_file="${argument#--body-file=}"
+        read_pr_body_file "$body_file" "--body-file=-"
+        ;;
+      -F?*)
+        body_file="${argument#-F}"
+        body_file="${body_file#=}"
+        read_pr_body_file "$body_file" "-F-"
+        ;;
+      -R|--repo|--hostname|-a|--assignee|-B|--base|-H|--head|-l|--label|-m|--milestone|-p|--project|--recover|-r|--reviewer|-T|--template|-t|--title)
+        if [ "$#" -eq 0 ]; then
+          echo "gh-as-author: PR creation flag '$argument' is missing its value." >&2
+          exit 1
+        fi
+        NORMALIZED_COMMAND+=("$argument" "$1")
+        shift
+        ;;
+      # ATTACHED value for another value-taking short option. `-tbug` is
+      # `-t bug`, not a clustered `-b`; the catch-all below would otherwise
+      # reject valid creates whose title/label/head merely contains b or F.
+      # Letters are gh's value-taking pr-create shorthands EXCEPT -b/-F, which
+      # are body flags handled above.
+      -[TtalpmBHr]?*)
+        NORMALIZED_COMMAND+=("$argument")
+        ;;
+      -[^-]*[bF][^-]*)
+        echo "gh-as-author: ambiguous clustered short option '$argument' contains a PR body flag; pass -b or -F separately." >&2
+        exit 1
+        ;;
+      *) NORMALIZED_COMMAND+=("$argument") ;;
+    esac
+  done
+
+  if ! pr_body_validate "$PR_BODY" "$ROOT/.github/review-policy.yml"; then
+    echo "gh-as-author: refusing to create a PR that Phase 4b cannot attribute." >&2
+    exit 1
+  fi
+
+  # The validated snapshot is the only body value passed to gh. This prevents
+  # stdin or a mutable body file from changing between validation and creation.
+  NORMALIZED_COMMAND+=(--body "$PR_BODY")
+  set -- "${NORMALIZED_COMMAND[@]}"
 fi
 
 run_with_author_token() {

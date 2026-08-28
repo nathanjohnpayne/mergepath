@@ -481,6 +481,26 @@ jobs:
       (github.event.action == 'opened' || github.event.action == 'ready_for_review' || github.event.action == 'labeled')
     runs-on: ubuntu-latest
     steps:
+      # The reviewer-assignment parse below runs the SHARED PR-body parser
+      # (scripts/lib/pr-body-contract.mjs) rather than a local regex, so this
+      # job needs the repo on disk. Explicit-token github-script only, no
+      # authenticated git, so don't leave the checkout token in .git/config
+      # (#548 / Codex #550).
+      - name: Check out the shared PR-body parser
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # TRUSTED default-branch checkout, not the PR merge ref (#788, and
+          # the same rule load-config uses above). This job hands a
+          # write-capable token to github-script and then EXECUTES
+          # scripts/lib/pr-body-contract.mjs from this checkout. On
+          # `pull_request` the default ref is the PR merge ref, so an
+          # unpinned checkout would run PR-authored JavaScript with that
+          # token in scope. Disabling checkout credential persistence removes the
+          # checkout credential; it does NOT make the checked-out code
+          # trusted, and the parser must be the canonical one regardless.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
       - name: Assign reviewer identity based on Authoring-Agent
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -508,12 +528,35 @@ jobs:
             // Read the Authoring-Agent line from the PR body to determine which
             // agent wrote the code. Per REVIEW_POLICY.md, the same agent reviews
             // under its own reviewer identity (e.g., claude → nathanpayne-claude).
+            //
+            // This MUST use the shared parser, not a local regex (#1121). The
+            // previous `body.match(/^Authoring-Agent:.../mi)` took the first RAW
+            // line, so a marker inside an HTML comment counted as a declaration
+            // here while gh-pr-guard.sh ignored it. The same PR could then be
+            // assigned to one reviewer while the guard attributed it to another,
+            // and merge-clearance could wrongly consider the same-agent Codex
+            // fallback eligible. One parser, one answer, everywhere.
+            const { execFileSync } = require('child_process');
             const body = pr.body || '';
-            const agentMatch = body.match(/^Authoring-Agent:\s*(\w+)/mi);
+            const runParser = (flag) => {
+              try {
+                return execFileSync('node', ['scripts/lib/pr-body-contract.mjs', flag],
+                  { input: body, encoding: 'utf8' }).trim();
+              } catch (e) {
+                console.log(`shared PR-body parser failed for ${flag}: ${e.message}`);
+                return '';
+              }
+            };
+
+            // Exactly one VISIBLE marker, matching the guard and the merge gate.
+            // Zero, or more than one, is not a declaration and must not resolve
+            // to a reviewer — falling through to the default keeps assignment
+            // conservative instead of guessing from an ambiguous body.
+            const agentCount = runParser('--author-count');
+            const agentName = agentCount === '1' ? runParser('--author').toLowerCase() : '';
             let reviewer;
 
-            if (agentMatch) {
-              const agentName = agentMatch[1].toLowerCase();
+            if (agentName) {
               const matchingReviewer = reviewers.find(
                 r => r.endsWith(`-${agentName}`)
               );
@@ -1000,7 +1043,7 @@ jobs:
           #
           # This step used to parse `author_identity` out of THIS job's
           # checkout, and that checkout is not pinned: on a `pull_request`
-          # event `actions/checkout` materializes `refs/pull/N/merge`, so the
+          # event checkout materializes `refs/pull/N/merge`, so the
           # expected identity came from the PR's OWN copy of the policy, and on
           # a `pull_request_review` event it came from a different file again.
           # Two answers for one PR, neither of them the governing one — the

@@ -465,6 +465,9 @@ paths:
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
+    # Hard-sources the shared Authoring-Agent parser (#1121): this script
+    # decides gate (b), so a divergent local regex here is what makes the
+    # same-agent Codex-reaction fallback wrongly eligible.
     # Sources scripts/lib/gh-retry-helpers.sh on startup to wrap the
     # statusCheckRollup read in 3×30s retry on transient gh failures
     # (#324). Without the helper present in the consumer, the
@@ -472,6 +475,8 @@ paths:
     # retry semantics are lost — every transient failure becomes a
     # hard rc=3 and the auto-clear stalls.
     requires:
+      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/reviewers-helpers.sh"   # #453, hard-sourced for the gate (b)/(c) reviewer allow-list
       - "scripts/lib/codex-failure-markers.sh"   # #722, sourced for the gate (c) usage-limit/not-connected diagnostic
@@ -502,6 +507,8 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/phase-4b/"
       - "scripts/gh-as-reviewer.sh"
       - "scripts/post-phase-4b-handoff.sh"
@@ -685,12 +692,18 @@ paths:
   - path: scripts/resolve-pr-threads.sh
     type: canonical
     consumers: all
+    # #1104 uses scripts/lib/gh-retry-helpers.sh to retry a rate-limited read.
+    # The source is existence-guarded, so a consumer without it still fails
+    # LOUDLY and still distinguishes "could not look" from "nothing to do" --
+    # that classification is the fix; the retry is the improvement. Declared
+    # here anyway so a wave carries the helper and consumers get both.
     # #572 --resolve-verified-propagation's templated arm sources the SAME
     # render pair verify-propagation-pr.sh uses (existence-guarded — a
     # missing lib skips the thread fail-closed rather than aborting). Both
     # are consumers:all entries already; declared here so the #264 closure
     # invariant keeps the coupling explicit.
     requires:
+      - "scripts/lib/gh-retry-helpers.sh"  # retry for the #1104 read path
       - "scripts/lib/template-substitution.sh"
       - "scripts/lib/manifest-fact-helpers.sh"
   - path: scripts/request-label-removal.sh
@@ -701,8 +714,20 @@ paths:
     consumers: all
     # Sources scripts/lib/gh-token-resolver.sh at startup; without it the
     # wrapper aborts under `set -euo pipefail`. Closure-tracked (#264).
+    #
+    # It also owns the RUNTIME half of the PR-body contract: gh-pr-guard.sh
+    # exits 0 for an author-wrapped `gh pr create`/`gh pr new` on the promise
+    # that this wrapper parses and validates the effective body first. That
+    # delegation spans two files and is invisible to a source-reference scan,
+    # which is exactly how it shipped broken once: the guard was propagated
+    # with the escape while this wrapper still had no validator, leaving the
+    # `--body-file` path with no Authoring-Agent or Self-Review check at all.
+    # Declaring the contract libs here keeps the two halves inseparable.
     requires:
       - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
+      - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
   - path: scripts/gh-as-reviewer.sh
     type: canonical
     consumers: all
@@ -718,9 +743,49 @@ paths:
   - path: scripts/identity-check.sh
     type: canonical
     consumers: all
+  # The guard sources scripts/lib/pr-body-contract.sh, which in turn shells out
+  # to scripts/lib/pr-body-contract.mjs. Both are declared below and named in
+  # `requires:` here, because the coupling is lockstep and fails LOUDLY but
+  # late: without the lib the guard aborts at its `.` source line under `set -u`,
+  # and without the .mjs every contract helper returns empty, which the
+  # self-approve check reads as "no Authoring-Agent" and blocks. Shipping the
+  # guard ahead of either one breaks every guarded write in the consumer.
   - path: scripts/hooks/gh-pr-guard.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
+      - "scripts/lib/pr-body-contract.sh"   # sourced directly; missing = guard aborts
+      - "scripts/lib/pr-body-contract.mjs"  # invoked by the lib; missing = helpers return empty
+  # The PR-body parsing contract, extracted so the guard and the author wrapper
+  # read identity fields the same way. The .mjs does the parsing because the
+  # markers must be recognised in RENDERED markdown terms — a marker inside an
+  # HTML comment is not a declaration, and a grep cannot tell the difference.
+  # That distinction is what makes the self-approve check fail closed rather
+  # than silently accepting a hidden or duplicated Authoring-Agent line.
+  - path: scripts/lib/pr-body-contract.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/pr-body-contract.mjs"  # every helper shells out to it
+      - "scripts/lib/reviewers-helpers.sh"  # canonical available_reviewers parser
+  - path: scripts/lib/pr-body-contract.mjs
+    type: canonical
+    consumers: all
+  - path: scripts/lib/gh-command-classifier.sh
+    type: canonical
+    consumers: all
+  # Parity suite: asserts every identity consumer reads through the shared
+  # parser and that none reintroduces a first-raw-line matcher. The property is
+  # AGREEMENT between consumers, which no single consumer's own suite can test.
+  - path: tests/test_pr_body_contract_parity.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-command-classifier.sh"  # sourced for wrapper-shape parity
+      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
+      - "scripts/lib/reviewers-helpers.sh"  # transitive dependency of the shell facade
   - path: scripts/hooks/label-removal-guard.sh
     type: canonical
     consumers: all
@@ -1096,6 +1161,16 @@ paths:
   # exits 1 on the wrapper's "missing $TAG_TEST" branch — same
   # #264/#266 coupling class as the codex-p1-gate / disagreement-
   # detector / verify-propagation-pr pairings above. See #305.
+  # Regression suite for the #1104 read-failure classification. Pinned so a
+  # consumer carrying the fixed script also carries the test proving the
+  # failure stays DISTINGUISHABLE. Silence was the failure mode, and only a
+  # test asserting the exit code AND the wording can catch its return.
+  - path: tests/test_resolve_pr_threads_read_failure.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/resolve-pr-threads.sh"
+      - "scripts/lib/gh-retry-helpers.sh"
   - path: tests/test_resolve_pr_threads_rationale_tag.sh
     type: canonical
     consumers: all
@@ -1245,6 +1320,11 @@ paths:
   - path: .github/workflows/agent-review.yml
     type: canonical
     consumers: all
+    # The assign job runs scripts/lib/pr-body-contract.mjs from a checkout to
+    # resolve Authoring-Agent, instead of a local regex, so reviewer assignment
+    # cannot disagree with the guard or the merge gate about who authored a PR
+    # (#1121). Propagating this workflow without the parser leaves the node
+    # call failing, which falls through to the default reviewer.
     # The detect-disagreement job runs `require('scripts/disagreement-
     # detector.cjs')`. Without the module file, the job aborts on
     # MODULE_NOT_FOUND. Same lockstep coupling as #259 — propagate the
@@ -1259,6 +1339,8 @@ paths:
     # wave that moved the workflow without the kit would break every
     # consumer's load-config step.
     requires:
+      - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
+      - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/disagreement-detector.cjs"
       - "scripts/lib/blocking-labels.sh"
       - "scripts/workflow/"
@@ -1328,6 +1410,8 @@ paths:
   - path: .github/workflows/pr-audit.yml
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/pr-body-contract.mjs"  # weekly audit uses the canonical rendered-body parser
   - path: .github/workflows/codex-p1-gate.yml
     type: canonical
     consumers: all
@@ -1482,6 +1566,7 @@ paths:
       - "tests/test_repo_lint_optimization.sh"   # check_repo_lint_optimization
       - "tests/test_check_doc_ownership.sh"      # check_doc_ownership
       - "tests/test_gh_pr_guard.sh"            # check_gh_as_author
+      - "tests/test_pr_body_contract_parity.sh"  # check_gh_as_author (#1121) — invoked by the wrapper, so a path-scoped kit sync without it reds the consumer lint
       - "tests/test_gh_as_author.sh"           # check_gh_as_author
       - "tests/test_gh_as_reviewer.sh"         # check_gh_as_author
       - "tests/test_gh_wrapper_parallel.sh"    # check_gh_as_author
@@ -1510,6 +1595,7 @@ paths:
       - "tests/test_disagreement_detector.sh"  # check_disagreement_detector
       - "tests/test_verify_propagation_pr.sh"  # check_verify_propagation_pr
       - "tests/test_match_protected_paths.sh"  # check_verify_propagation_pr (#471)
+      - "tests/test_resolve_pr_threads_read_failure.sh"  # check_resolve_pr_threads (delegated test, #1104) — the wrapper now invokes it, so a kit sync without it reds the consumer lint
       - "tests/test_resolve_pr_threads_rationale_tag.sh"  # check_resolve_pr_threads (delegated test)
       - "tests/test_resolve_pr_threads_staleness_pagination.sh"  # check_resolve_pr_threads (delegated test, #573)
       - "tests/test_resolve_pr_threads_verified_propagation.sh"  # check_resolve_pr_threads (delegated test, #572)
