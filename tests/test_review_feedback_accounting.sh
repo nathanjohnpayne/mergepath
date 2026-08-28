@@ -1766,25 +1766,25 @@ assert_eq 3 "$ARGCOUNT_ONE_RC" "ghas_alert_severity with only one argument retur
 
 # CodeRabbit round 2, PR #1124: a failed cache COMMIT (jq or mv failing) must
 # not be folded into the "could not read" rc=3 contract -- the read already
-# succeeded and the correct value must still be returned. The cache file is
-# properly initialized (so ghas_alert_severity's own not-initialized guard
-# doesn't fire), but its directory is read-only, so the `.tmp` sibling
-# write fails every time; the correct severity must still come back, and a
-# WARN must land on stderr instead of the failure being silent.
+# succeeded and the correct value must still be returned. `mv` is shadowed
+# to fail deterministically rather than relying on chmod-based permission
+# enforcement (Codex review round 2, PR #1124: running this suite as root,
+# as many containerized dev/CI environments do, lets root write through a
+# 0500 directory, so the intended failure never occurred and this
+# assertion flaked green-when-it-should-fail).
 COMMIT_FAIL_DIR="$TMP/ghas-commit-fail-dir"
 mkdir -p "$COMMIT_FAIL_DIR"
 printf '{}' >"$COMMIT_FAIL_DIR/cache"
-chmod 0500 "$COMMIT_FAIL_DIR"
 COMMIT_FAIL_RC=0
 COMMIT_FAIL_OUT=$(bash -c '
   set -euo pipefail
+  mv() { return 1; }
   . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
   gh_api_scalar() { printf "high"; }
   . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
   GHAS_SEVERITY_CACHE="'"$COMMIT_FAIL_DIR"'/cache"
   ghas_alert_severity acme/widget 99
 ' 2>"$TMP/commit-fail-stderr.txt") || COMMIT_FAIL_RC=$?
-chmod 0700 "$COMMIT_FAIL_DIR"
 assert_eq 0 "$COMMIT_FAIL_RC" "a failed cache commit does not fail the read (#1124 round 2)"
 assert_eq high "$COMMIT_FAIL_OUT" "a failed cache commit still returns the correctly-resolved severity"
 assert_match 'WARN.*could not write severity cache' "$(cat "$TMP/commit-fail-stderr.txt")" "a failed cache commit is not silent"

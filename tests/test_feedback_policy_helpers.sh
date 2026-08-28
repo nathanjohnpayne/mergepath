@@ -31,6 +31,9 @@
 #     16. extracts alert number from a /security/code-scanning/N link;
 #         first match wins; no link / no digits / empty / missing arg
 #         -> empty (rc0)
+#   read_policy_block_field (#1124)
+#     17. reads a field from an arbitrary top-level block (not only
+#         feedback_policy:); absent field/block/file -> empty
 #
 # Bash 3.2 portable.
 
@@ -233,6 +236,27 @@ eq "" "$(ghas_alert_number_from_body '/security/code-scanning/ (no digits)')" \
 
 rc=0; out=$(ghas_alert_number_from_body 'no link here') || rc=$?
 if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "ghas_alert_number_from_body: no match is rc0+empty under set -e"; else fail "ghas_alert_number_from_body: no-match rc=$rc out=[$out]"; fi
+
+# --- read_policy_block_field (#1124) ----------------------------------------
+CFG_BLOCK="$WORKDIR/code-scanning-block.yml"
+cat > "$CFG_BLOCK" <<'YAML'
+external_review_threshold: 300
+code_scanning:
+  enabled: true
+  bot_login: "custom-ghas-bot[bot]"   # inline comment + quotes to strip
+feedback_policy:
+  mode: by-priority
+YAML
+eq "custom-ghas-bot[bot]" "$(read_policy_block_field code_scanning bot_login "$CFG_BLOCK")" \
+  "read_policy_block_field: reads a field from an arbitrary top-level block, not only feedback_policy:"
+eq "true" "$(read_policy_block_field code_scanning enabled "$CFG_BLOCK")" \
+  "read_policy_block_field: reads a second field from the same block"
+eq "" "$(read_policy_block_field code_scanning missing_field "$CFG_BLOCK")" \
+  "read_policy_block_field: absent field in a present block -> empty"
+eq "" "$(read_policy_block_field nonexistent_block bot_login "$CFG_BLOCK")" \
+  "read_policy_block_field: absent block -> empty"
+eq "" "$(read_policy_block_field code_scanning bot_login "$WORKDIR/does-not-exist.yml")" \
+  "read_policy_block_field: missing config file -> empty (not an error)"
 
 # ---------------------------------------------------------------------------
 echo

@@ -77,15 +77,26 @@ ISSUES=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comm
 # extracted number, so it would be looked up against THIS repo and, on a
 # 404, hard-fail the whole fingerprint (and the required Codex P1 check
 # it feeds) over a link accounting itself never resolves severity for.
-# The well-known default bot login is used directly rather than adding a
-# review-policy.yml dependency this script didn't previously have — the
-# override in .github/review-policy.yml is documented as an escape hatch
-# for a GitHub-side rename, not real per-repo customization, matching the
-# same simplification codex-p1-gate.yml's archive job already makes for
-# this exact tradeoff. Lazy: zero alert-number links found means zero
+#
+# The well-known default login is ALWAYS included; `code_scanning.bot_login`
+# from review-policy.yml (if configured and different) is ADDED to, never
+# substituted for, that default (Codex review round 2, PR #1124: a repo
+# that overrode the login away from the default would otherwise have its
+# retriaged findings missing from this consistency hash entirely). This is
+# a best-effort, non-materialized read -- widening which comments get
+# scanned is always safe for a fingerprint (more inclusive only makes it
+# MORE sensitive to a real change, never less), unlike accounting's own
+# policy read, which must be base-SHA-trusted because it decides whether a
+# finding blocks merge. Lazy: zero alert-number links found means zero
 # fetches, so a repo without code scanning enabled pays nothing extra.
+GHAS_BOT_LOGINS_JSON=$(
+  { printf '%s\n' 'github-advanced-security[bot]'
+    read_policy_block_field code_scanning bot_login 2>/dev/null || true
+  } | awk 'NF && !seen[$0]++' | jq -Rsc 'split("\n") | map(select(. != ""))'
+)
 GHAS_ALERT_NUMBERS=$(printf '%s' "$INLINE" \
-  | jq -r '.[] | select((.user.login // "") == "github-advanced-security[bot]") | .body // ""' \
+  | jq -r --argjson logins "$GHAS_BOT_LOGINS_JSON" \
+    '.[] | select((.user.login // "") as $login | ($logins | index($login)) != null) | .body // ""' \
   | while IFS= read -r body; do
   ghas_alert_number_from_body "$body"
 done | awk 'NF && !seen[$0]++' | sort -n)
