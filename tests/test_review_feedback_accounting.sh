@@ -1004,7 +1004,7 @@ Review rate limited.
 
 </details>
 EOF
-STATUS_ARCHIVE_MARKER=$($RENDER_ARCHIVE issue-comment 7990 'coderabbitai[bot]' \
+STATUS_ARCHIVE_MARKER=$("$RENDER_ARCHIVE" issue-comment 7990 'coderabbitai[bot]' \
   '2026-08-18T22:19:02Z' "$STATUS_ARCHIVE_BODY")
 assert_eq "" "$STATUS_ARCHIVE_MARKER" "archived CodeRabbit command status emits no invented finding record"
 
