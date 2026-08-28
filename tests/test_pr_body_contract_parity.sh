@@ -351,7 +351,79 @@ else
   bad "gh-pr-guard has $guard_exit2 explicit parser exit-2 guards, expected 2"
 fi
 
-# --- 12. the contract's own verdicts, including the #1132 bypass -------------
+# --- 12. the REQUIRED Self-Review gate must use the parser, not a line grep ---
+# The server-side gate is the ONLY backstop for a PR created through the web UI
+# or the REST API, where the local gh-as-author wrapper never runs. A
+# line-based `grep -qE '^## Self-Review'` is satisfied by a heading inside a
+# fenced code block and says nothing at all about Authoring-Agent, so the
+# required check passed bodies that pr_body_validate rejects (#1132).
+PRP=".github/workflows/pr-review-policy.yml"
+prp_job=$(awk '/^  self-review-check:/{f=1;next} /^  [a-z-]+:$/{f=0} f' "$ROOT/$PRP")
+# Every assertion below matches LIVE YAML only. The comment prose in that job
+# explains what it does and does not use, which makes comments readable as
+# either half of an assertion: a positive one goes green on prose describing an
+# option that was deleted, and a negative one fires on prose documenting the
+# pattern it forbids. This bit three times while writing this file, once on the
+# trusted-checkout assertion — where `persist-credentials:false` in a comment
+# was one added space away from satisfying the check with the real option gone.
+prp_live=$(printf '%s\n' "$prp_job" | grep -vE '^[[:space:]]*#')
+
+if printf '%s\n' "$prp_live" | grep -qE "grep -q[A-Za-z]*[[:space:]]+.\^## Self-Review"; then
+  bad "$PRP still gates Self-Review with a line grep (a fenced heading defeats it)"
+else
+  ok "the Self-Review gate no longer relies on a line grep"
+fi
+
+if printf '%s\n' "$prp_live" | grep -qF 'scripts/validate-pr-body.sh'; then
+  ok "the Self-Review gate routes through the shared validate-pr-body entrypoint"
+else
+  bad "$PRP does not call scripts/validate-pr-body.sh; the gate cannot see fenced headings or Authoring-Agent"
+fi
+
+# The job runs on `pull_request`, so a default checkout fetches the PR HEAD --
+# letting a PR rewrite the validator that judges it, strictly worse than the
+# grep it replaces. The parser must come from the default branch.
+if printf '%s\n' "$prp_live" | grep -qF 'uses: actions/checkout@'; then
+  if printf '%s\n' "$prp_live" | grep -qF 'ref: ${{ github.event.repository.default_branch }}'; then
+    ok "the Self-Review gate checks the validator out from the TRUSTED default branch"
+  else
+    bad "$PRP checks out for the Self-Review gate without pinning ref to default_branch — a PR could edit its own validator"
+  fi
+  if printf '%s\n' "$prp_live" | grep -qF 'persist-credentials: false'; then
+    ok "the trusted validator checkout does not persist credentials"
+  else
+    bad "$PRP trusted checkout must set persist-credentials: false (#548)"
+  fi
+else
+  bad "$PRP self-review-check has no checkout, so it cannot run the trusted validator"
+fi
+
+# node-version-file would fail on every consumer without an .nvmrc, and this
+# workflow is canonical. Pin a literal version instead.
+if printf '%s\n' "$prp_live" | grep -qF 'node-version-file'; then
+  bad "$PRP uses node-version-file; canonical workflows must not depend on a consumer-owned .nvmrc"
+else
+  ok "the gate pins Node by literal version, not a consumer-owned .nvmrc"
+fi
+
+# The bootstrap soft-pass is a fail-open, so its shape is pinned. It must key
+# ONLY on the validator being absent from the trusted checkout -- any broader
+# condition (a flag, an env var, an event type) would be a way to disable a
+# required security gate on demand.
+if printf '%s\n' "$prp_live" | grep -qF 'exit 0'; then
+  if printf '%s\n' "$prp_live" | grep -qE '\[ ! -f scripts/validate-pr-body\.sh \]'; then
+    ok "the bootstrap soft-pass keys only on the validator being absent"
+  else
+    bad "$PRP has a soft-pass in the Self-Review gate that is NOT keyed on the validator being absent"
+  fi
+  if printf '%s\n' "$prp_live" | grep -qF '::warning::'; then
+    ok "the bootstrap soft-pass is loud"
+  else
+    bad "$PRP soft-passes the Self-Review gate silently"
+  fi
+fi
+
+# --- 13. the contract's own verdicts, including the #1132 bypass -------------
 # A workflow assertion alone cannot see a parser regression, and "rejects the
 # fenced body" alone is satisfied by a gate that rejects everything -- so the
 # valid body is asserted to PASS in the same block.
@@ -385,7 +457,7 @@ else
   ok "two Authoring-Agent lines are rejected"
 fi
 
-# --- 13. the policy argument's failure modes must be honest ------------------
+# --- 14. the policy argument's failure modes must be honest ------------------
 # Before #1132 an unreadable policy rejected EVERY body while reporting
 # "unknown Authoring-Agent" -- blaming the author for a repo misconfiguration
 # no PR edit could fix. It must still fail closed, but say what actually broke.
