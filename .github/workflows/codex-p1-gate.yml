@@ -260,12 +260,34 @@ jobs:
               ghas_severity_cache_init || true
               trap 'ghas_severity_cache_cleanup; rm -f "$previous_file" "$archive_records_file" "$payload_file"' EXIT
               ghas_severity=""
-              if ! ghas_severity=$(ghas_alert_severity "$REPO" "$alert_number"); then
-                echo "::warning::could not resolve code-scanning alert #$alert_number severity for archival ($source_kind $source_id); archiving at the accountable-but-non-blocking default (p2)."
-                ghas_severity=""
+              if ghas_severity=$(ghas_alert_severity "$REPO" "$alert_number"); then
+                # Read succeeded: the rule genuinely carries no assigned
+                # severity (e.g. a non-security CodeQL quality query).
+                # p2 is the correct classification here, same as live.
+                ghas_tier=$(ghas_severity_tier "$ghas_severity")
+                ghas_tier="${ghas_tier:-p2}"
+              else
+                # Codex review, PR #1124: a FAILED read (network/rate-limit
+                # -- distinct from the branch above, where the read
+                # succeeded and simply found no severity) must NOT default
+                # to p2. A repo with feedback_policy.priorities.p2: ignore
+                # would then have strongest_nonignored_archive_tier drop
+                # the archived record from inventory entirely -- an
+                # originally p0/p1 finding vanishing not because anyone
+                # reviewed it, but because of a transient infrastructure
+                # failure at the exact moment its comment was archived.
+                # Live evaluation avoids this because a failed read there
+                # hard-fails the gate (exit 2) rather than ever reaching a
+                # tier classification an ignore policy could act on.
+                # Archival can't hard-fail (there is no scheduled retry,
+                # and the record would be lost forever), so it defaults to
+                # p1 instead -- required under this repo's own default
+                # feedback_policy split (P0/P1-required), erring toward
+                # over-inclusion for a genuinely unresolved severity
+                # rather than risking silent exclusion.
+                echo "::warning::could not resolve code-scanning alert #$alert_number severity for archival ($source_kind $source_id); archiving at p1 (unresolved, not p2, so a p2:ignore policy cannot silently drop it)."
+                ghas_tier=p1
               fi
-              ghas_tier=$(ghas_severity_tier "$ghas_severity")
-              ghas_tier="${ghas_tier:-p2}"
             elif [ "$source_login" = "$ghas_bot_login" ]; then
               # Codex review, PR #1124 (two rounds): live accounting's
               # ghas_finding_tier ALSO falls back to p2 when no alert link

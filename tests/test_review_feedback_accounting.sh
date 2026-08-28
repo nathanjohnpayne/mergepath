@@ -2045,6 +2045,41 @@ assert_eq 1 "$RUN_RC" "codex-p1-gate.yml's GHAS-login p2 fallback preserves a li
 assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the workflow-shaped archive record carries the p2 fallback tier"
 assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "the workflow-shaped archive record stays bound to the GHAS bot login"
 
+# Codex review, PR #1124: codex-p1-gate.yml archives a FAILED severity
+# read (network/rate-limit) at p1, not p2 -- distinct from the p2 branch
+# above, which is a successful read that simply found no assigned
+# severity. A repo with feedback_policy.priorities.p2: ignore would
+# otherwise have strongest_nonignored_archive_tier drop an originally
+# p0/p1 finding from inventory entirely just because its severity read
+# failed at the moment of archival, not because anyone reviewed it.
+reset_fixtures
+PREVIOUS_GHAS_READ_FAILED="$TMP/previous-ghas-read-failed.txt"
+cat >"$PREVIOUS_GHAS_READ_FAILED" <<'EOF'
+## CodeQL / Some rule
+
+[Show more details](https://github.com/acme/widget/security/code-scanning/70)
+EOF
+GHAS_ARCHIVE_READ_FAILED=$("$RENDER_ARCHIVE" inline 8620 'github-advanced-security[bot]' \
+  '2026-08-26T22:20:00Z' "$PREVIOUS_GHAS_READ_FAILED" p1)
+jq -n --arg archive "$GHAS_ARCHIVE_READ_FAILED" '[{
+  "id": 8621,
+  "created_at": "2026-08-26T22:20:01Z",
+  "updated_at": "2026-08-26T22:20:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+cp "$TMP/review-policy.yml" "$TMP/review-policy.ignore-p2-archive.yml"
+cat >>"$TMP/review-policy.yml" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p2: ignore
+YAML
+run_gate
+assert_eq 1 "$RUN_RC" "a failed archive-time severity read at p1 survives a p2:ignore policy (#1124)"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the failed-read archive record carries p1, not p2"
+mv "$TMP/review-policy.ignore-p2-archive.yml" "$TMP/review-policy.yml"
+
 # Two comments linking the SAME alert number must fetch it only ONCE
 # (scripts/lib/ghas-alert-severity.sh's GHAS_SEVERITY_CACHE) -- without
 # memoization a PR with several comments on one finding would re-read the
