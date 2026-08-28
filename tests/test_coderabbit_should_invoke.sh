@@ -131,6 +131,9 @@ echo "--- defaults and malformed input must NOT skip ---"
 case_is "invoke absent defaults to always"     "$ON"                                  0 0
 case_is "unrecognized mode defaults to invoke" "$ON"$'\n'"  invoke: bogus"            0 0
 case_is "empty mode value defaults to invoke"  "$ON"$'\n'"  invoke:"                  0 0
+case_is "unrecognized enabled value invokes"   "  enabled: bogus"$'\n'"  invoke: never" 0 0
+case_is "empty enabled value invokes"          "  enabled:"$'\n'"  invoke: never"      0 0
+case_is "quoted empty enabled value invokes"   '  enabled: ""'$'\n'"  invoke: never" 0 0
 case_is "quoted mode parses"                   "$ON"$'\n''  invoke: "never"'          0 1
 case_is "mode with inline comment parses"      "$ON"$'\n'"  invoke: never   # why"    0 1
 
@@ -170,6 +173,9 @@ classifier_reason_is "exit 0 cannot carry match true" \
   '{"match": true, "files_inspected": 4}' 0 'match disagrees with exit status'
 classifier_reason_is "exit 1 cannot carry match false" \
   '{"match": false, "files_inspected": 4}' 1 'match disagrees with exit status'
+classifier_reason_is "3,000-file API cap invokes" \
+  '{"match": false, "files_inspected": 3000}' 0 'may have capped'
+CLS_FILES_FIXTURE=2999 case_is "2,999 inspected files may still skip" "$CX" 0 1
 
 echo "--- argument validation ---"
 d=$(scratch "$ON" 0)

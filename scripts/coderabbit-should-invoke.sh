@@ -314,7 +314,13 @@ coderabbit_field() {  # <field>
           # unnecessary wait; the cost the other way is a silently skipped
           # round (#1084 r8, corrected r13).
           if (after ~ /^[[:space:]]*$/ || after ~ /^[[:space:]]+#/) {
-            print substr(rest, 1, idx - 1); exit
+            value = substr(rest, 1, idx - 1)
+            if (fld == "enabled" && value == "") {
+              print "<<ambiguous:empty scalar for enabled>>"
+            } else {
+              print value
+            }
+            exit
           }
           print "<<ambiguous:malformed quoting on " fld ">>"; exit
         }
@@ -322,7 +328,11 @@ coderabbit_field() {  # <field>
       }
       sub(/[[:space:]]+#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
-      print
+      if (fld == "enabled" && $0 == "") {
+        print "<<ambiguous:empty scalar for enabled>>"
+      } else {
+        print
+      }
     }
   ' "$CONFIG"
 }
@@ -438,6 +448,14 @@ if [ -f "$CONFIG" ]; then
   # INVOKES -- the fail-safe direction, and the same answer this script gave
   # before yq was involved at all.
 fi
+
+case "$CR_ENABLED" in
+  ""|true|false) ;;
+  *)
+    echo "[coderabbit-should-invoke] WARN: unrecognized coderabbit.enabled='$CR_ENABLED'; treating policy as unsafe" >&2
+    emit invoke "unrecognized coderabbit.enabled='$CR_ENABLED' — policy cannot safely suppress review"
+    ;;
+esac
 
 CR_ENABLED=${CR_ENABLED:-true}
 if [ "$CR_ENABLED" = "false" ]; then
@@ -559,8 +577,12 @@ if [ "$CLS_PARSE_RC" -ne 0 ] || [ -z "$CLS_PARSED" ]; then
 fi
 CLS_FILES=$(printf '%s' "$CLS_PARSED" | jq -r '.files_inspected')
 CLS_MATCH=$(printf '%s' "$CLS_PARSED" | jq -r '.match')
+CLS_CAPPED=$(printf '%s' "$CLS_PARSED" | jq -r '.files_inspected >= 3000')
 if [ "$CLS_FILES" = "0" ]; then
   emit invoke "classifier inspected no files (phase_4b_default short-circuit or empty diff) — complexity unassessed, defaulting to invoke"
+fi
+if [ "$CLS_CAPPED" = "true" ]; then
+  emit invoke "classifier inspected at least 3000 files — GitHub may have capped the PR files response, defaulting to invoke"
 fi
 
 if { [ "$CLS_RC" = "0" ] && [ "$CLS_MATCH" != "false" ]; } \

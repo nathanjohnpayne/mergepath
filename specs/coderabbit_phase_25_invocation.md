@@ -47,6 +47,7 @@ The reader accepts ordinary YAML spellings rather than one fixed shape, and must
 And the reader must answer from the right place:
 
 - Only **direct children** of `coderabbit:` are eligible. A nested map that shares a key name — `severity_gate.enabled` versus `coderabbit.enabled` — must never answer for its parent, in either document order. YAML mapping order is not semantic, so reordering two keys may not change the decision.
+- `coderabbit.enabled` accepts only absent, `true`, or `false`. An empty or unsupported value invokes; it cannot combine with `invoke: never` to suppress review.
 - A `#` inside a quoted scalar is content. Outside quotes it opens a comment only when preceded by whitespace.
 - The policy is resolved from the script's own checkout, following symlinks, not from `$PWD`.
 
@@ -57,6 +58,7 @@ And the reader must answer from the right place:
 - Selectivity is therefore independent of `phase_4b_default`. A routine PR skips under any 4b mode; a complex PR invokes under any 4b mode.
 - If the classifier rejects `--detect-only` (exit `3`, an older copy on a not-yet-synced consumer), the call retries without it. An older classifier may then short-circuit with `files_inspected: 0`, which deliberately invokes CodeRabbit for every such unassessed PR until propagation catches up; compatibility does not preserve selectivity at the cost of silently skipping review.
 - A classifier result reporting `files_inspected: 0` means the diff was not assessed — a short-circuit on an older copy, or an empty diff — and invokes.
+- A classifier result reporting `files_inspected >= 3000` is also unassessed because GitHub may have capped the PR-files response at 3,000 entries; it invokes rather than trusting a no-match over a partial diff.
 - Classifier stdout must contain exactly one valid JSON object with a boolean `match` and a nonnegative integer `files_inspected`. For a positive inspection count, `match: false` must pair with exit `0` and `match: true` with exit `1`; malformed, concatenated, truncated, missing-field, or exit-inconsistent output invokes as unassessed.
 - A changed-file entry with a missing, null, non-string, or empty `patch` makes the classifier exit as unassessed; content-based detectors did not inspect that file, so a no-match cannot safely suppress review.
 - Any other classifier failure invokes.
