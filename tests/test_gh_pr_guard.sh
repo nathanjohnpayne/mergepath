@@ -326,6 +326,18 @@ assert_rc_contains "cross-agent approve allowed" 0 "" \
 assert_rc_contains "commented author decoy cannot bypass same-agent approval" 2 "self-approve detected" \
   'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" $'<!-- Authoring-Agent: claude -->\nAuthoring-Agent: codex' "5000" "0"
 
+# The strict Authoring-Agent body contract belongs to the shared author lane.
+# Dependabot and external contributors do not use that template; a registered
+# reviewer must still be able to approve their PRs.
+assert_rc_contains "markerless Dependabot PR can receive reviewer approval" 0 "" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "" "5000" "0" "dependabot/npm_and_yarn/pkg" "dependabot[bot]"
+
+assert_rc_contains "markerless external-contributor PR can receive reviewer approval" 0 "" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "" "5000" "0" "contributor/fix" "outside-contributor"
+
+assert_rc_contains "markerless shared-author PR still fails closed" 2 "exactly one visible Authoring-Agent" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "" "5000" "0" "feature/fix" "nathanjohnpayne"
+
 # --- #671: the self-approve sub-guard resolves the reviewer the same way
 # the wrapper will (GH_AS_REVIEWER_IDENTITY, then MERGEPATH_AGENT, then
 # the default), honoring an inline same-segment MERGEPATH_AGENT prefix.

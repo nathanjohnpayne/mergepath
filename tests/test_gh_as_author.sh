@@ -154,6 +154,33 @@ else
   pass "pr new alias contract: invalid body blocked before write"
 fi
 
+# Every prefix shape the pre-write guard delegates to this wrapper must still
+# enter the create-only validation path. Otherwise an invalid body reaches the
+# generic command runner while the guard believes validation happens here.
+for prefixed_create in \
+  "command -p gh pr create" \
+  "sudo -n gh pr create" \
+  "time -p gh pr create" \
+  "nohup gh pr create" \
+  "nice -n 5 gh pr create" \
+  "ionice -c 2 gh pr create"; do
+  reset_log
+  set +e
+  # These are deliberately plain words: the wrapper must reject the invalid
+  # body before attempting to execute any prefix utility.
+  stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+    run_wrapper -- $prefixed_create --title "t" --body "INVALID" 2>&1 >/dev/null)
+  rc=$?
+  set -e
+  if [ "$rc" -ne 1 ]; then
+    fail "prefixed pr create contract ($prefixed_create): rc=$rc expected 1"
+  elif grep -q $'gh\tpr\tcreate' "$WORKDIR/calls.log"; then
+    fail "prefixed pr create contract ($prefixed_create): write ran despite invalid body"
+  else
+    pass "prefixed pr create contract ($prefixed_create): invalid body blocked before write"
+  fi
+done
+
 reset_log
 set +e
 stderr_capture=$(OP_PREFLIGHT_AUTHOR_PAT="author-token" \
@@ -226,6 +253,20 @@ if [ "$rc" -ne 0 ]; then
   fail "pr create contract: equals-separated -F body file should pass; rc=$rc"
 else
   pass "pr create contract: equals-separated -F strips its optional equals sign"
+fi
+
+reset_log
+TEMPLATE_FILE="$WORKDIR/Form.md"
+printf '%s\n' 'ignored template fixture' >"$TEMPLATE_FILE"
+OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_CREATE_PR_URL="https://github.com/example/repo/pull/77" GH_VIEW_AUTHOR="nathanjohnpayne" \
+  run_wrapper -- gh pr create --title "t" "-T$TEMPLATE_FILE" --body "$VALID_INLINE_BODY" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "pr create contract: attached -T template should pass; rc=$rc"
+elif ! grep -q -- "-T$TEMPLATE_FILE" "$WORKDIR/calls.log"; then
+  fail "pr create contract: attached -T template was not preserved"
+else
+  pass "pr create contract: attached -T is a template value, not an ambiguous -F body flag"
 fi
 
 reset_log
@@ -356,7 +397,9 @@ install_wrapper_copy() {
   mkdir -p "$dir/scripts/lib" "$dir/.github"
   cp "$ROOT/scripts/gh-as-author.sh" "$dir/scripts/gh-as-author.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
+  cp "$ROOT/scripts/lib/gh-command-classifier.sh" "$dir/scripts/lib/gh-command-classifier.sh"
   cp "$ROOT/scripts/lib/pr-body-contract.sh" "$dir/scripts/lib/pr-body-contract.sh"
+  cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
   cp "$ROOT/scripts/identity-check.sh" "$dir/scripts/identity-check.sh"
   chmod +x "$dir/scripts/gh-as-author.sh" "$dir/scripts/identity-check.sh"
 }

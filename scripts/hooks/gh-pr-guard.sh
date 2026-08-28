@@ -355,7 +355,11 @@ trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR"' EXIT
 # (CodeRabbit #551), and env -S/--split-string is NOT a value either — it runs
 # its argument as a SPLIT command with exotic dynamic semantics, so it FAILS
 # CLOSED in expand_wrappers (Codex #551) rather than being skipped here.
-PREFIX_VALUE_OPTS_SPEC="sudo=-u,--user,-g,--group,-p,--prompt,-h,--host,-t,--type,-r,--role,-C,--close-from,-D,--chdir,-R,--chroot,-U,--other-user,-T,--command-timeout;nice=-n,--adjustment;ionice=-c,--class,-n,--classdata,-p,--pid;env=-u,--unset,-C,--chdir;exec=-a;time=-f,--format,-o,--output"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GUARD_REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
+# shellcheck source=../lib/gh-command-classifier.sh
+. "$GUARD_REPO_ROOT/scripts/lib/gh-command-classifier.sh"
+PREFIX_VALUE_OPTS_SPEC="$GH_PREFIX_VALUE_OPTS_SPEC"
 export PREFIX_VALUE_OPTS_SPEC
 if ! printf '%s' "$COMMAND" | python3 -c '
 import sys, shlex, re, os
@@ -1370,8 +1374,6 @@ prefix_flag_takes_value() {
   return 1
 }
 
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GUARD_REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
 # shellcheck source=../lib/pr-body-contract.sh
 . "$GUARD_REPO_ROOT/scripts/lib/pr-body-contract.sh"
 
@@ -3023,6 +3025,14 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
          && [ "${PR_HEAD_REF#"$LANE_BRANCH_PREFIX"}" != "$PR_HEAD_REF" ]; then
         # Lane criteria met (and lane enabled) — skip the self-approve
         # guard entirely. Allow the gh pr review --approve to proceed.
+        exit 0
+      fi
+
+      # Only PRs authored through the shared author lane carry the strict body
+      # contract. Dependabot and external contributors have no Authoring-Agent
+      # marker, and their approvals cannot be same-agent self-approvals under
+      # the shared author identity.
+      if [ "$PR_AUTHOR" != "$LANE_AUTHOR" ]; then
         exit 0
       fi
 

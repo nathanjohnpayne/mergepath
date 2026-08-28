@@ -2,6 +2,8 @@
 # Shared parser for the identity-bearing fields in pull request bodies.
 
 PR_BODY_CONTRACT_PARSER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pr-body-contract.mjs"
+# shellcheck source=reviewers-helpers.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/reviewers-helpers.sh"
 
 pr_body_authoring_agent() {
   printf '%s\n' "$1" | node "$PR_BODY_CONTRACT_PARSER" --author
@@ -13,28 +15,14 @@ pr_body_authoring_agent_count() {
 
 pr_body_available_authoring_agents() {
   local policy_file=$1
+  local reviewer
   [ -r "$policy_file" ] || return 0
-
-  awk '
-    /^[^[:space:]#]/ {
-      if ($1 == "available_reviewers:") { in_reviewers = 1; next }
-      in_reviewers = 0
-    }
-    in_reviewers && /^[[:space:]]*-[[:space:]]*/ {
-      value = $0
-      sub(/^[[:space:]]*-[[:space:]]*/, "", value)
-      sub(/[[:space:]]*#.*$/, "", value)
-      # Trailing whitespace FIRST: the closing-quote anchor below is $-anchored,
-      # so padding after the quote (a supported YAML form) left the quote in
-      # place and the slug regex then dropped an otherwise valid reviewer.
-      sub(/[[:space:]]+$/, "", value)
-      gsub(/^["\047]|["\047]$/, "", value)
-      sub(/[[:space:]]+$/, "", value)
-      value = tolower(value)
-      sub(/^nathanpayne-/, "", value)
-      if (value ~ /^[a-z0-9_-]+$/) print value
-    }
-  ' "$policy_file"
+  while IFS= read -r reviewer; do
+    reviewer="$(printf '%s' "$reviewer" | tr '[:upper:]' '[:lower:]')"
+    case "$reviewer" in
+      nathanpayne-*) printf '%s\n' "${reviewer#nathanpayne-}" ;;
+    esac
+  done <<< "$(read_available_reviewers "$policy_file")"
 }
 
 pr_body_agent_is_allowed() {

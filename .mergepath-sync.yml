@@ -725,6 +725,7 @@ paths:
     # Declaring the contract libs here keeps the two halves inseparable.
     requires:
       - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
       - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
   - path: scripts/gh-as-reviewer.sh
@@ -753,6 +754,7 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
       - "scripts/lib/pr-body-contract.sh"   # sourced directly; missing = guard aborts
       - "scripts/lib/pr-body-contract.mjs"  # invoked by the lib; missing = helpers return empty
   # The PR-body parsing contract, extracted so the guard and the author wrapper
@@ -766,7 +768,11 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/pr-body-contract.mjs"  # every helper shells out to it
+      - "scripts/lib/reviewers-helpers.sh"  # canonical available_reviewers parser
   - path: scripts/lib/pr-body-contract.mjs
+    type: canonical
+    consumers: all
+  - path: scripts/lib/gh-command-classifier.sh
     type: canonical
     consumers: all
   # Parity suite: asserts every identity consumer reads through the shared
@@ -776,8 +782,10 @@ paths:
     type: canonical
     consumers: all
     requires:
+      - "scripts/lib/gh-command-classifier.sh"  # sourced for wrapper-shape parity
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
+      - "scripts/lib/reviewers-helpers.sh"  # transitive dependency of the shell facade
   - path: scripts/hooks/label-removal-guard.sh
     type: canonical
     consumers: all
@@ -1402,6 +1410,8 @@ paths:
   - path: .github/workflows/pr-audit.yml
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/pr-body-contract.mjs"  # weekly audit uses the canonical rendered-body parser
   - path: .github/workflows/codex-p1-gate.yml
     type: canonical
     consumers: all

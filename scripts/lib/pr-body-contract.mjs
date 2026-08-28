@@ -15,12 +15,7 @@ export function parsePrBodyContract(body) {
   let htmlBlock = null;
 
   for (const rawLine of body.split(/\r?\n/)) {
-    let line = stripHtmlComments(rawLine, (state) => {
-      inComment = state;
-    }, inComment);
-    if (line == null) continue;
-
-    const container = stripContainerPrefix(line);
+    const container = stripContainerPrefix(rawLine);
     // Four spaces (or a tab) means an indented code block, and an indented
     // backtick run is CODE, not a fence delimiter. trimStart() erased that
     // distinction, so `    \u0060\u0060\u0060` opened a fence that never closed and the
@@ -37,6 +32,32 @@ export function parsePrBodyContract(body) {
       }
       continue;
     }
+
+    // Comment and raw-HTML state outrank fence-looking content while those
+    // blocks are active. Conversely, comment delimiters inside an active
+    // fenced code block above are literal code and never mutate inComment.
+    if (inComment) {
+      stripHtmlComments(rawLine, (state) => {
+        inComment = state;
+      }, true);
+      continue;
+    }
+
+    if (htmlBlock != null) {
+      if (htmlBlock === 'blank') {
+        if (rawLine.trim() === '') htmlBlock = null;
+      } else if (htmlBlock === 'processing') {
+        if (rawLine.includes('?>')) htmlBlock = null;
+      } else if (htmlBlock === 'cdata') {
+        if (rawLine.includes(']]>')) htmlBlock = null;
+      } else if (htmlBlock === 'declaration') {
+        if (rawLine.includes('>')) htmlBlock = null;
+      } else if (new RegExp(`</${htmlBlock}\\s*>`, 'i').test(rawLine)) {
+        htmlBlock = null;
+      }
+      continue;
+    }
+
     if (indentedCode) continue;
 
     const opening = fenceLine.match(/^(`{3,}|~{3,})(.*)$/);
@@ -45,20 +66,10 @@ export function parsePrBodyContract(body) {
       continue;
     }
 
-    if (htmlBlock != null) {
-      if (htmlBlock === 'blank') {
-        if (line.trim() === '') htmlBlock = null;
-      } else if (htmlBlock === 'processing') {
-        if (line.includes('?>')) htmlBlock = null;
-      } else if (htmlBlock === 'cdata') {
-        if (line.includes(']]>')) htmlBlock = null;
-      } else if (htmlBlock === 'declaration') {
-        if (line.includes('>')) htmlBlock = null;
-      } else if (new RegExp(`</${htmlBlock}\\s*>`, 'i').test(line)) {
-        htmlBlock = null;
-      }
-      continue;
-    }
+    let line = stripHtmlComments(rawLine, (state) => {
+      inComment = state;
+    }, false);
+    if (line == null) continue;
 
     const rawTag = line.match(/^ {0,3}<(script|pre|style|textarea)(?:\s|>|$)/i);
     if (rawTag) {
@@ -83,7 +94,7 @@ export function parsePrBodyContract(body) {
     // such as <https://example.com> is inline content, and treating it as a
     // raw HTML block swallowed every line up to the next blank one -- hiding
     // the very markers this parser exists to find.
-    if (/^ {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t\/>]|$)/.test(line)) {
+    if (/^ {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[^>]*|[ \t]*\/?)>/.test(line)) {
       htmlBlock = line.trim() === '' ? null : 'blank';
       continue;
     }
@@ -161,9 +172,12 @@ switch (mode) {
   case '--has-self-review':
     process.exitCode = contract.hasSelfReview ? 0 : 1;
     break;
+  case '--json':
+    process.stdout.write(`${JSON.stringify(contract)}\n`);
+    break;
   default:
     process.stderr.write(
-      'usage: pr-body-contract.mjs (--author|--author-count|--has-self-review) < pr-body.md\n',
+      'usage: pr-body-contract.mjs (--author|--author-count|--has-self-review|--json) < pr-body.md\n',
     );
     process.exitCode = 2;
 }

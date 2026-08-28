@@ -634,6 +634,7 @@ fi
 #   not parse", and treat the latter as a gate error.
 AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
+if [ "$DIAGNOSTIC_SIGNAL_ONLY" != "1" ]; then
 if ! AGENT_COUNT="$(pr_body_authoring_agent_count "$PR_BODY")"; then
   die 3 "shared PR-body parser failed while counting Authoring-Agent markers; refusing to evaluate gate (b) with an unknown authoring agent"
 fi
@@ -664,6 +665,9 @@ if [ "$AGENT_COUNT" -eq 1 ]; then
     # when no record matched.
     SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
   fi
+fi
+else
+  log "diagnostic-signal-only: skipping Authoring-Agent validation; gate (b) is outside this probe"
 fi
 
 # The trusted completed-workflow continuation needs the shared answers to

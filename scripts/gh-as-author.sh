@@ -32,6 +32,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/lib/gh-token-resolver.sh"
 # shellcheck source=lib/pr-body-contract.sh
 . "$ROOT/scripts/lib/pr-body-contract.sh"
+# shellcheck source=lib/gh-command-classifier.sh
+. "$ROOT/scripts/lib/gh-command-classifier.sh"
 
 AUTHOR="${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
 
@@ -76,69 +78,7 @@ fi
 TOKEN="$GH_RESOLVED_TOKEN"
 
 is_pr_create_command() {
-  # Match on the executable BASENAME, not the literal argv token. gh-pr-guard
-  # canonicalizes path-qualified invocations (`/opt/homebrew/bin/gh`, `./gh`)
-  # and then delegates author-wrapped creates to this validator, so a wrapper
-  # that recognized only bare `gh` fell through to the generic path -- skipping
-  # body validation AND the post-create author readback -- while the guard
-  # believed this function had taken responsibility for both.
-  # Skip prefix executables the GUARD also sees through. `env FOO=x gh pr
-  # create` and `command gh pr create` both reach gh, and the guard recognises
-  # the nested create and delegates here on the promise that this validator
-  # runs -- so rejecting the prefix silently skipped body validation AND the
-  # post-create author readback. Only the shapes the guard accepts are
-  # normalised; anything else still fails closed below.
-  while :; do
-    case "${1:-}" in
-      env|*/env)
-        shift
-        # env takes options and VAR=value assignments before the command.
-        while :; do
-          case "${1:-}" in
-            -i|--ignore-environment|-0|--null) shift ;;
-            -u|--unset) shift 2 ;;
-            *=*) shift ;;
-            *) break ;;
-          esac
-        done
-        ;;
-      command) shift ;;
-      *) break ;;
-    esac
-  done
-  case "${1:-}" in
-    gh|*/gh) ;;
-    *) return 1 ;;
-  esac
-  shift
-
-  local saw_pr=0
-  local skip_value=0
-  local argument
-  for argument in "$@"; do
-    if [ "$skip_value" -eq 1 ]; then
-      skip_value=0
-      continue
-    fi
-    case "$argument" in
-      -R|--repo|--hostname)
-        skip_value=1
-        ;;
-      -R?*|--repo=*|--hostname=*) ;;
-      pr)
-        [ "$saw_pr" -eq 0 ] || return 1
-        saw_pr=1
-        ;;
-      create|new)
-        [ "$saw_pr" -eq 1 ] && return 0
-        return 1
-        ;;
-      -*) ;;
-      *) return 1 ;;
-    esac
-  done
-
-  return 1
+  gh_is_pr_create_command "$@"
 }
 
 IS_PR_CREATE=0
@@ -211,7 +151,7 @@ if [ "$IS_PR_CREATE" -eq 1 ]; then
       # reject valid creates whose title/label/head merely contains b or F.
       # Letters are gh's value-taking pr-create shorthands EXCEPT -b/-F, which
       # are body flags handled above.
-      -[talpmBHr]?*)
+      -[TtalpmBHr]?*)
         NORMALIZED_COMMAND+=("$argument")
         ;;
       -[^-]*[bF]*)

@@ -338,6 +338,17 @@ else
   fail "#814: the gate bypass lost one of its non-inheritability guarantees"
 fi
 
+# Diagnostic mode asks only whether Codex produced a current-head signal for
+# the Phase 4b barrier. Its caller supplies the author explicitly, so a legacy
+# or external-contributor PR without an Authoring-Agent marker must not abort
+# before that signal check runs.
+if grep -q 'if \[ "$DIAGNOSTIC_SIGNAL_ONLY" != "1" \]; then' "$SCRIPT" && \
+   grep -q 'diagnostic-signal-only: skipping Authoring-Agent' "$SCRIPT"; then
+  pass "#1121: diagnostic-signal-only bypasses the unrelated Authoring-Agent gate"
+else
+  fail "#1121: diagnostic-signal-only still requires an Authoring-Agent marker"
+fi
+
 # Positional rather than a text scan — the header documents gate (c) long
 # before it is evaluated, so a "starts matching at the first mention" filter
 # reports a false leak (it did, on the first version of this assertion).

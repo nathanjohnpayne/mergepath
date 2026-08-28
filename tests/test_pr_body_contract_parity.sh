@@ -23,6 +23,7 @@ TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
 trap 'rm -f "$TMP_DETECTOR"' EXIT
 
 . "$ROOT/scripts/lib/pr-body-contract.sh"
+. "$ROOT/scripts/lib/gh-command-classifier.sh"
 
 # --- 1. every consumer routes through the shared parser ----------------------
 # Named explicitly rather than globbed: a new identity consumer should have to
@@ -41,6 +42,12 @@ else
   bad "agent-review.yml does not invoke scripts/lib/pr-body-contract.mjs"
 fi
 
+if grep -q 'pr-body-contract.mjs' .github/workflows/pr-audit.yml; then
+  ok "pr-audit.yml invokes the shared parser"
+else
+  bad "pr-audit.yml does not invoke scripts/lib/pr-body-contract.mjs"
+fi
+
 # --- 2. no consumer keeps a raw first-line regex ------------------------------
 # The literal shapes that caused the divergence. A consumer may still MENTION
 # the header in prose, in a `#`/`//` comment, or in a diagnostic string; what it
@@ -52,7 +59,7 @@ while IFS= read -r hit; do
   bad "$f still extracts Authoring-Agent with a local matcher: ${hit#*:}"
 done < <(grep -nE "(grep|sed|awk|match)[^|]*Authoring-Agent:" \
            scripts/codex-review-check.sh scripts/phase-4b-review.sh \
-           .github/workflows/agent-review.yml 2>/dev/null \
+           .github/workflows/agent-review.yml .github/workflows/pr-audit.yml 2>/dev/null \
          | grep -vE "^[^:]*:[0-9]+:[[:space:]]*(#|//)" \
          | grep -viE "echo|printf|fail_gate|console\.log")
 [ "$fail" -eq 0 ] && ok "no consumer extracts Authoring-Agent with a local matcher"
@@ -65,6 +72,14 @@ if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ]; then
   ok "commented marker before a visible one resolves to the VISIBLE agent (claude), count=1"
 else
   bad "commented-then-visible body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
+fi
+
+JSON_BODY=$'Authoring-Agent: CLAUDE\n\n## Self-Review\nok'
+json_contract="$(printf '%s\n' "$JSON_BODY" | node "$ROOT/scripts/lib/pr-body-contract.mjs" --json)"
+if [ "$json_contract" = '{"author":"claude","authorCount":1,"hasSelfReview":true}' ]; then
+  ok "the parser exposes one JSON snapshot for non-shell consumers"
+else
+  bad "parser JSON snapshot mismatch: $json_contract"
 fi
 
 ONLY_COMMENTED=$'<!-- Authoring-Agent: claude -->\n\n## Self-Review\nok'
@@ -219,6 +234,41 @@ if [ "$got_agent" = "claude" ]; then
   ok "a real top-level fence still suppresses its contents"
 else
   bad "real fence: expected agent=claude, got $got_agent"
+fi
+
+# HTML-comment delimiters inside a fence are literal code. Processing comments
+# first leaves the parser stuck in comment state after the closing fence and
+# hides the real declarations that follow it.
+FENCED_COMMENT=$'```html\n<!-- literal example\n```\n\nAuthoring-Agent: claude\n\n## Self-Review\nok'
+got_count="$(pr_body_authoring_agent_count "$FENCED_COMMENT")"
+got_agent="$(pr_body_authoring_agent "$FENCED_COMMENT")"
+if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ] && pr_body_has_self_review "$FENCED_COMMENT"; then
+  ok "an HTML-comment opener inside a fence cannot hide later visible markers"
+else
+  bad "fenced-comment body: expected count=1 agent=claude and Self-Review, got count=$got_count agent=$got_agent"
+fi
+
+# A generic type-7 HTML block needs a complete open/close tag. An incomplete
+# '<foo' line is ordinary text and must not swallow the declarations below it.
+INCOMPLETE_TAG=$'<foo\nAuthoring-Agent: claude\n\n## Self-Review\nok'
+got_count="$(pr_body_authoring_agent_count "$INCOMPLETE_TAG")"
+got_agent="$(pr_body_authoring_agent "$INCOMPLETE_TAG")"
+if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ]; then
+  ok "an incomplete generic HTML tag cannot open a blank-terminated block"
+else
+  bad "incomplete-tag body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
+fi
+
+# A fence-looking line inside raw HTML is HTML content, not a Markdown fence.
+# The raw block closes at </script>, after which declarations are visible
+# without an intervening blank line.
+RAW_HTML_FENCE=$'<script>\n```\n</script>\nAuthoring-Agent: claude\n\n## Self-Review\nok'
+got_count="$(pr_body_authoring_agent_count "$RAW_HTML_FENCE")"
+got_agent="$(pr_body_authoring_agent "$RAW_HTML_FENCE")"
+if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ]; then
+  ok "a fence-looking line inside raw HTML cannot hide later visible markers"
+else
+  bad "raw-html-fence body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
 fi
 
 # --- 11. the HOOK must fail closed on parser trouble --------------------------
