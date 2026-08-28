@@ -15,17 +15,58 @@ jobs:
     if: github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
-      - name: Check for Self-Review section
+      # The parser is loaded from the DEFAULT BRANCH, never from the PR head.
+      # This job triggers on `pull_request`, so a default checkout would fetch
+      # the proposed code and run the validator out of it — letting a PR
+      # rewrite the gate that judges it, which is strictly worse than the line
+      # grep this replaces. Same posture as agent-review.yml's trusted-helper
+      # checkouts; persist-credentials off because nothing here needs an
+      # authenticated git (#548).
+      - name: Checkout trusted PR body validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # Pins the VALIDATOR's runtime, chosen on its own merits — an active LTS.
+      # The parser imports exactly one thing (`node:fs`), so this buys
+      # determinism against runner-image drift, not capability. Deliberately a
+      # literal, not node-version-file: this workflow is canonical and lands
+      # byte-identical on every consumer, most of which have no .nvmrc.
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      # Asks the markdown-aware parser ONE question, through an interface that
+      # already exists on the default branch: is there a real `## Self-Review`
+      # heading? A heading inside a fenced code block answers no, which is the
+      # bypass this fixes. No policy is read and no claim is made about
+      # `Authoring-Agent:` — widening this required check to the identity
+      # contract is a separate change, tracked in #1137.
+      #
+      # Calling `--has-self-review` rather than adding a flag to
+      # scripts/validate-pr-body.sh is deliberate. The validator is loaded from
+      # the DEFAULT BRANCH, so a flag introduced in the same PR that uses it
+      # does not exist yet when the gate runs, and the required check fails
+      # `usage:` on its own PR — the identical bootstrap trap that splitting
+      # #1134 out was meant to remove, one level deeper. Using an interface the
+      # default branch already provides has no such window.
+      #
+      # The body goes in on STDIN via env, so it is never interpolated into the
+      # shell and never appears in argv.
+      - name: Validate the PR body against the contract
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          if echo "$PR_BODY" | grep -qE '^## Self-Review'; then
+          if printf '%s\n' "$PR_BODY" | node scripts/lib/pr-body-contract.mjs --has-self-review; then
             echo "Self-Review section found."
-          else
-            echo "PR description must contain a '## Self-Review' section."
-            echo "Required items: correctness, regression risk, style/conventions, test coverage, security/dependency hygiene."
-            exit 1
+            exit 0
           fi
+          echo "PR description must contain a '## Self-Review' section." >&2
+          echo "A heading inside a fenced code block does not count." >&2
+          echo "Required items: correctness, regression risk, style/conventions, test coverage, security/dependency hygiene." >&2
+          exit 1
 
   label-gate:
     name: Label Gate
