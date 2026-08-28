@@ -713,12 +713,18 @@ paths:
   - path: scripts/resolve-pr-threads.sh
     type: canonical
     consumers: all
+    # #1104 uses scripts/lib/gh-retry-helpers.sh to retry a rate-limited read.
+    # The source is existence-guarded, so a consumer without it still fails
+    # LOUDLY and still distinguishes "could not look" from "nothing to do" --
+    # that classification is the fix; the retry is the improvement. Declared
+    # here anyway so a wave carries the helper and consumers get both.
     # #572 --resolve-verified-propagation's templated arm sources the SAME
     # render pair verify-propagation-pr.sh uses (existence-guarded — a
     # missing lib skips the thread fail-closed rather than aborting). Both
     # are consumers:all entries already; declared here so the #264 closure
     # invariant keeps the coupling explicit.
     requires:
+      - "scripts/lib/gh-retry-helpers.sh"  # retry for the #1104 read path
       - "scripts/lib/template-substitution.sh"
       - "scripts/lib/manifest-fact-helpers.sh"
   - path: scripts/request-label-removal.sh
@@ -1130,6 +1136,16 @@ paths:
   # exits 1 on the wrapper's "missing $TAG_TEST" branch — same
   # #264/#266 coupling class as the codex-p1-gate / disagreement-
   # detector / verify-propagation-pr pairings above. See #305.
+  # Regression suite for the #1104 read-failure classification. Pinned so a
+  # consumer carrying the fixed script also carries the test proving the
+  # failure stays DISTINGUISHABLE. Silence was the failure mode, and only a
+  # test asserting the exit code AND the wording can catch its return.
+  - path: tests/test_resolve_pr_threads_read_failure.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/resolve-pr-threads.sh"
+      - "scripts/lib/gh-retry-helpers.sh"
   - path: tests/test_resolve_pr_threads_rationale_tag.sh
     type: canonical
     consumers: all
@@ -1547,6 +1563,7 @@ paths:
       - "tests/test_self_approval_detector.sh"  # check_self_approval_detector (#1094)
       - "tests/test_verify_propagation_pr.sh"  # check_verify_propagation_pr
       - "tests/test_match_protected_paths.sh"  # check_verify_propagation_pr (#471)
+      - "tests/test_resolve_pr_threads_read_failure.sh"  # check_resolve_pr_threads (delegated test, #1104) — the wrapper now invokes it, so a kit sync without it reds the consumer lint
       - "tests/test_resolve_pr_threads_rationale_tag.sh"  # check_resolve_pr_threads (delegated test)
       - "tests/test_resolve_pr_threads_staleness_pagination.sh"  # check_resolve_pr_threads (delegated test, #573)
       - "tests/test_resolve_pr_threads_verified_propagation.sh"  # check_resolve_pr_threads (delegated test, #572)
