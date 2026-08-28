@@ -665,7 +665,12 @@ if [ "$AGENT_COUNT" -eq 1 ]; then
     # pipefail-safe: REVIEWERS is small (~3 lines) so SIGPIPE on the
     # `echo` producer cannot fire here, and awk always exits 0 even
     # when no record matched.
-    SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
+    MATCHING_REVIEWERS=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print }')
+    MATCHING_REVIEWER_COUNT=$(printf '%s\n' "$MATCHING_REVIEWERS" | awk 'NF { count++ } END { print count + 0 }')
+    if [ "$MATCHING_REVIEWER_COUNT" -ne 1 ]; then
+      die 3 "Authoring-Agent '$AUTHORING_AGENT' does not map to exactly one configured reviewer; refusing to evaluate gate (b)"
+    fi
+    SAME_AGENT_REVIEWER="$MATCHING_REVIEWERS"
   fi
 fi
 elif [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then

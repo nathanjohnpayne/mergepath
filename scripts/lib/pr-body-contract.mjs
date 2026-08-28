@@ -15,14 +15,13 @@ export function parsePrBodyContract(body) {
   let htmlBlock = null;
 
   for (const rawLine of body.split(/\r?\n/)) {
-    const container = stripContainerPrefix(rawLine);
     // Four spaces (or a tab) means an indented code block, and an indented
     // backtick run is CODE, not a fence delimiter. trimStart() erased that
     // distinction, so `    \u0060\u0060\u0060` opened a fence that never closed and the
     // rest of the body -- including valid top-level markers -- was discarded.
     // A fence delimiter may be indented at most three spaces.
-    const indentedCode = /^(?: {4}|\t)/.test(container);
-    const fenceLine = container.trimStart();
+    const indentedCode = /^(?: {4}|\t)/.test(rawLine);
+    const fenceLine = rawLine.trimStart();
     if (fence != null) {
       if (!indentedCode) {
         const closing = fenceLine.match(/^(`{3,}|~{3,})\s*$/);
@@ -101,12 +100,16 @@ export function parsePrBodyContract(body) {
     }
 
     if (/^(?: {4}|\t)/.test(line)) continue;
-    if (/^ {0,3}##[ \t]+Self-Review(?:[ \t]+#*)?[ \t]*$/i.test(line)) {
+    // The contract is intentionally stricter than CommonMark's permissive
+    // indentation: declarations must begin at column zero. A one-to-three
+    // space prefix can be list continuation content, where the rendered
+    // declaration is nested rather than top-level.
+    if (/^##[ \t]+Self-Review(?:[ \t]+#*)?[ \t]*$/i.test(line)) {
       hasSelfReview = true;
       continue;
     }
 
-    const authorMatch = line.match(/^ {0,3}Authoring-Agent:\s*(.*?)\s*$/i);
+    const authorMatch = line.match(/^Authoring-Agent:\s*(.*?)\s*$/i);
     if (authorMatch) authorValues.push(authorMatch[1]);
   }
 
@@ -148,16 +151,6 @@ function stripHtmlComments(line, setState, initialState) {
 
   setState(inComment);
   return discardLine ? null : result;
-}
-
-function stripContainerPrefix(line) {
-  let result = line;
-  let previous;
-  do {
-    previous = result;
-    result = result.replace(/^ {0,3}> ?/, '').replace(/^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/, '');
-  } while (result !== previous);
-  return result;
 }
 
 const mode = process.argv[2];

@@ -271,6 +271,37 @@ else
   bad "raw-html-fence body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
 fi
 
+# A delimiter in a different Markdown container is literal content, not the
+# close for a top-level fence. Flattening the blockquote prefix made this line
+# close the fence early and exposed declarations that CommonMark still renders
+# as code.
+CONTAINER_FENCE=$'```text\n> ```\nAuthoring-Agent: claude\n\n## Self-Review\nok\n```'
+got_count="$(pr_body_authoring_agent_count "$CONTAINER_FENCE")"
+if [ "$got_count" = "0" ] && ! pr_body_has_self_review "$CONTAINER_FENCE"; then
+  ok "a blockquote fence delimiter cannot close a top-level fence"
+else
+  bad "container-fence body: hidden markers escaped their top-level fence"
+fi
+
+# Contract markers are deliberately top-level. Two-space list continuations
+# and explicit blockquotes render inside their containers, so accepting either
+# would let nested prose satisfy the policy.
+LIST_CONTINUATION=$'- note\n  Authoring-Agent: claude\n  ## Self-Review\n  nested'
+got_count="$(pr_body_authoring_agent_count "$LIST_CONTINUATION")"
+if [ "$got_count" = "0" ] && ! pr_body_has_self_review "$LIST_CONTINUATION"; then
+  ok "list-continuation declarations are not top-level contract markers"
+else
+  bad "list-continuation body: nested declarations were accepted"
+fi
+
+BLOCKQUOTE_MARKERS=$'> Authoring-Agent: claude\n> ## Self-Review\n> nested'
+got_count="$(pr_body_authoring_agent_count "$BLOCKQUOTE_MARKERS")"
+if [ "$got_count" = "0" ] && ! pr_body_has_self_review "$BLOCKQUOTE_MARKERS"; then
+  ok "blockquote declarations are not top-level contract markers"
+else
+  bad "blockquote body: nested declarations were accepted"
+fi
+
 BACKTICK_INFO=$'```foo`bar\nAuthoring-Agent: claude\n\n## Self-Review\nok'
 got_count="$(pr_body_authoring_agent_count "$BACKTICK_INFO")"
 got_agent="$(pr_body_authoring_agent "$BACKTICK_INFO")"
