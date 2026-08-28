@@ -25,4 +25,4 @@ Before opening or updating a pull request, perform a structured self-review and 
 
 ## CodeRabbit Review
 
-If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`, CodeRabbit provides automated review on every PR (Phase 2.5). Read and address CodeRabbit comments after internal review passes. CodeRabbit is advisory via CI, but unresolved GitHub review conversations still block merge until cleared under REVIEW_POLICY.md.
+Phase 2.5 (CodeRabbit) runs only when `scripts/coderabbit-should-invoke.sh <PR#>` exits 0 (#1084). `coderabbit.enabled: true` is necessary but not sufficient — the `coderabbit.invoke` mode (`always` / `complex-changes` / `never`) decides whether this PR gets the wait, and the decider resolves every ambiguous configuration to invoke. Run it rather than reading `enabled` directly. Exit 1 means skip Phase 2.5 and proceed. When it exits 0, CodeRabbit provides automated review (Phase 2.5). Read and address CodeRabbit comments after internal review passes. CodeRabbit is advisory via CI, but unresolved GitHub review conversations still block merge until cleared under REVIEW_POLICY.md.

@@ -15,15 +15,16 @@ if ! ci_check_select_mode "$@"; then
   echo "usage: check_coderabbit_wait [--check | --self-test]" >&2
   exit 2
 fi
-TESTS=(
-  "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh"
-  "$REPO_ROOT/tests/test_coderabbit_wait_identity_derivation.sh"
-  "$REPO_ROOT/tests/test_coderabbit_wait_paused.sh"
-  "$REPO_ROOT/tests/test_coderabbit_wait_codex_failover.sh"
-  "$REPO_ROOT/tests/test_coderabbit_automerge_rate_limit_gate.sh"
-  "$REPO_ROOT/tests/test_coderabbit_wait_statuscontext_ratelimit.sh"
-  "$REPO_ROOT/tests/test_coderabbit_wait_ratelimit_window.sh"
-  "$REPO_ROOT/tests/test_coderabbit_wait_post_clearance.sh"
+SUITES=(
+  "coderabbit-wait status-probe tests" "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh"
+  "coderabbit-wait identity-derivation tests (#438)" "$REPO_ROOT/tests/test_coderabbit_wait_identity_derivation.sh"
+  "coderabbit-wait paused/skip tests (#490)" "$REPO_ROOT/tests/test_coderabbit_wait_paused.sh"
+  "coderabbit-wait codex rate-limit failover tests (#489)" "$REPO_ROOT/tests/test_coderabbit_wait_codex_failover.sh"
+  "auto-merge rate-limit gate tests (#489)" "$REPO_ROOT/tests/test_coderabbit_automerge_rate_limit_gate.sh"
+  "StatusContext rate-limit false-clear tests (#596)" "$REPO_ROOT/tests/test_coderabbit_wait_statuscontext_ratelimit.sh"
+  "rate-limit remaining-window sleep tests (#727)" "$REPO_ROOT/tests/test_coderabbit_wait_ratelimit_window.sh"
+  "post-clearance fast-path cap tests (#727)" "$REPO_ROOT/tests/test_coderabbit_wait_post_clearance.sh"
+  "Phase 2.5 invocation-decision tests (#1084)" "$REPO_ROOT/tests/test_coderabbit_should_invoke.sh"
 )
 
 if [ ! -x "$REPO_ROOT/scripts/coderabbit-wait.sh" ]; then
@@ -36,11 +37,14 @@ if ! bash -n "$REPO_ROOT/scripts/coderabbit-wait.sh"; then
 fi
 
 if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
-  for TEST in "${TESTS[@]}"; do
+  _i=1
+  while [ "$_i" -lt "${#SUITES[@]}" ]; do
+    TEST=${SUITES[$_i]}
     if [ ! -x "$TEST" ]; then
       echo "check_coderabbit_wait: ERROR $TEST missing or not executable" >&2
       exit 1
     fi
+    _i=$((_i + 2))
   done
 fi
 
@@ -54,20 +58,10 @@ if [ "$CI_CHECK_RUN_SELF_TEST" -eq 0 ]; then
   exit 0
 fi
 
-echo "check_coderabbit_wait: running coderabbit-wait status-probe tests"
-"${TESTS[0]}"
-echo "check_coderabbit_wait: running coderabbit-wait identity-derivation tests (#438)"
-"${TESTS[1]}"
-echo "check_coderabbit_wait: running coderabbit-wait paused/skip tests (#490)"
-"${TESTS[2]}"
-echo "check_coderabbit_wait: running coderabbit-wait codex rate-limit failover tests (#489)"
-"${TESTS[3]}"
-echo "check_coderabbit_wait: running auto-merge rate-limit gate tests (#489)"
-"${TESTS[4]}"
-echo "check_coderabbit_wait: running StatusContext rate-limit false-clear tests (#596)"
-"${TESTS[5]}"
-echo "check_coderabbit_wait: running rate-limit remaining-window sleep tests (#727)"
-"${TESTS[6]}"
-echo "check_coderabbit_wait: running post-clearance fast-path cap tests (#727)"
-"${TESTS[7]}"
+_i=0
+while [ "$_i" -lt "${#SUITES[@]}" ]; do
+  echo "check_coderabbit_wait: running ${SUITES[$_i]}"
+  "${SUITES[$((_i + 1))]}"
+  _i=$((_i + 2))
+done
 echo "check_coderabbit_wait: PASS"

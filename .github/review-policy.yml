@@ -165,7 +165,13 @@ feedback_policy:
 # to read and address substantive CodeRabbit findings before proceeding past
 # Phase 2.5.
 #
-# When enabled, the agent MUST:
+# Phase 2.5 runs only when scripts/coderabbit-should-invoke.sh <PR#> exits 0
+# (#1084). `coderabbit.enabled: true` is necessary but NOT sufficient: the
+# `invoke` mode below decides whether THIS PR gets the wait. Run the decider
+# rather than reading `enabled` directly, or a repo set to `never` or to a
+# routine `complex-changes` result still gets waited on.
+#
+# When the decider says invoke, the agent MUST:
 #   1. Wait for CodeRabbit to post before proceeding — prefer
 #      scripts/coderabbit-wait.sh, whose max_wait_seconds ceiling (1245s,
 #      the measured full-fleet max + one poll interval; #623) covers the real latency
@@ -187,6 +193,29 @@ feedback_policy:
 # CodeRabbit GitHub App. All agent instructions use conditional language
 # and will skip Phase 2.5 automatically.
 coderabbit:
+  # When PHASE 2.5 runs at all (#1084) -- whether the AGENT waits for
+  # CodeRabbit and dispositions its findings.
+  #
+  # It does NOT stop the App from reviewing. .coderabbit.yml sets
+  # auto_review.enabled: true, so the App starts on PR open, before this
+  # decision is made. Skipping saves the agent's wait; it does NOT reduce
+  # provider invocations or rate-limit pressure, and findings the App posts
+  # later are left unwatched -- still unresolved conversations that the
+  # pre-merge gate blocks on. Reducing invocations needs an App-side opt-out
+  # in .coderabbit.yml and is not what this knob does.
+  #
+  #   always           -- invoke on every PR (the pre-#1084 behaviour, and the
+  #                       default when this key is absent, so a repo that has
+  #                       not adopted the knob is unaffected)
+  #   complex-changes  -- invoke only when scripts/phase-4b-classifier.sh
+  #                       matches a Phase 4b trigger
+  #   never            -- never invoke
+  #
+  # scripts/coderabbit-should-invoke.sh is the decision procedure. It resolves
+  # every ambiguous input -- unreadable config, unknown mode, missing or
+  # failing classifier -- to INVOKE, because skipping wrongly silently drops a
+  # review round while invoking wrongly only costs time.
+  invoke: complex-changes
   enabled: true
 
   # GitHub login of the CodeRabbit bot. Comments by this login are what
@@ -461,9 +490,19 @@ codex:
   cli_login: nathanpayne-codex
 
   # Maximum number of `@codex review` rounds before escalating as runaway.
-  # The 3rd round trips the guard. Normal termination is either approval,
+  # The 11th round trips the guard (10 since #1084). Normal termination is either approval,
   # disagreement (repeat-after-rebuttal), or timeout → Phase 4b fallback.
-  max_review_rounds: 2
+  # Raised 2 -> 10 (#1084). Codex is now the primary reviewer on every PR,
+  # so the budget has to cover a real convergence run rather than two
+  # courtesy rounds: #1080 took four rounds, and rounds 2 and 3 each found a
+  # defect the previous round's fix introduced. Exhausting the budget takes the
+  # HUMAN-TIEBREAKER route, not the automated Phase 4b leg: stop the loop, post
+  # a comment summarizing both positions with links to the rounds, alert the
+  # human, do not merge (AGENTS.md, Disagreements and Tiebreaking). Automated
+  # 4b is the wrong destination for THIS trigger because that leg can post an
+  # APPROVED, which would let a review that never converged merge with nobody
+  # adjudicating it.
+  max_review_rounds: 10
 
   # Poll timeout per round, in seconds, for `codex-review-request.sh`.
   # If Codex has not posted a review within this window, treat as timeout
@@ -663,19 +702,14 @@ codex:
 # is tracked as a narrow-start follow-up, consistent with how those two
 # gates themselves shipped disabled-by-default and were enabled here first.
 #
-# `enabled` governs AGENT behavior only (whether accounting tracks GHAS
-# findings), same semantics as `codex.enabled` / `coderabbit.enabled` — see
-# the "Note on `enabled` flags" in REVIEW_POLICY.md. It is NOT an opt-out
-# that suppresses GHAS comments: code scanning itself is controlled at the
-# repo settings level, independent of this file, so GitHub keeps posting
-# `github-advanced-security[bot]` comments regardless of what this flag
-# says. review-feedback-accounting.sh does not read it for exactly that
-# reason — deliberately, matching precedent: it has never read
-# `codex.enabled` / `coderabbit.enabled` either, because gating tracking on
-# a flag the agent didn't consult when the finding was posted would
-# recreate this whole change's own bug one layer down (a real, still-
-# arriving comment goes untracked because the config disagrees with what
-# GitHub is actually showing). To fully disable GHAS, disable code
+# `enabled` is informational for agent-facing configuration; it does NOT gate
+# feedback accounting and it does NOT suppress GHAS comments. Code scanning is
+# controlled at the repo settings level, independent of this file, so GitHub
+# can keep posting `github-advanced-security[bot]` comments regardless of this
+# value. review-feedback-accounting.sh therefore always tracks those findings:
+# gating on a flag the agent did not consult when a comment arrived would let a
+# real finding disappear from the completeness check. See the "Note on
+# `enabled` flags" in REVIEW_POLICY.md. To fully disable GHAS, disable code
 # scanning in the repo's Security settings — not this flag.
 code_scanning:
   enabled: true
@@ -717,8 +751,8 @@ dependabot:
 # Phase 4b proactive triggers (#158)
 # ---------------------------------------------------------------------------
 # Controls when Phase 4b (manual CLI fallback) fires as a FIRST-CLASS gate,
-# in addition to its existing fallback role on 4a unavailability/timeout/
-# escalation. Empirical evidence in #158: 4b's bug-catch rate is roughly
+# in addition to its existing fallback role on 4a unavailability/timeout.
+# Empirical evidence in #158: 4b's bug-catch rate is roughly
 # proportional to interaction-complexity of the change — state machines,
 # concurrency, transactional code, and prompt design consistently surfaced
 # real bugs that 4a cleared past. Pure-data and pure-helper PRs got nothing
@@ -726,7 +760,8 @@ dependabot:
 #
 # Options:
 #   fallback-only — current behavior. 4b only on 4a unavailability /
-#                   escalation / timeout. Use when 4b's latency cost
+#                   timeout. Disagreement/runaway stays on the human-
+#                   tiebreaker path. Use when 4b's latency cost
 #                   outweighs its catch-rate value (low-risk repo, mostly
 #                   data-plumbing PRs, etc.).
 #   complex-changes — run scripts/phase-4b-classifier.sh AFTER 4a clears

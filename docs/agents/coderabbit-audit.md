@@ -139,6 +139,7 @@ The pairing is required because the two keys govern *different* systems, and nei
 |---|---|
 | `reviews.auto_review.enabled: false` in `.coderabbit.yml` | the App's **automatic** reviews (it still answers explicit `@coderabbitai review` commands) |
 | `coderabbit.enabled: false` in `.github/review-policy.yml` | **agent wait behavior only** — Phase 2.5. The App is unaffected; see REVIEW_POLICY.md § the `coderabbit` block |
+| `coderabbit.invoke: never` (or `complex-changes` on a routine PR) in `.github/review-policy.yml` | **agent wait behavior on THAT PR only** (#1084). Same App-unaffected caveat as the row above, and the same consequence: findings still land as unresolved threads in front of the conversation-resolution gate. `scripts/coderabbit-should-invoke.sh` is the decision procedure |
 | uninstalling the CodeRabbit GitHub App | CodeRabbit **completely** |
 
 That table is also why the pre-#911 remediation text ("delete `.coderabbit.yml`") was wrong on its own terms: `auto_review.enabled` defaults to `true` for an ABSENT config, so deleting the file leaves the App auto-reviewing while `coderabbit.enabled: false` stops agents waiting for it — the exact worst state #911 names, where an advisory bot nobody is watching still parks unresolved threads in front of the conversation-resolution gate.
