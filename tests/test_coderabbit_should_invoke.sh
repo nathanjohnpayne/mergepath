@@ -17,6 +17,24 @@ PASS=0; FAIL=0
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/cri-test.XXXXXX")
 trap 'rm -rf "$WORKDIR"' EXIT
 
+# Most cases exercise the local field reader with intentionally valid YAML;
+# only the r14 block below exercises real parser rejection. On a supported
+# self-test host without mikefarah/yq, give those non-parser-specific cases a
+# success-only validator shim so ordinary `never` / `enabled: false` assertions
+# do not turn into dozens of false failures. The r14 parser cases remain
+# explicitly skipped without real yq, while the r16 cases override this seam to
+# verify the production no-parser fail-toward-invoking behavior.
+unset MERGEPATH_YQ_BIN
+REAL_YQ_AVAILABLE=false
+if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -q mikefarah; then
+  REAL_YQ_AVAILABLE=true
+else
+  TEST_YQ="$WORKDIR/yq-valid-fixture-shim"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$TEST_YQ"
+  chmod +x "$TEST_YQ"
+  export MERGEPATH_YQ_BIN="$TEST_YQ"
+fi
+
 # Portable watchdog. `timeout` is GNU coreutils and is NOT on a stock macOS
 # box, where it exits 127 and would fail this suite for the wrong reason
 # (#1084 r3). This is a PROPAGATED self-test, so it has to run wherever a
@@ -257,6 +275,9 @@ printf 'coderabbit:\n  enabled: true\n  invoke: never\n' >"$_d/.github/review-po
 printf 'coderabbit:\n  enabled: true\n!!str coderabbit:\n  invoke: never\n' >"$_d/.github/review-policy.yml"
 ( cd "$_d" && ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
 [ $? = 0 ] && pass "a tagged duplicate block header is ambiguous" || fail "tagged duplicate block header bypassed ambiguity detection"
+printf 'key: &cr_key coderabbit\ncoderabbit:\n  enabled: true\n*cr_key:\n  invoke: never\n' >"$_d/.github/review-policy.yml"
+( cd "$_d" && ./scripts/coderabbit-should-invoke.sh 99 >/dev/null 2>&1 )
+[ $? = 0 ] && pass "an aliased duplicate block header is ambiguous" || fail "aliased duplicate block header bypassed ambiguity detection"
 
 echo "--- #1084 r7: ambiguity is a property of the FILE, not of the field read first ---"
 # Honouring `enabled: false` before reading `invoke` let one well-formed field
@@ -277,6 +298,9 @@ case_is 'quoted duplicate key is ambiguous'    "$ON"$'\n'"  invoke: never"$'\n''
 # key. The local reader cannot safely normalize the complete tag grammar, so a
 # tagged key must be ambiguous rather than bypassing duplicate detection.
 case_is 'tagged duplicate key is ambiguous'    "$ON"$'\n'"  invoke: never"$'\n''  !!str invoke: always' 0 0
+case_is 'aliased duplicate key is ambiguous'   "$ON"$'\n'"  key: &invoke_key invoke"$'\n'"  invoke: never"$'\n'"  *invoke_key: always" 0 0
+case_is 'explicit duplicate key is ambiguous'  "$ON"$'\n'"  invoke: never"$'\n'"  ? invoke"$'\n'"  : always" 0 0
+case_is 'anchored duplicate key is ambiguous'  "$ON"$'\n'"  invoke: never"$'\n'"  &invoke_key invoke: always" 0 0
 # YAML needs whitespace before a `#` for it to open a comment.
 case_is 'no space before # is malformed'       "$ON"$'\n''  invoke: "never"#junk'                    0 0
 case_is 'space before # is a real comment'     "$ON"$'\n''  invoke: "never" # ok'                    0 1
@@ -321,7 +345,7 @@ echo "--- #1084 r14: document validity comes from a real parser ---"
 # suite too. Without this gate a host lacking yq fails four cases for a reason
 # that is not a defect -- and this file is canonical to all nine consumers,
 # so that would red every consumer that has not bootstrapped yq (#1084 r15).
-if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -q mikefarah; then
+if [ "$REAL_YQ_AVAILABLE" = true ]; then
 # <policy> <expect_rc> <expect_reason_substr> <name> — runs with yq available.
 # A document that go-yaml REJECTS must invoke even though the `coderabbit`
 # block itself is intact: enumeration of malformed shapes does not terminate,

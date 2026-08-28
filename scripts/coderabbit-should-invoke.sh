@@ -166,14 +166,16 @@ coderabbit_field() {  # <field>
       }
       return 0
     }
-    function tagged_key(line,   s) {
+    function nonliteral_key(line,   s, c) {
       s = line
       sub(/^[[:space:]]+/, "", s)
-      # YAML tags such as `!!str invoke:` change the spelling visible to this
-      # local reader without changing the semantic string key. Until #1090
-      # provides parser-aware duplicate detection, any tagged key could hide a
+      c = substr(s, 1, 1)
+      # YAML properties and indirection can change the spelling visible to this
+      # local reader without changing the semantic string key: tags (`!`),
+      # aliases (`*`), explicit keys (`?`), and anchors (`&`). Until #1090
+      # provides parser-aware duplicate detection, any such key could hide a
       # duplicate `coderabbit`, `enabled`, or `invoke` entry.
-      return substr(s, 1, 1) == "!"
+      return c == "!" || c == "*" || c == "?" || c == "&"
     }
 
     # YAML forbids TAB characters in indentation, and go-yaml (the parser this
@@ -202,7 +204,7 @@ coderabbit_field() {  # <field>
       # duplicate guard and suppress Phase 2.5. Any escaped top-level key could
       # likewise be a second `coderabbit` block. Fail toward invoking until the
       # parser-aware duplicate migration in #1090 replaces this reader.
-      if (tagged_key($0)) { taggedkey++; in_block = 0; next }
+      if (nonliteral_key($0)) { nonliteralkey++; in_block = 0; next }
       if (escaped_double_quoted_key($0)) { escapedkey++; in_block = 0; next }
       hdr = keyname($0)
       in_block = 0
@@ -260,7 +262,7 @@ coderabbit_field() {  # <field>
       sub(/^[[:space:]]+/, "", probe)
       sub(/[[:space:]]+#.*$/, "", probe)
       if (index(probe, ":") == 0) { nokey++; next }
-      if (tagged_key($0)) { taggedkey++; next }
+      if (nonliteral_key($0)) { nonliteralkey++; next }
       if (escaped_double_quoted_key($0)) { escapedkey++; next }
       haskey++
       # Remember whether THIS direct child is a mapping key (empty value) or a
@@ -275,7 +277,7 @@ coderabbit_field() {  # <field>
     }
     END {
       if (tabindent > 0) { print "<<ambiguous:tab in indentation>>"; exit }
-      if (taggedkey > 0) { print "<<ambiguous:tagged YAML key>>"; exit }
+      if (nonliteralkey > 0) { print "<<ambiguous:nonliteral YAML key>>"; exit }
       if (escapedkey > 0) { print "<<ambiguous:escaped double-quoted key>>"; exit }
       # Colonless children split by what the document actually IS. Mixed with
       # real entries it is a parse error; on their own they are a multi-line
