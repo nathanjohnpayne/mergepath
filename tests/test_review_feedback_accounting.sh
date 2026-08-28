@@ -2002,13 +2002,24 @@ run_gate
 assert_eq 0 "$RUN_RC" "post-deletion acknowledgement reconciles the archived GHAS finding"
 assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "acknowledged archived GHAS finding clears the gate"
 
-# A GHAS comment body with NO parseable alert-number link cannot be
-# resolved to a tier at archive time (render-feedback-archive.sh has no
-# network access -- the workflow could not populate GHAS_TIER either), so
-# no record is emitted. This matches -- not regresses -- the established
-# "markerless edits have nothing to preserve" behavior every other
-# reviewer already gets: an unclassifiable body was never archived before
-# #1113 and still is not, whether or not it happens to name GHAS.
+# render-feedback-archive.sh itself stays a pure function of its
+# arguments: with NO GHAS_TIER passed at all (the pre-#1113 call shape,
+# or any future caller that genuinely has nothing to report), a body
+# with no other classifiable marker still emits no record -- the
+# "markerless edits have nothing to preserve" contract every other
+# reviewer already gets.
+#
+# codex-p1-gate.yml's archive job itself, however, does NOT leave
+# GHAS_TIER empty for this exact body+login combination (Codex review,
+# PR #1124): live accounting's ghas_finding_tier ALSO falls back to p2
+# when a GHAS-authored comment has no parseable alert link -- unlike a
+# Codex/CodeRabbit body with no marker at all, which was never a
+# "finding" even while live, a linkless GHAS comment IS still tracked as
+# p2 today. The workflow resolves this by checking source_login == the
+# well-known default GHAS bot login when alert_number extraction fails,
+# and passes p2 explicitly -- asserted below by exercising the render
+# script exactly as that workflow branch now calls it, not as a bare
+# no-argument invocation.
 reset_fixtures
 PREVIOUS_GHAS_NO_LINK="$TMP/previous-ghas-no-link.txt"
 cat >"$PREVIOUS_GHAS_NO_LINK" <<'EOF'
@@ -2018,7 +2029,21 @@ No alert link in this body at all.
 EOF
 GHAS_ARCHIVE_NO_LINK=$("$RENDER_ARCHIVE" inline 8610 'github-advanced-security[bot]' \
   '2026-08-26T22:10:00Z' "$PREVIOUS_GHAS_NO_LINK")
-assert_eq "" "$GHAS_ARCHIVE_NO_LINK" "an unresolvable GHAS body with no GHAS_TIER argument emits no archive record"
+assert_eq "" "$GHAS_ARCHIVE_NO_LINK" "render-feedback-archive.sh with no GHAS_TIER argument emits no archive record (pure-function contract)"
+
+GHAS_ARCHIVE_NO_LINK_WORKFLOW_SHAPE=$("$RENDER_ARCHIVE" inline 8611 'github-advanced-security[bot]' \
+  '2026-08-26T22:11:00Z' "$PREVIOUS_GHAS_NO_LINK" p2)
+jq -n --arg archive "$GHAS_ARCHIVE_NO_LINK_WORKFLOW_SHAPE" '[{
+  "id": 8612,
+  "created_at": "2026-08-26T22:11:01Z",
+  "updated_at": "2026-08-26T22:11:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "codex-p1-gate.yml's GHAS-login p2 fallback preserves a linkless GHAS finding across archival (#1124)"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the workflow-shaped archive record carries the p2 fallback tier"
+assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "the workflow-shaped archive record stays bound to the GHAS bot login"
 
 # Two comments linking the SAME alert number must fetch it only ONCE
 # (scripts/lib/ghas-alert-severity.sh's GHAS_SEVERITY_CACHE) -- without
