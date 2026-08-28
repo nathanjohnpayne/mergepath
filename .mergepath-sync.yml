@@ -1415,6 +1415,8 @@ paths:
       # runs it from a DEFAULT-BRANCH checkout. A consumer receiving this
       # workflow without the entrypoint (or the contract libs it sources)
       # fails the required check on every PR with exit 127 (#1132).
+      - "scripts/validate-pr-body.sh"
+      - "scripts/lib/pr-body-contract.sh"
       - "scripts/lib/pr-body-contract.mjs"
   - path: .github/workflows/dependabot-auto-merge.yml
     type: canonical

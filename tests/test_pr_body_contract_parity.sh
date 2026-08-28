@@ -440,27 +440,46 @@ if printf '%s\n' "$prp_live" | grep -qE "grep -q[A-Za-z]*[[:space:]]+.\^## Self-
 else
   ok "the Self-Review gate no longer relies on a line grep"
 fi
-if printf '%s\n' "$prp_live" | grep -qF 'pr-body-contract.mjs'; then
-  ok "the Self-Review gate routes through the markdown-aware parser"
+if printf '%s\n' "$prp_live" | grep -qF 'scripts/validate-pr-body.sh'; then
+  ok "the Self-Review gate routes through the shared validate-pr-body entrypoint"
 else
-  bad "$PRP does not call the parser; the gate cannot see fenced headings"
+  bad "$PRP does not call scripts/validate-pr-body.sh; the contract would have two implementations"
 fi
 # Scope guard: this gate checks the HEADING only. Enforcing the identity
 # contract here is a POLICY change (#1137) and must be a deliberate edit to
 # this assertion, not a silent widening.
-if printf '%s\n' "$prp_live" | grep -qF -- '--has-self-review'; then
+if printf '%s\n' "$prp_live" | grep -qF -- '--self-review-only'; then
   ok "the gate asks only the heading question; the identity contract is not bundled in"
 else
-  bad "$PRP no longer passes --has-self-review; widening this required check is a policy change"
+  bad "$PRP no longer passes --self-review-only; widening this required check is a policy change"
 fi
-# The gate must call an interface the DEFAULT BRANCH already provides: the
-# validator is loaded from there, so a flag added in the same PR that uses it
-# does not exist when the gate runs and the required check fails `usage:` on
-# its own PR.
-if printf '%s\n' "$prp_live" | grep -qF -- '--self-review-only'; then
-  bad "$PRP calls --self-review-only, a flag added in this same change; the gate loads the validator from the default branch and will fail usage: on its own PR"
+
+# BOOTSTRAP GUARD. The gate loads the validator from the DEFAULT BRANCH, so
+# every flag it passes must already be understood there -- a flag introduced
+# alongside its caller does not exist when the gate runs and the required check
+# dies on `usage:` (#1132, hit twice: once as a missing script, once as a
+# missing interface). Asserted behaviourally: every flag the workflow passes to
+# the entrypoint must be accepted by the entrypoint, not answered with usage.
+gate_flags="$(printf '%s\n' "$prp_live" \
+  | grep -oE 'scripts/validate-pr-body\.sh( --[a-z-]+)+' \
+  | grep -oE ' --[a-z-]+' | tr -d ' ' | sort -u)"
+if [ -z "$gate_flags" ]; then
+  bad "could not extract the flags $PRP passes to validate-pr-body.sh; the bootstrap guard is inert"
 else
-  ok "the gate uses no flag introduced alongside it (no bootstrap window)"
+  while IFS= read -r flag; do
+    [ -n "$flag" ] || continue
+    # Output is CAPTURED before matching, never piped straight into grep.
+    # The entrypoint exits 2 on an unknown flag, and under `set -o pipefail`
+    # that exit status poisons the pipeline even when grep matches -- so the
+    # piped form reported "no usage message" for precisely the flags this guard
+    # exists to catch, inverting it silently.
+    _probe="$(printf '' | bash "$ROOT/scripts/validate-pr-body.sh" "$flag" 2>&1 || true)"
+    if printf '%s\n' "$_probe" | grep -q '^usage:'; then
+      bad "$PRP passes '$flag', which scripts/validate-pr-body.sh answers with usage: — it must land on the default branch BEFORE the gate uses it"
+    else
+      ok "the gate flag '$flag' is understood by the entrypoint (no bootstrap window)"
+    fi
+  done <<< "$gate_flags"
 fi
 if printf '%s\n' "$prp_live" | grep -qF 'uses: actions/checkout@'; then
   if printf '%s\n' "$prp_live" | grep -qF 'ref: ${{ github.event.repository.default_branch }}'; then
@@ -500,10 +519,10 @@ pr_body_has_self_review "$NO_SR" >/dev/null 2>&1 \
 # Authoring-Agent line at all has to pass, or this PR is silently carrying a
 # policy change it does not claim to.
 NO_AGENT=$'## Self-Review\n\n- no Authoring-Agent line anywhere.\n'
-if printf '%s\n' "$NO_AGENT" | node "$ROOT/scripts/lib/pr-body-contract.mjs" --has-self-review >/dev/null 2>&1; then
-  ok "the gate's question accepts a body with no Authoring-Agent (scope is the heading alone)"
+if printf '%s\n' "$NO_AGENT" | bash "$ROOT/scripts/validate-pr-body.sh" --self-review-only >/dev/null 2>&1; then
+  ok "the gate's mode accepts a body with no Authoring-Agent (scope is the heading alone)"
 else
-  bad "the gate's question rejected a body with no Authoring-Agent; it has silently widened to the identity contract"
+  bad "the gate's mode rejected a body with no Authoring-Agent; it has silently widened to the identity contract"
 fi
 
 # --- 15. the --self-review-only entrypoint mode ------------------------------
