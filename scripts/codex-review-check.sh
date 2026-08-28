@@ -185,6 +185,20 @@ fi
 # shellcheck source=lib/gh-api-array.sh
 . "$__CODEX_CHECK_DIR/lib/gh-api-array.sh"
 
+# Shared PR-body identity parser (#1121). Every consumer that reads
+# `Authoring-Agent:` MUST go through this, because the answer decides which
+# reviewer identity may clear gate (b) and whether the same-agent Codex-reaction
+# fallback is even eligible. A local regex here and a stricter parser in the
+# guard can disagree on the same body -- a marker inside an HTML comment is not
+# a declaration, and only a markdown-aware parser can tell. Hard-required for
+# the same reason as the two helpers above: this is a fail-closed gate input.
+if [ ! -r "$__CODEX_CHECK_DIR/lib/pr-body-contract.sh" ]; then
+  echo "ERROR: pr-body-contract helper missing: $__CODEX_CHECK_DIR/lib/pr-body-contract.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/pr-body-contract.sh
+. "$__CODEX_CHECK_DIR/lib/pr-body-contract.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --diagnostic-signal-only (#814) and --approval-readiness-only (#1062) are
@@ -509,6 +523,8 @@ if [ -z "$REVIEWERS" ]; then
   echo "ERROR: no available_reviewers found in $CONFIG" >&2
   exit 3
 fi
+AUTHOR_IDENTITY=$(grep -m1 '^author_identity:' "$CONFIG" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
+AUTHOR_IDENTITY="${AUTHOR_IDENTITY:-nathanjohnpayne}"
 
 # --- logging helpers --------------------------------------------------------
 
@@ -605,20 +621,62 @@ fi
 #   (extract from canonical). Works for every case-permutation of
 #   the header without per-letter character classing.
 #   (nathanpayne-codex Phase 4b r4 on PR #283.)
+#   SUPERSEDED by the shared parser (#1121). The pipeline described above was
+#   correct about case but still read the first RAW line, so a marker inside an
+#   HTML comment counted as a declaration here while the guard ignored it. The
+#   two then disagreed on the same body, and this side decides gate (b). The
+#   shared parser is markdown-aware and returns only a visible marker; it also
+#   returns empty when the body carries anything other than exactly one, which
+#   leaves SAME_AGENT_REVIEWER empty and keeps the same-agent exclusion armed.
+#   FAIL CLOSED on parser trouble. An empty SAME_AGENT_REVIEWER does not mean
+#   "no same-agent risk" -- downstream it DISABLES the authoring-agent
+#   exclusion, so a parser that cannot run (missing node, absent or broken
+#   .mjs) would silently permit exactly the same-agent APPROVED this gate
+#   exists to refuse. Distinguish "parsed, and there is no marker" from "could
+#   not parse", and treat the latter as a gate error.
 AUTHORING_AGENT=""
 SAME_AGENT_REVIEWER=""
-if grep -qiE '^Authoring-Agent:' <<<"$PR_BODY"; then
-  AUTHORING_AGENT=$(grep -i -m1 -E '^Authoring-Agent:' <<<"$PR_BODY" \
-    | tr '[:upper:]' '[:lower:]' \
-    | sed -E 's/^authoring-agent:[[:space:]]*([a-z0-9_-]+).*/\1/')
+if [ "$DIAGNOSTIC_SIGNAL_ONLY" != "1" ] && [ "$PR_AUTHOR" = "$AUTHOR_IDENTITY" ]; then
+if ! AGENT_COUNT="$(pr_body_authoring_agent_count "$PR_BODY")"; then
+  die 3 "shared PR-body parser failed while counting Authoring-Agent markers; refusing to evaluate gate (b) with an unknown authoring agent"
+fi
+case "$AGENT_COUNT" in
+  ''|*[!0-9]*)
+    die 3 "shared PR-body parser returned a non-numeric Authoring-Agent count (${AGENT_COUNT:-empty}); refusing to evaluate gate (b)"
+    ;;
+esac
+if [ "$AGENT_COUNT" -ne 1 ]; then
+  # NOT a fall-through: an ambiguous or absent marker leaves
+  # SAME_AGENT_REVIEWER empty, which the gate-(b) and Phase-4b filters read as
+  # "any registered reviewer is acceptable". That is precisely the fail-open
+  # this gate exists to prevent, so an unknown authoring agent must abort.
+  die 3 "PR body declares $AGENT_COUNT visible Authoring-Agent markers, expected exactly 1; refusing to evaluate gate (b) with an ambiguous authoring agent (an empty same-agent reviewer is read downstream as 'accept any reviewer')"
+fi
+if [ "$AGENT_COUNT" -eq 1 ]; then
+  if ! AUTHORING_AGENT="$(pr_body_authoring_agent "$PR_BODY")"; then
+    die 3 "shared PR-body parser failed while reading the Authoring-Agent value; refusing to evaluate gate (b)"
+  fi
+  if [ -z "$AUTHORING_AGENT" ]; then
+    die 3 "shared PR-body parser reported exactly one Authoring-Agent marker but returned an empty value; refusing to evaluate gate (b)"
+  fi
   if [ -n "$AUTHORING_AGENT" ]; then
     # Match against available_reviewers via suffix (e.g., "claude"
     # matches "nathanpayne-claude"). Empty if no match — also
     # pipefail-safe: REVIEWERS is small (~3 lines) so SIGPIPE on the
     # `echo` producer cannot fire here, and awk always exits 0 even
     # when no record matched.
-    SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
+    MATCHING_REVIEWERS=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print }')
+    MATCHING_REVIEWER_COUNT=$(printf '%s\n' "$MATCHING_REVIEWERS" | awk 'NF { count++ } END { print count + 0 }')
+    if [ "$MATCHING_REVIEWER_COUNT" -ne 1 ]; then
+      die 3 "Authoring-Agent '$AUTHORING_AGENT' does not map to exactly one configured reviewer; refusing to evaluate gate (b)"
+    fi
+    SAME_AGENT_REVIEWER="$MATCHING_REVIEWERS"
   fi
+fi
+elif [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
+  log "diagnostic-signal-only: skipping Authoring-Agent validation; gate (b) is outside this probe"
+else
+  log "non-shared-author PR: skipping Authoring-Agent validation (PR author $PR_AUTHOR; configured author $AUTHOR_IDENTITY)"
 fi
 
 # The trusted completed-workflow continuation needs the shared answers to
