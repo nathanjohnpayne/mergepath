@@ -475,11 +475,44 @@ fi
 # for the flag it never saw. Folding `\`-continuations into one logical line
 # makes the extractor see the whole invocation.
 prp_joined="$(printf '%s\n' "$prp_live" | sed -e ':a' -e '/\\$/{N;s/\\\n//;ta' -e '}')"
-gate_flags="$(printf '%s\n' "$prp_joined" \
-  | sed -n 's|.*scripts/validate-pr-body\.sh||p' \
-  | tr ' \t' '\n\n' \
-  | grep -E '^-' | sort -u)"
-if [ -z "$gate_flags" ]; then
+gate_argstr="$(printf '%s\n' "$prp_joined" | sed -n 's|.*scripts/validate-pr-body\.sh||p' | head -1)"
+
+# FAIL CLOSED on anything this extractor cannot account for.
+#
+# Three separate review rounds found three different ways to hide a flag from a
+# textual splitter -- `--flag=value` truncation, a `\`-continuation line, and a
+# quoted `"--flag"` that a leading-`-` filter drops. Each time the guard probed
+# a STRICT SUBSET of the real invocation and passed while the required job died
+# on `usage:` for the token it never saw. Patching the third spelling would
+# leave the fourth.
+#
+# So the contract is inverted: tokenise with the shell's own quoting rules, and
+# if ANY token is not a probeable flag, REFUSE rather than probe what is left.
+# A parsing gap now becomes a loud failure instead of a silent pass, which is
+# the property that ends the sequence.
+gate_flags=""
+gate_unprobeable=""
+if [ -n "${gate_argstr//[[:space:]]/}" ]; then
+  # xargs applies POSIX shell quoting, so "--x" and '--x' both yield --x. It
+  # exits nonzero on unbalanced quotes -- treated as unprobeable, not as empty.
+  if gate_tokens="$(printf '%s\n' "$gate_argstr" | xargs -n1 2>/dev/null)"; then
+    while IFS= read -r _tok; do
+      [ -n "$_tok" ] || continue
+      case "$_tok" in
+        -*) gate_flags="$gate_flags$_tok
+" ;;
+        *)  gate_unprobeable="$gate_unprobeable $_tok" ;;
+      esac
+    done <<< "$gate_tokens"
+  else
+    gate_unprobeable=" <unparseable: unbalanced quoting in the invocation>"
+  fi
+  gate_flags="$(printf '%s' "$gate_flags" | sed '/^$/d' | sort -u)"
+fi
+
+if [ -n "$gate_unprobeable" ]; then
+  bad "$PRP passes token(s) this guard cannot probe:$gate_unprobeable — the bootstrap guard would only validate a subset of the real invocation"
+elif [ -z "$gate_flags" ]; then
   bad "could not extract the flags $PRP passes to validate-pr-body.sh; the bootstrap guard is inert"
 else
   # Probe the DEFAULT-BRANCH copy, not this checkout's. The gate loads the
