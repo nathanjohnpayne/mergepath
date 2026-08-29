@@ -319,6 +319,111 @@ fi
 
 # ---------------------------------------------------------------------------
 echo
+# ---------------------------------------------------------------------------
+# The TypeScript preset must be FILE-SCOPED in the template.
+#
+# `tseslint.configs.recommended` is an array of flat-config objects with no
+# `files` key, and a flat-config object without `files` applies to EVERY file
+# ESLint visits. Spread unscoped, it reached the `**/*.cjs` block -- the
+# template told ESLint a file was CommonJS and then failed it for being
+# CommonJS via @typescript-eslint/no-require-imports
+# (nathanjohnpayne/nathanpaynedotcom#856).
+#
+# Reproduced on a live consumer before the fix: 2 errors on a .cjs probe,
+# clean after, with TS rules still firing on a .ts probe -- so the scoping did
+# not silently disable TypeScript linting.
+# ---------------------------------------------------------------------------
+# Both module-system variants carry the `frameworks contains typescript` arm,
+# so both need the scoping. overridebroadway is the CJS + TS consumer; it had
+# the identical .cjs failure and was verified fixed on its own toolchain.
+for tpl_rel in examples/eslint.config.js examples/eslint.config.cjs.js; do
+  TPL="$ROOT/$tpl_rel"
+  if [ ! -f "$TPL" ]; then
+    fail "$tpl_rel missing; the TS-preset scoping assertions cannot run"
+    continue
+  fi
+  tpl_live="$(grep -vE '^[[:space:]]*//' "$TPL")"
+
+  if printf '%s\n' "$tpl_live" | grep -qE '^[[:space:]]*\.\.\.tseslint\.configs\.recommended,[[:space:]]*$'; then
+    fail "$tpl_rel spreads tseslint.configs.recommended UNSCOPED; it will apply TS rules to .cjs and every other file type"
+  else
+    pass "$tpl_rel does not spread the TypeScript preset unscoped"
+  fi
+
+  if printf '%s\n' "$tpl_live" | grep -qF 'tseslint.configs.recommended.map'; then
+    pass "$tpl_rel maps the TypeScript preset onto explicit file globs"
+  else
+    fail "$tpl_rel no longer scopes tseslint.configs.recommended to TS globs"
+  fi
+
+  # A mapping target is not self-validating: `.map` accepts ANY glob, so a
+  # target that dropped .mts/.cts would satisfy the check above while silently
+  # disabling TypeScript rules for those files. Assert each extension.
+  preset_glob="$(printf '%s\n' "$tpl_live" \
+    | grep -A3 -F 'tseslint.configs.recommended.map' \
+    | sed -n 's/.*files:[[:space:]]*\["\([^"]*\)"\].*/\1/p' \
+    | head -1)"
+  if [ -z "$preset_glob" ]; then
+    fail "$tpl_rel maps the TypeScript preset but no files: glob could be extracted from the mapping body"
+  else
+    missing_ext=""
+    for ext in ts tsx mts cts; do
+      case ",$preset_glob," in
+        *"{$ext,"*|*",$ext,"*|*",$ext}"*|*"{$ext}"*) ;;
+        *) missing_ext="$missing_ext $ext" ;;
+      esac
+    done
+    if [ -n "$missing_ext" ]; then
+      fail "$tpl_rel scopes the TypeScript preset to '$preset_glob', omitting:$missing_ext"
+    else
+      pass "$tpl_rel scopes the TypeScript preset to every supported TypeScript extension"
+    fi
+    # Presence assertions alone cannot protect the PR objective: a glob that
+    # ADDED .cjs -- `{ts,tsx,mts,cts,astro,cjs}` -- satisfies every check above
+    # while reintroducing exactly the #856 failure, TS rules on the files the
+    # template deliberately declares CommonJS. Assert the exclusion too.
+    case "$preset_glob" in
+      *cjs*)
+        fail "$tpl_rel scopes the TypeScript preset to .cjs ('$preset_glob'), re-enabling @typescript-eslint/no-require-imports on the CommonJS files the .cjs block declares"
+        ;;
+      *)
+        pass "$tpl_rel keeps .cjs OUT of the TypeScript preset scope"
+        ;;
+    esac
+  fi
+
+  # The coupling that actually breaks consumers. The preset entry is what
+  # REGISTERS the @typescript-eslint plugin. Any file type the template applies
+  # `@typescript-eslint/*` RULES to must also be inside the preset scope, or
+  # ESLint refuses to load the config at all for that file type -- not a missed
+  # lint, a hard failure (the #327 rule-without-plugin break).
+  #
+  # nathanpaynedotcom is `frameworks: [astro, typescript]`, and this fired
+  # there: scoping the preset to TS extensions alone left the
+  # `**/*.{ts,tsx,astro}` rule block referencing plugin rule IDs with no plugin
+  # in the matching configuration.
+  rule_globs="$(printf '%s\n' "$tpl_live" \
+    | grep -B4 -F '"@typescript-eslint/' \
+    | sed -n 's/.*files:[[:space:]]*\["\([^"]*\)"\].*/\1/p')"
+  uncovered=""
+  for g in $rule_globs; do
+    case "$g" in *astro*) ;; *) continue ;; esac
+    case "$preset_glob" in *astro*) ;; *) uncovered="yes" ;; esac
+  done
+  if [ -n "$uncovered" ]; then
+    fail "$tpl_rel applies @typescript-eslint rules to .astro but the preset that registers the plugin is scoped to '$preset_glob'; ESLint will refuse to load for .astro consumers"
+  else
+    pass "$tpl_rel keeps every @typescript-eslint rule target inside the plugin-registering preset scope"
+  fi
+
+  # The .cjs block only means something if the TS preset cannot override it.
+  if printf '%s\n' "$tpl_live" | grep -qF '"**/*.cjs"'; then
+    pass "$tpl_rel still declares a CommonJS block for .cjs"
+  else
+    fail "$tpl_rel no longer declares the .cjs CommonJS block the scoping protects"
+  fi
+done
+
 echo "test_eslint_policy_check: $PASS passed, $FAIL failed"
 if [ "$FAIL" -ne 0 ]; then
   exit 1

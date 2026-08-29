@@ -176,10 +176,31 @@ module.exports = [
   },
 
 // >>> if frameworks contains typescript
-  // TypeScript recommended ruleset — applied to .ts / .tsx via the
-  // typescript-eslint plugin's flat-config preset. Includes the
-  // parser, the recommended rule set, and the file-glob targeting.
-  ...tseslint.configs.recommended,
+  // TypeScript recommended ruleset. The preset supplies the parser and the
+  // rules; it does NOT supply file-glob targeting, despite what the comment
+  // here used to claim. `tseslint.configs.recommended` is an array of
+  // config objects with no `files` key, and a flat-config object without
+  // `files` applies to EVERY file ESLint visits.
+  //
+  // Unscoped, it reached the `**/*.cjs` block above and fired
+  // `@typescript-eslint/no-require-imports` on files this config
+  // deliberately set up as CommonJS — the config told ESLint a file was
+  // CommonJS and then failed it for being CommonJS. Scoping each entry to
+  // TS sources is the fix (nathanjohnpayne/nathanpaynedotcom#856).
+  //
+  // `.astro` is in this glob for the same reason it is in the rule block
+  // below: astro frontmatter is TypeScript, and this preset entry is what
+  // REGISTERS the `@typescript-eslint` plugin. Scoping it to TS extensions
+  // alone leaves the block below referencing `@typescript-eslint/*` rule
+  // IDs for `.astro` with no plugin in the matching configuration, and
+  // ESLint refuses to load at all — the #327 rule-without-plugin break.
+  // The unscoped spread happened to cover `.astro`; narrowing the glob has
+  // to keep covering it. The astro plugin's own preset is spread AFTER
+  // this one, so it still wins for parser selection on `.astro`.
+  ...tseslint.configs.recommended.map((config) => ({
+    ...config,
+    files: ["**/*.{ts,tsx,mts,cts,astro}"],
+  })),
 // <<<
 
 // >>> if frameworks contains typescript
