@@ -382,6 +382,27 @@ for tpl_rel in examples/eslint.config.js examples/eslint.config.cjs.js; do
     # ADDED .cjs -- `{ts,tsx,mts,cts,astro,cjs}` -- satisfies every check above
     # while reintroducing exactly the #856 failure, TS rules on the files the
     # template deliberately declares CommonJS. Assert the exclusion too.
+    # The map MUST be conditional. `tseslint.configs.recommended` is not a
+    # homogeneous array: `typescript-eslint/eslint-recommended` ships its own
+    # `files: ["**/*.ts","**/*.tsx","**/*.mts","**/*.cts"]`, and its rules are
+    # core-rule DISABLES (no-undef, no-dupe-keys, no-redeclare, ...). An
+    # unconditional `.map` overwrites that selector, switching those core
+    # checks OFF for every extra extension in the glob -- silently removing
+    # coverage while looking like a scoping fix. Measured on a real consumer:
+    # an unconditional map made `no-undef` and `no-dupe-keys` stop firing on
+    # .astro entirely.
+    #
+    # This assertion is STRUCTURAL, not behavioural: mergepath has no
+    # node_modules, so the preset cannot be loaded here. The behavioural proof
+    # is the consumer probe recorded in the commit that added this.
+    map_body="$(printf '%s\n' "$tpl_live" \
+      | sed -n '/tseslint\.configs\.recommended\.map/,/^[[:space:]]*),\{0,1\}[[:space:]]*$/p')"
+    if printf '%s\n' "$map_body" | grep -qF 'config.files'; then
+      pass "$tpl_rel only scopes preset entries that do not already carry their own files"
+    else
+      fail "$tpl_rel maps files: onto EVERY preset entry unconditionally; that overwrites typescript-eslint/eslint-recommended's own TS-only scope and disables its core-rule checks (no-undef, no-dupe-keys, ...) for the extra extensions"
+    fi
+
     case "$preset_glob" in
       *cjs*)
         fail "$tpl_rel scopes the TypeScript preset to .cjs ('$preset_glob'), re-enabling @typescript-eslint/no-require-imports on the CommonJS files the .cjs block declares"
