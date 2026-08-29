@@ -183,18 +183,25 @@ export default [
   // TS sources is the fix (nathanjohnpayne/nathanpaynedotcom#856).
   //
   // `.astro` is in this glob for the same reason it is in the rule block
-  // below: astro frontmatter is TypeScript, and this preset entry is what
-  // REGISTERS the `@typescript-eslint` plugin. Scoping it to TS extensions
-  // alone leaves the block below referencing `@typescript-eslint/*` rule
-  // IDs for `.astro` with no plugin in the matching configuration, and
-  // ESLint refuses to load at all — the #327 rule-without-plugin break.
-  // The unscoped spread happened to cover `.astro`; narrowing the glob has
-  // to keep covering it. The astro plugin's own preset is spread AFTER
-  // this one, so it still wins for parser selection on `.astro`.
-  ...tseslint.configs.recommended.map((config) => ({
-    ...config,
-    files: ["**/*.{ts,tsx,mts,cts,astro}"],
-  })),
+  // below: astro frontmatter is TypeScript, and the preset entry that
+  // carries the plugin is what REGISTERS `@typescript-eslint`. Scoping to
+  // TS extensions alone leaves the block below referencing
+  // `@typescript-eslint/*` rule IDs for `.astro` with no plugin in the
+  // matching configuration, and ESLint refuses to load at all — the #327
+  // rule-without-plugin break. The astro plugin's own preset is spread
+  // AFTER this one, so it still wins for parser selection on `.astro`.
+  //
+  // The array is NOT homogeneous, which is why this maps conditionally.
+  // `typescript-eslint/eslint-recommended` ALREADY carries its own
+  // `files: ["**/*.ts","**/*.tsx","**/*.mts","**/*.cts"]`, and its 23 rules
+  // are core-rule DISABLES (no-undef, no-dupe-keys, no-redeclare, …) that
+  // TypeScript itself replaces. Overwriting that entry's selector to
+  // include `.astro` would switch those core checks OFF for astro files,
+  // where they were previously on — a silent loss of coverage, not a
+  // scoping fix. Only the entries with no `files` of their own get one.
+  ...tseslint.configs.recommended.map((config) =>
+    config.files ? config : { ...config, files: ["**/*.{ts,tsx,mts,cts,astro}"] },
+  ),
 // <<<
 
 // >>> if frameworks contains typescript
