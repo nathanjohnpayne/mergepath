@@ -484,7 +484,16 @@ prp_joined="$(printf '%s\n' "$prp_live" | sed -e ':a' -e '/\\$/{N;s/\\\n//;ta' -
 #
 # sed prints one line per match, so this keeps them all; the loop below probes
 # the union of their tokens.
-gate_argstr="$(printf '%s\n' "$prp_joined" | sed -n 's|.*scripts/validate-pr-body\.sh||p')"
+# Split on the path so EVERY occurrence yields its own argument string. sed's
+# `.*` is greedy: it consumes through the LAST occurrence on a logical line, so
+# `validate-pr-body.sh --unknown; validate-pr-body.sh --self-review-only`
+# probed only the second call and passed while the first killed the real job.
+# That is the sixth way this extractor has silently validated a subset, and
+# every one of them was a path that DISCARDED input, so this replaces the
+# discard rather than special-casing the spelling.
+gate_argstr="$(printf '%s\n' "$prp_joined" \
+  | awk -v RS='scripts/validate-pr-body\\.sh' 'NR>1{print}' \
+  | sed -E 's/[;&|<>].*$//')"
 
 # FAIL CLOSED on anything this extractor cannot account for.
 #
