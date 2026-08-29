@@ -116,8 +116,8 @@ if [ "$FAILED" -eq 0 ]; then
       }
       process.stdout.write(out);
     ' "$ESLINT_CONFIG")"
-    if ! printf '%s' "$STRIPPED" | grep -Eq '["'\'']@eslint/js["'\'']' \
-       || ! printf '%s' "$STRIPPED" | grep -Eq '\.configs\.recommended\b'; then
+    if ! grep -Eq '["'\'']@eslint/js["'\'']' <<<"$STRIPPED" \
+       || ! grep -Eq '\.configs\.recommended\b' <<<"$STRIPPED"; then
       echo "FAIL: eslint.config.js must include the @eslint/js recommended ruleset."
       echo "      Mergepath policy floor (rules/repo_rules.md § ESLint policy)"
       echo "      requires at least:"

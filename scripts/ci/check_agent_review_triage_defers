@@ -81,7 +81,7 @@ if [ -z "$TRIAGE_JOB" ]; then
 fi
 
 # 1. The defer marker + rationale anchor is present IN THE TRIAGE JOB.
-printf '%s\n' "$TRIAGE_JOB" | grep -qF 'PROPAGATION-LANE-DEFER (#656)' \
+grep -qF 'PROPAGATION-LANE-DEFER (#656)' <<<"$TRIAGE_JOB" \
   || fail "$WORKFLOW triage job is missing the PROPAGATION-LANE-DEFER (#656) anchor"
 
 # 2. Three-file marker lockstep: triage greps for the SAME literal the
@@ -110,7 +110,15 @@ grep -qF "c.user.login === 'github-actions[bot]'" "$WORKFLOW" \
 #    verified flag so an API error labels rather than skips. Scoped to the
 #    triage job so an unrelated job's `catch (e)` can't satisfy the proximity
 #    match.
-printf '%s\n' "$TRIAGE_JOB" | grep -A6 'catch (e)' | grep -qF 'laneVerifiedHead = false' \
+# Captured in two steps rather than piped. A here-string alone is NOT enough
+# here (#1147): with an intermediate stage, `grep -qF` still short-circuits and
+# the INTERMEDIATE grep takes EPIPE, so `pipefail` reports rc=141 on a genuine
+# match exactly as the printf form did. Measured on a 4 MB haystack:
+#   printf | grep -A6 | grep -qF     rc=141
+#   grep -A6 <<< | grep -qF          rc=141   <- naive fix, still broken
+#   capture, then grep -qF <<<       rc=0
+_catch_ctx="$(grep -A6 'catch (e)' <<<"$TRIAGE_JOB" || true)"
+grep -qF 'laneVerifiedHead = false' <<<"$_catch_ctx" \
   || fail "$WORKFLOW triage job no longer forces laneVerifiedHead=false on a failed marker read (must label fail-closed)"
 
 # 6. The label add still exists and the skip is conditioned on the
