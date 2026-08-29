@@ -23,8 +23,8 @@ TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
 # ONE exit handler for every temp this suite creates. A second `trap ... EXIT`
 # later REPLACES this one rather than extending it, which leaked the detector
 # file on every run that reached it.
-TMP_BASE_ENTRY=""
-trap 'rm -f "$TMP_DETECTOR" "${TMP_BASE_ENTRY:-}"' EXIT
+TMP_BASE_TREE=""
+trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"' EXIT
 
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
@@ -491,20 +491,61 @@ else
   # after the branch was cut -- the real job succeeds while this test reports
   # `usage:`. merge-base answers a different question than the one asked here.
   base_entrypoint=""
-  TMP_BASE_ENTRY="$ROOT/scripts/.base-validate-pr-body.$$.sh"   # cleaned by the single EXIT trap above
-  for ref in "origin/${MERGEPATH_DEFAULT_BRANCH:-main}" "${MERGEPATH_DEFAULT_BRANCH:-main}" origin/main main; do
+  # Materialise the COMPLETE default-branch closure, not just the entrypoint.
+  #
+  # Copying only validate-pr-body.sh is a hybrid that neither execution path
+  # ever runs: the entrypoint resolves $ROOT from its own location, so a lone
+  # copy inside this checkout sources the PR-HEAD libraries while claiming to
+  # probe the base. A head-side API refactor that lands with a matching
+  # entrypoint change would then make this probe inconclusive -- reding the
+  # required lint context -- while the real Self-Review job, which checks out
+  # the whole default-branch tree, succeeds.
+  #
+  # `git archive` of the base `scripts/` tree into a temp root reproduces what
+  # the workflow actually runs: $ROOT resolves to the temp root and every
+  # sourced library is the base copy. Extracting the directory wholesale also
+  # means the closure never has to be enumerated here, so a future dependency
+  # added to the validator is covered without editing this test.
+  TMP_BASE_TREE="$(mktemp -d "${TMPDIR:-/tmp}/parity-base.XXXXXX")"
+  # ONLY the configured default branch. Falling back to `main` when the
+  # configured branch's refs are unavailable would validate the gate's flags
+  # against a branch the workflow never checks out -- a hardcoded fleet fact in
+  # a canonical, propagated artifact, which is the same defect class as the
+  # `nathanpayne-` prefix and the .nvmrc coupling elsewhere in this work.
+  #
+  # Resolution order: the explicit override (repo_lint.yml passes the event's
+  # real default branch), else the repository's ACTUAL default branch as
+  # recorded by origin/HEAD. `main` is a last resort only when neither is
+  # discoverable, never a silent alternative to a configured branch that
+  # simply failed to resolve.
+  default_branch="${MERGEPATH_DEFAULT_BRANCH:-}"
+  if [ -z "$default_branch" ]; then
+    default_branch="$(git -C "$ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')"
+  fi
+  [ -n "$default_branch" ] || default_branch=main
+
+  # Extract base scripts/ into the temp root. Returns 0 only if the entrypoint
+  # actually materialised, so a partial or empty archive is not read as success.
+  _materialize_base() {
+    _sha=$1
+    git -C "$ROOT" archive "$_sha" scripts 2>/dev/null | tar -x -C "$TMP_BASE_TREE" 2>/dev/null || return 1
+    [ -f "$TMP_BASE_TREE/scripts/validate-pr-body.sh" ] || return 1
+    return 0
+  }
+
+  for ref in "origin/$default_branch" "$default_branch"; do
     if base_sha="$(git -C "$ROOT" rev-parse --verify "$ref" 2>/dev/null)" && [ -n "$base_sha" ]; then
-      if git -C "$ROOT" show "$base_sha:scripts/validate-pr-body.sh" > "$TMP_BASE_ENTRY" 2>/dev/null; then
-        base_entrypoint="$TMP_BASE_ENTRY"; break
+      if _materialize_base "$base_sha"; then
+        base_entrypoint="$TMP_BASE_TREE/scripts/validate-pr-body.sh"; break
       fi
     fi
   done
   if [ -z "$base_entrypoint" ]; then
     # One shallow fetch attempt, then degrade -- never block.
-    if git -C "$ROOT" fetch --depth=1 -q origin "${MERGEPATH_DEFAULT_BRANCH:-main}" 2>/dev/null; then
+    if git -C "$ROOT" fetch --depth=1 -q origin "$default_branch" 2>/dev/null; then
       if base_sha="$(git -C "$ROOT" rev-parse --verify FETCH_HEAD 2>/dev/null)" \
-         && git -C "$ROOT" show "$base_sha:scripts/validate-pr-body.sh" > "$TMP_BASE_ENTRY" 2>/dev/null; then
-        base_entrypoint="$TMP_BASE_ENTRY"
+         && _materialize_base "$base_sha"; then
+        base_entrypoint="$TMP_BASE_TREE/scripts/validate-pr-body.sh"
       fi
     fi
   fi
