@@ -125,10 +125,10 @@ if [ -z "$policy_resolve_line" ] || [ -z "$identity_load_line" ] ||
 fi
 
 triage_job=$(sed -n '/^  triage:/,/^  assign:/p' "$WORKFLOW")
-if ! printf '%s\n' "$triage_job" | grep -qF "policyResolverArgs.push('--materialize-default');" ||
-  ! printf '%s\n' "$triage_job" | grep -qF 'checkoutSha !== baseSha' ||
-  ! printf '%s\n' "$triage_job" | grep -qF "function loadGoverningIdentities(pr, policyConfigPath)" ||
-  ! printf '%s\n' "$triage_job" | grep -qF "'--default-config', policyConfigPath"; then
+if ! grep -qF "policyResolverArgs.push('--materialize-default');" <<<"$triage_job" ||
+  ! grep -qF 'checkoutSha !== baseSha' <<<"$triage_job" ||
+  ! grep -qF "function loadGoverningIdentities(pr, policyConfigPath)" <<<"$triage_job" ||
+  ! grep -qF "'--default-config', policyConfigPath" <<<"$triage_job"; then
   echo "check_self_approval_detector: triage must feed one exact materialized policy to both applicability and identity decisions" >&2
   exit 1
 fi
@@ -144,7 +144,7 @@ stale_fallback_block=$(awk '
   in_block {print}
 ' "$WORKFLOW")
 if [ -z "$stale_fallback_block" ] ||
-  printf '%s\n' "$stale_fallback_block" | grep -qF 'return;' ||
+  grep -qF 'return;' <<<"$stale_fallback_block" ||
   ! grep -qF 'const preparedApproval = prepareDirectApproval({' "$WORKFLOW"; then
   echo "check_self_approval_detector: stale durable approval events must reach the exact-review fallback" >&2
   exit 1
@@ -173,8 +173,8 @@ if [ -z "$stable_pr_line" ] || [ -z "$live_author_line" ] || [ -z "$live_require
   exit 1
 fi
 live_required_block=$(sed -n "${live_required_line},$((live_required_line + 4))p" "$WORKFLOW")
-if ! printf '%s\n' "$live_required_block" | grep -qF 'phase4IntrinsicRaw,' ||
-  ! printf '%s\n' "$live_required_block" | grep -qF 'pr,' ||
+if ! grep -qF 'phase4IntrinsicRaw,' <<<"$live_required_block" ||
+  ! grep -qF 'pr,' <<<"$live_required_block" ||
   ! grep -qF 'PHASE_4_INTRINSIC_REQUIRED: ${{ needs.triage.outputs.phase_4_intrinsic_required }}' "$WORKFLOW" ||
   ! grep -qF 'const phase4IntrinsicRaw =' "$WORKFLOW" ||
   ! grep -qF 'process.env.PHASE_4_INTRINSIC_REQUIRED;' "$WORKFLOW" ||
@@ -196,7 +196,7 @@ for success_requirement in \
   "needs.block-self-approval.result == 'success'" \
   "needs.block-self-approval.outputs.eligible_approval == 'true'" \
   "needs.block-self-approval.outputs.auto_arm_allowed == 'true'"; do
-  if ! printf '%s\n' "$auto_merge_job" | grep -qF "$success_requirement"; then
+  if ! grep -qF "$success_requirement" <<<"$auto_merge_job"; then
     echo "check_self_approval_detector: every auto-merge trigger must require successful triage and an eligible approval from the self-approval guard" >&2
     exit 1
   fi
@@ -209,12 +209,12 @@ if grep -qF 'approvals = [context.payload.review]' "$WORKFLOW" ||
 fi
 
 block_job=$(sed -n '/^  block-self-approval:/,/^    runs-on:/p' "$WORKFLOW")
-if ! printf '%s\n' "$block_job" | grep -qF "github.event.pull_request.user.login != 'dependabot[bot]'"; then
+if ! grep -qF "github.event.pull_request.user.login != 'dependabot[bot]'" <<<"$block_job"; then
   echo "check_self_approval_detector: Dependabot must bypass the agent-only guard because triage intentionally skips it" >&2
   exit 1
 fi
 for rearm_action in synchronize reopened edited labeled unlabeled; do
-  if ! printf '%s\n' "$block_job" | grep -qF "$rearm_action"; then
+  if ! grep -qF "$rearm_action" <<<"$block_job"; then
     echo "check_self_approval_detector: block-self-approval does not cover the $rearm_action re-arm" >&2
     exit 1
   fi
@@ -224,7 +224,7 @@ has_only_force_on_labeled_predicate() {
   compact=$(printf '%s\n' "$block" | awk '{$1=$1; printf "%s ", $0}')
   labeled_count=$(printf '%s\n' "$block" | grep -cF "github.event.action == 'labeled'" || true)
   [ "$labeled_count" -eq 1 ] &&
-    printf '%s\n' "$compact" | grep -qF "(github.event.action == 'labeled' && github.event.label.name == 'needs-external-review')"
+    grep -qF "(github.event.action == 'labeled' && github.event.label.name == 'needs-external-review')" <<<"$compact"
 }
 if ! has_only_force_on_labeled_predicate "$block_job"; then
   echo "check_self_approval_detector: only the needs-external-review force-on label may trigger approval invalidation" >&2
@@ -252,20 +252,20 @@ for required_fragment in \
   'auto_arm_allowed=true' \
   'retracting the existing unclassified auto-merge request fail closed' \
   '.autoMergeRequest == null'; do
-  if ! printf '%s\n' "$shared_author_retraction" | grep -qF -- "$required_fragment"; then
+  if ! grep -qF -- "$required_fragment" <<<"$shared_author_retraction"; then
     echo "check_self_approval_detector: shared-author approval invalidation must carry its self-contained workflow-token retraction path ($required_fragment)" >&2
     exit 1
   fi
 done
-if printf '%s\n' "$shared_author_retraction" | grep -qF -- '--match-head-commit'; then
+if grep -qF -- '--match-head-commit' <<<"$shared_author_retraction"; then
   echo "check_self_approval_detector: disable-only retraction must not advertise an ineffective head precondition" >&2
   exit 1
 fi
-if printf '%s\n' "$shared_author_retraction" | grep -qF 'AUTHOR_MERGE_TOKEN'; then
+if grep -qF 'AUTHOR_MERGE_TOKEN' <<<"$shared_author_retraction"; then
   echo "check_self_approval_detector: protective retraction must not depend on the optional auto-merge token" >&2
   exit 1
 fi
-if printf '%s\n' "$shared_author_retraction" | grep -qF 'approval-merge-continuation.sh'; then
+if grep -qF 'approval-merge-continuation.sh' <<<"$shared_author_retraction"; then
   echo "check_self_approval_detector: first-rollout retraction must remain self-contained and helper-independent" >&2
   exit 1
 fi
@@ -277,7 +277,7 @@ for job_and_name in \
   "$triage_job|triage"; do
   job=${job_and_name%|*}
   name=${job_and_name##*|}
-  if ! printf '%s\n' "$job" | grep -qF "github.event.action == 'edited'"; then
+  if ! grep -qF "github.event.action == 'edited'" <<<"$job"; then
     echo "check_self_approval_detector: $name must reclassify PR edited events" >&2
     exit 1
   fi
@@ -288,14 +288,14 @@ for job_and_name in \
 done
 
 triage_full_job=$(sed -n '/^  triage:/,/^  assign:/p' "$WORKFLOW")
-if ! printf '%s\n' "$triage_full_job" | grep -qF 'const mayMutateLabels = triageMayMutateLabels({' ||
-  ! printf '%s\n' "$triage_full_job" | grep -qF 'labelName: eventLabelName,'; then
+if ! grep -qF 'const mayMutateLabels = triageMayMutateLabels({' <<<"$triage_full_job" ||
+  ! grep -qF 'labelName: eventLabelName,' <<<"$triage_full_job"; then
   echo "check_self_approval_detector: triage label mutation must use the tested force-on classification-only decision" >&2
   exit 1
 fi
 
 assign_job=$(sed -n '/^  assign:/,/^    runs-on:/p' "$WORKFLOW")
-if printf '%s\n' "$assign_job" | grep -qF "github.event.action == 'labeled'"; then
+if grep -qF "github.event.action == 'labeled'" <<<"$assign_job"; then
   echo "check_self_approval_detector: force-on label enforcement must not reactivate reviewer assignment on label edits" >&2
   exit 1
 fi
@@ -313,15 +313,15 @@ fi
 concurrency_block=$(sed -n '/^concurrency:/,/^[^ ]/p' "$WORKFLOW")
 concurrency_group=$(sed -n '/^  group:/,/^  cancel-in-progress:/p' <<<"$concurrency_block")
 concurrency_cancel=$(sed -n '/^  cancel-in-progress:/,$p' <<<"$concurrency_block")
-if ! printf '%s\n' "$concurrency_group" | grep -qF 'agent-review-${{ github.event.pull_request.number }}-${{' ||
-  ! printf '%s\n' "$concurrency_group" | grep -qF "'approval-enforcement'" ||
-  ! printf '%s\n' "$concurrency_group" | grep -qF "format('approval-{0}', github.event.review.id)" ||
-  ! printf '%s\n' "$concurrency_group" | grep -qF 'github.run_id' ||
-  printf '%s\n' "$concurrency_block" | grep -qF "github.event.action != 'labeled'" ||
-  printf '%s\n' "$concurrency_block" | grep -qF "github.event.action == 'opened'" ||
-  printf '%s\n' "$concurrency_block" | grep -qF "github.event.action == 'ready_for_review'" ||
-  printf '%s\n' "$concurrency_block" | grep -qF '  cancel-in-progress: true' ||
-  printf '%s\n' "$concurrency_cancel" | grep -qF "github.event_name == 'pull_request_review'"; then
+if ! grep -qF 'agent-review-${{ github.event.pull_request.number }}-${{' <<<"$concurrency_group" ||
+  ! grep -qF "'approval-enforcement'" <<<"$concurrency_group" ||
+  ! grep -qF "format('approval-{0}', github.event.review.id)" <<<"$concurrency_group" ||
+  ! grep -qF 'github.run_id' <<<"$concurrency_group" ||
+  grep -qF "github.event.action != 'labeled'" <<<"$concurrency_block" ||
+  grep -qF "github.event.action == 'opened'" <<<"$concurrency_block" ||
+  grep -qF "github.event.action == 'ready_for_review'" <<<"$concurrency_block" ||
+  grep -qF '  cancel-in-progress: true' <<<"$concurrency_block" ||
+  grep -qF "github.event_name == 'pull_request_review'" <<<"$concurrency_cancel"; then
   echo "check_self_approval_detector: per-PR concurrency must keep every approved webhook durable and isolate non-enforcing events" >&2
   exit 1
 fi
@@ -337,19 +337,19 @@ for enforcement_fragment in \
   "github.event.action == 'labeled'" \
   "github.event.action == 'unlabeled'" \
   '["needs-external-review","needs-human-review","policy-violation","human-hold"]'; do
-  if ! printf '%s\n' "$concurrency_group" | grep -qF "$enforcement_fragment" ||
-    ! printf '%s\n' "$concurrency_cancel" | grep -qF "$enforcement_fragment"; then
+  if ! grep -qF "$enforcement_fragment" <<<"$concurrency_group" ||
+    ! grep -qF "$enforcement_fragment" <<<"$concurrency_cancel"; then
     echo "check_self_approval_detector: group and cancellation predicates must both carry $enforcement_fragment" >&2
     exit 1
   fi
 done
-if ! printf '%s\n' "$concurrency_group" | grep -qF "github.event.review.state == 'approved'"; then
+if ! grep -qF "github.event.review.state == 'approved'" <<<"$concurrency_group"; then
   echo "check_self_approval_detector: approved events must use their durable review-ID concurrency group" >&2
   exit 1
 fi
 
-if printf '%s\n' "$auto_merge_job" | grep -qF "github.event.action == 'edited'" ||
-  printf '%s\n' "$auto_merge_job" | grep -qF "github.event.action == 'labeled'"; then
+if grep -qF "github.event.action == 'edited'" <<<"$auto_merge_job" ||
+  grep -qF "github.event.action == 'labeled'" <<<"$auto_merge_job"; then
   echo "check_self_approval_detector: edited and force-on labeled events must invalidate approvals without arming auto-merge" >&2
   exit 1
 fi

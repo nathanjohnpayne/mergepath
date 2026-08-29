@@ -169,10 +169,10 @@ EXEMPT=$(awk '
 # check that ships on disk but never runs in CI.
 MISSING=()
 for name in "${ON_DISK[@]}"; do
-  if printf '%s\n' "$WIRED" | grep -Fxq "$name"; then
+  if grep -Fxq "$name" <<<"$WIRED"; then
     continue
   fi
-  if printf '%s\n' "$EXEMPT" | grep -Fxq "$name"; then
+  if grep -Fxq "$name" <<<"$EXEMPT"; then
     continue
   fi
   MISSING+=("$name")
