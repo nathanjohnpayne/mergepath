@@ -464,9 +464,14 @@ fi
 # dies on `usage:` (#1132, hit twice: once as a missing script, once as a
 # missing interface). Asserted behaviourally: every flag the workflow passes to
 # the entrypoint must be accepted by the entrypoint, not answered with usage.
+# WHOLE shell tokens. An `[a-z-]+` extraction silently truncated
+# `--self-review-only=true` to the valid `--self-review-only`, so the guard
+# probed a different invocation than the required job runs: the real entrypoint
+# exited 2 on `usage:` while the suite passed every assertion.
 gate_flags="$(printf '%s\n' "$prp_live" \
-  | grep -oE 'scripts/validate-pr-body\.sh( --[a-z-]+)+' \
-  | grep -oE ' --[a-z-]+' | tr -d ' ' | sort -u)"
+  | sed -n 's|.*scripts/validate-pr-body\.sh||p' \
+  | tr ' \t' '\n\n' \
+  | grep -E '^-' | sort -u)"
 if [ -z "$gate_flags" ]; then
   bad "could not extract the flags $PRP passes to validate-pr-body.sh; the bootstrap guard is inert"
 else
@@ -480,10 +485,15 @@ else
   # resolves $ROOT from its own location, so a copy in /tmp resolves ROOT to /
   # and dies sourcing //scripts/lib/... -- an error that is not `usage:` and
   # which an earlier version of this guard read as "flag understood".
+  # The DEFAULT-BRANCH TIP, not the merge base. The gate checks out
+  # `ref: default_branch`, so the tip is what it runs. Using the fork point
+  # fails a long-lived PR that adopts a flag which landed on the default branch
+  # after the branch was cut -- the real job succeeds while this test reports
+  # `usage:`. merge-base answers a different question than the one asked here.
   base_entrypoint=""
   TMP_BASE_ENTRY="$ROOT/scripts/.base-validate-pr-body.$$.sh"   # cleaned by the single EXIT trap above
   for ref in "origin/${MERGEPATH_DEFAULT_BRANCH:-main}" "${MERGEPATH_DEFAULT_BRANCH:-main}" origin/main main; do
-    if base_sha="$(git -C "$ROOT" merge-base "$ref" HEAD 2>/dev/null)" && [ -n "$base_sha" ]; then
+    if base_sha="$(git -C "$ROOT" rev-parse --verify "$ref" 2>/dev/null)" && [ -n "$base_sha" ]; then
       if git -C "$ROOT" show "$base_sha:scripts/validate-pr-body.sh" > "$TMP_BASE_ENTRY" 2>/dev/null; then
         base_entrypoint="$TMP_BASE_ENTRY"; break
       fi
@@ -492,7 +502,7 @@ else
   if [ -z "$base_entrypoint" ]; then
     # One shallow fetch attempt, then degrade -- never block.
     if git -C "$ROOT" fetch --depth=1 -q origin "${MERGEPATH_DEFAULT_BRANCH:-main}" 2>/dev/null; then
-      if base_sha="$(git -C "$ROOT" rev-parse FETCH_HEAD 2>/dev/null)" \
+      if base_sha="$(git -C "$ROOT" rev-parse --verify FETCH_HEAD 2>/dev/null)" \
          && git -C "$ROOT" show "$base_sha:scripts/validate-pr-body.sh" > "$TMP_BASE_ENTRY" 2>/dev/null; then
         base_entrypoint="$TMP_BASE_ENTRY"
       fi
