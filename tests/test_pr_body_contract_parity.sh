@@ -572,6 +572,52 @@ pr_body_validate "$p4b_valid" "$POLICY" >/dev/null 2>&1 \
   && ok "the contract phase-4b now calls accepts a valid body" \
   || bad "the contract rejects a valid body; phase-4b would die on every PR"
 
+# --- 17. Phase 4b's verdict, by EXECUTING it ---------------------------------
+# Cases 16's grep assertions read source text: they pass whether or not the
+# orchestrator acts on the result. This drives scripts/phase-4b-review.sh for
+# real and asserts the verdict, with a self-contained stub rather than the
+# shared automation suite's -- modifying that stub destabilised it twice.
+p4b_probe() {  # <pr-body> -> prints "rc=<n> <first stderr line>"
+  local body="$1" d bin
+  d="$(mktemp -d "${TMPDIR:-/tmp}/p4b-verdict.XXXXXX")"
+  bin="$d/bin"; mkdir -p "$bin"
+  # Minimal gh: serves the PR body for the `.body // ""` read, a fixed head
+  # otherwise. Nothing else is reached before the contract check.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'if [ "${1:-}" = "api" ]; then\n'
+    printf '  case "$*" in\n'
+    printf '    *".body // \\"\\""*) cat %q; exit 0 ;;\n' "$d/body.txt"
+    printf '    *) printf "%%s\\n" abc123; exit 0 ;;\n'
+    printf '  esac\n'
+    printf 'fi\n'
+    printf 'exit 0\n'
+  } > "$bin/gh"
+  chmod +x "$bin/gh"
+  printf '%s' "$body" > "$d/body.txt"
+  printf 'x\n' > "$d/diff.txt"
+  local out rc=0
+  out="$(cd "$ROOT" && PATH="$bin:$PATH" \
+    MERGEPATH_REVIEW_POLICY_PATH="$ROOT/.github/review-policy.yml" \
+    bash scripts/phase-4b-review.sh 123 --repo o/r --head abc123 \
+      --diff-file "$d/diff.txt" --dry-run 2>&1)" || rc=$?
+  rm -rf "$d"
+  printf 'rc=%s %s' "$rc" "$(printf '%s\n' "$out" | grep -m1 -iE 'contract|Authoring-Agent' || true)"
+}
+
+p4b_bad="$(p4b_probe "$(printf 'Authoring-Agent: nobody\n\n## Self-Review\n\n- ok.\n')")"
+case "$p4b_bad" in
+  rc=0*) bad "phase-4b ACCEPTED a body with an unknown Authoring-Agent: $p4b_bad" ;;
+  *contract*|*Authoring-Agent*) ok "phase-4b rejects an unknown Authoring-Agent, and says why ($p4b_bad)" ;;
+  *) bad "phase-4b rejected the body but not via the contract: $p4b_bad" ;;
+esac
+
+p4b_fence="$(p4b_probe "$(printf 'Authoring-Agent: claude\n\ntext\n\n```\n## Self-Review\n```\n')")"
+case "$p4b_fence" in
+  rc=0*) bad "phase-4b ACCEPTED a fenced ## Self-Review heading: $p4b_fence" ;;
+  *) ok "phase-4b rejects a body whose Self-Review heading is inside a code fence" ;;
+esac
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
