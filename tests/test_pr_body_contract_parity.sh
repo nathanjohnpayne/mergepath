@@ -495,18 +495,25 @@ gate_unprobeable=""
 if [ -n "${gate_argstr//[[:space:]]/}" ]; then
   # xargs applies POSIX shell quoting, so "--x" and '--x' both yield --x. It
   # exits nonzero on unbalanced quotes -- treated as unprobeable, not as empty.
-  if gate_tokens="$(printf '%s\n' "$gate_argstr" | xargs -n1 2>/dev/null)"; then
-    while IFS= read -r _tok; do
-      [ -n "$_tok" ] || continue
+  # NUL-delimited, so an EMPTY argument is a token rather than a blank line
+  # that a line reader would silently drop. `--self-review-only ""` really does
+  # reach the validator as a second argument and really does make it exit 2 --
+  # skipping it would put this guard back to probing a subset, which is the
+  # hole it exists to close.
+  TMP_GATE_TOKENS="$(mktemp "${TMPDIR:-/tmp}/parity-tokens.XXXXXX")"
+  if printf '%s\n' "$gate_argstr" | xargs -n1 printf '%s\0' > "$TMP_GATE_TOKENS" 2>/dev/null; then
+    while IFS= read -r -d '' _tok; do
       case "$_tok" in
+        "") gate_unprobeable="$gate_unprobeable <empty argument>" ;;
         -*) gate_flags="$gate_flags$_tok
 " ;;
         *)  gate_unprobeable="$gate_unprobeable $_tok" ;;
       esac
-    done <<< "$gate_tokens"
+    done < "$TMP_GATE_TOKENS"
   else
     gate_unprobeable=" <unparseable: unbalanced quoting in the invocation>"
   fi
+  rm -f "$TMP_GATE_TOKENS"
   gate_flags="$(printf '%s' "$gate_flags" | sed '/^$/d' | sort -u)"
 fi
 
