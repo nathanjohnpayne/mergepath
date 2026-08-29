@@ -845,6 +845,12 @@ paths:
       # guards it with `[ -r ... ]`, so a consumer without it still runs.
       - "scripts/phase-4b/"                 # sourced unconditionally at line 88
       - "scripts/lib/gh-api-scalar.sh"      # hard-required; p4b_die 3 if missing (#799)
+      # The suite READS this workflow and asserts on its content -- the gate
+      # call, the trusted-checkout pinning, persist-credentials, and the Node
+      # pinning. A commit-path sync restricted to the test would ship the new
+      # assertions to a consumer still holding the previous workflow, and they
+      # would fail there against a file this PR never delivered.
+      - ".github/workflows/pr-review-policy.yml"
       # Read rather than executed, but equally load-bearing: the suite sources a
       # function out of gh-as-author.sh and greps the other two. Pre-existing
       # couplings, declared now because they are the same defect class as the

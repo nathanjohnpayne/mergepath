@@ -457,6 +457,30 @@ if printf '%s\n' "$prp_live" | grep -qF -- '--self-review-only'; then
 else
   bad "$PRP no longer passes --self-review-only; widening this required check is a policy change"
 fi
+# The checkout the gate runs the validator FROM. These are security properties,
+# not bootstrap ones -- they were adjacent to the bootstrap guard in an earlier
+# revision of this PR and got carried out with it when that guard was split to
+# #1154. Restored: removing code around assertions is exactly when they stop
+# asserting, and nothing else in the suite covers these.
+if printf '%s\n' "$prp_live" | grep -qF 'uses: actions/checkout@'; then
+  if printf '%s\n' "$prp_live" | grep -qF 'ref: ${{ github.event.repository.default_branch }}'; then
+    ok "the gate checks the validator out from the TRUSTED default branch"
+  else
+    bad "$PRP checks out without pinning ref to default_branch — a PR could edit its own validator"
+  fi
+  if printf '%s\n' "$prp_live" | grep -qF 'persist-credentials: false'; then
+    ok "the trusted validator checkout does not persist credentials"
+  else
+    bad "$PRP trusted checkout must set persist-credentials: false (#548)"
+  fi
+else
+  bad "$PRP self-review-check has no checkout, so it cannot run the trusted validator"
+fi
+if printf '%s\n' "$prp_live" | grep -qF 'node-version-file'; then
+  bad "$PRP uses node-version-file; canonical workflows must not depend on a consumer-owned .nvmrc"
+else
+  ok "the gate pins Node by literal version, not a consumer-owned .nvmrc"
+fi
 # --- 13. the heading semantics the gate now enforces -------------------------
 FENCED_SR=$'Authoring-Agent: claude\n\ntext\n\n```\n## Self-Review\n```\n'
 REAL_SR=$'Authoring-Agent: claude\n\n## Self-Review\n\n- Correctness: verified.\n'
