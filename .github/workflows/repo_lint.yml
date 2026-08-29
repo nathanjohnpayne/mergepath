@@ -113,19 +113,6 @@ jobs:
   lint_fast:
     name: lint-fast
     runs-on: ubuntu-latest
-    env:
-      # tests/test_pr_body_contract_parity.sh's bootstrap guard probes the
-      # DEFAULT-BRANCH copy of scripts/validate-pr-body.sh, because that is what
-      # the Self-Review gate checks out. It needs the branch NAME to do that.
-      #
-      # An actions/checkout-style checkout need not create refs/remotes/origin/HEAD,
-      # so without this the guard falls back to guessing `main`. On a consumer whose
-      # default branch is not `main` the guess is simply wrong: the guard would probe
-      # a branch the gate never runs, or find no ref and degrade to the weaker in-tree
-      # check -- letting a same-change flag rollout pass here and then exit `usage:`
-      # in the real job. The event payload knows the answer; pass it rather than
-      # inferring it.
-      MERGEPATH_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
