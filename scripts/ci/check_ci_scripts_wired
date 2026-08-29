@@ -213,8 +213,19 @@ fi
 # scripts/ci/ is `type: kit, consumers: all`, so it reaches every repo.
 #
 # `grep -c` reads all of stdin and cannot take EPIPE, so only the short-circuit
-# forms (-q, -m, -l) are rejected. The fix is a here-string, which has no
-# second process to signal: `grep -qF X <<<"$var"`.
+# forms (-q, -m, -l) are rejected. The single-stage fix is a here-string, which
+# has no second process to signal: `grep -qF X <<<"$var"`.
+#
+# INTERMEDIATE STAGES COUNT. `printf … | grep -A6 … | grep -qF …` races too:
+# the short-circuit is at the END, and the middle grep is what takes EPIPE, so
+# a here-string on the front alone does NOT fix it. Measured on a 4 MB haystack:
+#
+#   printf | grep -A6 | grep -qF        rc=141
+#   grep -A6 <<< | grep -qF             rc=141   <- naive fix, still broken
+#   ctx="$(grep -A6 <<<…)"; grep -qF <<<"$ctx"   rc=0
+#
+# Hence the matcher spans pipes rather than requiring grep to follow printf
+# immediately (Codex P2 on #1148).
 EPIPE_HITS=()
 while IFS= read -r f; do
   [[ -f "$f" ]] || continue
@@ -225,7 +236,7 @@ while IFS= read -r f; do
     # checks legitimately embed this shape inside a QUOTED STRING as the
     # expected content of a workflow they assert on; those are data, not
     # executed pipelines, and cannot take EPIPE.
-  done < <(grep -nE 'printf[^|]*\| *grep +-[a-zA-Z]*[qml]' "$f" 2>/dev/null \
+  done < <(grep -nE 'printf[^|]*\|.*grep +-[a-zA-Z]*[qml]' "$f" 2>/dev/null \
              | grep -vE '^[0-9]+:[[:space:]]*#' \
              | grep -vF 'EPIPE-OK' || true)
 done < <(find scripts/ci -maxdepth 1 -type f 2>/dev/null)
