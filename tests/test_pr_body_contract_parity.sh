@@ -799,7 +799,7 @@ p4b_probe() {  # <pr-body> -> prints "rc=<n> <first stderr line>"
   out="$(cd "$ROOT" && PATH="$bin:$PATH" \
     MERGEPATH_REVIEW_POLICY_PATH="$ROOT/.github/review-policy.yml" \
     bash scripts/phase-4b-review.sh 123 --repo o/r --head abc123 \
-      --diff-file "$d/diff.txt" --dry-run 2>&1)" || rc=$?
+      --diff-file "$d/diff.txt" --dry-run --force-enabled 2>&1)" || rc=$?
   rm -rf "$d"
   printf 'rc=%s %s' "$rc" "$(printf '%s\n' "$out" | grep -m1 -iE 'contract|Authoring-Agent' || true)"
 }
