@@ -288,6 +288,14 @@ if [ -z "$AUTHOR" ]; then
   # a JSON error body for an agent name.
   body="$(gh_api_scalar "PR body for $REPO#$PR" \
     "repos/$REPO/pulls/$PR" --jq '.body // ""')" || body=""
+  # Validate the body against the SHARED contract before trusting any identity
+  # parsed out of it (#855). Phase 4b sourced pr-body-contract.sh and then only
+  # extracted the agent, so a body that the required Self-Review gate would
+  # reject -- a duplicate marker, an unknown agent, a heading hidden in a code
+  # fence -- still selected a reviewer here. One contract, one implementation,
+  # both enforcement paths.
+  pr_body_validate "$body" "$(p4b_config)" \
+    || p4b_die 3 "PR body does not satisfy the Authoring-Agent contract"
   AUTHOR="$(pr_body_authoring_agent "$body")"
   [ -n "$AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body; pass --author"
 fi
