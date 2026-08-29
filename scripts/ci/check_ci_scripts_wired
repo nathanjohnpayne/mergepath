@@ -96,7 +96,7 @@ if [[ -f "$LOCAL_ANNEX" ]]; then
       end
     triggers.map(&:to_s).each { |t| puts t }
   ' "$LOCAL_ANNEX" 2>/dev/null || true)"
-  if printf '%s\n' "$annex_triggers" | grep -qxE 'push|pull_request'; then
+  if grep -qxE 'push|pull_request' <<<"$annex_triggers"; then
     SCAN_FILES+=("$LOCAL_ANNEX")
   else
     echo "FAIL: repo_lint_local.yml annex exists but has no push/pull_request trigger (found: [$(printf '%s' "$annex_triggers" | tr '\n' ' ' | sed 's/ $//')]); an annex Actions never runs on pushes or PRs cannot satisfy the wiring contract" >&2
@@ -169,10 +169,10 @@ EXEMPT=$(awk '
 # check that ships on disk but never runs in CI.
 MISSING=()
 for name in "${ON_DISK[@]}"; do
-  if printf '%s\n' "$WIRED" | grep -Fxq "$name"; then
+  if grep -Fxq "$name" <<<"$WIRED"; then
     continue
   fi
-  if printf '%s\n' "$EXEMPT" | grep -Fxq "$name"; then
+  if grep -Fxq "$name" <<<"$EXEMPT"; then
     continue
   fi
   MISSING+=("$name")
@@ -201,5 +201,46 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
   exit 1
 fi
 
-echo "check_ci_scripts_wired: PASS (${#ON_DISK[@]} check_* scripts, all wired or exempt)"
+# ---------------------------------------------------------------------------
+# EPIPE hygiene (#1147). `printf ... | grep -q` under `set -o pipefail` reports
+# a MATCH as a failure: grep -q exits the moment it matches, printf takes EPIPE,
+# and pipefail propagates printf's status. Assertions written as
+# `if ! printf ... | grep -q X` then invert a success into a failure and abort
+# with a message describing a defect that does not exist.
+#
+# Measured, not theoretical: this red-lined the REQUIRED lint-fast context on
+# mergepath#1139 and device-source-of-truth#185 within the same hour, and
+# scripts/ci/ is `type: kit, consumers: all`, so it reaches every repo.
+#
+# `grep -c` reads all of stdin and cannot take EPIPE, so only the short-circuit
+# forms (-q, -m, -l) are rejected. The fix is a here-string, which has no
+# second process to signal: `grep -qF X <<<"$var"`.
+EPIPE_HITS=()
+while IFS= read -r f; do
+  [[ -f "$f" ]] || continue
+  grep -q 'set -[a-z]*o pipefail\|set -euo pipefail' "$f" 2>/dev/null || continue
+  while IFS= read -r hit; do
+    [[ -n "$hit" ]] && EPIPE_HITS+=("$f:$hit")
+    # Skip comment lines and anything carrying an explicit opt-out. Some
+    # checks legitimately embed this shape inside a QUOTED STRING as the
+    # expected content of a workflow they assert on; those are data, not
+    # executed pipelines, and cannot take EPIPE.
+  done < <(grep -nE 'printf[^|]*\| *grep +-[a-zA-Z]*[qml]' "$f" 2>/dev/null \
+             | grep -vE '^[0-9]+:[[:space:]]*#' \
+             | grep -vF 'EPIPE-OK' || true)
+done < <(find scripts/ci -maxdepth 1 -type f 2>/dev/null)
+
+if [[ ${#EPIPE_HITS[@]} -gt 0 ]]; then
+  echo "FAIL: piped short-circuit grep under pipefail (#1147) — a MATCH is reported as a failure:" >&2
+  for hit in "${EPIPE_HITS[@]}"; do
+    echo "  $hit" >&2
+  done
+  echo "" >&2
+  echo "Rewrite as a here-string so there is no second process to receive SIGPIPE:" >&2
+  echo "  printf '%s\\n' \"\$var\" | grep -qF X     ->     grep -qF X <<<\"\$var\"" >&2  # EPIPE-OK: this is the remediation hint text, not a pipeline
+  echo "check_ci_scripts_wired: FAIL" >&2
+  exit 1
+fi
+
+echo "check_ci_scripts_wired: PASS (${#ON_DISK[@]} check_* scripts, all wired or exempt; no piped short-circuit grep under pipefail)"
 exit 0

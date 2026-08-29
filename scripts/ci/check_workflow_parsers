@@ -1327,9 +1327,12 @@ else
   echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN resolves to the PR author" >&2
 fi
 
+# The expected CONTENT of dependabot-auto-merge.yml, held in a variable so the
+# #1147 EPIPE-OK marker can sit on the same line as the pattern it exempts.
+dependabot_allowlist_guard="if ! printf '%s\\n' \"\$ALLOWED\" | grep -Fxq \"\$ACTING_AS\"; then"  # EPIPE-OK (#1147): asserted workflow text, not a pipeline executed here
 if workflow_guard_block_contains_exit \
   "$dependabot_workflow" \
-  "if ! printf '%s\\n' \"\$ALLOWED\" | grep -Fxq \"\$ACTING_AS\"; then" \
+  "$dependabot_allowlist_guard" \
   'NOT in $POLICY available_reviewers'; then
   pass=$((pass + 1))
   echo "  PASS: Dependabot auto-merge exits when the reviewer token is not allowlisted"

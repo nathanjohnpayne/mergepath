@@ -81,7 +81,7 @@ if [ -z "$TRIAGE_JOB" ]; then
 fi
 
 # 1. The defer marker + rationale anchor is present IN THE TRIAGE JOB.
-printf '%s\n' "$TRIAGE_JOB" | grep -qF 'PROPAGATION-LANE-DEFER (#656)' \
+grep -qF 'PROPAGATION-LANE-DEFER (#656)' <<<"$TRIAGE_JOB" \
   || fail "$WORKFLOW triage job is missing the PROPAGATION-LANE-DEFER (#656) anchor"
 
 # 2. Three-file marker lockstep: triage greps for the SAME literal the
