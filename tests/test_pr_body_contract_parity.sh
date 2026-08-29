@@ -540,6 +540,38 @@ printf '%s\n' "$sro_noagent" | bash "$V" >/dev/null 2>&1 \
   && bad "full validation accepted a body with no Authoring-Agent; the modes are not distinct" \
   || ok "full validation still enforces Authoring-Agent (the two modes are distinct)"
 
+# --- 16. Phase 4b validates the body through the SHARED contract ------------
+# Phase 4b sourced pr-body-contract.sh and then only extracted the agent, so a
+# body the required Self-Review gate would reject still selected a reviewer
+# there -- the two enforcement paths had diverged (#855). Behavioural, not a
+# string match: a body that fails the contract must not yield an agent that
+# Phase 4b would act on.
+P4B="$ROOT/scripts/phase-4b-review.sh"
+if grep -qF 'pr_body_validate "$body" "$(p4b_config)"' "$P4B"; then
+  ok "phase-4b validates the PR body through the shared contract"
+else
+  bad "phase-4b sources the contract but never calls pr_body_validate; the gate and Phase 4b enforce different rules"
+fi
+if grep -qF '. "$ROOT/lib/pr-body-contract.sh"' "$P4B"; then
+  ok "phase-4b sources the shared contract library"
+else
+  bad "phase-4b no longer sources the shared contract library"
+fi
+# The verdicts the two paths must agree on. If these ever diverge, the string
+# assertions above are decorative.
+p4b_fenced=$'Authoring-Agent: claude\n\ntext\n\n```\n## Self-Review\n```\n'
+p4b_unknown=$'Authoring-Agent: nobody\n\n## Self-Review\n\n- ok.\n'
+p4b_valid=$'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n'
+pr_body_validate "$p4b_fenced" "$POLICY" >/dev/null 2>&1 \
+  && bad "contract accepts a fenced heading; phase-4b would act on it" \
+  || ok "the contract phase-4b now calls rejects a fenced heading"
+pr_body_validate "$p4b_unknown" "$POLICY" >/dev/null 2>&1 \
+  && bad "contract accepts an unknown agent; phase-4b would select a reviewer against it" \
+  || ok "the contract phase-4b now calls rejects an unknown agent"
+pr_body_validate "$p4b_valid" "$POLICY" >/dev/null 2>&1 \
+  && ok "the contract phase-4b now calls accepts a valid body" \
+  || bad "the contract rejects a valid body; phase-4b would die on every PR"
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
