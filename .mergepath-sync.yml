@@ -830,6 +830,21 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/reviewers-helpers.sh"  # transitive dependency of the shell facade
+      # The suite EXECUTES these, so a commit-path propagation that selects the
+      # test without them leaves a consumer running it against a missing or
+      # stale copy -- the required check_gh_as_author lint suite then fails on
+      # every PR there. The commit-path closure gate evaluates only THIS entry's
+      # requires, so each runtime dependency has to be named here even when
+      # another entry happens to declare it.
+      - "scripts/validate-pr-body.sh"       # bootstrap guard + --self-review-only cases run it
+      - "scripts/phase-4b-review.sh"        # case 17 executes it end-to-end
+      # Read rather than executed, but equally load-bearing: the suite sources a
+      # function out of gh-as-author.sh and greps the other two. Pre-existing
+      # couplings, declared now because they are the same defect class as the
+      # two above and this is the list that governs them.
+      - "scripts/codex-review-check.sh"     # scanned for Authoring-Agent parse parity
+      - "scripts/gh-as-author.sh"           # is_pr_create_command() is extracted and sourced
+      - "scripts/hooks/gh-pr-guard.sh"      # self-approval refusal string is asserted
   - path: scripts/hooks/label-removal-guard.sh
     type: canonical
     consumers: all
