@@ -838,6 +838,13 @@ paths:
       # another entry happens to declare it.
       - "scripts/validate-pr-body.sh"       # bootstrap guard + --self-review-only cases run it
       - "scripts/phase-4b-review.sh"        # case 17 executes it end-to-end
+      # ...and what THAT hard-sources. Declaring the entrypoint alone is not
+      # enough: the closure gate reads only this entry's requires, so the
+      # phase-4b manifest entry's own nested requires do not protect case 17.
+      # `preflight-helpers.sh` is deliberately absent -- phase-4b-review.sh
+      # guards it with `[ -r ... ]`, so a consumer without it still runs.
+      - "scripts/phase-4b/"                 # sourced unconditionally at line 88
+      - "scripts/lib/gh-api-scalar.sh"      # hard-required; p4b_die 3 if missing (#799)
       # Read rather than executed, but equally load-bearing: the suite sources a
       # function out of gh-as-author.sh and greps the other two. Pre-existing
       # couplings, declared now because they are the same defect class as the

@@ -468,7 +468,14 @@ fi
 # `--self-review-only=true` to the valid `--self-review-only`, so the guard
 # probed a different invocation than the required job runs: the real entrypoint
 # exited 2 on `usage:` while the suite passed every assertion.
-gate_flags="$(printf '%s\n' "$prp_live" \
+# Join shell line-continuations FIRST. The extractor keys on the line holding
+# the validator path, so a flag wrapped onto a continuation line is invisible to
+# it: `gate_flags` stays non-empty with only the flags that happened to sit on
+# the first line, and the guard passes while the required job dies on `usage:`
+# for the flag it never saw. Folding `\`-continuations into one logical line
+# makes the extractor see the whole invocation.
+prp_joined="$(printf '%s\n' "$prp_live" | sed -e ':a' -e '/\\$/{N;s/\\\n//;ta' -e '}')"
+gate_flags="$(printf '%s\n' "$prp_joined" \
   | sed -n 's|.*scripts/validate-pr-body\.sh||p' \
   | tr ' \t' '\n\n' \
   | grep -E '^-' | sort -u)"
