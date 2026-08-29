@@ -475,7 +475,16 @@ fi
 # for the flag it never saw. Folding `\`-continuations into one logical line
 # makes the extractor see the whole invocation.
 prp_joined="$(printf '%s\n' "$prp_live" | sed -e ':a' -e '/\\$/{N;s/\\\n//;ta' -e '}')"
-gate_argstr="$(printf '%s\n' "$prp_joined" | sed -n 's|.*scripts/validate-pr-body\.sh||p' | head -1)"
+# EVERY invocation, not the first. `head -1` was the last remaining discard
+# path in this extractor, and discard paths are how this guard has been wrong
+# five times: `--flag=value` truncation, a `\`-continuation, a quoted "--flag",
+# an empty "" argument, and now a SECOND call to the validator whose flags were
+# never probed at all. Each fix taught the parser one more spelling while some
+# other path still silently dropped input.
+#
+# sed prints one line per match, so this keeps them all; the loop below probes
+# the union of their tokens.
+gate_argstr="$(printf '%s\n' "$prp_joined" | sed -n 's|.*scripts/validate-pr-body\.sh||p')"
 
 # FAIL CLOSED on anything this extractor cannot account for.
 #
