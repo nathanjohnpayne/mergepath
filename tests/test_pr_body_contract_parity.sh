@@ -20,7 +20,11 @@ ok()   { pass=$((pass+1)); echo "PASS: $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL: $1" >&2; }
 
 TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
-trap 'rm -f "$TMP_DETECTOR"' EXIT
+# ONE exit handler for every temp this suite creates. A second `trap ... EXIT`
+# later REPLACES this one rather than extending it, which leaked the detector
+# file on every run that reached it.
+TMP_BASE_TREE=""
+trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"' EXIT
 
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
@@ -440,28 +444,24 @@ if printf '%s\n' "$prp_live" | grep -qE "grep -q[A-Za-z]*[[:space:]]+.\^## Self-
 else
   ok "the Self-Review gate no longer relies on a line grep"
 fi
-if printf '%s\n' "$prp_live" | grep -qF 'pr-body-contract.mjs'; then
-  ok "the Self-Review gate routes through the markdown-aware parser"
+if printf '%s\n' "$prp_live" | grep -qF 'scripts/validate-pr-body.sh'; then
+  ok "the Self-Review gate routes through the shared validate-pr-body entrypoint"
 else
-  bad "$PRP does not call the parser; the gate cannot see fenced headings"
+  bad "$PRP does not call scripts/validate-pr-body.sh; the contract would have two implementations"
 fi
 # Scope guard: this gate checks the HEADING only. Enforcing the identity
 # contract here is a POLICY change (#1137) and must be a deliberate edit to
 # this assertion, not a silent widening.
-if printf '%s\n' "$prp_live" | grep -qF -- '--has-self-review'; then
+if printf '%s\n' "$prp_live" | grep -qF -- '--self-review-only'; then
   ok "the gate asks only the heading question; the identity contract is not bundled in"
 else
-  bad "$PRP no longer passes --has-self-review; widening this required check is a policy change"
+  bad "$PRP no longer passes --self-review-only; widening this required check is a policy change"
 fi
-# The gate must call an interface the DEFAULT BRANCH already provides: the
-# validator is loaded from there, so a flag added in the same PR that uses it
-# does not exist when the gate runs and the required check fails `usage:` on
-# its own PR.
-if printf '%s\n' "$prp_live" | grep -qF -- '--self-review-only'; then
-  bad "$PRP calls --self-review-only, a flag added in this same change; the gate loads the validator from the default branch and will fail usage: on its own PR"
-else
-  ok "the gate uses no flag introduced alongside it (no bootstrap window)"
-fi
+# The checkout the gate runs the validator FROM. These are security properties,
+# not bootstrap ones -- they were adjacent to the bootstrap guard in an earlier
+# revision of this PR and got carried out with it when that guard was split to
+# #1154. Restored: removing code around assertions is exactly when they stop
+# asserting, and nothing else in the suite covers these.
 if printf '%s\n' "$prp_live" | grep -qF 'uses: actions/checkout@'; then
   if printf '%s\n' "$prp_live" | grep -qF 'ref: ${{ github.event.repository.default_branch }}'; then
     ok "the gate checks the validator out from the TRUSTED default branch"
@@ -481,7 +481,6 @@ if printf '%s\n' "$prp_live" | grep -qF 'node-version-file'; then
 else
   ok "the gate pins Node by literal version, not a consumer-owned .nvmrc"
 fi
-
 # --- 13. the heading semantics the gate now enforces -------------------------
 FENCED_SR=$'Authoring-Agent: claude\n\ntext\n\n```\n## Self-Review\n```\n'
 REAL_SR=$'Authoring-Agent: claude\n\n## Self-Review\n\n- Correctness: verified.\n'
@@ -500,10 +499,10 @@ pr_body_has_self_review "$NO_SR" >/dev/null 2>&1 \
 # Authoring-Agent line at all has to pass, or this PR is silently carrying a
 # policy change it does not claim to.
 NO_AGENT=$'## Self-Review\n\n- no Authoring-Agent line anywhere.\n'
-if printf '%s\n' "$NO_AGENT" | node "$ROOT/scripts/lib/pr-body-contract.mjs" --has-self-review >/dev/null 2>&1; then
-  ok "the gate's question accepts a body with no Authoring-Agent (scope is the heading alone)"
+if printf '%s\n' "$NO_AGENT" | bash "$ROOT/scripts/validate-pr-body.sh" --self-review-only >/dev/null 2>&1; then
+  ok "the gate's mode accepts a body with no Authoring-Agent (scope is the heading alone)"
 else
-  bad "the gate's question rejected a body with no Authoring-Agent; it has silently widened to the identity contract"
+  bad "the gate's mode rejected a body with no Authoring-Agent; it has silently widened to the identity contract"
 fi
 
 # --- 15. the --self-review-only entrypoint mode ------------------------------
@@ -547,12 +546,17 @@ printf '%s\n' "$sro_noagent" | bash "$V" >/dev/null 2>&1 \
 # string match: a body that fails the contract must not yield an agent that
 # Phase 4b would act on.
 P4B="$ROOT/scripts/phase-4b-review.sh"
-if grep -qF 'pr_body_validate "$body" "$(p4b_config)"' "$P4B"; then
+# Whitespace- and form-tolerant: these say "the call site still exists", not
+# "it is spelled exactly this way". An exact match red-lines on a harmless
+# reformat or a `source`-vs-`.` change, which is a false failure about
+# formatting dressed as a contract violation. Case 17 below is the behavioural
+# check; these only localise the breakage when it fires.
+if grep -qE 'pr_body_validate[[:space:]]+"\$body"' "$P4B"; then
   ok "phase-4b validates the PR body through the shared contract"
 else
   bad "phase-4b sources the contract but never calls pr_body_validate; the gate and Phase 4b enforce different rules"
 fi
-if grep -qF '. "$ROOT/lib/pr-body-contract.sh"' "$P4B"; then
+if grep -qE '^[[:space:]]*(\.|source)[[:space:]]+.*pr-body-contract\.sh' "$P4B"; then
   ok "phase-4b sources the shared contract library"
 else
   bad "phase-4b no longer sources the shared contract library"
@@ -612,10 +616,16 @@ case "$p4b_bad" in
   *) bad "phase-4b rejected the body but not via the contract: $p4b_bad" ;;
 esac
 
+# Discriminate on the REASON, exactly as the unknown-agent case above does. A
+# bare `*)` here would accept ANY nonzero status as proof -- a broken stub, a
+# missing script (rc=127), an unrelated abort -- so the case could pass while
+# the contract never rejected the fence at all. Measured: this body exits 3
+# with "PR body does not satisfy the Authoring-Agent contract".
 p4b_fence="$(p4b_probe "$(printf 'Authoring-Agent: claude\n\ntext\n\n```\n## Self-Review\n```\n')")"
 case "$p4b_fence" in
   rc=0*) bad "phase-4b ACCEPTED a fenced ## Self-Review heading: $p4b_fence" ;;
-  *) ok "phase-4b rejects a body whose Self-Review heading is inside a code fence" ;;
+  *contract*|*Authoring-Agent*) ok "phase-4b rejects a fenced ## Self-Review heading, and says why ($p4b_fence)" ;;
+  *) bad "phase-4b rejected the fenced body but not via the contract: $p4b_fence" ;;
 esac
 
 echo

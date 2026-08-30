@@ -830,6 +830,34 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/reviewers-helpers.sh"  # transitive dependency of the shell facade
+      # The suite EXECUTES these, so a commit-path propagation that selects the
+      # test without them leaves a consumer running it against a missing or
+      # stale copy -- the required check_gh_as_author lint suite then fails on
+      # every PR there. The commit-path closure gate evaluates only THIS entry's
+      # requires, so each runtime dependency has to be named here even when
+      # another entry happens to declare it.
+      - "scripts/validate-pr-body.sh"       # bootstrap guard + --self-review-only cases run it
+      - "scripts/phase-4b-review.sh"        # case 17 executes it end-to-end
+      # ...and what THAT hard-sources. Declaring the entrypoint alone is not
+      # enough: the closure gate reads only this entry's requires, so the
+      # phase-4b manifest entry's own nested requires do not protect case 17.
+      # `preflight-helpers.sh` is deliberately absent -- phase-4b-review.sh
+      # guards it with `[ -r ... ]`, so a consumer without it still runs.
+      - "scripts/phase-4b/"                 # sourced unconditionally at line 88
+      - "scripts/lib/gh-api-scalar.sh"      # hard-required; p4b_die 3 if missing (#799)
+      # The suite READS this workflow and asserts on its content -- the gate
+      # call, the trusted-checkout pinning, persist-credentials, and the Node
+      # pinning. A commit-path sync restricted to the test would ship the new
+      # assertions to a consumer still holding the previous workflow, and they
+      # would fail there against a file this PR never delivered.
+      - ".github/workflows/pr-review-policy.yml"
+      # Read rather than executed, but equally load-bearing: the suite sources a
+      # function out of gh-as-author.sh and greps the other two. Pre-existing
+      # couplings, declared now because they are the same defect class as the
+      # two above and this is the list that governs them.
+      - "scripts/codex-review-check.sh"     # scanned for Authoring-Agent parse parity
+      - "scripts/gh-as-author.sh"           # is_pr_create_command() is extracted and sourced
+      - "scripts/hooks/gh-pr-guard.sh"      # self-approval refusal string is asserted
   - path: scripts/hooks/label-removal-guard.sh
     type: canonical
     consumers: all
@@ -1415,7 +1443,16 @@ paths:
       # runs it from a DEFAULT-BRANCH checkout. A consumer receiving this
       # workflow without the entrypoint (or the contract libs it sources)
       # fails the required check on every PR with exit 127 (#1132).
+      - "scripts/validate-pr-body.sh"
+      - "scripts/lib/pr-body-contract.sh"
       - "scripts/lib/pr-body-contract.mjs"
+      # pr-body-contract.sh hard-sources this. The commit-path closure gate
+      # evaluates only the changed workflow's OWN requires, not the nested
+      # requires of the entrypoint, so a consumer could receive the workflow
+      # with a missing or stale copy and fail its required Self-Review job on
+      # every PR. Declared directly, as the manifest already does for the
+      # parity test's same transitive dependency.
+      - "scripts/lib/reviewers-helpers.sh"
   - path: .github/workflows/dependabot-auto-merge.yml
     type: canonical
     consumers: all
