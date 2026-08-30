@@ -153,6 +153,16 @@
 #     # Review: Didn't find any major issues" phrasing. A non-null,
 #     # non-affirmative verdict is still a real Codex response (has_signal
 #     # true) but does not clear (has_cleared_signal false) — fails closed.
+#     "terminal_determination": null | {
+#       "provider": "codex",
+#       "outcome": "timeout",
+#       "marker_comment_id": N
+#     },
+#     # #1085: a normal bounded timeout is recorded as an author-owned,
+#     # exact-head hidden PR comment bound to the confirmed trigger comment.
+#     # Phase 4b consumes that durable record instead of waiting a second time.
+#     # Account/connection blocks remain distinct through blocked_reason and
+#     # the provider-authored diagnostic exit-2 evidence above.
 #     "trigger_posted": true | false,
 #     "trigger_requested": true | false,
 #     "rounds_waited_seconds": N
@@ -165,7 +175,8 @@
 #       should route to REVIEW_POLICY.md § Phase 4b. See #27 for the
 #       explicit-review-required decision that mandates this path. Two
 #       sub-cases, distinguished by the `blocked_reason` field in the JSON:
-#       a plain timeout (blocked_reason:null) waited out the full window,
+#       a plain timeout (blocked_reason:null) waited out the full window and
+#       successfully recorded terminal_determination for this exact head,
 #       whereas a detected account-/connection-level block
 #       (blocked_reason:"usage_limit"|"not_connected", #722) short-circuits
 #       the wait immediately — re-polling/re-triggering cannot help until a
@@ -183,9 +194,9 @@
 #       every reported finding, then rerun this script (#1000).
 #
 # Design notes:
-#   - Read-only against the PR except for the one `@codex review` trigger
-#     comment. Does not push commits, does not modify labels, does not
-#     merge.
+#   - Writes only author-attributed PR comments: the `@codex review` trigger,
+#     and on an ordinary timeout one hidden exact-head terminal-determination
+#     marker (#1085). Does not push commits, modify labels, or merge.
 #   - Idempotent. Re-running on the same PR with the same HEAD is safe:
 #     it will see the existing Codex response and skip the trigger.
 #   - JSON emission uses `jq` throughout. No ad-hoc string concatenation.
@@ -637,6 +648,7 @@ if ! should_request_codex; then
       reaction: null,
       verdict: null,
       blocked_reason: null,
+      terminal_determination: null,
       trigger_posted: false,
       trigger_requested: false,
       rounds_waited_seconds: 0
@@ -1114,6 +1126,76 @@ run_feedback_accounting_gate() {
   esac
 }
 
+post_author_pr_comment() { # <body> <purpose> [body-file|inline]
+  local body="$1" purpose="$2" mode="${3:-body-file}" AS_AUTHOR bridge_author_pat=""
+  local body_file="" output="" rc=0 identity_checker
+  local -a body_args
+  AS_AUTHOR="$__CODEX_REQUEST_DIR/gh-as-author.sh"
+  if [ ! -x "$AS_AUTHOR" ]; then
+    echo "ERROR: gh-as-author.sh helper missing or non-executable: $AS_AUTHOR" >&2
+    echo "       Refusing to post $purpose without author-token attribution." >&2
+    die 3 "gh-as-author.sh helper unavailable"
+  fi
+
+  # Inline author-PAT bridging (#438): gh-as-author.sh's resolver
+  # intentionally ignores ambient GH_TOKEN — it reads only
+  # OP_PREFLIGHT_AUTHOR_PAT or a stored `gh auth token --user`. In a
+  # CI/fresh shell with no preflight cache and no keyring, the
+  # still-documented `GH_TOKEN=<author PAT> codex-review-request.sh`
+  # invocation shape passed every read-side check and then failed the
+  # trigger write despite holding a valid author token, forcing an
+  # unnecessary Phase 4b fallback. Bridge the ambient token into the
+  # wrapper's preferred env var ONLY after verifying it actually
+  # resolves to the author identity; any other token (the common
+  # reviewer-PAT session shape) is left alone so the wrapper's own
+  # resolution proceeds unchanged and fails closed as before.
+  if [ -n "${GH_TOKEN:-}" ] && [ -z "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]; then
+    identity_checker="$__CODEX_REQUEST_DIR/identity-check.sh"
+    if [ -x "$identity_checker" ] \
+      && GH_TOKEN="$GH_TOKEN" "$identity_checker" --expect-token-identity "$AUTHOR_IDENTITY" >/dev/null 2>&1; then
+      log "ambient GH_TOKEN verifies as author identity $AUTHOR_IDENTITY — bridging it into gh-as-author.sh as OP_PREFLIGHT_AUTHOR_PAT"
+      bridge_author_pat="$GH_TOKEN"
+    fi
+  fi
+
+  # The established trigger contract uses the exact safe literal
+  # `--body "@codex review"`; preserve it so wrapper policy/tests and the App's
+  # command matching do not change as a side effect of #1085. New machine
+  # markers use --body-file, keeping their structured Markdown out of shell
+  # arguments and following the repository write rule.
+  case "$mode" in
+    inline) body_args=(--body "$body") ;;
+    body-file)
+      body_file=$(mktemp "${TMPDIR:-/tmp}/codex-author-comment.XXXXXX") \
+        || die 3 "could not create temporary body file for $purpose"
+      printf '%s' "$body" >"$body_file" \
+        || die 3 "could not write temporary body file for $purpose"
+      body_args=(--body-file "$body_file")
+      ;;
+    *) die 3 "unknown author-comment body mode: $mode" ;;
+  esac
+
+  # Capture stdout+stderr so a failure surfaces the real gh error (404 / 403 /
+  # 422) rather than a bare failure. gh's comment URL remains extractable by
+  # the caller for the mandatory post-write readback.
+  # Pass the configured author identity on BOTH invocation branches:
+  # the wrapper's hard default (nathanjohnpayne) would reject a valid
+  # custom-author token in repos that override author_identity —
+  # bridged-token case (Codex P2 on PR #442 r2) AND warm-preflight /
+  # keyring case (Codex P2 on PR #442 r5). review-policy.yml is the
+  # source of truth this script already reads, so it wins.
+  if [ -n "$bridge_author_pat" ]; then
+    output=$(OP_PREFLIGHT_AUTHOR_PAT="$bridge_author_pat" GH_AS_AUTHOR_IDENTITY="$AUTHOR_IDENTITY" "$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" "${body_args[@]}" 2>&1) \
+      || rc=$?
+  else
+    output=$(GH_AS_AUTHOR_IDENTITY="$AUTHOR_IDENTITY" "$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" "${body_args[@]}" 2>&1) \
+      || rc=$?
+  fi
+  [ -z "$body_file" ] || rm -f "$body_file"
+  [ "$rc" -eq 0 ] || die 3 "failed to post $purpose: $output"
+  AUTHOR_COMMENT_OUTPUT="$output"
+}
+
 post_codex_trigger() {
   # A new review round must not hide findings from an earlier round. This
   # enumerates both inline and top-level review-body findings and fails before
@@ -1130,53 +1212,9 @@ post_codex_trigger() {
   # GH_TOKEN. This SUPERSEDES the #284 `identity-check --expect-reviewer`
   # guard, which fail-closed on the WRONG identity for this particular
   # write.
-  log "posting '@codex review' trigger comment (as author identity nathanjohnpayne)"
-  AS_AUTHOR="$__CODEX_REQUEST_DIR/gh-as-author.sh"
-  if [ ! -x "$AS_AUTHOR" ]; then
-    echo "ERROR: gh-as-author.sh helper missing or non-executable: $AS_AUTHOR" >&2
-    echo "       Refusing to post '@codex review' without author-token attribution" >&2
-    echo "       (Codex ignores reviewer/bot-authored triggers — see comment above)." >&2
-    die 3 "gh-as-author.sh helper unavailable"
-  fi
-
-  # Inline author-PAT bridging (#438): gh-as-author.sh's resolver
-  # intentionally ignores ambient GH_TOKEN — it reads only
-  # OP_PREFLIGHT_AUTHOR_PAT or a stored `gh auth token --user`. In a
-  # CI/fresh shell with no preflight cache and no keyring, the
-  # still-documented `GH_TOKEN=<author PAT> codex-review-request.sh`
-  # invocation shape passed every read-side check and then failed the
-  # trigger write despite holding a valid author token, forcing an
-  # unnecessary Phase 4b fallback. Bridge the ambient token into the
-  # wrapper's preferred env var ONLY after verifying it actually
-  # resolves to the author identity; any other token (the common
-  # reviewer-PAT session shape) is left alone so the wrapper's own
-  # resolution proceeds unchanged and fails closed as before.
-  BRIDGE_AUTHOR_PAT=""
-  if [ -n "${GH_TOKEN:-}" ] && [ -z "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]; then
-    IDENTITY_CHECKER="$__CODEX_REQUEST_DIR/identity-check.sh"
-    if [ -x "$IDENTITY_CHECKER" ] \
-      && GH_TOKEN="$GH_TOKEN" "$IDENTITY_CHECKER" --expect-token-identity "$AUTHOR_IDENTITY" >/dev/null 2>&1; then
-      log "ambient GH_TOKEN verifies as author identity $AUTHOR_IDENTITY — bridging it into gh-as-author.sh as OP_PREFLIGHT_AUTHOR_PAT"
-      BRIDGE_AUTHOR_PAT="$GH_TOKEN"
-    fi
-  fi
-
-  # Capture stdout+stderr so a failure surfaces the real gh error
-  # (404 / 403 / 422) rather than a bare "failed to post". The comment
-  # URL gh prints on success is still extractable downstream.
-  # Pass the configured author identity on BOTH invocation branches:
-  # the wrapper's hard default (nathanjohnpayne) would reject a valid
-  # custom-author token in repos that override author_identity —
-  # bridged-token case (Codex P2 on PR #442 r2) AND warm-preflight /
-  # keyring case (Codex P2 on PR #442 r5). review-policy.yml is the
-  # source of truth this script already reads, so it wins.
-  if [ -n "$BRIDGE_AUTHOR_PAT" ]; then
-    POST_OUTPUT=$(OP_PREFLIGHT_AUTHOR_PAT="$BRIDGE_AUTHOR_PAT" GH_AS_AUTHOR_IDENTITY="$AUTHOR_IDENTITY" "$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
-      || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
-  else
-    POST_OUTPUT=$(GH_AS_AUTHOR_IDENTITY="$AUTHOR_IDENTITY" "$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
-      || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
-  fi
+  log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY)"
+  post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline
+  POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
 
   # Capture the post time so the poll loop can ignore stale signals
@@ -1198,6 +1236,11 @@ post_codex_trigger() {
   # wall-clock issue on nathanpaynedotcom propagation PR #180 round 4.
   TRIGGER_COMMENT_ID=$(echo "$POST_OUTPUT" | grep -oE 'issuecomment-[0-9]+' | head -1 | sed 's/issuecomment-//' || true)
   if [ -n "$TRIGGER_COMMENT_ID" ]; then
+    # Keep the newest CONFIRMED trigger separately from the current ack target.
+    # A retry whose wrapper output format unexpectedly omits the id must not
+    # erase an earlier concrete trigger that the timeout marker can still bind
+    # to (#1085); if no post in the run ever yielded an id, persistence fails.
+    TERMINAL_TRIGGER_COMMENT_ID="$TRIGGER_COMMENT_ID"
     # #799: the wall-clock fallback immediately below was unreachable on a
     # failed read. The error body is non-empty, so `[ -z ]` passed and a JSON
     # blob became TRIGGER_POST_TIME — which is then compared as a STRING
@@ -1341,6 +1384,83 @@ run_trigger_ack_gate() {
   done
 }
 
+# Persist a normal Phase 4a timeout for the exact head whose confirmed trigger
+# exhausted the bounded wait (#1085). Phase 4b runs later, often from another
+# checkout and process, so stdout/exit 4 is not a handoff channel. The PR
+# timeline is. Account/connection blocks deliberately do NOT use this marker:
+# their provider-authored comments remain the distinct diagnostic exit-2 path.
+record_phase4a_timeout_determination() {
+  local live_head comments state marker_body post_id fresh_state
+
+  [ "$CODEX_FAILURE_MARKERS_OK" = true ] \
+    && command -v codex_phase4a_timeout_marker_body >/dev/null 2>&1 \
+    && command -v codex_phase4a_timeout_marker_state >/dev/null 2>&1 \
+    || die 3 "cannot persist Phase 4a timeout: shared terminal-marker helper unavailable"
+  [ "$TRIGGER_POSTED" = true ] \
+    || die 3 "cannot persist Phase 4a timeout: no trigger was posted in this request run"
+  codex_phase4a_comment_id_ok "$TERMINAL_TRIGGER_COMMENT_ID" \
+    || die 3 "cannot persist Phase 4a timeout: trigger comment id was not confirmed"
+
+  # A timeout determined for H must never become a waiver on H2. Re-read the
+  # live PR immediately before the write; the eventual Phase 4b reader repeats
+  # the same fence before consuming the marker.
+  live_head=$(gh_api_scalar --shape sha "Phase 4a timeout live PR head" \
+    "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha') \
+    || die 3 "cannot persist Phase 4a timeout: live PR head is unreadable"
+  [ "$live_head" = "$HEAD_SHA" ] \
+    || die 3 "cannot persist Phase 4a timeout: PR head moved from $HEAD_SHA to $live_head"
+
+  comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Phase 4a timeout comments") \
+    || die 3 "cannot persist Phase 4a timeout: issue comments are unreadable"
+  state=$(codex_phase4a_timeout_marker_state "$HEAD_SHA" "$AUTHOR_IDENTITY" "$comments")
+  case "$(printf '%s' "$state" | jq -r '.state // "malformed"')" in
+    current)
+      PHASE4A_TERMINAL_COMMENT_ID=$(printf '%s' "$state" | jq -r '.marker_id // empty')
+      codex_phase4a_comment_id_ok "$PHASE4A_TERMINAL_COMMENT_ID" \
+        || die 3 "existing Phase 4a timeout marker has no valid comment id"
+      PHASE4A_TERMINAL_RECORDED=true
+      log "Phase 4a timeout already recorded for $HEAD_SHA as comment $PHASE4A_TERMINAL_COMMENT_ID (idempotent)"
+      return 0
+      ;;
+    malformed)
+      die 3 "cannot persist Phase 4a timeout: trusted terminal-marker evidence is malformed"
+      ;;
+    none|stale) ;;
+    *) die 3 "cannot persist Phase 4a timeout: terminal-marker state is unreadable" ;;
+  esac
+
+  # The marker is bound to an actual author-owned trigger. This is stronger
+  # than trusting a hand-authored assertion that a timeout happened, and keeps
+  # "no request" distinct from "requested and timed out".
+  codex_phase4a_trigger_comment_present "$AUTHOR_IDENTITY" "$TERMINAL_TRIGGER_COMMENT_ID" "$comments" \
+    || die 3 "cannot persist Phase 4a timeout: confirmed trigger comment is absent from the live author-owned timeline"
+  marker_body=$(codex_phase4a_timeout_marker_body "$HEAD_SHA" "$TERMINAL_TRIGGER_COMMENT_ID") \
+    || die 3 "cannot build Phase 4a timeout marker for head $HEAD_SHA"
+
+  log "recording ordinary Phase 4a timeout for $HEAD_SHA on the PR timeline (#1085)"
+  post_author_pr_comment "$marker_body" "Phase 4a timeout determination"
+  post_id=$(printf '%s' "$AUTHOR_COMMENT_OUTPUT" | grep -oE 'issuecomment-[0-9]+' | head -1 | sed 's/issuecomment-//' || true)
+  codex_phase4a_comment_id_ok "$post_id" \
+    || die 3 "Phase 4a timeout marker write returned success but yielded no comment id"
+
+  # Mandatory readback: a zero write status is not proof that the intended
+  # author/body landed. Re-read the paginated timeline and run the SAME parser
+  # Phase 4b will use, then also require this exact new comment object.
+  comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Phase 4a timeout marker readback") \
+    || die 3 "Phase 4a timeout marker posted but readback failed"
+  fresh_state=$(codex_phase4a_timeout_marker_state "$HEAD_SHA" "$AUTHOR_IDENTITY" "$comments")
+  [ "$(printf '%s' "$fresh_state" | jq -r '.state // "malformed"')" = current ] \
+    || die 3 "Phase 4a timeout marker posted but shared-parser readback did not validate it"
+  printf '%s' "$comments" | jq -e --argjson id "$post_id" --arg who "$AUTHOR_IDENTITY" --arg body "$marker_body" '
+    any(.[]?; (.id == $id) and ((.user.login // "") == $who) and ((.body // "") == $body))
+  ' >/dev/null 2>&1 \
+    || die 3 "Phase 4a timeout marker posted but exact comment readback did not match"
+
+  PHASE4A_TERMINAL_RECORDED=true
+  PHASE4A_TERMINAL_COMMENT_ID="$post_id"
+  log "confirmed Phase 4a timeout marker comment $post_id for $HEAD_SHA"
+}
+
 # --- pre-flight: is Codex already working on HEAD? --------------------------
 
 log "checking for existing Codex signal on HEAD"
@@ -1351,6 +1471,7 @@ fi
 reset_review_wait_clock
 TRIGGER_POSTED=false
 TRIGGER_COMMENT_ID=""
+TERMINAL_TRIGGER_COMMENT_ID=""
 TRIGGER_POST_TIME=""
 TRIGGER_SIGNAL_THRESHOLD=""
 
@@ -1390,6 +1511,7 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
       reaction: null,
       verdict: null,
       blocked_reason: null,
+      terminal_determination: null,
       trigger_posted: $trigger_posted,
       trigger_requested: true,
       trigger_only: true,
@@ -1469,6 +1591,17 @@ done
 # from a prior HEAD does not leak into this run's report. Empty ⇒ null.
 BLOCKED_REASON=$(current_blocked_reason "$FINAL_SCAN")
 
+# A plain timeout is a terminal Phase 4a determination, not ordinary pending.
+# Persist it before emitting exit 4 so a later Phase 4b process can consume it.
+# Provider-authored account/connection blocks keep their existing, distinct
+# blocked_reason/diagnostic-exit-2 path and must not create this marker.
+PHASE4A_TERMINAL_RECORDED=false
+PHASE4A_TERMINAL_COMMENT_ID=""
+if [ "$TRIGGER_POSTED" = true ] && [ -z "$BLOCKED_REASON" ] \
+   && ! has_post_trigger_signal "$FINAL_SCAN"; then
+  record_phase4a_timeout_determination
+fi
+
 jq -n \
   --argjson pr_number "$PR_NUMBER" \
   --arg repo "$REPO" \
@@ -1478,6 +1611,8 @@ jq -n \
   --argjson scan "$FINAL_SCAN" \
   --argjson trigger_posted "$TRIGGER_POSTED" \
   --arg blocked_reason "$BLOCKED_REASON" \
+  --argjson terminal_recorded "$PHASE4A_TERMINAL_RECORDED" \
+  --arg terminal_comment_id "$PHASE4A_TERMINAL_COMMENT_ID" \
   --argjson elapsed "$ELAPSED" '
   {
     pr_number: $pr_number,
@@ -1490,6 +1625,11 @@ jq -n \
     reaction: $scan.reaction,
     verdict: $scan.verdict,
     blocked_reason: (if $blocked_reason == "" then null else $blocked_reason end),
+    terminal_determination: (if $terminal_recorded then {
+      provider: "codex",
+      outcome: "timeout",
+      marker_comment_id: ($terminal_comment_id | tonumber)
+    } else null end),
     trigger_posted: $trigger_posted,
     trigger_requested: true,
     rounds_waited_seconds: $elapsed

@@ -39,6 +39,8 @@ REQUIRED_EXEC=(
 REQUIRED_FILES=(
   "scripts/phase-4b/lib.sh"
   "scripts/phase-4b/verdict.schema.json"
+  "scripts/lib/codex-failure-markers.sh"
+  "scripts/lib/gh-api-array.sh"
 )
 TEST="tests/test_phase_4b_automation.sh"
 
@@ -93,6 +95,7 @@ if command -v shellcheck >/dev/null 2>&1; then
   if ! shellcheck --severity=warning \
       "$REPO_ROOT/scripts/phase-4b-review.sh" \
       "$REPO_ROOT/scripts/phase-4b/lib.sh" \
+      "$REPO_ROOT/scripts/lib/codex-failure-markers.sh" \
       "$REPO_ROOT/scripts/phase-4b/adapters/review-via-codex.sh" \
       "$REPO_ROOT/scripts/phase-4b/adapters/review-via-claude.sh" \
       "$REPO_ROOT/scripts/phase-4b/collect-enablement-evidence.sh" \

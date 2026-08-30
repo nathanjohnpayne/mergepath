@@ -58,6 +58,7 @@ make_case() {
   # #1008: the array twin, hard-sourced for the same reason — every signal
   # the poll loop scans for arrives through it.
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"
+  cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
 codex:
@@ -78,17 +79,30 @@ if [ "${1:-}" != "--" ] || [ "${2:-}" != "gh" ] || [ "${3:-}" != "pr" ] || [ "${
   echo "unexpected gh-as-author invocation: $*" >&2
   exit 97
 fi
-if [ "${8:-}" != "--body" ] || [ "${9:-}" != "@codex review" ]; then
-  echo "trigger body was not exact '@codex review': $*" >&2
-  exit 98
-fi
+body=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --body) body=${2-}; shift 2 ;;
+    --body-file)
+      body=$(cat "${2-}"; printf x)
+      body=${body%x}
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+case "$body" in
+  '@codex review') kind=trigger ;;
+  '<!-- mergepath-phase-4a-terminal:'*) kind=terminal ;;
+  *) echo "unexpected author comment body: $body" >&2; exit 98 ;;
+esac
 
 count=0
-if [ -f "$state_dir/trigger-count" ]; then
-  count=$(cat "$state_dir/trigger-count")
+if [ -f "$state_dir/$kind-count" ]; then
+  count=$(cat "$state_dir/$kind-count")
 fi
 count=$((count + 1))
-printf '%s\n' "$count" >"$state_dir/trigger-count"
+printf '%s\n' "$count" >"$state_dir/$kind-count"
 
 # Record the author-PAT and author-identity env the wrapper sees, so
 # the #438 inline-token bridging tests can assert what (if anything)
@@ -96,13 +110,23 @@ printf '%s\n' "$count" >"$state_dir/trigger-count"
 printf '%s\n' "${OP_PREFLIGHT_AUTHOR_PAT:-}" >>"$state_dir/author-pat-env"  # TOKEN_OUTPUT_EXEMPT: run_case unsets both PATs (#993), so this records only what the bridge injected, and the assertions compare it exactly (#996)
 printf '%s\n' "${GH_AS_AUTHOR_IDENTITY:-}" >>"$state_dir/author-identity-env"
 
-comment_id=$((1000 + count))
-printf '%s\n' "$comment_id" >>"$state_dir/trigger-comments"
-if [ "${CODEX_TEST_SCENARIO:-}" = "no_comment_id" ]; then
+post_count=0
+[ -f "$state_dir/post-count" ] && post_count=$(cat "$state_dir/post-count")
+post_count=$((post_count + 1))
+printf '%s\n' "$post_count" >"$state_dir/post-count"
+comment_id=$((1000 + post_count))
+created_at="2026-06-04T00:00:$(printf '%02d' "$((post_count - 1))")Z"
+jq -cn --argjson id "$comment_id" --arg who "${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}" \
+  --arg body "$body" --arg created "$created_at" \
+  '{id:$id,user:{login:$who},body:$body,created_at:$created}' >>"$state_dir/comments.jsonl"
+if [ "$kind" = trigger ]; then
+  printf '%s\n' "$comment_id" >>"$state_dir/trigger-comments"
+fi
+if [ "$kind" = trigger ] && [ "${CODEX_TEST_SCENARIO:-}" = "no_comment_id" ]; then
   printf 'https://github.com/owner/repo/pull/999#discussion_r%s\n' "$comment_id"
   exit 0
 fi
-if [ "${CODEX_TEST_SCENARIO:-}" = "retry_no_comment_id" ] && [ "$count" -gt 1 ]; then
+if [ "$kind" = trigger ] && [ "${CODEX_TEST_SCENARIO:-}" = "retry_no_comment_id" ] && [ "$count" -gt 1 ]; then
   printf 'https://github.com/owner/repo/pull/999#discussion_r%s\n' "$comment_id"
   exit 0
 fi
@@ -141,9 +165,13 @@ endpoint=${1:-}
 
 case "$endpoint" in
   repos/owner/repo/pulls/999)
-    printf '{"head":{"sha":"head-sha"}}\n'
+    if [ "${2:-}" = "--jq" ]; then
+      printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+    else
+      printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}\n'
+    fi
     ;;
-  repos/owner/repo/commits/head-sha)
+  repos/owner/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
     printf '%s\n' "$now"
     ;;
   repos/owner/repo/issues/999/timeline)
@@ -156,7 +184,7 @@ case "$endpoint" in
         count=$(cat "$state_dir/trigger-count")
       fi
       if [ "$count" -ge 2 ]; then
-        printf '[{"id":77,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"head-sha","body":"review for original trigger"}]\n' "$bot"
+        printf '[{"id":77,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"review for original trigger"}]\n' "$bot"
       else
         printf '[]\n'
       fi
@@ -175,7 +203,11 @@ case "$endpoint" in
     fi
     ;;
   repos/owner/repo/issues/999/comments)
-    printf '[]\n'
+    if [ -f "$state_dir/comments.jsonl" ]; then
+      jq -sc '.' "$state_dir/comments.jsonl"
+    else
+      printf '[]\n'
+    fi
     ;;
   repos/owner/repo/issues/comments/*/reactions)
     printf '%s\n' "$endpoint" >>"$state_dir/ack-endpoints"
@@ -367,21 +399,23 @@ test_skip_path_posts_no_trigger_or_ack_check() {
   fi
 }
 
-test_missing_comment_id_does_not_retrigger() {
+test_missing_comment_id_fails_closed_without_timeout_marker() {
   local dir rc count ack_count
   dir=$(make_case "missing-comment-id" 0 1)
   rc=$(run_case "$dir" no_comment_id)
   count=$(trigger_count "$dir")
   ack_count=$(ack_endpoint_count "$dir")
 
-  if [ "$rc" != "4" ]; then
-    fail "missing comment id: exit $rc, expected 4; stderr=$(cat "$dir/err.log")"
+  if [ "$rc" != "3" ]; then
+    fail "missing comment id: exit $rc, expected 3 because no confirmed trigger can anchor the durable timeout; stderr=$(cat "$dir/err.log")"
   elif [ "$count" != "1" ]; then
     fail "missing comment id: trigger count $count, expected no retry without a pollable id"
   elif [ "$ack_count" != "0" ]; then
     fail "missing comment id: ack endpoint called $ack_count times, expected 0"
+  elif [ -f "$dir/state/terminal-count" ]; then
+    fail "missing comment id: terminal marker was posted without a confirmed trigger id"
   else
-    pass "missing trigger comment id: ack gate skipped without re-trigger"
+    pass "missing trigger comment id: timeout persistence fails closed without fabricating a terminal marker (#1085)"
   fi
 }
 
@@ -689,7 +723,7 @@ test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
 test_retry_cap_respected
 test_skip_path_posts_no_trigger_or_ack_check
-test_missing_comment_id_does_not_retrigger
+test_missing_comment_id_fails_closed_without_timeout_marker
 test_retry_missing_comment_id_stops_without_extra_retry
 test_retry_resets_review_deadline
 test_retry_preserves_original_trigger_response

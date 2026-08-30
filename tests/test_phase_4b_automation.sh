@@ -2762,6 +2762,64 @@ else
   fail "#814: trigger idempotency wrong:$bad"
 fi
 
+# #1085: Phase 4a's ordinary timeout must survive process/checkout boundaries
+# without making an unrequested head look terminal. The durable evidence is an
+# author-owned, exact-head PR comment bound to the author-owned trigger it
+# timed out waiting on. This table is pure so malformed/forged/stale evidence
+# is pinned independently of the live API reader below.
+_p4a_head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+_p4a_old=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+_p4a_author=nathanjohnpayne
+_p4a_trigger_id=4101
+_p4a_marker_id=4102
+_p4a_marker="<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=$_p4a_head trigger_comment_id=$_p4a_trigger_id -->"
+_p4a_old_marker="<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=$_p4a_old trigger_comment_id=$_p4a_trigger_id -->"
+_p4a_comments() { # marker_body marker_author [include_trigger]
+  jq -cn --arg marker "$1" --arg who "$2" --arg author "$_p4a_author" \
+    --argjson include "${3:-true}" --argjson tid "$_p4a_trigger_id" \
+    --argjson mid "$_p4a_marker_id" '
+    ((if $include then [{id:$tid,user:{login:$author},body:"@codex review",created_at:"2026-08-30T00:00:00Z"}] else [] end)
+     + [{id:$mid,user:{login:$who},body:$marker,created_at:"2026-08-30T00:15:00Z"}])'
+}
+_p4a_state() {
+  local out
+  out="$(codex_phase4a_timeout_marker_state "$1" "$_p4a_author" "$2" 2>/dev/null)" \
+    || out='{"state":"missing-helper"}'
+  printf '%s' "$out" | jq -r '.state // "invalid-json"' 2>/dev/null || printf 'invalid-json'
+}
+
+bad=""
+_comments="$(_p4a_comments "$_p4a_marker" "$_p4a_author")"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = current ] || bad="$bad current"
+[ "$(_p4a_state "$_p4a_head" '[]')" = none ] || bad="$bad none"
+_comments="$(jq -cn --arg who "$_p4a_author" --argjson id "$_p4a_trigger_id" \
+  '[{id:$id,user:{login:$who},body:"@codex review",created_at:"2026-08-30T00:00:00Z"}]')"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = none ] || bad="$bad trigger-still-pending"
+_comments="$(_p4a_comments "$_p4a_old_marker" "$_p4a_author")"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = stale ] || bad="$bad stale"
+_comments="$(_p4a_comments "$_p4a_marker" someone-else)"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = none ] || bad="$bad forged-author"
+_comments="$(_p4a_comments '<!-- mergepath-phase-4a-terminal:v2 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=4101 -->' "$_p4a_author")"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = malformed ] || bad="$bad unknown-version"
+_comments="$(_p4a_comments "quoted: $_p4a_marker" "$_p4a_author")"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = none ] || bad="$bad quoted"
+_comments="$(_p4a_comments "$_p4a_marker" "$_p4a_author" false)"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = malformed ] || bad="$bad missing-trigger"
+_comments="$(_p4a_comments "$_p4a_marker" "$_p4a_author" | jq -c '.[0].user.login = "someone-else"')"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = malformed ] || bad="$bad wrong-author-trigger"
+_comments="$(_p4a_comments "$_p4a_marker" "$_p4a_author" | jq -c '.[0].body = "@codex review please"')"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = malformed ] || bad="$bad nonexact-trigger"
+_comments="$(_p4a_comments "$_p4a_marker" "$_p4a_author" | jq -c '.[0].created_at = "2026-08-30T00:20:00Z"')"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = malformed ] || bad="$bad later-trigger"
+_comments="$(jq -cn --argjson one "$(_p4a_comments "$_p4a_marker" "$_p4a_author")" '$one + [$one[1] + {id:4103}]')"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = current ] || bad="$bad idempotent-duplicate"
+if [ -z "$bad" ]; then
+  pass "#1085: Phase 4a timeout evidence is exact-head, author/trigger-bound, and fail-closed on malformed input"
+else
+  fail "#1085: Phase 4a timeout evidence classification wrong:$bad"
+fi
+unset -f _p4a_comments _p4a_state
+
 # Never re-ask a provider that is already working or has already refused:
 # both spend from the same pool the barrier exists to conserve.
 bad=""
@@ -2780,10 +2838,30 @@ fi
 # Composition. Stubs stand in for both provider CLIs; `gh` is stubbed on PATH
 # so nothing reaches the network, and dry=true so no trigger is ever posted.
 mkdir -p "$WORK/barrier-bin" "$WORK/barrier-state"
-printf '#!/bin/sh\necho "[]"\n' >"$WORK/barrier-bin/gh"
+cat >"$WORK/barrier-bin/gh" <<'EOF'
+#!/bin/sh
+set -eu
+[ "${1:-}" = api ] || exit 99
+shift
+endpoint=${1:-}
+[ "$endpoint" = --paginate ] && { shift; endpoint=${1:-}; }
+case "$endpoint" in
+  repos/owner/repo/issues/7/comments)
+    [ "${P4B_TEST_COMMENTS_FAIL:-false}" != true ] || exit 42
+    printf '%s\n' "${P4B_TEST_COMMENTS_JSON-[]}" ;;
+  repos/owner/repo/pulls/7)
+    if [ "${2:-}" = --jq ]; then
+      printf '%s\n' "${P4B_TEST_LIVE_HEAD:-abc123}"
+    else
+      printf '{"head":{"sha":"%s"}}\n' "${P4B_TEST_LIVE_HEAD:-abc123}"
+    fi ;;
+  *)
+    printf '[]\n' ;;
+esac
+EOF
 chmod +x "$WORK/barrier-bin/gh"
 
-_barrier() { # <cx_rc> <cr_rc> <cr_json> [policy]
+_barrier() { # <cx_rc> <cr_rc> <cr_json> [policy] [head]
   printf '#!/bin/sh\nexit %s\n' "$1" >"$WORK/stub-cx.sh"
   printf "#!/bin/sh\nprintf '%%s' '%s'\nexit %s\n" "$3" "$2" >"$WORK/stub-cr.sh"
   chmod +x "$WORK/stub-cx.sh" "$WORK/stub-cr.sh"
@@ -2792,8 +2870,10 @@ _barrier() { # <cx_rc> <cr_rc> <cr_json> [policy]
     export P4B_ACCT_STATE_DIR="$WORK/barrier-state"
     export P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx.sh"
     export P4B_CODERABBIT_WAIT="$WORK/stub-cr.sh"
+    export P4B_TEST_COMMENTS_JSON="${P4B_TEST_COMMENTS_JSON-[]}" P4B_TEST_LIVE_HEAD="${P4B_TEST_LIVE_HEAD:-${5:-abc123}}"
+    export P4B_TEST_COMMENTS_FAIL="${P4B_TEST_COMMENTS_FAIL:-false}"
     export PATH="$WORK/barrier-bin:$PATH"
-    p4b_same_head_barrier owner/repo 7 abc123 rev-bot true
+    p4b_same_head_barrier owner/repo 7 "${5:-abc123}" rev-bot true
   )
 }
 
@@ -2803,6 +2883,7 @@ coderabbit:
   max_wait_seconds: 100
 codex:
   enabled: true
+author_identity: nathanjohnpayne
 EOF
 cat >"$WORK/barrier-off.yml" <<'EOF'
 coderabbit:
@@ -2849,6 +2930,87 @@ else
   fail "#814: barrier composition wrong:$bad"
 fi
 
+# #1085 end to end: only a valid timeout determination for the head under
+# review may turn diagnostic rc=1 into a waiver. Ordinary absence/pending,
+# stale evidence, malformed evidence, and head drift retain distinct states.
+bad=""
+_trigger=$(jq -cn --argjson id "$_p4a_trigger_id" --arg who "$_p4a_author" \
+  '[{id:$id,user:{login:$who},body:"@codex review",created_at:"2026-08-30T00:00:00Z"}]')
+_current=$(printf '%s' "$_trigger" | jq -c --arg body "$_p4a_marker" --arg who "$_p4a_author" --argjson id "$_p4a_marker_id" \
+  '. + [{id:$id,user:{login:$who},body:$body,created_at:"2026-08-30T00:15:00Z"}]')
+_stale=$(printf '%s' "$_trigger" | jq -c --arg body "$_p4a_old_marker" --arg who "$_p4a_author" --argjson id "$_p4a_marker_id" \
+  '. + [{id:$id,user:{login:$who},body:$body,created_at:"2026-08-30T00:15:00Z"}]')
+_malformed=$(printf '%s' "$_trigger" | jq -c --arg who "$_p4a_author" --argjson id "$_p4a_marker_id" \
+  '. + [{id:$id,user:{login:$who},body:"<!-- mergepath-phase-4a-terminal:v9 -->",created_at:"2026-08-30T00:15:00Z"}]')
+_p4a_nosub="$WORK/policy-p4a-nosub.yml"
+cat >"$_p4a_nosub" <<'EOF'
+author_identity: nathanjohnpayne
+coderabbit:
+  enabled: true
+  max_wait_seconds: 100
+codex:
+  enabled: true
+  allow_phase_4b_substitute: false
+EOF
+
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_COMMENTS_JSON="$_current" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] || bad="$bad current-timeout-held"
+[ "$(printf '%s' "$out" | jq -r '.codex')" = waived ] || bad="$bad current-timeout-class"
+[ "$(printf '%s' "$out" | jq -r '.codex_evidence')" = timeout ] || bad="$bad current-timeout-evidence"
+
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad no-determination-not-pending"
+[ "$(printf '%s' "$out" | jq -r '.codex_evidence')" = none ] || bad="$bad no-determination-evidence"
+
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_COMMENTS_JSON="$_stale" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad stale-not-pending"
+[ "$(printf '%s' "$out" | jq -r '.codex_evidence')" = stale ] || bad="$bad stale-evidence"
+
+out="$(P4B_TEST_COMMENTS_JSON="$_malformed" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad malformed-not-escalated"
+[ "$(printf '%s' "$out" | jq -r '.codex_evidence')" = malformed ] || bad="$bad malformed-evidence"
+
+out="$(P4B_TEST_COMMENTS_FAIL=true P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad unreadable-not-escalated"
+[ "$(printf '%s' "$out" | jq -r '.codex_evidence')" = unreadable ] || bad="$bad unreadable-evidence"
+
+# The canonical paginated-list reader must reject response streams that a
+# naive `jq -s 'add // []'` would manufacture into [] or partially accept.
+for _stream_case in empty null mixed; do
+  case "$_stream_case" in
+    empty) _stream='' ;;
+    null) _stream='null' ;;
+    mixed) _stream="$(printf 'null\n%s' "$_current")" ;;
+  esac
+  out="$(P4B_TEST_COMMENTS_JSON="$_stream" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+    _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+  [ "$rc" = 2 ] || bad="$bad ${_stream_case}-stream-not-escalated"
+  [ "$(printf '%s' "$out" | jq -r '.codex_evidence')" = unreadable ] \
+    || bad="$bad ${_stream_case}-stream-evidence"
+done
+
+out="$(P4B_TEST_COMMENTS_JSON="$_current" P4B_TEST_LIVE_HEAD="$_p4a_old" \
+  _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad drift-not-escalated"
+printf '%s' "$out" | jq -e '.reason | test("head moved")' >/dev/null 2>&1 || bad="$bad drift-reason"
+
+out="$(P4B_TEST_COMMENTS_JSON="$_current" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$_p4a_nosub" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad timeout-nosub-not-escalated"
+if [ -z "$bad" ]; then
+  pass "#1085: a durable current-head timeout opens Phase 4b; pending, stale, malformed, drift, and no-substitute remain distinct"
+else
+  fail "#1085: Phase 4a timeout handoff routing wrong:$bad"
+fi
+
 # An account-blocked Codex must WAIVE, not hold. Phase 4b is the documented
 # fallback for "4a unavailable", so holding the run behind a Codex that cannot
 # report meant the automated leg could never serve that role — it waited out
@@ -2866,6 +3028,7 @@ printf '%s' "$out" | jq -e '.codex == "waived"' >/dev/null 2>&1 || bad="$bad blo
 # substitute disabled, waiving would let the leg post a review the merge gate
 # rejects by design — a green run leaving the PR unmergeable (Codex P2 on #842).
 cat >"$WORK/policy-nosub.yml" <<'EOF'
+author_identity: nathanjohnpayne
 coderabbit:
   enabled: true
   max_wait_seconds: 100
@@ -3042,6 +3205,7 @@ out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" \
   P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
   P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
+  PATH="$WORK/barrier-bin:$PATH" \
   bash "$ORCH" 814 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 6 ] \

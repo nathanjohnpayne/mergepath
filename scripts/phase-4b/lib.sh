@@ -26,6 +26,28 @@ p4b_die()  { local c="$1"; shift; echo "[phase-4b] ERROR: $*" >&2; exit "$c"; }
 # are found regardless of $PWD or how the caller was invoked.
 P4B_LIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# #1085 durable Phase 4a timeout grammar. The orchestrator's manifest requires
+# this helper alongside the Phase 4b kit; retain an explicit readiness bit so
+# a partial propagation skew escalates instead of silently treating an
+# unreadable timeout handoff as ordinary pending.
+P4B_CODEX_TERMINAL_MARKERS_OK=false
+if [ -r "$P4B_LIB_DIR/../lib/codex-failure-markers.sh" ]; then
+  # shellcheck source=../lib/codex-failure-markers.sh
+  . "$P4B_LIB_DIR/../lib/codex-failure-markers.sh"
+  P4B_CODEX_TERMINAL_MARKERS_OK=true
+fi
+
+# The timeout handoff is reconstructed from the paginated PR comment list.
+# Use the repository's one strict list reader (#1008): it rejects transport
+# failures as well as empty, null, mixed-shape, and unflattenable pagination
+# streams, so an incomplete timeline can never be graded as clean evidence.
+P4B_GH_API_ARRAY_OK=false
+if [ -r "$P4B_LIB_DIR/../lib/gh-api-array.sh" ]; then
+  # shellcheck source=../lib/gh-api-array.sh
+  . "$P4B_LIB_DIR/../lib/gh-api-array.sh"
+  P4B_GH_API_ARRAY_OK=true
+fi
+
 # Resolve the repo root from this library's own location (follow symlinks),
 # NOT $PWD — the same posture scripts/phase-4b-classifier.sh uses so a
 # PATH-symlinked or subdir invocation still finds the policy file.
@@ -360,6 +382,76 @@ p4b_barrier_class_codex() {
     1) printf 'not-yet' ;;
     2) printf 'waived' ;;
     *) printf 'escalate' ;;
+  esac
+}
+
+# p4b_codex_timeout_determination <repo> <pr> <reviewed-head>
+# Reconstruct the durable Phase 4a timeout handoff from GitHub. Emits JSON and
+# returns:
+#   0 current  — trusted exact-head timeout record; Phase 4b may waive Codex
+#   1 absent   — none or stale only; ordinary not-yet remains in force
+#   2 unsafe   — unreadable/malformed evidence or live-head drift; escalate
+#
+# The comments read is paginated and its failure is never collapsed to an
+# empty timeline. A matching marker causes one more live PR-head read before
+# it is consumed: a push between the orchestrator's initial HEAD capture and
+# this point must not let H's timeout waive H2 (including when CodeRabbit is
+# disabled and cannot independently expose the drift).
+p4b_codex_timeout_determination() {
+  local repo="$1" pr="$2" head="$3" comments state class live_head="" author
+  if [ "$P4B_CODEX_TERMINAL_MARKERS_OK" != true ] \
+     || ! command -v codex_phase4a_timeout_marker_state >/dev/null 2>&1; then
+    jq -nc '{state:"unreadable",reason:"terminal-marker-helper-unavailable"}'
+    return 2
+  fi
+  if [ "$P4B_GH_API_ARRAY_OK" != true ] \
+     || ! command -v gh_api_array >/dev/null 2>&1; then
+    jq -nc '{state:"unreadable",reason:"array-reader-unavailable"}'
+    return 2
+  fi
+
+  comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "Phase 4a timeout comments")" \
+    || { jq -nc '{state:"unreadable",reason:"comments-read-failed"}'; return 2; }
+  # Fast-path the overwhelmingly common case and preserve the existing short
+  # SHA fixtures used by the #814 suite. Marker bodies themselves still accept
+  # only full object ids; an empty timeline cannot contain malformed evidence.
+  if [ "$comments" = "[]" ]; then
+    jq -nc '{state:"none"}'
+    return 1
+  fi
+
+  author="$(p4b_top_field author_identity)"
+  author="${author:-nathanjohnpayne}"
+  state="$(codex_phase4a_timeout_marker_state "$head" "$author" "$comments")"
+  class="$(printf '%s' "$state" | jq -r '.state // "malformed"' 2>/dev/null || printf malformed)"
+  case "$class" in
+    current)
+      live_head="$(gh api "repos/$repo/pulls/$pr" --jq '.head.sha' 2>/dev/null)" \
+        || { jq -nc '{state:"unreadable",reason:"head-read-failed"}'; return 2; }
+      if ! codex_phase4a_full_sha_ok "$live_head"; then
+        jq -nc --arg h "$live_head" '{state:"unreadable",reason:"head-shape",live_head:$h}'
+        return 2
+      fi
+      if [ "$live_head" != "$head" ]; then
+        jq -nc --arg h "$head" --arg l "$live_head" \
+          '{state:"drift",reason:"head-moved",reviewed_head:$h,live_head:$l}'
+        return 2
+      fi
+      printf '%s' "$state" | jq -c --arg h "$live_head" '. + {live_head:$h}'
+      return 0
+      ;;
+    none|stale)
+      printf '%s' "$state"
+      return 1
+      ;;
+    malformed)
+      printf '%s' "$state"
+      return 2
+      ;;
+    *)
+      jq -nc --arg s "$class" '{state:"unreadable",reason:"unknown-state",observed:$s}'
+      return 2
+      ;;
   esac
 }
 
@@ -1140,8 +1232,9 @@ p4b_barrier_maybe_resume() {
 # will-not-report, and it cannot flip mid-flight on a live PR.
 p4b_same_head_barrier() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
-  local root cr_bin cx_bin rc json probe_head
+  local root cr_bin cx_bin rc json probe_head cx_timeout_json="" cx_timeout_rc=0
   local pending=false why="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
+  local cx_evidence="disabled"
   local elapsed budget remaining=0
   root="$(p4b_repo_root)"
   cr_bin="${P4B_CODERABBIT_WAIT:-$root/scripts/coderabbit-wait.sh}"
@@ -1157,6 +1250,37 @@ p4b_same_head_barrier() {
     CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
       "$cx_bin" --diagnostic-signal-only "$pr" "$repo" >/dev/null 2>&1 || rc=$?
     cls_cx="$(p4b_barrier_class_codex "$rc")"
+    case "$cls_cx" in
+      reported) cx_evidence="signal" ;;
+      waived) cx_evidence="account-or-connection-block" ;;
+      not-yet)
+        # Diagnostic rc 1 alone means only "no current-head provider signal".
+        # A prior, positively recorded Phase 4a timeout for this head refines
+        # that absence into the documented fallback; no record remains pending.
+        cx_timeout_rc=0
+        cx_timeout_json="$(p4b_codex_timeout_determination "$repo" "$pr" "$head")" || cx_timeout_rc=$?
+        cx_evidence="$(printf '%s' "$cx_timeout_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+        case "$cx_timeout_rc" in
+          0) cls_cx="waived"; cx_evidence="timeout" ;;
+          1) ;; # none/stale: keep ordinary not-yet
+          *)
+            cls_cx="escalate"
+            case "$cx_evidence" in
+              drift)
+                why="PR head moved during evaluation (reviewing $head, live $(printf '%s' "$cx_timeout_json" | jq -r '.live_head // "unknown"')) — rerun on the new head"
+                ;;
+              malformed)
+                why="Phase 4a timeout evidence is malformed; refusing to waive Codex"
+                ;;
+              *)
+                why="Phase 4a timeout evidence is unreadable; refusing to treat Codex as terminal"
+                ;;
+            esac
+            ;;
+        esac
+        ;;
+      *) cx_evidence="diagnostic-error" ;;
+    esac
     # Waiving an account-blocked Codex only helps where a Phase 4b APPROVED can
     # actually clear gate (c). With codex.allow_phase_4b_substitute: false the
     # merge gate rejects that review by design, so opening the barrier would
@@ -1167,7 +1291,11 @@ p4b_same_head_barrier() {
     if [ "$cls_cx" = waived ] \
        && [ "$(p4b_policy_block_field codex allow_phase_4b_substitute)" = "false" ]; then
       cls_cx="escalate"
-      why="Codex is account-blocked and codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c) — a human must resolve the block"
+      if [ "$cx_evidence" = timeout ]; then
+        why="Phase 4a timed out on $head, but codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c)"
+      else
+        why="Codex is account-blocked and codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c) — a human must resolve the block"
+      fi
     fi
     case "$cls_cx" in
       reported|will-not-report|waived) ;;
@@ -1256,17 +1384,17 @@ p4b_same_head_barrier() {
   fi
 
   if [ -n "$why" ]; then
-    jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg t "$trigger" --arg rs "$resume" \
-      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, trigger:$t, resume:$rs}'
+    jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg t "$trigger" --arg rs "$resume" \
+      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, codex_evidence:$ce, trigger:$t, resume:$rs}'
     return 2
   fi
   if [ "$pending" = true ]; then
-    jq -nc --argjson ra "$remaining" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg t "$trigger" --arg rs "$resume" \
-      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, trigger:$t, resume:$rs}'
+    jq -nc --argjson ra "$remaining" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg t "$trigger" --arg rs "$resume" \
+      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, codex_evidence:$ce, trigger:$t, resume:$rs}'
     return 1
   fi
-  jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" \
-    '{decision:"open", coderabbit:$cr, codex:$cx}'
+  jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
+    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce}'
   return 0
 }
 
