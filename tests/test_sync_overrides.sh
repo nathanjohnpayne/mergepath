@@ -539,6 +539,45 @@ else
   pass "override_substitution_for treats empty .value as no override"
 fi
 
+# Test 31: a malformed propagation manifest must report the parse failure,
+# not silently collapse to the distinct "no paths declared" condition. The
+# validator only reads manifest paths when skip_paths is non-empty, so keep a
+# valid override in this fixture to exercise that branch.
+malformed_manifest="$WORKDIR/malformed-manifest.yml"
+cat >"$malformed_manifest" <<'YAML'
+version: 1
+paths:
+  - path: scripts/keep-in-sync.sh
+   type: canonical
+YAML
+manifest_parse_override="$WORKDIR/manifest-parse-override.yml"
+cat >"$manifest_parse_override" <<'YAML'
+version: 1
+skip_paths:
+  - path: scripts/keep-in-sync.sh
+    reason: exercise manifest parsing
+YAML
+out=$("$VALIDATOR" "$manifest_parse_override" "$malformed_manifest" 2>&1 || true)
+if echo "$out" | grep -q "failed to parse manifest" \
+   && ! echo "$out" | grep -q "has no paths declared"; then
+  pass "malformed manifest → parse failure is preserved"
+else
+  fail "malformed manifest should preserve its parse failure; got: $out"
+fi
+
+empty_paths_manifest="$WORKDIR/empty-paths-manifest.yml"
+cat >"$empty_paths_manifest" <<'YAML'
+version: 1
+paths: []
+YAML
+out=$("$VALIDATOR" "$manifest_parse_override" "$empty_paths_manifest" 2>&1 || true)
+if echo "$out" | grep -q "has no paths declared" \
+   && ! echo "$out" | grep -q "failed to parse manifest"; then
+  pass "valid empty manifest paths → distinct no-paths failure is preserved"
+else
+  fail "valid empty manifest paths should retain the no-paths diagnostic; got: $out"
+fi
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

@@ -1396,7 +1396,7 @@ case "${MERGEPATH_TEST_GIT_FAILURE:-}" in
     ;;
   source-blob)
     case " $* " in
-      *" show "*":scripts/runtime-kit/check_a "*) printf 'runtime kit a v1\n'; exit 42 ;;
+      *" show "?*":scripts/runtime-kit/check_a "*) printf 'runtime kit a v1\n'; exit 42 ;;
     esac
     ;;
   templated-consumer-blob)
@@ -1408,6 +1408,28 @@ esac
 exec "$MERGEPATH_TEST_REAL_GIT" "$@"
 GITSTUB
 chmod +x "$REQ_FAKE_BIN/git"
+
+# The Case 15 fault must isolate only the source revision read. If it also
+# catches the staged consumer read, that second failure can keep the test green
+# even after the source-status guard regresses.
+set +e
+source_blob_probe=$(MERGEPATH_TEST_GIT_FAILURE=source-blob \
+  MERGEPATH_TEST_REAL_GIT="$REQ_REAL_GIT" \
+  "$REQ_FAKE_BIN/git" -C "$REQ_MP" show "$req_sha:scripts/runtime-kit/check_a" 2>&1)
+source_blob_rc=$?
+consumer_blob_probe=$(MERGEPATH_TEST_GIT_FAILURE=source-blob \
+  MERGEPATH_TEST_REAL_GIT="$REQ_REAL_GIT" \
+  "$REQ_FAKE_BIN/git" -C "$REQ_MP" show ":scripts/runtime-kit/check_a" 2>&1)
+consumer_blob_rc=$?
+set -e
+if [ "$source_blob_rc" -eq 42 ] \
+   && [ "$source_blob_probe" = "runtime kit a v1" ] \
+   && [ "$consumer_blob_rc" -eq 0 ] \
+   && [ "$consumer_blob_probe" = "runtime kit a v1" ]; then
+  echo "PASS: requires source-blob fault injection isolates the source revision read"
+else
+  fail "requires source-blob fault injection leaked across reads (source_rc=$source_blob_rc consumer_rc=$consumer_blob_rc)"
+fi
 
 req_setup_remote() {
   local remote=$1 seed=$2

@@ -191,13 +191,18 @@ if [ "$SKIP_COUNT" -gt 0 ]; then
   # therefore key those entries by destination. Canonical/kit propagation is
   # path-preserving and remains keyed by `.path`.
   MANIFEST_PATHS=()
-  while IFS= read -r _line; do
-    MANIFEST_PATHS+=("$_line")
-  done < <(yq eval '
+  manifest_paths_output=""
+  if ! manifest_paths_output=$(yq eval '
     .paths[]
     | . as $entry
     | (($entry.dest | select($entry.type == "templated")) // $entry.path)
-  ' "$MANIFEST_FILE" 2>/dev/null || true)
+  ' "$MANIFEST_FILE" 2>&1); then
+    fail "failed to parse manifest at $MANIFEST_FILE: $manifest_paths_output"
+  fi
+  while IFS= read -r _line; do
+    [ -z "$_line" ] && continue
+    MANIFEST_PATHS+=("$_line")
+  done <<< "$manifest_paths_output"
   if [ "${#MANIFEST_PATHS[@]}" -eq 0 ]; then
     fail "manifest at $MANIFEST_FILE has no paths declared (cannot validate skip_paths)"
   fi

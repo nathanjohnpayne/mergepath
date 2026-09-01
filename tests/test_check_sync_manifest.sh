@@ -3666,15 +3666,19 @@ FGAP_EOF
     "scripts/ci/"
     "scripts/workflow/"
   )
+  case66_has_edge() {
+    local manifest=$1 target=$2 dep=$3
+    awk -v target="$target" -v dep="$dep" '
+      $0 == "  - path: " target { in_target=1; next }
+      in_target && /^  - / { in_target=0 }
+      in_target && index($0, "      - \"" dep "\"") == 1 { found=1 }
+      END { exit(found ? 0 : 1) }
+    ' "$manifest"
+  }
   author_runtime_missing=""
   for target in "${author_runtime_targets[@]}"; do
     for dep in "${author_runtime_deps[@]}"; do
-      if ! awk -v target="$target" -v dep="$dep" '
-        $0 == "  - path: " target { in_target=1; next }
-        in_target && /^  - path:/ { in_target=0 }
-        in_target && index($0, "      - \"" dep "\"") == 1 { found=1 }
-        END { exit(found ? 0 : 1) }
-      ' "$LIVE_MANIFEST"; then
+      if ! case66_has_edge "$LIVE_MANIFEST" "$target" "$dep"; then
         author_runtime_missing="${author_runtime_missing}\n  - ${target} -> ${dep}"
       fi
     done
@@ -3683,6 +3687,27 @@ FGAP_EOF
     fail "Case 66: gh-as-author runtime closure is incomplete:${author_runtime_missing}"
   else
     pass "Case 66: every #1058 author-wrapper propagation entry repeats the complete runtime closure"
+  fi
+
+  case66_entry_boundary="$WORKDIR/case66-entry-boundary.yml"
+  cat >"$case66_entry_boundary" <<'YAML'
+paths:
+  - path: scripts/gh-as-author.sh
+    type: canonical
+    consumers: all
+  - type: canonical
+    path: scripts/other.sh
+    consumers: all
+    requires:
+      - "scripts/lib/gh-token-resolver.sh"
+YAML
+  if ! yq eval '.' "$case66_entry_boundary" >/dev/null 2>&1; then
+    fail "Case 66a: adversarial manifest fixture must itself be valid YAML"
+  elif case66_has_edge "$case66_entry_boundary" \
+      "scripts/gh-as-author.sh" "scripts/lib/gh-token-resolver.sh"; then
+    fail "Case 66a: a later non-path-first manifest entry leaked its requires edge into the preceding target"
+  else
+    pass "Case 66a: any new manifest entry ends the preceding target's requires scope"
   fi
 
 else
