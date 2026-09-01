@@ -440,9 +440,12 @@ paths:
     # travels with its only caller.
     #
     # HARD-sources scripts/lib/gh-api-scalar.sh (#799) for the post-trigger
-    # timestamp read. Unlike the two soft deps above, an absent lib exits 3:
-    # the read anchors every "newer than my trigger?" comparison in the poll
-    # loop, so degrading it silently is worse than refusing to run.
+    # timestamp read. This helper is unconditionally required; an absent lib
+    # exits 3. By contrast, the auto-trigger helper above is fully soft, while
+    # the failure-marker helper is soft only for provider-marker detection and
+    # required for ordinary-timeout persistence. The scalar read anchors every
+    # "newer than my trigger?" comparison in the poll loop, so degrading it
+    # silently is worse than refusing to run.
     requires:
       - "scripts/lib/codex-failure-markers.sh"
       - "scripts/workflow/codex_auto_trigger_gate.sh"   # #798, content-free auto-trigger gate
