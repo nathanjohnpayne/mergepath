@@ -1142,6 +1142,11 @@ paths:
   - path: tests/test_branch_requirements.sh
     type: canonical
     consumers: all
+    requires:
+      # The suite sources the resolver directly and exercises its real
+      # functions, so a commit-path sync that carried the test without the lib
+      # would fail the consumer lint on a missing source rather than skip.
+      - "scripts/lib/branch-requirements.sh"   # #1064, sourced under test
   # #465 fail-closed structural guards. check_codex_scripts hard-runs it.
   # Propagation-safe (skips workflows/scripts a consumer does not carry).
   - path: tests/test_465_fail_closed.sh
