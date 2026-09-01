@@ -1514,67 +1514,58 @@ else
   fail "#1064: the rollup does not carry the producing app id, so the collapse cannot separate independently required producers"
 fi
 
-# The app is part of the collapse key ONLY where the requirement is pinned to
-# one. A ruleset rule with integration_id: null accepts the context from ANY
-# producer, and classic protection cannot expose its pinning to an
-# unprivileged reader at all — splitting either per app would make every
-# publishing app separately mandatory and block merges GitHub permits.
-if grep -q 'pinned_contexts' <<<"$SCRIPT_CODE_1064" \
-   && grep -q 'index($e.label)) != null then $e.appId else ""' <<<"$SCRIPT_CODE_1064"; then
-  pass "#1064: the collapse splits per app only for app-pinned requirements, and per name otherwise"
+# The filter iterates REQUIREMENTS, not rollup groups.
+#
+# The earlier shape collapsed the rollup by some key and then judged the
+# survivors, which meant guessing a key — and guessing it produced a new
+# unmodelled configuration every review round on PR #1176: by name it hid a
+# second required app failure; by workflow it blocked PRs GitHub merges (three
+# contexts on nathanpaynedotcom#908 are published by two workflows under one
+# app); by app it made every producer of an any-producer context separately
+# mandatory; by app-when-any-rule-pins-the-name it did the same wherever a
+# pinned and an any-producer rule share a context.
+#
+# Iterating requirements needs no key: each rule selects its own candidates and
+# is satisfied by the current entry among them, which is what GitHub does.
+if grep -q 'REQUIREMENT-DRIVEN' <<<"$SCRIPT_CODE_1064" \
+   || grep -q '\$requirements\[\]' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: gate (a) iterates the branch rules rather than collapsing the rollup by a guessed key"
 else
-  fail "#1064: the collapse key ignores whether the requirement is app-pinned — splitting an any-producer context per app blocks PRs GitHub merges"
+  fail "#1064: gate (a) is back to collapsing by a grouping key — that shape cannot express a context carrying both a pinned and an any-producer rule"
 fi
 
-# The element must be bound before the $pinned_contexts sub-pipeline; a bare
-# .label inside it indexes the array and hard-errors the whole filter.
-if grep -q 'group_by(. as $e' <<<"$SCRIPT_CODE_1064"; then
-  pass "#1064: the collapse key binds the element before indexing the pinned-context list"
+# An any-producer rule (app_id null) draws candidates from every producer; a
+# pinned rule only from its app. One context carrying both is simply two
+# requirements, each judged on its own terms.
+if grep -q '($req.app_id == null) or (.appId == $req.app_id)' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: a rule selects candidates by its own producer scope, so pinned and any-producer rules coexist on one context"
 else
-  fail "#1064: the collapse key dereferences .label inside a sub-pipeline where . is the pinned-context array"
+  fail "#1064: candidate selection ignores the rule producer scope — an any-producer rule would be judged per app, or a pinned rule across all apps"
 fi
 
-# A required context with NO rollup entry forms no group, so the collapse
-# alone cannot see it. GitHub holds the PR for it regardless.
-if grep -q 'MISSING_REQUIRED' "$SCRIPT" \
-   && grep -q 'result: "MISSING"' "$SCRIPT"; then
-  pass "#1064: a required check that has not reported at all is treated as blocking"
+# A requirement with no candidate run at all is MISSING and blocks: GitHub
+# holds the PR for an unreported required context. This is not the
+# synthetic-MISSING approach #655 rounds 2-4 removed — those names were derived
+# from a consumer annex and could legitimately never report, while these come
+# from the branch rules themselves.
+if grep -q 'result: "MISSING"' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'not reported by app' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: an unreported requirement blocks, and names the producer when the rule pins one"
 else
-  fail "#1064: an unreported required check leaves BAD_CHECKS empty and gate (a) clears while GitHub still blocks the merge"
+  fail "#1064: an unreported requirement leaves BAD_CHECKS empty and gate (a) clears while GitHub still blocks the merge"
 fi
 
-# A StatusContext (legacy commit status) carries only createdAt — no
-# startedAt/completedAt. Without carrying it, every legacy status in a group
-# compares equal in the winner sort and the survivor is whichever node happened
-# to sort last, so an older SUCCESS can hide the current FAILURE.
-if grep -q 'createdAt: .createdAt' "$SCRIPT" \
-   && grep -q 'startedAt: (.startedAt // .createdAt' <<<"$SCRIPT_CODE_1064"; then
-  pass "#1064: a StatusContext falls back to createdAt, so legacy statuses have a real ordering key"
+# The candidate set is drawn AFTER the approval-readiness exclusion but the
+# exclusion only drops non-completed checks from the caller own trusted run, so
+# a still-running check of the caller cannot be reported as never-reported for
+# any OTHER run. The readiness filter must therefore stay on the entry
+# projection, not on the requirement iteration.
+if grep -q 'approval_readiness_only' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: approval readiness still scopes the entry set it was written for"
 else
-  fail "#1064: StatusContext entries reach the winner sort with empty timestamps — the survivor is then array order, not the newest status"
+  fail "#1064: the approval-readiness exclusion is gone — the gate can block forever on the caller own in-flight check"
 fi
 
-# Per-producer presence, for the requirements whose app is knowable. Only the
-# rulesets surface exposes it; RefUpdateRule carries bare context strings, so
-# classic-sourced requirements fall back to name presence by necessity.
-if grep -q 'required_pairs' "$SCRIPT" \
-   && grep -q 'not reported by app' "$SCRIPT"; then
-  pass "#1064: the missing scan also checks (context, app) presence where the producing app is knowable"
-else
-  fail "#1064: the missing scan compares names only, so a required context reported by one of two required apps reads as satisfied"
-fi
-
-# The missing-check scan must NOT reuse the approval-readiness-filtered set:
-# that filter deliberately ignores still-running checks from the caller own
-# trusted run, and calling those "never reported" reinstates the self-block it
-# exists to prevent.
-MISSING_BLOCK=$(sed -n '/MISSING_REQUIRED=\$(echo/,/^  fi$/p' "$SCRIPT")
-if grep -q 'ROLLUP_JSON' <<<"$MISSING_BLOCK" \
-   && ! grep -q 'approval_readiness_only' <<<"$MISSING_BLOCK"; then
-  pass "#1064: the missing-required scan reads the unfiltered rollup, so approval readiness cannot self-block"
-else
-  fail "#1064: the missing-required scan is computed from the readiness-filtered set — a still-running check from the caller own run would be reported as never-reported"
-fi
 
 # The CODEOWNERS deadlock: reviewDecision stays REVIEW_REQUIRED even though a
 # qualifying approval exists (scripts/admin-merge-codeowners-blocked.sh

@@ -119,8 +119,17 @@
 #       { "state": "known"|"unknown",
 #         "partial": true|false,
 #         "contexts": [ "<check name>", ... ],   # sorted, deduped
+#         "requirements": [ { "context": "<name>",
+#                             "app_id": "<id>"|null }, ... ],
 #         "surfaces": [ "classic", "rulesets" ], # the ones that ANSWERED
 #         "errors":   [ "<surface>: <message>", ... ] }
+#
+#     `contexts` is the deduped name list, useful for reporting. Anything
+#     DECIDING whether a branch is satisfied should read `requirements`, which
+#     keeps one entry per rule: GitHub evaluates rules independently, so one
+#     context can be pinned to app A by one ruleset and accepted from any
+#     producer by another, and only the uncollapsed list preserves that.
+#     `app_id: null` means any producer satisfies the rule.
 #     Never returns non-zero for an unreadable config — an unreadable config
 #     is a RESULT (`unknown`), not a failure of the helper. Callers branch on
 #     `.state`, so a helper that exited would force every caller to duplicate
@@ -299,7 +308,17 @@ br_required_checks() {
         # The surface would be marked readable-and-empty on the strength of an
         # error body, which is the conflation this lib exists to remove. jq
         # `error` exits non-zero, so the caller records it as an unread surface.
-        if (map(type != "array") | any)
+        # At least one page must have arrived. `gh api --paginate` can exit 0
+        # having emitted nothing — an anomalous empty 2xx — and `jq -s` then
+        # slurps `[]`, which the page-type check accepts vacuously and
+        # `add // []` turns into a readable-and-empty surface. Nothing was
+        # read, so nothing may be concluded: this is the same absence-versus-
+        # inability-to-look conflation as the 404, one layer down.
+        if length == 0
+        then error("rules/branches returned no pages at all")
+        else .
+        end
+        | if (map(type != "array") | any)
         then error("rules/branches returned a non-array page (\(map(type) | unique | join(",")))")
         else .
         end
@@ -375,17 +394,27 @@ br_required_checks() {
     | { state: (if $known then "known" else "unknown" end),
         partial: (($classic_ok + $rulesets_ok) == 1),
         contexts: (if $known then (($classic + $ruleset_names) | unique) else [] end),
-        # Requirements carrying a KNOWN producing app. Rulesets expose
-        # `integration_id`; the classic surface does not — `RefUpdateRule`
-        # exposes `requiredStatusCheckContexts` as bare strings and nothing
-        # else, so an unprivileged reader cannot learn which app a classic
-        # requirement is pinned to. A caller checking per-producer presence can
-        # therefore only do so for the pairs listed here, and must fall back to
-        # name presence for the rest. Stated so the gap is visible at the call
-        # site rather than inferred from an empty list.
-        required_pairs: (if $known
-                         then [ $rulesets[] | select(.app_id != null) ] | unique
-                         else [] end),
+        # The REQUIREMENT LIST, one entry per rule rather than one per name.
+        #
+        # This is the shape a caller needs to decide whether a branch is
+        # satisfied, and it is deliberately not collapsed by context: GitHub
+        # evaluates each rule independently, so one context can carry several
+        # requirements at once — pinned to app A by one ruleset, accepted from
+        # any producer by another, and required by classic protection as well.
+        # Collapsing them loses exactly the distinction that decides whether a
+        # given run satisfies the branch.
+        #
+        # `app_id` is null for "any producer satisfies this". Classic
+        # requirements are always null, by necessity rather than by
+        # observation: `RefUpdateRule` exposes `requiredStatusCheckContexts` as
+        # bare strings, and `BranchProtectionRule`, which does carry app
+        # identity, needs `Administration:read` — the scope this lib exists to
+        # avoid depending on. Modelling an unreadable pinning as any-producer
+        # is the choice that cannot block a merge GitHub would allow.
+        requirements: (if $known
+                       then ([ $classic[] | { context: ., app_id: null } ]
+                             + $rulesets) | unique
+                       else [] end),
         surfaces: $surfaces,
         errors: $errors }
   '

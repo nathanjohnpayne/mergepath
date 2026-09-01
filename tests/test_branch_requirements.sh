@@ -75,6 +75,8 @@ gh() {
       case "${GH_RULESETS:-ok}" in
         fail) echo '{"message":"Not Found","status":"404"}'
               echo "gh: Not Found (HTTP 404)" >&2; return 1 ;;
+        # Exit 0 having emitted nothing at all — an anomalous empty 2xx.
+        empty) return 0 ;;
         *)    echo "${GH_RULESETS_BODY:-$GH_RULESETS_DEFAULT}"; return 0 ;;
       esac
       ;;
@@ -287,6 +289,19 @@ if [ "$(field "$out" .state)" = "known" ] \
   pass "an unrelated rule type passes through without tripping the payload check"
 else
   fail "unrelated rule type: expected known/[], got $out"
+fi
+
+# ── 9d. An exit-0-with-no-output read is an unread surface. `jq -s` slurps
+# `[]`, which every downstream shape check accepts vacuously, so the surface
+# would be recorded readable-and-empty without a byte having been read.
+out=$(GH_CLASSIC=ok GH_RULESETS=empty \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "unknown" ] \
+   && printf '%s' "$out" | grep -q 'no pages at all'; then
+  pass "an empty rulesets response is an unread surface, not an empty rule set"
+else
+  fail "empty rulesets stream: expected unknown, got $out"
 fi
 
 # The documented array shape still resolves normally.

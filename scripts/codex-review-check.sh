@@ -1527,9 +1527,15 @@ BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref')
 # nothing. Measured live with a reviewer PAT that 404s on the REST endpoint:
 # nathanpaynedotcom@main resolved all 7 contexts, mergepath@main all 6.
 #
-# `state` is the tri-state that keeps the original conflation from returning:
-# `known` means a surface answered (and `contexts` may legitimately be empty),
-# `unknown` means none did and NOTHING was learned.
+# `state` is what keeps the original conflation from returning, and the rule is
+# BOTH surfaces, not either: `known` means both answered — its list may then
+# legitimately be empty, because an approvals-only branch really does require
+# no status checks — while `unknown` means at least one surface did not answer,
+# so the union could not be established and nothing usable was learned. A
+# one-surface read is `unknown` carrying `partial: true`, which is a diagnostic
+# for the operator and never a list to act on: one surface answering `[]` says
+# nothing about what the other would have said, and treating that as
+# "nothing required" is the fail-open this change exists to remove.
 BRANCH_REQUIREMENTS_JSON=$(br_required_checks "$REPO" "$BASE_BRANCH")
 BRANCH_REQUIREMENTS_STATE=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '.state // "unknown"')
 BRANCH_REQUIREMENTS_PARTIAL=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r 'if .partial then "1" else "0" end')
@@ -1538,11 +1544,11 @@ BRANCH_REQUIREMENTS_ERRORS=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '(.
 REQUIRED_CHECK_NAMES=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '(.contexts // []) | .[]')
 # Requirements whose producing app is knowable (ruleset-sourced only — see the
 # missing-check scan below for why classic cannot contribute here).
-REQUIRED_PAIRS_JSON=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -c '(.required_pairs // [])')
-# Context names whose requirement is PINNED to a specific producing app. Only
-# these may be split per app when collapsing duplicate runs; see the collapse
-# for why an unpinned or unknowable requirement must not be.
-PINNED_CONTEXTS_JSON=$(printf '%s' "$REQUIRED_PAIRS_JSON" | jq -c '[.[] | .context] | unique')
+# The rules gate (a) will evaluate, one entry per rule rather than one per
+# name. A context can carry several at once — pinned to an app by a ruleset and
+# required from any producer by classic protection — and each is satisfied
+# independently, so the uncollapsed list is what the filter iterates.
+REQUIREMENTS_JSON=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -c '(.requirements // [])')
 
 if [ "$BRANCH_REQUIREMENTS_STATE" = "known" ]; then
   protection_readable=1
@@ -1635,10 +1641,41 @@ if [ "$APPROVAL_READINESS_ONLY" = "1" ] && [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]
 fi
 
 BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
-  --argjson required_names "${REQUIRED_JSON:-[]}" \
+  --argjson requirements "${REQUIREMENTS_JSON:-[]}" \
   --arg approval_readiness_only "$APPROVAL_READINESS_ONLY" \
-  --arg current_run_id "$CURRENT_RUN_ID" \
-  --argjson pinned_contexts "${PINNED_CONTEXTS_JSON:-[]}" '
+  --arg current_run_id "$CURRENT_RUN_ID" '
+  # Pick the entry that REPRESENTS a set of runs: a still-non-terminal entry
+  # always wins over any completed sibling (a freshly-queued rerun has no
+  # usable timestamp and must not be outranked by an older completed one), and
+  # only when every entry is terminal does the latest-completed one win. This
+  # is the rule #655 round 13 already blessed for the annex scan.
+  #
+  # `.result` is bound BEFORE the `["PENDING","EXPECTED"] | …` sub-pipeline,
+  # because inside it `.` rebinds to the literal array and a bare `.result`
+  # would index an array with a string and hard-error the whole filter.
+  #
+  # `//` is deliberately NOT used to fall back from completedAt to startedAt:
+  # the projection emits "" rather than null for a missing timestamp, and "" is
+  # truthy in jq, so `.completedAt // .startedAt` would keep the empty string
+  # and sort every terminal entry as equal.
+  def current_entry:
+    (map(select(
+        if .status != ""
+        then .status != "COMPLETED"
+        else ((.result) as $r | ["PENDING", "EXPECTED"] | index($r)) != null
+        end
+      ))) as $pending
+    | if ($pending | length) > 0
+      then $pending[0]
+      else (sort_by(if .completedAt != "" then .completedAt else .startedAt end) | last)
+      end;
+
+  # A check passes iff SUCCESS, SKIPPED, or NEUTRAL. Everything else —
+  # FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, PENDING, EXPECTED, ERROR,
+  # MISSING, or unknown — blocks.
+  def blocks:
+    (.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL");
+
   [.statusCheckRollup[]
     | {
         label: (.name // .context // "?"),
@@ -1646,228 +1683,94 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         runId: (.runId // ""),
         status: (.status // ""),
         result: (.conclusion // .state // ""),
-        # Carried for the per-name winner selection below (#1064). A CheckRun
-        # has startedAt/completedAt; a StatusContext has only createdAt, so it
-        # falls back to that rather than to an empty string — otherwise every
-        # legacy status in a group compares equal and the winner is whichever
-        # node happened to sort last, letting an older SUCCESS hide the current
+        # A CheckRun has startedAt/completedAt; a StatusContext has only
+        # createdAt, so it falls back to that rather than to an empty string —
+        # otherwise every legacy status compares equal and the winner is
+        # whichever node sorted last, letting an older SUCCESS hide the current
         # FAILURE.
         startedAt: (.startedAt // .createdAt // ""),
         completedAt: (.completedAt // .createdAt // ""),
         isRequired: .isRequired,
         appId: (.appId // "")
       }
-    # Drop entries GitHub says do not count toward this PR requirements
-    # (#1064). Branch protection pins a required context to a producing app,
-    # so a same-named check run from a DIFFERENT producer does not satisfy it —
-    # but the required list is bare names, so name matching alone cannot tell
-    # them apart. Without this, a foreign later SUCCESS wins the per-name
-    # collapse below and masks the required producer FAILURE.
-    #
-    # Only an explicit `false` drops an entry. A null means GitHub returned no
-    # opinion for it, and treating that as "not required" would silently empty
-    # the gate; those fall through to the name filter as before.
-    | select(.isRequired != false)
-    # Approval readiness runs inside a check on the same HEAD. If branch
-    # protection is unreadable, the fail-closed full-rollup fallback would
-    # otherwise block forever on the caller itself. Exclude only non-completed
-    # checks from this exact trusted run; completed failures in this run and
-    # active checks in every other run remain blocking.
+    # Approval readiness runs inside a check on the same HEAD. If the
+    # requirement list is unreadable, the fail-closed full-rollup fallback
+    # would otherwise block forever on the caller itself. Exclude only
+    # non-completed checks from this exact trusted run; completed failures in
+    # this run and active checks in every other run remain blocking.
     | select(
         ($approval_readiness_only != "1")
         or ($current_run_id == "")
         or (.runId != $current_run_id)
         or (.status == "COMPLETED")
       )
-    # Filter out the known "expected to fail during Phase 4a" check.
-    # Label Gate lives in the "PR Review Policy" workflow and fails by
-    # design whenever needs-external-review / needs-human-review /
-    # policy-violation / human-hold is set. That enforcement is what Phase 4a is
-    # trying to unblock; we verify clearance separately in gate (c).
+    # Label Gate lives in the "PR Review Policy" workflow and fails by design
+    # whenever needs-external-review / needs-human-review / policy-violation /
+    # human-hold is set. That enforcement is what Phase 4a is trying to
+    # unblock; clearance is verified separately in gate (c).
     | select(
         (.workflow != "PR Review Policy") or
         (.label != "Label Gate")
       )
-    # When branch protection lists required checks, only those
-    # checks block the gate. When the list is empty (no branch
-    # protection configured or query failed), fall back to the
-    # prior behavior of treating all checks as required.
-    #
-    # Bind `.label` to a variable BEFORE the `$required_names | ...`
-    # sub-pipeline, because inside that sub-pipeline `.` rebinds to
-    # `$required_names` (the array) and `.label` would then try to
-    # index the array, producing the jq error
-    # "Cannot index array with string \"label\"".
-    | (.label) as $label_name
-    | select(
-        ($required_names | length) == 0
-        or ($required_names | index($label_name)) != null
-      )
-  ]
-  # Collapse each check NAME to its current entry before judging it (#1064).
-  #
-  # Load-bearing as of #1064, which is what first made this filter run against
-  # a real required list on the unprivileged paths. A gate that republishes
-  # under one name — the Codex P1 and merge-clearance gates both do, from a
-  # native job plus leased re-evaluations — leaves earlier FAILURE runs in the
-  # rollup next to the later SUCCESS. Judging every entry would block gate (a)
-  # on a superseded failure while GitHub itself merges the PR.
-  #
-  # That is not hypothetical. On nathanpaynedotcom#908, `Codex P1 unresolved
-  # threads` carried SUCCESS(18:53:15), FAILURE(18:53:28), SUCCESS(18:53:35)
-  # at merge time and the PR merged at 18:58:45 — GitHub resolved the required
-  # context to its latest run. Without this collapse, switching gate (a) on
-  # for CI would have reported that PR red — precisely the fleet-wide
-  # over-restriction the acceptance criteria on #1064 forbid.
-  #
-  # Collapse duplicate runs per NAME, and additionally per PRODUCING APP only
-  # where the requirement is provably PINNED to an app.
-  #
-  # Never by workflow. On nathanpaynedotcom#908 three required contexts are
-  # each emitted by two workflows under the SAME app 15368 (agent-review.yml
-  # republishes what the dedicated gate workflows publish) against protection
-  # entries listing each context once. Keying on workflow would demand both be
-  # green and block PRs GitHub merges — the over-restriction that caused the
-  # #1061 revert.
-  #
-  # Per app WHEN PINNED: when a ruleset requires one context from two distinct
-  # apps they are independently required, and collapsing them would let one app
-  # SUCCESS hide the other app FAILURE.
-  #
-  # Per name OTHERWISE, and that distinction is load-bearing rather than
-  # incidental. A ruleset rule with `integration_id: null` accepts the context
-  # from ANY producer, so GitHub is satisfied by the latest run whoever
-  # published it; splitting those per app would make every publishing app
-  # separately mandatory and block on an app whose later sibling already
-  # satisfied the requirement. Classic protection lands here too, by necessity:
-  # it does pin an app, but `RefUpdateRule.requiredStatusCheckContexts` exposes
-  # bare strings and the object carrying app identity needs
-  # `Administration:read` — the scope this change exists to avoid. Splitting an
-  # unknown-pinning requirement per app would be guessing in the direction that
-  # blocks merges GitHub permits, which acceptance criterion 4 on #1064
-  # forbids, so unknown collapses by name.
-  #
-  # A foreign app that is NOT required never reaches here — the isRequired
-  # filter above drops it — so the name-collapse case is already scoped to runs
-  # GitHub counts.
-  #
-  # The winner rule is the one #655 round 13 already blessed for the annex scan —
-  # a still-non-terminal entry always wins over any completed sibling
-  # (a freshly-queued rerun has no usable timestamp and must not be outranked
-  # by an older completed one), and only when every entry is terminal does the
-  # latest-completed one win.
-  #
-  # `//` is deliberately NOT used to fall back from completedAt to startedAt:
-  # the projection above emits "" rather than null for a missing timestamp,
-  # and "" is truthy in jq, so `.completedAt // .startedAt` would keep the
-  # empty string and sort every terminal entry as equal.
-  # The element is bound to $e before the `$pinned_contexts | …` sub-pipeline
-  # for the same reason `$label_name` is bound above: inside it `.` rebinds to
-  # the literal array, so a bare `.label` would index an array with a string
-  # and hard-error the whole filter.
-  | group_by(. as $e
-             | [ $e.label,
-                 (if ($pinned_contexts | index($e.label)) != null then $e.appId else "" end) ])
-  | [ .[]
-      | (map(select(
-            # `.result` is bound BEFORE the `["PENDING","EXPECTED"] | …`
-            # sub-pipeline for the same reason `$label_name` is bound above:
-            # inside it `.` rebinds to the literal array, so a bare `.result`
-            # would try to index an array with a string and hard-error the
-            # whole filter. Only a StatusContext (no `status` field) reaches
-            # this arm, so the fault stayed invisible until a rollup carrying
-            # one was tested.
-            if .status != ""
-            then .status != "COMPLETED"
-            else ((.result) as $r | ["PENDING", "EXPECTED"] | index($r)) != null
-            end
-          ))) as $pending
-      | if ($pending | length) > 0
-        then $pending[0]
-        else (sort_by(if .completedAt != "" then .completedAt else .startedAt end) | last)
-        end
-    ]
-  # A check passes the gate iff its result is SUCCESS, SKIPPED, or
-  # NEUTRAL. Everything else — FAILURE, CANCELLED, TIMED_OUT,
-  # ACTION_REQUIRED, PENDING, EXPECTED, ERROR, or unknown — blocks.
-  | [ .[]
-      | select(
-          (.result != "SUCCESS") and
-          (.result != "SKIPPED") and
-          (.result != "NEUTRAL")
-        )
-    ]
+  ] as $entries
+  # Runs GitHub does not count toward THIS PR requirements are not evidence
+  # about them. Only an explicit `false` drops one: a null means GitHub
+  # returned no opinion, and treating that as not-required would silently empty
+  # the gate.
+  | ($entries | map(select(.isRequired != false))) as $counted
+  | if ($requirements | length) == 0
+    then
+      # No requirement list — either the branch genuinely requires nothing (in
+      # which case the rollup was already emptied upstream) or it could not be
+      # resolved, where #465 says fail closed: every counted check must be
+      # green. Collapsed by name so a superseded rerun does not block.
+      ($counted | group_by(.label) | map(current_entry) | map(select(blocks)))
+    else
+      # REQUIREMENT-DRIVEN. Iterate the rules GitHub will evaluate, not the
+      # runs that happen to exist, and ask of each whether it is satisfied.
+      #
+      # This replaced a "collapse the rollup by some key, then judge" shape
+      # that had to guess a grouping key, and guessing it produced a new
+      # unmodelled configuration every review round: by name it hid a second
+      # required app failure; by workflow it blocked PRs GitHub merges (three
+      # contexts on nathanpaynedotcom#908 are published by two workflows under
+      # one app); by app it made every producer of an any-producer context
+      # separately mandatory; by app-when-any-rule-pins-the-name it did the
+      # same wherever a pinned and an any-producer rule share a context.
+      #
+      # Iterating requirements has no such key. Each rule selects its own
+      # candidate runs — every run of the context for an any-producer rule,
+      # that app runs for a pinned one — and is satisfied by the current entry
+      # among them. A context carrying several rules at once is simply several
+      # requirements, each judged on its own terms, which is what GitHub does.
+      #
+      # A requirement with NO candidate run is MISSING and blocks: GitHub holds
+      # the PR for an unreported required context, so gate (a) does too. This
+      # is not the synthetic-MISSING approach #655 rounds 2-4 removed — those
+      # names were DERIVED from a consumer annex and could legitimately never
+      # report, while these come from the branch rules themselves.
+      ([ $requirements[]
+         | . as $req
+         | ($counted
+            | map(select(
+                (.label == $req.context)
+                and (($req.app_id == null) or (.appId == $req.app_id))
+              ))) as $candidates
+         | if ($candidates | length) == 0
+           then { label: $req.context,
+                  workflow: (if $req.app_id == null
+                             then "(not reported)"
+                             else "(not reported by app \($req.app_id))"
+                             end),
+                  result: "MISSING" }
+           else ($candidates | current_entry)
+           end
+       ]
+       | map(select(blocks))
+       | unique)
+    end
 ')
 
-# A required context that has NOT REPORTED AT ALL blocks too (#1064).
-#
-# The filter above can only judge entries that exist. A required context whose
-# workflow has not been scheduled yet produces no rollup entry, so it forms no
-# group, contributes nothing to BAD_CHECKS, and gate (a) would clear while
-# GitHub still holds the PR for an unsatisfied required context. Before #1064
-# this was unreachable on the unprivileged paths — there was no required list
-# to be absent FROM — so resolving the list is what makes it reachable, and
-# closing it is part of the same change.
-#
-# This is NOT the synthetic-MISSING approach #655 rounds 2-4 tried and removed.
-# That one invented a requirement for a name DERIVED from a consumer's annex
-# workflow, which could legitimately never report (path-filtered, matrix-
-# expanded, or unparseable) and so deadlocked the gate permanently. These names
-# come from branch protection itself: GitHub will not merge the PR until each
-# one reports green, so reporting an absent one is describing the merge
-# blocker, not inventing one.
-#
-# Computed from the rollup WITHOUT the approval-readiness exclusion applied
-# above. That exclusion deliberately ignores still-running checks from the
-# caller own trusted workflow run so the gate cannot block on itself; treating
-# an excluded-but-present check as "never reported" would reinstate exactly
-# that self-block.
-if [ "$(printf '%s' "${REQUIRED_JSON:-[]}" | jq -r 'length')" -gt 0 ]; then
-  # Two passes, because the two rule surfaces expose different amounts.
-  #
-  # By NAME, for every requirement: a context with no reported entry at all.
-  #
-  # By (NAME, APP), for the requirements whose producing app is knowable: when
-  # protection requires one context from apps A and B and only A has reported,
-  # the NAME is present, so the name pass alone sees nothing outstanding while
-  # GitHub is still waiting for B.
-  #
-  # Only the rulesets surface exposes the producing app (`integration_id`).
-  # Classic protection does not: `RefUpdateRule.requiredStatusCheckContexts` is
-  # a list of bare strings and carries no app identity, and the object that does
-  # (`BranchProtectionRule`) needs `Administration:read` — the very scope this
-  # whole change exists to avoid depending on. So per-producer presence is
-  # checked for ruleset-sourced requirements and falls back to name presence for
-  # classic-sourced ones. The gap is bounded: it needs one context required from
-  # two DIFFERENT apps via classic protection, and only the second app to have
-  # not reported. Measured across this fleet, no repo configures that — every
-  # required context is listed once under app 15368.
-  MISSING_REQUIRED=$(echo "$ROLLUP_JSON" | jq -c \
-    --argjson required_names "${REQUIRED_JSON:-[]}" \
-    --argjson required_pairs "${REQUIRED_PAIRS_JSON:-[]}" '
-    [ .statusCheckRollup[]
-      | select(.isRequired != false)
-      | (.name // .context // "?") ] as $reported
-    | [ .statusCheckRollup[]
-        | select(.isRequired != false)
-        | { context: (.name // .context // "?"), app_id: (.appId // "") } ] as $reported_pairs
-    | [ $required_names[]
-        | select(($reported | index(.)) == null)
-        | { label: ., workflow: "(not reported)", result: "MISSING" } ]
-      + [ $required_pairs[]
-          | . as $pair
-          | select([ $reported_pairs[]
-                     | select(.context == $pair.context and .app_id == $pair.app_id) ] | length == 0)
-          | { label: $pair.context,
-              workflow: "(not reported by app \($pair.app_id))",
-              result: "MISSING" } ]
-      | unique
-  ')
-  if [ "$(printf '%s' "$MISSING_REQUIRED" | jq -r 'length')" -gt 0 ]; then
-    log "gate (a): $(printf '%s' "$MISSING_REQUIRED" | jq -r 'length') required check(s) on $BASE_BRANCH have not reported for this head: $(printf '%s' "$MISSING_REQUIRED" | jq -r '[.[].label] | join(", ")') — GitHub treats an unreported required context as unsatisfied, so gate (a) does too."
-    BAD_CHECKS=$(echo "$BAD_CHECKS" | jq -c --argjson extra "$MISSING_REQUIRED" '(. + $extra) | unique')
-  fi
-fi
 
 # #655 (Codex P2 round 5): rather than inventing a synthetic MISSING
 # requirement for a derived check name that has not reported (rounds 2-4's
