@@ -105,7 +105,7 @@ The FAQ is explicit (§ "How to troubleshoot CodeRabbit not functioning on certa
 Our entire fleet authors as the single shared identity **`nathanjohnpayne`**. So the coverage question reduces to one check: *does `nathanjohnpayne` have an active CodeRabbit seat covering every consumer repo?* CodeRabbit seat management is **not exposed via the `gh` API** — there is no GitHub-side endpoint for it — so this is a CodeRabbit-dashboard confirmation, not a scriptable CI gate. Confirm it this way:
 
 1. Open the CodeRabbit dashboard → **Subscription** → seat list, signed in as the org owner (`nathanjohnpayne`).
-2. Verify `nathanjohnpayne` holds an **active** seat and that the seat's repo/org coverage includes all 8 consumers (all **public**): `matchline`, `overridebroadway`, `tadlockpsychiatry`, `device-source-of-truth`, `friends-and-family-billing`, `swipewatch`, `nathanpaynedotcom`, `fiveacross`.
+2. Verify `nathanjohnpayne` holds an **active** seat and that the seat's repo/org coverage includes all 8 consumers: `matchline`, `overridebroadway`, `tadlockpsychiatry`, `friends-and-family-billing`, `swipewatch`, `nathanpaynedotcom`, `fiveacross` (public), and `device-source-of-truth` (**private** as of 2026-09-01 — a private repo still needs the seat, and its coverage is the easier one to overlook in the dashboard).
 3. **Observational cross-check (the only API-visible signal):** on a recent PR in each repo, confirm a `coderabbitai[bot]` review/summary actually landed:
 
    ```bash
@@ -121,7 +121,7 @@ Our entire fleet authors as the single shared identity **`nathanjohnpayne`**. So
    done
    ```
 
-   A non-zero count is positive evidence the author seat is working on that repo. A zero on a repo that *has* had PRs is the red flag to chase in the dashboard. (A quiet repo with no recent PRs is inconclusive, not a failure.) The bootstrap wizard's **private**-repo path can delete `.coderabbit.yml` and leave `coderabbit.enabled: false` (see #248 — `scripts/ci/check_coderabbit_config` PASSes on that state), so on a private consumer a zero count is expected, not a seat gap. **No current consumer is in that state:** all 8 are public and carry `.coderabbit.yml` (tadlockpsychiatry and fiveacross are explicitly `enabled: true`), so a zero on any of them *is* a red flag to chase.
+   A non-zero count is positive evidence the author seat is working on that repo. A zero on a repo that *has* had PRs is the red flag to chase in the dashboard. (A quiet repo with no recent PRs is inconclusive, not a failure.) The bootstrap wizard's **private**-repo path can delete `.coderabbit.yml` and leave `coderabbit.enabled: false` (see #248 — `scripts/ci/check_coderabbit_config` PASSes on that state), so on a consumer that has opted out a zero count is expected, not a seat gap. **Check the opt-out before chasing a zero (measured 2026-09-01):** `fiveacross` has CodeRabbit deliberately disabled on both keys since 2026-08-04 — `reviews.auto_review.enabled: false` in `.coderabbit.yml` paired with `coderabbit.enabled: false` in `.github/review-policy.yml` — so a zero there is the expected result and chasing it in the dashboard wastes the trip. The other seven carry `.coderabbit.yml` with auto-review on, so a zero on any of *those* is a real red flag. Re-read both keys rather than trusting this sentence; an opt-out is a per-repo decision that can change without touching this doc.
 
 ## Safety-floor coverage check (#481)
 
