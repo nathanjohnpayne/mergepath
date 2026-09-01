@@ -16,9 +16,10 @@
 #
 # Environment:
 #   GH_TOKEN                   Required for the read/polling calls. The
-#                              load-bearing trigger comment is posted
-#                              through gh-as-author.sh, which verifies and
-#                              uses the author token for that write.
+#                              load-bearing trigger and exact-head timeout
+#                              determination comments are posted through
+#                              gh-as-author.sh, which verifies and uses the
+#                              author token for those writes.
 #   MERGEPATH_PHASE_4A_GATED   Optional. Set to true/1 by the caller when
 #                              the PR independently qualifies for Phase 4a
 #                              (lines >= external_review_threshold OR a file
@@ -217,9 +218,10 @@ __CODEX_REQUEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -r "$__CODEX_REQUEST_DIR/lib/preflight-helpers.sh" ]; then
   # shellcheck source=lib/preflight-helpers.sh
   . "$__CODEX_REQUEST_DIR/lib/preflight-helpers.sh"
-  # Author PAT is correct for this helper because the one write it may
-  # perform is the `@codex review` trigger, which must be authored by
-  # nathanjohnpayne. The wrapper verifies that token before posting.
+  # Author PAT is correct because every PR comment this helper may write is
+  # author-owned: each `@codex review` trigger (including bounded retries)
+  # and, after an ordinary timeout, the exact-head timeout determination.
+  # The wrapper verifies that token before posting any such comment.
   preflight_require_token author || true
 fi
 
@@ -365,14 +367,16 @@ policy_top_field() {
   ' "$CONFIG"
 }
 
-# Author identity for the trigger comment write (#438): used to decide
-# whether an ambient GH_TOKEN may be bridged into gh-as-author.sh.
+# Author identity for the trigger and timeout-determination comment writes
+# (#438/#1085): used to decide whether an ambient GH_TOKEN may be bridged
+# into gh-as-author.sh.
 AUTHOR_IDENTITY=$(policy_top_field author_identity)
 AUTHOR_IDENTITY=${AUTHOR_IDENTITY:-nathanjohnpayne}
 
 # --- write-token resolution (#737) ------------------------------------------
-# Resolve a GitHub token for this helper's API reads and its one write (the
-# `@codex review` trigger, posted through gh-as-author.sh). Two independent
+# Resolve a GitHub token for this helper's API reads and its author-owned PR
+# comment writes (the `@codex review` trigger and exact-head timeout
+# determination, both posted through gh-as-author.sh). Two independent
 # sources satisfy it, tried in order:
 #
 #   1. GH_TOKEN already in the environment — exported inline by the caller,
@@ -390,9 +394,10 @@ AUTHOR_IDENTITY=${AUTHOR_IDENTITY:-nathanjohnpayne}
 #      succeed whenever EITHER source is available.
 #
 # author_identity (parsed from review-policy.yml above) is the account the
-# trigger must be attributed to — Codex ignores non-author triggers — and is
-# the identity post_codex_trigger writes as via gh-as-author.sh, so a keyring
-# token for it also bridges cleanly into that write (#438).
+# trigger and timeout determination must be attributed to — Codex ignores
+# non-author triggers, and Phase 4b accepts only trusted author markers. It is
+# the identity post_author_pr_comment writes as via gh-as-author.sh, so a
+# keyring token for it also bridges cleanly into either write (#438/#1085).
 if [ -z "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
   GH_TOKEN=$(gh auth token --user "$AUTHOR_IDENTITY" 2>/dev/null || true)
   if [ -n "$GH_TOKEN" ]; then

@@ -180,6 +180,7 @@ The current contract is token-attributed for the guarded core `gh` write surface
 | `gh pr edit --remove-label <protected>` | **BLOCKED** by `scripts/hooks/label-removal-guard.sh` for `needs-external-review` / `needs-human-review` / `policy-violation` / `human-hold`; use `scripts/request-label-removal.sh` | n/a |
 | `gh pr comment` | `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh pr comment ...` | reviewer identity verified from the token |
 | `gh pr comment "@codex review"` (Codex trigger) | `scripts/gh-as-author.sh -- gh pr comment ... --body "@codex review"` | `nathanjohnpayne`; `codex-review-request.sh` uses this because the Codex App only monitors author-authored triggers (#405) |
+| `gh pr comment "<!-- mergepath-phase-4a-terminal:... -->"` (exact-head Codex timeout determination) | `scripts/gh-as-author.sh -- gh pr comment ... --body-file ...` | `nathanjohnpayne`; `codex-review-request.sh` uses this because Phase 4b trusts only an author-owned marker bound to the exact head and confirmed trigger (#1085) |
 | `gh pr review --comment` / `--request-changes` | `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh pr review ...` | reviewer identity verified from the token |
 | `gh pr review --approve` (under-threshold) | reviewer wrapper | reviewer identity; allowed when PR's `Authoring-Agent:` matches the agent and Phase 4 does not apply |
 | `gh pr review --approve` (over-threshold, same agent) | **BLOCKED** by `scripts/hooks/gh-pr-guard.sh` per § No-self-approve scoping | n/a |
