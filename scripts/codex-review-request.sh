@@ -162,8 +162,9 @@
 #     # #1085: a normal bounded timeout is recorded as an author-owned,
 #     # exact-head hidden PR comment bound to the confirmed trigger comment.
 #     # Phase 4b consumes that durable record instead of waiting a second time.
-#     # Account/connection blocks remain distinct through blocked_reason and
-#     # the provider-authored diagnostic exit-2 evidence above.
+#     # Account/connection blocks remain distinct through blocked_reason here;
+#     # the later codex-review-check.sh --diagnostic-signal-only probe maps the
+#     # provider-authored evidence to its Phase 4b exit-2 waiver.
 #     "trigger_posted": true | false,
 #     "trigger_requested": true | false,
 #     "rounds_waited_seconds": N
@@ -1393,7 +1394,9 @@ run_trigger_ack_gate() {
 # exhausted the bounded wait (#1085). Phase 4b runs later, often from another
 # checkout and process, so stdout/exit 4 is not a handoff channel. The PR
 # timeline is. Account/connection blocks deliberately do NOT use this marker:
-# their provider-authored comments remain the distinct diagnostic exit-2 path.
+# this helper exits 4 with blocked_reason, while the later
+# codex-review-check.sh --diagnostic-signal-only probe maps their
+# provider-authored comments to its distinct Phase 4b exit-2 waiver.
 record_phase4a_timeout_determination() {
   local live_head comments state marker_body post_id fresh_state
 
@@ -1598,8 +1601,9 @@ BLOCKED_REASON=$(current_blocked_reason "$FINAL_SCAN")
 
 # A plain timeout is a terminal Phase 4a determination, not ordinary pending.
 # Persist it before emitting exit 4 so a later Phase 4b process can consume it.
-# Provider-authored account/connection blocks keep their existing, distinct
-# blocked_reason/diagnostic-exit-2 path and must not create this marker.
+# Provider-authored account/connection blocks keep blocked_reason here and must
+# not create this marker; the later codex-review-check.sh
+# --diagnostic-signal-only probe maps them to its Phase 4b exit-2 waiver.
 PHASE4A_TERMINAL_RECORDED=false
 PHASE4A_TERMINAL_COMMENT_ID=""
 if [ "$TRIGGER_POSTED" = true ] && [ -z "$BLOCKED_REASON" ] \
