@@ -122,6 +122,9 @@ jobs:
       needs.precheck.result == 'success'
     needs: [precheck]
     runs-on: ubuntu-latest
+    outputs:
+      final_audit_comment_id: ${{ steps.final_audit.outputs.final_audit_comment_id }}
+      final_audit_sha256: ${{ steps.final_audit.outputs.final_audit_sha256 }}
     permissions:
       actions: read
       contents: write
@@ -152,6 +155,7 @@ jobs:
           [ -z "$(git -C "$SOURCE_DIR" symbolic-ref -q HEAD || true)" ]
 
       - name: Dispatch and verify the final administrative audit
+        id: final_audit
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -214,6 +218,8 @@ jobs:
           WORKFLOW_SHA: ${{ job.workflow_sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          FINAL_AUDIT_COMMENT_ID: ${{ needs.handshake.outputs.final_audit_comment_id }}
+          FINAL_AUDIT_SHA256: ${{ needs.handshake.outputs.final_audit_sha256 }}
         run: |
           MERGEPATH_REPO_ROOT="$GITHUB_WORKSPACE/trusted-base" \
             "$GITHUB_WORKSPACE/trusted-base/scripts/workflow/merge-group-required-checks.sh" \
@@ -229,6 +235,8 @@ jobs:
               --workflow-sha "$WORKFLOW_SHA" \
               --run-id "$RUN_ID" \
               --run-attempt "$RUN_ATTEMPT" \
+              --final-audit-comment-id "$FINAL_AUDIT_COMMENT_ID" \
+              --final-audit-sha256 "$FINAL_AUDIT_SHA256" \
               --phase post-audit
 
   required-contexts:

@@ -6,7 +6,33 @@
 
 set -euo pipefail
 
+sha256_text() {
+  local digest
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$1" | sha256sum) || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$1" | shasum -a 256) || return 1
+  else
+    return 1
+  fi
+  printf '%s\n' "${digest%% *}"
+}
+
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+HUB_MARKER="$ROOT/scripts/sync-to-downstream.sh"
+
+# This wrapper travels in the scripts/ci/ consumer kit, but its #1058
+# materialization and manifest assertions are deliberately hub-only. Detect a
+# consumer from the absence of Mergepath's non-propagated orchestrator marker
+# before resolving any hub-only path. A missing marker on Mergepath is caught
+# independently by the hub's required-root/sync checks; a consumer must not be
+# required to carry the public policy-repository release sources.
+if [ ! -f "$HUB_MARKER" ]; then
+  echo "check_merge_group_required_checks: SKIP (consumer checkout: scripts/sync-to-downstream.sh is absent; #1058 policy-source release validation is hub-only)"
+  exit 0
+fi
+
+SELF="$ROOT/scripts/ci/check_merge_group_required_checks"
 WORKFLOW_TEMPLATE="$ROOT/.github/templates/required-workflows/mergepath-merge-queue-authorization.yml"
 AUTH_WORKFLOW="$ROOT/.github/workflows/merge-queue-authorization.yml"
 FINAL_AUDIT_WORKFLOW="$ROOT/.github/workflows/merge-queue-final-audit.yml"
@@ -18,6 +44,7 @@ FINAL_AUDITOR="$ROOT/scripts/workflow/record-merge-queue-final-audit.sh"
 FINAL_HANDSHAKE="$ROOT/.github/templates/required-workflows/scripts/merge-queue-final-handshake.sh"
 ARM_POLICY="$ROOT/scripts/workflow/merge-queue-arm-policy.sh"
 MATERIALIZER="$ROOT/scripts/build/materialize-merge-queue-policy-source.sh"
+BOOTSTRAP_MIRROR="$ROOT/scripts/bootstrap/template-mirror.sh"
 POLICY="$ROOT/.github/review-policy.yml"
 SYNC_MANIFEST="$ROOT/.mergepath-sync.yml"
 ROLLOUT_LIB="$ROOT/scripts/lib/merge-queue-protection.sh"
@@ -30,9 +57,19 @@ fi
 
 for file in "$WORKFLOW_TEMPLATE" "$AUTH_WORKFLOW" "$FINAL_AUDIT_WORKFLOW" \
   "$DEPENDABOT_WORKFLOW" "$POLICY" "$SYNC_MANIFEST" "$ROLLOUT_LIB" \
-  "$AUTH_LIB"; do
+  "$AUTH_LIB" "$BOOTSTRAP_MIRROR"; do
   [ -f "$file" ] || {
     echo "FAIL: required merge-queue surface is missing: $file" >&2
+    exit 1
+  }
+done
+
+
+for source_only_exclusion in \
+  "'.github/templates/required-workflows/'" \
+  "'scripts/build/materialize-merge-queue-policy-source.sh'"; do
+  grep -qF "$source_only_exclusion" "$BOOTSTRAP_MIRROR" || {
+    echo "FAIL: bootstrap mirror can seed policy-source-only surface into a consumer: $source_only_exclusion" >&2
     exit 1
   }
 done
@@ -74,6 +111,11 @@ for fragment in \
   'Merge group pre-audit policy check' \
   'Source-pinned final audit handshake' \
   'Merge group post-audit policy check' \
+  'id: final_audit' \
+  'final_audit_comment_id: ${{ steps.final_audit.outputs.final_audit_comment_id }}' \
+  'final_audit_sha256: ${{ steps.final_audit.outputs.final_audit_sha256 }}' \
+  'FINAL_AUDIT_COMMENT_ID: ${{ needs.handshake.outputs.final_audit_comment_id }}' \
+  'FINAL_AUDIT_SHA256: ${{ needs.handshake.outputs.final_audit_sha256 }}' \
   'GH_TOKEN: ${{ github.token }}' \
   'PR_NUMBER: ${{ github.event.pull_request.number }}' \
   'EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}' \
@@ -91,6 +133,8 @@ for fragment in \
   '--workflow-sha "$WORKFLOW_SHA"' \
   '--run-id "$RUN_ID"' \
   '--run-attempt "$RUN_ATTEMPT"' \
+  '--final-audit-comment-id "$FINAL_AUDIT_COMMENT_ID"' \
+  '--final-audit-sha256 "$FINAL_AUDIT_SHA256"' \
   '--pr "$PR_NUMBER"' \
   '--head-sha "$EVENT_HEAD_SHA"' \
   '--head-ref "$EVENT_HEAD_REF"' \
@@ -666,10 +710,19 @@ expect_output() {
 
 for tool in jq bash cmp shasum; do
   command -v "$tool" >/dev/null 2>&1 || {
-    echo "SKIP: $tool is required" >&2
+    echo "check_merge_group_required_checks: self-test unavailable ($tool is required)" >&2
     exit 0
   }
 done
+
+CONSUMER_CHECK_ROOT="$TMP/consumer-check"
+mkdir -p "$CONSUMER_CHECK_ROOT/scripts/ci"
+cp "$SELF" "$CONSUMER_CHECK_ROOT/scripts/ci/check_merge_group_required_checks"
+chmod +x "$CONSUMER_CHECK_ROOT/scripts/ci/check_merge_group_required_checks"
+expect_output \
+  "consumer checkout skips before requiring hub-only policy-source artifacts" \
+  "check_merge_group_required_checks: SKIP (consumer checkout: scripts/sync-to-downstream.sh is absent; #1058 policy-source release validation is hub-only)" \
+  "$CONSUMER_CHECK_ROOT/scripts/ci/check_merge_group_required_checks"
 
 WORKFLOW_SCAN_FIXTURES="$TMP/workflow-event-scan"
 mkdir -p "$WORKFLOW_SCAN_FIXTURES/mapping" \
@@ -2037,7 +2090,15 @@ case "$endpoint" in
     printf '%s\n' "$STUB_REQUESTER_RUN"
     ;;
   repos/owner/repo/actions/runs/456)
-    printf '%s\n' "$STUB_AUDITOR_RUN"
+    count=$(cat "$STUB_DIR/auditor-run-count"); count=$((count + 1));
+    printf '%s\n' "$count" > "$STUB_DIR/auditor-run-count"
+    printf 'auditor-run-%s\n' "$count" >> "$STUB_DIR/events.log"
+    if [ -n "${STUB_AUDITOR_RUN_AFTER_COUNT:-}" ] \
+        && [ "$count" -gt "$STUB_AUDITOR_RUN_AFTER_COUNT" ]; then
+      printf '%s\n' "${STUB_AUDITOR_RUN_AFTER:-{}}"
+    else
+      printf '%s\n' "$STUB_AUDITOR_RUN"
+    fi
     ;;
   repos/owner/repo/actions/runs/455/attempts/1)
     printf '%s\n' "$STUB_PRIOR_AUDITOR_RUN"
@@ -2109,7 +2170,10 @@ case "$endpoint" in
     count=$(cat "$STUB_DIR/comments-count"); count=$((count + 1));
     printf '%s\n' "$count" > "$STUB_DIR/comments-count"
     printf 'comments-%s\n' "$count" >> "$STUB_DIR/events.log"
-    if [ "$count" -gt 1 ] && [ -n "${STUB_COMMENTS_FINAL:-}" ]; then
+    if [ -n "${STUB_COMMENTS_AFTER_COUNT:-}" ] \
+        && [ "$count" -gt "$STUB_COMMENTS_AFTER_COUNT" ]; then
+      printf '%s\n' "${STUB_COMMENTS_AFTER:-[]}"
+    elif [ "$count" -gt 1 ] && [ -n "${STUB_COMMENTS_FINAL:-}" ]; then
       printf '%s\n' "$STUB_COMMENTS_FINAL"
       if [ "$paginate" -eq 1 ] \
           && [ -n "${STUB_COMMENTS_FINAL_PAGE_TWO:-}" ]; then
@@ -2948,6 +3012,17 @@ ENTRY_ONLY_COMMENTS=$(jq -cn --argjson entry \
 ENTRY_ATTESTATION_COMMENTS=$(jq -cn --argjson entry \
   "$ENTRY_ATTESTATION_COMMENT" --argjson audit "$FINAL_AUDIT_COMMENT" \
   '[$entry,$audit]')
+FINAL_AUDIT_MARKER=$(mergepath_merge_queue_decode_authorizations \
+  "$ENTRY_ATTESTATION_COMMENTS" | jq -ecS \
+  '[.[] | select(.kind == "final-admin-audit")] |
+    select(length == 1) | .[0]')
+FINAL_AUDIT_COMMENT_ID=$(printf '%s' "$FINAL_AUDIT_MARKER" | jq -er \
+  '._comment_id | tostring')
+FINAL_AUDIT_SHA256=$(sha256_text "$FINAL_AUDIT_MARKER")
+printf '%s' "$FINAL_AUDIT_SHA256" | grep -Eq '^[0-9a-f]{64}$' || {
+  echo "FAIL: could not derive the canonical final-audit fixture digest" >&2
+  exit 1
+}
 
 with_entry_attestation() {
   [ "$#" -eq 1 ] || return 1
@@ -2992,6 +3067,8 @@ reset_fixtures() {
   STUB_COMMENTS_PAGE_TWO=""
   STUB_COMMENTS_FINAL=""
   STUB_COMMENTS_FINAL_PAGE_TWO=""
+  STUB_COMMENTS_AFTER_COUNT=""
+  STUB_COMMENTS_AFTER=""
   STUB_CHANGED_FILES='[]'
   STUB_CHANGED_FILES_PAGE_TWO=""
   STUB_CHANGED_FILES_RAW=""
@@ -3003,6 +3080,8 @@ reset_fixtures() {
   STUB_GROUP_REF_FINAL=""
   STUB_REQUESTER_RUN=$REQUESTER_RUN
   STUB_AUDITOR_RUN=$AUDITOR_RUN
+  STUB_AUDITOR_RUN_AFTER_COUNT=""
+  STUB_AUDITOR_RUN_AFTER=""
   STUB_PRIOR_AUDITOR_RUN=$PRIOR_AUDITOR_RUN
   STUB_BRANCH_MAIN=$BRANCH_MAIN
   STUB_FINAL_AUDIT_PR=$FINAL_AUDIT_PR_RAW
@@ -3018,6 +3097,8 @@ reset_fixtures() {
   FINAL_REQUESTER_RUN_ATTEMPT_INPUT=1
   FINAL_AUDITOR_RUN_ID_INPUT=456
   FINAL_AUDITOR_RUN_ATTEMPT_INPUT=1
+  BRIDGE_FINAL_AUDIT_COMMENT_ID_INPUT=$FINAL_AUDIT_COMMENT_ID
+  BRIDGE_FINAL_AUDIT_SHA256_INPUT=$FINAL_AUDIT_SHA256
   STUB_DISPATCH_RC=0
   STUB_TIMELINE=$DIRECT_TIMELINE_RAW
   STUB_TIMELINE_FINAL=""
@@ -3067,11 +3148,13 @@ reset_fixtures() {
   export STUB_EFFECTIVE_RULES_FINAL STUB_TOPOLOGY STUB_TOPOLOGY_FINAL
   export STUB_LABELS STUB_LABELS_FINAL STUB_COMMENTS
   export STUB_COMMENTS_PAGE_TWO STUB_COMMENTS_FINAL
-  export STUB_COMMENTS_FINAL_PAGE_TWO STUB_CHANGED_FILES
+  export STUB_COMMENTS_FINAL_PAGE_TWO STUB_COMMENTS_AFTER_COUNT
+  export STUB_COMMENTS_AFTER STUB_CHANGED_FILES
   export STUB_CHANGED_FILES_PAGE_TWO STUB_CHANGED_FILES_RAW
   export STUB_PR STUB_PR_FINAL STUB_STACK STUB_STACK_FINAL STUB_GROUP_REF
   export STUB_GROUP_REF_FINAL STUB_TIMELINE STUB_TIMELINE_FINAL
-  export STUB_REQUESTER_RUN STUB_AUDITOR_RUN STUB_PRIOR_AUDITOR_RUN
+  export STUB_REQUESTER_RUN STUB_AUDITOR_RUN STUB_AUDITOR_RUN_AFTER_COUNT
+  export STUB_AUDITOR_RUN_AFTER STUB_PRIOR_AUDITOR_RUN
   export STUB_BRANCH_MAIN STUB_FINAL_AUDIT_PR
   export STUB_FINAL_AUDIT_PR_PREWRITE STUB_FINAL_AUDIT_PR_POST
   export STUB_POSTED_COMMENT_AT STUB_NOW STUB_DISPATCH_RC
@@ -3079,6 +3162,8 @@ reset_fixtures() {
   export FINAL_SOURCE_TOKEN_INPUT FINAL_PR_NUMBER_INPUT
   export FINAL_REQUESTER_RUN_ID_INPUT FINAL_REQUESTER_RUN_ATTEMPT_INPUT
   export FINAL_AUDITOR_RUN_ID_INPUT FINAL_AUDITOR_RUN_ATTEMPT_INPUT
+  export BRIDGE_FINAL_AUDIT_COMMENT_ID_INPUT
+  export BRIDGE_FINAL_AUDIT_SHA256_INPUT
   export STUB_AUTO_REQUEST STUB_AUTO_REQUEST_FINAL
   export STUB_GIT_HEAD STUB_GIT_VERIFY_OUTPUT STUB_GIT_VERIFY_RC
   export STUB_GIT_DIFF_RC STUB_GIT_ROOT STUB_GIT_CAT_FILE_RC
@@ -3104,6 +3189,7 @@ reset_fixtures() {
   : > "$TMP/posted-body"
   : > "$TMP/posted-comment"
   : > "$TMP/events.log"
+  : > "$TMP/final-handshake-output"
   echo 0 > "$TMP/queue-count"
   echo 0 > "$TMP/target-repo-count"
   echo 0 > "$TMP/source-repo-count"
@@ -3117,6 +3203,7 @@ reset_fixtures() {
   echo 0 > "$TMP/pr-count"
   echo 0 > "$TMP/ref-count"
   echo 0 > "$TMP/final-pr-count"
+  echo 0 > "$TMP/auditor-run-count"
   for gate in validate-pr-body.sh review-feedback-accounting.sh \
     resolve-pr-threads.sh coderabbit-severity-gate.sh codex-p1-gate.sh \
     merge-clearance-gate.sh approval-independence-check.sh; do
@@ -3240,6 +3327,7 @@ run_final_handshake() {
   PATH="$TMP/integration-bin:$PATH" STUB_DIR="$TMP" \
     STUB_GIT_HEAD="$WORKFLOW_SHA" STUB_GIT_ROOT="$FIXTURE_ROOT" \
     STUB_NOW=2026-01-03T00:02:00Z GH_TOKEN=test-token \
+    GITHUB_OUTPUT="$TMP/final-handshake-output" \
     MERGEPATH_MERGE_QUEUE_HANDSHAKE_ATTEMPTS=1 \
     MERGEPATH_MERGE_QUEUE_HANDSHAKE_INTERVAL_SECONDS=0 \
     MERGEPATH_MERGE_QUEUE_HANDSHAKE_MAX_INTERVAL_SECONDS=0 \
@@ -3271,6 +3359,13 @@ expect_final_handshake() {
 }
 
 run_bridge() {
+  local -a final_audit_args=()
+  if [ "$BRIDGE_PHASE_INPUT" = post-audit ]; then
+    final_audit_args=(
+      --final-audit-comment-id "$BRIDGE_FINAL_AUDIT_COMMENT_ID_INPUT"
+      --final-audit-sha256 "$BRIDGE_FINAL_AUDIT_SHA256_INPUT"
+    )
+  fi
   set +e
   PATH="$TMP/integration-bin:$PATH" STUB_DIR="$TMP" GH_TOKEN=test-token \
     MERGEPATH_MERGE_QUEUE_POLICY_TOKEN=policy-token \
@@ -3292,6 +3387,7 @@ run_bridge() {
       --workflow-file-path "$WORKFLOW_FILE_PATH" \
       --workflow-ref "$WORKFLOW_RUNTIME_REF" \
       --workflow-sha "$WORKFLOW_SHA" --run-id 123 --run-attempt 1 \
+      "${final_audit_args[@]}" \
       --phase "$BRIDGE_PHASE_INPUT" \
       > "$TMP/bridge.out" 2>&1
   BRIDGE_RC=$?
@@ -3971,6 +4067,15 @@ if [ "$(grep -cF $'gh\tapi\t--method\tPOST\trepos/owner/repo/dispatches' \
 else
   fail "source handshake crossed its source or one-dispatch boundary"
 fi
+if [ "$(wc -l < "$TMP/final-handshake-output" | tr -d ' ')" -eq 2 ] \
+    && grep -qxF "final_audit_comment_id=$FINAL_AUDIT_COMMENT_ID" \
+      "$TMP/final-handshake-output" \
+    && grep -qxF "final_audit_sha256=$FINAL_AUDIT_SHA256" \
+      "$TMP/final-handshake-output"; then
+  pass "source handshake publishes only the non-secret exact audit binding"
+else
+  fail "source handshake did not publish the exact comment-id/digest binding"
+fi
 
 reset_fixtures
 STUB_REQUESTER_RUN=$(printf '%s' "$STUB_REQUESTER_RUN" | jq -c \
@@ -4139,14 +4244,142 @@ for gate in validate-pr-body.sh review-feedback-accounting.sh \
   merge-clearance-gate.sh approval-independence-check.sh; do
   [ "$(cat "$TMP/gate-$gate-count")" -eq 1 ] || all_post_predicates_once=0
 done
+first_post_gate_line=$(grep -nF 'gate-validate-pr-body.sh-1' \
+  "$TMP/events.log" | head -1 | cut -d: -f1 || true)
+startup_audit_line=$(grep -nF 'auditor-run-1' "$TMP/events.log" \
+  | head -1 | cut -d: -f1 || true)
+final_post_comments_line=$(grep -nF 'comments-4' "$TMP/events.log" \
+  | head -1 | cut -d: -f1 || true)
+final_post_auditor_line=$(grep -nF 'auditor-run-3' "$TMP/events.log" \
+  | head -1 | cut -d: -f1 || true)
+last_post_gate_line=$(grep -nF 'gate-approval-independence-check.sh-1' \
+  "$TMP/events.log" | tail -1 | cut -d: -f1 || true)
 if [ "$all_post_predicates_once" -eq 1 ] \
-    && [ "$(cat "$TMP/target-repo-count")" -eq 2 ] \
-    && [ "$(cat "$TMP/effective-rules-count")" -eq 2 ] \
+    && [ "$(cat "$TMP/target-repo-count")" -eq 3 ] \
+    && [ "$(cat "$TMP/effective-rules-count")" -eq 3 ] \
+    && [ "$(cat "$TMP/comments-count")" -eq 4 ] \
+    && [ "$(cat "$TMP/auditor-run-count")" -eq 3 ] \
+    && [ -n "$startup_audit_line" ] && [ -n "$first_post_gate_line" ] \
+    && [ -n "$last_post_gate_line" ] \
+    && [ -n "$final_post_comments_line" ] \
+    && [ -n "$final_post_auditor_line" ] \
+    && [ "$startup_audit_line" -lt "$first_post_gate_line" ] \
+    && [ "$last_post_gate_line" -lt "$final_post_comments_line" ] \
+    && [ "$last_post_gate_line" -lt "$final_post_auditor_line" ] \
     && ! grep -qxF dispatch "$TMP/events.log"; then
-  pass "post-audit bridge replays every public predicate before its final fence"
+  pass "post-audit bridge binds the exact audit before and after every public predicate"
 else
   fail "post-audit bridge did not preserve its read-only replay/fence: $(tr '\n' ' ' < "$TMP/events.log")"
 fi
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+STUB_COMMENTS=$ENTRY_ONLY_COMMENTS
+export BRIDGE_PHASE_INPUT STUB_COMMENTS
+expect_bridge "post-audit bridge requires the handshake-cleared final marker" 1 \
+  "final audit"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+REPLACEMENT_ID_AUDIT=$(make_final_audit_comment 92)
+STUB_COMMENTS=$(jq -cn --argjson entry "$ENTRY_ATTESTATION_COMMENT" \
+  --argjson audit "$REPLACEMENT_ID_AUDIT" '[$entry,$audit]')
+export BRIDGE_PHASE_INPUT STUB_COMMENTS
+expect_bridge \
+  "post-audit bridge rejects replacement of the handshake-cleared comment" \
+  1 "comment id changed"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+REPLACEMENT_CONTENT_AUDIT=$(make_final_audit_comment 91 "$AUTHOR" \
+  "$(printf 'b%.0s' {1..64})")
+STUB_COMMENTS=$(jq -cn --argjson entry "$ENTRY_ATTESTATION_COMMENT" \
+  --argjson audit "$REPLACEMENT_CONTENT_AUDIT" '[$entry,$audit]')
+export BRIDGE_PHASE_INPUT STUB_COMMENTS
+expect_bridge \
+  "post-audit bridge rejects same-id semantic replacement before trusting it" \
+  1 "content changed"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+BRIDGE_FINAL_AUDIT_COMMENT_ID_INPUT=92
+export BRIDGE_PHASE_INPUT BRIDGE_FINAL_AUDIT_COMMENT_ID_INPUT
+expect_bridge "post-audit bridge rejects a wrong well-formed handshake comment id" \
+  1 "comment id changed"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+BRIDGE_FINAL_AUDIT_SHA256_INPUT=$(printf '0%.0s' {1..64})
+export BRIDGE_PHASE_INPUT BRIDGE_FINAL_AUDIT_SHA256_INPUT
+expect_bridge "post-audit bridge rejects a wrong well-formed handshake digest" \
+  1 "content changed"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+BRIDGE_FINAL_AUDIT_COMMENT_ID_INPUT=""
+BRIDGE_FINAL_AUDIT_SHA256_INPUT=""
+export BRIDGE_PHASE_INPUT BRIDGE_FINAL_AUDIT_COMMENT_ID_INPUT
+export BRIDGE_FINAL_AUDIT_SHA256_INPUT
+expect_bridge "post-audit bridge rejects missing handshake outputs before reads" \
+  2 "usage: merge-group-required-checks.sh"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+BRIDGE_FINAL_AUDIT_COMMENT_ID_INPUT=091
+export BRIDGE_PHASE_INPUT BRIDGE_FINAL_AUDIT_COMMENT_ID_INPUT
+expect_bridge "post-audit bridge rejects a noncanonical handshake comment id" \
+  2 "usage: merge-group-required-checks.sh"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+BRIDGE_FINAL_AUDIT_SHA256_INPUT=ABC
+export BRIDGE_PHASE_INPUT BRIDGE_FINAL_AUDIT_SHA256_INPUT
+expect_bridge "post-audit bridge rejects a malformed handshake digest" \
+  2 "usage: merge-group-required-checks.sh"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+DUPLICATE_REQUEST_AUDIT=$(make_final_audit_comment 92 "$AUTHOR" \
+  "$(printf 'b%.0s' {1..64})")
+STUB_COMMENTS=$(jq -cn --argjson entry "$ENTRY_ATTESTATION_COMMENT" \
+  --argjson first "$FINAL_AUDIT_COMMENT" \
+  --argjson second "$DUPLICATE_REQUEST_AUDIT" '[$entry,$first,$second]')
+export BRIDGE_PHASE_INPUT STUB_COMMENTS
+expect_bridge "post-audit bridge rejects duplicate requester-run markers" 1 \
+  "absent or duplicate"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+# The repaired read order is: queue attestation, handshake-output reload,
+# initial fence, then final fence. Remove the audit only after the initial
+# fence so this catches mutation during predicate replay, not just startup.
+STUB_COMMENTS_AFTER_COUNT=3
+STUB_COMMENTS_AFTER=$ENTRY_ONLY_COMMENTS
+export BRIDGE_PHASE_INPUT STUB_COMMENTS_AFTER_COUNT STUB_COMMENTS_AFTER
+expect_bridge "post-audit bridge rejects marker removal during predicate replay" 1 \
+  "final audit"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+FINAL_REPLACEMENT_AUDIT=$(make_final_audit_comment 91 "$AUTHOR" \
+  "$(printf 'b%.0s' {1..64})")
+STUB_COMMENTS_AFTER_COUNT=3
+STUB_COMMENTS_AFTER=$(jq -cn --argjson entry "$ENTRY_ATTESTATION_COMMENT" \
+  --argjson audit "$FINAL_REPLACEMENT_AUDIT" '[$entry,$audit]')
+export BRIDGE_PHASE_INPUT STUB_COMMENTS_AFTER_COUNT STUB_COMMENTS_AFTER
+expect_bridge \
+  "post-audit bridge rejects same-id replacement during predicate replay" \
+  1 "content changed"
+
+reset_fixtures
+BRIDGE_PHASE_INPUT=post-audit
+STUB_AUDITOR_RUN_AFTER_COUNT=2
+STUB_AUDITOR_RUN_AFTER=$(printf '%s' "$AUDITOR_RUN" | jq -c \
+  '.conclusion="failure"')
+export BRIDGE_PHASE_INPUT STUB_AUDITOR_RUN_AFTER_COUNT
+export STUB_AUDITOR_RUN_AFTER
+expect_bridge "post-audit bridge rejects auditor-run failure after predicates" \
+  1 "no longer successful"
 
 reset_fixtures
 STUB_REQUESTER_RUN=$(printf '%s' "$STUB_REQUESTER_RUN" | jq -c \

@@ -1942,10 +1942,11 @@ jobs:
   # approval; and removal of a blocking label after clearance settles. Edited
   # events only invalidate mutable approval provenance and deliberately do not
   # enter this job. Every path rechecks the governing author identity, labels,
-  # required checks, clearance, accounting, conversations, and live approval
-  # independence. This candidate-controlled job can only report readiness; the
-  # trusted continuation owns durable-arm retraction and the #1058 merge-group
-  # boundary.
+  # and required checks after consuming the upstream live-approval result.
+  # This candidate-controlled job can only report readiness; the trusted
+  # continuation rechecks clearance, accounting, conversations, approval
+  # independence, and mutable PR state before reporting stable unarmed
+  # readiness. The separate #1058 merge-group authorization owns admission.
   auto-merge-on-approval:
     needs: [load-config, detect-disagreement, block-self-approval, triage]
     # Job-level override (replaces rather than merges with the workflow
@@ -2045,7 +2046,7 @@ jobs:
           fi
           # --- synchronize / reopened readiness path (existing API check) ---
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::Neither CI_ACTOR_TOKEN nor REVIEWER_ASSIGNMENT_TOKEN is configured; cannot confirm an existing approval for the synchronize readiness retry."
+            echo "::notice::The read-only workflow token is unavailable; cannot confirm an existing approval for the synchronize readiness retry."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -2127,10 +2128,10 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           # Guard against the TOCTOU race between the trigger-time label
-          # snapshot and the actual merge. The job's top-level `if:` expression
-          # evaluates labels from the `pull_request_review` event payload at
-          # the moment GitHub Actions dispatched the event. Two things can
-          # make that snapshot stale by the time we reach the merge step:
+          # snapshot and this readiness report. The job's top-level `if:`
+          # expression evaluates labels from the `pull_request_review` event
+          # payload at the moment GitHub Actions dispatched the event. Two
+          # things can make that snapshot stale by the time this probe runs:
           #
           #   1. Eventual consistency. If a label is applied milliseconds
           #      before the review event fires, the event payload can still
@@ -2145,12 +2146,13 @@ jobs:
           #      The trigger payload does not reflect that later mutation.
           #
           # Re-fetch the authoritative label state from the GitHub API before
-          # entering the readiness probe. The shared continuation repeats this
-          # check, along with feedback-accounting and conversation-resolution
-          # gates before reporting readiness. Abort if any blocking
-          # label is now present. Also check `policy-violation`, which is applied by the
-          # block-self-approval job earlier in this same workflow run (and
-          # again, the `if:` at job start wouldn't have seen it).
+          # entering the readiness probe. The trusted continuation repeats this
+          # check alongside feedback-accounting and conversation-resolution
+          # gates before it reports stable unarmed readiness. Abort if any
+          # blocking label is now present. Also check `policy-violation`, which
+          # is applied by the block-self-approval job earlier in this same
+          # workflow run (and, again, the `if:` at job start wouldn't have seen
+          # it).
           # The trusted default-branch checkout intentionally lags an atomic
           # workflow+helper rollout by one merge. Source the shared helper when
           # it is present; retain the exact bootstrap predicate for the first
@@ -2600,7 +2602,7 @@ jobs:
               # three-dot diff this fetch provides -- an earlier commit
               # already in the PR could have touched a matching path
               # while the CURRENT push does not, wrongly keeping this
-              # "unfiltered" and blocking auto-merge forever waiting for a
+              # "unfiltered" and blocking readiness forever while waiting for a
               # check that will never report. The three-dot PR-wide diff
               # genuinely matches what GitHub documents for the
               # pull_request event, so only that event gets the real

@@ -119,6 +119,11 @@ CONSUMER_ABSENT=(
   "docs/projects"
   "scripts/project-doc-sync.sh"
   "tests/test_project_doc_sync.sh"
+  # #1058 organization policy-repository release sources are excluded from
+  # both bootstrap and ongoing consumer propagation. The propagated CI wrapper
+  # must take its marker-first consumer SKIP without either source present.
+  ".github/templates/required-workflows"
+  "scripts/build/materialize-merge-queue-policy-source.sh"
   "mergepath"
   "packaging"
   "dist"

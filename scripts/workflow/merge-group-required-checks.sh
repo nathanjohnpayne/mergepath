@@ -9,7 +9,8 @@ usage: merge-group-required-checks.sh --repo owner/repo --head-sha SHA \
   --head-ref REF --base-sha SHA --base-ref REF --default-branch BRANCH \
   --workflow-repository owner/repo --workflow-file-path PATH \
   --workflow-ref REF --workflow-sha SHA --run-id ID --run-attempt NUMBER \
-  --phase pre-audit|post-audit
+  --phase pre-audit|post-audit \
+  [--final-audit-comment-id ID --final-audit-sha256 SHA256]
 EOF
   exit 2
 }
@@ -27,6 +28,8 @@ WORKFLOW_SHA=""
 RUN_ID=""
 RUN_ATTEMPT=""
 PHASE=""
+EXPECTED_FINAL_AUDIT_COMMENT_ID=""
+EXPECTED_FINAL_AUDIT_SHA256=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo) [ "$#" -ge 2 ] || usage; REPO="$2"; shift 2 ;;
@@ -44,6 +47,16 @@ while [ "$#" -gt 0 ]; do
     --run-id) [ "$#" -ge 2 ] || usage; RUN_ID="$2"; shift 2 ;;
     --run-attempt) [ "$#" -ge 2 ] || usage; RUN_ATTEMPT="$2"; shift 2 ;;
     --phase) [ "$#" -ge 2 ] || usage; PHASE="$2"; shift 2 ;;
+    --final-audit-comment-id)
+      [ "$#" -ge 2 ] || usage
+      EXPECTED_FINAL_AUDIT_COMMENT_ID="$2"
+      shift 2
+      ;;
+    --final-audit-sha256)
+      [ "$#" -ge 2 ] || usage
+      EXPECTED_FINAL_AUDIT_SHA256="$2"
+      shift 2
+      ;;
     *) usage ;;
   esac
 done
@@ -66,7 +79,21 @@ fi
 case "$RUN_ID" in *[!0-9]*|'') usage ;; esac
 case "$RUN_ATTEMPT" in *[!0-9]*|'') usage ;; esac
 [ "$RUN_ID" -gt 0 ] && [ "$RUN_ATTEMPT" -gt 0 ] || usage
-case "$PHASE" in pre-audit|post-audit) ;; *) usage ;; esac
+canonical_positive_integer() {
+  case "$1" in ''|0*|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+case "$PHASE" in
+  pre-audit)
+    [ -z "$EXPECTED_FINAL_AUDIT_COMMENT_ID" ] \
+      && [ -z "$EXPECTED_FINAL_AUDIT_SHA256" ] || usage
+    ;;
+  post-audit)
+    canonical_positive_integer "$EXPECTED_FINAL_AUDIT_COMMENT_ID" || usage
+    printf '%s' "$EXPECTED_FINAL_AUDIT_SHA256" \
+      | grep -Eq '^[0-9a-f]{64}$' || usage
+    ;;
+  *) usage ;;
+esac
 
 ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
@@ -80,7 +107,19 @@ infra() {
   exit 2
 }
 
-for tool in gh jq git date od tr; do
+sha256_text() {
+  local digest
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$1" | sha256sum) || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$1" | shasum -a 256) || return 1
+  else
+    return 1
+  fi
+  printf '%s\n' "${digest%% *}"
+}
+
+for tool in gh jq git; do
   command -v "$tool" >/dev/null 2>&1 || infra "required tool '$tool' is unavailable"
 done
 [ -n "${GH_TOKEN:-}" ] || infra "GH_TOKEN is required"
@@ -680,6 +719,20 @@ audit_marker_candidate() {
     '
 }
 
+requester_audit_candidate() {
+  [ "$#" -eq 1 ] || return 1
+  local markers="$1"
+  printf '%s' "$markers" | jq -ec \
+    --arg author "$AUTHOR_IDENTITY" --arg run_id "$RUN_ID" \
+    --argjson run_attempt "$RUN_ATTEMPT" '
+      [.[] | select(
+        ._comment_author == $author and .kind == "final-admin-audit" and
+        .requester_run_id == $run_id and
+        .requester_run_attempt == $run_attempt)] |
+      select(length == 1) | .[0]
+    '
+}
+
 select_exact_final_audit() {
   [ "$#" -eq 2 ] || return 1
   local markers="$1" candidate="$2"
@@ -752,165 +805,53 @@ classify_auditor_run() {
     '
 }
 
-audit_wait_fence() {
-  local queue group_ref labels blockers timeline action
-  queue=$(read_queue_snapshot) \
-    || infra "could not re-read queue while awaiting the final audit"
-  validate_queue_snapshot "$queue" \
-    || die "queue became unsafe while awaiting the final audit"
-  [ "$(queue_signature "$queue")" = "$(queue_signature "$initial_queue")" ] \
-    || die "queue entry changed while awaiting the final audit"
-  group_ref=$(read_group_ref) \
-    || infra "could not re-read group ref while awaiting the final audit"
-  validate_group_ref "$group_ref" \
-    || die "merge-group ref changed while awaiting the final audit"
-  labels=$(fetch_labels) \
-    || infra "could not re-read labels while awaiting the final audit"
-  blockers=$(printf '%s' "$labels" | jq -r '.[].name' \
-    | mergepath_blocking_labels_csv)
-  [ -z "$blockers" ] \
-    || die "blocking labels appeared while awaiting the final audit: $blockers"
-  timeline=$(mergepath_merge_queue_read_auth_timeline "$REPO" "$PR_NUMBER") \
-    || infra "could not re-read queue action while awaiting the final audit"
-  action=$(mergepath_merge_queue_select_entry_action "$timeline" "$REPO" \
-    "$PR_NUMBER" "$AUTHOR_IDENTITY" "$QUEUE_ID" "$ENTRY_ENQUEUED_AT" \
-    "$(printf '%s' "$ROLLOUT_CONFIG" | jq -r .enabled_at)" "$QUEUE_METHOD") \
-    || die "governing queue action was revoked while awaiting the final audit"
-  [ "$(printf '%s' "$action" | jq -cS .)" = \
-    "$(printf '%s' "$ACTION" | jq -cS .)" ] \
-    || die "governing queue action changed while awaiting the final audit"
-}
+load_final_audit_binding() {
+  local comments markers candidate candidate_id canonical_candidate digest
+  local conflict_count exact_audit auditor_run_id auditor_run auditor_state
+  comments=$(fetch_comments) \
+    || infra "could not load complete handshake audit history"
+  markers=$(decode_markers "$comments") \
+    || infra "could not decode handshake audit history"
+  candidate=$(requester_audit_candidate "$markers") \
+    || die "handshake-cleared final audit is absent or duplicate"
+  candidate_id=$(printf '%s' "$candidate" | jq -er \
+    '._comment_id | select(type == "number" and floor == . and . > 0) | tostring') \
+    || die "handshake-cleared final audit has no canonical comment id"
+  [ "$candidate_id" = "$EXPECTED_FINAL_AUDIT_COMMENT_ID" ] \
+    || die "handshake-cleared final audit comment id changed"
+  canonical_candidate=$(printf '%s' "$candidate" | jq -ceS .) \
+    || infra "could not canonicalize the handshake-cleared final audit"
+  digest=$(sha256_text "$canonical_candidate") \
+    || infra "could not hash the handshake-cleared final audit"
+  [ "$digest" = "$EXPECTED_FINAL_AUDIT_SHA256" ] \
+    || die "handshake-cleared final audit content changed"
 
-request_final_admin_audit() {
-  # Kept temporarily as a parser-compatible tombstone for older callers. The
-  # target-base bridge is read-only; only the source-pinned handshake job may
-  # dispatch the protected audit.
-  die "final audit must be requested by the source-pinned handshake"
-  local dispatch_file dispatch_rc comments markers conflict_count candidate
-  local auditor_run auditor_state attempt=1 elapsed=0 wait_seconds
-  local initial_interval max_interval timeout_seconds max_attempts
-  local default_final_audit_attempts auditor_run_id auditor_state_rc remaining
-  initial_interval=${MERGEPATH_MERGE_QUEUE_FINAL_AUDIT_INTERVAL_SECONDS:-2}
-  max_interval=${MERGEPATH_MERGE_QUEUE_FINAL_AUDIT_MAX_INTERVAL_SECONDS:-60}
-  timeout_seconds=$((QUEUE_CHECK_TIMEOUT_MINUTES * 60))
-  case "$initial_interval:$max_interval" in
-    *[!0-9:]*|:*) infra "final-audit polling interval is malformed" ;;
-  esac
-  [ "$initial_interval" -le "$max_interval" ] \
-    && [ "$max_interval" -le 300 ] \
-    || infra "final-audit polling interval is outside the bounded policy"
-  if [ "$initial_interval" -eq 0 ]; then
-    default_final_audit_attempts=1
-  else
-    default_final_audit_attempts=100000
-  fi
-  max_attempts=${MERGEPATH_MERGE_QUEUE_FINAL_AUDIT_ATTEMPTS:-$default_final_audit_attempts}
-  case "$max_attempts" in *[!0-9]*|'') infra "final-audit attempts are malformed" ;; esac
-  [ "$max_attempts" -gt 0 ] && [ "$max_attempts" -le 100000 ] \
-    || infra "final-audit attempts are outside the bounded policy"
-
-  FINAL_AUDIT_NONCE=${MERGEPATH_MERGE_QUEUE_FINAL_AUDIT_NONCE:-$(
-    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
-  )} || infra "could not generate the final-audit nonce"
-  printf '%s' "$FINAL_AUDIT_NONCE" | grep -Eq '^[0-9a-f]{64}$' \
-    || infra "final-audit nonce is malformed"
-  FINAL_AUDIT_REQUESTED_AT=${MERGEPATH_MERGE_QUEUE_FINAL_AUDIT_REQUESTED_AT:-$(
-    date -u '+%Y-%m-%dT%H:%M:%SZ'
-  )} \
-    || infra "could not read the final-audit request clock"
-  printf '%s' "$FINAL_AUDIT_REQUESTED_AT" \
-    | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' \
-    || infra "final-audit request timestamp is malformed"
-  dispatch_file=$(mktemp) || infra "could not create the final-audit request"
-  jq -cn --arg event_type "mergepath-final-queue-audit" \
-    --arg repository "$REPO" --argjson pr "$PR_NUMBER" \
-    --arg head_sha "$PR_HEAD" --arg group_head_sha "$EVENT_HEAD_SHA" \
-    --arg group_ref "$EVENT_HEAD_REF" --arg base_sha "$EVENT_BASE_SHA" \
-    --arg base_ref "$DEFAULT_BRANCH" --arg queue_id "$QUEUE_ID" \
-    --arg queue_entry_id "$ENTRY_ID" \
-    --arg entry_enqueued_at "$ENTRY_ENQUEUED_AT" \
-    --arg queue_method "$QUEUE_METHOD" --arg entry_base_sha "$ENTRY_BASE" \
-    --arg request_nonce "$FINAL_AUDIT_NONCE" \
-    --arg requester_run_id "$RUN_ID" \
-    --argjson requester_run_attempt "$RUN_ATTEMPT" \
-    --arg requested_at "$FINAL_AUDIT_REQUESTED_AT" \
-    --arg requester_workflow_repository "$WORKFLOW_REPOSITORY" \
-    --arg requester_workflow_file_path "$WORKFLOW_FILE_PATH" \
-    --arg requester_workflow_ref "$WORKFLOW_REF" \
-    --arg requester_workflow_sha "$WORKFLOW_SHA" '{
-      event_type:$event_type,
-      client_payload:{request:{
-        repository:$repository,pr:$pr,head_sha:$head_sha,
-        group_head_sha:$group_head_sha,group_ref:$group_ref,
-        base_sha:$base_sha,base_ref:$base_ref,queue_id:$queue_id,
-        queue_entry_id:$queue_entry_id,entry_enqueued_at:$entry_enqueued_at,
-        queue_method:$queue_method,entry_base_sha:$entry_base_sha,
-        request_nonce:$request_nonce,requester_run_id:$requester_run_id,
-        requester_run_attempt:$requester_run_attempt,requested_at:$requested_at,
-        requester_workflow_repository:$requester_workflow_repository,
-        requester_workflow_file_path:$requester_workflow_file_path,
-        requester_workflow_ref:$requester_workflow_ref,
-        requester_workflow_sha:$requester_workflow_sha}}
-    }' > "$dispatch_file" || {
-      rm -f "$dispatch_file"
-      infra "could not render the final-audit request"
-    }
-  set +e
-  false
-  dispatch_rc=$?
-  set -e
-  rm -f "$dispatch_file"
-
-  wait_seconds=$initial_interval
-  while [ "$attempt" -le "$max_attempts" ]; do
-    comments=$(fetch_comments) \
-      || infra "could not read complete final-audit history"
-    markers=$(decode_markers "$comments") \
-      || infra "could not decode final-audit history"
-    conflict_count=$(mergepath_merge_queue_count_final_audits "$markers" \
-      "$REPO" "$PR_NUMBER" "$PR_HEAD" "$EVENT_HEAD_SHA" \
-      "$AUTHOR_IDENTITY" "$FINAL_AUDIT_NONCE" "$RUN_ID" "$RUN_ATTEMPT") \
-      || infra "could not classify final-audit responses"
-    [ "$conflict_count" -le 1 ] \
-      || die "final audit has duplicate or conflicting responses"
-    if [ "$conflict_count" -eq 1 ]; then
-      candidate=$(audit_marker_candidate "$markers") \
-        || die "final audit returned a malformed response"
-      FINAL_AUDIT=$(select_exact_final_audit "$markers" "$candidate") \
-        || die "final audit response does not bind the exact request"
-      auditor_run_id=$(printf '%s' "$FINAL_AUDIT" | jq -er .auditor_run_id) \
-        || die "final audit response names no auditor run"
-      auditor_run=$(read_workflow_run "$auditor_run_id") \
-        || infra "could not read the final-auditor workflow run"
-      set +e
-      auditor_state=$(classify_auditor_run "$auditor_run" "$FINAL_AUDIT")
-      auditor_state_rc=$?
-      set -e
-      [ "$auditor_state_rc" -eq 0 ] \
-        || die "final-auditor workflow run identity is invalid"
-      case "$auditor_state" in
-        success) return 0 ;;
-        pending) ;;
-        *) die "final-auditor workflow did not complete successfully" ;;
-      esac
-    fi
-    [ "$attempt" -lt "$max_attempts" ] && [ "$elapsed" -lt "$timeout_seconds" ] \
-      || break
-    audit_wait_fence
-    remaining=$((timeout_seconds - elapsed))
-    [ "$wait_seconds" -le "$remaining" ] || wait_seconds=$remaining
-    sleep "$wait_seconds"
-    elapsed=$((elapsed + wait_seconds))
-    if [ "$wait_seconds" -gt 0 ] && [ "$wait_seconds" -lt "$max_interval" ]; then
-      wait_seconds=$((wait_seconds * 2))
-      [ "$wait_seconds" -le "$max_interval" ] || wait_seconds=$max_interval
-    fi
-    attempt=$((attempt + 1))
-  done
-  if [ "$dispatch_rc" -ne 0 ]; then
-    die "final-audit dispatch outcome is unknown and no exact response arrived"
-  fi
-  die "final-audit response did not arrive within the queue timeout"
+  FINAL_AUDIT_NONCE=$(printf '%s' "$candidate" | jq -er \
+    '.request_nonce | select(type == "string" and test("^[0-9a-f]{64}$"))') \
+    || die "handshake-cleared final audit nonce is malformed"
+  FINAL_AUDIT_REQUESTED_AT=$(printf '%s' "$candidate" | jq -er \
+    '.requested_at | select(type == "string" and
+      test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))') \
+    || die "handshake-cleared final audit timestamp is malformed"
+  conflict_count=$(mergepath_merge_queue_count_final_audits "$markers" \
+    "$REPO" "$PR_NUMBER" "$PR_HEAD" "$EVENT_HEAD_SHA" \
+    "$AUTHOR_IDENTITY" "$FINAL_AUDIT_NONCE" "$RUN_ID" "$RUN_ATTEMPT") \
+    || infra "could not classify the handshake-cleared final audit"
+  [ "$conflict_count" -eq 1 ] \
+    || die "handshake-cleared final audit namespace is not unique"
+  exact_audit=$(select_exact_final_audit "$markers" "$candidate") \
+    || die "handshake-cleared final audit does not bind the exact request"
+  [ "$(printf '%s' "$exact_audit" | jq -cS .)" = "$canonical_candidate" ] \
+    || die "handshake-cleared final audit selection changed"
+  auditor_run_id=$(printf '%s' "$exact_audit" | jq -er .auditor_run_id) \
+    || die "handshake-cleared final audit names no auditor run"
+  auditor_run=$(read_workflow_run "$auditor_run_id") \
+    || infra "could not load the handshake-cleared auditor run"
+  auditor_state=$(classify_auditor_run "$auditor_run" "$exact_audit") \
+    || die "handshake-cleared auditor run identity is invalid"
+  [ "$auditor_state" = success ] \
+    || die "handshake-cleared auditor run is not successful"
+  FINAL_AUDIT=$exact_audit
 }
 
 # Re-read every mutable binding around the predicate set. The second call is
@@ -920,6 +861,7 @@ revalidate_binding() {
   local phase="$1" queue rules pr_snapshot live_comments live_markers
   local live_timeline live_action live_attestation group_ref transition_mode
   local final_conflict_count final_candidate live_final_audit
+  local final_candidate_id canonical_final_candidate final_candidate_digest
   local final_auditor_run_id final_auditor_run
   mergepath_merge_queue_validate_required_workflow "$ROLLOUT_CONFIG" "$REPO" \
     "$WORKFLOW_REPOSITORY" "$WORKFLOW_FILE_PATH" "$WORKFLOW_REF" \
@@ -1005,6 +947,17 @@ revalidate_binding() {
       || die "final audit became duplicate or unavailable ($phase)"
     final_candidate=$(audit_marker_candidate "$live_markers") \
       || die "final audit became malformed ($phase)"
+    final_candidate_id=$(printf '%s' "$final_candidate" | jq -er \
+      '._comment_id | select(type == "number" and floor == . and . > 0) | tostring') \
+      || die "final audit lost its canonical comment id ($phase)"
+    [ "$final_candidate_id" = "$EXPECTED_FINAL_AUDIT_COMMENT_ID" ] \
+      || die "final audit comment id changed during evaluation ($phase)"
+    canonical_final_candidate=$(printf '%s' "$final_candidate" | jq -ceS .) \
+      || infra "could not canonicalize the final audit ($phase)"
+    final_candidate_digest=$(sha256_text "$canonical_final_candidate") \
+      || infra "could not hash the final audit ($phase)"
+    [ "$final_candidate_digest" = "$EXPECTED_FINAL_AUDIT_SHA256" ] \
+      || die "final audit content changed during evaluation ($phase)"
     live_final_audit=$(select_exact_final_audit "$live_markers" "$final_candidate") \
       || die "final audit no longer binds the exact request ($phase)"
     [ "$(printf '%s' "$live_final_audit" | jq -cS .)" = \
@@ -1027,6 +980,8 @@ case "$PHASE" in
     revalidate_binding "handoff fence"
     ;;
   post-audit)
+    load_final_audit_binding
+    revalidate_binding "initial post-audit fence"
     run_all_predicates
     revalidate_binding "final post-audit fence"
     ;;

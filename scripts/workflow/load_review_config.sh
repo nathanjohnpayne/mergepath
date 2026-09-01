@@ -15,11 +15,11 @@ set -euo pipefail
 #                       approval-readiness gate, which
 #                       mirrors scripts/codex-review-check.sh gate (b) and the
 #                       required merge-clearance-gate.
-#   author_identity  -> the `assign` job's author check, AND the identity the
-#                       readiness job requires AUTHOR_MERGE_TOKEN to resolve
-#                       to before privileged evaluation. That step
-#                       parsed the value out of its own unpinned checkout until
-#                       #788's second half moved it onto this output.
+#   author_identity  -> the `assign` job's author check, AND the exact
+#                       governing identity the candidate workflow requires
+#                       before reporting read-only readiness. Trusted
+#                       continuations independently re-resolve the base policy
+#                       and verify their credentials before privileged work.
 #   threshold/paths  -> the `triage` job's preliminary requires-review calc.
 #
 # scripts/merge-clearance-gate.sh and scripts/codex-review-check.sh already
@@ -136,11 +136,11 @@ source "$SCALAR_HELPER"
 
 # Read one TOP-LEVEL scalar out of a policy file.
 #
-# This is the parser the legacy-named approval-readiness job used
-# to run inline against its own checkout before #788 routed the identity
-# through this script's output — byte-for-byte, so the value the
-# AUTHOR_MERGE_TOKEN check now compares is the value it computed for itself
-# then, and the switch of SOURCE does not smuggle in a change of SYNTAX.
+# This is the parser the legacy-named approval-readiness job used to run inline
+# against its own checkout before #788 routed the identity through this
+# script's output — byte-for-byte, so the candidate's read-only admission and
+# each trusted continuation consume the same base-policy spelling, and the
+# switch of SOURCE does not smuggle in a change of SYNTAX.
 # `scripts/ci/check_workflow_parsers` pins these semantics case by case
 # (bare / "double-quoted" / 'single-quoted').
 #
@@ -151,9 +151,9 @@ source "$SCALAR_HELPER"
 #                under another block — or the same word inside a comment — is
 #                not mistaken for the top-level setting.
 #   unquoted     `author_identity: "nathanjohnpayne"` yields nathanjohnpayne,
-#                not "nathanjohnpayne". A quoted value compared verbatim
-#                against `gh api user --jq .login` never matches, which would
-#                turn a legal YAML spelling into a permanent merge refusal.
+#                not "nathanjohnpayne". A quoted value consumed verbatim names
+#                a different identity, which would turn a legal YAML spelling
+#                into a permanent readiness refusal.
 #   first-wins   `exit` after the first match. A repeated scalar key would
 #                otherwise print twice, and a GITHUB_OUTPUT entry is a single
 #                `key=value` LINE — Actions parses the second one as its own
@@ -241,9 +241,10 @@ emit reviewers "$REVIEWERS"
 # nest it under a block, which `review_policy_scalar` correctly declines to match)
 # without anything failing. Substituting a hard-coded login here would hand the
 # readiness step a non-empty EXPECTED_AUTHOR, skip its `[ -z ]` fail-closed
-# branch, and authenticate privileged evaluation under an identity the governing
-# policy never named — the substitution #768/#769/#788 exist to prevent, moved
-# one file upstream rather than removed. The `assign` job keeps its own
+# branch, and admit readiness under an identity the governing policy never
+# named — the substitution #768/#769/#788 exist to prevent, moved one file
+# upstream rather than removed. Trusted continuations separately re-resolve
+# the policy and verify their credentials. The `assign` job keeps its own
 # `AUTHOR_IDENTITY || 'nathanjohnpayne'` default in JS, so dropping the default
 # here tightens readiness and leaves reviewer assignment unchanged.
 emit author_identity "$AUTHOR"

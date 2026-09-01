@@ -292,24 +292,68 @@ else
   fi
 
   wait_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Probe current-head check readiness once") | .key' "$AGENT_REVIEW")
-  merge_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Report stable readiness") | .key' "$AGENT_REVIEW")
-  merge_step=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Report stable readiness") | .run' "$AGENT_REVIEW")
-  merge_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR_NUMBER" "$REPO"' <<<"$merge_step" | head -1 | cut -d: -f1 || true)
-  merge_continue_line=$(grep -nF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$merge_step" | head -1 | cut -d: -f1 || true)
-  if [[ "$wait_step_index" =~ ^[0-9]+$ ]] \
-     && [[ "$merge_step_index" =~ ^[0-9]+$ ]] \
-     && [ "$merge_step_index" -gt "$wait_step_index" ] \
-     && grep -Fq 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$merge_step" \
-     && grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' <<<"$merge_step" \
-     && grep -Fq 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$merge_step" \
-     && grep -Fq 'MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$merge_step" \
-     && grep -Fq 'if [ "$protective_rc" -eq 0 ]; then' <<<"$merge_step" \
-     && [ -n "$merge_protect_line" ] && [ -n "$merge_continue_line" ] \
-     && [ "$merge_protect_line" -lt "$merge_continue_line" ] \
-     && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$merge_step"; then
-    pass "the immediate-green path protects with the workflow token before author-token continuation"
+  readiness_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Report stable read-only readiness") | .key' "$AGENT_REVIEW")
+  readiness_step=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Report stable read-only readiness") | .run' "$AGENT_REVIEW")
+  readiness_permissions=$(yq -r '.jobs."auto-merge-on-approval".permissions | to_entries | sort_by(.key) | .[] | "\(.key): \(.value)"' "$AGENT_REVIEW")
+  expected_readiness_permissions=$'actions: read\nchecks: read\ncontents: read\nissues: read\npull-requests: read\nstatuses: read'
+  agent_auto_merge_flat=$(tr '\n' ' ' <<<"$agent_auto_merge")
+  candidate_workflow_root_env() {
+    yq -r '.env // {}' "$1"
+  }
+  candidate_job_uses_secrets_context() {
+    grep -Eiq '(^|[^[:alnum:]_])secrets([^[:alnum:]_]|$)' <<<"$1"
+  }
+  candidate_job_uses_privileged_credential() {
+    grep -Eiq 'AUTHOR_MERGE_TOKEN|MERGE_QUEUE_POLICY_TOKEN|MERGE_QUEUE_SOURCE_TOKEN' <<<"$1"
+  }
+  candidate_readiness_uses_privileged_credential() {
+    candidate_job_uses_privileged_credential "$1" || candidate_job_uses_privileged_credential "$2"
+  }
+  candidate_readiness_uses_secrets_context() {
+    candidate_job_uses_secrets_context "$1" || candidate_job_uses_secrets_context "$2"
+  }
+  workflow_root_env=$(candidate_workflow_root_env "$AGENT_REVIEW")
+  inherited_env_fixture=$(
+    candidate_workflow_root_env - <<'YAML'
+name: inherited-secret-fixture
+env:
+  INHERITED: ${{ SeCrEtS ["REVIEWER_ASSIGNMENT_TOKEN"] }}
+jobs: {}
+YAML
+  )
+  privileged_credential_surface=$(sed \
+    -e '/^[[:space:]]*id:[[:space:]]*author_merge_token[[:space:]]*$/d' \
+    -e 's/steps\.author_merge_token/steps.read_only_readiness/g' \
+    <<<"$agent_auto_merge")
+  if candidate_job_uses_secrets_context '${{ toJSON(secrets) }}' \
+     && candidate_job_uses_secrets_context '${{ secrets ["REVIEWER_ASSIGNMENT_TOKEN"] }}' \
+     && candidate_job_uses_secrets_context '${{ Secrets.REVIEWER_ASSIGNMENT_TOKEN }}' \
+     && candidate_job_uses_secrets_context '${{ toJSON(SeCrEtS) }}' \
+     && candidate_readiness_uses_secrets_context '' "$inherited_env_fixture" \
+     && candidate_job_uses_privileged_credential 'aUtHoR_mErGe_ToKeN'; then
+    pass "candidate readiness rejects standalone secrets context, including inherited root env"
   else
-    fail "the immediate-green path must guard helper skew and preserve the ordered two-token continuation"
+    fail "candidate readiness secrets-context matcher must reject toJSON, whitespace-indexed, and inherited root-env forms"
+  fi
+  candidate_rest_merge=0
+  if grep -Eq 'pulls/[^[:space:]]+/merge' <<<"$agent_auto_merge_flat" \
+     && grep -Eiq '(^|[[:space:]])(-X|--method)(=|[[:space:]])*(PUT|POST)([[:space:]]|$)' <<<"$agent_auto_merge_flat"; then
+    candidate_rest_merge=1
+  fi
+  if [[ "$wait_step_index" =~ ^[0-9]+$ ]] \
+     && [[ "$readiness_step_index" =~ ^[0-9]+$ ]] \
+     && [ "$readiness_step_index" -gt "$wait_step_index" ] \
+     && [ "$readiness_permissions" = "$expected_readiness_permissions" ] \
+     && ! candidate_readiness_uses_secrets_context "$agent_auto_merge" "$workflow_root_env" \
+     && ! grep -Eq '^[[:space:]]+secrets:[[:space:]]*inherit([[:space:]]|$)' <<<"$agent_auto_merge" \
+     && ! candidate_readiness_uses_privileged_credential "$privileged_credential_surface" "$workflow_root_env" \
+     && grep -Fq 'trusted Agent Review Pipeline workflow_run continuation' <<<"$readiness_step" \
+     && ! grep -Fq 'approval-merge-continuation.sh' <<<"$agent_auto_merge" \
+     && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge|addPullRequestToMergeQueue|enqueuePullRequest|dequeuePullRequest|enablePullRequestAutoMerge|disablePullRequestAutoMerge|mergePullRequest' <<<"$agent_auto_merge_flat" \
+     && [ "$candidate_rest_merge" -eq 0 ]; then
+    pass "the immediate-green candidate path remains read-only and delegates privileged continuation"
+  else
+    fail "the immediate-green candidate path must expose no secret, write permission, helper call, or merge mutation"
   fi
 
   if grep -Fq 'repo_lint_local.yml annex present' <<<"$agent_review_probe" \

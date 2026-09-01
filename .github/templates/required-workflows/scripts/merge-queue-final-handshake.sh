@@ -83,6 +83,18 @@ timestamp_like() {
     '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 }
 
+sha256_text() {
+  local digest
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$1" | sha256sum) || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$1" | shasum -a 256) || return 1
+  else
+    return 1
+  fi
+  printf '%s\n' "${digest%% *}"
+}
+
 case "$REPO" in */*) ;; *) usage ;; esac
 printf '%s' "$REPO" \
   | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || usage
@@ -134,6 +146,9 @@ for tool in gh jq git date od tr grep sleep mktemp; do
     || infra "required tool '$tool' is unavailable"
 done
 [ -n "${GH_TOKEN:-}" ] || infra "GH_TOKEN is required"
+[ -n "${GITHUB_OUTPUT:-}" ] && [ -f "$GITHUB_OUTPUT" ] \
+  && [ -w "$GITHUB_OUTPUT" ] \
+  || infra "GITHUB_OUTPUT must name the writable step-output file"
 
 SOURCE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P) \
   || infra "could not resolve the policy-source checkout"
@@ -1039,6 +1054,21 @@ while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
           || infra "could not perform final auditor-run readback"
         [ "$(classify_auditor_run "$FINAL_RUN" "$FINAL_AUDIT")" = success ] \
           || die "target auditor run lost its successful binding"
+        FINAL_CANONICAL=$(printf '%s' "$FINAL_AUDIT" | jq -ceS .) \
+          || infra "could not canonicalize the final audit output"
+        FINAL_COMMENT_ID=$(printf '%s' "$FINAL_AUDIT" | jq -er \
+          '._comment_id | select(type == "number" and floor == . and . > 0) |
+            tostring') \
+          || die "final audit has no canonical comment id"
+        FINAL_SHA256=$(sha256_text "$FINAL_CANONICAL") \
+          || infra "could not hash the final audit output"
+        printf '%s' "$FINAL_SHA256" | grep -Eq '^[0-9a-f]{64}$' \
+          || infra "final audit output hash is malformed"
+        {
+          printf 'final_audit_comment_id=%s\n' "$FINAL_COMMENT_ID"
+          printf 'final_audit_sha256=%s\n' "$FINAL_SHA256"
+        } >> "$GITHUB_OUTPUT" \
+          || infra "could not publish the final audit binding"
         echo "merge-queue-final-handshake: PASS — unique final audit verified"
         exit 0
         ;;

@@ -1056,22 +1056,68 @@ fi
 # is pinned to trusted default-branch scripts. Its early label read preserves
 # the exact bootstrap predicate for the first atomic consumer rollout, while
 # every privileged continuation lives in pull_request_target/workflow_run.
+auto_merge_permissions=$(yq -r '.jobs."auto-merge-on-approval".permissions | to_entries | sort_by(.key) | .[] | "\(.key): \(.value)"' "$agent_review_workflow")
+expected_auto_merge_permissions=$'actions: read\nchecks: read\ncontents: read\nissues: read\npull-requests: read\nstatuses: read'
+auto_merge_job_flat=$(tr '\n' ' ' <<<"$auto_merge_job_block")
+candidate_workflow_root_env() {
+  yq -r '.env // {}' "$1"
+}
+candidate_job_uses_secrets_context() {
+  grep -Eiq '(^|[^[:alnum:]_])secrets([^[:alnum:]_]|$)' <<<"$1"
+}
+candidate_job_uses_privileged_credential() {
+  grep -Eiq 'AUTHOR_MERGE_TOKEN|MERGE_QUEUE_POLICY_TOKEN|MERGE_QUEUE_SOURCE_TOKEN' <<<"$1"
+}
+candidate_readiness_uses_privileged_credential() {
+  candidate_job_uses_privileged_credential "$1" || candidate_job_uses_privileged_credential "$2"
+}
+candidate_readiness_uses_secrets_context() {
+  candidate_job_uses_secrets_context "$1" || candidate_job_uses_secrets_context "$2"
+}
+agent_review_root_env=$(candidate_workflow_root_env "$agent_review_workflow")
+inherited_env_fixture=$(
+  candidate_workflow_root_env - <<'YAML'
+name: inherited-secret-fixture
+env:
+  INHERITED: ${{ SeCrEtS ["REVIEWER_ASSIGNMENT_TOKEN"] }}
+jobs: {}
+YAML
+)
+privileged_credential_surface=$(sed \
+  -e '/^[[:space:]]*id:[[:space:]]*author_merge_token[[:space:]]*$/d' \
+  -e 's/steps\.author_merge_token/steps.read_only_readiness/g' \
+  <<<"$auto_merge_job_block")
+if candidate_job_uses_secrets_context '${{ toJSON(secrets) }}' \
+  && candidate_job_uses_secrets_context '${{ secrets ["REVIEWER_ASSIGNMENT_TOKEN"] }}' \
+  && candidate_job_uses_secrets_context '${{ Secrets.REVIEWER_ASSIGNMENT_TOKEN }}' \
+  && candidate_job_uses_secrets_context '${{ toJSON(SeCrEtS) }}' \
+  && candidate_readiness_uses_secrets_context '' "$inherited_env_fixture" \
+  && candidate_job_uses_privileged_credential 'aUtHoR_mErGe_ToKeN'; then
+  pass=$((pass + 1))
+  echo "  PASS: candidate readiness rejects standalone secrets context, including inherited root env"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: candidate readiness secrets-context matcher must reject toJSON, whitespace-indexed, and inherited root-env forms" >&2
+fi
+candidate_rest_merge=0
+if grep -Eq 'pulls/[^[:space:]]+/merge' <<<"$auto_merge_job_flat" \
+  && grep -Eiq '(^|[[:space:]])(-X|--method)(=|[[:space:]])*(PUT|POST)([[:space:]]|$)' <<<"$auto_merge_job_flat"; then
+  candidate_rest_merge=1
+fi
 if grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'source scripts/lib/blocking-labels.sh' <<<"$auto_merge_job_block")" -eq 1 ] \
   && grep -Fq 'if [ -f scripts/lib/blocking-labels.sh ]; then' <<<"$auto_merge_job_block" \
   && grep -Fq 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'blocking_labels=$(printf' <<<"$auto_merge_job_block")" -eq 1 ] \
-  && grep -Fq 'actions: read' <<<"$auto_merge_job_block" \
-  && grep -Fq 'checks: read' <<<"$auto_merge_job_block" \
-  && grep -Fq 'contents: read' <<<"$auto_merge_job_block" \
-  && grep -Fq 'issues: read' <<<"$auto_merge_job_block" \
-  && grep -Fq 'pull-requests: read' <<<"$auto_merge_job_block" \
-  && grep -Fq 'statuses: read' <<<"$auto_merge_job_block" \
+  && [ "$auto_merge_permissions" = "$expected_auto_merge_permissions" ] \
   && ! grep -Eq '^[[:space:]]+[a-z-]+:[[:space:]]+write([[:space:]]|$)' <<<"$auto_merge_job_block" \
-  && ! grep -Fq 'secrets.' <<<"$auto_merge_job_block" \
+  && ! candidate_readiness_uses_secrets_context "$auto_merge_job_block" "$agent_review_root_env" \
+  && ! grep -Eq '^[[:space:]]+secrets:[[:space:]]*inherit([[:space:]]|$)' <<<"$auto_merge_job_block" \
+  && ! candidate_readiness_uses_privileged_credential "$privileged_credential_surface" "$agent_review_root_env" \
   && ! grep -Fq 'approval-merge-continuation.sh' <<<"$auto_merge_job_block" \
-  && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' <<<"$auto_merge_job_block" \
-  && ! grep -Eq 'addPullRequestToMergeQueue|enqueuePullRequest' <<<"$auto_merge_job_block" \
+  && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' <<<"$auto_merge_job_flat" \
+  && ! grep -Eq 'addPullRequestToMergeQueue|enqueuePullRequest|dequeuePullRequest|enablePullRequestAutoMerge|disablePullRequestAutoMerge|mergePullRequest' <<<"$auto_merge_job_flat" \
+  && [ "$candidate_rest_merge" -eq 0 ] \
   && grep -Fq 'Enter read-only readiness lane' <<<"$auto_merge_job_block" \
   && grep -Fq 'Probe current-head check readiness once' <<<"$auto_merge_job_block" \
   && grep -Fq 'Report stable read-only readiness' <<<"$auto_merge_job_block" \

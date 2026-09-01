@@ -521,8 +521,8 @@ EOF
   [ "$FAIL" -ne "$before" ] || pass "O: unaccounted feedback exits 6 before a new @codex trigger"
 }
 
-# K: a registered approval routes straight to the shared continuation helper.
-# Parsed as YAML, not grepped: the claim is about executable step wiring, and a
+# K: a registered approval stays in the candidate-controlled read-only lane.
+# Parsed as YAML, not grepped: the claim is about executable job wiring, and a
 # text match cannot distinguish a step body from comments elsewhere in the file.
 test_workflow_declares_auto_trigger_flag() {
   local wf="$ROOT/.github/workflows/agent-review.yml" before=$FAIL
@@ -538,15 +538,70 @@ test_workflow_declares_auto_trigger_flag() {
     steps = job["steps"] || []
     abort("approval job must not wait for CodeRabbit") \
       if steps.any? { |s| s.is_a?(Hash) && s["name"].to_s.include?("CodeRabbit") }
-    step = steps.find { |s| s.is_a?(Hash) && s["name"] == "Report stable readiness" } \
-      or abort("step \"Report stable readiness\" not found")
+    permissions = job["permissions"] || {}
+    expected_permissions = {
+      "actions" => "read",
+      "checks" => "read",
+      "contents" => "read",
+      "issues" => "read",
+      "pull-requests" => "read",
+      "statuses" => "read",
+    }
+    abort("candidate readiness permissions must be the exact read-only allowlist") \
+      unless permissions == expected_permissions
+    serialized_job = job.to_s
+    secrets_context_pattern = /(^|[^A-Za-z0-9_])secrets([^A-Za-z0-9_]|$)/i
+    uses_secrets_context = ->(value) { value.to_s.match?(secrets_context_pattern) }
+    candidate_readiness_uses_secrets_context = lambda do |candidate_job, workflow|
+      candidate_job.key?("secrets") ||
+        uses_secrets_context.call(candidate_job) ||
+        uses_secrets_context.call(workflow["env"] || {})
+    end
+    expression_secret_fixtures = {
+      "toJSON secrets context" => %q(${{ toJSON(secrets) }}),
+      "whitespace-indexed reviewer secret" => %q(${{ secrets ["REVIEWER_ASSIGNMENT_TOKEN"] }}),
+      "mixed-case dotted reviewer secret" => %q(${{ Secrets.REVIEWER_ASSIGNMENT_TOKEN }}),
+      "mixed-case toJSON secrets context" => %q(${{ toJSON(SeCrEtS) }}),
+    }
+    expression_secret_fixtures.each do |name, fixture|
+      abort("candidate readiness secrets-context matcher missed #{name}") \
+        unless uses_secrets_context.call(fixture)
+    end
+    inherited_env_fixture = YAML.safe_load(<<~YAML)
+      name: inherited-secret-fixture
+      env:
+        INHERITED: ${{ SeCrEtS ["REVIEWER_ASSIGNMENT_TOKEN"] }}
+      jobs: {}
+    YAML
+    abort("candidate readiness guard missed inherited top-level env secret context") \
+      unless candidate_readiness_uses_secrets_context.call({}, inherited_env_fixture)
+    abort("candidate readiness must not materialize any repository secret") \
+      if candidate_readiness_uses_secrets_context.call(job, wf)
+    privileged_credentials_pattern = /AUTHOR_MERGE_TOKEN|MERGE_QUEUE_POLICY_TOKEN|MERGE_QUEUE_SOURCE_TOKEN/i
+    abort("candidate readiness privileged-credential matcher missed mixed case") \
+      unless %q(aUtHoR_mErGe_ToKeN).match?(privileged_credentials_pattern)
+    privileged_credential_surface = YAML.dump(job)
+      .gsub(/^(\s*id:\s*)author_merge_token\s*$/i, "\\1read_only_readiness")
+      .gsub(/steps\.author_merge_token/i, "steps.read_only_readiness")
+    privileged_credential_surface += YAML.dump(wf["env"] || {})
+    abort("candidate readiness must not reference a privileged credential") \
+      if privileged_credential_surface.match?(privileged_credentials_pattern)
+    step = steps.find { |s| s.is_a?(Hash) && s["name"] == "Report stable read-only readiness" } \
+      or abort("step \"Report stable read-only readiness\" not found")
     run = step["run"].to_s
-    abort("Report stable readiness must route through approval-merge-continuation.sh") \
-      unless run.include?("scripts/workflow/approval-merge-continuation.sh")
+    abort("read-only readiness must delegate mutable gates to the trusted continuation") \
+      unless run.include?("trusted Agent Review Pipeline workflow_run continuation")
+    abort("candidate readiness must not invoke the privileged continuation helper") \
+      if run.include?("approval-merge-continuation.sh")
+    mutation_names = /gh\s+pr\s+merge|addPullRequestToMergeQueue|enqueuePullRequest|dequeuePullRequest|enablePullRequestAutoMerge|disablePullRequestAutoMerge|mergePullRequest/
+    rest_merge_endpoint = serialized_job.match?(%r{pulls/[^\s]+/merge})
+    rest_write_method = serialized_job.match?(/(?:--method|-X)(?:=|\s)*(?:PUT|POST)\b/i)
+    abort("candidate readiness must not invoke a merge or queue mutation") \
+      if serialized_job.match?(mutation_names) || (rest_merge_endpoint && rest_write_method)
   ' "$wf" 2>"$WORKDIR/k.err"; then
     fail "K: $(cat "$WORKDIR/k.err")"
   fi
-  [ "$FAIL" -ne "$before" ] || pass "K: registered approval routes directly through the shared continuation helper"
+  [ "$FAIL" -ne "$before" ] || pass "K: registered approval remains read-only and delegates privileged continuation"
 }
 
 test_fresh_posts_once_no_poll
