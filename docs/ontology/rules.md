@@ -681,7 +681,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-99.** Approved-wave fan-out mirrors carry the CodeRabbit-ignore marker and no Codex trigger. ○ — docs/agents/propagation-ordering.md
 
-**G-100.** The canary keeps the full advisory CodeRabbit pass. ○ — docs/agents/propagation-ordering.md
+**G-100.** The canary keeps the full advisory CodeRabbit pass, except where the canary's own repo has CodeRabbit disabled — then the leg is recorded unavailable in the wave tracker rather than assumed. ○ — docs/agents/propagation-ordering.md
 
 **G-101.** Consumer-specific divergence goes through overrides, facts, or exclusions with a reason — never a hand edit. ● — docs/agents/propagation-ordering.md
 
@@ -1129,7 +1129,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-297.** A PR against a non-default base is not auto-reviewed; a workflow targeting one must add that base to the base-branches list in that repo's own config. ● — docs/agents/coderabbit-audit.md
 
-**G-298.** Learnings scope stays `auto` (resolving local for the all-public fleet); org-wide sharing would require an explicit global override, never an accident of visibility. ● — docs/agents/coderabbit-audit.md
+**G-298.** Learnings scope stays `auto`, which resolves per repo by visibility — `local` for a public repo, `global` for a private one — so the resolution is read off the repo's current visibility rather than assumed uniform across the fleet. ● — docs/agents/coderabbit-audit.md
 
 **G-299.** Path instructions are targeted supplements added on an observed miss, never speculative additions. ○ — docs/agents/coderabbit-audit.md
 
