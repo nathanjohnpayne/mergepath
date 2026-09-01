@@ -420,9 +420,20 @@ br_required_checks() {
   # fails open in exactly the direction this probe exists to prevent.
   if [ "$rulesets_ok" -eq 1 ]; then
     if rulesets_meta="$(_br_retry gh api --paginate "repos/$repo/rulesets" 2>"$errfile")"; then
+      # BRANCH-targeted and ACTIVE only.
+      #
+      # A tag ruleset cannot contribute to `rules/branches/<branch>` and cannot
+      # hide a branch status-check requirement, so counting one would mark the
+      # surface unknown — and, because that state is itself blocking, would
+      # permanently stop gate (a) clearing on a repo whose only bypassable
+      # ruleset governs tags. `target` is a field on the listing, so this costs
+      # no ref-pattern matching: it distinguishes what a ruleset governs, not
+      # which refs it names.
       active_rulesets="$(printf '%s' "$rulesets_meta" | jq -r -s '
         add // []
-        | [ .[]? | objects | select((.enforcement // "") == "active") ]
+        | [ .[]? | objects
+            | select((.enforcement // "") == "active")
+            | select((.target // "branch") == "branch") ]
         | .[] | "\(.id)|\(.source_type // "")|\(.source // "")"' 2>/dev/null || echo "PARSE_FAILED")"
       if [ "$active_rulesets" = "PARSE_FAILED" ]; then
         rulesets_ok=0
@@ -445,7 +456,20 @@ br_required_checks() {
             break
           fi
           if rs_detail="$(_br_retry gh api "$rs_endpoint" 2>"$errfile")"; then
-            if [ "$(printf '%s' "$rs_detail" | jq -r '((.bypass_actors // []) | length)' 2>/dev/null || echo 1)" -ne 0 ]; then
+            # `bypass_actors` must be an ACTUAL ARRAY. GitHub OMITS the field
+            # when the token lacks write access to the ruleset rather than
+            # returning it empty, so `// []` would turn "I was not shown the
+            # bypass list" into "there is no bypass list" — the absence-versus-
+            # inability-to-look conflation this whole change exists to remove,
+            # reappearing inside the probe written to catch it. An absent field
+            # leaves completeness unproven, exactly like an unreadable detail.
+            rs_bypass="$(printf '%s' "$rs_detail" \
+              | jq -r 'if (.bypass_actors | type) == "array" then (.bypass_actors | length | tostring) else "unknown" end' 2>/dev/null || echo "unknown")"
+            if [ "$rs_bypass" = "unknown" ]; then
+              rulesets_ok=0
+              errors="$(printf '%s' "$errors" | jq -c --arg i "$rs_id" '. + ["rulesets: ruleset \($i) did not report a bypass_actors array (the field is omitted when the token lacks write access to the ruleset), so completeness cannot be shown"]')"
+              break
+            elif [ "$rs_bypass" -ne 0 ]; then
               rulesets_ok=0
               errors="$(printf '%s' "$errors" | jq -c --arg i "$rs_id" '. + ["rulesets: ruleset \($i) has bypass actors, so a rule binding the merging identity may be hidden from this reader"]')"
               break

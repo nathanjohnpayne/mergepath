@@ -78,6 +78,9 @@ gh() {
         fail)   echo '{"message":"Not Found","status":"404"}'
                 echo "gh: Not Found (HTTP 404)" >&2; return 1 ;;
         bypass) echo '{"bypass_actors":[{"actor_id":5,"actor_type":"Team"}]}'; return 0 ;;
+        # GitHub OMITS bypass_actors when the token lacks write access to the
+        # ruleset, rather than returning it empty.
+        omitted) echo '{"id":42,"name":"x"}'; return 0 ;;
         *)      echo '{"bypass_actors":[]}'; return 0 ;;
       esac
       ;;
@@ -88,6 +91,7 @@ gh() {
                   echo "gh: Server Error (HTTP 500)" >&2; return 1 ;;
         active)   echo '[{"id":42,"enforcement":"active","source_type":"Repository","source":"owner/repo"}]'; return 0 ;;
         org)      echo '[{"id":43,"enforcement":"active","source_type":"Organization","source":"owner"}]'; return 0 ;;
+        tag)      echo '[{"id":45,"enforcement":"active","target":"tag","source_type":"Repository","source":"owner/repo"}]'; return 0 ;;
         evaluate) echo '[{"id":44,"enforcement":"evaluate","source_type":"Repository","source":"owner/repo"}]'; return 0 ;;
         *)        echo '[]'; return 0 ;;
       esac
@@ -402,6 +406,35 @@ if [ "$(field "$out" .state)" = "known" ] \
   pass "a repo with no rulesets resolves normally — the probe costs nothing where nothing can hide"
 else
   fail "no rulesets: expected known/[lint], got $out"
+fi
+
+# An OMITTED bypass_actors is not an empty one. GitHub drops the field when the
+# token lacks write access to the ruleset, so `// []` would convert "I was not
+# shown the bypass list" into "there is no bypass list" — the same
+# absence-versus-inability-to-look conflation, inside the probe written to
+# catch it.
+out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=active GH_RULESET_DETAIL=omitted \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "unknown" ] \
+   && printf '%s' "$out" | grep -q 'bypass_actors array'; then
+  pass "an omitted bypass_actors leaves completeness unproven rather than reading as empty"
+else
+  fail "omitted bypass_actors: expected unknown, got $out"
+fi
+
+# A TAG ruleset cannot contribute to rules/branches or hide a branch
+# status-check requirement, so a bypassable one must not degrade the result —
+# otherwise a repo whose only bypassable ruleset governs tags could never clear
+# gate (a) on any PR.
+out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=tag GH_RULESET_DETAIL=bypass \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "known" ] \
+   && [ "$(field "$out" '.contexts | join(",")')" = "lint" ]; then
+  pass "a bypassable TAG ruleset does not degrade the branch requirement union"
+else
+  fail "tag-targeted ruleset: expected known/[lint], got $out"
 fi
 
 # ── 10. Each surface is retried once before being given up on, so a single
