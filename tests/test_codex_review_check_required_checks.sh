@@ -1555,6 +1555,27 @@ else
   fail "#1064: an unreported requirement leaves BAD_CHECKS empty and gate (a) clears while GitHub still blocks the merge"
 fi
 
+# An UNRESOLVED requirement list is itself blocking. On that path the filter
+# can only judge checks that reported, so a required context whose workflow has
+# not been scheduled produces no entry and an otherwise-green rollup would
+# clear gate (a) while GitHub is still waiting for it. Scrutinising every
+# counted check (#465) catches a red check but not an absent one.
+if grep -q 'requirement list unresolved' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'requirements_state == "known"' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: an unresolved requirement list blocks gate (a) instead of clearing on a rollup-only result"
+else
+  fail "#1064: gate (a) can still report clean while the requirement list is unreadable — a never-reported required check is invisible on that path"
+fi
+
+# It blocks via a synthetic entry, not a hard exit: an infrastructure exit
+# would take the script down fleet-wide on any anomaly in one endpoint, which
+# is the shape of the #1061 regression.
+if grep -q 'result: "UNKNOWN"' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: the unresolved state blocks via a reported entry rather than a fleet-wide hard exit"
+else
+  fail "#1064: the unresolved state no longer surfaces as a blocking entry"
+fi
+
 # The candidate set is drawn AFTER the approval-readiness exclusion but the
 # exclusion only drops non-completed checks from the caller own trusted run, so
 # a still-running check of the caller cannot be reported as never-reported for

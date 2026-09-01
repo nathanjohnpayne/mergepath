@@ -1642,6 +1642,7 @@ fi
 
 BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
   --argjson requirements "${REQUIREMENTS_JSON:-[]}" \
+  --arg requirements_state "$BRANCH_REQUIREMENTS_STATE" \
   --arg approval_readiness_only "$APPROVAL_READINESS_ONLY" \
   --arg current_run_id "$CURRENT_RUN_ID" '
   # Pick the entry that REPRESENTS a set of runs: a still-non-terminal entry
@@ -1666,7 +1667,23 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         end
       ))) as $pending
     | if ($pending | length) > 0
-      then $pending[0]
+      then
+        # A non-terminal entry wins over any completed sibling. That
+        # precedence is #655 round 6 deliberately: once a run for a required
+        # context has appeared in the rollup, gate (a) must not report clean
+        # until it finishes, so a fast sibling cannot clear the label while a
+        # slower run of the same context is still in flight.
+        #
+        # Among SEVERAL pending entries, prefer one with no timestamp at all —
+        # a freshly-queued rerun, which is by construction the newest and is
+        # why the precedence above is unconditional — and otherwise take the
+        # latest-started, so the choice is by recency rather than by whichever
+        # node happened to sort first.
+        (($pending | map(select(.startedAt == ""))) as $untimed
+         | if ($untimed | length) > 0
+           then $untimed[0]
+           else ($pending | sort_by(.startedAt) | last)
+           end)
       else (sort_by(if .completedAt != "" then .completedAt else .startedAt end) | last)
       end;
 
@@ -1720,11 +1737,35 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
   | ($entries | map(select(.isRequired != false))) as $counted
   | if ($requirements | length) == 0
     then
-      # No requirement list — either the branch genuinely requires nothing (in
-      # which case the rollup was already emptied upstream) or it could not be
-      # resolved, where #465 says fail closed: every counted check must be
-      # green. Collapsed by name so a superseded rerun does not block.
-      ($counted | group_by(.label) | map(current_entry) | map(select(blocks)))
+      # No requirement list. Two very different reasons reach here, and they
+      # are told apart by $requirements_state rather than by the empty list —
+      # which is the whole point of the tri-state.
+      #
+      # `known`: the branch genuinely requires nothing. The rollup was already
+      # emptied upstream, so this judges nothing and gate (a) imposes no filter.
+      #
+      # `unknown`: the list could not be RESOLVED. Judging the rollup alone is
+      # not enough here, because it can only see checks that reported: a
+      # required context whose workflow has not been scheduled produces no
+      # entry, so an otherwise-green rollup would clear gate (a) while GitHub
+      # is still waiting for that context. Scrutinising every counted check
+      # (#465) catches a red one but cannot catch an absent one, and on this
+      # path there is no list to notice the absence from. So an unresolved
+      # requirement list is itself blocking: gate (a) reports that it could not
+      # determine the requirements rather than reporting clean.
+      #
+      # Blocking via a synthetic entry rather than a hard exit is deliberate.
+      # An infrastructure exit would take the whole script down fleet-wide on
+      # any anomaly in one endpoint, which is the shape of the regression that
+      # caused the #1061 revert; a blocking entry declines to clear, keeps the
+      # genuinely-red checks visible alongside it, and resolves on its own when
+      # the surfaces answer again.
+      (($counted | group_by(.label) | map(current_entry) | map(select(blocks)))
+       + (if $requirements_state == "known" then []
+          else [ { label: "(requirement list unresolved)",
+                   workflow: "(gate (a) could not read the branch rules)",
+                   result: "UNKNOWN" } ]
+          end))
     else
       # REQUIREMENT-DRIVEN. Iterate the rules GitHub will evaluate, not the
       # runs that happen to exist, and ask of each whether it is satisfied.
