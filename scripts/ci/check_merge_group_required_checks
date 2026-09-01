@@ -4467,7 +4467,14 @@ expect_bridge "bridge permits a safe queue-entry state transition" 0 \
 reset_fixtures
 STUB_TARGET_METADATA_FINAL=$(printf '%s' "$STUB_TARGET_METADATA" | jq -c \
   '.id=112')
-export STUB_TARGET_METADATA_FINAL
+# Force the body producer past every common pipe-buffer size.  The body gate
+# deliberately exits without reading stdin in this fixture; under pipefail the
+# caller must still reach the later identity fence instead of surfacing a
+# scheduler-dependent EPIPE from its input producer (#1058).
+LARGE_PR_BODY=$(head -c 98304 /dev/zero | tr '\0' x)
+STUB_PR=$(printf '%s' "$STUB_PR" | jq -c --arg body "$LARGE_PR_BODY" \
+  '.body=$body')
+export STUB_TARGET_METADATA_FINAL STUB_PR
 expect_bridge "bridge rejects target identity drift on a runtime reread" 1 \
   "source identity became unsafe"
 
@@ -4610,22 +4617,23 @@ expect_bridge "bridge ignores legacy intents for another repository or PR" 0 \
 # exact marker found only on page two makes retries idempotent.
 run_recorder() {
   set +e
-  PATH="$TMP/integration-bin:$PATH" STUB_DIR="$TMP" GH_TOKEN=test-token \
-    MERGEPATH_MERGE_QUEUE_POLICY_TOKEN=policy-token \
-    MERGEPATH_MERGE_QUEUE_SOURCE_TOKEN=source-token \
-    MERGEPATH_MERGE_QUEUE_ATTESTATION_ATTEMPTS="$ATTESTATION_ATTEMPTS_INPUT" \
-    MERGEPATH_MERGE_QUEUE_ATTESTATION_INTERVAL_SECONDS="$ATTESTATION_INTERVAL_INPUT" \
-    MERGEPATH_REPO_ROOT="$FIXTURE_ROOT" \
-    bash "$FIXTURE_ROOT/scripts/workflow/record-merge-queue-authorization.sh" \
-      --repo "$REPO" --event-action "$RECORDER_EVENT_ACTION" \
-      --pr 7 --head-sha "$HEAD_SHA" --head-repo "$REPO" \
-      --base-sha "$BASE_SHA" --base-ref main --enabled-by "$AUTHOR" \
-      --pr-author "$AUTHOR" --default-branch main \
-      --runtime-ref refs/heads/main --runtime-sha "$BASE_SHA" \
-      --runtime-workflow-ref \
-        "$REPO/.github/workflows/merge-queue-authorization.yml@refs/heads/main" \
-      --runtime-workflow-sha "$BASE_SHA" \
-      > "$TMP/recorder.out" 2>&1
+  (cd "$TMP" && \
+    PATH="$TMP/integration-bin:$PATH" STUB_DIR="$TMP" GH_TOKEN=test-token \
+      MERGEPATH_MERGE_QUEUE_POLICY_TOKEN=policy-token \
+      MERGEPATH_MERGE_QUEUE_SOURCE_TOKEN=source-token \
+      MERGEPATH_MERGE_QUEUE_ATTESTATION_ATTEMPTS="$ATTESTATION_ATTEMPTS_INPUT" \
+      MERGEPATH_MERGE_QUEUE_ATTESTATION_INTERVAL_SECONDS="$ATTESTATION_INTERVAL_INPUT" \
+      MERGEPATH_REPO_ROOT="$FIXTURE_ROOT" \
+      bash "$FIXTURE_ROOT/scripts/workflow/record-merge-queue-authorization.sh" \
+        --repo "$REPO" --event-action "$RECORDER_EVENT_ACTION" \
+        --pr 7 --head-sha "$HEAD_SHA" --head-repo "$REPO" \
+        --base-sha "$BASE_SHA" --base-ref main --enabled-by "$AUTHOR" \
+        --pr-author "$AUTHOR" --default-branch main \
+        --runtime-ref refs/heads/main --runtime-sha "$BASE_SHA" \
+        --runtime-workflow-ref \
+          "$REPO/.github/workflows/merge-queue-authorization.yml@refs/heads/main" \
+        --runtime-workflow-sha "$BASE_SHA" \
+        > "$TMP/recorder.out" 2>&1)
   RECORDER_RC=$?
   set -e
 }
@@ -4712,11 +4720,13 @@ export STUB_PR STUB_TIMELINE STUB_AUTO_REQUEST STUB_COMMENTS \
 run_recorder
 if [ "$RECORDER_RC" -eq 0 ] && [ ! -s "$TMP/writes.log" ] \
   && grep -qF "already recorded" "$TMP/recorder.out" \
+  && grep -F $'git\t-C\t'"$FIXTURE_ROOT"$'\trev-parse\tHEAD' \
+    "$TMP/git.log" >/dev/null \
   && grep -F $'gh\tapi\t--paginate\trepos/owner/repo/issues/7/comments?per_page=100' \
     "$TMP/gh.log" >/dev/null; then
-  pass "recorder finds a page-two marker and remains idempotent"
+  pass "recorder anchors checkout identity to its configured root from a foreign cwd and remains idempotent"
 else
-  fail "recorder did not honor page-two idempotency: $(cat "$TMP/recorder.out")"
+  fail "recorder did not anchor its checkout or honor page-two idempotency: $(cat "$TMP/recorder.out")"
 fi
 
 reset_fixtures

@@ -1511,6 +1511,9 @@ paths:
       - "scripts/workflow/record-merge-queue-authorization.sh"
       - "scripts/lib/merge-queue-protection.sh"
       - "scripts/lib/merge-queue-authorization.sh"
+      - "scripts/lib/blocking-labels.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/review-policy-scalar.sh"
       - "scripts/gh-as-author.sh"
   # The source-pinned required workflow sends its one private-nonce request to
   # this target-base responder. Propagate the workflow and recorder in the
@@ -1710,6 +1713,7 @@ paths:
     requires:
       - "scripts/lib/ci-check-modes.sh"          # shared --check/--self-test selector (#1062)
       - "scripts/lib/blocking-labels.sh"         # check_workflow_parsers shared exact-label predicate (#1062)
+      - "scripts/lib/gh-command-classifier.sh"   # shared native/API mutation guard (#1058)
       - "tests/test_repo_lint_optimization.sh"   # check_repo_lint_optimization
       - "tests/test_check_doc_ownership.sh"      # check_doc_ownership
       - "tests/test_gh_pr_guard.sh"            # check_gh_as_author

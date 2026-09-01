@@ -14,6 +14,26 @@ WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
 CONTINUATION_TEST="$ROOT/tests/test_approval_merge_continuation.sh"
 CONTINUATION="$ROOT/scripts/workflow/approval-merge-continuation.sh"
 CONTINUATION_REPORTER="$ROOT/scripts/workflow/report-approval-continuation-failures.sh"
+COMMAND_CLASSIFIER="$ROOT/scripts/lib/gh-command-classifier.sh"
+MODE_HELPER="$ROOT/scripts/lib/ci-check-modes.sh"
+
+[ -r "$MODE_HELPER" ] || {
+  echo "check_auto_clear_workflow: missing $MODE_HELPER" >&2
+  exit 1
+}
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: check_auto_clear_workflow [--check | --self-test]" >&2
+  exit 2
+fi
+
+[ -r "$COMMAND_CLASSIFIER" ] || {
+  echo "check_auto_clear_workflow: missing $COMMAND_CLASSIFIER" >&2
+  exit 1
+}
+# shellcheck source=../lib/gh-command-classifier.sh
+. "$COMMAND_CLASSIFIER"
 
 pass=0
 fail=0
@@ -29,12 +49,433 @@ fi
 
 if [ -f "$CONTINUATION" ] \
    && ! grep -Fq -- '--disable-auto' "$CONTINUATION" \
-   && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' "$CONTINUATION"; then
+   && gh_source_lacks_direct_literal_pr_mutation < "$CONTINUATION"; then
   pass=$((pass + 1))
-  echo "  PASS: approval cleanup is read-only and contains no native merge/disable write"
+  echo "  PASS: approval cleanup exposes no direct native or API merge/disable syntax"
 else
   fail=$((fail + 1))
-  echo "  FAIL: approval cleanup must never issue an unconditional native merge/disable write" >&2
+  echo "  FAIL: approval cleanup must expose no direct native or API merge/disable syntax" >&2
+fi
+
+workflow_source_has_trigger_fallback() {
+  local trigger="$1" ambiguity_scope="${2:-all}"
+  awk -v wanted="$trigger" -v ambiguity_scope="$ambiguity_scope" -v sq="'" '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    function key_is(token, expected) {
+      return token == expected || token == "\"" expected "\"" \
+        || token == sq expected sq
+    }
+    function key_is_ambiguous(token) {
+      return token == "<<" || token ~ /^[*?!&]/ \
+        || (token ~ /^\"/ && token ~ /\\/)
+    }
+    function strip_yaml_comments(value, i, char, quote, escaped, previous, output, in_comment) {
+      quote = ""
+      escaped = 0
+      output = ""
+      in_comment = 0
+      for (i = 1; i <= length(value); i++) {
+        char = substr(value, i, 1)
+        if (in_comment) {
+          if (char == "\n") {
+            in_comment = 0
+            output = output " "
+          }
+          continue
+        }
+        if (quote != "") {
+          output = output char
+          if (escaped) { escaped = 0; continue }
+          if (char == "\\" && quote == "\"") { escaped = 1; continue }
+          if (char == quote) quote = ""
+          continue
+        }
+        if (char == "\"" || char == sq) {
+          quote = char
+          output = output char
+          continue
+        }
+        previous = i > 1 ? substr(value, i - 1, 1) : " "
+        if (char == "#" && previous ~ /[[:space:]]/) {
+          in_comment = 1
+          continue
+        }
+        output = output char
+      }
+      return output
+    }
+    function flow_mapping_has(value, expected, i, char, depth, quote, escaped, token, key) {
+      depth = 0
+      quote = ""
+      escaped = 0
+      token = ""
+      expecting_key = 0
+      for (i = 1; i <= length(value); i++) {
+        char = substr(value, i, 1)
+        if (quote != "") {
+          if (expecting_key) token = token char
+          if (escaped) { escaped = 0; continue }
+          if (char == "\\" && quote == "\"") { escaped = 1; continue }
+          if (char == quote) quote = ""
+          continue
+        }
+        if (char == "\"" || char == sq) {
+          quote = char
+          if (expecting_key) token = token char
+          continue
+        }
+        if (char == "{") {
+          depth++
+          if (depth == 1) { expecting_key = 1; token = "" }
+          continue
+        }
+        if (char == "}") {
+          depth--
+          continue
+        }
+        if (depth != 1) continue
+        if (expecting_key && char == ":") {
+          key = trim(token)
+          if (ambiguity_scope == "all" && key_is_ambiguous(key)) ambiguous = 1
+          if (key_is(key, expected)) return 1
+          expecting_key = 0
+          token = ""
+          continue
+        }
+        if (char == ",") {
+          expecting_key = 1
+          token = ""
+          continue
+        }
+        if (expecting_key) token = token char
+      }
+      return 0
+    }
+    function flow_depth_change(value, i, char, quote, escaped, change) {
+      quote = ""
+      escaped = 0
+      change = 0
+      for (i = 1; i <= length(value); i++) {
+        char = substr(value, i, 1)
+        if (quote != "") {
+          if (escaped) { escaped = 0; continue }
+          if (char == "\\" && quote == "\"") { escaped = 1; continue }
+          if (char == quote) quote = ""
+          continue
+        }
+        if (char == "\"" || char == sq) { quote = char; continue }
+        if (char == "{") change++
+        if (char == "}") change--
+      }
+      return change
+    }
+    BEGIN {
+      in_on = 0
+      in_flow = 0
+      on_indent = -1
+      child_indent = -1
+      flow_depth = 0
+      flow_value = ""
+      found = 0
+      ambiguous = 0
+      seen_on = 0
+    }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (line ~ /^[[:space:]]*$/ || line ~ /^[[:space:]]*#/) next
+      match(line, /^ */)
+      indent = RLENGTH
+      raw_content = substr(line, indent + 1)
+      content = strip_yaml_comments(raw_content)
+      if (trim(content) == "") next
+      # A root-level flow mapping can carry duplicate `on` keys that ordinary
+      # YAML parsers silently collapse. The fallback intentionally supports
+      # flow mappings as the VALUE of one block-root `on:` key, but a flow-map
+      # document root is outside its proof surface and therefore ambiguous,
+      # including when an inline YAML document marker precedes the map.
+      if (!in_on && !in_flow && indent == 0 \
+          && content ~ /^(---[[:space:]]+)?\{/) {
+        ambiguous = 1
+        next
+      }
+      if (ambiguity_scope == "all" \
+          && (content ~ /^\?[[:space:]]/ || content ~ /^:[[:space:]]/)) ambiguous = 1
+
+      if (in_flow) {
+        flow_value = flow_value "\n" raw_content
+        flow_clean = strip_yaml_comments(flow_value)
+        flow_depth = flow_depth_change(flow_clean)
+        if (flow_depth <= 0) {
+          if (flow_mapping_has(flow_clean, wanted)) found = 1
+          in_flow = 0
+          flow_value = ""
+        }
+        next
+      }
+
+      if (!in_on) {
+        if (indent != 0) next
+        colon = index(content, ":")
+        if (colon == 0) next
+        top_key = trim(substr(content, 1, colon - 1))
+        if (ambiguity_scope == "all" && key_is_ambiguous(top_key)) ambiguous = 1
+        if (!key_is(top_key, "on")) next
+        if (seen_on) ambiguous = 1
+        seen_on = 1
+        rest = trim(substr(content, colon + 1))
+        raw_rest = trim(substr(raw_content, colon + 1))
+        if (rest == "" || rest ~ /^#/) {
+          in_on = 1
+          on_indent = indent
+          child_indent = -1
+        } else if (ambiguity_scope == "all" && (rest ~ /^[&!?]/ \
+                   || rest ~ /^\*[^[:space:]\[\]{},]+$/)) {
+          ambiguous = 1
+        } else if (rest ~ /^\{/) {
+          flow_value = raw_rest
+          flow_clean = strip_yaml_comments(flow_value)
+          flow_depth = flow_depth_change(flow_clean)
+          if (flow_depth <= 0) {
+            if (flow_mapping_has(flow_clean, wanted)) found = 1
+          } else {
+            in_flow = 1
+          }
+        } else if (key_is(rest, wanted)) {
+          found = 1
+        }
+        next
+      }
+
+      if (indent <= on_indent) {
+        in_on = 0
+      } else {
+        if (child_indent == -1) child_indent = indent
+        if (indent != child_indent) next
+        colon = index(content, ":")
+        if (colon > 0) {
+          child_key = trim(substr(content, 1, colon - 1))
+          if (ambiguity_scope == "all" && key_is_ambiguous(child_key)) ambiguous = 1
+          if (key_is(child_key, wanted)) found = 1
+        }
+        next
+      }
+
+      # Reprocess the boundary record after leaving a block `on:` mapping.
+      # It may itself be a duplicate top-level `on` key; skipping that record
+      # would let the first mapping decide forbidden-trigger absence.
+      if (indent != 0) next
+      colon = index(content, ":")
+      if (colon == 0) next
+      top_key = trim(substr(content, 1, colon - 1))
+      if (ambiguity_scope == "all" && key_is_ambiguous(top_key)) ambiguous = 1
+      if (!key_is(top_key, "on")) next
+      ambiguous = 1
+      seen_on = 1
+    }
+    END {
+      if (ambiguous) exit 2
+      if (found) exit 0
+      exit 1
+    }
+  '
+}
+
+workflow_source_has_trigger() {
+  local trigger="$1" document result rc ambiguity_rc
+  document=$(cat) || return 2
+  if command -v yq >/dev/null 2>&1; then
+    # yq resolves anchors and tags, but like most YAML parsers it accepts
+    # duplicate mapping keys and retains only one value. Probe that ambiguity
+    # before parsing; this pass never decides trigger presence.
+    ambiguity_rc=0
+    printf '%s\n' "$document" \
+      | workflow_source_has_trigger_fallback \
+        __mergepath_trigger_ambiguity_probe_1058__ duplicates-only \
+      || ambiguity_rc=$?
+    [ "$ambiguity_rc" -ne 2 ] || return 2
+    rc=0
+    result=$(printf '%s\n' "$document" \
+      | MERGEPATH_TRIGGER_KEY="$trigger" yq -r \
+        'explode(.) | ((.on | type) == "!!map" and (.on | has(strenv(MERGEPATH_TRIGGER_KEY))))' \
+        - 2>/dev/null) || rc=$?
+    [ "$rc" -eq 0 ] || return 2
+    case "$result" in
+      true) return 0 ;;
+      false) return 1 ;;
+      *) return 2 ;;
+    esac
+  elif python3 -c 'import yaml' >/dev/null 2>&1; then
+    # The BaseLoader path does not provide yq's explode semantics, so retain
+    # the broader fail-closed ambiguity probe used by the parserless path.
+    ambiguity_rc=0
+    printf '%s\n' "$document" \
+      | workflow_source_has_trigger_fallback \
+        __mergepath_trigger_ambiguity_probe_1058__ \
+      || ambiguity_rc=$?
+    [ "$ambiguity_rc" -ne 2 ] || return 2
+    rc=0
+    result=$(printf '%s\n' "$document" \
+      | MERGEPATH_TRIGGER_KEY="$trigger" python3 -c '
+import os, sys, yaml
+document = yaml.load(sys.stdin, Loader=yaml.BaseLoader)
+triggers = document.get("on", {}) if isinstance(document, dict) else {}
+print("found" if isinstance(triggers, dict) and os.environ["MERGEPATH_TRIGGER_KEY"] in triggers else "absent")
+' 2>/dev/null) || rc=$?
+    [ "$rc" -eq 0 ] || return 2
+    case "$result" in
+      found) return 0 ;;
+      absent) return 1 ;;
+      *) return 2 ;;
+    esac
+  else
+    printf '%s\n' "$document" | workflow_source_has_trigger_fallback "$trigger"
+  fi
+}
+
+workflow_source_lacks_trigger() {
+  local rc=0
+  workflow_source_has_trigger "$@" || rc=$?
+  [ "$rc" -eq 1 ]
+}
+
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+trigger_parser_ok=1
+for trigger_fixture in \
+  $'on:\n  pull_request_review:\n    types: [submitted]' \
+  $'on:\n    pull_request_review:\n      types: [submitted]' \
+  $'on:\n  "pull_request_review"  :\n    types: [submitted]' \
+  $'on:\n  \'pull_request_review\':\n    types: [submitted]'; do
+  printf '%s\n' "$trigger_fixture" \
+    | workflow_source_has_trigger pull_request_review \
+    || trigger_parser_ok=0
+  printf '%s\n' "$trigger_fixture" \
+    | workflow_source_has_trigger_fallback pull_request_review \
+    || trigger_parser_ok=0
+done
+flow_trigger_fixture='on: {"pull_request_review": {types: [submitted]}}'
+multiline_flow_trigger_fixture=$'on: {\n  push: {},\n  "pull_request_review": {types: [submitted]}\n}'
+comment_brace_flow_trigger_fixture=$'on: {\n  pull_request_target: {},\n  workflow_run: {}, # }\n  pull_request_review: {}\n}'
+multiline_quoted_flow_trigger_fixture=$'on: {\n  pull_request_target: {},\n  workflow_run: {types: ["completed\n  }}"]},\n  pull_request_review: {}\n}'
+alias_trigger_fixture=$'name: &event pull_request_review\non:\n  pull_request_target: {}\n  workflow_run: {}\n  *event: {}'
+flow_alias_trigger_fixture=$'name: &event pull_request_review\non: {pull_request_target: {}, workflow_run: {}, *event: {}}'
+merge_alias_trigger_fixture=$'triggers: &triggers\n  pull_request_review: {}\non:\n  <<: *triggers\n  pull_request_target: {}\n  workflow_run: {}'
+whole_on_alias_trigger_fixture=$'triggers: &triggers\n  pull_request_review: {}\non: *triggers'
+dotted_alias_trigger_fixture=$'name: &event.name pull_request_review\non:\n  pull_request_target: {}\n  workflow_run: {}\n  *event.name: {}'
+escaped_trigger_fixture=$'on:\n  pull_request_target: {}\n  workflow_run: {}\n  "pull_request_\\x72eview": {}'
+explicit_trigger_fixture=$'on:\n  pull_request_target: {}\n  workflow_run: {}\n  ? pull_request_review\n  : {}'
+anchored_on_block_trigger_fixture=$'on: &events\n  pull_request_target: {}\n  workflow_run: {}\n  pull_request_review: {}'
+anchored_on_flow_trigger_fixture=$'on: &events {pull_request_target: {}, workflow_run: {}, pull_request_review: {}}'
+tagged_on_block_trigger_fixture=$'on: !!map\n  pull_request_target: {}\n  workflow_run: {}\n  pull_request_review: {}'
+tagged_on_flow_trigger_fixture=$'on: !!map {pull_request_target: {}, workflow_run: {}, pull_request_review: {}}'
+duplicate_on_trigger_fixture=$'on:\n  pull_request_target: {}\n  workflow_run: {}\non:\n  pull_request_review: {}'
+duplicate_on_reverse_trigger_fixture=$'on:\n  pull_request_review: {}\non:\n  pull_request_target: {}\n  workflow_run: {}'
+duplicate_root_flow_on_trigger_fixture='{on: {pull_request_review: {}}, on: {pull_request_target: {}, workflow_run: {}}}'
+duplicate_marked_root_flow_on_trigger_fixture='--- {on: {pull_request_review: {}}, on: {pull_request_target: {}, workflow_run: {}}}'
+if command -v yq >/dev/null 2>&1 \
+   || python3 -c 'import yaml' >/dev/null 2>&1; then
+  printf '%s\n' "$flow_trigger_fixture" \
+    | workflow_source_has_trigger pull_request_review \
+    || trigger_parser_ok=0
+  printf '%s\n' "$multiline_flow_trigger_fixture" \
+    | workflow_source_has_trigger pull_request_review \
+    || trigger_parser_ok=0
+  for parsed_complex_flow_trigger in \
+    pull_request_target workflow_run pull_request_review; do
+    printf '%s\n' "$comment_brace_flow_trigger_fixture" \
+      | workflow_source_has_trigger "$parsed_complex_flow_trigger" \
+      || trigger_parser_ok=0
+    printf '%s\n' "$multiline_quoted_flow_trigger_fixture" \
+      | workflow_source_has_trigger "$parsed_complex_flow_trigger" \
+      || trigger_parser_ok=0
+  done
+fi
+for alias_fixture in \
+  "$alias_trigger_fixture" \
+  "$flow_alias_trigger_fixture" \
+  "$merge_alias_trigger_fixture" \
+  "$whole_on_alias_trigger_fixture" \
+  "$dotted_alias_trigger_fixture" \
+  "$escaped_trigger_fixture" \
+  "$explicit_trigger_fixture" \
+  "$anchored_on_block_trigger_fixture" \
+  "$anchored_on_flow_trigger_fixture" \
+  "$tagged_on_block_trigger_fixture" \
+  "$tagged_on_flow_trigger_fixture"; do
+  if command -v yq >/dev/null 2>&1; then
+    printf '%s\n' "$alias_fixture" \
+      | workflow_source_has_trigger pull_request_review \
+      || trigger_parser_ok=0
+  fi
+  alias_fallback_rc=0
+  printf '%s\n' "$alias_fixture" \
+    | workflow_source_has_trigger_fallback pull_request_review \
+    || alias_fallback_rc=$?
+  [ "$alias_fallback_rc" -eq 2 ] || trigger_parser_ok=0
+  if printf '%s\n' "$alias_fixture" \
+      | workflow_source_lacks_trigger pull_request_review; then
+    trigger_parser_ok=0
+  fi
+done
+for duplicate_fixture in \
+  "$duplicate_on_trigger_fixture" \
+  "$duplicate_on_reverse_trigger_fixture" \
+  "$duplicate_root_flow_on_trigger_fixture" \
+  "$duplicate_marked_root_flow_on_trigger_fixture"; do
+  for duplicate_trigger in \
+    pull_request_target workflow_run pull_request_review; do
+    duplicate_parser_rc=0
+    printf '%s\n' "$duplicate_fixture" \
+      | workflow_source_has_trigger "$duplicate_trigger" \
+      || duplicate_parser_rc=$?
+    [ "$duplicate_parser_rc" -eq 2 ] || trigger_parser_ok=0
+    duplicate_fallback_rc=0
+    printf '%s\n' "$duplicate_fixture" \
+      | workflow_source_has_trigger_fallback "$duplicate_trigger" \
+      || duplicate_fallback_rc=$?
+    [ "$duplicate_fallback_rc" -eq 2 ] || trigger_parser_ok=0
+  done
+done
+printf '%s\n' "$flow_trigger_fixture" \
+  | workflow_source_has_trigger_fallback pull_request_review \
+  || trigger_parser_ok=0
+printf '%s\n' "$multiline_flow_trigger_fixture" \
+  | workflow_source_has_trigger_fallback pull_request_review \
+  || trigger_parser_ok=0
+for complex_flow_trigger in \
+  pull_request_target workflow_run pull_request_review; do
+  printf '%s\n' "$comment_brace_flow_trigger_fixture" \
+    | workflow_source_has_trigger_fallback "$complex_flow_trigger" \
+    || trigger_parser_ok=0
+  printf '%s\n' "$multiline_quoted_flow_trigger_fixture" \
+    | workflow_source_has_trigger_fallback "$complex_flow_trigger" \
+    || trigger_parser_ok=0
+done
+for non_trigger_fixture in \
+  $'on:\n  pull_request_review_thread:\n    types: [submitted]' \
+  $'on:\n  workflow_call:\n    inputs:\n      pull_request_review:\n        required: false' \
+  $'on: {workflow_call: {inputs: {other: {}, pull_request_review: {required: false}}}}' \
+  $'on:\n  # pull_request_review:\njobs:\n  pull_request_review:\n    steps:\n      - run: |\n          pull_request_review:'; do
+  if ! printf '%s\n' "$non_trigger_fixture" \
+      | workflow_source_lacks_trigger pull_request_review; then
+    trigger_parser_ok=0
+  fi
+  if printf '%s\n' "$non_trigger_fixture" \
+      | workflow_source_has_trigger_fallback pull_request_review; then
+    trigger_parser_ok=0
+  fi
+done
+if [ "$trigger_parser_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: trigger parser handles quoted, spaced, and flow keys without matching comments, steps, or similarly named keys"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: trigger parser must recognize every valid pull_request_review key spelling and reject inert lookalikes" >&2
+fi
 fi
 
 # Parse via yq (preferred — no extra deps needed in GitHub-hosted
@@ -69,7 +510,7 @@ fi
 # Codex P1 on PR #202 r1: workflow_run replaces check_suite (which
 # doesn't fire for Actions-created suites).
 for trig in 'pull_request_target' 'workflow_run'; do
-  if grep -qE "^[[:space:]]+${trig}:" "$WORKFLOW"; then
+  if workflow_source_has_trigger "$trig" < "$WORKFLOW"; then
     pass=$((pass + 1))
     echo "  PASS: trigger '$trig' configured"
   else
@@ -81,9 +522,9 @@ done
 # pull_request_review runs on the PR merge ref. Keeping that trigger in a
 # workflow that names the queue-policy environment would let a same-repo PR
 # rewrite the workflow definition and request administrator credentials.
-if grep -qE "^[[:space:]]+pull_request_review:" "$WORKFLOW"; then
+if ! workflow_source_lacks_trigger pull_request_review < "$WORKFLOW"; then
   fail=$((fail + 1))
-  echo "  FAIL: pull_request_review trigger must remain absent from the queue-credential workflow" >&2
+  echo "  FAIL: pull_request_review trigger must be provably absent from the queue-credential workflow" >&2
 else
   pass=$((pass + 1))
   echo "  PASS: pull_request_review is routed through trusted workflow_run before queue credentials are available"
@@ -268,7 +709,8 @@ clear_block_protects_before_delete() {
     && grep -Fq 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$block" \
     && grep -Fq 'MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN"' <<<"$block" \
     && ! grep -Fq -- '--disable-auto' <<<"$block" \
-    && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' <<<"$block" \
+    && gh_source_lacks_direct_literal_pr_mutation \
+      --allow-needs-external-review-delete <<<"$block" \
     && [ -n "$protect_line" ] && [ -n "$failure_line" ] && [ -n "$delete_line" ] \
     && [ "$protect_line" -lt "$failure_line" ] \
     && [ "$failure_line" -lt "$delete_line" ] \
@@ -277,16 +719,17 @@ clear_block_protects_before_delete() {
 if clear_block_protects_before_delete "$clear_block" \
    && clear_block_protects_before_delete "$scheduled_clear_block"; then
   pass=$((pass + 1))
-  echo "  PASS: both label-clear paths require read-only arm classification before PAT-backed blocker deletion"
+  echo "  PASS: both label-clear paths pair runtime arm classification with a direct-mutation regression scan before PAT-backed blocker deletion"
 else
   fail=$((fail + 1))
-  echo "  FAIL: every label-clear path must classify arms read-only, fail closed, and retain the PAT only for deleting needs-external-review" >&2
+  echo "  FAIL: every label-clear path must classify arms, reject direct mutation syntax, and retain the PAT only for deleting needs-external-review" >&2
 fi
 
 # Execute both literal clear blocks against a token-aware stub. Structural
 # ordering alone cannot prove that a failed arm-classification call skips the
 # DELETE, or that the ambient PAT still owns the label write that re-triggers
 # downstream workflows.
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
 clear_harness_dir=$(mktemp -d "${TMPDIR:-/tmp}/auto-clear-protection.XXXXXX")
 mkdir -p "$clear_harness_dir/bin" "$clear_harness_dir/scripts/lib" \
   "$clear_harness_dir/scripts/workflow"
@@ -425,6 +868,7 @@ else
   echo "  FAIL: label-clear execution must use read-only arm classification, PAT deletion, and no writes after classification failure" >&2
 fi
 rm -rf "$clear_harness_dir"
+fi
 
 event_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR" "$REPO"' <<<"$event_continuation_block" | head -1 | cut -d: -f1 || true)
 event_continue_line=$(grep -nF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$event_continuation_block" | head -1 | cut -d: -f1 || true)
@@ -491,6 +935,7 @@ else
   echo "  FAIL: continuation failures must not share the label-removal healing channel" >&2
 fi
 
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
 reporter_tmp=$(mktemp -d "${TMPDIR:-/tmp}/continuation-reporter.XXXXXX")
 mkdir -p "$reporter_tmp/bin"
 cat > "$reporter_tmp/bin/gh" <<'STUB'
@@ -520,6 +965,7 @@ else
   echo "  FAIL: continuation reporter must publish an unconditional head-pinned failure diagnostic" >&2
 fi
 rm -rf "$reporter_tmp"
+fi
 
 # #730: the pull_request_target trigger must include `edited` so a body-edit
 # nudge (the reliable re-fire for a claude-authored Phase-4 PR after a late
@@ -792,6 +1238,7 @@ fi
 # The workflow embeds this dispatch as inline bash. Extract the logic
 # pattern and exercise the three event shapes against canned
 # github.event payloads.
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
 echo
 echo "auto-clear-blocking-labels.yml PR-number resolution tests"
 
@@ -933,14 +1380,17 @@ else
   fail=$((fail + 1))
   echo "  FAIL: unsupported event handling (rc=$rc, out=$out)" >&2
 fi
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then
-  if [ ! -f "$CONTINUATION_TEST" ]; then
-    skip_reason="approval continuation test not present in this consumer checkout"
-  elif ! bash "$CONTINUATION_TEST"; then
-    echo "check_auto_clear_workflow: FAIL (approval continuation contract)" >&2
-    exit 1
+  if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+    if [ ! -f "$CONTINUATION_TEST" ]; then
+      skip_reason="approval continuation test not present in this consumer checkout"
+    elif ! bash "$CONTINUATION_TEST"; then
+      echo "check_auto_clear_workflow: FAIL (approval continuation contract)" >&2
+      exit 1
+    fi
   fi
   if [ -n "$skip_reason" ]; then
     echo "check_auto_clear_workflow: SKIP ($skip_reason)"

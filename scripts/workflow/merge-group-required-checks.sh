@@ -675,8 +675,10 @@ run_predicate() {
 }
 
 run_all_predicates() {
-  printf '%s\n' "$(printf '%s' "$pr_before" | jq -r .body)" \
-    | "$ROOT/scripts/validate-pr-body.sh" --self-review-only \
+  local pr_body
+  pr_body=$(jq -r .body <<<"$pr_before") \
+    || infra "could not decode the PR body for predicate evaluation"
+  "$ROOT/scripts/validate-pr-body.sh" --self-review-only <<<"$pr_body" \
     || die "PR body no longer satisfies Self-Review Required"
   run_predicate "complete feedback accounting" \
     "$ROOT/scripts/review-feedback-accounting.sh" "$PR_NUMBER" "$REPO"

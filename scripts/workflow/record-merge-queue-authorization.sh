@@ -111,7 +111,8 @@ if [ "$EVENT_ACTION" = "auto_merge_enabled" ]; then
 fi
 [ "$EVENT_BASE_REF" = "$DEFAULT_BRANCH" ] && [ "$DEFAULT_BRANCH" = "main" ] \
   || skip "event does not target the supported default branch"
-CHECKOUT_SHA=$(git rev-parse HEAD 2>/dev/null) || infra "could not identify trusted checkout"
+CHECKOUT_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null) \
+  || infra "could not identify trusted checkout"
 [ "$CHECKOUT_SHA" = "$EVENT_BASE_SHA" ] \
   || infra "trusted checkout is $CHECKOUT_SHA, expected event base $EVENT_BASE_SHA"
 

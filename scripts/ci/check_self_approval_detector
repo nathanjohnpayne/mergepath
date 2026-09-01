@@ -12,12 +12,14 @@ TEST_SCRIPT="tests/test_self_approval_detector.sh"
 INDEPENDENCE_TEST="tests/test_approval_independence_check.sh"
 WORKFLOW=".github/workflows/agent-review.yml"
 RULES="rules/repo_rules.md"
+COMMAND_CLASSIFIER="scripts/lib/gh-command-classifier.sh"
 
 for file in \
   "$DETECTOR" \
   "$RENDERER" \
   "$TEST_SCRIPT" \
   "$INDEPENDENCE_TEST" \
+  "$COMMAND_CLASSIFIER" \
   "$WORKFLOW" \
   scripts/workflow/resolve_base_policy.sh \
   scripts/workflow/external_review_fingerprint.sh; do
@@ -26,6 +28,9 @@ for file in \
     exit 1
   fi
 done
+
+# shellcheck source=../lib/gh-command-classifier.sh
+. "$COMMAND_CLASSIFIER"
 
 # rules/repo_rules.md is a hub-owned binding policy, not a propagated
 # canonical file. Keep its exact prose locked on Mergepath without making the
@@ -271,12 +276,13 @@ if grep -qF -- '--match-head-commit' <<<"$shared_author_retraction"; then
   exit 1
 fi
 # Candidate-controlled workflow code cannot safely receive the administrator
-# topology credentials. Every armed state must reach the final refusal, never
-# a queue-classifier, native auto-merge, or merge mutation.
+# topology credentials. Runtime fixtures prove that every armed state reaches
+# the final refusal; this source scan separately guards direct GitHub CLI
+# merge/disable spellings and is not an arbitrary-Bash execution proof.
 if grep -qF -- '--disable-auto' <<<"$shared_author_retraction" \
-  || grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' <<<"$shared_author_retraction" \
+  || ! gh_source_lacks_direct_literal_pr_mutation <<<"$shared_author_retraction" \
   || grep -Eq -- '--(auto|merge|rebase|squash)([[:space:]]|$)' <<<"$shared_author_retraction"; then
-  echo "check_self_approval_detector: candidate-controlled armed-state refusal must contain no merge or disable mutation" >&2
+  echo "check_self_approval_detector: candidate-controlled armed-state refusal must expose no direct merge or disable syntax" >&2
   exit 1
 fi
 if grep -qF 'approval-merge-continuation.sh' <<<"$shared_author_retraction"; then

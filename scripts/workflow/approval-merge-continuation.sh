@@ -202,7 +202,7 @@ retract_snapshot_arm() {
     GH_TOKEN="$queue_policy_token" \
       MERGEPATH_AUTHOR_TOKEN="$author_token" \
       MERGEPATH_MERGE_QUEUE_SOURCE_TOKEN="$queue_source_token" \
-      "$ROOT/scripts/workflow/merge-queue-arm-policy.sh" \
+      bash "$ROOT/scripts/workflow/merge-queue-arm-policy.sh" \
         "$PR_NUMBER" "$REPO"
     queue_policy_rc=$?
     set -e
