@@ -460,8 +460,10 @@ fi
 
 # An ordered list starting at 1 DOES interrupt, symmetric with the
 # non-interrupting case above -- same decoy-visibility shape as the other
-# interrupting constructs.
-ORDERED_LIST_INTERRUPTING=$'Authoring-Agent: claude\n\nProse call`s own thing.\n1. item\nAuthoring-Agent: codex\nLater `code` here.'
+# interrupting constructs. Blank-line-separated for the same reason as the
+# blockquote/list-item cases: an unprefixed line right after "1. item" is
+# its lazy continuation, still nested, not a fresh top-level paragraph.
+ORDERED_LIST_INTERRUPTING=$'Authoring-Agent: claude\n\nProse call`s own thing.\n1. item\n\nAuthoring-Agent: codex\nLater `code` here.'
 got_count="$(pr_body_authoring_agent_count "$ORDERED_LIST_INTERRUPTING")"
 if [ "$got_count" = "2" ]; then
   ok "an ordered list starting at 1 interrupts (decoy Authoring-Agent stays visible)"

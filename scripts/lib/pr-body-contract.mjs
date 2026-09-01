@@ -5,7 +5,11 @@ import { readFileSync } from 'node:fs';
 // HTML block starters shared between the top-level block dispatch below and
 // interruptsParagraph()'s CommonMark paragraph-interruption check, so the
 // two classifications cannot drift apart.
-const RAW_TAG_RE = /^ {0,3}<(script|pre|style|textarea)(?:\s|>|$)/i;
+// GFM/CommonMark's inter-token whitespace is space/tab only, not the full
+// Unicode set JavaScript's \s matches (e.g. U+2003). Using \s here let a
+// Unicode-whitespace-separated tag like "<pre >" open a raw HTML block
+// that cmark-gfm would not, ending a code-span search early.
+const RAW_TAG_RE = /^ {0,3}<(script|pre|style|textarea)(?:[ \t]|>|$)/i;
 const PROCESSING_INSTRUCTION_RE = /^ {0,3}<\?/;
 const CDATA_RE = /^ {0,3}<!\[CDATA\[/;
 const DECLARATION_RE = /^ {0,3}<![A-Z]/;
@@ -15,6 +19,56 @@ const DECLARATION_RE = /^ {0,3}<![A-Z]/;
 const FIXED_TAG_LIST_RE =
   /^ {0,3}<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ \t]|\/?>|$)/i;
 const HTML_COMMENT_OPEN_RE = /^ {0,3}<!--/;
+
+const BLOCKQUOTE_RE = /^ {0,3}>/;
+const BARE_LIST_MARKER_RE = /^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)/;
+
+// A line made of only "=" is always a setext underline; a line made of only
+// "-" is ambiguous between a setext underline and a thematic break, and one
+// made of only "_" or "*" (3+, CommonMark requires at least 3 for these two)
+// is always a thematic break. CommonMark resolves the "-" ambiguity in favor
+// of ending the paragraph either way, so BOTH classifications matter here
+// for a DIFFERENT reason than in most parsers: this predicate does not need
+// to pick one, but a pure-dash line must NOT also be read as a list marker,
+// or a thematic break like "- - -" would be mistaken for an ongoing list
+// container that swallows real content after it.
+const SETEXT_OR_THEMATIC_DASH_RE = /^ {0,3}(?:-[ \t]*)+$/;
+const SETEXT_EQUALS_RE = /^ {0,3}=+[ \t]*$/;
+const THEMATIC_UNDERSCORE_RE = /^ {0,3}(?:_[ \t]*){3,}$/;
+const THEMATIC_ASTERISK_RE = /^ {0,3}(?:\*[ \t]*){3,}$/;
+
+function isSetextOrThematicLine(line) {
+  return (
+    SETEXT_EQUALS_RE.test(line) ||
+    SETEXT_OR_THEMATIC_DASH_RE.test(line) ||
+    THEMATIC_UNDERSCORE_RE.test(line) ||
+    THEMATIC_ASTERISK_RE.test(line)
+  );
+}
+
+// Container markers shared between interruptsParagraph() (does a fresh
+// top-level paragraph get interrupted here?) and the main loop's lazy-
+// continuation tracking (once already inside a blockquote/list item, does
+// THIS line still belong to it?). Deliberately more permissive than
+// isInterruptingListItem() below: an empty/bare marker cannot freshly
+// INTERRUPT a paragraph, but it is still container content once already
+// inside one -- excluding thematic-break-shaped lines either way, per the
+// comment above.
+function isContainerMarker(line) {
+  return BLOCKQUOTE_RE.test(line) || (BARE_LIST_MARKER_RE.test(line) && !isSetextOrThematicLine(line));
+}
+
+// A GENUINE list item: unlike isContainerMarker() above, requires real
+// content after the marker (CommonMark: an empty list item cannot interrupt
+// a paragraph) and, for an ordered marker, a NUMERIC start value of 1
+// (leading zeros count, e.g. "01." -- CommonMark: an ordered list
+// interrupts a paragraph only when it starts at 1).
+function isInterruptingListItem(line) {
+  if (isSetextOrThematicLine(line)) return false;
+  const match = line.match(/^ {0,3}(?:([-+*])|(\d{1,9})[.)])[ \t]+\S/);
+  if (!match) return false;
+  return match[1] != null || Number(match[2]) === 1;
+}
 
 /**
  * Read the repository's deliberately strict PR-body contract without runtime
@@ -28,6 +82,14 @@ export function parsePrBodyContract(body) {
   let inComment = false;
   let htmlBlock = null;
   let codeSpanTicks = null;
+  // Once inside a blockquote or list item, a following line with no marker
+  // of its own is a LAZY CONTINUATION of it in CommonMark -- still nested,
+  // not a new top-level paragraph -- until a blank line or another
+  // interrupting construct ends it. Without tracking this, a line like
+  // "Authoring-Agent: attacker" right after "> quoted" (no blank line) was
+  // read as a live top-level declaration when CommonMark renders it inside
+  // the quote, letting nested content satisfy the identity contract.
+  let lazyContainer = false;
 
   const lines = body.split(/\r?\n/);
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
@@ -85,6 +147,19 @@ export function parsePrBodyContract(body) {
 
     if (indentedCode) continue;
 
+    // Checked on rawLine, before fence/comment/code-span opening below: a
+    // construct that opens one of those states (e.g. a bare fence with no
+    // ">" prefix) genuinely exits the container, and this line's OWN
+    // handling of that state takes over from here as normal.
+    if (lazyContainer) {
+      if (isContainerMarker(rawLine)) continue;
+      if (interruptsParagraph(rawLine)) {
+        lazyContainer = false;
+      } else {
+        continue;
+      }
+    }
+
     const opening =
       fenceLine.match(/^(`{3,})([^`]*)$/) ?? fenceLine.match(/^(~{3,})(.*)$/);
     if (opening) {
@@ -140,6 +215,15 @@ export function parsePrBodyContract(body) {
     }
 
     if (/^(?: {4}|\t)/.test(line)) continue;
+
+    // A fresh blockquote or list item at top level: everything that
+    // follows it, up to a blank line or another interrupting construct, is
+    // its lazy continuation (see the lazyContainer declaration above).
+    if (isContainerMarker(line)) {
+      lazyContainer = true;
+      continue;
+    }
+
     // The contract is intentionally stricter than CommonMark's permissive
     // indentation: declarations must begin at column zero. A one-to-three
     // space prefix can be list continuation content, where the rendered
@@ -263,21 +347,18 @@ function interruptsParagraph(line) {
   if (/^ {0,3}`{3,}[^`]*$/.test(line)) return true;
   if (/^ {0,3}~{3,}/.test(line)) return true;
   // Blockquote.
-  if (/^ {0,3}>/.test(line)) return true;
-  // List item: unordered marker, or an ordered marker whose start number is
-  // exactly 1 -- CommonMark allows an ordered list to interrupt a paragraph
-  // ONLY when it starts at 1 ("2. item" does not interrupt, and a real code
-  // span may legitimately cross such a line).
-  if (/^ {0,3}(?:[-+*](?:[ \t]|$)|1[.)](?:[ \t]|$))/.test(line)) return true;
+  if (BLOCKQUOTE_RE.test(line)) return true;
+  // List item: requires real content after the marker (CommonMark: an empty
+  // item cannot interrupt) and, for an ordered marker, a numeric start value
+  // of 1 -- "2. item" does not interrupt, so a real code span may
+  // legitimately cross such a line.
+  if (isInterruptingListItem(line)) return true;
   // Setext heading underline (contiguous "=" or "-", nothing else) and
   // thematic break (3+ of the same "-", "_", or "*", each optionally
   // followed by spaces/tabs). A line of dashes can satisfy both; either
   // interpretation ends the paragraph above it, so this does not need to
   // disambiguate which one CommonMark would actually render.
-  if (/^ {0,3}=+[ \t]*$/.test(line)) return true;
-  if (/^ {0,3}(?:-[ \t]*)+$/.test(line) && /-/.test(line)) return true;
-  if (/^ {0,3}(?:_[ \t]*){3,}$/.test(line)) return true;
-  if (/^ {0,3}(?:\*[ \t]*){3,}$/.test(line)) return true;
+  if (isSetextOrThematicLine(line)) return true;
   // HTML blocks (conditions 1-6, shared with the top-level dispatch above;
   // condition 7's generic complete tag is deliberately excluded -- unlike
   // 1-6, it cannot interrupt a paragraph in CommonMark).
