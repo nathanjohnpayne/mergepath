@@ -344,6 +344,171 @@ else
   bad "backtick-info body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
 fi
 
+# A code span's closer must not cross a blank line: CommonMark never pairs
+# backticks across a paragraph boundary. Without that bound, a stray/unmatched
+# backtick (an apostrophe mistyped as a backtick, e.g. "call`s own") paired
+# with the next unrelated backtick run several paragraphs later and swallowed
+# everything in between, including a genuine "## Self-Review" heading.
+# Reproduced against the live parser on the real body of #1122, which the
+# retroactive #1160 audit flagged as "missing Self-Review" -- a false
+# positive: the heading was present, but a stray backtick earlier in the body
+# (an apostrophe typo) paired with an unrelated later code span and hid it.
+STRAY_BACKTICK=$'Authoring-Agent: claude\n\nIt points at the failing call`s own thing.\n\n## Self-Review\n\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$STRAY_BACKTICK")"
+got_agent="$(pr_body_authoring_agent "$STRAY_BACKTICK")"
+if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ] && pr_body_has_self_review "$STRAY_BACKTICK"; then
+  ok "a stray backtick in one paragraph cannot pair across a blank line and hide a later Self-Review heading"
+else
+  bad "stray-backtick body: expected count=1 agent=claude and Self-Review, got count=$got_count agent=$got_agent"
+fi
+
+# An ATX heading interrupts a paragraph even with NO blank line before it
+# (CommonMark headings always interrupt). The blank-line bound alone missed
+# this one-line-tighter variant of the same #1122 defect (Codex P2 on #1165).
+STRAY_BACKTICK_NO_BLANK=$'Authoring-Agent: claude\n\nProse call`s own thing.\n## Self-Review\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$STRAY_BACKTICK_NO_BLANK")"
+got_agent="$(pr_body_authoring_agent "$STRAY_BACKTICK_NO_BLANK")"
+if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ] && pr_body_has_self_review "$STRAY_BACKTICK_NO_BLANK"; then
+  ok "a stray backtick cannot pair past an interrupting ATX heading with no blank line before it"
+else
+  bad "stray-backtick-no-blank body: expected count=1 agent=claude and Self-Review, got count=$got_count agent=$got_agent"
+fi
+
+# CommonMark's blank line is spaces/tabs only, not JavaScript's broader
+# trim() whitespace set. A line of pure U+2003 is NOT blank in CommonMark, so
+# a code span crossing it stays open; treating it as blank would end the
+# code-span search early and let its content -- including an
+# Authoring-Agent: line -- surface as a live declaration instead of staying
+# hidden inline code (Codex P1 on #1165: an identity-check bypass, not just a
+# false rejection).
+UNICODE_WHITESPACE_NOT_BLANK=$'## Self-Review\n\n`example\n\xe2\x80\x83\nAuthoring-Agent: codex\n`'
+got_count="$(pr_body_authoring_agent_count "$UNICODE_WHITESPACE_NOT_BLANK")"
+if [ "$got_count" = "0" ]; then
+  ok "a line of pure Unicode whitespace does not end a code span (Authoring-Agent stays hidden)"
+else
+  bad "unicode-whitespace body: Authoring-Agent inside a code span was accepted (count=$got_count)"
+fi
+
+# A setext heading underline ("===" or "---" with nothing else on the line)
+# retroactively turns the PRECEDING line into a heading and ends its
+# paragraph there, with no blank line required -- the same interrupting-block
+# gap as the ATX case above, one construct over (Codex P2 on #1165). Signal
+# is authorCount, not Self-Review: Codex's actual repro showed the swallowed
+# span hiding a second "Authoring-Agent:" line, not the heading -- a body
+# with the heading immediately after the construct would pass on the
+# ATX-heading check alone without exercising this construct at all, so the
+# decoy Authoring-Agent line (which the ATX check cannot see) is what proves
+# THIS boundary is doing the work.
+SETEXT_UNDERLINE=$'Authoring-Agent: claude\n\nProse call`s own thing.\n===\nAuthoring-Agent: codex\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$SETEXT_UNDERLINE")"
+if [ "$got_count" = "2" ]; then
+  ok "a stray backtick cannot pair past a setext heading underline (decoy Authoring-Agent stays visible)"
+else
+  bad "setext-underline body: expected count=2 (decoy stays visible), got count=$got_count"
+fi
+
+# Thematic breaks, blockquotes, and list items are the remaining CommonMark
+# constructs that unconditionally interrupt a paragraph. Same decoy-based
+# shape and rationale as the setext case above.
+THEMATIC_BREAK=$'Authoring-Agent: claude\n\nProse call`s own thing.\n- - -\nAuthoring-Agent: codex\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$THEMATIC_BREAK")"
+if [ "$got_count" = "2" ]; then
+  ok "a stray backtick cannot pair past a thematic break (decoy Authoring-Agent stays visible)"
+else
+  bad "thematic-break body: expected count=2 (decoy stays visible), got count=$got_count"
+fi
+
+# A blank line separates the construct from the decoy here (unlike the
+# thematic-break case above): a line with no ">" immediately after a
+# blockquote line is a LAZY CONTINUATION of it in CommonMark, nested inside
+# the quote rather than a new top-level paragraph, so asserting the decoy
+# visible without the blank line would lock in an incorrect expectation
+# (Codex P1 on #1165, caught on this exact test). The blank line removes the
+# ambiguity -- it unconditionally ends the blockquote -- while the
+# interrupting construct under test (">") still sits BEFORE it, so the
+# code-span boundary this test targets is exercised the same as the others.
+BLOCKQUOTE_INTERRUPT=$'Authoring-Agent: claude\n\nProse call`s own thing.\n> quoted\n\nAuthoring-Agent: codex\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$BLOCKQUOTE_INTERRUPT")"
+if [ "$got_count" = "2" ]; then
+  ok "a stray backtick cannot pair past a blockquote (decoy Authoring-Agent stays visible)"
+else
+  bad "blockquote-interrupt body: expected count=2 (decoy stays visible), got count=$got_count"
+fi
+
+# Same lazy-continuation reasoning as the blockquote case: an unprefixed line
+# right after a list item is the item's own continuation, not a new
+# top-level paragraph, so the decoy needs the same blank-line separation.
+LIST_ITEM_INTERRUPT=$'Authoring-Agent: claude\n\nProse call`s own thing.\n- list item\n\nAuthoring-Agent: codex\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$LIST_ITEM_INTERRUPT")"
+if [ "$got_count" = "2" ]; then
+  ok "a stray backtick cannot pair past a list item (decoy Authoring-Agent stays visible)"
+else
+  bad "list-item-interrupt body: expected count=2 (decoy stays visible), got count=$got_count"
+fi
+
+# Lazy continuation extends an OPEN PARAGRAPH inside a container -- never any
+# other block type. A blockquote whose own content is itself a heading has
+# no open paragraph, so the unprefixed line right after it is a FRESH
+# top-level paragraph, not nested content (Codex P2 on #1165, caught on the
+# round-5 lazy-continuation fix itself).
+BLOCKQUOTE_NO_OPEN_PARAGRAPH=$'Authoring-Agent: claude\n\n> # quoted heading\nAuthoring-Agent: codex\n\n## Self-Review'
+got_count="$(pr_body_authoring_agent_count "$BLOCKQUOTE_NO_OPEN_PARAGRAPH")"
+if [ "$got_count" = "2" ] && pr_body_has_self_review "$BLOCKQUOTE_NO_OPEN_PARAGRAPH"; then
+  ok "a blockquote containing only a heading has no open paragraph to nest a following declaration in"
+else
+  bad "blockquote-no-open-paragraph body: expected count=2 and Self-Review, got count=$got_count"
+fi
+
+# A whitespace-only line (a tab, or 4+ spaces, nothing else) is blank in
+# CommonMark regardless of length and must end lazy continuation, same as
+# any other blank line. Checking the indentedCode short-circuit before the
+# lazyContainer state handler swallowed such a line as "indented code" and
+# left lazyContainer stuck set, suppressing a valid declaration after it
+# (Codex P2 on #1165).
+WHITESPACE_ONLY_BLANK_LINE=$'Authoring-Agent: claude\n\n> quoted paragraph\n\t\nAuthoring-Agent: codex\n\n## Self-Review'
+got_count="$(pr_body_authoring_agent_count "$WHITESPACE_ONLY_BLANK_LINE")"
+if [ "$got_count" = "2" ] && pr_body_has_self_review "$WHITESPACE_ONLY_BLANK_LINE"; then
+  ok "a whitespace-only (tab) blank line ends lazy continuation like any other blank line"
+else
+  bad "whitespace-only-blank-line body: expected count=2 and Self-Review, got count=$got_count"
+fi
+
+# Ordered lists can interrupt a paragraph ONLY when the start number is 1;
+# "2. item" does not, so a real multi-line code span may legitimately cross
+# it (Codex P1 on #1165: the generalized matcher over-classified every
+# 1-9-digit marker, exposing an Authoring-Agent line that must stay hidden).
+ORDERED_LIST_NON_INTERRUPTING=$'## Self-Review\n\n`example\n2. item\nAuthoring-Agent: codex\n`'
+got_count="$(pr_body_authoring_agent_count "$ORDERED_LIST_NON_INTERRUPTING")"
+if [ "$got_count" = "0" ]; then
+  ok "an ordered list not starting at 1 does not interrupt a real code span (Authoring-Agent stays hidden)"
+else
+  bad "non-interrupting-ordered-list body: expected count=0 (stays hidden), got count=$got_count"
+fi
+
+# An ordered list starting at 1 DOES interrupt, symmetric with the
+# non-interrupting case above -- same decoy-visibility shape as the other
+# interrupting constructs. Blank-line-separated for the same reason as the
+# blockquote/list-item cases: an unprefixed line right after "1. item" is
+# its lazy continuation, still nested, not a fresh top-level paragraph.
+ORDERED_LIST_INTERRUPTING=$'Authoring-Agent: claude\n\nProse call`s own thing.\n1. item\n\nAuthoring-Agent: codex\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$ORDERED_LIST_INTERRUPTING")"
+if [ "$got_count" = "2" ]; then
+  ok "an ordered list starting at 1 interrupts (decoy Authoring-Agent stays visible)"
+else
+  bad "interrupting-ordered-list body: expected count=2 (decoy stays visible), got count=$got_count"
+fi
+
+# A backtick fence's info string cannot itself contain a backtick (mirrors
+# the top-level fence-open rule); a line violating that is not a fence
+# opener and must not end a real code-span search early (Codex P1 on #1165).
+INVALID_BACKTICK_FENCE_INFO=$'## Self-Review\n\n``example\n```foo`bar\nAuthoring-Agent: codex\n``'
+got_count="$(pr_body_authoring_agent_count "$INVALID_BACKTICK_FENCE_INFO")"
+if [ "$got_count" = "0" ]; then
+  ok "an invalid backtick-fence info string does not interrupt a real code span (Authoring-Agent stays hidden)"
+else
+  bad "invalid-backtick-fence-info body: expected count=0 (stays hidden), got count=$got_count"
+fi
+
 # --- 11. the HOOK must fail closed on parser trouble --------------------------
 # A non-2 hook exit is a NONBLOCKING error in the hook wiring, so letting `set
 # -e` propagate the helper status would fail OPEN on the self-approve check --
