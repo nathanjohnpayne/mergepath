@@ -1310,30 +1310,72 @@ REQ_MP="$req_workdir/mergepath"
 REQ_FAKE_BIN="$req_workdir/bin"
 REQ_CAPTURE="$req_workdir/capture"
 mkdir -p "$REQ_MP/scripts/sync" "$REQ_MP/scripts/lib" "$REQ_MP/scripts/ci" \
-         "$REQ_MP/.github/workflows" "$REQ_FAKE_BIN" "$REQ_CAPTURE"
+         "$REQ_MP/scripts/runtime-kit" \
+         "$REQ_MP/.github/workflows" "$REQ_MP/examples" "$REQ_FAKE_BIN" "$REQ_CAPTURE"
 cp "$ROOT/scripts/sync/apply-overrides.sh" "$REQ_MP/scripts/sync/apply-overrides.sh"
 cp "$ROOT/scripts/lib/manifest-fact-helpers.sh" "$REQ_MP/scripts/lib/manifest-fact-helpers.sh"
+cp "$ROOT/scripts/lib/template-substitution.sh" "$REQ_MP/scripts/lib/template-substitution.sh"
 cat >"$REQ_MP/.mergepath-sync.yml" <<'YAML'
 version: 1
 consumers:
-  - {name: alpha, repo: example/alpha}
+  - name: alpha
+    repo: example/alpha
+    facts: {flavor: blue}
 paths:
   - path: .github/workflows/repo_lint.yml
     type: canonical
     consumers: all
     requires:
-      - "scripts/ci/"
-  - {path: scripts/ci/, type: kit, consumers: all}
+      - "scripts/ci/check_a"
+      - "scripts/ci/check_b"
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+    requires:
+      - ".github/workflows/repo_lint.yml"
+  - path: .github/workflows/templated_runtime.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "examples/runtime-helper.in"
+  - path: .github/workflows/slashless_kit.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/runtime-kit"
+  - {path: scripts/runtime-kit, type: kit, consumers: all}
+  - path: examples/runtime-helper.in
+    source: examples/runtime-helper.in
+    dest: scripts/runtime/helper.sh
+    type: templated
+    consumers: all
+    requires:
+      - "scripts/ci/check_b"
 YAML
 cat >"$REQ_MP/.github/review-policy.yml" <<'YAML'
 author_identity: nathanjohnpayne
 YAML
 printf 'lint v1\n' >"$REQ_MP/.github/workflows/repo_lint.yml"
+printf 'runtime workflow v1\n' >"$REQ_MP/.github/workflows/templated_runtime.yml"
+printf 'slashless kit workflow v1\n' >"$REQ_MP/.github/workflows/slashless_kit.yml"
 printf 'check a v1\n' >"$REQ_MP/scripts/ci/check_a"
 printf 'check b v1\n' >"$REQ_MP/scripts/ci/check_b"
+printf 'runtime kit a v1\n' >"$REQ_MP/scripts/runtime-kit/check_a"
+printf 'runtime kit b v1\n' >"$REQ_MP/scripts/runtime-kit/check_b"
+printf 'runtime {{flavor}}\n' >"$REQ_MP/examples/runtime-helper.in"
+chmod +x "$REQ_MP/scripts/ci/check_a"
+chmod +x "$REQ_MP/scripts/runtime-kit/check_a"
+chmod +x "$REQ_MP/examples/runtime-helper.in"
 git -C "$REQ_MP" init -q
 git -C "$REQ_MP" -c user.email=t@t -c user.name=t add -A
 git -C "$REQ_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m initial
+if ! req_manifest_validation=$(
+  MERGEPATH_REPO_ROOT="$REQ_MP" \
+  MERGEPATH_MANIFEST_PATH="$REQ_MP/.mergepath-sync.yml" \
+    "$ROOT/scripts/ci/check_sync_manifest" 2>&1
+); then
+  fail "requires-closure fixture must satisfy the live manifest contract: $req_manifest_validation"
+fi
 printf 'lint v2\n' >"$REQ_MP/.github/workflows/repo_lint.yml"
 git -C "$REQ_MP" -c user.email=t@t -c user.name=t add -A
 git -C "$REQ_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "repo_lint bump only"
@@ -1343,6 +1385,29 @@ req_sha=$(git -C "$REQ_MP" rev-parse HEAD)
 # pr create bodies into the capture dir.
 cp "$META_FAKE_BIN/gh" "$REQ_FAKE_BIN/gh"
 chmod +x "$REQ_FAKE_BIN/gh"
+REQ_REAL_GIT=$(command -v git)
+cat >"$REQ_FAKE_BIN/git" <<'GITSTUB'
+#!/usr/bin/env bash
+case "${MERGEPATH_TEST_GIT_FAILURE:-}" in
+  kit-ls-tree)
+    case " $* " in
+      *" ls-tree -r --name-only "*" scripts/runtime-kit "*) exit 42 ;;
+    esac
+    ;;
+  source-blob)
+    case " $* " in
+      *" show "*":scripts/runtime-kit/check_a "*) printf 'runtime kit a v1\n'; exit 42 ;;
+    esac
+    ;;
+  templated-consumer-blob)
+    case " $* " in
+      *" show :scripts/runtime/helper.sh "*) printf 'runtime blue\n'; exit 42 ;;
+    esac
+    ;;
+esac
+exec "$MERGEPATH_TEST_REAL_GIT" "$@"
+GITSTUB
+chmod +x "$REQ_FAKE_BIN/git"
 
 req_setup_remote() {
   local remote=$1 seed=$2
@@ -1367,8 +1432,36 @@ req_run() {
     MERGEPATH_TEST_REMOTE_ALPHA="$remote" \
     MERGEPATH_TEST_CAPTURE_DIR="$REQ_CAPTURE" \
     MERGEPATH_TEST_RUN="$run_id" \
+    MERGEPATH_TEST_REAL_GIT="$REQ_REAL_GIT" \
+    MERGEPATH_TEST_GIT_FAILURE="${MERGEPATH_TEST_GIT_FAILURE:-}" \
     MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
     "$SCRIPT" "$req_sha" --repos alpha 2>&1
+}
+req_run_sync_all() {
+  local run_id=$1 remote=$2
+  local path_filter=${3:-.github/workflows/repo_lint.yml}
+  env PATH="$REQ_FAKE_BIN:$PATH" \
+    MERGEPATH_ROOT_OVERRIDE="$REQ_MP" \
+    MERGEPATH_TEST_REMOTE_ALPHA="$remote" \
+    MERGEPATH_TEST_CAPTURE_DIR="$REQ_CAPTURE" \
+    MERGEPATH_TEST_RUN="$run_id" \
+    MERGEPATH_TEST_REAL_GIT="$REQ_REAL_GIT" \
+    MERGEPATH_TEST_GIT_FAILURE="${MERGEPATH_TEST_GIT_FAILURE:-}" \
+    MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+    "$SCRIPT" --sync-all --repos alpha \
+      --paths "$path_filter" 2>&1
+}
+req_run_full_sync_all() {
+  local run_id=$1 remote=$2
+  env PATH="$REQ_FAKE_BIN:$PATH" \
+    MERGEPATH_ROOT_OVERRIDE="$REQ_MP" \
+    MERGEPATH_TEST_REMOTE_ALPHA="$remote" \
+    MERGEPATH_TEST_CAPTURE_DIR="$REQ_CAPTURE" \
+    MERGEPATH_TEST_RUN="$run_id" \
+    MERGEPATH_TEST_REAL_GIT="$REQ_REAL_GIT" \
+    MERGEPATH_TEST_GIT_FAILURE="${MERGEPATH_TEST_GIT_FAILURE:-}" \
+    MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+    "$SCRIPT" --sync-all --repos alpha 2>&1
 }
 
 # (1) Required kit entirely MISSING on the consumer → the gate blocks this
@@ -1398,6 +1491,7 @@ req_setup_remote "$remote2" "$seed2"
 mkdir -p "$seed2/scripts/ci"
 printf 'check a v1\n' >"$seed2/scripts/ci/check_a"
 printf 'check b v1\n' >"$seed2/scripts/ci/check_b"
+chmod +x "$seed2/scripts/ci/check_a"
 req_push_seed "$remote2" "$seed2"
 set +e
 output=$(req_run reqgate2 "$remote2")
@@ -1408,29 +1502,308 @@ echo "$output" | grep -q "requires-closure gate" \
   || fail "kit-current consumer did not get a PR: $output"
 echo "PASS: requires-closure gate passes a kit-current consumer and the PR opens (#624)"
 
-# (3) A required file the consumer skips via .sync-overrides.yml is a
-#     documented divergence, not a gate violation: check_b absent but
-#     override-skipped → PR opens.
+# (3) A required kit the consumer skips via .sync-overrides.yml is a
+#     documented divergence, not a gate violation: check_b absent but the
+#     manifest-level scripts/ci/ entry is override-skipped → PR opens.
 remote3="$req_workdir/kitovr.git"; seed3="$req_workdir/kitovr-seed"
 req_setup_remote "$remote3" "$seed3"
 mkdir -p "$seed3/scripts/ci"
 printf 'check a v1\n' >"$seed3/scripts/ci/check_a"
+chmod +x "$seed3/scripts/ci/check_a"
 cat >"$seed3/.sync-overrides.yml" <<'YAML'
 version: 1
 skip_paths:
-  - path: scripts/ci/check_b
+  - path: scripts/ci/
     reason: |
-      Consumer-local replacement; tracked for convergence in alpha#1.
+      Consumer-local CI kit; tracked for convergence in alpha#1.
 YAML
 req_push_seed "$remote3" "$seed3"
 set +e
 output=$(req_run reqgate3 "$remote3")
 set -e
 echo "$output" | grep -q "requires-closure gate" \
-  && fail "requires gate fired on an override-skipped required file: $output"
+  && fail "requires gate fired on an override-skipped required kit: $output"
 [ -f "$REQ_CAPTURE/pr-title-reqgate3.txt" ] \
   || fail "override-skipped consumer did not get a PR: $output"
-echo "PASS: requires-closure gate honors consumer overrides for required files (#624)"
+echo "PASS: requires-closure gate honors manifest-entry overrides for required kits (#624/#1058)"
+
+# (4) Filtered sync-all has the same closure obligation. Selecting only the
+#     requires-bearing workflow must fail closed when its kit is absent; the
+#     unfiltered sync-all remedy can then carry both entries. Before this
+#     regression, --sync-all --paths copied the workflow alone and opened a
+#     consumer PR whose required lint failed at runtime.
+remote4="$req_workdir/syncall-nokit.git"; seed4="$req_workdir/syncall-nokit-seed"
+req_setup_remote "$remote4" "$seed4"
+req_push_seed "$remote4" "$seed4"
+set +e
+output=$(req_run_sync_all reqgate4 "$remote4")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  || fail "filtered sync-all did not reject a missing required kit: $output"
+echo "$output" | grep -q "scripts/ci/check_a" \
+  || fail "filtered sync-all diagnostic did not name a missing required file: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate4.txt" ] \
+  || fail "filtered sync-all opened a PR despite the missing required kit"
+echo "PASS: requires-closure gate blocks filtered sync-all onto a kit-less consumer (#1058)"
+
+# (5) Runtime closure includes executable helpers. Matching bytes with a stale
+#     mode are not current: gh-token-resolver refuses a non-executable
+#     identity-check helper. Model that with check_a (100755 at source, 100644
+#     in the consumer) and require the closure gate to reject it before a PR.
+remote5="$req_workdir/syncall-mode.git"; seed5="$req_workdir/syncall-mode-seed"
+req_setup_remote "$remote5" "$seed5"
+mkdir -p "$seed5/scripts/ci"
+printf 'check a v1\n' >"$seed5/scripts/ci/check_a"
+printf 'check b v1\n' >"$seed5/scripts/ci/check_b"
+chmod -x "$seed5/scripts/ci/check_a"
+req_push_seed "$remote5" "$seed5"
+set +e
+output=$(req_run_sync_all reqgate5 "$remote5")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  || fail "filtered sync-all accepted a required file with stale executable mode: $output"
+echo "$output" | grep -q "scripts/ci/check_a" \
+  || fail "mode-mismatch diagnostic did not name the required file: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate5.txt" ] \
+  || fail "filtered sync-all opened a PR with a stale required-file mode"
+echo "PASS: requires-closure gate compares required-file content and git mode (#1058)"
+
+# (6) The prescribed unfiltered remedy carries the requiring workflow and its
+#     covering kit in one slice. A kit-less consumer must therefore pass the
+#     post-materialization closure check and receive a PR, rather than being
+#     trapped by a gate that only looked at its pre-sync tree.
+remote6="$req_workdir/syncall-full.git"; seed6="$req_workdir/syncall-full-seed"
+req_setup_remote "$remote6" "$seed6"
+req_push_seed "$remote6" "$seed6"
+set +e
+output=$(req_run_full_sync_all reqgate6 "$remote6")
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "unfiltered sync-all closure remedy failed: $output"
+echo "$output" | grep -q "requires-closure gate" \
+  && fail "requires gate rejected a slice that carried its own complete kit: $output"
+[ -f "$REQ_CAPTURE/pr-title-reqgate6.txt" ] \
+  || fail "unfiltered sync-all did not open a PR after carrying the complete kit: $output"
+echo "PASS: unfiltered sync-all carries and clears the selected target's runtime closure (#1058)"
+
+# (7) A templated manifest entry covers its rendered destination, not its
+#     source-side `.path`. A filtered slice carrying only a workflow that
+#     requires that entry must fail when the rendered destination is absent.
+remote7="$req_workdir/template-missing.git"; seed7="$req_workdir/template-missing-seed"
+req_setup_remote "$remote7" "$seed7"
+req_push_seed "$remote7" "$seed7"
+set +e
+output=$(req_run_sync_all reqgate7 "$remote7" ".github/workflows/templated_runtime.yml")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  || fail "templated requirement did not reject a missing rendered destination: $output"
+echo "$output" | grep -q "scripts/runtime/helper.sh" \
+  || fail "templated requirement diagnostic did not name its rendered destination: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate7.txt" ] \
+  || fail "filtered sync-all opened a PR without its required templated destination"
+echo "PASS: requires-closure gate rejects a missing templated runtime destination (#1058)"
+
+# (8) The same filtered slice passes when the consumer already has the exact
+#     per-consumer render and source mode. Comparing the raw template path here
+#     would false-block even though the runtime artifact is current.
+remote8="$req_workdir/template-current.git"; seed8="$req_workdir/template-current-seed"
+req_setup_remote "$remote8" "$seed8"
+mkdir -p "$seed8/scripts/runtime"
+printf 'runtime blue\n' >"$seed8/scripts/runtime/helper.sh"
+chmod +x "$seed8/scripts/runtime/helper.sh"
+req_push_seed "$remote8" "$seed8"
+set +e
+output=$(req_run_sync_all reqgate8 "$remote8" ".github/workflows/templated_runtime.yml")
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "current templated requirement blocked its filtered sync: $output"
+echo "$output" | grep -q "requires-closure gate" \
+  && fail "requires gate compared a templated source instead of its current rendered destination: $output"
+[ -f "$REQ_CAPTURE/pr-title-reqgate8.txt" ] \
+  || fail "filtered sync-all did not open a PR with its templated runtime already current: $output"
+echo "PASS: requires-closure gate accepts an exact consumer-specific templated render (#1058)"
+
+# (9) Render equality alone is insufficient for executable templated runtime
+#     dependencies. Preserve the source template's git mode in the comparison,
+#     just as materialization does when it stages the destination.
+remote9="$req_workdir/template-mode.git"; seed9="$req_workdir/template-mode-seed"
+req_setup_remote "$remote9" "$seed9"
+mkdir -p "$seed9/scripts/runtime"
+printf 'runtime blue\n' >"$seed9/scripts/runtime/helper.sh"
+chmod -x "$seed9/scripts/runtime/helper.sh"
+req_push_seed "$remote9" "$seed9"
+set +e
+output=$(req_run_sync_all reqgate9 "$remote9" ".github/workflows/templated_runtime.yml")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  || fail "templated requirement accepted a rendered destination with stale executable mode: $output"
+echo "$output" | grep -q "scripts/runtime/helper.sh" \
+  || fail "templated mode-mismatch diagnostic did not name its destination: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate9.txt" ] \
+  || fail "filtered sync-all opened a PR with a mode-stale templated runtime"
+echo "PASS: requires-closure gate compares templated destination content and git mode (#1058)"
+
+# (10) A templated target skipped through its consumer destination override is
+#      not part of the outgoing slice. Its own requirements must therefore not
+#      be checked: nothing that depends on them will ship. Before this fix the
+#      materializer honored the override but the closure gate still received
+#      the unfiltered manifest entry and falsely blocked the no-op sync.
+remote10="$req_workdir/template-override.git"; seed10="$req_workdir/template-override-seed"
+req_setup_remote "$remote10" "$seed10"
+cat >"$seed10/.sync-overrides.yml" <<'YAML'
+version: 1
+skip_paths:
+  - path: scripts/runtime/helper.sh
+    reason: |
+      Consumer owns this rendered helper; tracked for convergence in alpha#2.
+YAML
+if ! override_validation=$(
+  "$ROOT/scripts/sync/validate-overrides.sh" \
+    "$seed10/.sync-overrides.yml" "$REQ_MP/.mergepath-sync.yml" 2>&1
+); then
+  fail "templated destination override must satisfy the live override schema: $override_validation"
+fi
+req_push_seed "$remote10" "$seed10"
+set +e
+output=$(req_run_sync_all reqgate10 "$remote10" "examples/runtime-helper.in")
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "override-skipped templated target failed its no-op sync: $output"
+echo "$output" | grep -q "requires-closure gate" \
+  && fail "closure gate checked requirements for an override-skipped templated target: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate10.txt" ] \
+  || fail "override-skipped templated no-op unexpectedly opened a PR"
+echo "PASS: requires-closure gate excludes override-skipped templated targets (#1058)"
+
+# (11) Fact export is part of the templated comparison, not an advisory setup
+#      step. Model a helper failure after it clears the fact environment. The
+#      lenient renderer would otherwise substitute an empty flavor and accept a
+#      consumer artifact rendered from no facts at all.
+cp "$REQ_MP/scripts/lib/manifest-fact-helpers.sh" "$req_workdir/manifest-fact-helpers.backup"
+cat >"$REQ_MP/scripts/lib/manifest-fact-helpers.sh" <<'SH'
+export_consumer_facts() {
+  local var
+  for var in $(env | awk -F= '/^MERGEPATH_FACT_/ {print $1}'); do
+    unset "$var"
+  done
+  return 42
+}
+SH
+remote11="$req_workdir/template-facts-fail.git"; seed11="$req_workdir/template-facts-fail-seed"
+req_setup_remote "$remote11" "$seed11"
+mkdir -p "$seed11/scripts/runtime"
+printf 'runtime \n' >"$seed11/scripts/runtime/helper.sh"
+chmod +x "$seed11/scripts/runtime/helper.sh"
+req_push_seed "$remote11" "$seed11"
+set +e
+output=$(req_run_sync_all reqgate11 "$remote11" ".github/workflows/templated_runtime.yml")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  || fail "templated comparison did not fail closed when fact export failed: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate11.txt" ] \
+  || fail "fact-less rendered dependency was accepted and a PR opened"
+echo "PASS: requires-closure gate fails closed when consumer fact export fails (#1058)"
+
+# (12) The materializer follows the same fail-closed fact contract. Give the
+#      target's direct requirement an exact consumer copy so only the failed
+#      fact export can stop the PR; lenient empty-fact rendering must not turn
+#      that setup failure into a plausible generated artifact.
+remote12="$req_workdir/template-materialize-facts-fail.git"; seed12="$req_workdir/template-materialize-facts-fail-seed"
+req_setup_remote "$remote12" "$seed12"
+mkdir -p "$seed12/scripts/ci"
+printf 'check b v1\n' >"$seed12/scripts/ci/check_b"
+req_push_seed "$remote12" "$seed12"
+set +e
+output=$(req_run_sync_all reqgate12 "$remote12" "examples/runtime-helper.in")
+set -e
+mv "$req_workdir/manifest-fact-helpers.backup" "$REQ_MP/scripts/lib/manifest-fact-helpers.sh"
+echo "$output" | grep -q "render failed for templated" \
+  || fail "templated materialization did not fail closed when fact export failed: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate12.txt" ] \
+  || fail "materializer opened a PR after consumer fact export failed"
+echo "PASS: templated materialization fails closed when consumer fact export fails (#1058)"
+
+# (13) Kit paths are valid with or without a trailing slash. A slashless exact
+#      kit requirement must recurse through the tree just like `scripts/ci/`;
+#      comparing the directory tree object to the consumer's first child blob
+#      falsely blocks an otherwise exact consumer.
+remote13="$req_workdir/slashless-kit.git"; seed13="$req_workdir/slashless-kit-seed"
+req_setup_remote "$remote13" "$seed13"
+mkdir -p "$seed13/scripts/runtime-kit"
+printf 'runtime kit a v1\n' >"$seed13/scripts/runtime-kit/check_a"
+printf 'runtime kit b v1\n' >"$seed13/scripts/runtime-kit/check_b"
+chmod +x "$seed13/scripts/runtime-kit/check_a"
+req_push_seed "$remote13" "$seed13"
+set +e
+output=$(req_run_sync_all reqgate13 "$remote13" ".github/workflows/slashless_kit.yml")
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "slashless exact kit blocked a current consumer: $output"
+echo "$output" | grep -q "requires-closure gate" \
+  && fail "requires gate treated a slashless kit as a single file: $output"
+[ -f "$REQ_CAPTURE/pr-title-reqgate13.txt" ] \
+  || fail "current slashless-kit consumer did not get the selected workflow PR: $output"
+echo "PASS: requires-closure gate recursively compares slashless exact kits (#1058)"
+
+# (14) Once a requirement is known to be a tree, enumeration is safety
+#      evidence. A failed `ls-tree -r` must not collapse to an empty file list
+#      and be accepted as current.
+remote14="$req_workdir/slashless-kit-enumeration-fail.git"; seed14="$req_workdir/slashless-kit-enumeration-fail-seed"
+req_setup_remote "$remote14" "$seed14"
+mkdir -p "$seed14/scripts/runtime-kit"
+printf 'runtime kit a v1\n' >"$seed14/scripts/runtime-kit/check_a"
+printf 'runtime kit b v1\n' >"$seed14/scripts/runtime-kit/check_b"
+chmod +x "$seed14/scripts/runtime-kit/check_a"
+req_push_seed "$remote14" "$seed14"
+set +e
+output=$(MERGEPATH_TEST_GIT_FAILURE=kit-ls-tree \
+  req_run_sync_all reqgate14 "$remote14" ".github/workflows/slashless_kit.yml")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  || fail "kit enumeration failure did not fail the closure gate: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate14.txt" ] \
+  || fail "kit enumeration failure was accepted and a PR opened"
+echo "PASS: requires-closure gate fails closed on kit enumeration failure (#1058)"
+
+# (15) Metadata equality is insufficient when either blob cannot be read.
+#      Fault the source read after the tree and index modes have matched; the
+#      gate must reject instead of comparing two empty process substitutions.
+remote15="$req_workdir/slashless-kit-blob-fail.git"; seed15="$req_workdir/slashless-kit-blob-fail-seed"
+req_setup_remote "$remote15" "$seed15"
+mkdir -p "$seed15/scripts/runtime-kit"
+printf 'runtime kit a v1\n' >"$seed15/scripts/runtime-kit/check_a"
+printf 'runtime kit b v1\n' >"$seed15/scripts/runtime-kit/check_b"
+chmod +x "$seed15/scripts/runtime-kit/check_a"
+req_push_seed "$remote15" "$seed15"
+set +e
+output=$(MERGEPATH_TEST_GIT_FAILURE=source-blob \
+  req_run_sync_all reqgate15 "$remote15" ".github/workflows/slashless_kit.yml")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  || fail "required blob read failure did not fail the closure gate: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate15.txt" ] \
+  || fail "required blob read failure was accepted and a PR opened"
+echo "PASS: requires-closure gate fails closed on required blob read failure (#1058)"
+
+# (16) Templated comparisons have the same read-status obligation. Emit the
+#      exact expected bytes but fail the staged consumer `git show`; a process
+#      substitution makes `cmp` report equality while hiding that non-zero
+#      producer, whereas an explicit checked read must reject it.
+remote16="$req_workdir/template-consumer-blob-fail.git"; seed16="$req_workdir/template-consumer-blob-fail-seed"
+req_setup_remote "$remote16" "$seed16"
+mkdir -p "$seed16/scripts/runtime"
+printf 'runtime blue\n' >"$seed16/scripts/runtime/helper.sh"
+chmod +x "$seed16/scripts/runtime/helper.sh"
+req_push_seed "$remote16" "$seed16"
+set +e
+output=$(MERGEPATH_TEST_GIT_FAILURE=templated-consumer-blob \
+  req_run_sync_all reqgate16 "$remote16" ".github/workflows/templated_runtime.yml")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  || fail "templated consumer blob read failure did not fail the closure gate: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate16.txt" ] \
+  || fail "templated consumer blob read failure was accepted and a PR opened"
+echo "PASS: templated closure comparison fails closed on staged blob read failure (#1058)"
 
 
 # ===========================================================================

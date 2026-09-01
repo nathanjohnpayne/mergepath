@@ -24,10 +24,11 @@ Without the override mechanism the script would either silently overwrite legiti
 version: 1
 
 # Paths the propagation script must NOT overwrite for this repo.
-# Each entry references a `paths[].path` value declared by the
-# manifest at .mergepath-sync.yml.
+# Each entry references the consumer-side target declared by the
+# manifest at .mergepath-sync.yml: `.dest` for a templated entry,
+# `.path` for a canonical or kit entry.
 skip_paths:
-  - path: <path-from-manifest>
+  - path: <consumer-target-from-manifest>
     reason: <non-empty rationale; multi-line allowed>
 
 # Override values for templated-path substitution markers. Manifest
@@ -52,14 +53,14 @@ substitutions:
 | File parses as YAML | Exit 1 |
 | Top-level keys ⊆ {`version`, `skip_paths`, `substitutions`} | Exit 1 |
 | `version` is required on non-empty documents and must equal 1 | Exit 1 |
-| Every `skip_paths[].path` is declared by the manifest | Exit 1 |
+| Every `skip_paths[].path` exactly matches a manifest consumer target (`.dest` for templated, `.path` otherwise) | Exit 1 |
 | Every `skip_paths[].reason` is non-empty (whitespace counts as empty) | Exit 1 |
 | Every `substitutions.<key>` matches a marker declared by a `type: templated` manifest path | Exit 1 |
 | Every `substitutions.<key>` is a map with non-empty `value` and non-empty `reason` fields (whitespace counts as empty for both) | Exit 1 |
 
 Absence of the file → exit 0. Empty file → exit 0 (no entries means no constraints to validate).
 
-The "every marker is declared" rule is the strictest of these and is intentional. The v1 manifest currently has no `type: templated` paths, so any non-empty `substitutions:` content fails validation — that's correct: the validator picks up new templated paths automatically once they land in the manifest, without a code change here.
+The "every marker is declared" rule is the strictest of these and is intentional. A templated path may declare no substitution markers; any non-empty `substitutions:` content must still match a marker that a templated manifest entry actually declares.
 
 ## Worked examples
 

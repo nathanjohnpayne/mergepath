@@ -28,14 +28,13 @@
 #   3. `version` is required on any non-empty document and must equal
 #      SUPPORTED_OVERRIDE_VERSION (currently 1). Empty / null-root
 #      documents bypass at Rule 1b before this rule runs.
-#   4. Every `skip_paths[].path` exists in the manifest's `paths[].path`.
-#      Skip-of-nonexistent-file exits non-zero.
+#   4. Every `skip_paths[].path` names an exact consumer-side manifest
+#      target: `.dest` for templated entries, `.path` otherwise.
+#      Skip-of-nonexistent-target exits non-zero.
 #   5. Every `skip_paths[]` has a non-empty `reason` field.
 #   6. Every `substitutions.<key>` matches a marker declared by a
-#      manifest path with `type: templated`. (No templated paths in v1
-#      means any `substitutions:` content fails validation. This is the
-#      correct strict default — when templated paths land, the
-#      validator picks them up automatically without a code change.)
+#      manifest path with `type: templated`. A templated path may declare
+#      no markers; undeclared substitutions still fail closed.
 #   7. Every `substitutions.<key>` entry is a map with non-empty
 #      `value` and `reason` fields. Bare scalar substitutions
 #      (`marker: just-a-value`) fail validation — every override
@@ -186,11 +185,19 @@ if [ "$SKIP_TYPE" = "!!seq" ]; then
   SKIP_COUNT=$(yq eval '.skip_paths | length' "$OVERRIDES_FILE" 2>/dev/null || echo "0")
 fi
 if [ "$SKIP_COUNT" -gt 0 ]; then
-  # Snapshot the manifest's set of declared paths once, for fast lookup.
+  # Snapshot the manifest's consumer-side target keys once, for fast lookup.
+  # Templated entries are selected in Mergepath by `.path` but land in the
+  # consumer at `.dest`; overrides describe consumer-owned divergence and
+  # therefore key those entries by destination. Canonical/kit propagation is
+  # path-preserving and remains keyed by `.path`.
   MANIFEST_PATHS=()
   while IFS= read -r _line; do
     MANIFEST_PATHS+=("$_line")
-  done < <(yq eval '.paths[].path' "$MANIFEST_FILE" 2>/dev/null || true)
+  done < <(yq eval '
+    .paths[]
+    | . as $entry
+    | (($entry.dest | select($entry.type == "templated")) // $entry.path)
+  ' "$MANIFEST_FILE" 2>/dev/null || true)
   if [ "${#MANIFEST_PATHS[@]}" -eq 0 ]; then
     fail "manifest at $MANIFEST_FILE has no paths declared (cannot validate skip_paths)"
   fi
@@ -211,10 +218,9 @@ if [ "$SKIP_COUNT" -gt 0 ]; then
       VIOLATIONS=$((VIOLATIONS + 1))
     fi
 
-    # Match the path against the manifest. Manifest paths can be exact
-    # files (e.g., scripts/keep-in-sync.sh) or directories ending in `/`
-    # (e.g., scripts/ci/). For skip_paths, the override path must equal
-    # a manifest entry exactly; partial-prefix skips would be ambiguous.
+    # Match the path against the manifest's effective consumer targets.
+    # These can be exact files or kit directories. The override must equal
+    # one target exactly; partial-prefix skips would be ambiguous.
     found=0
     for mp in "${MANIFEST_PATHS[@]}"; do
       if [ "$mp" = "$P" ]; then
@@ -223,7 +229,7 @@ if [ "$SKIP_COUNT" -gt 0 ]; then
       fi
     done
     if [ "$found" -eq 0 ]; then
-      err "skip_paths[$i] (path=$P): not found in manifest's paths[].path — cannot skip a path the manifest doesn't declare"
+      err "skip_paths[$i] (path=$P): not found in manifest consumer targets (.dest for templated, .path otherwise) — cannot skip a path the manifest doesn't deliver"
       VIOLATIONS=$((VIOLATIONS + 1))
     fi
   done

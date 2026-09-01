@@ -3643,8 +3643,50 @@ FGAP_EOF
     pass "Case 65: a marker gap past four columns starts the item with indented code, so the marker line and its block are code (#890)"
   fi
 
+  # Case 66: path-scoped propagation validates only the changed entry's own
+  # requires edges. An entry that carries gh-as-author.sh therefore has to
+  # repeat the wrapper's complete runtime closure rather than relying on the
+  # wrapper entry's nested requires. The six #1058 entries below execute the
+  # wrapper (directly or through the workflow kit), so an omitted edge makes a
+  # targeted wave publish a queue path that fails before it can record its
+  # authorization or final-audit evidence.
+  author_runtime_deps=(
+    "scripts/lib/gh-token-resolver.sh"
+    "scripts/identity-check.sh"
+    "scripts/lib/gh-command-classifier.sh"
+    "scripts/lib/pr-body-contract.sh"
+    "scripts/lib/pr-body-contract.mjs"
+    "scripts/lib/reviewers-helpers.sh"
+  )
+  author_runtime_targets=(
+    "scripts/gh-as-author.sh"
+    ".github/workflows/merge-queue-authorization.yml"
+    ".github/workflows/merge-queue-final-audit.yml"
+    "scripts/workflow/record-merge-queue-final-audit.sh"
+    "scripts/ci/"
+    "scripts/workflow/"
+  )
+  author_runtime_missing=""
+  for target in "${author_runtime_targets[@]}"; do
+    for dep in "${author_runtime_deps[@]}"; do
+      if ! awk -v target="$target" -v dep="$dep" '
+        $0 == "  - path: " target { in_target=1; next }
+        in_target && /^  - path:/ { in_target=0 }
+        in_target && index($0, "      - \"" dep "\"") == 1 { found=1 }
+        END { exit(found ? 0 : 1) }
+      ' "$LIVE_MANIFEST"; then
+        author_runtime_missing="${author_runtime_missing}\n  - ${target} -> ${dep}"
+      fi
+    done
+  done
+  if [ -n "$author_runtime_missing" ]; then
+    fail "Case 66: gh-as-author runtime closure is incomplete:${author_runtime_missing}"
+  else
+    pass "Case 66: every #1058 author-wrapper propagation entry repeats the complete runtime closure"
+  fi
+
 else
-  echo "SKIP: Cases 36-65 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-66 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo

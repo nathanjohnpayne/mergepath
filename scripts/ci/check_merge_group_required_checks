@@ -260,7 +260,27 @@ manifest = YAML.safe_load(
 paths = manifest.fetch("paths")
 abort "FAIL: sync manifest paths are malformed" unless paths.is_a?(Array)
 
+author_wrapper_runtime = [
+  "scripts/lib/gh-token-resolver.sh",
+  "scripts/identity-check.sh",
+  "scripts/lib/gh-command-classifier.sh",
+  "scripts/lib/pr-body-contract.sh",
+  "scripts/lib/pr-body-contract.mjs",
+  "scripts/lib/reviewers-helpers.sh"
+]
+
 expected = {
+  "scripts/gh-as-author.sh" => author_wrapper_runtime,
+  ".github/workflows/merge-queue-authorization.yml" => [
+    "scripts/workflow/record-merge-queue-authorization.sh",
+    "scripts/lib/merge-queue-protection.sh",
+    "scripts/lib/merge-queue-authorization.sh",
+    "scripts/lib/blocking-labels.sh",
+    "scripts/lib/gh-api-array.sh",
+    "scripts/lib/review-policy-scalar.sh",
+    "scripts/gh-as-author.sh",
+    *author_wrapper_runtime
+  ],
   ".github/workflows/merge-queue-final-audit.yml" => [
     "scripts/workflow/record-merge-queue-final-audit.sh",
     "scripts/lib/merge-queue-authorization.sh",
@@ -268,7 +288,8 @@ expected = {
     "scripts/lib/blocking-labels.sh",
     "scripts/lib/gh-api-array.sh",
     "scripts/lib/review-policy-scalar.sh",
-    "scripts/gh-as-author.sh"
+    "scripts/gh-as-author.sh",
+    *author_wrapper_runtime
   ],
   "scripts/workflow/record-merge-queue-final-audit.sh" => [
     "scripts/lib/merge-queue-authorization.sh",
@@ -276,7 +297,8 @@ expected = {
     "scripts/lib/blocking-labels.sh",
     "scripts/lib/gh-api-array.sh",
     "scripts/lib/review-policy-scalar.sh",
-    "scripts/gh-as-author.sh"
+    "scripts/gh-as-author.sh",
+    *author_wrapper_runtime
   ]
 }
 expected.each do |path, requires|
@@ -292,8 +314,18 @@ end
 workflow_kit = paths.find do |entry|
   entry.is_a?(Hash) && entry["path"] == "scripts/workflow/"
 end
-abort "FAIL: workflow kit lost the target final-auditor author wrapper" unless
-  workflow_kit && Array(workflow_kit["requires"]).include?("scripts/gh-as-author.sh")
+workflow_kit_missing = ["scripts/gh-as-author.sh", *author_wrapper_runtime] -
+  Array(workflow_kit && workflow_kit["requires"])
+abort "FAIL: workflow kit lost the target final-auditor author-wrapper closure: #{workflow_kit_missing.join(', ')}" unless
+  workflow_kit_missing.empty?
+
+ci_kit = paths.find do |entry|
+  entry.is_a?(Hash) && entry["path"] == "scripts/ci/"
+end
+ci_kit_missing = ["scripts/gh-as-author.sh", *author_wrapper_runtime] -
+  Array(ci_kit && ci_kit["requires"])
+abort "FAIL: CI kit lost the gh-as-author runtime closure: #{ci_kit_missing.join(', ')}" unless
+  ci_kit_missing.empty?
 
 source_only = [
   ".github/templates/required-workflows/mergepath-merge-queue-authorization.yml",

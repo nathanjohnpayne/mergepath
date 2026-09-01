@@ -771,9 +771,11 @@ paths:
     # Declaring the contract libs here keeps the two halves inseparable.
     requires:
       - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
       - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
       - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
+      - "scripts/lib/reviewers-helpers.sh"  # pr-body-contract.sh hard-sources it
   # Single entrypoint for PR-body validation (#1132). The required
   # Self-Review gate, gh-as-author.sh and local checks all route through it, so
   # the contract has one tested implementation rather than a shell copy and a
@@ -1515,6 +1517,12 @@ paths:
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/review-policy-scalar.sh"
       - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"
+      - "scripts/lib/gh-command-classifier.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
   # The source-pinned required workflow sends its one private-nonce request to
   # this target-base responder. Propagate the workflow and recorder in the
   # same wave: either one without the other makes every queue handshake fail
@@ -1532,6 +1540,12 @@ paths:
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/review-policy-scalar.sh"
       - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"
+      - "scripts/lib/gh-command-classifier.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
   - path: scripts/workflow/record-merge-queue-final-audit.sh
     type: canonical
     consumers: all
@@ -1542,6 +1556,12 @@ paths:
       - "scripts/lib/gh-api-array.sh"
       - "scripts/lib/review-policy-scalar.sh"
       - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"
+      - "scripts/lib/gh-command-classifier.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
   - path: scripts/workflow/report-approval-continuation-failures.sh
     type: canonical
     consumers: all
@@ -1792,6 +1812,11 @@ paths:
       - "scripts/resolve-pr-threads.sh"        # check_resolve_pr_threads
       - "scripts/lib/ensure-yq.sh"             # check_resolve_pr_threads CI-only yq bootstrap (#616)
       - "scripts/gh-as-author.sh"              # check_gh_as_author (transitive)
+      - "scripts/lib/gh-token-resolver.sh"     # gh-as-author.sh runtime closure (#1058)
+      - "scripts/identity-check.sh"            # gh-token-resolver.sh runtime closure (#1058)
+      - "scripts/lib/pr-body-contract.sh"      # gh-as-author.sh runtime closure (#1058)
+      - "scripts/lib/pr-body-contract.mjs"     # gh-as-author.sh runtime closure (#1058)
+      - "scripts/lib/reviewers-helpers.sh"     # pr-body-contract.sh runtime closure (#1058)
       - "scripts/gh-as-reviewer.sh"            # check_gh_as_author (transitive)
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
       - "scripts/coderabbit-automerge-rate-limit-gate.sh"  # tests/test_coderabbit_automerge_rate_limit_gate.sh runs it (#489/#521)
@@ -1847,6 +1872,11 @@ paths:
       - "scripts/lib/merge-queue-protection.sh"   # #1058, safe native-arm preservation + bridge topology
       - "scripts/lib/merge-queue-authorization.sh" # #1058, exact-head queue authorization history
       - "scripts/gh-as-author.sh"                 # #1058, final target-audit marker write
+      - "scripts/lib/gh-token-resolver.sh"         # gh-as-author.sh runtime closure (#1058)
+      - "scripts/identity-check.sh"                # gh-token-resolver.sh runtime closure (#1058)
+      - "scripts/lib/gh-command-classifier.sh"     # gh-as-author.sh runtime closure (#1058)
+      - "scripts/lib/pr-body-contract.sh"          # gh-as-author.sh runtime closure (#1058)
+      - "scripts/lib/pr-body-contract.mjs"         # gh-as-author.sh runtime closure (#1058)
       - "scripts/self-approval-detector.cjs"      # #1094, canonical final independence decision
       - "scripts/merge-clearance-gate.sh"         # #1094, shared Phase 4 requiredness query
 
