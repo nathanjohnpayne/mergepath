@@ -145,9 +145,17 @@ consumers:
   # root package.json and ~148 .ts/.tsx files, so it IS in scope for the
   # canonical ESLint floor (#458). Folded into the ESM templated entry
   # below; the prior "zero lintable surface" exclusion was false.
+  # Visibility flipped public -> private during the 2026-08 window; measured
+  # 2026-09-01 by the monthly propagation-order review (anonymous API access
+  # returns 404). It is the fleet's only non-public consumer. Nothing in the
+  # sync engine reads this field -- it is documentary -- but it is read by
+  # humans and agents reasoning about the fleet, and docs/agents/coderabbit-
+  # audit.md's learnings.scope posture turns on it (`auto` resolves to
+  # `global` for a private repo, `local` for a public one), so a stale value
+  # here propagates into a wrong privacy conclusion.
   - name: device-source-of-truth
     repo: nathanjohnpayne/device-source-of-truth
-    visibility: public
+    visibility: private
     facts:
       frameworks: [react, typescript]
   - name: friends-and-family-billing
