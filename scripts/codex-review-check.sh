@@ -912,6 +912,7 @@ while :; do
                         conclusion
                         startedAt
                         completedAt
+                        isRequired(pullRequestNumber: $number)
                         checkSuite {
                           workflowRun {
                             databaseId
@@ -923,6 +924,7 @@ while :; do
                         context
                         state
                         createdAt
+                        isRequired(pullRequestNumber: $number)
                       }
                     }
                   }
@@ -959,6 +961,17 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       status: .status,
       conclusion: .conclusion,
       state: .state,
+      # The GitHub-side answer to whether this run counts toward the required
+      # checks for THIS pull request (#1064). A required context is a bare
+      # name, so a same-named run from a different producer cannot be told
+      # apart by name alone — and branch protection pins each context to a
+      # producing app, so that foreign run does NOT satisfy the requirement.
+      # Carried here so the per-name collapse below can drop entries GitHub
+      # says do not count, instead of letting a foreign SUCCESS mask the
+      # required producer FAILURE. Null on any entry GitHub does not answer
+      # for, which the filter treats as no-opinion and falls back to name
+      # matching.
+      isRequired: .isRequired,
       startedAt: .startedAt,
       completedAt: .completedAt
     }))
@@ -1513,11 +1526,12 @@ else
 fi
 
 if [ "$BRANCH_REQUIREMENTS_PARTIAL" = "1" ]; then
-  # A degraded-but-usable read. Kept as `known` deliberately: on a
-  # classic-protected repo whose rulesets read hiccups, filtering on the
-  # classic list is strictly better than imposing no filter at all. Logged so
-  # an operator can tell a degraded read from a clean one without re-running.
-  log "gate (a): resolved the required-check list for $BASE_BRANCH from only one of two rule surfaces ($BRANCH_REQUIREMENTS_SURFACES); the other errored, so the list may be incomplete and gate (a) may scrutinise fewer checks than GitHub enforces: $BRANCH_REQUIREMENTS_ERRORS"
+  # Diagnostic only — a half-read is `unknown`, not a usable list, because the
+  # requirement is the UNION of the two surfaces and one of them answering
+  # says nothing about the other. Distinguishing a half-outage from a total
+  # one is what an operator needs to act, so it is logged separately from the
+  # fail-closed warning below rather than folded into it.
+  log "gate (a): only one of the two rule surfaces answered for $BASE_BRANCH ($BRANCH_REQUIREMENTS_SURFACES); the union could not be established, so the requirement list is UNKNOWN rather than partial. Details: $BRANCH_REQUIREMENTS_ERRORS"
 fi
 
 if [ "$protection_readable" -eq 0 ]; then
@@ -1597,8 +1611,20 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         # Carried for the per-name winner selection below (#1064). Absent on a
         # StatusContext, which the selection handles as a non-terminal entry.
         startedAt: (.startedAt // ""),
-        completedAt: (.completedAt // "")
+        completedAt: (.completedAt // ""),
+        isRequired: .isRequired
       }
+    # Drop entries GitHub says do not count toward this PR requirements
+    # (#1064). Branch protection pins a required context to a producing app,
+    # so a same-named check run from a DIFFERENT producer does not satisfy it —
+    # but the required list is bare names, so name matching alone cannot tell
+    # them apart. Without this, a foreign later SUCCESS wins the per-name
+    # collapse below and masks the required producer FAILURE.
+    #
+    # Only an explicit `false` drops an entry. A null means GitHub returned no
+    # opinion for it, and treating that as "not required" would silently empty
+    # the gate; those fall through to the name filter as before.
+    | select(.isRequired != false)
     # Approval readiness runs inside a check on the same HEAD. If branch
     # protection is unreadable, the fail-closed full-rollup fallback would
     # otherwise block forever on the caller itself. Exclude only non-completed
@@ -1694,6 +1720,45 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         )
     ]
 ')
+
+# A required context that has NOT REPORTED AT ALL blocks too (#1064).
+#
+# The filter above can only judge entries that exist. A required context whose
+# workflow has not been scheduled yet produces no rollup entry, so it forms no
+# group, contributes nothing to BAD_CHECKS, and gate (a) would clear while
+# GitHub still holds the PR for an unsatisfied required context. Before #1064
+# this was unreachable on the unprivileged paths — there was no required list
+# to be absent FROM — so resolving the list is what makes it reachable, and
+# closing it is part of the same change.
+#
+# This is NOT the synthetic-MISSING approach #655 rounds 2-4 tried and removed.
+# That one invented a requirement for a name DERIVED from a consumer's annex
+# workflow, which could legitimately never report (path-filtered, matrix-
+# expanded, or unparseable) and so deadlocked the gate permanently. These names
+# come from branch protection itself: GitHub will not merge the PR until each
+# one reports green, so reporting an absent one is describing the merge
+# blocker, not inventing one.
+#
+# Computed from the rollup WITHOUT the approval-readiness exclusion applied
+# above. That exclusion deliberately ignores still-running checks from the
+# caller own trusted workflow run so the gate cannot block on itself; treating
+# an excluded-but-present check as "never reported" would reinstate exactly
+# that self-block.
+if [ "$(printf '%s' "${REQUIRED_JSON:-[]}" | jq -r 'length')" -gt 0 ]; then
+  MISSING_REQUIRED=$(echo "$ROLLUP_JSON" | jq -c \
+    --argjson required_names "${REQUIRED_JSON:-[]}" '
+    [ .statusCheckRollup[]
+      | select(.isRequired != false)
+      | (.name // .context // "?") ] as $reported
+    | [ $required_names[]
+        | select(($reported | index(.)) == null)
+        | { label: ., workflow: "(not reported)", result: "MISSING" } ]
+  ')
+  if [ "$(printf '%s' "$MISSING_REQUIRED" | jq -r 'length')" -gt 0 ]; then
+    log "gate (a): $(printf '%s' "$MISSING_REQUIRED" | jq -r 'length') required check(s) on $BASE_BRANCH have not reported for this head: $(printf '%s' "$MISSING_REQUIRED" | jq -r '[.[].label] | join(", ")') — GitHub treats an unreported required context as unsatisfied, so gate (a) does too."
+    BAD_CHECKS=$(echo "$BAD_CHECKS" | jq -c --argjson extra "$MISSING_REQUIRED" '(. + $extra) | unique')
+  fi
+fi
 
 # #655 (Codex P2 round 5): rather than inventing a synthetic MISSING
 # requirement for a derived check name that has not reported (rounds 2-4's

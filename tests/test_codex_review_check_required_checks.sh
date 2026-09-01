@@ -1472,6 +1472,49 @@ else
   fail "#1064: gate (a) infers readability from an empty list again — that is exactly how 'could not look' became 'nothing required'"
 fi
 
+# ---------------------------------------------------------------------------
+# #1064 review round 1 (PR #1176): the two fail-opens Codex found in the
+# collapse that resolving the required list newly exposed.
+# ---------------------------------------------------------------------------
+
+# A required context is a bare NAME, and branch protection pins it to a
+# producing app. Collapsing purely by name lets a later same-named run from a
+# foreign producer win and mask the required producer FAILURE. GitHub answers
+# this directly via isRequired(pullRequestNumber:), so the rollup carries it.
+if grep -q 'isRequired(pullRequestNumber: $number)' "$SCRIPT" \
+   && grep -q 'isRequired: .isRequired' "$SCRIPT"; then
+  pass "#1064: the rollup query carries GitHub own isRequired verdict per entry"
+else
+  fail "#1064: the rollup no longer carries isRequired — the per-name collapse can then let a foreign producer SUCCESS mask a required FAILURE"
+fi
+
+if grep -q 'select(.isRequired != false)' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: entries GitHub says do not count are dropped before the collapse, and only an explicit false drops one"
+else
+  fail "#1064: the filter does not exclude isRequired==false entries, so a foreign same-named check can decide a required context"
+fi
+
+# A required context with NO rollup entry forms no group, so the collapse
+# alone cannot see it. GitHub holds the PR for it regardless.
+if grep -q 'MISSING_REQUIRED' "$SCRIPT" \
+   && grep -q 'result: "MISSING"' "$SCRIPT"; then
+  pass "#1064: a required check that has not reported at all is treated as blocking"
+else
+  fail "#1064: an unreported required check leaves BAD_CHECKS empty and gate (a) clears while GitHub still blocks the merge"
+fi
+
+# The missing-check scan must NOT reuse the approval-readiness-filtered set:
+# that filter deliberately ignores still-running checks from the caller own
+# trusted run, and calling those "never reported" reinstates the self-block it
+# exists to prevent.
+MISSING_BLOCK=$(sed -n '/MISSING_REQUIRED=\$(echo/,/^  fi$/p' "$SCRIPT")
+if grep -q 'ROLLUP_JSON' <<<"$MISSING_BLOCK" \
+   && ! grep -q 'approval_readiness_only' <<<"$MISSING_BLOCK"; then
+  pass "#1064: the missing-required scan reads the unfiltered rollup, so approval readiness cannot self-block"
+else
+  fail "#1064: the missing-required scan is computed from the readiness-filtered set — a still-running check from the caller own run would be reported as never-reported"
+fi
+
 # The CODEOWNERS deadlock: reviewDecision stays REVIEW_REQUIRED even though a
 # qualifying approval exists (scripts/admin-merge-codeowners-blocked.sh
 # evaluates reviews directly for exactly this reason). Prescribing Phase 4b

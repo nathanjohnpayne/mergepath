@@ -36,6 +36,10 @@ PASS=0; FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
+# Every failure case below is provoked deliberately, so do not pay the
+# inter-attempt pause the lib uses to absorb real transients.
+export BR_RETRY_SLEEP=0
+
 # `gh` stub. GH_CLASSIC / GH_RULESETS select the behaviour of each surface:
 #   ok       — answer with the fixture in GH_CLASSIC_BODY / GH_RULESETS_BODY
 #   fail     — exit non-zero with a message on stderr (network / 4xx / 5xx)
@@ -44,6 +48,14 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 # Deliberately overrides the real binary for the whole suite: these tests are
 # about the lib's state machine, and reaching the network would make them
 # depend on live branch protection.
+# Defaults live in their own variables. A brace-heavy JSON literal written
+# inline as `${VAR:-{"a":{"b":1}}}` does NOT work: the first `}` closes the
+# parameter expansion and the remainder is appended as literal text, so the
+# stub emits malformed JSON and every assertion downstream reads a parse
+# failure instead of the fixture it asked for.
+GH_CLASSIC_DEFAULT='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}'
+GH_RULESETS_DEFAULT='[]'
+
 gh() {
   case "$*" in
     *graphql*)
@@ -51,19 +63,29 @@ gh() {
         fail)     echo "gh: Bad credentials (HTTP 401)" >&2; return 1 ;;
         gqlerror) echo '{"data":null,"errors":[{"message":"Resource not accessible by integration"}]}'; return 0 ;;
         noref)    echo '{"data":{"repository":{"ref":null}}}'; return 0 ;;
-        *)        echo "${GH_CLASSIC_BODY:-{\"data\":{\"repository\":{\"ref\":{\"refUpdateRule\":{\"requiredStatusCheckContexts\":[\"lint\"]}}}}}}"; return 0 ;;
+        *)        echo "${GH_CLASSIC_BODY:-$GH_CLASSIC_DEFAULT}"; return 0 ;;
       esac
       ;;
     *rules/branches*)
       case "${GH_RULESETS:-ok}" in
         fail) echo "gh: Not Found (HTTP 404)" >&2; return 1 ;;
-        *)    echo "${GH_RULESETS_BODY:-[]}"; return 0 ;;
+        *)    echo "${GH_RULESETS_BODY:-$GH_RULESETS_DEFAULT}"; return 0 ;;
       esac
       ;;
   esac
   echo "unexpected gh invocation: $*" >&2
   return 1
 }
+
+# Guard the harness itself: if the stub stops emitting parseable JSON, every
+# assertion below silently degrades into "the read failed" and the suite goes
+# green for the wrong reason. This is not hypothetical — the inline-default
+# form described above did exactly that during PR #1176.
+if ! GH_CLASSIC=ok gh api graphql | jq -e '.data.repository.ref.refUpdateRule.requiredStatusCheckContexts | length == 1' >/dev/null 2>&1 \
+   || ! GH_RULESETS=ok gh api "repos/o/r/rules/branches/main" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  echo "FAIL: the gh stub does not emit parseable fixtures; every assertion below would be meaningless" >&2
+  exit 1
+fi
 
 # Read one field out of a br_required_checks result.
 field() { printf '%s' "$1" | jq -r "$2"; }
@@ -113,24 +135,54 @@ else
   fail "approvals-only branch: expected known + [], got $empty_out"
 fi
 
-# ── 5. One surface down: degraded but usable, and it says so.
+# ── 5. THE SECOND REGRESSION (PR #1176 review). One surface down is UNKNOWN,
+# not a usable list. The requirement is the UNION, so a surface answering says
+# nothing about what the other would have said.
+#
+# The concrete failure both reviewers found: the GraphQL read fails while
+# `rules/branches` returns `[]`. An earlier revision called that known-and-
+# empty, so gate (a) wiped the rollup and a red classic required check cleared
+# — the original fail-open, reintroduced one level up.
+out=$(GH_CLASSIC=fail GH_RULESETS=ok GH_RULESETS_BODY='[]' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "unknown" ]; then
+  pass "classic down + empty rulesets: unknown, so the fail-closed arm handles it (#1176 review)"
+else
+  fail "classic down + empty rulesets: expected unknown — this is the fail-open both reviewers caught — got $out"
+fi
+
+# Same rule when the surviving surface DOES carry names: a partial union is
+# still not the union, and acting on it would silently drop the other surface
+# requirements.
 out=$(GH_CLASSIC=ok GH_RULESETS=fail br_required_checks owner/repo main)
-if [ "$(field "$out" .state)" = "known" ] \
+if [ "$(field "$out" .state)" = "unknown" ] \
    && [ "$(field "$out" .partial)" = "true" ] \
    && [ "$(field "$out" '.surfaces | join(",")')" = "classic" ]; then
-  pass "rulesets down: still known (filtering on the classic list beats no filter) and flagged partial"
+  pass "rulesets down: unknown, with partial + surfaces recorded as diagnostics"
 else
-  fail "rulesets down: expected known/partial/classic, got $out"
+  fail "rulesets down: expected unknown/partial/classic, got $out"
 fi
 
 out=$(GH_CLASSIC=fail GH_RULESETS=ok GH_RULESETS_BODY="$RULESET_ONE" \
   br_required_checks owner/repo main)
-if [ "$(field "$out" .state)" = "known" ] \
-   && [ "$(field "$out" .partial)" = "true" ] \
-   && [ "$(field "$out" '.contexts | join(",")')" = "build" ]; then
-  pass "classic down: the ruleset-only branch still resolves its required checks (#1064 acceptance)"
+if [ "$(field "$out" .state)" = "unknown" ] \
+   && [ "$(field "$out" .partial)" = "true" ]; then
+  pass "classic down: unknown even though the rulesets surface carried names"
 else
-  fail "classic down: expected known/partial/[build], got $out"
+  fail "classic down: expected unknown/partial, got $out"
+fi
+
+# A ruleset-governed branch still resolves — #1064 acceptance — as long as
+# BOTH surfaces answer, which is the normal case (classic answers with an
+# empty rule set on a ruleset-only repo).
+out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_BODY="$RULESET_ONE" \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "known" ] \
+   && [ "$(field "$out" '.contexts | join(",")')" = "build" ]; then
+  pass "a ruleset-only branch resolves its required checks (#1064 acceptance)"
+else
+  fail "ruleset-only branch: expected known/[build], got $out"
 fi
 
 # ── 6. A 200 carrying a GraphQL errors array is a FAILED read, not an empty
@@ -180,6 +232,49 @@ enc_case "hierarchical slashes are preserved"   'release/1.0'   'release/1.0'
 enc_case "a space is escaped"                   'my branch'     'my%20branch'
 enc_case "plain names are untouched"            'main'          'main'
 enc_case "non-ASCII is UTF-8 percent-encoded"   'feat/ü'        'feat/%C3%BC'
+
+# ── 10. Each surface is retried once before being given up on, so a single
+# transient blip does not degrade the whole resolution to unknown (both
+# surfaces are needed for `known`, which makes one blip otherwise expensive).
+ATTEMPTS_FILE="$(mktemp)"
+gh_flaky_once() {
+  # Fail the FIRST graphql attempt only; succeed thereafter.
+  case "$*" in
+    *graphql*)
+      if [ ! -s "$ATTEMPTS_FILE" ]; then
+        echo "seen" >"$ATTEMPTS_FILE"
+        echo "gh: Internal Server Error (HTTP 500)" >&2
+        return 1
+      fi
+      echo '{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}'
+      return 0
+      ;;
+    *rules/branches*) echo '[]'; return 0 ;;
+  esac
+  return 1
+}
+out=$(gh() { gh_flaky_once "$@"; }; br_required_checks owner/repo main)
+rm -f "$ATTEMPTS_FILE"
+if [ "$(field "$out" .state)" = "known" ] \
+   && [ "$(field "$out" '.contexts | join(",")')" = "lint" ]; then
+  pass "a surface that fails once and then succeeds is retried, not written off as unknown"
+else
+  fail "transient-blip retry: expected known/[lint], got $out"
+fi
+
+# ── 11. Structural: GraphQL String variables must be passed with -f, not -F.
+#
+# `gh api -F` applies magic type conversion, so a repository or owner whose
+# name is numeric — or a ref segment that is literally true/false/null — is
+# sent as a JSON number/boolean/null against a `String!` variable and the query
+# hard-fails on EVERY invocation for that repo. Measured against live gh while
+# fixing PR #1176: `-F name=12345` returns "Could not coerce value 12345 to
+# String"; `-f name=12345` resolves normally.
+if grep -qE '^\s*-F (owner|name|qualifiedName)=' "$LIB"; then
+  fail "a String! GraphQL variable is passed with -F, which coerces numeric and boolean-looking values and breaks those repos outright"
+else
+  pass "GraphQL String variables are passed with -f, so numeric/boolean-looking names are not coerced"
+fi
 
 echo
 echo "test_branch_requirements: $PASS passed, $FAIL failed"

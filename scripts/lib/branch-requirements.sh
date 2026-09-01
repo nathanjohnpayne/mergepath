@@ -89,18 +89,23 @@
 # nothing" and "I could not read the config" produced the same empty list and
 # therefore the same decision. This helper never merges them. `state` is:
 #
-#   known    at least one surface answered. `contexts` is what it/they carry,
-#            and MAY legitimately be empty (an approvals-only branch really
-#            does require no status checks).
-#   unknown  no surface answered. `contexts` is empty because nothing was
+#   known    BOTH surfaces answered. `contexts` is their union, and MAY
+#            legitimately be empty (an approvals-only branch really does
+#            require no status checks).
+#   unknown  at least one surface did not answer, so the union could not be
+#            established. `contexts` is empty because nothing usable was
 #            learned, and a caller must NOT read that as "nothing required".
 #
-# `partial` marks a `known` result where one surface answered and the other
-# errored. It stays `known` deliberately: on a classic-protected repo whose
-# rulesets read hiccups, filtering on the classic list is strictly better than
-# degrading to `unknown` and imposing no filter at all. `surfaces` and `errors`
-# record which is which so an operator can tell a degraded read from a clean
-# one without re-running under a different token.
+# Both surfaces are required for `known` because the requirement IS the union.
+# One surface answering `[]` says nothing about what the other would have
+# said, so acting on a half-read reintroduces the fail-open one level up: a
+# transient GraphQL failure alongside an empty `rules/branches` would read as
+# known-and-empty and clear a red classic required check. Each read is retried
+# once before being given up on, so a single blip does not reach this.
+#
+# `partial` marks the half-read case as a DIAGNOSTIC only — it tells an
+# operator a half-outage from a total one — and never licenses acting on the
+# list. `surfaces` and `errors` record who answered and why the others did not.
 #
 # ─────────────────────────────────────────────────────────────────────
 # Contract
@@ -121,15 +126,13 @@
 #     `.state`, so a helper that exited would force every caller to duplicate
 #     the tri-state in exit codes.
 #
-# Bounded limitation, stated rather than hidden: a branch that does not exist
-# resolves to `known` + `partial` + `[]`, because `rules/branches/{branch}`
-# answers 200 `[]` for ANY branch name (verified live) and cannot distinguish
-# "no rules apply here" from "here is nowhere". The classic surface does not
-# make the claim — it reports the ref as not found and contributes nothing —
-# so the empty list comes from the rulesets read alone. Gate (a)'s only input
-# is a PR's own base ref, which exists by construction, so this is unreachable
-# from the caller that motivated the lib; a future caller resolving an
-# arbitrary ref should test existence separately rather than infer it here.
+# Note on a nonexistent branch: `rules/branches/{branch}` answers 200 `[]` for
+# ANY branch name (verified live) and cannot distinguish "no rules apply here"
+# from "here is nowhere". On its own that would be a fabricated empty list. It
+# is not one, because the classic surface refuses to make the claim — it
+# reports the ref as not found and contributes nothing — and a result needs
+# BOTH surfaces to be `known`. So a nonexistent branch resolves to `unknown`,
+# which is the honest answer.
 #
 # Requires: gh, jq. Bash 3.2 portable (no associative arrays, no mapfile).
 
@@ -155,6 +158,26 @@
 # reused by the propagated scripts that need it (#1063).
 br_urlencode_branch_path() {
   jq -rn --arg s "${1-}" '$s | split("/") | map(@uri) | join("/")'
+}
+
+# Run a read once, and once more after a pause if it fails.
+#
+# Both surfaces must answer for the result to be usable (see the tri-state
+# note above), so a single transient blip on either one would otherwise
+# degrade the whole resolution to `unknown` and put gate (a) on the
+# fail-closed path. One retry absorbs the common case — a rate-limit tick or
+# a 5xx on one of two independent endpoints — without pretending to be a
+# general retry framework; a persistent failure still resolves to `unknown`,
+# which is the honest answer.
+#
+# BR_RETRY_SLEEP exists so the offline suites do not pay the pause for the
+# failure cases they deliberately provoke.
+_br_retry() {
+  if "$@"; then
+    return 0
+  fi
+  sleep "${BR_RETRY_SLEEP:-2}"
+  "$@"
 }
 
 # Resolve the required status checks enforced on <branch> of <owner/repo>.
@@ -195,7 +218,14 @@ br_required_checks() {
   # interpolated RAW here (not percent-encoded): this is a GraphQL variable
   # carried in the request BODY, not a URL path segment, so encoding it would
   # look for a branch whose name literally contains `%23`.
-  if classic_out="$(gh api graphql \
+  # `-f`, NOT `-F`. `gh api -F` applies magic type conversion, so a repository
+  # or owner whose name is numeric — or a ref segment that is literally `true`,
+  # `false` or `null` — is sent as a JSON number/boolean/null against a
+  # `String!` variable and the query hard-fails on EVERY invocation for that
+  # repo. Measured: `-F name=12345` → "Could not coerce value 12345 to String";
+  # `-f name=12345` resolves normally. `-f` sends every value as a raw string,
+  # which is what all three variables are declared as.
+  if classic_out="$(_br_retry gh api graphql \
       -f query='query($owner:String!,$name:String!,$qualifiedName:String!){
         repository(owner:$owner,name:$name){
           ref(qualifiedName:$qualifiedName){
@@ -203,7 +233,7 @@ br_required_checks() {
           }
         }
       }' \
-      -F owner="$owner" -F name="$name" -F qualifiedName="refs/heads/$branch" \
+      -f owner="$owner" -f name="$name" -f qualifiedName="refs/heads/$branch" \
       2>"$errfile")"; then
     # A 200 can still carry a GraphQL `errors` array with a null data field,
     # and `gh` does not always exit non-zero for it. Treat any errors array as
@@ -243,7 +273,7 @@ br_required_checks() {
   #
   # A branch with no rulesets answers `[]` with HTTP 200 — verified live —
   # which is a successful read of "no ruleset requirements", not a failure.
-  if rulesets_out="$(gh api --paginate "repos/$repo/rules/branches/$branch_enc" 2>"$errfile")"; then
+  if rulesets_out="$(_br_retry gh api --paginate "repos/$repo/rules/branches/$branch_enc" 2>"$errfile")"; then
     if rulesets_ctx="$(printf '%s' "$rulesets_out" | jq -c -s '
         add // []
         | [ .[]? | objects
@@ -264,6 +294,21 @@ br_required_checks() {
   [ "$classic_ok" -eq 1 ] && surfaces="$(printf '%s' "$surfaces" | jq -c '. + ["classic"]')"
   [ "$rulesets_ok" -eq 1 ] && surfaces="$(printf '%s' "$surfaces" | jq -c '. + ["rulesets"]')"
 
+  # BOTH surfaces must answer for the result to be `known`.
+  #
+  # An earlier revision returned `known` when either one did, reasoning that
+  # filtering on a partial list beats imposing no filter. That is wrong, and
+  # both reviewers caught it independently on PR #1176: the requirement is the
+  # UNION, so one surface answering `[]` says nothing about what the other
+  # would have said. Concretely — the GraphQL read fails transiently while
+  # `rules/branches` returns `[]`, the result reads as known-and-empty, gate
+  # (a) wipes the rollup, and a red classic required check clears. That is the
+  # original fail-open reintroduced one level up, which is exactly the shape of
+  # bug this lib exists to remove.
+  #
+  # `partial` is retained as a diagnostic — it marks the case where one surface
+  # DID answer, which is what an operator needs to know to tell a half-outage
+  # from a total one — but it is never a licence to act on the list.
   jq -nc \
     --argjson classic "$classic_ctx" \
     --argjson rulesets "$rulesets_ctx" \
@@ -271,9 +316,9 @@ br_required_checks() {
     --argjson errors "$errors" \
     --argjson classic_ok "$classic_ok" \
     --argjson rulesets_ok "$rulesets_ok" '
-    (($classic_ok + $rulesets_ok) > 0) as $known
+    (($classic_ok + $rulesets_ok) == 2) as $known
     | { state: (if $known then "known" else "unknown" end),
-        partial: ($known and (($classic_ok + $rulesets_ok) == 1)),
+        partial: (($classic_ok + $rulesets_ok) == 1),
         contexts: (if $known then (($classic + $rulesets) | unique) else [] end),
         surfaces: $surfaces,
         errors: $errors }
