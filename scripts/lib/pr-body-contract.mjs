@@ -255,12 +255,20 @@ function interruptsParagraph(line) {
   if (/^[ \t]*$/.test(line)) return true;
   // ATX heading, e.g. "## Self-Review" itself.
   if (/^ {0,3}#{1,6}(?:[ \t]|$)/.test(line)) return true;
-  // Fenced code block opener.
-  if (/^ {0,3}(?:`{3,}|~{3,})/.test(line)) return true;
+  // Fenced code block opener. A backtick fence's info string cannot itself
+  // contain a backtick (mirrors the top-level fence-open check above); a
+  // tilde fence has no such restriction. Without this, a line like
+  // "```foo`bar" -- not a valid fence opener -- would wrongly end the
+  // search early, exactly the class of bug this boundary exists to avoid.
+  if (/^ {0,3}`{3,}[^`]*$/.test(line)) return true;
+  if (/^ {0,3}~{3,}/.test(line)) return true;
   // Blockquote.
   if (/^ {0,3}>/.test(line)) return true;
-  // List item (unordered marker, or ordered marker up to 9 digits).
-  if (/^ {0,3}(?:[-+*](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$))/.test(line)) return true;
+  // List item: unordered marker, or an ordered marker whose start number is
+  // exactly 1 -- CommonMark allows an ordered list to interrupt a paragraph
+  // ONLY when it starts at 1 ("2. item" does not interrupt, and a real code
+  // span may legitimately cross such a line).
+  if (/^ {0,3}(?:[-+*](?:[ \t]|$)|1[.)](?:[ \t]|$))/.test(line)) return true;
   // Setext heading underline (contiguous "=" or "-", nothing else) and
   // thematic break (3+ of the same "-", "_", or "*", each optionally
   // followed by spaces/tabs). A line of dashes can satisfy both; either
