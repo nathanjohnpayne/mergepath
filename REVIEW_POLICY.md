@@ -503,7 +503,7 @@ Readiness validation is event-driven rather than runner-polled. Three triggers r
 
 #### Phase 4b: Manual CLI Fallback (Human Handoff)
 
-Phase 4b is invoked when Phase 4a **times out** (single timeout, exit code `4` from `codex-review-request.sh`) or when `codex.enabled: false` in the repo. It preserves the cross-agent review flow that existed before the Codex GitHub App integration and provides a human-mediated escape hatch.
+Phase 4b is invoked when Phase 4a **falls back**: `codex-review-request.sh` exits `4` after either a single timeout (`blocked_reason: null`) or a provider-authored account/connection block (`blocked_reason: "usage_limit" | "not_connected"`), or `codex.enabled: false` in the repo. The later `codex-review-check.sh --diagnostic-signal-only` probe separately maps that same provider-authored account/connection evidence to exit `2` inside the Phase 4b barrier; that diagnostic contract does not change the request helper's exit-`4` contract. Phase 4b preserves the cross-agent review flow that existed before the Codex GitHub App integration and provides a human-mediated escape hatch.
 
 It is **not** the destination for disagreement or runaway. Those are review-did-not-converge outcomes and take the human-tiebreaker route instead; routing them here would let the automated leg approve a review that never converged.
 
