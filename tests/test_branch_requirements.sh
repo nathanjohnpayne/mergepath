@@ -233,6 +233,33 @@ enc_case "a space is escaped"                   'my branch'     'my%20branch'
 enc_case "plain names are untouched"            'main'          'main'
 enc_case "non-ASCII is UTF-8 percent-encoded"   'feat/ü'        'feat/%C3%BC'
 
+# ── 9b. A 2xx carrying a JSON OBJECT instead of the documented array is an
+# unread surface, not an empty one. Without a shape check the filter returns
+# `[]` with exit 0 — `add` yields the object, `.[]?` iterates its values, and
+# `objects` discards the scalars — so an error envelope would be recorded as
+# "this branch has no ruleset requirements" on the strength of an error body.
+out=$(GH_CLASSIC=ok GH_RULESETS=ok \
+  GH_RULESETS_BODY='{"message":"Server Error","status":"500"}' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "unknown" ] \
+   && printf '%s' "$out" | grep -q 'non-array'; then
+  pass "a 2xx object body is classified as an unread rulesets surface, not an empty one"
+else
+  fail "non-array rulesets page: expected unknown naming the shape, got $out"
+fi
+
+# The documented array shape still resolves normally.
+out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_BODY="$RULESET_ONE" \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "known" ] \
+   && [ "$(field "$out" '.contexts | join(",")')" = "build" ]; then
+  pass "the shape check does not disturb a well-formed rulesets response"
+else
+  fail "well-formed rulesets after the shape check: expected known/[build], got $out"
+fi
+
 # ── 10. Each surface is retried once before being given up on, so a single
 # transient blip does not degrade the whole resolution to unknown (both
 # surfaces are needed for `known`, which makes one blip otherwise expensive).

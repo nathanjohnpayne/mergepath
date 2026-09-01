@@ -275,7 +275,18 @@ br_required_checks() {
   # which is a successful read of "no ruleset requirements", not a failure.
   if rulesets_out="$(_br_retry gh api --paginate "repos/$repo/rules/branches/$branch_enc" 2>"$errfile")"; then
     if rulesets_ctx="$(printf '%s' "$rulesets_out" | jq -c -s '
-        add // []
+        # Every page must be the documented ARRAY. A 2xx carrying a JSON
+        # OBJECT instead — an error envelope — would otherwise pass silently:
+        # `add` yields that object, `.[]?` then iterates its VALUES, `objects`
+        # discards the scalar ones, and the filter returns `[]` with exit 0.
+        # The surface would be marked readable-and-empty on the strength of an
+        # error body, which is the conflation this lib exists to remove. jq
+        # `error` exits non-zero, so the caller records it as an unread surface.
+        if (map(type != "array") | any)
+        then error("rules/branches returned a non-array page (\(map(type) | unique | join(",")))")
+        else .
+        end
+        | add // []
         | [ .[]? | objects
             | select(.type == "required_status_checks")
             | .parameters.required_status_checks[]?
