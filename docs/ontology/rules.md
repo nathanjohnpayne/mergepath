@@ -681,7 +681,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-99.** Approved-wave fan-out mirrors carry the CodeRabbit-ignore marker and no Codex trigger. ○ — docs/agents/propagation-ordering.md
 
-**G-100.** The canary keeps the full advisory CodeRabbit pass. ○ — docs/agents/propagation-ordering.md
+**G-100.** The canary keeps the full advisory CodeRabbit pass, except where the canary's own repo has CodeRabbit disabled — then the leg is recorded unavailable in the wave tracker rather than assumed. ○ — docs/agents/propagation-ordering.md
 
 **G-101.** Consumer-specific divergence goes through overrides, facts, or exclusions with a reason — never a hand edit. ● — docs/agents/propagation-ordering.md
 
