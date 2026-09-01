@@ -16,7 +16,20 @@ permissions:
   checks: write
   contents: read
   issues: write
-  pull-requests: read
+  # `pull-requests: write`, not just `issues: write`, is what authorises this
+  # job's comment POSTs. Every `repos/{repo}/issues/{n}/comments` write here
+  # targets a PULL REQUEST, and for a GitHub App installation token — which
+  # `secrets.GITHUB_TOKEN` is — GitHub routes that endpoint by the target's
+  # kind: the `issues` scope covers real issues, the `pull-requests` scope
+  # covers pull requests. The shared REST path makes `issues: write` look
+  # sufficient; it is not. With `pull-requests: read` the archive-record and
+  # relay-marker POSTs both 403 `Resource not accessible by integration`,
+  # which fails the relay closed and leaves the REQUIRED `Codex P1 unresolved
+  # threads` context red on every affected PR — repo-wide merge blockage from
+  # a scope that reads as already-granted. `pr-review-policy.yml` is the
+  # control case: it posts PR comments under the exact inverse map
+  # (`pull-requests: write` + `issues: read`) and has never hit this.
+  pull-requests: write
   # Required for scripts/codex-p1-gate.sh's scripts/review-feedback-
   # accounting.sh call, which reads code-scanning/alerts to grade a
   # github-advanced-security[bot] finding's severity (#1101). Without it,
