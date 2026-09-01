@@ -1514,10 +1514,24 @@ else
   fail "#1064: the rollup does not carry the producing app id, so the collapse cannot separate independently required producers"
 fi
 
-if grep -q 'group_by(\[.label, .appId\])' <<<"$SCRIPT_CODE_1064"; then
-  pass "#1064: duplicate runs collapse per (name, app) — same-app republishes merge, distinct required apps stay separate"
+# The app is part of the collapse key ONLY where the requirement is pinned to
+# one. A ruleset rule with integration_id: null accepts the context from ANY
+# producer, and classic protection cannot expose its pinning to an
+# unprivileged reader at all — splitting either per app would make every
+# publishing app separately mandatory and block merges GitHub permits.
+if grep -q 'pinned_contexts' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'index($e.label)) != null then $e.appId else ""' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: the collapse splits per app only for app-pinned requirements, and per name otherwise"
 else
-  fail "#1064: the collapse key is not (name, app) — by bare name it hides a second required app failure, by workflow it blocks PRs GitHub merges"
+  fail "#1064: the collapse key ignores whether the requirement is app-pinned — splitting an any-producer context per app blocks PRs GitHub merges"
+fi
+
+# The element must be bound before the $pinned_contexts sub-pipeline; a bare
+# .label inside it indexes the array and hard-errors the whole filter.
+if grep -q 'group_by(. as $e' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: the collapse key binds the element before indexing the pinned-context list"
+else
+  fail "#1064: the collapse key dereferences .label inside a sub-pipeline where . is the pinned-context array"
 fi
 
 # A required context with NO rollup entry forms no group, so the collapse

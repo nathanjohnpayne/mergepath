@@ -1539,6 +1539,10 @@ REQUIRED_CHECK_NAMES=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '(.contex
 # Requirements whose producing app is knowable (ruleset-sourced only — see the
 # missing-check scan below for why classic cannot contribute here).
 REQUIRED_PAIRS_JSON=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -c '(.required_pairs // [])')
+# Context names whose requirement is PINNED to a specific producing app. Only
+# these may be split per app when collapsing duplicate runs; see the collapse
+# for why an unpinned or unknowable requirement must not be.
+PINNED_CONTEXTS_JSON=$(printf '%s' "$REQUIRED_PAIRS_JSON" | jq -c '[.[] | .context] | unique')
 
 if [ "$BRANCH_REQUIREMENTS_STATE" = "known" ]; then
   protection_readable=1
@@ -1574,7 +1578,19 @@ if [ "$protection_readable" -eq 0 ]; then
   # normally have already exited 3 at the retry-wrapped statusCheckRollup read
   # above, so reaching here at all is a strong signal something is actually
   # wrong — and #465's fail-closed answer is the right one for it.
-  log "gate (a): WARNING — could not resolve the required-check list for $BASE_BRANCH from EITHER rule surface (classic protection via GraphQL, or rulesets via REST). Both are readable by a plain write-scoped token, so this is not a permission shape — it is an API or network fault, usually transient and worth retrying before touching credentials. Failing closed: every non-skipped rollup check must be green (#465). Details: $BRANCH_REQUIREMENTS_ERRORS"
+  # The warning must match which surfaces actually failed. A partial read
+  # reaches this same arm — the union cannot be established from one surface —
+  # so asserting that neither answered, and that the cause cannot be
+  # permission-related, would contradict the partial diagnostic logged above
+  # and point an operator at the wrong remediation. A single unreadable surface
+  # CAN be an authorization failure (a rulesets read denied while the classic
+  # read succeeds); only the both-failed case rules that out, because both
+  # surfaces are readable by a plain write-scoped token.
+  if [ "$BRANCH_REQUIREMENTS_PARTIAL" = "1" ]; then
+    log "gate (a): WARNING — could not resolve the required-check list for $BASE_BRANCH: one rule surface answered ($BRANCH_REQUIREMENTS_SURFACES) and the other did not, so the union of classic protection and rulesets is unknown. A single unreadable surface can be an authorization failure as well as a transient one — check the detail below before assuming either. Failing closed: every non-skipped rollup check must be green (#465). Details: $BRANCH_REQUIREMENTS_ERRORS"
+  else
+    log "gate (a): WARNING — could not resolve the required-check list for $BASE_BRANCH from EITHER rule surface (classic protection via GraphQL, or rulesets via REST). Both are readable by a plain write-scoped token, so a total failure is not a permission shape — it is an API or network fault, usually transient and worth retrying before touching credentials. Failing closed: every non-skipped rollup check must be green (#465). Details: $BRANCH_REQUIREMENTS_ERRORS"
+  fi
   REQUIRED_JSON='[]'
 elif [ -z "$REQUIRED_CHECK_NAMES" ]; then
   # Read SUCCEEDED and the branch genuinely requires no status checks (an
@@ -1621,7 +1637,8 @@ fi
 BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
   --argjson required_names "${REQUIRED_JSON:-[]}" \
   --arg approval_readiness_only "$APPROVAL_READINESS_ONLY" \
-  --arg current_run_id "$CURRENT_RUN_ID" '
+  --arg current_run_id "$CURRENT_RUN_ID" \
+  --argjson pinned_contexts "${PINNED_CONTEXTS_JSON:-[]}" '
   [.statusCheckRollup[]
     | {
         label: (.name // .context // "?"),
@@ -1703,25 +1720,36 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
   # for CI would have reported that PR red — precisely the fleet-wide
   # over-restriction the acceptance criteria on #1064 forbid.
   #
-  # Group by (NAME, PRODUCING APP) — GitHub own unit of requirement, since
-  # protection requires a context from a specific app. Two consequences, both
-  # measured rather than assumed:
+  # Collapse duplicate runs per NAME, and additionally per PRODUCING APP only
+  # where the requirement is provably PINNED to an app.
   #
-  #   Same app, several workflows → ONE group. On nathanpaynedotcom#908 three
-  #   required contexts are each emitted by two workflows under app 15368
-  #   (agent-review.yml republishes what the dedicated gate workflows publish)
-  #   against a protection entry listing each context once. Keying on workflow
-  #   would demand both be green and block PRs GitHub merges — the fleet-wide
-  #   over-restriction that caused the #1061 revert.
+  # Never by workflow. On nathanpaynedotcom#908 three required contexts are
+  # each emitted by two workflows under the SAME app 15368 (agent-review.yml
+  # republishes what the dedicated gate workflows publish) against protection
+  # entries listing each context once. Keying on workflow would demand both be
+  # green and block PRs GitHub merges — the over-restriction that caused the
+  # #1061 revert.
   #
-  #   Different apps, both required → SEPARATE groups, each judged. When
-  #   protection lists one context under two app ids they are independently
-  #   required, and collapsing them would let one app SUCCESS hide the other
-  #   app FAILURE. `scripts/merge-clearance-gate.sh` accounts for the same
-  #   multi-producer configuration.
+  # Per app WHEN PINNED: when a ruleset requires one context from two distinct
+  # apps they are independently required, and collapsing them would let one app
+  # SUCCESS hide the other app FAILURE.
+  #
+  # Per name OTHERWISE, and that distinction is load-bearing rather than
+  # incidental. A ruleset rule with `integration_id: null` accepts the context
+  # from ANY producer, so GitHub is satisfied by the latest run whoever
+  # published it; splitting those per app would make every publishing app
+  # separately mandatory and block on an app whose later sibling already
+  # satisfied the requirement. Classic protection lands here too, by necessity:
+  # it does pin an app, but `RefUpdateRule.requiredStatusCheckContexts` exposes
+  # bare strings and the object carrying app identity needs
+  # `Administration:read` — the scope this change exists to avoid. Splitting an
+  # unknown-pinning requirement per app would be guessing in the direction that
+  # blocks merges GitHub permits, which acceptance criterion 4 on #1064
+  # forbids, so unknown collapses by name.
   #
   # A foreign app that is NOT required never reaches here — the isRequired
-  # filter above drops it.
+  # filter above drops it — so the name-collapse case is already scoped to runs
+  # GitHub counts.
   #
   # The winner rule is the one #655 round 13 already blessed for the annex scan —
   # a still-non-terminal entry always wins over any completed sibling
@@ -1733,7 +1761,13 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
   # the projection above emits "" rather than null for a missing timestamp,
   # and "" is truthy in jq, so `.completedAt // .startedAt` would keep the
   # empty string and sort every terminal entry as equal.
-  | group_by([.label, .appId])
+  # The element is bound to $e before the `$pinned_contexts | …` sub-pipeline
+  # for the same reason `$label_name` is bound above: inside it `.` rebinds to
+  # the literal array, so a bare `.label` would index an array with a string
+  # and hard-error the whole filter.
+  | group_by(. as $e
+             | [ $e.label,
+                 (if ($pinned_contexts | index($e.label)) != null then $e.appId else "" end) ])
   | [ .[]
       | (map(select(
             # `.result` is bound BEFORE the `["PENDING","EXPECTED"] | …`
