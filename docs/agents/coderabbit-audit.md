@@ -58,13 +58,14 @@ If we ever target such bases and want CodeRabbit on them, the base (or a regex l
 
 `learnings.scope` controls where CodeRabbit's accumulated review-preference "learnings" are stored and applied. Allowed values: `local` (this repo only), `global` (shared across the whole org/owner), `auto` (= `local` for **public** repos, `global` for **private** repos).
 
-We keep `auto`. As of **2026-07-06 the entire fleet is public** — matchline, overridebroadway, and tadlockpsychiatry were private earlier in the fleet's history and have since been made public — so `auto` resolves to **`local`** for every consumer and the template repo alike:
+We keep `auto`. **This is no longer a uniformly-public fleet, and the resolution is no longer uniform.** From 2026-07-06 until 2026-09-01 every consumer was public, so `auto` resolved to `local` everywhere; on 2026-09-01 the monthly propagation-order review measured `device-source-of-truth` as **private**, and `auto` resolves to **`global`** for a private repo. That repo's learnings are therefore shared across the `nathanjohnpayne` owner boundary while the other seven stay local:
 
 | Visibility | Consumers | `auto` resolves to |
 |---|---|---|
-| Public (all 8) | matchline, overridebroadway, tadlockpsychiatry, device-source-of-truth, friends-and-family-billing, swipewatch, nathanpaynedotcom, fiveacross | `local` |
+| Public (7) | matchline, overridebroadway, tadlockpsychiatry, friends-and-family-billing, swipewatch, nathanpaynedotcom, fiveacross | `local` |
+| Private (1, as of 2026-09-01) | device-source-of-truth | `global` |
 
-So no consumer currently shares learnings org-wide — each repo's learnings stay local to that repo. (Historically, while three consumers were private, `auto` gave *those* repos `global`, and the single-owner `nathanjohnpayne` fleet shared review conventions across them; that was deliberate, not a leak — learnings stay within one account's org boundary and CodeRabbit does not use code for model training, FAQ § Data Security — but it no longer applies now the fleet is uniformly public.) If cross-repo convention sharing is later wanted across the public fleet, it would take an explicit `scope: global` override — `auto` will not grant `global` to a public repo. We keep `auto` because it is the correct low-surprise default that needs no per-repo maintenance as visibility changes.
+So exactly one consumer currently shares learnings owner-wide: `device-source-of-truth`, by virtue of being private. That is the same posture three consumers had earlier in the fleet's history, and it is deliberate rather than a leak — learnings stay within one account's owner boundary and CodeRabbit does not use code for model training (FAQ § Data Security). It does mean a reader cannot assume `auto` implies `local` here any more; check the repo's visibility first. If uniform `local` is ever wanted regardless of visibility, that takes an explicit `scope: local` override on the private repo. If cross-repo convention sharing is later wanted across the public fleet, it would take an explicit `scope: global` override — `auto` will not grant `global` to a public repo. We keep `auto` because it is the correct low-surprise default that needs no per-repo maintenance as visibility changes.
 
 ### `path_instructions` — matches doc guidance (no action)
 

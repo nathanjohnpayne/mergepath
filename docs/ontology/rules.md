@@ -1129,7 +1129,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-297.** A PR against a non-default base is not auto-reviewed; a workflow targeting one must add that base to the base-branches list in that repo's own config. ● — docs/agents/coderabbit-audit.md
 
-**G-298.** Learnings scope stays `auto` (resolving local for the all-public fleet); org-wide sharing would require an explicit global override, never an accident of visibility. ● — docs/agents/coderabbit-audit.md
+**G-298.** Learnings scope stays `auto`, which resolves per repo by visibility — `local` for a public repo, `global` for a private one — so the resolution is read off the repo's current visibility rather than assumed uniform across the fleet. ● — docs/agents/coderabbit-audit.md
 
 **G-299.** Path instructions are targeted supplements added on an observed miss, never speculative additions. ○ — docs/agents/coderabbit-audit.md
 
