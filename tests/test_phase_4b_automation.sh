@@ -2813,6 +2813,28 @@ _comments="$(_p4a_comments "$_p4a_marker" "$_p4a_author" | jq -c '.[0].created_a
 [ "$(_p4a_state "$_p4a_head" "$_comments")" = malformed ] || bad="$bad later-trigger"
 _comments="$(jq -cn --argjson one "$(_p4a_comments "$_p4a_marker" "$_p4a_author")" '$one + [$one[1] + {id:4103}]')"
 [ "$(_p4a_state "$_p4a_head" "$_comments")" = current ] || bad="$bad idempotent-duplicate"
+# A future-version marker with the same canonical field envelope can be
+# scoped to its claimed head without understanding that version's semantics.
+# It must remain fail-closed on the head it names, but must not permanently
+# wedge every later head or override an independently valid current record.
+_p4a_old_v2="<!-- mergepath-phase-4a-terminal:v2 provider=codex outcome=timeout head=$_p4a_old trigger_comment_id=$_p4a_trigger_id -->"
+_comments="$(_p4a_comments "$_p4a_old_v2" "$_p4a_author")"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = stale ] || bad="$bad stale-future-version"
+_comments="$(jq -cn \
+  --argjson current "$(_p4a_comments "$_p4a_marker" "$_p4a_author")" \
+  --arg old_v2 "$_p4a_old_v2" --arg who "$_p4a_author" \
+  '$current + [{id:4103,user:{login:$who},body:$old_v2,created_at:"2026-08-29T00:15:00Z"}]')"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = current ] || bad="$bad stale-future-overrode-current"
+_comments="$(jq -cn \
+  --argjson current "$(_p4a_comments "$_p4a_marker" "$_p4a_author")" \
+  --arg marker "<!-- mergepath-phase-4a-terminal:damaged -->" --arg who "$_p4a_author" \
+  '$current + [{id:4103,user:{login:$who},body:$marker,created_at:"2026-08-29T00:15:00Z"}]')"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = current ] || bad="$bad damaged-history-overrode-current"
+_comments="$(jq -cn \
+  --argjson current "$(_p4a_comments "$_p4a_marker" "$_p4a_author")" \
+  --arg head "$_p4a_head" --arg who "$_p4a_author" \
+  '$current + [{id:4103,user:{login:$who},body:("<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=" + $head + " trigger_comment_id=4999 -->"),created_at:"2026-08-30T00:16:00Z"}]')"
+[ "$(_p4a_state "$_p4a_head" "$_comments")" = malformed ] || bad="$bad bad-binding-lost-to-current"
 if [ -z "$bad" ]; then
   pass "#1085: Phase 4a timeout evidence is exact-head, author/trigger-bound, and fail-closed on malformed input"
 else

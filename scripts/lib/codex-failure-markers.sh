@@ -94,6 +94,12 @@ codex_failure_marker_of() {
 # the writer's readback and Phase 4b cannot drift on marker semantics.
 CODEX_PHASE4A_TERMINAL_MARKER_PREFIX='<!-- mergepath-phase-4a-terminal:'
 CODEX_PHASE4A_TIMEOUT_MARKER_RE='^<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=(?<head>(?:[0-9a-f]{40}|[0-9a-f]{64})) trigger_comment_id=(?<trigger>[1-9][0-9]*) -->$'
+# A reader may encounter a later numeric marker version during propagation
+# skew. This wider envelope is never clearance: it extracts only enough of
+# the canonical shape to prove that an otherwise-unknown record names a
+# different head. Without independent valid current-head evidence, unknown
+# records on this head (or without this exact shape) still fail closed.
+CODEX_PHASE4A_TIMEOUT_MARKER_HEAD_HINT_RE='^<!-- mergepath-phase-4a-terminal:v[0-9]+ provider=codex outcome=timeout head=(?<head>(?:[0-9a-f]{40}|[0-9a-f]{64})) trigger_comment_id=[1-9][0-9]* -->$'
 
 codex_phase4a_full_sha_ok() {
   local head=${1-}
@@ -134,18 +140,23 @@ codex_phase4a_trigger_comment_present() {
 # Emits one JSON object with state:
 #   current    at least one valid marker for <head>, bound to a preceding
 #              exact author trigger; duplicate valid records are idempotent.
-#   stale      valid marker grammar exists, but only for another head.
+#   stale      valid marker grammar exists only for another head, or a
+#              future numeric version with the canonical field envelope can
+#              be proven to name only another head.
 #   none       no trusted marker candidate exists (including forged/quoted).
-#   malformed  a trusted marker candidate has unknown/bad grammar, or a
-#              current-head record is not bound to its claimed trigger.
+#   malformed  without independent valid current-head evidence, a trusted
+#              marker candidate has unknown/unscoped/current bad grammar; or
+#              a current-head v1 record is not bound to its claimed trigger.
 #
 # A candidate must BEGIN with the hidden-marker namespace. That means quoting
 # a marker in ordinary prose cannot create either evidence or a denial of
 # service. Once the trusted author deliberately begins a comment with the
 # namespace, however, malformed evidence fails closed rather than degrading to
-# absence. A stale, parseable marker does not validate its old trigger because
-# it cannot waive this head either way; this prevents obsolete damaged history
-# from wedging every later head on the PR.
+# absence. An independently valid, bound current-head record wins over damaged
+# siblings. A stale v1 marker, or an unknown numeric version whose canonical
+# envelope proves it names another head, does not validate its old trigger
+# because it cannot waive this head either way; this prevents obsolete damaged
+# history and propagation skew from wedging every later head on the PR.
 codex_phase4a_timeout_marker_state() {
   local head=${1-} author=${2-} comments=${3-}
   if ! codex_phase4a_full_sha_ok "$head" || [ -z "$author" ]; then
@@ -157,7 +168,8 @@ codex_phase4a_timeout_marker_state() {
     --arg head "$head" \
     --arg who "$author" \
     --arg prefix "$CODEX_PHASE4A_TERMINAL_MARKER_PREFIX" \
-    --arg re "$CODEX_PHASE4A_TIMEOUT_MARKER_RE" '
+    --arg re "$CODEX_PHASE4A_TIMEOUT_MARKER_RE" \
+    --arg hint_re "$CODEX_PHASE4A_TIMEOUT_MARKER_HEAD_HINT_RE" '
     if type != "array" then
       {state:"malformed",reason:"comments-json"}
     else
@@ -181,9 +193,16 @@ codex_phase4a_timeout_marker_state() {
       | [ $candidates[]
           | ((try (.normalized_body | capture($re)) catch null) // null) as $match
           | select($match == null)
-          | (.id // null)
+          | ((try (.normalized_body | capture($hint_re)) catch null) // null) as $hint
+          | {
+              comment_id: (.id // null),
+              head_hint: ($hint.head // null)
+            }
         ] as $bad_schema
       | [ $parsed[] | select(.head == $head) ] as $on_head
+      | [ $bad_schema[]
+          | select(.head_hint == null or .head_hint == $head)
+        ] as $bad_schema_relevant
       | [ $on_head[]
           | . as $marker
           | select(
@@ -202,13 +221,13 @@ codex_phase4a_timeout_marker_state() {
                   ] | length == 0)
             )
         ] as $bad_binding
-      | if ($bad_schema | length) > 0 then
-          {state:"malformed",reason:"schema",comment_id:$bad_schema[0]}
-        elif ($bad_binding | length) > 0 then
+      | if ($bad_binding | length) > 0 then
           {state:"malformed",reason:"trigger-binding",comment_id:$bad_binding[0].marker_id}
         elif ($on_head | length) > 0 then
           {state:"current",marker_id:$on_head[0].marker_id,trigger_comment_id:$on_head[0].trigger_comment_id}
-        elif ($parsed | length) > 0 then
+        elif ($bad_schema_relevant | length) > 0 then
+          {state:"malformed",reason:"schema",comment_id:$bad_schema_relevant[0].comment_id}
+        elif (($parsed | length) > 0 or ($bad_schema | length) > 0) then
           {state:"stale"}
         else
           {state:"none"}
