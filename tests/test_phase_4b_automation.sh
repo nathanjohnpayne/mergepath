@@ -3330,8 +3330,9 @@ fi
 # A pre-side-effect hold must leave NO accounting trace. Evaluate the full
 # barrier once before the adapter, then revalidate only a timeout-derived Codex
 # waiver immediately afterward. A second targeted recheck belongs immediately
-# before the review POST; it owns explicit cleanup for the accounting/issues
-# that necessarily precede it. Neither targeted read re-probes CodeRabbit.
+# before the final live-head fence and review POST; it owns explicit cleanup
+# for the accounting/issues that necessarily precede it. Neither targeted read
+# re-probes CodeRabbit.
 # The ordering must be anchored on the CALL SITE, not on the helper reference
 # inside run_same_head_barrier's definition (CodeRabbit on #842). That
 # definition sits near the top of the file, so its line number is below the
@@ -3350,6 +3351,7 @@ _post_adapter_line="$(grep -n '^  revalidate_phase4a_timeout_generation post-ada
 _issue_line="$(grep -n '^[[:space:]]*_pri_out="$(p4b_file_post_review_issues ' "$ORCH" | cut -d: -f1)"
 _first_loop_line="$(grep -n '^[[:space:]]*if p4b_acct_hook_record_loop ' "$ORCH" | head -1 | cut -d: -f1)"
 _pre_post_line="$(grep -n '^  revalidate_phase4a_timeout_generation pre-post$' "$ORCH" | cut -d: -f1)"
+_live_head_line="$(grep -n '^  live_head="$(gh_api_scalar --shape sha "live PR head for ' "$ORCH" | tail -1 | cut -d: -f1)"
 _payload_line="$(grep -n '^  payload_file="$(mktemp ' "$ORCH" | cut -d: -f1)"
 if [ "$n_eval" = "1" ] && [ "$n_call" = "1" ] && [ "$_n_timeout_recheck" = "2" ] \
    && [ "$_full_barrier_line" -lt "$_adapter_line" ] \
@@ -3358,10 +3360,11 @@ if [ "$n_eval" = "1" ] && [ "$n_call" = "1" ] && [ "$_n_timeout_recheck" = "2" ]
    && [ "$_post_adapter_line" -lt "$_first_loop_line" ] \
    && [ "$_issue_line" -lt "$_pre_post_line" ] \
    && [ "$_first_loop_line" -lt "$_pre_post_line" ] \
-   && [ "$_pre_post_line" -lt "$_payload_line" ]; then
-  pass "#814/#1085: full barrier precedes the adapter; targeted timeout reads fence the first side effect and final review POST"
+   && [ "$_pre_post_line" -lt "$_live_head_line" ] \
+   && [ "$_live_head_line" -lt "$_payload_line" ]; then
+  pass "#814/#1085: full barrier precedes the adapter; targeted timeout reads fence the first side effect, final live-head read, and review POST"
 else
-  fail "#814/#1085: barrier/recheck ordering drifted (barrier=$_full_barrier_line adapter=$_adapter_line validate=$_validate_line post-adapter=$_post_adapter_line issue=$_issue_line loop=$_first_loop_line pre-post=$_pre_post_line payload=$_payload_line; evals=$n_eval calls=$n_call rechecks=$_n_timeout_recheck)"
+  fail "#814/#1085: barrier/recheck ordering drifted (barrier=$_full_barrier_line adapter=$_adapter_line validate=$_validate_line post-adapter=$_post_adapter_line issue=$_issue_line loop=$_first_loop_line pre-post=$_pre_post_line live-head=$_live_head_line payload=$_payload_line; evals=$n_eval calls=$n_call rechecks=$_n_timeout_recheck)"
 fi
 
 # Behavioral form of the adapter-window race. The first timeline read carries

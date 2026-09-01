@@ -1101,6 +1101,16 @@ post_review() {
     --request-changes) event="REQUEST_CHANGES" ;;
     *) p4b_die 3 "unsupported review state flag: $state_flag" ;;
   esac
+  # The post-adapter recheck protects every earlier approval-side effect, but
+  # rendering, accounting, and optional step-9 issue filing leave another
+  # window before the review POST. Close it with one final targeted generation
+  # read before the final live-head fence. On a hold, the helper corrects the
+  # provisional accounting record and closes this run's filed follow-ups before
+  # exiting; malformed evidence takes the same cleanup path before the manual
+  # fallback. This is deliberately not the full provider barrier, so an
+  # unrelated late CodeRabbit probe cannot flap a verdict whose ordering
+  # evidence was already established.
+  revalidate_phase4a_timeout_generation pre-post
   local live_head
   # #799: the last drift check before a review POSTS. An unreadable read that
   # arrived as a JSON blob compared unequal to $HEAD and took the
@@ -1122,15 +1132,6 @@ post_review() {
     fi
     fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
   fi
-  # The post-adapter recheck protects every earlier approval-side effect, but
-  # rendering, accounting, and optional step-9 issue filing leave another
-  # window before the review POST. Close it with one final targeted generation
-  # read. On a hold, the helper corrects the provisional accounting record and
-  # closes this run's filed follow-ups before exiting; malformed evidence takes
-  # the same cleanup path before the manual fallback. This is deliberately not
-  # the full provider barrier, so an unrelated late CodeRabbit probe cannot
-  # flap a verdict whose ordering evidence was already established.
-  revalidate_phase4a_timeout_generation pre-post
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"
