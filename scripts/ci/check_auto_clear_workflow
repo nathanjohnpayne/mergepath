@@ -12,6 +12,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORKFLOW="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
 CONTINUATION_TEST="$ROOT/tests/test_approval_merge_continuation.sh"
+CONTINUATION="$ROOT/scripts/workflow/approval-merge-continuation.sh"
 CONTINUATION_REPORTER="$ROOT/scripts/workflow/report-approval-continuation-failures.sh"
 
 pass=0
@@ -24,6 +25,16 @@ echo "auto-clear-blocking-labels.yml structural tests"
 if [ ! -f "$WORKFLOW" ]; then
   echo "  FAIL: $WORKFLOW does not exist" >&2
   exit 1
+fi
+
+if [ -f "$CONTINUATION" ] \
+   && ! grep -Fq -- '--disable-auto' "$CONTINUATION" \
+   && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' "$CONTINUATION"; then
+  pass=$((pass + 1))
+  echo "  PASS: approval cleanup is read-only and contains no native merge/disable write"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: approval cleanup must never issue an unconditional native merge/disable write" >&2
 fi
 
 # Parse via yq (preferred — no extra deps needed in GitHub-hosted
@@ -57,7 +68,7 @@ fi
 # ── Test 2: required triggers present
 # Codex P1 on PR #202 r1: workflow_run replaces check_suite (which
 # doesn't fire for Actions-created suites).
-for trig in 'pull_request_target' 'pull_request_review' 'workflow_run'; do
+for trig in 'pull_request_target' 'workflow_run'; do
   if grep -qE "^[[:space:]]+${trig}:" "$WORKFLOW"; then
     pass=$((pass + 1))
     echo "  PASS: trigger '$trig' configured"
@@ -66,6 +77,25 @@ for trig in 'pull_request_target' 'pull_request_review' 'workflow_run'; do
     echo "  FAIL: missing required trigger '$trig'" >&2
   fi
 done
+
+# pull_request_review runs on the PR merge ref. Keeping that trigger in a
+# workflow that names the queue-policy environment would let a same-repo PR
+# rewrite the workflow definition and request administrator credentials.
+if grep -qE "^[[:space:]]+pull_request_review:" "$WORKFLOW"; then
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request_review trigger must remain absent from the queue-credential workflow" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: pull_request_review is routed through trusted workflow_run before queue credentials are available"
+fi
+
+if [ "$(grep -cE '^[[:space:]]+environment: merge-queue-policy$' "$WORKFLOW")" -eq 2 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both trusted jobs bind queue credentials through the main-only merge-queue-policy environment"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: both trusted queue-credential jobs must name the merge-queue-policy environment" >&2
+fi
 
 # Negative: workflow_run is the canonical post-CI signal. check_suite
 # would silently fail to fire for GitHub-Actions-created suites.
@@ -230,8 +260,15 @@ clear_block_protects_before_delete() {
   failure_line=$(grep -nF 'if [ "$protective_rc" -ne 0 ]; then' <<<"$block" | head -1 | cut -d: -f1 || true)
   delete_line=$(grep -nF 'del_out=$(gh api "repos/$REPO/issues/$PR/labels/needs-external-review" -X DELETE' <<<"$block" | head -1 | cut -d: -f1 || true)
   grep -Fq 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$block" \
+    && grep -Fq 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$block" \
+    && grep -Fq 'QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}' <<<"$block" \
+    && grep -Fq 'QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}' <<<"$block" \
     && grep -Fq 'GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}' <<<"$block" \
-    && grep -Fq 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$block" \
+    && grep -Fq 'GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$block" \
+    && grep -Fq 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$block" \
+    && grep -Fq 'MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN"' <<<"$block" \
+    && ! grep -Fq -- '--disable-auto' <<<"$block" \
+    && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' <<<"$block" \
     && [ -n "$protect_line" ] && [ -n "$failure_line" ] && [ -n "$delete_line" ] \
     && [ "$protect_line" -lt "$failure_line" ] \
     && [ "$failure_line" -lt "$delete_line" ] \
@@ -240,14 +277,14 @@ clear_block_protects_before_delete() {
 if clear_block_protects_before_delete "$clear_block" \
    && clear_block_protects_before_delete "$scheduled_clear_block"; then
   pass=$((pass + 1))
-  echo "  PASS: both label-clear paths retract with the workflow token before PAT-backed blocker deletion"
+  echo "  PASS: both label-clear paths require read-only arm classification before PAT-backed blocker deletion"
 else
   fail=$((fail + 1))
-  echo "  FAIL: every label-clear path must retract with github.token, fail closed, and retain the PAT for deleting needs-external-review" >&2
+  echo "  FAIL: every label-clear path must classify arms read-only, fail closed, and retain the PAT only for deleting needs-external-review" >&2
 fi
 
 # Execute both literal clear blocks against a token-aware stub. Structural
-# ordering alone cannot prove that a failed protective call actually skips the
+# ordering alone cannot prove that a failed arm-classification call skips the
 # DELETE, or that the ambient PAT still owns the label write that re-triggers
 # downstream workflows.
 clear_harness_dir=$(mktemp -d "${TMPDIR:-/tmp}/auto-clear-protection.XXXXXX")
@@ -326,6 +363,9 @@ run_clear_harness() {
       PATH="$clear_harness_dir/bin:$PATH" \
       GH_TOKEN=pat-token \
       WORKFLOW_TOKEN=workflow-token \
+      AUTHOR_TOKEN=author-token \
+      QUEUE_POLICY_TOKEN=queue-policy-token \
+      QUEUE_SOURCE_TOKEN=queue-source-token \
       REPO=owner/repo \
       PR_NUMBERS="$([ "$input_name" = PR_NUMBERS ] && printf 7)" \
       PRS="$([ "$input_name" = PRS ] && printf 7)" \
@@ -353,7 +393,7 @@ for clear_case in event scheduled; do
   clear_success_rc=$?
   set -e
   clear_success_calls=$(grep -E '^(protect|delete|comment):' \
-    "$clear_harness_dir/calls.log" | tr '\n' ' ')
+    "$clear_harness_dir/calls.log" | tr '\n' ' ' || true)
   if [ "$clear_success_rc" -ne 0 ] \
      || [ "$clear_success_calls" != \
           'protect:workflow-token delete:pat-token comment:pat-token ' ]; then
@@ -379,10 +419,10 @@ done
 
 if [ "$clear_execution_ok" -eq 1 ]; then
   pass=$((pass + 1))
-  echo "  PASS: both literal clear blocks protect before PAT deletion and skip all writes on protective failure"
+  echo "  PASS: both literal clear blocks classify arms before PAT deletion and skip all writes on classification failure"
 else
   fail=$((fail + 1))
-  echo "  FAIL: label-clear execution must use workflow-token protection, PAT deletion, and no writes after protective failure" >&2
+  echo "  FAIL: label-clear execution must use read-only arm classification, PAT deletion, and no writes after classification failure" >&2
 fi
 rm -rf "$clear_harness_dir"
 
@@ -398,9 +438,16 @@ if grep -qF 'echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITH
    && grep -qF "APPROVAL_PROTECTIVE_RETRACTION_V2" <<<"$event_continuation_block" \
    && grep -qF 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$event_continuation_block" \
    && grep -qF 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$event_continuation_block" \
-   && grep -qF 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$event_continuation_block" \
+   && grep -qF 'QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}' <<<"$event_continuation_block" \
+   && grep -qF 'QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}' <<<"$event_continuation_block" \
+   && grep -qF 'GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$event_continuation_block" \
    && grep -qF 'elif [ "$protective_rc" -eq 0 ]; then' <<<"$event_continuation_block" \
-   && grep -qF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN"' <<<"$event_continuation_block" \
+   && ! grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$AUTHOR_TOKEN"' <<<"$event_continuation_block" \
    && grep -qF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$event_continuation_block" \
    && [ -n "$event_protect_line" ] && [ -n "$event_no_author_line" ] && [ -n "$event_continue_line" ] \
    && [ "$event_protect_line" -lt "$event_no_author_line" ] \
@@ -411,9 +458,16 @@ if grep -qF 'echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITH
    && grep -qF "APPROVAL_PROTECTIVE_RETRACTION_V2" <<<"$scheduled_continuation_block" \
    && grep -qF 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$scheduled_continuation_block" \
    && grep -qF 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$scheduled_continuation_block" \
-   && grep -qF 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$scheduled_continuation_block" \
+   && grep -qF 'QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}' <<<"$scheduled_continuation_block" \
+   && grep -qF 'QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}' <<<"$scheduled_continuation_block" \
+   && grep -qF 'GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$scheduled_continuation_block" \
    && grep -qF 'elif [ "$protective_rc" -eq 0 ]; then' <<<"$scheduled_continuation_block" \
-   && grep -qF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN"' <<<"$scheduled_continuation_block" \
+   && ! grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$AUTHOR_TOKEN"' <<<"$scheduled_continuation_block" \
    && grep -qF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$scheduled_continuation_block" \
    && [ -n "$scheduled_protect_line" ] && [ -n "$scheduled_no_author_line" ] && [ -n "$scheduled_continue_line" ] \
    && [ "$scheduled_protect_line" -lt "$scheduled_no_author_line" ] \
@@ -491,11 +545,9 @@ else
   echo "  FAIL: workflow_run resolver missing the head_sha fallback (#730)" >&2
 fi
 
-# SECURITY: checkout MUST pin to default branch ref for
-# pull_request_review safety. CR Critical on PR #202 r2 — without
-# the explicit ref, a malicious PR could supply its own version of
-# scripts/codex-review-check.sh and have it run with this workflow's
-# pull-requests:write permissions.
+# SECURITY: checkout MUST pin to the default branch ref. The workflow routes
+# review events through workflow_run and receives queue credentials only from a
+# main-only environment; the checkout must preserve that trusted-code boundary.
 if grep -qF "ref: \${{ github.event.repository.default_branch }}" "$WORKFLOW"; then
   pass=$((pass + 1))
   echo "  PASS: checkout pinned to default_branch (security: blocks PR-controlled gate-script execution)"
@@ -762,7 +814,7 @@ dispatch() {
   local event_name="$1"
   local event_json="$2"
   case "$event_name" in
-    pull_request_target|pull_request_review)
+    pull_request_target)
       jq -r '.pull_request.number' <<<"$event_json"
       ;;
     workflow_run)
@@ -800,14 +852,15 @@ else
   echo "  FAIL: pull_request_target dispatch (got: $out)" >&2
 fi
 
-# pull_request_review → 1 PR
-out=$(dispatch pull_request_review '{"pull_request":{"number":99}}')
-if [ "$out" = "99" ]; then
+# pull_request_review is intentionally unsupported here; Agent Review
+# Pipeline completion supplies the trusted workflow_run event instead.
+out=$(dispatch pull_request_review '{"pull_request":{"number":99}}' 2>/dev/null)
+if [ -z "$out" ]; then
   pass=$((pass + 1))
-  echo "  PASS: pull_request_review resolves to PR number"
+  echo "  PASS: pull_request_review cannot enter the credentialed resolver directly"
 else
   fail=$((fail + 1))
-  echo "  FAIL: pull_request_review dispatch (got: $out)" >&2
+  echo "  FAIL: pull_request_review entered the credentialed resolver (got: $out)" >&2
 fi
 
 # workflow_run success → multiple PRs

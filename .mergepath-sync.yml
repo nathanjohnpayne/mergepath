@@ -368,6 +368,20 @@ paths:
   - path: scripts/lib/gh-api-array.sh
     type: canonical
     consumers: all
+  # #1058 native merge-queue boundary. These side-effect-free libraries are
+  # hard-sourced by the propagated queue workflows and the existing
+  # approval-cleanup lane, so they must travel atomically with those callers.
+  - path: scripts/lib/merge-queue-protection.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/review-policy-scalar.sh"
+  - path: scripts/lib/merge-queue-authorization.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-api-array.sh"
   # The Phase 2.5 invocation decision (#1084). Reads coderabbit.invoke and,
   # for `complex-changes`, defers to scripts/phase-4b-classifier.sh rather
   # than inventing a second notion of "complex" that would drift from the
@@ -1486,6 +1500,45 @@ paths:
       - "scripts/codex-review-check.sh"
       - "scripts/review-feedback-accounting.sh"
       - "scripts/resolve-pr-threads.sh"
+  # #1058 exact-head author authorization is recorded by trusted default-
+  # branch code. The merge-group bridge lives only in a separately protected
+  # organization policy repository; propagating a runnable target copy would
+  # put its YAML back under the synthetic merge-group commit's control.
+  - path: .github/workflows/merge-queue-authorization.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/record-merge-queue-authorization.sh"
+      - "scripts/lib/merge-queue-protection.sh"
+      - "scripts/lib/merge-queue-authorization.sh"
+      - "scripts/gh-as-author.sh"
+  # The source-pinned required workflow sends its one private-nonce request to
+  # this target-base responder. Propagate the workflow and recorder in the
+  # same wave: either one without the other makes every queue handshake fail
+  # closed after dispatch. The workflow's direct requires intentionally repeat
+  # the recorder's runtime closure because path-scoped propagation validates
+  # only the changed entry's own edges, not transitive requires.
+  - path: .github/workflows/merge-queue-final-audit.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/record-merge-queue-final-audit.sh"
+      - "scripts/lib/merge-queue-authorization.sh"
+      - "scripts/lib/merge-queue-protection.sh"
+      - "scripts/lib/blocking-labels.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/review-policy-scalar.sh"
+      - "scripts/gh-as-author.sh"
+  - path: scripts/workflow/record-merge-queue-final-audit.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/merge-queue-authorization.sh"
+      - "scripts/lib/merge-queue-protection.sh"
+      - "scripts/lib/blocking-labels.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/review-policy-scalar.sh"
+      - "scripts/gh-as-author.sh"
   - path: scripts/workflow/report-approval-continuation-failures.sh
     type: canonical
     consumers: all
@@ -1787,6 +1840,9 @@ paths:
       - "scripts/lib/gh-api-array.sh"             # #1094, final live review pagination
       - "scripts/lib/reviewers-helpers.sh"        # #1094, governing reviewer allow-list
       - "scripts/lib/blocking-labels.sh"          # #1094, final mutable label recheck
+      - "scripts/lib/merge-queue-protection.sh"   # #1058, safe native-arm preservation + bridge topology
+      - "scripts/lib/merge-queue-authorization.sh" # #1058, exact-head queue authorization history
+      - "scripts/gh-as-author.sh"                 # #1058, final target-audit marker write
       - "scripts/self-approval-detector.cjs"      # #1094, canonical final independence decision
       - "scripts/merge-clearance-gate.sh"         # #1094, shared Phase 4 requiredness query
 

@@ -385,6 +385,9 @@ jobs:
       - name: check_workflow_parsers
         run: ./scripts/ci/check_workflow_parsers || { rc=$?; if [ ! -f scripts/ci/check_workflow_parsers ]; then echo "check_workflow_parsers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      - name: check_merge_group_required_checks
+        run: ./scripts/ci/check_merge_group_required_checks || { rc=$?; if [ ! -f scripts/ci/check_merge_group_required_checks ]; then echo "check_merge_group_required_checks not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_session_finalization
         run: ./scripts/ci/check_session_finalization || { rc=$?; if [ ! -f scripts/ci/check_session_finalization ]; then echo "check_session_finalization not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 

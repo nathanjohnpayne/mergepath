@@ -247,26 +247,40 @@ for required_fragment in \
   '--json author,autoMergeRequest,url,headRefOid,baseRefName,baseRefOid' \
   'EVENT_HEAD: ${{ github.event.pull_request.head.sha }}' \
   'EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}' \
-  '--disable-auto' \
+  'Refusing to mutate or classify a durable arm from a candidate-controlled workflow.' \
   'auto_arm_allowed=false' \
   'auto_arm_allowed=true' \
-  'retracting the existing unclassified auto-merge request fail closed' \
+  'blocking on the existing unclassified auto-merge request fail closed' \
   '.autoMergeRequest == null'; do
   if ! grep -qF -- "$required_fragment" <<<"$shared_author_retraction"; then
     echo "check_self_approval_detector: shared-author approval invalidation must carry its self-contained workflow-token retraction path ($required_fragment)" >&2
     exit 1
   fi
 done
+for forbidden_fragment in \
+  'MERGE_QUEUE_POLICY_TOKEN' \
+  'MERGE_QUEUE_SOURCE_TOKEN' \
+  'scripts/workflow/merge-queue-arm-policy.sh'; do
+  if grep -qF -- "$forbidden_fragment" <<<"$shared_author_retraction"; then
+    echo "check_self_approval_detector: candidate-controlled invalidation must not receive queue topology credentials or run the privileged classifier ($forbidden_fragment)" >&2
+    exit 1
+  fi
+done
 if grep -qF -- '--match-head-commit' <<<"$shared_author_retraction"; then
-  echo "check_self_approval_detector: disable-only retraction must not advertise an ineffective head precondition" >&2
+  echo "check_self_approval_detector: read-only armed-state cleanup must not advertise an ineffective head precondition" >&2
   exit 1
 fi
-if grep -qF 'AUTHOR_MERGE_TOKEN' <<<"$shared_author_retraction"; then
-  echo "check_self_approval_detector: protective retraction must not depend on the optional auto-merge token" >&2
+# Candidate-controlled workflow code cannot safely receive the administrator
+# topology credentials. Every armed state must reach the final refusal, never
+# a queue-classifier, native auto-merge, or merge mutation.
+if grep -qF -- '--disable-auto' <<<"$shared_author_retraction" \
+  || grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' <<<"$shared_author_retraction" \
+  || grep -Eq -- '--(auto|merge|rebase|squash)([[:space:]]|$)' <<<"$shared_author_retraction"; then
+  echo "check_self_approval_detector: candidate-controlled armed-state refusal must contain no merge or disable mutation" >&2
   exit 1
 fi
 if grep -qF 'approval-merge-continuation.sh' <<<"$shared_author_retraction"; then
-  echo "check_self_approval_detector: first-rollout retraction must remain self-contained and helper-independent" >&2
+  echo "check_self_approval_detector: first-rollout armed-state classification must remain self-contained" >&2
   exit 1
 fi
 
