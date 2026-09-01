@@ -426,8 +426,11 @@ paths:
     consumers: all
     # Sources scripts/lib/codex-failure-markers.sh (existence-guarded) so the
     # poll loop can short-circuit on a usage-limit / not-connected marker
-    # instead of running out the full review timeout (#722). Soft-degrades to
-    # the pre-#722 behavior if the lib is absent mid-skew.
+    # instead of running out the full review timeout (#722). That provider-
+    # marker detection soft-degrades to the pre-#722 behavior if the lib is
+    # absent mid-skew. Persisting an ordinary timeout for Phase 4b is different:
+    # the same helper is required, and its absence fails closed with exit 3
+    # rather than creating a timeout waiver (#1085).
     #
     # Shells out to scripts/workflow/codex_auto_trigger_gate.sh (also
     # existence-guarded) to decide whether an AUTOMATIC trigger may be skipped
