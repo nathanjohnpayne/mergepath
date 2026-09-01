@@ -145,9 +145,17 @@ consumers:
   # root package.json and ~148 .ts/.tsx files, so it IS in scope for the
   # canonical ESLint floor (#458). Folded into the ESM templated entry
   # below; the prior "zero lintable surface" exclusion was false.
+  # Visibility flipped public -> private during the 2026-08 window; measured
+  # 2026-09-01 by the monthly propagation-order review (anonymous API access
+  # returns 404). It is the fleet's only non-public consumer. Nothing in the
+  # sync engine reads this field -- it is documentary -- but it is read by
+  # humans and agents reasoning about the fleet, and docs/agents/coderabbit-
+  # audit.md's learnings.scope posture turns on it (`auto` resolves to
+  # `global` for a private repo, `local` for a public one), so a stale value
+  # here propagates into a wrong privacy conclusion.
   - name: device-source-of-truth
     repo: nathanjohnpayne/device-source-of-truth
-    visibility: public
+    visibility: private
     facts:
       frameworks: [react, typescript]
   - name: friends-and-family-billing
@@ -1618,10 +1626,13 @@ paths:
   # mergepath@<sha>, which carries its own authoritative manifest.
   # The consumer's copy would be unused — and this file enumerates the
   # full fleet inventory (every consumer repo name + facts), which there
-  # is no reason to mirror into each consumer. (It historically also
-  # avoided leaking then-private repo names to a public consumer; the
-  # fleet is uniformly public as of 2026-07-06, so that specific concern
-  # is now moot, but the file stays mergepath-only regardless.) Keep it
+  # is no reason to mirror into each consumer. (It also avoids leaking
+  # private repo names to a public consumer. That concern was moot while
+  # the fleet was uniformly public from 2026-07-06, and it is ACTIVE
+  # AGAIN as of 2026-09-01: device-source-of-truth is private, so this
+  # file now names a private repo and mirroring it into eight public
+  # consumers would disclose that name. Do not treat the moot period as
+  # the standing state -- re-read the visibility fields.) Keep it
   # mergepath-only. (CodeRabbit Major, #271.)
 
   # Kit directories — Mergepath-canonical files are required;
