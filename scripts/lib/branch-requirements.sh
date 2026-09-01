@@ -303,11 +303,30 @@ br_required_checks() {
         then error("rules/branches returned a non-array page (\(map(type) | unique | join(",")))")
         else .
         end
-        | add // []
+        | (add // [])
+        # A rule that DECLARES itself a required-status-checks rule must carry
+        # the documented payload. Checking only the page type is not enough:
+        # for `{"type":"required_status_checks","parameters":{}}` the
+        # `.parameters.required_status_checks[]?` traversal yields nothing and
+        # the surface is recorded as readable with an INCOMPLETE list, so a
+        # genuinely required context silently stops being scrutinised. Same
+        # conflation as a non-array page, one level down — an unparseable rule
+        # is an unread surface, not an empty one.
+        | (map(select(objects | .type == "required_status_checks"))
+           | map(select(
+               ((.parameters | type) != "object")
+               or ((.parameters.required_status_checks | type) != "array")
+               or ((.parameters.required_status_checks
+                    | map(select((.context | type) != "string")) | length) > 0)
+             ))) as $malformed
+        | if ($malformed | length) > 0
+          then error("rules/branches returned \($malformed | length) malformed required_status_checks rule(s)")
+          else .
+          end
         | [ .[]? | objects
             | select(.type == "required_status_checks")
             | .parameters.required_status_checks[]?
-            | .context? | select(type == "string") ]' 2>"$errfile")"; then
+            | .context ]' 2>"$errfile")"; then
       rulesets_ok=1
     else
       rulesets_ctx='[]'

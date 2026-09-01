@@ -255,6 +255,40 @@ else
   fail "non-array rulesets page: expected unknown naming the shape, got $out"
 fi
 
+# ── 9c. A rule that declares itself a required-status-checks rule but omits
+# the documented payload is an unread surface too. The page-type check alone
+# does not catch it: `.parameters.required_status_checks[]?` simply yields
+# nothing, so the surface would be recorded as readable with an INCOMPLETE
+# list and a genuinely required context would stop being scrutinised.
+for malformed in \
+  '[{"type":"required_status_checks","parameters":{}}]' \
+  '[{"type":"required_status_checks","parameters":{"required_status_checks":"nope"}}]' \
+  '[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":123}]}}]'
+do
+  out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_BODY="$malformed" \
+    GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+    br_required_checks owner/repo main)
+  if [ "$(field "$out" .state)" = "unknown" ] \
+     && printf '%s' "$out" | grep -q 'malformed'; then
+    pass "a malformed required_status_checks rule is an unread surface, not an empty one"
+  else
+    fail "malformed rule ($malformed): expected unknown, got $out"
+  fi
+done
+
+# A rule of a DIFFERENT type is not the resolver business and must not trip
+# the payload check.
+out=$(GH_CLASSIC=ok GH_RULESETS=ok \
+  GH_RULESETS_BODY='[{"type":"pull_request","parameters":{"required_approving_review_count":1}}]' \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "known" ] \
+   && [ "$(field "$out" '.contexts | length')" = "0" ]; then
+  pass "an unrelated rule type passes through without tripping the payload check"
+else
+  fail "unrelated rule type: expected known/[], got $out"
+fi
+
 # The documented array shape still resolves normally.
 out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_BODY="$RULESET_ONE" \
   GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":null}}}}' \
