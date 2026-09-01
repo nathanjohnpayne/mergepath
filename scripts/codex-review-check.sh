@@ -1813,6 +1813,49 @@ fi  # end REQUIRE_CI_GREEN
 # Only a Codex-bot signal, so compute it only when codex.enabled=true;
 # leaves disabled repos byte-identical in behavior.
 
+# BEGIN codex_review_summary_selector
+# Select the newest marker-tagged Codex Review Summary whose Code Review row
+# names the current head, as `{status, commit, observed_at, trigger,
+# comment_id}` or `null` (#1157).
+#
+# Codex creates this issue comment when a review starts and edits it in place
+# as the review advances, so `updated_at` — not `created_at` — is the signal
+# time. The row is exact-head evidence because its Commit cell carries a
+# 7-to-40-character hexadecimal prefix. Status remains explicit: `running`
+# proves liveness only, while `completed` can prove terminal delivery to a
+# diagnostic caller. Neither status is an affirmative merge verdict.
+#
+# Pure: jq over the passed strings only, no globals and no I/O.
+#
+# crc_select_codex_review_summary <issue-comments-json> <bot-login> <head-sha>
+crc_select_codex_review_summary() {
+  echo "${1:-[]}" | jq -c \
+    --arg bot "${2:-}" --arg sha "${3:-}" '
+    ($sha | ascii_downcase) as $head
+    | [ .[]
+      | select((.user.login // "") == $bot)
+      | select((.body // "") | startswith("<!-- codex-pull-request-review-summary -->"))
+      | . as $comment
+      | ((.body // "")
+          | capture("(?m)^\\|[[:space:]]*📝[[:space:]]*\\*\\*Code Review\\*\\*[[:space:]]*\\|[[:space:]]*(?<status>[^|]+)[[:space:]]*\\|[[:space:]]*`(?<commit>[0-9A-Fa-f]{7,40})`[[:space:]]*\\|[[:space:]]*(?<trigger>[^|]+)[[:space:]]*\\|[[:space:]]*$")?
+          // null) as $row
+      | select($row != null)
+      | ($row.commit | ascii_downcase) as $commit
+      | select($head | startswith($commit))
+      | { status:
+            (if ($row.status | test("\\*\\*Completed\\*\\*"; "i")) then "completed"
+             elif ($row.status | test("\\*\\*Running\\*\\*"; "i")) then "running"
+             else "unknown" end),
+          commit: $commit,
+          observed_at: ($comment.updated_at // $comment.created_at // ""),
+          trigger: ($row.trigger | gsub("^[[:space:]]+|[[:space:]]+$"; "")),
+          comment_id: ($comment.id // 0) }
+    ]
+    | max_by([.observed_at, .comment_id]) // null
+  '
+}
+# END codex_review_summary_selector
+
 # BEGIN codex_block_marker_selector
 # Select the newest account-/connection-level BLOCK marker on this head, as
 # `{reason, created_at}` or `null` (#722).
@@ -1864,8 +1907,21 @@ CODEX_CARRYFORWARD_COMMIT=""
 CODEX_CARRYFORWARD_FINGERPRINT=""
 CODEX_BLOCKED_REASON=""
 CODEX_BLOCKED_TIME=""
+CODEX_SUMMARY_JSON='null'
+CODEX_SUMMARY_STATUS=""
+CODEX_SUMMARY_TIME=""
+CODEX_SUMMARY_COMMIT=""
+CODEX_SUMMARY_TRIGGER=""
 if [ "$CODEX_ENABLED" = "true" ]; then
   ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  CODEX_SUMMARY_JSON=$(crc_select_codex_review_summary "$ISSUE_COMMENTS_JSON" "$BOT_LOGIN" "$HEAD_SHA")
+  CODEX_SUMMARY_STATUS=$(echo "$CODEX_SUMMARY_JSON" | jq -r 'if . == null then "" else .status end')
+  CODEX_SUMMARY_TIME=$(echo "$CODEX_SUMMARY_JSON" | jq -r 'if . == null then "" else .observed_at end')
+  CODEX_SUMMARY_COMMIT=$(echo "$CODEX_SUMMARY_JSON" | jq -r 'if . == null then "" else .commit end')
+  CODEX_SUMMARY_TRIGGER=$(echo "$CODEX_SUMMARY_JSON" | jq -r 'if . == null then "" else .trigger end')
+  if [ -n "$CODEX_SUMMARY_STATUS" ]; then
+    log "codex summary: Code Review is $CODEX_SUMMARY_STATUS on current HEAD prefix $CODEX_SUMMARY_COMMIT @ $CODEX_SUMMARY_TIME (trigger: ${CODEX_SUMMARY_TRIGGER:-unknown}; #1157)"
+  fi
   # Select the LATEST HEAD-anchored Codex verdict comment FIRST (any
   # disposition), THEN decide whether that latest one is affirmative. Filtering
   # to affirmative-only BEFORE taking max() would let an older clean "Didn't
@@ -2254,8 +2310,8 @@ LATEST_THUMBS_UP_TIME=$(echo "$REACTIONS_JSON" | jq -r \
 # Latest Codex review submission time on HEAD (empty if none).
 CODEX_REVIEW_TIME=$(echo "$CODEX_REVIEW" | jq -r 'if . == null then "" else .submitted_at end')
 
-# Decide clearance using the LATEST Codex signal on HEAD among THREE signal
-# types — 👍 reaction, COMMENTED review, and issue-comment verdict — not
+# Decide clearance using the LATEST Codex signal on HEAD among THREE merge
+# signal types — 👍 reaction, COMMENTED review, and issue-comment verdict — not
 # whichever the script checks first (#64, extended for the verdict in
 # #600/#608). Codex emits one signal per pass but can accumulate several on the
 # same HEAD across rounds; the newest wins:
@@ -2298,6 +2354,19 @@ for __sig in "thumbs|$LATEST_THUMBS_UP_TIME" "review|$CODEX_REVIEW_TIME" "verdic
     LATEST_SIGNAL_KIND="$__k"
   fi
 done
+
+# #1157: the mutable summary's Completed row is an additional exact-head
+# terminal signal only for diagnostic callers. It does not say whether the run
+# was clean, so the merge gate must continue to require a review, reaction, or
+# affirmative legacy verdict. Use updated_at for ordering because Codex edits
+# the one summary comment in place from Running to Completed.
+if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ] \
+   && [ -n "$CODEX_SUMMARY_STATUS" ] \
+   && { [ -z "$LATEST_SIGNAL_TIME" ] || [[ "$CODEX_SUMMARY_TIME" > "$LATEST_SIGNAL_TIME" ]] \
+        || [ "$CODEX_SUMMARY_TIME" = "$LATEST_SIGNAL_TIME" ]; }; then
+  LATEST_SIGNAL_KIND="summary"
+  LATEST_SIGNAL_TIME="$CODEX_SUMMARY_TIME"
+fi
 
 if [ -z "$LATEST_SIGNAL_KIND" ] && [ -n "$CODEX_CARRYFORWARD_VERDICT_TIME" ]; then
   LATEST_SIGNAL_KIND="carry_verdict"
@@ -2349,6 +2418,18 @@ case "$LATEST_SIGNAL_KIND" in
       CLEARANCE_REASON="latest Codex signal is a HEAD-anchored AFFIRMATIVE verdict comment @ $LATEST_SIGNAL_TIME (Reviewed commit prefixes $HEAD_SHA; no unaddressed P0/P1) (#600)"
     else
       log "gate (c): latest Codex signal is a non-affirmative or findings-bearing verdict comment @ $LATEST_SIGNAL_TIME — fail closed, does not clear (#608 P1)"
+    fi
+    ;;
+  summary)
+    # This kind is selected only in diagnostic mode above. A newer Running
+    # row must outrank stale same-head reviews/verdicts without clearing; a
+    # Completed row says the head was reviewed but still does not claim a
+    # clean disposition or enter the ordinary merge-clearance path.
+    if [ "$CODEX_SUMMARY_STATUS" = "completed" ]; then
+      CLEARED=true
+      CLEARANCE_REASON="head-anchored Completed Codex review summary @ $LATEST_SIGNAL_TIME for $CODEX_SUMMARY_COMMIT (presence only; disposition not evaluated under --diagnostic-signal-only; #1157)"
+    else
+      log "gate (c): head-anchored Codex review summary is $CODEX_SUMMARY_STATUS @ $LATEST_SIGNAL_TIME — terminal delivery not yet proven (#1157)"
     fi
     ;;
   carry_verdict)
@@ -2487,15 +2568,23 @@ if [ "$CLEARED" != "true" ]; then
     else
       fail_gate "codex.enabled=false and codex.allow_phase_4b_substitute=false, so no gate (c) clearance path is available"
     fi
-  elif [ -z "$LATEST_THUMBS_UP_TIME" ] && [ -z "$CODEX_REVIEW_TIME" ]; then
-    if [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
-      fail_gate "Codex has not cleared current HEAD and no Phase 4b substitute APPROVED on $HEAD_SHA from a non-author identity in available_reviewers (no review on HEAD, no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)$BLOCKED_SUFFIX"
+  elif [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ] && [ "$CODEX_SUMMARY_STATUS" = "running" ]; then
+    fail_gate "Codex review summary is Running on current HEAD $HEAD_SHA (updated $CODEX_SUMMARY_TIME; trigger: ${CODEX_SUMMARY_TRIGGER:-unknown}) — liveness is confirmed, but the review has not completed (#1157)"
+  elif [ -z "$LATEST_SIGNAL_KIND" ]; then
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
+      fail_gate "Codex has not produced an eligible current-head review, reaction, verdict, or Completed review summary$BLOCKED_SUFFIX"
+    elif [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
+      fail_gate "Codex has not cleared current HEAD and no Phase 4b substitute APPROVED on $HEAD_SHA from a non-author identity in available_reviewers (no eligible current-head review, reaction, or verdict)$BLOCKED_SUFFIX"
     else
-      fail_gate "Codex has not cleared current HEAD (no review on $HEAD_SHA and no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)$BLOCKED_SUFFIX"
+      fail_gate "Codex has not cleared current HEAD (no eligible current-head review, reaction, or verdict)$BLOCKED_SUFFIX"
     fi
-  else
+  elif [ "$LATEST_SIGNAL_KIND" = "review" ]; then
     PATHS=$(echo "$UNADDRESSED_P01" | jq -r '[.[] | "\(.path):\(.line)"] | join(", ")')
     fail_gate "latest Codex signal is a review on HEAD with $UNADDRESSED_COUNT unaddressed P0/P1 finding(s): $PATHS"
+  elif [ "$LATEST_SIGNAL_KIND" = "verdict" ]; then
+    fail_gate "latest Codex signal is a non-affirmative or findings-bearing verdict on current HEAD @ $LATEST_SIGNAL_TIME"
+  else
+    fail_gate "latest Codex signal kind '$LATEST_SIGNAL_KIND' @ $LATEST_SIGNAL_TIME did not satisfy merge clearance"
   fi
 fi
 
