@@ -29,6 +29,25 @@ source "$ROOT/scripts/lib/review-policy-scalar.sh"
 
 RETRACT_ON_EXIT=0
 
+# The native Dependabot account answers to two spellings depending on which
+# surface named it, and both mean the identical account. `gh pr view --json
+# author` renders bot logins in the `app/<slug>` form (`app/dependabot`);
+# REST payloads (`.user.login`) and Actions contexts (`github.actor`,
+# `github.event.pull_request.user.login`) render the same account as
+# `dependabot[bot]`. Every author read in THIS script comes from `read_pr()`,
+# i.e. `gh pr view --json author`, so a bare `= "dependabot[bot]"` test here
+# is never true and the Dependabot boundary below silently never fires —
+# which is the opposite of fail-closed: the sweeps enumerate every approved
+# PR, so the script would proceed to `gh pr merge --disable-auto` against the
+# durable arm the dedicated Dependabot lane owns. Match on equality against
+# both exact spellings rather than a prefix or glob: `dependabot[bot]` inside
+# an unquoted `case` pattern is a CHARACTER CLASS (`dependabot` + one of
+# b/o/t), and a prefix test would swallow `app/dependabot-lookalike`. The
+# exemption must match the two real logins and nothing else.
+is_native_dependabot_login() {
+  [ "$1" = 'dependabot[bot]' ] || [ "$1" = 'app/dependabot' ]
+}
+
 retract_latest_arm_for_exit() {
   local reason="$1"
   if [ -n "${MERGEPATH_PROTECTIVE_TOKEN:-}" ]; then
@@ -141,7 +160,7 @@ retract_snapshot_arm() {
   # native-login boundary at the mutation site as well as at normal entry:
   # EXIT cleanup can reach here after the first PR read failed, before the
   # top-level author classification ever ran.
-  if [ "$target_author" = "dependabot[bot]" ]; then
+  if is_native_dependabot_login "$target_author"; then
     echo "approval continuation: $reason snapshot belongs to Dependabot's dedicated auto-merge lane; leaving its durable request unchanged"
     return 0
   fi
@@ -196,7 +215,7 @@ arm_enabled=$(jq -r 'if .autoMergeRequest == null then "false" else "true" end' 
 # mode nor a mistakenly-entered normal continuation may disable Dependabot's
 # request. The login comes from the live PR object and cannot be supplied by
 # PR-authored content.
-if [ "$native_author" = "dependabot[bot]" ]; then
+if is_native_dependabot_login "$native_author"; then
   RETRACT_ON_EXIT=0
   echo "approval continuation: Dependabot PR is owned by the dedicated auto-merge lane; leaving its durable request unchanged"
   exit 0
