@@ -71,6 +71,27 @@ gh() {
         *)        echo "${GH_CLASSIC_BODY:-$GH_CLASSIC_DEFAULT}"; return 0 ;;
       esac
       ;;
+    # Ruleset DETAIL read, used by the completeness probe to prove that no rule
+    # could have been hidden from this viewer.
+    */rulesets/*)
+      case "${GH_RULESET_DETAIL:-clean}" in
+        fail)   echo '{"message":"Not Found","status":"404"}'
+                echo "gh: Not Found (HTTP 404)" >&2; return 1 ;;
+        bypass) echo '{"bypass_actors":[{"actor_id":5,"actor_type":"Team"}]}'; return 0 ;;
+        *)      echo '{"bypass_actors":[]}'; return 0 ;;
+      esac
+      ;;
+    # Ruleset LISTING — a configuration read, not an actor-scoped evaluation.
+    */rulesets)
+      case "${GH_RULESETS_LIST:-none}" in
+        fail)     echo '{"message":"Server Error","status":"500"}'
+                  echo "gh: Server Error (HTTP 500)" >&2; return 1 ;;
+        active)   echo '[{"id":42,"enforcement":"active","source_type":"Repository","source":"owner/repo"}]'; return 0 ;;
+        org)      echo '[{"id":43,"enforcement":"active","source_type":"Organization","source":"owner"}]'; return 0 ;;
+        evaluate) echo '[{"id":44,"enforcement":"evaluate","source_type":"Repository","source":"owner/repo"}]'; return 0 ;;
+        *)        echo '[]'; return 0 ;;
+      esac
+      ;;
     *rules/branches*)
       case "${GH_RULESETS:-ok}" in
         fail) echo '{"message":"Not Found","status":"404"}'
@@ -315,6 +336,74 @@ else
   fail "well-formed rulesets after the shape check: expected known/[build], got $out"
 fi
 
+# ── 9e. Viewer-scoping. `rules/branches` returns the rules enforced on the
+# REQUESTING identity, and this fleet reviews under one identity and merges
+# under another, so a ruleset that bypasses the reviewer while still binding
+# the merging author is simply absent from that response. A requirement hidden
+# that way is one gate (a) would never scrutinise — the same fail-open, arriving
+# through the reader instead of the endpoint. The response is therefore used
+# only when it can be PROVEN complete: a ruleset with no bypass actors cannot
+# have been hidden from anybody.
+out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=active GH_RULESET_DETAIL=bypass \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "unknown" ] \
+   && printf '%s' "$out" | grep -q 'bypass actors'; then
+  pass "a ruleset with bypass actors leaves the viewer-scoped response unproven, so the union is unknown"
+else
+  fail "bypassable ruleset: expected unknown naming the bypass actors, got $out"
+fi
+
+out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=active GH_RULESET_DETAIL=clean \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "known" ] \
+   && [ "$(field "$out" '.contexts | join(",")')" = "lint" ]; then
+  pass "an active ruleset with no bypass actors cannot hide a rule, so the union stands"
+else
+  fail "non-bypassable ruleset: expected known/[lint], got $out"
+fi
+
+out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=active GH_RULESET_DETAIL=fail \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "unknown" ]; then
+  pass "a ruleset whose detail cannot be read leaves completeness unproven"
+else
+  fail "unreadable ruleset detail: expected unknown, got $out"
+fi
+
+out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=fail \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "unknown" ]; then
+  pass "an unreadable ruleset listing leaves completeness unproven"
+else
+  fail "unreadable ruleset listing: expected unknown, got $out"
+fi
+
+# An `evaluate`-mode ruleset does not gate merges, so it cannot hide an
+# enforced requirement and must not degrade the result.
+out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=evaluate GH_RULESET_DETAIL=bypass \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "known" ]; then
+  pass "a non-active ruleset does not gate merges and does not degrade the union"
+else
+  fail "evaluate-mode ruleset: expected known, got $out"
+fi
+
+# The fleet's actual shape: no rulesets at all, so nothing can be hidden.
+out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST=none \
+  GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+  br_required_checks owner/repo main)
+if [ "$(field "$out" .state)" = "known" ] \
+   && [ "$(field "$out" '.contexts | join(",")')" = "lint" ]; then
+  pass "a repo with no rulesets resolves normally — the probe costs nothing where nothing can hide"
+else
+  fail "no rulesets: expected known/[lint], got $out"
+fi
+
 # ── 10. Each surface is retried once before being given up on, so a single
 # transient blip does not degrade the whole resolution to unknown (both
 # surfaces are needed for `known`, which makes one blip otherwise expensive).
@@ -335,6 +424,8 @@ gh_flaky_once() {
       echo '{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}'
       return 0
       ;;
+    */rulesets/*)     echo '{"bypass_actors":[]}'; return 0 ;;
+    */rulesets)       echo '[]'; return 0 ;;
     *rules/branches*) echo '[]'; return 0 ;;
   esac
   return 1

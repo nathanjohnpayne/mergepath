@@ -74,12 +74,25 @@
 # contexts are non-empty while `rules/branches/main` returns `[]`. Reading
 # either alone and stopping there under-reports on a repo that uses the other.
 #
-# Both surfaces are scoped to rules enforced on the VIEWER, so a bypass actor
-# can only HIDE a rule from this reader, never invent one. For a filter that
-# means the resolved list can only ever be a SUBSET of the true one, which
-# pushes gate (a) toward scrutinising fewer checks — the same direction as the
-# pre-existing behaviour, never toward newly blocking a PR that GitHub itself
-# would merge. That asymmetry is what makes adopting this safe fleet-wide.
+# Both surfaces are scoped to rules enforced on the VIEWER, and that is a
+# hazard rather than a comfort. An earlier revision of this comment argued it
+# was safe because a bypass actor can only HIDE a rule, making the resolved
+# list a subset, which can only make gate (a) scrutinise fewer checks and never
+# newly block a merge GitHub would allow. That is sound for over-restriction
+# and wrong for what this gate is for: a hidden requirement is a context gate
+# (a) never checks, which is the same fail-open the lib exists to close,
+# arriving through the reader instead of the endpoint. It matters concretely
+# here because the fleet reviews under one identity and merges under another,
+# so a ruleset bypassing the reviewer can still bind the merger.
+#
+# The rulesets response is therefore used only when it can be PROVEN complete —
+# see the completeness probe in br_required_checks, which reads `/rulesets` (a
+# configuration listing, not an actor-scoped evaluation) and accepts the
+# response only when no active ruleset has any bypass actor. The classic
+# surface carries the same caveat in principle; in practice
+# `refUpdateRule.requiredStatusCheckContexts` reports the branch rule rather
+# than a per-actor evaluation, and no reader-independent cross-check for it
+# exists below `Administration:read`.
 #
 # ─────────────────────────────────────────────────────────────────────
 # The tri-state, and why "unknown" is not "empty"
@@ -275,9 +288,25 @@ br_required_checks() {
       # fabrication this lib exists to prevent).
       ref_seen="$(printf '%s' "$classic_out" | jq -r 'if .data.repository.ref == null then "no" else "yes" end' 2>/dev/null || echo "no")"
       if [ "$ref_seen" = "yes" ]; then
-        classic_ctx="$(printf '%s' "$classic_out" \
-          | jq -c '[.data.repository.ref.refUpdateRule.requiredStatusCheckContexts // empty | .[]? | select(type == "string")]' 2>/dev/null || echo '[]')"
-        classic_ok=1
+        # Validate the WHOLE array rather than filtering it. Dropping a
+        # non-string entry and marking the surface readable would return an
+        # incomplete union: if that entry named a required context, gate (a)
+        # would stop scrutinising it and clear. An unexpected shape means the
+        # surface was not understood, which is the same as not having read it —
+        # the fail-closed treatment the ruleset payloads already get.
+        if classic_ctx="$(printf '%s' "$classic_out" | jq -c '
+            (.data.repository.ref.refUpdateRule.requiredStatusCheckContexts // []) as $ctx
+            | if ($ctx | type) != "array"
+              then error("requiredStatusCheckContexts is not an array (\($ctx | type))")
+              elif ($ctx | map(select(type != "string")) | length) > 0
+              then error("requiredStatusCheckContexts carries \($ctx | map(select(type != "string")) | length) non-string entry/entries")
+              else $ctx
+              end' 2>"$errfile")"; then
+          classic_ok=1
+        else
+          classic_ctx='[]'
+          errors="$(printf '%s' "$errors" | jq -c --arg m "$(tr '\n' ' ' <"$errfile")" '. + ["classic: \($m)"]')"
+        fi
       else
         errors="$(printf '%s' "$errors" | jq -c '. + ["classic: ref not found in the GraphQL response; nothing learned about classic protection"]')"
       fi
@@ -360,6 +389,81 @@ br_required_checks() {
     fi
   else
     errors="$(printf '%s' "$errors" | jq -c --arg m "$(tr '\n' ' ' <"$errfile")" '. + ["rulesets: \($m)"]')"
+  fi
+
+  # ── Completeness probe for surface 2.
+  #
+  # `rules/branches` returns the rules enforced on the REQUESTING identity. This
+  # fleet reviews under one identity and merges under another by design, so a
+  # ruleset that lists the reviewer among its `bypass_actors` while still
+  # binding the merging author is simply absent from the response above. The
+  # resolver would then report `known` with that requirement missing, and gate
+  # (a) would never scrutinise the context — the same fail-open this lib exists
+  # to close, arriving through the reader instead of the endpoint.
+  #
+  # An earlier revision argued viewer-scoping was safe because it can only ever
+  # HIDE a rule, making the list a subset. That is sound for over-restriction
+  # and wrong here: a hidden requirement is one gate (a) never checks.
+  #
+  # So the response is used only when it can be PROVEN complete. `/rulesets` is
+  # a configuration listing rather than an actor-scoped evaluation, and a
+  # ruleset with no bypass actors cannot be hidden from anybody — so if every
+  # active ruleset has an empty `bypass_actors`, nothing was withheld from this
+  # reader and the union stands. Anything else, including a ruleset whose
+  # detail cannot be read, leaves completeness unproven and the surface unread.
+  #
+  # This deliberately avoids ref-pattern matching. Whether a ruleset targets
+  # THIS branch does not matter to the question being asked: if no ruleset
+  # anywhere can be bypassed, no rule can have been hidden from this response.
+  # Ref matching would need the Ruby glob translation
+  # scripts/audit-branch-protection.sh carries, and getting it subtly wrong
+  # fails open in exactly the direction this probe exists to prevent.
+  if [ "$rulesets_ok" -eq 1 ]; then
+    if rulesets_meta="$(_br_retry gh api --paginate "repos/$repo/rulesets" 2>"$errfile")"; then
+      active_rulesets="$(printf '%s' "$rulesets_meta" | jq -r -s '
+        add // []
+        | [ .[]? | objects | select((.enforcement // "") == "active") ]
+        | .[] | "\(.id)|\(.source_type // "")|\(.source // "")"' 2>/dev/null || echo "PARSE_FAILED")"
+      if [ "$active_rulesets" = "PARSE_FAILED" ]; then
+        rulesets_ok=0
+        errors="$(printf '%s' "$errors" | jq -c '. + ["rulesets: could not parse the ruleset listing, so the viewer-scoped rule response cannot be shown complete"]')"
+      elif [ -n "$active_rulesets" ]; then
+        while IFS= read -r rs_line; do
+          [ -n "$rs_line" ] || continue
+          rs_id="${rs_line%%|*}"
+          rs_rest="${rs_line#*|}"
+          rs_src_type="${rs_rest%%|*}"
+          rs_src="${rs_rest#*|}"
+          case "$rs_src_type" in
+            Organization) rs_endpoint="orgs/$rs_src/rulesets/$rs_id" ;;
+            Repository|"") rs_endpoint="repos/$repo/rulesets/$rs_id" ;;
+            *) rs_endpoint="" ;;
+          esac
+          if [ -z "$rs_endpoint" ]; then
+            rulesets_ok=0
+            errors="$(printf '%s' "$errors" | jq -c --arg t "$rs_src_type" '. + ["rulesets: ruleset scope \($t) cannot be read, so the viewer-scoped rule response cannot be shown complete"]')"
+            break
+          fi
+          if rs_detail="$(_br_retry gh api "$rs_endpoint" 2>"$errfile")"; then
+            if [ "$(printf '%s' "$rs_detail" | jq -r '((.bypass_actors // []) | length)' 2>/dev/null || echo 1)" -ne 0 ]; then
+              rulesets_ok=0
+              errors="$(printf '%s' "$errors" | jq -c --arg i "$rs_id" '. + ["rulesets: ruleset \($i) has bypass actors, so a rule binding the merging identity may be hidden from this reader"]')"
+              break
+            fi
+          else
+            rulesets_ok=0
+            errors="$(printf '%s' "$errors" | jq -c --arg i "$rs_id" --arg m "$(tr '\n' ' ' <"$errfile")" '. + ["rulesets: ruleset \($i) detail unreadable (\($m)), so the viewer-scoped rule response cannot be shown complete"]')"
+            break
+          fi
+        done <<EOF
+$active_rulesets
+EOF
+      fi
+    else
+      rulesets_ok=0
+      errors="$(printf '%s' "$errors" | jq -c --arg m "$(tr '\n' ' ' <"$errfile")" '. + ["rulesets: ruleset listing unreadable (\($m)), so the viewer-scoped rule response cannot be shown complete"]')"
+    fi
+    [ "$rulesets_ok" -eq 1 ] || rulesets_ctx='[]'
   fi
 
   rm -f "$errfile"

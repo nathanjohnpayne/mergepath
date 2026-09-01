@@ -1576,6 +1576,24 @@ else
   fail "#1064: the unresolved state no longer surfaces as a blocking entry"
 fi
 
+# Label Gate is one of the five canonical REQUIRED contexts and fails by design
+# during Phase 4a, which is what Phase 4a exists to clear. Its exclusion must
+# therefore hide only its VERDICT: dropping its entry from the projection made
+# its requirement find no entry and be synthesized as MISSING on every
+# evaluation, so gate (a) could never clear on any consumer.
+LABELGATE_BLOCK=$(sed -n '/TWO exclusions/,/as \$counted/p' "$SCRIPT")
+if grep -q 'PR Review Policy' <<<"$LABELGATE_BLOCK"; then
+  pass "#1064: the Label Gate exclusion applies to verdict selection, alongside the readiness exclusion"
+else
+  fail "#1064: the Label Gate exclusion is not on the verdict-selection path — if it drops the entry outright, its requirement reports MISSING forever and gate (a) can never clear"
+fi
+if grep -q 'select(.isRequired != false)' <<<"$(sed -n '/\] as \$counted_all/q;/statusCheckRollup\[\]/,$p' "$SCRIPT")" \
+   && ! grep -q 'PR Review Policy' <<<"$(sed -n '/statusCheckRollup\[\]/,/\] as \$counted_all/p' "$SCRIPT")"; then
+  pass "#1064: Label Gate stays visible to the presence test, so it is not reported MISSING"
+else
+  fail "#1064: Label Gate is filtered out before the presence test — its requirement would be permanently MISSING"
+fi
+
 # PRESENCE is judged pre-exclusion, VERDICT post-exclusion.
 #
 # The approval-readiness exclusion drops non-completed checks from the caller

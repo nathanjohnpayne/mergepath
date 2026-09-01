@@ -1710,31 +1710,40 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         isRequired: .isRequired,
         appId: (.appId // "")
       }
-    # Label Gate lives in the "PR Review Policy" workflow and fails by design
-    # whenever needs-external-review / needs-human-review / policy-violation /
-    # human-hold is set. That enforcement is what Phase 4a is trying to
-    # unblock; clearance is verified separately in gate (c).
-    | select(
-        (.workflow != "PR Review Policy") or
-        (.label != "Label Gate")
-      )
     # Runs GitHub does not count toward THIS PR requirements are not evidence
     # about them. Only an explicit `false` drops one: a null means GitHub
     # returned no opinion, and treating that as not-required would silently
     # empty the gate.
     | select(.isRequired != false)
   ] as $counted_all
-  # Approval readiness runs inside a check on the same HEAD, so the caller own
-  # in-flight run must not decide its own verdict. Exclude only non-completed
-  # checks from that exact trusted run; completed failures in this run and
-  # active checks in every other run remain blocking.
+  # TWO exclusions, both applying to VERDICT SELECTION only. PRESENCE is judged
+  # against $counted_all above, because an entry excluded here HAS reported —
+  # calling its requirement MISSING would manufacture a blocking requirement
+  # out of a check the exclusion exists to permit.
   #
-  # The exclusion applies to VERDICT SELECTION only. PRESENCE is judged against
-  # the pre-exclusion set below, because a context whose sole entry was
-  # excluded here HAS reported — calling it MISSING would manufacture a
-  # blocking requirement out of the caller own still-running check, which is
-  # precisely the self-block the exclusion exists to prevent.
+  # 1. Label Gate lives in the "PR Review Policy" workflow and fails by design
+  #    whenever needs-external-review / needs-human-review / policy-violation /
+  #    human-hold is set. That enforcement is what Phase 4a is trying to
+  #    unblock; clearance is verified separately in gate (c).
+  #
+  #    This exclusion used to drop the entry from the projection outright,
+  #    which was correct while the filter judged rollup entries and became a
+  #    hard deadlock the moment it started iterating requirements: Label Gate
+  #    is one of the five canonical required contexts, so its requirement found
+  #    no entry and was synthesized as MISSING on EVERY evaluation, and gate
+  #    (a) could never clear on any consumer. Keeping the entry visible to the
+  #    presence test and hiding it only from the verdict is what the original
+  #    exclusion actually meant.
+  #
+  # 2. Approval readiness runs inside a check on the same HEAD, so the caller
+  #    own in-flight run must not decide its own verdict. Exclude only
+  #    non-completed checks from that exact trusted run; completed failures in
+  #    this run and active checks in every other run remain blocking.
   | ($counted_all
+     | map(select(
+         (.workflow != "PR Review Policy") or
+         (.label != "Label Gate")
+       ))
      | map(select(
          ($approval_readiness_only != "1")
          or ($current_run_id == "")
