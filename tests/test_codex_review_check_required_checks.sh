@@ -1576,15 +1576,29 @@ else
   fail "#1064: the unresolved state no longer surfaces as a blocking entry"
 fi
 
-# The candidate set is drawn AFTER the approval-readiness exclusion but the
-# exclusion only drops non-completed checks from the caller own trusted run, so
-# a still-running check of the caller cannot be reported as never-reported for
-# any OTHER run. The readiness filter must therefore stay on the entry
-# projection, not on the requirement iteration.
-if grep -q 'approval_readiness_only' <<<"$SCRIPT_CODE_1064"; then
-  pass "#1064: approval readiness still scopes the entry set it was written for"
+# PRESENCE is judged pre-exclusion, VERDICT post-exclusion.
+#
+# The approval-readiness exclusion drops non-completed checks from the caller
+# own trusted run so the gate cannot decide its own verdict. Drawing the
+# MISSING test from that same reduced set turns the caller in-flight check into
+# a manufactured blocking requirement — the exact self-block the exclusion
+# exists to prevent. This regressed once during the requirement-driven
+# restructure and the assertion that replaced it was too weak to notice, so it
+# is pinned on both halves now.
+if grep -q '\$counted_all' <<<"$SCRIPT_CODE_1064" \
+   && grep -q ')) as \$reported' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'elif (\$candidates | length) == 0' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: presence uses the pre-exclusion set and a caller-excluded requirement drops out rather than reporting MISSING"
 else
-  fail "#1064: the approval-readiness exclusion is gone — the gate can block forever on the caller own in-flight check"
+  fail "#1064: MISSING is derived from the readiness-filtered set — the caller own in-flight check would be reported as never-reported and block the gate on itself"
+fi
+
+# And the exclusion must still apply to verdict selection.
+if grep -q 'approval_readiness_only' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'current_run_id' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: the readiness exclusion still scopes verdict selection"
+else
+  fail "#1064: the approval-readiness exclusion is gone — the gate can block on its own in-flight check"
 fi
 
 

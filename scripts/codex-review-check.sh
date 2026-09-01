@@ -1710,17 +1710,6 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         isRequired: .isRequired,
         appId: (.appId // "")
       }
-    # Approval readiness runs inside a check on the same HEAD. If the
-    # requirement list is unreadable, the fail-closed full-rollup fallback
-    # would otherwise block forever on the caller itself. Exclude only
-    # non-completed checks from this exact trusted run; completed failures in
-    # this run and active checks in every other run remain blocking.
-    | select(
-        ($approval_readiness_only != "1")
-        or ($current_run_id == "")
-        or (.runId != $current_run_id)
-        or (.status == "COMPLETED")
-      )
     # Label Gate lives in the "PR Review Policy" workflow and fails by design
     # whenever needs-external-review / needs-human-review / policy-violation /
     # human-hold is set. That enforcement is what Phase 4a is trying to
@@ -1729,12 +1718,29 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         (.workflow != "PR Review Policy") or
         (.label != "Label Gate")
       )
-  ] as $entries
-  # Runs GitHub does not count toward THIS PR requirements are not evidence
-  # about them. Only an explicit `false` drops one: a null means GitHub
-  # returned no opinion, and treating that as not-required would silently empty
-  # the gate.
-  | ($entries | map(select(.isRequired != false))) as $counted
+    # Runs GitHub does not count toward THIS PR requirements are not evidence
+    # about them. Only an explicit `false` drops one: a null means GitHub
+    # returned no opinion, and treating that as not-required would silently
+    # empty the gate.
+    | select(.isRequired != false)
+  ] as $counted_all
+  # Approval readiness runs inside a check on the same HEAD, so the caller own
+  # in-flight run must not decide its own verdict. Exclude only non-completed
+  # checks from that exact trusted run; completed failures in this run and
+  # active checks in every other run remain blocking.
+  #
+  # The exclusion applies to VERDICT SELECTION only. PRESENCE is judged against
+  # the pre-exclusion set below, because a context whose sole entry was
+  # excluded here HAS reported — calling it MISSING would manufacture a
+  # blocking requirement out of the caller own still-running check, which is
+  # precisely the self-block the exclusion exists to prevent.
+  | ($counted_all
+     | map(select(
+         ($approval_readiness_only != "1")
+         or ($current_run_id == "")
+         or (.runId != $current_run_id)
+         or (.status == "COMPLETED")
+       ))) as $counted
   | if ($requirements | length) == 0
     then
       # No requirement list. Two very different reasons reach here, and they
@@ -1792,18 +1798,29 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
       # report, while these come from the branch rules themselves.
       ([ $requirements[]
          | . as $req
+         # PRESENCE from the pre-exclusion set, VERDICT from the post-exclusion
+         # one. A requirement whose only run is the caller own in-flight check
+         # has reported — it just has no entry eligible to decide the verdict —
+         # so it is neither MISSING nor judged, and drops out via `empty`.
+         | ($counted_all
+            | map(select(
+                (.label == $req.context)
+                and (($req.app_id == null) or (.appId == $req.app_id))
+              ))) as $reported
          | ($counted
             | map(select(
                 (.label == $req.context)
                 and (($req.app_id == null) or (.appId == $req.app_id))
               ))) as $candidates
-         | if ($candidates | length) == 0
+         | if ($reported | length) == 0
            then { label: $req.context,
                   workflow: (if $req.app_id == null
                              then "(not reported)"
                              else "(not reported by app \($req.app_id))"
                              end),
                   result: "MISSING" }
+           elif ($candidates | length) == 0
+           then empty
            else ($candidates | current_entry)
            end
        ]
