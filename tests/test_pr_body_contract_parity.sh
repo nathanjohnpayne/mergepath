@@ -362,6 +362,33 @@ else
   bad "stray-backtick body: expected count=1 agent=claude and Self-Review, got count=$got_count agent=$got_agent"
 fi
 
+# An ATX heading interrupts a paragraph even with NO blank line before it
+# (CommonMark headings always interrupt). The blank-line bound alone missed
+# this one-line-tighter variant of the same #1122 defect (Codex P2 on #1165).
+STRAY_BACKTICK_NO_BLANK=$'Authoring-Agent: claude\n\nProse call`s own thing.\n## Self-Review\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$STRAY_BACKTICK_NO_BLANK")"
+got_agent="$(pr_body_authoring_agent "$STRAY_BACKTICK_NO_BLANK")"
+if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ] && pr_body_has_self_review "$STRAY_BACKTICK_NO_BLANK"; then
+  ok "a stray backtick cannot pair past an interrupting ATX heading with no blank line before it"
+else
+  bad "stray-backtick-no-blank body: expected count=1 agent=claude and Self-Review, got count=$got_count agent=$got_agent"
+fi
+
+# CommonMark's blank line is spaces/tabs only, not JavaScript's broader
+# trim() whitespace set. A line of pure U+2003 is NOT blank in CommonMark, so
+# a code span crossing it stays open; treating it as blank would end the
+# code-span search early and let its content -- including an
+# Authoring-Agent: line -- surface as a live declaration instead of staying
+# hidden inline code (Codex P1 on #1165: an identity-check bypass, not just a
+# false rejection).
+UNICODE_WHITESPACE_NOT_BLANK=$'## Self-Review\n\n`example\n\xe2\x80\x83\nAuthoring-Agent: codex\n`'
+got_count="$(pr_body_authoring_agent_count "$UNICODE_WHITESPACE_NOT_BLANK")"
+if [ "$got_count" = "0" ]; then
+  ok "a line of pure Unicode whitespace does not end a code span (Authoring-Agent stays hidden)"
+else
+  bad "unicode-whitespace body: Authoring-Agent inside a code span was accepted (count=$got_count)"
+fi
+
 # --- 11. the HOOK must fail closed on parser trouble --------------------------
 # A non-2 hook exit is a NONBLOCKING error in the hook wiring, so letting `set
 # -e` propagate the helper status would fail OPEN on the self-approve check --

@@ -205,19 +205,35 @@ function scanCodeSpanTicks(line, activeTicks, lines, lineIndex) {
 function hasMatchingCodeSpanRun(lines, lineIndex, column, runLength) {
   // A code span's closer must land in the SAME paragraph as its opener: in
   // CommonMark, inline parsing (and so backtick pairing) never crosses a
-  // blank line. Without this bound, a stray/unmatched backtick anywhere
-  // earlier in the body could pair with an unrelated backtick many
+  // paragraph boundary. Without this bound, a stray/unmatched backtick
+  // anywhere earlier in the body could pair with an unrelated backtick many
   // paragraphs later -- e.g. a typo'd "call`s own" pairing with the next
   // real `code span` and swallowing every top-level marker in between,
   // including a genuine "## Self-Review" heading (reproduced on #1122).
   for (let index = lineIndex; index < lines.length; index += 1) {
-    if (index > lineIndex && lines[index].trim() === '') return false;
+    if (index > lineIndex && interruptsParagraph(lines[index])) return false;
     const candidate = index === lineIndex ? lines[index].slice(column) : lines[index];
     for (const match of candidate.matchAll(/`+/g)) {
       if (match[0].length === runLength) return true;
     }
   }
   return false;
+}
+
+// CommonMark's blank line is spaces/tabs only (or nothing) -- NOT
+// JavaScript's broader trim() whitespace set, which also strips Unicode
+// separators like U+2003. A line of pure U+2003 is not blank in CommonMark,
+// so treating it as one would end a code-span search early and let genuine
+// code-span content (e.g. a smuggled "Authoring-Agent:" line) surface as a
+// live top-level declaration instead of staying hidden inline code.
+//
+// An ATX heading also ends a paragraph even with NO blank line before it --
+// CommonMark headings interrupt paragraphs unconditionally. Without this, a
+// stray backtick on the line immediately above a "## Self-Review" heading
+// (no blank line separating them) could still reach past the heading to
+// pair with a later backtick, the same swallowing bug with one fewer line.
+function interruptsParagraph(line) {
+  return /^[ \t]*$/.test(line) || /^ {0,3}#{1,6}(?:[ \t]|$)/.test(line);
 }
 
 const mode = process.argv[2];
