@@ -1,0 +1,281 @@
+# scripts/lib/branch-requirements.sh
+#
+# Resolve the required status checks that actually gate merges on a branch,
+# from a token that has NO `Administration:read` (nathanjohnpayne/mergepath#1064,
+# subsuming #1063).
+#
+# ─────────────────────────────────────────────────────────────────────
+# The defect this closes
+# ─────────────────────────────────────────────────────────────────────
+#
+# `scripts/codex-review-check.sh` gate (a) read the required-check list from
+# the REST branch-protection endpoint:
+#
+#     gh api repos/$REPO/branches/$BRANCH/protection/required_status_checks
+#
+# That endpoint needs `Administration:read`, and GitHub HIDES the resource
+# rather than admitting a permission denial — an unprivileged token gets
+# **404, not 403**. Gate (a) read that 404 as "no required checks are
+# configured", imposed no filter, and passed unconditionally. Measured live on
+# nathanjohnpayne/nathanpaynedotcom, same endpoint, same moment:
+#
+#     reviewer PAT (write scope) → {"message":"Not Found","status":"404"}
+#     author  PAT (admin scope)  → 7 contexts, strict: true
+#
+# Every caller in the fleet runs unprivileged. Agents invoke this script under
+# a reviewer PAT, and `.github/workflows/auto-clear-blocking-labels.yml` runs
+# it with `GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}` — a reviewer PAT
+# too — while NOT skipping gate (a) the way merge-clearance-gate.yml does. So
+# gate (a) evaluated an empty required set on every path it is actually used
+# on, and a genuinely red required check went unnoticed. That is the fail-open
+# #465 set out to close, reopened through the one door #465's 403 arm does not
+# cover.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Why the fix is a different READ, not a different DECISION
+# ─────────────────────────────────────────────────────────────────────
+#
+# #1064 framed this as needing "a privileged read CI can reach", and the #1061
+# attempt that was reverted in 2e5da40 tried exactly that: retry the same REST
+# endpoint under `OP_PREFLIGHT_AUTHOR_PAT`. It cannot work — auto-clear CI has
+# no author PAT, and `preflight_require_token` returns early when `GH_TOKEN` is
+# already set, so the retry is unreachable dead code there. What was left was a
+# choice between two bad options: fail closed on an unreadable list (which
+# treats every optional and stale-red rollup entry as required, blocking PRs
+# fleet-wide) or keep failing open.
+#
+# That dilemma was false. The REST endpoint is not the only surface carrying
+# this data, and the other two are readable by a PLAIN WRITE-SCOPED TOKEN:
+#
+#   1. GraphQL `repository.ref.refUpdateRule.requiredStatusCheckContexts`
+#      — CLASSIC branch protection, which is what the whole fleet uses today.
+#   2. REST `repos/{owner}/{repo}/rules/branches/{branch}`
+#      — repository RULESETS, the modern model.
+#
+# `scripts/merge-clearance-gate.sh` already reads both, from CI, under the same
+# reviewer token, for its own enforcement probe — this lib generalises that
+# proven pair rather than inventing a surface. Measured live while writing
+# this, with the reviewer PAT that 404s on REST above:
+#
+#     nathanpaynedotcom@main → 7 contexts (exactly the admin-visible list)
+#     mergepath@main         → 6 contexts
+#
+# So gate (a) does not need an admin token, a new secret, or a privilege
+# grant. It needed a different query.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Why both surfaces, and why the union
+# ─────────────────────────────────────────────────────────────────────
+#
+# They are not alternatives. GitHub enforces classic protection and every
+# applicable ruleset SIMULTANEOUSLY, so the effective requirement is the UNION
+# of the two lists. Classic protection does not surface on the rulesets
+# endpoint and vice versa: verified live on mergepath@main, whose classic
+# contexts are non-empty while `rules/branches/main` returns `[]`. Reading
+# either alone and stopping there under-reports on a repo that uses the other.
+#
+# Both surfaces are scoped to rules enforced on the VIEWER, so a bypass actor
+# can only HIDE a rule from this reader, never invent one. For a filter that
+# means the resolved list can only ever be a SUBSET of the true one, which
+# pushes gate (a) toward scrutinising fewer checks — the same direction as the
+# pre-existing behaviour, never toward newly blocking a PR that GitHub itself
+# would merge. That asymmetry is what makes adopting this safe fleet-wide.
+#
+# ─────────────────────────────────────────────────────────────────────
+# The tri-state, and why "unknown" is not "empty"
+# ─────────────────────────────────────────────────────────────────────
+#
+# The whole bug was one conflation: "I read the config and it requires
+# nothing" and "I could not read the config" produced the same empty list and
+# therefore the same decision. This helper never merges them. `state` is:
+#
+#   known    at least one surface answered. `contexts` is what it/they carry,
+#            and MAY legitimately be empty (an approvals-only branch really
+#            does require no status checks).
+#   unknown  no surface answered. `contexts` is empty because nothing was
+#            learned, and a caller must NOT read that as "nothing required".
+#
+# `partial` marks a `known` result where one surface answered and the other
+# errored. It stays `known` deliberately: on a classic-protected repo whose
+# rulesets read hiccups, filtering on the classic list is strictly better than
+# degrading to `unknown` and imposing no filter at all. `surfaces` and `errors`
+# record which is which so an operator can tell a degraded read from a clean
+# one without re-running under a different token.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Contract
+# ─────────────────────────────────────────────────────────────────────
+#
+#   br_urlencode_branch_path <branch>
+#     Percent-encode a branch name for interpolation into an API path.
+#
+#   br_required_checks <owner/repo> <branch>
+#     Print ONE JSON object and return 0:
+#       { "state": "known"|"unknown",
+#         "partial": true|false,
+#         "contexts": [ "<check name>", ... ],   # sorted, deduped
+#         "surfaces": [ "classic", "rulesets" ], # the ones that ANSWERED
+#         "errors":   [ "<surface>: <message>", ... ] }
+#     Never returns non-zero for an unreadable config — an unreadable config
+#     is a RESULT (`unknown`), not a failure of the helper. Callers branch on
+#     `.state`, so a helper that exited would force every caller to duplicate
+#     the tri-state in exit codes.
+#
+# Bounded limitation, stated rather than hidden: a branch that does not exist
+# resolves to `known` + `partial` + `[]`, because `rules/branches/{branch}`
+# answers 200 `[]` for ANY branch name (verified live) and cannot distinguish
+# "no rules apply here" from "here is nowhere". The classic surface does not
+# make the claim — it reports the ref as not found and contributes nothing —
+# so the empty list comes from the rulesets read alone. Gate (a)'s only input
+# is a PR's own base ref, which exists by construction, so this is unreachable
+# from the caller that motivated the lib; a future caller resolving an
+# arbitrary ref should test existence separately rather than infer it here.
+#
+# Requires: gh, jq. Bash 3.2 portable (no associative arrays, no mapfile).
+
+# Percent-encode a branch name for interpolation into an API path.
+#
+# `gh api` passes the path through verbatim, so a branch name carrying a
+# character that is legal in a git ref but structural in a URL corrupts the
+# request rather than 404ing honestly: `#` truncates everything after it as a
+# fragment, `%` is read as the start of an escape, and `?` starts a query
+# string. Each silently addresses a DIFFERENT branch, or none — and an empty
+# result is indistinguishable from "nothing required", which is precisely the
+# conflation this lib exists to remove.
+#
+# Slashes are the one thing that must NOT be encoded: GitHub addresses a
+# hierarchical branch name (`release/1.0`) with literal separators in these
+# routes, so encoding `/` as %2F would break the common case to guard the rare
+# one. Each segment is encoded on its own and the segments rejoined. jq's
+# `@uri` does the per-segment work — correct for UTF-8, which a hand-rolled
+# byte loop is not — and jq is already a hard dependency of every caller.
+#
+# This is the promoted copy of the definition that lived only in
+# scripts/audit-branch-protection.sh, which is hub-only and so could not be
+# reused by the propagated scripts that need it (#1063).
+br_urlencode_branch_path() {
+  jq -rn --arg s "${1-}" '$s | split("/") | map(@uri) | join("/")'
+}
+
+# Resolve the required status checks enforced on <branch> of <owner/repo>.
+# See the contract block above for the emitted shape.
+br_required_checks() {
+  local repo="${1-}"
+  local branch="${2-}"
+  local owner name branch_enc
+  local classic_out rulesets_out errfile
+  local classic_ctx='[]' rulesets_ctx='[]'
+  local surfaces='[]' errors='[]'
+  local classic_ok=0 rulesets_ok=0
+  local ref_seen
+
+  # Emit a well-formed `unknown` for a malformed call rather than a bare
+  # failure: a caller that mis-invokes this must land on the conservative
+  # branch, not on an empty string it might then treat as "nothing required".
+  if [ -z "$repo" ] || [ -z "$branch" ] || [ "${repo#*/}" = "$repo" ]; then
+    jq -nc --arg r "$repo" --arg b "$branch" \
+      '{state:"unknown", partial:false, contexts:[], surfaces:[],
+        errors:["args: expected <owner/repo> <branch>, got repo=\($r) branch=\($b)"]}'
+    return 0
+  fi
+
+  owner="${repo%%/*}"
+  name="${repo##*/}"
+  branch_enc="$(br_urlencode_branch_path "$branch")"
+  errfile="$(mktemp)"
+
+  # ── Surface 1: classic branch protection, via GraphQL.
+  #
+  # `refUpdateRule` is the viewer-scoped projection of classic protection and,
+  # unlike the REST protection endpoint, needs no Administration:read.
+  #
+  # The ref is selected by its FULLY QUALIFIED name. `qualifiedName` also
+  # accepts a short name, but a branch and a tag can share one, and the tag
+  # would win for some inputs — `refs/heads/` is unambiguous. The branch is
+  # interpolated RAW here (not percent-encoded): this is a GraphQL variable
+  # carried in the request BODY, not a URL path segment, so encoding it would
+  # look for a branch whose name literally contains `%23`.
+  if classic_out="$(gh api graphql \
+      -f query='query($owner:String!,$name:String!,$qualifiedName:String!){
+        repository(owner:$owner,name:$name){
+          ref(qualifiedName:$qualifiedName){
+            refUpdateRule{ requiredStatusCheckContexts }
+          }
+        }
+      }' \
+      -F owner="$owner" -F name="$name" -F qualifiedName="refs/heads/$branch" \
+      2>"$errfile")"; then
+    # A 200 can still carry a GraphQL `errors` array with a null data field,
+    # and `gh` does not always exit non-zero for it. Treat any errors array as
+    # a failed read: a partial response would under-report the list, and this
+    # surface's whole value is that its list is trustworthy.
+    if [ -n "$(printf '%s' "$classic_out" | jq -r '(.errors // []) | if length > 0 then .[0].message else "" end' 2>/dev/null)" ]; then
+      errors="$(printf '%s' "$errors" | jq -c --arg m "$(printf '%s' "$classic_out" | jq -r '.errors[0].message' 2>/dev/null)" '. + ["classic: graphql error: \($m)"]')"
+    else
+      # Distinguish "the ref was observed and carries no protection rule"
+      # (a real, usable answer: nothing is required by the classic surface)
+      # from "the ref itself came back null" (the branch was not seen at all,
+      # so NOTHING was learned and claiming an empty list would be the same
+      # fabrication this lib exists to prevent).
+      ref_seen="$(printf '%s' "$classic_out" | jq -r 'if .data.repository.ref == null then "no" else "yes" end' 2>/dev/null || echo "no")"
+      if [ "$ref_seen" = "yes" ]; then
+        classic_ctx="$(printf '%s' "$classic_out" \
+          | jq -c '[.data.repository.ref.refUpdateRule.requiredStatusCheckContexts // empty | .[]? | select(type == "string")]' 2>/dev/null || echo '[]')"
+        classic_ok=1
+      else
+        errors="$(printf '%s' "$errors" | jq -c '. + ["classic: ref not found in the GraphQL response; nothing learned about classic protection"]')"
+      fi
+    fi
+  else
+    errors="$(printf '%s' "$errors" | jq -c --arg m "$(tr '\n' ' ' <"$errfile")" '. + ["classic: \($m)"]')"
+  fi
+
+  # ── Surface 2: repository rulesets, via REST.
+  #
+  # `--paginate` is load-bearing: this endpoint pages at 30 applicable rules,
+  # and stacked rulesets can push a `required_status_checks` rule onto page 2.
+  # A truncated first page is INDISTINGUISHABLE from an absent rule, so the
+  # omission would silently drop contexts instead of announcing itself.
+  #
+  # `--paginate` emits one JSON array per page, so the filter slurps (`-s`)
+  # and concatenates with `add`; `objects` keeps a non-object page element (an
+  # error envelope on a partial-failure page) from hard-erroring mid-stream.
+  #
+  # A branch with no rulesets answers `[]` with HTTP 200 — verified live —
+  # which is a successful read of "no ruleset requirements", not a failure.
+  if rulesets_out="$(gh api --paginate "repos/$repo/rules/branches/$branch_enc" 2>"$errfile")"; then
+    if rulesets_ctx="$(printf '%s' "$rulesets_out" | jq -c -s '
+        add // []
+        | [ .[]? | objects
+            | select(.type == "required_status_checks")
+            | .parameters.required_status_checks[]?
+            | .context? | select(type == "string") ]' 2>"$errfile")"; then
+      rulesets_ok=1
+    else
+      rulesets_ctx='[]'
+      errors="$(printf '%s' "$errors" | jq -c --arg m "$(tr '\n' ' ' <"$errfile")" '. + ["rulesets: unparseable response: \($m)"]')"
+    fi
+  else
+    errors="$(printf '%s' "$errors" | jq -c --arg m "$(tr '\n' ' ' <"$errfile")" '. + ["rulesets: \($m)"]')"
+  fi
+
+  rm -f "$errfile"
+
+  [ "$classic_ok" -eq 1 ] && surfaces="$(printf '%s' "$surfaces" | jq -c '. + ["classic"]')"
+  [ "$rulesets_ok" -eq 1 ] && surfaces="$(printf '%s' "$surfaces" | jq -c '. + ["rulesets"]')"
+
+  jq -nc \
+    --argjson classic "$classic_ctx" \
+    --argjson rulesets "$rulesets_ctx" \
+    --argjson surfaces "$surfaces" \
+    --argjson errors "$errors" \
+    --argjson classic_ok "$classic_ok" \
+    --argjson rulesets_ok "$rulesets_ok" '
+    (($classic_ok + $rulesets_ok) > 0) as $known
+    | { state: (if $known then "known" else "unknown" end),
+        partial: ($known and (($classic_ok + $rulesets_ok) == 1)),
+        contexts: (if $known then (($classic + $rulesets) | unique) else [] end),
+        surfaces: $surfaces,
+        errors: $errors }
+  '
+}

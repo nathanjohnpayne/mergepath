@@ -362,6 +362,20 @@ paths:
   - path: scripts/lib/gh-api-scalar.sh
     type: canonical
     consumers: all
+  # Branch-requirement resolver (#1064, subsuming #1063). Answers "which status
+  # checks actually gate merges on this branch" from a token with NO
+  # Administration:read, by reading the two viewer-scoped surfaces that a plain
+  # write-scoped token can see (GraphQL refUpdateRule for classic protection,
+  # REST rules/branches for rulesets) instead of the admin-only REST protection
+  # endpoint. That endpoint answers 404 — not 403 — for an unprivileged token,
+  # so gate (a) read "nothing is required" and passed without examining a check
+  # run on every path it is actually used on. Returns an explicit tri-state so
+  # "requires nothing" and "could not look" can never again be the same answer.
+  # HARD-sourced by codex-review-check.sh (exit 3 when absent) and declared in
+  # its requires: below — a degraded mode here IS the defect.
+  - path: scripts/lib/branch-requirements.sh
+    type: canonical
+    consumers: all
   # Paginated LIST reader (#1008) — the array twin of gh-api-scalar.sh above,
   # and the one definition of `fetch → capture → flatten` that eight review
   # sensing scripts each used to carry inline. The duplication is what
@@ -493,6 +507,7 @@ paths:
       - "scripts/lib/reviewers-helpers.sh"   # #453, hard-sourced for the gate (b)/(c) reviewer allow-list
       - "scripts/lib/codex-failure-markers.sh"   # #722, sourced for the gate (c) usage-limit/not-connected diagnostic
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/lib/branch-requirements.sh"   # #1064, hard-sourced gate (a) required-check resolution
   # Phase 4a feedback loop (#487): records the validated 👍/👎 reaction
   # Codex solicits on each finding. WRITE path — every reaction POST goes
   # through scripts/gh-as-reviewer.sh under the reviewer identity, so the
