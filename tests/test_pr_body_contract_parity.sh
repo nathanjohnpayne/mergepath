@@ -459,6 +459,20 @@ else
   bad "blockquote-no-open-paragraph body: expected count=2 and Self-Review, got count=$got_count"
 fi
 
+# A whitespace-only line (a tab, or 4+ spaces, nothing else) is blank in
+# CommonMark regardless of length and must end lazy continuation, same as
+# any other blank line. Checking the indentedCode short-circuit before the
+# lazyContainer state handler swallowed such a line as "indented code" and
+# left lazyContainer stuck set, suppressing a valid declaration after it
+# (Codex P2 on #1165).
+WHITESPACE_ONLY_BLANK_LINE=$'Authoring-Agent: claude\n\n> quoted paragraph\n\t\nAuthoring-Agent: codex\n\n## Self-Review'
+got_count="$(pr_body_authoring_agent_count "$WHITESPACE_ONLY_BLANK_LINE")"
+if [ "$got_count" = "2" ] && pr_body_has_self_review "$WHITESPACE_ONLY_BLANK_LINE"; then
+  ok "a whitespace-only (tab) blank line ends lazy continuation like any other blank line"
+else
+  bad "whitespace-only-blank-line body: expected count=2 and Self-Review, got count=$got_count"
+fi
+
 # Ordered lists can interrupt a paragraph ONLY when the start number is 1;
 # "2. item" does not, so a real multi-line code span may legitimately cross
 # it (Codex P1 on #1165: the generalized matcher over-classified every

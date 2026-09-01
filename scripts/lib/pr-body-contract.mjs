@@ -164,12 +164,16 @@ export function parsePrBodyContract(body) {
       continue;
     }
 
-    if (indentedCode) continue;
-
-    // Checked on rawLine, before fence/comment/code-span opening below: a
-    // construct that opens one of those states (e.g. a bare fence with no
-    // ">" prefix) genuinely exits the container, and this line's OWN
-    // handling of that state takes over from here as normal.
+    // Checked before the indentedCode short-circuit below (and before
+    // fence/comment/code-span opening): a whitespace-only line is blank
+    // regardless of how much whitespace it carries -- 4+ spaces or a tab
+    // included -- and interruptsParagraph's blank check already handles any
+    // length. Checking indentedCode first would swallow such a line as
+    // "indented code" and leave lazyContainer stuck set, suppressing a
+    // valid top-level declaration after it. A construct that opens one of
+    // the other states (e.g. a bare fence with no ">" prefix) genuinely
+    // exits the container, and this line's OWN handling of that state
+    // takes over from here as normal.
     if (lazyContainer) {
       if (isContainerMarker(rawLine)) {
         // Re-evaluate on every explicit continuation line: a later "> ..."
@@ -184,6 +188,8 @@ export function parsePrBodyContract(body) {
         continue;
       }
     }
+
+    if (indentedCode) continue;
 
     const opening =
       fenceLine.match(/^(`{3,})([^`]*)$/) ?? fenceLine.match(/^(~{3,})(.*)$/);
