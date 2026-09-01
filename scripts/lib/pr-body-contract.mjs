@@ -203,7 +203,15 @@ function scanCodeSpanTicks(line, activeTicks, lines, lineIndex) {
 }
 
 function hasMatchingCodeSpanRun(lines, lineIndex, column, runLength) {
+  // A code span's closer must land in the SAME paragraph as its opener: in
+  // CommonMark, inline parsing (and so backtick pairing) never crosses a
+  // blank line. Without this bound, a stray/unmatched backtick anywhere
+  // earlier in the body could pair with an unrelated backtick many
+  // paragraphs later -- e.g. a typo'd "call`s own" pairing with the next
+  // real `code span` and swallowing every top-level marker in between,
+  // including a genuine "## Self-Review" heading (reproduced on #1122).
   for (let index = lineIndex; index < lines.length; index += 1) {
+    if (index > lineIndex && lines[index].trim() === '') return false;
     const candidate = index === lineIndex ? lines[index].slice(column) : lines[index];
     for (const match of candidate.matchAll(/`+/g)) {
       if (match[0].length === runLength) return true;

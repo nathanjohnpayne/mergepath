@@ -344,6 +344,24 @@ else
   bad "backtick-info body: expected count=1 agent=claude, got count=$got_count agent=$got_agent"
 fi
 
+# A code span's closer must not cross a blank line: CommonMark never pairs
+# backticks across a paragraph boundary. Without that bound, a stray/unmatched
+# backtick (an apostrophe mistyped as a backtick, e.g. "call`s own") paired
+# with the next unrelated backtick run several paragraphs later and swallowed
+# everything in between, including a genuine "## Self-Review" heading.
+# Reproduced against the live parser on the real body of #1122, which the
+# retroactive #1160 audit flagged as "missing Self-Review" -- a false
+# positive: the heading was present, but a stray backtick earlier in the body
+# (an apostrophe typo) paired with an unrelated later code span and hid it.
+STRAY_BACKTICK=$'Authoring-Agent: claude\n\nIt points at the failing call`s own thing.\n\n## Self-Review\n\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$STRAY_BACKTICK")"
+got_agent="$(pr_body_authoring_agent "$STRAY_BACKTICK")"
+if [ "$got_count" = "1" ] && [ "$got_agent" = "claude" ] && pr_body_has_self_review "$STRAY_BACKTICK"; then
+  ok "a stray backtick in one paragraph cannot pair across a blank line and hide a later Self-Review heading"
+else
+  bad "stray-backtick body: expected count=1 agent=claude and Self-Review, got count=$got_count agent=$got_agent"
+fi
+
 # --- 11. the HOOK must fail closed on parser trouble --------------------------
 # A non-2 hook exit is a NONBLOCKING error in the hook wiring, so letting `set
 # -e` propagate the helper status would fail OPEN on the self-approve check --
