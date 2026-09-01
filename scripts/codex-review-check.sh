@@ -985,7 +985,13 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       # and block PRs GitHub merges.
       appId: ((.checkSuite.app.databaseId // "") | tostring),
       startedAt: .startedAt,
-      completedAt: .completedAt
+      completedAt: .completedAt,
+      # A StatusContext (legacy commit status) has NO startedAt/completedAt —
+      # only createdAt, which the query already selects. Carried so the
+      # per-name winner selection has a real ordering key for those entries
+      # instead of comparing empty strings and taking whichever node happened
+      # to sort last (#1064).
+      createdAt: .createdAt
     }))
 }')
 # #655 Codex P1 round 7 ("keep rollup when annex only has matrix jobs"): a
@@ -1530,6 +1536,9 @@ BRANCH_REQUIREMENTS_PARTIAL=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r 'i
 BRANCH_REQUIREMENTS_SURFACES=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '(.surfaces // []) | join("+")')
 BRANCH_REQUIREMENTS_ERRORS=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '(.errors // []) | join("; ")')
 REQUIRED_CHECK_NAMES=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '(.contexts // []) | .[]')
+# Requirements whose producing app is knowable (ruleset-sourced only — see the
+# missing-check scan below for why classic cannot contribute here).
+REQUIRED_PAIRS_JSON=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -c '(.required_pairs // [])')
 
 if [ "$BRANCH_REQUIREMENTS_STATE" = "known" ]; then
   protection_readable=1
@@ -1620,10 +1629,14 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         runId: (.runId // ""),
         status: (.status // ""),
         result: (.conclusion // .state // ""),
-        # Carried for the per-name winner selection below (#1064). Absent on a
-        # StatusContext, which the selection handles as a non-terminal entry.
-        startedAt: (.startedAt // ""),
-        completedAt: (.completedAt // ""),
+        # Carried for the per-name winner selection below (#1064). A CheckRun
+        # has startedAt/completedAt; a StatusContext has only createdAt, so it
+        # falls back to that rather than to an empty string — otherwise every
+        # legacy status in a group compares equal and the winner is whichever
+        # node happened to sort last, letting an older SUCCESS hide the current
+        # FAILURE.
+        startedAt: (.startedAt // .createdAt // ""),
+        completedAt: (.completedAt // .createdAt // ""),
         isRequired: .isRequired,
         appId: (.appId // "")
       }
@@ -1776,14 +1789,45 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
 # an excluded-but-present check as "never reported" would reinstate exactly
 # that self-block.
 if [ "$(printf '%s' "${REQUIRED_JSON:-[]}" | jq -r 'length')" -gt 0 ]; then
+  # Two passes, because the two rule surfaces expose different amounts.
+  #
+  # By NAME, for every requirement: a context with no reported entry at all.
+  #
+  # By (NAME, APP), for the requirements whose producing app is knowable: when
+  # protection requires one context from apps A and B and only A has reported,
+  # the NAME is present, so the name pass alone sees nothing outstanding while
+  # GitHub is still waiting for B.
+  #
+  # Only the rulesets surface exposes the producing app (`integration_id`).
+  # Classic protection does not: `RefUpdateRule.requiredStatusCheckContexts` is
+  # a list of bare strings and carries no app identity, and the object that does
+  # (`BranchProtectionRule`) needs `Administration:read` — the very scope this
+  # whole change exists to avoid depending on. So per-producer presence is
+  # checked for ruleset-sourced requirements and falls back to name presence for
+  # classic-sourced ones. The gap is bounded: it needs one context required from
+  # two DIFFERENT apps via classic protection, and only the second app to have
+  # not reported. Measured across this fleet, no repo configures that — every
+  # required context is listed once under app 15368.
   MISSING_REQUIRED=$(echo "$ROLLUP_JSON" | jq -c \
-    --argjson required_names "${REQUIRED_JSON:-[]}" '
+    --argjson required_names "${REQUIRED_JSON:-[]}" \
+    --argjson required_pairs "${REQUIRED_PAIRS_JSON:-[]}" '
     [ .statusCheckRollup[]
       | select(.isRequired != false)
       | (.name // .context // "?") ] as $reported
+    | [ .statusCheckRollup[]
+        | select(.isRequired != false)
+        | { context: (.name // .context // "?"), app_id: (.appId // "") } ] as $reported_pairs
     | [ $required_names[]
         | select(($reported | index(.)) == null)
         | { label: ., workflow: "(not reported)", result: "MISSING" } ]
+      + [ $required_pairs[]
+          | . as $pair
+          | select([ $reported_pairs[]
+                     | select(.context == $pair.context and .app_id == $pair.app_id) ] | length == 0)
+          | { label: $pair.context,
+              workflow: "(not reported by app \($pair.app_id))",
+              result: "MISSING" } ]
+      | unique
   ')
   if [ "$(printf '%s' "$MISSING_REQUIRED" | jq -r 'length')" -gt 0 ]; then
     log "gate (a): $(printf '%s' "$MISSING_REQUIRED" | jq -r 'length') required check(s) on $BASE_BRANCH have not reported for this head: $(printf '%s' "$MISSING_REQUIRED" | jq -r '[.[].label] | join(", ")') — GitHub treats an unreported required context as unsatisfied, so gate (a) does too."

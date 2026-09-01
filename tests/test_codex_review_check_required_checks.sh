@@ -1529,6 +1529,27 @@ else
   fail "#1064: an unreported required check leaves BAD_CHECKS empty and gate (a) clears while GitHub still blocks the merge"
 fi
 
+# A StatusContext (legacy commit status) carries only createdAt — no
+# startedAt/completedAt. Without carrying it, every legacy status in a group
+# compares equal in the winner sort and the survivor is whichever node happened
+# to sort last, so an older SUCCESS can hide the current FAILURE.
+if grep -q 'createdAt: .createdAt' "$SCRIPT" \
+   && grep -q 'startedAt: (.startedAt // .createdAt' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: a StatusContext falls back to createdAt, so legacy statuses have a real ordering key"
+else
+  fail "#1064: StatusContext entries reach the winner sort with empty timestamps — the survivor is then array order, not the newest status"
+fi
+
+# Per-producer presence, for the requirements whose app is knowable. Only the
+# rulesets surface exposes it; RefUpdateRule carries bare context strings, so
+# classic-sourced requirements fall back to name presence by necessity.
+if grep -q 'required_pairs' "$SCRIPT" \
+   && grep -q 'not reported by app' "$SCRIPT"; then
+  pass "#1064: the missing scan also checks (context, app) presence where the producing app is knowable"
+else
+  fail "#1064: the missing scan compares names only, so a required context reported by one of two required apps reads as satisfied"
+fi
+
 # The missing-check scan must NOT reuse the approval-readiness-filtered set:
 # that filter deliberately ignores still-running checks from the caller own
 # trusted run, and calling those "never reported" reinstates the self-block it

@@ -323,10 +323,17 @@ br_required_checks() {
           then error("rules/branches returned \($malformed | length) malformed required_status_checks rule(s)")
           else .
           end
+        # Emitted as {context, app_id} pairs, not bare names. Rulesets expose
+        # the producing app as `integration_id`, and a caller checking whether
+        # every requirement has REPORTED needs that: when one context is
+        # required from two apps and only one has reported, the name is present
+        # while a requirement is still outstanding. `app_id` is null when the
+        # rule accepts the context from any producer.
         | [ .[]? | objects
             | select(.type == "required_status_checks")
             | .parameters.required_status_checks[]?
-            | .context ]' 2>"$errfile")"; then
+            | { context: .context,
+                app_id: (if .integration_id == null then null else (.integration_id | tostring) end) } ]' 2>"$errfile")"; then
       rulesets_ok=1
     else
       rulesets_ctx='[]'
@@ -364,9 +371,21 @@ br_required_checks() {
     --argjson classic_ok "$classic_ok" \
     --argjson rulesets_ok "$rulesets_ok" '
     (($classic_ok + $rulesets_ok) == 2) as $known
+    | ($rulesets | map(.context)) as $ruleset_names
     | { state: (if $known then "known" else "unknown" end),
         partial: (($classic_ok + $rulesets_ok) == 1),
-        contexts: (if $known then (($classic + $rulesets) | unique) else [] end),
+        contexts: (if $known then (($classic + $ruleset_names) | unique) else [] end),
+        # Requirements carrying a KNOWN producing app. Rulesets expose
+        # `integration_id`; the classic surface does not — `RefUpdateRule`
+        # exposes `requiredStatusCheckContexts` as bare strings and nothing
+        # else, so an unprivileged reader cannot learn which app a classic
+        # requirement is pinned to. A caller checking per-producer presence can
+        # therefore only do so for the pairs listed here, and must fall back to
+        # name presence for the rest. Stated so the gap is visible at the call
+        # site rather than inferred from an empty list.
+        required_pairs: (if $known
+                         then [ $rulesets[] | select(.app_id != null) ] | unique
+                         else [] end),
         surfaces: $surfaces,
         errors: $errors }
   '
