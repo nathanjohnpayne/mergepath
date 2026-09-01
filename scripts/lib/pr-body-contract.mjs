@@ -58,6 +58,25 @@ function isContainerMarker(line) {
   return BLOCKQUOTE_RE.test(line) || (BARE_LIST_MARKER_RE.test(line) && !isSetextOrThematicLine(line));
 }
 
+// Lazy continuation extends an OPEN PARAGRAPH inside the container -- never
+// any other block type. A container line whose own content (after its
+// marker) is itself blank, or is itself a heading/fence/another
+// container/etc., has NO open paragraph, so nothing that follows it is a
+// lazy continuation: "> # quoted heading" opens a heading inside the quote,
+// not a paragraph, so an unprefixed "Authoring-Agent:" line right after it
+// is a fresh top-level paragraph, not nested content. Assumes line already
+// satisfies isContainerMarker(line).
+function opensLazyParagraph(line) {
+  const blockquote = line.match(BLOCKQUOTE_RE);
+  if (blockquote) {
+    const remainder = line.slice(blockquote[0].length).replace(/^ /, '');
+    return remainder.trim() !== '' && !interruptsParagraph(remainder);
+  }
+  const listItem = line.match(/^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+(\S.*)?)?$/);
+  const remainder = (listItem?.[1] ?? '').trim();
+  return remainder !== '' && !interruptsParagraph(remainder);
+}
+
 // A GENUINE list item: unlike isContainerMarker() above, requires real
 // content after the marker (CommonMark: an empty list item cannot interrupt
 // a paragraph) and, for an ordered marker, a NUMERIC start value of 1
@@ -152,7 +171,13 @@ export function parsePrBodyContract(body) {
     // ">" prefix) genuinely exits the container, and this line's OWN
     // handling of that state takes over from here as normal.
     if (lazyContainer) {
-      if (isContainerMarker(rawLine)) continue;
+      if (isContainerMarker(rawLine)) {
+        // Re-evaluate on every explicit continuation line: a later "> ..."
+        // can open (or fail to open) its own paragraph independently of
+        // whatever came before it in the same container.
+        lazyContainer = opensLazyParagraph(rawLine);
+        continue;
+      }
       if (interruptsParagraph(rawLine)) {
         lazyContainer = false;
       } else {
@@ -216,11 +241,14 @@ export function parsePrBodyContract(body) {
 
     if (/^(?: {4}|\t)/.test(line)) continue;
 
-    // A fresh blockquote or list item at top level: everything that
-    // follows it, up to a blank line or another interrupting construct, is
-    // its lazy continuation (see the lazyContainer declaration above).
+    // A fresh blockquote or list item at top level: IF it opens a
+    // paragraph (see opensLazyParagraph), everything that follows it, up to
+    // a blank line or another interrupting construct, is that paragraph's
+    // lazy continuation (see the lazyContainer declaration above). A
+    // container whose own content is a heading/fence/etc. has no open
+    // paragraph, so lazyContainer stays false and the next line is fresh.
     if (isContainerMarker(line)) {
-      lazyContainer = true;
+      lazyContainer = opensLazyParagraph(line);
       continue;
     }
 

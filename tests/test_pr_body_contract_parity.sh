@@ -446,6 +446,19 @@ else
   bad "list-item-interrupt body: expected count=2 (decoy stays visible), got count=$got_count"
 fi
 
+# Lazy continuation extends an OPEN PARAGRAPH inside a container -- never any
+# other block type. A blockquote whose own content is itself a heading has
+# no open paragraph, so the unprefixed line right after it is a FRESH
+# top-level paragraph, not nested content (Codex P2 on #1165, caught on the
+# round-5 lazy-continuation fix itself).
+BLOCKQUOTE_NO_OPEN_PARAGRAPH=$'Authoring-Agent: claude\n\n> # quoted heading\nAuthoring-Agent: codex\n\n## Self-Review'
+got_count="$(pr_body_authoring_agent_count "$BLOCKQUOTE_NO_OPEN_PARAGRAPH")"
+if [ "$got_count" = "2" ] && pr_body_has_self_review "$BLOCKQUOTE_NO_OPEN_PARAGRAPH"; then
+  ok "a blockquote containing only a heading has no open paragraph to nest a following declaration in"
+else
+  bad "blockquote-no-open-paragraph body: expected count=2 and Self-Review, got count=$got_count"
+fi
+
 # Ordered lists can interrupt a paragraph ONLY when the start number is 1;
 # "2. item" does not, so a real multi-line code span may legitimately cross
 # it (Codex P1 on #1165: the generalized matcher over-classified every
