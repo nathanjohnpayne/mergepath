@@ -60,7 +60,12 @@ gh() {
   case "$*" in
     *graphql*)
       case "${GH_CLASSIC:-ok}" in
-        fail)     echo "gh: Bad credentials (HTTP 401)" >&2; return 1 ;;
+        # Real `gh api` writes the JSON HTTP-error body to STDOUT and only the
+        # one-line summary to stderr. The stub must do the same or it cannot
+        # catch a retry that concatenates a failed attempt output with a
+        # successful one — which is exactly what it missed on PR #1176.
+        fail)     echo '{"message":"Bad credentials","status":"401"}'
+                  echo "gh: Bad credentials (HTTP 401)" >&2; return 1 ;;
         gqlerror) echo '{"data":null,"errors":[{"message":"Resource not accessible by integration"}]}'; return 0 ;;
         noref)    echo '{"data":{"repository":{"ref":null}}}'; return 0 ;;
         *)        echo "${GH_CLASSIC_BODY:-$GH_CLASSIC_DEFAULT}"; return 0 ;;
@@ -68,7 +73,8 @@ gh() {
       ;;
     *rules/branches*)
       case "${GH_RULESETS:-ok}" in
-        fail) echo "gh: Not Found (HTTP 404)" >&2; return 1 ;;
+        fail) echo '{"message":"Not Found","status":"404"}'
+              echo "gh: Not Found (HTTP 404)" >&2; return 1 ;;
         *)    echo "${GH_RULESETS_BODY:-$GH_RULESETS_DEFAULT}"; return 0 ;;
       esac
       ;;
@@ -265,11 +271,15 @@ fi
 # surfaces are needed for `known`, which makes one blip otherwise expensive).
 ATTEMPTS_FILE="$(mktemp)"
 gh_flaky_once() {
-  # Fail the FIRST graphql attempt only; succeed thereafter.
+  # Fail the FIRST graphql attempt only; succeed thereafter. The failing
+  # attempt writes its JSON error body to STDOUT, as real `gh api` does — the
+  # whole point of this case is that the retry must not concatenate it with
+  # the successful attempt output.
   case "$*" in
     *graphql*)
       if [ ! -s "$ATTEMPTS_FILE" ]; then
         echo "seen" >"$ATTEMPTS_FILE"
+        echo '{"message":"Internal Server Error","status":"500"}'
         echo "gh: Internal Server Error (HTTP 500)" >&2
         return 1
       fi

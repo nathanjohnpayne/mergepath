@@ -914,6 +914,7 @@ while :; do
                         completedAt
                         isRequired(pullRequestNumber: $number)
                         checkSuite {
+                          app { databaseId }
                           workflowRun {
                             databaseId
                             workflow { name resourcePath }
@@ -972,6 +973,17 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       # for, which the filter treats as no-opinion and falls back to name
       # matching.
       isRequired: .isRequired,
+      # The PRODUCING app (#1064). Branch protection requires a context from a
+      # specific app — `required_status_checks.checks[] = {context, app_id}` —
+      # so (context, app) is GitHub own unit of requirement and therefore the
+      # right key to collapse duplicate runs under. Deliberately NOT the
+      # workflow: measured on nathanpaynedotcom#908, three required contexts
+      # are each emitted by TWO different workflows under the SAME app 15368
+      # (agent-review.yml republishes what the dedicated gate workflows
+      # publish), all reporting isRequired=true against a protection entry that
+      # lists each context once. Keying on workflow would demand both be green
+      # and block PRs GitHub merges.
+      appId: ((.checkSuite.app.databaseId // "") | tostring),
       startedAt: .startedAt,
       completedAt: .completedAt
     }))
@@ -1612,7 +1624,8 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         # StatusContext, which the selection handles as a non-terminal entry.
         startedAt: (.startedAt // ""),
         completedAt: (.completedAt // ""),
-        isRequired: .isRequired
+        isRequired: .isRequired,
+        appId: (.appId // "")
       }
     # Drop entries GitHub says do not count toward this PR requirements
     # (#1064). Branch protection pins a required context to a producing app,
@@ -1677,9 +1690,27 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
   # for CI would have reported that PR red — precisely the fleet-wide
   # over-restriction the acceptance criteria on #1064 forbid.
   #
-  # Group by NAME, not by (workflow, name): a required context is satisfied by
-  # its name, and GitHub resolves it across producers the same way. The winner
-  # rule is the one #655 round 13 already blessed for the annex scan below —
+  # Group by (NAME, PRODUCING APP) — GitHub own unit of requirement, since
+  # protection requires a context from a specific app. Two consequences, both
+  # measured rather than assumed:
+  #
+  #   Same app, several workflows → ONE group. On nathanpaynedotcom#908 three
+  #   required contexts are each emitted by two workflows under app 15368
+  #   (agent-review.yml republishes what the dedicated gate workflows publish)
+  #   against a protection entry listing each context once. Keying on workflow
+  #   would demand both be green and block PRs GitHub merges — the fleet-wide
+  #   over-restriction that caused the #1061 revert.
+  #
+  #   Different apps, both required → SEPARATE groups, each judged. When
+  #   protection lists one context under two app ids they are independently
+  #   required, and collapsing them would let one app SUCCESS hide the other
+  #   app FAILURE. `scripts/merge-clearance-gate.sh` accounts for the same
+  #   multi-producer configuration.
+  #
+  # A foreign app that is NOT required never reaches here — the isRequired
+  # filter above drops it.
+  #
+  # The winner rule is the one #655 round 13 already blessed for the annex scan —
   # a still-non-terminal entry always wins over any completed sibling
   # (a freshly-queued rerun has no usable timestamp and must not be outranked
   # by an older completed one), and only when every entry is terminal does the
@@ -1689,7 +1720,7 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
   # the projection above emits "" rather than null for a missing timestamp,
   # and "" is truthy in jq, so `.completedAt // .startedAt` would keep the
   # empty string and sort every terminal entry as equal.
-  | group_by(.label)
+  | group_by([.label, .appId])
   | [ .[]
       | (map(select(
             # `.result` is bound BEFORE the `["PENDING","EXPECTED"] | …`

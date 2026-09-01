@@ -1494,6 +1494,32 @@ else
   fail "#1064: the filter does not exclude isRequired==false entries, so a foreign same-named check can decide a required context"
 fi
 
+# The collapse key is (name, PRODUCING APP) — GitHub own unit of requirement,
+# since protection requires a context from a specific app id.
+#
+# Not the workflow, and that distinction is measured rather than assumed: on
+# nathanpaynedotcom#908 three required contexts are each emitted by TWO
+# workflows under the SAME app 15368 (agent-review.yml republishes what the
+# dedicated gate workflows publish), all reporting isRequired=true against a
+# protection entry that lists each context once. Keying on workflow would
+# demand both be green and block PRs GitHub merges.
+#
+# Not the bare name either: when protection lists one context under two app
+# ids those producers are independently required, and collapsing them lets one
+# app SUCCESS hide the other app FAILURE.
+if grep -q 'app { databaseId }' "$SCRIPT" \
+   && grep -q 'appId: ((.checkSuite.app.databaseId' "$SCRIPT"; then
+  pass "#1064: the rollup carries the producing app id"
+else
+  fail "#1064: the rollup does not carry the producing app id, so the collapse cannot separate independently required producers"
+fi
+
+if grep -q 'group_by(\[.label, .appId\])' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: duplicate runs collapse per (name, app) — same-app republishes merge, distinct required apps stay separate"
+else
+  fail "#1064: the collapse key is not (name, app) — by bare name it hides a second required app failure, by workflow it blocks PRs GitHub merges"
+fi
+
 # A required context with NO rollup entry forms no group, so the collapse
 # alone cannot see it. GitHub holds the PR for it regardless.
 if grep -q 'MISSING_REQUIRED' "$SCRIPT" \

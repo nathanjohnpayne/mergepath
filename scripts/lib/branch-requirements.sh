@@ -172,12 +172,29 @@ br_urlencode_branch_path() {
 #
 # BR_RETRY_SLEEP exists so the offline suites do not pay the pause for the
 # failure cases they deliberately provoke.
+# Each attempt stdout is captured SEPARATELY and only the successful attempt is
+# emitted. `gh api` writes its JSON HTTP-error body to STDOUT (documented at
+# length in scripts/lib/gh-api-scalar.sh), so a naive `cmd || cmd` streams the
+# error object and then the good document into one pipe. The classic parser
+# would see an error object followed by a GraphQL response and resolve the ref
+# as not-found; the rulesets parser would reject the mixed object/array stream.
+# The retry would then be unable to recover from the ordinary transient HTTP
+# failure it exists for, and gate (a) would take its fail-closed path anyway.
+#
+# stderr is deliberately NOT captured — callers redirect it themselves to
+# collect the diagnostic for the `errors` array.
 _br_retry() {
-  if "$@"; then
+  local attempt_out
+  if attempt_out="$("$@")"; then
+    printf '%s' "$attempt_out"
     return 0
   fi
   sleep "${BR_RETRY_SLEEP:-2}"
-  "$@"
+  if attempt_out="$("$@")"; then
+    printf '%s' "$attempt_out"
+    return 0
+  fi
+  return 1
 }
 
 # Resolve the required status checks enforced on <branch> of <owner/repo>.
