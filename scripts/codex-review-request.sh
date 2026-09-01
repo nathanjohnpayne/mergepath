@@ -1243,9 +1243,9 @@ post_codex_trigger() {
   TRIGGER_COMMENT_ID=$(echo "$POST_OUTPUT" | grep -oE 'issuecomment-[0-9]+' | head -1 | sed 's/issuecomment-//' || true)
   if [ -n "$TRIGGER_COMMENT_ID" ]; then
     # Keep the newest CONFIRMED trigger separately from the current ack target.
-    # A retry whose wrapper output format unexpectedly omits the id must not
-    # erase an earlier concrete trigger that the timeout marker can still bind
-    # to (#1085); if no post in the run ever yielded an id, persistence fails.
+    # A retry whose wrapper output unexpectedly omits the id must not erase an
+    # earlier concrete trigger, but timeout persistence later re-reads the full
+    # timeline and refuses that older id if the unconfirmed retry did land.
     TERMINAL_TRIGGER_COMMENT_ID="$TRIGGER_COMMENT_ID"
     # #799: the wall-clock fallback immediately below was unreachable on a
     # failed read. The error body is non-empty, so `[ -z ]` passed and a JSON
@@ -1433,15 +1433,17 @@ record_phase4a_timeout_determination() {
     malformed)
       die 3 "cannot persist Phase 4a timeout: trusted terminal-marker evidence is malformed"
       ;;
-    none|stale) ;;
+    none|stale|superseded) ;;
     *) die 3 "cannot persist Phase 4a timeout: terminal-marker state is unreadable" ;;
   esac
 
   # The marker is bound to an actual author-owned trigger. This is stronger
   # than trusting a hand-authored assertion that a timeout happened, and keeps
   # "no request" distinct from "requested and timed out".
-  codex_phase4a_trigger_comment_present "$AUTHOR_IDENTITY" "$TERMINAL_TRIGGER_COMMENT_ID" "$comments" \
-    || die 3 "cannot persist Phase 4a timeout: confirmed trigger comment is absent from the live author-owned timeline"
+  command -v codex_phase4a_trigger_comment_is_latest >/dev/null 2>&1 \
+    || die 3 "cannot persist Phase 4a timeout: latest-trigger verifier unavailable"
+  codex_phase4a_trigger_comment_is_latest "$AUTHOR_IDENTITY" "$TERMINAL_TRIGGER_COMMENT_ID" "$comments" \
+    || die 3 "cannot persist Phase 4a timeout: confirmed trigger is absent, malformed, or superseded in the live author-owned timeline"
   marker_body=$(codex_phase4a_timeout_marker_body "$HEAD_SHA" "$TERMINAL_TRIGGER_COMMENT_ID") \
     || die 3 "cannot build Phase 4a timeout marker for head $HEAD_SHA"
 

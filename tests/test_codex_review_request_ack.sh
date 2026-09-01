@@ -426,14 +426,16 @@ test_retry_missing_comment_id_stops_without_extra_retry() {
   count=$(trigger_count "$dir")
   ack_count=$(ack_endpoint_count "$dir")
 
-  if [ "$rc" != "4" ]; then
-    fail "retry missing comment id: exit $rc, expected 4; stderr=$(cat "$dir/err.log")"
+  if [ "$rc" != "3" ]; then
+    fail "retry missing comment id: exit $rc, expected fail-closed 3; stderr=$(cat "$dir/err.log")"
   elif [ "$count" != "2" ]; then
     fail "retry missing comment id: trigger count $count, expected original + one retry only"
   elif [ "$ack_count" != "1" ]; then
     fail "retry missing comment id: ack endpoint called $ack_count times, expected only the first pollable trigger"
+  elif [ -f "$dir/state/terminal-count" ]; then
+    fail "retry missing comment id: old confirmed trigger received a timeout after the unconfirmed retry landed"
   else
-    pass "retry with missing trigger comment id: gate stops without extra retry"
+    pass "retry with missing trigger comment id: gate stops without extra retry or an obsolete timeout marker"
   fi
 }
 

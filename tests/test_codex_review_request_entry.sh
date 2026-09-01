@@ -300,6 +300,41 @@ test_timeout_head_drift_fails_closed_without_marker() {
   fi
 }
 
+# --- a newer request on the same head supersedes an older timeout -----------
+test_new_trigger_replaces_superseded_timeout_marker() {
+  local dir rc count terminals body expected marker final_state
+  dir=$(make_case "superseded-timeout" "  enabled: true"$'\n'"  request_by_default: true")
+  marker="<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=$TEST_HEAD trigger_comment_id=900 -->"
+  jq -cn '{id:900,user:{login:"nathanjohnpayne"},body:"@codex review",created_at:"2026-06-16T23:45:00Z"}' \
+    >"$dir/state/comments.jsonl"
+  jq -cn --arg body "$marker" \
+    '{id:901,user:{login:"nathanjohnpayne"},body:$body,created_at:"2026-06-16T23:59:00Z"}' \
+    >>"$dir/state/comments.jsonl"
+
+  rc=$(run_case "$dir")
+  count=$(trigger_count "$dir")
+  terminals=$(terminal_count "$dir")
+  body=$(terminal_body "$dir")
+  expected="<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=$TEST_HEAD trigger_comment_id=1001 -->"
+  final_state=$(jq -sc '.' "$dir/state/comments.jsonl" | \
+    bash -c 'source "$1/scripts/lib/codex-failure-markers.sh"; comments=$(cat); codex_phase4a_timeout_marker_state "$2" nathanjohnpayne "$comments"' \
+      _ "$dir" "$TEST_HEAD" | jq -r '.state + ":" + (.trigger_comment_id | tostring)')
+
+  if [ "$rc" != "4" ]; then
+    fail "superseded timeout: exit $rc, expected 4; stderr=$(cat "$dir/err.log")"
+  elif [ "$count" != "1" ]; then
+    fail "superseded timeout: new trigger count $count, expected 1"
+  elif [ "$terminals" != "1" ]; then
+    fail "superseded timeout: new terminal count $terminals, expected 1"
+  elif [ "$body" != "$expected" ]; then
+    fail "superseded timeout: terminal body '$body', expected '$expected'"
+  elif [ "$final_state" != "current:1001" ]; then
+    fail "superseded timeout: final parser state '$final_state', expected current:1001"
+  else
+    pass "a newer same-head request supersedes the old timeout; only its own timeout may reopen Phase 4b"
+  fi
+}
+
 test_defaults_request_on_every_pr
 test_request_by_default_true_triggers_under_threshold
 test_single_quoted_booleans_trigger_under_threshold
@@ -307,6 +342,7 @@ test_request_by_default_false_skips_under_threshold
 test_request_by_default_false_triggers_when_gated
 test_enabled_false_never_triggers
 test_timeout_head_drift_fails_closed_without_marker
+test_new_trigger_replaces_superseded_timeout_marker
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

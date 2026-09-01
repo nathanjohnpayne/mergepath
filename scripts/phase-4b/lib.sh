@@ -389,7 +389,7 @@ p4b_barrier_class_codex() {
 # Reconstruct the durable Phase 4a timeout handoff from GitHub. Emits JSON and
 # returns:
 #   0 current  — trusted exact-head timeout record; Phase 4b may waive Codex
-#   1 absent   — none or stale only; ordinary not-yet remains in force
+#   1 absent   — none, stale, or superseded; ordinary not-yet remains in force
 #   2 unsafe   — unreadable/malformed evidence or live-head drift; escalate
 #
 # The comments read is paginated and its failure is never collapsed to an
@@ -409,6 +409,16 @@ p4b_codex_timeout_determination() {
     jq -nc '{state:"unreadable",reason:"array-reader-unavailable"}'
     return 2
   fi
+  if ! command -v gh_api_scalar >/dev/null 2>&1; then
+    jq -nc '{state:"unreadable",reason:"scalar-reader-unavailable"}'
+    return 2
+  fi
+
+  author="$(p4b_top_field author_identity)"
+  if [ -z "$author" ]; then
+    jq -nc '{state:"unreadable",reason:"author-identity-missing"}'
+    return 2
+  fi
 
   comments="$(gh_api_array "repos/$repo/issues/$pr/comments" "Phase 4a timeout comments")" \
     || { jq -nc '{state:"unreadable",reason:"comments-read-failed"}'; return 2; }
@@ -420,13 +430,12 @@ p4b_codex_timeout_determination() {
     return 1
   fi
 
-  author="$(p4b_top_field author_identity)"
-  author="${author:-nathanjohnpayne}"
   state="$(codex_phase4a_timeout_marker_state "$head" "$author" "$comments")"
   class="$(printf '%s' "$state" | jq -r '.state // "malformed"' 2>/dev/null || printf malformed)"
   case "$class" in
     current)
-      live_head="$(gh api "repos/$repo/pulls/$pr" --jq '.head.sha' 2>/dev/null)" \
+      live_head="$(gh_api_scalar --shape sha "Phase 4a timeout live PR head" \
+        "repos/$repo/pulls/$pr" --jq '.head.sha')" \
         || { jq -nc '{state:"unreadable",reason:"head-read-failed"}'; return 2; }
       if ! codex_phase4a_full_sha_ok "$live_head"; then
         jq -nc --arg h "$live_head" '{state:"unreadable",reason:"head-shape",live_head:$h}'
@@ -440,7 +449,7 @@ p4b_codex_timeout_determination() {
       printf '%s' "$state" | jq -c --arg h "$live_head" '. + {live_head:$h}'
       return 0
       ;;
-    none|stale)
+    none|stale|superseded)
       printf '%s' "$state"
       return 1
       ;;

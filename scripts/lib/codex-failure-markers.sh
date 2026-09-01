@@ -136,10 +136,39 @@ codex_phase4a_trigger_comment_present() {
   ' >/dev/null 2>&1
 }
 
+# codex_phase4a_trigger_comment_is_latest <author> <id> <comments-json>
+# True only when <id> is the latest exact author-owned trigger in total
+# [created_at,id] order. Any exact trigger with unorderable metadata fails
+# closed; silently ignoring it could let a writer bind a timeout to an older
+# review attempt.
+codex_phase4a_trigger_comment_is_latest() {
+  local author=${1-} id=${2-} comments=${3-}
+  [ -n "$author" ] || return 1
+  codex_phase4a_comment_id_ok "$id" || return 1
+  printf '%s' "$comments" | jq -e --arg who "$author" --argjson id "$id" '
+    [ .[]?
+      | select(
+          ((.user.login // "") == $who)
+          and ((.body // "") == "@codex review")
+        )
+    ] as $triggers
+    | ($triggers | length) > 0
+      and all($triggers[];
+        ((.id // null) | type) == "number"
+        and .id > 0
+        and (.id | floor) == .id
+        and ((.created_at // "")
+          | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")))
+      and (($triggers | sort_by([.created_at, .id]) | last | .id) == $id)
+  ' >/dev/null 2>&1
+}
+
 # codex_phase4a_timeout_marker_state <head> <author> <comments-json>
 # Emits one JSON object with state:
-#   current    at least one valid marker for <head>, bound to a preceding
-#              exact author trigger; duplicate valid records are idempotent.
+#   current    at least one valid marker for <head>, bound to the latest exact
+#              author trigger; duplicate valid records are idempotent.
+#   superseded valid current-head timeout history exists, but a later exact
+#              author trigger started another review attempt on that head.
 #   stale      valid marker grammar exists only for another head, or a
 #              future numeric version with the canonical field envelope can
 #              be proven to name only another head.
@@ -173,8 +202,7 @@ codex_phase4a_timeout_marker_state() {
     if type != "array" then
       {state:"malformed",reason:"comments-json"}
     else
-      . as $all
-      | [ .[]?
+      [ .[]?
           | select((.user.login // "") == $who)
           | . + {normalized_body: ((.body // "") | rtrimstr("\n") | rtrimstr("\r"))}
         ] as $trusted
@@ -199,6 +227,33 @@ codex_phase4a_timeout_marker_state() {
               head_hint: ($hint.head // null)
             }
         ] as $bad_schema
+      | [ $trusted[]
+          | select((.body // "") == "@codex review")
+          | {
+              comment_id: (.id // null),
+              created_at: (.created_at // "")
+            }
+        ] as $author_trigger_candidates
+      | [ $author_trigger_candidates[]
+          | select(
+              (.comment_id | type) != "number"
+              or .comment_id <= 0
+              or (.comment_id | floor) != .comment_id
+              or (.created_at
+                | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+                | not)
+            )
+        ] as $bad_trigger_metadata
+      | [ $author_trigger_candidates[]
+          | select(
+              (.comment_id | type) == "number"
+              and .comment_id > 0
+              and (.comment_id | floor) == .comment_id
+              and (.created_at
+                | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            )
+        ] as $author_triggers
+      | ($author_triggers | sort_by([.created_at, .comment_id]) | last) as $latest_author_trigger
       | [ $parsed[] | select(.head == $head) ] as $on_head
       | [ $bad_schema[]
           | select(.head_hint == null or .head_hint == $head)
@@ -209,24 +264,52 @@ codex_phase4a_timeout_marker_state() {
               ($marker.marker_created_at
                 | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
               | not
-              or ([ $all[]?
+              or (($marker.marker_id // null) | type != "number")
+              or ($marker.marker_id <= 0)
+              or (($marker.marker_id | floor) != $marker.marker_id)
+              or ([ $author_triggers[]
                     | select(
-                        (.id == $marker.trigger_comment_id)
-                        and ((.user.login // "") == $who)
-                        and ((.body // "") == "@codex review")
-                        and ((.created_at // "")
-                          | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-                        and ((.created_at // "") <= $marker.marker_created_at)
+                        (.comment_id == $marker.trigger_comment_id)
+                        and (
+                          (.created_at < $marker.marker_created_at)
+                          or (
+                            .created_at == $marker.marker_created_at
+                            and .comment_id < $marker.marker_id
+                          )
+                        )
                       )
                   ] | length == 0)
             )
         ] as $bad_binding
-      | if ($bad_binding | length) > 0 then
+      | [ $on_head[]
+          | . as $marker
+          | select(
+              ($bad_binding | map(.marker_id) | index($marker.marker_id)) == null
+              and $latest_author_trigger != null
+              and $marker.trigger_comment_id == $latest_author_trigger.comment_id
+            )
+        ] as $operative_on_head
+      | [ $on_head[]
+          | . as $marker
+          | select(
+              ($bad_binding | map(.marker_id) | index($marker.marker_id)) == null
+              and $latest_author_trigger != null
+              and $marker.trigger_comment_id != $latest_author_trigger.comment_id
+            )
+          | . + {superseding_trigger_comment_id: $latest_author_trigger.comment_id}
+        ] as $superseded_on_head
+      | if ($bad_trigger_metadata | length) > 0 then
+          {state:"malformed",reason:"trigger-metadata",comment_id:$bad_trigger_metadata[0].comment_id}
+        elif ($bad_binding | length) > 0 then
           {state:"malformed",reason:"trigger-binding",comment_id:$bad_binding[0].marker_id}
-        elif ($on_head | length) > 0 then
-          {state:"current",marker_id:$on_head[0].marker_id,trigger_comment_id:$on_head[0].trigger_comment_id}
+        elif ($operative_on_head | length) > 0 then
+          ($operative_on_head | sort_by([.marker_created_at, .marker_id]) | last)
+          | {state:"current",marker_id:.marker_id,trigger_comment_id:.trigger_comment_id}
         elif ($bad_schema_relevant | length) > 0 then
           {state:"malformed",reason:"schema",comment_id:$bad_schema_relevant[0].comment_id}
+        elif ($superseded_on_head | length) > 0 then
+          ($superseded_on_head | sort_by([.marker_created_at, .marker_id]) | last)
+          | {state:"superseded",marker_id:.marker_id,trigger_comment_id:.trigger_comment_id,superseding_trigger_comment_id:.superseding_trigger_comment_id}
         elif (($parsed | length) > 0 or ($bad_schema | length) > 0) then
           {state:"stale"}
         else
