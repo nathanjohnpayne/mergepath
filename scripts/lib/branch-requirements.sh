@@ -429,16 +429,32 @@ br_required_checks() {
       # ruleset governs tags. `target` is a field on the listing, so this costs
       # no ref-pattern matching: it distinguishes what a ruleset governs, not
       # which refs it names.
-      active_rulesets="$(printf '%s' "$rulesets_meta" | jq -r -s '
-        add // []
+      # The inventory gets the same shape validation as the rule read above,
+      # and for the same reason: an inventory that exits 0 having emitted
+      # nothing, or a 2xx carrying an object, both slurp to something whose
+      # `objects` traversal yields no active rulesets. That would read as
+      # "nothing can be bypassed" and certify the viewer-scoped response as
+      # complete on the strength of a response nobody parsed — the completeness
+      # proof would be exactly as empty as the evidence for it.
+      if active_rulesets="$(printf '%s' "$rulesets_meta" | jq -r -s '
+        if length == 0
+        then error("the ruleset listing returned no pages at all")
+        elif (map(type != "array") | any)
+        then error("the ruleset listing returned a non-array page (\(map(type) | unique | join(",")))")
+        else .
+        end
+        | add // []
         | [ .[]? | objects
             | select((.enforcement // "") == "active")
             | select((.target // "branch") == "branch") ]
-        | .[] | "\(.id)|\(.source_type // "")|\(.source // "")"' 2>/dev/null || echo "PARSE_FAILED")"
-      if [ "$active_rulesets" = "PARSE_FAILED" ]; then
+        | .[] | "\(.id)|\(.source_type // "")|\(.source // "")"' 2>"$errfile")"; then
+        : # inventory parsed; the per-ruleset bypass check below decides
+      else
+        active_rulesets=""
         rulesets_ok=0
-        errors="$(printf '%s' "$errors" | jq -c '. + ["rulesets: could not parse the ruleset listing, so the viewer-scoped rule response cannot be shown complete"]')"
-      elif [ -n "$active_rulesets" ]; then
+        errors="$(printf '%s' "$errors" | jq -c --arg m "$(tr '\n' ' ' <"$errfile")" '. + ["rulesets: \($m), so the viewer-scoped rule response cannot be shown complete"]')"
+      fi
+      if [ "$rulesets_ok" -eq 1 ] && [ -n "$active_rulesets" ]; then
         while IFS= read -r rs_line; do
           [ -n "$rs_line" ] || continue
           rs_id="${rs_line%%|*}"

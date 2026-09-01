@@ -89,6 +89,9 @@ gh() {
       case "${GH_RULESETS_LIST:-none}" in
         fail)     echo '{"message":"Server Error","status":"500"}'
                   echo "gh: Server Error (HTTP 500)" >&2; return 1 ;;
+        # Exit 0 with no document at all, and a 2xx carrying an object.
+        silent)   return 0 ;;
+        object)   echo '{"message":"unexpected"}'; return 0 ;;
         active)   echo '[{"id":42,"enforcement":"active","source_type":"Repository","source":"owner/repo"}]'; return 0 ;;
         org)      echo '[{"id":43,"enforcement":"active","source_type":"Organization","source":"owner"}]'; return 0 ;;
         tag)      echo '[{"id":45,"enforcement":"active","target":"tag","source_type":"Repository","source":"owner/repo"}]'; return 0 ;;
@@ -436,6 +439,22 @@ if [ "$(field "$out" .state)" = "known" ] \
 else
   fail "tag-targeted ruleset: expected known/[lint], got $out"
 fi
+
+# The completeness proof must not rest on an unparsed inventory. An inventory
+# that exits 0 emitting nothing, or one carrying an object instead of the
+# documented page array, both traverse to "no active rulesets" — which would
+# certify the viewer-scoped response complete on the strength of a response
+# nobody read.
+for inventory_shape in silent object; do
+  out=$(GH_CLASSIC=ok GH_RULESETS=ok GH_RULESETS_LIST="$inventory_shape" \
+    GH_CLASSIC_BODY='{"data":{"repository":{"ref":{"refUpdateRule":{"requiredStatusCheckContexts":["lint"]}}}}}' \
+    br_required_checks owner/repo main)
+  if [ "$(field "$out" .state)" = "unknown" ]; then
+    pass "an unparseable ruleset inventory ($inventory_shape) leaves completeness unproven"
+  else
+    fail "ruleset inventory $inventory_shape: expected unknown, got $out"
+  fi
+done
 
 # ── 10. Each surface is retried once before being given up on, so a single
 # transient blip does not degrade the whole resolution to unknown (both
