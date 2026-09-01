@@ -389,6 +389,51 @@ else
   bad "unicode-whitespace body: Authoring-Agent inside a code span was accepted (count=$got_count)"
 fi
 
+# A setext heading underline ("===" or "---" with nothing else on the line)
+# retroactively turns the PRECEDING line into a heading and ends its
+# paragraph there, with no blank line required -- the same interrupting-block
+# gap as the ATX case above, one construct over (Codex P2 on #1165). Signal
+# is authorCount, not Self-Review: Codex's actual repro showed the swallowed
+# span hiding a second "Authoring-Agent:" line, not the heading -- a body
+# with the heading immediately after the construct would pass on the
+# ATX-heading check alone without exercising this construct at all, so the
+# decoy Authoring-Agent line (which the ATX check cannot see) is what proves
+# THIS boundary is doing the work.
+SETEXT_UNDERLINE=$'Authoring-Agent: claude\n\nProse call`s own thing.\n===\nAuthoring-Agent: codex\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$SETEXT_UNDERLINE")"
+if [ "$got_count" = "2" ]; then
+  ok "a stray backtick cannot pair past a setext heading underline (decoy Authoring-Agent stays visible)"
+else
+  bad "setext-underline body: expected count=2 (decoy stays visible), got count=$got_count"
+fi
+
+# Thematic breaks, blockquotes, and list items are the remaining CommonMark
+# constructs that unconditionally interrupt a paragraph. Same decoy-based
+# shape and rationale as the setext case above.
+THEMATIC_BREAK=$'Authoring-Agent: claude\n\nProse call`s own thing.\n- - -\nAuthoring-Agent: codex\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$THEMATIC_BREAK")"
+if [ "$got_count" = "2" ]; then
+  ok "a stray backtick cannot pair past a thematic break (decoy Authoring-Agent stays visible)"
+else
+  bad "thematic-break body: expected count=2 (decoy stays visible), got count=$got_count"
+fi
+
+BLOCKQUOTE_INTERRUPT=$'Authoring-Agent: claude\n\nProse call`s own thing.\n> quoted\nAuthoring-Agent: codex\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$BLOCKQUOTE_INTERRUPT")"
+if [ "$got_count" = "2" ]; then
+  ok "a stray backtick cannot pair past a blockquote (decoy Authoring-Agent stays visible)"
+else
+  bad "blockquote-interrupt body: expected count=2 (decoy stays visible), got count=$got_count"
+fi
+
+LIST_ITEM_INTERRUPT=$'Authoring-Agent: claude\n\nProse call`s own thing.\n- list item\nAuthoring-Agent: codex\nLater `code` here.'
+got_count="$(pr_body_authoring_agent_count "$LIST_ITEM_INTERRUPT")"
+if [ "$got_count" = "2" ]; then
+  ok "a stray backtick cannot pair past a list item (decoy Authoring-Agent stays visible)"
+else
+  bad "list-item-interrupt body: expected count=2 (decoy stays visible), got count=$got_count"
+fi
+
 # --- 11. the HOOK must fail closed on parser trouble --------------------------
 # A non-2 hook exit is a NONBLOCKING error in the hook wiring, so letting `set
 # -e` propagate the helper status would fail OPEN on the self-approve check --

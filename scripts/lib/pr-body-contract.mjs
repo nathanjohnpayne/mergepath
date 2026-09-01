@@ -2,6 +2,20 @@
 
 import { readFileSync } from 'node:fs';
 
+// HTML block starters shared between the top-level block dispatch below and
+// interruptsParagraph()'s CommonMark paragraph-interruption check, so the
+// two classifications cannot drift apart.
+const RAW_TAG_RE = /^ {0,3}<(script|pre|style|textarea)(?:\s|>|$)/i;
+const PROCESSING_INSTRUCTION_RE = /^ {0,3}<\?/;
+const CDATA_RE = /^ {0,3}<!\[CDATA\[/;
+const DECLARATION_RE = /^ {0,3}<![A-Z]/;
+// CommonMark HTML block condition 6's fixed tag-name list. Condition 7's
+// complete-generic-tag rule is deliberately NOT included here: unlike
+// conditions 1-6, condition 7 cannot interrupt a paragraph.
+const FIXED_TAG_LIST_RE =
+  /^ {0,3}<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ \t]|\/?>|$)/i;
+const HTML_COMMENT_OPEN_RE = /^ {0,3}<!--/;
+
 /**
  * Read the repository's deliberately strict PR-body contract without runtime
  * packages. Contract markers must be plain top-level Markdown, never hidden in
@@ -89,22 +103,22 @@ export function parsePrBodyContract(body) {
       continue;
     }
 
-    const rawTag = line.match(/^ {0,3}<(script|pre|style|textarea)(?:\s|>|$)/i);
+    const rawTag = line.match(RAW_TAG_RE);
     if (rawTag) {
       if (!new RegExp(`</${rawTag[1]}\\s*>`, 'i').test(line)) {
         htmlBlock = rawTag[1].toLowerCase();
       }
       continue;
     }
-    if (/^ {0,3}<\?/.test(line)) {
+    if (PROCESSING_INSTRUCTION_RE.test(line)) {
       if (!line.includes('?>')) htmlBlock = 'processing';
       continue;
     }
-    if (/^ {0,3}<!\[CDATA\[/.test(line)) {
+    if (CDATA_RE.test(line)) {
       if (!line.includes(']]>')) htmlBlock = 'cdata';
       continue;
     }
-    if (/^ {0,3}<![A-Z]/.test(line)) {
+    if (DECLARATION_RE.test(line)) {
       if (!line.includes('>')) htmlBlock = 'declaration';
       continue;
     }
@@ -112,7 +126,7 @@ export function parsePrBodyContract(body) {
     // not require a closing `>`: `<div` at end of line starts a raw block that
     // runs until the next blank line. Keep this distinct from condition 7's
     // complete generic-tag rule so `<foo` remains ordinary prose.
-    if (/^ {0,3}<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ \t]|\/?>|$)/i.test(line)) {
+    if (FIXED_TAG_LIST_RE.test(line)) {
       htmlBlock = 'blank';
       continue;
     }
@@ -151,7 +165,7 @@ function stripHtmlComments(line, setState, initialState) {
   let result = '';
   let cursor = 0;
   let inComment = initialState;
-  const discardLine = initialState || /^ {0,3}<!--/.test(line);
+  const discardLine = initialState || HTML_COMMENT_OPEN_RE.test(line);
 
   while (cursor < line.length) {
     if (inComment) {
@@ -220,20 +234,52 @@ function hasMatchingCodeSpanRun(lines, lineIndex, column, runLength) {
   return false;
 }
 
-// CommonMark's blank line is spaces/tabs only (or nothing) -- NOT
-// JavaScript's broader trim() whitespace set, which also strips Unicode
-// separators like U+2003. A line of pure U+2003 is not blank in CommonMark,
-// so treating it as one would end a code-span search early and let genuine
-// code-span content (e.g. a smuggled "Authoring-Agent:" line) surface as a
-// live top-level declaration instead of staying hidden inline code.
-//
-// An ATX heading also ends a paragraph even with NO blank line before it --
-// CommonMark headings interrupt paragraphs unconditionally. Without this, a
-// stray backtick on the line immediately above a "## Self-Review" heading
-// (no blank line separating them) could still reach past the heading to
-// pair with a later backtick, the same swallowing bug with one fewer line.
+// Every CommonMark construct that ends the paragraph an opening backtick
+// belongs to -- so hasMatchingCodeSpanRun's search never reaches past it
+// looking for a closer. Each interrupts UNCONDITIONALLY, with no blank line
+// required first (blank lines are the trivial case, handled by the first
+// branch below). Missing any one of these lets a stray backtick before it
+// pair with an unrelated backtick beyond it, the same #1122 swallowing bug
+// in a different shape -- this file's own tests (LIST_CONTINUATION,
+// BLOCKQUOTE_MARKERS, REAL_FENCE, REAL_HTML, etc.) already establish that
+// content nested inside any of these constructs is never a top-level
+// marker, so a code span reaching past one risks swallowing a genuine
+// marker that follows it, exactly as an unswallowed heading would.
 function interruptsParagraph(line) {
-  return /^[ \t]*$/.test(line) || /^ {0,3}#{1,6}(?:[ \t]|$)/.test(line);
+  // Blank line (CommonMark: spaces/tabs only, or nothing -- NOT JavaScript's
+  // broader trim() whitespace set, which also strips Unicode separators like
+  // U+2003. A line of pure U+2003 is not blank in CommonMark, so treating it
+  // as one would end a code-span search early and let genuine code-span
+  // content, e.g. a smuggled "Authoring-Agent:" line, surface as a live
+  // top-level declaration instead of staying hidden inline code.)
+  if (/^[ \t]*$/.test(line)) return true;
+  // ATX heading, e.g. "## Self-Review" itself.
+  if (/^ {0,3}#{1,6}(?:[ \t]|$)/.test(line)) return true;
+  // Fenced code block opener.
+  if (/^ {0,3}(?:`{3,}|~{3,})/.test(line)) return true;
+  // Blockquote.
+  if (/^ {0,3}>/.test(line)) return true;
+  // List item (unordered marker, or ordered marker up to 9 digits).
+  if (/^ {0,3}(?:[-+*](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$))/.test(line)) return true;
+  // Setext heading underline (contiguous "=" or "-", nothing else) and
+  // thematic break (3+ of the same "-", "_", or "*", each optionally
+  // followed by spaces/tabs). A line of dashes can satisfy both; either
+  // interpretation ends the paragraph above it, so this does not need to
+  // disambiguate which one CommonMark would actually render.
+  if (/^ {0,3}=+[ \t]*$/.test(line)) return true;
+  if (/^ {0,3}(?:-[ \t]*)+$/.test(line) && /-/.test(line)) return true;
+  if (/^ {0,3}(?:_[ \t]*){3,}$/.test(line)) return true;
+  if (/^ {0,3}(?:\*[ \t]*){3,}$/.test(line)) return true;
+  // HTML blocks (conditions 1-6, shared with the top-level dispatch above;
+  // condition 7's generic complete tag is deliberately excluded -- unlike
+  // 1-6, it cannot interrupt a paragraph in CommonMark).
+  if (RAW_TAG_RE.test(line)) return true;
+  if (HTML_COMMENT_OPEN_RE.test(line)) return true;
+  if (PROCESSING_INSTRUCTION_RE.test(line)) return true;
+  if (CDATA_RE.test(line)) return true;
+  if (DECLARATION_RE.test(line)) return true;
+  if (FIXED_TAG_LIST_RE.test(line)) return true;
+  return false;
 }
 
 const mode = process.argv[2];
