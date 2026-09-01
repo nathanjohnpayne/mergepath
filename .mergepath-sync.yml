@@ -1626,10 +1626,13 @@ paths:
   # mergepath@<sha>, which carries its own authoritative manifest.
   # The consumer's copy would be unused — and this file enumerates the
   # full fleet inventory (every consumer repo name + facts), which there
-  # is no reason to mirror into each consumer. (It historically also
-  # avoided leaking then-private repo names to a public consumer; the
-  # fleet is uniformly public as of 2026-07-06, so that specific concern
-  # is now moot, but the file stays mergepath-only regardless.) Keep it
+  # is no reason to mirror into each consumer. (It also avoids leaking
+  # private repo names to a public consumer. That concern was moot while
+  # the fleet was uniformly public from 2026-07-06, and it is ACTIVE
+  # AGAIN as of 2026-09-01: device-source-of-truth is private, so this
+  # file now names a private repo and mirroring it into eight public
+  # consumers would disclose that name. Do not treat the moot period as
+  # the standing state -- re-read the visibility fields.) Keep it
   # mergepath-only. (CodeRabbit Major, #271.)
 
   # Kit directories — Mergepath-canonical files are required;
