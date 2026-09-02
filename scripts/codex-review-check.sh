@@ -185,6 +185,19 @@ fi
 # shellcheck source=lib/gh-api-array.sh
 . "$__CODEX_CHECK_DIR/lib/gh-api-array.sh"
 
+# Shared branch-requirement resolver (#1064, subsuming #1063). Gate (a)'s
+# required-check filter is a fail-closed gate input in the same sense as the
+# two above: without it the gate cannot tell "this branch requires nothing"
+# from "this token may not read the branch's rules", and it is exactly that
+# conflation that made gate (a) pass without examining a single check run.
+# Hard-require it — a degraded mode here IS the defect.
+if [ ! -r "$__CODEX_CHECK_DIR/lib/branch-requirements.sh" ]; then
+  echo "ERROR: branch-requirements helper missing: $__CODEX_CHECK_DIR/lib/branch-requirements.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/branch-requirements.sh
+. "$__CODEX_CHECK_DIR/lib/branch-requirements.sh"
+
 # Shared PR-body identity parser (#1121). Every consumer that reads
 # `Authoring-Agent:` MUST go through this, because the answer decides which
 # reviewer identity may clear gate (b) and whether the same-agent Codex-reaction
@@ -899,7 +912,9 @@ while :; do
                         conclusion
                         startedAt
                         completedAt
+                        isRequired(pullRequestNumber: $number)
                         checkSuite {
+                          app { databaseId }
                           workflowRun {
                             databaseId
                             workflow { name resourcePath }
@@ -910,6 +925,7 @@ while :; do
                         context
                         state
                         createdAt
+                        isRequired(pullRequestNumber: $number)
                       }
                     }
                   }
@@ -946,8 +962,36 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       status: .status,
       conclusion: .conclusion,
       state: .state,
+      # The GitHub-side answer to whether this run counts toward the required
+      # checks for THIS pull request (#1064). A required context is a bare
+      # name, so a same-named run from a different producer cannot be told
+      # apart by name alone — and branch protection pins each context to a
+      # producing app, so that foreign run does NOT satisfy the requirement.
+      # Carried here so the per-name collapse below can drop entries GitHub
+      # says do not count, instead of letting a foreign SUCCESS mask the
+      # required producer FAILURE. Null on any entry GitHub does not answer
+      # for, which the filter treats as no-opinion and falls back to name
+      # matching.
+      isRequired: .isRequired,
+      # The PRODUCING app (#1064). Branch protection requires a context from a
+      # specific app — `required_status_checks.checks[] = {context, app_id}` —
+      # so (context, app) is GitHub own unit of requirement and therefore the
+      # right key to collapse duplicate runs under. Deliberately NOT the
+      # workflow: measured on nathanpaynedotcom#908, three required contexts
+      # are each emitted by TWO different workflows under the SAME app 15368
+      # (agent-review.yml republishes what the dedicated gate workflows
+      # publish), all reporting isRequired=true against a protection entry that
+      # lists each context once. Keying on workflow would demand both be green
+      # and block PRs GitHub merges.
+      appId: ((.checkSuite.app.databaseId // "") | tostring),
       startedAt: .startedAt,
-      completedAt: .completedAt
+      completedAt: .completedAt,
+      # A StatusContext (legacy commit status) has NO startedAt/completedAt —
+      # only createdAt, which the query already selects. Carried so the
+      # per-name winner selection has a real ordering key for those entries
+      # instead of comparing empty strings and taking whichever node happened
+      # to sort last (#1064).
+      createdAt: .createdAt
     }))
 }')
 # #655 Codex P1 round 7 ("keep rollup when annex only has matrix jobs"): a
@@ -1454,52 +1498,72 @@ fi
 # caught the over-strict behavior on swipewatch propagation PR #33
 # round 4.
 #
-# The base branch is read from PR_JSON. If branch protection isn't
-# configured (or returns empty), fall back to the prior behavior
-# (consider all checks). If branch protection IS configured, only
-# checks listed in required_status_checks.contexts AND/OR
-# required_status_checks.checks[].context block the gate.
+# The base branch is read from PR_JSON. When the branch requires no status
+# checks, no required-name filter applies. When it requires some, only those
+# names block the gate. When the requirement list cannot be resolved at all,
+# gate (a) falls back to scrutinising the whole rollup (#465). Which of the
+# three applies is decided by the resolver below, not inferred from an empty
+# list — inferring it is what #1064 fixed.
 BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref')
-# Fetch the branch-protection required-check list, DISTINGUISHING
-# "read OK, none required" (gate (a) imposes no filter, passes) from
-# "could not read" (fail closed) — #465 Option A. The prior code swallowed
-# the gh failure and treated BOTH cases as "no required checks = pass",
-# which fails OPEN: when the token cannot read branch protection (403) or
-# the API errors (5xx), a genuinely-failing required check went unnoticed.
+# Resolve the required-check list through the shared tri-state resolver
+# (#1064, subsuming #1063). The full rationale lives in
+# scripts/lib/branch-requirements.sh; the short version:
 #
-# gh api exits non-zero on any 4xx/5xx; capture stderr to tell a 404 (the
-# required_status_checks sub-resource is not configured → legitimately NO
-# required checks) apart from 403 (token lacks Administration:read scope) or
-# 5xx/network (transient) — the latter leave the required list UNKNOWN.
-PROTECTION_404_AMBIGUOUS=0
-protection_err=$(mktemp)
-if protection_json=$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" 2>"$protection_err"); then
-  REQUIRED_CHECK_NAMES=$(printf '%s' "$protection_json" | jq -r '[.contexts[]?, .checks[]?.context] | unique | .[]' 2>/dev/null || true)
+# This used to read `branches/$BASE_BRANCH/protection/required_status_checks`.
+# That endpoint needs `Administration:read`, and GitHub HIDES the resource
+# rather than admitting a permission denial, so an unprivileged token gets
+# **404, not 403** — and the 404 arm treated it as "no required checks are
+# configured". Every path gate (a) actually runs on is unprivileged: agents
+# invoke it under a reviewer PAT, and auto-clear-blocking-labels.yml runs it
+# with `secrets.REVIEWER_ASSIGNMENT_TOKEN` while NOT skipping gate (a). So the
+# gate evaluated an empty required set and passed without examining a single
+# check run. The #465 fail-closed arm below never fired for the common cause,
+# because the common cause is a 404 and that arm only sees 403/5xx.
+#
+# The fix is a different READ, not a different decision. Two other surfaces
+# carry the same data and are readable by a plain WRITE-scoped token — the
+# same pair scripts/merge-clearance-gate.sh already reads from CI — so the
+# resolver returns the real list on exactly the tokens that used to see
+# nothing. Measured live with a reviewer PAT that 404s on the REST endpoint:
+# nathanpaynedotcom@main resolved all 7 contexts, mergepath@main all 6.
+#
+# `state` is what keeps the original conflation from returning, and the rule is
+# BOTH surfaces, not either: `known` means both answered — its list may then
+# legitimately be empty, because an approvals-only branch really does require
+# no status checks — while `unknown` means at least one surface did not answer,
+# so the union could not be established and nothing usable was learned. A
+# one-surface read is `unknown` carrying `partial: true`, which is a diagnostic
+# for the operator and never a list to act on: one surface answering `[]` says
+# nothing about what the other would have said, and treating that as
+# "nothing required" is the fail-open this change exists to remove.
+BRANCH_REQUIREMENTS_JSON=$(br_required_checks "$REPO" "$BASE_BRANCH")
+BRANCH_REQUIREMENTS_STATE=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '.state // "unknown"')
+BRANCH_REQUIREMENTS_PARTIAL=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r 'if .partial then "1" else "0" end')
+BRANCH_REQUIREMENTS_SURFACES=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '(.surfaces // []) | join("+")')
+BRANCH_REQUIREMENTS_ERRORS=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '(.errors // []) | join("; ")')
+REQUIRED_CHECK_NAMES=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -r '(.contexts // []) | .[]')
+# Requirements whose producing app is knowable (ruleset-sourced only — see the
+# missing-check scan below for why classic cannot contribute here).
+# The rules gate (a) will evaluate, one entry per rule rather than one per
+# name. A context can carry several at once — pinned to an app by a ruleset and
+# required from any producer by classic protection — and each is satisfied
+# independently, so the uncollapsed list is what the filter iterates.
+REQUIREMENTS_JSON=$(printf '%s' "$BRANCH_REQUIREMENTS_JSON" | jq -c '(.requirements // [])')
+
+if [ "$BRANCH_REQUIREMENTS_STATE" = "known" ]; then
   protection_readable=1
-elif grep -q 'HTTP 404' "$protection_err"; then
-  # Behaviour here is UNCHANGED and deliberately so; only the reporting is
-  # fixed. This 404 is AMBIGUOUS: GitHub returns it both when no required
-  # status checks are configured AND when the token simply may not see branch
-  # protection — it hides the resource's existence rather than admitting a
-  # permission denial (which is why the 403 arm below never fires for the most
-  # common cause). A reviewer PAT therefore lands here on a repo with five
-  # required checks, and the old log line asserted "lists no required checks"
-  # as if that were established fact.
-  #
-  # Resolving the ambiguity for real needs more than a second read: classic
-  # protection 404s on a ruleset-governed branch, `#`/`%` in a ref name corrupt
-  # the path, and the privileged retry is unreachable from auto-clear CI, which
-  # runs this script with only GH_TOKEN. Attempting it here shipped a
-  # fleet-wide gate (a) regression, so it is deferred whole to #1064. What
-  # remains is the honest log: say the list is unverified rather than absent.
-  REQUIRED_CHECK_NAMES=""
-  protection_readable=1
-  PROTECTION_404_AMBIGUOUS=1
 else
-  REQUIRED_CHECK_NAMES=""
-  protection_readable=0   # 403 token scope / 5xx / network → could not read
+  protection_readable=0
 fi
-rm -f "$protection_err"
+
+if [ "$BRANCH_REQUIREMENTS_PARTIAL" = "1" ]; then
+  # Diagnostic only — a half-read is `unknown`, not a usable list, because the
+  # requirement is the UNION of the two surfaces and one of them answering
+  # says nothing about the other. Distinguishing a half-outage from a total
+  # one is what an operator needs to act, so it is logged separately from the
+  # fail-closed warning below rather than folded into it.
+  log "gate (a): only one of the two rule surfaces answered for $BASE_BRANCH ($BRANCH_REQUIREMENTS_SURFACES); the union could not be established, so the requirement list is UNKNOWN rather than partial. Details: $BRANCH_REQUIREMENTS_ERRORS"
+fi
 
 if [ "$protection_readable" -eq 0 ]; then
   # FAIL CLOSED (#465): the required-check list is UNKNOWN (token lacks
@@ -1510,24 +1574,45 @@ if [ "$protection_readable" -eq 0 ]; then
   # be green. SKIPPED/NEUTRAL still pass (optional jobs that skip by design
   # do not block), so this closes the fail-open hole while only blocking on
   # ACTUAL failures (a narrower reversal of the swipewatch #33 skip than a
-  # blanket exit-3). To restore the precise required-check filter, grant the
-  # token Administration:read.
-  log "gate (a): WARNING — the branch-protection read for $BASE_BRANCH failed with a real error (403 forbidden, 5xx, or network). A permission-hiding 404 is handled by the branch above and does NOT reach here, so this is a genuine failure: a 403 means the token lacks Administration:read, while a 5xx or network error is usually transient and worth retrying before touching credentials. Failing closed: every non-skipped rollup check must be green (#465)."
+  # blanket exit-3).
+  #
+  # #1064 made this arm both RARER and more meaningful. It used to be
+  # unreachable for the overwhelmingly common cause — an unprivileged token —
+  # because that presents as 404 and the 404 arm passed instead. Now `unknown`
+  # means BOTH viewer-readable rule surfaces failed, which is a genuine API or
+  # network fault rather than a permission shape. That class of fault would
+  # normally have already exited 3 at the retry-wrapped statusCheckRollup read
+  # above, so reaching here at all is a strong signal something is actually
+  # wrong — and #465's fail-closed answer is the right one for it.
+  # The warning must match which surfaces actually failed. A partial read
+  # reaches this same arm — the union cannot be established from one surface —
+  # so asserting that neither answered, and that the cause cannot be
+  # permission-related, would contradict the partial diagnostic logged above
+  # and point an operator at the wrong remediation. A single unreadable surface
+  # CAN be an authorization failure (a rulesets read denied while the classic
+  # read succeeds); only the both-failed case rules that out, because both
+  # surfaces are readable by a plain write-scoped token.
+  if [ "$BRANCH_REQUIREMENTS_PARTIAL" = "1" ]; then
+    log "gate (a): WARNING — could not resolve the required-check list for $BASE_BRANCH: one rule surface answered ($BRANCH_REQUIREMENTS_SURFACES) and the other did not, so the union of classic protection and rulesets is unknown. A single unreadable surface can be an authorization failure as well as a transient one — check the detail below before assuming either. Failing closed: every non-skipped rollup check must be green (#465). Details: $BRANCH_REQUIREMENTS_ERRORS"
+  else
+    log "gate (a): WARNING — could not resolve the required-check list for $BASE_BRANCH from EITHER rule surface (classic protection via GraphQL, or rulesets via REST). Both are readable by a plain write-scoped token, so a total failure is not a permission shape — it is an API or network fault, usually transient and worth retrying before touching credentials. Failing closed: every non-skipped rollup check must be green (#465). Details: $BRANCH_REQUIREMENTS_ERRORS"
+  fi
   REQUIRED_JSON='[]'
 elif [ -z "$REQUIRED_CHECK_NAMES" ]; then
-  # Read succeeded; branch protection lists NO required checks (404 or empty
-  # contexts). Nothing to enforce for any OTHER check — gate (a) imposes no
-  # required-check filter (the other gates still run). The repo_lint_local.yml
-  # annex (#601), when present, is enforced independently below via the
-  # workflow-wide ANNEX_WORKFLOW_BAD scan reading ANNEX_SCAN_ROLLUP_JSON (a
-  # copy frozen BEFORE this branch's own wipe, #655 round 7) -- so wiping
-  # ROLLUP_JSON here unconditionally does NOT hide the annex the way it used
-  # to before that scan existed (#655 round 1's original problem).
-  if [ "${PROTECTION_404_AMBIGUOUS:-0}" -eq 1 ]; then
-    log "gate (a): could not VERIFY the required-check list for $BASE_BRANCH — the protection endpoint returned 404, which GitHub uses both for \"no required checks configured\" and for \"this token may not see protection\" (it is 404, not 403 — mergepath#1059). Proceeding with no required-check filter, which is the long-standing behaviour on this path; re-run with GH_TOKEN=\"\$OP_PREFLIGHT_AUTHOR_PAT\" to read the real list. Resolving this automatically is #1064."
-  else
-    log "gate (a): branch protection for $BASE_BRANCH lists no required checks; gate (a) imposes no required-check filter beyond the independent annex workflow-wide scan."
-  fi
+  # Read SUCCEEDED and the branch genuinely requires no status checks (an
+  # approvals-only branch, or an unprotected one). Nothing to enforce for any
+  # OTHER check — gate (a) imposes no required-check filter (the other gates
+  # still run). The repo_lint_local.yml annex (#601), when present, is enforced
+  # independently below via the workflow-wide ANNEX_WORKFLOW_BAD scan reading
+  # ANNEX_SCAN_ROLLUP_JSON (a copy frozen BEFORE this branch's own wipe, #655
+  # round 7) -- so wiping ROLLUP_JSON here unconditionally does NOT hide the
+  # annex the way it used to before that scan existed (#655 round 1's original
+  # problem).
+  #
+  # This branch is now only reached on POSITIVE evidence of an empty
+  # requirement list. Before #1064 it also absorbed every unreadable config,
+  # which is what let gate (a) pass without examining anything.
+  log "gate (a): $BASE_BRANCH requires no status checks according to its rule surfaces ($BRANCH_REQUIREMENTS_SURFACES); gate (a) imposes no required-check filter beyond the independent annex workflow-wide scan."
   ROLLUP_JSON='{"statusCheckRollup":[]}'
   REQUIRED_JSON='[]'
 else
@@ -1546,6 +1631,7 @@ else
   # unrelated check. No annex-name merge is needed here any more; only
   # branch protection's own required names apply to this filter.
   REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s .)
+  log "gate (a): $BASE_BRANCH requires $(printf '%s' "$REQUIRED_JSON" | jq -r 'length') status check(s) per its rule surfaces ($BRANCH_REQUIREMENTS_SURFACES): $(printf '%s' "$REQUIRED_JSON" | jq -r 'join(", ")')"
 fi
 
 CURRENT_RUN_ID=""
@@ -1555,62 +1641,203 @@ if [ "$APPROVAL_READINESS_ONLY" = "1" ] && [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]
 fi
 
 BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
-  --argjson required_names "${REQUIRED_JSON:-[]}" \
+  --argjson requirements "${REQUIREMENTS_JSON:-[]}" \
+  --arg requirements_state "$BRANCH_REQUIREMENTS_STATE" \
   --arg approval_readiness_only "$APPROVAL_READINESS_ONLY" \
   --arg current_run_id "$CURRENT_RUN_ID" '
+  # Pick the entry that REPRESENTS a set of runs: a still-non-terminal entry
+  # always wins over any completed sibling (a freshly-queued rerun has no
+  # usable timestamp and must not be outranked by an older completed one), and
+  # only when every entry is terminal does the latest-completed one win. This
+  # is the rule #655 round 13 already blessed for the annex scan.
+  #
+  # `.result` is bound BEFORE the `["PENDING","EXPECTED"] | …` sub-pipeline,
+  # because inside it `.` rebinds to the literal array and a bare `.result`
+  # would index an array with a string and hard-error the whole filter.
+  #
+  # `//` is deliberately NOT used to fall back from completedAt to startedAt:
+  # the projection emits "" rather than null for a missing timestamp, and "" is
+  # truthy in jq, so `.completedAt // .startedAt` would keep the empty string
+  # and sort every terminal entry as equal.
+  def current_entry:
+    (map(select(
+        if .status != ""
+        then .status != "COMPLETED"
+        else ((.result) as $r | ["PENDING", "EXPECTED"] | index($r)) != null
+        end
+      ))) as $pending
+    | if ($pending | length) > 0
+      then
+        # A non-terminal entry wins over any completed sibling. That
+        # precedence is #655 round 6 deliberately: once a run for a required
+        # context has appeared in the rollup, gate (a) must not report clean
+        # until it finishes, so a fast sibling cannot clear the label while a
+        # slower run of the same context is still in flight.
+        #
+        # Among SEVERAL pending entries, prefer one with no timestamp at all —
+        # a freshly-queued rerun, which is by construction the newest and is
+        # why the precedence above is unconditional — and otherwise take the
+        # latest-started, so the choice is by recency rather than by whichever
+        # node happened to sort first.
+        (($pending | map(select(.startedAt == ""))) as $untimed
+         | if ($untimed | length) > 0
+           then $untimed[0]
+           else ($pending | sort_by(.startedAt) | last)
+           end)
+      else (sort_by(if .completedAt != "" then .completedAt else .startedAt end) | last)
+      end;
+
+  # A check passes iff SUCCESS, SKIPPED, or NEUTRAL. Everything else —
+  # FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, PENDING, EXPECTED, ERROR,
+  # MISSING, or unknown — blocks.
+  def blocks:
+    (.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL");
+
   [.statusCheckRollup[]
     | {
         label: (.name // .context // "?"),
         workflow: (.workflowName // ""),
         runId: (.runId // ""),
         status: (.status // ""),
-        result: (.conclusion // .state // "")
+        result: (.conclusion // .state // ""),
+        # A CheckRun has startedAt/completedAt; a StatusContext has only
+        # createdAt, so it falls back to that rather than to an empty string —
+        # otherwise every legacy status compares equal and the winner is
+        # whichever node sorted last, letting an older SUCCESS hide the current
+        # FAILURE.
+        startedAt: (.startedAt // .createdAt // ""),
+        completedAt: (.completedAt // .createdAt // ""),
+        isRequired: .isRequired,
+        appId: (.appId // "")
       }
-    # Approval readiness runs inside a check on the same HEAD. If branch
-    # protection is unreadable, the fail-closed full-rollup fallback would
-    # otherwise block forever on the caller itself. Exclude only non-completed
-    # checks from this exact trusted run; completed failures in this run and
-    # active checks in every other run remain blocking.
-    | select(
-        ($approval_readiness_only != "1")
-        or ($current_run_id == "")
-        or (.runId != $current_run_id)
-        or (.status == "COMPLETED")
-      )
-    # Filter out the known "expected to fail during Phase 4a" check.
-    # Label Gate lives in the "PR Review Policy" workflow and fails by
-    # design whenever needs-external-review / needs-human-review /
-    # policy-violation / human-hold is set. That enforcement is what Phase 4a is
-    # trying to unblock; we verify clearance separately in gate (c).
-    | select(
-        (.workflow != "PR Review Policy") or
-        (.label != "Label Gate")
-      )
-    # When branch protection lists required checks, only those
-    # checks block the gate. When the list is empty (no branch
-    # protection configured or query failed), fall back to the
-    # prior behavior of treating all checks as required.
-    #
-    # Bind `.label` to a variable BEFORE the `$required_names | ...`
-    # sub-pipeline, because inside that sub-pipeline `.` rebinds to
-    # `$required_names` (the array) and `.label` would then try to
-    # index the array, producing the jq error
-    # "Cannot index array with string \"label\"".
-    | (.label) as $label_name
-    | select(
-        ($required_names | length) == 0
-        or ($required_names | index($label_name)) != null
-      )
-    # A check passes the gate iff its result is SUCCESS, SKIPPED, or
-    # NEUTRAL. Everything else — FAILURE, CANCELLED, TIMED_OUT,
-    # ACTION_REQUIRED, PENDING, EXPECTED, ERROR, or unknown — blocks.
-    | select(
-        (.result != "SUCCESS") and
-        (.result != "SKIPPED") and
-        (.result != "NEUTRAL")
-      )
-  ]
+    # Runs GitHub does not count toward THIS PR requirements are not evidence
+    # about them. Only an explicit `false` drops one: a null means GitHub
+    # returned no opinion, and treating that as not-required would silently
+    # empty the gate.
+    | select(.isRequired != false)
+  ] as $counted_all
+  # TWO exclusions, both applying to VERDICT SELECTION only. PRESENCE is judged
+  # against $counted_all above, because an entry excluded here HAS reported —
+  # calling its requirement MISSING would manufacture a blocking requirement
+  # out of a check the exclusion exists to permit.
+  #
+  # 1. Label Gate lives in the "PR Review Policy" workflow and fails by design
+  #    whenever needs-external-review / needs-human-review / policy-violation /
+  #    human-hold is set. That enforcement is what Phase 4a is trying to
+  #    unblock; clearance is verified separately in gate (c).
+  #
+  #    This exclusion used to drop the entry from the projection outright,
+  #    which was correct while the filter judged rollup entries and became a
+  #    hard deadlock the moment it started iterating requirements: Label Gate
+  #    is one of the five canonical required contexts, so its requirement found
+  #    no entry and was synthesized as MISSING on EVERY evaluation, and gate
+  #    (a) could never clear on any consumer. Keeping the entry visible to the
+  #    presence test and hiding it only from the verdict is what the original
+  #    exclusion actually meant.
+  #
+  # 2. Approval readiness runs inside a check on the same HEAD, so the caller
+  #    own in-flight run must not decide its own verdict. Exclude only
+  #    non-completed checks from that exact trusted run; completed failures in
+  #    this run and active checks in every other run remain blocking.
+  | ($counted_all
+     | map(select(
+         (.workflow != "PR Review Policy") or
+         (.label != "Label Gate")
+       ))
+     | map(select(
+         ($approval_readiness_only != "1")
+         or ($current_run_id == "")
+         or (.runId != $current_run_id)
+         or (.status == "COMPLETED")
+       ))) as $counted
+  | if ($requirements | length) == 0
+    then
+      # No requirement list. Two very different reasons reach here, and they
+      # are told apart by $requirements_state rather than by the empty list —
+      # which is the whole point of the tri-state.
+      #
+      # `known`: the branch genuinely requires nothing. The rollup was already
+      # emptied upstream, so this judges nothing and gate (a) imposes no filter.
+      #
+      # `unknown`: the list could not be RESOLVED. Judging the rollup alone is
+      # not enough here, because it can only see checks that reported: a
+      # required context whose workflow has not been scheduled produces no
+      # entry, so an otherwise-green rollup would clear gate (a) while GitHub
+      # is still waiting for that context. Scrutinising every counted check
+      # (#465) catches a red one but cannot catch an absent one, and on this
+      # path there is no list to notice the absence from. So an unresolved
+      # requirement list is itself blocking: gate (a) reports that it could not
+      # determine the requirements rather than reporting clean.
+      #
+      # Blocking via a synthetic entry rather than a hard exit is deliberate.
+      # An infrastructure exit would take the whole script down fleet-wide on
+      # any anomaly in one endpoint, which is the shape of the regression that
+      # caused the #1061 revert; a blocking entry declines to clear, keeps the
+      # genuinely-red checks visible alongside it, and resolves on its own when
+      # the surfaces answer again.
+      (($counted | group_by(.label) | map(current_entry) | map(select(blocks)))
+       + (if $requirements_state == "known" then []
+          else [ { label: "(requirement list unresolved)",
+                   workflow: "(gate (a) could not read the branch rules)",
+                   result: "UNKNOWN" } ]
+          end))
+    else
+      # REQUIREMENT-DRIVEN. Iterate the rules GitHub will evaluate, not the
+      # runs that happen to exist, and ask of each whether it is satisfied.
+      #
+      # This replaced a "collapse the rollup by some key, then judge" shape
+      # that had to guess a grouping key, and guessing it produced a new
+      # unmodelled configuration every review round: by name it hid a second
+      # required app failure; by workflow it blocked PRs GitHub merges (three
+      # contexts on nathanpaynedotcom#908 are published by two workflows under
+      # one app); by app it made every producer of an any-producer context
+      # separately mandatory; by app-when-any-rule-pins-the-name it did the
+      # same wherever a pinned and an any-producer rule share a context.
+      #
+      # Iterating requirements has no such key. Each rule selects its own
+      # candidate runs — every run of the context for an any-producer rule,
+      # that app runs for a pinned one — and is satisfied by the current entry
+      # among them. A context carrying several rules at once is simply several
+      # requirements, each judged on its own terms, which is what GitHub does.
+      #
+      # A requirement with NO candidate run is MISSING and blocks: GitHub holds
+      # the PR for an unreported required context, so gate (a) does too. This
+      # is not the synthetic-MISSING approach #655 rounds 2-4 removed — those
+      # names were DERIVED from a consumer annex and could legitimately never
+      # report, while these come from the branch rules themselves.
+      ([ $requirements[]
+         | . as $req
+         # PRESENCE from the pre-exclusion set, VERDICT from the post-exclusion
+         # one. A requirement whose only run is the caller own in-flight check
+         # has reported — it just has no entry eligible to decide the verdict —
+         # so it is neither MISSING nor judged, and drops out via `empty`.
+         | ($counted_all
+            | map(select(
+                (.label == $req.context)
+                and (($req.app_id == null) or (.appId == $req.app_id))
+              ))) as $reported
+         | ($counted
+            | map(select(
+                (.label == $req.context)
+                and (($req.app_id == null) or (.appId == $req.app_id))
+              ))) as $candidates
+         | if ($reported | length) == 0
+           then { label: $req.context,
+                  workflow: (if $req.app_id == null
+                             then "(not reported)"
+                             else "(not reported by app \($req.app_id))"
+                             end),
+                  result: "MISSING" }
+           elif ($candidates | length) == 0
+           then empty
+           else ($candidates | current_entry)
+           end
+       ]
+       | map(select(blocks))
+       | unique)
+    end
 ')
+
 
 # #655 (Codex P2 round 5): rather than inventing a synthetic MISSING
 # requirement for a derived check name that has not reported (rounds 2-4's

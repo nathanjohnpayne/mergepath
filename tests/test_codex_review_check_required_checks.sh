@@ -1411,36 +1411,214 @@ fi
 
 
 # ---------------------------------------------------------------------------
-# #1059: the ambiguous-404 REPORT is fixed; the DECISION is deliberately not.
+# #1064 (superseding the #1059 assertions that stood here): the ambiguous 404
+# is GONE, because gate (a) no longer asks the endpoint that produces it.
 #
-# Resolving the ambiguity for real needs ruleset support, URI-segment encoding,
-# and a privileged read that auto-clear CI can actually reach (it runs this
-# script with only GH_TOKEN). Attempting it here shipped a fleet-wide gate (a)
-# regression, so it is deferred whole to #1064 and only the log is corrected.
-# These assertions pin that the BEHAVIOUR stayed put.
+# #1059/#1061 could only fix the REPORT. The read itself was
+# `branches/{branch}/protection/required_status_checks`, which needs
+# Administration:read and answers 404 — not 403 — for an unprivileged token, so
+# "requires nothing" and "may not look" arrived as the same empty list. Every
+# path gate (a) runs on is unprivileged (agents use a reviewer PAT;
+# auto-clear-blocking-labels.yml uses REVIEWER_ASSIGNMENT_TOKEN and does NOT
+# skip gate (a)), so the gate passed without examining a check run.
+#
+# #1064 replaced the read rather than the decision. The two surfaces a plain
+# write-scoped token CAN see — GraphQL refUpdateRule for classic protection,
+# REST rules/branches for rulesets — resolve the real list on exactly those
+# tokens, so the ambiguity has no path back. These assertions pin that.
 # ---------------------------------------------------------------------------
 
-UNPRIV_404_ARM=$(sed -n '/elif grep -q .HTTP 404. "\$protection_err"; then/,/^else$/p' "$SCRIPT")
-if [ -z "$UNPRIV_404_ARM" ]; then
-  fail "#1059: could not locate the unprivileged 404 arm in $SCRIPT"
+# Comment-stripped view. These two assertions are about what the script DOES,
+# and the block above deliberately names the retired endpoint in prose so a
+# future reader knows what was replaced and why — a whole-file grep would read
+# that history as a regression.
+SCRIPT_CODE_1064=$(grep -vE '^[[:space:]]*#' "$SCRIPT")
+
+if grep -q 'protection/required_status_checks' <<<"$SCRIPT_CODE_1064"; then
+  fail "#1064: gate (a) reads the admin-only REST protection endpoint again — that read answers 404 for every token the fleet runs under, which is the conflation #1064 removed"
 else
-  if grep -Eq '^[[:space:]]*protection_readable=1[[:space:]]*$' <<<"$UNPRIV_404_ARM"; then
-    pass "#1059: the 404 arm still marks the list readable — behaviour unchanged, as intended for this PR"
-  else
-    fail "#1059: the 404 arm changed the gate (a) DECISION. That belongs in #1064: auto-clear CI runs this script with only GH_TOKEN, so a privileged retry is unreachable there and failing closed reds gate (a) on every protected consumer"
-  fi
-  if grep -q 'PROTECTION_404_AMBIGUOUS=1' <<<"$UNPRIV_404_ARM"; then
-    pass "#1059: the 404 arm records that the required-check list is UNVERIFIED"
-  else
-    fail "#1059: the ambiguity flag is gone — gate (a) will again assert 'lists no required checks' as established fact"
-  fi
+  pass "#1064: gate (a) no longer reads the admin-only REST protection endpoint"
 fi
 
-if grep -q 'could not VERIFY the required-check list' <<<"$SCRIPT_CODE_1059"; then
-  pass "#1059: the ambiguous case reports the list as unverified, not absent"
+if grep -q 'PROTECTION_404_AMBIGUOUS' <<<"$SCRIPT_CODE_1064"; then
+  fail "#1064: the ambiguous-404 flag is back — it exists only to describe a read gate (a) should no longer be making"
 else
-  fail "#1059: nothing distinguishes 'no required checks configured' from 'this token may not see protection'"
+  pass "#1064: the ambiguous-404 bookkeeping is gone with the read that needed it"
 fi
+
+if grep -q 'lib/branch-requirements.sh' "$SCRIPT" \
+   && grep -q 'br_required_checks' "$SCRIPT"; then
+  pass "#1064: gate (a) resolves the required list through the shared tri-state resolver"
+else
+  fail "#1064: gate (a) is not using scripts/lib/branch-requirements.sh — without it there is nothing separating an unreadable rule set from an empty one"
+fi
+
+# Hard-sourced, not existence-guarded: a degraded mode here IS the defect, so
+# a consumer that ships the caller without the lib must fail loudly rather
+# than silently fall back to an unfiltered gate.
+BR_SOURCE_BLOCK=$(sed -n '/branch-requirements helper missing/,/lib\/branch-requirements.sh"$/p' "$SCRIPT")
+if grep -q 'exit 3' <<<"$BR_SOURCE_BLOCK"; then
+  pass "#1064: the branch-requirements lib is HARD-required (exit 3 when absent)"
+else
+  fail "#1064: the branch-requirements lib is soft-sourced — an absent lib would leave gate (a) unfiltered and silent, which is the original bug"
+fi
+
+# The tri-state must stay three-valued at the point of decision. `known` with
+# an empty list is a real answer (an approvals-only branch); `unknown` is not
+# an answer at all and must not reach the no-filter branch.
+if grep -q 'BRANCH_REQUIREMENTS_STATE" = "known"' "$SCRIPT"; then
+  pass "#1064: gate (a) branches on the resolver state rather than on list emptiness alone"
+else
+  fail "#1064: gate (a) infers readability from an empty list again — that is exactly how 'could not look' became 'nothing required'"
+fi
+
+# ---------------------------------------------------------------------------
+# #1064 review round 1 (PR #1176): the two fail-opens Codex found in the
+# collapse that resolving the required list newly exposed.
+# ---------------------------------------------------------------------------
+
+# A required context is a bare NAME, and branch protection pins it to a
+# producing app. Collapsing purely by name lets a later same-named run from a
+# foreign producer win and mask the required producer FAILURE. GitHub answers
+# this directly via isRequired(pullRequestNumber:), so the rollup carries it.
+if grep -q 'isRequired(pullRequestNumber: $number)' "$SCRIPT" \
+   && grep -q 'isRequired: .isRequired' "$SCRIPT"; then
+  pass "#1064: the rollup query carries GitHub own isRequired verdict per entry"
+else
+  fail "#1064: the rollup no longer carries isRequired — the per-name collapse can then let a foreign producer SUCCESS mask a required FAILURE"
+fi
+
+if grep -q 'select(.isRequired != false)' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: entries GitHub says do not count are dropped before the collapse, and only an explicit false drops one"
+else
+  fail "#1064: the filter does not exclude isRequired==false entries, so a foreign same-named check can decide a required context"
+fi
+
+# The collapse key is (name, PRODUCING APP) — GitHub own unit of requirement,
+# since protection requires a context from a specific app id.
+#
+# Not the workflow, and that distinction is measured rather than assumed: on
+# nathanpaynedotcom#908 three required contexts are each emitted by TWO
+# workflows under the SAME app 15368 (agent-review.yml republishes what the
+# dedicated gate workflows publish), all reporting isRequired=true against a
+# protection entry that lists each context once. Keying on workflow would
+# demand both be green and block PRs GitHub merges.
+#
+# Not the bare name either: when protection lists one context under two app
+# ids those producers are independently required, and collapsing them lets one
+# app SUCCESS hide the other app FAILURE.
+if grep -q 'app { databaseId }' "$SCRIPT" \
+   && grep -q 'appId: ((.checkSuite.app.databaseId' "$SCRIPT"; then
+  pass "#1064: the rollup carries the producing app id"
+else
+  fail "#1064: the rollup does not carry the producing app id, so the collapse cannot separate independently required producers"
+fi
+
+# The filter iterates REQUIREMENTS, not rollup groups.
+#
+# The earlier shape collapsed the rollup by some key and then judged the
+# survivors, which meant guessing a key — and guessing it produced a new
+# unmodelled configuration every review round on PR #1176: by name it hid a
+# second required app failure; by workflow it blocked PRs GitHub merges (three
+# contexts on nathanpaynedotcom#908 are published by two workflows under one
+# app); by app it made every producer of an any-producer context separately
+# mandatory; by app-when-any-rule-pins-the-name it did the same wherever a
+# pinned and an any-producer rule share a context.
+#
+# Iterating requirements needs no key: each rule selects its own candidates and
+# is satisfied by the current entry among them, which is what GitHub does.
+if grep -q 'REQUIREMENT-DRIVEN' <<<"$SCRIPT_CODE_1064" \
+   || grep -q '\$requirements\[\]' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: gate (a) iterates the branch rules rather than collapsing the rollup by a guessed key"
+else
+  fail "#1064: gate (a) is back to collapsing by a grouping key — that shape cannot express a context carrying both a pinned and an any-producer rule"
+fi
+
+# An any-producer rule (app_id null) draws candidates from every producer; a
+# pinned rule only from its app. One context carrying both is simply two
+# requirements, each judged on its own terms.
+if grep -q '($req.app_id == null) or (.appId == $req.app_id)' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: a rule selects candidates by its own producer scope, so pinned and any-producer rules coexist on one context"
+else
+  fail "#1064: candidate selection ignores the rule producer scope — an any-producer rule would be judged per app, or a pinned rule across all apps"
+fi
+
+# A requirement with no candidate run at all is MISSING and blocks: GitHub
+# holds the PR for an unreported required context. This is not the
+# synthetic-MISSING approach #655 rounds 2-4 removed — those names were derived
+# from a consumer annex and could legitimately never report, while these come
+# from the branch rules themselves.
+if grep -q 'result: "MISSING"' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'not reported by app' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: an unreported requirement blocks, and names the producer when the rule pins one"
+else
+  fail "#1064: an unreported requirement leaves BAD_CHECKS empty and gate (a) clears while GitHub still blocks the merge"
+fi
+
+# An UNRESOLVED requirement list is itself blocking. On that path the filter
+# can only judge checks that reported, so a required context whose workflow has
+# not been scheduled produces no entry and an otherwise-green rollup would
+# clear gate (a) while GitHub is still waiting for it. Scrutinising every
+# counted check (#465) catches a red check but not an absent one.
+if grep -q 'requirement list unresolved' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'requirements_state == "known"' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: an unresolved requirement list blocks gate (a) instead of clearing on a rollup-only result"
+else
+  fail "#1064: gate (a) can still report clean while the requirement list is unreadable — a never-reported required check is invisible on that path"
+fi
+
+# It blocks via a synthetic entry, not a hard exit: an infrastructure exit
+# would take the script down fleet-wide on any anomaly in one endpoint, which
+# is the shape of the #1061 regression.
+if grep -q 'result: "UNKNOWN"' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: the unresolved state blocks via a reported entry rather than a fleet-wide hard exit"
+else
+  fail "#1064: the unresolved state no longer surfaces as a blocking entry"
+fi
+
+# Label Gate is one of the five canonical REQUIRED contexts and fails by design
+# during Phase 4a, which is what Phase 4a exists to clear. Its exclusion must
+# therefore hide only its VERDICT: dropping its entry from the projection made
+# its requirement find no entry and be synthesized as MISSING on every
+# evaluation, so gate (a) could never clear on any consumer.
+LABELGATE_BLOCK=$(sed -n '/TWO exclusions/,/as \$counted/p' "$SCRIPT")
+if grep -q 'PR Review Policy' <<<"$LABELGATE_BLOCK"; then
+  pass "#1064: the Label Gate exclusion applies to verdict selection, alongside the readiness exclusion"
+else
+  fail "#1064: the Label Gate exclusion is not on the verdict-selection path — if it drops the entry outright, its requirement reports MISSING forever and gate (a) can never clear"
+fi
+if grep -q 'select(.isRequired != false)' <<<"$(sed -n '/\] as \$counted_all/q;/statusCheckRollup\[\]/,$p' "$SCRIPT")" \
+   && ! grep -q 'PR Review Policy' <<<"$(sed -n '/statusCheckRollup\[\]/,/\] as \$counted_all/p' "$SCRIPT")"; then
+  pass "#1064: Label Gate stays visible to the presence test, so it is not reported MISSING"
+else
+  fail "#1064: Label Gate is filtered out before the presence test — its requirement would be permanently MISSING"
+fi
+
+# PRESENCE is judged pre-exclusion, VERDICT post-exclusion.
+#
+# The approval-readiness exclusion drops non-completed checks from the caller
+# own trusted run so the gate cannot decide its own verdict. Drawing the
+# MISSING test from that same reduced set turns the caller in-flight check into
+# a manufactured blocking requirement — the exact self-block the exclusion
+# exists to prevent. This regressed once during the requirement-driven
+# restructure and the assertion that replaced it was too weak to notice, so it
+# is pinned on both halves now.
+if grep -q '\$counted_all' <<<"$SCRIPT_CODE_1064" \
+   && grep -q ')) as \$reported' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'elif (\$candidates | length) == 0' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: presence uses the pre-exclusion set and a caller-excluded requirement drops out rather than reporting MISSING"
+else
+  fail "#1064: MISSING is derived from the readiness-filtered set — the caller own in-flight check would be reported as never-reported and block the gate on itself"
+fi
+
+# And the exclusion must still apply to verdict selection.
+if grep -q 'approval_readiness_only' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'current_run_id' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: the readiness exclusion still scopes verdict selection"
+else
+  fail "#1064: the approval-readiness exclusion is gone — the gate can block on its own in-flight check"
+fi
+
 
 # The CODEOWNERS deadlock: reviewDecision stays REVIEW_REQUIRED even though a
 # qualifying approval exists (scripts/admin-merge-codeowners-blocked.sh
@@ -1483,10 +1661,19 @@ if grep -q 'reports this as 404' <<<"$FAILCLOSED_WARN"; then
 else
   pass "#1061: the fail-closed warning no longer misattributes the failure to a 404"
 fi
-if grep -qE '403|5xx' <<<"$FAILCLOSED_WARN" && grep -q 'transient' <<<"$FAILCLOSED_WARN"; then
-  pass "#1061: the fail-closed warning names the errors that actually reach it and flags 5xx as retryable"
+# #1064 narrowed which failures can reach this arm. A permission shape can no
+# longer land here at all — both rule surfaces are readable by a write-scoped
+# token — so the warning must describe an API/network fault and say it is
+# usually transient, NOT send the operator off to fix credentials.
+if grep -q 'transient' <<<"$FAILCLOSED_WARN"; then
+  pass "#1064: the fail-closed warning flags the fault as usually transient rather than a credential problem"
 else
-  fail "#1061: the fail-closed warning does not distinguish a scope failure from a transient one"
+  fail "#1064: the fail-closed warning does not tell the operator the fault is usually transient"
+fi
+if grep -qE 'EITHER rule surface|both.*surface' <<<"$FAILCLOSED_WARN"; then
+  pass "#1064: the fail-closed warning names the condition that actually reaches it (neither rule surface answered)"
+else
+  fail "#1064: the fail-closed warning still describes a token-scope failure — after #1064 that shape cannot reach this arm, so the advice would misdirect"
 fi
 
 

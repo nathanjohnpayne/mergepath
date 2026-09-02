@@ -398,8 +398,24 @@ looks_like_branch_name() {
 # and the segments rejoined. jq's `@uri` does the per-segment work
 # (correct for UTF-8, which a hand-rolled byte loop is not), and jq is
 # already a hard dependency of this script.
+#
+# The definition moved to scripts/lib/branch-requirements.sh (#1063, landed
+# with #1064): gate (a) needs the same encoding, and this script is hub-only,
+# so a propagated caller could not reuse the copy that lived here. This
+# wrapper keeps the local call sites reading the same as before.
+#
+# Hard-required. A silent fallback to an unencoded path is precisely the
+# failure this function exists to prevent — it would read a DIFFERENT branch
+# and report its protection as this one.
+if [ ! -r "$SCRIPT_DIR/lib/branch-requirements.sh" ]; then
+  echo "ERROR: branch-requirements helper missing: $SCRIPT_DIR/lib/branch-requirements.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/branch-requirements.sh
+. "$SCRIPT_DIR/lib/branch-requirements.sh"
+
 urlencode_branch_path() {
-  jq -rn --arg s "$1" '$s | split("/") | map(@uri) | join("/")'
+  br_urlencode_branch_path "$1"
 }
 
 # ─────────────────────────────────────────────────────────────────────
