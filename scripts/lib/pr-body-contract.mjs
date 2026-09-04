@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 // two classifications cannot drift apart.
 // GFM/CommonMark's inter-token whitespace is space/tab only, not the full
 // Unicode set JavaScript's \s matches (e.g. U+2003). Using \s here let a
-// Unicode-whitespace-separated tag like "<pre >" open a raw HTML block
+// Unicode-whitespace-separated tag like "<pre\u2003>" open a raw HTML block
 // that cmark-gfm would not, ending a code-span search early.
 const RAW_TAG_RE = /^ {0,3}<(script|pre|style|textarea)(?:[ \t]|>|$)/i;
 const PROCESSING_INSTRUCTION_RE = /^ {0,3}<\?/;
