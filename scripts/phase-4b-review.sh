@@ -70,9 +70,11 @@
 #      handoff (today's behavior). Not an error.
 #   6  held: external review has not reached the reviewed head yet (#814).
 #      NOT a fallback and NOT an unavailable reviewer — no handoff block is
-#      emitted and no fail-closed loop is recorded. The JSON carries
-#      barrier_pending:true and retry_after; the caller should retry after
-#      that many seconds. Deliberately distinct from 4 so that every existing
+#      emitted. An early hold records no loop; a final pre-POST timeout-
+#      generation retraction corrects its already-provisional loop to
+#      not-posted/fail-closed. The JSON carries barrier_pending:true and
+#      retry_after; the caller should retry after that many seconds.
+#      Deliberately distinct from 4 so that every existing
 #      consumer of 4 keeps its meaning: AGENTS.md, REVIEW_POLICY.md and
 #      scripts/wave-audit.sh all treat 4 as a reviewer that will not answer,
 #      and wave-audit proceeds fail-open on it — which would be wrong for a
@@ -107,6 +109,10 @@ p4b_acct_on() { [ "$P4B_ACCT_AVAILABLE" = true ] && p4b_acct_hook_active; }
 # Set after the pre-post record; consulted by the failure paths so a review
 # that never actually posted is corrected instead of double-recorded.
 P4B_ACCT_LOOP_RECORDED=false
+# Set only when a late timeout-generation revalidation already corrected this
+# invocation's provisional loop before entering fall_back_to_manual. The
+# fallback must not append a second record for the same invocation.
+P4B_TIMEOUT_REVALIDATION_ACCT_CLEANED=false
 
 # Per-invocation ledger-staging token (#615 Codex round 6). Exported so the
 # render subshell (which stages the pending record on disk) and this process's
@@ -378,7 +384,9 @@ fall_back_to_manual() {
   # posting step, e.g. head drift inside post_review), amend that line
   # instead of appending a duplicate fail-closed loop (#615 Codex).
   if p4b_acct_on 2>/dev/null; then
-    if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
+    if [ "${P4B_TIMEOUT_REVALIDATION_ACCT_CLEANED:-false}" = true ]; then
+      : # the final timeout fence already corrected this invocation's loop
+    elif [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
       p4b_acct_mark_unposted "$why"
     else
       p4b_acct_hook_note_fallback "$why" \
@@ -423,9 +431,11 @@ fall_back_to_manual() {
 # on every bounded retry would flood the accounting history and inflate the
 # #813 series-3 fallback counts with waits that later succeed on their own.
 #
-# Reached only from the pre-adapter evaluation, which runs before any loop is
-# recorded and before any step-9 issue is filed — so a hold leaves no
-# provisional posted record to correct and no follow-up issues to orphan.
+# Normally reached before approval-side accounting and step-9 issue filing:
+# either from the pre-adapter barrier or from the first targeted timeout-
+# generation recheck immediately after the adapter. The final pre-POST recheck
+# can also hold after those side effects; that caller corrects the provisional
+# accounting record and closes this run's follow-up issues first.
 hold_for_external_review() {
   local payload="$1"
   p4b_warn "external review has not reached the current head; holding without posting (retry_after=$(printf '%s' "$payload" | jq -r '.retry_after // 0')s)"
@@ -443,13 +453,69 @@ hold_for_external_review() {
 
 # Run the same-head barrier and act on it. Escalation routes to the existing
 # manual handoff; only the non-terminal case takes the new hold path.
+P4B_PRE_ADAPTER_CODEX_EVIDENCE=""
 run_same_head_barrier() {
   local where="$1" out rc=0
   out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN")" || rc=$?
   case "$rc" in
-    0) return 0 ;;
+    0)
+      if [ "$where" = "pre-adapter" ]; then
+        P4B_PRE_ADAPTER_CODEX_EVIDENCE="$(printf '%s' "$out" | jq -r '.codex_evidence // "unreadable"')"
+      fi
+      return 0
+      ;;
     1) hold_for_external_review "$out" ;;
     *) fall_back_to_manual "external review barrier ($where): $(printf '%s' "$out" | jq -r '.reason // "escalated"')" ;;
+  esac
+}
+
+# A timeout is retractable evidence: another exact author trigger on the same
+# head starts a new Phase 4a attempt. Only revalidate that generation here;
+# rerunning the whole barrier would also re-probe CodeRabbit and could turn an
+# unrelated transient into a late hold.
+cleanup_timeout_revalidation_side_effects() {
+  local why="$1" mark_accounting="${2:-false}"
+  # Local state first: issue cleanup and the fallback accounting gate both use
+  # external commands and may fail or hang. The loop/ledger must already say
+  # not-posted before either can interrupt this refusal path.
+  if [ "$mark_accounting" = true ]; then
+    if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
+      p4b_acct_mark_unposted "$why"
+      P4B_TIMEOUT_REVALIDATION_ACCT_CLEANED=true
+    fi
+  fi
+  if [ "${VERDICT:-}" = "APPROVED" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then
+    p4b_warn "Phase 4a timeout evidence changed before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
+    p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the Phase 4a timeout waiver for ${REPO}#${PR} changed before the Phase 4b approval could post; a rerun files fresh follow-ups."
+    P4B_CREATED_ISSUE_REFS=""
+  fi
+}
+
+revalidate_phase4a_timeout_generation() {
+  local where="${1:-post-adapter}"
+  [ "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" = timeout ] || return 0
+  local out rc=0 state why
+  out="$(p4b_codex_timeout_determination "$REPO" "$PR" "$HEAD")" || rc=$?
+  state="$(printf '%s' "$out" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+  case "$rc" in
+    0) return 0 ;;
+    1)
+      why="Phase 4a timeout generation changed during external review ($state); holding for the newer attempt"
+      if [ "$where" = "pre-post" ]; then
+        cleanup_timeout_revalidation_side_effects "$why" true
+      fi
+      hold_for_external_review "$(jq -nc --arg ce "$state" \
+        '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:$ce,trigger:"skipped",resume:"skipped"}')"
+      ;;
+    *)
+      why="Phase 4a timeout generation changed during external review ($state); refusing the old waiver"
+      if [ "$where" = "pre-post" ]; then
+        # Correct accounting before the fallback's feedback gate can itself
+        # fail, then tell the fallback not to append a duplicate loop record.
+        cleanup_timeout_revalidation_side_effects "$why" true
+      fi
+      fall_back_to_manual "$why"
+      ;;
   esac
 }
 
@@ -566,6 +632,14 @@ fi
 # Defense in depth: re-validate before we act on it.
 if ! p4b_validate_verdict "$VERDICT_JSON"; then
   fall_back_to_manual "adapter returned a non-conformant verdict"
+fi
+
+# A Codex trigger can arrive without changing the PR head while the external
+# adapter is running. Revalidate a timeout-derived waiver after the adapter's
+# output is schema-valid but before interpreting it or performing the first
+# approval-side effect. Keep dry-runs offline.
+if [ "$DRY_RUN" != true ]; then
+  revalidate_phase4a_timeout_generation post-adapter
 fi
 
 VERDICT="$(printf '%s' "$VERDICT_JSON" | jq -r '.verdict')"
@@ -1027,6 +1101,16 @@ post_review() {
     --request-changes) event="REQUEST_CHANGES" ;;
     *) p4b_die 3 "unsupported review state flag: $state_flag" ;;
   esac
+  # The post-adapter recheck protects every earlier approval-side effect, but
+  # rendering, accounting, and optional step-9 issue filing leave another
+  # window before the review POST. Close it with one final targeted generation
+  # read before the final live-head fence. On a hold, the helper corrects the
+  # provisional accounting record and closes this run's filed follow-ups before
+  # exiting; malformed evidence takes the same cleanup path before the manual
+  # fallback. This is deliberately not the full provider barrier, so an
+  # unrelated late CodeRabbit probe cannot flap a verdict whose ordering
+  # evidence was already established.
+  revalidate_phase4a_timeout_generation pre-post
   local live_head
   # #799: the last drift check before a review POSTS. An unreadable read that
   # arrived as a JSON blob compared unequal to $HEAD and took the
@@ -1048,22 +1132,6 @@ post_review() {
     fi
     fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
   fi
-  # No second barrier evaluation here, despite #814's change detail asking for
-  # one at this line — recorded on #814 as superseded.
-  #
-  # It cannot change the answer. A provider's report on head H is permanent
-  # for H: reports do not un-happen, so a barrier that opened before the
-  # adapter is still open now. The one state change that WOULD invalidate it
-  # is a push, and that is caught by the live-head recheck immediately above,
-  # which returns before this point. Meanwhile the pre-adapter barrier holds
-  # the run outright unless it opened, so reaching here already implies it did.
-  #
-  # Re-evaluating could therefore only agree, or spuriously escalate on a
-  # transient provider-CLI failure — converting a valid approval into a manual
-  # handoff. It also cost two defects found in review: this line sits AFTER the
-  # step-9 issue filing and after the provisional posted loop record, so a hold
-  # here left a phantom posted approval in the accounting history and re-filed
-  # follow-up issues on every retry cycle.
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"

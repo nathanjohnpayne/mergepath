@@ -343,11 +343,14 @@ paths:
   # Single source of truth for the Codex App failure-marker regexes (#722):
   # the usage-limit / not-connected patterns audit-codex-latency.sh classifies
   # retrospectively, factored out so the live Phase 4a scripts test the SAME
-  # patterns. Sourced (existence-guarded, flag-gated) by codex-review-request.sh
-  # and codex-review-check.sh — declared in each of their requires: below so the
+  # patterns. #1085 also makes this the one grammar/parser for the durable,
+  # exact-head Phase 4a timeout determination consumed by phase-4b/lib.sh.
+  # Sourced (existence-guarded, flag-gated) by codex-review-request.sh and
+  # codex-review-check.sh — declared in each of their requires: below so the
   # closure invariant records the coupling and the lib travels with them. A
-  # consumer missing it degrades to the pre-#722 behavior (no marker detection),
-  # so the source is soft, not fail-closed.
+  # consumer missing it degrades to pre-#722 behavior for provider markers,
+  # but a normal timeout or Phase 4b timeout read fails closed because inventing
+  # a terminal determination would bypass the ordering barrier.
   - path: scripts/lib/codex-failure-markers.sh
     type: canonical
     consumers: all
@@ -445,8 +448,11 @@ paths:
     consumers: all
     # Sources scripts/lib/codex-failure-markers.sh (existence-guarded) so the
     # poll loop can short-circuit on a usage-limit / not-connected marker
-    # instead of running out the full review timeout (#722). Soft-degrades to
-    # the pre-#722 behavior if the lib is absent mid-skew.
+    # instead of running out the full review timeout (#722). That provider-
+    # marker detection soft-degrades to the pre-#722 behavior if the lib is
+    # absent mid-skew. Persisting an ordinary timeout for Phase 4b is different:
+    # the same helper is required, and its absence fails closed with exit 3
+    # rather than creating a timeout waiver (#1085).
     #
     # Shells out to scripts/workflow/codex_auto_trigger_gate.sh (also
     # existence-guarded) to decide whether an AUTOMATIC trigger may be skipped
@@ -456,9 +462,12 @@ paths:
     # travels with its only caller.
     #
     # HARD-sources scripts/lib/gh-api-scalar.sh (#799) for the post-trigger
-    # timestamp read. Unlike the two soft deps above, an absent lib exits 3:
-    # the read anchors every "newer than my trigger?" comparison in the poll
-    # loop, so degrading it silently is worse than refusing to run.
+    # timestamp read. This helper is unconditionally required; an absent lib
+    # exits 3. By contrast, the auto-trigger helper above is fully soft, while
+    # the failure-marker helper is soft only for provider-marker detection and
+    # required for ordinary-timeout persistence. The scalar read anchors every
+    # "newer than my trigger?" comparison in the poll loop, so degrading it
+    # silently is worse than refusing to run.
     requires:
       - "scripts/lib/codex-failure-markers.sh"
       - "scripts/workflow/codex_auto_trigger_gate.sh"   # #798, content-free auto-trigger gate
@@ -537,6 +546,8 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/phase-4b/"
+      - "scripts/lib/codex-failure-markers.sh"   # #1085, exact-head Phase 4a timeout handoff parsed by phase-4b/lib.sh
+      - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
       - "scripts/gh-as-reviewer.sh"
       - "scripts/post-phase-4b-handoff.sh"
       # The #814 same-head barrier invokes both of these directly, by path,
@@ -1675,6 +1686,10 @@ paths:
   - path: scripts/phase-4b/
     type: kit
     consumers: all
+    requires:
+      - "scripts/lib/codex-failure-markers.sh"   # #1085, durable timeout grammar/parser sourced by lib.sh
+      - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
+      - "scripts/lib/gh-api-scalar.sh"  # #799/#1085, shaped live-head fence before timeout consumption
     # Automated Phase 4b handoff package (#579): adapters, schema, shared
     # shell helpers, and README — plus the approval-loop accounting module
     # (#602: accounting.sh, accounting.schema.json, prices.json) rendered
