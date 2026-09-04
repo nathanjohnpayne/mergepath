@@ -150,6 +150,8 @@ spec_test_map:
     - tests/test_mergepath_playground.sh
   bootstrap_consumer_identity:
     - tests/test_bootstrap_template_mirror.sh
+  bootstrap_label_seeding:
+    - tests/test_bootstrap_github_infra.sh
   some_other_spec:
     - tests/test_some_other.sh
 test_globs:
@@ -236,6 +238,10 @@ echo "# CodeRabbit configuration audit (hub-only)" >"$FAKE_MP/docs/agents/codera
 
 # --- excluded paths (must NOT propagate) ---
 echo "playground spec" >"$FAKE_MP/specs/mergepath_playground.md"
+# #1182: hub-only bootstrap label-seeding spec. Seeded here so the
+# exclusion below is asserted against a file that actually exists —
+# an absent file would pass the "not mirrored" check vacuously.
+echo "label seeding spec" >"$FAKE_MP/specs/bootstrap_label_seeding.md"
 echo "playground plan" >"$FAKE_MP/plans/mergepath-playground.md"
 echo "playground test" >"$FAKE_MP/tests/test_mergepath_playground.sh"
 echo "screenshot bug"  >"$FAKE_MP/bugs/screenshots/foo.png"
@@ -431,6 +437,7 @@ for excluded in \
   '.claude/settings.local.json' \
   '.claude/launch.json' \
   'specs/mergepath_playground.md' \
+  'specs/bootstrap_label_seeding.md' \
   'plans/mergepath-playground.md' \
   'scripts/policy-sim.sh' \
   'scripts/audit-canonical-mirrors.sh' \
@@ -1570,6 +1577,16 @@ if yq '.spec_test_map.bootstrap_consumer_identity' "$TARGET/.repo-template.yml" 
   fail "bootstrap_consumer_identity spec_test_map entry not removed"
 else
   pass "bootstrap_consumer_identity spec_test_map entry removed"
+fi
+# The label-seeding entry must be gone for the same reason (#1182). Without
+# this, a new consumer keeps a spec_test_map entry pointing at
+# tests/test_bootstrap_github_infra.sh — a hub-only test it does not have —
+# and check_spec_test_alignment reds its very first repo-lint run.
+if yq '.spec_test_map.bootstrap_label_seeding' "$TARGET/.repo-template.yml" 2>/dev/null \
+     | grep -q "tests/test_bootstrap_github_infra"; then
+  fail "bootstrap_label_seeding spec_test_map entry not removed"
+else
+  pass "bootstrap_label_seeding spec_test_map entry removed"
 fi
 # But some_other_spec entry should remain (we only dropped the hub-only ones).
 yq '.spec_test_map.some_other_spec' "$TARGET/.repo-template.yml" 2>/dev/null \

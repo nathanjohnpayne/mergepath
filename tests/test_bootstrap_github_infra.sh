@@ -352,6 +352,14 @@ for badspec in "future-label|abcdef" "no-separators-at-all" "bad-colour|zzzzzz|n
     && pass "malformed spec '$badspec' is named in a warning rather than silently dropped" \
     || fail "no warning named malformed spec '$badspec'; out: $malformed_out"
 done
+# The empty-name spec needs its OWN assertion. The loop above matches on the
+# spec's name, so it cannot express "no call was made with an EMPTY name" —
+# a regression that warned and then ran `gh label create ""` would pass it.
+# An empty first argument collapses to `create --repo` (or a double space).
+grep -qE "^gh label create( +--repo| +$|$)" "$GUARD_LOG" \
+  && fail "an empty-name spec reached gh label create; log: $(cat "$GUARD_LOG")" \
+  || pass "the empty-name spec never reached gh label create with an empty name"
+
 grep -q "^gh label create size:S --repo nathanjohnpayne/guard-repo --color c2e0c6 " "$GUARD_LOG" \
   && pass "a colon-bearing name still seeds with its own colour after the guard" \
   || fail "well-formed colon-bearing spec was rejected by the guard; log: $(cat "$GUARD_LOG")"
