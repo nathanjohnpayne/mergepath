@@ -1989,6 +1989,16 @@ $CR_PRE_MERGE_BLOCK_END"
   summary_blocking_marker_present "$rl_quoted_delim" \
     || bad="$bad quoted-delimiter-stripped-real-finding"
 
+  # The SAME body with the reader FAILING (Codex P1 round 8). Round 7's fallback
+  # handed the raw body to the delimiter search, so the quoted start paired with
+  # the real end and the strip deleted the genuine marker — the widened scan
+  # reasoned to be fail-closed could delete more than it saw. The fallback must
+  # skip structural stripping entirely, not merely widen its input.
+  crw_unfenced_body() { return 3; }
+  summary_blocking_marker_present "$rl_quoted_delim" \
+    || bad="$bad reader-failure-strip-ate-the-finding"
+  eval "$_real_reader"
+
   # Scoped to rate_limit ONLY. paused and in_progress still map to not-yet at
   # the barrier, so they keep reaching a human through the bounded wait;
   # widening the guard would turn their self-clearing holds into immediate

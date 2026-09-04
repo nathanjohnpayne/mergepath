@@ -1708,7 +1708,22 @@ summary_blocking_marker_present() {
   # result at three of them. The contract is restored: a reader failure falls
   # back to scanning the RAW body, which is strictly WIDER text and therefore
   # more likely to find a marker — fail-closed, and no caller has to change.
-  unfenced=$(crw_unfenced_body "$body") || unfenced="$body"
+  if ! unfenced=$(crw_unfenced_body "$body"); then
+    # Reader failed: scan the COMPLETE raw body with NO structural stripping
+    # (Codex P1 round 8). Round 7's fallback set `unfenced="$body"` and carried
+    # on into the delimiter search, which is where it broke: on the raw body a
+    # FENCED quotation of the start delimiter pairs with the real table end, and
+    # the strip deletes the genuine marker sitting between them — so the widened
+    # scan I reasoned was fail-closed could delete more than it saw.
+    #
+    # Stripping structure out of text whose structure could not be read is the
+    # error. Skipping the strip cannot lose a marker: the scan is a superset of
+    # every narrower one, and the only cost is a fenced quote grading as a
+    # finding, which is a spurious escalation — fail-closed in the direction
+    # that matters.
+    crw_scan_has_blocking_marker "$body"
+    return
+  fi
   scan="$unfenced"
   # Delimiters located in the UNFENCED text, not the raw body (Codex P1 round
   # 7). A fenced walkthrough QUOTING the start delimiter above a genuine
