@@ -330,15 +330,28 @@ malformed_out=$(PATH="$SHIM_PATH" SHIM_LOG="$GUARD_LOG" bash -c '
   )
   bootstrap::_seed_labels "nathanjohnpayne/guard-repo"
 ' 2>&1)
+malformed_rc=$?
 set -e
+# The skip must be non-fatal. Without this the log assertions below would
+# all pass against an implementation that seeded the valid specs and THEN
+# returned nonzero for a malformed one.
+[ "$malformed_rc" -eq 0 ] \
+  && pass "a malformed spec leaves _seed_labels returning 0 (skip is non-fatal)" \
+  || fail "_seed_labels returned $malformed_rc on malformed specs; out: $malformed_out"
 for bad in future-label no-separators-at-all bad-colour empty-desc; do
   grep -q "^gh label create $bad " "$GUARD_LOG" \
     && fail "malformed spec '$bad' reached gh label create; log: $(cat "$GUARD_LOG")" \
     || pass "malformed spec '$bad' never reached gh label create"
 done
-printf '%s' "$malformed_out" | grep -q "future-label|abcdef" \
-  && pass "the one-separator spec is named in a warning rather than silently dropped" \
-  || fail "no warning named the one-separator spec; out: $malformed_out"
+# Every malformed CLASS must be named in a warning. Asserting only the
+# separator case would pass against an implementation that silently
+# dropped a bad colour or an empty field — the same silent-skip failure
+# the guard exists to prevent.
+for badspec in "future-label|abcdef" "no-separators-at-all" "bad-colour|zzzzzz|nope" "|abcdef|empty name" "empty-desc|abcdef|"; do
+  printf '%s' "$malformed_out" | grep -qF "$badspec" \
+    && pass "malformed spec '$badspec' is named in a warning rather than silently dropped" \
+    || fail "no warning named malformed spec '$badspec'; out: $malformed_out"
+done
 grep -q "^gh label create size:S --repo nathanjohnpayne/guard-repo --color c2e0c6 " "$GUARD_LOG" \
   && pass "a colon-bearing name still seeds with its own colour after the guard" \
   || fail "well-formed colon-bearing spec was rejected by the guard; log: $(cat "$GUARD_LOG")"
