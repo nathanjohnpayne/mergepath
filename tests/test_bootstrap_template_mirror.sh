@@ -1569,25 +1569,32 @@ if yq 'has("extra_top_level_dirs")' "$TARGET/.repo-template.yml" 2>/dev/null \
 else
   pass "extra_top_level_dirs key removed"
 fi
+# Assert a spec_test_map key was DELETED, failing closed.
+# `yq | grep -q <expected-value>` is fail-OPEN in two ways, both verified:
+# a key that survives with a DIFFERENT value does not match the grep, and an
+# unreadable/unparseable file yields no output at all — each takes the "removed"
+# branch and passes. Require the query to succeed AND return exactly `null`.
+assert_spec_map_key_removed() {
+  local key=$1 file=$2 out rc
+  out=$(yq -r ".spec_test_map.$key" "$file" 2>&1); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "could not read $file to verify the $key cleanup (yq rc=$rc): $out"
+  elif [ "$out" = "null" ]; then
+    pass "$key spec_test_map entry removed"
+  else
+    fail "$key spec_test_map entry not removed (got: $out)"
+  fi
+}
+
 # The bootstrap consumer-identity entry must be gone too (#747: its
 # spec and mapped hub-only test are both mirror-excluded, so a
 # surviving map entry is stale hub metadata in the consumer).
-if yq '.spec_test_map.bootstrap_consumer_identity' "$TARGET/.repo-template.yml" 2>/dev/null \
-     | grep -q "tests/test_bootstrap_template_mirror"; then
-  fail "bootstrap_consumer_identity spec_test_map entry not removed"
-else
-  pass "bootstrap_consumer_identity spec_test_map entry removed"
-fi
+assert_spec_map_key_removed bootstrap_consumer_identity "$TARGET/.repo-template.yml"
 # The label-seeding entry must be gone for the same reason (#1182). Without
 # this, a new consumer keeps a spec_test_map entry pointing at
 # tests/test_bootstrap_github_infra.sh — a hub-only test it does not have —
 # and check_spec_test_alignment reds its very first repo-lint run.
-if yq '.spec_test_map.bootstrap_label_seeding' "$TARGET/.repo-template.yml" 2>/dev/null \
-     | grep -q "tests/test_bootstrap_github_infra"; then
-  fail "bootstrap_label_seeding spec_test_map entry not removed"
-else
-  pass "bootstrap_label_seeding spec_test_map entry removed"
-fi
+assert_spec_map_key_removed bootstrap_label_seeding "$TARGET/.repo-template.yml"
 # But some_other_spec entry should remain (we only dropped the hub-only ones).
 yq '.spec_test_map.some_other_spec' "$TARGET/.repo-template.yml" 2>/dev/null \
   | grep -q "tests/test_some_other" \
