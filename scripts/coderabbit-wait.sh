@@ -1947,7 +1947,13 @@ crw_rate_limit_hides_a_finding() {
   if [ -n "$comments" ]; then
     sel=$(crw_select_summary_comment "$comments" "$BOT_LOGIN" "$SUMMARY_MARKER") || return 3
     if [ -n "$sel" ]; then
-      sbody=$(printf '%s' "$sel" | base64 --decode | jq -r '.body')
+      # rc 3 on a failed decode, never a bare refusal (#1178 round 10). Discarding
+      # this status left `sbody` empty, which the head predicate's `[ -n ]` guard
+      # turns into 1, which this helper reports as "no finding" — a verdict about
+      # a surface that was never read. crw_summary_names_only_other_head already
+      # guards the same read this way.
+      sbody=$(printf '%s' "$sel" | base64 --decode | jq -r '.body') || return 3
+      [ -n "$sbody" ] || return 3
       rc=0; crw_head_summary_holds_blocking_marker "$head" "$sbody" || rc=$?
       [ "$rc" = 3 ] && return 3
       if [ "$rc" = 0 ]; then
@@ -4120,7 +4126,7 @@ probe_emit_verdict() {
     while :; do
       summary_body=""
       newest_class=""
-      rl_summary=""; rl_sbody=""; rl_sjson=""; rl_rc=0
+      rl_summary=""; rl_sbody=""; rl_sjson=""; rl_rc=0; rl_rid=""; rl_rbody=""
       # The body newest_class was read from, retained for the #1178 guard
       # below. Only the CLASS used to leave this loop, which is enough to name
       # the observed state but not to tell a bare refusal from a refusal
@@ -4250,11 +4256,27 @@ probe_emit_verdict() {
       # ONE call, EVERY surface (#1178 rounds 3/5/7/9). This site previously
       # carried two inline blocks that between them knew about the notice body
       # and the marker-selected summary, but not the review OBJECT's own body —
-      # which the spec calls the primary summary surface. rbody is passed here.
+      # which the spec calls the primary summary surface.
+      #
+      # The FULL body, re-read from the reviews array by id (#1178 round 10,
+      # found independently by both reviewers). The first version passed
+      # `.body_excerpt`, which `crw_select_head_pinned_review_run` truncates to
+      # 200 characters FOR LOGGING — so the surface added to close this door was
+      # scanning a truncated document, and a marker past byte 200 escaped. This
+      # file already documents the trap a few hundred lines up, where
+      # `crw_head_pinned_clean_review_run` re-reads for exactly this reason;
+      # same idiom, same array, same id.
       if [ "$PROBE_OBSERVED" = "rate_limit" ]; then
+        rl_rid=$(printf '%s' "$review" | jq -r '.id // empty') || die 3 "failed to read the review object id for the #1178 full-body re-read"
+        rl_rbody=""
+        if [ -n "$rl_rid" ] && [ "$rl_rid" != "null" ]; then
+          rl_rbody=$(printf '%s' "$reviews" | jq -r --argjson id "$rl_rid" \
+            '[ .[] | select(.id == $id) | (.body // "") ] | first // ""') \
+            || die 3 "failed to re-read the head-pinned review body for the #1178 marker scan — an unread surface is not evidence that it carries no finding"
+        fi
         rl_rc=0
         crw_rate_limit_hides_a_finding "$HEAD_SHA" "$newest_body" \
-          "$(printf '%s' "$review" | jq -r '.body_excerpt // ""')" "$issue_comments" || rl_rc=$?
+          "$rl_rbody" "$issue_comments" || rl_rc=$?
         [ "$rl_rc" = 3 ] && die 3 "a surface could not be read while checking whether the rate-limit state on $HEAD_SHA hides a blocking finding — an unread surface is not evidence that it carries none (#1178)"
         if [ "$rl_rc" = 0 ]; then
           PROBE_CONTEXT_STATE=""

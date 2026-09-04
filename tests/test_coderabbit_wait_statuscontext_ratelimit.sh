@@ -2064,6 +2064,22 @@ _🟠 Major_ something is wrong here."
   # notice itself masked → escalate even with a clean review body
   crw_rate_limit_hides_a_finding "$h40" "$masked_limit" "$_rob_clean" "" \
     || bad="$bad notice-surface-lost-in-consolidation"
+  # A marker PAST BYTE 200 must still be found (#1178 round 10, found
+  # independently by both reviewers). The first version of the review-object
+  # surface was handed `.body_excerpt`, a 200-char logging field, so it scanned a
+  # truncated document. This fixture puts the marker well past that boundary; it
+  # fails if anyone reintroduces an excerpt at the call site or truncates inside
+  # the helper.
+  local _rob_late
+  _rob_late="**Actionable comments posted: 1**
+
+$(printf 'x%.0s' $(seq 1 400))
+
+_🟠 Major_ the marker is past byte 200."
+  [ "${#_rob_late}" -gt 400 ] || bad="$bad late-marker-fixture-too-short"
+  crw_rate_limit_hides_a_finding "$h40" "$plain_limit" "$_rob_late" "" \
+    || bad="$bad review-body-truncated-at-200"
+
   # reader failure anywhere → rc 3, never a verdict
   crw_unfenced_body() { return 3; }
   _rc=0; crw_rate_limit_hides_a_finding "$h40" "$masked_limit" "$_rob_clean" "" || _rc=$?
