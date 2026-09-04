@@ -2080,6 +2080,42 @@ _🟠 Major_ the marker is past byte 200."
   crw_rate_limit_hides_a_finding "$h40" "$plain_limit" "$_rob_late" "" \
     || bad="$bad review-body-truncated-at-200"
 
+  # An EMPTY review body must not read as "no finding on the primary surface"
+  # (CodeRabbit Major, round 11). The call site now fails closed on an unusable
+  # id or an empty round-trip, but the helper's own contract matters too: an
+  # empty review_body means that surface was not read, so the verdict must come
+  # from the OTHER surfaces rather than silently counting this one as clean.
+  # Here the notice is masked, so the answer is escalate either way — the point
+  # is that an empty review body neither suppresses nor manufactures a verdict.
+  crw_rate_limit_hides_a_finding "$h40" "$masked_limit" "" "" \
+    || bad="$bad empty-review-body-suppressed-notice-surface"
+  _rc=0; crw_rate_limit_hides_a_finding "$h40" "$plain_limit" "" "" || _rc=$?
+  [ "$_rc" = 1 ] || bad="$bad empty-review-body-manufactured-verdict=$_rc"
+
+  # The CALL SITE's fail-closed guards for a body-bearing review with no usable
+  # ID, and for an ID that does not round-trip (CodeRabbit Major, round 11).
+  # crw_select_head_pinned_review_run permits a body-bearing review whose id is
+  # missing, and the first version of the full-body re-read left rl_rbody empty
+  # in that case — which the helper skips, so the PRIMARY surface silently went
+  # unscanned.
+  #
+  # Asserted structurally rather than end-to-end, and the reason is worth
+  # stating: both guards are `die 3` inside probe_emit_verdict, which the unit
+  # harness cannot enter without a full probe fixture, and a behavioural test
+  # that drove the whole probe would assert on the exit code rather than on
+  # which branch produced it. The helper's own contract for an empty body IS
+  # covered behaviourally above; this pins that the call site never reaches it
+  # with an unread surface.
+  local _src="$ROOT/scripts/coderabbit-wait.sh"
+  grep -q "case \"\$rl_rid\" in" "$_src" \
+    || bad="$bad callsite-missing-id-guard-absent"
+  grep -q '\[ -n "\$rl_rbody" \] || die 3' "$_src" \
+    || bad="$bad callsite-empty-body-guard-absent"
+  # Control: the guards must sit BEFORE the helper call, not after it.
+  if ! awk '/case "\$rl_rid" in/{a=NR} /crw_rate_limit_hides_a_finding "\$HEAD_SHA" "\$newest_body"/{b=NR} END{exit !(a && b && a < b)}' "$_src"; then
+    bad="$bad callsite-guard-after-use"
+  fi
+
   # reader failure anywhere → rc 3, never a verdict
   crw_unfenced_body() { return 3; }
   _rc=0; crw_rate_limit_hides_a_finding "$h40" "$masked_limit" "$_rob_clean" "" || _rc=$?

@@ -4267,13 +4267,27 @@ probe_emit_verdict() {
       # `crw_head_pinned_clean_review_run` re-reads for exactly this reason;
       # same idiom, same array, same id.
       if [ "$PROBE_OBSERVED" = "rate_limit" ]; then
+        # FAIL CLOSED on an unusable id or an empty round-trip (CodeRabbit Major,
+        # round 11). The first version left `rl_rbody` empty in both cases and
+        # passed that to the helper, which skips an empty surface — so "I could
+        # not read the primary surface" became "the primary surface carries no
+        # finding". That is the fifth instance of this same
+        # absence-versus-inability conflation in this PR, and the one that would
+        # have silently disabled the surface added two rounds ago to close it.
+        #
+        # An empty body after a successful lookup means the id did not round-trip,
+        # not that the review is silent: crw_select_head_pinned_review_run already
+        # required a non-empty body to select this object at all, which is the
+        # same reasoning crw_head_pinned_clean_review_run applies to its own
+        # re-read.
         rl_rid=$(printf '%s' "$review" | jq -r '.id // empty') || die 3 "failed to read the review object id for the #1178 full-body re-read"
-        rl_rbody=""
-        if [ -n "$rl_rid" ] && [ "$rl_rid" != "null" ]; then
-          rl_rbody=$(printf '%s' "$reviews" | jq -r --argjson id "$rl_rid" \
-            '[ .[] | select(.id == $id) | (.body // "") ] | first // ""') \
-            || die 3 "failed to re-read the head-pinned review body for the #1178 marker scan — an unread surface is not evidence that it carries no finding"
-        fi
+        case "$rl_rid" in
+          ''|null) die 3 "the head-pinned review object on $HEAD_SHA carries no usable id, so its body — the PRIMARY summary surface — cannot be scanned for a blocking marker (#1178)" ;;
+        esac
+        rl_rbody=$(printf '%s' "$reviews" | jq -r --argjson id "$rl_rid" \
+          '[ .[] | select(.id == $id) | (.body // "") ] | first // ""') \
+          || die 3 "failed to re-read the head-pinned review body for the #1178 marker scan — an unread surface is not evidence that it carries no finding"
+        [ -n "$rl_rbody" ] || die 3 "the head-pinned review body for id $rl_rid did not round-trip from the reviews array — the selector required a non-empty body, so this is an unread surface rather than a silent one (#1178)"
         rl_rc=0
         crw_rate_limit_hides_a_finding "$HEAD_SHA" "$newest_body" \
           "$rl_rbody" "$issue_comments" || rl_rc=$?
