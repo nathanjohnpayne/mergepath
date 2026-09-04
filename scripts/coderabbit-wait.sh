@@ -1688,10 +1688,29 @@ summary_blocking_marker_present() {
 # records the reasoning — that state "previously returned rc 7, held the
 # barrier full budget and escalated with the WRONG reason; now it escalates
 # immediately with the right one". Same class, same answer, third site.
+# <head_sha> is REQUIRED for the demotion below (Codex P1, round 4). Without it
+# this predicate was head-BLIND while its round-3 sibling was head-anchored, and
+# the asymmetry ran the wrong way: CodeRabbit edits ONE summary in place across
+# revisions, so an old-head summary still carrying `_⚠️ Potential issue_` that
+# picks up a rate-limit stanza after a new push made all three call sites emit
+# rc 2 for a PRIOR head's finding. That is not a false clear, it is a false
+# ESCALATE — a stale head holding the current one hostage, forcing the manual
+# fallback the partial-quorum path exists to avoid, exactly the case
+# crw_head_summary_holds_blocking_marker was careful to exclude.
+#
+# The demotion is `summary_names_only_other_head`, NOT a `summary_names_head`
+# requirement, and the difference is the fail direction. Requiring a head
+# reference would drop escalation for any marker-carrying body with NO commits
+# range at all — a shape this predicate cannot rule out and whose absence proves
+# nothing — reopening the round-2 hole from underneath. Demoting only on a range
+# that names ANOTHER head fixes the hostage case while leaving every unrangeable
+# body fail-closed. Same asymmetry #968 drew for the clearance demotion, for the
+# same reason.
 crw_rate_limit_masks_blocking_marker() {
   [ "${1:-}" = "rate_limit" ] || return 1
   [ -n "${2:-}" ] || return 1
-  summary_blocking_marker_present "$2"
+  summary_blocking_marker_present "$2" || return 1
+  ! summary_names_only_other_head "$2" "${3:-}"
 }
 
 # crw_head_summary_holds_blocking_marker <head_sha> <summary_body>
@@ -4005,7 +4024,7 @@ probe_emit_verdict() {
       # the head-pinned-summary escalation sits before its own not-yet gate: a
       # blocking marker is a signal a human must see, and downgrading it costs
       # an escalation nothing else makes.
-      if crw_rate_limit_masks_blocking_marker "$PROBE_OBSERVED" "$newest_body"; then
+      if crw_rate_limit_masks_blocking_marker "$PROBE_OBSERVED" "$newest_body" "$HEAD_SHA"; then
         PROBE_CONTEXT_STATE=""
         PROBE_CONTEXT_UPDATED_AT=""
         PROBE_OBSERVED="terminal"
@@ -4076,7 +4095,7 @@ probe_emit_verdict() {
     newest_class=$(classify_comment "$body")
     # #1178 guard, site 2 of 3 — the no-review-object triage. Same body, same
     # masking, same answer as site 1.
-    if crw_rate_limit_masks_blocking_marker "$newest_class" "$body"; then
+    if crw_rate_limit_masks_blocking_marker "$newest_class" "$body" "$HEAD_SHA"; then
       PROBE_OBSERVED="terminal"
       log "probe: rate-limit notice on $HEAD_SHA is carried by a body that ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
       emit_json_and_exit "findings" 2 "$latest_json" 1
@@ -4230,7 +4249,7 @@ probe_emit_verdict() {
     # anchor-free by newest_bot_comment_from_issue_comments, so it can be the
     # summarize comment itself; the masking is the same and so is the answer.
     if crw_rate_limit_masks_blocking_marker rate_limit \
-         "$(printf '%s' "$active_notice" | jq -r '.body // ""')"; then
+         "$(printf '%s' "$active_notice" | jq -r '.body // ""')" "$HEAD_SHA"; then
       PROBE_OBSERVED="terminal"
       log "probe: the open-window rate-limit notice on $HEAD_SHA ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
       emit_json_and_exit "findings" 2 \

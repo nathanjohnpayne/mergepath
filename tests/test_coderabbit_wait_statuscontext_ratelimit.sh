@@ -1772,6 +1772,8 @@ test_rate_limit_masking_a_blocking_marker_unit() {
   local snip="$WORKDIR/rl-guard.sh" helpers="$WORKDIR/rl-summary-helpers.sh"
   local classifier="$WORKDIR/rl-classifier.sh" bad=""
   local plain_limit masked_limit table_only plain_review
+  local h40='0123456789abcdef0123456789abcdef01234567'
+  local b40='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
   eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END|RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER|SUMMARY_MARKER)=' \
     "$ROOT/scripts/coderabbit-wait.sh")"
   awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
@@ -1819,11 +1821,41 @@ _⚠️ Potential issue_"
   [ "$(classify_comment "$masked_limit")" = rate_limit ] || bad="$bad premise-masked"
   [ "$(classify_comment "$table_only")" = rate_limit ]   || bad="$bad premise-table"
 
-  # A masked marker is caught; a bare refusal is not disturbed.
+  # A masked marker is caught; a bare refusal is not disturbed. No commits range
+  # in any of these, which is the fail-CLOSED side of the demotion below.
   crw_rate_limit_masks_blocking_marker rate_limit "$masked_limit" || bad="$bad masked-missed"
   ! crw_rate_limit_masks_blocking_marker rate_limit "$plain_limit" || bad="$bad plain-flagged"
   ! crw_rate_limit_masks_blocking_marker rate_limit "$table_only"  || bad="$bad table-flagged"
   ! crw_rate_limit_masks_blocking_marker rate_limit ""             || bad="$bad empty-flagged"
+
+  # Codex P1 round 4: the STALE-HEAD HOSTAGE, the inverse failure of the
+  # two-comment case. CodeRabbit edits one summary in place across revisions, so
+  # an old-head summary still carrying a marker can pick up a rate-limit stanza
+  # after a push. Escalating on that forces the manual fallback for a PRIOR
+  # head's finding — a false escalate that defeats the partial-quorum path
+  # rather than a false clear.
+  #
+  # The demotion is `summary_names_only_other_head`, not a `summary_names_head`
+  # requirement: a body with NO range at all must still escalate (asserted
+  # above), because absence of a range proves nothing about which head the
+  # marker belongs to.
+  local rl_this_head rl_other_head
+  rl_this_head="$RATE_LIMIT_MARKER
+Review between $b40 and $h40.
+
+_⚠️ Potential issue_"
+  rl_other_head="$RATE_LIMIT_MARKER
+Review between $b40 and $b40.
+
+_⚠️ Potential issue_"
+  crw_rate_limit_masks_blocking_marker rate_limit "$rl_this_head" "$h40" \
+    || bad="$bad head-ranged-missed"
+  ! crw_rate_limit_masks_blocking_marker rate_limit "$rl_other_head" "$h40" \
+    || bad="$bad stale-head-hostage"
+  # Belt and braces on the fail direction: an unrangeable masked body still
+  # escalates even when a head is supplied.
+  crw_rate_limit_masks_blocking_marker rate_limit "$masked_limit" "$h40" \
+    || bad="$bad norange-demoted"
 
   # Scoped to rate_limit ONLY. paused and in_progress still map to not-yet at
   # the barrier, so they keep reaching a human through the bounded wait;
@@ -1843,8 +1875,6 @@ _⚠️ Potential issue_"
   # one standing in for a PRIOR head, so the head-identity conjunct is tested
   # rather than assumed.
   local head_marked other_head_marked head_clean
-  local h40='0123456789abcdef0123456789abcdef01234567'
-  local b40='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
   head_marked="$SUMMARY_MARKER
 Review between $b40 and $h40.
 
