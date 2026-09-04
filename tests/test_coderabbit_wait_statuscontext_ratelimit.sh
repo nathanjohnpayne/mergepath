@@ -1834,8 +1834,44 @@ _⚠️ Potential issue_"
   ! crw_rate_limit_masks_blocking_marker review "$plain_review"      || bad="$bad review-scoped"
   ! crw_rate_limit_masks_blocking_marker "" "$masked_limit"          || bad="$bad empty-class-scoped"
 
+  # Codex P1 round 3: the TWO-COMMENT shape. The sibling predicate reads only
+  # the newest notice, so a head-pinned summary holding the finding and a
+  # separate later rate-limit notice slip past it — and the no-review-object
+  # triage's probe_not_yet exits before the marker-selected summary scan that
+  # would have caught it. crw_head_summary_holds_blocking_marker closes that.
+  # Two distinct 40-hex SHAs: the head this probe is about, and an unrelated
+  # one standing in for a PRIOR head, so the head-identity conjunct is tested
+  # rather than assumed.
+  local head_marked other_head_marked head_clean
+  local h40='0123456789abcdef0123456789abcdef01234567'
+  local b40='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  head_marked="$SUMMARY_MARKER
+Review between $b40 and $h40.
+
+_⚠️ Potential issue_"
+  other_head_marked="$SUMMARY_MARKER
+Review between $b40 and $b40.
+
+_⚠️ Potential issue_"
+  head_clean="$SUMMARY_MARKER
+Review between $b40 and $h40.
+
+No actionable comments."
+  crw_head_summary_holds_blocking_marker "$h40" "$head_marked" || bad="$bad twocomment-missed"
+  # Head identity is the whole safety of it: a PRIOR head's summary (#789) must
+  # not hold this head hostage, and a clean head-pinned summary must not either.
+  ! crw_head_summary_holds_blocking_marker "$h40" "$other_head_marked" || bad="$bad twocomment-otherhead"
+  ! crw_head_summary_holds_blocking_marker "$h40" "$head_clean"        || bad="$bad twocomment-clean"
+  ! crw_head_summary_holds_blocking_marker "$h40" ""                   || bad="$bad twocomment-empty"
+  ! crw_head_summary_holds_blocking_marker "" "$head_marked"           || bad="$bad twocomment-nohead"
+  # The class is deliberately unconstrained: a summary that ITSELF classifies
+  # rate_limit is the very shape being guarded against, so requiring `review`
+  # here would reopen the hole from the other side.
+  crw_head_summary_holds_blocking_marker "$h40" "$RATE_LIMIT_MARKER
+$head_marked" || bad="$bad twocomment-ratelimited-summary"
+
   if [ -z "$bad" ]; then
-    pass "1178: a rate-limit stanza masking a summary-only blocking marker is caught, a bare refusal is not, and the guard stays scoped to rate_limit"
+    pass "1178: a masked rate-limit stanza AND the two-comment head-pinned-summary shape both escalate; bare refusals, hygiene tables, prior heads and non-rate_limit classes do not"
   else
     fail "1178: rate-limit marker guard wrong:$bad"
   fi

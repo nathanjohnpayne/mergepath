@@ -1693,6 +1693,38 @@ crw_rate_limit_masks_blocking_marker() {
   [ -n "${2:-}" ] || return 1
   summary_blocking_marker_present "$2"
 }
+
+# crw_head_summary_holds_blocking_marker <head_sha> <summary_body>
+# True when the marker-selected PR-level summary is pinned to THIS head AND
+# carries a blocking marker (#1178, Codex P1 round 3).
+#
+# The sibling predicate above closes the case where ONE body says both things.
+# This closes the case where they are two DIFFERENT comments: a no-review-object
+# incremental review whose head-pinned summary carries a summary-only finding,
+# followed by a separate rate-limit notice that becomes the newest comment. The
+# notice body alone is clean, so the masking check passes it, and the
+# no-review-object triage's `probe_not_yet` then exits BEFORE the
+# marker-selected summary scan further down ever runs. The finding is never
+# looked at.
+#
+# That was survivable while rate_limit read as not-yet downstream. It is not now
+# that the Phase 4b barrier opens on a bare `rate_limit` whenever Codex has
+# reported: the approval posts over a head-pinned summary-only finding that no
+# required gate reads.
+#
+# Head identity is the whole safety of this: `summary_names_head` is the same
+# SHA conjunct the #851 clearance path uses, so a PRIOR head's summary (#789)
+# cannot hold this head hostage. The class is deliberately NOT constrained to
+# `review` — a summary that itself classifies rate_limit is exactly the shape
+# being guarded against, and requiring `review` here would reopen the hole from
+# the other side.
+crw_head_summary_holds_blocking_marker() {
+  local head="${1:-}" sbody="${2:-}"
+  [ -n "$head" ] || return 1
+  [ -n "$sbody" ] || return 1
+  summary_names_head "$sbody" "$head" || return 1
+  summary_blocking_marker_present "$sbody"
+}
 # END coderabbit_rate_limit_marker_guard
 
 # Scan the PR-level `issues/{pr}/comments` endpoint for the latest
@@ -4037,7 +4069,7 @@ probe_emit_verdict() {
             body: (.body // "")} | @base64 end
   ') || die 3 "failed to classify the latest comment"
 
-  local latest_json="null"
+  local latest_json="null" rl_summary rl_sbody rl_sjson
   if [ -n "$cand" ]; then
     body=$(printf '%s' "$cand" | base64 --decode | jq -r '.body')
     latest_json=$(printf '%s' "$cand" | base64 --decode | jq -r '.json')
@@ -4048,6 +4080,29 @@ probe_emit_verdict() {
       PROBE_OBSERVED="terminal"
       log "probe: rate-limit notice on $HEAD_SHA is carried by a body that ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
       emit_json_and_exit "findings" 2 "$latest_json" 1
+    fi
+    # ...and the TWO-COMMENT shape of the same hazard (Codex P1 round 3 on
+    # #1179). The check above reads only the newest notice, and the
+    # marker-selected summary scan that would catch a separate head-pinned
+    # finding lives BELOW the `probe_not_yet` in the case statement that
+    # follows — so on a no-review-object incremental review whose summary holds
+    # a summary-only finding, a later bare rate-limit notice short-circuits past
+    # it entirely. Scoped to rate_limit for the same reason as its sibling:
+    # in_progress and paused still map to not-yet at the barrier and keep
+    # reaching a human through the bounded wait, so only rate_limit can convert
+    # this into a clearance.
+    if [ "$newest_class" = "rate_limit" ]; then
+      rl_summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
+        || die 3 "failed to select the CodeRabbit summary comment for the rate-limit masking re-read"
+      if [ -n "$rl_summary" ]; then
+        rl_sbody=$(printf '%s' "$rl_summary" | base64 --decode | jq -r '.body')
+        if crw_head_summary_holds_blocking_marker "$HEAD_SHA" "$rl_sbody"; then
+          rl_sjson=$(printf '%s' "$rl_summary" | base64 --decode | jq -r '.json')
+          PROBE_OBSERVED="terminal"
+          log "probe: bare rate-limit notice on $HEAD_SHA, but the head-pinned summary holds a summary-only blocking marker — escalating rather than reporting a refusal that would open the barrier (#1178)"
+          emit_json_and_exit "findings" 2 "$rl_sjson" 1
+        fi
+      fi
     fi
     case "$newest_class" in
       in_progress|rate_limit|paused)
