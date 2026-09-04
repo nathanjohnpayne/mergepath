@@ -1835,13 +1835,15 @@ crw_rate_limit_masks_blocking_marker() {
   local rc=0
   [ "${1:-}" = "rate_limit" ] || return 1
   [ -n "${2:-}" ] || return 1
-  # BOTH conjuncts propagate rc 3, not just the second. The first draft of this
-  # fix wrote `summary_blocking_marker_present "$2" || return 1` and flattened
-  # the reader failure one line above the code that exists to preserve it —
-  # caught by the rung test below rather than by inspection, which is the whole
-  # reason that test simulates a failing reader instead of asserting on inputs.
-  # Boolean again: summary_blocking_marker_present fails closed internally now,
-  # so there is no rc 3 to propagate from this conjunct.
+  # Only the SECOND conjunct propagates rc 3, and the asymmetry is deliberate.
+  # `summary_blocking_marker_present` fails closed INTERNALLY — on a reader
+  # failure it scans the raw body with no structural stripping — so it is a
+  # boolean here and has no rc 3 to propagate. Do not restore the tri-state
+  # version: an earlier round made it rc-3-aware, audited only its two new
+  # callers, and silently converted a reader failure into a CLEAN result at six
+  # boolean ones. The head question below is different, and there the rung is
+  # load-bearing: an unreadable body must never read as "belongs to another
+  # head", because the demotion's `!` would invert that into a suppress.
   summary_blocking_marker_present "$2" || return 1
   summary_names_only_other_head "$2" "${3:-}" || rc=$?
   case "$rc" in
