@@ -265,6 +265,8 @@ make_case() {
   # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
   # grades findings with the shared coderabbit_tier_of.
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: hard-sourced by the waiter, so the fixture must carry it too.
+  cp "$ROOT/scripts/lib/coderabbit-fence.sh" "$dir/scripts/lib/coderabbit-fence.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   printf '%s' "$comment_body" >"$dir/state/comment-body.txt"
@@ -1785,6 +1787,9 @@ test_rate_limit_masking_a_blocking_marker_unit() {
   [ -s "$snip" ] || { fail "1178: the coderabbit_rate_limit_marker_guard sentinel block is missing or empty"; return; }
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # The shared CommonMark fence reader the range predicates now go through.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   # shellcheck disable=SC1090
   . "$helpers"
   # shellcheck disable=SC1090
@@ -1856,6 +1861,73 @@ _⚠️ Potential issue_"
   # escalates even when a head is supplied.
   crw_rate_limit_masks_blocking_marker rate_limit "$masked_limit" "$h40" \
     || bad="$bad norange-demoted"
+
+  # Codex P1 round 5: a QUOTED range must not demote. The demotion suppresses an
+  # escalation, so a fenced `between <old> and <old>` that the raw grep counted
+  # as the summary's own anchor was a fail-OPEN input — a masked finding
+  # reported as a bare refusal, which the barrier then opens on. The gate's copy
+  # of this predicate was hardened for the same shape on #886; this asserts the
+  # waiter's copy now answers identically. Both fence characters, because a
+  # backtick-only reader walks straight past a `~~~` quote.
+  local rl_fenced_backtick rl_fenced_tilde
+  rl_fenced_backtick="$RATE_LIMIT_MARKER
+_⚠️ Potential issue_
+
+\`\`\`
+Review between $b40 and $b40.
+\`\`\`"
+  rl_fenced_tilde="$RATE_LIMIT_MARKER
+_⚠️ Potential issue_
+
+~~~
+Review between $b40 and $b40.
+~~~"
+  crw_rate_limit_masks_blocking_marker rate_limit "$rl_fenced_backtick" "$h40" \
+    || bad="$bad fenced-backtick-demoted"
+  crw_rate_limit_masks_blocking_marker rate_limit "$rl_fenced_tilde" "$h40" \
+    || bad="$bad fenced-tilde-demoted"
+  # Control: the SAME range unfenced still demotes, so the assertions above are
+  # about fencing rather than about the range never matching.
+  ! crw_rate_limit_masks_blocking_marker rate_limit "$rl_other_head" "$h40" \
+    || bad="$bad control-unfenced-not-demoted"
+
+  # Pin the SIGN of the unreadable-body rung. This copy of the range predicate
+  # is 0/1 while the severity gate's is three-rung (rc 3 = could not read), and
+  # the demotion's `!` inverts a wrong-branch non-zero into a SUPPRESS. So
+  # "unreadable" must reach `escalate`, not `suppress` — a body of pure fence
+  # noise yields no unfenced range at all, which is the same path an unreadable
+  # one takes. Without this, unifying the two predicates could flip the sign
+  # invisibly at the call site.
+  local rl_all_fenced
+  rl_all_fenced="$RATE_LIMIT_MARKER
+_⚠️ Potential issue_
+
+\`\`\`\`
+Review between $b40 and $b40.
+\`\`\`\`"
+  crw_rate_limit_masks_blocking_marker rate_limit "$rl_all_fenced" "$h40" \
+    || bad="$bad unreadable-rung-suppressed"
+
+  # Pin `scan`'s whole-body default in summary_blocking_marker_present, which is
+  # the ACTUAL reason this guard is fail-closed when the #1038 pipeline loses its
+  # delimiters — not the abort semantics it looks like, since `... || return 1`
+  # suspends errexit for the whole call. Losing the delimiters WIDENS the scan
+  # instead of blinding it. A #1038 fix that initialises `scan=""`, makes the
+  # narrowed block the default, or adds `|| return 1` to the `s_line=`
+  # assignment would flip this to a false clear, and nothing else would notice.
+  #
+  # A body with a marker and NO pre-merge delimiters at all takes exactly that
+  # widened path.
+  local rl_no_delims
+  rl_no_delims="$RATE_LIMIT_MARKER
+Review rate limited.
+
+_⚠️ Potential issue_"
+  case "$rl_no_delims" in
+    *"$CR_PRE_MERGE_BLOCK_START"*) bad="$bad no-delims-fixture-has-delims" ;;
+  esac
+  crw_rate_limit_masks_blocking_marker rate_limit "$rl_no_delims" "$h40" \
+    || bad="$bad scan-default-not-whole-body"
 
   # Scoped to rate_limit ONLY. paused and in_progress still map to not-yet at
   # the barrier, so they keep reaching a human through the bounded wait;

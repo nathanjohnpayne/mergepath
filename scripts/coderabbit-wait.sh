@@ -399,6 +399,18 @@ fi
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh"
 
+# The ONE CommonMark fence reader (#1178 round 5). HARD-sourced, beside its
+# siblings and through the same resolved dir: the range predicates below read
+# UNFENCED text only, and a missing lib must stop the script rather than let
+# them silently degrade to a whole-body match — the fail-open shape that let a
+# QUOTED `between X and Y` suppress a real finding.
+if [ ! -r "$__CODERABBIT_WAIT_DIR/lib/coderabbit-fence.sh" ]; then
+  echo "ERROR: coderabbit-fence missing: $__CODERABBIT_WAIT_DIR/lib/coderabbit-fence.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/coderabbit-fence.sh
+. "$__CODERABBIT_WAIT_DIR/lib/coderabbit-fence.sh"
+
 # Shared paginated-list reader (#1008). Owns the fetch → capture → flatten
 # algorithm the two wrappers below used to carry inline, so a correctness fix
 # to it lands once instead of eight times. Hard-required for the same reason
@@ -1576,8 +1588,34 @@ summary_stanzas_all_benign() {
 # answer in the SAFE direction — this one only ever declines to clear — but
 # `summary_names_only_other_head` below does not, so the idiom is corrected in
 # both rather than left to be re-derived from which caller happens to read it.
+# UNFENCED text only, through the shared CommonMark reader (#1178 round 5).
+#
+# Arity note: the gate's copy of this predicate carries a THREE-rung contract
+# (rc 3 = "I could not read this body"), and its comment records that flattening
+# rc 3 into rc 1 was itself a defect. This copy stays 0/1, and that is safe only
+# because an unreadable body flattens to "names no range", which
+# summary_names_only_other_head turns into `escalate` — the fail-closed
+# direction. Anyone unifying the two predicates must preserve that sign: the `!`
+# at the demotion's call site inverts a wrong-branch non-zero into a SUPPRESS.
+# Asserted below rather than left to inspection.
+# The severity gate's copy of this predicate was hardened for exactly this on
+# #886 — a `between X and Y` string CodeRabbit was merely QUOTING from a diff is
+# enough to make a stale summary read as the current head's report — and this
+# copy was left on a raw whole-body grep. The divergence was latent until a new
+# consumer read it in a fail-OPEN direction; both copies now answer the fence
+# question the same way, which is what specs/coderabbit_review_sensing.md
+# already required of them.
+crw_unfenced_body() {
+  printf '%s\n' "$1" | awk "$CR_AWK_FENCE_PRELUDE"'
+    { line = $0; sub(/\r$/, "", line)
+      if (fence_update(line)) next
+      if (FENCE) next
+      print line }
+  '
+}
+
 summary_names_head() {
-  grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)" <<<"$1"
+  grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)" <<<"$(crw_unfenced_body "$1")"
 }
 
 # True when the body carries a machine-readable commits range AND none of its
@@ -1625,7 +1663,11 @@ summary_names_head() {
 # this predicate exists to close, restored on the large summaries most likely
 # to carry one. Reproduced at 200 KiB before the fix.
 summary_names_only_other_head() {  # <body> <head_sha>
-  grep -qiE "between [0-9a-f]{40} and [0-9a-f]{40}([^0-9a-fA-F]|\$)" <<<"$1" || return 1
+  # Unfenced only, for the same reason and through the same reader as
+  # summary_names_head above (#1178 round 5). This one matters MORE, not less:
+  # its consumers use a positive answer to SUPPRESS, so a quoted range is a
+  # fail-open input rather than a fail-closed one.
+  grep -qiE "between [0-9a-f]{40} and [0-9a-f]{40}([^0-9a-fA-F]|\$)" <<<"$(crw_unfenced_body "$1")" || return 1
   summary_names_head "$1" "$2" && return 1
   return 0
 }
@@ -1706,6 +1748,38 @@ summary_blocking_marker_present() {
 # that names ANOTHER head fixes the hostage case while leaving every unrangeable
 # body fail-closed. Same asymmetry #968 drew for the clearance demotion, for the
 # same reason.
+# Residual, named so the next round does not rediscover it as new: fence
+# awareness does not make this shape-complete, it moves ONE error from
+# fail-open to fail-closed. If CodeRabbit ever fenced its authoritative commits
+# row, a stale-head body would read as no-range, escalate, and reintroduce the
+# round-4 hostage case. The severity gate's copy asserts "CodeRabbit's own
+# commits row is never inside a fence"; that is asserted rather than measured.
+# Fail-closed is the right direction to be wrong in, so this ships as-is.
+#
+# Second conjunct dependency: `summary_blocking_marker_present` still locates
+# its delimiters with a `grep -nF | head -1` pipeline under `set -euo pipefail`,
+# which is the #1038 SIGPIPE-141 shape (#520/#947/#1147). Left to that issue
+# rather than widened into here — but the reason this call site is SAFE is not
+# the one it looks like, and getting it wrong is how a later fix inverts it.
+#
+# It is NOT "the abort escalates". Calling it as `... || return 1` puts it on
+# the left of a `||`, which suspends errexit for the whole dynamic extent of the
+# call, so a SIGPIPE inside it does not abort anything: `s_line` is simply empty
+# and the function runs to completion. Measured, not reasoned.
+#
+# What makes it fail-closed is the FIRST LINE of that function: `local body=$1
+# scan=$1`. `scan` defaults to the WHOLE body and is narrowed to the pre-merge
+# block only inside `if [ -n "$s_line" ] && [ -n "$e_line" ]`. Losing the
+# delimiters therefore WIDENS the scan rather than blinding it — the marker is
+# still found and this guard still escalates.
+#
+# So a #1038 fix must preserve that default, not merely remove the pipe. Three
+# plausible cleanups flip this call site from fail-closed to fail-open:
+# initialising `scan=""`, restructuring so the narrowed block is the default, or
+# adding `|| return 1` to the `s_line=` assignment "for hygiene" — that last one
+# turns a widened scan into "no marker found", i.e. suppress, i.e. a false clear
+# on a published required finding. The invariant is asserted in the guard's unit
+# test (delimiters absent must still escalate) rather than left to inspection.
 crw_rate_limit_masks_blocking_marker() {
   [ "${1:-}" = "rate_limit" ] || return 1
   [ -n "${2:-}" ] || return 1

@@ -405,6 +405,16 @@ paths:
   - path: tests/test_coderabbit_should_invoke.sh
     type: canonical
     consumers: all
+  # The ONE CommonMark fence reader (#1178). Extracted from
+  # scripts/coderabbit-severity-gate.sh once the advisory waiter needed the same
+  # answer: specs/coderabbit_review_sensing.md already required one
+  # implementation ("the first attempt did carry three copies and they were
+  # three different degrees of wrong"), while the waiter in fact carried a
+  # raw-grep copy of the range predicates that had diverged from the gate's
+  # hardened one. Both now source this.
+  - path: scripts/lib/coderabbit-fence.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
@@ -418,6 +428,12 @@ paths:
       - "scripts/lib/reviewers-helpers.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced by both fetch wrappers
+      # #1178: the ONE CommonMark fence reader. Hard-sourced, because the range
+      # predicates below it read UNFENCED text only — a consumer missing this
+      # lib would not degrade to a whole-body match, it would fail to source and
+      # exit, which is the correct direction for a predicate whose fail-open
+      # mode lets a quoted range suppress a real finding.
+      - "scripts/lib/coderabbit-fence.sh"
   # #489 CodeRabbit-rate-limit auto-merge disposition gate. agent-review.yml's
   # exit-5 (rate-limited) branch calls this script to decide whether the
   # Codex-failover path may auto-merge. Absent on a consumer it exits 127 and
@@ -589,6 +605,7 @@ paths:
     requires:
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/lib/coderabbit-fence.sh"  # #1178, was inline here until the waiter needed it too
   # CodeRabbit disposition-verdict ledger (#584) — the DISPOSITION-ONLY twin
   # of scripts/codex-record-feedback.sh (#487). By-nature asymmetry (#574):
   # CodeRabbit does not solicit per-finding reactions, so this helper never

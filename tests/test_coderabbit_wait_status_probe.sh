@@ -39,6 +39,8 @@ make_case() {
   # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
   # grades findings with the shared coderabbit_tier_of.
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: hard-sourced by coderabbit-wait.sh, so the fixture must carry it.
+  cp "$ROOT/scripts/lib/coderabbit-fence.sh" "$dir/scripts/lib/coderabbit-fence.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
@@ -1960,6 +1962,11 @@ test_968_summary_head_claim_unit() {
     "$ROOT/scripts/coderabbit-wait.sh")"
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: the summary-range predicates now read UNFENCED text through the
+  # shared CommonMark reader, so a harness that sources the helpers block
+  # directly needs the prelude in scope too.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   {
     awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
       "$ROOT/scripts/coderabbit-wait.sh"
@@ -2150,6 +2157,11 @@ test_1003_head_run_evidence_unit() {
     "$ROOT/scripts/coderabbit-wait.sh")"
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: the summary-range predicates now read UNFENCED text through the
+  # shared CommonMark reader, so a harness that sources the helpers block
+  # directly needs the prelude in scope too.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   {
     awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' \
       "$ROOT/scripts/coderabbit-wait.sh"
@@ -2358,6 +2370,11 @@ test_1031_rung_binds_to_the_graded_run() {
     "$ROOT/scripts/coderabbit-wait.sh")"
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: the summary-range predicates now read UNFENCED text through the
+  # shared CommonMark reader, so a harness that sources the helpers block
+  # directly needs the prelude in scope too.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   {
     awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' \
       "$ROOT/scripts/coderabbit-wait.sh"
@@ -2532,6 +2549,11 @@ test_851_summary_helpers_unit() {
   # against the real classifier rather than a test-local stand-in.
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: the summary-range predicates now read UNFENCED text through the
+  # shared CommonMark reader, so a harness that sources the helpers block
+  # directly needs the prelude in scope too.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   # shellcheck disable=SC1090
   . "$snip"
   h40='0123456789abcdef0123456789abcdef01234567'
@@ -2649,6 +2671,11 @@ test_884_count_bodies_fails_closed_unit() {
   # script's stderr logger, which crw_count_blocking_bodies calls on refusal.
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: the summary-range predicates now read UNFENCED text through the
+  # shared CommonMark reader, so a harness that sources the helpers block
+  # directly needs the prelude in scope too.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   log() { echo "[coderabbit-wait] $*" >&2; }
   # shellcheck disable=SC1090
   . "$snip"
