@@ -453,6 +453,22 @@ bootstrap::_seed_labels() {
     # taxonomy does), which is why the separator is not ':'. Capture
     # the first two splits and let the rest be the description, so a
     # description containing '|' would still round-trip.
+    # Require BOTH separators before splitting. `${var%%|*}` and
+    # `${var#*|}` return the input UNCHANGED when the separator is
+    # absent, so a one-separator entry does not fail — it silently
+    # aliases two fields onto one value. "future-label|abcdef" would
+    # otherwise parse as color=abcdef AND desc=abcdef, pass a
+    # colour-only check, and create a label with its colour copied into
+    # its description. The glob tests the shape before any field is
+    # trusted; a description may still contain '|' and round-trips.
+    case "$spec" in
+      *"|"*"|"*) : ;;
+      *)
+        bootstrap::warn "github-infra: label spec '$spec' is malformed (expected name|color|description — both '|' separators required) — skipping"
+        continue
+        ;;
+    esac
+
     name=${spec%%|*}
     local rest=${spec#*|}
     color=${rest%%|*}

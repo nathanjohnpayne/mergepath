@@ -284,6 +284,63 @@ done
   && pass "all 19 canonical labels seeded with --force" \
   || fail "expected 19 labels, got $seeded"
 
+# --- assertion 2b: the malformed-spec guard fails CLOSED (Codex P2, #1182) ---
+# The parse uses ${var%%|*} / ${var#*|}, which return the input UNCHANGED
+# when the separator is absent. A one-separator entry therefore does not
+# fail on its own — it aliases two fields onto one value:
+# "future-label|abcdef" yields color=abcdef AND desc=abcdef, which passes
+# a colour-only check and creates a label with its colour copied into its
+# description. Drive the REAL _seed_labels so this asserts the shipped
+# path, not a re-implementation of it.
+#
+# Writes to its OWN shim log: $SHIM_LOG still holds the happy-path run that
+# the invite / secret-set assertions below read, and truncating it here
+# would fail them from a distance.
+GUARD_LOG="$WORKDIR/gh-shim-labelguard.log"
+: >"$GUARD_LOG"
+set +e
+malformed_out=$(PATH="$SHIM_PATH" SHIM_LOG="$GUARD_LOG" bash -c '
+  ROOT="'"$ROOT"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/github-infra.sh"
+  BOOTSTRAP_STATE_FILE=""
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1
+  # One separator (the Codex case), none at all, a non-hex colour, and an
+  # empty name / empty description — then one WELL-FORMED entry whose name
+  # and description both carry colons, and one whose description carries
+  # the separator itself, to prove the guard rejects only the bad ones.
+  BOOTSTRAP_LABELS=(
+    "future-label|abcdef"
+    "no-separators-at-all"
+    "bad-colour|zzzzzz|nope"
+    "|abcdef|empty name"
+    "empty-desc|abcdef|"
+    "size:S|c2e0c6|Small: one or a few files."
+    "piped|abcdef|desc|with|pipes"
+  )
+  bootstrap::_seed_labels "nathanjohnpayne/guard-repo"
+' 2>&1)
+set -e
+for bad in future-label no-separators-at-all bad-colour empty-desc; do
+  grep -q "^gh label create $bad " "$GUARD_LOG" \
+    && fail "malformed spec '$bad' reached gh label create; log: $(cat "$GUARD_LOG")" \
+    || pass "malformed spec '$bad' never reached gh label create"
+done
+printf '%s' "$malformed_out" | grep -q "future-label|abcdef" \
+  && pass "the one-separator spec is named in a warning rather than silently dropped" \
+  || fail "no warning named the one-separator spec; out: $malformed_out"
+grep -q "^gh label create size:S --repo nathanjohnpayne/guard-repo --color c2e0c6 " "$GUARD_LOG" \
+  && pass "a colon-bearing name still seeds with its own colour after the guard" \
+  || fail "well-formed colon-bearing spec was rejected by the guard; log: $(cat "$GUARD_LOG")"
+grep -q -- "--description desc|with|pipes --force$" "$GUARD_LOG" \
+  && pass "a description containing the separator round-trips intact" \
+  || fail "pipe-bearing description did not round-trip; log: $(cat "$GUARD_LOG")"
+[ "$(grep -c '^gh label create ' "$GUARD_LOG")" -eq 2 ] \
+  && pass "exactly the 2 well-formed specs were seeded (5 malformed skipped, none fatal)" \
+  || fail "expected 2 seeded labels, got $(grep -c '^gh label create ' "$GUARD_LOG"); log: $(cat "$GUARD_LOG")"
+
 # --- assertion 3: reviewer collaborator invites ---
 for agent in claude cursor codex; do
   login="nathanpayne-$agent"
