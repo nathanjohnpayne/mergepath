@@ -1605,17 +1605,32 @@ summary_stanzas_all_benign() {
 # consumer read it in a fail-OPEN direction; both copies now answer the fence
 # question the same way, which is what specs/coderabbit_review_sensing.md
 # already required of them.
+# THREE rungs, not two (Codex P1 round 6). rc 0 = read, rc 3 = the reader
+# FAILED. An awk failure — locale, encoding, pathological input — used to print
+# nothing and exit 0 through the pipeline, so "the reader broke" and "this body
+# has no unfenced text" were the same answer. That conflation is only safe where
+# the consumer's fail direction happens to point the right way, and it did not:
+# see crw_head_summary_holds_blocking_marker, where an unread summary read as
+# "belongs to another head" and suppressed a published finding.
+#
+# The gate's copy of these predicates has carried an rc-3 rung all along, and
+# its comment records that flattening rc 3 into rc 1 was itself a defect. This
+# is the same lesson reaching the waiter's copy.
 crw_unfenced_body() {
-  printf '%s\n' "$1" | awk "$CR_AWK_FENCE_PRELUDE"'
+  local out
+  out=$(printf '%s\n' "$1" | awk "$CR_AWK_FENCE_PRELUDE"'
     { line = $0; sub(/\r$/, "", line)
       if (fence_update(line)) next
       if (FENCE) next
       print line }
-  '
+  ') || return 3
+  printf '%s\n' "$out"
 }
 
 summary_names_head() {
-  grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)" <<<"$(crw_unfenced_body "$1")"
+  local unfenced
+  unfenced=$(crw_unfenced_body "$1") || return 3
+  grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)" <<<"$unfenced"
 }
 
 # True when the body carries a machine-readable commits range AND none of its
@@ -1667,7 +1682,12 @@ summary_names_only_other_head() {  # <body> <head_sha>
   # summary_names_head above (#1178 round 5). This one matters MORE, not less:
   # its consumers use a positive answer to SUPPRESS, so a quoted range is a
   # fail-open input rather than a fail-closed one.
-  grep -qiE "between [0-9a-f]{40} and [0-9a-f]{40}([^0-9a-fA-F]|\$)" <<<"$(crw_unfenced_body "$1")" || return 1
+  local unfenced
+  # rc 3 is propagated, never flattened (Codex P1 round 6): this predicate's
+  # consumers invert it, so "unreadable" collapsing into "carries a range for
+  # another head" would suppress rather than escalate.
+  unfenced=$(crw_unfenced_body "$1") || return 3
+  grep -qiE "between [0-9a-f]{40} and [0-9a-f]{40}([^0-9a-fA-F]|\$)" <<<"$unfenced" || return 1
   summary_names_head "$1" "$2" && return 1
   return 0
 }
@@ -1691,7 +1711,20 @@ summary_blocking_marker_present() {
       -v s="$CR_PRE_MERGE_BLOCK_START" -v e="$CR_PRE_MERGE_BLOCK_END" \
       'index($0,s){k=1} !k; index($0,e){k=0}')
   fi
-  crw_scan_has_blocking_marker "$scan"
+  # UNFENCED lines only (CodeRabbit round 6). The spec's classification rule is
+  # explicit that "only UNFENCED lines are classified", and the severity gate's
+  # twin already does this; the waiter's copy did not, so a `_⚠️ Potential
+  # issue_` line CodeRabbit was QUOTING inside a fence graded p1 and made all
+  # three rate-limit paths emit findings. That direction is fail-CLOSED — a
+  # spurious escalation, not a spurious clearance — which is why it is Minor and
+  # not the P1 above it. It is still wrong, and it is the third instance of this
+  # same gate/waiter pair drifting (#895).
+  #
+  # A reader failure is propagated, not swallowed: rc 3 rather than a scan of
+  # nothing.
+  local unfenced
+  unfenced=$(crw_unfenced_body "$scan") || return 3
+  crw_scan_has_blocking_marker "$unfenced"
 }
 # END coderabbit_summary_helpers
 
@@ -1780,11 +1813,32 @@ summary_blocking_marker_present() {
 # turns a widened scan into "no marker found", i.e. suppress, i.e. a false clear
 # on a published required finding. The invariant is asserted in the guard's unit
 # test (delimiters absent must still escalate) rather than left to inspection.
+# Returns 0 (masked, escalate), 1 (bare refusal) or 3 (the fence reader failed,
+# so nothing was decided). rc 3 is NOT folded into either verdict: a read that
+# did not happen is not evidence, which is the same rule #957 applied to the
+# comment-list reads.
 crw_rate_limit_masks_blocking_marker() {
+  local rc=0
   [ "${1:-}" = "rate_limit" ] || return 1
   [ -n "${2:-}" ] || return 1
-  summary_blocking_marker_present "$2" || return 1
-  ! summary_names_only_other_head "$2" "${3:-}"
+  # BOTH conjuncts propagate rc 3, not just the second. The first draft of this
+  # fix wrote `summary_blocking_marker_present "$2" || return 1` and flattened
+  # the reader failure one line above the code that exists to preserve it —
+  # caught by the rung test below rather than by inspection, which is the whole
+  # reason that test simulates a failing reader instead of asserting on inputs.
+  summary_blocking_marker_present "$2" || rc=$?
+  case "$rc" in
+    0) ;;            # a marker is present — go on to the head question
+    1) return 1 ;;   # no marker at all
+    *) return 3 ;;   # unreadable
+  esac
+  rc=0
+  summary_names_only_other_head "$2" "${3:-}" || rc=$?
+  case "$rc" in
+    0) return 1 ;;   # names ANOTHER head — prior-head finding, do not escalate
+    1) return 0 ;;   # no other-head range — this body's marker stands
+    *) return 3 ;;   # unreadable — the caller decides, and it decides infra
+  esac
 }
 
 # crw_head_summary_holds_blocking_marker <head_sha> <summary_body>
@@ -1811,11 +1865,20 @@ crw_rate_limit_masks_blocking_marker() {
 # `review` — a summary that itself classifies rate_limit is exactly the shape
 # being guarded against, and requiring `review` here would reopen the hole from
 # the other side.
+# Same three rungs, and this is the site Codex round 6 caught: `summary_names_head
+# ... || return 1` read an UNREAD summary as "belongs to another head", so a
+# reader failure suppressed the escalation and let the barrier open past a
+# published finding. rc 3 now propagates.
 crw_head_summary_holds_blocking_marker() {
-  local head="${1:-}" sbody="${2:-}"
+  local head="${1:-}" sbody="${2:-}" rc=0
   [ -n "$head" ] || return 1
   [ -n "$sbody" ] || return 1
-  summary_names_head "$sbody" "$head" || return 1
+  summary_names_head "$sbody" "$head" || rc=$?
+  case "$rc" in
+    0) ;;            # pinned to this head — fall through to the marker scan
+    1) return 1 ;;   # a different head's summary; not this head's problem
+    *) return 3 ;;   # unreadable — never "not this head"
+  esac
   summary_blocking_marker_present "$sbody"
 }
 # END coderabbit_rate_limit_marker_guard
@@ -4098,7 +4161,10 @@ probe_emit_verdict() {
       # the head-pinned-summary escalation sits before its own not-yet gate: a
       # blocking marker is a signal a human must see, and downgrading it costs
       # an escalation nothing else makes.
-      if crw_rate_limit_masks_blocking_marker "$PROBE_OBSERVED" "$newest_body" "$HEAD_SHA"; then
+      rl_rc=0
+      crw_rate_limit_masks_blocking_marker "$PROBE_OBSERVED" "$newest_body" "$HEAD_SHA" || rl_rc=$?
+      [ "$rl_rc" = 3 ] && die 3 "the fence reader failed while checking whether the rate-limit body on $HEAD_SHA masks a blocking marker — an unread body is not evidence that it carries none (#1178)"
+      if [ "$rl_rc" = 0 ]; then
         PROBE_CONTEXT_STATE=""
         PROBE_CONTEXT_UPDATED_AT=""
         PROBE_OBSERVED="terminal"
@@ -4162,14 +4228,17 @@ probe_emit_verdict() {
             body: (.body // "")} | @base64 end
   ') || die 3 "failed to classify the latest comment"
 
-  local latest_json="null" rl_summary rl_sbody rl_sjson
+  local latest_json="null" rl_summary rl_sbody rl_sjson rl_rc
   if [ -n "$cand" ]; then
     body=$(printf '%s' "$cand" | base64 --decode | jq -r '.body')
     latest_json=$(printf '%s' "$cand" | base64 --decode | jq -r '.json')
     newest_class=$(classify_comment "$body")
     # #1178 guard, site 2 of 3 — the no-review-object triage. Same body, same
     # masking, same answer as site 1.
-    if crw_rate_limit_masks_blocking_marker "$newest_class" "$body" "$HEAD_SHA"; then
+    rl_rc=0
+    crw_rate_limit_masks_blocking_marker "$newest_class" "$body" "$HEAD_SHA" || rl_rc=$?
+    [ "$rl_rc" = 3 ] && die 3 "the fence reader failed while checking whether the rate-limit notice on $HEAD_SHA masks a blocking marker — an unread body is not evidence that it carries none (#1178)"
+    if [ "$rl_rc" = 0 ]; then
       PROBE_OBSERVED="terminal"
       log "probe: rate-limit notice on $HEAD_SHA is carried by a body that ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
       emit_json_and_exit "findings" 2 "$latest_json" 1
@@ -4189,7 +4258,10 @@ probe_emit_verdict() {
         || die 3 "failed to select the CodeRabbit summary comment for the rate-limit masking re-read"
       if [ -n "$rl_summary" ]; then
         rl_sbody=$(printf '%s' "$rl_summary" | base64 --decode | jq -r '.body')
-        if crw_head_summary_holds_blocking_marker "$HEAD_SHA" "$rl_sbody"; then
+        rl_rc=0
+        crw_head_summary_holds_blocking_marker "$HEAD_SHA" "$rl_sbody" || rl_rc=$?
+        [ "$rl_rc" = 3 ] && die 3 "the fence reader failed while checking whether the head-pinned summary on $HEAD_SHA holds a blocking marker — an unread summary must never read as another head's (#1178)"
+        if [ "$rl_rc" = 0 ]; then
           rl_sjson=$(printf '%s' "$rl_summary" | base64 --decode | jq -r '.json')
           PROBE_OBSERVED="terminal"
           log "probe: bare rate-limit notice on $HEAD_SHA, but the head-pinned summary holds a summary-only blocking marker — escalating rather than reporting a refusal that would open the barrier (#1178)"
@@ -4322,8 +4394,11 @@ probe_emit_verdict() {
     # #1178 guard, site 3 of 3 — the open-window path. This notice is selected
     # anchor-free by newest_bot_comment_from_issue_comments, so it can be the
     # summarize comment itself; the masking is the same and so is the answer.
-    if crw_rate_limit_masks_blocking_marker rate_limit \
-         "$(printf '%s' "$active_notice" | jq -r '.body // ""')" "$HEAD_SHA"; then
+    rl_rc=0
+    crw_rate_limit_masks_blocking_marker rate_limit \
+      "$(printf '%s' "$active_notice" | jq -r '.body // ""')" "$HEAD_SHA" || rl_rc=$?
+    [ "$rl_rc" = 3 ] && die 3 "the fence reader failed while checking whether the open-window rate-limit notice on $HEAD_SHA masks a blocking marker — an unread body is not evidence that it carries none (#1178)"
+    if [ "$rl_rc" = 0 ]; then
       PROBE_OBSERVED="terminal"
       log "probe: the open-window rate-limit notice on $HEAD_SHA ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
       emit_json_and_exit "findings" 2 \

@@ -1929,6 +1929,36 @@ _⚠️ Potential issue_"
   crw_rate_limit_masks_blocking_marker rate_limit "$rl_no_delims" "$h40" \
     || bad="$bad scan-default-not-whole-body"
 
+  # The rc-3 rung (Codex P1 round 6). Both guards consume a range predicate that
+  # could not previously say "I could not read this", and their fail directions
+  # on that answer were OPPOSITE and neither was chosen: the masking guard
+  # inverts it (unreadable → escalate, safe by luck), while the head-summary
+  # guard did not (unreadable → "belongs to another head" → SUPPRESS, which
+  # opens the barrier past a published finding). Both must now report 3, so the
+  # caller can treat it as infrastructure rather than as a verdict.
+  #
+  # Simulated by making the shared reader fail, which is the real failure mode —
+  # a locale/encoding error or pathological input inside awk.
+  # Built locally rather than reusing a fixture assigned further down this
+  # function — the first attempt at this test referenced one before its
+  # assignment and aborted on `unbound variable` instead of asserting anything.
+  local _rc3_head_pinned _real_reader _rc
+  _rc3_head_pinned="$SUMMARY_MARKER
+Review between $b40 and $h40.
+
+_⚠️ Potential issue_"
+  _real_reader=$(declare -f crw_unfenced_body)
+  crw_unfenced_body() { return 3; }
+  _rc=0; crw_rate_limit_masks_blocking_marker rate_limit "$masked_limit" "$h40" || _rc=$?
+  [ "$_rc" = 3 ] || bad="$bad masking-guard-rc3=$_rc"
+  _rc=0; crw_head_summary_holds_blocking_marker "$h40" "$_rc3_head_pinned" || _rc=$?
+  [ "$_rc" = 3 ] || bad="$bad head-summary-guard-rc3=$_rc"
+  eval "$_real_reader"
+  # Control: with the real reader back, the same inputs give real verdicts, so
+  # the assertions above are about the rung and not about a wedged harness.
+  crw_rate_limit_masks_blocking_marker rate_limit "$masked_limit" "$h40" \
+    || bad="$bad reader-not-restored"
+
   # Scoped to rate_limit ONLY. paused and in_progress still map to not-yet at
   # the barrier, so they keep reaching a human through the bounded wait;
   # widening the guard would turn their self-clearing holds into immediate
