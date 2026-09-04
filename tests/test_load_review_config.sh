@@ -191,11 +191,6 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$PATHARG" in
-  user)
-    # `gh api user --jq .login` — the auto-merge job's AUTHOR_MERGE_TOKEN
-    # identity probe (section 6).
-    printf '%s\n' "${STUB_TOKEN_LOGIN:-nathanjohnpayne}"
-    exit 0 ;;
   repos/*/pulls/*)
     cat "${STUB_PR_JSON:-/dev/null}"
     exit 0 ;;
@@ -315,10 +310,10 @@ fi
 # ---------------------------------------------------------------------------
 # 3c. Scalar spellings. The emitted `author_identity` is no longer just an
 #     input to a string comparison inside a script — since #788 it IS the
-#     identity the readiness job requires AUTHOR_MERGE_TOKEN to resolve to, so
-#     a value carrying its YAML quotes refuses every evaluation, and a nested
-#     key of the same name (matched first by an unanchored grep) authorizes the wrong
-#     one. Both spellings are legal YAML.
+#     identity the readiness lane consumes from the governing base policy. A
+#     value carrying its YAML quotes names a different identity, and a nested
+#     key of the same name (matched first by an unanchored grep) admits the
+#     wrong one. Both spellings are legal YAML.
 # ---------------------------------------------------------------------------
 export STUB_CONTENTS_MODE=quirk
 run_loader release/1.x main
@@ -346,9 +341,10 @@ fi
 #     block, which `review_policy_scalar` deliberately declines to match.
 #
 #     Emitting a hard-coded login here instead would make EXPECTED_AUTHOR
-#     non-empty in the auto-merge step, skipping the `[ -z ]` fail-closed branch
-#     that section 6b pins, and enabling a merge under an identity the governing
-#     policy never named. Section 6e runs that consequence end to end.
+#     non-empty in the read-only readiness step, skipping the `[ -z ]`
+#     fail-closed branch that section 6b pins and admitting readiness under an
+#     identity the governing policy never named. Section 6d runs that
+#     consequence end to end.
 # ---------------------------------------------------------------------------
 export STUB_CONTENTS_MODE=noauth
 run_loader release/1.x main
@@ -522,30 +518,31 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. The CONSUMER of `author_identity` that gates a real merge: the auto-merge
-#    job's `Check author readiness token` step, as the runner executes it.
+# 6. The CONSUMER of `author_identity`: the candidate-controlled job's
+#    `Enter read-only readiness lane` step, as the runner executes it.
 #
-#    Exporting the identity from the governing policy is only half of #788. The
-#    step that decides whether AUTHOR_MERGE_TOKEN may call `gh pr merge` parsed
-#    `author_identity` out of its OWN checkout, and that job's
-#    `actions/checkout` carries no `ref:` — on a `pull_request` event it is
-#    `refs/pull/N/merge`, the PR's own copy of the policy, and on a
-#    `pull_request_review` event it is a different file again. Two answers for
-#    one PR, neither of them the base branch's.
+#    #1058 deliberately removed AUTHOR_MERGE_TOKEN and every merge mutation
+#    from this pull_request / pull_request_review workflow. Credential identity
+#    is proved later by trusted workflow_run and merge-queue boundaries. This
+#    candidate lane may only admit read-only readiness for the exact identity
+#    load-config resolved from the governing base policy; an unproven identity
+#    must still fail closed.
 #
-#    So the assertions below are about SOURCE, not about parsing: each runs the
+#    The assertions remain about SOURCE, not about parsing: each runs the
 #    lifted step inside a tree whose `.github/review-policy.yml` names
 #    `nathanjohnpayne`, and varies only the load-config output. A step that
-#    still reads the checked-out file agrees with itself in every case and
-#    fails 6a and 6b.
+#    re-parses the checked-out file therefore disagrees with 6a. The structural
+#    assertion also makes the privilege reduction non-vacuous: this exact step
+#    receives only github.token and contains no secret, identity probe,
+#    continuation, or merge mutation.
 #
 #    Lifted from the workflow rather than retyped, for the same reason as
 #    section 5: a copy keeps passing while the shipped step is broken.
 # ---------------------------------------------------------------------------
-STEP2="$WORK/author-token-step.sh"
+STEP2="$WORK/read-only-readiness-step.sh"
 
 awk '
-  /^      - name: Check author readiness token$/ { instep = 1; next }
+  /^      - name: Enter read-only readiness lane$/ { instep = 1; next }
   instep && /^      - name: /                { instep = 0 }
   instep && /^        run: \|$/              { inrun = 1; next }
   inrun && /^          /                     { print substr($0, 11); next }
@@ -553,10 +550,12 @@ awk '
   inrun                                      { inrun = 0 }
 ' "$WORKFLOW" > "$STEP2"
 
-if [ -s "$STEP2" ] && grep -q 'AUTHOR_MERGE_TOKEN' "$STEP2"; then
-  pass "lifted the auto-merge author-token step out of agent-review.yml"
+if [ -s "$STEP2" ] \
+   && grep -Fq 'expected_author="${EXPECTED_AUTHOR:-}"' "$STEP2" \
+   && grep -Fq 'echo "enabled=true" >> "$GITHUB_OUTPUT"' "$STEP2"; then
+  pass "lifted the read-only readiness step out of agent-review.yml"
 else
-  fail "could not lift the author-token run block out of $WORKFLOW — section 6 asserts nothing"
+  fail "could not lift the read-only readiness run block out of $WORKFLOW — section 6 asserts nothing"
 fi
 
 # The lifted `run:` block reads EXPECTED_AUTHOR out of the environment, so the
@@ -567,88 +566,94 @@ fi
 # unchanged. `needs.load-config.outputs.` is also the load-bearing prefix: it
 # is what makes the value the BASE-resolved one, and dropping the `needs:`
 # declaration that feeds it yields an empty string, which 6b pins as
-# fail-closed.
+# fail-closed. github.token is the only token this candidate-controlled step
+# may receive; privileged queue credentials and merge continuations belong to
+# trusted workflows.
 AUTH_STEP_ENV=$(awk '
-  /^      - name: Check author readiness token$/ { instep = 1; next }
+  /^      - name: Enter read-only readiness lane$/ { instep = 1; next }
   instep && /^      - name: /                { instep = 0 }
   instep                                     { print }
 ' "$WORKFLOW")
+# `author_merge_token` is a legacy step id retained for downstream expression
+# compatibility, not a credential reference. Remove only that exact YAML key
+# before scanning the executable privilege surface; every other case/spelling
+# of a privileged credential remains blocking.
+AUTH_STEP_PRIVILEGE_SURFACE=$(printf '%s\n' "$AUTH_STEP_ENV" | awk '
+  tolower($0) !~ /^[[:space:]]*id:[[:space:]]*author_merge_token[[:space:]]*$/ { print }
+')
 if printf '%s\n' "$AUTH_STEP_ENV" \
-   | grep -Fq 'EXPECTED_AUTHOR: ${{ needs.load-config.outputs.author_identity }}'; then
-  pass "the author-token step binds EXPECTED_AUTHOR to load-config's base-resolved output (#788)"
+   | grep -Fq 'EXPECTED_AUTHOR: ${{ needs.load-config.outputs.author_identity }}' \
+   && printf '%s\n' "$AUTH_STEP_ENV" | grep -Fq 'GH_TOKEN: ${{ github.token }}' \
+   && ! printf '%s\n' "$AUTH_STEP_PRIVILEGE_SURFACE" | grep -Eiq 'secrets[[:space:]]*\.|secrets[[:space:]]*\[|AUTHOR_MERGE_TOKEN|MERGE_QUEUE_(POLICY|SOURCE)_TOKEN' \
+   && ! printf '%s\n' "$AUTH_STEP_PRIVILEGE_SURFACE" | grep -Eiq 'gh[[:space:]]+api[[:space:]]+user|gh[[:space:]]+pr[[:space:]]+merge|approval-merge-continuation\.sh'; then
+  pass "the readiness step binds the base-resolved author to github.token without privileged credentials or mutation (#788/#1058)"
 else
-  fail "the author-token step does not bind EXPECTED_AUTHOR to needs.load-config.outputs.author_identity"
+  fail "the readiness step must bind the base-resolved author to github.token and remain credential-free and read-only"
 fi
 
 AUTH_TREE="$WORK/auth-tree"
 mkdir -p "$AUTH_TREE/.github"
 cp "$DEFAULT_CONFIG" "$AUTH_TREE/.github/review-policy.yml"   # names nathanjohnpayne
 
-# <expected_author> <token_login> ; sets ASRC / ASTEP_OUT / ASTEP_LOG
-run_author_step() {
-  ASTEP_OUT="$WORK/author-step-output.txt"
+# <expected_author> ; sets ASRC / ASTEP_OUT / ASTEP_LOG
+run_readiness_step() {
+  ASTEP_OUT="$WORK/readiness-step-output.txt"
   : > "$ASTEP_OUT"
-  ASTEP_LOG=$(cd "$AUTH_TREE" && GITHUB_OUTPUT="$ASTEP_OUT" GH_TOKEN="stub-author-token" \
-    EXPECTED_AUTHOR="$1" STUB_TOKEN_LOGIN="$2" BASE_REF="release/1.x" \
+  : > "$CALLS_LOG"
+  ASTEP_LOG=$(cd "$AUTH_TREE" && GITHUB_OUTPUT="$ASTEP_OUT" GH_TOKEN="stub-read-only-token" \
+    EXPECTED_AUTHOR="$1" BASE_REF="release/1.x" \
     bash -e "$STEP2" 2>&1) && ASRC=0 || ASRC=$?
 }
 
-# 6a. The governing (base) policy names a different identity than the checked-out
-#     one, and the token is the checked-out one's. Refuse.
-run_author_step "release-bot" "nathanjohnpayne"
-if [ "$ASRC" -ne 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" != "true" ]; then
-  pass "a token that does not match the BASE policy's author_identity is refused, even when the checked-out policy names it (#788)"
+# 6a. The governing (base) policy names a different identity than the
+#     checked-out one. The lane must consume the base-resolved value without
+#     consulting the checkout or probing a credential.
+run_readiness_step "release-bot"
+if [ "$ASRC" -eq 0 ] \
+   && [ "$(val_in "$ASTEP_OUT" enabled)" = "true" ] \
+   && printf '%s' "$ASTEP_LOG" | grep -Fq 'governing author: release-bot' \
+   && ! grep -q . "$CALLS_LOG"; then
+  pass "read-only readiness consumes the BASE policy's author_identity without re-parsing the checkout or probing a credential (#788/#1058)"
 else
-  fail "base-policy mismatch was not refused (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
+  fail "base-resolved readiness source was not preserved (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled) calls=$(cat "$CALLS_LOG")): $ASTEP_LOG"
 fi
 
 # 6b. load-config could not prove the governing policy (its fail-closed output
-#     is an empty author_identity). Disable the merge path; do NOT fall back to
-#     a hard-coded login, which is the substitution #768/#769/#788 close.
-run_author_step "" "nathanjohnpayne"
+#     is an empty author_identity). Disable readiness; do NOT fall back to a
+#     hard-coded login, which is the substitution #768/#769/#788 close.
+run_readiness_step ""
 if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "false" ]; then
-  pass "an unproven author_identity disables automatic merge rather than defaulting to a hard-coded login (#788 fail-closed)"
+  pass "an unproven author_identity disables read-only readiness rather than defaulting to a hard-coded login (#788 fail-closed)"
 else
   fail "unproven identity path (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
 fi
 
 # 6c. Positive control against a step that simply always disables: the ordinary
 #     fleet case, where the governing policy IS the checked-out one.
-run_author_step "nathanjohnpayne" "nathanjohnpayne"
+run_readiness_step "nathanjohnpayne"
 if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "true" ]; then
-  pass "a token matching the governing author_identity still enables automatic merge (#788 no-regression)"
+  pass "a proven governing author_identity still enables read-only readiness (#788 no-regression)"
 else
   fail "positive control (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
 fi
 
-# 6d. The mirror of 6a, against a step hard-wired to expect nathanjohnpayne: a
-#     base policy naming release-bot, with a token that IS release-bot, merges —
-#     the checked-out policy's nathanjohnpayne is not consulted in either
-#     direction.
-run_author_step "release-bot" "release-bot"
-if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "true" ]; then
-  pass "a token matching a NON-default base policy's author_identity is accepted (the identity comes from the policy, not from a hard-coded name)"
-else
-  fail "non-default base identity accepted path (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
-fi
-
-# 6e. The two halves joined: the loader's real output for a governing policy
-#     that names no author_identity is handed to the lifted merge-gate step,
+# 6d. The two halves joined: the loader's real output for a governing policy
+#     that names no author_identity is handed to the lifted readiness step,
 #     exactly as `needs.load-config.outputs.author_identity` hands it over.
 #
 #     Sections 3d and 6b each pin one end and can both pass while the pipeline
-#     still merges: 6b feeds a hand-written empty string, so it never observes
-#     what the loader actually produces. Here the value is not written by this
-#     test at all. If the loader substitutes a login, EXPECTED_AUTHOR arrives
-#     non-empty, the token (which IS that login) matches, and automatic merge is
-#     enabled under an identity the governing policy never named.
+#     still admits readiness incorrectly: 6b feeds a hand-written empty string,
+#     so it never observes what the loader actually produces. Here the value is
+#     not written by this test at all. If the loader substitutes a login,
+#     EXPECTED_AUTHOR arrives non-empty and read-only readiness is enabled under
+#     an identity the governing policy never named.
 export STUB_CONTENTS_MODE=noauth
 run_loader release/1.x main
-run_author_step "$(out_value author_identity)" "nathanjohnpayne"
+run_readiness_step "$(out_value author_identity)"
 if [ "$ASRC" -eq 0 ] && [ "$(val_in "$ASTEP_OUT" enabled)" = "false" ]; then
-  pass "a governing policy naming no author_identity disables automatic merge end to end, loader output through merge gate (#788)"
+  pass "a governing policy naming no author_identity disables readiness end to end, loader output through the candidate gate (#788/#1058)"
 else
-  fail "end-to-end missing-identity path enabled the merge (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
+  fail "end-to-end missing-identity path enabled readiness (rc=$ASRC enabled=$(val_in "$ASTEP_OUT" enabled)): $ASTEP_LOG"
 fi
 
 echo

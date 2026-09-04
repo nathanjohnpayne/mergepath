@@ -53,7 +53,9 @@ paths:
   - {path: scripts/keep-in-sync.sh,    type: canonical, consumers: all}
   - {path: scripts/hooks/the-hook.sh,  type: canonical, consumers: all}
   - {path: scripts/ci/,                type: kit,       consumers: all}
-  - path: AGENTS.md
+  - path: examples/AGENTS.md
+    source: examples/AGENTS.md
+    dest: AGENTS.md
     type: templated
     consumers: all
     substitutions:
@@ -140,6 +142,37 @@ if "$VALIDATOR" "$bad_path" "$MANIFEST" >/dev/null 2>&1; then
   fail "nonexistent skip path should fail; validator passed"
 else
   pass "nonexistent skip path → exits non-zero"
+fi
+
+# A templated entry is selected by its Mergepath-side `.path` but writes its
+# consumer-side `.dest`. Overrides describe consumer-owned divergence, so the
+# destination is the only valid skip key. This live-shaped source/dest split
+# prevents a validator-legal override that propagation silently ignores.
+templated_dest_skip="$WORKDIR/templated-dest-skip.yml"
+cat >"$templated_dest_skip" <<'YAML'
+version: 1
+skip_paths:
+  - path: AGENTS.md
+    reason: Consumer owns its rendered agent instructions.
+YAML
+if "$VALIDATOR" "$templated_dest_skip" "$MANIFEST" >/dev/null 2>&1; then
+  pass "templated destination skip key → exits 0"
+else
+  out=$("$VALIDATOR" "$templated_dest_skip" "$MANIFEST" 2>&1 || true)
+  fail "templated destination skip key should pass; got: $out"
+fi
+
+templated_source_skip="$WORKDIR/templated-source-skip.yml"
+cat >"$templated_source_skip" <<'YAML'
+version: 1
+skip_paths:
+  - path: examples/AGENTS.md
+    reason: Source-side keys do not identify the consumer artifact.
+YAML
+if "$VALIDATOR" "$templated_source_skip" "$MANIFEST" >/dev/null 2>&1; then
+  fail "templated source-side skip key should fail; validator passed"
+else
+  pass "templated source-side skip key → exits non-zero"
 fi
 
 # ---------------------------------------------------------------------------
@@ -504,6 +537,45 @@ if override_substitution_for "$empty_value_apply" "phase_4b_default" >/dev/null 
   fail "override_substitution_for should return non-zero for empty value"
 else
   pass "override_substitution_for treats empty .value as no override"
+fi
+
+# Test 31: a malformed propagation manifest must report the parse failure,
+# not silently collapse to the distinct "no paths declared" condition. The
+# validator only reads manifest paths when skip_paths is non-empty, so keep a
+# valid override in this fixture to exercise that branch.
+malformed_manifest="$WORKDIR/malformed-manifest.yml"
+cat >"$malformed_manifest" <<'YAML'
+version: 1
+paths:
+  - path: scripts/keep-in-sync.sh
+   type: canonical
+YAML
+manifest_parse_override="$WORKDIR/manifest-parse-override.yml"
+cat >"$manifest_parse_override" <<'YAML'
+version: 1
+skip_paths:
+  - path: scripts/keep-in-sync.sh
+    reason: exercise manifest parsing
+YAML
+out=$("$VALIDATOR" "$manifest_parse_override" "$malformed_manifest" 2>&1 || true)
+if echo "$out" | grep -q "failed to parse manifest" \
+   && ! echo "$out" | grep -q "has no paths declared"; then
+  pass "malformed manifest → parse failure is preserved"
+else
+  fail "malformed manifest should preserve its parse failure; got: $out"
+fi
+
+empty_paths_manifest="$WORKDIR/empty-paths-manifest.yml"
+cat >"$empty_paths_manifest" <<'YAML'
+version: 1
+paths: []
+YAML
+out=$("$VALIDATOR" "$manifest_parse_override" "$empty_paths_manifest" 2>&1 || true)
+if echo "$out" | grep -q "has no paths declared" \
+   && ! echo "$out" | grep -q "failed to parse manifest"; then
+  pass "valid empty manifest paths → distinct no-paths failure is preserved"
+else
+  fail "valid empty manifest paths should retain the no-paths diagnostic; got: $out"
 fi
 
 # ---------------------------------------------------------------------------

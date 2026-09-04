@@ -12,12 +12,14 @@ TEST_SCRIPT="tests/test_self_approval_detector.sh"
 INDEPENDENCE_TEST="tests/test_approval_independence_check.sh"
 WORKFLOW=".github/workflows/agent-review.yml"
 RULES="rules/repo_rules.md"
+COMMAND_CLASSIFIER="scripts/lib/gh-command-classifier.sh"
 
 for file in \
   "$DETECTOR" \
   "$RENDERER" \
   "$TEST_SCRIPT" \
   "$INDEPENDENCE_TEST" \
+  "$COMMAND_CLASSIFIER" \
   "$WORKFLOW" \
   scripts/workflow/resolve_base_policy.sh \
   scripts/workflow/external_review_fingerprint.sh; do
@@ -26,6 +28,9 @@ for file in \
     exit 1
   fi
 done
+
+# shellcheck source=../lib/gh-command-classifier.sh
+. "$COMMAND_CLASSIFIER"
 
 # rules/repo_rules.md is a hub-owned binding policy, not a propagated
 # canonical file. Keep its exact prose locked on Mergepath without making the
@@ -247,26 +252,41 @@ for required_fragment in \
   '--json author,autoMergeRequest,url,headRefOid,baseRefName,baseRefOid' \
   'EVENT_HEAD: ${{ github.event.pull_request.head.sha }}' \
   'EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}' \
-  '--disable-auto' \
+  'Refusing to mutate or classify a durable arm from a candidate-controlled workflow.' \
   'auto_arm_allowed=false' \
   'auto_arm_allowed=true' \
-  'retracting the existing unclassified auto-merge request fail closed' \
+  'blocking on the existing unclassified auto-merge request fail closed' \
   '.autoMergeRequest == null'; do
   if ! grep -qF -- "$required_fragment" <<<"$shared_author_retraction"; then
     echo "check_self_approval_detector: shared-author approval invalidation must carry its self-contained workflow-token retraction path ($required_fragment)" >&2
     exit 1
   fi
 done
+for forbidden_fragment in \
+  'MERGE_QUEUE_POLICY_TOKEN' \
+  'MERGE_QUEUE_SOURCE_TOKEN' \
+  'scripts/workflow/merge-queue-arm-policy.sh'; do
+  if grep -qF -- "$forbidden_fragment" <<<"$shared_author_retraction"; then
+    echo "check_self_approval_detector: candidate-controlled invalidation must not receive queue topology credentials or run the privileged classifier ($forbidden_fragment)" >&2
+    exit 1
+  fi
+done
 if grep -qF -- '--match-head-commit' <<<"$shared_author_retraction"; then
-  echo "check_self_approval_detector: disable-only retraction must not advertise an ineffective head precondition" >&2
+  echo "check_self_approval_detector: read-only armed-state cleanup must not advertise an ineffective head precondition" >&2
   exit 1
 fi
-if grep -qF 'AUTHOR_MERGE_TOKEN' <<<"$shared_author_retraction"; then
-  echo "check_self_approval_detector: protective retraction must not depend on the optional auto-merge token" >&2
+# Candidate-controlled workflow code cannot safely receive the administrator
+# topology credentials. Runtime fixtures prove that every armed state reaches
+# the final refusal; this source scan separately guards direct GitHub CLI
+# merge/disable spellings and is not an arbitrary-Bash execution proof.
+if grep -qF -- '--disable-auto' <<<"$shared_author_retraction" \
+  || ! gh_source_lacks_direct_literal_pr_mutation <<<"$shared_author_retraction" \
+  || grep -Eq -- '--(auto|merge|rebase|squash)([[:space:]]|$)' <<<"$shared_author_retraction"; then
+  echo "check_self_approval_detector: candidate-controlled armed-state refusal must expose no direct merge or disable syntax" >&2
   exit 1
 fi
 if grep -qF 'approval-merge-continuation.sh' <<<"$shared_author_retraction"; then
-  echo "check_self_approval_detector: first-rollout retraction must remain self-contained and helper-independent" >&2
+  echo "check_self_approval_detector: first-rollout armed-state classification must remain self-contained" >&2
   exit 1
 fi
 

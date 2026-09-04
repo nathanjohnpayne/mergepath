@@ -23,13 +23,17 @@ FIXTURE="scripts/ci/fixtures/workflow-parsers/review-policy.sample.yml"
 PARSE="scripts/workflow/parse_policy_list.sh"
 MATCH="scripts/workflow/match_protected_paths.sh"
 BLOCKING_LABELS="scripts/lib/blocking-labels.sh"
+COMMAND_CLASSIFIER="scripts/lib/gh-command-classifier.sh"
 
-for f in "$FIXTURE" "$PARSE" "$MATCH" "$BLOCKING_LABELS"; do
+for f in "$FIXTURE" "$PARSE" "$MATCH" "$BLOCKING_LABELS" "$COMMAND_CLASSIFIER"; do
   if [ ! -f "$f" ]; then
     echo "check_workflow_parsers: missing required file: $f" >&2
     exit 1
   fi
 done
+
+# shellcheck source=../lib/gh-command-classifier.sh
+. "$COMMAND_CLASSIFIER"
 
 pass=0
 fail=0
@@ -804,15 +808,17 @@ else
 fi
 
 echo
-echo "agent-review.yml author-token auto-merge regression (#359)"
+echo "agent-review.yml candidate-readiness credential isolation (#1058)"
 
 agent_review_workflow=".github/workflows/agent-review.yml"
-if grep -Fq "secrets.AUTHOR_MERGE_TOKEN" "$agent_review_workflow"; then
+if ! grep -Fq 'secrets.AUTHOR_MERGE_TOKEN' "$agent_review_workflow" \
+  && ! grep -Fq 'secrets.MERGE_QUEUE_POLICY_TOKEN' "$agent_review_workflow" \
+  && ! grep -Fq 'secrets.MERGE_QUEUE_SOURCE_TOKEN' "$agent_review_workflow"; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review auto-merge references AUTHOR_MERGE_TOKEN"
+  echo "  PASS: candidate-controlled agent-review receives no author, queue-policy, or queue-source credential"
 else
   fail=$((fail + 1))
-  echo "  FAIL: agent-review auto-merge must use an author-owned AUTHOR_MERGE_TOKEN, not the reviewer assignment token" >&2
+  echo "  FAIL: candidate-controlled agent-review must not reference author, queue-policy, or queue-source credentials" >&2
 fi
 
 shared_author_retraction_block=$(awk '
@@ -828,32 +834,47 @@ if grep -Fq 'if: ${{ always() }}' <<<"$shared_author_retraction_block" \
   && grep -Fq 'id: retract_shared_author' <<<"$shared_author_retraction_block" \
   && grep -Fq 'SHARED_AUTHOR_DISARM_REQUIRED_V1' <<<"$shared_author_retraction_block" \
   && grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$shared_author_retraction_block" \
+  && ! grep -Fq 'MERGE_QUEUE_POLICY_TOKEN' <<<"$shared_author_retraction_block" \
+  && ! grep -Fq 'MERGE_QUEUE_SOURCE_TOKEN' <<<"$shared_author_retraction_block" \
   && grep -Fq 'AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}' <<<"$shared_author_retraction_block" \
-  && ! grep -Fq 'AUTHOR_MERGE_TOKEN' <<<"$shared_author_retraction_block" \
+  && ! grep -Fq 'scripts/workflow/merge-queue-arm-policy.sh' <<<"$shared_author_retraction_block" \
   && grep -Fq -- '--json author,autoMergeRequest,url' <<<"$shared_author_retraction_block" \
-  && grep -Fq -- '--disable-auto' <<<"$shared_author_retraction_block" \
+  && ! grep -Fq -- '--disable-auto' <<<"$shared_author_retraction_block" \
+  && gh_source_lacks_direct_literal_pr_mutation <<<"$shared_author_retraction_block" \
   && ! grep -Eq -- '--(auto|merge|rebase|squash)([[:space:]]|$)' <<<"$shared_author_retraction_block" \
-  && grep -Fq 'Durable auto-merge retraction did not persist.' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'Refusing to mutate or classify a durable arm from a candidate-controlled workflow.' <<<"$shared_author_retraction_block" \
   && grep -Fq 'auto_arm_allowed=false' <<<"$shared_author_retraction_block" \
   && grep -Fq 'auto_arm_allowed=true' <<<"$shared_author_retraction_block" \
-  && grep -Fq 'retracting the existing unclassified auto-merge request fail closed' <<<"$shared_author_retraction_block" \
+  && grep -Fq 'blocking on the existing unclassified auto-merge request fail closed' <<<"$shared_author_retraction_block" \
   && ! grep -Fq 'approval-merge-continuation.sh' <<<"$shared_author_retraction_block" \
   && [ -n "$retraction_no_arm_line" ] \
   && [ -n "$retraction_identity_line" ] \
   && [ "$retraction_no_arm_line" -lt "$retraction_identity_line" ]; then
   pass=$((pass + 1))
-  echo "  PASS: approval invalidation uses an atomic workflow-token retraction that is optional-token and first-rollout safe (#1094)"
+  echo "  PASS: candidate-controlled approval invalidation receives no queue-admin/source PAT and fails closed without writes (#1058/#1094)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: block-self-approval must read arm state first, avoid AUTHOR_MERGE_TOKEN/helper skew, and only disable + verify shared-author auto-merge (#1094)" >&2
+  echo "  FAIL: block-self-approval must read arm state, accept only queue proof, and never issue a native merge/disable mutation (#1058/#1094)" >&2
 fi
 
-if grep -Fq "AUTHOR_MERGE_TOKEN resolves to" "$agent_review_workflow"; then
+read_only_admission_block=$(awk '
+  /- name: Enter read-only readiness lane/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Enter read-only readiness lane/ {exit}
+  in_block {print}
+' "$agent_review_workflow")
+if grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$read_only_admission_block" \
+  && grep -Fq 'EXPECTED_AUTHOR: ${{ needs.load-config.outputs.author_identity }}' <<<"$read_only_admission_block" \
+  && grep -Fq 'if [ -z "$expected_author" ]; then' <<<"$read_only_admission_block" \
+  && grep -Fq 'Read-only readiness admitted for governing author: $expected_author' <<<"$read_only_admission_block" \
+  && grep -Fq 'echo "enabled=true" >> "$GITHUB_OUTPUT"' <<<"$read_only_admission_block" \
+  && ! grep -Fq 'secrets.' <<<"$read_only_admission_block" \
+  && ! grep -Fq 'approval-merge-continuation.sh' <<<"$read_only_admission_block" \
+  && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' <<<"$read_only_admission_block"; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review verifies AUTHOR_MERGE_TOKEN identity before merge"
+  echo "  PASS: candidate readiness admits only the base-policy author under github.token without a privileged continuation"
 else
   fail=$((fail + 1))
-  echo "  FAIL: agent-review must verify AUTHOR_MERGE_TOKEN resolves to author_identity before merge" >&2
+  echo "  FAIL: candidate readiness must bind the governing author to a read-only github.token lane" >&2
 fi
 
 # The semantics below are the contract for reading `author_identity` out of a
@@ -886,22 +907,24 @@ assert_eq "author_identity parser strips double quotes" "nathanjohnpayne" "$got"
 got=$(printf '%s\n' "author_identity: 'nathanjohnpayne'" | awk "$author_identity_awk")
 assert_eq "author_identity parser strips single quotes" "nathanjohnpayne" "$got"
 
-enable_auto_merge_block=$(awk '
-  /- name: Report stable readiness/ {in_block=1}
-  in_block && /- name:/ && $0 !~ /- name: Report stable readiness/ {exit}
+stable_readiness_block=$(awk '
+  /- name: Report stable read-only readiness/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Report stable read-only readiness/ {exit}
   in_block {print}
 ' "$agent_review_workflow")
-if grep -Fq 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$enable_auto_merge_block" \
-  && grep -Fq 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$enable_auto_merge_block" \
-  && grep -Fq 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$enable_auto_merge_block"; then
+if grep -Fq "steps.author_merge_token.outputs.enabled == 'true' && steps.check_readiness.outputs.ready == 'true'" <<<"$stable_readiness_block" \
+  && grep -Fq 'Read-only readiness is green. The trusted Agent Review Pipeline workflow_run continuation will re-evaluate every mutable gate.' <<<"$stable_readiness_block" \
+  && ! grep -Fq 'secrets.' <<<"$stable_readiness_block" \
+  && ! grep -Fq 'approval-merge-continuation.sh' <<<"$stable_readiness_block" \
+  && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' <<<"$stable_readiness_block"; then
   pass=$((pass + 1))
-  echo "  PASS: stable-readiness step binds normal continuation explicitly to AUTHOR_MERGE_TOKEN"
+  echo "  PASS: stable-readiness step only reports readiness and delegates every mutable gate to the trusted continuation"
 else
   fail=$((fail + 1))
-  echo "  FAIL: stable-readiness step must bind the normal helper pass explicitly to AUTHOR_MERGE_TOKEN" >&2
+  echo "  FAIL: stable-readiness step must stay read-only and delegate privileged continuation" >&2
 fi
 
-if grep -Fq 'REVIEWER_ASSIGNMENT_TOKEN' <<<"$enable_auto_merge_block"; then
+if grep -Fq 'REVIEWER_ASSIGNMENT_TOKEN' <<<"$stable_readiness_block"; then
   fail=$((fail + 1))
   echo "  FAIL: stable-readiness step still references REVIEWER_ASSIGNMENT_TOKEN" >&2
 else
@@ -909,7 +932,7 @@ else
   echo "  PASS: stable-readiness step does not use REVIEWER_ASSIGNMENT_TOKEN"
 fi
 
-if grep -Fq '|| true' <<<"$enable_auto_merge_block"; then
+if grep -Fq '|| true' <<<"$stable_readiness_block"; then
   fail=$((fail + 1))
   echo "  FAIL: stable-readiness step must not swallow continuation failures with '|| true'" >&2
 else
@@ -1033,35 +1056,81 @@ else
   echo "  FAIL: auto-merge-on-approval must not invoke coderabbit-wait.sh or hold a runner for CodeRabbit after a registered approval (#1062)" >&2
 fi
 
-# 2e-bis. This privileged job sources merge helpers, so its checkout must be
-# pinned to the trusted default branch. Its early label read uses the shared
-# predicate when available and preserves the exact bootstrap predicate for the
-# first atomic consumer rollout, when the trusted default branch necessarily
-# lacks the helper. The final label read and all other safety gates belong to
-# the shared approval continuation for both immediate and deferred paths.
-immediate_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block" | head -1 | cut -d: -f1 || true)
-immediate_continue_line=$(grep -nF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$auto_merge_job_block" | head -1 | cut -d: -f1 || true)
+# 2e-bis. Candidate-controlled readiness stays read-only even though its logic
+# is pinned to trusted default-branch scripts. Its early label read preserves
+# the exact bootstrap predicate for the first atomic consumer rollout, while
+# every privileged continuation lives in pull_request_target/workflow_run.
+auto_merge_permissions=$(yq -r '.jobs."auto-merge-on-approval".permissions | to_entries | sort_by(.key) | .[] | "\(.key): \(.value)"' "$agent_review_workflow")
+expected_auto_merge_permissions=$'actions: read\nchecks: read\ncontents: read\nissues: read\npull-requests: read\nstatuses: read'
+auto_merge_job_flat=$(tr '\n' ' ' <<<"$auto_merge_job_block")
+candidate_workflow_root_env() {
+  yq -r '.env // {}' "$1"
+}
+candidate_job_uses_secrets_context() {
+  grep -Eiq '(^|[^[:alnum:]_])secrets([^[:alnum:]_]|$)' <<<"$1"
+}
+candidate_job_uses_privileged_credential() {
+  grep -Eiq 'AUTHOR_MERGE_TOKEN|MERGE_QUEUE_POLICY_TOKEN|MERGE_QUEUE_SOURCE_TOKEN' <<<"$1"
+}
+candidate_readiness_uses_privileged_credential() {
+  candidate_job_uses_privileged_credential "$1" || candidate_job_uses_privileged_credential "$2"
+}
+candidate_readiness_uses_secrets_context() {
+  candidate_job_uses_secrets_context "$1" || candidate_job_uses_secrets_context "$2"
+}
+agent_review_root_env=$(candidate_workflow_root_env "$agent_review_workflow")
+inherited_env_fixture=$(
+  candidate_workflow_root_env - <<'YAML'
+name: inherited-secret-fixture
+env:
+  INHERITED: ${{ SeCrEtS ["REVIEWER_ASSIGNMENT_TOKEN"] }}
+jobs: {}
+YAML
+)
+privileged_credential_surface=$(sed \
+  -e '/^[[:space:]]*id:[[:space:]]*author_merge_token[[:space:]]*$/d' \
+  -e 's/steps\.author_merge_token/steps.read_only_readiness/g' \
+  <<<"$auto_merge_job_block")
+if candidate_job_uses_secrets_context '${{ toJSON(secrets) }}' \
+  && candidate_job_uses_secrets_context '${{ secrets ["REVIEWER_ASSIGNMENT_TOKEN"] }}' \
+  && candidate_job_uses_secrets_context '${{ Secrets.REVIEWER_ASSIGNMENT_TOKEN }}' \
+  && candidate_job_uses_secrets_context '${{ toJSON(SeCrEtS) }}' \
+  && candidate_readiness_uses_secrets_context '' "$inherited_env_fixture" \
+  && candidate_job_uses_privileged_credential 'aUtHoR_mErGe_ToKeN'; then
+  pass=$((pass + 1))
+  echo "  PASS: candidate readiness rejects standalone secrets context, including inherited root env"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: candidate readiness secrets-context matcher must reject toJSON, whitespace-indexed, and inherited root-env forms" >&2
+fi
+candidate_rest_merge=0
+if grep -Eq 'pulls/[^[:space:]]+/merge' <<<"$auto_merge_job_flat" \
+  && grep -Eiq '(^|[[:space:]])(-X|--method)(=|[[:space:]])*(PUT|POST)([[:space:]]|$)' <<<"$auto_merge_job_flat"; then
+  candidate_rest_merge=1
+fi
 if grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'source scripts/lib/blocking-labels.sh' <<<"$auto_merge_job_block")" -eq 1 ] \
   && grep -Fq 'if [ -f scripts/lib/blocking-labels.sh ]; then' <<<"$auto_merge_job_block" \
   && grep -Fq 'mergepath_blocking_labels_csv()' <<<"$auto_merge_job_block" \
   && [ "$(grep -c 'blocking_labels=$(printf' <<<"$auto_merge_job_block")" -eq 1 ] \
-  && grep -Fq 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$auto_merge_job_block" \
-  && grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' <<<"$auto_merge_job_block" \
-  && grep -Fq 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$auto_merge_job_block" \
-  && grep -Fq 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$auto_merge_job_block" \
-  && grep -Fq 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$auto_merge_job_block" \
-  && grep -Fq 'MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$auto_merge_job_block" \
-  && grep -Fq 'if [ "$protective_rc" -eq 0 ]; then' <<<"$auto_merge_job_block" \
-  && [ -n "$immediate_protect_line" ] && [ -n "$immediate_continue_line" ] \
-  && [ "$immediate_protect_line" -lt "$immediate_continue_line" ] \
-  && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$auto_merge_job_block" \
+  && [ "$auto_merge_permissions" = "$expected_auto_merge_permissions" ] \
+  && ! grep -Eq '^[[:space:]]+[a-z-]+:[[:space:]]+write([[:space:]]|$)' <<<"$auto_merge_job_block" \
+  && ! candidate_readiness_uses_secrets_context "$auto_merge_job_block" "$agent_review_root_env" \
+  && ! grep -Eq '^[[:space:]]+secrets:[[:space:]]*inherit([[:space:]]|$)' <<<"$auto_merge_job_block" \
+  && ! candidate_readiness_uses_privileged_credential "$privileged_credential_surface" "$agent_review_root_env" \
+  && ! grep -Fq 'approval-merge-continuation.sh' <<<"$auto_merge_job_block" \
+  && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' <<<"$auto_merge_job_flat" \
+  && ! grep -Eq 'addPullRequestToMergeQueue|enqueuePullRequest|dequeuePullRequest|enablePullRequestAutoMerge|disablePullRequestAutoMerge|mergePullRequest' <<<"$auto_merge_job_flat" \
+  && [ "$candidate_rest_merge" -eq 0 ] \
+  && grep -Fq 'Enter read-only readiness lane' <<<"$auto_merge_job_block" \
+  && grep -Fq 'Probe current-head check readiness once' <<<"$auto_merge_job_block" \
+  && grep -Fq 'Report stable read-only readiness' <<<"$auto_merge_job_block" \
   && grep -Fq "needs.block-self-approval.outputs.auto_arm_allowed == 'true'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: privileged approval readiness uses ordered workflow-token protection then author-token continuation from the trusted helper"
+  echo "  PASS: candidate readiness is trusted-source, read-only, credential-free, and delegates every mutation"
 else
   fail=$((fail + 1))
-  echo "  FAIL: approval readiness must pin its checkout, preserve first-rollout skew, and run ordered workflow-token protection before author-token continuation" >&2
+  echo "  FAIL: candidate readiness must pin trusted logic, preserve bootstrap skew, and expose no write permission, privileged credential, or mutation" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that
@@ -1434,7 +1503,7 @@ if grep -Fq "Probe current-head check readiness once" .github/workflows/agent-re
    grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" .github/workflows/agent-review.yml && \
    grep -Fq 'select((.name // .context // "") == $name)' .github/workflows/agent-review.yml && \
    grep -Fq 'steps.check_readiness.outputs.ready == '\''true'\''' .github/workflows/agent-review.yml && \
-   grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' .github/workflows/agent-review.yml && \
+   ! grep -Fq 'approval-merge-continuation.sh' .github/workflows/agent-review.yml && \
    grep -Fq 'approval-merge-continuation.sh' .github/workflows/auto-clear-blocking-labels.yml && \
    grep -Fq 'post_independence=$(read_pr)' scripts/workflow/approval-merge-continuation.sh && \
    grep -Fq 'durable auto-merge remains disabled pending the #1058 merge-group boundary' scripts/workflow/approval-merge-continuation.sh && \
@@ -1515,7 +1584,7 @@ fi
 if workflow_guard_block_contains_exit \
   "$dependabot_workflow" \
   'if [ -z "${AUTHOR_MERGE_TOKEN:-}" ]; then' \
-  'AUTHOR_MERGE_TOKEN is empty'; then
+  'AUTHOR_MERGE_TOKEN is unavailable from the merge-queue-policy environment'; then
   pass=$((pass + 1))
   echo "  PASS: Dependabot auto-merge exits when AUTHOR_MERGE_TOKEN is empty"
 else

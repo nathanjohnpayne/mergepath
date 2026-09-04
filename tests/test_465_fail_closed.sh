@@ -50,8 +50,12 @@ refute_grep "D1: merge-clearance no longer silently skips on unresolved head SHA
 # Defect 2: no unconditional immediate-merge fallback when --auto is unavailable.
 refute_grep "D2: agent-review dropped the '|| gh pr merge --squash' immediate fallback" \
   "$W/agent-review.yml" '--auto "$PR_URL" || gh pr merge --squash "$PR_URL"'
-assert_grep "D2: agent-review delegates merge arming to the shared continuation" \
+refute_grep "D2: candidate-controlled agent-review cannot invoke the privileged continuation" \
   "$W/agent-review.yml" 'scripts/workflow/approval-merge-continuation.sh'
+assert_grep "D2: candidate-controlled agent-review reports read-only readiness" \
+  "$W/agent-review.yml" 'Report stable read-only readiness'
+assert_grep "D2: candidate-controlled readiness names the trusted continuation boundary" \
+  "$W/agent-review.yml" 'The trusted Agent Review Pipeline workflow_run continuation will re-evaluate every mutable gate.'
 refute_grep "D2: shared continuation does not recreate a head-only durable arm" \
   scripts/workflow/approval-merge-continuation.sh '--squash --auto'
 assert_grep "D2: shared continuation fails closed when durable-arm cleanup cannot be verified" \

@@ -390,6 +390,20 @@ paths:
   - path: scripts/lib/gh-api-array.sh
     type: canonical
     consumers: all
+  # #1058 native merge-queue boundary. These side-effect-free libraries are
+  # hard-sourced by the propagated queue workflows and the existing
+  # approval-cleanup lane, so they must travel atomically with those callers.
+  - path: scripts/lib/merge-queue-protection.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/review-policy-scalar.sh"
+  - path: scripts/lib/merge-queue-authorization.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/gh-api-array.sh"
   # The Phase 2.5 invocation decision (#1084). Reads coderabbit.invoke and,
   # for `complex-changes`, defers to scripts/phase-4b-classifier.sh rather
   # than inventing a second notion of "complex" that would drift from the
@@ -797,9 +811,11 @@ paths:
     # Declaring the contract libs here keeps the two halves inseparable.
     requires:
       - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"         # gh-token-resolver.sh executes it before any write
       - "scripts/lib/gh-command-classifier.sh"  # shared guard/wrapper prefix vocabulary
       - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
+      - "scripts/lib/reviewers-helpers.sh"  # pr-body-contract.sh hard-sources it
   # Single entrypoint for PR-body validation (#1132). The required
   # Self-Review gate, gh-as-author.sh and local checks all route through it, so
   # the contract has one tested implementation rather than a shell copy and a
@@ -1538,6 +1554,66 @@ paths:
       - "scripts/codex-review-check.sh"
       - "scripts/review-feedback-accounting.sh"
       - "scripts/resolve-pr-threads.sh"
+  # #1058 exact-head author authorization is recorded by trusted default-
+  # branch code. The merge-group bridge lives only in a separately protected
+  # organization policy repository; propagating a runnable target copy would
+  # put its YAML back under the synthetic merge-group commit's control.
+  - path: .github/workflows/merge-queue-authorization.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/record-merge-queue-authorization.sh"
+      - "scripts/lib/merge-queue-protection.sh"
+      - "scripts/lib/merge-queue-authorization.sh"
+      - "scripts/lib/blocking-labels.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/review-policy-scalar.sh"
+      - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"
+      - "scripts/lib/gh-command-classifier.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
+  # The source-pinned required workflow sends its one private-nonce request to
+  # this target-base responder. Propagate the workflow and recorder in the
+  # same wave: either one without the other makes every queue handshake fail
+  # closed after dispatch. The workflow's direct requires intentionally repeat
+  # the recorder's runtime closure because path-scoped propagation validates
+  # only the changed entry's own edges, not transitive requires.
+  - path: .github/workflows/merge-queue-final-audit.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/record-merge-queue-final-audit.sh"
+      - "scripts/lib/merge-queue-authorization.sh"
+      - "scripts/lib/merge-queue-protection.sh"
+      - "scripts/lib/blocking-labels.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/review-policy-scalar.sh"
+      - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"
+      - "scripts/lib/gh-command-classifier.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
+  - path: scripts/workflow/record-merge-queue-final-audit.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/merge-queue-authorization.sh"
+      - "scripts/lib/merge-queue-protection.sh"
+      - "scripts/lib/blocking-labels.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/review-policy-scalar.sh"
+      - "scripts/gh-as-author.sh"
+      - "scripts/lib/gh-token-resolver.sh"
+      - "scripts/identity-check.sh"
+      - "scripts/lib/gh-command-classifier.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
   - path: scripts/workflow/report-approval-continuation-failures.sh
     type: canonical
     consumers: all
@@ -1712,6 +1788,7 @@ paths:
     requires:
       - "scripts/lib/ci-check-modes.sh"          # shared --check/--self-test selector (#1062)
       - "scripts/lib/blocking-labels.sh"         # check_workflow_parsers shared exact-label predicate (#1062)
+      - "scripts/lib/gh-command-classifier.sh"   # shared native/API mutation guard (#1058)
       - "tests/test_repo_lint_optimization.sh"   # check_repo_lint_optimization
       - "tests/test_check_doc_ownership.sh"      # check_doc_ownership
       - "tests/test_gh_pr_guard.sh"            # check_gh_as_author
@@ -1791,6 +1868,11 @@ paths:
       - "scripts/resolve-pr-threads.sh"        # check_resolve_pr_threads
       - "scripts/lib/ensure-yq.sh"             # check_resolve_pr_threads CI-only yq bootstrap (#616)
       - "scripts/gh-as-author.sh"              # check_gh_as_author (transitive)
+      - "scripts/lib/gh-token-resolver.sh"     # gh-as-author.sh runtime closure (#1058)
+      - "scripts/identity-check.sh"            # gh-token-resolver.sh runtime closure (#1058)
+      - "scripts/lib/pr-body-contract.sh"      # gh-as-author.sh runtime closure (#1058)
+      - "scripts/lib/pr-body-contract.mjs"     # gh-as-author.sh runtime closure (#1058)
+      - "scripts/lib/reviewers-helpers.sh"     # pr-body-contract.sh runtime closure (#1058)
       - "scripts/gh-as-reviewer.sh"            # check_gh_as_author (transitive)
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
       - "scripts/coderabbit-automerge-rate-limit-gate.sh"  # tests/test_coderabbit_automerge_rate_limit_gate.sh runs it (#489/#521)
@@ -1843,6 +1925,14 @@ paths:
       - "scripts/lib/gh-api-array.sh"             # #1094, final live review pagination
       - "scripts/lib/reviewers-helpers.sh"        # #1094, governing reviewer allow-list
       - "scripts/lib/blocking-labels.sh"          # #1094, final mutable label recheck
+      - "scripts/lib/merge-queue-protection.sh"   # #1058, safe native-arm preservation + bridge topology
+      - "scripts/lib/merge-queue-authorization.sh" # #1058, exact-head queue authorization history
+      - "scripts/gh-as-author.sh"                 # #1058, final target-audit marker write
+      - "scripts/lib/gh-token-resolver.sh"         # gh-as-author.sh runtime closure (#1058)
+      - "scripts/identity-check.sh"                # gh-token-resolver.sh runtime closure (#1058)
+      - "scripts/lib/gh-command-classifier.sh"     # gh-as-author.sh runtime closure (#1058)
+      - "scripts/lib/pr-body-contract.sh"          # gh-as-author.sh runtime closure (#1058)
+      - "scripts/lib/pr-body-contract.mjs"         # gh-as-author.sh runtime closure (#1058)
       - "scripts/self-approval-detector.cjs"      # #1094, canonical final independence decision
       - "scripts/merge-clearance-gate.sh"         # #1094, shared Phase 4 requiredness query
 

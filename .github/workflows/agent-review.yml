@@ -1857,8 +1857,8 @@ jobs:
         if: ${{ always() }}
         env:
           # SHARED_AUTHOR_DISARM_REQUIRED_V1. The marker name is retained for
-          # rollout compatibility. This workflow write only disables
-          # auto-merge; it can never arm or merge the PR.
+          # rollout compatibility. The step is now read-only: GitHub offers no
+          # conditional disable, so an unproven arm blocks without mutation.
           GH_TOKEN: ${{ github.token }}
           AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}
           SNAPSHOT_CURRENT: ${{ steps.check.outputs.snapshot_current }}
@@ -1905,38 +1905,26 @@ jobs:
               echo "Governing author_identity is unavailable, but no auto-merge request exists; readiness continuation remains disabled."
               exit 0
             fi
-            echo "::warning::Governing author_identity is unavailable; retracting the existing unclassified auto-merge request fail closed."
+            echo "::warning::Governing author_identity is unavailable; blocking on the existing unclassified auto-merge request fail closed."
           elif [ "$native_author" != "$AUTHOR_IDENTITY" ]; then
             echo "auto_arm_allowed=true" >> "$GITHUB_OUTPUT"
             if jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
               echo "Native non-shared PR is eligible for readiness validation and has no durable arm."
               exit 0
             fi
-            echo "::warning::Native non-shared PR has a head-only durable arm; retracting it pending the #1058 merge-group boundary."
+            echo "::warning::Native non-shared PR has a head-only durable arm; blocking pending the #1058 merge-group boundary."
           elif jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
             echo "Shared-author PR has no auto-merge request to retract; readiness continuation remains disabled."
             exit 0
           fi
-          pr_url=$(jq -r '.url' <<<"$pr_state")
-          if ! gh pr merge "$pr_url" --repo "$REPO" --disable-auto; then # NO_BARE_GH_WRITE_EXEMPT: github.token is write-scoped and disable-only cleanup intentionally applies across head drift; tuple readback fails closed
-            echo "::error::Could not retract durable auto-merge."
-            exit 1
-          fi
-          if ! readback=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
-            --json author,autoMergeRequest,headRefOid); then
-            echo "::error::Could not verify durable auto-merge retraction."
-            exit 1
-          fi
-          if ! jq -e --arg author "$native_author" --arg head "$live_head" '
-            (.author.login == $author) and
-            (.headRefOid == $head) and
-            has("autoMergeRequest") and
-            .autoMergeRequest == null
-          ' >/dev/null 2>&1 <<<"$readback"; then
-            echo "::error::Durable auto-merge retraction did not persist."
-            exit 1
-          fi
-          echo "Durable or unclassified auto-merge retraction verified."
+          # #1058: native disable has no exact-action precondition. This
+          # pull_request workflow is candidate-controlled for same-repository
+          # PRs, so it must never receive the target-admin or source-read PATs
+          # needed to prove the queue topology. Trusted-default-branch
+          # pull_request_target/workflow_run/scheduled paths perform that proof.
+          # Here every armed state remains untouched and blocks fail closed.
+          echo "::error::Refusing to mutate or classify a durable arm from a candidate-controlled workflow."
+          exit 1
 
   # ──────────────────────────────────────────────
   # Job 6: Approval readiness (legacy job id retained for consumers)
@@ -1946,32 +1934,32 @@ jobs:
   # Triage also recomputes Phase 4 applicability for synchronize, reopen,
   # approved-review, and blocking-label-removal events. The guard exports a
   # live eligible-approval result and the legacy-named auto_arm_allowed output;
-  # the latter now means only that a native non-shared PR may enter readiness
-  # validation. It is never permission to arm, enqueue, or merge.
+  # the latter now means only that a native non-shared PR may enter read-only
+  # readiness validation. It is never permission to arm, enqueue, or merge.
   #
   # Three event shapes re-evaluate readiness (#495, #620): a newly submitted
   # approval; synchronize or reopen with a surviving registered latest-state
   # approval; and removal of a blocking label after clearance settles. Edited
   # events only invalidate mutable approval provenance and deliberately do not
   # enter this job. Every path rechecks the governing author identity, labels,
-  # required checks, clearance, accounting, conversations, and live approval
-  # independence. The trusted continuation then retracts every durable arm and
-  # reports stable unarmed readiness. #1058 owns the future merge-group boundary.
+  # and required checks after consuming the upstream live-approval result.
+  # This candidate-controlled job can only report readiness; the trusted
+  # continuation rechecks clearance, accounting, conversations, approval
+  # independence, and mutable PR state before reporting stable unarmed
+  # readiness. The separate #1058 merge-group authorization owns admission.
   auto-merge-on-approval:
     needs: [load-config, detect-disagreement, block-self-approval, triage]
     # Job-level override (replaces rather than merges with the workflow
-    # default above): adds security-events: read, required for
-    # scripts/workflow/approval-merge-continuation.sh's
-    # review-feedback-accounting.sh call, which reads code-scanning/alerts
-    # to grade a github-advanced-security[bot] finding's severity (#1101).
-    # That call runs under ACCOUNTING_GH_TOKEN (this job's GITHUB_TOKEN,
-    # not the AUTHOR_MERGE_TOKEN this job otherwise uses) specifically so
-    # this permissions block can reach it — CodeRabbit on PR #1106.
+    # default above): candidate-controlled review jobs are strictly read-only.
+    # Privileged author and queue-policy credentials live behind the trusted-
+    # main environment and are consumed only by trusted continuation workflows.
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      security-events: read
+      actions: read
+      checks: read
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: read
     if: >
       always() &&
       ((github.event_name == 'pull_request_review' &&
@@ -1992,8 +1980,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # This job holds the author readiness token. Its helper scripts must
-          # come from the trusted default branch, never the PR checkout.
+          # Readiness logic still comes from the trusted default branch, never
+          # the PR checkout, even though this job receives only read access.
           ref: ${{ github.event.repository.default_branch }}
           # Explicit-token API path only, no authenticated git, so don't
           # leave the checkout token in .git/config (#548 / Codex #550).
@@ -2020,7 +2008,7 @@ jobs:
           github.event_name == 'pull_request' ||
           github.event_name == 'pull_request_review'
         env:
-          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           REPO: ${{ github.repository }}
@@ -2058,7 +2046,7 @@ jobs:
           fi
           # --- synchronize / reopened readiness path (existing API check) ---
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::Neither CI_ACTOR_TOKEN nor REVIEWER_ASSIGNMENT_TOKEN is configured; cannot confirm an existing approval for the synchronize readiness retry."
+            echo "::notice::The read-only workflow token is unavailable; cannot confirm an existing approval for the synchronize readiness retry."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -2112,88 +2100,38 @@ jobs:
           echo "Existing non-author approval found ($APPROVER); proceeding with the synchronize readiness retry."
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Check author readiness token
+      - name: Enter read-only readiness lane
         id: author_merge_token
-        # Skip privileged readiness when the require_approval gate set
-        # proceed=false — either the synchronize retry found no existing
-        # registered-reviewer approval, or (since #544) the direct
-        # pull_request_review approver was not a registered reviewer. The
-        # `!= 'false'` test still lets a genuine registered-reviewer approval
-        # (proceed=true) and any other event shape (empty) through.
+        # Candidate-controlled pull_request and pull_request_review workflows
+        # must never materialize the author credential. This job can report
+        # read-only readiness with github.token; trusted pull_request_target,
+        # workflow_run, and schedule jobs own every privileged continuation.
         if: steps.require_approval.outputs.proceed != 'false'
         env:
-          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
-          # The author identity this token must resolve to comes from the
-          # policy that GOVERNS this PR — the base branch's — which
-          # `load-config` already resolved through
-          # scripts/workflow/resolve_base_policy.sh (#788).
-          #
-          # This step used to parse `author_identity` out of THIS job's
-          # checkout, and that checkout is not pinned: on a `pull_request`
-          # event checkout materializes `refs/pull/N/merge`, so the
-          # expected identity came from the PR's OWN copy of the policy, and on
-          # a `pull_request_review` event it came from a different file again.
-          # Two answers for one PR, neither of them the governing one — the
-          # remaining half of #788, on the surface that issue named explicitly
-          # (the approval-readiness gate). A PR must not be able to nominate
-          # the identity that is allowed to merge it by editing policy on its
-          # own branch, and on a non-default base the default-branch copy is
-          # equally wrong in the other direction: it can name an identity the
-          # base policy does not permit to merge there.
+          GH_TOKEN: ${{ github.token }}
           EXPECTED_AUTHOR: ${{ needs.load-config.outputs.author_identity }}
-          # Diagnostic only, and an env var rather than a `${{ }}` expansion
-          # inside the shell below: a ref name interpolated into script text is
-          # the workflow-injection shape this repo keeps out of `run:` blocks.
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; privileged readiness evaluation is disabled. Merge manually as the author identity."
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # FAIL CLOSED on an unproven identity. An empty value means
-          # `load-config` could not resolve the governing policy (or was itself
-          # skipped — this job runs under `always()`), and it is exactly the
-          # fail-closed output scripts/workflow/load_review_config.sh emits in
-          # that case. Defaulting to a hard-coded login here would evaluate
-          # under an identity no policy we can read has authorized, which is the
-          # substitution #768/#769/#788 exist to prevent. Disabling readiness
-          # path costs nothing that is not already lost: the same fail-closed
-          # load-config emits `reviewers=[]`, so the readiness-admission gate
-          # above has already rejected every approver. The author merges manually, and
-          # the required merge-clearance gate is untouched either way.
           expected_author="${EXPECTED_AUTHOR:-}"
           if [ -z "$expected_author" ]; then
-            echo "::notice::The review policy governing this PR's base branch yielded no author_identity, so privileged readiness evaluation is disabled (#788). Merge manually as the author identity."
+            echo "::notice::The governing base policy yielded no author identity; read-only readiness is disabled."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          if ! actual_author=$(gh api user --jq .login); then
-            echo "::error::AUTHOR_MERGE_TOKEN could not authenticate to GitHub. Refusing privileged readiness evaluation."
-            exit 1
-          fi
-          if [ "$actual_author" != "$expected_author" ]; then
-            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$actual_author', expected '$expected_author' (author_identity in the policy governing base branch '${BASE_REF:-?}'). Refusing privileged readiness evaluation."
-            exit 1
-          fi
-
-          echo "Author readiness token verified for identity: $actual_author"
+          echo "Read-only readiness admitted for governing author: $expected_author"
           echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Re-verify blocking labels before readiness probe
         if: steps.author_merge_token.outputs.enabled == 'true'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           # Guard against the TOCTOU race between the trigger-time label
-          # snapshot and the actual merge. The job's top-level `if:` expression
-          # evaluates labels from the `pull_request_review` event payload at
-          # the moment GitHub Actions dispatched the event. Two things can
-          # make that snapshot stale by the time we reach the merge step:
+          # snapshot and this readiness report. The job's top-level `if:`
+          # expression evaluates labels from the `pull_request_review` event
+          # payload at the moment GitHub Actions dispatched the event. Two
+          # things can make that snapshot stale by the time this probe runs:
           #
           #   1. Eventual consistency. If a label is applied milliseconds
           #      before the review event fires, the event payload can still
@@ -2208,12 +2146,13 @@ jobs:
           #      The trigger payload does not reflect that later mutation.
           #
           # Re-fetch the authoritative label state from the GitHub API before
-          # entering the readiness probe. The shared continuation repeats this
-          # check, along with feedback-accounting and conversation-resolution
-          # gates before reporting readiness. Abort if any blocking
-          # label is now present. Also check `policy-violation`, which is applied by the
-          # block-self-approval job earlier in this same workflow run (and
-          # again, the `if:` at job start wouldn't have seen it).
+          # entering the readiness probe. The trusted continuation repeats this
+          # check alongside feedback-accounting and conversation-resolution
+          # gates before it reports stable unarmed readiness. Abort if any
+          # blocking label is now present. Also check `policy-violation`, which
+          # is applied by the block-self-approval job earlier in this same
+          # workflow run (and, again, the `if:` at job start wouldn't have seen
+          # it).
           # The trusted default-branch checkout intentionally lags an atomic
           # workflow+helper rollout by one merge. Source the shared helper when
           # it is present; retain the exact bootstrap predicate for the first
@@ -2243,7 +2182,7 @@ jobs:
         if: steps.author_merge_token.outputs.enabled == 'true'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           REQUIRED_HEAD_CHECK_NAME: lint
         run: |
@@ -2663,7 +2602,7 @@ jobs:
               # three-dot diff this fetch provides -- an earlier commit
               # already in the PR could have touched a matching path
               # while the CURRENT push does not, wrongly keeping this
-              # "unfiltered" and blocking auto-merge forever waiting for a
+              # "unfiltered" and blocking readiness forever while waiting for a
               # check that will never report. The three-dot PR-wide diff
               # genuinely matches what GitHub documents for the
               # pull_request event, so only that event gets the real
@@ -2772,7 +2711,7 @@ jobs:
             # too (the same 403 recurs every time), not just ones with an
             # actual annex. Do not enforce; warn loudly so the token's scope
             # gets fixed instead.
-            echo "::warning::repo_lint_local.yml probe at $sha got HTTP 403 (AUTHOR_MERGE_TOKEN likely lacks Contents: read) — NOT failing closed, since a persistent 403 would otherwise force an unresolvable synthetic check on every future PR too. Grant the token Contents: read to restore annex enforcement (#655)."
+            echo "::warning::repo_lint_local.yml probe at $sha got HTTP 403 (workflow token likely lacks Contents: read) — NOT failing closed, since a persistent 403 would otherwise force an unresolvable synthetic check on every future PR too. Grant the workflow Contents: read to restore annex enforcement (#655)."
           else
             # An indeterminate but plausibly-transient read failure (rate
             # limit, 5xx, network) must not be treated the same as a
@@ -3194,47 +3133,7 @@ jobs:
             echo "::notice::Required current-head checks are still pending. Approval readiness is recorded; the completed-workflow continuation will re-evaluate without holding this runner."
             exit 0
 
-      - name: Report stable readiness
+      - name: Report stable read-only readiness
         if: steps.author_merge_token.outputs.enabled == 'true' && steps.check_readiness.outputs.ready == 'true'
         run: |
-          # Route the immediate-green case through the same trusted final
-          # safety path used by later workflow completions and the sweep. It
-          # revalidates the live head, approval, checks, blocking labels,
-          # feedback accounting, and unresolved conversations before reporting
-          # readiness. The helper leaves the PR unarmed pending #1058.
-          if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then
-            echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout approval event."
-            exit 0
-          fi
-          if ! grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' scripts/workflow/approval-merge-continuation.sh; then
-            echo "::notice::Trusted approval continuation predates governing-policy protective retraction; skipping this first-rollout approval event."
-            exit 0
-          fi
-          set +e
-          GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
-            --retract-unsafe-only "$PR_NUMBER" "$REPO"
-          protective_rc=$?
-          if [ "$protective_rc" -eq 0 ]; then
-            GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
-              MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
-              bash scripts/workflow/approval-merge-continuation.sh "$PR_NUMBER" "$REPO"
-            rc=$?
-          else
-            rc=$protective_rc
-          fi
-          set -e
-          case "$rc" in
-            0) ;;
-            4) echo "::notice::PR #$PR_NUMBER is no longer merge-ready; a later completion event or sweep will re-evaluate it." ;;
-            *) echo "::error::Approval continuation hit infrastructure/config error rc=$rc on PR #$PR_NUMBER."; exit "$rc" ;;
-          esac
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
-          WORKFLOW_TOKEN: ${{ github.token }}
-          # Routes ONLY the review-feedback-accounting.sh call inside
-          # approval-merge-continuation.sh through GITHUB_TOKEN instead of the
-          # author token used by normal continuation (#1101, CodeRabbit on PR
-          # #1106). See this job's permissions block for why.
-          ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "::notice::Read-only readiness is green. The trusted Agent Review Pipeline workflow_run continuation will re-evaluate every mutable gate."

@@ -41,6 +41,8 @@ spec_test_map:
   repo_lint_execution:
     - tests/test_repo_lint_optimization.sh
     - tests/test_655_repo_lint_local_observed.sh
+  merge_group_required_checks:
+    - scripts/ci/check_merge_group_required_checks
   # The publisher's fence and fixtures live in the merge-clearance suite
   # (Test 25) rather than a file of their own: a new tests/ file wired into
   # a propagated scripts/ci/check_* needs its own manifest requires: entry,

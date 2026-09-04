@@ -385,6 +385,9 @@ jobs:
       - name: check_workflow_parsers
         run: ./scripts/ci/check_workflow_parsers || { rc=$?; if [ ! -f scripts/ci/check_workflow_parsers ]; then echo "check_workflow_parsers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      - name: check_merge_group_required_checks
+        run: ./scripts/ci/check_merge_group_required_checks || { rc=$?; if [ ! -f scripts/ci/check_merge_group_required_checks ]; then echo "check_merge_group_required_checks not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_session_finalization
         run: ./scripts/ci/check_session_finalization || { rc=$?; if [ ! -f scripts/ci/check_session_finalization ]; then echo "check_session_finalization not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
@@ -627,7 +630,7 @@ jobs:
         run: ./scripts/ci/check_eslint_config_policy || { rc=$?; if [ ! -f scripts/ci/check_eslint_config_policy ]; then echo "check_eslint_config_policy not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_auto_clear_workflow
-        run: ./scripts/ci/check_auto_clear_workflow || { rc=$?; if [ ! -f scripts/ci/check_auto_clear_workflow ]; then echo "check_auto_clear_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+        run: ./scripts/ci/check_auto_clear_workflow --check || { rc=$?; if [ ! -f scripts/ci/check_auto_clear_workflow ]; then echo "check_auto_clear_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_pr_audit_codex_clearance
         run: ./scripts/ci/check_pr_audit_codex_clearance || { rc=$?; if [ ! -f scripts/ci/check_pr_audit_codex_clearance ]; then echo "check_pr_audit_codex_clearance not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
@@ -881,6 +884,10 @@ jobs:
       - name: check_phase_4b_accounting --self-test
         if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_phase_4b_accounting'))
         run: ./scripts/ci/check_phase_4b_accounting --self-test || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_accounting ]; then echo "check_phase_4b_accounting not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_auto_clear_workflow --self-test
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_auto_clear_workflow'))
+        run: ./scripts/ci/check_auto_clear_workflow --self-test || { rc=$?; if [ ! -f scripts/ci/check_auto_clear_workflow ]; then echo "check_auto_clear_workflow not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_repo_lint_consumer_safety
         if: matrix.safety == 'consumer'

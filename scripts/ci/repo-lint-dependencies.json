@@ -27,6 +27,18 @@
       "scripts/lib/ci-check-modes.sh",
       "tests/test_check_doc_ownership.sh"
     ],
+    "check_auto_clear_workflow": [
+      ".github/workflows/agent-review.yml",
+      ".github/workflows/auto-clear-blocking-labels.yml",
+      "scripts/lib/ci-check-modes.sh",
+      "scripts/lib/blocking-labels.sh",
+      "scripts/lib/gh-command-classifier.sh",
+      "scripts/lib/gh-retry-helpers.sh",
+      "scripts/lib/review-policy-scalar.sh",
+      "scripts/workflow/approval-merge-continuation.sh",
+      "scripts/workflow/report-approval-continuation-failures.sh",
+      "tests/test_approval_merge_continuation.sh"
+    ],
     "check_coderabbit_wait": [
       "scripts/lib/ci-check-modes.sh",
       "scripts/coderabbit-wait.sh",
@@ -62,6 +74,7 @@
       "scripts/workflow/approval-independence-check.sh",
       "scripts/workflow/approval-merge-continuation.sh",
       "scripts/lib/gh-api-array.sh",
+      "scripts/lib/gh-command-classifier.sh",
       "scripts/lib/reviewers-helpers.sh",
       "scripts/lib/review-policy-scalar.sh",
       "scripts/lib/blocking-labels.sh",
