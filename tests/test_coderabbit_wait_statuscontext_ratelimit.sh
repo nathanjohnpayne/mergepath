@@ -2042,6 +2042,34 @@ No actionable comments."
   crw_head_summary_holds_blocking_marker "$h40" "$RATE_LIMIT_MARKER
 $head_marked" || bad="$bad twocomment-ratelimited-summary"
 
+  # The CONSOLIDATED all-surfaces helper (#1178 round 9). Four rounds found the
+  # same defect at four doors because each exit knew a different subset of
+  # surfaces; this asks once, over all of them. The surface added last is the
+  # review OBJECT's own body — which the spec calls the PRIMARY summary surface
+  # and which none of the per-site blocks ever read.
+  #
+  # `comments` is passed empty so these assertions isolate the notice and
+  # review-body surfaces without needing a marker-selected summary fixture.
+  local _rob_clean _rob_marked
+  _rob_clean="No actionable comments."
+  _rob_marked="**Actionable comments posted: 1**
+
+_🟠 Major_ something is wrong here."
+  # review body carries the finding, notice is bare → escalate
+  crw_rate_limit_hides_a_finding "$h40" "$plain_limit" "$_rob_marked" "" \
+    || bad="$bad review-object-body-not-scanned"
+  # both clean → bare refusal
+  _rc=0; crw_rate_limit_hides_a_finding "$h40" "$plain_limit" "$_rob_clean" "" || _rc=$?
+  [ "$_rc" = 1 ] || bad="$bad clean-surfaces-not-bare=$_rc"
+  # notice itself masked → escalate even with a clean review body
+  crw_rate_limit_hides_a_finding "$h40" "$masked_limit" "$_rob_clean" "" \
+    || bad="$bad notice-surface-lost-in-consolidation"
+  # reader failure anywhere → rc 3, never a verdict
+  crw_unfenced_body() { return 3; }
+  _rc=0; crw_rate_limit_hides_a_finding "$h40" "$masked_limit" "$_rob_clean" "" || _rc=$?
+  [ "$_rc" = 3 ] || bad="$bad consolidated-rc3=$_rc"
+  eval "$_real_reader"
+
   if [ -z "$bad" ]; then
     pass "1178: a masked rate-limit stanza AND the two-comment head-pinned-summary shape both escalate; bare refusals, hygiene tables, prior heads and non-rate_limit classes do not"
   else

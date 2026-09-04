@@ -1891,6 +1891,71 @@ crw_head_summary_holds_blocking_marker() {
   esac
   summary_blocking_marker_present "$sbody"
 }
+# crw_rate_limit_hides_a_finding <head> <notice_body> <review_body> <issue_comments>
+# ONE question, asked once, over EVERY surface a blocking finding can occupy
+# while `observed` reads `rate_limit` (#1178, Codex rounds 3/5/7/9).
+#
+# The four rounds that produced this each found the same defect behind a
+# different door, because "has CodeRabbit published a finding?" was being
+# re-asked inline at each exit of a control flow with many exits, and each exit
+# knew about a different subset of surfaces:
+#
+#   round 3  the notice body itself, one comment carrying refusal AND finding
+#   round 5  a head-pinned marker-selected summary, with a later bare notice
+#   round 7  the same, reached via the review-object branch
+#   round 9  the review OBJECT's own body, and the anchor-free open-window path
+#
+# Consolidating is the fix rather than a fifth inline block: a new exit added
+# later calls this and inherits every surface, instead of inheriting whichever
+# subset its author remembered. specs/coderabbit_review_sensing.md names the
+# review object as the PRIMARY summary surface, which is precisely the one the
+# per-site blocks kept omitting.
+#
+# Returns 0 (a finding is hidden behind this refusal — escalate), 1 (a bare
+# refusal), or 3 (a surface could not be read, so nothing was decided). On 0 it
+# sets CRW_HIDDEN_FINDING_JSON to the evidence for the caller to emit.
+#
+# Every surface is head-anchored or head-owned: the notice body and the
+# marker-selected summary through crw_head_summary_holds_blocking_marker's
+# summary_names_head conjunct, and the review body through the object's own
+# GitHub-owned commit_id, which the caller has already matched. A prior head's
+# summary therefore cannot hold this head hostage on any of them.
+crw_rate_limit_hides_a_finding() {
+  local head="${1:-}" notice="${2:-}" review_body="${3:-}" comments="${4:-}"
+  local rc=0 sel sbody
+  CRW_HIDDEN_FINDING_JSON=""
+
+  # 1. the notice body itself
+  if [ -n "$notice" ]; then
+    rc=0; crw_rate_limit_masks_blocking_marker rate_limit "$notice" "$head" || rc=$?
+    [ "$rc" = 3 ] && return 3
+    [ "$rc" = 0 ] && return 0
+  fi
+
+  # 2. the head-pinned review OBJECT's own body. The spec calls this the primary
+  #    summary surface, and it is scoped by the object's commit_id rather than by
+  #    a commits range, so summary_names_head does not apply and must not be
+  #    required — the caller only reaches here with a head-matched object.
+  if [ -n "$review_body" ]; then
+    rc=0; summary_blocking_marker_present "$review_body" || rc=$?
+    [ "$rc" = 0 ] && return 0
+  fi
+
+  # 3. the marker-selected PR-level summary, head-anchored
+  if [ -n "$comments" ]; then
+    sel=$(crw_select_summary_comment "$comments" "$BOT_LOGIN" "$SUMMARY_MARKER") || return 3
+    if [ -n "$sel" ]; then
+      sbody=$(printf '%s' "$sel" | base64 --decode | jq -r '.body')
+      rc=0; crw_head_summary_holds_blocking_marker "$head" "$sbody" || rc=$?
+      [ "$rc" = 3 ] && return 3
+      if [ "$rc" = 0 ]; then
+        CRW_HIDDEN_FINDING_JSON=$(printf '%s' "$sel" | base64 --decode | jq -r '.json')
+        return 0
+      fi
+    fi
+  fi
+  return 1
+}
 # END coderabbit_rate_limit_marker_guard
 
 # Scan the PR-level `issues/{pr}/comments` endpoint for the latest
@@ -4180,33 +4245,22 @@ probe_emit_verdict() {
       # summary re-read to the no-review-object branch only; without it here,
       # the same masked finding emits a bare `rate_limit` that Phase 4b may open
       # on. Same predicate, same head anchoring, same rc-3 handling.
+      # ONE call, EVERY surface (#1178 rounds 3/5/7/9). This site previously
+      # carried two inline blocks that between them knew about the notice body
+      # and the marker-selected summary, but not the review OBJECT's own body —
+      # which the spec calls the primary summary surface. rbody is passed here.
       if [ "$PROBE_OBSERVED" = "rate_limit" ]; then
-        rl_summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
-          || die 3 "failed to select the CodeRabbit summary comment for the review-object rate-limit re-read"
-        if [ -n "$rl_summary" ]; then
-          rl_sbody=$(printf '%s' "$rl_summary" | base64 --decode | jq -r '.body')
-          rl_rc=0
-          crw_head_summary_holds_blocking_marker "$HEAD_SHA" "$rl_sbody" || rl_rc=$?
-          [ "$rl_rc" = 3 ] && die 3 "the fence reader failed while checking whether the head-pinned summary on $HEAD_SHA holds a blocking marker — an unread summary must never read as another head's (#1178)"
-          if [ "$rl_rc" = 0 ]; then
-            rl_sjson=$(printf '%s' "$rl_summary" | base64 --decode | jq -r '.json')
-            PROBE_CONTEXT_STATE=""
-            PROBE_CONTEXT_UPDATED_AT=""
-            PROBE_OBSERVED="terminal"
-            log "probe: bare rate-limit notice above a review object on $HEAD_SHA, but the head-pinned summary holds a summary-only blocking marker — escalating (#1178)"
-            emit_json_and_exit "findings" 2 "$rl_sjson" 1
-          fi
+        rl_rc=0
+        crw_rate_limit_hides_a_finding "$HEAD_SHA" "$newest_body" \
+          "$(printf '%s' "$review" | jq -r '.body_excerpt // ""')" "$issue_comments" || rl_rc=$?
+        [ "$rl_rc" = 3 ] && die 3 "a surface could not be read while checking whether the rate-limit state on $HEAD_SHA hides a blocking finding — an unread surface is not evidence that it carries none (#1178)"
+        if [ "$rl_rc" = 0 ]; then
+          PROBE_CONTEXT_STATE=""
+          PROBE_CONTEXT_UPDATED_AT=""
+          PROBE_OBSERVED="terminal"
+          log "probe: the rate-limit state on $HEAD_SHA hides a blocking finding — escalating rather than reporting a bare refusal (#1178)"
+          emit_json_and_exit "findings" 2 "${CRW_HIDDEN_FINDING_JSON:-$review}" 1
         fi
-      fi
-      rl_rc=0
-      crw_rate_limit_masks_blocking_marker "$PROBE_OBSERVED" "$newest_body" "$HEAD_SHA" || rl_rc=$?
-      [ "$rl_rc" = 3 ] && die 3 "the fence reader failed while checking whether the rate-limit body on $HEAD_SHA masks a blocking marker — an unread body is not evidence that it carries none (#1178)"
-      if [ "$rl_rc" = 0 ]; then
-        PROBE_CONTEXT_STATE=""
-        PROBE_CONTEXT_UPDATED_AT=""
-        PROBE_OBSERVED="terminal"
-        log "probe: rate-limit notice on $HEAD_SHA is carried by a body that ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
-        emit_json_and_exit "findings" 2 "$review" 1
       fi
       log "probe: review object on $HEAD_SHA but no terminal summary yet (newest=${newest_class:-none}, context_state=${PROBE_CONTEXT_STATE:-unsampled}, context_updated_at=${PROBE_CONTEXT_UPDATED_AT:-unsampled})"
       probe_not_yet "$PROBE_OBSERVED" "$review"
@@ -4272,38 +4326,16 @@ probe_emit_verdict() {
     newest_class=$(classify_comment "$body")
     # #1178 guard, site 2 of 3 — the no-review-object triage. Same body, same
     # masking, same answer as site 1.
-    rl_rc=0
-    crw_rate_limit_masks_blocking_marker "$newest_class" "$body" "$HEAD_SHA" || rl_rc=$?
-    [ "$rl_rc" = 3 ] && die 3 "the fence reader failed while checking whether the rate-limit notice on $HEAD_SHA masks a blocking marker — an unread body is not evidence that it carries none (#1178)"
-    if [ "$rl_rc" = 0 ]; then
-      PROBE_OBSERVED="terminal"
-      log "probe: rate-limit notice on $HEAD_SHA is carried by a body that ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
-      emit_json_and_exit "findings" 2 "$latest_json" 1
-    fi
-    # ...and the TWO-COMMENT shape of the same hazard (Codex P1 round 3 on
-    # #1179). The check above reads only the newest notice, and the
-    # marker-selected summary scan that would catch a separate head-pinned
-    # finding lives BELOW the `probe_not_yet` in the case statement that
-    # follows — so on a no-review-object incremental review whose summary holds
-    # a summary-only finding, a later bare rate-limit notice short-circuits past
-    # it entirely. Scoped to rate_limit for the same reason as its sibling:
-    # in_progress and paused still map to not-yet at the barrier and keep
-    # reaching a human through the bounded wait, so only rate_limit can convert
-    # this into a clearance.
+    # ONE call, EVERY surface (#1178 rounds 3/5/7/9) — replaces the two inline
+    # blocks this site used to carry.
     if [ "$newest_class" = "rate_limit" ]; then
-      rl_summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
-        || die 3 "failed to select the CodeRabbit summary comment for the rate-limit masking re-read"
-      if [ -n "$rl_summary" ]; then
-        rl_sbody=$(printf '%s' "$rl_summary" | base64 --decode | jq -r '.body')
-        rl_rc=0
-        crw_head_summary_holds_blocking_marker "$HEAD_SHA" "$rl_sbody" || rl_rc=$?
-        [ "$rl_rc" = 3 ] && die 3 "the fence reader failed while checking whether the head-pinned summary on $HEAD_SHA holds a blocking marker — an unread summary must never read as another head's (#1178)"
-        if [ "$rl_rc" = 0 ]; then
-          rl_sjson=$(printf '%s' "$rl_summary" | base64 --decode | jq -r '.json')
-          PROBE_OBSERVED="terminal"
-          log "probe: bare rate-limit notice on $HEAD_SHA, but the head-pinned summary holds a summary-only blocking marker — escalating rather than reporting a refusal that would open the barrier (#1178)"
-          emit_json_and_exit "findings" 2 "$rl_sjson" 1
-        fi
+      rl_rc=0
+      crw_rate_limit_hides_a_finding "$HEAD_SHA" "$body" "" "$issue_comments" || rl_rc=$?
+      [ "$rl_rc" = 3 ] && die 3 "a surface could not be read while checking whether the rate-limit notice on $HEAD_SHA hides a blocking finding — an unread surface is not evidence that it carries none (#1178)"
+      if [ "$rl_rc" = 0 ]; then
+        PROBE_OBSERVED="terminal"
+        log "probe: the rate-limit notice on $HEAD_SHA hides a blocking finding — escalating (#1178)"
+        emit_json_and_exit "findings" 2 "${CRW_HIDDEN_FINDING_JSON:-$latest_json}" 1
       fi
     fi
     case "$newest_class" in
@@ -4431,15 +4463,22 @@ probe_emit_verdict() {
     # #1178 guard, site 3 of 3 — the open-window path. This notice is selected
     # anchor-free by newest_bot_comment_from_issue_comments, so it can be the
     # summarize comment itself; the masking is the same and so is the answer.
+    # ONE call, EVERY surface (#1178 round 9). This anchor-free open-window path
+    # scanned only `active_notice`, so a current-head summary carrying both a
+    # blocking marker and a rate-limit stanza that had AGED BELOW HEAD_ANCHOR —
+    # while its published window stayed open — was never examined: the anchored
+    # guards had already been skipped, and this one did not look. The
+    # marker-selected summary read inside the helper is anchor-free by
+    # construction, which is exactly what this path needs.
     rl_rc=0
-    crw_rate_limit_masks_blocking_marker rate_limit \
-      "$(printf '%s' "$active_notice" | jq -r '.body // ""')" "$HEAD_SHA" || rl_rc=$?
-    [ "$rl_rc" = 3 ] && die 3 "the fence reader failed while checking whether the open-window rate-limit notice on $HEAD_SHA masks a blocking marker — an unread body is not evidence that it carries none (#1178)"
+    crw_rate_limit_hides_a_finding "$HEAD_SHA" \
+      "$(printf '%s' "$active_notice" | jq -r '.body // ""')" "" "$issue_comments" || rl_rc=$?
+    [ "$rl_rc" = 3 ] && die 3 "a surface could not be read while checking whether the open-window rate-limit notice on $HEAD_SHA hides a blocking finding — an unread surface is not evidence that it carries none (#1178)"
     if [ "$rl_rc" = 0 ]; then
       PROBE_OBSERVED="terminal"
-      log "probe: the open-window rate-limit notice on $HEAD_SHA ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
+      log "probe: the open-window rate-limit state on $HEAD_SHA hides a blocking finding — escalating (#1178)"
       emit_json_and_exit "findings" 2 \
-        "$(printf '%s' "$active_notice" | jq -c '{id, created_at, updated_at, fresh_at, endpoint, body_excerpt: ((.body // "")[0:200])}')" 1
+        "${CRW_HIDDEN_FINDING_JSON:-$(printf '%s' "$active_notice" | jq -c '{id, created_at, updated_at, fresh_at, endpoint, body_excerpt: ((.body // "")[0:200])}')}" 1
     fi
     log "probe: no head evidence, and CodeRabbit's newest comment is a rate-limit notice with $(printf '%s' "$active_notice" | jq -r '.rate_limit_remaining_seconds // "unknown"')s left on its published window (#891/#912)"
     probe_not_yet "rate_limit" \
