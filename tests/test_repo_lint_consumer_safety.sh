@@ -127,6 +127,14 @@ CONSUMER_ABSENT=(
   "plans/mergepath-playground.md"
   "tests/test_mergepath_playground.sh"
   "specs/bootstrap_consumer_identity.md"
+  # Same class: a spec for the bootstrap wizard, which is hub-only
+  # machinery no consumer runs. It must be absent here for the same
+  # concrete reason as the line above — CONSUMER_ABSENT already strips
+  # `scripts/bootstrap` and `tests/test_bootstrap*`, so a consumer that
+  # kept the spec would carry a spec_test_map entry pointing at a test
+  # file it does not have, and check_spec_test_alignment would exit 1 on
+  # every consumer's repo-lint (#1182).
+  "specs/bootstrap_label_seeding.md"
   "bugs/screenshots"
   ".github/screenshots"
   # #774 fleet branch-protection audit — the two paths NO consumer has.
