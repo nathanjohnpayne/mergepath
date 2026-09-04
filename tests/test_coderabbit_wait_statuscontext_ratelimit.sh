@@ -1758,6 +1758,89 @@ test_status_description_predicate_unit
 test_status_context_verdict_carries_status_created_at
 test_open_window_inside_freshness_defers_to_arbitration
 test_failed_summary_read_does_not_clear
+test_rate_limit_masking_a_blocking_marker_unit() {
+  # #1178. classify_comment is marker-FIRST (#593), so a summarize comment that
+  # CodeRabbit edited to add a rate-limit stanza reads `rate_limit` and
+  # short-circuits the probe before summary_blocking_marker_present is ever
+  # reached. That was harmless while every rate_limit read as not-yet at the
+  # Phase 4b barrier — the budget expired and a human read the summary. #1178
+  # lets a rate-limited head OPEN that barrier on a Codex report alone, so a
+  # bare refusal now has to mean there is nothing unread behind it.
+  #
+  # Pure predicate, so assert it directly: extract the guard block plus the two
+  # blocks it depends on, exactly as test_851_summary_helpers_unit does.
+  local snip="$WORKDIR/rl-guard.sh" helpers="$WORKDIR/rl-summary-helpers.sh"
+  local classifier="$WORKDIR/rl-classifier.sh" bad=""
+  local plain_limit masked_limit table_only plain_review
+  eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END|RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER|SUMMARY_MARKER)=' \
+    "$ROOT/scripts/coderabbit-wait.sh")"
+  awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$helpers"
+  awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$classifier"
+  awk '/^# BEGIN coderabbit_rate_limit_marker_guard$/{f=1;next} /^# END coderabbit_rate_limit_marker_guard$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  [ -s "$snip" ] || { fail "1178: the coderabbit_rate_limit_marker_guard sentinel block is missing or empty"; return; }
+  # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+  . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # shellcheck disable=SC1090
+  . "$helpers"
+  # shellcheck disable=SC1090
+  . "$classifier"
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  plain_limit="$SUMMARY_MARKER
+$RATE_LIMIT_MARKER
+Review rate limited."
+  masked_limit="$SUMMARY_MARKER
+$RATE_LIMIT_MARKER
+Review rate limited.
+
+_⚠️ Potential issue_
+
+The barrier can open over this."
+  # A hygiene ⚠️ inside the pre-merge check table is NOT a finding — the
+  # predicate this guard delegates to already strips that block, and 3 of 5
+  # sampled summaries carry one. Asserted here so the guard cannot be
+  # "fixed" later by reaching past summary_blocking_marker_present.
+  table_only="$SUMMARY_MARKER
+$RATE_LIMIT_MARKER
+Review rate limited.
+$CR_PRE_MERGE_BLOCK_START
+| Docstring Coverage | ⚠️ Warning | 38% |
+$CR_PRE_MERGE_BLOCK_END"
+  plain_review="$SUMMARY_MARKER
+_⚠️ Potential issue_"
+
+  # The premise: both bodies classify rate_limit, marker-first, so the class
+  # alone cannot tell them apart. Without this the rest proves nothing.
+  [ "$(classify_comment "$plain_limit")" = rate_limit ]  || bad="$bad premise-plain"
+  [ "$(classify_comment "$masked_limit")" = rate_limit ] || bad="$bad premise-masked"
+  [ "$(classify_comment "$table_only")" = rate_limit ]   || bad="$bad premise-table"
+
+  # A masked marker is caught; a bare refusal is not disturbed.
+  crw_rate_limit_masks_blocking_marker rate_limit "$masked_limit" || bad="$bad masked-missed"
+  ! crw_rate_limit_masks_blocking_marker rate_limit "$plain_limit" || bad="$bad plain-flagged"
+  ! crw_rate_limit_masks_blocking_marker rate_limit "$table_only"  || bad="$bad table-flagged"
+  ! crw_rate_limit_masks_blocking_marker rate_limit ""             || bad="$bad empty-flagged"
+
+  # Scoped to rate_limit ONLY. paused and in_progress still map to not-yet at
+  # the barrier, so they keep reaching a human through the bounded wait;
+  # widening the guard would turn their self-clearing holds into immediate
+  # escalations for a hazard they do not have.
+  ! crw_rate_limit_masks_blocking_marker paused "$masked_limit"      || bad="$bad paused-scoped"
+  ! crw_rate_limit_masks_blocking_marker in_progress "$masked_limit" || bad="$bad inprogress-scoped"
+  ! crw_rate_limit_masks_blocking_marker review "$plain_review"      || bad="$bad review-scoped"
+  ! crw_rate_limit_masks_blocking_marker "" "$masked_limit"          || bad="$bad empty-class-scoped"
+
+  if [ -z "$bad" ]; then
+    pass "1178: a rate-limit stanza masking a summary-only blocking marker is caught, a bare refusal is not, and the guard stays scoped to rate_limit"
+  else
+    fail "1178: rate-limit marker guard wrong:$bad"
+  fi
+}
+
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
 test_later_notice_does_not_mask_head_summary
@@ -1783,6 +1866,7 @@ test_quoted_range_in_chat_reply_does_not_veto_current_head
 test_large_rate_limit_body_still_suppresses_status
 test_emit_json_invariant_unit
 test_fetch_wrapper_contracts_unit
+test_rate_limit_masking_a_blocking_marker_unit
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"

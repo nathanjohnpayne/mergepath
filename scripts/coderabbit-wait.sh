@@ -63,7 +63,9 @@
 #              summary-only class: rc 0 means REPORTED, NOT clean; rc 2 is
 #              the one verdict probe mode makes (a blocking marker carried
 #              solely by the PR-level summary, which no required gate
-#              dispositions, reported as `potential_issue_count: 1`); rc 7
+#              dispositions, reported as `potential_issue_count: 1` — since
+#              #1178 including one masked by a rate-limit stanza written
+#              into that same body); rc 7
 #              means not yet. Equivalent to
 #              CODERABBIT_WAIT_PROBE=1. Use the polling mode for a verdict.
 #
@@ -317,7 +319,13 @@
 #       exists, or the summarize comment is head-pinned and completed (#851).
 #       It does NOT mean "no findings". rc 2 is the ONE verdict probe mode
 #       makes, unchanged in meaning (#535): a blocking marker carried solely
-#       by the PR-level summary, which no required gate dispositions.
+#       by the PR-level summary, which no required gate dispositions. Since
+#       #1178 it also fires when that marker is MASKED by a rate-limit stanza
+#       CodeRabbit wrote into the same comment: classify_comment is
+#       marker-first, so such a body reads `rate_limit` and short-circuits
+#       before the summary scan — and `observed: "rate_limit"` is a class the
+#       Phase 4b barrier may now OPEN on, so a bare refusal has to mean there
+#       is nothing unread sitting behind it.
 #       `potential_issue_count` carries no verdict on a probe run: 0 on every
 #       probe terminal except that rc-2 one, where it is the literal 1 of the
 #       summary-carried finding rather than a scan of the inline surface. Use
@@ -1644,6 +1652,48 @@ summary_blocking_marker_present() {
   crw_scan_has_blocking_marker "$scan"
 }
 # END coderabbit_summary_helpers
+
+# BEGIN coderabbit_rate_limit_marker_guard
+# crw_rate_limit_masks_blocking_marker <observed> <body>
+# True when a `rate_limit` classification was read off a body that ALSO carries
+# a summary-level blocking marker (#1178).
+#
+# classify_comment is marker-FIRST by design (#593): the rate-limit marker is
+# tested before every other predicate so a notice is recognized whatever
+# CodeRabbit calls it this month. That ordering is right for naming the state
+# and wrong for deciding what to do about it, because CodeRabbit writes its
+# rate-limit stanza INTO the one summarize comment it edits in place — the same
+# comment that carries the #535 summary-only finding. So one body can say both
+# "I refused" and "here is a blocking finding", and the refusal wins the
+# classification and short-circuits the scan before summary_blocking_marker_present
+# is ever reached.
+#
+# That was survivable while every rate_limit read as not-yet downstream: the
+# Phase 4b barrier held its budget and escalated, and a human read the summary.
+# #1178 lets a rate-limited head OPEN that barrier on a Codex report alone, and
+# nothing else disposition s the summary-only class — coderabbit-severity-gate.sh
+# reads only pulls/{pr}/comments, the conversation gate covers threads, and the
+# Phase 4b adapter sees only the diff. Without this guard the approval posts
+# over a finding no required gate ever read (Codex P1 on #1179).
+#
+# Scoped to `rate_limit` deliberately. `paused` and `in_progress` still map to
+# not-yet at the barrier, so they keep ending at a human by way of the bounded
+# wait; rate_limit is the only class #1178 gave an opening path, so it is the
+# only one whose masking now changes an outcome. Widening this to the other two
+# would convert their self-clearing waits into immediate escalations for a
+# hazard they do not have.
+#
+# The response is rc 2, not a suppression: this is the same move #535 made for
+# the head-pinned summary, and the head-pinned-summary path's own comment
+# records the reasoning — that state "previously returned rc 7, held the
+# barrier full budget and escalated with the WRONG reason; now it escalates
+# immediately with the right one". Same class, same answer, third site.
+crw_rate_limit_masks_blocking_marker() {
+  [ "${1:-}" = "rate_limit" ] || return 1
+  [ -n "${2:-}" ] || return 1
+  summary_blocking_marker_present "$2"
+}
+# END coderabbit_rate_limit_marker_guard
 
 # Scan the PR-level `issues/{pr}/comments` endpoint for the latest
 # CodeRabbit comment on or after HEAD_ANCHOR. CodeRabbit edits its
@@ -3805,6 +3855,11 @@ probe_emit_verdict() {
     while :; do
       summary_body=""
       newest_class=""
+      # The body newest_class was read from, retained for the #1178 guard
+      # below. Only the CLASS used to leave this loop, which is enough to name
+      # the observed state but not to tell a bare refusal from a refusal
+      # written into a summary that still carries a blocking marker.
+      newest_body=""
       cand=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg at "$review_at" '
         [ .[] | select(.user.login == $bot)
           | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
@@ -3824,7 +3879,7 @@ probe_emit_verdict() {
         # still names the observed state, and no narration hides a published
         # summary deeper in the scan.
         [ "$class" = "status_probe" ] && continue
-        [ -n "$newest_class" ] || newest_class="$class"
+        if [ -z "$newest_class" ]; then newest_class="$class"; newest_body="$body"; fi
         if [ "$class" = "review" ]; then summary_body="$body"; break; fi
       done <<< "$cand"
 
@@ -3912,6 +3967,19 @@ probe_emit_verdict() {
           fi
         fi
       fi
+      # #1178 guard, site 1 of 3. A refusal written into a summary that still
+      # carries a blocking marker must escalate, not report a bare refusal the
+      # barrier may now open on. Sited BEFORE probe_not_yet for the same reason
+      # the head-pinned-summary escalation sits before its own not-yet gate: a
+      # blocking marker is a signal a human must see, and downgrading it costs
+      # an escalation nothing else makes.
+      if crw_rate_limit_masks_blocking_marker "$PROBE_OBSERVED" "$newest_body"; then
+        PROBE_CONTEXT_STATE=""
+        PROBE_CONTEXT_UPDATED_AT=""
+        PROBE_OBSERVED="terminal"
+        log "probe: rate-limit notice on $HEAD_SHA is carried by a body that ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
+        emit_json_and_exit "findings" 2 "$review" 1
+      fi
       log "probe: review object on $HEAD_SHA but no terminal summary yet (newest=${newest_class:-none}, context_state=${PROBE_CONTEXT_STATE:-unsampled}, context_updated_at=${PROBE_CONTEXT_UPDATED_AT:-unsampled})"
       probe_not_yet "$PROBE_OBSERVED" "$review"
     done
@@ -3974,6 +4042,13 @@ probe_emit_verdict() {
     body=$(printf '%s' "$cand" | base64 --decode | jq -r '.body')
     latest_json=$(printf '%s' "$cand" | base64 --decode | jq -r '.json')
     newest_class=$(classify_comment "$body")
+    # #1178 guard, site 2 of 3 — the no-review-object triage. Same body, same
+    # masking, same answer as site 1.
+    if crw_rate_limit_masks_blocking_marker "$newest_class" "$body"; then
+      PROBE_OBSERVED="terminal"
+      log "probe: rate-limit notice on $HEAD_SHA is carried by a body that ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
+      emit_json_and_exit "findings" 2 "$latest_json" 1
+    fi
     case "$newest_class" in
       in_progress|rate_limit|paused)
         probe_not_yet "$newest_class" "$latest_json"
@@ -4096,6 +4171,16 @@ probe_emit_verdict() {
     die 3 "could not read CodeRabbit's newest comment on $HEAD_SHA while checking for an open rate-limit window — a failed read is not evidence that CodeRabbit has said nothing, so the probe refuses to report on it (#957)"
   fi
   if [ "$active_rc" = "0" ]; then
+    # #1178 guard, site 3 of 3 — the open-window path. This notice is selected
+    # anchor-free by newest_bot_comment_from_issue_comments, so it can be the
+    # summarize comment itself; the masking is the same and so is the answer.
+    if crw_rate_limit_masks_blocking_marker rate_limit \
+         "$(printf '%s' "$active_notice" | jq -r '.body // ""')"; then
+      PROBE_OBSERVED="terminal"
+      log "probe: the open-window rate-limit notice on $HEAD_SHA ALSO holds a summary-only blocking marker — escalating rather than reporting a bare refusal (#1178)"
+      emit_json_and_exit "findings" 2 \
+        "$(printf '%s' "$active_notice" | jq -c '{id, created_at, updated_at, fresh_at, endpoint, body_excerpt: ((.body // "")[0:200])}')" 1
+    fi
     log "probe: no head evidence, and CodeRabbit's newest comment is a rate-limit notice with $(printf '%s' "$active_notice" | jq -r '.rate_limit_remaining_seconds // "unknown"')s left on its published window (#891/#912)"
     probe_not_yet "rate_limit" \
       "$(printf '%s' "$active_notice" | jq -c '{id, created_at, updated_at, fresh_at, endpoint, body_excerpt: ((.body // "")[0:200])}')"

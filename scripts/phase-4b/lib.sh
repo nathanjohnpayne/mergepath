@@ -1268,6 +1268,21 @@ p4b_same_head_barrier() {
           # bounds, it keeps bounding; only the reason it escalates with
           # changes, below.
           #
+          # WHAT MAKES THE OPEN ARM SAFE, and where that safety lives:
+          # `observed: rate_limit` has to mean "refused, with nothing unread
+          # behind the refusal". It does not say that for free. CodeRabbit
+          # writes its rate-limit stanza INTO the summarize comment it edits
+          # in place — the same comment that carries the #535 summary-only
+          # finding — and classify_comment is marker-first, so one body can
+          # say both and the refusal wins the classification. Opening on that
+          # would post an approval over a finding no required gate reads
+          # (Codex P1 on #1179). crw_rate_limit_masks_blocking_marker in
+          # scripts/coderabbit-wait.sh closes it upstream: such a body emits
+          # rc 2, which this classifier already escalates, so a rate_limit
+          # that reaches HERE is a bare refusal. That invariant is the
+          # precondition for this arm — a probe without the guard must not be
+          # paired with it.
+          #
           # Every OTHER cls_cx escalates now, `waived` and `disabled`
           # included: in those states nothing will read this head at all, so
           # opening would post an approval with no external corroboration
