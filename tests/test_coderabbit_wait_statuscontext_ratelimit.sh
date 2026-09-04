@@ -1959,6 +1959,36 @@ _⚠️ Potential issue_"
   crw_rate_limit_masks_blocking_marker rate_limit "$masked_limit" "$h40" \
     || bad="$bad reader-not-restored"
 
+  # The marker scan itself must NOT be tri-state (Codex P1 round 7). Round 6
+  # made summary_blocking_marker_present return 3 and audited only two of its
+  # eight callers; six consume it as a boolean, so a reader failure became a
+  # CLEAN result at three of them. It now falls back to scanning the RAW body —
+  # strictly wider text, so the marker is still found and the answer is still
+  # `true`, which is the fail-closed direction and needs no caller to change.
+  crw_unfenced_body() { return 3; }
+  _rc=0; summary_blocking_marker_present "$masked_limit" || _rc=$?
+  [ "$_rc" = 0 ] || bad="$bad marker-scan-not-boolean-failclosed=$_rc"
+  eval "$_real_reader"
+
+  # Pre-merge delimiters are located in the UNFENCED text (Codex P1 round 7). A
+  # fenced quote of the START delimiter above a genuine finding, with the real
+  # table end below it, used to make the strip span from the quote to that end
+  # and delete the finding in between. The marker here sits between the two, so
+  # a raw-body delimiter scan loses it and this returns false.
+  local rl_quoted_delim
+  rl_quoted_delim="$RATE_LIMIT_MARKER
+\`\`\`
+$CR_PRE_MERGE_BLOCK_START
+\`\`\`
+
+_⚠️ Potential issue_
+
+$CR_PRE_MERGE_BLOCK_START
+| Docstring Coverage | ⚠️ Warning | 38% |
+$CR_PRE_MERGE_BLOCK_END"
+  summary_blocking_marker_present "$rl_quoted_delim" \
+    || bad="$bad quoted-delimiter-stripped-real-finding"
+
   # Scoped to rate_limit ONLY. paused and in_progress still map to not-yet at
   # the barrier, so they keep reaching a human through the bounded wait;
   # widening the guard would turn their self-clearing holds into immediate
