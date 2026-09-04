@@ -464,7 +464,7 @@ bootstrap::_seed_labels() {
     case "$spec" in
       *"|"*"|"*) : ;;
       *)
-        bootstrap::warn "github-infra: label spec '$spec' is malformed (expected name|color|description — both '|' separators required) — skipping"
+        bootstrap::record_warning "github-infra: label spec '$spec' is malformed (expected name|color|description — both '|' separators required) — skipped, label NOT created"
         continue
         ;;
     esac
@@ -481,7 +481,7 @@ bootstrap::_seed_labels() {
     # of edit fail at the entry instead of at the API, and a bad entry
     # must not take the other 18 labels down with it.
     if [ -z "$name" ] || [ -z "$desc" ] || ! printf '%s' "$color" | grep -qE '^[0-9a-fA-F]{6}$'; then
-      bootstrap::warn "github-infra: label spec '$spec' is malformed (expected name|color|description with a 6-digit hex colour) — skipping"
+      bootstrap::record_warning "github-infra: label spec '$spec' is malformed (expected name|color|description with a 6-digit hex colour) — skipped, label NOT created"
       continue
     fi
 
@@ -494,9 +494,15 @@ bootstrap::_seed_labels() {
         --description "$desc" \
         --force \
       || {
-        # Single label failure is non-fatal — log and continue with
-        # the rest. The summary collects the count.
-        bootstrap::warn "github-infra: label '$name' create failed (continuing with remaining labels)"
+        # Single label failure is non-fatal — record and continue with
+        # the rest. This uses record_warning, NOT warn: bootstrap::warn
+        # only writes to stderr, so a failed create scrolled past while
+        # the stage summary still reported the full label count as done
+        # (CodeRabbit, #1182). Recorded warnings surface in the summary,
+        # which is where the operator actually reads the outcome. No key
+        # — several labels can fail independently and a keyed record
+        # would have each one clobber the last.
+        bootstrap::record_warning "github-infra: label '$name' create failed on $full_repo (continuing with remaining labels)"
       }
   done
 }

@@ -277,7 +277,7 @@ By the end of a successful run, the target dir contains:
 And on GitHub:
 
 - Remote repo `nathanjohnpayne/<repo>` with the bootstrap commit pushed to main.
-- 19 canonical labels.
+- Up to 19 canonical labels. An individual `gh label create` failure is non-fatal: the stage records a warning and continues with the remaining labels, so a run can complete with fewer than 19 present. Check the summary's warnings block before assuming the full set landed.
 - Reviewer-identity collaborators invited.
 - `REVIEWER_ASSIGNMENT_TOKEN` repo secret set.
 - `AUTHOR_MERGE_TOKEN` unset by default (the wizard does not provision it). Required wherever Dependabot auto-merge is enabled (#426) — `dependabot-auto-merge.yml` hard-fails without it. Agent Review can use it only for author-identity readiness authentication; non-Dependabot unattended merging remains disabled pending #1058.

@@ -156,6 +156,14 @@ case "$1" in
     esac
     ;;
   label)
+    # $3 is the label name for `gh label create <name> ...`.
+    # GH_SHIM_FAIL_LABEL fails exactly ONE named label so a test can prove
+    # the seed loop continues past it; SHIM_EXIT_LABEL keeps its existing
+    # all-or-nothing meaning for the callers that already use it.
+    if [ -n "${GH_SHIM_FAIL_LABEL:-}" ] && [ "${3:-}" = "$GH_SHIM_FAIL_LABEL" ]; then
+      echo "gh: HTTP 422: Validation Failed (label create $3)" >&2
+      exit 1
+    fi
     exit "${SHIM_EXIT_LABEL:-0}"
     ;;
   api)
@@ -340,6 +348,48 @@ grep -q -- "--description desc|with|pipes --force$" "$GUARD_LOG" \
 [ "$(grep -c '^gh label create ' "$GUARD_LOG")" -eq 2 ] \
   && pass "exactly the 2 well-formed specs were seeded (5 malformed skipped, none fatal)" \
   || fail "expected 2 seeded labels, got $(grep -c '^gh label create ' "$GUARD_LOG"); log: $(cat "$GUARD_LOG")"
+
+# --- assertion 2c: a failed label create is RECORDED, not just warned (#1182) ---
+# bootstrap::warn writes to stderr only. A failed `gh label create` is
+# non-fatal, so under warn the failure scrolled past while the stage
+# summary still reported the full label count as done — the operator had
+# no surviving signal that the set was short. record_warning persists to
+# the warnings sidecar the summary reads. Assert the SIDECAR, because
+# that is the property the summary depends on; asserting stderr would
+# pass just as well under the old broken behaviour.
+LBLFAIL_TARGET="$WORKDIR/label-failure-record"
+rm -rf "$LBLFAIL_TARGET"; mkdir -p "$LBLFAIL_TARGET"
+LBLFAIL_LOG="$WORKDIR/gh-shim-labelfail.log"
+: >"$LBLFAIL_LOG"
+set +e
+lblfail_out=$(PATH="$SHIM_PATH" SHIM_LOG="$LBLFAIL_LOG" GH_SHIM_FAIL_LABEL="flaky-label" bash -c '
+  ROOT="'"$ROOT"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/github-infra.sh"
+  BOOTSTRAP_STATE_FILE="'"$LBLFAIL_TARGET"'/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1
+  BOOTSTRAP_LABELS=(
+    "flaky-label|abcdef|this one fails at the API"
+    "good-label|c2e0c6|this one succeeds"
+  )
+  bootstrap::_seed_labels "nathanjohnpayne/labelfail-repo"
+  echo "SEED_RC=$?"
+' 2>&1)
+set -e
+printf '%s' "$lblfail_out" | grep -q "SEED_RC=0" \
+  && pass "a single label failure stays non-fatal (the stage continues)" \
+  || fail "label failure became fatal; out: $lblfail_out"
+grep -q "^gh label create good-label " "$LBLFAIL_LOG" \
+  && pass "the label after a failing one is still attempted" \
+  || fail "a failing label aborted the remaining seeds; log: $(cat "$LBLFAIL_LOG")"
+grep -q "flaky-label" "$LBLFAIL_TARGET/.bootstrap-state.warnings" 2>/dev/null \
+  && pass "the failed label create is RECORDED in the warnings sidecar the summary reads" \
+  || fail "failed label create left no record for the summary; sidecar: $(cat "$LBLFAIL_TARGET/.bootstrap-state.warnings" 2>/dev/null || echo '<absent>')"
+grep -q "labelfail-repo" "$LBLFAIL_TARGET/.bootstrap-state.warnings" 2>/dev/null \
+  && pass "the record names the repo the label failed on" \
+  || fail "the record does not name the target repo; sidecar: $(cat "$LBLFAIL_TARGET/.bootstrap-state.warnings" 2>/dev/null)"
 
 # --- assertion 3: reviewer collaborator invites ---
 for agent in claude cursor codex; do
