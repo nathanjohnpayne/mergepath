@@ -499,7 +499,7 @@ fi
 # hard-fails on EVERY invocation for that repo. Measured against live gh while
 # fixing PR #1176: `-F name=12345` returns "Could not coerce value 12345 to
 # String"; `-f name=12345` resolves normally.
-if grep -qE '^\s*-F (owner|name|qualifiedName)=' "$LIB"; then
+if grep -qE '^[[:space:]]*-F (owner|name|qualifiedName)=' "$LIB"; then
   fail "a String! GraphQL variable is passed with -F, which coerces numeric and boolean-looking values and breaks those repos outright"
 else
   pass "GraphQL String variables are passed with -f, so numeric/boolean-looking names are not coerced"
