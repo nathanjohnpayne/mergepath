@@ -591,11 +591,16 @@ if [ "$1" = "api" ]; then
   # look, and a stub that quietly stops matching returns an empty result that
   # reads exactly like "no diagnostic on this head".
   endpoint=""
+  patch_target=""
   for a in "$@"; do
     case "$a" in
       */commits/*/check-runs*) endpoint="$a" ;;
+      */check-runs/[0-9]*) patch_target="$a" ;;
     esac
   done
+  if [ -n "$patch_target" ] && [ -n "${GH_STUB_FAIL_PATCH:-}" ]; then
+    exit 22
+  fi
   case "$endpoint" in
     *"/commits/"*"/check-runs"*)
       # Emulates gh: --jq is applied per page, and page 2 exists only when the
@@ -622,9 +627,7 @@ if [ "$1" = "api" ]; then
       fi
       exit 0
       ;;
-    */check-runs/*)
-      exit 0
-      ;;
+
   esac
   exit 0
 fi
@@ -870,6 +873,70 @@ else
   fail=$((fail + 1))
   echo "  FAIL: the watermark write must restore a newer failure it buried, not leave a false green (#1191)" >&2
 fi
+
+# A cleared diagnostic carries the superseded summary verbatim, so the record
+# contains BOTH the current marker and the historical one it preserved. Reading
+# the whole string classifies a full-stage watermark as protective purely
+# because of what it preserved -- history read as current state -- and a later
+# stale full-stage failure then escapes suppression.
+CLEARED_WITH_HISTORY='{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T09:00:00Z","id":81,"output":{"summary":"clean [continuation-stage: full] [continuation-evaluated-at: 1788609600] ok\nSuperseded diagnostic, preserved verbatim:\nboom [continuation-stage: protective] [continuation-evaluated-at: 1788480000] old"}}]}'
+run_report_case "watermark carrying preserved protective history reads as full" no \
+  "$CLEARED_WITH_HISTORY" "7:full:$VERDICT_BEFORE"
+
+# Same record, but evaluated BEFORE the verdict, so the advance path is reached
+# rather than the recency guard correctly leaving a newer record alone.
+OLD_CLEARED_WITH_HISTORY='{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T09:00:00Z","id":82,"output":{"summary":"clean [continuation-stage: full] [continuation-evaluated-at: 1788480000] ok\nSuperseded diagnostic, preserved verbatim:\nboom [continuation-stage: protective] old"}}]}'
+
+# Advancing a watermark must not discard the preserved diagnostic. Losing it
+# undoes the evidence preservation the clear performs, and on a five-minute
+# scheduled sweep it would vanish within minutes of being recorded.
+: > "$clear_tmp/gh.log"
+PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" \
+  GH_STUB_CHECKRUNS="$OLD_CLEARED_WITH_HISTORY" GH_RETRY_ATTEMPTS=1 \
+  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7:abc123:$VERDICT_AFTER:full" >/dev/null 2>&1 || true
+if grep -Fq 'Superseded diagnostic, preserved verbatim' "$clear_tmp/gh.log"; then
+  pass=$((pass + 1))
+  echo "  PASS: advancing a watermark carries preserved diagnostic history forward"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: advancing a watermark discarded the preserved diagnostic history" >&2
+fi
+
+# A clear that could not be written must surface as a failed run, not a green
+# workflow over a diagnostic that is still blocking the merge.
+: > "$clear_tmp/gh.log"
+set +e
+PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_FAIL_PATCH=1 \
+  GH_STUB_CHECKRUNS='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":91,"output":{"summary":"boom [continuation-stage: full] [continuation-evaluated-at: 1788480000] x"}}]}' \
+  GH_RETRY_ATTEMPTS=1 \
+  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7:abc123:$VERDICT_AFTER:full" >/dev/null 2>&1
+clear_fail_rc=$?
+set -e
+if [ "$clear_fail_rc" -ne 0 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: a failed clear write exits non-zero instead of reporting green"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a failed clear write must not exit 0 over a still-blocking diagnostic" >&2
+fi
+
+# The helper must name the head its GATES evaluated, not a later drift read.
+if grep -qF 'EVALUATED_HEAD is deliberately NOT advanced to $final_head' "$CONTINUATION_HELPER" \
+   && [ "$(grep -cF 'EVALUATED_HEAD="$final_head"' "$CONTINUATION_HELPER")" -eq 0 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: the helper reports the gated head, not a post-gate drift read (#1190)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a post-gate read must not overwrite the evaluated head (#1190)" >&2
+fi
+
+# Two invocations can start in the same second and receive identical epochs.
+# The two comparisons must agree on that tie: when they disagreed, clear refused
+# to clear a same-second failure while report declined to suppress it, so the
+# head stayed red with neither side willing to resolve it.
+SAME_SECOND_FAILURE='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":95,"output":{"summary":"boom [continuation-stage: full] [continuation-evaluated-at: 1788609600] x"}}]}'
+run_clear_case "same-second failure is resolved, not deadlocked" yes \
+  "$SAME_SECOND_FAILURE" "" "7:abc123:$VERDICT_AFTER:full" 95
 
 # Round-trip: the marker the FAILURE arm writes must be the one the CLEAR arm
 # reads. These are two independent string expressions in the same file, so a

@@ -450,7 +450,12 @@ valid_pr_shape "$final" || infra_error "final PR readback is malformed"
 final_state=$(jq -r '.state // ""' <<<"$final")
 final_draft=$(jq -r 'if has("isDraft") then .isDraft else true end' <<<"$final")
 final_head=$(jq -r '.headRefOid // ""' <<<"$final")
-[ -n "$final_head" ] && EVALUATED_HEAD="$final_head"
+# EVALUATED_HEAD is deliberately NOT advanced to $final_head. This read is the
+# drift CHECK, not the evaluation: the readiness gates above ran against the
+# earlier head, so overwriting here would make a drift verdict (rc=4) name a
+# head nothing was gated on -- and the reporter would then be entitled to clear
+# or watermark it. The verdict names what was actually examined; the reporter
+# rejects it on its own once the PR has moved.
 final_base_ref=$(jq -r '.baseRefName // ""' <<<"$final")
 final_base_sha=$(jq -r '.baseRefOid // ""' <<<"$final")
 final_labels=$(blocking_labels <<<"$final")

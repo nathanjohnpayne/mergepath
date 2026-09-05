@@ -80,6 +80,15 @@ STAGE_MARKER_PREFIX='[continuation-stage: '
 # present; selection still uses started_at, because publication order is what
 # GitHub's own rollup gates on.
 EVAL_MARKER_PREFIX='[continuation-evaluated-at: '
+# Heading under which a superseded diagnostic is preserved, so the advance path
+# can find and carry it forward rather than overwriting it.
+PRESERVED_HEADING='Superseded diagnostic, preserved verbatim:'
+# Set when a clear-side write fails. A failed clear leaves the merge-blocking
+# diagnostic red while the workflow reports success, and on a consumer with
+# scheduled_sweep_enabled: false nothing is guaranteed to retry it -- exactly
+# the silently-preserved condition this script exists to heal, so it surfaces
+# as a retryable failed run instead.
+CLEAR_WRITE_FAILED=0
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=../lib/gh-retry-helpers.sh
 source "$ROOT/scripts/lib/gh-retry-helpers.sh"
@@ -126,7 +135,16 @@ latest_run() {
       else {
         state: (.conclusion // "none"),
         id: .id,
-        stage: (if (.summary | contains($marker + "protective]")) then "protective" else "full" end),
+        # The CURRENT marker is the first one: a cleared diagnostic carries the
+        # superseded summary verbatim, so the text also contains the OLD marker
+        # of that record. `contains` searches the whole string and would classify
+        # a full-stage watermark as protective purely because it preserved a
+        # protective diagnostic -- reading history as if it were current state.
+        # (No apostrophes here: this comment sits inside a single-quoted jq
+        # program, where one would close the shell string mid-expression.)
+        stage: ((.summary | split($marker)) as $sp
+                | if ($sp | length) > 1 and ($sp[1] | split("]")[0]) == "protective"
+                  then "protective" else "full" end),
         summary: .summary,
         at: (marked_epoch(.summary) // (.started_at | fromdateiso8601))
       } end' <<<"$runs"
@@ -234,7 +252,14 @@ for ENTRY in $PR_NUMBERS; do
 
     # A record whose evaluation is at least as recent as this verdict is newer
     # evidence and must survive it, whatever it says.
-    if [ "$SEL_STATE" != none ] && [ "${SEL_AT%.*}" -ge "$EVAL_STARTED" ]; then
+    # Strictly-greater on BOTH sides, deliberately. The two comparisons used to
+    # disagree on an exact tie -- clear refused a same-second failure (>=) while
+    # report declined to suppress it (>) -- so two invocations starting in the
+    # same second could leave a permanent red that neither side would resolve.
+    # Consistency matters more than which way the tie falls: these are
+    # infrastructure diagnostics, not merge-safety failures, and a condition
+    # that persists is re-posted by the next evaluation.
+    if [ "$SEL_STATE" != none ] && [ "${SEL_AT%.*}" -gt "$EVAL_STARTED" ]; then
       echo "PR #$PR has a $CHECK_NAME record newer than this verdict on $EVAL_HEAD; leaving it alone."
       echo "::endgroup::"
       continue
@@ -307,11 +332,21 @@ for ENTRY in $PR_NUMBERS; do
       if ! stage_covers "$VERDICT_STAGE" "$SEL_STAGE"; then
         echo "PR #$PR carries a $SEL_STAGE-stage record and this verdict only reached the $VERDICT_STAGE stage; leaving it as is."
       else
+        # Carry any preserved history forward. Advancing a watermark used to
+        # replace the summary outright, so the diagnostic evidence appended by
+        # an earlier clear vanished on the next clean pass -- on a five-minute
+        # scheduled sweep, within minutes. That silently undid the preservation
+        # this script does when it clears.
+        CARRIED=""
+        case "$SEL_SUMMARY" in
+          *"$PRESERVED_HEADING"*) CARRIED="
+$PRESERVED_HEADING${SEL_SUMMARY#*"$PRESERVED_HEADING"}" ;;
+        esac
         with_gh_retry gh api "repos/$REPO/check-runs/$SEL_ID" \
           -X PATCH \
           -f conclusion='success' \
           -F "output[title]=Approval continuation completed without infrastructure error" \
-          -F "output[summary]=$WATERMARK_SUMMARY" \
+          -F "output[summary]=$WATERMARK_SUMMARY$CARRIED" \
           || echo "::warning::Failed to advance the clean-verdict watermark for PR #$PR."
       fi
       echo "::endgroup::"
@@ -341,9 +376,9 @@ for ENTRY in $PR_NUMBERS; do
       -F "output[title]=Approval continuation completed without infrastructure error" \
       -F "output[summary]=$WATERMARK_SUMMARY
 
-Superseded diagnostic, preserved verbatim:
+$PRESERVED_HEADING
 $SEL_SUMMARY" \
-      || echo "::warning::Failed to clear check-run $SEL_ID for PR #$PR; the stale diagnostic remains on $EVAL_HEAD."
+      || { echo "::error::Failed to clear check-run $SEL_ID for PR #$PR; the stale diagnostic remains on $EVAL_HEAD."; CLEAR_WRITE_FAILED=1; }
     echo "::endgroup::"
     continue
   fi
@@ -410,3 +445,8 @@ $SEL_SUMMARY" \
     || echo "::warning::Failed to post the diagnostic check-run for PR #$PR; the workflow log still surfaces the failure."
   echo "::endgroup::"
 done
+
+# A clear that could not be written is not a success: the workflow must expose a
+# retryable failed run rather than reporting green over a diagnostic that is
+# still blocking the merge.
+exit "$CLEAR_WRITE_FAILED"
