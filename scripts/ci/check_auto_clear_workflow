@@ -604,7 +604,14 @@ if [ "$1" = "api" ]; then
         [ "$a" = "--paginate" ] && paginate=yes
         prev="$a"
       done
-      printf '%s' "$GH_STUB_CHECKRUNS" | jq -r "$filter"
+      # A second and later read can serve GH_STUB_CHECKRUNS_AFTER, which is how
+      # a failure published concurrently with our write becomes observable.
+      payload="$GH_STUB_CHECKRUNS"
+      if [ -n "${GH_STUB_CHECKRUNS_AFTER:-}" ]; then
+        reads=$(grep -c 'commits/.*/check-runs' "$GH_STUB_LOG" 2>/dev/null || echo 1)
+        [ "${reads:-1}" -gt 1 ] && payload="$GH_STUB_CHECKRUNS_AFTER"
+      fi
+      printf '%s' "$payload" | jq -r "$filter"
       if [ "$paginate" = yes ] && [ -n "${GH_STUB_CHECKRUNS_P2:-}" ]; then
         printf '%s' "$GH_STUB_CHECKRUNS_P2" | jq -r "$filter"
       fi
@@ -629,7 +636,7 @@ chmod +x "$clear_tmp/bin/gh"
 VERDICT_AFTER=1788609600
 VERDICT_BEFORE=1788480000
 run_clear_case() {
-  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}" entry="${5:-7:abc123:$VERDICT_AFTER:full}" expect_run_id="${6:-[0-9]+}" expect_evidence="${7:-}"
+  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}" entry="${5:-7:abc123:$VERDICT_AFTER:full}" expect_run_id="${6:-[0-9]+}" expect_evidence="${7:-}" allow_create="${8:-no}"
   : > "$clear_tmp/gh.log"
   if ! PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_CHECKRUNS="$fixture" \
        GH_STUB_CHECKRUNS_P2="$fixture_p2" \
@@ -643,10 +650,12 @@ run_clear_case() {
   if grep -Fq 'conclusion=success' "$clear_tmp/gh.log"; then
     posted=yes
   fi
-  # A clear must never CREATE a check-run. Creating one re-enters the
-  # latest-run-wins race: a failure published between the read and the write
-  # would be newer evidence, and a fresh success would bury it.
-  if grep -Eq '(^| )api repos/[^ ]*/check-runs( |$)' "$clear_tmp/gh.log"; then
+  # A clear must never CREATE a check-run when one already exists: that
+  # re-enters the latest-run-wins race, where a failure published between the
+  # read and the write is newer evidence that a fresh success would bury. The
+  # sole exception is the watermark on an EMPTY head, which has nothing to bury
+  # and carries its own read-after-write reconciliation.
+  if [ "${allow_create:-no}" != yes ] && grep -Eq '(^| )api repos/[^ ]*/check-runs( |$)' "$clear_tmp/gh.log"; then
     fail=$((fail + 1))
     echo "  FAIL: --clear ($label) created a new check-run instead of updating the selected one" >&2
   fi
@@ -680,13 +689,23 @@ run_clear_case() {
   if [ "$posted" = yes ]; then
     local pinned="${entry#*:}"
     pinned="${pinned%%:*}"
-    if grep -Fq "commits/$pinned/check-runs" "$clear_tmp/gh.log" \
-       && grep -Eq "api repos/[^ ]*/check-runs/${expect_run_id:-[0-9]+} " "$clear_tmp/gh.log"; then
+    # Pinning shows up differently for the two write shapes: an update names the
+    # run id selected from the evaluated head, a watermark create names the head
+    # directly. Both must reference the EVALUATED head, never a re-resolved one.
+    pinned_ok=no
+    if [ "${allow_create:-no}" = yes ]; then
+      grep -Fq "head_sha=$pinned" "$clear_tmp/gh.log" && pinned_ok=yes
+    else
+      grep -Fq "commits/$pinned/check-runs" "$clear_tmp/gh.log" \
+        && grep -Eq "api repos/[^ ]*/check-runs/${expect_run_id:-[0-9]+} " "$clear_tmp/gh.log" \
+        && pinned_ok=yes
+    fi
+    if [ "$pinned_ok" = yes ]; then
       pass=$((pass + 1))
-      echo "  PASS: --clear ($label) updated the run selected from the evaluated head"
+      echo "  PASS: --clear ($label) pinned its write to the evaluated head"
     else
       fail=$((fail + 1))
-      echo "  FAIL: --clear ($label) did not update the run selected from the evaluated head" >&2
+      echo "  FAIL: --clear ($label) did not pin its write to the evaluated head" >&2
     fi
   fi
 }
@@ -701,16 +720,24 @@ run_clear_case() {
 run_clear_case "failure is latest, listed in the middle" yes \
   '{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T02:00:00Z","id":7},{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":11},{"conclusion":"success","started_at":"2026-09-04T10:00:00Z","id":1}]}' \
   "" "7:abc123:$VERDICT_AFTER:full" 11
-run_clear_case "success is latest, listed in the middle" no \
+# A clean verdict now ADVANCES an existing watermark rather than returning
+# early, so later stale failures keep being rejected as the verdict moves
+# forward. This case asserted the old "do nothing" contract.
+run_clear_case "clean verdict advances an existing watermark" yes \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2},{"conclusion":"success","started_at":"2026-09-05T05:00:00Z","id":9},{"conclusion":"failure","started_at":"2026-09-04T10:00:00Z","id":1}]}'
-run_clear_case "no diagnostic on this head" no \
-  '{"check_runs":[]}'
+# #1191: an empty head now records the clean verdict instead of writing
+# nothing. Without a durable "a clean evaluation happened at T", an OLDER
+# evaluation that fails and reaches its reporter afterwards has nothing to be
+# judged against, so it publishes a stale failure that no later event is
+# guaranteed to clear.
+run_clear_case "empty head records a clean-verdict watermark" yes \
+  '{"check_runs":[]}' "" "7:abc123:$VERDICT_AFTER:full" "[0-9]+" "" yes
 # Page 1 says failure, page 2 carries the newer success. An unpaginated read
 # returns page 1 cleanly with no signal that page 2 exists, so it would clear a
 # head whose latest run is already green — the same silent truncation
 # docs/agents/shared-operating-rules.md documents for this endpoint (194
 # check-runs on one head, #687).
-run_clear_case "latest run is on page 2" no \
+run_clear_case "latest run is on page 2 (watermark advanced, not cleared)" yes \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2}]}' \
   '{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T06:00:00Z","id":40}]}'
 run_clear_case "page 2 carries the newer failure" yes \
@@ -781,6 +808,63 @@ run_clear_case "failure evaluated after the verdict survives" no \
 UNMARKED_LATE='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-06T00:00:00Z","id":53,"output":{"summary":"boom [continuation-stage: full] see run"}}]}'
 run_clear_case "unmarked late failure falls back to publication time" no \
   "$UNMARKED_LATE" "" "7:abc123:$VERDICT_AFTER:full"
+
+# #1191 report-mode suppression. A stale failure must not publish once a NEWER
+# clean verdict is on record. The fixture head carries a watermark evaluated
+# AFTER this failure's own evaluation, so publishing it would resurrect a red
+# that a later evaluation has already spoken for -- and with
+# scheduled_sweep_enabled: false no later event is guaranteed to clear it.
+run_report_case() {
+  local label="$1" want_post="$2" fixture="$3" entry="$4"
+  : > "$clear_tmp/gh.log"
+  PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_CHECKRUNS="$fixture" \
+    GH_RETRY_ATTEMPTS=1 \
+    bash "$CONTINUATION_REPORTER" owner/repo https://example.test/run/1 "$entry" >/dev/null 2>&1 || true
+  local posted=no
+  grep -Fq 'conclusion=failure' "$clear_tmp/gh.log" && posted=yes
+  if [ "$posted" = "$want_post" ]; then
+    pass=$((pass + 1))
+    echo "  PASS: report ($label) posts=$posted as required (#1191)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: report ($label) expected posts=$want_post, got posts=$posted" >&2
+  fi
+}
+
+NEWER_WATERMARK='{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T09:00:00Z","id":61,"output":{"summary":"clean [continuation-stage: full] [continuation-evaluated-at: 1788609600] ok"}}]}'
+OLDER_WATERMARK='{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T09:00:00Z","id":62,"output":{"summary":"clean [continuation-stage: full] [continuation-evaluated-at: 1788480000] ok"}}]}'
+PROT_WATERMARK='{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T09:00:00Z","id":63,"output":{"summary":"clean [continuation-stage: protective] [continuation-evaluated-at: 1788609600] ok"}}]}'
+
+# Failure evaluated BEFORE the recorded clean verdict -> superseded, suppressed.
+run_report_case "stale failure under a newer clean verdict" no \
+  "$NEWER_WATERMARK" "7:full:$VERDICT_BEFORE"
+# Failure evaluated AFTER it -> genuinely newer evidence, must publish.
+run_report_case "failure newer than the clean verdict" yes \
+  "$OLDER_WATERMARK" "7:full:$VERDICT_AFTER"
+# A protective-only watermark does not speak for a full-stage failure.
+run_report_case "protective watermark does not suppress a full-stage failure" yes \
+  "$PROT_WATERMARK" "7:full:$VERDICT_BEFORE"
+# No epoch -> nothing to compare -> fail OPEN and publish, never suppress.
+run_report_case "no evaluation epoch fails open and publishes" yes \
+  "$NEWER_WATERMARK" "7:full"
+
+# The watermark create must not trade a fail-closed bug for a fail-open one.
+# The head reads empty, so a watermark is written; the stub then reports a
+# failure NEWER than the verdict, i.e. one published in the gap. The reporter
+# must notice and restore the block rather than leave it buried under a green.
+: > "$clear_tmp/gh.log"
+PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" \
+  GH_STUB_CHECKRUNS='{"check_runs":[]}' \
+  GH_STUB_CHECKRUNS_AFTER='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T13:00:00Z","id":71,"output":{"summary":"real boom [continuation-stage: full] [continuation-evaluated-at: 1788696000] see run"}}]}' \
+  GH_RETRY_ATTEMPTS=1 \
+  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7:abc123:$VERDICT_AFTER:full" >/dev/null 2>&1 || true
+if grep -Fq 'conclusion=failure' "$clear_tmp/gh.log" && grep -Fq 'real boom' "$clear_tmp/gh.log"; then
+  pass=$((pass + 1))
+  echo "  PASS: a failure buried by the watermark write is detected and restored (#1191)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the watermark write must restore a newer failure it buried, not leave a false green (#1191)" >&2
+fi
 
 # Round-trip: the marker the FAILURE arm writes must be the one the CLEAR arm
 # reads. These are two independent string expressions in the same file, so a

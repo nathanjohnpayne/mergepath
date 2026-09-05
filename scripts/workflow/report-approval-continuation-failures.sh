@@ -88,20 +88,22 @@ source "$ROOT/scripts/lib/gh-retry-helpers.sh"
 # that share a second) is not cosmetic: reading an arbitrary array element here
 # reproduces the exact misdiagnosis this script exists to prevent — a
 # superseded red read as current state.
-# Selects the newest diagnostic on $1, judged against a verdict taken at $2, and
-# emits a compact JSON object describing it:
+# Reads the newest check-run on $1 and reports FACTS about it, leaving the
+# judgement to each caller -- the two arms ask different questions of the same
+# record and a shared verdict-shaped answer cannot serve both:
 #
-#   {"state":"none"}                 the head carries no diagnostic at all
-#   {"state":"newer-than-verdict"}   the newest run started at or after the
-#                                    verdict — newer evidence outranks it
-#   {"state":<conclusion>, "id":…, "stage":…, "summary":…}
+#   {"state":"none"}   the head carries no diagnostic at all
+#   {"state":<conclusion>, "id":…, "stage":…, "summary":…, "at":<epoch>}
 #
-# `stage` records WHICH stage produced the diagnostic, read back from the marker
-# the failure arm writes. An unmarked diagnostic (anything posted before this
-# marker existed) is treated as "full", which is the conservative direction:
-# only a full verdict can clear it.
+# `at` is WHEN THE RUN'S EVALUATION HAPPENED, not when it was published: the
+# embedded marker if present, else publication time. Concurrent triggers make
+# those diverge, and publication order is the wrong clock for "is this newer
+# evidence than my verdict".
+#
+# `stage` records which stage produced the record. An unmarked one (posted
+# before the marker existed) reads as "full", the conservative default.
 latest_run() {
-  local head_sha="$1" cutoff="$2" runs
+  local head_sha="$1" runs
   # `--paginate` is not belt-and-braces next to per_page=100:
   # docs/agents/shared-operating-rules.md names this exact endpoint, and a head
   # that has been through repeated scheduled-sweep re-evaluations has been
@@ -113,30 +115,40 @@ latest_run() {
   runs=$(with_gh_retry gh api --paginate \
     "repos/$REPO/commits/$head_sha/check-runs?check_name=$CHECK_NAME&per_page=100" \
     --jq '.check_runs[] | {conclusion, started_at, id, summary: (.output.summary // "")}') || return 1
-  # fromdateiso8601 keeps the comparison inside jq: converting timestamps in
-  # shell would need date(1), whose flags differ between GNU and BSD — the
-  # portability trap this script was fixed for once already.
-  jq -cs --argjson cutoff "$cutoff" --arg marker "$STAGE_MARKER_PREFIX" --arg evmarker "$EVAL_MARKER_PREFIX" '
-    # `split` on a literal string, never a regex: both markers begin with "[",
-    # which opens a character class the moment it is concatenated into a
-    # pattern. A literal split needs no escaping and cannot drift.
+  # `split` on a literal string, never a regex: both markers begin with "[",
+  # which opens a character class the moment it is concatenated into a pattern.
+  # That already broke this file once.
+  jq -cs --arg marker "$STAGE_MARKER_PREFIX" --arg evmarker "$EVAL_MARKER_PREFIX" '
     def marked_epoch(s): (s | split($evmarker)) as $p
       | if ($p | length) > 1 then ($p[1] | split("]")[0] | tonumber? ) else null end;
     sort_by(.started_at, .id) | last
     | if . == null then {state: "none"}
-      elif ((marked_epoch(.summary) // (.started_at | fromdateiso8601)) >= $cutoff) then {state: "newer-than-verdict"}
       else {
         state: (.conclusion // "none"),
         id: .id,
-        # `contains`, not `test`: the marker literal begins with "[", which
-        # opens a character class when concatenated into a regex. A substring
-        # test needs no escaping and cannot drift from the writer.
         stage: (if (.summary | contains($marker + "protective]")) then "protective" else "full" end),
-        summary: .summary
+        summary: .summary,
+        at: (marked_epoch(.summary) // (.started_at | fromdateiso8601))
       } end' <<<"$runs"
 }
 
-# A verdict from stage $1 may clear a diagnostic from stage $2. A full
+# Emits the summary of the newest FAILURE on $1 whose evaluation is strictly
+# newer than $2, or nothing. Used only for the read-after-write check below.
+failure_newer_than() {
+  local head_sha="$1" cutoff="$2" runs
+  runs=$(with_gh_retry gh api --paginate \
+    "repos/$REPO/commits/$head_sha/check-runs?check_name=$CHECK_NAME&per_page=100" \
+    --jq '.check_runs[] | {conclusion, started_at, id, summary: (.output.summary // "")}') || return 1
+  jq -rs --argjson cutoff "$cutoff" --arg evmarker "$EVAL_MARKER_PREFIX" '
+    def marked_epoch(s): (s | split($evmarker)) as $p
+      | if ($p | length) > 1 then ($p[1] | split("]")[0] | tonumber? ) else null end;
+    [ .[]
+      | select(.conclusion == "failure")
+      | select((marked_epoch(.summary) // (.started_at | fromdateiso8601)) > $cutoff) ]
+    | sort_by(.started_at, .id) | last | .summary // ""' <<<"$runs"
+}
+
+# A verdict from stage $1 may speak for a record from stage $2. A full
 # continuation subsumes the protective stage it runs after; a protective-only
 # pass does not speak for the author-token continuation it never reached.
 stage_covers() {
@@ -192,7 +204,7 @@ for ENTRY in $PR_NUMBERS; do
       echo "::endgroup::"
       continue
     fi
-    # The verdict describes $EVAL_HEAD. Re-resolving the head at POST time is
+    # The verdict describes $EVAL_HEAD. Re-resolving the head at write time is
     # the whole defect: a push landing between the verdict and this step would
     # let a clean result for head A publish success on head B, superseding a
     # failure that belongs to B and was never evaluated. If the PR has moved,
@@ -209,27 +221,103 @@ for ENTRY in $PR_NUMBERS; do
       echo "::endgroup::"
       continue
     fi
-    if ! SELECTED=$(latest_run "$EVAL_HEAD" "$EVAL_STARTED"); then
+    if ! SELECTED=$(latest_run "$EVAL_HEAD"); then
       echo "::warning::Failed to read existing $CHECK_NAME check-runs for PR #$PR; leaving the head untouched."
       echo "::endgroup::"
       continue
     fi
     SEL_STATE=$(jq -r '.state' <<<"$SELECTED")
-    if [ "$SEL_STATE" != failure ]; then
-      echo "PR #$PR carries no supersedable $CHECK_NAME diagnostic on $EVAL_HEAD (latest: $SEL_STATE); nothing to clear."
-      echo "::endgroup::"
-      continue
-    fi
     SEL_ID=$(jq -r '.id // 0' <<<"$SELECTED")
     SEL_STAGE=$(jq -r '.stage // "full"' <<<"$SELECTED")
     SEL_SUMMARY=$(jq -r '.summary // ""' <<<"$SELECTED")
+    SEL_AT=$(jq -r '.at // 0' <<<"$SELECTED")
+
+    # A record whose evaluation is at least as recent as this verdict is newer
+    # evidence and must survive it, whatever it says.
+    if [ "$SEL_STATE" != none ] && [ "${SEL_AT%.*}" -ge "$EVAL_STARTED" ]; then
+      echo "PR #$PR has a $CHECK_NAME record newer than this verdict on $EVAL_HEAD; leaving it alone."
+      echo "::endgroup::"
+      continue
+    fi
+
+    WATERMARK_SUMMARY="PR #$PR completed an approval continuation on $EVAL_HEAD at the $VERDICT_STAGE stage with no infrastructure error. ${STAGE_MARKER_PREFIX}${VERDICT_STAGE}] ${EVAL_MARKER_PREFIX}${EVAL_STARTED}] Clearing run: $RUN_URL"
+
+    # No diagnostic to supersede — record the clean verdict instead of writing
+    # nothing (#1191). Without a durable record of "a clean evaluation happened
+    # at T", an OLDER evaluation that fails and reaches its reporter after this
+    # step has nothing to be judged against, so it publishes a stale failure
+    # that no later event is guaranteed to clear. That is the #1188 bug by a
+    # narrower route, and it is why this writes a watermark rather than
+    # returning early. It creates at most ONE check-run per head: every later
+    # clean verdict PATCHes this same run rather than adding another.
+    if [ "$SEL_STATE" = none ]; then
+      with_gh_retry gh api "repos/$REPO/check-runs" \
+        -X POST \
+        -f name="$CHECK_NAME" \
+        -f "head_sha=$EVAL_HEAD" \
+        -f status='completed' \
+        -f conclusion='success' \
+        -F "output[title]=Approval continuation completed without infrastructure error" \
+        -F "output[summary]=$WATERMARK_SUMMARY" \
+        || echo "::warning::Failed to record the clean-verdict watermark for PR #$PR; a late stale failure on $EVAL_HEAD would have nothing to be judged against."
+      # Read-after-write. This POST makes our watermark the newest run on the
+      # head, so a failure published between the read above and this write is
+      # now hidden beneath it. Left alone that trades #1188's fail-CLOSED bug
+      # for a fail-OPEN one -- a merge-blocking diagnostic silently removed --
+      # which is the wrong direction and worse than the gap being closed. If a
+      # failure newer than this verdict exists, restore the block by turning
+      # our own watermark into it, carrying its evidence.
+      if BURIED=$(failure_newer_than "$EVAL_HEAD" "$EVAL_STARTED"); then
+        if [ -n "$BURIED" ]; then
+          if ! WM=$(latest_run "$EVAL_HEAD"); then
+            echo "::error::PR #$PR may have buried a newer failure on $EVAL_HEAD and the head could not be re-read; the workflow log is authoritative."
+          else
+            WM_ID=$(jq -r '.id // 0' <<<"$WM")
+            case "$WM_ID" in
+              ''|0|*[!0-9]*) echo "::error::PR #$PR may have buried a newer failure on $EVAL_HEAD; no usable run id to restore it." ;;
+              *)
+                echo "::warning::A failure newer than this verdict appeared on $EVAL_HEAD while the watermark was being written; restoring it."
+                with_gh_retry gh api "repos/$REPO/check-runs/$WM_ID" \
+                  -X PATCH \
+                  -f conclusion='failure' \
+                  -F "output[title]=Approval continuation hit an infrastructure error" \
+                  -F "output[summary]=$BURIED" \
+                  || echo "::error::Failed to restore the newer failure on $EVAL_HEAD after writing a watermark."
+                ;;
+            esac
+          fi
+        fi
+      else
+        echo "::warning::Could not re-read $EVAL_HEAD after writing the watermark; a concurrently-published failure may be hidden beneath it."
+      fi
+      echo "::endgroup::"
+      continue
+    fi
+
     case "$SEL_ID" in
       ''|0|*[!0-9]*)
-        echo "::warning::PR #$PR has a failing $CHECK_NAME diagnostic on $EVAL_HEAD but no usable run id; leaving it untouched."
+        echo "::warning::PR #$PR has a $CHECK_NAME record on $EVAL_HEAD but no usable run id; leaving it untouched."
         echo "::endgroup::"
         continue
         ;;
     esac
+
+    # Advance an existing watermark so later stale failures keep being rejected.
+    if [ "$SEL_STATE" != failure ]; then
+      if ! stage_covers "$VERDICT_STAGE" "$SEL_STAGE"; then
+        echo "PR #$PR carries a $SEL_STAGE-stage record and this verdict only reached the $VERDICT_STAGE stage; leaving it as is."
+      else
+        with_gh_retry gh api "repos/$REPO/check-runs/$SEL_ID" \
+          -X PATCH \
+          -f conclusion='success' \
+          -F "output[title]=Approval continuation completed without infrastructure error" \
+          -F "output[summary]=$WATERMARK_SUMMARY" \
+          || echo "::warning::Failed to advance the clean-verdict watermark for PR #$PR."
+      fi
+      echo "::endgroup::"
+      continue
+    fi
+
     if ! stage_covers "$VERDICT_STAGE" "$SEL_STAGE"; then
       echo "PR #$PR has a $SEL_STAGE-stage diagnostic on $EVAL_HEAD and this verdict only reached the $VERDICT_STAGE stage; leaving it for a continuation that gets that far."
       echo "::endgroup::"
@@ -251,7 +339,7 @@ for ENTRY in $PR_NUMBERS; do
       -X PATCH \
       -f conclusion='success' \
       -F "output[title]=Approval continuation completed without infrastructure error" \
-      -F "output[summary]=PR #$PR was re-evaluated cleanly on $EVAL_HEAD at the $VERDICT_STAGE stage, superseding the $SEL_STAGE-stage infrastructure diagnostic this run originally recorded. Clearing run: $RUN_URL
+      -F "output[summary]=$WATERMARK_SUMMARY
 
 Superseded diagnostic, preserved verbatim:
 $SEL_SUMMARY" \
@@ -262,8 +350,7 @@ $SEL_SUMMARY" \
 
   # Report mode takes PR, PR:STAGE or PR:STAGE:EPOCH. A missing stage defaults
   # to "full", the conservative reading: only a full verdict clears it. A
-  # missing epoch simply omits the marker, leaving recency judged on
-  # publication time as before.
+  # missing epoch omits the marker and disables the staleness check below.
   FAIL_STAGE=full
   FAIL_EPOCH=""
   REPORT_REST="${ENTRY#*:}"
@@ -288,6 +375,30 @@ $SEL_SUMMARY" \
     echo "::endgroup::"
     continue
   fi
+
+  # Do not publish a failure that a NEWER clean verdict has already spoken for
+  # (#1191). Concurrent triggers let an older evaluation reach this point after
+  # a newer clean one finished; without this check that stale failure lands and
+  # no later event is guaranteed to clear it.
+  #
+  # Fails OPEN in every uncertain case — no epoch, an unreadable record, a
+  # watermark from a stage that does not cover this failure — because
+  # suppressing a real diagnostic is worse than publishing a redundant one.
+  if [ -n "$FAIL_EPOCH" ]; then
+    if EXISTING=$(latest_run "$HEAD_SHA"); then
+      EX_STATE=$(jq -r '.state' <<<"$EXISTING")
+      EX_AT=$(jq -r '.at // 0' <<<"$EXISTING")
+      EX_STAGE=$(jq -r '.stage // "full"' <<<"$EXISTING")
+      if [ "$EX_STATE" = success ] && [ "${EX_AT%.*}" -gt "$FAIL_EPOCH" ] && stage_covers "$EX_STAGE" "$FAIL_STAGE"; then
+        echo "PR #$PR already has a clean $EX_STAGE-stage continuation on $HEAD_SHA newer than this evaluation; not publishing a superseded failure."
+        echo "::endgroup::"
+        continue
+      fi
+    else
+      echo "::warning::Could not read existing $CHECK_NAME records for PR #$PR; publishing the diagnostic rather than suppressing it."
+    fi
+  fi
+
   with_gh_retry gh api "repos/$REPO/check-runs" \
     -X POST \
     -f name="$CHECK_NAME" \
