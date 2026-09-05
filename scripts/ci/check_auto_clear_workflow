@@ -484,6 +484,8 @@ if [ "$continuation_clear_count" -eq 2 ] \
    && [ "$(grep -cF 'CONTINUATION_EVALUATED_PRS' "$WORKFLOW")" -ge 4 ] \
    && [ "$(grep -cF "report-approval-continuation-failures.sh --clear" "$WORKFLOW")" -eq 2 ] \
    && [ "$(grep -cF "grep -Fq 'CONTINUATION_CLEAR_V1'" "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF 'eval_started_at=$(date -u +%s)' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF '$PR:$eval_head:$eval_started_at' "$WORKFLOW")" -eq 4 ] \
    && grep -Fq 'CONTINUATION_CLEAR_V1' "$CONTINUATION_REPORTER"; then
   pass=$((pass + 1))
   echo "  PASS: both continuation loops clear per-PR after a clean evaluation, without the batch sentinel (#1188)"
@@ -540,13 +542,19 @@ chmod +x "$clear_tmp/bin/gh"
 
 # Each case asserts on a fresh log. `want_post` is whether a clearing check-run
 # should reach the API for that fixture.
+# The stub's PR head is always abc123. VERDICT_AFTER is later than every fixture
+# run (so recency never masks the case under test); VERDICT_BEFORE is earlier
+# than all of them, which is how a failure published after the verdict is
+# expressed. `entry` is the PR:SHA:EPOCH token the workflow now passes.
+VERDICT_AFTER=1788609600
+VERDICT_BEFORE=1788480000
 run_clear_case() {
-  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}"
+  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}" entry="${5:-7:abc123:$VERDICT_AFTER}"
   : > "$clear_tmp/gh.log"
   if ! PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_CHECKRUNS="$fixture" \
        GH_STUB_CHECKRUNS_P2="$fixture_p2" \
        GH_RETRY_ATTEMPTS=1 \
-       bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7" >/dev/null 2>&1; then
+       bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "$entry" >/dev/null 2>&1; then
     fail=$((fail + 1))
     echo "  FAIL: --clear ($label) exited non-zero" >&2
     return
@@ -566,6 +574,19 @@ run_clear_case() {
   if grep -Fq 'conclusion=failure' "$clear_tmp/gh.log"; then
     fail=$((fail + 1))
     echo "  FAIL: --clear ($label) published a failure conclusion" >&2
+  fi
+  # Whatever it posts must be pinned to the head the verdict was about, not to
+  # whatever the head happens to be when the POST goes out.
+  if [ "$posted" = yes ]; then
+    local pinned="${entry#*:}"
+    pinned="${pinned%%:*}"
+    if grep -Fq "head_sha=$pinned" "$clear_tmp/gh.log"; then
+      pass=$((pass + 1))
+      echo "  PASS: --clear ($label) pinned the write to the evaluated head"
+    else
+      fail=$((fail + 1))
+      echo "  FAIL: --clear ($label) posted against a head other than the evaluated one" >&2
+    fi
   fi
 }
 
@@ -593,6 +614,40 @@ run_clear_case "latest run is on page 2" no \
 run_clear_case "page 2 carries the newer failure" yes \
   '{"check_runs":[{"conclusion":"success","started_at":"2026-09-04T09:00:00Z","id":3}]}' \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T06:00:00Z","id":41}]}'
+
+# The head moved between the verdict and this call. The verdict describes a head
+# that is no longer current, so it must not publish anything: re-resolving the
+# head here is what would let a clean result for head A clear a real failure on
+# head B that was never evaluated.
+run_clear_case "head moved since the verdict" no \
+  '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2}]}' \
+  "" "7:deadbeefcafe:$VERDICT_AFTER"
+
+# Same head, but the failure was published AFTER this verdict was taken — it is
+# newer evidence than the verdict and must survive it.
+run_clear_case "failure is newer than the verdict" no \
+  '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2}]}' \
+  "" "7:abc123:$VERDICT_BEFORE"
+
+# A caller that passes a bare PR number has lost the head pinning entirely.
+# Asserting only "posts nothing" would pass for the WRONG reason: with the shape
+# guard removed, `7` still falls out at the head-mismatch check further down
+# (EVAL_HEAD parses as "7", which never equals a real SHA). So assert the shape
+# guard's own diagnostic, which is the only thing that distinguishes "the caller
+# is malformed" from "the head moved" — two very different operational stories.
+: > "$clear_tmp/gh.log"
+bare_out=$(PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" \
+  GH_STUB_CHECKRUNS='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2}]}' \
+  GH_RETRY_ATTEMPTS=1 \
+  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7" 2>&1 || true)
+if grep -Fq 'refusing to guess a head' <<<"$bare_out" \
+   && ! grep -Fq 'conclusion=success' "$clear_tmp/gh.log"; then
+  pass=$((pass + 1))
+  echo "  PASS: --clear rejects a bare PR number as malformed, not as a moved head (#1188)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --clear must reject an unpinned entry with its own shape diagnostic (#1188)" >&2
+fi
 
 # Arg contract: the clearing arm still takes exactly three positionals, so a
 # consumer calling it wrongly fails loudly rather than posting to a guessed repo.

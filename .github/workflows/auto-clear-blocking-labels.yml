@@ -486,6 +486,20 @@ jobs:
                 continue
                 ;;
             esac
+            # Pin the verdict to the head it is ABOUT, captured BEFORE the
+            # evaluation runs. The clearing arm must not re-resolve the head at
+            # post time: a push (or another trigger) landing between the verdict
+            # and the clearing step would otherwise let a clean verdict for head
+            # A publish success on head B, superseding a failure that belongs to
+            # B and was never evaluated. The epoch is the companion guard for
+            # the same-head case -- a failure posted AFTER this verdict started
+            # is newer than the verdict and must survive it.
+            eval_started_at=$(date -u +%s)
+            eval_head=""
+            if ! eval_head=$(GH_TOKEN="$WORKFLOW_TOKEN" gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
+              echo "::warning::Could not resolve the head SHA for PR #$PR before evaluation; it will not be eligible for diagnostic clearing on this pass."
+              eval_head=""
+            fi
             set +e
             GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
               --retract-unsafe-only "$PR" "$REPO"
@@ -503,10 +517,16 @@ jobs:
             fi
             set -e
             case "$rc" in
-              0) continuation_evaluated_prs="$continuation_evaluated_prs $PR" ;;
+              0)
+                if [ -n "$eval_head" ]; then
+                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at"
+                fi
+                ;;
               4)
                 echo "PR #$PR is not merge-ready on this event; a later completion event will re-evaluate it."
-                continuation_evaluated_prs="$continuation_evaluated_prs $PR"
+                if [ -n "$eval_head" ]; then
+                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at"
+                fi
                 ;;
               *)
                 echo "::error::Approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
@@ -946,6 +966,20 @@ jobs:
           continuation_evaluated_prs=""
           while IFS= read -r PR; do
             [ -n "$PR" ] || continue
+            # Pin the verdict to the head it is ABOUT, captured BEFORE the
+            # evaluation runs. The clearing arm must not re-resolve the head at
+            # post time: a push (or another trigger) landing between the verdict
+            # and the clearing step would otherwise let a clean verdict for head
+            # A publish success on head B, superseding a failure that belongs to
+            # B and was never evaluated. The epoch is the companion guard for
+            # the same-head case -- a failure posted AFTER this verdict started
+            # is newer than the verdict and must survive it.
+            eval_started_at=$(date -u +%s)
+            eval_head=""
+            if ! eval_head=$(GH_TOKEN="$WORKFLOW_TOKEN" gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
+              echo "::warning::Could not resolve the head SHA for PR #$PR before evaluation; it will not be eligible for diagnostic clearing on this pass."
+              eval_head=""
+            fi
             set +e
             GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
               --retract-unsafe-only "$PR" "$REPO"
@@ -963,10 +997,16 @@ jobs:
             fi
             set -e
             case "$rc" in
-              0) continuation_evaluated_prs="$continuation_evaluated_prs $PR" ;;
+              0)
+                if [ -n "$eval_head" ]; then
+                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at"
+                fi
+                ;;
               4)
                 echo "PR #$PR is not merge-ready; a later event or sweep will re-evaluate it."
-                continuation_evaluated_prs="$continuation_evaluated_prs $PR"
+                if [ -n "$eval_head" ]; then
+                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at"
+                fi
                 ;;
               *)
                 echo "::error::Scheduled approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
