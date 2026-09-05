@@ -91,15 +91,23 @@ fi
 
 # --- argument parsing -------------------------------------------------------
 
-# Default fleet: ALL SEVEN CodeRabbit-active consumers (the hub, mergepath,
-# does not run CodeRabbit auto-review). Every one currently ships
-# coderabbit.enabled: true (verified 2026-07-05) and is on the covered-fleet
-# list in docs/agents/coderabbit-audit.md, so the full set is the right
-# sampling frame for coderabbit-wait.sh's wait window — a 5-repo subset would
-# derive p50/p99 from a partial fleet and miss slower reviews in the omitted
-# repos (Codex P2 on #688). Keep this in step with the coderabbit-audit.md
-# roster if the fleet changes.
-REPOS="nathanjohnpayne/swipewatch,nathanjohnpayne/matchline,nathanjohnpayne/nathanpaynedotcom,nathanjohnpayne/overridebroadway,nathanjohnpayne/tadlockpsychiatry,nathanjohnpayne/friends-and-family-billing,nathanjohnpayne/fiveacross"
+# Default fleet: ALL SIX CodeRabbit-ACTIVE consumers (the hub, mergepath, does
+# not run CodeRabbit auto-review). This is the active roster, which is NOT the
+# same as the consumer roster: the fleet has seven consumers, and `fiveacross`
+# is deliberately excluded here because CodeRabbit is disabled on it — since
+# 2026-08-04 it carries `reviews.auto_review.enabled: false` in .coderabbit.yml
+# paired with `coderabbit.enabled: false` in .github/review-policy.yml
+# (re-verified 2026-09-05). It can produce no CodeRabbit review events, so
+# sampling it contributes nothing and only makes the roster look wrong.
+#
+# Do NOT "restore" fiveacross to match the consumer list — the two rosters are
+# meant to differ, and this comment is the reason. Re-add it only if that
+# opt-out is lifted, and re-read both keys rather than trusting this note.
+#
+# Otherwise keep this in step with the covered-fleet list in
+# docs/agents/coderabbit-audit.md: a partial fleet would derive p50/p99 from a
+# subset and miss slower reviews in the omitted repos (Codex P2 on #688).
+REPOS="nathanjohnpayne/swipewatch,nathanjohnpayne/matchline,nathanjohnpayne/nathanpaynedotcom,nathanjohnpayne/overridebroadway,nathanjohnpayne/tadlockpsychiatry,nathanjohnpayne/friends-and-family-billing"
 SINCE=""
 LOOPS_DIR=".mergepath/phase-4b-loops"
 OUT_DIR=".mergepath/review-latency-audit"
