@@ -467,6 +467,118 @@ else
 fi
 rm -rf "$reporter_tmp"
 
+# ── #1188: the failure diagnostic must have a way back to green.
+#
+# Before CONTINUATION_CLEAR_V1 the reporter had no success arm anywhere, so a
+# head that hit one transient infra error kept a red check-run permanently and
+# the PR sat at UNSTABLE for the life of that head. These tests pin both halves
+# of the fix: the workflow runs a clearing arm on a clean evaluation, and the
+# reporter clears ONLY a failure it can actually see.
+# Whole-line anchor, not a substring: `grep -F 'name: Clear …'` still matches a
+# step renamed to "… DISABLED", which is precisely how this assertion was first
+# written and precisely the mutation it failed to catch.
+continuation_clear_count=$(grep -cE '^[[:space:]]+- name: Clear superseded approval-continuation diagnostics$' "$WORKFLOW" || true)
+if [ "$continuation_clear_count" -eq 2 ] \
+   && [ "$(grep -cF "env.CONTINUATION_INFRA_ERROR == '0'" "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF 'CONTINUATION_EVALUATED_PRS' "$WORKFLOW")" -ge 4 ] \
+   && [ "$(grep -cF "report-approval-continuation-failures.sh --clear" "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF "grep -Fq 'CONTINUATION_CLEAR_V1'" "$WORKFLOW")" -eq 2 ] \
+   && grep -Fq 'CONTINUATION_CLEAR_V1' "$CONTINUATION_REPORTER"; then
+  pass=$((pass + 1))
+  echo "  PASS: both continuation loops clear a superseded diagnostic after a clean evaluation (#1188)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: each continuation loop must run a marker-guarded --clear arm on a clean evaluation (#1188)" >&2
+fi
+
+clear_tmp=$(mktemp -d "${TMPDIR:-/tmp}/continuation-clear.XXXXXX")
+mkdir -p "$clear_tmp/bin"
+cat > "$clear_tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_STUB_LOG"
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s' abc123
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  case "${2:-}" in
+    *"/commits/"*"/check-runs"*)
+      filter='.'
+      prev=""
+      for a in "$@"; do
+        [ "$prev" = "--jq" ] && filter="$a"
+        prev="$a"
+      done
+      printf '%s' "$GH_STUB_CHECKRUNS" | jq -r "$filter"
+      exit 0
+      ;;
+  esac
+  exit 0
+fi
+exit 90
+STUB
+chmod +x "$clear_tmp/bin/gh"
+
+# Each case asserts on a fresh log. `want_post` is whether a clearing check-run
+# should reach the API for that fixture.
+run_clear_case() {
+  local label="$1" want_post="$2" fixture="$3"
+  : > "$clear_tmp/gh.log"
+  if ! PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_CHECKRUNS="$fixture" \
+       GH_RETRY_ATTEMPTS=1 \
+       bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7" >/dev/null 2>&1; then
+    fail=$((fail + 1))
+    echo "  FAIL: --clear ($label) exited non-zero" >&2
+    return
+  fi
+  local posted=no
+  if grep -Fq 'conclusion=success' "$clear_tmp/gh.log"; then
+    posted=yes
+  fi
+  if [ "$posted" = "$want_post" ]; then
+    pass=$((pass + 1))
+    echo "  PASS: --clear ($label) posts=$posted as required (#1188)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: --clear ($label) expected posts=$want_post, got posts=$posted" >&2
+  fi
+  # A clearing pass must never publish a fresh failure.
+  if grep -Fq 'conclusion=failure' "$clear_tmp/gh.log"; then
+    fail=$((fail + 1))
+    echo "  FAIL: --clear ($label) published a failure conclusion" >&2
+  fi
+}
+
+# Latest-run-wins, proven in BOTH directions. Reading an arbitrary element here
+# reproduces the superseded-red misread the clearing arm exists to undo, so the
+# decisive run sits in the MIDDLE of each fixture: an unsorted `first` and an
+# unsorted `last` then both land on a run that disagrees with the required
+# outcome. A fixture that lists the decisive run at either end is satisfied by
+# array position alone and proves nothing about the sort — the first draft of
+# this test did exactly that and survived the mutation.
+run_clear_case "failure is latest, listed in the middle" yes \
+  '{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T02:00:00Z","id":7},{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":11},{"conclusion":"success","started_at":"2026-09-04T10:00:00Z","id":1}]}'
+run_clear_case "success is latest, listed in the middle" no \
+  '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2},{"conclusion":"success","started_at":"2026-09-05T05:00:00Z","id":9},{"conclusion":"failure","started_at":"2026-09-04T10:00:00Z","id":1}]}'
+run_clear_case "no diagnostic on this head" no \
+  '{"check_runs":[]}'
+
+# Arg contract: the clearing arm still takes exactly three positionals, so a
+# consumer calling it wrongly fails loudly rather than posting to a guessed repo.
+set +e
+PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_RETRY_ATTEMPTS=1 \
+  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 >/dev/null 2>&1
+clear_argrc=$?
+set -e
+if [ "$clear_argrc" -eq 2 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: --clear rejects a short argument list with rc=2"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --clear should exit 2 on a short argument list (got rc=$clear_argrc)" >&2
+fi
+rm -rf "$clear_tmp"
+
 # #730: the pull_request_target trigger must include `edited` so a body-edit
 # nudge (the reliable re-fire for a claude-authored Phase-4 PR after a late
 # Codex clearance) re-evaluates auto-clear on the PR head. Anchor to the

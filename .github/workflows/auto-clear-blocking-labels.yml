@@ -477,6 +477,7 @@ jobs:
           fi
           continuation_infra_error=0
           continuation_failing_prs=""
+          continuation_evaluated_prs=""
           while IFS= read -r PR; do
             [ -n "$PR" ] || continue
             case " $CLEARED_PRS " in
@@ -502,8 +503,11 @@ jobs:
             fi
             set -e
             case "$rc" in
-              0) ;;
-              4) echo "PR #$PR is not merge-ready on this event; a later completion event will re-evaluate it." ;;
+              0) continuation_evaluated_prs="$continuation_evaluated_prs $PR" ;;
+              4)
+                echo "PR #$PR is not merge-ready on this event; a later completion event will re-evaluate it."
+                continuation_evaluated_prs="$continuation_evaluated_prs $PR"
+                ;;
               *)
                 echo "::error::Approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
                 continuation_infra_error=1
@@ -514,6 +518,8 @@ jobs:
           echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITHUB_ENV"
           # shellcheck disable=SC2086  # intentional word-splitting to trim
           echo "CONTINUATION_INFRA_ERROR_PRS=$(echo $continuation_failing_prs)" >> "$GITHUB_ENV"
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "CONTINUATION_EVALUATED_PRS=$(echo $continuation_evaluated_prs)" >> "$GITHUB_ENV"
           exit "$continuation_infra_error"
 
       - name: Surface approval continuation failures as per-PR check-runs
@@ -530,6 +536,44 @@ jobs:
           fi
           bash scripts/workflow/report-approval-continuation-failures.sh \
             "$REPO" "$RUN_URL" "${CONTINUATION_INFRA_ERROR_PRS:-}"
+
+      - name: Clear superseded approval-continuation diagnostics
+        # #1188: the failure arm above is head-pinned and, before
+        # CONTINUATION_CLEAR_V1, had no counterpart anywhere — so a head that
+        # hit one transient infrastructure error kept a red
+        # `approval-merge-continuation` check-run permanently, even after the
+        # continuation it reports on later succeeded. `mergeStateStatus` then
+        # sat at UNSTABLE for the life of that head and gh-pr-guard demanded a
+        # break-glass merge for a PR with nothing wrong with it — the exact
+        # reflex #962 argues must not be trained. Observed on
+        # nathanjohnpayne/fiveacross#1108.
+        #
+        # This arm is deliberately narrow on both sides: it runs ONLY from the
+        # continuation's own clean-evaluation path (so label-absence healing
+        # still cannot clear a real failure — the invariant the reporter's
+        # header protects), and the reporter itself posts nothing unless a
+        # failure is already present on that head (so an approved PR does not
+        # accumulate a check-run per qualifying event).
+        if: always() && env.CONTINUATION_INFRA_ERROR == '0' && env.CONTINUATION_EVALUATED_PRS != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/workflow/report-approval-continuation-failures.sh ]; then
+            echo "::notice::Continuation reporter is not on the trusted default branch yet; nothing to clear."
+            exit 0
+          fi
+          # Marker guard, not a version check: a reporter predating the
+          # clearing arm rejects the 4-argument form with rc=2, which would
+          # convert this clean evaluation into a failed job.
+          if ! grep -Fq 'CONTINUATION_CLEAR_V1' scripts/workflow/report-approval-continuation-failures.sh; then
+            echo "::notice::Continuation reporter predates the clearing arm; a stale diagnostic on this head clears on the next sync."
+            exit 0
+          fi
+          bash scripts/workflow/report-approval-continuation-failures.sh --clear \
+            "$REPO" "$RUN_URL" "${CONTINUATION_EVALUATED_PRS:-}"
 
       - name: Surface infra failure as per-PR check-runs
         # Run even when the prior step failed — `if: always()` + the
@@ -891,6 +935,7 @@ jobs:
           fi
           continuation_infra_error=0
           continuation_failing_prs=""
+          continuation_evaluated_prs=""
           while IFS= read -r PR; do
             [ -n "$PR" ] || continue
             set +e
@@ -910,8 +955,11 @@ jobs:
             fi
             set -e
             case "$rc" in
-              0) ;;
-              4) echo "PR #$PR is not merge-ready; a later event or sweep will re-evaluate it." ;;
+              0) continuation_evaluated_prs="$continuation_evaluated_prs $PR" ;;
+              4)
+                echo "PR #$PR is not merge-ready; a later event or sweep will re-evaluate it."
+                continuation_evaluated_prs="$continuation_evaluated_prs $PR"
+                ;;
               *)
                 echo "::error::Scheduled approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
                 continuation_infra_error=1
@@ -922,6 +970,8 @@ jobs:
           echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITHUB_ENV"
           # shellcheck disable=SC2086  # intentional word-splitting to trim
           echo "CONTINUATION_INFRA_ERROR_PRS=$(echo $continuation_failing_prs)" >> "$GITHUB_ENV"
+          # shellcheck disable=SC2086  # intentional word-splitting to trim
+          echo "CONTINUATION_EVALUATED_PRS=$(echo $continuation_evaluated_prs)" >> "$GITHUB_ENV"
           exit "$continuation_infra_error"
 
       - name: Surface approval continuation failures as per-PR check-runs
@@ -938,6 +988,44 @@ jobs:
           fi
           bash scripts/workflow/report-approval-continuation-failures.sh \
             "$REPO" "$RUN_URL" "${CONTINUATION_INFRA_ERROR_PRS:-}"
+
+      - name: Clear superseded approval-continuation diagnostics
+        # #1188: the failure arm above is head-pinned and, before
+        # CONTINUATION_CLEAR_V1, had no counterpart anywhere — so a head that
+        # hit one transient infrastructure error kept a red
+        # `approval-merge-continuation` check-run permanently, even after the
+        # continuation it reports on later succeeded. `mergeStateStatus` then
+        # sat at UNSTABLE for the life of that head and gh-pr-guard demanded a
+        # break-glass merge for a PR with nothing wrong with it — the exact
+        # reflex #962 argues must not be trained. Observed on
+        # nathanjohnpayne/fiveacross#1108.
+        #
+        # This arm is deliberately narrow on both sides: it runs ONLY from the
+        # continuation's own clean-evaluation path (so label-absence healing
+        # still cannot clear a real failure — the invariant the reporter's
+        # header protects), and the reporter itself posts nothing unless a
+        # failure is already present on that head (so an approved PR does not
+        # accumulate a check-run per qualifying event).
+        if: always() && env.CONTINUATION_INFRA_ERROR == '0' && env.CONTINUATION_EVALUATED_PRS != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/workflow/report-approval-continuation-failures.sh ]; then
+            echo "::notice::Continuation reporter is not on the trusted default branch yet; nothing to clear."
+            exit 0
+          fi
+          # Marker guard, not a version check: a reporter predating the
+          # clearing arm rejects the 4-argument form with rc=2, which would
+          # convert this clean evaluation into a failed job.
+          if ! grep -Fq 'CONTINUATION_CLEAR_V1' scripts/workflow/report-approval-continuation-failures.sh; then
+            echo "::notice::Continuation reporter predates the clearing arm; a stale diagnostic on this head clears on the next sync."
+            exit 0
+          fi
+          bash scripts/workflow/report-approval-continuation-failures.sh --clear \
+            "$REPO" "$RUN_URL" "${CONTINUATION_EVALUATED_PRS:-}"
 
       - name: Surface infra failure as per-PR check-runs
         # Mirrors evaluate-and-clear's surfacing step. See that step's
