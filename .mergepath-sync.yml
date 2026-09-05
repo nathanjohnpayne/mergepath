@@ -2020,10 +2020,12 @@ doc_ownership:
   - path: docs/agents/documentation-rules.md
     class: per-repo-owned
     note: >-
-      MIXED, and confirmed so by the fleet: all 9 consumer copies differ
-      from the hub and from each other, and every one of them is a
-      repo-specific list of which of ITS docs to update when. Stays
-      per-repo-owned. #780 step 6 extracted the prose line-wrapping rule
+      MIXED, and confirmed so by the fleet. Re-measured 2026-09-05
+      against hub 5aea5db (the prior "all 9" was undated and stale):
+      all 7 consumer copies differ from the hub AND from each other
+      (7 distinct md5s), they run 421-5763 bytes against the hub's
+      6916, and every one of them is a repo-specific list of which of
+      ITS docs to update when. Stays per-repo-owned. #780 step 6 extracted the prose line-wrapping rule
       into canonical docs/agents/prose-line-wrapping.md and left the
       allowlist + gate behind. Canonical-source discipline was
       deliberately NOT extracted: as written it names
@@ -2038,18 +2040,29 @@ doc_ownership:
       repo-specific by construction, so it stays per-repo-owned. #780
       step 6 declined to mint a canonical deploy doc and extracted the
       universal floor into shared-operating-rules.md § Secret handling
-      instead. Evidence for declining: the 9 consumer copies are 925-2814
-      bytes against the hub's 6853 and are already rewritten to each
-      repo's own deploy story; only 2 of 4 sampled carry the
+      instead. Evidence for declining, re-measured 2026-09-05 against
+      hub 5aea5db (the prior "9 copies / 925-2814 bytes / hub's 6853"
+      was undated and is now wrong in all three figures): the 7 consumer
+      copies run 925-11848 bytes against the hub's 6916, and are
+      largely rewritten to each repo's own deploy story. Two caveats the
+      old note's numbers hid. (1) They do NOT all differ from each
+      other: matchline and tadlockpsychiatry are byte-identical
+      (md5 1e2f0bae, 1358 bytes), so "rewritten per repo" is the trend,
+      not a universal. (2) fiveacross is now the fleet's LARGEST copy at
+      11848 bytes, well above the hub — the upper bound moved by 4x.
+      Also: only 2 of 4 sampled carry the
       no-downgrade invariant, in incompatible wordings ("template-derived
       repos" vs "this repo"); the surrounding procedure depends on
       op-firebase-deploy, a PATH command rather than a guaranteed repo
       file; and the one procedural rule that IS universal (the op
-      sign-in pause-and-prompt) was already canonical. Residual:
-      gaycruisebingo's copy is still byte-identical to the hub's
-      (un-scrubbed bootstrap residue asserting a hub-only workflow it
-      does not have — the #744/#747 class), a consumer-side deletion for
-      the steps 4-5 migration wave.
+      sign-in pause-and-prompt) was already canonical. Residual
+      (RESOLVED, verified 2026-09-05): the note recorded gaycruisebingo's
+      copy as byte-identical to the hub's — un-scrubbed bootstrap residue
+      of the #744/#747 class, pending a consumer-side deletion. That repo
+      was renamed fiveacross on 2026-08-27, and its copy is no longer
+      identical to the hub (11848 bytes against 6916), so the residue has
+      since been scrubbed and rewritten. No migration-wave deletion is
+      outstanding on this path.
   - path: docs/agents/repository-overview.md
     class: per-repo-owned
   - path: docs/agents/testing-requirements.md
