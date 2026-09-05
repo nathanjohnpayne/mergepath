@@ -55,14 +55,26 @@ source "$ROOT/scripts/lib/gh-retry-helpers.sh"
 # superseded red read as current state.
 latest_conclusion() {
   local head_sha="$1" runs
-  runs=$(with_gh_retry gh api \
+  # `--paginate` is not belt-and-braces next to per_page=100:
+  # docs/agents/shared-operating-rules.md names this exact endpoint, and a head
+  # that has been through repeated scheduled-sweep re-evaluations has been
+  # observed carrying 194 check-runs (#687). An unpaginated read returns page 1
+  # cleanly, with no error and no signal that more exist, so the newest run can
+  # sit on page 2 and this function would confidently answer with a superseded
+  # one. gh applies `--jq` per page, so the result is a STREAM of objects that
+  # `jq -s` slurps whole before selecting.
+  runs=$(with_gh_retry gh api --paginate \
     "repos/$REPO/commits/$head_sha/check-runs?check_name=$CHECK_NAME&per_page=100" \
-    --jq '[.check_runs[] | {conclusion, started_at, id}]') || return 1
-  jq -r 'sort_by(.started_at, .id) | last | .conclusion // "none"' <<<"$runs"
+    --jq '.check_runs[] | {conclusion, started_at, id}') || return 1
+  jq -rs 'sort_by(.started_at, .id) | last | .conclusion // "none"' <<<"$runs"
 }
 
 for PR in $PR_NUMBERS; do
-  echo "::group::${MODE^} approval-continuation state for PR #$PR"
+  # Deliberately plain interpolation: bash 4 case-modification expansions abort
+  # stock macOS bash 3.2 with "bad substitution" before either arm can post, and
+  # check_auto_clear_workflow greps this file to keep them out. Naming the
+  # operator here would match that grep, so it is described rather than written.
+  echo "::group::approval-continuation ($MODE) for PR #$PR"
   if ! HEAD_SHA=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
     echo "::warning::Failed to resolve head SHA for PR #$PR; the workflow log remains authoritative."
     echo "::endgroup::"

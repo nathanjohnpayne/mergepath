@@ -479,16 +479,17 @@ rm -rf "$reporter_tmp"
 # written and precisely the mutation it failed to catch.
 continuation_clear_count=$(grep -cE '^[[:space:]]+- name: Clear superseded approval-continuation diagnostics$' "$WORKFLOW" || true)
 if [ "$continuation_clear_count" -eq 2 ] \
-   && [ "$(grep -cF "env.CONTINUATION_INFRA_ERROR == '0'" "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cE "^[[:space:]]+if: always\(\) && env\.CONTINUATION_EVALUATED_PRS != ''\$" "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF "env.CONTINUATION_INFRA_ERROR == '0'" "$WORKFLOW")" -eq 0 ] \
    && [ "$(grep -cF 'CONTINUATION_EVALUATED_PRS' "$WORKFLOW")" -ge 4 ] \
    && [ "$(grep -cF "report-approval-continuation-failures.sh --clear" "$WORKFLOW")" -eq 2 ] \
    && [ "$(grep -cF "grep -Fq 'CONTINUATION_CLEAR_V1'" "$WORKFLOW")" -eq 2 ] \
    && grep -Fq 'CONTINUATION_CLEAR_V1' "$CONTINUATION_REPORTER"; then
   pass=$((pass + 1))
-  echo "  PASS: both continuation loops clear a superseded diagnostic after a clean evaluation (#1188)"
+  echo "  PASS: both continuation loops clear per-PR after a clean evaluation, without the batch sentinel (#1188)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: each continuation loop must run a marker-guarded --clear arm on a clean evaluation (#1188)" >&2
+  echo "  FAIL: each continuation loop must run a marker-guarded --clear arm gated on the per-PR evaluated list, never on the batch-wide infra sentinel (#1188)" >&2
 fi
 
 clear_tmp=$(mktemp -d "${TMPDIR:-/tmp}/continuation-clear.XXXXXX")
@@ -501,15 +502,33 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   exit 0
 fi
 if [ "$1" = "api" ]; then
-  case "${2:-}" in
+  # Scan every argument for the endpoint rather than assuming a position:
+  # `gh api --paginate <endpoint>` puts the flag where a positional match would
+  # look, and a stub that quietly stops matching returns an empty result that
+  # reads exactly like "no diagnostic on this head".
+  endpoint=""
+  for a in "$@"; do
+    case "$a" in
+      */commits/*/check-runs*) endpoint="$a" ;;
+    esac
+  done
+  case "$endpoint" in
     *"/commits/"*"/check-runs"*)
+      # Emulates gh: --jq is applied per page, and page 2 exists only when the
+      # caller actually passed --paginate. A caller that drops the flag sees
+      # page 1 alone, exactly as the real endpoint behaves.
       filter='.'
       prev=""
+      paginate=no
       for a in "$@"; do
         [ "$prev" = "--jq" ] && filter="$a"
+        [ "$a" = "--paginate" ] && paginate=yes
         prev="$a"
       done
       printf '%s' "$GH_STUB_CHECKRUNS" | jq -r "$filter"
+      if [ "$paginate" = yes ] && [ -n "${GH_STUB_CHECKRUNS_P2:-}" ]; then
+        printf '%s' "$GH_STUB_CHECKRUNS_P2" | jq -r "$filter"
+      fi
       exit 0
       ;;
   esac
@@ -522,9 +541,10 @@ chmod +x "$clear_tmp/bin/gh"
 # Each case asserts on a fresh log. `want_post` is whether a clearing check-run
 # should reach the API for that fixture.
 run_clear_case() {
-  local label="$1" want_post="$2" fixture="$3"
+  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}"
   : > "$clear_tmp/gh.log"
   if ! PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_CHECKRUNS="$fixture" \
+       GH_STUB_CHECKRUNS_P2="$fixture_p2" \
        GH_RETRY_ATTEMPTS=1 \
        bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7" >/dev/null 2>&1; then
     fail=$((fail + 1))
@@ -562,6 +582,17 @@ run_clear_case "success is latest, listed in the middle" no \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2},{"conclusion":"success","started_at":"2026-09-05T05:00:00Z","id":9},{"conclusion":"failure","started_at":"2026-09-04T10:00:00Z","id":1}]}'
 run_clear_case "no diagnostic on this head" no \
   '{"check_runs":[]}'
+# Page 1 says failure, page 2 carries the newer success. An unpaginated read
+# returns page 1 cleanly with no signal that page 2 exists, so it would clear a
+# head whose latest run is already green — the same silent truncation
+# docs/agents/shared-operating-rules.md documents for this endpoint (194
+# check-runs on one head, #687).
+run_clear_case "latest run is on page 2" no \
+  '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2}]}' \
+  '{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T06:00:00Z","id":40}]}'
+run_clear_case "page 2 carries the newer failure" yes \
+  '{"check_runs":[{"conclusion":"success","started_at":"2026-09-04T09:00:00Z","id":3}]}' \
+  '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T06:00:00Z","id":41}]}'
 
 # Arg contract: the clearing arm still takes exactly three positionals, so a
 # consumer calling it wrongly fails loudly rather than posting to a guessed repo.
@@ -576,6 +607,15 @@ if [ "$clear_argrc" -eq 2 ]; then
 else
   fail=$((fail + 1))
   echo "  FAIL: --clear should exit 2 on a short argument list (got rc=$clear_argrc)" >&2
+fi
+# Stock macOS ships bash 3.2, where `${VAR^}` aborts with "bad substitution"
+# before either arm can post. The hosted Ubuntu runner masks it, so pin it here.
+if grep -qE '\$\{[A-Za-z_][A-Za-z0-9_]*\^' "$CONTINUATION_REPORTER"; then
+  fail=$((fail + 1))
+  echo "  FAIL: reporter uses a bash 4-only case-modification expansion; stock macOS bash 3.2 aborts on it" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: reporter avoids bash 4-only case-modification expansions"
 fi
 rm -rf "$clear_tmp"
 

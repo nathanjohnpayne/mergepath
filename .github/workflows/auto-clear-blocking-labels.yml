@@ -554,7 +554,15 @@ jobs:
         # header protects), and the reporter itself posts nothing unless a
         # failure is already present on that head (so an approved PR does not
         # accumulate a check-run per qualifying event).
-        if: always() && env.CONTINUATION_INFRA_ERROR == '0' && env.CONTINUATION_EVALUATED_PRS != ''
+        # Gated on the per-PR evaluated list ALONE, deliberately not on the
+        # batch-wide CONTINUATION_INFRA_ERROR sentinel. In the scheduled sweep
+        # that list spans every open approved PR, so one persistently
+        # misconfigured PR would otherwise suppress clearing for every PR that
+        # independently reached a clean verdict, indefinitely. The list already
+        # carries exactly the PRs that reached a definite non-infra verdict, so
+        # a PR that errored is excluded by construction rather than by the
+        # sentinel — narrower AND more correct.
+        if: always() && env.CONTINUATION_EVALUATED_PRS != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -1006,7 +1014,15 @@ jobs:
         # header protects), and the reporter itself posts nothing unless a
         # failure is already present on that head (so an approved PR does not
         # accumulate a check-run per qualifying event).
-        if: always() && env.CONTINUATION_INFRA_ERROR == '0' && env.CONTINUATION_EVALUATED_PRS != ''
+        # Gated on the per-PR evaluated list ALONE, deliberately not on the
+        # batch-wide CONTINUATION_INFRA_ERROR sentinel. In the scheduled sweep
+        # that list spans every open approved PR, so one persistently
+        # misconfigured PR would otherwise suppress clearing for every PR that
+        # independently reached a clean verdict, indefinitely. The list already
+        # carries exactly the PRs that reached a definite non-infra verdict, so
+        # a PR that errored is excluded by construction rather than by the
+        # sentinel — narrower AND more correct.
+        if: always() && env.CONTINUATION_EVALUATED_PRS != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
