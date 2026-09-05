@@ -21,8 +21,12 @@
 #     (or any other unrelated path) still cannot convert a failure to success.
 #   * It only ever supersedes a failure it can see. If the head carries no
 #     `approval-merge-continuation` check-run, or its latest one is not a
-#     failure, `--clear` posts nothing. Without that guard every approved PR
+#     failure, `--clear` writes nothing. Without that guard every approved PR
 #     fleet-wide would grow a fresh check-run on every qualifying event.
+#   * It UPDATES the run it selected rather than creating a newer success.
+#     Creating one would re-enter the latest-run-wins race: a failure published
+#     between the read and the write would be the newest evidence, and a fresh
+#     success would bury it. Updating the selected run cannot bury anything.
 #
 # `--clear` therefore takes `PR:SHA:EPOCH`, not a bare PR number. Re-resolving
 # the head at POST time is unsafe on its own: a push landing between the verdict
@@ -82,11 +86,15 @@ latest_conclusion() {
   # fromdateiso8601 keeps the comparison inside jq: converting timestamps in
   # shell would need date(1), whose flags differ between GNU and BSD — the
   # portability trap this script was fixed for one round ago.
+  # Emits "<conclusion> <run-id>". The ID is the point: clearing PATCHes that
+  # specific run rather than creating a newer one, so the outcome no longer
+  # depends on this script winning a latest-run-wins race against a failure
+  # published between the read and the write.
   jq -rs --argjson cutoff "$cutoff" '
     sort_by(.started_at, .id) | last
-    | if . == null then "none"
-      elif (.started_at | fromdateiso8601) >= $cutoff then "newer-than-verdict"
-      else (.conclusion // "none") end' <<<"$runs"
+    | if . == null then "none 0"
+      elif (.started_at | fromdateiso8601) >= $cutoff then "newer-than-verdict 0"
+      else ((.conclusion // "none") + " " + (.id | tostring)) end' <<<"$runs"
 }
 
 for ENTRY in $PR_NUMBERS; do
@@ -138,20 +146,34 @@ for ENTRY in $PR_NUMBERS; do
       echo "::endgroup::"
       continue
     fi
-    if [ "$CURRENT" != failure ]; then
-      echo "PR #$PR carries no supersedable $CHECK_NAME diagnostic on $EVAL_HEAD (latest: $CURRENT); nothing to clear."
+    CURRENT_CONCLUSION="${CURRENT%% *}"
+    CURRENT_RUN_ID="${CURRENT##* }"
+    if [ "$CURRENT_CONCLUSION" != failure ]; then
+      echo "PR #$PR carries no supersedable $CHECK_NAME diagnostic on $EVAL_HEAD (latest: $CURRENT_CONCLUSION); nothing to clear."
       echo "::endgroup::"
       continue
     fi
-    with_gh_retry gh api "repos/$REPO/check-runs" \
-      -X POST \
-      -f name="$CHECK_NAME" \
-      -f "head_sha=$EVAL_HEAD" \
-      -f status='completed' \
+    case "$CURRENT_RUN_ID" in
+      ''|0|*[!0-9]*)
+        echo "::warning::PR #$PR has a failing $CHECK_NAME diagnostic on $EVAL_HEAD but no usable run id; leaving it untouched."
+        echo "::endgroup::"
+        continue
+        ;;
+    esac
+    # PATCH the run we actually selected, rather than POSTing a newer success.
+    # Creating a run would re-enter the latest-run-wins race this script exists
+    # to arbitrate: a failure published between the read above and the write
+    # below would be the newest evidence, and a fresh success would bury it.
+    # Updating run $CURRENT_RUN_ID cannot bury anything — a newer failure stays
+    # newer, stays current, and keeps blocking. Both runs come from the same
+    # GitHub App (this workflow's GITHUB_TOKEN), which is what makes the update
+    # permitted at all.
+    with_gh_retry gh api "repos/$REPO/check-runs/$CURRENT_RUN_ID" \
+      -X PATCH \
       -f conclusion='success' \
       -F "output[title]=Approval continuation completed without infrastructure error" \
-      -F "output[summary]=PR #$PR was re-evaluated cleanly, superseding an earlier infrastructure diagnostic on this head. See workflow run logs: $RUN_URL" \
-      || echo "::warning::Failed to post the clearing check-run for PR #$PR; the stale diagnostic remains on $EVAL_HEAD."
+      -F "output[summary]=PR #$PR was re-evaluated cleanly on $EVAL_HEAD, superseding the infrastructure diagnostic this run originally recorded. See workflow run logs: $RUN_URL" \
+      || echo "::warning::Failed to clear check-run $CURRENT_RUN_ID for PR #$PR; the stale diagnostic remains on $EVAL_HEAD."
     echo "::endgroup::"
     continue
   fi

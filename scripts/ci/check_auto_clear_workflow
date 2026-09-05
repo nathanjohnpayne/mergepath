@@ -533,6 +533,9 @@ if [ "$1" = "api" ]; then
       fi
       exit 0
       ;;
+    */check-runs/*)
+      exit 0
+      ;;
   esac
   exit 0
 fi
@@ -549,7 +552,7 @@ chmod +x "$clear_tmp/bin/gh"
 VERDICT_AFTER=1788609600
 VERDICT_BEFORE=1788480000
 run_clear_case() {
-  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}" entry="${5:-7:abc123:$VERDICT_AFTER}"
+  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}" entry="${5:-7:abc123:$VERDICT_AFTER}" expect_run_id="${6:-[0-9]+}"
   : > "$clear_tmp/gh.log"
   if ! PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_CHECKRUNS="$fixture" \
        GH_STUB_CHECKRUNS_P2="$fixture_p2" \
@@ -563,6 +566,13 @@ run_clear_case() {
   if grep -Fq 'conclusion=success' "$clear_tmp/gh.log"; then
     posted=yes
   fi
+  # A clear must never CREATE a check-run. Creating one re-enters the
+  # latest-run-wins race: a failure published between the read and the write
+  # would be newer evidence, and a fresh success would bury it.
+  if grep -Eq '(^| )api repos/[^ ]*/check-runs( |$)' "$clear_tmp/gh.log"; then
+    fail=$((fail + 1))
+    echo "  FAIL: --clear ($label) created a new check-run instead of updating the selected one" >&2
+  fi
   if [ "$posted" = "$want_post" ]; then
     pass=$((pass + 1))
     echo "  PASS: --clear ($label) posts=$posted as required (#1188)"
@@ -575,17 +585,19 @@ run_clear_case() {
     fail=$((fail + 1))
     echo "  FAIL: --clear ($label) published a failure conclusion" >&2
   fi
-  # Whatever it posts must be pinned to the head the verdict was about, not to
-  # whatever the head happens to be when the POST goes out.
+  # The write must target the run selected from the EVALUATED head. The head
+  # pinning now shows up as which run id was chosen, since the read is scoped to
+  # that head and the write addresses the run by id.
   if [ "$posted" = yes ]; then
     local pinned="${entry#*:}"
     pinned="${pinned%%:*}"
-    if grep -Fq "head_sha=$pinned" "$clear_tmp/gh.log"; then
+    if grep -Fq "commits/$pinned/check-runs" "$clear_tmp/gh.log" \
+       && grep -Eq "api repos/[^ ]*/check-runs/${expect_run_id:-[0-9]+} " "$clear_tmp/gh.log"; then
       pass=$((pass + 1))
-      echo "  PASS: --clear ($label) pinned the write to the evaluated head"
+      echo "  PASS: --clear ($label) updated the run selected from the evaluated head"
     else
       fail=$((fail + 1))
-      echo "  FAIL: --clear ($label) posted against a head other than the evaluated one" >&2
+      echo "  FAIL: --clear ($label) did not update the run selected from the evaluated head" >&2
     fi
   fi
 }
@@ -598,7 +610,8 @@ run_clear_case() {
 # array position alone and proves nothing about the sort — the first draft of
 # this test did exactly that and survived the mutation.
 run_clear_case "failure is latest, listed in the middle" yes \
-  '{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T02:00:00Z","id":7},{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":11},{"conclusion":"success","started_at":"2026-09-04T10:00:00Z","id":1}]}'
+  '{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T02:00:00Z","id":7},{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":11},{"conclusion":"success","started_at":"2026-09-04T10:00:00Z","id":1}]}' \
+  "" "7:abc123:$VERDICT_AFTER" 11
 run_clear_case "success is latest, listed in the middle" no \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2},{"conclusion":"success","started_at":"2026-09-05T05:00:00Z","id":9},{"conclusion":"failure","started_at":"2026-09-04T10:00:00Z","id":1}]}'
 run_clear_case "no diagnostic on this head" no \
@@ -613,7 +626,8 @@ run_clear_case "latest run is on page 2" no \
   '{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T06:00:00Z","id":40}]}'
 run_clear_case "page 2 carries the newer failure" yes \
   '{"check_runs":[{"conclusion":"success","started_at":"2026-09-04T09:00:00Z","id":3}]}' \
-  '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T06:00:00Z","id":41}]}'
+  '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T06:00:00Z","id":41}]}' \
+  "7:abc123:$VERDICT_AFTER" 41
 
 # The head moved between the verdict and this call. The verdict describes a head
 # that is no longer current, so it must not publish anything: re-resolving the
@@ -628,6 +642,27 @@ run_clear_case "head moved since the verdict" no \
 run_clear_case "failure is newer than the verdict" no \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2}]}' \
   "" "7:abc123:$VERDICT_BEFORE"
+
+# Interleaving regression (CodeRabbit P1). The clear must address the run it
+# SELECTED, by id. Creating a new success instead would make the clear the
+# newest run on the head, so a failure published between the read and the write
+# would be silently buried under it — the exact latest-run-wins race this whole
+# script arbitrates. Updating run 11 cannot bury a run that does not exist yet:
+# a newer failure stays newer, stays current, and keeps blocking.
+: > "$clear_tmp/gh.log"
+PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" \
+  GH_STUB_CHECKRUNS='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":11}]}' \
+  GH_RETRY_ATTEMPTS=1 \
+  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7:abc123:$VERDICT_AFTER" >/dev/null 2>&1 || true
+if grep -Eq 'api repos/owner/repo/check-runs/11( |$)' "$clear_tmp/gh.log" \
+   && grep -Fq 'PATCH' "$clear_tmp/gh.log" \
+   && ! grep -Eq '(^| )api repos/owner/repo/check-runs( |$)' "$clear_tmp/gh.log"; then
+  pass=$((pass + 1))
+  echo "  PASS: --clear updates the selected run by id and never creates a competing one (#1188)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --clear must PATCH the selected run id, not create a success that can bury a newer failure (#1188)" >&2
+fi
 
 # A caller that passes a bare PR number has lost the head pinning entirely.
 # Asserting only "posts nothing" would pass for the WRONG reason: with the shape
