@@ -486,12 +486,32 @@ if [ "$continuation_clear_count" -eq 2 ] \
    && [ "$(grep -cF "grep -Fq 'CONTINUATION_CLEAR_V1'" "$WORKFLOW")" -eq 2 ] \
    && [ "$(grep -cF 'eval_started_at=$(date -u +%s)' "$WORKFLOW")" -eq 2 ] \
    && [ "$(grep -cF '$PR:$eval_head:$eval_started_at' "$WORKFLOW")" -eq 4 ] \
+   && [ "$(grep -cF 'continuation_evaluated=0' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF 'continuation_evaluated=1' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF 'if [ "$continuation_evaluated" = 1 ] && [ -n "$eval_head" ]; then' "$WORKFLOW")" -eq 4 ] \
    && grep -Fq 'CONTINUATION_CLEAR_V1' "$CONTINUATION_REPORTER"; then
   pass=$((pass + 1))
   echo "  PASS: both continuation loops clear per-PR after a clean evaluation, without the batch sentinel (#1188)"
 else
   fail=$((fail + 1))
   echo "  FAIL: each continuation loop must run a marker-guarded --clear arm gated on the per-PR evaluated list, never on the batch-wide infra sentinel (#1188)" >&2
+fi
+
+# rc=0 means two different things in these loops. The AUTHOR_MERGE_TOKEN-unset
+# branch sets rc=0 after protective retraction alone and deliberately SKIPS the
+# author-token continuation, so it is not a verdict about the PR. Recording it
+# for clearing would patch a diagnostic left by the very path that never ran —
+# an invalid author-token identity or an API failure cleared unexamined. Only
+# the branch that actually invokes the author-token helper may set the flag, so
+# assert the flag is raised inside that branch and nowhere else.
+if [ "$(grep -cF 'continuation_evaluated=1' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(awk '/AUTHOR_MERGE_TOKEN is not configured/{f=1} f&&/continuation_evaluated=1/{print "leaked"; exit} f&&/elif \[ "\$protective_rc" -eq 0 \]/{f=0}' "$WORKFLOW" | grep -c leaked)" -eq 0 ] \
+   && grep -qF 'continuation_evaluated=1' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: only a real author-token continuation marks a PR clearable, not the disabled path (#1188)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the AUTHOR_MERGE_TOKEN-unset path must not record a PR for diagnostic clearing (#1188)" >&2
 fi
 
 clear_tmp=$(mktemp -d "${TMPDIR:-/tmp}/continuation-clear.XXXXXX")
