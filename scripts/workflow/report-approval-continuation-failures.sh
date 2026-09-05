@@ -45,6 +45,18 @@
 # failure published DURING or AFTER that verdict from being cleared by it --
 # newer evidence outranks an older verdict even on the same head.
 #
+# DELIBERATELY OUT OF SCOPE (#1191): this records nothing when the head carries
+# no diagnostic at all. An older invocation that fails and reaches its reporter
+# after a newer clean one has already run its clear therefore has no clean
+# verdict to be judged against, and publishes a stale failure. Closing that
+# needs a durable clean watermark, and a watermark on the checks API turned out
+# to pull in a create (which re-opens the burial race in the fail-open
+# direction), a read-after-write reconciliation, and a summary field doing
+# double duty as current state and history log -- five of six findings in one
+# review round were interactions between those rules. The substrate is the
+# problem, so #1191 settles where the watermark lives instead of bolting one
+# on here.
+#
 # The failure conclusion stays `failure` rather than softening to `neutral`.
 # "We could not verify this is safe to merge" should block; the defect was the
 # missing exit, not the severity.
@@ -138,8 +150,8 @@ latest_run() {
         # The CURRENT marker is the first one: a cleared diagnostic carries the
         # superseded summary verbatim, so the text also contains the OLD marker
         # of that record. `contains` searches the whole string and would classify
-        # a full-stage watermark as protective purely because it preserved a
-        # protective diagnostic -- reading history as if it were current state.
+        # a full-stage cleared record as protective purely because it preserved
+        # a protective diagnostic -- reading history as if it were current state.
         # (No apostrophes here: this comment sits inside a single-quoted jq
         # program, where one would close the shell string mid-expression.)
         stage: ((.summary | split($marker)) as $sp
@@ -148,22 +160,6 @@ latest_run() {
         summary: .summary,
         at: (marked_epoch(.summary) // (.started_at | fromdateiso8601))
       } end' <<<"$runs"
-}
-
-# Emits the summary of the newest FAILURE on $1 whose evaluation is strictly
-# newer than $2, or nothing. Used only for the read-after-write check below.
-failure_newer_than() {
-  local head_sha="$1" cutoff="$2" runs
-  runs=$(with_gh_retry gh api --paginate \
-    "repos/$REPO/commits/$head_sha/check-runs?check_name=$CHECK_NAME&per_page=100" \
-    --jq '.check_runs[] | {conclusion, started_at, id, summary: (.output.summary // "")}') || return 1
-  jq -rs --argjson cutoff "$cutoff" --arg evmarker "$EVAL_MARKER_PREFIX" '
-    def marked_epoch(s): (s | split($evmarker)) as $p
-      | if ($p | length) > 1 then ($p[1] | split("]")[0] | tonumber? ) else null end;
-    [ .[]
-      | select(.conclusion == "failure")
-      | select((marked_epoch(.summary) // (.started_at | fromdateiso8601)) > $cutoff) ]
-    | sort_by(.started_at, .id) | last | .summary // ""' <<<"$runs"
 }
 
 # A verdict from stage $1 may speak for a record from stage $2. A full
@@ -265,56 +261,8 @@ for ENTRY in $PR_NUMBERS; do
       continue
     fi
 
-    WATERMARK_SUMMARY="PR #$PR completed an approval continuation on $EVAL_HEAD at the $VERDICT_STAGE stage with no infrastructure error. ${STAGE_MARKER_PREFIX}${VERDICT_STAGE}] ${EVAL_MARKER_PREFIX}${EVAL_STARTED}] Clearing run: $RUN_URL"
-
-    # No diagnostic to supersede — record the clean verdict instead of writing
-    # nothing (#1191). Without a durable record of "a clean evaluation happened
-    # at T", an OLDER evaluation that fails and reaches its reporter after this
-    # step has nothing to be judged against, so it publishes a stale failure
-    # that no later event is guaranteed to clear. That is the #1188 bug by a
-    # narrower route, and it is why this writes a watermark rather than
-    # returning early. It creates at most ONE check-run per head: every later
-    # clean verdict PATCHes this same run rather than adding another.
     if [ "$SEL_STATE" = none ]; then
-      with_gh_retry gh api "repos/$REPO/check-runs" \
-        -X POST \
-        -f name="$CHECK_NAME" \
-        -f "head_sha=$EVAL_HEAD" \
-        -f status='completed' \
-        -f conclusion='success' \
-        -F "output[title]=Approval continuation completed without infrastructure error" \
-        -F "output[summary]=$WATERMARK_SUMMARY" \
-        || echo "::warning::Failed to record the clean-verdict watermark for PR #$PR; a late stale failure on $EVAL_HEAD would have nothing to be judged against."
-      # Read-after-write. This POST makes our watermark the newest run on the
-      # head, so a failure published between the read above and this write is
-      # now hidden beneath it. Left alone that trades #1188's fail-CLOSED bug
-      # for a fail-OPEN one -- a merge-blocking diagnostic silently removed --
-      # which is the wrong direction and worse than the gap being closed. If a
-      # failure newer than this verdict exists, restore the block by turning
-      # our own watermark into it, carrying its evidence.
-      if BURIED=$(failure_newer_than "$EVAL_HEAD" "$EVAL_STARTED"); then
-        if [ -n "$BURIED" ]; then
-          if ! WM=$(latest_run "$EVAL_HEAD"); then
-            echo "::error::PR #$PR may have buried a newer failure on $EVAL_HEAD and the head could not be re-read; the workflow log is authoritative."
-          else
-            WM_ID=$(jq -r '.id // 0' <<<"$WM")
-            case "$WM_ID" in
-              ''|0|*[!0-9]*) echo "::error::PR #$PR may have buried a newer failure on $EVAL_HEAD; no usable run id to restore it." ;;
-              *)
-                echo "::warning::A failure newer than this verdict appeared on $EVAL_HEAD while the watermark was being written; restoring it."
-                with_gh_retry gh api "repos/$REPO/check-runs/$WM_ID" \
-                  -X PATCH \
-                  -f conclusion='failure' \
-                  -F "output[title]=Approval continuation hit an infrastructure error" \
-                  -F "output[summary]=$BURIED" \
-                  || echo "::error::Failed to restore the newer failure on $EVAL_HEAD after writing a watermark."
-                ;;
-            esac
-          fi
-        fi
-      else
-        echo "::warning::Could not re-read $EVAL_HEAD after writing the watermark; a concurrently-published failure may be hidden beneath it."
-      fi
+      echo "PR #$PR carries no $CHECK_NAME diagnostic on $EVAL_HEAD; nothing to clear."
       echo "::endgroup::"
       continue
     fi
@@ -327,32 +275,11 @@ for ENTRY in $PR_NUMBERS; do
         ;;
     esac
 
-    # Advance an existing watermark so later stale failures keep being rejected.
     if [ "$SEL_STATE" != failure ]; then
-      if ! stage_covers "$VERDICT_STAGE" "$SEL_STAGE"; then
-        echo "PR #$PR carries a $SEL_STAGE-stage record and this verdict only reached the $VERDICT_STAGE stage; leaving it as is."
-      else
-        # Carry any preserved history forward. Advancing a watermark used to
-        # replace the summary outright, so the diagnostic evidence appended by
-        # an earlier clear vanished on the next clean pass -- on a five-minute
-        # scheduled sweep, within minutes. That silently undid the preservation
-        # this script does when it clears.
-        CARRIED=""
-        case "$SEL_SUMMARY" in
-          *"$PRESERVED_HEADING"*) CARRIED="
-$PRESERVED_HEADING${SEL_SUMMARY#*"$PRESERVED_HEADING"}" ;;
-        esac
-        with_gh_retry gh api "repos/$REPO/check-runs/$SEL_ID" \
-          -X PATCH \
-          -f conclusion='success' \
-          -F "output[title]=Approval continuation completed without infrastructure error" \
-          -F "output[summary]=$WATERMARK_SUMMARY$CARRIED" \
-          || echo "::warning::Failed to advance the clean-verdict watermark for PR #$PR."
-      fi
+      echo "PR #$PR carries no supersedable $CHECK_NAME diagnostic on $EVAL_HEAD (latest: $SEL_STATE); nothing to clear."
       echo "::endgroup::"
       continue
     fi
-
     if ! stage_covers "$VERDICT_STAGE" "$SEL_STAGE"; then
       echo "PR #$PR has a $SEL_STAGE-stage diagnostic on $EVAL_HEAD and this verdict only reached the $VERDICT_STAGE stage; leaving it for a continuation that gets that far."
       echo "::endgroup::"
@@ -374,7 +301,7 @@ $PRESERVED_HEADING${SEL_SUMMARY#*"$PRESERVED_HEADING"}" ;;
       -X PATCH \
       -f conclusion='success' \
       -F "output[title]=Approval continuation completed without infrastructure error" \
-      -F "output[summary]=$WATERMARK_SUMMARY
+      -F "output[summary]=PR #$PR was re-evaluated cleanly on $EVAL_HEAD at the $VERDICT_STAGE stage, superseding the $SEL_STAGE-stage infrastructure diagnostic this run originally recorded. Clearing run: $RUN_URL
 
 $PRESERVED_HEADING
 $SEL_SUMMARY" \
@@ -409,29 +336,6 @@ $SEL_SUMMARY" \
     echo "::warning::Failed to resolve head SHA for PR #$PR; the workflow log remains authoritative."
     echo "::endgroup::"
     continue
-  fi
-
-  # Do not publish a failure that a NEWER clean verdict has already spoken for
-  # (#1191). Concurrent triggers let an older evaluation reach this point after
-  # a newer clean one finished; without this check that stale failure lands and
-  # no later event is guaranteed to clear it.
-  #
-  # Fails OPEN in every uncertain case — no epoch, an unreadable record, a
-  # watermark from a stage that does not cover this failure — because
-  # suppressing a real diagnostic is worse than publishing a redundant one.
-  if [ -n "$FAIL_EPOCH" ]; then
-    if EXISTING=$(latest_run "$HEAD_SHA"); then
-      EX_STATE=$(jq -r '.state' <<<"$EXISTING")
-      EX_AT=$(jq -r '.at // 0' <<<"$EXISTING")
-      EX_STAGE=$(jq -r '.stage // "full"' <<<"$EXISTING")
-      if [ "$EX_STATE" = success ] && [ "${EX_AT%.*}" -gt "$FAIL_EPOCH" ] && stage_covers "$EX_STAGE" "$FAIL_STAGE"; then
-        echo "PR #$PR already has a clean $EX_STAGE-stage continuation on $HEAD_SHA newer than this evaluation; not publishing a superseded failure."
-        echo "::endgroup::"
-        continue
-      fi
-    else
-      echo "::warning::Could not read existing $CHECK_NAME records for PR #$PR; publishing the diagnostic rather than suppressing it."
-    fi
   fi
 
   with_gh_retry gh api "repos/$REPO/check-runs" \

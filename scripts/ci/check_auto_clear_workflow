@@ -728,24 +728,21 @@ run_clear_case() {
 run_clear_case "failure is latest, listed in the middle" yes \
   '{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T02:00:00Z","id":7},{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":11},{"conclusion":"success","started_at":"2026-09-04T10:00:00Z","id":1}]}' \
   "" "7:abc123:$VERDICT_AFTER:full" 11
-# A clean verdict now ADVANCES an existing watermark rather than returning
-# early, so later stale failures keep being rejected as the verdict moves
-# forward. This case asserted the old "do nothing" contract.
-run_clear_case "clean verdict advances an existing watermark" yes \
+run_clear_case "success is latest, listed in the middle" no \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2},{"conclusion":"success","started_at":"2026-09-05T05:00:00Z","id":9},{"conclusion":"failure","started_at":"2026-09-04T10:00:00Z","id":1}]}'
-# #1191: an empty head now records the clean verdict instead of writing
-# nothing. Without a durable "a clean evaluation happened at T", an OLDER
-# evaluation that fails and reaches its reporter afterwards has nothing to be
-# judged against, so it publishes a stale failure that no later event is
-# guaranteed to clear.
-run_clear_case "empty head records a clean-verdict watermark" yes \
-  '{"check_runs":[]}' "" "7:abc123:$VERDICT_AFTER:full" "[0-9]+" "" yes
+# An empty head is left alone. Recording a clean watermark here is #1191,
+# deliberately out of scope: a watermark on the checks API pulls in a create
+# (which re-opens the burial race in the fail-open direction), a
+# read-after-write reconciliation, and a summary field doing double duty as
+# current state and history log. See the reporter header.
+run_clear_case "no diagnostic on this head" no \
+  '{"check_runs":[]}'
 # Page 1 says failure, page 2 carries the newer success. An unpaginated read
 # returns page 1 cleanly with no signal that page 2 exists, so it would clear a
 # head whose latest run is already green — the same silent truncation
 # docs/agents/shared-operating-rules.md documents for this endpoint (194
 # check-runs on one head, #687).
-run_clear_case "latest run is on page 2 (watermark advanced, not cleared)" yes \
+run_clear_case "latest run is on page 2" no \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2}]}' \
   '{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T06:00:00Z","id":40}]}'
 run_clear_case "page 2 carries the newer failure" yes \
@@ -817,90 +814,11 @@ UNMARKED_LATE='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-06T0
 run_clear_case "unmarked late failure falls back to publication time" no \
   "$UNMARKED_LATE" "" "7:abc123:$VERDICT_AFTER:full"
 
-# #1191 report-mode suppression. A stale failure must not publish once a NEWER
-# clean verdict is on record. The fixture head carries a watermark evaluated
-# AFTER this failure's own evaluation, so publishing it would resurrect a red
-# that a later evaluation has already spoken for -- and with
-# scheduled_sweep_enabled: false no later event is guaranteed to clear it.
-run_report_case() {
-  local label="$1" want_post="$2" fixture="$3" entry="$4"
-  : > "$clear_tmp/gh.log"
-  PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_CHECKRUNS="$fixture" \
-    GH_RETRY_ATTEMPTS=1 \
-    bash "$CONTINUATION_REPORTER" owner/repo https://example.test/run/1 "$entry" >/dev/null 2>&1 || true
-  local posted=no
-  grep -Fq 'conclusion=failure' "$clear_tmp/gh.log" && posted=yes
-  if [ "$posted" = "$want_post" ]; then
-    pass=$((pass + 1))
-    echo "  PASS: report ($label) posts=$posted as required (#1191)"
-  else
-    fail=$((fail + 1))
-    echo "  FAIL: report ($label) expected posts=$want_post, got posts=$posted" >&2
-  fi
-}
-
-NEWER_WATERMARK='{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T09:00:00Z","id":61,"output":{"summary":"clean [continuation-stage: full] [continuation-evaluated-at: 1788609600] ok"}}]}'
-OLDER_WATERMARK='{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T09:00:00Z","id":62,"output":{"summary":"clean [continuation-stage: full] [continuation-evaluated-at: 1788480000] ok"}}]}'
-PROT_WATERMARK='{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T09:00:00Z","id":63,"output":{"summary":"clean [continuation-stage: protective] [continuation-evaluated-at: 1788609600] ok"}}]}'
-
-# Failure evaluated BEFORE the recorded clean verdict -> superseded, suppressed.
-run_report_case "stale failure under a newer clean verdict" no \
-  "$NEWER_WATERMARK" "7:full:$VERDICT_BEFORE"
-# Failure evaluated AFTER it -> genuinely newer evidence, must publish.
-run_report_case "failure newer than the clean verdict" yes \
-  "$OLDER_WATERMARK" "7:full:$VERDICT_AFTER"
-# A protective-only watermark does not speak for a full-stage failure.
-run_report_case "protective watermark does not suppress a full-stage failure" yes \
-  "$PROT_WATERMARK" "7:full:$VERDICT_BEFORE"
-# No epoch -> nothing to compare -> fail OPEN and publish, never suppress.
-run_report_case "no evaluation epoch fails open and publishes" yes \
-  "$NEWER_WATERMARK" "7:full"
-
-# The watermark create must not trade a fail-closed bug for a fail-open one.
-# The head reads empty, so a watermark is written; the stub then reports a
-# failure NEWER than the verdict, i.e. one published in the gap. The reporter
-# must notice and restore the block rather than leave it buried under a green.
-: > "$clear_tmp/gh.log"
-PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" \
-  GH_STUB_CHECKRUNS='{"check_runs":[]}' \
-  GH_STUB_CHECKRUNS_AFTER='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T13:00:00Z","id":71,"output":{"summary":"real boom [continuation-stage: full] [continuation-evaluated-at: 1788696000] see run"}}]}' \
-  GH_RETRY_ATTEMPTS=1 \
-  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7:abc123:$VERDICT_AFTER:full" >/dev/null 2>&1 || true
-if grep -Fq 'conclusion=failure' "$clear_tmp/gh.log" && grep -Fq 'real boom' "$clear_tmp/gh.log"; then
-  pass=$((pass + 1))
-  echo "  PASS: a failure buried by the watermark write is detected and restored (#1191)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: the watermark write must restore a newer failure it buried, not leave a false green (#1191)" >&2
-fi
-
-# A cleared diagnostic carries the superseded summary verbatim, so the record
-# contains BOTH the current marker and the historical one it preserved. Reading
-# the whole string classifies a full-stage watermark as protective purely
-# because of what it preserved -- history read as current state -- and a later
-# stale full-stage failure then escapes suppression.
-CLEARED_WITH_HISTORY='{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T09:00:00Z","id":81,"output":{"summary":"clean [continuation-stage: full] [continuation-evaluated-at: 1788609600] ok\nSuperseded diagnostic, preserved verbatim:\nboom [continuation-stage: protective] [continuation-evaluated-at: 1788480000] old"}}]}'
-run_report_case "watermark carrying preserved protective history reads as full" no \
-  "$CLEARED_WITH_HISTORY" "7:full:$VERDICT_BEFORE"
-
-# Same record, but evaluated BEFORE the verdict, so the advance path is reached
-# rather than the recency guard correctly leaving a newer record alone.
-OLD_CLEARED_WITH_HISTORY='{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T09:00:00Z","id":82,"output":{"summary":"clean [continuation-stage: full] [continuation-evaluated-at: 1788480000] ok\nSuperseded diagnostic, preserved verbatim:\nboom [continuation-stage: protective] old"}}]}'
-
-# Advancing a watermark must not discard the preserved diagnostic. Losing it
-# undoes the evidence preservation the clear performs, and on a five-minute
-# scheduled sweep it would vanish within minutes of being recorded.
-: > "$clear_tmp/gh.log"
-PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" \
-  GH_STUB_CHECKRUNS="$OLD_CLEARED_WITH_HISTORY" GH_RETRY_ATTEMPTS=1 \
-  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7:abc123:$VERDICT_AFTER:full" >/dev/null 2>&1 || true
-if grep -Fq 'Superseded diagnostic, preserved verbatim' "$clear_tmp/gh.log"; then
-  pass=$((pass + 1))
-  echo "  PASS: advancing a watermark carries preserved diagnostic history forward"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: advancing a watermark discarded the preserved diagnostic history" >&2
-fi
+# The stage parse reads the FIRST marker rather than searching the whole
+# summary, because a cleared record carries the superseded diagnostic verbatim
+# and therefore holds the old marker too. In this scope a failure record never
+# carries preserved history, so the misread is unreachable here -- the parse is
+# kept correct anyway, and #1191 is where it becomes load-bearing.
 
 # A clear that could not be written must surface as a failed run, not a green
 # workflow over a diagnostic that is still blocking the merge.
