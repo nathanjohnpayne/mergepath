@@ -27,6 +27,15 @@
 #     Creating one would re-enter the latest-run-wins race: a failure published
 #     between the read and the write would be the newest evidence, and a fresh
 #     success would bury it. Updating the selected run cannot bury anything.
+#   * A verdict only clears a diagnostic from a stage it actually REACHED. The
+#     continuation runs in two stages -- protective retraction, then the
+#     author-token readiness continuation -- and a repo with no
+#     AUTHOR_MERGE_TOKEN never reaches the second. Without the stage on both
+#     sides, either a protective-only pass silently clears a failure from the
+#     author-token stage it never ran, or (the mirror defect) a repo that can
+#     only ever reach the protective stage can never clear a protective-stage
+#     failure and keeps a permanently red head -- exactly the #1188 bug, for a
+#     different population. Both sides are recorded, so neither happens.
 #
 # `--clear` therefore takes `PR:SHA:EPOCH`, not a bare PR number. Re-resolving
 # the head at POST time is unsafe on its own: a push landing between the verdict
@@ -57,6 +66,10 @@ REPO="$1"
 RUN_URL="$2"
 PR_NUMBERS="$3"
 CHECK_NAME='approval-merge-continuation'
+# Machine-readable stage marker embedded in the diagnostic's summary. It is the
+# only durable record of WHICH stage failed, and a clear consults it so a
+# protective-only verdict cannot clear a full-continuation failure.
+STAGE_MARKER_PREFIX='[continuation-stage: '
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=../lib/gh-retry-helpers.sh
 source "$ROOT/scripts/lib/gh-retry-helpers.sh"
@@ -65,12 +78,19 @@ source "$ROOT/scripts/lib/gh-retry-helpers.sh"
 # that share a second) is not cosmetic: reading an arbitrary array element here
 # reproduces the exact misdiagnosis this script exists to prevent — a
 # superseded red read as current state.
-# Answers "what is the latest diagnostic on this head, judged against a verdict
-# taken at $2". Returns the conclusion, "none" when the head carries no
-# diagnostic at all, or "newer-than-verdict" when the newest run started at or
-# after that verdict did — a failure published while (or after) we were
-# evaluating is newer evidence than our own result and must survive it.
-latest_conclusion() {
+# Selects the newest diagnostic on $1, judged against a verdict taken at $2, and
+# emits a compact JSON object describing it:
+#
+#   {"state":"none"}                 the head carries no diagnostic at all
+#   {"state":"newer-than-verdict"}   the newest run started at or after the
+#                                    verdict — newer evidence outranks it
+#   {"state":<conclusion>, "id":…, "stage":…, "summary":…}
+#
+# `stage` records WHICH stage produced the diagnostic, read back from the marker
+# the failure arm writes. An unmarked diagnostic (anything posted before this
+# marker existed) is treated as "full", which is the conservative direction:
+# only a full verdict can clear it.
+latest_run() {
   local head_sha="$1" cutoff="$2" runs
   # `--paginate` is not belt-and-braces next to per_page=100:
   # docs/agents/shared-operating-rules.md names this exact endpoint, and a head
@@ -82,24 +102,37 @@ latest_conclusion() {
   # `jq -s` slurps whole before selecting.
   runs=$(with_gh_retry gh api --paginate \
     "repos/$REPO/commits/$head_sha/check-runs?check_name=$CHECK_NAME&per_page=100" \
-    --jq '.check_runs[] | {conclusion, started_at, id}') || return 1
+    --jq '.check_runs[] | {conclusion, started_at, id, summary: (.output.summary // "")}') || return 1
   # fromdateiso8601 keeps the comparison inside jq: converting timestamps in
   # shell would need date(1), whose flags differ between GNU and BSD — the
-  # portability trap this script was fixed for one round ago.
-  # Emits "<conclusion> <run-id>". The ID is the point: clearing PATCHes that
-  # specific run rather than creating a newer one, so the outcome no longer
-  # depends on this script winning a latest-run-wins race against a failure
-  # published between the read and the write.
-  jq -rs --argjson cutoff "$cutoff" '
+  # portability trap this script was fixed for once already.
+  jq -cs --argjson cutoff "$cutoff" --arg marker "$STAGE_MARKER_PREFIX" '
     sort_by(.started_at, .id) | last
-    | if . == null then "none 0"
-      elif (.started_at | fromdateiso8601) >= $cutoff then "newer-than-verdict 0"
-      else ((.conclusion // "none") + " " + (.id | tostring)) end' <<<"$runs"
+    | if . == null then {state: "none"}
+      elif (.started_at | fromdateiso8601) >= $cutoff then {state: "newer-than-verdict"}
+      else {
+        state: (.conclusion // "none"),
+        id: .id,
+        # `contains`, not `test`: the marker literal begins with "[", which
+        # opens a character class when concatenated into a regex. A substring
+        # test needs no escaping and cannot drift from the writer.
+        stage: (if (.summary | contains($marker + "protective]")) then "protective" else "full" end),
+        summary: .summary
+      } end' <<<"$runs"
+}
+
+# A verdict from stage $1 may clear a diagnostic from stage $2. A full
+# continuation subsumes the protective stage it runs after; a protective-only
+# pass does not speak for the author-token continuation it never reached.
+stage_covers() {
+  case "$1:$2" in
+    full:*) return 0 ;;
+    protective:protective) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 for ENTRY in $PR_NUMBERS; do
-  # Report mode takes bare PR numbers; clear mode takes PR:SHA:EPOCH, because a
-  # clear MUST be pinned to the head its verdict was about — see the header.
   PR="${ENTRY%%:*}"
   # Deliberately plain interpolation: bash 4 case-modification expansions abort
   # stock macOS bash 3.2 with "bad substitution" before either arm can post, and
@@ -108,20 +141,33 @@ for ENTRY in $PR_NUMBERS; do
   echo "::group::approval-continuation ($MODE) for PR #$PR"
 
   if [ "$MODE" = clear ]; then
+    # Clear mode takes PR:SHA:EPOCH:STAGE. Every field is load-bearing and a
+    # wrong clear is the dangerous direction, so a malformed entry is refused
+    # rather than defaulted.
     case "$ENTRY" in
-      *:*:*) ;;
+      *:*:*:*) ;;
       *)
-        echo "::warning::PR #$PR reached --clear without an evaluated head and timestamp; refusing to guess a head."
+        echo "::warning::PR #$PR reached --clear without an evaluated head, timestamp and stage; refusing to guess."
         echo "::endgroup::"
         continue
         ;;
     esac
     ENTRY_REST="${ENTRY#*:}"
     EVAL_HEAD="${ENTRY_REST%%:*}"
-    EVAL_STARTED="${ENTRY_REST#*:}"
+    ENTRY_REST="${ENTRY_REST#*:}"
+    EVAL_STARTED="${ENTRY_REST%%:*}"
+    VERDICT_STAGE="${ENTRY_REST#*:}"
     case "$EVAL_STARTED" in
       ''|*[!0-9]*)
         echo "::warning::PR #$PR carries a non-numeric verdict timestamp ($EVAL_STARTED); refusing to clear."
+        echo "::endgroup::"
+        continue
+        ;;
+    esac
+    case "$VERDICT_STAGE" in
+      protective|full) ;;
+      *)
+        echo "::warning::PR #$PR carries an unknown verdict stage ($VERDICT_STAGE); refusing to clear."
         echo "::endgroup::"
         continue
         ;;
@@ -136,48 +182,79 @@ for ENTRY in $PR_NUMBERS; do
     # let a clean result for head A publish success on head B, superseding a
     # failure that belongs to B and was never evaluated. If the PR has moved,
     # this verdict says nothing about the current head — stop.
+    #
+    # KNOWN LIMIT (#1190): $EVAL_HEAD is the head read immediately BEFORE the
+    # continuation ran, not a head the continuation itself reported. If a PR
+    # moves A→B and is force-reset back to A within one run, this check passes
+    # while the evaluation actually saw B. Closing it needs the helper to report
+    # the SHA it pinned; deferred deliberately, see #1190.
     if [ "$HEAD_SHA" != "$EVAL_HEAD" ]; then
       echo "PR #$PR moved from $EVAL_HEAD to $HEAD_SHA since this verdict; a later completion event will re-evaluate the new head."
       echo "::endgroup::"
       continue
     fi
-    if ! CURRENT=$(latest_conclusion "$EVAL_HEAD" "$EVAL_STARTED"); then
+    if ! SELECTED=$(latest_run "$EVAL_HEAD" "$EVAL_STARTED"); then
       echo "::warning::Failed to read existing $CHECK_NAME check-runs for PR #$PR; leaving the head untouched."
       echo "::endgroup::"
       continue
     fi
-    CURRENT_CONCLUSION="${CURRENT%% *}"
-    CURRENT_RUN_ID="${CURRENT##* }"
-    if [ "$CURRENT_CONCLUSION" != failure ]; then
-      echo "PR #$PR carries no supersedable $CHECK_NAME diagnostic on $EVAL_HEAD (latest: $CURRENT_CONCLUSION); nothing to clear."
+    SEL_STATE=$(jq -r '.state' <<<"$SELECTED")
+    if [ "$SEL_STATE" != failure ]; then
+      echo "PR #$PR carries no supersedable $CHECK_NAME diagnostic on $EVAL_HEAD (latest: $SEL_STATE); nothing to clear."
       echo "::endgroup::"
       continue
     fi
-    case "$CURRENT_RUN_ID" in
+    SEL_ID=$(jq -r '.id // 0' <<<"$SELECTED")
+    SEL_STAGE=$(jq -r '.stage // "full"' <<<"$SELECTED")
+    SEL_SUMMARY=$(jq -r '.summary // ""' <<<"$SELECTED")
+    case "$SEL_ID" in
       ''|0|*[!0-9]*)
         echo "::warning::PR #$PR has a failing $CHECK_NAME diagnostic on $EVAL_HEAD but no usable run id; leaving it untouched."
         echo "::endgroup::"
         continue
         ;;
     esac
+    if ! stage_covers "$VERDICT_STAGE" "$SEL_STAGE"; then
+      echo "PR #$PR has a $SEL_STAGE-stage diagnostic on $EVAL_HEAD and this verdict only reached the $VERDICT_STAGE stage; leaving it for a continuation that gets that far."
+      echo "::endgroup::"
+      continue
+    fi
     # PATCH the run we actually selected, rather than POSTing a newer success.
     # Creating a run would re-enter the latest-run-wins race this script exists
     # to arbitrate: a failure published between the read above and the write
     # below would be the newest evidence, and a fresh success would bury it.
-    # Updating run $CURRENT_RUN_ID cannot bury anything — a newer failure stays
-    # newer, stays current, and keeps blocking. Both runs come from the same
-    # GitHub App (this workflow's GITHUB_TOKEN), which is what makes the update
-    # permitted at all.
-    with_gh_retry gh api "repos/$REPO/check-runs/$CURRENT_RUN_ID" \
+    # Updating run $SEL_ID cannot bury anything — a newer failure stays newer,
+    # stays current, and keeps blocking. Both runs come from the same GitHub App
+    # (this workflow's GITHUB_TOKEN), which is what permits the update.
+    #
+    # The superseded failure's own summary is carried into the replacement: this
+    # is the only check-run record of that failure, so overwriting it outright
+    # would erase the reason and the run URL an operator needs to chase a
+    # recurring flake.
+    with_gh_retry gh api "repos/$REPO/check-runs/$SEL_ID" \
       -X PATCH \
       -f conclusion='success' \
       -F "output[title]=Approval continuation completed without infrastructure error" \
-      -F "output[summary]=PR #$PR was re-evaluated cleanly on $EVAL_HEAD, superseding the infrastructure diagnostic this run originally recorded. See workflow run logs: $RUN_URL" \
-      || echo "::warning::Failed to clear check-run $CURRENT_RUN_ID for PR #$PR; the stale diagnostic remains on $EVAL_HEAD."
+      -F "output[summary]=PR #$PR was re-evaluated cleanly on $EVAL_HEAD at the $VERDICT_STAGE stage, superseding the $SEL_STAGE-stage infrastructure diagnostic this run originally recorded. Clearing run: $RUN_URL
+
+Superseded diagnostic, preserved verbatim:
+$SEL_SUMMARY" \
+      || echo "::warning::Failed to clear check-run $SEL_ID for PR #$PR; the stale diagnostic remains on $EVAL_HEAD."
     echo "::endgroup::"
     continue
   fi
 
+  # Report mode takes PR or PR:STAGE. An entry without a stage defaults to
+  # "full", which is the conservative reading: only a full verdict clears it.
+  FAIL_STAGE=full
+  case "$ENTRY" in
+    *:*)
+      case "${ENTRY#*:}" in
+        protective|full) FAIL_STAGE="${ENTRY#*:}" ;;
+        *) echo "::warning::PR #$PR reported an unknown failure stage (${ENTRY#*:}); recording it as full." ;;
+      esac
+      ;;
+  esac
   if ! HEAD_SHA=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
     echo "::warning::Failed to resolve head SHA for PR #$PR; the workflow log remains authoritative."
     echo "::endgroup::"
@@ -190,7 +267,7 @@ for ENTRY in $PR_NUMBERS; do
     -f status='completed' \
     -f conclusion='failure' \
     -F "output[title]=Approval continuation hit an infrastructure error" \
-    -F "output[summary]=PR #$PR could not complete its final merge-safety evaluation. See workflow run logs: $RUN_URL" \
+    -F "output[summary]=PR #$PR could not complete its final merge-safety evaluation. ${STAGE_MARKER_PREFIX}${FAIL_STAGE}] See workflow run logs: $RUN_URL" \
     || echo "::warning::Failed to post the diagnostic check-run for PR #$PR; the workflow log still surfaces the failure."
   echo "::endgroup::"
 done

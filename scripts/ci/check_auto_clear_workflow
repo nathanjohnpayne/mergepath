@@ -485,10 +485,10 @@ if [ "$continuation_clear_count" -eq 2 ] \
    && [ "$(grep -cF "report-approval-continuation-failures.sh --clear" "$WORKFLOW")" -eq 2 ] \
    && [ "$(grep -cF "grep -Fq 'CONTINUATION_CLEAR_V1'" "$WORKFLOW")" -eq 2 ] \
    && [ "$(grep -cF 'eval_started_at=$(date -u +%s)' "$WORKFLOW")" -eq 2 ] \
-   && [ "$(grep -cF '$PR:$eval_head:$eval_started_at' "$WORKFLOW")" -eq 4 ] \
-   && [ "$(grep -cF 'continuation_evaluated=0' "$WORKFLOW")" -eq 2 ] \
-   && [ "$(grep -cF 'continuation_evaluated=1' "$WORKFLOW")" -eq 2 ] \
-   && [ "$(grep -cF 'if [ "$continuation_evaluated" = 1 ] && [ -n "$eval_head" ]; then' "$WORKFLOW")" -eq 4 ] \
+   && [ "$(grep -cF '$PR:$eval_head:$eval_started_at:$continuation_stage' "$WORKFLOW")" -eq 4 ] \
+   && [ "$(grep -cF 'continuation_stage=protective' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF 'continuation_stage=full' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF '$PR:$continuation_stage' "$WORKFLOW")" -eq 2 ] \
    && grep -Fq 'CONTINUATION_CLEAR_V1' "$CONTINUATION_REPORTER"; then
   pass=$((pass + 1))
   echo "  PASS: both continuation loops clear per-PR after a clean evaluation, without the batch sentinel (#1188)"
@@ -499,19 +499,20 @@ fi
 
 # rc=0 means two different things in these loops. The AUTHOR_MERGE_TOKEN-unset
 # branch sets rc=0 after protective retraction alone and deliberately SKIPS the
-# author-token continuation, so it is not a verdict about the PR. Recording it
-# for clearing would patch a diagnostic left by the very path that never ran —
-# an invalid author-token identity or an API failure cleared unexamined. Only
-# the branch that actually invokes the author-token helper may set the flag, so
-# assert the flag is raised inside that branch and nowhere else.
-if [ "$(grep -cF 'continuation_evaluated=1' "$WORKFLOW")" -eq 2 ] \
-   && [ "$(awk '/AUTHOR_MERGE_TOKEN is not configured/{f=1} f&&/continuation_evaluated=1/{print "leaked"; exit} f&&/elif \[ "\$protective_rc" -eq 0 \]/{f=0}' "$WORKFLOW" | grep -c leaked)" -eq 0 ] \
-   && grep -qF 'continuation_evaluated=1' "$WORKFLOW"; then
+# author-token continuation. A boolean "did it evaluate" cannot express that
+# without breaking one side or the other: treat the disabled path as evaluated
+# and it clears failures from a stage it never ran; treat it as unevaluated and
+# a repo with no AUTHOR_MERGE_TOKEN can never clear its own protective-stage
+# failures, keeping a permanently red head — the #1188 bug for a different
+# population. The stage is recorded on both sides instead, so `full` must be
+# reachable ONLY through the branch that runs the author-token helper.
+if [ "$(grep -cF 'continuation_stage=full' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(awk '/AUTHOR_MERGE_TOKEN is not configured/{f=1} f&&/continuation_stage=full/{print "leaked"; exit} f&&/elif \[ "\$protective_rc" -eq 0 \]/{f=0}' "$WORKFLOW" | grep -c leaked)" -eq 0 ]; then
   pass=$((pass + 1))
-  echo "  PASS: only a real author-token continuation marks a PR clearable, not the disabled path (#1188)"
+  echo "  PASS: the full stage is reachable only via the author-token continuation, never the disabled path (#1188)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the AUTHOR_MERGE_TOKEN-unset path must not record a PR for diagnostic clearing (#1188)" >&2
+  echo "  FAIL: the AUTHOR_MERGE_TOKEN-unset path must not claim the full continuation stage (#1188)" >&2
 fi
 
 clear_tmp=$(mktemp -d "${TMPDIR:-/tmp}/continuation-clear.XXXXXX")
@@ -572,7 +573,7 @@ chmod +x "$clear_tmp/bin/gh"
 VERDICT_AFTER=1788609600
 VERDICT_BEFORE=1788480000
 run_clear_case() {
-  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}" entry="${5:-7:abc123:$VERDICT_AFTER}" expect_run_id="${6:-[0-9]+}"
+  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}" entry="${5:-7:abc123:$VERDICT_AFTER:full}" expect_run_id="${6:-[0-9]+}" expect_evidence="${7:-}"
   : > "$clear_tmp/gh.log"
   if ! PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_CHECKRUNS="$fixture" \
        GH_STUB_CHECKRUNS_P2="$fixture_p2" \
@@ -599,6 +600,18 @@ run_clear_case() {
   else
     fail=$((fail + 1))
     echo "  FAIL: --clear ($label) expected posts=$want_post, got posts=$posted" >&2
+  fi
+  # The superseded failure's summary must survive into the replacement. This is
+  # the only check-run record of that failure, so overwriting it outright erases
+  # the reason and run URL an operator needs to chase a recurring flake.
+  if [ "$posted" = yes ] && [ -n "${expect_evidence:-}" ]; then
+    if grep -Fq "$expect_evidence" "$clear_tmp/gh.log"; then
+      pass=$((pass + 1))
+      echo "  PASS: --clear ($label) preserved the superseded failure evidence"
+    else
+      fail=$((fail + 1))
+      echo "  FAIL: --clear ($label) discarded the superseded failure evidence" >&2
+    fi
   fi
   # A clearing pass must never publish a fresh failure.
   if grep -Fq 'conclusion=failure' "$clear_tmp/gh.log"; then
@@ -631,7 +644,7 @@ run_clear_case() {
 # this test did exactly that and survived the mutation.
 run_clear_case "failure is latest, listed in the middle" yes \
   '{"check_runs":[{"conclusion":"success","started_at":"2026-09-05T02:00:00Z","id":7},{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":11},{"conclusion":"success","started_at":"2026-09-04T10:00:00Z","id":1}]}' \
-  "" "7:abc123:$VERDICT_AFTER" 11
+  "" "7:abc123:$VERDICT_AFTER:full" 11
 run_clear_case "success is latest, listed in the middle" no \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2},{"conclusion":"success","started_at":"2026-09-05T05:00:00Z","id":9},{"conclusion":"failure","started_at":"2026-09-04T10:00:00Z","id":1}]}'
 run_clear_case "no diagnostic on this head" no \
@@ -647,7 +660,7 @@ run_clear_case "latest run is on page 2" no \
 run_clear_case "page 2 carries the newer failure" yes \
   '{"check_runs":[{"conclusion":"success","started_at":"2026-09-04T09:00:00Z","id":3}]}' \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T06:00:00Z","id":41}]}' \
-  "7:abc123:$VERDICT_AFTER" 41
+  "7:abc123:$VERDICT_AFTER:full" 41
 
 # The head moved between the verdict and this call. The verdict describes a head
 # that is no longer current, so it must not publish anything: re-resolving the
@@ -655,13 +668,65 @@ run_clear_case "page 2 carries the newer failure" yes \
 # head B that was never evaluated.
 run_clear_case "head moved since the verdict" no \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2}]}' \
-  "" "7:deadbeefcafe:$VERDICT_AFTER"
+  "" "7:deadbeefcafe:$VERDICT_AFTER:full"
 
 # Same head, but the failure was published AFTER this verdict was taken — it is
 # newer evidence than the verdict and must survive it.
 run_clear_case "failure is newer than the verdict" no \
   '{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2}]}' \
-  "" "7:abc123:$VERDICT_BEFORE"
+  "" "7:abc123:$VERDICT_BEFORE:full"
+
+# Stage coverage. A verdict clears only a diagnostic from a stage it actually
+# REACHED. Both directions matter and they fail differently: without the guard a
+# protective-only pass clears an author-token-stage failure it never re-ran;
+# with too strict a guard a repo that can only ever reach the protective stage
+# can never clear its own protective failures and keeps a permanently red head.
+PROTECTIVE_DIAG='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":21,"output":{"summary":"boom [continuation-stage: protective] see run"}}]}'
+FULL_DIAG='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":22,"output":{"summary":"boom [continuation-stage: full] see run"}}]}'
+LEGACY_DIAG='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":23,"output":{"summary":"boom, posted before stage markers existed"}}]}'
+
+run_clear_case "protective verdict clears a protective diagnostic" yes \
+  "$PROTECTIVE_DIAG" "" "7:abc123:$VERDICT_AFTER:protective" 21 "boom [continuation-stage: protective] see run"
+run_clear_case "protective verdict leaves a full-stage diagnostic" no \
+  "$FULL_DIAG" "" "7:abc123:$VERDICT_AFTER:protective"
+run_clear_case "full verdict clears a protective diagnostic" yes \
+  "$PROTECTIVE_DIAG" "" "7:abc123:$VERDICT_AFTER:full" 21
+# An unmarked diagnostic predates the marker; reading it as "full" is the
+# conservative default, so only a full verdict may clear it.
+run_clear_case "protective verdict leaves an unmarked legacy diagnostic" no \
+  "$LEGACY_DIAG" "" "7:abc123:$VERDICT_AFTER:protective"
+run_clear_case "full verdict clears an unmarked legacy diagnostic" yes \
+  "$LEGACY_DIAG" "" "7:abc123:$VERDICT_AFTER:full" 23
+# An unknown stage is refused rather than defaulted: a wrong clear is the
+# dangerous direction.
+run_clear_case "unknown verdict stage is refused" no \
+  "$PROTECTIVE_DIAG" "" "7:abc123:$VERDICT_AFTER:partial"
+
+# Round-trip: the marker the FAILURE arm writes must be the one the CLEAR arm
+# reads. These are two independent string expressions in the same file, so a
+# drift between them would silently downgrade every protective diagnostic to
+# "full" and re-create the permanently-red case. Assert on the writer's actual
+# output rather than on the constant.
+: > "$clear_tmp/gh.log"
+PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_RETRY_ATTEMPTS=1 \
+  bash "$CONTINUATION_REPORTER" owner/repo https://example.test/run/9 "7:protective" >/dev/null 2>&1 || true
+# `grep -m1 ... || true`, not `grep | head`: this grep is EXPECTED to find
+# nothing when the marker drifts, and under `set -euo pipefail` both the empty
+# match and head(1) closing the pipe early abort the whole harness — which is
+# how the first draft of this test silently killed the suite instead of failing
+# the assertion it exists to make.
+written_marker=$(grep -o -m1 '\[continuation-stage: protective\]' "$clear_tmp/gh.log" || true)
+: > "$clear_tmp/gh.log"
+PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_RETRY_ATTEMPTS=1 \
+  GH_STUB_CHECKRUNS="{\"check_runs\":[{\"conclusion\":\"failure\",\"started_at\":\"2026-09-05T05:00:00Z\",\"id\":31,\"output\":{\"summary\":\"x ${written_marker} y\"}}]}" \
+  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/9 "7:abc123:$VERDICT_AFTER:protective" >/dev/null 2>&1 || true
+if [ -n "$written_marker" ] && grep -Fq 'conclusion=success' "$clear_tmp/gh.log"; then
+  pass=$((pass + 1))
+  echo "  PASS: the stage marker the failure arm writes is the one the clear arm reads (#1188)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stage marker drift between the failure and clear arms (written='${written_marker}') (#1188)" >&2
+fi
 
 # Interleaving regression (CodeRabbit P1). The clear must address the run it
 # SELECTED, by id. Creating a new success instead would make the clear the
@@ -673,7 +738,7 @@ run_clear_case "failure is newer than the verdict" no \
 PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" \
   GH_STUB_CHECKRUNS='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":11}]}' \
   GH_RETRY_ATTEMPTS=1 \
-  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7:abc123:$VERDICT_AFTER" >/dev/null 2>&1 || true
+  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7:abc123:$VERDICT_AFTER:full" >/dev/null 2>&1 || true
 if grep -Eq 'api repos/owner/repo/check-runs/11( |$)' "$clear_tmp/gh.log" \
    && grep -Fq 'PATCH' "$clear_tmp/gh.log" \
    && ! grep -Eq '(^| )api repos/owner/repo/check-runs( |$)' "$clear_tmp/gh.log"; then
@@ -695,7 +760,7 @@ bare_out=$(PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" \
   GH_STUB_CHECKRUNS='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-04T16:45:23Z","id":2}]}' \
   GH_RETRY_ATTEMPTS=1 \
   bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7" 2>&1 || true)
-if grep -Fq 'refusing to guess a head' <<<"$bare_out" \
+if grep -Fq 'refusing to guess' <<<"$bare_out" \
    && ! grep -Fq 'conclusion=success' "$clear_tmp/gh.log"; then
   pass=$((pass + 1))
   echo "  PASS: --clear rejects a bare PR number as malformed, not as a moved head (#1188)"

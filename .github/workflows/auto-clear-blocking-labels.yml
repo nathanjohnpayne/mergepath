@@ -495,14 +495,18 @@ jobs:
             # the same-head case -- a failure posted AFTER this verdict started
             # is newer than the verdict and must survive it.
             eval_started_at=$(date -u +%s)
-            # rc=0 is ambiguous: it means EITHER "the author-token continuation
-            # evaluated this PR and found nothing wrong" OR "protective
-            # retraction succeeded and the continuation was skipped because
-            # AUTHOR_MERGE_TOKEN is unset". Only the first is a verdict. Without
-            # this flag the disabled path would clear a diagnostic left by the
-            # very code path it never ran -- an invalid author-token identity or
-            # an API failure would be patched to success unexamined.
-            continuation_evaluated=0
+            # How far this pass actually got. The continuation runs in two
+            # stages -- protective retraction, then the author-token readiness
+            # continuation -- and rc=0 is ambiguous between them: it means
+            # EITHER "the author-token continuation found nothing wrong" OR
+            # "protective retraction succeeded and the continuation was skipped
+            # because AUTHOR_MERGE_TOKEN is unset". Recording the stage rather
+            # than a boolean settles both directions: a protective-only pass
+            # cannot clear a failure from the author-token stage it never ran,
+            # AND a repo that can only ever reach the protective stage can still
+            # clear its own protective-stage failures instead of keeping a
+            # permanently red head.
+            continuation_stage=protective
             eval_head=""
             if ! eval_head=$(GH_TOKEN="$WORKFLOW_TOKEN" gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
               echo "::warning::Could not resolve the head SHA for PR #$PR before evaluation; it will not be eligible for diagnostic clearing on this pass."
@@ -520,27 +524,27 @@ jobs:
                 MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
                 bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
               rc=$?
-              continuation_evaluated=1
+              continuation_stage=full
             else
               rc=$protective_rc
             fi
             set -e
             case "$rc" in
               0)
-                if [ "$continuation_evaluated" = 1 ] && [ -n "$eval_head" ]; then
-                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at"
+                if [ -n "$eval_head" ]; then
+                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at:$continuation_stage"
                 fi
                 ;;
               4)
                 echo "PR #$PR is not merge-ready on this event; a later completion event will re-evaluate it."
-                if [ "$continuation_evaluated" = 1 ] && [ -n "$eval_head" ]; then
-                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at"
+                if [ -n "$eval_head" ]; then
+                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at:$continuation_stage"
                 fi
                 ;;
               *)
                 echo "::error::Approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
                 continuation_infra_error=1
-                continuation_failing_prs="$continuation_failing_prs $PR"
+                continuation_failing_prs="$continuation_failing_prs $PR:$continuation_stage"
                 ;;
             esac
           done <<<"$PR_NUMBERS"
@@ -984,14 +988,18 @@ jobs:
             # the same-head case -- a failure posted AFTER this verdict started
             # is newer than the verdict and must survive it.
             eval_started_at=$(date -u +%s)
-            # rc=0 is ambiguous: it means EITHER "the author-token continuation
-            # evaluated this PR and found nothing wrong" OR "protective
-            # retraction succeeded and the continuation was skipped because
-            # AUTHOR_MERGE_TOKEN is unset". Only the first is a verdict. Without
-            # this flag the disabled path would clear a diagnostic left by the
-            # very code path it never ran -- an invalid author-token identity or
-            # an API failure would be patched to success unexamined.
-            continuation_evaluated=0
+            # How far this pass actually got. The continuation runs in two
+            # stages -- protective retraction, then the author-token readiness
+            # continuation -- and rc=0 is ambiguous between them: it means
+            # EITHER "the author-token continuation found nothing wrong" OR
+            # "protective retraction succeeded and the continuation was skipped
+            # because AUTHOR_MERGE_TOKEN is unset". Recording the stage rather
+            # than a boolean settles both directions: a protective-only pass
+            # cannot clear a failure from the author-token stage it never ran,
+            # AND a repo that can only ever reach the protective stage can still
+            # clear its own protective-stage failures instead of keeping a
+            # permanently red head.
+            continuation_stage=protective
             eval_head=""
             if ! eval_head=$(GH_TOKEN="$WORKFLOW_TOKEN" gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
               echo "::warning::Could not resolve the head SHA for PR #$PR before evaluation; it will not be eligible for diagnostic clearing on this pass."
@@ -1009,27 +1017,27 @@ jobs:
                 MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
                 bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
               rc=$?
-              continuation_evaluated=1
+              continuation_stage=full
             else
               rc=$protective_rc
             fi
             set -e
             case "$rc" in
               0)
-                if [ "$continuation_evaluated" = 1 ] && [ -n "$eval_head" ]; then
-                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at"
+                if [ -n "$eval_head" ]; then
+                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at:$continuation_stage"
                 fi
                 ;;
               4)
                 echo "PR #$PR is not merge-ready; a later event or sweep will re-evaluate it."
-                if [ "$continuation_evaluated" = 1 ] && [ -n "$eval_head" ]; then
-                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at"
+                if [ -n "$eval_head" ]; then
+                  continuation_evaluated_prs="$continuation_evaluated_prs $PR:$eval_head:$eval_started_at:$continuation_stage"
                 fi
                 ;;
               *)
                 echo "::error::Scheduled approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
                 continuation_infra_error=1
-                continuation_failing_prs="$continuation_failing_prs $PR"
+                continuation_failing_prs="$continuation_failing_prs $PR:$continuation_stage"
                 ;;
             esac
           done <<<"$PRS"
