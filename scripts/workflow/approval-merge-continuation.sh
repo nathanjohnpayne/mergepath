@@ -57,6 +57,17 @@ retract_latest_arm_for_exit() {
   fi
 }
 
+# The SHA this invocation actually evaluated, published on every VERDICT exit
+# (mergepath#1190). The caller previously recorded a head it read just BEFORE
+# invoking this script, which is not the same claim: a PR that moves A->B and is
+# force-reset back to A within one run passes an equality check against the
+# pre-read while this script evaluated B. Because the caller uses that value to
+# decide whether it may clear a merge-blocking diagnostic, guessing there can
+# turn an unevaluated head green. Only this script knows which head it pinned,
+# so only this script can say.
+EVALUATED_HEAD=""
+CONTINUATION_EVALUATED_HEAD_MARKER='approval continuation: evaluated-head'
+
 cleanup_on_exit() {
   local exit_rc cleanup_rc
   exit_rc="$1"
@@ -70,6 +81,14 @@ cleanup_on_exit() {
   fi
   if [ "$cleanup_rc" -ne 0 ]; then
     exit "$cleanup_rc"
+  fi
+  # Emitted from the trap so EVERY verdict path is covered by construction --
+  # the early Dependabot and protective-mode returns included -- rather than by
+  # remembering to add a line at each `exit`. Only rc 0 and rc 4 are verdicts;
+  # an infrastructure error (rc 3) evaluated nothing and must publish no head,
+  # so a caller parsing this marker cannot mistake a failure for an evaluation.
+  if [ -n "$EVALUATED_HEAD" ] && { [ "$exit_rc" -eq 0 ] || [ "$exit_rc" -eq 4 ]; }; then
+    echo "$CONTINUATION_EVALUATED_HEAD_MARKER $EVALUATED_HEAD"
   fi
   exit "$exit_rc"
 }
@@ -202,6 +221,7 @@ valid_pr_shape "$initial" || infra_error "PR response lacks valid safety or auto
 state=$(jq -r '.state // ""' <<<"$initial")
 draft=$(jq -r 'if has("isDraft") then .isDraft else true end' <<<"$initial")
 head=$(jq -r '.headRefOid // ""' <<<"$initial")
+EVALUATED_HEAD="$head"
 base_ref=$(jq -r '.baseRefName // ""' <<<"$initial")
 base_sha=$(jq -r '.baseRefOid // ""' <<<"$initial")
 url=$(jq -r '.url // ""' <<<"$initial")
@@ -314,6 +334,7 @@ initial="$normal_snapshot"
 state=$(jq -r '.state // ""' <<<"$initial")
 draft=$(jq -r 'if has("isDraft") then .isDraft else true end' <<<"$initial")
 head=$(jq -r '.headRefOid' <<<"$initial")
+EVALUATED_HEAD="$head"
 base_ref=$(jq -r '.baseRefName' <<<"$initial")
 base_sha=$(jq -r '.baseRefOid' <<<"$initial")
 url=$(jq -r '.url' <<<"$initial")
@@ -429,6 +450,7 @@ valid_pr_shape "$final" || infra_error "final PR readback is malformed"
 final_state=$(jq -r '.state // ""' <<<"$final")
 final_draft=$(jq -r 'if has("isDraft") then .isDraft else true end' <<<"$final")
 final_head=$(jq -r '.headRefOid // ""' <<<"$final")
+[ -n "$final_head" ] && EVALUATED_HEAD="$final_head"
 final_base_ref=$(jq -r '.baseRefName // ""' <<<"$final")
 final_base_sha=$(jq -r '.baseRefOid // ""' <<<"$final")
 final_labels=$(blocking_labels <<<"$final")

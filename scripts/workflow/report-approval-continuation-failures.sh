@@ -198,11 +198,12 @@ for ENTRY in $PR_NUMBERS; do
     # failure that belongs to B and was never evaluated. If the PR has moved,
     # this verdict says nothing about the current head — stop.
     #
-    # KNOWN LIMIT (#1190): $EVAL_HEAD is the head read immediately BEFORE the
-    # continuation ran, not a head the continuation itself reported. If a PR
-    # moves A→B and is force-reset back to A within one run, this check passes
-    # while the evaluation actually saw B. Closing it needs the helper to report
-    # the SHA it pinned; deferred deliberately, see #1190.
+    # $EVAL_HEAD is the head the CONTINUATION reported evaluating (#1190), not a
+    # head read just before it started. Those differ when a PR moves A→B and is
+    # force-reset back to A within one run: an equality check against a pre-read
+    # would pass while the evaluation actually saw B, clearing a diagnostic on a
+    # head nothing examined. The helper is the only component that knows which
+    # head it pinned, so it is the only one that may say.
     if [ "$HEAD_SHA" != "$EVAL_HEAD" ]; then
       echo "PR #$PR moved from $EVAL_HEAD to $HEAD_SHA since this verdict; a later completion event will re-evaluate the new head."
       echo "::endgroup::"

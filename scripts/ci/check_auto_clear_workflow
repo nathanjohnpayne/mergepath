@@ -515,6 +515,62 @@ else
   echo "  FAIL: the AUTHOR_MERGE_TOKEN-unset path must not claim the full continuation stage (#1188)" >&2
 fi
 
+# #1190: the recorded head must come from the HELPER, not from a pre-read. A
+# pre-read cannot distinguish "the helper evaluated this head" from "this was
+# the head a moment before the helper started", and an A->B->A force-reset
+# inside one run makes those differ while an equality check still passes —
+# which would clear a merge-blocking diagnostic on a head nothing evaluated.
+CONTINUATION_HELPER="$ROOT/scripts/workflow/approval-merge-continuation.sh"
+if [ ! -f "$CONTINUATION_HELPER" ]; then
+  skip_reason="approval continuation helper not present in this consumer checkout"
+else
+  # Round-trip the marker the helper EMITS through the parser the workflow
+  # USES, both read from source. They are two independent string expressions in
+  # different files and different languages; asserting them separately against a
+  # hardcoded literal would pass while they drifted apart from each other.
+  helper_marker=$(sed -n "s/^CONTINUATION_EVALUATED_HEAD_MARKER='\(.*\)'$/\1/p" "$CONTINUATION_HELPER")
+  wf_expr=$(grep -m1 -o "sed -n '[^']*'" "$WORKFLOW" | sed "s/^sed -n '//; s/'$//")
+  sample_sha=0123456789abcdef0123456789abcdef01234567
+  extracted=""
+  if [ -n "$helper_marker" ] && [ -n "$wf_expr" ]; then
+    extracted=$(printf '%s\n' "$helper_marker $sample_sha" | sed -n "$wf_expr" || true)
+  fi
+  if [ "$extracted" = "$sample_sha" ]; then
+    pass=$((pass + 1))
+    echo "  PASS: the evaluated-head marker the helper emits is the one the workflow parses (#1190)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: evaluated-head marker drift (helper='${helper_marker}' extracted='${extracted}') (#1190)" >&2
+  fi
+
+  # The marker is a VERDICT statement. An infrastructure error evaluated
+  # nothing, so publishing a head on rc=3 would let a failed run be read as an
+  # evaluation of that head — the same false-green this pins shut.
+  if grep -qF 'if [ -n "$EVALUATED_HEAD" ] && { [ "$exit_rc" -eq 0 ] || [ "$exit_rc" -eq 4 ]; }; then' "$CONTINUATION_HELPER"; then
+    pass=$((pass + 1))
+    echo "  PASS: the helper publishes its evaluated head only on verdict exits, never on an infra error (#1190)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: the helper must publish its evaluated head only for rc 0 and rc 4 (#1190)" >&2
+  fi
+
+  # The workflow must not reintroduce a pre-read as the recorded head. Assert
+  # the PROPERTY -- eval_head is assigned from the marker parse and never from a
+  # PR lookup -- rather than the absence of one historical spelling: the first
+  # draft of this check pinned the exact old `if ! eval_head=$(... gh pr view`
+  # line, and a mutation that reintroduced the lookup WITHOUT that prefix sailed
+  # straight through it.
+  if [ "$(grep -cF 'eval_head="$(sed -n' "$WORKFLOW")" -eq 2 ] \
+     && [ "$(grep -cE 'eval_head=.*gh pr view' "$WORKFLOW")" -eq 0 ] \
+     && [ "$(grep -cF 'verdict_out="$protective_out"' "$WORKFLOW")" -eq 2 ]; then
+    pass=$((pass + 1))
+    echo "  PASS: both loops record the helper-reported head, not a pre-evaluation lookup (#1190)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: a pre-evaluation head lookup must not be the recorded head (#1190)" >&2
+  fi
+fi
+
 clear_tmp=$(mktemp -d "${TMPDIR:-/tmp}/continuation-clear.XXXXXX")
 mkdir -p "$clear_tmp/bin"
 cat > "$clear_tmp/bin/gh" <<'STUB'
