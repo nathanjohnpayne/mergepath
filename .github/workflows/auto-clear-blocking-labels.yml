@@ -544,7 +544,7 @@ jobs:
               *)
                 echo "::error::Approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
                 continuation_infra_error=1
-                continuation_failing_prs="$continuation_failing_prs $PR:$continuation_stage"
+                continuation_failing_prs="$continuation_failing_prs $PR:$continuation_stage:$eval_started_at"
                 ;;
             esac
           done <<<"$PR_NUMBERS"
@@ -1037,7 +1037,7 @@ jobs:
               *)
                 echo "::error::Scheduled approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
                 continuation_infra_error=1
-                continuation_failing_prs="$continuation_failing_prs $PR:$continuation_stage"
+                continuation_failing_prs="$continuation_failing_prs $PR:$continuation_stage:$eval_started_at"
                 ;;
             esac
           done <<<"$PRS"

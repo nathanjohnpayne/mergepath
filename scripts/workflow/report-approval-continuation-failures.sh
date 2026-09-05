@@ -70,6 +70,16 @@ CHECK_NAME='approval-merge-continuation'
 # only durable record of WHICH stage failed, and a clear consults it so a
 # protective-only verdict cannot clear a full-continuation failure.
 STAGE_MARKER_PREFIX='[continuation-stage: '
+# When the diagnostic's evaluation happened, as opposed to when it was
+# published. Concurrent triggers make these diverge: an older evaluation can
+# fail and reach the reporter AFTER a newer clean evaluation already ran its
+# clearing step, and `started_at` would then rank that stale failure as the
+# newer evidence and keep the head red. On a consumer with
+# `scheduled_sweep_enabled: false` no later event is guaranteed to arrive, so
+# that is the #1188 bug once more. Recency is judged on this marker when it is
+# present; selection still uses started_at, because publication order is what
+# GitHub's own rollup gates on.
+EVAL_MARKER_PREFIX='[continuation-evaluated-at: '
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=../lib/gh-retry-helpers.sh
 source "$ROOT/scripts/lib/gh-retry-helpers.sh"
@@ -106,10 +116,15 @@ latest_run() {
   # fromdateiso8601 keeps the comparison inside jq: converting timestamps in
   # shell would need date(1), whose flags differ between GNU and BSD — the
   # portability trap this script was fixed for once already.
-  jq -cs --argjson cutoff "$cutoff" --arg marker "$STAGE_MARKER_PREFIX" '
+  jq -cs --argjson cutoff "$cutoff" --arg marker "$STAGE_MARKER_PREFIX" --arg evmarker "$EVAL_MARKER_PREFIX" '
+    # `split` on a literal string, never a regex: both markers begin with "[",
+    # which opens a character class the moment it is concatenated into a
+    # pattern. A literal split needs no escaping and cannot drift.
+    def marked_epoch(s): (s | split($evmarker)) as $p
+      | if ($p | length) > 1 then ($p[1] | split("]")[0] | tonumber? ) else null end;
     sort_by(.started_at, .id) | last
     | if . == null then {state: "none"}
-      elif (.started_at | fromdateiso8601) >= $cutoff then {state: "newer-than-verdict"}
+      elif ((marked_epoch(.summary) // (.started_at | fromdateiso8601)) >= $cutoff) then {state: "newer-than-verdict"}
       else {
         state: (.conclusion // "none"),
         id: .id,
@@ -244,17 +259,29 @@ $SEL_SUMMARY" \
     continue
   fi
 
-  # Report mode takes PR or PR:STAGE. An entry without a stage defaults to
-  # "full", which is the conservative reading: only a full verdict clears it.
+  # Report mode takes PR, PR:STAGE or PR:STAGE:EPOCH. A missing stage defaults
+  # to "full", the conservative reading: only a full verdict clears it. A
+  # missing epoch simply omits the marker, leaving recency judged on
+  # publication time as before.
   FAIL_STAGE=full
-  case "$ENTRY" in
-    *:*)
-      case "${ENTRY#*:}" in
-        protective|full) FAIL_STAGE="${ENTRY#*:}" ;;
-        *) echo "::warning::PR #$PR reported an unknown failure stage (${ENTRY#*:}); recording it as full." ;;
+  FAIL_EPOCH=""
+  REPORT_REST="${ENTRY#*:}"
+  if [ "$REPORT_REST" != "$ENTRY" ]; then
+    case "${REPORT_REST%%:*}" in
+      protective|full) FAIL_STAGE="${REPORT_REST%%:*}" ;;
+      *) echo "::warning::PR #$PR reported an unknown failure stage (${REPORT_REST%%:*}); recording it as full." ;;
+    esac
+    if [ "${REPORT_REST#*:}" != "$REPORT_REST" ]; then
+      case "${REPORT_REST#*:}" in
+        ''|*[!0-9]*) echo "::warning::PR #$PR reported a non-numeric evaluation epoch (${REPORT_REST#*:}); omitting it." ;;
+        *) FAIL_EPOCH="${REPORT_REST#*:}" ;;
       esac
-      ;;
-  esac
+    fi
+  fi
+  EVAL_MARKER=""
+  if [ -n "$FAIL_EPOCH" ]; then
+    EVAL_MARKER=" ${EVAL_MARKER_PREFIX}${FAIL_EPOCH}]"
+  fi
   if ! HEAD_SHA=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
     echo "::warning::Failed to resolve head SHA for PR #$PR; the workflow log remains authoritative."
     echo "::endgroup::"
@@ -267,7 +294,7 @@ $SEL_SUMMARY" \
     -f status='completed' \
     -f conclusion='failure' \
     -F "output[title]=Approval continuation hit an infrastructure error" \
-    -F "output[summary]=PR #$PR could not complete its final merge-safety evaluation. ${STAGE_MARKER_PREFIX}${FAIL_STAGE}] See workflow run logs: $RUN_URL" \
+    -F "output[summary]=PR #$PR could not complete its final merge-safety evaluation. ${STAGE_MARKER_PREFIX}${FAIL_STAGE}]${EVAL_MARKER} See workflow run logs: $RUN_URL" \
     || echo "::warning::Failed to post the diagnostic check-run for PR #$PR; the workflow log still surfaces the failure."
   echo "::endgroup::"
 done

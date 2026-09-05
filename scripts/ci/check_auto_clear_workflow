@@ -488,7 +488,7 @@ if [ "$continuation_clear_count" -eq 2 ] \
    && [ "$(grep -cF '$PR:$eval_head:$eval_started_at:$continuation_stage' "$WORKFLOW")" -eq 4 ] \
    && [ "$(grep -cF 'continuation_stage=protective' "$WORKFLOW")" -eq 2 ] \
    && [ "$(grep -cF 'continuation_stage=full' "$WORKFLOW")" -eq 2 ] \
-   && [ "$(grep -cF '$PR:$continuation_stage' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF '$PR:$continuation_stage:$eval_started_at' "$WORKFLOW")" -eq 2 ] \
    && grep -Fq 'CONTINUATION_CLEAR_V1' "$CONTINUATION_REPORTER"; then
   pass=$((pass + 1))
   echo "  PASS: both continuation loops clear per-PR after a clean evaluation, without the batch sentinel (#1188)"
@@ -702,6 +702,30 @@ run_clear_case "full verdict clears an unmarked legacy diagnostic" yes \
 run_clear_case "unknown verdict stage is refused" no \
   "$PROTECTIVE_DIAG" "" "7:abc123:$VERDICT_AFTER:partial"
 
+# Concurrent triggers make publication time and evaluation time diverge: an
+# older evaluation can fail and reach the reporter AFTER a newer clean
+# evaluation already ran its clearing step. Judged on `started_at` that stale
+# failure outranks the clean verdict and the head stays red — and on a consumer
+# with `scheduled_sweep_enabled: false` no later event is guaranteed to arrive,
+# which is the #1188 bug again. `started_at` here is deliberately LATER than the
+# verdict while the embedded evaluation epoch is EARLIER, so the two readings
+# disagree and only the correct one clears.
+LATE_PUBLISHED_STALE='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-06T00:00:00Z","id":51,"output":{"summary":"boom [continuation-stage: full] [continuation-evaluated-at: 1788480000] see run"}}]}'
+run_clear_case "stale failure published after the verdict" yes \
+  "$LATE_PUBLISHED_STALE" "" "7:abc123:$VERDICT_AFTER:full" 51
+
+# The mirror: a failure genuinely evaluated AFTER the verdict is newer evidence
+# and must survive, even though both markers are present.
+GENUINELY_NEWER='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-06T00:00:00Z","id":52,"output":{"summary":"boom [continuation-stage: full] [continuation-evaluated-at: 1788696000] see run"}}]}'
+run_clear_case "failure evaluated after the verdict survives" no \
+  "$GENUINELY_NEWER" "" "7:abc123:$VERDICT_AFTER:full"
+
+# Without the marker, recency falls back to publication time — the prior
+# behaviour, kept for diagnostics posted before the marker existed.
+UNMARKED_LATE='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-06T00:00:00Z","id":53,"output":{"summary":"boom [continuation-stage: full] see run"}}]}'
+run_clear_case "unmarked late failure falls back to publication time" no \
+  "$UNMARKED_LATE" "" "7:abc123:$VERDICT_AFTER:full"
+
 # Round-trip: the marker the FAILURE arm writes must be the one the CLEAR arm
 # reads. These are two independent string expressions in the same file, so a
 # drift between them would silently downgrade every protective diagnostic to
@@ -709,7 +733,15 @@ run_clear_case "unknown verdict stage is refused" no \
 # output rather than on the constant.
 : > "$clear_tmp/gh.log"
 PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_RETRY_ATTEMPTS=1 \
-  bash "$CONTINUATION_REPORTER" owner/repo https://example.test/run/9 "7:protective" >/dev/null 2>&1 || true
+  bash "$CONTINUATION_REPORTER" owner/repo https://example.test/run/9 "7:protective:1788480000" >/dev/null 2>&1 || true
+written_epoch_marker=$(grep -o -m1 '\[continuation-evaluated-at: 1788480000\]' "$clear_tmp/gh.log" || true)
+if [ -n "$written_epoch_marker" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: the failure arm writes the evaluation-epoch marker the clear arm reads (#1188)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the failure arm did not write a readable evaluation-epoch marker (#1188)" >&2
+fi
 # `grep -m1 ... || true`, not `grep | head`: this grep is EXPECTED to find
 # nothing when the marker drifts, and under `set -euo pipefail` both the empty
 # match and head(1) closing the pipe early abort the whole harness — which is
