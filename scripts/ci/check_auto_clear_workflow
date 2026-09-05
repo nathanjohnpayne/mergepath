@@ -529,7 +529,12 @@ else
   # different files and different languages; asserting them separately against a
   # hardcoded literal would pass while they drifted apart from each other.
   helper_marker=$(sed -n "s/^CONTINUATION_EVALUATED_HEAD_MARKER='\(.*\)'$/\1/p" "$CONTINUATION_HELPER")
-  wf_expr=$(grep -m1 -o "sed -n '[^']*'" "$WORKFLOW" | sed "s/^sed -n '//; s/'$//")
+  # Anchored to the eval_head assignment, not to the first `sed -n` anywhere in
+  # this 1197-line workflow: an unrelated step adding one earlier would silently
+  # make this round-trip validate the wrong expression and then report
+  # "evaluated-head marker drift", pointing at the wrong file.
+  wf_expr=$(grep -m1 -F 'eval_head="$(sed -n' "$WORKFLOW" \
+    | grep -o "sed -n '[^']*'" | sed "s/^sed -n '//; s/'$//")
   sample_sha=0123456789abcdef0123456789abcdef01234567
   extracted=""
   if [ -n "$helper_marker" ] && [ -n "$wf_expr" ]; then
