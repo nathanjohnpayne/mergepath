@@ -152,6 +152,8 @@ spec_test_map:
     - tests/test_bootstrap_template_mirror.sh
   bootstrap_label_seeding:
     - tests/test_bootstrap_github_infra.sh
+  bootstrap_source_attribution:
+    - tests/test_bootstrap_template_mirror.sh
   some_other_spec:
     - tests/test_some_other.sh
 test_globs:
@@ -242,6 +244,9 @@ echo "playground spec" >"$FAKE_MP/specs/mergepath_playground.md"
 # exclusion below is asserted against a file that actually exists —
 # an absent file would pass the "not mirrored" check vacuously.
 echo "label seeding spec" >"$FAKE_MP/specs/bootstrap_label_seeding.md"
+# #1056: hub-only bootstrap source-attribution spec, seeded for the same
+# vacuous-test reason as the line above.
+echo "source attribution spec" >"$FAKE_MP/specs/bootstrap_source_attribution.md"
 echo "playground plan" >"$FAKE_MP/plans/mergepath-playground.md"
 echo "playground test" >"$FAKE_MP/tests/test_mergepath_playground.sh"
 echo "screenshot bug"  >"$FAKE_MP/bugs/screenshots/foo.png"
@@ -438,6 +443,7 @@ for excluded in \
   '.claude/launch.json' \
   'specs/mergepath_playground.md' \
   'specs/bootstrap_label_seeding.md' \
+  'specs/bootstrap_source_attribution.md' \
   'plans/mergepath-playground.md' \
   'scripts/policy-sim.sh' \
   'scripts/audit-canonical-mirrors.sh' \
@@ -1595,6 +1601,8 @@ assert_spec_map_key_removed bootstrap_consumer_identity "$TARGET/.repo-template.
 # tests/test_bootstrap_github_infra.sh — a hub-only test it does not have —
 # and check_spec_test_alignment reds its very first repo-lint run.
 assert_spec_map_key_removed bootstrap_label_seeding "$TARGET/.repo-template.yml"
+# The source-attribution entry must be gone for the same reason (#1056).
+assert_spec_map_key_removed bootstrap_source_attribution "$TARGET/.repo-template.yml"
 # But some_other_spec entry should remain (we only dropped the hub-only ones).
 yq '.spec_test_map.some_other_spec' "$TARGET/.repo-template.yml" 2>/dev/null \
   | grep -q "tests/test_some_other" \
@@ -2104,6 +2112,113 @@ chmod 755 "$LOCKED_DIR"
 [ "$rc" -ne 0 ] \
   && pass "unremovable stale CONTEXT.md fails the cleanup (rc=$rc)" \
   || fail "cleanup swallowed the removal failure"
+
+# ---------------------------------------------------------------------------
+# #1056: name the mergepath revision a bootstrap was based on. Best-effort
+# provenance, not a proof the resulting commit's tree is byte-for-byte
+# derivable from the recorded sha — see specs/bootstrap_source_attribution.md.
+# Three outcomes, each driven through the real bootstrap::_init_target_git
+# (via a real git fixture + the real bootstrap::run) rather than stubs, so
+# the assertion is against an actual commit.
+# ---------------------------------------------------------------------------
+run_init_target_git() {
+  BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    . "$1/scripts/bootstrap/_lib.sh"
+    # shellcheck disable=SC1091
+    . "$1/scripts/bootstrap/template-mirror.sh"
+    bootstrap::_init_target_git "$2" "$3"
+  ' _ "$ROOT" "$1" "$2" >/dev/null
+}
+
+# --- outcome 1: attributed clean canonical source ---
+CLEAN_SOURCE="$WORKDIR/source-clean"
+mkdir -p "$CLEAN_SOURCE"
+git -C "$CLEAN_SOURCE" init -q -b main
+git -C "$CLEAN_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo "content" >"$CLEAN_SOURCE/file.txt"
+git -C "$CLEAN_SOURCE" add -A
+git -C "$CLEAN_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "clean-source seed"
+git -C "$CLEAN_SOURCE" update-ref refs/remotes/origin/main HEAD
+clean_source_sha=$(git -C "$CLEAN_SOURCE" rev-parse HEAD)
+
+CLEAN_TARGET="$WORKDIR/target-clean"
+mkdir -p "$CLEAN_TARGET"
+echo seed >"$CLEAN_TARGET/README.md"
+run_init_target_git "$CLEAN_TARGET" "$CLEAN_SOURCE"
+
+clean_subject=$(git -C "$CLEAN_TARGET" log -1 --format=%s)
+clean_body=$(git -C "$CLEAN_TARGET" log -1 --format=%b)
+[ "$clean_subject" = "Initial commit (bootstrapped from mergepath@${clean_source_sha:0:7})" ] \
+  && pass "a clean, canonical, upstream source is attributed in the subject (#1056)" \
+  || fail "clean canonical source not attributed: $clean_subject"
+case "$clean_body" in
+  *"Source: https://github.com/nathanjohnpayne/mergepath/commit/${clean_source_sha}"*)
+    pass "a sha reachable from origin/* gets the Source: trailer (#1056)" ;;
+  *)
+    fail "Source: trailer missing or wrong for an upstream-reachable sha: $clean_body" ;;
+esac
+
+# --- outcome 2: dirty-source fallback ---
+DIRTY_SOURCE="$WORKDIR/source-dirty"
+mkdir -p "$DIRTY_SOURCE"
+git -C "$DIRTY_SOURCE" init -q -b main
+git -C "$DIRTY_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo "content" >"$DIRTY_SOURCE/file.txt"
+git -C "$DIRTY_SOURCE" add -A
+git -C "$DIRTY_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "dirty-source seed"
+git -C "$DIRTY_SOURCE" update-ref refs/remotes/origin/main HEAD
+echo "uncommitted edit" >>"$DIRTY_SOURCE/file.txt"
+[ -n "$(git -C "$DIRTY_SOURCE" status --porcelain)" ] \
+  || fail "dirty-source fixture did not actually dirty the working tree"
+
+DIRTY_TARGET="$WORKDIR/target-dirty"
+mkdir -p "$DIRTY_TARGET"
+echo seed >"$DIRTY_TARGET/README.md"
+run_init_target_git "$DIRTY_TARGET" "$DIRTY_SOURCE"
+
+dirty_subject=$(git -C "$DIRTY_TARGET" log -1 --format=%s)
+[ "$dirty_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a dirty source_root falls back to the un-attributed subject (#1056)" \
+  || fail "dirty source_root was wrongly attributed: $dirty_subject"
+
+# --- outcome 3: unresolvable/noncanonical-source fallback ---
+NONCANONICAL_SOURCE="$WORKDIR/source-noncanonical"
+mkdir -p "$NONCANONICAL_SOURCE"
+git -C "$NONCANONICAL_SOURCE" init -q -b main
+git -C "$NONCANONICAL_SOURCE" remote add origin "https://github.com/some-other-org/some-other-repo.git"
+echo "content" >"$NONCANONICAL_SOURCE/file.txt"
+git -C "$NONCANONICAL_SOURCE" add -A
+git -C "$NONCANONICAL_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "noncanonical-source seed"
+git -C "$NONCANONICAL_SOURCE" update-ref refs/remotes/origin/main HEAD
+
+NONCANONICAL_TARGET="$WORKDIR/target-noncanonical"
+mkdir -p "$NONCANONICAL_TARGET"
+echo seed >"$NONCANONICAL_TARGET/README.md"
+run_init_target_git "$NONCANONICAL_TARGET" "$NONCANONICAL_SOURCE"
+
+noncanonical_subject=$(git -C "$NONCANONICAL_TARGET" log -1 --format=%s)
+[ "$noncanonical_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a clean but non-canonical-origin source_root falls back to the un-attributed subject (#1056)" \
+  || fail "non-canonical source_root was wrongly attributed: $noncanonical_subject"
+
+# A non-git directory (the other half of "unresolvable") must fall back too,
+# without erroring the bootstrap over a diagnostic.
+NOTGIT_SOURCE="$WORKDIR/source-not-a-git-repo"
+mkdir -p "$NOTGIT_SOURCE"
+NOTGIT_TARGET="$WORKDIR/target-notgit"
+mkdir -p "$NOTGIT_TARGET"
+echo seed >"$NOTGIT_TARGET/README.md"
+run_init_target_git "$NOTGIT_TARGET" "$NOTGIT_SOURCE"
+
+notgit_subject=$(git -C "$NOTGIT_TARGET" log -1 --format=%s)
+[ "$notgit_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a non-git source_root falls back to the un-attributed subject without erroring (#1056)" \
+  || fail "non-git source_root was wrongly attributed: $notgit_subject"
 
 # --- summary --------------------------------------------------------------
 echo
