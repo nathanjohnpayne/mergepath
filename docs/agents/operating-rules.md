@@ -103,6 +103,14 @@ If the round-trip is lossy, the reviewer must flag the information loss as a des
 - An explicit justification for why the loss is acceptable, or
 - A plan to eliminate the intermediate format
 
+## Scope discipline for `priority:high` work
+
+`docs/agents/high-priority-scope-discipline.md` carries the operating rules for high-priority work: freeze a contract before implementing, classify every automated-review finding as required / adjacent / rebutted, and stop when the issue is proved rather than when the finding space is exhausted.
+
+It is a sibling of the escalation policy above and derives from the same class of failure. Where the two-strike rule catches an agent re-patching one broken assumption across separate attempts, the scope rules catch a single PR growing a new guarantee per review round — #1189 ran ten rounds and seventeen commits before being closed unmerged in favour of a one-word fix.
+
+Three of those rules are load-bearing rather than advisory — no new guarantee without an explicit scope decision, a finding in reviewer-induced machinery is a stop signal, and re-review is against the frozen contract. Enforcement is tracked in #1199.
+
 ## Session finalization
 
 Before an agent session goes idle, implementation-ready work must end in one of three durable states: a committed PR, an explicit issue/PR handoff, or an explicit discard. Start follow-up work after a PR merges on a fresh branch or worktree from current `origin/main`; do not continue shipping follow-ups from the just-merged branch's stale checkout. Open the tracking PR or issue early enough that in-flight work is visible. Run `scripts/session-finalization-check.sh` (or equivalent `git status` / stash / worktree checks) before closeout; the script is read-only and reports dirty files, stashes, stale branch state, and dirty auxiliary worktrees without deleting work. Verified-merged local branch classification is handled by `scripts/worktree-cleanup.sh`.
