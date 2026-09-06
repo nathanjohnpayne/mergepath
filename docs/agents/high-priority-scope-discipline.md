@@ -139,7 +139,7 @@ If scope has deliberately changed, update the contract before requesting another
 
 Merge when the ratified required outcome is satisfied, explicit invariants hold, required-tier findings against that contract are resolved or rebutted, acceptance evidence passes, and remaining findings are documented follow-ups or accepted residuals.
 
-**This rule governs which findings you owe a fix, never which gates you owe a pass.** It grants no exemption from the standard merge path: whatever review and clearance that PR's lane requires under REVIEW_POLICY.md still applies after a fix push, and a verdict on superseded code satisfies nothing.
+**This rule governs which findings you owe a fix, never which gates you owe a pass.** Stopping here means stopping the *addition of scope*. When a head is clear enough to merge is REVIEW_POLICY.md's question, and this document does not answer it.
 
 Do not continue reviewing merely because another review might find something. The objective is risk reduction per unit time, not exhaustion of the possible finding space.
 
