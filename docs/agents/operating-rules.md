@@ -105,11 +105,11 @@ If the round-trip is lossy, the reviewer must flag the information loss as a des
 
 ## Scope discipline for `priority:high` work
 
-`docs/agents/high-priority-scope-discipline.md` carries the operating rules for high-priority work: freeze a contract before implementing, classify every automated-review finding as required / adjacent / rebutted, and stop when the issue is proved rather than when the finding space is exhausted.
+**Hub-side.** [Operating Rules for `priority:high` Work](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/high-priority-scope-discipline.md) carries the rules for high-priority work: freeze a contract before implementing, classify every automated-review finding as required / adjacent / rebutted, and stop when the issue is proved rather than when the finding space is exhausted. The link is absolute because that document is classified `hub-only` and is deliberately not mirrored into consumer repositories — its evidence and its three load-bearing rules are stated in mergepath issue numbers and in this repo's review-round machinery, so a verbatim copy would cite issues a consumer cannot resolve. A consumer reading this section is reading a pointer to how the hub works, not an instruction to open a local path.
 
-It is a sibling of the escalation policy above and derives from the same class of failure. Where the two-strike rule catches an agent re-patching one broken assumption across separate attempts, the scope rules catch a single PR growing a new guarantee per review round — #1189 ran ten rounds and seventeen commits before being closed unmerged in favour of a one-word fix.
+It is a sibling of the escalation policy above and derives from the same class of failure. Where the two-strike rule catches an agent re-patching one broken assumption across separate attempts, the scope rules catch a single PR growing a new guarantee per review round — mergepath#1189 ran twelve Codex review rounds and twenty-one commits before being closed unmerged in favour of a one-word fix.
 
-Three of those rules are load-bearing rather than advisory — no new guarantee without an explicit scope decision, a finding in reviewer-induced machinery is a stop signal, and re-review is against the frozen contract. Enforcement is tracked in #1199.
+Three of those rules are load-bearing rather than advisory — no new guarantee without an explicit scope decision, a finding in reviewer-induced machinery is a stop signal, and re-review is against the frozen contract. Enforcement is tracked in mergepath#1199.
 
 ## Session finalization
 

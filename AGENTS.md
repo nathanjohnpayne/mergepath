@@ -16,6 +16,7 @@ Agent instructions are organized into focused sub-files under `docs/agents/`. Re
 10. **[Prose Line-Wrapping](docs/agents/prose-line-wrapping.md)** --- Soft-wrap Markdown prose, one physical line per paragraph (synced canonical convention); this repo's in-scope path allowlist and gate live in Documentation Rules above
 11. **[Code Review Requirements](docs/agents/code-review-requirements.md)** --- Thin pointer: all review behavior is governed by REVIEW_POLICY.md and `.github/review-policy.yml` (synced canonical pointer)
 12. **[Cloudflare MCP Servers](docs/agents/cloudflare-mcp-servers.md)** --- Capability note: the five remote MCP servers the `cloudflare` plugin ships, their auth model, and the write-capability hazard
+13. **[Operating Rules for `priority:high` Work](docs/agents/high-priority-scope-discipline.md)** --- Scope discipline while a high-priority PR is under automated review: freeze a contract, disposition every finding against it, stop when the issue is proved (hub-only; not mirrored to consumers)
 
 Item 2 is the stable entrypoint for shared rules: it is one canonical file mirrored to every repo, so a new fleet-wide rule lands by editing it at the canonical source, not by editing every repo's index again.
 

@@ -4,7 +4,11 @@ High-priority work optimizes for closing the demonstrated problem, not for satis
 
 **Automated review is a defect detector, not a scope authority.**
 
-These rules are derived from a real failure. #1189 spent seventeen commits and ten review rounds on a fix for #1188. Findings per round ran 4, 1, 3, 1, 1, 6, 1, 2, 1 — rising, not converging — and roughly half of the later findings were interactions with rules added in the round before, including three regressions introduced in a single round. Every reviewer was correct every time. The error was converting each correct finding into an obligation instead of asking whether the guarantee being defended was one the issue required. #1189 was eventually closed unmerged and replaced by #1196, a one-word change.
+These rules are derived from a real failure. #1189 spent **twenty-one commits** and **twelve Codex review rounds** on a fix for #1188, plus three CodeRabbit rounds. Codex inline findings per round, in order, were **4, 1, 3, 1, 1, 6, 1, 2, 1, 2, 1, 3** — twenty-six findings that never trended toward zero. The point is not that the count rose; it is that it never fell. The largest round was the sixth, the final round still produced three findings, and there was no round after which the next one was reliably quieter. Under a fix-every-finding policy that series has no natural end, because roughly half of the later findings were interactions with rules added in the round before — including three regressions introduced in a single round.
+
+Every reviewer was correct every time. The error was converting each correct finding into an obligation instead of asking whether the guarantee being defended was one the issue required. #1189 was eventually closed unmerged and replaced by #1196, a one-word change.
+
+*(Counts are re-derivable: inline comments on #1189 authored by `chatgpt-codex-connector[bot]`, grouped by posting minute; commits from that PR's commit list.)*
 
 Three rules here are load-bearing rather than advisory: **rule 3**, **rule 5**, and **rule 11**. Their enforcement is tracked in #1199.
 
@@ -49,6 +53,8 @@ The finding may be correct, but fixing it would require:
 - materially new acceptance criteria.
 
 Record it separately. Do not implement it merely because it was discovered during review.
+
+**This is a disposition, not silence.** `.github/review-policy.yml` maps P0/P1 to `required` and P2/P3/nitpick to `discretionary`, and a required-tier finding must be dispositioned before merge — but a disposition is *a fix or an explicit recorded rationale*, not necessarily a fix. Deferral is a first-class disposition class: `scripts/resolve-pr-threads.sh` tags it `[mergepath-resolve: deferred-to-followup]`, and `scripts/review-feedback-accounting.sh` counts a rationale-carrying deferral as accounted. So a valid P1 that this rule classifies adjacent is deferred *on the record*, with the follow-up issue named — and the required gate clears. What strands the gate is leaving the finding unanswered, which no rule here permits.
 
 ### C. Rebutted
 
@@ -140,6 +146,8 @@ If scope has deliberately changed, update the contract before requesting another
 ## 12. Stop when the issue is proved
 
 Merge when the frozen required outcome is satisfied, explicit invariants hold, required-tier findings against that contract are resolved or rebutted, acceptance evidence passes, and remaining findings are documented follow-ups or accepted residuals.
+
+**This rule governs which findings you owe a fix, never which gates you owe a pass.** It grants no exemption from the standard merge path: a fix push still requires a fresh review invocation and HEAD-anchored clearance on the *current* head, exactly as REVIEW_POLICY.md Phase 4 specifies. A verdict on superseded code satisfies nothing. Rule 12 says stop *adding scope*; the gates decide when the head is clear.
 
 Do not continue reviewing merely because another review might find something. The objective for `priority:high` work is risk reduction per unit time, not exhaustion of the possible finding space.
 
