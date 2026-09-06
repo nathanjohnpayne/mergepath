@@ -803,7 +803,7 @@ run_clear_case "diagnostic published after this invocation began is left alone" 
 
 # The mirror: a failure genuinely evaluated AFTER the verdict is newer evidence
 # and must survive, even though both markers are present.
-GENUINELY_NEWER='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-06T00:00:00Z","id":52,"output":{"summary":"boom [continuation-stage: full] [continuation-evaluated-at: 1788696000] see run"}}]}'
+GENUINELY_NEWER='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-06T00:00:00Z","id":52,"output":{"summary":"boom [continuation-stage: full] see run"}}]}'
 run_clear_case "failure evaluated after the verdict survives" no \
   "$GENUINELY_NEWER" "" "7:abc123:$VERDICT_AFTER:full"
 
@@ -843,7 +843,7 @@ fi
 : > "$clear_tmp/gh.log"
 set +e
 PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_FAIL_PATCH=1 \
-  GH_STUB_CHECKRUNS='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":91,"output":{"summary":"boom [continuation-stage: full] [continuation-evaluated-at: 1788480000] x"}}]}' \
+  GH_STUB_CHECKRUNS='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":91,"output":{"summary":"boom [continuation-stage: full] x"}}]}' \
   GH_RETRY_ATTEMPTS=1 \
   bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7:abc123:$VERDICT_AFTER:full" >/dev/null 2>&1
 clear_fail_rc=$?
@@ -866,13 +866,25 @@ else
   echo "  FAIL: a post-gate read must not overwrite the evaluated head (#1190)" >&2
 fi
 
-# Two invocations can start in the same second and receive identical epochs.
-# The two comparisons must agree on that tie: when they disagreed, clear refused
-# to clear a same-second failure while report declined to suppress it, so the
-# head stayed red with neither side willing to resolve it.
-SAME_SECOND_FAILURE='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":95,"output":{"summary":"boom [continuation-stage: full] [continuation-evaluated-at: 1788609600] x"}}]}'
-run_clear_case "same-second failure is resolved, not deadlocked" yes \
-  "$SAME_SECOND_FAILURE" "" "7:abc123:$VERDICT_AFTER:full" 95
+# The exact boundary of the published-before-start guard. VERDICT_AFTER is
+# 2026-09-05T12:00:00Z, so this fixture's started_at is the SAME SECOND as the
+# invocation start rather than merely earlier -- the case a fixture with a
+# comfortable gap never reaches.
+#
+# Equality is left alone, deliberately. Second-resolution timestamps cannot
+# distinguish "published just before I started" from "published just after", so
+# the tie resolves to a stale RED, which a later evaluation clears, rather than
+# to a clear that might green a failure this invocation never saw. Recovering
+# ordering inside the tie needs a cross-invocation tie-breaker, which is #1191.
+SAME_SECOND_AS_START='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T12:00:00Z","id":95,"output":{"summary":"boom [continuation-stage: full] x"}}]}'
+run_clear_case "diagnostic published in the same second as the start is left alone" no \
+  "$SAME_SECOND_AS_START" "" "7:abc123:$VERDICT_AFTER:full"
+
+# One second earlier IS cleared, which is what makes the boundary a boundary
+# rather than a blanket refusal.
+ONE_SECOND_BEFORE_START='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T11:59:59Z","id":96,"output":{"summary":"boom [continuation-stage: full] x"}}]}'
+run_clear_case "diagnostic published one second before the start is cleared" yes \
+  "$ONE_SECOND_BEFORE_START" "" "7:abc123:$VERDICT_AFTER:full" 96
 
 # The evaluation-order tests that stood here -- a veto scanning every run for a
 # failure evaluated after the verdict -- went with the model they tested.
