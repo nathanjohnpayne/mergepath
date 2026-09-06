@@ -437,6 +437,14 @@ else
   echo "  FAIL: continuation failures must not share the label-removal healing channel" >&2
 fi
 
+# The conclusion is the whole of #1188. `failure` on a NON-REQUIRED check
+# blocked no merge but drove mergeStateStatus to UNSTABLE, which made
+# gh-pr-guard demand a break-glass on a PR with every required context green --
+# and nothing ever posted a success for this name, so it never healed.
+# `neutral` keeps the diagnostic equally visible and strands nothing, which is
+# why no clearing path is needed. Asserted in both directions: neutral present
+# AND failure absent, so a revert to `failure` cannot pass by adding a
+# conclusion rather than changing one.
 reporter_tmp=$(mktemp -d "${TMPDIR:-/tmp}/continuation-reporter.XXXXXX")
 mkdir -p "$reporter_tmp/bin"
 cat > "$reporter_tmp/bin/gh" <<'STUB'
@@ -457,13 +465,14 @@ if PATH="$reporter_tmp/bin:$PATH" GH_STUB_LOG="$reporter_tmp/gh.log" GH_RETRY_AT
      bash "$CONTINUATION_REPORTER" owner/repo https://example.test/run/1 "7" >/dev/null \
    && grep -Fq 'api repos/owner/repo/check-runs' "$reporter_tmp/gh.log" \
    && grep -Fq 'head_sha=abc123' "$reporter_tmp/gh.log" \
-   && grep -Fq 'conclusion=failure' "$reporter_tmp/gh.log" \
+   && grep -Fq 'conclusion=neutral' "$reporter_tmp/gh.log" \
+   && ! grep -Fq 'conclusion=failure' "$reporter_tmp/gh.log" \
    && ! grep -Fq -- '--json labels' "$reporter_tmp/gh.log"; then
   pass=$((pass + 1))
-  echo "  PASS: continuation reporter posts a failure without label-absence healing"
+  echo "  PASS: continuation reporter posts a NEUTRAL diagnostic without label-absence healing (#1188)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: continuation reporter must publish an unconditional head-pinned failure diagnostic" >&2
+  echo "  FAIL: continuation reporter must publish an unconditional head-pinned NEUTRAL diagnostic (#1188)" >&2
 fi
 rm -rf "$reporter_tmp"
 
