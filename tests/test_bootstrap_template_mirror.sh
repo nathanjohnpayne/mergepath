@@ -152,6 +152,8 @@ spec_test_map:
     - tests/test_bootstrap_template_mirror.sh
   bootstrap_label_seeding:
     - tests/test_bootstrap_github_infra.sh
+  bootstrap_source_attribution:
+    - tests/test_bootstrap_template_mirror.sh
   some_other_spec:
     - tests/test_some_other.sh
 test_globs:
@@ -242,6 +244,9 @@ echo "playground spec" >"$FAKE_MP/specs/mergepath_playground.md"
 # exclusion below is asserted against a file that actually exists —
 # an absent file would pass the "not mirrored" check vacuously.
 echo "label seeding spec" >"$FAKE_MP/specs/bootstrap_label_seeding.md"
+# #1056: hub-only bootstrap source-attribution spec, seeded for the same
+# vacuous-test reason as the line above.
+echo "source attribution spec" >"$FAKE_MP/specs/bootstrap_source_attribution.md"
 echo "playground plan" >"$FAKE_MP/plans/mergepath-playground.md"
 echo "playground test" >"$FAKE_MP/tests/test_mergepath_playground.sh"
 echo "screenshot bug"  >"$FAKE_MP/bugs/screenshots/foo.png"
@@ -438,6 +443,7 @@ for excluded in \
   '.claude/launch.json' \
   'specs/mergepath_playground.md' \
   'specs/bootstrap_label_seeding.md' \
+  'specs/bootstrap_source_attribution.md' \
   'plans/mergepath-playground.md' \
   'scripts/policy-sim.sh' \
   'scripts/audit-canonical-mirrors.sh' \
@@ -1595,6 +1601,8 @@ assert_spec_map_key_removed bootstrap_consumer_identity "$TARGET/.repo-template.
 # tests/test_bootstrap_github_infra.sh — a hub-only test it does not have —
 # and check_spec_test_alignment reds its very first repo-lint run.
 assert_spec_map_key_removed bootstrap_label_seeding "$TARGET/.repo-template.yml"
+# The source-attribution entry must be gone for the same reason (#1056).
+assert_spec_map_key_removed bootstrap_source_attribution "$TARGET/.repo-template.yml"
 # But some_other_spec entry should remain (we only dropped the hub-only ones).
 yq '.spec_test_map.some_other_spec' "$TARGET/.repo-template.yml" 2>/dev/null \
   | grep -q "tests/test_some_other" \
@@ -2104,6 +2112,226 @@ chmod 755 "$LOCKED_DIR"
 [ "$rc" -ne 0 ] \
   && pass "unremovable stale CONTEXT.md fails the cleanup (rc=$rc)" \
   || fail "cleanup swallowed the removal failure"
+
+# ---------------------------------------------------------------------------
+# #1056: name the mergepath revision a bootstrap was based on. Best-effort
+# provenance, not a proof the resulting commit's tree is byte-for-byte
+# derivable from the recorded sha — see specs/bootstrap_source_attribution.md.
+# Three outcomes, each driven through the real bootstrap::_init_target_git
+# (via a real git fixture + the real bootstrap::run) rather than stubs, so
+# the assertion is against an actual commit.
+# ---------------------------------------------------------------------------
+run_init_target_git() {
+  BOOTSTRAP_AUTHOR_NAME="test" BOOTSTRAP_AUTHOR_EMAIL="t@t" bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    . "$1/scripts/bootstrap/_lib.sh"
+    # shellcheck disable=SC1091
+    . "$1/scripts/bootstrap/template-mirror.sh"
+    bootstrap::_init_target_git "$2" "$3"
+  ' _ "$ROOT" "$1" "$2" >/dev/null
+}
+
+# --- outcome 1: attributed clean canonical source ---
+CLEAN_SOURCE="$WORKDIR/source-clean"
+mkdir -p "$CLEAN_SOURCE"
+git -C "$CLEAN_SOURCE" init -q -b main
+git -C "$CLEAN_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo "content" >"$CLEAN_SOURCE/file.txt"
+git -C "$CLEAN_SOURCE" add -A
+git -C "$CLEAN_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "clean-source seed"
+git -C "$CLEAN_SOURCE" update-ref refs/remotes/origin/main HEAD
+clean_source_sha=$(git -C "$CLEAN_SOURCE" rev-parse HEAD)
+
+CLEAN_TARGET="$WORKDIR/target-clean"
+mkdir -p "$CLEAN_TARGET"
+echo seed >"$CLEAN_TARGET/README.md"
+run_init_target_git "$CLEAN_TARGET" "$CLEAN_SOURCE"
+
+clean_subject=$(git -C "$CLEAN_TARGET" log -1 --format=%s)
+clean_body=$(git -C "$CLEAN_TARGET" log -1 --format=%b)
+[ "$clean_subject" = "Initial commit (bootstrapped from mergepath@${clean_source_sha:0:7})" ] \
+  && pass "a clean, canonical, upstream source is attributed in the subject (#1056)" \
+  || fail "clean canonical source not attributed: $clean_subject"
+case "$clean_body" in
+  *"Source: https://github.com/nathanjohnpayne/mergepath/commit/${clean_source_sha}"*)
+    pass "a sha reachable from origin/* gets the Source: trailer (#1056)" ;;
+  *)
+    fail "Source: trailer missing or wrong for an upstream-reachable sha: $clean_body" ;;
+esac
+
+# A clean, canonical-origin source whose HEAD is NOT reachable from any
+# refs/remotes/origin/* ref (an operator's own local, not-yet-pushed
+# mergepath commit) must fall back to the un-attributed subject entirely --
+# not attribute a subject-only sha. A sha only the operator's local clone
+# can resolve is not a recoverable HUB_REF: another clone can't resolve it,
+# and the local clone may eventually garbage-collect it.
+UNPUSHED_SOURCE="$WORKDIR/source-unpushed"
+mkdir -p "$UNPUSHED_SOURCE"
+git -C "$UNPUSHED_SOURCE" init -q -b main
+git -C "$UNPUSHED_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo "pushed content" >"$UNPUSHED_SOURCE/file.txt"
+git -C "$UNPUSHED_SOURCE" add -A
+git -C "$UNPUSHED_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "unpushed-source pushed baseline"
+git -C "$UNPUSHED_SOURCE" update-ref refs/remotes/origin/main HEAD
+echo "local-only content" >>"$UNPUSHED_SOURCE/file.txt"
+git -C "$UNPUSHED_SOURCE" add -A
+git -C "$UNPUSHED_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "unpushed-source local-only commit"
+[ -z "$(git -C "$UNPUSHED_SOURCE" status --porcelain)" ] \
+  || fail "unpushed-source fixture is dirty, not just unpushed"
+git -C "$UNPUSHED_SOURCE" merge-base --is-ancestor HEAD refs/remotes/origin/main 2>/dev/null \
+  && fail "unpushed-source fixture's HEAD is reachable from origin/main -- it did not actually advance past the pushed baseline"
+
+UNPUSHED_TARGET="$WORKDIR/target-unpushed"
+mkdir -p "$UNPUSHED_TARGET"
+echo seed >"$UNPUSHED_TARGET/README.md"
+run_init_target_git "$UNPUSHED_TARGET" "$UNPUSHED_SOURCE"
+
+unpushed_subject=$(git -C "$UNPUSHED_TARGET" log -1 --format=%s)
+[ "$unpushed_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a clean, canonical-origin source with an unpushed local HEAD falls back to the un-attributed subject (#1056)" \
+  || fail "an unpushed local HEAD was wrongly attributed (not a recoverable HUB_REF): $unpushed_subject"
+
+# --- outcome 2: dirty-source fallback ---
+DIRTY_SOURCE="$WORKDIR/source-dirty"
+mkdir -p "$DIRTY_SOURCE"
+git -C "$DIRTY_SOURCE" init -q -b main
+git -C "$DIRTY_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo "content" >"$DIRTY_SOURCE/file.txt"
+git -C "$DIRTY_SOURCE" add -A
+git -C "$DIRTY_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "dirty-source seed"
+git -C "$DIRTY_SOURCE" update-ref refs/remotes/origin/main HEAD
+echo "uncommitted edit" >>"$DIRTY_SOURCE/file.txt"
+[ -n "$(git -C "$DIRTY_SOURCE" status --porcelain)" ] \
+  || fail "dirty-source fixture did not actually dirty the working tree"
+
+DIRTY_TARGET="$WORKDIR/target-dirty"
+mkdir -p "$DIRTY_TARGET"
+echo seed >"$DIRTY_TARGET/README.md"
+run_init_target_git "$DIRTY_TARGET" "$DIRTY_SOURCE"
+
+dirty_subject=$(git -C "$DIRTY_TARGET" log -1 --format=%s)
+[ "$dirty_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a dirty source_root falls back to the un-attributed subject (#1056)" \
+  || fail "dirty source_root was wrongly attributed: $dirty_subject"
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1197: a bare `git status --porcelain` silently honors the
+# operator's own status.showUntrackedFiles=no, under which an ordinary
+# untracked file reads as clean even though rsync -a would still copy it.
+# Verify the fixture actually reproduces an empty `git status --porcelain`
+# under that config before asserting the fix, so this test cannot pass
+# vacuously.
+# ---------------------------------------------------------------------------
+UNTRACKED_SOURCE="$WORKDIR/source-untracked-hidden"
+mkdir -p "$UNTRACKED_SOURCE"
+git -C "$UNTRACKED_SOURCE" init -q -b main
+git -C "$UNTRACKED_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo "content" >"$UNTRACKED_SOURCE/file.txt"
+git -C "$UNTRACKED_SOURCE" add -A
+git -C "$UNTRACKED_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "untracked-hidden seed"
+git -C "$UNTRACKED_SOURCE" update-ref refs/remotes/origin/main HEAD
+git -C "$UNTRACKED_SOURCE" config status.showUntrackedFiles no
+echo "stray content" >"$UNTRACKED_SOURCE/stray.txt"
+if [ -n "$(git -C "$UNTRACKED_SOURCE" status --porcelain)" ]; then
+  fail "untracked-hidden fixture did not reproduce the status.showUntrackedFiles=no blind spot: $(git -C "$UNTRACKED_SOURCE" status --porcelain)"
+fi
+
+UNTRACKED_TARGET="$WORKDIR/target-untracked-hidden"
+mkdir -p "$UNTRACKED_TARGET"
+echo seed >"$UNTRACKED_TARGET/README.md"
+run_init_target_git "$UNTRACKED_TARGET" "$UNTRACKED_SOURCE"
+
+untracked_subject=$(git -C "$UNTRACKED_TARGET" log -1 --format=%s)
+[ "$untracked_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a stray untracked file hidden by status.showUntrackedFiles=no blocks attribution (#1056 Codex P2 on #1197)" \
+  || fail "untracked-hidden source_root wrongly attributed: $untracked_subject"
+
+# ---------------------------------------------------------------------------
+# Codex P2 on #1197 (second round): a bare `git status --porcelain` also
+# silently honors the operator's own diff.ignoreSubmodules=all, under which
+# a submodule checked out at a different commit than the superproject's
+# tree records reads as clean even though rsync -a would still copy the
+# mismatched checkout. Verify the fixture actually reproduces an empty
+# `git status --porcelain` under that config before asserting the fix.
+# ---------------------------------------------------------------------------
+SUBMODULE_UPSTREAM="$WORKDIR/submodule-upstream"
+mkdir -p "$SUBMODULE_UPSTREAM"
+git -C "$SUBMODULE_UPSTREAM" init -q -b main
+echo "v1" >"$SUBMODULE_UPSTREAM/sub-file.txt"
+git -C "$SUBMODULE_UPSTREAM" add -A
+git -C "$SUBMODULE_UPSTREAM" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "submodule-upstream v1"
+echo "v2" >"$SUBMODULE_UPSTREAM/sub-file.txt"
+git -C "$SUBMODULE_UPSTREAM" add -A
+git -C "$SUBMODULE_UPSTREAM" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "submodule-upstream v2"
+submodule_v1=$(git -C "$SUBMODULE_UPSTREAM" rev-parse HEAD~1)
+
+SUBMODULE_SOURCE="$WORKDIR/source-submodule-dirty"
+mkdir -p "$SUBMODULE_SOURCE"
+git -C "$SUBMODULE_SOURCE" init -q -b main
+git -C "$SUBMODULE_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+git -C "$SUBMODULE_SOURCE" -c protocol.file.allow=always submodule --quiet add "$SUBMODULE_UPSTREAM" sub >/dev/null 2>&1
+git -C "$SUBMODULE_SOURCE" add -A
+git -C "$SUBMODULE_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "submodule-dirty seed (records submodule at v2)"
+git -C "$SUBMODULE_SOURCE" update-ref refs/remotes/origin/main HEAD
+git -C "$SUBMODULE_SOURCE" config diff.ignoreSubmodules all
+(cd "$SUBMODULE_SOURCE/sub" && git checkout -q "$submodule_v1")
+if [ -n "$(git -C "$SUBMODULE_SOURCE" status --porcelain)" ]; then
+  fail "submodule-dirty fixture did not reproduce the diff.ignoreSubmodules=all blind spot: $(git -C "$SUBMODULE_SOURCE" status --porcelain)"
+fi
+
+SUBMODULE_TARGET="$WORKDIR/target-submodule-dirty"
+mkdir -p "$SUBMODULE_TARGET"
+echo seed >"$SUBMODULE_TARGET/README.md"
+run_init_target_git "$SUBMODULE_TARGET" "$SUBMODULE_SOURCE"
+
+submodule_subject=$(git -C "$SUBMODULE_TARGET" log -1 --format=%s)
+[ "$submodule_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a submodule checked out at a different commit, hidden by diff.ignoreSubmodules=all, blocks attribution (#1056 Codex P2 on #1197)" \
+  || fail "submodule-dirty source_root wrongly attributed: $submodule_subject"
+
+# --- outcome 3: unresolvable/noncanonical-source fallback ---
+NONCANONICAL_SOURCE="$WORKDIR/source-noncanonical"
+mkdir -p "$NONCANONICAL_SOURCE"
+git -C "$NONCANONICAL_SOURCE" init -q -b main
+git -C "$NONCANONICAL_SOURCE" remote add origin "https://github.com/some-other-org/some-other-repo.git"
+echo "content" >"$NONCANONICAL_SOURCE/file.txt"
+git -C "$NONCANONICAL_SOURCE" add -A
+git -C "$NONCANONICAL_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "noncanonical-source seed"
+git -C "$NONCANONICAL_SOURCE" update-ref refs/remotes/origin/main HEAD
+
+NONCANONICAL_TARGET="$WORKDIR/target-noncanonical"
+mkdir -p "$NONCANONICAL_TARGET"
+echo seed >"$NONCANONICAL_TARGET/README.md"
+run_init_target_git "$NONCANONICAL_TARGET" "$NONCANONICAL_SOURCE"
+
+noncanonical_subject=$(git -C "$NONCANONICAL_TARGET" log -1 --format=%s)
+[ "$noncanonical_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a clean but non-canonical-origin source_root falls back to the un-attributed subject (#1056)" \
+  || fail "non-canonical source_root was wrongly attributed: $noncanonical_subject"
+
+# A non-git directory (the other half of "unresolvable") must fall back too,
+# without erroring the bootstrap over a diagnostic.
+NOTGIT_SOURCE="$WORKDIR/source-not-a-git-repo"
+mkdir -p "$NOTGIT_SOURCE"
+NOTGIT_TARGET="$WORKDIR/target-notgit"
+mkdir -p "$NOTGIT_TARGET"
+echo seed >"$NOTGIT_TARGET/README.md"
+run_init_target_git "$NOTGIT_TARGET" "$NOTGIT_SOURCE"
+
+notgit_subject=$(git -C "$NOTGIT_TARGET" log -1 --format=%s)
+[ "$notgit_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a non-git source_root falls back to the un-attributed subject without erroring (#1056)" \
+  || fail "non-git source_root was wrongly attributed: $notgit_subject"
 
 # --- summary --------------------------------------------------------------
 echo
