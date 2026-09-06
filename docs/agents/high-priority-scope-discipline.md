@@ -4,9 +4,30 @@ High-priority work optimizes for closing the demonstrated problem, not for satis
 
 **Automated review is a defect detector, not a scope authority.**
 
-**This document is not review policy and does not compete with it.** [REVIEW_POLICY.md](../../REVIEW_POLICY.md) and `.github/review-policy.yml` remain the sole authority for review behavior — identities, workflow, thresholds, tiers, disposition requirements, gates. Nothing here creates a required check, changes what any gate blocks on, or alters what disposition a finding needs; where anything below appears to conflict with the governing policy, **the governing policy wins and this document is the thing that is wrong.** What this document governs is a different category from review behaviour, which is why it is not a competing rulebook: these are **owner decision rights** and **agent reporting obligations**. Rule 1 is a decision the owner makes; rule 3 escalates to that same decision; the checkpoint is a report the author files. None of them says what a reviewer does, what a tier means, what a gate blocks on, or when a PR may merge — the questions REVIEW_POLICY.md answers. The subject here is narrower and belongs to the author: *given* a finding you must already disposition under that policy, how do you decide whether the code it is about should exist at all. The checkpoint below is a record the author keeps, not a gate anyone enforces.
+## This is a design document, not a normative source
 
-Whether even that separation is enough — or whether these rules should live inside the governing policy rather than beside it — is an open question for the repo owner, raised as a P1 on this document's own PR and deliberately not settled by the author of the document.
+**Owner decision, 2026-09-06.** Read this before treating anything below as a rule you must follow.
+
+> The mistake would be to turn the lesson into a new scope-discipline constitution sitting beside REVIEW_POLICY.md. That would reproduce a pattern Mergepath already struggles with: two documents describing overlapping behavior, followed by machinery to detect which one drifted.
+
+So this document explains and does not mandate. It is the reasoning and the evidence; the obligations live at the control points below, and if this file and a control point ever disagree, **the control point wins and this file is out of date**. [REVIEW_POLICY.md](../../REVIEW_POLICY.md) and `.github/review-policy.yml` remain the sole authority for review behavior — identities, workflow, thresholds, tiers, disposition requirements, gates. Nothing here creates a required check, changes what a gate blocks on, or alters what disposition a finding needs.
+
+### Where each rule actually lives
+
+The governing principle is that these are **distinct decision rights with distinct actors**, and bundling them into one document merely because they were discovered together is itself the error:
+
+> Don't bundle distinct decision rights into one mechanism merely because they were discovered together. Owner scope decisions, authoring requirements, and reviewer obligations have different actors and should live at their respective control points.
+
+| Rule | Control point | Actor |
+|---|---|---|
+| **1** — contract ratified against the issue, with named guarantees and residual costs visible | PR authoring / open | **Owner** ratifies |
+| **The checkpoint** — original ask, named additional guarantees, relevant failure costs | The PR template carries the artifact | Author reports |
+| **3, 5** — mechanism lineage and scope delta reported whenever a finding would strengthen a guarantee; escalation offers fix / reduce-defer / remove / recut / accept residual | During implementation and escalation (#1201) | Author reports, owner decides |
+| **2, 11** — what constitutes an in-contract blocking finding, and how adjacent findings are recorded | The review request machinery, or REVIEW_POLICY.md | Reviewer — *this is genuinely review behavior and belongs under the existing authority* |
+
+PR authoring/open is where #1189 should have been stopped, and no amount of doctrine in a `docs/agents/` file would have stopped it.
+
+**While that distribution is being built, this document is explanatory only.** Rules 3, 5 and 11 were earlier marked load-bearing here; they remain load-bearing as *decisions*, but the load is carried at the control points above, not by this file.
 
 These rules are derived from a real failure. #1189 spent **twenty-one commits** and **twelve Codex review rounds** on a fix for #1188, plus three CodeRabbit rounds. Codex inline findings per round, in order, were **4, 1, 3, 1, 1, 6, 1, 2, 1, 2, 1, 3** — twenty-six findings that never trended toward zero. The point is not that the count rose; it is that it never fell. The largest round was the sixth, the final round still produced three findings, and there was no round after which the next one was reliably quieter. Under a fix-every-finding policy that series has no natural end, because roughly half of the later findings were interactions with rules added in the round before — including three regressions introduced in a single round.
 
@@ -14,7 +35,33 @@ Every reviewer was correct every time. The error was converting each correct fin
 
 *(Counts are re-derivable: inline comments on #1189 authored by `chatgpt-codex-connector[bot]`, grouped by posting minute; commits from that PR's commit list.)*
 
-Three rules here are load-bearing rather than advisory: **rule 3**, **rule 5**, and **rule 11**. Enforcement is tracked in #1199 — but rule 5 is load-bearing *without* being automatable, and #1199 records why the mechanical version of it was withdrawn.
+### What happened to this document under review
+
+Recorded because the document argues for measuring, and its own numbers were asserted before they were checked.
+
+I told the owner across three separate reports that every review round had made this file *smaller*. That was false, and nobody measured it until the owner asked for it to be preserved on the record. Measured (`git show <sha>:<this file> | wc -w`):
+
+| | words | delta |
+|---|---|---|
+| initial commit `2e480aa` | 1583 | — |
+| after review round 1 `d696980` | 1835 | +252 |
+| after review round 2 `ab04106` | 1948 | +113 |
+| owner rule-5 change `9fd26ec` | 2285 | +337 |
+| evidence re-measurement `7ca225e` | 2652 | +367 |
+| after review round 3 `69de1f7` | 2878 | +226 |
+| evidence correction `a4d6be2` | 3221 | +343 |
+| owner rule-1 change `0a42275` | 3513 | +292 |
+| framing correction `d4ef45c` | 3652 | +139 |
+
+**The document grew 131%.** It never shrank in any commit. The rule count stayed at twelve throughout.
+
+What *did* shrink was mechanism: rule 5 lost two thresholds, and a tier-mechanics paragraph added in round 1 was removed in round 3 rather than repaired a third time. That is real, and it is what the "smaller" claim was reaching for — but "we removed two mechanisms" and "the document got smaller" are different statements, and only the first one is true.
+
+The attribution is worth more than the total. **The three review rounds account for +591 words. Owner decisions and evidence corrections account for +1478** — two and a half times as much. Automated review was not the main source of growth in a document about automated review causing growth; the main source was correcting claims this document had made about itself, and absorbing decisions that changed what it is for.
+
+That is the fourth unmeasured claim caught in this file. The first three were caught by a reviewer or a peer. This one was caught only because the owner asked for it in writing.
+
+Enforcement is tracked in #1199 (rules 2 and 11, at the review-request machinery) and #1201 (rules 3 and 5, at the escalation surface). Rule 5 is load-bearing *without* being automatable, and #1199 records why the mechanical version of it was withdrawn.
 
 ## 1. Get the contract ratified, not merely frozen
 
@@ -202,7 +249,7 @@ Do not continue reviewing merely because another review might find something. Th
 
 ## The scope checkpoint
 
-For every `priority:high` PR, after each substantive automated-review round, the author records — in the PR, where the owner and the other reviewers can see it:
+The artifact belongs in the **PR template**, not in a separate doctrine — the template is the control point, and a checkpoint nobody is prompted for is a checkpoint nobody files. For every `priority:high` PR, after each substantive automated-review round, the author records — in the PR, where the owner and the other reviewers can see it:
 
 ```
 Contract changed?                            yes / no
