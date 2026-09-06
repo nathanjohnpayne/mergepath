@@ -54,7 +54,14 @@ The finding may be correct, but fixing it would require:
 
 Record it separately. Do not implement it merely because it was discovered during review.
 
-**This is a disposition, not silence.** `.github/review-policy.yml` maps P0/P1 to `required` and P2/P3/nitpick to `discretionary`, and a required-tier finding must be dispositioned before merge — but a disposition is *a fix or an explicit recorded rationale*, not necessarily a fix. Deferral is a first-class disposition class: `scripts/resolve-pr-threads.sh` tags it `[mergepath-resolve: deferred-to-followup]`, and `scripts/review-feedback-accounting.sh` counts a rationale-carrying deferral as accounted. So a valid P1 that this rule classifies adjacent is deferred *on the record*, with the follow-up issue named — and the required gate clears. What strands the gate is leaving the finding unanswered, which no rule here permits.
+**Deferral is available at discretionary tier only.** REVIEW_POLICY.md § Feedback Disposition Policy is explicit: a disposition is a fix, a rebuttal, or — *for a discretionary-tier finding only* — a deferral reply linking a follow-up issue. **A required-tier (P0/P1) finding must be fixed or rebutted.** The one exception is the summary-only ack path, for findings that have no review thread.
+
+So this classification resolves differently by tier:
+
+- **Discretionary (P2/P3/nitpick).** File the follow-up, post the deferral reply linking it, resolve the thread. This is the ordinary path and needs nobody's permission.
+- **Required (P0/P1).** You may not self-defer. Either the finding is genuinely inapplicable under the frozen contract, in which case **rebut** it and say why — a rebuttal is a substantive disposition, not a dodge — or it is applicable and valid, in which case it is a **scope decision, and rule 3 applies**: stop and obtain an explicit owner decision. Do not route around a valid required-tier finding by filing an issue and calling it handled.
+
+That boundary is the whole safeguard. Without it, "valid but adjacent" becomes a way for an agent to unilaterally downgrade any blocking finding it would rather not fix — which is the failure this document exists to prevent, run in the opposite direction.
 
 ### C. Rebutted
 

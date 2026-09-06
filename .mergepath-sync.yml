@@ -2080,8 +2080,9 @@ doc_ownership:
     class: hub-only
     note: >-
       Scope-discipline rules for priority:high work, derived from the
-      #1189 failure (ten review rounds, seventeen commits, closed
-      unmerged in favour of the one-word #1196). HUB-ONLY rather than
+      #1189 failure (twenty-one commits, twelve Codex review rounds and
+      three CodeRabbit rounds, closed unmerged in favour of the one-word
+      #1196). HUB-ONLY rather than
       canonical for now on the shared-operating-rules.md test — that file
       deliberately carries "only the rules proven true AND usable
       everywhere", and this one is not yet either: its evidence and its
