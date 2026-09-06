@@ -109,7 +109,7 @@ If the round-trip is lossy, the reviewer must flag the information loss as a des
 
 It is a sibling of the escalation policy above and derives from the same class of failure. Where the two-strike rule catches an agent re-patching one broken assumption across separate attempts, the scope rules catch a single PR growing a new guarantee per review round — mergepath#1189 ran twelve Codex review rounds and twenty-one commits before being closed unmerged in favour of a one-word fix.
 
-Three of those rules are load-bearing rather than advisory — no new guarantee without an explicit scope decision, ask whether machinery belongs before repairing it, and re-review is against the ratified contract. Enforcement is tracked in mergepath#1199, with the qualification that the second of the three is deliberately not automatable: it marks where product judgment has to re-enter the loop.
+Three of those rules are load-bearing rather than advisory — no new guarantee without an explicit scope decision, ask whether machinery belongs before repairing it, and re-review is against the ratified contract. Each is enforced at its own control point rather than in that document, which is explanatory: contract ratification at PR open (mergepath#1202), mechanism lineage and the escalation menu during implementation (mergepath#1201), and reviewer obligations at the review-request machinery (mergepath#1199). The machinery question is deliberately not automatable — it marks where product judgment has to re-enter the loop.
 
 ## Session finalization
 

@@ -55,7 +55,9 @@ I told the owner across three separate reports that every review round had made 
 | owner rule-1 change `0a42275` | 3513 | +292 |
 | framing correction `d4ef45c` | 3652 | +139 |
 
-**The document grew 67.5% in lines and 130.8% in words** — 160 to 268 lines, 1583 to 3652 words. (The two rates are not the same number, and quoting one against the other's units is how the first version of this sentence was wrong.) It never shrank in any commit. The rule count stayed at twelve throughout. (The PR as a whole stands at +295/-2 across three files; the figures above are this file alone.)
+**The document grew 70% in lines and 179% in words** — 160 to 272 lines, 1583 to 4414 words. The PR is +299/-2 across six files. Figures measured at commit `61de632`; the two rates are different numbers, and quoting one against the other's units is how an earlier version of this sentence was wrong.
+
+*A table of a document's size, inside that document, goes stale on the next commit — including the commit that updates the table.* The row-by-row history below is therefore a snapshot, not a maintained record: it ends where it ends, the totals above are the reviewed tree at the named sha, and neither is worth another correction round. That staleness is structural, not an oversight, and it is the reason this measurement lives here as a one-time record rather than as something the document promises to keep true. It never shrank in any commit. The rule count stayed at twelve throughout. (The PR as a whole stands at +295/-2 across three files; the figures above are this file alone.)
 
 The accurate word is **narrower, not smaller**. Every commit reduced what this document *claims the authority to do* — thresholds dropped from rule 5, a tier-mechanics paragraph removed rather than repaired a third time, review authority explicitly disclaimed, and finally the rules distributed to their control points so this file stopped being normative at all. Authority contracted monotonically while length grew monotonically. "We narrowed it" and "we made it smaller" are different statements, and only the first is true.
 
@@ -269,4 +271,4 @@ The machinery question is rule 5 in checkpoint form, and it is the one that most
 
 If the last answer is **yes**, implementation stops until the stronger guarantee is explicitly accepted into scope.
 
-If two successive rounds increase implementation size or conceptual surface without changing the original acceptance evidence, default to reverting the reviewer-induced expansion and filing the stronger requirement separately.
+This checkpoint deliberately ends without a count. An earlier version closed with *"if two successive rounds increase implementation size or conceptual surface, default to reverting"* — which is the two-round mechanical trigger rule 5 withdrew, restored one section later with the same remedy attached. A rule dropped for being satisfiable without judgment cannot come back as a checklist item; the machinery question above is the replacement, and it has no threshold on purpose.
