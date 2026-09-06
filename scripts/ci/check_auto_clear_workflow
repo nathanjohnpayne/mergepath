@@ -621,6 +621,9 @@ if [ "$1" = "api" ]; then
         reads=$(grep -c 'commits/.*/check-runs' "$GH_STUB_LOG" 2>/dev/null || echo 1)
         [ "${reads:-1}" -gt 1 ] && payload="$GH_STUB_CHECKRUNS_AFTER"
       fi
+      if [ -n "${GH_STUB_FAIL_LIST:-}" ]; then
+        exit 22
+      fi
       printf '%s' "$payload" | jq -r "$filter"
       if [ "$paginate" = yes ] && [ -n "${GH_STUB_CHECKRUNS_P2:-}" ]; then
         printf '%s' "$GH_STUB_CHECKRUNS_P2" | jq -r "$filter"
@@ -819,6 +822,25 @@ run_clear_case "unmarked late failure falls back to publication time" no \
 # and therefore holds the old marker too. In this scope a failure record never
 # carries preserved history, so the misread is unreachable here -- the parse is
 # kept correct anyway, and #1191 is where it becomes load-bearing.
+
+# A prerequisite READ that exhausts its retries is a failed clear too. Warning
+# and exiting 0 there reports success over a diagnostic that is still red, and
+# on a consumer with the scheduled sweep disabled nothing is guaranteed to retry
+# it -- the same fail-silent shape as a failed write, one step earlier.
+: > "$clear_tmp/gh.log"
+set +e
+PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_FAIL_LIST=1 \
+  GH_STUB_CHECKRUNS='{"check_runs":[]}' GH_RETRY_ATTEMPTS=1 \
+  bash "$CONTINUATION_REPORTER" --clear owner/repo https://example.test/run/1 "7:abc123:$VERDICT_AFTER:full" >/dev/null 2>&1
+clear_read_rc=$?
+set -e
+if [ "$clear_read_rc" -ne 0 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: a failed clear-side read exits non-zero instead of reporting green"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a clear-side read that exhausts retries must not exit 0" >&2
+fi
 
 # A clear that could not be written must surface as a failed run, not a green
 # workflow over a diagnostic that is still blocking the merge.

@@ -95,12 +95,13 @@ EVAL_MARKER_PREFIX='[continuation-evaluated-at: '
 # Heading under which a superseded diagnostic is preserved, so the advance path
 # can find and carry it forward rather than overwriting it.
 PRESERVED_HEADING='Superseded diagnostic, preserved verbatim:'
-# Set when a clear-side write fails. A failed clear leaves the merge-blocking
+# Set when any step of a clear fails -- a prerequisite READ as much as the
+# final write. A failed clear leaves the merge-blocking
 # diagnostic red while the workflow reports success, and on a consumer with
 # scheduled_sweep_enabled: false nothing is guaranteed to retry it -- exactly
 # the silently-preserved condition this script exists to heal, so it surfaces
 # as a retryable failed run instead.
-CLEAR_WRITE_FAILED=0
+CLEAR_FAILED=0
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=../lib/gh-retry-helpers.sh
 source "$ROOT/scripts/lib/gh-retry-helpers.sh"
@@ -213,8 +214,14 @@ for ENTRY in $PR_NUMBERS; do
         continue
         ;;
     esac
+    # A prerequisite read that exhausts its retries is a FAILED clear, not a
+    # skipped one: the stale diagnostic stays red and, on a consumer with
+    # scheduled_sweep_enabled: false, nothing is guaranteed to retry it. Warning
+    # and exiting 0 would report success over exactly the condition this script
+    # exists to heal -- the same fail-silent shape as a failed PATCH.
     if ! HEAD_SHA=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
-      echo "::warning::Failed to resolve head SHA for PR #$PR; the workflow log remains authoritative."
+      echo "::error::Failed to resolve head SHA for PR #$PR; the stale diagnostic on its head was not evaluated."
+      CLEAR_FAILED=1
       echo "::endgroup::"
       continue
     fi
@@ -236,7 +243,8 @@ for ENTRY in $PR_NUMBERS; do
       continue
     fi
     if ! SELECTED=$(latest_run "$EVAL_HEAD"); then
-      echo "::warning::Failed to read existing $CHECK_NAME check-runs for PR #$PR; leaving the head untouched."
+      echo "::error::Failed to read existing $CHECK_NAME check-runs for PR #$PR; any stale diagnostic on $EVAL_HEAD remains."
+      CLEAR_FAILED=1
       echo "::endgroup::"
       continue
     fi
@@ -305,7 +313,7 @@ for ENTRY in $PR_NUMBERS; do
 
 $PRESERVED_HEADING
 $SEL_SUMMARY" \
-      || { echo "::error::Failed to clear check-run $SEL_ID for PR #$PR; the stale diagnostic remains on $EVAL_HEAD."; CLEAR_WRITE_FAILED=1; }
+      || { echo "::error::Failed to clear check-run $SEL_ID for PR #$PR; the stale diagnostic remains on $EVAL_HEAD."; CLEAR_FAILED=1; }
     echo "::endgroup::"
     continue
   fi
@@ -350,7 +358,8 @@ $SEL_SUMMARY" \
   echo "::endgroup::"
 done
 
-# A clear that could not be written is not a success: the workflow must expose a
-# retryable failed run rather than reporting green over a diagnostic that is
-# still blocking the merge.
-exit "$CLEAR_WRITE_FAILED"
+# A clear that could not be completed is not a success -- whether it failed at a
+# prerequisite read or at the write. The workflow must expose a retryable failed
+# run rather than reporting green over a diagnostic that is still blocking the
+# merge.
+exit "$CLEAR_FAILED"
