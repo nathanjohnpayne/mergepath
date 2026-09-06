@@ -647,7 +647,7 @@ chmod +x "$clear_tmp/bin/gh"
 VERDICT_AFTER=1788609600
 VERDICT_BEFORE=1788480000
 run_clear_case() {
-  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}" entry="${5:-7:abc123:$VERDICT_AFTER:full}" expect_run_id="${6:-[0-9]+}" expect_evidence="${7:-}" allow_create="${8:-no}"
+  local label="$1" want_post="$2" fixture="$3" fixture_p2="${4:-}" entry="${5:-7:abc123:$VERDICT_AFTER:full}" expect_run_id="${6:-[0-9]+}" expect_evidence="${7:-}"
   : > "$clear_tmp/gh.log"
   if ! PATH="$clear_tmp/bin:$PATH" GH_STUB_LOG="$clear_tmp/gh.log" GH_STUB_CHECKRUNS="$fixture" \
        GH_STUB_CHECKRUNS_P2="$fixture_p2" \
@@ -661,12 +661,11 @@ run_clear_case() {
   if grep -Fq 'conclusion=success' "$clear_tmp/gh.log"; then
     posted=yes
   fi
-  # A clear must never CREATE a check-run when one already exists: that
-  # re-enters the latest-run-wins race, where a failure published between the
-  # read and the write is newer evidence that a fresh success would bury. The
-  # sole exception is the watermark on an EMPTY head, which has nothing to bury
-  # and carries its own read-after-write reconciliation.
-  if [ "${allow_create:-no}" != yes ] && grep -Eq '(^| )api repos/[^ ]*/check-runs( |$)' "$clear_tmp/gh.log"; then
+  # A clear must NEVER create a check-run: that re-enters the latest-run-wins
+  # race, where a failure published between the read and the write is newer
+  # evidence a fresh success would bury. There is no exception in this scope --
+  # the empty-head watermark that would have needed one is #1191.
+  if grep -Eq '(^| )api repos/[^ ]*/check-runs( |$)' "$clear_tmp/gh.log"; then
     fail=$((fail + 1))
     echo "  FAIL: --clear ($label) created a new check-run instead of updating the selected one" >&2
   fi
@@ -700,16 +699,13 @@ run_clear_case() {
   if [ "$posted" = yes ]; then
     local pinned="${entry#*:}"
     pinned="${pinned%%:*}"
-    # Pinning shows up differently for the two write shapes: an update names the
-    # run id selected from the evaluated head, a watermark create names the head
-    # directly. Both must reference the EVALUATED head, never a re-resolved one.
-    pinned_ok=no
-    if [ "${allow_create:-no}" = yes ]; then
-      grep -Fq "head_sha=$pinned" "$clear_tmp/gh.log" && pinned_ok=yes
-    else
-      grep -Fq "commits/$pinned/check-runs" "$clear_tmp/gh.log" \
-        && grep -Eq "api repos/[^ ]*/check-runs/${expect_run_id:-[0-9]+} " "$clear_tmp/gh.log" \
-        && pinned_ok=yes
+    # The write must name the run selected FROM the evaluated head: the read is
+    # scoped to that head and the write addresses the run by id, so both halves
+    # have to line up or the clear touched something it did not evaluate.
+    local pinned_ok=no
+    if grep -Fq "commits/$pinned/check-runs" "$clear_tmp/gh.log" \
+       && grep -Eq "api repos/[^ ]*/check-runs/${expect_run_id:-[0-9]+} " "$clear_tmp/gh.log"; then
+      pinned_ok=yes
     fi
     if [ "$pinned_ok" = yes ]; then
       pass=$((pass + 1))
