@@ -55,7 +55,7 @@ I told the owner across three separate reports that every review round had made 
 | owner rule-1 change `0a42275` | 3513 | +292 |
 | framing correction `d4ef45c` | 3652 | +139 |
 
-**The document grew 131%** — 160 to 268 lines, 1583 to 3652 words. It never shrank in any commit. The rule count stayed at twelve throughout. (The PR as a whole stands at +295/-2 across three files; the figures above are this file alone.)
+**The document grew 67.5% in lines and 130.8% in words** — 160 to 268 lines, 1583 to 3652 words. (The two rates are not the same number, and quoting one against the other's units is how the first version of this sentence was wrong.) It never shrank in any commit. The rule count stayed at twelve throughout. (The PR as a whole stands at +295/-2 across three files; the figures above are this file alone.)
 
 The accurate word is **narrower, not smaller**. Every commit reduced what this document *claims the authority to do* — thresholds dropped from rule 5, a tier-mechanics paragraph removed rather than repaired a third time, review authority explicitly disclaimed, and finally the rules distributed to their control points so this file stopped being normative at all. Authority contracted monotonically while length grew monotonically. "We narrowed it" and "we made it smaller" are different statements, and only the first is true.
 
@@ -103,7 +103,7 @@ Fix only when the finding demonstrates that the current patch:
 - creates a security or correctness failure on the changed execution path; or
 - makes the proposed implementation internally inconsistent.
 
-The burden is on the finding to connect itself to the frozen contract.
+The burden is on the finding to connect itself to the ratified contract.
 
 ### B. Valid but adjacent — file or fold into follow-up
 
@@ -123,7 +123,7 @@ Record it separately. Do not implement it merely because it was discovered durin
 What this rule adds is only the consequence for classification B:
 
 - **A finding in a discretionary tier** may be deferred to a follow-up. Ordinary path, nobody's permission needed.
-- **A finding in a required tier may not be self-deferred.** Either it is genuinely inapplicable under the frozen contract, in which case **rebut** it and say why — a rebuttal is a substantive disposition, not a dodge — or it is applicable and valid, in which case it is a **scope decision and rule 3 applies**: stop and obtain an explicit owner decision. Do not route around a valid required-tier finding by filing an issue and calling it handled.
+- **A finding in a required tier may not be self-deferred.** Either it is genuinely inapplicable under the ratified contract, in which case **rebut** it and say why — a rebuttal is a substantive disposition, not a dodge — or it is applicable and valid, in which case it is a **scope decision and rule 3 applies**: stop and obtain an explicit owner decision. Do not route around a valid required-tier finding by filing an issue and calling it handled.
 
 That boundary is the whole safeguard. Without it, "valid but adjacent" becomes a way for an agent to unilaterally downgrade any blocking finding it would rather not fix — this document's own failure mode, run in reverse.
 
