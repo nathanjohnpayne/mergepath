@@ -912,13 +912,32 @@ fi
 # snapshot other than the one the verdict was opened against. Reporting a head
 # that was not acted on would let an A→B→A reset clear a head this invocation
 # never evaluated -- the one outcome the reduced contract forbids.
-if grep -qF 'EVALUATED_HEAD=""' "$CONTINUATION_HELPER" \
-   && [ "$(awk '/PR head\/base\/author changed during policy classification/{f=1} f&&/EVALUATED_HEAD=""/{print "ok"; exit}' "$CONTINUATION_HELPER")" = ok ]; then
+# BOTH drift branches must blank it -- protective mode and normal mode. Fixing
+# one and leaving the sibling is how this defect survived a round: the marker is
+# published from a shared exit trap, so either unblanked path publishes a head
+# nothing was gated against.
+# Checked per branch rather than by a single pattern: the two drift branches
+# order the blank and the message differently (protective blanks after its
+# notice, normal blanks before its not_ready), so one window expression matches
+# only one of them and reports success while the sibling is unguarded.
+# The window is BOUNDED. An unbounded "find the next blank after this marker"
+# scans past the end of its own branch and finds the OTHER branch's blank, so
+# deleting the first one still reports ok -- which is exactly how the first
+# draft of this check passed while the protective branch was unguarded.
+_blank_within() {
+  awk -v pat="$1" -v lim=12 '
+    $0 ~ pat { start = NR }
+    start && NR > start && NR - start <= lim && /EVALUATED_HEAD=""/ { print "ok"; exit }
+  ' "$CONTINUATION_HELPER"
+}
+_prot_blank=$(_blank_within 'treating the latest armed state as unclassified')
+_norm_blank=$(_blank_within 'could not retract a policy-drift auto-merge request')
+if [ "$_prot_blank" = ok ] && [ "$_norm_blank" = ok ]; then
   pass=$((pass + 1))
-  echo "  PASS: the helper withholds its evaluated head when the protective snapshot drifts"
+  echo "  PASS: the helper withholds its evaluated head on BOTH protective and normal drift"
 else
   fail=$((fail + 1))
-  echo "  FAIL: protective-snapshot drift must withhold the evaluated head, not report an unacted one" >&2
+  echo "  FAIL: BOTH drift branches must withhold the evaluated head (protective=${_prot_blank:-missing} normal=${_norm_blank:-missing})" >&2
 fi
 
 # The contract is stated in the reporter header as exactly five guarantees, and

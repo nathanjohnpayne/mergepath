@@ -339,6 +339,13 @@ valid_pr_shape "$normal_snapshot" || infra_error "normal policy readback is malf
 if [ "$(policy_snapshot_signature "$normal_snapshot")" != "$(policy_snapshot_signature "$initial")" ]; then
   retract_snapshot_arm "$normal_snapshot" "policy-drift" || \
     infra_error "could not retract a policy-drift auto-merge request"
+  # Withhold the evaluated head, exactly as the protective-mode drift branch
+  # does. This exit is rc=4 -- a VERDICT -- so without blanking the marker the
+  # trap would publish head A while none of the readiness gates ran against
+  # anything; a force-reset back to A would then let the clear patch a
+  # pre-existing full-stage failure on A. Same defect as the protective branch,
+  # one mode over: the twin, not a new class.
+  EVALUATED_HEAD=""
   not_ready "PR head/base/author changed during policy classification"
 fi
 
