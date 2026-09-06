@@ -105,7 +105,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 ### CodeRabbit (Phase 2.5)
 
-**R-39.** When CodeRabbit is enabled, the agent must wait for its review on the current HEAD before proceeding past Phase 2.5. ○ — REVIEW_POLICY.md § Phase 2.5
+**R-39.** The agent must wait for CodeRabbit's review on the current HEAD before proceeding past Phase 2.5 exactly when `scripts/coderabbit-should-invoke.sh <PR#>` exits 0. `coderabbit.enabled: true` is necessary but not sufficient — the `coderabbit.invoke` mode (`always` / `complex-changes` / `never`) decides whether THIS PR gets the wait, and the decider resolves every ambiguous policy to invoking. ○ — REVIEW_POLICY.md § Phase 2.5
 
 **R-40.** The agent must not hand-wait a folkloric interval and escalate early; the wait helper's measured windows govern. ○ — review-policy.yml § CodeRabbit
 
@@ -117,7 +117,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-44.** Advisory status never overrides the conversation-resolution gate: an unresolved CodeRabbit thread still blocks merge until fixed-or-rebutted and resolved. ● — REVIEW_POLICY.md § Phase 2.5
 
-**R-45.** CodeRabbit runs on all PRs in enabled repos regardless of size (wave fan-out mirrors, opened with the ignore marker, are the exception — R-201). ● — REVIEW_POLICY.md § Phase 2.5
+**R-45.** The CodeRabbit **App** reviews all PRs in enabled repos regardless of size — `.coderabbit.yml` governs it and `coderabbit.invoke` does not, so a skipped Phase 2.5 still accrues App findings as unresolved threads (wave fan-out mirrors, opened with the ignore marker, are the exception — R-201). What is now selective is the **agent's wait**, which R-39 keys to the decider; the two must not be conflated. ● — REVIEW_POLICY.md § Phase 2.5
 
 **R-46.** A wait exit `6` (skip: paused / non-base-branch / draft) must have its named cause resolved and is never a clean clearance. ● — REVIEW_POLICY.md § Phase 2.5
 
@@ -253,17 +253,17 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 ### Auto-merge and Dependabot
 
-**R-106.** Non-Dependabot auto-merge is opt-in only: it may merge solely under an `AUTHOR_MERGE_TOKEN` secret verified to resolve to the author identity immediately before the merge. ● — REVIEW_POLICY.md § Agent prohibitions
+**R-106.** Non-Dependabot unattended merging is disabled pending #1058's merge-group boundary; Agent Review never arms, enqueues, or merges those PRs. ● — REVIEW_POLICY.md § Agent prohibitions
 
-**R-107.** Absent that secret, the workflow stops after validation and manual author merge remains the path. ● — REVIEW_POLICY.md § Agent prohibitions
+**R-107.** `AUTHOR_MERGE_TOKEN` may authenticate privileged readiness evaluation, but it does not authorize a non-Dependabot merge mutation; ordinary one-shot author merge remains the path. ● — REVIEW_POLICY.md § Agent prohibitions
 
 **R-108.** Reviewer tokens are never used for merges. ● — REVIEW_POLICY.md § Phase 4a
 
 **R-109.** Automatic merge is not a sanctioned reviewer-identity exception. ○ — REVIEW_POLICY.md § Agent prohibitions
 
-**R-110.** Every auto-merge arm and re-arm path requires an existing non-author latest-state approval; a push with no approval never arms. ● — REVIEW_POLICY.md § Phase 4a
+**R-110.** Every approval-readiness evaluation requires an existing non-author latest-state approval; a push with no approval never becomes ready, and no evaluation creates a durable arm. ● — REVIEW_POLICY.md § Phase 4a
 
-**R-111.** Every gate re-applies on the new HEAD, and downgraded runs re-derive protection just before merge and abort on head drift. ● — REVIEW_POLICY.md § Phase 4a
+**R-111.** Every readiness gate re-applies on the new HEAD and governing base, and every exit performs workflow-token arm cleanup; ambiguous cleanup fails closed. ● — REVIEW_POLICY.md § Phase 4a
 
 **R-112.** Rate-limit protection is never derived from label events; it uses the intrinsic threshold and protected-path computation on the live head. ● — REVIEW_POLICY.md § Phase 2.5
 
@@ -681,7 +681,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-99.** Approved-wave fan-out mirrors carry the CodeRabbit-ignore marker and no Codex trigger. ○ — docs/agents/propagation-ordering.md
 
-**G-100.** The canary keeps the full advisory CodeRabbit pass. ○ — docs/agents/propagation-ordering.md
+**G-100.** The canary keeps the full advisory CodeRabbit pass, except where the canary's own repo has CodeRabbit disabled — then the leg is recorded unavailable in the wave tracker rather than assumed. ○ — docs/agents/propagation-ordering.md
 
 **G-101.** Consumer-specific divergence goes through overrides, facts, or exclusions with a reason — never a hand edit. ● — docs/agents/propagation-ordering.md
 
@@ -1129,7 +1129,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-297.** A PR against a non-default base is not auto-reviewed; a workflow targeting one must add that base to the base-branches list in that repo's own config. ● — docs/agents/coderabbit-audit.md
 
-**G-298.** Learnings scope stays `auto` (resolving local for the all-public fleet); org-wide sharing would require an explicit global override, never an accident of visibility. ● — docs/agents/coderabbit-audit.md
+**G-298.** Learnings scope stays `auto`, which resolves per repo by visibility — `local` for a public repo, `global` for a private one — so the resolution is read off the repo's current visibility rather than assumed uniform across the fleet. ● — docs/agents/coderabbit-audit.md
 
 **G-299.** Path instructions are targeted supplements added on an observed miss, never speculative additions. ○ — docs/agents/coderabbit-audit.md
 

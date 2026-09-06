@@ -42,7 +42,7 @@ elif python3 -c "import yaml" >/dev/null 2>&1; then
   # `$WORKFLOW` into the Python source literal. Interpolation was brittle:
   # a path containing a quote or backslash would break the literal (or
   # worse). argv keeps the path out of the parsed Python text entirely.
-  if WORKFLOW="$WORKFLOW" python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$WORKFLOW" 2>/dev/null; then
+  if python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$WORKFLOW" 2>/dev/null; then
     pass=$((pass + 1))
     echo "  PASS: workflow YAML parses (via python+PyYAML)"
   else
@@ -209,22 +209,220 @@ event_continuation_block=$(awk '
   in_block && /- name:/ && $0 !~ /- name: Continue approved PRs after completed checks/ {exit}
   in_block {print}
 ' "$WORKFLOW")
+clear_block=$(awk '
+  /- name: Re-evaluate gate per PR \+ remove label on pass/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Re-evaluate gate per PR \+ remove label on pass/ {exit}
+  in_block {print}
+' "$WORKFLOW")
+scheduled_clear_block=$(awk '
+  /- name: Re-evaluate gate per PR$/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Re-evaluate gate per PR$/ {exit}
+  in_block {print}
+' "$WORKFLOW")
 scheduled_continuation_block=$(awk '
   /- name: Continue approved PRs after custom-workflow completions/ {in_block=1}
   in_block && /- name:/ && $0 !~ /- name: Continue approved PRs after custom-workflow completions/ {exit}
   in_block {print}
 ' "$WORKFLOW")
+clear_block_protects_before_delete() {
+  local block="$1" protect_line failure_line delete_line
+  protect_line=$(grep -nF -- '--retract-unsafe-only "$PR" "$REPO"' <<<"$block" | head -1 | cut -d: -f1 || true)
+  failure_line=$(grep -nF 'if [ "$protective_rc" -ne 0 ]; then' <<<"$block" | head -1 | cut -d: -f1 || true)
+  delete_line=$(grep -nF 'del_out=$(gh api "repos/$REPO/issues/$PR/labels/needs-external-review" -X DELETE' <<<"$block" | head -1 | cut -d: -f1 || true)
+  grep -Fq 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$block" \
+    && grep -Fq 'GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}' <<<"$block" \
+    && grep -Fq 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$block" \
+    && [ -n "$protect_line" ] && [ -n "$failure_line" ] && [ -n "$delete_line" ] \
+    && [ "$protect_line" -lt "$failure_line" ] \
+    && [ "$failure_line" -lt "$delete_line" ] \
+    && grep -Fq 'had_infra_error=1' <<<"$block"
+}
+if clear_block_protects_before_delete "$clear_block" \
+   && clear_block_protects_before_delete "$scheduled_clear_block"; then
+  pass=$((pass + 1))
+  echo "  PASS: both label-clear paths retract with the workflow token before PAT-backed blocker deletion"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: every label-clear path must retract with github.token, fail closed, and retain the PAT for deleting needs-external-review" >&2
+fi
+
+# Execute both literal clear blocks against a token-aware stub. Structural
+# ordering alone cannot prove that a failed protective call actually skips the
+# DELETE, or that the ambient PAT still owns the label write that re-triggers
+# downstream workflows.
+clear_harness_dir=$(mktemp -d "${TMPDIR:-/tmp}/auto-clear-protection.XXXXXX")
+mkdir -p "$clear_harness_dir/bin" "$clear_harness_dir/scripts/lib" \
+  "$clear_harness_dir/scripts/workflow"
+
+extract_named_run_block() {
+  local name="$1" destination="$2"
+  awk -v target="$name" '
+    $0 == "      - name: " target { in_step=1; next }
+    in_step && $0 == "        run: |" { in_run=1; next }
+    in_run && /^          / { sub(/^          /, ""); print; next }
+    in_run && /^[[:space:]]*$/ { print; next }
+    in_run { exit }
+  ' "$WORKFLOW" >"$destination"
+}
+
+extract_named_run_block \
+  'Re-evaluate gate per PR + remove label on pass' \
+  "$clear_harness_dir/event-clear.sh"
+extract_named_run_block \
+  'Re-evaluate gate per PR' \
+  "$clear_harness_dir/scheduled-clear.sh"
+
+cat >"$clear_harness_dir/scripts/lib/gh-retry-helpers.sh" <<'STUB'
+with_gh_retry() { "$@"; }
+STUB
+cat >"$clear_harness_dir/scripts/codex-review-check.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+cat >"$clear_harness_dir/scripts/workflow/approval-merge-continuation.sh" <<'STUB'
+#!/usr/bin/env bash
+# APPROVAL_PROTECTIVE_RETRACTION_V2
+printf 'protect:%s\n' "${GH_TOKEN:-unset}" >>"${CLEAR_STUB_LOG:?}"
+exit "${CLEAR_PROTECT_RC:-0}"
+STUB
+cat >"$clear_harness_dir/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-} ${2:-}" in
+  'pr view')
+    if [ "$(cat "${CLEAR_LABEL_STATE:?}")" = present ]; then
+      printf 'true\n'
+    else
+      printf 'false\n'
+    fi
+    ;;
+  'pr comment')
+    printf 'comment:%s\n' "${GH_TOKEN:-unset}" >>"${CLEAR_STUB_LOG:?}"
+    ;;
+  'api repos/owner/repo/issues/7/labels/needs-external-review')
+    printf 'delete:%s\n' "${GH_TOKEN:-unset}" >>"${CLEAR_STUB_LOG:?}"
+    printf 'absent\n' >"${CLEAR_LABEL_STATE:?}"
+    printf 'HTTP/2.0 204 No Content\n'
+    ;;
+  *)
+    printf 'unexpected gh call: %s\n' "$*" >&2
+    exit 90
+    ;;
+esac
+STUB
+chmod +x "$clear_harness_dir/bin/gh" \
+  "$clear_harness_dir/scripts/codex-review-check.sh" \
+  "$clear_harness_dir/scripts/workflow/approval-merge-continuation.sh"
+
+run_clear_harness() {
+  local script="$1" input_name="$2" protective_rc="$3"
+  printf 'present\n' >"$clear_harness_dir/label-state"
+  : >"$clear_harness_dir/calls.log"
+  : >"$clear_harness_dir/github-env"
+  : >"$clear_harness_dir/github-output"
+  (
+    cd "$clear_harness_dir"
+    env \
+      PATH="$clear_harness_dir/bin:$PATH" \
+      GH_TOKEN=pat-token \
+      WORKFLOW_TOKEN=workflow-token \
+      REPO=owner/repo \
+      PR_NUMBERS="$([ "$input_name" = PR_NUMBERS ] && printf 7)" \
+      PRS="$([ "$input_name" = PRS ] && printf 7)" \
+      CLEAR_PROTECT_RC="$protective_rc" \
+      CLEAR_STUB_LOG="$clear_harness_dir/calls.log" \
+      CLEAR_LABEL_STATE="$clear_harness_dir/label-state" \
+      GITHUB_ENV="$clear_harness_dir/github-env" \
+      GITHUB_OUTPUT="$clear_harness_dir/github-output" \
+      bash "$script" >"$clear_harness_dir/run.out" 2>&1
+  )
+}
+
+clear_execution_ok=1
+for clear_case in event scheduled; do
+  if [ "$clear_case" = event ]; then
+    clear_script="$clear_harness_dir/event-clear.sh"
+    clear_input=PR_NUMBERS
+  else
+    clear_script="$clear_harness_dir/scheduled-clear.sh"
+    clear_input=PRS
+  fi
+
+  set +e
+  run_clear_harness "$clear_script" "$clear_input" 0
+  clear_success_rc=$?
+  set -e
+  clear_success_calls=$(grep -E '^(protect|delete|comment):' \
+    "$clear_harness_dir/calls.log" | tr '\n' ' ')
+  if [ "$clear_success_rc" -ne 0 ] \
+     || [ "$clear_success_calls" != \
+          'protect:workflow-token delete:pat-token comment:pat-token ' ]; then
+    echo "  INFO: $clear_case clear success fixture rc=$clear_success_rc calls='$clear_success_calls'" >&2
+    sed 's/^/        call: /' "$clear_harness_dir/calls.log" >&2
+    sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    clear_execution_ok=0
+  fi
+
+  set +e
+  run_clear_harness "$clear_script" "$clear_input" 3
+  clear_failure_rc=$?
+  set -e
+  if [ "$clear_failure_rc" -ne 1 ] \
+     || ! grep -Fxq 'protect:workflow-token' "$clear_harness_dir/calls.log" \
+     || grep -Eq '^(delete|comment):' "$clear_harness_dir/calls.log" \
+     || ! grep -Fxq 'HAD_INFRA_ERROR=1' "$clear_harness_dir/github-env"; then
+    echo "  INFO: $clear_case clear failure fixture rc=$clear_failure_rc" >&2
+    sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    clear_execution_ok=0
+  fi
+done
+
+if [ "$clear_execution_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both literal clear blocks protect before PAT deletion and skip all writes on protective failure"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: label-clear execution must use workflow-token protection, PAT deletion, and no writes after protective failure" >&2
+fi
+rm -rf "$clear_harness_dir"
+
+event_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR" "$REPO"' <<<"$event_continuation_block" | head -1 | cut -d: -f1 || true)
+event_continue_line=$(grep -nF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$event_continuation_block" | head -1 | cut -d: -f1 || true)
+event_no_author_line=$(grep -nF '[ -z "${AUTHOR_TOKEN:-}" ]' <<<"$event_continuation_block" | head -1 | cut -d: -f1 || true)
+scheduled_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR" "$REPO"' <<<"$scheduled_continuation_block" | head -1 | cut -d: -f1 || true)
+scheduled_continue_line=$(grep -nF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$scheduled_continuation_block" | head -1 | cut -d: -f1 || true)
+scheduled_no_author_line=$(grep -nF '[ -z "${AUTHOR_TOKEN:-}" ]' <<<"$scheduled_continuation_block" | head -1 | cut -d: -f1 || true)
 if grep -qF 'echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITHUB_ENV"' <<<"$event_continuation_block" \
    && grep -qF 'echo "CONTINUATION_INFRA_ERROR_PRS=$(echo $continuation_failing_prs)" >> "$GITHUB_ENV"' <<<"$event_continuation_block" \
    && grep -qF 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$event_continuation_block" \
+   && grep -qF "APPROVAL_PROTECTIVE_RETRACTION_V2" <<<"$event_continuation_block" \
+   && grep -qF 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$event_continuation_block" \
+   && grep -qF 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$event_continuation_block" \
+   && grep -qF 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$event_continuation_block" \
+   && grep -qF 'elif [ "$protective_rc" -eq 0 ]; then' <<<"$event_continuation_block" \
+   && grep -qF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$event_continuation_block" \
+   && [ -n "$event_protect_line" ] && [ -n "$event_no_author_line" ] && [ -n "$event_continue_line" ] \
+   && [ "$event_protect_line" -lt "$event_no_author_line" ] \
+   && [ "$event_no_author_line" -lt "$event_continue_line" ] \
    && grep -qF 'echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITHUB_ENV"' <<<"$scheduled_continuation_block" \
    && grep -qF 'echo "CONTINUATION_INFRA_ERROR_PRS=$(echo $continuation_failing_prs)" >> "$GITHUB_ENV"' <<<"$scheduled_continuation_block" \
-   && grep -qF 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$scheduled_continuation_block"; then
+   && grep -qF 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$scheduled_continuation_block" \
+   && grep -qF "APPROVAL_PROTECTIVE_RETRACTION_V2" <<<"$scheduled_continuation_block" \
+   && grep -qF 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$scheduled_continuation_block" \
+   && grep -qF 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$scheduled_continuation_block" \
+   && grep -qF 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$scheduled_continuation_block" \
+   && grep -qF 'elif [ "$protective_rc" -eq 0 ]; then' <<<"$scheduled_continuation_block" \
+   && grep -qF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$scheduled_continuation_block" \
+   && [ -n "$scheduled_protect_line" ] && [ -n "$scheduled_no_author_line" ] && [ -n "$scheduled_continue_line" ] \
+   && [ "$scheduled_protect_line" -lt "$scheduled_no_author_line" ] \
+   && [ "$scheduled_no_author_line" -lt "$scheduled_continue_line" ]; then
   pass=$((pass + 1))
-  echo "  PASS: both approval-continuation loops guard first-rollout skew and export a dedicated failure channel"
+  echo "  PASS: both approval-continuation loops protect with github.token before author-token continuation and export a dedicated failure channel"
 else
   fail=$((fail + 1))
-  echo "  FAIL: each approval-continuation loop must guard the helper and export dedicated continuation failure state" >&2
+  echo "  FAIL: each approval-continuation loop must guard the helper, run ordered workflow-token protection before author-token continuation, and export dedicated failure state" >&2
 fi
 
 continuation_surface_count=$(grep -cF 'name: Surface approval continuation failures as per-PR check-runs' "$WORKFLOW" || true)

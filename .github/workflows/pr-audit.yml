@@ -60,7 +60,16 @@ jobs:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const fs = require('fs');
+            const { execFileSync } = require('child_process');
             const yaml = require('js-yaml');
+
+            function parsePrBodyContract(body) {
+              return JSON.parse(execFileSync(
+                process.execPath,
+                ['scripts/lib/pr-body-contract.mjs', '--json'],
+                { input: body || '', encoding: 'utf8' }
+              ));
+            }
 
             // Read reviewer accounts and the Codex bot login from
             // review-policy.yml. The Codex bot login is read from
@@ -175,6 +184,14 @@ jobs:
             for (const pr of mergedPRs) {
               const prViolations = [];
               const isDependabot = pr.user.login === 'dependabot[bot]';
+              let bodyContract = { author: '', authorCount: 0, hasSelfReview: false };
+              try {
+                bodyContract = parsePrBodyContract(pr.body);
+              } catch (e) {
+                if (!isDependabot) {
+                  prViolations.push('Could not parse PR body contract');
+                }
+              }
 
               // Fetch all reviews for this PR once, up front. Both
               // Check 2 (external-review approval) and Check 3 (bot
@@ -214,7 +231,7 @@ jobs:
               // audit was previously flagging every Dependabot PR as
               // a false positive — see #20.
               if (!isDependabot) {
-                if (!pr.body || !pr.body.match(/^## Self-Review/m)) {
+                if (!bodyContract.hasSelfReview) {
                   prViolations.push('Missing `## Self-Review` section');
                 }
               }
@@ -813,11 +830,8 @@ jobs:
                   // Mirrors the shell's AUTHORING_AGENT →
                   // SAME_AGENT_REVIEWER suffix match.
                   let sameAgentContext = false;
-                  const agentMatch = (pr.body || '').match(
-                    /^Authoring-Agent:[ \t]*([A-Za-z0-9_-]+)/im
-                  );
-                  if (agentMatch) {
-                    const authoringAgent = agentMatch[1].toLowerCase();
+                  if (bodyContract.authorCount === 1 && bodyContract.author) {
+                    const authoringAgent = bodyContract.author;
                     sameAgentContext = reviewerAccounts.some(
                       r => String(r).toLowerCase().endsWith('-' + authoringAgent)
                     );

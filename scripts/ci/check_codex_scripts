@@ -77,6 +77,9 @@ echo "check_codex_scripts: running codex-review-check verdict-comment clearance 
 echo "check_codex_scripts: running codex-review-check gate (a) required-check scoping tests (#655)"
 "$REPO_ROOT/tests/test_codex_review_check_required_checks.sh"
 
+echo "check_codex_scripts: running branch-requirement resolver tests (#1064)"
+"$REPO_ROOT/tests/test_branch_requirements.sh"
+
 echo "check_codex_scripts: running #465 fail-closed structural guards"
 "$REPO_ROOT/tests/test_465_fail_closed.sh"
 

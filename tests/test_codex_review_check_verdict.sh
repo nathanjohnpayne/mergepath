@@ -31,6 +31,112 @@ PASS=0; FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
+# ── #1157: mutable Codex Review Summary issue comment ---------------------
+#
+# The connector now creates one marker-tagged summary comment while a review
+# is Running, then edits that same comment to Completed. The Code Review row
+# carries an abbreviated commit, so diagnostic mode can use Completed as
+# exact-head completion evidence even when a clean pass produced no review
+# object and no legacy `Reviewed commit:` verdict. Running is liveness only.
+SUMMARY_SELECTOR=$(sed -n \
+  '/^# BEGIN codex_review_summary_selector$/,/^# END codex_review_summary_selector$/p' \
+  "$SCRIPT")
+if [ -n "$SUMMARY_SELECTOR" ] \
+   && grep -q '^crc_select_codex_review_summary()' <<<"$SUMMARY_SELECTOR" \
+   && grep -q 'codex-pull-request-review-summary' <<<"$SUMMARY_SELECTOR" \
+   && grep -q 'updated_at' <<<"$SUMMARY_SELECTOR"; then
+  eval "$SUMMARY_SELECTOR"
+  pass "#1157: codex-review-check.sh exposes the marker-scoped mutable summary selector"
+else
+  fail "#1157: codex-review-check.sh is missing the marker-scoped mutable summary selector"
+fi
+
+SUMMARY_BOT="chatgpt-codex-connector[bot]"
+SUMMARY_HEAD="d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"
+
+summary_body() { # status commit trigger
+  printf '<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | %s | `%s` | %s |\n\n<details><summary>ℹ️ About Codex in GitHub</summary></details>' "$1" "$2" "$3"
+}
+
+mk_summary() { # login body created updated id
+  jq -n --arg login "$1" --arg body "$2" --arg created "$3" --arg updated "$4" --argjson id "$5" \
+    '[{user:{login:$login},body:$body,created_at:$created,updated_at:$updated,id:$id}]'
+}
+
+run_summary() {
+  crc_select_codex_review_summary "$1" "$SUMMARY_BOT" "$SUMMARY_HEAD"
+}
+
+if declare -F crc_select_codex_review_summary >/dev/null 2>&1; then
+  SUMMARY_COMPLETED=$(mk_summary "$SUMMARY_BOT" \
+    "$(summary_body '✅ **Completed** <relative-time datetime="2026-08-30T07:19:37Z">now</relative-time>' d05ff4d0 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 101)
+  GOT=$(run_summary "$SUMMARY_COMPLETED")
+  if [ "$(echo "$GOT" | jq -r '[.status,.commit,.observed_at,.trigger] | @tsv')" = $'completed\td05ff4d0\t2026-08-30T07:19:41Z\tManual request' ]; then
+    pass "#1157 summary: exact-head Completed uses edited updated_at as terminal time"
+  else
+    fail "#1157 summary: exact-head Completed parse mismatch: $GOT"
+  fi
+
+  SUMMARY_RUNNING=$(mk_summary "$SUMMARY_BOT" \
+    "$(summary_body '🔄 **Running** since 1 minute ago' d05ff4d0 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:17:18Z" 102)
+  GOT=$(run_summary "$SUMMARY_RUNNING")
+  if [ "$(echo "$GOT" | jq -r '[.status,.commit,.observed_at] | @tsv')" = $'running\td05ff4d0\t2026-08-30T07:17:18Z' ]; then
+    pass "#1157 summary: exact-head Running is represented distinctly from Completed"
+  else
+    fail "#1157 summary: exact-head Running parse mismatch: $GOT"
+  fi
+
+  STALE=$(mk_summary "$SUMMARY_BOT" \
+    "$(summary_body '✅ **Completed** now' aaaa1111 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 103)
+  if [ "$(run_summary "$STALE")" = "null" ]; then
+    pass "#1157 summary: stale commit prefix is rejected"
+  else
+    fail "#1157 summary: stale commit prefix was accepted"
+  fi
+
+  WRONG_AUTHOR=$(mk_summary "nathanjohnpayne" \
+    "$(summary_body '✅ **Completed** now' d05ff4d0 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 104)
+  if [ "$(run_summary "$WRONG_AUTHOR")" = "null" ]; then
+    pass "#1157 summary: a human-authored lookalike is rejected"
+  else
+    fail "#1157 summary: a human-authored lookalike was accepted"
+  fi
+
+  NO_MARKER_BODY=$(summary_body '✅ **Completed** now' d05ff4d0 'Manual request' | sed '1d')
+  NO_MARKER=$(mk_summary "$SUMMARY_BOT" "$NO_MARKER_BODY" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 105)
+  if [ "$(run_summary "$NO_MARKER")" = "null" ]; then
+    pass "#1157 summary: an unmarked bot table is rejected"
+  else
+    fail "#1157 summary: an unmarked bot table was accepted"
+  fi
+
+  TWO=$(jq -n --arg bot "$SUMMARY_BOT" --arg old "$(summary_body '✅ **Completed** now' d05ff4d0 'PR opened')" --arg new "$(summary_body '🔄 **Running** since 1 minute ago' d05ff4d0 'Manual request')" '[
+    {user:{login:$bot},body:$old,created_at:"2026-08-30T07:00:00Z",updated_at:"2026-08-30T07:05:00Z",id:106},
+    {user:{login:$bot},body:$new,created_at:"2026-08-30T07:10:00Z",updated_at:"2026-08-30T07:11:00Z",id:107}
+  ]')
+  GOT=$(run_summary "$TWO")
+  if [ "$(echo "$GOT" | jq -r '[.status,.comment_id] | @tsv')" = $'running\t107' ]; then
+    pass "#1157 summary: newest exact-head edited comment wins"
+  else
+    fail "#1157 summary: newest exact-head edited comment did not win: $GOT"
+  fi
+fi
+
+if grep -q 'LATEST_SIGNAL_KIND="summary"' "$SCRIPT" \
+   && grep -q '\[ -n "\$CODEX_SUMMARY_STATUS" \]' "$SCRIPT" \
+   && grep -q 'if \[ "\$CODEX_SUMMARY_STATUS" = "completed" \]; then' "$SCRIPT" \
+   && grep -q 'head-anchored Completed Codex review summary' "$SCRIPT" \
+   && grep -q 'Codex review summary is Running on current HEAD' "$SCRIPT"; then
+  pass "#1157: latest summary state participates in diagnostic ordering; Completed clears and Running does not"
+else
+  fail "#1157: diagnostic gate does not order both summary states or distinguish Completed from Running"
+fi
+
 # ── 1. Structural: the shared verdict signal is computed from issue
 #      comments, gated on codex.enabled, HEAD-anchored + affirmative-matched,
 #      and referenced to #600.
@@ -336,6 +442,82 @@ if [ "$knob_ok" = 1 ]; then
   pass "#814: the gate bypass is flag-only, defaults off, has no env-var path, and cannot mask a real approval"
 else
   fail "#814: the gate bypass lost one of its non-inheritability guarantees"
+fi
+
+# Diagnostic mode asks only whether Codex produced a current-head signal for
+# the Phase 4b barrier. Its caller supplies the author explicitly, so a legacy
+# or external-contributor PR without an Authoring-Agent marker must not abort
+# before that signal check runs. Execute the real script with fixture PR bodies
+# and stop it at the immediately-following commit read: this proves the parser
+# branch was bypassed, rather than merely proving that expected source text
+# exists somewhere in the file.
+BEHAVIOR_TMP="$(mktemp -d "${TMPDIR:-/tmp}/codex-check-body.XXXXXX")"
+trap 'rm -rf "$BEHAVIOR_TMP"' EXIT
+mkdir -p "$BEHAVIOR_TMP/bin"
+cat >"$BEHAVIOR_TMP/policy.yml" <<'POLICY'
+author_identity: nathanjohnpayne
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+codex:
+  enabled: true
+  require_ci_green: false
+POLICY
+cat >"$BEHAVIOR_TMP/bin/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+if [ "$1" = api ] && [[ "$2" == repos/*/pulls/7 ]]; then
+  jq -n --arg author "${FIXTURE_PR_AUTHOR:?}" --arg body "${FIXTURE_PR_BODY-}" \
+    '{head:{sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},user:{login:$author},body:$body}'
+  exit 0
+fi
+echo "fixture commit stop" >&2
+exit 1
+GHSTUB
+chmod +x "$BEHAVIOR_TMP/bin/gh"
+
+run_body_fixture() {
+  local author=$1 mode=$2 body=${3:-} output rc
+  set +e
+  output=$(PATH="$BEHAVIOR_TMP/bin:$PATH" GH_TOKEN=fixture \
+    MERGEPATH_REVIEW_POLICY_PATH="$BEHAVIOR_TMP/policy.yml" \
+    FIXTURE_PR_AUTHOR="$author" FIXTURE_PR_BODY="$body" \
+    "$SCRIPT" $mode 7 owner/repo 2>&1)
+  rc=$?
+  set -e
+  printf '%s\n%s\n' "$rc" "$output"
+}
+
+fixture_result="$(run_body_fixture nathanjohnpayne --diagnostic-signal-only)"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] \
+   && grep -q 'diagnostic-signal-only: skipping Authoring-Agent' <<<"$fixture_output" \
+   && grep -q 'failed to fetch commit date' <<<"$fixture_output" \
+   && ! grep -q 'PR body declares' <<<"$fixture_output"; then
+  pass "#1121: diagnostic-signal-only executes past a markerless PR body"
+else
+  fail "#1121: diagnostic markerless fixture did not bypass identity parsing (rc=$fixture_rc output=$fixture_output)"
+fi
+
+fixture_result="$(run_body_fixture external-contributor '')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] \
+   && grep -q 'non-shared-author PR: skipping Authoring-Agent' <<<"$fixture_output" \
+   && grep -q 'failed to fetch commit date' <<<"$fixture_output" \
+   && ! grep -q 'PR body declares' <<<"$fixture_output"; then
+  pass "#1121: a markerless non-shared-author PR executes past identity parsing"
+else
+  fail "#1121: non-shared-author markerless fixture did not bypass identity parsing (rc=$fixture_rc output=$fixture_output)"
+fi
+
+fixture_result="$(run_body_fixture nathanjohnpayne '' 'Authoring-Agent: unknown')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] && grep -q 'does not map to exactly one configured reviewer' <<<"$fixture_output"; then
+  pass "#1121: an unregistered Authoring-Agent fails closed before gate evaluation"
+else
+  fail "#1121: unregistered Authoring-Agent fixture did not fail closed (rc=$fixture_rc output=$fixture_output)"
 fi
 
 # Positional rather than a text scan — the header documents gate (c) long

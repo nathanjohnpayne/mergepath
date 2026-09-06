@@ -185,6 +185,12 @@ fi
 # --derive-rate-limit-protection below because Phase-4b-cleared protected PRs
 # can be safe to auto-merge even after the removable label is gone (#713).
 #
+# --derive-phase-4-requiredness (#1094): QUERY mode for the final approval-
+# independence recheck. It shares the intrinsic threshold/protected-path,
+# force-on label, and exact-head propagation-lane exemption calculation below,
+# but deliberately ignores whether the optional external merge gate is
+# enabled. Phase 4 policy scope exists independently of that enforcement knob.
+#
 # --derive-rate-limit-protection (#713, tightened by #772): QUERY mode for
 # agent-review.yml's CodeRabbit rc=5 branch. It prints `true` when a
 # rate-limited PR is protected from bot-unreviewed auto-merge by either:
@@ -204,24 +210,30 @@ fi
 # Phase-4b timing case where the APPROVED review already removed
 # `needs-external-review` before the auto-merge job re-checks CodeRabbit.
 DERIVE_ONLY=false
+PHASE_4_DERIVE_ONLY=false
 RATE_LIMIT_PROTECTION_ONLY=false
 _positional=()
 for _arg in "$@"; do
   case "$_arg" in
     --derive-external-requiredness) DERIVE_ONLY=true ;;
+    --derive-phase-4-requiredness) PHASE_4_DERIVE_ONLY=true ;;
     --derive-rate-limit-protection) RATE_LIMIT_PROTECTION_ONLY=true ;;
     *) _positional+=("$_arg") ;;
   esac
 done
 set -- ${_positional[@]+"${_positional[@]}"}
 
-if [ "$DERIVE_ONLY" = "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
+query_mode_count=0
+[ "$DERIVE_ONLY" = "true" ] && query_mode_count=$((query_mode_count + 1))
+[ "$PHASE_4_DERIVE_ONLY" = "true" ] && query_mode_count=$((query_mode_count + 1))
+[ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ] && query_mode_count=$((query_mode_count + 1))
+if [ "$query_mode_count" -gt 1 ]; then
   echo "ERROR: choose only one query mode" >&2
   exit 2
 fi
 
 if [ $# -gt 2 ]; then
-  echo "Usage: $0 [--derive-external-requiredness|--derive-rate-limit-protection] [PR_NUMBER] [REPO]" >&2
+  echo "Usage: $0 [--derive-external-requiredness|--derive-phase-4-requiredness|--derive-rate-limit-protection] [PR_NUMBER] [REPO]" >&2
   echo "       PR_NUMBER and REPO may also be set via env." >&2
   exit 2
 fi
@@ -837,6 +849,14 @@ PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) \
 
 HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
 BASE_SHA=$(echo "$PR_JSON" | jq -r '.base.sha // ""')
+EXPECTED_HEAD_SHA=${MERGE_CLEARANCE_EXPECTED_HEAD_SHA:-}
+EXPECTED_BASE_REF=${MERGE_CLEARANCE_EXPECTED_BASE_REF:-}
+EXPECTED_BASE_SHA=${MERGE_CLEARANCE_EXPECTED_BASE_SHA:-}
+MATERIALIZE_BASE_POLICY=${MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY:-false}
+case "$MATERIALIZE_BASE_POLICY" in
+  true|false) ;;
+  *) die 2 "MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY must be true|false" ;;
+esac
 
 # --- PR-base review policy (#763) -------------------------------------------
 #
@@ -864,6 +884,15 @@ BASE_SHA=$(echo "$PR_JSON" | jq -r '.base.sha // ""')
 # Silently substituting the default-branch policy there is the bypass itself.
 BASE_REF=$(echo "$PR_JSON" | jq -r '.base.ref // ""')
 DEFAULT_BRANCH=$(echo "$PR_JSON" | jq -r '.base.repo.default_branch // ""')
+if [ -n "$EXPECTED_HEAD_SHA" ] && [ "$HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+  die 2 "PR head changed from expected $EXPECTED_HEAD_SHA to ${HEAD_SHA:-unknown} before requiredness evaluation"
+fi
+if [ -n "$EXPECTED_BASE_REF" ] && [ "$BASE_REF" != "$EXPECTED_BASE_REF" ]; then
+  die 2 "PR base ref changed from expected $EXPECTED_BASE_REF to ${BASE_REF:-unknown} before requiredness evaluation"
+fi
+if [ -n "$EXPECTED_BASE_SHA" ] && [ "$BASE_SHA" != "$EXPECTED_BASE_SHA" ]; then
+  die 2 "PR base sha changed from expected $EXPECTED_BASE_SHA to ${BASE_SHA:-unknown} before requiredness evaluation"
+fi
 RESOLVE_POLICY_BIN="${MERGE_CLEARANCE_WORKFLOW_DIR:-$SCRIPT_DIR/workflow}/resolve_base_policy.sh"
 if [ ! -f "$RESOLVE_POLICY_BIN" ]; then
   # Broken install (the resolver ships with this gate via .mergepath-sync.yml).
@@ -884,6 +913,10 @@ if [ ! -f "$RESOLVE_POLICY_BIN" ]; then
   # undeterminable base — fell through to the degrade branch, which is an
   # assumption, not proof (CodeRabbit Major on #768). Same rule the resolver
   # applies: "unknown" is not proof.
+  if [ "$MATERIALIZE_BASE_POLICY" = "true" ]; then
+    echo "ERROR: policy resolver missing ($RESOLVE_POLICY_BIN) while exact-base policy materialization is required — refusing checkout-policy fallback" >&2
+    exit 2
+  fi
   if [ -z "$BASE_REF" ] || [ -z "$DEFAULT_BRANCH" ] || [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
     echo "ERROR: policy resolver missing ($RESOLVE_POLICY_BIN) and this PR is not provably against the default branch (base='$BASE_REF' default='$DEFAULT_BRANCH') — refusing to evaluate it against the default-branch policy" >&2
     exit 2
@@ -895,10 +928,13 @@ else
 # stdout is the policy PATH, stderr is diagnostics — keep them separate so a
 # warning cannot be concatenated into the path (#715/#716 class).
 RESOLVE_ERR=$(mktemp "${TMPDIR:-/tmp}/mcg-resolve-err.XXXXXX")
+MATERIALIZE_ARG=""
+[ "$MATERIALIZE_BASE_POLICY" = "true" ] && MATERIALIZE_ARG="--materialize-default"
 set +e
 RESOLVED_POLICY=$(bash "$RESOLVE_POLICY_BIN" \
   --repo "$REPO" --base-ref "$BASE_REF" --base-sha "$BASE_SHA" \
-  --default-branch "$DEFAULT_BRANCH" --default-config "$CONFIG" 2>"$RESOLVE_ERR")
+  --default-branch "$DEFAULT_BRANCH" --default-config "$CONFIG" \
+  ${MATERIALIZE_ARG:+"$MATERIALIZE_ARG"} 2>"$RESOLVE_ERR")
 resolve_rc=$?
 set -e
 RESOLVE_MSG=$(cat "$RESOLVE_ERR" 2>/dev/null || true)
@@ -990,7 +1026,7 @@ log "HEAD = $HEAD_SHA    author = $PR_AUTHOR    needs-external-review = $HAS_EXT
 # Query modes are deliberately exempt: --derive-rate-limit-protection answers a
 # narrow question about bot review coverage, and folding an unrelated identity
 # verdict into that boolean would change what its callers think they asked.
-if [ "$DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
+if [ "$DERIVE_ONLY" != "true" ] && [ "$PHASE_4_DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
   NON_REVIEWERS=$(read_non_reviewer_identities "$POLICY_CONFIG")
   # A key present with an inline value the block reader cannot consume -- a
   # YAML flow list or a bare scalar -- parses to NOTHING and is otherwise
@@ -1059,7 +1095,7 @@ fi
 # carries needs-external-review is still judged by the Dependabot rule.
 
 if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
-  if [ "$DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
+  if [ "$DERIVE_ONLY" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
     # Query mode always returns FALSE for a Dependabot PR (automated-4b P1).
     # The query consumers ask a NARROW question: will this PR be protected
     # from bot-unreviewed auto-merge after CodeRabbit rate-limits? The
@@ -1152,7 +1188,7 @@ if [ "$DERIVE_ONLY" = "true" ] && [ "$EXTERNAL_GATE_ENABLED" != "true" ]; then
   exit 0
 fi
 
-if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
+if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
   REQUIRES_EXTERNAL=false
   REQUIRES_REASON=""
 
@@ -1180,7 +1216,7 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
     # unknowable exemption state here must NOT assert requiredness or
     # protection. Fail closed to the caller instead (the rc=5 branch reads a
     # nonzero query as false → block). automated-4b round-5 P1.
-    if [ "${lane_rc:-0}" -eq 2 ] && { [ "$DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; }; then
+    if [ "${lane_rc:-0}" -eq 2 ] && { [ "$DERIVE_ONLY" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; }; then
       die 2 "propagation-lane marker read was indeterminate (comments API fetch/parse failed) in query mode for $HEAD_SHA; refusing to assert external-review requiredness/protection (fail-closed)"
     fi
     # `|| true` so a missing key (grep no-match → pipeline non-zero under
@@ -1264,6 +1300,12 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
         fi
       fi
     fi
+  fi
+
+  if [ "$PHASE_4_DERIVE_ONLY" = "true" ]; then
+    log "query mode: Phase 4 requiredness on HEAD $HEAD_SHA = $REQUIRES_EXTERNAL${REQUIRES_REASON:+ ($REQUIRES_REASON)}"
+    printf '%s\n' "$REQUIRES_EXTERNAL"
+    exit 0
   fi
 
   if [ "$DERIVE_ONLY" = "true" ]; then

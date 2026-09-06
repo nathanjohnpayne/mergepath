@@ -182,6 +182,15 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   # both links dangling (Codex P2 on #1112).
   'specs/bootstrap_source_attribution.md'
 
+  # Bootstrap label-seeding spec (#1182): same class and same failure as the
+  # entry above. It describes the bootstrap wizard's canonical label set and
+  # maps to the hub-only tests/test_bootstrap_github_infra.sh in
+  # spec_test_map, so shipping it without the test reds a consumer's
+  # check_spec_test_alignment. Modeling it absent in the consumer-safety
+  # fixture is NOT sufficient on its own - the fixture asserts what a
+  # consumer looks like, this exclusion is what makes that true.
+  'specs/bootstrap_label_seeding.md'
+
   # Mergepath-internal policy simulation tool
   'scripts/policy-sim.sh'
 
@@ -1548,6 +1557,12 @@ bootstrap::_yq_clean_repo_template() {
   # round 4 on #1112): it too is mirror-excluded (both it and the doc
   # ownership) alongside the hub-only test it maps to.
   yq -i 'del(.spec_test_map.bootstrap_source_attribution)' "$f"
+  # Drop the bootstrap label-seeding spec_test_map entry (#1182), for the
+  # same reason as the line above: both the spec and its mapped hub-only
+  # test are mirror-excluded, so a surviving map entry points at a test the
+  # consumer does not have. This key is not name-bearing, so it survives
+  # substitution as-is.
+  yq -i 'del(.spec_test_map.bootstrap_label_seeding)' "$f"
   # Drop extra_top_level_dirs entirely — the new repo has no
   # mergepath/ or packaging/ dirs.
   yq -i 'del(.extra_top_level_dirs)' "$f"

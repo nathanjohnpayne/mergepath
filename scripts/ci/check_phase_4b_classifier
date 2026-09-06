@@ -3,9 +3,9 @@ set -euo pipefail
 
 # Unit-level coverage for scripts/phase-4b-classifier.sh.
 #
-# Runs the classifier against six fixture PRs (one per trigger class
-# plus a no-trigger negative case) and asserts the output triggers
-# array. Fixture inputs live in scripts/ci/fixtures/phase-4b/.
+# Runs the classifier against fixture PRs covering every trigger class,
+# negative cases, and incomplete-payload handling. Fixture inputs live in
+# scripts/ci/fixtures/phase-4b/.
 #
 # Each fixture is a JSON object: {body: string, files: [{filename,
 # patch}, ...]}. The classifier's --fixture flag reads this shape
@@ -111,6 +111,24 @@ assert_triggers "no-trigger fixture (README + LICENSE only) matches nothing" \
 assert_triggers "3 root-only files do not trigger cross-cutting-refactor (regression)" \
   "root-files-only.json" "" "0"
 
+# A changed file with no patch was previously counted as inspected even though
+# the content-based detectors saw nothing. That let an incomplete one-file diff
+# return a confident no-match and suppress review. The classifier must report
+# the payload as unassessed via its documented exit-2 path.
+set +e
+patchless_err=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_TRIGGERS/.github/review-policy.yml" \
+  bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/patchless.json" 2>&1 >/dev/null)
+patchless_rc=$?
+set -e
+if [ "$patchless_rc" = "2" ] && echo "$patchless_err" | grep -q "patch unavailable for"; then
+  pass=$((pass + 1))
+  echo "  PASS: a patchless changed-file entry is unassessed (exit 2)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: patchless changed-file entry should exit 2 as unassessed (rc=$patchless_rc)" >&2
+  echo "$patchless_err" | sed 's/^/      /' >&2
+fi
+
 echo
 echo "phase-4b-classifier.sh policy short-circuit tests"
 
@@ -132,6 +150,21 @@ jq_get() {
   got_rc=$?
   set -e
 }
+
+is_positive_integer() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -gt 0 ]
+}
+
+if is_positive_integer 1 && ! is_positive_integer 0 && ! is_positive_integer null && ! is_positive_integer ''; then
+  pass=$((pass + 1))
+  echo "  PASS: files_inspected assertions reject missing, null, and zero values"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: positive-integer guard accepted an absent/non-positive files_inspected value" >&2
+fi
 
 # fallback-only short-circuits without inspecting any diff.
 echo "phase_4b_default: fallback-only" > "$SCRATCH/.github/review-policy.yml"
@@ -163,6 +196,49 @@ if [ "$rec_rc" = 0 ] && [ "$rc" = "1" ] && [ "$got_rec" = "invoke-4b" ]; then
 else
   fail=$((fail + 1))
   echo "  FAIL: always short-circuit (rc=$rc, rec=$got_rec [jq_rc=$rec_rc])" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# --detect-only bypasses BOTH short-circuits, exercised against the REAL
+# classifier (#1084 r12). The only other coverage lives in
+# test_coderabbit_should_invoke.sh, which substitutes a stub classifier that
+# ignores its arguments -- so if either short-circuit stopped honoring
+# DETECT_ONLY, every `complex-changes` consumer would silently lose Phase 2.5
+# selectivity with all suites still green.
+#
+# Each mode is paired with the fixture whose REAL answer is the opposite of
+# that mode's short-circuit, so rc, match and files_inspected all flip if the
+# flag is ignored -- asserting a shape both branches already produce would
+# have no teeth.
+echo "phase_4b_default: fallback-only" > "$SCRATCH/.github/review-policy.yml"
+set +e
+out=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH/.github/review-policy.yml" bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/state-machine.json" --detect-only 2>/dev/null)
+rc=$?
+set -e
+jq_get match; got_match=$got_VAL; match_rc=$got_rc
+jq_get files_inspected; got_files=$got_VAL; files_rc=$got_rc
+if [ "$match_rc" = 0 ] && [ "$files_rc" = 0 ] && [ "$rc" = "1" ] && [ "$got_match" = "true" ] && is_positive_integer "$got_files"; then
+  pass=$((pass + 1))
+  echo "  PASS: --detect-only bypasses the fallback-only short-circuit (real classifier: match=true, files=$got_files)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --detect-only under fallback-only (rc=$rc, match=$got_match [jq_rc=$match_rc], files=$got_files [jq_rc=$files_rc]); expected rc=1, match=true, files>0" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+echo "phase_4b_default: always" > "$SCRATCH/.github/review-policy.yml"
+set +e
+out=$(MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH/.github/review-policy.yml" bash "$ROOT/$CLASSIFIER" 99999 --fixture "$ROOT/$FIXTURES_DIR/no-trigger.json" --detect-only 2>/dev/null)
+rc=$?
+set -e
+jq_get match; got_match=$got_VAL; match_rc=$got_rc
+jq_get files_inspected; got_files=$got_VAL; files_rc=$got_rc
+if [ "$match_rc" = 0 ] && [ "$files_rc" = 0 ] && [ "$rc" = "0" ] && [ "$got_match" = "false" ] && is_positive_integer "$got_files"; then
+  pass=$((pass + 1))
+  echo "  PASS: --detect-only bypasses the always short-circuit (real classifier: match=false, files=$got_files)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --detect-only under always (rc=$rc, match=$got_match [jq_rc=$match_rc], files=$got_files [jq_rc=$files_rc]); expected rc=0, match=false, files>0" >&2
   echo "$out" | sed 's/^/      /' >&2
 fi
 

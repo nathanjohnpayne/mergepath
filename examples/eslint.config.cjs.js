@@ -176,10 +176,38 @@ module.exports = [
   },
 
 // >>> if frameworks contains typescript
-  // TypeScript recommended ruleset — applied to .ts / .tsx via the
-  // typescript-eslint plugin's flat-config preset. Includes the
-  // parser, the recommended rule set, and the file-glob targeting.
-  ...tseslint.configs.recommended,
+  // TypeScript recommended ruleset. The preset supplies the parser and the
+  // rules; it does NOT supply file-glob targeting, despite what the comment
+  // here used to claim. `tseslint.configs.recommended` is an array of
+  // config objects with no `files` key, and a flat-config object without
+  // `files` applies to EVERY file ESLint visits.
+  //
+  // Unscoped, it reached the `**/*.cjs` block above and fired
+  // `@typescript-eslint/no-require-imports` on files this config
+  // deliberately set up as CommonJS — the config told ESLint a file was
+  // CommonJS and then failed it for being CommonJS. Scoping each entry to
+  // TS sources is the fix (nathanjohnpayne/nathanpaynedotcom#856).
+  //
+  // `.astro` is in this glob for the same reason it is in the rule block
+  // below: astro frontmatter is TypeScript, and the preset entry that
+  // carries the plugin is what REGISTERS `@typescript-eslint`. Scoping to
+  // TS extensions alone leaves the block below referencing
+  // `@typescript-eslint/*` rule IDs for `.astro` with no plugin in the
+  // matching configuration, and ESLint refuses to load at all — the #327
+  // rule-without-plugin break. The astro plugin's own preset is spread
+  // AFTER this one, so it still wins for parser selection on `.astro`.
+  //
+  // The array is NOT homogeneous, which is why this maps conditionally.
+  // `typescript-eslint/eslint-recommended` ALREADY carries its own
+  // `files: ["**/*.ts","**/*.tsx","**/*.mts","**/*.cts"]`, and its 23 rules
+  // are core-rule DISABLES (no-undef, no-dupe-keys, no-redeclare, …) that
+  // TypeScript itself replaces. Overwriting that entry's selector to
+  // include `.astro` would switch those core checks OFF for astro files,
+  // where they were previously on — a silent loss of coverage, not a
+  // scoping fix. Only the entries with no `files` of their own get one.
+  ...tseslint.configs.recommended.map((config) =>
+    config.files ? config : { ...config, files: ["**/*.{ts,tsx,mts,cts,astro}"] },
+  ),
 // <<<
 
 // >>> if frameworks contains typescript

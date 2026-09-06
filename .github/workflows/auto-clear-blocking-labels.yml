@@ -270,6 +270,7 @@ jobs:
           # secret is not provisioned. Either way it must be a PAT,
           # not GITHUB_TOKEN, or the label write fires no re-arm.
           GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          WORKFLOW_TOKEN: ${{ github.token }}
           PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
           REPO: ${{ github.repository }}
         run: |
@@ -327,6 +328,31 @@ jobs:
 
             case "$rc" in
               0)
+                # Retract any durable request while needs-external-review is
+                # still a blocker. Deleting the last blocking label first can
+                # let GitHub consume an older arm before the continuation step
+                # gets a chance to clean it up. Dependabot is preserved inside
+                # the helper because its dedicated workflow owns that lane.
+                if [ ! -f scripts/workflow/approval-merge-continuation.sh ] \
+                   || ! grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' scripts/workflow/approval-merge-continuation.sh; then
+                  echo "::error::Protective retraction helper is unavailable; refusing to remove needs-external-review from PR #$PR."
+                  had_infra_error=1
+                  failing_prs="$failing_prs $PR"
+                  echo "::endgroup::"
+                  continue
+                fi
+                set +e
+                GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+                  --retract-unsafe-only "$PR" "$REPO"
+                protective_rc=$?
+                set -e
+                if [ "$protective_rc" -ne 0 ]; then
+                  echo "::error::Protective retraction failed rc=$protective_rc; refusing to remove needs-external-review from PR #$PR."
+                  had_infra_error=1
+                  failing_prs="$failing_prs $PR"
+                  echo "::endgroup::"
+                  continue
+                fi
                 echo "Gate passes — removing needs-external-review label."
                 # Single (non-retried) removal, then verify end state with a
                 # retried READ (#465): retrying the removal can double-fire
@@ -429,23 +455,24 @@ jobs:
       - name: Continue approved PRs after completed checks
         if: github.event_name == 'workflow_run' && steps.pr.outputs.numbers != ''
         env:
-          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          WORKFLOW_TOKEN: ${{ github.token }}
           # Routes ONLY the review-feedback-accounting.sh call inside
-          # approval-merge-continuation.sh through GITHUB_TOKEN instead of
-          # the ambient AUTHOR_MERGE_TOKEN above (#1101, CodeRabbit on PR
-          # #1106) — see this job's permissions block for why.
+          # approval-merge-continuation.sh through GITHUB_TOKEN instead of the
+          # author token used by normal continuation (#1101, CodeRabbit on PR
+          # #1106). See this job's permissions block for why.
           ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
           CLEARED_PRS: ${{ steps.clear.outputs.cleared_prs }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; approval continuation is disabled."
-            exit 0
-          fi
           if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then
             echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout event."
+            exit 0
+          fi
+          if ! grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' scripts/workflow/approval-merge-continuation.sh; then
+            echo "::notice::Approval continuation predates governing-policy protective retraction; skipping this first-rollout event."
             exit 0
           fi
           continuation_infra_error=0
@@ -459,8 +486,20 @@ jobs:
                 ;;
             esac
             set +e
-            bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
-            rc=$?
+            GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+              --retract-unsafe-only "$PR" "$REPO"
+            protective_rc=$?
+            if [ "$protective_rc" -eq 0 ] && [ -z "${AUTHOR_TOKEN:-}" ]; then
+              echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but author-token continuation remains disabled."
+              rc=0
+            elif [ "$protective_rc" -eq 0 ]; then
+              GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
+                MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
+                bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
+              rc=$?
+            else
+              rc=$protective_rc
+            fi
             set -e
             case "$rc" in
               0) ;;
@@ -681,6 +720,7 @@ jobs:
           # BLOCKED until the next push or manual nudge, defeating
           # the sweep's purpose.
           GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          WORKFLOW_TOKEN: ${{ github.token }}
           PRS: ${{ steps.find.outputs.prs }}
           REPO: ${{ github.repository }}
         run: |
@@ -723,6 +763,29 @@ jobs:
             set -e
             case "$rc" in
               0)
+                # Match the event-driven clear path: remove any unsafe durable
+                # request while the label still blocks GitHub from consuming
+                # it. The helper preserves Dependabot's dedicated lane.
+                if [ ! -f scripts/workflow/approval-merge-continuation.sh ] \
+                   || ! grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' scripts/workflow/approval-merge-continuation.sh; then
+                  echo "::error::Protective retraction helper is unavailable; refusing to remove needs-external-review from PR #$PR."
+                  had_infra_error=1
+                  failing_prs="$failing_prs $PR"
+                  echo "::endgroup::"
+                  continue
+                fi
+                set +e
+                GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+                  --retract-unsafe-only "$PR" "$REPO"
+                protective_rc=$?
+                set -e
+                if [ "$protective_rc" -ne 0 ]; then
+                  echo "::error::Protective retraction failed rc=$protective_rc; refusing to remove needs-external-review from PR #$PR."
+                  had_infra_error=1
+                  failing_prs="$failing_prs $PR"
+                  echo "::endgroup::"
+                  continue
+                fi
                 echo "Gate passes — removing needs-external-review label."
                 # Single (non-retried) REST DELETE + retried verify (#465/#827)
                 # — see the evaluate-and-clear job above for the full rationale
@@ -807,22 +870,23 @@ jobs:
       - name: Continue approved PRs after custom-workflow completions
         if: steps.find.outputs.enabled != 'false' && steps.approved.outputs.prs != ''
         env:
-          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          WORKFLOW_TOKEN: ${{ github.token }}
           # Routes ONLY the review-feedback-accounting.sh call inside
-          # approval-merge-continuation.sh through GITHUB_TOKEN instead of
-          # the ambient AUTHOR_MERGE_TOKEN above (#1101, CodeRabbit on PR
-          # #1106) — see this job's permissions block for why.
+          # approval-merge-continuation.sh through GITHUB_TOKEN instead of the
+          # author token used by normal continuation (#1101, CodeRabbit on PR
+          # #1106). See this job's permissions block for why.
           ACCOUNTING_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRS: ${{ steps.approved.outputs.prs }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; scheduled approval continuation is disabled."
-            exit 0
-          fi
           if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then
             echo "::notice::Approval continuation helper is not on the trusted default branch yet; skipping this first-rollout sweep."
+            exit 0
+          fi
+          if ! grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' scripts/workflow/approval-merge-continuation.sh; then
+            echo "::notice::Approval continuation predates governing-policy protective retraction; skipping this first-rollout sweep."
             exit 0
           fi
           continuation_infra_error=0
@@ -830,8 +894,20 @@ jobs:
           while IFS= read -r PR; do
             [ -n "$PR" ] || continue
             set +e
-            bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
-            rc=$?
+            GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+              --retract-unsafe-only "$PR" "$REPO"
+            protective_rc=$?
+            if [ "$protective_rc" -eq 0 ] && [ -z "${AUTHOR_TOKEN:-}" ]; then
+              echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but scheduled author-token continuation remains disabled."
+              rc=0
+            elif [ "$protective_rc" -eq 0 ]; then
+              GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
+                MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
+                bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
+              rc=$?
+            else
+              rc=$protective_rc
+            fi
             set -e
             case "$rc" in
               0) ;;

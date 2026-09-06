@@ -14,9 +14,10 @@
 #      both run under the SAME verified author credential, the create
 #      via bootstrap::run_author_gh and the push via
 #      bootstrap::run_author_git.
-#   2. Seed the 12 canonical labels (needs-external-review,
+#   2. Seed the 19 canonical labels (needs-external-review,
 #      needs-human-review, policy-violation, human-hold,
-#      human-action, decision-needed, agent-action, phase-0..4).
+#      human-action, decision-needed, agent-action, phase-0..4,
+#      size:S/M/L, priority:critical/high/normal/low).
 #      Eliminates the first-PR "label not found" friction.
 #   3. Invite reviewer-identity collaborators (claude / cursor /
 #      codex per BOOTSTRAP_INPUT_REVIEWERS). Each invite is async;
@@ -56,23 +57,54 @@
 
 set -euo pipefail
 
-# Canonical label set. Each entry: name:hex-color:description.
-# Format kept consistent with the existing matchline / mergepath
-# label conventions. Colors picked to be distinguishable in the
-# GitHub UI light + dark themes.
+# Canonical label set. Each entry: name|color|description.
+#
+# The separator is `|`, NOT `:`. The original `name:color:description`
+# encoding split on the first two colons, which structurally cannot
+# express a label name that itself contains a colon — and the whole
+# shared `size:` / `priority:` taxonomy does. Under the old format
+# "size:S:c2e0c6:Small..." parsed as name="size", color="S", which is
+# not valid hex, so `gh label create` would have failed the entry
+# outright. `|` appears in no label name, color or description here,
+# and bootstrap::_seed_labels rejects a malformed entry rather than
+# creating a mis-parsed label.
+#
+# Colors picked to be distinguishable in the GitHub UI light + dark
+# themes.
+#
+# The `size:` / `priority:` entries are the fleet-shared subset agreed
+# in the 2026-09-04 backlog audit: the three universal size buckets and
+# the four priority levels, seeded so a new repo starts on the same
+# scale the rest of the fleet uses. Names, colors and descriptions are
+# byte-identical to mergepath's own labels — that is the point, and a
+# drifted description is what makes a shared label stop meaning one
+# thing. `size:XL` is deliberately absent: it existed in
+# nathanpaynedotcom and was never applied to a single issue.
+#
+# Deliberately NOT seeded: `area:*`, `status:*` and the repo-local
+# `type:*` values. Those are per-repo vocabulary; imposing the hub's
+# nine-area scheme on a repo with four open issues is bureaucracy, not
+# standardization.
 BOOTSTRAP_LABELS=(
-  "needs-external-review:bf0606:External review required before merge"
-  "needs-human-review:7057ff:Awaiting human triage or decision"
-  "policy-violation:b60205:Blocked by review-policy.yml violation"
-  "human-hold:000000:Hard merge freeze - human-remove-only; supersedes all gates"
-  "human-action:0e8a16:Requires human attention"
-  "decision-needed:e99695:Needs a human decision before work proceeds (issue triage, not a PR merge gate)"
-  "agent-action:1d76db:Agent task — not blocked on human"
-  "phase-0:c5def5:Phase 0: foundations"
-  "phase-1:bfd4f2:Phase 1: core"
-  "phase-2:bfd4f2:Phase 2"
-  "phase-3:bfd4f2:Phase 3"
-  "phase-4:bfd4f2:Phase 4"
+  "needs-external-review|bf0606|External review required before merge"
+  "needs-human-review|7057ff|Awaiting human triage or decision"
+  "policy-violation|b60205|Blocked by review-policy.yml violation"
+  "human-hold|000000|Hard merge freeze - human-remove-only; supersedes all gates"
+  "human-action|0e8a16|Requires human attention"
+  "decision-needed|e99695|Needs a human decision before work proceeds (issue triage, not a PR merge gate)"
+  "agent-action|1d76db|Agent task — not blocked on human"
+  "phase-0|c5def5|Phase 0: foundations"
+  "phase-1|bfd4f2|Phase 1: core"
+  "phase-2|bfd4f2|Phase 2"
+  "phase-3|bfd4f2|Phase 3"
+  "phase-4|bfd4f2|Phase 4"
+  "size:S|c2e0c6|Small: one or a few files, straightforward verification. Calibrated to nathanpaynedotcom#942/#849."
+  "size:M|fef2c0|Medium: real design choice plus tests across a subsystem. Calibrated to nathanpaynedotcom#881/#825."
+  "size:L|f9d0c4|Large: crosses subsystems or changes a depended-on contract. Calibrated to nathanpaynedotcom#900."
+  "priority:critical|B60205|Broken now on the merge path, dated evidence, no workaround. Expect this to be empty."
+  "priority:high|D93F0B|Measured live impact, or it blocks a named issue. Cite that evidence in the issue."
+  "priority:normal|8B949E|Default. Worth doing; no observed live impact, or it fails in the safe direction."
+  "priority:low|D4D8DD|Would not be missed. A candidate for closure at the next audit if still untouched."
 )
 
 # 1Password reference for the REVIEWER_ASSIGNMENT_TOKEN PAT (the
@@ -416,13 +448,42 @@ bootstrap::_seed_labels() {
   local spec name color desc
 
   for spec in "${BOOTSTRAP_LABELS[@]}"; do
-    # Field-split on ':' — name:color:description. `description` can
-    # contain colons; capture only the first two splits and let the
-    # rest be the description.
-    name=${spec%%:*}
-    local rest=${spec#*:}
-    color=${rest%%:*}
-    desc=${rest#*:}
+    # Field-split on '|' — name|color|description. Both `name` and
+    # `description` may contain colons (the whole `size:` / `priority:`
+    # taxonomy does), which is why the separator is not ':'. Capture
+    # the first two splits and let the rest be the description, so a
+    # description containing '|' would still round-trip.
+    # Require BOTH separators before splitting. `${var%%|*}` and
+    # `${var#*|}` return the input UNCHANGED when the separator is
+    # absent, so a one-separator entry does not fail — it silently
+    # aliases two fields onto one value. "future-label|abcdef" would
+    # otherwise parse as color=abcdef AND desc=abcdef, pass a
+    # colour-only check, and create a label with its colour copied into
+    # its description. The glob tests the shape before any field is
+    # trusted; a description may still contain '|' and round-trips.
+    case "$spec" in
+      *"|"*"|"*) : ;;
+      *)
+        bootstrap::record_warning "github-infra: label spec '$spec' is malformed (expected name|color|description — both '|' separators required) — skipped, label NOT created"
+        continue
+        ;;
+    esac
+
+    name=${spec%%|*}
+    local rest=${spec#*|}
+    color=${rest%%|*}
+    desc=${rest#*|}
+
+    # Reject a malformed entry rather than creating a mis-parsed label.
+    # A separator typo used to be silently survivable: the old ':'
+    # format turned "size:S:c2e0c6:..." into a label named `size` with
+    # colour `S`. Validating the parsed colour is what makes that class
+    # of edit fail at the entry instead of at the API, and a bad entry
+    # must not take the other 18 labels down with it.
+    if [ -z "$name" ] || [ -z "$desc" ] || ! printf '%s' "$color" | grep -qE '^[0-9a-fA-F]{6}$'; then
+      bootstrap::record_warning "github-infra: label spec '$spec' is malformed (expected name|color|description with a 6-digit hex colour) — skipped, label NOT created"
+      continue
+    fi
 
     # --force makes the operation idempotent: existing labels get
     # their color/description updated instead of erroring.
@@ -433,9 +494,15 @@ bootstrap::_seed_labels() {
         --description "$desc" \
         --force \
       || {
-        # Single label failure is non-fatal — log and continue with
-        # the rest. The summary collects the count.
-        bootstrap::warn "github-infra: label '$name' create failed (continuing with remaining labels)"
+        # Single label failure is non-fatal — record and continue with
+        # the rest. This uses record_warning, NOT warn: bootstrap::warn
+        # only writes to stderr, so a failed create scrolled past while
+        # the stage summary still reported the full label count as done
+        # (CodeRabbit, #1182). Recorded warnings surface in the summary,
+        # which is where the operator actually reads the outcome. No key
+        # — several labels can fail independently and a keyed record
+        # would have each one clobber the last.
+        bootstrap::record_warning "github-infra: label '$name' create failed on $full_repo (continuing with remaining labels)"
       }
   done
 }

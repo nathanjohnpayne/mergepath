@@ -152,6 +152,8 @@ spec_test_map:
     - tests/test_bootstrap_template_mirror.sh
   bootstrap_source_attribution:
     - tests/test_bootstrap_template_mirror.sh
+  bootstrap_label_seeding:
+    - tests/test_bootstrap_github_infra.sh
   some_other_spec:
     - tests/test_some_other.sh
 test_globs:
@@ -238,6 +240,10 @@ echo "# CodeRabbit configuration audit (hub-only)" >"$FAKE_MP/docs/agents/codera
 
 # --- excluded paths (must NOT propagate) ---
 echo "playground spec" >"$FAKE_MP/specs/mergepath_playground.md"
+# #1182: hub-only bootstrap label-seeding spec. Seeded here so the
+# exclusion below is asserted against a file that actually exists —
+# an absent file would pass the "not mirrored" check vacuously.
+echo "label seeding spec" >"$FAKE_MP/specs/bootstrap_label_seeding.md"
 echo "playground plan" >"$FAKE_MP/plans/mergepath-playground.md"
 echo "playground test" >"$FAKE_MP/tests/test_mergepath_playground.sh"
 # source-SHA-attribution spec (#1056): must NOT propagate either, since it
@@ -446,6 +452,7 @@ for excluded in \
   '.claude/settings.local.json' \
   '.claude/launch.json' \
   'specs/mergepath_playground.md' \
+  'specs/bootstrap_label_seeding.md' \
   'plans/mergepath-playground.md' \
   'scripts/policy-sim.sh' \
   'scripts/audit-canonical-mirrors.sh' \
@@ -1627,27 +1634,39 @@ if yq 'has("extra_top_level_dirs")' "$TARGET/.repo-template.yml" 2>/dev/null \
 else
   pass "extra_top_level_dirs key removed"
 fi
+# Assert a spec_test_map key was DELETED, failing closed.
+# `yq | grep -q <expected-value>` is fail-OPEN in two ways, both verified:
+# a key that survives with a DIFFERENT value does not match the grep, and an
+# unreadable/unparseable file yields no output at all — each takes the "removed"
+# branch and passes. Require the query to succeed AND return exactly `null`.
+assert_spec_map_key_removed() {
+  local key=$1 file=$2 out rc
+  out=$(yq -r ".spec_test_map.$key" "$file" 2>&1); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "could not read $file to verify the $key cleanup (yq rc=$rc): $out"
+  elif [ "$out" = "null" ]; then
+    pass "$key spec_test_map entry removed"
+  else
+    fail "$key spec_test_map entry not removed (got: $out)"
+  fi
+}
+
 # The bootstrap consumer-identity entry must be gone too (#747: its
 # spec and mapped hub-only test are both mirror-excluded, so a
 # surviving map entry is stale hub metadata in the consumer).
-if yq '.spec_test_map.bootstrap_consumer_identity' "$TARGET/.repo-template.yml" 2>/dev/null \
-     | grep -q "tests/test_bootstrap_template_mirror"; then
-  fail "bootstrap_consumer_identity spec_test_map entry not removed"
-else
-  pass "bootstrap_consumer_identity spec_test_map entry removed"
-fi
+assert_spec_map_key_removed bootstrap_consumer_identity "$TARGET/.repo-template.yml"
 # Same for the source-SHA-attribution spec (#1056, Codex P2 round 4 on
 # #1112): its spec file is mirror-excluded too, so a surviving map entry
 # would be equally stale.
-if yq '.spec_test_map.bootstrap_source_attribution' "$TARGET/.repo-template.yml" 2>/dev/null \
-     | grep -q "tests/test_bootstrap_template_mirror"; then
-  fail "bootstrap_source_attribution spec_test_map entry not removed"
-else
-  pass "bootstrap_source_attribution spec_test_map entry removed"
-fi
+assert_spec_map_key_removed bootstrap_source_attribution "$TARGET/.repo-template.yml"
 [ -f "$TARGET/specs/bootstrap_source_attribution.md" ] \
   && fail "specs/bootstrap_source_attribution.md leaked into the consumer (its links to hub-only docs would 404)" \
   || pass "specs/bootstrap_source_attribution.md excluded from the consumer mirror"
+# The label-seeding entry must be gone for the same reason (#1182). Without
+# this, a new consumer keeps a spec_test_map entry pointing at
+# tests/test_bootstrap_github_infra.sh — a hub-only test it does not have —
+# and check_spec_test_alignment reds its very first repo-lint run.
+assert_spec_map_key_removed bootstrap_label_seeding "$TARGET/.repo-template.yml"
 # But some_other_spec entry should remain (we only dropped the hub-only ones).
 yq '.spec_test_map.some_other_spec' "$TARGET/.repo-template.yml" 2>/dev/null \
   | grep -q "tests/test_some_other" \

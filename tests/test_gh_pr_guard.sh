@@ -46,11 +46,13 @@ case "${1:-} ${2:-}" in
     done
     case "$json_fields" in
       *body*)
-        printf '%s\n' "${STUB_PR_BODY:-}"
-        printf '"additions": %s\n' "${STUB_PR_ADDITIONS:-0}"
-        printf '"deletions": %s\n' "${STUB_PR_DELETIONS:-0}"
-        printf '"head": "%s"\n' "${STUB_PR_HEAD:-feature/some-branch}"
-        printf '"author": "%s"\n' "${STUB_PR_AUTHOR:-nathanjohnpayne}"
+        jq -n \
+          --arg body "${STUB_PR_BODY:-}" \
+          --argjson additions "${STUB_PR_ADDITIONS:-0}" \
+          --argjson deletions "${STUB_PR_DELETIONS:-0}" \
+          --arg head "${STUB_PR_HEAD:-feature/some-branch}" \
+          --arg author "${STUB_PR_AUTHOR:-nathanjohnpayne}" \
+          '{body: $body, additions: $additions, deletions: $deletions, head: $head, author: $author}'
         exit 0
         ;;
       *)
@@ -116,6 +118,12 @@ assert_rc_contains() {
 
 assert_rc_contains "direct pr create blocked" 2 "token-verifying wrapper" \
   'gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "direct pr new alias blocked" 2 "token-verifying wrapper" \
+  'gh pr new --title "t" --body "Authoring-Agent: claude
 
 ## Self-Review
 - ok"'
@@ -218,8 +226,20 @@ assert_rc_contains "author wrapper pr create valid body allowed" 0 "" \
 ## Self-Review
 - ok"'
 
-assert_rc_contains "author wrapper pr create missing body blocked" 2 "Self-Review" \
+assert_rc_contains "author wrapper pr new alias allowed" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr new --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "author wrapper shell-wrapped pr create blocked" 2 "direct gh pr create" \
+  'scripts/gh-as-author.sh -- bash -c "gh pr create --title t --body INVALID"'
+
+assert_rc_contains "author wrapper defers inline body validation to runtime wrapper" 0 "" \
   'scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude"'
+
+assert_rc_contains "author wrapper body-file creation allowed for runtime validation" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr create --title "t" --body-file /tmp/pr-body.md'
 
 assert_rc_contains "reviewer wrapper pr create blocked" 2 "author token" \
   'scripts/gh-as-reviewer.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
@@ -305,6 +325,21 @@ assert_rc_contains "self-approve over-threshold blocked from wrapper identity" 2
 
 assert_rc_contains "cross-agent approve allowed" 0 "" \
   'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "Authoring-Agent: claude" "5000" "0"
+
+assert_rc_contains "commented author decoy cannot bypass same-agent approval" 2 "self-approve detected" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" $'<!-- Authoring-Agent: claude -->\nAuthoring-Agent: codex' "5000" "0"
+
+# The strict Authoring-Agent body contract belongs to the shared author lane.
+# Dependabot and external contributors do not use that template; a registered
+# reviewer must still be able to approve their PRs.
+assert_rc_contains "markerless Dependabot PR can receive reviewer approval" 0 "" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "" "5000" "0" "dependabot/npm_and_yarn/pkg" "dependabot[bot]"
+
+assert_rc_contains "markerless external-contributor PR can receive reviewer approval" 0 "" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "" "5000" "0" "contributor/fix" "outside-contributor"
+
+assert_rc_contains "markerless shared-author PR still fails closed" 2 "exactly one visible Authoring-Agent" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "" "5000" "0" "feature/fix" "nathanjohnpayne"
 
 # --- #671: the self-approve sub-guard resolves the reviewer the same way
 # the wrapper will (GH_AS_REVIEWER_IDENTITY, then MERGEPATH_AGENT, then
@@ -408,6 +443,16 @@ assert_rc_contains "inline MERGEPATH_AGENT before env -i does not unlock approve
   'MERGEPATH_AGENT=codex env -i scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
 
 ORIG_DIR="$(pwd)"
+mkdir -p "$WORKDIR/repo-custom-shared-author/.github"
+cat >"$WORKDIR/repo-custom-shared-author/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+external_review_threshold: 300
+YML
+cd "$WORKDIR/repo-custom-shared-author"
+assert_rc_contains "policy-defined custom shared author is not treated as external" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "feature/fix" "custom-owner"
+cd "$ORIG_DIR"
+
 mkdir -p "$WORKDIR/repo-with-policy/.github"
 cat >"$WORKDIR/repo-with-policy/.github/review-policy.yml" <<'YML'
 external_review_threshold: 500

@@ -135,10 +135,15 @@ p4b_top_field() {
 #   waived            it will not report in any useful window, and policy
 #                     explicitly permits proceeding without it
 #   not-yet           it has not posted on this head YET
+#   rate-limited      it has REFUSED to report and no wait this run can make
+#                     lasts long enough to lift the refusal (#1178)
 #   escalate          a stuck condition only a human can clear
 #
 # `reported`, `will-not-report` and `waived` let the barrier open. `not-yet`
 # is a bounded, self-clearing wait; `escalate` goes to the human immediately.
+# `rate-limited` is the one class the CLASSIFIER cannot resolve on its own —
+# it names the provider's state and the composer decides, because the answer
+# depends on whether the OTHER provider reported. See p4b_same_head_barrier.
 #
 # `waived` is deliberately a separate class rather than reuse of `reported`,
 # which would claim a report that never happened, or of `will-not-report`,
@@ -281,7 +286,41 @@ p4b_barrier_class_coderabbit() {
       # barrier's own drift check.
       probe_head="$(printf '%s' "$json" | jq -r '.head_sha // empty' 2>/dev/null || true)"
       probe_observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
-      if [ -n "$probe_head" ] && [ "$probe_head" = "$head" ] \
+      # A REFUSAL is not a delay (#1178). `rate_limit` is the one observed
+      # value on this branch that CodeRabbit will not leave on its own for
+      # anything the barrier is allowed to do:
+      #
+      #   - p4b_barrier_should_trigger declines on rate_limit by design, so
+      #     no request is ever sent for this head;
+      #   - coderabbit-wait.sh's header records that CodeRabbit "does NOT
+      #     auto-retry when the window elapses";
+      #   - the one path that DOES re-ask is the polling mode's backoff
+      #     retry, which --probe cannot reach — it "posts NOTHING".
+      #
+      # So `not-yet` bought a bounded wait nothing could satisfy: the run
+      # spent the whole coderabbit.max_wait_seconds and then escalated
+      # naming a timeout rather than the refusal (#826 measured the budget
+      # at roughly half the observed window, so it stalls on arrival). And
+      # the observation need not age out — on the review-object branch the
+      # limit stanza is written into the summarize comment IN PLACE, whose
+      # fresh_at stays at-or-after the review object, so the anchored
+      # expiry the triage relies on never arrives.
+      #
+      # Deliberately NOT head-anchored, unlike the `reported` conjunction
+      # below. A rate limit is provider-level state, the same shape as a
+      # pause — "a paused CodeRabbit cannot report on ANY head" — and the
+      # composer's own drift check already owns the head question, so
+      # requiring head equality here would only re-answer it while letting
+      # an old-probe payload with no head_sha fall back to a wait that
+      # cannot end.
+      #
+      # This arm names the state and stops. Whether it opens the barrier or
+      # pages a human depends on the CODEX arm, which a pure function over
+      # one CodeRabbit probe cannot see — the same split the #842 drift fix
+      # drew, for the same reason.
+      if [ "$probe_observed" = "rate_limit" ]; then
+        printf 'rate-limited'
+      elif [ -n "$probe_head" ] && [ "$probe_head" = "$head" ] \
          && { [ "$probe_observed" = "awaiting-summary" ] || [ "$probe_observed" = "terminal" ]; } \
          && [ "$(printf '%s' "$json" | jq -r '.review.endpoint // empty' 2>/dev/null || true)" = "reviews" ] \
          && [ "$(printf '%s' "$json" | jq -r '.probe.context_state // empty' 2>/dev/null || true)" = "success" ] \
@@ -1200,6 +1239,72 @@ p4b_same_head_barrier() {
       cls_cr="$(p4b_barrier_class_coderabbit "$head" "$rc" "$json")"
       case "$cls_cr" in
         reported|will-not-report|waived) ;;
+        rate-limited)
+          # #1178. The classifier has established that CodeRabbit REFUSED
+          # this head and that no wait available to this run lifts the
+          # refusal. That is exactly the question the rc-5 arm already
+          # answers for the polling mode — waived when the #489 Codex
+          # failover engaged, escalate otherwise — and the reason it was
+          # unreachable here is only that --probe never returns rc 5 and
+          # never sets codex_failover_requested.
+          #
+          # Resolve it against the Codex arm THIS run already classified,
+          # which is the same claim the failover flag makes and is better
+          # evidence: the flag says a request was sent, cls_cx == reported
+          # says Codex actually spoke on the exact head about to be
+          # approved. That, and not CodeRabbit's participation, is what the
+          # barrier's ordering guarantee requires — see the rc-5 note on
+          # why waived is the right class for a stall the other provider
+          # has already covered.
+          #
+          # A Codex arm still `not-yet` is the one case that keeps waiting,
+          # and the wait is honest because it is a wait on CODEX: that arm
+          # is self-clearing, and the next probe can find it reported and
+          # open the barrier on it. Escalating here instead would page a
+          # human on a PR whose Codex round was about to land — the #835
+          # objection to escalating a rate limit unconditionally, which
+          # holds just as well when the failover's role is played by the
+          # barrier's own Codex arm. What the head-anchored budget already
+          # bounds, it keeps bounding; only the reason it escalates with
+          # changes, below.
+          #
+          # WHAT MAKES THE OPEN ARM SAFE, and where that safety lives:
+          # `observed: rate_limit` has to mean "refused, with nothing unread
+          # behind the refusal". It does not say that for free. CodeRabbit
+          # writes its rate-limit stanza INTO the summarize comment it edits
+          # in place — the same comment that carries the #535 summary-only
+          # finding — and classify_comment is marker-first, so one body can
+          # say both and the refusal wins the classification. Opening on that
+          # would post an approval over a finding no required gate reads
+          # (Codex P1 on #1179). crw_rate_limit_masks_blocking_marker in
+          # scripts/coderabbit-wait.sh closes it upstream: such a body emits
+          # rc 2, which this classifier already escalates, so a rate_limit
+          # that reaches HERE is a bare refusal. That invariant is the
+          # precondition for this arm — a probe without the guard must not be
+          # paired with it.
+          #
+          # Every OTHER cls_cx escalates now, `waived` and `disabled`
+          # included: in those states nothing will read this head at all, so
+          # opening would post an approval with no external corroboration
+          # and waiting would spend a budget with nothing to wait on. That
+          # is the routing #839 gave the account-blocked Codex, for the same
+          # reason — no marker is written, so no budget starts.
+          #
+          # (`escalate` is unreachable: the Codex arm sets `why`, and this
+          # whole block is guarded on `why` being empty.)
+          #
+          # No trigger and no resume on any of these paths: should_trigger
+          # declines on rate_limit anyway, and a resume answers a pause, not
+          # a limit. The class spends no CodeRabbit allowance in either
+          # direction.
+          case "$cls_cx" in
+            reported) ;;
+            not-yet)  pending=true ;;
+            *)
+              why="CodeRabbit refused to review $head (rate limited) and no wait this run can make lifts that, while Codex is '$cls_cx' rather than reported — nothing has read this head, so a human must review it or clear the limit"
+              ;;
+          esac
+          ;;
         not-yet)
           pending=true
           # The pause recovery is NOT gated on Codex terminality, unlike the
@@ -1237,6 +1342,17 @@ p4b_same_head_barrier() {
     budget="$(p4b_barrier_budget_seconds)"
     if [ "$elapsed" -ge "$budget" ]; then
       why="external review did not reach the current head within ${budget}s"
+      # Name the REFUSAL, not just the clock (#1178). This exhaustion is
+      # reachable with cls_cr=rate-limited whenever Codex stayed not-yet for
+      # the whole budget, and "did not reach the current head" reads as
+      # latency to whoever opens the handoff — sending them to wait longer
+      # or re-nudge, when what actually happened is that one provider
+      # refused outright and the other never finished. The manual fallback's
+      # renderer carries only this string, which is why the pause recovery
+      # below is appended to it for the same reason.
+      case "$cls_cr" in
+        rate-limited) why="$why (CodeRabbit refused this head as rate limited and cannot be re-asked; the wait was on Codex, which stayed '$cls_cx')" ;;
+      esac
       # The recovery this same run just sent must survive into the manual
       # fallback, whose renderer carries only the reason — an operator who
       # cannot see it may post a second resume on top (Codex P2, round 2).

@@ -53,6 +53,22 @@
       "scripts/phase-4b/accounting.schema.json",
       "scripts/phase-4b/prices.json",
       "tests/test_phase_4b_accounting.sh"
+    ],
+    "check_self_approval_detector": [
+      ".github/workflows/agent-review.yml",
+      "scripts/merge-clearance-gate.sh",
+      "scripts/self-approval-detector.cjs",
+      "scripts/render-self-approval-bootstrap.cjs",
+      "scripts/workflow/approval-independence-check.sh",
+      "scripts/workflow/approval-merge-continuation.sh",
+      "scripts/lib/gh-api-array.sh",
+      "scripts/lib/reviewers-helpers.sh",
+      "scripts/lib/review-policy-scalar.sh",
+      "scripts/lib/blocking-labels.sh",
+      "tests/test_self_approval_detector.sh",
+      "tests/test_approval_independence_check.sh",
+      "tests/test_approval_merge_continuation.sh",
+      "tests/test_merge_clearance_gate.sh"
     ]
   }
 }

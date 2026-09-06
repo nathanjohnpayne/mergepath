@@ -132,13 +132,15 @@
 #   skippable only when every ENFORCING ruleset requiring that check also
 #   grants a bypass. A bypass on a ruleset that requires no canonical
 #   check — or on one whose checks a no-bypass ruleset also requires —
-#   leaves the gate intact and is not reported. ADR 0002 requires that
-#   posture on the HUB specifically — the two escapes that motivated the
-#   merge-clearance gate (#427/#428) were both admin merges — so `--fleet`
-#   passes this flag for the hub repo and a hub that requires all five
-#   canonical checks but leaves admins unconstrained is DRIFT (exit 3), not
-#   a PASS. Consumers are not audited for it: ADR 0002 does not require it
-#   of them.
+#   leaves the gate intact and is not reported. ADR 0002 originally
+#   required that posture on the HUB specifically, because the two escapes
+#   that motivated the merge-clearance gate (#427/#428) were both admin
+#   merges. The owner declined that recommendation on 2026-08-28: an admin
+#   bypass is retained fleet-wide as the escape hatch for a CI or provider
+#   outage, after a rate-limited gate stranded a fully reviewed PR (#1121).
+#   `--fleet` therefore passes this flag for NO repo, and an unconstrained
+#   admin is not drift anywhere. The flag remains available for ad-hoc
+#   audits that want to ask the question; nothing scheduled passes it.
 
 set -eo pipefail
 
@@ -218,9 +220,10 @@ while [ $# -gt 0 ]; do
       fi
       DEFAULT_BRANCH_HINT="$2"; shift 2 ;;
     --require-admin-enforcement)
-      # ADR 0002 requires enforce_admins on the hub (#427/#428 were both
-      # admin merges). Off by default so consumer audits keep their
-      # documented posture.
+      # Off by default everywhere. ADR 0002 originally asked for this on
+      # the hub (#427/#428 were both admin merges); the owner declined that
+      # recommendation on 2026-08-28, so no scheduled path passes it. Kept
+      # for ad-hoc audits that want to ask the bypass question directly.
       REQUIRE_ADMIN_ENFORCEMENT=1; shift ;;
     --fleet)
       FLEET=1; shift ;;
@@ -271,7 +274,9 @@ requiring it also allows a bypass — classic protection without
 array (or, where GitHub withholds that array from a read-only caller,
 \`current_user_can_bypass\` other than \`never\` reported to a confirmed
 repository admin). A ruleset payload that answers neither bypass
-question exits 2. ADR 0002 requires this on the hub.
+question exits 2. NOT passed by --fleet for any repo: the owner
+declined ADR 0002's hub requirement on 2026-08-28 in favour of keeping
+an admin escape hatch fleet-wide. Available for ad-hoc audits.
 
 --default-branch supplies this repo's default branch instead of reading
 it from GET /repos/{owner}/{repo}; only \`~DEFAULT_BRANCH\` ruleset
@@ -283,7 +288,8 @@ Exit 2 on gh API auth/scope failures (use an author/admin PAT).
 --fleet audits the hub plus every \`.consumers[].repo\` in
 .mergepath-sync.yml and prints a per-repo verdict table. Each repo is
 audited on its OWN default branch unless --branch is passed explicitly,
-and the hub is audited with --require-admin-enforcement. The manifest's
+and every repo, hub included, is audited WITHOUT
+--require-admin-enforcement. The manifest's
 schema \`version:\` must be $SUPPORTED_MANIFEST_VERSION. Same exit-code shape: 0 all clean,
 1 usage/prerequisite (including an unwritable --summary-file), 2 at least
 one repo unreadable (infrastructure, NOT drift), 3 drift on at least one
@@ -392,8 +398,24 @@ looks_like_branch_name() {
 # and the segments rejoined. jq's `@uri` does the per-segment work
 # (correct for UTF-8, which a hand-rolled byte loop is not), and jq is
 # already a hard dependency of this script.
+#
+# The definition moved to scripts/lib/branch-requirements.sh (#1063, landed
+# with #1064): gate (a) needs the same encoding, and this script is hub-only,
+# so a propagated caller could not reuse the copy that lived here. This
+# wrapper keeps the local call sites reading the same as before.
+#
+# Hard-required. A silent fallback to an unencoded path is precisely the
+# failure this function exists to prevent — it would read a DIFFERENT branch
+# and report its protection as this one.
+if [ ! -r "$SCRIPT_DIR/lib/branch-requirements.sh" ]; then
+  echo "ERROR: branch-requirements helper missing: $SCRIPT_DIR/lib/branch-requirements.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/branch-requirements.sh
+. "$SCRIPT_DIR/lib/branch-requirements.sh"
+
 urlencode_branch_path() {
-  jq -rn --arg s "$1" '$s | split("/") | map(@uri) | join("/")'
+  br_urlencode_branch_path "$1"
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -546,13 +568,14 @@ fleet_audit() {
       child_args+=(--default-branch "$repo_branch")
     fi
 
-    # ADR 0002 requires enforce_admins on the hub only, so the flag is
-    # passed for the hub and withheld from consumers.
-    if [ "$r" = "$hub" ]; then
-      "$audit_cmd" --repo "$r" --branch "$repo_branch" "${child_args[@]}" --require-admin-enforcement >"$tmp" 2>&1 || rc=$?
-    else
-      "$audit_cmd" --repo "$r" --branch "$repo_branch" "${child_args[@]}" >"$tmp" 2>&1 || rc=$?
-    fi
+    # The owner declined ADR 0002's hub-only enforce_admins requirement on
+    # 2026-08-28 and set the posture the other way: an admin merge-without-
+    # waiting escape is retained on EVERY repo, hub included, so that a CI
+    # or provider outage cannot strand a fully reviewed PR. `--fleet` no
+    # longer passes --require-admin-enforcement for any repo, so the hub is
+    # audited exactly like a consumer. The flag itself is kept for ad-hoc
+    # use; nothing in the scheduled path passes it. See ADR 0002 Exceptions.
+    "$audit_cmd" --repo "$r" --branch "$repo_branch" "${child_args[@]}" >"$tmp" 2>&1 || rc=$?
     out="$(cat "$tmp")"
     case "$rc" in
       0) verdict="PASS";  n_pass=$((n_pass + 1)) ;;
@@ -629,8 +652,9 @@ if [ "$FLEET" -eq 1 ] && [ -n "$DEFAULT_BRANCH_HINT" ]; then
   exit 1
 fi
 if [ "$FLEET" -eq 1 ] && [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
-  echo "Error: --require-admin-enforcement is decided per repo by --fleet (hub only, per ADR 0002)" >&2
-  echo "       and would be silently ignored here. Drop it, or audit the hub directly with --repo." >&2
+  echo "Error: --require-admin-enforcement is not passed by --fleet for any repo" >&2
+  echo "       (the owner declined ADR 0002's hub requirement on 2026-08-28) and would be" >&2
+  echo "       silently ignored here. Drop it, or audit one repo with --repo." >&2
   exit 1
 fi
 if [ "$FLEET" -eq 0 ]; then
@@ -1394,9 +1418,10 @@ fi
 # people who cannot skip them: classic protection lets every repo admin
 # "merge without waiting for requirements" unless `enforce_admins` is on,
 # and a ruleset lets everyone in `bypass_actors` do the same. ADR 0002
-# requires the closed posture on the hub because #427/#428 were both
-# admin merges, so a hub that lists all five checks and leaves this open
-# must not read as PASS.
+# argued for the closed posture on the hub because #427/#428 were both
+# admin merges; the owner declined that on 2026-08-28 and kept the escape
+# fleet-wide, so this block runs only when a caller asks for it
+# explicitly. Nothing scheduled does. See ADR 0002 Exceptions.
 if [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
   # One analysis over BOTH protection surfaces, because they are enforced
   # together. A bypass weakens only the source that grants it, so a
@@ -1449,7 +1474,11 @@ if [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
     done
     echo ""
     echo "The two escapes that motivated the merge-clearance gate (#427/#428) were"
-    echo "both admin merges, which is why ADR 0002 requires the closed posture."
+    echo "both admin merges, which is the case ADR 0002 made for the closed posture."
+    echo "That recommendation was DECLINED by the owner on 2026-08-28: the escape is"
+    echo "retained fleet-wide so that a CI or provider outage cannot strand a fully"
+    echo "reviewed PR. You passed --require-admin-enforcement explicitly, so this is"
+    echo "the answer to that question, not fleet drift."
     echo ""
     echo "Fix (classic protection): Settings → Branches → Branch protection rule for"
     echo "'$BRANCH' → tick 'Do not allow bypassing the above settings' (enforce_admins)."
