@@ -53,13 +53,15 @@ I told the owner across three separate reports that every review round had made 
 | owner rule-1 change `0a42275` | 3513 | +292 |
 | framing correction `d4ef45c` | 3652 | +139 |
 
-**The document grew 131%.** It never shrank in any commit. The rule count stayed at twelve throughout.
+**The document grew 131%** — 160 to 268 lines, 1583 to 3652 words. It never shrank in any commit. The rule count stayed at twelve throughout. (The PR as a whole stands at +295/-2 across three files; the figures above are this file alone.)
 
-What *did* shrink was mechanism: rule 5 lost two thresholds, and a tier-mechanics paragraph added in round 1 was removed in round 3 rather than repaired a third time. That is real, and it is what the "smaller" claim was reaching for — but "we removed two mechanisms" and "the document got smaller" are different statements, and only the first one is true.
+The accurate word is **narrower, not smaller**. Every commit reduced what this document *claims the authority to do* — thresholds dropped from rule 5, a tier-mechanics paragraph removed rather than repaired a third time, review authority explicitly disclaimed, and finally the rules distributed to their control points so this file stopped being normative at all. Authority contracted monotonically while length grew monotonically. "We narrowed it" and "we made it smaller" are different statements, and only the first is true.
+
+There were **three** automated review rounds on this PR, not four — three Codex review submissions, at 05:17, 05:29 and 05:50 UTC. That count was also misreported before it was checked.
 
 The attribution is worth more than the total. **The three review rounds account for +591 words. Owner decisions and evidence corrections account for +1478** — two and a half times as much. Automated review was not the main source of growth in a document about automated review causing growth; the main source was correcting claims this document had made about itself, and absorbing decisions that changed what it is for.
 
-That is the fourth unmeasured claim caught in this file. The first three were caught by a reviewer or a peer. This one was caught only because the owner asked for it in writing.
+That is the fourth unmeasured claim caught in this file, and the fifth counting the round count. The first three were caught by a reviewer or a peer. This one was caught only because the owner asked for it to be preserved in writing — which is the general case worth noting: **a claim becomes checkable at the moment someone asks to record it**, and every one of these survived unchecked precisely as long as it was only being asserted.
 
 Enforcement is tracked in #1199 (rules 2 and 11, at the review-request machinery) and #1201 (rules 3 and 5, at the escalation surface). Rule 5 is load-bearing *without* being automatable, and #1199 records why the mechanical version of it was withdrawn.
 
