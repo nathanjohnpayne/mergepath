@@ -2252,6 +2252,52 @@ untracked_subject=$(git -C "$UNTRACKED_TARGET" log -1 --format=%s)
   && pass "a stray untracked file hidden by status.showUntrackedFiles=no blocks attribution (#1056 Codex P2 on #1197)" \
   || fail "untracked-hidden source_root wrongly attributed: $untracked_subject"
 
+# ---------------------------------------------------------------------------
+# Codex P2 on #1197 (second round): a bare `git status --porcelain` also
+# silently honors the operator's own diff.ignoreSubmodules=all, under which
+# a submodule checked out at a different commit than the superproject's
+# tree records reads as clean even though rsync -a would still copy the
+# mismatched checkout. Verify the fixture actually reproduces an empty
+# `git status --porcelain` under that config before asserting the fix.
+# ---------------------------------------------------------------------------
+SUBMODULE_UPSTREAM="$WORKDIR/submodule-upstream"
+mkdir -p "$SUBMODULE_UPSTREAM"
+git -C "$SUBMODULE_UPSTREAM" init -q -b main
+echo "v1" >"$SUBMODULE_UPSTREAM/sub-file.txt"
+git -C "$SUBMODULE_UPSTREAM" add -A
+git -C "$SUBMODULE_UPSTREAM" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "submodule-upstream v1"
+echo "v2" >"$SUBMODULE_UPSTREAM/sub-file.txt"
+git -C "$SUBMODULE_UPSTREAM" add -A
+git -C "$SUBMODULE_UPSTREAM" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "submodule-upstream v2"
+submodule_v1=$(git -C "$SUBMODULE_UPSTREAM" rev-parse HEAD~1)
+
+SUBMODULE_SOURCE="$WORKDIR/source-submodule-dirty"
+mkdir -p "$SUBMODULE_SOURCE"
+git -C "$SUBMODULE_SOURCE" init -q -b main
+git -C "$SUBMODULE_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+git -C "$SUBMODULE_SOURCE" -c protocol.file.allow=always submodule --quiet add "$SUBMODULE_UPSTREAM" sub >/dev/null 2>&1
+git -C "$SUBMODULE_SOURCE" add -A
+git -C "$SUBMODULE_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "submodule-dirty seed (records submodule at v2)"
+git -C "$SUBMODULE_SOURCE" update-ref refs/remotes/origin/main HEAD
+git -C "$SUBMODULE_SOURCE" config diff.ignoreSubmodules all
+(cd "$SUBMODULE_SOURCE/sub" && git checkout -q "$submodule_v1")
+if [ -n "$(git -C "$SUBMODULE_SOURCE" status --porcelain)" ]; then
+  fail "submodule-dirty fixture did not reproduce the diff.ignoreSubmodules=all blind spot: $(git -C "$SUBMODULE_SOURCE" status --porcelain)"
+fi
+
+SUBMODULE_TARGET="$WORKDIR/target-submodule-dirty"
+mkdir -p "$SUBMODULE_TARGET"
+echo seed >"$SUBMODULE_TARGET/README.md"
+run_init_target_git "$SUBMODULE_TARGET" "$SUBMODULE_SOURCE"
+
+submodule_subject=$(git -C "$SUBMODULE_TARGET" log -1 --format=%s)
+[ "$submodule_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a submodule checked out at a different commit, hidden by diff.ignoreSubmodules=all, blocks attribution (#1056 Codex P2 on #1197)" \
+  || fail "submodule-dirty source_root wrongly attributed: $submodule_subject"
+
 # --- outcome 3: unresolvable/noncanonical-source fallback ---
 NONCANONICAL_SOURCE="$WORKDIR/source-noncanonical"
 mkdir -p "$NONCANONICAL_SOURCE"
