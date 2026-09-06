@@ -14,18 +14,27 @@ Every reviewer was correct every time. The error was converting each correct fin
 
 Three rules here are load-bearing rather than advisory: **rule 3**, **rule 5**, and **rule 11**. Enforcement is tracked in #1199 — but rule 5 is load-bearing *without* being automatable, and #1199 records why the mechanical version of it was withdrawn.
 
-## 1. Freeze the contract before implementation
+## 1. Get the contract ratified, not merely frozen
 
 Before opening a PR, write a short implementation contract containing:
 
 - **Problem being fixed** — the observed failure or measured cost that makes the issue high priority.
+- **Guarantees this implementation will provide** — named, one line each, each marked as either *asked for by the issue* or *added by this implementation*. Anchor the list to the guarantees the **issue** states, not to the ones the implementation finds natural; a broadly-scoped issue legitimately asks for many, and measuring against the implementation's own ambition makes any PR look restrained.
 - **Required outcome** — the smallest externally observable behavior that must change.
 - **Invariants that must remain true** — existing safety properties the fix may not weaken.
 - **Explicit non-goals** — adjacent guarantees this PR does not attempt to provide.
 - **Acceptance evidence** — the tests, reproduction, measurement, or canary that proves the required outcome.
 - **Stop condition** — what constitutes enough evidence to merge.
 
-Once implementation begins, automated review may identify defects in satisfying this contract. It may not silently enlarge the contract.
+**Freezing it is not enough. Somebody with authority has to agree to it before expensive review begins.**
+
+> Given the issue's problem statement, are these the guarantees we actually intend to buy?
+
+That is the control, and it is a decision right rather than better agent documentation. #1189 is the proof that the weaker version fails: `af513e9`'s commit header already explained and froze the choice to publish a `failure` conclusion and build a path back to green, in preference to publishing `neutral`. The contract was coherent, written down, and adhered to. It was also unnecessary — #1188 had named the one-word option as the cheapest — and **nobody with authority was asked to agree with it before round one**. Twelve review rounds then argued about how to implement it correctly, which was never the question.
+
+An agent can explain and freeze a coherent but unnecessary contract. Explanation is not ratification, and a contract the author wrote and the author approved is not a control on the author.
+
+Ratification is cheap and belongs before the expensive part: it costs one exchange at PR open, against the twelve rounds #1189 spent defending a guarantee nobody had agreed to buy. Once ratified, automated review may identify defects in satisfying that contract. It may not silently enlarge it, and neither may the author.
 
 ## 2. Classify every review finding before changing code
 
@@ -87,7 +96,7 @@ A known residual failure mode is acceptable when all of these hold:
 2. it is outside the issue's required contract;
 3. its failure direction is understood;
 4. it does not make the original defect worse;
-5. it is documented;
+5. it is documented **with its cost stated in product terms** — what a user or operator experiences if it fires, not what the code does;
 6. it can be tracked separately if worth fixing.
 
 Condition 1 is not optional and is the one that keeps this rule from contradicting rule 2A. A regression *introduced by this patch* satisfies every other condition on the list — understood polarity, does not worsen the original defect, documentable, trackable — and rule 2A requires it to be fixed. Without condition 1 the two rules hand an agent opposite dispositions for the same finding, and the agent gets to pick.
@@ -104,7 +113,7 @@ Do not build serialization, state machines, watermarks, epochs, reconciliation p
 
 That is the whole rule. The question is *what can we delete or defer while still satisfying the original issue?* — never *what additional guard makes this latest finding impossible?*
 
-**Anchor "the original contract" to the issue's problem statement, not to the contract this PR chose.** Rule 1 has you freeze a contract before implementing, and that frozen contract is what review is judged against — but it is not what *this* question is judged against, because the PR's contract is itself the thing that can be too big. Read literally against the PR's own contract, #1189's clearing arm is "necessary" by construction: the PR had decided to build a clearing arm, so every piece of ordering machinery under it was load-bearing. Measured against #1188's problem statement — which listed publishing a non-blocking conclusion as the cheapest option — none of it was. Ask the question against the issue and the answer inverts.
+**Anchor "the original contract" to the issue's problem statement, not to the contract this PR chose.** Rule 1 has you get a contract ratified before implementing, and that contract is what review is judged against — but it is not what *this* question is judged against, because even a ratified contract can drift, and an unratified one is exactly the thing that can be too big. Read literally against the PR's own contract, #1189's clearing arm is "necessary" by construction: the PR had decided to build a clearing arm, so every piece of ordering machinery under it was load-bearing. Measured against #1188's problem statement — which listed publishing a non-blocking conclusion as the cheapest option — none of it was. Ask the question against the issue and the answer inverts.
 
 It is deliberately not a threshold. An earlier draft of this rule carried two: remove the machinery after **two consecutive findings in reviewer-induced code**, and force a scope review after **three substantive rounds without decreasing scope**. Both were dropped by owner decision on 2026-09-06, and the reason matters more than the rules did.
 
