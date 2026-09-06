@@ -91,14 +91,14 @@ knowledge_base:
   # across the whole org/owner), auto (= local for PUBLIC repos, global for
   # PRIVATE repos).
   #
-  # We keep `auto` deliberately, but the resolution is NO LONGER UNIFORM
-  # across the fleet, so do not read `auto` here as meaning `local`.
-  # From 2026-07-06 until 2026-09-01 every consumer was public and `auto`
-  # did resolve to `local` everywhere. As of 2026-09-01
-  # device-source-of-truth is PRIVATE, so `auto` resolves to `global`
-  # there and that one repo's learnings are shared across the
-  # nathanjohnpayne owner boundary; the other seven consumers and this
-  # template repo stay `local`. (.coderabbit.yml is NOT propagated —
+  # We keep `auto` deliberately. From 2026-07-06 until 2026-09-01 every
+  # consumer was public and `auto` resolved to `local` everywhere; from
+  # 2026-09-01 device-source-of-truth was PRIVATE and resolved to
+  # `global`, making the fleet briefly non-uniform. That repo was dropped
+  # as a consumer on 2026-09-05, so all seven remaining consumers and
+  # this template repo are public and resolve to `local` again. Do not
+  # read that as permanent — it is a consequence of current visibility,
+  # not of the `auto` setting. (.coderabbit.yml is NOT propagated —
   # see .mergepath-sync.yml — so each consumer ships its own copy, and
   # each copy resolves by ITS OWN repo's visibility.) Deciding whether a
   # scope override is needed means checking that repo's current
