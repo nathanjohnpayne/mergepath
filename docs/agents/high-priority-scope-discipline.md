@@ -4,6 +4,8 @@ High-priority work optimizes for closing the demonstrated problem, not for satis
 
 **Automated review is a defect detector, not a scope authority.**
 
+**This document is not review policy and does not compete with it.** [REVIEW_POLICY.md](../../REVIEW_POLICY.md) and `.github/review-policy.yml` remain the sole authority for review behavior — identities, workflow, thresholds, tiers, disposition requirements, gates. Nothing here creates a required check, changes what any gate blocks on, or alters what disposition a finding needs; where anything below appears to conflict with the governing policy, **the governing policy wins and this document is the thing that is wrong.** What this document governs is narrower and belongs to the author, not the reviewer: *given* a finding you must already disposition, how do you decide whether the code it is about should exist at all. The checkpoint below is a record the author keeps, not a gate anyone enforces.
+
 These rules are derived from a real failure. #1189 spent **twenty-one commits** and **twelve Codex review rounds** on a fix for #1188, plus three CodeRabbit rounds. Codex inline findings per round, in order, were **4, 1, 3, 1, 1, 6, 1, 2, 1, 2, 1, 3** — twenty-six findings that never trended toward zero. The point is not that the count rose; it is that it never fell. The largest round was the sixth, the final round still produced three findings, and there was no round after which the next one was reliably quieter. Under a fix-every-finding policy that series has no natural end, because roughly half of the later findings were interactions with rules added in the round before — including three regressions introduced in a single round.
 
 Every reviewer was correct every time. The error was converting each correct finding into an obligation instead of asking whether the guarantee being defended was one the issue required. #1189 was eventually closed unmerged and replaced by #1196, a one-word change.
@@ -54,14 +56,14 @@ The finding may be correct, but fixing it would require:
 
 Record it separately. Do not implement it merely because it was discovered during review.
 
-**Deferral is available at discretionary tier only.** REVIEW_POLICY.md § Feedback Disposition Policy is explicit: a disposition is a fix, a rebuttal, or — *for a discretionary-tier finding only* — a deferral reply linking a follow-up issue. **A required-tier (P0/P1) finding must be fixed or rebutted.** The one exception is the summary-only ack path, for findings that have no review thread.
+**Deferral is available at discretionary tier only, and which tiers those are is a configuration question.** Resolve the required set from `feedback_policy` in the governing `.github/review-policy.yml` — it is per-repo, and `mode: address-all` or a per-tier override can make any tier required. Do not assume the default map. REVIEW_POLICY.md § Feedback Disposition Policy is the authority for what a disposition is; this document does not restate it.
 
-So this classification resolves differently by tier:
+What this rule adds is only the consequence for classification B:
 
-- **Discretionary (P2/P3/nitpick).** File the follow-up, post the deferral reply linking it, resolve the thread. This is the ordinary path and needs nobody's permission.
-- **Required (P0/P1).** You may not self-defer. Either the finding is genuinely inapplicable under the frozen contract, in which case **rebut** it and say why — a rebuttal is a substantive disposition, not a dodge — or it is applicable and valid, in which case it is a **scope decision, and rule 3 applies**: stop and obtain an explicit owner decision. Do not route around a valid required-tier finding by filing an issue and calling it handled.
+- **A finding in a discretionary tier** may be deferred to a follow-up. Ordinary path, nobody's permission needed.
+- **A finding in a required tier may not be self-deferred.** Either it is genuinely inapplicable under the frozen contract, in which case **rebut** it and say why — a rebuttal is a substantive disposition, not a dodge — or it is applicable and valid, in which case it is a **scope decision and rule 3 applies**: stop and obtain an explicit owner decision. Do not route around a valid required-tier finding by filing an issue and calling it handled.
 
-That boundary is the whole safeguard. Without it, "valid but adjacent" becomes a way for an agent to unilaterally downgrade any blocking finding it would rather not fix — which is the failure this document exists to prevent, run in the opposite direction.
+That boundary is the whole safeguard. Without it, "valid but adjacent" becomes a way for an agent to unilaterally downgrade any blocking finding it would rather not fix — this document's own failure mode, run in reverse.
 
 ### C. Rebutted
 
@@ -81,11 +83,14 @@ The trigger is the finding's *disposition*, not the vocabulary of the codebase. 
 
 A known residual failure mode is acceptable when all of these hold:
 
-1. it is outside the issue's required contract;
-2. its failure direction is understood;
-3. it does not make the original defect worse;
-4. it is documented;
-5. it can be tracked separately if worth fixing.
+1. **it pre-dates this patch** — it is a pre-existing condition, not something this change introduced;
+2. it is outside the issue's required contract;
+3. its failure direction is understood;
+4. it does not make the original defect worse;
+5. it is documented;
+6. it can be tracked separately if worth fixing.
+
+Condition 1 is not optional and is the one that keeps this rule from contradicting rule 2A. A regression *introduced by this patch* satisfies every other condition on the list — understood polarity, does not worsen the original defect, documentable, trackable — and rule 2A requires it to be fixed. Without condition 1 the two rules hand an agent opposite dispositions for the same finding, and the agent gets to pick.
 
 Do not build serialization, state machines, watermarks, epochs, reconciliation protocols, generalized parsers, or new policy layers merely to eliminate a residual outside the contract.
 
@@ -172,9 +177,9 @@ Merge when the frozen required outcome is satisfied, explicit invariants hold, r
 
 Do not continue reviewing merely because another review might find something. The objective for `priority:high` work is risk reduction per unit time, not exhaustion of the possible finding space.
 
-## Mandatory scope checkpoint
+## The scope checkpoint
 
-For every `priority:high` PR, after each substantive automated-review round, record:
+For every `priority:high` PR, after each substantive automated-review round, the author records — in the PR, where the owner and the other reviewers can see it:
 
 ```
 Contract changed?                            yes / no
