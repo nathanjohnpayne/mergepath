@@ -135,6 +135,9 @@ CONSUMER_ABSENT=(
   # file it does not have, and check_spec_test_alignment would exit 1 on
   # every consumer's repo-lint (#1182).
   "specs/bootstrap_label_seeding.md"
+  # Same class again: the bootstrap source-revision spec (#1056) describes
+  # hub-only provenance machinery no consumer runs.
+  "specs/bootstrap_source_attribution.md"
   "bugs/screenshots"
   ".github/screenshots"
   # #774 fleet branch-protection audit — the two paths NO consumer has.

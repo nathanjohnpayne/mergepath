@@ -170,6 +170,10 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   # consumer looks like, this exclusion is what makes that true.
   'specs/bootstrap_label_seeding.md'
 
+  # Bootstrap source-attribution spec (#1056): same class and same failure
+  # as the entries above.
+  'specs/bootstrap_source_attribution.md'
+
   # Mergepath-internal policy simulation tool
   'scripts/policy-sim.sh'
 
@@ -398,7 +402,7 @@ bootstrap::stage_template_mirror() {
   fi
 
   # Step 5: initialize git history.
-  bootstrap::_init_target_git "$target" || step_rc=$?
+  bootstrap::_init_target_git "$target" "$source_root" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "template-mirror: git-init step failed (rc=$step_rc); aborting stage"
     return "$step_rc"
@@ -1197,13 +1201,87 @@ bootstrap::_yq_clean_repo_template() {
   # consumer does not have. This key is not name-bearing, so it survives
   # substitution as-is.
   yq -i 'del(.spec_test_map.bootstrap_label_seeding)' "$f"
+  # Drop the bootstrap source-attribution spec_test_map entry (#1056), for
+  # the same reason as the lines above.
+  yq -i 'del(.spec_test_map.bootstrap_source_attribution)' "$f"
   # Drop extra_top_level_dirs entirely — the new repo has no
   # mergepath/ or packaging/ dirs.
   yq -i 'del(.extra_top_level_dirs)' "$f"
 }
 
+# bootstrap::_resolve_bootstrap_source_revision <source_root> — prints
+# source_root's HEAD sha, exit 0, when source_root is eligible to name a
+# bootstrap source revision; prints nothing and exits 1 otherwise. Best
+# effort, not proof: this names "which mergepath revision was this
+# bootstrap based on", not a claim that the resulting consumer commit's
+# tree is byte-for-byte derivable from that sha. See
+# specs/bootstrap_source_attribution.md (#1056).
+#
+# Eligibility, all required. A sha this returns is always written to BOTH
+# the commit subject and the Source: trailer -- there is no partial
+# attribution, because a sha that fails any one of these checks is not a
+# recoverable HUB_REF, and #1056's whole point is that it be recoverable.
+#
+#   1. Its origin remote names canonical mergepath exactly (host + path),
+#      not merely as a substring/suffix of some other host. This also
+#      fails closed on source_root not being a git repo at all -- there's
+#      no remote to read.
+#   2. A plain `git status --porcelain --untracked-files=all
+#      --ignore-submodules=none` succeeds and is empty. Both flags are
+#      pinned on the command line (Codex P2 on #1197, twice) because a
+#      bare `git status` silently honors the operator's own
+#      `status.showUntrackedFiles=no` or `diff.ignoreSubmodules=all`,
+#      under which an ordinary untracked file, or a submodule checked out
+#      at a different commit than the superproject's tree records, reads
+#      as clean even though rsync -a would still copy the mismatched
+#      content. This is a conservative gate against a KNOWN mismatch risk
+#      (uncommitted or untracked changes at source_root that HEAD does
+#      not reflect) — not an attempt to reconcile every path the mirror's
+#      own exclude/rsync/resume behavior might separately drop or keep,
+#      nor to pin every other config knob (core.filemode, core.autocrlf,
+#      core.symlinks) that could affect what a mirrored TREE looks like.
+#   3. HEAD is reachable from some ref under source_root's own
+#      refs/remotes/origin/*. A sha that exists only in the operator's
+#      local clone is not reliably recoverable later -- another clone
+#      cannot resolve it, and the original clone may eventually garbage
+#      collect it -- so it is not eligible at all, not merely ineligible
+#      for a link.
+bootstrap::_resolve_bootstrap_source_revision() {
+  local source_root=$1
+  [ -n "$source_root" ] && [ -d "$source_root" ] || return 1
+
+  local origin_url
+  origin_url=$(git -C "$source_root" remote get-url origin 2>/dev/null) || return 1
+  case "$origin_url" in
+    https://github.com/nathanjohnpayne/mergepath | https://github.com/nathanjohnpayne/mergepath.git | \
+    http://github.com/nathanjohnpayne/mergepath | http://github.com/nathanjohnpayne/mergepath.git | \
+    git@github.com:nathanjohnpayne/mergepath | git@github.com:nathanjohnpayne/mergepath.git | \
+    ssh://git@github.com/nathanjohnpayne/mergepath | ssh://git@github.com/nathanjohnpayne/mergepath.git)
+      ;;
+    *) return 1 ;;
+  esac
+
+  local status_output
+  status_output=$(git -C "$source_root" status --porcelain --untracked-files=all --ignore-submodules=none 2>/dev/null) || return 1
+  [ -z "$status_output" ] || return 1
+
+  local sha
+  sha=$(git -C "$source_root" rev-parse HEAD 2>/dev/null) || return 1
+
+  local ref
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    if git -C "$source_root" merge-base --is-ancestor "$sha" "$ref" 2>/dev/null; then
+      echo "$sha"
+      return 0
+    fi
+  done < <(git -C "$source_root" for-each-ref --format='%(refname)' refs/remotes/origin/ 2>/dev/null)
+  return 1
+}
+
 bootstrap::_init_target_git() {
   local target=$1
+  local source_root=${2:-}
 
   if [ -d "$target/.git" ]; then
     bootstrap::log "target already has .git, skipping init"
@@ -1215,6 +1293,29 @@ bootstrap::_init_target_git() {
 
   bootstrap::run "stage initial files" \
     git -C "$target" add -A
+
+  # #1056: name the mergepath revision this bootstrap was based on, so a
+  # bootstrapped repo (which has no sync PR, and therefore none of the
+  # Source:/branch-name provenance scripts/sync-to-downstream.sh writes on
+  # every sync PR) still leaves a recoverable HUB_REF for the drift
+  # measurement in docs/agents/propagation-ordering.md § Measuring tier
+  # membership. Best-effort: an ineligible source_root falls back to the
+  # un-attributed subject rather than blocking the bootstrap over a
+  # diagnostic — see bootstrap::_resolve_bootstrap_source_revision.
+  local source_sha=""
+  source_sha=$(bootstrap::_resolve_bootstrap_source_revision "$source_root") || source_sha=""
+
+  local commit_message
+  if [ -n "$source_sha" ]; then
+    # Eligibility already required upstream reachability, so subject and
+    # trailer are written together, never one without the other -- see
+    # bootstrap::_resolve_bootstrap_source_revision.
+    commit_message="Initial commit (bootstrapped from mergepath@${source_sha:0:7})
+
+Source: https://github.com/nathanjohnpayne/mergepath/commit/${source_sha}"
+  else
+    commit_message="Initial commit (bootstrapped from mergepath)"
+  fi
 
   # Use the operator's git config for the commit identity. Tests
   # can override via BOOTSTRAP_AUTHOR_NAME / BOOTSTRAP_AUTHOR_EMAIL
@@ -1228,12 +1329,12 @@ bootstrap::_init_target_git() {
         -c "user.name=$author_name" \
         -c "user.email=$author_email" \
         -c commit.gpgsign=false \
-        commit -q -m "Initial commit (bootstrapped from mergepath)"
+        commit -q -m "$commit_message"
   else
     bootstrap::run "initial commit" \
       git -C "$target" \
         -c commit.gpgsign=false \
-        commit -q -m "Initial commit (bootstrapped from mergepath)"
+        commit -q -m "$commit_message"
   fi
 }
 
