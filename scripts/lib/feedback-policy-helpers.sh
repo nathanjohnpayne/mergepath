@@ -27,6 +27,8 @@
 #   coderabbit_tiers_of "<comment-body>"   # every graded marker, in order
 #   coderabbit_finding_scan "<body>"       # strip fenced/pre-merge regions
 #   ghas_severity_tier "<security_severity_level>"  # p0..p3 or empty (#1101)
+#   ghas_alert_number_from_body "<comment-body>"     # alert number or empty (#1113)
+#   read_policy_block_field <block> <field> [cfg]    # scalar under an arbitrary top-level block
 #
 # cfg defaults to $CONFIG (the global the gate scripts set) and then to
 # .github/review-policy.yml, matching scripts/lib/reviewers-helpers.sh.
@@ -48,6 +50,29 @@ feedback_policy_field() {
   [ -f "$cfg" ] || return 0
   awk -v field="$field" '
     /^feedback_policy:/ {in_block=1; next}
+    in_block && /^[^[:space:]#]/ {in_block=0}
+    in_block && $1 == field":" {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      print
+      exit
+    }
+  ' "$cfg" | sed -E "s/[[:space:]]+#.*$//; s/^[\"']//; s/[\"'][[:space:]]*$//; s/[[:space:]]+$//"
+}
+
+# Same reader, parameterized on an ARBITRARY top-level block (not only
+# feedback_policy:) -- e.g. `read_policy_block_field code_scanning
+# bot_login` (#1124). Deliberately untrusted / not base-materialized: a
+# caller that needs the same trust guarantees review-feedback-accounting.sh
+# gives its OWN policy reads (governing the PR's exact base SHA, for a
+# merge-safety decision) must resolve $CONFIG itself before sourcing this,
+# same as that script already does. A caller that only needs a best-effort
+# hint (e.g. an additional login to widen a scan, never to narrow one) can
+# use this directly against whatever checkout it has.
+read_policy_block_field() {
+  local block=$1 field=$2 cfg="${3:-${CONFIG:-.github/review-policy.yml}}"
+  [ -f "$cfg" ] || return 0
+  awk -v block="$block" -v field="$field" '
+    $0 == block":" {in_block=1; next}
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
@@ -322,4 +347,16 @@ ghas_severity_tier() {
     low) echo p3 ;;
     *) return 0 ;;
   esac
+}
+
+# Pure regex extraction of the code-scanning alert number a
+# github-advanced-security[bot] comment body links to (the
+# "[Show more details](.../security/code-scanning/<number>)" line every such
+# comment carries), or empty if none is found. No I/O — the caller resolves
+# the number to a severity via scripts/lib/ghas-alert-severity.sh
+# (nathanjohnpayne/mergepath#1113), which needs the network access this file's
+# sourcing contract excludes.
+ghas_alert_number_from_body() {
+  printf '%s' "${1:-}" \
+    | grep -oE '/security/code-scanning/[0-9]+' | head -n1 | grep -oE '[0-9]+$' || true
 }

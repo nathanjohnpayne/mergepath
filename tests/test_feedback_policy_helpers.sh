@@ -27,6 +27,13 @@
 #   ghas_severity_tier (#1101)
 #     15. critical/high/medium/low -> p0/p1/p2/p3; none/empty/unrecognized
 #         -> empty (rc0, caller decides the fallback)
+#   ghas_alert_number_from_body (#1113)
+#     16. extracts alert number from a /security/code-scanning/N link;
+#         first match wins; no link / no digits / empty / missing arg
+#         -> empty (rc0)
+#   read_policy_block_field (#1124)
+#     17. reads a field from an arbitrary top-level block (not only
+#         feedback_policy:); absent field/block/file -> empty
 #
 # Bash 3.2 portable.
 
@@ -286,6 +293,48 @@ eq ""   "$(ghas_severity_tier warning)"  "ghas_severity_tier: unrecognized value
 
 rc=0; out=$(ghas_severity_tier bogus) || rc=$?
 if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "ghas_severity_tier: unrecognized is rc0+empty under set -e"; else fail "ghas_severity_tier: unrecognized rc=$rc out=[$out]"; fi
+
+# --- ghas_alert_number_from_body (#1113) ------------------------------------
+eq "25" "$(ghas_alert_number_from_body 'See [Show more details](https://github.com/acme/widget/security/code-scanning/25)')" \
+  "ghas_alert_number_from_body: extracts the number from a real CodeQL comment link"
+eq "25" "$(ghas_alert_number_from_body 'text before /security/code-scanning/25 text after')" \
+  "ghas_alert_number_from_body: matches without requiring markdown link syntax"
+eq "7" "$(ghas_alert_number_from_body 'https://github.com/owner/repo-name/security/code-scanning/7')" \
+  "ghas_alert_number_from_body: works with hyphenated owner/repo names"
+eq "3" "$(ghas_alert_number_from_body 'first /security/code-scanning/3 then /security/code-scanning/9')" \
+  "ghas_alert_number_from_body: takes the FIRST match when a body links multiple alerts"
+eq "" "$(ghas_alert_number_from_body 'no alert link here at all')" \
+  "ghas_alert_number_from_body: no link -> empty"
+eq "" "$(ghas_alert_number_from_body '')" \
+  "ghas_alert_number_from_body: empty body -> empty"
+eq "" "$(ghas_alert_number_from_body)" \
+  "ghas_alert_number_from_body: missing arg -> empty (does not abort under set -u)"
+eq "" "$(ghas_alert_number_from_body '/security/code-scanning/ (no digits)')" \
+  "ghas_alert_number_from_body: path with no trailing digits -> empty"
+
+rc=0; out=$(ghas_alert_number_from_body 'no link here') || rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "ghas_alert_number_from_body: no match is rc0+empty under set -e"; else fail "ghas_alert_number_from_body: no-match rc=$rc out=[$out]"; fi
+
+# --- read_policy_block_field (#1124) ----------------------------------------
+CFG_BLOCK="$WORKDIR/code-scanning-block.yml"
+cat > "$CFG_BLOCK" <<'YAML'
+external_review_threshold: 300
+code_scanning:
+  enabled: true
+  bot_login: "custom-ghas-bot[bot]"   # inline comment + quotes to strip
+feedback_policy:
+  mode: by-priority
+YAML
+eq "custom-ghas-bot[bot]" "$(read_policy_block_field code_scanning bot_login "$CFG_BLOCK")" \
+  "read_policy_block_field: reads a field from an arbitrary top-level block, not only feedback_policy:"
+eq "true" "$(read_policy_block_field code_scanning enabled "$CFG_BLOCK")" \
+  "read_policy_block_field: reads a second field from the same block"
+eq "" "$(read_policy_block_field code_scanning missing_field "$CFG_BLOCK")" \
+  "read_policy_block_field: absent field in a present block -> empty"
+eq "" "$(read_policy_block_field nonexistent_block bot_login "$CFG_BLOCK")" \
+  "read_policy_block_field: absent block -> empty"
+eq "" "$(read_policy_block_field code_scanning bot_login "$WORKDIR/does-not-exist.yml")" \
+  "read_policy_block_field: missing config file -> empty (not an error)"
 
 # ---------------------------------------------------------------------------
 echo

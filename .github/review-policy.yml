@@ -672,22 +672,55 @@ codex:
 #
 # The comment body carries no severity — only a link to the alert
 # (`.../security/code-scanning/<number>`). Accounting resolves severity by
-# reading `repos/{owner}/{repo}/code-scanning/alerts?ref=refs/pull/{pr}/head`
-# (fetched lazily, only when a `github-advanced-security[bot]` inline comment
-# is present, so a repo without code scanning enabled never pays this API
-# call — and `ref` is required: the unscoped list silently omits an alert
-# that exists only on the PR branch, confirmed live on
-# nathanjohnpayne/nathanpaynedotcom#809) and mapping
-# the alert's `rule.security_severity_level` onto the SAME p0–p3 ladder
-# Codex/CodeRabbit use:
+# reading `repos/{owner}/{repo}/code-scanning/alerts/{number}` — the alert's
+# permanent identity, not a ref-scoped list (`scripts/lib/ghas-alert-severity.sh`,
+# #1113; fetched lazily, only when a `github-advanced-security[bot]` inline
+# comment is present, so a repo without code scanning enabled never pays
+# this API call). Memoized per (repo, alert number) via a FILE named by
+# `GHAS_SEVERITY_CACHE` — not a plain shell variable, which a value read
+# back through `severity=$(ghas_alert_severity ...)` would silently lose
+# to that command substitution's subshell — created and removed once per
+# caller invocation (`ghas_severity_cache_init` / `_cleanup`). Mapping the
+# alert's `rule.security_severity_level`
+# onto the SAME p0–p3 ladder Codex/CodeRabbit use:
 #
 #   critical -> p0   high -> p1   medium -> p2   low -> p3
+#
+# Resolving by alert NUMBER rather than the `?ref=refs/pull/{pr}/head`-scoped
+# list #1101 originally used (confirmed live on
+# nathanjohnpayne/nathanpaynedotcom#809, where the unscoped list silently
+# omitted an alert that existed only on the PR branch) closes a SECOND gap
+# #1101 traded into: a finding raised on an earlier, since-superseded head
+# could not resolve its severity either, since the list is scoped to
+# whichever head is queried. The single-alert endpoint works for any head
+# that ever raised the finding, live evaluation, archive-time resolution
+# (below), and the surface fingerprint alike (#1113).
 #
 # An alert whose severity can't be resolved (no severity assigned to the
 # rule, e.g. a non-security CodeQL quality query, or the alert number
 # couldn't be parsed from the comment) maps to p2 — accountable, but not
 # merge-blocking by the default `feedback_policy` below — rather than being
 # dropped untracked, which is the exact defect this block exists to close.
+# A FAILED read (network/auth/rate-limit) is different from an unresolvable
+# severity: live evaluation fails the gate loudly rather than guessing p2, so
+# a systemic security-events permission gap surfaces instead of hiding.
+#
+# GHAS findings are covered by the append-only archive mechanism the same
+# way Codex/CodeRabbit findings are (#1113): an edited or deleted GHAS
+# comment is snapshotted by `codex-p1-gate.yml`'s archive job, which
+# resolves the alert's severity before the comment can disappear and hands
+# it to `scripts/render-feedback-archive.sh` as an explicit tier, so the
+# finding stays in accounting's inventory instead of silently vanishing.
+# Archive-time resolution deliberately does NOT share live evaluation's
+# fail-loudly posture: a failed read there WARNS and falls back to `p2`
+# rather than failing the archive job, because archival is a one-shot
+# capture of a disappearing comment with no scheduled retry — losing the
+# only surviving record entirely would be worse than archiving it under a
+# possibly-too-low tier with a visible warning.
+# `scripts/review-feedback-surface-fingerprint.sh`'s before/after
+# consistency hash also includes every referenced alert's current severity,
+# so a same-window severity change or newly-resolvable alert is detected
+# rather than hashing identically to a run before the change.
 #
 # `feedback_policy.priorities` (above) governs blocking exactly as it does
 # for Codex/CodeRabbit: the default P0/P1-required, P2/P3-discretionary

@@ -238,10 +238,107 @@ jobs:
             else
               jq -j '.comment.body // ""' "$GITHUB_EVENT_PATH" >"$previous_file"
             fi
+
+            # #1113: a github-advanced-security[bot] body carries no severity
+            # marker render-feedback-archive.sh's text-only classifiers can
+            # find -- only a link to the alert. That script stays pure (no
+            # network calls, per its documented sourcing contract), so THIS
+            # step resolves the tier and hands it in as a 6th argument,
+            # matching how it already hands in the previous body. Matched by
+            # BODY PATTERN, not by comparing source_login against a
+            # configured bot login: render-feedback-archive.sh's own
+            # codex_tiers_of/coderabbit_tiers_of already classify purely by
+            # body content regardless of author, and this keeps the archive
+            # step free of a review-policy.yml dependency.
+            #
+            # Sources the SAME functions review-feedback-accounting.sh and
+            # the surface fingerprint use for this, rather than a third
+            # independent copy of the alert-number regex and severity-tier
+            # mapping.
+            #
+            # Best-effort on a failed read: WARN and fall back to p2 rather
+            # than failing the whole archival. Unlike live accounting (which
+            # re-evaluates every round and should fail loudly on a systemic
+            # permissions gap), this is a one-shot capture of a
+            # disappearing comment -- if the alert read fails here, there is
+            # no scheduled retry, and losing the archive record entirely
+            # would be worse than archiving it under a possibly-too-low
+            # tier with a visible warning.
+            ghas_tier=""
+            # shellcheck source=scripts/lib/feedback-policy-helpers.sh
+            . scripts/lib/feedback-policy-helpers.sh
+            # shellcheck source=scripts/lib/gh-api-scalar.sh
+            . scripts/lib/gh-api-scalar.sh
+            # shellcheck source=scripts/lib/ghas-alert-severity.sh
+            . scripts/lib/ghas-alert-severity.sh
+            # This job runs on a trusted default-branch checkout, so a
+            # local read_policy_block_field read here carries the same
+            # trust this job already places in every other file it reads
+            # from that checkout -- unlike the surface fingerprint's
+            # non-materialized read, which can run from any ref. Falls
+            # back to the well-known default both when unconfigured and
+            # when the read itself fails, so a config problem never
+            # silently drops the common case.
+            ghas_configured_bot_login=$(read_policy_block_field code_scanning bot_login 2>/dev/null || true)
+            ghas_bot_login="${ghas_configured_bot_login:-github-advanced-security[bot]}"
+
+            alert_number=$(ghas_alert_number_from_body "$(cat "$previous_file")")
+            if [ -n "$alert_number" ]; then
+              # A failed cache_init (disk/permissions) leaves
+              # GHAS_SEVERITY_CACHE unset, which ghas_alert_severity below
+              # already treats as an rc-3 read failure -- same WARN+p2
+              # fallback as a failed live fetch, so no separate handling
+              # is needed here.
+              ghas_severity_cache_init || true
+              trap 'ghas_severity_cache_cleanup; rm -f "$previous_file" "$archive_records_file" "$payload_file"' EXIT
+              ghas_severity=""
+              if ghas_severity=$(ghas_alert_severity "$REPO" "$alert_number"); then
+                # Read succeeded: the rule genuinely carries no assigned
+                # severity (e.g. a non-security CodeQL quality query).
+                # p2 is the correct classification here, same as live.
+                ghas_tier=$(ghas_severity_tier "$ghas_severity")
+                ghas_tier="${ghas_tier:-p2}"
+              else
+                # Codex review, PR #1124: a FAILED read (network/rate-limit
+                # -- distinct from the branch above, where the read
+                # succeeded and simply found no severity) must NOT default
+                # to p2. A repo with feedback_policy.priorities.p2: ignore
+                # would then have strongest_nonignored_archive_tier drop
+                # the archived record from inventory entirely -- an
+                # originally p0/p1 finding vanishing not because anyone
+                # reviewed it, but because of a transient infrastructure
+                # failure at the exact moment its comment was archived.
+                # Live evaluation avoids this because a failed read there
+                # hard-fails the gate (exit 2) rather than ever reaching a
+                # tier classification an ignore policy could act on.
+                # Archival can't hard-fail (there is no scheduled retry,
+                # and the record would be lost forever), so it defaults to
+                # p1 instead -- required under this repo's own default
+                # feedback_policy split (P0/P1-required), erring toward
+                # over-inclusion for a genuinely unresolved severity
+                # rather than risking silent exclusion.
+                echo "::warning::could not resolve code-scanning alert #$alert_number severity for archival ($source_kind $source_id); archiving at p1 (unresolved, not p2, so a p2:ignore policy cannot silently drop it)."
+                ghas_tier=p1
+              fi
+            elif [ "$source_login" = "$ghas_bot_login" ]; then
+              # Codex review, PR #1124 (two rounds): live accounting's
+              # ghas_finding_tier ALSO falls back to p2 when no alert link
+              # can be parsed from a GHAS-authored body -- unlike a
+              # Codex/CodeRabbit body with no classifiable marker at all
+              # (which was never a "finding" even while live), a linkless
+              # GHAS comment IS still tracked as a p2 finding today.
+              # Without this branch, archiving such a comment would
+              # silently drop it below the "markerless has nothing to
+              # preserve" check further down, reopening the exact
+              # vanish-on-edit gap #1113 exists to close, just for this
+              # narrower shape.
+              ghas_tier=p2
+            fi
+
             # The renderer emits one v1 record or a complete set of chunked v2
             # records when the full prior body cannot fit in one comment.
             scripts/render-feedback-archive.sh \
-              "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file" \
+              "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file" "$ghas_tier" \
               >"$archive_records_file"
           fi
 

@@ -373,6 +373,17 @@ paths:
   - path: scripts/lib/gh-api-array.sh
     type: canonical
     consumers: all
+  # Resolves ONE code-scanning alert's severity by its permanent number, not
+  # a ref-scoped list (#1113 — nathanjohnpayne/mergepath#1113 closed the same
+  # #1101 defect class for GHAS findings that #831/#1008 closed for Codex/
+  # CodeRabbit reads). Memoized via a FILE named by GHAS_SEVERITY_CACHE — not
+  # a plain shell variable, which every caller's own
+  # `severity=$(ghas_alert_severity ...)` command substitution would silently
+  # lose to that subshell. HARD-sourced by every consumer below: declared in
+  # each of their requires: so the lib can never ship behind its callers.
+  - path: scripts/lib/ghas-alert-severity.sh
+    type: canonical
+    consumers: all
   # The Phase 2.5 invocation decision (#1084). Reads coderabbit.invoke and,
   # for `complex-changes`, defers to scripts/phase-4b-classifier.sh rather
   # than inventing a second notion of "complex" that would drift from the
@@ -475,6 +486,8 @@ paths:
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/lib/gh-api-scalar.sh"   # #1113, hard-sourced by ghas-alert-severity.sh's fetch
+      - "scripts/lib/ghas-alert-severity.sh"   # #1113, GHAS severity by alert number
       - "scripts/workflow/resolve_base_policy.sh"   # #1000, governing base-branch policy
   - path: scripts/render-feedback-archive.sh
     type: canonical
@@ -487,6 +500,9 @@ paths:
     requires:
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1000, generation fence over all accounting surfaces
+      - "scripts/lib/feedback-policy-helpers.sh"   # #1113, alert-number extraction from comment bodies
+      - "scripts/lib/gh-api-scalar.sh"   # #1113, hard-sourced by ghas-alert-severity.sh's fetch
+      - "scripts/lib/ghas-alert-severity.sh"   # #1113, GHAS severity by alert number
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
@@ -1553,6 +1569,13 @@ paths:
       - "scripts/codex-p1-gate.sh"
       - "scripts/render-feedback-archive.sh"   # #1000, persist edited/deleted PR-level, inline, and review-body findings
       - "scripts/review-feedback-surface-fingerprint.sh"   # #1000, reject stale publications
+      # The archive-edited-feedback job resolves a disappearing GHAS
+      # comment's severity inline (not via a script), so these three are
+      # sourced directly by the workflow's own shell steps, not only
+      # transitively through render-feedback-archive.sh's requires above.
+      - "scripts/lib/feedback-policy-helpers.sh"   # #1113, ghas_alert_number_from_body / ghas_severity_tier
+      - "scripts/lib/gh-api-scalar.sh"   # #1113, hard-sourced by ghas-alert-severity.sh's fetch
+      - "scripts/lib/ghas-alert-severity.sh"   # #1113, GHAS severity by alert number
   - path: .github/workflows/codex-feedback-archive-relay.yml
     type: canonical
     consumers: all

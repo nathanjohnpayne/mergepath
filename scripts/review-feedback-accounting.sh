@@ -33,6 +33,26 @@ fi
 # shellcheck source=lib/gh-api-array.sh
 . "$SCRIPT_DIR/lib/gh-api-array.sh"
 
+if [ ! -r "$SCRIPT_DIR/lib/gh-api-scalar.sh" ]; then
+  echo "[review-feedback-accounting] ERROR: missing gh-api-scalar.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-api-scalar.sh
+. "$SCRIPT_DIR/lib/gh-api-scalar.sh"
+
+if [ ! -r "$SCRIPT_DIR/lib/ghas-alert-severity.sh" ]; then
+  echo "[review-feedback-accounting] ERROR: missing ghas-alert-severity.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/ghas-alert-severity.sh
+. "$SCRIPT_DIR/lib/ghas-alert-severity.sh"
+ghas_severity_cache_init || exit 2
+# Registered immediately (not after later setup) so a validation failure
+# between here and the fuller trap below still cleans up the cache file;
+# $RESOLVED_CONFIG is read at EXIT time, not now, so it is safe to
+# reference before that variable is ever assigned a real path.
+trap 'ghas_severity_cache_cleanup; if [ -n "$RESOLVED_CONFIG" ]; then rm -f "$RESOLVED_CONFIG"; fi' EXIT
+
 die() {
   local code="$1"
   shift
@@ -79,8 +99,6 @@ if [ -z "$CONFIG" ]; then
     RESOLVED_CONFIG="$CONFIG"
   fi
 fi
-
-trap 'if [ -n "$RESOLVED_CONFIG" ]; then rm -f "$RESOLVED_CONFIG"; fi' EXIT
 
 validate_governing_policy() {
   local parsed=""
@@ -201,31 +219,6 @@ INLINE_COMMENTS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inlin
 REVIEWS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects")
 ISSUE_COMMENTS=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments")
 
-# code-scanning/alerts (#1101) carries the severity a GHAS inline comment
-# body never does — the comment only links to the alert. Fetched lazily,
-# ONLY when a github-advanced-security[bot] inline comment is actually
-# present, so a repo with code scanning never enabled (the common case
-# fleet-wide) never pays this extra API call or risks a permissions
-# failure on an endpoint it has no reason to use.
-#
-# MUST pass ref=refs/pull/{pr}/head: without it, the list endpoint does
-# NOT reliably include an alert that exists only on the PR branch (an
-# alert not yet merged to the default branch) — confirmed live against
-# nathanjohnpayne/nathanpaynedotcom#809, where the unscoped list omitted a
-# `high`-severity alert #26 found only on the PR ref (it returned only
-# alert numbers up to #18, all default-branch history) while
-# `?ref=refs/pull/809/head` correctly returned both PR-scoped alerts #25
-# and #26. Losing that scope would have silently reintroduced this
-# change's own bug: an unresolvable severity falls back to p2 rather than
-# erroring, so the failure mode is quiet — every PR-branch-only alert
-# under-tiers to p2 instead of its real severity, not a loud API error.
-GHAS_ALERTS='[]'
-if printf '%s' "$INLINE_COMMENTS" \
-    | jq -e --arg login "$GHAS_BOT" 'any(.[]; (.user.login // "") == $login)' \
-    >/dev/null 2>&1; then
-  GHAS_ALERTS=$(fetch_api_array "repos/$REPO/code-scanning/alerts?ref=refs/pull/$PR_NUMBER/head" "code scanning alerts")
-fi
-
 # A source run blocks only when EVERY terminal marker it carries says failed.
 # Recency cannot decide this: restoring an edited or deleted marker reposts the
 # exact prior body under a new comment id and created_at, so the restored copy
@@ -270,26 +263,38 @@ tier_rank() {
 }
 
 # ghas_finding_tier <body> — resolve a github-advanced-security[bot] inline
-# comment to a tier (#1101). The body's only structured signal is a link to
-# the alert (".../security/code-scanning/<number>"); the severity itself
-# lives on GHAS_ALERTS (fetched above), keyed by alert number.
+# comment to a tier (#1101, redesigned #1113). The body's only structured
+# signal is a link to the alert (".../security/code-scanning/<number>");
+# ghas_alert_severity resolves that number's CURRENT severity by a direct
+# per-alert GET, not a ref-scoped list, so this works identically for a
+# finding raised on any past head, not only the current one (#1113 item 3).
 #
 # Falls back to p2 — accountable, but not required under the default
-# feedback_policy — whenever severity can't be resolved (no alert-number
-# link found in the body, the alert isn't in GHAS_ALERTS, or the rule
-# carries no security_severity_level, e.g. a non-security CodeQL quality
-# query). p2 keeps the finding tracked rather than silently dropped, which
-# is the defect this whole change exists to close, without unilaterally
-# making an unclassifiable finding merge-blocking.
+# feedback_policy — when no alert-number link can be parsed from the body,
+# or the alert was read successfully but its rule carries no
+# security_severity_level (e.g. a non-security CodeQL quality query). p2
+# keeps the finding tracked rather than silently dropped, which is the
+# defect this whole change exists to close, without unilaterally making an
+# unclassifiable finding merge-blocking.
+#
+# A FAILED read (network/auth/rate-limit — ghas_alert_severity rc=3) is
+# NOT folded into that same p2 fallback: it propagates as a hard failure
+# (return 2), matching every other fetch in this script. A systemic
+# security-events permission gap must surface loudly, not disappear as a
+# confident-looking p2 — exactly the class of bug Codex found in #1101's
+# first version (PR #1106).
 ghas_finding_tier() {
-  local body="$1" alert_number severity tier
-  alert_number=$(printf '%s' "$body" \
-    | grep -oE '/security/code-scanning/[0-9]+' | head -n1 | grep -oE '[0-9]+$') || true
-  if [ -n "$alert_number" ]; then
-    severity=$(printf '%s' "$GHAS_ALERTS" | jq -r --argjson num "$alert_number" \
-      'first(.[] | select(.number == $num) | .rule.security_severity_level // empty) // empty')
-  else
-    severity=""
+  local body="$1" alert_number severity tier rc
+  alert_number=$(ghas_alert_number_from_body "$body")
+  if [ -z "$alert_number" ]; then
+    printf '%s' p2
+    return 0
+  fi
+  rc=0
+  severity=$(ghas_alert_severity "$REPO" "$alert_number") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "[review-feedback-accounting] ERROR: could not read code-scanning alert #$alert_number for $REPO" >&2
+    return 2
   fi
   tier=$(ghas_severity_tier "$severity")
   printf '%s' "${tier:-p2}"
@@ -501,6 +506,8 @@ validate_archive_payload() {
       and all(.[]; . == "p0" or . == "p1" or . == "p2" or . == "p3"))
     and (.coderabbit_tiers | type == "array"
       and all(.[]; . == "p0" or . == "p1" or . == "p2" or . == "p3" or . == "nitpick"))
+    and ((.ghas_tiers // []) | type == "array"
+      and all(.[]; . == "p0" or . == "p1" or . == "p2" or . == "p3"))
   ' >/dev/null 2>&1
 }
 
@@ -639,7 +646,7 @@ append_archive_candidate() {
       ;;
     inline)
       case "$source_login" in
-        "$CODEX_BOT"|"$CODERABBIT_BOT") ;;
+        "$CODEX_BOT"|"$CODERABBIT_BOT"|"$GHAS_BOT") ;;
         *) registered_reviewer_login "$source_login" || return 0 ;;
       esac
       source_comments="$INLINE_COMMENTS"
@@ -666,6 +673,10 @@ append_archive_candidate() {
 
   if [ "$source_login" = "$CODERABBIT_BOT" ]; then
     archive_tiers=$(printf '%s' "$payload" | jq -c '.coderabbit_tiers')
+  elif [ "$source_login" = "$GHAS_BOT" ]; then
+    # Absent on any record archived before #1113 added this field —
+    # optional in validate_archive_payload for exactly that reason.
+    archive_tiers=$(printf '%s' "$payload" | jq -c '.ghas_tiers // []')
   else
     archive_tiers=$(printf '%s' "$payload" | jq -c '.codex_tiers')
   fi
