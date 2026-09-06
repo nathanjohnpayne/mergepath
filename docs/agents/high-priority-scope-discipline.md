@@ -4,9 +4,9 @@ High-priority work optimizes for closing the demonstrated problem, not for satis
 
 **Automated review is a defect detector, not a scope authority.**
 
-**This document explains; it does not mandate.** [REVIEW_POLICY.md](../../REVIEW_POLICY.md) and `.github/review-policy.yml` remain the sole authority for review behavior — identities, workflow, thresholds, tiers, disposition requirements, gates. Nothing here creates a required check, changes what a gate blocks on, or alters what disposition a finding needs, and where this file disagrees with the governing policy or with an enforcement control point, they win and this file is out of date. These rules are owner decision rights and author reporting obligations rather than review mechanics, and they are enforced at the control points that own them: contract ratification at PR open (#1202), mechanism lineage and the escalation menu during implementation (#1201), and reviewer-facing obligations at the review-request machinery (#1199).
+**This document explains; it does not mandate.** [REVIEW_POLICY.md](../../REVIEW_POLICY.md) and `.github/review-policy.yml` remain the sole authority for review behavior — identities, workflow, thresholds, tiers, disposition requirements, gates. Nothing here creates a required check, changes what a gate blocks on, or alters what disposition a finding needs, and where this file disagrees with the governing policy or with an enforcement control point, they win and this file is out of date. These rules are owner decision rights and author reporting obligations rather than review mechanics, and the control points intended to carry them are tracked, not built: contract ratification at PR open (#1202), mechanism lineage and the escalation menu during implementation (#1201), and reviewer-facing obligations at the review-request machinery (#1199). None of those exists yet; until one does, these rules bind nothing on their own.
 
-The rules come from #1189, which spent twenty-one commits and twelve review rounds implementing a contract nobody had agreed to buy, was closed unmerged, and was replaced by #1196 — a one-word change. Every reviewer was correct every time. The error was converting each correct finding into an obligation instead of asking whether the guarantee being defended was one the issue required.
+The rules come from #1189, which spent twenty-one commits and twelve Codex review rounds implementing a contract nobody had agreed to buy, was closed unmerged, and was replaced by #1196 — a one-word change. Every reviewer was correct every time. The error was converting each correct finding into an obligation instead of asking whether the guarantee being defended was one the issue required.
 
 ## 1. Get the contract ratified, not merely frozen
 
@@ -42,7 +42,7 @@ Fix when the finding demonstrates that the current patch:
 
 The burden is on the finding to connect itself to the ratified contract.
 
-### B. Valid but adjacent — file or fold into follow-up
+### B. Valid but adjacent — file, fold into follow-up, or accept as a residual
 
 The finding may be correct, but fixing it would require:
 
@@ -53,7 +53,7 @@ The finding may be correct, but fixing it would require:
 - hardening against a pre-existing condition not made worse by this PR; or
 - materially new acceptance criteria.
 
-Record it separately. Do not implement it merely because it was discovered during review.
+Record it separately. Do not implement it merely because it was discovered during review. Accepting it as a known residual is also this disposition, and requires rule 4's conditions to hold.
 
 **Which findings may be deferred is a policy question** — answered by `feedback_policy` in the governing `.github/review-policy.yml` and by REVIEW_POLICY.md § Feedback Disposition Policy, not restated here. What this rule adds is the consequence: where deferral is not permitted, a valid finding you do not intend to fix is a **scope decision**, and rule 3 applies. Rebut it as inapplicable, or obtain an owner decision. Do not route around it by filing an issue and calling it handled — otherwise "valid but adjacent" becomes a way to unilaterally downgrade any blocking finding, which is this document's own failure mode run in reverse.
 
@@ -88,7 +88,7 @@ Do not build serialization, state machines, watermarks, epochs, reconciliation p
 
 The question is *what can we delete or defer while still satisfying the original issue?* — never *what additional guard makes this latest finding impossible?*
 
-**Anchor "the original contract" to the issue's problem statement, not to the contract this PR chose.** Read against the PR's own contract, #1189's clearing arm is necessary by construction: the PR had decided to build one, so every piece of ordering machinery beneath it was load-bearing. Measured against #1188, which named a one-word option as the cheapest, none of it was.
+**Anchor "the original contract" to the issue's problem statement, not to the contract this PR chose.** If read against the PR's own contract, #1189's clearing arm is necessary by construction: the PR had decided to build one, so every piece of ordering machinery beneath it was load-bearing. Measured against #1188, which named a one-word option as the cheapest, none of it was.
 
 The rule deliberately carries no threshold. Earlier drafts triggered on two consecutive findings in reviewer-induced code, or on three rounds without scope contraction; both were dropped because a count can be satisfied without anyone thinking. The question needs someone to look at the machinery and say whether the issue asked for it — this is where product judgment has to re-enter the loop, and it should not be automated into something that feels answered without anyone having thought.
 
