@@ -293,6 +293,18 @@ if [ "$MODE" = "retract-only" ]; then
     protection_snapshot="$initial"
   elif [ "$(policy_snapshot_signature "$protection_snapshot")" != "$(policy_snapshot_signature "$initial")" ]; then
     echo "approval continuation: PR head/base/author changed during policy classification; treating the latest armed state as unclassified"
+    # The protective pass is about to act on THIS snapshot, which is no longer
+    # the head the verdict was opened against. Withhold the evaluated head
+    # rather than reporting one that was not acted on: an A→B→A reset would
+    # otherwise let a clear touch head A on the strength of a pass that
+    # actually examined B -- a clear of a head this invocation never evaluated,
+    # which is the one thing the reduced contract must never permit.
+    #
+    # Withholding, not correcting. Emitting the snapshot head instead would be
+    # a second guess at a value that can drift again before exit; an empty
+    # marker makes the PR ineligible for clearing, so the worst case is a stale
+    # red that a later evaluation clears.
+    EVALUATED_HEAD=""
   fi
 
   if jq -e '.autoMergeRequest == null' >/dev/null 2>&1 <<<"$protection_snapshot"; then

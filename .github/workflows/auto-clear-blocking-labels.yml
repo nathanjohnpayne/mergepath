@@ -510,6 +510,7 @@ jobs:
             # permanently red head.
             continuation_stage=protective
             eval_head=""
+            capture_rc=0
             protective_out="$(mktemp)"
             continuation_out=""
             set +e
@@ -518,7 +519,15 @@ jobs:
             # $? the tee status, so the helper's own status comes from PIPESTATUS.
             GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
               --retract-unsafe-only "$PR" "$REPO" 2>&1 | tee "$protective_out"
-            protective_rc=${PIPESTATUS[0]}
+            # Capture BOTH sides at once -- PIPESTATUS is rebuilt by the next
+            # command, so reading it twice reads the wrong pipeline. A tee that
+            # cannot write (a full runner filesystem, say) truncates or loses
+            # the evaluated-head marker while the helper itself reports 0 or 4;
+            # the PR would then drop silently out of both lists and the step
+            # would exit green over a stale diagnostic.
+            pipe_status=("${PIPESTATUS[@]}")
+            protective_rc=${pipe_status[0]}
+            capture_rc=${pipe_status[1]:-0}
             if [ "$protective_rc" -eq 0 ] && [ -z "${AUTHOR_TOKEN:-}" ]; then
               echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but author-token continuation remains disabled."
               rc=0
@@ -527,7 +536,11 @@ jobs:
               GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
                 MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
                 bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO" 2>&1 | tee "$continuation_out"
-              rc=${PIPESTATUS[0]}
+              pipe_status=("${PIPESTATUS[@]}")
+              rc=${pipe_status[0]}
+              if [ "${pipe_status[1]:-0}" -ne 0 ]; then
+                capture_rc=${pipe_status[1]}
+              fi
               continuation_stage=full
             else
               rc=$protective_rc
@@ -549,6 +562,14 @@ jobs:
               echo "::notice::PR #$PR produced no evaluated-head marker; it is not eligible for diagnostic clearing on this pass."
             fi
             rm -f "$protective_out" ${continuation_out:+"$continuation_out"}
+            # A failed capture means the verdict cannot be trusted even when the
+            # helper itself succeeded, so it routes through the
+            # infrastructure-error path rather than the helper status standing
+            # alone.
+            if [ "${capture_rc:-0}" -ne 0 ]; then
+              echo "::error::Failed to capture approval-continuation output for PR #$PR (rc=$capture_rc); its verdict cannot be trusted."
+              rc=3
+            fi
             case "$rc" in
               0)
                 if [ -n "$eval_head" ]; then
@@ -1023,6 +1044,7 @@ jobs:
             # permanently red head.
             continuation_stage=protective
             eval_head=""
+            capture_rc=0
             protective_out="$(mktemp)"
             continuation_out=""
             set +e
@@ -1031,7 +1053,15 @@ jobs:
             # $? the tee status, so the helper's own status comes from PIPESTATUS.
             GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
               --retract-unsafe-only "$PR" "$REPO" 2>&1 | tee "$protective_out"
-            protective_rc=${PIPESTATUS[0]}
+            # Capture BOTH sides at once -- PIPESTATUS is rebuilt by the next
+            # command, so reading it twice reads the wrong pipeline. A tee that
+            # cannot write (a full runner filesystem, say) truncates or loses
+            # the evaluated-head marker while the helper itself reports 0 or 4;
+            # the PR would then drop silently out of both lists and the step
+            # would exit green over a stale diagnostic.
+            pipe_status=("${PIPESTATUS[@]}")
+            protective_rc=${pipe_status[0]}
+            capture_rc=${pipe_status[1]:-0}
             if [ "$protective_rc" -eq 0 ] && [ -z "${AUTHOR_TOKEN:-}" ]; then
               echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but scheduled author-token continuation remains disabled."
               rc=0
@@ -1040,7 +1070,11 @@ jobs:
               GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
                 MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
                 bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO" 2>&1 | tee "$continuation_out"
-              rc=${PIPESTATUS[0]}
+              pipe_status=("${PIPESTATUS[@]}")
+              rc=${pipe_status[0]}
+              if [ "${pipe_status[1]:-0}" -ne 0 ]; then
+                capture_rc=${pipe_status[1]}
+              fi
               continuation_stage=full
             else
               rc=$protective_rc
@@ -1062,6 +1096,14 @@ jobs:
               echo "::notice::PR #$PR produced no evaluated-head marker; it is not eligible for diagnostic clearing on this pass."
             fi
             rm -f "$protective_out" ${continuation_out:+"$continuation_out"}
+            # A failed capture means the verdict cannot be trusted even when the
+            # helper itself succeeded, so it routes through the
+            # infrastructure-error path rather than the helper status standing
+            # alone.
+            if [ "${capture_rc:-0}" -ne 0 ]; then
+              echo "::error::Failed to capture approval-continuation output for PR #$PR (rc=$capture_rc); its verdict cannot be trusted."
+              rc=3
+            fi
             case "$rc" in
               0)
                 if [ -n "$eval_head" ]; then

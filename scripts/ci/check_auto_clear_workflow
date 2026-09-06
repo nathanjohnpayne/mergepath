@@ -892,6 +892,35 @@ run_clear_case "diagnostic published one second before the start is cleared" yes
 # whether a record predates the invocation looking at it, which each
 # invocation can answer alone.
 
+# A capture failure invalidates the verdict even when the helper succeeded: a
+# tee that cannot write loses or truncates the evaluated-head marker, and the PR
+# would then drop out of both lists while the step exits green over a stale
+# diagnostic. Both sides of the pipeline must be read, and read ONCE --
+# PIPESTATUS is rebuilt by the next command.
+if [ "$(grep -cF 'pipe_status=("${PIPESTATUS[@]}")' "$WORKFLOW")" -eq 4 ] \
+   && [ "$(grep -cF 'capture_rc=${pipe_status[1]:-0}' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF 'its verdict cannot be trusted' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cE 'rc=\$\{PIPESTATUS\[0\]\}' "$WORKFLOW")" -eq 0 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: a failed output capture invalidates the verdict in both loops"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: both pipelines must read PIPESTATUS once and route a capture failure to the infra path" >&2
+fi
+
+# The helper must WITHHOLD its evaluated head when the protective pass acts on a
+# snapshot other than the one the verdict was opened against. Reporting a head
+# that was not acted on would let an A→B→A reset clear a head this invocation
+# never evaluated -- the one outcome the reduced contract forbids.
+if grep -qF 'EVALUATED_HEAD=""' "$CONTINUATION_HELPER" \
+   && [ "$(awk '/PR head\/base\/author changed during policy classification/{f=1} f&&/EVALUATED_HEAD=""/{print "ok"; exit}' "$CONTINUATION_HELPER")" = ok ]; then
+  pass=$((pass + 1))
+  echo "  PASS: the helper withholds its evaluated head when the protective snapshot drifts"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: protective-snapshot drift must withhold the evaluated head, not report an unacted one" >&2
+fi
+
 # Round-trip: the marker the FAILURE arm writes must be the one the CLEAR arm
 # reads. These are two independent string expressions in the same file, so a
 # drift between them would silently downgrade every protective diagnostic to
