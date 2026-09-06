@@ -103,6 +103,10 @@ If the round-trip is lossy, the reviewer must flag the information loss as a des
 - An explicit justification for why the loss is acceptable, or
 - A plan to eliminate the intermediate format
 
+## Scope discipline for `priority:high` work
+
+**Hub-side.** [Operating Rules for `priority:high` Work](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/high-priority-scope-discipline.md) explains how to decide what a `priority:high` PR should build when automated review keeps finding more — a sibling of the escalation policy above, catching a single PR growing a new guarantee per review round rather than an agent re-patching one assumption across attempts. The link is absolute because that document is `hub-only` and is deliberately not mirrored to consumers; a consumer reading this is being pointed at how the hub works, not told to open a local path.
+
 ## Session finalization
 
 Before an agent session goes idle, implementation-ready work must end in one of three durable states: a committed PR, an explicit issue/PR handoff, or an explicit discard. Start follow-up work after a PR merges on a fresh branch or worktree from current `origin/main`; do not continue shipping follow-ups from the just-merged branch's stale checkout. Open the tracking PR or issue early enough that in-flight work is visible. Run `scripts/session-finalization-check.sh` (or equivalent `git status` / stash / worktree checks) before closeout; the script is read-only and reports dirty files, stashes, stale branch state, and dirty auxiliary worktrees without deleting work. Verified-merged local branch classification is handled by `scripts/worktree-cleanup.sh`.
