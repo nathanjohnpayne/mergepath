@@ -2079,18 +2079,14 @@ doc_ownership:
   - path: docs/agents/high-priority-scope-discipline.md
     class: hub-only
     note: >-
-      Scope-discipline rules for priority:high work, derived from the
-      #1189 failure (twenty-one commits, twelve Codex review rounds and
-      three CodeRabbit rounds, closed unmerged in favour of the one-word
-      #1196). HUB-ONLY rather than
-      canonical for now on the shared-operating-rules.md test — that file
+      Scope-discipline rules for priority:high work. HUB-ONLY rather
+      than canonical on the shared-operating-rules.md test — that file
       deliberately carries "only the rules proven true AND usable
-      everywhere", and this one is not yet either: its evidence and its
-      three load-bearing rules are stated in terms of mergepath issue
-      numbers and this repo's Codex/CodeRabbit round machinery, so a
-      verbatim consumer copy would cite issues the consumer cannot
-      resolve. Promote to canonical once the rules have been exercised on
-      a consumer and the hub-specific citations are separated from the
+      everywhere", and this one is not yet either: it cites mergepath
+      issue numbers and this repo's review-round machinery, so a verbatim
+      consumer copy would reference issues the consumer cannot resolve.
+      Promote to canonical once the rules have been exercised on a
+      consumer and the hub-specific citations are separated from the
       rules themselves.
   - path: docs/agents/bootstrap-runbook.md
     class: hub-only
