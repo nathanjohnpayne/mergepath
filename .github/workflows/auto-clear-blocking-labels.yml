@@ -516,6 +516,14 @@ jobs:
               echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but author-token continuation remains disabled."
               rc=0
             elif [ "$protective_rc" -eq 0 ]; then
+              # Re-stamp: the epoch must describe the stage it labels. The
+              # stamp above was taken before protective retraction, and if that
+              # stalls, a full-stage verdict carries a timestamp from long
+              # before the full stage ran -- so a genuinely newer full-stage
+              # failure reads as older than a clean verdict that actually
+              # preceded it, and can be cleared. A protective-only verdict
+              # keeps the original stamp, which is the stage it describes.
+              eval_started_at=$(date -u +%s)
               continuation_out="$(mktemp)"
               GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
                 MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
@@ -1022,6 +1030,14 @@ jobs:
               echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but scheduled author-token continuation remains disabled."
               rc=0
             elif [ "$protective_rc" -eq 0 ]; then
+              # Re-stamp: the epoch must describe the stage it labels. The
+              # stamp above was taken before protective retraction, and if that
+              # stalls, a full-stage verdict carries a timestamp from long
+              # before the full stage ran -- so a genuinely newer full-stage
+              # failure reads as older than a clean verdict that actually
+              # preceded it, and can be cleared. A protective-only verdict
+              # keeps the original stamp, which is the stage it describes.
+              eval_started_at=$(date -u +%s)
               continuation_out="$(mktemp)"
               GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
                 MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \

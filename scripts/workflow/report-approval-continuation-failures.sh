@@ -163,6 +163,32 @@ latest_run() {
       } end' <<<"$runs"
 }
 
+# True when ANY run on $1 is a failure that this verdict does not speak for:
+# covered by stage $4, but evaluated AFTER the verdict at $2.
+#
+# latest_run selects by PUBLICATION order, because that is what GitHub gates on.
+# Publication order is not evaluation order, so the selected run can be an
+# OLDER evaluation that merely posted last -- and clearing it would bury a
+# genuinely newer failure that posted earlier. Checking only the selected
+# record discards the ordering evidence every other run carries.
+newer_covered_failure() {
+  local head_sha="$1" cutoff="$2" verdict_stage="$3" runs
+  runs=$(with_gh_retry gh api --paginate \
+    "repos/$REPO/commits/$head_sha/check-runs?check_name=$CHECK_NAME&per_page=100" \
+    --jq '.check_runs[] | {conclusion, started_at, id, summary: (.output.summary // "")}') || return 2
+  jq -es --argjson cutoff "$cutoff" --arg marker "$STAGE_MARKER_PREFIX" \
+        --arg evmarker "$EVAL_MARKER_PREFIX" --arg vstage "$verdict_stage" '
+    def marked_epoch(s): (s | split($evmarker)) as $p
+      | if ($p | length) > 1 then ($p[1] | split("]")[0] | tonumber? ) else null end;
+    def stage_of(s): (s | split($marker)) as $sp
+      | if ($sp | length) > 1 and ($sp[1] | split("]")[0]) == "protective"
+        then "protective" else "full" end;
+    any(.[];
+      .conclusion == "failure"
+      and ((marked_epoch(.summary) // (.started_at | fromdateiso8601)) > $cutoff)
+      and ($vstage == "full" or stage_of(.summary) == "protective"))' <<<"$runs" >/dev/null
+}
+
 # A verdict from stage $1 may speak for a record from stage $2. A full
 # continuation subsumes the protective stage it runs after; a protective-only
 # pass does not speak for the author-token continuation it never reached.
@@ -293,6 +319,27 @@ for ENTRY in $PR_NUMBERS; do
       echo "::endgroup::"
       continue
     fi
+    # Veto: publication order is not evaluation order, so a failure evaluated
+    # after this verdict may be sitting behind the selected run. Clearing the
+    # selected one would leave that newer failure hidden under a success.
+    # `|| NEWER_RC=$?` rather than a bare call: this function returns 1 for the
+    # ORDINARY case (no newer failure), and under `set -e` a bare non-zero
+    # command aborts the script.
+    NEWER_RC=0
+    newer_covered_failure "$EVAL_HEAD" "$EVAL_STARTED" "$VERDICT_STAGE" || NEWER_RC=$?
+    case "$NEWER_RC" in
+      0)
+        echo "PR #$PR has a $CHECK_NAME failure on $EVAL_HEAD evaluated after this verdict; not clearing, so it stays visible."
+        echo "::endgroup::"
+        continue
+        ;;
+      2)
+        echo "::error::Failed to check $EVAL_HEAD for newer failures for PR #$PR; refusing to clear on an incomplete read."
+        CLEAR_FAILED=1
+        echo "::endgroup::"
+        continue
+        ;;
+    esac
     # PATCH the run we actually selected, rather than POSTing a newer success.
     # Creating a run would re-enter the latest-run-wins race this script exists
     # to arbitrate: a failure published between the read above and the write

@@ -484,7 +484,7 @@ if [ "$continuation_clear_count" -eq 2 ] \
    && [ "$(grep -cF 'CONTINUATION_EVALUATED_PRS' "$WORKFLOW")" -ge 4 ] \
    && [ "$(grep -cF "report-approval-continuation-failures.sh --clear" "$WORKFLOW")" -eq 2 ] \
    && [ "$(grep -cF "grep -Fq 'CONTINUATION_CLEAR_V1'" "$WORKFLOW")" -eq 2 ] \
-   && [ "$(grep -cF 'eval_started_at=$(date -u +%s)' "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF 'eval_started_at=$(date -u +%s)' "$WORKFLOW")" -eq 4 ] \
    && [ "$(grep -cF '$PR:$eval_head:$eval_started_at:$continuation_stage' "$WORKFLOW")" -eq 4 ] \
    && [ "$(grep -cF 'continuation_stage=protective' "$WORKFLOW")" -eq 2 ] \
    && [ "$(grep -cF 'continuation_stage=full' "$WORKFLOW")" -eq 2 ] \
@@ -873,6 +873,39 @@ fi
 SAME_SECOND_FAILURE='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T05:00:00Z","id":95,"output":{"summary":"boom [continuation-stage: full] [continuation-evaluated-at: 1788609600] x"}}]}'
 run_clear_case "same-second failure is resolved, not deadlocked" yes \
   "$SAME_SECOND_FAILURE" "" "7:abc123:$VERDICT_AFTER:full" 95
+
+# Publication order is not evaluation order. Here the publication-LATEST run is
+# an OLDER evaluation (id 101, evaluated before the verdict) while an earlier
+# published run is a NEWER evaluation (id 100, evaluated after it). Clearing the
+# selected run would hide that newer failure beneath a success, so the clear
+# must be vetoed. Checking only the selected record misses this entirely.
+OUT_OF_ORDER='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T03:00:00Z","id":100,"output":{"summary":"newer eval [continuation-stage: full] [continuation-evaluated-at: 1788696000] x"}},{"conclusion":"failure","started_at":"2026-09-05T09:00:00Z","id":101,"output":{"summary":"older eval [continuation-stage: full] [continuation-evaluated-at: 1788480000] y"}}]}'
+run_clear_case "newer failure published earlier vetoes the clear" no \
+  "$OUT_OF_ORDER" "" "7:abc123:$VERDICT_AFTER:full"
+
+# The veto must not fire on a failure the verdict DOES speak for, or nothing
+# would ever clear -- the selected run itself is always older than the verdict.
+ONLY_OLDER='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T03:00:00Z","id":102,"output":{"summary":"old [continuation-stage: full] [continuation-evaluated-at: 1788480000] x"}},{"conclusion":"failure","started_at":"2026-09-05T09:00:00Z","id":103,"output":{"summary":"old too [continuation-stage: full] [continuation-evaluated-at: 1788480000] y"}}]}'
+run_clear_case "all failures older than the verdict still clear" yes \
+  "$ONLY_OLDER" "" "7:abc123:$VERDICT_AFTER:full" 103
+
+# A protective-only verdict does not speak for a full-stage failure, so one it
+# cannot cover must not veto its clear of a protective-stage record.
+PROT_PLUS_FULL='{"check_runs":[{"conclusion":"failure","started_at":"2026-09-05T03:00:00Z","id":104,"output":{"summary":"newer full [continuation-stage: full] [continuation-evaluated-at: 1788696000] x"}},{"conclusion":"failure","started_at":"2026-09-05T09:00:00Z","id":105,"output":{"summary":"prot [continuation-stage: protective] [continuation-evaluated-at: 1788480000] y"}}]}'
+run_clear_case "an uncoverable newer failure does not veto a protective clear" yes \
+  "$PROT_PLUS_FULL" "" "7:abc123:$VERDICT_AFTER:protective" 105
+
+# The full-stage epoch must be stamped when the FULL stage starts, not before
+# protective retraction: a stalled protective stage would otherwise tag a
+# full-stage verdict with a timestamp from long before it ran.
+if [ "$(grep -cF 'eval_started_at=$(date -u +%s)' "$WORKFLOW")" -eq 4 ] \
+   && [ "$(awk '/MERGEPATH_PROTECTIVE_RETRACTION_DONE=1/{found=1} /eval_started_at=\$\(date -u \+%s\)/{if(!found) pre++; else post++} END{print (pre>=2 && post==0) ? "bad" : "ok"}' "$WORKFLOW")" = ok ]; then
+  pass=$((pass + 1))
+  echo "  PASS: the full stage is timestamped when it starts, not before protective retraction"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a full-stage verdict must carry a timestamp taken at the full stage" >&2
+fi
 
 # Round-trip: the marker the FAILURE arm writes must be the one the CLEAR arm
 # reads. These are two independent string expressions in the same file, so a
