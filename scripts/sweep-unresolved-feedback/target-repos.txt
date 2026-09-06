@@ -11,12 +11,16 @@
 #
 # device-platform-reporting was removed 2026-08-26 when that repo was
 # archived and made private; it is no longer a sync consumer and can
-# accrue no new review feedback. That is why this list holds 9, not 10.
+# accrue no new review feedback.
+#
+# device-source-of-truth was removed 2026-09-05 when that repo went
+# dormant: GitHub Actions was disabled on it and it was dropped as a
+# sync consumer, so it accrues no new review feedback either. That is
+# why this list holds 8, not 10.
 #
 # To onboard a new repo: add a line. No code changes required.
 
 nathanjohnpayne/friends-and-family-billing
-nathanjohnpayne/device-source-of-truth
 nathanjohnpayne/swipewatch
 nathanjohnpayne/nathanpaynedotcom
 nathanjohnpayne/overridebroadway

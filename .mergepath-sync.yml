@@ -141,23 +141,6 @@ consumers:
     visibility: public
     facts:
       frameworks: [react, typescript]
-  # device-source-of-truth is a React 19 + TypeScript + Vite SPA with a
-  # root package.json and ~148 .ts/.tsx files, so it IS in scope for the
-  # canonical ESLint floor (#458). Folded into the ESM templated entry
-  # below; the prior "zero lintable surface" exclusion was false.
-  # Visibility flipped public -> private during the 2026-08 window; measured
-  # 2026-09-01 by the monthly propagation-order review (anonymous API access
-  # returns 404). It is the fleet's only non-public consumer. Nothing in the
-  # sync engine reads this field -- it is documentary -- but it is read by
-  # humans and agents reasoning about the fleet, and docs/agents/coderabbit-
-  # audit.md's learnings.scope posture turns on it (`auto` resolves to
-  # `global` for a private repo, `local` for a public one), so a stale value
-  # here propagates into a wrong privacy conclusion.
-  - name: device-source-of-truth
-    repo: nathanjohnpayne/device-source-of-truth
-    visibility: private
-    facts:
-      frameworks: [react, typescript]
   - name: friends-and-family-billing
     repo: nathanjohnpayne/friends-and-family-billing
     visibility: public
@@ -1672,12 +1655,12 @@ paths:
   # full fleet inventory (every consumer repo name + facts), which there
   # is no reason to mirror into each consumer. (It also avoids leaking
   # private repo names to a public consumer. That concern was moot while
-  # the fleet was uniformly public from 2026-07-06, and it is ACTIVE
-  # AGAIN as of 2026-09-01: device-source-of-truth is private, so this
-  # file now names a private repo and mirroring it into eight public
-  # consumers would disclose that name. Do not treat the moot period as
-  # the standing state -- re-read the visibility fields.) Keep it
-  # mergepath-only. (CodeRabbit Major, #271.)
+  # the fleet was uniformly public from 2026-07-06; it went ACTIVE on
+  # 2026-09-01 when device-source-of-truth was measured private, and it
+  # is moot again as of 2026-09-05, when that repo was dropped as a
+  # consumer and the remaining seven are all public. Do not treat either
+  # moot period as the standing state -- re-read the visibility fields.)
+  # Keep it mergepath-only. (CodeRabbit Major, #271.)
 
   # Kit directories — Mergepath-canonical files are required;
   # consumer-only additions in the same directory are allowed.
@@ -1861,8 +1844,10 @@ paths:
   # export is byte-identical, only the import/export syntax differs.
   #
   # device-source-of-truth was previously excluded on a false "zero
-  # lintable surface" rationale; #458 folds it into the ESM entry below
+  # lintable surface" rationale; #458 folded it into the ESM entry below
   # (React 19 + TypeScript + Vite SPA, root package.json, ~148 .ts/.tsx).
+  # It was dropped as a consumer entirely on 2026-09-05 when the repo went
+  # dormant, so it no longer appears in that entry.
   # overridebroadway carried the same false rationale; #461 folds it into
   # the CJS entry below (CJS + React 19 + TypeScript, root package.json,
   # ~81 .ts/.tsx) — the first CJS + TS consumer of the floor. The CJS
@@ -1873,7 +1858,6 @@ paths:
   #   matchline (ESM)                  → JS + TS + React + react-hooks
   #   nathanpaynedotcom (ESM)          → JS + TS + Astro
   #   tadlockpsychiatry (ESM)          → JS + TS + React + react-hooks
-  #   device-source-of-truth (ESM)     → JS + TS + React + react-hooks
   #   fiveacross (ESM)                 → JS + TS + React + react-hooks
   #   friends-and-family-billing (CJS) → JS + React + react-hooks
   #   overridebroadway (CJS)           → JS + TS + React + react-hooks
@@ -1888,7 +1872,6 @@ paths:
       - matchline
       - nathanpaynedotcom
       - tadlockpsychiatry
-      - device-source-of-truth
       - fiveacross
 
   # CJS variant — consumers without `"type": "module"` (default
@@ -2019,20 +2002,30 @@ doc_ownership:
   - path: docs/agents/operating-rules.md
     class: per-repo-owned
     note: >-
-      MIXED — the transitional debt #780 exists to split. All 9 consumer
-      copies differ from the hub and from each other; five carry large
-      repo-specific architecture, logging, and coding blocks (up to 407
-      lines in device-source-of-truth). Dominant ownership is per-repo,
-      so it stays the LOCAL OVERLAY. The shared half moved to
-      docs/agents/shared-operating-rules.md; removing the now-duplicated
-      prose from each local overlay is #780 steps 4-5 (canary first).
+      MIXED — the transitional debt #780 exists to split. Re-measured
+      2026-09-05 against hub 5aea5db, replacing an undated "all 9 / five
+      carry / up to 407 lines" claim that had gone stale: all 7 consumer
+      copies differ from the hub AND from each other (7 distinct
+      checksums, no two alike), and every one carries a repo-specific
+      architecture, logging, and coding block absent from the hub copy.
+      Those blocks run 19-304 lines; six of the seven are 80+, swipewatch
+      is the largest at 304, and fiveacross is the lone small one at 19.
+      Method (re-derivable): fetch docs/agents/operating-rules.md from
+      each `.consumers[].repo`, md5 for the distinctness claim, and
+      `diff <hub> <consumer> | grep -c '^>'` for the block size.
+      Dominant ownership is per-repo, so it stays the LOCAL OVERLAY. The
+      shared half moved to docs/agents/shared-operating-rules.md;
+      removing the now-duplicated prose from each local overlay is #780
+      steps 4-5 (canary first).
   - path: docs/agents/documentation-rules.md
     class: per-repo-owned
     note: >-
-      MIXED, and confirmed so by the fleet: all 9 consumer copies differ
-      from the hub and from each other, and every one of them is a
-      repo-specific list of which of ITS docs to update when. Stays
-      per-repo-owned. #780 step 6 extracted the prose line-wrapping rule
+      MIXED, and confirmed so by the fleet. Re-measured 2026-09-05
+      against hub 5aea5db (the prior "all 9" was undated and stale):
+      all 7 consumer copies differ from the hub AND from each other
+      (7 distinct md5s), they run 421-5763 bytes against the hub's
+      6916, and every one of them is a repo-specific list of which of
+      ITS docs to update when. Stays per-repo-owned. #780 step 6 extracted the prose line-wrapping rule
       into canonical docs/agents/prose-line-wrapping.md and left the
       allowlist + gate behind. Canonical-source discipline was
       deliberately NOT extracted: as written it names
@@ -2047,18 +2040,29 @@ doc_ownership:
       repo-specific by construction, so it stays per-repo-owned. #780
       step 6 declined to mint a canonical deploy doc and extracted the
       universal floor into shared-operating-rules.md § Secret handling
-      instead. Evidence for declining: the 9 consumer copies are 925-2814
-      bytes against the hub's 6853 and are already rewritten to each
-      repo's own deploy story; only 2 of 4 sampled carry the
+      instead. Evidence for declining, re-measured 2026-09-05 against
+      hub 5aea5db (the prior "9 copies / 925-2814 bytes / hub's 6853"
+      was undated and is now wrong in all three figures): the 7 consumer
+      copies run 925-11848 bytes against the hub's 6916, and are
+      largely rewritten to each repo's own deploy story. Two caveats the
+      old note's numbers hid. (1) They do NOT all differ from each
+      other: matchline and tadlockpsychiatry are byte-identical
+      (md5 1e2f0bae, 1358 bytes), so "rewritten per repo" is the trend,
+      not a universal. (2) fiveacross is now the fleet's LARGEST copy at
+      11848 bytes, well above the hub — the upper bound moved by 4x.
+      Also: only 2 of 4 sampled carry the
       no-downgrade invariant, in incompatible wordings ("template-derived
       repos" vs "this repo"); the surrounding procedure depends on
       op-firebase-deploy, a PATH command rather than a guaranteed repo
       file; and the one procedural rule that IS universal (the op
-      sign-in pause-and-prompt) was already canonical. Residual:
-      gaycruisebingo's copy is still byte-identical to the hub's
-      (un-scrubbed bootstrap residue asserting a hub-only workflow it
-      does not have — the #744/#747 class), a consumer-side deletion for
-      the steps 4-5 migration wave.
+      sign-in pause-and-prompt) was already canonical. Residual
+      (RESOLVED, verified 2026-09-05): the note recorded gaycruisebingo's
+      copy as byte-identical to the hub's — un-scrubbed bootstrap residue
+      of the #744/#747 class, pending a consumer-side deletion. That repo
+      was renamed fiveacross on 2026-08-27, and its copy is no longer
+      identical to the hub (11848 bytes against 6916), so the residue has
+      since been scrubbed and rewritten. No migration-wave deletion is
+      outstanding on this path.
   - path: docs/agents/repository-overview.md
     class: per-repo-owned
   - path: docs/agents/testing-requirements.md
