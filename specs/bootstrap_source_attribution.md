@@ -10,24 +10,25 @@ This records **which mergepath revision the bootstrap was based on** — informa
 
 ## Acceptance criteria
 
+There is no partial attribution: a `source_root` is either eligible, and gets both the subject's short sha and the trailer's full-sha link, or it is not, and gets neither. A sha that fails any eligibility check below is not a recoverable `HUB_REF` — #1056's whole point — so it does not earn even the subject.
+
 ### Attribution shape, when the source is eligible
 
 - The commit subject reads `Initial commit (bootstrapped from mergepath@<sha7>)` — the short sha, greppable and surviving a squash.
-- The commit body additionally carries a `Source: https://github.com/nathanjohnpayne/mergepath/commit/<sha>` trailer, with the full sha, **only when** that sha is reachable from a ref under `source_root`'s own `refs/remotes/origin/*` — an unpushed local commit is still legitimate provenance for the subject's short sha, but recording a GitHub link for it would 404.
+- The commit body additionally carries a `Source: https://github.com/nathanjohnpayne/mergepath/commit/<sha>` trailer, with the full sha.
 
 ### Fallback, when the source is not eligible
 
 - The commit subject reads the un-attributed `Initial commit (bootstrapped from mergepath)`, with no `Source:` trailer, identical to the commit this feature did not exist to produce.
 - Fallback is fail-open with respect to the bootstrap itself: an ineligible source never blocks or errors the bootstrap, it only omits the attribution.
 
-### Eligibility — two independent, both-required checks
+### Eligibility — three independent, all-required checks
 
-A `source_root` is eligible for subject attribution only when both of the following hold; either failing falls back per above.
+A `source_root` is eligible only when all three of the following hold; any one failing falls back per above.
 
 1. **`origin` names canonical mergepath by an exact host+path match** — one of the enumerated forms (`https://`, `http://`, `git@host:path` scp-like, `ssh://`) naming exactly `github.com` and exactly `nathanjohnpayne/mergepath` (with or without a `.git` suffix). An unanchored substring/suffix match is insufficient: an origin such as `https://evilgithub.com/nathanjohnpayne/mergepath.git` must not pass. This also fails closed when `source_root` is not a git repository at all — there is no origin to read.
 2. **A plain, unconfigured `git status --porcelain` succeeds and is empty.** This is a conservative eligibility gate against a known mismatch risk — uncommitted or untracked changes at `source_root` that `HEAD` does not reflect — not an attempt to reconcile every path the mirror's own exclude, rsync, or resume behavior might separately drop or keep. A failed `status` read is also treated as ineligible, never as "empty output, therefore clean."
-
-The `Source:` trailer's GitHub link carries one further, independent check: the resolved sha must be reachable from some ref under `refs/remotes/origin/*` at `source_root`. This gates only the trailer, not the subject's short sha.
+3. **`HEAD` is reachable from some ref under `source_root`'s own `refs/remotes/origin/*`.** A sha that exists only in the operator's local clone is not reliably recoverable later: another clone cannot resolve it, and the original clone may eventually garbage-collect it. This is deliberately an eligibility check, not merely a gate on whether to include a link — an unpushed local commit is a real revision the bootstrap was based on, but recording it (with or without the GitHub URL) would still name a sha most readers can never resolve, so it is not eligible at all.
 
 ### Scope
 

@@ -2161,6 +2161,40 @@ case "$clean_body" in
     fail "Source: trailer missing or wrong for an upstream-reachable sha: $clean_body" ;;
 esac
 
+# A clean, canonical-origin source whose HEAD is NOT reachable from any
+# refs/remotes/origin/* ref (an operator's own local, not-yet-pushed
+# mergepath commit) must fall back to the un-attributed subject entirely --
+# not attribute a subject-only sha. A sha only the operator's local clone
+# can resolve is not a recoverable HUB_REF: another clone can't resolve it,
+# and the local clone may eventually garbage-collect it.
+UNPUSHED_SOURCE="$WORKDIR/source-unpushed"
+mkdir -p "$UNPUSHED_SOURCE"
+git -C "$UNPUSHED_SOURCE" init -q -b main
+git -C "$UNPUSHED_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo "pushed content" >"$UNPUSHED_SOURCE/file.txt"
+git -C "$UNPUSHED_SOURCE" add -A
+git -C "$UNPUSHED_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "unpushed-source pushed baseline"
+git -C "$UNPUSHED_SOURCE" update-ref refs/remotes/origin/main HEAD
+echo "local-only content" >>"$UNPUSHED_SOURCE/file.txt"
+git -C "$UNPUSHED_SOURCE" add -A
+git -C "$UNPUSHED_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "unpushed-source local-only commit"
+[ -z "$(git -C "$UNPUSHED_SOURCE" status --porcelain)" ] \
+  || fail "unpushed-source fixture is dirty, not just unpushed"
+git -C "$UNPUSHED_SOURCE" merge-base --is-ancestor HEAD refs/remotes/origin/main 2>/dev/null \
+  && fail "unpushed-source fixture's HEAD is reachable from origin/main -- it did not actually advance past the pushed baseline"
+
+UNPUSHED_TARGET="$WORKDIR/target-unpushed"
+mkdir -p "$UNPUSHED_TARGET"
+echo seed >"$UNPUSHED_TARGET/README.md"
+run_init_target_git "$UNPUSHED_TARGET" "$UNPUSHED_SOURCE"
+
+unpushed_subject=$(git -C "$UNPUSHED_TARGET" log -1 --format=%s)
+[ "$unpushed_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a clean, canonical-origin source with an unpushed local HEAD falls back to the un-attributed subject (#1056)" \
+  || fail "an unpushed local HEAD was wrongly attributed (not a recoverable HUB_REF): $unpushed_subject"
+
 # --- outcome 2: dirty-source fallback ---
 DIRTY_SOURCE="$WORKDIR/source-dirty"
 mkdir -p "$DIRTY_SOURCE"

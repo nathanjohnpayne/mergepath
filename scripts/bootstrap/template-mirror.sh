@@ -1217,7 +1217,11 @@ bootstrap::_yq_clean_repo_template() {
 # tree is byte-for-byte derivable from that sha. See
 # specs/bootstrap_source_attribution.md (#1056).
 #
-# Eligibility, all required:
+# Eligibility, all required. A sha this returns is always written to BOTH
+# the commit subject and the Source: trailer -- there is no partial
+# attribution, because a sha that fails any one of these checks is not a
+# recoverable HUB_REF, and #1056's whole point is that it be recoverable.
+#
 #   1. Its origin remote names canonical mergepath exactly (host + path),
 #      not merely as a substring/suffix of some other host. This also
 #      fails closed on source_root not being a git repo at all -- there's
@@ -1227,6 +1231,12 @@ bootstrap::_yq_clean_repo_template() {
 #      (uncommitted or untracked changes at source_root that HEAD does
 #      not reflect) — not an attempt to reconcile every path the mirror's
 #      own exclude/rsync/resume behavior might separately drop or keep.
+#   3. HEAD is reachable from some ref under source_root's own
+#      refs/remotes/origin/*. A sha that exists only in the operator's
+#      local clone is not reliably recoverable later -- another clone
+#      cannot resolve it, and the original clone may eventually garbage
+#      collect it -- so it is not eligible at all, not merely ineligible
+#      for a link.
 bootstrap::_resolve_bootstrap_source_revision() {
   local source_root=$1
   [ -n "$source_root" ] && [ -d "$source_root" ] || return 1
@@ -1246,23 +1256,16 @@ bootstrap::_resolve_bootstrap_source_revision() {
   status_output=$(git -C "$source_root" status --porcelain 2>/dev/null) || return 1
   [ -z "$status_output" ] || return 1
 
-  git -C "$source_root" rev-parse HEAD 2>/dev/null
-}
+  local sha
+  sha=$(git -C "$source_root" rev-parse HEAD 2>/dev/null) || return 1
 
-# bootstrap::_bootstrap_source_revision_is_upstream <source_root> <sha> —
-# true when sha is reachable from some ref under source_root's own
-# refs/remotes/origin/*. Gates ONLY whether the Source: trailer's GitHub
-# URL is included; a local-only commit is still legitimate provenance for
-# the subject's short sha (an operator's own not-yet-pushed mergepath
-# checkout is a real bootstrap source), it just cannot back a link that
-# would 404.
-bootstrap::_bootstrap_source_revision_is_upstream() {
-  local source_root=$1
-  local sha=$2
   local ref
   while IFS= read -r ref; do
     [ -n "$ref" ] || continue
-    git -C "$source_root" merge-base --is-ancestor "$sha" "$ref" 2>/dev/null && return 0
+    if git -C "$source_root" merge-base --is-ancestor "$sha" "$ref" 2>/dev/null; then
+      echo "$sha"
+      return 0
+    fi
   done < <(git -C "$source_root" for-each-ref --format='%(refname)' refs/remotes/origin/ 2>/dev/null)
   return 1
 }
@@ -1295,16 +1298,12 @@ bootstrap::_init_target_git() {
 
   local commit_message
   if [ -n "$source_sha" ]; then
-    # Subject carries the short sha (greppable, survives a squash) always;
-    # the trailer carries the full sha as a clickable GitHub URL only when
-    # it resolves to canonical remote history, so a local-only commit's
-    # link can't 404.
-    commit_message="Initial commit (bootstrapped from mergepath@${source_sha:0:7})"
-    if bootstrap::_bootstrap_source_revision_is_upstream "$source_root" "$source_sha"; then
-      commit_message="$commit_message
+    # Eligibility already required upstream reachability, so subject and
+    # trailer are written together, never one without the other -- see
+    # bootstrap::_resolve_bootstrap_source_revision.
+    commit_message="Initial commit (bootstrapped from mergepath@${source_sha:0:7})
 
 Source: https://github.com/nathanjohnpayne/mergepath/commit/${source_sha}"
-    fi
   else
     commit_message="Initial commit (bootstrapped from mergepath)"
   fi
