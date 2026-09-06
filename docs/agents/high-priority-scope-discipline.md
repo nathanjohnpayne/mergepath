@@ -10,7 +10,7 @@ Every reviewer was correct every time. The error was converting each correct fin
 
 *(Counts are re-derivable: inline comments on #1189 authored by `chatgpt-codex-connector[bot]`, grouped by posting minute; commits from that PR's commit list.)*
 
-Three rules here are load-bearing rather than advisory: **rule 3**, **rule 5**, and **rule 11**. Their enforcement is tracked in #1199.
+Three rules here are load-bearing rather than advisory: **rule 3**, **rule 5**, and **rule 11**. Enforcement is tracked in #1199 — but rule 5 is load-bearing *without* being automatable, and #1199 records why the mechanical version of it was withdrawn.
 
 ## 1. Freeze the contract before implementation
 
@@ -91,15 +91,21 @@ Do not build serialization, state machines, watermarks, epochs, reconciliation p
 
 #1189 is the canonical warning: attempts to establish stronger cross-invocation ordering generated new interactions faster than review eliminated them. Five successive mechanisms were built and removed — an evaluation-epoch marker, a clean-verdict watermark, a read-after-write reconciliation for the burial race that watermark created, evaluation-order arbitration, and a per-stage re-stamp. The correct move was to reduce the guarantee and separate the stronger concurrency problem into #1191.
 
-## 5. A finding caused by the previous finding's fix is a stop signal
+## 5. Before repairing machinery, ask whether the machinery belongs
 
-**Load-bearing.** If an automated review finds a new defect in machinery introduced solely to satisfy an earlier review finding, do not immediately fix it. Reassess the abstraction first.
+**Load-bearing.**
 
-After **two consecutive findings in reviewer-induced machinery**, default to removing that machinery and returning to the smallest implementation that satisfies the original contract.
+> When a finding requires additional machinery, ask first whether the machinery being repaired is necessary to satisfy the original contract. If not, remove or defer the machinery instead of repairing it.
 
-After **three substantive review rounds without decreasing scope**, the PR must undergo a scope review before another code change.
+That is the whole rule. The question is *what can we delete or defer while still satisfying the original issue?* — never *what additional guard makes this latest finding impossible?*
 
-The question becomes *what can we delete or defer while still satisfying the original issue?* — not *what additional guard makes this latest finding impossible?*
+It is deliberately not a threshold. An earlier draft of this rule carried two: remove the machinery after **two consecutive findings in reviewer-induced code**, and force a scope review after **three substantive rounds without decreasing scope**. Both were dropped by owner decision on 2026-09-06, and the reason matters more than the rules did.
+
+Reflexive findings — a reviewer finding a defect in the fix for its own previous finding — appear to be an ordinary background rate on PRs that merge perfectly well, not a distress signal. A working estimate puts them near 40% of findings on healthy merged PRs (sibling-session proxy across #1084, #1121 and #1139; **not yet re-derived here**, and #1199 should confirm it before any enforcement keys on it). If that holds even approximately, "two in a row" fires constantly on good PRs and diagnoses nothing. A threshold that trips on the normal case is worse than no threshold, because it trains everyone to click past it.
+
+Round counting fails for a related reason, now measured rather than assumed: #1176 merged at 11 rounds and 26 findings, #1179 at 8 and 13, #1139 at 11 and 19. #1189 died at 12 rounds and 26 findings. Volume does not separate the healthy case from the failing one, so a rule keyed on volume cannot either.
+
+What separates them is **disposition** — whether the code a finding is about was ever required. That question has no reliable mechanical form. It needs someone to look at the machinery and say whether the issue asked for it, which is exactly the point: this rule marks the place where product judgment has to re-enter the loop, and it should not be automated into something that feels answered without anyone having thought.
 
 ## 6. Review does not get to generalize a local requirement
 
@@ -167,8 +173,12 @@ Contract changed?                            yes / no
 Production code added because of this review: +N / -N lines
 New concepts introduced:                      none / list
 Finding disposition:                          contract defect / regression / adjacent / rebutted
+Is the machinery this finding repairs
+  required by the original contract?          yes / no / no machinery involved
 Requires a stronger guarantee than the issue? yes / no
 ```
+
+The machinery question is rule 5 in checkpoint form, and it is the one that most often changes the outcome. Answer it about the code the finding is *about*, not about the fix being proposed — a **no** means remove or defer that code, not repair it.
 
 If the last answer is **yes**, implementation stops until the stronger guarantee is explicitly accepted into scope.
 
