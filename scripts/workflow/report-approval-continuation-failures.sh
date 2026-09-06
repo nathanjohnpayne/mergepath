@@ -13,20 +13,56 @@
 # wrong (observed on nathanjohnpayne/fiveacross#1108, whose failing run was
 # re-run to success while the check-run stayed red).
 #
-# `--clear` closes that gap WITHOUT weakening the header's invariant, because
-# it is deliberately narrow on both sides:
+# ─────────────────────────────────────────────────────────────────────
+# What this guarantees, and what it deliberately does not
+# ─────────────────────────────────────────────────────────────────────
+#
+# GUARANTEED (sequential / re-evaluation semantics): a diagnostic left by an
+# earlier evaluation of the same head and stage is cleared by a later clean
+# evaluation of that head and stage. That is #1188, and it is the whole point.
+#
+# GUARANTEED (fail-safe under concurrency): an evaluation never clears a
+# failure it did not see. A clear touches exactly one check-run, chosen because
+# it was already published when this invocation began, addressed by its own id.
+# Anything published afterwards is untouched and keeps gating.
+#
+# NOT GUARANTEED (accepted, #1191): convergence under arbitrary interleaving.
+# An older invocation can publish a stale failure AFTER a newer clean
+# invocation has already completed its clear step. Nothing here reconciles
+# that, so without a later qualifying event the head can stay red. On a
+# consumer with `scheduled_sweep_enabled: false` no such event is guaranteed.
+#
+# That asymmetry is deliberate. A false RED costs a re-run; a false GREEN
+# removes a merge-blocking safety diagnostic. Establishing a happens-before
+# relation between concurrent workflow invocations is not something the Checks
+# API can express — it offers no conditional write, no compare-and-swap, and a
+# single mutable text field per run — and the attempts to encode one here (an
+# evaluation-epoch marker, a clean-verdict watermark with read-after-write
+# reconciliation, evaluation-order arbitration across every run on the head)
+# each closed one interleaving and opened another. #1191 owns that problem and
+# treats the state/serialization substrate as the design question.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Why the clear is narrow
+# ─────────────────────────────────────────────────────────────────────
 #
 #   * Only this producer clears it. The caller runs `--clear` solely from the
 #     continuation step's own clean-evaluation arm, so label-absence healing
 #     (or any other unrelated path) still cannot convert a failure to success.
 #   * It only ever supersedes a failure it can see. If the head carries no
 #     `approval-merge-continuation` check-run, or its latest one is not a
-#     failure, `--clear` writes nothing. Without that guard every approved PR
-#     fleet-wide would grow a fresh check-run on every qualifying event.
+#     failure, `--clear` writes nothing.
 #   * It UPDATES the run it selected rather than creating a newer success.
 #     Creating one would re-enter the latest-run-wins race: a failure published
 #     between the read and the write would be the newest evidence, and a fresh
-#     success would bury it. Updating the selected run cannot bury anything.
+#     success would bury it. A PATCH does not move a run's publication
+#     position, so it cannot outrank anything published after it.
+#   * It only clears a record that PREDATES this invocation. A failure
+#     published after this invocation began belongs to an evaluation this
+#     verdict does not speak for. This is the fail-safe guard, not an ordering
+#     scheme: it asks "was this already there when I started", which each
+#     invocation can answer alone, rather than "which evaluation is newer",
+#     which it cannot.
 #   * A verdict only clears a diagnostic from a stage it actually REACHED. The
 #     continuation runs in two stages -- protective retraction, then the
 #     author-token readiness continuation -- and a repo with no
@@ -37,25 +73,12 @@
 #     failure and keeps a permanently red head -- exactly the #1188 bug, for a
 #     different population. Both sides are recorded, so neither happens.
 #
-# `--clear` therefore takes `PR:SHA:EPOCH`, not a bare PR number. Re-resolving
-# the head at POST time is unsafe on its own: a push landing between the verdict
-# and this call would let a clean result for head A publish success on head B,
-# superseding a failure that belongs to B and was never evaluated. The SHA pins
-# the write to the head the verdict was actually about, and the epoch keeps a
-# failure published DURING or AFTER that verdict from being cleared by it --
-# newer evidence outranks an older verdict even on the same head.
-#
-# DELIBERATELY OUT OF SCOPE (#1191): this records nothing when the head carries
-# no diagnostic at all. An older invocation that fails and reaches its reporter
-# after a newer clean one has already run its clear therefore has no clean
-# verdict to be judged against, and publishes a stale failure. Closing that
-# needs a durable clean watermark, and a watermark on the checks API turned out
-# to pull in a create (which re-opens the burial race in the fail-open
-# direction), a read-after-write reconciliation, and a summary field doing
-# double duty as current state and history log -- five of six findings in one
-# review round were interactions between those rules. The substrate is the
-# problem, so #1191 settles where the watermark lives instead of bolting one
-# on here.
+# `--clear` therefore takes `PR:SHA:START:STAGE`, not a bare PR number. The SHA
+# is the head the CONTINUATION reported evaluating (#1190), not one read just
+# before it started: a PR that moves A→B and is force-reset back to A within a
+# single run would defeat an equality check against a pre-read while the
+# evaluation actually saw B. The helper is the only component that knows which
+# head it pinned, so it is the only one that may say.
 #
 # The failure conclusion stays `failure` rather than softening to `neutral`.
 # "We could not verify this is safe to merge" should block; the defect was the
@@ -82,48 +105,30 @@ CHECK_NAME='approval-merge-continuation'
 # only durable record of WHICH stage failed, and a clear consults it so a
 # protective-only verdict cannot clear a full-continuation failure.
 STAGE_MARKER_PREFIX='[continuation-stage: '
-# When the diagnostic's evaluation happened, as opposed to when it was
-# published. Concurrent triggers make these diverge: an older evaluation can
-# fail and reach the reporter AFTER a newer clean evaluation already ran its
-# clearing step, and `started_at` would then rank that stale failure as the
-# newer evidence and keep the head red. On a consumer with
-# `scheduled_sweep_enabled: false` no later event is guaranteed to arrive, so
-# that is the #1188 bug once more. Recency is judged on this marker when it is
-# present; selection still uses started_at, because publication order is what
-# GitHub's own rollup gates on.
-EVAL_MARKER_PREFIX='[continuation-evaluated-at: '
-# Heading under which a superseded diagnostic is preserved, so the advance path
-# can find and carry it forward rather than overwriting it.
+# Heading under which a superseded diagnostic is preserved. That run is the only
+# record of the failure, so a clear must not overwrite the reason and run URL an
+# operator needs to chase a recurring flake.
 PRESERVED_HEADING='Superseded diagnostic, preserved verbatim:'
-# Set when any step of a clear fails -- a prerequisite READ as much as the
-# final write. A failed clear leaves the merge-blocking
-# diagnostic red while the workflow reports success, and on a consumer with
-# scheduled_sweep_enabled: false nothing is guaranteed to retry it -- exactly
-# the silently-preserved condition this script exists to heal, so it surfaces
-# as a retryable failed run instead.
+# Set when any step of a clear fails -- a prerequisite READ as much as the final
+# write. A failed clear leaves the merge-blocking diagnostic red while the
+# workflow reports success, and on a consumer with scheduled_sweep_enabled:
+# false nothing is guaranteed to retry it -- exactly the silently-preserved
+# condition this script exists to heal, so it surfaces as a retryable failed run
+# instead.
 CLEAR_FAILED=0
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=../lib/gh-retry-helpers.sh
 source "$ROOT/scripts/lib/gh-retry-helpers.sh"
 
-# Latest check-run wins. Sorting by `started_at` (id as the tiebreak for runs
-# that share a second) is not cosmetic: reading an arbitrary array element here
-# reproduces the exact misdiagnosis this script exists to prevent — a
-# superseded red read as current state.
-# Reads the newest check-run on $1 and reports FACTS about it, leaving the
-# judgement to each caller -- the two arms ask different questions of the same
-# record and a shared verdict-shaped answer cannot serve both:
+# Reads the newest check-run on $1 and reports facts about it:
 #
 #   {"state":"none"}   the head carries no diagnostic at all
-#   {"state":<conclusion>, "id":…, "stage":…, "summary":…, "at":<epoch>}
+#   {"state":<conclusion>, "id":…, "stage":…, "summary":…, "published":<epoch>}
 #
-# `at` is WHEN THE RUN'S EVALUATION HAPPENED, not when it was published: the
-# embedded marker if present, else publication time. Concurrent triggers make
-# those diverge, and publication order is the wrong clock for "is this newer
-# evidence than my verdict".
-#
-# `stage` records which stage produced the record. An unmarked one (posted
-# before the marker existed) reads as "full", the conservative default.
+# "Newest" is publication order, which is what GitHub's own rollup gates on --
+# so the selected run is the one actually blocking the merge. `published` is
+# that run's own started_at, used only to ask whether it predates this
+# invocation.
 latest_run() {
   local head_sha="$1" runs
   # `--paginate` is not belt-and-braces next to per_page=100:
@@ -137,56 +142,22 @@ latest_run() {
   runs=$(with_gh_retry gh api --paginate \
     "repos/$REPO/commits/$head_sha/check-runs?check_name=$CHECK_NAME&per_page=100" \
     --jq '.check_runs[] | {conclusion, started_at, id, summary: (.output.summary // "")}') || return 1
-  # `split` on a literal string, never a regex: both markers begin with "[",
-  # which opens a character class the moment it is concatenated into a pattern.
-  # That already broke this file once.
-  jq -cs --arg marker "$STAGE_MARKER_PREFIX" --arg evmarker "$EVAL_MARKER_PREFIX" '
-    def marked_epoch(s): (s | split($evmarker)) as $p
-      | if ($p | length) > 1 then ($p[1] | split("]")[0] | tonumber? ) else null end;
+  jq -cs --arg marker "$STAGE_MARKER_PREFIX" '
     sort_by(.started_at, .id) | last
     | if . == null then {state: "none"}
       else {
         state: (.conclusion // "none"),
         id: .id,
-        # The CURRENT marker is the first one: a cleared diagnostic carries the
-        # superseded summary verbatim, so the text also contains the OLD marker
-        # of that record. `contains` searches the whole string and would classify
-        # a full-stage cleared record as protective purely because it preserved
-        # a protective diagnostic -- reading history as if it were current state.
-        # (No apostrophes here: this comment sits inside a single-quoted jq
-        # program, where one would close the shell string mid-expression.)
+        # `split`, never a regex: the marker begins with "[", which opens a
+        # character class the moment it is concatenated into a pattern. The
+        # FIRST occurrence is the current one -- a cleared record carries the
+        # superseded summary verbatim and therefore holds the old marker too.
         stage: ((.summary | split($marker)) as $sp
                 | if ($sp | length) > 1 and ($sp[1] | split("]")[0]) == "protective"
                   then "protective" else "full" end),
         summary: .summary,
-        at: (marked_epoch(.summary) // (.started_at | fromdateiso8601))
+        published: (.started_at | fromdateiso8601)
       } end' <<<"$runs"
-}
-
-# True when ANY run on $1 is a failure that this verdict does not speak for:
-# covered by stage $4, but evaluated AFTER the verdict at $2.
-#
-# latest_run selects by PUBLICATION order, because that is what GitHub gates on.
-# Publication order is not evaluation order, so the selected run can be an
-# OLDER evaluation that merely posted last -- and clearing it would bury a
-# genuinely newer failure that posted earlier. Checking only the selected
-# record discards the ordering evidence every other run carries.
-newer_covered_failure() {
-  local head_sha="$1" cutoff="$2" verdict_stage="$3" runs
-  runs=$(with_gh_retry gh api --paginate \
-    "repos/$REPO/commits/$head_sha/check-runs?check_name=$CHECK_NAME&per_page=100" \
-    --jq '.check_runs[] | {conclusion, started_at, id, summary: (.output.summary // "")}') || return 2
-  jq -es --argjson cutoff "$cutoff" --arg marker "$STAGE_MARKER_PREFIX" \
-        --arg evmarker "$EVAL_MARKER_PREFIX" --arg vstage "$verdict_stage" '
-    def marked_epoch(s): (s | split($evmarker)) as $p
-      | if ($p | length) > 1 then ($p[1] | split("]")[0] | tonumber? ) else null end;
-    def stage_of(s): (s | split($marker)) as $sp
-      | if ($sp | length) > 1 and ($sp[1] | split("]")[0]) == "protective"
-        then "protective" else "full" end;
-    any(.[];
-      .conclusion == "failure"
-      and ((marked_epoch(.summary) // (.started_at | fromdateiso8601)) > $cutoff)
-      and ($vstage == "full" or stage_of(.summary) == "protective"))' <<<"$runs" >/dev/null
 }
 
 # A verdict from stage $1 may speak for a record from stage $2. A full
@@ -209,13 +180,12 @@ for ENTRY in $PR_NUMBERS; do
   echo "::group::approval-continuation ($MODE) for PR #$PR"
 
   if [ "$MODE" = clear ]; then
-    # Clear mode takes PR:SHA:EPOCH:STAGE. Every field is load-bearing and a
-    # wrong clear is the dangerous direction, so a malformed entry is refused
-    # rather than defaulted.
+    # PR:SHA:START:STAGE. Every field is load-bearing and a wrong clear is the
+    # dangerous direction, so a malformed entry is refused rather than defaulted.
     case "$ENTRY" in
       *:*:*:*) ;;
       *)
-        echo "::warning::PR #$PR reached --clear without an evaluated head, timestamp and stage; refusing to guess."
+        echo "::warning::PR #$PR reached --clear without an evaluated head, start time and stage; refusing to guess."
         echo "::endgroup::"
         continue
         ;;
@@ -227,7 +197,7 @@ for ENTRY in $PR_NUMBERS; do
     VERDICT_STAGE="${ENTRY_REST#*:}"
     case "$EVAL_STARTED" in
       ''|*[!0-9]*)
-        echo "::warning::PR #$PR carries a non-numeric verdict timestamp ($EVAL_STARTED); refusing to clear."
+        echo "::warning::PR #$PR carries a non-numeric start time ($EVAL_STARTED); refusing to clear."
         echo "::endgroup::"
         continue
         ;;
@@ -241,28 +211,15 @@ for ENTRY in $PR_NUMBERS; do
         ;;
     esac
     # A prerequisite read that exhausts its retries is a FAILED clear, not a
-    # skipped one: the stale diagnostic stays red and, on a consumer with
-    # scheduled_sweep_enabled: false, nothing is guaranteed to retry it. Warning
-    # and exiting 0 would report success over exactly the condition this script
-    # exists to heal -- the same fail-silent shape as a failed PATCH.
+    # skipped one: the stale diagnostic stays red and nothing is guaranteed to
+    # retry it. Warning and exiting 0 would report success over exactly the
+    # condition this script exists to heal.
     if ! HEAD_SHA=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
       echo "::error::Failed to resolve head SHA for PR #$PR; the stale diagnostic on its head was not evaluated."
       CLEAR_FAILED=1
       echo "::endgroup::"
       continue
     fi
-    # The verdict describes $EVAL_HEAD. Re-resolving the head at write time is
-    # the whole defect: a push landing between the verdict and this step would
-    # let a clean result for head A publish success on head B, superseding a
-    # failure that belongs to B and was never evaluated. If the PR has moved,
-    # this verdict says nothing about the current head — stop.
-    #
-    # $EVAL_HEAD is the head the CONTINUATION reported evaluating (#1190), not a
-    # head read just before it started. Those differ when a PR moves A→B and is
-    # force-reset back to A within one run: an equality check against a pre-read
-    # would pass while the evaluation actually saw B, clearing a diagnostic on a
-    # head nothing examined. The helper is the only component that knows which
-    # head it pinned, so it is the only one that may say.
     if [ "$HEAD_SHA" != "$EVAL_HEAD" ]; then
       echo "PR #$PR moved from $EVAL_HEAD to $HEAD_SHA since this verdict; a later completion event will re-evaluate the new head."
       echo "::endgroup::"
@@ -275,42 +232,28 @@ for ENTRY in $PR_NUMBERS; do
       continue
     fi
     SEL_STATE=$(jq -r '.state' <<<"$SELECTED")
+    if [ "$SEL_STATE" != failure ]; then
+      echo "PR #$PR carries no supersedable $CHECK_NAME diagnostic on $EVAL_HEAD (latest: $SEL_STATE); nothing to clear."
+      echo "::endgroup::"
+      continue
+    fi
     SEL_ID=$(jq -r '.id // 0' <<<"$SELECTED")
     SEL_STAGE=$(jq -r '.stage // "full"' <<<"$SELECTED")
     SEL_SUMMARY=$(jq -r '.summary // ""' <<<"$SELECTED")
-    SEL_AT=$(jq -r '.at // 0' <<<"$SELECTED")
-
-    # A record whose evaluation is at least as recent as this verdict is newer
-    # evidence and must survive it, whatever it says.
-    # Strictly-greater on BOTH sides, deliberately. The two comparisons used to
-    # disagree on an exact tie -- clear refused a same-second failure (>=) while
-    # report declined to suppress it (>) -- so two invocations starting in the
-    # same second could leave a permanent red that neither side would resolve.
-    # Consistency matters more than which way the tie falls: these are
-    # infrastructure diagnostics, not merge-safety failures, and a condition
-    # that persists is re-posted by the next evaluation.
-    if [ "$SEL_STATE" != none ] && [ "${SEL_AT%.*}" -gt "$EVAL_STARTED" ]; then
-      echo "PR #$PR has a $CHECK_NAME record newer than this verdict on $EVAL_HEAD; leaving it alone."
-      echo "::endgroup::"
-      continue
-    fi
-
-    if [ "$SEL_STATE" = none ]; then
-      echo "PR #$PR carries no $CHECK_NAME diagnostic on $EVAL_HEAD; nothing to clear."
-      echo "::endgroup::"
-      continue
-    fi
-
+    SEL_PUBLISHED=$(jq -r '.published // 0' <<<"$SELECTED")
     case "$SEL_ID" in
       ''|0|*[!0-9]*)
-        echo "::warning::PR #$PR has a $CHECK_NAME record on $EVAL_HEAD but no usable run id; leaving it untouched."
+        echo "::warning::PR #$PR has a failing $CHECK_NAME diagnostic on $EVAL_HEAD but no usable run id; leaving it untouched."
         echo "::endgroup::"
         continue
         ;;
     esac
-
-    if [ "$SEL_STATE" != failure ]; then
-      echo "PR #$PR carries no supersedable $CHECK_NAME diagnostic on $EVAL_HEAD (latest: $SEL_STATE); nothing to clear."
+    # The fail-safe guard. A record published at or after this invocation began
+    # belongs to an evaluation this verdict does not speak for, so it is left
+    # alone -- a stale red, which a later evaluation clears, in preference to a
+    # false green, which nothing catches.
+    if [ "${SEL_PUBLISHED%.*}" -ge "$EVAL_STARTED" ]; then
+      echo "PR #$PR has a $CHECK_NAME diagnostic on $EVAL_HEAD published after this invocation began; leaving it for an evaluation that saw it."
       echo "::endgroup::"
       continue
     fi
@@ -319,39 +262,6 @@ for ENTRY in $PR_NUMBERS; do
       echo "::endgroup::"
       continue
     fi
-    # Veto: publication order is not evaluation order, so a failure evaluated
-    # after this verdict may be sitting behind the selected run. Clearing the
-    # selected one would leave that newer failure hidden under a success.
-    # `|| NEWER_RC=$?` rather than a bare call: this function returns 1 for the
-    # ORDINARY case (no newer failure), and under `set -e` a bare non-zero
-    # command aborts the script.
-    NEWER_RC=0
-    newer_covered_failure "$EVAL_HEAD" "$EVAL_STARTED" "$VERDICT_STAGE" || NEWER_RC=$?
-    case "$NEWER_RC" in
-      0)
-        echo "PR #$PR has a $CHECK_NAME failure on $EVAL_HEAD evaluated after this verdict; not clearing, so it stays visible."
-        echo "::endgroup::"
-        continue
-        ;;
-      2)
-        echo "::error::Failed to check $EVAL_HEAD for newer failures for PR #$PR; refusing to clear on an incomplete read."
-        CLEAR_FAILED=1
-        echo "::endgroup::"
-        continue
-        ;;
-    esac
-    # PATCH the run we actually selected, rather than POSTing a newer success.
-    # Creating a run would re-enter the latest-run-wins race this script exists
-    # to arbitrate: a failure published between the read above and the write
-    # below would be the newest evidence, and a fresh success would bury it.
-    # Updating run $SEL_ID cannot bury anything — a newer failure stays newer,
-    # stays current, and keeps blocking. Both runs come from the same GitHub App
-    # (this workflow's GITHUB_TOKEN), which is what permits the update.
-    #
-    # The superseded failure's own summary is carried into the replacement: this
-    # is the only check-run record of that failure, so overwriting it outright
-    # would erase the reason and the run URL an operator needs to chase a
-    # recurring flake.
     with_gh_retry gh api "repos/$REPO/check-runs/$SEL_ID" \
       -X PATCH \
       -f conclusion='success' \
@@ -365,34 +275,21 @@ $SEL_SUMMARY" \
     continue
   fi
 
-  # Report mode takes PR, PR:STAGE or PR:STAGE:EPOCH. A missing stage defaults
-  # to "full", the conservative reading: only a full verdict clears it. A
-  # missing epoch omits the marker and disables the staleness check below.
+  # Report mode takes PR or PR:STAGE. A missing stage defaults to "full", the
+  # conservative reading: only a full verdict clears it.
   FAIL_STAGE=full
-  FAIL_EPOCH=""
   REPORT_REST="${ENTRY#*:}"
   if [ "$REPORT_REST" != "$ENTRY" ]; then
     case "${REPORT_REST%%:*}" in
       protective|full) FAIL_STAGE="${REPORT_REST%%:*}" ;;
       *) echo "::warning::PR #$PR reported an unknown failure stage (${REPORT_REST%%:*}); recording it as full." ;;
     esac
-    if [ "${REPORT_REST#*:}" != "$REPORT_REST" ]; then
-      case "${REPORT_REST#*:}" in
-        ''|*[!0-9]*) echo "::warning::PR #$PR reported a non-numeric evaluation epoch (${REPORT_REST#*:}); omitting it." ;;
-        *) FAIL_EPOCH="${REPORT_REST#*:}" ;;
-      esac
-    fi
-  fi
-  EVAL_MARKER=""
-  if [ -n "$FAIL_EPOCH" ]; then
-    EVAL_MARKER=" ${EVAL_MARKER_PREFIX}${FAIL_EPOCH}]"
   fi
   if ! HEAD_SHA=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
     echo "::warning::Failed to resolve head SHA for PR #$PR; the workflow log remains authoritative."
     echo "::endgroup::"
     continue
   fi
-
   with_gh_retry gh api "repos/$REPO/check-runs" \
     -X POST \
     -f name="$CHECK_NAME" \
@@ -400,7 +297,7 @@ $SEL_SUMMARY" \
     -f status='completed' \
     -f conclusion='failure' \
     -F "output[title]=Approval continuation hit an infrastructure error" \
-    -F "output[summary]=PR #$PR could not complete its final merge-safety evaluation. ${STAGE_MARKER_PREFIX}${FAIL_STAGE}]${EVAL_MARKER} See workflow run logs: $RUN_URL" \
+    -F "output[summary]=PR #$PR could not complete its final merge-safety evaluation. ${STAGE_MARKER_PREFIX}${FAIL_STAGE}] See workflow run logs: $RUN_URL" \
     || echo "::warning::Failed to post the diagnostic check-run for PR #$PR; the workflow log still surfaces the failure."
   echo "::endgroup::"
 done

@@ -486,9 +486,16 @@ jobs:
                 continue
                 ;;
             esac
-            # The epoch pins the verdict in TIME: a failure posted after this
-            # verdict started is newer than the verdict and must survive it.
-            # The head it is ABOUT comes from the helper itself, below.
+            # When this invocation began. Used for one question only: was a
+            # given diagnostic already published before we started? A record
+            # that appeared afterwards belongs to an evaluation this verdict
+            # does not speak for, so it is left alone. Taken BEFORE either
+            # stage deliberately -- an earlier stamp is the conservative
+            # direction, since it qualifies fewer records for clearing.
+            #
+            # This is not an ordering scheme between invocations. Establishing
+            # a happens-before relation across concurrent runs is #1191; here
+            # each invocation answers only about its own start.
             eval_started_at=$(date -u +%s)
             # How far this pass actually got. The continuation runs in two
             # stages -- protective retraction, then the author-token readiness
@@ -516,14 +523,6 @@ jobs:
               echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but author-token continuation remains disabled."
               rc=0
             elif [ "$protective_rc" -eq 0 ]; then
-              # Re-stamp: the epoch must describe the stage it labels. The
-              # stamp above was taken before protective retraction, and if that
-              # stalls, a full-stage verdict carries a timestamp from long
-              # before the full stage ran -- so a genuinely newer full-stage
-              # failure reads as older than a clean verdict that actually
-              # preceded it, and can be cleared. A protective-only verdict
-              # keeps the original stamp, which is the stage it describes.
-              eval_started_at=$(date -u +%s)
               continuation_out="$(mktemp)"
               GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
                 MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
@@ -565,7 +564,7 @@ jobs:
               *)
                 echo "::error::Approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
                 continuation_infra_error=1
-                continuation_failing_prs="$continuation_failing_prs $PR:$continuation_stage:$eval_started_at"
+                continuation_failing_prs="$continuation_failing_prs $PR:$continuation_stage"
                 ;;
             esac
           done <<<"$PR_NUMBERS"
@@ -1000,9 +999,16 @@ jobs:
           continuation_evaluated_prs=""
           while IFS= read -r PR; do
             [ -n "$PR" ] || continue
-            # The epoch pins the verdict in TIME: a failure posted after this
-            # verdict started is newer than the verdict and must survive it.
-            # The head it is ABOUT comes from the helper itself, below.
+            # When this invocation began. Used for one question only: was a
+            # given diagnostic already published before we started? A record
+            # that appeared afterwards belongs to an evaluation this verdict
+            # does not speak for, so it is left alone. Taken BEFORE either
+            # stage deliberately -- an earlier stamp is the conservative
+            # direction, since it qualifies fewer records for clearing.
+            #
+            # This is not an ordering scheme between invocations. Establishing
+            # a happens-before relation across concurrent runs is #1191; here
+            # each invocation answers only about its own start.
             eval_started_at=$(date -u +%s)
             # How far this pass actually got. The continuation runs in two
             # stages -- protective retraction, then the author-token readiness
@@ -1030,14 +1036,6 @@ jobs:
               echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but scheduled author-token continuation remains disabled."
               rc=0
             elif [ "$protective_rc" -eq 0 ]; then
-              # Re-stamp: the epoch must describe the stage it labels. The
-              # stamp above was taken before protective retraction, and if that
-              # stalls, a full-stage verdict carries a timestamp from long
-              # before the full stage ran -- so a genuinely newer full-stage
-              # failure reads as older than a clean verdict that actually
-              # preceded it, and can be cleared. A protective-only verdict
-              # keeps the original stamp, which is the stage it describes.
-              eval_started_at=$(date -u +%s)
               continuation_out="$(mktemp)"
               GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
                 MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
@@ -1079,7 +1077,7 @@ jobs:
               *)
                 echo "::error::Scheduled approval continuation hit infrastructure/config error rc=$rc on PR #$PR."
                 continuation_infra_error=1
-                continuation_failing_prs="$continuation_failing_prs $PR:$continuation_stage:$eval_started_at"
+                continuation_failing_prs="$continuation_failing_prs $PR:$continuation_stage"
                 ;;
             esac
           done <<<"$PRS"
