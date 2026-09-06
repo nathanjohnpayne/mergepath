@@ -1226,11 +1226,18 @@ bootstrap::_yq_clean_repo_template() {
 #      not merely as a substring/suffix of some other host. This also
 #      fails closed on source_root not being a git repo at all -- there's
 #      no remote to read.
-#   2. A plain, unconfigured `git status --porcelain` succeeds and is
-#      empty. This is a conservative gate against a KNOWN mismatch risk
-#      (uncommitted or untracked changes at source_root that HEAD does
-#      not reflect) — not an attempt to reconcile every path the mirror's
-#      own exclude/rsync/resume behavior might separately drop or keep.
+#   2. A plain `git status --porcelain --untracked-files=all` succeeds
+#      and is empty. `--untracked-files=all` is pinned on the command
+#      line (Codex P2 on #1197) because a bare `git status` silently
+#      honors the operator's own `status.showUntrackedFiles=no`, under
+#      which an ordinary untracked file at source_root reads as clean
+#      even though rsync -a would still copy it. This is a conservative
+#      gate against a KNOWN mismatch risk (uncommitted or untracked
+#      changes at source_root that HEAD does not reflect) — not an
+#      attempt to reconcile every path the mirror's own
+#      exclude/rsync/resume behavior might separately drop or keep, nor
+#      to pin every other config knob (core.filemode, core.autocrlf,
+#      core.symlinks) that could affect what a mirrored TREE looks like.
 #   3. HEAD is reachable from some ref under source_root's own
 #      refs/remotes/origin/*. A sha that exists only in the operator's
 #      local clone is not reliably recoverable later -- another clone
@@ -1253,7 +1260,7 @@ bootstrap::_resolve_bootstrap_source_revision() {
   esac
 
   local status_output
-  status_output=$(git -C "$source_root" status --porcelain 2>/dev/null) || return 1
+  status_output=$(git -C "$source_root" status --porcelain --untracked-files=all 2>/dev/null) || return 1
   [ -z "$status_output" ] || return 1
 
   local sha

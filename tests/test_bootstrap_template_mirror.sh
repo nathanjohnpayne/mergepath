@@ -2219,6 +2219,39 @@ dirty_subject=$(git -C "$DIRTY_TARGET" log -1 --format=%s)
   && pass "a dirty source_root falls back to the un-attributed subject (#1056)" \
   || fail "dirty source_root was wrongly attributed: $dirty_subject"
 
+# ---------------------------------------------------------------------------
+# Codex P2 on #1197: a bare `git status --porcelain` silently honors the
+# operator's own status.showUntrackedFiles=no, under which an ordinary
+# untracked file reads as clean even though rsync -a would still copy it.
+# Verify the fixture actually reproduces an empty `git status --porcelain`
+# under that config before asserting the fix, so this test cannot pass
+# vacuously.
+# ---------------------------------------------------------------------------
+UNTRACKED_SOURCE="$WORKDIR/source-untracked-hidden"
+mkdir -p "$UNTRACKED_SOURCE"
+git -C "$UNTRACKED_SOURCE" init -q -b main
+git -C "$UNTRACKED_SOURCE" remote add origin "https://github.com/nathanjohnpayne/mergepath.git"
+echo "content" >"$UNTRACKED_SOURCE/file.txt"
+git -C "$UNTRACKED_SOURCE" add -A
+git -C "$UNTRACKED_SOURCE" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+  commit -q -m "untracked-hidden seed"
+git -C "$UNTRACKED_SOURCE" update-ref refs/remotes/origin/main HEAD
+git -C "$UNTRACKED_SOURCE" config status.showUntrackedFiles no
+echo "stray content" >"$UNTRACKED_SOURCE/stray.txt"
+if [ -n "$(git -C "$UNTRACKED_SOURCE" status --porcelain)" ]; then
+  fail "untracked-hidden fixture did not reproduce the status.showUntrackedFiles=no blind spot: $(git -C "$UNTRACKED_SOURCE" status --porcelain)"
+fi
+
+UNTRACKED_TARGET="$WORKDIR/target-untracked-hidden"
+mkdir -p "$UNTRACKED_TARGET"
+echo seed >"$UNTRACKED_TARGET/README.md"
+run_init_target_git "$UNTRACKED_TARGET" "$UNTRACKED_SOURCE"
+
+untracked_subject=$(git -C "$UNTRACKED_TARGET" log -1 --format=%s)
+[ "$untracked_subject" = "Initial commit (bootstrapped from mergepath)" ] \
+  && pass "a stray untracked file hidden by status.showUntrackedFiles=no blocks attribution (#1056 Codex P2 on #1197)" \
+  || fail "untracked-hidden source_root wrongly attributed: $untracked_subject"
+
 # --- outcome 3: unresolvable/noncanonical-source fallback ---
 NONCANONICAL_SOURCE="$WORKDIR/source-noncanonical"
 mkdir -p "$NONCANONICAL_SOURCE"
