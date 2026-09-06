@@ -20,10 +20,12 @@ The governing principle is that these are **distinct decision rights with distin
 
 | Rule | Control point | Actor |
 |---|---|---|
-| **1** — contract ratified against the issue, with named guarantees and residual costs visible | PR authoring / open | **Owner** ratifies |
-| **The checkpoint** — original ask, named additional guarantees, relevant failure costs | The PR template carries the artifact | Author reports |
-| **3, 5** — mechanism lineage and scope delta reported whenever a finding would strengthen a guarantee; escalation offers fix / reduce-defer / remove / recut / accept residual | During implementation and escalation (#1201) | Author reports, owner decides |
-| **2, 11** — what constitutes an in-contract blocking finding, and how adjacent findings are recorded | The review request machinery, or REVIEW_POLICY.md | Reviewer — *this is genuinely review behavior and belongs under the existing authority* |
+| **1** — contract ratified against the issue, with named guarantees and residual costs visible | PR authoring / open — **#1202** | **Owner** ratifies |
+| **The checkpoint** — original ask, named additional guarantees, relevant failure costs | The PR template carries the artifact — **#1202** | Author reports |
+| **3, 5** — mechanism lineage and scope delta reported whenever a finding would strengthen a guarantee; escalation offers fix / reduce-defer / remove / recut / accept residual | During implementation and escalation — **#1201** | Author reports, owner decides |
+| **2, 11** — what constitutes an in-contract blocking finding, and how adjacent findings are recorded | The review-request machinery, or REVIEW_POLICY.md — **#1199** | Reviewer — *this is genuinely review behavior and belongs under the existing authority* |
+
+Ratification is the input the other two depend on: an escalation that fires when a finding would *strengthen* a guarantee needs a ratified guarantee list to strengthen relative to, and telling a reviewer what is in-contract presumes a contract someone agreed to. #1202 is therefore first in sequence as well as cheapest.
 
 PR authoring/open is where #1189 should have been stopped, and no amount of doctrine in a `docs/agents/` file would have stopped it.
 
@@ -63,7 +65,7 @@ The attribution is worth more than the total. **The three review rounds account 
 
 That is the fourth unmeasured claim caught in this file, and the fifth counting the round count. The first three were caught by a reviewer or a peer. This one was caught only because the owner asked for it to be preserved in writing — which is the general case worth noting: **a claim becomes checkable at the moment someone asks to record it**, and every one of these survived unchecked precisely as long as it was only being asserted.
 
-Enforcement is tracked in #1199 (rules 2 and 11, at the review-request machinery) and #1201 (rules 3 and 5, at the escalation surface). Rule 5 is load-bearing *without* being automatable, and #1199 records why the mechanical version of it was withdrawn.
+Enforcement is tracked in #1202 (rule 1 and the checkpoint artifact, at PR open), #1201 (rules 3 and 5, at the escalation surface) and #1199 (rules 2 and 11, at the review-request machinery). Rule 5 is load-bearing *without* being automatable, and #1199 records why the mechanical version of it was withdrawn.
 
 ## 1. Get the contract ratified, not merely frozen
 
