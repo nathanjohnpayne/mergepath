@@ -14,33 +14,35 @@
 # re-run to success while the check-run stayed red).
 #
 # ─────────────────────────────────────────────────────────────────────
-# What this guarantees, and what it deliberately does not
+# The contract — exactly five guarantees, and one accepted residual
 # ─────────────────────────────────────────────────────────────────────
 #
-# GUARANTEED (sequential / re-evaluation semantics): a diagnostic left by an
-# earlier evaluation of the same head and stage is cleared by a later clean
-# evaluation of that head and stage. That is #1188, and it is the whole point.
+#   1. A later clean evaluation can clear an existing diagnostic from the same
+#      head and stage that PREDATES that evaluation.
+#   2. A clear is PATCH-by-id, and therefore cannot supersede a failure it did
+#      not observe.
+#   3. The emitted head and stage accurately describe what that invocation
+#      actually evaluated.
+#   4. Failures to perform the clear surface as failures, never as silent
+#      greens.
+#   5. Arbitrary concurrent ordering may leave a false RED. That is explicitly
+#      acceptable.
 #
-# GUARANTEED (fail-safe under concurrency): an evaluation never clears a
-# failure it did not see. A clear touches exactly one check-run, chosen because
-# it was already published when this invocation began, addressed by its own id.
-# Anything published afterwards is untouched and keeps gating.
+# Nothing here answers "which invocation was really newer?". That question
+# requires a happens-before relation between concurrent workflow invocations,
+# the Checks API offers no primitive for one -- no conditional write, no
+# compare-and-swap, a single mutable text field per run -- and every attempt to
+# encode one here closed one interleaving while opening another. Five such
+# mechanisms were implemented and removed on this branch: an evaluation-epoch
+# marker, a clean-verdict watermark, a read-after-write reconciliation for the
+# burial race that watermark created, evaluation-order arbitration across every
+# run on the head, and a per-stage epoch re-stamp. #1191 owns that requirement
+# and treats the state/serialization substrate as the design problem.
 #
-# NOT GUARANTEED (accepted, #1191): convergence under arbitrary interleaving.
-# An older invocation can publish a stale failure AFTER a newer clean
-# invocation has already completed its clear step. Nothing here reconciles
-# that, so without a later qualifying event the head can stay red. On a
-# consumer with `scheduled_sweep_enabled: false` no such event is guaranteed.
-#
-# That asymmetry is deliberate. A false RED costs a re-run; a false GREEN
-# removes a merge-blocking safety diagnostic. Establishing a happens-before
-# relation between concurrent workflow invocations is not something the Checks
-# API can express — it offers no conditional write, no compare-and-swap, and a
-# single mutable text field per run — and the attempts to encode one here (an
-# evaluation-epoch marker, a clean-verdict watermark with read-after-write
-# reconciliation, evaluation-order arbitration across every run on the head)
-# each closed one interleaving and opened another. #1191 owns that problem and
-# treats the state/serialization substrate as the design question.
+# A reviewer can therefore be entirely CORRECT about a concurrent execution
+# that leaves a stale red, and the right disposition is still "valid, #1191, no
+# code change". Validity and scope are separate questions here. A false red
+# costs a re-run; a false green removes a merge-blocking safety diagnostic.
 #
 # ─────────────────────────────────────────────────────────────────────
 # Why the clear is narrow

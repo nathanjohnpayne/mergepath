@@ -921,6 +921,28 @@ else
   echo "  FAIL: protective-snapshot drift must withhold the evaluated head, not report an unacted one" >&2
 fi
 
+# The contract is stated in the reporter header as exactly five guarantees, and
+# review scope is triaged against it. Pin that it is present and enumerated: a
+# reviewer -- human or bot -- needs to be able to read the boundary out of the
+# file rather than infer it from the code, and a finding that requires
+# cross-invocation ordering is dispositioned "valid, #1191, no code change"
+# rather than fixed here.
+#
+# Anchored on a sentence that does not wrap: the more obvious phrase ("valid,
+# #1191, no code change") is split across two comment lines, and a line-oriented
+# grep silently never matches it -- which is how the first draft of this check
+# reported 5/5 guarantees found and still failed.
+contract_lines=$(awk '/The contract — exactly five guarantees/{f=1} f&&/^#   [1-5]\./{n++} END{print n+0}' "$CONTINUATION_REPORTER")
+if [ "${contract_lines:-0}" -eq 5 ] \
+   && grep -qF 'Arbitrary concurrent ordering may leave a false RED' "$CONTINUATION_REPORTER" \
+   && grep -qF 'Validity and scope are separate questions' "$CONTINUATION_REPORTER"; then
+  pass=$((pass + 1))
+  echo "  PASS: the reporter states its five guarantees and the accepted residual"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the reporter must enumerate its five guarantees and name the accepted residual (found ${contract_lines:-0}/5)" >&2
+fi
+
 # Round-trip: the marker the FAILURE arm writes must be the one the CLEAR arm
 # reads. These are two independent string expressions in the same file, so a
 # drift between them would silently downgrade every protective diagnostic to
