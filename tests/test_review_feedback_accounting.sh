@@ -723,10 +723,13 @@ mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
 run_gate
 assert_eq 1 "$RUN_RC" "unclosed fenced CodeRabbit confirmation pair is not a trusted suffix"
 
-# #1167: CodeRabbit acknowledges a disposition by editing its finding, in more
-# than one wording. No wording may raise the evidence floor, recognition is
-# anchored on the generated-reply marker rather than the wording, and the
-# revision the relay archives at that edit is not a second finding.
+# #1167: CodeRabbit acknowledges a disposition by editing its finding, in the
+# shapes the vendor actually emits: the finding's own footer rewritten to the
+# reply marker plus a confirmation line; reply marker, line, reply marker;
+# reply marker, line, comment footer; and any of them stacked. No shape may
+# raise the evidence floor, recognition is anchored on the footer markers
+# rather than the wording, and the revision the relay archives at that edit
+# is not a second finding.
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [
@@ -737,7 +740,7 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
     "user": {"login": "coderabbitai[bot]"},
     "path": "scripts/a.sh",
     "line": 4,
-    "body": "_🟡 Minor_ Clarify the error\n\n<!-- This is an auto-generated comment by CodeRabbit -->"
+    "body": "_🟡 Minor_ Clarify the error\n\n<!-- cr-comment:v1:0123456789abcdef -->\n\n<!-- This is an auto-generated comment by CodeRabbit -->"
   },
   {
     "id": 21,
@@ -753,78 +756,129 @@ JSON
 cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-before-ack.json"
 run_gate
 assert_eq 0 "$RUN_RC" "author reply reconciles the CodeRabbit finding before any acknowledgement"
-jq '.[0].updated_at = "2026-08-18T21:02:00Z"
-  | .[0].body += "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678"' \
-  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
-mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+
+# ack_edit <jq body filter> <updated_at> — apply one acknowledgement edit to the root finding.
+ack_edit() {
+  jq --arg at "$2" ".[0].updated_at = \$at | .[0].body |= ($1)" \
+    "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+  mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+}
+# Shape 1: the comment footer is rewritten to the reply marker and a line is appended.
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
 run_gate
-assert_eq 0 "$RUN_RC" "commit-naming acknowledgement after the marker does not raise the evidence floor (#1167)"
-jq '.[0].updated_at = "2026-08-18T21:03:00Z"
-  | .[0].body += "\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' \
-  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
-mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+assert_eq 0 "$RUN_RC" "footer-swap acknowledgement with the commit-naming line does not raise the evidence floor (#1167)"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-acked-once.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' "2026-08-18T21:03:00Z"
 run_gate
 assert_eq 0 "$RUN_RC" "a second acknowledgement stacked on the first keeps the finding accounted"
-cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-acked.json"
-jq '.[0].updated_at = "2026-08-18T21:04:00Z"
-  | .[0].body += "\n\nordinary trailing content"' \
-  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
-mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
-run_gate
-assert_eq 1 "$RUN_RC" "visible content after the acknowledgement pairs is an ordinary edit"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-acked-twice.json"
+# Shape 2: reply marker, line, reply marker, appended whole.
 cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
-jq '.[0].updated_at = "2026-08-18T21:02:00Z"
-  | .[0].body += "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Verified in a later commit"' \
-  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
-mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' "2026-08-18T21:02:00Z"
 run_gate
-assert_eq 0 "$RUN_RC" "acknowledgement recognition is anchored on the generated-reply marker, not the wording"
+assert_eq 0 "$RUN_RC" "bracketed acknowledgement (marker, line, marker) does not raise the evidence floor"
+# Shape 3: reply marker, login-naming line, comment footer.
 cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
-jq '.[0].updated_at = "2026-08-18T21:02:00Z"
-  | .[0].body += "\n\n✅ Addressed in commit def5678"' \
-  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
-mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated comment by CodeRabbit -->")' "2026-08-18T21:02:00Z"
 run_gate
-assert_eq 1 "$RUN_RC" "a confirmation line without CodeRabbit's marker is an ordinary edit"
+assert_eq 0 "$RUN_RC" "login-naming line between the reply marker and the comment footer is an acknowledgement"
+# The wording is not load-bearing.
 cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
-jq '.[0].updated_at = "2026-08-18T21:02:00Z"
-  | .[0].body += "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne"' \
-  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
-mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Verified in a later commit"' "2026-08-18T21:02:00Z"
 run_gate
-assert_eq 0 "$RUN_RC" "login-naming acknowledgement is recognised with the marker first"
+assert_eq 0 "$RUN_RC" "acknowledgement recognition is anchored on the footer marker, not the confirmation wording"
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅️  Addressed in commit def5678"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "a confirmation line with a variation selector and a double space is still recognised"
+# CRLF bodies.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+jq '.[0].body |= gsub("\n"; "\r\n")' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-before-ack-crlf.json"
+ack_edit '. + "\r\n\r\n<!-- This is an auto-generated reply by CodeRabbit -->\r\n\r\n✅ Addressed in commit def5678\r\n\r\n<!-- This is an auto-generated reply by CodeRabbit -->"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "a CRLF acknowledgement does not raise the evidence floor"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-acked-crlf.json"
+# Negatives: the run must end the body, and a line alone is not an acknowledgement.
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\nordinary trailing content"' "2026-08-18T21:04:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "visible content after the acknowledgement run is an ordinary edit"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n```text\nappended after the acknowledgement\n```"' "2026-08-18T21:04:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "a code fence after the acknowledgement run is an ordinary edit"
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+jq '.[0].body = "_🟡 Minor_ Clarify the error"' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n✅ Addressed in commit def5678"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "a confirmation line with no CodeRabbit footer anywhere is an ordinary edit"
 
 # The relay archives the pre-acknowledgement revision when CodeRabbit edits
 # the finding. That revision is the finding the reply already dispositioned,
 # so it must not demand an acknowledgement token of its own.
-cp "$TMP/fixtures/inline-acked.json" "$TMP/fixtures/inline.json"
+# archive_of <body file> <comment id> — one relay record as the issues fixture.
+archive_of() {
+  local rendered
+  rendered=$("$RENDER_ARCHIVE" inline 20 'coderabbitai[bot]' '2026-08-18T21:02:00Z' "$1")
+  jq -n --arg archive "$rendered" --argjson id "$2" '[{
+    "id": $id,
+    "created_at": "2026-08-18T21:02:01Z",
+    "updated_at": "2026-08-18T21:02:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }]' >"$TMP/fixtures/issues.json"
+}
 PRE_ACK_BODY="$TMP/pre-ack-body.txt"
 jq -r '.[0].body' "$TMP/fixtures/inline-before-ack.json" >"$PRE_ACK_BODY"
-PRE_ACK_ARCHIVE=$("$RENDER_ARCHIVE" inline 20 'coderabbitai[bot]' \
-  '2026-08-18T21:02:00Z' "$PRE_ACK_BODY")
-jq -n --arg archive "$PRE_ACK_ARCHIVE" '[{
-  "id": 8700,
-  "created_at": "2026-08-18T21:02:01Z",
-  "updated_at": "2026-08-18T21:02:01Z",
-  "user": {"login": "github-actions[bot]"},
-  "body": $archive
-}]' >"$TMP/fixtures/issues.json"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+archive_of "$PRE_ACK_BODY" 8700
 run_gate
-assert_eq 0 "$RUN_RC" "an archived revision that differs from the live finding only by acknowledgements is not a second finding (#1167)"
+assert_eq 0 "$RUN_RC" "an archived revision that differs from the live finding only by the footer swap and line is not a second finding (#1167)"
 assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "acknowledgement-only archive demands no inline acknowledgement token"
+cp "$TMP/fixtures/inline-acked-twice.json" "$TMP/fixtures/inline.json"
+jq -r '.[0].body' "$TMP/fixtures/inline-acked-once.json" >"$TMP/acked-once-body.txt"
+archive_of "$TMP/acked-once-body.txt" 8701
+run_gate
+assert_eq 0 "$RUN_RC" "an archived first-acknowledgement revision collapses with the twice-acknowledged live finding"
+cp "$TMP/fixtures/inline-acked-crlf.json" "$TMP/fixtures/inline.json"
+jq -r '.[0].body' "$TMP/fixtures/inline-before-ack-crlf.json" >"$TMP/pre-ack-body-crlf.txt"
+archive_of "$TMP/pre-ack-body-crlf.txt" 8702
+run_gate
+assert_eq 0 "$RUN_RC" "a CRLF archived revision collapses with its CRLF acknowledged live finding"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
 printf '%s\n\nAlso bound the retry counter.\n' "$(cat "$PRE_ACK_BODY")" >"$TMP/pre-ack-body-edited.txt"
-EDITED_ARCHIVE=$("$RENDER_ARCHIVE" inline 20 'coderabbitai[bot]' \
-  '2026-08-18T21:02:00Z' "$TMP/pre-ack-body-edited.txt")
-jq -n --arg archive "$EDITED_ARCHIVE" '[{
-  "id": 8701,
-  "created_at": "2026-08-18T21:02:01Z",
-  "updated_at": "2026-08-18T21:02:01Z",
-  "user": {"login": "github-actions[bot]"},
-  "body": $archive
-}]' >"$TMP/fixtures/issues.json"
+archive_of "$TMP/pre-ack-body-edited.txt" 8703
 run_gate
 assert_eq 1 "$RUN_RC" "an archived revision with different visible content still needs its own acknowledgement"
 assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "content-changed archive keeps the inline-archive shape"
+# archive_version 1 records: without a body the record is inventoried as before, never a crash;
+# with a body it compares like a v2 record. The fingerprint is not checked against a v1 body.
+v1_record() {  # v1_record <comment id> [body file]
+  local payload
+  if [ -n "${2:-}" ]; then
+    payload=$(jq -n --rawfile body "$2" '{archive_version:1,source_kind:"inline",source_comment_id:20,source_login:"coderabbitai[bot]",archived_at:"2026-08-18T21:02:00Z",body_fingerprint:"0123456789ab",codex_tiers:[],coderabbit_tiers:["p2"],body:($body | rtrimstr("\n"))}')
+  else
+    payload=$(jq -n '{archive_version:1,source_kind:"inline",source_comment_id:20,source_login:"coderabbitai[bot]",archived_at:"2026-08-18T21:02:00Z",body_fingerprint:"0123456789ab",codex_tiers:[],coderabbit_tiers:["p2"]}')
+  fi
+  jq -n --arg marker "<!-- mergepath-feedback-archive:v1 $(printf '%s' "$payload" | base64 | tr -d '\n') -->" --argjson id "$1" '[{
+    "id": $id,
+    "created_at": "2026-08-18T21:02:01Z",
+    "updated_at": "2026-08-18T21:02:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $marker
+  }]' >"$TMP/fixtures/issues.json"
+}
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+v1_record 8704
+run_gate
+assert_eq 1 "$RUN_RC" "a body-less archive_version 1 record is inventoried, not a crash"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "body-less v1 record keeps the inline-archive shape"
+v1_record 8705 "$PRE_ACK_BODY"
+run_gate
+assert_eq 0 "$RUN_RC" "an archive_version 1 record carrying the pre-acknowledgement body collapses with the acknowledged live finding"
 
 reset_fixtures
 cat >"$TMP/fixtures/reviews.json" <<'JSON'
