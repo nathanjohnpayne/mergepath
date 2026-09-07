@@ -410,42 +410,65 @@ agent_reply_after_finding() {
 #   2. reply marker, confirmation line, reply marker;
 #   3. reply marker, confirmation line, `auto-generated comment` footer;
 #   4. confirmation line, then either footer (the original #1000 form);
+#   5. the footer rewritten to the reply marker with NO confirmation line,
+#      after a reply CodeRabbit does not confirm (handled below the FINDINGS
+#      loop from the relay's record, since it carries no marker of its own);
 # and any of them stacked when CodeRabbit acknowledges again. The wording of
 # the confirmation line varies (`✅ Confirmed as addressed by @<login>`,
 # `✅ Addressed in commit <sha>`, plurals), so recognition is anchored on the
-# vendor's generated footer markers, either kind, and the confirmation line
-# only has to be one ✅ line (#1167).
+# vendor's generated footer markers, either kind (#1167).
 #
 # The model is a trailing RUN: the lines at the end of the body that are a
-# footer marker or a confirmation line, blank lines allowed between them.
-# The run acknowledges when it holds at least one marker and at least one
-# confirmation line. Anything else after the run, visible content or a code
-# fence, is an ordinary edit, and a run inside a fence is not a run.
+# footer marker or a confirmation line, blank lines allowed between them. A
+# ✅ line is a confirmation when it carries a known confirmation wording or
+# when the non-blank line directly above it is the reply marker, which is
+# where every observed shape puts it; a content line that happens to start
+# with ✅ before the finding's own footer stays content. The run acknowledges
+# when it holds at least one marker and at least one confirmation line.
+# Anything after the run, visible content or a code fence, is an ordinary
+# edit, and a run inside a fence is not a run.
 #
 # mode=run prints the run (trimmed, non-blank; may be empty); mode=suffix
 # prints it and exits 1 unless it acknowledges; mode=strip prints the body
 # without the run; mode=trim prints the body with only trailing blank lines
-# removed. strip and trim print trimmed lines (no CR, no trailing spaces) so
-# two revisions compare on content.
+# removed. strip and trim print lines with only the carriage return removed,
+# so two revisions compare on content, trailing spaces included.
 CODERABBIT_ACK_PAIR_AWK='
   function trimmed(s) { sub(/\r$/, "", s); sub(/[ \t]+$/, "", s); return s }
+  function crless(s) { sub(/\r$/, "", s); return s }
+  function is_reply(s) {
+    return s ~ /^<!-- This is an auto-generated reply by CodeRabbit -->$/
+  }
   function is_marker(s) {
     return s ~ /^<!-- This is an auto-generated (comment|reply) by CodeRabbit -->$/
   }
-  function is_confirmation(s) { return s ~ /^✅[^ \t]*[ \t]+[^ \t]/ }
-  { t[NR] = trimmed($0) }
+  function is_check(s) { return s ~ /^✅[^ \t]*[ \t]+[^ \t]/ }
+  function is_known(s) {
+    return s ~ /^✅[^ \t]*[ \t]+(Confirmed as addressed by @[A-Za-z0-9-]+$|Addressed in commits? )/
+  }
+  { raw[NR] = crless($0); t[NR] = trimmed($0) }
   END {
     n = NR
     while (n > 0 && t[n] == "") n--
-    i = n
+    m = 0
+    for (k = 1; k <= n; k++) if (t[k] != "") nb[++m] = k
+    p = m
     markers = 0
     confirmations = 0
-    while (i > 0) {
-      if (t[i] == "") { i--; continue }
-      if (is_marker(t[i])) { markers++; i--; continue }
-      if (is_confirmation(t[i])) { confirmations++; i--; continue }
+    while (p > 0) {
+      k = nb[p]
+      if (is_marker(t[k])) { markers++; p--; continue }
+      if (is_check(t[k])) {
+        above = (p > 1) ? nb[p - 1] : 0
+        if (is_known(t[k]) || (above && is_reply(t[above]))) {
+          confirmations++
+          p--
+          continue
+        }
+      }
       break
     }
+    i = (p > 0) ? nb[p] : 0
     if (mode == "run" || mode == "suffix") {
       for (k = i + 1; k <= n; k++) if (t[k] != "") print t[k]
       if (mode == "suffix" && (markers == 0 || confirmations == 0)) exit 1
@@ -453,20 +476,34 @@ CODERABBIT_ACK_PAIR_AWK='
     }
     end = n
     if (mode == "strip") end = i
-    for (k = 1; k <= end; k++) print t[k]
+    for (k = 1; k <= end; k++) print raw[k]
   }
 '
 
 # coderabbit_ack_run <body> — the trailing footer/confirmation run of a
-# CodeRabbit body, only when the raw body and its fence-aware visible text
-# agree on it; exit 1 when they do not (a run inside an unclosed fence, or
-# a fence after the run). Empty output with exit 0 means "no run".
+# CodeRabbit body, when the raw body and its fence-aware visible text agree
+# on it: the raw run must be the tail of the visible run (the visible run may
+# reach further up through a region the scan suppresses). Exit 1 when they
+# disagree: a run inside an unclosed fence, or a fence after the run. Empty
+# output with exit 0 means "no run".
 coderabbit_ack_run() {
-  local body="$1" visible raw_run visible_run
+  local body="$1" visible raw_run visible_run vl rl
   visible=$(coderabbit_finding_scan "$body") || return 1
   raw_run=$(printf '%s\n' "$body" | awk -v mode=run "$CODERABBIT_ACK_PAIR_AWK")
   visible_run=$(printf '%s\n' "$visible" | awk -v mode=run "$CODERABBIT_ACK_PAIR_AWK")
-  [ "$raw_run" = "$visible_run" ] || return 1
+  if [ -z "$raw_run" ]; then
+    [ -z "$visible_run" ] || return 1
+    return 0
+  fi
+  vl=${#visible_run}
+  rl=${#raw_run}
+  if [ "$vl" -eq "$rl" ]; then
+    [ "$visible_run" = "$raw_run" ] || return 1
+  else
+    [ "$vl" -gt "$rl" ] || return 1
+    [ "${visible_run:$((vl - rl))}" = "$raw_run" ] || return 1
+    [ "${visible_run:$((vl - rl - 1)):1}" = $'\n' ] || return 1
+  fi
   printf '%s' "$raw_run"
 }
 
@@ -480,30 +517,34 @@ coderabbit_ack_suffix() {
   printf '%s' "$run"
 }
 
-# coderabbit_ack_login <suffix> — the configured identity a login-naming
-# confirmation names, or exit 1. Only that wording carries one; the
-# commit-naming form and any other marker-anchored wording reset the floor
-# without naming anyone.
+# coderabbit_ack_login <suffix> — the first configured identity a
+# login-naming confirmation names, or exit 1. Only that wording carries one;
+# the commit-naming form and any other marker-anchored wording reset the
+# floor without naming anyone.
 coderabbit_ack_login() {
   local suffix="$1" login
-  login=$(printf '%s\n' "$suffix" | awk '
-    /^✅ Confirmed as addressed by @[A-Za-z0-9-]+$/ {
-      sub(/^✅ Confirmed as addressed by @/, "")
-      login = $0
-    }
-    END { if (login != "") print login }
-  ')
-  [ -n "$login" ] || return 1
-  printf '%s' "$AGENT_LOGINS_JSON" \
-    | jq -e --arg login "$login" 'index($login) != null' >/dev/null 2>&1 \
-    || return 1
-  printf '%s' "$login"
+  while IFS= read -r login; do
+    [ -n "$login" ] || continue
+    if printf '%s' "$AGENT_LOGINS_JSON" \
+      | jq -e --arg login "$login" 'index($login) != null' >/dev/null 2>&1; then
+      printf '%s' "$login"
+      return 0
+    fi
+  done <<EOF
+$(printf '%s\n' "$suffix" | awk '
+  /^✅[^ \t]*[ \t]+Confirmed as addressed by @[A-Za-z0-9-]+$/ {
+    sub(/^✅[^ \t]*[ \t]+Confirmed as addressed by @/, "")
+    print
+  }')
+EOF
+  return 1
 }
 
 # coderabbit_strip_ack_suffix <body> — the body without its trailing
-# footer/confirmation run, trimmed line by line, for comparing two revisions
-# of one finding on content. The run is removed only when the raw body and
-# its visible text agree on it; otherwise only trailing blank lines go.
+# footer/confirmation run, carriage returns and trailing blank lines removed,
+# for comparing two revisions of one finding on content. The run is removed
+# only when the raw body and its visible text agree on it; otherwise only the
+# carriage returns and trailing blank lines go.
 coderabbit_strip_ack_suffix() {
   local body="$1" mode=strip
   coderabbit_ack_run "$body" >/dev/null 2>&1 || mode=trim
@@ -700,6 +741,55 @@ printf '%s' "$V2_ARCHIVE_ENTRIES" | jq -e 'all(.[]; .payload | type == "object")
   >/dev/null 2>&1 || die 2 "chunked feedback archive payload is malformed"
 ARCHIVE_ENTRIES=$(printf '%s\n%s\n' "$ARCHIVE_ENTRIES" "$V2_ARCHIVE_ENTRIES" \
   | jq -cs '.[0] + .[1]')
+
+# #1167, with the relay's record available: an edit that changed no visible
+# content never raises a CodeRabbit inline finding's evidence floor, whether
+# or not it carried a confirmation line (CodeRabbit also rewrites its footer
+# to the reply marker after a reply it does not confirm, with no line at
+# all). The floor is then the newest archived revision whose content differs
+# from the live body, or the finding's creation when none does. Only findings
+# still unaccounted are revisited, and only when some archived revision has
+# the live body's content, which is what proves the latest edit was empty.
+# Without such a record that edit stays an ordinary edit.
+REFINED_FINDINGS='[]'
+while IFS= read -r finding; do
+  [ -n "$finding" ] || continue
+  if [ "$(printf '%s' "$finding" | jq -r '.accounted')" = true ] \
+    || [ "$(printf '%s' "$finding" | jq -r '.reviewer')" != "$CODERABBIT_BOT" ]; then
+    REFINED_FINDINGS=$(printf '%s\n%s\n' "$REFINED_FINDINGS" "$finding" | jq -cs '.[0] + [.[1]]')
+    continue
+  fi
+  finding_id=$(printf '%s' "$finding" | jq -r '.finding_id')
+  root_id=$(printf '%s' "$finding" | jq -r '.root_id')
+  live_stripped=$(coderabbit_strip_ack_suffix "$(printf '%s' "$finding" | jq -r '.body // ""')")
+  content_floor=""
+  content_matched=false
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    archived_at=$(printf '%s' "$entry" | jq -r '.archived_at')
+    if [ "$(coderabbit_strip_ack_suffix "$(printf '%s' "$entry" | jq -r '.payload.body')")" = "$live_stripped" ]; then
+      content_matched=true
+    elif [ -z "$content_floor" ] || [ "$archived_at" \> "$content_floor" ]; then
+      content_floor="$archived_at"
+    fi
+  done <<EOF
+$(printf '%s' "$ARCHIVE_ENTRIES" | jq -c --argjson id "$finding_id" --arg login "$CODERABBIT_BOT" '
+  .[] | select((.payload.source_kind // "issue-comment") == "inline"
+    and .payload.source_comment_id == $id
+    and .payload.source_login == $login
+    and (.payload.body | type) == "string")')
+EOF
+  if [ "$content_matched" = true ]; then
+    [ -n "$content_floor" ] || content_floor=$(printf '%s' "$finding" | jq -r '.created_at')
+    if agent_reply_after_finding "$root_id" "$content_floor" "$finding_id" ""; then
+      finding=$(printf '%s' "$finding" | jq -c '.accounted = true | .evidence = "thread-reply"')
+    fi
+  fi
+  REFINED_FINDINGS=$(printf '%s\n%s\n' "$REFINED_FINDINGS" "$finding" | jq -cs '.[0] + [.[1]]')
+done <<EOF
+$(printf '%s' "$FINDINGS" | jq -c '.[]')
+EOF
+FINDINGS="$REFINED_FINDINGS"
 
 ARCHIVED_CANDIDATES='[]'
 append_archive_candidate() {
