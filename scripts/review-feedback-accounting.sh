@@ -402,25 +402,96 @@ agent_reply_after_finding() {
     ' >/dev/null 2>&1
 }
 
-coderabbit_confirmation_login() {
-  local body="$1" login visible
-  visible=$(coderabbit_finding_scan "$body") || return 1
-  login=$(printf '%s\n' "$visible" | awk '
-    /^[[:space:]]*$/ {next}
-    {penultimate=last; last=$0}
-    END {
-      if (last ~ /^<!-- This is an auto-generated (comment|reply) by CodeRabbit -->$/ \
-          && penultimate ~ /^✅ Confirmed as addressed by @[A-Za-z0-9-]+$/) {
-        sub(/^✅ Confirmed as addressed by @/, "", penultimate)
-        print penultimate
+# CodeRabbit acknowledges a disposition by EDITING its finding comment rather
+# than replying, so every acknowledgement advances the finding's updated_at.
+# The acknowledgement is a trailing pair of visible lines: CodeRabbit's
+# generated-reply marker and one confirmation line, adjacent
+# (blank lines between them are fine), in either order, and the pair repeats
+# when CodeRabbit acknowledges twice. Two confirmation wordings are known,
+# `✅ Confirmed as addressed by @<login>` and `✅ Addressed in commit <sha>`.
+# The marker is the stable vendor signal the pair is anchored on, and the
+# confirmation line only has to be one ✅ line, so a third wording cannot
+# reopen #1167. The finding's own `auto-generated comment` footer is a
+# different marker and never pairs. Nothing after the last pair is
+# tolerated: a pair followed by other visible content, or inside a fence, is
+# an ordinary edit.
+#
+# mode=suffix prints the trailing pairs (visible, non-blank, trimmed) and
+# exits 1 when there are none; mode=strip prints the body without them;
+# mode=trim prints the body with only trailing blank lines removed.
+CODERABBIT_ACK_PAIR_AWK='
+  function trimmed(s) { sub(/\r$/, "", s); sub(/[ \t]+$/, "", s); return s }
+  function is_marker(s) {
+    return s ~ /^<!-- This is an auto-generated reply by CodeRabbit -->$/
+  }
+  function is_confirmation(s) { return s ~ /^✅ [^ \t]/ }
+  { raw[NR] = $0; t[NR] = trimmed($0) }
+  END {
+    n = NR
+    while (n > 0 && t[n] == "") n--
+    i = n
+    pairs = 0
+    while (i >= 2) {
+      j = i - 1
+      while (j > 0 && t[j] == "") j--
+      if (j < 1) break
+      if ((is_marker(t[j]) && is_confirmation(t[i])) \
+          || (is_confirmation(t[j]) && is_marker(t[i]))) {
+        pairs++
+        i = j - 1
+        while (i > 0 && t[i] == "") i--
+      } else {
+        break
       }
     }
-  ' | tail -n 1)
+    if (mode == "suffix") {
+      if (pairs == 0) exit 1
+      for (k = i + 1; k <= n; k++) if (t[k] != "") print t[k]
+      exit 0
+    }
+    end = n
+    if (mode == "strip" && pairs > 0) end = i
+    for (k = 1; k <= end; k++) print raw[k]
+  }
+'
+
+# coderabbit_ack_suffix <body> — the trusted acknowledgement suffix of a
+# CodeRabbit finding body, or exit 1 when its visible text does not end in
+# acknowledgement pairs.
+coderabbit_ack_suffix() {
+  local body="$1" visible
+  visible=$(coderabbit_finding_scan "$body") || return 1
+  printf '%s\n' "$visible" | awk -v mode=suffix "$CODERABBIT_ACK_PAIR_AWK"
+}
+
+# coderabbit_ack_login <suffix> — the configured identity a login-naming
+# confirmation names, or exit 1. Only that wording carries one; the
+# commit-naming form and any other marker-anchored wording reset the floor
+# without naming anyone.
+coderabbit_ack_login() {
+  local suffix="$1" login
+  login=$(printf '%s\n' "$suffix" | awk '
+    /^✅ Confirmed as addressed by @[A-Za-z0-9-]+$/ {
+      sub(/^✅ Confirmed as addressed by @/, "")
+      login = $0
+    }
+    END { if (login != "") print login }
+  ')
   [ -n "$login" ] || return 1
   printf '%s' "$AGENT_LOGINS_JSON" \
     | jq -e --arg login "$login" 'index($login) != null' >/dev/null 2>&1 \
     || return 1
   printf '%s' "$login"
+}
+
+# coderabbit_strip_ack_suffix <body> — the body without its trusted
+# acknowledgement suffix and without trailing blank lines, for comparing two
+# revisions of one finding. Only a suffix the fence-aware scan trusts is
+# removed; otherwise just the trailing blank lines go.
+coderabbit_strip_ack_suffix() {
+  local body="$1" mode=strip
+  coderabbit_ack_suffix "$body" >/dev/null 2>&1 || mode=trim
+  printf '%s\n' "$body" | awk -v mode="$mode" "$CODERABBIT_ACK_PAIR_AWK"
 }
 
 FINDINGS='[]'
@@ -433,9 +504,13 @@ while IFS= read -r finding; do
   floor=$(printf '%s' "$finding" | jq -r '.updated_at // .created_at')
   confirmed_login=""
   if [ "$reviewer" = "$CODERABBIT_BOT" ]; then
-    confirmed_login=$(coderabbit_confirmation_login "$body" || true)
-    if [ -n "$confirmed_login" ]; then
+    if ack_suffix=$(coderabbit_ack_suffix "$body"); then
+      # CodeRabbit's own acknowledgement of a disposition is not a re-raise.
+      # Keep the finding's creation as its evidence floor so the reply the
+      # acknowledgement answers stays valid, whichever wording it uses and
+      # however often it is appended (#1167).
       floor=$(printf '%s' "$finding" | jq -r '.created_at')
+      confirmed_login=$(coderabbit_ack_login "$ack_suffix" || true)
     fi
   fi
   accounted=false
@@ -616,6 +691,7 @@ append_archive_candidate() {
   local source_kind source_id source_login source_comments source_comment
   local live_source_login live_source_body_json live_source_fingerprint archive_tiers tier
   local body_fingerprint payload_body_json finding_kind ack_token accounted evidence
+  local live_body archived_body
 
   printf '%s' "$payload" | validate_archive_payload \
     || die 2 "feedback archive payload failed schema validation"
@@ -662,6 +738,19 @@ append_archive_candidate() {
     live_source_body_json=$(printf '%s' "$source_comment" | jq -c '.body // ""')
     live_source_fingerprint=$(fingerprint "$live_source_body_json")
     [ "$live_source_fingerprint" != "$body_fingerprint" ] || return 0
+    # A CodeRabbit acknowledgement is an edit of the finding, so the relay
+    # archives the revision being acknowledged. That revision is the same
+    # finding, already dispositioned by the reply the acknowledgement
+    # answers; demanding a second acknowledgement for it is the archive half
+    # of #1167. Compare the two revisions with their acknowledgement pairs
+    # removed: equal means the archive adds nothing to disposition.
+    if [ "$source_kind" = inline ] && [ "$source_login" = "$CODERABBIT_BOT" ] \
+      && [ -n "$payload_body_json" ]; then
+      live_body=$(printf '%s' "$source_comment" | jq -r '.body // ""')
+      archived_body=$(printf '%s' "$payload_body_json" | jq -r '.')
+      [ "$(coderabbit_strip_ack_suffix "$live_body")" != \
+        "$(coderabbit_strip_ack_suffix "$archived_body")" ] || return 0
+    fi
   fi
 
   if [ "$source_login" = "$CODERABBIT_BOT" ]; then
