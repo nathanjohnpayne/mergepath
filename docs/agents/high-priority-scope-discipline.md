@@ -65,6 +65,8 @@ Record why the finding does not apply, is unreachable under the contract, mistak
 
 If satisfying a finding requires adding words such as "always", "under arbitrary concurrency", "for every caller", "even if configuration is malformed", "across all interleavings", "atomically", "prove", "canonical", "authoritative", "fully close", or "prevent all" — stop. Those phrases usually mean a local fix is being converted into a stronger system contract. Do not implement that contract unless it was already part of the issue: file it separately, or obtain an explicit owner decision to expand scope.
 
+**This rule never releases you from rule 2A.** A regression this patch introduced is fixed or the offending machinery is removed, even when the fix is phrased in one of those words — a patch that newly breaks a caller under malformed configuration is still a patch-introduced regression, not a request for a stronger contract. Rule 3 governs guarantees the issue never asked for; it does not govern damage this change did. (Rule 4's condition 1 is the same guard on the residual side.)
+
 The trigger is the finding's *disposition*, not the vocabulary of the codebase. Several of these words are ordinary technical vocabulary here — "canonical" describes propagation paths in dozens of files — so the rule fires when a finding using one is dispositioned **Required**, not whenever the word appears.
 
 ## 4. Prefer a bounded residual risk to an unbounded mechanism
@@ -156,5 +158,7 @@ Is the machinery this finding repairs
   required by the original contract?          yes / no / no machinery involved
 Requires a stronger guarantee than the issue? yes / no
 ```
+
+The first three lines are per round; **the finding-level lines below them are answered once per finding**, because a round routinely carries findings with different dispositions and different machinery answers. How the artifact represents that — repeated blocks, keying to finding ids, or something else — is #1202's design problem, not this document's.
 
 The machinery question is rule 5 in checkpoint form and is the one that most often changes the outcome. Answer it about the code the finding is *about*, not about the fix being proposed — a **no** means remove or defer that code, not repair it. If the last answer is **yes**, implementation stops until the stronger guarantee is explicitly accepted into scope.
