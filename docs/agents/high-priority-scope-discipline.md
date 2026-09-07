@@ -63,7 +63,7 @@ Record why the finding does not apply, is unreachable under the contract, mistak
 
 ## 3. No new guarantee without an explicit scope decision
 
-If satisfying a finding requires adding words such as "always", "under arbitrary concurrency", "for every caller", "even if configuration is malformed", "across all interleavings", "atomically", "prove", "canonical", "authoritative", "fully close", or "prevent all" — stop. Those phrases usually mean a local fix is being converted into a stronger system contract. Do not implement that contract unless it was already part of the issue: file it separately, or obtain an explicit owner decision to expand scope.
+If satisfying a finding requires adding words such as "always", "under arbitrary concurrency", "for every caller", "even if configuration is malformed", "across all interleavings", "atomically", "prove", "canonical", "authoritative", "fully close", or "prevent all" — stop. Those phrases usually mean a local fix is being converted into a stronger system contract. Do not implement that contract unless it was already part of the issue: file it separately, or obtain an explicit owner decision to expand scope. Whether filing it separately is available to you at all is rule 2B's question, not this one.
 
 **This rule never releases you from rule 2A.** A regression this patch introduced is fixed or the offending machinery is removed, even when the fix is phrased in one of those words — a patch that newly breaks a caller under malformed configuration is still a patch-introduced regression, not a request for a stronger contract. Rule 3 governs guarantees the issue never asked for; it does not govern damage this change did. (Rule 4's condition 1 is the same guard on the residual side.)
 
@@ -125,7 +125,7 @@ For staged issues such as #937, a successful stage is a deliverable, and a faile
 
 ## 10. Follow-up issues are a convergence mechanism
 
-Filing a valid finding separately is not unfinished work. It is the preferred response when the finding would increase the current PR's contract.
+Filing a valid finding separately is not unfinished work. It is the preferred response when the finding would increase the current PR's contract **and rule 2B permits deferral for that finding's tier** — this rule describes what a good follow-up looks like, and never widens who may create one.
 
 A follow-up should state the newly discovered condition, whether it is reachable today, the failure direction, the evidence, why it is outside the current PR, and whether it changes the current PR's safety. Do not inherit the parent issue's `priority:high` automatically.
 
