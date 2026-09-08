@@ -1776,7 +1776,8 @@ elif ! printf '[]' | jq -f "$G1193_DIR/proj.jq" >/dev/null 2>&1; then
   fail "#1193: the extracted rollup projection does not compile as a jq program — extraction captured the wrong span"
 elif ! printf '{"statusCheckRollup":[]}' | jq --argjson requirements '[]' \
         --arg requirements_state known --arg approval_readiness_only 0 \
-        --arg current_run_id "" -f "$G1193_DIR/bad.jq" >/dev/null 2>&1; then
+        --arg current_run_id "" --argjson lineage_contexts '[]' \
+        -f "$G1193_DIR/bad.jq" >/dev/null 2>&1; then
   G1193_EXTRACTION_OK=0
   fail "#1193: the extracted BAD_CHECKS filter does not compile as a jq program — extraction captured the wrong span"
 else
@@ -1789,6 +1790,7 @@ g1193_gate_a() {
     | jq -c -f "$G1193_DIR/proj.jq" \
     | jq -c --argjson requirements "$2" --arg requirements_state "$3" \
             --arg approval_readiness_only "0" --arg current_run_id "" \
+            --argjson lineage_contexts '[]' \
             -f "$G1193_DIR/bad.jq"
 }
 # `-` stands for "no surface recorded": jq treats "" as truthy, so an absent
@@ -2039,9 +2041,11 @@ fi
 if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
   g1215() {
     printf '%s' "$1" | jq -c -f "$G1193_DIR/proj.jq" \
-      | jq -c --argjson requirements '[{"context":"Merge clearance gate","app_id":null}]' \
+      | jq -c --argjson requirements "[{\"context\":\"${2:-Merge clearance gate}\",\"app_id\":null}]" \
               --arg requirements_state known --arg approval_readiness_only "0" \
-              --arg current_run_id "" -f "$G1193_DIR/bad.jq" \
+              --arg current_run_id "" \
+              --argjson lineage_contexts '["Merge clearance gate","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings"]' \
+              -f "$G1193_DIR/bad.jq" \
       | jq -c '[.[] | "\(.lineage // "-"):\(.result)"] | sort'
   }
   G1215_NAT_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","externalId":"11111111-2222-3333-4444-555555555555","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
@@ -2128,6 +2132,22 @@ if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
   else
     fail "#1215: the lineage heuristic was applied to a third-party app and its stale failure now blocks permanently, got $GOT"
   fi
+
+  # Review round 3, Codex P2 "limit lineage splitting to the guarded contexts".
+  # The Actions app is not confined to the gate workflows: auto-clear also POSTs
+  # check runs with the same token, and a consumer can publish anything. A
+  # context this repository does not publish has no guarded discriminator, so
+  # splitting it would fold a synthetic entry into the native lineage on a
+  # field its producer was never asked to leave empty. Same app, same two
+  # lineages, a name we do not own: must NOT split.
+  G1215_OTHER_NAT_BAD='{"__typename":"CheckRun","name":"consumer-local-gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","externalId":"11111111-2222-3333-4444-555555555555","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Consumer Gate","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+  G1215_OTHER_API_OK='{"__typename":"CheckRun","name":"consumer-local-gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":"Consumer Gate","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+  GOT=$(g1215 "[$G1215_OTHER_NAT_BAD,$G1215_OTHER_API_OK]" "consumer-local-gate")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: a required context this repository does not publish keeps the single recency winner, even under the Actions app"
+  else
+    fail "#1215: the lineage split reached a context with no guarded publisher, got $GOT"
+  fi
 fi
 
 # Review round 1, Codex P2 "verify externalId inside the GraphQL selection".
@@ -2164,7 +2184,10 @@ fi
 # check run — would red that consumer forever, and the consumer could not fix
 # it because the hub owns this file. Absent files are skipped, since a consumer
 # need not carry every gate workflow.
-G1215_PUBLISHERS="merge-clearance-gate.yml codex-p1-gate.yml coderabbit-severity-gate.yml required-check-publisher.yml"
+# codex-feedback-archive-relay.yml publishes "Codex P1 unresolved threads" too
+# (#1215 review round 3, Codex P2) — it was missing here, so a discriminator
+# regression in the relay would not have been caught.
+G1215_PUBLISHERS="merge-clearance-gate.yml codex-p1-gate.yml coderabbit-severity-gate.yml codex-feedback-archive-relay.yml required-check-publisher.yml"
 G1215_EXTID_SETTERS=""
 G1215_PUBLISHERS_SEEN=0
 for g1215_wf in $G1215_PUBLISHERS; do
@@ -2182,10 +2205,39 @@ else
   fail "#1215: a check-run publisher now sets external_id ($G1215_EXTID_SETTERS) — its synthetic run would be classified native and the lineage split would silently collapse"
 fi
 if grep -qF 'map(select((.lineage // "") == $l)) | current_entry' "$SCRIPT" \
-   && grep -qF '($apps | length) == 1 and ($apps[0] == "15368")' "$SCRIPT"; then
-  pass "#1215: winner selection splits by producer lineage within a surface, and only within a single app"
+   && grep -qF '($apps | length) == 1 and ($apps[0] == "15368")' "$SCRIPT" \
+   && grep -qF '($lineage_contexts | index($ctx)) != null' "$SCRIPT"; then
+  pass "#1215: the lineage split is scoped to one surface, one app, and a named owned context"
 else
-  fail "#1215: winner selection is back to a surface-only partition, or the split is no longer scoped to one app"
+  fail "#1215: the lineage split lost its surface, single-app or owned-context scoping"
+fi
+
+# The context list is a hard-coded constant, so hold it to the workflows rather
+# than to a comment (#1215 review round 3, "preferably by inspecting the actual
+# POST payloads"). Every CHECK_NAME a check-run publisher emits must either be
+# in the script list or be a name that is deliberately not a required context.
+G1215_LIST=$(sed -n 's/^LINEAGE_SPLIT_CONTEXTS_JSON=.\(.*\).$/\1/p' "$SCRIPT")
+if [ -z "$G1215_LIST" ]; then
+  fail "#1215: could not read LINEAGE_SPLIT_CONTEXTS_JSON from $SCRIPT — the context list guard is testing nothing"
+else
+  G1215_UNLISTED=""
+  for g1215_wf in $G1215_PUBLISHERS; do
+    [ -f ".github/workflows/$g1215_wf" ] || continue
+    while IFS= read -r g1215_name; do
+      [ -n "$g1215_name" ] || continue
+      # The publisher ships shadow-suffixed names while it is not yet live;
+      # those are not required contexts and are covered by their live twin.
+      case "$g1215_name" in *" (shadow)") continue ;; esac
+      case "$G1215_LIST" in *"\"$g1215_name\""*) ;; *) G1215_UNLISTED="$G1215_UNLISTED $g1215_wf:$g1215_name" ;; esac
+    done <<EOF2
+$(grep -hoE '(CHECK_NAME|[A-Z_]+_CONTEXT): *"?[^"$]*"?' ".github/workflows/$g1215_wf" 2>/dev/null | sed 's/^[A-Z_]*: *//' | tr -d '"' | sort -u)
+EOF2
+  done
+  if [ -z "$G1215_UNLISTED" ]; then
+    pass "#1215: every context a check-run publisher emits is named in the lineage-split list"
+  else
+    fail "#1215: a check-run publisher emits a context missing from LINEAGE_SPLIT_CONTEXTS_JSON ($G1215_UNLISTED) — that context would keep the pre-fix single winner while its publisher goes unguarded"
+  fi
 fi
 
 rm -rf "$G1193_DIR"

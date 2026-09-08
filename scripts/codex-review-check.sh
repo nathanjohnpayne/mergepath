@@ -1695,6 +1695,27 @@ else
   log "gate (a): $BASE_BRANCH requires $(printf '%s' "$REQUIRED_JSON" | jq -r 'length') status check(s) per its rule surfaces ($BRANCH_REQUIREMENTS_SURFACES): $(printf '%s' "$REQUIRED_JSON" | jq -r 'join(", ")')"
 fi
 
+# The required contexts this repository publishes through the Checks API as
+# well as natively, and therefore the ONLY ones for which the two-lineage split
+# below applies (#1215 review round 2/3). Derived by inspection of every
+# workflow that POSTs a check run: merge-clearance-gate.yml, codex-p1-gate.yml,
+# coderabbit-severity-gate.yml, codex-feedback-archive-relay.yml and
+# required-check-publisher.yml, which between them publish exactly these three
+# names. auto-clear-blocking-labels.yml also POSTs, under its own name, which
+# is not a required context; dependabot-auto-merge.yml only reads.
+#
+# Naming them is the point rather than a shortcut. The split rests on a
+# heuristic — `externalId` empty means Checks-API — that is only sound for
+# publishers this repository controls and can hold to it. Restricting the split
+# to those contexts means a context published by anyone else, including a
+# consumer-owned workflow using the same Actions token, keeps the single
+# recency winner it had before and cannot be split on a field its producer was
+# never asked to leave empty.
+#
+# tests/test_codex_review_check_required_checks.sh holds this list to the
+# workflows: it fails when a publisher starts emitting a name that is not here.
+LINEAGE_SPLIT_CONTEXTS_JSON='["Merge clearance gate","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings"]'
+
 CURRENT_RUN_ID=""
 if [ "$APPROVAL_READINESS_ONLY" = "1" ] && [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]]; then
   CURRENT_RUN_ID="$GITHUB_RUN_ID"
@@ -1705,7 +1726,8 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
   --argjson requirements "${REQUIREMENTS_JSON:-[]}" \
   --arg requirements_state "$BRANCH_REQUIREMENTS_STATE" \
   --arg approval_readiness_only "$APPROVAL_READINESS_ONLY" \
-  --arg current_run_id "$CURRENT_RUN_ID" '
+  --arg current_run_id "$CURRENT_RUN_ID" \
+  --argjson lineage_contexts "$LINEAGE_SPLIT_CONTEXTS_JSON" '
   # Pick the entry that REPRESENTS a set of runs: a still-non-terminal entry
   # always wins over any completed sibling (a freshly-queued rerun has no
   # usable timestamp and must not be outranked by an older completed one), and
@@ -1782,6 +1804,7 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
     | [ $kinds[] as $k
         | (map(select((.kind // "") == $k))) as $of_kind
         | ([$of_kind[] | (.appId // "")] | unique) as $apps
+        | ([$of_kind[] | (.label // "")] | unique) as $labels
         # Split ONLY for the GitHub Actions app (#1215 review round 2, Codex
         # P2 "restrict lineage splitting to controlled check producers").
         # The two lineages exist because this repository gate workflows POST
@@ -1797,6 +1820,8 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         # #655 rounds and #1076 already produced once each, and it is strictly
         # worse than the fail-open being closed here.
         | (if ($apps | length) == 1 and ($apps[0] == "15368")
+              and ($labels | length) == 1
+              and (($labels[0]) as $ctx | ($lineage_contexts | index($ctx)) != null)
            then (([$of_kind[] | (.lineage // "")] | unique)) as $lineages
                 | ($lineages[] as $l
                    | ($of_kind | map(select((.lineage // "") == $l)) | current_entry))
