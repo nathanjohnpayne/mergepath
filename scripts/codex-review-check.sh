@@ -2001,9 +2001,20 @@ else
     # ("repo-lint-local", enforced by the select() below) but group_by
     # still resolves the zero-matches case to an empty array with no extra
     # branching.
+    #
+    # #1214: group by (name, SURFACE), not by name alone. This arm is already
+    # guessing by NAME -- it exists precisely because the annex real workflow
+    # identity could not be determined -- so a legacy commit status reported
+    # under that name is exactly as plausible an annex report as a check run,
+    # and the fail-closed reading is the one consistent with that premise.
+    # Collapsing them let a green check run drop a same-named red status: the
+    # sort key here is completedAt/startedAt, which a StatusContext does not
+    # carry at all in this projection, so it sorted first and lost every tie.
+    # That asymmetry was an accident of the sort key rather than a decision,
+    # and it is the same masking #1193 removed from the required-context path.
     ANNEX_NAME_FALLBACK_BAD=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq '
       [.statusCheckRollup[] | select((.name // .context // "") == "repo-lint-local")]
-      | group_by(.name // .context // "?")
+      | group_by([(.name // .context // "?"), (.kind // "")])
       | [
           .[]
           | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
