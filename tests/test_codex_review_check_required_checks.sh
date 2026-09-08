@@ -1794,6 +1794,11 @@ g1193_gate_a() {
 # `-` stands for "no surface recorded": jq treats "" as truthy, so an absent
 # and an empty kind both have to be normalised explicitly.
 g1193_labels() { printf '%s' "$1" | jq -c '[.[] | (if (.kind // "") == "" then "-" else .kind end) + ":\(.label)=\(.result)"] | sort'; }
+# Surface-agnostic form, for the assertions whose point is only WHETHER the
+# gate blocks. Naming the surface there would make them fail under a revert of
+# the fix for a cosmetic reason, and a guard that cannot stay green while the
+# mechanism is removed is not a guard.
+g1193_plain() { printf '%s' "$1" | jq -c '[.[] | "\(.label)=\(.result)"] | sort'; }
 
 # Raw statusCheckRollup union nodes, exactly as the GraphQL query selects them.
 G1193_CR_FAIL='{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":11,"workflow":{"name":"CI","resourcePath":"/o/r/actions/workflows/ci.yml"}}}}'
@@ -1846,14 +1851,14 @@ if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
   # ── No false blocks. Splitting the surfaces must not degrade into
   #    "any non-green entry anywhere blocks", which would resurrect the stale
   #    failed rerun that #655 round 13 stopped blocking on forever.
-  GOT=$(g1193_labels "$(g1193_gate_a "[$G1193_CR_OK,$G1193_SC_OK]" "$G1193_REQ" known)")
+  GOT=$(g1193_plain "$(g1193_gate_a "[$G1193_CR_OK,$G1193_SC_OK]" "$G1193_REQ" known)")
   if [ "$GOT" = '[]' ]; then
     pass "#1193: a head where BOTH surfaces are green still clears gate (a)"
   else
     fail "#1193: both-surfaces-green must not block, got $GOT"
   fi
 
-  GOT=$(g1193_labels "$(g1193_gate_a "[$G1193_CR_FAIL,$G1193_CR_OK]" "$G1193_REQ" known)")
+  GOT=$(g1193_plain "$(g1193_gate_a "[$G1193_CR_FAIL,$G1193_CR_OK]" "$G1193_REQ" known)")
   if [ "$GOT" = '[]' ]; then
     pass "#1193: within one surface, a stale FAILED check run superseded by a later SUCCESS still collapses to the later one"
   else
@@ -1862,8 +1867,8 @@ if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
 
   # Pending precedence has to survive the split: an in-flight check run holds
   # the gate even when the other surface has already reported success.
-  GOT=$(g1193_labels "$(g1193_gate_a "[$G1193_CR_RUNNING,$G1193_SC_OK]" "$G1193_REQ" known)")
-  if [ "$GOT" = '["CheckRun:lint="]' ]; then
+  GOT=$(g1193_plain "$(g1193_gate_a "[$G1193_CR_RUNNING,$G1193_SC_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '["lint="]' ]; then
     pass "#1193: an in-flight check run still holds gate (a) when the commit status under the same name is already green"
   else
     fail "#1193: pending precedence lost across the surface split, got $GOT"
@@ -1872,8 +1877,8 @@ if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
   # Totality. An entry whose union member is not carried must fall back to the
   # single pre-#1193 winner, not vanish: an empty partition would drop the
   # requirement out of scrutiny entirely, a fail-open worse than the original.
-  GOT=$(g1193_labels "$(g1193_gate_a '[{"name":"lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":true},{"context":"lint","state":"FAILURE","createdAt":"2026-05-21T11:00:00Z","isRequired":true}]' "$G1193_REQ" known)")
-  if [ "$GOT" = '["-:lint=FAILURE"]' ]; then
+  GOT=$(g1193_plain "$(g1193_gate_a '[{"name":"lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":true},{"context":"lint","state":"FAILURE","createdAt":"2026-05-21T11:00:00Z","isRequired":true}]' "$G1193_REQ" known)")
+  if [ "$GOT" = '["lint=FAILURE"]' ]; then
     pass "#1193: entries carrying no __typename collapse to one winner as before, rather than dropping out of scrutiny"
   else
     fail "#1193: untyped entries are no longer judged at all — the split must degrade to the pre-fix winner, got $GOT"
