@@ -1005,6 +1005,15 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       # check suite id either: that is finer than the rule and reintroduces the
       # #1076 permanent deadlock, refuted by #1119.
       #
+      # ASSUMPTION, and it is enforced by a test rather than left implicit
+      # (#1215 review round 1, Codex P1): `external_id` is an OPTIONAL field on
+      # the Checks API, so a synthetic producer that set it would be classified
+      # native and the two timelines would silently re-merge. No workflow in
+      # this repository sets it on a check-run POST, and
+      # tests/test_codex_review_check_required_checks.sh asserts that none
+      # starts. GitHub exposes no field that names the lineage directly, so a
+      # discriminator plus a guarded assumption is the honest shape here.
+      #
       # An entry with no externalId at all collapses to one lineage, which is
       # exactly the pre-#1215 single winner rather than an empty partition.
       lineage: (if .__typename == "CheckRun"
@@ -1754,10 +1763,28 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
   # result is exactly the pre-#1193 single winner, rather than an empty set
   # that would drop the requirement out of scrutiny entirely — a fail-open
   # strictly worse than the one being fixed.
+  # The lineage split is scoped to a SINGLE producing app, deliberately
+  # (#1215 review round 1, Codex P1 "preserve any-producer semantics across
+  # apps"). What was measured is two lineages under ONE app: the job-native
+  # check run and the Checks-API run a gate workflow POSTs. Applying the same
+  # split across apps would make a native run from one app and an API-style run
+  # from another INDEPENDENTLY mandatory, so an unrelated same-named failure
+  # could block a requirement its real producer satisfies — a false block, and
+  # on exactly the cross-app question that is still unmeasured in #1213.
+  #
+  # So: when a surface partition draws on more than one app, fall back to the
+  # single recency winner this filter used before. Cross-app selection is
+  # unchanged by this commit; only the one-app case gains the lineage split.
   def current_entries:
-    ([.[] | [(.kind // ""), (.lineage // "")]] | unique) as $keys
-    | [ $keys[] as $k
-        | (map(select([(.kind // ""), (.lineage // "")] == $k)) | current_entry) ];
+    ([.[] | (.kind // "")] | unique) as $kinds
+    | [ $kinds[] as $k
+        | (map(select((.kind // "") == $k))) as $of_kind
+        | (if (([$of_kind[] | (.appId // "")] | unique) | length) == 1
+           then (([$of_kind[] | (.lineage // "")] | unique)) as $lineages
+                | ($lineages[] as $l
+                   | ($of_kind | map(select((.lineage // "") == $l)) | current_entry))
+           else ($of_kind | current_entry)
+           end) ];
 
   # A check passes iff SUCCESS, SKIPPED, or NEUTRAL. Everything else —
   # FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, PENDING, EXPECTED, ERROR,

@@ -2091,17 +2091,65 @@ if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
   else
     fail "#1215: untyped-lineage entries changed verdict — the split must degrade to the pre-fix winner, got $GOT"
   fi
+
+  # Review round 1, Codex P1 "preserve any-producer semantics across apps".
+  # The lineage split is scoped to a single producing app. Across apps the
+  # filter keeps the single recency winner it used before, so an unrelated
+  # same-named failure cannot become independently mandatory for a requirement
+  # its real producer satisfies.
+  G1215_FOREIGN_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:01:00Z","completedAt":"2026-05-21T10:01:20Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":57789},"workflowRun":null}}'
+  GOT=$(g1215 "[$G1215_FOREIGN_BAD,$G1215_NAT_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: across apps the single recency winner is unchanged, so a foreign same-named failure does not become mandatory"
+  else
+    fail "#1215: the lineage split leaked across apps and blocked on a foreign producer, got $GOT"
+  fi
+  # ... and the one-app split still fires when the same set is single-app.
+  GOT=$(g1215 "[$G1215_NAT_BAD,$G1215_API_OK]")
+  if [ "$GOT" = '["native:FAILURE"]' ]; then
+    pass "#1215: the one-app lineage split still fires after the cross-app scoping"
+  else
+    fail "#1215: scoping to one app disabled the split it exists for, got $GOT"
+  fi
 fi
 
-if grep -q 'externalId' "$SCRIPT"; then
-  pass "#1215: the rollup query selects the lineage discriminator"
-else
-  fail "#1215: the rollup query no longer selects externalId — the two lineages become indistinguishable"
+# Review round 1, Codex P2 "verify externalId inside the GraphQL selection".
+# A bare grep for the token passes even when the QUERY drops it, because the
+# same word appears in the projection and in comments — and the behavioural
+# fixtures inject externalId directly, so they would keep passing while
+# production collapsed every check run into one lineage. Assert it inside the
+# CheckRun selection block, extracted from the real query.
+if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
+  cat > "$G1193_DIR/frag.awk" <<'AWK'
+BEGIN { start = "                      ... on CheckRun {"; stop = "                      }" }
+$0 == start { started = 1; next }
+started { if ($0 == stop) { exit } print }
+AWK
+  awk -f "$G1193_DIR/frag.awk" "$SCRIPT" > "$G1193_DIR/frag.txt"
+  if [ ! -s "$G1193_DIR/frag.txt" ]; then
+    fail "#1215: could not extract the CheckRun GraphQL selection from $SCRIPT — the anchor moved, so the lineage-field guard is testing nothing"
+  elif grep -qE '^[[:space:]]*externalId[[:space:]]*$' "$G1193_DIR/frag.txt"; then
+    pass "#1215: externalId is selected inside the CheckRun GraphQL fragment, not merely mentioned elsewhere in the file"
+  else
+    fail "#1215: the CheckRun GraphQL selection does not request externalId — production would collapse every check run into one lineage while the fixtures kept passing"
+  fi
 fi
-if grep -q '\[(.kind // ""), (.lineage // "")\]' "$SCRIPT"; then
-  pass "#1215: winner selection partitions by surface AND producer lineage"
+
+# The discriminator rests on an OPTIONAL Checks-API field. A synthetic
+# publisher that set external_id would be classified native and the two
+# timelines would re-merge silently. Nothing in this repository sets it; this
+# asserts nothing starts.
+G1215_EXTID_SETTERS=$(grep -rln "external_id" .github/workflows/ 2>/dev/null || true)
+if [ -z "$G1215_EXTID_SETTERS" ]; then
+  pass "#1215: no workflow sets external_id on a check-run POST, so the lineage discriminator holds"
 else
-  fail "#1215: winner selection is back to a surface-only partition, so a synthetic run can speak for the native one"
+  fail "#1215: a workflow now sets external_id ($G1215_EXTID_SETTERS) — a synthetic run would be classified native and the lineage split would silently collapse"
+fi
+if grep -qF 'map(select((.lineage // "") == $l)) | current_entry' "$SCRIPT" \
+   && grep -qF '([$of_kind[] | (.appId // "")] | unique) | length) == 1' "$SCRIPT"; then
+  pass "#1215: winner selection splits by producer lineage within a surface, and only within a single app"
+else
+  fail "#1215: winner selection is back to a surface-only partition, or the split is no longer scoped to one app"
 fi
 
 rm -rf "$G1193_DIR"
