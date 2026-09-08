@@ -938,6 +938,16 @@ run_gate
 assert_eq 1 "$RUN_RC" "a content change delivered with an acknowledgement is still an edit"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "the archived pre-change revision still needs its own token"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "a reply to the old text does not stand for the rewritten live finding"
+# The same-second allowance for a confirmed reply holds only at creation: a reply
+# sharing the second of a content-changing confirmed edit may precede the rewrite.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit 'sub("Clarify the error"; "Clarify the error and its exit code") | sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne")' "2026-08-18T21:02:00Z"
+jq '. + [{"id": 22, "in_reply_to_id": 20, "created_at": "2026-08-18T21:02:00Z", "user": {"login": "nathanjohnpayne"}, "path": "scripts/a.sh", "line": 4, "body": "Fixed in def5678 with the exit code named."}]' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+archive_of "$PRE_ACK_BODY" 8714
+run_gate
+assert_eq 1 "$RUN_RC" "a same-second reply beside a content-changing confirmed edit is not evidence for the rewritten finding"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "the same-second allowance holds only at the creation floor"
 # The record-informed floor is the newest content-changing edit, not the latest edit.
 cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
 CONTENT_A="$PRE_ACK_BODY"

@@ -798,12 +798,18 @@ EOF
   # the floor is that edit, whatever acknowledgement it was delivered with.
   # Without a record the marker-based decision above stands.
   if [ "$archives_seen" = true ]; then
+    finding_created_at=$(printf '%s' "$finding" | jq -r '.created_at')
     if [ "$content_matched" = true ]; then
-      [ -n "$content_floor" ] || content_floor=$(printf '%s' "$finding" | jq -r '.created_at')
+      [ -n "$content_floor" ] || content_floor="$finding_created_at"
     else
       content_floor=$(printf '%s' "$finding" | jq -r '.updated_at // .created_at')
     fi
-    if agent_reply_after_finding "$root_id" "$content_floor" "$finding_id" "$confirmed_login"; then
+    # The same-second allowance for the reply a confirmation names holds only
+    # at the finding's creation; at a content edit the reply must be strictly
+    # later, since a reply in the edit's second may precede the rewrite.
+    floor_login="$confirmed_login"
+    [ "$content_floor" = "$finding_created_at" ] || floor_login=""
+    if agent_reply_after_finding "$root_id" "$content_floor" "$finding_id" "$floor_login"; then
       finding=$(printf '%s' "$finding" | jq -c '.accounted = true | .evidence = "thread-reply"')
     else
       finding=$(printf '%s' "$finding" | jq -c '.accounted = false | .evidence = null')
