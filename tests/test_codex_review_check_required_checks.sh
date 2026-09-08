@@ -1975,6 +1975,38 @@ AWK
       fail "#1214: the annex fallback regrouping broke stale-rerun selection (#655 round 13), got $GOT"
     fi
   fi
+
+  # Review round 1, found independently by Codex (P2) and CodeRabbit: giving
+  # commit statuses their own partition made their INTERNAL ordering
+  # load-bearing for the first time. A StatusContext carries neither
+  # startedAt nor completedAt in this projection, so every status compared
+  # equal on the old sort key and the winner fell out of GraphQL connection
+  # order -- a stale failure could block a recovered annex, or a stale
+  # success could hide its current failure. The projection already carried
+  # createdAt; the ordering now uses it. Both array orders are asserted,
+  # because connection order is exactly what must stop mattering.
+  if [ "$G1193_EXTRACTION_OK" -eq 1 ] && [ -s "$G1193_DIR/annex.jq" ]; then
+    SC_OLD_BAD='{"__typename":"StatusContext","context":"repo-lint-local","state":"FAILURE","createdAt":"2026-05-21T10:00:00Z","isRequired":false}'
+    SC_NEW_OK='{"__typename":"StatusContext","context":"repo-lint-local","state":"SUCCESS","createdAt":"2026-05-21T12:00:00Z","isRequired":false}'
+    SC_NEW_BAD='{"__typename":"StatusContext","context":"repo-lint-local","state":"FAILURE","createdAt":"2026-05-21T12:00:00Z","isRequired":false}'
+    SC_OLD_OK='{"__typename":"StatusContext","context":"repo-lint-local","state":"SUCCESS","createdAt":"2026-05-21T10:00:00Z","isRequired":false}'
+
+    GOT_A=$(g1214_labels "$(g1214_annex "[$SC_OLD_BAD,$SC_NEW_OK]")")
+    GOT_B=$(g1214_labels "$(g1214_annex "[$SC_NEW_OK,$SC_OLD_BAD]")")
+    if [ "$GOT_A" = '[]' ] && [ "$GOT_B" = '[]' ]; then
+      pass "#1214: a recovered annex status wins over its own stale failure, in either connection order"
+    else
+      fail "#1214: stale status failure still decides the annex fallback (order A=$GOT_A order B=$GOT_B)"
+    fi
+
+    GOT_A=$(g1214_labels "$(g1214_annex "[$SC_OLD_OK,$SC_NEW_BAD]")")
+    GOT_B=$(g1214_labels "$(g1214_annex "[$SC_NEW_BAD,$SC_OLD_OK]")")
+    if [ "$GOT_A" = '["repo-lint-local=FAILURE"]' ] && [ "$GOT_B" = '["repo-lint-local=FAILURE"]' ]; then
+      pass "#1214: a current annex status failure is not hidden by its own stale success, in either connection order"
+    else
+      fail "#1214: stale status success still hides the current annex failure (order A=$GOT_A order B=$GOT_B)"
+    fi
+  fi
 fi
 
 if grep -q 'group_by(\[(.name // .context // "?"), (.kind // "")\])' "$SCRIPT"; then

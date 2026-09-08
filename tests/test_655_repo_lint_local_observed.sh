@@ -445,7 +445,7 @@ if command -v jq >/dev/null 2>&1; then
           | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
           | if ($pending | length) > 0
             then $pending[0]
-            else (sort_by(.completedAt // .startedAt // "") | last)
+            else (sort_by(.completedAt // .startedAt // .createdAt // "") | last)
             end
         ]'
   }
@@ -816,6 +816,32 @@ AWK
       pass "#1214: an entry carrying no __typename is still judged rather than dropped"
     else
       fail "#1214: untyped entries fell out of readiness scrutiny, got bad_count=$GOT"
+    fi
+
+    # Review round 1 (Codex P2, CodeRabbit Major): the surface partition made
+    # status ordering load-bearing here too, and the workflow projection was
+    # dropping createdAt entirely -- the only timestamp a StatusContext has.
+    # Both array orders are asserted, because GraphQL connection order is
+    # precisely what must stop deciding the winner.
+    W_SC_OLD_BAD='{"__typename":"StatusContext","context":"lint","state":"FAILURE","createdAt":"2026-05-21T10:00:00Z","isRequired":true}'
+    W_SC_NEW_OK='{"__typename":"StatusContext","context":"lint","state":"SUCCESS","createdAt":"2026-05-21T12:00:00Z","isRequired":true}'
+    W_SC_OLD_OK='{"__typename":"StatusContext","context":"lint","state":"SUCCESS","createdAt":"2026-05-21T10:00:00Z","isRequired":true}'
+    W_SC_NEW_BAD='{"__typename":"StatusContext","context":"lint","state":"FAILURE","createdAt":"2026-05-21T12:00:00Z","isRequired":true}'
+
+    GOT_A=$(g1214_bad "[$W_SC_OLD_BAD,$W_SC_NEW_OK]")
+    GOT_B=$(g1214_bad "[$W_SC_NEW_OK,$W_SC_OLD_BAD]")
+    if [ "$GOT_A" = "0" ] && [ "$GOT_B" = "0" ]; then
+      pass "#1214: a recovered required status clears readiness over its own stale failure, in either connection order"
+    else
+      fail "#1214: a stale status failure still denies readiness (order A=$GOT_A order B=$GOT_B)"
+    fi
+
+    GOT_A=$(g1214_bad "[$W_SC_OLD_OK,$W_SC_NEW_BAD]")
+    GOT_B=$(g1214_bad "[$W_SC_NEW_BAD,$W_SC_OLD_OK]")
+    if [ "$GOT_A" = "1" ] && [ "$GOT_B" = "1" ]; then
+      pass "#1214: a current required status failure is not hidden by its own stale success, in either connection order"
+    else
+      fail "#1214: a stale status success still hides the current failure from readiness (order A=$GOT_A order B=$GOT_B)"
     fi
   fi
   rm -rf "$G1214_DIR"

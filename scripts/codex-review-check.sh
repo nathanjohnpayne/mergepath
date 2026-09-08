@@ -2020,7 +2020,7 @@ else
           | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
           | if ($pending | length) > 0
             then $pending[0]
-            else (sort_by(.completedAt // .startedAt // "") | last)
+            else (sort_by(.completedAt // .startedAt // .createdAt // "") | last)
             end
         ] as $winners
       | [$winners[]

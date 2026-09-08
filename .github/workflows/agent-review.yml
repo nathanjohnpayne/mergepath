@@ -2971,6 +2971,16 @@ jobs:
                   state: .state,
                   startedAt: .startedAt,
                   completedAt: .completedAt,
+                  # A StatusContext has NEITHER startedAt nor completedAt --
+                  # the GraphQL fragment selects only createdAt for that union
+                  # member. Carried so the surface partition below has a real
+                  # ordering key (#1214 review round 1, found independently by
+                  # Codex and CodeRabbit): before the partition existed a
+                  # status could never win a tie anyway, so the missing key was
+                  # inert; giving statuses their own winner made it load-
+                  # bearing, and without this every status compares equal and
+                  # the winner falls out of GraphQL connection order.
+                  createdAt: .createdAt,
                   isRequired: .isRequired,
                   # Which GraphQL union member this entry came from (#1214,
                   # mirroring #1193 in codex-review-check.sh). A required
@@ -3073,7 +3083,7 @@ jobs:
                     | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
                     | if ($pending | length) > 0
                       then $pending[0]
-                      else (sort_by(.completedAt // .startedAt // "") | last)
+                      else (sort_by(.completedAt // .startedAt // .createdAt // "") | last)
                       end
                   ]')
               winner_count=$(echo "$winners" | jq 'length')
