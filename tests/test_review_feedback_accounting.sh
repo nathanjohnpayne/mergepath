@@ -907,6 +907,7 @@ run_gate
 assert_eq 1 "$RUN_RC" "a v1 body that does not match the record's fingerprint is ignored, so the record is inventoried"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "the mismatched v1 record keeps the inline-archive shape"
 assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "an ignored v1 body leaves the marker-based decision on the live finding in place"
+assert_eq "(archived reviewer inline version)" "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")][0].body')" "a rejected v1 body is not reported as the archived finding text"
 
 # archive_entry <body file> <comment id> <archived_at> — one relay record as a JSON object on stdout.
 archive_entry() {

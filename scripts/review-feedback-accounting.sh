@@ -929,6 +929,7 @@ append_archive_candidate() {
     --arg source_login "$source_login" \
     --arg tier "$tier" --arg archived_at "$archived_at" \
     --arg fingerprint "$body_fingerprint" --arg token "$ack_token" \
+    --arg validated_body_json "$payload_body_json" \
     --argjson accounted "$accounted" --arg evidence "$evidence" '
       .[0] + [(.[1] as $payload | {
         kind: $finding_kind,
@@ -943,7 +944,8 @@ append_archive_candidate() {
         updated_at: $archived_at,
         body_fingerprint: $fingerprint,
         ack_token: $token,
-        body: ($payload.body // ("(archived reviewer " + $source_kind + " version)")),
+        body: (if $validated_body_json == "" then ("(archived reviewer " + $source_kind + " version)")
+               else ($validated_body_json | fromjson) end),
         accounted: $accounted,
         evidence: (if $evidence == "" then null else $evidence end)
       })]
