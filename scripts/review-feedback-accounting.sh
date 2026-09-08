@@ -402,25 +402,155 @@ agent_reply_after_finding() {
     ' >/dev/null 2>&1
 }
 
-coderabbit_confirmation_login() {
-  local body="$1" login visible
-  visible=$(coderabbit_finding_scan "$body") || return 1
-  login=$(printf '%s\n' "$visible" | awk '
-    /^[[:space:]]*$/ {next}
-    {penultimate=last; last=$0}
-    END {
-      if (last ~ /^<!-- This is an auto-generated (comment|reply) by CodeRabbit -->$/ \
-          && penultimate ~ /^✅ Confirmed as addressed by @[A-Za-z0-9-]+$/) {
-        sub(/^✅ Confirmed as addressed by @/, "", penultimate)
-        print penultimate
+# CodeRabbit acknowledges a disposition by EDITING its finding comment rather
+# than replying, so every acknowledgement advances the finding's updated_at.
+# Observed shapes of that edit, all ending the body:
+#   1. the finding's `auto-generated comment` footer is rewritten to the
+#      `auto-generated reply` marker and a confirmation line is appended;
+#   2. reply marker, confirmation line, reply marker;
+#   3. reply marker, confirmation line, `auto-generated comment` footer;
+#   4. confirmation line, then either footer (the original #1000 form);
+#   5. the footer rewritten to the reply marker with NO confirmation line,
+#      after a reply CodeRabbit does not confirm (handled below the FINDINGS
+#      loop from the relay's record, since it carries no marker of its own);
+# and any of them stacked when CodeRabbit acknowledges again. The wording of
+# the confirmation line varies (`✅ Confirmed as addressed by @<login>`,
+# `✅ Addressed in commit <sha>`, plurals), so recognition is anchored on the
+# vendor's generated footer markers, either kind (#1167).
+#
+# The model is a trailing RUN: the lines at the end of the body that are a
+# footer marker or a confirmation line, blank lines allowed between them. A
+# ✅ line is a confirmation when it carries a known confirmation wording or
+# when the non-blank line directly above it is the reply marker, which is
+# where every observed shape puts it; a content line that happens to start
+# with ✅ before the finding's own footer stays content, and ✅ lines with no
+# marker at all are content, not a run. The run acknowledges when it holds
+# at least one marker and at least one confirmation line.
+# Anything after the run, visible content or a code fence, is an ordinary
+# edit, and a run inside a fence is not a run.
+#
+# mode=run prints the run (trimmed, non-blank; may be empty); mode=suffix
+# prints it and exits 1 unless it acknowledges; mode=strip prints the body
+# without the run; mode=trim prints the body with only trailing blank lines
+# removed. strip and trim print lines with only the carriage return removed,
+# so two revisions compare on content, trailing spaces included.
+CODERABBIT_ACK_PAIR_AWK='
+  function trimmed(s) { sub(/\r$/, "", s); sub(/[ \t]+$/, "", s); return s }
+  function crless(s) { sub(/\r$/, "", s); return s }
+  function is_reply(s) {
+    return s ~ /^<!-- This is an auto-generated reply by CodeRabbit -->$/
+  }
+  function is_marker(s) {
+    return s ~ /^<!-- This is an auto-generated (comment|reply) by CodeRabbit -->$/
+  }
+  function is_check(s) { return s ~ /^✅[^ \t]*[ \t]+[^ \t]/ }
+  function is_known(s) {
+    return s ~ /^✅[^ \t]*[ \t]+(Confirmed as addressed by @[A-Za-z0-9-]+$|Addressed in commits? )/
+  }
+  { raw[NR] = crless($0); t[NR] = trimmed($0) }
+  END {
+    n = NR
+    while (n > 0 && t[n] == "") n--
+    m = 0
+    for (k = 1; k <= n; k++) if (t[k] != "") nb[++m] = k
+    p = m
+    markers = 0
+    confirmations = 0
+    while (p > 0) {
+      k = nb[p]
+      if (is_marker(t[k])) { markers++; p--; continue }
+      if (is_check(t[k])) {
+        above = (p > 1) ? nb[p - 1] : 0
+        if (is_known(t[k]) || (above && is_reply(t[above]))) {
+          confirmations++
+          p--
+          continue
+        }
       }
+      break
     }
-  ' | tail -n 1)
-  [ -n "$login" ] || return 1
-  printf '%s' "$AGENT_LOGINS_JSON" \
-    | jq -e --arg login "$login" 'index($login) != null' >/dev/null 2>&1 \
-    || return 1
-  printf '%s' "$login"
+    if (markers == 0) { p = m; confirmations = 0 }
+    i = (p > 0) ? nb[p] : 0
+    if (mode == "run" || mode == "suffix") {
+      for (k = i + 1; k <= n; k++) if (t[k] != "") print t[k]
+      if (mode == "suffix" && (markers == 0 || confirmations == 0)) exit 1
+      exit 0
+    }
+    end = n
+    if (mode == "strip") end = i
+    for (k = 1; k <= end; k++) print raw[k]
+  }
+'
+
+# coderabbit_ack_run <body> — the trailing footer/confirmation run of a
+# CodeRabbit body, when the raw body and its fence-aware visible text agree
+# on it: the raw run must be the tail of the visible run (the visible run may
+# reach further up through a region the scan suppresses). Exit 1 when they
+# disagree: a run inside an unclosed fence, or a fence after the run. Empty
+# output with exit 0 means "no run".
+coderabbit_ack_run() {
+  local body="$1" visible raw_run visible_run vl rl
+  visible=$(coderabbit_finding_scan "$body") || return 1
+  raw_run=$(printf '%s\n' "$body" | awk -v mode=run "$CODERABBIT_ACK_PAIR_AWK")
+  visible_run=$(printf '%s\n' "$visible" | awk -v mode=run "$CODERABBIT_ACK_PAIR_AWK")
+  if [ -z "$raw_run" ]; then
+    [ -z "$visible_run" ] || return 1
+    return 0
+  fi
+  vl=${#visible_run}
+  rl=${#raw_run}
+  if [ "$vl" -eq "$rl" ]; then
+    [ "$visible_run" = "$raw_run" ] || return 1
+  else
+    [ "$vl" -gt "$rl" ] || return 1
+    [ "${visible_run:$((vl - rl))}" = "$raw_run" ] || return 1
+    [ "${visible_run:$((vl - rl - 1)):1}" = $'\n' ] || return 1
+  fi
+  printf '%s' "$raw_run"
+}
+
+# coderabbit_ack_suffix <body> — the trusted acknowledgement suffix, or exit
+# 1 when the body does not end in an acknowledging run.
+coderabbit_ack_suffix() {
+  local body="$1" run
+  run=$(coderabbit_ack_run "$body") || return 1
+  [ -n "$run" ] || return 1
+  printf '%s\n' "$run" | awk -v mode=suffix "$CODERABBIT_ACK_PAIR_AWK" >/dev/null || return 1
+  printf '%s' "$run"
+}
+
+# coderabbit_ack_login <suffix> — the first configured identity a
+# login-naming confirmation names, or exit 1. Only that wording carries one;
+# the commit-naming form and any other marker-anchored wording reset the
+# floor without naming anyone.
+coderabbit_ack_login() {
+  local suffix="$1" login
+  while IFS= read -r login; do
+    [ -n "$login" ] || continue
+    if printf '%s' "$AGENT_LOGINS_JSON" \
+      | jq -e --arg login "$login" 'index($login) != null' >/dev/null 2>&1; then
+      printf '%s' "$login"
+      return 0
+    fi
+  done <<EOF
+$(printf '%s\n' "$suffix" | awk '
+  /^✅[^ \t]*[ \t]+Confirmed as addressed by @[A-Za-z0-9-]+$/ {
+    sub(/^✅[^ \t]*[ \t]+Confirmed as addressed by @/, "")
+    print
+  }')
+EOF
+  return 1
+}
+
+# coderabbit_strip_ack_suffix <body> — the body without its trailing
+# footer/confirmation run, carriage returns and trailing blank lines removed,
+# for comparing two revisions of one finding on content. The run is removed
+# only when the raw body and its visible text agree on it; otherwise only the
+# carriage returns and trailing blank lines go.
+coderabbit_strip_ack_suffix() {
+  local body="$1" mode=strip
+  coderabbit_ack_run "$body" >/dev/null 2>&1 || mode=trim
+  printf '%s\n' "$body" | awk -v mode="$mode" "$CODERABBIT_ACK_PAIR_AWK"
 }
 
 FINDINGS='[]'
@@ -433,9 +563,13 @@ while IFS= read -r finding; do
   floor=$(printf '%s' "$finding" | jq -r '.updated_at // .created_at')
   confirmed_login=""
   if [ "$reviewer" = "$CODERABBIT_BOT" ]; then
-    confirmed_login=$(coderabbit_confirmation_login "$body" || true)
-    if [ -n "$confirmed_login" ]; then
+    if ack_suffix=$(coderabbit_ack_suffix "$body"); then
+      # CodeRabbit's own acknowledgement of a disposition is not a re-raise.
+      # Keep the finding's creation as its evidence floor so the reply the
+      # acknowledgement answers stays valid, whichever shape or wording the
+      # acknowledgement takes and however often it is appended (#1167).
       floor=$(printf '%s' "$finding" | jq -r '.created_at')
+      confirmed_login=$(coderabbit_ack_login "$ack_suffix" || true)
     fi
   fi
   accounted=false
@@ -445,10 +579,12 @@ while IFS= read -r finding; do
     evidence="thread-reply"
   fi
   FINDINGS=$(printf '%s\n%s\n' "$FINDINGS" "$finding" | jq -cs \
-    --argjson accounted "$accounted" --arg evidence "$evidence" '
+    --argjson accounted "$accounted" --arg evidence "$evidence" \
+    --arg confirmed_login "$confirmed_login" '
       .[0] + [(.[1] + {
         accounted: $accounted,
-        evidence: (if $evidence == "" then null else $evidence end)
+        evidence: (if $evidence == "" then null else $evidence end),
+        confirmed_login: (if $confirmed_login == "" then null else $confirmed_login end)
       })]
     ')
 done <<EOF
@@ -610,20 +746,106 @@ printf '%s' "$V2_ARCHIVE_ENTRIES" | jq -e 'all(.[]; .payload | type == "object")
 ARCHIVE_ENTRIES=$(printf '%s\n%s\n' "$ARCHIVE_ENTRIES" "$V2_ARCHIVE_ENTRIES" \
   | jq -cs '.[0] + .[1]')
 
+# #1167, with the relay's record available: the record decides what the
+# latest edit did. An edit that changed no visible content never raises a
+# CodeRabbit inline finding's evidence floor, whether or not it carried a
+# confirmation line (CodeRabbit also rewrites its footer to the reply marker
+# after a reply it does not confirm, with no line at all); the floor is then
+# the newest archived revision whose content differs from the live body, or
+# the finding's creation. An edit that changed content raises the floor to
+# that edit even when an acknowledgement came with it, so a reply to the old
+# text cannot stand for the new. Every CodeRabbit inline finding with a
+# record is revisited; without a record the marker-based decision stands.
+REFINED_FINDINGS='[]'
+while IFS= read -r finding; do
+  [ -n "$finding" ] || continue
+  if [ "$(printf '%s' "$finding" | jq -r '.reviewer')" != "$CODERABBIT_BOT" ]; then
+    REFINED_FINDINGS=$(printf '%s\n%s\n' "$REFINED_FINDINGS" "$finding" | jq -cs '.[0] + [.[1]]')
+    continue
+  fi
+  finding_id=$(printf '%s' "$finding" | jq -r '.finding_id')
+  root_id=$(printf '%s' "$finding" | jq -r '.root_id')
+  confirmed_login=$(printf '%s' "$finding" | jq -r '.confirmed_login // ""')
+  live_stripped=$(coderabbit_strip_ack_suffix "$(printf '%s' "$finding" | jq -r '.body // ""')")
+  content_floor=""
+  content_matched=false
+  archives_seen=false
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    archives_seen=true
+    archived_at=$(printf '%s' "$entry" | jq -r '.archived_at')
+    if [ "$(coderabbit_strip_ack_suffix "$(printf '%s' "$entry" | jq -r '.payload.body')")" = "$live_stripped" ]; then
+      content_matched=true
+    elif [ -z "$content_floor" ] || [ "$archived_at" \> "$content_floor" ]; then
+      content_floor="$archived_at"
+    fi
+  done <<EOF
+$(printf '%s' "$ARCHIVE_ENTRIES" | jq -c --argjson id "$finding_id" --arg login "$CODERABBIT_BOT" '
+  .[] | select((.payload.source_kind // "issue-comment") == "inline"
+    and .payload.source_comment_id == $id
+    and .payload.source_login == $login
+    and (.payload.body | type) == "string")' \
+  | while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      [ "$(fingerprint "$(printf '%s' "$entry" | jq -c '.payload.body')")" = \
+        "$(printf '%s' "$entry" | jq -r '.payload.body_fingerprint')" ] || continue
+      printf '%s\n' "$entry"
+    done)
+EOF
+  # With a record, the record decides: the latest edit was content-free only
+  # when some archived revision has the live content, and then the floor is
+  # the newest content change; otherwise the latest edit changed content and
+  # the floor is that edit, whatever acknowledgement it was delivered with.
+  # Without a record the marker-based decision above stands.
+  if [ "$archives_seen" = true ]; then
+    finding_created_at=$(printf '%s' "$finding" | jq -r '.created_at')
+    if [ "$content_matched" = true ]; then
+      [ -n "$content_floor" ] || content_floor="$finding_created_at"
+    else
+      content_floor=$(printf '%s' "$finding" | jq -r '.updated_at // .created_at')
+    fi
+    # The same-second allowance for the reply a confirmation names holds only
+    # at the finding's creation; at a content edit the reply must be strictly
+    # later, since a reply in the edit's second may precede the rewrite.
+    floor_login="$confirmed_login"
+    [ "$content_floor" = "$finding_created_at" ] || floor_login=""
+    if agent_reply_after_finding "$root_id" "$content_floor" "$finding_id" "$floor_login"; then
+      finding=$(printf '%s' "$finding" | jq -c '.accounted = true | .evidence = "thread-reply"')
+    else
+      finding=$(printf '%s' "$finding" | jq -c '.accounted = false | .evidence = null')
+    fi
+  fi
+  REFINED_FINDINGS=$(printf '%s\n%s\n' "$REFINED_FINDINGS" "$finding" | jq -cs '.[0] + [.[1]]')
+done <<EOF
+$(printf '%s' "$FINDINGS" | jq -c '.[]')
+EOF
+FINDINGS="$REFINED_FINDINGS"
+
 ARCHIVED_CANDIDATES='[]'
 append_archive_candidate() {
   local payload="$1" archive_comment_id="$2" archived_at="$3"
   local source_kind source_id source_login source_comments source_comment
   local live_source_login live_source_body_json live_source_fingerprint archive_tiers tier
   local body_fingerprint payload_body_json finding_kind ack_token accounted evidence
+  local live_body archived_body
 
   printf '%s' "$payload" | validate_archive_payload \
     || die 2 "feedback archive payload failed schema validation"
+  payload_body_json=""
   if [ "$(printf '%s' "$payload" | jq -r '.archive_version // 1')" -eq 2 ]; then
     payload_body_json=$(printf '%s' "$payload" | jq -c '.body')
     [ "$(fingerprint "$payload_body_json")" = \
       "$(printf '%s' "$payload" | jq -r '.body_fingerprint')" ] \
       || die 2 "feedback archive body fingerprint mismatch"
+  elif [ "$(printf '%s' "$payload" | jq -r 'if (.body | type) == "string" then "yes" else "no" end')" = yes ]; then
+    # A v1 record may carry its body. Use it only when it is the body the
+    # record's fingerprint was taken from, as for v2; a body that does not
+    # match (a handoff can be fork-supplied) is ignored and the archived
+    # revision is inventoried as if the record carried no body.
+    payload_body_json=$(printf '%s' "$payload" | jq -c '.body')
+    [ "$(fingerprint "$payload_body_json")" = \
+      "$(printf '%s' "$payload" | jq -r '.body_fingerprint')" ] \
+      || payload_body_json=""
   fi
   source_kind=$(printf '%s' "$payload" | jq -r '.source_kind')
   source_id=$(printf '%s' "$payload" | jq -r '.source_comment_id')
@@ -662,6 +884,20 @@ append_archive_candidate() {
     live_source_body_json=$(printf '%s' "$source_comment" | jq -c '.body // ""')
     live_source_fingerprint=$(fingerprint "$live_source_body_json")
     [ "$live_source_fingerprint" != "$body_fingerprint" ] || return 0
+    # A CodeRabbit acknowledgement is an edit of the finding, so the relay
+    # archives the revision being acknowledged. That revision is the same
+    # finding, already dispositioned by the reply the acknowledgement
+    # answers; demanding a second acknowledgement for it is the archive half
+    # of #1167. Compare the two revisions with their trailing footer and
+    # confirmation runs removed: equal means the archive adds nothing to
+    # disposition, and a changed visible content line still archives.
+    if [ "$source_kind" = inline ] && [ "$source_login" = "$CODERABBIT_BOT" ] \
+      && [ -n "$payload_body_json" ]; then
+      live_body=$(printf '%s' "$source_comment" | jq -r '.body // ""')
+      archived_body=$(printf '%s' "$payload_body_json" | jq -r '.')
+      [ "$(coderabbit_strip_ack_suffix "$live_body")" != \
+        "$(coderabbit_strip_ack_suffix "$archived_body")" ] || return 0
+    fi
   fi
 
   if [ "$source_login" = "$CODERABBIT_BOT" ]; then
@@ -699,6 +935,7 @@ append_archive_candidate() {
     --arg source_login "$source_login" \
     --arg tier "$tier" --arg archived_at "$archived_at" \
     --arg fingerprint "$body_fingerprint" --arg token "$ack_token" \
+    --arg validated_body_json "$payload_body_json" \
     --argjson accounted "$accounted" --arg evidence "$evidence" '
       .[0] + [(.[1] as $payload | {
         kind: $finding_kind,
@@ -713,7 +950,8 @@ append_archive_candidate() {
         updated_at: $archived_at,
         body_fingerprint: $fingerprint,
         ack_token: $token,
-        body: ($payload.body // ("(archived reviewer " + $source_kind + " version)")),
+        body: (if $validated_body_json == "" then ("(archived reviewer " + $source_kind + " version)")
+               else ($validated_body_json | fromjson) end),
         accounted: $accounted,
         evidence: (if $evidence == "" then null else $evidence end)
       })]
