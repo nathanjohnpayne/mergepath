@@ -1900,6 +1900,121 @@ else
   fail "#1193: gate (a) is back to a single current_entry over the mixed CheckRun/StatusContext set"
 fi
 
+# ── #1214 site 1: the annex conventional-name fallback collapsed surfaces ───
+#
+# #1193 split CheckRun from StatusContext in the required-context path and in
+# the unresolved-requirement-list path. ANNEX_NAME_FALLBACK_BAD is a third
+# collapse of the same mixed union in this same gate, and it was left behind.
+#
+# It groups by NAME alone, then picks a winner with
+# `sort_by(.completedAt // .startedAt // "") | last`. A StatusContext carries
+# neither timestamp in this projection — the GraphQL fragment selects only
+# createdAt for that union member, and this arm never reads it — so a commit
+# status always sorts FIRST and loses every tie to a completed check run. The
+# masking was therefore one-directional and entirely an accident of the sort
+# key: a red check run still won over a green status, while a GREEN check run
+# silently dropped a same-named RED status.
+#
+# The fix groups by (name, surface). This arm is already guessing by name —
+# it exists precisely because the annex real workflow identity could not be
+# determined — so a status reported under that name is exactly as plausible an
+# annex report as a check run, and fail-closed is the reading consistent with
+# that premise. The sibling ANNEX_WORKFLOW_BAD scan needs no change: it matches
+# on .workflowPath, which a StatusContext can never carry.
+if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
+  cat > "$G1193_DIR/annex.awk" <<'AWK'
+BEGIN { start = "    ANNEX_NAME_FALLBACK_BAD=$(echo \"$ANNEX_SCAN_ROLLUP_JSON\" | jq '"; stop = "    ')" }
+$0 == start { started = 1; next }
+started { if ($0 == stop) { exit } print }
+AWK
+  awk -f "$G1193_DIR/annex.awk" "$SCRIPT" > "$G1193_DIR/annex.jq"
+
+  g1214_annex() { printf '%s' "$1" | jq -c -f "$G1193_DIR/proj.jq" | jq -c -f "$G1193_DIR/annex.jq"; }
+  g1214_labels() { printf '%s' "$1" | jq -c '[.[] | "\(.label)=\(.result)"] | sort'; }
+
+  G1214_CR_OK='{"__typename":"CheckRun","name":"repo-lint-local","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":false,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Consumer CI","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+  G1214_CR_BAD='{"__typename":"CheckRun","name":"repo-lint-local","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":false,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Consumer CI","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+  G1214_SC_OK='{"__typename":"StatusContext","context":"repo-lint-local","state":"SUCCESS","createdAt":"2026-05-21T11:00:00Z","isRequired":false}'
+  G1214_SC_BAD='{"__typename":"StatusContext","context":"repo-lint-local","state":"FAILURE","createdAt":"2026-05-21T11:00:00Z","isRequired":false}'
+
+  if [ ! -s "$G1193_DIR/annex.jq" ]; then
+    fail "#1214: could not extract ANNEX_NAME_FALLBACK_BAD from $SCRIPT — the anchor lines moved, so nothing below tests the shipped scan"
+  else
+    # THE DISCRIMINATOR. Green check run, red same-named commit status.
+    GOT=$(g1214_labels "$(g1214_annex "[$G1214_CR_OK,$G1214_SC_BAD]")")
+    if [ "$GOT" = '["repo-lint-local=FAILURE"]' ]; then
+      pass "#1214: a green annex check run no longer drops a same-named red commit status"
+    else
+      fail "#1214: green CheckRun + red StatusContext must still report the red status, got $GOT"
+    fi
+
+    # The direction that already worked, kept working: the check run has real
+    # timestamps and always outranked the status, so this passed before too.
+    GOT=$(g1214_labels "$(g1214_annex "[$G1214_CR_BAD,$G1214_SC_OK]")")
+    if [ "$GOT" = '["repo-lint-local=FAILURE"]' ]; then
+      pass "#1214: a red annex check run still blocks alongside a green same-named commit status"
+    else
+      fail "#1214: red CheckRun + green StatusContext must report the red check run, got $GOT"
+    fi
+
+    # No false block when both surfaces are green.
+    GOT=$(g1214_labels "$(g1214_annex "[$G1214_CR_OK,$G1214_SC_OK]")")
+    if [ "$GOT" = '[]' ]; then
+      pass "#1214: both annex surfaces green still clears the conventional-name fallback"
+    else
+      fail "#1214: both-green must not block the annex fallback, got $GOT"
+    fi
+
+    # Within one surface, the stale-rerun rule #655 round 13 established must
+    # survive the regrouping: a superseded failure still loses to a later pass.
+    G1214_CR_LATER_OK='{"__typename":"CheckRun","name":"repo-lint-local","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T12:00:00Z","completedAt":"2026-05-21T12:05:00Z","isRequired":false,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":2,"workflow":{"name":"Consumer CI","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+    GOT=$(g1214_labels "$(g1214_annex "[$G1214_CR_BAD,$G1214_CR_LATER_OK]")")
+    if [ "$GOT" = '[]' ]; then
+      pass "#1214: inside one surface, a superseded annex failure still loses to the later success"
+    else
+      fail "#1214: the annex fallback regrouping broke stale-rerun selection (#655 round 13), got $GOT"
+    fi
+  fi
+
+  # Review round 1, found independently by Codex (P2) and CodeRabbit: giving
+  # commit statuses their own partition made their INTERNAL ordering
+  # load-bearing for the first time. A StatusContext carries neither
+  # startedAt nor completedAt in this projection, so every status compared
+  # equal on the old sort key and the winner fell out of GraphQL connection
+  # order -- a stale failure could block a recovered annex, or a stale
+  # success could hide its current failure. The projection already carried
+  # createdAt; the ordering now uses it. Both array orders are asserted,
+  # because connection order is exactly what must stop mattering.
+  if [ "$G1193_EXTRACTION_OK" -eq 1 ] && [ -s "$G1193_DIR/annex.jq" ]; then
+    SC_OLD_BAD='{"__typename":"StatusContext","context":"repo-lint-local","state":"FAILURE","createdAt":"2026-05-21T10:00:00Z","isRequired":false}'
+    SC_NEW_OK='{"__typename":"StatusContext","context":"repo-lint-local","state":"SUCCESS","createdAt":"2026-05-21T12:00:00Z","isRequired":false}'
+    SC_NEW_BAD='{"__typename":"StatusContext","context":"repo-lint-local","state":"FAILURE","createdAt":"2026-05-21T12:00:00Z","isRequired":false}'
+    SC_OLD_OK='{"__typename":"StatusContext","context":"repo-lint-local","state":"SUCCESS","createdAt":"2026-05-21T10:00:00Z","isRequired":false}'
+
+    GOT_A=$(g1214_labels "$(g1214_annex "[$SC_OLD_BAD,$SC_NEW_OK]")")
+    GOT_B=$(g1214_labels "$(g1214_annex "[$SC_NEW_OK,$SC_OLD_BAD]")")
+    if [ "$GOT_A" = '[]' ] && [ "$GOT_B" = '[]' ]; then
+      pass "#1214: a recovered annex status wins over its own stale failure, in either connection order"
+    else
+      fail "#1214: stale status failure still decides the annex fallback (order A=$GOT_A order B=$GOT_B)"
+    fi
+
+    GOT_A=$(g1214_labels "$(g1214_annex "[$SC_OLD_OK,$SC_NEW_BAD]")")
+    GOT_B=$(g1214_labels "$(g1214_annex "[$SC_NEW_BAD,$SC_OLD_OK]")")
+    if [ "$GOT_A" = '["repo-lint-local=FAILURE"]' ] && [ "$GOT_B" = '["repo-lint-local=FAILURE"]' ]; then
+      pass "#1214: a current annex status failure is not hidden by its own stale success, in either connection order"
+    else
+      fail "#1214: stale status success still hides the current annex failure (order A=$GOT_A order B=$GOT_B)"
+    fi
+  fi
+fi
+
+if grep -q 'group_by(\[(.name // .context // "?"), (.kind // "")\])' "$SCRIPT"; then
+  pass "#1214: the annex conventional-name fallback groups by name AND surface"
+else
+  fail "#1214: the annex conventional-name fallback is back to grouping by name alone"
+fi
+
 rm -rf "$G1193_DIR"
 trap - EXIT
 
