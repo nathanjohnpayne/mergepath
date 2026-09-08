@@ -1776,7 +1776,8 @@ elif ! printf '[]' | jq -f "$G1193_DIR/proj.jq" >/dev/null 2>&1; then
   fail "#1193: the extracted rollup projection does not compile as a jq program — extraction captured the wrong span"
 elif ! printf '{"statusCheckRollup":[]}' | jq --argjson requirements '[]' \
         --arg requirements_state known --arg approval_readiness_only 0 \
-        --arg current_run_id "" -f "$G1193_DIR/bad.jq" >/dev/null 2>&1; then
+        --arg current_run_id "" --argjson lineage_contexts '[]' \
+        -f "$G1193_DIR/bad.jq" >/dev/null 2>&1; then
   G1193_EXTRACTION_OK=0
   fail "#1193: the extracted BAD_CHECKS filter does not compile as a jq program — extraction captured the wrong span"
 else
@@ -1789,6 +1790,7 @@ g1193_gate_a() {
     | jq -c -f "$G1193_DIR/proj.jq" \
     | jq -c --argjson requirements "$2" --arg requirements_state "$3" \
             --arg approval_readiness_only "0" --arg current_run_id "" \
+            --argjson lineage_contexts '[]' \
             -f "$G1193_DIR/bad.jq"
 }
 # `-` stands for "no surface recorded": jq treats "" as truthy, so an absent
@@ -2013,6 +2015,229 @@ if grep -q 'group_by(\[(.name // .context // "?"), (.kind // "")\])' "$SCRIPT"; 
   pass "#1214: the annex conventional-name fallback groups by name AND surface"
 else
   fail "#1214: the annex conventional-name fallback is back to grouping by name alone"
+fi
+
+# ── #1215: one app, two PRODUCER LINEAGES under one required context ───────
+#
+# A required context here is published twice under app 15368: the job-native
+# check run Actions materialises, and a Checks-API run POSTed by a gate
+# workflow. GitHub resolves the two independently and requires the newest of
+# EACH to be green. Measured on this repo own auto-merge history, which is the
+# only bypass-proof oracle: on #828 every native run was green from 00:20:23,
+# auto-merge withheld for 35 minutes, and fired 2 seconds after the Checks-API
+# entry turned green; on #835 it withheld 13 minutes and released 1 second
+# after the synthetic red was superseded. #1119 is the control in the other
+# direction -- a native failure still latest in its own suite did not block --
+# which is what rules the check suite out as the partition.
+#
+# #1193 partitioned by SURFACE. Both lineages are check runs, so they shared
+# one partition and the recency winner spoke for both: a native FAILURE
+# followed by a synthetic SUCCESS reported clean while GitHub blocked.
+#
+# The discriminator is externalId: Actions stamps a UUID on every job run and
+# an API POST leaves it empty. Verified live -- on the head of #1216 the
+# required context "CodeRabbit unresolved blocking findings" appears under both
+# lineages within app 15368.
+if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
+  g1215() {
+    printf '%s' "$1" | jq -c -f "$G1193_DIR/proj.jq" \
+      | jq -c --argjson requirements "[{\"context\":\"${2:-Merge clearance gate}\",\"app_id\":null}]" \
+              --arg requirements_state known --arg approval_readiness_only "0" \
+              --arg current_run_id "" \
+              --argjson lineage_contexts '["Merge clearance gate","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings"]' \
+              -f "$G1193_DIR/bad.jq" \
+      | jq -c '[.[] | "\(.lineage // "-"):\(.result)"] | sort'
+  }
+  G1215_NAT_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","externalId":"11111111-2222-3333-4444-555555555555","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
+  G1215_NAT_OK='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:06:00Z","completedAt":"2026-05-21T10:06:20Z","externalId":"66666666-7777-8888-9999-000000000000","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":2,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
+  # The synthetic lineage coalesces into whichever suite was created first on
+  # the head, so its reported workflow is one that publishes nothing. That is
+  # exactly why workflowName is the wrong key.
+  G1215_API_OK='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":".github/workflows/agent-review.yml","resourcePath":"/o/r/actions/workflows/agent-review.yml"}}}}'
+  G1215_API_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:04:00Z","completedAt":"2026-05-21T10:04:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":".github/workflows/agent-review.yml","resourcePath":"/o/r/actions/workflows/agent-review.yml"}}}}'
+  G1215_NAT_STALE_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T09:00:00Z","completedAt":"2026-05-21T09:00:20Z","externalId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":0,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
+
+  GOT=$(g1215 "[$G1215_NAT_BAD,$G1215_API_OK]")
+  if [ "$GOT" = '["native:FAILURE"]' ]; then
+    pass "#1215: a later synthetic SUCCESS no longer masks the native FAILURE of the same required context"
+  else
+    fail "#1215: native FAILURE + later Checks-API SUCCESS must block on the native run, got $GOT"
+  fi
+
+  GOT=$(g1215 "[$G1215_API_BAD,$G1215_NAT_OK]")
+  if [ "$GOT" = '["api:FAILURE"]' ]; then
+    pass "#1215: a later native SUCCESS no longer masks the synthetic FAILURE of the same required context"
+  else
+    fail "#1215: Checks-API FAILURE + later native SUCCESS must block on the synthetic run, got $GOT"
+  fi
+
+  GOT=$(g1215 "[$G1215_API_OK,$G1215_NAT_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: both lineages green still clears gate (a)"
+  else
+    fail "#1215: both-lineages-green must not block, got $GOT"
+  fi
+
+  # #655 round 13, one level in: superseding still works WITHIN a lineage, and
+  # across suites, which is what rules out keying on the check suite (#1076).
+  GOT=$(g1215 "[$G1215_NAT_STALE_BAD,$G1215_NAT_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: inside one lineage, a superseded failure in its own suite still loses to the later success"
+  else
+    fail "#1215: the lineage partition broke across-suite superseding — that is the #1076 deadlock, got $GOT"
+  fi
+
+  # Totality: no externalId at all collapses to one lineage, which is the
+  # pre-#1215 single winner rather than an empty partition.
+  GOT=$(g1215 '[{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","isRequired":true},{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:20Z","isRequired":true}]')
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: entries carrying no externalId collapse to one lineage, as before the split"
+  else
+    fail "#1215: untyped-lineage entries changed verdict — the split must degrade to the pre-fix winner, got $GOT"
+  fi
+
+  # Review round 1, Codex P1 "preserve any-producer semantics across apps".
+  # The lineage split is scoped to a single producing app. Across apps the
+  # filter keeps the single recency winner it used before, so an unrelated
+  # same-named failure cannot become independently mandatory for a requirement
+  # its real producer satisfies.
+  G1215_FOREIGN_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:01:00Z","completedAt":"2026-05-21T10:01:20Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":57789},"workflowRun":null}}'
+  GOT=$(g1215 "[$G1215_FOREIGN_BAD,$G1215_NAT_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: across apps the single recency winner is unchanged, so a foreign same-named failure does not become mandatory"
+  else
+    fail "#1215: the lineage split leaked across apps and blocked on a foreign producer, got $GOT"
+  fi
+  # ... and the one-app split still fires when the same set is single-app.
+  GOT=$(g1215 "[$G1215_NAT_BAD,$G1215_API_OK]")
+  if [ "$GOT" = '["native:FAILURE"]' ]; then
+    pass "#1215: the one-app lineage split still fires after the cross-app scoping"
+  else
+    fail "#1215: scoping to one app disabled the split it exists for, got $GOT"
+  fi
+
+  # Review round 2, Codex P2 "restrict lineage splitting to controlled check
+  # producers". The two lineages exist only because this repository gate
+  # workflows POST with the Actions token, so the synthetic runs share the
+  # Actions app. A THIRD-PARTY app has no such duality, and external_id is
+  # optional for it: if it set the field on one run and omitted it on the next,
+  # a stale failure and its own recovery would land in different partitions and
+  # the stale failure would block forever. That is a permanent block, which is
+  # worse than the fail-open being closed.
+  G1215_TP_STALE_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T09:00:00Z","completedAt":"2026-05-21T09:00:20Z","externalId":"tp-run-1","isRequired":true,"checkSuite":{"app":{"databaseId":99999},"workflowRun":null}}'
+  G1215_TP_FRESH_OK='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":99999},"workflowRun":null}}'
+  GOT=$(g1215 "[$G1215_TP_STALE_BAD,$G1215_TP_FRESH_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: a third-party app that varies external_id between reruns is not split, so its stale failure cannot block forever"
+  else
+    fail "#1215: the lineage heuristic was applied to a third-party app and its stale failure now blocks permanently, got $GOT"
+  fi
+
+  # Review round 3, Codex P2 "limit lineage splitting to the guarded contexts".
+  # The Actions app is not confined to the gate workflows: auto-clear also POSTs
+  # check runs with the same token, and a consumer can publish anything. A
+  # context this repository does not publish has no guarded discriminator, so
+  # splitting it would fold a synthetic entry into the native lineage on a
+  # field its producer was never asked to leave empty. Same app, same two
+  # lineages, a name we do not own: must NOT split.
+  G1215_OTHER_NAT_BAD='{"__typename":"CheckRun","name":"consumer-local-gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","externalId":"11111111-2222-3333-4444-555555555555","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Consumer Gate","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+  G1215_OTHER_API_OK='{"__typename":"CheckRun","name":"consumer-local-gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":"Consumer Gate","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+  GOT=$(g1215 "[$G1215_OTHER_NAT_BAD,$G1215_OTHER_API_OK]" "consumer-local-gate")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: a required context this repository does not publish keeps the single recency winner, even under the Actions app"
+  else
+    fail "#1215: the lineage split reached a context with no guarded publisher, got $GOT"
+  fi
+fi
+
+# Review round 1, Codex P2 "verify externalId inside the GraphQL selection".
+# A bare grep for the token passes even when the QUERY drops it, because the
+# same word appears in the projection and in comments — and the behavioural
+# fixtures inject externalId directly, so they would keep passing while
+# production collapsed every check run into one lineage. Assert it inside the
+# CheckRun selection block, extracted from the real query.
+if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
+  cat > "$G1193_DIR/frag.awk" <<'AWK'
+BEGIN { start = "                      ... on CheckRun {"; stop = "                      }" }
+$0 == start { started = 1; next }
+started { if ($0 == stop) { exit } print }
+AWK
+  awk -f "$G1193_DIR/frag.awk" "$SCRIPT" > "$G1193_DIR/frag.txt"
+  if [ ! -s "$G1193_DIR/frag.txt" ]; then
+    fail "#1215: could not extract the CheckRun GraphQL selection from $SCRIPT — the anchor moved, so the lineage-field guard is testing nothing"
+  elif grep -qE '^[[:space:]]*externalId[[:space:]]*$' "$G1193_DIR/frag.txt"; then
+    pass "#1215: externalId is selected inside the CheckRun GraphQL fragment, not merely mentioned elsewhere in the file"
+  else
+    fail "#1215: the CheckRun GraphQL selection does not request externalId — production would collapse every check run into one lineage while the fixtures kept passing"
+  fi
+fi
+
+# The discriminator rests on an OPTIONAL Checks-API field. A synthetic
+# publisher that set external_id would be classified native and the two
+# timelines would re-merge silently. Nothing in this repository sets it; this
+# asserts nothing starts.
+# Scoped to the workflows that actually publish the affected required contexts
+# (#1215 review round 2, Codex P2). A repository-wide substring scan was wrong
+# twice over: this suite is propagated to every consumer and runs in the
+# required lint context, so a consumer workflow that merely MENTIONS
+# external_id — in a comment, or when reading a response, or for an unrelated
+# check run — would red that consumer forever, and the consumer could not fix
+# it because the hub owns this file. Absent files are skipped, since a consumer
+# need not carry every gate workflow.
+# codex-feedback-archive-relay.yml publishes "Codex P1 unresolved threads" too
+# (#1215 review round 3, Codex P2) — it was missing here, so a discriminator
+# regression in the relay would not have been caught.
+G1215_PUBLISHERS="merge-clearance-gate.yml codex-p1-gate.yml coderabbit-severity-gate.yml codex-feedback-archive-relay.yml required-check-publisher.yml"
+G1215_EXTID_SETTERS=""
+G1215_PUBLISHERS_SEEN=0
+for g1215_wf in $G1215_PUBLISHERS; do
+  [ -f ".github/workflows/$g1215_wf" ] || continue
+  G1215_PUBLISHERS_SEEN=$((G1215_PUBLISHERS_SEEN + 1))
+  if grep -q "external_id" ".github/workflows/$g1215_wf" 2>/dev/null; then
+    G1215_EXTID_SETTERS="$G1215_EXTID_SETTERS $g1215_wf"
+  fi
+done
+if [ "$G1215_PUBLISHERS_SEEN" -eq 0 ]; then
+  echo "SKIP: #1215 external_id guard (no known check-run publisher workflow present)"; SKIP=$((SKIP + 1))
+elif [ -z "$G1215_EXTID_SETTERS" ]; then
+  pass "#1215: no check-run publisher sets external_id, so the lineage discriminator holds for the Actions app"
+else
+  fail "#1215: a check-run publisher now sets external_id ($G1215_EXTID_SETTERS) — its synthetic run would be classified native and the lineage split would silently collapse"
+fi
+if grep -qF 'map(select((.lineage // "") == $l)) | current_entry' "$SCRIPT" \
+   && grep -qF '($apps | length) == 1 and ($apps[0] == "15368")' "$SCRIPT" \
+   && grep -qF '($lineage_contexts | index($ctx)) != null' "$SCRIPT"; then
+  pass "#1215: the lineage split is scoped to one surface, one app, and a named owned context"
+else
+  fail "#1215: the lineage split lost its surface, single-app or owned-context scoping"
+fi
+
+# The context list is a hard-coded constant, so hold it to the workflows rather
+# than to a comment (#1215 review round 3, "preferably by inspecting the actual
+# POST payloads"). Every CHECK_NAME a check-run publisher emits must either be
+# in the script list or be a name that is deliberately not a required context.
+G1215_LIST=$(sed -n 's/^LINEAGE_SPLIT_CONTEXTS_JSON=.\(.*\).$/\1/p' "$SCRIPT")
+if [ -z "$G1215_LIST" ]; then
+  fail "#1215: could not read LINEAGE_SPLIT_CONTEXTS_JSON from $SCRIPT — the context list guard is testing nothing"
+else
+  G1215_UNLISTED=""
+  for g1215_wf in $G1215_PUBLISHERS; do
+    [ -f ".github/workflows/$g1215_wf" ] || continue
+    while IFS= read -r g1215_name; do
+      [ -n "$g1215_name" ] || continue
+      # The publisher ships shadow-suffixed names while it is not yet live;
+      # those are not required contexts and are covered by their live twin.
+      case "$g1215_name" in *" (shadow)") continue ;; esac
+      case "$G1215_LIST" in *"\"$g1215_name\""*) ;; *) G1215_UNLISTED="$G1215_UNLISTED $g1215_wf:$g1215_name" ;; esac
+    done <<EOF2
+$(grep -hoE '(CHECK_NAME|[A-Z_]+_CONTEXT): *"?[^"$]*"?' ".github/workflows/$g1215_wf" 2>/dev/null | sed 's/^[A-Z_]*: *//' | tr -d '"' | sort -u)
+EOF2
+  done
+  if [ -z "$G1215_UNLISTED" ]; then
+    pass "#1215: every context a check-run publisher emits is named in the lineage-split list"
+  else
+    fail "#1215: a check-run publisher emits a context missing from LINEAGE_SPLIT_CONTEXTS_JSON ($G1215_UNLISTED) — that context would keep the pre-fix single winner while its publisher goes unguarded"
+  fi
 fi
 
 rm -rf "$G1193_DIR"
