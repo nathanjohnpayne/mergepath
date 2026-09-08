@@ -123,11 +123,11 @@ reset_fixtures() {
   "base": {
     "ref": "release",
     "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "repo": {"default_branch": "main"}
+    "repo": {"id": 4242, "full_name": "acme/widget", "default_branch": "main"}
   },
   "head": {
     "sha": "cccccccccccccccccccccccccccccccccccccccc",
-    "repo": {"full_name": "acme/widget", "fork": false}
+    "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}
   }
 }
 JSON
@@ -941,24 +941,30 @@ set_head() {  # set_head <jq expression for .head>
   jq ".head = ($1)" "$TMP/fixtures/pull.json" >"$TMP/fixtures/pull.next"
   mv "$TMP/fixtures/pull.next" "$TMP/fixtures/pull.json"
 }
-set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"full_name": "someone/widget", "fork": true}}'
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 9999, "full_name": "someone/widget", "fork": true}}'
 run_gate
 assert_eq 1 "$RUN_RC" "on a fork pull request an archived revision never lowers the floor (#1210)"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "the fork-supplied record leaves the rewritten live finding at its ordinary-edit floor"
 set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": null}'
 run_gate
 assert_eq 1 "$RUN_RC" "a pull request whose head repository is gone is read as a fork"
-set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"full_name": "acme/widget", "fork": false}}'
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}}'
 run_gate
 assert_eq 0 "$RUN_RC" "the same fixture with a same-repository head keeps the record-informed floor"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": true}}'
+run_gate
+assert_eq 0 "$RUN_RC" "a same-repository head on a repository that is itself a fork is not a fork pull request"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"full_name": "Someone/Widget", "fork": false}}'
+run_gate
+assert_eq 1 "$RUN_RC" "without repository ids the head is a fork when its full name differs from the base"
 cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
 archive_of "$PRE_ACK_BODY" 8715
-set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"full_name": "someone/widget", "fork": true}}'
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 9999, "full_name": "someone/widget", "fork": true}}'
 run_gate
 assert_eq 0 "$RUN_RC" "on a fork pull request the marker-based decision still stands and an acknowledgement-only archive still collapses"
 GH_FAIL_ENDPOINT="repos/acme/widget/pulls/7" run_gate
 assert_eq 2 "$RUN_RC" "a failed pull request fetch fails the gate closed"
-set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"full_name": "acme/widget", "fork": false}}'
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}}'
 # A content change delivered with an acknowledgement is still an edit, and its archive still needs a token.
 cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
 ack_edit 'sub("Clarify the error"; "Clarify the error and its exit code") | sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
