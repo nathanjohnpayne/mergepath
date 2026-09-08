@@ -2015,6 +2015,95 @@ else
   fail "#1214: the annex conventional-name fallback is back to grouping by name alone"
 fi
 
+# ── #1215: one app, two PRODUCER LINEAGES under one required context ───────
+#
+# A required context here is published twice under app 15368: the job-native
+# check run Actions materialises, and a Checks-API run POSTed by a gate
+# workflow. GitHub resolves the two independently and requires the newest of
+# EACH to be green. Measured on this repo own auto-merge history, which is the
+# only bypass-proof oracle: on #828 every native run was green from 00:20:23,
+# auto-merge withheld for 35 minutes, and fired 2 seconds after the Checks-API
+# entry turned green; on #835 it withheld 13 minutes and released 1 second
+# after the synthetic red was superseded. #1119 is the control in the other
+# direction -- a native failure still latest in its own suite did not block --
+# which is what rules the check suite out as the partition.
+#
+# #1193 partitioned by SURFACE. Both lineages are check runs, so they shared
+# one partition and the recency winner spoke for both: a native FAILURE
+# followed by a synthetic SUCCESS reported clean while GitHub blocked.
+#
+# The discriminator is externalId: Actions stamps a UUID on every job run and
+# an API POST leaves it empty. Verified live -- on the head of #1216 the
+# required context "CodeRabbit unresolved blocking findings" appears under both
+# lineages within app 15368.
+if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
+  g1215() {
+    printf '%s' "$1" | jq -c -f "$G1193_DIR/proj.jq" \
+      | jq -c --argjson requirements '[{"context":"Merge clearance gate","app_id":null}]' \
+              --arg requirements_state known --arg approval_readiness_only "0" \
+              --arg current_run_id "" -f "$G1193_DIR/bad.jq" \
+      | jq -c '[.[] | "\(.lineage // "-"):\(.result)"] | sort'
+  }
+  G1215_NAT_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","externalId":"11111111-2222-3333-4444-555555555555","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
+  G1215_NAT_OK='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:06:00Z","completedAt":"2026-05-21T10:06:20Z","externalId":"66666666-7777-8888-9999-000000000000","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":2,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
+  # The synthetic lineage coalesces into whichever suite was created first on
+  # the head, so its reported workflow is one that publishes nothing. That is
+  # exactly why workflowName is the wrong key.
+  G1215_API_OK='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":".github/workflows/agent-review.yml","resourcePath":"/o/r/actions/workflows/agent-review.yml"}}}}'
+  G1215_API_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:04:00Z","completedAt":"2026-05-21T10:04:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":".github/workflows/agent-review.yml","resourcePath":"/o/r/actions/workflows/agent-review.yml"}}}}'
+  G1215_NAT_STALE_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T09:00:00Z","completedAt":"2026-05-21T09:00:20Z","externalId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":0,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
+
+  GOT=$(g1215 "[$G1215_NAT_BAD,$G1215_API_OK]")
+  if [ "$GOT" = '["native:FAILURE"]' ]; then
+    pass "#1215: a later synthetic SUCCESS no longer masks the native FAILURE of the same required context"
+  else
+    fail "#1215: native FAILURE + later Checks-API SUCCESS must block on the native run, got $GOT"
+  fi
+
+  GOT=$(g1215 "[$G1215_API_BAD,$G1215_NAT_OK]")
+  if [ "$GOT" = '["api:FAILURE"]' ]; then
+    pass "#1215: a later native SUCCESS no longer masks the synthetic FAILURE of the same required context"
+  else
+    fail "#1215: Checks-API FAILURE + later native SUCCESS must block on the synthetic run, got $GOT"
+  fi
+
+  GOT=$(g1215 "[$G1215_API_OK,$G1215_NAT_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: both lineages green still clears gate (a)"
+  else
+    fail "#1215: both-lineages-green must not block, got $GOT"
+  fi
+
+  # #655 round 13, one level in: superseding still works WITHIN a lineage, and
+  # across suites, which is what rules out keying on the check suite (#1076).
+  GOT=$(g1215 "[$G1215_NAT_STALE_BAD,$G1215_NAT_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: inside one lineage, a superseded failure in its own suite still loses to the later success"
+  else
+    fail "#1215: the lineage partition broke across-suite superseding — that is the #1076 deadlock, got $GOT"
+  fi
+
+  # Totality: no externalId at all collapses to one lineage, which is the
+  # pre-#1215 single winner rather than an empty partition.
+  GOT=$(g1215 '[{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","isRequired":true},{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:20Z","isRequired":true}]')
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: entries carrying no externalId collapse to one lineage, as before the split"
+  else
+    fail "#1215: untyped-lineage entries changed verdict — the split must degrade to the pre-fix winner, got $GOT"
+  fi
+fi
+
+if grep -q 'externalId' "$SCRIPT"; then
+  pass "#1215: the rollup query selects the lineage discriminator"
+else
+  fail "#1215: the rollup query no longer selects externalId — the two lineages become indistinguishable"
+fi
+if grep -q '\[(.kind // ""), (.lineage // "")\]' "$SCRIPT"; then
+  pass "#1215: winner selection partitions by surface AND producer lineage"
+else
+  fail "#1215: winner selection is back to a surface-only partition, so a synthetic run can speak for the native one"
+fi
+
 rm -rf "$G1193_DIR"
 trap - EXIT
 

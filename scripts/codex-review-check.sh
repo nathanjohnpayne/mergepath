@@ -912,6 +912,7 @@ while :; do
                         conclusion
                         startedAt
                         completedAt
+                        externalId
                         isRequired(pullRequestNumber: $number)
                         checkSuite {
                           app { databaseId }
@@ -984,16 +985,54 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       # what #655 round 13 settled and what #1064 left unresolved for an
       # any-producer rule.
       kind: (.__typename // ""),
+      # Which PRODUCER LINEAGE this check run came from (#1215). A required
+      # context is published twice under one app: the job-native check run
+      # Actions materialises, and a Checks-API run POSTed by a gate workflow.
+      # GitHub resolves the two independently and requires the newest of each
+      # to be green -- measured on nathanjohnpayne/mergepath#828 (auto-merge
+      # withheld 35 minutes with every native run green, released 2 seconds
+      # after the API entry turned green) and #835 (withheld 13 minutes,
+      # released 1 second after), with #1119 as the control proving the
+      # partition is NOT the check suite.
+      #
+      # `externalId` is the discriminator: Actions stamps a UUID on every job
+      # run, and an API POST leaves it empty. Measured on this repo own heads,
+      # where one required context appears under both lineages within app
+      # 15368. Deliberately NOT workflowName: API POSTs coalesce into whichever
+      # suite was created first on the head, so that field reports a workflow
+      # that published nothing -- which is how the #1064 comment came to
+      # describe these two lineages as "two workflows". Deliberately NOT the
+      # check suite id either: that is finer than the rule and reintroduces the
+      # #1076 permanent deadlock, refuted by #1119.
+      #
+      # An entry with no externalId at all collapses to one lineage, which is
+      # exactly the pre-#1215 single winner rather than an empty partition.
+      lineage: (if .__typename == "CheckRun"
+                then (if ((.externalId // "") == "") then "api" else "native" end)
+                else "" end),
       # The PRODUCING app (#1064). Branch protection requires a context from a
       # specific app — `required_status_checks.checks[] = {context, app_id}` —
-      # so (context, app) is GitHub own unit of requirement and therefore the
-      # right key to collapse duplicate runs under. Deliberately NOT the
-      # workflow: measured on nathanpaynedotcom#908, three required contexts
-      # are each emitted by TWO different workflows under the SAME app 15368
-      # (agent-review.yml republishes what the dedicated gate workflows
-      # publish), all reporting isRequired=true against a protection entry that
-      # lists each context once. Keying on workflow would demand both be green
-      # and block PRs GitHub merges.
+      # so (context, app) is the right key for SELECTING which runs a
+      # requirement applies to. It is NOT the right key for collapsing them to
+      # one verdict: within a single app the same context is published by two
+      # independent lineages, and GitHub requires the newest of each to be
+      # green. That is what `lineage` above partitions on.
+      #
+      # CORRECTED (#1215). This comment used to justify the collapse with
+      # nathanpaynedotcom#908, "three required contexts each emitted by TWO
+      # different workflows under the SAME app 15368 (agent-review.yml
+      # republishes what the dedicated gate workflows publish)". Both halves
+      # are wrong. agent-review.yml publishes no check runs at all; the entries
+      # attributed to it are Checks-API POSTs, which coalesce into whichever
+      # suite was created first on the head and inherit its workflow name. And
+      # that pull request merged with the context red on BOTH lineages, so it
+      # is a merge over a red required check rather than evidence about what
+      # GitHub permits. Keying on workflow is still wrong, but for the reason
+      # above rather than the one recorded here.
+      #
+      # Deliberately NOT the workflow, and deliberately NOT the check suite:
+      # the suite is finer than the rule and reintroduces the #1076 permanent
+      # deadlock, refuted by #1119.
       appId: ((.checkSuite.app.databaseId // "") | tostring),
       startedAt: .startedAt,
       completedAt: .completedAt,
@@ -1716,8 +1755,9 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
   # that would drop the requirement out of scrutiny entirely — a fail-open
   # strictly worse than the one being fixed.
   def current_entries:
-    ([.[] | (.kind // "")] | unique) as $kinds
-    | [ $kinds[] as $k | (map(select((.kind // "") == $k)) | current_entry) ];
+    ([.[] | [(.kind // ""), (.lineage // "")]] | unique) as $keys
+    | [ $keys[] as $k
+        | (map(select([(.kind // ""), (.lineage // "")] == $k)) | current_entry) ];
 
   # A check passes iff SUCCESS, SKIPPED, or NEUTRAL. Everything else —
   # FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, PENDING, EXPECTED, ERROR,
@@ -1741,8 +1781,9 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         completedAt: (.completedAt // .createdAt // ""),
         isRequired: .isRequired,
         appId: (.appId // ""),
-        # #1193 — see the projection above and current_entries below.
-        kind: (.kind // "")
+        # #1193 / #1215 — see the projection above and current_entries below.
+        kind: (.kind // ""),
+        lineage: (.lineage // "")
       }
     # Runs GitHub does not count toward THIS PR requirements are not evidence
     # about them. Only an explicit `false` drops one: a null means GitHub
