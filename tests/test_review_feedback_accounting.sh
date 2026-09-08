@@ -853,13 +853,36 @@ printf '%s\n\nAlso bound the retry counter.\n' "$(cat "$PRE_ACK_BODY")" >"$TMP/p
 archive_of "$TMP/pre-ack-body-edited.txt" 8703
 run_gate
 assert_eq 1 "$RUN_RC" "an archived revision with different visible content still needs its own acknowledgement"
-assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "content-changed archive keeps the inline-archive shape"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "content-changed archive keeps the inline-archive shape"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "the record shows the acknowledged edit changed content, so the live finding is unaccounted too"
+# A ✅ line with no CodeRabbit footer anywhere is content, in the archive
+# comparison as in the live finding: nothing collapses and the record does
+# not lower the live floor.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+jq '.[0].body = "_🟡 Minor_ Clarify the error"' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+printf '%s\n' "_🟡 Minor_ Clarify the error" >"$TMP/no-footer-body.txt"
+ack_edit '. + "\n\n✅ Addressed in commit def5678"' "2026-08-18T21:02:00Z"
+archive_of "$TMP/no-footer-body.txt" 8713
+run_gate
+assert_eq 1 "$RUN_RC" "a markerless confirmation line is content in the archive comparison too"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "neither the live finding nor its archived predecessor is cleared by a markerless line"
 # archive_version 1 records: without a body the record is inventoried as before, never a crash;
-# with a body it compares like a v2 record. The fingerprint is not checked against a v1 body.
-v1_record() {  # v1_record <comment id> [body file]
-  local payload
+# with a body it compares like a v2 record, and only when the body matches the record's fingerprint.
+fingerprint_of_body_file() {  # the gate's fingerprint of a body: sha256 of its JSON string, first 12 hex
+  local json
+  json=$(jq -nc --rawfile body "$1" '$body | rtrimstr("\n")')
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$json" | sha256sum | awk '{print substr($1, 1, 12)}'
+  else
+    printf '%s' "$json" | shasum -a 256 | awk '{print substr($1, 1, 12)}'
+  fi
+}
+v1_record() {  # v1_record <comment id> [body file] [fingerprint override]
+  local payload fp
   if [ -n "${2:-}" ]; then
-    payload=$(jq -n --rawfile body "$2" '{archive_version:1,source_kind:"inline",source_comment_id:20,source_login:"coderabbitai[bot]",archived_at:"2026-08-18T21:02:00Z",body_fingerprint:"0123456789ab",codex_tiers:[],coderabbit_tiers:["p2"],body:($body | rtrimstr("\n"))}')
+    fp="${3:-$(fingerprint_of_body_file "$2")}"
+    payload=$(jq -n --rawfile body "$2" --arg fp "$fp" '{archive_version:1,source_kind:"inline",source_comment_id:20,source_login:"coderabbitai[bot]",archived_at:"2026-08-18T21:02:00Z",body_fingerprint:$fp,codex_tiers:[],coderabbit_tiers:["p2"],body:($body | rtrimstr("\n"))}')
   else
     payload=$(jq -n '{archive_version:1,source_kind:"inline",source_comment_id:20,source_login:"coderabbitai[bot]",archived_at:"2026-08-18T21:02:00Z",body_fingerprint:"0123456789ab",codex_tiers:[],coderabbit_tiers:["p2"]}')
   fi
@@ -879,6 +902,11 @@ assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')"
 v1_record 8705 "$PRE_ACK_BODY"
 run_gate
 assert_eq 0 "$RUN_RC" "an archive_version 1 record carrying the pre-acknowledgement body collapses with the acknowledged live finding"
+v1_record 8705 "$PRE_ACK_BODY" "0123456789ab"
+run_gate
+assert_eq 1 "$RUN_RC" "a v1 body that does not match the record's fingerprint is ignored, so the record is inventoried"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "the mismatched v1 record keeps the inline-archive shape"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "an ignored v1 body leaves the marker-based decision on the live finding in place"
 
 # archive_entry <body file> <comment id> <archived_at> — one relay record as a JSON object on stdout.
 archive_entry() {
@@ -908,6 +936,7 @@ archive_of "$PRE_ACK_BODY" 8707
 run_gate
 assert_eq 1 "$RUN_RC" "a content change delivered with an acknowledgement is still an edit"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "the archived pre-change revision still needs its own token"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "a reply to the old text does not stand for the rewritten live finding"
 # The record-informed floor is the newest content-changing edit, not the latest edit.
 cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
 CONTENT_A="$PRE_ACK_BODY"
