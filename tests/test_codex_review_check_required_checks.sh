@@ -1724,6 +1724,185 @@ else
   fail "#1061: the advisory does not mention the states where a further Phase 4b round is the correct remedy"
 fi
 
+# ── #1193: gate (a) collapsed CheckRun and StatusContext into ONE entry ─────
+#
+# A required context is satisfiable by a check run OR by a legacy commit
+# status, and GitHub evaluates each surface as its own row: when a head
+# carries both under one required name, both must be green for the merge to
+# proceed. gate (a) built one candidate set from the mixed union and picked a
+# single `current_entry` from it, ranked by recency — so the later-reporting
+# surface decided for both and a passing StatusContext masked a failing
+# CheckRun. The direction is a FAIL-OPEN on a merge gate: gate (a) reports
+# green, GitHub still blocks, and the disagreement reads as an infra flake.
+#
+# THESE ASSERTIONS RUN THE REAL FILTER. Every other end-to-end block in this
+# file re-types the jq inline and keeps it in sync by hand, and the copy in
+# `bad_checks` above has already drifted past #1064 (it carries no
+# requirements list, no isRequired scoping and no winner selection) — a copy
+# like that can pass while the shipped gate is broken, which is precisely the
+# defect class #1193 is. So the two jq programs are EXTRACTED from
+# scripts/codex-review-check.sh and executed: the fixtures enter as raw
+# GraphQL union nodes, pass through the script own projection, and are judged
+# by the script own BAD_CHECKS filter. If the projection stops carrying
+# __typename, these fail.
+G1193_DIR=$(mktemp -d)
+trap 'rm -rf "$G1193_DIR"' EXIT
+
+# Exact-line anchors, not regexes: a `{` in an ERE is an interval expression
+# whose escaping is not portable across BSD awk and gawk, and an exact match
+# cannot silently half-match a line that later drifts.
+cat > "$G1193_DIR/proj.awk" <<'AWK'
+BEGIN { start = "ROLLUP_JSON=$(echo \"$ROLLUP_CONTEXTS\" | jq '{"; stop = "}')" }
+$0 == start { started = 1; print "{"; next }
+started { if ($0 == stop) { print "}"; exit } print }
+AWK
+cat > "$G1193_DIR/bad.awk" <<'AWK'
+BEGIN { start = "BAD_CHECKS=$(echo \"$ROLLUP_JSON\" | jq \\"; stop = "')"; q = sprintf("%c", 39) }
+$0 == start { inblk = 1; next }
+inblk && !started { if (substr($0, length($0), 1) == q) { started = 1 } next }
+started { if ($0 == stop) { exit } print }
+AWK
+awk -f "$G1193_DIR/proj.awk" "$SCRIPT" > "$G1193_DIR/proj.jq"
+awk -f "$G1193_DIR/bad.awk"  "$SCRIPT" > "$G1193_DIR/bad.jq"
+
+# An empty or uncompilable extraction must FAIL here, never quietly turn every
+# assertion below into a vacuous pass.
+G1193_EXTRACTION_OK=1
+if [ ! -s "$G1193_DIR/proj.jq" ] || [ ! -s "$G1193_DIR/bad.jq" ]; then
+  G1193_EXTRACTION_OK=0
+  fail "#1193: could not extract gate (a) rollup projection / BAD_CHECKS filter from $SCRIPT — the anchor lines moved, so nothing below is testing the shipped gate"
+elif ! printf '[]' | jq -f "$G1193_DIR/proj.jq" >/dev/null 2>&1; then
+  G1193_EXTRACTION_OK=0
+  fail "#1193: the extracted rollup projection does not compile as a jq program — extraction captured the wrong span"
+elif ! printf '{"statusCheckRollup":[]}' | jq --argjson requirements '[]' \
+        --arg requirements_state known --arg approval_readiness_only 0 \
+        --arg current_run_id "" -f "$G1193_DIR/bad.jq" >/dev/null 2>&1; then
+  G1193_EXTRACTION_OK=0
+  fail "#1193: the extracted BAD_CHECKS filter does not compile as a jq program — extraction captured the wrong span"
+else
+  pass "#1193: gate (a) rollup projection and BAD_CHECKS filter extracted from the real script and both compile"
+fi
+
+# nodes_json requirements_json requirements_state -> compact array of labels
+g1193_gate_a() {
+  printf '%s' "$1" \
+    | jq -c -f "$G1193_DIR/proj.jq" \
+    | jq -c --argjson requirements "$2" --arg requirements_state "$3" \
+            --arg approval_readiness_only "0" --arg current_run_id "" \
+            -f "$G1193_DIR/bad.jq"
+}
+# `-` stands for "no surface recorded": jq treats "" as truthy, so an absent
+# and an empty kind both have to be normalised explicitly.
+g1193_labels() { printf '%s' "$1" | jq -c '[.[] | (if (.kind // "") == "" then "-" else .kind end) + ":\(.label)=\(.result)"] | sort'; }
+# Surface-agnostic form, for the assertions whose point is only WHETHER the
+# gate blocks. Naming the surface there would make them fail under a revert of
+# the fix for a cosmetic reason, and a guard that cannot stay green while the
+# mechanism is removed is not a guard.
+g1193_plain() { printf '%s' "$1" | jq -c '[.[] | "\(.label)=\(.result)"] | sort'; }
+
+# Raw statusCheckRollup union nodes, exactly as the GraphQL query selects them.
+G1193_CR_FAIL='{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":11,"workflow":{"name":"CI","resourcePath":"/o/r/actions/workflows/ci.yml"}}}}'
+G1193_CR_OK='{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T11:00:00Z","completedAt":"2026-05-21T11:05:00Z","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":12,"workflow":{"name":"CI","resourcePath":"/o/r/actions/workflows/ci.yml"}}}}'
+G1193_CR_RUNNING='{"__typename":"CheckRun","name":"lint","status":"IN_PROGRESS","conclusion":null,"startedAt":"2026-05-21T12:00:00Z","completedAt":null,"isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":13,"workflow":{"name":"CI","resourcePath":"/o/r/actions/workflows/ci.yml"}}}}'
+# A StatusContext carries NO name/status/conclusion/checkSuite and NO
+# startedAt/completedAt — only context, state and createdAt. Measured live on
+# nathanjohnpayne/mergepath#1208, whose head carries 82 CheckRun nodes and one
+# StatusContext (CodeRabbit).
+G1193_SC_OK='{"__typename":"StatusContext","context":"lint","state":"SUCCESS","createdAt":"2026-05-21T11:00:00Z","isRequired":true}'
+G1193_SC_FAIL='{"__typename":"StatusContext","context":"lint","state":"FAILURE","createdAt":"2026-05-21T10:00:00Z","isRequired":true}'
+# Classic protection requires a bare context from ANY producer, which is what
+# every one of the six contexts on mergepath@main resolves to today.
+G1193_REQ='[{"context":"lint","app_id":null}]'
+
+if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
+  # THE ISSUE SCENARIO. One required name, a FAILING check run, and a LATER
+  # SUCCEEDING commit status. Before the fix the status won on recency and
+  # BAD_CHECKS came back empty — gate (a) reported CI green on a red required
+  # check. A fixture carrying only ONE of the two shapes passes identically
+  # before and after, so the mixed head is the whole test.
+  GOT=$(g1193_labels "$(g1193_gate_a "[$G1193_CR_FAIL,$G1193_SC_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '["CheckRun:lint=FAILURE"]' ]; then
+    pass "#1193: a later SUCCEEDING commit status no longer masks the failing check run under the same required name"
+  else
+    fail "#1193: mixed head (CheckRun FAILURE + later StatusContext SUCCESS) must block on the check run, got $GOT"
+  fi
+
+  # The same collapse in the other direction. Nothing orders the two surfaces,
+  # so whichever reports last speaks for both; a green check run hid a red
+  # legacy status just as readily.
+  GOT=$(g1193_labels "$(g1193_gate_a "[$G1193_SC_FAIL,$G1193_CR_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '["StatusContext:lint=FAILURE"]' ]; then
+    pass "#1193: a later SUCCEEDING check run no longer masks the failing commit status under the same required name"
+  else
+    fail "#1193: mixed head (StatusContext FAILURE + later CheckRun SUCCESS) must block on the commit status, got $GOT"
+  fi
+
+  # The unresolved-requirements arm reaches a DIFFERENT collapse — group_by
+  # label over the whole rollup — and had the identical defect. This is the
+  # live fail-closed path (#465): REQUIRED_JSON is empty and the rollup is NOT
+  # wiped, so every counted check is scrutinised.
+  GOT=$(g1193_labels "$(g1193_gate_a "[$G1193_CR_FAIL,$G1193_SC_OK]" '[]' unknown)")
+  if [ "$GOT" = '["-:(requirement list unresolved)=UNKNOWN","CheckRun:lint=FAILURE"]' ]; then
+    pass "#1193: the unresolved-requirement-list arm also judges each surface separately, so its whole-rollup scan cannot be masked either"
+  else
+    fail "#1193: the unresolved-requirement-list arm still lets a passing commit status mask a failing check run, got $GOT"
+  fi
+
+  # ── No false blocks. Splitting the surfaces must not degrade into
+  #    "any non-green entry anywhere blocks", which would resurrect the stale
+  #    failed rerun that #655 round 13 stopped blocking on forever.
+  GOT=$(g1193_plain "$(g1193_gate_a "[$G1193_CR_OK,$G1193_SC_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1193: a head where BOTH surfaces are green still clears gate (a)"
+  else
+    fail "#1193: both-surfaces-green must not block, got $GOT"
+  fi
+
+  GOT=$(g1193_plain "$(g1193_gate_a "[$G1193_CR_FAIL,$G1193_CR_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1193: within one surface, a stale FAILED check run superseded by a later SUCCESS still collapses to the later one"
+  else
+    fail "#1193: winner selection inside a single surface regressed — a superseded failure is blocking again, got $GOT"
+  fi
+
+  # Pending precedence has to survive the split: an in-flight check run holds
+  # the gate even when the other surface has already reported success.
+  GOT=$(g1193_plain "$(g1193_gate_a "[$G1193_CR_RUNNING,$G1193_SC_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '["lint="]' ]; then
+    pass "#1193: an in-flight check run still holds gate (a) when the commit status under the same name is already green"
+  else
+    fail "#1193: pending precedence lost across the surface split, got $GOT"
+  fi
+
+  # Totality. An entry whose union member is not carried must fall back to the
+  # single pre-#1193 winner, not vanish: an empty partition would drop the
+  # requirement out of scrutiny entirely, a fail-open worse than the original.
+  GOT=$(g1193_plain "$(g1193_gate_a '[{"name":"lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":true},{"context":"lint","state":"FAILURE","createdAt":"2026-05-21T11:00:00Z","isRequired":true}]' "$G1193_REQ" known)")
+  if [ "$GOT" = '["lint=FAILURE"]' ]; then
+    pass "#1193: entries carrying no __typename collapse to one winner as before, rather than dropping out of scrutiny"
+  else
+    fail "#1193: untyped entries are no longer judged at all — the split must degrade to the pre-fix winner, got $GOT"
+  fi
+fi
+
+# Structural: the projection must keep __typename, and the filter must define
+# the per-surface selector. Without these the extraction above would still
+# compile and every behavioural assertion would be testing a filter that
+# cannot tell the surfaces apart.
+if grep -q 'kind: (.__typename // "")' "$SCRIPT"; then
+  pass "#1193: the rollup projection carries the GraphQL union member per entry"
+else
+  fail "#1193: the rollup projection drops __typename again — the two surfaces become indistinguishable downstream"
+fi
+if grep -q 'def current_entries:' "$SCRIPT" && ! grep -q 'map(current_entry) | map(select(blocks))' "$SCRIPT"; then
+  pass "#1193: gate (a) selects a current entry per surface rather than one across the mixed union"
+else
+  fail "#1193: gate (a) is back to a single current_entry over the mixed CheckRun/StatusContext set"
+fi
+
+rm -rf "$G1193_DIR"
+trap - EXIT
+
 echo ""
 echo "test_codex_review_check_required_checks: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

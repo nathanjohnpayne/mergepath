@@ -973,6 +973,17 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       # for, which the filter treats as no-opinion and falls back to name
       # matching.
       isRequired: .isRequired,
+      # Which GraphQL union member this entry came from (#1193). A required
+      # context is satisfiable by a CheckRun and by a legacy StatusContext,
+      # and GitHub evaluates each surface as its own row rather than as two
+      # reports of one thing. Carried so winner-selection below can keep the
+      # two timelines apart instead of letting whichever reported LAST speak
+      # for both surfaces — which is how a passing commit status masked a
+      # failing check run under the same required name. This separates the
+      # SURFACES only; ranking WITHIN a surface is still by recency, which is
+      # what #655 round 13 settled and what #1064 left unresolved for an
+      # any-producer rule.
+      kind: (.__typename // ""),
       # The PRODUCING app (#1064). Branch protection requires a context from a
       # specific app — `required_status_checks.checks[] = {context, app_id}` —
       # so (context, app) is GitHub own unit of requirement and therefore the
@@ -1687,6 +1698,27 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
       else (sort_by(if .completedAt != "" then .completedAt else .startedAt end) | last)
       end;
 
+  # One required context, TWO surfaces. GitHub satisfies a required context
+  # from a check run OR a legacy commit status, and when a head carries both
+  # under one name it evaluates each as its own row and holds the merge until
+  # every row is green. `current_entry` above answers "which run represents
+  # this set", which is the right question WITHIN a surface and the wrong one
+  # across two: it ranks by recency, so the later-reporting surface decides for
+  # both and a passing StatusContext masks a failing CheckRun (#1193). The
+  # direction is what makes it urgent — the gate reports green, GitHub still
+  # blocks, and the disagreement reads as an infrastructure flake.
+  #
+  # Partition by the union member and take the current entry of each surface, so
+  # neither can speak for the other. Grouping on the OBSERVED `kind` values
+  # rather than a hard-coded CheckRun/StatusContext pair keeps this total: an
+  # entry carrying no type at all falls into a single "" partition and the
+  # result is exactly the pre-#1193 single winner, rather than an empty set
+  # that would drop the requirement out of scrutiny entirely — a fail-open
+  # strictly worse than the one being fixed.
+  def current_entries:
+    ([.[] | (.kind // "")] | unique) as $kinds
+    | [ $kinds[] as $k | (map(select((.kind // "") == $k)) | current_entry) ];
+
   # A check passes iff SUCCESS, SKIPPED, or NEUTRAL. Everything else —
   # FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED, PENDING, EXPECTED, ERROR,
   # MISSING, or unknown — blocks.
@@ -1708,7 +1740,9 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
         startedAt: (.startedAt // .createdAt // ""),
         completedAt: (.completedAt // .createdAt // ""),
         isRequired: .isRequired,
-        appId: (.appId // "")
+        appId: (.appId // ""),
+        # #1193 — see the projection above and current_entries below.
+        kind: (.kind // "")
       }
     # Runs GitHub does not count toward THIS PR requirements are not evidence
     # about them. Only an explicit `false` drops one: a null means GitHub
@@ -1775,7 +1809,7 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
       # caused the #1061 revert; a blocking entry declines to clear, keeps the
       # genuinely-red checks visible alongside it, and resolves on its own when
       # the surfaces answer again.
-      (($counted | group_by(.label) | map(current_entry) | map(select(blocks)))
+      (([ ($counted | group_by(.label))[] | current_entries[] ] | map(select(blocks)))
        + (if $requirements_state == "known" then []
           else [ { label: "(requirement list unresolved)",
                    workflow: "(gate (a) could not read the branch rules)",
@@ -1830,7 +1864,7 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
                   result: "MISSING" }
            elif ($candidates | length) == 0
            then empty
-           else ($candidates | current_entry)
+           else ($candidates | current_entries[])
            end
        ]
        | map(select(blocks))
@@ -1998,7 +2032,15 @@ BAD_COUNT=$(echo "$BAD_CHECKS" | jq 'length')
 
 if [ "$BAD_COUNT" -gt 0 ]; then
   SUMMARY=$(echo "$BAD_CHECKS" | jq -r '
-    [.[] | (if .workflow == "" then .label else "\(.workflow)/\(.label)" end) + "=" + .result]
+    # Name the surface for a legacy commit status (#1193). Splitting the two
+    # surfaces creates a blocking cause an operator has no other way to see: a
+    # red commit status under a required name whose same-named check run is
+    # green. Unannotated, that reads as the gate contradicting a check run
+    # everyone can see is passing. CheckRun stays unannotated because it is
+    # what every pre-existing entry in this summary already was.
+    [.[] | (if .workflow == "" then .label else "\(.workflow)/\(.label)" end)
+         + (if (.kind // "") == "StatusContext" then " (commit status)" else "" end)
+         + "=" + .result]
     | unique | join(", ")
   ')
   fail_gate "CI not green: $BAD_COUNT non-passing check(s): $SUMMARY"
