@@ -978,8 +978,11 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       # and GitHub evaluates each surface as its own row rather than as two
       # reports of one thing. Carried so winner-selection below can keep the
       # two timelines apart instead of letting whichever reported LAST speak
-      # for both — which is how a passing commit status masked a failing
-      # check run under the same required name.
+      # for both surfaces — which is how a passing commit status masked a
+      # failing check run under the same required name. This separates the
+      # SURFACES only; ranking WITHIN a surface is still by recency, which is
+      # what #655 round 13 settled and what #1064 left unresolved for an
+      # any-producer rule.
       kind: (.__typename // ""),
       # The PRODUCING app (#1064). Branch protection requires a context from a
       # specific app — `required_status_checks.checks[] = {context, app_id}` —
