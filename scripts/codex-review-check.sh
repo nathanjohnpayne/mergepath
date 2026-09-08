@@ -1008,11 +1008,13 @@ ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
       # ASSUMPTION, and it is enforced by a test rather than left implicit
       # (#1215 review round 1, Codex P1): `external_id` is an OPTIONAL field on
       # the Checks API, so a synthetic producer that set it would be classified
-      # native and the two timelines would silently re-merge. No workflow in
-      # this repository sets it on a check-run POST, and
+      # native and the two timelines would silently re-merge. The gate
+      # workflows that publish the affected contexts do not set it, and
       # tests/test_codex_review_check_required_checks.sh asserts that none
       # starts. GitHub exposes no field that names the lineage directly, so a
-      # discriminator plus a guarded assumption is the honest shape here.
+      # discriminator plus a guarded assumption is the honest shape here — and
+      # the assumption is only ever relied on for the Actions app, which is the
+      # only producer this repository controls. See the app scoping below.
       #
       # An entry with no externalId at all collapses to one lineage, which is
       # exactly the pre-#1215 single winner rather than an empty partition.
@@ -1779,7 +1781,22 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq \
     ([.[] | (.kind // "")] | unique) as $kinds
     | [ $kinds[] as $k
         | (map(select((.kind // "") == $k))) as $of_kind
-        | (if (([$of_kind[] | (.appId // "")] | unique) | length) == 1
+        | ([$of_kind[] | (.appId // "")] | unique) as $apps
+        # Split ONLY for the GitHub Actions app (#1215 review round 2, Codex
+        # P2 "restrict lineage splitting to controlled check producers").
+        # The two lineages exist because this repository gate workflows POST
+        # check runs with the Actions GITHUB_TOKEN, so the synthetic runs carry
+        # the SAME app as the job-native ones. No other app has that duality: a
+        # third-party app publishes through the Checks API only.
+        #
+        # Applying the heuristic to a third-party app would be worse than the
+        # bug. `external_id` is optional, so an app that sets it on one run and
+        # omits it on the next would have a stale failure and its own recovery
+        # land in different partitions, and the stale failure would block gate
+        # (a) indefinitely. That is a PERMANENT block, the failure class the
+        # #655 rounds and #1076 already produced once each, and it is strictly
+        # worse than the fail-open being closed here.
+        | (if ($apps | length) == 1 and ($apps[0] == "15368")
            then (([$of_kind[] | (.lineage // "")] | unique)) as $lineages
                 | ($lineages[] as $l
                    | ($of_kind | map(select((.lineage // "") == $l)) | current_entry))

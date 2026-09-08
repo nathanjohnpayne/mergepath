@@ -2111,6 +2111,23 @@ if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
   else
     fail "#1215: scoping to one app disabled the split it exists for, got $GOT"
   fi
+
+  # Review round 2, Codex P2 "restrict lineage splitting to controlled check
+  # producers". The two lineages exist only because this repository gate
+  # workflows POST with the Actions token, so the synthetic runs share the
+  # Actions app. A THIRD-PARTY app has no such duality, and external_id is
+  # optional for it: if it set the field on one run and omitted it on the next,
+  # a stale failure and its own recovery would land in different partitions and
+  # the stale failure would block forever. That is a permanent block, which is
+  # worse than the fail-open being closed.
+  G1215_TP_STALE_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T09:00:00Z","completedAt":"2026-05-21T09:00:20Z","externalId":"tp-run-1","isRequired":true,"checkSuite":{"app":{"databaseId":99999},"workflowRun":null}}'
+  G1215_TP_FRESH_OK='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":99999},"workflowRun":null}}'
+  GOT=$(g1215 "[$G1215_TP_STALE_BAD,$G1215_TP_FRESH_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: a third-party app that varies external_id between reruns is not split, so its stale failure cannot block forever"
+  else
+    fail "#1215: the lineage heuristic was applied to a third-party app and its stale failure now blocks permanently, got $GOT"
+  fi
 fi
 
 # Review round 1, Codex P2 "verify externalId inside the GraphQL selection".
@@ -2139,14 +2156,33 @@ fi
 # publisher that set external_id would be classified native and the two
 # timelines would re-merge silently. Nothing in this repository sets it; this
 # asserts nothing starts.
-G1215_EXTID_SETTERS=$(grep -rln "external_id" .github/workflows/ 2>/dev/null || true)
-if [ -z "$G1215_EXTID_SETTERS" ]; then
-  pass "#1215: no workflow sets external_id on a check-run POST, so the lineage discriminator holds"
+# Scoped to the workflows that actually publish the affected required contexts
+# (#1215 review round 2, Codex P2). A repository-wide substring scan was wrong
+# twice over: this suite is propagated to every consumer and runs in the
+# required lint context, so a consumer workflow that merely MENTIONS
+# external_id — in a comment, or when reading a response, or for an unrelated
+# check run — would red that consumer forever, and the consumer could not fix
+# it because the hub owns this file. Absent files are skipped, since a consumer
+# need not carry every gate workflow.
+G1215_PUBLISHERS="merge-clearance-gate.yml codex-p1-gate.yml coderabbit-severity-gate.yml required-check-publisher.yml"
+G1215_EXTID_SETTERS=""
+G1215_PUBLISHERS_SEEN=0
+for g1215_wf in $G1215_PUBLISHERS; do
+  [ -f ".github/workflows/$g1215_wf" ] || continue
+  G1215_PUBLISHERS_SEEN=$((G1215_PUBLISHERS_SEEN + 1))
+  if grep -q "external_id" ".github/workflows/$g1215_wf" 2>/dev/null; then
+    G1215_EXTID_SETTERS="$G1215_EXTID_SETTERS $g1215_wf"
+  fi
+done
+if [ "$G1215_PUBLISHERS_SEEN" -eq 0 ]; then
+  echo "SKIP: #1215 external_id guard (no known check-run publisher workflow present)"; SKIP=$((SKIP + 1))
+elif [ -z "$G1215_EXTID_SETTERS" ]; then
+  pass "#1215: no check-run publisher sets external_id, so the lineage discriminator holds for the Actions app"
 else
-  fail "#1215: a workflow now sets external_id ($G1215_EXTID_SETTERS) — a synthetic run would be classified native and the lineage split would silently collapse"
+  fail "#1215: a check-run publisher now sets external_id ($G1215_EXTID_SETTERS) — its synthetic run would be classified native and the lineage split would silently collapse"
 fi
 if grep -qF 'map(select((.lineage // "") == $l)) | current_entry' "$SCRIPT" \
-   && grep -qF '([$of_kind[] | (.appId // "")] | unique) | length) == 1' "$SCRIPT"; then
+   && grep -qF '($apps | length) == 1 and ($apps[0] == "15368")' "$SCRIPT"; then
   pass "#1215: winner selection splits by producer lineage within a surface, and only within a single app"
 else
   fail "#1215: winner selection is back to a surface-only partition, or the split is no longer scoped to one app"
