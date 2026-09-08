@@ -201,6 +201,26 @@ INLINE_COMMENTS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inlin
 REVIEWS=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "review objects")
 ISSUE_COMMENTS=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comments")
 
+# #1210: on a pull request from a fork the relay's archive records are
+# rendered by the fork-side run and accepted by the relay on marker shape
+# alone, so their bodies are the fork's to write. Such a record may add a
+# demand (an inventoried revision and its token) but never stands as
+# evidence that lowers a floor. The head is a fork when it is not the base
+# repository itself, compared by repository identity rather than by the
+# fork flag of the head, which is also true for every branch of a
+# repository that is itself a fork. A head repository that is gone can only
+# have been a fork, and reads the same way. The fetch fails closed.
+PR_OBJECT=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) \
+  || die 2 "could not fetch pull request $REPO#$PR_NUMBER"
+PR_HEAD_IS_FORK=$(printf '%s' "$PR_OBJECT" | jq -r '
+  if (.head.repo // null) == null then "true"
+  elif (.head.repo.id // null) != null and (.base.repo.id // null) != null
+  then (if .head.repo.id != .base.repo.id then "true" else "false" end)
+  elif (.head.repo.full_name // "") != "" and (.base.repo.full_name // "") != ""
+  then (if (.head.repo.full_name | ascii_downcase) != (.base.repo.full_name | ascii_downcase)
+        then "true" else "false" end)
+  else "true" end')
+
 # code-scanning/alerts (#1101) carries the severity a GHAS inline comment
 # body never does — the comment only links to the alert. Fetched lazily,
 # ONLY when a github-advanced-security[bot] inline comment is actually
@@ -756,10 +776,14 @@ ARCHIVE_ENTRIES=$(printf '%s\n%s\n' "$ARCHIVE_ENTRIES" "$V2_ARCHIVE_ENTRIES" \
 # that edit even when an acknowledgement came with it, so a reply to the old
 # text cannot stand for the new. Every CodeRabbit inline finding with a
 # record is revisited; without a record the marker-based decision stands.
+# On a fork pull request the record is fork-supplied (#1210), so no finding
+# is revisited: the marker-based decision stands and every archived
+# revision stays inventoried.
 REFINED_FINDINGS='[]'
 while IFS= read -r finding; do
   [ -n "$finding" ] || continue
-  if [ "$(printf '%s' "$finding" | jq -r '.reviewer')" != "$CODERABBIT_BOT" ]; then
+  if [ "$PR_HEAD_IS_FORK" = true ] \
+    || [ "$(printf '%s' "$finding" | jq -r '.reviewer')" != "$CODERABBIT_BOT" ]; then
     REFINED_FINDINGS=$(printf '%s\n%s\n' "$REFINED_FINDINGS" "$finding" | jq -cs '.[0] + [.[1]]')
     continue
   fi
