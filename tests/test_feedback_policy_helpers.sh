@@ -336,6 +336,45 @@ eq "" "$(read_policy_block_field nonexistent_block bot_login "$CFG_BLOCK")" \
 eq "" "$(read_policy_block_field code_scanning bot_login "$WORKDIR/does-not-exist.yml")" \
   "read_policy_block_field: missing config file -> empty (not an error)"
 
+# Header tolerance (CodeRabbit, PR #1124). resolve_base_policy.sh writes raw
+# policy content, so a block header may legitimately carry trailing whitespace
+# or a comment; an exact `$0 == block":"` match silently skipped those blocks
+# and the caller fell back to the default login only.
+CFG_HDR="$WORKDIR/header-shapes.yml"
+cat > "$CFG_HDR" <<'YAML'
+code_scanning:  # GHAS
+  bot_login: "commented-header[bot]"
+YAML
+eq "commented-header[bot]" "$(read_policy_block_field code_scanning bot_login "$CFG_HDR")" \
+  "read_policy_block_field: block header with a trailing comment still matches"
+
+CFG_WS="$WORKDIR/header-trailing-space.yml"
+printf 'code_scanning:   \n  bot_login: "spaced-header[bot]"\n' > "$CFG_WS"
+eq "spaced-header[bot]" "$(read_policy_block_field code_scanning bot_login "$CFG_WS")" \
+  "read_policy_block_field: block header with trailing whitespace still matches"
+
+# The false-positive guard for that relaxation: a DIFFERENT block whose name
+# merely starts with the requested one must still not match, or a scan would
+# silently read another block's configuration.
+CFG_PREFIX="$WORKDIR/header-prefix.yml"
+cat > "$CFG_PREFIX" <<'YAML'
+code_scanning_extra:
+  bot_login: "wrong-block[bot]"
+YAML
+eq "" "$(read_policy_block_field code_scanning bot_login "$CFG_PREFIX")" \
+  "read_policy_block_field: a longer block sharing the prefix does NOT match (no over-capture)"
+
+# And a value that itself looks like a header must not be mistaken for one.
+CFG_NEST="$WORKDIR/header-nested.yml"
+cat > "$CFG_NEST" <<'YAML'
+code_scanning:
+  bot_login: "real[bot]"
+other_block:
+  bot_login: "later[bot]"
+YAML
+eq "real[bot]" "$(read_policy_block_field code_scanning bot_login "$CFG_NEST")" \
+  "read_policy_block_field: a following top-level block still closes the previous one"
+
 # ---------------------------------------------------------------------------
 echo
 echo "feedback-policy-helpers: $PASS passed, $FAIL failed"

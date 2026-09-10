@@ -72,7 +72,7 @@ read_policy_block_field() {
   local block=$1 field=$2 cfg="${3:-${CONFIG:-.github/review-policy.yml}}"
   [ -f "$cfg" ] || return 0
   awk -v block="$block" -v field="$field" '
-    $0 == block":" {in_block=1; next}
+    $0 ~ "^"block":[[:space:]]*(#.*)?$" {in_block=1; next}
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)

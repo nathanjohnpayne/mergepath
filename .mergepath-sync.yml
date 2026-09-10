@@ -399,6 +399,12 @@ paths:
   - path: tests/test_coderabbit_should_invoke.sh
     type: canonical
     consumers: all
+    requires:
+      # The test copies this script into a fixture tree and executes it, so a
+      # commit-path sync that selects only the test must carry it too
+      # (CodeRabbit, PR #1124). The classifier is NOT required here: the test
+      # builds its own temporary classifier fixtures.
+      - "scripts/coderabbit-should-invoke.sh"
   # The ONE CommonMark fence reader (#1178). Extracted from
   # scripts/coderabbit-severity-gate.sh once the advisory waiter needed the same
   # answer: specs/coderabbit_review_sensing.md already required one

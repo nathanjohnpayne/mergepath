@@ -94,10 +94,17 @@ GHAS_BOT_LOGINS_JSON=$(
     read_policy_block_field code_scanning bot_login 2>/dev/null || true
   } | awk 'NF && !seen[$0]++' | jq -Rsc 'split("\n") | map(select(. != ""))'
 )
+# NUL-delimited, one record per COMMENT -- not per line. `jq -r` would split a
+# multi-line body across several `read` iterations, so the first-match helper
+# would run once per line and collect EVERY linked alert number, while
+# accounting runs it once on the whole body and consumes only the first. The
+# extra numbers are not merely wasted fetches: a stale or cross-repository link
+# further down a body resolves to a 404 here and fails this required gate
+# closed on state accounting never reads (Codex review, PR #1124).
 GHAS_ALERT_NUMBERS=$(printf '%s' "$INLINE" \
-  | jq -r --argjson logins "$GHAS_BOT_LOGINS_JSON" \
-    '.[] | select((.user.login // "") as $login | ($logins | index($login)) != null) | .body // ""' \
-  | while IFS= read -r body; do
+  | jq -j --argjson logins "$GHAS_BOT_LOGINS_JSON" \
+    '.[] | select((.user.login // "") as $login | ($logins | index($login)) != null) | ((.body // ""), "\u0000")' \
+  | while IFS= read -r -d '' body; do
   ghas_alert_number_from_body "$body"
 done | awk 'NF && !seen[$0]++' | sort -n)
 GHAS_SEVERITIES='{}'
