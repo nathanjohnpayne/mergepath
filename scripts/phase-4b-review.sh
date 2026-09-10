@@ -441,13 +441,32 @@ hold_for_external_review() {
   exit 6
 }
 
+# A barrier that opened over a rate-limited CodeRabbit (#1178). Set when the
+# barrier's CodeRabbit arm classified `rate-limited` and it opened anyway on a
+# head-pinned Codex report. Read only by the review-body renderer below.
+BARRIER_CODERABBIT_RATE_LIMITED=false
+
 # Run the same-head barrier and act on it. Escalation routes to the existing
 # manual handoff; only the non-terminal case takes the new hold path.
 run_same_head_barrier() {
   local where="$1" out rc=0
   out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN")" || rc=$?
   case "$rc" in
-    0) return 0 ;;
+    0)
+      # An open barrier is normally silent — every enabled provider reported
+      # and there is nothing to say. #1178 adds one shape that opens on a
+      # PARTIAL quorum: CodeRabbit refused this head, and Codex alone carries
+      # the ordering. That is a deliberate policy trade, not a fact to leave
+      # in a JSON field nobody reads, so it is narrated here and recorded in
+      # the posted review body below. Both, because they reach different
+      # people: the warn reaches whoever ran the orchestrator, the body line
+      # reaches whoever reads the approval afterwards.
+      if [ "$(printf '%s' "$out" | jq -r '.coderabbit // empty' 2>/dev/null || true)" = "rate-limited" ]; then
+        BARRIER_CODERABBIT_RATE_LIMITED=true
+        p4b_warn "CodeRabbit refused $HEAD as rate limited and cannot be re-asked; the barrier opened on Codex's head-pinned report alone, so this review is ordered against Codex only"
+      fi
+      return 0
+      ;;
     1) hold_for_external_review "$out" ;;
     *) fall_back_to_manual "external review barrier ($where): $(printf '%s' "$out" | jq -r '.reason // "escalated"')" ;;
   esac
@@ -831,6 +850,13 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
     printf -- '- Token usage: not exposed by adapter/CLI\n'
   fi
   printf -- '- Model-internal turn count: not exposed by the adapter contract\n'
+  # #1178: an approval posted over a refusing provider must say so on the PR
+  # itself. The barrier opened on a partial quorum, and a reader who assumes
+  # the usual both-providers ordering would draw a stronger conclusion from
+  # this review than it supports.
+  if [ "$BARRIER_CODERABBIT_RATE_LIMITED" = true ]; then
+    printf -- '- Provider ordering: CodeRabbit was **rate limited** on this head and could not be re-asked, so the same-head barrier opened on Codex'"'"'s head-pinned report alone (#1178)\n'
+  fi
   if [ "$FINDINGS_COUNT" -gt 0 ]; then
     printf '\n### Findings\n\n'
     printf '%s' "$VERDICT_JSON" | jq -r '

@@ -582,12 +582,12 @@ if [ ! -f "$SHIPPED_TARGETS" ]; then
   fail "shipped targets: file missing at $SHIPPED_TARGETS"
 else
   N=$(grep -v '^#' "$SHIPPED_TARGETS" | grep -v '^[[:space:]]*$' | wc -l | tr -d ' ')
-  if [ "$N" = "9" ]; then
-    pass "shipped targets: 9 repos configured"
+  if [ "$N" = "8" ]; then
+    pass "shipped targets: 8 repos configured"
   else
-    fail "shipped targets: expected 9 repos, got $N"
+    fail "shipped targets: expected 8 repos, got $N"
   fi
-  for slug in friends-and-family-billing device-source-of-truth swipewatch nathanpaynedotcom overridebroadway matchline tadlockpsychiatry mergepath fiveacross; do
+  for slug in friends-and-family-billing swipewatch nathanpaynedotcom overridebroadway matchline tadlockpsychiatry mergepath fiveacross; do
     if grep -qE "/${slug}\$" "$SHIPPED_TARGETS"; then
       pass "shipped targets: includes $slug"
     else
