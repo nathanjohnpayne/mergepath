@@ -58,14 +58,13 @@ If we ever target such bases and want CodeRabbit on them, the base (or a regex l
 
 `learnings.scope` controls where CodeRabbit's accumulated review-preference "learnings" are stored and applied. Allowed values: `local` (this repo only), `global` (shared across the whole org/owner), `auto` (= `local` for **public** repos, `global` for **private** repos).
 
-We keep `auto`. **This is no longer a uniformly-public fleet, and the resolution is no longer uniform.** From 2026-07-06 until 2026-09-01 every consumer was public, so `auto` resolved to `local` everywhere; on 2026-09-01 the monthly propagation-order review measured `device-source-of-truth` as **private**, and `auto` resolves to **`global`** for a private repo. That repo's learnings are therefore shared across the `nathanjohnpayne` owner boundary while the other seven stay local:
+We keep `auto`. **The fleet is uniformly public again, so the resolution is uniform.** From 2026-07-06 until 2026-09-01 every consumer was public and `auto` resolved to `local` everywhere; on 2026-09-01 the monthly propagation-order review measured `device-source-of-truth` as **private**, making it the one consumer whose `auto` resolved to `global`. That repo was dropped as a consumer on 2026-09-05 when it went dormant, so every remaining consumer is public and every one resolves to `local`:
 
 | Visibility | Consumers | `auto` resolves to |
 |---|---|---|
-| Public (7) | matchline, overridebroadway, tadlockpsychiatry, friends-and-family-billing, swipewatch, nathanpaynedotcom, fiveacross | `local` |
-| Private (1, as of 2026-09-01) | device-source-of-truth | `global` |
+| Public (all 7) | matchline, overridebroadway, tadlockpsychiatry, friends-and-family-billing, swipewatch, nathanpaynedotcom, fiveacross | `local` |
 
-So exactly one consumer currently shares learnings owner-wide: `device-source-of-truth`, by virtue of being private. That is the same posture three consumers had earlier in the fleet's history, and it is deliberate rather than a leak — learnings stay within one account's owner boundary and CodeRabbit does not use code for model training (FAQ § Data Security). It does mean a reader cannot assume `auto` implies `local` here any more; check the repo's visibility first. If uniform `local` is ever wanted regardless of visibility, that takes an explicit `scope: local` override on the private repo. If cross-repo convention sharing is later wanted across the public fleet, it would take an explicit `scope: global` override — `auto` will not grant `global` to a public repo. We keep `auto` because it is the correct low-surprise default that needs no per-repo maintenance as visibility changes.
+So no consumer currently shares learnings owner-wide — each repo's learnings stay local to that repo. (Historically, while `device-source-of-truth` was a private consumer, and while three consumers were private earlier in the fleet's history, `auto` gave *those* repos `global`; that was deliberate rather than a leak — learnings stay within one account's owner boundary and CodeRabbit does not use code for model training, FAQ § Data Security — but it no longer applies now the fleet is uniformly public.) Do not read the uniform resolution as permanent: it is a consequence of current visibility, so check a repo's visibility before assuming `auto` implies `local`. If cross-repo convention sharing is later wanted across the public fleet, it would take an explicit `scope: global` override — `auto` will not grant `global` to a public repo. We keep `auto` because it is the correct low-surprise default that needs no per-repo maintenance as visibility changes.
 
 ### `path_instructions` — matches doc guidance (no action)
 
@@ -105,14 +104,13 @@ The FAQ is explicit (§ "How to troubleshoot CodeRabbit not functioning on certa
 Our entire fleet authors as the single shared identity **`nathanjohnpayne`**. So the coverage question reduces to one check: *does `nathanjohnpayne` have an active CodeRabbit seat covering every consumer repo?* CodeRabbit seat management is **not exposed via the `gh` API** — there is no GitHub-side endpoint for it — so this is a CodeRabbit-dashboard confirmation, not a scriptable CI gate. Confirm it this way:
 
 1. Open the CodeRabbit dashboard → **Subscription** → seat list, signed in as the org owner (`nathanjohnpayne`).
-2. Verify `nathanjohnpayne` holds an **active** seat and that the seat's repo/org coverage includes all 8 consumers: `matchline`, `overridebroadway`, `tadlockpsychiatry`, `friends-and-family-billing`, `swipewatch`, `nathanpaynedotcom`, `fiveacross` (public), and `device-source-of-truth` (**private** as of 2026-09-01 — a private repo still needs the seat, and its coverage is the easier one to overlook in the dashboard).
+2. Verify `nathanjohnpayne` holds an **active** seat and that the seat's repo/org coverage includes all 7 consumers (all **public**): `matchline`, `overridebroadway`, `tadlockpsychiatry`, `friends-and-family-billing`, `swipewatch`, `nathanpaynedotcom`, `fiveacross`.
 3. **Observational cross-check (the only API-visible signal):** on a recent PR in each repo, confirm a `coderabbitai[bot]` review/summary actually landed:
 
    ```bash
    command -v brew >/dev/null 2>&1 && eval "$(brew shellenv)"
    for r in matchline nathanpaynedotcom overridebroadway tadlockpsychiatry \
-            device-source-of-truth friends-and-family-billing \
-            swipewatch fiveacross; do
+            friends-and-family-billing swipewatch fiveacross; do
      echo "=== $r ==="
      GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api \
        "repos/nathanjohnpayne/$r/issues/comments?per_page=100&sort=created&direction=desc" \
@@ -121,7 +119,7 @@ Our entire fleet authors as the single shared identity **`nathanjohnpayne`**. So
    done
    ```
 
-   A non-zero count is positive evidence the author seat is working on that repo. A zero on a repo that *has* had PRs is the red flag to chase in the dashboard. (A quiet repo with no recent PRs is inconclusive, not a failure.) The bootstrap wizard's **private**-repo path can delete `.coderabbit.yml` and leave `coderabbit.enabled: false` (see #248 — `scripts/ci/check_coderabbit_config` PASSes on that state), so on a consumer that has opted out a zero count is expected, not a seat gap. **Check the opt-out before chasing a zero (measured 2026-09-01):** `fiveacross` has CodeRabbit deliberately disabled on both keys since 2026-08-04 — `reviews.auto_review.enabled: false` in `.coderabbit.yml` paired with `coderabbit.enabled: false` in `.github/review-policy.yml` — so a zero there is the expected result and chasing it in the dashboard wastes the trip. The other seven carry `.coderabbit.yml` with auto-review on, so a zero on any of *those* is a real red flag. Re-read both keys rather than trusting this sentence; an opt-out is a per-repo decision that can change without touching this doc.
+   A non-zero count is positive evidence the author seat is working on that repo. A zero on a repo that *has* had PRs is the red flag to chase in the dashboard. (A quiet repo with no recent PRs is inconclusive, not a failure.) The bootstrap wizard's **private**-repo path can delete `.coderabbit.yml` and leave `coderabbit.enabled: false` (see #248 — `scripts/ci/check_coderabbit_config` PASSes on that state), so on a consumer that has opted out a zero count is expected, not a seat gap. **Check the opt-out before chasing a zero (measured 2026-09-01):** `fiveacross` has CodeRabbit deliberately disabled on both keys since 2026-08-04 — `reviews.auto_review.enabled: false` in `.coderabbit.yml` paired with `coderabbit.enabled: false` in `.github/review-policy.yml` — so a zero there is the expected result and chasing it in the dashboard wastes the trip. The other six carry `.coderabbit.yml` with auto-review on, so a zero on any of *those* is a real red flag. Re-read both keys rather than trusting this sentence; an opt-out is a per-repo decision that can change without touching this doc.
 
 ## Safety-floor coverage check (#481)
 

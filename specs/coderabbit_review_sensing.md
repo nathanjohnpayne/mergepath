@@ -1,6 +1,6 @@
 # CodeRabbit Review Sensing
 
-Feature: corroborated CodeRabbit barrier evidence on the Phase 4b rc-7 path. When `scripts/coderabbit-wait.sh --probe` (#814) finds a HEAD-pinned CodeRabbit review object whose PR-level summary has not published, it returns rc 7 `observed=awaiting-summary` — deliberately not a report, because the summary can carry the ONLY blocking marker (the #535 summary-only class, e.g. the auto-pause note). On #866 that state persisted for hours while the head was in fact fully reviewed (two COMMENTED head objects plus a per-SHA status success), and the barrier held not-yet until it escalated. This spec pins the additive evidence the probe now emits on that one path and the conjuncts under which the CodeRabbit arm of the Phase 4b same-head barrier (`p4b_barrier_class_coderabbit` in `scripts/phase-4b/lib.sh`) counts that state as reported. Comment-classification behavior is unchanged by this feature and is out of its scope.
+Feature: corroborated CodeRabbit barrier evidence on the Phase 4b rc-7 path. When `scripts/coderabbit-wait.sh --probe` (#814) finds a HEAD-pinned CodeRabbit review object whose PR-level summary has not published, it returns rc 7 `observed=awaiting-summary` — deliberately not a report, because the summary can carry the ONLY blocking marker (the #535 summary-only class, e.g. the auto-pause note). On #866 that state persisted for hours while the head was in fact fully reviewed (two COMMENTED head objects plus a per-SHA status success), and the barrier held not-yet until it escalated. This spec pins the additive evidence the probe now emits on that one path and the conjuncts under which the CodeRabbit arm of the Phase 4b same-head barrier (`p4b_barrier_class_coderabbit` in `scripts/phase-4b/lib.sh`) counts that state as reported. It also owns the `rate-limited` class and its cross-provider outcome (#1178), which is the one place a CodeRabbit observation alone does not determine the barrier's answer. Comment-classification behavior is otherwise unchanged by this feature and out of its scope, with one exception the #1178 section states explicitly: the rc-2 masking guards, which exist only because that class can open a barrier.
 
 ## Acceptance criteria
 
@@ -24,6 +24,24 @@ That anchor-free read applies on BOTH probe branches, not only the one with no r
 - rc 0 maps to `reported` only when the result's `head_sha` equals the head under review (#794 stale-clearance posture); rc 2 and rc 3 escalate; rc 4 and every rc 6 skip are `not-yet`; rc 5 is `waived` only when the #489 failover engaged, else escalate.
 - rc 7 maps to `reported` only when ALL hold: `head_sha` matches the head under review; `probe.observed` is in the completion family (`awaiting-summary` or `terminal` — an active `rate_limit` / `paused` / `in_progress` observed state, or a missing/unmodelled value, fails closed); the evidence endpoint is `reviews` (a HEAD-pinned review object — `issues` evidence never opens); `probe.context_state` is `success`; and `probe.context_updated_at` is at-or-after `review.submitted_at` (same-run correlation — a success left over from a previous run against the same sha predates the new object and must not open past its pending summary). Any missing field or unparseable timestamp fails closed to `not-yet`.
 - The classifier is pure — jq over the passed JSON string only, no I/O — so every condition above is decidable from the probe emission alone.
+
+### Phase 4b barrier — the `rate-limited` class and the cross-provider outcome (#1178)
+
+An rc-7 `probe.observed = rate_limit` is a REFUSAL, not a delay, and the classifier names it as its own class rather than folding it into `not-yet`. Three facts make the distinction load-bearing: `p4b_barrier_should_trigger` declines on `rate_limit` by design, so the barrier never re-asks; CodeRabbit does not auto-retry when its published window elapses; and the polling mode's retry-with-backoff is unreachable from `--probe`, which posts nothing. A `not-yet` there therefore bought a wait that nothing in the run could satisfy — measured at roughly half the observed window, so it stalled on arrival — and the observation need not age out at all, because a limit stanza written into the in-place-edited summarize comment keeps `fresh_at` at-or-after the review object.
+
+`rate-limited` is NOT in the family that opens a barrier on its own. It is the one class the classifier cannot resolve alone, because the answer depends on the OTHER provider, and the classifier is pure over a single CodeRabbit probe result. The composer decides:
+
+| CodeRabbit | Codex | Barrier outcome |
+|---|---|---|
+| `rate-limited` | `reported` | **open** — a provider has read the exact head about to be approved, which is what the ordering guarantee requires |
+| `rate-limited` | `not-yet` | **pending**, on the unchanged bound — the wait is on Codex, which clears on its own; an exhausted bound escalates with a reason naming the refusal rather than the clock |
+| `rate-limited` | `waived` / `disabled` | **escalate** immediately — nothing will read this head at all, so no budget has anything to wait on |
+
+These are BARRIER outcomes, not orchestrator exit statuses: an opened barrier proceeds to the adapter and exits on its verdict.
+
+The `not-yet` row is a deliberate amendment to #1178's original acceptance criteria, which said a rate-limited CodeRabbit must never set `pending`. Escalating while Codex is actively reviewing the exact head spends human attention on a wait that is about to clear itself — the same objection #835 raised against escalating every rate-limited run. The issue was amended to match; the contract is this table.
+
+**Precondition on the opening row.** It is sound only because `observed: rate_limit` means CodeRabbit is holding nothing unread. That is not free: `classify_comment` is marker-first, and CodeRabbit writes limit stanzas into the same in-place-edited comment that carries the #535 summary-only finding. The probe therefore emits rc 2 — which the classifier already escalates — for a rate-limit result in either shape where a blocking marker is present: carried by the notice body itself, or carried by a separate head-pinned summary that a later bare notice would otherwise short-circuit past. Both reads are head-anchored through the shared CommonMark fence reader, so a PRIOR head's summary cannot hold this head hostage and a QUOTED range cannot suppress a real finding. A probe without those guards must not be paired with the opening row.
 
 ### Required severity gate — PR-level summary surface
 

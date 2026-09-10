@@ -107,8 +107,40 @@ jobs:
       # Same-repository events normally append directly. Fork and Dependabot
       # events can only upload a handoff artifact; the trusted workflow_run
       # relay owns the write.
+      #
+      # `pull-requests: write`, not just `issues: write`, is what authorises the
+      # same-repository archive POST below (#881). The endpoint is
+      # `repos/{repo}/issues/{n}/comments`, but every write here targets a PULL
+      # REQUEST, and for a GitHub App installation token — which
+      # `secrets.GITHUB_TOKEN` is — GitHub routes that endpoint by the target's
+      # kind: `issues` covers real issues, `pull-requests` covers pull requests.
+      # The shared REST path makes `issues: write` look sufficient, and the run
+      # log makes it look granted, because the token really does carry
+      # `Issues: write`.
+      #
+      # MEASURED, not inferred — mergepath#1163 records that this routing claim
+      # was asserted from one failure plus one control and disputed by two
+      # reviewers, so it was settled by a natural experiment across two
+      # consumers on 2026-09-04:
+      #
+      #   nathanpaynedotcom  pull-requests: write  13 archive records, ALL direct-path
+      #   matchline          pull-requests: read    8 archive records, ALL via the relay
+      #
+      # The repo with `write` produces same-repository archive records; the repo
+      # with `read` produces none, and its eight records all arrived through
+      # `codex-feedback-archive-relay.yml`, which already carries `write`. A raw
+      # record count hides this — the two paths have to be separated to see it.
+      #
+      # This matters beyond the archive: the gate below fails closed on
+      # `ARCHIVE_RESULT: failure`, so a scope that reads as already-granted turns
+      # the REQUIRED `Codex P1 unresolved threads` context red. Only the
+      # `edited`/`deleted` paths reach the POST, which is why this looked
+      # event-specific for so long — every run that attempts the write fails, and
+      # every run that appears to succeed skipped it. `pr-review-policy.yml` is
+      # the control case: it posts PR comments under the exact inverse map
+      # (`pull-requests: write` + `issues: read`) and has never hit this.
       issues: write
-      pull-requests: read
+      pull-requests: write
       # See the workflow-level permissions block above (#1101): this job
       # calls scripts/codex-p1-gate.sh too, so it needs the same grant —
       # a job-level permissions block replaces rather than merges with the

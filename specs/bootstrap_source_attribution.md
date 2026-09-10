@@ -1,0 +1,36 @@
+# Bootstrap Source Revision
+
+Feature: a bootstrapped consumer's initial commit names which mergepath revision the bootstrap was based on, so a drift measurement against that consumer has a starting `HUB_REF` to work from (#1056). Implemented in `scripts/bootstrap/template-mirror.sh`, `bootstrap::_init_target_git` / `bootstrap::_resolve_bootstrap_source_revision`.
+
+A bootstrapped repo has no sync PR, so it carries none of the `Source:`/branch-name provenance `scripts/sync-to-downstream.sh` writes on every sync PR. This feature gives the bootstrap's own single initial commit an equivalent, lighter-weight pointer. See [`docs/agents/propagation-ordering.md`](../docs/agents/propagation-ordering.md) § Measuring tier membership for how the recorded revision is used, and [`docs/agents/bootstrap-runbook.md`](../docs/agents/bootstrap-runbook.md) step 7 for the operator-facing description.
+
+## What this is, and what it deliberately is not
+
+This records **which mergepath revision the bootstrap was based on** — informational provenance, the same kind of fact a human would note by hand ("branched from around commit X"). It is not a claim that the resulting consumer commit's tree is byte-for-byte derivable from that sha: `template-mirror.sh` copies a working tree through exclusions, substitutions, removals, and identity scaffolding, so the mirrored tree is never identical to the source tree at that sha in the first place. Proving exact derivability would mean modeling every way that transformation pipeline can diverge from a single git commit, which is a much larger and different problem than #1056 asked for. Do not read the eligibility checks below as an attempt at that proof — they are a cheap, conservative gate against attributing a sha that is *obviously* wrong, not a guarantee the mirrored bytes exactly match it.
+
+## Acceptance criteria
+
+There is no partial attribution: a `source_root` is either eligible, and gets both the subject's short sha and the trailer's full-sha link, or it is not, and gets neither. A sha that fails any eligibility check below is not a recoverable `HUB_REF` — #1056's whole point — so it does not earn even the subject.
+
+### Attribution shape, when the source is eligible
+
+- The commit subject reads `Initial commit (bootstrapped from mergepath@<sha7>)` — the short sha, greppable and surviving a squash.
+- The commit body additionally carries a `Source: https://github.com/nathanjohnpayne/mergepath/commit/<sha>` trailer, with the full sha.
+
+### Fallback, when the source is not eligible
+
+- The commit subject reads the un-attributed `Initial commit (bootstrapped from mergepath)`, with no `Source:` trailer, identical to the commit this feature did not exist to produce.
+- Fallback is fail-open with respect to the bootstrap itself: an ineligible source never blocks or errors the bootstrap, it only omits the attribution.
+
+### Eligibility — three independent, all-required checks
+
+A `source_root` is eligible only when all three of the following hold; any one failing falls back per above.
+
+1. **`origin` names canonical mergepath by an exact host+path match** — one of the enumerated forms (`https://`, `http://`, `git@host:path` scp-like, `ssh://`) naming exactly `github.com` and exactly `nathanjohnpayne/mergepath` (with or without a `.git` suffix). An unanchored substring/suffix match is insufficient: an origin such as `https://evilgithub.com/nathanjohnpayne/mergepath.git` must not pass. This also fails closed when `source_root` is not a git repository at all — there is no origin to read.
+2. **`git status --porcelain --untracked-files=all --ignore-submodules=none` succeeds and is empty.** Both flags are pinned on the command line rather than left to the operator's config, because a bare `git status` silently honors `status.showUntrackedFiles=no` or `diff.ignoreSubmodules=all`, under which an ordinary untracked file, or a submodule checked out at a different commit than the superproject's tree records, reads as clean even though rsync's mirror would still copy the mismatched content. This is a conservative eligibility gate against a known mismatch risk — uncommitted or untracked changes at `source_root` that `HEAD` does not reflect — not an attempt to reconcile every path the mirror's own exclude, rsync, or resume behavior might separately drop or keep, nor to pin every other config knob (`core.filemode`, `core.autocrlf`, `core.symlinks`) that could affect what a mirrored tree looks like. A failed `status` read is also treated as ineligible, never as "empty output, therefore clean."
+3. **`HEAD` is reachable from some ref under `source_root`'s own `refs/remotes/origin/*`.** A sha that exists only in the operator's local clone is not reliably recoverable later: another clone cannot resolve it, and the original clone may eventually garbage-collect it. This is deliberately an eligibility check, not merely a gate on whether to include a link — an unpushed local commit is a real revision the bootstrap was based on, but recording it (with or without the GitHub URL) would still name a sha most readers can never resolve, so it is not eligible at all.
+
+### Scope
+
+- This is a **forward-only** fix: it changes what a future bootstrap records. A consumer bootstrapped before this feature existed has no recoverable revision and cannot be retrofitted; the documented answer for such a consumer is the consumer-to-consumer comparison in `docs/agents/propagation-ordering.md`, which needs no hub ref.
+- No other bootstrap behavior changes as part of this feature: rsync exclusion, resume handling, and post-mirror cleanup are unchanged.
