@@ -2557,7 +2557,12 @@ bad=""
 # postdating spurious success (#595) must not outrank it. Otherwise-valid
 # evidence with an adverse observed stays not-yet; so does a missing or
 # unmodelled observed (fail closed).
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"rate_limit","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+#
+# `rate_limit` is the one adverse value that no longer says not-yet (#1178).
+# It still does not OPEN — which is all the #875 precedence rule ever
+# asserted — but it now carries its own class, because a refusal and a delay
+# need different handling and only the composer can choose between them.
+[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"rate_limit","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = rate-limited ] \
                                                          || bad="$bad rc7-observed-ratelimit"
 [ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"paused","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-observed-paused"
@@ -2620,6 +2625,33 @@ bad=""
 # has to actually open, with the Codex arm carrying the ordering from there.
 [ "$(_cr 5 '{"codex_failover_requested":true}')" = waived ]       || bad="$bad rc5-failover"
 [ "$(_cr 3 '{}')" = escalate ]                           || bad="$bad rc3"
+# #1178. The probe's rate_limit is the PROBE-mode sibling of rc 5, and it must
+# reach a decision the same way. Three properties of the classifier half:
+#
+# 1. It is its own class, never `not-yet`. The barrier can neither trigger on
+#    rate_limit (should_trigger declines) nor reach the polling retry from
+#    --probe, so the bounded wait it used to buy could not be satisfied by
+#    anything the run was allowed to do.
+[ "$(_cr 7 '{"head_sha":"abc123","probe":{"observed":"rate_limit"}}')" = rate-limited ] \
+                                                         || bad="$bad rc7-ratelimit-bare"
+# 2. NOT head-anchored, unlike the `reported` conjunction. A rate limit is
+#    provider-level state, the same shape as a pause; head identity is the
+#    composer's drift check to make, and an old probe payload with no
+#    head_sha must not fall back to a wait that cannot end.
+[ "$(_cr 7 '{"probe":{"observed":"rate_limit"}}')" = rate-limited ] \
+                                                         || bad="$bad rc7-ratelimit-nohead"
+[ "$(_cr 7 '{"head_sha":"old999","probe":{"observed":"rate_limit"}}')" = rate-limited ] \
+                                                         || bad="$bad rc7-ratelimit-staleheadev"
+# 3. It never opens the barrier on its own. `rate-limited` is not in the
+#    reported / will-not-report / waived family, so the composition below is
+#    the only thing that can turn it into an `open`.
+case "$(_cr 7 '{"head_sha":"abc123","probe":{"observed":"rate_limit"}}')" in
+  reported|will-not-report|waived) bad="$bad rc7-ratelimit-opens" ;;
+esac
+# The class is probe-shaped and must not leak into the polling rcs, whose own
+# rate-limit contract (rc 5) is unchanged and asserted above.
+[ "$(_cr 4 '{"head_sha":"abc123","probe":{"observed":"rate_limit"}}')" = not-yet ] \
+                                                         || bad="$bad rc4-ratelimit-leak"
 [ "$(p4b_barrier_class_codex 0)" = reported ]            || bad="$bad codex0"
 [ "$(p4b_barrier_class_codex 1)" = not-yet ]             || bad="$bad codex1"
 [ "$(p4b_barrier_class_codex 3)" = escalate ]            || bad="$bad codex3"
@@ -2978,6 +3010,93 @@ if [ -z "$bad" ]; then
   pass "#842: head drift escalates before any trigger, and the request waits for Codex to be terminal"
 else
   fail "#842 trigger sequencing wrong:$bad"
+fi
+
+# --- #1178: a rate-limited CodeRabbit resolves against the Codex arm --------
+#
+# The composition half of the classifier assertions above. Every case uses the
+# rc-7 probe shape the live #946 stall produced — observed=rate_limit on the
+# head under review — and varies only the Codex delegate's exit code, because
+# that is the whole decision.
+bad=""
+_ratelimited='{"head_sha":"abc123","probe":{"observed":"rate_limit"}}'
+_marker="$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-abc123.pending"
+
+# 1. Codex reported on this head ⇒ OPEN. The barrier's guarantee is that some
+#    provider has read the head about to be approved, and Codex reporting is
+#    exactly that. This is the rc-5 `waived` trade reached without the #489
+#    failover having to have run: cls_cx == reported is strictly better
+#    evidence than codex_failover_requested, which only says a request was
+#    sent.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(_barrier 0 7 "$_ratelimited")" && rc=0 || rc=$?
+[ "$rc" = 0 ] || bad="$bad codexreported-not-open"
+printf '%s' "$out" | jq -e '.decision == "open"' >/dev/null 2>&1 || bad="$bad codexreported-decision"
+# Acceptance criterion 2: the barrier's OWN output distinguishes "has not
+# reviewed yet" from "cannot review". Before this the same state reported
+# `not-yet` and the distinction lived only inside coderabbit-wait.sh.
+printf '%s' "$out" | jq -e '.coderabbit == "rate-limited"' >/dev/null 2>&1 || bad="$bad codexreported-class"
+# No wait was started, so nothing accumulates toward a budget that had
+# nothing to wait for — the #839 routing.
+[ ! -f "$_marker" ] || bad="$bad codexreported-started-budget"
+
+# 2. Codex account-blocked (rc 2 ⇒ waived) ⇒ ESCALATE, not open. This is the
+#    case the whole design turns on: `waived` is in the family that opens the
+#    barrier for the Codex arm, so a naive "CodeRabbit refused, is anyone
+#    else terminal?" test would let an approval post with NOTHING having read
+#    the head. A refusal plus a block is a human's problem.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(_barrier 2 7 "$_ratelimited")" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad codexwaived-not-escalated"
+printf '%s' "$out" | jq -e '.reason | test("rate limited")' >/dev/null 2>&1 || bad="$bad codexwaived-reason"
+printf '%s' "$out" | jq -e '.coderabbit == "rate-limited"' >/dev/null 2>&1 || bad="$bad codexwaived-class"
+[ ! -f "$_marker" ] || bad="$bad codexwaived-started-budget"
+
+# 3. Codex still working (rc 1 ⇒ not-yet) ⇒ PENDING, and the budget DOES
+#    start. Deliberately not an escalation: the wait is on Codex, which is
+#    self-clearing, and the next probe can find it reported and open on it.
+#    Escalating here would page a human on a PR whose Codex round was about
+#    to land — the #835 objection to escalating a rate limit unconditionally.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(_barrier 1 7 "$_ratelimited")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad codexnotyet-not-pending"
+printf '%s' "$out" | jq -e '.coderabbit == "rate-limited"' >/dev/null 2>&1 || bad="$bad codexnotyet-class"
+[ -f "$_marker" ] || bad="$bad codexnotyet-no-marker"
+# And no allowance is spent in any direction while it holds: should_trigger
+# declines on rate_limit, and a resume answers a pause rather than a limit.
+printf '%s' "$out" | jq -e '.trigger == "skipped" and .resume == "skipped"' >/dev/null 2>&1 \
+  || bad="$bad codexnotyet-spent-allowance"
+
+# 4. When THAT wait does exhaust, the escalation names the refusal rather than
+#    the clock. The manual fallback's renderer carries only this string, so
+#    "did not reach the current head" would send an operator to wait longer or
+#    re-nudge a provider that has already refused.
+# Age case 3's marker past barrier-both.yml's 100s budget. Backdating the
+# marker is how every other bound assertion in this suite exhausts a wait.
+printf '%s\n' "$(( $(date +%s) - 100000 ))" >"$_marker"
+out="$(_barrier 1 7 "$_ratelimited")" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad exhausted-not-escalated"
+printf '%s' "$out" | jq -e '.reason | test("rate limited")' >/dev/null 2>&1 || bad="$bad exhausted-reason-ratelimit"
+printf '%s' "$out" | jq -e '.reason | test("Codex")' >/dev/null 2>&1 || bad="$bad exhausted-reason-codex"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+
+# 5. Criterion 3: a CodeRabbit that is genuinely just SLOW is untouched. Every
+#    other rc-7 observed still takes the bounded wait, so the fix cannot be
+#    "stop waiting on CodeRabbit" — which would let Phase 4b approve ahead of
+#    a review that was seconds from landing.
+for _o in none in_progress paused awaiting-summary summary-without-head-review; do
+  rm -rf "$WORK/barrier-state/phase-4b-barrier"
+  out="$(_barrier 0 7 "{\"head_sha\":\"abc123\",\"probe\":{\"observed\":\"$_o\"}}")" && rc=0 || rc=$?
+  [ "$rc" = 1 ] || bad="$bad slow-$_o-not-pending"
+  printf '%s' "$out" | jq -e '.coderabbit == "not-yet"' >/dev/null 2>&1 || bad="$bad slow-$_o-class"
+  [ -f "$_marker" ] || bad="$bad slow-$_o-no-marker"
+done
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+
+if [ -z "$bad" ]; then
+  pass "#1178: a rate-limited CodeRabbit opens on a head-pinned Codex report, escalates when nothing read the head, and never silently holds forever"
+else
+  fail "#1178 rate-limited routing wrong:$bad"
 fi
 
 # 4. The mention follows coderabbit.bot_login. coderabbit-wait.sh probes the

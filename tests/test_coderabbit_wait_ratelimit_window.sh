@@ -75,6 +75,8 @@ make_case() {
   # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
   # grades findings with the shared coderabbit_tier_of.
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: hard-sourced by coderabbit-wait.sh, so the fixture must carry it.
+  cp "$ROOT/scripts/lib/coderabbit-fence.sh" "$dir/scripts/lib/coderabbit-fence.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   # Seed the fake clock so "now" is clock_offset seconds after the notice.

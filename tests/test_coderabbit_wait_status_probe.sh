@@ -39,6 +39,8 @@ make_case() {
   # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
   # grades findings with the shared coderabbit_tier_of.
   cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: hard-sourced by coderabbit-wait.sh, so the fixture must carry it.
+  cp "$ROOT/scripts/lib/coderabbit-fence.sh" "$dir/scripts/lib/coderabbit-fence.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
@@ -319,6 +321,16 @@ case "$endpoint" in
         # exists — only the summary issue comment, which carries no SHA.
         printf '[{"id":9951,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"old-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
         ;;
+      probe_rate_limit_review_no_id)
+        # #1178 round 11 (CodeRabbit Major): a body-bearing HEAD-pinned run whose
+        # id is NULL. crw_select_head_pinned_review_run permits this — it requires
+        # a non-empty body, not an id — so the rate-limit path's full-body re-read
+        # has nothing to look the body up by. Before the fix that yielded an EMPTY
+        # review_body, which the all-surfaces helper skips, so the PRIMARY summary
+        # surface went unscanned and a bare `rate_limit` was reported. The body
+        # carries a blocking marker precisely so a silent skip is detectable.
+        printf '[{"id":null,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"**Actionable comments posted: 1**\\n\\n_🟠 Major_ must not be skipped."}]\n' "$bot" "$reply_time"
+        ;;
       probe_summary_lags_review)
         # #814 / Phase 4b P1 on #823: mid-publication. A HEAD-pinned review
         # object EXISTS (submitted at reply_time), but the newest summary
@@ -492,6 +504,11 @@ case "$endpoint" in
         # fresh_at >= HEAD_ANCHOR filter because the new head's committer date
         # is older than this comment — the author-controlled-timestamp hole.
         printf '[{"id":7805,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nReviewed the previous head."}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_rate_limit_review_no_id)
+        # Newest bot comment is a BARE rate-limit notice, so the probe reaches the
+        # rate-limit branch; the finding lives on the id-less review object above.
+        printf '[{"id":7830,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- rate limited by coderabbit.ai -->\\nReview rate limited."}]\n' "$bot" "$reply_time" "$reply_time"
         ;;
       probe_summary_lags_review)
         # Prior head's summary at head_time, i.e. BEFORE the HEAD review
@@ -1960,6 +1977,11 @@ test_968_summary_head_claim_unit() {
     "$ROOT/scripts/coderabbit-wait.sh")"
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: the summary-range predicates now read UNFENCED text through the
+  # shared CommonMark reader, so a harness that sources the helpers block
+  # directly needs the prelude in scope too.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   {
     awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
       "$ROOT/scripts/coderabbit-wait.sh"
@@ -2150,6 +2172,11 @@ test_1003_head_run_evidence_unit() {
     "$ROOT/scripts/coderabbit-wait.sh")"
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: the summary-range predicates now read UNFENCED text through the
+  # shared CommonMark reader, so a harness that sources the helpers block
+  # directly needs the prelude in scope too.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   {
     awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' \
       "$ROOT/scripts/coderabbit-wait.sh"
@@ -2358,6 +2385,11 @@ test_1031_rung_binds_to_the_graded_run() {
     "$ROOT/scripts/coderabbit-wait.sh")"
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: the summary-range predicates now read UNFENCED text through the
+  # shared CommonMark reader, so a harness that sources the helpers block
+  # directly needs the prelude in scope too.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   {
     awk '/^# BEGIN coderabbit_comment_classifier$/{f=1;next} /^# END coderabbit_comment_classifier$/{f=0} f' \
       "$ROOT/scripts/coderabbit-wait.sh"
@@ -2532,6 +2564,11 @@ test_851_summary_helpers_unit() {
   # against the real classifier rather than a test-local stand-in.
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: the summary-range predicates now read UNFENCED text through the
+  # shared CommonMark reader, so a harness that sources the helpers block
+  # directly needs the prelude in scope too.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   # shellcheck disable=SC1090
   . "$snip"
   h40='0123456789abcdef0123456789abcdef01234567'
@@ -2649,6 +2686,11 @@ test_884_count_bodies_fails_closed_unit() {
   # script's stderr logger, which crw_count_blocking_bodies calls on refusal.
   # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
   . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # #1178: the summary-range predicates now read UNFENCED text through the
+  # shared CommonMark reader, so a harness that sources the helpers block
+  # directly needs the prelude in scope too.
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
   log() { echo "[coderabbit-wait] $*" >&2; }
   # shellcheck disable=SC1090
   . "$snip"
@@ -3047,6 +3089,64 @@ test_891_probe_open_rate_limit_window_is_not_silence() {
     "#891 boundary: an aged notice whose published window EXPIRED is silence again"
 }
 
+# #1178 round 11 (CodeRabbit Major): the CALLER must never turn a selected,
+# body-bearing review with an unusable ID into an empty-body helper call.
+#
+# This is the behavioural half of that regression. The structural assertions in
+# test_coderabbit_wait_statuscontext_ratelimit.sh pin that the guards exist and
+# precede the helper call; this drives the whole probe and asserts on the
+# OUTCOME, across the boundary where the bug actually occurred.
+#
+# Fixture: a HEAD-pinned review run with a NULL id whose body carries a blocking
+# marker, plus a newer bare rate-limit notice. Before the fix the full-body
+# re-read produced an empty string, crw_rate_limit_hides_a_finding skipped that
+# surface, and the probe emitted rc 7 `rate_limit` — which the Phase 4b barrier
+# may OPEN on when Codex has reported, approving past a published finding.
+#
+# The assertion is rc 3, not rc 2: the correct answer is "I could not inspect
+# the primary surface", which is distinct from "I inspected it and found a
+# finding". Asserting rc 2 would pass for the wrong reason if the body were read
+# some other way.
+test_1178_review_no_id_fails_closed() {
+  local dir rc obs bad=""
+  dir=$(make_case probe-rl-no-id 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_rate_limit_review_no_id)
+  obs=$(jq -r '.probe.observed // "none"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+
+  # rc 3 is necessary but NOWHERE NEAR sufficient, and asserting on it alone was
+  # this test's own defect before an independent review caught it. There are 38
+  # `die 3` sites in this script and four within eight lines of the guard under
+  # test — including the empty-round-trip check immediately below it, which
+  # catches this same fixture. A test keyed on the exit code alone stays GREEN
+  # when the guard it exists to pin is deleted outright, which is the exact
+  # pass-for-the-wrong-reason failure this suite has produced repeatedly.
+  #
+  # So assert on the MESSAGE. `die` writes it to stderr, which run_probe_case
+  # captures per case, and the wording is unique to this guard.
+  [ "$rc" = 3 ] || bad="$bad rc=$rc(want-3,observed=$obs)"
+  # ONE positive assertion pinning enough of the guard's own message that no
+  # other die site can satisfy it. Deliberately not "a substring plus a negation
+  # of the sibling's substring": that form discriminates only while the SIBLING
+  # keeps its wording, so rewording line ~4290 in a later round would make the
+  # negation vacuously true and quietly restore "any die 3 passes" — the same
+  # stops-asserting decay this suite has produced repeatedly, and coupled to a
+  # string this guard does not own.
+  grep -q "carries no usable id, so its body — the PRIMARY summary surface — cannot be scanned" \
+    "$dir/err.log" 2>/dev/null || bad="$bad wrong-die-site"
+  # Kept as defence in depth, NOT as the discriminator: if the sibling ever
+  # reworded, this goes vacuously true and the positive assertion above still
+  # carries the test. Whoever edits the empty-round-trip guard should know this
+  # line references it.
+  ! grep -q "did not round-trip" "$dir/err.log" 2>/dev/null \
+    || bad="$bad sibling-guard-fired-instead"
+
+  if [ -z "$bad" ]; then
+    pass "#1178 probe: a body-bearing HEAD review with no usable id fails CLOSED at ITS OWN guard (rc 3 + that guard's message), not merely somewhere"
+  else
+    fail "#1178 probe: expected the no-usable-id guard to fire;$bad — an unread review body must never read as 'no finding'"
+  fi
+}
+
 test_900_review_run_selector_ignores_bodyless_replies
 test_919_pending_status_blocks_the_terminal_verdict
 test_936_unreadable_status_is_not_an_absent_status
@@ -3095,6 +3195,7 @@ test_1031_bodyless_ack_over_findings_run_does_not_clear
 test_837_badge_only_inline_finding_is_counted
 test_837_badge_only_summary_finding_probe_is_findings
 test_824_sha_matched_review_is_honored_regardless_of_timestamp
+test_1178_review_no_id_fails_closed
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

@@ -1411,36 +1411,214 @@ fi
 
 
 # ---------------------------------------------------------------------------
-# #1059: the ambiguous-404 REPORT is fixed; the DECISION is deliberately not.
+# #1064 (superseding the #1059 assertions that stood here): the ambiguous 404
+# is GONE, because gate (a) no longer asks the endpoint that produces it.
 #
-# Resolving the ambiguity for real needs ruleset support, URI-segment encoding,
-# and a privileged read that auto-clear CI can actually reach (it runs this
-# script with only GH_TOKEN). Attempting it here shipped a fleet-wide gate (a)
-# regression, so it is deferred whole to #1064 and only the log is corrected.
-# These assertions pin that the BEHAVIOUR stayed put.
+# #1059/#1061 could only fix the REPORT. The read itself was
+# `branches/{branch}/protection/required_status_checks`, which needs
+# Administration:read and answers 404 — not 403 — for an unprivileged token, so
+# "requires nothing" and "may not look" arrived as the same empty list. Every
+# path gate (a) runs on is unprivileged (agents use a reviewer PAT;
+# auto-clear-blocking-labels.yml uses REVIEWER_ASSIGNMENT_TOKEN and does NOT
+# skip gate (a)), so the gate passed without examining a check run.
+#
+# #1064 replaced the read rather than the decision. The two surfaces a plain
+# write-scoped token CAN see — GraphQL refUpdateRule for classic protection,
+# REST rules/branches for rulesets — resolve the real list on exactly those
+# tokens, so the ambiguity has no path back. These assertions pin that.
 # ---------------------------------------------------------------------------
 
-UNPRIV_404_ARM=$(sed -n '/elif grep -q .HTTP 404. "\$protection_err"; then/,/^else$/p' "$SCRIPT")
-if [ -z "$UNPRIV_404_ARM" ]; then
-  fail "#1059: could not locate the unprivileged 404 arm in $SCRIPT"
+# Comment-stripped view. These two assertions are about what the script DOES,
+# and the block above deliberately names the retired endpoint in prose so a
+# future reader knows what was replaced and why — a whole-file grep would read
+# that history as a regression.
+SCRIPT_CODE_1064=$(grep -vE '^[[:space:]]*#' "$SCRIPT")
+
+if grep -q 'protection/required_status_checks' <<<"$SCRIPT_CODE_1064"; then
+  fail "#1064: gate (a) reads the admin-only REST protection endpoint again — that read answers 404 for every token the fleet runs under, which is the conflation #1064 removed"
 else
-  if grep -Eq '^[[:space:]]*protection_readable=1[[:space:]]*$' <<<"$UNPRIV_404_ARM"; then
-    pass "#1059: the 404 arm still marks the list readable — behaviour unchanged, as intended for this PR"
-  else
-    fail "#1059: the 404 arm changed the gate (a) DECISION. That belongs in #1064: auto-clear CI runs this script with only GH_TOKEN, so a privileged retry is unreachable there and failing closed reds gate (a) on every protected consumer"
-  fi
-  if grep -q 'PROTECTION_404_AMBIGUOUS=1' <<<"$UNPRIV_404_ARM"; then
-    pass "#1059: the 404 arm records that the required-check list is UNVERIFIED"
-  else
-    fail "#1059: the ambiguity flag is gone — gate (a) will again assert 'lists no required checks' as established fact"
-  fi
+  pass "#1064: gate (a) no longer reads the admin-only REST protection endpoint"
 fi
 
-if grep -q 'could not VERIFY the required-check list' <<<"$SCRIPT_CODE_1059"; then
-  pass "#1059: the ambiguous case reports the list as unverified, not absent"
+if grep -q 'PROTECTION_404_AMBIGUOUS' <<<"$SCRIPT_CODE_1064"; then
+  fail "#1064: the ambiguous-404 flag is back — it exists only to describe a read gate (a) should no longer be making"
 else
-  fail "#1059: nothing distinguishes 'no required checks configured' from 'this token may not see protection'"
+  pass "#1064: the ambiguous-404 bookkeeping is gone with the read that needed it"
 fi
+
+if grep -q 'lib/branch-requirements.sh' "$SCRIPT" \
+   && grep -q 'br_required_checks' "$SCRIPT"; then
+  pass "#1064: gate (a) resolves the required list through the shared tri-state resolver"
+else
+  fail "#1064: gate (a) is not using scripts/lib/branch-requirements.sh — without it there is nothing separating an unreadable rule set from an empty one"
+fi
+
+# Hard-sourced, not existence-guarded: a degraded mode here IS the defect, so
+# a consumer that ships the caller without the lib must fail loudly rather
+# than silently fall back to an unfiltered gate.
+BR_SOURCE_BLOCK=$(sed -n '/branch-requirements helper missing/,/lib\/branch-requirements.sh"$/p' "$SCRIPT")
+if grep -q 'exit 3' <<<"$BR_SOURCE_BLOCK"; then
+  pass "#1064: the branch-requirements lib is HARD-required (exit 3 when absent)"
+else
+  fail "#1064: the branch-requirements lib is soft-sourced — an absent lib would leave gate (a) unfiltered and silent, which is the original bug"
+fi
+
+# The tri-state must stay three-valued at the point of decision. `known` with
+# an empty list is a real answer (an approvals-only branch); `unknown` is not
+# an answer at all and must not reach the no-filter branch.
+if grep -q 'BRANCH_REQUIREMENTS_STATE" = "known"' "$SCRIPT"; then
+  pass "#1064: gate (a) branches on the resolver state rather than on list emptiness alone"
+else
+  fail "#1064: gate (a) infers readability from an empty list again — that is exactly how 'could not look' became 'nothing required'"
+fi
+
+# ---------------------------------------------------------------------------
+# #1064 review round 1 (PR #1176): the two fail-opens Codex found in the
+# collapse that resolving the required list newly exposed.
+# ---------------------------------------------------------------------------
+
+# A required context is a bare NAME, and branch protection pins it to a
+# producing app. Collapsing purely by name lets a later same-named run from a
+# foreign producer win and mask the required producer FAILURE. GitHub answers
+# this directly via isRequired(pullRequestNumber:), so the rollup carries it.
+if grep -q 'isRequired(pullRequestNumber: $number)' "$SCRIPT" \
+   && grep -q 'isRequired: .isRequired' "$SCRIPT"; then
+  pass "#1064: the rollup query carries GitHub own isRequired verdict per entry"
+else
+  fail "#1064: the rollup no longer carries isRequired — the per-name collapse can then let a foreign producer SUCCESS mask a required FAILURE"
+fi
+
+if grep -q 'select(.isRequired != false)' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: entries GitHub says do not count are dropped before the collapse, and only an explicit false drops one"
+else
+  fail "#1064: the filter does not exclude isRequired==false entries, so a foreign same-named check can decide a required context"
+fi
+
+# The collapse key is (name, PRODUCING APP) — GitHub own unit of requirement,
+# since protection requires a context from a specific app id.
+#
+# Not the workflow, and that distinction is measured rather than assumed: on
+# nathanpaynedotcom#908 three required contexts are each emitted by TWO
+# workflows under the SAME app 15368 (agent-review.yml republishes what the
+# dedicated gate workflows publish), all reporting isRequired=true against a
+# protection entry that lists each context once. Keying on workflow would
+# demand both be green and block PRs GitHub merges.
+#
+# Not the bare name either: when protection lists one context under two app
+# ids those producers are independently required, and collapsing them lets one
+# app SUCCESS hide the other app FAILURE.
+if grep -q 'app { databaseId }' "$SCRIPT" \
+   && grep -q 'appId: ((.checkSuite.app.databaseId' "$SCRIPT"; then
+  pass "#1064: the rollup carries the producing app id"
+else
+  fail "#1064: the rollup does not carry the producing app id, so the collapse cannot separate independently required producers"
+fi
+
+# The filter iterates REQUIREMENTS, not rollup groups.
+#
+# The earlier shape collapsed the rollup by some key and then judged the
+# survivors, which meant guessing a key — and guessing it produced a new
+# unmodelled configuration every review round on PR #1176: by name it hid a
+# second required app failure; by workflow it blocked PRs GitHub merges (three
+# contexts on nathanpaynedotcom#908 are published by two workflows under one
+# app); by app it made every producer of an any-producer context separately
+# mandatory; by app-when-any-rule-pins-the-name it did the same wherever a
+# pinned and an any-producer rule share a context.
+#
+# Iterating requirements needs no key: each rule selects its own candidates and
+# is satisfied by the current entry among them, which is what GitHub does.
+if grep -q 'REQUIREMENT-DRIVEN' <<<"$SCRIPT_CODE_1064" \
+   || grep -q '\$requirements\[\]' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: gate (a) iterates the branch rules rather than collapsing the rollup by a guessed key"
+else
+  fail "#1064: gate (a) is back to collapsing by a grouping key — that shape cannot express a context carrying both a pinned and an any-producer rule"
+fi
+
+# An any-producer rule (app_id null) draws candidates from every producer; a
+# pinned rule only from its app. One context carrying both is simply two
+# requirements, each judged on its own terms.
+if grep -q '($req.app_id == null) or (.appId == $req.app_id)' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: a rule selects candidates by its own producer scope, so pinned and any-producer rules coexist on one context"
+else
+  fail "#1064: candidate selection ignores the rule producer scope — an any-producer rule would be judged per app, or a pinned rule across all apps"
+fi
+
+# A requirement with no candidate run at all is MISSING and blocks: GitHub
+# holds the PR for an unreported required context. This is not the
+# synthetic-MISSING approach #655 rounds 2-4 removed — those names were derived
+# from a consumer annex and could legitimately never report, while these come
+# from the branch rules themselves.
+if grep -q 'result: "MISSING"' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'not reported by app' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: an unreported requirement blocks, and names the producer when the rule pins one"
+else
+  fail "#1064: an unreported requirement leaves BAD_CHECKS empty and gate (a) clears while GitHub still blocks the merge"
+fi
+
+# An UNRESOLVED requirement list is itself blocking. On that path the filter
+# can only judge checks that reported, so a required context whose workflow has
+# not been scheduled produces no entry and an otherwise-green rollup would
+# clear gate (a) while GitHub is still waiting for it. Scrutinising every
+# counted check (#465) catches a red check but not an absent one.
+if grep -q 'requirement list unresolved' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'requirements_state == "known"' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: an unresolved requirement list blocks gate (a) instead of clearing on a rollup-only result"
+else
+  fail "#1064: gate (a) can still report clean while the requirement list is unreadable — a never-reported required check is invisible on that path"
+fi
+
+# It blocks via a synthetic entry, not a hard exit: an infrastructure exit
+# would take the script down fleet-wide on any anomaly in one endpoint, which
+# is the shape of the #1061 regression.
+if grep -q 'result: "UNKNOWN"' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: the unresolved state blocks via a reported entry rather than a fleet-wide hard exit"
+else
+  fail "#1064: the unresolved state no longer surfaces as a blocking entry"
+fi
+
+# Label Gate is one of the five canonical REQUIRED contexts and fails by design
+# during Phase 4a, which is what Phase 4a exists to clear. Its exclusion must
+# therefore hide only its VERDICT: dropping its entry from the projection made
+# its requirement find no entry and be synthesized as MISSING on every
+# evaluation, so gate (a) could never clear on any consumer.
+LABELGATE_BLOCK=$(sed -n '/TWO exclusions/,/as \$counted/p' "$SCRIPT")
+if grep -q 'PR Review Policy' <<<"$LABELGATE_BLOCK"; then
+  pass "#1064: the Label Gate exclusion applies to verdict selection, alongside the readiness exclusion"
+else
+  fail "#1064: the Label Gate exclusion is not on the verdict-selection path — if it drops the entry outright, its requirement reports MISSING forever and gate (a) can never clear"
+fi
+if grep -q 'select(.isRequired != false)' <<<"$(sed -n '/\] as \$counted_all/q;/statusCheckRollup\[\]/,$p' "$SCRIPT")" \
+   && ! grep -q 'PR Review Policy' <<<"$(sed -n '/statusCheckRollup\[\]/,/\] as \$counted_all/p' "$SCRIPT")"; then
+  pass "#1064: Label Gate stays visible to the presence test, so it is not reported MISSING"
+else
+  fail "#1064: Label Gate is filtered out before the presence test — its requirement would be permanently MISSING"
+fi
+
+# PRESENCE is judged pre-exclusion, VERDICT post-exclusion.
+#
+# The approval-readiness exclusion drops non-completed checks from the caller
+# own trusted run so the gate cannot decide its own verdict. Drawing the
+# MISSING test from that same reduced set turns the caller in-flight check into
+# a manufactured blocking requirement — the exact self-block the exclusion
+# exists to prevent. This regressed once during the requirement-driven
+# restructure and the assertion that replaced it was too weak to notice, so it
+# is pinned on both halves now.
+if grep -q '\$counted_all' <<<"$SCRIPT_CODE_1064" \
+   && grep -q ')) as \$reported' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'elif (\$candidates | length) == 0' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: presence uses the pre-exclusion set and a caller-excluded requirement drops out rather than reporting MISSING"
+else
+  fail "#1064: MISSING is derived from the readiness-filtered set — the caller own in-flight check would be reported as never-reported and block the gate on itself"
+fi
+
+# And the exclusion must still apply to verdict selection.
+if grep -q 'approval_readiness_only' <<<"$SCRIPT_CODE_1064" \
+   && grep -q 'current_run_id' <<<"$SCRIPT_CODE_1064"; then
+  pass "#1064: the readiness exclusion still scopes verdict selection"
+else
+  fail "#1064: the approval-readiness exclusion is gone — the gate can block on its own in-flight check"
+fi
+
 
 # The CODEOWNERS deadlock: reviewDecision stays REVIEW_REQUIRED even though a
 # qualifying approval exists (scripts/admin-merge-codeowners-blocked.sh
@@ -1483,10 +1661,19 @@ if grep -q 'reports this as 404' <<<"$FAILCLOSED_WARN"; then
 else
   pass "#1061: the fail-closed warning no longer misattributes the failure to a 404"
 fi
-if grep -qE '403|5xx' <<<"$FAILCLOSED_WARN" && grep -q 'transient' <<<"$FAILCLOSED_WARN"; then
-  pass "#1061: the fail-closed warning names the errors that actually reach it and flags 5xx as retryable"
+# #1064 narrowed which failures can reach this arm. A permission shape can no
+# longer land here at all — both rule surfaces are readable by a write-scoped
+# token — so the warning must describe an API/network fault and say it is
+# usually transient, NOT send the operator off to fix credentials.
+if grep -q 'transient' <<<"$FAILCLOSED_WARN"; then
+  pass "#1064: the fail-closed warning flags the fault as usually transient rather than a credential problem"
 else
-  fail "#1061: the fail-closed warning does not distinguish a scope failure from a transient one"
+  fail "#1064: the fail-closed warning does not tell the operator the fault is usually transient"
+fi
+if grep -qE 'EITHER rule surface|both.*surface' <<<"$FAILCLOSED_WARN"; then
+  pass "#1064: the fail-closed warning names the condition that actually reaches it (neither rule surface answered)"
+else
+  fail "#1064: the fail-closed warning still describes a token-scope failure — after #1064 that shape cannot reach this arm, so the advice would misdirect"
 fi
 
 
@@ -1536,6 +1723,525 @@ if grep -qE 'MORE of them|specific CODEOWNER' <<<"$ADVISORY_BLOCK"; then
 else
   fail "#1061: the advisory does not mention the states where a further Phase 4b round is the correct remedy"
 fi
+
+# ── #1193: gate (a) collapsed CheckRun and StatusContext into ONE entry ─────
+#
+# A required context is satisfiable by a check run OR by a legacy commit
+# status, and GitHub evaluates each surface as its own row: when a head
+# carries both under one required name, both must be green for the merge to
+# proceed. gate (a) built one candidate set from the mixed union and picked a
+# single `current_entry` from it, ranked by recency — so the later-reporting
+# surface decided for both and a passing StatusContext masked a failing
+# CheckRun. The direction is a FAIL-OPEN on a merge gate: gate (a) reports
+# green, GitHub still blocks, and the disagreement reads as an infra flake.
+#
+# THESE ASSERTIONS RUN THE REAL FILTER. Every other end-to-end block in this
+# file re-types the jq inline and keeps it in sync by hand, and the copy in
+# `bad_checks` above has already drifted past #1064 (it carries no
+# requirements list, no isRequired scoping and no winner selection) — a copy
+# like that can pass while the shipped gate is broken, which is precisely the
+# defect class #1193 is. So the two jq programs are EXTRACTED from
+# scripts/codex-review-check.sh and executed: the fixtures enter as raw
+# GraphQL union nodes, pass through the script own projection, and are judged
+# by the script own BAD_CHECKS filter. If the projection stops carrying
+# __typename, these fail.
+G1193_DIR=$(mktemp -d)
+trap 'rm -rf "$G1193_DIR"' EXIT
+
+# Exact-line anchors, not regexes: a `{` in an ERE is an interval expression
+# whose escaping is not portable across BSD awk and gawk, and an exact match
+# cannot silently half-match a line that later drifts.
+cat > "$G1193_DIR/proj.awk" <<'AWK'
+BEGIN { start = "ROLLUP_JSON=$(echo \"$ROLLUP_CONTEXTS\" | jq '{"; stop = "}')" }
+$0 == start { started = 1; print "{"; next }
+started { if ($0 == stop) { print "}"; exit } print }
+AWK
+cat > "$G1193_DIR/bad.awk" <<'AWK'
+BEGIN { start = "BAD_CHECKS=$(echo \"$ROLLUP_JSON\" | jq \\"; stop = "')"; q = sprintf("%c", 39) }
+$0 == start { inblk = 1; next }
+inblk && !started { if (substr($0, length($0), 1) == q) { started = 1 } next }
+started { if ($0 == stop) { exit } print }
+AWK
+awk -f "$G1193_DIR/proj.awk" "$SCRIPT" > "$G1193_DIR/proj.jq"
+awk -f "$G1193_DIR/bad.awk"  "$SCRIPT" > "$G1193_DIR/bad.jq"
+
+# An empty or uncompilable extraction must FAIL here, never quietly turn every
+# assertion below into a vacuous pass.
+G1193_EXTRACTION_OK=1
+if [ ! -s "$G1193_DIR/proj.jq" ] || [ ! -s "$G1193_DIR/bad.jq" ]; then
+  G1193_EXTRACTION_OK=0
+  fail "#1193: could not extract gate (a) rollup projection / BAD_CHECKS filter from $SCRIPT — the anchor lines moved, so nothing below is testing the shipped gate"
+elif ! printf '[]' | jq -f "$G1193_DIR/proj.jq" >/dev/null 2>&1; then
+  G1193_EXTRACTION_OK=0
+  fail "#1193: the extracted rollup projection does not compile as a jq program — extraction captured the wrong span"
+elif ! printf '{"statusCheckRollup":[]}' | jq --argjson requirements '[]' \
+        --arg requirements_state known --arg approval_readiness_only 0 \
+        --arg current_run_id "" --argjson lineage_contexts '[]' \
+        -f "$G1193_DIR/bad.jq" >/dev/null 2>&1; then
+  G1193_EXTRACTION_OK=0
+  fail "#1193: the extracted BAD_CHECKS filter does not compile as a jq program — extraction captured the wrong span"
+else
+  pass "#1193: gate (a) rollup projection and BAD_CHECKS filter extracted from the real script and both compile"
+fi
+
+# nodes_json requirements_json requirements_state -> compact array of labels
+g1193_gate_a() {
+  printf '%s' "$1" \
+    | jq -c -f "$G1193_DIR/proj.jq" \
+    | jq -c --argjson requirements "$2" --arg requirements_state "$3" \
+            --arg approval_readiness_only "0" --arg current_run_id "" \
+            --argjson lineage_contexts '[]' \
+            -f "$G1193_DIR/bad.jq"
+}
+# `-` stands for "no surface recorded": jq treats "" as truthy, so an absent
+# and an empty kind both have to be normalised explicitly.
+g1193_labels() { printf '%s' "$1" | jq -c '[.[] | (if (.kind // "") == "" then "-" else .kind end) + ":\(.label)=\(.result)"] | sort'; }
+# Surface-agnostic form, for the assertions whose point is only WHETHER the
+# gate blocks. Naming the surface there would make them fail under a revert of
+# the fix for a cosmetic reason, and a guard that cannot stay green while the
+# mechanism is removed is not a guard.
+g1193_plain() { printf '%s' "$1" | jq -c '[.[] | "\(.label)=\(.result)"] | sort'; }
+
+# Raw statusCheckRollup union nodes, exactly as the GraphQL query selects them.
+G1193_CR_FAIL='{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":11,"workflow":{"name":"CI","resourcePath":"/o/r/actions/workflows/ci.yml"}}}}'
+G1193_CR_OK='{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T11:00:00Z","completedAt":"2026-05-21T11:05:00Z","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":12,"workflow":{"name":"CI","resourcePath":"/o/r/actions/workflows/ci.yml"}}}}'
+G1193_CR_RUNNING='{"__typename":"CheckRun","name":"lint","status":"IN_PROGRESS","conclusion":null,"startedAt":"2026-05-21T12:00:00Z","completedAt":null,"isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":13,"workflow":{"name":"CI","resourcePath":"/o/r/actions/workflows/ci.yml"}}}}'
+# A StatusContext carries NO name/status/conclusion/checkSuite and NO
+# startedAt/completedAt — only context, state and createdAt. Measured live on
+# nathanjohnpayne/mergepath#1208, whose head carries 82 CheckRun nodes and one
+# StatusContext (CodeRabbit).
+G1193_SC_OK='{"__typename":"StatusContext","context":"lint","state":"SUCCESS","createdAt":"2026-05-21T11:00:00Z","isRequired":true}'
+G1193_SC_FAIL='{"__typename":"StatusContext","context":"lint","state":"FAILURE","createdAt":"2026-05-21T10:00:00Z","isRequired":true}'
+# Classic protection requires a bare context from ANY producer, which is what
+# every one of the six contexts on mergepath@main resolves to today.
+G1193_REQ='[{"context":"lint","app_id":null}]'
+
+if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
+  # THE ISSUE SCENARIO. One required name, a FAILING check run, and a LATER
+  # SUCCEEDING commit status. Before the fix the status won on recency and
+  # BAD_CHECKS came back empty — gate (a) reported CI green on a red required
+  # check. A fixture carrying only ONE of the two shapes passes identically
+  # before and after, so the mixed head is the whole test.
+  GOT=$(g1193_labels "$(g1193_gate_a "[$G1193_CR_FAIL,$G1193_SC_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '["CheckRun:lint=FAILURE"]' ]; then
+    pass "#1193: a later SUCCEEDING commit status no longer masks the failing check run under the same required name"
+  else
+    fail "#1193: mixed head (CheckRun FAILURE + later StatusContext SUCCESS) must block on the check run, got $GOT"
+  fi
+
+  # The same collapse in the other direction. Nothing orders the two surfaces,
+  # so whichever reports last speaks for both; a green check run hid a red
+  # legacy status just as readily.
+  GOT=$(g1193_labels "$(g1193_gate_a "[$G1193_SC_FAIL,$G1193_CR_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '["StatusContext:lint=FAILURE"]' ]; then
+    pass "#1193: a later SUCCEEDING check run no longer masks the failing commit status under the same required name"
+  else
+    fail "#1193: mixed head (StatusContext FAILURE + later CheckRun SUCCESS) must block on the commit status, got $GOT"
+  fi
+
+  # The unresolved-requirements arm reaches a DIFFERENT collapse — group_by
+  # label over the whole rollup — and had the identical defect. This is the
+  # live fail-closed path (#465): REQUIRED_JSON is empty and the rollup is NOT
+  # wiped, so every counted check is scrutinised.
+  GOT=$(g1193_labels "$(g1193_gate_a "[$G1193_CR_FAIL,$G1193_SC_OK]" '[]' unknown)")
+  if [ "$GOT" = '["-:(requirement list unresolved)=UNKNOWN","CheckRun:lint=FAILURE"]' ]; then
+    pass "#1193: the unresolved-requirement-list arm also judges each surface separately, so its whole-rollup scan cannot be masked either"
+  else
+    fail "#1193: the unresolved-requirement-list arm still lets a passing commit status mask a failing check run, got $GOT"
+  fi
+
+  # ── No false blocks. Splitting the surfaces must not degrade into
+  #    "any non-green entry anywhere blocks", which would resurrect the stale
+  #    failed rerun that #655 round 13 stopped blocking on forever.
+  GOT=$(g1193_plain "$(g1193_gate_a "[$G1193_CR_OK,$G1193_SC_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1193: a head where BOTH surfaces are green still clears gate (a)"
+  else
+    fail "#1193: both-surfaces-green must not block, got $GOT"
+  fi
+
+  GOT=$(g1193_plain "$(g1193_gate_a "[$G1193_CR_FAIL,$G1193_CR_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1193: within one surface, a stale FAILED check run superseded by a later SUCCESS still collapses to the later one"
+  else
+    fail "#1193: winner selection inside a single surface regressed — a superseded failure is blocking again, got $GOT"
+  fi
+
+  # Pending precedence has to survive the split: an in-flight check run holds
+  # the gate even when the other surface has already reported success.
+  GOT=$(g1193_plain "$(g1193_gate_a "[$G1193_CR_RUNNING,$G1193_SC_OK]" "$G1193_REQ" known)")
+  if [ "$GOT" = '["lint="]' ]; then
+    pass "#1193: an in-flight check run still holds gate (a) when the commit status under the same name is already green"
+  else
+    fail "#1193: pending precedence lost across the surface split, got $GOT"
+  fi
+
+  # Totality. An entry whose union member is not carried must fall back to the
+  # single pre-#1193 winner, not vanish: an empty partition would drop the
+  # requirement out of scrutiny entirely, a fail-open worse than the original.
+  GOT=$(g1193_plain "$(g1193_gate_a '[{"name":"lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":true},{"context":"lint","state":"FAILURE","createdAt":"2026-05-21T11:00:00Z","isRequired":true}]' "$G1193_REQ" known)")
+  if [ "$GOT" = '["lint=FAILURE"]' ]; then
+    pass "#1193: entries carrying no __typename collapse to one winner as before, rather than dropping out of scrutiny"
+  else
+    fail "#1193: untyped entries are no longer judged at all — the split must degrade to the pre-fix winner, got $GOT"
+  fi
+fi
+
+# Structural: the projection must keep __typename, and the filter must define
+# the per-surface selector. Without these the extraction above would still
+# compile and every behavioural assertion would be testing a filter that
+# cannot tell the surfaces apart.
+if grep -q 'kind: (.__typename // "")' "$SCRIPT"; then
+  pass "#1193: the rollup projection carries the GraphQL union member per entry"
+else
+  fail "#1193: the rollup projection drops __typename again — the two surfaces become indistinguishable downstream"
+fi
+if grep -q 'def current_entries:' "$SCRIPT" && ! grep -q 'map(current_entry) | map(select(blocks))' "$SCRIPT"; then
+  pass "#1193: gate (a) selects a current entry per surface rather than one across the mixed union"
+else
+  fail "#1193: gate (a) is back to a single current_entry over the mixed CheckRun/StatusContext set"
+fi
+
+# ── #1214 site 1: the annex conventional-name fallback collapsed surfaces ───
+#
+# #1193 split CheckRun from StatusContext in the required-context path and in
+# the unresolved-requirement-list path. ANNEX_NAME_FALLBACK_BAD is a third
+# collapse of the same mixed union in this same gate, and it was left behind.
+#
+# It groups by NAME alone, then picks a winner with
+# `sort_by(.completedAt // .startedAt // "") | last`. A StatusContext carries
+# neither timestamp in this projection — the GraphQL fragment selects only
+# createdAt for that union member, and this arm never reads it — so a commit
+# status always sorts FIRST and loses every tie to a completed check run. The
+# masking was therefore one-directional and entirely an accident of the sort
+# key: a red check run still won over a green status, while a GREEN check run
+# silently dropped a same-named RED status.
+#
+# The fix groups by (name, surface). This arm is already guessing by name —
+# it exists precisely because the annex real workflow identity could not be
+# determined — so a status reported under that name is exactly as plausible an
+# annex report as a check run, and fail-closed is the reading consistent with
+# that premise. The sibling ANNEX_WORKFLOW_BAD scan needs no change: it matches
+# on .workflowPath, which a StatusContext can never carry.
+if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
+  cat > "$G1193_DIR/annex.awk" <<'AWK'
+BEGIN { start = "    ANNEX_NAME_FALLBACK_BAD=$(echo \"$ANNEX_SCAN_ROLLUP_JSON\" | jq '"; stop = "    ')" }
+$0 == start { started = 1; next }
+started { if ($0 == stop) { exit } print }
+AWK
+  awk -f "$G1193_DIR/annex.awk" "$SCRIPT" > "$G1193_DIR/annex.jq"
+
+  g1214_annex() { printf '%s' "$1" | jq -c -f "$G1193_DIR/proj.jq" | jq -c -f "$G1193_DIR/annex.jq"; }
+  g1214_labels() { printf '%s' "$1" | jq -c '[.[] | "\(.label)=\(.result)"] | sort'; }
+
+  G1214_CR_OK='{"__typename":"CheckRun","name":"repo-lint-local","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":false,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Consumer CI","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+  G1214_CR_BAD='{"__typename":"CheckRun","name":"repo-lint-local","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":false,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Consumer CI","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+  G1214_SC_OK='{"__typename":"StatusContext","context":"repo-lint-local","state":"SUCCESS","createdAt":"2026-05-21T11:00:00Z","isRequired":false}'
+  G1214_SC_BAD='{"__typename":"StatusContext","context":"repo-lint-local","state":"FAILURE","createdAt":"2026-05-21T11:00:00Z","isRequired":false}'
+
+  if [ ! -s "$G1193_DIR/annex.jq" ]; then
+    fail "#1214: could not extract ANNEX_NAME_FALLBACK_BAD from $SCRIPT — the anchor lines moved, so nothing below tests the shipped scan"
+  else
+    # THE DISCRIMINATOR. Green check run, red same-named commit status.
+    GOT=$(g1214_labels "$(g1214_annex "[$G1214_CR_OK,$G1214_SC_BAD]")")
+    if [ "$GOT" = '["repo-lint-local=FAILURE"]' ]; then
+      pass "#1214: a green annex check run no longer drops a same-named red commit status"
+    else
+      fail "#1214: green CheckRun + red StatusContext must still report the red status, got $GOT"
+    fi
+
+    # The direction that already worked, kept working: the check run has real
+    # timestamps and always outranked the status, so this passed before too.
+    GOT=$(g1214_labels "$(g1214_annex "[$G1214_CR_BAD,$G1214_SC_OK]")")
+    if [ "$GOT" = '["repo-lint-local=FAILURE"]' ]; then
+      pass "#1214: a red annex check run still blocks alongside a green same-named commit status"
+    else
+      fail "#1214: red CheckRun + green StatusContext must report the red check run, got $GOT"
+    fi
+
+    # No false block when both surfaces are green.
+    GOT=$(g1214_labels "$(g1214_annex "[$G1214_CR_OK,$G1214_SC_OK]")")
+    if [ "$GOT" = '[]' ]; then
+      pass "#1214: both annex surfaces green still clears the conventional-name fallback"
+    else
+      fail "#1214: both-green must not block the annex fallback, got $GOT"
+    fi
+
+    # Within one surface, the stale-rerun rule #655 round 13 established must
+    # survive the regrouping: a superseded failure still loses to a later pass.
+    G1214_CR_LATER_OK='{"__typename":"CheckRun","name":"repo-lint-local","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T12:00:00Z","completedAt":"2026-05-21T12:05:00Z","isRequired":false,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":2,"workflow":{"name":"Consumer CI","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+    GOT=$(g1214_labels "$(g1214_annex "[$G1214_CR_BAD,$G1214_CR_LATER_OK]")")
+    if [ "$GOT" = '[]' ]; then
+      pass "#1214: inside one surface, a superseded annex failure still loses to the later success"
+    else
+      fail "#1214: the annex fallback regrouping broke stale-rerun selection (#655 round 13), got $GOT"
+    fi
+  fi
+
+  # Review round 1, found independently by Codex (P2) and CodeRabbit: giving
+  # commit statuses their own partition made their INTERNAL ordering
+  # load-bearing for the first time. A StatusContext carries neither
+  # startedAt nor completedAt in this projection, so every status compared
+  # equal on the old sort key and the winner fell out of GraphQL connection
+  # order -- a stale failure could block a recovered annex, or a stale
+  # success could hide its current failure. The projection already carried
+  # createdAt; the ordering now uses it. Both array orders are asserted,
+  # because connection order is exactly what must stop mattering.
+  if [ "$G1193_EXTRACTION_OK" -eq 1 ] && [ -s "$G1193_DIR/annex.jq" ]; then
+    SC_OLD_BAD='{"__typename":"StatusContext","context":"repo-lint-local","state":"FAILURE","createdAt":"2026-05-21T10:00:00Z","isRequired":false}'
+    SC_NEW_OK='{"__typename":"StatusContext","context":"repo-lint-local","state":"SUCCESS","createdAt":"2026-05-21T12:00:00Z","isRequired":false}'
+    SC_NEW_BAD='{"__typename":"StatusContext","context":"repo-lint-local","state":"FAILURE","createdAt":"2026-05-21T12:00:00Z","isRequired":false}'
+    SC_OLD_OK='{"__typename":"StatusContext","context":"repo-lint-local","state":"SUCCESS","createdAt":"2026-05-21T10:00:00Z","isRequired":false}'
+
+    GOT_A=$(g1214_labels "$(g1214_annex "[$SC_OLD_BAD,$SC_NEW_OK]")")
+    GOT_B=$(g1214_labels "$(g1214_annex "[$SC_NEW_OK,$SC_OLD_BAD]")")
+    if [ "$GOT_A" = '[]' ] && [ "$GOT_B" = '[]' ]; then
+      pass "#1214: a recovered annex status wins over its own stale failure, in either connection order"
+    else
+      fail "#1214: stale status failure still decides the annex fallback (order A=$GOT_A order B=$GOT_B)"
+    fi
+
+    GOT_A=$(g1214_labels "$(g1214_annex "[$SC_OLD_OK,$SC_NEW_BAD]")")
+    GOT_B=$(g1214_labels "$(g1214_annex "[$SC_NEW_BAD,$SC_OLD_OK]")")
+    if [ "$GOT_A" = '["repo-lint-local=FAILURE"]' ] && [ "$GOT_B" = '["repo-lint-local=FAILURE"]' ]; then
+      pass "#1214: a current annex status failure is not hidden by its own stale success, in either connection order"
+    else
+      fail "#1214: stale status success still hides the current annex failure (order A=$GOT_A order B=$GOT_B)"
+    fi
+  fi
+fi
+
+if grep -q 'group_by(\[(.name // .context // "?"), (.kind // "")\])' "$SCRIPT"; then
+  pass "#1214: the annex conventional-name fallback groups by name AND surface"
+else
+  fail "#1214: the annex conventional-name fallback is back to grouping by name alone"
+fi
+
+# ── #1215: one app, two PRODUCER LINEAGES under one required context ───────
+#
+# A required context here is published twice under app 15368: the job-native
+# check run Actions materialises, and a Checks-API run POSTed by a gate
+# workflow. GitHub resolves the two independently and requires the newest of
+# EACH to be green. Measured on this repo own auto-merge history, which is the
+# only bypass-proof oracle: on #828 every native run was green from 00:20:23,
+# auto-merge withheld for 35 minutes, and fired 2 seconds after the Checks-API
+# entry turned green; on #835 it withheld 13 minutes and released 1 second
+# after the synthetic red was superseded. #1119 is the control in the other
+# direction -- a native failure still latest in its own suite did not block --
+# which is what rules the check suite out as the partition.
+#
+# #1193 partitioned by SURFACE. Both lineages are check runs, so they shared
+# one partition and the recency winner spoke for both: a native FAILURE
+# followed by a synthetic SUCCESS reported clean while GitHub blocked.
+#
+# The discriminator is externalId: Actions stamps a UUID on every job run and
+# an API POST leaves it empty. Verified live -- on the head of #1216 the
+# required context "CodeRabbit unresolved blocking findings" appears under both
+# lineages within app 15368.
+if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
+  g1215() {
+    printf '%s' "$1" | jq -c -f "$G1193_DIR/proj.jq" \
+      | jq -c --argjson requirements "[{\"context\":\"${2:-Merge clearance gate}\",\"app_id\":null}]" \
+              --arg requirements_state known --arg approval_readiness_only "0" \
+              --arg current_run_id "" \
+              --argjson lineage_contexts '["Merge clearance gate","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings"]' \
+              -f "$G1193_DIR/bad.jq" \
+      | jq -c '[.[] | "\(.lineage // "-"):\(.result)"] | sort'
+  }
+  G1215_NAT_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","externalId":"11111111-2222-3333-4444-555555555555","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
+  G1215_NAT_OK='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:06:00Z","completedAt":"2026-05-21T10:06:20Z","externalId":"66666666-7777-8888-9999-000000000000","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":2,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
+  # The synthetic lineage coalesces into whichever suite was created first on
+  # the head, so its reported workflow is one that publishes nothing. That is
+  # exactly why workflowName is the wrong key.
+  G1215_API_OK='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":".github/workflows/agent-review.yml","resourcePath":"/o/r/actions/workflows/agent-review.yml"}}}}'
+  G1215_API_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:04:00Z","completedAt":"2026-05-21T10:04:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":".github/workflows/agent-review.yml","resourcePath":"/o/r/actions/workflows/agent-review.yml"}}}}'
+  G1215_NAT_STALE_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T09:00:00Z","completedAt":"2026-05-21T09:00:20Z","externalId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":0,"workflow":{"name":"Merge Clearance Gate","resourcePath":"/o/r/actions/workflows/merge-clearance-gate.yml"}}}}'
+
+  GOT=$(g1215 "[$G1215_NAT_BAD,$G1215_API_OK]")
+  if [ "$GOT" = '["native:FAILURE"]' ]; then
+    pass "#1215: a later synthetic SUCCESS no longer masks the native FAILURE of the same required context"
+  else
+    fail "#1215: native FAILURE + later Checks-API SUCCESS must block on the native run, got $GOT"
+  fi
+
+  GOT=$(g1215 "[$G1215_API_BAD,$G1215_NAT_OK]")
+  if [ "$GOT" = '["api:FAILURE"]' ]; then
+    pass "#1215: a later native SUCCESS no longer masks the synthetic FAILURE of the same required context"
+  else
+    fail "#1215: Checks-API FAILURE + later native SUCCESS must block on the synthetic run, got $GOT"
+  fi
+
+  GOT=$(g1215 "[$G1215_API_OK,$G1215_NAT_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: both lineages green still clears gate (a)"
+  else
+    fail "#1215: both-lineages-green must not block, got $GOT"
+  fi
+
+  # #655 round 13, one level in: superseding still works WITHIN a lineage, and
+  # across suites, which is what rules out keying on the check suite (#1076).
+  GOT=$(g1215 "[$G1215_NAT_STALE_BAD,$G1215_NAT_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: inside one lineage, a superseded failure in its own suite still loses to the later success"
+  else
+    fail "#1215: the lineage partition broke across-suite superseding — that is the #1076 deadlock, got $GOT"
+  fi
+
+  # Totality: no externalId at all collapses to one lineage, which is the
+  # pre-#1215 single winner rather than an empty partition.
+  GOT=$(g1215 '[{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","isRequired":true},{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:20Z","isRequired":true}]')
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: entries carrying no externalId collapse to one lineage, as before the split"
+  else
+    fail "#1215: untyped-lineage entries changed verdict — the split must degrade to the pre-fix winner, got $GOT"
+  fi
+
+  # Review round 1, Codex P1 "preserve any-producer semantics across apps".
+  # The lineage split is scoped to a single producing app. Across apps the
+  # filter keeps the single recency winner it used before, so an unrelated
+  # same-named failure cannot become independently mandatory for a requirement
+  # its real producer satisfies.
+  G1215_FOREIGN_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:01:00Z","completedAt":"2026-05-21T10:01:20Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":57789},"workflowRun":null}}'
+  GOT=$(g1215 "[$G1215_FOREIGN_BAD,$G1215_NAT_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: across apps the single recency winner is unchanged, so a foreign same-named failure does not become mandatory"
+  else
+    fail "#1215: the lineage split leaked across apps and blocked on a foreign producer, got $GOT"
+  fi
+  # ... and the one-app split still fires when the same set is single-app.
+  GOT=$(g1215 "[$G1215_NAT_BAD,$G1215_API_OK]")
+  if [ "$GOT" = '["native:FAILURE"]' ]; then
+    pass "#1215: the one-app lineage split still fires after the cross-app scoping"
+  else
+    fail "#1215: scoping to one app disabled the split it exists for, got $GOT"
+  fi
+
+  # Review round 2, Codex P2 "restrict lineage splitting to controlled check
+  # producers". The two lineages exist only because this repository gate
+  # workflows POST with the Actions token, so the synthetic runs share the
+  # Actions app. A THIRD-PARTY app has no such duality, and external_id is
+  # optional for it: if it set the field on one run and omitted it on the next,
+  # a stale failure and its own recovery would land in different partitions and
+  # the stale failure would block forever. That is a permanent block, which is
+  # worse than the fail-open being closed.
+  G1215_TP_STALE_BAD='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T09:00:00Z","completedAt":"2026-05-21T09:00:20Z","externalId":"tp-run-1","isRequired":true,"checkSuite":{"app":{"databaseId":99999},"workflowRun":null}}'
+  G1215_TP_FRESH_OK='{"__typename":"CheckRun","name":"Merge clearance gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":99999},"workflowRun":null}}'
+  GOT=$(g1215 "[$G1215_TP_STALE_BAD,$G1215_TP_FRESH_OK]")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: a third-party app that varies external_id between reruns is not split, so its stale failure cannot block forever"
+  else
+    fail "#1215: the lineage heuristic was applied to a third-party app and its stale failure now blocks permanently, got $GOT"
+  fi
+
+  # Review round 3, Codex P2 "limit lineage splitting to the guarded contexts".
+  # The Actions app is not confined to the gate workflows: auto-clear also POSTs
+  # check runs with the same token, and a consumer can publish anything. A
+  # context this repository does not publish has no guarded discriminator, so
+  # splitting it would fold a synthetic entry into the native lineage on a
+  # field its producer was never asked to leave empty. Same app, same two
+  # lineages, a name we do not own: must NOT split.
+  G1215_OTHER_NAT_BAD='{"__typename":"CheckRun","name":"consumer-local-gate","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:00:20Z","externalId":"11111111-2222-3333-4444-555555555555","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"Consumer Gate","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+  G1215_OTHER_API_OK='{"__typename":"CheckRun","name":"consumer-local-gate","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:05:00Z","completedAt":"2026-05-21T10:05:00Z","externalId":"","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":9,"workflow":{"name":"Consumer Gate","resourcePath":"/o/r/actions/workflows/consumer.yml"}}}}'
+  GOT=$(g1215 "[$G1215_OTHER_NAT_BAD,$G1215_OTHER_API_OK]" "consumer-local-gate")
+  if [ "$GOT" = '[]' ]; then
+    pass "#1215: a required context this repository does not publish keeps the single recency winner, even under the Actions app"
+  else
+    fail "#1215: the lineage split reached a context with no guarded publisher, got $GOT"
+  fi
+fi
+
+# Review round 1, Codex P2 "verify externalId inside the GraphQL selection".
+# A bare grep for the token passes even when the QUERY drops it, because the
+# same word appears in the projection and in comments — and the behavioural
+# fixtures inject externalId directly, so they would keep passing while
+# production collapsed every check run into one lineage. Assert it inside the
+# CheckRun selection block, extracted from the real query.
+if [ "$G1193_EXTRACTION_OK" -eq 1 ]; then
+  cat > "$G1193_DIR/frag.awk" <<'AWK'
+BEGIN { start = "                      ... on CheckRun {"; stop = "                      }" }
+$0 == start { started = 1; next }
+started { if ($0 == stop) { exit } print }
+AWK
+  awk -f "$G1193_DIR/frag.awk" "$SCRIPT" > "$G1193_DIR/frag.txt"
+  if [ ! -s "$G1193_DIR/frag.txt" ]; then
+    fail "#1215: could not extract the CheckRun GraphQL selection from $SCRIPT — the anchor moved, so the lineage-field guard is testing nothing"
+  elif grep -qE '^[[:space:]]*externalId[[:space:]]*$' "$G1193_DIR/frag.txt"; then
+    pass "#1215: externalId is selected inside the CheckRun GraphQL fragment, not merely mentioned elsewhere in the file"
+  else
+    fail "#1215: the CheckRun GraphQL selection does not request externalId — production would collapse every check run into one lineage while the fixtures kept passing"
+  fi
+fi
+
+# The discriminator rests on an OPTIONAL Checks-API field. A synthetic
+# publisher that set external_id would be classified native and the two
+# timelines would re-merge silently. Nothing in this repository sets it; this
+# asserts nothing starts.
+# Scoped to the workflows that actually publish the affected required contexts
+# (#1215 review round 2, Codex P2). A repository-wide substring scan was wrong
+# twice over: this suite is propagated to every consumer and runs in the
+# required lint context, so a consumer workflow that merely MENTIONS
+# external_id — in a comment, or when reading a response, or for an unrelated
+# check run — would red that consumer forever, and the consumer could not fix
+# it because the hub owns this file. Absent files are skipped, since a consumer
+# need not carry every gate workflow.
+# codex-feedback-archive-relay.yml publishes "Codex P1 unresolved threads" too
+# (#1215 review round 3, Codex P2) — it was missing here, so a discriminator
+# regression in the relay would not have been caught.
+G1215_PUBLISHERS="merge-clearance-gate.yml codex-p1-gate.yml coderabbit-severity-gate.yml codex-feedback-archive-relay.yml required-check-publisher.yml"
+G1215_EXTID_SETTERS=""
+G1215_PUBLISHERS_SEEN=0
+for g1215_wf in $G1215_PUBLISHERS; do
+  [ -f ".github/workflows/$g1215_wf" ] || continue
+  G1215_PUBLISHERS_SEEN=$((G1215_PUBLISHERS_SEEN + 1))
+  if grep -q "external_id" ".github/workflows/$g1215_wf" 2>/dev/null; then
+    G1215_EXTID_SETTERS="$G1215_EXTID_SETTERS $g1215_wf"
+  fi
+done
+if [ "$G1215_PUBLISHERS_SEEN" -eq 0 ]; then
+  echo "SKIP: #1215 external_id guard (no known check-run publisher workflow present)"; SKIP=$((SKIP + 1))
+elif [ -z "$G1215_EXTID_SETTERS" ]; then
+  pass "#1215: no check-run publisher sets external_id, so the lineage discriminator holds for the Actions app"
+else
+  fail "#1215: a check-run publisher now sets external_id ($G1215_EXTID_SETTERS) — its synthetic run would be classified native and the lineage split would silently collapse"
+fi
+if grep -qF 'map(select((.lineage // "") == $l)) | current_entry' "$SCRIPT" \
+   && grep -qF '($apps | length) == 1 and ($apps[0] == "15368")' "$SCRIPT" \
+   && grep -qF '($lineage_contexts | index($ctx)) != null' "$SCRIPT"; then
+  pass "#1215: the lineage split is scoped to one surface, one app, and a named owned context"
+else
+  fail "#1215: the lineage split lost its surface, single-app or owned-context scoping"
+fi
+
+# The context list is a hard-coded constant, so hold it to the workflows rather
+# than to a comment (#1215 review round 3, "preferably by inspecting the actual
+# POST payloads"). Every CHECK_NAME a check-run publisher emits must either be
+# in the script list or be a name that is deliberately not a required context.
+G1215_LIST=$(sed -n 's/^LINEAGE_SPLIT_CONTEXTS_JSON=.\(.*\).$/\1/p' "$SCRIPT")
+if [ -z "$G1215_LIST" ]; then
+  fail "#1215: could not read LINEAGE_SPLIT_CONTEXTS_JSON from $SCRIPT — the context list guard is testing nothing"
+else
+  G1215_UNLISTED=""
+  for g1215_wf in $G1215_PUBLISHERS; do
+    [ -f ".github/workflows/$g1215_wf" ] || continue
+    while IFS= read -r g1215_name; do
+      [ -n "$g1215_name" ] || continue
+      # The publisher ships shadow-suffixed names while it is not yet live;
+      # those are not required contexts and are covered by their live twin.
+      case "$g1215_name" in *" (shadow)") continue ;; esac
+      case "$G1215_LIST" in *"\"$g1215_name\""*) ;; *) G1215_UNLISTED="$G1215_UNLISTED $g1215_wf:$g1215_name" ;; esac
+    done <<EOF2
+$(grep -hoE '(CHECK_NAME|[A-Z_]+_CONTEXT): *"?[^"$]*"?' ".github/workflows/$g1215_wf" 2>/dev/null | sed 's/^[A-Z_]*: *//' | tr -d '"' | sort -u)
+EOF2
+  done
+  if [ -z "$G1215_UNLISTED" ]; then
+    pass "#1215: every context a check-run publisher emits is named in the lineage-split list"
+  else
+    fail "#1215: a check-run publisher emits a context missing from LINEAGE_SPLIT_CONTEXTS_JSON ($G1215_UNLISTED) — that context would keep the pre-fix single winner while its publisher goes unguarded"
+  fi
+fi
+
+rm -rf "$G1193_DIR"
+trap - EXIT
 
 echo ""
 echo "test_codex_review_check_required_checks: $PASS passed, $FAIL failed"

@@ -157,6 +157,12 @@ DEPENDABOT_BASE=$(jq -c '
   .author.login = "dependabot[bot]" |
   .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}
 ' <<<"$BASE")
+# `gh pr view --json author` — the subject's only author source — renders bot
+# logins as `app/<slug>`, so this is the spelling the boundary sees in CI.
+DEPENDABOT_APP_BASE=$(jq -c '
+  .author.login = "app/dependabot" |
+  .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}
+' <<<"$BASE")
 
 run_case() {
   local -a subject_args=(7 owner/repo)
@@ -309,6 +315,59 @@ if run_case \
   pass "normal approval continuation defers Dependabot to its dedicated lane"
 else
   fail "normal approval continuation interfered with Dependabot's dedicated lane"
+fi
+
+# The fixtures above spell the bot `dependabot[bot]`, which is the REST /
+# Actions-context rendering. Every author read in the subject comes from
+# `gh pr view --json author`, and gh renders bot logins as `app/<slug>`, so
+# `app/dependabot` is the spelling the boundary ACTUALLY receives in CI. The
+# suite stubbing only the REST form is why the boundary could silently stop
+# matching without a single test going red: the exemption never fired, and
+# the sweeps' `gh pr merge --disable-auto` against Dependabot's durable arm
+# was held off only by the retraction token's 403.
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_INITIAL="$DEPENDABOT_APP_BASE"
+STUB_FINAL="$DEPENDABOT_APP_BASE"
+if run_case \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'Dependabot PR is owned by the dedicated auto-merge lane' "$TMP/subject.out"; then
+  pass "protective-only continuation preserves Dependabot's durable arm under the gh app/ login"
+else
+  fail "protective-only continuation disabled Dependabot auto-merge under the gh app/ login"
+fi
+
+reset_fixtures
+STUB_INITIAL="$DEPENDABOT_APP_BASE"
+STUB_FINAL="$DEPENDABOT_APP_BASE"
+if run_case \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/readiness.log" ] \
+   && grep -Fq 'Dependabot PR is owned by the dedicated auto-merge lane' "$TMP/subject.out"; then
+  pass "normal approval continuation defers the gh app/ Dependabot login to its dedicated lane"
+else
+  fail "normal approval continuation interfered with Dependabot under the gh app/ login"
+fi
+
+# Closest false positive to the widened match: the exemption must accept the
+# two exact native logins and nothing that merely starts with one. A prefix
+# test — or an unquoted `case` pattern, where `dependabot[bot]` is a
+# character class — would hand an outside contributor a way to park an
+# unretractable arm behind a lookalike login.
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_INITIAL=$(jq -c '
+  .author.login = "app/dependabot-lookalike" |
+  .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}
+' <<<"$BASE")
+STUB_SECOND="$STUB_INITIAL"
+STUB_THIRD=$(jq -c '.autoMergeRequest = null' <<<"$STUB_INITIAL")
+if run_case \
+   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
+   && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
+  pass "gh app/ Dependabot lookalike logins remain inside protective retraction"
+else
+  fail "Dependabot exemption matched more than the two exact native bot logins"
 fi
 
 reset_fixtures

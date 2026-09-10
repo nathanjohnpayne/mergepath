@@ -11,7 +11,7 @@
 #   1. `gh repo create` is invoked with the right flags (visibility,
 #      description, source — and NOT --push, which is now its own
 #      command under the same verified author credential).
-#   2. All 12 canonical labels are seeded with --force (idempotency).
+#   2. All 19 canonical labels are seeded with --force (idempotency).
 #   3. Reviewer invitations land via `gh api -X PUT` to the right
 #      collaborator endpoint for each agent in BOOTSTRAP_INPUT_REVIEWERS.
 #   4. REVIEWER_ASSIGNMENT_TOKEN provisioning uses the inline-PAT
@@ -156,6 +156,14 @@ case "$1" in
     esac
     ;;
   label)
+    # $3 is the label name for `gh label create <name> ...`.
+    # GH_SHIM_FAIL_LABEL fails exactly ONE named label so a test can prove
+    # the seed loop continues past it; SHIM_EXIT_LABEL keeps its existing
+    # all-or-nothing meaning for the callers that already use it.
+    if [ -n "${GH_SHIM_FAIL_LABEL:-}" ] && [ "${3:-}" = "$GH_SHIM_FAIL_LABEL" ]; then
+      echo "gh: HTTP 422: Validation Failed (label create $3)" >&2
+      exit 1
+    fi
     exit "${SHIM_EXIT_LABEL:-0}"
     ;;
   api)
@@ -264,8 +272,14 @@ echo "$out" | grep -q "push bootstrap commit to nathanjohnpayne/test-repo" \
   && pass "the bootstrap commit landed on the remote's main" \
   || fail "remote has no main after the push: $(git -C "$WORKDIR/remotes/test-repo.git" branch -a 2>&1)"
 
-# --- assertion 2: all 12 labels seeded with --force ---
-expected_labels=(needs-external-review needs-human-review policy-violation human-hold human-action decision-needed agent-action phase-0 phase-1 phase-2 phase-3 phase-4)
+# --- assertion 2: all 19 labels seeded with --force ---
+# Hard-coded on purpose: this is an INDEPENDENT assertion of the intended
+# set, not a mirror of BOOTSTRAP_LABELS. Deriving it from the array would
+# make the test pass trivially if the array were emptied or mis-parsed.
+# The `size:` / `priority:` names carry a colon, which is exactly what the
+# old `name:color:description` encoding could not express — a regression to
+# ':' would seed a label named `size` and fail these entries.
+expected_labels=(needs-external-review needs-human-review policy-violation human-hold human-action decision-needed agent-action phase-0 phase-1 phase-2 phase-3 phase-4 size:S size:M size:L priority:critical priority:high priority:normal priority:low)
 seeded=0
 for label in "${expected_labels[@]}"; do
   if grep -qE "^gh label create $label .* --force\$" "$SHIM_LOG"; then
@@ -274,9 +288,129 @@ for label in "${expected_labels[@]}"; do
     fail "label '$label' not seeded with --force; log: $(grep "label create $label" "$SHIM_LOG")"
   fi
 done
-[ "$seeded" -eq 12 ] \
-  && pass "all 12 canonical labels seeded with --force" \
-  || fail "expected 12 labels, got $seeded"
+[ "$seeded" -eq 19 ] \
+  && pass "all 19 canonical labels seeded with --force" \
+  || fail "expected 19 labels, got $seeded"
+
+# --- assertion 2b: the malformed-spec guard fails CLOSED (Codex P2, #1182) ---
+# The parse uses ${var%%|*} / ${var#*|}, which return the input UNCHANGED
+# when the separator is absent. A one-separator entry therefore does not
+# fail on its own — it aliases two fields onto one value:
+# "future-label|abcdef" yields color=abcdef AND desc=abcdef, which passes
+# a colour-only check and creates a label with its colour copied into its
+# description. Drive the REAL _seed_labels so this asserts the shipped
+# path, not a re-implementation of it.
+#
+# Writes to its OWN shim log: $SHIM_LOG still holds the happy-path run that
+# the invite / secret-set assertions below read, and truncating it here
+# would fail them from a distance.
+GUARD_LOG="$WORKDIR/gh-shim-labelguard.log"
+: >"$GUARD_LOG"
+set +e
+malformed_out=$(PATH="$SHIM_PATH" SHIM_LOG="$GUARD_LOG" bash -c '
+  ROOT="'"$ROOT"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/github-infra.sh"
+  BOOTSTRAP_STATE_FILE=""
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1
+  # One separator (the Codex case), none at all, a non-hex colour, and an
+  # empty name / empty description — then one WELL-FORMED entry whose name
+  # and description both carry colons, and one whose description carries
+  # the separator itself, to prove the guard rejects only the bad ones.
+  BOOTSTRAP_LABELS=(
+    "future-label|abcdef"
+    "no-separators-at-all"
+    "bad-colour|zzzzzz|nope"
+    "|abcdef|empty name"
+    "empty-desc|abcdef|"
+    "size:S|c2e0c6|Small: one or a few files."
+    "piped|abcdef|desc|with|pipes"
+  )
+  bootstrap::_seed_labels "nathanjohnpayne/guard-repo"
+' 2>&1)
+malformed_rc=$?
+set -e
+# The skip must be non-fatal. Without this the log assertions below would
+# all pass against an implementation that seeded the valid specs and THEN
+# returned nonzero for a malformed one.
+[ "$malformed_rc" -eq 0 ] \
+  && pass "a malformed spec leaves _seed_labels returning 0 (skip is non-fatal)" \
+  || fail "_seed_labels returned $malformed_rc on malformed specs; out: $malformed_out"
+for bad in future-label no-separators-at-all bad-colour empty-desc; do
+  grep -q "^gh label create $bad " "$GUARD_LOG" \
+    && fail "malformed spec '$bad' reached gh label create; log: $(cat "$GUARD_LOG")" \
+    || pass "malformed spec '$bad' never reached gh label create"
+done
+# Every malformed CLASS must be named in a warning. Asserting only the
+# separator case would pass against an implementation that silently
+# dropped a bad colour or an empty field — the same silent-skip failure
+# the guard exists to prevent.
+for badspec in "future-label|abcdef" "no-separators-at-all" "bad-colour|zzzzzz|nope" "|abcdef|empty name" "empty-desc|abcdef|"; do
+  printf '%s' "$malformed_out" | grep -qF "$badspec" \
+    && pass "malformed spec '$badspec' is named in a warning rather than silently dropped" \
+    || fail "no warning named malformed spec '$badspec'; out: $malformed_out"
+done
+# The empty-name spec needs its OWN assertion. The loop above matches on the
+# spec's name, so it cannot express "no call was made with an EMPTY name" —
+# a regression that warned and then ran `gh label create ""` would pass it.
+# An empty first argument collapses to `create --repo` (or a double space).
+grep -qE "^gh label create( +--repo| +$|$)" "$GUARD_LOG" \
+  && fail "an empty-name spec reached gh label create; log: $(cat "$GUARD_LOG")" \
+  || pass "the empty-name spec never reached gh label create with an empty name"
+
+grep -q "^gh label create size:S --repo nathanjohnpayne/guard-repo --color c2e0c6 " "$GUARD_LOG" \
+  && pass "a colon-bearing name still seeds with its own colour after the guard" \
+  || fail "well-formed colon-bearing spec was rejected by the guard; log: $(cat "$GUARD_LOG")"
+grep -q -- "--description desc|with|pipes --force$" "$GUARD_LOG" \
+  && pass "a description containing the separator round-trips intact" \
+  || fail "pipe-bearing description did not round-trip; log: $(cat "$GUARD_LOG")"
+[ "$(grep -c '^gh label create ' "$GUARD_LOG")" -eq 2 ] \
+  && pass "exactly the 2 well-formed specs were seeded (5 malformed skipped, none fatal)" \
+  || fail "expected 2 seeded labels, got $(grep -c '^gh label create ' "$GUARD_LOG"); log: $(cat "$GUARD_LOG")"
+
+# --- assertion 2c: a failed label create is RECORDED, not just warned (#1182) ---
+# bootstrap::warn writes to stderr only. A failed `gh label create` is
+# non-fatal, so under warn the failure scrolled past while the stage
+# summary still reported the full label count as done — the operator had
+# no surviving signal that the set was short. record_warning persists to
+# the warnings sidecar the summary reads. Assert the SIDECAR, because
+# that is the property the summary depends on; asserting stderr would
+# pass just as well under the old broken behaviour.
+LBLFAIL_TARGET="$WORKDIR/label-failure-record"
+rm -rf "$LBLFAIL_TARGET"; mkdir -p "$LBLFAIL_TARGET"
+LBLFAIL_LOG="$WORKDIR/gh-shim-labelfail.log"
+: >"$LBLFAIL_LOG"
+set +e
+lblfail_out=$(PATH="$SHIM_PATH" SHIM_LOG="$LBLFAIL_LOG" GH_SHIM_FAIL_LABEL="flaky-label" bash -c '
+  ROOT="'"$ROOT"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/github-infra.sh"
+  BOOTSTRAP_STATE_FILE="'"$LBLFAIL_TARGET"'/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1
+  BOOTSTRAP_LABELS=(
+    "flaky-label|abcdef|this one fails at the API"
+    "good-label|c2e0c6|this one succeeds"
+  )
+  bootstrap::_seed_labels "nathanjohnpayne/labelfail-repo"
+  echo "SEED_RC=$?"
+' 2>&1)
+set -e
+printf '%s' "$lblfail_out" | grep -q "SEED_RC=0" \
+  && pass "a single label failure stays non-fatal (the stage continues)" \
+  || fail "label failure became fatal; out: $lblfail_out"
+grep -q "^gh label create good-label " "$LBLFAIL_LOG" \
+  && pass "the label after a failing one is still attempted" \
+  || fail "a failing label aborted the remaining seeds; log: $(cat "$LBLFAIL_LOG")"
+grep -q "flaky-label" "$LBLFAIL_TARGET/.bootstrap-state.warnings" 2>/dev/null \
+  && pass "the failed label create is RECORDED in the warnings sidecar the summary reads" \
+  || fail "failed label create left no record for the summary; sidecar: $(cat "$LBLFAIL_TARGET/.bootstrap-state.warnings" 2>/dev/null || echo '<absent>')"
+grep -q "labelfail-repo" "$LBLFAIL_TARGET/.bootstrap-state.warnings" 2>/dev/null \
+  && pass "the record names the repo the label failed on" \
+  || fail "the record does not name the target repo; sidecar: $(cat "$LBLFAIL_TARGET/.bootstrap-state.warnings" 2>/dev/null)"
 
 # --- assertion 3: reviewer collaborator invites ---
 for agent in claude cursor codex; do

@@ -31,6 +31,112 @@ PASS=0; FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
+# ── #1157: mutable Codex Review Summary issue comment ---------------------
+#
+# The connector now creates one marker-tagged summary comment while a review
+# is Running, then edits that same comment to Completed. The Code Review row
+# carries an abbreviated commit, so diagnostic mode can use Completed as
+# exact-head completion evidence even when a clean pass produced no review
+# object and no legacy `Reviewed commit:` verdict. Running is liveness only.
+SUMMARY_SELECTOR=$(sed -n \
+  '/^# BEGIN codex_review_summary_selector$/,/^# END codex_review_summary_selector$/p' \
+  "$SCRIPT")
+if [ -n "$SUMMARY_SELECTOR" ] \
+   && grep -q '^crc_select_codex_review_summary()' <<<"$SUMMARY_SELECTOR" \
+   && grep -q 'codex-pull-request-review-summary' <<<"$SUMMARY_SELECTOR" \
+   && grep -q 'updated_at' <<<"$SUMMARY_SELECTOR"; then
+  eval "$SUMMARY_SELECTOR"
+  pass "#1157: codex-review-check.sh exposes the marker-scoped mutable summary selector"
+else
+  fail "#1157: codex-review-check.sh is missing the marker-scoped mutable summary selector"
+fi
+
+SUMMARY_BOT="chatgpt-codex-connector[bot]"
+SUMMARY_HEAD="d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"
+
+summary_body() { # status commit trigger
+  printf '<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | %s | `%s` | %s |\n\n<details><summary>ℹ️ About Codex in GitHub</summary></details>' "$1" "$2" "$3"
+}
+
+mk_summary() { # login body created updated id
+  jq -n --arg login "$1" --arg body "$2" --arg created "$3" --arg updated "$4" --argjson id "$5" \
+    '[{user:{login:$login},body:$body,created_at:$created,updated_at:$updated,id:$id}]'
+}
+
+run_summary() {
+  crc_select_codex_review_summary "$1" "$SUMMARY_BOT" "$SUMMARY_HEAD"
+}
+
+if declare -F crc_select_codex_review_summary >/dev/null 2>&1; then
+  SUMMARY_COMPLETED=$(mk_summary "$SUMMARY_BOT" \
+    "$(summary_body '✅ **Completed** <relative-time datetime="2026-08-30T07:19:37Z">now</relative-time>' d05ff4d0 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 101)
+  GOT=$(run_summary "$SUMMARY_COMPLETED")
+  if [ "$(echo "$GOT" | jq -r '[.status,.commit,.observed_at,.trigger] | @tsv')" = $'completed\td05ff4d0\t2026-08-30T07:19:41Z\tManual request' ]; then
+    pass "#1157 summary: exact-head Completed uses edited updated_at as terminal time"
+  else
+    fail "#1157 summary: exact-head Completed parse mismatch: $GOT"
+  fi
+
+  SUMMARY_RUNNING=$(mk_summary "$SUMMARY_BOT" \
+    "$(summary_body '🔄 **Running** since 1 minute ago' d05ff4d0 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:17:18Z" 102)
+  GOT=$(run_summary "$SUMMARY_RUNNING")
+  if [ "$(echo "$GOT" | jq -r '[.status,.commit,.observed_at] | @tsv')" = $'running\td05ff4d0\t2026-08-30T07:17:18Z' ]; then
+    pass "#1157 summary: exact-head Running is represented distinctly from Completed"
+  else
+    fail "#1157 summary: exact-head Running parse mismatch: $GOT"
+  fi
+
+  STALE=$(mk_summary "$SUMMARY_BOT" \
+    "$(summary_body '✅ **Completed** now' aaaa1111 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 103)
+  if [ "$(run_summary "$STALE")" = "null" ]; then
+    pass "#1157 summary: stale commit prefix is rejected"
+  else
+    fail "#1157 summary: stale commit prefix was accepted"
+  fi
+
+  WRONG_AUTHOR=$(mk_summary "nathanjohnpayne" \
+    "$(summary_body '✅ **Completed** now' d05ff4d0 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 104)
+  if [ "$(run_summary "$WRONG_AUTHOR")" = "null" ]; then
+    pass "#1157 summary: a human-authored lookalike is rejected"
+  else
+    fail "#1157 summary: a human-authored lookalike was accepted"
+  fi
+
+  NO_MARKER_BODY=$(summary_body '✅ **Completed** now' d05ff4d0 'Manual request' | sed '1d')
+  NO_MARKER=$(mk_summary "$SUMMARY_BOT" "$NO_MARKER_BODY" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 105)
+  if [ "$(run_summary "$NO_MARKER")" = "null" ]; then
+    pass "#1157 summary: an unmarked bot table is rejected"
+  else
+    fail "#1157 summary: an unmarked bot table was accepted"
+  fi
+
+  TWO=$(jq -n --arg bot "$SUMMARY_BOT" --arg old "$(summary_body '✅ **Completed** now' d05ff4d0 'PR opened')" --arg new "$(summary_body '🔄 **Running** since 1 minute ago' d05ff4d0 'Manual request')" '[
+    {user:{login:$bot},body:$old,created_at:"2026-08-30T07:00:00Z",updated_at:"2026-08-30T07:05:00Z",id:106},
+    {user:{login:$bot},body:$new,created_at:"2026-08-30T07:10:00Z",updated_at:"2026-08-30T07:11:00Z",id:107}
+  ]')
+  GOT=$(run_summary "$TWO")
+  if [ "$(echo "$GOT" | jq -r '[.status,.comment_id] | @tsv')" = $'running\t107' ]; then
+    pass "#1157 summary: newest exact-head edited comment wins"
+  else
+    fail "#1157 summary: newest exact-head edited comment did not win: $GOT"
+  fi
+fi
+
+if grep -q 'LATEST_SIGNAL_KIND="summary"' "$SCRIPT" \
+   && grep -q '\[ -n "\$CODEX_SUMMARY_STATUS" \]' "$SCRIPT" \
+   && grep -q 'if \[ "\$CODEX_SUMMARY_STATUS" = "completed" \]; then' "$SCRIPT" \
+   && grep -q 'head-anchored Completed Codex review summary' "$SCRIPT" \
+   && grep -q 'Codex review summary is Running on current HEAD' "$SCRIPT"; then
+  pass "#1157: latest summary state participates in diagnostic ordering; Completed clears and Running does not"
+else
+  fail "#1157: diagnostic gate does not order both summary states or distinguish Completed from Running"
+fi
+
 # ── 1. Structural: the shared verdict signal is computed from issue
 #      comments, gated on codex.enabled, HEAD-anchored + affirmative-matched,
 #      and referenced to #600.

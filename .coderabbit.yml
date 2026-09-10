@@ -91,17 +91,21 @@ knowledge_base:
   # across the whole org/owner), auto (= local for PUBLIC repos, global for
   # PRIVATE repos).
   #
-  # We keep `auto` deliberately. As of 2026-07-06 the ENTIRE fleet is
-  # PUBLIC (matchline, overridebroadway, and tadlockpsychiatry were
-  # private earlier and have since been made public), so `auto` resolves
-  # to `local` everywhere — this template repo and every consumer alike.
-  # No consumer shares learnings org-wide; each repo's learnings stay
-  # local to that repo. (.coderabbit.yml is NOT propagated —
-  # .mergepath-sync.yml — so each consumer ships its own copy, but the
-  # resolution is the same `local` for all now the fleet is uniformly
-  # public.) If cross-repo convention sharing is ever wanted again across
-  # the public fleet, it would take an explicit `scope: global` override —
-  # `auto` will not grant `global` to a public repo. See
+  # We keep `auto` deliberately. From 2026-07-06 until 2026-09-01 every
+  # consumer was public and `auto` resolved to `local` everywhere; from
+  # 2026-09-01 device-source-of-truth was PRIVATE and resolved to
+  # `global`, making the fleet briefly non-uniform. That repo was dropped
+  # as a consumer on 2026-09-05, so all seven remaining consumers and
+  # this template repo are public and resolve to `local` again. Do not
+  # read that as permanent — it is a consequence of current visibility,
+  # not of the `auto` setting. (.coderabbit.yml is NOT propagated —
+  # see .mergepath-sync.yml — so each consumer ships its own copy, and
+  # each copy resolves by ITS OWN repo's visibility.) Deciding whether a
+  # scope override is needed means checking that repo's current
+  # visibility, not this comment. Uniform `local` regardless of
+  # visibility would take an explicit `scope: local` on the private repo;
+  # `global` on a public repo would take an explicit `scope: global`,
+  # since `auto` will not grant it. See
   # docs/agents/coderabbit-audit.md § learnings.scope.
   learnings:
     scope: auto

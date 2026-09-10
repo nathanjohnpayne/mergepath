@@ -160,7 +160,7 @@ jobs:
           # NOTE (unfixed here, deliberately): the `lint` default is a
           # proxy signal, not the actual merge gate. It is only ever "a
           # check we expect to be green on HEAD" — it is NOT read from
-          # branch protection's required contexts. In gaycruisebingo, for
+          # branch protection's required contexts. In fiveacross, for
           # instance, the five genuinely-required contexts are CodeRabbit
           # unresolved blocking findings / Codex P1 unresolved threads /
           # Label Gate / Merge clearance gate / Self-Review Required, and
