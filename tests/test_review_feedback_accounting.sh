@@ -2189,6 +2189,70 @@ bash -c '
   ghas_severity_cache_cleanup
 ' || CLEANUP_TMP_RC=$?
 assert_eq 0 "$CLEANUP_TMP_RC" "ghas_severity_cache_cleanup with a set cache var succeeds"
+
+# Codex P2, PR #1124: the cache holds repository names, alert numbers and
+# security severities, so an update must never widen its mode. The old write
+# path opened a predictable `$CACHE.tmp` by redirection -- 0644 under the usual
+# 022 umask -- and renamed it over the 0600 mktemp cache.
+CACHE_MODE_OUT=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  gh_api_scalar() { printf "high"; }
+  umask 022
+  ghas_severity_cache_init
+  ghas_alert_severity acme/widget 50 >/dev/null
+  ls -l "$GHAS_SEVERITY_CACHE" | cut -c1-10
+  rm -f "$GHAS_SEVERITY_CACHE"
+' 2>/dev/null || true)
+assert_eq "-rw-------" "$CACHE_MODE_OUT" "severity cache stays 0600 after an update under a 022 umask (Codex P2, #1124)"
+
+# The false-positive guard for that fix: the update must still actually land,
+# not merely be mode-correct because it never happened.
+CACHE_VALUE_OUT=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  gh_api_scalar() { printf "high"; }
+  ghas_severity_cache_init
+  ghas_alert_severity acme/widget 50 >/dev/null
+  jq -r ".[\"acme/widget#50\"] // \"MISSING\"" "$GHAS_SEVERITY_CACHE"
+  rm -f "$GHAS_SEVERITY_CACHE"
+' 2>/dev/null || true)
+assert_eq "high" "$CACHE_VALUE_OUT" "the memoized severity is actually written to the cache (#1124)"
+
+# And cleanup must still sweep a randomized update file a killed process left.
+CACHE_SWEEP_FILE="$TMP/ghas-sweep-cache"
+: >"$CACHE_SWEEP_FILE"
+: >"$CACHE_SWEEP_FILE.update.ABC123"
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$CACHE_SWEEP_FILE"'"
+  ghas_severity_cache_cleanup
+' || true
+if [ -f "$CACHE_SWEEP_FILE.update.ABC123" ]; then
+  fail "ghas_severity_cache_cleanup sweeps a leftover randomized .update file (Codex P2, #1124)"
+else
+  pass "ghas_severity_cache_cleanup sweeps a leftover randomized .update file (Codex P2, #1124)"
+fi
+
+# Codex P1, PR #1124: codex-p1-gate.yml must not extract an alert number or
+# perform the privileged security-events read from a commenter-controlled body
+# before confirming the source is a configured-GHAS INLINE comment. Asserted
+# structurally, because the vulnerable ordering is the bug: extraction textually
+# preceding the author guard is exactly what let a non-GHAS commenter plant a
+# guessed alert URL and have Actions resolve it.
+P1_GATE_WF="$ROOT/.github/workflows/codex-p1-gate.yml"
+GUARD_LINE=$(grep -n 'if \[ "\$source_kind" = "inline" \] && \[ "\$source_login" = "\$ghas_bot_login" \]; then' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+EXTRACT_LINE=$(grep -n 'alert_number=\$(ghas_alert_number_from_body' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+LOOKUP_LINE=$(grep -n 'ghas_severity=\$(ghas_alert_severity "\$REPO" "\$alert_number")' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+if [ -n "$GUARD_LINE" ] && [ -n "$EXTRACT_LINE" ] && [ -n "$LOOKUP_LINE" ] \
+   && [ "$GUARD_LINE" -lt "$EXTRACT_LINE" ] && [ "$GUARD_LINE" -lt "$LOOKUP_LINE" ]; then
+  pass "codex-p1-gate.yml gates alert extraction and the privileged read on a GHAS inline source (Codex P1, #1124)"
+else
+  fail "codex-p1-gate.yml gates alert extraction and the privileged read on a GHAS inline source (Codex P1, #1124) — guard=$GUARD_LINE extract=$EXTRACT_LINE lookup=$LOOKUP_LINE"
+fi
 if [ -f "$CLEANUP_TMP_FILE" ] || [ -f "$CLEANUP_TMP_FILE.tmp" ]; then
   fail "ghas_severity_cache_cleanup removes both the cache file and its .tmp sibling (#1124)"
 else

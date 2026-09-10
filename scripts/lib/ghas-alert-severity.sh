@@ -97,15 +97,16 @@ ghas_severity_cache_cleanup() {
   # GHAS_SEVERITY_CACHE (e.g. ghas_severity_cache_init itself failed) must
   # never make this return non-zero, or a cleanup helper would get to
   # decide the gate's verdict (CodeRabbit, PR #1124). Also remove the
-  # `.tmp` sibling the write path in ghas_alert_severity can leave behind
-  # if jq or mv fails mid-write.
+  # `.tmp` sibling older revisions wrote, plus any randomized
+  # `.update.XXXXXX` file the current write path can leave behind if the
+  # process is killed between mktemp and mv (Codex P2, PR #1124).
   if [ -n "${GHAS_SEVERITY_CACHE:-}" ]; then
     # `|| :` is load-bearing, not cosmetic (CodeRabbit, PR #1124): under
     # `set -e`, `rm -f` FAILING (a real removal failure -- permissions, a
     # read-only filesystem -- `-f` only silences "already gone") would
     # itself abort this function before reaching `return 0` below, the
     # exact bug this rewrite exists to close, just moved one line down.
-    rm -f "$GHAS_SEVERITY_CACHE" "$GHAS_SEVERITY_CACHE.tmp" || :
+    rm -f "$GHAS_SEVERITY_CACHE" "$GHAS_SEVERITY_CACHE.tmp" "$GHAS_SEVERITY_CACHE".update.* || :
   fi
   return 0
 }
@@ -120,7 +121,7 @@ ghas_alert_severity() {
     printf '[ghas-alert-severity] ERROR: usage: ghas_alert_severity <owner/repo> <alert_number>\n' >&2
     return 3
   fi
-  local repo="$1" number="$2" cache_key value rc
+  local repo="$1" number="$2" cache_key value rc cache_tmp
 
   if [ -z "$repo" ] || [ -z "$number" ]; then
     printf '[ghas-alert-severity] ERROR: usage: ghas_alert_severity <owner/repo> <alert_number>\n' >&2
@@ -160,8 +161,23 @@ ghas_alert_severity() {
   # severity", which it is not. Warn instead: a caller that hits this
   # simply re-fetches next time for the same alert number, which is a
   # missed-memoization cost, not a correctness one.
-  if ! { jq -c --arg k "$cache_key" --arg v "$value" '.[$k] = $v' "$GHAS_SEVERITY_CACHE" \
-    >"$GHAS_SEVERITY_CACHE.tmp" && mv "$GHAS_SEVERITY_CACHE.tmp" "$GHAS_SEVERITY_CACHE"; }; then
+  # Codex P2, PR #1124: the update file is created with mktemp in the cache's
+  # OWN directory, not as a predictable `$CACHE.tmp` sibling opened by
+  # redirection. Under the usual 022 umask that redirection created the
+  # sibling 0644 and the rename then replaced the 0600 mktemp cache with a
+  # world-readable file exposing repository names, alert numbers and security
+  # severities; worse, on a shared /tmp another local user could pre-create
+  # that predictable name as a symlink, so the redirection would truncate and
+  # overwrite any file this process can write. mktemp both randomizes the name
+  # and creates it 0600, and O_EXCL means it never follows a planted symlink.
+  # The name stays anchored to the cache path so cache_cleanup can still glob
+  # away a temp left behind by a process killed mid-write.
+  if ! cache_tmp=$(mktemp "$GHAS_SEVERITY_CACHE.update.XXXXXX" 2>/dev/null); then
+    printf '[ghas-alert-severity] WARN: could not create severity cache update file for %s — will re-fetch next time\n' \
+      "$cache_key" >&2
+  elif ! { jq -c --arg k "$cache_key" --arg v "$value" '.[$k] = $v' "$GHAS_SEVERITY_CACHE" \
+    >"$cache_tmp" && mv "$cache_tmp" "$GHAS_SEVERITY_CACHE"; }; then
+    rm -f "$cache_tmp"
     printf '[ghas-alert-severity] WARN: could not write severity cache for %s — will re-fetch next time\n' \
       "$cache_key" >&2
   fi
