@@ -3050,6 +3050,55 @@ for _f in required-check-publisher.yml merge-clearance-gate.yml \
   cp "$ROOT/.github/workflows/$_f" "$RCP_WFDIR/$_f"
 done
 
+# Stage B changes names, not shape, so the structural fence stays
+# deliberately name-agnostic. Pin the live identity separately: branch
+# protection consumes exact strings, and a reintroduced shadow suffix would
+# make the publisher silently stop refreshing the required slots.
+rcp_live_contexts() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+import yaml
+
+expected = {
+    "MCG_CONTEXT": "Merge clearance gate",
+    "CODEX_P1_CONTEXT": "Codex P1 unresolved threads",
+    "CODERABBIT_CONTEXT": "CodeRabbit unresolved blocking findings",
+}
+with open(sys.argv[1], encoding="utf-8") as stream:
+    document = yaml.safe_load(stream)
+environment = document.get("env", {}) if isinstance(document, dict) else {}
+actual = {key: environment.get(key) for key in expected}
+if actual != expected:
+    print(
+        "publisher live-context mismatch: "
+        f"expected {json.dumps(expected, sort_keys=True)}, "
+        f"got {json.dumps(actual, sort_keys=True)}"
+    )
+    raise SystemExit(1)
+PY
+}
+
+if OUT=$(rcp_live_contexts "$RCP_WF" 2>&1); then
+  pass "#845 Stage B: canonical publisher names all three live required contexts"
+else
+  fail "#845 Stage B: canonical publisher live-context assertion failed: $OUT"
+fi
+
+RCP_SHADOW_NAME="$RCP_DIR/wf-shadow-name.yml"
+cp "$RCP_WF" "$RCP_SHADOW_NAME"
+perl -0pi -e 's{MCG_CONTEXT: "Merge clearance gate"}{MCG_CONTEXT: "Merge clearance gate (shadow)"}' "$RCP_SHADOW_NAME"
+if cmp -s "$RCP_WF" "$RCP_SHADOW_NAME"; then
+  fail "#845 Stage B: shadow-name mutation was a no-op"
+elif OUT=$(rcp_live_contexts "$RCP_SHADOW_NAME" 2>&1); then
+  fail "#845 Stage B: live-context assertion accepted a restored shadow name"
+elif grep -qF 'publisher live-context mismatch' <<<"$OUT"; then
+  pass "#845 Stage B: live-context assertion rejects a restored shadow name"
+else
+  fail "#845 Stage B: shadow-name fixture failed for the wrong reason: $OUT"
+fi
+
 # <fixture-workflow> [workflow-dir] [parent] -> echoes rc, output to <fixture>.out
 rcp_run() {
   local out rc

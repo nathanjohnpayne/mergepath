@@ -88,9 +88,10 @@
 # allowlist — reassigning an allowlisted variable immediately before a
 # POST rebinds it without touching any binding site.
 #
-# Stage A ships the publisher under SHADOW context names that are not in
-# branch protection, so nothing it publishes can affect a merge; that is
-# the window in which these are safe to fix properly rather than quickly.
+# Stage A shipped the publisher under SHADOW context names that were not in
+# branch protection, so nothing it published could affect a merge. Stage B
+# promotes only those names; the structural fence remains name-agnostic and
+# the disclosed semantic residuals stay tracked in #976 and #977.
 #
 # ─────────────────────────────────────────────────────────────────────
 # Consumer posture (the #845 ordering constraint, enforced not advised)
