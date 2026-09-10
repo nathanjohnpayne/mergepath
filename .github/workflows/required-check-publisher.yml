@@ -1,18 +1,17 @@
 name: Required Check Publisher
 
 # Single writer of the Checks-API slot for the three script-backed required
-# contexts (#845, Stage A). This file always executes from the DEFAULT
+# contexts (#845, Stage B). This file always executes from the DEFAULT
 # branch — workflow_run, schedule, and repository_dispatch all read the
 # default-branch definition — so a PR cannot edit the publisher that
 # evaluates it (the P1a closure). The natively-named gate jobs in the three
 # gate workflows are untouched and keep producing the truth on their own
 # lineage; this workflow writes only the synthetic (Checks-API) slot.
 #
-# SHADOW STAGE: the published names carry a "(shadow)" suffix and are not in
-# branch protection, so nothing here can affect a merge. PR 3 flips the
-# three env values to the live strings after the #845 canary passes; until
-# then the trigger shape, head binding, PR resolution and rc mapping are
-# rehearsed against production traffic at zero risk.
+# LIVE STAGE: Stage A rehearsed this trigger shape, head binding, PR
+# resolution and rc mapping under shadow names. These names now match the
+# required contexts; the native producers remain as independent fallbacks
+# through the post-live observation window and the later removal stage.
 
 on:
   workflow_run:
@@ -50,11 +49,11 @@ permissions:
   contents: read
 
 env:
-  # The single flip point for PR 3: change these three values to the live
-  # context strings and nothing else.
-  MCG_CONTEXT: "Merge clearance gate (shadow)"
-  CODEX_P1_CONTEXT: "Codex P1 unresolved threads (shadow)"
-  CODERABBIT_CONTEXT: "CodeRabbit unresolved blocking findings (shadow)"
+  # Stage B's single behavior change: these three values now name the live
+  # required contexts. The publisher shape remains unchanged.
+  MCG_CONTEXT: "Merge clearance gate"
+  CODEX_P1_CONTEXT: "Codex P1 unresolved threads"
+  CODERABBIT_CONTEXT: "CodeRabbit unresolved blocking findings"
 
 jobs:
   # Phase 1. NOT named for any required context, and OUTSIDE the publish
