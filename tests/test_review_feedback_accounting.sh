@@ -2221,6 +2221,27 @@ CACHE_VALUE_OUT=$(bash -c '
 ' 2>/dev/null || true)
 assert_eq "high" "$CACHE_VALUE_OUT" "the memoized severity is actually written to the cache (#1124)"
 
+# CodeRabbit, PR #1124 round 5: the write-failure branch's own `rm -f` must not
+# decide the caller's status either. Under `set -e` in a sourced caller a
+# genuinely failing rm (-f only silences "already gone") would abort
+# ghas_alert_severity before the WARN and before it prints $value, turning a
+# cache-write hiccup into a severity-read failure. mv and rm are stubbed to
+# fail so the write-failure branch is genuinely entered AND its cleanup fails --
+# a read-only directory would instead fail mktemp and never reach this branch.
+RM_FATAL_RC=0
+RM_FATAL_OUT=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  gh_api_scalar() { printf "high"; }
+  ghas_severity_cache_init
+  mv() { return 1; }
+  rm() { return 1; }
+  ghas_alert_severity acme/widget 50
+' 2>/dev/null) || RM_FATAL_RC=$?
+assert_eq 0 "$RM_FATAL_RC" "a failing cleanup rm in the write-failure branch does not fail the read (CodeRabbit, #1124 round 5)"
+assert_eq "high" "$RM_FATAL_OUT" "the correctly-resolved severity is still returned when the cache update cannot be committed"
+
 # And cleanup must still sweep a randomized update file a killed process left.
 CACHE_SWEEP_FILE="$TMP/ghas-sweep-cache"
 : >"$CACHE_SWEEP_FILE"

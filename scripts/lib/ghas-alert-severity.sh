@@ -177,7 +177,13 @@ ghas_alert_severity() {
       "$cache_key" >&2
   elif ! { jq -c --arg k "$cache_key" --arg v "$value" '.[$k] = $v' "$GHAS_SEVERITY_CACHE" \
     >"$cache_tmp" && mv "$cache_tmp" "$GHAS_SEVERITY_CACHE"; }; then
-    rm -f "$cache_tmp"
+    # `|| :` for the same reason as the cleanup path above (CodeRabbit, PR
+    # #1124): under `set -e` in a sourced caller, an `rm -f` that genuinely
+    # FAILS (permissions, read-only fs -- `-f` only silences "already gone")
+    # would abort this function before the WARN and before the
+    # `printf '%s' "$value"` below, turning a cache-write hiccup into a
+    # severity-read failure and contradicting the contract documented above.
+    rm -f "$cache_tmp" || :
     printf '[ghas-alert-severity] WARN: could not write severity cache for %s — will re-fetch next time\n' \
       "$cache_key" >&2
   fi
