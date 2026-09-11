@@ -273,6 +273,13 @@ assert_grep "D10: the scheduled sweep re-verifies the label against live state, 
 # assertions green while Dependabot could again run the validator with no
 # checkout. The predicates below are therefore scoped to the named job and the
 # named steps, by block extraction rather than by grepping the whole file.
+#
+# Round 3 (CodeRabbit, P1): block scoping was necessary but not sufficient --
+# the predicates still matched SUBSTRINGS. `!= 'true' || true` satisfied a
+# `grep -qF` on the field while running the validator for Dependabot anyway,
+# and the env assertion never checked its right-hand side, so exempting a
+# DIFFERENT bot passed too. The field predicates are now anchored exact-line
+# matches and the env predicate carries the whole expression.
 g1095_job_block() {  # <file> <job-name> -- the job's own lines, minus its key
   awk -v job="  $2:" '
     $0 == job { inj = 1; next }
@@ -303,7 +310,7 @@ else
   fi
 
   # 2. The exemption is single-sourced as a job env predicate.
-  if grep -qF 'SELF_REVIEW_EXEMPT: ${{ github.event.pull_request.user.login ==' "$G1095_JOB"; then
+  if grep -qF "SELF_REVIEW_EXEMPT: \${{ github.event.pull_request.user.login == 'dependabot[bot]' }}" "$G1095_JOB"; then
     pass "D11: the dependabot exemption is a single-sourced job env predicate (#1095)"
   else
     fail "D11: the dependabot exemption is not a single-sourced job env predicate (#1095)"
@@ -314,7 +321,7 @@ else
   #    condition, so a file-wide grep proved nothing about this one.
   G1095_VALIDATE="$(mktemp "${TMPDIR:-/tmp}/d11-validate.XXXXXX")"
   g1095_step_block "$G1095_JOB" "Validate the PR body against the contract" > "$G1095_VALIDATE"
-  if [ -s "$G1095_VALIDATE" ] && grep -qF "if: env.SELF_REVIEW_EXEMPT != 'true'" "$G1095_VALIDATE"; then
+  if [ -s "$G1095_VALIDATE" ] && grep -qE "^        if: env\.SELF_REVIEW_EXEMPT != 'true'\$" "$G1095_VALIDATE"; then
     pass "D11: the body-validation step itself is what the exemption gates (#1095)"
   else
     fail "D11: the body-validation step does not carry the non-exempt condition -- dependabot would run the validator (#1095)"
@@ -324,7 +331,7 @@ else
   #    the job still produces a green conclusion with a stated reason.
   G1095_EXEMPT="$(mktemp "${TMPDIR:-/tmp}/d11-exempt.XXXXXX")"
   g1095_step_block "$G1095_JOB" "Self-review not applicable" > "$G1095_EXEMPT"
-  if [ -s "$G1095_EXEMPT" ] && grep -qF "if: env.SELF_REVIEW_EXEMPT == 'true'" "$G1095_EXEMPT"; then
+  if [ -s "$G1095_EXEMPT" ] && grep -qE "^        if: env\.SELF_REVIEW_EXEMPT == 'true'\$" "$G1095_EXEMPT"; then
     pass "D11: the exempt path is a real step gated on the exemption, not just prose (#1095)"
   else
     fail "D11: the exempt path is missing or not gated on the exemption (#1095)"
