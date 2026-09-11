@@ -352,7 +352,7 @@ jobs:
                 // from codex-review-check.sh), refactor the inline
                 // computation below to call it so the audit gate and
                 // merge gate cannot drift.
-                const cliApprovedReviews = reviews.filter(
+                let cliApprovedReviews = reviews.filter(
                   r => r.state === 'APPROVED' &&
                        reviewerAccounts.includes(r.user.login)
                 );
@@ -638,6 +638,97 @@ jobs:
                   );
                   issueComments = null;
                 }
+
+                // Automated Phase 4b approvals carry a strict first-line
+                // provider-evidence record (#1085). A timeout-derived review
+                // is merge-time compliant only while the exact author trigger
+                // generation named by that record is still the latest Phase
+                // 4a trigger on this head. This mirrors
+                // crc_select_phase4b_approver in codex-review-check.sh; without
+                // it the retrospective audit would call a merge compliant
+                // even when the live required gate correctly rejected the
+                // superseded timeout approval.
+                const p4bPrefix = '<!-- mergepath-phase-4b-clearance:';
+                const p4bRecord = /^<!-- mergepath-phase-4b-clearance:v1 head=([0-9a-f]{40}|[0-9a-f]{64}) codex_evidence=(timeout|signal|account-or-connection-block|disabled) timeout_trigger_comment_id=(none|[1-9][0-9]*) -->$/;
+                const p4aTimeout = /^<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=([0-9a-f]{40}|[0-9a-f]{64}) trigger_comment_id=([1-9][0-9]*) -->$/;
+
+                function parsePhase4bClearance(body) {
+                  const lines = String(body || '').split('\n').map(x => x.replace(/\r$/, ''));
+                  const indexes = [];
+                  for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].startsWith(p4bPrefix)) indexes.push(i);
+                  }
+                  if (indexes.length === 0) return {state: 'absent'};
+                  if (indexes.length !== 1 || indexes[0] !== 0) return {state: 'malformed'};
+                  const m = lines[0].match(p4bRecord);
+                  if (!m) return {state: 'malformed'};
+                  const evidence = m[2];
+                  const trigger = m[3];
+                  if ((evidence === 'timeout') !== (trigger !== 'none')) {
+                    return {state: 'malformed'};
+                  }
+                  return {
+                    state: 'valid',
+                    head: m[1],
+                    evidence,
+                    timeoutTrigger: trigger === 'none' ? null : Number(trigger),
+                  };
+                }
+
+                function timeoutTriggerAtMerge() {
+                  if (issueComments === null || !mergedAt || !headSha) return null;
+                  const isoTimestamp = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
+                  const trusted = issueComments.filter(c =>
+                    c.user && c.user.login === authorIdentity &&
+                    c.created_at && c.created_at <= mergedAt
+                  );
+                  const triggerCandidates = trusted.filter(c => c.body === '@codex review');
+                  if (triggerCandidates.some(c =>
+                    !Number.isSafeInteger(c.id) || c.id <= 0 ||
+                    !isoTimestamp.test(c.created_at)
+                  )) return null;
+                  const triggers = triggerCandidates.sort((a, b) =>
+                    a.created_at.localeCompare(b.created_at) || a.id - b.id
+                  );
+                  if (triggers.length === 0) return null;
+                  const latest = triggers[triggers.length - 1];
+                  const onHead = [];
+                  for (const c of trusted) {
+                    const m = String(c.body || '').replace(/\r?\n$/, '').match(p4aTimeout);
+                    if (!m || m[1] !== headSha) continue;
+                    onHead.push({
+                      id: c.id,
+                      createdAt: c.created_at,
+                      triggerId: Number(m[2]),
+                    });
+                  }
+                  const badBinding = onHead.some(marker =>
+                    !Number.isSafeInteger(marker.id) || marker.id <= 0 ||
+                    !isoTimestamp.test(marker.createdAt) ||
+                    !triggers.some(trigger =>
+                      trigger.id === marker.triggerId &&
+                      (trigger.created_at < marker.createdAt ||
+                       (trigger.created_at === marker.createdAt && trigger.id < marker.id))
+                    )
+                  );
+                  if (badBinding) return null;
+                  return onHead.some(marker => marker.triggerId === latest.id)
+                    ? latest.id
+                    : null;
+                }
+
+                const liveTimeoutTriggerAtMerge = timeoutTriggerAtMerge();
+                cliApprovedReviews = cliApprovedReviews.filter(r => {
+                  const body = String(r.body || '');
+                  const record = parsePhase4bClearance(body);
+                  if (record.state === 'absent') {
+                    return !body.startsWith('**Automated Phase 4b review**');
+                  }
+                  if (record.state !== 'valid' || record.head !== headSha) return false;
+                  if (record.evidence !== 'timeout') return true;
+                  return liveTimeoutTriggerAtMerge !== null &&
+                    record.timeoutTrigger === liveTimeoutTriggerAtMerge;
+                });
 
                 // ── Clearance algorithm (#249/#449/#450/#612) ─────────
                 // KEEP IN SYNC with the mirrored runner in

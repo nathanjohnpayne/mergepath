@@ -558,6 +558,212 @@ else
   fail "#842: exit 2 is unguarded or duplicated (guard_ok=$guard_ok count=$n_exit2)"
 fi
 
+# #1085: an automated Phase 4b substitute reached through a durable Phase 4a
+# timeout must carry that exact timeout generation into its review body. The
+# later merge-clearance read validates the binding against the LIVE timeout
+# state, so a same-head author trigger landing after Phase 4b's final timeline
+# read invalidates the old approval instead of clearing gate (c). Manual
+# external approvals and non-timeout automated evidence retain their existing
+# paths.
+P4B_SELECTOR=$(sed -n \
+  '/^# BEGIN phase4b_approver_selector$/,/^# END phase4b_approver_selector$/p' \
+  "$SCRIPT")
+if [ -n "$P4B_SELECTOR" ] \
+   && grep -q '^crc_select_phase4b_approver()' <<<"$P4B_SELECTOR" \
+   && grep -q 'clearance record' <<<"$P4B_SELECTOR"; then
+  # The selector delegates the marker grammar to the same shared parser used
+  # by the automated-review writer.
+  # shellcheck source=../scripts/lib/codex-failure-markers.sh
+  . "$ROOT/scripts/lib/codex-failure-markers.sh"
+  eval "$P4B_SELECTOR"
+  pass "#1085: codex-review-check.sh exposes the timeout-generation-bound Phase 4b selector"
+else
+  fail "#1085: codex-review-check.sh is missing the timeout-generation-bound Phase 4b selector"
+fi
+
+if declare -F crc_select_phase4b_approver >/dev/null 2>&1; then
+  P4B_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  P4B_REVIEWERS='["nathanpayne-claude"]'
+  P4B_TIMEOUT_BODY="$(printf '%s\n\n**Automated Phase 4b review**' \
+    "$(codex_phase4b_clearance_marker_body "$P4B_HEAD" timeout 4101)")"
+  P4B_SIGNAL_BODY="$(printf '%s\n\n**Automated Phase 4b review**' \
+    "$(codex_phase4b_clearance_marker_body "$P4B_HEAD" signal none)")"
+  P4B_REVIEWS=$(jq -cn --arg body "$P4B_TIMEOUT_BODY" --arg head "$P4B_HEAD" '[
+    {id:1,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:00:00Z",commit_id:$head,body:$body}
+  ]')
+  p4b_pick() {
+    crc_select_phase4b_approver "$P4B_REVIEWS" "$P4B_REVIEWERS" nathanjohnpayne nathanpayne-codex "$P4B_HEAD" "$1"
+  }
+  _picked="$(p4b_pick '{"state":"current","trigger_comment_id":4101}')"
+  [ "$(printf '%s' "$_picked" | jq -r '.id // empty')" = 1 ] \
+    && pass "#1085 Phase 4b binding: exact live timeout generation is accepted" \
+    || fail "#1085 Phase 4b binding: exact live timeout generation was rejected: $_picked"
+
+  for _state in \
+    '{"state":"superseded","superseding_trigger_comment_id":4103}' \
+    '{"state":"current","trigger_comment_id":4103}'; do
+    _picked="$(p4b_pick "$_state")"
+    [ "$_picked" = null ] \
+      && pass "#1085 Phase 4b binding: changed timeout generation is rejected" \
+      || fail "#1085 Phase 4b binding: changed timeout generation cleared: $_picked"
+  done
+
+  P4B_REVIEWS=$(jq -cn --arg head "$P4B_HEAD" '[
+    {id:2,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:01:00Z",commit_id:$head,body:"Manual external review: approved."}
+  ]')
+  _picked="$(p4b_pick '{"state":"superseded","superseding_trigger_comment_id":4103}')"
+  [ "$(printf '%s' "$_picked" | jq -r '.id // empty')" = 2 ] \
+    && pass "#1085 Phase 4b binding: manual external approval remains independent of the automated marker" \
+    || fail "#1085 Phase 4b binding: manual external approval was rejected: $_picked"
+
+  P4B_REVIEWS=$(jq -cn --arg body "$P4B_SIGNAL_BODY" --arg head "$P4B_HEAD" '[
+    {id:3,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:02:00Z",commit_id:$head,body:$body}
+  ]')
+  _picked="$(p4b_pick '{"state":"none"}')"
+  [ "$(printf '%s' "$_picked" | jq -r '.id // empty')" = 3 ] \
+    && pass "#1085 Phase 4b binding: non-timeout automated evidence stays eligible" \
+    || fail "#1085 Phase 4b binding: non-timeout automated evidence was rejected: $_picked"
+
+  for _evidence in account-or-connection-block disabled; do
+    _body="$(printf '%s\n\n**Automated Phase 4b review**' \
+      "$(codex_phase4b_clearance_marker_body "$P4B_HEAD" "$_evidence" none)")"
+    P4B_REVIEWS=$(jq -cn --arg body "$_body" --arg head "$P4B_HEAD" '[
+      {id:31,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:02:30Z",commit_id:$head,body:$body}
+    ]')
+    _picked="$(p4b_pick '{"state":"none"}')"
+    [ "$(printf '%s' "$_picked" | jq -r '.id // empty')" = 31 ] \
+      && pass "#1085 Phase 4b binding: $_evidence automated evidence stays eligible without a timeout timeline" \
+      || fail "#1085 Phase 4b binding: $_evidence evidence was rejected: $_picked"
+  done
+
+  P4B_REVIEWS=$(jq -cn --arg head "$P4B_HEAD" '[
+    {id:4,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:03:00Z",commit_id:$head,body:"**Automated Phase 4b review**"}
+  ]')
+  _picked="$(p4b_pick '{"state":"current","trigger_comment_id":4101}')"
+  [ "$_picked" = null ] \
+    && pass "#1085 Phase 4b binding: unmarked automated approval fails closed" \
+    || fail "#1085 Phase 4b binding: unmarked automated approval cleared: $_picked"
+
+  P4B_BAD_BODY="$(printf '%s\n%s\n\n**Automated Phase 4b review**' \
+    "$(codex_phase4b_clearance_marker_body "$P4B_HEAD" timeout 4101)" \
+    "$(codex_phase4b_clearance_marker_body "$P4B_HEAD" timeout 4101)")"
+  P4B_REVIEWS=$(jq -cn --arg body "$P4B_BAD_BODY" --arg head "$P4B_HEAD" '[
+    {id:5,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:04:00Z",commit_id:$head,body:$body}
+  ]')
+  _picked="$(p4b_pick '{"state":"current","trigger_comment_id":4101}')"
+  [ "$_picked" = null ] \
+    && pass "#1085 Phase 4b binding: duplicate automated clearance records fail closed" \
+    || fail "#1085 Phase 4b binding: duplicate clearance records cleared: $_picked"
+
+  P4B_REVIEWS=$(jq -cn --arg body "$P4B_TIMEOUT_BODY" --arg head "$P4B_HEAD" '[
+    {id:6,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:05:00Z",commit_id:$head,body:$body},
+    {id:7,user:{login:"nathanpayne-claude"},state:"CHANGES_REQUESTED",submitted_at:"2026-09-01T00:06:00Z",commit_id:$head,body:"newer objection"}
+  ]')
+  _picked="$(p4b_pick '{"state":"current","trigger_comment_id":4101}')"
+  [ "$_picked" = null ] \
+    && pass "#1085 Phase 4b binding: a reviewer's newer objection supersedes its bound approval" \
+    || fail "#1085 Phase 4b binding: a stale approval survived the reviewer's newer objection: $_picked"
+
+  P4B_REVIEWS=$(jq -cn --arg timeout "$P4B_TIMEOUT_BODY" --arg head "$P4B_HEAD" '[
+    {id:8,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:07:00Z",commit_id:$head,body:$timeout},
+    {id:9,user:{login:"nathanpayne-claude"},state:"CHANGES_REQUESTED",submitted_at:"2026-09-01T00:08:00Z",commit_id:$head,body:"supersedes timeout"},
+    {id:10,user:{login:"nathanpayne-cursor"},state:"APPROVED",submitted_at:"2026-09-01T00:09:00Z",commit_id:$head,body:"Manual external review: approved."}
+  ]')
+  _scan_rc=0
+  crc_phase4b_needs_timeout_timeline "$P4B_REVIEWS" \
+    '["nathanpayne-claude","nathanpayne-cursor"]' nathanjohnpayne nathanpayne-codex "$P4B_HEAD" \
+    || _scan_rc=$?
+  [ "$_scan_rc" = 1 ] \
+    && pass "#1085 Phase 4b binding: a superseded timeout approval imposes no live-timeline dependency" \
+    || fail "#1085 Phase 4b binding: stale timeout approval requested a timeline read (rc=$_scan_rc)"
+
+  P4B_REVIEWS=$(jq -cn --arg timeout "$P4B_TIMEOUT_BODY" --arg head "$P4B_HEAD" '[
+    {id:11,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:10:00Z",commit_id:$head,body:$timeout}
+  ]')
+  _scan_rc=0
+  crc_phase4b_needs_timeout_timeline "$P4B_REVIEWS" \
+    '["nathanpayne-claude"]' nathanjohnpayne nathanpayne-codex "$P4B_HEAD" \
+    || _scan_rc=$?
+  [ "$_scan_rc" = 0 ] \
+    && pass "#1085 Phase 4b binding: a strict current-head timeout approval requests the live timeline" \
+    || fail "#1085 Phase 4b binding: valid timeout approval skipped the timeline read (rc=$_scan_rc)"
+
+  P4B_REVIEWS=$(jq -cn --arg timeout "$P4B_TIMEOUT_BODY" --arg head "$P4B_HEAD" '[
+    {id:111,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:10:10Z",commit_id:$head,body:$timeout},
+    {id:112,user:{login:"nathanpayne-cursor"},state:"APPROVED",submitted_at:"2026-09-01T00:10:20Z",commit_id:$head,body:"Manual external review: approved."}
+  ]')
+  _scan_rc=0
+  crc_phase4b_needs_timeout_timeline "$P4B_REVIEWS" \
+    '["nathanpayne-claude","nathanpayne-cursor"]' nathanjohnpayne nathanpayne-codex "$P4B_HEAD" \
+    || _scan_rc=$?
+  _picked="$(crc_select_phase4b_approver "$P4B_REVIEWS" \
+    '["nathanpayne-claude","nathanpayne-cursor"]' nathanjohnpayne nathanpayne-codex \
+    "$P4B_HEAD" '{"state":"unreadable"}')"
+  [ "$_scan_rc" = 1 ] \
+    && [ "$(printf '%s' "$_picked" | jq -r '.id // empty')" = 112 ] \
+    && pass "#1085 Phase 4b binding: an independent manual approval avoids the timeout candidate's timeline dependency" \
+    || fail "#1085 Phase 4b binding: valid timeout history masked an independent manual approval (scan_rc=$_scan_rc picked=$_picked)"
+
+  P4B_WRONG_HEAD_BODY="$(printf '%s\n\n**Automated Phase 4b review**' \
+    "$(codex_phase4b_clearance_marker_body bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb timeout 4101)")"
+  P4B_MALFORMED_BODY="<!-- mergepath-phase-4b-clearance:v1 head=$P4B_HEAD codex_evidence=timeout timeout_trigger_comment_id=none -->
+
+**Automated Phase 4b review**"
+  for _body in "$P4B_WRONG_HEAD_BODY" "$P4B_MALFORMED_BODY"; do
+    P4B_REVIEWS=$(jq -cn --arg body "$_body" --arg head "$P4B_HEAD" '[
+      {id:12,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:11:00Z",commit_id:$head,body:$body},
+      {id:13,user:{login:"nathanpayne-cursor"},state:"APPROVED",submitted_at:"2026-09-01T00:12:00Z",commit_id:$head,body:"Manual external review: approved."}
+    ]')
+    _scan_rc=0
+    crc_phase4b_needs_timeout_timeline "$P4B_REVIEWS" \
+      '["nathanpayne-claude","nathanpayne-cursor"]' nathanjohnpayne nathanpayne-codex "$P4B_HEAD" \
+      || _scan_rc=$?
+    [ "$_scan_rc" = 1 ] \
+      && pass "#1085 Phase 4b binding: malformed or wrong-head timeout-like history cannot impose a timeline read" \
+      || fail "#1085 Phase 4b binding: invalid timeout-like history requested a timeline read (rc=$_scan_rc)"
+  done
+
+  P4B_REVIEWS=$(jq -cn --arg head "$P4B_HEAD" '[
+    {id:14,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:13:00Z",commit_id:$head,body:"Manual external review: approved."}
+  ]')
+  unset -f codex_phase4b_clearance_marker_parse
+  _picked="$(p4b_pick '{"state":"unreadable"}')"
+  [ "$(printf '%s' "$_picked" | jq -r '.id // empty')" = 14 ] \
+    && pass "#1085 Phase 4b binding: manual approval remains usable during marker-parser propagation skew" \
+    || fail "#1085 Phase 4b binding: manual approval gained an automated-marker dependency: $_picked"
+
+  P4B_REVIEWERS='["nathanpayne-claude","nathanpayne-cursor"]'
+  P4B_REVIEWS=$(jq -cn --arg auto "$P4B_SIGNAL_BODY" --arg head "$P4B_HEAD" '[
+    {id:15,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:14:00Z",commit_id:$head,body:$auto},
+    {id:16,user:{login:"nathanpayne-cursor"},state:"APPROVED",submitted_at:"2026-09-01T00:15:00Z",commit_id:$head,body:"Manual external review: approved."}
+  ]')
+  _picked="$(p4b_pick '{"state":"unreadable"}')"
+  [ "$(printf '%s' "$_picked" | jq -r '.id // empty')" = 16 ] \
+    && pass "#1085 Phase 4b binding: unreadable automated history cannot mask an independent manual approval" \
+    || fail "#1085 Phase 4b binding: propagation skew masked the manual approval: $_picked"
+
+  P4B_REVIEWS=$(jq -cn --arg head "$P4B_HEAD" '[
+    {id:18,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:14:30Z",commit_id:$head,body:"**Automated Phase 4b review**\n\nLegacy body."},
+    {id:19,user:{login:"nathanpayne-cursor"},state:"APPROVED",submitted_at:"2026-09-01T00:15:30Z",commit_id:$head,body:"Manual external review: approved."}
+  ]')
+  _picked="$(p4b_pick '{"state":"unreadable"}')"
+  [ "$(printf '%s' "$_picked" | jq -r '.id // empty')" = 19 ] \
+    && pass "#1085 Phase 4b binding: a legacy unmarked automated review cannot mask a manual approval during propagation skew" \
+    || fail "#1085 Phase 4b binding: legacy unmarked history masked the manual approval: $_picked"
+
+  P4B_REVIEWERS='["nathanpayne-claude"]'
+  P4B_REVIEWS=$(jq -cn --arg auto "$P4B_SIGNAL_BODY" --arg head "$P4B_HEAD" '[
+    {id:17,user:{login:"nathanpayne-claude"},state:"APPROVED",submitted_at:"2026-09-01T00:16:00Z",commit_id:$head,body:$auto}
+  ]')
+  _pick_rc=0
+  _picked="$(p4b_pick '{"state":"unreadable"}')" || _pick_rc=$?
+  [ "$_pick_rc" = 2 ] \
+    && pass "#1085 Phase 4b binding: automated-only propagation skew still fails closed as infrastructure" \
+    || fail "#1085 Phase 4b binding: unreadable automated-only approval did not fail closed (rc=$_pick_rc; $_picked)"
+  . "$ROOT/scripts/lib/codex-failure-markers.sh"
+  unset -f p4b_pick
+fi
+
 echo ""
 echo "test_codex_review_check_verdict: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

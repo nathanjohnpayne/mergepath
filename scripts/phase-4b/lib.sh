@@ -1282,7 +1282,7 @@ p4b_same_head_barrier() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
   local root cr_bin cx_bin rc json probe_head cx_timeout_json="" cx_timeout_rc=0
   local pending=false why="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
-  local cx_evidence="disabled"
+  local cx_evidence="disabled" cx_timeout_trigger_id=""
   local elapsed budget remaining=0
   root="$(p4b_repo_root)"
   cr_bin="${P4B_CODERABBIT_WAIT:-$root/scripts/coderabbit-wait.sh}"
@@ -1309,7 +1309,16 @@ p4b_same_head_barrier() {
         cx_timeout_json="$(p4b_codex_timeout_determination "$repo" "$pr" "$head")" || cx_timeout_rc=$?
         cx_evidence="$(printf '%s' "$cx_timeout_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
         case "$cx_timeout_rc" in
-          0) cls_cx="waived"; cx_evidence="timeout" ;;
+          0)
+            cls_cx="waived"
+            cx_evidence="timeout"
+            cx_timeout_trigger_id="$(printf '%s' "$cx_timeout_json" | jq -r '.trigger_comment_id // empty' 2>/dev/null || true)"
+            if ! codex_phase4a_comment_id_ok "$cx_timeout_trigger_id"; then
+              cls_cx="escalate"
+              cx_evidence="unreadable"
+              why="Phase 4a timeout evidence omitted a valid trigger generation; refusing to waive Codex"
+            fi
+            ;;
           1) ;; # none/stale: keep ordinary not-yet
           *)
             cls_cx="escalate"
@@ -1509,17 +1518,24 @@ p4b_same_head_barrier() {
   fi
 
   if [ -n "$why" ]; then
-    jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg t "$trigger" --arg rs "$resume" \
-      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, codex_evidence:$ce, trigger:$t, resume:$rs}'
+    jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
+      --arg ctid "$cx_timeout_trigger_id" --arg t "$trigger" --arg rs "$resume" \
+      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, codex_evidence:$ce,
+        codex_timeout_trigger_comment_id:(if $ctid == "" then null else ($ctid | tonumber) end),
+        trigger:$t, resume:$rs}'
     return 2
   fi
   if [ "$pending" = true ]; then
-    jq -nc --argjson ra "$remaining" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg t "$trigger" --arg rs "$resume" \
-      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, codex_evidence:$ce, trigger:$t, resume:$rs}'
+    jq -nc --argjson ra "$remaining" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
+      --arg ctid "$cx_timeout_trigger_id" --arg t "$trigger" --arg rs "$resume" \
+      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, codex_evidence:$ce,
+        codex_timeout_trigger_comment_id:(if $ctid == "" then null else ($ctid | tonumber) end),
+        trigger:$t, resume:$rs}'
     return 1
   fi
-  jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
-    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce}'
+  jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg ctid "$cx_timeout_trigger_id" \
+    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce,
+      codex_timeout_trigger_comment_id:(if $ctid == "" then null else ($ctid | tonumber) end)}'
   return 0
 }
 

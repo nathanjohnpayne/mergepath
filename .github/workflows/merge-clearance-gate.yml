@@ -55,6 +55,12 @@ on:
   # review-submission event (external-review path).
   pull_request_review_comment:
     types: [created, edited, deleted]
+  # Phase 4a triggers and terminal timeout records are PR-level issue
+  # comments. A new exact author trigger retracts a timeout-bound automated
+  # Phase 4b approval on the same head, so refresh the PR-head check instead
+  # of leaving the prior green result authoritative until the sweep.
+  issue_comment:
+    types: [created, edited, deleted]
   # #658: the propagation lane posts its head-pinned verified-head marker as
   # a github-actions[bot] ISSUE comment. After #657 stopped the label
   # add/remove dance, nothing re-ran this gate when the marker landed, and a
@@ -145,6 +151,7 @@ jobs:
     if: >-
       github.event_name != 'schedule'
       && github.event_name != 'repository_dispatch'
+      && github.event_name != 'issue_comment'
     steps:
       - name: Open the required check_run (#841 phase 1)
         id: open
@@ -543,7 +550,7 @@ jobs:
           fi
 
   dispatch-recheck:
-    name: Merge clearance dispatch re-evaluation
+    name: Merge clearance out-of-band re-evaluation
     # #658: re-evaluate promptly when the propagation lane sends a
     # `merge-clearance-recheck` repository_dispatch right after posting its
     # head-pinned verified-head marker. The marker itself is a GITHUB_TOKEN
@@ -558,7 +565,12 @@ jobs:
     # a pass — so no guard on the payload is needed beyond validating it is a
     # PR number. Label events are still not a trigger (not head-pinned proof —
     # #429 round-3 P1).
-    if: github.event_name == 'repository_dispatch'
+    # issue_comment runs on the default branch and has no native PR-head check,
+    # so it shares the explicit check_run publisher used by dispatch. Ignore
+    # ordinary issues. The live PR read below derives the authoritative head.
+    if: >-
+      github.event_name == 'repository_dispatch'
+      || (github.event_name == 'issue_comment' && github.event.issue.pull_request)
     runs-on: ubuntu-latest
     # checks:write to POST the check_run (same as the sweep). issues:read for
     # the gate script's /issues/{pr}/comments marker read + the delegated
@@ -582,10 +594,9 @@ jobs:
       - name: Re-evaluate gate for the dispatched PR and post check_run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The PR number the lane put in the dispatch payload. Passed via env
-          # (not interpolated into the script) and validated as a positive
-          # integer below, so an arbitrary client_payload cannot inject shell.
-          PR: ${{ github.event.client_payload.pr }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_PR: ${{ github.event.client_payload.pr }}
+          ISSUE_PR: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
           # Check name MUST match the event-driven job name above AND the
           # sweep CHECK_NAME so branch protection resolves every source as the
@@ -600,12 +611,21 @@ jobs:
           CHECK_NAME: "Merge clearance gate"
         run: |
           set -euo pipefail
-          # Validate the dispatched PR number before it reaches any API call —
-          # the payload is attacker-influenceable (anyone with repo write can
-          # dispatch), so reject anything that is not a bare positive integer.
+          case "$EVENT_NAME" in
+            repository_dispatch) PR="$DISPATCH_PR" ;;
+            issue_comment) PR="$ISSUE_PR" ;;
+            *)
+              echo "::error::unsupported out-of-band event: '$EVENT_NAME'"
+              exit 1
+              ;;
+          esac
+          # Validate the resolved PR number before it reaches any API call.
+          # The dispatch payload is attacker-influenceable and the issue path
+          # is still treated as untrusted input, so only a positive integer is
+          # accepted.
           case "$PR" in
             ''|*[!0-9]*)
-              echo "::error::repository_dispatch client_payload.pr is not a positive integer: '$PR'"
+              echo "::error::$EVENT_NAME did not resolve to a positive PR number: '$PR'"
               exit 1
               ;;
           esac
@@ -628,12 +648,37 @@ jobs:
             echo "::error::PR #$PR not found in the open-PR list; cannot resolve its head to refresh the Merge clearance gate (fail closed, #658/#465)."
             exit 1
           fi
+          # Open this event's generation before evaluating. A later comment
+          # event creates a newer generation; patching this exact older id can
+          # never supersede that newer in-progress/red result even if runners
+          # finish out of order. A crash after the POST leaves a blocking
+          # in-progress check rather than the prior stale green.
+          check_id=""
+          for attempt in 1 2 3; do
+            check_id=$(gh api -X POST "repos/$REPO/check-runs" \
+              -f name="$CHECK_NAME" \
+              -f head_sha="$head_sha" \
+              -f status="in_progress" \
+              -f "output[title]=Merge clearance gate (out-of-band re-evaluation in progress)" \
+              -f "output[summary]=Re-evaluating merge clearance on $head_sha after $EVENT_NAME." \
+              --jq .id 2>/dev/null) && [ -n "$check_id" ] && break
+            check_id=""
+            sleep $((attempt * 5))
+          done
+          if [ -z "$check_id" ]; then
+            echo "::error::Could not open the PR-head Merge clearance check lease."
+            exit 1
+          fi
           set +e
           output=$(scripts/merge-clearance-gate.sh "$PR" "$REPO" 2>&1)
           rc=$?
           set -e
           echo "$output"
-          check_title="Merge clearance gate (propagation-lane dispatch re-evaluation)"
+          if [ "$EVENT_NAME" = issue_comment ]; then
+            check_title="Merge clearance gate (PR-comment re-evaluation)"
+          else
+            check_title="Merge clearance gate (propagation-lane dispatch re-evaluation)"
+          fi
           case "$rc" in
             0) conclusion="success" ;;
             1) conclusion="failure" ;;
@@ -643,6 +688,22 @@ jobs:
               check_title="Merge clearance gate — infra/config error (rc=$rc)"
               ;;
           esac
+          # A PR-level comment can change the timeout generation while the
+          # first evaluation is running. Re-read the complete gate immediately
+          # before a success PATCH. If the surface changed, publish failure;
+          # the newer comment event also owns a later check generation.
+          if [ "$EVENT_NAME" = issue_comment ] && [ "$conclusion" = success ]; then
+            set +e
+            final_output=$(scripts/merge-clearance-gate.sh "$PR" "$REPO" 2>&1)
+            final_rc=$?
+            set -e
+            output="$(printf '%s\n\nFinal issue-comment publication fence:\n%s' \
+              "$output" "$final_output")"
+            if [ "$final_rc" -ne 0 ]; then
+              conclusion="failure"
+              check_title="Merge clearance gate — comment surface changed during evaluation"
+            fi
+          fi
           # Truncate to stay under GitHub's 65535-char summary limit. Bash
           # slice, NOT `printf | head -c`: under `set -euo pipefail` a >60KB
           # output makes head close the pipe early, printf takes SIGPIPE, and
@@ -653,9 +714,7 @@ jobs:
           # the stale required check on the PR head after the marker lands
           # (or pins a fail-closed red on infra error). A failed POST means the
           # job did not do its job; that's an infra error.
-          if ! gh api -X POST "repos/$REPO/check-runs" \
-            -f name="$CHECK_NAME" \
-            -f head_sha="$head_sha" \
+          if ! gh api -X PATCH "repos/$REPO/check-runs/$check_id" \
             -f status="completed" \
             -f conclusion="$conclusion" \
             -f "output[title]=$check_title" \

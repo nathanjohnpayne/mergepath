@@ -1107,6 +1107,8 @@ on:
     types: [submitted]
   pull_request_review_comment:
     types: [created]
+  issue_comment:
+    types: [created, edited, deleted]
   repository_dispatch:
     types: [merge-clearance-recheck]
   schedule:
@@ -1803,8 +1805,11 @@ mcg22_case x 's{^(  merge-clearance-gate:\n)}{$1    concurrency:\n      group: m
 # y — a producer's pinned condition DELETED outright: validating the
 #     allowlist only when the key is supplied lets the strongest mutation —
 #     removing the condition — pass untested, and dispatch-recheck then runs
-#     red on every pull_request event (App P2 on #852).
-mcg22_case y 's{^    if: github.event_name == \x27repository_dispatch\x27\n}{}m' \
+#     red on every pull_request event (App P2 on #852). The anchor deletes the
+#     FOLDED three-line form the condition took when issue_comment joined it
+#     (#1085); a stale single-line anchor silently mutates nothing, which the
+#     harness reports as drift rather than passing.
+mcg22_case y 's{^    if: >-\n      github\.event_name == \x27repository_dispatch\x27\n      \|\| \(github\.event_name == \x27issue_comment\x27 && github\.event\.issue\.pull_request\)\n}{}m' \
   fail "has no job-level if"
 # x2/x3 — concurrency on the NON-event producers: not the permanent native
 #     block of case x, but a cancelled member silently drops a refresh that

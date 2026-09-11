@@ -327,7 +327,9 @@ paths:
   # the usage-limit / not-connected patterns audit-codex-latency.sh classifies
   # retrospectively, factored out so the live Phase 4a scripts test the SAME
   # patterns. #1085 also makes this the one grammar/parser for the durable,
-  # exact-head Phase 4a timeout determination consumed by phase-4b/lib.sh.
+  # exact-head Phase 4a timeout determination consumed by phase-4b/lib.sh,
+  # plus the strict first-line Phase 4b approval record that the orchestrator
+  # writes and codex-review-check.sh parses against the live timeout generation.
   # Sourced (existence-guarded, flag-gated) by codex-review-request.sh and
   # codex-review-check.sh — declared in each of their requires: below so the
   # closure invariant records the coupling and the lib travels with them. A
@@ -549,7 +551,7 @@ paths:
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/reviewers-helpers.sh"   # #453, hard-sourced for the gate (b)/(c) reviewer allow-list
-      - "scripts/lib/codex-failure-markers.sh"   # #722, sourced for the gate (c) usage-limit/not-connected diagnostic
+      - "scripts/lib/codex-failure-markers.sh"   # #722/#1085, provider diagnostics + Phase 4b approval-generation parser
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
       - "scripts/lib/branch-requirements.sh"   # #1064, hard-sourced gate (a) required-check resolution
   # Phase 4a feedback loop (#487): records the validated 👍/👎 reaction
@@ -581,7 +583,7 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/phase-4b/"
-      - "scripts/lib/codex-failure-markers.sh"   # #1085, exact-head Phase 4a timeout handoff parsed by phase-4b/lib.sh
+      - "scripts/lib/codex-failure-markers.sh"   # #1085, Phase 4a timeout + first-line Phase 4b clearance record
       - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
       - "scripts/gh-as-reviewer.sh"
       - "scripts/post-phase-4b-handoff.sh"
@@ -1792,7 +1794,7 @@ paths:
     type: kit
     consumers: all
     requires:
-      - "scripts/lib/codex-failure-markers.sh"   # #1085, durable timeout grammar/parser sourced by lib.sh
+      - "scripts/lib/codex-failure-markers.sh"   # #1085, durable timeout + automated-approval grammar/parser
       - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
       - "scripts/lib/gh-api-scalar.sh"  # #799/#1085, shaped live-head fence before timeout consumption
     # Automated Phase 4b handoff package (#579): adapters, schema, shared

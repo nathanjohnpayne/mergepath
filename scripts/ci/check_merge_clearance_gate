@@ -67,7 +67,7 @@ fi
 # for the no-event transitions that produced #428: 👍 reaction, UI label
 # resolve, GITHUB_TOKEN-authored relabel).
 if [ -f "$WORKFLOW" ]; then
-  for trigger in pull_request pull_request_review pull_request_review_comment schedule; do
+  for trigger in pull_request pull_request_review pull_request_review_comment issue_comment schedule; do
     if ! grep -qE "^[[:space:]]*${trigger}:" "$WORKFLOW"; then
       echo "FAIL: $WORKFLOW missing required trigger: $trigger"
       echo "      The gate must fire on push, review submission, inline-comment, AND on a periodic schedule (no-event safety net)."
@@ -121,6 +121,25 @@ if [ -f "$WORKFLOW" ]; then
   if [ "$dispatch_wiring_missing" -ne 0 ]; then
     echo "FAIL: $WORKFLOW repository_dispatch path is not wired for the marker re-trigger."
     echo "      It must accept the 'merge-clearance-recheck' dispatch type AND resolve the PR from github.event.client_payload.pr in a check_run-posting job (#658)."
+    FAILED=1
+  fi
+
+  # #1085: an author-PAT `@codex review` issue comment can retract the exact
+  # timeout generation named by an already-green automated Phase 4b approval.
+  # issue_comment workflows attach to the default branch, so the ordinary
+  # event job must decline them and the explicit check_run publisher must
+  # resolve github.event.issue.number back to the PR head. Without all three
+  # pieces the live gate code is correct only when some unrelated later event
+  # happens to re-run it; the stale green required check can still merge.
+  issue_comment_wiring_missing=0
+  grep -qE "^[[:space:]]*issue_comment:" "$WORKFLOW" || issue_comment_wiring_missing=1
+  grep -qF "github.event.issue.number" "$WORKFLOW" || issue_comment_wiring_missing=1
+  grep -qF "github.event_name != 'issue_comment'" "$WORKFLOW" || issue_comment_wiring_missing=1
+  grep -qF "github.event_name == 'issue_comment' && github.event.issue.pull_request" "$WORKFLOW" \
+    || issue_comment_wiring_missing=1
+  if [ "$issue_comment_wiring_missing" -ne 0 ]; then
+    echo "FAIL: $WORKFLOW does not refresh the PR-head Merge clearance gate on issue_comment."
+    echo "      The author trigger that supersedes a timeout-bound Phase 4b approval must publish a fresh check_run on the live PR head (#1085)."
     FAILED=1
   fi
 
@@ -221,6 +240,21 @@ if [ -f "$WORKFLOW" ]; then
   mcg_has() {  # <stripped-block> <fixed-string>
     grep -qF -- "$2" <<<"$1"
   }
+
+  out_of_band_block=$(mcg_job_block "$WORKFLOW" dispatch-recheck 2>/dev/null || true)
+  out_of_band_code=$(mcg_strip "$out_of_band_block" 2>/dev/null || true)
+  issue_comment_lease_missing=0
+  mcg_has "$out_of_band_code" 'status="in_progress"' || issue_comment_lease_missing=1
+  mcg_has "$out_of_band_code" 'check_id=$(gh api -X POST' || issue_comment_lease_missing=1
+  mcg_has "$out_of_band_code" 'gh api -X PATCH "repos/$REPO/check-runs/$check_id"' \
+    || issue_comment_lease_missing=1
+  mcg_has "$out_of_band_code" 'Final issue-comment publication fence:' \
+    || issue_comment_lease_missing=1
+  if [ "$issue_comment_lease_missing" -ne 0 ]; then
+    echo "FAIL: $WORKFLOW issue_comment publisher lacks a two-phase PR-head lease or final publication fence."
+    echo "      Out-of-order comment runs must patch their own generation so an older green cannot supersede a newer timeout-generation failure (#1085)."
+    FAILED=1
+  fi
 
   # Print the body of a nested mapping (e.g. `permissions:`) from a job block,
   # stopping at the first line indented no deeper than the key itself. Needed
@@ -650,11 +684,22 @@ HEAD_SHA_OK = ("${{ github.event.pull_request.head.sha }}",)
 # legitimate change to one must update this allowlist in the same diff, which
 # is precisely the loud coupling a fence wants.
 JOB_IF_ALLOWED = {
+    # Extended, not widened, for the issue_comment producer (#1085): the event
+    # job must now also stand aside for issue_comment, and dispatch-recheck
+    # picks it up. The previous spellings are REPLACED rather than kept
+    # alongside — an allowlist that still admits the pre-issue_comment
+    # condition would let a revert pass this fence while the issue_comment
+    # path silently stopped refreshing the required context, which is the
+    # exact class of regression the exact-match pin exists to catch.
     "merge-clearance-gate": (
-        "github.event_name != 'schedule' && github.event_name != 'repository_dispatch'",
+        "github.event_name != 'schedule' && github.event_name != 'repository_dispatch'"
+        " && github.event_name != 'issue_comment'",
     ),
     "scheduled-sweep": ("github.event_name == 'schedule'",),
-    "dispatch-recheck": ("github.event_name == 'repository_dispatch'",),
+    "dispatch-recheck": (
+        "github.event_name == 'repository_dispatch'"
+        " || (github.event_name == 'issue_comment' && github.event.issue.pull_request)",
+    ),
 }
 
 

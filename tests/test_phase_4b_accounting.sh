@@ -286,7 +286,7 @@ cat > "$BIN/gh" <<'SH'
 if [ "${1:-}" = "api" ]; then
   case "${2:-}" in
     repos/o/r/pulls/*)
-      printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-abc123}"
+      printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-abc123abc123abc123abc123abc123abc123abcd}"
       exit 0
       ;;
     graphql)
@@ -348,12 +348,12 @@ while [ "$#" -gt 0 ]; do
     if [ -n "${P4B_WRAPPER_BODY:-}" ]; then
       jq -r '.body' "${2:?}" > "$P4B_WRAPPER_BODY"
     fi
-    printf '{"id":1,"commit_id":"%s"}\n' "${P4B_FAKE_CREATED_REVIEW_HEAD:-abc123}"
+    printf '{"id":1,"commit_id":"%s"}\n' "${P4B_FAKE_CREATED_REVIEW_HEAD:-abc123abc123abc123abc123abc123abc123abcd}"
     exit 0
   fi
   shift
 done
-printf '{"id":1,"commit_id":"%s"}\n' "${P4B_FAKE_CREATED_REVIEW_HEAD:-abc123}"
+printf '{"id":1,"commit_id":"%s"}\n' "${P4B_FAKE_CREATED_REVIEW_HEAD:-abc123abc123abc123abc123abc123abc123abcd}"
 SH
 chmod +x "$BIN/fake-gh-as-reviewer"
 
@@ -599,10 +599,10 @@ else fail "filed join collision: $uf"; fi
 # fully specified F-id entry overrides disposition, fix_commit, AND issue.
 uf="$(printf '%s\n' '{"loop":1,"severity":"P2","path":"a.js","line":3,"body":"dup"}' \
   | p4b_acct_unique_findings \
-      '{"F1":{"disposition":"fixed","fix_commit":"abc123","issue":999}}' \
+      '{"F1":{"disposition":"fixed","fix_commit":"abc123abc123abc123abc123abc123abc123abcd","issue":999}}' \
       '[{"severity":"P2","path":"a.js","line":3,"body":"dup","issue":701}]')"
 if printf '%s' "$uf" | jq -e '
-    .[0].disposition == "fixed" and .[0].fix_commit == "abc123" and .[0].issue == 999' >/dev/null; then
+    .[0].disposition == "fixed" and .[0].fix_commit == "abc123abc123abc123abc123abc123abc123abcd" and .[0].issue == 999' >/dev/null; then
   pass "explicit F-id dispositions map wins per finding over the filed-issues channel (#675)"
 else fail "F-id precedence over filed channel: $uf"; fi
 
@@ -623,9 +623,9 @@ else fail "advisory_issues_filed derivation: $tt_filed"; fi
 # override keeps issue null instead of reattaching the filed follow-up.
 uf="$(printf '%s\n' '{"loop":1,"severity":"P2","path":"a.js","line":3,"body":"dup"}' \
   | p4b_acct_unique_findings \
-      '{"F1":{"disposition":"fixed","fix_commit":"abc123","issue":null}}' \
+      '{"F1":{"disposition":"fixed","fix_commit":"abc123abc123abc123abc123abc123abc123abcd","issue":null}}' \
       '[{"severity":"P2","path":"a.js","line":3,"body":"dup","issue":585}]')"
-if printf '%s' "$uf" | jq -e '.[0].disposition == "fixed" and .[0].fix_commit == "abc123" and .[0].issue == null' >/dev/null; then
+if printf '%s' "$uf" | jq -e '.[0].disposition == "fixed" and .[0].fix_commit == "abc123abc123abc123abc123abc123abc123abcd" and .[0].issue == null' >/dev/null; then
   pass "explicit F-id issue:null wins over the filed channel (key-presence, not null-coalescing) (#675)"
 else fail "explicit-null issue override: $uf"; fi
 # An F-id entry that OMITS the issue key still inherits the filed issue link.
@@ -810,7 +810,7 @@ echo "accounting.sh — fail-closed posting-rule assertion + record builder"
 # ===========================================================================
 mkloop() { # mkloop <n> <verdict> <P0> <P1> <fail_closed_bool> [head]
   jq -nc --argjson n "$1" --arg v "$2" --argjson p0 "$3" --argjson p1 "$4" --argjson fc "$5" \
-    --arg head "${6:-abc123}" '
+    --arg head "${6:-abc123abc123abc123abc123abc123abc123abcd}" '
     {loop:$n, reviewer:"nathanpayne-codex", adapter:"review-via-codex.sh",
      direction:"claude->codex", head_sha:$head, verdict:$v,
      posted:(if $fc then "not-posted" else "posted" end), fell_back:$fc,
@@ -824,16 +824,16 @@ mkloop() { # mkloop <n> <verdict> <P0> <P1> <fail_closed_bool> [head]
 }
 CLEAN_LOOP="$(mkloop 1 APPROVED 0 0 false)"
 CR_LOOP="$(mkloop 1 CHANGES_REQUESTED 0 1 false)"
-# A REAL fix advances the head: the CR loop's P1 is on abc123, and the approval
-# lands on def456 (a new commit). Same-head reruns are covered separately below.
-FIXED_LOOP="$(mkloop 2 APPROVED 0 0 false def456)"
+# A REAL fix advances the head: the CR loop's P1 is on abc123abc123abc123abc123abc123abc123abcd, and the approval
+# lands on def456def456def456def456def456def456def4 (a new commit). Same-head reruns are covered separately below.
+FIXED_LOOP="$(mkloop 2 APPROVED 0 0 false def456def456def456def456def456def456def4)"
 BAD_APPROVED_LOOP="$(mkloop 1 APPROVED 0 1 false)"
-GUARDED_BAD_LOOP="$(mkloop 2 APPROVED_WITH_ADVISORIES 0 1 true def456)"
+GUARDED_BAD_LOOP="$(mkloop 2 APPROVED_WITH_ADVISORIES 0 1 true def456def456def456def456def456def456def4)"
 
 p4b_acct_assert_no_required_with_approved "APPROVED" "[$CLEAN_LOOP]" \
   && pass "zero-finding APPROVED passes the posting-rule assertion" \
   || fail "clean APPROVED rejected"
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_LOOP,$FIXED_LOOP]" def456 \
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_LOOP,$FIXED_LOOP]" def456def456def456def456def456def456def4 \
   && pass "changes-requested-then-fixed history passes (P1 on a CR loop is legitimate history)" \
   || fail "changes-requested-then-fixed wrongly refused"
 p4b_acct_assert_no_required_with_approved "APPROVED" "[$BAD_APPROVED_LOOP]" \
@@ -846,7 +846,7 @@ NULLREQ_LOOP="$(printf '%s' "$CLEAN_LOOP" | jq -c '.findings.P1 = null')"
 p4b_acct_assert_no_required_with_approved "APPROVED" "[$NULLREQ_LOOP]" \
   && fail "null required-tier counts on the only approved loop accepted" \
   || pass "null required-tier counts cannot back a posted APPROVED (fail-closed)"
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_LOOP,$FIXED_LOOP,$GUARDED_BAD_LOOP]" def456 \
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_LOOP,$FIXED_LOOP,$GUARDED_BAD_LOOP]" def456def456def456def456def456def456def4 \
   && pass "a fail-closed-guarded findings-bearing approval is recorded history, not a violation" \
   || fail "guarded fail-closed loop wrongly poisons the record"
 p4b_acct_assert_no_required_with_approved "APPROVED" "$GOLDEN_LOOPS" \
@@ -856,28 +856,28 @@ RT_ZERO='{"source":"unavailable","records":0,"reason":"test"}'
 # --- Same-head unresolved required finding (#615 round 8, finding 3) ---------
 # FAILS pre-fix (the two-argument checks accept a CR-P1-then-clean-APPROVED on
 # the SAME head): the loop log only rotates after an approval posts, so a CR
-# loop with a P1 on abc123 survives a rerun-without-commit that returns a clean
-# APPROVED for the SAME abc123. Approving that would record a clean approval for
+# loop with a P1 on abc123abc123abc123abc123abc123abc123abcd survives a rerun-without-commit that returns a clean
+# APPROVED for the SAME abc123abc123abc123abc123abc123abc123abcd. Approving that would record a clean approval for
 # a head whose required finding was never fixed.
-CR_SAMEHEAD="$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)"
-RERUN_APPROVED_SAMEHEAD="$(mkloop 2 APPROVED 0 0 false abc123)"
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD,$RERUN_APPROVED_SAMEHEAD]" abc123 \
+CR_SAMEHEAD="$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123abc123abc123abc123abc123abc123abcd)"
+RERUN_APPROVED_SAMEHEAD="$(mkloop 2 APPROVED 0 0 false abc123abc123abc123abc123abc123abc123abcd)"
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD,$RERUN_APPROVED_SAMEHEAD]" abc123abc123abc123abc123abc123abc123abcd \
   && fail "same-head rerun laundered an unresolved P1 into a clean approval" \
   || pass "a clean APPROVED on the SAME head as an earlier unresolved required finding fails closed (finding 3)"
-# The fix path — the approval lands on a NEW head (def456) — still passes: the
-# required finding on abc123 was addressed by a real commit.
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD,$FIXED_LOOP]" def456 \
+# The fix path — the approval lands on a NEW head (def456def456def456def456def456def456def4) — still passes: the
+# required finding on abc123abc123abc123abc123abc123abc123abcd was addressed by a real commit.
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD,$FIXED_LOOP]" def456def456def456def456def456def456def4 \
   && pass "an approval on a NEW head clears the earlier required finding (real fix commit)" \
   || fail "new-head fix wrongly rejected by the same-head guard"
 # A P0 case on the same head is likewise rejected.
 CR_SAMEHEAD_P0="$(jq -c '.findings.P0 = 1 | .findings.P1 = 0' <<<"$CR_SAMEHEAD")"
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD_P0,$RERUN_APPROVED_SAMEHEAD]" abc123 \
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD_P0,$RERUN_APPROVED_SAMEHEAD]" abc123abc123abc123abc123abc123abc123abcd \
   && fail "same-head rerun laundered an unresolved P0" \
   || pass "a same-head unresolved P0 fails closed too (finding 3)"
 # A fail-closed-marked same-head required finding is legitimate recorded history
 # (it was already refused as an approval) and does NOT re-block.
-CR_SAMEHEAD_GUARDED="$(mkloop 1 APPROVED_WITH_ADVISORIES 0 1 true abc123)"
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD_GUARDED,$RERUN_APPROVED_SAMEHEAD]" abc123 \
+CR_SAMEHEAD_GUARDED="$(mkloop 1 APPROVED_WITH_ADVISORIES 0 1 true abc123abc123abc123abc123abc123abc123abcd)"
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD_GUARDED,$RERUN_APPROVED_SAMEHEAD]" abc123abc123abc123abc123abc123abc123abcd \
   && pass "a fail-closed-marked same-head required finding is history, not a re-block (finding 3)" \
   || fail "guarded same-head loop wrongly re-blocked"
 # Omitting the final head (or passing 'unknown') skips the same-head guard —
@@ -891,33 +891,33 @@ p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD,$RERUN_APPRO
 # mode would then demand a clean APPROVED loop that is not in the log and
 # refuse a VALID head-advanced approval; same_head_only applies exactly the
 # laundering clause and nothing record-scoped.
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" def456 same_head_only \
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" def456def456def456def456def456def456def4 same_head_only \
   && pass "same_head_only: head-advanced approval passes with only a prior CR-P1 loop in the log (current loop unrecorded) (round 9 CodeRabbit)" \
   || fail "same_head_only wrongly refused a head-advanced approval whose current loop is unrecorded"
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" def456 \
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" def456def456def456def456def456def456def4 \
   && fail "full mode accepted a final APPROVED with no clean approved loop (record-context regression)" \
   || pass "full mode still requires the clean APPROVED loop (record context unchanged)"
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" abc123 same_head_only \
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" abc123abc123abc123abc123abc123abc123abcd same_head_only \
   && fail "same_head_only laundered a same-head unresolved P1" \
   || pass "same_head_only still fails closed on a same-head unresolved required finding"
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" def456 bogus-mode \
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" def456def456def456def456def456def456def4 bogus-mode \
   && fail "an unrecognized mode weakened the assertion (must behave as full)" \
   || pass "an unrecognized mode falls back to full (stricter is the safe direction)"
 # build_record threads its final-head argument into the guard: a same-head
 # rerun record is REFUSED (fails pre-fix).
-p4b_acct_build_record 55 abc123 APPROVED nathanpayne-codex "claude->codex" posted "" \
+p4b_acct_build_record 55 abc123abc123abc123abc123abc123abc123abcd APPROVED nathanpayne-codex "claude->codex" posted "" \
   "[$CR_SAMEHEAD,$RERUN_APPROVED_SAMEHEAD]" "[]" \
   "$(p4b_acct_compute_totals "[$CR_SAMEHEAD,$RERUN_APPROVED_SAMEHEAD]" "" null '[]')" "$RT_ZERO" "" >/dev/null 2>&1 \
   && fail "build_record emitted a same-head laundered approval" \
   || pass "build_record refuses a same-head laundered approval (finding 3, head threaded)"
 
-rec="$(p4b_acct_build_record 42 def456 APPROVED nathanpayne-codex "claude->codex" posted "" \
+rec="$(p4b_acct_build_record 42 def456def456def456def456def456def456def4 APPROVED nathanpayne-codex "claude->codex" posted "" \
   "[$CR_LOOP,$FIXED_LOOP]" "[]" \
   "$(p4b_acct_compute_totals "[$CR_LOOP,$FIXED_LOOP]" "" null '[]')" "$RT_ZERO" "2026-07-01T00:00:00Z")"
 if [ -n "$rec" ] && printf '%s' "$rec" | jq -e '.schema == "p4b-accounting/v1" and (.loops | length) == 2 and .wall_time_first_loop_to_approval_seconds == null' >/dev/null; then
   pass "build_record assembles a changes-requested-then-fixed record"
 else fail "build_record: $rec"; fi
-p4b_acct_build_record 42 abc123 APPROVED r d posted "" "[$BAD_APPROVED_LOOP]" "[]" "{}" "$RT_ZERO" "" >/dev/null \
+p4b_acct_build_record 42 abc123abc123abc123abc123abc123abc123abcd APPROVED r d posted "" "[$BAD_APPROVED_LOOP]" "[]" "{}" "$RT_ZERO" "" >/dev/null \
   && fail "build_record emitted an illegal APPROVED record" \
   || pass "build_record refuses a findings-bearing APPROVED (fail-closed, no output)"
 p4b_acct_build_record "abc" x APPROVED r d posted "" "[$CLEAN_LOOP]" "[]" "{}" "$RT_ZERO" "" >/dev/null \
@@ -1497,7 +1497,7 @@ grep -q '| Plan-capacity throttle events | not captured |' <<<"$ZBLOCK" \
 # the golden render tests above).
 CFULL_LOOP="$(printf '%s' "$CLEAN_LOOP" | jq -c '.tokens = {total:150, input:100, output:50, cache_creation:null, cache_read:null, reasoning:null, cost_usd:0.42, source:"claude-json"}')"
 CTOT="$(p4b_acct_compute_totals "[$CFULL_LOOP]" "test-1" "0.66" '[]')"
-CREC="$(p4b_acct_build_record 9 abc123 APPROVED nathanpayne-claude "codex->claude" posted 9 \
+CREC="$(p4b_acct_build_record 9 abc123abc123abc123abc123abc123abc123abcd APPROVED nathanpayne-claude "codex->claude" posted 9 \
   "[$CFULL_LOOP]" "[]" "$CTOT" "$RT_ZERO" "2026-07-01T00:00:00Z")"
 CBLOCK="$(p4b_acct_render_block "$CREC")"
 grep -qF  -- '~$0.42 *(not billed; CLI-reported)*' <<<"$CBLOCK" \
@@ -1621,7 +1621,7 @@ echo "accounting.sh — loop-log JSONL integrity + object-count numbering (#615 
 if (
   P4B_ACCT_STATE_DIR="$WORK/state-jsonl"; export P4B_ACCT_STATE_DIR
   REPO="o/r"; PR=301; REVIEWER=nathanpayne-codex; ADAPTER=codex
-  DIRECTION="claude->codex"; HEAD=abc123
+  DIRECTION="claude->codex"; HEAD=abc123abc123abc123abc123abc123abc123abcd
   VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[]}'
   p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
   p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
@@ -1646,7 +1646,7 @@ else fail "corrected loop log lost its JSONL shape or its correction"; fi
 if (
   P4B_ACCT_STATE_DIR="$WORK/state-prettylog"; export P4B_ACCT_STATE_DIR
   REPO="o/r"; PR=302; REVIEWER=nathanpayne-codex; ADAPTER=codex
-  DIRECTION="claude->codex"; HEAD=abc123
+  DIRECTION="claude->codex"; HEAD=abc123abc123abc123abc123abc123abc123abcd
   log="$(p4b_acct_hook_loop_log)"
   mkdir -p "$(dirname "$log")"
   # one record, PRETTY-PRINTED across many lines (simulated non-compact write)
@@ -1708,20 +1708,20 @@ else fail "absent cli_version key was not handled as null"; fi
 
 # Approval-time same-head gate at the HOOK level (#615 round 9, CodeRabbit;
 # fails pre-fix): a live log holding ONLY a prior CR-P1 loop, current loop
-# unrecorded. A head-advanced approval (def456) must be SAFE (pre-fix the
+# unrecorded. A head-advanced approval (def456def456def456def456def456def456def4) must be SAFE (pre-fix the
 # full-mode record clauses refused it: no clean APPROVED loop in the log); a
-# same-head rerun (abc123) must still BLOCK (the laundering clause survives
+# same-head rerun (abc123abc123abc123abc123abc123abc123abcd) must still BLOCK (the laundering clause survives
 # the mode split).
 # shellcheck disable=SC2034  # orchestrator globals read by the sourced hook
 if (
   P4B_ACCT_STATE_DIR="$WORK/state-samehead-hook"; export P4B_ACCT_STATE_DIR
-  REPO="o/r"; PR=303; HEAD=def456
+  REPO="o/r"; PR=303; HEAD=def456def456def456def456def456def456def4
   log="$(p4b_acct_hook_loop_log)"
   mkdir -p "$(dirname "$log")"
-  jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)" \
+  jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123abc123abc123abc123abc123abc123abcd)" \
     '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$log"
   p4b_acct_hook_same_head_required_block || exit 1
-  HEAD=abc123
+  HEAD=abc123abc123abc123abc123abc123abc123abcd
   p4b_acct_hook_same_head_required_block && exit 1
   exit 0
 ); then
@@ -1742,7 +1742,7 @@ else fail "approval-time hook safe/block split wrong on an unrecorded current lo
 if (
   P4B_ACCT_STATE_DIR="$WORK/state-reqtier-fallback"; export P4B_ACCT_STATE_DIR
   REPO="o/r"; PR=340; REVIEWER=nathanpayne-codex; ADAPTER=codex
-  DIRECTION="claude->codex"; HEAD=abc123
+  DIRECTION="claude->codex"; HEAD=abc123abc123abc123abc123abc123abc123abcd
   # An APPROVED verdict carrying a required-tier (P1) finding: what the adapter
   # returned and validate_verdict rejected. VERDICT_JSON is still set (it parsed).
   VERDICT_JSON='{"verdict":"APPROVED","summary":"ok despite issue","findings":[{"severity":"P1","path":"a.js","line":3,"body":"unsafe"}]}'
@@ -1771,7 +1771,7 @@ else fail "required-tier fail-closed accounting ($(cat "$WORK/state-reqtier-fall
 if (
   P4B_ACCT_STATE_DIR="$WORK/state-malformed-fallback"; export P4B_ACCT_STATE_DIR
   REPO="o/r"; PR=341; REVIEWER=nathanpayne-codex; ADAPTER=codex
-  DIRECTION="claude->codex"; HEAD=abc123
+  DIRECTION="claude->codex"; HEAD=abc123abc123abc123abc123abc123abc123abcd
   VERDICT_JSON='not even json'
   p4b_acct_hook_note_fallback "adapter returned a non-conformant verdict" || exit 1
   log="$(p4b_acct_hook_loop_log)"
@@ -1842,7 +1842,7 @@ else fail "own-pending commit (ledger=$(cat "$WORK/state-ownpending/phase-4b-led
 if (
   P4B_ACCT_STATE_DIR="$WORK/state-logreset"; export P4B_ACCT_STATE_DIR
   REPO="o/r"; PR=332; REVIEWER=nathanpayne-codex; ADAPTER=codex
-  DIRECTION="claude->codex"; HEAD=abc123
+  DIRECTION="claude->codex"; HEAD=abc123abc123abc123abc123abc123abc123abcd
   VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[]}'
   P4B_ACCT_RUN_ID="reset-run"; export P4B_ACCT_RUN_ID
   log="$(p4b_acct_hook_loop_log)"
@@ -1881,7 +1881,7 @@ else fail "loop-log reset (live=$(jq -s length "$WORK/state-logreset/phase-4b-lo
 if (
   P4B_ACCT_STATE_DIR="$WORK/state-norecord-rotate"; export P4B_ACCT_STATE_DIR
   REPO="o/r"; PR=350; REVIEWER=nathanpayne-codex; ADAPTER=codex
-  DIRECTION="claude->codex"; HEAD=abc123
+  DIRECTION="claude->codex"; HEAD=abc123abc123abc123abc123abc123abc123abcd
   VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[]}'
   P4B_ACCT_RUN_ID="norecord-run"; export P4B_ACCT_RUN_ID
   log="$(p4b_acct_hook_loop_log)"; archive="${log}.archive"
@@ -1909,7 +1909,7 @@ else fail "no-record rotation (live=$(jq -s length "$WORK/state-norecord-rotate/
 if (
   P4B_ACCT_STATE_DIR="$WORK/state-mismatch-rotate"; export P4B_ACCT_STATE_DIR
   REPO="o/r"; PR=351; REVIEWER=nathanpayne-codex; ADAPTER=codex
-  DIRECTION="claude->codex"; HEAD=abc123
+  DIRECTION="claude->codex"; HEAD=abc123abc123abc123abc123abc123abc123abcd
   VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[]}'
   P4B_ACCT_RUN_ID="mine-mismatch"; export P4B_ACCT_RUN_ID
   log="$(p4b_acct_hook_loop_log)"; archive="${log}.archive"
@@ -1976,7 +1976,7 @@ echo "orchestrator — accounting hook (fail-open, exit codes preserved)"
 run_orch() { # run_orch <state-dir> <policy> <codex-fake> <pr> [extra env as VAR=VAL...] -- [extra args...]
   # Extra env vars come LAST so a test can override the defaults below (env
   # takes the last assignment); extra args land after the defaults, and the
-  # orchestrator flag parser is last-wins, so e.g. `-- --head def456` works.
+  # orchestrator flag parser is last-wins, so e.g. `-- --head def456def456def456def456def456def456def4` works.
   local state="$1" policy="$2" fake="$3" pr="$4"; shift 4
   local -a envs=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
@@ -1986,9 +1986,9 @@ run_orch() { # run_orch <state-dir> <policy> <codex-fake> <pr> [extra env as VAR
     P4B_ACCT_STATE_DIR="$state" \
     CODEX_BIN="$BIN/$fake" \
     P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
-    P4B_FAKE_LIVE_HEAD=abc123 \
+    P4B_FAKE_LIVE_HEAD=abc123abc123abc123abc123abc123abc123abcd \
     "${envs[@]:-_P4B_NOOP=1}" \
-    bash "$ORCH" "$pr" --repo o/r --author claude --head abc123 --diff-file "$DIFF" "$@"
+    bash "$ORCH" "$pr" --repo o/r --author claude --head abc123abc123abc123abc123abc123abc123abcd --diff-file "$DIFF" "$@"
 }
 
 # (a) APPROVED posted with accounting on → block embedded, record parses,
@@ -2088,7 +2088,7 @@ _a3c_i=1
 while [ "$_a3c_i" -le 150 ]; do
   jq -nc --argjson n "$_a3c_i" '{schema:"p4b-loop-log/v1", started_at_epoch:1700000000,
     loop:{loop:$n, reviewer:"nathanpayne-codex", adapter:"review-via-codex.sh",
-      direction:"claude->codex", head_sha:"abc123", verdict:"APPROVED",
+      direction:"claude->codex", head_sha:"abc123abc123abc123abc123abc123abc123abcd", verdict:"APPROVED",
       posted:"posted", fell_back:false, elapsed_seconds:10,
       tokens:{total:100,input:null,output:null,cache_creation:null,cache_read:null,reasoning:null,cost_usd:null,source:"codex-stderr"},
       findings:{P0:0,P1:0,P2:0,P3:0,nitpick:0,unknown:0},
@@ -2215,7 +2215,7 @@ set -e
 if [ "$rc" = 0 ] \
    && ! grep -q 'Phase 4b Approval Accounting' "$BODY_C" \
    && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_C" \
-   && grep -q 'Reviewed head: `abc123`' "$BODY_C"; then
+   && grep -q 'Reviewed head: `abc123abc123abc123abc123abc123abc123abcd`' "$BODY_C"; then
   pass "report-generation error → plain-summary approval still posts with exit 0 (fail-open for reporting only)"
 else fail "generation-error fallback (rc=$rc, body=$(cat "$BODY_C" 2>/dev/null | head -3))"; fi
 
@@ -2308,14 +2308,14 @@ else
 fi
 
 # (c5) the safety direction of the same split: identical setup but the prior
-#      unresolved CR-P1 sits on the RUN head itself (abc123) — the rerun
+#      unresolved CR-P1 sits on the RUN head itself (abc123abc123abc123abc123abc123abc123abcd) — the rerun
 #      without a fix commit must STILL be refused to the manual handoff even
 #      though its own record append failed (the gate must not need the
 #      current loop to enforce the laundering block).
 STATE_C5="$WORK/state-c5"; BODY_C5="$WORK/body-c5.md"
 LOG_C5="$(P4B_ACCT_STATE_DIR="$STATE_C5" REPO="o/r" PR=308 p4b_acct_hook_loop_log)"
 mkdir -p "$(dirname "$LOG_C5")"
-jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)" \
+jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123abc123abc123abc123abc123abc123abcd)" \
   '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_C5"
 lock_rc=0
 LOCK_C5="$(make_file_unappendable "$LOG_C5")" || lock_rc=$?
@@ -2342,7 +2342,7 @@ fi
 STATE_C6="$WORK/state-c6"; BODY_C6="$WORK/body-c6.md"
 LOG_C6="$(P4B_ACCT_STATE_DIR="$STATE_C6" REPO="o/r" PR=309 p4b_acct_hook_loop_log)"
 mkdir -p "$(dirname "$LOG_C6")"
-jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)" \
+jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123abc123abc123abc123abc123abc123abcd)" \
   '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_C6"
 set +e
 out="$(run_orch "$STATE_C6" "$POLICY_ACCT_OFF" fake-codex-approve 309 P4B_WRAPPER_BODY="$BODY_C6" -- 2>/dev/null)"; rc=$?
@@ -2370,14 +2370,14 @@ else fail "ACCT-OFF head-advanced approval over-blocked (rc=$rc, out=$(printf '%
 
 # (d) changes-requested-then-fixed across two invocations: loop history
 #     accumulates and the final approval renders both loops + the lifecycle.
-#     The fix lands as a NEW head (def456), so the loop-1 finding must be
+#     The fix lands as a NEW head (def456def456def456def456def456def456def4), so the loop-1 finding must be
 #     labeled historical, never current-head (#615 Codex).
 STATE_D="$WORK/state-d"; BODY_D1="$WORK/body-d1.md"; BODY_D2="$WORK/body-d2.md"
 set +e
 run_orch "$STATE_D" "$POLICY_ON" fake-codex-changes 204 P4B_WRAPPER_BODY="$BODY_D1" -- >/dev/null 2>&1; rc1=$?
 run_orch "$STATE_D" "$POLICY_ON" fake-codex-approve 204 \
-  P4B_WRAPPER_BODY="$BODY_D2" P4B_FAKE_LIVE_HEAD=def456 P4B_FAKE_CREATED_REVIEW_HEAD=def456 \
-  -- --head def456 >/dev/null 2>&1; rc2=$?
+  P4B_WRAPPER_BODY="$BODY_D2" P4B_FAKE_LIVE_HEAD=def456def456def456def456def456def456def4 P4B_FAKE_CREATED_REVIEW_HEAD=def456def456def456def456def456def456def4 \
+  -- --head def456def456def456def456def456def456def4 >/dev/null 2>&1; rc2=$?
 set -e
 REC_D="$(p4b_acct_extract_records < "$BODY_D2" 2>/dev/null || true)"
 if [ "$rc1" = 1 ] && [ "$rc2" = 0 ] \
@@ -2394,7 +2394,7 @@ if [ "$rc1" = 1 ] && [ "$rc2" = 0 ] \
   pass "changes-requested-then-fixed: exit codes 1 then 0 preserved; final record carries both loops + finding lifecycle"
 else fail "CR-then-fixed (rc1=$rc1 rc2=$rc2, rec=$REC_D)"; fi
 if printf '%s' "$REC_D" | jq -e '
-     .final_head_sha == "def456"
+     .final_head_sha == "def456def456def456def456def456def456def4"
      and .unique_findings[0].path == "x.js" and .unique_findings[0].line == 2
      and .unique_findings[0].title == "bug here"' >/dev/null 2>&1 \
    && grep -qF '| F1 | P1 | `x.js:2` | bug here | historical | 1 | 1 | unresolved | — |' "$BODY_D2" \
@@ -2505,7 +2505,7 @@ else fail "dry-run rehearsal leaked into real accounting (rc1=$rc1 rc2=$rc2, loo
 STATE_F3="$WORK/state-f3"
 LOG_F3="$(P4B_ACCT_STATE_DIR="$STATE_F3" REPO="o/r" PR=208 p4b_acct_hook_loop_log)"
 mkdir -p "$(dirname "$LOG_F3")"
-jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)" \
+jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123abc123abc123abc123abc123abc123abcd)" \
   '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_F3"
 F3_BEFORE="$(cat "$LOG_F3")"
 set +e
@@ -2616,9 +2616,9 @@ else fail "POST-failure correction (rc=$rc, ledger=$(cat "$STATE_J/phase-4b-ledg
 #      laundered approval made the record builder return non-zero, the render
 #      hook propagated that as an ordinary ADVISORY report-generation failure,
 #      and the orchestrator posted the plain-summary APPROVED anyway. Pre-seed
-#      the live loop log with a prior CHANGES_REQUESTED + P1 on head abc123 (the
+#      the live loop log with a prior CHANGES_REQUESTED + P1 on head abc123abc123abc123abc123abc123abc123abcd (the
 #      log has NOT rotated because no approval posted), then run the orchestrator
-#      on the SAME head abc123 with a clean APPROVED (no fix commit). The
+#      on the SAME head abc123abc123abc123abc123abc123abc123abcd with a clean APPROVED (no fix commit). The
 #      approval MUST now be REFUSED via the manual handoff (exit 4), the review
 #      MUST NOT post, and no ledger record is written.
 STATE_J2="$WORK/state-j2"; BODY_J2="$WORK/body-j2.md"
@@ -2627,7 +2627,7 @@ mkdir -p "$STATE_J2/phase-4b-loops"
 # {schema, started_at_epoch, loop:{…}, details:[…]}); the render/guard read .loop.
 jq -nc '{schema:"p4b-loop-log/v1", started_at_epoch:1700000000,
   loop:{loop:1, reviewer:"nathanpayne-codex", adapter:"review-via-codex.sh",
-    direction:"claude->codex", head_sha:"abc123", verdict:"CHANGES_REQUESTED",
+    direction:"claude->codex", head_sha:"abc123abc123abc123abc123abc123abc123abcd", verdict:"CHANGES_REQUESTED",
     posted:"posted", fell_back:false, elapsed_seconds:10,
     tokens:{total:null,input:null,output:null,cache_creation:null,cache_read:null,reasoning:null,cost_usd:null,source:"unavailable"},
     findings:{P0:0,P1:1,P2:0,P3:0,nitpick:0,unknown:0},
@@ -2645,14 +2645,14 @@ if [ "$rc" = 4 ] \
    && [ ! -e "$STATE_J2/phase-4b-ledger.jsonl" ]; then
   pass "a clean APPROVED rerun on the SAME head as a prior unresolved required finding is REFUSED (exit 4, no post) via the orchestrator (finding 2)"
 else fail "same-head required block via review path (rc=$rc, out=$out, body_bytes=$(wc -c < "$BODY_J2" 2>/dev/null), ledger=$( [ -e "$STATE_J2/phase-4b-ledger.jsonl" ] && echo present || echo absent))"; fi
-# Control: the SAME prior CR+P1 on abc123, but the approval lands on a NEW head
-# (def456 = a real fix commit) still POSTS — the guard permits the legitimate
+# Control: the SAME prior CR+P1 on abc123abc123abc123abc123abc123abc123abcd, but the approval lands on a NEW head
+# (def456def456def456def456def456def456def4 = a real fix commit) still POSTS — the guard permits the legitimate
 # changes-requested-then-fixed path and does not over-block.
 STATE_J2B="$WORK/state-j2b"; BODY_J2B="$WORK/body-j2b.md"
 mkdir -p "$STATE_J2B/phase-4b-loops"
 jq -nc '{schema:"p4b-loop-log/v1", started_at_epoch:1700000000,
   loop:{loop:1, reviewer:"nathanpayne-codex", adapter:"review-via-codex.sh",
-    direction:"claude->codex", head_sha:"abc123", verdict:"CHANGES_REQUESTED",
+    direction:"claude->codex", head_sha:"abc123abc123abc123abc123abc123abc123abcd", verdict:"CHANGES_REQUESTED",
     posted:"posted", fell_back:false, elapsed_seconds:10,
     tokens:{total:null,input:null,output:null,cache_creation:null,cache_read:null,reasoning:null,cost_usd:null,source:"unavailable"},
     findings:{P0:0,P1:1,P2:0,P3:0,nitpick:0,unknown:0},
@@ -2663,9 +2663,9 @@ jq -nc '{schema:"p4b-loop-log/v1", started_at_epoch:1700000000,
 set +e
 out="$(env PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   P4B_ACCT_STATE_DIR="$STATE_J2B" CODEX_BIN="$BIN/fake-codex-approve" \
-  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_FAKE_LIVE_HEAD=def456 \
-  P4B_FAKE_CREATED_REVIEW_HEAD=def456 P4B_WRAPPER_BODY="$BODY_J2B" \
-  bash "$ORCH" 235 --repo o/r --author claude --head def456 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_FAKE_LIVE_HEAD=def456def456def456def456def456def456def4 \
+  P4B_FAKE_CREATED_REVIEW_HEAD=def456def456def456def456def456def456def4 P4B_WRAPPER_BODY="$BODY_J2B" \
+  bash "$ORCH" 235 --repo o/r --author claude --head def456def456def456def456def456def456def4 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null; then
@@ -2746,10 +2746,10 @@ out="$(env PATH="$BIN:$PATH" \
   P4B_ACCT_STATE_DIR="$STATE_M" \
   CLAUDE_BIN="$BIN/fake-claude-cache-usage" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
-  P4B_FAKE_LIVE_HEAD=abc123 \
+  P4B_FAKE_LIVE_HEAD=abc123abc123abc123abc123abc123abc123abcd \
   P4B_WRAPPER_BODY="$BODY_M" \
   bash "$ORCH" 213 --repo o/r --author codex --reviewer nathanpayne-claude \
-    --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+    --head abc123abc123abc123abc123abc123abc123abcd --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 REC_M="$(p4b_acct_extract_records < "$BODY_M" 2>/dev/null || true)"
 if [ "$rc" = 0 ] && [ -n "$REC_M" ] \

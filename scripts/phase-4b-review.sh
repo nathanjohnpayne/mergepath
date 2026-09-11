@@ -9,7 +9,10 @@
 # APPROVED review on the current HEAD from a non-author reviewer identity
 # is exactly the "Phase 4b substitute" clearance the existing merge gate
 # (scripts/codex-review-check.sh, codex.allow_phase_4b_substitute, #218)
-# already accepts — so this script changes NO merge-gate code.
+# accepts. Automated approvals also carry a first-line provider-evidence
+# record that the merge gate revalidates before treating the review as a
+# substitute; timeout-derived clearance is therefore bound to its exact
+# Phase 4a trigger generation.
 #
 # Design: plans/automated-phase-4b-handoff.md.
 #
@@ -459,6 +462,7 @@ BARRIER_CODERABBIT_RATE_LIMITED=false
 # Run the same-head barrier and act on it. Escalation routes to the existing
 # manual handoff; only the non-terminal case takes the new hold path.
 P4B_PRE_ADAPTER_CODEX_EVIDENCE=""
+P4B_PRE_ADAPTER_TIMEOUT_TRIGGER_ID=""
 run_same_head_barrier() {
   local where="$1" out rc=0
   out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN")" || rc=$?
@@ -466,6 +470,13 @@ run_same_head_barrier() {
     0)
       if [ "$where" = "pre-adapter" ]; then
         P4B_PRE_ADAPTER_CODEX_EVIDENCE="$(printf '%s' "$out" | jq -r '.codex_evidence // "unreadable"')"
+        P4B_PRE_ADAPTER_TIMEOUT_TRIGGER_ID="$(printf '%s' "$out" | jq -r '.codex_timeout_trigger_comment_id // empty')"
+        if [ "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" = timeout ]; then
+          codex_phase4a_comment_id_ok "$P4B_PRE_ADAPTER_TIMEOUT_TRIGGER_ID" \
+            || fall_back_to_manual "external review barrier ($where): timeout evidence omitted a valid trigger generation"
+        elif [ -n "$P4B_PRE_ADAPTER_TIMEOUT_TRIGGER_ID" ]; then
+          fall_back_to_manual "external review barrier ($where): non-timeout evidence carried an unexpected timeout trigger generation"
+        fi
       fi
       # An open barrier is normally silent — every enabled provider reported
       # and there is nothing to say. #1178 adds one shape that opens on a
@@ -511,9 +522,19 @@ cleanup_timeout_revalidation_side_effects() {
 revalidate_phase4a_timeout_generation() {
   local where="${1:-post-adapter}"
   [ "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" = timeout ] || return 0
-  local out rc=0 state why
+  local out rc=0 state why observed_trigger=""
   out="$(p4b_codex_timeout_determination "$REPO" "$PR" "$HEAD")" || rc=$?
   state="$(printf '%s' "$out" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+  if [ "$rc" -eq 0 ]; then
+    observed_trigger="$(printf '%s' "$out" | jq -r '.trigger_comment_id // empty' 2>/dev/null || true)"
+    if ! codex_phase4a_comment_id_ok "$observed_trigger"; then
+      rc=2
+      state="malformed-generation"
+    elif [ "$observed_trigger" != "$P4B_PRE_ADAPTER_TIMEOUT_TRIGGER_ID" ]; then
+      rc=1
+      state="replacement-timeout"
+    fi
+  fi
   case "$rc" in
     0) return 0 ;;
     1)
@@ -665,6 +686,33 @@ FINDINGS_COUNT="$(printf '%s' "$VERDICT_JSON" | jq -r '.findings | length')"
 TOKEN_COUNT="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.token_count // empty')"
 USAGE_SOURCE="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.source // empty')"
 ADAPTER_RUNS=1
+
+# A review POST cannot atomically lock the PR issue timeline. Carry the exact
+# provider evidence that opened the pre-adapter barrier into the automated
+# review body so the later merge-clearance read can revalidate a timeout-bound
+# approval against the then-live latest author trigger. Non-timeout modes carry
+# an explicit `none` trigger rather than sharing the timeout namespace.
+P4B_PROVIDER_EVIDENCE_MARKER=""
+if [ "$DRY_RUN" != true ]; then
+  case "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" in
+    signal|account-or-connection-block|disabled)
+      [ -z "$P4B_PRE_ADAPTER_TIMEOUT_TRIGGER_ID" ] \
+        || fall_back_to_manual "non-timeout provider evidence carried an unexpected timeout trigger generation"
+      _p4b_timeout_trigger=none
+      ;;
+    timeout)
+      codex_phase4a_comment_id_ok "$P4B_PRE_ADAPTER_TIMEOUT_TRIGGER_ID" \
+        || fall_back_to_manual "timeout provider evidence omitted a valid trigger generation"
+      _p4b_timeout_trigger="$P4B_PRE_ADAPTER_TIMEOUT_TRIGGER_ID"
+      ;;
+    *)
+      fall_back_to_manual "unrecognized pre-adapter Codex evidence (${P4B_PRE_ADAPTER_CODEX_EVIDENCE:-empty})"
+      ;;
+  esac
+  P4B_PROVIDER_EVIDENCE_MARKER="$(codex_phase4b_clearance_marker_body \
+    "$HEAD" "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" "$_p4b_timeout_trigger")" \
+    || fall_back_to_manual "could not render the automated Phase 4b clearance-evidence record"
+fi
 
 # p4b_file_post_review_issues <verdict-json>
 # Policy step 9 executor (#672): one `post-review` + `observation` issue per
@@ -905,6 +953,9 @@ fi
 BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
 # (cleanup is owned by the _p4b_cleanup_tmp EXIT trap installed above)
 {
+  if [ -n "$P4B_PROVIDER_EVIDENCE_MARKER" ]; then
+    printf '%s\n\n' "$P4B_PROVIDER_EVIDENCE_MARKER"
+  fi
   printf '**Automated Phase 4b review** (%s, reviewer %s)\n\n' "$DIRECTION" "$REVIEWER"
   printf '%s\n' "$SUMMARY"
   printf '\n### Review Metadata\n\n'
@@ -1220,6 +1271,8 @@ jq -n \
   --arg usage_source "$USAGE_SOURCE" \
   --argjson adapter_timeout "$ADAPTER_TIMEOUT" \
   --arg effort "$EFFECTIVE_EFFORT" \
+  --arg codex_evidence "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" \
+  --arg timeout_trigger "$P4B_PRE_ADAPTER_TIMEOUT_TRIGGER_ID" \
   --argjson findings_count "$FINDINGS_COUNT" \
   --arg enabled_via "$ENABLED_VIA" '
   {
@@ -1235,6 +1288,8 @@ jq -n \
     findings_count: $findings_count,
     adapter_timeout_seconds: $adapter_timeout,
     reviewer_effort: (if $effort == "" then null else $effort end),
+    codex_evidence: (if $codex_evidence == "" then null else $codex_evidence end),
+    codex_timeout_trigger_comment_id: (if $timeout_trigger == "" then null else ($timeout_trigger | tonumber) end),
     token_count: (if $token_count == "" then null else ($token_count | tonumber) end),
     usage_source: (if $usage_source == "" then null else $usage_source end),
     fell_back_to_manual: false,

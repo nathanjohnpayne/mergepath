@@ -2290,6 +2290,187 @@ crc_select_codex_block_marker() {
 }
 # END codex_block_marker_selector
 
+# BEGIN phase4b_approver_selector
+# Select the newest eligible Phase 4b substitute after collapsing each
+# reviewer's opinionated reviews on HEAD to that reviewer's latest state.
+# Manual approvals preserve their existing behavior. Automated approvals must
+# carry the strict first-line clearance record parsed by the shared marker
+# library. A timeout-derived approval is eligible only while its exact trigger
+# generation is still the live Phase 4a timeout generation.
+#
+# crc_select_phase4b_approver <reviews-json> <reviewers-json> <pr-author>
+#   <same-agent-reviewer> <head-sha> <live-timeout-state-json>
+# Emits the selected review object or `null`. Returns 2 when the inputs or the
+# shared parser are unavailable, allowing the caller to report infrastructure
+# failure instead of grading unreadable provenance as absence.
+crc_select_phase4b_approver() {
+  local reviews=${1:-[]} reviewers=${2:-[]} author=${3:-}
+  local same_agent_reviewer=${4:-} head=${5:-} timeout_state=${6:-'{"state":"none"}'}
+  local candidates review body marker marker_state evidence marker_head
+  local marker_trigger timeout_live_state timeout_live_trigger submitted best='null'
+  local unreadable_automated=false
+
+  case "$head" in ''|*[!0-9a-f]*) return 2 ;; esac
+  [ "${#head}" -eq 40 ] || [ "${#head}" -eq 64 ] || return 2
+  printf '%s' "$reviews" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
+  printf '%s' "$reviewers" | jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 || return 2
+  printf '%s' "$timeout_state" | jq -e 'type == "object" and ((.state // "") | type == "string")' >/dev/null 2>&1 || return 2
+
+  candidates="$(printf '%s' "$reviews" | jq -c \
+    --argjson reviewers "$reviewers" \
+    --arg author "$author" \
+    --arg same_agent_reviewer "$same_agent_reviewer" \
+    --arg sha "$head" '
+      [ .[]
+        | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+        | select(.commit_id == $sha)
+        | select(.user.login as $u | $reviewers | index($u))
+        | select(.user.login != $author)
+        | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
+      ]
+      | group_by(.user.login)
+      | map(max_by([.submitted_at, (.id // 0)]))
+      | map(select(.state == "APPROVED"))
+      | .[]
+    ' 2>/dev/null)" || return 2
+
+  while IFS= read -r review; do
+    [ -n "$review" ] || continue
+    body="$(printf '%s' "$review" | jq -r '.body // ""')" || return 2
+    case "$body" in
+      *'<!-- mergepath-phase-4b-clearance:'*)
+        # Manual approvals do not depend on the propagated parser. An
+        # automated review does. Propagation skew makes that candidate
+        # unreadable, but it must not invalidate an independently sufficient
+        # manual approval from another reviewer.
+        if ! declare -F codex_phase4b_clearance_marker_parse >/dev/null 2>&1; then
+          unreadable_automated=true
+          continue
+        fi
+        marker="$(codex_phase4b_clearance_marker_parse "$body")" || return 2
+        marker_state="$(printf '%s' "$marker" | jq -r '.state // "malformed"')" || return 2
+        ;;
+      '**Automated Phase 4b review**'*)
+        # A legacy automated approval is known to be missing the controlled
+        # record, so reject it without imposing a parser dependency.
+        continue
+        ;;
+      *) marker_state=absent ;;
+    esac
+
+    case "$marker_state" in
+      absent)
+        # Pre-record manual reviews remain valid. The orchestrator's legacy
+        # heading identifies an automated review whose missing record must not
+        # be mistaken for a manual approval.
+        ;;
+      valid)
+        marker_head="$(printf '%s' "$marker" | jq -r '.head // ""')"
+        [ "$marker_head" = "$head" ] || continue
+        evidence="$(printf '%s' "$marker" | jq -r '.codex_evidence // ""')"
+        marker_trigger="$(printf '%s' "$marker" | jq -r '.timeout_trigger_comment_id // empty')"
+        case "$evidence" in
+          timeout)
+            timeout_live_state="$(printf '%s' "$timeout_state" | jq -r '.state // "unreadable"')"
+            timeout_live_trigger="$(printf '%s' "$timeout_state" | jq -r '.trigger_comment_id // empty')"
+            [ "$timeout_live_state" = current ] || continue
+            [ -n "$marker_trigger" ] && [ "$marker_trigger" = "$timeout_live_trigger" ] || continue
+            ;;
+          signal|account-or-connection-block|disabled)
+            [ -z "$marker_trigger" ] || continue
+            ;;
+          *) continue ;;
+        esac
+        ;;
+      malformed) continue ;;
+      *) return 2 ;;
+    esac
+
+    submitted="$(printf '%s' "$review" | jq -r '.submitted_at // ""')" || return 2
+    if [ "$best" = null ] \
+       || [[ "$submitted" > "$(printf '%s' "$best" | jq -r '.submitted_at // ""')" ]]; then
+      best="$review"
+    fi
+  done < <(printf '%s\n' "$candidates")
+
+  if [ "$best" = null ] && [ "$unreadable_automated" = true ]; then
+    return 2
+  fi
+  printf '%s\n' "$best"
+}
+
+# Return 0 only when a latest-state APPROVED automated timeout candidate could
+# be eligible and therefore needs a fresh issue-timeline read; 1 when no such
+# candidate exists; 2 on malformed inputs. Collapse reviewer state FIRST so a
+# stale approval later replaced by CHANGES_REQUESTED cannot impose a new API
+# dependency on an otherwise-independent manual/non-timeout approval.
+crc_phase4b_needs_timeout_timeline() {
+  local reviews=${1:-[]} reviewers=${2:-[]} author=${3:-}
+  local same_agent_reviewer=${4:-} head=${5:-}
+  local candidates review body marker marker_state marker_head evidence
+  local timeout_candidate=false independent_candidate=false
+
+  case "$head" in ''|*[!0-9a-f]*) return 2 ;; esac
+  [ "${#head}" -eq 40 ] || [ "${#head}" -eq 64 ] || return 2
+  printf '%s' "$reviews" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
+  printf '%s' "$reviewers" | jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 || return 2
+
+  candidates="$(printf '%s' "$reviews" | jq -c \
+    --argjson reviewers "$reviewers" \
+    --arg author "$author" \
+    --arg same_agent_reviewer "$same_agent_reviewer" \
+    --arg sha "$head" '
+      [ .[]
+        | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+        | select(.commit_id == $sha)
+        | select(.user.login as $u | $reviewers | index($u))
+        | select(.user.login != $author)
+        | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
+      ]
+      | group_by(.user.login)
+      | map(max_by([.submitted_at, (.id // 0)]))
+      | map(select(.state == "APPROVED"))
+      | .[]
+    ' 2>/dev/null)" || return 2
+
+  # Only the authoritative shared grammar can classify a timeout record. If
+  # the helper has not propagated yet, the selector will fail closed for an
+  # automated-only candidate while still allowing an independent manual one;
+  # no issue-timeline dependency is justified by an unreadable marker.
+  declare -F codex_phase4b_clearance_marker_parse >/dev/null 2>&1 || return 1
+
+  while IFS= read -r review; do
+    [ -n "$review" ] || continue
+    body="$(printf '%s' "$review" | jq -r '.body // ""')" || return 2
+    case "$body" in
+      *'<!-- mergepath-phase-4b-clearance:'*) ;;
+      '**Automated Phase 4b review**'*) continue ;;
+      *)
+        independent_candidate=true
+        continue
+        ;;
+    esac
+    marker="$(codex_phase4b_clearance_marker_parse "$body")" || return 2
+    marker_state="$(printf '%s' "$marker" | jq -r '.state // "malformed"')" || return 2
+    [ "$marker_state" = valid ] || continue
+    marker_head="$(printf '%s' "$marker" | jq -r '.head // ""')" || return 2
+    [ "$marker_head" = "$head" ] || continue
+    evidence="$(printf '%s' "$marker" | jq -r '.codex_evidence // ""')" || return 2
+    case "$evidence" in
+      timeout) timeout_candidate=true ;;
+      signal|account-or-connection-block|disabled) independent_candidate=true ;;
+    esac
+  done < <(printf '%s\n' "$candidates")
+
+  # A manual or non-timeout approval is independently sufficient. Do not make
+  # its availability depend on the issue timeline merely because a different
+  # reviewer also has a timeout-derived candidate.
+  [ "$independent_candidate" = true ] && return 1
+  [ "$timeout_candidate" = true ] && return 0
+  return 1
+}
+# END phase4b_approver_selector
+
 CODEX_HEAD_VERDICT_TIME=""
 CODEX_HEAD_VERDICT_ANY_TIME=""
 CODEX_CARRYFORWARD_VERDICT_TIME=""
@@ -2302,6 +2483,7 @@ CODEX_SUMMARY_STATUS=""
 CODEX_SUMMARY_TIME=""
 CODEX_SUMMARY_COMMIT=""
 CODEX_SUMMARY_TRIGGER=""
+ISSUE_COMMENTS_JSON='[]'
 if [ "$CODEX_ENABLED" = "true" ]; then
   ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
   CODEX_SUMMARY_JSON=$(crc_select_codex_review_summary "$ISSUE_COMMENTS_JSON" "$BOT_LOGIN" "$HEAD_SHA")
@@ -2863,27 +3045,40 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
   # nathanpayne-claude posting APPROVED on HEAD — collapsing the
   # cross-agent guarantee Phase 4b is meant to provide. (Same
   # nathanpayne-codex Phase 4b finding on the 263caf3 sync wave.)
-  PHASE_4B_APPROVER=$(echo "$REVIEWS_JSON" | jq -r \
-    --argjson reviewers "$REVIEWERS_JSON" \
-    --arg author "$PR_AUTHOR" \
-    --arg same_agent_reviewer "$SAME_AGENT_REVIEWER" \
-    --arg sha "$HEAD_SHA" '
-      [ .[]
-        | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
-        | select(.commit_id == $sha)
-        | select(.user.login as $u | $reviewers | index($u))
-        | select(.user.login != $author)
-        | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
-      ]
-      | group_by(.user.login)
-      | map(max_by(.submitted_at))
-      | map(select(.state == "APPROVED"))
-      | max_by(.submitted_at)
-      | if . == null then "" else .user.login + "|" + .submitted_at end
-  ')
-  if [ -n "$PHASE_4B_APPROVER" ]; then
-    PHASE_4B_LOGIN="${PHASE_4B_APPROVER%|*}"
-    PHASE_4B_TIME="${PHASE_4B_APPROVER#*|}"
+  # A timeout-derived automated approval must be checked against a FRESH
+  # paginated issue timeline after the review list was read. Reusing the
+  # earlier gate-(c) snapshot leaves a same-head author trigger that lands
+  # between those reads invisible and lets an approval for generation A clear
+  # generation B. Non-timeout and manual approvals do not gain this API
+  # dependency.
+  PHASE_4B_TIMEOUT_STATE='{"state":"none"}'
+  _phase4b_timeout_scan_rc=0
+  crc_phase4b_needs_timeout_timeline \
+    "$REVIEWS_JSON" "$REVIEWERS_JSON" "$PR_AUTHOR" "$SAME_AGENT_REVIEWER" \
+    "$HEAD_SHA" || _phase4b_timeout_scan_rc=$?
+  case "$_phase4b_timeout_scan_rc" in
+    0)
+      [ "$CODEX_FAILURE_MARKERS_OK" = true ] \
+        || die 3 "cannot validate timeout-bound Phase 4b approval: shared marker parser unavailable"
+      PHASE_4B_LIVE_COMMENTS_JSON=$(fetch_api_array \
+        "repos/$REPO/issues/$PR_NUMBER/comments" "fresh Phase 4b timeout-generation comments")
+      PHASE_4B_TIMEOUT_STATE=$(codex_phase4a_timeout_marker_state \
+        "$HEAD_SHA" "$AUTHOR_IDENTITY" "$PHASE_4B_LIVE_COMMENTS_JSON")
+      ;;
+    1) : ;;
+    *) die 3 "could not classify Phase 4b timeout-bound approval candidates" ;;
+  esac
+
+  PHASE_4B_APPROVER_JSON='null'
+  _phase4b_select_rc=0
+  PHASE_4B_APPROVER_JSON="$(crc_select_phase4b_approver \
+    "$REVIEWS_JSON" "$REVIEWERS_JSON" "$PR_AUTHOR" "$SAME_AGENT_REVIEWER" \
+    "$HEAD_SHA" "$PHASE_4B_TIMEOUT_STATE")" || _phase4b_select_rc=$?
+  [ "$_phase4b_select_rc" -eq 0 ] \
+    || die 3 "could not validate Phase 4b approval provenance"
+  if [ "$PHASE_4B_APPROVER_JSON" != null ]; then
+    PHASE_4B_LOGIN="$(printf '%s' "$PHASE_4B_APPROVER_JSON" | jq -r '.user.login')"
+    PHASE_4B_TIME="$(printf '%s' "$PHASE_4B_APPROVER_JSON" | jq -r '.submitted_at')"
 
     # Latest-signal-wins guard (codex CHANGES_REQUESTED + CodeRabbit ⚠️
     # Major @ scripts/codex-review-check.sh:811 on PR #225 round 3):

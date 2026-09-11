@@ -113,6 +113,71 @@ codex_phase4a_comment_id_ok() {
   return 0
 }
 
+# Automated Phase 4b approvals carry the exact Phase 4a provider evidence
+# that opened their same-head barrier. GitHub cannot atomically condition a
+# review POST on an unchanged issue-comment timeline, so the merge-clearance
+# reader revalidates this record against the then-live timeline. Keep the
+# grammar here beside the Phase 4a timeout grammar so writer and reader cannot
+# silently diverge during propagation.
+CODEX_PHASE4B_CLEARANCE_MARKER_PREFIX='<!-- mergepath-phase-4b-clearance:'
+CODEX_PHASE4B_CLEARANCE_MARKER_RE='^<!-- mergepath-phase-4b-clearance:v1 head=(?<head>(?:[0-9a-f]{40}|[0-9a-f]{64})) codex_evidence=(?<evidence>timeout|signal|account-or-connection-block|disabled) timeout_trigger_comment_id=(?<trigger>none|[1-9][0-9]*) -->$'
+
+# codex_phase4b_clearance_marker_body <head> <evidence> <trigger-id|none>
+# Prints the canonical first-line record. Invalid combinations return 1.
+codex_phase4b_clearance_marker_body() {
+  local head=${1-} evidence=${2-} trigger=${3-}
+  codex_phase4a_full_sha_ok "$head" || return 1
+  case "$evidence" in
+    timeout)
+      codex_phase4a_comment_id_ok "$trigger" || return 1
+      ;;
+    signal|account-or-connection-block|disabled)
+      [ "$trigger" = none ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  printf '<!-- mergepath-phase-4b-clearance:v1 head=%s codex_evidence=%s timeout_trigger_comment_id=%s -->' \
+    "$head" "$evidence" "$trigger"
+}
+
+# codex_phase4b_clearance_marker_parse <review-body>
+# Emits `{state:"valid",...}`, `{state:"absent"}`, or
+# `{state:"malformed",reason:...}`. The record is valid only as the first
+# physical line and only once. A namespace-looking record elsewhere or an
+# unknown/malformed version fails closed instead of degrading to a manual
+# approval.
+codex_phase4b_clearance_marker_parse() {
+  local body=${1-}
+  printf '%s' "$body" | jq -Rsc \
+    --arg prefix "$CODEX_PHASE4B_CLEARANCE_MARKER_PREFIX" \
+    --arg re "$CODEX_PHASE4B_CLEARANCE_MARKER_RE" '
+      (split("\n") | map(rtrimstr("\r"))) as $lines
+      | [ range(0; $lines | length)
+          | select($lines[.] | startswith($prefix))
+        ] as $marker_lines
+      | if ($marker_lines | length) == 0 then
+          {state:"absent"}
+        elif ($marker_lines | length) != 1 then
+          {state:"malformed",reason:"duplicate"}
+        elif $marker_lines[0] != 0 then
+          {state:"malformed",reason:"position"}
+        else
+          ((try ($lines[0] | capture($re)) catch null) // null) as $m
+          | if $m == null then
+              {state:"malformed",reason:"schema"}
+            elif $m.evidence == "timeout" and ($m.trigger | test("^[1-9][0-9]*$")) then
+              {state:"valid",head:$m.head,codex_evidence:$m.evidence,
+               timeout_trigger_comment_id:($m.trigger | tonumber)}
+            elif $m.evidence != "timeout" and $m.trigger == "none" then
+              {state:"valid",head:$m.head,codex_evidence:$m.evidence,
+               timeout_trigger_comment_id:null}
+            else
+              {state:"malformed",reason:"binding"}
+            end
+        end
+    ' 2>/dev/null || jq -nc '{state:"malformed",reason:"body"}'
+}
+
 # codex_phase4a_timeout_marker_body <full-head-sha> <trigger-comment-id>
 # Prints the one canonical body. Invalid inputs produce no output and rc 1.
 codex_phase4a_timeout_marker_body() {

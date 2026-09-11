@@ -1,0 +1,42 @@
+{
+  "description": "replacement timeout generation cannot be cleared by an approval bound to its predecessor",
+  "expected_cleared": false,
+  "expected_cli_valid": false,
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "author_identity": "nathanjohnpayne",
+  "merged_at": "2026-09-01T00:50:00Z",
+  "issue_comments": [
+    {
+      "id": 4101,
+      "body": "@codex review",
+      "created_at": "2026-09-01T00:00:00Z",
+      "user": { "login": "nathanjohnpayne" }
+    },
+    {
+      "id": 4102,
+      "body": "<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=4101 -->",
+      "created_at": "2026-09-01T00:15:00Z",
+      "user": { "login": "nathanjohnpayne" }
+    },
+    {
+      "id": 4103,
+      "body": "@codex review",
+      "created_at": "2026-09-01T00:25:00Z",
+      "user": { "login": "nathanjohnpayne" }
+    },
+    {
+      "id": 4104,
+      "body": "<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=4103 -->",
+      "created_at": "2026-09-01T00:40:00Z",
+      "user": { "login": "nathanjohnpayne" }
+    }
+  ],
+  "cli_reviews": [
+    {
+      "body": "<!-- mergepath-phase-4b-clearance:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa codex_evidence=timeout timeout_trigger_comment_id=4101 -->\n\n**Automated Phase 4b review**",
+      "submitted_at": "2026-09-01T00:20:00Z",
+      "user": { "login": "nathanpayne-claude" }
+    }
+  ]
+}
