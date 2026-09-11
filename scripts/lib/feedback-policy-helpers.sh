@@ -27,6 +27,8 @@
 #   coderabbit_tiers_of "<comment-body>"   # every graded marker, in order
 #   coderabbit_finding_scan "<body>"       # strip fenced/pre-merge regions
 #   ghas_severity_tier "<security_severity_level>"  # p0..p3 or empty (#1101)
+#   ghas_alert_number_from_body "<comment-body>"     # alert number or empty (#1113)
+#   read_policy_block_field <block> <field> [cfg]    # scalar under an arbitrary top-level block
 #
 # cfg defaults to $CONFIG (the global the gate scripts set) and then to
 # .github/review-policy.yml, matching scripts/lib/reviewers-helpers.sh.
@@ -48,6 +50,74 @@ feedback_policy_field() {
   [ -f "$cfg" ] || return 0
   awk -v field="$field" '
     /^feedback_policy:/ {in_block=1; next}
+    in_block && /^[^[:space:]#]/ {in_block=0}
+    in_block && $1 == field":" {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      print
+      exit
+    }
+  ' "$cfg" | sed -E "s/[[:space:]]+#.*$//; s/^[\"']//; s/[\"'][[:space:]]*$//; s/[[:space:]]+$//"
+}
+
+
+# policy_yaml_to_json <path> -- parse a review-policy YAML file to JSON on
+# stdout; non-zero and empty on any failure. This is THE one parser
+# review-feedback-accounting.sh's validate_governing_policy uses (it adds its
+# own schema validation on top), extracted here (Codex P2, PR #1124) so a
+# second caller cannot drift from it. The earlier line-oriented awk reader
+# below could not see flow-style YAML at all -- `code_scanning: {bot_login:
+# "custom-ghas[bot]"}` returned empty -- so accounting recognized a consumer's
+# custom GHAS bot while the fingerprint and the archive workflow silently fell
+# back to the default login. Two readers of the same file is the bug; this is
+# the shared one.
+policy_yaml_to_json() {
+  local cfg="${1:-}"
+  [ -r "$cfg" ] || return 1
+  if command -v yq >/dev/null 2>&1 \
+     && yq --version 2>/dev/null | grep -qi 'mikefarah'; then
+    yq eval -o=json '.' "$cfg" 2>/dev/null || return 1
+  elif command -v python3 >/dev/null 2>&1 \
+       && python3 -c 'import yaml' >/dev/null 2>&1; then
+    python3 -c '
+import json, sys, yaml
+with open(sys.argv[1], encoding="utf-8") as source:
+    print(json.dumps(yaml.safe_load(source)))
+' "$cfg" 2>/dev/null || return 1
+  elif command -v ruby >/dev/null 2>&1; then
+    ruby -ryaml -rjson -e '
+value = YAML.safe_load(File.read(ARGV[0]), permitted_classes: [], permitted_symbols: [], aliases: false)
+puts JSON.generate(value)
+' "$cfg" 2>/dev/null || return 1
+  else
+    return 1
+  fi
+}
+
+# policy_block_field_parsed <block> <field> [config] -- read one block field
+# through policy_yaml_to_json, so block AND flow style both resolve. Empty
+# (rc 1) when the file is unreadable or no YAML parser exists, which callers
+# must treat as "unknown", NOT as "unset" -- see the fingerprint's use.
+policy_block_field_parsed() {
+  local block="$1" field="$2" cfg="${3:-${CONFIG:-.github/review-policy.yml}}" json=""
+  json="$(policy_yaml_to_json "$cfg")" || return 1
+  [ -n "$json" ] || return 1
+  printf '%s' "$json" | jq -r --arg b "$block" --arg f "$field" '.[$b][$f] // empty'
+}
+
+# Same reader, parameterized on an ARBITRARY top-level block (not only
+# feedback_policy:) -- e.g. `read_policy_block_field code_scanning
+# bot_login` (#1124). Deliberately untrusted / not base-materialized: a
+# caller that needs the same trust guarantees review-feedback-accounting.sh
+# gives its OWN policy reads (governing the PR's exact base SHA, for a
+# merge-safety decision) must resolve $CONFIG itself before sourcing this,
+# same as that script already does. A caller that only needs a best-effort
+# hint (e.g. an additional login to widen a scan, never to narrow one) can
+# use this directly against whatever checkout it has.
+read_policy_block_field() {
+  local block=$1 field=$2 cfg="${3:-${CONFIG:-.github/review-policy.yml}}"
+  [ -f "$cfg" ] || return 0
+  awk -v block="$block" -v field="$field" '
+    $0 ~ "^"block":[[:space:]]*(#.*)?$" {in_block=1; next}
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
@@ -322,4 +392,16 @@ ghas_severity_tier() {
     low) echo p3 ;;
     *) return 0 ;;
   esac
+}
+
+# Pure regex extraction of the code-scanning alert number a
+# github-advanced-security[bot] comment body links to (the
+# "[Show more details](.../security/code-scanning/<number>)" line every such
+# comment carries), or empty if none is found. No I/O — the caller resolves
+# the number to a severity via scripts/lib/ghas-alert-severity.sh
+# (nathanjohnpayne/mergepath#1113), which needs the network access this file's
+# sourcing contract excludes.
+ghas_alert_number_from_body() {
+  printf '%s' "${1:-}" \
+    | grep -oE '/security/code-scanning/[0-9]+' | head -n1 | grep -oE '[0-9]+$' || true
 }

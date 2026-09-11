@@ -12,8 +12,8 @@ HELPERS="$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
 # shellcheck source=lib/feedback-policy-helpers.sh
 . "$HELPERS"
 
-if [ "$#" -ne 5 ]; then
-  echo "usage: $0 SOURCE_KIND SOURCE_ID SOURCE_LOGIN ARCHIVED_AT PREVIOUS_BODY_FILE" >&2
+if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then
+  echo "usage: $0 SOURCE_KIND SOURCE_ID SOURCE_LOGIN ARCHIVED_AT PREVIOUS_BODY_FILE [GHAS_TIER]" >&2
   exit 2
 fi
 
@@ -22,6 +22,21 @@ SOURCE_ID="$2"
 SOURCE_LOGIN="$3"
 ARCHIVED_AT="$4"
 PREVIOUS_BODY_FILE="$5"
+# Resolved by the CALLING workflow, never here (#1113): a
+# github-advanced-security[bot] body carries no severity marker this
+# script's text-only classifiers (codex_tiers_of / coderabbit_tiers_of)
+# can find -- it only links to the alert. Resolving that link's current
+# severity needs a live code-scanning/alerts GET, which this script's
+# documented sourcing contract deliberately excludes ("the render script
+# itself stays pure -- no network calls"). The caller resolves it (see
+# .github/workflows/codex-p1-gate.yml's archive-edited-feedback job) and
+# hands the already-mapped p0-p3 tier here, exactly like it hands the
+# previous body.
+GHAS_TIER="${6:-}"
+case "$GHAS_TIER" in
+  ''|p0|p1|p2|p3) ;;
+  *) echo "render-feedback-archive: GHAS_TIER must be p0, p1, p2, p3, or empty; got '$GHAS_TIER'" >&2; exit 2 ;;
+esac
 
 case "$SOURCE_KIND" in
   issue-comment|inline|review-body) ;;
@@ -64,12 +79,20 @@ CODEX_TIERS=$(codex_tiers_of "$BODY" | jq -Rsc 'split("\n") | map(select(. != ""
 VISIBLE=$(coderabbit_finding_scan "$BODY") \
   || { echo "render-feedback-archive: could not scan CodeRabbit body" >&2; exit 2; }
 CODERABBIT_TIERS=$(coderabbit_tiers_of "$VISIBLE" | jq -Rsc 'split("\n") | map(select(. != ""))')
+if [ -n "$GHAS_TIER" ]; then
+  GHAS_TIERS=$(jq -nc --arg t "$GHAS_TIER" '[$t]')
+else
+  GHAS_TIERS='[]'
+fi
 
 # Markerless edits have nothing to preserve. Provider identity is deliberately
 # validated later by accounting against the live source comment + base policy;
-# this renderer only snapshots the marker vocabulary present in the old body.
+# this renderer only snapshots the marker vocabulary present in the old body
+# (or, for GHAS, the tier the caller resolved from the alert the body links
+# to -- #1113).
 if [ "$(printf '%s' "$CODEX_TIERS" | jq 'length')" -eq 0 ] \
-   && [ "$(printf '%s' "$CODERABBIT_TIERS" | jq 'length')" -eq 0 ]; then
+   && [ "$(printf '%s' "$CODERABBIT_TIERS" | jq 'length')" -eq 0 ] \
+   && [ "$(printf '%s' "$GHAS_TIERS" | jq 'length')" -eq 0 ]; then
   exit 0
 fi
 
@@ -90,7 +113,8 @@ PAYLOAD=$(jq -nc \
   --arg archived_at "$ARCHIVED_AT" \
   --arg body_fingerprint "$BODY_FINGERPRINT" \
   --argjson codex_tiers "$CODEX_TIERS" \
-  --argjson coderabbit_tiers "$CODERABBIT_TIERS" '
+  --argjson coderabbit_tiers "$CODERABBIT_TIERS" \
+  --argjson ghas_tiers "$GHAS_TIERS" '
     {
       archive_version: 2,
       source_kind: $source_kind,
@@ -100,7 +124,8 @@ PAYLOAD=$(jq -nc \
       body_fingerprint: $body_fingerprint,
       body: $body,
       codex_tiers: $codex_tiers,
-      coderabbit_tiers: $coderabbit_tiers
+      coderabbit_tiers: $coderabbit_tiers,
+      ghas_tiers: $ghas_tiers
     }
   ')
 ENCODED=$(printf '%s' "$PAYLOAD" | jq -Rr '@base64')

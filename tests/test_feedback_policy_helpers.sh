@@ -27,6 +27,13 @@
 #   ghas_severity_tier (#1101)
 #     15. critical/high/medium/low -> p0/p1/p2/p3; none/empty/unrecognized
 #         -> empty (rc0, caller decides the fallback)
+#   ghas_alert_number_from_body (#1113)
+#     16. extracts alert number from a /security/code-scanning/N link;
+#         first match wins; no link / no digits / empty / missing arg
+#         -> empty (rc0)
+#   read_policy_block_field (#1124)
+#     17. reads a field from an arbitrary top-level block (not only
+#         feedback_policy:); absent field/block/file -> empty
 #
 # Bash 3.2 portable.
 
@@ -286,6 +293,119 @@ eq ""   "$(ghas_severity_tier warning)"  "ghas_severity_tier: unrecognized value
 
 rc=0; out=$(ghas_severity_tier bogus) || rc=$?
 if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "ghas_severity_tier: unrecognized is rc0+empty under set -e"; else fail "ghas_severity_tier: unrecognized rc=$rc out=[$out]"; fi
+
+# --- ghas_alert_number_from_body (#1113) ------------------------------------
+eq "25" "$(ghas_alert_number_from_body 'See [Show more details](https://github.com/acme/widget/security/code-scanning/25)')" \
+  "ghas_alert_number_from_body: extracts the number from a real CodeQL comment link"
+eq "25" "$(ghas_alert_number_from_body 'text before /security/code-scanning/25 text after')" \
+  "ghas_alert_number_from_body: matches without requiring markdown link syntax"
+eq "7" "$(ghas_alert_number_from_body 'https://github.com/owner/repo-name/security/code-scanning/7')" \
+  "ghas_alert_number_from_body: works with hyphenated owner/repo names"
+eq "3" "$(ghas_alert_number_from_body 'first /security/code-scanning/3 then /security/code-scanning/9')" \
+  "ghas_alert_number_from_body: takes the FIRST match when a body links multiple alerts"
+eq "" "$(ghas_alert_number_from_body 'no alert link here at all')" \
+  "ghas_alert_number_from_body: no link -> empty"
+eq "" "$(ghas_alert_number_from_body '')" \
+  "ghas_alert_number_from_body: empty body -> empty"
+eq "" "$(ghas_alert_number_from_body)" \
+  "ghas_alert_number_from_body: missing arg -> empty (does not abort under set -u)"
+eq "" "$(ghas_alert_number_from_body '/security/code-scanning/ (no digits)')" \
+  "ghas_alert_number_from_body: path with no trailing digits -> empty"
+
+rc=0; out=$(ghas_alert_number_from_body 'no link here') || rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "ghas_alert_number_from_body: no match is rc0+empty under set -e"; else fail "ghas_alert_number_from_body: no-match rc=$rc out=[$out]"; fi
+
+# --- read_policy_block_field (#1124) ----------------------------------------
+CFG_BLOCK="$WORKDIR/code-scanning-block.yml"
+cat > "$CFG_BLOCK" <<'YAML'
+external_review_threshold: 300
+code_scanning:
+  enabled: true
+  bot_login: "custom-ghas-bot[bot]"   # inline comment + quotes to strip
+feedback_policy:
+  mode: by-priority
+YAML
+eq "custom-ghas-bot[bot]" "$(read_policy_block_field code_scanning bot_login "$CFG_BLOCK")" \
+  "read_policy_block_field: reads a field from an arbitrary top-level block, not only feedback_policy:"
+eq "true" "$(read_policy_block_field code_scanning enabled "$CFG_BLOCK")" \
+  "read_policy_block_field: reads a second field from the same block"
+eq "" "$(read_policy_block_field code_scanning missing_field "$CFG_BLOCK")" \
+  "read_policy_block_field: absent field in a present block -> empty"
+eq "" "$(read_policy_block_field nonexistent_block bot_login "$CFG_BLOCK")" \
+  "read_policy_block_field: absent block -> empty"
+eq "" "$(read_policy_block_field code_scanning bot_login "$WORKDIR/does-not-exist.yml")" \
+  "read_policy_block_field: missing config file -> empty (not an error)"
+
+# Header tolerance (CodeRabbit, PR #1124). resolve_base_policy.sh writes raw
+# policy content, so a block header may legitimately carry trailing whitespace
+# or a comment; an exact `$0 == block":"` match silently skipped those blocks
+# and the caller fell back to the default login only.
+CFG_HDR="$WORKDIR/header-shapes.yml"
+cat > "$CFG_HDR" <<'YAML'
+code_scanning:  # GHAS
+  bot_login: "commented-header[bot]"
+YAML
+eq "commented-header[bot]" "$(read_policy_block_field code_scanning bot_login "$CFG_HDR")" \
+  "read_policy_block_field: block header with a trailing comment still matches"
+
+CFG_WS="$WORKDIR/header-trailing-space.yml"
+printf 'code_scanning:   \n  bot_login: "spaced-header[bot]"\n' > "$CFG_WS"
+eq "spaced-header[bot]" "$(read_policy_block_field code_scanning bot_login "$CFG_WS")" \
+  "read_policy_block_field: block header with trailing whitespace still matches"
+
+# The false-positive guard for that relaxation: a DIFFERENT block whose name
+# merely starts with the requested one must still not match, or a scan would
+# silently read another block's configuration.
+CFG_PREFIX="$WORKDIR/header-prefix.yml"
+cat > "$CFG_PREFIX" <<'YAML'
+code_scanning_extra:
+  bot_login: "wrong-block[bot]"
+YAML
+eq "" "$(read_policy_block_field code_scanning bot_login "$CFG_PREFIX")" \
+  "read_policy_block_field: a longer block sharing the prefix does NOT match (no over-capture)"
+
+# And a value that itself looks like a header must not be mistaken for one.
+CFG_NEST="$WORKDIR/header-nested.yml"
+cat > "$CFG_NEST" <<'YAML'
+code_scanning:
+  bot_login: "real[bot]"
+other_block:
+  bot_login: "later[bot]"
+YAML
+eq "real[bot]" "$(read_policy_block_field code_scanning bot_login "$CFG_NEST")" \
+  "read_policy_block_field: a following top-level block still closes the previous one"
+
+# Codex P2, PR #1124: flow-style YAML is valid and accounting (which parses the
+# file as YAML) resolves it, but the line-oriented reader cannot see it at all.
+# That split let a consumer's custom GHAS bot be inventoried by accounting while
+# the fingerprint and archive workflow silently used the default login.
+CFG_FLOW="$WORKDIR/flow-style.yml"
+cat > "$CFG_FLOW" <<'YAML'
+code_scanning: {enabled: true, bot_login: "custom-ghas[bot]"}
+YAML
+eq "" "$(read_policy_block_field code_scanning bot_login "$CFG_FLOW")" \
+  "read_policy_block_field: flow style is invisible to the line reader (the defect, pinned)"
+eq "custom-ghas[bot]" "$(policy_block_field_parsed code_scanning bot_login "$CFG_FLOW")" \
+  "policy_block_field_parsed: flow-style block resolves (Codex P2, #1124)"
+eq "custom-ghas-bot[bot]" "$(policy_block_field_parsed code_scanning bot_login "$CFG_BLOCK")" \
+  "policy_block_field_parsed: block style resolves identically, incl. quote + inline-comment stripping"
+eq "" "$(policy_block_field_parsed code_scanning missing_field "$CFG_FLOW")" \
+  "policy_block_field_parsed: absent field in a present block -> empty"
+eq "" "$(policy_block_field_parsed nonexistent_block bot_login "$CFG_FLOW")" \
+  "policy_block_field_parsed: absent block -> empty"
+
+# Unreadable/unparseable must be rc 1 ("unknown"), NOT rc 0 with empty output
+# ("unset") -- the fingerprint narrows its scan on rc 0 and must never do so on
+# a read it could not actually perform.
+PARSED_RC=0
+policy_block_field_parsed code_scanning bot_login "$WORKDIR/does-not-exist.yml" >/dev/null 2>&1 || PARSED_RC=$?
+eq 1 "$PARSED_RC" "policy_block_field_parsed: missing file is rc 1 (unknown), not rc 0 (unset)"
+
+CFG_BROKEN="$WORKDIR/broken.yml"
+printf 'code_scanning: {bot_login: "unterminated\n' > "$CFG_BROKEN"
+BROKEN_RC=0
+policy_block_field_parsed code_scanning bot_login "$CFG_BROKEN" >/dev/null 2>&1 || BROKEN_RC=$?
+eq 1 "$BROKEN_RC" "policy_block_field_parsed: unparseable YAML is rc 1 (unknown), not a silent empty"
 
 # ---------------------------------------------------------------------------
 echo
