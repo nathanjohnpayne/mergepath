@@ -2310,8 +2310,27 @@ crc_select_phase4b_approver() {
   local marker_trigger timeout_live_state timeout_live_trigger submitted best='null'
   local unreadable_automated=false
 
-  case "$head" in ''|*[!0-9a-f]*) return 2 ;; esac
-  [ "${#head}" -eq 40 ] || [ "${#head}" -eq 64 ] || return 2
+  # A head that is not a full sha admits NO candidate rather than being
+  # unclassifiable, so it returns 1 ("nothing to validate") and not 2. Both
+  # are fail-closed for the waiver — the caller leaves PHASE_4B_TIMEOUT_STATE
+  # at "none" either way, so no timeout-bound approval clears — but 2 is
+  # escalated to `die 3` and would take the WHOLE check down on PRs that never
+  # involved a timeout at all. Candidates are selected by `.commit_id == $sha`
+  # against real 40-hex commit ids, and the marker grammar pins a 40/64-char
+  # head, so a malformed head cannot match either: reporting "no candidates"
+  # is the accurate answer, not a softened one. Caught by
+  # scripts/ci/check_canonical_bugs_263caf3, whose disabled-Codex cases use a
+  # `headsha` placeholder precisely because head validity is irrelevant there.
+  # Deliberately NO head-format guard here. This selector serves MANUAL Phase
+  # 4b substitutes as well as timeout-derived ones, and a manual approval's
+  # eligibility does not depend on the head being a full sha — it is matched by
+  # `.commit_id == $sha`, whatever that sha is. The strict 40/64-char pin the
+  # timeout hardening adds belongs to the MARKER grammar, which is where a
+  # timeout waiver's head is actually bound and where an unpinnable head is
+  # genuinely inadmissible. Guarding here instead denied every disabled-Codex
+  # Phase 4b substitute whose head was not a real sha, which
+  # scripts/ci/check_canonical_bugs_263caf3 exercises with a `headsha`
+  # placeholder.
   printf '%s' "$reviews" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
   printf '%s' "$reviewers" | jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 || return 2
   printf '%s' "$timeout_state" | jq -e 'type == "object" and ((.state // "") | type == "string")' >/dev/null 2>&1 || return 2
@@ -2410,8 +2429,19 @@ crc_phase4b_needs_timeout_timeline() {
   local candidates review body marker marker_state marker_head evidence
   local timeout_candidate=false independent_candidate=false
 
-  case "$head" in ''|*[!0-9a-f]*) return 2 ;; esac
-  [ "${#head}" -eq 40 ] || [ "${#head}" -eq 64 ] || return 2
+  # A head that is not a full sha admits NO candidate rather than being
+  # unclassifiable, so it returns 1 ("nothing to validate") and not 2. Both
+  # are fail-closed for the waiver — the caller leaves PHASE_4B_TIMEOUT_STATE
+  # at "none" either way, so no timeout-bound approval clears — but 2 is
+  # escalated to `die 3` and would take the WHOLE check down on PRs that never
+  # involved a timeout at all. Candidates are selected by `.commit_id == $sha`
+  # against real 40-hex commit ids, and the marker grammar pins a 40/64-char
+  # head, so a malformed head cannot match either: reporting "no candidates"
+  # is the accurate answer, not a softened one. Caught by
+  # scripts/ci/check_canonical_bugs_263caf3, whose disabled-Codex cases use a
+  # `headsha` placeholder precisely because head validity is irrelevant there.
+  case "$head" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#head}" -eq 40 ] || [ "${#head}" -eq 64 ] || return 1
   printf '%s' "$reviews" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
   printf '%s' "$reviewers" | jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 || return 2
 
