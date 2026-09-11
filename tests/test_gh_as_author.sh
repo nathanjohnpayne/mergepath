@@ -5,8 +5,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WRAPPER="$ROOT/scripts/gh-as-author.sh"
+COMMAND_CLASSIFIER="$ROOT/scripts/lib/gh-command-classifier.sh"
 
 [[ -x "$WRAPPER" ]] || { echo "missing or non-executable $WRAPPER" >&2; exit 1; }
+[[ -r "$COMMAND_CLASSIFIER" ]] || { echo "missing $COMMAND_CLASSIFIER" >&2; exit 1; }
+
+# shellcheck source=../scripts/lib/gh-command-classifier.sh
+. "$COMMAND_CLASSIFIER"
 
 # #996: the gh stub below records whichever token the wrapper selected, and
 # several failure branches print that log. Every case pins its own token
@@ -26,6 +31,242 @@ PASS=0
 FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+
+assert_prohibited_source() {
+  local label="$1" source="$2" mode="${3:-}"
+  if printf '%s\n' "$source" \
+      | gh_source_lacks_direct_literal_pr_mutation "$mode"; then
+    fail "direct-literal mutation classifier missed $label"
+  else
+    pass "direct-literal mutation classifier rejects $label"
+  fi
+}
+
+assert_allowed_source() {
+  local label="$1" source="$2" mode="${3:-}"
+  if printf '%s\n' "$source" \
+      | gh_source_lacks_direct_literal_pr_mutation "$mode"; then
+    pass "direct-literal mutation classifier permits $label"
+  else
+    fail "direct-literal mutation classifier over-rejected $label"
+  fi
+}
+
+assert_prohibited_source "bare native merge" 'gh pr merge 7 --squash'
+assert_prohibited_source "path-qualified native merge" '/opt/bin/gh pr merge 7'
+assert_prohibited_source "prefixed native merge" 'env GH_TOKEN=x gh pr merge 7'
+assert_prohibited_source "globally flagged native merge" 'gh --repo owner/repo pr merge 7'
+assert_prohibited_source "attached global short repo flag native merge" \
+  'gh -Rowner/repo pr merge 7 --squash'
+assert_prohibited_source "attached PR short repo flag native merge" \
+  'gh pr -Rowner/repo merge 7 --squash'
+assert_prohibited_source "line-wrapped native merge" $'gh pr \\\n  merge 7'
+assert_prohibited_source "token-internal continuation cannot split gh" \
+  $'g\\\nh pr merge 7'
+assert_prohibited_source "token-internal continuation cannot split pr" \
+  $'gh p\\\nr merge 7'
+assert_prohibited_source "token-internal continuation cannot split merge" \
+  $'gh pr m\\\nerge 7'
+assert_prohibited_source "token-internal continuation cannot split api" \
+  $'gh a\\\npi repos/o/r/pulls/7/merge -X PUT'
+assert_prohibited_source "compact REST PUT" 'gh api -XPUT repos/o/r/pulls/7/merge'
+assert_prohibited_source "spaced REST PUT after endpoint" 'gh api repos/o/r/pulls/7/merge -X PUT'
+assert_prohibited_source "equal-form REST POST" 'gh api --method=POST repos/o/r/pulls/7/merge'
+assert_prohibited_source "quoted lowercase REST method" 'gh api repos/o/r/pulls/7/merge --method "patch"'
+assert_prohibited_source "implicit REST POST from a raw field" \
+  'gh api repos/o/r/pulls/7/merge -f merge_method=squash'
+assert_prohibited_source "implicit REST POST from an input file" \
+  'gh api repos/o/r/pulls/7/merge --input payload.json'
+assert_prohibited_source "opaque REST method" \
+  'METHOD=PUT; gh api --method "$METHOD" repos/o/r/pulls/7/merge'
+assert_prohibited_source "opaque REST method followed by an unrelated GET" \
+  'METHOD=PUT; gh api --method "$METHOD" repos/o/r/pulls/7/merge; gh api -X GET repos/o/r/pulls/7'
+assert_prohibited_source "multiple REST method flags" \
+  'gh api -X GET --method "$METHOD" repos/o/r/pulls/7/merge'
+assert_prohibited_source "opaque REST argument array" \
+  'ARGS=(--method PUT); gh api "${ARGS[@]}" repos/o/r/pulls/7/merge'
+assert_prohibited_source "opaque implicit-write argument array" \
+  'ARGS=(-f merge_method=squash); gh api repos/o/r/pulls/7/merge "${ARGS[@]}"'
+assert_prohibited_source "opaque REST wrapper arguments" \
+  'run_api(){ gh api "$@"; }; run_api repos/o/r/pulls/7/merge -X PUT'
+assert_prohibited_source "opaque native PR verb" \
+  'VERB=merge; gh pr "$VERB" 7'
+assert_prohibited_source "concatenated dynamic gh command group" \
+  'GROUP=pi; gh a"$GROUP" repos/o/r/pulls/7/merge -X PUT'
+assert_prohibited_source "concatenated dynamic native PR verb" \
+  'VERB=erge; gh pr m"$VERB" 7'
+assert_prohibited_source "concatenated dynamic REST flag" \
+  'FLAG=method; gh api --"$FLAG" PUT repos/o/r/pulls/7/merge'
+assert_prohibited_source "concatenated dynamic GraphQL endpoint" \
+  'GROUP=raphql; gh api g"$GROUP" -f query="mutation { mergePullRequest(input: {}) { clientMutationId } }"'
+assert_prohibited_source "escaped gh executable spelling" \
+  'g\h pr merge 7'
+assert_prohibited_source "escaped REST group spelling" \
+  'gh a\pi repos/o/r/pulls/7/merge -X PUT'
+assert_prohibited_source "escaped native PR verb spelling" \
+  'gh pr m\erge 7'
+assert_prohibited_source "quoted gh executable concatenation" \
+  'g"h" pr merge 7'
+assert_prohibited_source "quoted REST group concatenation" \
+  'gh a"pi" repos/o/r/pulls/7/merge -X PUT'
+assert_prohibited_source "quoted native PR verb concatenation" \
+  'gh pr m"erge" 7'
+assert_prohibited_source "separately quoted native command tokens" \
+  'gh "pr" "merge" 7'
+assert_prohibited_source "mixed quoted native command tokens" \
+  'g"h" "pr" m"erge" 7'
+assert_prohibited_source "separately quoted REST write tokens" \
+  '"gh" "api" repos/o/r/pulls/7/merge "-X" "PUT"'
+assert_prohibited_source "nested executable quoted token concatenation" \
+  'echo "$(g"h" "pr" m"erge" 7)"'
+assert_prohibited_source "apostrophe in a preceding comment cannot mask a dynamic PR verb" \
+  $'# it\'s inert commentary\nVERB=merge; gh pr "$VERB" 7'
+assert_prohibited_source "ANSI-C quoted gh executable concatenation" \
+  "g\$'h' pr merge 7"
+assert_prohibited_source "locale quoted gh executable concatenation" \
+  'g$"h" pr merge 8'
+assert_prohibited_source "literal native merge in backtick substitution" \
+  'echo `gh pr merge 7`'
+assert_prohibited_source "literal REST write in backtick substitution" \
+  'x=`gh api repos/o/r/pulls/7/merge -X PUT`'
+assert_prohibited_source "double quotes do not hide a backtick native merge" \
+  'echo "`gh pr merge 7`"'
+assert_prohibited_source "nested legacy backticks cannot hide a native merge" \
+  'echo `echo \`gh pr merge 7\``'
+assert_prohibited_source "double quotes do not hide nested legacy backticks" \
+  'echo "`echo \`gh pr merge 7\``"'
+assert_allowed_source "escaped backticks remain literal data" \
+  'printf "%s\n" "\`gh pr merge 7\`"'
+assert_prohibited_source "source text cannot collide with lexer markers" \
+  'echo MERGEPATH_CLASSIFIER_LITERAL_NEWLINE MERGEPATH_CLASSIFIER_LITERAL_XNEWLINE; gh pr merge 7'
+assert_prohibited_source "legacy backtick heredoc cannot poison quote state" \
+  $'echo "`cat <<EOF\n\'\nEOF\ngh pr merge 7\n`"'
+assert_prohibited_source "gh alias definition followed by opaque invocation" \
+  "gh alias set m 'pr merge'; gh m 7"
+assert_prohibited_source "gh alias import can install an opaque merger" \
+  'gh alias import aliases.yml; gh m 7'
+assert_prohibited_source "dynamic gh alias action cannot hide installation" \
+  "ACTION=set; gh alias \"\$ACTION\" m 'pr merge'; gh m 7"
+assert_prohibited_source "clustered REST method flag" \
+  'gh api repos/o/r/pulls/7/merge -iXPUT'
+assert_prohibited_source "clustered implicit-write field flag" \
+  'gh api repos/o/r/pulls/7/merge -iFmerge_method=squash'
+LT_PAIR='<''<'
+HEREDOC_OPEN="cat ${LT_PAIR}EOF"
+ADJACENT_HEREDOC_OPEN="cat${LT_PAIR}EOF"
+ADJACENT_STRIPPING_HEREDOC_OPEN="cat${LT_PAIR}-EOF"
+assert_prohibited_source "heredoc data cannot mask a later literal merge" \
+  "$HEREDOC_OPEN"$'\n\'\nEOF\ngh pr merge 7 --squash'
+assert_prohibited_source "adjacent heredoc data cannot mask a later literal merge" \
+  "$ADJACENT_HEREDOC_OPEN"$'\n\'\nEOF\ngh pr merge 7 --squash'
+assert_prohibited_source "adjacent stripping heredoc cannot mask a later literal merge" \
+  "$ADJACENT_STRIPPING_HEREDOC_OPEN"$'\n\t\'\nEOF\ngh pr merge 7 --squash'
+assert_prohibited_source "array-shaped command argument remains a real heredoc" \
+  "echo a[1${LT_PAIR}EOF]=x"$'\n\'\nEOF]=x\ngh pr merge 7 --squash'
+assert_prohibited_source "digit-prefixed assignment lookalike remains a real heredoc" \
+  "1a[1${LT_PAIR}EOF x]=y || true"$'\n\'\nEOF\ngh pr merge 7 --squash'
+assert_prohibited_source "spaced assignment lookalike remains a real heredoc" \
+  "a[1${LT_PAIR}EOF x]=y || true"$'\n\'\nEOF\ngh pr merge 7 --squash'
+assert_prohibited_source "quoted arithmetic state cannot hide a later heredoc" \
+  $': $((a["("]))\ncat <<EOF\n\'\nEOF\ngh pr merge 7 --squash'
+assert_prohibited_source "quoted parameter state cannot hide a later heredoc" \
+  $': ${x:-"{"}\ncat <<EOF\n\'\nEOF\ngh pr merge 7 --squash'
+assert_allowed_source "explicit REST GET with a field" \
+  'gh api repos/o/r/pulls -X GET -f state=open'
+assert_allowed_source "REST GET followed by an unrelated rm flag" \
+  $'gh api repos/o/r/pulls/7 --jq .state\nrm -f scratch'
+assert_allowed_source "REST GET containing dash-f text" \
+  "gh api 'repos/o/r/issues/comments?labels=needs-fix' --jq '.foo-far'"
+assert_allowed_source "REST GET with an escaped literal jq dollar" \
+  'gh api repos/o/r/pulls/7 --jq \$.state'
+assert_allowed_source "an inert commented REST write" \
+  '# gh api repos/o/r/pulls/7/merge -X PUT'
+assert_allowed_source "double-quoted native mutation prose is one argument" \
+  'echo "gh pr merge 7"'
+assert_allowed_source "double-quoted REST mutation prose is one argument" \
+  'printf "%s\n" "gh api repos/o/r/pulls/7/merge -X PUT"'
+assert_allowed_source "a quoted multiword PR group remains one argument" \
+  'gh "pr merge" 7'
+assert_allowed_source "a quoted multiword PR verb remains one argument" \
+  'gh pr "merge 7"'
+assert_allowed_source "a quoted separator remains inert data" \
+  'echo "safe; gh pr merge 7"'
+assert_allowed_source "a quoted physical newline remains inert data" \
+  $'echo "safe\ngh" pr merge 7'
+assert_allowed_source "a here-string remains ordinary read-only syntax" \
+  'value=$(gh api repos/o/r/pulls/7 --jq .state); jq -e . <<<"$value"'
+assert_allowed_source "command lookup does not execute its dynamic operand" \
+  'command -v "$tool" >/dev/null; gh api repos/o/r/pulls/7 --jq .state'
+assert_allowed_source "nested command substitution preserves parameter quote state" \
+  'ROOT="${MERGEPATH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"; gh api repos/o/r/pulls/7 --jq .state'
+assert_allowed_source "quoted GitHub-output heredoc marker text is data" \
+  "echo 'prs${LT_PAIR}EOF'"
+assert_allowed_source "double-quoted heredoc-like text is data" \
+  "echo \"literal ${LT_PAIR}EOF\""
+assert_allowed_source "inline-comment heredoc-like text is inert" \
+  "echo ok # cat ${LT_PAIR}EOF"
+assert_allowed_source "arithmetic expansion left shift is not a heredoc" \
+  "x=\$((1${LT_PAIR}2)); echo \"\$x\""
+assert_allowed_source "arithmetic command left shift is not a heredoc" \
+  "((x=1${LT_PAIR}2)); echo \"\$x\""
+assert_allowed_source "legacy arithmetic expansion left shift is not a heredoc" \
+  "x=\$[1${LT_PAIR}2]; echo \"\$x\""
+assert_allowed_source "array-subscript left shift is not a heredoc" \
+  "a[1${LT_PAIR}2]=x; echo \"\${a[4]}\""
+assert_allowed_source "parameter-substring left shift is not a heredoc" \
+  "echo \${x:1${LT_PAIR}2}"
+
+for graphql_operation in \
+  addPullRequestToMergeQueue enqueuePullRequest dequeuePullRequest \
+  enablePullRequestAutoMerge disablePullRequestAutoMerge mergePullRequest; do
+  graphql_source=$(printf \
+    "gh api graphql -f query='mutation QueueChange {\n  %s(input: {}) { clientMutationId }\n}'" \
+    "$graphql_operation")
+  assert_prohibited_source "multiline GraphQL $graphql_operation" \
+    "$graphql_source"
+done
+
+EXPECTED_LABEL_DELETE='del_out=$(gh api "repos/$REPO/issues/$PR/labels/needs-external-review" -X DELETE -i --silent 2>/dev/null || true)'
+assert_prohibited_source "label DELETE without its explicit exception" \
+  "$EXPECTED_LABEL_DELETE"
+assert_allowed_source "the exact needs-external-review label DELETE" \
+  "$EXPECTED_LABEL_DELETE" --allow-needs-external-review-delete
+assert_prohibited_source "a different label DELETE" \
+  'gh api "repos/$REPO/issues/$PR/labels/human-hold" -X DELETE -i --silent 2>/dev/null || true' \
+  --allow-needs-external-review-delete
+assert_prohibited_source "a POST to the exempt label endpoint" \
+  'gh api "repos/$REPO/issues/$PR/labels/needs-external-review" -X POST -i --silent 2>/dev/null || true' \
+  --allow-needs-external-review-delete
+assert_prohibited_source "an exempt DELETE chained with a second API write" \
+  "$EXPECTED_LABEL_DELETE; gh api repos/o/r/pulls/7/merge -X PUT" \
+  --allow-needs-external-review-delete
+assert_prohibited_source "two copies of the exempt DELETE" \
+  "$EXPECTED_LABEL_DELETE; $EXPECTED_LABEL_DELETE" \
+  --allow-needs-external-review-delete
+assert_prohibited_source "a suffixed exempt endpoint" \
+  'gh api "repos/$REPO/issues/$PR/labels/needs-external-review/extra" -X DELETE -i --silent 2>/dev/null || true' \
+  --allow-needs-external-review-delete
+
+assert_allowed_source "a REST GET" 'gh api repos/o/r/pulls/7 --jq .state'
+assert_allowed_source "a GraphQL query" \
+  "gh api graphql -f query='query ReadPr { repository { name } }'"
+assert_allowed_source "a literal GraphQL query with variables" \
+  "gh api graphql -f query='query Read(\$owner: String!) { repository(owner: \$owner) { name } }' -F owner=o"
+assert_allowed_source "unrelated mutation prose cannot taint a GraphQL read" \
+  "gh api graphql -f query='query ReadPr { repository { name } }'"$'\necho "mutation"'
+assert_prohibited_source "an opaque GraphQL query variable" \
+  'gh api graphql -f query="$QUERY"'
+assert_prohibited_source "a literal GraphQL prefix with a dynamic suffix" \
+  'gh api graphql -f query='\''query Safe { viewer { login } } '\''"$(payload)" -f operationName=Exploit'
+assert_prohibited_source "a literal GraphQL prefix with a simple dynamic suffix" \
+  'gh api graphql -f query='\''query Safe { viewer { login } } '\''"$PAYLOAD"'
+assert_prohibited_source "a GraphQL input file" \
+  'gh api graphql --input payload.json'
+assert_allowed_source "a native PR read" 'gh pr view 7 --json autoMergeRequest'
+assert_allowed_source "an inert mutation-name string" \
+  'echo enablePullRequestAutoMerge'
+assert_prohibited_source "an invalid classifier mode fails closed" \
+  'gh api repos/o/r/pulls/7' --unsupported-mode
 
 STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"

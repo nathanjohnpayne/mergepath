@@ -1,0 +1,85 @@
+name: Merge Queue Authorization
+
+on:
+  pull_request_target:
+    types: [auto_merge_enabled, enqueued]
+
+concurrency:
+  group: merge-queue-authorization-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    name: Record exact-head queue authorization
+    # This expression is evaluated from the trusted event envelope before a
+    # checkout occurs or the author PAT is materialized. pull_request_target
+    # may also fire for a PR aimed at a non-default same-repository branch;
+    # executing that branch's recorder would hand its code the secret.
+    if: >-
+      github.event.repository.default_branch == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch &&
+      github.ref == 'refs/heads/main' &&
+      github.sha == github.event.pull_request.base.sha &&
+      github.workflow_sha == github.event.pull_request.base.sha &&
+      github.workflow_ref == format(
+        '{0}/.github/workflows/merge-queue-authorization.yml@refs/heads/main',
+        github.repository) &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action == 'enqueued' ||
+       (github.event.action == 'auto_merge_enabled' &&
+        github.event.pull_request.auto_merge.enabled_by.login == github.event.pull_request.user.login))
+    runs-on: ubuntu-latest
+    # All three credentials are environment-only secrets. The environment is
+    # restricted to literal main, disallows administrator bypass, and has no
+    # repository/organization secret with the same names.
+    environment: merge-queue-policy
+    steps:
+      # pull_request_target supplies trusted default-branch code. Pinning the
+      # payload's exact base SHA also makes the rollout policy auditable.
+      - name: Checkout the exact trusted event base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record the governing-author event head
+        env:
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          OP_PREFLIGHT_AUTHOR_PAT: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          MERGEPATH_MERGE_QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}
+          MERGEPATH_MERGE_QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}
+          EVENT_ACTION: ${{ github.event.action }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_ENABLED_BY: ${{ github.event.pull_request.auto_merge.enabled_by.login }}
+          EVENT_PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUNTIME_REF: ${{ github.ref }}
+          RUNTIME_SHA: ${{ github.sha }}
+          RUNTIME_WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUNTIME_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          scripts/workflow/record-merge-queue-authorization.sh \
+            --repo "$REPO" \
+            --event-action "$EVENT_ACTION" \
+            --pr "$PR_NUMBER" \
+            --head-sha "$EVENT_HEAD_SHA" \
+            --head-repo "$EVENT_HEAD_REPO" \
+            --base-sha "$EVENT_BASE_SHA" \
+            --base-ref "$EVENT_BASE_REF" \
+            --enabled-by "$EVENT_ENABLED_BY" \
+            --pr-author "$EVENT_PR_AUTHOR" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --runtime-ref "$RUNTIME_REF" \
+            --runtime-sha "$RUNTIME_SHA" \
+            --runtime-workflow-ref "$RUNTIME_WORKFLOW_REF" \
+            --runtime-workflow-sha "$RUNTIME_WORKFLOW_SHA"

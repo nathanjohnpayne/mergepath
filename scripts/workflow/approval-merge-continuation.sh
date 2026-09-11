@@ -12,7 +12,7 @@ MODE="continue"
 case "${1:-}" in
   --retract-unsafe-only|--disarm-shared-author-only)
     # APPROVAL_PROTECTIVE_RETRACTION_V2. The old spelling remains accepted for
-    # one propagation window; both names select the same disable-only mode.
+    # one propagation window; both names select the same read-only arm check.
     MODE="retract-only"
     shift
     ;;
@@ -28,6 +28,8 @@ ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 source "$ROOT/scripts/lib/review-policy-scalar.sh"
 
 RETRACT_ON_EXIT=0
+MERGEPATH_ARM_RETAINED=0
+MERGEPATH_READY_MESSAGE=""
 
 # The native Dependabot account answers to two spellings depending on which
 # surface named it, and both mean the identical account. `gh pr view --json
@@ -36,11 +38,11 @@ RETRACT_ON_EXIT=0
 # `github.event.pull_request.user.login`) render the same account as
 # `dependabot[bot]`. Every author read in THIS script comes from `read_pr()`,
 # i.e. `gh pr view --json author`, so a bare `= "dependabot[bot]"` test here
-# is never true and the Dependabot boundary below silently never fires —
-# which is the opposite of fail-closed: the sweeps enumerate every approved
-# PR, so the script would proceed to `gh pr merge --disable-auto` against the
-# durable arm the dedicated Dependabot lane owns. Match on equality against
-# both exact spellings rather than a prefix or glob: `dependabot[bot]` inside
+# is never true and the Dependabot boundary below silently never fires. The
+# #1058 cleanup path is read-only, but routing a native Dependabot arm through
+# the ordinary queue proof would still break its separate dedicated lane.
+# Match on equality against both exact spellings rather than a prefix or glob:
+# `dependabot[bot]` inside
 # an unquoted `case` pattern is a CHARACTER CLASS (`dependabot` + one of
 # b/o/t), and a prefix test would swallow `app/dependabot-lookalike`. The
 # exemption must match the two real logins and nothing else.
@@ -71,6 +73,13 @@ cleanup_on_exit() {
   if [ "$cleanup_rc" -ne 0 ]; then
     exit "$cleanup_rc"
   fi
+  if [ "$exit_rc" -eq 0 ] && [ "$MERGEPATH_ARM_RETAINED" -eq 1 ]; then
+    echo "approval continuation: not ready — queue-governed arm became active at continuation exit; ordinary one-shot readiness is not the active lane"
+    exit 4
+  fi
+  if [ "$exit_rc" -eq 0 ] && [ -n "$MERGEPATH_READY_MESSAGE" ]; then
+    echo "$MERGEPATH_READY_MESSAGE"
+  fi
   exit "$exit_rc"
 }
 trap 'cleanup_on_exit "$?"' EXIT
@@ -85,13 +94,34 @@ infra_error() {
   exit 3
 }
 
+# Queue credentials are high-impact environment secrets. Refuse a provisioning
+# alias before any live classification: identical values could otherwise put
+# the topology administrator credential back into the ordinary author lane.
+queue_policy_token=${MERGEPATH_QUEUE_POLICY_TOKEN:-}
+queue_source_token=${MERGEPATH_QUEUE_SOURCE_TOKEN:-}
+author_token=${MERGEPATH_AUTHOR_TOKEN:-}
+if [ -n "$queue_policy_token" ] || [ -n "$queue_source_token" ]; then
+  [ -n "$queue_policy_token" ] && [ -n "$queue_source_token" ] \
+    || infra_error "queue-policy and queue-source credentials must be provisioned together"
+  [ "$queue_policy_token" != "$queue_source_token" ] \
+    || infra_error "queue-policy and queue-source credentials must be value-distinct"
+  if [ "$MODE" = "continue" ]; then
+    author_token=${GH_TOKEN:-}
+  fi
+  [ -n "$author_token" ] \
+    || infra_error "queue classification requires the distinct author credential binding"
+  [ "$author_token" != "$queue_policy_token" ] \
+    && [ "$author_token" != "$queue_source_token" ] \
+    || infra_error "author, queue-policy, and queue-source credentials must be pairwise value-distinct"
+fi
+
 if [ "$MODE" = "continue" ]; then
   [ "${MERGEPATH_PROTECTIVE_RETRACTION_DONE:-}" = "1" ] || \
     infra_error "normal continuation requires a successful workflow-token protective retraction first"
   [ -n "${MERGEPATH_PROTECTIVE_TOKEN:-}" ] || \
     infra_error "normal continuation requires a separate workflow token for exit cleanup"
   # Install cleanup before the first live read. The token is available solely
-  # for disable-only cleanup and is never merge authorization.
+  # for read-only protective classification and is never merge authorization.
   RETRACT_ON_EXIT=1
 fi
 
@@ -141,9 +171,9 @@ policy_snapshot_signature() {
 }
 
 retract_snapshot_arm() {
-  local snapshot="$1" reason="$2" target_url target_head target_base_ref
-  local target_base_sha target_author readback readback_head readback_base_ref
-  local readback_base_sha readback_author
+  local snapshot="$1" reason="$2" target_author queue_policy_rc
+  local queue_policy_token queue_source_token
+  MERGEPATH_ARM_RETAINED=0
   valid_pr_shape "$snapshot" || {
     echo "approval continuation: $reason snapshot is malformed" >&2
     return 1
@@ -151,10 +181,6 @@ retract_snapshot_arm() {
   if jq -e '.autoMergeRequest == null' >/dev/null 2>&1 <<<"$snapshot"; then
     return 0
   fi
-  target_url=$(jq -r '.url' <<<"$snapshot")
-  target_head=$(jq -r '.headRefOid' <<<"$snapshot")
-  target_base_ref=$(jq -r '.baseRefName' <<<"$snapshot")
-  target_base_sha=$(jq -r '.baseRefOid' <<<"$snapshot")
   target_author=$(jq -r '.author.login' <<<"$snapshot")
   # The dedicated Dependabot workflow owns its durable arm. Keep this exact
   # native-login boundary at the mutation site as well as at normal entry:
@@ -164,28 +190,33 @@ retract_snapshot_arm() {
     echo "approval continuation: $reason snapshot belongs to Dependabot's dedicated auto-merge lane; leaving its durable request unchanged"
     return 0
   fi
-  if ! gh pr merge "$target_url" --repo "$REPO" --disable-auto; then # NO_BARE_GH_WRITE_EXEMPT: disable-only cleanup is intentionally monotone across head drift; tuple readback below fails closed
-    echo "approval continuation: could not disable $reason auto-merge request" >&2
-    return 1
+  # #1058: GitHub exposes no compare-and-swap precondition for disabling an
+  # auto-merge request. Any read-then-disable sequence can revoke a newer owner
+  # action, even when the head and base return to the same tuple. Preserve only
+  # an arm proven inside the active queue boundary; every other armed state is
+  # left unchanged and blocks continuation for explicit human/admin handling.
+  if [ -x "$ROOT/scripts/workflow/merge-queue-arm-policy.sh" ]; then
+    queue_policy_token=${MERGEPATH_QUEUE_POLICY_TOKEN:-}
+    queue_source_token=${MERGEPATH_QUEUE_SOURCE_TOKEN:-}
+    set +e
+    GH_TOKEN="$queue_policy_token" \
+      MERGEPATH_AUTHOR_TOKEN="$author_token" \
+      MERGEPATH_MERGE_QUEUE_SOURCE_TOKEN="$queue_source_token" \
+      bash "$ROOT/scripts/workflow/merge-queue-arm-policy.sh" \
+        "$PR_NUMBER" "$REPO"
+    queue_policy_rc=$?
+    set -e
+    case "$queue_policy_rc" in
+      0)
+        MERGEPATH_ARM_RETAINED=1
+        echo "approval continuation: $reason arm is protected by the #1058 merge-queue boundary; leaving it intact"
+        return 0
+        ;;
+      *) ;;
+    esac
   fi
-  readback=$(read_pr) || {
-    echo "approval continuation: could not verify $reason auto-merge retraction" >&2
-    return 1
-  }
-  valid_pr_shape "$readback" || {
-    echo "approval continuation: $reason retraction readback is malformed" >&2
-    return 1
-  }
-  readback_head=$(jq -r '.headRefOid' <<<"$readback")
-  readback_base_ref=$(jq -r '.baseRefName' <<<"$readback")
-  readback_base_sha=$(jq -r '.baseRefOid' <<<"$readback")
-  readback_author=$(jq -r '.author.login' <<<"$readback")
-  [ "$readback_head" = "$target_head" ] || return 1
-  [ "$readback_base_ref" = "$target_base_ref" ] || return 1
-  [ "$readback_base_sha" = "$target_base_sha" ] || return 1
-  [ "$readback_author" = "$target_author" ] || return 1
-  jq -e '.autoMergeRequest == null' >/dev/null 2>&1 <<<"$readback" || return 1
-  echo "approval continuation: $reason auto-merge retraction verified"
+  echo "approval continuation: refusing to mutate $reason arm because native disable has no exact-action precondition" >&2
+  return 1
 }
 
 retract_latest_arm() {
@@ -281,6 +312,8 @@ if [ "$MODE" = "retract-only" ]; then
   fi
   retract_snapshot_arm "$protection_snapshot" "durable or unclassified" || \
     infra_error "could not retract and verify the protective auto-merge request"
+  [ "$MERGEPATH_ARM_RETAINED" -eq 0 ] \
+    || not_ready "queue-governed arm remains active; protective classification made no mutation"
   exit 0
 fi
 
@@ -319,12 +352,14 @@ base_sha=$(jq -r '.baseRefOid' <<<"$initial")
 url=$(jq -r '.url' <<<"$initial")
 native_author=$(jq -r '.author.login' <<<"$initial")
 
-# Reclaim every pre-existing arm before expensive readiness work, even for a
-# proven native non-shared author. A later not-ready exit then cannot strand an
-# arm whose base-policy classification has gone stale. A fully clean run stays
-# unarmed and reports readiness for an ordinary one-shot author merge.
+# Classify every pre-existing arm before expensive readiness work. There is no
+# safe disable mutation: an exact queue-governed arm remains intact and stops
+# this ordinary continuation, while every unproven arm fails closed. Only an
+# actually unarmed snapshot may proceed toward one-shot readiness.
 retract_snapshot_arm "$initial" "pre-evaluation" || \
   infra_error "could not retract and verify the pre-evaluation auto-merge request"
+[ "$MERGEPATH_ARM_RETAINED" -eq 0 ] \
+  || not_ready "queue-governed arm remains active; direct readiness continuation is not authorized"
 initial=$(jq -c '.autoMergeRequest = null' <<<"$initial")
 
 # Every subsequent not-ready exit performs a final live protective pass. This
@@ -438,9 +473,9 @@ if [ "$final_head" != "$head" ] || [ "$final_base_ref" != "$base_ref" ] ||
   [ "$final_base_sha" != "$base_sha" ]; then
   retract_snapshot_arm "$final" "final-snapshot-drift" || \
     infra_error "could not retract an arm from the drifted final snapshot"
-  # The exact drifted snapshot was retracted and read back above. The exit trap
-  # performs one more workflow-token pass so a newer overlapping arm cannot
-  # appear between this readback and process exit.
+  # A proven queue-governed arm may remain intact. The exit trap performs one
+  # more workflow-token classification so a newer overlapping arm cannot be
+  # mistaken for the previously observed action.
   not_ready "head or base changed during evaluation"
 fi
 [ -z "$final_labels" ] || not_ready "blocking labels appeared: $final_labels"
@@ -492,4 +527,6 @@ fi
 GH_TOKEN="$MERGEPATH_PROTECTIVE_TOKEN" \
   retract_snapshot_arm "$post_independence" "post-independence" || \
   infra_error "could not retract and verify a post-independence auto-merge request"
-echo "approval continuation: merge-ready at $final_head; durable auto-merge remains disabled pending the #1058 merge-group boundary"
+[ "$MERGEPATH_ARM_RETAINED" -eq 0 ] \
+  || not_ready "queue-governed arm remains active; ordinary one-shot readiness is not the active lane"
+MERGEPATH_READY_MESSAGE="approval continuation: merge-ready at $final_head; durable auto-merge remains disabled pending the #1058 merge-group boundary"

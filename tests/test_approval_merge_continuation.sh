@@ -55,7 +55,7 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
 fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
   if [[ " $* " == *" --match-head-commit "* ]]; then
-    echo "unexpected ineffective --match-head-commit on disable-auto" >&2
+    echo "unexpected merge write with a head-only precondition" >&2
     exit 91
   fi
   printf 'merge\n' >> "$STUB_DIR/events.log"
@@ -117,6 +117,15 @@ printf '%s\n' "$MERGEPATH_REPO_ROOT/policy.yml"
 STUB
 chmod +x "$TMP/root/scripts/workflow/resolve_base_policy.sh"
 
+cat > "$TMP/root/scripts/workflow/merge-queue-arm-policy.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'queue-policy:%s queue-source:%s\n' "${GH_TOKEN:-unset}" \
+  "${MERGEPATH_MERGE_QUEUE_SOURCE_TOKEN:-unset}" \
+  >> "${STUB_DIR:?}/queue-policy.log"
+exit "${STUB_QUEUE_POLICY_RC:-4}"
+STUB
+chmod +x "$TMP/root/scripts/workflow/merge-queue-arm-policy.sh"
+
 # Execute the shipping workflow step itself rather than only grepping its
 # shape. The extraction is bounded by the next job separator and dedents the
 # literal run block exactly as Actions will hand it to bash.
@@ -151,6 +160,13 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
+if ! grep -Fq -- '--disable-auto' "$SUBJECT" "$ROOT/.github/workflows/agent-review.yml" \
+   && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge' "$SUBJECT" "$ROOT/.github/workflows/agent-review.yml"; then
+  pass "non-Dependabot approval cleanup contains no native merge or disable mutation"
+else
+  fail "non-Dependabot approval cleanup reintroduced a native merge or disable mutation"
+fi
+
 BASE='{"state":"OPEN","isDraft":false,"headRefOid":"abc123","baseRefName":"main","baseRefOid":"base123","url":"https://example.test/pr/7","body":"Authoring-Agent: codex","labels":[],"author":{"login":"outside-contributor"},"autoMergeRequest":null}'
 SHARED_BASE=$(jq -c '.author.login = "nathanjohnpayne"' <<<"$BASE")
 DEPENDABOT_BASE=$(jq -c '
@@ -163,6 +179,12 @@ DEPENDABOT_APP_BASE=$(jq -c '
   .author.login = "app/dependabot" |
   .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}
 ' <<<"$BASE")
+ARMED_SHARED_BASE=$(jq -c '
+  .autoMergeRequest = {
+    "enabledAt":"2026-01-09T00:00:00Z",
+    "enabledBy":{"login":"nathanjohnpayne"}
+  }
+' <<<"$SHARED_BASE")
 
 run_case() {
   local -a subject_args=(7 owner/repo)
@@ -185,12 +207,16 @@ run_case() {
   : > "$TMP/policy.log"
   : > "$TMP/events.log"
   : > "$TMP/accounting-token.log"
+  : > "$TMP/queue-policy.log"
   printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}" > "$TMP/root/policy.yml"
   printf 'author_identity: %s\n' "${STUB_TRUSTED_AUTHOR:-${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}}" > "$TMP/root/.github/review-policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
     GH_TOKEN="${TEST_AMBIENT_GH_TOKEN:-${STUB_SUBJECT_TOKEN:-author-token}}" \
     ACCOUNTING_GH_TOKEN="${TEST_ACCOUNTING_GH_TOKEN:-}" \
+    MERGEPATH_AUTHOR_TOKEN="${STUB_AUTHOR_TOKEN-author-token}" \
     MERGEPATH_PROTECTIVE_TOKEN="${STUB_PROTECTIVE_TOKEN-workflow-token}" \
+    MERGEPATH_QUEUE_POLICY_TOKEN="${STUB_QUEUE_POLICY_TOKEN-queue-policy-token}" \
+    MERGEPATH_QUEUE_SOURCE_TOKEN="${STUB_QUEUE_SOURCE_TOKEN-queue-source-token}" \
     MERGEPATH_PROTECTIVE_RETRACTION_DONE="${STUB_PROTECTIVE_DONE:-1}" \
     STUB_INITIAL="$stub_initial" STUB_SECOND="$stub_second" \
     STUB_THIRD="$stub_third" STUB_FOURTH="$stub_fourth" STUB_FINAL="$stub_final" \
@@ -207,6 +233,7 @@ run_case() {
     STUB_DEFAULT_BRANCH="${STUB_DEFAULT_BRANCH:-main}" \
     STUB_DEFAULT_BRANCH_RC="${STUB_DEFAULT_BRANCH_RC:-0}" \
     STUB_LOGIN_RC="${STUB_LOGIN_RC:-0}" STUB_MERGE_RC="${STUB_MERGE_RC:-0}" \
+    STUB_QUEUE_POLICY_RC="${STUB_QUEUE_POLICY_RC:-4}" \
     bash "$TMP/subject.sh" "${subject_args[@]}" >"$TMP/subject.out" 2>&1
 }
 
@@ -217,6 +244,7 @@ run_workflow_retraction_case() {
   echo 0 > "$TMP/read-count"
   : > "$TMP/merge.log"
   : > "$TMP/events.log"
+  : > "$TMP/queue-policy.log"
   : > "$TMP/workflow-output"
   (
     cd "$TMP/old-trusted-checkout"
@@ -224,11 +252,15 @@ run_workflow_retraction_case() {
       STUB_INITIAL="$stub_initial" STUB_FINAL="$stub_final" \
       STUB_SECOND="$stub_final" \
       STUB_MERGE_RC="${STUB_MERGE_RC:-0}" \
+      STUB_QUEUE_POLICY_RC="${STUB_QUEUE_POLICY_RC:-4}" \
       AUTHOR_IDENTITY="${STUB_WORKFLOW_AUTHOR_IDENTITY-}" \
       SNAPSHOT_CURRENT="${STUB_WORKFLOW_SNAPSHOT_CURRENT:-true}" \
       EVENT_HEAD="${STUB_WORKFLOW_EVENT_HEAD:-abc123}" \
       EVENT_BASE_REF="${STUB_WORKFLOW_EVENT_BASE_REF:-main}" \
       EVENT_BASE_SHA="${STUB_WORKFLOW_EVENT_BASE_SHA:-base123}" \
+      GH_TOKEN="${STUB_WORKFLOW_GH_TOKEN:-workflow-token}" \
+      QUEUE_POLICY_TOKEN="${STUB_WORKFLOW_QUEUE_POLICY_TOKEN-queue-policy-token}" \
+      QUEUE_SOURCE_TOKEN="${STUB_WORKFLOW_QUEUE_SOURCE_TOKEN-queue-source-token}" \
       GITHUB_OUTPUT="$TMP/workflow-output" \
       PR_NUMBER=7 REPO=owner/repo \
       bash "$WORKFLOW_RETRACTION" >"$TMP/workflow.out" 2>&1
@@ -254,7 +286,11 @@ reset_fixtures() {
   unset STUB_SECOND STUB_THIRD STUB_FOURTH STUB_DEFAULT_BRANCH STUB_DEFAULT_BRANCH_RC
   unset STUB_WORKFLOW_SNAPSHOT_CURRENT STUB_WORKFLOW_EVENT_HEAD
   unset STUB_WORKFLOW_EVENT_BASE_REF STUB_WORKFLOW_EVENT_BASE_SHA STUB_TRUSTED_AUTHOR
-  unset STUB_SUBJECT_TOKEN STUB_PROTECTIVE_TOKEN
+  unset STUB_SUBJECT_TOKEN STUB_AUTHOR_TOKEN STUB_PROTECTIVE_TOKEN
+  unset STUB_QUEUE_POLICY_TOKEN STUB_QUEUE_POLICY_RC
+  unset STUB_QUEUE_SOURCE_TOKEN
+  unset STUB_WORKFLOW_QUEUE_POLICY_TOKEN STUB_WORKFLOW_GH_TOKEN
+  unset STUB_WORKFLOW_QUEUE_SOURCE_TOKEN
   unset STUB_PROTECTIVE_DONE
   unset TEST_AMBIENT_GH_TOKEN TEST_ACCOUNTING_GH_TOKEN
 }
@@ -322,9 +358,9 @@ fi
 # `gh pr view --json author`, and gh renders bot logins as `app/<slug>`, so
 # `app/dependabot` is the spelling the boundary ACTUALLY receives in CI. The
 # suite stubbing only the REST form is why the boundary could silently stop
-# matching without a single test going red: the exemption never fired, and
-# the sweeps' `gh pr merge --disable-auto` against Dependabot's durable arm
-# was held off only by the retraction token's 403.
+# matching without a single test going red. The #1058 cleanup path is now
+# read-only, but this account boundary still has to select the dedicated
+# Dependabot lane before ordinary arm classification.
 reset_fixtures
 STUB_SUBJECT_MODE=disarm
 STUB_INITIAL="$DEPENDABOT_APP_BASE"
@@ -362,10 +398,14 @@ STUB_INITIAL=$(jq -c '
 ' <<<"$BASE")
 STUB_SECOND="$STUB_INITIAL"
 STUB_THIRD=$(jq -c '.autoMergeRequest = null' <<<"$STUB_INITIAL")
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
-  pass "gh app/ Dependabot lookalike logins remain inside protective retraction"
+set +e
+run_case
+dependabot_app_lookalike_rc=$?
+set -e
+if [ "$dependabot_app_lookalike_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "gh app/ Dependabot lookalikes fail closed in ordinary arm classification"
 else
   fail "Dependabot exemption matched more than the two exact native bot logins"
 fi
@@ -408,12 +448,133 @@ STUB_INITIAL=$(jq -c '
 ' <<<"$BASE")
 STUB_SECOND="$STUB_INITIAL"
 STUB_THIRD=$(jq -c '.autoMergeRequest = null' <<<"$STUB_INITIAL")
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
-  pass "Dependabot lookalike logins remain inside protective retraction"
+set +e
+run_case
+dependabot_lookalike_rc=$?
+set -e
+if [ "$dependabot_lookalike_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "Dependabot lookalike logins fail closed as ordinary armed PRs"
 else
   fail "Dependabot exemption matched more than the exact native bot login"
+fi
+
+# #1058: the established cleanup lane may preserve an owner arm only
+# after the read-only queue-policy helper proves the complete live boundary.
+# The proof uses distinct target-policy and source-read tokens. A protected
+# arm returns not-ready rather than pretending that retraction occurred.
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_SUBJECT_TOKEN=workflow-token
+STUB_QUEUE_POLICY_TOKEN=queue-policy-token
+STUB_QUEUE_POLICY_RC=0
+STUB_INITIAL="$ARMED_SHARED_BASE"
+STUB_SECOND="$ARMED_SHARED_BASE"
+set +e
+run_case
+protected_arm_rc=$?
+set -e
+if [ "$protected_arm_rc" -eq 4 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+   && grep -Fq 'protective classification made no mutation' "$TMP/subject.out"; then
+  pass "protective continuation reports a proven queue-governed arm as retained"
+else
+  fail "protective continuation misreported a proven queue-governed arm"
+fi
+
+# Normal continuation must make the same retained-arm decision before any
+# readiness gate. In particular, it must not locally rewrite the snapshot to
+# look unarmed and later publish the ordinary unarmed-readiness claim.
+reset_fixtures
+STUB_QUEUE_POLICY_TOKEN=queue-policy-token
+STUB_QUEUE_POLICY_RC=0
+STUB_INITIAL=$(jq -c '.autoMergeRequest = {
+  "enabledAt":"2026-01-09T00:00:00Z",
+  "enabledBy":{"login":"nathanjohnpayne"}
+}' <<<"$BASE")
+STUB_SECOND="$STUB_INITIAL"
+STUB_FINAL="$STUB_INITIAL"
+set +e
+run_case
+normal_retained_arm_rc=$?
+set -e
+if [ "$normal_retained_arm_rc" -eq 4 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/readiness.log" ] \
+   && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+   && grep -Fq 'queue-governed arm remains active; direct readiness continuation is not authorized' "$TMP/subject.out" \
+   && ! grep -Fq 'durable auto-merge remains disabled pending the #1058 merge-group boundary' "$TMP/subject.out"; then
+  pass "normal continuation stops on a proven retained arm without claiming unarmed readiness"
+else
+  fail "normal continuation locally reclassified or advanced a proven retained arm (rc=$normal_retained_arm_rc; output=$(tr '\n' ' ' < "$TMP/subject.out"))"
+fi
+
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_SUBJECT_TOKEN=workflow-token
+STUB_QUEUE_POLICY_TOKEN=queue-policy-token
+STUB_QUEUE_POLICY_RC=4
+STUB_INITIAL="$ARMED_SHARED_BASE"
+STUB_SECOND="$ARMED_SHARED_BASE"
+STUB_THIRD="$SHARED_BASE"
+STUB_FINAL="$SHARED_BASE"
+set +e
+run_case
+queue_disabled_result=$?
+set -e
+if [ "$queue_disabled_result" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/merge-token.log" ] \
+   && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "queue proof rc=4 refuses an unconditioned disable mutation"
+else
+  fail "queue proof rc=4 wrote or silently accepted an unproven arm"
+fi
+
+for queue_reject_rc in 3 5; do
+  reset_fixtures
+  STUB_SUBJECT_MODE=disarm
+  STUB_SUBJECT_TOKEN=workflow-token
+  STUB_QUEUE_POLICY_TOKEN=queue-policy-token
+  STUB_QUEUE_POLICY_RC="$queue_reject_rc"
+  STUB_INITIAL="$ARMED_SHARED_BASE"
+  STUB_SECOND="$ARMED_SHARED_BASE"
+  set +e
+  run_case
+  queue_reject_result=$?
+  set -e
+  if [ "$queue_reject_result" -ne 0 ] \
+     && [ ! -s "$TMP/merge.log" ] \
+     && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+     && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+    pass "queue proof rc=$queue_reject_rc refuses ambiguous active-rollout mutation"
+  else
+    fail "queue proof rc=$queue_reject_rc disabled or silently preserved an ambiguous arm"
+  fi
+done
+
+# A trusted checkout without the new proof helper must also block. Falling
+# back to native disable would recreate the read/newer-arm/disable race.
+chmod -x "$TMP/root/scripts/workflow/merge-queue-arm-policy.sh"
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_INITIAL="$ARMED_SHARED_BASE"
+STUB_SECOND="$ARMED_SHARED_BASE"
+set +e
+run_case
+missing_queue_helper_rc=$?
+set -e
+chmod +x "$TMP/root/scripts/workflow/merge-queue-arm-policy.sh"
+if [ "$missing_queue_helper_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/queue-policy.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "missing queue proof helper leaves an armed PR untouched and blocks"
+else
+  fail "missing queue proof helper allowed an unconditioned arm mutation"
 fi
 
 reset_fixtures
@@ -589,14 +750,18 @@ STUB_SECOND="$BASE"
 STUB_THIRD="$BASE"
 STUB_FOURTH=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:06Z"}' <<<"$BASE")
 STUB_FINAL="$BASE"
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && [ "$(cat "$TMP/merge-token.log")" = "workflow-token" ] \
-   && grep -Fq 'post-independence auto-merge retraction verified' "$TMP/subject.out" \
-   && grep -Fq 'durable auto-merge remains disabled pending the #1058 merge-group boundary' "$TMP/subject.out"; then
-  pass "stable readiness scrubs an arm that appears after independence"
+set +e
+run_case
+late_post_independence_arm_rc=$?
+set -e
+if [ "$late_post_independence_arm_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/merge-token.log" ] \
+   && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+   && grep -Fq 'refusing to mutate post-independence arm' "$TMP/subject.out"; then
+  pass "stable readiness blocks without mutating an arm that appears after independence"
 else
-  fail "stable readiness preserved a late durable arm or used the author token"
+  fail "stable readiness mutated or accepted a late durable arm"
 fi
 
 # The post-independence snapshot can be clear while an overlapping rollout
@@ -610,12 +775,44 @@ run_case
 post_snapshot_arm_rc=$?
 set -e
 if [ "$post_snapshot_arm_rc" -eq 3 ] \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && [ "$(cat "$TMP/merge-token.log")" = "workflow-token" ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/merge-token.log" ] \
+   && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+   && grep -Fq 'refusing to mutate continuation exit arm' "$TMP/subject.out" \
    && grep -Fq 'could not retract the latest arm before exit' "$TMP/subject.out"; then
-  pass "EXIT cleanup catches an arm created after the post-independence snapshot"
+  pass "EXIT cleanup detects a newer arm and blocks without mutating it"
 else
-  fail "EXIT cleanup stranded or silently accepted a post-snapshot arm (rc=$post_snapshot_arm_rc)"
+  fail "EXIT cleanup mutated or silently accepted a post-snapshot arm (rc=$post_snapshot_arm_rc)"
+fi
+
+# A newly active arm may be valid inside the queue boundary. It must remain
+# untouched, but that means the ordinary one-shot readiness claim is no longer
+# true. The EXIT observation therefore replaces success with not-ready rather
+# than printing a stale merge-ready result and returning zero.
+reset_fixtures
+STUB_FOURTH="$BASE"
+STUB_FINAL=$(jq -c \
+  '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:08Z"}' \
+  <<<"$BASE")
+STUB_QUEUE_POLICY_RC=0
+set +e
+run_case
+post_snapshot_proven_arm_rc=$?
+set -e
+if [ "$post_snapshot_proven_arm_rc" -eq 4 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/merge-token.log" ] \
+   && grep -Fxq \
+     'queue-policy:queue-policy-token queue-source:queue-source-token' \
+     "$TMP/queue-policy.log" \
+   && grep -Fq 'continuation exit arm is protected by the #1058 merge-queue boundary' \
+     "$TMP/subject.out" \
+   && grep -Fq 'queue-governed arm became active at continuation exit' \
+     "$TMP/subject.out" \
+   && ! grep -Fq 'merge-ready at' "$TMP/subject.out"; then
+  pass "EXIT cleanup preserves a proven queue arm and revokes ordinary readiness"
+else
+  fail "EXIT cleanup reported stale readiness for a proven post-snapshot arm (rc=$post_snapshot_proven_arm_rc; output=$(tr '\n' ' ' < "$TMP/subject.out"))"
 fi
 
 # The head-only merge precondition cannot bind a same-head base transition.
@@ -687,13 +884,13 @@ set +e
 run_case
 armed_shared_phase4_rc=$?
 set -e
-if [ "$armed_shared_phase4_rc" -eq 4 ] \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 pr-view-4 " ] \
+if [ "$armed_shared_phase4_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate pre-evaluation arm' "$TMP/subject.out" \
    && [ ! -s "$TMP/readiness.log" ]; then
-  pass "shared-author re-entry retracts a pre-existing arm before readiness work"
+  pass "shared-author re-entry blocks on a pre-existing unproven arm without mutation"
 else
-  fail "pre-existing shared-author auto-merge arm was not retracted first (rc=$armed_shared_phase4_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
+  fail "pre-existing shared-author arm was mutated or allowed into readiness work (rc=$armed_shared_phase4_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
 fi
 
 reset_fixtures
@@ -719,9 +916,9 @@ else
   fail "native non-shared Phase 4 readiness created a head-only durable arm"
 fi
 
-# An invalidated shared-author run must retract an old arm before any early
-# readiness exit. This is the same-head under-threshold -> Phase 4 transition
-# that an approval-triggered auto-merge job otherwise skips as ineligible.
+# An invalidated shared-author run with an old arm must block before any early
+# readiness predicate. Native disable cannot distinguish that old request from
+# a newer owner action on the same tuple.
 for early_failure in draft readiness independence; do
   reset_fixtures
   STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
@@ -735,18 +932,18 @@ for early_failure in draft readiness independence; do
   run_case
   early_failure_rc=$?
   set -e
-  if [ "$early_failure_rc" -eq 4 ] \
-     && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-     && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 pr-view-4 " ]; then
-    pass "shared-author $early_failure invalidation retracts the existing arm before exiting"
+  if [ "$early_failure_rc" -eq 3 ] \
+     && [ ! -s "$TMP/merge.log" ] \
+     && [ ! -s "$TMP/readiness.log" ] \
+     && grep -Fq 'refusing to mutate pre-evaluation arm' "$TMP/subject.out"; then
+    pass "shared-author $early_failure invalidation blocks on the existing arm without mutation"
   else
-    fail "shared-author $early_failure invalidation did not retract first (rc=$early_failure_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
+    fail "shared-author $early_failure invalidation mutated or bypassed the existing arm (rc=$early_failure_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
   fi
 done
 
-# A shared-author run must also perform the last-moment protective pass. This
-# covers an older first-rollout invocation that arms after this invocation's
-# pre-evaluation readback but before the shared-author stop.
+# A shared-author run must also perform the last-moment protective read. This
+# covers a newer owner arm appearing after pre-evaluation and before the stop.
 reset_fixtures
 STUB_INITIAL="$SHARED_BASE"
 STUB_SECOND="$SHARED_BASE"
@@ -756,18 +953,18 @@ set +e
 run_case
 shared_late_arm_rc=$?
 set -e
-if [ "$shared_late_arm_rc" -eq 4 ] \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 pr-view-3 merge pr-view-4 " ]; then
-  pass "a shared-author stop retracts an arm created after pre-evaluation"
+if [ "$shared_late_arm_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+   && grep -Fq 'refusing to mutate continuation exit arm' "$TMP/subject.out"; then
+  pass "a shared-author stop detects a newer arm and refuses to mutate it"
 else
-  fail "shared-author final cleanup stranded a late arm (rc=$shared_late_arm_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
+  fail "shared-author final cleanup mutated or accepted a late arm (rc=$shared_late_arm_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
 fi
 
-# An overlapping continuation can create an arm while this invocation is
-# inside an expensive readiness gate. Every normal-mode not-ready exit performs
-# one final live protective pass, so a base-policy transition cannot inherit
-# that arm without reclassification.
+# A newer owner action can create an arm while this invocation is inside an
+# expensive readiness gate. The final read must turn that into a non-mutating
+# failure, never an unconditional disable.
 reset_fixtures
 STUB_READINESS_RC=1
 STUB_INITIAL="$BASE"
@@ -778,17 +975,17 @@ set +e
 run_case
 late_arm_not_ready_rc=$?
 set -e
-if [ "$late_arm_not_ready_rc" -eq 4 ] \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 pr-view-3 merge pr-view-4 " ]; then
-  pass "a late arm is retracted before an early normal-mode not-ready exit"
+if [ "$late_arm_not_ready_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+   && grep -Fq 'refusing to mutate continuation exit arm' "$TMP/subject.out"; then
+  pass "a late arm blocks an early normal-mode exit without mutation"
 else
-  fail "normal-mode not-ready cleanup stranded a late arm (rc=$late_arm_not_ready_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
+  fail "normal-mode not-ready cleanup mutated or accepted a late arm (rc=$late_arm_not_ready_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
 fi
 
-# Infrastructure failures use the same trailing workflow-token pass. The
-# author token remains untrusted for protective writes, and no unexpected gate
-# rc may strand an arm created by an older overlapping continuation.
+# Infrastructure failures use the same trailing read-only pass. No unexpected
+# gate result may authorize mutation of an arm created by a newer action.
 for infra_gate in readiness clearance accounting threads required-checks independence; do
   reset_fixtures
   STUB_INITIAL="$BASE"
@@ -812,17 +1009,17 @@ for infra_gate in readiness clearance accounting threads required-checks indepen
   late_arm_infra_rc=$?
   set -e
   if [ "$late_arm_infra_rc" -eq 3 ] \
-     && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-     && [ "$(cat "$TMP/merge-token.log")" = "workflow-token" ]; then
-    pass "$infra_gate infrastructure exit retracts a late arm with the workflow token"
+     && [ ! -s "$TMP/merge.log" ] \
+     && [ ! -s "$TMP/merge-token.log" ] \
+     && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log"; then
+    pass "$infra_gate infrastructure exit detects a late arm without mutation"
   else
-    fail "$infra_gate infrastructure cleanup stranded a late arm or used the wrong token (rc=$late_arm_infra_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
+    fail "$infra_gate infrastructure cleanup mutated or accepted a late arm (rc=$late_arm_infra_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
   fi
 done
 
-# The final live snapshot is itself the authority when it reveals base drift.
-# Retract its arm directly before deferring; a second free-floating read could
-# otherwise miss the exact tuple that was just found unsafe.
+# A final live snapshot that reveals base drift and an arm must block without
+# mutation. There is no action-level precondition with which to disable it.
 reset_fixtures
 STUB_INITIAL="$BASE"
 STUB_SECOND="$BASE"
@@ -832,13 +1029,13 @@ set +e
 run_case
 final_drift_arm_rc=$?
 set -e
-if [ "$final_drift_arm_rc" -eq 4 ] \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'final-snapshot-drift auto-merge retraction verified' "$TMP/subject.out" \
-   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 pr-view-3 merge pr-view-4 pr-view-5 " ]; then
-  pass "a final base-drift snapshot is disarmed before the continuation defers"
+if [ "$final_drift_arm_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+   && grep -Fq 'refusing to mutate final-snapshot-drift arm' "$TMP/subject.out"; then
+  pass "a final base-drift arm blocks without an unconditional disable"
 else
-  fail "final base drift left its exact armed tuple standing (rc=$final_drift_arm_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
+  fail "final base drift mutated or accepted its armed tuple (rc=$final_drift_arm_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
 fi
 
 reset_fixtures
@@ -850,12 +1047,12 @@ run_case
 armed_policy_failure_rc=$?
 set -e
 if [ "$armed_policy_failure_rc" -eq 3 ] \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && [ "$(cat "$TMP/merge-token.log")" = "workflow-token" ] \
-   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 " ]; then
-  pass "unreadable governing policy exits through workflow-token protective cleanup"
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+   && grep -Fq 'refusing to mutate continuation exit arm' "$TMP/subject.out"; then
+  pass "unreadable governing policy leaves an armed PR untouched and fails closed"
 else
-  fail "unreadable governing policy did not use bounded protective cleanup (rc=$armed_policy_failure_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
+  fail "unreadable governing policy mutated or accepted an arm (rc=$armed_policy_failure_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
 fi
 
 reset_fixtures
@@ -863,12 +1060,16 @@ STUB_SUBJECT_MODE=disarm
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
 STUB_FINAL="$SHARED_BASE"
 STUB_POLICY_RC=9
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
-  pass "workflow-token protection retracts an armed PR when governing policy is unreadable"
+set +e
+run_case
+unreadable_policy_arm_rc=$?
+set -e
+if [ "$unreadable_policy_arm_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "workflow-token protection blocks an unclassified arm without mutation"
 else
-  fail "workflow-token protection stranded an unclassified arm"
+  fail "workflow-token protection mutated or accepted an unclassified arm"
 fi
 
 reset_fixtures
@@ -876,44 +1077,53 @@ STUB_SUBJECT_MODE=disarm
 STUB_INITIAL="$SHARED_BASE"
 STUB_SECOND=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:01Z"}' <<<"$SHARED_BASE")
 STUB_FINAL="$SHARED_BASE"
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 " ]; then
-  pass "protective mode retracts a shared-author arm that appears during policy materialization"
+set +e
+run_case
+arm_during_policy_rc=$?
+set -e
+if [ "$arm_during_policy_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "protective mode blocks an arm that appears during policy materialization"
 else
-  fail "protective mode trusted the stale initially-unarmed bit"
+  fail "protective mode mutated or trusted the stale initially-unarmed bit"
 fi
 
 reset_fixtures
 STUB_SUBJECT_MODE=disarm
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
 STUB_FINAL="$SHARED_BASE"
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
-  pass "the approval guard can invoke the bounded protective retraction mode"
+set +e
+run_case
+protective_arm_rc=$?
+set -e
+if [ "$protective_arm_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "the approval guard blocks an unproven arm in protective mode"
 else
-  fail "protective retraction mode did not verify the disarm"
+  fail "protective mode mutated or accepted an unproven arm"
 fi
 
-for failed_readback in still_armed moved_head moved_base; do
+for armed_snapshot in still_armed moved_head moved_base; do
   reset_fixtures
   STUB_SUBJECT_MODE=disarm
   STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
-  case "$failed_readback" in
-    still_armed) STUB_FINAL="$STUB_INITIAL" ;;
-    moved_head) STUB_FINAL=$(jq -c '.headRefOid = "def456"' <<<"$SHARED_BASE") ;;
-    moved_base) STUB_FINAL=$(jq -c '.baseRefOid = "base456"' <<<"$SHARED_BASE") ;;
+  case "$armed_snapshot" in
+    still_armed) STUB_SECOND="$STUB_INITIAL" ;;
+    moved_head) STUB_SECOND=$(jq -c '.headRefOid = "def456" | .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:01Z"}' <<<"$SHARED_BASE") ;;
+    moved_base) STUB_SECOND=$(jq -c '.baseRefOid = "base456" | .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:01Z"}' <<<"$SHARED_BASE") ;;
   esac
   set +e
   run_case
-  failed_readback_rc=$?
+  armed_snapshot_rc=$?
   set -e
-  if [ "$failed_readback_rc" -eq 3 ] \
-     && grep -Fq -- '--disable-auto' "$TMP/merge.log"; then
-    pass "a $failed_readback disarm readback fails closed after the retraction write"
+  if [ "$armed_snapshot_rc" -eq 3 ] \
+     && [ ! -s "$TMP/merge.log" ] \
+     && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+    pass "a $armed_snapshot protective snapshot fails closed without a write"
   else
-    fail "a $failed_readback disarm readback was accepted (rc=$failed_readback_rc)"
+    fail "a $armed_snapshot protective snapshot was mutated or accepted (rc=$armed_snapshot_rc)"
   fi
 done
 
@@ -921,23 +1131,26 @@ reset_fixtures
 STUB_SUBJECT_MODE=disarm
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
 STUB_FINAL="$BASE"
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out" \
-   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 " ] \
+set +e
+run_case
+nonshared_arm_rc=$?
+set -e
+if [ "$nonshared_arm_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out" \
    && grep -Fq -- '--base-ref main --base-sha base123 --default-branch main --materialize-default' "$TMP/policy.log" \
    && ! grep -Fq -- '--pr' "$TMP/policy.log"; then
-  pass "protective mode retracts a native non-shared durable arm"
+  pass "protective mode blocks a native non-shared durable arm without mutation"
 else
-  fail "protective mode preserved a native non-shared durable arm"
+  fail "protective mode mutated or accepted a native non-shared durable arm"
 fi
 
 # #1094 adversarial race: policy was pinned to the first main/base123 tuple,
 # but the PR retargeted after that materialization. The old implementation
 # preserved this external-author arm as "proven non-shared" even though its
 # policy and live base no longer described the same state. The latest armed
-# tuple must instead be treated as unclassified and retracted with its own head
-# CAS, then verified against that same base tuple.
+# tuple must instead be treated as unclassified and left untouched for explicit
+# disposition; native disable has no head or action CAS.
 reset_fixtures
 STUB_SUBJECT_MODE=disarm
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
@@ -948,13 +1161,17 @@ STUB_SECOND=$(jq -c '
   .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:01Z"}
 ' <<<"$BASE")
 STUB_FINAL=$(jq -c '.autoMergeRequest = null' <<<"$STUB_SECOND")
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
+set +e
+run_case
+policy_drift_arm_rc=$?
+set -e
+if [ "$policy_drift_arm_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'changed during policy classification; treating the latest armed state as unclassified' "$TMP/subject.out" \
-   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 " ]; then
-  pass "base/head drift during non-shared preservation retracts the latest arm as unclassified"
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "base/head drift leaves the latest unclassified arm untouched and blocks"
 else
-  fail "policy/PR drift preserved or retracted the wrong armed snapshot (events=$(tr '\n' ' ' < "$TMP/events.log"); merge=$(cat "$TMP/merge.log" 2>/dev/null); output=$(cat "$TMP/subject.out" 2>/dev/null))"
+  fail "policy/PR drift mutated or accepted an armed snapshot (events=$(tr '\n' ' ' < "$TMP/events.log"); merge=$(cat "$TMP/merge.log" 2>/dev/null); output=$(cat "$TMP/subject.out" 2>/dev/null))"
 fi
 
 reset_fixtures
@@ -962,12 +1179,17 @@ STUB_SUBJECT_MODE=disarm
 STUB_DEFAULT_BRANCH_RC=7
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
 STUB_FINAL="$BASE"
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'governing policy is unclassified' "$TMP/subject.out"; then
-  pass "an unreadable default branch retracts an armed PR instead of guessing its policy identity"
+set +e
+run_case
+unreadable_default_arm_rc=$?
+set -e
+if [ "$unreadable_default_arm_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'governing policy is unclassified' "$TMP/subject.out" \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "an unreadable default branch leaves an armed PR untouched and blocks"
 else
-  fail "default-branch lookup failure preserved an unclassified arm"
+  fail "default-branch lookup failure mutated or accepted an unclassified arm"
 fi
 
 reset_fixtures
@@ -979,13 +1201,13 @@ run_case
 misconfigured_contributor_token_rc=$?
 set -e
 if [ "$misconfigured_contributor_token_rc" -eq 3 ] \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && [ "$(cat "$TMP/merge-token.log")" = "workflow-token" ] \
-   && [ "$(tr '\n' ' ' < "$TMP/events.log")" = "pr-view-1 repo-view policy pr-view-2 merge pr-view-3 " ] \
-   && grep -Fq 'expected nathanjohnpayne' "$TMP/subject.out"; then
-  pass "a misconfigured author token cannot block workflow-token exit cleanup"
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
+   && grep -Fq 'expected nathanjohnpayne' "$TMP/subject.out" \
+   && grep -Fq 'refusing to mutate continuation exit arm' "$TMP/subject.out"; then
+  pass "a misconfigured author token cannot authorize mutation during exit cleanup"
 else
-  fail "misconfigured author-token exit stranded an arm or used the wrong token (rc=$misconfigured_contributor_token_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
+  fail "misconfigured author-token exit mutated or accepted an arm (rc=$misconfigured_contributor_token_rc; events=$(tr '\n' ' ' < "$TMP/events.log"))"
 fi
 
 reset_fixtures
@@ -1003,8 +1225,8 @@ else
 fi
 
 # Run the inline workflow implementation through the rollout states that a
-# structural grep cannot prove: optional-token repos, an old trusted helper,
-# non-shared arms, shared arms, and a failed retraction readback.
+# structural grep cannot prove: optional-token repos, a missing queue-policy
+# helper, non-shared/shared arms, and every helper outcome.
 reset_fixtures
 if run_workflow_retraction_case && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'readiness continuation remains disabled' "$TMP/workflow.out" \
@@ -1018,13 +1240,18 @@ reset_fixtures
 STUB_WORKFLOW_AUTHOR_IDENTITY=nathanjohnpayne
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
 STUB_FINAL="$BASE"
-if run_workflow_retraction_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'Durable or unclassified auto-merge retraction verified' "$TMP/workflow.out" \
+set +e
+run_workflow_retraction_case
+workflow_nonshared_arm_rc=$?
+set -e
+if [ "$workflow_nonshared_arm_rc" -eq 1 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'Native non-shared PR has a head-only durable arm' "$TMP/workflow.out" \
+   && grep -Fq 'Refusing to mutate or classify a durable arm' "$TMP/workflow.out" \
    && grep -Fxq 'auto_arm_allowed=true' "$TMP/workflow-output"; then
-  pass "workflow-token retraction removes a native non-shared arm without an author token"
+  pass "missing queue helper blocks a native non-shared arm without mutation"
 else
-  fail "workflow-token retraction preserved a native non-shared arm"
+  fail "missing queue helper mutated or accepted a native non-shared arm"
 fi
 
 reset_fixtures
@@ -1032,39 +1259,79 @@ STUB_WORKFLOW_AUTHOR_IDENTITY=nathanjohnpayne
 STUB_WORKFLOW_SNAPSHOT_CURRENT=false
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
 STUB_FINAL="$BASE"
-if run_workflow_retraction_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
+set +e
+run_workflow_retraction_case
+workflow_stale_snapshot_rc=$?
+set -e
+if [ "$workflow_stale_snapshot_rc" -eq 1 ] \
+   && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'event head/base is stale or unclassified' "$TMP/workflow.out" \
+   && grep -Fq 'Refusing to mutate or classify a durable arm' "$TMP/workflow.out" \
    && ! grep -Fxq 'auto_arm_allowed=true' "$TMP/workflow-output"; then
-  pass "a stale event snapshot retracts an armed PR as unclassified instead of trusting its old base identity"
+  pass "a stale event snapshot leaves its unclassified arm untouched and blocks"
 else
-  fail "stale event identity was trusted to preserve an unclassified live arm"
+  fail "stale event identity authorized mutation or acceptance of an unclassified arm"
 fi
 
 reset_fixtures
 STUB_WORKFLOW_AUTHOR_IDENTITY=nathanjohnpayne
 STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
 STUB_FINAL="$SHARED_BASE"
-if run_workflow_retraction_case \
-   && grep -Fq 'pr merge https://example.test/pr/7 --repo owner/repo --disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'Durable or unclassified auto-merge retraction verified' "$TMP/workflow.out" \
+set +e
+run_workflow_retraction_case
+workflow_missing_helper_shared_rc=$?
+set -e
+if [ "$workflow_missing_helper_shared_rc" -eq 1 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'Refusing to mutate or classify a durable arm' "$TMP/workflow.out" \
    && ! grep -Fxq 'auto_arm_allowed=true' "$TMP/workflow-output"; then
-  pass "workflow retraction is self-contained for the first consumer rollout"
+  pass "first-rollout checkout without the queue helper blocks a shared-author arm"
 else
-  fail "workflow retraction could not disable and verify a shared-author arm"
+  fail "missing queue helper mutated or accepted a shared-author arm"
 fi
+
+cat > "$TMP/old-trusted-checkout/scripts/workflow/merge-queue-arm-policy.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'candidate workflow invoked privileged queue policy\n' \
+  >> "${STUB_DIR:?}/queue-policy.log"
+exit 0
+STUB
+chmod +x "$TMP/old-trusted-checkout/scripts/workflow/merge-queue-arm-policy.sh"
+reset_fixtures
+STUB_WORKFLOW_AUTHOR_IDENTITY=nathanjohnpayne
+STUB_WORKFLOW_QUEUE_POLICY_TOKEN=author-token
+STUB_WORKFLOW_QUEUE_SOURCE_TOKEN=source-token
+STUB_INITIAL="$ARMED_SHARED_BASE"
+STUB_FINAL="$ARMED_SHARED_BASE"
+set +e
+run_workflow_retraction_case
+workflow_candidate_arm_rc=$?
+set -e
+if [ "$workflow_candidate_arm_rc" -eq 1 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/queue-policy.log" ] \
+   && grep -Fq 'Refusing to mutate or classify a durable arm' "$TMP/workflow.out"; then
+  pass "candidate-controlled workflow cannot invoke the privileged queue classifier even when ambient test tokens exist"
+else
+  fail "candidate-controlled workflow invoked or bypassed the privileged queue boundary"
+fi
+rm -f "$TMP/old-trusted-checkout/scripts/workflow/merge-queue-arm-policy.sh"
 
 reset_fixtures
 STUB_WORKFLOW_AUTHOR_IDENTITY=release-author
 WORKFLOW_RELEASE_SHARED=$(jq -c '.author.login = "release-author" | .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
 STUB_INITIAL="$WORKFLOW_RELEASE_SHARED"
 STUB_FINAL=$(jq -c '.autoMergeRequest = null' <<<"$WORKFLOW_RELEASE_SHARED")
-if run_workflow_retraction_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'Durable or unclassified auto-merge retraction verified' "$TMP/workflow.out"; then
-  pass "workflow retraction consumes the exact governing identity even when it diverges from the default checkout"
+set +e
+run_workflow_retraction_case
+workflow_release_arm_rc=$?
+set -e
+if [ "$workflow_release_arm_rc" -eq 1 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'Refusing to mutate or classify a durable arm' "$TMP/workflow.out"; then
+  pass "inline cleanup blocks a governing-identity arm without mutation"
 else
-  fail "workflow retraction preserved an arm under a stale default-checkout identity"
+  fail "inline cleanup mutated or accepted an arm under a divergent identity"
 fi
 
 reset_fixtures
@@ -1074,13 +1341,14 @@ set +e
 run_workflow_retraction_case
 workflow_missing_identity_rc=$?
 set -e
-if [ "$workflow_missing_identity_rc" -eq 0 ] \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'retracting the existing unclassified auto-merge request fail closed' "$TMP/workflow.out" \
+if [ "$workflow_missing_identity_rc" -eq 1 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'blocking on the existing unclassified auto-merge request fail closed' "$TMP/workflow.out" \
+   && grep -Fq 'Refusing to mutate or classify a durable arm' "$TMP/workflow.out" \
    && ! grep -Fxq 'auto_arm_allowed=true' "$TMP/workflow-output"; then
-  pass "workflow retraction removes an existing arm even when policy identity is unavailable"
+  pass "inline cleanup blocks an unclassified arm without mutation"
 else
-  fail "workflow retraction stranded an unclassified existing arm (rc=$workflow_missing_identity_rc)"
+  fail "inline cleanup mutated or accepted an unclassified arm (rc=$workflow_missing_identity_rc)"
 fi
 
 reset_fixtures
@@ -1092,10 +1360,11 @@ run_workflow_retraction_case
 workflow_still_armed_rc=$?
 set -e
 if [ "$workflow_still_armed_rc" -eq 1 ] \
-   && grep -Fq 'retraction did not persist' "$TMP/workflow.out"; then
-  pass "workflow retraction rejects a still-armed readback"
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'Refusing to mutate or classify a durable arm' "$TMP/workflow.out"; then
+  pass "inline cleanup rejects an unproven still-armed state without mutation"
 else
-  fail "workflow retraction accepted a still-armed readback (rc=$workflow_still_armed_rc)"
+  fail "inline cleanup mutated or accepted a still-armed state (rc=$workflow_still_armed_rc)"
 fi
 
 for invalid_field in author auto_merge_absent auto_merge_scalar; do
@@ -1138,12 +1407,12 @@ set +e
 run_case
 divergent_base_rc=$?
 set -e
-if [ "$divergent_base_rc" -eq 4 ] \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'shared-author PR requires a one-shot author merge' "$TMP/subject.out"; then
-  pass "non-default governing identity overrides the divergent default policy for retraction"
+if [ "$divergent_base_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate pre-evaluation arm' "$TMP/subject.out"; then
+  pass "non-default governing identity cannot authorize mutation of its armed PR"
 else
-  fail "divergent default policy masked the governing shared author (rc=$divergent_base_rc)"
+  fail "divergent default policy enabled mutation or acceptance of an armed PR (rc=$divergent_base_rc)"
 fi
 
 reset_fixtures
@@ -1153,12 +1422,16 @@ STUB_EXPECTED_AUTHOR=release-author
 RELEASE_SHARED=$(jq -c '.author.login = "release-author" | .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
 STUB_INITIAL="$RELEASE_SHARED"
 STUB_FINAL=$(jq -c '.autoMergeRequest = null' <<<"$RELEASE_SHARED")
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
-  pass "protective mode uses the divergent governing base identity to retract its shared author"
+set +e
+run_case
+divergent_protective_shared_rc=$?
+set -e
+if [ "$divergent_protective_shared_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "protective mode blocks a governing-base shared-author arm without mutation"
 else
-  fail "protective mode trusted the divergent default identity instead of the governing base"
+  fail "protective mode mutated or accepted the governing-base shared-author arm"
 fi
 
 reset_fixtures
@@ -1168,12 +1441,16 @@ STUB_EXPECTED_AUTHOR=release-author
 DEFAULT_SHARED=$(jq -c '.author.login = "nathanjohnpayne" | .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$BASE")
 STUB_INITIAL="$DEFAULT_SHARED"
 STUB_FINAL=$(jq -c '.autoMergeRequest = null' <<<"$DEFAULT_SHARED")
-if run_case \
-   && grep -Fq -- '--disable-auto' "$TMP/merge.log" \
-   && grep -Fq 'durable or unclassified auto-merge retraction verified' "$TMP/subject.out"; then
-  pass "protective mode retracts a governing-base non-shared durable arm despite the divergent default identity"
+set +e
+run_case
+divergent_protective_nonshared_rc=$?
+set -e
+if [ "$divergent_protective_nonshared_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+  pass "protective mode blocks a governing-base non-shared arm without mutation"
 else
-  fail "protective mode preserved a governing-base non-shared durable arm"
+  fail "protective mode mutated or accepted a governing-base non-shared arm"
 fi
 
 reset_fixtures
@@ -1183,10 +1460,12 @@ set +e
 run_case
 rc=$?
 set -e
-if [ "$rc" -eq 3 ] && [ -s "$TMP/merge.log" ]; then
-  pass "failed post-independence protective retraction surfaces as an infrastructure error"
+if [ "$rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate post-independence arm' "$TMP/subject.out"; then
+  pass "post-independence armed state fails closed without a mutation attempt"
 else
-  fail "failed post-independence protective retraction must exit 3 (rc=$rc)"
+  fail "post-independence armed state must exit 3 without mutation (rc=$rc)"
 fi
 
 reset_fixtures

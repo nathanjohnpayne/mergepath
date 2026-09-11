@@ -258,6 +258,14 @@ ALLOW_LIST=(
   # above.
   "scripts/audit-branch-protection.sh"
 
+  # #1058 policy-source release materializer. The propagated
+  # check_merge_group_required_checks wrapper validates this only on the hub
+  # and takes a marker-first consumer SKIP before resolving any source-only
+  # path. The materializer is excluded from both the ongoing sync manifest and
+  # the bootstrap mirror; consumers receive the target-side workflows/helpers,
+  # never the organization policy-repository release tool.
+  "scripts/build/materialize-merge-queue-policy-source.sh"
+
   # Self-tests of hub-only CI check suites. The check wrappers ship via
   # the scripts/ci/ kit and — now that repo_lint.yml propagates (#601) —
   # run on every consumer, but each one SKIPs (or skips its suite) when

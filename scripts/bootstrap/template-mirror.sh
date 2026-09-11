@@ -146,6 +146,13 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'scripts/project-doc-sync.sh'
   'tests/test_project_doc_sync.sh'
 
+  # #1058 organization policy-repository release sources. Target consumers
+  # receive the separately reviewed target workflows/helpers through the sync
+  # manifest; these templates and their materializer exist only to build the
+  # exact-SHA public policy source and must not be seeded into a new consumer.
+  '.github/templates/required-workflows/'
+  'scripts/build/materialize-merge-queue-policy-source.sh'
+
   # Local operator state under .claude/
   '.claude/worktrees/'
   '.claude/settings.local.json'

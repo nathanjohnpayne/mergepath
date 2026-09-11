@@ -1,0 +1,226 @@
+name: Merge Queue Final Admin Audit
+
+on:
+  repository_dispatch:
+    types: [mergepath-final-queue-audit]
+
+permissions:
+  actions: read
+  contents: read
+
+# Duplicate deliveries of one requester attempt serialize behind the same
+# namespace. A distinct merge-group run or attempt never cancels or replaces
+# the audit that another queue entry is waiting on.
+concurrency:
+  group: >-
+    merge-queue-final-audit-${{ github.event.client_payload.request.requester_run_id }}-${{
+    github.event.client_payload.request.requester_run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Final merge-queue administrative audit
+    # repository_dispatch is accepted only from a GitHub Actions token in this
+    # exact target repository. The script repeats these bindings after checkout.
+    if: >-
+      github.actor == 'github-actions[bot]' &&
+      github.event.action == 'mergepath-final-queue-audit' &&
+      github.event.repository.full_name == github.repository &&
+      github.event.repository.default_branch == 'main' &&
+      github.event.client_payload.request.repository == github.repository &&
+      github.event.client_payload.request.base_ref == 'main' &&
+      github.ref == 'refs/heads/main' &&
+      github.sha == github.event.client_payload.request.base_sha &&
+      github.workflow_sha == github.event.client_payload.request.base_sha &&
+      github.workflow_ref == format(
+        '{0}/.github/workflows/merge-queue-final-audit.yml@refs/heads/main',
+        github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: merge-queue-policy
+    steps:
+      - name: Authenticate the request before selecting executable code
+        id: authenticate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_ACTOR: ${{ github.actor }}
+          DISPATCH_ACTION: ${{ github.event.action }}
+          EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
+          EVENT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.event.client_payload.request.repository }}
+          PR_NUMBER: ${{ github.event.client_payload.request.pr }}
+          HEAD_SHA: ${{ github.event.client_payload.request.head_sha }}
+          GROUP_HEAD_SHA: ${{ github.event.client_payload.request.group_head_sha }}
+          GROUP_REF: ${{ github.event.client_payload.request.group_ref }}
+          BASE_SHA: ${{ github.event.client_payload.request.base_sha }}
+          BASE_REF: ${{ github.event.client_payload.request.base_ref }}
+          ENTRY_BASE_SHA: ${{ github.event.client_payload.request.entry_base_sha }}
+          REQUESTER_RUN_ID: ${{ github.event.client_payload.request.requester_run_id }}
+          REQUESTER_RUN_ATTEMPT: ${{ github.event.client_payload.request.requester_run_attempt }}
+          REQUESTED_AT: ${{ github.event.client_payload.request.requested_at }}
+          REQUESTER_WORKFLOW_REPOSITORY: ${{ github.event.client_payload.request.requester_workflow_repository }}
+          REQUESTER_WORKFLOW_FILE_PATH: ${{ github.event.client_payload.request.requester_workflow_file_path }}
+          REQUESTER_WORKFLOW_REF: ${{ github.event.client_payload.request.requester_workflow_ref }}
+          REQUESTER_WORKFLOW_SHA: ${{ github.event.client_payload.request.requester_workflow_sha }}
+        run: |
+          set -euo pipefail
+          REQUEST_NONCE=$(jq -er '
+            .client_payload.request.request_nonce |
+            select(type == "string" and test("^[0-9a-f]{64}$"))
+          ' "$GITHUB_EVENT_PATH") || {
+            echo "::error::merge-queue final-audit request has a malformed request identifier"
+            exit 1
+          }
+          echo "::add-mask::$REQUEST_NONCE"
+          fail() {
+            echo "::error::merge-queue final-audit request rejected before checkout: $*"
+            exit 1
+          }
+          sha_like() {
+            printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$'
+          }
+          canonical_positive_integer() {
+            case "$1" in
+              ''|0*|*[!0-9]*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+          [ "$DISPATCH_ACTOR" = 'github-actions[bot]' ] || fail "untrusted dispatch actor"
+          [ "$DISPATCH_ACTION" = 'mergepath-final-queue-audit' ] || fail "wrong dispatch type"
+          [ "$EVENT_REPOSITORY" = "$GITHUB_REPOSITORY" ] || fail "event repository mismatch"
+          [ "$REPOSITORY" = "$GITHUB_REPOSITORY" ] || fail "payload repository mismatch"
+          [ "$EVENT_DEFAULT_BRANCH" = main ] && [ "$BASE_REF" = main ] \
+            || fail "unsupported target branch"
+          canonical_positive_integer "$PR_NUMBER" || fail "invalid PR number"
+          sha_like "$HEAD_SHA" && sha_like "$GROUP_HEAD_SHA" \
+            && sha_like "$BASE_SHA" && sha_like "$ENTRY_BASE_SHA" \
+            && sha_like "$REQUESTER_WORKFLOW_SHA" \
+            || fail "malformed commit identifier"
+          canonical_positive_integer "$REQUESTER_RUN_ID" \
+            || fail "invalid requester run id"
+          canonical_positive_integer "$REQUESTER_RUN_ATTEMPT" \
+            || fail "invalid requester run attempt"
+          printf '%s' "$REQUESTED_AT" | grep -Eq \
+            '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' \
+            || fail "malformed request time"
+          git check-ref-format "$GROUP_REF" >/dev/null 2>&1 \
+            || fail "malformed merge-group ref"
+          case "$GROUP_REF" in
+            "refs/heads/gh-readonly-queue/main/pr-$PR_NUMBER-"*) ;;
+            *) fail "merge-group ref does not identify the requested PR" ;;
+          esac
+          [ "$REQUESTER_WORKFLOW_REPOSITORY" != "$REPOSITORY" ] \
+            || fail "required workflow source is not external"
+          [ "$REQUESTER_WORKFLOW_FILE_PATH" = \
+            '.github/workflows/mergepath-merge-queue-authorization.yml' ] \
+            || fail "unexpected requester workflow path"
+          case "$REQUESTER_WORKFLOW_REPOSITORY" in */*) ;; *) fail "malformed requester repository" ;; esac
+          case "$REQUESTER_WORKFLOW_REF" in
+            "$REQUESTER_WORKFLOW_REPOSITORY/$REQUESTER_WORKFLOW_FILE_PATH@"*) ;;
+            *) fail "malformed requester workflow ref" ;;
+          esac
+
+          live_base=$(gh api "repos/$REPOSITORY/branches/main" --jq .commit.sha) \
+            || fail "could not read live main"
+          [ "$live_base" = "$BASE_SHA" ] \
+            || fail "payload base is not the live main commit"
+          requester=$(gh api "repos/$REPOSITORY/actions/runs/$REQUESTER_RUN_ID") \
+            || fail "could not read requester workflow run"
+          printf '%s' "$requester" | jq -e \
+            --arg repo "$REPOSITORY" --argjson run_id "$REQUESTER_RUN_ID" \
+            --argjson attempt "$REQUESTER_RUN_ATTEMPT" \
+            --arg head "$GROUP_HEAD_SHA" --arg branch "${GROUP_REF#refs/heads/}" '
+              .id == $run_id and .run_attempt == $attempt and
+              .event == "merge_group" and .status == "in_progress" and
+              .conclusion == null and .head_sha == $head and
+              .head_branch == $branch and .repository.full_name == $repo and
+              .head_repository.full_name == $repo
+            ' >/dev/null 2>&1 || fail "requester workflow run does not match the payload"
+
+          printf 'base_sha=%s\n' "$BASE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the authenticated exact target base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.authenticate.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record the final administrative audit
+        env:
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          OP_PREFLIGHT_AUTHOR_PAT: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          MERGEPATH_MERGE_QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}
+          MERGEPATH_MERGE_QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}
+          DISPATCH_ACTOR: ${{ github.actor }}
+          DISPATCH_ACTION: ${{ github.event.action }}
+          EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
+          EVENT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.event.client_payload.request.repository }}
+          PR_NUMBER: ${{ github.event.client_payload.request.pr }}
+          HEAD_SHA: ${{ github.event.client_payload.request.head_sha }}
+          GROUP_HEAD_SHA: ${{ github.event.client_payload.request.group_head_sha }}
+          GROUP_REF: ${{ github.event.client_payload.request.group_ref }}
+          BASE_SHA: ${{ github.event.client_payload.request.base_sha }}
+          BASE_REF: ${{ github.event.client_payload.request.base_ref }}
+          QUEUE_ID: ${{ github.event.client_payload.request.queue_id }}
+          QUEUE_ENTRY_ID: ${{ github.event.client_payload.request.queue_entry_id }}
+          ENTRY_ENQUEUED_AT: ${{ github.event.client_payload.request.entry_enqueued_at }}
+          QUEUE_METHOD: ${{ github.event.client_payload.request.queue_method }}
+          ENTRY_BASE_SHA: ${{ github.event.client_payload.request.entry_base_sha }}
+          REQUESTER_RUN_ID: ${{ github.event.client_payload.request.requester_run_id }}
+          REQUESTER_RUN_ATTEMPT: ${{ github.event.client_payload.request.requester_run_attempt }}
+          REQUESTED_AT: ${{ github.event.client_payload.request.requested_at }}
+          REQUESTER_WORKFLOW_REPOSITORY: ${{ github.event.client_payload.request.requester_workflow_repository }}
+          REQUESTER_WORKFLOW_FILE_PATH: ${{ github.event.client_payload.request.requester_workflow_file_path }}
+          REQUESTER_WORKFLOW_REF: ${{ github.event.client_payload.request.requester_workflow_ref }}
+          REQUESTER_WORKFLOW_SHA: ${{ github.event.client_payload.request.requester_workflow_sha }}
+          AUDITOR_RUN_ID: ${{ github.run_id }}
+          AUDITOR_RUN_ATTEMPT: ${{ github.run_attempt }}
+          AUDITOR_WORKFLOW_REF: ${{ github.workflow_ref }}
+          AUDITOR_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          REQUEST_NONCE=$(jq -er '
+            .client_payload.request.request_nonce |
+            select(type == "string" and test("^[0-9a-f]{64}$"))
+          ' "$GITHUB_EVENT_PATH") || {
+            echo "::error::merge-queue final-audit request has a malformed request identifier"
+            exit 1
+          }
+          echo "::add-mask::$REQUEST_NONCE"
+          scripts/workflow/record-merge-queue-final-audit.sh \
+            --dispatch-actor "$DISPATCH_ACTOR" \
+            --dispatch-action "$DISPATCH_ACTION" \
+            --dispatch-repository "$EVENT_REPOSITORY" \
+            --dispatch-default-branch "$EVENT_DEFAULT_BRANCH" \
+            --dispatch-ref "$EVENT_REF" \
+            --dispatch-sha "$EVENT_SHA" \
+            --repo "$REPOSITORY" \
+            --pr "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" \
+            --group-head-sha "$GROUP_HEAD_SHA" \
+            --group-ref "$GROUP_REF" \
+            --base-sha "$BASE_SHA" \
+            --base-ref "$BASE_REF" \
+            --queue-id "$QUEUE_ID" \
+            --queue-entry-id "$QUEUE_ENTRY_ID" \
+            --entry-enqueued-at "$ENTRY_ENQUEUED_AT" \
+            --queue-method "$QUEUE_METHOD" \
+            --entry-base-sha "$ENTRY_BASE_SHA" \
+            --request-nonce "$REQUEST_NONCE" \
+            --requester-run-id "$REQUESTER_RUN_ID" \
+            --requester-run-attempt "$REQUESTER_RUN_ATTEMPT" \
+            --requested-at "$REQUESTED_AT" \
+            --requester-workflow-repository "$REQUESTER_WORKFLOW_REPOSITORY" \
+            --requester-workflow-file-path "$REQUESTER_WORKFLOW_FILE_PATH" \
+            --requester-workflow-ref "$REQUESTER_WORKFLOW_REF" \
+            --requester-workflow-sha "$REQUESTER_WORKFLOW_SHA" \
+            --auditor-run-id "$AUDITOR_RUN_ID" \
+            --auditor-run-attempt "$AUDITOR_RUN_ATTEMPT" \
+            --auditor-workflow-ref "$AUDITOR_WORKFLOW_REF" \
+            --auditor-workflow-sha "$AUDITOR_WORKFLOW_SHA"

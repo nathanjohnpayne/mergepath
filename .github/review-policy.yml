@@ -132,6 +132,40 @@ default_external_reviewer: nathanpayne-codex
 author_identity: nathanjohnpayne
 
 # ---------------------------------------------------------------------------
+# Native merge-queue rollout (#1058)
+# ---------------------------------------------------------------------------
+# This is deliberately dark until organization ownership, queue/protection
+# topology, a repository queue ruleset, a SHA-pinned organization workflow
+# ruleset, an exact main-only/no-bypass merge-queue-policy environment, its
+# three pairwise-distinct environment-only credentials, complete repo/org/env
+# secret inventories, an empty queue, and drained legacy runs are audited.
+# Candidate workflows receive none of those credentials. Trusted
+# pull_request_target/workflow_run/scheduled jobs bind the environment. The
+# observer handles auto_merge_enabled plus enqueued; admission treats draft as
+# neutral but rejects SHA-like heads and stacks, and the group rejects both
+# drafts and stacks while bounded-polling for the exact entry attestation.
+# Required workflows are identity-bound GitHub ruleset primitives; ordinary
+# same-name Actions checks are not merge authority.
+# Canary mode is merged through the old one-shot path with a future activation
+# instant and predeclares the exact canary PR/head plus one transition PR. The
+# transition number is predeclared, but its future commit hash is not: a later
+# native owner action binds that exact head. It may clear the selectors into
+# `enabled` after the canary merges, or into `disabled` to abort the canary.
+# Consumers omit these local keys and therefore remain disabled.
+merge_queue_rollout_mode: disabled
+merge_queue_canary_pr: 0
+merge_queue_canary_head: ""
+merge_queue_promotion_pr: 0
+merge_queue_enabled_at: ""
+merge_queue_repository_ruleset_id: 0
+merge_queue_workflow_ruleset_id: 0
+merge_queue_target_repository_id: 0
+merge_queue_required_workflow_repository: ""
+merge_queue_required_workflow_repository_id: 0
+merge_queue_required_workflow_ref: ""
+merge_queue_required_workflow_sha: ""
+
+# ---------------------------------------------------------------------------
 # Review-feedback disposition policy (#574)
 # ---------------------------------------------------------------------------
 # Controls which review findings require disposition before merge. A

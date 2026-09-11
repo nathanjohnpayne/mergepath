@@ -31,6 +31,10 @@ jobs:
   auto-merge:
     runs-on: ubuntu-latest
     if: github.event.pull_request.user.login == 'dependabot[bot]'
+    # AUTHOR_MERGE_TOKEN is an environment secret. The trusted
+    # pull_request_target definition runs on main and no candidate-controlled
+    # workflow can request this environment from a refs/pull/* merge ref.
+    environment: merge-queue-policy
     steps:
       # Check out the BASE ref (the target branch's tip), NOT the PR
       # HEAD. This workflow runs under pull_request_target which has
@@ -102,8 +106,8 @@ jobs:
           # the secret yet get a clear error rather than a wrong
           # mergedBy attribution.
           if [ -z "${AUTHOR_MERGE_TOKEN:-}" ]; then
-            echo "::error::AUTHOR_MERGE_TOKEN is empty. AUTHOR_MERGE_TOKEN secret is not set in this repo."
-            echo "::error::Add an author-identity PAT (nathanjohnpayne) to repo Settings → Secrets and variables → Actions → AUTHOR_MERGE_TOKEN."
+            echo "::error::AUTHOR_MERGE_TOKEN is unavailable from the merge-queue-policy environment."
+            echo "::error::Add the author-identity PAT under repo Settings → Environments → merge-queue-policy → Environment secrets. Do not create a repository or organization shadow."
             exit 1
           fi
           MERGE_AS=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh api user --jq .login 2>/dev/null || true)

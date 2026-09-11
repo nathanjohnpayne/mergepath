@@ -12,6 +12,7 @@ AGENT_REVIEW="$ROOT/.github/workflows/agent-review.yml"
 AUTO_CLEAR="$ROOT/.github/workflows/auto-clear-blocking-labels.yml"
 TOKEN_WRAPPER="$ROOT/scripts/ci/check_no_token_in_output"
 DOC_WRAPPER="$ROOT/scripts/ci/check_doc_ownership"
+AUTO_CLEAR_WRAPPER="$ROOT/scripts/ci/check_auto_clear_workflow"
 CONSUMER_VERDICT="$ROOT/scripts/ci/repo-lint-consumer-verdict.sh"
 MODE_HELPER="$ROOT/scripts/lib/ci-check-modes.sh"
 SELECTION_HELPER="$ROOT/scripts/lib/repo-lint-check-selection.sh"
@@ -115,7 +116,8 @@ else
 
   selected=$(scope_value checks pull_request scripts/lib/ci-check-modes.sh)
   if jq -e '
-      length == 5
+      length == 6
+      and (index("check_auto_clear_workflow") != null)
       and (index("check_doc_ownership") != null)
       and (index("check_coderabbit_wait") != null)
       and (index("check_merge_clearance_gate") != null)
@@ -125,6 +127,35 @@ else
     pass "the shared mode selector selects every wrapper that sources it"
   else
     fail "ci-check-modes.sh must select every sourcing wrapper (got $selected)"
+  fi
+
+  auto_clear_dependencies_ok=1
+  for path in \
+    .github/workflows/agent-review.yml \
+    scripts/lib/blocking-labels.sh \
+    scripts/lib/gh-retry-helpers.sh \
+    scripts/lib/review-policy-scalar.sh; do
+    selected=$(scope_value checks pull_request "$path")
+    if ! jq -e 'index("check_auto_clear_workflow") != null' <<<"$selected" >/dev/null 2>&1; then
+      auto_clear_dependencies_ok=0
+      echo "INFO: $path selected $selected" >&2
+    fi
+  done
+  if [ "$auto_clear_dependencies_ok" -eq 1 ]; then
+    pass "every shared auto-clear self-test input selects its deep wrapper"
+  else
+    fail "shared auto-clear self-test inputs must select check_auto_clear_workflow"
+  fi
+
+  selected=$(scope_value checks pull_request scripts/lib/gh-command-classifier.sh)
+  if jq -e '
+      length == 2
+      and (index("check_auto_clear_workflow") != null)
+      and (index("check_self_approval_detector") != null)
+    ' <<<"$selected" >/dev/null 2>&1; then
+    pass "the command classifier selects every wrapper that sources it"
+  else
+    fail "gh-command-classifier.sh must select auto-clear and self-approval checks (got $selected)"
   fi
 
   selected=$(scope_value checks pull_request scripts/phase-4b-review.sh)
@@ -265,13 +296,13 @@ else
   fi
 
   governance_modes_ok=1
-  for name in check_coderabbit_wait check_merge_clearance_gate check_phase_4b_automation check_phase_4b_accounting; do
+  for name in check_auto_clear_workflow check_coderabbit_wait check_merge_clearance_gate check_phase_4b_automation check_phase_4b_accounting; do
     name="$name" yq -e '([.jobs.lint_fast.steps[] | select(.name == strenv(name)) | .run | contains("--check")] | any) and ([.jobs.deep_safety.steps[] | select(.name == (strenv(name) + " --self-test")) | select((.if | contains("needs.scope.outputs.full")) and (.if | contains("needs.scope.outputs.checks"))) | .run | contains("--self-test")] | any)' "$REPO_LINT" >/dev/null || governance_modes_ok=0
   done
   if [ "$governance_modes_ok" -eq 1 ]; then
-    pass "governance wrappers keep live structure fast and move regression suites to deep CI"
+    pass "auto-clear and governance wrappers keep live structure fast and move regression suites to deep CI"
   else
-    fail "CodeRabbit, merge-clearance, and Phase 4b wrappers must split live and self-test modes"
+    fail "auto-clear, CodeRabbit, merge-clearance, and Phase 4b wrappers must split live and self-test modes"
   fi
 
   agent_review_probe=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Probe current-head check readiness once") | .run' "$AGENT_REVIEW")
@@ -292,24 +323,73 @@ else
   fi
 
   wait_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Probe current-head check readiness once") | .key' "$AGENT_REVIEW")
-  merge_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Report stable readiness") | .key' "$AGENT_REVIEW")
-  merge_step=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Report stable readiness") | .run' "$AGENT_REVIEW")
-  merge_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR_NUMBER" "$REPO"' <<<"$merge_step" | head -1 | cut -d: -f1 || true)
-  merge_continue_line=$(grep -nF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$merge_step" | head -1 | cut -d: -f1 || true)
-  if [[ "$wait_step_index" =~ ^[0-9]+$ ]] \
-     && [[ "$merge_step_index" =~ ^[0-9]+$ ]] \
-     && [ "$merge_step_index" -gt "$wait_step_index" ] \
-     && grep -Fq 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$merge_step" \
-     && grep -Fq 'APPROVAL_PROTECTIVE_RETRACTION_V2' <<<"$merge_step" \
-     && grep -Fq 'GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh' <<<"$merge_step" \
-     && grep -Fq 'MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$merge_step" \
-     && grep -Fq 'if [ "$protective_rc" -eq 0 ]; then' <<<"$merge_step" \
-     && [ -n "$merge_protect_line" ] && [ -n "$merge_continue_line" ] \
-     && [ "$merge_protect_line" -lt "$merge_continue_line" ] \
-     && grep -Fq 'approval-merge-continuation.sh "$PR_NUMBER" "$REPO"' <<<"$merge_step"; then
-    pass "the immediate-green path protects with the workflow token before author-token continuation"
+  readiness_step_index=$(yq -r '.jobs."auto-merge-on-approval".steps | to_entries[] | select(.value.name == "Report stable read-only readiness") | .key' "$AGENT_REVIEW")
+  readiness_step=$(yq -r '.jobs."auto-merge-on-approval".steps[] | select(.name == "Report stable read-only readiness") | .run' "$AGENT_REVIEW")
+  readiness_permissions=$(yq -r '.jobs."auto-merge-on-approval".permissions | to_entries | sort_by(.key) | .[] | "\(.key): \(.value)"' "$AGENT_REVIEW")
+  expected_readiness_permissions=$'actions: read\nchecks: read\ncontents: read\nissues: read\npull-requests: read\nstatuses: read'
+  agent_auto_merge_flat=$(tr '\n' ' ' <<<"$agent_auto_merge")
+  candidate_workflow_root_env() {
+    yq -r '.env // {}' "$1"
+  }
+  candidate_job_uses_secrets_context() {
+    grep -Eiq '(^|[^[:alnum:]_])secrets([^[:alnum:]_]|$)' <<<"$1"
+  }
+  candidate_job_uses_privileged_credential() {
+    grep -Eiq 'AUTHOR_MERGE_TOKEN|MERGE_QUEUE_POLICY_TOKEN|MERGE_QUEUE_SOURCE_TOKEN' <<<"$1"
+  }
+  candidate_readiness_uses_privileged_credential() {
+    candidate_job_uses_privileged_credential "$1" || candidate_job_uses_privileged_credential "$2"
+  }
+  candidate_readiness_uses_secrets_context() {
+    candidate_job_uses_secrets_context "$1" || candidate_job_uses_secrets_context "$2"
+  }
+  candidate_job_inherits_secrets() {
+    grep -Eq '^[[:space:]]*secrets:[[:space:]]*inherit([[:space:]]|$)' <<<"$1"
+  }
+  workflow_root_env=$(candidate_workflow_root_env "$AGENT_REVIEW")
+  inherited_env_fixture=$(
+    candidate_workflow_root_env - <<'YAML'
+name: inherited-secret-fixture
+env:
+  INHERITED: ${{ SeCrEtS ["REVIEWER_ASSIGNMENT_TOKEN"] }}
+jobs: {}
+YAML
+  )
+  privileged_credential_surface=$(sed \
+    -e '/^[[:space:]]*id:[[:space:]]*author_merge_token[[:space:]]*$/d' \
+    -e 's/steps\.author_merge_token/steps.read_only_readiness/g' \
+    <<<"$agent_auto_merge")
+  if candidate_job_uses_secrets_context '${{ toJSON(secrets) }}' \
+     && candidate_job_uses_secrets_context '${{ secrets ["REVIEWER_ASSIGNMENT_TOKEN"] }}' \
+     && candidate_job_uses_secrets_context '${{ Secrets.REVIEWER_ASSIGNMENT_TOKEN }}' \
+     && candidate_job_uses_secrets_context '${{ toJSON(SeCrEtS) }}' \
+     && candidate_readiness_uses_secrets_context '' "$inherited_env_fixture" \
+     && candidate_job_inherits_secrets 'secrets: inherit' \
+     && candidate_job_inherits_secrets '    secrets: inherit' \
+     && candidate_job_uses_privileged_credential 'aUtHoR_mErGe_ToKeN'; then
+    pass "candidate readiness rejects standalone secrets context and inherited-secret declarations regardless of extracted indentation"
   else
-    fail "the immediate-green path must guard helper skew and preserve the ordered two-token continuation"
+    fail "candidate readiness secrets matcher must reject toJSON, whitespace-indexed, inherited root-env, and column-zero inherit forms"
+  fi
+  candidate_rest_merge=0
+  if grep -Eq 'pulls/[^[:space:]]+/merge' <<<"$agent_auto_merge_flat" \
+     && grep -Eiq '(^|[[:space:]])(-X|--method)(=|[[:space:]])*(PUT|POST)([[:space:]]|$)' <<<"$agent_auto_merge_flat"; then
+    candidate_rest_merge=1
+  fi
+  if [[ "$wait_step_index" =~ ^[0-9]+$ ]] \
+     && [[ "$readiness_step_index" =~ ^[0-9]+$ ]] \
+     && [ "$readiness_step_index" -gt "$wait_step_index" ] \
+     && [ "$readiness_permissions" = "$expected_readiness_permissions" ] \
+     && ! candidate_readiness_uses_secrets_context "$agent_auto_merge" "$workflow_root_env" \
+     && ! candidate_job_inherits_secrets "$agent_auto_merge" \
+     && ! candidate_readiness_uses_privileged_credential "$privileged_credential_surface" "$workflow_root_env" \
+     && grep -Fq 'trusted Agent Review Pipeline workflow_run continuation' <<<"$readiness_step" \
+     && ! grep -Fq 'approval-merge-continuation.sh' <<<"$agent_auto_merge" \
+     && ! grep -Eq 'gh[[:space:]]+pr[[:space:]]+merge|addPullRequestToMergeQueue|enqueuePullRequest|dequeuePullRequest|enablePullRequestAutoMerge|disablePullRequestAutoMerge|mergePullRequest' <<<"$agent_auto_merge_flat" \
+     && [ "$candidate_rest_merge" -eq 0 ]; then
+    pass "the immediate-green candidate path remains read-only and delegates privileged continuation"
+  else
+    fail "the immediate-green candidate path must expose no secret, write permission, helper call, or merge mutation"
   fi
 
   if grep -Fq 'repo_lint_local.yml annex present' <<<"$agent_review_probe" \
@@ -393,6 +473,13 @@ if [ -f "$MODE_HELPER" ]; then
   fi
 else
   fail "shared wrapper mode selector exists"
+fi
+
+if grep -Fq 'ci_check_select_mode "$@"' "$AUTO_CLEAR_WRAPPER" \
+   && ! grep -Fq 'case "${1:-}" in' "$AUTO_CLEAR_WRAPPER"; then
+  pass "auto-clear delegates mode selection to the shared helper"
+else
+  fail "auto-clear must not duplicate the shared mode selector"
 fi
 
 if [ ! -f "$ROOT/tests/test_repo_lint_consumer_safety.sh" ]; then

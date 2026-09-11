@@ -43,6 +43,8 @@ spec_test_map:
   repo_lint_execution:
     - tests/test_repo_lint_optimization.sh
     - tests/test_655_repo_lint_local_observed.sh
+  merge_group_required_checks:
+    - scripts/ci/check_merge_group_required_checks
   bootstrap_label_seeding:
     # Covered by the stage's own suite rather than a spec-named file. The
     # format, the fail-closed guard and the warning-record behaviour are all

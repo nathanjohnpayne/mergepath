@@ -48,7 +48,8 @@
 # Args:
 #   $1  Path to the consumer's .sync-overrides.yml. May be empty
 #       string or a missing file — both are handled as "no override."
-#   $2  The path being propagated (from manifest `paths[].path`).
+#   $2  The consumer-side target being propagated (`.dest` for templated
+#       entries, `.path` for canonical/kit entries).
 #
 # Returns 0 if the overrides file's skip_paths declares this path,
 # non-zero otherwise.

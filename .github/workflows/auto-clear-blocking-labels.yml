@@ -27,8 +27,6 @@ on:
   # label still present. The `unlabeled`-self-fire guard below still applies.
   pull_request_target:
     types: [synchronize, edited, reopened, labeled, unlabeled]
-  pull_request_review:
-    types: [submitted]
   # workflow_run fires on completion of OTHER workflows. We target
   # the three that produce the required-check signals codex-review-
   # check.sh inspects: PR Review Policy (Label Gate, Self-Review,
@@ -147,6 +145,10 @@ jobs:
   evaluate-and-clear:
     name: Re-evaluate codex-review-check gate
     runs-on: ubuntu-latest
+    # These are environment secrets, never repository secrets. The environment
+    # permits only main-associated deployments, so a candidate-controlled
+    # pull_request/pull_request_review workflow cannot request either PAT.
+    environment: merge-queue-policy
     # Self-fire loop guard: when this workflow's label removal fires
     # the `unlabeled` event for `needs-external-review`, skip — we
     # just removed it; nothing to do.
@@ -166,13 +168,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # SECURITY: pin to the default branch so we always run the
-          # TRUSTED copy of scripts/codex-review-check.sh — never the
-          # PR's own version. Without this, on pull_request_review
-          # events GITHUB_REF defaults to refs/pull/<N>/merge and
-          # actions/checkout pulls the PR's HEAD; combined with this
-          # workflow's `pull-requests: write` permission, a malicious
-          # PR could modify the gate script to remove arbitrary labels
-          # or post arbitrary comments. CR Critical on PR #202 r2.
+          # TRUSTED copy of scripts/codex-review-check.sh — never a
+          # candidate version. pull_request_review reaches this path only
+          # indirectly, after Agent Review Pipeline completes and emits the
+          # trusted-definition workflow_run event.
           ref: ${{ github.event.repository.default_branch }}
           # Need full history so codex-review-check can inspect the
           # PR HEAD against base. The script doesn't currently do that
@@ -200,7 +199,7 @@ jobs:
           # workflow_run.completed can attach to multiple PRs in
           # principle, so we enumerate.
           case "$EVENT_NAME" in
-            pull_request_target|pull_request_review)
+            pull_request_target)
               prs=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
               ;;
             workflow_run)
@@ -271,6 +270,10 @@ jobs:
           # not GITHUB_TOKEN, or the label write fires no re-arm.
           GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           WORKFLOW_TOKEN: ${{ github.token }}
+          AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          # Dedicated target-admin and source-read tokens for the queue proof.
+          QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}
+          QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}
           PR_NUMBERS: ${{ steps.pr.outputs.numbers }}
           REPO: ${{ github.repository }}
         run: |
@@ -342,7 +345,10 @@ jobs:
                   continue
                 fi
                 set +e
-                GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+                GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN" \
+                  MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN" \
+                  MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN" \
+                  bash scripts/workflow/approval-merge-continuation.sh \
                   --retract-unsafe-only "$PR" "$REPO"
                 protective_rc=$?
                 set -e
@@ -457,6 +463,8 @@ jobs:
         env:
           AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           WORKFLOW_TOKEN: ${{ github.token }}
+          QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}
+          QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}
           # Routes ONLY the review-feedback-accounting.sh call inside
           # approval-merge-continuation.sh through GITHUB_TOKEN instead of the
           # author token used by normal continuation (#1101, CodeRabbit on PR
@@ -486,14 +494,20 @@ jobs:
                 ;;
             esac
             set +e
-            GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+            GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN" \
+              MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN" \
+              MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN" \
+              bash scripts/workflow/approval-merge-continuation.sh \
               --retract-unsafe-only "$PR" "$REPO"
             protective_rc=$?
             if [ "$protective_rc" -eq 0 ] && [ -z "${AUTHOR_TOKEN:-}" ]; then
               echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but author-token continuation remains disabled."
               rc=0
             elif [ "$protective_rc" -eq 0 ]; then
-              GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
+              GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN" \
+                MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
+                MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN" \
+                MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN" \
                 MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
                 bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
               rc=$?
@@ -618,6 +632,7 @@ jobs:
     # + read-only gate evaluation).
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    environment: merge-queue-policy
     steps:
       - name: Checkout repo (for codex-review-check.sh)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -721,6 +736,10 @@ jobs:
           # the sweep's purpose.
           GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           WORKFLOW_TOKEN: ${{ github.token }}
+          AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          # Dedicated target-admin and source-read tokens for the queue proof.
+          QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}
+          QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}
           PRS: ${{ steps.find.outputs.prs }}
           REPO: ${{ github.repository }}
         run: |
@@ -775,7 +794,10 @@ jobs:
                   continue
                 fi
                 set +e
-                GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+                GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN" \
+                  MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN" \
+                  MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN" \
+                  bash scripts/workflow/approval-merge-continuation.sh \
                   --retract-unsafe-only "$PR" "$REPO"
                 protective_rc=$?
                 set -e
@@ -872,6 +894,8 @@ jobs:
         env:
           AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           WORKFLOW_TOKEN: ${{ github.token }}
+          QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}
+          QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}
           # Routes ONLY the review-feedback-accounting.sh call inside
           # approval-merge-continuation.sh through GITHUB_TOKEN instead of the
           # author token used by normal continuation (#1101, CodeRabbit on PR
@@ -894,14 +918,20 @@ jobs:
           while IFS= read -r PR; do
             [ -n "$PR" ] || continue
             set +e
-            GH_TOKEN="$WORKFLOW_TOKEN" bash scripts/workflow/approval-merge-continuation.sh \
+            GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN" \
+              MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN" \
+              MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN" \
+              bash scripts/workflow/approval-merge-continuation.sh \
               --retract-unsafe-only "$PR" "$REPO"
             protective_rc=$?
             if [ "$protective_rc" -eq 0 ] && [ -z "${AUTHOR_TOKEN:-}" ]; then
               echo "::notice::AUTHOR_MERGE_TOKEN is not configured; protective retraction completed but scheduled author-token continuation remains disabled."
               rc=0
             elif [ "$protective_rc" -eq 0 ]; then
-              GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
+              GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN" \
+                MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN" \
+                MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN" \
+                MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN" \
                 MERGEPATH_PROTECTIVE_RETRACTION_DONE=1 \
                 bash scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"
               rc=$?

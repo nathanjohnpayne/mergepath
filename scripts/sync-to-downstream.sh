@@ -734,6 +734,11 @@ materialize_templated_targets() {
   local templated_list=$4
   local consumer_overrides=$5
 
+  # The callers use this exact list for the post-materialization runtime
+  # closure gate and PR body. It deliberately excludes entries skipped by a
+  # consumer override: those artifacts do not ship, so their own `requires`
+  # edges must not block an otherwise valid no-op or partial sync.
+  MATERIALIZED_TEMPLATED_LIST=""
   [ -z "$templated_list" ] && return 0
 
   local manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
@@ -783,9 +788,9 @@ materialize_templated_targets() {
     tpl_consumer_target="$workspace/repo/$tpl_dest"
     mkdir -p "$(dirname "$tpl_consumer_target")"
     if ! (
-      export_consumer_facts "$consumer_name" "$manifest"
+      export_consumer_facts "$consumer_name" "$manifest" || exit $?
       # shellcheck disable=SC1091
-      source "$MERGEPATH_ROOT/scripts/lib/template-substitution.sh"
+      source "$MERGEPATH_ROOT/scripts/lib/template-substitution.sh" || exit $?
       template_substitution::render_to "$tpl_tmp" "$tpl_consumer_target"
     ); then
       rm -f "$tpl_tmp"
@@ -830,6 +835,11 @@ materialize_templated_targets() {
        || ! git -C "$workspace/repo" update-index --chmod="$tpl_idx_chmod" -- "$tpl_dest"; then
       err "$consumer_name: failed to stage templated dest mode ($tpl_idx_chmod) for $tpl_dest"
       return 1
+    fi
+    if [ -z "$MATERIALIZED_TEMPLATED_LIST" ]; then
+      MATERIALIZED_TEMPLATED_LIST="$tpl_path"
+    else
+      MATERIALIZED_TEMPLATED_LIST+=",$tpl_path"
     fi
     printf "  ✎ %s rendered %s → %s\n" "$consumer_name" "$tpl_source" "$tpl_dest"
   done
@@ -1472,6 +1482,325 @@ sync_one_consumer() {
   SYNC_PR_OPENED=$((SYNC_PR_OPENED + 1))
 }
 
+# Compare one templated requirement against the consumer's staged destination.
+# The manifest's requires contract names the templated entry's `.path`, while
+# consumers receive its rendered `.dest`; comparing the source path verbatim
+# would reject a correct consumer and even a same-slice unfiltered sync.
+#
+# Sets REQUIRES_TEMPLATE_DETAIL on mismatch for the aggregate gate diagnostic.
+requires_templated_artifact_matches() {
+  local consumer_name=$1
+  local sha=$2
+  local workspace=$3
+  local tpl_source=$4
+  local tpl_dest=$5
+  local manifest=$6
+  local tmp_root=${TMPDIR:-/tmp}
+  local tmp_dir source_mode consumer_meta consumer_mode expected_meta
+
+  REQUIRES_TEMPLATE_DETAIL=""
+  tmp_dir=$(mktemp -d "$tmp_root/mergepath-requires-template.XXXXXX") || {
+    REQUIRES_TEMPLATE_DETAIL="$tpl_dest (rendered from $tpl_source; could not create comparison workspace)"
+    return 1
+  }
+
+  if ! git -C "$MERGEPATH_ROOT" show "$sha:$tpl_source" >"$tmp_dir/source" 2>/dev/null; then
+    REQUIRES_TEMPLATE_DETAIL="$tpl_dest (rendered from $tpl_source; source missing at $sha)"
+    rm -f "$tmp_dir/source"
+    rmdir "$tmp_dir" 2>/dev/null || true
+    return 1
+  fi
+  if ! (
+    export_consumer_facts "$consumer_name" "$manifest" || exit $?
+    # shellcheck disable=SC1091
+    source "$MERGEPATH_ROOT/scripts/lib/template-substitution.sh" || exit $?
+    template_substitution::render "$tmp_dir/source"
+  ) >"$tmp_dir/rendered" 2>/dev/null; then
+    REQUIRES_TEMPLATE_DETAIL="$tpl_dest (rendered from $tpl_source; render failed for $consumer_name)"
+    rm -f "$tmp_dir/source" "$tmp_dir/rendered"
+    rmdir "$tmp_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  source_mode=$(git -C "$MERGEPATH_ROOT" ls-tree "$sha" -- "$tpl_source" 2>/dev/null | awk 'NR == 1 { print $1 }')
+  consumer_meta=$(git -C "$workspace/repo" ls-files -s -- "$tpl_dest" 2>/dev/null | awk 'NR == 1 { print $1 "\tblob" }')
+  consumer_mode=${consumer_meta%%$'\t'*}
+  expected_meta="${source_mode}"$'\t'"blob"
+  if ! git -C "$workspace/repo" show ":$tpl_dest" >"$tmp_dir/consumer" 2>/dev/null; then
+    REQUIRES_TEMPLATE_DETAIL="$tpl_dest (rendered from $tpl_source; could not read staged consumer artifact)"
+    rm -f "$tmp_dir/source" "$tmp_dir/rendered" "$tmp_dir/consumer"
+    rmdir "$tmp_dir" 2>/dev/null || true
+    return 1
+  fi
+  if [ -z "$source_mode" ] || [ -z "$consumer_meta" ] \
+     || [ "$expected_meta" != "$consumer_meta" ] \
+     || ! cmp -s "$tmp_dir/rendered" "$tmp_dir/consumer"; then
+    REQUIRES_TEMPLATE_DETAIL="$tpl_dest (rendered from $tpl_source; source mode=${source_mode:-missing}, consumer mode=${consumer_mode:-missing})"
+    rm -f "$tmp_dir/source" "$tmp_dir/rendered" "$tmp_dir/consumer"
+    rmdir "$tmp_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  rm -f "$tmp_dir/source" "$tmp_dir/rendered" "$tmp_dir/consumer"
+  rmdir "$tmp_dir" 2>/dev/null || true
+  return 0
+}
+
+# Compare one plain canonical/kit requirement against the consumer index.
+# Metadata and both blob reads are checked independently before bytes are
+# compared. Process substitution cannot propagate a producer's exit status to
+# `cmp`, so a failed `git show` could otherwise masquerade as an empty current
+# artifact after metadata had resolved.
+#
+# Sets REQUIRES_PLAIN_DETAIL on mismatch or unreadable evidence.
+requires_plain_artifact_matches() {
+  local sha=$1
+  local workspace=$2
+  local req_file=$3
+  local source_meta consumer_meta source_mode consumer_mode
+  local tmp_root=${TMPDIR:-/tmp}
+  local tmp_dir
+
+  REQUIRES_PLAIN_DETAIL=""
+  if ! source_meta=$(git -C "$MERGEPATH_ROOT" ls-tree "$sha" -- "$req_file" 2>/dev/null \
+      | awk 'NR == 1 { print $1 "\t" $2 }'); then
+    REQUIRES_PLAIN_DETAIL="$req_file (could not read source metadata)"
+    return 1
+  fi
+  if ! consumer_meta=$(git -C "$workspace/repo" ls-files -s -- "$req_file" 2>/dev/null \
+      | awk 'NR == 1 { print $1 "\tblob" }'); then
+    REQUIRES_PLAIN_DETAIL="$req_file (could not read consumer index metadata)"
+    return 1
+  fi
+  source_mode=${source_meta%%$'\t'*}
+  consumer_mode=${consumer_meta%%$'\t'*}
+  if [ -z "$source_meta" ] || [ -z "$consumer_meta" ] \
+     || [ "$source_meta" != "$consumer_meta" ]; then
+    REQUIRES_PLAIN_DETAIL="$req_file (source mode=${source_mode:-missing}, consumer mode=${consumer_mode:-missing})"
+    return 1
+  fi
+
+  tmp_dir=$(mktemp -d "$tmp_root/mergepath-requires-plain.XXXXXX") || {
+    REQUIRES_PLAIN_DETAIL="$req_file (could not create comparison workspace)"
+    return 1
+  }
+  if ! git -C "$MERGEPATH_ROOT" show "$sha:$req_file" >"$tmp_dir/source" 2>/dev/null; then
+    REQUIRES_PLAIN_DETAIL="$req_file (could not read source blob)"
+    rm -f "$tmp_dir/source" "$tmp_dir/consumer"
+    rmdir "$tmp_dir" 2>/dev/null || true
+    return 1
+  fi
+  if ! git -C "$workspace/repo" show ":$req_file" >"$tmp_dir/consumer" 2>/dev/null; then
+    REQUIRES_PLAIN_DETAIL="$req_file (could not read staged consumer blob)"
+    rm -f "$tmp_dir/source" "$tmp_dir/consumer"
+    rmdir "$tmp_dir" 2>/dev/null || true
+    return 1
+  fi
+  if ! cmp -s "$tmp_dir/source" "$tmp_dir/consumer"; then
+    REQUIRES_PLAIN_DETAIL="$req_file (source mode=$source_mode, consumer mode=$consumer_mode)"
+    rm -f "$tmp_dir/source" "$tmp_dir/consumer"
+    rmdir "$tmp_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  rm -f "$tmp_dir/source" "$tmp_dir/consumer"
+  rmdir "$tmp_dir" 2>/dev/null || true
+  return 0
+}
+
+# Fail closed when a propagation slice would publish a manifest target ahead
+# of one of its direct runtime requirements. The static manifest check proves
+# only that each required path is covered somewhere in the manifest; it does
+# not make a commit slice or a filtered --sync-all slice carry that other
+# entry. Compare the consumer index after this slice has been materialized, so
+# a requirement either travels in the same slice or must already match the
+# source commit's canonical bytes (or its consumer-specific templated render).
+# Git mode is part of the contract: an identity helper with the right bytes but
+# without 100755 is still unusable.
+requires_closure_gate() {
+  local consumer_name=$1
+  local sha=$2
+  local workspace=$3
+  local targets=$4
+  local consumer_overrides=$5
+  local gate_context=$6
+  local requires_manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
+  local req_violations=""
+  local manifest_entry_rows manifest_requires_rows
+  local req_target edge_target req_entry req_files req_file
+  local covering_path covering_type covering_consumers covering_source covering_dest kit_prefix
+  local coverage_found applicable_coverage unoverridden_coverage
+  local plain_unoverridden_coverage templated_coverages requirement_satisfied
+  local plain_requirement_satisfied
+  local coverage_reason req_entry_violations plain_violations
+  local req_object_type
+
+  # Parse the manifest once per consumer slice. A full --sync-all can carry
+  # every manifest entry; spawning yq once per target or requirement makes the
+  # safety gate itself dominate a fleet propagation wave.
+  if ! manifest_entry_rows=$(yq -r '
+    .paths[]
+    | [
+        .path,
+        .type,
+        (.consumers | (select(tag == "!!str") // join(",")) | tostring),
+        (.source // .path),
+        (.dest // .path)
+      ]
+    | @tsv
+  ' "$requires_manifest" 2>/dev/null); then
+    err "$consumer_name: requires-closure gate could not read manifest coverage"
+    return 1
+  fi
+  if ! manifest_requires_rows=$(yq -r '
+    .paths[]
+    | .path as $target
+    | (.requires // [])[]
+    | [$target, .]
+    | @tsv
+  ' "$requires_manifest" 2>/dev/null); then
+    err "$consumer_name: requires-closure gate could not read manifest requirements"
+    return 1
+  fi
+
+  while IFS= read -r req_target; do
+    [ -z "$req_target" ] && continue
+    while IFS=$'\t' read -r edge_target req_entry; do
+      [ "$edge_target" = "$req_target" ] || continue
+      [ -z "$req_entry" ] && continue
+
+      # Resolve the UNION of every manifest entry that covers this required
+      # path: exact entries plus every containing kit. Overrides are valid only
+      # for those manifest entries, so a requirement strictly inside an
+      # overridden kit must be skipped too. If multiple applicable entries
+      # cover the same path, all must be overridden before the runtime
+      # requirement is exempt; any unoverridden carrier can still write it.
+      coverage_found=0
+      applicable_coverage=0
+      unoverridden_coverage=0
+      plain_unoverridden_coverage=0
+      templated_coverages=""
+      while IFS=$'\t' read -r covering_path covering_type covering_consumers covering_source covering_dest; do
+        [ -z "$covering_path" ] && continue
+        if [ "$covering_path" = "$req_entry" ]; then
+          coverage_found=1
+        elif [ "$covering_type" = "kit" ]; then
+          kit_prefix="${covering_path%/}/"
+          if [[ "$req_entry" == "$kit_prefix"* ]]; then
+            coverage_found=1
+          else
+            continue
+          fi
+        else
+          continue
+        fi
+
+        if [ "$covering_consumers" != "all" ]; then
+          case ",$covering_consumers," in
+            *",$consumer_name,"*) : ;;
+            *) continue ;;
+          esac
+        fi
+        applicable_coverage=1
+        if [ "$covering_type" = "templated" ] && [ "$covering_path" = "$req_entry" ]; then
+          # Templated materialization and audit both apply overrides to the
+          # destination because that is the path the consumer owns.
+          if override_should_skip_path "$consumer_overrides" "$covering_dest"; then
+            continue
+          fi
+          unoverridden_coverage=1
+          templated_coverages+="${templated_coverages:+$'\n'}${covering_source}"$'\t'"${covering_dest}"
+        elif ! override_should_skip_path "$consumer_overrides" "$covering_path"; then
+          unoverridden_coverage=1
+          plain_unoverridden_coverage=1
+        fi
+      done <<< "$manifest_entry_rows"
+
+      if [ "$applicable_coverage" -eq 0 ]; then
+        coverage_reason="not covered by the manifest"
+        if [ "$coverage_found" -eq 1 ]; then
+          coverage_reason="manifest coverage excludes $consumer_name"
+        fi
+        req_violations+="${req_violations:+$'\n'}$req_entry (required by $req_target; $coverage_reason)"
+        continue
+      fi
+      if [ "$unoverridden_coverage" -eq 0 ]; then
+        continue
+      fi
+
+      # Coverage is a union. A correct templated destination OR a correct
+      # plain/exact/kit artifact satisfies the requirement for this consumer.
+      requirement_satisfied=0
+      req_entry_violations=""
+      while IFS=$'\t' read -r covering_source covering_dest; do
+        [ -z "$covering_source" ] && continue
+        if requires_templated_artifact_matches "$consumer_name" "$sha" "$workspace" \
+             "$covering_source" "$covering_dest" "$requires_manifest"; then
+          requirement_satisfied=1
+          break
+        fi
+        req_entry_violations+="${req_entry_violations:+$'\n'}$REQUIRES_TEMPLATE_DETAIL (required by $req_target)"
+      done <<< "$templated_coverages"
+      if [ "$requirement_satisfied" -eq 1 ]; then
+        continue
+      fi
+
+      if [ "$plain_unoverridden_coverage" -eq 1 ]; then
+        plain_requirement_satisfied=0
+        plain_violations=""
+        # `type: kit` accepts paths with or without a trailing slash. Infer
+        # recursion from the source tree object, not spelling, so an exact
+        # slashless kit is compared file-by-file instead of comparing its tree
+        # metadata to the consumer's first child blob.
+        req_object_type=$(git -C "$MERGEPATH_ROOT" cat-file -t \
+          "$sha:${req_entry%/}" 2>/dev/null || true)
+        if [ "$req_object_type" = "tree" ]; then
+          if ! req_files=$(git -C "$MERGEPATH_ROOT" ls-tree -r --name-only \
+              "$sha" -- "${req_entry%/}" 2>/dev/null); then
+            plain_violations="$req_entry (could not enumerate source tree at $sha)"
+          elif [ -z "$req_files" ]; then
+            plain_violations="$req_entry (source tree at $sha unexpectedly enumerated no files)"
+          fi
+        else
+          req_files="$req_entry"
+        fi
+        if [ -z "$plain_violations" ]; then
+          while IFS= read -r req_file; do
+            [ -z "$req_file" ] && continue
+            if ! requires_plain_artifact_matches "$sha" "$workspace" "$req_file"; then
+              plain_violations+="${plain_violations:+$'\n'}$REQUIRES_PLAIN_DETAIL (required by $req_target)"
+            fi
+          done <<< "$req_files"
+          if [ -z "$plain_violations" ]; then
+            plain_requirement_satisfied=1
+          fi
+        fi
+        if [ "$plain_requirement_satisfied" -eq 1 ]; then
+          continue
+        fi
+        req_entry_violations+="${req_entry_violations:+$'\n'}$plain_violations"
+      fi
+      if [ -z "$req_entry_violations" ]; then
+        req_entry_violations="$req_entry (required by $req_target; no comparable artifact resolved from manifest coverage)"
+      fi
+      req_violations+="${req_violations:+$'\n'}$req_entry_violations"
+    done <<< "$manifest_requires_rows"
+  done <<< "$targets"
+
+  if [ -z "$req_violations" ]; then
+    return 0
+  fi
+
+  local remedy
+  if [ "$gate_context" = "sync-all" ]; then
+    remedy="A filtered --sync-all must not ship a requires-bearing target ahead of its closure — rerun --sync-all without --paths (or include the required manifest entries), then retry."
+  else
+    remedy="A commit-path sync must not ship a requires-bearing target ahead of its closure — run the --sync-all wave path to bring this consumer current, then retry."
+  fi
+  err "$consumer_name: requires-closure gate (#624/#1058): $(echo "$req_violations" | wc -l | tr -d ' ') file(s) required by this sync's target(s) are missing, stale, or mode-mismatched on the consumer (first: $(echo "$req_violations" | head -n1)). $remedy"
+  return 1
+}
+
 # Live PR-open. Clones the consumer repo into a tmpdir (writeable
 # workspace, never reuses the cache or sibling worktree), copies canonical
 # files from the Mergepath worktree at $sha, commits with the standard
@@ -1670,65 +1999,16 @@ sync_open_pr() {
                                       "$templated_list" "$consumer_overrides"; then
     return 1
   fi
+  templated_list=${MATERIALIZED_TEMPLATED_LIST:-}
 
-  # Commit-path requires-closure gate (#624 Codex P1). The manifest
-  # `requires:` key is validated statically by check_sync_manifest, but the
-  # per-commit path builds targets from CHANGED canonical files only — kit
-  # entries never travel here (they are the sync-all layer). So a commit
-  # touching .github/workflows/repo_lint.yml alone would ship the workflow
-  # WITHOUT the scripts/ci wrappers its run: steps execute, turning every
-  # consumer lint red on the first #601 wave (and on any consumer whose kit
-  # is stale). Rather than silently materializing unrequested kit files
-  # (surprising wave semantics — the operator asked to propagate one
-  # commit), FAIL CLOSED per consumer: after this sync's own files are
-  # materialized above, every path a target `requires:` must be
-  # byte-current in the consumer clone. Files in this sync's own target
-  # set pass automatically (just written); a requirement whose manifest
-  # entry scopes `consumers:` away from this consumer is skipped (they
-  # never receive it); a consumer-override-skipped file is the consumer's
-  # documented divergence (same posture as the override filter above).
-  # Anything else missing or stale aborts THIS consumer with the sync-all
-  # remedy; other consumers proceed independently.
-  local requires_manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
-  local req_violations="" req_target req_entry req_files req_file req_consumers
-  while IFS= read -r req_target; do
-    [ -z "$req_target" ] && continue
-    while IFS= read -r req_entry; do
-      [ -z "$req_entry" ] && continue
-      # Scope the requirement: if the manifest entry covering the required
-      # path names an explicit consumer list that excludes this consumer,
-      # the kit never ships here and must not block.
-      # mikefarah yq v4 (the engine's dialect): parameterize via strenv, not
-      # the jq-style --arg (which yq does not support — a silent no-op gate
-      # was the first version of this bug, caught by the reqgate1 test).
-      req_consumers=$(REQ_GATE_PATH="$req_entry" yq -r '
-        .paths[] | select(.path == strenv(REQ_GATE_PATH))
-        | .consumers | (select(tag == "!!str") // (join(","))) | tostring
-      ' "$requires_manifest" 2>/dev/null | head -n1)
-      if [ -n "$req_consumers" ] && [ "$req_consumers" != "all" ]; then
-        case ",$req_consumers," in
-          *",$consumer_name,"*) : ;;
-          *) continue ;;
-        esac
-      fi
-      case "$req_entry" in
-        */) req_files=$(git -C "$MERGEPATH_ROOT" ls-tree -r --name-only "$sha" -- "$req_entry" 2>/dev/null || true) ;;
-        *)  req_files="$req_entry" ;;
-      esac
-      while IFS= read -r req_file; do
-        [ -z "$req_file" ] && continue
-        if override_should_skip_path "$consumer_overrides" "$req_file"; then
-          continue
-        fi
-        if ! git -C "$MERGEPATH_ROOT" show "$sha:$req_file" 2>/dev/null \
-             | cmp -s - "$workspace/repo/$req_file" 2>/dev/null; then
-          req_violations+="${req_violations:+$'\n'}$req_file (required by $req_target)"
-        fi
-      done <<< "$req_files"
-    done <<< "$(REQ_GATE_PATH="$req_target" yq -r '.paths[] | select(.path == strenv(REQ_GATE_PATH)) | (.requires // [])[]' "$requires_manifest" 2>/dev/null)"
-  done <<< "$targets"
-  if [ -n "$req_violations" ]; then
-    err "$consumer_name: requires-closure gate (#624): $(echo "$req_violations" | wc -l | tr -d ' ') file(s) required by this sync's target(s) are missing or stale on the consumer (first: $(echo "$req_violations" | head -n1)). A commit-path sync must not ship a requires-bearing target ahead of its kit — run the --sync-all wave path (which carries kit targets) to bring this consumer current, then retry."
+  # Commit-path slices select changed canonical entries only. A direct
+  # requirement not selected in this commit must already be current.
+  local closure_targets="$targets"
+  if [ -n "$templated_list" ]; then
+    closure_targets+="${closure_targets:+$'\n'}${templated_list//,/$'\n'}"
+  fi
+  if ! requires_closure_gate "$consumer_name" "$sha" "$workspace" \
+       "$closure_targets" "$consumer_overrides" "commit"; then
     return 1
   fi
 
@@ -2203,6 +2483,20 @@ sync_all_open_pr() {
   # whole consumer (same all-or-nothing semantics as canonical/kit).
   if ! materialize_templated_targets "$consumer_name" "$sha" "$workspace" \
                                       "$templated_list" "$consumer_overrides"; then
+    return 1
+  fi
+  templated_list=${MATERIALIZED_TEMPLATED_LIST:-}
+
+  # A filtered --sync-all is still a partial propagation slice. Check every
+  # selected canonical, kit, and templated entry against its direct runtime
+  # closure before a branch or PR can be written.
+  local closure_targets="$canonical_targets"
+  closure_targets+="${closure_targets:+$'\n'}${kit_targets}"
+  if [ -n "$templated_list" ]; then
+    closure_targets+="${closure_targets:+$'\n'}${templated_list//,/$'\n'}"
+  fi
+  if ! requires_closure_gate "$consumer_name" "$sha" "$workspace" \
+       "$closure_targets" "$consumer_overrides" "sync-all"; then
     return 1
   fi
 
