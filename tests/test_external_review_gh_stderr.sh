@@ -473,6 +473,68 @@ for cf_rc in 1 0; do
 done
 reset_stub_env
 
+# ── Oversized comments/reviews payloads (#1092) ─────────────────────
+#
+# carryforward.sh handed the whole /issues/N/comments and /pulls/N/reviews
+# payloads to three `jq -n` programs as ARGV values (`--argjson reviews
+# "$REVIEWS_JSON"`). Linux caps a SINGLE execve argument at MAX_ARG_STRLEN
+# (131072 bytes), independently of the much larger total ARG_MAX, so once a
+# PR's reviews payload crossed that ceiling jq never started: bash reported
+# rc=126 "Argument list too long", and `set -euo pipefail` made it the
+# script's exit status. codex-review-check.sh discarded the helper's stderr,
+# so this surfaced only as `helper failed rc=126` and the #705 carry-forward
+# was silently inert on exactly the long-running PRs it exists to rescue
+# (measured: mergepath#1084 reviews 306KB, #1124 150KB -- both rc=126; #1169
+# 84KB, #1222 9KB -- both fine). Same defect class as #497/#750; the remedy is
+# the same one those landed: concatenate via stdin, not argv.
+#
+# TWO NETS, because neither alone catches a revert everywhere:
+#   behavioural -- runs the REAL script against an over-ceiling payload, so a
+#     revert to the argv form actually reproduces rc=126 on Linux CI. macOS
+#     has a ~1MB per-argument ceiling, so this half cannot fail there.
+#   structural  -- asserts the argv form is absent, which is portable and
+#     therefore catches the same revert on a macOS dev machine.
+echo
+echo "Oversized comments/reviews payloads — carry-forward survives a >128KB reviews array (#1092)"
+
+reset_stub_env
+CF1092_REVIEWS="$WORK/cf1092-reviews.json"
+# Built by jq INSIDE the harness: passing a >128KB payload as an argument
+# would hit the very ceiling under test and fail the harness, not the code.
+jq -cn '[range(1200) | {
+  id: .,
+  user: {login: "some-reviewer-login-padding"},
+  commit_id: "2222222222222222222222222222222222222222",
+  submitted_at: "2026-01-01T00:00:00Z",
+  state: "COMMENTED",
+  body: "padding body for review \(.) — this text exists only to push the serialized array past MAX_ARG_STRLEN so the argv form fails"
+}]' > "$CF1092_REVIEWS"
+CF1092_BYTES=$(wc -c < "$CF1092_REVIEWS" | tr -d ' ')
+# Self-validating: if the fixture ever shrinks below the ceiling this test
+# silently stops covering the bug.
+if [ "$CF1092_BYTES" -le 131072 ]; then
+  fail "#1092: fixture too small to exercise MAX_ARG_STRLEN ($CF1092_BYTES bytes <= 131072)"
+else
+  export STUB_REVIEWS_JSON="$CF1092_REVIEWS"
+  run_cf "$WORK/cf1092.stderr"
+  if [ "$RC" -eq 126 ] || grep -qi 'argument list too long' "$WORK/cf1092.stderr"; then
+    fail "#1092: carryforward hit the argv ceiling on a ${CF1092_BYTES}-byte reviews payload (rc=$RC) — the payloads are back on argv"
+  elif [ "$RC" -eq 0 ] && [ -n "$OUT" ] && printf '%s' "$OUT" | jq -e 'has("carried")' >/dev/null 2>&1; then
+    pass "#1092: carryforward completes on a ${CF1092_BYTES}-byte reviews payload and still emits a carried verdict"
+  else
+    fail "#1092: carryforward did not complete cleanly on a ${CF1092_BYTES}-byte reviews payload (rc=$RC out=$OUT)"
+  fi
+fi
+reset_stub_env
+
+# Structural net. Deliberately matches the DEFECT (payload on argv) rather
+# than the fix, so any form that keeps the payloads off argv passes.
+if grep -qE -- '--argjson[[:space:]]+(comments|reviews)[[:space:]]+"\$(COMMENTS|REVIEWS)_JSON"' "$CARRYFORWARD"; then
+  fail "#1092: external_review_carryforward.sh passes a comments/reviews payload as an argv value again — that is the >128KB rc=126 shape"
+else
+  pass "#1092: no comments/reviews payload is passed to jq as an argv value"
+fi
+
 echo
 echo "== external_review gh-stderr/#718/#799 tests: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

@@ -166,17 +166,18 @@ REVIEWS_JSON=$(printf '%s\n' "$REVIEWS_JSON" | jq -s 'add // []') || {
 }
 
 HEAD_LC=$(printf '%s' "$HEAD_SHA" | tr '[:upper:]' '[:lower:]')
-CURRENT_SIGNAL=$(jq -n -c \
+CURRENT_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
   --arg bot "$BOT_LOGIN" \
   --arg head "$HEAD_LC" \
-  --argjson comments "$COMMENTS_JSON" \
-  --argjson reviews "$REVIEWS_JSON" '
+  '
   def verdict_shas($body):
     [ $body
       | ascii_downcase
       | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
       | .[0]
     ];
+  .[0] as $comments |
+  .[1] as $reviews |
   ([
     $comments[]
     | select(.user.login == $bot)
@@ -291,18 +292,19 @@ while IFS=$'\t' read -r source_time source_sha; do
   [ -n "$resolved_sha" ] || continue
 
   resolved_lc=$(printf '%s' "$resolved_sha" | tr '[:upper:]' '[:lower:]')
-  NEWER_SOURCE_SIGNAL=$(jq -n -c \
+  NEWER_SOURCE_SIGNAL=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -c \
     --arg bot "$BOT_LOGIN" \
     --arg resolved "$resolved_lc" \
     --arg source_time "$source_time" \
-    --argjson comments "$COMMENTS_JSON" \
-    --argjson reviews "$REVIEWS_JSON" '
+    '
     def verdict_shas($body):
       [ $body
         | ascii_downcase
         | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
         | .[0]
       ];
+    .[0] as $comments |
+    .[1] as $reviews |
     ([
       $comments[]
       | select(.user.login == $bot)
@@ -329,17 +331,18 @@ while IFS=$'\t' read -r source_time source_sha; do
     continue
   fi
 
-  NEWER_SIGNALS=$(jq -n -r \
+  NEWER_SIGNALS=$(printf '%s\n%s\n' "$COMMENTS_JSON" "$REVIEWS_JSON" | jq -s -r \
     --arg bot "$BOT_LOGIN" \
     --arg source_time "$source_time" \
-    --argjson comments "$COMMENTS_JSON" \
-    --argjson reviews "$REVIEWS_JSON" '
+    '
     def verdict_shas($body):
       [ $body
         | ascii_downcase
         | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
         | .[0]
       ];
+    .[0] as $comments |
+    .[1] as $reviews |
     ([
       $comments[]
       | select(.user.login == $bot)
