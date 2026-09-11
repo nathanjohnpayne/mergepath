@@ -60,6 +60,61 @@ assert_prohibited_source "attached global short repo flag native merge" \
   'gh -Rowner/repo pr merge 7 --squash'
 assert_prohibited_source "attached PR short repo flag native merge" \
   'gh pr -Rowner/repo merge 7 --squash'
+
+# An option the classifier does not model must not end the scan. Enumerating
+# only -R/--repo/--hostname let every one of these read as clean, so a real
+# mutation walked past the guard (#1219). The option run is matched by SHAPE
+# now, so an option nobody has thought of yet still cannot split the command.
+assert_prohibited_source "unmodelled long global flag before the PR group" \
+  'gh --verbose pr merge 7'
+assert_prohibited_source "unmodelled short global flag with a separate value" \
+  'gh -q .x pr merge 7'
+assert_prohibited_source "unmodelled global flag with an attached value" \
+  'gh --cache=5m pr merge 7'
+assert_prohibited_source "several unmodelled global flags" \
+  'gh --verbose --debug pr merge 7'
+assert_prohibited_source "a modelled and an unmodelled global flag together" \
+  'gh -R owner/repo --verbose pr merge 7'
+assert_prohibited_source "unmodelled flag between the PR group and the verb" \
+  'gh pr --unknown-flag merge 7'
+assert_prohibited_source "unmodelled global flag before a REST write" \
+  'gh --unknown-flag api repos/o/r/pulls/7/merge -X PUT'
+assert_prohibited_source "unmodelled global flag before a GraphQL mutation" \
+  "gh --verbose api graphql -f query='mutation { mergePullRequest(input: {}) { clientMutationId } }'"
+
+# The widened option run must not start swallowing ordinary read-only syntax.
+# `merged`/`mergeStateStatus` are a flag VALUE and a longer word, not the
+# `merge` verb, and an unmodelled option on a GET is still a GET.
+assert_allowed_source "a flag value that spells merged is not the merge verb" \
+  'gh pr list --state merged'
+assert_allowed_source "merge as a prefix of a longer JSON field is not the verb" \
+  'gh pr view 114 --json mergeStateStatus'
+assert_allowed_source "an unmodelled global flag on an explicit REST GET" \
+  'gh --verbose api repos/o/r/pulls -X GET -f state=open'
+
+# Both forms below are valid reads that the first cut of the widened option run
+# newly blocked (Codex P2 on #1222). Each was confirmed against gh 2.100.0 by
+# running it and reaching the API rather than a flag-parse error.
+#
+# gh accepts a subcommand flag ahead of its subcommand, so the `merge` here is
+# the jq expression and not the verb; the bare-option parse must not reinterpret
+# a consumed value as a command word.
+assert_allowed_source "a value-taking option whose value spells merge" \
+  'gh pr -q merge view 1 --json title'
+assert_allowed_source "a value-taking long option whose value spells merge" \
+  'gh pr --jq merge view 1 --json title'
+# The method flag is a gh option and is legal on either side of `api`; gh sends
+# the fields as a query string, so this is an explicit read.
+assert_allowed_source "an explicit GET pinned before the api command" \
+  'gh -X GET api search/issues -f q=x'
+assert_allowed_source "an explicit long-form GET pinned before the api command" \
+  'gh --method GET api search/issues -f q=x'
+# The same prefix position must not become a way to launder a write.
+assert_prohibited_source "a REST write method pinned before the api command" \
+  'gh -X PUT api repos/o/r/pulls/7/merge'
+assert_prohibited_source "a long-form REST write method pinned before api" \
+  'gh --method POST api repos/o/r/pulls/7/merge'
+
 assert_prohibited_source "line-wrapped native merge" $'gh pr \\\n  merge 7'
 assert_prohibited_source "token-internal continuation cannot split gh" \
   $'g\\\nh pr merge 7'

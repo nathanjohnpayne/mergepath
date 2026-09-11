@@ -173,6 +173,7 @@ gh_source_has_direct_literal_pr_mutation() {
   local mode source allowed_delete prefix suffix normalized api_count
   local protected_source dynamic_scan content_scan graphql_segment gh_command_start_re
   local api_command_start_re method_flag_re api_segment method_count get_count
+  local gh_opt_run
   local literal_marker_prefix literal_space literal_newline literal_semi
   local literal_amp literal_pipe literal_lparen literal_rparen literal_lbrace
   local literal_rbrace literal_newline_boundary
@@ -635,7 +636,41 @@ gh_source_has_direct_literal_pr_mutation() {
   normalized=${dynamic_scan//\`/;}
   literal_newline_boundary="${literal_newline};"
   normalized=${normalized//"$literal_newline_boundary"/"$literal_newline"}
-  gh_command_start_re='(^|[;&|()[:space:]])([^;&|()[:space:]]*/)?gh([[:space:]]+(-R([^;&|()[:space:]]+|[[:space:]]+[^;&|()[:space:]]+)|--repo(=[^;&|()[:space:]]+|[[:space:]]+[^;&|()[:space:]]+)|--hostname(=[^;&|()[:space:]]+|[[:space:]]+[^;&|()[:space:]]+)))*'
+  # Option run between a command word and the next command word. Enumerating
+  # the options we happen to know (-R/--repo/--hostname) is the FAIL-OPEN
+  # shape: any option outside the list ends the match, so `gh --verbose pr
+  # merge 7` reads as clean and a real mutation walks past the guard. The next
+  # unmodelled option reopens the hole, exactly as the `env -S` and
+  # command-position sweeps found. So model option SHAPE, not option identity:
+  # any `-`-leading token, optionally followed by one separate non-option
+  # value. Both branches are needed and the alternation must keep them —
+  # `-q .x pr merge` only resolves via the with-value branch, `--verbose pr
+  # merge` only via the bare branch, and ERE asks whether ANY parse matches,
+  # so an option whose value is omitted still resolves through the bare form.
+  # Widening here moves sources from clean to blocked, which is the safe
+  # direction for a guard; the read-only allowances below (`-X GET`, the
+  # exempt label DELETE) are gated on the method/endpoint words, not on which
+  # options precede them.
+  #
+  # The optional-value branch creates one ambiguity that must be removed
+  # FIRST. `gh pr -q merge view 1` is a valid read — gh accepts a subcommand
+  # flag ahead of its subcommand, so `merge` there is the jq expression, not
+  # the verb — but the bare-option parse can reinterpret that value as the
+  # verb and block a read. ERE cannot express "an option token that is not one
+  # of these", so no single pattern separates the two readings. Collapse the
+  # value into its attached spelling instead, which gh accepts and which the
+  # option run reads as one token, and the ambiguity is gone before matching.
+  # Only options whose VALUE no later check inspects may be collapsed here;
+  # `-X`/`--method` and the field flags carry values the method and
+  # implicit-write tests below read, so they are deliberately absent.
+  normalized=$(printf '%s\n' "$normalized" \
+    | sed -E 's/(^|[;&|()[:space:]])(-q|--jq|-t|--template|-H|--header|--cache)[[:space:]]+([^;&|()[:space:]]+)/\1\2=\3/g') \
+    || return 2
+  dynamic_scan=$(printf '%s\n' "$dynamic_scan" \
+    | sed -E 's/(^|[;&|()[:space:]])(-q|--jq|-t|--template|-H|--header|--cache)[[:space:]]+([^;&|()[:space:]]+)/\1\2=\3/g') \
+    || return 2
+  gh_opt_run='([[:space:]]+-[^;&|()[:space:]]*([[:space:]]+[^-;&|()[:space:]][^;&|()[:space:]]*)?)*'
+  gh_command_start_re='(^|[;&|()[:space:]])([^;&|()[:space:]]*/)?gh'"$gh_opt_run"
   api_command_start_re="$gh_command_start_re"'[[:space:]]+api'
   method_flag_re='(-X([^;&|()[:space:]]*)|--method(=[^;&|()[:space:]]*)?)([;&|()[:space:]]|$)'
   # An opaque command group, PR verb, or standalone API argument can expand
@@ -645,7 +680,7 @@ gh_source_has_direct_literal_pr_mutation() {
   if printf '%s\n' "$dynamic_scan" | grep -Eiq \
       "$gh_command_start_re"'[[:space:]]+[^;&|()[:space:]]*[\$`][^;&|()[:space:]]*' \
     || printf '%s\n' "$dynamic_scan" | grep -Eiq \
-      "$gh_command_start_re"'[[:space:]]+pr([[:space:]]+(-R([^;&|()[:space:]]+|[[:space:]]+[^;&|()[:space:]]+)|--repo(=[^;&|()[:space:]]+|[[:space:]]+[^;&|()[:space:]]+)))*[[:space:]]+[^;&|()[:space:]]*[\$`][^;&|()[:space:]]*' \
+      "$gh_command_start_re"'[[:space:]]+pr'"$gh_opt_run"'[[:space:]]+[^;&|()[:space:]]*[\$`][^;&|()[:space:]]*' \
     || printf '%s\n' "$dynamic_scan" | grep -Eiq \
       "$api_command_start_re"'[[:space:]]+([^;&|]*[[:space:]])?[^;&|()[:space:]/=<>]*[\$`]'; then
     return 0
@@ -659,10 +694,12 @@ gh_source_has_direct_literal_pr_mutation() {
     return 0
   fi
 
-  # Native command, including a path-qualified/prefixed gh and the common gh
-  # repository/hostname options before either `pr` or `merge`.
+  # Native command, including a path-qualified/prefixed gh and any gh options
+  # before either `pr` or `merge`. This previously inlined its own copy of the
+  # gh command-start pattern instead of reusing the variable, so the two could
+  # drift apart silently; it now composes the same single-sourced pieces.
   if printf '%s\n' "$normalized" | grep -Eiq \
-    '(^|[;&|()[:space:]])([^;&|()[:space:]]*/)?gh([[:space:]]+(-R([^;&|()[:space:]]+|[[:space:]]+[^;&|()[:space:]]+)|--repo(=[^;&|()[:space:]]+|[[:space:]]+[^;&|()[:space:]]+)|--hostname(=[^;&|()[:space:]]+|[[:space:]]+[^;&|()[:space:]]+)))*[[:space:]]+pr([[:space:]]+(-R([^;&|()[:space:]]+|[[:space:]]+[^;&|()[:space:]]+)|--repo(=[^;&|()[:space:]]+|[[:space:]]+[^;&|()[:space:]]+)))*[[:space:]]+merge([;&|()[:space:]]|$)'; then
+    "$gh_command_start_re"'[[:space:]]+pr'"$gh_opt_run"'[[:space:]]+merge([;&|()[:space:]]|$)'; then
     return 0
   fi
 
@@ -762,9 +799,18 @@ gh_source_has_direct_literal_pr_mutation() {
   # explicitly pins GET; otherwise it is an implicit write even without -X.
   if printf '%s\n' "$normalized" | grep -Eiq \
       "$api_command_start_re"'[[:space:]]+([^;&|]*[[:space:]])?((-f|-F)([^;&|()[:space:]]*|[[:space:]]+[^;&|()[:space:]]+)|--field([=;&|()[:space:]]|$)|--raw-field([=;&|()[:space:]]|$)|--input([=;&|()[:space:]]|$))'; then
+    # The method flag is a gh option, so it is legal on either side of `api`
+    # (`gh -X GET api search/issues -f q=x` is a read, and gh sends the fields
+    # as a query string). Recognising a wider option run made that prefix form
+    # reachable here for the first time, so a GET search for the suffix alone
+    # would newly report an explicit read as a write. Accept the pin from
+    # either position; the single-call `api_count` guard still prevents a read
+    # in one command from laundering a write in another.
     if [ "$api_count" -eq 1 ] \
-      && printf '%s\n' "$normalized" | grep -Eiq \
-        "$api_command_start_re"'[[:space:]]+([^;&|]*[[:space:]])?(-X[[:space:]]*|--method[[:space:]]*(=[[:space:]]*)?)GET([;&|()[:space:]]|$)'; then
+      && { printf '%s\n' "$normalized" | grep -Eiq \
+        "$api_command_start_re"'[[:space:]]+([^;&|]*[[:space:]])?(-X[[:space:]]*|--method[[:space:]]*(=[[:space:]]*)?)GET([;&|()[:space:]]|$)' \
+        || printf '%s\n' "$normalized" | grep -Eiq \
+          '(^|[;&|()[:space:]])([^;&|()[:space:]]*/)?gh'"$gh_opt_run"'[[:space:]]+(-X[[:space:]]*|--method[[:space:]]*(=[[:space:]]*)?)GET'"$gh_opt_run"'[[:space:]]+api([;&|()[:space:]]|$)'; }; then
       return 1
     fi
     return 0
