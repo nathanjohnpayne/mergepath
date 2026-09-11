@@ -384,9 +384,38 @@ jobs:
 
             # The renderer emits one v1 record or a complete set of chunked v2
             # records when the full prior body cannot fit in one comment.
-            scripts/render-feedback-archive.sh \
-              "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file" "$ghas_tier" \
-              >"$archive_records_file"
+            #
+            # #1221, Codex P1: the renderer is manifest-delivered too, and in
+            # the first-delivery window the default branch carries its OLD
+            # copy. #1124 widened its arity from `$# -ne 5` to `5..6`, so a
+            # default branch predating that rejects a six-argument call
+            # outright -- the archive step then fails and the wave is deadlocked
+            # exactly as before, with the helper guard above reporting that it
+            # had degraded. Presence is not the whole question; the INTERFACE
+            # is. Ask it the same way: does the DEFAULT BRANCH's own copy of
+            # this workflow already pass the tier argument?
+            g1221_render_ok=1
+            g1221_render_legacy=0
+            if [ ! -x scripts/render-feedback-archive.sh ]; then
+              if grep -Fq 'scripts/render-feedback-archive.sh' .github/workflows/codex-p1-gate.yml; then
+                echo "::error::scripts/render-feedback-archive.sh is absent from the trusted default-branch checkout, but the default-branch copy of this workflow references it - infrastructure failure, not first delivery"
+                exit 1
+              fi
+              g1221_render_ok=0
+              echo "::warning::scripts/render-feedback-archive.sh is not on the default branch yet - first-delivery window; this feedback edit is not archived (#1221)"
+            elif ! grep -Fq '"$ghas_tier"' .github/workflows/codex-p1-gate.yml; then
+              g1221_render_legacy=1
+              echo "::warning::the default-branch copy of this workflow does not pass the tier argument, so its renderer predates #1124 - archiving through the five-argument form (#1221)"
+            fi
+            if [ "$g1221_render_ok" = 1 ] && [ "$g1221_render_legacy" = 1 ]; then
+              scripts/render-feedback-archive.sh \
+                "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file" \
+                >"$archive_records_file"
+            elif [ "$g1221_render_ok" = 1 ]; then
+              scripts/render-feedback-archive.sh \
+                "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file" "$ghas_tier" \
+                >"$archive_records_file"
+            fi
           fi
 
           if [ "$requires_relay" != true ] && [ -s "$archive_records_file" ]; then

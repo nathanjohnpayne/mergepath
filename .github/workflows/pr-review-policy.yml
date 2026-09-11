@@ -76,12 +76,22 @@ jobs:
           # breakage. Both files come from the same trusted checkout, so a PR
           # cannot forge either side and deleting the validator alone cannot
           # buy a silent pass.
-          if [ ! -x scripts/validate-pr-body.sh ]; then
-            if grep -Fq 'scripts/validate-pr-body.sh' .github/workflows/pr-review-policy.yml; then
-              echo "::error::scripts/validate-pr-body.sh is absent from the trusted default-branch checkout, but the default-branch copy of this workflow references it - infrastructure failure, not first delivery"
+          # Codex P1 on #1229: presence is not the whole question. The other
+          # half of #1132 was a MISSING INTERFACE -- the validator was present
+          # and executable but predated the flag its caller passed, and the
+          # required check died on `usage:` just as it would have on a missing
+          # file. So the test is not "does the validator exist" but "does the
+          # DEFAULT BRANCH's own copy of this workflow already make THIS CALL",
+          # flag included. A wave introducing a new flag alongside its caller
+          # therefore reads as first delivery rather than deadlocking.
+          if grep -Fq -- 'scripts/validate-pr-body.sh --self-review-only' \
+            .github/workflows/pr-review-policy.yml; then
+            if [ ! -x scripts/validate-pr-body.sh ]; then
+              echo "::error::scripts/validate-pr-body.sh is absent from the trusted default-branch checkout, but the default-branch copy of this workflow already makes this call - infrastructure failure, not first delivery"
               exit 1
             fi
-            echo "::warning::scripts/validate-pr-body.sh is not on the default branch yet and the default-branch copy of this workflow does not reference it - first-delivery window; the PR-body contract is not evaluated for this run (#1221)"
+          else
+            echo "::warning::the default-branch copy of this workflow does not make this call (missing script, or a validator predating --self-review-only) - first-delivery window; the PR-body contract is not evaluated for this run (#1221)"
             exit 0
           fi
           printf '%s\n' "$PR_BODY" | scripts/validate-pr-body.sh --self-review-only

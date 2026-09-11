@@ -269,21 +269,36 @@ assert_grep "D10: the scheduled sweep re-verifies the label against live state, 
 # every consumer, so a manifest test is permanently permissive downstream --
 # i.e. it would let deleting the helper silently disable the guarded work on
 # exactly the repos the guard is supposed to protect.
-g1221_guard_reads_workflow() {  # <label> <workflow-file> <helper-path>
+g1221_guard_reads_workflow() {  # <label> <workflow-file> <own-basename>
   if [ ! -f "$2" ]; then echo "SKIP: $1 ($2 absent)"; SKIP=$((SKIP + 1)); return; fi
-  if grep -Fq "grep -Fq \"\$_g1221_lib\" .github/workflows/" "$2" \
-     || grep -Fq "grep -Fq '$3' .github/workflows/" "$2"; then
+  # The guard must compare against its OWN workflow, which is a file every
+  # consumer has -- unlike `.mergepath-sync.yml`, which 404s downstream and
+  # would leave the guard permanently permissive there. Scoped to the guards
+  # this change owns: codex-p1-gate.yml still carries two PRE-EXISTING
+  # manifest-discriminating fences of the same shape, tracked separately in
+  # #1230, and this assertion deliberately does not fail on those.
+  if grep -Fq ".github/workflows/$3" "$2"; then
     pass "$1"
   else
-    fail "$1 (no default-branch workflow self-comparison found in $2)"
+    fail "$1 (no default-branch workflow self-comparison, or a manifest test remains, in $2)"
   fi
 }
 g1221_guard_reads_workflow \
   "D12: the codex-p1-gate archive guard discriminates on the workflow, not the hub-only manifest (#1221)" \
-  "$W/codex-p1-gate.yml" "scripts/lib/ghas-alert-severity.sh"
+  "$W/codex-p1-gate.yml" "codex-p1-gate.yml"
 g1221_guard_reads_workflow \
   "D12: the Self-Review validator guard discriminates on the workflow, not the hub-only manifest (#1221)" \
-  "$W/pr-review-policy.yml" "scripts/validate-pr-body.sh"
+  "$W/pr-review-policy.yml" "pr-review-policy.yml"
+# Codex P1 on #1229: the validator guard must test the CALL, flag included --
+# the other half of #1132 was a validator that existed but predated the flag
+# its caller passed, which dies on `usage:` exactly as a missing file does.
+if [ ! -f "$W/pr-review-policy.yml" ]; then
+  echo "SKIP: D12 validator call-shape guard (#1221) ($W/pr-review-policy.yml absent)"; SKIP=$((SKIP + 1))
+elif grep -Fq -- "grep -Fq -- 'scripts/validate-pr-body.sh --self-review-only'" "$W/pr-review-policy.yml"; then
+  pass "D12: the validator guard tests the call INCLUDING its flag, so interface skew reads as first delivery (#1221)"
+else
+  fail "D12: the validator guard tests presence only -- a validator predating --self-review-only still deadlocks (#1221)"
+fi
 
 # Behavioural: EXTRACT the archive guard's decision loop from the workflow and
 # run it, so a revert is executed rather than merely text-matched. Deliberately
@@ -333,6 +348,60 @@ else
       fail "D12: a missing-but-expected helper did not fail closed (#1221): $G1221_OUT"
     fi
     rm -rf "$G1221_DIR"
+  fi
+fi
+
+# Codex P1 on #1229, second half: the RENDERER is manifest-delivered too, and
+# #1124 widened its arity from `$# -ne 5` to `5..6`. A default branch predating
+# that rejects a six-argument call, so a degrade that still passes six
+# arguments fails the archive step and the wave stays deadlocked -- having
+# announced that it degraded. Extract that decision and run it.
+if [ ! -f "$W/codex-p1-gate.yml" ]; then
+  echo "SKIP: D12 renderer arity decision (#1221) ($W/codex-p1-gate.yml absent)"; SKIP=$((SKIP + 1))
+else
+  G1221_REND="$(awk '/\$g1221_render_ok" = 1 \] &&/ { exit } /^ *g1221_render_ok=1$/ { grab = 1 } grab { sub(/^ +/, ""); print }' "$W/codex-p1-gate.yml")"
+  if [ -z "$G1221_REND" ]; then
+    fail "D12: could not extract the renderer arity decision from $W/codex-p1-gate.yml (#1221)"
+  else
+    G1221_RDIR="$(mktemp -d "${TMPDIR:-/tmp}/d12-rend.XXXXXX")"
+    mkdir -p "$G1221_RDIR/scripts" "$G1221_RDIR/.github/workflows"
+    g1221_rend_run() {
+      ( cd "$G1221_RDIR" && set -euo pipefail && eval "$G1221_REND" \
+        && echo "ok=$g1221_render_ok legacy=$g1221_render_legacy" ) 2>&1
+    }
+    printf '#!/bin/sh\n' > "$G1221_RDIR/scripts/render-feedback-archive.sh"
+    chmod +x "$G1221_RDIR/scripts/render-feedback-archive.sh"
+    # Current fleet: the default-branch workflow passes the tier argument.
+    printf 'a line with "$ghas_tier" in it\n' > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
+    if g1221_rend_run | grep -q 'ok=1 legacy=0'; then
+      pass "D12: default-branch workflow passes the tier argument -> six-argument renderer (#1221)"
+    else
+      fail "D12: renderer decision did not select the six-argument form (#1221)"
+    fi
+    # Pre-#1124 default branch: no tier argument -> its renderer takes five.
+    printf 'a line referencing scripts/render-feedback-archive.sh only\n' > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
+    if g1221_rend_run | grep -q 'ok=1 legacy=1'; then
+      pass "D12: default-branch workflow omits the tier argument -> five-argument renderer, not a six-argument call it would reject (#1221)"
+    else
+      fail "D12: renderer decision did not fall back to the five-argument form (#1221)"
+    fi
+    # Renderer absent and unreferenced -> first delivery, skip archiving.
+    rm -f "$G1221_RDIR/scripts/render-feedback-archive.sh"
+    printf 'unrelated\n' > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
+    if g1221_rend_run | grep -q 'ok=0'; then
+      pass "D12: renderer absent and unreferenced -> first-delivery window, archive skipped rather than failing (#1221)"
+    else
+      fail "D12: renderer absence did not degrade (#1221)"
+    fi
+    # Renderer absent but REFERENCED -> breakage, fail closed.
+    printf 'scripts/render-feedback-archive.sh is referenced here\n' > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
+    G1221_ROUT="$(g1221_rend_run || true)"
+    if printf '%s' "$G1221_ROUT" | grep -q '::error::' && ! printf '%s' "$G1221_ROUT" | grep -q 'ok='; then
+      pass "D12: renderer absent but referenced by the default-branch workflow -> fails closed (#1221)"
+    else
+      fail "D12: a missing-but-expected renderer did not fail closed (#1221): $G1221_ROUT"
+    fi
+    rm -rf "$G1221_RDIR"
   fi
 fi
 
