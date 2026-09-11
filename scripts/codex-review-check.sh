@@ -2394,22 +2394,34 @@ if [ "$CODEX_ENABLED" = "true" ]; then
     # same-content verdict on an older commit is not that answer.
     log "codex verdict carry-forward: SKIPPED (--diagnostic-signal-only — current-head signal required)"
   elif [ -x "$CARRY_BIN" ]; then
+    # #1092: capture the helper's stderr instead of discarding it. Sending it
+    # to /dev/null is why an rc=126 ("Argument list too long") went unnoticed
+    # for so long: the gate fails closed and only logs, so the one line that
+    # named the defect was thrown away on every run. No EXIT trap here -- this
+    # script already registers one for __POLICY_TMP, and a second would REPLACE
+    # rather than extend it; the explicit rm below mirrors the resolver capture
+    # above.
+    __carry_err=$(mktemp "${TMPDIR:-/tmp}/carryforward-err.XXXXXX")
     set +e
     CARRY_JSON=$(bash "$CARRY_BIN" \
       --repo "$REPO" \
       --pr "$PR_NUMBER" \
       --head "$HEAD_SHA" \
       --config "$CONFIG" \
-      --bot-login "$BOT_LOGIN" 2>/dev/null)
+      --bot-login "$BOT_LOGIN" 2>"$__carry_err")
     carry_rc=$?
     set -e
+    # Collapse to one line and truncate: this stderr can carry a gh error body,
+    # the same handling scripts/lib/gh-api-scalar.sh already applies.
+    __carry_err_msg=$(tr '\n' ' ' < "$__carry_err" 2>/dev/null | cut -c1-500)
+    rm -f "$__carry_err"
     if [ "$carry_rc" -eq 0 ] && [ "$(echo "$CARRY_JSON" | jq -r '.carried // false')" = "true" ]; then
       CODEX_CARRYFORWARD_VERDICT_TIME=$(echo "$CARRY_JSON" | jq -r '.source_time // ""')
       CODEX_CARRYFORWARD_COMMIT=$(echo "$CARRY_JSON" | jq -r '.source_commit // ""')
       CODEX_CARRYFORWARD_FINGERPRINT=$(echo "$CARRY_JSON" | jq -r '.fingerprint // ""')
       log "codex verdict carry-forward: prior affirmative verdict on $CODEX_CARRYFORWARD_COMMIT @ $CODEX_CARRYFORWARD_VERDICT_TIME matches current external-review fingerprint $CODEX_CARRYFORWARD_FINGERPRINT (#705)"
     elif [ "$carry_rc" -ne 0 ]; then
-      log "codex verdict carry-forward: helper failed rc=$carry_rc — ignoring carry-forward and requiring a current-head signal (fail closed)"
+      log "codex verdict carry-forward: helper failed rc=$carry_rc — ignoring carry-forward and requiring a current-head signal (fail closed)${__carry_err_msg:+ — stderr: $__carry_err_msg}"
     fi
   else
     log "codex verdict carry-forward: helper missing at $CARRY_BIN — requiring a current-head signal"
