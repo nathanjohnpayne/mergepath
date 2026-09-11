@@ -96,7 +96,7 @@ SCRIPT="$ROOT/scripts/codex-review-check.sh"
 [ -r "$SCRIPT" ] || { echo "missing $SCRIPT" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
