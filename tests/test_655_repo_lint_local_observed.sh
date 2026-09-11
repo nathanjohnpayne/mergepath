@@ -183,8 +183,11 @@ assert_grep "agent-review: disambiguates required checks by (name, workflow) via
 # groups, EVERY group's winner must be green -- so a same-named annex job
 # (allowed by the annex contract, workflow=="" matches any workflow) can
 # never stand in for a failing canonical `lint`.
+# #1214 widened the key from workflow alone to (workflow, surface); the
+# workflow half is still the invariant this guards, so the match is the
+# prefix rather than the whole expression.
 assert_grep "agent-review: groups matching checks by workflow before picking a winner (not a bare sort_by | last)" \
-  "$W/agent-review.yml" 'group_by(.workflowName // "")'
+  "$W/agent-review.yml" 'group_by([(.workflowName // "")'
 assert_grep "agent-review: picks the latest COMPLETED run within a workflow group when nothing is pending" \
   "$W/agent-review.yml" 'sort_by(.completedAt // .startedAt // "")'
 assert_grep "agent-review: requires every matched workflow group to be green, not just one arbitrary winner" \
@@ -419,6 +422,10 @@ assert_grep "agent-review: the canonical (workflow==\"\") match builds a require
 assert_grep "agent-review: the canonical (workflow==\"\") match falls back to all name matches when none report required=true (#655 round 15)" \
   "$W/agent-review.yml" 'if $workflow == "" and ($required_matches | length) > 0'
 
+# NOTE: this helper re-types the winners query inline and is kept in sync by
+# hand, so it can only ever confirm the shape recorded here. The #1214 block
+# further down EXECUTES the query extracted from agent-review.yml itself, and
+# that is the assertion to trust when the two disagree.
 if command -v jq >/dev/null 2>&1; then
   agent_review_winners() {
     local rollup_json=$1 check_name=$2 check_workflow=$3
@@ -432,13 +439,13 @@ if command -v jq >/dev/null 2>&1; then
          then $required_matches
          else $name_matches
          end) as $matches
-      | ($matches | group_by(.workflowName // "")) as $groups
+      | ($matches | group_by([(.workflowName // ""), (.kind // "")])) as $groups
       | [
           $groups[]
           | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
           | if ($pending | length) > 0
             then $pending[0]
-            else (sort_by(.completedAt // .startedAt // "") | last)
+            else (sort_by(.completedAt // .startedAt // .createdAt // "") | last)
             end
         ]'
   }
@@ -695,6 +702,155 @@ elif grep -Fq "name: Probe current-head check readiness once" "$W/agent-review.y
 else
   fail "#1062: approval readiness must not retain a wait loop, poll budget, or sleep"
 fi
+
+# ── #1214 site 2: the readiness winners query collapsed surfaces ────────────
+#
+# agent-review.yml's required-check readiness groups candidate runs before
+# picking a winner per group, and requires EVERY group's winner to be green.
+# The group key was `.workflowName // ""`. A StatusContext has no workflow
+# name, so it landed in the "" group — which separated it from Actions check
+# runs only by accident, and put it in the SAME group as every check run that
+# also has no workflow name, meaning every check run NOT published by GitHub
+# Actions. One winner then spoke for both surfaces.
+#
+# As at the annex fallback, the masking was one-directional: a StatusContext
+# has no startedAt/completedAt in this projection, so it sorts first and loses
+# every tie, and a GREEN non-Actions check run silently dropped a same-named
+# RED commit status. This is the native auto-merge readiness path, so that is
+# the same consequence as a fail-open in gate (a).
+#
+# Unlike the rest of this suite, these assertions EXECUTE the shipped jq rather
+# than grepping for it: the query is extracted from agent-review.yml by
+# exact-line anchors and run on rollup nodes shaped as the workflow's own
+# projection emits them. Exact-string anchors, not regexes — `{` is an ERE
+# interval whose escaping is not portable across BSD awk and gawk.
+if [ ! -f "$W/agent-review.yml" ]; then
+  echo "SKIP: #1214 winners-query execution ($W/agent-review.yml absent)"; SKIP=$((SKIP + 1))
+elif ! command -v jq >/dev/null 2>&1; then
+  echo "SKIP: #1214 winners-query execution (jq not available)"; SKIP=$((SKIP + 1))
+else
+  G1214_DIR=$(mktemp -d)
+  cat > "$G1214_DIR/proj.awk" <<'AWK'
+BEGIN { start = "            rollup_json=$(echo \"$rollup_contexts\" | jq '{"; stop = "            }')" }
+$0 == start { started = 1; print "{"; next }
+started { if ($0 == stop) { print "}"; exit } print }
+AWK
+  cat > "$G1214_DIR/win.awk" <<'AWK'
+BEGIN { start = "              winners=$(echo \"$rollup_json\" | jq -c --arg name \"$check_name\" --arg workflow \"$check_workflow\" '"; stop = "                  ]')" }
+$0 == start { started = 1; next }
+started { if ($0 == stop) { print "                  ]"; exit } print }
+AWK
+  awk -f "$G1214_DIR/proj.awk" "$W/agent-review.yml" > "$G1214_DIR/proj.jq"
+  awk -f "$G1214_DIR/win.awk"  "$W/agent-review.yml" > "$G1214_DIR/win.jq"
+
+  G1214_OK=1
+  if [ ! -s "$G1214_DIR/proj.jq" ] || [ ! -s "$G1214_DIR/win.jq" ]; then
+    G1214_OK=0
+    fail "#1214: could not extract the rollup projection / winners query from agent-review.yml — the anchor lines moved, so nothing below tests the shipped readiness probe"
+  elif ! printf '[]' | jq -f "$G1214_DIR/proj.jq" >/dev/null 2>&1; then
+    G1214_OK=0
+    fail "#1214: the extracted agent-review.yml rollup projection does not compile as a jq program"
+  elif ! printf '{"statusCheckRollup":[]}' | jq --arg name x --arg workflow "" -f "$G1214_DIR/win.jq" >/dev/null 2>&1; then
+    G1214_OK=0
+    fail "#1214: the extracted agent-review.yml winners query does not compile as a jq program"
+  else
+    pass "#1214: agent-review.yml rollup projection and winners query extracted from the real workflow and both compile"
+  fi
+
+  if [ "$G1214_OK" -eq 1 ]; then
+    g1214_win() {  # nodes_json -> winners, as "kind:result" pairs
+      printf '%s' "$1" | jq -c -f "$G1214_DIR/proj.jq" \
+        | jq -c --arg name "lint" --arg workflow "" -f "$G1214_DIR/win.jq" \
+        | jq -c '[.[] | (if (.kind // "") == "" then "-" else .kind end) + ":" + (.conclusion // .state // "")] | sort'
+    }
+    g1214_bad() {  # the workflow own bad-winner test, verbatim in spirit
+      printf '%s' "$1" | jq -c -f "$G1214_DIR/proj.jq" \
+        | jq -c --arg name "lint" --arg workflow "" -f "$G1214_DIR/win.jq" \
+        | jq -c '[.[] | select((.conclusion // .state // "") as $r | ($r != "SUCCESS" and $r != "SKIPPED" and $r != "NEUTRAL"))] | length'
+    }
+    # A check run with no workflowRun is what a non-Actions producer looks
+    # like; it is the entry that shared the "" group with commit statuses.
+    N_CR_OK='{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T12:00:00Z","completedAt":"2026-05-21T12:05:00Z","isRequired":true,"checkSuite":{"app":{"databaseId":777},"workflowRun":null}}'
+    N_SC_BAD='{"__typename":"StatusContext","context":"lint","state":"FAILURE","createdAt":"2026-05-21T11:00:00Z","isRequired":true}'
+    N_SC_OK='{"__typename":"StatusContext","context":"lint","state":"SUCCESS","createdAt":"2026-05-21T11:00:00Z","isRequired":true}'
+    A_CR_BAD='{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T09:00:00Z","completedAt":"2026-05-21T09:05:00Z","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"CI","resourcePath":"/o/r/actions/workflows/ci.yml"}}}}'
+    A_CR_OK='{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":true,"checkSuite":{"app":{"databaseId":15368},"workflowRun":{"databaseId":1,"workflow":{"name":"CI","resourcePath":"/o/r/actions/workflows/ci.yml"}}}}'
+
+    # THE DISCRIMINATOR: a green non-Actions check run must no longer drop a
+    # same-named red commit status. Judged by the workflow own bad-winner
+    # count, which is what actually denies readiness.
+    GOT=$(g1214_bad "[$N_CR_OK,$N_SC_BAD]")
+    if [ "$GOT" = "1" ]; then
+      pass "#1214: readiness no longer clears when a green non-Actions check run shares a required name with a red commit status"
+    else
+      fail "#1214: green non-Actions CheckRun + red StatusContext must leave a non-green winner, got bad_count=$GOT"
+    fi
+    GOT=$(g1214_win "[$N_CR_OK,$N_SC_BAD]")
+    if [ "$GOT" = '["CheckRun:SUCCESS","StatusContext:FAILURE"]' ]; then
+      pass "#1214: each surface contributes its own winner to the readiness probe"
+    else
+      fail "#1214: the two surfaces are still collapsed into one winner, got $GOT"
+    fi
+
+    # No false block: both surfaces green must still clear.
+    GOT=$(g1214_bad "[$N_CR_OK,$N_SC_OK]")
+    if [ "$GOT" = "0" ]; then
+      pass "#1214: readiness still clears when both surfaces are green"
+    else
+      fail "#1214: both-surfaces-green must not deny readiness, got bad_count=$GOT"
+    fi
+
+    # The #655 round 5 rule this grouping exists for is untouched: a stale
+    # failure superseded by a later success in the same workflow still loses.
+    GOT=$(g1214_bad "[$A_CR_BAD,$A_CR_OK]")
+    if [ "$GOT" = "0" ]; then
+      pass "#1214: within one workflow, a superseded failure still loses to the later success (#655 round 5)"
+    else
+      fail "#1214: adding the surface to the group key broke stale-rerun selection, got bad_count=$GOT"
+    fi
+
+    # Totality: an entry with no recorded surface must still be judged, not
+    # dropped — an empty partition would be a fail-open worse than the one fixed.
+    GOT=$(g1214_bad '[{"name":"lint","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-05-21T10:00:00Z","completedAt":"2026-05-21T10:05:00Z","isRequired":true}]')
+    if [ "$GOT" = "1" ]; then
+      pass "#1214: an entry carrying no __typename is still judged rather than dropped"
+    else
+      fail "#1214: untyped entries fell out of readiness scrutiny, got bad_count=$GOT"
+    fi
+
+    # Review round 1 (Codex P2, CodeRabbit Major): the surface partition made
+    # status ordering load-bearing here too, and the workflow projection was
+    # dropping createdAt entirely -- the only timestamp a StatusContext has.
+    # Both array orders are asserted, because GraphQL connection order is
+    # precisely what must stop deciding the winner.
+    W_SC_OLD_BAD='{"__typename":"StatusContext","context":"lint","state":"FAILURE","createdAt":"2026-05-21T10:00:00Z","isRequired":true}'
+    W_SC_NEW_OK='{"__typename":"StatusContext","context":"lint","state":"SUCCESS","createdAt":"2026-05-21T12:00:00Z","isRequired":true}'
+    W_SC_OLD_OK='{"__typename":"StatusContext","context":"lint","state":"SUCCESS","createdAt":"2026-05-21T10:00:00Z","isRequired":true}'
+    W_SC_NEW_BAD='{"__typename":"StatusContext","context":"lint","state":"FAILURE","createdAt":"2026-05-21T12:00:00Z","isRequired":true}'
+
+    GOT_A=$(g1214_bad "[$W_SC_OLD_BAD,$W_SC_NEW_OK]")
+    GOT_B=$(g1214_bad "[$W_SC_NEW_OK,$W_SC_OLD_BAD]")
+    if [ "$GOT_A" = "0" ] && [ "$GOT_B" = "0" ]; then
+      pass "#1214: a recovered required status clears readiness over its own stale failure, in either connection order"
+    else
+      fail "#1214: a stale status failure still denies readiness (order A=$GOT_A order B=$GOT_B)"
+    fi
+
+    GOT_A=$(g1214_bad "[$W_SC_OLD_OK,$W_SC_NEW_BAD]")
+    GOT_B=$(g1214_bad "[$W_SC_NEW_BAD,$W_SC_OLD_OK]")
+    if [ "$GOT_A" = "1" ] && [ "$GOT_B" = "1" ]; then
+      pass "#1214: a current required status failure is not hidden by its own stale success, in either connection order"
+    else
+      fail "#1214: a stale status success still hides the current failure from readiness (order A=$GOT_A order B=$GOT_B)"
+    fi
+  fi
+  rm -rf "$G1214_DIR"
+fi
+
+assert_grep "agent-review: the readiness projection carries the GraphQL union member (#1214)" \
+  "$W/agent-review.yml" 'kind: (.__typename // "")'
+assert_grep "agent-review: the readiness winner grouping keys on workflow AND surface (#1214)" \
+  "$W/agent-review.yml" 'group_by([(.workflowName // ""), (.kind // "")])'
 
 echo ""
 echo "test_655_repo_lint_local_observed: $PASS passed, $FAIL failed, $SKIP skipped"

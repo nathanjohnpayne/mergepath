@@ -141,15 +141,6 @@ consumers:
     visibility: public
     facts:
       frameworks: [react, typescript]
-  # device-source-of-truth is a React 19 + TypeScript + Vite SPA with a
-  # root package.json and ~148 .ts/.tsx files, so it IS in scope for the
-  # canonical ESLint floor (#458). Folded into the ESM templated entry
-  # below; the prior "zero lintable surface" exclusion was false.
-  - name: device-source-of-truth
-    repo: nathanjohnpayne/device-source-of-truth
-    visibility: public
-    facts:
-      frameworks: [react, typescript]
   - name: friends-and-family-billing
     repo: nathanjohnpayne/friends-and-family-billing
     visibility: public
@@ -335,11 +326,14 @@ paths:
   # Single source of truth for the Codex App failure-marker regexes (#722):
   # the usage-limit / not-connected patterns audit-codex-latency.sh classifies
   # retrospectively, factored out so the live Phase 4a scripts test the SAME
-  # patterns. Sourced (existence-guarded, flag-gated) by codex-review-request.sh
-  # and codex-review-check.sh — declared in each of their requires: below so the
+  # patterns. #1085 also makes this the one grammar/parser for the durable,
+  # exact-head Phase 4a timeout determination consumed by phase-4b/lib.sh.
+  # Sourced (existence-guarded, flag-gated) by codex-review-request.sh and
+  # codex-review-check.sh — declared in each of their requires: below so the
   # closure invariant records the coupling and the lib travels with them. A
-  # consumer missing it degrades to the pre-#722 behavior (no marker detection),
-  # so the source is soft, not fail-closed.
+  # consumer missing it degrades to pre-#722 behavior for provider markers,
+  # but a normal timeout or Phase 4b timeout read fails closed because inventing
+  # a terminal determination would bypass the ordering barrier.
   - path: scripts/lib/codex-failure-markers.sh
     type: canonical
     consumers: all
@@ -354,6 +348,20 @@ paths:
   - path: scripts/lib/gh-api-scalar.sh
     type: canonical
     consumers: all
+  # Branch-requirement resolver (#1064, subsuming #1063). Answers "which status
+  # checks actually gate merges on this branch" from a token with NO
+  # Administration:read, by reading the two viewer-scoped surfaces that a plain
+  # write-scoped token can see (GraphQL refUpdateRule for classic protection,
+  # REST rules/branches for rulesets) instead of the admin-only REST protection
+  # endpoint. That endpoint answers 404 — not 403 — for an unprivileged token,
+  # so gate (a) read "nothing is required" and passed without examining a check
+  # run on every path it is actually used on. Returns an explicit tri-state so
+  # "requires nothing" and "could not look" can never again be the same answer.
+  # HARD-sourced by codex-review-check.sh (exit 3 when absent) and declared in
+  # its requires: below — a degraded mode here IS the defect.
+  - path: scripts/lib/branch-requirements.sh
+    type: canonical
+    consumers: all
   # Paginated LIST reader (#1008) — the array twin of gh-api-scalar.sh above,
   # and the one definition of `fetch → capture → flatten` that eight review
   # sensing scripts each used to carry inline. The duplication is what
@@ -366,6 +374,17 @@ paths:
   # callers. Each caller keeps only its own failure ACTION (die 2 / die 3 /
   # return 3 / return 1), which is the part that genuinely differs.
   - path: scripts/lib/gh-api-array.sh
+    type: canonical
+    consumers: all
+  # Resolves ONE code-scanning alert's severity by its permanent number, not
+  # a ref-scoped list (#1113 — nathanjohnpayne/mergepath#1113 closed the same
+  # #1101 defect class for GHAS findings that #831/#1008 closed for Codex/
+  # CodeRabbit reads). Memoized via a FILE named by GHAS_SEVERITY_CACHE — not
+  # a plain shell variable, which every caller's own
+  # `severity=$(ghas_alert_severity ...)` command substitution would silently
+  # lose to that subshell. HARD-sourced by every consumer below: declared in
+  # each of their requires: so the lib can never ship behind its callers.
+  - path: scripts/lib/ghas-alert-severity.sh
     type: canonical
     consumers: all
   # #1058 native merge-queue boundary. These side-effect-free libraries are
@@ -397,6 +416,22 @@ paths:
   - path: tests/test_coderabbit_should_invoke.sh
     type: canonical
     consumers: all
+    requires:
+      # The test copies this script into a fixture tree and executes it, so a
+      # commit-path sync that selects only the test must carry it too
+      # (CodeRabbit, PR #1124). The classifier is NOT required here: the test
+      # builds its own temporary classifier fixtures.
+      - "scripts/coderabbit-should-invoke.sh"
+  # The ONE CommonMark fence reader (#1178). Extracted from
+  # scripts/coderabbit-severity-gate.sh once the advisory waiter needed the same
+  # answer: specs/coderabbit_review_sensing.md already required one
+  # implementation ("the first attempt did carry three copies and they were
+  # three different degrees of wrong"), while the waiter in fact carried a
+  # raw-grep copy of the range predicates that had diverged from the gate's
+  # hardened one. Both now source this.
+  - path: scripts/lib/coderabbit-fence.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
@@ -410,6 +445,12 @@ paths:
       - "scripts/lib/reviewers-helpers.sh"
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced by both fetch wrappers
+      # #1178: the ONE CommonMark fence reader. Hard-sourced, because the range
+      # predicates below it read UNFENCED text only — a consumer missing this
+      # lib would not degrade to a whole-body match, it would fail to source and
+      # exit, which is the correct direction for a predicate whose fail-open
+      # mode lets a quoted range suppress a real finding.
+      - "scripts/lib/coderabbit-fence.sh"
   # #489 CodeRabbit-rate-limit auto-merge disposition gate. agent-review.yml's
   # exit-5 (rate-limited) branch calls this script to decide whether the
   # Codex-failover path may auto-merge. Absent on a consumer it exits 127 and
@@ -437,8 +478,11 @@ paths:
     consumers: all
     # Sources scripts/lib/codex-failure-markers.sh (existence-guarded) so the
     # poll loop can short-circuit on a usage-limit / not-connected marker
-    # instead of running out the full review timeout (#722). Soft-degrades to
-    # the pre-#722 behavior if the lib is absent mid-skew.
+    # instead of running out the full review timeout (#722). That provider-
+    # marker detection soft-degrades to the pre-#722 behavior if the lib is
+    # absent mid-skew. Persisting an ordinary timeout for Phase 4b is different:
+    # the same helper is required, and its absence fails closed with exit 3
+    # rather than creating a timeout waiver (#1085).
     #
     # Shells out to scripts/workflow/codex_auto_trigger_gate.sh (also
     # existence-guarded) to decide whether an AUTOMATIC trigger may be skipped
@@ -448,9 +492,12 @@ paths:
     # travels with its only caller.
     #
     # HARD-sources scripts/lib/gh-api-scalar.sh (#799) for the post-trigger
-    # timestamp read. Unlike the two soft deps above, an absent lib exits 3:
-    # the read anchors every "newer than my trigger?" comparison in the poll
-    # loop, so degrading it silently is worse than refusing to run.
+    # timestamp read. This helper is unconditionally required; an absent lib
+    # exits 3. By contrast, the auto-trigger helper above is fully soft, while
+    # the failure-marker helper is soft only for provider-marker detection and
+    # required for ordinary-timeout persistence. The scalar read anchors every
+    # "newer than my trigger?" comparison in the poll loop, so degrading it
+    # silently is worse than refusing to run.
     requires:
       - "scripts/lib/codex-failure-markers.sh"
       - "scripts/workflow/codex_auto_trigger_gate.sh"   # #798, content-free auto-trigger gate
@@ -468,6 +515,8 @@ paths:
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/lib/gh-api-scalar.sh"   # #1113, hard-sourced by ghas-alert-severity.sh's fetch
+      - "scripts/lib/ghas-alert-severity.sh"   # #1113, GHAS severity by alert number
       - "scripts/workflow/resolve_base_policy.sh"   # #1000, governing base-branch policy
   - path: scripts/render-feedback-archive.sh
     type: canonical
@@ -480,6 +529,9 @@ paths:
     requires:
       - "scripts/lib/preflight-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1000, generation fence over all accounting surfaces
+      - "scripts/lib/feedback-policy-helpers.sh"   # #1113, alert-number extraction from comment bodies
+      - "scripts/lib/gh-api-scalar.sh"   # #1113, hard-sourced by ghas-alert-severity.sh's fetch
+      - "scripts/lib/ghas-alert-severity.sh"   # #1113, GHAS severity by alert number
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
@@ -499,6 +551,7 @@ paths:
       - "scripts/lib/reviewers-helpers.sh"   # #453, hard-sourced for the gate (b)/(c) reviewer allow-list
       - "scripts/lib/codex-failure-markers.sh"   # #722, sourced for the gate (c) usage-limit/not-connected diagnostic
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/lib/branch-requirements.sh"   # #1064, hard-sourced gate (a) required-check resolution
   # Phase 4a feedback loop (#487): records the validated 👍/👎 reaction
   # Codex solicits on each finding. WRITE path — every reaction POST goes
   # through scripts/gh-as-reviewer.sh under the reviewer identity, so the
@@ -528,6 +581,8 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/phase-4b/"
+      - "scripts/lib/codex-failure-markers.sh"   # #1085, exact-head Phase 4a timeout handoff parsed by phase-4b/lib.sh
+      - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
       - "scripts/gh-as-reviewer.sh"
       - "scripts/post-phase-4b-handoff.sh"
       # The #814 same-head barrier invokes both of these directly, by path,
@@ -580,6 +635,7 @@ paths:
     requires:
       - "scripts/lib/feedback-policy-helpers.sh"
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
+      - "scripts/lib/coderabbit-fence.sh"  # #1178, was inline here until the waiter needed it too
   # CodeRabbit disposition-verdict ledger (#584) — the DISPOSITION-ONLY twin
   # of scripts/codex-record-feedback.sh (#487). By-nature asymmetry (#574):
   # CodeRabbit does not solicit per-finding reactions, so this helper never
@@ -1128,6 +1184,18 @@ paths:
   - path: tests/test_codex_review_check_required_checks.sh
     type: canonical
     consumers: all
+  # Branch-requirement resolver behavioural suite (#1064). check_codex_scripts
+  # hard-runs it, so it must travel to every consumer or the check fails
+  # pre-flight with `No such file`. Offline: every surface is driven through a
+  # stubbed gh, so no consumer needs network or a privileged token to run it.
+  - path: tests/test_branch_requirements.sh
+    type: canonical
+    consumers: all
+    requires:
+      # The suite sources the resolver directly and exercises its real
+      # functions, so a commit-path sync that carried the test without the lib
+      # would fail the consumer lint on a missing source rather than skip.
+      - "scripts/lib/branch-requirements.sh"   # #1064, sourced under test
   # #465 fail-closed structural guards. check_codex_scripts hard-runs it.
   # Propagation-safe (skips workflows/scripts a consumer does not carry).
   - path: tests/test_465_fail_closed.sh
@@ -1594,6 +1662,13 @@ paths:
       - "scripts/codex-p1-gate.sh"
       - "scripts/render-feedback-archive.sh"   # #1000, persist edited/deleted PR-level, inline, and review-body findings
       - "scripts/review-feedback-surface-fingerprint.sh"   # #1000, reject stale publications
+      # The archive-edited-feedback job resolves a disappearing GHAS
+      # comment's severity inline (not via a script), so these three are
+      # sourced directly by the workflow's own shell steps, not only
+      # transitively through render-feedback-archive.sh's requires above.
+      - "scripts/lib/feedback-policy-helpers.sh"   # #1113, ghas_alert_number_from_body / ghas_severity_tier
+      - "scripts/lib/gh-api-scalar.sh"   # #1113, hard-sourced by ghas-alert-severity.sh's fetch
+      - "scripts/lib/ghas-alert-severity.sh"   # #1113, GHAS severity by alert number
   - path: .github/workflows/codex-feedback-archive-relay.yml
     type: canonical
     consumers: all
@@ -1694,11 +1769,14 @@ paths:
   # mergepath@<sha>, which carries its own authoritative manifest.
   # The consumer's copy would be unused — and this file enumerates the
   # full fleet inventory (every consumer repo name + facts), which there
-  # is no reason to mirror into each consumer. (It historically also
-  # avoided leaking then-private repo names to a public consumer; the
-  # fleet is uniformly public as of 2026-07-06, so that specific concern
-  # is now moot, but the file stays mergepath-only regardless.) Keep it
-  # mergepath-only. (CodeRabbit Major, #271.)
+  # is no reason to mirror into each consumer. (It also avoids leaking
+  # private repo names to a public consumer. That concern was moot while
+  # the fleet was uniformly public from 2026-07-06; it went ACTIVE on
+  # 2026-09-01 when device-source-of-truth was measured private, and it
+  # is moot again as of 2026-09-05, when that repo was dropped as a
+  # consumer and the remaining seven are all public. Do not treat either
+  # moot period as the standing state -- re-read the visibility fields.)
+  # Keep it mergepath-only. (CodeRabbit Major, #271.)
 
   # Kit directories — Mergepath-canonical files are required;
   # consumer-only additions in the same directory are allowed.
@@ -1713,6 +1791,10 @@ paths:
   - path: scripts/phase-4b/
     type: kit
     consumers: all
+    requires:
+      - "scripts/lib/codex-failure-markers.sh"   # #1085, durable timeout grammar/parser sourced by lib.sh
+      - "scripts/lib/gh-api-array.sh"   # #1008/#1085, strict paginated timeout-evidence read
+      - "scripts/lib/gh-api-scalar.sh"  # #799/#1085, shaped live-head fence before timeout consumption
     # Automated Phase 4b handoff package (#579): adapters, schema, shared
     # shell helpers, and README — plus the approval-loop accounting module
     # (#602: accounting.sh, accounting.schema.json, prices.json) rendered
@@ -1785,6 +1867,7 @@ paths:
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_codex_review_check_required_checks.sh"  # check_codex_scripts (#655)
+      - "tests/test_branch_requirements.sh"    # check_codex_scripts (#1064)
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)
       - "tests/test_655_repo_lint_local_observed.sh"  # check_codex_scripts (#655)
       - "tests/test_approval_merge_continuation.sh"  # check_auto_clear_workflow (#1062)
@@ -1895,8 +1978,10 @@ paths:
   # export is byte-identical, only the import/export syntax differs.
   #
   # device-source-of-truth was previously excluded on a false "zero
-  # lintable surface" rationale; #458 folds it into the ESM entry below
+  # lintable surface" rationale; #458 folded it into the ESM entry below
   # (React 19 + TypeScript + Vite SPA, root package.json, ~148 .ts/.tsx).
+  # It was dropped as a consumer entirely on 2026-09-05 when the repo went
+  # dormant, so it no longer appears in that entry.
   # overridebroadway carried the same false rationale; #461 folds it into
   # the CJS entry below (CJS + React 19 + TypeScript, root package.json,
   # ~81 .ts/.tsx) — the first CJS + TS consumer of the floor. The CJS
@@ -1907,7 +1992,6 @@ paths:
   #   matchline (ESM)                  → JS + TS + React + react-hooks
   #   nathanpaynedotcom (ESM)          → JS + TS + Astro
   #   tadlockpsychiatry (ESM)          → JS + TS + React + react-hooks
-  #   device-source-of-truth (ESM)     → JS + TS + React + react-hooks
   #   fiveacross (ESM)                 → JS + TS + React + react-hooks
   #   friends-and-family-billing (CJS) → JS + React + react-hooks
   #   overridebroadway (CJS)           → JS + TS + React + react-hooks
@@ -1922,7 +2006,6 @@ paths:
       - matchline
       - nathanpaynedotcom
       - tadlockpsychiatry
-      - device-source-of-truth
       - fiveacross
 
   # CJS variant — consumers without `"type": "module"` (default
@@ -2053,20 +2136,30 @@ doc_ownership:
   - path: docs/agents/operating-rules.md
     class: per-repo-owned
     note: >-
-      MIXED — the transitional debt #780 exists to split. All 9 consumer
-      copies differ from the hub and from each other; five carry large
-      repo-specific architecture, logging, and coding blocks (up to 407
-      lines in device-source-of-truth). Dominant ownership is per-repo,
-      so it stays the LOCAL OVERLAY. The shared half moved to
-      docs/agents/shared-operating-rules.md; removing the now-duplicated
-      prose from each local overlay is #780 steps 4-5 (canary first).
+      MIXED — the transitional debt #780 exists to split. Re-measured
+      2026-09-05 against hub 5aea5db, replacing an undated "all 9 / five
+      carry / up to 407 lines" claim that had gone stale: all 7 consumer
+      copies differ from the hub AND from each other (7 distinct
+      checksums, no two alike), and every one carries a repo-specific
+      architecture, logging, and coding block absent from the hub copy.
+      Those blocks run 19-304 lines; six of the seven are 80+, swipewatch
+      is the largest at 304, and fiveacross is the lone small one at 19.
+      Method (re-derivable): fetch docs/agents/operating-rules.md from
+      each `.consumers[].repo`, md5 for the distinctness claim, and
+      `diff <hub> <consumer> | grep -c '^>'` for the block size.
+      Dominant ownership is per-repo, so it stays the LOCAL OVERLAY. The
+      shared half moved to docs/agents/shared-operating-rules.md;
+      removing the now-duplicated prose from each local overlay is #780
+      steps 4-5 (canary first).
   - path: docs/agents/documentation-rules.md
     class: per-repo-owned
     note: >-
-      MIXED, and confirmed so by the fleet: all 9 consumer copies differ
-      from the hub and from each other, and every one of them is a
-      repo-specific list of which of ITS docs to update when. Stays
-      per-repo-owned. #780 step 6 extracted the prose line-wrapping rule
+      MIXED, and confirmed so by the fleet. Re-measured 2026-09-05
+      against hub 5aea5db (the prior "all 9" was undated and stale):
+      all 7 consumer copies differ from the hub AND from each other
+      (7 distinct md5s), they run 421-5763 bytes against the hub's
+      6916, and every one of them is a repo-specific list of which of
+      ITS docs to update when. Stays per-repo-owned. #780 step 6 extracted the prose line-wrapping rule
       into canonical docs/agents/prose-line-wrapping.md and left the
       allowlist + gate behind. Canonical-source discipline was
       deliberately NOT extracted: as written it names
@@ -2081,18 +2174,29 @@ doc_ownership:
       repo-specific by construction, so it stays per-repo-owned. #780
       step 6 declined to mint a canonical deploy doc and extracted the
       universal floor into shared-operating-rules.md § Secret handling
-      instead. Evidence for declining: the 9 consumer copies are 925-2814
-      bytes against the hub's 6853 and are already rewritten to each
-      repo's own deploy story; only 2 of 4 sampled carry the
+      instead. Evidence for declining, re-measured 2026-09-05 against
+      hub 5aea5db (the prior "9 copies / 925-2814 bytes / hub's 6853"
+      was undated and is now wrong in all three figures): the 7 consumer
+      copies run 925-11848 bytes against the hub's 6916, and are
+      largely rewritten to each repo's own deploy story. Two caveats the
+      old note's numbers hid. (1) They do NOT all differ from each
+      other: matchline and tadlockpsychiatry are byte-identical
+      (md5 1e2f0bae, 1358 bytes), so "rewritten per repo" is the trend,
+      not a universal. (2) fiveacross is now the fleet's LARGEST copy at
+      11848 bytes, well above the hub — the upper bound moved by 4x.
+      Also: only 2 of 4 sampled carry the
       no-downgrade invariant, in incompatible wordings ("template-derived
       repos" vs "this repo"); the surrounding procedure depends on
       op-firebase-deploy, a PATH command rather than a guaranteed repo
       file; and the one procedural rule that IS universal (the op
-      sign-in pause-and-prompt) was already canonical. Residual:
-      gaycruisebingo's copy is still byte-identical to the hub's
-      (un-scrubbed bootstrap residue asserting a hub-only workflow it
-      does not have — the #744/#747 class), a consumer-side deletion for
-      the steps 4-5 migration wave.
+      sign-in pause-and-prompt) was already canonical. Residual
+      (RESOLVED, verified 2026-09-05): the note recorded gaycruisebingo's
+      copy as byte-identical to the hub's — un-scrubbed bootstrap residue
+      of the #744/#747 class, pending a consumer-side deletion. That repo
+      was renamed fiveacross on 2026-08-27, and its copy is no longer
+      identical to the hub (11848 bytes against 6916), so the residue has
+      since been scrubbed and rewritten. No migration-wave deletion is
+      outstanding on this path.
   - path: docs/agents/repository-overview.md
     class: per-repo-owned
   - path: docs/agents/testing-requirements.md
@@ -2106,6 +2210,18 @@ doc_ownership:
       (#908), not a fleet-wide convention. Stays per-repo-owned.
 
   # ── hub-only ───────────────────────────────────────────────────────
+  - path: docs/agents/high-priority-scope-discipline.md
+    class: hub-only
+    note: >-
+      Scope-discipline rules for priority:high work. HUB-ONLY rather
+      than canonical on the shared-operating-rules.md test — that file
+      deliberately carries "only the rules proven true AND usable
+      everywhere", and this one is not yet either: it cites mergepath
+      issue numbers and this repo's review-round machinery, so a verbatim
+      consumer copy would reference issues the consumer cannot resolve.
+      Promote to canonical once the rules have been exercised on a
+      consumer and the hub-specific citations are separated from the
+      rules themselves.
   - path: docs/agents/bootstrap-runbook.md
     class: hub-only
   - path: docs/agents/propagation-ordering.md

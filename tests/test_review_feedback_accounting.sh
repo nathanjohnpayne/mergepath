@@ -48,16 +48,44 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$GH_CALL_LOG"
 
 endpoint=""
+jq_expr=""
+prev=""
 for arg in "$@"; do
+  if [ "$prev" = "--jq" ]; then
+    jq_expr="$arg"
+  fi
   case "$arg" in
     repos/*) endpoint="$arg" ;;
   esac
+  prev="$arg"
 done
 
 if [ -n "${GH_FAIL_ENDPOINT:-}" ] && [ "$endpoint" = "$GH_FAIL_ENDPOINT" ]; then
   echo "synthetic API failure for $endpoint" >&2
   exit 1
 fi
+
+# Alert-number GET (#1113): mimics real gh's client-side --jq filtering,
+# which none of the other fixture endpoints below need (they're consumed
+# by fetch_api_array, whose callers apply their own jq on the captured
+# JSON). A missing fixture file is a genuine 404 — gh_alert_severity's
+# rc=3 contract, exercised by the "fetch itself fails" test cases.
+case "$endpoint" in
+  repos/acme/widget/code-scanning/alerts/[0-9]*)
+    number="${endpoint##*/}"
+    fixture="$GH_FIXTURE_DIR/code-scanning-alert-$number.json"
+    if [ ! -f "$fixture" ]; then
+      echo "gh: Not Found (HTTP 404)" >&2
+      exit 1
+    fi
+    if [ -n "$jq_expr" ]; then
+      jq -r "$jq_expr" "$fixture"
+    else
+      cat "$fixture"
+    fi
+    exit 0
+    ;;
+esac
 
 case "$endpoint" in
   repos/acme/widget/pulls/7)
@@ -74,13 +102,6 @@ case "$endpoint" in
     ;;
   repos/acme/widget/issues/7/comments)
     cat "$GH_FIXTURE_DIR/issues.json"
-    ;;
-  repos/acme/widget/code-scanning/alerts\?ref=refs/pull/7/head)
-    if [ -f "$GH_FIXTURE_DIR/code-scanning-alerts.json" ]; then
-      cat "$GH_FIXTURE_DIR/code-scanning-alerts.json"
-    else
-      printf '[]\n'
-    fi
     ;;
   repos/acme/widget/pulls/comments/*/reactions)
     id="${endpoint#repos/acme/widget/pulls/comments/}"
@@ -117,13 +138,17 @@ reset_fixtures() {
   printf '[]\n' >"$TMP/fixtures/inline.json"
   printf '[]\n' >"$TMP/fixtures/reviews.json"
   printf '[]\n' >"$TMP/fixtures/issues.json"
-  printf '[]\n' >"$TMP/fixtures/code-scanning-alerts.json"
+  rm -f "$TMP/fixtures"/code-scanning-alert-*.json
   cat >"$TMP/fixtures/pull.json" <<'JSON'
 {
   "base": {
     "ref": "release",
     "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "repo": {"default_branch": "main"}
+    "repo": {"id": 4242, "full_name": "acme/widget", "default_branch": "main"}
+  },
+  "head": {
+    "sha": "cccccccccccccccccccccccccccccccccccccccc",
+    "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}
   }
 }
 JSON
@@ -722,6 +747,400 @@ jq '.[0].body += "\n\n```text\n✅ Confirmed as addressed by @nathanjohnpayne\n<
 mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
 run_gate
 assert_eq 1 "$RUN_RC" "unclosed fenced CodeRabbit confirmation pair is not a trusted suffix"
+
+# #1167: CodeRabbit acknowledges a disposition by editing its finding, in the
+# shapes the vendor actually emits: the finding's own footer rewritten to the
+# reply marker plus a confirmation line; reply marker, line, reply marker;
+# reply marker, line, comment footer; and any of them stacked. No shape may
+# raise the evidence floor, recognition is anchored on the footer markers
+# rather than the wording, and the revision the relay archives at that edit
+# is not a second finding.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error\n\n<!-- cr-comment:v1:0123456789abcdef -->\n\n<!-- This is an auto-generated comment by CodeRabbit -->"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:01:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-before-ack.json"
+run_gate
+assert_eq 0 "$RUN_RC" "author reply reconciles the CodeRabbit finding before any acknowledgement"
+
+# ack_edit <jq body filter> <updated_at> — apply one acknowledgement edit to the root finding.
+ack_edit() {
+  jq --arg at "$2" ".[0].updated_at = \$at | .[0].body |= ($1)" \
+    "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+  mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+}
+# Shape 1: the comment footer is rewritten to the reply marker and a line is appended.
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "footer-swap acknowledgement with the commit-naming line does not raise the evidence floor (#1167)"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-acked-once.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' "2026-08-18T21:03:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "a second acknowledgement stacked on the first keeps the finding accounted"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-acked-twice.json"
+# Shape 2: reply marker, line, reply marker, appended whole.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "bracketed acknowledgement (marker, line, marker) does not raise the evidence floor"
+# Shape 3: reply marker, login-naming line, comment footer.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated comment by CodeRabbit -->")' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "login-naming line between the reply marker and the comment footer is an acknowledgement"
+# The wording is not load-bearing.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Verified in a later commit"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "acknowledgement recognition is anchored on the footer marker, not the confirmation wording"
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅️  Addressed in commit def5678"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "a confirmation line with a variation selector and a double space is still recognised"
+# CRLF bodies.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+jq '.[0].body |= gsub("\n"; "\r\n")' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-before-ack-crlf.json"
+ack_edit '. + "\r\n\r\n<!-- This is an auto-generated reply by CodeRabbit -->\r\n\r\n✅ Addressed in commit def5678\r\n\r\n<!-- This is an auto-generated reply by CodeRabbit -->"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "a CRLF acknowledgement does not raise the evidence floor"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-acked-crlf.json"
+# Negatives: the run must end the body, and a line alone is not an acknowledgement.
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\nordinary trailing content"' "2026-08-18T21:04:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "visible content after the acknowledgement run is an ordinary edit"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n```text\nappended after the acknowledgement\n```"' "2026-08-18T21:04:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "a code fence after the acknowledgement run is an ordinary edit"
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+jq '.[0].body = "_🟡 Minor_ Clarify the error"' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n✅ Addressed in commit def5678"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "a confirmation line with no CodeRabbit footer anywhere is an ordinary edit"
+
+# The relay archives the pre-acknowledgement revision when CodeRabbit edits
+# the finding. That revision is the finding the reply already dispositioned,
+# so it must not demand an acknowledgement token of its own.
+# archive_of <body file> <comment id> — one relay record as the issues fixture.
+archive_of() {
+  local rendered
+  rendered=$("$RENDER_ARCHIVE" inline 20 'coderabbitai[bot]' '2026-08-18T21:02:00Z' "$1")
+  jq -n --arg archive "$rendered" --argjson id "$2" '[{
+    "id": $id,
+    "created_at": "2026-08-18T21:02:01Z",
+    "updated_at": "2026-08-18T21:02:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }]' >"$TMP/fixtures/issues.json"
+}
+PRE_ACK_BODY="$TMP/pre-ack-body.txt"
+jq -r '.[0].body' "$TMP/fixtures/inline-before-ack.json" >"$PRE_ACK_BODY"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+archive_of "$PRE_ACK_BODY" 8700
+run_gate
+assert_eq 0 "$RUN_RC" "an archived revision that differs from the live finding only by the footer swap and line is not a second finding (#1167)"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "acknowledgement-only archive demands no inline acknowledgement token"
+cp "$TMP/fixtures/inline-acked-twice.json" "$TMP/fixtures/inline.json"
+jq -r '.[0].body' "$TMP/fixtures/inline-acked-once.json" >"$TMP/acked-once-body.txt"
+archive_of "$TMP/acked-once-body.txt" 8701
+run_gate
+assert_eq 0 "$RUN_RC" "an archived first-acknowledgement revision collapses with the twice-acknowledged live finding"
+cp "$TMP/fixtures/inline-acked-crlf.json" "$TMP/fixtures/inline.json"
+jq -r '.[0].body' "$TMP/fixtures/inline-before-ack-crlf.json" >"$TMP/pre-ack-body-crlf.txt"
+archive_of "$TMP/pre-ack-body-crlf.txt" 8702
+run_gate
+assert_eq 0 "$RUN_RC" "a CRLF archived revision collapses with its CRLF acknowledged live finding"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+printf '%s\n\nAlso bound the retry counter.\n' "$(cat "$PRE_ACK_BODY")" >"$TMP/pre-ack-body-edited.txt"
+archive_of "$TMP/pre-ack-body-edited.txt" 8703
+run_gate
+assert_eq 1 "$RUN_RC" "an archived revision with different visible content still needs its own acknowledgement"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "content-changed archive keeps the inline-archive shape"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "the record shows the acknowledged edit changed content, so the live finding is unaccounted too"
+# A ✅ line with no CodeRabbit footer anywhere is content, in the archive
+# comparison as in the live finding: nothing collapses and the record does
+# not lower the live floor.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+jq '.[0].body = "_🟡 Minor_ Clarify the error"' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+printf '%s\n' "_🟡 Minor_ Clarify the error" >"$TMP/no-footer-body.txt"
+ack_edit '. + "\n\n✅ Addressed in commit def5678"' "2026-08-18T21:02:00Z"
+archive_of "$TMP/no-footer-body.txt" 8713
+run_gate
+assert_eq 1 "$RUN_RC" "a markerless confirmation line is content in the archive comparison too"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "neither the live finding nor its archived predecessor is cleared by a markerless line"
+# archive_version 1 records: without a body the record is inventoried as before, never a crash;
+# with a body it compares like a v2 record, and only when the body matches the record's fingerprint.
+fingerprint_of_body_file() {  # the gate's fingerprint of a body: sha256 of its JSON string, first 12 hex
+  local json
+  json=$(jq -nc --rawfile body "$1" '$body | rtrimstr("\n")')
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$json" | sha256sum | awk '{print substr($1, 1, 12)}'
+  else
+    printf '%s' "$json" | shasum -a 256 | awk '{print substr($1, 1, 12)}'
+  fi
+}
+v1_record() {  # v1_record <comment id> [body file] [fingerprint override]
+  local payload fp
+  if [ -n "${2:-}" ]; then
+    fp="${3:-$(fingerprint_of_body_file "$2")}"
+    payload=$(jq -n --rawfile body "$2" --arg fp "$fp" '{archive_version:1,source_kind:"inline",source_comment_id:20,source_login:"coderabbitai[bot]",archived_at:"2026-08-18T21:02:00Z",body_fingerprint:$fp,codex_tiers:[],coderabbit_tiers:["p2"],body:($body | rtrimstr("\n"))}')
+  else
+    payload=$(jq -n '{archive_version:1,source_kind:"inline",source_comment_id:20,source_login:"coderabbitai[bot]",archived_at:"2026-08-18T21:02:00Z",body_fingerprint:"0123456789ab",codex_tiers:[],coderabbit_tiers:["p2"]}')
+  fi
+  jq -n --arg marker "<!-- mergepath-feedback-archive:v1 $(printf '%s' "$payload" | base64 | tr -d '\n') -->" --argjson id "$1" '[{
+    "id": $id,
+    "created_at": "2026-08-18T21:02:01Z",
+    "updated_at": "2026-08-18T21:02:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $marker
+  }]' >"$TMP/fixtures/issues.json"
+}
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+v1_record 8704
+run_gate
+assert_eq 1 "$RUN_RC" "a body-less archive_version 1 record is inventoried, not a crash"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "body-less v1 record keeps the inline-archive shape"
+v1_record 8705 "$PRE_ACK_BODY"
+run_gate
+assert_eq 0 "$RUN_RC" "an archive_version 1 record carrying the pre-acknowledgement body collapses with the acknowledged live finding"
+v1_record 8705 "$PRE_ACK_BODY" "0123456789ab"
+run_gate
+assert_eq 1 "$RUN_RC" "a v1 body that does not match the record's fingerprint is ignored, so the record is inventoried"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "the mismatched v1 record keeps the inline-archive shape"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "an ignored v1 body leaves the marker-based decision on the live finding in place"
+assert_eq "(archived reviewer inline version)" "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")][0].body')" "a rejected v1 body is not reported as the archived finding text"
+
+# archive_entry <body file> <comment id> <archived_at> — one relay record as a JSON object on stdout.
+archive_entry() {
+  local rendered
+  rendered=$("$RENDER_ARCHIVE" inline 20 'coderabbitai[bot]' "$3" "$1")
+  jq -n --arg archive "$rendered" --argjson id "$2" --arg at "$3" '{
+    "id": $id, "created_at": $at, "updated_at": $at,
+    "user": {"login": "github-actions[bot]"}, "body": $archive
+  }'
+}
+# Shape 5: the footer rewritten to the reply marker with no confirmation line,
+# CodeRabbit's edit after a reply it does not confirm. With the relay's record
+# the edit is provably content-free; without it, it is an ordinary edit.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->")' "2026-08-18T21:02:00Z"
+printf '[]\n' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "a footer rewrite with no confirmation line and no archived record is an ordinary edit"
+archive_of "$PRE_ACK_BODY" 8706
+run_gate
+assert_eq 0 "$RUN_RC" "a footer rewrite with no confirmation line keeps the floor when the archived revision has the same content (#1167)"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "the archived pre-rewrite revision collapses with the rewritten live finding"
+# #1210: on a fork pull request the relay's record is fork-supplied, so it never
+# lowers a floor. The same fixture with a fork head keeps the ordinary-edit floor;
+# a head repository that is gone reads as a fork; the fetch failing exits 2.
+set_head() {  # set_head <jq expression for .head>
+  jq ".head = ($1)" "$TMP/fixtures/pull.json" >"$TMP/fixtures/pull.next"
+  mv "$TMP/fixtures/pull.next" "$TMP/fixtures/pull.json"
+}
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 9999, "full_name": "someone/widget", "fork": true}}'
+run_gate
+assert_eq 1 "$RUN_RC" "on a fork pull request an archived revision never lowers the floor (#1210)"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "the fork-supplied record leaves the rewritten live finding at its ordinary-edit floor"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": null}'
+run_gate
+assert_eq 1 "$RUN_RC" "a pull request whose head repository is gone is read as a fork"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}}'
+run_gate
+assert_eq 0 "$RUN_RC" "the same fixture with a same-repository head keeps the record-informed floor"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": true}}'
+run_gate
+assert_eq 0 "$RUN_RC" "a same-repository head on a repository that is itself a fork is not a fork pull request"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"full_name": "Someone/Widget", "fork": false}}'
+run_gate
+assert_eq 1 "$RUN_RC" "without repository ids the head is a fork when its full name differs from the base"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+archive_of "$PRE_ACK_BODY" 8715
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 9999, "full_name": "someone/widget", "fork": true}}'
+run_gate
+assert_eq 0 "$RUN_RC" "on a fork pull request the marker-based decision still stands and an acknowledgement-only archive still collapses"
+GH_FAIL_ENDPOINT="repos/acme/widget/pulls/7" run_gate
+assert_eq 2 "$RUN_RC" "a failed pull request fetch fails the gate closed"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}}'
+# A content change delivered with an acknowledgement is still an edit, and its archive still needs a token.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit 'sub("Clarify the error"; "Clarify the error and its exit code") | sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$PRE_ACK_BODY" 8707
+run_gate
+assert_eq 1 "$RUN_RC" "a content change delivered with an acknowledgement is still an edit"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "the archived pre-change revision still needs its own token"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "a reply to the old text does not stand for the rewritten live finding"
+# The same-second allowance for a confirmed reply holds only at creation: a reply
+# sharing the second of a content-changing confirmed edit may precede the rewrite.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit 'sub("Clarify the error"; "Clarify the error and its exit code") | sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne")' "2026-08-18T21:02:00Z"
+jq '. + [{"id": 22, "in_reply_to_id": 20, "created_at": "2026-08-18T21:02:00Z", "user": {"login": "nathanjohnpayne"}, "path": "scripts/a.sh", "line": 4, "body": "Fixed in def5678 with the exit code named."}]' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+archive_of "$PRE_ACK_BODY" 8714
+run_gate
+assert_eq 1 "$RUN_RC" "a same-second reply beside a content-changing confirmed edit is not evidence for the rewritten finding"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "the same-second allowance holds only at the creation floor"
+# The record-informed floor is the newest content-changing edit, not the latest edit.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+CONTENT_A="$PRE_ACK_BODY"
+jq -r '.[0].body | sub("Clarify the error"; "Clarify the error and its exit code")' "$TMP/fixtures/inline-before-ack.json" >"$TMP/content-b.txt"
+jq '.[0].body |= sub("Clarify the error"; "Clarify the error and its exit code")
+  | .[0].body |= sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->")
+  | .[0].updated_at = "2026-08-18T21:02:00Z"
+  | .[1].created_at = "2026-08-18T21:01:00Z"' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+jq -n --argjson a "$(archive_entry "$CONTENT_A" 8708 "2026-08-18T21:00:30Z")" \
+  --argjson b "$(archive_entry "$TMP/content-b.txt" 8709 "2026-08-18T21:02:00Z")" '[$a, $b]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq true "$(printf '%s' "$RUN_JSON" | jq -r '[.findings[] | select(.kind == "inline")] | .[0].accounted')" "a reply after the last content change and before a content-free rewrite is evidence for the live finding"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "only the superseded content revision still needs a token"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "the superseded content revision keeps the inline-archive shape"
+jq '.[1].created_at = "2026-08-18T21:00:10Z"' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "a reply from before the last content change is not evidence, whatever the later rewrite did"
+# A content line that starts with ✅ before the finding's own footer is content, not acknowledgement.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error\n\n✅ Also bound the retry counter to 3\n\n<!-- This is an auto-generated comment by CodeRabbit -->"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:01:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+jq -r '.[0].body' "$TMP/fixtures/inline.json" >"$TMP/check-content-body.txt"
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$TMP/check-content-body.txt" 8710
+run_gate
+assert_eq 0 "$RUN_RC" "a content line starting with ✅ before the footer is content and the acknowledgement-only archive still collapses"
+ack_edit 'sub("retry counter to 3"; "retry counter to 30 and add jitter")' "2026-08-18T21:03:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "a change to a content line starting with ✅ is a content change"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "the archive of the unchanged ✅ content line still needs its token"
+# A scan-suppressed region between the content and the run does not untrust the run.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error\n\n✅ Passed checks\n<!-- pre_merge_checks_walkthrough_start -->\nwalkthrough\n<!-- pre_merge_checks_walkthrough_end -->\n\n<!-- This is an auto-generated comment by CodeRabbit -->"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:01:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+jq -r '.[0].body' "$TMP/fixtures/inline.json" >"$TMP/suppressed-body.txt"
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$TMP/suppressed-body.txt" 8711
+run_gate
+assert_eq 0 "$RUN_RC" "a scan-suppressed region before the run leaves the acknowledgement trusted and the archive collapsed"
+# Trailing spaces are content: a Markdown hard break removed is a content change.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error  \nsecond sentence\n\n<!-- This is an auto-generated comment by CodeRabbit -->"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:01:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+jq -r '.[0].body' "$TMP/fixtures/inline.json" >"$TMP/hard-break-body.txt"
+ack_edit 'sub("error  \n"; "error\n") | sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$TMP/hard-break-body.txt" 8712
+run_gate
+assert_eq 1 "$RUN_RC" "removing a Markdown hard break is a content change, not acknowledgement noise"
+# Stacked login-naming lines: the configured identity keeps its same-second allowance whatever the line order.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "updated_at": "2026-08-18T21:03:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @outside-collaborator\n\n<!-- This is an auto-generated reply by CodeRabbit -->"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "a configured identity named by an earlier stacked confirmation keeps its same-second allowance"
 
 reset_fixtures
 cat >"$TMP/fixtures/reviews.json" <<'JSON'
@@ -1592,6 +2011,182 @@ else
   fail "feedback-surface fingerprint changes with PR-level disposition state"
 fi
 
+# #1113 item 2: a code-scanning alert's severity is a FOURTH mutable input
+# this fingerprint must cover. Before this, two evaluations straddling a
+# same-window severity retriage (or a newly-resolvable alert) would hash
+# identically even though accounting's own tier for that finding changed
+# underneath them -- a race the fingerprint exists specifically to catch.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 60,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/e.js",
+    "line": 1,
+    "body": "## CodeQL / Rule\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/60)"
+  }
+]
+JSON
+cat >"$TMP/fixtures/code-scanning-alert-60.json" <<'JSON'
+{"number": 60, "rule": {"security_severity_level": "medium"}}
+JSON
+FINGERPRINT_GHAS_BEFORE=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+
+cat >"$TMP/fixtures/code-scanning-alert-60.json" <<'JSON'
+{"number": 60, "rule": {"security_severity_level": "critical"}}
+JSON
+FINGERPRINT_GHAS_AFTER=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+if [ -n "$FINGERPRINT_GHAS_BEFORE" ] && [ "$FINGERPRINT_GHAS_BEFORE" != "$FINGERPRINT_GHAS_AFTER" ]; then
+  pass "feedback-surface fingerprint changes when a referenced alert's severity changes (#1113)"
+else
+  fail "feedback-surface fingerprint changes when a referenced alert's severity changes (#1113)"
+fi
+
+FINGERPRINT_GHAS_REPEAT=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+assert_eq "$FINGERPRINT_GHAS_AFTER" "$FINGERPRINT_GHAS_REPEAT" \
+  "feedback-surface fingerprint is stable when nothing (including alert severity) changed"
+
+# An unresolvable code-scanning alert must fail the fingerprint just as
+# loudly as the live accounting gate -- a silently stale fingerprint would
+# defeat the whole point of a before/after consistency check.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 61,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/f.js",
+    "line": 1,
+    "body": "## CodeQL / Rule\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/61)"
+  }
+]
+JSON
+set +e
+FINGERPRINT_GHAS_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_GHAS_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_GHAS_RC" "feedback-surface fingerprint fails closed on an unreadable code-scanning alert (#1113)"
+assert_match 'could not read code-scanning alert' "$FINGERPRINT_GHAS_ERROR" \
+  "feedback-surface fingerprint names the unreadable alert"
+
+# Codex review, PR #1124: a NON-GHAS comment happening to contain a
+# `/security/code-scanning/<number>` link (e.g. a human or Codex quoting a
+# link into a different repository) must not be treated as this repo's
+# own alert -- accounting itself never resolves severity for a comment
+# outside github-advanced-security[bot]'s own login, so the fingerprint
+# scanning it too would hard-fail the required check on a lookup nothing
+# else in this codebase performs. No fixture is created for alert #62
+# deliberately: if the scan incorrectly included this comment, the
+# missing fixture would 404 and the assertion below would catch it.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 63,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "nathanpayne-codex"},
+    "path": "src/g.js",
+    "line": 1,
+    "body": "See https://github.com/other-org/other-repo/security/code-scanning/62 for a similar issue in that repo."
+  }
+]
+JSON
+FINGERPRINT_UNRELATED_LINK_RC=0
+FINGERPRINT_UNRELATED_LINK=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget) || FINGERPRINT_UNRELATED_LINK_RC=$?
+assert_eq 0 "$FINGERPRINT_UNRELATED_LINK_RC" \
+  "a non-GHAS comment's unrelated alert-shaped link does not fail the fingerprint (#1124)"
+if [ -n "$FINGERPRINT_UNRELATED_LINK" ]; then
+  pass "fingerprint still produces a real hash despite the unrelated link"
+else
+  fail "fingerprint still produces a real hash despite the unrelated link"
+fi
+if grep -F 'repos/acme/widget/code-scanning/alerts/62' "$TMP/gh-calls.log" >/dev/null; then
+  fail "a non-GHAS comment's alert-shaped link is not looked up (#1124)"
+else
+  pass "a non-GHAS comment's alert-shaped link is not looked up (#1124)"
+fi
+
+# Codex P2, PR #1124: after a bot_login override the fingerprint must scan ONLY
+# the configured identity -- the one accounting inventories -- not a union with
+# the default. Unioning leaves an old default-authored comment scanned HERE and
+# nowhere else, and a single unreadable alert of its holds this required gate
+# red over input accounting ignores entirely. Flow style is deliberate: the
+# line-oriented reader could not see it at all, so this pins both findings at
+# once. Alert 900 has NO fixture, so if the default login is still scanned the
+# stub 404s and the run fails closed -- the assertion cannot pass vacuously.
+reset_fixtures
+CFG_OVERRIDE="$TMP/policy-override.yml"
+cat >"$CFG_OVERRIDE" <<'YAML'
+code_scanning: {bot_login: "custom-ghas[bot]"}
+YAML
+write_override_fixtures() {
+  jq -n '[
+    {"id":9001,"created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z",
+     "user":{"login":"github-advanced-security[bot]"},"path":"a.js","line":1,
+     "body":"## CodeQL\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/900)"},
+    {"id":9002,"created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z",
+     "user":{"login":"custom-ghas[bot]"},"path":"b.js","line":1,
+     "body":"## CodeQL\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/901)"}
+  ]' >"$TMP/fixtures/inline.json"
+  cat >"$TMP/fixtures/code-scanning-alert-901.json" <<'JSON'
+{"number":901,"rule":{"security_severity_level":"high"}}
+JSON
+}
+write_override_fixtures
+: >"$TMP/gh-calls.log"
+set +e
+env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_FIXTURE_DIR="$TMP/fixtures" \
+  GH_CALL_LOG="$TMP/gh-calls.log" CONFIG="$CFG_OVERRIDE" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget >/dev/null 2>&1
+OVERRIDE_RC=$?
+set -e
+assert_eq 0 "$OVERRIDE_RC" "an overridden GHAS login substitutes for the default (flow style parsed; Codex P2, #1124)"
+if grep -F 'code-scanning/alerts/900' "$TMP/gh-calls.log" >/dev/null; then
+  fail "the default GHAS login is no longer scanned once bot_login is overridden (#1124)"
+else
+  pass "the default GHAS login is no longer scanned once bot_login is overridden (#1124)"
+fi
+if grep -F 'code-scanning/alerts/901' "$TMP/gh-calls.log" >/dev/null; then
+  pass "the configured GHAS login IS scanned (#1124)"
+else
+  fail "the configured GHAS login IS scanned (#1124)"
+fi
+
+# The guard that makes the narrowing safe: an UNREADABLE policy is "unknown",
+# not "unset". The scan must WIDEN back to the union rather than narrow on a
+# read that never happened -- so the default-authored comment is scanned again,
+# and its missing alert fixture makes the fingerprint fail closed.
+write_override_fixtures
+: >"$TMP/gh-calls.log"
+set +e
+env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_FIXTURE_DIR="$TMP/fixtures" \
+  GH_CALL_LOG="$TMP/gh-calls.log" CONFIG="$TMP/no-such-policy.yml" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget >/dev/null 2>&1
+UNKNOWN_RC=$?
+set -e
+if grep -F 'code-scanning/alerts/900' "$TMP/gh-calls.log" >/dev/null; then
+  pass "an unreadable policy widens back to the union instead of narrowing (#1124)"
+else
+  fail "an unreadable policy widens back to the union instead of narrowing (#1124)"
+fi
+assert_eq 2 "$UNKNOWN_RC" "and the widened scan still fails closed on its unreadable alert"
+
 for caller in \
   scripts/codex-review-request.sh \
   scripts/phase-4b-review.sh \
@@ -1620,6 +2215,199 @@ else
   pass "surface fingerprint streams complete histories instead of passing them through argv"
 fi
 
+# GHAS severity must stay resolved by alert NUMBER (code-scanning/alerts/N),
+# never by a ref-scoped list -- that shape (?ref=refs/pull/{pr}/head) is
+# exactly the #1101 mechanism that couldn't see a finding raised on a
+# superseded head (#1113 item 3). A regression back to it would reopen
+# that gap silently, since every unit test above exercises the CURRENT
+# head only and would not itself catch the reintroduction.
+if grep -F 'ref=refs/pull' "$SCRIPT" >/dev/null; then
+  fail "GHAS severity resolution must not reintroduce ref-scoped list fetching (#1113)"
+else
+  pass "GHAS severity resolution stays alert-number-scoped, not ref-scoped (#1113)"
+fi
+
+# CodeRabbit, PR #1124: ghas_severity_cache_cleanup must never itself decide
+# the caller's exit status. Under `set -e`, a command inside an EXIT trap
+# that returns non-zero aborts the rest of that trap AND overrides the
+# script's real exit code with its own -- so an empty/unset
+# GHAS_SEVERITY_CACHE (the state right after a failed
+# ghas_severity_cache_init) must not make cleanup fail.
+CLEANUP_RC=0
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE=""
+  trap "ghas_severity_cache_cleanup" EXIT
+  exit 0
+' || CLEANUP_RC=$?
+assert_eq 0 "$CLEANUP_RC" "ghas_severity_cache_cleanup with an empty cache var does not override the caller's exit status (#1124)"
+
+CLEANUP_TMP_RC=0
+CLEANUP_TMP_FILE="$TMP/ghas-cleanup-check"
+: >"$CLEANUP_TMP_FILE"
+: >"$CLEANUP_TMP_FILE.tmp"
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$CLEANUP_TMP_FILE"'"
+  ghas_severity_cache_cleanup
+' || CLEANUP_TMP_RC=$?
+assert_eq 0 "$CLEANUP_TMP_RC" "ghas_severity_cache_cleanup with a set cache var succeeds"
+
+# Codex P2, PR #1124: the cache holds repository names, alert numbers and
+# security severities, so an update must never widen its mode. The old write
+# path opened a predictable `$CACHE.tmp` by redirection -- 0644 under the usual
+# 022 umask -- and renamed it over the 0600 mktemp cache.
+CACHE_MODE_OUT=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  gh_api_scalar() { printf "high"; }
+  umask 022
+  ghas_severity_cache_init
+  ghas_alert_severity acme/widget 50 >/dev/null
+  ls -l "$GHAS_SEVERITY_CACHE" | cut -c1-10
+  rm -f "$GHAS_SEVERITY_CACHE"
+' 2>/dev/null || true)
+assert_eq "-rw-------" "$CACHE_MODE_OUT" "severity cache stays 0600 after an update under a 022 umask (Codex P2, #1124)"
+
+# The false-positive guard for that fix: the update must still actually land,
+# not merely be mode-correct because it never happened.
+CACHE_VALUE_OUT=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  gh_api_scalar() { printf "high"; }
+  ghas_severity_cache_init
+  ghas_alert_severity acme/widget 50 >/dev/null
+  jq -r ".[\"acme/widget#50\"] // \"MISSING\"" "$GHAS_SEVERITY_CACHE"
+  rm -f "$GHAS_SEVERITY_CACHE"
+' 2>/dev/null || true)
+assert_eq "high" "$CACHE_VALUE_OUT" "the memoized severity is actually written to the cache (#1124)"
+
+# CodeRabbit, PR #1124 round 5: the write-failure branch's own `rm -f` must not
+# decide the caller's status either. Under `set -e` in a sourced caller a
+# genuinely failing rm (-f only silences "already gone") would abort
+# ghas_alert_severity before the WARN and before it prints $value, turning a
+# cache-write hiccup into a severity-read failure. mv and rm are stubbed to
+# fail so the write-failure branch is genuinely entered AND its cleanup fails --
+# a read-only directory would instead fail mktemp and never reach this branch.
+RM_FATAL_RC=0
+RM_FATAL_OUT=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  gh_api_scalar() { printf "high"; }
+  ghas_severity_cache_init
+  mv() { return 1; }
+  rm() { return 1; }
+  ghas_alert_severity acme/widget 50
+' 2>/dev/null) || RM_FATAL_RC=$?
+assert_eq 0 "$RM_FATAL_RC" "a failing cleanup rm in the write-failure branch does not fail the read (CodeRabbit, #1124 round 5)"
+assert_eq "high" "$RM_FATAL_OUT" "the correctly-resolved severity is still returned when the cache update cannot be committed"
+
+# And cleanup must still sweep a randomized update file a killed process left.
+CACHE_SWEEP_FILE="$TMP/ghas-sweep-cache"
+: >"$CACHE_SWEEP_FILE"
+: >"$CACHE_SWEEP_FILE.update.ABC123"
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$CACHE_SWEEP_FILE"'"
+  ghas_severity_cache_cleanup
+' || true
+if [ -f "$CACHE_SWEEP_FILE.update.ABC123" ]; then
+  fail "ghas_severity_cache_cleanup sweeps a leftover randomized .update file (Codex P2, #1124)"
+else
+  pass "ghas_severity_cache_cleanup sweeps a leftover randomized .update file (Codex P2, #1124)"
+fi
+
+# Codex P1, PR #1124: codex-p1-gate.yml must not extract an alert number or
+# perform the privileged security-events read from a commenter-controlled body
+# before confirming the source is a configured-GHAS INLINE comment. Asserted
+# structurally, because the vulnerable ordering is the bug: extraction textually
+# preceding the author guard is exactly what let a non-GHAS commenter plant a
+# guessed alert URL and have Actions resolve it.
+P1_GATE_WF="$ROOT/.github/workflows/codex-p1-gate.yml"
+GUARD_LINE=$(grep -n 'if \[ "\$source_kind" = "inline" \] && \[ "\$source_login" = "\$ghas_bot_login" \]; then' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+EXTRACT_LINE=$(grep -n 'alert_number=\$(ghas_alert_number_from_body' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+LOOKUP_LINE=$(grep -n 'ghas_severity=\$(ghas_alert_severity "\$REPO" "\$alert_number")' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+if [ -n "$GUARD_LINE" ] && [ -n "$EXTRACT_LINE" ] && [ -n "$LOOKUP_LINE" ] \
+   && [ "$GUARD_LINE" -lt "$EXTRACT_LINE" ] && [ "$GUARD_LINE" -lt "$LOOKUP_LINE" ]; then
+  pass "codex-p1-gate.yml gates alert extraction and the privileged read on a GHAS inline source (Codex P1, #1124)"
+else
+  fail "codex-p1-gate.yml gates alert extraction and the privileged read on a GHAS inline source (Codex P1, #1124) — guard=$GUARD_LINE extract=$EXTRACT_LINE lookup=$LOOKUP_LINE"
+fi
+if [ -f "$CLEANUP_TMP_FILE" ] || [ -f "$CLEANUP_TMP_FILE.tmp" ]; then
+  fail "ghas_severity_cache_cleanup removes both the cache file and its .tmp sibling (#1124)"
+else
+  pass "ghas_severity_cache_cleanup removes both the cache file and its .tmp sibling (#1124)"
+fi
+
+# CodeRabbit round 2, PR #1124: a genuinely FAILING `rm -f` (not just an
+# empty cache var) inside the EXIT trap must also not override the
+# caller's exit status -- the same class of bug one line down from the
+# one just fixed above. Shadows `rm` to fail unconditionally, matching
+# CodeRabbit's own PoC.
+CLEANUP_RM_FAIL_RC=0
+bash -c '
+  set -euo pipefail
+  rm() { return 1; }
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$TMP"'/ghas-cleanup-rm-fail"
+  : >"$GHAS_SEVERITY_CACHE"
+  trap "ghas_severity_cache_cleanup" EXIT
+  exit 0
+' || CLEANUP_RM_FAIL_RC=$?
+assert_eq 0 "$CLEANUP_RM_FAIL_RC" "ghas_severity_cache_cleanup survives a genuinely failing rm without overriding the caller's exit status (#1124 round 2)"
+
+# CodeRabbit round 2, PR #1124: this library is sourced by scripts that run
+# under `set -u`. Calling ghas_alert_severity with too few arguments must
+# hit the documented rc=3 usage error, not an unbound-variable abort from
+# `local repo="$1"` evaluating a $1 that was never passed.
+ARGCOUNT_RC=0
+ARGCOUNT_ERR=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  ghas_alert_severity
+' 2>&1) || ARGCOUNT_RC=$?
+assert_eq 3 "$ARGCOUNT_RC" "ghas_alert_severity with zero arguments returns rc=3, not an unbound-variable abort (#1124 round 2)"
+assert_match 'usage: ghas_alert_severity' "$ARGCOUNT_ERR" "missing-argument error names correct usage"
+
+ARGCOUNT_ONE_RC=0
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  ghas_alert_severity acme/widget
+' >/dev/null 2>&1 || ARGCOUNT_ONE_RC=$?
+assert_eq 3 "$ARGCOUNT_ONE_RC" "ghas_alert_severity with only one argument returns rc=3, not an unbound-variable abort (#1124 round 2)"
+
+# CodeRabbit round 2, PR #1124: a failed cache COMMIT (jq or mv failing) must
+# not be folded into the "could not read" rc=3 contract -- the read already
+# succeeded and the correct value must still be returned. `mv` is shadowed
+# to fail deterministically rather than relying on chmod-based permission
+# enforcement (Codex review round 2, PR #1124: running this suite as root,
+# as many containerized dev/CI environments do, lets root write through a
+# 0500 directory, so the intended failure never occurred and this
+# assertion flaked green-when-it-should-fail).
+COMMIT_FAIL_DIR="$TMP/ghas-commit-fail-dir"
+mkdir -p "$COMMIT_FAIL_DIR"
+printf '{}' >"$COMMIT_FAIL_DIR/cache"
+COMMIT_FAIL_RC=0
+COMMIT_FAIL_OUT=$(bash -c '
+  set -euo pipefail
+  mv() { return 1; }
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  gh_api_scalar() { printf "high"; }
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$COMMIT_FAIL_DIR"'/cache"
+  ghas_alert_severity acme/widget 99
+' 2>"$TMP/commit-fail-stderr.txt") || COMMIT_FAIL_RC=$?
+assert_eq 0 "$COMMIT_FAIL_RC" "a failed cache commit does not fail the read (#1124 round 2)"
+assert_eq high "$COMMIT_FAIL_OUT" "a failed cache commit still returns the correctly-resolved severity"
+assert_match 'WARN.*could not write severity cache' "$(cat "$TMP/commit-fail-stderr.txt")" "a failed cache commit is not silent"
+
 # --- github-advanced-security / code scanning (#1101) ----------------------
 #
 # Before #1101, a github-advanced-security[bot] inline comment (the form
@@ -1627,6 +2415,11 @@ fi
 # even counted in `posted` — so a real finding could ride through repeated
 # "fully accounted" rounds unread (observed on nathanpaynedotcom#809).
 
+# Severity is resolved BY ALERT NUMBER (a direct
+# code-scanning/alerts/{number} GET), not by a ref-scoped list (#1113) --
+# see scripts/lib/ghas-alert-severity.sh for why. A missing fixture file
+# for a referenced number is therefore a genuine 404 in this harness, same
+# as a real unreadable alert.
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [
@@ -1641,39 +2434,48 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
   }
 ]
 JSON
+
+# A FAILED alert read (no fixture -> 404) is a hard infrastructure
+# failure, not a silent p2 downgrade -- unlike "no severity data", it
+# must not look like a confident low-severity verdict. This is the
+# #1113 redesign's deliberate asymmetry: a systemic security-events
+# permission gap (Codex's #1106 finding) must surface loudly here too.
+run_gate
+assert_eq 2 "$RUN_RC" "a failed alert read is an infrastructure error, not a p2 downgrade (#1113)"
+
+if grep -F 'repos/acme/widget/code-scanning/alerts/25' "$TMP/gh-calls.log" >/dev/null; then
+  pass "a CodeQL comment on the PR triggers the code-scanning alert-by-number lookup"
+else
+  fail "a CodeQL comment on the PR triggers the code-scanning alert-by-number lookup"
+fi
+
+# Alert successfully read, but its rule carries no security_severity_level
+# (a non-security CodeQL quality query) -- THIS is the legitimate p2
+# fallback, distinct from a failed read above.
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {}}
+JSON
 run_gate
 assert_eq 1 "$RUN_RC" "undispositioned CodeQL finding blocks (#1101)"
 assert_eq unaccounted "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "CodeQL miss emits unaccounted status"
 assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "CodeQL finding contributes to posted count"
 assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "CodeQL finding is inventoried under its bot login"
-assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "unresolvable severity (no matching alert) falls back to p2, not dropped"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "alert with no assigned severity falls back to p2, not dropped"
 
-if grep -F 'repos/acme/widget/code-scanning/alerts' "$TMP/gh-calls.log" >/dev/null; then
-  pass "a CodeQL comment on the PR triggers the code-scanning/alerts lookup"
-else
-  fail "a CodeQL comment on the PR triggers the code-scanning/alerts lookup"
-fi
-
-cat >"$TMP/fixtures/code-scanning-alerts.json" <<'JSON'
-[
-  {"number": 25, "rule": {"security_severity_level": "medium"}}
-]
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {"security_severity_level": "medium"}}
 JSON
 run_gate
 assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "medium security_severity_level maps to p2"
 
-cat >"$TMP/fixtures/code-scanning-alerts.json" <<'JSON'
-[
-  {"number": 25, "rule": {"security_severity_level": "critical"}}
-]
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {"security_severity_level": "critical"}}
 JSON
 run_gate
 assert_eq p0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "critical security_severity_level maps to p0"
 
-cat >"$TMP/fixtures/code-scanning-alerts.json" <<'JSON'
-[
-  {"number": 25, "rule": {"security_severity_level": "high"}}
-]
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {"security_severity_level": "high"}}
 JSON
 cat >"$TMP/fixtures/inline-with-reply.json" <<'JSON'
 [
@@ -1705,8 +2507,8 @@ assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "high secu
 assert_eq thread-reply "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "CodeQL reply evidence is visible"
 
 # feedback_policy tiers apply uniformly across reviewers: a repo that
-# marks p2 `ignore` must drop an unresolvable-severity CodeQL finding
-# from inventory exactly as it would a CodeRabbit or Codex one.
+# marks p2 `ignore` must drop a no-severity CodeQL finding from inventory
+# exactly as it would a CodeRabbit or Codex one.
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
 [
@@ -1721,6 +2523,9 @@ cat >"$TMP/fixtures/inline.json" <<'JSON'
   }
 ]
 JSON
+cat >"$TMP/fixtures/code-scanning-alert-99.json" <<'JSON'
+{"number": 99, "rule": {}}
+JSON
 cp "$TMP/review-policy.yml" "$TMP/review-policy.ignore-p2.yml"
 cat >>"$TMP/review-policy.yml" <<'YAML'
 feedback_policy:
@@ -1729,7 +2534,7 @@ feedback_policy:
     p2: ignore
 YAML
 run_gate
-assert_eq 0 "$RUN_RC" "feedback_policy p2:ignore excludes an unresolvable-severity CodeQL finding"
+assert_eq 0 "$RUN_RC" "feedback_policy p2:ignore excludes a no-severity CodeQL finding"
 assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "ignored CodeQL tier contributes nothing to posted count"
 mv "$TMP/review-policy.ignore-p2.yml" "$TMP/review-policy.yml"
 
@@ -1766,6 +2571,168 @@ JSON
 run_gate
 assert_eq 1 "$RUN_RC" "CodeQL comment with no alert link still blocks (does not abort)"
 assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "no parseable alert link falls back to p2"
+
+# --- GHAS archive coverage (#1113 item 1) -----------------------------------
+#
+# Before #1113, render-feedback-archive.sh recognized only Codex/CodeRabbit
+# body-text markers, so an edited/deleted github-advanced-security[bot]
+# inline comment left NO history record at all -- the finding vanished from
+# accounting exactly like the pre-#1101 defect this whole mechanism exists
+# to close, just for GHAS instead of Codex/CodeRabbit. The calling workflow
+# (codex-p1-gate.yml) now resolves the alert's severity BEFORE the comment
+# disappears and hands it to render-feedback-archive.sh as an explicit
+# GHAS_TIER argument, which validate_archive_payload accepts as the
+# optional `ghas_tiers` array.
+reset_fixtures
+PREVIOUS_GHAS="$TMP/previous-ghas.txt"
+cat >"$PREVIOUS_GHAS" <<'EOF'
+## CodeQL / Hardcoded credential
+
+This stores a credential directly in source.
+
+[Show more details](https://github.com/acme/widget/security/code-scanning/50)
+EOF
+GHAS_ARCHIVE=$("$RENDER_ARCHIVE" inline 8600 'github-advanced-security[bot]' \
+  '2026-08-26T22:00:00Z' "$PREVIOUS_GHAS" p1)
+jq -n --arg archive "$GHAS_ARCHIVE" '[{
+  "id": 8601,
+  "created_at": "2026-08-26T22:00:01Z",
+  "updated_at": "2026-08-26T22:00:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "deleted GHAS inline finding remains in the accounting inventory (#1113)"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "archived GHAS finding retains inline source kind"
+assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "archived GHAS finding is inventoried under its bot login"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "archived GHAS finding preserves the workflow-resolved tier"
+GHAS_ARCHIVE_ACK=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
+assert_match '^\[mergepath-inline-ack: 8600 [0-9a-f]{12}\]$' "$GHAS_ARCHIVE_ACK" "archived GHAS finding gets a content-pinned acknowledgement path"
+
+jq --arg token "$GHAS_ARCHIVE_ACK" '. + [{
+  "id": 8602,
+  "created_at": "2026-08-26T22:05:00Z",
+  "updated_at": "2026-08-26T22:05:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nRemoved the hardcoded credential in commit def5678.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-deletion acknowledgement reconciles the archived GHAS finding"
+assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "acknowledged archived GHAS finding clears the gate"
+
+# render-feedback-archive.sh itself stays a pure function of its
+# arguments: with NO GHAS_TIER passed at all (the pre-#1113 call shape,
+# or any future caller that genuinely has nothing to report), a body
+# with no other classifiable marker still emits no record -- the
+# "markerless edits have nothing to preserve" contract every other
+# reviewer already gets.
+#
+# codex-p1-gate.yml's archive job itself, however, does NOT leave
+# GHAS_TIER empty for this exact body+login combination (Codex review,
+# PR #1124): live accounting's ghas_finding_tier ALSO falls back to p2
+# when a GHAS-authored comment has no parseable alert link -- unlike a
+# Codex/CodeRabbit body with no marker at all, which was never a
+# "finding" even while live, a linkless GHAS comment IS still tracked as
+# p2 today. The workflow resolves this by checking source_login == the
+# well-known default GHAS bot login when alert_number extraction fails,
+# and passes p2 explicitly -- asserted below by exercising the render
+# script exactly as that workflow branch now calls it, not as a bare
+# no-argument invocation.
+reset_fixtures
+PREVIOUS_GHAS_NO_LINK="$TMP/previous-ghas-no-link.txt"
+cat >"$PREVIOUS_GHAS_NO_LINK" <<'EOF'
+## CodeQL / Some rule
+
+No alert link in this body at all.
+EOF
+GHAS_ARCHIVE_NO_LINK=$("$RENDER_ARCHIVE" inline 8610 'github-advanced-security[bot]' \
+  '2026-08-26T22:10:00Z' "$PREVIOUS_GHAS_NO_LINK")
+assert_eq "" "$GHAS_ARCHIVE_NO_LINK" "render-feedback-archive.sh with no GHAS_TIER argument emits no archive record (pure-function contract)"
+
+GHAS_ARCHIVE_NO_LINK_WORKFLOW_SHAPE=$("$RENDER_ARCHIVE" inline 8611 'github-advanced-security[bot]' \
+  '2026-08-26T22:11:00Z' "$PREVIOUS_GHAS_NO_LINK" p2)
+jq -n --arg archive "$GHAS_ARCHIVE_NO_LINK_WORKFLOW_SHAPE" '[{
+  "id": 8612,
+  "created_at": "2026-08-26T22:11:01Z",
+  "updated_at": "2026-08-26T22:11:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "codex-p1-gate.yml's GHAS-login p2 fallback preserves a linkless GHAS finding across archival (#1124)"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the workflow-shaped archive record carries the p2 fallback tier"
+assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "the workflow-shaped archive record stays bound to the GHAS bot login"
+
+# Codex review, PR #1124: codex-p1-gate.yml archives a FAILED severity
+# read (network/rate-limit) at p1, not p2 -- distinct from the p2 branch
+# above, which is a successful read that simply found no assigned
+# severity. A repo with feedback_policy.priorities.p2: ignore would
+# otherwise have strongest_nonignored_archive_tier drop an originally
+# p0/p1 finding from inventory entirely just because its severity read
+# failed at the moment of archival, not because anyone reviewed it.
+reset_fixtures
+PREVIOUS_GHAS_READ_FAILED="$TMP/previous-ghas-read-failed.txt"
+cat >"$PREVIOUS_GHAS_READ_FAILED" <<'EOF'
+## CodeQL / Some rule
+
+[Show more details](https://github.com/acme/widget/security/code-scanning/70)
+EOF
+GHAS_ARCHIVE_READ_FAILED=$("$RENDER_ARCHIVE" inline 8620 'github-advanced-security[bot]' \
+  '2026-08-26T22:20:00Z' "$PREVIOUS_GHAS_READ_FAILED" p1)
+jq -n --arg archive "$GHAS_ARCHIVE_READ_FAILED" '[{
+  "id": 8621,
+  "created_at": "2026-08-26T22:20:01Z",
+  "updated_at": "2026-08-26T22:20:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+cp "$TMP/review-policy.yml" "$TMP/review-policy.ignore-p2-archive.yml"
+cat >>"$TMP/review-policy.yml" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p2: ignore
+YAML
+run_gate
+assert_eq 1 "$RUN_RC" "a failed archive-time severity read at p1 survives a p2:ignore policy (#1124)"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the failed-read archive record carries p1, not p2"
+mv "$TMP/review-policy.ignore-p2-archive.yml" "$TMP/review-policy.yml"
+
+# Two comments linking the SAME alert number must fetch it only ONCE
+# (scripts/lib/ghas-alert-severity.sh's GHAS_SEVERITY_CACHE) -- without
+# memoization a PR with several comments on one finding would re-read the
+# same alert per comment, needlessly spending the reviewer PAT's rate
+# limit budget.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 30,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/c.js",
+    "line": 1,
+    "body": "## CodeQL / Rule one\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/40)"
+  },
+  {
+    "id": 31,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:50:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/d.js",
+    "line": 1,
+    "body": "## CodeQL / Rule one, again\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/40)"
+  }
+]
+JSON
+cat >"$TMP/fixtures/code-scanning-alert-40.json" <<'JSON'
+{"number": 40, "rule": {"security_severity_level": "high"}}
+JSON
+run_gate
+CALLS=$(grep -cF 'repos/acme/widget/code-scanning/alerts/40' "$TMP/gh-calls.log" || true)
+assert_eq 1 "$CALLS" "same alert number referenced by two comments is fetched only once (memoized)"
 
 if [ "$FAIL" -ne 0 ]; then
   printf 'review-feedback-accounting: FAIL (%s failed, %s passed)\n' "$FAIL" "$PASS" >&2

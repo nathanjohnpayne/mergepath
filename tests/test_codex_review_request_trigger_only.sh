@@ -126,6 +126,8 @@ test_fresh_posts_once_no_poll() {
   [ "$(trig_count "$dir")" = "1" ] || fail "A: expected exactly 1 @codex post (no ack-retry), got $(trig_count "$dir")"
   [ "$(jqf "$dir" '.trigger_only')" = "true" ] || fail "A: trigger_only=$(jqf "$dir" '.trigger_only'), expected true"
   [ "$(jqf "$dir" '.trigger_posted')" = "true" ] || fail "A: trigger_posted=$(jqf "$dir" '.trigger_posted'), expected true"
+  jq -e 'has("terminal_determination") and (.terminal_determination == null)' "$dir/out.json" >/dev/null \
+    || fail "A: terminal_determination must be present and null"
   [ "$(jqf "$dir" '.rounds_waited_seconds')" = "0" ] || fail "A: rounds_waited_seconds=$(jqf "$dir" '.rounds_waited_seconds'), expected 0 (no poll)"
   [ "$FAIL" -ne "$before" ] || pass "A: fresh HEAD posts one @codex trigger, exits 0 without polling/ack-retry"
 }

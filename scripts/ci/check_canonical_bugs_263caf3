@@ -914,7 +914,43 @@ case "$1" in
         # the annex-scan branch that matters here -- an empty list is a
         # harmless, honest stand-in.
         repos/nathanjohnpayne/mergepath/pulls/99999/files) printf '[]\n' ;;
-        *) printf 'unexpected paginated endpoint: %s\n' "${1:-}" >&2; exit 9 ;;
+        # #1064 (landed in #1176), stub gap closed in #1180. gate (a) used to
+        # read the admin-only REST endpoint
+        # `branches/main/protection/required_status_checks`, which this stub
+        # answered with a bare `exit 1` further below; that arm is gone with
+        # the read. scripts/lib/branch-requirements.sh now unions TWO surfaces
+        # a plain write-scoped token can actually see, and BOTH must answer or
+        # the resolver reports `unknown` — which makes gate (a) fail closed on
+        # an unresolved requirement list before any Bug 4 assertion is reached.
+        # Surface 1 is the GraphQL refUpdateRule read handled in the `graphql`
+        # arm above; these two are surface 2.
+        #
+        # A literal `[]` page, NOT silence. `gh api --paginate` exiting 0 having
+        # emitted nothing is an anomalous empty 2xx, and br_required_checks
+        # rejects it by design ("rules/branches returned no pages at all")
+        # rather than reading it as "nothing is required" — so a `cat
+        # /dev/null`-style stub would reintroduce the same fail-closed verdict
+        # this arm exists to prevent.
+        #
+        # `rulesets` is the completeness probe, not a second requirement source:
+        # `rules/branches` returns only the rules enforced on the REQUESTING
+        # identity, so the resolver proves nothing was hidden from it by
+        # checking that no active ruleset carries bypass actors. An empty
+        # inventory proves that trivially — there are no rulesets to hide
+        # anything — and keeps this fixture free of ruleset bookkeeping it does
+        # not exercise.
+        repos/nathanjohnpayne/mergepath/rules/branches/main) printf '[]\n' ;;
+        repos/nathanjohnpayne/mergepath/rulesets) printf '[]\n' ;;
+        *)
+          # An endpoint this stub does not model is a FIXTURE GAP, not an API
+          # fault — but the caller cannot tell them apart, and gate (a) reports
+          # an unreadable rule surface as "an API or network fault, usually
+          # transient". That reframing is what made #1180 take three red `main`
+          # runs to diagnose. Say it plainly here, where the truth is known.
+          printf 'FIXTURE GAP: this gh stub does not model paginated endpoint: %s\n' "${1:-}" >&2
+          printf '  NOT an API failure. Add the endpoint to the case above (scripts/ci/check_canonical_bugs_263caf3).\n' >&2
+          exit 9
+          ;;
       esac
       exit 0
     fi
@@ -932,9 +968,13 @@ JSON
           printf '{"commit":{"committer":{"date":"2026-05-21T11:30:00Z"}}}\n'
         fi
         ;;
-      repos/nathanjohnpayne/mergepath/branches/main/protection/required_status_checks)
-        exit 1
-        ;;
+      # NOTE (#1064/#1176): the arm that used to sit here answered
+      # `branches/main/protection/required_status_checks` with `exit 1`. gate
+      # (a) no longer makes that read — the endpoint needs Administration:read
+      # and answers 404 for every token the fleet runs under, which is the
+      # conflation #1064 removed. tests/test_codex_review_check_required_checks.sh
+      # asserts the script never reaches for it again. Do not re-add it; the
+      # replacement surfaces are in the paginated case above.
       repos/nathanjohnpayne/mergepath/contents/.github/workflows/repo_lint_local.yml?ref=headsha)
         # #655: this fixture repo carries no repo_lint_local.yml annex --
         # simulate the real gh CLI's 404 shape (a genuine "Not Found" HTTP
@@ -950,11 +990,36 @@ JSON
         exit 1
         ;;
       graphql)
-        # #655 round 13: codex-review-check.sh's statusCheckRollup fetch
-        # switched from `gh pr view --json statusCheckRollup` (the now-dead
-        # `pr view` stub below) to a paginated `gh api graphql` query, to
-        # fix a real bug where a PR with more than 100 status contexts
-        # silently hid every entry past the first page. These Bug 4
+        # TWO different GraphQL queries reach this arm, and they must not
+        # share a response.
+        #
+        # Query 1 — classic branch protection (#1064, landed in #1176).
+        # gate (a) resolves its required-check list through
+        # scripts/lib/branch-requirements.sh, whose first surface is a
+        # GraphQL read of repository.ref(qualifiedName:).refUpdateRule.
+        # `qualifiedName` appears in no other query this fixture provokes,
+        # so its presence anywhere in the argv is the discriminator.
+        #
+        # `ref` non-null carrying `refUpdateRule: null` is the honest shape
+        # for this fixture repo: the ref was OBSERVED (so the surface really
+        # was read) and carries no classic protection rule. A null `ref`
+        # would mean nothing was learned, which br_required_checks correctly
+        # records as an UNREAD surface — and an unread surface resolves to
+        # `unknown`, which makes gate (a) fail closed on an unresolved
+        # requirement list. That is the #1180 failure, not a Bug 4 assertion.
+        for gql_arg in "$@"; do
+          case "$gql_arg" in
+            *qualifiedName*)
+              printf '{"data":{"repository":{"ref":{"refUpdateRule":null}}}}\n'
+              exit 0
+              ;;
+          esac
+        done
+        # Query 2 — #655 round 13: codex-review-check.sh's statusCheckRollup
+        # fetch switched from `gh pr view --json statusCheckRollup` (the
+        # now-dead `pr view` stub below) to a paginated `gh api graphql`
+        # query, to fix a real bug where a PR with more than 100 status
+        # contexts silently hid every entry past the first page. These Bug 4
         # fixtures exercise Codex bot clearance (gate c), not CI-check
         # status (gate a), so an empty, single-page rollup preserves the
         # same "zero reported checks" shape the old stub returned.

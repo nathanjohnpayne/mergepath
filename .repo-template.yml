@@ -16,6 +16,8 @@ spec_test_map:
     - tests/test_mergepath_playground.sh
   bootstrap_consumer_identity:
     - tests/test_bootstrap_template_mirror.sh
+  bootstrap_source_attribution:
+    - tests/test_bootstrap_template_mirror.sh
   coderabbit_review_sensing:
     - tests/test_coderabbit_wait_status_probe.sh
     - tests/test_phase_4b_automation.sh
@@ -43,6 +45,12 @@ spec_test_map:
     - tests/test_655_repo_lint_local_observed.sh
   merge_group_required_checks:
     - scripts/ci/check_merge_group_required_checks
+  bootstrap_label_seeding:
+    # Covered by the stage's own suite rather than a spec-named file. The
+    # format, the fail-closed guard and the warning-record behaviour are all
+    # asserted against the real bootstrap::_seed_labels there, driven through
+    # the gh shim, so a separate file would duplicate the whole harness.
+    - tests/test_bootstrap_github_infra.sh
   # The publisher's fence and fixtures live in the merge-clearance suite
   # (Test 25) rather than a file of their own: a new tests/ file wired into
   # a propagated scripts/ci/check_* needs its own manifest requires: entry,

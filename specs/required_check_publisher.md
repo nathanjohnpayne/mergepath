@@ -18,7 +18,7 @@ The exception is stated rather than smoothed over because it carries a real resi
 
 **Not pinned, and tracked in [#977](https://github.com/nathanjohnpayne/mergepath/issues/977):** every property whose subject is the shell inside a `run:` body — which step opens the hold and whether it iterates all three contexts and POSTs; the count of `conclusion="success"` assignments; the read-then-write ordering of the freshness read and the head revalidation against the verdict POST — plus a job natively named for a required context, because `name:` may carry a `${{ }}` expression Actions evaluates and this fence cannot. Four review rounds on the introducing PR (#974) each found a *new spelling* of the same hole in the text-matching versions of these, which is the #849 non-termination signature; they return on a parsed shell AST rather than as a sixth regex. **Also not pinned, tracked in [#976](https://github.com/nathanjohnpayne/mergepath/issues/976):** the dataflow residual described under *Head binding*.
 
-Stage A ships the publisher under shadow context names that are not in branch protection, so nothing it publishes can affect a merge. That is the window in which these are safe to close properly rather than quickly.
+Stage A shipped the publisher under shadow context names that were not in branch protection, so nothing it published could affect a merge. Stage B promotes only the three context-name values; the structural fence remains name-agnostic, and the disclosed semantic residuals stay tracked in #976 and #977 rather than being smuggled into the promotion.
 
 Nothing here describes the **native** lineage — the check run Actions materialises for each job. That lineage is retained deliberately and is out of the publisher's reach; see *Two lineages*.
 
@@ -90,9 +90,9 @@ Everything else fails toward *pending*. A stuck pending is an availability cost 
 
 ## Staging
 
-Stage A ships the publisher under **shadow** context names, which are not in branch protection, so nothing it publishes can affect a merge while the trigger shape, head binding, PR resolution and rc mapping are rehearsed against production traffic. The three `env:` values are the single flip point for the live names. The fence is name-agnostic by construction: it pins the *shape*, so it does not have to change at the flip.
+Stage A shipped the publisher under **shadow** context names, which were not in branch protection, and rehearsed the trigger shape, head binding, PR resolution and rc mapping against production traffic. Stage B changes exactly the three `env:` values to the live required-context strings while retaining the native producers as independent fallbacks. The structural fence is name-agnostic by construction: it pins the *shape*, so it does not change at the flip; the fixture suite separately pins the current live names so a shadow suffix or other identity drift cannot return unnoticed.
 
-The publisher's introducing PR cannot exercise it — a `workflow_run` workflow runs the default branch's definition — which is why the fence, the fixtures and this specification substitute for in-vivo validation on the introducing diff, and why the shadow stage exists to answer the remaining live questions afterwards.
+The publisher's introducing PR could not exercise it — a `workflow_run` workflow runs the default branch's definition — which is why the fence, the fixtures and this specification substituted for in-vivo validation on the introducing diff, and why Stage A used shadow names before the live promotion. Stage B still requires its own post-merge observation period before any producer-removal stage.
 
 ## Propagation posture
 
