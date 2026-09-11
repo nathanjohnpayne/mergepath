@@ -405,6 +405,38 @@ else
   fi
 fi
 
+# CodeRabbit + Codex on #1229: the first-delivery degrade must NOT leave
+# ghas_tier empty for a GHAS source. render-feedback-archive.sh treats a body
+# carrying no text marker and no tier as "markerless edits have nothing to
+# preserve" and exits 0 having emitted NOTHING -- so the one-shot previous body
+# of a P0/P1 security finding disappears silently, which is worse than the
+# deadlock the degrade replaces. Pin the renderer property itself, since it is
+# the reason the fallback exists, then assert the caller supplies the fallback.
+if [ ! -x "$ROOT/scripts/render-feedback-archive.sh" ]; then
+  echo "SKIP: D12 markerless GHAS drop (#1221) (renderer absent)"; SKIP=$((SKIP + 1))
+else
+  G1221_GDIR="$(mktemp -d "${TMPDIR:-/tmp}/d12-ghas.XXXXXX")"
+  printf 'See https://github.com/o/r/security/code-scanning/42 for details.\n' > "$G1221_GDIR/body.md"
+  g1221_records() {  # <tier> -> record count
+    "$ROOT/scripts/render-feedback-archive.sh" inline 12345 'github-advanced-security[bot]' \
+      '2026-09-11T00:00:00Z' "$G1221_GDIR/body.md" "$1" 2>/dev/null | grep -c . || true
+  }
+  if [ "$(g1221_records '')" = "0" ] && [ "$(g1221_records p1)" -ge 1 ]; then
+    pass "D12: a link-only GHAS body is dropped as markerless at an empty tier and preserved at p1 -- the reason the degrade must not pass an empty tier (#1221)"
+  else
+    fail "D12: renderer no longer distinguishes empty vs p1 for a link-only GHAS body; the #1221 fallback rationale needs re-checking (empty=$(g1221_records ''), p1=$(g1221_records p1))"
+  fi
+  rm -rf "$G1221_GDIR"
+fi
+if [ ! -f "$W/codex-p1-gate.yml" ]; then
+  echo "SKIP: D12 GHAS first-delivery fallback (#1221) ($W/codex-p1-gate.yml absent)"; SKIP=$((SKIP + 1))
+elif grep -Fq 'ghas_tier=p1' "$W/codex-p1-gate.yml" \
+     && awk '/^ *elif \[ "\$source_kind" = "inline" \] && \[ "\$source_login" = "\$ghas_bot_login" \]; then/ { found = 1 } END { exit (found ? 0 : 1) }' "$W/codex-p1-gate.yml"; then
+  pass "D12: the first-delivery degrade assigns a conservative tier for a GHAS source rather than an empty one (#1221)"
+else
+  fail "D12: the first-delivery degrade leaves ghas_tier empty for a GHAS source -- a link-only body would be dropped as markerless (#1221)"
+fi
+
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1

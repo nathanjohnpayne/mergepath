@@ -380,6 +380,24 @@ jobs:
                 # narrower shape.
                 ghas_tier=p2
               fi
+            elif [ "$source_kind" = "inline" ] && [ "$source_login" = "$ghas_bot_login" ]; then
+              # #1221, CodeRabbit + Codex: a GHAS body whose only content is
+              # its alert link carries no text marker, so with an EMPTY tier
+              # render-feedback-archive.sh takes the "markerless edits have
+              # nothing to preserve" exit above and emits NO record -- exiting
+              # 0, so nothing notices. Measured on the renderer: link-only body
+              # with "" -> 0 records, with p1 -> 1 record. The first-delivery
+              # degrade would therefore have silently dropped the one-shot
+              # previous body of a P0/P1 security finding, which is strictly
+              # worse than the deadlock it replaces.
+              #
+              # p1, not p2, for the same reason the failed-read branch above
+              # chooses p1: the severity is genuinely unresolved here, and a
+              # repo configuring p2 as ignore would otherwise have accounting
+              # drop the record from inventory entirely. Over-inclusion beats
+              # silent exclusion when nobody has reviewed it.
+              echo "::warning::code-scanning enrichment is unavailable in the first-delivery window; archiving $source_kind $source_id at p1 (unresolved) so a link-only GHAS body is not dropped as markerless (#1221)"
+              ghas_tier=p1
             fi
 
             # The renderer emits one v1 record or a complete set of chunked v2
