@@ -77,6 +77,26 @@ echo "check_codex_scripts: running codex-review-check verdict-comment clearance 
 echo "check_codex_scripts: running codex-review-check gate (a) required-check scoping tests (#655)"
 "$REPO_ROOT/tests/test_codex_review_check_required_checks.sh"
 
+# #1219: that suite's #1215 publisher probe reads .github/workflows relative to
+# the CWD, so a checkout carrying none of the five publisher workflows -- a
+# freshly bootstrapped repo, a consumer behind the wave that delivered them, or
+# any invocation not rooted at the repo root -- takes its skip branch. That
+# branch increments a SKIP counter that was never initialized, so `set -u`
+# aborted the suite mid-run: it reported failure and every assertion after the
+# skip silently stopped running. Re-run it from a workflow-less CWD so the skip
+# branch stays exercised rather than only the hub shape above.
+echo "check_codex_scripts: re-running gate (a) suite in the no-publisher shape (#1219)"
+G1219_DIR="$(mktemp -d "${TMPDIR:-/tmp}/check-codex-scripts-1219.XXXXXX")"
+# This file registers no other EXIT trap, so this one cannot replace an
+# existing handler -- a second `trap ... EXIT` REPLACES rather than extends.
+trap 'rm -rf "$G1219_DIR"' EXIT
+if ! ( cd "$G1219_DIR" && "$REPO_ROOT/tests/test_codex_review_check_required_checks.sh" ) \
+     >"$G1219_DIR/suite.log" 2>&1; then
+  echo "FAIL: gate (a) suite does not survive the no-publisher shape (#1219)" >&2
+  tail -20 "$G1219_DIR/suite.log" >&2
+  exit 1
+fi
+
 echo "check_codex_scripts: running branch-requirement resolver tests (#1064)"
 "$REPO_ROOT/tests/test_branch_requirements.sh"
 
