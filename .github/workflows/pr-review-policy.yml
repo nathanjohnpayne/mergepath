@@ -12,9 +12,31 @@ permissions:
 jobs:
   self-review-check:
     name: Self-Review Required
-    if: github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    # #1095: the Dependabot exemption used to be a JOB-level `if:`, which made
+    # this required check report `skipped` rather than `success`. GitHub branch
+    # protection does not accept a skipped conclusion as satisfying a required
+    # status check, so every Dependabot PR sat at mergeStateStatus BLOCKED with
+    # every other required context green -- and the only way past it was a human
+    # with admin bypass force-merging, which is the behaviour the required check
+    # exists to prevent. The exemption itself is sound (a bot cannot write a
+    # `## Self-Review` section); it just has to be expressed as a job that RUNS
+    # and passes, not a job that never runs.
+    #
+    # Single-sourced as one env expression so the four conditions below cannot
+    # drift into disagreeing about who is exempt. GitHub renders env values as
+    # strings, hence the comparison against 'true'.
+    env:
+      SELF_REVIEW_EXEMPT: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
     steps:
+      # The exempt path still produces a real, green conclusion for the
+      # required context, with the reason visible in the job log.
+      - name: Self-review not applicable
+        if: env.SELF_REVIEW_EXEMPT == 'true'
+        run: |
+          echo "Self-review not applicable — automated dependency bump (${{ github.event.pull_request.user.login }})."
+          echo "This required check passes without evaluating the PR body contract."
+
       # The parser is loaded from the DEFAULT BRANCH, never from the PR head.
       # This job triggers on `pull_request`, so a default checkout would fetch
       # the proposed code and run the validator out of it — letting a PR
@@ -23,6 +45,7 @@ jobs:
       # checkouts; persist-credentials off because nothing here needs an
       # authenticated git (#548).
       - name: Checkout trusted PR body validator
+        if: env.SELF_REVIEW_EXEMPT != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -34,6 +57,7 @@ jobs:
       # literal, not node-version-file: this workflow is canonical and lands
       # byte-identical on every consumer, most of which have no .nvmrc.
       - name: Set up Node.js
+        if: env.SELF_REVIEW_EXEMPT != 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
@@ -58,6 +82,7 @@ jobs:
       # The body goes in on STDIN via env, so it is never interpolated into the
       # shell and never appears in argv.
       - name: Validate the PR body against the contract
+        if: env.SELF_REVIEW_EXEMPT != 'true'
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |

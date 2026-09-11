@@ -255,6 +255,24 @@ refute_grep "D10: auto-clear no longer removes via the unattributable gh pr edit
 assert_grep "D10: the scheduled sweep re-verifies the label against live state, not the search index (#827)" \
   "$W/auto-clear-blocking-labels.yml" 'stale search-index hit'
 
+# Defect 11: the Self-Review Required job must RUN for every PR author,
+# including dependabot[bot] (#1095). A job-level `if:` made this required
+# context report `skipped`, and GitHub branch protection does not accept a
+# skipped conclusion as satisfying a required status check -- so every
+# Dependabot PR sat BLOCKED with all other required contexts green, and the
+# only way past was a human with admin bypass (enforce_admins is false fleet-
+# wide). The exemption is still correct, it just has to pass rather than
+# vanish. Asserted structurally because a required-context conclusion cannot
+# be exercised without a full Actions runner.
+refute_grep "D11: Self-Review Required no longer skips the whole job for dependabot (#1095)" \
+  "$W/pr-review-policy.yml" "    if: github.event.pull_request.user.login != 'dependabot[bot]'"
+assert_grep "D11: the dependabot exemption is a single-sourced job env predicate (#1095)" \
+  "$W/pr-review-policy.yml" 'SELF_REVIEW_EXEMPT: ${{ github.event.pull_request.user.login =='
+assert_grep "D11: the exempt path still produces a green conclusion with a reason (#1095)" \
+  "$W/pr-review-policy.yml" 'Self-review not applicable'
+assert_grep "D11: the body validation step is the thing gated, not the job (#1095)" \
+  "$W/pr-review-policy.yml" "        if: env.SELF_REVIEW_EXEMPT != 'true'"
+
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1
