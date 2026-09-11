@@ -43,6 +43,8 @@
       "scripts/lib/ci-check-modes.sh",
       "scripts/phase-4b-review.sh",
       "scripts/phase-4b/*",
+      "scripts/lib/codex-failure-markers.sh",
+      "scripts/lib/gh-api-array.sh",
       "tests/test_phase_4b_automation.sh"
     ],
     "check_phase_4b_accounting": [
