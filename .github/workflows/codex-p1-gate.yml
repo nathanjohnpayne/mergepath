@@ -265,12 +265,40 @@ jobs:
             # would be worse than archiving it under a possibly-too-low
             # tier with a visible warning.
             ghas_tier=""
-            # shellcheck source=scripts/lib/feedback-policy-helpers.sh
-            . scripts/lib/feedback-policy-helpers.sh
-            # shellcheck source=scripts/lib/gh-api-scalar.sh
-            . scripts/lib/gh-api-scalar.sh
-            # shellcheck source=scripts/lib/ghas-alert-severity.sh
-            . scripts/lib/ghas-alert-severity.sh
+            # #1221 first-delivery window. This job runs the PR's copy of this
+            # workflow against a DEFAULT-BRANCH checkout, so a helper the same
+            # wave introduces is not on the default branch yet -- the gate then
+            # fail-closes on a file the wave itself is delivering, and the wave
+            # cannot merge. Discriminate by asking whether the DEFAULT BRANCH's
+            # own copy of this workflow already references the helper: if it
+            # does not, this wave is the first delivery; if it does, the helper
+            # is expected and its absence is breakage, not bootstrap. Both
+            # files come from the same trusted checkout, so a PR cannot forge
+            # either side, and deleting the helper alone cannot buy silence.
+            #
+            # Deliberately NOT the `.mergepath-sync.yml` test used at the
+            # fingerprint fence below: the manifest is hub-only (404 on every
+            # consumer), so that test is permanently permissive downstream.
+            ghas_libs_ok=1
+            for _g1221_lib in scripts/lib/feedback-policy-helpers.sh \
+                              scripts/lib/gh-api-scalar.sh \
+                              scripts/lib/ghas-alert-severity.sh; do
+              [ -r "$_g1221_lib" ] && continue
+              if grep -Fq "$_g1221_lib" .github/workflows/codex-p1-gate.yml; then
+                echo "::error::$_g1221_lib is absent from the trusted default-branch checkout, but the default-branch copy of this workflow references it - infrastructure failure, not first delivery"
+                exit 1
+              fi
+              ghas_libs_ok=0
+              echo "::warning::$_g1221_lib is not on the default branch yet and the default-branch copy of this workflow does not reference it - first-delivery window; archiving WITHOUT code-scanning severity enrichment (#1221)"
+            done
+            if [ "$ghas_libs_ok" = 1 ]; then
+              # shellcheck source=scripts/lib/feedback-policy-helpers.sh
+              . scripts/lib/feedback-policy-helpers.sh
+              # shellcheck source=scripts/lib/gh-api-scalar.sh
+              . scripts/lib/gh-api-scalar.sh
+              # shellcheck source=scripts/lib/ghas-alert-severity.sh
+              . scripts/lib/ghas-alert-severity.sh
+            fi
             # This job runs on a trusted default-branch checkout, so a
             # local read_policy_block_field read here carries the same
             # trust this job already places in every other file it reads
@@ -299,7 +327,7 @@ jobs:
             # persisted archive record, even though accounting later rejects that
             # source. Inline-only matches accounting's own enumeration rule: GHAS
             # never posts a top-level review body or a PR-level issue comment.
-            if [ "$source_kind" = "inline" ] && [ "$source_login" = "$ghas_bot_login" ]; then
+            if [ "$ghas_libs_ok" = 1 ] && [ "$source_kind" = "inline" ] && [ "$source_login" = "$ghas_bot_login" ]; then
               alert_number=$(ghas_alert_number_from_body "$(cat "$previous_file")")
               if [ -n "$alert_number" ]; then
                 # A failed cache_init (disk/permissions) leaves

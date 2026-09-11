@@ -255,6 +255,87 @@ refute_grep "D10: auto-clear no longer removes via the unattributable gh pr edit
 assert_grep "D10: the scheduled sweep re-verifies the label against live state, not the search index (#827)" \
   "$W/auto-clear-blocking-labels.yml" 'stale search-index hit'
 
+# Defect 12: first-delivery window guards (#1221).
+#
+# A job that runs the PR's copy of a workflow against a DEFAULT-BRANCH checkout
+# cannot assume a manifest-delivered helper is present: on the wave that first
+# delivers it, the gate fail-closes on a file that wave is itself delivering,
+# and the file cannot reach the default branch until the gate passes. Hit live
+# on swipewatch#114 (cleared only by a break-glass admin merge) and twice
+# before that on the PR-body validator (#1132).
+#
+# The discriminator must read the DEFAULT BRANCH's own copy of the WORKFLOW,
+# not `.mergepath-sync.yml`: the manifest is deliberately hub-only and 404s on
+# every consumer, so a manifest test is permanently permissive downstream --
+# i.e. it would let deleting the helper silently disable the guarded work on
+# exactly the repos the guard is supposed to protect.
+g1221_guard_reads_workflow() {  # <label> <workflow-file> <helper-path>
+  if [ ! -f "$2" ]; then echo "SKIP: $1 ($2 absent)"; SKIP=$((SKIP + 1)); return; fi
+  if grep -Fq "grep -Fq \"\$_g1221_lib\" .github/workflows/" "$2" \
+     || grep -Fq "grep -Fq '$3' .github/workflows/" "$2"; then
+    pass "$1"
+  else
+    fail "$1 (no default-branch workflow self-comparison found in $2)"
+  fi
+}
+g1221_guard_reads_workflow \
+  "D12: the codex-p1-gate archive guard discriminates on the workflow, not the hub-only manifest (#1221)" \
+  "$W/codex-p1-gate.yml" "scripts/lib/ghas-alert-severity.sh"
+g1221_guard_reads_workflow \
+  "D12: the Self-Review validator guard discriminates on the workflow, not the hub-only manifest (#1221)" \
+  "$W/pr-review-policy.yml" "scripts/validate-pr-body.sh"
+
+# Behavioural: EXTRACT the archive guard's decision loop from the workflow and
+# run it, so a revert is executed rather than merely text-matched. Deliberately
+# form-agnostic about everything except the loop's own boundaries.
+if [ ! -f "$W/codex-p1-gate.yml" ]; then
+  echo "SKIP: D12 archive guard behaviour (#1221) ($W/codex-p1-gate.yml absent)"; SKIP=$((SKIP + 1))
+else
+  G1221_LOOP="$(awk '/^ *ghas_libs_ok=1$/ { grab = 1 } grab { sub(/^ +/, ""); print } /^ *done$/ { if (grab) exit }' "$W/codex-p1-gate.yml")"
+  if [ -z "$G1221_LOOP" ]; then
+    fail "D12: could not extract the archive first-delivery loop from $W/codex-p1-gate.yml (#1221)"
+  else
+    G1221_DIR="$(mktemp -d "${TMPDIR:-/tmp}/d12-1221.XXXXXX")"
+    mkdir -p "$G1221_DIR/scripts/lib" "$G1221_DIR/.github/workflows"
+    g1221_run() {  # <state> -> prints "rc=<n> <stdout+stderr>"
+      ( cd "$G1221_DIR" && set -euo pipefail && eval "$G1221_LOOP" && echo "ghas_libs_ok=$ghas_libs_ok" ) 2>&1
+    }
+    # State 1: helper present -> proceed, libs usable.
+    : > "$G1221_DIR/scripts/lib/feedback-policy-helpers.sh"
+    : > "$G1221_DIR/scripts/lib/gh-api-scalar.sh"
+    : > "$G1221_DIR/scripts/lib/ghas-alert-severity.sh"
+    printf 'irrelevant\n' > "$G1221_DIR/.github/workflows/codex-p1-gate.yml"
+    if g1221_run | grep -q 'ghas_libs_ok=1'; then
+      pass "D12: helpers present -> archive enrichment proceeds (#1221)"
+    else
+      fail "D12: helpers present but the guard did not proceed (#1221)"
+    fi
+    # State 2: helper absent AND the default-branch workflow does not
+    # reference it -> first delivery -> degrade, do not fail.
+    rm -f "$G1221_DIR/scripts/lib/ghas-alert-severity.sh"
+    G1221_OUT="$(g1221_run || true)"
+    if printf '%s' "$G1221_OUT" | grep -q 'ghas_libs_ok=0' \
+       && printf '%s' "$G1221_OUT" | grep -q '::warning::'; then
+      pass "D12: helper absent and unreferenced by the default-branch workflow -> first-delivery window, degrades with a warning (#1221)"
+    else
+      fail "D12: first-delivery window did not degrade (#1221): $G1221_OUT"
+    fi
+    # State 3: helper absent BUT the default-branch workflow references it ->
+    # breakage, must fail closed. This is the half that stops the guard
+    # becoming a way to disable the archive by deleting a file.
+    printf 'a line mentioning scripts/lib/ghas-alert-severity.sh\n' \
+      > "$G1221_DIR/.github/workflows/codex-p1-gate.yml"
+    G1221_OUT="$(g1221_run || true)"
+    if printf '%s' "$G1221_OUT" | grep -q '::error::' \
+       && ! printf '%s' "$G1221_OUT" | grep -q 'ghas_libs_ok='; then
+      pass "D12: helper absent but referenced by the default-branch workflow -> fails closed, not a bootstrap window (#1221)"
+    else
+      fail "D12: a missing-but-expected helper did not fail closed (#1221): $G1221_OUT"
+    fi
+    rm -rf "$G1221_DIR"
+  fi
+fi
+
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -61,6 +61,29 @@ jobs:
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
+          # #1221 first-delivery window. This gate runs the PR's copy of this
+          # workflow against a DEFAULT-BRANCH checkout, so a validator the same
+          # wave introduces is not on the default branch yet and the required
+          # check dies on `No such file` -- the wave cannot merge, and the
+          # script cannot reach the default branch until it does. That is the
+          # deadlock the ORDERING note above tries to prevent by hand; it has
+          # already been hit twice (#1132), which is why the rule is now
+          # enforced here rather than only written down.
+          #
+          # Discriminate on the DEFAULT BRANCH's own copy of this workflow: if
+          # it does not reference the validator, this wave is the first
+          # delivery; if it does, the validator is expected and its absence is
+          # breakage. Both files come from the same trusted checkout, so a PR
+          # cannot forge either side and deleting the validator alone cannot
+          # buy a silent pass.
+          if [ ! -x scripts/validate-pr-body.sh ]; then
+            if grep -Fq 'scripts/validate-pr-body.sh' .github/workflows/pr-review-policy.yml; then
+              echo "::error::scripts/validate-pr-body.sh is absent from the trusted default-branch checkout, but the default-branch copy of this workflow references it - infrastructure failure, not first delivery"
+              exit 1
+            fi
+            echo "::warning::scripts/validate-pr-body.sh is not on the default branch yet and the default-branch copy of this workflow does not reference it - first-delivery window; the PR-body contract is not evaluated for this run (#1221)"
+            exit 0
+          fi
           printf '%s\n' "$PR_BODY" | scripts/validate-pr-body.sh --self-review-only
 
   label-gate:
