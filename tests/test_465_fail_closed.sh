@@ -264,14 +264,73 @@ assert_grep "D10: the scheduled sweep re-verifies the label against live state, 
 # wide). The exemption is still correct, it just has to pass rather than
 # vanish. Asserted structurally because a required-context conclusion cannot
 # be exercised without a full Actions runner.
-refute_grep "D11: Self-Review Required no longer skips the whole job for dependabot (#1095)" \
-  "$W/pr-review-policy.yml" "    if: github.event.pull_request.user.login != 'dependabot[bot]'"
-assert_grep "D11: the dependabot exemption is a single-sourced job env predicate (#1095)" \
-  "$W/pr-review-policy.yml" 'SELF_REVIEW_EXEMPT: ${{ github.event.pull_request.user.login =='
-assert_grep "D11: the exempt path still produces a green conclusion with a reason (#1095)" \
-  "$W/pr-review-policy.yml" 'Self-review not applicable'
-assert_grep "D11: the body validation step is the thing gated, not the job (#1095)" \
-  "$W/pr-review-policy.yml" "        if: env.SELF_REVIEW_EXEMPT != 'true'"
+#
+# Review round 2 (CodeRabbit + Codex, same point): file-wide greps do NOT
+# establish this. `    if:` as a fixed string misses any equivalent spelling of
+# the same job condition; "Self-review not applicable" also matches the comment
+# above the step; and the non-exempt predicate appears on the checkout and
+# setup-node steps, so dropping it from the VALIDATOR alone left all four
+# assertions green while Dependabot could again run the validator with no
+# checkout. The predicates below are therefore scoped to the named job and the
+# named steps, by block extraction rather than by grepping the whole file.
+g1095_job_block() {  # <file> <job-name> -- the job's own lines, minus its key
+  awk -v job="  $2:" '
+    $0 == job { inj = 1; next }
+    inj && /^  [^[:space:]]/ { exit }
+    inj { print }
+  ' "$1"
+}
+g1095_step_block() {  # <job-block-file> <step-name> -- one "- name:" entry
+  awk -v want="      - name: $2" '
+    $0 == want { ins = 1; print; next }
+    ins && /^      - name: / { exit }
+    ins { print }
+  ' "$1"
+}
+
+if [ ! -f "$W/pr-review-policy.yml" ]; then
+  echo "SKIP: D11 Self-Review Required job shape (#1095) ($W/pr-review-policy.yml absent)"; SKIP=$((SKIP + 1))
+else
+  G1095_JOB="$(mktemp "${TMPDIR:-/tmp}/d11-job.XXXXXX")"
+  g1095_job_block "$W/pr-review-policy.yml" self-review-check > "$G1095_JOB"
+
+  # 1. No job-level condition AT ALL -- any condition here can skip the job,
+  #    and a skipped required context is the defect. Shape, not one spelling.
+  if [ -s "$G1095_JOB" ] && ! grep -qE '^    if:' "$G1095_JOB"; then
+    pass "D11: the Self-Review Required job carries no job-level condition, so it cannot report skipped (#1095)"
+  else
+    fail "D11: the Self-Review Required job has a job-level condition (or could not be extracted) -- it can report skipped, which branch protection rejects (#1095)"
+  fi
+
+  # 2. The exemption is single-sourced as a job env predicate.
+  if grep -qF 'SELF_REVIEW_EXEMPT: ${{ github.event.pull_request.user.login ==' "$G1095_JOB"; then
+    pass "D11: the dependabot exemption is a single-sourced job env predicate (#1095)"
+  else
+    fail "D11: the dependabot exemption is not a single-sourced job env predicate (#1095)"
+  fi
+
+  # 3. The VALIDATOR step specifically must carry the non-exempt condition.
+  #    Scoped to that step: the checkout and setup-node steps carry the same
+  #    condition, so a file-wide grep proved nothing about this one.
+  G1095_VALIDATE="$(mktemp "${TMPDIR:-/tmp}/d11-validate.XXXXXX")"
+  g1095_step_block "$G1095_JOB" "Validate the PR body against the contract" > "$G1095_VALIDATE"
+  if [ -s "$G1095_VALIDATE" ] && grep -qF "if: env.SELF_REVIEW_EXEMPT != 'true'" "$G1095_VALIDATE"; then
+    pass "D11: the body-validation step itself is what the exemption gates (#1095)"
+  else
+    fail "D11: the body-validation step does not carry the non-exempt condition -- dependabot would run the validator (#1095)"
+  fi
+
+  # 4. The exempt step exists AS A STEP and runs only on the exempt path, so
+  #    the job still produces a green conclusion with a stated reason.
+  G1095_EXEMPT="$(mktemp "${TMPDIR:-/tmp}/d11-exempt.XXXXXX")"
+  g1095_step_block "$G1095_JOB" "Self-review not applicable" > "$G1095_EXEMPT"
+  if [ -s "$G1095_EXEMPT" ] && grep -qF "if: env.SELF_REVIEW_EXEMPT == 'true'" "$G1095_EXEMPT"; then
+    pass "D11: the exempt path is a real step gated on the exemption, not just prose (#1095)"
+  else
+    fail "D11: the exempt path is missing or not gated on the exemption (#1095)"
+  fi
+  rm -f "$G1095_JOB" "$G1095_VALIDATE" "$G1095_EXEMPT"
+fi
 
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
