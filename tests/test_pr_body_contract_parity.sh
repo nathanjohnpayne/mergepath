@@ -327,6 +327,71 @@ else
   bad "blockquote body: nested declarations were accepted"
 fi
 
+# #1192: CommonMark blankness is spaces and tabs ONLY. A container line whose
+# content is a Unicode separator -- U+2003 EM SPACE, U+00A0 NO-BREAK SPACE,
+# U+3000 IDEOGRAPHIC SPACE -- is NOT blank, so it opens a paragraph and the
+# unprefixed line after it is a LAZY CONTINUATION inside that container, not a
+# fresh top-level declaration. Reading blankness with JavaScript's trim(),
+# which strips those separators, collapsed the container and surfaced quoted
+# content as a live identity declaration. Every expectation below was verified
+# against GitHub's own renderer (POST /markdown, i.e. cmark-gfm) rather than
+# derived from the spec.
+g1192_rejects() { # label, body
+  local g1192_count
+  g1192_count="$(pr_body_authoring_agent_count "$2")"
+  if [ "$g1192_count" = "0" ]; then
+    ok "#1192: $1"
+  else
+    bad "#1192: $1 -- expected count=0, got count=$g1192_count"
+  fi
+}
+g1192_accepts() { # label, body
+  local g1192_count g1192_agent
+  g1192_count="$(pr_body_authoring_agent_count "$2")"
+  g1192_agent="$(pr_body_authoring_agent "$2")"
+  if [ "$g1192_count" = "1" ] && [ "$g1192_agent" = "claude" ]; then
+    ok "#1192: $1"
+  else
+    bad "#1192: $1 -- expected count=1 agent=claude, got count=$g1192_count agent=$g1192_agent"
+  fi
+}
+
+g1192_rejects "blockquote whose content is U+2003 does not open a top-level marker" \
+  $'>  \nAuthoring-Agent: claude\n'
+g1192_rejects "blockquote whose content is U+00A0 does not open a top-level marker" \
+  $'>  \nAuthoring-Agent: claude\n'
+g1192_rejects "blockquote whose content is U+3000 does not open a top-level marker" \
+  $'> 　\nAuthoring-Agent: claude\n'
+g1192_rejects "nested-marker case stays rejected under the blankness fix" \
+  $'>  \n> Authoring-Agent: claude\n'
+g1192_rejects "bullet item whose content is U+2003 does not open a top-level marker" \
+  $'-  \nAuthoring-Agent: claude\n'
+g1192_rejects "star item whose content is U+2003 does not open a top-level marker" \
+  $'*  \nAuthoring-Agent: claude\n'
+g1192_rejects "ordered item whose content is U+2003 does not open a top-level marker" \
+  $'1.  \nAuthoring-Agent: claude\n'
+g1192_rejects "paren-ordered item whose content is U+2003 does not open a top-level marker" \
+  $'1)  \nAuthoring-Agent: claude\n'
+g1192_rejects "bullet item led by U+2003 then text does not open a top-level marker" \
+  $'-  x\nAuthoring-Agent: claude\n'
+g1192_rejects "a U+2003 line does not end a raw HTML block" \
+  $'<div>\n \nAuthoring-Agent: claude\n</div>\n'
+g1192_rejects "a U+00A0 line does not end a raw HTML block" \
+  $'<div>\n \nAuthoring-Agent: claude\n</div>\n'
+
+# The other half of the same guarantee: a REAL blank line must still do exactly
+# what CommonMark says, so the fix cannot have been "reject everything". These
+# are the shapes above with the separator replaced by a genuine blank; cmark-gfm
+# renders the marker as a live top-level paragraph in each.
+g1192_accepts "an empty blockquote leaves the next line top-level" \
+  $'>\nAuthoring-Agent: claude\n'
+g1192_accepts "an empty list item leaves the next line top-level" \
+  $'-\nAuthoring-Agent: claude\n'
+g1192_accepts "a real blank line ends a raw HTML block" \
+  $'<div>\n\nAuthoring-Agent: claude\n</div>\n'
+g1192_accepts "a blockquote opening a heading leaves the next line top-level" \
+  $'> # h\nAuthoring-Agent: claude\n'
+
 MULTILINE_CODE_SPAN=$'## Self-Review\n\n`example\nAuthoring-Agent: codex\n`'
 got_count="$(pr_body_authoring_agent_count "$MULTILINE_CODE_SPAN")"
 if [ "$got_count" = "0" ]; then
