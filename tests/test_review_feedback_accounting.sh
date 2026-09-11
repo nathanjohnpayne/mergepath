@@ -2122,6 +2122,71 @@ else
   pass "a non-GHAS comment's alert-shaped link is not looked up (#1124)"
 fi
 
+# Codex P2, PR #1124: after a bot_login override the fingerprint must scan ONLY
+# the configured identity -- the one accounting inventories -- not a union with
+# the default. Unioning leaves an old default-authored comment scanned HERE and
+# nowhere else, and a single unreadable alert of its holds this required gate
+# red over input accounting ignores entirely. Flow style is deliberate: the
+# line-oriented reader could not see it at all, so this pins both findings at
+# once. Alert 900 has NO fixture, so if the default login is still scanned the
+# stub 404s and the run fails closed -- the assertion cannot pass vacuously.
+reset_fixtures
+CFG_OVERRIDE="$TMP/policy-override.yml"
+cat >"$CFG_OVERRIDE" <<'YAML'
+code_scanning: {bot_login: "custom-ghas[bot]"}
+YAML
+write_override_fixtures() {
+  jq -n '[
+    {"id":9001,"created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z",
+     "user":{"login":"github-advanced-security[bot]"},"path":"a.js","line":1,
+     "body":"## CodeQL\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/900)"},
+    {"id":9002,"created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z",
+     "user":{"login":"custom-ghas[bot]"},"path":"b.js","line":1,
+     "body":"## CodeQL\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/901)"}
+  ]' >"$TMP/fixtures/inline.json"
+  cat >"$TMP/fixtures/code-scanning-alert-901.json" <<'JSON'
+{"number":901,"rule":{"security_severity_level":"high"}}
+JSON
+}
+write_override_fixtures
+: >"$TMP/gh-calls.log"
+set +e
+env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_FIXTURE_DIR="$TMP/fixtures" \
+  GH_CALL_LOG="$TMP/gh-calls.log" CONFIG="$CFG_OVERRIDE" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget >/dev/null 2>&1
+OVERRIDE_RC=$?
+set -e
+assert_eq 0 "$OVERRIDE_RC" "an overridden GHAS login substitutes for the default (flow style parsed; Codex P2, #1124)"
+if grep -F 'code-scanning/alerts/900' "$TMP/gh-calls.log" >/dev/null; then
+  fail "the default GHAS login is no longer scanned once bot_login is overridden (#1124)"
+else
+  pass "the default GHAS login is no longer scanned once bot_login is overridden (#1124)"
+fi
+if grep -F 'code-scanning/alerts/901' "$TMP/gh-calls.log" >/dev/null; then
+  pass "the configured GHAS login IS scanned (#1124)"
+else
+  fail "the configured GHAS login IS scanned (#1124)"
+fi
+
+# The guard that makes the narrowing safe: an UNREADABLE policy is "unknown",
+# not "unset". The scan must WIDEN back to the union rather than narrow on a
+# read that never happened -- so the default-authored comment is scanned again,
+# and its missing alert fixture makes the fingerprint fail closed.
+write_override_fixtures
+: >"$TMP/gh-calls.log"
+set +e
+env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_FIXTURE_DIR="$TMP/fixtures" \
+  GH_CALL_LOG="$TMP/gh-calls.log" CONFIG="$TMP/no-such-policy.yml" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget >/dev/null 2>&1
+UNKNOWN_RC=$?
+set -e
+if grep -F 'code-scanning/alerts/900' "$TMP/gh-calls.log" >/dev/null; then
+  pass "an unreadable policy widens back to the union instead of narrowing (#1124)"
+else
+  fail "an unreadable policy widens back to the union instead of narrowing (#1124)"
+fi
+assert_eq 2 "$UNKNOWN_RC" "and the widened scan still fails closed on its unreadable alert"
+
 for caller in \
   scripts/codex-review-request.sh \
   scripts/phase-4b-review.sh \

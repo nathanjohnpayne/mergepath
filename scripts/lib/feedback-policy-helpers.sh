@@ -59,6 +59,51 @@ feedback_policy_field() {
   ' "$cfg" | sed -E "s/[[:space:]]+#.*$//; s/^[\"']//; s/[\"'][[:space:]]*$//; s/[[:space:]]+$//"
 }
 
+
+# policy_yaml_to_json <path> -- parse a review-policy YAML file to JSON on
+# stdout; non-zero and empty on any failure. This is THE one parser
+# review-feedback-accounting.sh's validate_governing_policy uses (it adds its
+# own schema validation on top), extracted here (Codex P2, PR #1124) so a
+# second caller cannot drift from it. The earlier line-oriented awk reader
+# below could not see flow-style YAML at all -- `code_scanning: {bot_login:
+# "custom-ghas[bot]"}` returned empty -- so accounting recognized a consumer's
+# custom GHAS bot while the fingerprint and the archive workflow silently fell
+# back to the default login. Two readers of the same file is the bug; this is
+# the shared one.
+policy_yaml_to_json() {
+  local cfg="${1:-}"
+  [ -r "$cfg" ] || return 1
+  if command -v yq >/dev/null 2>&1 \
+     && yq --version 2>/dev/null | grep -qi 'mikefarah'; then
+    yq eval -o=json '.' "$cfg" 2>/dev/null || return 1
+  elif command -v python3 >/dev/null 2>&1 \
+       && python3 -c 'import yaml' >/dev/null 2>&1; then
+    python3 -c '
+import json, sys, yaml
+with open(sys.argv[1], encoding="utf-8") as source:
+    print(json.dumps(yaml.safe_load(source)))
+' "$cfg" 2>/dev/null || return 1
+  elif command -v ruby >/dev/null 2>&1; then
+    ruby -ryaml -rjson -e '
+value = YAML.safe_load(File.read(ARGV[0]), permitted_classes: [], permitted_symbols: [], aliases: false)
+puts JSON.generate(value)
+' "$cfg" 2>/dev/null || return 1
+  else
+    return 1
+  fi
+}
+
+# policy_block_field_parsed <block> <field> [config] -- read one block field
+# through policy_yaml_to_json, so block AND flow style both resolve. Empty
+# (rc 1) when the file is unreadable or no YAML parser exists, which callers
+# must treat as "unknown", NOT as "unset" -- see the fingerprint's use.
+policy_block_field_parsed() {
+  local block="$1" field="$2" cfg="${3:-${CONFIG:-.github/review-policy.yml}}" json=""
+  json="$(policy_yaml_to_json "$cfg")" || return 1
+  [ -n "$json" ] || return 1
+  printf '%s' "$json" | jq -r --arg b "$block" --arg f "$field" '.[$b][$f] // empty'
+}
+
 # Same reader, parameterized on an ARBITRARY top-level block (not only
 # feedback_policy:) -- e.g. `read_policy_block_field code_scanning
 # bot_login` (#1124). Deliberately untrusted / not base-materialized: a

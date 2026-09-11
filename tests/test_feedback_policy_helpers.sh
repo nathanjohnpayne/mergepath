@@ -375,6 +375,38 @@ YAML
 eq "real[bot]" "$(read_policy_block_field code_scanning bot_login "$CFG_NEST")" \
   "read_policy_block_field: a following top-level block still closes the previous one"
 
+# Codex P2, PR #1124: flow-style YAML is valid and accounting (which parses the
+# file as YAML) resolves it, but the line-oriented reader cannot see it at all.
+# That split let a consumer's custom GHAS bot be inventoried by accounting while
+# the fingerprint and archive workflow silently used the default login.
+CFG_FLOW="$WORKDIR/flow-style.yml"
+cat > "$CFG_FLOW" <<'YAML'
+code_scanning: {enabled: true, bot_login: "custom-ghas[bot]"}
+YAML
+eq "" "$(read_policy_block_field code_scanning bot_login "$CFG_FLOW")" \
+  "read_policy_block_field: flow style is invisible to the line reader (the defect, pinned)"
+eq "custom-ghas[bot]" "$(policy_block_field_parsed code_scanning bot_login "$CFG_FLOW")" \
+  "policy_block_field_parsed: flow-style block resolves (Codex P2, #1124)"
+eq "custom-ghas-bot[bot]" "$(policy_block_field_parsed code_scanning bot_login "$CFG_BLOCK")" \
+  "policy_block_field_parsed: block style resolves identically, incl. quote + inline-comment stripping"
+eq "" "$(policy_block_field_parsed code_scanning missing_field "$CFG_FLOW")" \
+  "policy_block_field_parsed: absent field in a present block -> empty"
+eq "" "$(policy_block_field_parsed nonexistent_block bot_login "$CFG_FLOW")" \
+  "policy_block_field_parsed: absent block -> empty"
+
+# Unreadable/unparseable must be rc 1 ("unknown"), NOT rc 0 with empty output
+# ("unset") -- the fingerprint narrows its scan on rc 0 and must never do so on
+# a read it could not actually perform.
+PARSED_RC=0
+policy_block_field_parsed code_scanning bot_login "$WORKDIR/does-not-exist.yml" >/dev/null 2>&1 || PARSED_RC=$?
+eq 1 "$PARSED_RC" "policy_block_field_parsed: missing file is rc 1 (unknown), not rc 0 (unset)"
+
+CFG_BROKEN="$WORKDIR/broken.yml"
+printf 'code_scanning: {bot_login: "unterminated\n' > "$CFG_BROKEN"
+BROKEN_RC=0
+policy_block_field_parsed code_scanning bot_login "$CFG_BROKEN" >/dev/null 2>&1 || BROKEN_RC=$?
+eq 1 "$BROKEN_RC" "policy_block_field_parsed: unparseable YAML is rc 1 (unknown), not a silent empty"
+
 # ---------------------------------------------------------------------------
 echo
 echo "feedback-policy-helpers: $PASS passed, $FAIL failed"

@@ -89,11 +89,33 @@ ISSUES=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level comm
 # policy read, which must be base-SHA-trusted because it decides whether a
 # finding blocks merge. Lazy: zero alert-number links found means zero
 # fetches, so a repo without code scanning enabled pays nothing extra.
-GHAS_BOT_LOGINS_JSON=$(
-  { printf '%s\n' 'github-advanced-security[bot]'
-    read_policy_block_field code_scanning bot_login 2>/dev/null || true
-  } | awk 'NF && !seen[$0]++' | jq -Rsc 'split("\n") | map(select(. != ""))'
-)
+# Codex P2, PR #1124: scan exactly the identity accounting inventories -- not
+# a union of it with the default. Unioning looks safely inclusive but is not:
+# accounting inventories only the CONFIGURED login, so after a bot_login
+# override an old default-authored comment is scanned here and nowhere else,
+# and one unreadable alert of its makes the severity read below exit 2 and
+# holds this required gate red over input accounting ignores entirely.
+#
+# The substitution is only sound because the read is now authoritative:
+# policy_block_field_parsed goes through the same YAML->JSON parse accounting
+# uses, so flow-style (`code_scanning: {bot_login: ...}`) resolves too, which
+# the line-oriented reader could not see at all.
+#
+# A FAILED parse (no YAML parser on this host) is "unknown", NOT "unset", so
+# it falls back to the widening union rather than narrowing: substituting on
+# an unreliable read would scan the wrong identity outright. That is the
+# read_policy_block_field contract -- widen on best-effort, never narrow.
+GHAS_DEFAULT_BOT='github-advanced-security[bot]'
+if GHAS_CONFIGURED_BOT="$(policy_block_field_parsed code_scanning bot_login 2>/dev/null)"; then
+  GHAS_BOT_LOGINS_JSON=$(printf '%s' "${GHAS_CONFIGURED_BOT:-$GHAS_DEFAULT_BOT}" \
+    | jq -Rsc 'split("\n") | map(select(. != ""))')
+else
+  GHAS_BOT_LOGINS_JSON=$(
+    { printf '%s\n' "$GHAS_DEFAULT_BOT"
+      read_policy_block_field code_scanning bot_login 2>/dev/null || true
+    } | awk 'NF && !seen[$0]++' | jq -Rsc 'split("\n") | map(select(. != ""))'
+  )
+fi
 # NUL-delimited, one record per COMMENT -- not per line. `jq -r` would split a
 # multi-line body across several `read` iterations, so the first-match helper
 # would run once per line and collect EVERY linked alert number, while

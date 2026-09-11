@@ -279,7 +279,15 @@ jobs:
             # back to the well-known default both when unconfigured and
             # when the read itself fails, so a config problem never
             # silently drops the common case.
-            ghas_configured_bot_login=$(read_policy_block_field code_scanning bot_login 2>/dev/null || true)
+            # Codex P2, PR #1124: read through the shared YAML->JSON parse so a
+            # flow-style `code_scanning: {bot_login: ...}` resolves here exactly
+            # as it does in accounting. The line-oriented reader could not see
+            # flow style at all, so a consumer's custom GHAS bot was recognized
+            # by accounting but not here -- and an edited/deleted finding of
+            # that bot's was then archived under no tier, or not at all. Falls
+            # back to the line reader when no YAML parser exists on the runner.
+            ghas_configured_bot_login=$(policy_block_field_parsed code_scanning bot_login 2>/dev/null \
+              || read_policy_block_field code_scanning bot_login 2>/dev/null || true)
             ghas_bot_login="${ghas_configured_bot_login:-github-advanced-security[bot]}"
 
             # Codex P1, PR #1124: `previous_file` is commenter-controlled, so neither

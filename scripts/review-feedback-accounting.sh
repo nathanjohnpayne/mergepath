@@ -103,27 +103,14 @@ fi
 validate_governing_policy() {
   local parsed=""
   [ -r "$CONFIG" ] || die 2 "governing review policy is unreadable: $CONFIG"
-  if command -v yq >/dev/null 2>&1 \
-     && yq --version 2>/dev/null | grep -qi 'mikefarah'; then
-    parsed=$(yq eval -o=json '.' "$CONFIG" 2>/dev/null) \
-      || die 2 "governing review policy did not parse as YAML: $CONFIG"
-  elif command -v python3 >/dev/null 2>&1 \
-       && python3 -c 'import yaml' >/dev/null 2>&1; then
-    parsed=$(python3 -c '
-import json, sys, yaml
-with open(sys.argv[1], encoding="utf-8") as source:
-    print(json.dumps(yaml.safe_load(source)))
-' "$CONFIG" 2>/dev/null) \
-      || die 2 "governing review policy did not parse as YAML: $CONFIG"
-  elif command -v ruby >/dev/null 2>&1; then
-    parsed=$(ruby -ryaml -rjson -e '
-value = YAML.safe_load(File.read(ARGV[0]), permitted_classes: [], permitted_symbols: [], aliases: false)
-puts JSON.generate(value)
-' "$CONFIG" 2>/dev/null) \
-      || die 2 "governing review policy did not parse as YAML: $CONFIG"
-  else
-    die 2 "no YAML parser is available to validate governing review policy: $CONFIG"
-  fi
+  # Parsed through the shared policy_yaml_to_json in
+  # scripts/lib/feedback-policy-helpers.sh (Codex P2, PR #1124). It began as
+  # this block; a second, weaker reader drifting from it is precisely the bug
+  # that review found, so there is now one parser and this is a caller of it.
+  parsed=$(policy_yaml_to_json "$CONFIG") \
+    || die 2 "governing review policy did not parse as YAML (or no YAML parser is available): $CONFIG"
+  [ -n "$parsed" ] \
+    || die 2 "governing review policy did not parse as YAML: $CONFIG"
   printf '%s' "$parsed" | jq -e '
     def optional_string($key):
       (has($key) | not) or (.[$key] | type == "string");
