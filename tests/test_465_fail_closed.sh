@@ -280,6 +280,11 @@ assert_grep "D10: the scheduled sweep re-verifies the label against live state, 
 # and the env assertion never checked its right-hand side, so exempting a
 # DIFFERENT bot passed too. The field predicates are now anchored exact-line
 # matches and the env predicate carries the whole expression.
+#
+# Round 4 (Codex, P2): the env predicate was still UNANCHORED, so a trailing
+# corruption passed -- `...'dependabot[bot]' }}-corrupted` evaluates to
+# `true-corrupted`, which skips the exempt step and runs the validator for
+# Dependabot. Anchored now, like the two step predicates beside it.
 g1095_job_block() {  # <file> <job-name> -- the job's own lines, minus its key
   awk -v job="  $2:" '
     $0 == job { inj = 1; next }
@@ -310,7 +315,7 @@ else
   fi
 
   # 2. The exemption is single-sourced as a job env predicate.
-  if grep -qF "SELF_REVIEW_EXEMPT: \${{ github.event.pull_request.user.login == 'dependabot[bot]' }}" "$G1095_JOB"; then
+  if grep -qE "^      SELF_REVIEW_EXEMPT: \\\$\\{\\{ github\\.event\\.pull_request\\.user\\.login == 'dependabot\\[bot\\]' \\}\\}\$" "$G1095_JOB"; then
     pass "D11: the dependabot exemption is a single-sourced job env predicate (#1095)"
   else
     fail "D11: the dependabot exemption is not a single-sourced job env predicate (#1095)"
