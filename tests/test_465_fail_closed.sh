@@ -294,10 +294,10 @@ g1221_guard_reads_workflow \
 # its caller passed, which dies on `usage:` exactly as a missing file does.
 if [ ! -f "$W/pr-review-policy.yml" ]; then
   echo "SKIP: D12 validator call-shape guard (#1221) ($W/pr-review-policy.yml absent)"; SKIP=$((SKIP + 1))
-elif grep -Fq -- "grep -Fq -- 'scripts/validate-pr-body.sh --self-review-only'" "$W/pr-review-policy.yml"; then
-  pass "D12: the validator guard tests the call INCLUDING its flag, so interface skew reads as first delivery (#1221)"
+elif grep -Fq 'scripts/validate-pr-body\.sh --self-review-only' "$W/pr-review-policy.yml"; then
+  pass "D12: the validator guard tests the INVOCATION line including its flag, so interface skew reads as first delivery and the probe cannot match itself (#1221)"
 else
-  fail "D12: the validator guard tests presence only -- a validator predating --self-review-only still deadlocks (#1221)"
+  fail "D12: the validator guard does not test the invocation line -- either presence-only, or a fixed string that matches its own predicate (#1221)"
 fi
 
 # Behavioural: EXTRACT the archive guard's decision loop from the workflow and
@@ -371,35 +371,55 @@ else
     }
     printf '#!/bin/sh\n' > "$G1221_RDIR/scripts/render-feedback-archive.sh"
     chmod +x "$G1221_RDIR/scripts/render-feedback-archive.sh"
-    # Current fleet: the default-branch workflow passes the tier argument.
-    printf 'a line with "$ghas_tier" in it\n' > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
-    if g1221_rend_run | grep -q 'ok=1 legacy=0'; then
-      pass "D12: default-branch workflow passes the tier argument -> six-argument renderer (#1221)"
+    # CodeRabbit P1: the earlier fixtures were a single contrived line, so they
+    # never exercised the case that actually matters -- the guard's OWN text
+    # present in the file it searches. A fixed-string probe matched itself
+    # there and reported "six-argument capable" whatever the call was, which
+    # reintroduced the deadlock this guard exists to remove. Every fixture
+    # below therefore carries the REAL guard, copied out of the workflow, and
+    # varies only the invocation.
+    G1221_GUARD_TEXT="$(sed -n '/g1221_render_ok=1/,/^            fi$/p' "$W/codex-p1-gate.yml")"
+    g1221_fixture() {  # <invocation-line-block>
+      { printf '%s\n' "$G1221_GUARD_TEXT"; printf '%s\n' "$1"; } \
+        > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
+    }
+    G1221_CALL6='            scripts/render-feedback-archive.sh \
+              "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file" "$ghas_tier" \
+              >"$archive_records_file"'
+    G1221_CALL5='            scripts/render-feedback-archive.sh \
+              "$source_kind" "$source_id" "$source_login" "$archived_at" "$previous_file" \
+              >"$archive_records_file"'
+    if [ -z "$G1221_GUARD_TEXT" ]; then
+      fail "D12: could not copy the renderer guard out of $W/codex-p1-gate.yml for the fixtures (#1221)"
     else
-      fail "D12: renderer decision did not select the six-argument form (#1221)"
-    fi
-    # Pre-#1124 default branch: no tier argument -> its renderer takes five.
-    printf 'a line referencing scripts/render-feedback-archive.sh only\n' > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
-    if g1221_rend_run | grep -q 'ok=1 legacy=1'; then
-      pass "D12: default-branch workflow omits the tier argument -> five-argument renderer, not a six-argument call it would reject (#1221)"
-    else
-      fail "D12: renderer decision did not fall back to the five-argument form (#1221)"
-    fi
-    # Renderer absent and unreferenced -> first delivery, skip archiving.
-    rm -f "$G1221_RDIR/scripts/render-feedback-archive.sh"
-    printf 'unrelated\n' > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
-    if g1221_rend_run | grep -q 'ok=0'; then
-      pass "D12: renderer absent and unreferenced -> first-delivery window, archive skipped rather than failing (#1221)"
-    else
-      fail "D12: renderer absence did not degrade (#1221)"
-    fi
-    # Renderer absent but REFERENCED -> breakage, fail closed.
-    printf 'scripts/render-feedback-archive.sh is referenced here\n' > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
-    G1221_ROUT="$(g1221_rend_run || true)"
-    if printf '%s' "$G1221_ROUT" | grep -q '::error::' && ! printf '%s' "$G1221_ROUT" | grep -q 'ok='; then
-      pass "D12: renderer absent but referenced by the default-branch workflow -> fails closed (#1221)"
-    else
-      fail "D12: a missing-but-expected renderer did not fail closed (#1221): $G1221_ROUT"
+      g1221_fixture "$G1221_CALL6"
+      if g1221_rend_run | grep -q 'ok=1 legacy=0'; then
+        pass "D12: guard present and the default branch passes the tier argument -> six-argument renderer (#1221)"
+      else
+        fail "D12: renderer decision did not select the six-argument form with the guard present (#1221)"
+      fi
+      g1221_fixture "$G1221_CALL5"
+      if g1221_rend_run | grep -q 'ok=1 legacy=1'; then
+        pass "D12: guard present but the default branch calls with five arguments -> five-argument renderer, so the probe does not match ITSELF (#1221)"
+      else
+        fail "D12: the renderer probe matched its own predicate -- it would call a five-argument renderer with six arguments (#1221)"
+      fi
+      # Renderer absent and unreferenced -> first delivery, skip archiving.
+      rm -f "$G1221_RDIR/scripts/render-feedback-archive.sh"
+      printf 'unrelated\n' > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
+      if g1221_rend_run | grep -q 'ok=0'; then
+        pass "D12: renderer absent and unreferenced -> first-delivery window, archive skipped rather than failing (#1221)"
+      else
+        fail "D12: renderer absence did not degrade (#1221)"
+      fi
+      # Renderer absent but REFERENCED -> breakage, fail closed.
+      printf 'scripts/render-feedback-archive.sh is referenced here\n' > "$G1221_RDIR/.github/workflows/codex-p1-gate.yml"
+      G1221_ROUT="$(g1221_rend_run || true)"
+      if printf '%s' "$G1221_ROUT" | grep -q '::error::' && ! printf '%s' "$G1221_ROUT" | grep -q 'ok='; then
+        pass "D12: renderer absent but referenced by the default-branch workflow -> fails closed (#1221)"
+      else
+        fail "D12: a missing-but-expected renderer did not fail closed (#1221): $G1221_ROUT"
+      fi
     fi
     rm -rf "$G1221_RDIR"
   fi

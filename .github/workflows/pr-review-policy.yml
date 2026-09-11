@@ -84,7 +84,7 @@ jobs:
           # DEFAULT BRANCH's own copy of this workflow already make THIS CALL",
           # flag included. A wave introducing a new flag alongside its caller
           # therefore reads as first delivery rather than deadlocking.
-          if grep -Fq -- 'scripts/validate-pr-body.sh --self-review-only' \
+          if grep -Eq '^[[:space:]]*printf .*\| *scripts/validate-pr-body\.sh --self-review-only' \
             .github/workflows/pr-review-policy.yml; then
             if [ ! -x scripts/validate-pr-body.sh ]; then
               echo "::error::scripts/validate-pr-body.sh is absent from the trusted default-branch checkout, but the default-branch copy of this workflow already makes this call - infrastructure failure, not first delivery"
