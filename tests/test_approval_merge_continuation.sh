@@ -1298,6 +1298,64 @@ for replaced_field in enabledAt enabledBy mergeMethod; do
   fi
 done
 
+# A detector fed only well-formed input cannot report whether it fails closed.
+# `valid_pr_shape` checks only that `autoMergeRequest` is an OBJECT, so these
+# three fields are exactly the ones nothing upstream validates. A malformed one
+# aborted jq mid-filter, and two such failures produced two empty strings that
+# compared EQUAL -- reading a replacement as a standing arm and deferring it.
+# Both snapshots carry the same malformed shape here, which is the double-
+# failure case; an unreadable identity is an unclassifiable arm, so exit 3.
+for malformed_identity in \
+  'enabledBy_boolean:.autoMergeRequest.enabledBy = true' \
+  'enabledBy_string:.autoMergeRequest.enabledBy = "nathanjohnpayne"' \
+  'enabledAt_number:.autoMergeRequest.enabledAt = 1757000000' \
+  'enabledAt_empty:.autoMergeRequest.enabledAt = ""' \
+  'mergeMethod_object:.autoMergeRequest.mergeMethod = {"method":"SQUASH"}' \
+  'identityless_request:.autoMergeRequest = {}' \
+  ; do
+  malformed_name=${malformed_identity%%:*}
+  malformed_expr=${malformed_identity#*:}
+  reset_fixtures
+  STUB_SUBJECT_MODE=disarm
+  STUB_INITIAL=$(jq -c "$malformed_expr" <<<"$ARMED_SHARED_BASE")
+  STUB_SECOND="$STUB_INITIAL"
+  set +e
+  run_case
+  malformed_identity_rc=$?
+  set -e
+  if [ "$malformed_identity_rc" -eq 3 ] \
+     && [ ! -s "$TMP/merge.log" ] \
+     && grep -Fq 'the auto-merge request is malformed, so the standing arm cannot be identified' "$TMP/subject.out" \
+     && grep -Fq 'could not retract and verify the protective auto-merge request' "$TMP/subject.out" \
+     && ! grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary' "$TMP/subject.out"; then
+    pass "a $malformed_name request is unclassifiable rather than standing"
+  else
+    fail "a malformed identity ($malformed_name) was read as a standing arm (rc=$malformed_identity_rc)"
+  fi
+done
+
+# One side malformed, the other well-formed: the single-failure case. It already
+# produced a mismatch rather than a match, but it must report the unreadable
+# identity rather than claiming the request was replaced -- those are different
+# events and an operator acts on them differently.
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_INITIAL="$ARMED_SHARED_BASE"
+STUB_SECOND=$(jq -c '.autoMergeRequest.enabledBy = true' <<<"$ARMED_SHARED_BASE")
+set +e
+run_case
+half_malformed_rc=$?
+set -e
+if [ "$half_malformed_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'the auto-merge request is malformed, so the standing arm cannot be identified' "$TMP/subject.out" \
+   && ! grep -Fq 'the auto-merge request was replaced during policy classification' "$TMP/subject.out" \
+   && ! grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary' "$TMP/subject.out"; then
+  pass "one malformed identity reports an unreadable arm, not a replacement"
+else
+  fail "a half-malformed identity was misreported (rc=$half_malformed_rc)"
+fi
+
 # The converse, so the comparison stays an IDENTITY test rather than a
 # whole-object diff: commit headline and body are payload the enabling actor
 # chose, not identity. Churn there is not a replacement and must still defer,

@@ -177,12 +177,36 @@ policy_snapshot_signature() {
 # that appeared mid-run". Deliberately narrow -- `commitHeadline` and
 # `commitBody` are payload rather than identity, and comparing them would report
 # unrelated churn as a replacement.
+#
+# Every field is type-checked here because `valid_pr_shape` checks only that
+# `autoMergeRequest` is an object, so these three are exactly the fields nothing
+# upstream validates. Without that, a malformed request made jq abort mid-filter
+# and emit nothing -- and two such failures compared EQUAL, which read a
+# replacement as a standing arm and deferred it (a fail-open, #1239 CodeRabbit).
+# The signature therefore fails loudly instead of emitting a partial or empty
+# projection, and callers MUST check the status rather than the output: two
+# empty strings are two unknowns, never a match.
 arm_request_signature() {
-  jq -c 'if .autoMergeRequest == null then null else {
-    enabledAt: .autoMergeRequest.enabledAt,
-    enabledBy: (.autoMergeRequest.enabledBy.login // null),
-    mergeMethod: .autoMergeRequest.mergeMethod
-  } end' <<<"$1"
+  jq -c '
+    def require($value; $types; $name):
+      if ($types | index($value | type)) then $value
+      else error("auto-merge request \($name) is \($value | type)") end;
+    if .autoMergeRequest == null then null
+    else
+      require(.autoMergeRequest; ["object"]; "payload") as $request
+      | require($request.enabledBy; ["object", "null"]; "enabledBy") as $enabler
+      | {
+          # Non-empty string, not merely well-typed: `enabledAt` is the field a
+          # re-enable always moves, so it is what makes one request identifiable
+          # as the same request. A request carrying none of it has no identity,
+          # and two identity-less arms comparing equal would be the same
+          # empty-equals-match fail-open one level up.
+          enabledAt: (require($request.enabledAt; ["string"]; "enabledAt")
+                      | if length > 0 then . else error("auto-merge request enabledAt is empty") end),
+          enabledBy: require(($enabler.login // null); ["string", "null"]; "enabledBy.login"),
+          mergeMethod: require($request.mergeMethod; ["string", "null"]; "mergeMethod")
+        }
+    end' <<<"$1"
 }
 
 # Classify a snapshot's auto-merge arm. The return code is a contract, because
@@ -363,7 +387,15 @@ if [ "$MODE" = "retract-only" ]; then
   elif [ "$(policy_snapshot_signature "$protection_snapshot")" != "$(policy_snapshot_signature "$initial")" ]; then
     echo "approval continuation: PR head/base/author changed during policy classification; treating the latest armed state as unclassified"
   elif [ "$arm_enabled" = "true" ]; then
-    if [ "$(arm_request_signature "$protection_snapshot")" = "$(arm_request_signature "$initial")" ]; then
+    # Status first, output second. Comparing the outputs of two signature
+    # commands without checking whether either SUCCEEDED makes a double failure
+    # compare equal, which is the fail-open this guard exists to prevent.
+    protective_arm_identity=""
+    initial_arm_identity=""
+    if ! protective_arm_identity=$(arm_request_signature "$protection_snapshot") \
+       || ! initial_arm_identity=$(arm_request_signature "$initial"); then
+      echo "approval continuation: the auto-merge request is malformed, so the standing arm cannot be identified; treating the latest armed state as unclassified" >&2
+    elif [ "$protective_arm_identity" = "$initial_arm_identity" ]; then
       protective_standing_arm=1
     else
       echo "approval continuation: the auto-merge request was replaced during policy classification; treating the latest armed state as unclassified"
