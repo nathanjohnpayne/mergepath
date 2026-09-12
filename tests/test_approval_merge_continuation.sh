@@ -402,7 +402,7 @@ set +e
 run_case
 dependabot_app_lookalike_rc=$?
 set -e
-if [ "$dependabot_app_lookalike_rc" -eq 3 ] \
+if [ "$dependabot_app_lookalike_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
   pass "gh app/ Dependabot lookalikes fail closed in ordinary arm classification"
@@ -452,7 +452,7 @@ set +e
 run_case
 dependabot_lookalike_rc=$?
 set -e
-if [ "$dependabot_lookalike_rc" -eq 3 ] \
+if [ "$dependabot_lookalike_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
   pass "Dependabot lookalike logins fail closed as ordinary armed PRs"
@@ -524,7 +524,7 @@ set +e
 run_case
 queue_disabled_result=$?
 set -e
-if [ "$queue_disabled_result" -eq 3 ] \
+if [ "$queue_disabled_result" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && [ ! -s "$TMP/merge-token.log" ] \
    && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
@@ -532,6 +532,58 @@ if [ "$queue_disabled_result" -eq 3 ] \
   pass "queue proof rc=4 refuses an unconditioned disable mutation"
 else
   fail "queue proof rc=4 wrote or silently accepted an unproven arm"
+fi
+
+# #1159: an arm already standing when the protective pass opens, which the
+# #1058 boundary does not prove, is the STEADY STATE of every approved PR whose
+# auto-merge is enabled -- and both callers of this mode enumerate approved PRs,
+# the scheduled sweep re-entering every five minutes. The refusal is therefore
+# reported as a classified not-ready result: the sweep records the PR and moves
+# on instead of failing the whole periodic run for as long as the arm stands.
+# The safety half is unchanged and asserted here too -- no write, no merge, and
+# no merge-ready claim -- and the infrastructure-error diagnostic must be absent,
+# because that is the exact misclassification being fixed.
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_SUBJECT_TOKEN=workflow-token
+STUB_QUEUE_POLICY_TOKEN=queue-policy-token
+STUB_QUEUE_POLICY_RC=4
+STUB_INITIAL="$ARMED_SHARED_BASE"
+STUB_SECOND="$ARMED_SHARED_BASE"
+set +e
+run_case
+standing_arm_not_ready_rc=$?
+set -e
+if [ "$standing_arm_not_ready_rc" -eq 4 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && [ ! -s "$TMP/merge-token.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out" \
+   && grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary and cannot be retracted' "$TMP/subject.out" \
+   && ! grep -Fq 'could not retract and verify the protective auto-merge request' "$TMP/subject.out" \
+   && ! grep -Fq 'merge-ready at' "$TMP/subject.out"; then
+  pass "a standing unprovable arm defers the sweep instead of failing it"
+else
+  fail "protective refusal was not reported as a classified not-ready result (rc=$standing_arm_not_ready_rc; output=$(tr '\n' ' ' < "$TMP/subject.out"))"
+fi
+
+# The deferral above is scoped to the classified refusal. A protective pass that
+# cannot establish what state the PR is in at all is still an infrastructure
+# error: it fails the sweep and surfaces the diagnostic, because no policy
+# decision was reached to defer on.
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_INITIAL="$SHARED_BASE"
+STUB_SECOND='{}'
+set +e
+run_case
+unclassifiable_protective_rc=$?
+set -e
+if [ "$unclassifiable_protective_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'could not bracket the unarmed PR after policy classification' "$TMP/subject.out"; then
+  pass "an unclassifiable protective pass still fails closed as an infrastructure error"
+else
+  fail "an unclassifiable protective pass stopped failing the sweep (rc=$unclassifiable_protective_rc)"
 fi
 
 for queue_reject_rc in 3 5; do
@@ -568,7 +620,7 @@ run_case
 missing_queue_helper_rc=$?
 set -e
 chmod +x "$TMP/root/scripts/workflow/merge-queue-arm-policy.sh"
-if [ "$missing_queue_helper_rc" -eq 3 ] \
+if [ "$missing_queue_helper_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && [ ! -s "$TMP/queue-policy.log" ] \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
@@ -1064,7 +1116,7 @@ set +e
 run_case
 unreadable_policy_arm_rc=$?
 set -e
-if [ "$unreadable_policy_arm_rc" -eq 3 ] \
+if [ "$unreadable_policy_arm_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
   pass "workflow-token protection blocks an unclassified arm without mutation"
@@ -1081,7 +1133,7 @@ set +e
 run_case
 arm_during_policy_rc=$?
 set -e
-if [ "$arm_during_policy_rc" -eq 3 ] \
+if [ "$arm_during_policy_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
   pass "protective mode blocks an arm that appears during policy materialization"
@@ -1097,7 +1149,7 @@ set +e
 run_case
 protective_arm_rc=$?
 set -e
-if [ "$protective_arm_rc" -eq 3 ] \
+if [ "$protective_arm_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
   pass "the approval guard blocks an unproven arm in protective mode"
@@ -1118,7 +1170,7 @@ for armed_snapshot in still_armed moved_head moved_base; do
   run_case
   armed_snapshot_rc=$?
   set -e
-  if [ "$armed_snapshot_rc" -eq 3 ] \
+  if [ "$armed_snapshot_rc" -eq 4 ] \
      && [ ! -s "$TMP/merge.log" ] \
      && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
     pass "a $armed_snapshot protective snapshot fails closed without a write"
@@ -1135,7 +1187,7 @@ set +e
 run_case
 nonshared_arm_rc=$?
 set -e
-if [ "$nonshared_arm_rc" -eq 3 ] \
+if [ "$nonshared_arm_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out" \
    && grep -Fq -- '--base-ref main --base-sha base123 --default-branch main --materialize-default' "$TMP/policy.log" \
@@ -1165,7 +1217,7 @@ set +e
 run_case
 policy_drift_arm_rc=$?
 set -e
-if [ "$policy_drift_arm_rc" -eq 3 ] \
+if [ "$policy_drift_arm_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'changed during policy classification; treating the latest armed state as unclassified' "$TMP/subject.out" \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
@@ -1183,7 +1235,7 @@ set +e
 run_case
 unreadable_default_arm_rc=$?
 set -e
-if [ "$unreadable_default_arm_rc" -eq 3 ] \
+if [ "$unreadable_default_arm_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'governing policy is unclassified' "$TMP/subject.out" \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
@@ -1426,7 +1478,7 @@ set +e
 run_case
 divergent_protective_shared_rc=$?
 set -e
-if [ "$divergent_protective_shared_rc" -eq 3 ] \
+if [ "$divergent_protective_shared_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
   pass "protective mode blocks a governing-base shared-author arm without mutation"
@@ -1445,7 +1497,7 @@ set +e
 run_case
 divergent_protective_nonshared_rc=$?
 set -e
-if [ "$divergent_protective_nonshared_rc" -eq 3 ] \
+if [ "$divergent_protective_nonshared_rc" -eq 4 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
   pass "protective mode blocks a governing-base non-shared arm without mutation"

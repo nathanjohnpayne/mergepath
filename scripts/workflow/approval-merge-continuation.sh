@@ -170,6 +170,14 @@ policy_snapshot_signature() {
   }' <<<"$1"
 }
 
+# Classify a snapshot's auto-merge arm. The return code is a contract, because
+# the two nonzero outcomes are not the same kind of event (#1159):
+#   0  nothing to retract, or an arm deliberately left intact -- Dependabot's
+#      dedicated lane, or one proven inside the #1058 queue boundary (which also
+#      sets MERGEPATH_ARM_RETAINED=1).
+#   1  the snapshot could not be classified at all.
+#   2  an arm exists and policy refuses to mutate it.
+# No path mutates the arm; the codes describe what was learned, not what was done.
 retract_snapshot_arm() {
   local snapshot="$1" reason="$2" target_author queue_policy_rc
   local queue_policy_token queue_source_token
@@ -215,8 +223,11 @@ retract_snapshot_arm() {
       *) ;;
     esac
   fi
+  # 2, not 1: the refusal above is the decision this function was asked to make,
+  # not a failure to make it. Only the protective entry pass distinguishes them;
+  # every other caller still treats any nonzero as an infrastructure error.
   echo "approval continuation: refusing to mutate $reason arm because native disable has no exact-action precondition" >&2
-  return 1
+  return 2
 }
 
 retract_latest_arm() {
@@ -310,8 +321,33 @@ if [ "$MODE" = "retract-only" ]; then
     echo "approval continuation: no auto-merge request requires protective retraction"
     exit 0
   fi
-  retract_snapshot_arm "$protection_snapshot" "durable or unclassified" || \
-    infra_error "could not retract and verify the protective auto-merge request"
+  # An arm that was already standing when this pass opened, and that the #1058
+  # boundary does not prove, is a POLICY outcome rather than a broken dependency
+  # (#1159). Both callers of this mode enumerate every approved PR, and the
+  # scheduled one re-enters every five minutes, so reporting the refusal as an
+  # infrastructure error made the sweep permanently red on any repo holding one
+  # such PR -- burying the genuine infrastructure errors that reporting exists
+  # to surface. Not-ready is the truthful classification, and the one this
+  # branch already gives the other arm it may not touch: the proven
+  # queue-governed one immediately below. Neither path retracts, merges, or
+  # clears anything, so nothing that was blocked becomes unblocked. Every OTHER
+  # retraction failure is unclassified and still fails the sweep.
+  protective_retraction_rc=0
+  retract_snapshot_arm "$protection_snapshot" "durable or unclassified" \
+    || protective_retraction_rc=$?
+  case "$protective_retraction_rc" in
+    0) ;;
+    2)
+      not_ready "the standing auto-merge request is outside the #1058 queue boundary and cannot be retracted; it remains intact for explicit human or admin disposition"
+      ;;
+    *)
+      # Unreachable today -- the only other nonzero is 1, which needs a snapshot
+      # that failed valid_pr_shape, and both snapshots reaching here have already
+      # passed it. Kept as the fail-closed default so a third outcome added to
+      # the classifier fails the sweep rather than inheriting the deferral above.
+      infra_error "could not retract and verify the protective auto-merge request"
+      ;;
+  esac
   [ "$MERGEPATH_ARM_RETAINED" -eq 0 ] \
     || not_ready "queue-governed arm remains active; protective classification made no mutation"
   exit 0
