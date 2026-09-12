@@ -255,6 +255,60 @@ refute_grep "D10: auto-clear no longer removes via the unattributable gh pr edit
 assert_grep "D10: the scheduled sweep re-verifies the label against live state, not the search index (#827)" \
   "$W/auto-clear-blocking-labels.yml" 'stale search-index hit'
 
+# Defect 12: token budget vs the App-only checks endpoint (#1130).
+#
+# Six workflows share this repository's 1,000/hr GITHUB_TOKEN budget and
+# measured ~2,400 requests/hour on a two-PR day, so an exhausted budget turns
+# every required gate red and no PR can merge. Read steps therefore draw on the
+# CI actor PAT's 5,000/hr budget instead.
+#
+# The constraint that bounds this, and that the issue's own proposed fix missed:
+# creating a check run is a GitHub App-only endpoint. A step that POSTs a
+# check_run must keep GITHUB_TOKEN or the required context stops publishing
+# altogether -- strictly worse than the rate limit. Write steps stay too,
+# because GITHUB_TOKEN-authored events fire no workflow runs and a PAT would
+# both re-author them and add to the volume.
+#
+# So the rule under test is a PAIRING, not a preference: fallback on the read
+# steps, never on a step that touches check-runs.
+g1130_step_of() {  # <workflow-file> <line-no> -> that line's FULL owning step
+  awk -v target="$2" '
+    /^[[:space:]]*- name:/ { if (NR <= target) { start = NR } else if (!stop) { stop = NR } }
+    { line[NR] = $0 }
+    END {
+      if (!stop) stop = NR + 1
+      for (i = start; i < stop; i++) print line[i]
+    }
+  ' "$1"
+}
+if [ ! -f "$W/codex-p1-gate.yml" ]; then
+  echo "SKIP: D12 token-budget pairing (#1130) ($W/codex-p1-gate.yml absent)"; SKIP=$((SKIP + 1))
+else
+  g1130_bad=""
+  g1130_fallbacks=0
+  for g1130_wf in codex-p1-gate.yml merge-clearance-gate.yml coderabbit-severity-gate.yml \
+                  required-check-publisher.yml codex-feedback-archive-relay.yml \
+                  auto-clear-blocking-labels.yml; do
+    [ -f "$W/$g1130_wf" ] || continue
+    while IFS=: read -r g1130_ln g1130_rest; do
+      [ -n "$g1130_ln" ] || continue
+      g1130_fallbacks=$((g1130_fallbacks + 1))
+      if g1130_step_of "$W/$g1130_wf" "$g1130_ln" | grep -qE 'check-runs|check_runs'; then
+        g1130_bad="$g1130_bad $g1130_wf:$g1130_ln"
+      fi
+    done <<EOF_1130
+$(grep -n 'CI_ACTOR_TOKEN || secrets.GITHUB_TOKEN' "$W/$g1130_wf" 2>/dev/null || true)
+EOF_1130
+  done
+  if [ -n "$g1130_bad" ]; then
+    fail "D12: a CI_ACTOR_TOKEN fallback sits on a step that touches check-runs ($g1130_bad) -- creating a check run is App-only, so a PAT there stops the required context publishing (#1130)"
+  elif [ "$g1130_fallbacks" -eq 0 ]; then
+    fail "D12: no read step carries the CI_ACTOR_TOKEN fallback, so these workflows still share the 1,000/hr GITHUB_TOKEN budget (#1130)"
+  else
+    pass "D12: all $g1130_fallbacks CI_ACTOR_TOKEN fallback(s) sit on check-run-free steps (#1130)"
+  fi
+fi
+
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1

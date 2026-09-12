@@ -581,7 +581,25 @@ jobs:
         if: steps.open.outputs.requires_relay != 'true'
         id: gate
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # #1130: this step only READS -- measured 100% GET (merge-clearance
+          # 17, codex-p1 6-11, coderabbit-severity 4 requests per run, all
+          # GET). So it can draw on the CI actor PAT's 5,000/hr budget instead
+          # of this repository's 1,000/hr GITHUB_TOKEN budget, which six
+          # workflows share and which measured ~2,400 requests/hour on a
+          # two-PR day.
+          #
+          # Only the read steps move. Every step that POSTs a check_run stays
+          # on GITHUB_TOKEN: creating a check run is a GitHub App-only
+          # endpoint ("Write permission for the REST API to interact with
+          # checks is only available to GitHub Apps"), so a PAT there would
+          # fail outright and the required context would stop publishing.
+          # Write steps also stay put because GITHUB_TOKEN-authored events
+          # deliberately fire no workflow runs, and a PAT would both re-author
+          # them and add to the volume this issue is about.
+          #
+          # Falls back to GITHUB_TOKEN where CI_ACTOR_TOKEN is unprovisioned,
+          # so behaviour is unchanged on any repo without the secret.
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.open.outputs.pr }}
           REPO: ${{ github.repository }}
           EXPECTED_HEAD_SHA: ${{ steps.open.outputs.head_sha }}
