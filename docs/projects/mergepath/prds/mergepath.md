@@ -3,7 +3,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/mergepath/prds/mergepath.md
-source_ref: a219367
+source_ref: 5b5452f
 project: mergepath
 document_class: prd
 document_slug: mergepath
@@ -1620,8 +1620,9 @@ scripts. Use `scripts/gh-as-author.sh` for author-identity writes and
 |-------|-------------------|-------------------|--------------------------|--------------------------------------|
 | Claude | `nathanpayne-claude` | `pvbq24vl2h6gl7yjclxy2hbote` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/pvbq24vl2h6gl7yjclxy2hbote/token` |
 | Cursor | `nathanpayne-cursor` | `bslrih4spwxgookzfy6zedz5g4` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/bslrih4spwxgookzfy6zedz5g4/token` |
-| Codex | `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
+| Codex | `nathanpayne-codex` | `etak327mpz4drd4byxszfex4vm` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/etak327mpz4drd4byxszfex4vm/token` |
 | Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `$OP_PREFLIGHT_AUTHOR_PAT` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
+| CI (not a reviewer) | `nathanpayne-robot` | `o6ekjxjjl5gq6rmcneomrjahpu` | *(none — CI only)* | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
 
 ```bash
 # Read-path identity check after preflight
