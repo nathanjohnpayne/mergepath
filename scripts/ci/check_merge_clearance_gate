@@ -640,7 +640,23 @@ PRODUCERS = ("merge-clearance-gate", "scheduled-sweep", "dispatch-recheck")
 # Exact-match allowlists, never containment (the #849 lesson, third shape): a
 # value that CONTAINS the wanted expression — `literal-${{ ... }}` — satisfies
 # a substring test while the publisher submits something GitHub rejects.
-GH_TOKEN_OK = ("${{ secrets.GITHUB_TOKEN }}",)
+# #1130: the CI-actor fallback is permitted alongside the bare token. The
+# property this fence protects is that a producer step BINDS a token at all --
+# an unbound gh falls back to unauthenticated, the publish 401s, and the
+# required context silently stops refreshing (#854). `secrets.CI_ACTOR_TOKEN ||
+# secrets.GITHUB_TOKEN` always yields one, because GITHUB_TOKEN is present in
+# every Actions run, so the binding property holds.
+#
+# Admitting it here rather than loosening the comparison is deliberate, and is
+# what this fence asks for: a new accepted spelling is a visible one-line edit
+# in this file, so the coupling stays loud. Note the fallback is only ever
+# placed on READ steps -- creating a check run is a GitHub App-only endpoint,
+# so a step that POSTs one must keep the bare GITHUB_TOKEN or stop publishing
+# altogether.
+GH_TOKEN_OK = (
+    "${{ secrets.GITHUB_TOKEN }}",
+    "${{ secrets.CI_ACTOR_TOKEN || secrets.GITHUB_TOKEN }}",
+)
 HEAD_SHA_OK = ("${{ github.event.pull_request.head.sha }}",)
 # Exact job-level conditions per producer (cross-agent P1 on #852). A
 # NON-literal always-false condition — `github.event_name == 'push'` on the

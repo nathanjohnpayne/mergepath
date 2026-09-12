@@ -284,28 +284,56 @@ g1130_step_of() {  # <workflow-file> <line-no> -> that line's FULL owning step
 if [ ! -f "$W/codex-p1-gate.yml" ]; then
   echo "SKIP: D12 token-budget pairing (#1130) ($W/codex-p1-gate.yml absent)"; SKIP=$((SKIP + 1))
 else
+  # Per MIGRATED GATE, not an aggregate: an aggregate nonzero count let one or
+  # two of the three silently fall back onto the exhausted 1,000/hr budget
+  # while another workflow's fallback kept the total positive (CodeRabbit +
+  # Codex, round 1). Each named read step is now asserted on its own.
   g1130_bad=""
-  g1130_fallbacks=0
+  g1130_missing=""
+  while IFS='|' read -r g1130_wf g1130_step; do
+    [ -n "$g1130_wf" ] || continue
+    if [ ! -f "$W/$g1130_wf" ]; then
+      echo "SKIP: D12 token budget for $g1130_wf (#1130) (absent)"; SKIP=$((SKIP + 1)); continue
+    fi
+    g1130_ln="$(grep -n "CI_ACTOR_TOKEN || secrets.GITHUB_TOKEN" "$W/$g1130_wf" 2>/dev/null | cut -d: -f1 | head -1 || true)"
+    if [ -z "$g1130_ln" ]; then
+      g1130_missing="$g1130_missing $g1130_wf"
+      continue
+    fi
+    # the fallback must be on the NAMED read step, and that step must be check-run free
+    g1130_owner="$(g1130_step_of "$W/$g1130_wf" "$g1130_ln" 2>/dev/null | head -1 || true)"
+    case "$g1130_owner" in
+      *"$g1130_step"*) ;;
+      *) g1130_missing="$g1130_missing $g1130_wf(wrong-step)" ;;
+    esac
+    if g1130_step_of "$W/$g1130_wf" "$g1130_ln" | grep -qE 'check-runs|check_runs'; then
+      g1130_bad="$g1130_bad $g1130_wf:$g1130_ln"
+    fi
+  done <<'EOF_1130'
+codex-p1-gate.yml|Run scripts/codex-p1-gate.sh
+merge-clearance-gate.yml|Run scripts/merge-clearance-gate.sh
+coderabbit-severity-gate.yml|Run scripts/coderabbit-severity-gate.sh
+EOF_1130
+  # And no fallback anywhere may sit on a check-run step, in ANY of the six.
   for g1130_wf in codex-p1-gate.yml merge-clearance-gate.yml coderabbit-severity-gate.yml \
                   required-check-publisher.yml codex-feedback-archive-relay.yml \
                   auto-clear-blocking-labels.yml; do
     [ -f "$W/$g1130_wf" ] || continue
-    while IFS=: read -r g1130_ln g1130_rest; do
-      [ -n "$g1130_ln" ] || continue
-      g1130_fallbacks=$((g1130_fallbacks + 1))
-      if g1130_step_of "$W/$g1130_wf" "$g1130_ln" | grep -qE 'check-runs|check_runs'; then
-        g1130_bad="$g1130_bad $g1130_wf:$g1130_ln"
+    while IFS=: read -r g1130_l2 g1130_rest2; do
+      [ -n "$g1130_l2" ] || continue
+      if g1130_step_of "$W/$g1130_wf" "$g1130_l2" | grep -qE 'check-runs|check_runs'; then
+        case "$g1130_bad" in *"$g1130_wf:$g1130_l2"*) ;; *) g1130_bad="$g1130_bad $g1130_wf:$g1130_l2" ;; esac
       fi
-    done <<EOF_1130
+    done <<EOF_1130B
 $(grep -n 'CI_ACTOR_TOKEN || secrets.GITHUB_TOKEN' "$W/$g1130_wf" 2>/dev/null || true)
-EOF_1130
+EOF_1130B
   done
   if [ -n "$g1130_bad" ]; then
     fail "D12: a CI_ACTOR_TOKEN fallback sits on a step that touches check-runs ($g1130_bad) -- creating a check run is App-only, so a PAT there stops the required context publishing (#1130)"
-  elif [ "$g1130_fallbacks" -eq 0 ]; then
-    fail "D12: no read step carries the CI_ACTOR_TOKEN fallback, so these workflows still share the 1,000/hr GITHUB_TOKEN budget (#1130)"
+  elif [ -n "$g1130_missing" ]; then
+    fail "D12: these migrated gates lost the CI_ACTOR_TOKEN fallback on their named read step ($g1130_missing) -- they are back on the 1,000/hr GITHUB_TOKEN budget (#1130)"
   else
-    pass "D12: all $g1130_fallbacks CI_ACTOR_TOKEN fallback(s) sit on check-run-free steps (#1130)"
+    pass "D12: each migrated gate carries the fallback on its own named read step, and no fallback sits on a check-run step (#1130)"
   fi
 fi
 

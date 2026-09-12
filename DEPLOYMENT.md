@@ -299,6 +299,10 @@ Go to the new repo → Settings → Secrets and variables → Actions → New re
 | `REVIEWER_ASSIGNMENT_TOKEN` | PAT for a **reviewer identity** (e.g., `nathanpayne-claude`) — NOT `nathanjohnpayne` | Classic with `repo` scope (collaborator account) |
 | `CI_ACTOR_TOKEN` | PAT for the **CI service account** (`nathanpayne-robot`) — holds no reviewer standing | Classic with `repo` scope (service account) |
 
+> **`CI_ACTOR_TOKEN` scope, for a PRIVATE or internal consumer (#1130).** The required gates read code-scanning alerts to resolve GHAS finding severity (`scripts/lib/ghas-alert-severity.sh` → `GET /repos/{owner}/{repo}/code-scanning/alerts/{number}`). GitHub requires the `security_events` scope for that endpoint on a private repository; `public_repo` covers it only for public ones, and the workflow-level `security-events: read` grant applies to `GITHUB_TOKEN`, **not** to a PAT. So a private consumer whose `CI_ACTOR_TOKEN` carries only `repo` will see that read 403 as soon as a PR has a GHAS finding, and the required gate fails closed.
+>
+> Measured 2026-09-12: every repo in the fleet is currently **public**, and a classic `repo`-scope PAT reads the alerts endpoint there successfully (HTTP 200 on `mergepath`, `swipewatch`, `matchline`, `tadlockpsychiatry`), so this is latent rather than live. Add `security_events` when provisioning this secret for any repository that is private or may become private.
+
 Before enabling Dependabot auto-merge or #1058, create the target Actions environment `merge-queue-policy`. Disable administrator bypass, configure no required reviewers and no wait timer, select custom deployment branches, and allow exactly one branch named `main`. Store exactly these three pairwise-distinct values as environment secrets, never as repository or organization secrets:
 
 | Secret name | Value | PAT type |
