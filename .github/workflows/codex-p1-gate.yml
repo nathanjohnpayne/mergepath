@@ -327,77 +327,83 @@ jobs:
             # persisted archive record, even though accounting later rejects that
             # source. Inline-only matches accounting's own enumeration rule: GHAS
             # never posts a top-level review body or a PR-level issue comment.
-            if [ "$ghas_libs_ok" = 1 ] && [ "$source_kind" = "inline" ] && [ "$source_login" = "$ghas_bot_login" ]; then
-              alert_number=$(ghas_alert_number_from_body "$(cat "$previous_file")")
-              if [ -n "$alert_number" ]; then
-                # A failed cache_init (disk/permissions) leaves
-                # GHAS_SEVERITY_CACHE unset, which ghas_alert_severity below
-                # already treats as an rc-3 read failure -- same WARN+p2
-                # fallback as a failed live fetch, so no separate handling
-                # is needed here.
-                ghas_severity_cache_init || true
-                trap 'ghas_severity_cache_cleanup; rm -f "$previous_file" "$archive_records_file" "$payload_file"' EXIT
-                ghas_severity=""
-                if ghas_severity=$(ghas_alert_severity "$REPO" "$alert_number"); then
-                  # Read succeeded: the rule genuinely carries no assigned
-                  # severity (e.g. a non-security CodeQL quality query).
-                  # p2 is the correct classification here, same as live.
-                  ghas_tier=$(ghas_severity_tier "$ghas_severity")
-                  ghas_tier="${ghas_tier:-p2}"
+            if [ "$source_kind" = "inline" ] && [ "$source_login" = "$ghas_bot_login" ]; then
+              # #1221: helpers gate the ENRICHMENT only. Nested inside the
+              # identity guard rather than folded into it, so the #1124
+              # ordering property (extraction and the privileged read never
+              # precede the source-identity check) is textually unchanged.
+              if [ "$ghas_libs_ok" = 1 ]; then
+                alert_number=$(ghas_alert_number_from_body "$(cat "$previous_file")")
+                if [ -n "$alert_number" ]; then
+                  # A failed cache_init (disk/permissions) leaves
+                  # GHAS_SEVERITY_CACHE unset, which ghas_alert_severity below
+                  # already treats as an rc-3 read failure -- same WARN+p2
+                  # fallback as a failed live fetch, so no separate handling
+                  # is needed here.
+                  ghas_severity_cache_init || true
+                  trap 'ghas_severity_cache_cleanup; rm -f "$previous_file" "$archive_records_file" "$payload_file"' EXIT
+                  ghas_severity=""
+                  if ghas_severity=$(ghas_alert_severity "$REPO" "$alert_number"); then
+                    # Read succeeded: the rule genuinely carries no assigned
+                    # severity (e.g. a non-security CodeQL quality query).
+                    # p2 is the correct classification here, same as live.
+                    ghas_tier=$(ghas_severity_tier "$ghas_severity")
+                    ghas_tier="${ghas_tier:-p2}"
+                  else
+                    # Codex review, PR #1124: a FAILED read (network/rate-limit
+                    # -- distinct from the branch above, where the read
+                    # succeeded and simply found no severity) must NOT default
+                    # to p2. A repo with feedback_policy.priorities.p2: ignore
+                    # would then have strongest_nonignored_archive_tier drop
+                    # the archived record from inventory entirely -- an
+                    # originally p0/p1 finding vanishing not because anyone
+                    # reviewed it, but because of a transient infrastructure
+                    # failure at the exact moment its comment was archived.
+                    # Live evaluation avoids this because a failed read there
+                    # hard-fails the gate (exit 2) rather than ever reaching a
+                    # tier classification an ignore policy could act on.
+                    # Archival can't hard-fail (there is no scheduled retry,
+                    # and the record would be lost forever), so it defaults to
+                    # p1 instead -- required under this repo's own default
+                    # feedback_policy split (P0/P1-required), erring toward
+                    # over-inclusion for a genuinely unresolved severity
+                    # rather than risking silent exclusion.
+                    echo "::warning::could not resolve code-scanning alert #$alert_number severity for archival ($source_kind $source_id); archiving at p1 (unresolved, not p2, so a p2:ignore policy cannot silently drop it)."
+                    ghas_tier=p1
+                  fi
                 else
-                  # Codex review, PR #1124: a FAILED read (network/rate-limit
-                  # -- distinct from the branch above, where the read
-                  # succeeded and simply found no severity) must NOT default
-                  # to p2. A repo with feedback_policy.priorities.p2: ignore
-                  # would then have strongest_nonignored_archive_tier drop
-                  # the archived record from inventory entirely -- an
-                  # originally p0/p1 finding vanishing not because anyone
-                  # reviewed it, but because of a transient infrastructure
-                  # failure at the exact moment its comment was archived.
-                  # Live evaluation avoids this because a failed read there
-                  # hard-fails the gate (exit 2) rather than ever reaching a
-                  # tier classification an ignore policy could act on.
-                  # Archival can't hard-fail (there is no scheduled retry,
-                  # and the record would be lost forever), so it defaults to
-                  # p1 instead -- required under this repo's own default
-                  # feedback_policy split (P0/P1-required), erring toward
-                  # over-inclusion for a genuinely unresolved severity
-                  # rather than risking silent exclusion.
-                  echo "::warning::could not resolve code-scanning alert #$alert_number severity for archival ($source_kind $source_id); archiving at p1 (unresolved, not p2, so a p2:ignore policy cannot silently drop it)."
-                  ghas_tier=p1
+                  # Codex review, PR #1124 (two rounds): live accounting's
+                  # ghas_finding_tier ALSO falls back to p2 when no alert link
+                  # can be parsed from a GHAS-authored body -- unlike a
+                  # Codex/CodeRabbit body with no classifiable marker at all
+                  # (which was never a "finding" even while live), a linkless
+                  # GHAS comment IS still tracked as a p2 finding today.
+                  # Without this branch, archiving such a comment would
+                  # silently drop it below the "markerless has nothing to
+                  # preserve" check further down, reopening the exact
+                  # vanish-on-edit gap #1113 exists to close, just for this
+                  # narrower shape.
+                  ghas_tier=p2
                 fi
               else
-                # Codex review, PR #1124 (two rounds): live accounting's
-                # ghas_finding_tier ALSO falls back to p2 when no alert link
-                # can be parsed from a GHAS-authored body -- unlike a
-                # Codex/CodeRabbit body with no classifiable marker at all
-                # (which was never a "finding" even while live), a linkless
-                # GHAS comment IS still tracked as a p2 finding today.
-                # Without this branch, archiving such a comment would
-                # silently drop it below the "markerless has nothing to
-                # preserve" check further down, reopening the exact
-                # vanish-on-edit gap #1113 exists to close, just for this
-                # narrower shape.
-                ghas_tier=p2
+                # #1221, CodeRabbit + Codex: a GHAS body whose only content is
+                # its alert link carries no text marker, so with an EMPTY tier
+                # render-feedback-archive.sh takes the "markerless edits have
+                # nothing to preserve" exit above and emits NO record -- exiting
+                # 0, so nothing notices. Measured on the renderer: link-only body
+                # with "" -> 0 records, with p1 -> 1 record. The first-delivery
+                # degrade would therefore have silently dropped the one-shot
+                # previous body of a P0/P1 security finding, which is strictly
+                # worse than the deadlock it replaces.
+                #
+                # p1, not p2, for the same reason the failed-read branch above
+                # chooses p1: the severity is genuinely unresolved here, and a
+                # repo configuring p2 as ignore would otherwise have accounting
+                # drop the record from inventory entirely. Over-inclusion beats
+                # silent exclusion when nobody has reviewed it.
+                echo "::warning::code-scanning enrichment is unavailable in the first-delivery window; archiving $source_kind $source_id at p1 (unresolved) so a link-only GHAS body is not dropped as markerless (#1221)"
+                ghas_tier=p1
               fi
-            elif [ "$source_kind" = "inline" ] && [ "$source_login" = "$ghas_bot_login" ]; then
-              # #1221, CodeRabbit + Codex: a GHAS body whose only content is
-              # its alert link carries no text marker, so with an EMPTY tier
-              # render-feedback-archive.sh takes the "markerless edits have
-              # nothing to preserve" exit above and emits NO record -- exiting
-              # 0, so nothing notices. Measured on the renderer: link-only body
-              # with "" -> 0 records, with p1 -> 1 record. The first-delivery
-              # degrade would therefore have silently dropped the one-shot
-              # previous body of a P0/P1 security finding, which is strictly
-              # worse than the deadlock it replaces.
-              #
-              # p1, not p2, for the same reason the failed-read branch above
-              # chooses p1: the severity is genuinely unresolved here, and a
-              # repo configuring p2 as ignore would otherwise have accounting
-              # drop the record from inventory entirely. Over-inclusion beats
-              # silent exclusion when nobody has reviewed it.
-              echo "::warning::code-scanning enrichment is unavailable in the first-delivery window; archiving $source_kind $source_id at p1 (unresolved) so a link-only GHAS body is not dropped as markerless (#1221)"
-              ghas_tier=p1
             fi
 
             # The renderer emits one v1 record or a complete set of chunked v2

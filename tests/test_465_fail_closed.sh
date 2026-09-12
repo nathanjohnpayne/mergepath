@@ -450,8 +450,16 @@ else
 fi
 if [ ! -f "$W/codex-p1-gate.yml" ]; then
   echo "SKIP: D12 GHAS first-delivery fallback (#1221) ($W/codex-p1-gate.yml absent)"; SKIP=$((SKIP + 1))
-elif grep -Fq 'ghas_tier=p1' "$W/codex-p1-gate.yml" \
-     && awk '/^ *elif \[ "\$source_kind" = "inline" \] && \[ "\$source_login" = "\$ghas_bot_login" \]; then/ { found = 1 } END { exit (found ? 0 : 1) }' "$W/codex-p1-gate.yml"; then
+elif awk '
+       match($0, /^ *if \[ "\$source_kind" = "inline" \] && \[ "\$source_login" = "\$ghas_bot_login" \]; then/) { ident = 1; next }
+       ident && match($0, /^ *if \[ "\$ghas_libs_ok" = 1 \]; then/) {
+         nested = 1; depth = index($0, "if") - 1; next
+       }
+       nested && $0 == sprintf("%*selse", depth, "") { in_else = 1; next }
+       in_else && match($0, /^ *ghas_tier=p1$/) { found = 1 }
+       in_else && $0 == sprintf("%*sfi", depth, "") { in_else = 0 }
+       END { exit (found ? 0 : 1) }
+     ' "$W/codex-p1-gate.yml"; then
   pass "D12: the first-delivery degrade assigns a conservative tier for a GHAS source rather than an empty one (#1221)"
 else
   fail "D12: the first-delivery degrade leaves ghas_tier empty for a GHAS source -- a link-only body would be dropped as markerless (#1221)"
