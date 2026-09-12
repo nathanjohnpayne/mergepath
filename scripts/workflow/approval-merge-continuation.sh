@@ -170,6 +170,21 @@ policy_snapshot_signature() {
   }' <<<"$1"
 }
 
+# Identity of the auto-merge REQUEST itself, which the PR tuple above does not
+# carry: an arm can be disabled and a different one enabled while head, base and
+# author stay put. Disabling and re-enabling always produces a fresh `enabledAt`,
+# so these three fields separate "the same standing request" from "a replacement
+# that appeared mid-run". Deliberately narrow -- `commitHeadline` and
+# `commitBody` are payload rather than identity, and comparing them would report
+# unrelated churn as a replacement.
+arm_request_signature() {
+  jq -c 'if .autoMergeRequest == null then null else {
+    enabledAt: .autoMergeRequest.enabledAt,
+    enabledBy: (.autoMergeRequest.enabledBy.login // null),
+    mergeMethod: .autoMergeRequest.mergeMethod
+  } end' <<<"$1"
+}
+
 # Classify a snapshot's auto-merge arm. The return code is a contract, because
 # the two nonzero outcomes are not the same kind of event (#1159):
 #   0  nothing to retract, or an arm deliberately left intact -- Dependabot's
@@ -330,7 +345,10 @@ if [ "$MODE" = "retract-only" ]; then
   #   * an arm first observed BY the readback appeared DURING this continuation,
   #     which is a concurrency signal, not a standing state;
   #   * a moved head/base/author means the arm being judged is not the arm that
-  #     was classified, which the messages below already call unclassified.
+  #     was classified, which the messages below already call unclassified;
+  #   * a REPLACED request -- the original disabled and another enabled while the
+  #     PR tuple stayed identical -- is the same concurrency event one field
+  #     deeper, and the tuple comparison alone cannot see it.
   protective_standing_arm=0
   set +e
   protection_snapshot=$(read_pr)
@@ -345,7 +363,11 @@ if [ "$MODE" = "retract-only" ]; then
   elif [ "$(policy_snapshot_signature "$protection_snapshot")" != "$(policy_snapshot_signature "$initial")" ]; then
     echo "approval continuation: PR head/base/author changed during policy classification; treating the latest armed state as unclassified"
   elif [ "$arm_enabled" = "true" ]; then
-    protective_standing_arm=1
+    if [ "$(arm_request_signature "$protection_snapshot")" = "$(arm_request_signature "$initial")" ]; then
+      protective_standing_arm=1
+    else
+      echo "approval continuation: the auto-merge request was replaced during policy classification; treating the latest armed state as unclassified"
+    fi
   fi
 
   if jq -e '.autoMergeRequest == null' >/dev/null 2>&1 <<<"$protection_snapshot"; then

@@ -1264,6 +1264,67 @@ else
   fail "protective mode mutated or accepted a native non-shared durable arm"
 fi
 
+# The PR tuple does not carry the auto-merge REQUEST. An arm disabled and a
+# different one enabled while head, base and author stay identical is the same
+# mid-run concurrency event as the unarmed -> armed case, one field deeper, and
+# must not be deferred as a standing arm. Each field that identifies the request
+# is exercised separately so a projection that silently drops one is caught.
+for replaced_field in enabledAt enabledBy mergeMethod; do
+  reset_fixtures
+  STUB_SUBJECT_MODE=disarm
+  STUB_INITIAL=$(jq -c '
+    .autoMergeRequest = {
+      "enabledAt":"2026-01-09T00:00:00Z",
+      "enabledBy":{"login":"nathanjohnpayne"},
+      "mergeMethod":"SQUASH"
+    }' <<<"$SHARED_BASE")
+  case "$replaced_field" in
+    enabledAt) STUB_SECOND=$(jq -c '.autoMergeRequest.enabledAt = "2026-01-09T00:00:05Z"' <<<"$STUB_INITIAL") ;;
+    enabledBy) STUB_SECOND=$(jq -c '.autoMergeRequest.enabledBy.login = "someone-else"' <<<"$STUB_INITIAL") ;;
+    mergeMethod) STUB_SECOND=$(jq -c '.autoMergeRequest.mergeMethod = "MERGE"' <<<"$STUB_INITIAL") ;;
+  esac
+  set +e
+  run_case
+  replaced_arm_rc=$?
+  set -e
+  if [ "$replaced_arm_rc" -eq 3 ] \
+     && [ ! -s "$TMP/merge.log" ] \
+     && grep -Fq 'the auto-merge request was replaced during policy classification' "$TMP/subject.out" \
+     && grep -Fq 'could not retract and verify the protective auto-merge request' "$TMP/subject.out" \
+     && ! grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary' "$TMP/subject.out"; then
+    pass "a request replaced by $replaced_field fails the sweep instead of deferring it"
+  else
+    fail "a replaced auto-merge request ($replaced_field) was deferred as standing (rc=$replaced_arm_rc)"
+  fi
+done
+
+# The converse, so the comparison stays an IDENTITY test rather than a
+# whole-object diff: commit headline and body are payload the enabling actor
+# chose, not identity. Churn there is not a replacement and must still defer,
+# otherwise the #1159 relief evaporates on unrelated metadata movement.
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_INITIAL=$(jq -c '
+  .autoMergeRequest = {
+    "enabledAt":"2026-01-09T00:00:00Z",
+    "enabledBy":{"login":"nathanjohnpayne"},
+    "mergeMethod":"SQUASH",
+    "commitHeadline":"old headline"
+  }' <<<"$SHARED_BASE")
+STUB_SECOND=$(jq -c '.autoMergeRequest.commitHeadline = "new headline"' <<<"$STUB_INITIAL")
+set +e
+run_case
+same_arm_payload_rc=$?
+set -e
+if [ "$same_arm_payload_rc" -eq 4 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary' "$TMP/subject.out" \
+   && ! grep -Fq 'the auto-merge request was replaced during policy classification' "$TMP/subject.out"; then
+  pass "commit-message churn on the same request is not read as a replacement"
+else
+  fail "payload churn on an unchanged request was misread as a replacement (rc=$same_arm_payload_rc)"
+fi
+
 # The governing policy can resolve and still establish nothing: the normal
 # continuation has a separate guard for a policy naming no author_identity, and
 # it sits below this mode's exit alongside the policy_rc guard. A standing arm
