@@ -465,11 +465,13 @@ test_print_exports_error_paths_fail_closed() {
   make_stale_cache "$stale" claude
   make_fresh_cache "$incomplete" claude "pe-rev" "pe-auth"   # review cache, asked for deploy
 
-  local label dir extra rc out
-  for spec in "stale:$stale:" "missing:$missing:" "incomplete:$incomplete:--mode deploy"; do
+  local label dir extra want rc out
+  for spec in "stale:$stale::--mode review" "missing:$missing::--mode review" \
+              "incomplete:$incomplete:--mode deploy:--mode deploy"; do
     label="${spec%%:*}"
     dir="$(printf '%s' "$spec" | cut -d: -f2)"
     extra="$(printf '%s' "$spec" | cut -d: -f3)"
+    want="$(printf '%s' "$spec" | cut -d: -f4)"
     rc=0
     out=$(bash -c '
       eval "$(PATH="$2:$PATH" OP_PREFLIGHT_CACHE_DIR="$3" "$1" --agent claude --check --print-exports $4 2>/dev/null)"
@@ -483,12 +485,48 @@ test_print_exports_error_paths_fail_closed() {
       fail "test_print_exports_error_paths_fail_closed: execution continued past the eval on the $label path ($out)"
       return
     fi
-    if ! grep -q -- "--mode review" "$WORKDIR/pe-$label.err"; then
-      fail "test_print_exports_error_paths_fail_closed: $label path does not name the remediation; got $(cat "$WORKDIR/pe-$label.err")"
+    # review and deploy share the per-agent session file but not its contents, so
+    # a review cache is exactly what makes the deploy case incomplete. The
+    # remediation has to name the mode the caller ASKED for or it sends them
+    # back to the run that already failed them.
+    if ! grep -q -- "$want" "$WORKDIR/pe-$label.err"; then
+      fail "test_print_exports_error_paths_fail_closed: $label path should name '$want'; got $(cat "$WORKDIR/pe-$label.err")"
       return
     fi
   done
   pass "test_print_exports_error_paths_fail_closed: --print-exports fails closed on stale/missing/incomplete"
+}
+
+# ---------------------------------------------------------------------------
+# #1021, CodeRabbit round 2. The guard line is EVALUATED by the caller, so every
+# value interpolated into it is code. $MODE is not validated on the --check
+# path, and before the fix `--mode 'review"; <command>; echo "'` escaped the
+# double-quoted echo and ran in the caller's shell. Reproduced against the real
+# script before fixing.
+# ---------------------------------------------------------------------------
+test_check_guard_is_injection_safe() {
+  local case_dir="$WORKDIR/case1021_inj"   # never created -> the failure guard path
+  local canary="$WORKDIR/INJECTION-CANARY"
+  rm -f "$canary"
+
+  local rc=0
+  bash -c '
+    eval "$(PATH="$2:$PATH" OP_PREFLIGHT_CACHE_DIR="$3" "$1" --agent claude --check --print-exports \
+      --mode "review\"; touch $4; echo \"" 2>/dev/null)"
+    echo REACHED
+  ' _ "$SCRIPT" "$STUB_DIR" "$case_dir" "$canary" >"$WORKDIR/inj.out" 2>/dev/null || rc=$?
+
+  if [ -e "$canary" ]; then
+    fail "test_check_guard_is_injection_safe: evaluating the guard executed --mode content"
+    rm -f "$canary"
+    return
+  fi
+  # Still fail closed: quoting must not turn the guard into a no-op.
+  if [ "$rc" -eq 0 ] || grep -q REACHED "$WORKDIR/inj.out"; then
+    fail "test_check_guard_is_injection_safe: guard stopped failing closed once quoted (rc=$rc)"
+    return
+  fi
+  pass "test_check_guard_is_injection_safe: hostile --mode is inert text and the guard still fails closed"
 }
 
 # ---------------------------------------------------------------------------
@@ -1599,6 +1637,7 @@ test_check_emits_no_credentials
 test_check_compat_guard_fails_closed
 test_print_exports_eval_populates_both_vars
 test_print_exports_error_paths_fail_closed
+test_check_guard_is_injection_safe
 test_quiet_mode
 test_default_mode_is_review
 test_default_ttl_is_ten_hours

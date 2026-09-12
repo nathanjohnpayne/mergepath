@@ -907,8 +907,15 @@ warm_ssh_keys() {
 # than the leak this change closes. So stdout carries a guard that is inert when
 # read but fails loudly when evaluated. Remove it once every consumer passes
 # --print-exports; tracked separately.
+# The emitted line is EVALUATED by the caller, so every interpolated value must
+# be shell-quoted -- $MODE is not validated on the --check path, and
+# `--mode 'review"; <command>; echo "'` escaped the double-quoted echo and ran
+# in the caller's shell (CodeRabbit, round 2; reproduced before fixing). Quoting
+# happens HERE, once, rather than at each call site: a later caller cannot
+# forget it. This is the same `printf '%q'` treatment the export emitters
+# already give $AGENT.
 emit_eval_guard() { # <message>
-  printf '%s\n' "echo \"op-preflight: $1\" >&2; return 1 2>/dev/null || exit 1"
+  printf 'echo %s >&2; return 1 2>/dev/null || exit 1\n' "$(printf '%q' "op-preflight: $1")"
 }
 emit_check_compat_guard() {
   emit_eval_guard "--check no longer prints exports (mergepath#1021); re-run with --print-exports to populate OP_PREFLIGHT_*_PAT"
@@ -923,7 +930,7 @@ emit_check_compat_guard() {
 # tells everyone to use. The invariant is therefore: stdout always carries
 # something that FAILS when evaluated, unless real exports are being emitted.
 emit_check_failure_guard() {
-  emit_eval_guard "--check found no usable cache for agent=$AGENT (mode=$MODE); run: scripts/op-preflight.sh --agent $AGENT --mode review"
+  emit_eval_guard "--check found no usable cache for agent=$AGENT (mode=$MODE); run: scripts/op-preflight.sh --agent $AGENT --mode $MODE"
 }
 
 if $CHECK; then
