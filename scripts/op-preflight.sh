@@ -907,8 +907,23 @@ warm_ssh_keys() {
 # than the leak this change closes. So stdout carries a guard that is inert when
 # read but fails loudly when evaluated. Remove it once every consumer passes
 # --print-exports; tracked separately.
+emit_eval_guard() { # <message>
+  printf '%s\n' "echo \"op-preflight: $1\" >&2; return 1 2>/dev/null || exit 1"
+}
 emit_check_compat_guard() {
-  printf '%s\n' 'echo "op-preflight: --check no longer prints exports (mergepath#1021); re-run with --print-exports to populate OP_PREFLIGHT_*_PAT" >&2; return 1 2>/dev/null || exit 1'
+  emit_eval_guard "--check no longer prints exports (mergepath#1021); re-run with --print-exports to populate OP_PREFLIGHT_*_PAT"
+}
+# The ERROR paths need a guard even WITH --print-exports, and that is not the
+# same hazard as the compat one. `eval "$(cmd)"` discards the command
+# substitution's exit status: a script that exits 2 having printed nothing makes
+# `eval` return 0, so the documented caller sails on with both PATs unset --
+# verified, `eval "$(... --check --print-exports)"` against a missing cache
+# returns rc=0 with OP_PREFLIGHT_REVIEWER_PAT unset. That is the same silent
+# keyring fallback #1021 is closing, reached through the path this change now
+# tells everyone to use. The invariant is therefore: stdout always carries
+# something that FAILS when evaluated, unless real exports are being emitted.
+emit_check_failure_guard() {
+  emit_eval_guard "--check found no usable cache for agent=$AGENT (mode=$MODE); run: scripts/op-preflight.sh --agent $AGENT --mode review"
 }
 
 if $CHECK; then
@@ -916,7 +931,7 @@ if $CHECK; then
     echo "# preflight: cache missing or stale for agent=$AGENT" >&2
     echo "#   run: scripts/op-preflight.sh --agent $AGENT --mode review" >&2
     echo "#   then re-run this command." >&2
-    $PRINT_EXPORTS || emit_check_compat_guard
+    emit_check_failure_guard
     exit 2
   fi
   # The session is fresh. Emit the cached exports the same way the fast
@@ -933,7 +948,7 @@ if $CHECK; then
   if [[ "$rc" != "0" ]]; then
     echo "# preflight: cache present but incomplete for agent=$AGENT (mode=$MODE)" >&2
     echo "#   run: scripts/op-preflight.sh --agent $AGENT --mode review" >&2
-    $PRINT_EXPORTS || emit_check_compat_guard
+    emit_check_failure_guard
     exit 2
   fi
   # #1021: the liveness check and the token dump used to be the SAME

@@ -242,8 +242,8 @@ test_check_missing_cache() {
     fail "test_check_missing_cache: stdout carries a PAT export on the miss path: $(cat "$WORKDIR/case2.out")"
     return
   fi
-  if [ -s "$WORKDIR/case2.out" ] && ! grep -q -- "--print-exports" "$WORKDIR/case2.out"; then
-    fail "test_check_missing_cache: unexpected stdout on miss, got $(cat "$WORKDIR/case2.out")"
+  if [ -s "$WORKDIR/case2.out" ] && ! grep -qF 'return 1 2>/dev/null || exit 1' "$WORKDIR/case2.out"; then
+    fail "test_check_missing_cache: stdout on miss is not an eval-failing guard, got $(cat "$WORKDIR/case2.out")"
     return
   fi
   if ! echo "$err" | grep -q "cache missing or stale"; then
@@ -447,6 +447,48 @@ test_print_exports_eval_populates_both_vars() {
     return
   fi
   pass "test_print_exports_eval_populates_both_vars: eval \"\$(... --print-exports)\" populates both PATs"
+}
+
+# ---------------------------------------------------------------------------
+# #1021, Codex P1 round 2. The compat guard was gated on --print-exports, so the
+# path this change now tells EVERYONE to use was the one path it did not
+# protect. `eval "$(cmd)"` discards the command substitution's exit status: a
+# script that exits 2 having printed nothing makes `eval` return 0, so the
+# documented caller continued with both PATs unset and fell through to the gh
+# keyring -- the exact wrong-identity behaviour #1021 closes. The invariant is
+# that stdout always carries something that FAILS when evaluated, unless real
+# exports are being emitted.
+# ---------------------------------------------------------------------------
+test_print_exports_error_paths_fail_closed() {
+  local stale="$WORKDIR/case1021_pe_stale" missing="$WORKDIR/case1021_pe_missing"
+  local incomplete="$WORKDIR/case1021_pe_incomplete"
+  make_stale_cache "$stale" claude
+  make_fresh_cache "$incomplete" claude "pe-rev" "pe-auth"   # review cache, asked for deploy
+
+  local label dir extra rc out
+  for spec in "stale:$stale:" "missing:$missing:" "incomplete:$incomplete:--mode deploy"; do
+    label="${spec%%:*}"
+    dir="$(printf '%s' "$spec" | cut -d: -f2)"
+    extra="$(printf '%s' "$spec" | cut -d: -f3)"
+    rc=0
+    out=$(bash -c '
+      eval "$(PATH="$2:$PATH" OP_PREFLIGHT_CACHE_DIR="$3" "$1" --agent claude --check --print-exports $4 2>/dev/null)"
+      printf "REACHED:%s:%s" "${OP_PREFLIGHT_REVIEWER_PAT:-UNSET}" "${OP_PREFLIGHT_AUTHOR_PAT:-UNSET}"
+    ' _ "$SCRIPT" "$STUB_DIR" "$dir" "$extra" 2>"$WORKDIR/pe-$label.err") || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      fail "test_print_exports_error_paths_fail_closed: $label path returned rc=0; eval swallowed the failure (out=$out)"
+      return
+    fi
+    if [ -n "$out" ]; then
+      fail "test_print_exports_error_paths_fail_closed: execution continued past the eval on the $label path ($out)"
+      return
+    fi
+    if ! grep -q -- "--mode review" "$WORKDIR/pe-$label.err"; then
+      fail "test_print_exports_error_paths_fail_closed: $label path does not name the remediation; got $(cat "$WORKDIR/pe-$label.err")"
+      return
+    fi
+  done
+  pass "test_print_exports_error_paths_fail_closed: --print-exports fails closed on stale/missing/incomplete"
 }
 
 # ---------------------------------------------------------------------------
@@ -1556,6 +1598,7 @@ test_status_alias
 test_check_emits_no_credentials
 test_check_compat_guard_fails_closed
 test_print_exports_eval_populates_both_vars
+test_print_exports_error_paths_fail_closed
 test_quiet_mode
 test_default_mode_is_review
 test_default_ttl_is_ten_hours
