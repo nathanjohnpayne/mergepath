@@ -364,8 +364,11 @@ test_new_trigger_replaces_superseded_timeout_marker
 # g1100_decide is invoked inside a command substitution, so a shell variable
 # set there cannot reach the caller. The scratch dir travels back in a sidecar
 # file so the post-call assertions below can inspect what the run left behind.
-G1100_LASTDIR="$(mktemp "${TMPDIR:-/tmp}/g1100-lastdir.XXXXXX")"
-trap 'rm -f "$G1100_LASTDIR"' EXIT
+# Inside WORKDIR, so the EXIT trap registered with it at the top of this file
+# is the only one. A second `trap ... EXIT` REPLACES the first rather than
+# extending it, which leaked the whole WORKDIR tree on every run -- and this
+# suite runs in required CI via scripts/ci/check_codex_scripts.
+G1100_LASTDIR="$(mktemp "$WORKDIR/g1100-lastdir.XXXXXX")"
 
 g1100_extract() {  # <fn-name> -- the REAL function body, so a revert is executed
   # Prefix match, not an awk -v regex: -v processes escape sequences, so the
