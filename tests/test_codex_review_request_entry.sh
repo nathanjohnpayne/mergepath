@@ -427,12 +427,20 @@ STUB
     # exercised by the feedback-policy-helpers suite. Keeping them stubbed also
     # keeps this suite hermetic on a runner with no YAML parser, where the real
     # reader returns rc 1 for every shape alike.
-    policy_block_field_parsed() { case "$1" in
+    # Every reader records the policy path it was handed. Without that, a
+    # regression that reads $CONFIG -- the CANDIDATE checkout, the round-1 P1
+    # privilege escalation -- passes unnoticed: the stubs return the same
+    # values whatever path they are given, and $CONFIG exists and is readable
+    # here. The assertions below require every reader path to equal the one
+    # materialized base policy.
+    policy_block_field_parsed() { printf '%s\n' "${3:-<none>}" >> "$fake/reader-paths.log"
+      case "$1" in
       coderabbit) printf '%s' "${G1100_CR-coderabbitai[bot]}" ;;
       code_scanning) printf '%s' "${G1100_GHAS-github-advanced-security[bot]}" ;;
       codex) printf '%s' "${G1100_CODEX-chatgpt-codex-connector[bot]}" ;;
       *) printf '' ;; esac; }
     policy_yaml_to_json() {
+      printf '%s\n' "${1:-<none>}" >> "$fake/reader-paths.log"
       printf '{"author_identity":%s,"available_reviewers":%s}' \
         "$(printf '%s' "${G1100_AUTHOR-nathanjohnpayne}" | jq -Rs 'rtrimstr("\n")')" \
         "$(printf '%s' "${G1100_REVIEWERS-nathanpayne-codex nathanpayne-claude}" \
@@ -565,6 +573,25 @@ if [ -n "${G1100_FAKE:-}" ] && [ -s "$G1100_FAKE/materialized.log" ] \
   pass "#1100: accounting is handed the one materialized policy, not a second resolution"
 else
   fail "#1100: accounting CONFIG ($(cat "${G1100_FAKE:-}/accounting-config.log" 2>/dev/null)) is not the one materialized policy ($(cat "${G1100_FAKE:-}/materialized.log" 2>/dev/null))"
+fi
+# The relax and collision readers must be handed that SAME path. Asserting only
+# the accounting CONFIG leaves the original privilege escalation untested: a
+# reader that took $CONFIG -- the candidate checkout a PR can edit -- would keep
+# every case above green, because the stubs answer identically whatever path
+# they are given (CodeRabbit, round 4).
+g1100_reader_paths_ok() {
+  local materialized reader
+  [ -n "${G1100_FAKE:-}" ] && [ -s "$G1100_FAKE/reader-paths.log" ] || return 1
+  materialized="$(cat "$G1100_FAKE/materialized.log")"
+  while IFS= read -r reader; do
+    [ "$reader" = "$materialized" ] || return 1
+  done < "$G1100_FAKE/reader-paths.log"
+  return 0
+}
+if g1100_reader_paths_ok; then
+  pass "#1100: the relax and collision readers are handed the base policy, never \$CONFIG"
+else
+  fail "#1100: a policy reader was handed $(sort -u "${G1100_FAKE:-}/reader-paths.log" 2>/dev/null | tr '\n' ' ') rather than the base policy $(cat "${G1100_FAKE:-}/materialized.log" 2>/dev/null)"
 fi
 rm -rf "${G1100_FAKE:-/nonexistent}"
 
