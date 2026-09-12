@@ -19,8 +19,13 @@
 #       [--head <sha>] [--diff-file <path>] [--dry-run] [--force-enabled]
 #
 # Overrides (mostly for tests / non-git contexts):
-#   --author         PR's authoring agent (claude|codex|...). Default: parsed
-#                    from the PR body `Authoring-Agent:` line.
+#   --author         PR's authoring agent (claude|codex|...). NOT an override
+#                    (#1143): the PR body is read and validated against the
+#                    shared contract on every run, and this flag is only
+#                    cross-checked against the `Authoring-Agent:` the body
+#                    declares. A disagreement fails closed (exit 3); omitting
+#                    the flag simply skips the cross-check. There is no way to
+#                    make Phase 4b act on an identity the body does not carry.
 #   --reviewer       force the external reviewer login (skips selection, but
 #                    still must differ from the authoring agent).
 #   --head           HEAD sha. Default: gh api pulls/<n> .head.sha.
@@ -281,30 +286,51 @@ if [ -z "$HEAD" ]; then
   [ -n "$HEAD" ] || p4b_die 3 "could not resolve HEAD sha for $REPO#$PR; pass --head"
 fi
 
-# Authoring agent: explicit override, else parse the PR body line. Required
-# even when --reviewer is forced so the cross-agent invariant still applies.
-if [ -z "$AUTHOR" ]; then
-  need_gh
-  # #799: `--jq '.body // ""'` reads as a safe default and is not one — gh
-  # emits the error body WITHOUT running the filter, so the `// ""` never
-  # applies. No `--shape` is possible on free text (a PR body may legitimately
-  # be empty, or contain anything), so the status is the whole guard here:
-  # gh_api_scalar returns 3 with empty stdout, and the Authoring-Agent parse
-  # below then finds nothing and dies with its own message instead of scanning
-  # a JSON error body for an agent name.
-  body="$(gh_api_scalar "PR body for $REPO#$PR" \
-    "repos/$REPO/pulls/$PR" --jq '.body // ""')" || body=""
-  # Validate the body against the SHARED contract before trusting any identity
-  # parsed out of it (#855). Phase 4b sourced pr-body-contract.sh and then only
-  # extracted the agent, so a body that the required Self-Review gate would
-  # reject -- a duplicate marker, an unknown agent, a heading hidden in a code
-  # fence -- still selected a reviewer here. One contract, one implementation,
-  # both enforcement paths.
-  pr_body_validate "$body" "$(p4b_config)" \
-    || p4b_die 3 "PR body does not satisfy the Authoring-Agent contract"
-  AUTHOR="$(pr_body_authoring_agent "$body")"
-  [ -n "$AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body; pass --author"
+# Authoring agent. The PR BODY is the record of authorship, and it is read and
+# validated on EVERY run (#1143). Required even when --reviewer is forced, so
+# the cross-agent invariant still applies.
+#
+# #1143: this block used to run only under `[ -z "$AUTHOR" ]`, which made the
+# contract enforced for callers that omitted `--author` and unenforced for
+# callers that passed it — backwards from what the flag means. `--author` is a
+# convenience for a caller that already knows the identity, never an assertion
+# that the body is well-formed and never a licence to skip reading it. There is
+# deliberately NO opt-out: a caller that cannot produce a contract-satisfying
+# body has not established who authored the PR, and Phase 4b must not pick a
+# reviewer against an identity nothing corroborates.
+need_gh
+# #799: `--jq '.body // ""'` reads as a safe default and is not one — gh
+# emits the error body WITHOUT running the filter, so the `// ""` never
+# applies. No `--shape` is possible on free text (a PR body may legitimately
+# be empty, or contain anything), so the status is the whole guard here:
+# gh_api_scalar returns 3 with empty stdout, and the contract check below then
+# rejects the empty body instead of scanning a JSON error body for an agent
+# name.
+body="$(gh_api_scalar "PR body for $REPO#$PR" \
+  "repos/$REPO/pulls/$PR" --jq '.body // ""')" || body=""
+# Validate the body against the SHARED contract before trusting any identity
+# parsed out of it (#855). Phase 4b sourced pr-body-contract.sh and then only
+# extracted the agent, so a body that the required Self-Review gate would
+# reject -- a duplicate marker, an unknown agent, a heading hidden in a code
+# fence -- still selected a reviewer here. One contract, one implementation,
+# both enforcement paths.
+pr_body_validate "$body" "$(p4b_config)" \
+  || p4b_die 3 "PR body does not satisfy the Authoring-Agent contract"
+BODY_AUTHOR="$(pr_body_authoring_agent "$body")"
+[ -n "$BODY_AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body"
+# #1143: when the caller ALSO named an identity, the two must agree. Compare
+# the normalized AGENT on both sides (p4b_agent_of_login lowercases and strips
+# the `nathanpayne-` prefix), because the agent — not the literal spelling — is
+# what selects the reviewer and carries the cross-agent invariant below. A
+# disagreement fails closed rather than silently preferring the flag, which
+# could otherwise pair the PR with a reviewer the real authoring agent must not
+# be paired with.
+if [ -n "$AUTHOR" ] \
+   && [ "$(p4b_agent_of_login "$AUTHOR")" != "$(p4b_agent_of_login "$BODY_AUTHOR")" ]; then
+  p4b_die 3 "--author '$AUTHOR' contradicts the PR body's Authoring-Agent '$BODY_AUTHOR'"
 fi
+# The body wins even when they agree: one source of truth downstream.
+AUTHOR="$BODY_AUTHOR"
 
 # --- select reviewer + adapter ---------------------------------------------
 AUTHOR_AGENT="$(p4b_agent_of_login "$AUTHOR")"

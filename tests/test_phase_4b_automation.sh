@@ -370,6 +370,33 @@ if [ "${1:-}" = "api" ]; then
   fi
   case "${2:-}" in
     repos/o/r/pulls/*)
+      # #1143: the orchestrator now reads the PR body on EVERY run, not only
+      # when --author is absent, so this fake has to serve one. The two reads
+      # hit the same endpoint and are told apart by the --jq expression.
+      # P4B_FAKE_PR_BODY_FILE serves an arbitrary body; otherwise a
+      # contract-valid default naming P4B_FAKE_PR_BODY_AGENT (default claude).
+      # A fixture that wants an INVALID body points the file knob at one — the
+      # skip is declared per-fixture, never implied by a flag.
+      for a in "$@"; do
+        case "$a" in
+          *'.body'*)
+            # P4B_FAKE_PR_BODY_FAIL reproduces the #799 shape exactly: gh puts
+            # the JSON ERROR BODY on stdout and exits nonzero, so a caller that
+            # inferred failure from empty output would parse the error body.
+            if [ -n "${P4B_FAKE_PR_BODY_FAIL:-}" ]; then
+              printf '{"message":"Not Found","status":"404"}\n'
+              exit 1
+            fi
+            if [ -n "${P4B_FAKE_PR_BODY_FILE:-}" ]; then
+              cat "$P4B_FAKE_PR_BODY_FILE"
+            else
+              printf 'Authoring-Agent: %s\n\n## Self-Review\n\n- ok.\n' \
+                "${P4B_FAKE_PR_BODY_AGENT:-claude}"
+            fi
+            exit 0
+            ;;
+        esac
+      done
       # #674 round 4: P4B_FAKE_LIVE_HEAD2 simulates a head that drifts
       # between reads — served from the SECOND live-head read on.
       cnt_file="${P4B_ISSUE_LOG:-${TMPDIR:-/tmp}/p4b-fake}.headreads"
@@ -1518,6 +1545,11 @@ set -e
 # ===========================================================================
 echo "orchestrator — entry decision + dispatch (dry-run, offline)"
 # ===========================================================================
+# (#1143) Every orchestrator case below reads the PR body, so the fake `gh`
+# has to be reachable from all of them — not just the non-dry-run cases that
+# already prefixed PATH by hand. $BIN holds only the fakes this suite injects
+# (`gh` plus `fake-*` shims), so prepending it shadows nothing else.
+export PATH="$BIN:$PATH"
 # automation disabled → exit 5
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" bash "$ORCH" 123 --repo o/r 2>/dev/null)"; rc=$?
@@ -1671,7 +1703,7 @@ else fail "Direction A (rc=$rc): $out"; fi
 # Direction B: author=codex → reviewer claude → CHANGES_REQUESTED → exit 1
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-changes" \
-  bash "$ORCH" 124 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 124 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 1 ] \
    && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "CHANGES_REQUESTED" ] \
@@ -1697,13 +1729,131 @@ HANDOFF_LOG="$WORK/handoff-claude.log"
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-junk" \
   P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
-  bash "$ORCH" 126 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 126 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
    && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
    && [ "$(cat "$HANDOFF_LOG")" = "nathanpayne-claude o/r#126" ]; then
   pass "manual fallback handoff targets the selected Claude reviewer for codex-authored PRs"
 else fail "claude fallback target (rc=$rc): $out"; fi
+
+# ---------------------------------------------------------------------------
+# #1143 — --author is cross-checked against the PR body, never a bypass of it
+# ---------------------------------------------------------------------------
+# #855 put the shared-contract check on the orchestrator, but only under
+# `[ -z "$AUTHOR" ]`: the contract was enforced for callers that omitted
+# --author and unenforced for callers that passed it. A caller that supplied
+# the identity on the command line selected a reviewer off a body the required
+# Self-Review gate would have rejected — and nothing ever compared the flag
+# against the agent the body declares, so a caller could pair the PR with a
+# reviewer the real authoring agent must not be paired with.
+#
+# These drive the orchestrator for real. Every case passes --author, because
+# that is precisely the path that used to skip the check.
+P4B1143_BODY="$WORK/p4b1143-body.md"
+p4b1143_run() {  # p4b1143_run <body-file-or-""> <extra orchestrator args...>
+  local bodyfile="$1"; shift
+  local out rc=0
+  set +e
+  out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
+    CLAUDE_BIN="$BIN/fake-claude-approve-usage" \
+    P4B_FAKE_PR_BODY_FILE="$bodyfile" \
+    bash "$ORCH" 1143 --repo o/r --head abc123 --diff-file "$DIFF" --dry-run "$@" 2>&1)"
+  rc=$?
+  set -e
+  printf 'rc=%s %s' "$rc" "$out"
+}
+
+# Every refusal below is discriminated on the ORCHESTRATOR's own p4b_die line,
+# never on pr_body_validate's stderr chatter. The chatter is printed even when
+# the status that carries it is discarded, so matching it proves only that the
+# validator ran — measured: with `pr_body_validate || true` in place, an
+# unknown-agent body still prints "unknown Authoring-Agent" while the run is
+# actually refused by a different check. The die line is the reason of record.
+P4B1143_CONTRACT_DIE="ERROR: PR body does not satisfy the Authoring-Agent contract"
+
+# (a) The three body defects the contract exists to catch — an unknown agent,
+#     a duplicate marker, a `## Self-Review` heading hidden in a code fence —
+#     must all refuse even though --author names a real agent.
+printf 'Authoring-Agent: nobody\n\n## Self-Review\n\n- ok.\n' > "$P4B1143_BODY"
+got="$(p4b1143_run "$P4B1143_BODY" --author claude)"
+case "$got" in
+  rc=0*) fail "#1143: --author accepted an unknown Authoring-Agent: $got" ;;
+  *"$P4B1143_CONTRACT_DIE"*) pass "#1143: --author does not bypass the unknown-agent check" ;;
+  *) fail "#1143: unknown-agent body refused, but not by the contract: $got" ;;
+esac
+
+printf 'Authoring-Agent: claude\nAuthoring-Agent: codex\n\n## Self-Review\n\n- ok.\n' > "$P4B1143_BODY"
+got="$(p4b1143_run "$P4B1143_BODY" --author claude)"
+case "$got" in
+  rc=0*) fail "#1143: --author accepted a duplicate Authoring-Agent marker: $got" ;;
+  *"$P4B1143_CONTRACT_DIE"*) pass "#1143: --author does not bypass the duplicate-marker check" ;;
+  *) fail "#1143: duplicate-marker body refused, but not by the contract: $got" ;;
+esac
+
+printf 'Authoring-Agent: claude\n\ntext\n\n```\n## Self-Review\n```\n' > "$P4B1143_BODY"
+got="$(p4b1143_run "$P4B1143_BODY" --author claude)"
+case "$got" in
+  rc=0*) fail "#1143: --author accepted a fenced ## Self-Review heading: $got" ;;
+  *"$P4B1143_CONTRACT_DIE"*) pass "#1143: --author does not bypass the fenced-heading check" ;;
+  *) fail "#1143: fenced-heading body refused, but not by the contract: $got" ;;
+esac
+
+# (b) The EMPTY form. A PR body may legitimately be the empty string, and an
+#     empty body carries no identity at all — it must refuse, not fall through
+#     to the flag. A detector that only handles well-formed input is the
+#     fail-open shape this fix exists to remove.
+: > "$P4B1143_BODY"
+got="$(p4b1143_run "$P4B1143_BODY" --author claude)"
+case "$got" in
+  rc=0*) fail "#1143: --author accepted an EMPTY PR body: $got" ;;
+  *"$P4B1143_CONTRACT_DIE"*) pass "#1143: an empty PR body refuses even with --author" ;;
+  *) fail "#1143: empty body refused, but not by the contract: $got" ;;
+esac
+
+# (c) The ABSENT form. The read itself fails: gh writes its JSON error body to
+#     stdout and exits nonzero (#799). The run must refuse, and must not mine
+#     the error body for an agent name.
+got="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" P4B_FAKE_PR_BODY_FAIL=1 \
+  p4b1143_run "" --author claude)"
+case "$got" in
+  rc=0*) fail "#1143: --author accepted an UNREADABLE PR body: $got" ;;
+  *"$P4B1143_CONTRACT_DIE"*) pass "#1143: an unreadable PR body refuses even with --author" ;;
+  *) fail "#1143: unreadable body refused, but not by the contract: $got" ;;
+esac
+
+# (d) The consistency check. A valid body that declares a DIFFERENT agent than
+#     --author must fail closed rather than silently preferring the flag.
+printf 'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n' > "$P4B1143_BODY"
+got="$(p4b1143_run "$P4B1143_BODY" --author codex)"
+case "$got" in
+  rc=0*) fail "#1143: --author overrode a contradicting PR body: $got" ;;
+  *"ERROR: --author 'codex' contradicts the PR body's Authoring-Agent 'claude'"*)
+    pass "#1143: --author contradicting the body's Authoring-Agent fails closed" ;;
+  *) fail "#1143: contradicting --author refused, but not by the cross-check: $got" ;;
+esac
+
+# (e) Not a blanket refusal, and not a spelling test: --author may name the
+#     reviewer LOGIN form of the same agent. The comparison is on the
+#     normalized agent, which is what actually selects the reviewer, so this
+#     agrees and the run proceeds to its ordinary verdict.
+got="$(p4b1143_run "$P4B1143_BODY" --author nathanpayne-CLAUDE)"
+case "$got" in
+  *contradicts*) fail "#1143: the login form of the same agent was read as a contradiction: $got" ;;
+  rc=0*direction*) pass "#1143: --author in login/mixed-case form still agrees with the body" ;;
+  *) fail "#1143: agreeing login-form --author did not complete: $got" ;;
+esac
+
+# (f) The body is the source of truth downstream, not the flag. An EMPTY
+#     --author value is not a cross-check to skip AND not an identity to act
+#     on: the body's agent is what selects the reviewer, so a codex-authored
+#     body still routes to the claude reviewer.
+printf 'Authoring-Agent: codex\n\n## Self-Review\n\n- ok.\n' > "$P4B1143_BODY"
+got="$(p4b1143_run "$P4B1143_BODY" --author "")"
+case "$got" in
+  rc=0*'"direction": "codex->claude"'*) pass "#1143: the body's agent, not the flag, selects the reviewer" ;;
+  *) fail "#1143: empty --author did not fall back to the body's agent: $got" ;;
+esac
 
 # #574 feedback_policy: a finding in a configured required tier cannot be
 # carried by an approval, even when the adapter output is otherwise valid.
@@ -2094,7 +2244,7 @@ WRAPPER_PAYLOAD="$WORK/wrapper-usage-payload.json"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-approve-usage" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 \
-  bash "$ORCH" 130 --repo o/r --author codex --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 130 --repo o/r --author codex --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.token_count')" = "150" ] \
@@ -2119,7 +2269,7 @@ else fail "orchestrator adapter timeout (rc=$rc): $out"; fi
 # Forced reviewer override must still preserve the cross-agent invariant.
 set +e
 MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-  bash "$ORCH" 133 --repo o/r --author codex --reviewer nathanpayne-codex --head abc123 --diff-file "$DIFF" --dry-run >/dev/null 2>&1; rc=$?
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 133 --repo o/r --author codex --reviewer nathanpayne-codex --head abc123 --diff-file "$DIFF" --dry-run >/dev/null 2>&1; rc=$?
 set -e
 [ "$rc" = 3 ] && pass "forced reviewer matching author rejected with exit 3" \
   || fail "forced same-agent reviewer should exit 3 (got $rc)"
@@ -2296,7 +2446,7 @@ else fail "orchestrator policy codex effort/timeout (rc=$rc, out=$out, body=$(te
 
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te.yml" CLAUDE_BIN="$BIN/fake-claude-effort" \
-  bash "$ORCH" 141 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 141 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.reviewer_effort')" = "xhigh" ]; then
   pass "orchestrator resolves claude effort=xhigh from policy (author=codex → reviewer claude)"
@@ -2962,6 +3112,14 @@ set -eu
 shift
 endpoint=${1:-}
 [ "$endpoint" = --paginate ] && { shift; endpoint=${1:-}; }
+# (#1143) The orchestrator reads the PR body on every run; the one orchestrator
+# case that runs with this bin on PATH needs a contract-valid one. Barrier
+# reads never carry a `.body` filter, so this cannot shadow them.
+for a in "$@"; do
+  case "$a" in
+    *'.body'*) printf 'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n'; exit 0 ;;
+  esac
+done
 case "$endpoint" in
   repos/owner/repo/issues/7/comments)
     [ "${P4B_TEST_COMMENTS_FAIL:-false}" != true ] || exit 42
