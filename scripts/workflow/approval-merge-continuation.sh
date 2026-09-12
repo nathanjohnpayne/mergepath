@@ -363,18 +363,31 @@ if [ "$MODE" = "retract-only" ]; then
   # queue-governed one immediately below. Neither path retracts, merges, or
   # clears anything, so nothing that was blocked becomes unblocked.
   #
-  # BOTH halves are required, and each is established elsewhere: a verdict the
-  # classifier actually reached (code 2, never a failure to reach one), and the
-  # standing-arm shape (protective_standing_arm, set above). Anything else --
-  # an unbracketable readback, an arm that appeared mid-run, a moved tuple, a
-  # classifier that failed or is absent -- is unclassified and still fails the
-  # sweep, because none of them establish what this PR's arm actually is.
+  # THREE things must hold, each established separately: the governing policy
+  # was resolved and names an author identity, a verdict the classifier actually
+  # reached (code 2, never a failure to reach one), and the standing-arm shape
+  # (protective_standing_arm, set above). Anything else -- an unresolvable
+  # policy, an unbracketable readback, an arm that appeared mid-run, a moved
+  # tuple, a classifier that failed or is absent -- is unclassified and still
+  # fails the sweep, because none of them establish what this PR's arm is.
   protective_retraction_rc=0
   retract_snapshot_arm "$protection_snapshot" "durable or unclassified" \
     || protective_retraction_rc=$?
   case "$protective_retraction_rc" in
     0) ;;
     2)
+      # Calling this a routine policy outcome presupposes that the governing
+      # policy was actually established. The two guards that establish it sit
+      # BELOW this mode's exit and so never run here -- the structural gap this
+      # branch has now produced findings from twice. Without a resolved policy
+      # there is no author_identity, so the author binding the whole
+      # classification rests on was never verified: a broken dependency, and the
+      # sweep must see it. Each cause names itself, so an operator reading exit 3
+      # can tell an unresolvable policy from an unbracketable readback.
+      [ "$policy_rc" -eq 0 ] || \
+        infra_error "could not resolve the governing base policy, so the standing auto-merge request's author binding is unverified"
+      [ -n "$expected_author" ] || \
+        infra_error "governing base policy names no author_identity, so the standing auto-merge request's author binding is unverified"
       [ "$protective_standing_arm" -eq 1 ] || \
         infra_error "could not retract and verify the protective auto-merge request"
       not_ready "the standing auto-merge request is outside the #1058 queue boundary and cannot be retracted; it remains intact for explicit human or admin disposition"

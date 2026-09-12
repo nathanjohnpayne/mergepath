@@ -212,7 +212,7 @@ run_case() {
   : > "$TMP/events.log"
   : > "$TMP/accounting-token.log"
   : > "$TMP/queue-policy.log"
-  printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}" > "$TMP/root/policy.yml"
+  printf 'author_identity: %s\n' "${STUB_EXPECTED_AUTHOR-nathanjohnpayne}" > "$TMP/root/policy.yml"
   printf 'author_identity: %s\n' "${STUB_TRUSTED_AUTHOR:-${STUB_EXPECTED_AUTHOR:-nathanjohnpayne}}" > "$TMP/root/.github/review-policy.yml"
   PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" MERGEPATH_REPO_ROOT="$TMP/root" \
     GH_TOKEN="${TEST_AMBIENT_GH_TOKEN:-${STUB_SUBJECT_TOKEN:-author-token}}" \
@@ -1176,9 +1176,11 @@ set +e
 run_case
 unreadable_policy_arm_rc=$?
 set -e
-if [ "$unreadable_policy_arm_rc" -eq 4 ] \
+if [ "$unreadable_policy_arm_rc" -eq 3 ] \
    && [ ! -s "$TMP/merge.log" ] \
-   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out" \
+   && grep -Fq "could not resolve the governing base policy, so the standing auto-merge request's author binding is unverified" "$TMP/subject.out" \
+   && ! grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary' "$TMP/subject.out"; then
   pass "workflow-token protection blocks an unclassified arm without mutation"
 else
   fail "workflow-token protection mutated or accepted an unclassified arm"
@@ -1262,6 +1264,29 @@ else
   fail "protective mode mutated or accepted a native non-shared durable arm"
 fi
 
+# The governing policy can resolve and still establish nothing: the normal
+# continuation has a separate guard for a policy naming no author_identity, and
+# it sits below this mode's exit alongside the policy_rc guard. A standing arm
+# whose author binding was never established is not a routine policy outcome.
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_EXPECTED_AUTHOR=
+STUB_INITIAL="$ARMED_SHARED_BASE"
+STUB_SECOND="$ARMED_SHARED_BASE"
+set +e
+run_case
+authorless_policy_arm_rc=$?
+set -e
+if [ "$authorless_policy_arm_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out" \
+   && grep -Fq "governing base policy names no author_identity, so the standing auto-merge request's author binding is unverified" "$TMP/subject.out" \
+   && ! grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary' "$TMP/subject.out"; then
+  pass "a policy naming no author_identity fails the sweep instead of deferring it"
+else
+  fail "an unbound standing arm was deferred as a routine policy outcome (rc=$authorless_policy_arm_rc)"
+fi
+
 # #1094 adversarial race: policy was pinned to the first main/base123 tuple,
 # but the PR retargeted after that materialization. The old implementation
 # preserved this external-author arm as "proven non-shared" even though its
@@ -1300,10 +1325,12 @@ set +e
 run_case
 unreadable_default_arm_rc=$?
 set -e
-if [ "$unreadable_default_arm_rc" -eq 4 ] \
+if [ "$unreadable_default_arm_rc" -eq 3 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'governing policy is unclassified' "$TMP/subject.out" \
-   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out" \
+   && grep -Fq "could not resolve the governing base policy, so the standing auto-merge request's author binding is unverified" "$TMP/subject.out" \
+   && ! grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary' "$TMP/subject.out"; then
   pass "an unreadable default branch leaves an armed PR untouched and blocks"
 else
   fail "default-branch lookup failure mutated or accepted an unclassified arm"
