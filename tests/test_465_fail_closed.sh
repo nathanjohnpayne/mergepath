@@ -295,7 +295,10 @@ else
     if [ ! -f "$W/$g1130_wf" ]; then
       echo "SKIP: D12 token budget for $g1130_wf (#1130) (absent)"; SKIP=$((SKIP + 1)); continue
     fi
-    g1130_ln="$(grep -n "CI_ACTOR_TOKEN || secrets.GITHUB_TOKEN" "$W/$g1130_wf" 2>/dev/null | cut -d: -f1 | head -1 || true)"
+    # Anchored on the BINDING, not the phrase: a comment that happened to quote
+    # the full expression would otherwise satisfy this while the step's actual
+    # GH_TOKEN stayed bare (CodeRabbit, round 2).
+    g1130_ln="$(grep -nE '^[[:space:]]*GH_TOKEN:[[:space:]]*\$\{\{[[:space:]]*secrets\.CI_ACTOR_TOKEN[[:space:]]*\|\|[[:space:]]*secrets\.GITHUB_TOKEN[[:space:]]*\}\}[[:space:]]*$' "$W/$g1130_wf" 2>/dev/null | cut -d: -f1 | head -1 || true)"
     if [ -z "$g1130_ln" ]; then
       g1130_missing="$g1130_missing $g1130_wf"
       continue
@@ -325,7 +328,7 @@ EOF_1130
         case "$g1130_bad" in *"$g1130_wf:$g1130_l2"*) ;; *) g1130_bad="$g1130_bad $g1130_wf:$g1130_l2" ;; esac
       fi
     done <<EOF_1130B
-$(grep -n 'CI_ACTOR_TOKEN || secrets.GITHUB_TOKEN' "$W/$g1130_wf" 2>/dev/null || true)
+$(grep -nE '^[[:space:]]*GH_TOKEN:[[:space:]]*\$\{\{[[:space:]]*secrets\.CI_ACTOR_TOKEN[[:space:]]*\|\|[[:space:]]*secrets\.GITHUB_TOKEN[[:space:]]*\}\}[[:space:]]*$' "$W/$g1130_wf" 2>/dev/null || true)
 EOF_1130B
   done
   if [ -n "$g1130_bad" ]; then
