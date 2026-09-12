@@ -466,8 +466,20 @@ __CODEX_REQ_LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # would leak one file per attempt on a long-lived runner (and every `die` path
 # would leak unconditionally). review-feedback-accounting.sh:54 solves the same
 # problem with one EXIT trap over one variable; this mirrors it.
+# run_trigger_ack_gate re-posts the trigger up to MAX_ACK_RETRIES times, and
+# every re-post re-enters the accounting gate and materializes ANOTHER policy
+# file. A single-variable trap would remove only the last one, so each prior
+# retry's file would survive on a long-lived runner. Retiring the previous path
+# at the moment the next one is assigned keeps exactly one file live, and the
+# trap removes that one.
 __CRA_BASE_CFG_TMP=""
-trap 'if [ -n "$__CRA_BASE_CFG_TMP" ]; then rm -f "$__CRA_BASE_CFG_TMP"; fi' EXIT
+__cra_retire_base_cfg() { # <new-path-or-empty>
+  if [ -n "$__CRA_BASE_CFG_TMP" ] && [ "$__CRA_BASE_CFG_TMP" != "${1:-}" ]; then
+    rm -f "$__CRA_BASE_CFG_TMP"
+  fi
+  __CRA_BASE_CFG_TMP="${1:-}"
+}
+trap '__cra_retire_base_cfg ""' EXIT
 REQUIRED_TIERS_JSON='["p1"]'
 if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
   # shellcheck source=lib/feedback-policy-helpers.sh
@@ -1123,7 +1135,34 @@ run_feedback_accounting_gate() {
   command -v "$gate" >/dev/null 2>&1 \
     || die 3 "review feedback accounting gate unavailable: $gate"
 
-  output=$("$gate" "$PR_NUMBER" "$REPO") || rc=$?
+  # #1100: resolve the governing base policy ONCE, here, and hand the SAME
+  # snapshot to accounting via its documented REVIEW_FEEDBACK_ACCOUNTING_CONFIG
+  # injection point. Resolving separately on each side opened a window: if the
+  # PR base advanced between the two calls, `.missing` was classified under one
+  # policy while the relax and collision sets came from another, and a policy
+  # that moved a gating login onto coderabbit/code_scanning in the newer
+  # revision would relax a finding the older revision classified as gating --
+  # with no collision to catch it, because the newer revision is internally
+  # consistent. AGENTS.md states relaxation uses the same base policy accounting
+  # classified with; one resolution is what makes that literally true.
+  #
+  # Resolution failure leaves the variable empty: accounting falls back to
+  # resolving its own (unchanged pre-#1100 behaviour) and the relax set below is
+  # empty, so nothing is skippable. Fail-closed either way.
+  __cra_base_cfg=""
+  __cra_resolver="$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh"
+  if [ -x "$__cra_resolver" ]; then
+    __cra_base_cfg=$("$__cra_resolver" --repo "$REPO" --pr "$PR_NUMBER" \
+      --default-config "$CONFIG" --materialize-default 2>/dev/null) || __cra_base_cfg=""
+  fi
+  if [ -n "$__cra_base_cfg" ] && [ "$__cra_base_cfg" != "$CONFIG" ]; then
+    __cra_retire_base_cfg "$__cra_base_cfg"
+  fi
+  if [ -n "$__cra_base_cfg" ]; then
+    output=$(REVIEW_FEEDBACK_ACCOUNTING_CONFIG="$__cra_base_cfg" "$gate" "$PR_NUMBER" "$REPO") || rc=$?
+  else
+    output=$("$gate" "$PR_NUMBER" "$REPO") || rc=$?
+  fi
   case "$rc" in
     0)
       posted=$(printf '%s' "$output" | jq -r '.posted // "?"' 2>/dev/null || printf '?')
@@ -1159,16 +1198,9 @@ run_feedback_accounting_gate() {
       # style -- the #1124 defect class.
       #
       # Every failure path yields an EMPTY relax set, which refuses: an
-      # unresolvable base policy means we cannot say who may be skipped.
-      __cra_base_cfg=""
-      __cra_resolver="$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh"
-      if [ -x "$__cra_resolver" ]; then
-        __cra_base_cfg=$("$__cra_resolver" --repo "$REPO" --pr "$PR_NUMBER" \
-          --default-config "$CONFIG" --materialize-default 2>/dev/null) || __cra_base_cfg=""
-        if [ -n "$__cra_base_cfg" ] && [ "$__cra_base_cfg" != "$CONFIG" ]; then
-          __CRA_BASE_CFG_TMP="$__cra_base_cfg"
-        fi
-      fi
+      # unresolvable base policy means we cannot say who may be skipped. The
+      # snapshot is the one resolved above, which accounting also classified
+      # `.missing` with -- not a second resolution that could see a newer base.
       if [ -n "$__cra_base_cfg" ] && [ -r "$__cra_base_cfg" ]; then
         __cra_relax=$(printf '%s\n%s\n' \
           "$(policy_block_field_parsed coderabbit bot_login "$__cra_base_cfg" 2>/dev/null || true)" \

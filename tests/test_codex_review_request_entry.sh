@@ -361,45 +361,77 @@ test_new_trigger_replaces_superseded_timeout_marker
 #
 # Run against the decision EXTRACTED from the script, so a revert is executed
 # rather than text-matched.
-g1100_extract() {
-  awk '/^    1\)$/ { grab = 1 } grab { print } /^      ;;$/ { if (grab) exit }' \
+# g1100_decide is invoked inside a command substitution, so a shell variable
+# set there cannot reach the caller. The scratch dir travels back in a sidecar
+# file so the post-call assertions below can inspect what the run left behind.
+G1100_LASTDIR="$(mktemp "${TMPDIR:-/tmp}/g1100-lastdir.XXXXXX")"
+trap 'rm -f "$G1100_LASTDIR"' EXIT
+
+g1100_extract() {  # <fn-name> -- the REAL function body, so a revert is executed
+  # Prefix match, not an awk -v regex: -v processes escape sequences, so the
+  # backslashes needed to escape `(` and `{` do not survive into the pattern.
+  awk -v fn="$1() {" 'index($0, fn) == 1 { grab = 1 } grab { print } grab && /^\}$/ { exit }' \
     "$ROOT/scripts/codex-review-request.sh"
 }
+# Round 3 moved the base-policy resolution OUT of the `1)` arm and into the top
+# of run_feedback_accounting_gate, so one snapshot serves both accounting and
+# the relax set (Codex P2: a second resolution can see a newer base than the
+# one `.missing` was classified under). Extracting the whole function rather
+# than the arm keeps the test on the real boundary and lets the single-snapshot
+# property be asserted directly.
 g1100_decide() {  # <accounting-json> -> "refuse" | "proceed"
-  local body out fake
-  body="$(g1100_extract)"
-  [ -n "$body" ] || { printf 'extract-failed'; return 0; }
-  # A stub resolver standing in for scripts/workflow/resolve_base_policy.sh.
-  # G1100_NOBASE makes it fail, which must refuse: an unresolvable governing
-  # base policy means we cannot say who is skippable.
+  local body retire out fake
+  body="$(g1100_extract run_feedback_accounting_gate)"
+  retire="$(g1100_extract __cra_retire_base_cfg)"
+  [ -n "$body" ] && [ -n "$retire" ] || { printf 'extract-failed'; return 0; }
   fake="$(mktemp -d "${TMPDIR:-/tmp}/g1100-req.XXXXXX")"
+  printf '%s' "$fake" > "$G1100_LASTDIR"
   mkdir -p "$fake/workflow"
-  printf 'codex:\n  bot_login: "chatgpt-codex-connector[bot]"\n' > "$fake/base-policy.yml"
+  printf 'codex:\n  bot_login: "chatgpt-codex-connector[bot]"\n' > "$fake/default-policy.yml"
+  printf '%s' "$1" > "$fake/accounting.json"
+  printf '%s' "${G1100_RC:-1}" > "$fake/accounting.rc"
+  # A stub resolver standing in for scripts/workflow/resolve_base_policy.sh.
+  # It materializes a NEW file per call, exactly as --materialize-default does,
+  # and appends the path to materialized.log so the retry-leak property is
+  # observable. G1100_NOBASE makes it fail, which must refuse: an unresolvable
+  # governing base policy means we cannot say who is skippable.
   if [ -n "${G1100_NOBASE:-}" ]; then
     printf '#!/bin/sh\nexit 1\n' > "$fake/workflow/resolve_base_policy.sh"
   else
-    printf '#!/bin/sh\nprintf %%s "%s/base-policy.yml"\n' "$fake" > "$fake/workflow/resolve_base_policy.sh"
+    cat > "$fake/workflow/resolve_base_policy.sh" <<RESOLVER
+#!/bin/sh
+f=\$(mktemp "$fake/base-policy.XXXXXX")
+printf 'codex:\\n  bot_login: "chatgpt-codex-connector[bot]"\\n' > "\$f"
+printf '%s\\n' "\$f" >> "$fake/materialized.log"
+printf %s "\$f"
+RESOLVER
   fi
   chmod +x "$fake/workflow/resolve_base_policy.sh"
+  # The accounting stub records the CONFIG it was handed, so the single-snapshot
+  # property is asserted on the value that actually crossed the boundary.
+  cat > "$fake/accounting-stub.sh" <<STUB
+#!/bin/sh
+printf '%s\\n' "\${REVIEW_FEEDBACK_ACCOUNTING_CONFIG-<unset>}" >> "$fake/accounting-config.log"
+cat "$fake/accounting.json"
+exit "\$(cat "$fake/accounting.rc")"
+STUB
+  chmod +x "$fake/accounting-stub.sh"
   out="$(
-    output="$1"
     __CODEX_REQUEST_DIR="$fake"
-    CONFIG="$fake/base-policy.yml"
+    CONFIG="$fake/default-policy.yml"
+    MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$fake/accounting-stub.sh"
     REPO=owner/repo
     PR_NUMBER=1
-    # Stub the SHARED parsed reader the script now uses; the real one is
-    # exercised by the feedback-policy-helpers suite.
+    __CRA_BASE_CFG_TMP=""
+    # Stub the SHARED parsed readers the decision uses; the real ones are
+    # exercised by the feedback-policy-helpers suite. Keeping them stubbed also
+    # keeps this suite hermetic on a runner with no YAML parser, where the real
+    # reader returns rc 1 for every shape alike.
     policy_block_field_parsed() { case "$1" in
       coderabbit) printf '%s' "${G1100_CR-coderabbitai[bot]}" ;;
       code_scanning) printf '%s' "${G1100_GHAS-github-advanced-security[bot]}" ;;
       codex) printf '%s' "${G1100_CODEX-chatgpt-codex-connector[bot]}" ;;
       *) printf '' ;; esac; }
-    # The decision reads author_identity and available_reviewers through the
-    # shared YAML->JSON parse. Stubbed here for the same reason
-    # policy_block_field_parsed is: this suite pins the DECISION, and the
-    # parser itself is exercised by the feedback-policy-helpers suite. Keeping
-    # it stubbed also keeps the suite hermetic on a runner with no YAML parser,
-    # where the real reader returns rc 1 for every shape alike.
     policy_yaml_to_json() {
       printf '{"author_identity":%s,"available_reviewers":%s}' \
         "$(printf '%s' "${G1100_AUTHOR-nathanjohnpayne}" | jq -Rs 'rtrimstr("\n")')" \
@@ -408,10 +440,12 @@ g1100_decide() {  # <accounting-json> -> "refuse" | "proceed"
     }
     log() { :; }
     die() { printf 'refuse'; exit 0; }
-    eval "$(printf '%s' "$body" | sed -e 's/^    1)$//' -e 's/^      ;;$//')"
+    eval "$retire"
+    eval "$body"
+    run_feedback_accounting_gate
+    [ -z "${G1100_RUNS:-}" ] || run_feedback_accounting_gate
     printf 'proceed'
   )" 2>/dev/null || out='refuse'
-  rm -rf "$fake"
   printf '%s' "$out"
 }
 g1100_case() {  # <label> <json> <expected>
@@ -421,6 +455,9 @@ g1100_case() {  # <label> <json> <expected>
   else
     fail "#1100: $1 -> expected $3, got $got"
   fi
+  G1100_FAKE="$(cat "$G1100_LASTDIR")"
+  [ -z "${G1100_KEEP:-}" ] && [ -n "$G1100_FAKE" ] && rm -rf "$G1100_FAKE"
+  return 0
 }
 g1100_case "only CodeRabbit undispositioned"  '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' proceed
 g1100_case "only GHAS undispositioned"        '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' proceed
@@ -509,6 +546,44 @@ G1100_AUTHOR='' G1100_CR='nathanjohnpayne' \
 G1100_CR='coderabbitai[bot]' G1100_GHAS='github-advanced-security[bot]' \
   g1100_case "distinct identities are not a collision" \
     '{"missing":[{"reviewer":"coderabbitai[bot]"},{"reviewer":"github-advanced-security[bot]"}]}' proceed
+
+# ONE snapshot, both consumers. The relax set narrows what gates this request,
+# so it must come from the policy revision accounting classified `.missing`
+# with. Resolving separately on each side left a window: if the PR base
+# advanced between the two calls, a newer revision that moved a gating login
+# onto coderabbit/code_scanning would relax a finding the older revision
+# classified as gating, and the collision check could not catch it because the
+# newer revision is internally consistent (Codex P2, round 3). Asserted on the
+# value that actually crossed the boundary -- the CONFIG the accounting command
+# was invoked with -- against the file the resolver materialized.
+G1100_KEEP=1 \
+  g1100_case "single snapshot: relax set and accounting share one policy file" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' proceed
+if [ -n "${G1100_FAKE:-}" ] && [ -s "$G1100_FAKE/materialized.log" ] \
+   && [ "$(cat "$G1100_FAKE/materialized.log")" = "$(cat "$G1100_FAKE/accounting-config.log")" ] \
+   && [ "$(wc -l < "$G1100_FAKE/materialized.log")" -eq 1 ]; then
+  pass "#1100: accounting is handed the one materialized policy, not a second resolution"
+else
+  fail "#1100: accounting CONFIG ($(cat "${G1100_FAKE:-}/accounting-config.log" 2>/dev/null)) is not the one materialized policy ($(cat "${G1100_FAKE:-}/materialized.log" 2>/dev/null))"
+fi
+rm -rf "${G1100_FAKE:-/nonexistent}"
+
+# run_trigger_ack_gate re-posts the trigger up to MAX_ACK_RETRIES times, and
+# each re-post re-enters this gate and materializes ANOTHER policy file. The
+# first cut of the cleanup used one variable and one EXIT trap, so only the
+# last file was ever removed and every prior retry leaked (Codex P2, round 3).
+# Two invocations must leave exactly one file live.
+G1100_KEEP=1 G1100_RUNS=2 \
+  g1100_case "retry re-entry still proceeds" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' proceed
+if [ -n "${G1100_FAKE:-}" ] \
+   && [ "$(wc -l < "$G1100_FAKE/materialized.log")" -eq 2 ] \
+   && [ "$(find "$G1100_FAKE" -maxdepth 1 -name 'base-policy.*' | wc -l)" -eq 1 ]; then
+  pass "#1100: a second gate invocation retires the first materialized policy"
+else
+  fail "#1100: $(find "${G1100_FAKE:-}" -maxdepth 1 -name 'base-policy.*' 2>/dev/null | wc -l) materialized policies survive two invocations (expected 1 of 2)"
+fi
+rm -rf "${G1100_FAKE:-/nonexistent}"
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
