@@ -408,7 +408,11 @@ Issue #1099 cleanup has no non-Dependabot disable mutation because GitHub provid
 gh api repos/{owner}/{repo}/dispatches -f event_type=pr-review-policy-recheck
 ```
 
-A PAT is required — a `GITHUB_TOKEN`-authored dispatch creates no workflow run. There is deliberately no `workflow_dispatch` equivalent: a manual dispatch runs the workflow definition from the ref the dispatcher selects, which would let a PR branch run its own copy with `checks: write` and publish its own green `Self-Review Required`. The sweep publishes nothing for a head whose contexts already reported, so firing it on a healthy repository is a no-op.
+Fire it as the human author, or from any credential holding `contents: write` — a classic PAT with `repo`, or a fine-grained PAT or App installation with Contents: write. The recovery workflow's own job token is `contents: read` and so cannot dispatch to itself; that is deliberate, since the sweep only reads PR state and publishes check runs.
+
+The limit here is token **scope**, not GitHub's recursion guard. That guard — events raised by a workflow's `GITHUB_TOKEN` do not start new workflow runs — has two documented exceptions, and this is one of them: GitHub's [Trigger a workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow) reference states that `workflow_dispatch` and `repository_dispatch` events *always* create workflow runs. So a `GITHUB_TOKEN` with `contents: write` would start a run; a `contents: read` one cannot call the endpoint at all. The general no-run rule still governs every other event a `GITHUB_TOKEN` write raises, which is what the #315/#324 auto-clear lesson is about.
+
+There is deliberately no `workflow_dispatch` equivalent: a manual dispatch runs the workflow definition from the ref the dispatcher selects, which would let a PR branch run its own copy with `checks: write` and publish its own green `Self-Review Required`. The sweep publishes nothing for a head whose contexts already reported, so firing it on a healthy repository is a no-op.
 
 The `--admin` flag on `gh pr merge` does **not** bypass required status checks — it only bypasses review requirements. The break-glass hook (`BREAK_GLASS_ADMIN=1`) only bypasses the Claude Code PreToolUse guard, not GitHub's branch protection API.
 

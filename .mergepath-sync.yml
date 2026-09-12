@@ -922,6 +922,10 @@ paths:
     # Delegated suite for scripts/ci/check_pr_review_policy_recovery, which
     # hard-fails when it is missing. It PATH-shims `gh` and executes the
     # recovery script itself, so the script and its own closure travel with it.
+    # scripts/merge-clearance-gate.sh is deliberately NOT listed: the suite
+    # points PR_REVIEW_POLICY_RECOVERY_DERIVE_BIN at a stub, so it never
+    # executes the real derivation. The PRODUCTION closure that does need it is
+    # declared on the workflow and script entries above.
     requires:
       - "scripts/pr-review-policy-recovery.sh"
       - "scripts/validate-pr-body.sh"

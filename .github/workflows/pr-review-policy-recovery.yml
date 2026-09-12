@@ -43,12 +43,27 @@ name: PR Review Policy Recovery
 #
 #   gh api repos/{owner}/{repo}/dispatches -f event_type=pr-review-policy-recheck
 #
-# (a PAT is required — a GITHUB_TOKEN-authored dispatch creates no workflow
-# run.) Do NOT add workflow_dispatch here; the default-branch ref guard on the
-# job is a backstop, not a substitute, and
+# The dispatcher needs a credential with `contents: write` — a classic PAT
+# with `repo`, a fine-grained PAT or App installation with Contents: write, or
+# any workflow job token granted that scope. THIS workflow's own token is
+# `contents: read` and therefore cannot fire it, which is deliberate: the
+# sweep publishes check runs and reads PR state, nothing more.
+#
+# NOT because of the recursion guard, which is the reason this file used to
+# give and is wrong here. GitHub's "Trigger a workflow" reference states that
+# events triggered by the GITHUB_TOKEN "will not create a new workflow run,
+# with the following exceptions" and then names them: "workflow_dispatch and
+# repository_dispatch events always create workflow runs." So a
+# GITHUB_TOKEN-authored repository_dispatch DOES start a run; what stops one
+# here is scope, not recursion. (The general no-run rule still holds for every
+# other event a GITHUB_TOKEN write can raise, which is what the #315/#324
+# lesson is about.)
+#
+# Do NOT add workflow_dispatch here; the default-branch ref guard on the job
+# is a backstop, not a substitute, and
 # scripts/ci/check_pr_review_policy_recovery asserts its absence against the
-# PARSED trigger map, so a quoted `"workflow_dispatch":` spelling cannot slip
-# past it either.
+# PARSED trigger map — so the block, quoted-key and inline-mapping spellings
+# are all caught.
 
 on:
   repository_dispatch:

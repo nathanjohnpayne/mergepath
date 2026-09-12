@@ -323,14 +323,15 @@ while IFS=$'\t' read -r PR head <&3; do
     infra "head $head is carried by more than one open PR; publishing red on both contexts rather than one PR's verdict"
   fi
 
-  # ONE detail read per PR for the body and the author. The LABEL list is
-  # deliberately NOT taken from it — see the Label Gate arm below.
-  detail=""
-  if ! detail=$(gh_api_scalar "detail of PR #$PR" "repos/$REPO/pulls/$PR"); then
+  # The author is the one verdict input that cannot change, so it is the only
+  # one read up front. The BODY and the LABEL list are both read as late as
+  # possible, immediately before the verdict that consumes them — see the two
+  # arms below.
+  author=""
+  if ! author=$(gh_api_scalar "author of PR #$PR" "repos/$REPO/pulls/$PR" --jq '.user.login // ""'); then
     infra "could not read PR #$PR"
     continue
   fi
-  author=$(printf '%s' "$detail" | jq -r '.user.login // ""')
 
   # ── Self-Review Required ────────────────────────────────────────────
   runs=""
@@ -351,25 +352,35 @@ while IFS=$'\t' read -r PR head <&3; do
       title="$SELF_REVIEW_CONTEXT — Dependabot-exempt (recovery sweep)"
       summary="PR #$PR is authored by $DEPENDABOT_LOGIN, which the event-driven job exempts. Reported as skipped so the required context resolves the way the skipped job would have reported it."
     else
-      body=$(printf '%s' "$detail" | jq -r '.body // ""')
-      rc=0
-      output=$(printf '%s\n' "$body" | "$VALIDATOR" --self-review-only 2>&1) || rc=$?
-      case "$rc" in
-        0)
-          conclusion="success"
-          title="$SELF_REVIEW_CONTEXT (recovery sweep)"
-          summary="$output"
-          ;;
-        1)
-          conclusion="failure"
-          title="$SELF_REVIEW_CONTEXT (recovery sweep)"
-          summary="$output"
-          ;;
-        *)
-          conclusion=""
-          infra "validate-pr-body.sh exited $rc on PR #$PR (config/usage error); withholding '$SELF_REVIEW_CONTEXT'"
-          ;;
-      esac
+      # Read the body HERE, not once per PR at the top of the iteration. An
+      # ordinary body edit fires `edited` and so lands a native check run the
+      # compare-and-swap below would catch — but a GITHUB_TOKEN-authored edit
+      # creates no workflow run at all, so for that case a late read is the
+      # only thing that narrows the window (#1240). Same reasoning as the
+      # label list; the two verdict inputs are treated alike.
+      body=""
+      conclusion=""
+      if ! body=$(gh_api_scalar "body of PR #$PR" "repos/$REPO/pulls/$PR" --jq '.body // ""'); then
+        infra "could not read the body of PR #$PR; withholding '$SELF_REVIEW_CONTEXT'"
+      else
+        rc=0
+        output=$(printf '%s\n' "$body" | "$VALIDATOR" --self-review-only 2>&1) || rc=$?
+        case "$rc" in
+          0)
+            conclusion="success"
+            title="$SELF_REVIEW_CONTEXT (recovery sweep)"
+            summary="$output"
+            ;;
+          1)
+            conclusion="failure"
+            title="$SELF_REVIEW_CONTEXT (recovery sweep)"
+            summary="$output"
+            ;;
+          *)
+            infra "validate-pr-body.sh exited $rc on PR #$PR (config/usage error); withholding '$SELF_REVIEW_CONTEXT'"
+            ;;
+        esac
+      fi
     fi
     if [ -n "$conclusion" ]; then
       summary="$summary
@@ -396,7 +407,7 @@ Published by the pr-review-policy recovery lane ($decision) because the \`pull_r
     title="$LABEL_GATE_CONTEXT — ambiguous head"
     summary="More than one open PR carries $head, and one commit slot cannot carry both PRs' verdicts. Close or rebase one of them."
   else
-    # Read the labels HERE rather than from the detail read above. A label
+    # Read the labels HERE, immediately before the verdict. A label
     # add or remove moves no head SHA, and a GITHUB_TOKEN-driven one fires no
     # workflow run at all, so neither publish() fence can see it: reading as
     # late as possible is what shrinks that window (#1240 Codex P1).

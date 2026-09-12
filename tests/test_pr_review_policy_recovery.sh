@@ -214,11 +214,18 @@ case "$endpoint" in
         exit 0
       fi
     fi
-    # The LABEL read is a distinct, later call than the detail read.
-    # FIXTURE_LATE_LABELS_<pr> answers only that one, so a test can prove the
-    # labels are not taken from the earlier snapshot.
+    # The LABEL and BODY reads are distinct, later calls than the author read.
+    # FIXTURE_LATE_LABELS_<pr> / FIXTURE_LATE_BODY_<pr> answer only those, so a
+    # test can prove neither verdict is taken from an earlier snapshot.
     if [ "$jqexpr" = '(.labels // [])[].name' ]; then
       late_var="FIXTURE_LATE_LABELS_${pr}"
+      if [ -n "${!late_var:-}" ]; then
+        emit "${!late_var}"
+        exit 0
+      fi
+    fi
+    if [ "$jqexpr" = '.body // ""' ]; then
+      late_var="FIXTURE_LATE_BODY_${pr}"
       if [ -n "${!late_var:-}" ]; then
         emit "${!late_var}"
         exit 0
@@ -329,6 +336,13 @@ write_check_runs_second() {  # <context-slug> <sha> <external_id>...
   path="$WORKDIR/check-runs2-$slug-$key.json"
   _checkruns_file "$path" "$@"
   eval "export FIXTURE_CHECKRUNS2_${slug//-/_}_${key}=\"\$path\""
+}
+
+write_late_body() {  # <pr> <body>
+  local pr="$1" body="$2"
+  local path="$WORKDIR/late-body-$pr.json"
+  jq -n --arg b "$body" '{body: $b}' > "$path"
+  eval "export FIXTURE_LATE_BODY_$pr=\"\$path\""
 }
 
 write_late_labels() {  # <pr> <label>...
@@ -538,10 +552,14 @@ write_open_prs "7:$HEAD_A"
 write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
 export LIVE_HEAD_7="$HEAD_B"
 run_sweep
-if [ -z "$WRITES" ]; then
-  pass "a head that moved during evaluation gets no verdict pinned to it"
+# rc 0 is part of the contract, not incidental: a moved head is a SAFE skip,
+# not an infrastructure failure, and the new head gets its own evaluation.
+# Without this the case would also pass if the sweep published nothing and
+# then errored (#1240 CodeRabbit P2).
+if [ "$RC" -eq 0 ] && [ -z "$WRITES" ]; then
+  pass "a head that moved during evaluation is skipped safely, with no verdict pinned to it"
 else
-  fail "a moved head must not be published to (writes=[$WRITES])"
+  fail "a moved head must be skipped without error (rc=$RC, writes=[$WRITES])"
 fi
 
 # ---------------------------------------------------------------------------
@@ -618,6 +636,23 @@ if [ "$(published_conclusion 'Label Gate')" = "failure" ] \
   pass "the Label Gate verdict comes from a late label read, not the detail snapshot"
 else
   fail "a label added after the detail read must still block (writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 17b. The body is read LATE too, for the same reason the labels are: an
+#      ordinary edit fires `edited` and lands a native run the CAS would
+#      catch, but a GITHUB_TOKEN-authored edit creates no workflow run at all.
+#      The body present only in the later read is the one that decides.
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
+write_late_body 7 "$NO_SELF_REVIEW_BODY"
+run_sweep
+if [ "$(published_conclusion 'Self-Review Required')" = "failure" ]; then
+  pass "the Self-Review verdict comes from a late body read, not an earlier snapshot"
+else
+  fail "a body edited after the first read must decide the verdict (writes=[$WRITES])"
 fi
 
 # ---------------------------------------------------------------------------
@@ -715,10 +750,16 @@ write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
 write_pr 8 "$HEAD_B" "someone" "$SELF_REVIEW_BODY"
 export FAIL_PR_7=1
 run_sweep
+# BOTH contexts for the surviving PR, not just one: asserting only Label Gate
+# would still pass a regression that abandoned `Self-Review Required` after
+# the first PR's read failure (#1240 CodeRabbit P2).
 if [ "$RC" -eq 1 ] \
   && [ "$(published_field 'Label Gate' head_sha)" = "$HEAD_B" ] \
+  && [ "$(published_field 'Self-Review Required' head_sha)" = "$HEAD_B" ] \
+  && [ "$(published_conclusion 'Self-Review Required')" = "success" ] \
+  && [ "$(published_conclusion 'Label Gate')" = "success" ] \
   && ! printf '%s\n' "$WRITES" | grep -qF "$HEAD_A"; then
-  pass "an unreadable PR is skipped and flagged while the rest of the sweep continues"
+  pass "an unreadable PR is skipped and flagged while BOTH contexts of the next PR are still published"
 else
   fail "one bad PR must not abandon the sweep (rc=$RC, writes=[$WRITES])"
 fi

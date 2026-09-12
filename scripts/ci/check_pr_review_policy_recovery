@@ -144,9 +144,56 @@ triggers = triggers_of.call(document)
 require_shape.call(!triggers.empty?, "#{path} has no parseable `on:` block")
 
 # Recovery entrance 1: the periodic sweep.
+#
+# Assert the INTERVAL, not merely the presence of a cron. "Recovery within 15
+# minutes" is the documented guarantee; a check that accepts any non-empty
+# expression lets `0 3 * * *` pass and silently converts that guarantee into a
+# daily one, with every gate still green (#1240 CodeRabbit P1). Same shape as
+# the trigger fence itself: assert the property, not its container.
+#
+# Any schedule that fires at least every 15 minutes qualifies, so `*/15` and
+# `0,15,30,45` are both accepted and neither is privileged. The four
+# non-minute fields must be `*`, because anything else bounds the sweep to
+# some hours, days or months and the gap between firings is then unbounded.
+MAX_RECOVERY_GAP_MINUTES = 15
+
+# Expand a cron minute field to the sorted set of minutes it selects, or nil
+# when it is not a form this reader can evaluate. nil is treated as FAILING
+# the assertion: an expression whose interval cannot be established is exactly
+# the case that must not pass silently.
+expand_minutes = lambda do |field|
+  out = []
+  field.split(',').each do |item|
+    base, step_text = item.split('/', 2)
+    step = step_text.nil? ? 1 : Integer(step_text, 10) rescue (return nil)
+    return nil if step <= 0
+    case base
+    when '*' then lo, hi = 0, 59
+    when /\A(\d+)-(\d+)\z/ then lo, hi = Regexp.last_match(1).to_i, Regexp.last_match(2).to_i
+    when /\A\d+\z/ then lo = hi = base.to_i
+    else return nil
+    end
+    return nil if lo.negative? || hi > 59 || lo > hi
+    (lo..hi).step(step) { |m| out << m }
+  end
+  out.uniq.sort
+end
+
 schedule = triggers['schedule']
-require_shape.call(schedule.is_a?(Array) && schedule.any? { |e| e.is_a?(Hash) && e['cron'].to_s =~ /\S/ },
-  "#{path} must declare a `schedule:` trigger with a cron expression — without it a dropped `pull_request` delivery leaves 'Self-Review Required' and 'Label Gate' pending forever (#931)")
+fires_often_enough = schedule.is_a?(Array) && schedule.any? do |entry|
+  next false unless entry.is_a?(Hash)
+  parts = entry['cron'].to_s.strip.split(/\s+/)
+  next false unless parts.length == 5
+  next false unless parts[1..4].all? { |p| p == '*' }
+  minutes = expand_minutes.call(parts[0])
+  next false if minutes.nil? || minutes.empty?
+  gaps = minutes.each_cons(2).map { |a, b| b - a }
+  # The wrap from the last firing of one hour to the first of the next.
+  gaps << (60 - minutes.last + minutes.first)
+  gaps.max <= MAX_RECOVERY_GAP_MINUTES
+end
+require_shape.call(fires_often_enough,
+  "#{path} must declare a `schedule:` that fires at least every #{MAX_RECOVERY_GAP_MINUTES} minutes with `*` in every field but the minute — without it a dropped `pull_request` delivery leaves 'Self-Review Required' and 'Label Gate' pending, and a sparser cron keeps this check green while quietly replacing the documented #{MAX_RECOVERY_GAP_MINUTES}-minute recovery guarantee (#931)")
 
 # Recovery entrance 2: the operator's immediate path.
 dispatch = triggers['repository_dispatch']
