@@ -729,7 +729,7 @@ The workflow installs the 1Password CLI, reads the canary, compares only its dig
 ```bash
 eval "$(scripts/op-preflight.sh --agent codex --mode review)"
 export OP_PREFLIGHT_QUIET=1
-eval "$(scripts/op-preflight.sh --agent codex --check)"
+eval "$(scripts/op-preflight.sh --agent codex --check --print-exports)"
 ```
 
 The workflow is `workflow_dispatch` only. Run it after provisioning or rotating the service-account token; do not enable it as an automatic PR or push workflow unless the proof secrets are intentionally available to that event class.

@@ -21,7 +21,7 @@
 #
 #   # Idempotent re-check at the top of every subsequent tool call. NEVER
 #   # prompts for biometric; exits non-zero if no fresh cache exists:
-#   eval "$(scripts/op-preflight.sh --agent claude --check)"
+#   eval "$(scripts/op-preflight.sh --agent claude --check --print-exports)"
 #
 #   # Force a fresh fetch even if the session file is still warm:
 #   eval "$(scripts/op-preflight.sh --agent claude --refresh)"
@@ -41,11 +41,20 @@
 # Flags:
 #   --agent <name>   Agent name: claude, cursor, or codex (required except --purge-all)
 #   --mode <mode>    review, deploy, or all (default: review). #282
-#   --check          Validate the session file is fresh and emit cached
-#   --status         (alias for --check) exports WITHOUT invoking op.
-#                    Never burns biometric, never warms SSH, never reads
-#                    ADC. Exits non-zero if cache missing/stale. Mutually
-#                    exclusive with --refresh, --purge, --purge-all. #282
+#   --check          Validate the session file is fresh, WITHOUT invoking
+#   --status         (alias for --check) op. Never burns biometric, never
+#                    warms SSH, never reads ADC. Exits non-zero if cache
+#                    missing/stale. Mutually exclusive with --refresh,
+#                    --purge, --purge-all. #282
+#                    Writes NO credential material to stdout or stderr on
+#                    any exit path (#1021): the status line goes to stderr
+#                    and the cached exports are emitted only when
+#                    --print-exports is also passed. Running it bare is
+#                    the liveness check; it is safe in a transcript.
+#   --print-exports  With --check, print the cached `export OP_PREFLIGHT_*`
+#                    statements on stdout for `eval "$(...)"`. Meaningless
+#                    elsewhere: --mode review/deploy/all and --refresh are
+#                    deliberate export paths and still print by default.
 #   --dry-run        Show what would be fetched without prompting
 #   --skip-ssh       Skip SSH key warming (useful in CI or non-interactive)
 #   --refresh        Force biometric fetch even if session file is fresh
@@ -209,6 +218,7 @@ REFRESH=false
 PURGE=false
 PURGE_ALL=false
 CHECK=false
+PRINT_EXPORTS=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -220,6 +230,7 @@ while [[ $# -gt 0 ]]; do
     --purge) PURGE=true; shift ;;
     --purge-all) PURGE_ALL=true; shift ;;
     --check|--status) CHECK=true; shift ;;
+    --print-exports) PRINT_EXPORTS=true; shift ;;
     *)
       echo "Error: unknown argument: $1" >&2
       echo "Usage: eval \"\$(scripts/op-preflight.sh --agent claude --mode review)\"" >&2
@@ -888,11 +899,46 @@ warm_ssh_keys() {
 # invokes op, NEVER warms SSH, NEVER reads ADC. Designed to be re-run
 # at the top of every agent tool call without the biometric prompt risk
 # of `--mode review`.
+# TEMPORARY, #1021. Before the split, `eval "$(... --check)"` populated
+# OP_PREFLIGHT_*_PAT. After it, an un-migrated caller would evaluate an empty
+# string and leave both variables UNSET -- and an empty GH_TOKEN does not fail:
+# `GH_TOKEN="" gh api user` exits 0 and silently attributes to whatever account
+# the gh keyring has active. That is a wrong byline nobody sees, which is worse
+# than the leak this change closes. So stdout carries a guard that is inert when
+# read but fails loudly when evaluated. Remove it once every consumer passes
+# --print-exports; tracked separately.
+# The emitted line is EVALUATED by the caller, so every interpolated value must
+# be shell-quoted -- $MODE is not validated on the --check path, and
+# `--mode 'review"; <command>; echo "'` escaped the double-quoted echo and ran
+# in the caller's shell (CodeRabbit, round 2; reproduced before fixing). Quoting
+# happens HERE, once, rather than at each call site: a later caller cannot
+# forget it. This is the same `printf '%q'` treatment the export emitters
+# already give $AGENT.
+emit_eval_guard() { # <message>
+  printf 'echo %s >&2; return 1 2>/dev/null || exit 1\n' "$(printf '%q' "op-preflight: $1")"
+}
+emit_check_compat_guard() {
+  emit_eval_guard "--check no longer prints exports (mergepath#1021); re-run with --print-exports to populate OP_PREFLIGHT_*_PAT"
+}
+# The ERROR paths need a guard even WITH --print-exports, and that is not the
+# same hazard as the compat one. `eval "$(cmd)"` discards the command
+# substitution's exit status: a script that exits 2 having printed nothing makes
+# `eval` return 0, so the documented caller sails on with both PATs unset --
+# verified, `eval "$(... --check --print-exports)"` against a missing cache
+# returns rc=0 with OP_PREFLIGHT_REVIEWER_PAT unset. That is the same silent
+# keyring fallback #1021 is closing, reached through the path this change now
+# tells everyone to use. The invariant is therefore: stdout always carries
+# something that FAILS when evaluated, unless real exports are being emitted.
+emit_check_failure_guard() {
+  emit_eval_guard "--check found no usable cache for agent=$AGENT (mode=$MODE); run: scripts/op-preflight.sh --agent $AGENT --mode $MODE"
+}
+
 if $CHECK; then
   if ! session_is_fresh; then
     echo "# preflight: cache missing or stale for agent=$AGENT" >&2
     echo "#   run: scripts/op-preflight.sh --agent $AGENT --mode review" >&2
     echo "#   then re-run this command." >&2
+    emit_check_failure_guard
     exit 2
   fi
   # The session is fresh. Emit the cached exports the same way the fast
@@ -909,9 +955,21 @@ if $CHECK; then
   if [[ "$rc" != "0" ]]; then
     echo "# preflight: cache present but incomplete for agent=$AGENT (mode=$MODE)" >&2
     echo "#   run: scripts/op-preflight.sh --agent $AGENT --mode review" >&2
+    emit_check_failure_guard
     exit 2
   fi
-  echo "$cached_exports"
+  # #1021: the liveness check and the token dump used to be the SAME
+  # command. `--check` is documented as the thing every agent re-runs at the
+  # top of every tool call, so an agent testing whether the cache was warm
+  # wrote both live PATs into its transcript in plaintext -- observed twice
+  # in one session, by two different agents, both of which had been warned
+  # about credential hygiene. When careful actors break a rule repeatedly,
+  # the affordance is the defect. Printing now requires saying so.
+  if $PRINT_EXPORTS; then
+    echo "$cached_exports"
+  else
+    emit_check_compat_guard
+  fi
   if [[ "${OP_PREFLIGHT_QUIET:-0}" != "1" ]]; then
     epoch=$(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" | cut -d= -f2- | tr -d "'\"" || true)
     now=$(date +%s)

@@ -332,7 +332,7 @@ test_token_mode_reviewer_ref_override() {
     OP_PREFLIGHT_CACHE_DIR="$helper_space_cache" \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
     OP_PREFLIGHT_REVIEWER_PAT_REF="op://Mergepath CI Headless/nathanpayne-codex reviewer PAT/token" \
-    "$SCRIPT" --agent codex --check >"$WORKDIR/ref-helper-space-check.out" 2>"$WORKDIR/ref-helper-space-check.err" || rc=$?
+    "$SCRIPT" --agent codex --check --print-exports >"$WORKDIR/ref-helper-space-check.out" 2>"$WORKDIR/ref-helper-space-check.err" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail "test_token_mode_reviewer_ref_override: helper cache with space ref expected --check rc=0, got rc=$rc; stderr=$(cat "$WORKDIR/ref-helper-space-check.err")"
     return
@@ -450,7 +450,7 @@ test_token_mode_cache_and_check() {
     OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
     OP_PREFLIGHT_REVIEWER_PAT_REF="$(headless_reviewer_ref_for codex)" \
-    "$SCRIPT" --agent codex --check >"$WORKDIR/check.out" 2>"$WORKDIR/check.err" || rc=$?
+    "$SCRIPT" --agent codex --check --print-exports >"$WORKDIR/check.out" 2>"$WORKDIR/check.err" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail "test_token_mode_cache_and_check: --check expected rc=0, got rc=$rc; stderr=$(cat "$WORKDIR/check.err")"
     return
