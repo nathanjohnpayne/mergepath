@@ -392,7 +392,20 @@ g1100_decide() {  # <accounting-json> -> "refuse" | "proceed"
     policy_block_field_parsed() { case "$1" in
       coderabbit) printf '%s' "${G1100_CR-coderabbitai[bot]}" ;;
       code_scanning) printf '%s' "${G1100_GHAS-github-advanced-security[bot]}" ;;
+      codex) printf '%s' "${G1100_CODEX-chatgpt-codex-connector[bot]}" ;;
       *) printf '' ;; esac; }
+    # The decision reads author_identity and available_reviewers through the
+    # shared YAML->JSON parse. Stubbed here for the same reason
+    # policy_block_field_parsed is: this suite pins the DECISION, and the
+    # parser itself is exercised by the feedback-policy-helpers suite. Keeping
+    # it stubbed also keeps the suite hermetic on a runner with no YAML parser,
+    # where the real reader returns rc 1 for every shape alike.
+    policy_yaml_to_json() {
+      printf '{"author_identity":%s,"available_reviewers":%s}' \
+        "$(printf '%s' "${G1100_AUTHOR-nathanjohnpayne}" | jq -Rs 'rtrimstr("\n")')" \
+        "$(printf '%s' "${G1100_REVIEWERS-nathanpayne-codex nathanpayne-claude}" \
+           | jq -Rc 'rtrimstr("\n") | split(" ") | map(select(length > 0))')"
+    }
     log() { :; }
     die() { printf 'refuse'; exit 0; }
     eval "$(printf '%s' "$body" | sed -e 's/^    1)$//' -e 's/^      ;;$//')"
@@ -446,6 +459,56 @@ G1100_CR='' G1100_GHAS='' \
 G1100_NOBASE=1 \
   g1100_case "base policy unresolvable (must not fall back to the PR checkout)" \
     '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' refuse
+
+# Resolving the relax set from the BASE policy stops a PR NOMINATING its own
+# skippable providers. It does not stop a COLLISION, because
+# validate_governing_policy (review-feedback-accounting.sh:127-129) validates
+# codex/coderabbit/code_scanning bot_login only as `optional_string` and
+# available_reviewers only as non-empty strings -- nothing requires the
+# identities to be DISTINCT. A base policy that gives a skippable provider a
+# gating identity's login therefore passes validation, and a login-only
+# allowlist would relax that identity's findings (Codex P1, round 2).
+#
+# The contract is: ANY collision voids the WHOLE relax set. A policy that gives
+# two providers one login has not named either of them.
+G1100_CR='chatgpt-codex-connector[bot]' \
+  g1100_case "coderabbit.bot_login collides with the Codex bot" \
+    '{"missing":[{"reviewer":"chatgpt-codex-connector[bot]"}]}' refuse
+G1100_GHAS='chatgpt-codex-connector[bot]' \
+  g1100_case "code_scanning.bot_login collides with the Codex bot" \
+    '{"missing":[{"reviewer":"chatgpt-codex-connector[bot]"}]}' refuse
+G1100_CR='nathanpayne-codex' \
+  g1100_case "coderabbit.bot_login collides with a registered reviewer" \
+    '{"missing":[{"reviewer":"nathanpayne-codex"}]}' refuse
+G1100_CR='nathanjohnpayne' \
+  g1100_case "coderabbit.bot_login collides with the author identity" \
+    '{"missing":[{"reviewer":"nathanjohnpayne"}]}' refuse
+# A collision voids the relax set ENTIRELY, so even a finding from the
+# uncollided provider now gates. Subtracting only the colliding entry would
+# leave a policy we have already caught conflating identities still deciding
+# which findings may be skipped.
+G1100_CR='chatgpt-codex-connector[bot]' \
+  g1100_case "collision voids the whole relax set, not just the colliding entry" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' refuse
+
+# The gating set must be populated from DEFAULTS when the base policy omits a
+# field. policy_block_field_parsed exits 0 and prints nothing for an absent
+# field, so a `|| default` fallback never fires and would leave the Codex bot
+# (or the author) out of the gating set entirely -- the collision check would
+# then pass over exactly the shape it exists to catch.
+G1100_CODEX='' G1100_CR='chatgpt-codex-connector[bot]' \
+  g1100_case "codex.bot_login ABSENT still defaults into the gating set" \
+    '{"missing":[{"reviewer":"chatgpt-codex-connector[bot]"}]}' refuse
+G1100_AUTHOR='' G1100_CR='nathanjohnpayne' \
+  g1100_case "author_identity ABSENT still defaults into the gating set" \
+    '{"missing":[{"reviewer":"nathanjohnpayne"}]}' refuse
+
+# Control: a policy with DISTINCT identities is not a collision, and the
+# scoped exception still applies. Without this the collision check could be
+# refusing everything and every case above would still pass.
+G1100_CR='coderabbitai[bot]' G1100_GHAS='github-advanced-security[bot]' \
+  g1100_case "distinct identities are not a collision" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"},{"reviewer":"github-advanced-security[bot]"}]}' proceed
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
