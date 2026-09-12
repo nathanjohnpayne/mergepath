@@ -50,7 +50,11 @@ This repository uses a multi-identity AI agent code review system. The full poli
    eval "$(scripts/op-preflight.sh --agent {your-agent} --mode review)"
 
    # Every subsequent tool call (idempotent, NEVER prompts):
-   eval "$(scripts/op-preflight.sh --agent {your-agent} --check)"
+   eval "$(scripts/op-preflight.sh --agent {your-agent} --check --print-exports)"
+
+   # Just asking "is the cache warm?" — status on stderr, NO tokens anywhere.
+   # Use this one when you are not consuming the exports (#1021).
+   scripts/op-preflight.sh --agent {your-agent} --check
 
    # Read-path API call (uses cached PAT, no biometric):
    GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
@@ -63,7 +67,7 @@ This repository uses a multi-identity AI agent code review system. The full poli
    scripts/gh-as-author.sh -- gh pr create ...
    ```
 
-   `--check` (alias `--status`) is the lightweight re-validator: never invokes `op`, never warms SSH, exits non-zero on missing/stale cache. Set `OP_PREFLIGHT_QUIET=1` to collapse the cache-hit stderr block. It does not read or repair gh account selection. The helper scripts (`coderabbit-wait.sh`, `codex-review-request.sh`, `codex-review-check.sh`, `resolve-pr-threads.sh`, `request-label-removal.sh`) auto-source the cache when `GH_TOKEN` is unset (#282), so the explicit `GH_TOKEN=...` prefix is optional once preflight has run.
+   `--check` (alias `--status`) is the lightweight re-validator: never invokes `op`, never warms SSH, exits non-zero on missing/stale cache. It writes **no credential material to stdout or stderr on any exit path** (#1021) — run it bare to test whether the cache is warm, which is safe in a transcript, and add `--print-exports` only when you are consuming the `export OP_PREFLIGHT_*` statements through `eval "$(...)"`. Until every consumer has migrated, a bare `--check` piped into `eval` fails closed with a message naming the flag rather than silently leaving the PATs unset. Set `OP_PREFLIGHT_QUIET=1` to collapse the cache-hit stderr block. It does not read or repair gh account selection. The helper scripts (`coderabbit-wait.sh`, `codex-review-request.sh`, `codex-review-check.sh`, `resolve-pr-threads.sh`, `request-label-removal.sh`) auto-source the cache when `GH_TOKEN` is unset (#282), so the explicit `GH_TOKEN=...` prefix is optional once preflight has run.
 
    Do not use bare guarded writes. The `gh-pr-guard.sh` PreToolUse hook blocks direct or inline-token `gh pr create|merge|review|comment|edit` and `gh issue comment` because the hook cannot verify shell-expanded `GH_TOKEN=...` before execution. Use `scripts/gh-as-author.sh` for author writes (`gh pr create`, `gh pr merge`, `gh pr edit`, and the author-attributed `@codex review` trigger), and `scripts/gh-as-reviewer.sh` for reviewer writes (`gh pr review`, `gh pr comment`, `gh issue comment`). The wrappers verify the effective token with `identity-check.sh --expect-token-identity` and never mutate machine-global gh account selection.
 

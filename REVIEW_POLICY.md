@@ -230,10 +230,10 @@ Notes on the token-wrapper contract:
 eval "$(scripts/op-preflight.sh --agent claude --mode review)"
 
 # Every subsequent tool call (idempotent, NEVER prompts for biometric):
-eval "$(scripts/op-preflight.sh --agent claude --check)"
+eval "$(scripts/op-preflight.sh --agent claude --check --print-exports)"
 ```
 
-The `--check` (alias `--status`) mode is the lightweight idempotent re- validation pattern: it loads the cached export statements without invoking `op`, without warming SSH, and without reading ADC. On a missing or stale cache it exits non-zero with a remediation message pointing back at `--mode review`. Combined with `OP_PREFLIGHT_QUIET=1` the cache-hit path collapses to a single stderr line, so noisy agent sessions don't accumulate a verbose preflight block on every tool call. See nathanjohnpayne/mergepath#282.
+The `--check` (alias `--status`) mode is the lightweight idempotent re- validation pattern: it validates the cached session without invoking `op`, without warming SSH, and without reading ADC. It emits the cached export statements only when `--print-exports` is also passed (#1021): the liveness check and the token dump used to be the same command, so an agent testing whether the cache was warm wrote both live PATs into its transcript. A bare `--check` is therefore safe to run anywhere; a bare `--check` evaluated by an un-migrated `eval "$(...)"` fails closed with a message naming `--print-exports`, because an empty `GH_TOKEN` does not fail — it silently attributes to whatever account the `gh` keyring has active. On a missing or stale cache it exits non-zero with a remediation message pointing back at `--mode review`. Combined with `OP_PREFLIGHT_QUIET=1` the cache-hit path collapses to a single stderr line, so noisy agent sessions don't accumulate a verbose preflight block on every tool call. See nathanjohnpayne/mergepath#282.
 
 Replace `claude` with `cursor` or `codex` depending on which agent is running. The `--mode` flag controls what is loaded:
 

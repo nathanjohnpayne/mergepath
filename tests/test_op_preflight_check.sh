@@ -187,7 +187,10 @@ make_stale_cache() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 1: --check with a fresh cache emits exports, never invokes op.
+# Test 1: --check --print-exports with a fresh cache emits exports, never
+# invokes op. Before #1021 this was bare `--check`; the exports moved behind
+# the explicit flag, so this test now pins the EXPORT path and
+# test_check_emits_no_credentials pins the liveness path.
 # ---------------------------------------------------------------------------
 test_check_fresh_cache() {
   local case_dir="$WORKDIR/case1"
@@ -195,7 +198,7 @@ test_check_fresh_cache() {
 
   local out err rc
   out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
-    "$SCRIPT" --agent claude --check 2>"$WORKDIR/case1.err") || rc=$?
+    "$SCRIPT" --agent claude --check --print-exports 2>"$WORKDIR/case1.err") || rc=$?
   rc=${rc:-0}
   err=$(cat "$WORKDIR/case1.err")
 
@@ -215,7 +218,7 @@ test_check_fresh_cache() {
     fail "test_check_fresh_cache: --check invoked op or ssh; stderr=$err"
     return
   fi
-  pass "test_check_fresh_cache: fresh cache emits exports without op/ssh/gh auth switch"
+  pass "test_check_fresh_cache: --print-exports emits exports without op/ssh/gh auth switch"
 }
 
 # ---------------------------------------------------------------------------
@@ -231,8 +234,16 @@ test_check_missing_cache() {
     fail "test_check_missing_cache: expected non-zero exit, got 0"
     return
   fi
-  if [ -s "$WORKDIR/case2.out" ]; then
-    fail "test_check_missing_cache: expected empty stdout on miss, got $(cat "$WORKDIR/case2.out")"
+  # Pre-#1021 this asserted literal emptiness. The property it protects is "no
+  # credentials when there is no valid cache"; stdout now also carries the
+  # temporary compat guard, which is inert text. Assert the property, and that
+  # what IS there is the guard, so anything else appearing here still trips.
+  if grep -qE '(OP_PREFLIGHT_REVIEWER_PAT|OP_PREFLIGHT_AUTHOR_PAT)=' "$WORKDIR/case2.out"; then
+    fail "test_check_missing_cache: stdout carries a PAT export on the miss path: $(cat "$WORKDIR/case2.out")"
+    return
+  fi
+  if [ -s "$WORKDIR/case2.out" ] && ! grep -q -- "--print-exports" "$WORKDIR/case2.out"; then
+    fail "test_check_missing_cache: unexpected stdout on miss, got $(cat "$WORKDIR/case2.out")"
     return
   fi
   if ! echo "$err" | grep -q "cache missing or stale"; then
@@ -306,11 +317,136 @@ test_status_alias() {
     fail "test_status_alias: expected rc=0, got rc=$rc"
     return
   fi
-  if ! echo "$out" | grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-5"; then
-    fail "test_status_alias: stdout missing reviewer PAT export"
+  # The alias must track the CURRENT default, not the pre-#1021 one: bare
+  # --status is a liveness check and must not leak either PAT.
+  if echo "$out" | grep -q "rev-pat-5\|author-pat-5"; then
+    fail "test_status_alias: bare --status leaked a PAT on stdout"
     return
   fi
-  pass "test_status_alias: --status behaves like --check"
+  local out_exp rc_exp=0
+  out_exp=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
+    "$SCRIPT" --agent claude --status --print-exports 2>/dev/null) || rc_exp=$?
+  if [ "$rc_exp" -ne 0 ] || ! echo "$out_exp" | grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-5"; then
+    fail "test_status_alias: --status --print-exports did not emit the reviewer PAT"
+    return
+  fi
+  pass "test_status_alias: --status behaves like --check on both sides of the split"
+}
+
+# ---------------------------------------------------------------------------
+# #1021: the liveness check and the token dump were the same command, so an
+# agent testing whether the cache was warm wrote both live PATs into its
+# transcript. Bare --check must now write NO credential material to stdout or
+# stderr on ANY exit path. Driven with sentinel PATs so the assertion is on the
+# values themselves rather than on an `export ` prefix a refactor could rename.
+# ---------------------------------------------------------------------------
+test_check_emits_no_credentials() {
+  local sentinel_rev="SENTINEL-REVIEWER-b3f9c1" sentinel_auth="SENTINEL-AUTHOR-7d2e04"
+  local fresh="$WORKDIR/case1021_fresh" stale="$WORKDIR/case1021_stale"
+  local missing="$WORKDIR/case1021_missing"   # deliberately never created
+  local incomplete="$WORKDIR/case1021_incomplete"
+  make_fresh_cache "$fresh" claude "$sentinel_rev" "$sentinel_auth"
+  make_aged_cache "$stale" claude \
+    $(( SCRIPT_DEFAULT_TTL_SECONDS + 3600 )) "$sentinel_rev" "$sentinel_auth"
+  # A review-mode cache queried under --mode deploy is the "present but
+  # incomplete" exit path, which is a third place stdout could carry material.
+  make_fresh_cache "$incomplete" claude "$sentinel_rev" "$sentinel_auth"
+
+  local label dir extra_args
+  for spec in "fresh:$fresh:" "stale:$stale:" "missing:$missing:" "incomplete:$incomplete:--mode deploy"; do
+    label="${spec%%:*}"
+    dir="$(printf '%s' "$spec" | cut -d: -f2)"
+    extra_args="$(printf '%s' "$spec" | cut -d: -f3)"
+    # shellcheck disable=SC2086
+    PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$dir" \
+      "$SCRIPT" --agent claude --check $extra_args \
+      >"$WORKDIR/nc-$label.out" 2>"$WORKDIR/nc-$label.err" || true
+    if grep -qF "$sentinel_rev" "$WORKDIR/nc-$label.out" "$WORKDIR/nc-$label.err" \
+       || grep -qF "$sentinel_auth" "$WORKDIR/nc-$label.out" "$WORKDIR/nc-$label.err"; then
+      fail "test_check_emits_no_credentials: bare --check leaked a PAT on the $label path"
+      return
+    fi
+  done
+  pass "test_check_emits_no_credentials: no PAT on stdout or stderr across fresh/stale/missing/incomplete"
+}
+
+# ---------------------------------------------------------------------------
+# #1021, the migration hazard. Bare --check used to populate OP_PREFLIGHT_*_PAT
+# through `eval "$(...)"`. Simply printing nothing would leave an un-migrated
+# caller with both variables UNSET -- and an empty GH_TOKEN does not fail:
+# `GH_TOKEN="" gh api user` exits 0 and attributes to whatever account the gh
+# keyring has active, which is a wrong byline nobody sees. So stdout carries a
+# guard that fails loudly when evaluated. This is temporary; when it is removed,
+# this test goes with it.
+# ---------------------------------------------------------------------------
+test_check_compat_guard_fails_closed() {
+  local case_dir="$WORKDIR/case1021_guard"
+  make_fresh_cache "$case_dir" claude "guard-rev" "guard-auth"
+
+  local rc=0
+  bash -c '
+    set -e
+    eval "$(PATH="$2:$PATH" OP_PREFLIGHT_CACHE_DIR="$3" "$1" --agent claude --check 2>/dev/null)"
+    echo REACHED
+  ' _ "$SCRIPT" "$STUB_DIR" "$case_dir" >"$WORKDIR/guard.out" 2>"$WORKDIR/guard.err" || rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    fail "test_check_compat_guard_fails_closed: un-migrated eval succeeded (rc=0); it must fail closed"
+    return
+  fi
+  if grep -q REACHED "$WORKDIR/guard.out"; then
+    fail "test_check_compat_guard_fails_closed: execution continued past the eval"
+    return
+  fi
+  if ! grep -q -- "--print-exports" "$WORKDIR/guard.err"; then
+    fail "test_check_compat_guard_fails_closed: stderr does not name the remediation; got $(cat "$WORKDIR/guard.err")"
+    return
+  fi
+  # The miss path needs the guard too, and for a reason worth stating: it was
+  # ALREADY silently-empty before #1021, so an un-migrated eval on a stale or
+  # missing cache has always left both PATs unset and fallen through to the
+  # keyring. Emitting the guard on every --check exit path rather than only the
+  # one that used to print keeps the rule single -- and means the eventual
+  # removal has one shape, not two.
+  local miss_dir="$WORKDIR/case1021_guard_miss"   # never created
+  local rc_miss=0
+  bash -c '
+    set -e
+    eval "$(PATH="$2:$PATH" OP_PREFLIGHT_CACHE_DIR="$3" "$1" --agent claude --check 2>/dev/null)"
+    echo REACHED
+  ' _ "$SCRIPT" "$STUB_DIR" "$miss_dir" >"$WORKDIR/guard-miss.out" 2>/dev/null || rc_miss=$?
+  if [ "$rc_miss" -eq 0 ] || grep -q REACHED "$WORKDIR/guard-miss.out"; then
+    fail "test_check_compat_guard_fails_closed: un-migrated eval on a MISSING cache did not fail closed"
+    return
+  fi
+  pass "test_check_compat_guard_fails_closed: un-migrated eval exits non-zero on fresh and missing caches"
+}
+
+# ---------------------------------------------------------------------------
+# #1021 acceptance: the export path still works for its real consumers --
+# asserted through an actual `eval`, not by grepping stdout, because what
+# matters is that both variables end up POPULATED in the caller's shell.
+# ---------------------------------------------------------------------------
+test_print_exports_eval_populates_both_vars() {
+  local case_dir="$WORKDIR/case1021_eval"
+  make_fresh_cache "$case_dir" claude "eval-rev-pat" "eval-auth-pat"
+
+  local out rc=0
+  out=$(bash -c '
+    eval "$(PATH="$2:$PATH" OP_PREFLIGHT_CACHE_DIR="$3" "$1" --agent claude --check --print-exports 2>/dev/null)"
+    printf "%s|%s
+" "${OP_PREFLIGHT_REVIEWER_PAT:-UNSET}" "${OP_PREFLIGHT_AUTHOR_PAT:-UNSET}"
+  ' _ "$SCRIPT" "$STUB_DIR" "$case_dir") || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    fail "test_print_exports_eval_populates_both_vars: eval failed rc=$rc"
+    return
+  fi
+  if [ "$out" != "eval-rev-pat|eval-auth-pat" ]; then
+    fail "test_print_exports_eval_populates_both_vars: expected both vars populated, got [$out]"
+    return
+  fi
+  pass "test_print_exports_eval_populates_both_vars: eval \"\$(... --print-exports)\" populates both PATs"
 }
 
 # ---------------------------------------------------------------------------
@@ -376,7 +512,7 @@ test_default_ttl_is_ten_hours() {
 
   local out err rc=0
   out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
-    "$SCRIPT" --agent claude --check 2>"$WORKDIR/case8.err") || rc=$?
+    "$SCRIPT" --agent claude --check --print-exports 2>"$WORKDIR/case8.err") || rc=$?
   err=$(cat "$WORKDIR/case8.err")
 
   if [ "$rc" -ne 0 ]; then
@@ -407,7 +543,7 @@ test_ttl_override_both_directions() {
   local err rc=0
   PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$short_dir" \
     OP_PREFLIGHT_TTL_SECONDS=60 \
-    "$SCRIPT" --agent claude --check >"$WORKDIR/case9a.out" 2>"$WORKDIR/case9a.err" || rc=$?
+    "$SCRIPT" --agent claude --check --print-exports >"$WORKDIR/case9a.out" 2>"$WORKDIR/case9a.err" || rc=$?
   err=$(cat "$WORKDIR/case9a.err")
   if [ "$rc" -eq 0 ]; then
     fail "test_ttl_override_both_directions: OP_PREFLIGHT_TTL_SECONDS=60 should expire a 5h-old cache, got rc=0"
@@ -426,7 +562,7 @@ test_ttl_override_both_directions() {
   rc=0
   out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$long_dir" \
     OP_PREFLIGHT_TTL_SECONDS=86400 \
-    "$SCRIPT" --agent claude --check 2>"$WORKDIR/case9b.err") || rc=$?
+    "$SCRIPT" --agent claude --check --print-exports 2>"$WORKDIR/case9b.err") || rc=$?
   err=$(cat "$WORKDIR/case9b.err")
   if [ "$rc" -ne 0 ]; then
     fail "test_ttl_override_both_directions: OP_PREFLIGHT_TTL_SECONDS=86400 should revive an 11h-old cache; rc=$rc stderr=$err"
@@ -445,9 +581,9 @@ test_ttl_override_both_directions() {
 
 # ---------------------------------------------------------------------------
 # test_check_deploy_no_python3_probe (nathanpayne-codex Phase 4b r1 on
-# PR #292): --check --mode deploy must NOT invoke python3 to validate
+# PR #292): --check --print-exports --mode deploy must NOT invoke python3 to validate
 # ADC. Probe by PATH-shimming python3 with an aborting stub and
-# verifying the --check path exits 0 with cached exports rather than
+# verifying the --check --print-exports path exits 0 with cached exports rather than
 # aborting via the stub.
 # ---------------------------------------------------------------------------
 test_check_deploy_no_python3_probe() {
@@ -456,7 +592,7 @@ test_check_deploy_no_python3_probe() {
   local adc_file="$WORKDIR/deploy-no-python3-adc.json"
   # Fake but well-formed service_account JSON. adc_is_usable
   # short-circuits to OK on service_account creds without HTTP, but
-  # if --check honors the contract it shouldn't even reach
+  # if --check --print-exports honors the contract it shouldn't even reach
   # adc_is_usable.
   cat > "$adc_file" <<'JSON'
 {"type":"service_account","project_id":"x","private_key_id":"x","private_key":"x","client_email":"x"}
@@ -481,7 +617,7 @@ EOF
   mkdir -p "$py_stub"
   cat > "$py_stub/python3" <<'EOF'
 #!/usr/bin/env bash
-echo "FATAL: --check --mode deploy invoked python3 with args: $*" >&2
+echo "FATAL: --check --print-exports --mode deploy invoked python3 with args: $*" >&2
 exit 97
 EOF
   chmod +x "$py_stub/python3"
@@ -489,24 +625,24 @@ EOF
   local out rc=0
   out=$(OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
         PATH="$py_stub:$STUB_DIR:$PATH" \
-        "$SCRIPT" --agent claude --mode deploy --check 2>&1) || rc=$?
+        "$SCRIPT" --agent claude --mode deploy --check --print-exports 2>&1) || rc=$?
   if [ "$rc" -ne 0 ]; then
-    fail "test_check_deploy_no_python3_probe: --check --mode deploy returned rc=$rc; out=$out"
+    fail "test_check_deploy_no_python3_probe: --check --print-exports --mode deploy returned rc=$rc; out=$out"
     return
   fi
   if echo "$out" | grep -q "invoked python3"; then
-    fail "test_check_deploy_no_python3_probe: --check --mode deploy invoked python3 (ADC probe leaked)"
+    fail "test_check_deploy_no_python3_probe: --check --print-exports --mode deploy invoked python3 (ADC probe leaked)"
     return
   fi
   if ! echo "$out" | grep -q "export GOOGLE_APPLICATION_CREDENTIALS="; then
-    fail "test_check_deploy_no_python3_probe: --check --mode deploy did not emit ADC export; out=$out"
+    fail "test_check_deploy_no_python3_probe: --check --print-exports --mode deploy did not emit ADC export; out=$out"
     return
   fi
-  pass "test_check_deploy_no_python3_probe: --check --mode deploy emits ADC without python3 probe"
+  pass "test_check_deploy_no_python3_probe: --check --print-exports --mode deploy emits ADC without python3 probe"
 }
 
 # ---------------------------------------------------------------------------
-# test_check_deploy_firebase_sa_no_python3_probe: --check must stay a
+# test_check_deploy_firebase_sa_no_python3_probe: --check --print-exports must stay a
 # no-probe path even when the cached deploy credential is a Firebase SA
 # marker and the checkout has a .firebaserc.
 # ---------------------------------------------------------------------------
@@ -551,7 +687,7 @@ EOF
 
   cat > "$py_stub/python3" <<'EOF'
 #!/usr/bin/env bash
-echo "FATAL: --check --mode deploy invoked python3 with args: $*" >&2
+echo "FATAL: --check --print-exports --mode deploy invoked python3 with args: $*" >&2
 exit 97
 EOF
   chmod +x "$py_stub/python3"
@@ -561,28 +697,28 @@ EOF
     cd "$case_dir"
     OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
       PATH="$py_stub:$STUB_DIR:$PATH" \
-      "$SCRIPT" --agent claude --mode deploy --check 2>&1
+      "$SCRIPT" --agent claude --mode deploy --check --print-exports 2>&1
   ) >"$case_dir/out" || rc=$?
   out="$(cat "$case_dir/out")"
 
   if [ "$rc" -ne 0 ]; then
-    fail "test_check_deploy_firebase_sa_no_python3_probe: --check returned rc=$rc; out=$out"
+    fail "test_check_deploy_firebase_sa_no_python3_probe: --check --print-exports returned rc=$rc; out=$out"
     return
   fi
   if echo "$out" | grep -q "invoked python3"; then
-    fail "test_check_deploy_firebase_sa_no_python3_probe: --check invoked python3; out=$out"
+    fail "test_check_deploy_firebase_sa_no_python3_probe: --check --print-exports invoked python3; out=$out"
     return
   fi
   if ! echo "$out" | grep -q "export OP_PREFLIGHT_FIREBASE_SA_TMPFILE="; then
     fail "test_check_deploy_firebase_sa_no_python3_probe: missing Firebase SA marker export; out=$out"
     return
   fi
-  pass "test_check_deploy_firebase_sa_no_python3_probe: --check emits Firebase SA without python3 probe"
+  pass "test_check_deploy_firebase_sa_no_python3_probe: --check --print-exports emits Firebase SA without python3 probe"
 }
 
 # ---------------------------------------------------------------------------
 # test_check_deploy_firebase_sa_project_mismatch_fails_closed:
-# --check is probe-free, but it must still refuse a Firebase SA cache
+# --check --print-exports is probe-free, but it must still refuse a Firebase SA cache
 # whose project marker/file no longer match the checkout.
 # ---------------------------------------------------------------------------
 test_check_deploy_firebase_sa_project_mismatch_fails_closed() {
@@ -1152,7 +1288,7 @@ EOF
 
   local out rc=0
   out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
-    "$SCRIPT" --agent claude --check 2>/dev/null) || rc=$?
+    "$SCRIPT" --agent claude --check --print-exports 2>/dev/null) || rc=$?
   if [ "$rc" -ne 0 ]; then
     fail "test_check_review_mode_omits_deploy_creds: expected rc=0, got rc=$rc"
     return
@@ -1179,7 +1315,7 @@ EOF
     fail "test_check_review_mode_omits_deploy_creds: review mode did not unset CF_API_TOKEN; out=$out"
     return
   fi
-  pass "test_check_review_mode_omits_deploy_creds: review --check omits AND unsets stale deploy creds (#466)"
+  pass "test_check_review_mode_omits_deploy_creds: review --check --print-exports omits AND unsets stale deploy creds (#466)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1366,9 +1502,9 @@ test_preflight_mode_is_exported() {
   make_fresh_cache "$case_dir" claude "rev-pat-m" "author-pat-m"
   local out rc=0
   out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
-    "$SCRIPT" --agent claude --check 2>/dev/null) || rc=$?
+    "$SCRIPT" --agent claude --check --print-exports 2>/dev/null) || rc=$?
   if [ "$rc" -ne 0 ]; then
-    fail "test_preflight_mode_is_exported: cache-hit --check rc=$rc"
+    fail "test_preflight_mode_is_exported: cache-hit --check --print-exports rc=$rc"
     return
   fi
   if ! echo "$out" | grep -q "export OP_PREFLIGHT_MODE=review"; then
@@ -1417,6 +1553,9 @@ test_check_missing_cache
 test_check_stale_cache
 test_check_mutex
 test_status_alias
+test_check_emits_no_credentials
+test_check_compat_guard_fails_closed
+test_print_exports_eval_populates_both_vars
 test_quiet_mode
 test_default_mode_is_review
 test_default_ttl_is_ten_hours

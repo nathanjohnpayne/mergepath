@@ -285,7 +285,7 @@ local_preflight_proof() {
   exports=$(OP_PREFLIGHT_QUIET=1 \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_ACCOUNT_TOKEN" \
     OP_PREFLIGHT_REVIEWER_PAT_REF="$REVIEWER_PAT_REF" \
-    scripts/op-preflight.sh --agent "$AGENT" --check)
+    scripts/op-preflight.sh --agent "$AGENT" --check --print-exports)
   eval "$exports"
   [ "${OP_PREFLIGHT_TOKEN_MODE:-0}" = "1" ] || fail "op-preflight --check did not preserve token mode"
 
