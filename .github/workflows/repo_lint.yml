@@ -385,6 +385,15 @@ jobs:
       - name: check_workflow_parsers
         run: ./scripts/ci/check_workflow_parsers || { rc=$?; if [ ! -f scripts/ci/check_workflow_parsers ]; then echo "check_workflow_parsers not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      # check_pr_review_policy_recovery fences the #931 recovery lane: the
+      # schedule + repository_dispatch entrances that let `Self-Review
+      # Required` and `Label Gate` self-heal a missed `pull_request` event,
+      # the absence of workflow_dispatch (which would hand `checks: write` to
+      # a PR branch's own copy of the workflow), and the sweep script's
+      # decision logic against fixture payloads.
+      - name: check_pr_review_policy_recovery
+        run: ./scripts/ci/check_pr_review_policy_recovery || { rc=$?; if [ ! -f scripts/ci/check_pr_review_policy_recovery ]; then echo "check_pr_review_policy_recovery not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_merge_group_required_checks
         run: ./scripts/ci/check_merge_group_required_checks || { rc=$?; if [ ! -f scripts/ci/check_merge_group_required_checks ]; then echo "check_merge_group_required_checks not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 

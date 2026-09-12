@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# check_pr_review_policy_recovery
+#
+# Structural fence for the recovery lane that keeps `.github/workflows/
+# pr-review-policy.yml`'s two required contexts — `Self-Review Required` and
+# `Label Gate` — able to self-heal a missed `pull_request` event
+# (nathanjohnpayne/mergepath#931).
+#
+# Three concerns:
+#   1. The recovery script and its suite exist on disk, are executable, and
+#      pass shellcheck.
+#   2. The workflow keeps the SHAPE the guarantee depends on: a `schedule`
+#      cron and a `repository_dispatch` type as the two recovery entrances, NO
+#      `workflow_dispatch` (a ref-selectable trigger would let a PR branch run
+#      its own copy of this file with `checks: write` and publish its own green
+#      required context — the #550 hole), every event-driven job gated to
+#      `pull_request` so a sweep run cannot fail them onto the default branch,
+#      and a sweep job that is named for no required context, carries
+#      `checks: write` and no other write scope, and invokes the script.
+#   3. The decision logic works against fixture payloads. Delegated to
+#      tests/test_pr_review_policy_recovery.sh, which PATH-shims `gh`.
+#
+# Invoked by .github/workflows/repo_lint.yml alongside the other
+# scripts/ci/check_* scripts.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+SCRIPT="scripts/pr-review-policy-recovery.sh"
+WORKFLOW=".github/workflows/pr-review-policy.yml"
+TEST="tests/test_pr_review_policy_recovery.sh"
+
+# The lane stamps this into every check run it publishes and matches on it to
+# tell its own lineage from the job-native one. It is the whole refresh
+# contract, so the literal is asserted in lockstep rather than assumed.
+RECOVERY_EXTERNAL_ID="mergepath-pr-review-policy-recovery"
+DISPATCH_TYPE="pr-review-policy-recheck"
+SWEEP_JOB="recovery-sweep"
+# Job names that would be a SECOND producer of a required context if the sweep
+# job (or a skipped sibling) ever carried one of them.
+REQUIRED_CONTEXTS="Self-Review Required|Label Gate"
+
+FAILED=0
+
+for rel in "$SCRIPT" "$TEST"; do
+  if [ ! -f "$rel" ]; then
+    echo "FAIL: Missing required file: $rel"
+    FAILED=1
+    continue
+  fi
+  if [ ! -x "$rel" ]; then
+    echo "FAIL: File is not executable: $rel"
+    echo "      Fix with: chmod +x $rel"
+    FAILED=1
+  fi
+done
+
+if [ ! -f "$WORKFLOW" ]; then
+  echo "FAIL: Missing required workflow: $WORKFLOW"
+  FAILED=1
+fi
+
+if [ -f "$SCRIPT" ] && ! grep -qF "RECOVERY_EXTERNAL_ID=\"$RECOVERY_EXTERNAL_ID\"" "$SCRIPT"; then
+  echo "FAIL: $SCRIPT no longer stamps external_id '$RECOVERY_EXTERNAL_ID'."
+  echo "      The lane tells its own check runs apart from the job-native ones by that"
+  echo "      exact string. Change it in both places or a published recovery verdict"
+  echo "      becomes unrefreshable and strands the PR it was meant to unstick."
+  FAILED=1
+fi
+
+if [ -f "$WORKFLOW" ]; then
+  # A ref-selectable trigger on a workflow that grants pull-requests: write and
+  # checks: write is the #550 hole; repository_dispatch has no ref parameter.
+  if grep -qE "^[[:space:]]*workflow_dispatch:" "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW lists workflow_dispatch."
+    echo "      GitHub runs the workflow DEFINITION from the ref the dispatcher picks, so a"
+    echo "      PR branch could run its own copy of this file with checks: write and publish"
+    echo "      its own green 'Self-Review Required'. Use repository_dispatch (no ref"
+    echo "      parameter; always the default-branch copy) — see #550 and #931."
+    FAILED=1
+  fi
+
+  if ! command -v ruby >/dev/null 2>&1; then
+    echo "FAIL: ruby is required to validate $WORKFLOW structurally."
+    FAILED=1
+  elif ! ruby -ryaml - "$WORKFLOW" "$SCRIPT" "$DISPATCH_TYPE" "$SWEEP_JOB" "$REQUIRED_CONTEXTS" <<'RUBY'
+# encoding: utf-8
+# Ruby reads a script from STDIN as US-ASCII on some hosts, so the magic
+# comment is load-bearing: the diagnostics below contain em dashes.
+path, script, dispatch_type, sweep_job, required_contexts = ARGV
+failed = false
+
+require_shape = lambda do |condition, message|
+  next if condition
+  warn "FAIL: #{message}"
+  failed = true
+end
+
+begin
+  document = YAML.safe_load(File.read(path), aliases: false)
+rescue Psych::Exception => error
+  warn "FAIL: #{path} is not parseable YAML: #{error.message}"
+  exit 1
+end
+
+# YAML 1.1 reads a bare `on:` key as the boolean true.
+triggers = document[true] || document['on']
+require_shape.call(triggers.is_a?(Hash), "#{path} has no parseable `on:` block")
+triggers = {} unless triggers.is_a?(Hash)
+
+require_shape.call(triggers.key?('pull_request'),
+  "#{path} must keep its `pull_request` trigger — the recovery lane is a backstop for it, not a replacement")
+
+# Recovery entrance 1: the periodic sweep.
+schedule = triggers['schedule']
+require_shape.call(schedule.is_a?(Array) && schedule.any? { |e| e.is_a?(Hash) && e['cron'].to_s =~ /\S/ },
+  "#{path} must declare a `schedule:` trigger with a cron expression — without it a dropped `pull_request` delivery leaves 'Self-Review Required' and 'Label Gate' pending forever (#931)")
+
+# Recovery entrance 2: the operator's immediate path.
+dispatch = triggers['repository_dispatch']
+dispatch_types = dispatch.is_a?(Hash) ? Array(dispatch['types']) : []
+require_shape.call(dispatch_types.include?(dispatch_type),
+  "#{path} must declare `repository_dispatch` type `#{dispatch_type}` — it is the only manual way to unstick one PR without a no-op commit, and workflow_dispatch is deliberately unavailable (#550/#931)")
+
+jobs = document['jobs']
+require_shape.call(jobs.is_a?(Hash), "#{path} has no parseable `jobs:` block")
+jobs = {} unless jobs.is_a?(Hash)
+
+# Every job that reads `github.event.pull_request.*` must be gated to the
+# pull_request event. Without the gate a scheduled run executes them with no
+# PR in the payload: they fail, and their native check runs — two of which are
+# named for required contexts — attach to the default branch's tip.
+%w[self-review-check label-gate external-review-labeling].each do |name|
+  job = jobs[name]
+  require_shape.call(job.is_a?(Hash), "#{path} is missing the `#{name}` job")
+  next unless job.is_a?(Hash)
+  condition = job['if'].to_s
+  require_shape.call(condition.include?("github.event_name == 'pull_request'"),
+    "#{path} job `#{name}` must be gated on `github.event_name == 'pull_request'` — on the sweep's own triggers there is no `github.event.pull_request`, and an ungated run publishes a failing required context onto the default branch (#931)")
+end
+
+sweep = jobs[sweep_job]
+require_shape.call(sweep.is_a?(Hash), "#{path} is missing the `#{sweep_job}` job — the recovery lane has no runner")
+if sweep.is_a?(Hash)
+  condition = sweep['if'].to_s
+  require_shape.call(condition.include?("github.event_name == 'schedule'") &&
+                     condition.include?("github.event_name == 'repository_dispatch'"),
+    "#{path} job `#{sweep_job}` must run on BOTH recovery triggers")
+  require_shape.call(condition.include?('github.ref_name == github.event.repository.default_branch'),
+    "#{path} job `#{sweep_job}` must keep the default-branch ref backstop, so re-adding a ref-selectable trigger fails closed instead of handing `checks: write` to a feature branch (#550)")
+
+  permissions = sweep['permissions']
+  require_shape.call(permissions.is_a?(Hash),
+    "#{path} job `#{sweep_job}` must declare its own `permissions:` — a job-level block REPLACES the workflow map, and inheriting `pull-requests: write` would give the sweep label and comment scope it must not have")
+  if permissions.is_a?(Hash)
+    require_shape.call(permissions['checks'] == 'write',
+      "#{path} job `#{sweep_job}` needs `checks: write` to publish the recovered contexts")
+    writes = permissions.reject { |scope, level| scope == 'checks' || level != 'write' }
+    require_shape.call(writes.empty?,
+      "#{path} job `#{sweep_job}` must grant no write scope other than `checks` (found: #{writes.keys.join(', ')}) — the sweep reads PR state and publishes check runs, nothing else")
+  end
+
+  name = sweep['name'].to_s
+  require_shape.call(!Regexp.new("\\A(#{required_contexts})\\z").match?(name),
+    "#{path} job `#{sweep_job}` must NOT be named for a required context: it is skipped on `pull_request`, and a skipped job still materialises a native check run — a second producer of the very context this lane exists to publish")
+
+  steps = Array(sweep['steps'])
+  runs = steps.map { |s| s.is_a?(Hash) ? s['run'].to_s : '' }.join("\n")
+  require_shape.call(runs.include?(script),
+    "#{path} job `#{sweep_job}` must invoke #{script}")
+  checkout = steps.find { |s| s.is_a?(Hash) && s['uses'].to_s.start_with?('actions/checkout@') }
+  require_shape.call(checkout && checkout['with'].is_a?(Hash) &&
+                     checkout['with']['ref'].to_s.include?('github.event.repository.default_branch'),
+    "#{path} job `#{sweep_job}` must check out the default branch, matching the trusted-source posture of the event-driven gate")
+end
+
+exit(failed ? 1 : 0)
+RUBY
+  then
+    FAILED=1
+  fi
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_pr_review_policy_recovery: FAIL (pre-flight)"
+  exit 1
+fi
+
+if command -v shellcheck >/dev/null 2>&1; then
+  if ! shellcheck --severity=warning "$SCRIPT" "$TEST"; then
+    echo "FAIL: shellcheck reported warnings/errors in the recovery lane"
+    echo "check_pr_review_policy_recovery: FAIL (shellcheck)"
+    exit 1
+  fi
+else
+  # #588: a silent skip here is how a lint gate rots. Route through the shared
+  # visibility helper when it is present so the message is the fleet's.
+  if [ -f scripts/lib/lint-tooling.sh ]; then
+    # shellcheck source=../lib/lint-tooling.sh
+    . scripts/lib/lint-tooling.sh
+    lint_tooling_require_shellcheck || exit 1
+  else
+    echo "WARN: shellcheck is not installed; the recovery lane was NOT statically analysed here."
+  fi
+fi
+
+for tool in jq node; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "check_pr_review_policy_recovery: ERROR ($tool is required — the wrapped suite would report a green check over zero assertions)" >&2
+    exit 1
+  fi
+done
+
+if ! bash "$TEST"; then
+  echo "check_pr_review_policy_recovery: FAIL (test suite)"
+  exit 1
+fi
+
+echo "check_pr_review_policy_recovery: PASS"
+exit 0

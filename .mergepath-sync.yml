@@ -855,6 +855,50 @@ paths:
       - "scripts/lib/pr-body-contract.sh"   # sourced; provides pr_body_validate
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/reviewers-helpers.sh"  # pr-body-contract.sh hard-sources it
+  # Recovery lane for pr-review-policy.yml's two required contexts (#931).
+  # Canonical because the gap it closes is fleet-wide: every consumer receives
+  # pr-review-policy.yml byte-identical, so every consumer had the same
+  # single-producer exposure — a dropped `pull_request` delivery leaving
+  # `Self-Review Required` and `Label Gate` pending forever with no self-heal.
+  # The workflow's sweep job shells out to this script by path, so a consumer
+  # that received the workflow without it would run a sweep that exits 127 and
+  # recover nothing.
+  - path: scripts/pr-review-policy-recovery.sh
+    type: canonical
+    consumers: all
+    requires:
+      # The self-review verdict routes through the SAME single entrypoint the
+      # event-driven job pipes the body into, rather than a second copy of the
+      # heading contract. Its own transitive closure is declared here too: the
+      # commit-path closure gate reads only THIS entry's requires, so the
+      # validator's entry does not protect this one.
+      - "scripts/validate-pr-body.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
+      # Fail-closed scalar reads: an unreadable response must never reach the
+      # publish decision as a value (#799).
+      - "scripts/lib/gh-api-scalar.sh"
+      # The blocking-label predicate. Sourced when present, with the exact
+      # four-name bootstrap fallback retained for a pre-wave tree, so this is
+      # a soft dependency in behaviour and a hard one in intent: a consumer
+      # holding an older list would recover a Label Gate verdict that
+      # disagrees with its own event-driven job.
+      - "scripts/lib/blocking-labels.sh"
+  - path: tests/test_pr_review_policy_recovery.sh
+    type: canonical
+    consumers: all
+    # Delegated suite for scripts/ci/check_pr_review_policy_recovery, which
+    # hard-fails when it is missing. It PATH-shims `gh` and executes the
+    # recovery script itself, so the script and its own closure travel with it.
+    requires:
+      - "scripts/pr-review-policy-recovery.sh"
+      - "scripts/validate-pr-body.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/gh-api-scalar.sh"
+      - "scripts/lib/blocking-labels.sh"
   - path: scripts/gh-as-reviewer.sh
     type: canonical
     consumers: all
@@ -1548,6 +1592,12 @@ paths:
       # every PR. Declared directly, as the manifest already does for the
       # parity test's same transitive dependency.
       - "scripts/lib/reviewers-helpers.sh"
+      # The #931 recovery sweep job shells out to this by path. Without it a
+      # consumer receives a workflow whose */15 sweep exits 127 every quarter
+      # hour and recovers nothing — the exact single-producer exposure the
+      # sweep exists to remove.
+      - "scripts/pr-review-policy-recovery.sh"
+      - "scripts/lib/blocking-labels.sh"
   - path: .github/workflows/dependabot-auto-merge.yml
     type: canonical
     consumers: all
@@ -1847,6 +1897,8 @@ paths:
       - "tests/test_coderabbit_wait_codex_failover.sh"  # check_coderabbit_wait (#489/#521)
       - "tests/test_coderabbit_automerge_rate_limit_gate.sh"  # check_coderabbit_wait (#489/#521)
       - "tests/test_codex_p1_gate.sh"          # check_codex_p1_gate
+      - "tests/test_pr_review_policy_recovery.sh"  # check_pr_review_policy_recovery (#931)
+      - "scripts/pr-review-policy-recovery.sh"     # check_pr_review_policy_recovery subject (#931)
       - "tests/test_review_feedback_accounting.sh"  # check_review_feedback_accounting (#1000)
       - "scripts/review-feedback-accounting.sh"  # check_review_feedback_accounting (#1000)
       - "scripts/render-feedback-archive.sh"  # check_review_feedback_accounting (#1000)
@@ -1920,6 +1972,11 @@ paths:
       - ".github/workflows/codex-feedback-archive-relay.yml"  # check_codex_p1_gate trusted read-only relay shape
       - ".github/workflows/coderabbit-severity-gate.yml"  # check_coderabbit_severity_gate workflow shape (#577)
       - ".github/workflows/merge-clearance-gate.yml"  # check_merge_clearance_gate workflow shape
+      # check_pr_review_policy_recovery asserts this workflow's trigger and
+      # sweep-job shape (#931). The workflow travels as its own canonical entry
+      # above; this edge is the CLOSURE half — it makes a wave that ships the
+      # fence without the shape it fences structurally impossible.
+      - ".github/workflows/pr-review-policy.yml"  # check_pr_review_policy_recovery workflow shape
       # check_required_check_publisher's subject (#845 PR 2). The publisher
       # already travels as its own canonical entry above; this edge is the
       # CLOSURE half — it makes a wave that ships the fence without the

@@ -398,8 +398,17 @@ Every rollout step above is manual and changes external repository or organizati
 Issue #1099 cleanup has no non-Dependabot disable mutation because GitHub provides no conditional disable or compare-and-swap primitive. An exact queue-proven arm remains intact; every other armed state, including `rc 4`, `rc 3`, `rc 5`, a missing helper or credential, a stale trusted base, a blocker, unreadable topology, or a newer simulated arm, remains untouched and returns nonzero for explicit human/admin disposition. An unarmed state continues. The bootstrap bypass note below is not a #1058 rollout or rollback option: activated queue topology permits no bypass actors.
 
 **Known issue:** The `Self-Review Required` and `Label Gate` status checks are configured as required but may never report if the CI workflows that post them (`pr-review-policy.yml`) fail silently due to misconfigured repository secrets. This blocks all merges. Workarounds:
+- Fire the recovery lane and wait for it to publish (below), **or**
 - Fix the CI secrets so status checks report, **or**
 - Use the GitHub web UI "Merge without waiting for requirements" bypass checkbox
+
+**Recovery lane (#931).** The same two contexts also go unreported when the `pull_request` event that produces them is delayed or dropped by GitHub — measured at 6–32 minutes on `gaycruisebingo#662`, and as a complete drop on two heads there. `pr-review-policy.yml` therefore carries a `*/15` scheduled sweep that re-derives both contexts from live PR state and publishes them on the head of every open PR that has no check run for them. To recover a stuck PR immediately rather than waiting for the next interval, fire the dispatch:
+
+```bash
+gh api repos/{owner}/{repo}/dispatches -f event_type=pr-review-policy-recheck
+```
+
+A PAT is required — a `GITHUB_TOKEN`-authored dispatch creates no workflow run. There is deliberately no `workflow_dispatch` equivalent: a manual dispatch runs the workflow definition from the ref the dispatcher selects, which would let a PR branch run its own copy with `checks: write` and publish its own green `Self-Review Required`. The sweep publishes nothing for a head whose contexts already reported, so firing it on a healthy repository is a no-op.
 
 The `--admin` flag on `gh pr merge` does **not** bypass required status checks — it only bypasses review requirements. The break-glass hook (`BREAK_GLASS_ADMIN=1`) only bypasses the Claude Code PreToolUse guard, not GitHub's branch protection API.
 
