@@ -366,12 +366,30 @@ g1100_extract() {
     "$ROOT/scripts/codex-review-request.sh"
 }
 g1100_decide() {  # <accounting-json> -> "refuse" | "proceed"
-  local body out
+  local body out fake
   body="$(g1100_extract)"
   [ -n "$body" ] || { printf 'extract-failed'; return 0; }
+  # A stub resolver standing in for scripts/workflow/resolve_base_policy.sh.
+  # G1100_NOBASE makes it fail, which must refuse: an unresolvable governing
+  # base policy means we cannot say who is skippable.
+  fake="$(mktemp -d "${TMPDIR:-/tmp}/g1100-req.XXXXXX")"
+  mkdir -p "$fake/workflow"
+  printf 'codex:\n  bot_login: "chatgpt-codex-connector[bot]"\n' > "$fake/base-policy.yml"
+  if [ -n "${G1100_NOBASE:-}" ]; then
+    printf '#!/bin/sh\nexit 1\n' > "$fake/workflow/resolve_base_policy.sh"
+  else
+    printf '#!/bin/sh\nprintf %%s "%s/base-policy.yml"\n' "$fake" > "$fake/workflow/resolve_base_policy.sh"
+  fi
+  chmod +x "$fake/workflow/resolve_base_policy.sh"
   out="$(
     output="$1"
-    policy_bot_login() { case "$1" in
+    __CODEX_REQUEST_DIR="$fake"
+    CONFIG="$fake/base-policy.yml"
+    REPO=owner/repo
+    PR_NUMBER=1
+    # Stub the SHARED parsed reader the script now uses; the real one is
+    # exercised by the feedback-policy-helpers suite.
+    policy_block_field_parsed() { case "$1" in
       coderabbit) printf '%s' "${G1100_CR-coderabbitai[bot]}" ;;
       code_scanning) printf '%s' "${G1100_GHAS-github-advanced-security[bot]}" ;;
       *) printf '' ;; esac; }
@@ -380,6 +398,7 @@ g1100_decide() {  # <accounting-json> -> "refuse" | "proceed"
     eval "$(printf '%s' "$body" | sed -e 's/^    1)$//' -e 's/^      ;;$//')"
     printf 'proceed'
   )" 2>/dev/null || out='refuse'
+  rm -rf "$fake"
   printf '%s' "$out"
 }
 g1100_case() {  # <label> <json> <expected>
@@ -415,6 +434,17 @@ g1100_case "missing is not an array"          '{"status":"unaccounted","missing"
 # are where the first cut of this fix failed open, so this one is pinned too.
 G1100_CR='' G1100_GHAS='' \
   g1100_case "empty relax set (policy declares no skippable provider)" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' refuse
+
+# The relax set NARROWS what gates this request, so it must be resolved from
+# the governing BASE policy -- the same one accounting classifies `.missing`
+# with -- never from the candidate checkout. Otherwise a PR that edits
+# .github/review-policy.yml could point coderabbit.bot_login at the Codex bot
+# and mark Codex's own findings skippable (Codex P1, round 1). An unresolvable
+# base policy is therefore "we cannot say who is skippable" -> refuse, not a
+# fallback to whatever config the checkout happens to carry.
+G1100_NOBASE=1 \
+  g1100_case "base policy unresolvable (must not fall back to the PR checkout)" \
     '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' refuse
 
 echo

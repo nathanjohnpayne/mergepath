@@ -321,29 +321,6 @@ CONFIG=".github/review-policy.yml"
 # Uses the state-machine awk pattern established in #54 (stops at the next
 # top-level key, tolerates column-0 comments). Returns empty string if the
 # field is not present, which the caller should turn into a default.
-# #1100: the same reader as codex_field below, parameterised by block, so the
-# providers whose findings may NOT block a Codex request are read from the
-# policy rather than hard-coded here.
-policy_bot_login() {  # <block>
-  local block=$1
-  [ -f "$CONFIG" ] || return 0
-  awk -v blockre="^$block:" '
-    $0 ~ blockre {in_block=1; next}
-    in_block && /^[^[:space:]#]/ {in_block=0}
-    in_block {
-      if ($1 == "bot_login:") {
-        sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-        gsub(/^["\047]/, "", $0)
-        gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
-        gsub(/[[:space:]]*#.*$/, "", $0)
-        sub(/[[:space:]]+$/, "", $0)
-        print
-        exit
-      }
-    }
-  ' "$CONFIG"
-}
-
 codex_field() {
   local field=$1
   [ -f "$CONFIG" ] || return 0
@@ -1159,7 +1136,36 @@ run_feedback_accounting_gate() {
       # shape -- the next unmodelled provider would silently stop gating.
       # Codex's own findings, and any reviewer identity (including a Phase 4b
       # adapter review), still refuse exactly as before.
-      __cra_relax=$(printf '%s\n%s\n' "$(policy_bot_login coderabbit)" "$(policy_bot_login code_scanning)" | grep -v '^$' || true)
+      # The relax set NARROWS what gates this request, so it must come from the
+      # governing BASE policy -- the same one review-feedback-accounting.sh
+      # classifies `.missing` with -- not from the candidate checkout. Reading
+      # $CONFIG here would let a PR that edits .github/review-policy.yml point
+      # coderabbit.bot_login at the Codex bot and mark Codex's own findings
+      # skippable. feedback-policy-helpers.sh states this rule itself: its
+      # untrusted reader is "for an additional login to WIDEN a scan, never to
+      # narrow one", and a narrowing caller "must resolve $CONFIG itself".
+      #
+      # policy_block_field_parsed reads through the YAML->JSON parse, so a
+      # flow-style `coderabbit: {bot_login: ...}` resolves identically to block
+      # style -- the #1124 defect class.
+      #
+      # Every failure path yields an EMPTY relax set, which refuses: an
+      # unresolvable base policy means we cannot say who may be skipped.
+      __cra_base_cfg=""
+      __cra_resolver="$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh"
+      if [ -x "$__cra_resolver" ]; then
+        __cra_base_cfg=$("$__cra_resolver" --repo "$REPO" --pr "$PR_NUMBER" \
+          --default-config "$CONFIG" --materialize-default 2>/dev/null) || __cra_base_cfg=""
+      fi
+      if [ -n "$__cra_base_cfg" ] && [ -r "$__cra_base_cfg" ]; then
+        __cra_relax=$(printf '%s\n%s\n' \
+          "$(policy_block_field_parsed coderabbit bot_login "$__cra_base_cfg" 2>/dev/null || true)" \
+          "$(policy_block_field_parsed code_scanning bot_login "$__cra_base_cfg" 2>/dev/null || true)" \
+          | grep -v '^$' || true)
+      else
+        __cra_relax=""
+        log "review feedback accounting: could not resolve the governing base policy; no provider is skippable (#1100)"
+      fi
       __cra_blocking=$(printf '%s' "$output" | jq -r --arg relax "$__cra_relax" '
         ($relax | split("\n") | map(select(length > 0))) as $ok
         | if ((.missing | type) != "array") or ((.missing | length) == 0) then 1
