@@ -1,0 +1,136 @@
+name: PR Review Policy Recovery
+
+# Recovery lane for the two required contexts `.github/workflows/
+# pr-review-policy.yml` reports — `Self-Review Required` and `Label Gate`
+# (nathanjohnpayne/mergepath#931).
+#
+# Both had exactly ONE producer path, the `pull_request` event. Every sibling
+# required context already carried a second way in, so a delivery that never
+# arrived left only these two at "Expected — Waiting for status to be
+# reported": branch protection blocks, no event can re-fire them, and there is
+# no manual re-run path. Measured, not hypothetical — gaycruisebingo#662 ran
+# the whole pull_request family 6–32 minutes late while push-triggered
+# workflows fired normally, and gaycruisebingo#644 / #649 each merged with no
+# check run at all for either context on their merge head.
+#
+# A SEPARATE FILE, not extra triggers on pr-review-policy.yml — load-bearing,
+# and measured. Adding `schedule` there would mean gating its three
+# event-driven jobs to `pull_request`, and a skipped Actions job STILL
+# materialises a check run under its own name. Two of those names are required
+# contexts, and a skipped conclusion satisfies a required check. The proof is
+# already in this repository: on `main` at 099d49a,
+#
+#   Codex P1 scheduled sweep                     skipped
+#   CodeRabbit severity scheduled sweep          (queued)
+#   CodeRabbit unresolved blocking findings      skipped   <-- a REQUIRED context
+#
+# — `coderabbit-severity-gate.yml` gates its event job off on `schedule`, and
+# every scheduled run stamps a skipped run of that required context onto the
+# default branch's tip. A PR whose head is that SHA (a main-to-release PR)
+# inherits it. Worse for this lane specifically: those runs would make
+# scripts/pr-review-policy-recovery.sh see the contexts as "already reported"
+# and refuse to recover that head at all. Keeping the recovery triggers in
+# their own file means no job here shares a name with any required context and
+# no job here is ever skipped.
+#
+# NO `workflow_dispatch`, deliberately (the #550 posture, also stated in
+# branch-protection-audit.yml and required-check-publisher.yml): a
+# workflow_dispatch run executes the workflow DEFINITION from the ref the
+# dispatcher selects, so a PR branch could run its own copy of this file with
+# `checks: write` and publish its own green `Self-Review Required`.
+# repository_dispatch has no ref parameter at all; GitHub only ever runs the
+# default-branch copy. Fire the manual recovery with:
+#
+#   gh api repos/{owner}/{repo}/dispatches -f event_type=pr-review-policy-recheck
+#
+# (a PAT is required — a GITHUB_TOKEN-authored dispatch creates no workflow
+# run.) Do NOT add workflow_dispatch here; the default-branch ref guard on the
+# job is a backstop, not a substitute, and
+# scripts/ci/check_pr_review_policy_recovery asserts its absence against the
+# PARSED trigger map, so a quoted `"workflow_dispatch":` spelling cannot slip
+# past it either.
+
+on:
+  repository_dispatch:
+    types: [pr-review-policy-recheck]
+  # 15-min cadence mirrors codex-p1-gate.yml and merge-clearance-gate.yml.
+  # Read-mostly and idempotent: nothing is published for a head whose contexts
+  # already reported, so a no-op sweep costs one listing per open PR.
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+  pull-requests: read
+  # scripts/merge-clearance-gate.sh --derive-phase-4-requiredness reads
+  # /issues/{pr}/comments for the propagation-lane marker, an ISSUES-scoped
+  # endpoint. On a restricted-default GITHUB_TOKEN an omitted scope defaults
+  # to `none`, and the derivation fails closed — which this lane publishes as
+  # a red Label Gate. Same requirement merge-clearance-gate.yml documents.
+  issues: read
+  checks: write
+
+# Serialize every pass (#1240 Codex P1). Two passes can overlap — a
+# repository_dispatch fired during a scheduled sweep, or a sweep that runs
+# long — and a label change moves no head SHA, so the head re-read cannot see
+# it: an older pass holding a label-free snapshot could publish `success`
+# AFTER a newer pass published `failure` for a freshly added `human-hold`, and
+# the stale success would be the newest verdict on that commit.
+#
+# `concurrency` is SAFE here and is not safe on the gate workflows (#843): when
+# a third member queues, GitHub cancels the pending one and Actions
+# materialises that run's native check. On those workflows the cancelled check
+# is named for a required context and blocks permanently; here it is named
+# `PR review policy recovery sweep`, which nothing requires, and a cancelled
+# pass is simply a missed interval the next one subsumes. Same reasoning
+# required-check-publisher.yml records for its single `rcp-publish` queue.
+# `cancel-in-progress: false` so a running pass finishes rather than being
+# interrupted mid-publication.
+concurrency:
+  group: pr-review-policy-recovery
+  cancel-in-progress: false
+
+jobs:
+  recovery-sweep:
+    name: PR review policy recovery sweep
+    # Backstop, not the control. With only `schedule` and `repository_dispatch`
+    # reaching this workflow, `github.ref_name` is always the default branch,
+    # so this is expected to be trivially true; it exists so that adding a
+    # ref-selectable trigger fails closed instead of silently handing
+    # `checks: write` to a feature branch. The real protection is the absence
+    # of workflow_dispatch above (#550).
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      # The sweep runs the repository's DEFAULT-BRANCH scripts. These triggers
+      # cannot select a ref, so this is belt-and-braces rather than the
+      # control, but it keeps the checkout identical to every other
+      # trusted-helper job. fetch-depth: 0 because
+      # scripts/merge-clearance-gate.sh resolves the governing review policy
+      # from the PR's BASE commit.
+      - name: Checkout trusted recovery scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      # The sweep shells out to scripts/validate-pr-body.sh, which shells out
+      # to scripts/lib/pr-body-contract.mjs — so it needs the same pinned Node
+      # the event-driven Self-Review job uses, for the same reason
+      # (determinism against runner-image drift, and a literal rather than
+      # node-version-file because this lands byte-identical on every consumer).
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      # Full coverage on BOTH paths, including the dispatch: the script is
+      # cheap per PR (one listing per context, and nothing published for a
+      # head that already reported), and a dispatch that swept only one named
+      # PR would need a client_payload selector — an attacker-influenced value
+      # threaded into a shell loop, for no gain over sweeping everything.
+      - name: Re-derive the two required contexts for every open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/pr-review-policy-recovery.sh "${{ github.repository }}"

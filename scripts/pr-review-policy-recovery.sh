@@ -51,6 +51,25 @@
 # string; this lane stamps its own constant, so "did this lane write it?" is a
 # string equality rather than an inference about UUID shape.
 #
+# A HEAD CARRIED BY MORE THAN ONE OPEN PR is published RED on both contexts
+# and evaluated for neither (#1240 Codex P1). Check-run verdicts attach to a
+# COMMIT while the policy state they encode (labels, body, base) is per-PR, so
+# one slot cannot honestly carry two PRs' verdicts: a clean PR swept after a
+# `human-hold` PR would turn the held PR's `Label Gate` green. Red until
+# disambiguated is the only verdict that cannot be wrong for either. Same
+# posture required-check-publisher.yml takes for its per-commit slots.
+#
+# EVERY PUBLICATION IS FENCED BY A COMPARE-AND-SWAP on the check runs the
+# decision was made over (#1240 Codex P1). The run-id set is captured when the
+# decision is taken and re-read immediately before the POST; if it changed,
+# something else published for that (head, context) while this pass was
+# evaluating — a native job run arriving mid-sweep, or a newer pass — and this
+# now-stale verdict is withheld rather than posted over it. Overlapping passes
+# are additionally serialized by the workflow's `concurrency` group, because a
+# label change moves no head SHA and the head re-read cannot see it. The
+# residual window is the gap between that re-read and the POST, which is the
+# floor without conditional writes.
+#
 # ─────────────────────────────────────────────────────────────────────
 # Verdict sources — one implementation, not a second copy
 # ─────────────────────────────────────────────────────────────────────
@@ -64,10 +83,44 @@
 #     satisfied.
 #   Label Gate — `mergepath_blocking_labels_csv` from
 #     scripts/lib/blocking-labels.sh, the shared predicate agent-review.yml
-#     already uses for the same four labels.
+#     already uses for the same four labels, over a label list read as late as
+#     possible; AND, before any green, `scripts/merge-clearance-gate.sh
+#     --derive-phase-4-requiredness` (see below).
 #
 # Neither verdict is re-implemented here, so the recovery reading and the
 # event-driven reading cannot drift.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Why Label Gate cannot be published from the label list alone
+# ─────────────────────────────────────────────────────────────────────
+#
+# `needs-external-review` is applied by pr-review-policy.yml's OWN
+# `External Review Check` job, in the same workflow run as the two gates. So
+# in exactly the case this lane exists for — the `pull_request` delivery never
+# arrived — the classification that would have applied the label never ran
+# either. "No blocking label" is then a SYMPTOM of the missing event, not
+# evidence that no review was required, and publishing a green `Label Gate`
+# from it manufactures a Phase 4 bypass. On consumers, where
+# `codex.external_review_gate` keeps its documented default of disabled, that
+# label is the only enforced Phase 4 stop, so the bypass is total
+# (#1240 Codex P1).
+#
+# Withholding is not an answer either — it reinstates #931. So the lane
+# RE-DERIVES the classification before it will publish a green, through
+# `scripts/merge-clearance-gate.sh --derive-phase-4-requiredness`: the same
+# threshold, protected-path, force-on-label and head-pinned
+# propagation-lane-exemption calculation, over the policy resolved from the
+# PR's BASE commit, reusing the very helpers pr-review-policy.yml uses. It
+# prints `true` or `false` and exits 0; any other outcome is fail-closed by
+# its own documented contract.
+#
+#   requires Phase 4 + no blocking label  -> publish FAILURE. The label the
+#     classifier would have applied is missing only because the classifier
+#     never ran; blocking is what the native path produces once it does.
+#   does not require Phase 4               -> the green is justified.
+#   derivation failed                      -> publish FAILURE and redden the
+#     run. The next pass refreshes its own lineage, so a transient failure
+#     costs one interval of a red, not a permanent one.
 #
 # Usage:
 #   scripts/pr-review-policy-recovery.sh <owner/repo>
@@ -119,6 +172,12 @@ else
 fi
 
 VALIDATOR="$ROOT/scripts/validate-pr-body.sh"
+# Phase 4 applicability is asked of the gate script that already owns that
+# calculation. Overridable for tests ONLY — the fence
+# scripts/ci/check_pr_review_policy_recovery asserts the default is
+# scripts/merge-clearance-gate.sh, exactly as merge-clearance-gate.sh itself
+# exposes MERGE_CLEARANCE_WORKFLOW_DIR for its own suite.
+DERIVE_BIN="${PR_REVIEW_POLICY_RECOVERY_DERIVE_BIN:-$ROOT/scripts/merge-clearance-gate.sh}"
 
 SELF_REVIEW_CONTEXT="Self-Review Required"
 LABEL_GATE_CONTEXT="Label Gate"
@@ -134,36 +193,71 @@ infra() { had_infra_error=1; printf 'pr-review-policy-recovery: ERROR: %s\n' "$*
 # query string without a hand-rolled encoder.
 urlencode() { jq -rn --arg s "$1" '$s|@uri'; }
 
-# publish_decision <head> <context>
+# read_runs <head> <context>
 #
-# Prints `absent`, `refresh` or `skip`. A failed read prints nothing and
-# returns 3, which the caller treats as "withhold and flag", never as "skip
-# quietly" — the two are the same action but only one of them is a defect.
-publish_decision() {
-  local head="$1" context="$2" listing=""
-  if ! listing=$(gh_api_scalar "check runs for '$context' on $head" \
+# Prints one `<id> <external_id>` line per check run for that (head, context),
+# sorted so the output is a stable set fingerprint. A failed read prints
+# nothing and returns 3, so an outage can never be read as "no runs".
+read_runs() {
+  local head="$1" context="$2"
+  gh_api_scalar "check runs for '$context' on $head" \
     --paginate "repos/$REPO/commits/$head/check-runs?check_name=$(urlencode "$context")&per_page=100" \
-    --jq '.check_runs[] | "external_id=" + (.external_id // "")'); then
-    return 3
-  fi
-  if [ -z "$listing" ]; then
+    --jq '.check_runs[] | "\(.id) \(.external_id // "")"' | sort
+}
+
+# decide_from_runs <runs> — `absent`, `refresh` or `skip` for a run listing.
+decide_from_runs() {
+  local runs="$1"
+  if [ -z "$runs" ]; then
     printf 'absent'
     return 0
   fi
-  if printf '%s\n' "$listing" | grep -qxF "external_id=$RECOVERY_EXTERNAL_ID"; then
+  if printf '%s\n' "$runs" | grep -qE "^[0-9]+ $RECOVERY_EXTERNAL_ID\$"; then
     printf 'refresh'
     return 0
   fi
   printf 'skip'
 }
 
-# publish <head> <context> <conclusion> <title> <summary>
+# publish <pr> <head> <observed-runs> <context> <conclusion> <title> <summary>
 #
 # One POST per verdict. A fresh POST rather than a PATCH of an earlier run:
 # every Checks-API POST for a head coalesces into the shared suite where the
 # newest run wins, and no run id has to cross a sweep boundary.
+#
+# Two fences run first, in this order, both immediately before the write so
+# the stale window is as small as it can be without conditional writes:
+#
+#   1. the head must still be the PR's head. Both verdicts come from LIVE PR
+#      state, so a push between evaluation and publication would pin
+#      fresh-state conclusions to a superseded SHA.
+#   2. the check runs for this (head, context) must be EXACTLY the set the
+#      decision was taken over. Anything else means a native run or a newer
+#      pass published while this one evaluated, and this verdict is stale. A
+#      label change moves no head SHA, so fence 1 cannot see that case and
+#      fence 2 is the one that catches it (#1240 Codex P1).
+#
+# A failed re-read withholds too: unknown state is possibly-newer state.
 publish() {
-  local head="$1" context="$2" conclusion="$3" title="$4" summary="$5"
+  local pr="$1" head="$2" observed="$3" context="$4" conclusion="$5" title="$6" summary="$7"
+  local live="" current="" rc=0
+  if ! live=$(gh_api_scalar --shape sha "PR #$pr head" "repos/$REPO/pulls/$pr" --jq '.head.sha'); then
+    infra "could not revalidate the head of PR #$pr before publishing '$context'"
+    return 1
+  fi
+  if [ "$live" != "$head" ]; then
+    log "PR #$pr moved from $head to $live during evaluation; publishing nothing for the superseded head"
+    return 1
+  fi
+  current=$(read_runs "$head" "$context") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    infra "could not re-read the '$context' check runs on $head before publishing; withholding"
+    return 1
+  fi
+  if [ "$current" != "$observed" ]; then
+    log "PR #$pr: the '$context' check runs on $head changed while this pass evaluated; withholding the now-stale verdict"
+    return 1
+  fi
   local fields=(
     -f "name=$context"
     -f "head_sha=$head"
@@ -182,25 +276,27 @@ publish() {
   log "published '$context' = $conclusion on $head"
 }
 
-# head_unchanged <pr> <head> — re-read the head immediately before a POST.
-# Both verdicts are derived from LIVE PR state, so a push between evaluation
-# and publication would pin fresh-state conclusions to a superseded SHA. On
-# drift, or on a read that fails, publish nothing: the new head carries no
-# check run either, so the next interval recovers it from scratch.
-head_unchanged() {
-  local pr="$1" head="$2" live=""
-  if ! live=$(gh_api_scalar --shape sha "PR #$pr head" "repos/$REPO/pulls/$pr" --jq '.head.sha'); then
-    infra "could not revalidate the head of PR #$pr"
+# requires_phase_4 <pr> — `true`, `false`, or rc 1 when the derivation could
+# not be made. Delegates to the gate script that already owns the threshold,
+# protected-path, force-on-label and propagation-lane-exemption calculation
+# over the policy resolved from the PR's BASE commit; anything other than a
+# clean `true`/`false` on exit 0 is fail-closed by that script's own contract.
+requires_phase_4() {
+  local pr="$1" out="" rc=0
+  out=$(bash "$DERIVE_BIN" --derive-phase-4-requiredness "$pr" "$REPO" 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
     return 1
   fi
-  [ "$live" = "$head" ] && return 0
-  log "PR #$pr moved from $head to $live during evaluation; publishing nothing for the superseded head"
-  return 1
+  case "$out" in
+    true|false) printf '%s' "$out" ;;
+    *) return 1 ;;
+  esac
 }
 
 open_prs=""
 if ! open_prs=$(gh_api_scalar "open pull requests on $REPO" \
-  --paginate "repos/$REPO/pulls?state=open&per_page=100" --jq '.[].number'); then
+  --paginate "repos/$REPO/pulls?state=open&per_page=100" \
+  --jq '.[] | "\(.number)\t\(.head.sha // "")"'); then
   die 1 "could not list open pull requests on $REPO; nothing swept"
 fi
 if [ -z "$open_prs" ]; then
@@ -208,30 +304,49 @@ if [ -z "$open_prs" ]; then
   exit 0
 fi
 
+# Heads carried by MORE than one open PR are published RED on both contexts
+# and evaluated for neither. One commit slot cannot honestly carry two PRs'
+# verdicts (#1240 Codex P1) — see the header. Computed once, from the listing
+# both verdicts are driven by, so the two contexts cannot disagree about which
+# heads are ambiguous.
+dup_heads=$(printf '%s\n' "$open_prs" | cut -f2 | sort | uniq -d)
+
 # The PR list is fed on FD 3, not on the loop's stdin. `gh` and the validator
 # both run inside this loop, and a command that reads stdin would otherwise
 # swallow the remaining PR numbers and end the sweep early after one PR.
-while IFS= read -r PR <&3; do
+while IFS=$'\t' read -r PR head <&3; do
   [ -n "$PR" ] || continue
-  # ONE detail read per PR: head, author, body and labels all come from the
-  # same response, so the two verdicts cannot be computed against two
-  # different snapshots of the same PR.
+
+  ambiguous=false
+  if [ -n "$head" ] && printf '%s\n' "$dup_heads" | grep -qxF "$head"; then
+    ambiguous=true
+    infra "head $head is carried by more than one open PR; publishing red on both contexts rather than one PR's verdict"
+  fi
+
+  # ONE detail read per PR for the body and the author. The LABEL list is
+  # deliberately NOT taken from it — see the Label Gate arm below.
   detail=""
   if ! detail=$(gh_api_scalar "detail of PR #$PR" "repos/$REPO/pulls/$PR"); then
     infra "could not read PR #$PR"
     continue
   fi
-  head=$(printf '%s' "$detail" | jq -r '.head.sha // ""')
   author=$(printf '%s' "$detail" | jq -r '.user.login // ""')
 
   # ── Self-Review Required ────────────────────────────────────────────
-  decision=""
-  if ! decision=$(publish_decision "$head" "$SELF_REVIEW_CONTEXT"); then
+  runs=""
+  runs_rc=0
+  runs=$(read_runs "$head" "$SELF_REVIEW_CONTEXT") || runs_rc=$?
+  if [ "$runs_rc" -ne 0 ]; then
     infra "could not read the '$SELF_REVIEW_CONTEXT' check runs on $head (PR #$PR); withholding"
-  elif [ "$decision" = "skip" ]; then
+  elif [ "$(decide_from_runs "$runs")" = "skip" ]; then
     log "PR #$PR: '$SELF_REVIEW_CONTEXT' already reported on $head by another producer; not publishing"
   else
-    if [ "$author" = "$DEPENDABOT_LOGIN" ]; then
+    decision=$(decide_from_runs "$runs")
+    if [ "$ambiguous" = true ]; then
+      conclusion="failure"
+      title="$SELF_REVIEW_CONTEXT — ambiguous head"
+      summary="More than one open PR carries $head, and one commit slot cannot carry both PRs' verdicts. Close or rebase one of them."
+    elif [ "$author" = "$DEPENDABOT_LOGIN" ]; then
       conclusion="skipped"
       title="$SELF_REVIEW_CONTEXT — Dependabot-exempt (recovery sweep)"
       summary="PR #$PR is authored by $DEPENDABOT_LOGIN, which the event-driven job exempts. Reported as skipped so the required context resolves the way the skipped job would have reported it."
@@ -259,36 +374,64 @@ while IFS= read -r PR <&3; do
     if [ -n "$conclusion" ]; then
       summary="$summary
 Published by the pr-review-policy recovery lane ($decision) because the \`pull_request\` run that normally reports this context did not. See nathanjohnpayne/mergepath#931."
-      if head_unchanged "$PR" "$head"; then
-        publish "$head" "$SELF_REVIEW_CONTEXT" "$conclusion" "$title" "${summary:0:60000}" || true
-      fi
+      publish "$PR" "$head" "$runs" "$SELF_REVIEW_CONTEXT" "$conclusion" "$title" "${summary:0:60000}" || true
     fi
   fi
 
   # ── Label Gate ──────────────────────────────────────────────────────
-  decision=""
-  if ! decision=$(publish_decision "$head" "$LABEL_GATE_CONTEXT"); then
+  runs=""
+  runs_rc=0
+  runs=$(read_runs "$head" "$LABEL_GATE_CONTEXT") || runs_rc=$?
+  if [ "$runs_rc" -ne 0 ]; then
     infra "could not read the '$LABEL_GATE_CONTEXT' check runs on $head (PR #$PR); withholding"
     continue
   fi
-  if [ "$decision" = "skip" ]; then
+  if [ "$(decide_from_runs "$runs")" = "skip" ]; then
     log "PR #$PR: '$LABEL_GATE_CONTEXT' already reported on $head by another producer; not publishing"
     continue
   fi
-  labels=$(printf '%s' "$detail" | jq -r '(.labels // [])[].name')
-  blockers=$(printf '%s\n' "$labels" | mergepath_blocking_labels_csv)
-  if [ -n "$blockers" ]; then
+  decision=$(decide_from_runs "$runs")
+  if [ "$ambiguous" = true ]; then
     conclusion="failure"
-    summary="Merge blocked by label(s): $blockers. Per REVIEW_POLICY.md, the human is the tiebreaker and resolves blocking labels."
+    title="$LABEL_GATE_CONTEXT — ambiguous head"
+    summary="More than one open PR carries $head, and one commit slot cannot carry both PRs' verdicts. Close or rebase one of them."
   else
-    conclusion="success"
-    summary="No blocking labels on PR #$PR."
+    # Read the labels HERE rather than from the detail read above. A label
+    # add or remove moves no head SHA, and a GITHUB_TOKEN-driven one fires no
+    # workflow run at all, so neither publish() fence can see it: reading as
+    # late as possible is what shrinks that window (#1240 Codex P1).
+    title="$LABEL_GATE_CONTEXT (recovery sweep)"
+    labels=""
+    if ! labels=$(gh_api_scalar "labels on PR #$PR" "repos/$REPO/pulls/$PR" --jq '(.labels // [])[].name'); then
+      infra "could not read the labels of PR #$PR; withholding '$LABEL_GATE_CONTEXT'"
+      continue
+    fi
+    blockers=$(printf '%s\n' "$labels" | mergepath_blocking_labels_csv)
+    if [ -n "$blockers" ]; then
+      conclusion="failure"
+      summary="Merge blocked by label(s): $blockers. Per REVIEW_POLICY.md, the human is the tiebreaker and resolves blocking labels."
+    else
+      # A green here needs the CLASSIFICATION, not just the label list — see
+      # the header. `needs-external-review` is applied by the same workflow
+      # run that reports this context, so its absence is a symptom of the
+      # missing event, not evidence that no review was required.
+      phase_4=""
+      if ! phase_4=$(requires_phase_4 "$PR"); then
+        conclusion="failure"
+        summary="Phase 4 applicability could not be derived for PR #$PR, so the absence of a blocking label is not evidence that none is required; failing closed. The next sweep re-evaluates."
+        infra "could not derive Phase 4 requiredness for PR #$PR; published '$LABEL_GATE_CONTEXT' red"
+      elif [ "$phase_4" = "true" ]; then
+        conclusion="failure"
+        summary="PR #$PR requires Phase 4 external review, and the External Review Check job that applies \`needs-external-review\` never ran for this head — the same missing \`pull_request\` delivery this lane is recovering from. The absent label is a symptom, not a clearance, so this gate blocks until the classification runs. Push, edit the body, or toggle a label to re-fire the workflow."
+      else
+        conclusion="success"
+        summary="No blocking labels on PR #$PR, and Phase 4 external review does not apply to it (re-derived from the policy governing its base)."
+      fi
+    fi
   fi
   summary="$summary
 Published by the pr-review-policy recovery lane ($decision) because the \`pull_request\` run that normally reports this context did not. See nathanjohnpayne/mergepath#931."
-  if head_unchanged "$PR" "$head"; then
-    publish "$head" "$LABEL_GATE_CONTEXT" "$conclusion" "$LABEL_GATE_CONTEXT (recovery sweep)" "${summary:0:60000}" || true
-  fi
+  publish "$PR" "$head" "$runs" "$LABEL_GATE_CONTEXT" "$conclusion" "$title" "${summary:0:60000}" || true
 done 3<<EOF
 $open_prs
 EOF

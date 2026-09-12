@@ -1,54 +1,8 @@
 name: PR Review Policy
 
-# Trigger shape note (#931). The two required contexts this workflow reports —
-# `Self-Review Required` and `Label Gate` — used to have exactly ONE producer
-# path, the `pull_request` event. Every sibling required context already
-# carried a second way in (codex-p1-gate.yml and coderabbit-severity-gate.yml
-# have a */15 sweep; merge-clearance-gate.yml has a sweep and a
-# repository_dispatch), so a `pull_request` delivery that never arrived left
-# only these two at "Expected — Waiting for status to be reported", with no
-# self-heal and no re-run path: permanently unmergeable. Measured, not
-# hypothetical — gaycruisebingo#662 ran the whole pull_request family 6–32
-# minutes late while push-triggered workflows fired normally, and
-# gaycruisebingo#644 / #649 each merged with no check run at all for either
-# context on their merge head.
-#
-# The recovery lane below closes that. It re-derives both contexts from live
-# PR state and publishes them through the Checks API, but ONLY where recovery
-# is what is missing — a head with no check run for the context, or one this
-# lane already owns. See scripts/pr-review-policy-recovery.sh.
-#
-# NO `workflow_dispatch`, deliberately (the #550 posture, also stated in
-# branch-protection-audit.yml and required-check-publisher.yml): a
-# workflow_dispatch run executes the workflow DEFINITION from the ref the
-# dispatcher selects, so a PR branch could run its own copy of this file with
-# this workflow's `pull-requests: write` and the sweep job's `checks: write` —
-# and publish its own green `Self-Review Required`. repository_dispatch has no
-# ref parameter at all; GitHub only ever runs the default-branch copy. Fire the
-# manual recovery with:
-#
-#   gh api repos/{owner}/{repo}/dispatches -f event_type=pr-review-policy-recheck
-#
-# (a PAT is required — a GITHUB_TOKEN-authored dispatch creates no workflow
-# run.) Do NOT re-add workflow_dispatch here; the default-branch ref guard on
-# the sweep job is a backstop, not a substitute, and
-# scripts/ci/check_pr_review_policy_recovery fails if it reappears.
-
 on:
   pull_request:
     types: [opened, edited, synchronize, labeled, unlabeled]
-  # Operator recovery for a single stuck PR — no waiting for the next sweep.
-  # Keep the event type in sync with the dispatch command documented above and
-  # with scripts/ci/check_pr_review_policy_recovery.
-  repository_dispatch:
-    types: [pr-review-policy-recheck]
-  # Periodic sweep — the backstop for a `pull_request` delivery that is
-  # delayed or dropped. 15-min cadence mirrors codex-p1-gate.yml and
-  # merge-clearance-gate.yml. Read-mostly and idempotent: it publishes nothing
-  # for a head whose contexts already reported, so a no-op sweep costs one
-  # listing per open PR.
-  schedule:
-    - cron: "*/15 * * * *"
 
 permissions:
   pull-requests: write
@@ -58,14 +12,7 @@ permissions:
 jobs:
   self-review-check:
     name: Self-Review Required
-    # Event-gated: on `schedule` and `repository_dispatch` there is no
-    # `github.event.pull_request`, so the login comparison alone would be true
-    # and this job would run with no PR to validate — failing, and attaching a
-    # red `Self-Review Required` to the default branch's tip. The recovery
-    # sweep below is the non-pull_request path.
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.user.login != 'dependabot[bot]'
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       # The parser is loaded from the DEFAULT BRANCH, never from the PR head.
@@ -118,10 +65,6 @@ jobs:
 
   label-gate:
     name: Label Gate
-    # Event-gated for the same reason as self-review-check above: the step
-    # reads `context.payload.pull_request.labels`, which does not exist on the
-    # sweep's own triggers.
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Block merge if blocking labels present
@@ -146,12 +89,7 @@ jobs:
 
   external-review-labeling:
     name: External Review Check
-    # Event-gated like the two gates above — every step below reads
-    # `github.event.pull_request.*`. This job reports no required context, so
-    # the recovery lane deliberately does not cover it (#931 non-goal).
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.action != 'labeled' && github.event.action != 'unlabeled'
+    if: github.event.action != 'labeled' && github.event.action != 'unlabeled'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -683,70 +621,3 @@ jobs:
               --repo "${{ github.repository }}"
             echo "Removed needs-external-review — PR qualifies for the propagation review lane."
           fi
-
-  recovery-sweep:
-    name: PR review policy recovery sweep
-    # Non-pull_request path only. On `pull_request` the three jobs above are
-    # the producers and this job is skipped, which is why its NAME is not one
-    # of the required contexts — a skipped job materialises a native check run,
-    # and one named for a required context would be a second producer of it.
-    #
-    # The default-branch ref condition is a BACKSTOP, not the control. With
-    # only `schedule` and `repository_dispatch` reaching this job,
-    # `github.ref_name` is always the default branch, so it is expected to be
-    # trivially true; it exists so that re-adding a ref-selectable trigger
-    # fails closed instead of silently handing `checks: write` to a feature
-    # branch. The real protection is the absence of workflow_dispatch (#550).
-    if: >-
-      (github.event_name == 'schedule' || github.event_name == 'repository_dispatch') &&
-      github.ref_name == github.event.repository.default_branch
-    runs-on: ubuntu-latest
-    # Deliberately no `concurrency:` block — the #843 lesson. GitHub cancels a
-    # group's PENDING member when a third event queues, and Actions still
-    # materialises that run's native job check. Here that check is named
-    # `PR review policy recovery sweep`, which nothing requires, so a
-    # cancellation would be harmless rather than a permanent blocker; the
-    # block is omitted anyway because overlapping sweeps are idempotent (each
-    # POST is a fresh run on the same head and the newest wins) and a serialized
-    # sweep buys nothing to justify the cancellation surface.
-    #
-    # A job-level permissions block REPLACES the workflow map wholesale, so
-    # every scope this job uses is listed. Notably it does NOT inherit the
-    # workflow's `pull-requests: write`: the sweep publishes check runs and
-    # reads PR state, and must never label or comment.
-    permissions:
-      contents: read
-      pull-requests: read
-      checks: write
-    steps:
-      # Same trusted-source posture as the self-review job above: the sweep
-      # runs the repository's DEFAULT-BRANCH scripts. These triggers cannot
-      # select a ref, so this is belt-and-braces rather than the control, but
-      # it keeps the checkout identical to every other trusted-helper job.
-      - name: Checkout trusted recovery scripts
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
-          fetch-depth: 1
-
-      # The sweep shells out to scripts/validate-pr-body.sh, which shells out
-      # to scripts/lib/pr-body-contract.mjs — so it needs the same pinned Node
-      # the event-driven Self-Review job uses, for the same reason (determinism
-      # against runner-image drift, and a literal rather than
-      # node-version-file because this workflow lands byte-identical on every
-      # consumer).
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '24'
-
-      # Full coverage on BOTH paths, including the dispatch: the script is
-      # cheap per PR (one listing per context, and nothing published for a
-      # head that already reported), and a dispatch that swept only one named
-      # PR would need a client_payload selector — an attacker-influenced value
-      # threaded into a shell loop, for no gain over sweeping everything.
-      - name: Re-derive the two required contexts for every open PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: scripts/pr-review-policy-recovery.sh "${{ github.repository }}"

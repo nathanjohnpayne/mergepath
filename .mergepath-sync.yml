@@ -863,6 +863,32 @@ paths:
   # The workflow's sweep job shells out to this script by path, so a consumer
   # that received the workflow without it would run a sweep that exits 127 and
   # recover nothing.
+  # The recovery lane's own workflow (#931). Deliberately a SEPARATE file from
+  # pr-review-policy.yml: putting the schedule there would mean gating that
+  # workflow's three event-driven jobs to `pull_request`, and a skipped Actions
+  # job still materialises a check run under its own name — two of which are
+  # required contexts, and a skipped conclusion satisfies a required check.
+  # Measured on this repo's own default branch (#1240 Codex P1).
+  - path: .github/workflows/pr-review-policy-recovery.yml
+    type: canonical
+    consumers: all
+    requires:
+      # The sweep job shells out to this by path; without it the consumer's
+      # */15 run exits 127 every quarter hour and recovers nothing.
+      - "scripts/pr-review-policy-recovery.sh"
+      # ...and the full runtime closure of that script. The commit-path closure
+      # gate reads only THIS entry's requires, so each one is named here even
+      # where another entry happens to declare it.
+      - "scripts/lib/gh-api-scalar.sh"
+      - "scripts/lib/blocking-labels.sh"
+      - "scripts/validate-pr-body.sh"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/reviewers-helpers.sh"
+      # The Phase 4 re-derivation before any green Label Gate, and the parser
+      # helpers it resolves relative to itself.
+      - "scripts/merge-clearance-gate.sh"
+      - "scripts/workflow/"
   - path: scripts/pr-review-policy-recovery.sh
     type: canonical
     consumers: all
@@ -885,6 +911,11 @@ paths:
       # holding an older list would recover a Label Gate verdict that
       # disagrees with its own event-driven job.
       - "scripts/lib/blocking-labels.sh"
+      # Phase 4 applicability is re-derived through this gate script before any
+      # green Label Gate (#1240 Codex P1); it resolves its parser helpers
+      # relative to itself, so the kit travels too.
+      - "scripts/merge-clearance-gate.sh"
+      - "scripts/workflow/"
   - path: tests/test_pr_review_policy_recovery.sh
     type: canonical
     consumers: all
@@ -1592,12 +1623,6 @@ paths:
       # every PR. Declared directly, as the manifest already does for the
       # parity test's same transitive dependency.
       - "scripts/lib/reviewers-helpers.sh"
-      # The #931 recovery sweep job shells out to this by path. Without it a
-      # consumer receives a workflow whose */15 sweep exits 127 every quarter
-      # hour and recovers nothing — the exact single-producer exposure the
-      # sweep exists to remove.
-      - "scripts/pr-review-policy-recovery.sh"
-      - "scripts/lib/blocking-labels.sh"
   - path: .github/workflows/dependabot-auto-merge.yml
     type: canonical
     consumers: all
@@ -1976,7 +2001,8 @@ paths:
       # sweep-job shape (#931). The workflow travels as its own canonical entry
       # above; this edge is the CLOSURE half — it makes a wave that ships the
       # fence without the shape it fences structurally impossible.
-      - ".github/workflows/pr-review-policy.yml"  # check_pr_review_policy_recovery workflow shape
+      - ".github/workflows/pr-review-policy.yml"  # check_pr_review_policy_recovery context-name lockstep
+      - ".github/workflows/pr-review-policy-recovery.yml"  # check_pr_review_policy_recovery workflow shape
       # check_required_check_publisher's subject (#845 PR 2). The publisher
       # already travels as its own canonical entry above; this edge is the
       # CLOSURE half — it makes a wave that ships the fence without the

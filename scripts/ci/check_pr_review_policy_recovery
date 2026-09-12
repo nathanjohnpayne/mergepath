@@ -9,16 +9,23 @@
 # Three concerns:
 #   1. The recovery script and its suite exist on disk, are executable, and
 #      pass shellcheck.
-#   2. The workflow keeps the SHAPE the guarantee depends on: a `schedule`
-#      cron and a `repository_dispatch` type as the two recovery entrances, NO
-#      `workflow_dispatch` (a ref-selectable trigger would let a PR branch run
-#      its own copy of this file with `checks: write` and publish its own green
-#      required context — the #550 hole), every event-driven job gated to
-#      `pull_request` so a sweep run cannot fail them onto the default branch,
-#      and a sweep job that is named for no required context, carries
-#      `checks: write` and no other write scope, and invokes the script.
+#   2. `.github/workflows/pr-review-policy-recovery.yml` keeps the SHAPE the
+#      guarantee depends on: the two recovery entrances (`schedule` cron and a
+#      `repository_dispatch` type), NO `workflow_dispatch`, a serializing
+#      concurrency group, a sweep job named for no required context carrying
+#      `checks: write` and no other write scope, and a trusted default-branch
+#      checkout. It must ALSO stay a separate file from pr-review-policy.yml,
+#      and its two context names must stay in lockstep with that workflow's
+#      job names.
 #   3. The decision logic works against fixture payloads. Delegated to
 #      tests/test_pr_review_policy_recovery.sh, which PATH-shims `gh`.
+#
+# Every workflow assertion below runs against the PARSED YAML, never a line
+# grep. A grep for `^[[:space:]]*workflow_dispatch:` misses the equally valid
+# `"workflow_dispatch":` spelling that YAML normalises into the same trigger
+# map — measured — which would let a future edit restore the ref-selectable
+# path to `checks: write` with this required lint still green. Same defect
+# class as #1124.
 #
 # Invoked by .github/workflows/repo_lint.yml alongside the other
 # scripts/ci/check_* scripts.
@@ -29,7 +36,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 SCRIPT="scripts/pr-review-policy-recovery.sh"
-WORKFLOW=".github/workflows/pr-review-policy.yml"
+WORKFLOW=".github/workflows/pr-review-policy-recovery.yml"
+GATE_WORKFLOW=".github/workflows/pr-review-policy.yml"
 TEST="tests/test_pr_review_policy_recovery.sh"
 
 # The lane stamps this into every check run it publishes and matches on it to
@@ -38,9 +46,16 @@ TEST="tests/test_pr_review_policy_recovery.sh"
 RECOVERY_EXTERNAL_ID="mergepath-pr-review-policy-recovery"
 DISPATCH_TYPE="pr-review-policy-recheck"
 SWEEP_JOB="recovery-sweep"
-# Job names that would be a SECOND producer of a required context if the sweep
-# job (or a skipped sibling) ever carried one of them.
-REQUIRED_CONTEXTS="Self-Review Required|Label Gate"
+CONCURRENCY_GROUP="pr-review-policy-recovery"
+# The Phase 4 classification must be RE-DERIVED before any green Label Gate,
+# through the script that already owns that calculation. Publishing green from
+# the label list alone greens a PR whose classifier never ran (#1240 Codex P1).
+# The FULL invocation, not the bare flag. A bare-flag grep matches this
+# script's own prose about it: swapping the real call on line ~286 for
+# `--derive-external-requiredness` left the guard green, because two header
+# comments still carried the string (measured while mutation-testing #1240).
+DERIVE_CALL='bash "$DERIVE_BIN" --derive-phase-4-requiredness'
+DERIVE_DEFAULT='DERIVE_BIN="${PR_REVIEW_POLICY_RECOVERY_DERIVE_BIN:-$ROOT/scripts/merge-clearance-gate.sh}"'
 
 FAILED=0
 
@@ -57,39 +72,48 @@ for rel in "$SCRIPT" "$TEST"; do
   fi
 done
 
-if [ ! -f "$WORKFLOW" ]; then
-  echo "FAIL: Missing required workflow: $WORKFLOW"
-  FAILED=1
-fi
-
-if [ -f "$SCRIPT" ] && ! grep -qF "RECOVERY_EXTERNAL_ID=\"$RECOVERY_EXTERNAL_ID\"" "$SCRIPT"; then
-  echo "FAIL: $SCRIPT no longer stamps external_id '$RECOVERY_EXTERNAL_ID'."
-  echo "      The lane tells its own check runs apart from the job-native ones by that"
-  echo "      exact string. Change it in both places or a published recovery verdict"
-  echo "      becomes unrefreshable and strands the PR it was meant to unstick."
-  FAILED=1
-fi
-
-if [ -f "$WORKFLOW" ]; then
-  # A ref-selectable trigger on a workflow that grants pull-requests: write and
-  # checks: write is the #550 hole; repository_dispatch has no ref parameter.
-  if grep -qE "^[[:space:]]*workflow_dispatch:" "$WORKFLOW"; then
-    echo "FAIL: $WORKFLOW lists workflow_dispatch."
-    echo "      GitHub runs the workflow DEFINITION from the ref the dispatcher picks, so a"
-    echo "      PR branch could run its own copy of this file with checks: write and publish"
-    echo "      its own green 'Self-Review Required'. Use repository_dispatch (no ref"
-    echo "      parameter; always the default-branch copy) — see #550 and #931."
+for rel in "$WORKFLOW" "$GATE_WORKFLOW"; do
+  if [ ! -f "$rel" ]; then
+    echo "FAIL: Missing required workflow: $rel"
     FAILED=1
   fi
+done
 
+if [ -f "$SCRIPT" ]; then
+  if ! grep -qF "RECOVERY_EXTERNAL_ID=\"$RECOVERY_EXTERNAL_ID\"" "$SCRIPT"; then
+    echo "FAIL: $SCRIPT no longer stamps external_id '$RECOVERY_EXTERNAL_ID'."
+    echo "      The lane tells its own check runs apart from the job-native ones by that"
+    echo "      exact string. Change it in both places or a published recovery verdict"
+    echo "      becomes unrefreshable and strands the PR it was meant to unstick."
+    FAILED=1
+  fi
+  if ! grep -qF -e "$DERIVE_CALL" "$SCRIPT"; then
+    echo "FAIL: $SCRIPT no longer calls $DERIVE_CALL."
+    echo "      \`needs-external-review\` is applied by the same workflow run that reports"
+    echo "      Label Gate, so in the recovery case its absence is a symptom of the missing"
+    echo "      event, not a clearance. Without the re-derivation this lane publishes a"
+    echo "      green Label Gate over an unclassified PR — a total Phase 4 bypass wherever"
+    echo "      codex.external_review_gate keeps its documented default of disabled."
+    FAILED=1
+  fi
+  if ! grep -qF "$DERIVE_DEFAULT" "$SCRIPT"; then
+    echo "FAIL: $SCRIPT no longer defaults its Phase 4 derivation to scripts/merge-clearance-gate.sh."
+    echo "      The override exists for the test suite; production must resolve to the gate"
+    echo "      script that owns the threshold / protected-path / lane-exemption calculation."
+    FAILED=1
+  fi
+fi
+
+if [ -f "$WORKFLOW" ] && [ -f "$GATE_WORKFLOW" ]; then
   if ! command -v ruby >/dev/null 2>&1; then
     echo "FAIL: ruby is required to validate $WORKFLOW structurally."
     FAILED=1
-  elif ! ruby -ryaml - "$WORKFLOW" "$SCRIPT" "$DISPATCH_TYPE" "$SWEEP_JOB" "$REQUIRED_CONTEXTS" <<'RUBY'
+  elif ! ruby -ryaml - "$WORKFLOW" "$GATE_WORKFLOW" "$SCRIPT" \
+      "$DISPATCH_TYPE" "$SWEEP_JOB" "$CONCURRENCY_GROUP" <<'RUBY'
 # encoding: utf-8
 # Ruby reads a script from STDIN as US-ASCII on some hosts, so the magic
 # comment is load-bearing: the diagnostics below contain em dashes.
-path, script, dispatch_type, sweep_job, required_contexts = ARGV
+path, gate_path, script, dispatch_type, sweep_job, concurrency_group = ARGV
 failed = false
 
 require_shape = lambda do |condition, message|
@@ -98,20 +122,26 @@ require_shape = lambda do |condition, message|
   failed = true
 end
 
-begin
-  document = YAML.safe_load(File.read(path), aliases: false)
-rescue Psych::Exception => error
-  warn "FAIL: #{path} is not parseable YAML: #{error.message}"
-  exit 1
+load_yaml = lambda do |p|
+  begin
+    YAML.safe_load(File.read(p), aliases: false)
+  rescue Psych::Exception => error
+    warn "FAIL: #{p} is not parseable YAML: #{error.message}"
+    exit 1
+  end
 end
 
 # YAML 1.1 reads a bare `on:` key as the boolean true.
-triggers = document[true] || document['on']
-require_shape.call(triggers.is_a?(Hash), "#{path} has no parseable `on:` block")
-triggers = {} unless triggers.is_a?(Hash)
+triggers_of = lambda do |doc|
+  t = doc[true] || doc['on']
+  t.is_a?(Hash) ? t : {}
+end
 
-require_shape.call(triggers.key?('pull_request'),
-  "#{path} must keep its `pull_request` trigger — the recovery lane is a backstop for it, not a replacement")
+document = load_yaml.call(path)
+gate_document = load_yaml.call(gate_path)
+
+triggers = triggers_of.call(document)
+require_shape.call(!triggers.empty?, "#{path} has no parseable `on:` block")
 
 # Recovery entrance 1: the periodic sweep.
 schedule = triggers['schedule']
@@ -124,47 +154,79 @@ dispatch_types = dispatch.is_a?(Hash) ? Array(dispatch['types']) : []
 require_shape.call(dispatch_types.include?(dispatch_type),
   "#{path} must declare `repository_dispatch` type `#{dispatch_type}` — it is the only manual way to unstick one PR without a no-op commit, and workflow_dispatch is deliberately unavailable (#550/#931)")
 
+# PARSED absence, not a line grep: `"workflow_dispatch":` is a valid spelling
+# that YAML normalises into this same map and a grep anchored to the unquoted
+# key misses it entirely (#1240 Codex P2, the #1124 defect class).
+require_shape.call(!triggers.key?('workflow_dispatch'),
+  "#{path} declares workflow_dispatch. GitHub runs the workflow DEFINITION from the ref the dispatcher picks, so a PR branch could run its own copy of this file with `checks: write` and publish its own green 'Self-Review Required'. Use repository_dispatch (no ref parameter; always the default-branch copy) — see #550 and #931")
+
+# The gate workflow must stay free of it too: it grants `pull-requests: write`
+# at workflow level, and it is the file whose contexts this lane recovers.
+require_shape.call(!triggers_of.call(gate_document).key?('workflow_dispatch'),
+  "#{gate_path} declares workflow_dispatch — a ref-selectable trigger on a workflow that grants `pull-requests: write` (#550)")
+
+# The recovery triggers must stay in THIS file. Putting them on the gate
+# workflow means gating its three event-driven jobs to `pull_request`, and a
+# skipped Actions job still materialises a check run under its own name — two
+# of which are required contexts, and a skipped conclusion satisfies a
+# required check. Measured on this repository's own default branch: a
+# scheduled coderabbit-severity-gate.yml run leaves a skipped
+# `CodeRabbit unresolved blocking findings` on main's tip (#1240 Codex P1).
+gate_triggers = triggers_of.call(gate_document)
+require_shape.call(!gate_triggers.key?('schedule') && !gate_triggers.key?('repository_dispatch'),
+  "#{gate_path} must NOT carry the recovery triggers: its jobs are named for required contexts, and gating them off on a non-pull_request event materialises SKIPPED runs of those contexts on the default branch's tip, which satisfy branch protection and which this lane then reads as 'already reported'")
+
+concurrency = document['concurrency']
+require_shape.call(concurrency.is_a?(Hash) && concurrency['group'].to_s == concurrency_group,
+  "#{path} must serialize its passes with `concurrency: {group: #{concurrency_group}}` — two overlapping passes can publish out of order, and a label change moves no head SHA so the head re-read cannot catch it (#1240 Codex P1)")
+require_shape.call(concurrency.is_a?(Hash) && concurrency['cancel-in-progress'] == false,
+  "#{path} must set `cancel-in-progress: false` so a running pass finishes rather than being interrupted mid-publication")
+
 jobs = document['jobs']
 require_shape.call(jobs.is_a?(Hash), "#{path} has no parseable `jobs:` block")
 jobs = {} unless jobs.is_a?(Hash)
 
-# Every job that reads `github.event.pull_request.*` must be gated to the
-# pull_request event. Without the gate a scheduled run executes them with no
-# PR in the payload: they fail, and their native check runs — two of which are
-# named for required contexts — attach to the default branch's tip.
-%w[self-review-check label-gate external-review-labeling].each do |name|
-  job = jobs[name]
-  require_shape.call(job.is_a?(Hash), "#{path} is missing the `#{name}` job")
+# The two context names the lane publishes must be the two job names the gate
+# workflow reports, or the lane publishes contexts nothing requires while the
+# real ones stay pending.
+gate_jobs = gate_document['jobs']
+gate_jobs = {} unless gate_jobs.is_a?(Hash)
+%w[self-review-check label-gate].each do |name|
+  job = gate_jobs[name]
+  require_shape.call(job.is_a?(Hash), "#{gate_path} is missing the `#{name}` job")
   next unless job.is_a?(Hash)
-  condition = job['if'].to_s
-  require_shape.call(condition.include?("github.event_name == 'pull_request'"),
-    "#{path} job `#{name}` must be gated on `github.event_name == 'pull_request'` — on the sweep's own triggers there is no `github.event.pull_request`, and an ungated run publishes a failing required context onto the default branch (#931)")
+  context = job['name'].to_s
+  require_shape.call(File.read(script).include?("\"#{context}\""),
+    "#{script} does not carry the context literal \"#{context}\" that #{gate_path} job `#{name}` reports — the lane would publish a name nothing requires while the required context stays pending")
+end
+
+# No job in the recovery workflow may share a name with a required context:
+# every job here runs only on non-pull_request events, so such a name would
+# make this file a second producer of a context it is meant to repair.
+required_contexts = %w[self-review-check label-gate].map { |n| gate_jobs.fetch(n, {})['name'].to_s }
+jobs.each do |job_id, job|
+  next unless job.is_a?(Hash)
+  require_shape.call(!required_contexts.include?(job['name'].to_s),
+    "#{path} job `#{job_id}` is named for the required context '#{job['name']}' — it is a second producer of the very context this lane exists to publish")
 end
 
 sweep = jobs[sweep_job]
 require_shape.call(sweep.is_a?(Hash), "#{path} is missing the `#{sweep_job}` job — the recovery lane has no runner")
 if sweep.is_a?(Hash)
   condition = sweep['if'].to_s
-  require_shape.call(condition.include?("github.event_name == 'schedule'") &&
-                     condition.include?("github.event_name == 'repository_dispatch'"),
-    "#{path} job `#{sweep_job}` must run on BOTH recovery triggers")
   require_shape.call(condition.include?('github.ref_name == github.event.repository.default_branch'),
-    "#{path} job `#{sweep_job}` must keep the default-branch ref backstop, so re-adding a ref-selectable trigger fails closed instead of handing `checks: write` to a feature branch (#550)")
+    "#{path} job `#{sweep_job}` must keep the default-branch ref backstop, so adding a ref-selectable trigger fails closed instead of handing `checks: write` to a feature branch (#550)")
 
-  permissions = sweep['permissions']
+  permissions = sweep['permissions'] || document['permissions']
   require_shape.call(permissions.is_a?(Hash),
-    "#{path} job `#{sweep_job}` must declare its own `permissions:` — a job-level block REPLACES the workflow map, and inheriting `pull-requests: write` would give the sweep label and comment scope it must not have")
+    "#{path} must declare `permissions:` for the sweep")
   if permissions.is_a?(Hash)
     require_shape.call(permissions['checks'] == 'write',
-      "#{path} job `#{sweep_job}` needs `checks: write` to publish the recovered contexts")
+      "#{path} needs `checks: write` to publish the recovered contexts")
     writes = permissions.reject { |scope, level| scope == 'checks' || level != 'write' }
     require_shape.call(writes.empty?,
-      "#{path} job `#{sweep_job}` must grant no write scope other than `checks` (found: #{writes.keys.join(', ')}) — the sweep reads PR state and publishes check runs, nothing else")
+      "#{path} must grant no write scope other than `checks` (found: #{writes.keys.join(', ')}) — the sweep reads PR state and publishes check runs, nothing else")
   end
-
-  name = sweep['name'].to_s
-  require_shape.call(!Regexp.new("\\A(#{required_contexts})\\z").match?(name),
-    "#{path} job `#{sweep_job}` must NOT be named for a required context: it is skipped on `pull_request`, and a skipped job still materialises a native check run — a second producer of the very context this lane exists to publish")
 
   steps = Array(sweep['steps'])
   runs = steps.map { |s| s.is_a?(Hash) ? s['run'].to_s : '' }.join("\n")
