@@ -219,6 +219,11 @@ mk_fake fake-claude-changes \
   "jq -n --arg r '{\"verdict\":\"CHANGES_REQUESTED\",\"summary\":\"needs work\",\"findings\":[{\"severity\":\"P1\",\"path\":\"x.js\",\"line\":2,\"body\":\"bug\"}]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0}'"
 mk_fake fake-claude-approve-usage \
   "jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",usage:{input_tokens:120,output_tokens:30,total_tokens:150}}'"
+# Claude-side twin of fake-codex-approve-p2 (#1143): an APPROVED carrying a
+# discretionary P2, so the Direction B run reaches the step-9 issue-filing path
+# and the identity fences around it are actually exercised.
+mk_fake fake-claude-approve-p2-usage \
+  "jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"should be handled under stricter policy\"}]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",usage:{input_tokens:120,output_tokens:30,total_tokens:150}}'"
 mk_fake fake-claude-braces \
   "jq -n --arg r 'Here is the verdict:
 {\"verdict\":\"CHANGES_REQUESTED\",\"summary\":\"body has braces\",\"findings\":[{\"severity\":\"P1\",\"path\":\"x.js\",\"line\":2,\"body\":\"snippet contains { braces } and stays valid\"}]}
@@ -380,12 +385,31 @@ if [ "${1:-}" = "api" ]; then
       for a in "$@"; do
         case "$a" in
           *'.body'*)
-            # P4B_FAKE_PR_BODY_FAIL reproduces the #799 shape exactly: gh puts
-            # the JSON ERROR BODY on stdout and exits nonzero, so a caller that
-            # inferred failure from empty output would parse the error body.
-            if [ -n "${P4B_FAKE_PR_BODY_FAIL:-}" ]; then
+            # Body-read counter (#1143). The orchestrator reads the body up
+            # front and again at each identity fence, so a case can serve a
+            # DIFFERENT body from the Nth read on and simulate a PR-body edit
+            # landing mid-run. Same shape as the P4B_FAKE_LIVE_HEAD2 head-drift
+            # knob below; counting happens only when a case opts in with its
+            # own counter file, so cases cannot leak into each other.
+            bcnt=0
+            if [ -n "${P4B_FAKE_PR_BODY_COUNT:-}" ]; then
+              bcnt=$(( $( [ -f "$P4B_FAKE_PR_BODY_COUNT" ] && cat "$P4B_FAKE_PR_BODY_COUNT" || echo 0 ) + 1 ))
+              printf '%s\n' "$bcnt" > "$P4B_FAKE_PR_BODY_COUNT"
+            fi
+            # P4B_FAKE_PR_BODY_FAIL fails EVERY read; _FAIL_FROM fails from the
+            # Nth on. Both reproduce the #799 shape exactly: gh puts the JSON
+            # ERROR BODY on stdout and exits nonzero, so a caller that inferred
+            # failure from empty output would parse the error body.
+            if [ -n "${P4B_FAKE_PR_BODY_FAIL:-}" ] \
+               || { [ -n "${P4B_FAKE_PR_BODY_FAIL_FROM:-}" ] \
+                    && [ "$bcnt" -ge "$P4B_FAKE_PR_BODY_FAIL_FROM" ]; }; then
               printf '{"message":"Not Found","status":"404"}\n'
               exit 1
+            fi
+            if [ -n "${P4B_FAKE_PR_BODY_FILE2:-}" ] \
+               && [ "$bcnt" -ge "${P4B_FAKE_PR_BODY2_FROM:-2}" ]; then
+              cat "$P4B_FAKE_PR_BODY_FILE2"
+              exit 0
             fi
             if [ -n "${P4B_FAKE_PR_BODY_FILE:-}" ]; then
               cat "$P4B_FAKE_PR_BODY_FILE"
@@ -1853,6 +1877,158 @@ got="$(p4b1143_run "$P4B1143_BODY" --author "")"
 case "$got" in
   rc=0*'"direction": "codex->claude"'*) pass "#1143: the body's agent, not the flag, selects the reviewer" ;;
   *) fail "#1143: empty --author did not fall back to the body's agent: $got" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# #1143 round 2 — the body can disagree with ITSELF, later
+# ---------------------------------------------------------------------------
+# The up-front fence reads the body once, and the adapter run after it can last
+# the configured timeout. A PR-body edit moves no sha, so every drift check
+# between them — all of which compare heads — is blind to it. The attack: start
+# against a body declaring `codex` (so the CLAUDE reviewer is selected), edit
+# the body to `claude` while the adapter reasons, and collect a cross-agent
+# APPROVED from nathanpayne-claude on a PR that now declares claude.
+#
+# These are REAL runs, not dry-runs: the fences guard the side effects, and a
+# dry-run performs none. The reviewer wrapper is a guard stub that fails loudly,
+# so a regression cannot quietly post a review from any of the refusal cases.
+P4B1143R2_GUARD="$WORK/stub-rev-guard-1143.sh"
+printf '#!/bin/sh\necho "REGRESSION: reviewer wrapper invoked from an identity-drift refusal" >&2\nexit 9\n' \
+  > "$P4B1143R2_GUARD"
+chmod +x "$P4B1143R2_GUARD"
+
+P4B1143R2_BODY1="$WORK/p4b1143r2-body1.md"
+P4B1143R2_BODY2="$WORK/p4b1143r2-body2.md"
+printf 'Authoring-Agent: codex\n\n## Self-Review\n\n- ok.\n' > "$P4B1143R2_BODY1"
+
+# p4b1143r2_run <pr> <codex-or-claude-fake> <switch-from> <reviewer-wrapper> [extra env VAR=VAL...]
+# Runs for real against a codex-authored body (→ claude reviewer), with the
+# body switching to $P4B1143R2_BODY2 from the <switch-from>'th body read.
+# Body reads in a findings run are: 1 up-front, 2 pre-issue-filing, 3 pre-POST.
+p4b1143r2_run() {
+  local pr="$1" fake="$2" from="$3" revwrap="$4"; shift 4
+  local out rc=0
+  set +e
+  out="$(env MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+    CLAUDE_BIN="$BIN/$fake" \
+    OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat \
+    P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
+    P4B_GH_AS_REVIEWER="$revwrap" \
+    P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$WORK/p4b1143r2-handoff.log" \
+    P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+    P4B_ISSUE_LOG="$WORK/p4b1143r2-issues-${pr}.log" \
+    P4B_FAKE_PR_BODY_FILE="$P4B1143R2_BODY1" \
+    P4B_FAKE_PR_BODY_FILE2="$P4B1143R2_BODY2" \
+    P4B_FAKE_PR_BODY2_FROM="$from" \
+    P4B_FAKE_PR_BODY_COUNT="$WORK/p4b1143r2-count-${pr}" \
+    "$@" \
+    bash "$ORCH" "$pr" --repo o/r --head abc123 --diff-file "$DIFF" 2>&1)"
+  rc=$?
+  set -e
+  printf 'rc=%s %s' "$rc" "$out"
+}
+
+# `grep -c` exits 1 when the count is ZERO while still printing "0", so the
+# usual `$(grep -c ... || echo 0)` yields the two-line string "0\n0" and every
+# later `-eq` comparison on it is a syntax error the `if` swallows as false.
+# That is exactly the zero case these assertions care about, so count through
+# one helper that cannot be wrong about it.
+p4b1143r2_count() {  # <pattern> <file>
+  local n
+  n="$(/usr/bin/grep -c "$1" "$2" 2>/dev/null || true)"
+  n="$(printf '%s' "$n" | head -1 | tr -dc '0-9')"
+  printf '%s' "${n:-0}"
+}
+
+# (g) The attack itself, caught at the FIRST approval-side effect. The body
+#     flips to `claude` — the very agent selected as reviewer — before the
+#     step-9 issues are filed. Nothing may be filed and nothing may post.
+printf 'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n' > "$P4B1143R2_BODY2"
+: > "$WORK/p4b1143r2-issues-1144.log"
+got="$(p4b1143r2_run 1144 fake-claude-approve-p2-usage 2 "$P4B1143R2_GUARD")"
+_filed="$(p4b1143r2_count '^ARGV gh issue create' "$WORK/p4b1143r2-issues-1144.log")"
+case "$got" in
+  rc=0*) fail "#1143: a mid-run Authoring-Agent flip to the reviewer's own agent still APPROVED: $got" ;;
+  *"Authoring-Agent changed during review"*)
+    if [ "$_filed" -eq 0 ]; then
+      pass "#1143: identity drift before the first approval-side effect refuses and files nothing"
+    else
+      fail "#1143: refused the drift but filed $_filed post-review issue(s) anyway"
+    fi ;;
+  *) fail "#1143: mid-run identity drift refused, but not by the identity fence: $got" ;;
+esac
+
+# (h) Drift that lands AFTER filing is caught by the pre-POST fence, and this
+#     run's filed issues are closed as superseded — the same cleanup the
+#     head-drift path at that fence already performs.
+: > "$WORK/p4b1143r2-issues-1145.log"
+got="$(p4b1143r2_run 1145 fake-claude-approve-p2-usage 3 "$P4B1143R2_GUARD")"
+_filed="$(p4b1143r2_count '^ARGV gh issue create' "$WORK/p4b1143r2-issues-1145.log")"
+_closed="$(p4b1143r2_count '^CLOSE #' "$WORK/p4b1143r2-issues-1145.log")"
+case "$got" in
+  rc=0*) fail "#1143: identity drift in the pre-POST window still APPROVED: $got" ;;
+  *"Authoring-Agent changed during review"*)
+    if [ "$_filed" -gt 0 ] && [ "$_closed" -eq "$_filed" ]; then
+      pass "#1143: identity drift at the pre-POST fence closes this run's $_filed filed issue(s) as superseded"
+    else
+      fail "#1143: pre-POST identity drift left orphans (filed=$_filed closed=$_closed)"
+    fi ;;
+  *) fail "#1143: pre-POST identity drift refused, but not by the identity fence: $got" ;;
+esac
+
+# (i) A findings-free APPROVED files no issues at all, so the pre-POST fence is
+#     the ONLY thing between the adapter and the review. It must still catch the
+#     drift — otherwise the whole guarantee rests on a path that only runs when
+#     the reviewer happened to return findings.
+got="$(p4b1143r2_run 1146 fake-claude-approve-usage 2 "$P4B1143R2_GUARD")"
+case "$got" in
+  rc=0*) fail "#1143: identity drift on a findings-free approval still APPROVED: $got" ;;
+  *"Authoring-Agent changed during review"*)
+    pass "#1143: identity drift is caught on a findings-free approval too" ;;
+  *) fail "#1143: findings-free drift refused, but not by the identity fence: $got" ;;
+esac
+
+# (j) A body that stops satisfying the CONTRACT mid-run is drift as well, not
+#     just a changed agent — the fence revalidates, it does not merely compare.
+printf 'Authoring-Agent: codex\n\ntext\n\n```\n## Self-Review\n```\n' > "$P4B1143R2_BODY2"
+got="$(p4b1143r2_run 1147 fake-claude-approve-usage 2 "$P4B1143R2_GUARD")"
+case "$got" in
+  rc=0*) fail "#1143: a body that stopped satisfying the contract mid-run still APPROVED: $got" ;;
+  *"no longer satisfies the Authoring-Agent contract"*)
+    pass "#1143: a mid-run contract break is drift, not just an agent change" ;;
+  *) fail "#1143: mid-run contract break refused, but not by the identity fence: $got" ;;
+esac
+
+# (k) The ABSENT form, mid-run: the revalidating read itself fails. Unreadable
+#     must be drift, never "unchanged" — the fail-open reading would let the
+#     attack through by simply making the second read fail.
+got="$(p4b1143r2_run 1148 fake-claude-approve-usage 99 "$P4B1143R2_GUARD" P4B_FAKE_PR_BODY_FAIL_FROM=2)"
+case "$got" in
+  rc=0*) fail "#1143: an unreadable revalidation read still APPROVED: $got" ;;
+  *"no longer satisfies the Authoring-Agent contract"*)
+    pass "#1143: an unreadable mid-run body read refuses instead of reading as unchanged" ;;
+  *) fail "#1143: unreadable revalidation refused, but not by the identity fence: $got" ;;
+esac
+
+# (l) NOT a blanket refusal of every mid-run body edit. An edit that leaves the
+#     identity alone — added prose, a fixed typo — still validates and still
+#     declares the same agent, so the approval proceeds and posts. Without this,
+#     the fence could be "refuse whenever the body bytes changed", which would
+#     break the ordinary case of an author tidying their own description.
+printf 'Authoring-Agent: codex\n\nSome prose added while the adapter ran.\n\n## Self-Review\n\n- ok.\n' \
+  > "$P4B1143R2_BODY2"
+P4B1143R2_POSTED="$WORK/p4b1143r2-posted-body.md"
+rm -f "$P4B1143R2_POSTED"
+got="$(p4b1143r2_run 1149 fake-claude-approve-usage 2 "$BIN/fake-gh-as-reviewer" \
+  P4B_WRAPPER_LOG="$WORK/p4b1143r2-wrapper.log" P4B_WRAPPER_BODY="$P4B1143R2_POSTED")"
+case "$got" in
+  rc=0*)
+    if [ -s "$P4B1143R2_POSTED" ]; then
+      pass "#1143: a mid-run body edit that leaves the identity alone still posts"
+    else
+      fail "#1143: identity-preserving edit exited 0 but posted nothing: $got"
+    fi ;;
+  *) fail "#1143: an identity-preserving mid-run body edit was refused: $got" ;;
 esac
 
 # #574 feedback_policy: a finding in a configured required tier cannot be

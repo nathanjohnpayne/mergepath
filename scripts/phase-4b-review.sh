@@ -562,6 +562,50 @@ revalidate_phase4a_timeout_generation() {
   esac
 }
 
+# --- #1143: the body can disagree with ITSELF, later ------------------------
+#
+# The identity fence at the top of this script reads the PR body exactly ONCE,
+# and the adapter run that follows can last the configured timeout (900s by
+# default). Every drift check between that read and the review POST compares
+# HEAD shas — and editing a PR body does not move HEAD, so a mid-run identity
+# change passes all of them untouched.
+#
+# The concrete attack that closes: a run starts against a body declaring
+# `codex`, so it selects the CLAUDE reviewer; while the adapter reasons, the
+# body is edited to declare `claude`; the run then files follow-up issues and
+# posts an APPROVED as nathanpayne-claude on a PR whose declared authoring
+# agent is now claude. That is the cross-agent invariant broken by the same
+# mechanism the up-front fence exists to close, one layer deeper in time.
+#
+# Returns 0 only when the LIVE body still satisfies the contract AND still
+# declares the agent this run was planned against ($AUTHOR_AGENT, normalized).
+# Every unmodelled input is drift, not a pass: an unreadable read, an empty
+# body, and a body that no longer validates all return 1. Callers own the
+# cleanup, so this reuses the head-drift call sites rather than adding a
+# second drift idiom — the reason lands in P4B_BODY_DRIFT_REASON so no caller
+# has to infer status through a command substitution.
+#
+# A body edit that does NOT touch the identity (adding prose, fixing a typo)
+# still validates and still declares the same agent, so it does not refuse.
+# Only contract-breaking or identity-changing edits do.
+P4B_BODY_DRIFT_REASON=""
+revalidate_pr_body_author() {  # <stage-label>
+  local stage="${1:-pre-post}" live_body live_agent
+  P4B_BODY_DRIFT_REASON=""
+  live_body="$(gh_api_scalar "PR body for $REPO#$PR ($stage)" \
+    "repos/$REPO/pulls/$PR" --jq '.body // ""')" || live_body=""
+  if ! pr_body_validate "$live_body" "$(p4b_config)"; then
+    P4B_BODY_DRIFT_REASON="the PR body no longer satisfies the Authoring-Agent contract (checked $stage)"
+    return 1
+  fi
+  live_agent="$(p4b_agent_of_login "$(pr_body_authoring_agent "$live_body")")"
+  if [ -z "$live_agent" ] || [ "$live_agent" != "$AUTHOR_AGENT" ]; then
+    P4B_BODY_DRIFT_REASON="the PR body's Authoring-Agent changed during review (reviewed '$AUTHOR_AGENT', live '${live_agent:-unreadable}', checked $stage)"
+    return 1
+  fi
+  return 0
+}
+
 # Temp hygiene: one EXIT trap owns every temp path this run creates (the
 # review body rendered below and the dry-run accounting sandbox, when one
 # exists).
@@ -864,6 +908,17 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
       || fall_back_to_manual "could not re-read the live PR head before filing post-review issues"
     if [ "$live_head_pre" != "$HEAD" ]; then
       fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
+    fi
+    # Identity drift (#1143), hoisted ahead of the side effects for the same
+    # reason the head re-read above is: filing issues under the author PAT,
+    # assigned to the author identity and referencing this PR, is an
+    # approval-side effect performed in service of an approval that must not
+    # post. A body edited mid-run to declare the agent this run picked as
+    # REVIEWER evades the head checks entirely, because a body edit does not
+    # move HEAD. Nothing has been filed yet, so the cleanup is the same as the
+    # head-drift branch above: refuse, with zero issues left behind.
+    if ! revalidate_pr_body_author pre-issue-filing; then
+      fall_back_to_manual "$P4B_BODY_DRIFT_REASON — refusing to file post-review issues for an approval that will not post"
     fi
     # Same-head laundering gate, hoisted ahead of the side effects (#674
     # Codex round-2 P2): the authoritative gate below still guards the
@@ -1181,6 +1236,18 @@ post_review() {
       p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
     fi
     fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
+  fi
+  # Identity drift, last fence before the POST (#1143). Rendering, accounting
+  # and step-9 filing all sit between the pre-filing check and here, and a body
+  # edit in that window moves no sha, so the live-head fence above cannot see
+  # it. Same cleanup as that fence: close this run's filed follow-ups when an
+  # approval is what is being refused, then fall back.
+  if ! revalidate_pr_body_author pre-post; then
+    if [ "$event" = "APPROVE" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then
+      p4b_warn "PR body identity drifted before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
+      p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the Authoring-Agent declared by ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run against the current body files fresh follow-ups."
+    fi
+    fall_back_to_manual "$P4B_BODY_DRIFT_REASON"
   fi
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
