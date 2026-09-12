@@ -344,6 +344,277 @@ test_enabled_false_never_triggers
 test_timeout_head_drift_fails_closed_without_marker
 test_new_trigger_replaces_superseded_timeout_marker
 
+# ── #1100: the accounting precondition is scoped to the provider REQUESTED ──
+#
+# The Phase 4b barrier's Codex arm is read-only, so making Codex terminal is
+# the agent's job and codex-review-request.sh is its only tool. That tool
+# refused whenever accounting was unaccounted for ANY provider -- so
+# CodeRabbit's findings on the head refused the Codex request, and clearing
+# them needs fix commits, each producing a new head for CodeRabbit to find more
+# on. Codex could never reach terminal on the head the barrier was evaluating.
+# Observed live on nathanpaynedotcom#798.
+#
+# The relax set is ENUMERATED rather than the block set, and that direction is
+# the point: naming who may be skipped is fail-closed, because an unmodelled,
+# renamed or absent reviewer keeps refusing. Naming who must block would be the
+# fail-open shape.
+#
+# Run against the decision EXTRACTED from the script, so a revert is executed
+# rather than text-matched.
+# g1100_decide is invoked inside a command substitution, so a shell variable
+# set there cannot reach the caller. The scratch dir travels back in a sidecar
+# file so the post-call assertions below can inspect what the run left behind.
+# Inside WORKDIR, so the EXIT trap registered with it at the top of this file
+# is the only one. A second `trap ... EXIT` REPLACES the first rather than
+# extending it, which leaked the whole WORKDIR tree on every run -- and this
+# suite runs in required CI via scripts/ci/check_codex_scripts.
+G1100_LASTDIR="$(mktemp "$WORKDIR/g1100-lastdir.XXXXXX")"
+
+g1100_extract() {  # <fn-name> -- the REAL function body, so a revert is executed
+  # Prefix match, not an awk -v regex: -v processes escape sequences, so the
+  # backslashes needed to escape `(` and `{` do not survive into the pattern.
+  awk -v fn="$1() {" 'index($0, fn) == 1 { grab = 1 } grab { print } grab && /^\}$/ { exit }' \
+    "$ROOT/scripts/codex-review-request.sh"
+}
+# Round 3 moved the base-policy resolution OUT of the `1)` arm and into the top
+# of run_feedback_accounting_gate, so one snapshot serves both accounting and
+# the relax set (Codex P2: a second resolution can see a newer base than the
+# one `.missing` was classified under). Extracting the whole function rather
+# than the arm keeps the test on the real boundary and lets the single-snapshot
+# property be asserted directly.
+g1100_decide() {  # <accounting-json> -> "refuse" | "proceed"
+  local body retire out fake
+  body="$(g1100_extract run_feedback_accounting_gate)"
+  retire="$(g1100_extract __cra_retire_base_cfg)"
+  [ -n "$body" ] && [ -n "$retire" ] || { printf 'extract-failed'; return 0; }
+  fake="$(mktemp -d "${TMPDIR:-/tmp}/g1100-req.XXXXXX")"
+  printf '%s' "$fake" > "$G1100_LASTDIR"
+  mkdir -p "$fake/workflow"
+  printf 'codex:\n  bot_login: "chatgpt-codex-connector[bot]"\n' > "$fake/default-policy.yml"
+  printf '%s' "$1" > "$fake/accounting.json"
+  printf '%s' "${G1100_RC:-1}" > "$fake/accounting.rc"
+  # A stub resolver standing in for scripts/workflow/resolve_base_policy.sh.
+  # It materializes a NEW file per call, exactly as --materialize-default does,
+  # and appends the path to materialized.log so the retry-leak property is
+  # observable. G1100_NOBASE makes it fail, which must refuse: an unresolvable
+  # governing base policy means we cannot say who is skippable.
+  if [ -n "${G1100_NOBASE:-}" ]; then
+    printf '#!/bin/sh\nexit 1\n' > "$fake/workflow/resolve_base_policy.sh"
+  else
+    cat > "$fake/workflow/resolve_base_policy.sh" <<RESOLVER
+#!/bin/sh
+f=\$(mktemp "$fake/base-policy.XXXXXX")
+printf 'codex:\\n  bot_login: "chatgpt-codex-connector[bot]"\\n' > "\$f"
+printf '%s\\n' "\$f" >> "$fake/materialized.log"
+printf %s "\$f"
+RESOLVER
+  fi
+  chmod +x "$fake/workflow/resolve_base_policy.sh"
+  # The accounting stub records the CONFIG it was handed, so the single-snapshot
+  # property is asserted on the value that actually crossed the boundary.
+  cat > "$fake/accounting-stub.sh" <<STUB
+#!/bin/sh
+printf '%s\\n' "\${REVIEW_FEEDBACK_ACCOUNTING_CONFIG-<unset>}" >> "$fake/accounting-config.log"
+cat "$fake/accounting.json"
+exit "\$(cat "$fake/accounting.rc")"
+STUB
+  chmod +x "$fake/accounting-stub.sh"
+  out="$(
+    __CODEX_REQUEST_DIR="$fake"
+    CONFIG="$fake/default-policy.yml"
+    MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$fake/accounting-stub.sh"
+    REPO=owner/repo
+    PR_NUMBER=1
+    __CRA_BASE_CFG_TMP=""
+    # Stub the SHARED parsed readers the decision uses; the real ones are
+    # exercised by the feedback-policy-helpers suite. Keeping them stubbed also
+    # keeps this suite hermetic on a runner with no YAML parser, where the real
+    # reader returns rc 1 for every shape alike.
+    # Every reader records the policy path it was handed. Without that, a
+    # regression that reads $CONFIG -- the CANDIDATE checkout, the round-1 P1
+    # privilege escalation -- passes unnoticed: the stubs return the same
+    # values whatever path they are given, and $CONFIG exists and is readable
+    # here. The assertions below require every reader path to equal the one
+    # materialized base policy.
+    policy_block_field_parsed() { printf '%s\n' "${3:-<none>}" >> "$fake/reader-paths.log"
+      case "$1" in
+      coderabbit) printf '%s' "${G1100_CR-coderabbitai[bot]}" ;;
+      code_scanning) printf '%s' "${G1100_GHAS-github-advanced-security[bot]}" ;;
+      codex) printf '%s' "${G1100_CODEX-chatgpt-codex-connector[bot]}" ;;
+      *) printf '' ;; esac; }
+    policy_yaml_to_json() {
+      printf '%s\n' "${1:-<none>}" >> "$fake/reader-paths.log"
+      printf '{"author_identity":%s,"available_reviewers":%s}' \
+        "$(printf '%s' "${G1100_AUTHOR-nathanjohnpayne}" | jq -Rs 'rtrimstr("\n")')" \
+        "$(printf '%s' "${G1100_REVIEWERS-nathanpayne-codex nathanpayne-claude}" \
+           | jq -Rc 'rtrimstr("\n") | split(" ") | map(select(length > 0))')"
+    }
+    log() { :; }
+    die() { printf 'refuse'; exit 0; }
+    eval "$retire"
+    eval "$body"
+    run_feedback_accounting_gate
+    [ -z "${G1100_RUNS:-}" ] || run_feedback_accounting_gate
+    printf 'proceed'
+  )" 2>/dev/null || out='refuse'
+  printf '%s' "$out"
+}
+g1100_case() {  # <label> <json> <expected>
+  local got; got="$(g1100_decide "$2")"
+  if [ "$got" = "$3" ]; then
+    pass "#1100: $1 -> $3"
+  else
+    fail "#1100: $1 -> expected $3, got $got"
+  fi
+  G1100_FAKE="$(cat "$G1100_LASTDIR")"
+  [ -z "${G1100_KEEP:-}" ] && [ -n "$G1100_FAKE" ] && rm -rf "$G1100_FAKE"
+  return 0
+}
+g1100_case "only CodeRabbit undispositioned"  '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' proceed
+g1100_case "only GHAS undispositioned"        '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' proceed
+g1100_case "Codex App undispositioned"        '{"missing":[{"reviewer":"chatgpt-codex-connector[bot]"}]}' refuse
+g1100_case "Phase-4b reviewer undispositioned" '{"missing":[{"reviewer":"nathanpayne-codex"}]}' refuse
+g1100_case "CodeRabbit plus Codex"            '{"missing":[{"reviewer":"coderabbitai[bot]"},{"reviewer":"chatgpt-codex-connector[bot]"}]}' refuse
+g1100_case "renamed/unmodelled reviewer"      '{"missing":[{"reviewer":"some-new-bot[bot]"}]}' refuse
+g1100_case "reviewer field absent"            '{"missing":[{"kind":"inline"}]}' refuse
+g1100_case "unparseable accounting output"    'not json at all' refuse
+# The shapes that made the first cut fail OPEN. `.missing // []` treated an
+# ABSENT missing set as "nothing blocking", so an accounting run that reported
+# unaccounted without naming who was outstanding sailed through. Caught by the
+# pre-existing tests/test_codex_review_request_trigger_only.sh case O, whose
+# stub emits exactly that shape -- which is why that test is left untouched:
+# it asserts the same fail-closed property from the other side.
+g1100_case "unaccounted, missing set ABSENT"  '{"status":"unaccounted","posted":2,"accounted":1}' refuse
+g1100_case "unaccounted, missing set empty"   '{"status":"unaccounted","missing":[]}' refuse
+g1100_case "missing is not an array"          '{"status":"unaccounted","missing":"three"}' refuse
+
+# Every case above assumes the policy DECLARES the providers that may be
+# skipped. If it does not -- a policy without a coderabbit/code_scanning block,
+# or a read that fails -- the relax set is empty and nothing is skippable, so
+# the gate must refuse exactly as it did before this change. Untested shapes
+# are where the first cut of this fix failed open, so this one is pinned too.
+G1100_CR='' G1100_GHAS='' \
+  g1100_case "empty relax set (policy declares no skippable provider)" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' refuse
+
+# The relax set NARROWS what gates this request, so it must be resolved from
+# the governing BASE policy -- the same one accounting classifies `.missing`
+# with -- never from the candidate checkout. Otherwise a PR that edits
+# .github/review-policy.yml could point coderabbit.bot_login at the Codex bot
+# and mark Codex's own findings skippable (Codex P1, round 1). An unresolvable
+# base policy is therefore "we cannot say who is skippable" -> refuse, not a
+# fallback to whatever config the checkout happens to carry.
+G1100_NOBASE=1 \
+  g1100_case "base policy unresolvable (must not fall back to the PR checkout)" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' refuse
+
+# Resolving the relax set from the BASE policy stops a PR NOMINATING its own
+# skippable providers. It does not stop a COLLISION, because
+# validate_governing_policy (review-feedback-accounting.sh:127-129) validates
+# codex/coderabbit/code_scanning bot_login only as `optional_string` and
+# available_reviewers only as non-empty strings -- nothing requires the
+# identities to be DISTINCT. A base policy that gives a skippable provider a
+# gating identity's login therefore passes validation, and a login-only
+# allowlist would relax that identity's findings (Codex P1, round 2).
+#
+# The contract is: ANY collision voids the WHOLE relax set. A policy that gives
+# two providers one login has not named either of them.
+G1100_CR='chatgpt-codex-connector[bot]' \
+  g1100_case "coderabbit.bot_login collides with the Codex bot" \
+    '{"missing":[{"reviewer":"chatgpt-codex-connector[bot]"}]}' refuse
+G1100_GHAS='chatgpt-codex-connector[bot]' \
+  g1100_case "code_scanning.bot_login collides with the Codex bot" \
+    '{"missing":[{"reviewer":"chatgpt-codex-connector[bot]"}]}' refuse
+G1100_CR='nathanpayne-codex' \
+  g1100_case "coderabbit.bot_login collides with a registered reviewer" \
+    '{"missing":[{"reviewer":"nathanpayne-codex"}]}' refuse
+G1100_CR='nathanjohnpayne' \
+  g1100_case "coderabbit.bot_login collides with the author identity" \
+    '{"missing":[{"reviewer":"nathanjohnpayne"}]}' refuse
+# A collision voids the relax set ENTIRELY, so even a finding from the
+# uncollided provider now gates. Subtracting only the colliding entry would
+# leave a policy we have already caught conflating identities still deciding
+# which findings may be skipped.
+G1100_CR='chatgpt-codex-connector[bot]' \
+  g1100_case "collision voids the whole relax set, not just the colliding entry" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' refuse
+
+# The gating set must be populated from DEFAULTS when the base policy omits a
+# field. policy_block_field_parsed exits 0 and prints nothing for an absent
+# field, so a `|| default` fallback never fires and would leave the Codex bot
+# (or the author) out of the gating set entirely -- the collision check would
+# then pass over exactly the shape it exists to catch.
+G1100_CODEX='' G1100_CR='chatgpt-codex-connector[bot]' \
+  g1100_case "codex.bot_login ABSENT still defaults into the gating set" \
+    '{"missing":[{"reviewer":"chatgpt-codex-connector[bot]"}]}' refuse
+G1100_AUTHOR='' G1100_CR='nathanjohnpayne' \
+  g1100_case "author_identity ABSENT still defaults into the gating set" \
+    '{"missing":[{"reviewer":"nathanjohnpayne"}]}' refuse
+
+# Control: a policy with DISTINCT identities is not a collision, and the
+# scoped exception still applies. Without this the collision check could be
+# refusing everything and every case above would still pass.
+G1100_CR='coderabbitai[bot]' G1100_GHAS='github-advanced-security[bot]' \
+  g1100_case "distinct identities are not a collision" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"},{"reviewer":"github-advanced-security[bot]"}]}' proceed
+
+# ONE snapshot, both consumers. The relax set narrows what gates this request,
+# so it must come from the policy revision accounting classified `.missing`
+# with. Resolving separately on each side left a window: if the PR base
+# advanced between the two calls, a newer revision that moved a gating login
+# onto coderabbit/code_scanning would relax a finding the older revision
+# classified as gating, and the collision check could not catch it because the
+# newer revision is internally consistent (Codex P2, round 3). Asserted on the
+# value that actually crossed the boundary -- the CONFIG the accounting command
+# was invoked with -- against the file the resolver materialized.
+G1100_KEEP=1 \
+  g1100_case "single snapshot: relax set and accounting share one policy file" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' proceed
+if [ -n "${G1100_FAKE:-}" ] && [ -s "$G1100_FAKE/materialized.log" ] \
+   && [ "$(cat "$G1100_FAKE/materialized.log")" = "$(cat "$G1100_FAKE/accounting-config.log")" ] \
+   && [ "$(wc -l < "$G1100_FAKE/materialized.log")" -eq 1 ]; then
+  pass "#1100: accounting is handed the one materialized policy, not a second resolution"
+else
+  fail "#1100: accounting CONFIG ($(cat "${G1100_FAKE:-}/accounting-config.log" 2>/dev/null)) is not the one materialized policy ($(cat "${G1100_FAKE:-}/materialized.log" 2>/dev/null))"
+fi
+# The relax and collision readers must be handed that SAME path. Asserting only
+# the accounting CONFIG leaves the original privilege escalation untested: a
+# reader that took $CONFIG -- the candidate checkout a PR can edit -- would keep
+# every case above green, because the stubs answer identically whatever path
+# they are given (CodeRabbit, round 4).
+g1100_reader_paths_ok() {
+  local materialized reader
+  [ -n "${G1100_FAKE:-}" ] && [ -s "$G1100_FAKE/reader-paths.log" ] || return 1
+  materialized="$(cat "$G1100_FAKE/materialized.log")"
+  while IFS= read -r reader; do
+    [ "$reader" = "$materialized" ] || return 1
+  done < "$G1100_FAKE/reader-paths.log"
+  return 0
+}
+if g1100_reader_paths_ok; then
+  pass "#1100: the relax and collision readers are handed the base policy, never \$CONFIG"
+else
+  fail "#1100: a policy reader was handed $(sort -u "${G1100_FAKE:-}/reader-paths.log" 2>/dev/null | tr '\n' ' ') rather than the base policy $(cat "${G1100_FAKE:-}/materialized.log" 2>/dev/null)"
+fi
+rm -rf "${G1100_FAKE:-/nonexistent}"
+
+# run_trigger_ack_gate re-posts the trigger up to MAX_ACK_RETRIES times, and
+# each re-post re-enters this gate and materializes ANOTHER policy file. The
+# first cut of the cleanup used one variable and one EXIT trap, so only the
+# last file was ever removed and every prior retry leaked (Codex P2, round 3).
+# Two invocations must leave exactly one file live.
+G1100_KEEP=1 G1100_RUNS=2 \
+  g1100_case "retry re-entry still proceeds" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' proceed
+if [ -n "${G1100_FAKE:-}" ] \
+   && [ "$(wc -l < "$G1100_FAKE/materialized.log")" -eq 2 ] \
+   && [ "$(find "$G1100_FAKE" -maxdepth 1 -name 'base-policy.*' | wc -l)" -eq 1 ]; then
+  pass "#1100: a second gate invocation retires the first materialized policy"
+else
+  fail "#1100: $(find "${G1100_FAKE:-}" -maxdepth 1 -name 'base-policy.*' 2>/dev/null | wc -l) materialized policies survive two invocations (expected 1 of 2)"
+fi
+rm -rf "${G1100_FAKE:-/nonexistent}"
+
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

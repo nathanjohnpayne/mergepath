@@ -504,6 +504,17 @@ paths:
       - "scripts/lib/gh-api-scalar.sh"   # #799, fail-closed scalar API reads
       - "scripts/lib/gh-api-array.sh"    # #1008, hard-sourced paginated list reads
       - "scripts/review-feedback-accounting.sh"   # #1000, fail before another review round
+      # #1100: the provider-scoped accounting refusal resolves its relax set from
+      # the governing BASE policy, so both of these are load-bearing for that
+      # path. resolve_base_policy.sh is a NEW dependency of this script;
+      # feedback-policy-helpers.sh was already sourced, but the new call reaches
+      # policy_block_field_parsed, which only exists since #1124 -- an older copy
+      # yields an empty relax set, which refuses, recreating the livelock this
+      # change removes. A commit-path propagation checks only DIRECT requires,
+      # so transitive coverage through review-feedback-accounting.sh is not
+      # enough.
+      - "scripts/workflow/resolve_base_policy.sh"   # #1100, governing base policy for the relax set
+      - "scripts/lib/feedback-policy-helpers.sh"    # #1100, policy_block_field_parsed (#1124)
   # Complete-history reviewer-feedback accounting gate (#1000). Reads every
   # paginated inline comment, review object, and PR-level comment; reconciles
   # classified findings with finding-bound disposition evidence. It hard-

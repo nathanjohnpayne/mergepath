@@ -459,6 +459,27 @@ BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
 # not a merge gate. The gate scripts (codex-p1-gate.sh) always run from the
 # full checkout and DO source the lib unconditionally.
 __CODEX_REQ_LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# #1100: resolve_base_policy.sh --materialize-default hands ITS CALLER ownership
+# of a temp policy file. The accounting gate below materializes one, and an
+# eyes-ack retry re-enters that gate, so an inline rm on the success path alone
+# would leak one file per attempt on a long-lived runner (and every `die` path
+# would leak unconditionally). review-feedback-accounting.sh:54 solves the same
+# problem with one EXIT trap over one variable; this mirrors it.
+# run_trigger_ack_gate re-posts the trigger up to MAX_ACK_RETRIES times, and
+# every re-post re-enters the accounting gate and materializes ANOTHER policy
+# file. A single-variable trap would remove only the last one, so each prior
+# retry's file would survive on a long-lived runner. Retiring the previous path
+# at the moment the next one is assigned keeps exactly one file live, and the
+# trap removes that one.
+__CRA_BASE_CFG_TMP=""
+__cra_retire_base_cfg() { # <new-path-or-empty>
+  if [ -n "$__CRA_BASE_CFG_TMP" ] && [ "$__CRA_BASE_CFG_TMP" != "${1:-}" ]; then
+    rm -f "$__CRA_BASE_CFG_TMP"
+  fi
+  __CRA_BASE_CFG_TMP="${1:-}"
+}
+trap '__cra_retire_base_cfg ""' EXIT
 REQUIRED_TIERS_JSON='["p1"]'
 if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
   # shellcheck source=lib/feedback-policy-helpers.sh
@@ -1114,7 +1135,34 @@ run_feedback_accounting_gate() {
   command -v "$gate" >/dev/null 2>&1 \
     || die 3 "review feedback accounting gate unavailable: $gate"
 
-  output=$("$gate" "$PR_NUMBER" "$REPO") || rc=$?
+  # #1100: resolve the governing base policy ONCE, here, and hand the SAME
+  # snapshot to accounting via its documented REVIEW_FEEDBACK_ACCOUNTING_CONFIG
+  # injection point. Resolving separately on each side opened a window: if the
+  # PR base advanced between the two calls, `.missing` was classified under one
+  # policy while the relax and collision sets came from another, and a policy
+  # that moved a gating login onto coderabbit/code_scanning in the newer
+  # revision would relax a finding the older revision classified as gating --
+  # with no collision to catch it, because the newer revision is internally
+  # consistent. AGENTS.md states relaxation uses the same base policy accounting
+  # classified with; one resolution is what makes that literally true.
+  #
+  # Resolution failure leaves the variable empty: accounting falls back to
+  # resolving its own (unchanged pre-#1100 behaviour) and the relax set below is
+  # empty, so nothing is skippable. Fail-closed either way.
+  __cra_base_cfg=""
+  __cra_resolver="$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh"
+  if [ -x "$__cra_resolver" ]; then
+    __cra_base_cfg=$("$__cra_resolver" --repo "$REPO" --pr "$PR_NUMBER" \
+      --default-config "$CONFIG" --materialize-default 2>/dev/null) || __cra_base_cfg=""
+  fi
+  if [ -n "$__cra_base_cfg" ] && [ "$__cra_base_cfg" != "$CONFIG" ]; then
+    __cra_retire_base_cfg "$__cra_base_cfg"
+  fi
+  if [ -n "$__cra_base_cfg" ]; then
+    output=$(REVIEW_FEEDBACK_ACCOUNTING_CONFIG="$__cra_base_cfg" "$gate" "$PR_NUMBER" "$REPO") || rc=$?
+  else
+    output=$("$gate" "$PR_NUMBER" "$REPO") || rc=$?
+  fi
   case "$rc" in
     0)
       posted=$(printf '%s' "$output" | jq -r '.posted // "?"' 2>/dev/null || printf '?')
@@ -1122,8 +1170,89 @@ run_feedback_accounting_gate() {
       log "review feedback accounting clear ($accounted/$posted accounted)"
       ;;
     1)
-      printf '%s\n' "$output" >&2
-      die 6 "review feedback is unaccounted; disposition every finding before requesting another Codex review"
+      # #1100: scope the refusal to the provider being REQUESTED. The barrier's
+      # Codex arm is read-only, so making Codex terminal is the agent's job and
+      # this script is its only tool -- but the gate counted EVERY provider, so
+      # a CodeRabbit backlog refused the Codex request, and clearing that
+      # backlog needs fix commits that produce a new head for CodeRabbit to
+      # find more on. Codex could never reach terminal on the head the barrier
+      # was evaluating. Observed live on nathanpaynedotcom#798.
+      #
+      # The relax set is ENUMERATED, and that direction is deliberate: naming
+      # who may be skipped is fail-closed, because an unmodelled or renamed
+      # reviewer keeps blocking. Naming who must block would be the fail-open
+      # shape -- the next unmodelled provider would silently stop gating.
+      # Codex's own findings, and any reviewer identity (including a Phase 4b
+      # adapter review), still refuse exactly as before.
+      # The relax set NARROWS what gates this request, so it must come from the
+      # governing BASE policy -- the same one review-feedback-accounting.sh
+      # classifies `.missing` with -- not from the candidate checkout. Reading
+      # $CONFIG here would let a PR that edits .github/review-policy.yml point
+      # coderabbit.bot_login at the Codex bot and mark Codex's own findings
+      # skippable. feedback-policy-helpers.sh states this rule itself: its
+      # untrusted reader is "for an additional login to WIDEN a scan, never to
+      # narrow one", and a narrowing caller "must resolve $CONFIG itself".
+      #
+      # policy_block_field_parsed reads through the YAML->JSON parse, so a
+      # flow-style `coderabbit: {bot_login: ...}` resolves identically to block
+      # style -- the #1124 defect class.
+      #
+      # Every failure path yields an EMPTY relax set, which refuses: an
+      # unresolvable base policy means we cannot say who may be skipped. The
+      # snapshot is the one resolved above, which accounting also classified
+      # `.missing` with -- not a second resolution that could see a newer base.
+      if [ -n "$__cra_base_cfg" ] && [ -r "$__cra_base_cfg" ]; then
+        __cra_relax=$(printf '%s\n%s\n' \
+          "$(policy_block_field_parsed coderabbit bot_login "$__cra_base_cfg" 2>/dev/null || true)" \
+          "$(policy_block_field_parsed code_scanning bot_login "$__cra_base_cfg" 2>/dev/null || true)" \
+          | grep -v '^$' || true)
+        # Sourcing the relax set from the BASE policy stops a PR nominating its
+        # own skippable providers, but it does not stop a COLLISION.
+        # validate_governing_policy (review-feedback-accounting.sh:127-129)
+        # checks codex/coderabbit/code_scanning bot_login only as
+        # `optional_string`, and available_reviewers only as non-empty strings;
+        # nothing requires these identities to be DISTINCT. So a base policy
+        # that sets coderabbit.bot_login to the Codex bot -- or to a registered
+        # Phase 4b reviewer, or the author identity -- passes validation, gets
+        # that login's findings inventoried as gating, and would then have them
+        # relaxed by a login-only allowlist.
+        #
+        # Refuse the WHOLE relax set on any collision rather than subtracting
+        # the colliding entry: a policy that gives two providers one login has
+        # not named either of them, and the safe reading of an ambiguous
+        # skippable set is that nothing is skippable.
+        #
+        # Defaults are ${x:-...} rather than `|| ...` because
+        # policy_block_field_parsed exits 0 and prints nothing for an absent
+        # field -- the exact shape that leaves the Codex bot out of the gating
+        # set. They match review-feedback-accounting.sh:162-168.
+        __cra_policy_json=$(policy_yaml_to_json "$__cra_base_cfg" 2>/dev/null || true)
+        __cra_codex_bot=$(policy_block_field_parsed codex bot_login "$__cra_base_cfg" 2>/dev/null || true)
+        __cra_author_id=$(printf '%s' "$__cra_policy_json" | jq -r '.author_identity // empty' 2>/dev/null || true)
+        __cra_gating=$(printf '%s\n%s\n%s\n' \
+          "${__cra_codex_bot:-chatgpt-codex-connector[bot]}" \
+          "${__cra_author_id:-nathanjohnpayne}" \
+          "$(printf '%s' "$__cra_policy_json" | jq -r '.available_reviewers[]? // empty' 2>/dev/null || true)" \
+          | grep -v '^$' || true)
+        if [ -n "$__cra_relax" ] && [ -n "$__cra_gating" ] \
+           && printf '%s\n' "$__cra_relax" | grep -qxF "$__cra_gating"; then
+          log "review feedback accounting: the governing base policy gives a skippable provider the same login as Codex, the author identity, or a registered reviewer; no provider is skippable (#1100)"
+          __cra_relax=""
+        fi
+      else
+        __cra_relax=""
+        log "review feedback accounting: could not resolve the governing base policy; no provider is skippable (#1100)"
+      fi
+      __cra_blocking=$(printf '%s' "$output" | jq -r --arg relax "$__cra_relax" '
+        ($relax | split("\n") | map(select(length > 0))) as $ok
+        | if ((.missing | type) != "array") or ((.missing | length) == 0) then 1
+          else [ .missing[] | select((.reviewer // "") as $r | ($ok | index($r)) == null) ] | length
+          end' 2>/dev/null || printf '1')
+      if [ "${__cra_blocking:-1}" -gt 0 ]; then
+        printf '%s\n' "$output" >&2
+        die 6 "review feedback is unaccounted; disposition every finding before requesting another Codex review"
+      fi
+      log "review feedback accounting: $(printf '%s' "$output" | jq -r '(.missing // []) | length' 2>/dev/null || printf '?') undispositioned finding(s), none from a provider that gates this request (#1100) — proceeding"
       ;;
     *)
       printf '%s\n' "$output" >&2
