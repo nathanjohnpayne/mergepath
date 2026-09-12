@@ -344,6 +344,79 @@ test_enabled_false_never_triggers
 test_timeout_head_drift_fails_closed_without_marker
 test_new_trigger_replaces_superseded_timeout_marker
 
+# ── #1100: the accounting precondition is scoped to the provider REQUESTED ──
+#
+# The Phase 4b barrier's Codex arm is read-only, so making Codex terminal is
+# the agent's job and codex-review-request.sh is its only tool. That tool
+# refused whenever accounting was unaccounted for ANY provider -- so
+# CodeRabbit's findings on the head refused the Codex request, and clearing
+# them needs fix commits, each producing a new head for CodeRabbit to find more
+# on. Codex could never reach terminal on the head the barrier was evaluating.
+# Observed live on nathanpaynedotcom#798.
+#
+# The relax set is ENUMERATED rather than the block set, and that direction is
+# the point: naming who may be skipped is fail-closed, because an unmodelled,
+# renamed or absent reviewer keeps refusing. Naming who must block would be the
+# fail-open shape.
+#
+# Run against the decision EXTRACTED from the script, so a revert is executed
+# rather than text-matched.
+g1100_extract() {
+  awk '/^    1\)$/ { grab = 1 } grab { print } /^      ;;$/ { if (grab) exit }' \
+    "$ROOT/scripts/codex-review-request.sh"
+}
+g1100_decide() {  # <accounting-json> -> "refuse" | "proceed"
+  local body out
+  body="$(g1100_extract)"
+  [ -n "$body" ] || { printf 'extract-failed'; return 0; }
+  out="$(
+    output="$1"
+    policy_bot_login() { case "$1" in
+      coderabbit) printf '%s' "${G1100_CR-coderabbitai[bot]}" ;;
+      code_scanning) printf '%s' "${G1100_GHAS-github-advanced-security[bot]}" ;;
+      *) printf '' ;; esac; }
+    log() { :; }
+    die() { printf 'refuse'; exit 0; }
+    eval "$(printf '%s' "$body" | sed -e 's/^    1)$//' -e 's/^      ;;$//')"
+    printf 'proceed'
+  )" 2>/dev/null || out='refuse'
+  printf '%s' "$out"
+}
+g1100_case() {  # <label> <json> <expected>
+  local got; got="$(g1100_decide "$2")"
+  if [ "$got" = "$3" ]; then
+    pass "#1100: $1 -> $3"
+  else
+    fail "#1100: $1 -> expected $3, got $got"
+  fi
+}
+g1100_case "only CodeRabbit undispositioned"  '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' proceed
+g1100_case "only GHAS undispositioned"        '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' proceed
+g1100_case "Codex App undispositioned"        '{"missing":[{"reviewer":"chatgpt-codex-connector[bot]"}]}' refuse
+g1100_case "Phase-4b reviewer undispositioned" '{"missing":[{"reviewer":"nathanpayne-codex"}]}' refuse
+g1100_case "CodeRabbit plus Codex"            '{"missing":[{"reviewer":"coderabbitai[bot]"},{"reviewer":"chatgpt-codex-connector[bot]"}]}' refuse
+g1100_case "renamed/unmodelled reviewer"      '{"missing":[{"reviewer":"some-new-bot[bot]"}]}' refuse
+g1100_case "reviewer field absent"            '{"missing":[{"kind":"inline"}]}' refuse
+g1100_case "unparseable accounting output"    'not json at all' refuse
+# The shapes that made the first cut fail OPEN. `.missing // []` treated an
+# ABSENT missing set as "nothing blocking", so an accounting run that reported
+# unaccounted without naming who was outstanding sailed through. Caught by the
+# pre-existing tests/test_codex_review_request_trigger_only.sh case O, whose
+# stub emits exactly that shape -- which is why that test is left untouched:
+# it asserts the same fail-closed property from the other side.
+g1100_case "unaccounted, missing set ABSENT"  '{"status":"unaccounted","posted":2,"accounted":1}' refuse
+g1100_case "unaccounted, missing set empty"   '{"status":"unaccounted","missing":[]}' refuse
+g1100_case "missing is not an array"          '{"status":"unaccounted","missing":"three"}' refuse
+
+# Every case above assumes the policy DECLARES the providers that may be
+# skipped. If it does not -- a policy without a coderabbit/code_scanning block,
+# or a read that fails -- the relax set is empty and nothing is skippable, so
+# the gate must refuse exactly as it did before this change. Untested shapes
+# are where the first cut of this fix failed open, so this one is pinned too.
+G1100_CR='' G1100_GHAS='' \
+  g1100_case "empty relax set (policy declares no skippable provider)" \
+    '{"missing":[{"reviewer":"coderabbitai[bot]"}]}' refuse
+
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

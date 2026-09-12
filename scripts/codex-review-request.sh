@@ -321,6 +321,29 @@ CONFIG=".github/review-policy.yml"
 # Uses the state-machine awk pattern established in #54 (stops at the next
 # top-level key, tolerates column-0 comments). Returns empty string if the
 # field is not present, which the caller should turn into a default.
+# #1100: the same reader as codex_field below, parameterised by block, so the
+# providers whose findings may NOT block a Codex request are read from the
+# policy rather than hard-coded here.
+policy_bot_login() {  # <block>
+  local block=$1
+  [ -f "$CONFIG" ] || return 0
+  awk -v blockre="^$block:" '
+    $0 ~ blockre {in_block=1; next}
+    in_block && /^[^[:space:]#]/ {in_block=0}
+    in_block {
+      if ($1 == "bot_login:") {
+        sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+        gsub(/^["\047]/, "", $0)
+        gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+        gsub(/[[:space:]]*#.*$/, "", $0)
+        sub(/[[:space:]]+$/, "", $0)
+        print
+        exit
+      }
+    }
+  ' "$CONFIG"
+}
+
 codex_field() {
   local field=$1
   [ -f "$CONFIG" ] || return 0
@@ -1122,8 +1145,31 @@ run_feedback_accounting_gate() {
       log "review feedback accounting clear ($accounted/$posted accounted)"
       ;;
     1)
-      printf '%s\n' "$output" >&2
-      die 6 "review feedback is unaccounted; disposition every finding before requesting another Codex review"
+      # #1100: scope the refusal to the provider being REQUESTED. The barrier's
+      # Codex arm is read-only, so making Codex terminal is the agent's job and
+      # this script is its only tool -- but the gate counted EVERY provider, so
+      # a CodeRabbit backlog refused the Codex request, and clearing that
+      # backlog needs fix commits that produce a new head for CodeRabbit to
+      # find more on. Codex could never reach terminal on the head the barrier
+      # was evaluating. Observed live on nathanpaynedotcom#798.
+      #
+      # The relax set is ENUMERATED, and that direction is deliberate: naming
+      # who may be skipped is fail-closed, because an unmodelled or renamed
+      # reviewer keeps blocking. Naming who must block would be the fail-open
+      # shape -- the next unmodelled provider would silently stop gating.
+      # Codex's own findings, and any reviewer identity (including a Phase 4b
+      # adapter review), still refuse exactly as before.
+      __cra_relax=$(printf '%s\n%s\n' "$(policy_bot_login coderabbit)" "$(policy_bot_login code_scanning)" | grep -v '^$' || true)
+      __cra_blocking=$(printf '%s' "$output" | jq -r --arg relax "$__cra_relax" '
+        ($relax | split("\n") | map(select(length > 0))) as $ok
+        | if ((.missing | type) != "array") or ((.missing | length) == 0) then 1
+          else [ .missing[] | select((.reviewer // "") as $r | ($ok | index($r)) == null) ] | length
+          end' 2>/dev/null || printf '1')
+      if [ "${__cra_blocking:-1}" -gt 0 ]; then
+        printf '%s\n' "$output" >&2
+        die 6 "review feedback is unaccounted; disposition every finding before requesting another Codex review"
+      fi
+      log "review feedback accounting: $(printf '%s' "$output" | jq -r '(.missing // []) | length' 2>/dev/null || printf '?') undispositioned finding(s), none from a provider that gates this request (#1100) — proceeding"
       ;;
     *)
       printf '%s\n' "$output" >&2
