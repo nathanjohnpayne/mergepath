@@ -175,11 +175,15 @@ policy_snapshot_signature() {
 #   0  nothing to retract, or an arm deliberately left intact -- Dependabot's
 #      dedicated lane, or one proven inside the #1058 queue boundary (which also
 #      sets MERGEPATH_ARM_RETAINED=1).
-#   1  the snapshot could not be classified at all.
-#   2  an arm exists and policy refuses to mutate it.
+#   1  the arm's boundary status could not be established.
+#   2  the boundary classifier positively reported that the arm is OUTSIDE it,
+#      and policy therefore refuses to mutate the arm.
+# Code 2 is reserved for a verdict actually reached. Handing it back for a
+# classifier that never ran, or that failed while running, would let a broken
+# dependency read as a routine policy outcome downstream.
 # No path mutates the arm; the codes describe what was learned, not what was done.
 retract_snapshot_arm() {
-  local snapshot="$1" reason="$2" target_author queue_policy_rc
+  local snapshot="$1" reason="$2" target_author queue_policy_rc refusal_rc
   local queue_policy_token queue_source_token
   MERGEPATH_ARM_RETAINED=0
   valid_pr_shape "$snapshot" || {
@@ -203,6 +207,16 @@ retract_snapshot_arm() {
   # action, even when the head and base return to the same tuple. Preserve only
   # an arm proven inside the active queue boundary; every other armed state is
   # left unchanged and blocks continuation for explicit human/admin handling.
+  # merge-queue-arm-policy.sh splits verdicts from failures in its own exit
+  # codes, and this caller must preserve that split rather than reading every
+  # nonzero as one refusal: `0` proves the arm; `4` (rollout inactive) and `5`
+  # (not eligible) are positive verdicts that the arm is outside the boundary;
+  # `3` (unreadable API, missing or duplicated credential, malformed rollout
+  # config, unavailable library or tool) and `2` (usage) are the classifier
+  # failing to reach a verdict at all, which establishes nothing about the arm.
+  # A checkout with no classifier is the same kind of nothing: an absent helper
+  # is not evidence that no boundary covers the arm.
+  refusal_rc=1
   if [ -x "$ROOT/scripts/workflow/merge-queue-arm-policy.sh" ]; then
     queue_policy_token=${MERGEPATH_QUEUE_POLICY_TOKEN:-}
     queue_source_token=${MERGEPATH_QUEUE_SOURCE_TOKEN:-}
@@ -220,14 +234,18 @@ retract_snapshot_arm() {
         echo "approval continuation: $reason arm is protected by the #1058 merge-queue boundary; leaving it intact"
         return 0
         ;;
-      *) ;;
+      4|5)
+        refusal_rc=2
+        ;;
+      *)
+        echo "approval continuation: $reason queue-boundary classification failed (rc=$queue_policy_rc); the arm's boundary status is unknown" >&2
+        ;;
     esac
+  else
+    echo "approval continuation: $reason arm has no #1058 queue-boundary classifier in this checkout; its boundary status is unknown" >&2
   fi
-  # 2, not 1: the refusal above is the decision this function was asked to make,
-  # not a failure to make it. Only the protective entry pass distinguishes them;
-  # every other caller still treats any nonzero as an infrastructure error.
   echo "approval continuation: refusing to mutate $reason arm because native disable has no exact-action precondition" >&2
-  return 2
+  return "$refusal_rc"
 }
 
 retract_latest_arm() {
@@ -303,6 +321,17 @@ if [ "$MODE" = "retract-only" ]; then
   # Otherwise another run can add an arm while policy materializes and the
   # protective-only path (used when AUTHOR_MERGE_TOKEN is absent) returns
   # without ever observing it.
+  # Only ONE shape is the standing arm #1159 is about: the PR was already armed
+  # when this pass opened, the bracketing readback succeeded and validated, and
+  # it describes the same PR tuple. Each branch below is a different event and
+  # leaves the flag clear:
+  #   * an unreadable or malformed readback means live PR state could not be
+  #     bracketed at all -- not ordinary not-readiness, whatever the arm was;
+  #   * an arm first observed BY the readback appeared DURING this continuation,
+  #     which is a concurrency signal, not a standing state;
+  #   * a moved head/base/author means the arm being judged is not the arm that
+  #     was classified, which the messages below already call unclassified.
+  protective_standing_arm=0
   set +e
   protection_snapshot=$(read_pr)
   protection_rc=$?
@@ -315,6 +344,8 @@ if [ "$MODE" = "retract-only" ]; then
     protection_snapshot="$initial"
   elif [ "$(policy_snapshot_signature "$protection_snapshot")" != "$(policy_snapshot_signature "$initial")" ]; then
     echo "approval continuation: PR head/base/author changed during policy classification; treating the latest armed state as unclassified"
+  elif [ "$arm_enabled" = "true" ]; then
+    protective_standing_arm=1
   fi
 
   if jq -e '.autoMergeRequest == null' >/dev/null 2>&1 <<<"$protection_snapshot"; then
@@ -322,29 +353,33 @@ if [ "$MODE" = "retract-only" ]; then
     exit 0
   fi
   # An arm that was already standing when this pass opened, and that the #1058
-  # boundary does not prove, is a POLICY outcome rather than a broken dependency
-  # (#1159). Both callers of this mode enumerate every approved PR, and the
-  # scheduled one re-enters every five minutes, so reporting the refusal as an
-  # infrastructure error made the sweep permanently red on any repo holding one
-  # such PR -- burying the genuine infrastructure errors that reporting exists
-  # to surface. Not-ready is the truthful classification, and the one this
-  # branch already gives the other arm it may not touch: the proven
+  # boundary positively reports as outside it, is a POLICY outcome rather than a
+  # broken dependency (#1159). Both callers of this mode enumerate every approved
+  # PR, and the scheduled one re-enters every five minutes, so reporting that
+  # refusal as an infrastructure error made the sweep permanently red on any repo
+  # holding one such PR -- burying the genuine infrastructure errors that
+  # reporting exists to surface. Not-ready is the truthful classification, and
+  # the one this branch already gives the other arm it may not touch: the proven
   # queue-governed one immediately below. Neither path retracts, merges, or
-  # clears anything, so nothing that was blocked becomes unblocked. Every OTHER
-  # retraction failure is unclassified and still fails the sweep.
+  # clears anything, so nothing that was blocked becomes unblocked.
+  #
+  # BOTH halves are required, and each is established elsewhere: a verdict the
+  # classifier actually reached (code 2, never a failure to reach one), and the
+  # standing-arm shape (protective_standing_arm, set above). Anything else --
+  # an unbracketable readback, an arm that appeared mid-run, a moved tuple, a
+  # classifier that failed or is absent -- is unclassified and still fails the
+  # sweep, because none of them establish what this PR's arm actually is.
   protective_retraction_rc=0
   retract_snapshot_arm "$protection_snapshot" "durable or unclassified" \
     || protective_retraction_rc=$?
   case "$protective_retraction_rc" in
     0) ;;
     2)
+      [ "$protective_standing_arm" -eq 1 ] || \
+        infra_error "could not retract and verify the protective auto-merge request"
       not_ready "the standing auto-merge request is outside the #1058 queue boundary and cannot be retracted; it remains intact for explicit human or admin disposition"
       ;;
     *)
-      # Unreachable today -- the only other nonzero is 1, which needs a snapshot
-      # that failed valid_pr_shape, and both snapshots reaching here have already
-      # passed it. Kept as the fail-closed default so a third outcome added to
-      # the classifier fails the sweep rather than inheriting the deferral above.
       infra_error "could not retract and verify the protective auto-merge request"
       ;;
   esac

@@ -43,6 +43,10 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
     fi
     printf '%s\n' "$STUB_INITIAL"
   elif [ "$count" -eq 2 ]; then
+    if [ "${STUB_SECOND_RC:-0}" -ne 0 ]; then
+      echo "stub second PR read failed" >&2
+      exit "$STUB_SECOND_RC"
+    fi
     printf '%s\n' "${STUB_SECOND:-$STUB_INITIAL}"
   elif [ "$count" -eq 3 ]; then
     printf '%s\n' "${STUB_THIRD:-${STUB_FINAL:-$STUB_INITIAL}}"
@@ -221,6 +225,7 @@ run_case() {
     STUB_INITIAL="$stub_initial" STUB_SECOND="$stub_second" \
     STUB_THIRD="$stub_third" STUB_FOURTH="$stub_fourth" STUB_FINAL="$stub_final" \
     STUB_INITIAL_RC="${STUB_INITIAL_RC:-0}" \
+    STUB_SECOND_RC="${STUB_SECOND_RC:-0}" \
     STUB_READINESS_RC="${STUB_READINESS_RC:-0}" STUB_GATE_RC="${STUB_GATE_RC:-0}" \
     STUB_ACCOUNTING_RC="${STUB_ACCOUNTING_RC:-0}" \
     STUB_THREADS_RC="${STUB_THREADS_RC:-0}" STUB_LOGIN="${STUB_LOGIN:-nathanjohnpayne}" \
@@ -277,7 +282,7 @@ assert_not_ready() {
 }
 
 reset_fixtures() {
-  unset STUB_INITIAL STUB_FINAL STUB_INITIAL_RC STUB_READINESS_RC STUB_GATE_RC
+  unset STUB_INITIAL STUB_FINAL STUB_INITIAL_RC STUB_SECOND_RC STUB_READINESS_RC STUB_GATE_RC
   unset STUB_ACCOUNTING_RC STUB_THREADS_RC STUB_LOGIN STUB_LOGIN_RC
   unset STUB_MERGE_RC STUB_EXPECTED_AUTHOR STUB_REQUIRED_CHECKS_RC
   unset STUB_INDEPENDENCE_RC STUB_SHARED_AUTHOR STUB_REQUIRES_EXTERNAL
@@ -460,6 +465,29 @@ else
   fail "Dependabot exemption matched more than the exact native bot login"
 fi
 
+for unbracketable in failed_read malformed_read; do
+  reset_fixtures
+  STUB_SUBJECT_MODE=disarm
+  STUB_INITIAL="$ARMED_SHARED_BASE"
+  case "$unbracketable" in
+    failed_read) STUB_SECOND_RC=9 ;;
+    malformed_read) STUB_SECOND='{}' ;;
+  esac
+  set +e
+  run_case
+  unbracketable_rc=$?
+  set -e
+  if [ "$unbracketable_rc" -eq 3 ] \
+     && [ ! -s "$TMP/merge.log" ] \
+     && grep -Fq 'could not stabilize PR state after policy classification' "$TMP/subject.out" \
+     && grep -Fq 'could not retract and verify the protective auto-merge request' "$TMP/subject.out" \
+     && ! grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary' "$TMP/subject.out"; then
+    pass "an armed PR with a $unbracketable bracket still fails closed"
+  else
+    fail "an unbracketable armed PR was deferred as a standing arm ($unbracketable, rc=$unbracketable_rc)"
+  fi
+done
+
 # #1058: the established cleanup lane may preserve an owner arm only
 # after the read-only queue-policy helper proves the complete live boundary.
 # The proof uses distinct target-policy and source-read tokens. A protected
@@ -586,7 +614,9 @@ else
   fail "an unclassifiable protective pass stopped failing the sweep (rc=$unclassifiable_protective_rc)"
 fi
 
-for queue_reject_rc in 3 5; do
+for queue_reject_case in 5:4 3:3 2:3; do
+  queue_reject_rc=${queue_reject_case%%:*}
+  queue_reject_expect=${queue_reject_case##*:}
   reset_fixtures
   STUB_SUBJECT_MODE=disarm
   STUB_SUBJECT_TOKEN=workflow-token
@@ -598,15 +628,45 @@ for queue_reject_rc in 3 5; do
   run_case
   queue_reject_result=$?
   set -e
-  if [ "$queue_reject_result" -ne 0 ] \
+  # merge-queue-arm-policy.sh's own contract: 4 inactive and 5 not-eligible are
+  # VERDICTS that the arm is outside the boundary; 3 (unreadable API, missing or
+  # duplicated credential, malformed rollout config, unavailable library) and 2
+  # (usage) are the classifier failing to reach one. Only a verdict may defer
+  # the sweep -- a broken classifier that deferred would suppress the sweep's
+  # infrastructure sentinel at the exact moment it stopped being able to see.
+  if [ "$queue_reject_result" -eq "$queue_reject_expect" ] \
      && [ ! -s "$TMP/merge.log" ] \
      && grep -Fxq 'queue-policy:queue-policy-token queue-source:queue-source-token' "$TMP/queue-policy.log" \
      && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
-    pass "queue proof rc=$queue_reject_rc refuses ambiguous active-rollout mutation"
+    pass "queue proof rc=$queue_reject_rc refuses the mutation and reports rc=$queue_reject_expect"
   else
-    fail "queue proof rc=$queue_reject_rc disabled or silently preserved an ambiguous arm"
+    fail "queue proof rc=$queue_reject_rc mutated the arm or misreported it (rc=$queue_reject_result, expected $queue_reject_expect)"
   fi
 done
+
+# The same split, asserted on the diagnostics rather than the exit code alone: a
+# classifier that failed must say so and must NOT emit the standing-arm
+# deferral, because no verdict about this arm was ever reached.
+reset_fixtures
+STUB_SUBJECT_MODE=disarm
+STUB_SUBJECT_TOKEN=workflow-token
+STUB_QUEUE_POLICY_TOKEN=queue-policy-token
+STUB_QUEUE_POLICY_RC=3
+STUB_INITIAL="$ARMED_SHARED_BASE"
+STUB_SECOND="$ARMED_SHARED_BASE"
+set +e
+run_case
+broken_classifier_rc=$?
+set -e
+if [ "$broken_classifier_rc" -eq 3 ] \
+   && [ ! -s "$TMP/merge.log" ] \
+   && grep -Fq 'queue-boundary classification failed (rc=3)' "$TMP/subject.out" \
+   && grep -Fq 'could not retract and verify the protective auto-merge request' "$TMP/subject.out" \
+   && ! grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary' "$TMP/subject.out"; then
+  pass "a broken queue classifier fails the sweep instead of deferring it"
+else
+  fail "a broken queue classifier was reported as a standing-arm policy refusal (rc=$broken_classifier_rc)"
+fi
 
 # A trusted checkout without the new proof helper must also block. Falling
 # back to native disable would recreate the read/newer-arm/disable race.
@@ -620,7 +680,7 @@ run_case
 missing_queue_helper_rc=$?
 set -e
 chmod +x "$TMP/root/scripts/workflow/merge-queue-arm-policy.sh"
-if [ "$missing_queue_helper_rc" -eq 4 ] \
+if [ "$missing_queue_helper_rc" -eq 3 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && [ ! -s "$TMP/queue-policy.log" ] \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
@@ -1133,9 +1193,11 @@ set +e
 run_case
 arm_during_policy_rc=$?
 set -e
-if [ "$arm_during_policy_rc" -eq 4 ] \
+if [ "$arm_during_policy_rc" -eq 3 ] \
    && [ ! -s "$TMP/merge.log" ] \
-   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
+   && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out" \
+   && grep -Fq 'could not retract and verify the protective auto-merge request' "$TMP/subject.out" \
+   && ! grep -Fq 'the standing auto-merge request is outside the #1058 queue boundary' "$TMP/subject.out"; then
   pass "protective mode blocks an arm that appears during policy materialization"
 else
   fail "protective mode mutated or trusted the stale initially-unarmed bit"
@@ -1162,20 +1224,23 @@ for armed_snapshot in still_armed moved_head moved_base; do
   STUB_SUBJECT_MODE=disarm
   STUB_INITIAL=$(jq -c '.autoMergeRequest = {"enabledAt":"2026-01-09T00:00:00Z"}' <<<"$SHARED_BASE")
   case "$armed_snapshot" in
-    still_armed) STUB_SECOND="$STUB_INITIAL" ;;
-    moved_head) STUB_SECOND=$(jq -c '.headRefOid = "def456" | .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:01Z"}' <<<"$SHARED_BASE") ;;
-    moved_base) STUB_SECOND=$(jq -c '.baseRefOid = "base456" | .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:01Z"}' <<<"$SHARED_BASE") ;;
+    # Same PR tuple, armed before this pass opened: the standing arm, deferred.
+    still_armed) STUB_SECOND="$STUB_INITIAL"; armed_snapshot_expect=4 ;;
+    # A moved tuple means the arm being judged is not the arm that was
+    # classified, which the subject itself calls unclassified: infrastructure.
+    moved_head) STUB_SECOND=$(jq -c '.headRefOid = "def456" | .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:01Z"}' <<<"$SHARED_BASE"); armed_snapshot_expect=3 ;;
+    moved_base) STUB_SECOND=$(jq -c '.baseRefOid = "base456" | .autoMergeRequest = {"enabledAt":"2026-01-09T00:00:01Z"}' <<<"$SHARED_BASE"); armed_snapshot_expect=3 ;;
   esac
   set +e
   run_case
   armed_snapshot_rc=$?
   set -e
-  if [ "$armed_snapshot_rc" -eq 4 ] \
+  if [ "$armed_snapshot_rc" -eq "$armed_snapshot_expect" ] \
      && [ ! -s "$TMP/merge.log" ] \
      && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
     pass "a $armed_snapshot protective snapshot fails closed without a write"
   else
-    fail "a $armed_snapshot protective snapshot was mutated or accepted (rc=$armed_snapshot_rc)"
+    fail "a $armed_snapshot protective snapshot was mutated or misclassified (rc=$armed_snapshot_rc, expected $armed_snapshot_expect)"
   fi
 done
 
@@ -1217,7 +1282,7 @@ set +e
 run_case
 policy_drift_arm_rc=$?
 set -e
-if [ "$policy_drift_arm_rc" -eq 4 ] \
+if [ "$policy_drift_arm_rc" -eq 3 ] \
    && [ ! -s "$TMP/merge.log" ] \
    && grep -Fq 'changed during policy classification; treating the latest armed state as unclassified' "$TMP/subject.out" \
    && grep -Fq 'refusing to mutate durable or unclassified arm' "$TMP/subject.out"; then
