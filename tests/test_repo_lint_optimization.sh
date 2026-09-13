@@ -115,18 +115,27 @@ else
   fi
 
   selected=$(scope_value checks pull_request scripts/lib/ci-check-modes.sh)
-  if jq -e '
-      length == 6
-      and (index("check_auto_clear_workflow") != null)
-      and (index("check_doc_ownership") != null)
-      and (index("check_coderabbit_wait") != null)
-      and (index("check_merge_clearance_gate") != null)
-      and (index("check_phase_4b_automation") != null)
-      and (index("check_phase_4b_accounting") != null)
-    ' <<<"$selected" >/dev/null 2>&1; then
+  # DERIVED from the tree, not hardcoded. The assertion's intent is "every
+  # wrapper that sources the helper is selected", and a fixed list of six
+  # names asserted a snapshot of that instead: the seventh such wrapper
+  # (#931's check_pr_review_policy_nudge) failed it while satisfying it.
+  # Comments are stripped first so a wrapper that merely mentions the helper
+  # in prose is not counted as sourcing it.
+  sourcing=$(for f in "$ROOT"/scripts/ci/check_*; do
+      # `|| true`: a non-matching wrapper is the common case, and under set -e
+      # its nonzero grep would abort the suite instead of failing an assertion.
+      sed 's/[[:space:]]*#.*$//' "$f" | grep -q 'ci-check-modes\.sh' && basename "$f" || true
+    done | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
+  # A SUBSET check, matching the assertion's own words: every sourcing wrapper
+  # must be selected. Equality would be wrong — the graph also declares this
+  # dependency for wrappers that reach the helper indirectly rather than
+  # sourcing it textually, and those are legitimately selected too.
+  if jq -e --argjson sourcing "$sourcing" \
+      '. as $sel | $sourcing | all(. as $w | $sel | index($w) != null)' \
+      <<<"$selected" >/dev/null 2>&1; then
     pass "the shared mode selector selects every wrapper that sources it"
   else
-    fail "ci-check-modes.sh must select every sourcing wrapper (got $selected)"
+    fail "ci-check-modes.sh must select every sourcing wrapper (sourcing $sourcing, selected $selected)"
   fi
 
   auto_clear_dependencies_ok=1

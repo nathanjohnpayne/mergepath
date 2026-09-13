@@ -20,13 +20,6 @@
     "docs/architecture/*"
   ],
   "wrappers": {
-    "check_no_token_in_output": [
-      "scripts/ci/token_output_gate.py"
-    ],
-    "check_doc_ownership": [
-      "scripts/lib/ci-check-modes.sh",
-      "tests/test_check_doc_ownership.sh"
-    ],
     "check_auto_clear_workflow": [
       ".github/workflows/agent-review.yml",
       ".github/workflows/auto-clear-blocking-labels.yml",
@@ -45,19 +38,18 @@
       "tests/test_coderabbit_wait_*.sh",
       "tests/test_coderabbit_automerge_rate_limit_gate.sh"
     ],
+    "check_doc_ownership": [
+      "scripts/lib/ci-check-modes.sh",
+      "tests/test_check_doc_ownership.sh"
+    ],
     "check_merge_clearance_gate": [
       "scripts/lib/ci-check-modes.sh",
       "scripts/merge-clearance-gate.sh",
       "tests/test_merge_clearance_gate.sh",
       "tests/test_465_fail_closed.sh"
     ],
-    "check_phase_4b_automation": [
-      "scripts/lib/ci-check-modes.sh",
-      "scripts/phase-4b-review.sh",
-      "scripts/phase-4b/*",
-      "scripts/lib/codex-failure-markers.sh",
-      "scripts/lib/gh-api-array.sh",
-      "tests/test_phase_4b_automation.sh"
+    "check_no_token_in_output": [
+      "scripts/ci/token_output_gate.py"
     ],
     "check_phase_4b_accounting": [
       "scripts/lib/ci-check-modes.sh",
@@ -67,6 +59,23 @@
       "scripts/phase-4b/accounting.schema.json",
       "scripts/phase-4b/prices.json",
       "tests/test_phase_4b_accounting.sh"
+    ],
+    "check_phase_4b_automation": [
+      "scripts/lib/ci-check-modes.sh",
+      "scripts/phase-4b-review.sh",
+      "scripts/phase-4b/*",
+      "scripts/lib/codex-failure-markers.sh",
+      "scripts/lib/gh-api-array.sh",
+      "tests/test_phase_4b_automation.sh"
+    ],
+    "check_pr_review_policy_nudge": [
+      "scripts/pr-review-policy-nudge.sh",
+      "scripts/validate-pr-body.sh",
+      "scripts/gh-as-author.sh",
+      "scripts/lib/preflight-helpers.sh",
+      "scripts/lib/ci-check-modes.sh",
+      ".github/workflows/pr-review-policy.yml",
+      "tests/test_pr_review_policy_nudge.sh"
     ],
     "check_self_approval_detector": [
       ".github/workflows/agent-review.yml",

@@ -28,6 +28,20 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+# Marker-first, and BEFORE every other lookup — the mode helper included.
+# docs/agents/propagation-ordering.md is explicit: the sync-to-downstream
+# marker test must come first, before any test of the check's own hub-only
+# artifacts. Loading the shared mode helper ahead of it would turn the
+# required `lint` context red on a consumer that received this wrapper but
+# not `scripts/lib/ci-check-modes.sh` — bootstrap skew or a sync override —
+# for hub-only tooling that consumer cannot use anyway. Guard on the marker
+# ALONE: the presence of any wrapped artifact is the wrong signal, because a
+# stale bootstrap can leave one behind.
+if [ ! -f scripts/sync-to-downstream.sh ]; then
+  echo "check_pr_review_policy_nudge: SKIP (consumer checkout: scripts/sync-to-downstream.sh is absent; the #931 recovery nudge is hub-only operator tooling)"
+  exit 0
+fi
+
 # Live assertions and an implementation regression suite are separable here,
 # so the two get explicit modes per docs/agents/testing-requirements.md
 # § Repo-lint execution: the fast lane takes --check, deep CI takes
@@ -49,13 +63,6 @@ SUBJECT="scripts/pr-review-policy-nudge.sh"
 TEST_SCRIPT="tests/test_pr_review_policy_nudge.sh"
 GATE_WORKFLOW=".github/workflows/pr-review-policy.yml"
 
-# Marker-first, per the hub-only convention: guard on the orchestrator's
-# presence alone, never on whether the wrapped artifact happens to be there —
-# a consumer can carry stale residue at a different revision.
-if [ ! -f scripts/sync-to-downstream.sh ]; then
-  echo "check_pr_review_policy_nudge: SKIP (consumer checkout — the nudge is hub-only operator tooling)"
-  exit 0
-fi
 
 for f in "$SUBJECT" "$TEST_SCRIPT" "$GATE_WORKFLOW"; do
   if [ ! -f "$f" ]; then
@@ -119,6 +126,45 @@ for var in CONTEXT_SELF_REVIEW CONTEXT_LABEL_GATE; do
     echo "check_pr_review_policy_nudge: '$value' is not a job name in $GATE_WORKFLOW; the refuse-on-presence guard would never match" >&2
     exit 1
   fi
+done
+
+# --- 3: the recovery contract the nudge depends on --------------------------
+# The whole mechanism is "a body edit fires `edited`, and `edited` re-runs all
+# three producer jobs". Nothing else in the repository asserts that, so if the
+# workflow later drops `edited` from its types, or gates the Phase 4 classifier
+# off for that action, the nudge would report success while firing no complete
+# re-evaluation — the "recorded that we called it, not that it worked" shape.
+#
+# Decided over the PARSED trigger map, never a line grep: `on:`, `"on":` and
+# the inline-mapping spelling all resolve to the same map and a grep anchored
+# to one of them sees only that one. yq is installed earlier in this lane.
+if ! command -v yq >/dev/null 2>&1; then
+  echo "check_pr_review_policy_nudge: ERROR yq is required to read $GATE_WORKFLOW's trigger map" >&2
+  exit 1
+fi
+
+TYPES=$(yq -r '.on.pull_request.types // [] | join(" ")' "$GATE_WORKFLOW")
+case " $TYPES " in
+  *" edited "*) ;;
+  *)
+    echo "check_pr_review_policy_nudge: $GATE_WORKFLOW no longer subscribes to pull_request 'edited'; the nudge would fire nothing (types: $TYPES)" >&2
+    exit 1 ;;
+esac
+
+# Every job that produces something the nudge is recovering must actually run
+# for `edited`. A job whose `if:` names the action negatively — the classifier
+# excludes labeled/unlabeled — is fine; one that excludes `edited` is not.
+for job in self-review-check label-gate external-review-labeling; do
+  if [ "$(yq -r ".jobs.\"$job\" // \"MISSING\"" "$GATE_WORKFLOW")" = "MISSING" ]; then
+    echo "check_pr_review_policy_nudge: $GATE_WORKFLOW has no job '$job'; the recovery contract named three producers" >&2
+    exit 1
+  fi
+  JOB_IF=$(yq -r ".jobs.\"$job\".if // \"\"" "$GATE_WORKFLOW")
+  case "$JOB_IF" in
+    *"'edited'"* | *'"edited"'*)
+      echo "check_pr_review_policy_nudge: $GATE_WORKFLOW job '$job' conditions on the edited action ($JOB_IF); a nudge would no longer re-run all three producers" >&2
+      exit 1 ;;
+  esac
 done
 
 if [ "$CI_CHECK_RUN_SELF_TEST" -eq 0 ]; then

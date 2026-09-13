@@ -283,8 +283,20 @@ fi
 # large, self-inflicted part of the window — the four validator invocations
 # and the check-run listing — leaving only the round trip. That residual is
 # the floor for any whole-body write, and it is accepted rather than solved.
-LIVE_BODY=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.body // ""' 2>/dev/null) \
+# State as well as body: the PR can be closed or merged between the opening
+# read and here, and a re-read that selects only the body would let a stale
+# invocation edit an archived PR and report a successful recovery.
+# Fetched whole and split locally rather than with a server-side `--jq`
+# joining the two: every delimiter jq can join with (`@tsv`, `@csv`) escapes
+# newlines, so a multi-line body would come back mangled and never compare
+# equal — the guard would then fire on every ordinary run.
+LIVE_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) \
   || die "could not re-read $REPO#$PR_NUMBER before writing" 2
+LIVE_STATE=$(printf '%s' "$LIVE_JSON" | jq -r '.state // ""')
+LIVE_BODY=$(printf '%s' "$LIVE_JSON" | jq -r '.body // ""')
+if [ "$LIVE_STATE" != "open" ]; then
+  die "PR $REPO#$PR_NUMBER became $LIVE_STATE while this ran; refusing to edit a PR that is no longer open" 5
+fi
 if [ "$LIVE_BODY" != "$OLD_BODY" ]; then
   die "the PR body changed while this ran; refusing to overwrite the newer description — re-run to nudge against it" 5
 fi

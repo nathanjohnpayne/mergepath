@@ -98,7 +98,18 @@ case "$*" in
     while [ "$#" -gt 0 ]; do
       case "$1" in --jq) jqexpr=$2; shift 2 ;; *) shift ;; esac
     done
-    if [ -z "$jqexpr" ]; then cat "${STUB_PR_JSON_FILE:?}"; exit 0; fi
+    # The OPENING read is the first `/pulls/N` call; every later one is a
+    # re-read, which is the seam the STUB_LIVE_* overrides hang on. Keyed on
+    # call ordinal rather than on --jq, because the pre-write re-read now
+    # fetches the whole object (a server-side join would escape newlines in
+    # the body).
+    # `commits/<sha>/pulls` has no trailing slash, so it is not counted here.
+    # Only a no---jq call can be the opening read; the head confirmation
+    # carries one and must never be served the raw object.
+    if [ -z "$jqexpr" ]; then
+      PLAIN_PULLS=$(grep '/pulls/' "${STUB_GH_LOG:?}" | grep -vc -- '--jq' || true)
+      if [ "${PLAIN_PULLS:-0}" -le 1 ]; then cat "${STUB_PR_JSON_FILE:?}"; exit 0; fi
+    fi
     # Scoped by which field is being re-read, so a case can break the head
     # confirmation without also breaking the pre-write body re-read.
     case "$jqexpr" in
@@ -111,7 +122,9 @@ case "$*" in
     if [ -n "${STUB_LIVE_HEAD:-}" ]; then
       live=$(printf '%s' "$live" | jq --arg h "$STUB_LIVE_HEAD" '.head.sha = $h')
     fi
-    printf '%s' "$live" | jq -r "$jqexpr"
+    # The pre-write re-read now fetches the whole object (no --jq), so a
+    # re-read can be either shape.
+    if [ -z "$jqexpr" ]; then printf '%s' "$live"; else printf '%s' "$live" | jq -r "$jqexpr"; fi
     exit 0 ;;
 esac
 echo "unexpected gh call: $*" >&2
@@ -245,7 +258,7 @@ echo "--- 1c: nothing was published"
 EXPECTED_CALLS=$(cat <<'CALLS'
 api repos/owner/repo/pulls/7
 api --paginate repos/owner/repo/commits/sha111/check-runs
-api repos/owner/repo/pulls/7 --jq .body // ""
+api repos/owner/repo/pulls/7
 CALLS
 )
 if [ "$(cat "$D/gh.log")" = "$EXPECTED_CALLS" ]; then
