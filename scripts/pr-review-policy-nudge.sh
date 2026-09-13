@@ -60,11 +60,23 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # OP_PREFLIGHT_* vars and deliberately does not assign GH_TOKEN, so the choice
 # of which token below is this script's: reads take the reviewer PAT, and the
 # single write resolves the author PAT inside the wrapper.
-if [ -z "${GH_TOKEN:-}" ] && [ -r "$ROOT/scripts/lib/preflight-helpers.sh" ]; then
+if [ -r "$ROOT/scripts/lib/preflight-helpers.sh" ]; then
   # shellcheck source=lib/preflight-helpers.sh
   . "$ROOT/scripts/lib/preflight-helpers.sh"
-  auto_source_preflight
+  # Unconditional, NOT the GH_TOKEN-guarded auto_source_preflight. That one
+  # skips when GH_TOKEN is already set, which leaves OP_PREFLIGHT_AUTHOR_PAT
+  # unloaded — and the single write resolves the AUTHOR token, not the
+  # reviewer one the reads use. In a token-only shell carrying an ambient
+  # reviewer GH_TOKEN with no keyring, gh-as-author.sh would then find no
+  # preferred var, an ambient token whose identity does not match, and no
+  # keyring fallback, and recovery would fail at its only write. This loader
+  # populates both PATs and restores the caller's GH_TOKEN afterwards.
+  load_preflight_env_vars
 fi
+# The loader ASSIGNS but does not export, and gh-as-author.sh reads the author
+# PAT from its own environment as a child process.
+[ -n "${OP_PREFLIGHT_AUTHOR_PAT:-}" ] && export OP_PREFLIGHT_AUTHOR_PAT
+[ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ] && export OP_PREFLIGHT_REVIEWER_PAT
 GH_TOKEN="${GH_TOKEN:-${OP_PREFLIGHT_REVIEWER_PAT:-}}"
 export GH_TOKEN
 

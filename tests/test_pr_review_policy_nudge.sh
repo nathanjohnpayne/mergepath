@@ -138,6 +138,7 @@ cat > "$TMP/bin/gh-as-author-stub.sh" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
 printf '%s\n' "$*" >> "${STUB_EDIT_LOG:?}"
+printf 'author_pat_present=%s\n' "$([ -n "${OP_PREFLIGHT_AUTHOR_PAT:-}" ] && echo yes || echo no)" >> "${STUB_EDIT_LOG:?}"
 prev=""
 for a in "$@"; do
   if [ "$prev" = "--body-file" ]; then cp "$a" "${STUB_WRITTEN_BODY:?}"; fi
@@ -584,6 +585,28 @@ if [ "$RC" = 0 ] && printf '%s' "$ERR" | grep -q "unterminated code fence"; then
   pass "a tilde fence is recognized as well as a backtick fence"
 else
   fail "expected the fence warning on a tilde fence; rc=$RC err='$ERR'"
+fi
+
+echo "--- 20: the cached AUTHOR pat is loaded even when GH_TOKEN is already set"
+# Reads use the reviewer token; the single write resolves the AUTHOR one. A
+# GH_TOKEN-guarded load skips when an ambient token is present, leaving
+# gh-as-author.sh with no preferred var, a mismatched ambient token and no
+# keyring — recovery failing at its only write.
+mkdir -p "$TMP/cache"
+# Bare assignments, not `export`: preflight_session_is_fresh greps
+# `^OP_PREFLIGHT_CREATED_AT_EPOCH=`, so an `export ` prefix makes the cache
+# read as stale and the fixture silently proves nothing.
+cat > "$TMP/cache/op-preflight-claude.env" <<CACHE
+OP_PREFLIGHT_CREATED_AT_EPOCH=$(date +%s)
+OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat
+OP_PREFLIGHT_AUTHOR_PAT=fixture-author-pat
+CACHE
+run_nudge open sha20 "$VALID_BODY" "$NEITHER" \
+  GH_TOKEN=ambient-reviewer-token MERGEPATH_AGENT=claude OP_PREFLIGHT_CACHE_DIR="$TMP/cache"
+if [ "$RC" = 0 ] && grep -q 'author_pat_present=yes' "$D/edit.log"; then
+  pass "an ambient GH_TOKEN no longer suppresses the cached author credential"
+else
+  fail "expected the author pat to reach the write; rc=$RC edit.log='$(cat "$D/edit.log")'"
 fi
 
 echo
