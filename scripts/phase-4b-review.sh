@@ -114,10 +114,17 @@ p4b_acct_on() { [ "$P4B_ACCT_AVAILABLE" = true ] && p4b_acct_hook_active; }
 # Set after the pre-post record; consulted by the failure paths so a review
 # that never actually posted is corrected instead of double-recorded.
 P4B_ACCT_LOOP_RECORDED=false
-# Set only when a late timeout-generation revalidation already corrected this
+# Set only when a pre-POST fence has ALREADY, and SUCCESSFULLY, corrected this
 # invocation's provisional loop before entering fall_back_to_manual. The
-# fallback must not append a second record for the same invocation.
+# fallback must not append a second record for the same invocation — but it
+# must still retry when the earlier correction failed, so this records that the
+# correction LANDED, never merely that it was attempted (#1143 round 5).
 P4B_PRE_POST_ACCT_CLEANED=false
+# Outcome of the most recent p4b_acct_mark_unposted call: true when the loop
+# correction landed (or there was nothing to correct), false when the rewrite
+# failed. Carried in a global rather than an exit status — see the contract
+# note on p4b_acct_mark_unposted below.
+P4B_ACCT_LAST_CORRECTION_OK=true
 
 # Per-invocation ledger-staging token (#615 Codex round 6). Exported so the
 # render subshell (which stages the pending record on disk) and this process's
@@ -134,14 +141,32 @@ export P4B_ACCT_RUN_ID
 # not-posted, fail-closed with the reason) and discard the staged ledger
 # record so local state never claims a phantom posted approval. Advisory —
 # never alters review flow or exit codes.
+#
+# Whether the correction LANDED is reported in P4B_ACCT_LAST_CORRECTION_OK,
+# not in the exit status (#1143 round 5). The status stays 0 on every path
+# because six call sites below invoke this inside `X || { … ; p4b_die N …; }`
+# groups and one bare inside an `if` body, all under `set -e`: a non-zero
+# return there aborts the run before the intended p4b_die, turning an ADVISORY
+# accounting failure into a changed exit code — exactly what this function's
+# contract promises never to do, and a trap the next caller would have to
+# remember `|| true` to avoid. The global keeps the advisory guarantee
+# structural while still making the outcome observable.
 p4b_acct_mark_unposted() {
   local why="$1"
+  P4B_ACCT_LAST_CORRECTION_OK=true
   p4b_acct_on 2>/dev/null || return 0
   p4b_acct_hook_discard_pending_record || true
   if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
-    p4b_acct_hook_mark_last_loop_unposted "$why" \
-      || p4b_warn "accounting: could not correct the unposted loop record (continuing)"
-    P4B_ACCT_LOOP_RECORDED=false
+    if p4b_acct_hook_mark_last_loop_unposted "$why"; then
+      P4B_ACCT_LOOP_RECORDED=false
+    else
+      # Do NOT clear P4B_ACCT_LOOP_RECORDED here. The loop log still carries a
+      # `posted` claim for a review that did not post, so a later correction
+      # attempt must still see something to correct; clearing it made the
+      # failure indistinguishable from success and retired the retry.
+      p4b_warn "accounting: could not correct the unposted loop record (leaving it recorded so a later attempt retries)"
+      P4B_ACCT_LAST_CORRECTION_OK=false
+    fi
   fi
   return 0
 }
@@ -550,7 +575,17 @@ cleanup_pre_post_refusal_side_effects() {
   if [ "$mark_accounting" = true ]; then
     if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
       p4b_acct_mark_unposted "$why"
-      P4B_PRE_POST_ACCT_CLEANED=true
+      # Only claim the correction is done once it actually LANDED (#1143 round
+      # 5). Setting this unconditionally recorded "we called the corrector",
+      # not "the loop no longer says posted" — so a failed rewrite marked
+      # itself complete and fall_back_to_manual skipped the one remaining
+      # attempt, leaving a durable posted record for a review that never
+      # posted. That is the outcome the round-4 ordering fix exists to
+      # prevent, reached through the correction's FAILURE path instead of
+      # through its ordering.
+      if [ "${P4B_ACCT_LAST_CORRECTION_OK:-true}" = true ]; then
+        P4B_PRE_POST_ACCT_CLEANED=true
+      fi
     fi
   fi
   if [ "${VERDICT:-}" = "APPROVED" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then

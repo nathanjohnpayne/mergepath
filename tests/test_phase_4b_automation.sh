@@ -2175,6 +2175,113 @@ else
   fail "#1143: a failing fallback gate left durable state claiming a posted approval (loop=$(cat "$_loop" 2>/dev/null); pending=$(find "$P4B1143R2_ACCT/phase-4b-pending" -type f 2>/dev/null | tr '\n' ' '); got=$got)"
 fi
 
+# (n) #1143 round 5 (CodeRabbit P1): getting the ORDER right does not help if
+#     the corrected write can fail silently and then mark itself done.
+#     p4b_acct_hook_mark_last_loop_unposted has four `return 1` paths (an
+#     unresolvable log, an empty log, a failed jq rewrite, a failed mv), and
+#     p4b_acct_mark_unposted used to swallow that, clear
+#     P4B_ACCT_LOOP_RECORDED and return 0 regardless — after which the fence
+#     set P4B_PRE_POST_ACCT_CLEANED=true and fall_back_to_manual skipped its
+#     remaining attempt. Durable outcome: a `posted` loop record for a review
+#     that never posted, i.e. exactly what the round-4 ordering fix exists to
+#     prevent, reached through the correction's FAILURE path.
+#
+#     The flag now has to mean the property ("the loop no longer says posted"),
+#     not a side effect of the setup ("we called the corrector") — the same
+#     distinction that made the first case-(l) guard useless.
+#
+#     Both directions are asserted on DURABLE state, because a swallowed
+#     failure leaves the exit path byte-identical; only the loop log and the
+#     attempt count separate them.
+FLAKY_JQ_DIR="$WORK/flaky-jq-bin"
+mkdir -p "$FLAKY_JQ_DIR"
+# Fails ONLY the unposted-loop rewrite, and only the first
+# P4B_FAKE_JQ_FAIL_TIMES times. Every other jq call is delegated to the real
+# binary, so nothing else in the orchestrator is perturbed.
+#
+# The signature is `-cs` AND `--arg reason` together. `--arg reason` alone is
+# NOT unique — accounting.sh uses it in four places (the two prior-record
+# aggregation fallbacks, and the fail-closed sub-object built inside
+# p4b_acct_hook_record_loop) — and matching on it alone broke loop RECORDING
+# instead of the correction, which the direction-2 assertion caught as "no loop
+# log written". Only the rewrite at accounting.sh:1611 slurps with `-cs`.
+#
+# The real jq path is BAKED IN rather than passed through an env var, and the
+# counter knob is treated as optional. Both because the adapter runs its CLI
+# under a deliberately scrubbed child environment: an env-var indirection was
+# unset there, the shim exited non-zero for the adapter's own jq calls, the
+# adapter produced no valid verdict, and the run fell back on "invalid verdict"
+# WITHOUT ever reaching the identity fence — a green-looking rc=4 that tested
+# nothing. Measured, not guessed: a tracing shim showed the correction going
+# through note_fallback's `-nc` path with no `-cs` call at all.
+P4B1143R5_REAL_JQ="$(command -v jq)"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'slurp=false; reason=false; prev=""\n'
+  printf 'for a in "$@"; do\n'
+  printf '  [ "$a" = "-cs" ] && slurp=true\n'
+  printf '  if [ "$prev" = "--arg" ] && [ "$a" = "reason" ]; then reason=true; fi\n'
+  printf '  prev="$a"\n'
+  printf 'done\n'
+  printf 'if [ "$slurp" = true ] && [ "$reason" = true ] && [ -n "${P4B_FAKE_JQ_COUNT:-}" ]; then\n'
+  printf '  n=$(( $( [ -f "$P4B_FAKE_JQ_COUNT" ] && cat "$P4B_FAKE_JQ_COUNT" || echo 0 ) + 1 ))\n'
+  printf '  printf "%%s\\n" "$n" > "$P4B_FAKE_JQ_COUNT"\n'
+  printf '  if [ "$n" -le "${P4B_FAKE_JQ_FAIL_TIMES:-0}" ]; then\n'
+  printf '    echo "simulated jq failure in the unposted-loop rewrite" >&2\n'
+  printf '    exit 1\n'
+  printf '  fi\n'
+  printf 'fi\n'
+  printf 'exec %s "$@"\n' "$P4B1143R5_REAL_JQ"
+} > "$FLAKY_JQ_DIR/jq"
+chmod +x "$FLAKY_JQ_DIR/jq"
+
+p4b1143r5_case() {  # <pr> <fail-times> <expected-attempts> <label>
+  local pr="$1" failtimes="$2" want="$3" label="$4"
+  local acct="$WORK/acct-r5-$pr" cnt="$WORK/jqcount-$pr" got loop attempts
+  rm -rf "$acct"; rm -f "$cnt"
+  printf 'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n' > "$P4B1143R2_BODY2"
+  got="$(p4b1143r2_run "$pr" fake-claude-approve-usage 2 "$P4B1143R2_GUARD" \
+    P4B_ACCT_STATE_DIR="$acct" \
+    PATH="$FLAKY_JQ_DIR:$PATH" \
+    P4B_REAL_JQ="$P4B1143R5_REAL_JQ" \
+    P4B_FAKE_JQ_COUNT="$cnt" \
+    P4B_FAKE_JQ_FAIL_TIMES="$failtimes")"
+  attempts="$(tail -1 "$cnt" 2>/dev/null || true)"
+  case "$attempts" in ''|*[!0-9]*) attempts="" ;; esac
+  loop="$(find "$acct/phase-4b-loops" -name '*.jsonl' 2>/dev/null | head -n1)"
+  case "$got" in
+    *"Authoring-Agent changed during review"*) : ;;
+    *)
+      # Without this the case can pass on a run that fell back for an entirely
+      # different reason (an adapter that failed under the shimmed jq, say) and
+      # never exercised the fence at all.
+      fail "#1143: $label — the run did not refuse at the identity fence, so nothing here was exercised (got=$got)"
+      return 0 ;;
+  esac
+  if [ -z "$loop" ]; then
+    fail "#1143: $label — no loop log written; this assertion proves nothing (got=$got)"
+  elif [ -z "$attempts" ]; then
+    fail "#1143: $label — the rewrite was never attempted, so the shim never intercepted (got=$got)"
+  elif [ "$attempts" != "$want" ]; then
+    fail "#1143: $label — expected $want correction attempt(s), saw $attempts"
+  elif ! jq -e -s 'last.loop.posted == "not-posted"' "$loop" >/dev/null 2>&1; then
+    fail "#1143: $label — durable loop record still claims posted: $(cat "$loop" 2>/dev/null)"
+  else
+    pass "#1143: $label"
+  fi
+}
+
+# Direction 1 — the correction lands on the first attempt: the flag is set and
+# the fallback must NOT try again (no duplicate correction).
+p4b1143r5_case 1152 0 1 \
+  "a loop correction that lands marks itself done and the fallback does not retry"
+
+# Direction 2 — the correction FAILS once: the flag must stay unset so the
+# fallback's remaining attempt still runs, and that retry must land. Pre-fix
+# this saw ONE attempt and a loop record still claiming posted.
+p4b1143r5_case 1153 1 2 \
+  "a FAILED loop correction leaves the retry armed, and the retry corrects the record"
+
 # #574 feedback_policy: a finding in a configured required tier cannot be
 # carried by an approval, even when the adapter output is otherwise valid.
 set +e
