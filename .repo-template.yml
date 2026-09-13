@@ -26,6 +26,8 @@ spec_test_map:
     - tests/test_coderabbit_wait_statuscontext_ratelimit.sh
   review_feedback_accounting:
     - tests/test_review_feedback_accounting.sh
+  pr_review_policy_recovery:
+    - tests/test_pr_review_policy_recovery.sh
   # NOTE - avoid a colon followed by a space anywhere in a comment inside this
   # block. check_spec_test_alignment parses it line by line and treats any
   # line containing one as a key, silently rebinding the current spec and

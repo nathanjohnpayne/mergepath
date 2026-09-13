@@ -44,6 +44,7 @@ TEST="tests/test_pr_review_policy_recovery.sh"
 # tell its own lineage from the job-native one. It is the whole refresh
 # contract, so the literal is asserted in lockstep rather than assumed.
 RECOVERY_EXTERNAL_ID="mergepath-pr-review-policy-recovery"
+RETIRED_EXTERNAL_ID="mergepath-pr-review-policy-recovery-superseded"
 DISPATCH_TYPE="pr-review-policy-recheck"
 SWEEP_JOB="recovery-sweep"
 CONCURRENCY_GROUP="pr-review-policy-recovery"
@@ -56,6 +57,9 @@ CONCURRENCY_GROUP="pr-review-policy-recovery"
 # comments still carried the string (measured while mutation-testing #1240).
 DERIVE_CALL='bash "$DERIVE_BIN" --derive-phase-4-requiredness'
 DERIVE_DEFAULT='DERIVE_BIN="${PR_REVIEW_POLICY_RECOVERY_DERIVE_BIN:-$ROOT/scripts/merge-clearance-gate.sh}"'
+# The rotation's clock is overridable for the suite; production must read the
+# real one, or a truncated pass starves the same tail of the list every time.
+ROTATE_DEFAULT='rotate_now="${PR_REVIEW_POLICY_RECOVERY_NOW:-$(date -u +%s)}"'
 
 FAILED=0
 
@@ -87,6 +91,18 @@ if [ -f "$SCRIPT" ]; then
     echo "      becomes unrefreshable and strands the PR it was meant to unstick."
     FAILED=1
   fi
+  if ! grep -qF "RETIRED_EXTERNAL_ID=\"$RETIRED_EXTERNAL_ID\"" "$SCRIPT"; then
+    echo "FAIL: $SCRIPT no longer stamps the retirement external_id '$RETIRED_EXTERNAL_ID'."
+    echo "      It is what makes the stand-down idempotent: once it is the newest run this"
+    echo "      lane owns, the sweep stops writing. Without a DISTINCT id the lane cannot"
+    echo "      tell 'I published a verdict' from 'I already handed the slot back', and"
+    echo "      posts a fresh neutral run every interval forever."
+    FAILED=1
+  fi
+  if [ "$RETIRED_EXTERNAL_ID" = "$RECOVERY_EXTERNAL_ID" ]; then
+    echo "FAIL: the recovery and retirement external_ids must differ."
+    FAILED=1
+  fi
   if ! grep -qF -e "$DERIVE_CALL" "$SCRIPT"; then
     echo "FAIL: $SCRIPT no longer calls $DERIVE_CALL."
     echo "      \`needs-external-review\` is applied by the same workflow run that reports"
@@ -94,6 +110,13 @@ if [ -f "$SCRIPT" ]; then
     echo "      event, not a clearance. Without the re-derivation this lane publishes a"
     echo "      green Label Gate over an unclassified PR — a total Phase 4 bypass wherever"
     echo "      codex.external_review_gate keeps its documented default of disabled."
+    FAILED=1
+  fi
+  if ! grep -qF "$ROTATE_DEFAULT" "$SCRIPT"; then
+    echo "FAIL: $SCRIPT no longer derives its sweep rotation from the clock."
+    echo "      The override exists for the test suite; production must rotate, or a pass"
+    echo "      truncated by the API allowance re-reads the same PRs every interval and"
+    echo "      never reaches the tail of the list."
     FAILED=1
   fi
   if ! grep -qF "$DERIVE_DEFAULT" "$SCRIPT"; then
@@ -179,19 +202,43 @@ expand_minutes = lambda do |field|
   out.uniq.sort
 end
 
+# The UNION across entries, not each entry alone. `0 * * * *` / `15 * * * *` /
+# `30 * * * *` / `45 * * * *` is a valid 15-minute cadence that no single
+# entry satisfies, and a required repo-lint that false-rejects a valid
+# workflow is its own defect (#1240 Codex round 4 P2). Only entries that fire
+# every hour of every day contribute: one restricted to some hours or weekdays
+# leaves the gap between its windows unbounded, so it cannot be counted toward
+# a cadence claim.
 schedule = triggers['schedule']
-fires_often_enough = schedule.is_a?(Array) && schedule.any? do |entry|
-  next false unless entry.is_a?(Hash)
-  parts = entry['cron'].to_s.strip.split(/\s+/)
-  next false unless parts.length == 5
-  next false unless parts[1..4].all? { |p| p == '*' }
-  minutes = expand_minutes.call(parts[0])
-  next false if minutes.nil? || minutes.empty?
+minutes = []
+unreadable_entry = false
+if schedule.is_a?(Array)
+  schedule.each do |entry|
+    next unless entry.is_a?(Hash)
+    parts = entry['cron'].to_s.strip.split(/\s+/)
+    next unless parts.length == 5
+    next unless parts[1..4].all? { |p| p == '*' }
+    selected = expand_minutes.call(parts[0])
+    if selected.nil?
+      unreadable_entry = true
+      next
+    end
+    minutes.concat(selected)
+  end
+end
+minutes = minutes.uniq.sort
+fires_often_enough = false
+unless minutes.empty?
   gaps = minutes.each_cons(2).map { |a, b| b - a }
   # The wrap from the last firing of one hour to the first of the next.
   gaps << (60 - minutes.last + minutes.first)
-  gaps.max <= MAX_RECOVERY_GAP_MINUTES
+  fires_often_enough = gaps.max <= MAX_RECOVERY_GAP_MINUTES
 end
+# An entry the reader cannot evaluate must not be papered over by the others:
+# it may be the one someone edited, and an interval that cannot be established
+# is exactly the case that must not pass silently.
+require_shape.call(!unreadable_entry,
+  "#{path} has a `schedule:` entry whose cron expression this check cannot evaluate; the sweep interval cannot be established, so it is refused rather than assumed")
 require_shape.call(fires_often_enough,
   "#{path} must declare a `schedule:` that fires at least every #{MAX_RECOVERY_GAP_MINUTES} minutes with `*` in every field but the minute — without it a dropped `pull_request` delivery leaves 'Self-Review Required' and 'Label Gate' pending, and a sparser cron keeps this check green while quietly replacing the documented #{MAX_RECOVERY_GAP_MINUTES}-minute recovery guarantee (#931)")
 

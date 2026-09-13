@@ -31,25 +31,61 @@
 # publishes them on the PR head through the Checks API. It publishes ONLY
 # where recovery is genuinely what is missing:
 #
-#   absent  — the context has NO check run at all on that head. This is the
-#             stuck-forever shape, and the only verdict that can be wrong here
-#             is one nobody would otherwise get.
-#   refresh — the newest reading already contains a run THIS lane published
-#             (matched by `external_id`, below). Once the lane owns a head it
-#             must keep owning it: GitHub requires the newest run of EACH
-#             lineage to be green, so a stale recovery red left standing beside
-#             a later native green strands the PR just as hard as the original
-#             gap (the two-lineage behaviour measured on #828/#835/#1216).
+#   absent     nothing has reported on that head. This is the stuck-forever
+#              shape, and the only verdict that can be wrong here is one
+#              nobody would otherwise get.
+#   refresh    only this lane has reported. It still owns the slot, so it
+#              keeps the verdict current: GitHub requires the newest run of
+#              EACH lineage to be green, so a stale recovery red left standing
+#              would strand the PR just as hard as the original gap (the
+#              two-lineage behaviour measured on #828 / #835 / #1216).
+#   standdown  the event-driven producer has reported and this lane's newest
+#              word is still a verdict. It publishes ONE non-blocking
+#              `neutral` run to retire its own lineage and hands the slot
+#              back. See § Ownership below.
+#   skip       nothing to do — the lane never touched this head, or it has
+#              already stood down.
 #
-# Anything else is SKIPPED. A head whose native job check already reported is
-# not touched, so the common case gains no second lineage and no new strand
-# surface. A read that fails is also skipped, and reported as an infra error:
+# A read that fails is skipped too, and reported as an infra error:
 # publishing into unknown state is how a recovery lane turns into an outage.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Ownership: the lane is a stand-in, never an owner
+# ─────────────────────────────────────────────────────────────────────
+#
+# The full contract is specs/pr_review_policy_recovery.md; the rule in one
+# line is that the event-driven producer always wins, and the lane's job is to
+# get out of its way cleanly.
+#
+# The earlier rule got this wrong and shipped as a defect (#1240 Codex round
+# 4): it asked only whether a RECOVERY run existed, so once the lane had
+# published anything the answer was `refresh` forever — including after the
+# event-driven job reported. A real case: auto-clear-blocking-labels.yml
+# validly removes `needs-external-review`, the `unlabeled` event publishes a
+# native green Label Gate, and the next sweep overwrote it with the lane's own
+# stale red, every 15 minutes, wedging a PR that had been legitimately
+# cleared.
+#
+# The rule now reads the two sides differently, because the two questions are
+# different:
+#
+#   the native side is PRESENCE. A native run on this head means the producer
+#   this lane substitutes for is working, so the lane yields — no comparison
+#   with it, in either direction. "Yield only if the native run is newer than
+#   mine" would be the same defect one ordering later, leaving the lane's
+#   verdict overriding the real one.
+#
+#   this lane's own side is RECENCY, and only to answer "have I already stood
+#   down?". Check runs are append-only and their ids increase monotonically,
+#   so the retirement is in force exactly while it is the highest-numbered run
+#   this lane owns. That is what stops the sweep posting a fresh neutral every
+#   15 minutes forever.
 #
 # `external_id` is the discriminator because it is exact. Actions job-native
 # check runs carry a UUID there and plain Checks-API POSTs carry an empty
-# string; this lane stamps its own constant, so "did this lane write it?" is a
-# string equality rather than an inference about UUID shape.
+# string; this lane stamps its own two constants, so "did this lane write it,
+# and was that its retirement?" is string equality rather than an inference
+# about UUID shape.
 #
 # A HEAD CARRIED BY MORE THAN ONE OPEN PR is published RED on both contexts
 # and evaluated for neither (#1240 Codex P1). Check-run verdicts attach to a
@@ -184,6 +220,11 @@ LABEL_GATE_CONTEXT="Label Gate"
 # Stamped into every check run this lane publishes and matched on the way back
 # in. Keep it in sync with scripts/ci/check_pr_review_policy_recovery.
 RECOVERY_EXTERNAL_ID="mergepath-pr-review-policy-recovery"
+# Stamped on the single non-blocking run that retires this lane's lineage once
+# the event-driven producer reports. A SECOND id, not a flag on the first:
+# check runs are append-only, so "have we already stood down?" can only be
+# answered by what the newest run of our lineage IS.
+RETIRED_EXTERNAL_ID="mergepath-pr-review-policy-recovery-superseded"
 DEPENDABOT_LOGIN='dependabot[bot]'
 
 had_infra_error=0
@@ -205,48 +246,121 @@ read_runs() {
     --jq '.check_runs[] | "\(.id) \(.external_id // "")"' | sort
 }
 
-# decide_from_runs <runs> — `absent`, `refresh` or `skip` for a run listing.
+# decide_from_runs <runs> — the OWNERSHIP decision for one (head, context).
+#
+# Prints exactly one of:
+#
+#   absent     nothing has reported. Publish the recovered verdict; this is
+#              the stuck-forever shape the lane exists for.
+#   refresh    only this lane has reported. It still owns the slot, so keep
+#              the verdict current against live state.
+#   standdown  the event-driven producer has now reported, and this lane's
+#              own newest run is a verdict. Retire that lineage with one
+#              non-blocking run and hand the slot back.
+#   skip       nothing for this lane to do — either it never touched the head,
+#              or it has already stood down.
+#
+# Decided by RECENCY, not presence (#1240 Codex round 4 P1). The earlier rule
+# asked only whether a recovery run existed, so once the lane had published
+# anything it answered `refresh` forever — including after the event-driven
+# job reported. A real case: auto-clear-blocking-labels.yml validly removes
+# `needs-external-review`, the `unlabeled` event publishes a native green
+# Label Gate, and the next sweep overwrote it with the lane's own stale red,
+# every 15 minutes, wedging a PR that was legitimately cleared. A stand-in for
+# a missing producer must stand down when the real one returns.
+#
+# Yielding SILENTLY is not enough either, and that is why `standdown` exists
+# rather than just widening `skip`. GitHub requires the newest run of EACH
+# lineage to be green (measured on #828 / #835, stranding #1216), so a lane
+# red left standing beside a later native green blocks just as hard as the
+# original gap. The lane can only retire its own lineage by publishing into
+# it, so it posts one `neutral` run — a conclusion branch protection already
+# treats as satisfied — stamped with a DIFFERENT external_id. That second id
+# is what makes the retirement idempotent: once it is the newest run of this
+# lane's lineage, the answer is `skip` and the sweep stops writing.
 decide_from_runs() {
   local runs="$1"
   if [ -z "$runs" ]; then
     printf 'absent'
     return 0
   fi
-  if printf '%s\n' "$runs" | grep -qE "^[0-9]+ $RECOVERY_EXTERNAL_ID\$"; then
+  # The native side is a PRESENCE test — any run that is not one of this
+  # lane's two stamps means the producer it substitutes for is working.
+  if ! printf '%s\n' "$runs" \
+    | awk -v a="$RECOVERY_EXTERNAL_ID" -v b="$RETIRED_EXTERNAL_ID" \
+        '$2 != a && $2 != b { found = 1 } END { exit found ? 0 : 1 }'; then
+    # Nothing but this lane has reported. It is the producer here.
     printf 'refresh'
     return 0
   fi
-  printf 'skip'
+  # This lane's own side is RECENCY, and only to answer whether it has already
+  # retired. Ids increase monotonically, so the highest id this lane owns is
+  # its newest word.
+  local newest_ours newest_retired
+  newest_ours=$(printf '%s\n' "$runs" | awk -v id="$RECOVERY_EXTERNAL_ID" '$2 == id {print $1}' | sort -n | tail -1)
+  newest_retired=$(printf '%s\n' "$runs" | awk -v id="$RETIRED_EXTERNAL_ID" '$2 == id {print $1}' | sort -n | tail -1)
+  if [ -z "$newest_ours" ] && [ -z "$newest_retired" ]; then
+    # Never touched this head, and the real producer has it. Leave it alone.
+    printf 'skip'
+    return 0
+  fi
+  if [ -n "$newest_retired" ] && { [ -z "$newest_ours" ] || [ "$newest_retired" -gt "$newest_ours" ]; }; then
+    printf 'skip'
+    return 0
+  fi
+  printf 'standdown'
 }
 
-# publish <pr> <head> <observed-runs> <context> <conclusion> <title> <summary>
+# publish <pr> <head> <observed-runs> <expected-sole-owner> <external-id> \
+#         <context> <conclusion> <title> <summary>
 #
 # One POST per verdict. A fresh POST rather than a PATCH of an earlier run:
 # every Checks-API POST for a head coalesces into the shared suite where the
 # newest run wins, and no run id has to cross a sweep boundary.
 #
-# Two fences run first, in this order, both immediately before the write so
-# the stale window is as small as it can be without conditional writes:
+# THREE fences run first, all immediately before the write so the stale window
+# is as small as it can be without conditional writes:
 #
 #   1. the head must still be the PR's head. Both verdicts come from LIVE PR
 #      state, so a push between evaluation and publication would pin
 #      fresh-state conclusions to a superseded SHA.
-#   2. the check runs for this (head, context) must be EXACTLY the set the
+#   2. this PR must still be the ONLY open PR carrying that head, or still not
+#      be — whichever the decision was taken under. The duplicate-head set is
+#      computed once from the opening listing, and a reopen or a force-push
+#      onto another open PR's head invalidates it mid-sweep (#1240 Codex
+#      round 4 P1). Fence 3 covers the artifact; this one covers the SET
+#      MEMBERSHIP that made publishing that artifact safe.
+#   3. the check runs for this (head, context) must be EXACTLY the set the
 #      decision was taken over. Anything else means a native run or a newer
 #      pass published while this one evaluated, and this verdict is stale. A
 #      label change moves no head SHA, so fence 1 cannot see that case and
-#      fence 2 is the one that catches it (#1240 Codex P1).
+#      fence 3 is the one that catches it (#1240 Codex round 1 P1).
 #
-# A failed re-read withholds too: unknown state is possibly-newer state.
+# A failed re-read withholds at every fence: unknown state is possibly-newer
+# state.
 publish() {
-  local pr="$1" head="$2" observed="$3" context="$4" conclusion="$5" title="$6" summary="$7"
-  local live="" current="" rc=0
+  local pr="$1" head="$2" observed="$3" sole_owner="$4" external_id="$5"
+  local context="$6" conclusion="$7" title="$8" summary="$9"
+  local live="" current="" owners="" live_sole="" rc=0
   if ! live=$(gh_api_scalar --shape sha "PR #$pr head" "repos/$REPO/pulls/$pr" --jq '.head.sha'); then
     infra "could not revalidate the head of PR #$pr before publishing '$context'"
     return 1
   fi
   if [ "$live" != "$head" ]; then
     log "PR #$pr moved from $head to $live during evaluation; publishing nothing for the superseded head"
+    return 1
+  fi
+  # One call, and it asks the question directly rather than re-walking the
+  # open-PR listing: which PRs carry this commit?
+  if ! owners=$(gh_api_scalar "open PRs carrying $head" \
+    "repos/$REPO/commits/$head/pulls" --jq '[.[] | select(.state == "open") | .number] | join(",")'); then
+    infra "could not revalidate which open PRs carry $head before publishing '$context'"
+    return 1
+  fi
+  live_sole=false
+  [ "$owners" = "$pr" ] && live_sole=true
+  if [ "$live_sole" != "$sole_owner" ]; then
+    log "PR #$pr: the set of open PRs carrying $head changed to [$owners] while this pass evaluated; withholding the now-stale verdict"
     return 1
   fi
   current=$(read_runs "$head" "$context") || rc=$?
@@ -261,7 +375,7 @@ publish() {
   local fields=(
     -f "name=$context"
     -f "head_sha=$head"
-    -f "external_id=$RECOVERY_EXTERNAL_ID"
+    -f "external_id=$external_id"
     -f "status=completed"
     -f "conclusion=$conclusion"
     -f "output[title]=$title"
@@ -274,6 +388,30 @@ publish() {
     return 1
   fi
   log "published '$context' = $conclusion on $head"
+}
+
+# stand_down <pr> <head> <observed-runs> <sole-owner> <context>
+#
+# Retire this lane's lineage for one (head, context) with a single `neutral`
+# run, so the event-driven producer's verdict is the only one that can block.
+# `neutral` is one of the conclusions branch protection already treats as
+# satisfied, and the distinct external_id makes the retirement idempotent —
+# the next pass reads it as this lane's newest word and answers `skip`.
+stand_down() {
+  local pr="$1" head="$2" observed="$3" sole="$4" context="$5"
+  publish "$pr" "$head" "$observed" "$sole" "$RETIRED_EXTERNAL_ID" "$context" neutral \
+    "$context — recovery lane stood down" \
+    "The event-driven job has reported '$context' for $head, so the pr-review-policy recovery lane is handing the slot back and retiring its own entries. This run is deliberately non-blocking; the event-driven verdict governs. See nathanjohnpayne/mergepath#931."
+}
+
+# pr_author <pr> — read the login on demand. It is only needed on the path
+# that actually publishes a Self-Review verdict, and a pass over a healthy
+# repository publishes nothing, so reading it per PR up front spent one REST
+# call per PR per 15 minutes for nothing (#1240 Codex round 4 P2). Prints
+# empty on a failed read, which simply means the Dependabot exemption does not
+# apply — the safe direction, since the exemption can only relax the gate.
+pr_author() {
+  gh_api_scalar "author of PR #$1" "repos/$REPO/pulls/$1" --jq '.user.login // ""' 2>/dev/null || printf ''
 }
 
 # requires_phase_4 <pr> — `true`, `false`, or rc 1 when the derivation could
@@ -311,6 +449,29 @@ fi
 # heads are ambiguous.
 dup_heads=$(printf '%s\n' "$open_prs" | cut -f2 | sort | uniq -d)
 
+# Rotate the starting point each pass. Every read this sweep makes counts
+# against a GITHUB_TOKEN allowance that is 1,000 requests per HOUR PER REPO,
+# and a no-op pass costs two calls per open PR, so a repository somewhere north
+# of ~120 open PRs cannot complete a pass. Walking the same order every time
+# would make that failure silent AND permanent for the tail of the list: the
+# same PRs would be recovered every pass and the same ones never. A rotation
+# derived from the clock — no stored cursor, nothing to get out of sync —
+# converts that into round-robin degradation, so every PR is reached within a
+# bounded number of passes. It changes nothing while the budget holds.
+# See specs/pr_review_policy_recovery.md § Budget (#1240 Codex round 4 P2).
+pr_count=$(printf '%s\n' "$open_prs" | grep -c .)
+# Overridable so the rotation is a testable function of a known instant rather
+# than of when the suite happens to run. Tests only; the fence asserts the
+# default is the clock.
+rotate_now="${PR_REVIEW_POLICY_RECOVERY_NOW:-$(date -u +%s)}"
+rotate=0
+[ "$pr_count" -gt 1 ] && rotate=$(( (rotate_now / 900) % pr_count ))
+# `head -n 0` is an error on BSD head, so a zero rotation skips the splice
+# entirely rather than relying on it being a no-op.
+if [ "$rotate" -gt 0 ]; then
+  open_prs=$(printf '%s\n' "$open_prs" | tail -n "+$((rotate + 1))"; printf '%s\n' "$open_prs" | head -n "$rotate")
+fi
+
 # The PR list is fed on FD 3, not on the loop's stdin. `gh` and the validator
 # both run inside this loop, and a command that reads stdin would otherwise
 # swallow the remaining PR numbers and end the sweep early after one PR.
@@ -318,19 +479,11 @@ while IFS=$'\t' read -r PR head <&3; do
   [ -n "$PR" ] || continue
 
   ambiguous=false
+  sole_owner=true
   if [ -n "$head" ] && printf '%s\n' "$dup_heads" | grep -qxF "$head"; then
     ambiguous=true
+    sole_owner=false
     infra "head $head is carried by more than one open PR; publishing red on both contexts rather than one PR's verdict"
-  fi
-
-  # The author is the one verdict input that cannot change, so it is the only
-  # one read up front. The BODY and the LABEL list are both read as late as
-  # possible, immediately before the verdict that consumes them — see the two
-  # arms below.
-  author=""
-  if ! author=$(gh_api_scalar "author of PR #$PR" "repos/$REPO/pulls/$PR" --jq '.user.login // ""'); then
-    infra "could not read PR #$PR"
-    continue
   fi
 
   # ── Self-Review Required ────────────────────────────────────────────
@@ -340,14 +493,16 @@ while IFS=$'\t' read -r PR head <&3; do
   if [ "$runs_rc" -ne 0 ]; then
     infra "could not read the '$SELF_REVIEW_CONTEXT' check runs on $head (PR #$PR); withholding"
   elif [ "$(decide_from_runs "$runs")" = "skip" ]; then
-    log "PR #$PR: '$SELF_REVIEW_CONTEXT' already reported on $head by another producer; not publishing"
+    log "PR #$PR: '$SELF_REVIEW_CONTEXT' on $head needs nothing from this lane; not publishing"
+  elif [ "$(decide_from_runs "$runs")" = "standdown" ]; then
+    stand_down "$PR" "$head" "$runs" "$sole_owner" "$SELF_REVIEW_CONTEXT" || true
   else
     decision=$(decide_from_runs "$runs")
     if [ "$ambiguous" = true ]; then
       conclusion="failure"
       title="$SELF_REVIEW_CONTEXT — ambiguous head"
       summary="More than one open PR carries $head, and one commit slot cannot carry both PRs' verdicts. Close or rebase one of them."
-    elif [ "$author" = "$DEPENDABOT_LOGIN" ]; then
+    elif [ "$(pr_author "$PR")" = "$DEPENDABOT_LOGIN" ]; then
       conclusion="skipped"
       title="$SELF_REVIEW_CONTEXT — Dependabot-exempt (recovery sweep)"
       summary="PR #$PR is authored by $DEPENDABOT_LOGIN, which the event-driven job exempts. Reported as skipped so the required context resolves the way the skipped job would have reported it."
@@ -385,7 +540,8 @@ while IFS=$'\t' read -r PR head <&3; do
     if [ -n "$conclusion" ]; then
       summary="$summary
 Published by the pr-review-policy recovery lane ($decision) because the \`pull_request\` run that normally reports this context did not. See nathanjohnpayne/mergepath#931."
-      publish "$PR" "$head" "$runs" "$SELF_REVIEW_CONTEXT" "$conclusion" "$title" "${summary:0:60000}" || true
+      publish "$PR" "$head" "$runs" "$sole_owner" "$RECOVERY_EXTERNAL_ID" \
+        "$SELF_REVIEW_CONTEXT" "$conclusion" "$title" "${summary:0:60000}" || true
     fi
   fi
 
@@ -398,7 +554,11 @@ Published by the pr-review-policy recovery lane ($decision) because the \`pull_r
     continue
   fi
   if [ "$(decide_from_runs "$runs")" = "skip" ]; then
-    log "PR #$PR: '$LABEL_GATE_CONTEXT' already reported on $head by another producer; not publishing"
+    log "PR #$PR: '$LABEL_GATE_CONTEXT' on $head needs nothing from this lane; not publishing"
+    continue
+  fi
+  if [ "$(decide_from_runs "$runs")" = "standdown" ]; then
+    stand_down "$PR" "$head" "$runs" "$sole_owner" "$LABEL_GATE_CONTEXT" || true
     continue
   fi
   decision=$(decide_from_runs "$runs")
@@ -442,7 +602,8 @@ Published by the pr-review-policy recovery lane ($decision) because the \`pull_r
   fi
   summary="$summary
 Published by the pr-review-policy recovery lane ($decision) because the \`pull_request\` run that normally reports this context did not. See nathanjohnpayne/mergepath#931."
-  publish "$PR" "$head" "$runs" "$LABEL_GATE_CONTEXT" "$conclusion" "$title" "${summary:0:60000}" || true
+  publish "$PR" "$head" "$runs" "$sole_owner" "$RECOVERY_EXTERNAL_ID" \
+    "$LABEL_GATE_CONTEXT" "$conclusion" "$title" "${summary:0:60000}" || true
 done 3<<EOF
 $open_prs
 EOF

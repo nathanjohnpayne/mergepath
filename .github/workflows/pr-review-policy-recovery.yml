@@ -68,9 +68,21 @@ name: PR Review Policy Recovery
 on:
   repository_dispatch:
     types: [pr-review-policy-recheck]
-  # 15-min cadence mirrors codex-p1-gate.yml and merge-clearance-gate.yml.
-  # Read-mostly and idempotent: nothing is published for a head whose contexts
-  # already reported, so a no-op sweep costs one listing per open PR.
+  # 15-min cadence mirrors codex-p1-gate.yml and merge-clearance-gate.yml, and
+  # scripts/ci/check_pr_review_policy_recovery asserts the INTERVAL rather than
+  # the presence of a cron — the union of the unrestricted entries must select
+  # minutes no more than 15 apart. A sparser schedule silently replaces the
+  # documented recovery guarantee, so it is refused.
+  #
+  # Read-mostly and idempotent. A pass over a repository whose contexts have
+  # all reported natively costs exactly two requests per open PR (the two
+  # check-run listings) plus one listing: every other read lives inside the
+  # publish path. Against the 1,000/hour-per-repository GITHUB_TOKEN
+  # allowance that bounds a healthy repository at roughly 120 open PRs; see
+  # specs/pr_review_policy_recovery.md § Budget for the full arithmetic, the
+  # clock-derived rotation that keeps a truncated pass from starving the same
+  # tail every time, and why folding these contexts into
+  # required-check-publisher.yml is the structural fix rather than this.
   schedule:
     - cron: "*/15 * * * *"
 

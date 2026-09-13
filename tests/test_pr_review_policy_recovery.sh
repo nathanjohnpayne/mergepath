@@ -85,6 +85,7 @@ fail() {
 
 REPO="acme/widget"
 RECOVERY_ID="mergepath-pr-review-policy-recovery"
+RETIRED_ID="mergepath-pr-review-policy-recovery-superseded"
 
 # ---------------------------------------------------------------------------
 # PATH-shim `gh`.
@@ -199,6 +200,25 @@ case "$endpoint" in
     fi
     [ -n "$src" ] || src="$GH_STUB_EMPTY_CHECKRUNS"
     emit "$src"
+    exit 0
+    ;;
+  */commits/*/pulls)
+    # "which open PRs carry this commit" — the set-membership fence. By
+    # DEFAULT it is derived from the same open-PR listing the sweep
+    # enumerated, so the fence agrees with the decision unless a test says
+    # otherwise; FIXTURE_HEADPULLS_<sha> models the set changing mid-sweep.
+    [ -z "${FAIL_HEADPULLS:-}" ] || { echo "gh: HTTP 502 (commit pulls)" >&2; printf '{"message":"Bad gateway"}\n'; exit 1; }
+    sha="${endpoint#*/commits/}"
+    sha="${sha%%/pulls*}"
+    key=$(printf '%s' "$sha" | tr -c 'A-Za-z0-9' '_')
+    f="FIXTURE_HEADPULLS_${key}"
+    if [ -n "${!f:-}" ]; then
+      emit "${!f}"
+      exit 0
+    fi
+    jq --arg sha "$sha" '[.[] | select(.head.sha == $sha) | {number: .number, state: "open"}]' \
+      "${FIXTURE_OPEN_PRS:?FIXTURE_OPEN_PRS unset}" > "$GH_STUB_COUNTER_DIR/headpulls.json"
+    emit "$GH_STUB_COUNTER_DIR/headpulls.json"
     exit 0
     ;;
   */pulls/*)
@@ -336,6 +356,17 @@ write_check_runs_second() {  # <context-slug> <sha> <external_id>...
   path="$WORKDIR/check-runs2-$slug-$key.json"
   _checkruns_file "$path" "$@"
   eval "export FIXTURE_CHECKRUNS2_${slug//-/_}_${key}=\"\$path\""
+}
+
+# The open PRs the membership fence sees at publication time, which a test can
+# make differ from the listing the sweep enumerated.
+write_head_pulls() {  # <sha> <pr>...
+  local sha="$1"; shift
+  local key path
+  key=$(printf '%s' "$sha" | tr -c 'A-Za-z0-9' '_')
+  path="$WORKDIR/head-pulls-$key.json"
+  printf '%s\n' "$@" | jq -R 'tonumber' | jq -s 'map({number: ., state: "open"})' > "$path"
+  eval "export FIXTURE_HEADPULLS_${key}=\"\$path\""
 }
 
 write_late_body() {  # <pr> <body>
@@ -503,6 +534,138 @@ if [ "$(published_conclusion 'Self-Review Required')" = "success" ] \
   pass "a context this lane already owns is refreshed from live state"
 else
   fail "the lane must refresh its own lineage (writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 18. OWNERSHIP: the event-driven producer has reported AFTER this lane did.
+#     The lane must not keep overwriting it — it retires its own lineage with
+#     one non-blocking `neutral` run and hands the slot back. Presence-based
+#     ownership answered `refresh` here forever and wedged legitimately
+#     cleared PRs (#1240 Codex round 4 P1).
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" "someone" "$NO_SELF_REVIEW_BODY"
+write_check_runs self-review "$HEAD_A" "$RECOVERY_ID" "3f0b2b3e-0000-4000-8000-000000000001"
+write_check_runs label-gate "$HEAD_A" "$RECOVERY_ID" "3f0b2b3e-0000-4000-8000-000000000002"
+run_sweep
+if [ "$(uniq_conclusions 'Self-Review Required')" = "neutral" ] \
+  && [ "$(uniq_conclusions 'Label Gate')" = "neutral" ] \
+  && [ "$(published_field 'Label Gate' external_id)" = "$RETIRED_ID" ]; then
+  pass "the lane stands down with a neutral run once the native producer reports"
+else
+  fail "a native run published after the lane's must make it stand down (writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 18b. The stand-down is IDEMPOTENT. Once the retirement is this lane's newest
+#      word, the next pass writes nothing at all — otherwise the sweep would
+#      post a fresh neutral every 15 minutes forever.
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" "someone" "$NO_SELF_REVIEW_BODY"
+write_check_runs self-review "$HEAD_A" "$RECOVERY_ID" "3f0b2b3e-0000-4000-8000-000000000001" "$RETIRED_ID"
+write_check_runs label-gate "$HEAD_A" "$RECOVERY_ID" "3f0b2b3e-0000-4000-8000-000000000002" "$RETIRED_ID"
+run_sweep
+if [ "$RC" -eq 0 ] && [ -z "$WRITES" ]; then
+  pass "a lane that has already stood down writes nothing on later passes"
+else
+  fail "the stand-down must be idempotent (rc=$RC, writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 18c. The lane yields on the PRESENCE of a native run, not on a comparison
+#      with it: here the lane's own run is NEWER (higher id) and it still
+#      stands down. A "native must be newer than ours" rule would leave the
+#      lane's verdict overriding the real producer's, which is the defect
+#      being fixed, only one ordering later.
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
+write_check_runs self-review "$HEAD_A" "3f0b2b3e-0000-4000-8000-000000000001" "$RECOVERY_ID"
+write_check_runs label-gate "$HEAD_A" "3f0b2b3e-0000-4000-8000-000000000002" "$RECOVERY_ID"
+run_sweep
+if [ "$(uniq_conclusions 'Self-Review Required')" = "neutral" ] \
+  && [ "$(published_field 'Self-Review Required' external_id)" = "$RETIRED_ID" ]; then
+  pass "the lane stands down on the presence of a native run even when its own is newer"
+else
+  fail "a native run must win regardless of ordering (writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 19. SET-MEMBERSHIP fence: another open PR takes on this head between the
+#     decision and the publication. The duplicate-head set was computed once
+#     from the opening listing, and the head re-read cannot see this — the
+#     head did not move, its ownership did (#1240 Codex round 4 P1).
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
+write_head_pulls "$HEAD_A" 7 9
+run_sweep
+if [ "$RC" -eq 0 ] && [ -z "$WRITES" ]; then
+  pass "a head that gained a second open PR mid-sweep gets no single-PR verdict"
+else
+  fail "the set-membership fence must withhold (rc=$RC, writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 19b. The membership read failing is unknown state, so it withholds too.
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
+export FAIL_HEADPULLS=1
+run_sweep
+if [ "$RC" -eq 1 ] && [ -z "$WRITES" ]; then
+  pass "an unreadable membership read withholds and reddens the sweep"
+else
+  fail "a failed membership read must fail closed (rc=$RC, writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 20. BUDGET: a pass over a repository whose contexts have all reported
+#     natively costs exactly two reads per PR — the two check-run listings.
+#     No author, body, label, head, membership or Phase 4 call is made,
+#     because none of them can change the outcome (#1240 Codex round 4 P2).
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
+write_check_runs self-review "$HEAD_A" "3f0b2b3e-0000-4000-8000-000000000001"
+write_check_runs label-gate "$HEAD_A" "3f0b2b3e-0000-4000-8000-000000000002"
+run_sweep
+per_pr_calls=$(grep -c 'check-runs?check_name=' "$WORKDIR/calls.log" || true)
+other_calls=$(grep -v 'check-runs?check_name=' "$WORKDIR/calls.log" | grep -c 'pulls' || true)
+if [ "$RC" -eq 0 ] && [ "$per_pr_calls" -eq 2 ] && [ "$other_calls" -eq 1 ]; then
+  pass "a fully no-op pass costs two check-run reads per PR plus the one listing"
+else
+  fail "a no-op pass must not read PR detail (checkruns=$per_pr_calls other=$other_calls rc=$RC)"
+fi
+
+# ---------------------------------------------------------------------------
+# 21. The sweep order ROTATES with the clock. If the API allowance is
+#     exhausted mid-pass, a fixed order would starve the same tail of the
+#     list every time — silently, and forever. Two instants a quarter-hour
+#     apart must start the pass at different PRs (#1240 Codex round 4 P2).
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A" "8:$HEAD_B"
+write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
+write_pr 8 "$HEAD_B" "someone" "$SELF_REVIEW_BODY"
+export PR_REVIEW_POLICY_RECOVERY_NOW=0
+run_sweep
+first_at_0=$(published_field 'Self-Review Required' head_sha | head -1)
+export PR_REVIEW_POLICY_RECOVERY_NOW=900
+run_sweep
+first_at_900=$(published_field 'Self-Review Required' head_sha | head -1)
+unset PR_REVIEW_POLICY_RECOVERY_NOW
+if [ "$first_at_0" = "$HEAD_A" ] && [ "$first_at_900" = "$HEAD_B" ]; then
+  pass "the sweep start rotates with the clock, so a truncated pass cannot starve the same tail"
+else
+  fail "the sweep order must rotate (at 0 started with $first_at_0, at 900 with $first_at_900)"
 fi
 
 # ---------------------------------------------------------------------------
