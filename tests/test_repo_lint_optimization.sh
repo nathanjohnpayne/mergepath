@@ -122,9 +122,15 @@ else
   # Comments are stripped first so a wrapper that merely mentions the helper
   # in prose is not counted as sourcing it.
   sourcing=$(for f in "$ROOT"/scripts/ci/check_*; do
-      # `|| true`: a non-matching wrapper is the common case, and under set -e
-      # its nonzero grep would abort the suite instead of failing an assertion.
-      sed 's/[[:space:]]*#.*$//' "$f" | grep -q 'ci-check-modes\.sh' && basename "$f" || true
+      # `grep -c`, not `grep -q`: under this suite's `set -o pipefail`, a
+      # quiet grep exits at the first match and `sed` takes SIGPIPE (141),
+      # which failed the `&&` and silently dropped check_doc_ownership and
+      # check_merge_clearance_gate from the derived set — leaving the subset
+      # assertion below passing for the wrong reason. Counting consumes the
+      # whole stream. `|| true` because a non-matching wrapper is the common
+      # case and its exit 1 would abort the suite under `set -e`.
+      hits=$(sed 's/[[:space:]]*#.*$//' "$f" | grep -c 'ci-check-modes\.sh' || true)
+      [ "${hits:-0}" -gt 0 ] && basename "$f" || true
     done | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
   # A SUBSET check, matching the assertion's own words: every sourcing wrapper
   # must be selected. Equality would be wrong — the graph also declares this
@@ -137,6 +143,28 @@ else
   else
     fail "ci-check-modes.sh must select every sourcing wrapper (sourcing $sourcing, selected $selected)"
   fi
+
+  # #931: the nudge wrapper owns two paths and nothing else does, so a change
+  # to either selects it alone rather than the full deep net.
+  selected=$(scope_value checks pull_request scripts/pr-review-policy-nudge.sh)
+  full=$(scope_value full pull_request scripts/pr-review-policy-nudge.sh)
+  if [ "$full" = "false" ] && [ "$selected" = '["check_pr_review_policy_nudge"]' ]; then
+    pass "a change to the nudge selects only its own wrapper"
+  else
+    fail "nudge subject should select only its wrapper (full=$full, selected=$selected)"
+  fi
+
+  # The other side of that: a SHARED helper must NOT be narrowed by one
+  # wrapper declaring it. scripts/lib/preflight-helpers.sh is sourced by
+  # coderabbit-wait.sh and phase-4b-review.sh as well, so it stays undeclared
+  # and keeps the fail-closed full deep net rather than selecting one caller.
+  for shared in scripts/lib/preflight-helpers.sh scripts/validate-pr-body.sh scripts/gh-as-author.sh; do
+    if [ "$(scope_value full pull_request "$shared")" = "true" ]; then
+      pass "$shared keeps the full deep net rather than a partial selection"
+    else
+      fail "$shared was narrowed to a partial selection; its other callers' deep suites would be skipped"
+    fi
+  done
 
   auto_clear_dependencies_ok=1
   for path in \
