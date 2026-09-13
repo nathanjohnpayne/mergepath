@@ -1928,6 +1928,16 @@ paths:
       - "tests/test_codex_p1_gate.sh"          # check_codex_p1_gate
       - "tests/test_pr_review_policy_recovery.sh"  # check_pr_review_policy_recovery (#931)
       - "scripts/pr-review-policy-recovery.sh"     # check_pr_review_policy_recovery subject (#931)
+      # ...and what that subject needs AT RUNTIME, declared HERE and not only
+      # on its own entry. The commit-path closure gate reads only the SELECTED
+      # target's direct requires, so a kit sync that carries the fence and its
+      # subject still has to carry what the subject loads, or the delegated
+      # suite dies on the source line and reds the consumer's lint (#1240
+      # CodeRabbit). pr-body-contract.sh/.mjs, reviewers-helpers.sh and
+      # blocking-labels.sh are already above for other checks; these two were
+      # the gap.
+      - "scripts/lib/gh-api-scalar.sh"             # recovery lane hard-sources it (#931)
+      - "scripts/validate-pr-body.sh"              # the recovery lane's Self-Review verdict executes it (#931)
       - "tests/test_review_feedback_accounting.sh"  # check_review_feedback_accounting (#1000)
       - "scripts/review-feedback-accounting.sh"  # check_review_feedback_accounting (#1000)
       - "scripts/render-feedback-archive.sh"  # check_review_feedback_accounting (#1000)

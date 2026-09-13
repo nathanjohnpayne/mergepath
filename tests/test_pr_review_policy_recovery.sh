@@ -619,7 +619,9 @@ write_check_runs self-review "$HEAD_A" "3f0b2b3e-0000-4000-8000-000000000001" "$
 write_check_runs label-gate "$HEAD_A" "3f0b2b3e-0000-4000-8000-000000000002" "$RECOVERY_ID"
 run_sweep
 if [ "$(uniq_conclusions 'Self-Review Required')" = "neutral" ] \
-  && [ "$(published_field 'Self-Review Required' external_id)" = "$RETIRED_ID" ]; then
+  && [ "$(uniq_conclusions 'Label Gate')" = "neutral" ] \
+  && [ "$(published_field 'Self-Review Required' external_id)" = "$RETIRED_ID" ] \
+  && [ "$(published_field 'Label Gate' external_id)" = "$RETIRED_ID" ]; then
   pass "the lane stands down on the presence of a native run even when its own is newer"
 else
   fail "a native run must win regardless of ordering (writes=[$WRITES])"
@@ -673,8 +675,12 @@ write_open_prs "7:$HEAD_A"
 write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
 write_head_pulls_with_closed "$HEAD_A" 7 9
 run_sweep
-if [ "$RC" -eq 0 ] && [ "$(published_conclusion 'Label Gate')" = "success" ]; then
-  pass "a closed PR sharing the head does not block recovery"
+if [ "$RC" -eq 0 ] \
+  && [ "$(published_conclusion 'Label Gate')" = "success" ] \
+  && [ "$(published_conclusion 'Self-Review Required')" = "success" ] \
+  && [ "$(published_field 'Label Gate' head_sha)" = "$HEAD_A" ] \
+  && [ "$(published_field 'Self-Review Required' head_sha)" = "$HEAD_A" ]; then
+  pass "a closed PR sharing the head does not block recovery of either context"
 else
   fail "a closed PR must not count as a co-owner (rc=$RC, writes=[$WRITES])"
 fi
