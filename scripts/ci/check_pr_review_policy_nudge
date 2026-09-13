@@ -28,6 +28,23 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+# Live assertions and an implementation regression suite are separable here,
+# so the two get explicit modes per docs/agents/testing-requirements.md
+# § Repo-lint execution: the fast lane takes --check, deep CI takes
+# --self-test, and the no-argument form still runs both so a consumer whose
+# repo_lint.yml arrives before this wrapper is unaffected by the skew.
+MODE_HELPER="$ROOT/scripts/lib/ci-check-modes.sh"
+if [ ! -f "$MODE_HELPER" ]; then
+  echo "check_pr_review_policy_nudge: ERROR scripts/lib/ci-check-modes.sh missing" >&2
+  exit 1
+fi
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: check_pr_review_policy_nudge [--check | --self-test]" >&2
+  exit 2
+fi
+
 SUBJECT="scripts/pr-review-policy-nudge.sh"
 TEST_SCRIPT="tests/test_pr_review_policy_nudge.sh"
 GATE_WORKFLOW=".github/workflows/pr-review-policy.yml"
@@ -64,12 +81,18 @@ CODE=$(sed 's/[[:space:]]*#.*$//' "$SUBJECT")
 # that can create a check run — `gh pr edit`, the one write here, cannot.
 GH_CALLS=$(printf '%s\n' "$CODE" | sed -e :a -e '/\\$/{N;s/\\\n//;ba' -e '}' | grep 'gh api' || true)
 
-# Every option that makes `gh api` non-GET, in both spaced and attached-value
-# forms. `-f` / `-F` / `--field` / `--raw-field` matter as much as `-X`: gh
-# switches the default method to POST as soon as any field option is present,
-# so a check-run writer needs no explicit method at all.
+# Every option that makes `gh api` non-GET. `-f` / `-F` / `--field` /
+# `--raw-field` matter as much as `-X`: gh's own help says "adding request
+# parameters will automatically switch the request method to POST", so a
+# check-run writer needs no explicit method at all.
+#
+# The short forms take NO suffix constraint. Requiring a space or `=` after
+# them let `-fbody=x`, `-Fname=x` and `-XPOST` through, which are valid
+# attached-value spellings gh accepts — the guard read as tight while missing
+# the shortest way to write the thing it forbids. On a `gh api` line a bare
+# `-X`, `-f` or `-F` at a word boundary is suspicious whatever follows it.
 if printf '%s\n' "$GH_CALLS" \
-  | grep -Eq -- '(^|[[:space:]])(-X|-f|-F|--method|--input|--field|--raw-field)([[:space:]]|=)'; then
+  | grep -Eq -- '(^|[[:space:]])(-[XfF]|--method|--input|--field|--raw-field)'; then
   echo "check_pr_review_policy_nudge: $SUBJECT issues a non-GET gh api call; the nudge must publish nothing" >&2
   exit 1
 fi
@@ -97,6 +120,11 @@ for var in CONTEXT_SELF_REVIEW CONTEXT_LABEL_GATE; do
     exit 1
   fi
 done
+
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 0 ]; then
+  echo "check_pr_review_policy_nudge: PASS (live assertions only; suite runs in deep CI)"
+  exit 0
+fi
 
 bash "$TEST_SCRIPT"
 

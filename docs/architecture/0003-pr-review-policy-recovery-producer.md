@@ -73,7 +73,9 @@ The script is hub-only. It takes `<PR#> [owner/repo]`, so one copy run from the 
 
 Recovery is now a human action rather than an automatic one. That is a real reduction in coverage against the incident #931 describes: a PR whose delivery is dropped while nobody is looking stays stuck until somebody notices. The trade accepted here is that the automatic version costs the obligation inventory above, and an automatic mechanism that is subtly wrong about ownership is worse than a manual one that is right—the concrete failure #1240 shipped and then fixed was a sweep that overwrote a legitimately-cleared green with a stale red every fifteen minutes.
 
-The mechanism carries no state, no schedule, no concurrency group, no fences, and no API budget worth modelling: one PR read, one check-run listing, one body edit, per invocation, by a human.
+The mechanism carries no state, no schedule, no concurrency group, and no API budget worth modelling: two PR reads, one check-run listing, one body edit, per invocation, by a human.
+
+It does carry one fence, and the distinction matters because the rejected design's fences are half the reason it was rejected. Those existed because it *published verdicts*: they arbitrated ownership between two producers of one context, over a check-run set, with a compare-and-swap and a residual write window that no available primitive could close. This one is an ordinary lost-update guard—the body write replaces the whole description, so it is re-read immediately beforehand and the run aborts if it moved. Every tool that rewrites a whole PR body needs that, verdicts or not, and it is one read and one comparison rather than a three-fence protocol. It aborts rather than rebuilding, because rebuilding would re-run the validators and reopen the same window one layer down.
 
 Option A remains available to a future reader only if the skipped-job bypass is addressed first. Nothing in this change prevents someone adding `workflow_dispatch` to `pr-review-policy.yml`; this record is what should stop them.
 
