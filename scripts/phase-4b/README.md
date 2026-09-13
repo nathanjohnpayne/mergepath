@@ -248,12 +248,26 @@ that re-run it after `CHANGES_REQUESTED` own round counting and escalation.
 
 ## Try it (dry-run, offline, with fake CLIs)
 
+Save this as a file and run it (`bash try-it.sh`) rather than pasting it into a
+shell — it uses strict mode and exits on failure by design.
+
 ```bash
+#!/usr/bin/env bash
+# A recipe whose whole claim is "offline" has to FAIL CLOSED when its offline
+# setup fails. Without the strict-mode preamble, a failed `mkdir`/`cat`/`chmod`
+# below would leave PATH pointing at a directory that does not exist, the real
+# `gh` would resolve, and the run would quietly perform a LIVE PR-body read.
+set -euo pipefail
+
 # The identity fence reads the PR body from the API on every run (#1143), so
 # an offline recipe has to serve one. This fake `gh` answers the body read and
 # returns a fixed head for everything else; nothing leaves the machine.
-mkdir -p /tmp/p4b-offline/bin
-cat > /tmp/p4b-offline/bin/gh <<'SH'
+# A private mktemp -d, not a predictable /tmp path: a leftover from an earlier
+# run, or another user's file at the same name, is exactly how the setup fails.
+P4B_OFFLINE="$(mktemp -d "${TMPDIR:-/tmp}/p4b-offline.XXXXXX")"
+trap 'rm -rf "$P4B_OFFLINE"' EXIT
+mkdir -p "$P4B_OFFLINE/bin"
+cat > "$P4B_OFFLINE/bin/gh" <<'SH'
 #!/usr/bin/env bash
 for a in "$@"; do
   case "$a" in
@@ -262,14 +276,24 @@ for a in "$@"; do
 done
 printf 'deadbeef\n'
 SH
-chmod +x /tmp/p4b-offline/bin/gh
+chmod +x "$P4B_OFFLINE/bin/gh"
+export PATH="$P4B_OFFLINE/bin:$PATH"
 
-printf 'verdict' > /tmp/diff.txt
-PATH=/tmp/p4b-offline/bin:$PATH \
-  CODEX_BIN=/path/to/fake-codex \
+# Verify rather than assume. Strict mode catches a setup step that RETURNS
+# non-zero; it does not catch one that succeeds into the wrong state (a fake
+# written but left non-executable, a PATH that does not contain it). Proving
+# which `gh` resolves covers both, and is the only check that actually states
+# the guarantee this recipe makes.
+[ "$(command -v gh)" = "$P4B_OFFLINE/bin/gh" ] || {
+  echo "offline setup failed; refusing to run against the real gh" >&2
+  exit 1
+}
+
+printf 'verdict' > "$P4B_OFFLINE/diff.txt"
+CODEX_BIN=/path/to/fake-codex \
   MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true \
   scripts/phase-4b-review.sh 123 --repo nathanjohnpayne/mergepath \
-    --author claude --head deadbeef --diff-file /tmp/diff.txt --dry-run
+    --author claude --head deadbeef --diff-file "$P4B_OFFLINE/diff.txt" --dry-run
 ```
 
 `--dry-run` reads and validates the PR body, then performs selection + adapter

@@ -408,6 +408,14 @@ if [ "${1:-}" = "api" ]; then
             fi
             if [ -n "${P4B_FAKE_PR_BODY_FILE2:-}" ] \
                && [ "$bcnt" -ge "${P4B_FAKE_PR_BODY2_FROM:-2}" ]; then
+              # Record that the EDITED body was actually served. A case whose
+              # pass arm is "the run succeeded" cannot tell a working fence
+              # from an edit that never happened, and the read counter alone
+              # does not close that: the reads still occur when the swap point
+              # is out of reach. This marker is the only evidence that the
+              # second body reached the orchestrator.
+              [ -z "${P4B_FAKE_PR_BODY_SWAPPED:-}" ] \
+                || printf 'served\n' >> "$P4B_FAKE_PR_BODY_SWAPPED"
               cat "$P4B_FAKE_PR_BODY_FILE2"
               exit 0
             fi
@@ -1774,10 +1782,22 @@ else fail "claude fallback target (rc=$rc): $out"; fi
 #
 # These drive the orchestrator for real. Every case passes --author, because
 # that is precisely the path that used to skip the check.
+# A MISSING fixture and a malformed body refuse with the same contract message,
+# so a typo'd path would make every refusal case below pass for the wrong
+# reason. Require the fixture to EXIST (empty is a legitimate fixture — case
+# (b) depends on it) and report a distinct, non-matching string when it does
+# not, so the case falls to its catch-all `fail` instead of its pass arm.
+p4b1143_fixture_ok() {  # <path-or-"">
+  [ -z "$1" ] || [ -f "$1" ]
+}
+
 P4B1143_BODY="$WORK/p4b1143-body.md"
 p4b1143_run() {  # p4b1143_run <body-file-or-""> <extra orchestrator args...>
   local bodyfile="$1"; shift
   local out rc=0
+  if ! p4b1143_fixture_ok "$bodyfile"; then
+    printf 'FIXTURE-MISSING %s' "$bodyfile"; return 0
+  fi
   set +e
   out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
     CLAUDE_BIN="$BIN/fake-claude-approve-usage" \
@@ -1908,6 +1928,13 @@ printf 'Authoring-Agent: codex\n\n## Self-Review\n\n- ok.\n' > "$P4B1143R2_BODY1
 p4b1143r2_run() {
   local pr="$1" fake="$2" from="$3" revwrap="$4"; shift 4
   local out rc=0
+  # Same fixture precondition as the round-1 runner, for the same reason: a
+  # missing body file reads to the orchestrator as an empty one, and an empty
+  # body refuses with a message these cases would happily match.
+  if ! p4b1143_fixture_ok "$P4B1143R2_BODY1" || ! p4b1143_fixture_ok "$P4B1143R2_BODY2"; then
+    printf 'FIXTURE-MISSING %s or %s' "$P4B1143R2_BODY1" "$P4B1143R2_BODY2"; return 0
+  fi
+  [ -x "$revwrap" ] || { printf 'REVIEWER-STUB-NOT-EXECUTABLE %s' "$revwrap"; return 0; }
   set +e
   out="$(env MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
     CLAUDE_BIN="$BIN/$fake" \
@@ -1921,6 +1948,7 @@ p4b1143r2_run() {
     P4B_FAKE_PR_BODY_FILE2="$P4B1143R2_BODY2" \
     P4B_FAKE_PR_BODY2_FROM="$from" \
     P4B_FAKE_PR_BODY_COUNT="$WORK/p4b1143r2-count-${pr}" \
+    P4B_FAKE_PR_BODY_SWAPPED="$WORK/p4b1143r2-swapped-${pr}" \
     "$@" \
     bash "$ORCH" "$pr" --repo o/r --head abc123 --diff-file "$DIFF" 2>&1)"
   rc=$?
@@ -1928,16 +1956,32 @@ p4b1143r2_run() {
   printf 'rc=%s %s' "$rc" "$out"
 }
 
-# `grep -c` exits 1 when the count is ZERO while still printing "0", so the
-# usual `$(grep -c ... || echo 0)` yields the two-line string "0\n0" and every
-# later `-eq` comparison on it is a syntax error the `if` swallows as false.
-# That is exactly the zero case these assertions care about, so count through
-# one helper that cannot be wrong about it.
-p4b1143r2_count() {  # <pattern> <file>
+# Counting, done so that a count which could not be TAKEN can never read as
+# zero. Two distinct traps meet here:
+#
+#   1. `grep -c` exits 1 when the count is legitimately ZERO while still
+#      printing "0", so `$(grep -c … || echo 0)` yields the two-line string
+#      "0\n0" and every later `-eq` on it is a syntax error the `if` swallows
+#      as false. `|| true` is therefore required, which means the STATUS
+#      cannot be the guard either.
+#   2. With the status unusable, "could not look" and "looked, found none"
+#      are indistinguishable unless something else separates them. STDOUT
+#      does: a real count is digits; grep absent, file absent and file
+#      unreadable all produce empty stdout.
+#
+# So judge the stdout SHAPE and fail closed on anything else. Returning 0 for
+# an unusable count would make the "filed nothing" assertion below pass for a
+# run that filed plenty — the same swallowed-failure class as trap 1, one
+# level up. `grep` is resolved through PATH on purpose: it is not at
+# /usr/bin/grep on every platform (NixOS, minimal containers), and $BIN holds
+# only this suite's `gh` and `fake-*` shims so it cannot be shadowed.
+p4b1143r2_count() {  # <pattern> <file> -> digits on stdout, or rc 1
   local n
-  n="$(/usr/bin/grep -c "$1" "$2" 2>/dev/null || true)"
-  n="$(printf '%s' "$n" | head -1 | tr -dc '0-9')"
-  printf '%s' "${n:-0}"
+  n="$(grep -c "$1" "$2" 2>/dev/null || true)"
+  case "$n" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$n"
 }
 
 # (g) The attack itself, caught at the FIRST approval-side effect. The body
@@ -1946,11 +1990,13 @@ p4b1143r2_count() {  # <pattern> <file>
 printf 'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n' > "$P4B1143R2_BODY2"
 : > "$WORK/p4b1143r2-issues-1144.log"
 got="$(p4b1143r2_run 1144 fake-claude-approve-p2-usage 2 "$P4B1143R2_GUARD")"
-_filed="$(p4b1143r2_count '^ARGV gh issue create' "$WORK/p4b1143r2-issues-1144.log")"
+_filed="$(p4b1143r2_count '^ARGV gh issue create' "$WORK/p4b1143r2-issues-1144.log")" || _filed=""
 case "$got" in
   rc=0*) fail "#1143: a mid-run Authoring-Agent flip to the reviewer's own agent still APPROVED: $got" ;;
   *"Authoring-Agent changed during review"*)
-    if [ "$_filed" -eq 0 ]; then
+    if [ -z "$_filed" ]; then
+      fail "#1143: could not count filed issues — this assertion proves nothing, do not read it as a pass"
+    elif [ "$_filed" -eq 0 ]; then
       pass "#1143: identity drift before the first approval-side effect refuses and files nothing"
     else
       fail "#1143: refused the drift but filed $_filed post-review issue(s) anyway"
@@ -1963,12 +2009,14 @@ esac
 #     head-drift path at that fence already performs.
 : > "$WORK/p4b1143r2-issues-1145.log"
 got="$(p4b1143r2_run 1145 fake-claude-approve-p2-usage 3 "$P4B1143R2_GUARD")"
-_filed="$(p4b1143r2_count '^ARGV gh issue create' "$WORK/p4b1143r2-issues-1145.log")"
-_closed="$(p4b1143r2_count '^CLOSE #' "$WORK/p4b1143r2-issues-1145.log")"
+_filed="$(p4b1143r2_count '^ARGV gh issue create' "$WORK/p4b1143r2-issues-1145.log")" || _filed=""
+_closed="$(p4b1143r2_count '^CLOSE #' "$WORK/p4b1143r2-issues-1145.log")" || _closed=""
 case "$got" in
   rc=0*) fail "#1143: identity drift in the pre-POST window still APPROVED: $got" ;;
   *"Authoring-Agent changed during review"*)
-    if [ "$_filed" -gt 0 ] && [ "$_closed" -eq "$_filed" ]; then
+    if [ -z "$_filed" ] || [ -z "$_closed" ]; then
+      fail "#1143: could not count filed/closed issues — this assertion proves nothing, do not read it as a pass"
+    elif [ "$_filed" -gt 0 ] && [ "$_closed" -eq "$_filed" ]; then
       pass "#1143: identity drift at the pre-POST fence closes this run's $_filed filed issue(s) as superseded"
     else
       fail "#1143: pre-POST identity drift left orphans (filed=$_filed closed=$_closed)"
@@ -2021,9 +2069,22 @@ P4B1143R2_POSTED="$WORK/p4b1143r2-posted-body.md"
 rm -f "$P4B1143R2_POSTED"
 got="$(p4b1143r2_run 1149 fake-claude-approve-usage 2 "$BIN/fake-gh-as-reviewer" \
   P4B_WRAPPER_LOG="$WORK/p4b1143r2-wrapper.log" P4B_WRAPPER_BODY="$P4B1143R2_POSTED")"
+# This is the ONE case whose pass arm is "the run succeeded", so it is the one
+# case a swap that never fired would satisfy vacuously: if the body never
+# changed, of course nothing refused. Prove the edit landed by requiring the
+# fake's own "I served the second body" marker.
+#
+# The read COUNTER is not sufficient evidence here, measured rather than
+# assumed: mutation H3 moves the swap point out of reach, and the reads still
+# happen — counter 2, marker absent — so a counter-based guard passed while the
+# case proved nothing. The marker is written on the serving branch itself, so
+# it cannot be satisfied by anything short of the edited body reaching the
+# orchestrator.
 case "$got" in
   rc=0*)
-    if [ -s "$P4B1143R2_POSTED" ]; then
+    if [ ! -s "$WORK/p4b1143r2-swapped-1149" ]; then
+      fail "#1143: the edited body was never served — this assertion would pass vacuously"
+    elif [ -s "$P4B1143R2_POSTED" ]; then
       pass "#1143: a mid-run body edit that leaves the identity alone still posts"
     else
       fail "#1143: identity-preserving edit exited 0 but posted nothing: $got"
