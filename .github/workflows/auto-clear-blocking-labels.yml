@@ -352,6 +352,19 @@ jobs:
                   --retract-unsafe-only "$PR" "$REPO"
                 protective_rc=$?
                 set -e
+                if [ "$protective_rc" -eq 4 ]; then
+                  # Exit 4 is the helper's benign not-ready verdict (#1159): a
+                  # standing auto-merge request the #1058 boundary positively
+                  # reports as outside it. Nothing was mutated and no dependency
+                  # is broken, so this must not set the infrastructure sentinel
+                  # or emit a per-PR failure diagnostic. The label still stays:
+                  # removing the last blocker while an arm stands would let
+                  # GitHub consume it, which is the hazard this retraction
+                  # exists to prevent. Every other nonzero keeps failing below.
+                  echo "::notice::PR #$PR carries a standing auto-merge request outside the #1058 queue boundary; leaving needs-external-review in place until it is dispositioned."
+                  echo "::endgroup::"
+                  continue
+                fi
                 if [ "$protective_rc" -ne 0 ]; then
                   echo "::error::Protective retraction failed rc=$protective_rc; refusing to remove needs-external-review from PR #$PR."
                   had_infra_error=1
@@ -801,6 +814,19 @@ jobs:
                   --retract-unsafe-only "$PR" "$REPO"
                 protective_rc=$?
                 set -e
+                if [ "$protective_rc" -eq 4 ]; then
+                  # Exit 4 is the helper's benign not-ready verdict (#1159): a
+                  # standing auto-merge request the #1058 boundary positively
+                  # reports as outside it. Nothing was mutated and no dependency
+                  # is broken, so this must not set the infrastructure sentinel
+                  # or emit a per-PR failure diagnostic. The label still stays:
+                  # removing the last blocker while an arm stands would let
+                  # GitHub consume it, which is the hazard this retraction
+                  # exists to prevent. Every other nonzero keeps failing below.
+                  echo "::notice::PR #$PR carries a standing auto-merge request outside the #1058 queue boundary; leaving needs-external-review in place until it is dispositioned."
+                  echo "::endgroup::"
+                  continue
+                fi
                 if [ "$protective_rc" -ne 0 ]; then
                   echo "::error::Protective retraction failed rc=$protective_rc; refusing to remove needs-external-review from PR #$PR."
                   had_infra_error=1

@@ -170,8 +170,59 @@ policy_snapshot_signature() {
   }' <<<"$1"
 }
 
+# Identity of the auto-merge REQUEST itself, which the PR tuple above does not
+# carry: an arm can be disabled and a different one enabled while head, base and
+# author stay put. Disabling and re-enabling always produces a fresh `enabledAt`,
+# so these three fields separate "the same standing request" from "a replacement
+# that appeared mid-run". Deliberately narrow -- `commitHeadline` and
+# `commitBody` are payload rather than identity, and comparing them would report
+# unrelated churn as a replacement.
+#
+# Every field is type-checked here because `valid_pr_shape` checks only that
+# `autoMergeRequest` is an object, so these three are exactly the fields nothing
+# upstream validates. Without that, a malformed request made jq abort mid-filter
+# and emit nothing -- and two such failures compared EQUAL, which read a
+# replacement as a standing arm and deferred it (a fail-open, #1239 CodeRabbit).
+# The signature therefore fails loudly instead of emitting a partial or empty
+# projection, and callers MUST check the status rather than the output: two
+# empty strings are two unknowns, never a match.
+arm_request_signature() {
+  jq -c '
+    def require($value; $types; $name):
+      if ($types | index($value | type)) then $value
+      else error("auto-merge request \($name) is \($value | type)") end;
+    if .autoMergeRequest == null then null
+    else
+      require(.autoMergeRequest; ["object"]; "payload") as $request
+      | require($request.enabledBy; ["object", "null"]; "enabledBy") as $enabler
+      | {
+          # Non-empty string, not merely well-typed: `enabledAt` is the field a
+          # re-enable always moves, so it is what makes one request identifiable
+          # as the same request. A request carrying none of it has no identity,
+          # and two identity-less arms comparing equal would be the same
+          # empty-equals-match fail-open one level up.
+          enabledAt: (require($request.enabledAt; ["string"]; "enabledAt")
+                      | if length > 0 then . else error("auto-merge request enabledAt is empty") end),
+          enabledBy: require(($enabler.login // null); ["string", "null"]; "enabledBy.login"),
+          mergeMethod: require($request.mergeMethod; ["string", "null"]; "mergeMethod")
+        }
+    end' <<<"$1"
+}
+
+# Classify a snapshot's auto-merge arm. The return code is a contract, because
+# the two nonzero outcomes are not the same kind of event (#1159):
+#   0  nothing to retract, or an arm deliberately left intact -- Dependabot's
+#      dedicated lane, or one proven inside the #1058 queue boundary (which also
+#      sets MERGEPATH_ARM_RETAINED=1).
+#   1  the arm's boundary status could not be established.
+#   2  the boundary classifier positively reported that the arm is OUTSIDE it,
+#      and policy therefore refuses to mutate the arm.
+# Code 2 is reserved for a verdict actually reached. Handing it back for a
+# classifier that never ran, or that failed while running, would let a broken
+# dependency read as a routine policy outcome downstream.
+# No path mutates the arm; the codes describe what was learned, not what was done.
 retract_snapshot_arm() {
-  local snapshot="$1" reason="$2" target_author queue_policy_rc
+  local snapshot="$1" reason="$2" target_author queue_policy_rc refusal_rc
   local queue_policy_token queue_source_token
   MERGEPATH_ARM_RETAINED=0
   valid_pr_shape "$snapshot" || {
@@ -195,6 +246,16 @@ retract_snapshot_arm() {
   # action, even when the head and base return to the same tuple. Preserve only
   # an arm proven inside the active queue boundary; every other armed state is
   # left unchanged and blocks continuation for explicit human/admin handling.
+  # merge-queue-arm-policy.sh splits verdicts from failures in its own exit
+  # codes, and this caller must preserve that split rather than reading every
+  # nonzero as one refusal: `0` proves the arm; `4` (rollout inactive) and `5`
+  # (not eligible) are positive verdicts that the arm is outside the boundary;
+  # `3` (unreadable API, missing or duplicated credential, malformed rollout
+  # config, unavailable library or tool) and `2` (usage) are the classifier
+  # failing to reach a verdict at all, which establishes nothing about the arm.
+  # A checkout with no classifier is the same kind of nothing: an absent helper
+  # is not evidence that no boundary covers the arm.
+  refusal_rc=1
   if [ -x "$ROOT/scripts/workflow/merge-queue-arm-policy.sh" ]; then
     queue_policy_token=${MERGEPATH_QUEUE_POLICY_TOKEN:-}
     queue_source_token=${MERGEPATH_QUEUE_SOURCE_TOKEN:-}
@@ -212,11 +273,18 @@ retract_snapshot_arm() {
         echo "approval continuation: $reason arm is protected by the #1058 merge-queue boundary; leaving it intact"
         return 0
         ;;
-      *) ;;
+      4|5)
+        refusal_rc=2
+        ;;
+      *)
+        echo "approval continuation: $reason queue-boundary classification failed (rc=$queue_policy_rc); the arm's boundary status is unknown" >&2
+        ;;
     esac
+  else
+    echo "approval continuation: $reason arm has no #1058 queue-boundary classifier in this checkout; its boundary status is unknown" >&2
   fi
   echo "approval continuation: refusing to mutate $reason arm because native disable has no exact-action precondition" >&2
-  return 1
+  return "$refusal_rc"
 }
 
 retract_latest_arm() {
@@ -292,6 +360,20 @@ if [ "$MODE" = "retract-only" ]; then
   # Otherwise another run can add an arm while policy materializes and the
   # protective-only path (used when AUTHOR_MERGE_TOKEN is absent) returns
   # without ever observing it.
+  # Only ONE shape is the standing arm #1159 is about: the PR was already armed
+  # when this pass opened, the bracketing readback succeeded and validated, and
+  # it describes the same PR tuple. Each branch below is a different event and
+  # leaves the flag clear:
+  #   * an unreadable or malformed readback means live PR state could not be
+  #     bracketed at all -- not ordinary not-readiness, whatever the arm was;
+  #   * an arm first observed BY the readback appeared DURING this continuation,
+  #     which is a concurrency signal, not a standing state;
+  #   * a moved head/base/author means the arm being judged is not the arm that
+  #     was classified, which the messages below already call unclassified;
+  #   * a REPLACED request -- the original disabled and another enabled while the
+  #     PR tuple stayed identical -- is the same concurrency event one field
+  #     deeper, and the tuple comparison alone cannot see it.
+  protective_standing_arm=0
   set +e
   protection_snapshot=$(read_pr)
   protection_rc=$?
@@ -304,14 +386,70 @@ if [ "$MODE" = "retract-only" ]; then
     protection_snapshot="$initial"
   elif [ "$(policy_snapshot_signature "$protection_snapshot")" != "$(policy_snapshot_signature "$initial")" ]; then
     echo "approval continuation: PR head/base/author changed during policy classification; treating the latest armed state as unclassified"
+  elif [ "$arm_enabled" = "true" ]; then
+    # Status first, output second. Comparing the outputs of two signature
+    # commands without checking whether either SUCCEEDED makes a double failure
+    # compare equal, which is the fail-open this guard exists to prevent.
+    protective_arm_identity=""
+    initial_arm_identity=""
+    if ! protective_arm_identity=$(arm_request_signature "$protection_snapshot") \
+       || ! initial_arm_identity=$(arm_request_signature "$initial"); then
+      echo "approval continuation: the auto-merge request is malformed, so the standing arm cannot be identified; treating the latest armed state as unclassified" >&2
+    elif [ "$protective_arm_identity" = "$initial_arm_identity" ]; then
+      protective_standing_arm=1
+    else
+      echo "approval continuation: the auto-merge request was replaced during policy classification; treating the latest armed state as unclassified"
+    fi
   fi
 
   if jq -e '.autoMergeRequest == null' >/dev/null 2>&1 <<<"$protection_snapshot"; then
     echo "approval continuation: no auto-merge request requires protective retraction"
     exit 0
   fi
-  retract_snapshot_arm "$protection_snapshot" "durable or unclassified" || \
-    infra_error "could not retract and verify the protective auto-merge request"
+  # An arm that was already standing when this pass opened, and that the #1058
+  # boundary positively reports as outside it, is a POLICY outcome rather than a
+  # broken dependency (#1159). Both callers of this mode enumerate every approved
+  # PR, and the scheduled one re-enters every five minutes, so reporting that
+  # refusal as an infrastructure error made the sweep permanently red on any repo
+  # holding one such PR -- burying the genuine infrastructure errors that
+  # reporting exists to surface. Not-ready is the truthful classification, and
+  # the one this branch already gives the other arm it may not touch: the proven
+  # queue-governed one immediately below. Neither path retracts, merges, or
+  # clears anything, so nothing that was blocked becomes unblocked.
+  #
+  # THREE things must hold, each established separately: the governing policy
+  # was resolved and names an author identity, a verdict the classifier actually
+  # reached (code 2, never a failure to reach one), and the standing-arm shape
+  # (protective_standing_arm, set above). Anything else -- an unresolvable
+  # policy, an unbracketable readback, an arm that appeared mid-run, a moved
+  # tuple, a classifier that failed or is absent -- is unclassified and still
+  # fails the sweep, because none of them establish what this PR's arm is.
+  protective_retraction_rc=0
+  retract_snapshot_arm "$protection_snapshot" "durable or unclassified" \
+    || protective_retraction_rc=$?
+  case "$protective_retraction_rc" in
+    0) ;;
+    2)
+      # Calling this a routine policy outcome presupposes that the governing
+      # policy was actually established. The two guards that establish it sit
+      # BELOW this mode's exit and so never run here -- the structural gap this
+      # branch has now produced findings from twice. Without a resolved policy
+      # there is no author_identity, so the author binding the whole
+      # classification rests on was never verified: a broken dependency, and the
+      # sweep must see it. Each cause names itself, so an operator reading exit 3
+      # can tell an unresolvable policy from an unbracketable readback.
+      [ "$policy_rc" -eq 0 ] || \
+        infra_error "could not resolve the governing base policy, so the standing auto-merge request's author binding is unverified"
+      [ -n "$expected_author" ] || \
+        infra_error "governing base policy names no author_identity, so the standing auto-merge request's author binding is unverified"
+      [ "$protective_standing_arm" -eq 1 ] || \
+        infra_error "could not retract and verify the protective auto-merge request"
+      not_ready "the standing auto-merge request is outside the #1058 queue boundary and cannot be retracted; it remains intact for explicit human or admin disposition"
+      ;;
+    *)
+      infra_error "could not retract and verify the protective auto-merge request"
+      ;;
+  esac
   [ "$MERGEPATH_ARM_RETAINED" -eq 0 ] \
     || not_ready "queue-governed arm remains active; protective classification made no mutation"
   exit 0
