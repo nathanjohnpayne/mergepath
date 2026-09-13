@@ -452,8 +452,8 @@ fi
 echo "--- 18b: both reported but TWO open PRs share the head -> nudge"
 # Check runs attach to a commit, so the other PR's contexts are in this list.
 run_nudge open sha18b "$VALID_BODY" "$BOTH" \
-  STUB_SHARERS='[{"state":"open","head":{"sha":"sha18b"}},{"state":"open","head":{"sha":"sha18b"}}]'
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "2 open PRs share head sha18b"; then
+  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18b"}},{"number":9,"state":"open","head":{"sha":"sha18b"}}]'
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "1 other PR(s) share head sha18b"; then
   pass "an ambiguous head nudges rather than trusting another PR's contexts"
 else
   fail "expected a nudge naming the shared head; rc=$RC wrote=$WROTE err='$ERR'"
@@ -467,16 +467,31 @@ else
   fail "expected a nudge on an unreadable sharer count; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
-echo "--- 18d: a CLOSED PR and a STACKED PR on the head do not make it ambiguous"
+echo "--- 18d: a STACKED PR whose head moved on does not make the head ambiguous"
 # commits/{sha}/pulls lists every PR the commit is reachable from, including a
 # stacked PR whose branch has advanced past it (#1240). Counting those would
-# disable the refusal entirely, so the filter is `.head.sha` AND open.
+# disable the refusal entirely, so the filter is `.head.sha`, not association.
+# PR 7 itself is in the response and must not count as its own sharer.
 run_nudge open sha18d "$VALID_BODY" "$BOTH" \
-  STUB_SHARERS='[{"state":"open","head":{"sha":"sha18d"}},{"state":"closed","head":{"sha":"sha18d"}},{"state":"open","head":{"sha":"other-head"}}]'
+  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18d"}},{"number":8,"state":"open","head":{"sha":"other-head"}}]'
 if [ "$RC" = 3 ] && [ "$WROTE" = 0 ]; then
-  pass "only OPEN PRs whose head IS this commit count; the ordinary refusal survives"
+  pass "a stacked PR at a different head does not count, and the ordinary refusal survives"
 else
   fail "expected rc=3 with no edit; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 18e: a CLOSED PR at this exact head DOES make it ambiguous -> nudge"
+# Check runs outlive the PR that produced them. A new PR reusing a closed PR's
+# head SHA inherits its `Self-Review Required` and `Label Gate`, so refusing
+# would hand it a green it was never classified for. The question is whether
+# the commit's check-run set is exclusively this PR's, not whether another PR
+# is still open.
+run_nudge open sha18e "$VALID_BODY" "$BOTH" \
+  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18e"}},{"number":6,"state":"closed","head":{"sha":"sha18e"}}]'
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "1 other PR(s) share head sha18e"; then
+  pass "a closed PR's leftover runs are not accepted as this PR's contexts"
+else
+  fail "expected a nudge naming the other PR; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
 echo "--- 19: a body ending inside an unterminated fence is nudged, with a warning"
@@ -496,6 +511,17 @@ if [ "$RC" = 0 ] && ! printf '%s' "$ERR" | grep -q "unterminated code fence"; th
   pass "the fence notice does not fire on ordinary bodies"
 else
   fail "the fence notice fired spuriously; err='$ERR'"
+fi
+
+echo "--- 19c: an unterminated TILDE fence warns too"
+# `~~~` opens a fence exactly as backticks do; counting only one character
+# left the warning silent on the other.
+UNCLOSED_TILDE=$(printf 'Authoring-Agent: claude\n\n## Self-Review\n- [x] Correctness: fine\n\n~~~\nnot closed\n')
+run_nudge open sha19c "$UNCLOSED_TILDE" "$NEITHER"
+if [ "$RC" = 0 ] && printf '%s' "$ERR" | grep -q "unterminated code fence"; then
+  pass "a tilde fence is recognized as well as a backtick fence"
+else
+  fail "expected the fence warning on a tilde fence; rc=$RC err='$ERR'"
 fi
 
 echo

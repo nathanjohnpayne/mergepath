@@ -150,12 +150,20 @@ if [ "${#MISSING[@]}" -eq 0 ]; then
   elif [ "$LIVE_HEAD" != "$HEAD_SHA" ]; then
     DOUBT="the head moved to $LIVE_HEAD after the check runs were listed on $HEAD_SHA"
   else
-    # Check runs attach to a COMMIT, not a PR. Two open PRs on one head share
-    # one set, so PR A's contexts satisfy PR B's presence test and B never
-    # gets nudged. specs/required_check_publisher.md takes the same position
-    # for its own per-commit slots: a head carried by more than one open PR is
-    # ambiguous. Filter on `.head.sha`, because commits/{sha}/pulls also lists
-    # a stacked PR whose branch merely contains the commit (#1240).
+    # Check runs attach to a COMMIT, not a PR, and they outlive the PR that
+    # produced them. So the question is not "does another OPEN PR share this
+    # head" but "is this commit's check-run set exclusively about this PR" —
+    # any other PR at this exact head, open or closed, may have left the runs
+    # being read. A closed one is the sharper case: its `Self-Review Required`
+    # and `Label Gate` sit on the commit forever, so a new PR reusing the SHA
+    # would inherit a green it was never classified for.
+    # specs/required_check_publisher.md takes the same red-until-disambiguated
+    # position for its own per-commit slots.
+    #
+    # `.head.sha` is still the filter, not mere association: commits/{sha}/pulls
+    # also lists a stacked PR whose branch merely CONTAINS the commit and has
+    # advanced past it, and counting those would disable the refusal entirely
+    # (#1240).
     #
     # Fetched raw and filtered by a real jq, because `gh api` has no `--arg`:
     # it takes a `--jq` program but exposes no way to bind a variable into it,
@@ -163,10 +171,11 @@ if [ "${#MISSING[@]}" -eq 0 ]; then
     # the program text instead would work here and is the wrong habit, so the
     # filter runs in a jq of its own.
     SHARERS=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" 2>/dev/null \
-      | jq --arg sha "$HEAD_SHA" '[.[] | select(.state == "open" and .head.sha == $sha)] | length') || SHARERS=""
+      | jq --arg sha "$HEAD_SHA" --argjson pr "$PR_NUMBER" \
+        '[.[] | select(.head.sha == $sha and .number != $pr)] | length') || SHARERS=""
     case "$SHARERS" in
       '' | *[!0-9]*) DOUBT="whether another open PR shares head $HEAD_SHA could not be determined" ;;
-      *) [ "$SHARERS" -le 1 ] || DOUBT="$SHARERS open PRs share head $HEAD_SHA, so the reported contexts may belong to another one" ;;
+      *) [ "$SHARERS" -eq 0 ] || DOUBT="$SHARERS other PR(s) share head $HEAD_SHA, so the reported contexts may belong to one of them" ;;
     esac
   fi
 
@@ -218,8 +227,14 @@ fi
 # else's description, which is a larger mutation than the one complained of.
 # The parity count is a heuristic and guards only this message, never a
 # decision.
-FENCE_LINES=$(printf '%s\n' "$STRIPPED" | grep -c '^[[:space:]]*```' || true)
-if [ $((FENCE_LINES % 2)) -ne 0 ]; then
+# Counted per fence character rather than together: `~~~` opens a fence just
+# as `\`\`\`` does, and a body can carry both. Either count landing odd is the
+# signal. This stays a heuristic — it does not track opening fence length, and
+# a tilde run quoted inside a backtick fence will trip it — which is why it
+# guards a message and nothing else.
+BACKTICK_FENCES=$(printf '%s\n' "$STRIPPED" | grep -c '^[[:space:]]*```' || true)
+TILDE_FENCES=$(printf '%s\n' "$STRIPPED" | grep -c '^[[:space:]]*~~~' || true)
+if [ $((BACKTICK_FENCES % 2)) -ne 0 ] || [ $((TILDE_FENCES % 2)) -ne 0 ]; then
   echo "pr-review-policy-nudge: this body ends inside an unterminated code fence, so the marker will render as literal code rather than being hidden. Nudging anyway." >&2
 fi
 
