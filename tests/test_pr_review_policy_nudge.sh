@@ -138,7 +138,9 @@ cat > "$TMP/bin/gh-as-author-stub.sh" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
 printf '%s\n' "$*" >> "${STUB_EDIT_LOG:?}"
-printf 'author_pat_present=%s\n' "$([ -n "${OP_PREFLIGHT_AUTHOR_PAT:-}" ] && echo yes || echo no)" >> "${STUB_EDIT_LOG:?}"
+printf 'author_pat_matches=%s\n' \
+  "$([ -n "${STUB_EXPECT_AUTHOR_PAT:-}" ] && [ "${OP_PREFLIGHT_AUTHOR_PAT:-}" = "$STUB_EXPECT_AUTHOR_PAT" ] && echo yes || echo no)" \
+  >> "${STUB_EDIT_LOG:?}"
 prev=""
 for a in "$@"; do
   if [ "$prev" = "--body-file" ]; then cp "$a" "${STUB_WRITTEN_BODY:?}"; fi
@@ -601,9 +603,13 @@ OP_PREFLIGHT_CREATED_AT_EPOCH=$(date +%s)
 OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat
 OP_PREFLIGHT_AUTHOR_PAT=fixture-author-pat
 CACHE
+# The fixture's reviewer and author values differ, and the stub compares
+# against the AUTHOR one: asserting mere presence would be satisfied by the
+# reviewer pat landing in the author variable.
 run_nudge open sha20 "$VALID_BODY" "$NEITHER" \
-  GH_TOKEN=ambient-reviewer-token MERGEPATH_AGENT=claude OP_PREFLIGHT_CACHE_DIR="$TMP/cache"
-if [ "$RC" = 0 ] && grep -q 'author_pat_present=yes' "$D/edit.log"; then
+  GH_TOKEN=ambient-reviewer-token MERGEPATH_AGENT=claude OP_PREFLIGHT_CACHE_DIR="$TMP/cache" \
+  STUB_EXPECT_AUTHOR_PAT=fixture-author-pat
+if [ "$RC" = 0 ] && grep -q 'author_pat_matches=yes' "$D/edit.log"; then
   pass "an ambient GH_TOKEN no longer suppresses the cached author credential"
 else
   fail "expected the author pat to reach the write; rc=$RC edit.log='$(cat "$D/edit.log")'"
