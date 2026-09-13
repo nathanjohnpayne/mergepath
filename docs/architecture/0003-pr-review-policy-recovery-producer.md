@@ -30,7 +30,7 @@ A dispatch entrance on the gate workflow would therefore hand anyone who can dis
 | --- | --- | --- |
 | A | Add `schedule` / `workflow_dispatch` to `pr-review-policy.yml` | Rejected: the skipped-job bypass above |
 | B | An independent recovery producer that re-derives and publishes both contexts | Rejected: see below. Implemented and measured in #1240 |
-| C | Fold both contexts into `required-check-publisher.yml` | Preferred end-state, deferred behind [#845](https://github.com/nathanjohnpayne/mergepath/issues/845) |
+| C | Fold both contexts into `required-check-publisher.yml` | Preferred end-state; already PR 5 of the #845 plan, blocked on the fleet wave tracked in [#979](https://github.com/nathanjohnpayne/mergepath/issues/979) |
 | D | Make recovery cause the canonical producer to re-evaluate | **Adopted** |
 
 ## Why the independent producer was rejected
@@ -81,4 +81,8 @@ Option A remains available to a future reader only if the skipped-job bypass is 
 
 **Option C is the structural answer.** `required-check-publisher.yml` already walks every open PR once and publishes three contexts. Folding these two into it amortizes one listing across five contexts instead of standing up a second independent sweep, and it puts every required context behind a single publisher with one ownership model—which is the same reason the inventory above exists: a second ownership model is the expensive part, not a second sweep.
 
-C is deferred, not rejected. The publisher work is staged in #845, and consolidating into a publisher that is still being built would couple #931's fix to that migration's schedule. The nudge is compatible with C and is not a step away from it: it adds no producer for C to absorb, and when C lands the nudge either remains useful as a manual re-evaluation or is deleted outright.
+C is deferred, not rejected, and it is already the plan's own next-but-one step: extracting `Label Gate` and `Self-Review Required` into the publisher is **PR 5** of the #845 migration, marked optional there and explicitly sequenced after PR 4.
+
+That sequence is blocked on propagation rather than on implementation. #979 measured it on 2026-08-13: `required-check-publisher.yml` present on the hub and absent from all nine consumers then surveyed, whose `merge-clearance-gate.yml` copies are byte-identical to one another—one frozen pre-#843 snapshot rather than a wave caught mid-flight. Flipping branch protection onto the publisher, or removing the native producers, would point required contexts at a producer nine repositories do not have; PR 4 in particular would leave a required context with no producer at all and no partial degradation to warn anyone. Consolidating #931's two contexts into a publisher in that state would couple this issue's fix to a fleet wave.
+
+The nudge is compatible with C and is not a step away from it: it adds no producer for C to absorb, and when PR 5 lands the nudge is either still useful as a manual re-evaluation or deleted outright.

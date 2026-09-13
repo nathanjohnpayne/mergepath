@@ -49,6 +49,14 @@ case "$*" in
     exit 0 ;;
   *"/pulls/"*)
     if [ "${STUB_PR_RC:-0}" -ne 0 ]; then echo "pull read failed" >&2; exit "$STUB_PR_RC"; fi
+    # The pre-write re-read asks for `.body` alone. STUB_LIVE_BODY_FILE lets a
+    # case return a DIFFERENT body there, simulating a concurrent edit.
+    case "$*" in
+      *--jq*.body*)
+        if [ -n "${STUB_LIVE_BODY_FILE:-}" ]; then cat "$STUB_LIVE_BODY_FILE"
+        else jq -r '.body // ""' "${STUB_PR_JSON_FILE:?}"; fi
+        exit 0 ;;
+    esac
     cat "${STUB_PR_JSON_FILE:?}"; exit 0 ;;
 esac
 echo "unexpected gh call: $*" >&2
@@ -83,6 +91,16 @@ esac
 exit 0
 STUB
 chmod +x "$TMP/bin/validate-hostile.sh"
+
+# Cannot run at all. Distinct from validate-hostile.sh, which runs and rejects:
+# 127 is infrastructure, and folding it into "invalid" leaves both sides of
+# every comparison nonzero so the refusal never fires.
+cat > "$TMP/bin/validate-broken.sh" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 127
+STUB
+chmod +x "$TMP/bin/validate-broken.sh"
 
 # Freezes the clock so the "same second as the last nudge" path is reachable
 # without waiting for one.
@@ -259,10 +277,13 @@ fi
 # --- 8-11: fail closed on every input it cannot trust ----------------------
 echo; echo "--- 8: a closed PR -> rc 1, no write"
 run_nudge closed sha888 "$VALID_BODY" "$NEITHER"
-if [ "$RC" = 1 ] && [ "$WROTE" = 0 ]; then
-  pass "a closed PR is refused"
+# The trailing assertion is not cosmetic bookkeeping: `die` takes the exit
+# code as its second argument, so a `$*` there silently appends the status to
+# every error line the operator reads.
+if [ "$RC" = 1 ] && [ "$WROTE" = 0 ] && ! printf '%s' "$ERR" | grep -q "not open 1"; then
+  pass "a closed PR is refused, and the message does not leak the exit code"
 else
-  fail "expected rc=1 with no edit; rc=$RC wrote=$WROTE"
+  fail "expected rc=1, no edit, and a clean message; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
 echo "--- 9: the PR read fails -> rc 2, no write"
@@ -307,6 +328,61 @@ if [ "$RC" = 1 ]; then
   pass "a non-numeric PR number is a usage error"
 else
   fail "expected rc=1 for a non-numeric PR number; got $RC"
+fi
+
+echo "--- 14: a validator that cannot RUN -> rc 2, no write (127 is infra, not 'invalid')"
+run_nudge open shaddd "$VALID_BODY" "$NEITHER" \
+  MERGEPATH_NUDGE_VALIDATE_BIN="$TMP/bin/validate-broken.sh"
+if [ "$RC" = 2 ] && [ "$WROTE" = 0 ] && printf '%s' "$ERR" | grep -q "could not run"; then
+  pass "a validator exiting 127 fails closed instead of reading as a nonzero-to-nonzero delta"
+else
+  fail "expected rc=2 with no edit and a could-not-run message; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 15: an identical marker line elsewhere in the body is PRESERVED"
+# A PR body documenting this mechanism legitimately contains the marker inside
+# a fenced block. Only a terminal marker is provenance; the rest is content.
+FENCED=$(printf 'Authoring-Agent: claude\n\n## Summary\nThe marker looks like this:\n\n```\n<!-- mergepath-recovery-nudge: 2024-05-05T05:05:05Z -->\n```\n\n## Self-Review\n- [x] Correctness: fine\n\n<!-- mergepath-recovery-nudge: 2020-01-01T00:00:00Z -->')
+run_nudge open shaeee "$FENCED" "$NEITHER"
+MARKERS=$(grep -c "mergepath-recovery-nudge:" "$D/written.txt" || true)
+if [ "$RC" = 0 ] && [ "$MARKERS" = 2 ] \
+  && grep -q "2024-05-05T05:05:05Z" "$D/written.txt" \
+  && ! grep -q "2020-01-01T00:00:00Z" "$D/written.txt"; then
+  pass "the fenced example survives; only the terminal marker is replaced"
+else
+  fail "expected the fenced marker kept and the terminal one replaced; rc=$RC markers=$MARKERS body='$(cat "$D/written.txt")'"
+fi
+
+echo "--- 16: a CRLF body still gets replace-not-append"
+# A body typed in GitHub's web UI comes back CRLF-terminated. A match anchored
+# without tolerating the \r silently degrades into append.
+CRLF=$(printf 'Authoring-Agent: claude\r\n\r\n## Self-Review\r\n- [x] Correctness: fine\r\n\r\n<!-- mergepath-recovery-nudge: 2020-01-01T00:00:00Z -->\r')
+run_nudge open shafff "$CRLF" "$NEITHER"
+MARKERS=$(grep -c "mergepath-recovery-nudge:" "$D/written.txt" || true)
+if [ "$RC" = 0 ] && [ "$MARKERS" = 1 ] && ! grep -q "2020-01-01T00:00:00Z" "$D/written.txt"; then
+  pass "a CRLF body's terminal marker is replaced, not appended to"
+else
+  fail "expected one fresh marker on a CRLF body; rc=$RC markers=$MARKERS body='$(cat "$D/written.txt")'"
+fi
+
+echo "--- 17: a concurrent body edit -> rc 5, no write"
+# The write replaces the whole description from a snapshot taken before four
+# validator invocations. Overwriting an author's edit made inside that window
+# is a body mutation far outside the one marker this script may make.
+printf 'Authoring-Agent: claude\n\n## Self-Review\n- [x] Correctness: an edit someone else just made\n' > "$TMP/live-body.txt"
+run_nudge open shaggg "$VALID_BODY" "$NEITHER" STUB_LIVE_BODY_FILE="$TMP/live-body.txt"
+if [ "$RC" = 5 ] && [ "$WROTE" = 0 ] && printf '%s' "$ERR" | grep -q "changed while this ran"; then
+  pass "a description edited under us is not overwritten"
+else
+  fail "expected rc=5 with no edit; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 17b: an unchanged body still writes (the guard must not block the normal path)"
+run_nudge open shahhh "$VALID_BODY" "$NEITHER"
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
+  pass "the re-read guard passes when nothing changed"
+else
+  fail "expected rc=0 with an edit; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
 echo

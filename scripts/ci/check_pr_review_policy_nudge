@@ -58,14 +58,27 @@ done
 # about check runs and POSTs — cannot satisfy or trip its own assertion.
 CODE=$(sed 's/[[:space:]]*#.*$//' "$SUBJECT")
 
-if printf '%s\n' "$CODE" | grep -Eq -- '(^|[^-])-X[[:space:]]|--method[[:space:]]|--input[[:space:]]'; then
+# Scan gh invocations, not the whole file: `-f` and `-F` are ordinary test and
+# rm operators elsewhere in the script. Backslash continuations are joined
+# first, or an option on a wrapped line goes unseen. `gh api` is the only verb
+# that can create a check run — `gh pr edit`, the one write here, cannot.
+GH_CALLS=$(printf '%s\n' "$CODE" | sed -e :a -e '/\\$/{N;s/\\\n//;ba' -e '}' | grep 'gh api' || true)
+
+# Every option that makes `gh api` non-GET, in both spaced and attached-value
+# forms. `-f` / `-F` / `--field` / `--raw-field` matter as much as `-X`: gh
+# switches the default method to POST as soon as any field option is present,
+# so a check-run writer needs no explicit method at all.
+if printf '%s\n' "$GH_CALLS" \
+  | grep -Eq -- '(^|[[:space:]])(-X|-f|-F|--method|--input|--field|--raw-field)([[:space:]]|=)'; then
   echo "check_pr_review_policy_nudge: $SUBJECT issues a non-GET gh api call; the nudge must publish nothing" >&2
   exit 1
 fi
 
-CHECK_RUN_LINES=$(printf '%s\n' "$CODE" | grep -c 'check-runs' || true)
-if [ "$CHECK_RUN_LINES" -ne 1 ]; then
-  echo "check_pr_review_policy_nudge: expected exactly one check-runs reference (the read) in $SUBJECT; found $CHECK_RUN_LINES" >&2
+# Occurrences, not matching lines: joining continuations above means one line
+# can now carry several references.
+CHECK_RUN_REFS=$(printf '%s\n' "$CODE" | grep -o 'check-runs' | grep -c '' || true)
+if [ "$CHECK_RUN_REFS" -ne 1 ]; then
+  echo "check_pr_review_policy_nudge: expected exactly one check-runs reference (the read) in $SUBJECT; found $CHECK_RUN_REFS" >&2
   exit 1
 fi
 

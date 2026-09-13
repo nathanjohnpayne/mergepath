@@ -47,10 +47,27 @@
 #   2 = infrastructure failure (gh read failed, validator or wrapper missing)
 #   3 = not needed — both contexts have already reported on the current head
 #   4 = refused — the edit would make an otherwise valid body fail Self-Review
+#   5 = aborted — the body changed under us; re-run against the newer one
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Preflight auto-source (#282), the same contract the other read-path helpers
+# use. Without it this script dies at the first read on a machine that has a
+# warm op-preflight cache but no usable ambient gh credential, before
+# gh-as-author.sh ever gets the chance to resolve one. The library sets the
+# OP_PREFLIGHT_* vars and deliberately does not assign GH_TOKEN, so the choice
+# of which token below is this script's: reads take the reviewer PAT, and the
+# single write resolves the author PAT inside the wrapper.
+if [ -z "${GH_TOKEN:-}" ] && [ -r "$ROOT/scripts/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$ROOT/scripts/lib/preflight-helpers.sh"
+  auto_source_preflight
+fi
+GH_TOKEN="${GH_TOKEN:-${OP_PREFLIGHT_REVIEWER_PAT:-}}"
+export GH_TOKEN
+
 GH_AS_AUTHOR="${MERGEPATH_NUDGE_GH_AS_AUTHOR:-$ROOT/scripts/gh-as-author.sh}"
 VALIDATE="${MERGEPATH_NUDGE_VALIDATE_BIN:-$ROOT/scripts/validate-pr-body.sh}"
 
@@ -65,7 +82,9 @@ CONTEXT_LABEL_GATE="Label Gate"
 # so a second attempt has to write different bytes to fire the workflow at all.
 MARKER_PREFIX="mergepath-recovery-nudge:"
 
-die() { echo "pr-review-policy-nudge: $*" >&2; exit "${2:-1}"; }
+# `$1`, not `$*`: the second argument is the exit code, and `$*` printed it
+# as a trailing word on every error line.
+die() { echo "pr-review-policy-nudge: $1" >&2; exit "${2:-1}"; }
 
 PR_NUMBER="${1:-}"
 REPO="${2:-}"
@@ -124,7 +143,17 @@ fi
 # preceded it; command substitution strips those trailing newlines, so a
 # repeated nudge does not grow the body by a blank line each time. Nothing
 # above the tail is touched.
-STRIPPED=$(printf '%s' "$OLD_BODY" | grep -v -e "^<!-- $MARKER_PREFIX .* -->$" || true)
+# Remove ONLY a terminal marker. A blanket `grep -v` would also delete an
+# identical line anywhere else in the body — a fenced example documenting this
+# very marker, say — and body content outside the marker is not this script's
+# to touch. The `\r` strip is because a body typed in GitHub's web UI comes
+# back CRLF-terminated, which would otherwise defeat the match and turn
+# replace-not-append into append.
+STRIPPED=$OLD_BODY
+LAST_LINE=$(printf '%s' "$OLD_BODY" | tail -n 1 | tr -d '\r')
+case "$LAST_LINE" in
+  "<!-- $MARKER_PREFIX "*" -->") STRIPPED=$(printf '%s' "$OLD_BODY" | sed '$d') ;;
+esac
 new_body_for_stamp() { printf '%s\n\n<!-- %s %s -->' "$STRIPPED" "$MARKER_PREFIX" "$1"; }
 NEW_BODY=$(new_body_for_stamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
 
@@ -145,7 +174,7 @@ fi
 # an invalid body is exactly the state a red `Self-Review Required` should
 # report. The rule is that this edit must not be what breaks it: whatever the
 # original body passes, the nudged body must pass too.
-validate_rc() {  # <body> [flag...]  -> the validator's exit status
+validate_rc() {  # <body> [flag...]  -> the validator's raw exit status
   local body=$1; shift
   local rc=0
   printf '%s' "$body" | bash "$VALIDATE" "$@" >/dev/null 2>&1 || rc=$?
@@ -157,12 +186,38 @@ NEW_FULL=$(validate_rc "$NEW_BODY")
 OLD_SELF_REVIEW=$(validate_rc "$OLD_BODY" --self-review-only)
 NEW_SELF_REVIEW=$(validate_rc "$NEW_BODY" --self-review-only)
 
+# scripts/validate-pr-body.sh's contract is 0 valid, 1 invalid, 2 usage. Any
+# other status — 126/127 from a broken interpreter, a missing lib, an
+# unexecutable file — is infrastructure, not a verdict. Folding it into
+# "invalid" would leave both sides of every comparison nonzero, the refusal
+# below would never fire, and the edit would go out with the invariant never
+# actually evaluated: the same "a helper returns the same value for failed and
+# for a legitimate answer" shape the invariant exists to prevent.
+for rc in "$OLD_FULL" "$NEW_FULL" "$OLD_SELF_REVIEW" "$NEW_SELF_REVIEW"; do
+  case "$rc" in
+    0 | 1) ;;
+    *) die "PR-body validation could not run (validator exited $rc); refusing to edit a body it cannot check" 2 ;;
+  esac
+done
+
 if { [ "$OLD_FULL" -eq 0 ] && [ "$NEW_FULL" -ne 0 ]; } \
   || { [ "$OLD_SELF_REVIEW" -eq 0 ] && [ "$NEW_SELF_REVIEW" -ne 0 ]; }; then
   die "the nudge marker would make this body fail PR-body validation (full $OLD_FULL->$NEW_FULL, self-review $OLD_SELF_REVIEW->$NEW_SELF_REVIEW); refusing to edit" 4
 fi
 
 # --- the one write ---------------------------------------------------------
+# The author-wrapped body write replaces the WHOLE description, and NEW_BODY
+# was derived from a snapshot taken before four validator invocations. An
+# author or bot editing the description inside that window would be silently
+# overwritten, which is a body mutation well outside the one marker this
+# script is entitled to make. Abort rather than rebuild: rebuilding re-runs
+# the validators and reopens the same window one layer down.
+LIVE_BODY=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.body // ""' 2>/dev/null) \
+  || die "could not re-read $REPO#$PR_NUMBER before writing" 2
+if [ "$LIVE_BODY" != "$OLD_BODY" ]; then
+  die "the PR body changed while this ran; refusing to overwrite the newer description — re-run to nudge against it" 5
+fi
+
 BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/pr-review-policy-nudge.XXXXXX")
 trap 'rm -f "$BODY_FILE"' EXIT
 printf '%s\n' "$NEW_BODY" >"$BODY_FILE"
