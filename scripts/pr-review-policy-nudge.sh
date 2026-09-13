@@ -141,9 +141,11 @@ PR_CREATED_AT=$(printf '%s' "$PR_JSON" | jq -r '.created_at // ""')
 #     Actions, so a same-named run from another App never satisfies them and
 #     must not satisfy this check either. That confusion is #1213, one layer up.
 #
-#   associated with THIS PR — check runs attach to a COMMIT and outlive the PR
-#     that produced them, so two open PRs on one head would otherwise satisfy
-#     each other's presence test.
+#   associated with THIS PR ALONE — check runs attach to a COMMIT, and the
+#     association lists all open PRs sharing that head. A run for another
+#     open PR can name this PR and start after it was created, so membership
+#     plus the time floor below cannot settle a multiply shared head. Treat
+#     those runs as uncertain and nudge instead of refusing.
 #
 #   started AFTER this PR existed — because the association above is NOT
 #     provenance. `.pull_requests` lists the currently-open PRs sharing the
@@ -164,7 +166,7 @@ NAMES=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" 2>/dev/null
       [.[].check_runs[]]
       | .[]
       | select(.app.slug == "github-actions")
-      | select([.pull_requests[]?.number] | index($pr))
+      | select([.pull_requests[]?.number] == [$pr])
       | select($created == "" or (.started_at // "") >= $created)
       | .name') \
   || die "could not list check runs on $HEAD_SHA" 2
@@ -180,7 +182,7 @@ if [ "${#MISSING[@]}" -eq 0 ]; then
   # did not need it costs one workflow run; refusing one that did defeats the
   # whole tool. So where the refusal cannot establish its premise, it nudges.
   #
-  # The per-run association above already answers "are these contexts ours".
+  # The per-run filters above exclude ambiguous and pre-creation contexts.
   # One thing can still make that answer stale: the head moved after it was
   # read, so the listing described a superseded commit and "nothing to recover"
   # would be about the wrong commit. Confirm it LAST, with no request after —

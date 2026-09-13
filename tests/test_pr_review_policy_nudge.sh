@@ -483,9 +483,10 @@ fi
 # The refusal is an optimization, not a safety property: nudging a PR that did
 # not need it costs one workflow run, refusing one that did defeats the tool.
 # So wherever the refusal's premise is uncertain it must nudge instead. These
-# four pin that direction, and case 18d pins that it does not over-fire.
-# Presence is now per-run: the canonical app AND an association with this PR.
-# 18b/18e/18h are the cases that filter can see and a name-only test cannot.
+# cases pin that direction; case 21b preserves refusal for an unambiguous PR.
+# Presence is per-run: the canonical app, this PR alone, and a start after
+# PR creation. Every raw fixture below supplies a valid timestamp so the
+# app/association cases fail on their intended predicate, not the time floor.
 echo "--- 18a: both reported but the head MOVED -> nudge, do not refuse"
 run_nudge open sha18a "$VALID_BODY" "$BOTH" STUB_LIVE_HEAD=sha18a-new
 if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "the head moved to sha18a-new"; then
@@ -496,11 +497,23 @@ fi
 
 echo "--- 18b: the contexts belong to ANOTHER open PR at this head -> nudge"
 run_nudge open sha18b "$VALID_BODY" "$BOTH" \
-  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"github-actions"},"pull_requests":[{"number":9}]},{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[{"number":9}]}]}'
+  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"github-actions"},"pull_requests":[{"number":9}],"started_at":"2026-06-01T00:00:00Z"},{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[{"number":9}],"started_at":"2026-06-01T00:00:00Z"}]}'
 if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
   pass "another open PR's contexts at a shared head are not read as this PR's"
 else
   fail "expected a nudge; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 18d: both open PRs are associated with recent runs -> nudge"
+# Associations name every open PR sharing the head, not the PR that caused
+# the run. A run for PR 9 can start after PR 7 was created and name both, so
+# neither membership nor the timestamp establishes PR 7 was evaluated.
+run_nudge open sha18d "$VALID_BODY" "$BOTH" \
+  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"github-actions"},"pull_requests":[{"number":7},{"number":9}],"started_at":"2026-06-01T00:00:00Z"},{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[{"number":7},{"number":9}],"started_at":"2026-06-01T00:00:00Z"}]}'
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
+  pass "recent runs associated with multiple open PRs do not justify refusal"
+else
+  fail "expected a nudge for an ambiguous shared head; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
 echo "--- 18c: the head re-read fails -> nudge (unknown is not 'nothing to do')"
@@ -518,7 +531,7 @@ echo "--- 18e: a CLOSED PR's leftover runs carry no association -> nudge"
 # commits/{sha}/pulls cannot see this, because it omits closed PRs for a
 # commit off the default branch.
 run_nudge open sha18e "$VALID_BODY" "$BOTH" \
-  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"github-actions"},"pull_requests":[]},{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[]}]}'
+  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"github-actions"},"pull_requests":[],"started_at":"2026-06-01T00:00:00Z"},{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[],"started_at":"2026-06-01T00:00:00Z"}]}'
 if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
   pass "a closed PR's unassociated runs are not accepted as this PR's contexts"
 else
@@ -529,7 +542,7 @@ echo "--- 18h: same names from ANOTHER App -> nudge"
 # Branch protection pins these contexts to GitHub Actions, so a same-named run
 # from another App never satisfies them and must not satisfy this check either.
 run_nudge open sha18h "$VALID_BODY" "$BOTH" \
-  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"some-other-app"},"pull_requests":[{"number":7}]},{"name":"Label Gate","app":{"slug":"some-other-app"},"pull_requests":[{"number":7}]}]}'
+  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"some-other-app"},"pull_requests":[{"number":7}],"started_at":"2026-06-01T00:00:00Z"},{"name":"Label Gate","app":{"slug":"some-other-app"},"pull_requests":[{"number":7}],"started_at":"2026-06-01T00:00:00Z"}]}'
 if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
   pass "a foreign App's same-named runs do not count as the canonical producer reporting"
 else
@@ -628,10 +641,10 @@ else
   fail "expected a nudge; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
-echo "--- 21b: runs started AFTER the PR still count (the guard must not over-fire)"
+echo "--- 21b: recent runs associated ONLY with this PR still count"
 run_nudge open sha21b "$VALID_BODY" "$BOTH"
 if [ "$RC" = 3 ] && [ "$WROTE" = 0 ]; then
-  pass "the provenance guard does not reject this PR's own runs"
+  pass "the time and association guards preserve the ordinary refusal"
 else
   fail "expected rc=3 with no edit; rc=$RC wrote=$WROTE err='$ERR'"
 fi
