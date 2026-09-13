@@ -1104,6 +1104,52 @@ else
   echo "  FAIL: rc=3 from codex-review-check.sh must surface as job failure (sentinel + final exit)" >&2
 fi
 
+# #1159: the protective retraction helper has a THIRD exit code. 4 is its
+# benign not-ready verdict -- a standing auto-merge request the #1058 boundary
+# reports as outside it, with nothing mutated and no dependency broken. Both
+# label-clear paths used to fold it into the generic `-ne 0` infrastructure
+# branch, which set the sentinel and reddened the whole run for a PR where
+# nothing was wrong. The label must still NOT be removed (an arm GitHub could
+# consume the moment the last blocker goes), so this asserts all four halves of
+# that contract, per call site: the branch exists, it is evaluated BEFORE the
+# generic failure branch (after it, it would be dead code), it records no
+# failure, and it still skips the removal.
+# `|| true` on both: a missing branch is the very thing this asserts, and under
+# `set -e` an empty grep would abort the whole checker instead of reporting it
+# -- taking the remaining assertions down with it. (Caught by mutation MW1.)
+eq4_lines=$(grep -n '\[ "\$protective_rc" -eq 4 \]' "$WORKFLOW" | cut -d: -f1 || true)
+ne0_lines=$(grep -n '\[ "\$protective_rc" -ne 0 \]' "$WORKFLOW" | cut -d: -f1 || true)
+# shellcheck disable=SC2206  # deliberate word-splitting of newline-separated line numbers
+eq4_arr=($eq4_lines)
+# shellcheck disable=SC2206
+ne0_arr=($ne0_lines)
+protective_rc4_ok=1
+if [ "${#eq4_arr[@]}" -ne 2 ] || [ "${#ne0_arr[@]}" -ne 2 ]; then
+  protective_rc4_ok=0
+else
+  for idx in 0 1; do
+    eq4_line=${eq4_arr[$idx]}
+    ne0_line=${ne0_arr[$idx]}
+    if [ "$eq4_line" -ge "$ne0_line" ]; then
+      protective_rc4_ok=0
+      continue
+    fi
+    branch_body=$(sed -n "${eq4_line},$((ne0_line - 1))p" "$WORKFLOW")
+    if grep -qE '^[[:space:]]*had_infra_error=1([[:space:]]|$)' <<<"$branch_body" \
+       || grep -qE '^[[:space:]]*failing_prs=' <<<"$branch_body" \
+       || ! grep -qE '^[[:space:]]*continue([[:space:]]|$)' <<<"$branch_body"; then
+      protective_rc4_ok=0
+    fi
+  done
+fi
+if [ "$protective_rc4_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both label-clear paths treat protective rc=4 as benign before the failure branch, without clearing the label (#1159)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: each label-clear path must handle protective rc=4 ahead of the generic failure branch, set no infra sentinel, and still skip the label removal (#1159)" >&2
+fi
+
 # ── Test 3: self-fire loop guard present
 if grep -qE "github\.event\.action == 'unlabeled'" "$WORKFLOW" && \
    grep -qE "github\.event\.label\.name == 'needs-external-review'" "$WORKFLOW"; then
