@@ -212,6 +212,13 @@ fi
 # overwritten, which is a body mutation well outside the one marker this
 # script is entitled to make. Abort rather than rebuild: rebuilding re-runs
 # the validators and reopens the same window one layer down.
+#
+# This NARROWS the window; it does not close it. GitHub exposes no conditional
+# write for the pull-request update endpoint, so an edit landing between this
+# read and the write below is still overwritten. What the check buys is the
+# large, self-inflicted part of the window — the four validator invocations
+# and the check-run listing — leaving only the round trip. That residual is
+# the floor for any whole-body write, and it is accepted rather than solved.
 LIVE_BODY=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.body // ""' 2>/dev/null) \
   || die "could not re-read $REPO#$PR_NUMBER before writing" 2
 if [ "$LIVE_BODY" != "$OLD_BODY" ]; then

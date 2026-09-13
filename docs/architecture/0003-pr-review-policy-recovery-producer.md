@@ -77,6 +77,8 @@ The mechanism carries no state, no schedule, no concurrency group, and no API bu
 
 It does carry one fence, and the distinction matters because the rejected design's fences are half the reason it was rejected. Those existed because it *published verdicts*: they arbitrated ownership between two producers of one context, over a check-run set, with a compare-and-swap and a residual write window that no available primitive could close. This one is an ordinary lost-update guard—the body write replaces the whole description, so it is re-read immediately beforehand and the run aborts if it moved. Every tool that rewrites a whole PR body needs that, verdicts or not, and it is one read and one comparison rather than a three-fence protocol. It aborts rather than rebuilding, because rebuilding would re-run the validators and reopen the same window one layer down.
 
+It also narrows the window rather than closing it, and the record should say so plainly: GitHub exposes no conditional write for the pull-request update endpoint, so an edit landing between the re-read and the write is still lost. That is the same residual the rejected design documented for its own compare-and-swap—the floor for any whole-body write without conditional requests—and it is accepted here rather than solved. What the check buys is the large, self-inflicted part of the window: the four validator invocations and the check-run listing, leaving only the round trip.
+
 Option A remains available to a future reader only if the skipped-job bypass is addressed first. Nothing in this change prevents someone adding `workflow_dispatch` to `pr-review-policy.yml`; this record is what should stop them.
 
 ## Deferred end-state
