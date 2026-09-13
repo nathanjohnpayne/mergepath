@@ -117,7 +117,7 @@ P4B_ACCT_LOOP_RECORDED=false
 # Set only when a late timeout-generation revalidation already corrected this
 # invocation's provisional loop before entering fall_back_to_manual. The
 # fallback must not append a second record for the same invocation.
-P4B_TIMEOUT_REVALIDATION_ACCT_CLEANED=false
+P4B_PRE_POST_ACCT_CLEANED=false
 
 # Per-invocation ledger-staging token (#615 Codex round 6). Exported so the
 # render subshell (which stages the pending record on disk) and this process's
@@ -244,6 +244,21 @@ if [ "$MODE" != "local" ]; then
 fi
 
 command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
+# node is a HARD runtime dependency as of #1143, and it was not one before.
+# The identity fence runs the shared contract parser
+# (scripts/lib/pr-body-contract.mjs, executed by pr_body_validate) on EVERY
+# enabled run; callers passing --author used to skip the body read entirely and
+# therefore never reached node. Checked here — beside jq, and AFTER the
+# disabled/mode gates, so the default disabled path stays dependency-free for
+# consumers — so a host missing it is told which dependency is absent instead
+# of meeting a parser error three frames deeper.
+#
+# `node --version` rather than `command -v node`: a node that is present but
+# cannot execute is just as fatal, and this catches both. It also makes the
+# check testable, since shadowing a `command -v` probe with a failing shim
+# proves nothing — `command -v` would still find the shim.
+node --version >/dev/null 2>&1 \
+  || p4b_die 3 "node is required and must be runnable (the shared PR-body contract parser runs under it)"
 
 # Hard-required (#799). Every documented fallback in this script keyed off an
 # empty head sha, and an unreadable read never produced one — see the call
@@ -410,7 +425,7 @@ fall_back_to_manual() {
   # posting step, e.g. head drift inside post_review), amend that line
   # instead of appending a duplicate fail-closed loop (#615 Codex).
   if p4b_acct_on 2>/dev/null; then
-    if [ "${P4B_TIMEOUT_REVALIDATION_ACCT_CLEANED:-false}" = true ]; then
+    if [ "${P4B_PRE_POST_ACCT_CLEANED:-false}" = true ]; then
       : # the final timeout fence already corrected this invocation's loop
     elif [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
       p4b_acct_mark_unposted "$why"
@@ -516,20 +531,31 @@ run_same_head_barrier() {
 # head starts a new Phase 4a attempt. Only revalidate that generation here;
 # rerunning the whole barrier would also re-probe CodeRabbit and could turn an
 # unrelated transient into a late hold.
-cleanup_timeout_revalidation_side_effects() {
+# Shared by EVERY pre-POST refusal that can happen after this invocation's loop
+# was provisionally recorded — the Phase 4a timeout fence and, since #1143, the
+# PR-body identity fence. One ordering, one implementation: a second copy is
+# how the two drift out of step.
+#
+# The cause phrases are parameters so the two callers report truthfully; their
+# defaults reproduce the timeout wording byte-for-byte, so that caller is
+# unchanged.
+cleanup_pre_post_refusal_side_effects() {
+  # <why> <mark-accounting> [<warn-cause>] [<issue-cause>]
   local why="$1" mark_accounting="${2:-false}"
+  local warn_cause="${3:-Phase 4a timeout evidence}"
+  local issue_cause="${4:-the Phase 4a timeout waiver for ${REPO}#${PR}}"
   # Local state first: issue cleanup and the fallback accounting gate both use
   # external commands and may fail or hang. The loop/ledger must already say
   # not-posted before either can interrupt this refusal path.
   if [ "$mark_accounting" = true ]; then
     if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
       p4b_acct_mark_unposted "$why"
-      P4B_TIMEOUT_REVALIDATION_ACCT_CLEANED=true
+      P4B_PRE_POST_ACCT_CLEANED=true
     fi
   fi
   if [ "${VERDICT:-}" = "APPROVED" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then
-    p4b_warn "Phase 4a timeout evidence changed before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
-    p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the Phase 4a timeout waiver for ${REPO}#${PR} changed before the Phase 4b approval could post; a rerun files fresh follow-ups."
+    p4b_warn "$warn_cause changed before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
+    p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: $issue_cause changed before the Phase 4b approval could post; a rerun files fresh follow-ups."
     P4B_CREATED_ISSUE_REFS=""
   fi
 }
@@ -545,7 +571,7 @@ revalidate_phase4a_timeout_generation() {
     1)
       why="Phase 4a timeout generation changed during external review ($state); holding for the newer attempt"
       if [ "$where" = "pre-post" ]; then
-        cleanup_timeout_revalidation_side_effects "$why" true
+        cleanup_pre_post_refusal_side_effects "$why" true
       fi
       hold_for_external_review "$(jq -nc --arg ce "$state" \
         '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:$ce,trigger:"skipped",resume:"skipped"}')"
@@ -555,7 +581,7 @@ revalidate_phase4a_timeout_generation() {
       if [ "$where" = "pre-post" ]; then
         # Correct accounting before the fallback's feedback gate can itself
         # fail, then tell the fallback not to append a duplicate loop record.
-        cleanup_timeout_revalidation_side_effects "$why" true
+        cleanup_pre_post_refusal_side_effects "$why" true
       fi
       fall_back_to_manual "$why"
       ;;
@@ -1243,10 +1269,19 @@ post_review() {
   # it. Same cleanup as that fence: close this run's filed follow-ups when an
   # approval is what is being refused, then fall back.
   if ! revalidate_pr_body_author pre-post; then
-    if [ "$event" = "APPROVE" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then
-      p4b_warn "PR body identity drifted before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
-      p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the Authoring-Agent declared by ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run against the current body files fresh follow-ups."
-    fi
+    # Correct LOCAL state before anything that can be interrupted, via the same
+    # helper the timeout fence above uses (#1143 round 4). This matters because
+    # fall_back_to_manual runs the GitHub-backed require_feedback_accounted
+    # BEFORE it marks the loop unposted: if that gate exits — a transient read
+    # failure, or feedback that genuinely arrived during the adapter run — the
+    # loop log is left asserting that this unposted review WAS posted, with its
+    # pending ledger stage still staged. A persisted claim that a review posted
+    # when it did not is worse than the refusal itself. The helper marks the
+    # loop first, then closes this run's filed issues, and sets the flag
+    # fall_back_to_manual reads so the correction is not applied twice.
+    cleanup_pre_post_refusal_side_effects "$P4B_BODY_DRIFT_REASON" true \
+      "The PR body's declared Authoring-Agent" \
+      "the Authoring-Agent declared by ${REPO}#${PR}"
     fall_back_to_manual "$P4B_BODY_DRIFT_REASON"
   fi
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"

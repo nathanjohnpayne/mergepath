@@ -134,8 +134,14 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
 
 ## Dependencies
 
-- **Runtime:** `bash` (3.2+), `jq`, `gh`, `git`, and the reviewer CLI
-  (`codex` and/or `claude`) on `PATH`.
+- **Runtime:** `bash` (3.2+), `jq`, `node`, `gh`, `git`, and the reviewer CLI
+  (`codex` and/or `claude`) on `PATH`. `node` runs the shared PR-body contract
+  parser (`scripts/lib/pr-body-contract.mjs`), which the identity fence invokes
+  on **every** enabled run — including callers that pass `--author`, which
+  before #1143 skipped the body read and so never reached it. The orchestrator
+  probes `node --version` beside its `jq` check, after the disabled/mode gates,
+  so a host missing it gets a message naming the dependency rather than a
+  parser error; the default disabled path still needs neither.
 - **Reasoning-plane auth (per direction) — subscription plan only:** the
   adapters verify the persisted CLI auth mode before launch and run the
   reviewer CLI under a tightly allowlisted child environment. Codex must report
@@ -304,6 +310,15 @@ reviewer round while older feedback is unaccounted. Adapter CLIs are injectable
 via `CODEX_BIN` / `CLAUDE_BIN`, which is how
 `tests/test_phase_4b_automation.sh` exercises the package without network or
 real model calls.
+
+This recipe fakes `gh` and the reviewer CLI and nothing else. In particular it
+needs a **real** `node`, because the identity fence runs the shared contract
+parser under it. That is deliberate: `gh` is faked because it is the network
+boundary, and the point of faking it is to keep the run offline. `node` is a
+local execution dependency — the parser reads stdin and writes stdout, reaching
+nothing — so faking it would remove the real contract check the recipe exists to
+exercise, and would make a dry-run rehearse a different program than a real run.
+`jq` and `bash` are real here for the same reason.
 
 `--author` is a cross-check, not an override (#1143): it must name the same
 agent the body declares, so the fake above serves `claude` to match the

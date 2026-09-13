@@ -354,6 +354,19 @@ echo "jq intentionally unavailable" >&2
 exit 127
 SH
 chmod +x "$NO_JQ_DIR/jq"
+# (#1143) node became a hard runtime dependency when the identity fence started
+# running the shared contract parser on every enabled run. A shim that exits
+# non-zero is a faithful stand-in here precisely because the orchestrator probes
+# `node --version` rather than `command -v node` — an unrunnable node is as
+# fatal as an absent one, and `command -v` could not tell them apart.
+NO_NODE_DIR="$WORK/no-node-bin"
+mkdir -p "$NO_NODE_DIR"
+cat > "$NO_NODE_DIR/node" <<'SH'
+#!/usr/bin/env bash
+echo "node intentionally unavailable" >&2
+exit 127
+SH
+chmod +x "$NO_NODE_DIR/node"
 
 cat > "$BIN/gh" <<'SH'
 #!/usr/bin/env bash
@@ -1611,6 +1624,33 @@ if [ "$rc" = 5 ] && [ "$(printf '%s' "$out" | jq -r '.skipped')" = "true" ]; the
   pass "automation disabled → exit 5 even when jq is unavailable"
 else fail "disabled path without jq (rc=$rc, out=$out)"; fi
 
+# (#1143) node is a hard dependency ONLY from the enabled path inward. The
+# disabled path is what every consumer runs, and it must stay dependency-free —
+# if the probe ever drifts above the disabled/mode gates, this fails.
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" PATH="$NO_NODE_DIR:$PATH" bash "$ORCH" 123 --repo o/r 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 5 ] && [ "$(printf '%s' "$out" | jq -r '.skipped')" = "true" ]; then
+  pass "#1143: automation disabled → exit 5 even when node is unavailable"
+else fail "#1143: disabled path must not require node (rc=$rc, out=$out)"; fi
+
+# (#1143) On the ENABLED path node is required, and the failure must NAME it.
+# Before the explicit probe this surfaced as a parser error from three frames
+# deeper, on a host that satisfied every documented prerequisite.
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" PATH="$NO_NODE_DIR:$PATH" \
+  bash "$ORCH" 1150 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>&1)"; rc=$?
+set -e
+case "$out" in
+  *"node is required"*)
+    if [ "$rc" = 3 ]; then
+      pass "#1143: an unrunnable node fails closed on the enabled path and names the dependency"
+    else
+      fail "#1143: node check named the dependency but exited $rc (expected 3): $out"
+    fi ;;
+  *) fail "#1143: missing node did not produce the named dependency error (rc=$rc): $out" ;;
+esac
+
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" bash "$ORCH" 123 --repo $'o/r\nextra' 2>/dev/null)"; rc=$?
 set -e
@@ -2091,6 +2131,49 @@ case "$got" in
     fi ;;
   *) fail "#1143: an identity-preserving mid-run body edit was refused: $got" ;;
 esac
+
+# (m) #1143 round 4 (Codex P2): the loop must already say not-posted before the
+#     fallback can be interrupted. fall_back_to_manual runs the GitHub-backed
+#     require_feedback_accounted BEFORE it marks the loop unposted, and that
+#     gate exits on a transient read failure or on feedback that genuinely
+#     arrived during the adapter run — leaving the loop log asserting that this
+#     UNPOSTED review was posted, with its ledger stage still staged. A
+#     persisted phantom approval is worse than the refusal itself.
+#
+#     Modelled exactly: a gate that passes at dispatch and fails at fallback.
+#     The assertion is on durable local state, not on the exit code, because
+#     the exit code is the same either way — it is the loop log that lies.
+P4B1143R2_GATE="$WORK/acct-gate-flaky.sh"
+cat > "$P4B1143R2_GATE" <<'SH'
+#!/usr/bin/env bash
+c="${P4B_FAKE_GATE_COUNT:?}"
+n=$(( $( [ -f "$c" ] && cat "$c" || echo 0 ) + 1 ))
+printf '%s\n' "$n" > "$c"
+[ "$n" -le 1 ] || { echo "simulated accounting gate failure at fallback" >&2; exit 1; }
+printf '{"posted":0,"accounted":0}\n'
+SH
+chmod +x "$P4B1143R2_GATE"
+
+printf 'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n' > "$P4B1143R2_BODY2"
+P4B1143R2_ACCT="$WORK/acct-1151"
+rm -rf "$P4B1143R2_ACCT"
+got="$(p4b1143r2_run 1151 fake-claude-approve-usage 2 "$P4B1143R2_GUARD" \
+  P4B_ACCT_STATE_DIR="$P4B1143R2_ACCT" \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$P4B1143R2_GATE" \
+  P4B_FAKE_GATE_COUNT="$WORK/acct-gate-count-1151")"
+_gate_calls="$(tail -1 "$WORK/acct-gate-count-1151" 2>/dev/null || true)"
+_loop="$(find "$P4B1143R2_ACCT/phase-4b-loops" -name '*.jsonl' 2>/dev/null | head -n1)"
+if [ -z "$_loop" ]; then
+  fail "#1143: no loop log written — this assertion proves nothing (gate calls=${_gate_calls:-none}; got=$got)"
+elif [ "${_gate_calls:-0}" -lt 2 ]; then
+  fail "#1143: the fallback gate was never reached (calls=${_gate_calls:-0}) — the interruption this guards was not exercised"
+elif jq -e -s 'last.loop.posted == "not-posted" and last.loop.fail_closed.happened == true' "$_loop" >/dev/null 2>&1 \
+     && [ -z "$(find "$P4B1143R2_ACCT/phase-4b-pending" -type f 2>/dev/null)" ] \
+     && [ ! -e "$P4B1143R2_ACCT/phase-4b-ledger.jsonl" ]; then
+  pass "#1143: identity drift corrects the loop to not-posted before the fallback's feedback gate can interrupt"
+else
+  fail "#1143: a failing fallback gate left durable state claiming a posted approval (loop=$(cat "$_loop" 2>/dev/null); pending=$(find "$P4B1143R2_ACCT/phase-4b-pending" -type f 2>/dev/null | tr '\n' ' '); got=$got)"
+fi
 
 # #574 feedback_policy: a finding in a configured required tier cannot be
 # carried by an approval, even when the adapter output is otherwise valid.
