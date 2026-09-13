@@ -47,12 +47,14 @@ Neither verdict is re-implemented. `Self-Review Required` routes through `script
 Both verdict inputs — the body and the label list — are read immediately before the verdict that consumes them. The author is the only input read up front, because it is the only one that cannot change. Three fences then run immediately before every write:
 
 1. **Head.** The head must still be the PR's head; verdicts are derived from live state and must not be pinned to a superseded SHA.
-2. **Set membership.** The PR must still be the sole open PR carrying that head, or still not be — whichever the decision was taken under. A reopen or a force-push onto another open PR's head invalidates the duplicate-head set mid-sweep, and the head itself does not move when that happens.
+2. **Set membership.** The PR must still be the sole open PR **whose head is that commit**, or still not be — whichever the decision was taken under. A reopen or a force-push onto another open PR's head invalidates the duplicate-head set mid-sweep, and the head itself does not move when that happens.
+
+   *Ownership means head equality, not association.* `GET /repos/{owner}/{repo}/commits/{sha}/pulls` answers the weaker question — it lists every PR the commit is reachable from, including a stacked PR whose branch contains it but has advanced past it. Measured on mergepath#1240: `commits/6277745/pulls` returns that PR, whose head is `7414c61`. The fence therefore filters the response on `.head.sha == <sha>`, which is present and populated on that endpoint. Filtering on `state` alone counted a stacked PR as a co-owner and withheld every publication on a singly-owned head — a silent false block that disables the lane on any repository using stacked PRs, in the direction that is safe for correctness and fatal for purpose.
 3. **Compare-and-swap.** The check runs for that `(head, context)` must be exactly the set the decision was taken over.
 
 A failed read at any fence withholds: unknown state is possibly-newer state. Overlapping passes are additionally serialized by the workflow's `concurrency` group. The residual window is the gap between the last fence and the POST, which is the floor without conditional writes.
 
-A head carried by more than one open PR is published **red** on both contexts and evaluated for neither. One commit slot cannot honestly carry two PRs' verdicts, and red-until-disambiguated is the only verdict that cannot be wrong for either — the same posture `required-check-publisher.yml` takes for its per-commit slots.
+A head that is the head of more than one open PR is published **red** on both contexts and evaluated for neither. One commit slot cannot honestly carry two PRs' verdicts, and red-until-disambiguated is the only verdict that cannot be wrong for either — the same posture `required-check-publisher.yml` takes for its per-commit slots.
 
 ## Budget, and its ceiling
 

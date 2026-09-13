@@ -216,7 +216,10 @@ case "$endpoint" in
       emit "${!f}"
       exit 0
     fi
-    jq --arg sha "$sha" '[.[] | select(.head.sha == $sha) | {number: .number, state: "open"}]' \
+    # Shaped like the real endpoint: full PR entries carrying `head.sha`, so
+    # the production filter has the field it discriminates on. The default is
+    # derived from the open-PR listing the sweep enumerated.
+    jq --arg sha "$sha" '[.[] | select(.head.sha == $sha) | {number: .number, state: "open", head: {sha: .head.sha}}]' \
       "${FIXTURE_OPEN_PRS:?FIXTURE_OPEN_PRS unset}" > "$GH_STUB_COUNTER_DIR/headpulls.json"
     emit "$GH_STUB_COUNTER_DIR/headpulls.json"
     exit 0
@@ -358,14 +361,34 @@ write_check_runs_second() {  # <context-slug> <sha> <external_id>...
   eval "export FIXTURE_CHECKRUNS2_${slug//-/_}_${key}=\"\$path\""
 }
 
-# The open PRs the membership fence sees at publication time, which a test can
-# make differ from the listing the sweep enumerated.
-write_head_pulls() {  # <sha> <pr>...
+# What `commits/<sha>/pulls` returns at publication time, which a test can make
+# differ from the listing the sweep enumerated. Entries are `<pr>:<head-sha>`
+# because the endpoint lists PRs ASSOCIATED WITH the commit — a stacked PR
+# whose branch merely contains it has a DIFFERENT head, and telling those two
+# apart is the whole point of the fence's filter.
+write_head_pulls() {  # <sha> <pr>:<head-sha>...
   local sha="$1"; shift
-  local key path
+  local key path entry
   key=$(printf '%s' "$sha" | tr -c 'A-Za-z0-9' '_')
   path="$WORKDIR/head-pulls-$key.json"
-  printf '%s\n' "$@" | jq -R 'tonumber' | jq -s 'map({number: ., state: "open"})' > "$path"
+  : > "$WORKDIR/head-pulls.raw"
+  for entry in "$@"; do
+    jq -n --argjson n "${entry%%:*}" --arg h "${entry#*:}" \
+      '{number: $n, state: "open", head: {sha: $h}}' >> "$WORKDIR/head-pulls.raw"
+  done
+  jq -s . "$WORKDIR/head-pulls.raw" > "$path"
+  eval "export FIXTURE_HEADPULLS_${key}=\"\$path\""
+}
+
+# A CLOSED PR sharing the head, for the third direction of the same filter.
+write_head_pulls_with_closed() {  # <sha> <open-pr> <closed-pr>
+  local sha="$1" open_pr="$2" closed_pr="$3"
+  local key path
+  key=$(printf '%s' "$sha" | tr -c 'A-Za-z0-9' '_')
+  path="$WORKDIR/head-pulls-closed-$key.json"
+  jq -n --argjson o "$open_pr" --argjson c "$closed_pr" --arg h "$sha" \
+    '[{number: $o, state: "open", head: {sha: $h}}, {number: $c, state: "closed", head: {sha: $h}}]' \
+    > "$path"
   eval "export FIXTURE_HEADPULLS_${key}=\"\$path\""
 }
 
@@ -603,12 +626,49 @@ fi
 reset_env
 write_open_prs "7:$HEAD_A"
 write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
-write_head_pulls "$HEAD_A" 7 9
+write_head_pulls "$HEAD_A" "7:$HEAD_A" "9:$HEAD_A"
 run_sweep
 if [ "$RC" -eq 0 ] && [ -z "$WRITES" ]; then
   pass "a head that gained a second open PR mid-sweep gets no single-PR verdict"
 else
   fail "the set-membership fence must withhold (rc=$RC, writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 19c. The OTHER direction of the same filter, and the reason it exists.
+#      `commits/<sha>/pulls` lists PRs ASSOCIATED WITH the commit, so a
+#      STACKED PR whose branch contains it but has advanced past it comes back
+#      too — measured against the live API on this PR itself. Counting that as
+#      a co-owner made the fence withhold on a head that is genuinely singly
+#      owned: a silent false BLOCK that defeats the lane entirely on any repo
+#      using stacked PRs (#1240 Codex round 5 P1).
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
+write_head_pulls "$HEAD_A" "7:$HEAD_A" "9:$HEAD_B"
+run_sweep
+if [ "$RC" -eq 0 ] \
+  && [ "$(published_conclusion 'Self-Review Required')" = "success" ] \
+  && [ "$(published_conclusion 'Label Gate')" = "success" ]; then
+  pass "a stacked PR that merely contains the commit does not block recovery of its owner"
+else
+  fail "only a PR whose HEAD is this commit may count as a co-owner (rc=$RC, writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 19d. A CLOSED PR sharing the head is not a co-owner either — the fence asks
+#      who OPEN carries this head, and a closed PR cannot receive a verdict.
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" "someone" "$SELF_REVIEW_BODY"
+write_head_pulls_with_closed "$HEAD_A" 7 9
+run_sweep
+if [ "$RC" -eq 0 ] && [ "$(published_conclusion 'Label Gate')" = "success" ]; then
+  pass "a closed PR sharing the head does not block recovery"
+else
+  fail "a closed PR must not count as a co-owner (rc=$RC, writes=[$WRITES])"
 fi
 
 # ---------------------------------------------------------------------------

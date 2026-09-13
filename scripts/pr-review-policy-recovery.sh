@@ -87,8 +87,10 @@
 # and was that its retirement?" is string equality rather than an inference
 # about UUID shape.
 #
-# A HEAD CARRIED BY MORE THAN ONE OPEN PR is published RED on both contexts
-# and evaluated for neither (#1240 Codex P1). Check-run verdicts attach to a
+# A HEAD THAT IS THE HEAD OF MORE THAN ONE OPEN PR is published RED on both
+# contexts and evaluated for neither (#1240 Codex P1). Ownership here means
+# head EQUALITY — a stacked PR that merely contains the commit is not a
+# co-owner. Check-run verdicts attach to a
 # COMMIT while the policy state they encode (labels, body, base) is per-PR, so
 # one slot cannot honestly carry two PRs' verdicts: a clean PR swept after a
 # `human-hold` PR would turn the held PR's `Label Gate` green. Red until
@@ -324,8 +326,9 @@ decide_from_runs() {
 #   1. the head must still be the PR's head. Both verdicts come from LIVE PR
 #      state, so a push between evaluation and publication would pin
 #      fresh-state conclusions to a superseded SHA.
-#   2. this PR must still be the ONLY open PR carrying that head, or still not
-#      be — whichever the decision was taken under. The duplicate-head set is
+#   2. this PR must still be the ONLY open PR whose HEAD is that commit, or
+#      still not be — whichever the decision was taken under. Ownership is head
+#      EQUALITY, not association; see the filter below. The duplicate-head set is
 #      computed once from the opening listing, and a reopen or a force-push
 #      onto another open PR's head invalidates it mid-sweep (#1240 Codex
 #      round 4 P1). Fence 3 covers the artifact; this one covers the SET
@@ -350,10 +353,24 @@ publish() {
     log "PR #$pr moved from $head to $live during evaluation; publishing nothing for the superseded head"
     return 1
   fi
-  # One call, and it asks the question directly rather than re-walking the
-  # open-PR listing: which PRs carry this commit?
-  if ! owners=$(gh_api_scalar "open PRs carrying $head" \
-    "repos/$REPO/commits/$head/pulls" --jq '[.[] | select(.state == "open") | .number] | join(",")'); then
+  # One call instead of re-walking the open-PR listing. The endpoint lists PRs
+  # ASSOCIATED WITH the commit, which is a weaker relation than "has it as its
+  # head": a stacked PR whose branch contains this commit but has advanced past
+  # it comes back too. Measured on this PR — `commits/6277745/pulls` returns
+  # #1240, whose head is 7414c61. Filtering only on `state` therefore counted
+  # that stacked PR as a co-owner, `live_sole` went false, and the fence
+  # withheld every publication on a head that was in fact singly owned: a
+  # silent false BLOCK that defeats the whole lane on any repository using
+  # stacked PRs (#1240 Codex round 5 P1).
+  #
+  # `.head.sha == $head` is the actual ownership question, and `head.sha` is
+  # present and populated on this endpoint's response (verified against the
+  # live API, not just the reference). Embedding $head in the jq program is
+  # safe because fence 1 above has already proved it is a git object name via
+  # `--shape sha` AND that it equals the PR's live head.
+  if ! owners=$(gh_api_scalar "open PRs whose head is $head" \
+    "repos/$REPO/commits/$head/pulls" \
+    --jq "[.[] | select(.state == \"open\" and .head.sha == \"$head\") | .number] | join(\",\")"); then
     infra "could not revalidate which open PRs carry $head before publishing '$context'"
     return 1
   fi
