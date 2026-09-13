@@ -286,6 +286,18 @@ cat > "$BIN/gh" <<'SH'
 if [ "${1:-}" = "api" ]; then
   case "${2:-}" in
     repos/o/r/pulls/*)
+      # (#1143) The orchestrator reads and validates the PR body on EVERY run,
+      # not only when --author is absent. The body read and the head read hit
+      # the same endpoint and are told apart by the --jq expression.
+      for a in "$@"; do
+        case "$a" in
+          *'.body'*)
+            printf 'Authoring-Agent: %s\n\n## Self-Review\n\n- ok.\n' \
+              "${P4B_FAKE_PR_BODY_AGENT:-claude}"
+            exit 0
+            ;;
+        esac
+      done
       printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-abc123}"
       exit 0
       ;;
@@ -2748,6 +2760,7 @@ out="$(env PATH="$BIN:$PATH" \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
   P4B_FAKE_LIVE_HEAD=abc123 \
   P4B_WRAPPER_BODY="$BODY_M" \
+  P4B_FAKE_PR_BODY_AGENT=codex \
   bash "$ORCH" 213 --repo o/r --author codex --reviewer nathanpayne-claude \
     --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
