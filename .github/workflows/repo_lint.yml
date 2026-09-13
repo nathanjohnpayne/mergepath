@@ -638,6 +638,13 @@ jobs:
       - name: check_pr_audit_sync_exemption
         run: ./scripts/ci/check_pr_audit_sync_exemption || { rc=$?; if [ ! -f scripts/ci/check_pr_audit_sync_exemption ]; then echo "check_pr_audit_sync_exemption not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
+      - name: check_pr_review_policy_nudge
+        # #931 recovery nudge. SKIPs on consumers (hub-only operator
+        # tooling); on the hub it asserts the nudge publishes no check run
+        # and that its two context names still match pr-review-policy.yml's
+        # job names, then runs the paired suite.
+        run: ./scripts/ci/check_pr_review_policy_nudge --check || { rc=$?; if [ ! -f scripts/ci/check_pr_review_policy_nudge ]; then echo "check_pr_review_policy_nudge not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
       - name: check_sweep_unresolved_feedback
         run: ./scripts/ci/check_sweep_unresolved_feedback || { rc=$?; if [ ! -f scripts/ci/check_sweep_unresolved_feedback ]; then echo "check_sweep_unresolved_feedback not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
@@ -876,6 +883,10 @@ jobs:
       - name: check_merge_clearance_gate --self-test
         if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_merge_clearance_gate'))
         run: ./scripts/ci/check_merge_clearance_gate --self-test || { rc=$?; if [ ! -f scripts/ci/check_merge_clearance_gate ]; then echo "check_merge_clearance_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_pr_review_policy_nudge --self-test
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_pr_review_policy_nudge'))
+        run: ./scripts/ci/check_pr_review_policy_nudge --self-test || { rc=$?; if [ ! -f scripts/ci/check_pr_review_policy_nudge ]; then echo "check_pr_review_policy_nudge not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_phase_4b_automation --self-test
         if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_phase_4b_automation'))
