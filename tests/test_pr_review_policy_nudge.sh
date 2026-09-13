@@ -166,13 +166,30 @@ else
 fi
 
 echo "--- 1c: nothing was published"
-# The script's whole claim is that it produces no check run. Any write verb on
-# the check-runs endpoint, or any non-GET gh api call at all, breaks it.
-if ! grep -Eq -- "-X|--method|--input|-f |check-runs.*POST" "$D/gh.log" \
-  && [ "$(grep -c "check-runs" "$D/gh.log")" = 1 ]; then
-  pass "no check-run is created: the only check-runs call is the single read"
+# The script's whole claim is that it creates no check run. Assert the EXACT
+# set of gh invocations a full run makes, rather than pattern-matching the log
+# for write verbs.
+#
+# The distinction matters because it decides whether this assertion
+# terminates. The wrapper's source scan is a text assertion over the script,
+# and text assertions over programs do not converge: two review rounds widened
+# it, first for `-f`/`--field`, then for the attached `-fbody=x` spelling, and
+# a third could always find another. This one cannot be widened, because it
+# does not enumerate what is forbidden — it enumerates what is allowed. Any
+# extra gh call fails it whatever its spelling, and the stub additionally
+# exits 90 on a call it does not recognize. The wrapper's regex stays as
+# defence in depth against a write that never runs in the suite; this is the
+# assertion that actually pins the invariant.
+EXPECTED_CALLS=$(cat <<'CALLS'
+api repos/owner/repo/pulls/7
+api --paginate repos/owner/repo/commits/sha111/check-runs --jq .check_runs[].name
+api repos/owner/repo/pulls/7 --jq .body // ""
+CALLS
+)
+if [ "$(cat "$D/gh.log")" = "$EXPECTED_CALLS" ]; then
+  pass "the full run makes exactly three gh calls, all reads, and creates no check run"
 else
-  fail "the run made a non-GET gh api call or more than one check-runs call: $(cat "$D/gh.log")"
+  fail "the gh call set changed; expected exactly the three reads, got: $(cat "$D/gh.log")"
 fi
 
 # --- 2: one context missing is still a recovery case -----------------------
