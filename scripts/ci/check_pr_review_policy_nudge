@@ -80,7 +80,13 @@ done
 # --- 1: it publishes nothing ------------------------------------------------
 # Comments are stripped first so the rationale above — which necessarily talks
 # about check runs and POSTs — cannot satisfy or trip its own assertion.
-CODE=$(sed 's/[[:space:]]*#.*$//' "$SUBJECT")
+# FULL-LINE comments only. A trailing-comment strip cuts a code line at its
+# first `#`, and this file's own `die` messages contain `$REPO#$PR_NUMBER` —
+# so a future `gh api` call sharing a line with one would have its flags
+# hidden from the scan below, which is the one thing this scan must not
+# allow. The rationale prose that would otherwise trip the scan is all
+# full-line, so nothing is lost.
+CODE=$(grep -v '^[[:space:]]*#' "$SUBJECT")
 
 # Scan gh invocations, not the whole file: `-f` and `-F` are ordinary test and
 # rm operators elsewhere in the script. Backslash continuations are joined
