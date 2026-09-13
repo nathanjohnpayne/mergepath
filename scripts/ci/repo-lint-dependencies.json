@@ -84,6 +84,11 @@
       "tests/test_approval_independence_check.sh",
       "tests/test_approval_merge_continuation.sh",
       "tests/test_merge_clearance_gate.sh"
+    ],
+    "check_pr_review_policy_nudge": [
+      "scripts/pr-review-policy-nudge.sh",
+      "tests/test_pr_review_policy_nudge.sh",
+      "scripts/lib/ci-check-modes.sh"
     ]
   }
 }

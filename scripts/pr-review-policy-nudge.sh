@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# pr-review-policy-nudge.sh — make pr-review-policy.yml re-evaluate one PR.
+#
+# `.github/workflows/pr-review-policy.yml` produces two branch-protection
+# required contexts, `Self-Review Required` and `Label Gate`, and it is
+# triggered by `pull_request` only. When that delivery is missed or dropped,
+# both contexts sit at "Expected — Waiting for status to be reported", the PR
+# is unmergeable, and nothing re-fires them (#931).
+#
+# This script is the recovery path. It does NOT publish either context. It
+# edits the PR body, replacing a single inert provenance marker, which is a
+# `pull_request` action the workflow already listens for (`edited`) — so the
+# canonical producer runs and reports its own verdicts on the current head.
+#
+# WHY THE NUDGE AND NOT A SECOND PRODUCER. Both contexts come from inline
+# steps of that workflow, so adding a `schedule` or `workflow_dispatch`
+# entrance to it means gating its jobs to `pull_request`, and a skipped
+# Actions job still materializes a check run under the job's `name` whose
+# `skipped` conclusion satisfies a required check. Publishing the two
+# contexts from a separate workflow instead means owning producer-ownership
+# arbitration, lineage retirement, pre-write fences, and a re-derivation of
+# the Phase 4 classification the missed run also owned. Making the trusted
+# producer run has none of those obligations. See
+# docs/architecture/0003-pr-review-policy-recovery-producer.md.
+#
+# WHY A BODY EDIT AND NOT A LABEL TOGGLE. `labeled`/`unlabeled` are also in
+# the workflow's trigger list, but its `external-review-labeling` job — the
+# Phase 4 classifier — is explicitly gated OFF for those two actions. A label
+# toggle would recover the two gates and leave the classification unrecovered,
+# which is precisely the case where an absent `needs-external-review` is a
+# symptom of the missed delivery rather than a clearance.
+#
+# THIS IS NOT A "RERUN MY FAILING CHECKS" BUTTON. The refusal below is on
+# presence, not on success: once both contexts have reported on the head,
+# recovery has done its job, and a red verdict is a job done.
+#
+# Usage:
+#   scripts/pr-review-policy-nudge.sh <PR#> [owner/repo]
+#
+# The repo defaults to the current checkout's. Reads use whatever credential
+# `gh` resolves; the single write goes through scripts/gh-as-author.sh, which
+# verifies the token's identity before it runs.
+#
+# Exit codes:
+#   0 = the PR body was edited; the canonical workflow will re-evaluate
+#   1 = bad arguments, or the PR is not open
+#   2 = infrastructure failure (gh read failed, validator or wrapper missing)
+#   3 = not needed — both contexts have already reported on the current head
+#   4 = refused — the edit would make an otherwise valid body fail Self-Review
+#   5 = aborted — the body changed under us; re-run against the newer one
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Preflight auto-source (#282), the same contract the other read-path helpers
+# use. Without it this script dies at the first read on a machine that has a
+# warm op-preflight cache but no usable ambient gh credential, before
+# gh-as-author.sh ever gets the chance to resolve one. The library sets the
+# OP_PREFLIGHT_* vars and deliberately does not assign GH_TOKEN, so the choice
+# of which token below is this script's: reads take the reviewer PAT, and the
+# single write resolves the author PAT inside the wrapper.
+if [ -r "$ROOT/scripts/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$ROOT/scripts/lib/preflight-helpers.sh"
+  # Unconditional, NOT the GH_TOKEN-guarded auto_source_preflight. That one
+  # skips when GH_TOKEN is already set, which leaves OP_PREFLIGHT_AUTHOR_PAT
+  # unloaded — and the single write resolves the AUTHOR token, not the
+  # reviewer one the reads use. In a token-only shell carrying an ambient
+  # reviewer GH_TOKEN with no keyring, gh-as-author.sh would then find no
+  # preferred var, an ambient token whose identity does not match, and no
+  # keyring fallback, and recovery would fail at its only write. This loader
+  # populates both PATs and restores the caller's GH_TOKEN afterwards.
+  load_preflight_env_vars
+fi
+# The loader ASSIGNS but does not export, and gh-as-author.sh reads the author
+# PAT from its own environment as a child process.
+[ -n "${OP_PREFLIGHT_AUTHOR_PAT:-}" ] && export OP_PREFLIGHT_AUTHOR_PAT
+[ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ] && export OP_PREFLIGHT_REVIEWER_PAT
+GH_TOKEN="${GH_TOKEN:-${OP_PREFLIGHT_REVIEWER_PAT:-}}"
+export GH_TOKEN
+
+GH_AS_AUTHOR="${MERGEPATH_NUDGE_GH_AS_AUTHOR:-$ROOT/scripts/gh-as-author.sh}"
+VALIDATE="${MERGEPATH_NUDGE_VALIDATE_BIN:-$ROOT/scripts/validate-pr-body.sh}"
+
+# The two required contexts the workflow produces, spelled as the job `name:`
+# values GitHub uses for the check-run name.
+CONTEXT_SELF_REVIEW="Self-Review Required"
+CONTEXT_LABEL_GATE="Label Gate"
+
+# One marker, replaced rather than appended: this records the most recent
+# nudge, not a history of them. The timestamp is load-bearing rather than
+# decorative — GitHub emits no `edited` event for a body that did not change,
+# so a second attempt has to write different bytes to fire the workflow at all.
+MARKER_PREFIX="mergepath-recovery-nudge:"
+
+# `$1`, not `$*`: the second argument is the exit code, and `$*` printed it
+# as a trailing word on every error line.
+die() { echo "pr-review-policy-nudge: $1" >&2; exit "${2:-1}"; }
+
+PR_NUMBER="${1:-}"
+REPO="${2:-}"
+case "$PR_NUMBER" in
+  '' | *[!0-9]*)
+    echo "usage: scripts/pr-review-policy-nudge.sh <PR#> [owner/repo]" >&2
+    exit 1
+    ;;
+esac
+
+if [ -z "$REPO" ]; then
+  REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) \
+    || die "could not resolve the repository; pass it explicitly as the second argument" 2
+fi
+
+# Fail closed rather than skipping the invariant below: editing the body of a
+# PR whose mergeability depends on that body, without being able to check what
+# the edit did to it, is the one thing this script must never do silently.
+[ -r "$VALIDATE" ] || die "PR-body validator not found at $VALIDATE; refusing to edit a body it cannot check" 2
+[ -x "$GH_AS_AUTHOR" ] || die "author wrapper not executable at $GH_AS_AUTHOR" 2
+
+PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) \
+  || die "could not read $REPO#$PR_NUMBER" 2
+
+STATE=$(printf '%s' "$PR_JSON" | jq -r '.state // ""')
+HEAD_SHA=$(printf '%s' "$PR_JSON" | jq -r '.head.sha // ""')
+# An empty PR body reads back as JSON null, not "".
+OLD_BODY=$(printf '%s' "$PR_JSON" | jq -r '.body // ""')
+PR_CREATED_AT=$(printf '%s' "$PR_JSON" | jq -r '.created_at // ""')
+
+[ -n "$HEAD_SHA" ] || die "PR $REPO#$PR_NUMBER returned no head SHA" 2
+[ "$STATE" = "open" ] || die "PR $REPO#$PR_NUMBER is $STATE, not open" 1
+
+# --- refuse on presence, not on success ------------------------------------
+# The conclusion is deliberately not consulted: a red `Label Gate` is the
+# canonical producer having run and having decided, which is the outcome this
+# script exists to bring about.
+#
+# The NAME alone is not presence, though. A run counts only if it is also:
+#
+#   from the canonical app — branch protection pins these contexts to GitHub
+#     Actions, so a same-named run from another App never satisfies them and
+#     must not satisfy this check either. That confusion is #1213, one layer up.
+#
+#   associated with THIS PR ALONE — check runs attach to a COMMIT, and the
+#     association lists all open PRs sharing that head. A run for another
+#     open PR can name this PR and start after it was created, so membership
+#     plus the time floor below cannot settle a multiply shared head. Treat
+#     those runs as uncertain and nudge instead of refusing.
+#
+#   started AFTER this PR existed — because the association above is NOT
+#     provenance. `.pull_requests` lists the currently-open PRs sharing the
+#     run's head, which is why a closed PR's runs report `[]` (measured: 116
+#     runs on #1240's closed head, all empty). A new PR reusing that SHA would
+#     therefore be handed those same runs under its OWN number, and the
+#     association filter alone would accept a green it was never classified
+#     for. A run that began before this PR existed cannot be this PR's, and
+#     `created_at` is already in the PR object this script reads.
+#
+# Asking each run who it belongs to also beats asking `commits/{sha}/pulls` who
+# else is at the head: that endpoint documents, and this repository confirms,
+# that it omits closed PRs for a commit off the default branch — so it is blind
+# to precisely the case it would have been there for. And this costs no extra
+# read, because the listing is already being fetched.
+NAMES=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" 2>/dev/null \
+  | jq -r -s --argjson pr "$PR_NUMBER" --arg created "$PR_CREATED_AT" '
+      [.[].check_runs[]]
+      | .[]
+      | select(.app.slug == "github-actions")
+      | select([.pull_requests[]?.number] == [$pr])
+      | select($created == "" or (.started_at // "") >= $created)
+      | .name') \
+  || die "could not list check runs on $HEAD_SHA" 2
+
+has_context() { printf '%s\n' "$NAMES" | grep -Fxq "$1"; }
+
+MISSING=()
+has_context "$CONTEXT_SELF_REVIEW" || MISSING+=("$CONTEXT_SELF_REVIEW")
+has_context "$CONTEXT_LABEL_GATE" || MISSING+=("$CONTEXT_LABEL_GATE")
+
+if [ "${#MISSING[@]}" -eq 0 ]; then
+  # The refusal is an optimization, not a safety property. Nudging a PR that
+  # did not need it costs one workflow run; refusing one that did defeats the
+  # whole tool. So where the refusal cannot establish its premise, it nudges.
+  #
+  # The per-run filters above exclude ambiguous and pre-creation contexts.
+  # One thing can still make that answer stale: the head moved after it was
+  # read, so the listing described a superseded commit and "nothing to recover"
+  # would be about the wrong commit. Confirm it LAST, with no request after —
+  # the window that remains contains no I/O, which is the floor. Earlier rounds
+  # closed a window between two sequenced premise reads and each time a smaller
+  # one could be named; there is only one read here now.
+  DOUBT=""
+  LIVE_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha // ""' 2>/dev/null) || LIVE_HEAD=""
+  if [ -z "$LIVE_HEAD" ]; then
+    DOUBT="the head could not be re-read to confirm it is still $HEAD_SHA"
+  elif [ "$LIVE_HEAD" != "$HEAD_SHA" ]; then
+    DOUBT="the head moved to $LIVE_HEAD after the check runs were listed on $HEAD_SHA"
+  fi
+
+  if [ -z "$DOUBT" ]; then
+    echo "pr-review-policy-nudge: both required contexts have already reported on $HEAD_SHA — nothing to recover."
+    echo "  This recovers a missed delivery; it does not re-run a context that reported and failed."
+    exit 3
+  fi
+  echo "pr-review-policy-nudge: both contexts appear on $HEAD_SHA, but $DOUBT; nudging rather than refusing on an uncertain premise." >&2
+  MISSING=("none missing on $HEAD_SHA, but $DOUBT")
+fi
+
+# --- build the new body ----------------------------------------------------
+# Removing the previous marker leaves the body ending in the blank line that
+# preceded it; command substitution strips those trailing newlines, so a
+# repeated nudge does not grow the body by a blank line each time. Nothing
+# above the tail is touched.
+# Remove ONLY a terminal marker. A blanket `grep -v` would also delete an
+# identical line anywhere else in the body — a fenced example documenting this
+# very marker, say — and body content outside the marker is not this script's
+# to touch. The `\r` strip is because a body typed in GitHub's web UI comes
+# back CRLF-terminated, which would otherwise defeat the match and turn
+# replace-not-append into append.
+STRIPPED=$OLD_BODY
+LAST_LINE=$(printf '%s' "$OLD_BODY" | tail -n 1 | tr -d '\r')
+case "$LAST_LINE" in
+  "<!-- $MARKER_PREFIX "*" -->") STRIPPED=$(printf '%s' "$OLD_BODY" | sed '$d') ;;
+esac
+new_body_for_stamp() { printf '%s\n\n<!-- %s %s -->' "$STRIPPED" "$MARKER_PREFIX" "$1"; }
+NEW_BODY=$(new_body_for_stamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+
+# The stamp has one-second granularity, so a nudge repeated inside the same
+# second rebuilds a byte-identical body. GitHub emits no `edited` event for a
+# body that did not change, so writing that would report success having fired
+# nothing — the "recorded that we called it, not that it worked" shape. Wait
+# out the second, then assert the difference rather than assuming it.
+if [ "$NEW_BODY" = "$OLD_BODY" ]; then
+  sleep 1
+  NEW_BODY=$(new_body_for_stamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+fi
+[ "$NEW_BODY" != "$OLD_BODY" ] \
+  || die "the rebuilt marker is byte-identical to the current body; the edit would fire no event" 2
+
+# An unclosed fenced block runs to the end of the document, so a body that
+# ends inside one swallows the marker: GitHub renders the comment as literal
+# code instead of hiding it. Warn rather than refuse. Refusing would leave a
+# stuck PR stuck over a cosmetic artifact in a body that is already malformed,
+# and every placement outside the fence means editing the middle of someone
+# else's description, which is a larger mutation than the one complained of.
+# The parity count is a heuristic and guards only this message, never a
+# decision.
+# Counted per fence character rather than together: `~~~` opens a fence just
+# as `\`\`\`` does, and a body can carry both. Either count landing odd is the
+# signal. This stays a heuristic — it does not track opening fence length, and
+# a tilde run quoted inside a backtick fence will trip it — which is why it
+# guards a message and nothing else.
+BACKTICK_FENCES=$(printf '%s\n' "$STRIPPED" | grep -c '^[[:space:]]*```' || true)
+TILDE_FENCES=$(printf '%s\n' "$STRIPPED" | grep -c '^[[:space:]]*~~~' || true)
+if [ $((BACKTICK_FENCES % 2)) -ne 0 ] || [ $((TILDE_FENCES % 2)) -ne 0 ]; then
+  echo "pr-review-policy-nudge: this body ends inside an unterminated code fence, so the marker will render as literal code rather than being hidden. Nudging anyway." >&2
+fi
+
+# --- non-introduction invariant --------------------------------------------
+# The rule is NOT "the body must be valid" — that is the author's problem, and
+# an invalid body is exactly the state a red `Self-Review Required` should
+# report. The rule is that this edit must not be what breaks it: whatever the
+# original body passes, the nudged body must pass too.
+validate_rc() {  # <body> [flag...]  -> the validator's raw exit status
+  local body=$1; shift
+  local rc=0
+  printf '%s' "$body" | bash "$VALIDATE" "$@" >/dev/null 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+
+OLD_FULL=$(validate_rc "$OLD_BODY")
+NEW_FULL=$(validate_rc "$NEW_BODY")
+OLD_SELF_REVIEW=$(validate_rc "$OLD_BODY" --self-review-only)
+NEW_SELF_REVIEW=$(validate_rc "$NEW_BODY" --self-review-only)
+
+# scripts/validate-pr-body.sh's contract is 0 valid, 1 invalid, 2 usage. Any
+# other status — 126/127 from a broken interpreter, a missing lib, an
+# unexecutable file — is infrastructure, not a verdict. Folding it into
+# "invalid" would leave both sides of every comparison nonzero, the refusal
+# below would never fire, and the edit would go out with the invariant never
+# actually evaluated: the same "a helper returns the same value for failed and
+# for a legitimate answer" shape the invariant exists to prevent.
+for rc in "$OLD_FULL" "$NEW_FULL" "$OLD_SELF_REVIEW" "$NEW_SELF_REVIEW"; do
+  case "$rc" in
+    0 | 1) ;;
+    *) die "PR-body validation could not run (validator exited $rc); refusing to edit a body it cannot check" 2 ;;
+  esac
+done
+
+if { [ "$OLD_FULL" -eq 0 ] && [ "$NEW_FULL" -ne 0 ]; } \
+  || { [ "$OLD_SELF_REVIEW" -eq 0 ] && [ "$NEW_SELF_REVIEW" -ne 0 ]; }; then
+  die "the nudge marker would make this body fail PR-body validation (full $OLD_FULL->$NEW_FULL, self-review $OLD_SELF_REVIEW->$NEW_SELF_REVIEW); refusing to edit" 4
+fi
+
+# --- the one write ---------------------------------------------------------
+# The author-wrapped body write replaces the WHOLE description, and NEW_BODY
+# was derived from a snapshot taken before four validator invocations. An
+# author or bot editing the description inside that window would be silently
+# overwritten, which is a body mutation well outside the one marker this
+# script is entitled to make. Abort rather than rebuild: rebuilding re-runs
+# the validators and reopens the same window one layer down.
+#
+# This NARROWS the window; it does not close it. GitHub exposes no conditional
+# write for the pull-request update endpoint, so an edit landing between this
+# read and the write below is still overwritten. What the check buys is the
+# large, self-inflicted part of the window — the four validator invocations
+# and the check-run listing — leaving only the round trip. That residual is
+# the floor for any whole-body write, and it is accepted rather than solved.
+# State as well as body: the PR can be closed or merged between the opening
+# read and here, and a re-read that selects only the body would let a stale
+# invocation edit an archived PR and report a successful recovery.
+# Fetched whole and split locally rather than with a server-side `--jq`
+# joining the two: every delimiter jq can join with (`@tsv`, `@csv`) escapes
+# newlines, so a multi-line body would come back mangled and never compare
+# equal — the guard would then fire on every ordinary run.
+LIVE_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null) \
+  || die "could not re-read $REPO#$PR_NUMBER before writing" 2
+LIVE_STATE=$(printf '%s' "$LIVE_JSON" | jq -r '.state // ""')
+LIVE_BODY=$(printf '%s' "$LIVE_JSON" | jq -r '.body // ""')
+if [ "$LIVE_STATE" != "open" ]; then
+  die "PR $REPO#$PR_NUMBER became $LIVE_STATE while this ran; refusing to edit a PR that is no longer open" 5
+fi
+if [ "$LIVE_BODY" != "$OLD_BODY" ]; then
+  die "the PR body changed while this ran; refusing to overwrite the newer description — re-run to nudge against it" 5
+fi
+
+BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/pr-review-policy-nudge.XXXXXX")
+trap 'rm -f "$BODY_FILE"' EXIT
+printf '%s\n' "$NEW_BODY" >"$BODY_FILE"
+
+"$GH_AS_AUTHOR" -- gh pr edit "$PR_NUMBER" --repo "$REPO" --body-file "$BODY_FILE" >/dev/null \
+  || die "the PR body edit failed; the workflow was not nudged" 2
+
+MISSING_LIST=$(printf '%s, ' "${MISSING[@]:-unknown}"); MISSING_LIST=${MISSING_LIST%, }
+echo "pr-review-policy-nudge: edited $REPO#$PR_NUMBER (head $HEAD_SHA); not yet reported: $MISSING_LIST"
+echo "  The 'edited' action re-runs pr-review-policy.yml's three jobs, including External Review Check."
+echo "  This script published nothing; the verdicts are the canonical producer's."
