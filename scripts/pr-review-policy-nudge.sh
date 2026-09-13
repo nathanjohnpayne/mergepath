@@ -156,9 +156,14 @@ if [ "${#MISSING[@]}" -eq 0 ]; then
     # for its own per-commit slots: a head carried by more than one open PR is
     # ambiguous. Filter on `.head.sha`, because commits/{sha}/pulls also lists
     # a stacked PR whose branch merely contains the commit (#1240).
-    # shellcheck disable=SC2016  # $sha is a jq variable bound by --arg, not a shell one.
-    SHARERS=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" --arg sha "$HEAD_SHA" \
-      --jq '[.[] | select(.state == "open" and .head.sha == $sha)] | length' 2>/dev/null) || SHARERS=""
+    #
+    # Fetched raw and filtered by a real jq, because `gh api` has no `--arg`:
+    # it takes a `--jq` program but exposes no way to bind a variable into it,
+    # and passing one exits with "unknown flag". Interpolating the SHA into
+    # the program text instead would work here and is the wrong habit, so the
+    # filter runs in a jq of its own.
+    SHARERS=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" 2>/dev/null \
+      | jq --arg sha "$HEAD_SHA" '[.[] | select(.state == "open" and .head.sha == $sha)] | length') || SHARERS=""
     case "$SHARERS" in
       '' | *[!0-9]*) DOUBT="whether another open PR shares head $HEAD_SHA could not be determined" ;;
       *) [ "$SHARERS" -le 1 ] || DOUBT="$SHARERS open PRs share head $HEAD_SHA, so the reported contexts may belong to another one" ;;

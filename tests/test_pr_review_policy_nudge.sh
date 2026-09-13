@@ -39,6 +39,21 @@ cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
 printf '%s\n' "$*" >> "${STUB_GH_LOG:?}"
+
+# Reject any flag real `gh api` does not have, with gh's own wording. A stub
+# that is MORE permissive than the tool hides the bug it exists to catch:
+# `gh api --arg` exits "unknown flag", and a stub that quietly honoured it let
+# a broken sharer query pass the suite and fail on the first live run.
+for a in "$@"; do
+  case "$a" in
+    --*)
+      case "$a" in
+        --paginate | --jq | --method | --input | --field | --raw-field | --include | --silent | --slurp | --hostname | --template | --cache | --verbose | --header) ;;
+        *) echo "unknown flag: $a" >&2; exit 1 ;;
+      esac ;;
+  esac
+done
+
 case "$*" in
   "repo view"*)
     printf '%s\n' "${STUB_REPO:-owner/repo}"; exit 0 ;;
@@ -49,21 +64,13 @@ case "$*" in
     exit 0 ;;
   *commits/*/pulls*)
     # The refusal path asks who else carries this head. STUB_SHARERS is the
-    # RAW endpoint payload, and the caller's own --arg/--jq are applied to it
-    # rather than reimplemented here — so the `.head.sha` filter under test is
-    # the one that actually runs. A stub that answered with a pre-filtered
-    # count would be blind to exactly the defect that filter exists for: this
-    # endpoint also lists a stacked PR whose branch merely contains the commit.
+    # RAW endpoint payload and is returned unfiltered, so the `.head.sha`
+    # filter under test is the one that actually runs. A stub that answered
+    # with a pre-filtered count would be blind to exactly the defect that
+    # filter exists for: this endpoint also lists a stacked PR whose branch
+    # merely contains the commit.
     if [ "${STUB_SHARERS_RC:-0}" -ne 0 ]; then echo "sharers read failed" >&2; exit "$STUB_SHARERS_RC"; fi
-    argname=_unused; argval=""; jqexpr="."
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --arg) argname=$2; argval=$3; shift 3 ;;
-        --jq) jqexpr=$2; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    printf '%s\n' "${STUB_SHARERS:-[]}" | jq -r --arg "$argname" "$argval" "$jqexpr"
+    printf '%s\n' "${STUB_SHARERS:-[]}"
     exit 0 ;;
   *"/pulls/"*)
     if [ "${STUB_PR_RC:-0}" -ne 0 ]; then echo "pull read failed" >&2; exit "$STUB_PR_RC"; fi
