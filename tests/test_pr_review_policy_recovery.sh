@@ -237,6 +237,14 @@ case "$endpoint" in
         exit 0
       fi
     fi
+    # The AUTHOR read can be failed on its own, so the Dependabot exemption's
+    # own fail-closed branch is provable without breaking the body or label
+    # reads that share this endpoint.
+    if [ "$jqexpr" = '.user.login // ""' ] && [ -n "${FAIL_AUTHOR:-}" ]; then
+      echo "gh: HTTP 502 (author read)" >&2
+      printf '{"message":"Bad gateway"}\n'
+      exit 1
+    fi
     # The LABEL and BODY reads are distinct, later calls than the author read.
     # FIXTURE_LATE_LABELS_<pr> / FIXTURE_LATE_BODY_<pr> answer only those, so a
     # test can prove neither verdict is taken from an earlier snapshot.
@@ -765,6 +773,41 @@ if [ "$(published_conclusion 'Self-Review Required')" = "skipped" ] \
   pass "a Dependabot PR recovers Self-Review as skipped and still evaluates Label Gate"
 else
   fail "Dependabot must stay exempt from Self-Review Required (writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 7b. An unreadable AUTHOR read withholds and reddens the sweep. It must not
+#     fall through to "not Dependabot": that path validates a Dependabot body,
+#     finds no `## Self-Review` section, and publishes a BLOCKING red — the
+#     one verdict input that used to fail loud and wrong while the sweep
+#     still reported success (#1240 CodeRabbit P2).
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" 'dependabot[bot]' "$NO_SELF_REVIEW_BODY"
+export FAIL_AUTHOR=1
+run_sweep
+if [ "$RC" -eq 1 ] \
+  && [ -z "$(published_conclusion 'Self-Review Required')" ]; then
+  pass "an unreadable author read withholds Self-Review and reddens the sweep"
+else
+  fail "a failed author read must withhold, not publish a red (rc=$RC, writes=[$WRITES])"
+fi
+
+# ---------------------------------------------------------------------------
+# 7c. The OTHER direction: an author that is legitimately EMPTY — a deleted
+#     account reports `user.login: null` — is a successful read of "not
+#     Dependabot", and must still be evaluated rather than withheld. This is
+#     why the two cases had to be separated instead of both treated as errors.
+# ---------------------------------------------------------------------------
+reset_env
+write_open_prs "7:$HEAD_A"
+write_pr 7 "$HEAD_A" "" "$NO_SELF_REVIEW_BODY"
+run_sweep
+if [ "$RC" -eq 0 ] && [ "$(published_conclusion 'Self-Review Required')" = "failure" ]; then
+  pass "an author that is legitimately empty is evaluated, not withheld"
+else
+  fail "a null author is a successful read of 'not Dependabot' (rc=$RC, writes=[$WRITES])"
 fi
 
 # ---------------------------------------------------------------------------

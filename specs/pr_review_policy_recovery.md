@@ -62,9 +62,20 @@ A head that is the head of more than one open PR is published **red** on both co
 
 | per-PR cost | when |
 |---|---|
-| 2 reads | both contexts already reported natively — the steady state |
-| 3 reads | plus the membership fence, on any head this lane publishes to |
-| up to 8 reads | a head being recovered: author, body, labels, head re-read, membership, two CAS re-reads, and the Phase 4 derivation's own calls |
+| **2 reads** | both contexts already reported natively — the steady state, and the only figure that describes a healthy repository |
+| **11 reads + 2 writes**, plus more | a pass that publishes BOTH contexts for that PR |
+
+The publishing figure itemized, because "up to 8" understated it (#1240 CodeRabbit) and an understated bound is worse than none:
+
+| reads | where |
+|---|---|
+| 2 | the two `read_runs` decisions |
+| 3 | author, body, labels |
+| 6 | three fences — head, membership, CAS — per publication, and there are two |
+| *variable* | `requires_phase_4`, which is a separate process with its own API surface, including base-policy resolution's `contents` and commit reads when the PR's base is not the default branch |
+| *2 writes* | the two check-run POSTs |
+
+**The two figures are both correct and are not in tension.** They measure different passes: 2 is what a PR costs when nothing needs recovering, 11+ is what one costs while it is actually being recovered. Issue #1245 quotes the 2-read figure for the steady state, which is the right number for the sizing question it asks — a repository is not continuously recovering every PR, and a pass that were would already be failing loudly for other reasons. A reader comparing the two should not conclude either is wrong.
 
 At `*/15` the steady state is therefore about `8 × open_PR_count` requests per hour. Two properties keep that honest rather than merely small:
 

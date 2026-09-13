@@ -421,14 +421,26 @@ stand_down() {
     "The event-driven job has reported '$context' for $head, so the pr-review-policy recovery lane is handing the slot back and retiring its own entries. This run is deliberately non-blocking; the event-driven verdict governs. See nathanjohnpayne/mergepath#931."
 }
 
-# pr_author <pr> — read the login on demand. It is only needed on the path
-# that actually publishes a Self-Review verdict, and a pass over a healthy
-# repository publishes nothing, so reading it per PR up front spent one REST
-# call per PR per 15 minutes for nothing (#1240 Codex round 4 P2). Prints
-# empty on a failed read, which simply means the Dependabot exemption does not
-# apply — the safe direction, since the exemption can only relax the gate.
+# pr_author <pr> — the login on stdout, or rc 3 with empty stdout when the
+# read failed. Only needed on the path that actually publishes a Self-Review
+# verdict, and a healthy pass publishes nothing, so reading it per PR up front
+# spent one REST call per PR per 15 minutes for nothing (#1240 Codex round 4).
+#
+# Swallowing the failure here was a real defect, not a tidy default (#1240
+# CodeRabbit). "Read failed" and "author is not Dependabot" collapsed into the
+# same empty string, so a transient 502 on this one call made the caller
+# validate a Dependabot body, find no `## Self-Review` section, and publish a
+# BLOCKING red — while nothing set had_infra_error, so the sweep exited 0
+# claiming success. Every other verdict input in this lane withholds on an
+# unreadable read; this one failed loud and wrong. The status is now
+# propagated and the caller withholds.
+#
+# rc 0 with EMPTY stdout stays a legitimate value, and is the reason the two
+# cases had to be separated rather than both treated as errors: a PR whose
+# author account is deleted reports `user.login: null`, which is genuinely
+# "not Dependabot" and must still be evaluated.
 pr_author() {
-  gh_api_scalar "author of PR #$1" "repos/$REPO/pulls/$1" --jq '.user.login // ""' 2>/dev/null || printf ''
+  gh_api_scalar "author of PR #$1" "repos/$REPO/pulls/$1" --jq '.user.login // ""'
 }
 
 # requires_phase_4 <pr> — `true`, `false`, or rc 1 when the derivation could
@@ -519,39 +531,48 @@ while IFS=$'\t' read -r PR head <&3; do
       conclusion="failure"
       title="$SELF_REVIEW_CONTEXT — ambiguous head"
       summary="More than one open PR carries $head, and one commit slot cannot carry both PRs' verdicts. Close or rebase one of them."
-    elif [ "$(pr_author "$PR")" = "$DEPENDABOT_LOGIN" ]; then
-      conclusion="skipped"
-      title="$SELF_REVIEW_CONTEXT — Dependabot-exempt (recovery sweep)"
-      summary="PR #$PR is authored by $DEPENDABOT_LOGIN, which the event-driven job exempts. Reported as skipped so the required context resolves the way the skipped job would have reported it."
     else
-      # Read the body HERE, not once per PR at the top of the iteration. An
-      # ordinary body edit fires `edited` and so lands a native check run the
-      # compare-and-swap below would catch — but a GITHUB_TOKEN-authored edit
-      # creates no workflow run at all, so for that case a late read is the
-      # only thing that narrows the window (#1240). Same reasoning as the
-      # label list; the two verdict inputs are treated alike.
-      body=""
+      # The author gates the Dependabot exemption, so an unreadable read must
+      # withhold like every other verdict input rather than fall through to
+      # "not Dependabot" — that path publishes a blocking red on a body the
+      # exemption exists to skip (#1240 CodeRabbit).
+      author=""
       conclusion=""
-      if ! body=$(gh_api_scalar "body of PR #$PR" "repos/$REPO/pulls/$PR" --jq '.body // ""'); then
-        infra "could not read the body of PR #$PR; withholding '$SELF_REVIEW_CONTEXT'"
+      if ! author=$(pr_author "$PR"); then
+        infra "could not read the author of PR #$PR; withholding '$SELF_REVIEW_CONTEXT' rather than assuming the Dependabot exemption does not apply"
+      elif [ "$author" = "$DEPENDABOT_LOGIN" ]; then
+        conclusion="skipped"
+        title="$SELF_REVIEW_CONTEXT — Dependabot-exempt (recovery sweep)"
+        summary="PR #$PR is authored by $DEPENDABOT_LOGIN, which the event-driven job exempts. Reported as skipped so the required context resolves the way the skipped job would have reported it."
       else
-        rc=0
-        output=$(printf '%s\n' "$body" | "$VALIDATOR" --self-review-only 2>&1) || rc=$?
-        case "$rc" in
-          0)
-            conclusion="success"
-            title="$SELF_REVIEW_CONTEXT (recovery sweep)"
-            summary="$output"
-            ;;
-          1)
-            conclusion="failure"
-            title="$SELF_REVIEW_CONTEXT (recovery sweep)"
-            summary="$output"
-            ;;
-          *)
-            infra "validate-pr-body.sh exited $rc on PR #$PR (config/usage error); withholding '$SELF_REVIEW_CONTEXT'"
-            ;;
-        esac
+        # Read the body HERE, not once per PR at the top of the iteration. An
+        # ordinary body edit fires `edited` and so lands a native check run the
+        # compare-and-swap below would catch — but a GITHUB_TOKEN-authored edit
+        # creates no workflow run at all, so for that case a late read is the
+        # only thing that narrows the window (#1240). Same reasoning as the
+        # label list; the three verdict inputs are treated alike.
+        body=""
+        if ! body=$(gh_api_scalar "body of PR #$PR" "repos/$REPO/pulls/$PR" --jq '.body // ""'); then
+          infra "could not read the body of PR #$PR; withholding '$SELF_REVIEW_CONTEXT'"
+        else
+          rc=0
+          output=$(printf '%s\n' "$body" | "$VALIDATOR" --self-review-only 2>&1) || rc=$?
+          case "$rc" in
+            0)
+              conclusion="success"
+              title="$SELF_REVIEW_CONTEXT (recovery sweep)"
+              summary="$output"
+              ;;
+            1)
+              conclusion="failure"
+              title="$SELF_REVIEW_CONTEXT (recovery sweep)"
+              summary="$output"
+              ;;
+            *)
+              infra "validate-pr-body.sh exited $rc on PR #$PR (config/usage error); withholding '$SELF_REVIEW_CONTEXT'"
+              ;;
+          esac
+        fi
       fi
     fi
     if [ -n "$conclusion" ]; then
