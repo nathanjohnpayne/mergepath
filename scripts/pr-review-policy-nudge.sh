@@ -140,16 +140,13 @@ if [ "${#MISSING[@]}" -eq 0 ]; then
   # and both fail in that same direction rather than getting their own fence.
   DOUBT=""
 
-  # The presence answer is pinned to the SHA read before the listing. A
-  # `synchronize` in between leaves it describing a superseded commit — and
-  # "nothing to recover" about the wrong head is exactly the stuck state this
-  # command exists to clear.
-  LIVE_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha // ""' 2>/dev/null) || LIVE_HEAD=""
-  if [ -z "$LIVE_HEAD" ]; then
-    DOUBT="the head could not be re-read to confirm it is still $HEAD_SHA"
-  elif [ "$LIVE_HEAD" != "$HEAD_SHA" ]; then
-    DOUBT="the head moved to $LIVE_HEAD after the check runs were listed on $HEAD_SHA"
-  else
+  # Ordering is deliberate: the head confirmation goes LAST, with no I/O after
+  # it. It used to run first, which left a `synchronize` landing during the
+  # shared-head request able to produce a confident rc 3 about a superseded
+  # head. That gap is closed by reordering rather than by another read — and
+  # the one that remains, between this last read and the refusal returning,
+  # contains no request at all. That is the floor; a smaller window can always
+  # be named, and naming one is not a reason to add a fourth read.
     # Check runs attach to a COMMIT, not a PR, and they outlive the PR that
     # produced them. So the question is not "does another OPEN PR share this
     # head" but "is this commit's check-run set exclusively about this PR" —
@@ -170,13 +167,29 @@ if [ "${#MISSING[@]}" -eq 0 ]; then
     # and passing one exits with "unknown flag". Interpolating the SHA into
     # the program text instead would work here and is the wrong habit, so the
     # filter runs in a jq of its own.
-    SHARERS=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" 2>/dev/null \
-      | jq --arg sha "$HEAD_SHA" --argjson pr "$PR_NUMBER" \
-        '[.[] | select(.head.sha == $sha and .number != $pr)] | length') || SHARERS=""
-    case "$SHARERS" in
-      '' | *[!0-9]*) DOUBT="whether another open PR shares head $HEAD_SHA could not be determined" ;;
-      *) [ "$SHARERS" -eq 0 ] || DOUBT="$SHARERS other PR(s) share head $HEAD_SHA, so the reported contexts may belong to one of them" ;;
-    esac
+  # `--paginate` because the endpoint returns 30 per page by default, and a
+  # sharer on page two would read as "no sharer" and produce exactly the
+  # confident refusal this check exists to prevent. `jq -s 'add // []'` is the
+  # repository's idiom for flattening those pages.
+  SHARERS=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/pulls" 2>/dev/null \
+    | jq -s --arg sha "$HEAD_SHA" --argjson pr "$PR_NUMBER" \
+      'add // [] | [.[] | select(.head.sha == $sha and .number != $pr)] | length') || SHARERS=""
+  case "$SHARERS" in
+    '' | *[!0-9]*) DOUBT="whether another PR shares head $HEAD_SHA could not be determined" ;;
+    *) [ "$SHARERS" -eq 0 ] || DOUBT="$SHARERS other PR(s) share head $HEAD_SHA, so the reported contexts may belong to one of them" ;;
+  esac
+
+  # The presence answer is pinned to the SHA read before the listing, so a
+  # `synchronize` since then leaves it describing a superseded commit, and
+  # "nothing to recover" about the wrong head is the stuck state this command
+  # exists to clear.
+  if [ -z "$DOUBT" ]; then
+    LIVE_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha // ""' 2>/dev/null) || LIVE_HEAD=""
+    if [ -z "$LIVE_HEAD" ]; then
+      DOUBT="the head could not be re-read to confirm it is still $HEAD_SHA"
+    elif [ "$LIVE_HEAD" != "$HEAD_SHA" ]; then
+      DOUBT="the head moved to $LIVE_HEAD after the check runs were listed on $HEAD_SHA"
+    fi
   fi
 
   if [ -z "$DOUBT" ]; then

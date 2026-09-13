@@ -70,7 +70,16 @@ case "$*" in
     # filter exists for: this endpoint also lists a stacked PR whose branch
     # merely contains the commit.
     if [ "${STUB_SHARERS_RC:-0}" -ne 0 ]; then echo "sharers read failed" >&2; exit "$STUB_SHARERS_RC"; fi
+    # `gh api --paginate` concatenates one JSON document per page, which the
+    # caller flattens with `jq -s 'add // []'`. STUB_SHARERS_PAGE2 models a
+    # second page — emitted ONLY when --paginate was actually passed, because
+    # that is what real gh does. Emitting it unconditionally made the stub more
+    # permissive than the tool and a mutation dropping --paginate went
+    # uncaught; that is the same shape as the `gh api --arg` miss above.
     printf '%s\n' "${STUB_SHARERS:-[]}"
+    case " $* " in
+      *" --paginate "*) [ -n "${STUB_SHARERS_PAGE2:-}" ] && printf '%s\n' "$STUB_SHARERS_PAGE2" ;;
+    esac
     exit 0 ;;
   *"/pulls/"*)
     if [ "${STUB_PR_RC:-0}" -ne 0 ]; then echo "pull read failed" >&2; exit "$STUB_PR_RC"; fi
@@ -522,6 +531,34 @@ if [ "$RC" = 0 ] && printf '%s' "$ERR" | grep -q "unterminated code fence"; then
   pass "a tilde fence is recognized as well as a backtick fence"
 else
   fail "expected the fence warning on a tilde fence; rc=$RC err='$ERR'"
+fi
+
+echo "--- 18f: a sharer on PAGE TWO still counts"
+# commits/{sha}/pulls returns 30 per page. A sharer past the first page read as
+# "no sharer" would produce exactly the confident refusal this check prevents.
+run_nudge open sha18f "$VALID_BODY" "$BOTH" \
+  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18f"}}]' \
+  STUB_SHARERS_PAGE2='[{"number":11,"state":"open","head":{"sha":"sha18f"}}]'
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "1 other PR(s) share head sha18f"; then
+  pass "the shared-head query is paginated; a second-page sharer is not missed"
+else
+  fail "expected a nudge from a page-two sharer; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 18g: the head is confirmed LAST, with no request after it"
+# Ordering, not an extra read, is what closes the window in which a
+# synchronize during the shared-head request yields a confident rc 3 about a
+# superseded head. Assert the order rather than trusting the source.
+run_nudge open sha18g "$VALID_BODY" "$BOTH" \
+  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18g"}}]'
+SHARERS_LINE=$(grep -n 'commits/sha18g/pulls' "$D/gh.log" | head -1 | cut -d: -f1)
+HEAD_LINE=$(grep -n 'pulls/7 --jq .head.sha' "$D/gh.log" | head -1 | cut -d: -f1)
+LAST_LINE=$(grep -c '' "$D/gh.log")
+if [ "$RC" = 3 ] && [ -n "$SHARERS_LINE" ] && [ -n "$HEAD_LINE" ] \
+  && [ "$SHARERS_LINE" -lt "$HEAD_LINE" ] && [ "$HEAD_LINE" = "$LAST_LINE" ]; then
+  pass "the head confirmation is the final request before the refusal"
+else
+  fail "expected sharers then head last; rc=$RC sharers=$SHARERS_LINE head=$HEAD_LINE last=$LAST_LINE log='$(cat "$D/gh.log")'"
 fi
 
 echo
