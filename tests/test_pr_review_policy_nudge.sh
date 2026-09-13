@@ -649,6 +649,48 @@ else
   fail "expected rc=3 with no edit; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
+# --- 22: execute the live workflow-condition guard -------------------------
+# A minimal file fixture runs the real wrapper in --check mode. The git stub
+# supplies its root without creating a checkout; no PR or workflow is edited.
+WRAPPER_FIXTURE="$TMP/wrapper-fixture"
+mkdir -p "$WRAPPER_FIXTURE/scripts/ci" "$WRAPPER_FIXTURE/scripts/lib" \
+  "$WRAPPER_FIXTURE/tests" "$WRAPPER_FIXTURE/.github/workflows" "$TMP/wrapper-bin"
+cp "$SUBJECT" "$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh"
+cp "$ROOT/scripts/lib/ci-check-modes.sh" "$WRAPPER_FIXTURE/scripts/lib/"
+cp "$ROOT/.github/workflows/pr-review-policy.yml" "$WRAPPER_FIXTURE/.github/workflows/"
+touch "$WRAPPER_FIXTURE/scripts/sync-to-downstream.sh" "$WRAPPER_FIXTURE/tests/test_pr_review_policy_nudge.sh"
+chmod +x "$WRAPPER_FIXTURE/tests/test_pr_review_policy_nudge.sh"
+cat > "$TMP/wrapper-bin/git" <<'STUB'
+#!/usr/bin/env bash
+[ "$*" = "rev-parse --show-toplevel" ] || exit 90
+printf '%s\n' "${STUB_WRAPPER_ROOT:?}"
+STUB
+chmod +x "$TMP/wrapper-bin/git"
+
+check_wrapper_condition() { # <condition> <expected status> <description>
+  local condition=$1 expected=$2 description=$3 rc=0
+  CONDITION="$condition" yq -i '.jobs.label-gate.if = strenv(CONDITION)' \
+    "$WRAPPER_FIXTURE/.github/workflows/pr-review-policy.yml"
+  if [ "$condition" = false ]; then
+    yq -i '.jobs.label-gate.if = false' "$WRAPPER_FIXTURE/.github/workflows/pr-review-policy.yml"
+  fi
+  env PATH="$TMP/wrapper-bin:$PATH" STUB_WRAPPER_ROOT="$WRAPPER_FIXTURE" \
+    bash "$ROOT/scripts/ci/check_pr_review_policy_nudge" --check \
+    >"$TMP/wrapper.out" 2>&1 || rc=$?
+  if [ "$rc" -eq "$expected" ]; then
+    pass "$description"
+  else
+    fail "$description: expected rc=$expected, got $rc; $(cat "$TMP/wrapper.out")"
+  fi
+}
+
+check_wrapper_condition '' 0 "the live wrapper accepts the existing workflow conditions"
+check_wrapper_condition "github.event_name == 'workflow_dispatch'" 1 \
+  "the live wrapper rejects an unverified condition on another event field"
+check_wrapper_condition false 1 "the live wrapper rejects an always-false expression"
+check_wrapper_condition "github.event.action == 'edited'" 0 \
+  "the live wrapper preserves an explicitly supported edited condition"
+
 echo
 echo "============================================"
 echo "test_pr_review_policy_nudge.sh: $PASSED passed, $FAILED failed"

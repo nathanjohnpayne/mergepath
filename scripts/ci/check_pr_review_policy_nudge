@@ -171,15 +171,16 @@ esac
 # edited while never naming it, and `action == 'edited'` names it while being
 # perfectly valid. Evaluating GitHub expression semantics here is out of
 # proportion, so the accepted conditions are PINNED instead: a job may carry
-# no `if`, or one that does not depend on the action at all, or one on this
-# list. Anything else has to be added deliberately, which is the point — the
+# no `if`, or one complete expression on this list. Conditions on other
+# event fields can also exclude edited, so they receive no blanket exemption.
+# Anything else has to be added deliberately, which is the point — the
 # condition is load-bearing for the whole mechanism, so a change to it should
 # force someone to re-reason rather than slip through a regex.
-# The verified set, one per line. A condition that reads the action permits a
-# body edit only if it appears here; anything else must be re-reasoned and
-# added deliberately. Both shapes below genuinely permit `edited`: the first
-# excludes only the two label actions, the second names edited outright.
-ACTION_CONDITIONS_VERIFIED_FOR_EDITED=$(cat <<'CONDITIONS'
+# The verified set, one complete expression per line. Retain the workflow's
+# existing Dependabot exemption, exclude only the two label actions, or name
+# edited outright. Other nonempty conditions require explicit verification.
+JOB_CONDITIONS_VERIFIED_FOR_EDITED=$(cat <<'CONDITIONS'
+github.event.pull_request.user.login != 'dependabot[bot]'
 github.event.action != 'labeled' && github.event.action != 'unlabeled'
 github.event.action == 'edited'
 CONDITIONS
@@ -190,16 +191,14 @@ for job in self-review-check label-gate external-review-labeling; do
     echo "check_pr_review_policy_nudge: $GATE_WORKFLOW has no job '$job'; the recovery contract named three producers" >&2
     exit 1
   fi
-  JOB_IF=$(yq -r ".jobs.\"$job\".if // \"\"" "$GATE_WORKFLOW")
-  # Only a condition that reads the ACTION can gate a job off for `edited`.
-  case "$JOB_IF" in
-    *github.event.action*) ;;
-    *) continue ;;
-  esac
-  if ! printf '%s\n' "$ACTION_CONDITIONS_VERIFIED_FOR_EDITED" | grep -Fxq "$JOB_IF"; then
-    echo "check_pr_review_policy_nudge: $GATE_WORKFLOW job '$job' conditions on the event action with an expression this check has not verified runs for 'edited':" >&2
+  # Preserve a literal false: yq's alternate operator would turn it into the
+  # same empty string as an absent condition and silently accept a skipped job.
+  JOB_IF=$(yq -r ".jobs.\"$job\".if | select(. != null)" "$GATE_WORKFLOW")
+  [ -z "$JOB_IF" ] && continue
+  if ! printf '%s\n' "$JOB_CONDITIONS_VERIFIED_FOR_EDITED" | grep -Fxq "$JOB_IF"; then
+    echo "check_pr_review_policy_nudge: $GATE_WORKFLOW job '$job' has a condition this check has not verified runs for 'edited':" >&2
     echo "    $JOB_IF" >&2
-    echo "  Confirm a body edit still runs it, then add the expression to ACTION_CONDITIONS_VERIFIED_FOR_EDITED." >&2
+    echo "  Confirm a body edit still runs it, then add the expression to JOB_CONDITIONS_VERIFIED_FOR_EDITED." >&2
     exit 1
   fi
 done
