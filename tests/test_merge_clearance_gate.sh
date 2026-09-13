@@ -2173,6 +2173,50 @@ for pin_case in head base-ref base-sha; do
   fi
 done
 
+# GitHub caps the PR files listing at 3000 entries. AT the cap the inventory may
+# be truncated, so both the lines total and the protected-path match below are
+# reading an incomplete list. scripts/workflow/external_review_fingerprint.sh has
+# forced requires_review at this bound since #427; this derivation did not, so
+# two implementations of the same question disagreed FAIL-OPEN on exactly the
+# largest PRs. Both directions are pinned: at the cap the answer must be true
+# even when every entry is tiny and excluded, and one entry below the cap the
+# ordinary rules must still apply so the guard cannot mask a genuine `false`.
+lockfile_inventory() {  # <count>  excluded, zero-line entries: ordinary rules say false
+  jq -nc --argjson n "$1" '[range($n) | {filename:"p\(.)/yarn.lock", additions:0, deletions:0}]'
+}
+
+echo; echo "--- Phase 4 Query 9: files listing AT the 3000-entry cap → true (fail closed)"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture "$(lockfile_inventory 3000)")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-phase-4-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "Phase 4 query: a possibly-capped files inventory fails closed to true"
+else
+  fail "Phase 4 query: at the 3000-entry cap expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Phase 4 Query 10: one entry BELOW the cap → false (the guard must not over-fire)"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture "$(lockfile_inventory 2999)")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-phase-4-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "Phase 4 query: 2999 excluded zero-line entries stay false — the cap guard does not over-fire"
+else
+  fail "Phase 4 query: one entry below the cap expected false/0; got rc=$RC out='$OUT'"
+fi
+
 # ---------------------------------------------------------------------------
 # --derive-rate-limit-protection query mode (#713, tightened by #772): prints
 # exactly true/false. `true` means the auto-merge rc=5 path is protected either

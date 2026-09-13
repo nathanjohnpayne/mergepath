@@ -1238,7 +1238,30 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] 
       | add // 0')
     LINES_CHANGED=${LINES_CHANGED:-0}
 
-    if [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
+    # GitHub caps the pull-request files listing at 3000 entries. AT the cap the
+    # inventory may be truncated, which makes both tests below unsound: the
+    # lines total is a floor rather than the diff, and the protected-path match
+    # is reading an incomplete file list. Either can say "under threshold,
+    # nothing protected" about a PR that is neither.
+    #
+    # scripts/workflow/external_review_fingerprint.sh has forced requires_review
+    # at this bound since #427; this derivation did not, so the two
+    # implementations of the same question disagreed in the FAIL-OPEN direction
+    # on exactly the largest PRs. The live consumer is
+    # scripts/workflow/approval-independence-check.sh (#1094), which feeds this
+    # answer to the self-approval detector as `requiresExternalReview` — so a
+    # spurious `false` weakens approval independence precisely where the diff is
+    # too large to review casually.
+    #
+    # Keep this bound in step with the fingerprint helper's.
+    PR_FILES_CAP=3000
+    FILES_COUNT=$(echo "$FILES_JSON" | jq 'length')
+    FILES_COUNT=${FILES_COUNT:-0}
+
+    if [ "$FILES_COUNT" -ge "$PR_FILES_CAP" ]; then
+      REQUIRES_EXTERNAL=true
+      REQUIRES_REASON="PR files API returned $FILES_COUNT files; treating as external review required because GitHub may have capped the diff"
+    elif [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
       REQUIRES_EXTERNAL=true
       REQUIRES_REASON="$LINES_CHANGED lines changed >= threshold $THRESHOLD"
     else
