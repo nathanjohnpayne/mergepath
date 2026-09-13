@@ -167,8 +167,14 @@ run_nudge() {
   jq -n --arg s "$state" --arg h "$head" --arg b "$body" \
     '{state:$s, head:{sha:$h}, body:$b}' > "$D/pr.json"
   : > "$D/gh.log"; : > "$D/edit.log"; : > "$D/written.txt"
+  # The refusal's premise is "the set of PRs whose head IS this commit is
+  # exactly this PR", so that is the default payload. A case overrides it to
+  # model a moved head (this PR absent), a sharer (someone else present), or an
+  # unreadable answer.
+  DEFAULT_AT_HEAD=$(jq -nc --arg sha "$head" '[{number:7, state:"open", head:{sha:$sha}}]')
   set +e
   env PATH="$TMP/bin:$PATH" \
+    STUB_SHARERS="$DEFAULT_AT_HEAD" \
     STUB_GH_LOG="$D/gh.log" STUB_EDIT_LOG="$D/edit.log" \
     STUB_WRITTEN_BODY="$D/written.txt" STUB_PR_JSON_FILE="$D/pr.json" \
     STUB_CHECK_NAMES="$names" \
@@ -451,8 +457,9 @@ fi
 # So wherever the refusal's premise is uncertain it must nudge instead. These
 # four pin that direction, and case 18d pins that it does not over-fire.
 echo "--- 18a: both reported but the head MOVED -> nudge, do not refuse"
-run_nudge open sha18a "$VALID_BODY" "$BOTH" STUB_LIVE_HEAD=sha18a-new
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "the head moved to sha18a-new"; then
+run_nudge open sha18a "$VALID_BODY" "$BOTH" \
+  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18a-new"}}]'
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "carries PR set \[none\]"; then
   pass "a presence answer pinned to a superseded head does not become a refusal"
 else
   fail "expected a nudge naming the moved head; rc=$RC wrote=$WROTE err='$ERR'"
@@ -462,7 +469,7 @@ echo "--- 18b: both reported but TWO open PRs share the head -> nudge"
 # Check runs attach to a commit, so the other PR's contexts are in this list.
 run_nudge open sha18b "$VALID_BODY" "$BOTH" \
   STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18b"}},{"number":9,"state":"open","head":{"sha":"sha18b"}}]'
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "1 other PR(s) share head sha18b"; then
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "carries PR set \[7,9\]"; then
   pass "an ambiguous head nudges rather than trusting another PR's contexts"
 else
   fail "expected a nudge naming the shared head; rc=$RC wrote=$WROTE err='$ERR'"
@@ -470,7 +477,7 @@ fi
 
 echo "--- 18c: the sharers read fails -> nudge (unknown is not 'nothing to do')"
 run_nudge open sha18c "$VALID_BODY" "$BOTH" STUB_SHARERS_RC=1
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "could not be determined"; then
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "could not be read"; then
   pass "an unreadable sharer count nudges rather than refusing"
 else
   fail "expected a nudge on an unreadable sharer count; rc=$RC wrote=$WROTE err='$ERR'"
@@ -497,7 +504,7 @@ echo "--- 18e: a CLOSED PR at this exact head DOES make it ambiguous -> nudge"
 # is still open.
 run_nudge open sha18e "$VALID_BODY" "$BOTH" \
   STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18e"}},{"number":6,"state":"closed","head":{"sha":"sha18e"}}]'
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "1 other PR(s) share head sha18e"; then
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "carries PR set \[6,7\]"; then
   pass "a closed PR's leftover runs are not accepted as this PR's contexts"
 else
   fail "expected a nudge naming the other PR; rc=$RC wrote=$WROTE err='$ERR'"
@@ -539,26 +546,28 @@ echo "--- 18f: a sharer on PAGE TWO still counts"
 run_nudge open sha18f "$VALID_BODY" "$BOTH" \
   STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18f"}}]' \
   STUB_SHARERS_PAGE2='[{"number":11,"state":"open","head":{"sha":"sha18f"}}]'
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "1 other PR(s) share head sha18f"; then
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "carries PR set \[7,11\]"; then
   pass "the shared-head query is paginated; a second-page sharer is not missed"
 else
   fail "expected a nudge from a page-two sharer; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
-echo "--- 18g: the head is confirmed LAST, with no request after it"
-# Ordering, not an extra read, is what closes the window in which a
-# synchronize during the shared-head request yields a confident rc 3 about a
-# superseded head. Assert the order rather than trusting the source.
-run_nudge open sha18g "$VALID_BODY" "$BOTH" \
-  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18g"}}]'
-SHARERS_LINE=$(grep -n 'commits/sha18g/pulls' "$D/gh.log" | head -1 | cut -d: -f1)
-HEAD_LINE=$(grep -n 'pulls/7 --jq .head.sha' "$D/gh.log" | head -1 | cut -d: -f1)
-LAST_LINE=$(grep -c '' "$D/gh.log")
-if [ "$RC" = 3 ] && [ -n "$SHARERS_LINE" ] && [ -n "$HEAD_LINE" ] \
-  && [ "$SHARERS_LINE" -lt "$HEAD_LINE" ] && [ "$HEAD_LINE" = "$LAST_LINE" ]; then
-  pass "the head confirmation is the final request before the refusal"
+echo "--- 18g: the refusal establishes its premise in ONE request"
+# Two reads had to be sequenced, and whichever ran first left a window in which
+# the other's answer went stale; three review rounds each closed one such
+# window and named the next. One read has no interior, so this asserts the
+# exact call set rather than an ordering between two of them.
+run_nudge open sha18g "$VALID_BODY" "$BOTH"
+REFUSAL_CALLS=$(cat <<'CALLS'
+api repos/owner/repo/pulls/7
+api --paginate repos/owner/repo/commits/sha18g/check-runs --jq .check_runs[].name
+api --paginate repos/owner/repo/commits/sha18g/pulls
+CALLS
+)
+if [ "$RC" = 3 ] && [ "$(cat "$D/gh.log")" = "$REFUSAL_CALLS" ]; then
+  pass "a refusal costs exactly three reads and has no second premise query to race"
 else
-  fail "expected sharers then head last; rc=$RC sharers=$SHARERS_LINE head=$HEAD_LINE last=$LAST_LINE log='$(cat "$D/gh.log")'"
+  fail "expected rc=3 and exactly the three reads; rc=$RC log='$(cat "$D/gh.log")'"
 fi
 
 echo

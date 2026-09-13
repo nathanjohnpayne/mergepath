@@ -136,60 +136,53 @@ if [ "${#MISSING[@]}" -eq 0 ]; then
   # The refusal is an optimization, not a safety property. Nudging a PR that
   # did not need it costs one workflow run; refusing one that did defeats the
   # whole tool. So the refusal has to be sure of its own premise, and wherever
-  # it is not, it nudges and says why. Both doubts below were review findings,
-  # and both fail in that same direction rather than getting their own fence.
+  # it is not, it nudges and says why.
+  #
+  # ONE read answers the whole premise, because both halves of it are the same
+  # question. `commits/{sha}/pulls` lists every PR whose branch contains this
+  # commit, each with its own current head; filtering that list to PRs whose
+  # head IS this commit yields exactly the set of PRs the commit's check runs
+  # could belong to. The premise holds when that set is precisely this PR:
+  #
+  #   this PR absent   → its head moved since the listing, so the presence
+  #                      answer describes a superseded commit
+  #   anyone else in   → check runs attach to a commit and outlive the PR that
+  #                      produced them, so `Self-Review Required` and `Label
+  #                      Gate` here may be someone else's. A CLOSED sharer is
+  #                      the sharp case: a new PR reusing the SHA would inherit
+  #                      a green it was never classified for
+  #   exactly {this}   → certain, so refuse
+  #
+  # Asking it once is what makes the ordering hazard disappear rather than move.
+  # Two reads had to be sequenced, and whichever went first left a window in
+  # which the other's answer went stale; three review rounds each closed one
+  # such window and named the next. One read has no interior.
+  #
+  # `.head.sha` is the filter, never mere association: this endpoint also lists
+  # a stacked PR whose branch CONTAINS the commit but has advanced past it, and
+  # counting those would disable the refusal entirely (#1240).
+  #
+  # `--paginate` because the endpoint returns 30 per page and a sharer on page
+  # two would read as no sharer, producing the exact confident refusal this
+  # guards against; `jq -s 'add // []'` is the repository's flattening idiom.
+  # Filtered by a real jq rather than `--jq`, because `gh api` has no `--arg`
+  # to bind a variable into its program and passing one exits "unknown flag".
+  # Deliberately NOT `jq -r`: the quoting is load-bearing. A failed read leaves
+  # AT_HEAD empty, while a successful read that finds no PR at this head yields
+  # the two-character string `""`. `-r` would collapse those into one value —
+  # the "same answer for failed and for a real result" shape this file guards
+  # against everywhere else.
   DOUBT=""
+  AT_HEAD=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/pulls" 2>/dev/null \
+    | jq -s --arg sha "$HEAD_SHA" \
+      'add // [] | [.[] | select(.head.sha == $sha) | .number] | sort | join(",")') || AT_HEAD=""
+  EXPECTED_AT_HEAD="\"$PR_NUMBER\""
 
-  # Ordering is deliberate: the head confirmation goes LAST, with no I/O after
-  # it. It used to run first, which left a `synchronize` landing during the
-  # shared-head request able to produce a confident rc 3 about a superseded
-  # head. That gap is closed by reordering rather than by another read — and
-  # the one that remains, between this last read and the refusal returning,
-  # contains no request at all. That is the floor; a smaller window can always
-  # be named, and naming one is not a reason to add a fourth read.
-    # Check runs attach to a COMMIT, not a PR, and they outlive the PR that
-    # produced them. So the question is not "does another OPEN PR share this
-    # head" but "is this commit's check-run set exclusively about this PR" —
-    # any other PR at this exact head, open or closed, may have left the runs
-    # being read. A closed one is the sharper case: its `Self-Review Required`
-    # and `Label Gate` sit on the commit forever, so a new PR reusing the SHA
-    # would inherit a green it was never classified for.
-    # specs/required_check_publisher.md takes the same red-until-disambiguated
-    # position for its own per-commit slots.
-    #
-    # `.head.sha` is still the filter, not mere association: commits/{sha}/pulls
-    # also lists a stacked PR whose branch merely CONTAINS the commit and has
-    # advanced past it, and counting those would disable the refusal entirely
-    # (#1240).
-    #
-    # Fetched raw and filtered by a real jq, because `gh api` has no `--arg`:
-    # it takes a `--jq` program but exposes no way to bind a variable into it,
-    # and passing one exits with "unknown flag". Interpolating the SHA into
-    # the program text instead would work here and is the wrong habit, so the
-    # filter runs in a jq of its own.
-  # `--paginate` because the endpoint returns 30 per page by default, and a
-  # sharer on page two would read as "no sharer" and produce exactly the
-  # confident refusal this check exists to prevent. `jq -s 'add // []'` is the
-  # repository's idiom for flattening those pages.
-  SHARERS=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/pulls" 2>/dev/null \
-    | jq -s --arg sha "$HEAD_SHA" --argjson pr "$PR_NUMBER" \
-      'add // [] | [.[] | select(.head.sha == $sha and .number != $pr)] | length') || SHARERS=""
-  case "$SHARERS" in
-    '' | *[!0-9]*) DOUBT="whether another PR shares head $HEAD_SHA could not be determined" ;;
-    *) [ "$SHARERS" -eq 0 ] || DOUBT="$SHARERS other PR(s) share head $HEAD_SHA, so the reported contexts may belong to one of them" ;;
-  esac
-
-  # The presence answer is pinned to the SHA read before the listing, so a
-  # `synchronize` since then leaves it describing a superseded commit, and
-  # "nothing to recover" about the wrong head is the stuck state this command
-  # exists to clear.
-  if [ -z "$DOUBT" ]; then
-    LIVE_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha // ""' 2>/dev/null) || LIVE_HEAD=""
-    if [ -z "$LIVE_HEAD" ]; then
-      DOUBT="the head could not be re-read to confirm it is still $HEAD_SHA"
-    elif [ "$LIVE_HEAD" != "$HEAD_SHA" ]; then
-      DOUBT="the head moved to $LIVE_HEAD after the check runs were listed on $HEAD_SHA"
-    fi
+  if [ -z "$AT_HEAD" ]; then
+    DOUBT="the set of PRs at head $HEAD_SHA could not be read"
+  elif [ "$AT_HEAD" != "$EXPECTED_AT_HEAD" ]; then
+    AT_HEAD_PLAIN=$(printf '%s' "$AT_HEAD" | tr -d '"')
+    DOUBT="head $HEAD_SHA carries PR set [${AT_HEAD_PLAIN:-none}] rather than #$PR_NUMBER alone, so the reported contexts may not be this PR's"
   fi
 
   if [ -z "$DOUBT" ]; then

@@ -73,18 +73,20 @@ The script is hub-only. It takes `<PR#> [owner/repo]`, so one copy run from the 
 
 Recovery is now a human action rather than an automatic one. That is a real reduction in coverage against the incident #931 describes: a PR whose delivery is dropped while nobody is looking stays stuck until somebody notices. The trade accepted here is that the automatic version costs the obligation inventory above, and an automatic mechanism that is subtly wrong about ownership is worse than a manual one that is right—the concrete failure #1240 shipped and then fixed was a sweep that overwrote a legitimately-cleared green with a stale red every fifteen minutes.
 
-The mechanism carries no state, no schedule, no concurrency group, and no API budget worth modelling: at most five reads and one body edit per invocation, by a human.
+The mechanism carries no state, no schedule, no concurrency group, and no API budget worth modelling: at most four reads and one body edit per invocation, by a human.
 
 | path | reads |
 | --- | --- |
 | a context is missing, so it nudges | 3: the PR read, the check-run listing, the pre-write re-read |
-| both reported and the premise holds, so it refuses | 4: the first two, the shared-head query, the head confirmation |
-| both reported but the premise is uncertain, so it nudges anyway | 5: the four above plus the pre-write re-read |
+| both reported and the premise holds, so it refuses | 3: the PR read, the check-run listing, the at-head query |
+| both reported but the premise is uncertain, so it nudges anyway | 4: those three plus the pre-write re-read |
 
 
 It does carry one fence, and two checks that look like fences and are not. The distinction matters because the rejected design's fences are half the reason it was rejected. Those existed because it *published verdicts*: they arbitrated ownership between two producers of one context, over a check-run set, with a compare-and-swap and a residual write window that no available primitive could close. This one is an ordinary lost-update guard—the body write replaces the whole description, so it is re-read immediately beforehand and the run aborts if it moved. Every tool that rewrites a whole PR body needs that, verdicts or not, and it is one read and one comparison rather than a three-fence protocol. It aborts rather than rebuilding, because rebuilding would re-run the validators and reopen the same window one layer down.
 
-The two that are not fences guard the *refusal*, not the write, and they fail in the opposite direction. Check runs attach to a commit rather than a PR *and outlive the PR that produced them*, so the real question is whether a commit's check-run set is exclusively this PR's—any other PR at that exact head, open or closed, may have left the runs being read, and a new PR reusing a closed one's SHA would inherit a green it was never classified for. Separately, the presence answer is pinned to a SHA read before the listing, which a `synchronize` can supersede. Both would produce "nothing to recover" about a PR that has plenty to recover. So where the refusal cannot establish its own premise—the head moved, the head is shared, either answer is unreadable—it nudges and says why.
+The two that are not fences guard the *refusal*, not the write, and they fail in the opposite direction. Check runs attach to a commit rather than a PR *and outlive the PR that produced them*, so the real question is whether a commit's check-run set is exclusively this PR's—any other PR at that exact head, open or closed, may have left the runs being read, and a new PR reusing a closed one's SHA would inherit a green it was never classified for. The presence answer is also pinned to a SHA read before the listing, which a `synchronize` can supersede.
+
+Both are the same question, and asking it once is what keeps this from becoming a fence protocol. `commits/{sha}/pulls`, filtered to PRs whose head *is* that commit, yields exactly the set of PRs the commit's check runs could belong to: this PR missing from it means the head moved, anyone else in it means the runs may not be ours, and the set being precisely this PR is the only certain case. Three review rounds each closed a window between two sequenced reads and named the next one; a single read has no interior. Both would produce "nothing to recover" about a PR that has plenty to recover. So where the refusal cannot establish its own premise—the head moved, the head is shared, either answer is unreadable—it nudges and says why.
 
 That direction is the whole difference. A fence withholds a publication because acting on a stale premise could be wrong. These release a nudge because *not* acting on an uncertain premise is what would be wrong: nudging a PR that did not need it costs one workflow run, and refusing one that did defeats the tool. Nothing here has to be right about ownership, because nothing here publishes a verdict.
 
