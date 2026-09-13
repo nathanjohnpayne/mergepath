@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# check_pr_review_policy_nudge — CI for the #931 recovery nudge.
+#
+# scripts/pr-review-policy-nudge.sh is hub-only operator tooling: it takes
+# `<PR#> [owner/repo]`, so one copy run from the hub serves the whole fleet,
+# and the credential it needs to edit a PR body lives on the operator's
+# machine rather than in any consumer repo. This wrapper therefore SKIPs on
+# consumers via the sync-to-downstream marker, the way check_wave_audit and
+# check_project_doc_sync do; the paired suite legitimately does not travel.
+#
+# Two live assertions run before the suite, because each pins a property whose
+# quiet loss would turn the nudge back into the architecture #931 rejected:
+#
+#   1. It publishes nothing. The whole reason this is a nudge and not a second
+#      producer is that it never writes a check run. A write verb appearing in
+#      the script would re-acquire the ownership, retirement, fencing and
+#      Phase-4 obligations the design exists to avoid.
+#   2. The context names are in lockstep with pr-review-policy.yml's job
+#      names. The refuse-on-presence guardrail matches check-run names against
+#      those two strings; if the workflow renames a job, the match silently
+#      stops firing and the script degrades into an unconditional "re-run my
+#      checks" button, which is exactly what it must not become.
+#
+# See docs/architecture/0003-pr-review-policy-recovery-producer.md.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+SUBJECT="scripts/pr-review-policy-nudge.sh"
+TEST_SCRIPT="tests/test_pr_review_policy_nudge.sh"
+GATE_WORKFLOW=".github/workflows/pr-review-policy.yml"
+
+# Marker-first, per the hub-only convention: guard on the orchestrator's
+# presence alone, never on whether the wrapped artifact happens to be there —
+# a consumer can carry stale residue at a different revision.
+if [ ! -f scripts/sync-to-downstream.sh ]; then
+  echo "check_pr_review_policy_nudge: SKIP (consumer checkout — the nudge is hub-only operator tooling)"
+  exit 0
+fi
+
+for f in "$SUBJECT" "$TEST_SCRIPT" "$GATE_WORKFLOW"; do
+  if [ ! -f "$f" ]; then
+    echo "check_pr_review_policy_nudge: missing required file: $f" >&2
+    exit 1
+  fi
+done
+for f in "$SUBJECT" "$TEST_SCRIPT"; do
+  if [ ! -x "$f" ]; then
+    echo "check_pr_review_policy_nudge: $f is not executable" >&2
+    exit 1
+  fi
+done
+
+# --- 1: it publishes nothing ------------------------------------------------
+# Comments are stripped first so the rationale above — which necessarily talks
+# about check runs and POSTs — cannot satisfy or trip its own assertion.
+CODE=$(sed 's/[[:space:]]*#.*$//' "$SUBJECT")
+
+if printf '%s\n' "$CODE" | grep -Eq -- '(^|[^-])-X[[:space:]]|--method[[:space:]]|--input[[:space:]]'; then
+  echo "check_pr_review_policy_nudge: $SUBJECT issues a non-GET gh api call; the nudge must publish nothing" >&2
+  exit 1
+fi
+
+CHECK_RUN_LINES=$(printf '%s\n' "$CODE" | grep -c 'check-runs' || true)
+if [ "$CHECK_RUN_LINES" -ne 1 ]; then
+  echo "check_pr_review_policy_nudge: expected exactly one check-runs reference (the read) in $SUBJECT; found $CHECK_RUN_LINES" >&2
+  exit 1
+fi
+
+# --- 2: lockstep with the canonical producer's job names --------------------
+# The script's two constants must each be a `name:` in the gate workflow.
+# Read from the script rather than restated here, so this cannot drift into a
+# third copy of the same two strings.
+for var in CONTEXT_SELF_REVIEW CONTEXT_LABEL_GATE; do
+  value=$(printf '%s\n' "$CODE" | sed -n "s/^$var=\"\\(.*\\)\"$/\\1/p" | head -1)
+  if [ -z "$value" ]; then
+    echo "check_pr_review_policy_nudge: could not read $var from $SUBJECT" >&2
+    exit 1
+  fi
+  if ! grep -Eq "^[[:space:]]+name: $value\$" "$GATE_WORKFLOW"; then
+    echo "check_pr_review_policy_nudge: '$value' is not a job name in $GATE_WORKFLOW; the refuse-on-presence guard would never match" >&2
+    exit 1
+  fi
+done
+
+bash "$TEST_SCRIPT"
+
+echo "check_pr_review_policy_nudge: PASS"
