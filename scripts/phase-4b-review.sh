@@ -122,8 +122,34 @@ P4B_ACCT_LOOP_RECORDED=false
 P4B_PRE_POST_ACCT_CLEANED=false
 # Outcome of the most recent p4b_acct_mark_unposted call: true when the loop
 # correction landed (or there was nothing to correct), false when the rewrite
-# failed. Carried in a global rather than an exit status — see the contract
-# note on p4b_acct_mark_unposted below.
+# failed.
+#
+# WHY A GLOBAL AND NOT A RETURN STATUS — do not "tidy" this into one (#1143).
+# p4b_acct_mark_unposted is ADVISORY by contract: it must never change the
+# caller's exit code. Six of its call sites have the shape
+#
+#     X || { p4b_acct_mark_unposted "..."; p4b_die N "..."; }
+#
+# and bash applies errexit to commands inside the group following the FINAL
+# `||`. A non-zero return from the first command in that group therefore
+# aborts the run *before* the intended `p4b_die N`, silently turning an
+# advisory accounting failure into a different exit code — precisely the
+# contract violation the function promises cannot happen. A seventh call site
+# is bare inside an `if` body, with the same consequence. Making the status the
+# channel would leave the contract depending on every present and future caller
+# remembering `|| true`, which is a convention, not a guarantee.
+#
+# The global keeps the advisory guarantee structural (the function cannot
+# abort a caller) while still making the outcome observable to the one caller
+# that needs it.
+#
+# STALENESS: p4b_acct_mark_unposted resets this to true on entry, before any
+# early return, so a reader always sees the outcome of the attempt it just
+# triggered and never a leftover from an earlier one. Readers additionally
+# default it to FALSE when unset, not true — see the read site — so the
+# unreachable case fails toward "we did not correct it" (a retry, harmless and
+# idempotent) rather than toward "we did" (a durable phantom posted record,
+# which is the defect this whole variable exists to prevent).
 P4B_ACCT_LAST_CORRECTION_OK=true
 
 # Per-invocation ledger-staging token (#615 Codex round 6). Exported so the
@@ -153,6 +179,9 @@ export P4B_ACCT_RUN_ID
 # structural while still making the outcome observable.
 p4b_acct_mark_unposted() {
   local why="$1"
+  # Reset FIRST, before any early return, so this can never be read stale from
+  # an earlier attempt. A leftover `true` here would be the same "the flag
+  # records that we tried" defect one level up.
   P4B_ACCT_LAST_CORRECTION_OK=true
   p4b_acct_on 2>/dev/null || return 0
   p4b_acct_hook_discard_pending_record || true
@@ -583,7 +612,14 @@ cleanup_pre_post_refusal_side_effects() {
       # posted. That is the outcome the round-4 ordering fix exists to
       # prevent, reached through the correction's FAILURE path instead of
       # through its ordering.
-      if [ "${P4B_ACCT_LAST_CORRECTION_OK:-true}" = true ]; then
+      # Default FALSE when unset, deliberately. Unset is unreachable (the
+      # variable is initialised at the top of this script and reset on entry to
+      # p4b_acct_mark_unposted), but the two failure directions are not
+      # symmetric: defaulting true would claim a correction landed that may not
+      # have, leaving a durable `posted` record for a review that never posted;
+      # defaulting false at worst runs the later correction attempt again,
+      # which is idempotent. Fail toward the retry.
+      if [ "${P4B_ACCT_LAST_CORRECTION_OK:-false}" = true ]; then
         P4B_PRE_POST_ACCT_CLEANED=true
       fi
     fi
