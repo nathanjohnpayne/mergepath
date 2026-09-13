@@ -118,12 +118,34 @@ OLD_BODY=$(printf '%s' "$PR_JSON" | jq -r '.body // ""')
 [ "$STATE" = "open" ] || die "PR $REPO#$PR_NUMBER is $STATE, not open" 1
 
 # --- refuse on presence, not on success ------------------------------------
-# Any check run under either name means that context reported on this head.
 # The conclusion is deliberately not consulted: a red `Label Gate` is the
 # canonical producer having run and having decided, which is the outcome this
 # script exists to bring about.
-NAMES=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-  --jq '.check_runs[].name' 2>/dev/null) \
+#
+# The NAME alone is not presence, though. A run counts only if it is also:
+#
+#   from the canonical app — branch protection pins these contexts to GitHub
+#     Actions, so a same-named run from another App never satisfies them and
+#     must not satisfy this check either. That confusion is #1213, one layer up.
+#
+#   associated with THIS PR — check runs attach to a COMMIT and outlive the PR
+#     that produced them. Measured on this repository: an open PR's runs carry
+#     `pull_requests: [<its number>]` and a CLOSED PR's carry `[]`. Without the
+#     association a new PR reusing a closed PR's SHA inherits a green it was
+#     never classified for, and two open PRs on one head satisfy each other.
+#
+# Asking each run who it belongs to also beats asking `commits/{sha}/pulls` who
+# else is at the head: that endpoint documents, and this repository confirms,
+# that it omits closed PRs for a commit off the default branch — so it is blind
+# to precisely the case it would have been there for. And this costs no extra
+# read, because the listing is already being fetched.
+NAMES=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" 2>/dev/null \
+  | jq -r -s --argjson pr "$PR_NUMBER" '
+      [.[].check_runs[]]
+      | .[]
+      | select(.app.slug == "github-actions")
+      | select([.pull_requests[]?.number] | index($pr))
+      | .name') \
   || die "could not list check runs on $HEAD_SHA" 2
 
 has_context() { printf '%s\n' "$NAMES" | grep -Fxq "$1"; }
@@ -135,54 +157,21 @@ has_context "$CONTEXT_LABEL_GATE" || MISSING+=("$CONTEXT_LABEL_GATE")
 if [ "${#MISSING[@]}" -eq 0 ]; then
   # The refusal is an optimization, not a safety property. Nudging a PR that
   # did not need it costs one workflow run; refusing one that did defeats the
-  # whole tool. So the refusal has to be sure of its own premise, and wherever
-  # it is not, it nudges and says why.
+  # whole tool. So where the refusal cannot establish its premise, it nudges.
   #
-  # ONE read answers the whole premise, because both halves of it are the same
-  # question. `commits/{sha}/pulls` lists every PR whose branch contains this
-  # commit, each with its own current head; filtering that list to PRs whose
-  # head IS this commit yields exactly the set of PRs the commit's check runs
-  # could belong to. The premise holds when that set is precisely this PR:
-  #
-  #   this PR absent   → its head moved since the listing, so the presence
-  #                      answer describes a superseded commit
-  #   anyone else in   → check runs attach to a commit and outlive the PR that
-  #                      produced them, so `Self-Review Required` and `Label
-  #                      Gate` here may be someone else's. A CLOSED sharer is
-  #                      the sharp case: a new PR reusing the SHA would inherit
-  #                      a green it was never classified for
-  #   exactly {this}   → certain, so refuse
-  #
-  # Asking it once is what makes the ordering hazard disappear rather than move.
-  # Two reads had to be sequenced, and whichever went first left a window in
-  # which the other's answer went stale; three review rounds each closed one
-  # such window and named the next. One read has no interior.
-  #
-  # `.head.sha` is the filter, never mere association: this endpoint also lists
-  # a stacked PR whose branch CONTAINS the commit but has advanced past it, and
-  # counting those would disable the refusal entirely (#1240).
-  #
-  # `--paginate` because the endpoint returns 30 per page and a sharer on page
-  # two would read as no sharer, producing the exact confident refusal this
-  # guards against; `jq -s 'add // []'` is the repository's flattening idiom.
-  # Filtered by a real jq rather than `--jq`, because `gh api` has no `--arg`
-  # to bind a variable into its program and passing one exits "unknown flag".
-  # Deliberately NOT `jq -r`: the quoting is load-bearing. A failed read leaves
-  # AT_HEAD empty, while a successful read that finds no PR at this head yields
-  # the two-character string `""`. `-r` would collapse those into one value —
-  # the "same answer for failed and for a real result" shape this file guards
-  # against everywhere else.
+  # The per-run association above already answers "are these contexts ours".
+  # One thing can still make that answer stale: the head moved after it was
+  # read, so the listing described a superseded commit and "nothing to recover"
+  # would be about the wrong commit. Confirm it LAST, with no request after —
+  # the window that remains contains no I/O, which is the floor. Earlier rounds
+  # closed a window between two sequenced premise reads and each time a smaller
+  # one could be named; there is only one read here now.
   DOUBT=""
-  AT_HEAD=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/pulls" 2>/dev/null \
-    | jq -s --arg sha "$HEAD_SHA" \
-      'add // [] | [.[] | select(.head.sha == $sha) | .number] | sort | join(",")') || AT_HEAD=""
-  EXPECTED_AT_HEAD="\"$PR_NUMBER\""
-
-  if [ -z "$AT_HEAD" ]; then
-    DOUBT="the set of PRs at head $HEAD_SHA could not be read"
-  elif [ "$AT_HEAD" != "$EXPECTED_AT_HEAD" ]; then
-    AT_HEAD_PLAIN=$(printf '%s' "$AT_HEAD" | tr -d '"')
-    DOUBT="head $HEAD_SHA carries PR set [${AT_HEAD_PLAIN:-none}] rather than #$PR_NUMBER alone, so the reported contexts may not be this PR's"
+  LIVE_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha // ""' 2>/dev/null) || LIVE_HEAD=""
+  if [ -z "$LIVE_HEAD" ]; then
+    DOUBT="the head could not be re-read to confirm it is still $HEAD_SHA"
+  elif [ "$LIVE_HEAD" != "$HEAD_SHA" ]; then
+    DOUBT="the head moved to $LIVE_HEAD after the check runs were listed on $HEAD_SHA"
   fi
 
   if [ -z "$DOUBT" ]; then

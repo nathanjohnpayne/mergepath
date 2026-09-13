@@ -59,8 +59,14 @@ case "$*" in
     printf '%s\n' "${STUB_REPO:-owner/repo}"; exit 0 ;;
   *check-runs*)
     if [ "${STUB_RUNS_RC:-0}" -ne 0 ]; then echo "check-runs read failed" >&2; exit "$STUB_RUNS_RC"; fi
-    # The real command prints one name per line under this --jq.
-    [ -n "${STUB_CHECK_NAMES:-}" ] && printf '%s\n' "$STUB_CHECK_NAMES"
+    # The RAW page payload, so the production filter — app identity and PR
+    # association, not just the name — is the one that runs. A pre-filtered
+    # name list would make the suite blind to exactly the defects that filter
+    # exists for, which is how three findings on this PR got past it.
+    printf '%s\n' "${STUB_CHECK_RUNS_RAW:-${STUB_CHECK_RUNS:?}}"
+    case " $* " in
+      *" --paginate "*) [ -n "${STUB_CHECK_RUNS_PAGE2:-}" ] && printf '%s\n' "$STUB_CHECK_RUNS_PAGE2" ;;
+    esac
     exit 0 ;;
   *commits/*/pulls*)
     # The refusal path asks who else carries this head. STUB_SHARERS is the
@@ -93,6 +99,11 @@ case "$*" in
       case "$1" in --jq) jqexpr=$2; shift 2 ;; *) shift ;; esac
     done
     if [ -z "$jqexpr" ]; then cat "${STUB_PR_JSON_FILE:?}"; exit 0; fi
+    # Scoped by which field is being re-read, so a case can break the head
+    # confirmation without also breaking the pre-write body re-read.
+    case "$jqexpr" in
+      *head.sha*) [ "${STUB_HEADREAD_RC:-0}" -eq 0 ] || { echo "head re-read failed" >&2; exit "$STUB_HEADREAD_RC"; } ;;
+    esac
     live=$(cat "${STUB_PR_JSON_FILE:?}")
     if [ -n "${STUB_LIVE_BODY_FILE:-}" ]; then
       live=$(printf '%s' "$live" | jq --arg b "$(cat "$STUB_LIVE_BODY_FILE")" '.body = $b')
@@ -167,17 +178,18 @@ run_nudge() {
   jq -n --arg s "$state" --arg h "$head" --arg b "$body" \
     '{state:$s, head:{sha:$h}, body:$b}' > "$D/pr.json"
   : > "$D/gh.log"; : > "$D/edit.log"; : > "$D/written.txt"
-  # The refusal's premise is "the set of PRs whose head IS this commit is
-  # exactly this PR", so that is the default payload. A case overrides it to
-  # model a moved head (this PR absent), a sharer (someone else present), or an
-  # unreadable answer.
-  DEFAULT_AT_HEAD=$(jq -nc --arg sha "$head" '[{number:7, state:"open", head:{sha:$sha}}]')
+  # A realistic page: every named run carries the canonical app and this PR's
+  # association, exactly as the live endpoint returns them (measured on
+  # nathanjohnpayne/mergepath#1250). STUB_CHECK_RUNS_RAW replaces the whole
+  # payload for cases about app identity or association.
+  DEFAULT_RUNS=$(printf '%s\n' "$names" | jq -c -R -s --argjson pr 7 \
+    '{check_runs: (split("\n") | map(select(length > 0))
+       | map({name: ., app: {slug: "github-actions"}, pull_requests: [{number: $pr}]}))}')
   set +e
   env PATH="$TMP/bin:$PATH" \
-    STUB_SHARERS="$DEFAULT_AT_HEAD" \
+    STUB_CHECK_RUNS="${STUB_CHECK_RUNS_RAW:-$DEFAULT_RUNS}" \
     STUB_GH_LOG="$D/gh.log" STUB_EDIT_LOG="$D/edit.log" \
     STUB_WRITTEN_BODY="$D/written.txt" STUB_PR_JSON_FILE="$D/pr.json" \
-    STUB_CHECK_NAMES="$names" \
     MERGEPATH_NUDGE_GH_AS_AUTHOR="$TMP/bin/gh-as-author-stub.sh" \
     MERGEPATH_NUDGE_VALIDATE_BIN="$REAL_VALIDATE" \
     "$@" \
@@ -232,7 +244,7 @@ echo "--- 1c: nothing was published"
 # assertion that actually pins the invariant.
 EXPECTED_CALLS=$(cat <<'CALLS'
 api repos/owner/repo/pulls/7
-api --paginate repos/owner/repo/commits/sha111/check-runs --jq .check_runs[].name
+api --paginate repos/owner/repo/commits/sha111/check-runs
 api repos/owner/repo/pulls/7 --jq .body // ""
 CALLS
 )
@@ -307,7 +319,7 @@ set +e
 env PATH="$TMP/bin:$PATH" STUB_FROZEN_STAMP="$FROZEN" \
   STUB_GH_LOG="$D/gh.log" STUB_EDIT_LOG="$D/edit.log" \
   STUB_WRITTEN_BODY="$D/written.txt" STUB_PR_JSON_FILE="$D/pr.json" \
-  STUB_CHECK_NAMES="$NEITHER" \
+  STUB_CHECK_RUNS='{"check_runs":[]}' \
   MERGEPATH_NUDGE_GH_AS_AUTHOR="$TMP/bin/gh-as-author-stub.sh" \
   MERGEPATH_NUDGE_VALIDATE_BIN="$REAL_VALIDATE" \
   bash "$SUBJECT" 7 owner/repo >"$D/out.txt" 2>"$D/err.txt"
@@ -456,58 +468,79 @@ fi
 # not need it costs one workflow run, refusing one that did defeats the tool.
 # So wherever the refusal's premise is uncertain it must nudge instead. These
 # four pin that direction, and case 18d pins that it does not over-fire.
+# Presence is now per-run: the canonical app AND an association with this PR.
+# 18b/18e/18h are the cases that filter can see and a name-only test cannot.
 echo "--- 18a: both reported but the head MOVED -> nudge, do not refuse"
-run_nudge open sha18a "$VALID_BODY" "$BOTH" \
-  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18a-new"}}]'
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "carries PR set \[none\]"; then
+run_nudge open sha18a "$VALID_BODY" "$BOTH" STUB_LIVE_HEAD=sha18a-new
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "the head moved to sha18a-new"; then
   pass "a presence answer pinned to a superseded head does not become a refusal"
 else
   fail "expected a nudge naming the moved head; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
-echo "--- 18b: both reported but TWO open PRs share the head -> nudge"
-# Check runs attach to a commit, so the other PR's contexts are in this list.
+echo "--- 18b: the contexts belong to ANOTHER open PR at this head -> nudge"
 run_nudge open sha18b "$VALID_BODY" "$BOTH" \
-  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18b"}},{"number":9,"state":"open","head":{"sha":"sha18b"}}]'
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "carries PR set \[7,9\]"; then
-  pass "an ambiguous head nudges rather than trusting another PR's contexts"
+  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"github-actions"},"pull_requests":[{"number":9}]},{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[{"number":9}]}]}'
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
+  pass "another open PR's contexts at a shared head are not read as this PR's"
 else
-  fail "expected a nudge naming the shared head; rc=$RC wrote=$WROTE err='$ERR'"
+  fail "expected a nudge; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
-echo "--- 18c: the sharers read fails -> nudge (unknown is not 'nothing to do')"
-run_nudge open sha18c "$VALID_BODY" "$BOTH" STUB_SHARERS_RC=1
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "could not be read"; then
-  pass "an unreadable sharer count nudges rather than refusing"
+echo "--- 18c: the head re-read fails -> nudge (unknown is not 'nothing to do')"
+run_nudge open sha18c "$VALID_BODY" "$BOTH" STUB_HEADREAD_RC=1
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "could not be re-read"; then
+  pass "an unreadable head confirmation nudges rather than refusing"
 else
-  fail "expected a nudge on an unreadable sharer count; rc=$RC wrote=$WROTE err='$ERR'"
+  fail "expected a nudge on an unreadable head; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
-echo "--- 18d: a STACKED PR whose head moved on does not make the head ambiguous"
-# commits/{sha}/pulls lists every PR the commit is reachable from, including a
-# stacked PR whose branch has advanced past it (#1240). Counting those would
-# disable the refusal entirely, so the filter is `.head.sha`, not association.
-# PR 7 itself is in the response and must not count as its own sharer.
-run_nudge open sha18d "$VALID_BODY" "$BOTH" \
-  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18d"}},{"number":8,"state":"open","head":{"sha":"other-head"}}]'
+echo "--- 18e: a CLOSED PR's leftover runs carry no association -> nudge"
+# Measured on this repository: an open PR's runs report `pull_requests:
+# [<its number>]`, a closed PR's report `[]`. A new PR reusing a closed PR's
+# SHA would otherwise inherit a green it was never classified for — and
+# commits/{sha}/pulls cannot see this, because it omits closed PRs for a
+# commit off the default branch.
+run_nudge open sha18e "$VALID_BODY" "$BOTH" \
+  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"github-actions"},"pull_requests":[]},{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[]}]}'
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
+  pass "a closed PR's unassociated runs are not accepted as this PR's contexts"
+else
+  fail "expected a nudge; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 18h: same names from ANOTHER App -> nudge"
+# Branch protection pins these contexts to GitHub Actions, so a same-named run
+# from another App never satisfies them and must not satisfy this check either.
+run_nudge open sha18h "$VALID_BODY" "$BOTH" \
+  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"some-other-app"},"pull_requests":[{"number":7}]},{"name":"Label Gate","app":{"slug":"some-other-app"},"pull_requests":[{"number":7}]}]}'
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
+  pass "a foreign App's same-named runs do not count as the canonical producer reporting"
+else
+  fail "expected a nudge; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 18f: a context on PAGE TWO of the check-run listing still counts"
+run_nudge open sha18f "$VALID_BODY" "Self-Review Required" \
+  STUB_CHECK_RUNS_PAGE2='{"check_runs":[{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[{"number":7}]}]}'
 if [ "$RC" = 3 ] && [ "$WROTE" = 0 ]; then
-  pass "a stacked PR at a different head does not count, and the ordinary refusal survives"
+  pass "the check-run listing is paginated; a second-page context is not missed"
 else
   fail "expected rc=3 with no edit; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
-echo "--- 18e: a CLOSED PR at this exact head DOES make it ambiguous -> nudge"
-# Check runs outlive the PR that produced them. A new PR reusing a closed PR's
-# head SHA inherits its `Self-Review Required` and `Label Gate`, so refusing
-# would hand it a green it was never classified for. The question is whether
-# the commit's check-run set is exclusively this PR's, not whether another PR
-# is still open.
-run_nudge open sha18e "$VALID_BODY" "$BOTH" \
-  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18e"}},{"number":6,"state":"closed","head":{"sha":"sha18e"}}]'
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "carries PR set \[6,7\]"; then
-  pass "a closed PR's leftover runs are not accepted as this PR's contexts"
+echo "--- 18g: the refusal costs exactly three reads"
+run_nudge open sha18g "$VALID_BODY" "$BOTH"
+REFUSAL_CALLS=$(cat <<'CALLS'
+api repos/owner/repo/pulls/7
+api --paginate repos/owner/repo/commits/sha18g/check-runs
+api repos/owner/repo/pulls/7 --jq .head.sha // ""
+CALLS
+)
+if [ "$RC" = 3 ] && [ "$(cat "$D/gh.log")" = "$REFUSAL_CALLS" ]; then
+  pass "a refusal is three reads: the PR, the check runs, and the head confirmation last"
 else
-  fail "expected a nudge naming the other PR; rc=$RC wrote=$WROTE err='$ERR'"
+  fail "expected rc=3 and exactly the three reads; rc=$RC log='$(cat "$D/gh.log")'"
 fi
 
 echo "--- 19: a body ending inside an unterminated fence is nudged, with a warning"
@@ -538,36 +571,6 @@ if [ "$RC" = 0 ] && printf '%s' "$ERR" | grep -q "unterminated code fence"; then
   pass "a tilde fence is recognized as well as a backtick fence"
 else
   fail "expected the fence warning on a tilde fence; rc=$RC err='$ERR'"
-fi
-
-echo "--- 18f: a sharer on PAGE TWO still counts"
-# commits/{sha}/pulls returns 30 per page. A sharer past the first page read as
-# "no sharer" would produce exactly the confident refusal this check prevents.
-run_nudge open sha18f "$VALID_BODY" "$BOTH" \
-  STUB_SHARERS='[{"number":7,"state":"open","head":{"sha":"sha18f"}}]' \
-  STUB_SHARERS_PAGE2='[{"number":11,"state":"open","head":{"sha":"sha18f"}}]'
-if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "carries PR set \[7,11\]"; then
-  pass "the shared-head query is paginated; a second-page sharer is not missed"
-else
-  fail "expected a nudge from a page-two sharer; rc=$RC wrote=$WROTE err='$ERR'"
-fi
-
-echo "--- 18g: the refusal establishes its premise in ONE request"
-# Two reads had to be sequenced, and whichever ran first left a window in which
-# the other's answer went stale; three review rounds each closed one such
-# window and named the next. One read has no interior, so this asserts the
-# exact call set rather than an ordering between two of them.
-run_nudge open sha18g "$VALID_BODY" "$BOTH"
-REFUSAL_CALLS=$(cat <<'CALLS'
-api repos/owner/repo/pulls/7
-api --paginate repos/owner/repo/commits/sha18g/check-runs --jq .check_runs[].name
-api --paginate repos/owner/repo/commits/sha18g/pulls
-CALLS
-)
-if [ "$RC" = 3 ] && [ "$(cat "$D/gh.log")" = "$REFUSAL_CALLS" ]; then
-  pass "a refusal costs exactly three reads and has no second premise query to race"
-else
-  fail "expected rc=3 and exactly the three reads; rc=$RC log='$(cat "$D/gh.log")'"
 fi
 
 echo
