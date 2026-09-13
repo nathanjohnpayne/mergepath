@@ -47,17 +47,45 @@ case "$*" in
     # The real command prints one name per line under this --jq.
     [ -n "${STUB_CHECK_NAMES:-}" ] && printf '%s\n' "$STUB_CHECK_NAMES"
     exit 0 ;;
+  *commits/*/pulls*)
+    # The refusal path asks who else carries this head. STUB_SHARERS is the
+    # RAW endpoint payload, and the caller's own --arg/--jq are applied to it
+    # rather than reimplemented here — so the `.head.sha` filter under test is
+    # the one that actually runs. A stub that answered with a pre-filtered
+    # count would be blind to exactly the defect that filter exists for: this
+    # endpoint also lists a stacked PR whose branch merely contains the commit.
+    if [ "${STUB_SHARERS_RC:-0}" -ne 0 ]; then echo "sharers read failed" >&2; exit "$STUB_SHARERS_RC"; fi
+    argname=_unused; argval=""; jqexpr="."
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --arg) argname=$2; argval=$3; shift 3 ;;
+        --jq) jqexpr=$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf '%s\n' "${STUB_SHARERS:-[]}" | jq -r --arg "$argname" "$argval" "$jqexpr"
+    exit 0 ;;
   *"/pulls/"*)
     if [ "${STUB_PR_RC:-0}" -ne 0 ]; then echo "pull read failed" >&2; exit "$STUB_PR_RC"; fi
-    # The pre-write re-read asks for `.body` alone. STUB_LIVE_BODY_FILE lets a
-    # case return a DIFFERENT body there, simulating a concurrent edit.
-    case "$*" in
-      *--jq*.body*)
-        if [ -n "${STUB_LIVE_BODY_FILE:-}" ]; then cat "$STUB_LIVE_BODY_FILE"
-        else jq -r '.body // ""' "${STUB_PR_JSON_FILE:?}"; fi
-        exit 0 ;;
-    esac
-    cat "${STUB_PR_JSON_FILE:?}"; exit 0 ;;
+    # The initial snapshot read takes no --jq; every later re-read does. That
+    # is the seam the STUB_LIVE_* overrides hang on, so a case can model state
+    # that changed AFTER the snapshot: a concurrent body edit, or a
+    # synchronize that moved the head. The caller's own --jq is applied rather
+    # than reimplemented.
+    jqexpr=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in --jq) jqexpr=$2; shift 2 ;; *) shift ;; esac
+    done
+    if [ -z "$jqexpr" ]; then cat "${STUB_PR_JSON_FILE:?}"; exit 0; fi
+    live=$(cat "${STUB_PR_JSON_FILE:?}")
+    if [ -n "${STUB_LIVE_BODY_FILE:-}" ]; then
+      live=$(printf '%s' "$live" | jq --arg b "$(cat "$STUB_LIVE_BODY_FILE")" '.body = $b')
+    fi
+    if [ -n "${STUB_LIVE_HEAD:-}" ]; then
+      live=$(printf '%s' "$live" | jq --arg h "$STUB_LIVE_HEAD" '.head.sha = $h')
+    fi
+    printf '%s' "$live" | jq -r "$jqexpr"
+    exit 0 ;;
 esac
 echo "unexpected gh call: $*" >&2
 exit 90
@@ -400,6 +428,67 @@ if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
   pass "the re-read guard passes when nothing changed"
 else
   fail "expected rc=0 with an edit; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+# The refusal is an optimization, not a safety property: nudging a PR that did
+# not need it costs one workflow run, refusing one that did defeats the tool.
+# So wherever the refusal's premise is uncertain it must nudge instead. These
+# four pin that direction, and case 18d pins that it does not over-fire.
+echo "--- 18a: both reported but the head MOVED -> nudge, do not refuse"
+run_nudge open sha18a "$VALID_BODY" "$BOTH" STUB_LIVE_HEAD=sha18a-new
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "the head moved to sha18a-new"; then
+  pass "a presence answer pinned to a superseded head does not become a refusal"
+else
+  fail "expected a nudge naming the moved head; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 18b: both reported but TWO open PRs share the head -> nudge"
+# Check runs attach to a commit, so the other PR's contexts are in this list.
+run_nudge open sha18b "$VALID_BODY" "$BOTH" \
+  STUB_SHARERS='[{"state":"open","head":{"sha":"sha18b"}},{"state":"open","head":{"sha":"sha18b"}}]'
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "2 open PRs share head sha18b"; then
+  pass "an ambiguous head nudges rather than trusting another PR's contexts"
+else
+  fail "expected a nudge naming the shared head; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 18c: the sharers read fails -> nudge (unknown is not 'nothing to do')"
+run_nudge open sha18c "$VALID_BODY" "$BOTH" STUB_SHARERS_RC=1
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "could not be determined"; then
+  pass "an unreadable sharer count nudges rather than refusing"
+else
+  fail "expected a nudge on an unreadable sharer count; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 18d: a CLOSED PR and a STACKED PR on the head do not make it ambiguous"
+# commits/{sha}/pulls lists every PR the commit is reachable from, including a
+# stacked PR whose branch has advanced past it (#1240). Counting those would
+# disable the refusal entirely, so the filter is `.head.sha` AND open.
+run_nudge open sha18d "$VALID_BODY" "$BOTH" \
+  STUB_SHARERS='[{"state":"open","head":{"sha":"sha18d"}},{"state":"closed","head":{"sha":"sha18d"}},{"state":"open","head":{"sha":"other-head"}}]'
+if [ "$RC" = 3 ] && [ "$WROTE" = 0 ]; then
+  pass "only OPEN PRs whose head IS this commit count; the ordinary refusal survives"
+else
+  fail "expected rc=3 with no edit; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 19: a body ending inside an unterminated fence is nudged, with a warning"
+# Refusing here would leave a stuck PR stuck over a cosmetic artifact in a body
+# that is already malformed, and any other placement is a larger mutation.
+UNCLOSED=$(printf 'Authoring-Agent: claude\n\n## Self-Review\n- [x] Correctness: fine\n\n```\nnot closed\n')
+run_nudge open sha19 "$UNCLOSED" "$NEITHER"
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ] && printf '%s' "$ERR" | grep -q "unterminated code fence"; then
+  pass "an unterminated fence warns about the visible marker but still recovers the PR"
+else
+  fail "expected a nudge with a fence warning; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 19b: a well-formed body does NOT get the fence warning"
+run_nudge open sha19b "$VALID_BODY" "$NEITHER"
+if [ "$RC" = 0 ] && ! printf '%s' "$ERR" | grep -q "unterminated code fence"; then
+  pass "the fence notice does not fire on ordinary bodies"
+else
+  fail "the fence notice fired spuriously; err='$ERR'"
 fi
 
 echo

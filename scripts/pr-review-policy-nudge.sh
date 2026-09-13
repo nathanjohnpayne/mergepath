@@ -133,9 +133,45 @@ has_context "$CONTEXT_SELF_REVIEW" || MISSING+=("$CONTEXT_SELF_REVIEW")
 has_context "$CONTEXT_LABEL_GATE" || MISSING+=("$CONTEXT_LABEL_GATE")
 
 if [ "${#MISSING[@]}" -eq 0 ]; then
-  echo "pr-review-policy-nudge: both required contexts have already reported on $HEAD_SHA — nothing to recover."
-  echo "  This recovers a missed delivery; it does not re-run a context that reported and failed."
-  exit 3
+  # The refusal is an optimization, not a safety property. Nudging a PR that
+  # did not need it costs one workflow run; refusing one that did defeats the
+  # whole tool. So the refusal has to be sure of its own premise, and wherever
+  # it is not, it nudges and says why. Both doubts below were review findings,
+  # and both fail in that same direction rather than getting their own fence.
+  DOUBT=""
+
+  # The presence answer is pinned to the SHA read before the listing. A
+  # `synchronize` in between leaves it describing a superseded commit — and
+  # "nothing to recover" about the wrong head is exactly the stuck state this
+  # command exists to clear.
+  LIVE_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha // ""' 2>/dev/null) || LIVE_HEAD=""
+  if [ -z "$LIVE_HEAD" ]; then
+    DOUBT="the head could not be re-read to confirm it is still $HEAD_SHA"
+  elif [ "$LIVE_HEAD" != "$HEAD_SHA" ]; then
+    DOUBT="the head moved to $LIVE_HEAD after the check runs were listed on $HEAD_SHA"
+  else
+    # Check runs attach to a COMMIT, not a PR. Two open PRs on one head share
+    # one set, so PR A's contexts satisfy PR B's presence test and B never
+    # gets nudged. specs/required_check_publisher.md takes the same position
+    # for its own per-commit slots: a head carried by more than one open PR is
+    # ambiguous. Filter on `.head.sha`, because commits/{sha}/pulls also lists
+    # a stacked PR whose branch merely contains the commit (#1240).
+    # shellcheck disable=SC2016  # $sha is a jq variable bound by --arg, not a shell one.
+    SHARERS=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" --arg sha "$HEAD_SHA" \
+      --jq '[.[] | select(.state == "open" and .head.sha == $sha)] | length' 2>/dev/null) || SHARERS=""
+    case "$SHARERS" in
+      '' | *[!0-9]*) DOUBT="whether another open PR shares head $HEAD_SHA could not be determined" ;;
+      *) [ "$SHARERS" -le 1 ] || DOUBT="$SHARERS open PRs share head $HEAD_SHA, so the reported contexts may belong to another one" ;;
+    esac
+  fi
+
+  if [ -z "$DOUBT" ]; then
+    echo "pr-review-policy-nudge: both required contexts have already reported on $HEAD_SHA — nothing to recover."
+    echo "  This recovers a missed delivery; it does not re-run a context that reported and failed."
+    exit 3
+  fi
+  echo "pr-review-policy-nudge: both contexts appear on $HEAD_SHA, but $DOUBT; nudging rather than refusing on an uncertain premise." >&2
+  MISSING=("none missing on $HEAD_SHA, but $DOUBT")
 fi
 
 # --- build the new body ----------------------------------------------------
@@ -168,6 +204,19 @@ if [ "$NEW_BODY" = "$OLD_BODY" ]; then
 fi
 [ "$NEW_BODY" != "$OLD_BODY" ] \
   || die "the rebuilt marker is byte-identical to the current body; the edit would fire no event" 2
+
+# An unclosed fenced block runs to the end of the document, so a body that
+# ends inside one swallows the marker: GitHub renders the comment as literal
+# code instead of hiding it. Warn rather than refuse. Refusing would leave a
+# stuck PR stuck over a cosmetic artifact in a body that is already malformed,
+# and every placement outside the fence means editing the middle of someone
+# else's description, which is a larger mutation than the one complained of.
+# The parity count is a heuristic and guards only this message, never a
+# decision.
+FENCE_LINES=$(printf '%s\n' "$STRIPPED" | grep -c '^[[:space:]]*```' || true)
+if [ $((FENCE_LINES % 2)) -ne 0 ]; then
+  echo "pr-review-policy-nudge: this body ends inside an unterminated code fence, so the marker will render as literal code rather than being hidden. Nudging anyway." >&2
+fi
 
 # --- non-introduction invariant --------------------------------------------
 # The rule is NOT "the body must be valid" — that is the author's problem, and
@@ -232,7 +281,7 @@ printf '%s\n' "$NEW_BODY" >"$BODY_FILE"
 "$GH_AS_AUTHOR" -- gh pr edit "$PR_NUMBER" --repo "$REPO" --body-file "$BODY_FILE" >/dev/null \
   || die "the PR body edit failed; the workflow was not nudged" 2
 
-MISSING_LIST=$(printf '%s, ' "${MISSING[@]}"); MISSING_LIST=${MISSING_LIST%, }
+MISSING_LIST=$(printf '%s, ' "${MISSING[@]:-unknown}"); MISSING_LIST=${MISSING_LIST%, }
 echo "pr-review-policy-nudge: edited $REPO#$PR_NUMBER (head $HEAD_SHA); not yet reported: $MISSING_LIST"
 echo "  The 'edited' action re-runs pr-review-policy.yml's three jobs, including External Review Check."
 echo "  This script published nothing; the verdicts are the canonical producer's."
