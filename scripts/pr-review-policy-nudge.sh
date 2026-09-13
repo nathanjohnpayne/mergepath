@@ -125,6 +125,7 @@ STATE=$(printf '%s' "$PR_JSON" | jq -r '.state // ""')
 HEAD_SHA=$(printf '%s' "$PR_JSON" | jq -r '.head.sha // ""')
 # An empty PR body reads back as JSON null, not "".
 OLD_BODY=$(printf '%s' "$PR_JSON" | jq -r '.body // ""')
+PR_CREATED_AT=$(printf '%s' "$PR_JSON" | jq -r '.created_at // ""')
 
 [ -n "$HEAD_SHA" ] || die "PR $REPO#$PR_NUMBER returned no head SHA" 2
 [ "$STATE" = "open" ] || die "PR $REPO#$PR_NUMBER is $STATE, not open" 1
@@ -141,10 +142,17 @@ OLD_BODY=$(printf '%s' "$PR_JSON" | jq -r '.body // ""')
 #     must not satisfy this check either. That confusion is #1213, one layer up.
 #
 #   associated with THIS PR — check runs attach to a COMMIT and outlive the PR
-#     that produced them. Measured on this repository: an open PR's runs carry
-#     `pull_requests: [<its number>]` and a CLOSED PR's carry `[]`. Without the
-#     association a new PR reusing a closed PR's SHA inherits a green it was
-#     never classified for, and two open PRs on one head satisfy each other.
+#     that produced them, so two open PRs on one head would otherwise satisfy
+#     each other's presence test.
+#
+#   started AFTER this PR existed — because the association above is NOT
+#     provenance. `.pull_requests` lists the currently-open PRs sharing the
+#     run's head, which is why a closed PR's runs report `[]` (measured: 116
+#     runs on #1240's closed head, all empty). A new PR reusing that SHA would
+#     therefore be handed those same runs under its OWN number, and the
+#     association filter alone would accept a green it was never classified
+#     for. A run that began before this PR existed cannot be this PR's, and
+#     `created_at` is already in the PR object this script reads.
 #
 # Asking each run who it belongs to also beats asking `commits/{sha}/pulls` who
 # else is at the head: that endpoint documents, and this repository confirms,
@@ -152,11 +160,12 @@ OLD_BODY=$(printf '%s' "$PR_JSON" | jq -r '.body // ""')
 # to precisely the case it would have been there for. And this costs no extra
 # read, because the listing is already being fetched.
 NAMES=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" 2>/dev/null \
-  | jq -r -s --argjson pr "$PR_NUMBER" '
+  | jq -r -s --argjson pr "$PR_NUMBER" --arg created "$PR_CREATED_AT" '
       [.[].check_runs[]]
       | .[]
       | select(.app.slug == "github-actions")
       | select([.pull_requests[]?.number] | index($pr))
+      | select($created == "" or (.started_at // "") >= $created)
       | .name') \
   || die "could not list check runs on $HEAD_SHA" 2
 

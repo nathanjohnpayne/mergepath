@@ -190,7 +190,7 @@ run_nudge() {
   CASE=$((CASE + 1))
   D="$TMP/case-$CASE"; mkdir -p "$D"
   jq -n --arg s "$state" --arg h "$head" --arg b "$body" \
-    '{state:$s, head:{sha:$h}, body:$b}' > "$D/pr.json"
+    '{state:$s, head:{sha:$h}, body:$b, created_at:"2026-01-01T00:00:00Z"}' > "$D/pr.json"
   : > "$D/gh.log"; : > "$D/edit.log"; : > "$D/written.txt"
   # A realistic page: every named run carries the canonical app and this PR's
   # association, exactly as the live endpoint returns them (measured on
@@ -198,7 +198,7 @@ run_nudge() {
   # payload for cases about app identity or association.
   DEFAULT_RUNS=$(printf '%s\n' "$names" | jq -c -R -s --argjson pr 7 \
     '{check_runs: (split("\n") | map(select(length > 0))
-       | map({name: ., app: {slug: "github-actions"}, pull_requests: [{number: $pr}]}))}')
+       | map({name: ., app: {slug: "github-actions"}, pull_requests: [{number: $pr}], started_at: "2026-06-01T00:00:00Z"}))}')
   set +e
   env PATH="$TMP/bin:$PATH" \
     STUB_CHECK_RUNS="${STUB_CHECK_RUNS_RAW:-$DEFAULT_RUNS}" \
@@ -536,7 +536,7 @@ fi
 
 echo "--- 18f: a context on PAGE TWO of the check-run listing still counts"
 run_nudge open sha18f "$VALID_BODY" "Self-Review Required" \
-  STUB_CHECK_RUNS_PAGE2='{"check_runs":[{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[{"number":7}]}]}'
+  STUB_CHECK_RUNS_PAGE2='{"check_runs":[{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[{"number":7}],"started_at":"2026-06-01T00:00:00Z"}]}'
 if [ "$RC" = 3 ] && [ "$WROTE" = 0 ]; then
   pass "the check-run listing is paginated; a second-page context is not missed"
 else
@@ -607,6 +607,27 @@ if [ "$RC" = 0 ] && grep -q 'author_pat_present=yes' "$D/edit.log"; then
   pass "an ambient GH_TOKEN no longer suppresses the cached author credential"
 else
   fail "expected the author pat to reach the write; rc=$RC edit.log='$(cat "$D/edit.log")'"
+fi
+
+echo "--- 21: runs that PREDATE this PR are not its contexts -> nudge"
+# `.pull_requests` is association, not provenance: it lists the currently-open
+# PRs sharing the run's head, which is why a closed PR's runs report []. A new
+# PR reusing that SHA is therefore handed the old runs under its OWN number.
+# A run that started before this PR existed cannot be this PR's.
+run_nudge open sha21 "$VALID_BODY" "$BOTH" \
+  STUB_CHECK_RUNS_RAW='{"check_runs":[{"name":"Self-Review Required","app":{"slug":"github-actions"},"pull_requests":[{"number":7}],"started_at":"2025-01-01T00:00:00Z"},{"name":"Label Gate","app":{"slug":"github-actions"},"pull_requests":[{"number":7}],"started_at":"2025-01-01T00:00:00Z"}]}'
+if [ "$RC" = 0 ] && [ "$WROTE" != 0 ]; then
+  pass "runs inherited from a reused SHA are not accepted as this PR's contexts"
+else
+  fail "expected a nudge; rc=$RC wrote=$WROTE err='$ERR'"
+fi
+
+echo "--- 21b: runs started AFTER the PR still count (the guard must not over-fire)"
+run_nudge open sha21b "$VALID_BODY" "$BOTH"
+if [ "$RC" = 3 ] && [ "$WROTE" = 0 ]; then
+  pass "the provenance guard does not reject this PR's own runs"
+else
+  fail "expected rc=3 with no edit; rc=$RC wrote=$WROTE err='$ERR'"
 fi
 
 echo
