@@ -19,8 +19,13 @@
 #       [--head <sha>] [--diff-file <path>] [--dry-run] [--force-enabled]
 #
 # Overrides (mostly for tests / non-git contexts):
-#   --author         PR's authoring agent (claude|codex|...). Default: parsed
-#                    from the PR body `Authoring-Agent:` line.
+#   --author         PR's authoring agent (claude|codex|...). NOT an override
+#                    (#1143): the PR body is read and validated against the
+#                    shared contract on every run, and this flag is only
+#                    cross-checked against the `Authoring-Agent:` the body
+#                    declares. A disagreement fails closed (exit 3); omitting
+#                    the flag simply skips the cross-check. There is no way to
+#                    make Phase 4b act on an identity the body does not carry.
 #   --reviewer       force the external reviewer login (skips selection, but
 #                    still must differ from the authoring agent).
 #   --head           HEAD sha. Default: gh api pulls/<n> .head.sha.
@@ -109,10 +114,43 @@ p4b_acct_on() { [ "$P4B_ACCT_AVAILABLE" = true ] && p4b_acct_hook_active; }
 # Set after the pre-post record; consulted by the failure paths so a review
 # that never actually posted is corrected instead of double-recorded.
 P4B_ACCT_LOOP_RECORDED=false
-# Set only when a late timeout-generation revalidation already corrected this
+# Set only when a pre-POST fence has ALREADY, and SUCCESSFULLY, corrected this
 # invocation's provisional loop before entering fall_back_to_manual. The
-# fallback must not append a second record for the same invocation.
-P4B_TIMEOUT_REVALIDATION_ACCT_CLEANED=false
+# fallback must not append a second record for the same invocation — but it
+# must still retry when the earlier correction failed, so this records that the
+# correction LANDED, never merely that it was attempted (#1143 round 5).
+P4B_PRE_POST_ACCT_CLEANED=false
+# Outcome of the most recent p4b_acct_mark_unposted call: true when the loop
+# correction landed (or there was nothing to correct), false when the rewrite
+# failed.
+#
+# WHY A GLOBAL AND NOT A RETURN STATUS — do not "tidy" this into one (#1143).
+# p4b_acct_mark_unposted is ADVISORY by contract: it must never change the
+# caller's exit code. Six of its call sites have the shape
+#
+#     X || { p4b_acct_mark_unposted "..."; p4b_die N "..."; }
+#
+# and bash applies errexit to commands inside the group following the FINAL
+# `||`. A non-zero return from the first command in that group therefore
+# aborts the run *before* the intended `p4b_die N`, silently turning an
+# advisory accounting failure into a different exit code — precisely the
+# contract violation the function promises cannot happen. A seventh call site
+# is bare inside an `if` body, with the same consequence. Making the status the
+# channel would leave the contract depending on every present and future caller
+# remembering `|| true`, which is a convention, not a guarantee.
+#
+# The global keeps the advisory guarantee structural (the function cannot
+# abort a caller) while still making the outcome observable to the one caller
+# that needs it.
+#
+# STALENESS: p4b_acct_mark_unposted resets this to true on entry, before any
+# early return, so a reader always sees the outcome of the attempt it just
+# triggered and never a leftover from an earlier one. Readers additionally
+# default it to FALSE when unset, not true — see the read site — so the
+# unreachable case fails toward "we did not correct it" (a retry, harmless and
+# idempotent) rather than toward "we did" (a durable phantom posted record,
+# which is the defect this whole variable exists to prevent).
+P4B_ACCT_LAST_CORRECTION_OK=true
 
 # Per-invocation ledger-staging token (#615 Codex round 6). Exported so the
 # render subshell (which stages the pending record on disk) and this process's
@@ -129,14 +167,35 @@ export P4B_ACCT_RUN_ID
 # not-posted, fail-closed with the reason) and discard the staged ledger
 # record so local state never claims a phantom posted approval. Advisory —
 # never alters review flow or exit codes.
+#
+# Whether the correction LANDED is reported in P4B_ACCT_LAST_CORRECTION_OK,
+# not in the exit status (#1143 round 5). The status stays 0 on every path
+# because six call sites below invoke this inside `X || { … ; p4b_die N …; }`
+# groups and one bare inside an `if` body, all under `set -e`: a non-zero
+# return there aborts the run before the intended p4b_die, turning an ADVISORY
+# accounting failure into a changed exit code — exactly what this function's
+# contract promises never to do, and a trap the next caller would have to
+# remember `|| true` to avoid. The global keeps the advisory guarantee
+# structural while still making the outcome observable.
 p4b_acct_mark_unposted() {
   local why="$1"
+  # Reset FIRST, before any early return, so this can never be read stale from
+  # an earlier attempt. A leftover `true` here would be the same "the flag
+  # records that we tried" defect one level up.
+  P4B_ACCT_LAST_CORRECTION_OK=true
   p4b_acct_on 2>/dev/null || return 0
   p4b_acct_hook_discard_pending_record || true
   if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
-    p4b_acct_hook_mark_last_loop_unposted "$why" \
-      || p4b_warn "accounting: could not correct the unposted loop record (continuing)"
-    P4B_ACCT_LOOP_RECORDED=false
+    if p4b_acct_hook_mark_last_loop_unposted "$why"; then
+      P4B_ACCT_LOOP_RECORDED=false
+    else
+      # Do NOT clear P4B_ACCT_LOOP_RECORDED here. The loop log still carries a
+      # `posted` claim for a review that did not post, so a later correction
+      # attempt must still see something to correct; clearing it made the
+      # failure indistinguishable from success and retired the retry.
+      p4b_warn "accounting: could not correct the unposted loop record (leaving it recorded so a later attempt retries)"
+      P4B_ACCT_LAST_CORRECTION_OK=false
+    fi
   fi
   return 0
 }
@@ -239,6 +298,21 @@ if [ "$MODE" != "local" ]; then
 fi
 
 command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
+# node is a HARD runtime dependency as of #1143, and it was not one before.
+# The identity fence runs the shared contract parser
+# (scripts/lib/pr-body-contract.mjs, executed by pr_body_validate) on EVERY
+# enabled run; callers passing --author used to skip the body read entirely and
+# therefore never reached node. Checked here — beside jq, and AFTER the
+# disabled/mode gates, so the default disabled path stays dependency-free for
+# consumers — so a host missing it is told which dependency is absent instead
+# of meeting a parser error three frames deeper.
+#
+# `node --version` rather than `command -v node`: a node that is present but
+# cannot execute is just as fatal, and this catches both. It also makes the
+# check testable, since shadowing a `command -v` probe with a failing shim
+# proves nothing — `command -v` would still find the shim.
+node --version >/dev/null 2>&1 \
+  || p4b_die 3 "node is required and must be runnable (the shared PR-body contract parser runs under it)"
 
 # Hard-required (#799). Every documented fallback in this script keyed off an
 # empty head sha, and an unreadable read never produced one — see the call
@@ -281,30 +355,51 @@ if [ -z "$HEAD" ]; then
   [ -n "$HEAD" ] || p4b_die 3 "could not resolve HEAD sha for $REPO#$PR; pass --head"
 fi
 
-# Authoring agent: explicit override, else parse the PR body line. Required
-# even when --reviewer is forced so the cross-agent invariant still applies.
-if [ -z "$AUTHOR" ]; then
-  need_gh
-  # #799: `--jq '.body // ""'` reads as a safe default and is not one — gh
-  # emits the error body WITHOUT running the filter, so the `// ""` never
-  # applies. No `--shape` is possible on free text (a PR body may legitimately
-  # be empty, or contain anything), so the status is the whole guard here:
-  # gh_api_scalar returns 3 with empty stdout, and the Authoring-Agent parse
-  # below then finds nothing and dies with its own message instead of scanning
-  # a JSON error body for an agent name.
-  body="$(gh_api_scalar "PR body for $REPO#$PR" \
-    "repos/$REPO/pulls/$PR" --jq '.body // ""')" || body=""
-  # Validate the body against the SHARED contract before trusting any identity
-  # parsed out of it (#855). Phase 4b sourced pr-body-contract.sh and then only
-  # extracted the agent, so a body that the required Self-Review gate would
-  # reject -- a duplicate marker, an unknown agent, a heading hidden in a code
-  # fence -- still selected a reviewer here. One contract, one implementation,
-  # both enforcement paths.
-  pr_body_validate "$body" "$(p4b_config)" \
-    || p4b_die 3 "PR body does not satisfy the Authoring-Agent contract"
-  AUTHOR="$(pr_body_authoring_agent "$body")"
-  [ -n "$AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body; pass --author"
+# Authoring agent. The PR BODY is the record of authorship, and it is read and
+# validated on EVERY run (#1143). Required even when --reviewer is forced, so
+# the cross-agent invariant still applies.
+#
+# #1143: this block used to run only under `[ -z "$AUTHOR" ]`, which made the
+# contract enforced for callers that omitted `--author` and unenforced for
+# callers that passed it — backwards from what the flag means. `--author` is a
+# convenience for a caller that already knows the identity, never an assertion
+# that the body is well-formed and never a licence to skip reading it. There is
+# deliberately NO opt-out: a caller that cannot produce a contract-satisfying
+# body has not established who authored the PR, and Phase 4b must not pick a
+# reviewer against an identity nothing corroborates.
+need_gh
+# #799: `--jq '.body // ""'` reads as a safe default and is not one — gh
+# emits the error body WITHOUT running the filter, so the `// ""` never
+# applies. No `--shape` is possible on free text (a PR body may legitimately
+# be empty, or contain anything), so the status is the whole guard here:
+# gh_api_scalar returns 3 with empty stdout, and the contract check below then
+# rejects the empty body instead of scanning a JSON error body for an agent
+# name.
+body="$(gh_api_scalar "PR body for $REPO#$PR" \
+  "repos/$REPO/pulls/$PR" --jq '.body // ""')" || body=""
+# Validate the body against the SHARED contract before trusting any identity
+# parsed out of it (#855). Phase 4b sourced pr-body-contract.sh and then only
+# extracted the agent, so a body that the required Self-Review gate would
+# reject -- a duplicate marker, an unknown agent, a heading hidden in a code
+# fence -- still selected a reviewer here. One contract, one implementation,
+# both enforcement paths.
+pr_body_validate "$body" "$(p4b_config)" \
+  || p4b_die 3 "PR body does not satisfy the Authoring-Agent contract"
+BODY_AUTHOR="$(pr_body_authoring_agent "$body")"
+[ -n "$BODY_AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body"
+# #1143: when the caller ALSO named an identity, the two must agree. Compare
+# the normalized AGENT on both sides (p4b_agent_of_login lowercases and strips
+# the `nathanpayne-` prefix), because the agent — not the literal spelling — is
+# what selects the reviewer and carries the cross-agent invariant below. A
+# disagreement fails closed rather than silently preferring the flag, which
+# could otherwise pair the PR with a reviewer the real authoring agent must not
+# be paired with.
+if [ -n "$AUTHOR" ] \
+   && [ "$(p4b_agent_of_login "$AUTHOR")" != "$(p4b_agent_of_login "$BODY_AUTHOR")" ]; then
+  p4b_die 3 "--author '$AUTHOR' contradicts the PR body's Authoring-Agent '$BODY_AUTHOR'"
 fi
+# The body wins even when they agree: one source of truth downstream.
+AUTHOR="$BODY_AUTHOR"
 
 # --- select reviewer + adapter ---------------------------------------------
 AUTHOR_AGENT="$(p4b_agent_of_login "$AUTHOR")"
@@ -384,7 +479,7 @@ fall_back_to_manual() {
   # posting step, e.g. head drift inside post_review), amend that line
   # instead of appending a duplicate fail-closed loop (#615 Codex).
   if p4b_acct_on 2>/dev/null; then
-    if [ "${P4B_TIMEOUT_REVALIDATION_ACCT_CLEANED:-false}" = true ]; then
+    if [ "${P4B_PRE_POST_ACCT_CLEANED:-false}" = true ]; then
       : # the final timeout fence already corrected this invocation's loop
     elif [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
       p4b_acct_mark_unposted "$why"
@@ -490,20 +585,48 @@ run_same_head_barrier() {
 # head starts a new Phase 4a attempt. Only revalidate that generation here;
 # rerunning the whole barrier would also re-probe CodeRabbit and could turn an
 # unrelated transient into a late hold.
-cleanup_timeout_revalidation_side_effects() {
+# Shared by EVERY pre-POST refusal that can happen after this invocation's loop
+# was provisionally recorded — the Phase 4a timeout fence and, since #1143, the
+# PR-body identity fence. One ordering, one implementation: a second copy is
+# how the two drift out of step.
+#
+# The cause phrases are parameters so the two callers report truthfully; their
+# defaults reproduce the timeout wording byte-for-byte, so that caller is
+# unchanged.
+cleanup_pre_post_refusal_side_effects() {
+  # <why> <mark-accounting> [<warn-cause>] [<issue-cause>]
   local why="$1" mark_accounting="${2:-false}"
+  local warn_cause="${3:-Phase 4a timeout evidence}"
+  local issue_cause="${4:-the Phase 4a timeout waiver for ${REPO}#${PR}}"
   # Local state first: issue cleanup and the fallback accounting gate both use
   # external commands and may fail or hang. The loop/ledger must already say
   # not-posted before either can interrupt this refusal path.
   if [ "$mark_accounting" = true ]; then
     if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
       p4b_acct_mark_unposted "$why"
-      P4B_TIMEOUT_REVALIDATION_ACCT_CLEANED=true
+      # Only claim the correction is done once it actually LANDED (#1143 round
+      # 5). Setting this unconditionally recorded "we called the corrector",
+      # not "the loop no longer says posted" — so a failed rewrite marked
+      # itself complete and fall_back_to_manual skipped the one remaining
+      # attempt, leaving a durable posted record for a review that never
+      # posted. That is the outcome the round-4 ordering fix exists to
+      # prevent, reached through the correction's FAILURE path instead of
+      # through its ordering.
+      # Default FALSE when unset, deliberately. Unset is unreachable (the
+      # variable is initialised at the top of this script and reset on entry to
+      # p4b_acct_mark_unposted), but the two failure directions are not
+      # symmetric: defaulting true would claim a correction landed that may not
+      # have, leaving a durable `posted` record for a review that never posted;
+      # defaulting false at worst runs the later correction attempt again,
+      # which is idempotent. Fail toward the retry.
+      if [ "${P4B_ACCT_LAST_CORRECTION_OK:-false}" = true ]; then
+        P4B_PRE_POST_ACCT_CLEANED=true
+      fi
     fi
   fi
   if [ "${VERDICT:-}" = "APPROVED" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then
-    p4b_warn "Phase 4a timeout evidence changed before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
-    p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the Phase 4a timeout waiver for ${REPO}#${PR} changed before the Phase 4b approval could post; a rerun files fresh follow-ups."
+    p4b_warn "$warn_cause changed before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
+    p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: $issue_cause changed before the Phase 4b approval could post; a rerun files fresh follow-ups."
     P4B_CREATED_ISSUE_REFS=""
   fi
 }
@@ -519,7 +642,7 @@ revalidate_phase4a_timeout_generation() {
     1)
       why="Phase 4a timeout generation changed during external review ($state); holding for the newer attempt"
       if [ "$where" = "pre-post" ]; then
-        cleanup_timeout_revalidation_side_effects "$why" true
+        cleanup_pre_post_refusal_side_effects "$why" true
       fi
       hold_for_external_review "$(jq -nc --arg ce "$state" \
         '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:$ce,trigger:"skipped",resume:"skipped"}')"
@@ -529,11 +652,55 @@ revalidate_phase4a_timeout_generation() {
       if [ "$where" = "pre-post" ]; then
         # Correct accounting before the fallback's feedback gate can itself
         # fail, then tell the fallback not to append a duplicate loop record.
-        cleanup_timeout_revalidation_side_effects "$why" true
+        cleanup_pre_post_refusal_side_effects "$why" true
       fi
       fall_back_to_manual "$why"
       ;;
   esac
+}
+
+# --- #1143: the body can disagree with ITSELF, later ------------------------
+#
+# The identity fence at the top of this script reads the PR body exactly ONCE,
+# and the adapter run that follows can last the configured timeout (900s by
+# default). Every drift check between that read and the review POST compares
+# HEAD shas — and editing a PR body does not move HEAD, so a mid-run identity
+# change passes all of them untouched.
+#
+# The concrete attack that closes: a run starts against a body declaring
+# `codex`, so it selects the CLAUDE reviewer; while the adapter reasons, the
+# body is edited to declare `claude`; the run then files follow-up issues and
+# posts an APPROVED as nathanpayne-claude on a PR whose declared authoring
+# agent is now claude. That is the cross-agent invariant broken by the same
+# mechanism the up-front fence exists to close, one layer deeper in time.
+#
+# Returns 0 only when the LIVE body still satisfies the contract AND still
+# declares the agent this run was planned against ($AUTHOR_AGENT, normalized).
+# Every unmodelled input is drift, not a pass: an unreadable read, an empty
+# body, and a body that no longer validates all return 1. Callers own the
+# cleanup, so this reuses the head-drift call sites rather than adding a
+# second drift idiom — the reason lands in P4B_BODY_DRIFT_REASON so no caller
+# has to infer status through a command substitution.
+#
+# A body edit that does NOT touch the identity (adding prose, fixing a typo)
+# still validates and still declares the same agent, so it does not refuse.
+# Only contract-breaking or identity-changing edits do.
+P4B_BODY_DRIFT_REASON=""
+revalidate_pr_body_author() {  # <stage-label>
+  local stage="${1:-pre-post}" live_body live_agent
+  P4B_BODY_DRIFT_REASON=""
+  live_body="$(gh_api_scalar "PR body for $REPO#$PR ($stage)" \
+    "repos/$REPO/pulls/$PR" --jq '.body // ""')" || live_body=""
+  if ! pr_body_validate "$live_body" "$(p4b_config)"; then
+    P4B_BODY_DRIFT_REASON="the PR body no longer satisfies the Authoring-Agent contract (checked $stage)"
+    return 1
+  fi
+  live_agent="$(p4b_agent_of_login "$(pr_body_authoring_agent "$live_body")")"
+  if [ -z "$live_agent" ] || [ "$live_agent" != "$AUTHOR_AGENT" ]; then
+    P4B_BODY_DRIFT_REASON="the PR body's Authoring-Agent changed during review (reviewed '$AUTHOR_AGENT', live '${live_agent:-unreadable}', checked $stage)"
+    return 1
+  fi
+  return 0
 }
 
 # Temp hygiene: one EXIT trap owns every temp path this run creates (the
@@ -838,6 +1005,17 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
       || fall_back_to_manual "could not re-read the live PR head before filing post-review issues"
     if [ "$live_head_pre" != "$HEAD" ]; then
       fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
+    fi
+    # Identity drift (#1143), hoisted ahead of the side effects for the same
+    # reason the head re-read above is: filing issues under the author PAT,
+    # assigned to the author identity and referencing this PR, is an
+    # approval-side effect performed in service of an approval that must not
+    # post. A body edited mid-run to declare the agent this run picked as
+    # REVIEWER evades the head checks entirely, because a body edit does not
+    # move HEAD. Nothing has been filed yet, so the cleanup is the same as the
+    # head-drift branch above: refuse, with zero issues left behind.
+    if ! revalidate_pr_body_author pre-issue-filing; then
+      fall_back_to_manual "$P4B_BODY_DRIFT_REASON — refusing to file post-review issues for an approval that will not post"
     fi
     # Same-head laundering gate, hoisted ahead of the side effects (#674
     # Codex round-2 P2): the authoritative gate below still guards the
@@ -1155,6 +1333,27 @@ post_review() {
       p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
     fi
     fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
+  fi
+  # Identity drift, last fence before the POST (#1143). Rendering, accounting
+  # and step-9 filing all sit between the pre-filing check and here, and a body
+  # edit in that window moves no sha, so the live-head fence above cannot see
+  # it. Same cleanup as that fence: close this run's filed follow-ups when an
+  # approval is what is being refused, then fall back.
+  if ! revalidate_pr_body_author pre-post; then
+    # Correct LOCAL state before anything that can be interrupted, via the same
+    # helper the timeout fence above uses (#1143 round 4). This matters because
+    # fall_back_to_manual runs the GitHub-backed require_feedback_accounted
+    # BEFORE it marks the loop unposted: if that gate exits — a transient read
+    # failure, or feedback that genuinely arrived during the adapter run — the
+    # loop log is left asserting that this unposted review WAS posted, with its
+    # pending ledger stage still staged. A persisted claim that a review posted
+    # when it did not is worse than the refusal itself. The helper marks the
+    # loop first, then closes this run's filed issues, and sets the flag
+    # fall_back_to_manual reads so the correction is not applied twice.
+    cleanup_pre_post_refusal_side_effects "$P4B_BODY_DRIFT_REASON" true \
+      "The PR body's declared Authoring-Agent" \
+      "the Authoring-Agent declared by ${REPO}#${PR}"
+    fall_back_to_manual "$P4B_BODY_DRIFT_REASON"
   fi
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \

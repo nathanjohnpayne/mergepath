@@ -134,8 +134,14 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
 
 ## Dependencies
 
-- **Runtime:** `bash` (3.2+), `jq`, `gh`, `git`, and the reviewer CLI
-  (`codex` and/or `claude`) on `PATH`.
+- **Runtime:** `bash` (3.2+), `jq`, `node`, `gh`, `git`, and the reviewer CLI
+  (`codex` and/or `claude`) on `PATH`. `node` runs the shared PR-body contract
+  parser (`scripts/lib/pr-body-contract.mjs`), which the identity fence invokes
+  on **every** enabled run — including callers that pass `--author`, which
+  before #1143 skipped the body read and so never reached it. The orchestrator
+  probes `node --version` beside its `jq` check, after the disabled/mode gates,
+  so a host missing it gets a message naming the dependency rather than a
+  parser error; the default disabled path still needs neither.
 - **Reasoning-plane auth (per direction) — subscription plan only:** the
   adapters verify the persisted CLI auth mode before launch and run the
   reviewer CLI under a tightly allowlisted child environment. Codex must report
@@ -248,29 +254,114 @@ that re-run it after `CHANGES_REQUESTED` own round counting and escalation.
 
 ## Try it (dry-run, offline, with fake CLIs)
 
+Save this as a file and run it (`bash try-it.sh`) rather than pasting it into a
+shell — it uses strict mode and exits on failure by design.
+
 ```bash
-printf 'verdict' > /tmp/diff.txt
+#!/usr/bin/env bash
+# A recipe whose whole claim is "offline" has to FAIL CLOSED when its offline
+# setup fails. Without the strict-mode preamble, a failed `mkdir`/`cat`/`chmod`
+# below would leave PATH pointing at a directory that does not exist, the real
+# `gh` would resolve, and the run would quietly perform a LIVE PR-body read.
+set -euo pipefail
+
+# The identity fence reads the PR body from the API on every run (#1143), so
+# an offline recipe has to serve one. This fake `gh` answers the body read and
+# returns a fixed head for everything else; nothing leaves the machine.
+# A private mktemp -d, not a predictable /tmp path: a leftover from an earlier
+# run, or another user's file at the same name, is exactly how the setup fails.
+P4B_OFFLINE="$(mktemp -d "${TMPDIR:-/tmp}/p4b-offline.XXXXXX")"
+trap 'rm -rf "$P4B_OFFLINE"' EXIT
+mkdir -p "$P4B_OFFLINE/bin"
+cat > "$P4B_OFFLINE/bin/gh" <<'SH'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    *'.body'*) printf 'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n'; exit 0 ;;
+  esac
+done
+printf 'deadbeef\n'
+SH
+chmod +x "$P4B_OFFLINE/bin/gh"
+export PATH="$P4B_OFFLINE/bin:$PATH"
+
+# Verify rather than assume. Strict mode catches a setup step that RETURNS
+# non-zero; it does not catch one that succeeds into the wrong state (a fake
+# written but left non-executable, a PATH that does not contain it). Proving
+# which `gh` resolves covers both, and is the only check that actually states
+# the guarantee this recipe makes.
+[ "$(command -v gh)" = "$P4B_OFFLINE/bin/gh" ] || {
+  echo "offline setup failed; refusing to run against the real gh" >&2
+  exit 1
+}
+
+printf 'verdict' > "$P4B_OFFLINE/diff.txt"
 CODEX_BIN=/path/to/fake-codex \
   MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true \
   scripts/phase-4b-review.sh 123 --repo nathanjohnpayne/mergepath \
-    --author claude --head deadbeef --diff-file /tmp/diff.txt --dry-run
+    --author claude --head deadbeef --diff-file "$P4B_OFFLINE/diff.txt" --dry-run
 ```
 
-`--dry-run` performs selection + adapter dispatch + verdict validation and
-prints the intended action without posting. The offline recipe explicitly
-replaces the live review-feedback accounting read with `true`; real dry-runs
-keep that gate enabled so they cannot spend a reviewer round while older
-feedback is unaccounted. Adapter CLIs are injectable via
-`CODEX_BIN` / `CLAUDE_BIN`, which is how `tests/test_phase_4b_automation.sh`
-exercises the package without network or real model calls.
+`--dry-run` reads and validates the PR body, then performs selection + adapter
+dispatch + verdict validation, and prints the intended action without posting.
+The offline recipe explicitly replaces the live review-feedback accounting read
+with `true`; real dry-runs keep that gate enabled so they cannot spend a
+reviewer round while older feedback is unaccounted. Adapter CLIs are injectable
+via `CODEX_BIN` / `CLAUDE_BIN`, which is how
+`tests/test_phase_4b_automation.sh` exercises the package without network or
+real model calls.
 
-The #814 same-head barrier is **skipped** under `--dry-run`, which is what
-keeps this recipe offline. The barrier guards the review POST and a dry-run
-never posts, so there is no ordering hazard for it to prevent — and both
-provider probes it would otherwise run are `gh`-backed, so running them would
-require network and credentials here. A real run always evaluates it.
+This recipe fakes `gh` and the reviewer CLI and nothing else. In particular it
+needs a **real** `node`, because the identity fence runs the shared contract
+parser under it. That is deliberate: `gh` is faked because it is the network
+boundary, and the point of faking it is to keep the run offline. `node` is a
+local execution dependency — the parser reads stdin and writes stdout, reaching
+nothing — so faking it would remove the real contract check the recipe exists to
+exercise, and would make a dry-run rehearse a different program than a real run.
+`jq` and `bash` are real here for the same reason.
+
+`--author` is a cross-check, not an override (#1143): it must name the same
+agent the body declares, so the fake above serves `claude` to match the
+`--author claude` in the command. Change one and you must change the other, or
+the run refuses with exit `3` — which is the flag behaving as designed rather
+than the recipe being broken. Dropping `--author` entirely also works; the body
+is what supplies the identity.
+
+The #814 same-head barrier is **skipped** under `--dry-run`, which is part of
+what keeps this recipe offline. The barrier guards the review POST and a
+dry-run never posts, so there is no ordering hazard for it to prevent — and
+both provider probes it would otherwise run are `gh`-backed, so running them
+would require network and credentials here. A real run always evaluates it.
+The identity fence is `gh`-backed too and is **not** skipped on a dry-run,
+which is why this recipe injects a fake `gh` rather than relying on the
+orchestrator needing none: reading the body is the point of that fence, and a
+dry-run that skipped it would rehearse a different program than the real one.
 
 For Codex, “no current-head signal” is not sufficient to open the barrier: it ordinarily remains `not-yet`. The #1085 exception is a durable Phase 4a timeout determination written by `codex-review-request.sh` to the PR timeline after a confirmed author-owned trigger exhausts its bounded wait. The marker is versioned, pinned to the full head SHA, bound to that trigger comment, and trusted only from `author_identity`; it remains current only while that trigger is the latest exact author-owned `@codex review` request in the complete timeline. A newer exact request supersedes the old timeout and keeps Phase 4b pending until that new attempt reaches its own terminal result. The full provider barrier runs before the adapter. After the adapter returns schema-valid output, the orchestrator re-reads the paginated timeline and live head before interpreting the verdict or performing its first approval-side effect, then repeats that targeted timeout-generation read immediately before the review POST; the final read corrects provisional accounting and closes this run's filed follow-ups before holding or falling back. A request arriving during either external-review window therefore cannot inherit an older waiver. Stale markers remain pending, while malformed/unreadable evidence and head drift escalate fail-closed. Provider-authored usage-limit/not-connected comments make `codex-review-request.sh` exit `4` with `blocked_reason`; the later `codex-review-check.sh --diagnostic-signal-only` probe maps that evidence to its separate exit-`2` Phase 4b waiver.
+
+## Identity fences (#1143)
+
+The PR body is the record of authorship, and the orchestrator reads and
+validates it against the shared contract (`scripts/lib/pr-body-contract.sh`) on
+**every** run — the same contract the required Self-Review gate enforces.
+`--author` is a cross-check against the `Authoring-Agent:` the body declares,
+never an override: a disagreement exits `3`, and there is no opt-out.
+
+That up-front read is not sufficient on its own, because the adapter run after
+it can last the configured timeout and **editing a PR body moves no sha** — so
+a mid-run identity change is invisible to every head-drift check. A body edited
+to declare the agent the run picked as *reviewer* would otherwise collect a
+cross-agent approval from its own authoring agent. The body and its author are
+therefore revalidated at both approval-side-effect boundaries: immediately
+before the step-9 issue filing, and immediately again before the review POST.
+
+Both fences require the live body to still satisfy the contract **and** to
+still declare the agent the run was planned against. A changed agent, a body
+that stopped validating, and an unreadable read all refuse via
+`fall_back_to_manual`; the pre-POST fence closes this run's filed follow-up
+issues as superseded first, exactly as the head-drift check beside it does. An
+edit that leaves the identity intact — added prose, a fixed typo — is not drift
+and does not refuse.
 
 ## Exit codes (orchestrator)
 
