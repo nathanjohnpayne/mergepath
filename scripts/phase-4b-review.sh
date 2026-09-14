@@ -1380,15 +1380,37 @@ post_review() {
 acknowledge_approval() {
   local accounting accounting_rc missing token payload_file post_rc
   if accounting=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO"); then
-    return 0
+    accounting_rc=0
   else
     accounting_rc=$?
   fi
-  [ "$accounting_rc" = 1 ] || return 1
+  [ "$accounting_rc" -le 1 ] || return 1
+  # Filed optional findings prove this review must enter the inventory. A
+  # temporarily absent review is not evidence that acknowledgment is needless.
+  if [ "${FILE_COUNT:-0}" -gt 0 ]; then
+    printf '%s' "$accounting" | jq -e --arg id "$POSTED_REVIEW_ID" --rawfile body "$BODY_FILE" '
+      any(.findings[]; .kind == "review-body" and (.review_id | tostring) == $id
+        and .body == $body)' >/dev/null || return 1
+  fi
+  [ "$accounting_rc" != 0 ] || return 0
   case "$POSTED_REVIEW_ID" in ''|*[!0-9]*) return 1 ;; esac
   missing=$(printf '%s' "$accounting" | jq -c --arg id "$POSTED_REVIEW_ID" '
     [.missing[] | select(.kind == "review-body" and (.review_id | tostring) == $id)]') || return 1
   [ "$missing" != '[]' ] || return 0
+  # The gate resolves the governing base policy independently of this
+  # checkout. A stricter policy cannot inherit local step-9 dispositions.
+  printf '%s' "$accounting" | jq -e --argjson missing "$missing" \
+    --argjson verdict "$VERDICT_JSON" --argjson filed "${FILE_JSON:-null}" '
+      .feedback_policy as $policy |
+      def disposition($tier): $policy.priorities[$tier] //
+        (if $tier == "p0" or $tier == "p1" then "required" else "discretionary" end);
+      ($policy | type) == "object"
+      and ($policy.mode // "by-priority") == "by-priority"
+      and all($missing[]; disposition(.tier) == "discretionary")
+      and all($verdict.findings[]; . as $finding |
+        disposition(.severity | ascii_downcase) as $d |
+        $d == "ignore" or ($d == "discretionary" and any($filed.findings[]?; . == $finding)))
+    ' >/dev/null || return 1
   # A review edit does not move its id. Never acknowledge a body the adapter
   # did not produce, including edits consisting only of trailing newlines.
   token=$(printf '%s' "$missing" | jq -er --rawfile body "$BODY_FILE" '
@@ -1444,7 +1466,7 @@ case "$VERDICT" in
       p4b_log "posted APPROVED as $REVIEWER — Phase 4b substitute clearance is now on HEAD"
       if ! acknowledge_approval; then
         REVIEW_ACKNOWLEDGMENT=failed
-        EXIT_CODE=3
+        EXIT_CODE=7
         p4b_warn "approval review $POSTED_REVIEW_ID was posted, but its acknowledgment could not be verified; account for that review without repeating the review run"
       fi
     fi
