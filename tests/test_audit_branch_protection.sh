@@ -1445,7 +1445,7 @@ cat >"$FLEET_STUB" <<'STUB'
 # It also echoes the branch and the admin-enforcement flag it was handed,
 # because those are the loop's job to compute: the branch must be that
 # repo's own default (not a fleet-wide `main`), and --require-admin-
-# enforcement must reach the hub and only the hub.
+# enforcement must reach only consumers explicitly staged by the fleet loop.
 repo=""
 branch=""
 admin_flag="no"
@@ -1470,6 +1470,18 @@ case "${FLEET_SCENARIO:-all_pass}" in
       */beta)  exit 3 ;;
       */alpha) exit 2 ;;
       *)       exit 0 ;;
+    esac ;;
+  five_admin_enforcement)
+    case "$repo" in
+      */fiveacross)
+        [ "$admin_flag" = "yes" ] || exit 2
+        case "${FLEET_FIVE_ENFORCED:-false}" in
+          true) exit 0 ;;
+          false) exit 3 ;;
+          *) exit 2 ;;
+        esac
+        ;;
+      *) exit 0 ;;
     esac ;;
 esac
 exit 0
@@ -1762,14 +1774,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Fleet test 12: NO repo — the hub included — is audited with
-#                --require-admin-enforcement. ADR 0002 originally asked for
-#                enforce_admins on the hub (#427/#428 were both admin
-#                merges); the owner DECLINED that on 2026-08-28 and kept an
-#                admin escape fleet-wide, so a CI or provider outage cannot
-#                strand a fully reviewed PR (#1121). This asserts the new
-#                posture positively: reinstating the hub special case must
-#                fail here, not pass silently.
+# Fleet test 12: the hub and unactivated consumers are audited without
+#                --require-admin-enforcement. ADR 0002 retains the hub
+#                recovery path; #937 stages consumer enforcement only after
+#                each readiness canary. This asserts that the first staged
+#                entry does not silently become a fleet-wide rollout.
 # ---------------------------------------------------------------------------
 set +e
 out=$(run_fleet all_pass 2>&1)
@@ -1786,13 +1795,101 @@ elif echo "$out" | grep -q "repo=testowner/beta admin_enforcement=yes"; then
 elif ! echo "$out" | grep -q "repo=testowner/hub admin_enforcement=no"; then
   fail "fleet must still audit the hub, just without the admin flag; output: $out"
 else
-  pass "fleet audits every repo, hub included, WITHOUT admin enforcement"
+  pass "fleet audits the hub and unactivated consumers without admin enforcement"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 12b: #937 stages admin enforcement by literal consumer. Five
+# Across is the first completed pre-enforcement canary. Its unset
+# enforce_admins state is drift while the hub and other consumers still pass;
+# once it is enabled, the full fleet clears. This keeps the hub exception and
+# rejects an accidental fleet-wide rollout.
+# ---------------------------------------------------------------------------
+FLEET_MANIFEST_FIVE="$WORKDIR/fleet-manifest-five.yml"
+cat >"$FLEET_MANIFEST_FIVE" <<'MANIFEST'
+version: 1
+consumers:
+  - name: alpha
+    repo: testowner/alpha
+  - name: beta
+    repo: testowner/beta
+  - name: fiveacross
+    repo: nathanjohnpayne/fiveacross
+MANIFEST
+
+run_fleet_five_admin_enforcement() {
+  local enforced="$1"
+  PATH="$STUB_DIR:$PATH" \
+  FLEET_SCENARIO=five_admin_enforcement \
+  FLEET_FIVE_ENFORCED="$enforced" \
+    bash "$SCRIPT" --fleet \
+      --hub-repo testowner/hub \
+      --manifest "$FLEET_MANIFEST_FIVE" \
+      --audit-cmd "$FLEET_STUB"
+}
+
+set +e
+out=$(run_fleet_five_admin_enforcement false 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "fleet Five admin bypass: exit $rc, expected 3; output: $out"
+elif ! echo "$out" | grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=yes"; then
+  fail "fleet Five admin bypass: Five must receive --require-admin-enforcement; output: $out"
+elif echo "$out" | grep -q "repo=testowner/hub admin_enforcement=yes" \
+  || echo "$out" | grep -q "repo=testowner/alpha admin_enforcement=yes" \
+  || echo "$out" | grep -q "repo=testowner/beta admin_enforcement=yes"; then
+  fail "fleet Five admin bypass: hub and unactivated consumers must retain their exception; output: $out"
+elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +nathanjohnpayne/fiveacross@main$"; then
+  fail "fleet Five admin bypass: Five must be reported as fleet drift; output: $out"
+elif ! echo "$out" | grep -q "Audited 4 repo(s): 3 pass, 1 drift, 0 error."; then
+  fail "fleet Five admin bypass: tally line wrong; output: $out"
+else
+  pass "fleet stages Five admin enforcement: false is drift while hub and other consumers pass"
+fi
+
+set +e
+out=$(run_fleet_five_admin_enforcement true 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "fleet Five admin enforcement: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=yes"; then
+  fail "fleet Five admin enforcement: Five must retain --require-admin-enforcement; output: $out"
+elif ! echo "$out" | grep -q "Audited 4 repo(s): 4 pass, 0 drift, 0 error."; then
+  fail "fleet Five admin enforcement: tally line wrong; output: $out"
+else
+  pass "fleet clears after staged Five admin enforcement is enabled"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 12c: --hub-repo is an override for the hub identity, never a
+#                way to turn that hub into a staged consumer. The consumer
+#                row is skipped as a duplicate, so Five receives no
+#                admin-enforcement flag in this topology.
+# ---------------------------------------------------------------------------
+set +e
+out=$(PATH="$STUB_DIR:$PATH" FLEET_SCENARIO=all_pass \
+        bash "$SCRIPT" --fleet \
+          --hub-repo nathanjohnpayne/fiveacross \
+          --manifest "$FLEET_MANIFEST_FIVE" \
+          --audit-cmd "$FLEET_STUB" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "fleet Five-as-hub: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=no"; then
+  fail "fleet Five-as-hub: hub override must retain its exception; output: $out"
+elif echo "$out" | grep -q "repo=nathanjohnpayne/fiveacross admin_enforcement=yes"; then
+  fail "fleet Five-as-hub: a hub must never receive the consumer flag; output: $out"
+else
+  pass "fleet Five-as-hub retains the hub exception"
 fi
 
 # ---------------------------------------------------------------------------
 # Fleet test 13: --require-admin-enforcement is decided per repo by the
-#                fleet loop, so passing it alongside --fleet is rejected
-#                rather than silently ignored.
+#                fleet loop for staged consumers, so passing it alongside
+#                --fleet is rejected rather than silently ignored.
 # ---------------------------------------------------------------------------
 set +e
 out=$(bash "$SCRIPT" --fleet --require-admin-enforcement \
@@ -1802,7 +1899,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ]; then
   fail "--fleet + --require-admin-enforcement: exit $rc, expected 1; output: $out"
-elif ! echo "$out" | grep -q -- "--require-admin-enforcement is not passed by --fleet for any repo"; then
+elif ! echo "$out" | grep -q -- "--require-admin-enforcement is selected by --fleet for staged consumers"; then
   fail "--fleet + --require-admin-enforcement: diagnostic missing; output: $out"
 else
   pass "--fleet + --require-admin-enforcement: rejected rather than silently ignored"
