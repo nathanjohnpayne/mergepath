@@ -84,14 +84,19 @@ function opensLazyParagraph(line) {
     const remainder = line.slice(blockquote[0].length).replace(/^ /, '');
     return !BLANK_LINE_RE.test(remainder) && !interruptsParagraph(remainder);
   }
-  // The content group must NOT require \S: \S excludes the very Unicode
-  // separators at issue, so "- \u2003" matched no content group at all and
-  // read as an EMPTY list item -- no open paragraph -- which made the next
-  // line a fresh top-level paragraph rather than a lazy continuation inside
-  // the item. Capture the raw remainder and ask BLANK_LINE_RE instead, which
-  // is the same question the blockquote branch above asks (#1192).
-  const listItem = line.match(/^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]+(.*))?$/);
-  const remainder = listItem?.[1] ?? '';
+  // Neither \S nor dot preserves every CommonMark-nonblank Unicode
+  // separator: dot also drops U+2028/U+2029. Capture all content (#1192).
+  const listItem = line.match(/^( {0,3}(?:[-+*]|\d{1,9}[.)]))(?:([ \t]+)([\s\S]*))?$/);
+  const remainder = listItem?.[3] ?? '';
+  // One-to-four padding columns precede a paragraph; wider padding makes
+  // the first block indented code, which cannot have lazy continuations.
+  // Tabs advance from the physical column after the complete list marker.
+  const markerColumn = listItem?.[1].length ?? 0;
+  let padding = 0;
+  for (const char of listItem?.[2] ?? '') {
+    padding += char === '\t' ? 4 - ((markerColumn + padding) % 4) : 1;
+  }
+  if (padding > 4) return false;
   return !BLANK_LINE_RE.test(remainder) && !interruptsParagraph(remainder);
 }
 
