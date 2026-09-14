@@ -32,9 +32,9 @@ export P4B_TEST_POSTED_REVIEW="$WORK/posted-review.json"
 cat > "$WORK/clear-feedback.sh" <<'SH'
 #!/usr/bin/env bash
 if [ -s "$P4B_TEST_POSTED_REVIEW" ]; then
-  jq '{findings:[{kind:"review-body",review_id:1,body:.body,accounted:true}],missing:[]}' "$P4B_TEST_POSTED_REVIEW"
+  jq '{feedback_policy:{},findings:[{kind:"review-body",review_id:1,body:.body,accounted:true}],missing:[]}' "$P4B_TEST_POSTED_REVIEW"
 else
-  printf '{"findings":[],"missing":[]}'
+  printf '{"feedback_policy":{},"findings":[],"missing":[]}'
 fi
 SH
 chmod +x "$WORK/clear-feedback.sh"
@@ -569,12 +569,12 @@ if [ "${P4B_ACK_REAL_GATE:-}" = true ]; then
     GH_TOKEN=fixture-token exec "$P4B_ACK_GATE_SCRIPT" "$@"
 fi
 if [ ! -s "$P4B_ACK_REVIEW" ]; then
-  printf '{"findings":[],"missing":[]}'
+  printf '{"feedback_policy":{},"findings":[],"missing":[]}'
   exit 0
 fi
 [ "${P4B_ACK_READ_FAIL:-}" != true ] || exit 2
 if [ "${P4B_ACK_NOT_VISIBLE:-}" = true ]; then
-  printf '{"findings":[],"missing":[]}'
+  printf '{"feedback_policy":{},"findings":[],"missing":[]}'
   exit 0
 fi
 body_json=$(jq -c '.body' "$P4B_ACK_REVIEW")
@@ -720,6 +720,16 @@ for policy in "$POLICY_P2_REQUIRED" "$POLICY_ADDRESS_ALL"; do
     pass "#1261: governing $(basename "$policy") refuses acknowledgment despite a locally discretionary P2"
   else fail "#1261: stricter governing policy was bypassed (rc=$rc; $out)"; fi
 done
+
+POLICY_P2_IGNORED="$WORK/approval-p2-ignored.yml"
+cp "$POLICY_ON" "$POLICY_P2_IGNORED"
+printf '\nfeedback_policy: {priorities: {p2: ignore}}\n' >> "$POLICY_P2_IGNORED"
+run_approval_ack_case ignored-by-base fake-codex-approve-p2 claude \
+  P4B_ACK_REAL_GATE=true "P4B_ACK_POLICY=$POLICY_P2_IGNORED"
+if [ "$rc" = 0 ] && [ ! -e "$P4B_ACK_CASE/comment.json" ] \
+   && printf '%s' "$out" | jq -e '.review_posted == true and .review_acknowledgment == "not-needed"' >/dev/null; then
+  pass "#1261: governing ignore tier creates no acknowledgment obligation despite local issue filing"
+else fail "#1261: ignored governing tier created an impossible repair (rc=$rc; $out)"; fi
 
 # --- end #1261 approval acknowledgment regression ---------------------------
 

@@ -35,9 +35,9 @@ export P4B_TEST_POSTED_REVIEW="$WORK/posted-review.json"
 cat > "$WORK/clear-feedback.sh" <<'SH'
 #!/usr/bin/env bash
 if [ -s "$P4B_TEST_POSTED_REVIEW" ]; then
-  jq '{findings:[{kind:"review-body",review_id:1,body:.body,accounted:true}],missing:[]}' "$P4B_TEST_POSTED_REVIEW"
+  jq '{feedback_policy:{},findings:[{kind:"review-body",review_id:1,body:.body,accounted:true}],missing:[]}' "$P4B_TEST_POSTED_REVIEW"
 else
-  printf '{"findings":[],"missing":[]}'
+  printf '{"feedback_policy":{},"findings":[],"missing":[]}'
 fi
 SH
 chmod +x "$WORK/clear-feedback.sh"

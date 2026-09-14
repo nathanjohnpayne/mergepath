@@ -67,8 +67,7 @@
 # Exit codes:
 #   0  APPROVED — review posted (or would post under --dry-run).
 #   1  CHANGES_REQUESTED — review posted; the author must address findings.
-#   3  usage / infrastructure error; after an approval POST, acknowledgment
-#      failure retains review_posted:true (do not repeat the review).
+#   3  usage / infrastructure error.
 #   4  fell back to the manual handoff (adapter error/timeout, invalid
 #      verdict, or no adapter for the selected reviewer). The chat-side
 #      block from scripts/post-phase-4b-handoff.sh is emitted on stderr.
@@ -85,9 +84,10 @@
 #      scripts/wave-audit.sh all treat 4 as a reviewer that will not answer,
 #      and wave-audit proceeds fail-open on it — which would be wrong for a
 #      wait that clears on its own.
-#   7  FEEDBACK_UNACCOUNTED — an earlier reviewer finding has no durable
-#      disposition evidence. No adapter is dispatched and no handoff block is
-#      emitted. Account for every finding, then rerun this command (#1000).
+#   7  FEEDBACK_UNACCOUNTED — a reviewer finding has no durable disposition.
+#      Before dispatch, account for findings and rerun (#1000). After a posted
+#      approval, review_posted:true identifies an acknowledgment to repair
+#      without repeating the review. No handoff block is emitted.
 
 set -euo pipefail
 
@@ -1378,16 +1378,23 @@ post_review() {
 # need their own dispositions. Let the existing gate supply the token rather
 # than duplicating its classification, JSON fingerprint, or evidence rules.
 acknowledge_approval() {
-  local accounting accounting_rc missing token payload_file post_rc
+  local accounting accounting_rc missing token payload_file post_rc expected_findings
   if accounting=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO"); then
     accounting_rc=0
   else
     accounting_rc=$?
   fi
   [ "$accounting_rc" -le 1 ] || return 1
-  # Filed optional findings prove this review must enter the inventory. A
-  # temporarily absent review is not evidence that acknowledgment is needless.
-  if [ "${FILE_COUNT:-0}" -gt 0 ]; then
+  # Only rendered findings nonignored by the governing policy require an
+  # inventory row. Local issue filing may reflect an older, stricter policy.
+  expected_findings=$(printf '%s' "$accounting" | jq -er --argjson verdict "$VERDICT_JSON" '
+    .feedback_policy as $policy |
+    if ($verdict.findings | length) == 0 then 0
+    elif ($policy | type) != "object" then error("missing governing policy") else
+      [$verdict.findings[] | select(($policy.mode // "by-priority") == "address-all"
+        or $policy.priorities[(.severity | ascii_downcase)] != "ignore")] | length
+    end') || return 1
+  if [ "$expected_findings" -gt 0 ]; then
     printf '%s' "$accounting" | jq -e --arg id "$POSTED_REVIEW_ID" --rawfile body "$BODY_FILE" '
       any(.findings[]; .kind == "review-body" and (.review_id | tostring) == $id
         and .body == $body)' >/dev/null || return 1
