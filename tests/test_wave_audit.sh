@@ -386,6 +386,76 @@ run_wa "$POLICY_EXACT" reset 67 --repo owner/consumer --base "$C6" --head-sha "$
   && pass "exact-budget range remains eligible" || fail "exact-budget range refused"
 [ -e "$CAPTURE/args" ] && pass "exact-budget range dispatches" || fail "exact-budget range did not dispatch"
 
+# Tag annotation time is informational and must not become a freshness gate.
+echo "wave-audit.sh — selected watermark annotation age (#1186)"
+AGE_TAG="wave-audit-pass/$C6"
+TAG_TIME=946684800
+GIT_COMMITTER_DATE="@$TAG_TIME +0000" git -C "$CANON" tag -a "$AGE_TAG" "$C6" -m 'age fixture'
+git -C "$CANON" push -q origin "refs/tags/$AGE_TAG"
+[ "$(git -C "$CANON" show -s --format=%ct "$C6")" != "$TAG_TIME" ] \
+  || { echo "age fixture must distinguish commit and tag times" >&2; exit 1; }
+START_TIME="$(date +%s)"
+rc=0
+run_wa "$POLICY_SMALL" reset 68 --repo owner/consumer --head-sha "$LARGE_HEAD" > "$WORK/age.json" 2> "$WORK/age.err" || rc=$?
+END_TIME="$(date +%s)"
+[ "$rc" -eq 8 ] && [ ! -e "$CAPTURE/args" ] && ! remote_has_tag "$LARGE_HEAD" \
+  && pass "old watermark does not change over-budget refusal, dispatch or tagging" \
+  || fail "age changed the over-budget outcome"
+jq -e --arg tag "$AGE_TAG" --arg base "$C6" --argjson tagged "$TAG_TIME" --argjson start "$START_TIME" --argjson end "$END_TIME" \
+  '.base == $base and .base_watermark.tag == $tag and .base_watermark.tagger_timestamp == $tagged and .base_watermark.age_seconds >= ($start - $tagged) and .base_watermark.age_seconds <= ($end - $tagged)' "$WORK/age.json" >/dev/null \
+  && pass "over-budget JSON reports selected annotation age, not commit age" \
+  || fail "selected annotation age missing or incorrect"
+grep -q "tagger_timestamp=$TAG_TIME age_seconds=" "$WORK/age.err" \
+  && pass "watermark age is prominent in the refusal log" || fail "watermark age log missing"
+rc=0
+FAKE_ORCH_EXIT=4 run_wa "$POLICY_GOOD" reset 69 --repo owner/consumer --head-sha "$LARGE_HEAD" > "$WORK/age-unavailable.json" 2> "$WORK/age-unavailable.err" || rc=$?
+[ "$rc" -eq 4 ] && [ -e "$CAPTURE/args" ] && ! remote_has_tag "$LARGE_HEAD" \
+  && jq -e --arg tag "$AGE_TAG" '.base_watermark.tag == $tag and .base_watermark.age_seconds > 0 and .watermark_advanced == false' "$WORK/age-unavailable.json" >/dev/null \
+  && pass "reviewer-unavailable retains exit and tag behavior while reporting age" \
+  || fail "unavailable outcome or age incorrect"
+out="$(run_wa "$POLICY_GOOD" reset 70 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" --dry-run 2>/dev/null)"
+printf '%s' "$out" | jq -e '.base_watermark == {tag:null, tagger_timestamp:null, age_seconds:null}' >/dev/null \
+  && pass "explicit base has unknown age even when a matching tag exists" \
+  || fail "explicit base invented a selected watermark"
+
+# A lightweight selected tag has no tagger timestamp; never use commit time.
+git -C "$CANON" tag -d "$AGE_TAG" >/dev/null
+git -C "$CANON" tag "$AGE_TAG" "$C6"
+git -C "$CANON" push -q --force origin "refs/tags/$AGE_TAG" 2>/dev/null
+out="$(run_wa "$POLICY_GOOD" reset 71 --repo owner/consumer --head-sha "$LARGE_HEAD" --dry-run 2>/dev/null)"
+printf '%s' "$out" | jq -e --arg tag "$AGE_TAG" --arg base "$C6" '.base == $base and .base_watermark == {tag:$tag, tagger_timestamp:null, age_seconds:null}' >/dev/null \
+  && pass "unannotated selected tag has unknown age without changing base" \
+  || fail "unannotated tag time was invented or changed selection"
+
+# Future annotation time remains visible; elapsed age is unknown, not zero.
+FUTURE_TIME=$(( $(date +%s) + 86400 ))
+GIT_COMMITTER_DATE="@$FUTURE_TIME +0000" git -C "$CANON" tag -fa "$AGE_TAG" "$C6" -m 'future fixture' >/dev/null
+git -C "$CANON" push -q --force origin "refs/tags/$AGE_TAG" 2>/dev/null
+out="$(run_wa "$POLICY_GOOD" reset 72 --repo owner/consumer --head-sha "$LARGE_HEAD" --dry-run 2>/dev/null)"
+printf '%s' "$out" | jq -e --arg base "$C6" --argjson future "$FUTURE_TIME" '.base == $base and .base_watermark.tagger_timestamp == $future and .base_watermark.age_seconds == null' >/dev/null \
+  && pass "future tag time cannot imply verified freshness or change base" \
+  || fail "future tag time changed outcome or implied a known age"
+
+# Fail only the new informational metadata read; all selection/diff git calls
+# remain real. No malformed tag validation or new authority is under test.
+REAL_GIT="$(command -v git)"
+cat > "$FAKEBIN/git" <<'GIT'
+#!/usr/bin/env bash
+case "$*" in
+  *'for-each-ref --format=%(taggerdate:unix)'*)
+    [ "$AGE_METADATA_CASE" != unavailable ] || { printf '946684800\n'; exit 2; }
+    printf 'not-a-timestamp\n'; exit 0 ;;
+esac
+exec "$REAL_GIT" "$@"
+GIT
+chmod +x "$FAKEBIN/git"
+for metadata_case in invalid unavailable; do
+  out="$(PATH="$FAKEBIN:$PATH" REAL_GIT="$REAL_GIT" AGE_METADATA_CASE="$metadata_case" run_wa "$POLICY_GOOD" reset 73 --repo owner/consumer --head-sha "$LARGE_HEAD" --dry-run 2>/dev/null)"
+  printf '%s' "$out" | jq -e --arg tag "$AGE_TAG" --arg base "$C6" '.base == $base and .base_watermark == {tag:$tag, tagger_timestamp:null, age_seconds:null}' >/dev/null \
+    && pass "$metadata_case metadata leaves base and successful dry-run unchanged" \
+    || fail "$metadata_case metadata changed outcome or claimed an age"
+done
+
 echo
 echo "Summary: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
