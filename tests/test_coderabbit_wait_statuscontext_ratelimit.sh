@@ -1306,10 +1306,8 @@ STUB
 # this case proves the predicate is still WIRED, by running the whole script
 # against a status whose description is one of them.
 #
-# The expected outcome is not "blocked" but "not cleared BY THE FAST PATH": the
-# verdict falls through to the comment-driven poll, which reaches its own answer
-# off the clean review comment. `review.endpoint` is the assertion that
-# separates the two routes.
+# The fast path must still refuse this description. #940 now also refuses the
+# unanchored comment's fallback clearance, so the existing wait ends in timeout.
 test_negated_completed_description_does_not_take_fast_path() {
   local dir rc before=$FAIL
   dir=$(make_case "desc-no-review-completed" "$REVIEW_BODY_CLEAN" "$STATUS_TIME" "No review completed")
@@ -1318,8 +1316,10 @@ test_negated_completed_description_does_not_take_fast_path() {
     || fail "20: the description guard did not fire on 'No review completed'; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
   [ "$(jqf "$dir" '.review.endpoint')" != "status_context" ] \
     || fail "20: the fast path took a status describing NO completed review as clearance evidence"
-  [ "$rc" = "0" ] || fail "20: expected the poll route to reach exit 0 off the clean review comment, got $rc; err=$(tail -4 "$dir/err.log")"
-  [ "$FAIL" -ne "$before" ] || pass "20: 'No review completed' suppresses the fast path; the verdict comes from the comment-driven poll instead"
+  [ "$rc" = "4" ] || fail "20: expected timeout after both routes refuse the non-completion status, got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q "non-completion description 'No review completed'" "$dir/err.log" \
+    || fail "20: the fallback status veto did not run after the fast-path refusal"
+  [ "$FAIL" -ne "$before" ] || pass "20: 'No review completed' suppresses both the fast path and unanchored fallback clearance"
 }
 
 # --- Test 27: #967 — a 200 whose body is a JSON OBJECT is an UNREAD list -----
@@ -1401,18 +1401,21 @@ null'; do
   [ "$FAIL" -ne "$before" ] || pass "27b: #967 ordering — a null body, an empty body and a null page are failed reads, not the empty list 'add // []' would have made of them"
 }
 
-# --- Test 28: #967 escape — a genuine empty list still clears ---------------
+# --- Test 28: #967 escape — a genuine empty list is readable ---------------
 # The control that keeps test 27 from passing for the wrong reason. Same
 # fixture, same route, the ONLY difference being that the reviews endpoint
 # serves a valid `[]`: an empty array is a real answer ("no reviews on this
-# head") and must still reach the polling arm's clearance.
-test_empty_reviews_array_still_clears() {
+# head"). #940's status veto then withholds clearance; the empty list itself
+# must not become an infrastructure error like test 27's unreadable responses.
+test_empty_reviews_array_is_readable() {
   local dir rc before=$FAIL
   dir=$(make_case "reviews-empty-array" "$REVIEW_BODY_CLEAN" "$STATUS_TIME" "Review rate limited")
   rc=$(run_case "$dir")
-  [ "$rc" = "0" ] || fail "28: expected exit 0 (cleared) for a genuinely empty reviews list, got $rc; err=$(tail -4 "$dir/err.log")"
-  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "28: status=$(jqf "$dir" '.status'), expected cleared"
-  [ "$FAIL" -ne "$before" ] || pass "28: #967 escape — a valid empty reviews array is still a readable answer and still clears"
+  [ "$rc" = "4" ] || fail "28: expected status-veto timeout, not an unreadable-list error, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "timeout" ] || fail "28: status=$(jqf "$dir" '.status'), expected timeout"
+  grep -q "non-completion description 'Review rate limited'" "$dir/err.log" \
+    || fail "28: the readable empty list did not reach the fallback status veto"
+  [ "$FAIL" -ne "$before" ] || pass "28: #967 escape — a valid empty reviews array is readable; #940's non-completion status still withholds clearance"
 }
 
 # --- Test 29: #968 — an in-place summary EDIT is not a re-review ------------
@@ -1460,20 +1463,23 @@ test_summary_naming_current_head_still_clears() {
   [ "$FAIL" -ne "$before" ] || pass "30: #968 AC2 — a summary naming the current head still clears with a created_at below the HEAD-committer floor (#824 rung intact)"
 }
 
-# --- Test 31: #968 AC3 — a summary naming NO SHA is unchanged --------------
+# --- Test 31: #968 AC3 — no SHA claim does not trigger head demotion --------
 # The demotion is scoped to bodies that make a head claim. A body carrying no
 # commits range at all says nothing about which commit it covers, so the
-# `fresh_at >= HEAD_ANCHOR` floor stays the only test — exactly as before.
+# `fresh_at >= HEAD_ANCHOR` floor still admits it. #940's separate status veto
+# now refuses clearance on this same non-completion status.
 test_summary_naming_no_sha_falls_through_to_floor() {
   local dir rc before=$FAIL
   dir=$(make_case "summary-no-sha" "$SUMMARY_NAMES_NO_SHA" "$STATUS_TIME" \
     "Review rate limited" "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 "" "$HEAD_TIME" \
     "$HEAD_SHA_40" "$SUMMARY_EDITED_AFTER_HEAD")
   rc=$(run_case "$dir")
-  [ "$rc" = "0" ] || fail "31: expected exit 0 (cleared) for a summary that names no SHA, got $rc; err=$(tail -4 "$dir/err.log")"
-  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "31: status=$(jqf "$dir" '.status'), expected cleared"
+  [ "$rc" = "4" ] || fail "31: expected status-veto timeout for the unanchored summary, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "timeout" ] || fail "31: status=$(jqf "$dir" '.status'), expected timeout"
+  grep -q "fresh_at=$SUMMARY_EDITED_AFTER_HEAD" "$dir/err.log" \
+    || fail "31: the no-claim summary never passed the freshness floor"
   grep -q 'names a different commit' "$dir/err.log" && fail "31: the SHA demotion fired on a body that makes no head claim"
-  [ "$FAIL" -ne "$before" ] || pass "31: #968 AC3 — a summary carrying no commits range still falls through to the freshness floor unchanged"
+  [ "$FAIL" -ne "$before" ] || pass "31: #968 AC3 — a no-claim summary passes the freshness floor without head demotion; #940 status veto still applies"
 }
 
 # --- Test 32: #985 — emit_json_and_exit refuses an unusable review object ---
@@ -1576,7 +1582,7 @@ test_later_chat_reply_does_not_restore_other_head_clear() {
   [ "$rc" != "0" ] || fail "33: FALSE-CLEARED (exit 0) — a benign chat reply above the summary restored the #968 false clear; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "33: status=cleared on a verdict about a different commit"
   [ "$rc" = "4" ] || fail "33: expected exit 4 (timeout — nothing on this head to verdict on), got $rc; err=$(tail -4 "$dir/err.log")"
-  grep -q "summary comment has no blocking markers, but its commits range names a different commit" "$dir/err.log" \
+  grep -q "summary's commits range names a different commit" "$dir/err.log" \
     || fail "33: the refusal is not sourced from the SUMMARY comment; err=$(tail -4 "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "33: #968 AC1 — the head claim is read from the marker-selected summary, so a later benign chat reply cannot clear another commit's verdict"
 }
@@ -2142,7 +2148,7 @@ test_failed_fast_path_comment_decode_does_not_clear
 test_failed_poll_comment_decode_does_not_clear
 test_non_array_reviews_body_does_not_clear
 test_fallback_manufactured_array_does_not_clear
-test_empty_reviews_array_still_clears
+test_empty_reviews_array_is_readable
 test_summary_naming_other_head_does_not_clear
 test_summary_naming_current_head_still_clears
 test_summary_naming_no_sha_falls_through_to_floor
