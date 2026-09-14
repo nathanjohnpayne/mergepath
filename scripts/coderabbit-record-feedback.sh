@@ -508,7 +508,7 @@ fi_idx=0
 while [ "$fi_idx" -lt "$FINDINGS_COUNT" ]; do
   f=$(echo "$FINDINGS" | jq -c ".[$fi_idx]")
   body=$(echo "$f" | jq -r '.body // ""')
-  tier=$(coderabbit_tier_of "$body")
+  tier=$(coderabbit_tier_of "$body") || die 3 "could not classify CodeRabbit feedback; refusing a supplied-tier fallback"
   if [ -z "$tier" ]; then
     tier=$(echo "$f" | jq -r '.tier // empty')
   fi

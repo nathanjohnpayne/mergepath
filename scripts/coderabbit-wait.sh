@@ -1527,7 +1527,10 @@ classify_comment() {
 #     finding body, or one line of a multi-finding summary, never a whole
 #     multi-finding document.
 crw_body_is_blocking_finding() {
-  case "$(coderabbit_tier_of "${1:-}")" in
+  # 0: blocking marker; 1: legitimate absence; 2: unreadable tier evidence.
+  local tier
+  tier=$(coderabbit_tier_of "${1:-}") || return 2
+  case "$tier" in
     p0|p1) return 0 ;;
   esac
   return 1
@@ -1541,12 +1544,11 @@ crw_body_is_blocking_finding() {
 # which CodeRabbit renders the badge. Blank lines are skipped; they cannot
 # carry a marker.
 crw_scan_has_blocking_marker() {
-  local line
+  local line rc
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    if crw_body_is_blocking_finding "$line"; then
-      return 0
-    fi
+    rc=0; crw_body_is_blocking_finding "$line" || rc=$?
+    case "$rc" in 0) return 0 ;; 1) ;; *) return 2 ;; esac
   done <<< "${1:-}"
   return 1
 }
@@ -1702,12 +1704,9 @@ summary_names_only_other_head() {  # <body> <head_sha>
 # heuristic cannot drift between them.
 summary_blocking_marker_present() {
   local body=$1 unfenced scan s_line e_line
-  # ONE fence read, and DELIBERATELY NOT tri-state (Codex P1 round 7). Round 6
-  # made this return 3 on a reader failure and audited only the two new callers;
-  # six others consume it as a boolean, so an awk/locale failure became a CLEAN
-  # result at three of them. The contract is restored: a reader failure falls
-  # back to scanning the RAW body, which is strictly WIDER text and therefore
-  # more likely to find a marker — fail-closed, and no caller has to change.
+  # Preserve the structural reader's raw-body fallback (#1178). A failed tier
+  # classification has no readable fallback: it returns 2 through either scan,
+  # and every consumer distinguishes it from marker absence (#878).
   if ! unfenced=$(crw_unfenced_body "$body"); then
     # Reader failed: scan the COMPLETE raw body with NO structural stripping
     # (Codex P1 round 8). Round 7's fallback set `unfenced="$body"` and carried
@@ -1835,16 +1834,10 @@ crw_rate_limit_masks_blocking_marker() {
   local rc=0
   [ "${1:-}" = "rate_limit" ] || return 1
   [ -n "${2:-}" ] || return 1
-  # Only the SECOND conjunct propagates rc 3, and the asymmetry is deliberate.
-  # `summary_blocking_marker_present` fails closed INTERNALLY — on a reader
-  # failure it scans the raw body with no structural stripping — so it is a
-  # boolean here and has no rc 3 to propagate. Do not restore the tri-state
-  # version: an earlier round made it rc-3-aware, audited only its two new
-  # callers, and silently converted a reader failure into a CLEAN result at six
-  # boolean ones. The head question below is different, and there the rung is
-  # load-bearing: an unreadable body must never read as "belongs to another
-  # head", because the demotion's `!` would invert that into a suppress.
-  summary_blocking_marker_present "$2" || return 1
+  # Normalize the marker classifier's internal error to this predicate's
+  # existing infra result. Neither conjunct may turn an unread value absent.
+  summary_blocking_marker_present "$2" || rc=$?
+  case "$rc" in 0) ;; 1) return 1 ;; *) return 3 ;; esac
   summary_names_only_other_head "$2" "${3:-}" || rc=$?
   case "$rc" in
     0) return 1 ;;   # names ANOTHER head — prior-head finding, do not escalate
@@ -1891,7 +1884,8 @@ crw_head_summary_holds_blocking_marker() {
     1) return 1 ;;   # a different head's summary; not this head's problem
     *) return 3 ;;   # unreadable — never "not this head"
   esac
-  summary_blocking_marker_present "$sbody"
+  summary_blocking_marker_present "$sbody" || rc=$?
+  case "$rc" in 0|1) return "$rc" ;; *) return 3 ;; esac
 }
 # crw_rate_limit_hides_a_finding <head> <notice_body> <review_body> <issue_comments>
 # ONE question, asked once, over EVERY surface a blocking finding can occupy
@@ -1940,7 +1934,7 @@ crw_rate_limit_hides_a_finding() {
   #    required — the caller only reaches here with a head-matched object.
   if [ -n "$review_body" ]; then
     rc=0; summary_blocking_marker_present "$review_body" || rc=$?
-    [ "$rc" = 0 ] && return 0
+    case "$rc" in 0) return 0 ;; 1) ;; *) return 3 ;; esac
   fi
 
   # 3. the marker-selected PR-level summary, head-anchored
@@ -1955,7 +1949,7 @@ crw_rate_limit_hides_a_finding() {
       sbody=$(printf '%s' "$sel" | base64 --decode | jq -r '.body') || return 3
       [ -n "$sbody" ] || return 3
       rc=0; crw_head_summary_holds_blocking_marker "$head" "$sbody" || rc=$?
-      [ "$rc" = 3 ] && return 3
+      [ "$rc" -gt 1 ] && return 3
       if [ "$rc" = 0 ]; then
         CRW_HIDDEN_FINDING_JSON=$(printf '%s' "$sel" | base64 --decode | jq -r '.json')
         return 0
@@ -2264,16 +2258,15 @@ crw_json_array_length() {
 # coderabbit_summary_helpers block and the script's stderr `log`, so the
 # extracting test sources that block alongside this one.
 crw_count_blocking_bodies() {
-  local bodies=${1:-} total count=0 body i=0
+  local bodies=${1:-} total count=0 body i=0 rc
   total=$(crw_json_array_length "$bodies") || {
     log "FATAL: blocking-finding count received input that is not a JSON array — refusing to report a count (an upstream fetch almost certainly failed)"
     return 3
   }
   while [ "$i" -lt "$total" ]; do
     body=$(printf '%s' "$bodies" | jq -r ".[$i]")
-    if crw_body_is_blocking_finding "$body"; then
-      count=$((count + 1))
-    fi
+    rc=0; crw_body_is_blocking_finding "$body" || rc=$?
+    case "$rc" in 0) count=$((count + 1)) ;; 1) ;; *) return 3 ;; esac
     i=$((i + 1))
   done
   echo "$count"
@@ -2331,7 +2324,7 @@ count_blocking_tier_issues() {
   i=0
   while [ "$i" -lt "$cand_count" ]; do
     body=$(printf '%s' "$candidates" | jq -r ".[$i]")
-    tier=$(coderabbit_tier_of "$body")
+    tier=$(coderabbit_tier_of "$body") || return 3
     if crw_tier_is_required "$tier"; then
       blocking=$((blocking + 1))
     fi
@@ -2435,7 +2428,7 @@ count_blocking_tier_issues() {
 # gave when nothing survived the anchor. Only a failed READ is rc 3.
 summary_body_has_potential_issue_marker() {
   local anchor="${1:-$HEAD_ANCHOR}"
-  local issue_comments candidates candidate_count newest_body body i
+  local issue_comments candidates candidate_count newest_body body i rc=0
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
   # Newest-first bodies of the head-anchored bot comments. Ordering is the
   # whole point: the scan below takes the FIRST review-class body, which is the
@@ -2464,12 +2457,13 @@ summary_body_has_potential_issue_marker() {
       # them that way — a raw grep here made the SAME body a `findings` verdict
       # in polling and a `reported` one in probe, so agent-review and the Phase
       # 4b barrier disagreed about one head (adversarial verification on #851).
-      summary_blocking_marker_present "$body"
-      return $?
+      newest_body="$body"
+      break
     fi
     i=$((i + 1))
   done
-  summary_blocking_marker_present "$newest_body"
+  summary_blocking_marker_present "$newest_body" || rc=$?
+  case "$rc" in 0|1) return "$rc" ;; *) return 3 ;; esac
 }
 
 # SHA-scoped variant of count_potential_issues, used by the StatusContext
@@ -3112,7 +3106,8 @@ emit_terminal_review_after_probe_if_present() {
         log "post-probe terminal-review check: the HEAD-pinned review id could not be read — leaving the advisory timeout in place rather than counting against an unread selection"
         return 0
       }
-      potential_issues=$(count_potential_issues "$graded_review_id")
+      potential_issues=$(count_potential_issues "$graded_review_id") \
+        || die 3 "could not classify CodeRabbit inline findings after the status-probe wait"
       review_json=$(echo "$latest" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
       # #535: also honor a PR-level summary-body marker (the inline count
       # scans only pulls/{pr}/comments) so the probe-wait clearance path
@@ -3153,6 +3148,7 @@ emit_terminal_review_after_probe_if_present() {
           # demotion deciding.
           head_run_rc=0
           head_run_id=$(crw_head_pinned_clean_review_run "$HEAD_SHA" "$graded_review_id") || head_run_rc=$?
+          [ "$head_run_rc" != 2 ] || die 3 "could not classify the head-pinned CodeRabbit review"
           if [ "$head_run_rc" = "0" ]; then
             log "post-probe terminal-review check: CodeRabbit review run id=$head_run_id is pinned to $HEAD_SHA by commit_id, is the run the finding counter graded, and carries a clean report body — the exact-SHA rung wins outright, so the mutable summary's commits range does not demote this head (#1003/#1022)"
           else
@@ -3573,7 +3569,8 @@ emit_status_context_verdict() {
   # authoritative SHA-level evidence from the StatusContext check.
   local status_created_at=${2:-}
   local potential_issues synthetic
-  potential_issues=$(count_potential_issues_for_sha "$HEAD_SHA")
+  potential_issues=$(count_potential_issues_for_sha "$HEAD_SHA") \
+    || die 3 "could not classify CodeRabbit inline findings for the status-context verdict"
   # Keep the synthetic review object compatible with the documented
   # contract at the top of this file: `{ id, created_at, endpoint,
   # body_excerpt }`. The fast-path has no underlying GitHub review,
@@ -3889,7 +3886,7 @@ crw_summary_names_only_other_head() {
 # finding count, the summary-marker gate and the class ladder before it reaches
 # the `cleared` emit at all.
 #
-# Return codes, and both call sites honour all three:
+# Return codes, and both call sites honour each:
 #   0  a head-pinned, body-bearing, review-class, marker-free CodeRabbit run
 #      exists on this head AND it is the object <graded-review-id> names. The
 #      exact-SHA rung is satisfied; skip the demotion.
@@ -3897,6 +3894,8 @@ crw_summary_names_only_other_head() {
 #      object at all (an empty <graded-review-id>), and the case where a newer
 #      run has superseded the graded one. The demotion decides, exactly as
 #      before.
+#   2  tier evidence in the selected run could not be classified. Both callers
+#      stop with infrastructure failure; this is not alternate clean evidence.
 #   3  the reviews list could not be READ, or the selected run could not be
 #      derived. Never folded into 0 — an unreadable surface must not withdraw a
 #      refusal, which is the same failed-read-as-clean confusion #936/#959
@@ -3910,7 +3909,7 @@ crw_head_pinned_clean_review_run() {
   # the "counter's own id, not a re-derivation" conjunct in the block comment.
   # Unset (as opposed to empty) is a programming error, not a runtime state.
   local graded_id=${2?}
-  local reviews run run_id rbody
+  local reviews run run_id rbody marker_rc=0
   # The caller counted no findings because it graded NO review object. There is
   # no counted-findings evidence to outrank the summary with, which is the same
   # definite answer as "no body-bearing run at all".
@@ -3934,7 +3933,8 @@ crw_head_pinned_clean_review_run() {
   # the id did not round-trip — an unread body, not a silent one.
   [ -n "$rbody" ] || return 3
   [ "$(classify_comment "$rbody")" = "review" ] || return 1
-  summary_blocking_marker_present "$rbody" && return 1
+  summary_blocking_marker_present "$rbody" || marker_rc=$?
+  case "$marker_rc" in 0) return 1 ;; 1) ;; *) return 2 ;; esac
   # The stanza implication. The literal is the one summary_stanzas_all_benign
   # counts as its TOTAL, so the two cannot disagree about what a stanza is.
   if grep -qiE 'auto-generated comment: ' <<<"$rbody" \
@@ -4322,7 +4322,10 @@ probe_emit_verdict() {
     # Warning` rows (docstring coverage, description score) cannot read as a
     # blocking finding — 3 of 5 sampled summaries carry one and none is a
     # finding. One definition for both probe verdict sites.
-    if summary_blocking_marker_present "$summary_body"; then
+    local marker_rc=0
+    summary_blocking_marker_present "$summary_body" || marker_rc=$?
+    [ "$marker_rc" -le 1 ] || die 3 "could not classify the CodeRabbit review summary"
+    if [ "$marker_rc" = 0 ]; then
       PROBE_OBSERVED="terminal"
       log "probe: CodeRabbit reported on $HEAD_SHA with a summary-only blocking marker"
       emit_json_and_exit "findings" 2 "$review" 1
@@ -4450,7 +4453,10 @@ probe_emit_verdict() {
       # object as with one. Previously this state returned rc 7, held the
       # barrier's full budget and escalated with the WRONG reason; now it
       # escalates immediately with the right one.
-      if summary_blocking_marker_present "$sbody"; then
+      local marker_rc=0
+      summary_blocking_marker_present "$sbody" || marker_rc=$?
+      [ "$marker_rc" -le 1 ] || die 3 "could not classify the head-pinned CodeRabbit summary"
+      if [ "$marker_rc" = 0 ]; then
         log "probe: head-pinned summary on $HEAD_SHA carries a summary-only blocking marker"
         emit_json_and_exit "findings" 2 "$sjson" 1
       fi
@@ -4867,7 +4873,8 @@ while :; do
       # independent derivations would let a run that landed between them be
       # credited by the rung with its inline findings never counted.
       GRADED_REVIEW_ID=$(latest_head_pinned_review_id)
-      POTENTIAL_ISSUES=$(count_potential_issues "$GRADED_REVIEW_ID")
+      POTENTIAL_ISSUES=$(count_potential_issues "$GRADED_REVIEW_ID") \
+        || die 3 "could not classify CodeRabbit inline findings"
       REVIEW_JSON=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
       # #535: the inline count scans only pulls/{pr}/comments. Also honor a
       # PR-level summary-body marker so a finding surfaced solely in the
@@ -4910,6 +4917,7 @@ while :; do
           # unreadable surface can never withdraw a refusal.
           HEAD_RUN_RC=0
           HEAD_RUN_ID=$(crw_head_pinned_clean_review_run "$HEAD_SHA" "$GRADED_REVIEW_ID") || HEAD_RUN_RC=$?
+          [ "$HEAD_RUN_RC" != 2 ] || die 3 "could not classify the head-pinned CodeRabbit review"
           if [ "$HEAD_RUN_RC" = "0" ]; then
             log "CodeRabbit review run id=$HEAD_RUN_ID is pinned to $HEAD_SHA by commit_id, is the run the finding counter graded, and carries a clean report body — the exact-SHA rung wins outright, so the mutable summary's commits range does not demote this head (#1003/#1022)"
           else

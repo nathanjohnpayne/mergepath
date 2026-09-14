@@ -286,6 +286,7 @@ if [ -n "\${CR_GATE_TEST_GREP_ERROR_ON:-}" ]; then
   case "\$*" in
     *"\$CR_GATE_TEST_GREP_ERROR_ON"*)
       echo "grep: invalid byte sequence (fixture failure on '\$CR_GATE_TEST_GREP_ERROR_ON')" >&2
+      if [ -n "\${CR_GATE_TEST_GREP_PARTIAL:-}" ]; then printf '%s\n' "\$CR_GATE_TEST_GREP_PARTIAL"; fi
       exit 2
       ;;
   esac
@@ -4148,6 +4149,46 @@ else
   fail "#942: a grep error on the stanza-opener count cleared the gate or was misdiagnosed as a non-benign stanza; got rc=$RC_53D"
   echo "$OUT_53D" | sed 's/^/      /' >&2
 fi
+
+
+# #878: fail only the real classifier's marker extractor. A successful empty
+# scan remains covered above; an extraction error (even after partial stdout)
+# must be infrastructure exit 2, never clear or summary-pending exit 3.
+for SURFACE_878 in inline summary; do
+  for PARTIAL_878 in '' '🟠 Major'; do
+    SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+    FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+    FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [2001]}]')
+    if [ "$SURFACE_878" = inline ]; then
+      FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$MAJOR_BODY")
+      FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture '[]')
+    else
+      FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+      FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+        "$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING")")
+    fi
+    set +e
+    OUT_878=$(
+      FIXTURE_PR="$FIXTURE_PR" \
+      FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_THREADS="$FIXTURE_THREADS" \
+      FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+      FIXTURE_REVIEWS='' \
+      CR_GATE_TEST_GREP_ERROR_ON='-oE 🟠 Major|Potential issue|⚠️|🧹 Nitpick|🔵 Trivial|Outside diff range|🟡 Minor' \
+      CR_GATE_TEST_GREP_PARTIAL="$PARTIAL_878" \
+        run_gate "$SCRATCH" 99 owner/repo 2>&1
+    )
+    RC_878=$?
+    set -e
+    if [ "$RC_878" = 2 ] \
+        && ! printf '%s' "$OUT_878" | grep -q 'CodeRabbit blocking-tier unresolved: 0'; then
+      pass "#878: $SURFACE_878 extraction failure (partial='$PARTIAL_878') exits 2, not clear or pending"
+    else
+      fail "#878: $SURFACE_878 extraction failure (partial='$PARTIAL_878') expected rc=2, got $RC_878"
+      printf '%s\n' "$OUT_878" >&2
+    fi
+  done
+done
 
 # ---------------------------------------------------------------------------
 echo

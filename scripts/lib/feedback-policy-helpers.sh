@@ -25,6 +25,7 @@
 #   codex_tiers_of "<comment-body>"        # every p0..p3 marker, in order
 #   coderabbit_tier_of "<comment-body>"    # p0..p3|nitpick or empty
 #   coderabbit_tiers_of "<comment-body>"   # every graded marker, in order
+#     Both CodeRabbit tier readers return 2, with no output, on extraction error.
 #   coderabbit_finding_scan "<body>"       # strip fenced/pre-merge regions
 #   ghas_severity_tier "<security_severity_level>"  # p0..p3 or empty (#1101)
 #   ghas_alert_number_from_body "<comment-body>"     # alert number or empty (#1113)
@@ -335,9 +336,13 @@ coderabbit_finding_scan() {
 }
 
 coderabbit_tiers_of() {
-  local body=${1:-} markers marker
-  markers=$(printf '%s' "$body" \
-    | grep -oE '🟠 Major|Potential issue|⚠️|🧹 Nitpick|🔵 Trivial|Outside diff range|🟡 Minor' || true)
+  local body=${1:-} markers marker rc=0
+  markers=$(grep -oE '🟠 Major|Potential issue|⚠️|🧹 Nitpick|🔵 Trivial|Outside diff range|🟡 Minor' <<<"$body") || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *) echo "ERROR: could not classify CodeRabbit tier evidence" >&2; return 2 ;;
+  esac
   while IFS= read -r marker; do
     case "$marker" in
       "🟠 Major"|"Potential issue"|"⚠️") echo p1 ;;
@@ -357,12 +362,11 @@ coderabbit_tier_of() {
   # printf exits 141 (SIGPIPE), which aborts every caller. The badge markers
   # matched below are near the start, so a 600-char cut is more than enough.
   head="${1:-}"; head="${head:0:600}"
-  tiers=$(coderabbit_tiers_of "$head")
+  tiers=$(coderabbit_tiers_of "$head") || return 2
   for wanted in p1 nitpick p3 p2; do
-    if printf '%s\n' "$tiers" | grep -Fxq "$wanted"; then
-      echo "$wanted"
-      return 0
-    fi
+    case $'\n'"$tiers"$'\n' in
+      *$'\n'"$wanted"$'\n'*) echo "$wanted"; return 0 ;;
+    esac
   done
   return 0
 }

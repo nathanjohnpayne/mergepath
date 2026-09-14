@@ -429,6 +429,51 @@ test_never_posts_any_write() {
   fi
 }
 
+
+test_tier_extraction_error_refuses_supplied_fallback() {
+  local dir rc partial real_grep
+  real_grep=$(command -v grep)
+  for partial in '' '🟠 Major'; do
+    dir=$(make_case "tier-error-${partial:-empty}")
+    jq -n --arg body "$MAJOR_BODY" '{findings:[{
+      path:"src/foo.ts",line:42,comment_id:8781,body:$body,tier:"p2"
+    }]}' >"$dir/findings.json"
+    # Only the fixed marker extractor fails; config/JSON/API reads stay real.
+    cat >"$dir/bin/grep" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = -oE ] && [ "\${2:-}" = '🟠 Major|Potential issue|⚠️|🧹 Nitpick|🔵 Trivial|Outside diff range|🟡 Minor' ]; then
+  printf '%s' '$partial'
+  exit 2
+fi
+exec "$real_grep" "\$@"
+EOF
+    chmod +x "$dir/bin/grep"
+    rc=$(run_case "$dir" -- 999 --repo owner/repo --findings-json findings.json --verdict 8781=fixed)
+    if [ "$rc" = 3 ] && [ "$(ledger_lines "$dir")" = 0 ] && [ ! -s "$dir/out.json" ]; then
+      pass "#878: extraction failure (partial='$partial') exits 3 without ledger write or supplied-tier fallback"
+    else
+      fail "#878: extraction failure (partial='$partial') rc=$rc, ledger=$(ledger_lines "$dir"), expected infra3 and no output/write"
+    fi
+  done
+}
+
+test_marker_absence_preserves_supplied_tier() {
+  local dir rc
+  dir=$(make_case "tier-absent")
+  jq -n --arg body "$PLAIN_BODY" '{findings:[{
+    path:"src/foo.ts",line:42,comment_id:8782,body:$body,tier:"p2"
+  }]}' >"$dir/findings.json"
+  rc=$(run_case "$dir" -- 999 --repo owner/repo --findings-json findings.json --verdict 8782=fixed)
+  if [ "$rc" = 0 ] && [ "$(ledger_lines "$dir")" = 1 ] \
+      && [ "$(jq -r .tier "$(ledger_file "$dir")")" = p2 ]; then
+    pass "#878: genuine marker absence still records the supplied tier"
+  else
+    fail "#878: genuine marker absence lost its supplied-tier fallback (rc=$rc)"
+  fi
+}
+
+test_tier_extraction_error_refuses_supplied_fallback
+test_marker_absence_preserves_supplied_tier
 test_fixed_verdict_writes_ledger_row
 test_rebutted_verdict_records_reason
 test_no_verdict_finding_skipped
