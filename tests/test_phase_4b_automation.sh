@@ -1988,6 +1988,21 @@ if [ "$rc" = 1 ] \
   pass "Direction B (codex→claude) dry-run CHANGES_REQUESTED → exit 1"
 else fail "Direction B (rc=$rc): $out"; fi
 
+# #1186: a dry run makes the complete validated verdict available to the
+# caller before any publication path. The fixture includes a finding and full
+# normalized usage so a count/scalar-only summary cannot pass this assertion.
+expected_verdict="$(CLAUDE_BIN="$BIN/fake-claude-approve-p2-usage" \
+  bash "$AD_CLAUDE" --pr 127 --repo o/r --head abc123 --diff-file "$DIFF")"
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-approve-p2-usage" \
+  P4B_FAKE_PR_BODY_AGENT=codex bash "$ORCH" 127 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && printf '%s' "$out" | jq -e --argjson expected "$expected_verdict" \
+     '.dry_run == true and .validated_verdict == $expected' >/dev/null; then
+  pass "#1186: dry-run final JSON preserves the complete validated verdict"
+else fail "#1186: dry-run validated verdict (rc=$rc): $out"; fi
+
 # Fail-closed: adapter returns junk → orchestrator falls back, exit 4, never APPROVED
 HANDOFF_LOG="$WORK/handoff-junk.log"
 set +e
@@ -2880,10 +2895,11 @@ set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.token_count')" = "150" ] \
    && [ "$(printf '%s' "$out" | jq -r '.usage_source')" = "claude-json-envelope" ] \
+   && [ "$(printf '%s' "$out" | jq -r 'has("validated_verdict")')" = "false" ] \
    && jq -e '.commit_id == "abc123" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null \
    && grep -q -- "Reviewer identity: \`nathanpayne-claude\`" "$WRAPPER_BODY" \
    && grep -q -- "Token usage: \`150\` tokens (source: \`claude-json-envelope\`)" "$WRAPPER_BODY"; then
-  pass "posted approval body includes token usage when adapter exposes it"
+  pass "posted approval retains token usage and omits dry-run-only verdict data"
 else fail "success review token usage (rc=$rc, out=$out, log=$(test -e "$WRAPPER_LOG" && cat "$WRAPPER_LOG" || true), body=$(test -e "$WRAPPER_BODY" && cat "$WRAPPER_BODY" || true))"; fi
 
 set +e

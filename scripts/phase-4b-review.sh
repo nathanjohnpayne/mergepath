@@ -1512,6 +1512,7 @@ jq -n \
   --arg reviewer "$REVIEWER" \
   --arg adapter "$ADAPTER" \
   --arg verdict "$VERDICT" \
+  --argjson validated_verdict "$VERDICT_JSON" \
   --argjson review_posted "$REVIEW_POSTED" \
   --arg review_acknowledgment "$REVIEW_ACKNOWLEDGMENT" \
   --argjson dry_run "$DRY_RUN" \
@@ -1540,6 +1541,7 @@ jq -n \
     fell_back_to_manual: false,
     automation_enabled: true,
     enabled_via: $enabled_via
-  }'
+  }
+  | if $dry_run then . + {validated_verdict: $validated_verdict} else . end'
 
 exit "$EXIT_CODE"
