@@ -1119,12 +1119,13 @@ STATUS=clear
 RESULT=$(printf '%s\n%s\n' "$FINDINGS" "$MISSING" | jq -c -s \
   --arg status "$STATUS" --arg repo "$REPO" --argjson pr "$PR_NUMBER" \
   --argjson posted "$POSTED" --argjson accounted "$ACCOUNTED" \
-  --argjson missing_count "$MISSING_COUNT" '
+  --argjson missing_count "$MISSING_COUNT" --argjson policy "$POLICY_JSON" '
     .[0] as $findings | .[1] as $missing |
     {
       status: $status,
       repo: $repo,
       pr_number: $pr,
+      feedback_policy: ($policy.feedback_policy // {}),
       posted: $posted,
       accounted: $accounted,
       missing_count: $missing_count,

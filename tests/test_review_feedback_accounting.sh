@@ -347,6 +347,7 @@ JSON
 run_gate
 assert_eq 1 "$RUN_RC" "schema-valid flow-style policy preserves registered reviewer findings"
 assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "flow-style reviewer identity is inventoried"
+assert_eq required "$(printf '%s' "$RUN_JSON" | jq -r '.feedback_policy.priorities.p1')" "accounting exposes its parsed flow-style policy for acknowledgment decisions"
 mv "$TMP/review-policy.block-style.yml" "$TMP/review-policy.yml"
 
 reset_fixtures
@@ -394,9 +395,13 @@ cp "$TMP/review-policy.yml" "$TRUSTED_CHECKOUT/.github/review-policy.yml"
 git -C "$TRUSTED_CHECKOUT" init -q -b main
 git -C "$TRUSTED_CHECKOUT" remote add origin https://github.com/acme/widget.git
 git -C "$TRUSTED_CHECKOUT" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+cat >>"$TMP/fixtures/base-review-policy.yml" <<'YAML'
+feedback_policy: {mode: by-priority, priorities: {p2: required}}
+YAML
 run_gate ambient base "$TRUSTED_CHECKOUT/scripts/review-feedback-accounting.sh"
 assert_eq 1 "$RUN_RC" "default-branch checkout materializes the exact PR-base policy"
 assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "stale or dirty default checkout cannot omit a base reviewer"
+assert_eq required "$(printf '%s' "$RUN_JSON" | jq -r '.feedback_policy.priorities.p2')" "accounting emits the exact base policy, not stale local policy"
 
 reset_fixtures
 cat >"$TMP/fixtures/inline.json" <<'JSON'
