@@ -271,6 +271,7 @@ if [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ]; then
 fi
 
 # --- resolve the audit base (chaining watermark) ------------------------------
+BASE_WATERMARK_TAG=""
 if [ -z "$BASE" ]; then
   # The pushed tag is what lets EVERY checkout resolve the same base, so
   # refresh the namespace from origin before selecting (#663 round-4 P2):
@@ -290,7 +291,7 @@ if [ -z "$BASE" ]; then
     git -C "$REPO_DIR" rev-parse --verify --quiet "${sha}^{commit}" >/dev/null || continue
     git -C "$REPO_DIR" merge-base --is-ancestor "$sha" "$HEAD_FULL" 2>/dev/null || continue
     n="$(git -C "$REPO_DIR" rev-list --count "$sha")"
-    if [ "$n" -gt "$best_n" ]; then best="$sha"; best_n="$n"; fi
+    if [ "$n" -gt "$best_n" ]; then best="$sha"; best_n="$n"; BASE_WATERMARK_TAG="$t"; fi
   done
   BASE="$best"
 fi
@@ -299,6 +300,26 @@ BASE_FULL="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${BASE}^{commit}")" 
   || die 3 "audit base $BASE not found in $REPO_DIR"
 git -C "$REPO_DIR" merge-base --is-ancestor "$BASE_FULL" "$HEAD_FULL" 2>/dev/null \
   || die 3 "audit base $BASE is not an ancestor of wave head $HEAD_SHA"
+
+# Informational annotation time only: never substitute the commit date or
+# treat this unsigned metadata as a review receipt. Explicit --base selects
+# no tag. Missing/unreadable/invalid metadata leaves age unknown, without
+# changing selection or the audit outcome; future timestamps have no age.
+tagger_timestamp=""
+if [ -n "$BASE_WATERMARK_TAG" ]; then
+  tagger_timestamp="$(git -C "$REPO_DIR" for-each-ref --format='%(taggerdate:unix)' "refs/tags/$BASE_WATERMARK_TAG" 2>/dev/null)" \
+    || tagger_timestamp=""
+fi
+observed_timestamp="$(date +%s 2>/dev/null)" || observed_timestamp=""
+BASE_WATERMARK_JSON="$(jq -n --arg tag "$BASE_WATERMARK_TAG" \
+  --arg tagged "$tagger_timestamp" --arg now "$observed_timestamp" '
+    def epoch: if test("^[0-9]+$") then (try tonumber catch null) else null end;
+    ($tagged | epoch) as $timestamp | ($now | epoch) as $observed |
+    {tag: (if $tag == "" then null else $tag end), tagger_timestamp: $timestamp,
+     age_seconds: (if $timestamp != null and $observed != null and $timestamp <= $observed
+                   then $observed - $timestamp else null end)}')"
+log "$(printf '%s' "$BASE_WATERMARK_JSON" | jq -r '
+  "base watermark: tag=\(.tag // "unknown") tagger_timestamp=\(.tagger_timestamp // "unknown") age_seconds=\(.age_seconds // "unknown") (tag metadata only; not verified review freshness)"')"
 
 # --- build the curated diff ---------------------------------------------------
 # Manifest source paths (two-space `- path:` entries), minus excluded
@@ -391,10 +412,11 @@ emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
     --arg base "$BASE_FULL" --arg head "$HEAD_FULL" --arg repo "$REPO" \
     --argjson pr "$PR" --argjson files "$FILES" --argjson bytes "$BYTES" \
     --argjson limit "$DIFF_MAX" \
+    --argjson watermark "$BASE_WATERMARK_JSON" \
     --arg effort "$EFFORT" --argjson timeout "$TIMEOUT" \
     --argjson orch "$1" --argjson tagged "$2" --argjson skipped "$3" \
     --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" \
-    '{base:$base, head:$head, repo:$repo, pr:$pr, scope_files:$files,
+    '{base:$base, base_watermark:$watermark, head:$head, repo:$repo, pr:$pr, scope_files:$files,
       scope_bytes:$bytes, diff_max_bytes:$limit, effort:$effort, timeout_seconds:$timeout,
       orchestrator_exit:$orch, watermark_advanced:$tagged, skipped:$skipped,
       dry_run:$dry}'
