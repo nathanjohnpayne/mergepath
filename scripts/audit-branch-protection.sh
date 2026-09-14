@@ -138,9 +138,11 @@
 #   merges. The owner declined that recommendation on 2026-08-28: an admin
 #   bypass is retained fleet-wide as the escape hatch for a CI or provider
 #   outage, after a rate-limited gate stranded a fully reviewed PR (#1121).
-#   `--fleet` therefore passes this flag for NO repo, and an unconstrained
-#   admin is not drift anywhere. The flag remains available for ad-hoc
-#   audits that want to ask the question; nothing scheduled passes it.
+#   The hub remains excepted. Consumer enforcement is staged under #937:
+#   after a consumer's readiness canary, the fleet loop names that consumer
+#   explicitly and requires the same existing flag there. The first staged
+#   consumer is nathanjohnpayne/fiveacross; unactivated consumers retain the
+#   recovery path until their own canary and activation.
 
 set -eo pipefail
 
@@ -220,9 +222,8 @@ while [ $# -gt 0 ]; do
       fi
       DEFAULT_BRANCH_HINT="$2"; shift 2 ;;
     --require-admin-enforcement)
-      # Off by default everywhere. ADR 0002 originally asked for this on
-      # the hub (#427/#428 were both admin merges); the owner declined that
-      # recommendation on 2026-08-28, so no scheduled path passes it. Kept
+      # Off by default in single-repo mode. The fleet loop below opts the
+      # staged #937 consumers in explicitly; the hub remains excepted. Kept
       # for ad-hoc audits that want to ask the bypass question directly.
       REQUIRE_ADMIN_ENFORCEMENT=1; shift ;;
     --fleet)
@@ -274,9 +275,9 @@ requiring it also allows a bypass — classic protection without
 array (or, where GitHub withholds that array from a read-only caller,
 \`current_user_can_bypass\` other than \`never\` reported to a confirmed
 repository admin). A ruleset payload that answers neither bypass
-question exits 2. NOT passed by --fleet for any repo: the owner
-declined ADR 0002's hub requirement on 2026-08-28 in favour of keeping
-an admin escape hatch fleet-wide. Available for ad-hoc audits.
+question exits 2. In --fleet mode it is passed only for the staged #937
+consumer nathanjohnpayne/fiveacross. The hub and unactivated consumers
+retain the admin recovery path. Available for ad-hoc audits.
 
 --default-branch supplies this repo's default branch instead of reading
 it from GET /repos/{owner}/{repo}; only \`~DEFAULT_BRANCH\` ruleset
@@ -287,9 +288,10 @@ Exit 2 on gh API auth/scope failures (use an author/admin PAT).
 
 --fleet audits the hub plus every \`.consumers[].repo\` in
 .mergepath-sync.yml and prints a per-repo verdict table. Each repo is
-audited on its OWN default branch unless --branch is passed explicitly,
-and every repo, hub included, is audited WITHOUT
---require-admin-enforcement. The manifest's
+audited on its OWN default branch unless --branch is passed explicitly.
+Only staged consumer nathanjohnpayne/fiveacross is audited with
+--require-admin-enforcement; the hub and unactivated consumers are not.
+The manifest's
 schema \`version:\` must be $SUPPORTED_MANIFEST_VERSION. Same exit-code shape: 0 all clean,
 1 usage/prerequisite (including an unwritable --summary-file), 2 at least
 one repo unreadable (infrastructure, NOT drift), 3 drift on at least one
@@ -568,13 +570,16 @@ fleet_audit() {
       child_args+=(--default-branch "$repo_branch")
     fi
 
-    # The owner declined ADR 0002's hub-only enforce_admins requirement on
-    # 2026-08-28 and set the posture the other way: an admin merge-without-
-    # waiting escape is retained on EVERY repo, hub included, so that a CI
-    # or provider outage cannot strand a fully reviewed PR. `--fleet` no
-    # longer passes --require-admin-enforcement for any repo, so the hub is
-    # audited exactly like a consumer. The flag itself is kept for ad-hoc
-    # use; nothing in the scheduled path passes it. See ADR 0002 Exceptions.
+    # ADR 0002's hub exception remains: the hub keeps its recovery path.
+    # #937 adds consumers only after their own readiness canary. Five Across
+    # is the first completed pre-enforcement canary, so this literal entry
+    # makes a still-open admin bypass fleet drift there while leaving all
+    # other consumers unactivated. Do not turn this into a manifest policy
+    # layer: each later consumer is an independent owner-approved rollout
+    # decision.
+    if [ "$r" = "nathanjohnpayne/fiveacross" ] && [ "$r" != "$hub" ]; then
+      child_args+=(--require-admin-enforcement)
+    fi
     "$audit_cmd" --repo "$r" --branch "$repo_branch" "${child_args[@]}" >"$tmp" 2>&1 || rc=$?
     out="$(cat "$tmp")"
     case "$rc" in
@@ -652,9 +657,9 @@ if [ "$FLEET" -eq 1 ] && [ -n "$DEFAULT_BRANCH_HINT" ]; then
   exit 1
 fi
 if [ "$FLEET" -eq 1 ] && [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
-  echo "Error: --require-admin-enforcement is not passed by --fleet for any repo" >&2
-  echo "       (the owner declined ADR 0002's hub requirement on 2026-08-28) and would be" >&2
-  echo "       silently ignored here. Drop it, or audit one repo with --repo." >&2
+  echo "Error: --require-admin-enforcement is selected by --fleet for staged consumers;" >&2
+  echo "       do not pass it globally. The hub's ADR 0002 exception stays intact." >&2
+  echo "       Drop it, or audit one repo with --repo." >&2
   exit 1
 fi
 if [ "$FLEET" -eq 0 ]; then
@@ -1419,9 +1424,9 @@ fi
 # "merge without waiting for requirements" unless `enforce_admins` is on,
 # and a ruleset lets everyone in `bypass_actors` do the same. ADR 0002
 # argued for the closed posture on the hub because #427/#428 were both
-# admin merges; the owner declined that on 2026-08-28 and kept the escape
-# fleet-wide, so this block runs only when a caller asks for it
-# explicitly. Nothing scheduled does. See ADR 0002 Exceptions.
+# admin merges. The hub remains excepted, while #937 stages enforcement one
+# canaried consumer at a time. This block therefore runs for explicit
+# single-repo audits and for the fleet's named staged consumers.
 if [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
   # One analysis over BOTH protection surfaces, because they are enforced
   # together. A bypass weakens only the source that grants it, so a
@@ -1474,11 +1479,11 @@ if [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
     done
     echo ""
     echo "The two escapes that motivated the merge-clearance gate (#427/#428) were"
-    echo "both admin merges, which is the case ADR 0002 made for the closed posture."
-    echo "That recommendation was DECLINED by the owner on 2026-08-28: the escape is"
-    echo "retained fleet-wide so that a CI or provider outage cannot strand a fully"
-    echo "reviewed PR. You passed --require-admin-enforcement explicitly, so this is"
-    echo "the answer to that question, not fleet drift."
+    echo "both admin merges. ADR 0002 keeps the hub exception, while #937 stages"
+    echo "consumer enforcement after each repository completes its readiness canary."
+    echo "For a consumer named in that staged fleet set, this bypass is fleet drift"
+    echo "until the applicable protection source prevents it. An explicit single-repo"
+    echo "audit reports the same configuration gap directly."
     echo ""
     echo "Fix (classic protection): Settings → Branches → Branch protection rule for"
     echo "'$BRANCH' → tick 'Do not allow bypassing the above settings' (enforce_admins)."
