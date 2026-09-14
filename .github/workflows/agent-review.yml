@@ -52,7 +52,7 @@ concurrency:
           (github.event.action == 'labeled' &&
            github.event.label.name == 'needs-external-review') ||
           (github.event.action == 'unlabeled' &&
-           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))) &&
+           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))))) &&
         'approval-enforcement') || github.run_id }}
   cancel-in-progress: >-
     ${{ github.event_name == 'pull_request' &&
