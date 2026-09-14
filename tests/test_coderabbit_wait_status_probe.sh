@@ -3147,6 +3147,207 @@ test_1178_review_no_id_fails_closed() {
   fi
 }
 
+# Fail only the real tier-extraction grep, with plausible partial stdout. All
+# other grep users (provider selection, freshness, policy) remain operational.
+install_878_extraction_failure() {
+  local dir=$1
+  cat >"$dir/bin/grep" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = -oE ]; then
+  body=$(cat)
+  case "$body" in
+    *TIER_READ_FAILURE*)
+      if [ -f "${CODERABBIT_TEST_STATE_DIR:?}/fail-after-first" ] && [ ! -f "$CODERABBIT_TEST_STATE_DIR/first-tier-read" ]; then
+        : >"$CODERABBIT_TEST_STATE_DIR/first-tier-read"
+        exec /usr/bin/grep "$@" <<<"$body"
+      fi
+      printf 'hit\n' >>"${CODERABBIT_TEST_STATE_DIR:?}/tier-read-failures"
+      printf '🟡 Minor\n'
+      exit 2 ;;
+  esac
+  exec /usr/bin/grep "$@" <<<"$body"
+fi
+exec /usr/bin/grep "$@"
+EOF
+  chmod +x "$dir/bin/grep"
+}
+
+test_878_nested_tier_errors() (
+  local snip="$WORKDIR/878-helpers.sh" block rc out body comments bad=""
+  local head=0123456789abcdef0123456789abcdef01234567
+  eval "$(grep -E '^(CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END|SUMMARY_MARKER|RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER)=' "$ROOT/scripts/coderabbit-wait.sh")"
+  # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+  . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
+  for block in comment_classifier summary_helpers rate_limit_marker_guard summary_selector count_helpers review_run_selector head_run_evidence; do
+    awk -v block="coderabbit_$block" '$0 == "# BEGIN " block {f=1;next} $0 == "# END " block {f=0} f' \
+      "$ROOT/scripts/coderabbit-wait.sh" >>"$snip"
+  done
+  # shellcheck disable=SC1090
+  . "$snip"
+  log() { :; }
+  BOT_LOGIN='coderabbitai[bot]'
+  # Read by the extracted runtime through dynamic scope.
+  # shellcheck disable=SC2034
+  REPO=owner/repo
+  # shellcheck disable=SC2034
+  PR_NUMBER=999
+  body="TIER_READ_FAILURE _🟠 Major_ between aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and $head"
+  comments=$(jq -nc --arg b "$SUMMARY_MARKER
+$body" --arg bot "$BOT_LOGIN" '[{id:1,user:{login:$bot},body:$b,created_at:"2026-06-04T00:00:00Z"}]')
+  grep() {
+    if [ "${1:-}" = -oE ]; then
+      local input
+      input=$(cat)
+      case "$input" in *TIER_READ_FAILURE*) printf '🟡 Minor\n'; return 2 ;; esac
+      command grep "$@" <<<"$input"
+    else command grep "$@"; fi
+  }
+  for predicate in crw_body_is_blocking_finding crw_scan_has_blocking_marker summary_blocking_marker_present; do
+    rc=0; out=$("$predicate" "$body") || rc=$?
+    [ "$rc" = 2 ] && [ -z "$out" ] || bad="$bad $predicate=$rc/$out"
+    rc=0; "$predicate" 'ordinary prose' || rc=$?
+    [ "$rc" = 1 ] || bad="$bad $predicate-absence=$rc"
+  done
+  rc=0; crw_rate_limit_masks_blocking_marker rate_limit "$body" "$head" || rc=$?
+  [ "$rc" = 3 ] || bad="$bad rate-limit-mask=$rc"
+  rc=0; crw_head_summary_holds_blocking_marker "$head" "$body" || rc=$?
+  [ "$rc" = 3 ] || bad="$bad head-summary=$rc"
+  # Each surface must propagate independently, including the third surface
+  # after two genuinely clean bodies have already been read.
+  for surface in notice review summary; do
+    rc=0
+    case "$surface" in
+      notice) crw_rate_limit_hides_a_finding "$head" "$body" '' '[]' || rc=$? ;;
+      review) crw_rate_limit_hides_a_finding "$head" 'ordinary prose' "$body" '[]' || rc=$? ;;
+      summary) crw_rate_limit_hides_a_finding "$head" 'ordinary prose' 'ordinary prose' "$comments" || rc=$? ;;
+    esac
+    [ "$rc" = 3 ] || bad="$bad hidden-$surface=$rc"
+  done
+  rc=0; out=$(crw_count_blocking_bodies '["ordinary prose","TIER_READ_FAILURE _🟠 Major_"]') || rc=$?
+  [ "$rc" = 3 ] && [ -z "$out" ] || bad="$bad counter=$rc/$out"
+  rc=0; out=$(crw_count_blocking_bodies '[]') || rc=$?
+  [ "$rc" = 0 ] && [ "$out" = 0 ] || bad="$bad empty-counter=$rc/$out"
+  fetch_api_array() {
+    jq -nc --arg bot "$BOT_LOGIN" --arg h "$head" --arg b "$body" \
+      '[{id:1,user:{login:$bot},commit_id:$h,submitted_at:"2026-06-04T00:00:00Z",body:$b}]'
+  }
+  rc=0; out=$(crw_head_pinned_clean_review_run "$head" 1) || rc=$?
+  [ "$rc" = 2 ] && [ -z "$out" ] || bad="$bad clean-run-classifier=$rc/$out"
+  body='**Actionable comments posted: 0**'
+  rc=0; out=$(crw_head_pinned_clean_review_run "$head" 1) || rc=$?
+  [ "$rc" = 0 ] && [ "$out" = 1 ] || bad="$bad clean-run-control=$rc/$out"
+  fetch_api_array() { return 3; }
+  rc=0; crw_head_pinned_clean_review_run "$head" 1 >/dev/null || rc=$?
+  [ "$rc" = 3 ] || bad="$bad clean-run-api=$rc"
+  fetch_api_array() { printf '[]\n'; }
+  rc=0; crw_head_pinned_clean_review_run "$head" 1 >/dev/null || rc=$?
+  [ "$rc" = 1 ] || bad="$bad clean-run-absence=$rc"
+  # Structural-reader fallback remains a raw scan; only tier failure is new.
+  crw_unfenced_body() { return 3; }
+  rc=0; summary_blocking_marker_present '_🟠 Major_' || rc=$?
+  [ "$rc" = 0 ] || bad="$bad raw-fallback-marker=$rc"
+  rc=0; summary_blocking_marker_present 'TIER_READ_FAILURE _🟠 Major_' || rc=$?
+  [ "$rc" = 2 ] || bad="$bad raw-fallback-classifier=$rc"
+  [ -z "$bad" ] || { printf '%s\n' "$bad" >&2; exit 1; }
+)
+
+test_878_waiter_tier_errors() {
+  local route dir scenario rc expected bad=""
+  for route in poll-inline poll-summary context-inline context-summary post-inline post-summary probe-summary probe-object clean-poll clean-post-probe advisory-null api-poll api-post-probe; do
+    dir=$(make_case "878-$route" 0 true 12 0)
+    case "$route" in
+      poll-inline|context-inline|advisory-null) scenario=badge_only_inline_finding ;;
+      poll-summary|context-summary) scenario=summary_marker_only ;;
+      probe-summary) scenario=probe_clean_incremental ;;
+      probe-object) scenario=probe_review_object_premerge_warning ;;
+      clean-poll|api-poll) scenario=probe_review_on_head ;;
+      clean-post-probe|api-post-probe|post-inline|post-summary) scenario=review_arrives_during_probe ;;
+    esac
+    # Modify only fixture evidence, retaining the shipped polling/probe flow.
+    python3 - "$dir" "$route" <<'PY878'
+import pathlib, sys
+root, route = pathlib.Path(sys.argv[1]), sys.argv[2]
+gh = root / 'bin/gh'
+s = gh.read_text()
+if route in ('poll-inline', 'context-inline', 'post-inline', 'advisory-null'):
+    s = s.replace('_🟠 Major_', 'TIER_READ_FAILURE _🟠 Major_')
+elif route == 'post-summary':
+    s = s.replace('CodeRabbit review completed.', 'TIER_READ_FAILURE CodeRabbit review completed.')
+elif route in ('poll-summary', 'context-summary'):
+    s = s.replace('_⚠️ Potential issue_', 'TIER_READ_FAILURE _⚠️ Potential issue_')
+elif route in ('probe-summary', 'probe-object'):
+    s = s.replace('No actionable comments', 'TIER_READ_FAILURE No actionable comments')
+elif route.startswith('clean-'):
+    s = s.replace("run_body='**Actionable comments posted: 0**'", "run_body='**Actionable comments posted: 0** TIER_READ_FAILURE'")
+if route.endswith('post-probe') or route == 'post-summary':
+    # The existing delayed-review scenario normally has an inline finding;
+    # remove just that endpoint so the clean-run caller is actually reached.
+    s = s.replace('  repos/owner/repo/pulls/999/comments)\n', '  repos/owner/repo/pulls/999/comments)\n    printf "[]\\n"; exit 0\n')
+gh.write_text(s)
+if route.startswith('context-'):
+    waiter = root / 'scripts/coderabbit-wait.sh'
+    s = waiter.read_text().replace('emit_status_context_verdict() {', 'emit_status_context_verdict() {\n  : >"${CODERABBIT_TEST_STATE_DIR:?}/status-context-called"')
+    waiter.write_text(s)
+if route.startswith('api-'):
+    waiter = root / 'scripts/coderabbit-wait.sh'
+    s = waiter.read_text().replace('# END coderabbit_head_run_evidence', '# END coderabbit_head_run_evidence\ncrw_head_pinned_clean_review_run() { : >"${CODERABBIT_TEST_STATE_DIR:?}/api-fallback-called"; return 3; }')
+    waiter.write_text(s)
+PY878
+    install_878_extraction_failure "$dir"
+    if [ "$route" = advisory-null ]; then
+      printf '\nfeedback_policy:\n  mode: by-priority\n' >>"$dir/.github/review-policy.yml"
+      : >"$dir/state/fail-after-first"
+    fi
+    case "$route" in
+      context-*)
+        enable_trust_status_context "$dir"
+        rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:08Z run_case "$dir" "$scenario")
+        [ -f "$dir/state/status-context-called" ] || bad="$bad $route-wrong-caller"
+        ;;
+      probe-*) rc=$(run_probe_case "$dir" "$scenario") ;;
+      *) rc=$(run_case "$dir" "$scenario") ;;
+    esac
+    expected=3
+    case "$route" in advisory-null) expected=2 ;; api-*) expected=0 ;; esac
+    [ "$rc" = "$expected" ] || bad="$bad $route-rc=$rc"
+    case "$route" in
+      api-*)
+        [ -f "$dir/state/api-fallback-called" ] || bad="$bad $route-never-called"
+        [ "$(jq -r '.status' "$dir/out.json")" = cleared ] || bad="$bad $route-no-fallback"
+        ;;
+      advisory-null)
+        [ -s "$dir/state/tier-read-failures" ] || bad="$bad advisory-never-injected"
+        jq -e '.status == "findings" and .blocking_tier_unresolved == null' "$dir/out.json" >/dev/null \
+          || bad="$bad advisory-not-null"
+        ;;
+      *)
+        [ -s "$dir/state/tier-read-failures" ] || bad="$bad $route-never-injected"
+        grep -qi 'classif' "$dir/err.log" || bad="$bad $route-unrelated-error"
+        ;;
+    esac
+    case "$route" in
+      clean-*|api-*|post-*)
+        # One POST proves the delayed route ran after the probe, not before it.
+        case "$route" in *post-probe|post-*) [ "$(probe_count "$dir")" = 1 ] || bad="$bad $route-never-probed" ;; esac
+        ;;
+    esac
+  done
+  if [ -z "$bad" ]; then
+    pass "#878: extraction errors stop every waiter verdict path; advisory count is unknown and API-only fallback survives"
+  else
+    fail "#878 waiter extraction:$bad"
+  fi
+}
+
+if test_878_nested_tier_errors; then
+  pass "#878: nested marker predicates preserve extraction errors separately from absence and API failure"
+else
+  fail "#878: nested marker extraction error propagation"
+fi
+test_878_waiter_tier_errors
+
 test_900_review_run_selector_ignores_bodyless_replies
 test_919_pending_status_blocks_the_terminal_verdict
 test_936_unreadable_status_is_not_an_absent_status

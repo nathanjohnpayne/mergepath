@@ -4,6 +4,14 @@ Feature: corroborated CodeRabbit barrier evidence on the Phase 4b rc-7 path. Whe
 
 ## Acceptance criteria
 
+### Tier-classification read failures (#878)
+
+The shared CodeRabbit tier classifiers preserve their existing marker vocabulary, ordering, selection precedence and empty-output/exit-0 absence result. A failed marker extraction returns exit 2 with no classification, including when the failed reader produced partial output. Selecting a tier already extracted in memory requires no additional external reader.
+
+Every consumer handles that failure during the same evaluation: the waiter and feedback recorder report their existing infrastructure exit 3; the severity gate, feedback accounting and archive renderer report infrastructure exit 2. The waiter's diagnostic-only required-tier count may remain unknown (`null`), never a false zero. Severity-gate exit 3 remains the existing pending-summary state. No clean observation, clear accounting result, successful empty archive or supplied-tier fallback may be derived from a failed classifier read.
+
+The migration includes nested waiter predicates and clean-run selection, not only direct callers. Internal classifier failure remains distinguishable from the clean-run selector's existing review-list failure: the latter may still let independently read summary evidence decide under the existing contract, whereas unread tier evidence cannot establish a clean run or use that fallback. The existing raw-body fallback on structural-sanitizer failure is preserved; failure to classify that raw body is an error. No marker grammar, quotation, terminality, publication provenance or archive-recovery policy changes are implied.
+
 ### Probe rc-7 evidence contract
 
 - rc 7 (PROBE_NO_REVIEW) is `--probe`-only: no terminal signal on this head; `probe.observed` names the surface the scan landed on (`none | rate_limit | paused | in_progress | summary-without-head-review | awaiting-summary`), and the JSON may still carry head-anchored evidence for the barrier to weigh. Polling mode never exits 7.

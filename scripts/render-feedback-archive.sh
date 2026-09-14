@@ -78,7 +78,8 @@ EOF
 CODEX_TIERS=$(codex_tiers_of "$BODY" | jq -Rsc 'split("\n") | map(select(. != ""))')
 VISIBLE=$(coderabbit_finding_scan "$BODY") \
   || { echo "render-feedback-archive: could not scan CodeRabbit body" >&2; exit 2; }
-CODERABBIT_TIERS=$(coderabbit_tiers_of "$VISIBLE" | jq -Rsc 'split("\n") | map(select(. != ""))')
+CODERABBIT_TIERS=$(coderabbit_tiers_of "$VISIBLE" | jq -Rsc 'split("\n") | map(select(. != ""))') \
+  || { echo "render-feedback-archive: could not classify CodeRabbit tier evidence" >&2; exit 2; }
 if [ -n "$GHAS_TIER" ]; then
   GHAS_TIERS=$(jq -nc --arg t "$GHAS_TIER" '[$t]')
 else

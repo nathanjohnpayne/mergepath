@@ -413,7 +413,7 @@ i=0
 while [ "$i" -lt "$CAND_COUNT" ]; do
   c=$(echo "$CANDIDATES" | jq -c ".[$i]")
   body=$(echo "$c" | jq -r '.body')
-  tier=$(coderabbit_tier_of "$body")
+  tier=$(coderabbit_tier_of "$body") || die 2 "could not classify an inline CodeRabbit finding"
   if tier_is_required "$tier"; then
     BLOCKING_COMMENTS=$(echo "$BLOCKING_COMMENTS" | jq -c \
       --argjson c "$c" --arg tier "$tier" '
@@ -1400,7 +1400,7 @@ while IFS= read -r SUMMARY_JSON; do
     cr_line_no=${cr_numbered%%	*}
     cr_line=${cr_numbered#*	}
     [ -n "$cr_line" ] || continue
-    cr_tier=$(coderabbit_tier_of "$cr_line")
+    cr_tier=$(coderabbit_tier_of "$cr_line") || die 2 "could not classify the CodeRabbit summary"
     if tier_is_required "$cr_tier"; then
       SUMMARY_BLOCKING=$(echo "$SUMMARY_BLOCKING" | jq -c \
         --argjson id "$SUMMARY_ID" --argjson line "$cr_line_no" \

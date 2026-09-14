@@ -188,6 +188,32 @@ eq ""        "$(coderabbit_tier_of 'This is Trivial, no finding badge.')"       
 eq "p2"      "$(coderabbit_tier_of '_📐 Maintainability_ | _🟡 Minor_: This cleanup is Trivial but visible')" "cr_tier_of: Minor badge beats Trivial-in-prose -> p2 (#581 4b F2)"
 eq "p3 p1 p2" "$(coderabbit_tiers_of '🔵 Trivial first, 🟠 Major second, 🟡 Minor third')" "cr_tiers_of: emits every canonical marker in document order"
 
+# A failed marker read is neither absence nor a usable partial classification.
+for partial in '' '🟠 Major'; do
+  for classifier in coderabbit_tiers_of coderabbit_tier_of; do
+    if (
+      grep() { printf '%s' "$partial"; return 2; }
+      rc=0; out=$("$classifier" '🟠 Major') || rc=$?
+      [ "$rc" = 2 ] && [ -z "$out" ]
+    ); then
+      pass "$classifier: failed extraction discards partial output"
+    else
+      fail "$classifier: failed extraction became a classification or absence"
+    fi
+  done
+done
+
+# Selecting from tiers already extracted in memory needs no second reader.
+if (
+  coderabbit_tiers_of() { printf 'p2\np1\n'; }
+  grep() { return 2; }
+  [ "$(coderabbit_tier_of 'body')" = p1 ]
+); then
+  pass "coderabbit_tier_of: selection does not lose an extracted tier to grep failure"
+else
+  fail "coderabbit_tier_of: selection lost an extracted tier"
+fi
+
 # #1050: a CodeRabbit command-invocation reply can use a warning glyph for
 # provider status rather than reviewer feedback. The sanitizer excludes only
 # the exact status-summary line when the same visible body carries the exact
