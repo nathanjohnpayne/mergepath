@@ -731,6 +731,22 @@ if [ "$rc" = 0 ] && [ ! -e "$P4B_ACK_CASE/comment.json" ] \
   pass "#1261: governing ignore tier creates no acknowledgment obligation despite local issue filing"
 else fail "#1261: ignored governing tier created an impossible repair (rc=$rc; $out)"; fi
 
+# A freeform summary is not represented by the structured step-9 findings.
+for structured in '[]' '[{"severity":"P2","path":"x.js","line":2,"body":"filed advisory"}]'; do
+  verdict=$(jq -nc --argjson findings "$structured" '{verdict:"APPROVED",summary:"**P2** unfiled summary finding",findings:$findings}')
+  mk_fake fake-summary-finding "printf '%s' '$verdict'"
+  run_approval_ack_case "summary-$(printf '%s' "$structured" | jq length)" fake-summary-finding claude P4B_ACK_REAL_GATE=true
+  if [ "$rc" = 7 ] && [ ! -e "$P4B_ACK_CASE/comment.json" ] \
+     && printf '%s' "$out" | jq -e '.review_posted == true and .review_acknowledgment == "failed"' >/dev/null; then
+    pass "#1261: summary finding outside $structured is not automatically acknowledged"
+  else fail "#1261: summary finding bypassed step-9 evidence (rc=$rc; $out)"; fi
+done
+run_approval_ack_case summary-ignored fake-summary-finding claude \
+  P4B_ACK_REAL_GATE=true "P4B_ACK_POLICY=$POLICY_P2_IGNORED"
+if [ "$rc" = 0 ] && [ ! -e "$P4B_ACK_CASE/comment.json" ]; then
+  pass "#1261: ignored summary markers create no acknowledgment obligation"
+else fail "#1261: ignored summary marker invented an obligation (rc=$rc; $out)"; fi
+
 # --- end #1261 approval acknowledgment regression ---------------------------
 
 # ===========================================================================

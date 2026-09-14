@@ -1378,13 +1378,23 @@ post_review() {
 # need their own dispositions. Let the existing gate supply the token rather
 # than duplicating its classification, JSON fingerprint, or evidence rules.
 acknowledge_approval() {
-  local accounting accounting_rc missing token payload_file post_rc expected_findings
+  local accounting accounting_rc missing token payload_file post_rc expected_findings summary_tiers
   if accounting=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO"); then
     accounting_rc=0
   else
     accounting_rc=$?
   fi
   [ "$accounting_rc" -le 1 ] || return 1
+  # Freeform summary findings have no structured step-9 disposition. Reuse
+  # the gate's marker classifier and leave nonignored ones for manual repair.
+  [ -r "$ROOT/lib/feedback-policy-helpers.sh" ] || return 1
+  # shellcheck source=lib/feedback-policy-helpers.sh
+  . "$ROOT/lib/feedback-policy-helpers.sh"
+  summary_tiers=$(codex_tiers_of "$SUMMARY" | jq -Rsc 'split("\n") | map(select(length > 0))') || return 1
+  printf '%s' "$accounting" | jq -e --argjson tiers "$summary_tiers" '
+    .feedback_policy as $policy | all($tiers[]; . as $tier |
+      ($policy.mode // "by-priority") == "by-priority" and $policy.priorities[$tier] == "ignore")
+    ' >/dev/null || return 1
   # Only rendered findings nonignored by the governing policy require an
   # inventory row. Local issue filing may reflect an older, stricter policy.
   expected_findings=$(printf '%s' "$accounting" | jq -er --argjson verdict "$VERDICT_JSON" '

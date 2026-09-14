@@ -607,6 +607,7 @@ paths:
       - "scripts/coderabbit-wait.sh"
       - "scripts/codex-review-check.sh"
       - "scripts/review-feedback-accounting.sh"   # #1000, no adapter dispatch over unread findings
+      - "scripts/lib/feedback-policy-helpers.sh"   # #1261, summary markers outside step-9 evidence
       # Hard-sourced (#799): all four head resolutions in this orchestrator —
       # the initial --head default and the three drift re-reads around the
       # post-review issue filing and the review POST — route through
