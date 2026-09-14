@@ -223,6 +223,21 @@ case "$endpoint" in
     ;;
   repos/owner/repo/pulls/999/reviews)
     case "$scenario" in
+      run_replaced_after_count|run_replaced_during_probe|run_replaced_every_count|newer_clean_run)
+        if [ "$scenario" = run_replaced_every_count ]; then
+          n=5000
+          [ ! -f "$state_dir/run-read-count" ] || n=$(cat "$state_dir/run-read-count")
+          n=$((n + 1)); printf '%s\n' "$n" >"$state_dir/run-read-count"
+          printf '[{"id":%s,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$n" "$bot" "$reply_time" "$run_body"
+        elif [ "$scenario" = newer_clean_run ]; then
+          printf '[{"id":5001,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"**Actionable comments posted: 1**"},{"id":5003,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$bot" "$reply_time" "$run_body"
+        elif [ -f "$state_dir/counted-run" ]; then
+          # The former run is deliberately absent from this later snapshot.
+          printf '[{"id":5003,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"**Actionable comments posted: 1**"}]\n' "$bot" "$reply_time"
+        else
+          printf '[{"id":5001,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$head_time" "$run_body"
+        fi
+        ;;
       review_arrives_during_probe)
         count=0
         if [ -f "$state_dir/probe-count" ]; then
@@ -345,7 +360,7 @@ case "$endpoint" in
         # surface it without the explicit anchor-free pause read below.
         printf '[{"id":9965,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
         ;;
-      bodyless_ack_over_findings_run)
+      bodyless_ack_over_findings_run|bodyless_ack_silent_summary)
         # #1031: ONE head, two CodeRabbit review objects. 9401 is the findings
         # RUN — it carries the report body, and its blocking finding is inline
         # (pulls endpoint below), not in that body. 9402 is the body-LESS
@@ -372,6 +387,12 @@ case "$endpoint" in
     ;;
   repos/owner/repo/pulls/999/comments)
     case "$scenario" in
+      run_replaced_after_count|run_replaced_during_probe|newer_clean_run)
+        : >"$state_dir/counted-run"
+        finding_run=5003
+        [ "$scenario" != newer_clean_run ] || finding_run=5001
+        printf '[{"id":6001,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","commit_id":"head-sha","pull_request_review_id":%s,"in_reply_to_id":null,"body":"_🟠 Major_ A live blocking finding."}]\n' "$bot" "$head_time" "$head_time" "$finding_run"
+        ;;
       probe_finding_predates_head)
         # created_at is BEFORE head_time, i.e. before HEAD_IDENTITY_ANCHOR.
         # The anchored counter drops it; the probe must not, because commit_id
@@ -408,7 +429,7 @@ case "$endpoint" in
         # the commit_id ties it to this head.
         printf '[{"id":9732,"user":{"login":"%s"},"created_at":"2026-06-03T00:00:00Z","updated_at":"2026-06-03T00:00:00Z","commit_id":"head-sha","pull_request_review_id":9731,"in_reply_to_id":null,"body":"_⚠️ Potential issue_\\n\\nFinding on the SHA-matched review."}]\n' "$bot"
         ;;
-      bodyless_ack_over_findings_run)
+      bodyless_ack_over_findings_run|bodyless_ack_silent_summary)
         # #1031: the live blocking finding hangs off the findings run (9401) as
         # a ROOT comment; the ack (9402) owns only a REPLY to it, which every
         # counter drops as a non-root. So scoping the count to the ack yields
@@ -431,6 +452,13 @@ case "$endpoint" in
     ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
+      run_replaced_after_count|run_replaced_during_probe|run_replaced_every_count|newer_clean_run)
+        if [ "$scenario" = run_replaced_during_probe ] && [ ! -f "$state_dir/probe-count" ]; then
+          printf '[]\n'
+        else
+          printf '[{"id":7001,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\nNo actionable comments were generated in the recent review."}]\n' "$bot" "$head_time" "$reply_time"
+        fi
+        ;;
       status_reply_after_delay)
         count=0
         if [ -f "$state_dir/probe-count" ]; then
@@ -444,6 +472,9 @@ case "$endpoint" in
         ;;
       existing_status_probe_reply)
         printf '[{"id":8802,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- CodeRabbit review command invocation: prior -->\\n`@nathanjohnpayne`: Here is a summary of where things stand.\\n\\n### Open CodeRabbit Threads\\nStill checking."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      bodyless_ack_silent_summary)
+        printf '[{"id":7943,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\nNo actionable comments were generated in the recent review."}]\n' "$bot" "$head_time" "$reply_time"
         ;;
       bodyless_ack_over_findings_run)
         # #1031: the #968 shape the rung was added to outrank — CodeRabbit's
@@ -2358,25 +2389,9 @@ Review failed.
   fi
 }
 
-# #1031: the exact-SHA rung must credit the run the finding COUNTER graded,
-# not merely the newest run that carries a body.
-#
-# The two head-pinned selections read ONE reviews array through different
-# filters — `crw_select_head_pinned_review_run` keeps only body-BEARING
-# objects (#900), `latest_head_pinned_review` (which count_potential_issues
-# scopes its inline findings to) keeps every head-pinned object — so they part
-# company the moment the newest object carries no body. That is not an exotic
-# shape: it is the #919 wrapper GitHub puts around CodeRabbit's `🐇 ✅`
-# acknowledgement of the `[mergepath-resolve:…]` tag reply the review loop
-# posts on EVERY finding thread. The counter then reports 0 for the ack while
-# the rung credits the findings run underneath, whose own body carries no
-# marker because its findings are inline — and the #968 demotion is withdrawn
-# on a head with a live Major.
-#
-# Driven directly because the disagreement is a property of the two selectors,
-# and the id-binding conjunct is the whole of the fix; the end-to-end verdict
-# it changes is asserted by
-# test_1031_bodyless_ack_over_findings_run_does_not_clear below.
+# #1037: the counter and exact-SHA rung select the same body-bearing run.
+# A later API snapshot may still contain a newer run; it must return a distinct
+# superseded result instead of falling through as ordinary absent evidence.
 test_1031_rung_binds_to_the_graded_run() {
   local snip="$WORKDIR/rung-graded-binding.sh" bad="" rc out
   local h40 run_body ack_body reviews_both reviews_run_only reviews_ack_first
@@ -2446,28 +2461,19 @@ test_1031_rung_binds_to_the_graded_run() {
      submitted_at: "2026-06-04T00:01:00Z", body: $r}
   ]')
 
-  # THE REGRESSION. The body-less ack is the newest head-pinned object, so the
-  # counter grades IT (id 5602) and finds no root comments beneath it; the rung
-  # would otherwise credit the findings run (5601) and withdraw the demotion.
-  # The two disagree, so the rung has no counted-findings evidence and the
-  # demotion decides: rc 1.
+  # Both selectors now retain the findings run under the acknowledgement.
+  # The end-to-end case below proves the inline finding is actually counted.
   fetch_api_array() { printf '%s\n' "$reviews_both"; }
   rc=0; out=$(crw_head_pinned_clean_review_run "$h40" "$(graded_of "$reviews_both")") || rc=$?
-  [ "$rc" = "1" ] || bad="$bad ack-newer-not-1(rc=$rc,out=$out)"
+  [ "$rc" = "0" ] || bad="$bad ack-newer-not-0(rc=$rc,out=$out)"
 
-  # The refusal above must come from the DISAGREEMENT, not from the run body:
-  # remove the ack and the same run satisfies the rung outright. Without this
-  # control the case above is also passed by a helper that has simply stopped
-  # working.
+  # Removing the acknowledgement keeps the same run selected and eligible.
   fetch_api_array() { printf '%s\n' "$reviews_run_only"; }
   rc=0; out=$(crw_head_pinned_clean_review_run "$h40" "$(graded_of "$reviews_run_only")") || rc=$?
   [ "$rc" = "0" ] || bad="$bad run-alone-not-0(rc=$rc)"
   [ "$out" = "5601" ] || bad="$bad run-alone-id($out)"
 
-  # Direction check: a body-less object is not itself disqualifying. When the
-  # ack PRECEDES the run, the counter grades the run too, the two agree, and
-  # the rung is satisfied — so the binding is a co-selection test, not a
-  # blanket refusal whenever a reply exists on the head.
+  # Acknowledgements preceding the run also leave its selection unchanged.
   fetch_api_array() { printf '%s\n' "$reviews_ack_first"; }
   rc=0; out=$(crw_head_pinned_clean_review_run "$h40" "$(graded_of "$reviews_ack_first")") || rc=$?
   [ "$rc" = "0" ] || bad="$bad ack-older-not-0(rc=$rc)"
@@ -2476,9 +2482,12 @@ test_1031_rung_binds_to_the_graded_run() {
   # The two selectors must agree about the graded object on the plain shape as
   # well, or the binding above would be comparing look-alikes.
   out=$(crw_select_head_pinned_graded_review "$reviews_both" "$BOT_LOGIN" "$h40" | jq -r '.id')
-  [ "$out" = "5602" ] || bad="$bad graded-selection($out)"
+  [ "$out" = "5601" ] || bad="$bad graded-selection($out)"
   out=$(crw_select_head_pinned_review_run "$reviews_both" "$BOT_LOGIN" "$h40" | jq -r '.id')
   [ "$out" = "5601" ] || bad="$bad run-selection($out)"
+  # Acknowledgement-only evidence is no run, not a selected empty run.
+  out=$(crw_select_head_pinned_graded_review "$(jq '[.[] | select(.id == 5602)]' <<<"$reviews_both")" "$BOT_LOGIN" "$h40")
+  [ -z "$out" ] || bad="$bad acknowledgement-only-selected($out)"
 
   # ROUND 2 (Phase 4b P1). Naming one selector is not enough: the counter and
   # the rung read the live `pulls/{pr}/reviews` endpoint at DIFFERENT times, so
@@ -2497,7 +2506,7 @@ test_1031_rung_binds_to_the_graded_run() {
   ]')
   fetch_api_array() { printf '%s\n' "$reviews_newer_run"; }
   rc=0; out=$(crw_head_pinned_clean_review_run "$h40" 5601) || rc=$?
-  [ "$rc" = "1" ] || bad="$bad newer-run-after-count-not-1(rc=$rc,out=$out)"
+  [ "$rc" = "4" ] || bad="$bad newer-run-after-count-not-4(rc=$rc,out=$out)"
   # Non-vacuity: the refusal is the STALE id, not the fixture. Grading the same
   # live array the rung sees clears it.
   rc=0; out=$(crw_head_pinned_clean_review_run "$h40" "$(graded_of "$reviews_newer_run")") || rc=$?
@@ -2520,28 +2529,57 @@ test_1031_rung_binds_to_the_graded_run() {
   fi
 }
 
-# #1031 end-to-end: the same fixture through the real script. Pre-fix this
-# emitted `cleared` (exit 0) with potential_issue_count 0 on a head carrying a
-# live `_🟠 Major_ / **Potential issue**` — the counter graded the body-less
-# ack, the rung credited the findings run, and between them the #968 demotion
-# was withdrawn with nobody having looked at the finding. Post-fix the rung
-# declines, the demotion stands, and the wait holds to its advisory timeout.
+# #1037 end-to-end: an acknowledgement cannot move the count away from the
+# live finding. Even a summary naming another head must not hide that finding.
 test_1031_bodyless_ack_over_findings_run_does_not_clear() {
-  local dir rc status
-  dir=$(make_case "bodyless-ack-over-findings-run" 60 false 0 2)
-  rc=$(run_case "$dir" bodyless_ack_over_findings_run)
-  status=""
-  if [ -s "$dir/out.json" ]; then
+  local dir rc status scenario
+  for scenario in bodyless_ack_silent_summary bodyless_ack_over_findings_run; do
+    dir=$(make_case "1037-$scenario" 60 false 0 2)
+    rc=$(run_case "$dir" "$scenario")
     status=$(jq -r '.status' "$dir/out.json")
-  fi
-  if [ "$rc" = "0" ] || [ "$status" = "cleared" ]; then
-    fail "#1031 end-to-end: exit $rc status=$status — a body-less ack must not let the exact-SHA rung clear a head whose findings nothing counted; stderr=$(tail -5 "$dir/err.log")"
-  elif [ "$rc" != "4" ] || [ "$status" != "timeout" ]; then
-    fail "#1031 end-to-end: exit $rc status=$status, expected the advisory timeout (4/timeout) the #968 demotion produces; stderr=$(tail -5 "$dir/err.log")"
-  elif ! grep -q 'commits range names a different commit' "$dir/err.log"; then
-    fail "#1031 end-to-end: the #968 demotion never fired, so the verdict was reached some other way; stderr=$(tail -5 "$dir/err.log")"
+    if [ "$rc" = 2 ] && [ "$status" = findings ] && [ "$(jq -r '.potential_issue_count' "$dir/out.json")" = 1 ]; then
+      pass "#1037: $scenario retains the body-bearing run's live finding"
+    else
+      fail "#1037 $scenario: rc=$rc status=$status, expected findings/count 1"
+    fi
+  done
+}
+
+test_1037_superseded_run_paths() {
+  local scenario dir rc expected status bad=""
+  for scenario in run_replaced_after_count run_replaced_during_probe run_replaced_every_count newer_clean_run; do
+    if [ "$scenario" = run_replaced_during_probe ]; then
+      dir=$(make_case "1037-$scenario" 0 true 12 0)
+    else
+      dir=$(make_case "1037-$scenario" 60 false 0 0)
+    fi
+    rc=$(run_case "$dir" "$scenario")
+    case "$scenario" in
+      run_replaced_after_count) expected=2; status=findings ;;
+      run_replaced_during_probe|run_replaced_every_count) expected=4; status=timeout ;;
+      newer_clean_run) expected=0; status=cleared ;;
+    esac
+    [ "$rc" = "$expected" ] || bad="$bad $scenario-rc=$rc"
+    [ "$(jq -r '.status' "$dir/out.json")" = "$status" ] || bad="$bad $scenario-status"
+    case "$scenario" in
+      run_replaced_after_count)
+        [ "$(jq -r '.potential_issue_count' "$dir/out.json")" = 1 ] || bad="$bad recount-missed-finding"
+        grep -q 'superseded the counted run' "$dir/err.log" || bad="$bad no-supersession"
+        ;;
+      run_replaced_during_probe)
+        [ "$(probe_count "$dir")" = 1 ] || bad="$bad no-probe"
+        grep -q 'post-probe terminal-review check:.*superseded' "$dir/err.log" || bad="$bad wrong-post-probe-path"
+        ;;
+      run_replaced_every_count)
+        [ "$(jq -r '.waited_seconds' "$dir/out.json")" = 60 ] || bad="$bad budget-changed"
+        grep -q 'superseded the counted run' "$dir/err.log" || bad="$bad no-repeated-supersession"
+        ;;
+    esac
+  done
+  if [ -z "$bad" ]; then
+    pass "#1037: superseded counts retry within budget or retain timeout; a newer clean run can clear"
   else
-    pass "#1031: a body-less resolve-tag ack newer than the findings run leaves the #968 demotion standing instead of clearing the head"
+    fail "#1037 superseded paths:$bad"
   fi
 }
 
@@ -3393,6 +3431,7 @@ test_1005_classifier_pipe_buffer_unit
 test_1003_head_run_evidence_unit
 test_1031_rung_binds_to_the_graded_run
 test_1031_bodyless_ack_over_findings_run_does_not_clear
+test_1037_superseded_run_paths
 test_837_badge_only_inline_finding_is_counted
 test_837_badge_only_summary_finding_probe_is_findings
 test_824_sha_matched_review_is_honored_regardless_of_timestamp

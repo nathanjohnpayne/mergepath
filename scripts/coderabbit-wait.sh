@@ -2061,39 +2061,15 @@ scan_latest_comment_best_effort() {
 }
 
 # BEGIN coderabbit_graded_review_selector
-# The head-pinned CodeRabbit review object whose inline findings the counters
-# GRADE, as `{id, submitted_at}`, or nothing.
-#
-# Extracted (#1031) because two decisions now have to agree about which object
-# that is. `latest_head_pinned_review` below feeds head_review_finding_bodies
-# and therefore count_potential_issues; `crw_head_pinned_clean_review_run`
-# credits a run as clean and may only credit the run the counter actually
-# graded. The two read the SAME endpoint through DIFFERENT filters — the
-# evidence helper keeps only body-BEARING objects (#900), this selection keeps
-# every head-pinned one — so a private copy of the selection in the second
-# reader is exactly how the two came to disagree about one head.
-#
-# Naming it is necessary but NOT sufficient, and that distinction is the whole
-# of #1031 round 2: two CALLS to this one function still read two different
-# snapshots of a live endpoint, so a run published between them makes both
-# answers correct and different. The agreement is therefore established by
-# calling this ONCE per decision and passing the resulting id down — into the
-# count it scopes (`count_potential_issues <id>`) and into the rung that
-# credits it (`crw_head_pinned_clean_review_run <head> <id>`) — never by
-# re-deriving it at each reader.
-#
-# Pure: jq over the passed strings only, no globals and no I/O.
+# The latest body-bearing CodeRabbit review run on this HEAD whose root inline
+# findings the counters grade, projected as {id, submitted_at}. Reuse the #900
+# discriminator so a later body-less acknowledgement cannot replace that run.
+# The caller passes this selected id to both the count and the later clearance
+# comparison: identical selectors can still observe different API snapshots.
 #
 # crw_select_head_pinned_graded_review <reviews-json> <bot-login> <head-sha>
 crw_select_head_pinned_graded_review() {
-  printf '%s' "${1:-}" | jq -c --arg bot "${2:-}" --arg head_sha "${3:-}" '
-    [ .[]
-      | select(.user.login == $bot)
-      | select(.commit_id == $head_sha)
-    ]
-    | sort_by(.submitted_at) | last
-    | if . == null then empty else {id, submitted_at} end
-  '
+  crw_select_head_pinned_review_run "$1" "$2" "$3" | jq -c '{id, submitted_at}'
 }
 # END coderabbit_graded_review_selector
 
@@ -2103,14 +2079,14 @@ crw_select_head_pinned_graded_review() {
 # helpers below; ordinary human/agent replies do not clear a finding by
 # themselves.
 #
-# Id of the latest CodeRabbit review object pinned to the current HEAD, or
+# Id of the latest body-bearing CodeRabbit run pinned to the current HEAD, or
 # empty. Pin the selection to the current HEAD commit (`commit_id ==
 # HEAD_SHA`). A review submitted recently but referencing an intermediate
 # commit (e.g. a rapid push sequence where CodeRabbit reviewed an earlier SHA)
 # must not be chosen as the HEAD review. Mirror the HEAD-pinning in
 # scripts/codex-review-check.sh (commit_id == $sha).
 #
-# The SHA match is the WHOLE test; there is deliberately no
+# The SHA match is the WHOLE freshness test; there is deliberately no
 # `submitted_at >= HEAD_ANCHOR` conjunct (#824). HEAD_ANCHOR derives from the
 # HEAD committer date, which whoever pushed controls: a metadata-rewritten
 # commit or a skewed local clock dates the head into the future, and a
@@ -3149,6 +3125,10 @@ emit_terminal_review_after_probe_if_present() {
           head_run_rc=0
           head_run_id=$(crw_head_pinned_clean_review_run "$HEAD_SHA" "$graded_review_id") || head_run_rc=$?
           [ "$head_run_rc" != 2 ] || die 3 "could not classify the head-pinned CodeRabbit review"
+          if [ "$head_run_rc" = 4 ]; then
+            log "post-probe terminal-review check: a newer CodeRabbit run superseded the counted run — leaving the advisory timeout in place"
+            return 0
+          fi
           if [ "$head_run_rc" = "0" ]; then
             log "post-probe terminal-review check: CodeRabbit review run id=$head_run_id is pinned to $HEAD_SHA by commit_id, is the run the finding counter graded, and carries a clean report body — the exact-SHA rung wins outright, so the mutable summary's commits range does not demote this head (#1003/#1022)"
           else
@@ -3847,59 +3827,26 @@ crw_summary_names_only_other_head() {
 #     carries none: this repository's own model of one is the bare
 #     `**Actionable comments posted: 0**`. Requiring a stanza would make this
 #     rung unreachable and silently restore the inverted ladder.
-#   - the run must be the SAME object the finding counter graded (#1031). The
-#     selector and `latest_head_pinned_review` read one array through different
-#     filters, so they answer differently the moment the newest head-pinned
-#     object carries no body — which is the #919 shape this comment block
-#     already documents, and the review-loop rules make it the COMMON shape:
-#     we post a `[mergepath-resolve:…]` tag reply on every finding thread, and
-#     GitHub wraps a body-less review object around CodeRabbit's `🐇 ✅`
-#     acknowledgement of it. The counter then scopes `pull_request_review_id`
-#     to that ACK, finds no root comments beneath it and reports 0 blocking
-#     findings, while this rung would credit the FINDINGS run underneath —
-#     whose findings are inline, so the marker conjunct above never sees them
-#     either. The demotion is withdrawn and the wait emits `cleared` on a head
-#     carrying a live `_🟠 Major_ / **Potential issue**`. Binding the two makes
-#     the rung mean what it claims: THIS run's findings were counted, and there
-#     were none. When they differ the counter graded some other object, so the
-#     rung has no counted-findings evidence to outrank a summary with and the
-#     demotion decides — the same answer as "no body-bearing run at all".
-#
-#     The counter's OWN id, not a re-derivation of it (#1031 round 2, Phase 4b
-#     P1). Deriving the graded selection here — even from the same array this
-#     helper's own run came from — binds two readers of ONE fetch, and the
-#     fetch is not the counter's: `count_potential_issues` reads
-#     `pulls/{pr}/reviews` earlier and independently. If CodeRabbit publishes a
-#     newer body-bearing run B after the counter graded a clean run A and
-#     before this helper's fetch, BOTH selectors here answer B, they agree, and
-#     B satisfies the rung — while B's inline findings were never counted, and
-#     inline findings put no marker in the run body for the conjunct above to
-#     catch. That is the same false clear one snapshot further along. So the id
-#     is a REQUIRED parameter, produced by the caller and passed verbatim into
-#     the count it scopes: the caller cannot count against one object and
-#     credit another, whatever lands between the two reads. A newer run makes
-#     the ids differ, which refuses.
-#
-# Direction is preserved: this can only ever WITHDRAW a refusal that rests on a
-# mutable comment, in favour of GitHub-owned immutable head identity. It never
-# promotes a body to clearance — the caller still has to pass the inline
-# finding count, the summary-marker gate and the class ladder before it reaches
-# the `cleared` emit at all.
+#   - the run must be the SAME body-bearing run the counter graded (#1037).
+#     Selection is shared, but the counter and this comparison read separate
+#     snapshots. If a different run is now selected, the old count cannot
+#     establish this run's clearance. Return the distinct superseded result so
+#     both callers withhold clearance, even if the counted run is now absent.
 #
 # Return codes, and both call sites honour each:
 #   0  a head-pinned, body-bearing, review-class, marker-free CodeRabbit run
 #      exists on this head AND it is the object <graded-review-id> names. The
 #      exact-SHA rung is satisfied; skip the demotion.
-#   1  no such run — including the case where the caller graded no review
-#      object at all (an empty <graded-review-id>), and the case where a newer
-#      run has superseded the graded one. The demotion decides, exactly as
-#      before.
+#   1  no qualifying counted run, including an empty counted id or no selected
+#      body-bearing run. The summary demotion decides as before.
 #   2  tier evidence in the selected run could not be classified. Both callers
 #      stop with infrastructure failure; this is not alternate clean evidence.
 #   3  the reviews list could not be READ, or the selected run could not be
 #      derived. Never folded into 0 — an unreadable surface must not withdraw a
 #      refusal, which is the same failed-read-as-clean confusion #936/#959
 #      closed at the neighbouring reads.
+#   4  another run superseded the counted body-bearing run. Polling retries
+#      within its existing budget; the post-probe upgrade leaves timeout intact.
 #
 # crw_head_pinned_clean_review_run <head-sha> <graded-review-id>
 crw_head_pinned_clean_review_run() {
@@ -3922,7 +3869,8 @@ crw_head_pinned_clean_review_run() {
   run_id=$(printf '%s' "$run" | jq -r '.id // empty') || return 3
   [ -n "$run_id" ] || return 3
   # #1031: the counter-binding conjunct, argued in the block comment above.
-  [ "$run_id" = "$graded_id" ] || return 1
+  [ "$run_id" = "$graded_id" ] || return 4
+
   # Re-read the FULL body from the same array. The selector emits a 200-char
   # `body_excerpt` for logging, and classifying an excerpt would grade a
   # truncated document — the marker a run carries need not be in the first 200
@@ -4918,6 +4866,11 @@ while :; do
           HEAD_RUN_RC=0
           HEAD_RUN_ID=$(crw_head_pinned_clean_review_run "$HEAD_SHA" "$GRADED_REVIEW_ID") || HEAD_RUN_RC=$?
           [ "$HEAD_RUN_RC" != 2 ] || die 3 "could not classify the head-pinned CodeRabbit review"
+          if [ "$HEAD_RUN_RC" = 4 ]; then
+            log "a newer CodeRabbit run superseded the counted run — retrying within the existing wait budget"
+            sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+            continue
+          fi
           if [ "$HEAD_RUN_RC" = "0" ]; then
             log "CodeRabbit review run id=$HEAD_RUN_ID is pinned to $HEAD_SHA by commit_id, is the run the finding counter graded, and carries a clean report body — the exact-SHA rung wins outright, so the mutable summary's commits range does not demote this head (#1003/#1022)"
           else
