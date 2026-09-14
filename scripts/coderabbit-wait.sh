@@ -1944,7 +1944,7 @@ crw_rate_limit_hides_a_finding() {
       # rc 3 on a failed decode, never a bare refusal (#1178 round 10). Discarding
       # this status left `sbody` empty, which the head predicate's `[ -n ]` guard
       # turns into 1, which this helper reports as "no finding" — a verdict about
-      # a surface that was never read. crw_summary_names_only_other_head already
+      # a surface that was never read. crw_summary_blocks_fallback_clearance already
       # guards the same read this way.
       sbody=$(printf '%s' "$sel" | base64 --decode | jq -r '.body') || return 3
       [ -n "$sbody" ] || return 3
@@ -3133,15 +3133,15 @@ emit_terminal_review_after_probe_if_present() {
             log "post-probe terminal-review check: CodeRabbit review run id=$head_run_id is pinned to $HEAD_SHA by commit_id, is the run the finding counter graded, and carries a clean report body — the exact-SHA rung wins outright, so the mutable summary's commits range does not demote this head (#1003/#1022)"
           else
             summary_head_claim_rc=0
-            crw_summary_names_only_other_head "$HEAD_SHA" || summary_head_claim_rc=$?
+            crw_summary_blocks_fallback_clearance "$HEAD_SHA" || summary_head_claim_rc=$?
             case "$summary_head_claim_rc" in
               0)
-                log "post-probe terminal-review check: the PR's CodeRabbit summary has no blocking markers, but its commits range names a different commit than $HEAD_SHA — leaving the advisory timeout in place rather than clearing on another commit's verdict (#968)"
+                log "post-probe terminal-review check: the fallback summary or per-SHA CodeRabbit status refuses clearance on $HEAD_SHA — leaving the advisory timeout in place (#968/#940)"
                 return 0
                 ;;
               1) : ;;
               *)
-                log "post-probe terminal-review check: the CodeRabbit summary comment could not be read, so a verdict about another commit cannot be ruled out — leaving the advisory timeout in place"
+                log "post-probe terminal-review check: the CodeRabbit fallback summary or status could not be read — leaving the advisory timeout in place"
                 return 0
                 ;;
             esac
@@ -3759,31 +3759,64 @@ crw_select_summary_comment() {
 # REFUSE a clearance, never manufacture one — which is what makes reading a
 # mutable comment body acceptable evidence here.
 #
-# Return codes, and both call sites honour all three:
-#   0  a summary exists and every commits range in it ends at some OTHER
-#      commit. Refuse the clearance.
-#   1  no refusal: there is no summary comment, or its body carries no
-#      machine-readable range, or one of its ranges ends at this head. Those
-#      are #968 AC2/AC3 and stay exactly as they were.
-#   3  the issue-comment list could not be READ, or the selected body could not
-#      be derived. Never folded into 1 — "the surface is unreadable" reading as
-#      "the surface says nothing to refuse on" is the same failed-read-as-clean
-#      confusion #936/#959 closed at the neighbouring reads.
+# #940: a refreshed walkthrough can also lack a head claim while the per-SHA
+# status still says pending or success/Review rate limited. Such activity cannot
+# clear via either fallback site. The existing #851 completed current-head
+# summary escape stays authoritative; ordinary --probe keeps its #919 behavior.
+# The callers have already checked findings, clean-run evidence and supersession.
 #
-# crw_summary_names_only_other_head <head-sha>
-crw_summary_names_only_other_head() {
+# Return codes, and both call sites honour all three:
+#   0  the summary names only another head, or the trusted status vetoes fallback
+#      clearance. The helper logs which refusal applies.
+#   1  no refusal: a completed current-head summary, trust disabled, or a status
+#      other than pending/non-completion success. Missing and empty descriptions
+#      retain their existing escape.
+#   3  the selected summary or required status evidence could not be read.
+#      Polling reports infra failure; the terminal upgrade keeps its timeout.
+#
+# crw_summary_blocks_fallback_clearance <head-sha>
+crw_summary_blocks_fallback_clearance() {
   local head_sha=${1:?}
-  local issue_comments summary sbody
+  local issue_comments summary sbody="" rc=0 rec state desc
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
     || return 3
   summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
     || return 3
-  # No summary comment on the PR at all is a definite answer, not an unread
-  # one: there is no verdict here about any commit, so there is nothing to
-  # demote and the caller's other freshness tests keep deciding.
-  [ -n "$summary" ] || return 1
-  sbody=$(printf '%s' "$summary" | base64 --decode | jq -r '.body') || return 3
-  summary_names_only_other_head "$sbody" "$head_sha"
+  if [ -n "$summary" ]; then
+    sbody=$(printf '%s' "$summary" | base64 --decode | jq -r '.body') || return 3
+    summary_names_only_other_head "$sbody" "$head_sha" || rc=$?
+    case "$rc" in
+      0)
+        log "the CodeRabbit summary's commits range names a different commit than $head_sha — an in-place edit is not a re-review (#968)"
+        return 0 ;;
+      1) ;;
+      *) return 3 ;;
+    esac
+  fi
+  [ "${TRUST_STATUS_CONTEXT:-false}" = "true" ] || return 1
+  # #940: the completed current-head summary escape (#851) outranks a status
+  # veto in polling. Ordinary --probe retains its own #919 pending behavior.
+  if [ -n "$sbody" ] && [ "$(classify_comment "$sbody")" = review ] \
+     && summary_stanzas_all_benign "$sbody"; then
+    rc=0; summary_names_head "$sbody" "$head_sha" || rc=$?
+    case "$rc" in 0) return 1 ;; 1) ;; *) return 3 ;; esac
+  fi
+  rec=$(check_status_context_record) || return 3
+  state=$(crw_status_record_state "$rec")
+  case "$state" in
+    unreadable) return 3 ;;
+    pending)
+      log "the per-SHA CodeRabbit status on $head_sha is pending — fallback summary activity cannot establish a finished review (#940)"
+      return 0 ;;
+    success)
+      desc=$(printf '%s' "$rec" | jq -r '.description // ""') || return 3
+      if ! crw_status_description_permits_clearance "$desc"; then
+        log "the per-SHA CodeRabbit status on $head_sha is success with non-completion description '$desc' — refusing fallback summary clearance (#940)"
+        return 0
+      fi
+      ;;
+  esac
+  return 1
 }
 # END coderabbit_summary_head_claim
 
@@ -4875,16 +4908,16 @@ while :; do
             log "CodeRabbit review run id=$HEAD_RUN_ID is pinned to $HEAD_SHA by commit_id, is the run the finding counter graded, and carries a clean report body — the exact-SHA rung wins outright, so the mutable summary's commits range does not demote this head (#1003/#1022)"
           else
             SUMMARY_HEAD_CLAIM_RC=0
-            crw_summary_names_only_other_head "$HEAD_SHA" || SUMMARY_HEAD_CLAIM_RC=$?
+            crw_summary_blocks_fallback_clearance "$HEAD_SHA" || SUMMARY_HEAD_CLAIM_RC=$?
             case "$SUMMARY_HEAD_CLAIM_RC" in
               0)
-                log "the PR's CodeRabbit summary comment has no blocking markers, but its commits range names a different commit than $HEAD_SHA — an in-place EDIT is not a re-review, so this is not clearance for this head (#968); sleeping ${POLL_INTERVAL_SECONDS}s"
+                log "the fallback summary or per-SHA CodeRabbit status refuses clearance on $HEAD_SHA (#968/#940); sleeping ${POLL_INTERVAL_SECONDS}s"
                 sleep_or_timeout "$POLL_INTERVAL_SECONDS"
                 continue
                 ;;
               1) : ;;
               *)
-                die 3 "could not read the CodeRabbit summary comment to rule out a verdict about another commit on $HEAD_SHA — refusing to report a clearance"
+                die 3 "could not read CodeRabbit fallback summary or status evidence on $HEAD_SHA — refusing to report a clearance"
                 ;;
             esac
           fi

@@ -209,10 +209,11 @@ case "$endpoint" in
     # nonzero. That is the transport failure Codex's P1 found conflated with
     # `absent` — the fixture has to be able to tell them apart before the
     # script can.
+    printf 'read\n' >>"$state_dir/status-reads"
     case "${CODERABBIT_TEST_STATUS:-absent}" in
-      success|failure|pending)
-        printf '[{"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"}}]\n' \
-          "${CODERABBIT_TEST_STATUS}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "$bot"
+      success|failure|pending|error)
+        printf '[{"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":%s}]\n' \
+          "${CODERABBIT_TEST_STATUS}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "$bot" "$(json_string "${CODERABBIT_TEST_STATUS_DESCRIPTION:-}")"
         ;;
       unreadable)
         echo "simulated statuses endpoint failure" >&2
@@ -452,6 +453,19 @@ case "$endpoint" in
     ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
+      fallback_summary|fallback_summary_during_probe)
+        # #940: the walkthrough predates HEAD; only its edit is fresh. No
+        # review object or rate-limit notice exists. The delayed variant proves
+        # the same invocation's terminal upgrade cannot restore clearance.
+        if [ "$scenario" = fallback_summary_during_probe ] && [ ! -f "$state_dir/probe-count" ]; then
+          printf '[]\n'
+        else
+          body=${CODERABBIT_TEST_FALLBACK_BODY:-'<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+No actionable comments were generated in the recent review.'}
+          jq -nc --arg bot "$bot" --arg body "$body" --arg updated "$reply_time" \
+            '[{id:94001,user:{login:$bot},created_at:"2026-06-03T00:00:00Z",updated_at:$updated,body:$body}]'
+        fi
+        ;;
       run_replaced_after_count|run_replaced_during_probe|run_replaced_every_count|newer_clean_run)
         if [ "$scenario" = run_replaced_during_probe ] && [ ! -f "$state_dir/probe-count" ]; then
           printf '[]\n'
@@ -2052,25 +2066,25 @@ the current head per gh pr view is $h40"
        updated_at: "2026-06-04T00:01:30Z", body: $c}
     ]'
   }
-  rc=0; crw_summary_names_only_other_head "$h40" || rc=$?
+  rc=0; crw_summary_blocks_fallback_clearance "$h40" || rc=$?
   [ "$rc" = "0" ] || bad="$bad other-head-not-refused(rc=$rc)"
   # Control: the same two comments, the summary naming THIS head. Refusing
   # here would stall every PR CodeRabbit chats on.
   fixture_summary="$marker
 Reviewing files that changed from the base of the PR and between $b40 and $h40."
-  rc=0; crw_summary_names_only_other_head "$h40" || rc=$?
+  rc=0; crw_summary_blocks_fallback_clearance "$h40" || rc=$?
   [ "$rc" = "1" ] || bad="$bad current-head-refused(rc=$rc)"
 
   # No summary comment at all: a definite "nothing here claims another commit",
   # which is what keeps the caller's other freshness tests deciding (AC3).
   fetch_api_array() { printf '[]\n'; }
-  rc=0; crw_summary_names_only_other_head "$h40" || rc=$?
+  rc=0; crw_summary_blocks_fallback_clearance "$h40" || rc=$?
   [ "$rc" = "1" ] || bad="$bad no-summary-not-1(rc=$rc)"
 
   # An UNREADABLE comment list is rc 3, never rc 1. Folding it into 1 is the
   # failed-read-as-clean confusion the neighbouring reads already refuse.
   fetch_api_array() { return 3; }
-  rc=0; crw_summary_names_only_other_head "$h40" || rc=$?
+  rc=0; crw_summary_blocks_fallback_clearance "$h40" || rc=$?
   [ "$rc" = "3" ] || bad="$bad unread-not-3(rc=$rc)"
 
   # A summary body that cannot be DERIVED is rc 3 too — the selector returns a
@@ -2084,7 +2098,7 @@ Reviewing files that changed from the base of the PR and between $b40 and $h40."
   crw_select_summary_comment() { printf 'not-base64-@@@\n'; }
   # stderr silenced: the decode failure this case induces is the point, and its
   # jq diagnostic would otherwise land in the middle of the suite's output.
-  rc=0; crw_summary_names_only_other_head "$h40" 2>/dev/null || rc=$?
+  rc=0; crw_summary_blocks_fallback_clearance "$h40" 2>/dev/null || rc=$?
   [ "$rc" = "3" ] || bad="$bad bad-derive-not-3(rc=$rc)"
 
   # Restore the extracted definitions this case stubbed over, so a later unit
@@ -2976,6 +2990,99 @@ test_919_pending_status_blocks_the_terminal_verdict() {
   fi
 }
 
+test_940_fallback_status_veto() {
+  local scenario state desc expected reason dir rc bad=""
+  while IFS='|' read -r scenario state desc expected reason; do
+    dir=$(make_case "940-$scenario-$state" 15 true 1 0)
+    enable_trust_status_context "$dir"
+    rc=$(CODERABBIT_TEST_STATUS="$state" CODERABBIT_TEST_STATUS_DESCRIPTION="$desc" run_case "$dir" "$scenario")
+    [ "$rc" = "$expected" ] || bad="$bad $scenario/$state-rc=$rc"
+    grep -q "$reason" "$dir/err.log" || bad="$bad $scenario/$state-no-reason"
+    if [ "$expected" = 4 ]; then
+      [ "$(jq -r '.status' "$dir/out.json")" = timeout ] || bad="$bad not-timeout"
+      [ "$(probe_count "$dir")" = 1 ] || bad="$bad no-terminal-probe"
+      grep -q 'post-probe terminal-review check:' "$dir/err.log" || bad="$bad no-terminal-check"
+      [ "$(jq -r '.codex_failover_requested' "$dir/out.json")" = false ] || bad="$bad invented-failover"
+    fi
+  done <<'EOF'
+fallback_summary|success|Review rate limited|4|non-completion description 'Review rate limited'
+fallback_summary|pending|Review in progress|4|is pending
+fallback_summary_during_probe|success|Review rate limited|4|non-completion description 'Review rate limited'
+fallback_summary_during_probe|pending|Review in progress|4|is pending
+fallback_summary|unreadable||3|could not read CodeRabbit fallback
+fallback_summary_during_probe|unreadable||4|could not be read
+EOF
+  if [ -z "$bad" ]; then
+    pass "#940: status refusals and unreadable evidence cannot clear via polling or its terminal upgrade"
+  else
+    fail "#940 fallback veto:$bad"
+  fi
+}
+
+test_940_fallback_authority_and_absence() {
+  local scenario state desc trust expected reads dir rc got_reads bad="" n=0
+  while IFS='|' read -r scenario state desc trust expected reads; do
+    n=$((n + 1))
+    dir=$(make_case "940-control-$n-$scenario-$state-$trust" 15 true 1 0)
+    [ "$trust" != true ] || enable_trust_status_context "$dir"
+    rc=$(CODERABBIT_TEST_STATUS="$state" CODERABBIT_TEST_STATUS_DESCRIPTION="$desc" run_case "$dir" "$scenario")
+    [ "$rc" = "$expected" ] || bad="$bad $scenario/$state-rc=$rc"
+    got_reads=0
+    [ ! -f "$dir/state/status-reads" ] || got_reads=$(wc -l <"$dir/state/status-reads" | tr -d ' ')
+    [ "$got_reads" = "$reads" ] || bad="$bad $scenario/$state-status-reads=$got_reads"
+  done <<'EOF'
+probe_review_on_head|pending||true|0|2
+probe_review_on_head|success|Review rate limited|true|0|2
+probe_clean_incremental|pending||true|0|2
+probe_clean_incremental|success|Review rate limited|true|0|2
+badge_only_inline_finding|pending||true|2|2
+badge_only_summary_finding|pending||true|2|2
+fallback_summary|absent||true|0|3
+fallback_summary|success||true|0|1
+fallback_summary|success|Review completed|true|0|1
+fallback_summary|failure||true|0|3
+fallback_summary|error||true|0|3
+fallback_summary|pending||false|0|0
+fallback_summary_during_probe|pending||false|0|0
+EOF
+  if [ -z "$bad" ]; then
+    pass "#940: findings, run/content authority, status absence and opt-out retain their outcomes and read cost"
+  else
+    fail "#940 authority controls:$bad"
+  fi
+}
+
+test_940_summary_escape_requires_completed_own_content() {
+  local dir rc body bad="" marker='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+  # Same current-head content after the status request still wins over pending.
+  body="$marker
+Reviewing files between aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and head-sha."
+  dir=$(make_case 940-terminal-content 15 true 1 0)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=pending CODERABBIT_TEST_FALLBACK_BODY="$body" run_case "$dir" fallback_summary_during_probe)
+  [ "$rc" = 0 ] && [ "$(probe_count "$dir")" = 1 ] || bad="$bad terminal-content=$rc"
+  # A head range inside an unrecognised outcome is not a completed summary.
+  body="$body
+<!-- This is an auto-generated comment: future outcome by coderabbit.ai -->"
+  dir=$(make_case 940-unknown-outcome 15 true 1 0)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=pending CODERABBIT_TEST_FALLBACK_BODY="$body" run_case "$dir" fallback_summary)
+  [ "$rc" = 4 ] || bad="$bad unknown-outcome=$rc"
+  # Preserve the existing specific other-head reason at the shared refusal site.
+  body="$marker
+Reviewing files between aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb."
+  dir=$(make_case 940-other-head-reason 15 true 1 0)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=pending CODERABBIT_TEST_FALLBACK_BODY="$body" run_case "$dir" fallback_summary)
+  [ "$rc" = 4 ] || bad="$bad other-head=$rc"
+  grep -q 'commits range names a different commit' "$dir/err.log" || bad="$bad lost-other-head-reason"
+  if [ -z "$bad" ]; then
+    pass "#940: completed own-summary content escapes at the terminal site; other refusals keep their reason"
+  else
+    fail "#940 summary content:$bad"
+  fi
+}
+
 test_936_unreadable_status_is_not_an_absent_status() {
   # Codex P1 on #936 head 18b1571. `check_status_context_record` serialized a
   # FAILED statuses read as `{state: "missing"}` — byte-identical to the record
@@ -3388,6 +3495,9 @@ test_878_waiter_tier_errors
 
 test_900_review_run_selector_ignores_bodyless_replies
 test_919_pending_status_blocks_the_terminal_verdict
+test_940_fallback_status_veto
+test_940_fallback_authority_and_absence
+test_940_summary_escape_requires_completed_own_content
 test_936_unreadable_status_is_not_an_absent_status
 test_891_probe_open_rate_limit_window_is_not_silence
 test_884_count_bodies_fails_closed_unit
