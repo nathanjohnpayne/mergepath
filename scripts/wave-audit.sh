@@ -45,6 +45,9 @@
 #   exit 7  feedback unaccounted. No reviewer ran and no tag is written.
 #           Never fan out: disposition the canary's earlier findings and
 #           rerun the same audit.
+#   exit 8  curated diff exceeds the configured byte budget. No reviewer
+#           is dispatched and no tag is written. Never fan out on this:
+#           the range needs bounded review, not another unavailable retry.
 #
 # Usage:
 #   scripts/wave-audit.sh <canary-pr> --repo <owner/repo>
@@ -386,16 +389,26 @@ emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
   jq -n \
     --arg base "$BASE_FULL" --arg head "$HEAD_FULL" --arg repo "$REPO" \
     --argjson pr "$PR" --argjson files "$FILES" --argjson bytes "$BYTES" \
+    --argjson limit "$DIFF_MAX" \
     --arg effort "$EFFORT" --argjson timeout "$TIMEOUT" \
     --argjson orch "$1" --argjson tagged "$2" --argjson skipped "$3" \
     --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" \
     '{base:$base, head:$head, repo:$repo, pr:$pr, scope_files:$files,
-      scope_bytes:$bytes, effort:$effort, timeout_seconds:$timeout,
+      scope_bytes:$bytes, diff_max_bytes:$limit, effort:$effort, timeout_seconds:$timeout,
       orchestrator_exit:$orch, watermark_advanced:$tagged, skipped:$skipped,
       dry_run:$dry}'
 }
 
 log "audit range ${BASE_FULL} .. ${HEAD_FULL} — ${FILES} file(s), ${BYTES} bytes in scope (effort=${EFFORT}, timeout=${TIMEOUT}s)"
+
+# The complete curated payload is already known. Refuse deterministic
+# overage before the orchestrator waits on providers or accounts feedback;
+# its transient-unavailability exit would only chain a larger range (#1186).
+if [ "$BYTES" -gt "$DIFF_MAX" ]; then
+  emit_json null false '"over-budget"'
+  log "audit scope exceeds the ${DIFF_MAX}-byte budget (${BYTES} bytes) — no reviewer dispatched and no watermark; do NOT fan out, this range needs bounded review before retrying"
+  exit 8
+fi
 
 if [ "$BYTES" -eq 0 ]; then
   # Only excluded-prefix (or no) content changed in the range: vacuously

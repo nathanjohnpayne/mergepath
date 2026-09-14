@@ -356,6 +356,36 @@ git -C "$REMOTE" tag -l 'wave-audit-pass/*' | while IFS= read -r t; do git -C "$
 run_wa "$POLICY_GOOD" reset 46 --repo owner/consumer --head-sha "$C2" >/dev/null 2>&1 \
   && fail "run without watermark or --base accepted" || { [ $? -eq 3 ] && pass "no watermark anywhere + no --base fails closed (exit 3)" || fail "wrong exit for missing base"; }
 
+# An oversized range is a deterministic refusal before provider waits and
+# feedback accounting, not a transient reviewer-unavailable result (#1186).
+echo "wave-audit.sh — pre-dispatch byte budget"
+awk 'BEGIN { for (i=0; i<600; i++) print "canonical audit budget fixture " i }' > "$CANON/scripts/large.sh"
+git -C "$CANON" add scripts/large.sh && git -C "$CANON" commit -qm oversized
+LARGE_HEAD="$(git -C "$CANON" rev-parse HEAD)"
+LARGE_BYTES="$(git -C "$CANON" diff "$C6..$LARGE_HEAD" -- scripts/ | wc -c | tr -d ' ')"
+POLICY_SMALL="$WORK/policy-small.yml"
+sed 's/diff_max_bytes: 800000/diff_max_bytes: 4096/' "$POLICY_GOOD" > "$POLICY_SMALL"
+for mode in operational dry-run; do
+  budget_args=()
+  [ "$mode" != dry-run ] || budget_args=(--dry-run)
+  rc=0
+  run_wa "$POLICY_SMALL" reset 66 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" "${budget_args[@]}" > "$WORK/budget.json" 2> "$WORK/budget.err" || rc=$?
+  [ "$rc" -eq 8 ] && pass "$mode over-budget returns distinct exit 8" || fail "$mode over-budget returned $rc"
+  [ ! -e "$CAPTURE/args" ] && pass "$mode over-budget never dispatches" || fail "$mode over-budget dispatched"
+  jq -e --argjson bytes "$LARGE_BYTES" '.skipped == "over-budget" and .orchestrator_exit == null and .watermark_advanced == false and .scope_bytes == $bytes and .diff_max_bytes == 4096' "$WORK/budget.json" >/dev/null \
+    && pass "$mode reports measured refusal" || fail "$mode refusal JSON incorrect"
+  [ -z "$(git -C "$CANON" tag -l "wave-audit-pass/$LARGE_HEAD")" ] \
+    && pass "$mode over-budget leaves local watermark untouched" || fail "$mode over-budget created local tag"
+  remote_has_tag "$LARGE_HEAD" && fail "$mode over-budget pushed watermark" || pass "$mode over-budget leaves remote watermark untouched"
+done
+
+# Equality remains eligible: mutate > to >= and this control fails.
+POLICY_EXACT="$WORK/policy-exact.yml"
+sed "s/diff_max_bytes: 800000/diff_max_bytes: $LARGE_BYTES/" "$POLICY_GOOD" > "$POLICY_EXACT"
+run_wa "$POLICY_EXACT" reset 67 --repo owner/consumer --base "$C6" --head-sha "$LARGE_HEAD" --dry-run >/dev/null \
+  && pass "exact-budget range remains eligible" || fail "exact-budget range refused"
+[ -e "$CAPTURE/args" ] && pass "exact-budget range dispatches" || fail "exact-budget range did not dispatch"
+
 echo
 echo "Summary: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
