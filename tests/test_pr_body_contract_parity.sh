@@ -379,6 +379,50 @@ g1192_rejects "a U+2003 line does not end a raw HTML block" \
 g1192_rejects "a U+00A0 line does not end a raw HTML block" \
   $'<div>\n \nAuthoring-Agent: claude\n</div>\n'
 
+# JavaScript's dot excludes U+2028/U+2029 even though CommonMark treats them
+# as list paragraph content. Octal escapes keep both separators visible here.
+for marker in '-' '1.'; do
+  g1192_rejects "$marker item preserves U+2028 paragraph content" \
+    "$marker "$'\342\200\250\nAuthoring-Agent: claude\n'
+  g1192_rejects "$marker item preserves U+2029 paragraph content" \
+    "$marker "$'\342\200\251\nAuthoring-Agent: claude\n'
+done
+
+# Five padding columns make the first list block indented code, not a lazy
+# paragraph. Hiding its following top-level marker can conceal a duplicate.
+for marker in '-' '*' '1.' '1)'; do
+  g1192_accepts "$marker code-first Unicode item leaves the next marker top-level" \
+    "$marker     "$' \nAuthoring-Agent: claude\n'
+  duplicate_body=$'Authoring-Agent: codex\n\n'"$marker     "$' \nAuthoring-Agent: claude\n'
+  got_count="$(pr_body_authoring_agent_count "$duplicate_body")"
+  got_agent="$(pr_body_authoring_agent "$duplicate_body")"
+  if [ "$got_count" = 2 ] && [ -z "$got_agent" ]; then
+    ok "#1192: $marker code-first Unicode item cannot hide a duplicate identity"
+  else
+    bad "#1192: $marker expected duplicate count=2 and no author, got $got_count/$got_agent"
+  fi
+done
+g1192_rejects "four list-padding spaces still open a Unicode paragraph" \
+  $'-     \nAuthoring-Agent: claude\n'
+g1192_rejects "one tab after a bullet still opens a Unicode paragraph" \
+  $'-\t \nAuthoring-Agent: claude\n'
+g1192_accepts "two tabs after a bullet open code instead of a paragraph" \
+  $'-\t\t \nAuthoring-Agent: claude\n'
+g1192_rejects "initial indentation affects the tab stop after a bullet" \
+  $'   -\t \nAuthoring-Agent: claude\n'
+g1192_rejects "one tab after an ordered marker opens a Unicode paragraph" \
+  $'1.\t \nAuthoring-Agent: claude\n'
+g1192_rejects "initial indentation affects the tab stop after an ordered marker" \
+  $'  1.\t \nAuthoring-Agent: claude\n'
+g1192_accepts "two tabs after a wider ordered marker open code" \
+  $'12.\t\t \nAuthoring-Agent: claude\n'
+g1192_accepts "two tabs after an indented ordered marker open code" \
+  $'  1.\t\t \nAuthoring-Agent: claude\n'
+g1192_accepts "U+2028 after five padding spaces stays code-first" \
+  $'-     \342\200\250\nAuthoring-Agent: claude\n'
+g1192_accepts "the same code-first padding rule applies to ordinary content" \
+  $'-     text\nAuthoring-Agent: claude\n'
+
 # The other half of the same guarantee: a REAL blank line must still do exactly
 # what CommonMark says, so the fix cannot have been "reject everything". These
 # are the shapes above with the separator replaced by a genuine blank; cmark-gfm
