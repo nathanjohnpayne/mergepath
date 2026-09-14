@@ -306,6 +306,11 @@ CODEX_BIN=/path/to/fake-codex \
 
 `--dry-run` reads and validates the PR body, then performs selection + adapter
 dispatch + verdict validation, and prints the intended action without posting.
+Its final JSON adds `validated_verdict` only for a dry run: the complete,
+schema-validated adapter verdict, including its summary, findings, and
+normalized usage. This lets a caller classify the result before any publisher
+acts. Real-run JSON retains its existing summary shape and never includes this
+field.
 The offline recipe explicitly replaces the live review-feedback accounting read
 with `true`; real dry-runs keep that gate enabled so they cannot spend a
 reviewer round while older feedback is unaccounted. Adapter CLIs are injectable
