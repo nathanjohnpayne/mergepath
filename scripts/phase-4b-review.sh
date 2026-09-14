@@ -1424,8 +1424,8 @@ acknowledge_approval() {
   # Accounting deliberately requires a strictly later GitHub second. The
   # review POST has completed, so wait a second before the acknowledgment POST.
   sleep 1
-  if env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" "$GH_AS_REVIEWER" -- \
-    gh api "repos/$REPO/issues/$PR/comments" --method POST --input "$payload_file" >/dev/null; then
+  if env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" \
+    "$GH_AS_REVIEWER" -- gh api "repos/$REPO/issues/$PR/comments" --method POST --input "$payload_file" >/dev/null; then
     post_rc=0
   else
     post_rc=$?
