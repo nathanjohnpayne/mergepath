@@ -67,7 +67,8 @@
 # Exit codes:
 #   0  APPROVED — review posted (or would post under --dry-run).
 #   1  CHANGES_REQUESTED — review posted; the author must address findings.
-#   3  usage / infrastructure error.
+#   3  usage / infrastructure error; after an approval POST, acknowledgment
+#      failure retains review_posted:true (do not repeat the review).
 #   4  fell back to the manual handoff (adapter error/timeout, invalid
 #      verdict, or no adapter for the selected reviewer). The chat-side
 #      block from scripts/post-phase-4b-handoff.sh is emitted on stderr.
@@ -1367,11 +1368,66 @@ post_review() {
   set -e
   rm -f "$payload_file"
   [ "$review_rc" -eq 0 ] || { p4b_acct_mark_unposted "review POST failed (gh exit $review_rc)"; return "$review_rc"; }
+  POSTED_REVIEW_ID="$(printf '%s' "$review_response" | jq -r '.id // empty' 2>/dev/null || true)"
   created_commit="$(printf '%s' "$review_response" | jq -r '.commit_id // empty' 2>/dev/null || true)"
   [ "$created_commit" = "$HEAD" ] || { p4b_acct_mark_unposted "created review not pinned to reviewed head"; p4b_die 3 "created review was not pinned to reviewed head (expected $HEAD, got ${created_commit:-unknown})"; }
 }
 
+# Account only for this invocation's APPROVED body. Its optional findings
+# already passed step 9; prior/unrelated findings and CHANGES_REQUESTED still
+# need their own dispositions. Let the existing gate supply the token rather
+# than duplicating its classification, JSON fingerprint, or evidence rules.
+acknowledge_approval() {
+  local accounting accounting_rc missing token payload_file post_rc
+  if accounting=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO"); then
+    return 0
+  else
+    accounting_rc=$?
+  fi
+  [ "$accounting_rc" = 1 ] || return 1
+  case "$POSTED_REVIEW_ID" in ''|*[!0-9]*) return 1 ;; esac
+  missing=$(printf '%s' "$accounting" | jq -c --arg id "$POSTED_REVIEW_ID" '
+    [.missing[] | select(.kind == "review-body" and (.review_id | tostring) == $id)]') || return 1
+  [ "$missing" != '[]' ] || return 0
+  # A review edit does not move its id. Never acknowledge a body the adapter
+  # did not produce, including edits consisting only of trailing newlines.
+  token=$(printf '%s' "$missing" | jq -er --rawfile body "$BODY_FILE" '
+    if length == 1 and .[0].body == $body then .[0].ack_token else empty end') || return 1
+  payload_file=$(mktemp "${TMPDIR:-/tmp}/p4b-approval-ack.XXXXXX") || return 1
+  jq -n --arg token "$token" --arg refs "$POST_REVIEW_ISSUE_REFS" '
+    {body: ($token + "\n\nThis APPROVED review has no required-tier findings. " +
+      (if $refs == "" then "No advisory findings required follow-up issues."
+       else "Follow-up issues filed before approval: " + $refs + "." end))}' \
+    > "$payload_file" || { rm -f "$payload_file"; return 1; }
+  # Accounting deliberately requires a strictly later GitHub second. The
+  # review POST has completed, so wait a second before the acknowledgment POST.
+  sleep 1
+  if env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" "$GH_AS_REVIEWER" -- \
+    gh api "repos/$REPO/issues/$PR/comments" --method POST --input "$payload_file" >/dev/null; then
+    post_rc=0
+  else
+    post_rc=$?
+  fi
+  rm -f "$payload_file"
+  [ "$post_rc" = 0 ] || return 1
+  # This readback re-reads GitHub's comments and applies identity, body and
+  # timestamp rules. Other findings arriving meanwhile do not authorize us to
+  # acknowledge them and do not invalidate evidence for this exact review.
+  if accounting=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO"); then
+    accounting_rc=0
+  else
+    accounting_rc=$?
+  fi
+  [ "$accounting_rc" -le 1 ] || return 1
+  printf '%s' "$accounting" | jq -e --arg id "$POSTED_REVIEW_ID" --rawfile body "$BODY_FILE" '
+    any(.findings[]; .kind == "review-body" and (.review_id | tostring) == $id
+      and .body == $body and .accounted == true)' >/dev/null || return 1
+  REVIEW_ACKNOWLEDGMENT=accounted
+}
+
 REVIEW_POSTED=false
+POSTED_REVIEW_ID=""
+REVIEW_ACKNOWLEDGMENT=not-needed
 EXIT_CODE=0
 case "$VERDICT" in
   APPROVED)
@@ -1386,8 +1442,12 @@ case "$VERDICT" in
         p4b_acct_hook_commit_posted_record || true
       fi
       p4b_log "posted APPROVED as $REVIEWER — Phase 4b substitute clearance is now on HEAD"
+      if ! acknowledge_approval; then
+        REVIEW_ACKNOWLEDGMENT=failed
+        EXIT_CODE=3
+        p4b_warn "approval review $POSTED_REVIEW_ID was posted, but its acknowledgment could not be verified; account for that review without repeating the review run"
+      fi
     fi
-    EXIT_CODE=0
     ;;
   CHANGES_REQUESTED)
     if [ "$DRY_RUN" = true ]; then
@@ -1414,6 +1474,7 @@ jq -n \
   --arg adapter "$ADAPTER" \
   --arg verdict "$VERDICT" \
   --argjson review_posted "$REVIEW_POSTED" \
+  --arg review_acknowledgment "$REVIEW_ACKNOWLEDGMENT" \
   --argjson dry_run "$DRY_RUN" \
   --arg token_count "${TOKEN_COUNT:-}" \
   --arg usage_source "$USAGE_SOURCE" \
@@ -1430,6 +1491,7 @@ jq -n \
     adapter: $adapter,
     verdict: $verdict,
     review_posted: $review_posted,
+    review_acknowledgment: $review_acknowledgment,
     dry_run: $dry_run,
     findings_count: $findings_count,
     adapter_timeout_seconds: $adapter_timeout,

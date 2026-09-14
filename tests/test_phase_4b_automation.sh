@@ -545,6 +545,157 @@ exit 64
 SH
 chmod +x "$BIN/fake-gh-as-author"
 
+# --- #1261 approval acknowledgment regression -------------------------------
+# This stub is clear before posting and inventories the actual review payload
+# afterwards. It also requires the production fingerprint encoding (including
+# trailing newlines), so an acknowledgment of another body cannot pass.
+cat > "$WORK/approval-accounting.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${P4B_ACK_REAL_GATE:-}" = true ]; then
+  PATH="$P4B_ACK_GATE_BIN:$PATH" REVIEW_FEEDBACK_ACCOUNTING_CONFIG="$P4B_ACK_POLICY" \
+    GH_TOKEN=fixture-token exec "$P4B_ACK_GATE_SCRIPT" "$@"
+fi
+if [ ! -s "$P4B_ACK_REVIEW" ]; then
+  printf '{"findings":[],"missing":[]}'
+  exit 0
+fi
+[ "${P4B_ACK_READ_FAIL:-}" != true ] || exit 2
+body_json=$(jq -c '.body' "$P4B_ACK_REVIEW")
+[ "${P4B_ACK_EDIT_BODY:-}" != true ] || body_json=$(printf '%s' "$body_json" | jq -c '. + "\nEdited finding"')
+fp=$(printf '%s' "$body_json" | shasum -a 256 | cut -c1-12)
+token="[mergepath-review-ack: 1 $fp]"
+accounted=false
+if [ -s "$P4B_ACK_COMMENT" ]; then
+  if jq -e --arg token "$token" '.body | startswith($token + "\n")' "$P4B_ACK_COMMENT" >/dev/null; then
+    accounted=true
+  fi
+fi
+jq -n --argjson body "$body_json" --arg token "$token" --argjson accounted "$accounted" '
+  {kind:"review-body", review_id:1, commit_id:"abc123", body:$body, ack_token:$token, accounted:$accounted} as $f
+  | {findings:[$f],missing:([$f] | map(select(.accounted == false)))}'
+[ "$accounted" = true ]
+SH
+chmod +x "$WORK/approval-accounting.sh"
+cat > "$WORK/approval-reviewer.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+endpoint=${4:?}
+shift 4
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --input ]; then
+    case "$endpoint" in
+      */reviews)
+        jq --arg submitted "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          '. + {submitted_at:$submitted}' "$2" > "$P4B_ACK_REVIEW"
+        printf '{"id":1,"commit_id":"abc123"}'
+        ;;
+      */comments)
+        [ "${P4B_ACK_POST_FAIL:-}" != true ] || exit 1
+        created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        [ "${P4B_ACK_SAME_SECOND:-}" != true ] || created=$(jq -r '.submitted_at' "$P4B_ACK_REVIEW")
+        jq --arg created "$created" --arg login "$GH_AS_REVIEWER_IDENTITY" \
+          '. + {id:2,created_at:$created,user:{login:$login}}' "$2" > "$P4B_ACK_COMMENT"
+        printf '%s' "$GH_AS_REVIEWER_IDENTITY" > "$P4B_ACK_IDENTITY"
+        printf '{"id":2}'
+        ;;
+      *) exit 64 ;;
+    esac
+    exit 0
+  fi
+  shift
+done
+exit 64
+SH
+chmod +x "$WORK/approval-reviewer.sh"
+
+mkdir -p "$WORK/approval-accounting-bin"
+cat > "$WORK/approval-accounting-bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+endpoint=""
+for arg in "$@"; do case "$arg" in repos/*) endpoint="$arg" ;; esac; done
+case "$endpoint" in
+  repos/o/r/pulls/1261/comments) printf '[]' ;;
+  repos/o/r/pulls/1261/reviews)
+    if [ -s "$P4B_ACK_REVIEW" ]; then
+      jq '[. + {id:1,user:{login:"nathanpayne-codex"},state:"APPROVED"}]' "$P4B_ACK_REVIEW"
+    else printf '[]'; fi
+    ;;
+  repos/o/r/issues/1261/comments)
+    if [ -s "$P4B_ACK_COMMENT" ]; then jq '[.]' "$P4B_ACK_COMMENT"; else printf '[]'; fi
+    ;;
+  repos/o/r/pulls/1261)
+    printf '{"head":{"repo":{"id":1}},"base":{"repo":{"id":1}}}' ;;
+  *) echo "unexpected approval accounting endpoint: $endpoint" >&2; exit 2 ;;
+esac
+SH
+chmod +x "$WORK/approval-accounting-bin/gh"
+
+run_approval_ack_case() {
+  local scenario="$1" adapter="$2" author="$3"; shift 3
+  local -a extra_args=()
+  [ "$scenario" != dry-run ] || extra_args=(--dry-run)
+  P4B_ACK_CASE="$WORK/approval-ack-$scenario"
+  mkdir -p "$P4B_ACK_CASE"
+  set +e
+  out=$(env PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+    MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$WORK/approval-accounting.sh" \
+    CODEX_BIN="$BIN/$adapter" CLAUDE_BIN="$BIN/$adapter" \
+    P4B_FAKE_PR_BODY_AGENT="$author" \
+    P4B_GH_AS_REVIEWER="$WORK/approval-reviewer.sh" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
+    P4B_ISSUE_LOG="$P4B_ACK_CASE/issues" P4B_ACCT_STATE_DIR="$P4B_ACK_CASE/accounting" \
+    P4B_ACK_REVIEW="$P4B_ACK_CASE/review.json" P4B_ACK_COMMENT="$P4B_ACK_CASE/comment.json" \
+    P4B_ACK_IDENTITY="$P4B_ACK_CASE/identity" P4B_ACK_POLICY="$POLICY_ON" \
+    P4B_ACK_GATE_BIN="$WORK/approval-accounting-bin" \
+    P4B_ACK_GATE_SCRIPT="$ROOT/scripts/review-feedback-accounting.sh" "$@" \
+    bash "$ORCH" 1261 --repo o/r --author "$author" --head abc123 --diff-file "$DIFF" "${extra_args[@]}" \
+    2>"$P4B_ACK_CASE/stderr")
+  rc=$?
+  set -e
+}
+
+run_approval_ack_case approved fake-codex-approve-p2 claude
+if [ "$rc" = 0 ] && [ -s "$P4B_ACK_CASE/comment.json" ] \
+   && [ "$(cat "$P4B_ACK_CASE/identity")" = nathanpayne-codex ] \
+   && grep -q 'issue create' "$P4B_ACK_CASE/issues"; then
+  pass "#1261: an approved advisory review is acknowledged under its reviewer identity after issue filing"
+else
+  fail "#1261: approval leaves an accounting obligation (rc=$rc; $out)"
+fi
+
+run_approval_ack_case changes fake-claude-changes codex
+if [ "$rc" = 1 ] && [ -s "$P4B_ACK_CASE/review.json" ] && [ ! -e "$P4B_ACK_CASE/comment.json" ]; then
+  pass "#1261: CHANGES_REQUESTED findings are never automatically acknowledged"
+else fail "#1261: changes-requested review was acknowledged (rc=$rc; $out)"; fi
+
+for failure in POST_FAIL READ_FAIL EDIT_BODY; do
+  run_approval_ack_case "$failure" fake-codex-approve-p2 claude "P4B_ACK_$failure=true"
+  if [ "$rc" = 3 ] && printf '%s' "$out" | jq -e '.review_posted == true and .review_acknowledgment == "failed"' >/dev/null; then
+    pass "#1261: $failure reports failure without erasing the posted approval"
+  else fail "#1261: $failure lost post-state or claimed success (rc=$rc; $out)"; fi
+  if [ "$failure" = EDIT_BODY ] && [ -e "$P4B_ACK_CASE/comment.json" ]; then
+    fail "#1261: body changed after posting was acknowledged"
+  fi
+done
+run_approval_ack_case dry-run fake-codex-approve-p2 claude
+if [ "$rc" = 0 ] && [ ! -e "$P4B_ACK_CASE/comment.json" ] && [ ! -e "$P4B_ACK_CASE/review.json" ]; then
+  pass "#1261: dry-run posts neither review nor acknowledgment"
+else fail "#1261: dry-run wrote a review or acknowledgment (rc=$rc; $out)"; fi
+
+run_approval_ack_case real-accounting fake-codex-approve-p2 claude P4B_ACK_REAL_GATE=true
+if [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.review_acknowledgment == "accounted"' >/dev/null; then
+  pass "#1261: real accounting accepts the exact body, reviewer identity and strictly later acknowledgment"
+else fail "#1261: real accounting rejected the acknowledgment (rc=$rc; $out; $(cat "$P4B_ACK_CASE/stderr"))"; fi
+
+run_approval_ack_case same-second fake-codex-approve-p2 claude P4B_ACK_REAL_GATE=true P4B_ACK_SAME_SECOND=true
+if [ "$rc" = 3 ] && [ -s "$P4B_ACK_CASE/comment.json" ] \
+   && printf '%s' "$out" | jq -e '.review_posted == true and .review_acknowledgment == "failed"' >/dev/null; then
+  pass "#1261: a same-second acknowledgment cannot pass the existing accounting rule"
+else fail "#1261: timestamp readback failed to enforce the accounting rule (rc=$rc; $out)"; fi
+
+# --- end #1261 approval acknowledgment regression ---------------------------
+
 # ===========================================================================
 echo "lib.sh — reviewer selection"
 # ===========================================================================

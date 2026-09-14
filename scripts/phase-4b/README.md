@@ -111,6 +111,8 @@ Covered by `tests/test_phase_4b_accounting.sh` via
 `plans/automated-phase-4b-handoff.md` § 17 and the reconciled spec
 `plans/issue-602-phase-4b-accounting-SPEC.md`.
 
+After posting an approval, the orchestrator acknowledges its exact review body when the feedback-accounting gate requires it (#1261). It uses the gate's emitted token under the selected reviewer identity and verifies the resulting accounting evidence. Optional findings already have the step-9 dispositions recorded above. Changes-requested, unrelated, and edited bodies are not automatically acknowledged. An acknowledgment failure exits `3` while reporting `review_posted: true` and `review_acknowledgment: "failed"`; repair that review's acknowledgment rather than repeating the review run.
+
 ## How it plugs in (no merge-gate changes)
 
 The orchestrator posts an `APPROVED` review on the current HEAD under a
