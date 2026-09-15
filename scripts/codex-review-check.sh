@@ -2428,6 +2428,67 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   fi
 fi
 
+# BEGIN codex_request_diagnostics
+crc_select_head_review() { # reviews-json bot head
+  printf '%s\n' "$1" | jq --arg bot "$2" --arg sha "$3" '
+    [.[] | select(.user.login == $bot) | select(.commit_id == $sha)]
+    | max_by(.submitted_at) // null
+  '
+}
+
+# Called only after an ordinary opted-in external gate has already blocked.
+# It reports observations, never clearance or an active waiter's remaining time.
+crc_request_evidence() {
+  [ "${CODEX_REVIEW_CHECK_REPORT_REQUEST_EVIDENCE:-0}" = 1 ] || return 0
+  [ "$DIAGNOSTIC_SIGNAL_ONLY" = 0 ] && [ "$APPROVAL_READINESS_ONLY" = 0 ] || return 0
+  [ "$CODEX_ENABLED" = true ] || return 0
+  if ! ( crc_render_request_evidence ); then
+    log "request evidence: unknown (diagnostic evidence could not be read); BLOCKED is unchanged"
+  fi
+}
+
+crc_render_request_evidence() {
+  # Optional during propagation skew. Failure cannot change the blocked verdict.
+  [ -r "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" ] || return 1
+  # shellcheck source=lib/codex-request-evidence.sh
+  . "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" || return 1
+  local trigger id posted age reactions ack=unknown provider=none review budget ack_budget
+  trigger=$(crqe_select_trigger "$ISSUE_COMMENTS_JSON" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
+  review=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA") || return 1
+  log "request evidence (informational; BLOCKED unchanged):"
+  # Independent observations: an older terminal artifact must not hide a newer run.
+  if [ -n "$CODEX_BLOCKED_REASON" ]; then
+    provider=observed
+    log "request evidence: account block observed: $CODEX_BLOCKED_REASON; inspect the provider block"
+  fi
+  if [ "$review" != null ] || [ -n "$CODEX_HEAD_VERDICT_ANY_TIME" ]; then
+    provider=observed
+    log "request evidence: current-head terminal artifact observed; inspect the unmet clearance requirement"
+  fi
+  if [ -n "$CODEX_SUMMARY_STATUS" ]; then
+    provider=observed
+    log "request evidence: current-head $CODEX_SUMMARY_STATUS summary observed at $CODEX_SUMMARY_TIME; monitor provider progress"
+  fi
+  if [ "$trigger" = null ]; then
+    log "request evidence: no freshness-qualified author trigger since $REACTION_THRESHOLD (not proof that no review is in flight)"
+    [ "$provider" != none ] || log "request evidence: no matching provider activity observed; request review through codex-review-request.sh if required"
+    return 0
+  fi
+  id=$(printf '%s' "$trigger" | jq -r '.id // empty') || return 1
+  posted=$(printf '%s' "$trigger" | jq -r '.created_at') || return 1
+  age=$(jq -nr --arg t "$posted" 'now - ($t | fromdateiso8601) | floor | if . < 0 then error("future request") else . end' 2>/dev/null) || age=unknown
+  if [[ "$id" =~ ^[0-9]+$ ]] && reactions=$(gh_api_array "repos/$REPO/issues/comments/$id/reactions" "trigger acknowledgements"); then
+    ack=$(crqe_ack_present "$reactions" "$BOT_LOGIN" "$posted") || ack=unknown
+  fi
+  budget=$(codex_field review_timeout_seconds); ack_budget=$(codex_field ack_wait_seconds)
+  [[ "$budget" =~ ^[0-9]+$ ]] || budget=unknown
+  [[ "$ack_budget" =~ ^[0-9]+$ ]] || ack_budget=unknown
+  log "request evidence: freshness-qualified author trigger #${id:-unknown} at $posted (anchor $REACTION_THRESHOLD; not immutable SHA attribution)"
+  log "request evidence: linked eyes acknowledgement=$ack; age=${age}s; configured ack_wait_seconds=$ack_budget; review_timeout_seconds=$budget"
+  log "request evidence: age is not an active waiter or remaining retry budget; inspect the configured timeout/fallback if exhausted"
+}
+# END codex_request_diagnostics
+
 # --- gate (b): reviewer identity approval ----------------------------------
 
 log "gate (b): checking for latest-state APPROVED review from a reviewer identity"
@@ -2573,6 +2634,7 @@ if [ -z "$APPROVING_REVIEWER" ]; then
     if [ "$APPROVAL_READINESS_ONLY" = "1" ]; then
       fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review on current HEAD $HEAD_SHA"
     fi
+    crc_request_evidence
     fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review, and same-agent + Codex 👍 fallback (branch 2) did not apply (codex.enabled=$CODEX_ENABLED; Authoring-Agent: ${AUTHORING_AGENT:-not set}; matched reviewer: ${SAME_AGENT_REVIEWER:-none}; threshold: $REACTION_THRESHOLD)"
   fi
 else
@@ -2603,11 +2665,7 @@ if [ "$CODEX_ENABLED" = "true" ]; then
 
 # Latest Codex review on the current HEAD commit (if any). Codex always
 # uses COMMENTED state regardless of findings — do NOT filter on state.
-CODEX_REVIEW=$(echo "$REVIEWS_JSON" | jq \
-  --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
-  [.[] | select(.user.login == $bot) | select(.commit_id == $sha)]
-  | max_by(.submitted_at) // null
-')
+CODEX_REVIEW=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA")
 
 # If a Codex review on HEAD exists, extract its id for filtering inline
 # comments down to THAT REVIEW ONLY. Older reviews on the same HEAD
@@ -2940,6 +2998,7 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
 fi
 
 if [ "$CLEARED" != "true" ]; then
+  crc_request_evidence
   # #722: when a fresh account-/connection-level block was detected above,
   # name it in the failure message so the human/agent reads the real cause
   # (quota exhausted / App not connected → a human must act) instead of

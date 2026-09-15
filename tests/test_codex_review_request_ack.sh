@@ -58,6 +58,7 @@ make_case() {
   # #1008: the array twin, hard-sourced for the same reason — every signal
   # the poll loop scans for arrives through it.
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"
+  cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
   cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF

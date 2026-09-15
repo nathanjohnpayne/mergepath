@@ -41,6 +41,7 @@ make_case() {
   chmod +x "$dir/scripts/codex-review-request.sh"
   cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
+  cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 author_identity: nathanjohnpayne
@@ -116,6 +117,16 @@ run_trigger_only() {
 
 trig_count() { if [ -f "$1/state/trigger-count" ]; then cat "$1/state/trigger-count"; else printf '0\n'; fi; }
 jqf() { jq -r "$2" "$1/out.json"; }
+
+# #1276: losing the shared selector cannot turn a known trigger into a new POST.
+dir=$(make_case missing-selector)
+mv "$dir/scripts/lib/codex-request-evidence.sh" "$dir/helper-removed.sh"
+rc=$(run_trigger_only "$dir" dup_author)
+if [ "$rc" = 3 ] && [ "$(trig_count "$dir")" = 0 ] && grep -q 'request evidence helper unavailable' "$dir/err.log"; then
+  pass "#1276: missing selector fails before a duplicate trigger can be posted"
+else
+  fail "#1276: missing selector rc=$rc posts=$(trig_count "$dir")"
+fi
 
 # A: fresh HEAD → posts once, exits 0, no poll, no ack-retry (#3), JSON shape
 test_fresh_posts_once_no_poll() {
