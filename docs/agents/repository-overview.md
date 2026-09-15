@@ -4,4 +4,6 @@ This repository is **Mergepath**, the reference implementation of the AI Agent T
 
 Primary stack: Markdown documentation, shell automation, YAML review-policy configuration, and the Mergepath Playground (static HTML + JS at `mergepath/playground/`). Agent role: maintain Mergepath's structure, the review-policy tooling and Playground, and the supporting developer workflows — ensuring documentation and tooling behavior do not drift over time. See [`BRAND.md`](../../BRAND.md) at repo root for the umbrella vocabulary.
 
+The shared pull-request body parser and its standalone generated runtime are specified in [`specs/pr_body_contract.md`](../../specs/pr_body_contract.md).
+
 `scripts/ci/check_doc_ownership` is a fail-closed repository-integrity check. It validates the `doc_ownership` inventory and verifies that canonical agent documentation does not contain rendered relative links to hub-only documentation that consumers do not receive. Its Markdown extraction contract is defined in [`specs/doc_ownership_validation.md`](../../specs/doc_ownership_validation.md) and covered by `tests/test_check_doc_ownership.sh`.
