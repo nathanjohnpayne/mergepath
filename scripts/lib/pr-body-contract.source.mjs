@@ -11,6 +11,10 @@ const AUTHORING_AGENT_RE = /^Authoring-Agent:\s*(.*?)\s*$/i;
 const SELF_REVIEW_RE = /^##[ \t]+Self-Review(?:[ \t]+#*)?[ \t]*$/i;
 const CONTAINERS = new Set(['blockquote', 'list', 'listItem']);
 
+function rawLines(body) {
+  return body.split(/\r\n|\r|\n/);
+}
+
 function gfmMembershipExtensions() {
   // This CLI reads source positions and block membership; it never renders or
   // consumes GFM's rewritten inline link nodes. Keep every GFM tokenizer and
@@ -67,12 +71,12 @@ function visibleLinesAfterComments(body, lines, entries) {
       for (let line = position.start.line; line <= position.end.line; line += 1) discardLines.add(line);
     }
   }
-  const visibleLines = characters.join('').split(/\r?\n/);
+  const visibleLines = rawLines(characters.join(''));
   return visibleLines.map((line, index) => discardLines.has(index + 1) ? null : line);
 }
 
 export function parsePrBodyContract(body) {
-  const lines = body.split(/\r?\n/);
+  const lines = rawLines(body);
   const entries = collect(fromMarkdown(body, {
     extensions: [gfm()],
     mdastExtensions: gfmMembershipExtensions(),

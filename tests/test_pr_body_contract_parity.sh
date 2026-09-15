@@ -941,6 +941,22 @@ renderer_contract "malformed multiline heading comment is not an exact heading" 
   '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
   $'Authoring-Agent: codex\n## Self-Review <!-- a\nb -->\n'
 
+# mdast counts CR, CRLF and LF as line boundaries. The raw marker and
+# comment-visible line views must use the same boundary so source positions
+# cannot bind a nested marker to an earlier top-level text node.
+renderer_contract "LF line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "CRLF line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\r\n\r\n## Self-Review\r\n'
+renderer_contract "lone CR line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\r\r## Self-Review\r'
+renderer_contract "lone CR lines keep a lazy quoted declaration nested" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'## Self-Review\n\nfoo\rbar\rbaz\n> quote\nAuthoring-Agent: codex'
+
 # A deep, real Markdown container must not make the AST traversal exhaust the
 # JavaScript call stack. The Authoring-Agent declaration remains inside the
 # blockquote; the blank line leaves the Self-Review heading top-level.
