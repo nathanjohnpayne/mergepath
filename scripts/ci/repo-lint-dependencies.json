@@ -27,6 +27,12 @@
       "scripts/lib/ci-check-modes.sh",
       "tests/test_check_doc_ownership.sh"
     ],
+    "check_gh_as_author": [
+      "scripts/lib/pr-body-contract.mjs",
+      "scripts/lib/pr-body-contract.source.mjs",
+      "scripts/lib/pr-body-contract.bundle/*",
+      "tests/test_pr_body_contract_parity.sh"
+    ],
     "check_auto_clear_workflow": [
       ".github/workflows/agent-review.yml",
       ".github/workflows/auto-clear-blocking-labels.yml",
