@@ -3836,7 +3836,7 @@ crw_summary_risk_names_other_head() { # body head-sha
 # crw_summary_blocks_fallback_clearance <head-sha>
 crw_summary_blocks_fallback_clearance() {
   local head_sha=${1:?}
-  local issue_comments summary sbody="" rc=0 rec state desc
+  local issue_comments summary sbody="" rc=0 marker_rc=0 rec state desc
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
     || return 3
   summary=$(crw_select_summary_comment "$issue_comments" "$BOT_LOGIN" "$SUMMARY_MARKER") \
@@ -3865,8 +3865,20 @@ crw_summary_blocks_fallback_clearance() {
   # veto in polling. Ordinary --probe retains its own #919 pending behavior.
   if [ -n "$sbody" ] && [ "$(classify_comment "$sbody")" = review ] \
      && summary_stanzas_all_benign "$sbody"; then
-    rc=0; summary_names_head "$sbody" "$head_sha" || rc=$?
-    case "$rc" in 0) return 1 ;; 1) ;; *) return 3 ;; esac
+    # A current-head summary with a blocking marker is not clean completion
+    # evidence. It must reach the trusted-status veto below rather than use the
+    # #851 escape just because the head-anchored polling scan aged it out.
+    # Keep the marker reader's third outcome explicit: an extraction failure is
+    # not absence and cannot become an escape through shell's `!` inversion.
+    marker_rc=0; summary_blocking_marker_present "$sbody" || marker_rc=$?
+    case "$marker_rc" in
+      0) : ;; # Marker present: do not grant the completed-summary escape.
+      1)
+        rc=0; summary_names_head "$sbody" "$head_sha" || rc=$?
+        case "$rc" in 0) return 1 ;; 1) ;; *) return 3 ;; esac
+        ;;
+      *) return 3 ;;
+    esac
   fi
   rec=$(check_status_context_record) || return 3
   state=$(crw_status_record_state "$rec")
