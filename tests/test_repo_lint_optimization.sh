@@ -114,6 +114,16 @@ else
     fail "declared dependencies must select their owning wrappers (got $selected)"
   fi
 
+  # #1276: independent helper/test changes must reach the real blocked-evidence suite.
+  for evidence_path in scripts/lib/codex-request-evidence.sh tests/test_codex_request_evidence.sh; do
+    selected=$(scope_value checks pull_request "$evidence_path")
+    if jq -e 'index("check_codex_scripts") != null' <<<"$selected" >/dev/null; then
+      pass "$evidence_path selects the Codex wrapper"
+    else
+      fail "$evidence_path omitted the Codex wrapper (selected=$selected)"
+    fi
+  done
+
   selected=$(scope_value checks pull_request scripts/lib/ci-check-modes.sh)
   # DERIVED from the tree, not hardcoded. The assertion's intent is "every
   # wrapper that sources the helper is selected", and a fixed list of six
