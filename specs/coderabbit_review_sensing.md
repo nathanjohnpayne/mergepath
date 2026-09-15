@@ -12,6 +12,14 @@ Every consumer handles that failure during the same evaluation: the waiter and f
 
 The migration includes nested waiter predicates and clean-run selection, not only direct callers. Internal classifier failure remains distinguishable from the clean-run selector's existing review-list failure: the latter may still let independently read summary evidence decide under the existing contract, whereas unread tier evidence cannot establish a clean run or use that fallback. The existing raw-body fallback on structural-sanitizer failure is preserved; failure to classify that raw body is an error. No marker grammar, quotation, terminality, publication provenance or archive-recovery policy changes are implied.
 
+### Polling timeout after a notice-less rate-limit refusal (#940)
+
+At the existing polling timeout boundary, the pause latch and post-status-question terminal-review decision retain their precedence. If neither produces a verdict, a fresh trusted per-head CodeRabbit status of `success` with the exact description `Review rate limited` (case and surrounding whitespace normalized) produces exit 5 / `rate_limit_stalled` and attempts the existing #489 Codex failover once. The result records whether that attempt succeeded; an opted-out or failed request still reports the rate-limit stall with `codex_failover_requested: false`. The status evidence retains its source creation time.
+
+This is a terminal disposition, not an early trigger: the existing polling and status-question budgets are unchanged. No CodeRabbit retry is scheduled without a published window. The new observation uses the configured bot/context and current head through the existing status reader; it does not latch an earlier refusal after the provider recovers. Missing or unreadable status, disabled status trust, pending/failure/error states, and any other description retain the previous timeout result on this path. Ordinary `--probe`, notice-driven retries, findings and clean-run precedence, the #851 completed own-summary escape, and the existing review-list failure fallback are unchanged.
+
+Acceptance covers the no-artifact and refreshed-walkthrough reproductions, failover opt-out/failure/idempotence, recovered and unreadable terminal observations, preserved earlier verdicts, and a mutation that restores rc 4 when the terminal refusal check is removed.
+
 ### Probe rc-7 evidence contract
 
 - rc 7 (PROBE_NO_REVIEW) is `--probe`-only: no terminal signal on this head; `probe.observed` names the surface the scan landed on (`none | rate_limit | paused | in_progress | summary-without-head-review | awaiting-summary`), and the JSON may still carry head-anchored evidence for the barrier to weigh. Polling mode never exits 7.

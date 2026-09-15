@@ -294,8 +294,9 @@
 #   3   API / infrastructure error. Error on stderr.
 #   4   Timeout — max_wait_seconds elapsed without a real review. Caller
 #       may log a warning and proceed (CodeRabbit is advisory), or block.
-#   5   Rate-limit stalled — max_rate_limit_retries exceeded. Distinct
-#       from timeout so callers can alert the human instead of proceeding.
+#   5   Rate-limit stalled — retry/window budget exhausted, or a trusted
+#       notice-less refusal remains at timeout (#940). Distinct from timeout
+#       so callers can alert the human when Codex failover did not engage.
 #   6   Auto-review skipped and not (re-)invocable. Either the static
 #       skip — base branch ∉ base_branches, or draft when drafts:false —
 #       or an auto-pause whose `@coderabbitai resume` retries are
@@ -995,12 +996,18 @@ fetch_api_array_best_effort() {
 # field. Nothing else is stripped: trailing punctuation or an appended clause
 # makes the string a wording nobody has shipped, which is exactly the case the
 # positive test is meant to refuse.
-crw_status_description_permits_clearance() {
+crw_normalize_status_description() {
   local desc=${1:-} lower
   lower=$(printf '%s' "$desc" | tr '[:upper:]' '[:lower:]')
   # Bash 3.2 trim: strip the leading, then the trailing, whitespace run.
   lower="${lower#"${lower%%[![:space:]]*}"}"
   lower="${lower%"${lower##*[![:space:]]}"}"
+  printf '%s' "$lower"
+}
+
+crw_status_description_permits_clearance() {
+  local lower
+  lower=$(crw_normalize_status_description "${1:-}") || return 1
   [ -n "$lower" ] || return 0
   case "$lower" in
     "review complete"|"review completed") return 0 ;;
@@ -3268,6 +3275,38 @@ run_status_probe_once() {
   fi
 }
 
+# BEGIN coderabbit_timeout_disposition
+# Shared by notice-driven polling and the terminal-only #940 refusal path.
+request_codex_rate_limit_failover() {
+  if [ "$CODEX_FAILOVER_ON_RATE_LIMIT" != "false" ] && [ "$CODEX_FAILOVER_FIRED" != "true" ]; then
+    CODEX_FAILOVER_FIRED=true
+    log "codex failover: CodeRabbit rate-limited — requesting @codex review (trigger-only)"
+    if MERGEPATH_PHASE_4A_GATED=true "$CODEX_REQUEST_CMD" --trigger-only "$PR_NUMBER" "$REPO" >&2; then
+      CODEX_FAILOVER_REQUESTED=true
+      log "codex failover: @codex review requested (or already present) on HEAD"
+    else
+      log "codex failover: codex-review-request did not post (Codex disabled/opted out or read error) — leaving failover unrecorded"
+    fi
+  fi
+}
+
+# A refusal with no published notice has no retry window to schedule. Preserve
+# the existing wait, then diagnose only a still-current, positively read refusal.
+emit_rate_limit_stall_at_timeout_if_present() {
+  local rec state desc evidence
+  [ "${TRUST_STATUS_CONTEXT:-false}" = true ] || return 0
+  rec=$(check_status_context_record) || return 0
+  state=$(crw_status_record_state "$rec")
+  [ "$state" = success ] || return 0
+  desc=$(printf '%s' "$rec" | jq -r '.description // ""') || return 0
+  desc=$(crw_normalize_status_description "$desc") || return 0
+  [ "$desc" = "review rate limited" ] || return 0
+  evidence=$(printf '%s' "$rec" | jq -c '{id:null, created_at, endpoint:"status_context", body_excerpt:.description}') || return 0
+  log "timeout reached with a trusted per-SHA CodeRabbit rate-limit refusal — reporting rate_limit_stalled (exit 5)"
+  request_codex_rate_limit_failover
+  emit_json_and_exit "rate_limit_stalled" 5 "$evidence" 0
+}
+
 emit_timeout() {
   local message=$1
   log "$message"
@@ -3284,8 +3323,11 @@ emit_timeout() {
   fi
   run_status_probe_once
   emit_terminal_review_after_probe_if_present
+  emit_rate_limit_stall_at_timeout_if_present
   emit_json_and_exit "timeout" 4 "null" 0
 }
+
+# END coderabbit_timeout_disposition
 
 # Emit the read-only probe verdict and exit PROBE_EXIT_CODE. `observed`
 # records WHICH non-terminal surface the scan landed on, so a caller can
@@ -4743,16 +4785,7 @@ while :; do
       # across this run's retries. MERGEPATH_PHASE_4A_GATED=true forces the
       # request even when codex.request_by_default is false; if Codex is
       # disabled/opted out the helper no-ops and the failover stays unrecorded.
-      if [ "$CODEX_FAILOVER_ON_RATE_LIMIT" != "false" ] && [ "$CODEX_FAILOVER_FIRED" != "true" ]; then
-        CODEX_FAILOVER_FIRED=true
-        log "codex failover: CodeRabbit rate-limited — requesting @codex review (trigger-only)"
-        if MERGEPATH_PHASE_4A_GATED=true "$CODEX_REQUEST_CMD" --trigger-only "$PR_NUMBER" "$REPO" >&2; then
-          CODEX_FAILOVER_REQUESTED=true
-          log "codex failover: @codex review requested (or already present) on HEAD"
-        else
-          log "codex failover: codex-review-request did not post (Codex disabled/opted out or read error) — continuing CodeRabbit retry"
-        fi
-      fi
+      request_codex_rate_limit_failover
 
       if [ "$RATE_LIMIT_RETRIES" -ge "$MAX_RATE_LIMIT_RETRIES" ]; then
         log "max_rate_limit_retries ($MAX_RATE_LIMIT_RETRIES) exceeded — stalling"
