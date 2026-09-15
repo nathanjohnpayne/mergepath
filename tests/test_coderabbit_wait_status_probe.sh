@@ -2995,19 +2995,27 @@ test_940_fallback_status_veto() {
   while IFS='|' read -r scenario state desc expected reason; do
     dir=$(make_case "940-$scenario-$state" 15 true 1 0)
     enable_trust_status_context "$dir"
-    rc=$(CODERABBIT_TEST_STATUS="$state" CODERABBIT_TEST_STATUS_DESCRIPTION="$desc" run_case "$dir" "$scenario")
+    rc=$(CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" CODEX_STUB_LOG="$dir/state/codex-stub.log" \
+      CODERABBIT_TEST_STATUS="$state" CODERABBIT_TEST_STATUS_DESCRIPTION="$desc" run_case "$dir" "$scenario")
     [ "$rc" = "$expected" ] || bad="$bad $scenario/$state-rc=$rc"
     grep -q "$reason" "$dir/err.log" || bad="$bad $scenario/$state-no-reason"
-    if [ "$expected" = 4 ]; then
-      [ "$(jq -r '.status' "$dir/out.json")" = timeout ] || bad="$bad not-timeout"
+    if [ "$expected" = 4 ] || [ "$expected" = 5 ]; then
+      if [ "$expected" = 5 ]; then
+        [ "$(jq -r '.status' "$dir/out.json")" = rate_limit_stalled ] || bad="$bad not-stalled"
+        [ "$(jq -r '.codex_failover_requested' "$dir/out.json")" = true ] || bad="$bad missing-failover"
+        [ "$(codex_invocations "$dir")" = 1 ] || bad="$bad wrong-failover-count"
+        [ "$(jq -r '.rate_limit_retries' "$dir/out.json")" = 0 ] || bad="$bad invented-retry"
+      else
+        [ "$(jq -r '.status' "$dir/out.json")" = timeout ] || bad="$bad not-timeout"
+        [ "$(jq -r '.codex_failover_requested' "$dir/out.json")" = false ] || bad="$bad invented-failover"
+      fi
       [ "$(probe_count "$dir")" = 1 ] || bad="$bad no-terminal-probe"
       grep -q 'post-probe terminal-review check:' "$dir/err.log" || bad="$bad no-terminal-check"
-      [ "$(jq -r '.codex_failover_requested' "$dir/out.json")" = false ] || bad="$bad invented-failover"
     fi
   done <<'EOF'
-fallback_summary|success|Review rate limited|4|non-completion description 'Review rate limited'
+fallback_summary|success|Review rate limited|5|non-completion description 'Review rate limited'
 fallback_summary|pending|Review in progress|4|is pending
-fallback_summary_during_probe|success|Review rate limited|4|non-completion description 'Review rate limited'
+fallback_summary_during_probe|success|Review rate limited|5|non-completion description 'Review rate limited'
 fallback_summary_during_probe|pending|Review in progress|4|is pending
 fallback_summary|unreadable||3|could not read CodeRabbit fallback
 fallback_summary_during_probe|unreadable||4|could not be read
