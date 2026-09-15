@@ -902,6 +902,91 @@ case "$p4b_fence" in
   *) bad "phase-4b rejected the fenced body but not via the contract: $p4b_fence" ;;
 esac
 
+# --- 18. #1192 renderer-membership and comment compatibility corpus ----------
+# These compact cases are representatives of the recorded GitHub renderer
+# corpus. They cover the distinct historical failures that the handwritten
+# container state could not model: a quote's initial indented-code block,
+# list transitions, and nested-list lazy continuation. The comment rows retain
+# established syntax treatment, while the malformed multiline-heading row is
+# deliberately a renderer-grounded rejection.
+renderer_contract() { # label, expected JSON, body
+  local renderer_got
+  renderer_got="$(printf '%s' "$3" | node "$ROOT/scripts/lib/pr-body-contract.mjs" --json)"
+  if [ "$renderer_got" = "$2" ]; then
+    ok "#1192 renderer corpus: $1"
+  else
+    bad "#1192 renderer corpus: $1 -- expected $2, got $renderer_got"
+  fi
+}
+
+renderer_contract "quote first-block code ends before a top-level declaration" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'>     x\nAuthoring-Agent: codex\n'
+renderer_contract "list transition keeps its later declaration in the item" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'-     y\n  text\nAuthoring-Agent: codex\n## Self-Review\n'
+renderer_contract "nested-list continuation keeps its later declaration in the item" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'- x\n  -     y\n  text\nAuthoring-Agent: codex\n## Self-Review\n'
+renderer_contract "inline author comment remains part of a valid declaration" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: co<!-- note -->dex\n## Self-Review\n'
+renderer_contract "inline heading comment remains part of a valid heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n## Self-Review <!-- note -->\n'
+renderer_contract "comment-looking fenced code does not alter later declarations" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'```\n<!-- literal -->\n```\nAuthoring-Agent: codex\n## Self-Review\n'
+renderer_contract "malformed multiline heading comment is not an exact heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'Authoring-Agent: codex\n## Self-Review <!-- a\nb -->\n'
+
+# mdast counts CR, CRLF and LF as line boundaries. The raw marker and
+# comment-visible line views must use the same boundary so source positions
+# cannot bind a nested marker to an earlier top-level text node.
+renderer_contract "LF line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "CRLF line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\r\n\r\n## Self-Review\r\n'
+renderer_contract "lone CR line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\r\r## Self-Review\r'
+renderer_contract "lone CR lines keep a lazy quoted declaration nested" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'## Self-Review\n\nfoo\rbar\rbaz\n> quote\nAuthoring-Agent: codex'
+renderer_contract "a BOM keeps the existing inline author-comment result" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'\357\273\277<!-- hidden -->\n\nAuthoring-Agent: codex<!-- tail -->\n\n## Self-Review\n'
+renderer_contract "a BOM keeps the existing inline heading-comment result" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'\357\273\277<!-- hidden -->\n\nAuthoring-Agent: codex\n\n## Self-Review<!-- tail -->\n'
+renderer_contract "a BOM does not make a first-line declaration valid" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'\357\273\277Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "an ordinary leading comment retains inline author handling" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'<!-- hidden -->\n\nAuthoring-Agent: codex<!-- tail -->\n\n## Self-Review\n'
+renderer_contract "a BOM does not surface fenced comment-looking declarations" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'\357\273\277<!-- hidden -->\n\n```\nAuthoring-Agent: codex<!-- literal -->\n## Self-Review\n```\n'
+renderer_contract "a BOM does not surface raw HTML declarations" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'\357\273\277<!-- hidden -->\n\n<div>\nAuthoring-Agent: codex<!-- literal -->\n## Self-Review\n</div>\n'
+
+# A deep, real Markdown container must not make the AST traversal exhaust the
+# JavaScript call stack. The Authoring-Agent declaration remains inside the
+# blockquote; the blank line leaves the Self-Review heading top-level.
+DEEP_BLOCKQUOTE=''
+for ((index = 0; index < 5000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
+renderer_contract "deep blockquote excludes its nested declaration without a stack overflow" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  "${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "top-level declarations remain valid after the deep-container case" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n\n## Self-Review\n'
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

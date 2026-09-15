@@ -10,6 +10,8 @@
 # Used by check_spec_test_alignment when the default filename search
 # wouldn't find the test.
 spec_test_map:
+  pr_body_contract:
+    - tests/test_pr_body_contract_parity.sh
   codex_request_evidence: tests/test_codex_request_evidence.sh
   coderabbit_phase_25_invocation:
     - tests/test_coderabbit_should_invoke.sh
