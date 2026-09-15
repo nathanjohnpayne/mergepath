@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Read-only selectors shared by request deduplication/ack and blocked evidence.
-# A trigger qualifies by author and freshness, not an immutable commit anchor.
+# A trigger qualifies by complete command body, author, and freshness, not an
+# immutable commit anchor.
 crqe_select_trigger() { # comments-json author since
   printf '%s\n' "$1" | jq -c --arg author "$2" --arg since "$3" '
     [.[] | select((.user.login // "") == $author)
-     | select((.body // "") | test("@codex review"; "i"))
+     | select((.body // "") | test("\\A@codex review\\z"; "i"))
      | select(.created_at >= $since)]
     | max_by([.created_at, .id]) // null
   '
