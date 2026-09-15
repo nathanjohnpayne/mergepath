@@ -2452,26 +2452,24 @@ crc_render_request_evidence() {
   [ -r "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" ] || return 1
   # shellcheck source=lib/codex-request-evidence.sh
   . "$__CODEX_CHECK_DIR/lib/codex-request-evidence.sh" || return 1
-  local trigger id posted age reactions ack=unknown provider=none review budget ack_budget
+  local trigger id posted age reactions ack=unknown review budget ack_budget summary_advice
   trigger=$(crqe_select_trigger "$ISSUE_COMMENTS_JSON" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
   review=$(crc_select_head_review "$REVIEWS_JSON" "$BOT_LOGIN" "$HEAD_SHA") || return 1
   log "request evidence (informational; BLOCKED unchanged):"
   # Independent observations: an older terminal artifact must not hide a newer run.
   if [ -n "$CODEX_BLOCKED_REASON" ]; then
-    provider=observed
     log "request evidence: account block observed: $CODEX_BLOCKED_REASON; inspect the provider block"
   fi
   if [ "$review" != null ] || [ -n "$CODEX_HEAD_VERDICT_ANY_TIME" ]; then
-    provider=observed
     log "request evidence: current-head terminal artifact observed; inspect the unmet clearance requirement"
   fi
   if [ -n "$CODEX_SUMMARY_STATUS" ]; then
-    provider=observed
-    log "request evidence: current-head $CODEX_SUMMARY_STATUS summary observed at $CODEX_SUMMARY_TIME; monitor provider progress"
+    summary_advice='inspect the unmet clearance requirement'
+    [ "$CODEX_SUMMARY_STATUS" != running ] || summary_advice='monitor provider progress'
+    log "request evidence: current-head $CODEX_SUMMARY_STATUS summary observed at $CODEX_SUMMARY_TIME; $summary_advice"
   fi
   if [ "$trigger" = null ]; then
     log "request evidence: no freshness-qualified author trigger since $REACTION_THRESHOLD (not proof that no review is in flight)"
-    [ "$provider" != none ] || log "request evidence: no matching provider activity observed; request review through codex-review-request.sh if required"
     return 0
   fi
   id=$(printf '%s' "$trigger" | jq -r '.id // empty') || return 1
@@ -2481,6 +2479,8 @@ crc_render_request_evidence() {
     ack=$(crqe_ack_present "$reactions" "$BOT_LOGIN" "$posted") || ack=unknown
   fi
   budget=$(codex_field review_timeout_seconds); ack_budget=$(codex_field ack_wait_seconds)
+  # Optional policy fields have the same defaults as codex-review-request.sh.
+  budget=${budget:-840}; ack_budget=${ack_budget:-30}
   [[ "$budget" =~ ^[0-9]+$ ]] || budget=unknown
   [[ "$ack_budget" =~ ^[0-9]+$ ]] || ack_budget=unknown
   log "request evidence: freshness-qualified author trigger #${id:-unknown} at $posted (anchor $REACTION_THRESHOLD; not immutable SHA attribution)"
