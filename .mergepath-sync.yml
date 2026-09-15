@@ -767,6 +767,7 @@ paths:
       - "scripts/codex-review-check.sh"
       - "scripts/workflow/"
       - "scripts/lib/reviewers-helpers.sh"   # #817, hard-sourced for the Dependabot reviewer allow-list
+      - "scripts/lib/blocking-labels.sh"   # #1277, holds apply before clearance exemptions
       - "scripts/lib/gh-api-array.sh"   # #1008, hard-sourced paginated list reads
   - path: scripts/daily-feedback-rollup.sh
     # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.

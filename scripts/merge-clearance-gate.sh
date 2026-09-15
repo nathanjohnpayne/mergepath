@@ -75,6 +75,11 @@
 #
 # What it enforces, by PR class (evaluated on pr.head.sha):
 #
+#   Every full-gate invocation:
+#     BLOCKS on human-hold, needs-human-review, or policy-violation before
+#     class exemptions, even when both review-gate knobs are disabled (#1277).
+#     Query modes retain their narrower applicability/coverage contracts.
+#
 #   Dependabot PR (author == 'dependabot[bot]'):
 #     Gated by `dependabot.reviewer_gate.enabled` (default false; true in
 #     mergepath). When enabled, BLOCKS unless a reviewer identity in
@@ -105,7 +110,7 @@
 #     force them into Phase 4 and break the lane (#429 Codex round-2 P1).
 #
 #   Any other PR (under-threshold, non-Dependabot, or relevant knob off):
-#     CLEAN PASS (exit 0). The gate is a no-op so it can be a required
+#     CLEAN PASS (exit 0) unless a human-controlled hold is present. It can be a required
 #     check on every PR without blocking normal under-threshold merges.
 #
 # Exit codes (same contract as scripts/codex-p1-gate.sh):
@@ -153,6 +158,13 @@ if [ ! -r "$SCRIPT_DIR/lib/reviewers-helpers.sh" ]; then
 fi
 # shellcheck source=lib/reviewers-helpers.sh
 . "$SCRIPT_DIR/lib/reviewers-helpers.sh"
+
+if [ ! -r "$SCRIPT_DIR/lib/blocking-labels.sh" ]; then
+  echo "ERROR: blocking-labels helper missing: $SCRIPT_DIR/lib/blocking-labels.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/blocking-labels.sh
+. "$SCRIPT_DIR/lib/blocking-labels.sh"
 
 # Shared paginated-list reader (#1008) — the fetch → capture → flatten
 # algorithm fetch_api_array below used to carry inline, alongside seven other
@@ -993,6 +1005,18 @@ HAS_EXTERNAL_LABEL=$(echo "$PR_JSON" \
   | jq -r 'if any(.labels[]?.name; . == "needs-external-review") then "true" else "false" end')
 
 log "HEAD = $HEAD_SHA    author = $PR_AUTHOR    needs-external-review = $HAS_EXTERNAL_LABEL"
+
+# Human-controlled holds precede every clearance exemption (#1277).
+# needs-external-review keeps its existing delegated clearance semantics;
+# the derivation queries answer coverage/applicability, not merge permission.
+if [ "$DERIVE_ONLY" != "true" ] && [ "$PHASE_4_DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
+  HOLD_LABELS=$(printf '%s' "$PR_JSON" \
+    | jq -r '.labels[]?.name | select(. != "needs-external-review")' \
+    | mergepath_blocking_labels_csv)
+  if [ -n "$HOLD_LABELS" ]; then
+    block "human-controlled blocking labels present: $HOLD_LABELS. A human must release the hold before merge clearance."
+  fi
+fi
 
 # --- non-reviewer approval assertion (#1080) --------------------------------
 #
