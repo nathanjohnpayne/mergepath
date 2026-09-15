@@ -27,18 +27,18 @@
 # scripts/audit-codex-latency.sh has detected both retrospectively for a
 # while (its normalize phase classifies them as `rate_limit` /
 # `dropped_trigger_marker` events), but that detection lived ONLY in the
-# retrospective audit. This lib factors the two regexes out so the audit and
-# the live scripts (codex-review-request.sh, codex-review-check.sh) test the
-# IDENTICAL patterns instead of drifting (#722 proposal 1).
+# retrospective audit. This lib owns both contexts while keeping the live
+# usage-limit marker specific to the provider response and the audit's broader
+# historical classification stable.
 #
 # Contract:
-#   - CODEX_USAGE_LIMIT_MARKER_RE / CODEX_NOT_CONNECTED_MARKER_RE are the
-#     canonical ERE pattern bodies, WITHOUT a leading `(?i)` inline flag and
-#     WITHOUT anchors — every caller applies case-insensitivity explicitly
-#     (jq `test($re; "i")`, grep `-iE`) and matches the marker wherever it
-#     appears in a longer bot comment. Keeping the `(?i)` out of the stored
-#     pattern is what lets jq's `test(re; "i")` and grep's `-i` share one
-#     literal.
+#   - CODEX_USAGE_LIMIT_MARKER_RE / CODEX_NOT_CONNECTED_MARKER_RE are the live
+#     ERE pattern bodies, WITHOUT a leading `(?i)` inline flag. Every caller
+#     applies case-insensitivity explicitly (jq `test($re; "i")`, grep `-iE`).
+#     The usage-limit pattern is anchored to the provider response; the
+#     not-connected pattern retains its existing substring match.
+#   - CODEX_AUDIT_USAGE_LIMIT_MARKER_RE preserves the retrospective audit's
+#     historical broad classification. It is not terminal live evidence.
 #   - usage_limit is checked BEFORE not_connected (a comment matching both
 #     is quota-blocked first), and a caller that also recognizes verdicts
 #     MUST classify a verdict comment as a verdict first — a marker is only a
@@ -52,11 +52,16 @@
 # guarded, by the two propagated live Phase 4a scripts. Sourcing has no side
 # effects beyond defining constants and functions.
 
-# Rate-limit / usage-limit / quota-exhaustion marker. Mirrors the pattern
-# audit-codex-latency.sh's normalize phase has used for its `rate_limit`
-# event kind; the alternation is grouped so `test(re; "i")` reads as one
-# marker check.
-CODEX_USAGE_LIMIT_MARKER_RE='(rate.?limit|usage.?limit|quota|limit (was|has been) (hit|reached)|try again (later|in))'
+# Live account-quota response. Anchor the provider's opening sentence so
+# incidental quota vocabulary in ordinary task/review summaries cannot end a
+# live wait. The documented provider response may continue after this sentence.
+CODEX_USAGE_LIMIT_MARKER_RE='^[[:space:]]*you have reached your codex usage limits for code reviews([.]|$)'
+
+# Retrospective event classification predates the live terminal detector and
+# intentionally retains its broader historical vocabulary. Do not use this to
+# short-circuit a live wait.
+# shellcheck disable=SC2034  # consumed by the audit after sourcing this file
+CODEX_AUDIT_USAGE_LIMIT_MARKER_RE='(rate.?limit|usage.?limit|quota|limit (was|has been) (hit|reached)|try again (later|in))'
 
 # Dropped-trigger / app-not-connected marker (#570 class): the Codex App was
 # not connected or had no environment, so the trigger produced no round.

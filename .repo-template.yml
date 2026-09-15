@@ -11,6 +11,7 @@
 # wouldn't find the test.
 spec_test_map:
   codex_request_evidence: tests/test_codex_request_evidence.sh
+  codex_usage_limit_marker: tests/test_codex_usage_limit_marker.sh
   coderabbit_phase_25_invocation:
     - tests/test_coderabbit_should_invoke.sh
   mergepath_playground:
