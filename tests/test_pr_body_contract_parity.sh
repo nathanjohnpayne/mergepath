@@ -956,6 +956,24 @@ renderer_contract "lone CR line endings retain top-level markers" \
 renderer_contract "lone CR lines keep a lazy quoted declaration nested" \
   '{"author":"","authorCount":0,"hasSelfReview":true}' \
   $'## Self-Review\n\nfoo\rbar\rbaz\n> quote\nAuthoring-Agent: codex'
+renderer_contract "a BOM keeps the existing inline author-comment result" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'\357\273\277<!-- hidden -->\n\nAuthoring-Agent: codex<!-- tail -->\n\n## Self-Review\n'
+renderer_contract "a BOM keeps the existing inline heading-comment result" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'\357\273\277<!-- hidden -->\n\nAuthoring-Agent: codex\n\n## Self-Review<!-- tail -->\n'
+renderer_contract "a BOM does not make a first-line declaration valid" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'\357\273\277Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "an ordinary leading comment retains inline author handling" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'<!-- hidden -->\n\nAuthoring-Agent: codex<!-- tail -->\n\n## Self-Review\n'
+renderer_contract "a BOM does not surface fenced comment-looking declarations" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'\357\273\277<!-- hidden -->\n\n```\nAuthoring-Agent: codex<!-- literal -->\n## Self-Review\n```\n'
+renderer_contract "a BOM does not surface raw HTML declarations" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'\357\273\277<!-- hidden -->\n\n<div>\nAuthoring-Agent: codex<!-- literal -->\n## Self-Review\n</div>\n'
 
 # A deep, real Markdown container must not make the AST traversal exhaust the
 # JavaScript call stack. The Authoring-Agent declaration remains inside the

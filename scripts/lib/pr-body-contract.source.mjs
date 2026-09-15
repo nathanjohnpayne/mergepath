@@ -59,14 +59,22 @@ function collect(root) {
 function visibleLinesAfterComments(body, lines, entries) {
   const characters = body.split('');
   const discardLines = new Set();
+  // micromark skips a leading BOM before assigning source positions. Keep the
+  // raw body for the strict marker syntax, but translate html-node coordinates
+  // back to that body before removing real HTML comments.
+  const bomOffset = body.charCodeAt(0) === 0xFEFF ? 1 : 0;
   for (const { node } of entries) {
     const position = node.type === 'html' ? node.position : null;
     if (!position || !node.value?.startsWith('<!--')) continue;
-    if (body.slice(position.start.offset, position.start.offset + 4) !== '<!--') continue;
-    for (let offset = position.start.offset; offset < position.end.offset; offset += 1) {
+    const startOffset = position.start.offset + bomOffset;
+    const endOffset = position.end.offset + bomOffset;
+    if (body.slice(startOffset, startOffset + 4) !== '<!--') continue;
+    for (let offset = startOffset; offset < endOffset; offset += 1) {
       if (characters[offset] !== '\n' && characters[offset] !== '\r') characters[offset] = '';
     }
-    const prefix = lines[position.start.line - 1].slice(0, position.start.column - 1);
+    const firstLineOffset = position.start.line === 1 ? bomOffset : 0;
+    const prefixLength = position.start.column - 1 + firstLineOffset;
+    const prefix = lines[position.start.line - 1].slice(firstLineOffset, prefixLength);
     if (/^ {0,3}$/.test(prefix)) {
       for (let line = position.start.line; line <= position.end.line; line += 1) discardLines.add(line);
     }
