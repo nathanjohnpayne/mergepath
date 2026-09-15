@@ -224,6 +224,12 @@ case "$endpoint" in
     ;;
   repos/owner/repo/pulls/999/reviews)
     case "$scenario" in
+      aged_marker_fresh_benign_clean_head_run)
+        # #878 control: immutable exact-head clean-run evidence stays first in
+        # the published ladder, even when an older marker summary and pending
+        # StatusContext would otherwise refuse the fallback route.
+        printf '[{"id":87803,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"**Actionable comments posted: 0**"}]\n' "$bot" "$reply_time"
+        ;;
       run_replaced_after_count|run_replaced_during_probe|run_replaced_every_count|newer_clean_run)
         if [ "$scenario" = run_replaced_every_count ]; then
           n=5000
@@ -453,6 +459,34 @@ case "$endpoint" in
     ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
+      aged_marker_fresh_benign|aged_marker_fresh_benign_clean_head_run|aged_marker_fresh_benign_tier_failure)
+        # #878: the marker-selected summary is aged out of the normal polling
+        # scan, while a later ordinary comment becomes the review-arm candidate.
+        # The summary's full range still names this head, so it is the precise
+        # #851/#940 escape shape rather than a prior-head demotion.
+        old_body='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+**Actionable comments posted: 1**
+
+_⚠️ Potential issue_ | _🟠 Major_
+
+Reviewing files between aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and head-sha.'
+        if [ "$scenario" = aged_marker_fresh_benign_tier_failure ]; then
+          old_body='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+**Actionable comments posted: 1**
+
+TIER_READ_FAILURE _⚠️ Potential issue_ | _🟠 Major_
+
+Reviewing files between aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and head-sha.'
+        fi
+        fresh_body='<details>
+Fresh benign CodeRabbit activity without a summary marker.
+</details>'
+        jq -nc --arg bot "$bot" --arg old "$old_body" --arg fresh "$fresh_body" --arg old_time '2026-06-03T00:00:00Z' --arg fresh_time "$reply_time" '
+          [
+            {id:87801,user:{login:$bot},created_at:$old_time,updated_at:$old_time,body:$old},
+            {id:87802,user:{login:$bot},created_at:$fresh_time,updated_at:$fresh_time,body:$fresh}
+          ]'
+        ;;
       fallback_summary|fallback_summary_during_probe)
         # #940: the walkthrough predates HEAD; only its edit is fresh. No
         # review object or rate-limit notice exists. The delayed variant proves
@@ -3027,6 +3061,60 @@ EOF
   fi
 }
 
+test_878_aged_marker_cannot_escape_trusted_status_veto() {
+  local dir rc status review bad=""
+
+  # Exact accepted case: the fresh benign body is the ordinary review-arm
+  # candidate, but the marker-selected summary belongs to this unchanged head.
+  # The trusted pending status must keep that marker-bearing summary from using
+  # the #851 completed-summary escape.
+  dir=$(make_case 878-aged-marker-pending 15 true 1 0)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=pending CODERABBIT_TEST_STATUS_DESCRIPTION='Review in progress' \
+    run_case "$dir" aged_marker_fresh_benign)
+  status=$(jq -r '.status // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  [ "$rc" = 4 ] && [ "$status" = timeout ] \
+    && grep -q 'per-SHA CodeRabbit status on head-sha is pending' "$dir/err.log" \
+    || bad="$bad pending=$rc/$status"
+
+  # Missing and opt-out statuses retain the existing non-veto behavior: this
+  # change does not make an aged marker independently authoritative.
+  dir=$(make_case 878-aged-marker-missing 15 true 1 0)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=absent run_case "$dir" aged_marker_fresh_benign)
+  [ "$rc" = 0 ] || bad="$bad missing=$rc"
+
+  dir=$(make_case 878-aged-marker-untrusted 15 true 1 0)
+  rc=$(CODERABBIT_TEST_STATUS=pending CODERABBIT_TEST_STATUS_DESCRIPTION='Review in progress' \
+    run_case "$dir" aged_marker_fresh_benign)
+  [ "$rc" = 0 ] || bad="$bad untrusted=$rc"
+
+  # The immutable exact-SHA clean-run rung remains ahead of the mutable
+  # summary/status fallback.
+  dir=$(make_case 878-aged-marker-clean-run 15 true 1 0)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=pending CODERABBIT_TEST_STATUS_DESCRIPTION='Review in progress' \
+    run_case "$dir" aged_marker_fresh_benign_clean_head_run)
+  review=$(jq -r '.review.id // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  [ "$rc" = 0 ] && [ "$review" = 87802 ] || bad="$bad clean-run=$rc/$review"
+
+  # The three-way marker read must not flatten extraction failure into absence.
+  dir=$(make_case 878-aged-marker-tier-failure 15 true 1 0)
+  enable_trust_status_context "$dir"
+  install_878_extraction_failure "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=pending CODERABBIT_TEST_STATUS_DESCRIPTION='Review in progress' \
+    run_case "$dir" aged_marker_fresh_benign_tier_failure)
+  [ "$rc" = 3 ] \
+    && grep -q 'could not read CodeRabbit fallback summary or status evidence' "$dir/err.log" \
+    || bad="$bad tier-failure=$rc"
+
+  if [ -z "$bad" ]; then
+    pass "#878: aged marker summary cannot bypass trusted pending-status veto; missing, opt-out, clean-run, and extraction controls hold"
+  else
+    fail "#878 aged-summary status veto:$bad"
+  fi
+}
+
 
 # The summary appears only after the one status probe, so polling cannot save us.
 test_1034_terminal_risk_refusal() {
@@ -3530,6 +3618,7 @@ test_878_waiter_tier_errors
 test_900_review_run_selector_ignores_bodyless_replies
 test_919_pending_status_blocks_the_terminal_verdict
 test_940_fallback_status_veto
+test_878_aged_marker_cannot_escape_trusted_status_veto
 test_1034_terminal_risk_refusal
 test_940_fallback_authority_and_absence
 test_940_summary_escape_requires_completed_own_content
