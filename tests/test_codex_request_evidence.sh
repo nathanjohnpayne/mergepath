@@ -47,6 +47,7 @@ esac
 GH
 chmod +x "$DIR/bin/gh"
 TRIGGER='{"id":123,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:01:00Z","body":"@codex review"}'
+LATER_MENTION='{"id":124,"user":{"login":"nathanjohnpayne"},"created_at":"2026-09-14T00:03:00Z","body":"Status: @codex review was already requested."}'
 EYES='[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"eyes","created_at":"2026-09-14T00:02:00Z"}]'
 # shellcheck disable=SC2016 # Literal Markdown commit cell, not shell substitution.
 RUNNING='{"id":456,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-14T00:02:00Z","body":"<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | **Running** | `abcdef0` | Manual |"}'
@@ -56,6 +57,9 @@ while IFS='|' read -r name comments ack reviews mode opted expected pattern read
   case "$comments" in
     trigger) comments="[$TRIGGER]" ;;
     wrong-id) comments="[${TRIGGER/123/124}]" ;;
+    mention-only) comments="[$LATER_MENTION]" ;;
+    trigger-then-mention) comments="[$TRIGGER,$LATER_MENTION]" ;;
+    mention-running) comments="[$LATER_MENTION,$RUNNING]" ;;
     future) comments="[${TRIGGER/2026-09-14T00:01:00Z/2077-09-14T00:01:00Z}]" ;;
     stale) comments="[${TRIGGER/2026-09-14T00:01:00Z/2026-09-13T00:01:00Z}]" ;;
     foreign) comments="[${TRIGGER/nathanjohnpayne/nathanpayne-claude}]" ;;
@@ -87,6 +91,12 @@ while IFS='|' read -r name comments ack reviews mode opted expected pattern read
   if [ "$rc" != "$expected" ] || ! grep -q "$pattern" "$DIR/out"; then
     cat "$DIR/out"; echo "FAIL $name rc=$rc"; exit 1
   fi
+  if [ "$name" = trigger-then-mention ]; then
+    if ! grep -q 'freshness-qualified author trigger #123 at 2026-09-14T00:01:00Z' "$DIR/out" \
+      || grep -q 'freshness-qualified author trigger #124' "$DIR/out"; then
+      cat "$DIR/out"; echo 'FAIL trigger-then-mention did not bind exact request #123'; exit 1
+    fi
+  fi
   if [ "$name" = requested ]; then
     grep -Eq 'age=[0-9]+s; configured ack_wait_seconds=30; review_timeout_seconds=840' "$DIR/out"
     grep -q 'not immutable SHA attribution' "$DIR/out"
@@ -109,6 +119,9 @@ missing|none|none|[]||1|1|no freshness-qualified author trigger|0
 requested|trigger|eyes|[]||1|1|linked eyes acknowledgement=true|1
 no-ack|trigger|none|[]||1|1|linked eyes acknowledgement=false|1
 wrong-comment|wrong-id|eyes|[]||1|1|linked eyes acknowledgement=false|1
+mention-only|mention-only|eyes|[]||1|1|no freshness-qualified author trigger|0
+mention-running|mention-running|eyes|[]||1|1|current-head running summary observed.*monitor provider progress|0
+trigger-then-mention|trigger-then-mention|eyes|[]||1|1|linked eyes acknowledgement=true|1
 foreign-ack|trigger|foreign|[]||1|1|linked eyes acknowledgement=false|1
 error|trigger|none|[]||1|1|linked eyes acknowledgement=unknown|1
 unknown-budget|trigger|none|[]||1|1|review_timeout_seconds=unknown|1
