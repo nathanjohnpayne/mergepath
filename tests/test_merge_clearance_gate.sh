@@ -219,6 +219,9 @@ if [ "${CODEX_STUB_REQUIRE_HEAD_PIN:-0}" = "1" ] && [ "${CODEX_REVIEW_CHECK_REQU
   echo "codex-check-stub: expected CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1" >&2
   exit 42
 fi
+if [ -n "${CODEX_STUB_EXPECT_EVIDENCE:-}" ] && [ "${CODEX_REVIEW_CHECK_REPORT_REQUEST_EVIDENCE:-0}" != "$CODEX_STUB_EXPECT_EVIDENCE" ]; then
+  echo "unexpected request evidence opt-in" >&2; exit 42
+fi
 [ -z "${CODEX_STUB_STDOUT:-}" ] || printf '%s\n' "$CODEX_STUB_STDOUT"
 exit "${CODEX_STUB_RC:-0}"
 STUB
@@ -597,6 +600,7 @@ FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" "$EXT_LABEL")
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+      CODEX_STUB_EXPECT_EVIDENCE=1 \
       CODEX_STUB_RC=1 \
       run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
@@ -2342,6 +2346,7 @@ FIXTURE_PROTECTION=$(make_protection_fixture '["Label Gate","Self-Review Require
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       FIXTURE_PROTECTION="$FIXTURE_PROTECTION" \
+      CODEX_REVIEW_CHECK_REPORT_REQUEST_EVIDENCE=1 CODEX_STUB_EXPECT_EVIDENCE=0 \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
   run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>"$WORKDIR/protection-1c-stderr.log")
 RC=$?

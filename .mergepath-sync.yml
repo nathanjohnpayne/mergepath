@@ -323,6 +323,10 @@ paths:
   - path: scripts/lib/review-policy-scalar.sh
     type: canonical
     consumers: all
+  # Shared author/freshness trigger and linked-ack selectors (#1276).
+  - path: scripts/lib/codex-request-evidence.sh
+    type: canonical
+    consumers: all
   # Single source of truth for the Codex App failure-marker regexes (#722):
   # the usage-limit / not-connected patterns audit-codex-latency.sh classifies
   # retrospectively, factored out so the live Phase 4a scripts test the SAME
@@ -499,6 +503,7 @@ paths:
     # "newer than my trigger?" comparison in the poll loop, so degrading it
     # silently is worse than refusing to run.
     requires:
+      - "scripts/lib/codex-request-evidence.sh"   # #1276, shared read-only request/ack selectors
       - "scripts/lib/codex-failure-markers.sh"
       - "scripts/workflow/codex_auto_trigger_gate.sh"   # #798, content-free auto-trigger gate
       - "scripts/lib/gh-api-scalar.sh"   # #799, fail-closed scalar API reads
@@ -556,6 +561,7 @@ paths:
     # retry semantics are lost — every transient failure becomes a
     # hard rc=3 and the auto-clear stalls.
     requires:
+      - "scripts/lib/codex-request-evidence.sh"   # #1276, shared read-only request/ack selectors
       - "scripts/lib/pr-body-contract.sh"   # shared Authoring-Agent parser (#1121)
       - "scripts/lib/pr-body-contract.mjs"  # the lib shells out to it
       - "scripts/lib/gh-retry-helpers.sh"
@@ -1181,6 +1187,10 @@ paths:
   # Resolution-aware gate (c) regression (#460 Option B). check_codex_scripts
   # (scripts/ci kit) hard-runs it, so it must travel to every consumer.
   - path: tests/test_codex_review_check_resolution.sh
+    type: canonical
+    consumers: all
+  # #1276 blocked request diagnostics, run by check_codex_scripts.
+  - path: tests/test_codex_request_evidence.sh
     type: canonical
     consumers: all
   # HEAD-anchored Codex issue-comment verdict clearance (#600/#567).
@@ -1878,6 +1888,7 @@ paths:
       - "tests/test_codex_review_request_verdict.sh"  # check_codex_scripts (#609)
       - "tests/test_codex_review_request_token_fallback.sh"  # check_codex_scripts (#737)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
+      - "tests/test_codex_request_evidence.sh"   # #1276, blocked evidence
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_codex_review_check_required_checks.sh"  # check_codex_scripts (#655)
       - "tests/test_branch_requirements.sh"    # check_codex_scripts (#1064)
