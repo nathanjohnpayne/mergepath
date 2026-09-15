@@ -941,6 +941,18 @@ renderer_contract "malformed multiline heading comment is not an exact heading" 
   '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
   $'Authoring-Agent: codex\n## Self-Review <!-- a\nb -->\n'
 
+# A deep, real Markdown container must not make the AST traversal exhaust the
+# JavaScript call stack. The Authoring-Agent declaration remains inside the
+# blockquote; the blank line leaves the Self-Review heading top-level.
+DEEP_BLOCKQUOTE=''
+for ((index = 0; index < 5000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
+renderer_contract "deep blockquote excludes its nested declaration without a stack overflow" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  "${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "top-level declarations remain valid after the deep-container case" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n\n## Self-Review\n'
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

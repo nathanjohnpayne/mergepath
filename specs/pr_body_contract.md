@@ -8,6 +8,8 @@
 
 CommonMark with GFM extensions decides whether a raw candidate belongs to the document's top level. Candidates inside blockquotes, lists, fenced code, inline code, or raw HTML are excluded. Existing HTML-comment treatment remains: real HTML comments are removed before marker syntax is checked, while comment-looking text in code remains code. This contract does not add a Markdown dialect, a marker form, or a hand-maintained container parser.
 
+The parser uses GFM tokenization and mdast handlers to establish source positions and block membership; it does not render Markdown or consume rewritten inline link nodes. Its GFM post-parse transforms are therefore omitted, retaining the CLI's marker and membership results while avoiding an irrelevant recursive linkification walk.
+
 ## Generated runtime and rebuild
 
 The generated standalone runtime remains at `scripts/lib/pr-body-contract.mjs`, the propagated consumer path. Its readable source and build inputs are hub-only: `scripts/lib/pr-body-contract.source.mjs` and `scripts/lib/pr-body-contract.bundle/`. A consumer executes only the generated runtime and performs no npm install or network operation.

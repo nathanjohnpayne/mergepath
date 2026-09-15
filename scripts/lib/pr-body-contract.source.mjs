@@ -11,6 +11,14 @@ const AUTHORING_AGENT_RE = /^Authoring-Agent:\s*(.*?)\s*$/i;
 const SELF_REVIEW_RE = /^##[ \t]+Self-Review(?:[ \t]+#*)?[ \t]*$/i;
 const CONTAINERS = new Set(['blockquote', 'list', 'listItem']);
 
+function gfmMembershipExtensions() {
+  // This CLI reads source positions and block membership; it never renders or
+  // consumes GFM's rewritten inline link nodes. Keep every GFM tokenizer and
+  // mdast enter/exit handler, but omit post-parse transforms such as autolink
+  // linkification, whose recursive visitor cannot affect this contract.
+  return gfmFromMarkdown().map((extension) => ({ ...extension, transforms: [] }));
+}
+
 function covers(position, line, column = 1) {
   if (!position) return false;
   const startsBefore =
@@ -22,15 +30,22 @@ function covers(position, line, column = 1) {
   return startsBefore && endsAfter;
 }
 
-function collect(node, ancestors = [], entries = []) {
-  const entry = { node, ancestors: [...ancestors, node.type] };
-  entries.push(entry);
-  for (const child of node.children ?? []) collect(child, entry.ancestors, entries);
+function collect(root) {
+  const entries = [];
+  const stack = [{ node: root, isInContainer: false }];
+  while (stack.length > 0) {
+    const { node, isInContainer } = stack.pop();
+    const entry = {
+      node,
+      isInContainer: isInContainer || CONTAINERS.has(node.type),
+    };
+    entries.push(entry);
+    const children = node.children ?? [];
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      stack.push({ node: children[index], isInContainer: entry.isInContainer });
+    }
+  }
   return entries;
-}
-
-function hasContainerAncestor(entry) {
-  return entry.ancestors.some((type) => CONTAINERS.has(type));
 }
 
 // The existing contract removes HTML comments before checking marker syntax.
@@ -60,7 +75,7 @@ export function parsePrBodyContract(body) {
   const lines = body.split(/\r?\n/);
   const entries = collect(fromMarkdown(body, {
     extensions: [gfm()],
-    mdastExtensions: [gfmFromMarkdown()],
+    mdastExtensions: gfmMembershipExtensions(),
   }));
   const visibleLines = visibleLinesAfterComments(body, lines, entries);
   const authorValues = [];
@@ -71,7 +86,7 @@ export function parsePrBodyContract(body) {
     const text = entries.find((entry) =>
       entry.node.type === 'text' && covers(entry.node.position, index + 1),
     );
-    if (text && !hasContainerAncestor(text)) authorValues.push(match[1]);
+    if (text && !text.isInContainer) authorValues.push(match[1]);
   }
 
   const hasSelfReview = entries.some((entry) => {
@@ -80,7 +95,7 @@ export function parsePrBodyContract(body) {
       node.depth === 2 &&
       node.position?.start.column === 1 &&
       SELF_REVIEW_RE.test(visibleLines[node.position.start.line - 1] ?? '') &&
-      !hasContainerAncestor(entry);
+      !entry.isInContainer;
   });
 
   const author =
