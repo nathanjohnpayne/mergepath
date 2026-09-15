@@ -378,7 +378,9 @@ E2E_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-blocked-e2e.XXXXXX")"
 # With later_verdict=true, the first post-trigger scan returns that comment and
 # the next returns a valid current-head verdict.
 run_request_e2e() { # comment_body [later_verdict] → prints "rc|blocked_reason|elapsed|affirmative"
-  local body="$1" later_verdict="${2:-false}" dir="$E2E_WORKDIR/case.$RANDOM" rc=0 start elapsed
+  # Keep punctuation in the ordinary fixture path so the generated stub must
+  # transport it as data rather than embedding it in shell source.
+  local body="$1" later_verdict="${2:-false}" dir="$E2E_WORKDIR/case $RANDOM's fixture" rc=0 start elapsed
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin"
   printf '%s' "$body" >"$dir/comment-body.txt"
   [ "$later_verdict" = true ] && : >"$dir/later-verdict"
@@ -402,7 +404,7 @@ set -euo pipefail
 printf 'https://github.com/owner/repo/pull/999#issuecomment-1001\n'
 EOF
   chmod +x "$dir/scripts/gh-as-author.sh"
-  cat >"$dir/bin/gh" <<EOF
+  cat >"$dir/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 bot='chatgpt-codex-connector[bot]'
@@ -410,35 +412,36 @@ head='d2c70ce6d1b2236326585484e8b0dfa17a40b172'
 t0='2026-07-07T01:08:39Z'
 t1='2026-07-07T01:10:19Z'
 t2='2026-07-07T01:12:19Z'
-[ "\${1:-}" = "api" ] || { echo "unexpected gh command: \$*" >&2; exit 99; }
+[ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
-[ "\${1:-}" = "--paginate" ] && shift
-endpoint=\${1:-}
-case "\$endpoint" in
-  repos/owner/repo/pulls/999)            printf '{"head":{"sha":"%s"}}\n' "\$head" ;;
-  repos/owner/repo/commits/\$head)       printf '%s\n' "\$t0" ;;
+[ "${1:-}" = "--paginate" ] && shift
+endpoint=${1:-}
+case "$endpoint" in
+  repos/owner/repo/pulls/999)            printf '{"head":{"sha":"%s"}}\n' "$head" ;;
+  repos/owner/repo/commits/$head)        printf '%s\n' "$t0" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)    printf '[]\n' ;;
   repos/owner/repo/pulls/999/comments)   printf '[]\n' ;;
   repos/owner/repo/issues/999/reactions) printf '[]\n' ;;
-  repos/owner/repo/issues/comments/1001) printf '%s\n' "\$t0" ;;
+  repos/owner/repo/issues/comments/1001) printf '%s\n' "$t0" ;;
   repos/owner/repo/issues/comments/1001/reactions) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
-    count_file='$dir/comment-read-count'
+    case_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+    count_file="$case_dir/comment-read-count"
     count=0
-    [ ! -r "\$count_file" ] || count=\$(cat "\$count_file")
-    count=\$((count + 1))
-    printf '%s' "\$count" >"\$count_file"
-    if [ -f '$dir/later-verdict' ] && [ "\$count" -eq 1 ]; then
+    [ ! -r "$count_file" ] || count=$(cat "$count_file")
+    count=$((count + 1))
+    printf '%s' "$count" >"$count_file"
+    if [ -f "$case_dir/later-verdict" ] && [ "$count" -eq 1 ]; then
       printf '[]\n'
-    elif [ -f '$dir/later-verdict' ] && [ "\$count" -ge 3 ]; then
-      jq -cn --arg bot "\$bot" --arg t "\$t2" --arg head "\$head" \
-        '[{id:8002,user:{login:\$bot},created_at:\$t,body:("Codex Review: Didn'"'"'t find any major issues. Swish!\nReviewed commit: " + \$head)}]'
+    elif [ -f "$case_dir/later-verdict" ] && [ "$count" -ge 3 ]; then
+      jq -cn --arg bot "$bot" --arg t "$t2" --arg head "$head" \
+        '[{id:8002,user:{login:$bot},created_at:$t,body:("Codex Review: Didn'"'"'t find any major issues. Swish!\nReviewed commit: " + $head)}]'
     else
-      jq -Rsc --arg bot "\$bot" --arg t "\$t1" \
-        '[{id:8001,user:{login:\$bot},created_at:\$t,body:.}]' '$dir/comment-body.txt'
+      jq -Rsc --arg bot "$bot" --arg t "$t1" \
+        '[{id:8001,user:{login:$bot},created_at:$t,body:.}]' "$case_dir/comment-body.txt"
     fi ;;
-  *) echo "unexpected gh api endpoint: \$endpoint" >&2; exit 99 ;;
+  *) echo "unexpected gh api endpoint: $endpoint" >&2; exit 99 ;;
 esac
 EOF
   chmod +x "$dir/bin/gh"
