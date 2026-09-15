@@ -47,6 +47,7 @@
     ],
     "check_merge_clearance_gate": [
       "scripts/lib/ci-check-modes.sh",
+      "scripts/lib/blocking-labels.sh",
       "scripts/merge-clearance-gate.sh",
       "tests/test_merge_clearance_gate.sh",
       "tests/test_465_fail_closed.sh"

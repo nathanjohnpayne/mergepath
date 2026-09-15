@@ -669,6 +669,67 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# #1277: human-controlled holds apply before every full-gate class dispatch.
+# The disabled knobs and propagation exemption must not turn a hold green.
+for hold_label in human-hold needs-human-review policy-violation; do
+  for hold_lane in ordinary disabled dependabot propagation; do
+    SCRATCH=$(make_scratch true true)
+    hold_author=nathanjohnpayne
+    FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+    FIXTURE_FILES=$(make_files_fixture '[{"filename":"README.md","additions":3,"deletions":1}]')
+    case "$hold_lane" in
+      disabled) SCRATCH=$(make_scratch false false) ;;
+      dependabot) hold_author="$DEPENDABOT"; SCRATCH=$(make_scratch false false) ;;
+      propagation)
+        FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":400,"deletions":50}]')
+        FIXTURE_COMMENTS=$(make_comments_fixture "[{\"user\":{\"login\":\"github-actions[bot]\"},\"body\":\"<!-- mergepath-propagation-lane verified-head=$HEAD_SHA -->\"}]") ;;
+    esac
+    FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$hold_author" "[{\"name\":\"$hold_label\"}]")
+    set +e
+    OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+    RC=$?
+    set -e
+    if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED.*$hold_label"; then
+      pass "#1277: $hold_label blocks $hold_lane lane"
+    else
+      fail "#1277: $hold_label/$hold_lane expected block/1; got rc=$RC: $OUT"
+    fi
+  done
+done
+
+# These queries describe external-review applicability/coverage, not permission
+# to merge. A hold must not change their boolean contract.
+SCRATCH=$(make_scratch true true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" nathanjohnpayne '[{"name":"human-hold"}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"README.md","additions":3,"deletions":1}]')
+for hold_query in --derive-external-requiredness --derive-phase-4-requiredness --derive-rate-limit-protection; do
+  set +e
+  OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+    run_gate "$SCRATCH" "$hold_query" 99 owner/repo 2>/dev/null)
+  RC=$?
+  set -e
+  if [ "$RC" = 0 ] && [ "$OUT" = false ]; then
+    pass "#1277: hold preserves $hold_query"
+  else
+    fail "#1277: $hold_query expected false/0; got '$OUT'/$RC"
+  fi
+done
+
+# Exact-label control: issue-triage labels and similar names are not holds.
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" nathanjohnpayne '[{"name":"decision-needed"},{"name":"human-hold-extra"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ]; then
+  pass "#1277: unrelated labels preserve ordinary clearance"
+else
+  fail "#1277: unrelated labels expected pass/0; got $RC: $OUT"
+fi
+
 # Test 11e (#763 Codex P1): NON-DEFAULT base whose policy ENABLES the external
 # gate, while the default-branch policy DISABLES it. Parsing the switch from
 # the default-branch checkout made the whole external arm vacuous, so the
