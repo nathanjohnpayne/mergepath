@@ -298,6 +298,15 @@ if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
   exit 3
 fi
 
+# This dependency must be usable before deduplication or any trigger write.
+# shellcheck source=lib/codex-request-evidence.sh
+if [ ! -r "$__CODEX_REQUEST_DIR/lib/codex-request-evidence.sh" ] \
+  || ! . "$__CODEX_REQUEST_DIR/lib/codex-request-evidence.sh" \
+  || ! declare -F crqe_select_trigger crqe_ack_present >/dev/null; then
+  echo "[codex-review-request] ERROR: request evidence helper unavailable (see #1276)" >&2
+  exit 3
+fi
+
 REPO=${2:-}
 if [ -z "$REPO" ]; then
   REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
@@ -1045,14 +1054,9 @@ existing_codex_trigger_on_head() {
   comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null) || return 1
   [ -n "$comments" ] || return 1
-  echo "$comments" | jq -e \
-    --arg author "$AUTHOR_IDENTITY" \
-    --arg since "$REACTION_THRESHOLD" '
-    any(.[];
-      ((.user.login // "") == $author)
-      and ((.body // "") | test("@codex review"; "i"))
-      and (.created_at >= $since))
-  ' >/dev/null 2>&1
+  local trigger
+  trigger=$(crqe_select_trigger "$comments" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") || return 1
+  [ "$trigger" != null ]
 }
 
 # #798: content-fingerprint idempotency for AUTOMATIC callers, alongside the
@@ -1432,14 +1436,7 @@ trigger_ack_present() {
 
   [ -n "$TRIGGER_COMMENT_ID" ] || return 1
   reactions=$(fetch_api_array "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID/reactions" "trigger comment reactions")
-  [ "$(echo "$reactions" | jq -r --arg bot "$BOT_LOGIN" --arg after "$TRIGGER_POST_TIME" '
-    [ .[]
-      | select(.user.login == $bot)
-      | select(.content == "eyes")
-      | select(.created_at >= $after)
-    ]
-    | length > 0
-  ')" = "true" ]
+  [ "$(crqe_ack_present "$reactions" "$BOT_LOGIN" "$TRIGGER_POST_TIME")" = true ]
 }
 
 wait_for_trigger_ack() {
