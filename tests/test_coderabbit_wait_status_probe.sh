@@ -3027,6 +3027,32 @@ EOF
   fi
 }
 
+
+# The summary appears only after the one status probe, so polling cannot save us.
+test_1034_terminal_risk_refusal() {
+  local mode dir body rc expected before=$FAIL head=f9c7847139881a1004e796d4ab8967b23e083baa
+  for mode in stale matching; do
+    # shellcheck disable=SC2016 # Literal provider Markdown, not substitution.
+    body='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+**Actionable comments posted: 0**
+<!-- final_review_risk_start -->
+**Merge Risk:** _🟡 Moderate_ · up to `e192e`
+<!-- final_review_risk_end -->'
+    expected=4
+    if [ "$mode" = matching ]; then body=${body/e192e/f9c78}; expected=0; fi
+    dir=$(make_case "1034-terminal-$mode" 15 true 1 0)
+    sed -i.bak "s/head-sha/$head/g" "$dir/bin/gh"
+    rc=$(CODERABBIT_TEST_FALLBACK_BODY="$body" run_case "$dir" fallback_summary_during_probe)
+    [ "$rc" = "$expected" ] || fail "1034 terminal $mode: rc=$rc expected=$expected"
+    [ "$(probe_count "$dir")" = 1 ] || fail "1034 terminal $mode never probed"
+    if [ "$mode" = stale ]; then
+      grep -q 'final_review_risk.*different commit' "$dir/err.log" || fail '1034 terminal risk refusal absent'
+      grep -q 'post-probe terminal-review check:.*leaving the advisory timeout' "$dir/err.log" || fail '1034 terminal refusal did not retain timeout'
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass '#1034: late stale risk blocks the terminal upgrade; matching risk preserves it'
+}
+
 test_940_fallback_authority_and_absence() {
   local scenario state desc trust expected reads dir rc got_reads bad="" n=0
   while IFS='|' read -r scenario state desc trust expected reads; do
@@ -3504,6 +3530,7 @@ test_878_waiter_tier_errors
 test_900_review_run_selector_ignores_bodyless_replies
 test_919_pending_status_blocks_the_terminal_verdict
 test_940_fallback_status_veto
+test_1034_terminal_risk_refusal
 test_940_fallback_authority_and_absence
 test_940_summary_escape_requires_completed_own_content
 test_936_unreadable_status_is_not_an_absent_status

@@ -2233,6 +2233,56 @@ _🟠 Major_ the marker is past byte 200."
   fi
 }
 
+# #1034: a short risk marker is negative evidence only, on fallback clearance.
+# shellcheck disable=SC2016 # Fixture backticks are literal provider Markdown.
+test_final_risk_marker_fallback() {
+  local mode body risk dir rc expected reviews second before=$FAIL
+  risk='<!-- final_review_risk_start -->
+**Merge Risk:** _🟡 Moderate_ · up to `e192e`
+<!-- final_review_risk_end -->'
+  for mode in stale matching unparseable incomplete absent fenced coverage chat-risk exact-run matching-rate-limit; do
+    body=$risk; expected=0; reviews='[]'; second=''
+    case "$mode" in
+      stale) expected=4 ;;
+      matching|matching-rate-limit) body=${risk/e192e/F9C78} ;;
+      unparseable) body=${risk/e192e/not-a-sha} ;;
+      incomplete) body=${risk/<!-- final_review_risk_end -->/} ;;
+      absent) body='' ;;
+      fenced) body=$(printf '```\n%s\n```' "$risk") ;;
+      coverage)
+        body=$(printf '%s\n' '<!-- final_review_risk_start -->' '**Merge Risk:** _⚪ Minimal_ · up to `f9c78`' \
+          "<!-- final_review_risk_coverage:{\"sourceCommitId\":\"$HEAD_SHA_40\",\"coveredCommitId\":\"$HEAD_SHA_40\",\"kind\":\"reviewed\"} -->" \
+          '<!-- final_review_risk_end -->') ;;
+      chat-risk) second=$risk; body='' ;;
+      exact-run)
+        reviews=$(jq -nc --arg sha "$HEAD_SHA_40" '[{id:5501,user:{login:"coderabbitai[bot]"},commit_id:$sha,submitted_at:"2026-06-04T00:01:00Z",body:"**Actionable comments posted: 0**"}]') ;;
+    esac
+    body=$(printf '%s\n\n%s\n' "$SUMMARY_NAMES_NO_SHA" "$body")
+    dir=$(make_case "1034-$mode" "$body" "$STATUS_TIME" 'Review rate limited' \
+      "$SUMMARY_CREATED_BEFORE_HEAD" 999999999 "$second" '2026-06-04T00:01:00Z' "$HEAD_SHA_40" "$SUMMARY_EDITED_AFTER_HEAD")
+    sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 15/' "$dir/.github/review-policy.yml"
+    if [ "$mode" = matching-rate-limit ]; then
+      expected=5
+    else
+      sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+    fi
+    rc=$(CODERABBIT_TEST_REVIEWS_RAW="$reviews" run_case "$dir")
+    [ "$rc" = "$expected" ] || fail "1034 $mode: rc=$rc expected=$expected; $(tail -3 "$dir/err.log")"
+    if [ "$mode" = stale ]; then
+      grep -q "fresh_at=$SUMMARY_EDITED_AFTER_HEAD" "$dir/err.log" || fail '1034 stale never passed freshness floor'
+      grep -q 'final_review_risk.*different commit' "$dir/err.log" || fail '1034 stale did not reach risk refusal'
+      [ "$(jqf "$dir" '.status')" = timeout ] || fail '1034 stale false-cleared'
+    elif [ "$mode" = exact-run ]; then
+      grep -q 'exact-SHA rung wins outright' "$dir/err.log" || fail '1034 exact run did not supply clearance'
+    elif [ "$mode" = matching-rate-limit ]; then
+      [ "$(stub_calls "$dir")" = 1 ] || fail '1034 matching prefix manufactured authority over rate-limit status'
+    fi
+  done
+  [ "$FAIL" -ne "$before" ] || pass '#1034: stale risk refuses fallback; matching, malformed, fenced and exact-run controls preserve behavior'
+}
+
+test_final_risk_marker_fallback
+
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
 test_later_notice_does_not_mask_head_summary

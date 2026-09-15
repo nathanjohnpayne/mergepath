@@ -3780,6 +3780,23 @@ crw_select_summary_comment() {
 # END coderabbit_summary_selector
 
 # BEGIN coderabbit_summary_head_claim
+# #1034: the risk block is negative evidence only. Keep this separate from
+# summary_names_only_other_head, whose other caller also decides escalation.
+# Missing/unparseable blocks make no claim; only a complete unfenced block is
+# read. Coverage JSON inside the block is not a head claim for this predicate.
+crw_summary_risk_names_other_head() { # body head-sha
+  local unfenced risk prefix
+  local block_pattern='<!-- final_review_risk_start -->(.*)<!-- final_review_risk_end -->'
+  # shellcheck disable=SC2016 # Literal Markdown backticks in the provider text.
+  local prefix_pattern='up to `([0-9a-fA-F]+)`'
+  unfenced=$(crw_unfenced_body "$1") || return 3
+  [[ "$unfenced" =~ $block_pattern ]] || return 1
+  risk=${BASH_REMATCH[1]}
+  [[ "$risk" =~ $prefix_pattern ]] || return 1
+  prefix=$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]') || return 3
+  case "$2" in "$prefix"*) return 1 ;; *) return 0 ;; esac
+}
+
 # #968 AC1. The other-head demotion is a statement about the review SUMMARY,
 # and the two clearance sites evaluated it against whatever body the poll loop
 # happened to be holding instead. Those two coincide only while the summary IS
@@ -3830,6 +3847,14 @@ crw_summary_blocks_fallback_clearance() {
     case "$rc" in
       0)
         log "the CodeRabbit summary's commits range names a different commit than $head_sha — an in-place edit is not a re-review (#968)"
+        return 0 ;;
+      1) ;;
+      *) return 3 ;;
+    esac
+    rc=0; crw_summary_risk_names_other_head "$sbody" "$head_sha" || rc=$?
+    case "$rc" in
+      0)
+        log "the CodeRabbit summary's final_review_risk block names a different commit than $head_sha — refusing fallback clearance (#1034)"
         return 0 ;;
       1) ;;
       *) return 3 ;;
