@@ -11,6 +11,16 @@ const AUTHORING_AGENT_RE = /^Authoring-Agent:\s*(.*?)\s*$/i;
 const SELF_REVIEW_RE = /^##[ \t]+Self-Review(?:[ \t]+#*)?[ \t]*$/i;
 const CONTAINERS = new Set(['blockquote', 'list', 'listItem']);
 
+// GitHub's renderer stops opening new list containers past ten levels; deeper
+// markers become content of the innermost item rather than fresh containers.
+// Verified against POST /markdown: `'- '.repeat(n)` renders exactly ten `<ul>`
+// for every n >= 10.
+const MAX_LIST_DEPTH = 10;
+
+// The codes micromark registers the CommonMark `list` construct under: the
+// three bullet markers and the ten digits that can open an ordered item.
+const LIST_MARKER_CODES = [42, 43, 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
+
 function rawLines(body) {
   return body.split(/\r\n|\r|\n/);
 }
@@ -21,6 +31,87 @@ function gfmMembershipExtensions() {
   // mdast enter/exit handler, but omit post-parse transforms such as autolink
   // linkification, whose recursive visitor cannot affect this contract.
   return gfmFromMarkdown().map((extension) => ({ ...extension, transforms: [] }));
+}
+
+// micromark opens list containers without any nesting bound, so a single line
+// of repeated markers costs O(n^2): the document tokenizer re-shuffles its
+// whole event array as each container opens. A 60,042-byte body of
+// `'- '.repeat(30000)` does not finish in 45 seconds, while the parser this
+// file replaces answers it in about 0.2 seconds -- and PR bodies are untrusted
+// input that three validator invocations each re-parse. micromark 4.0.2 is
+// the current release and exposes no depth option.
+//
+// Bound the nesting at the depth GitHub itself stops nesting at. This is a
+// gate, not a parser: the construct below never tokenizes a list. It runs
+// before the upstream `list` construct at each marker code and either lets it
+// run untouched, or -- past the bound -- vetoes it by name for exactly one
+// attempt, so the marker becomes content of the innermost open item. A third
+// construct registered after `list` lifts the veto in the same attempt, so no
+// later sibling item can inherit it.
+//
+// Truncating depth cannot change this contract's answers. Membership is the
+// boolean "inside at least one container", and a marker that sits inside ten
+// list levels sits inside a container on either reading.
+function boundedListNesting(limit) {
+  const states = new WeakMap();
+
+  function stateFor(self) {
+    let state = states.get(self);
+    if (!state) {
+      state = { line: 0, depth: 0 };
+      states.set(self, state);
+    }
+    const { line } = self.now();
+    if (line !== state.line) {
+      state.line = line;
+      state.depth = 0;
+    }
+    return state;
+  }
+
+  function veto(self, on) {
+    const disabled = self.parser.constructs.disable.null;
+    const at = disabled.indexOf('list');
+    if (on && at === -1) disabled.push('list');
+    if (!on && at !== -1) disabled.splice(at, 1);
+  }
+
+  const gate = {
+    name: 'boundedListGate',
+    add: 'before',
+    tokenize(effects, ok, nok) {
+      veto(this, false);
+      const state = stateFor(this);
+      // A sibling item re-attempts `list` against the OPEN container's state,
+      // which already carries its depth. It adds no nesting.
+      const open = this.containerState._boundedListDepth;
+      if (typeof open === 'number') {
+        state.depth = open;
+        return nok;
+      }
+      const depth = state.depth + 1;
+      if (depth > limit) {
+        veto(this, true);
+        return nok;
+      }
+      this.containerState._boundedListDepth = depth;
+      state.depth = depth;
+      return nok;
+    },
+  };
+
+  const lift = {
+    name: 'boundedListLift',
+    add: 'after',
+    tokenize(effects, ok, nok) {
+      veto(this, false);
+      return nok;
+    },
+  };
+
+  const document = {};
+  for (const code of LIST_MARKER_CODES) document[code] = [gate, lift];
+  return { document };
 }
 
 function covers(position, line, column = 1) {
@@ -86,7 +177,7 @@ function visibleLinesAfterComments(body, lines, entries) {
 export function parsePrBodyContract(body) {
   const lines = rawLines(body);
   const entries = collect(fromMarkdown(body, {
-    extensions: [gfm()],
+    extensions: [gfm(), boundedListNesting(MAX_LIST_DEPTH)],
     mdastExtensions: gfmMembershipExtensions(),
   }));
   const visibleLines = visibleLinesAfterComments(body, lines, entries);

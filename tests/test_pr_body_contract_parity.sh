@@ -24,7 +24,8 @@ TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
 # later REPLACES this one rather than extending it, which leaked the detector
 # file on every run that reached it.
 TMP_BASE_TREE=""
-trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"' EXIT
+TMP_DEPTH_TREE=""
+trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"; [ -n "${TMP_DEPTH_TREE:-}" ] && rm -rf "$TMP_DEPTH_TREE"' EXIT
 
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
@@ -986,6 +987,143 @@ renderer_contract "deep blockquote excludes its nested declaration without a sta
 renderer_contract "top-level declarations remain valid after the deep-container case" \
   '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
   $'Authoring-Agent: codex\n\n## Self-Review\n'
+
+# --- 15. the list-nesting bound (#1281) --------------------------------------
+# micromark opens list containers with no nesting bound, and its document
+# tokenizer re-shuffles the whole event array per container, so a single line
+# of repeated markers costs quadratic time. Codex's repro -- the exact
+# 60,042-byte body below -- did not finish in 45 seconds on the runtime before
+# the bound, against about 0.2 seconds for the parser this one replaces. PR
+# bodies are untrusted and every validator invocation re-parses them.
+#
+# The bound is set at ten, the depth GitHub's own renderer stops at. Two
+# independent properties are pinned here, and the FIRST two checks are the ones
+# with teeth:
+#
+#   (a) complexity -- the deep body parses in bounded time. Verified by
+#       mutation: the pre-bound runtime fails this at 180s.
+#   (b) answer-preservation -- a bound only stays safe while it is wide enough.
+#       This is NOT expressible as fixed expectations: membership is the boolean
+#       "inside at least one container", so truncating depth changes no single
+#       answer, and hand-written cases pass against a bound of 1 as readily as
+#       against 10. It is a DIFFERENTIAL property, so it is tested as one,
+#       against an unbounded build of the shipped bundle. Verified by mutation:
+#       a bound of 1 diverges on 58 of 20000 bodies -- and diverges FAIL-OPEN,
+#       reading a six-marker duplicate body as a single valid declaration.
+#
+# The renderer controls that follow are documentation of where GitHub places
+# over-deep content, and a guard against a bound that breaks membership
+# outright. They are deliberately not claimed as coverage of the depth itself.
+
+DEEP_LIST=''
+for ((index = 0; index < 30000; index += 1)); do DEEP_LIST+='- '; done
+DEEP_LIST_BODY="${DEEP_LIST}"$'x\n\nAuthoring-Agent: codex\n\n## Self-Review\n'
+
+deep_list_start="$(date +%s)"
+deep_list_contract="$(printf '%s' "$DEEP_LIST_BODY" \
+  | node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null)"
+deep_list_elapsed="$(( $(date +%s) - deep_list_start ))"
+
+if [ "$deep_list_contract" = '{"author":"codex","authorCount":1,"hasSelfReview":true}' ]; then
+  ok "#1281: a 30000-deep list leaves the following top-level declarations valid"
+else
+  bad "#1281: deep-list body: expected the top-level contract, got [$deep_list_contract]"
+fi
+
+# 30s against a pre-bound runtime that took 180s and a bounded one that takes
+# under a second: wide enough to measure the complexity class rather than the
+# load on this machine.
+if [ "$deep_list_elapsed" -lt 30 ]; then
+  ok "#1281: a 30000-deep list parses in bounded time (${deep_list_elapsed}s)"
+else
+  bad "#1281: deep-list body took ${deep_list_elapsed}s -- the nesting bound is not holding"
+fi
+
+TMP_DEPTH_TREE="$(mktemp -d "${TMPDIR:-/tmp}/parity-depth.XXXXXX")"
+cat > "$TMP_DEPTH_TREE/differential.mjs" <<'DIFFERENTIAL'
+// Compare the shipped bundle against an unbounded build of ITSELF. Both sides
+// come from one file, so the ONLY difference is the bound.
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const [bundlePath, workDir, totalRaw] = process.argv.slice(2);
+const bundle = readFileSync(bundlePath, 'utf8');
+
+// Neutralise the CLI tail so the module can be imported for its export, and
+// derive the unbounded build. Every patch point is asserted: a silently
+// unpatched variant would compare the bundle with itself and always pass, and
+// a CLI left live would read stdin and write over this script's own output.
+const MODE = 'var mode = process.argv[2];';
+const CLI = 'var contract = parsePrBodyContract(readFileSync(0, "utf8"));';
+const BOUND = 'extensions: [gfm(), boundedListNesting(MAX_LIST_DEPTH)]';
+if (!bundle.includes(MODE)) throw new Error('CLI mode point not found in the bundle');
+if (!bundle.includes(CLI)) throw new Error('CLI read point not found in the bundle');
+if (!bundle.includes(BOUND)) throw new Error('bound call not found in the bundle');
+// `--has-self-review` is the one CLI branch that writes nothing at all.
+const importable = bundle
+  .replace(MODE, 'var mode = "--has-self-review";')
+  .replace(CLI, 'var contract = { author: "", authorCount: 0, hasSelfReview: true };');
+writeFileSync(join(workDir, 'bounded.mjs'), importable);
+writeFileSync(join(workDir, 'unbounded.mjs'), importable.replace(BOUND, 'extensions: [gfm()]'));
+
+const bounded = (await import(join(workDir, 'bounded.mjs'))).parsePrBodyContract;
+const unbounded = (await import(join(workDir, 'unbounded.mjs'))).parsePrBodyContract;
+process.exitCode = 0;
+
+// Markers that open containers, padding that changes the indent class, and the
+// content shapes this contract turns on. Nesting straddles the bound of ten.
+const MARKERS = ['- ', '* ', '+ ', '1. ', '1) ', '> ', '  ', '\t', '    '];
+const CONTENT = [
+  'Authoring-Agent: claude', 'Authoring-Agent: codex', '## Self-Review', 'text',
+  '<!-- Authoring-Agent: codex -->', '```', '<div>', '# h', '---', '===',
+  '`code`', '', '   ', ' ', '- [ ] task', '## Self-Review ##',
+];
+
+// A fixed seed: this is a permanent control, so it must fail reproducibly.
+let rng = 20260915;
+const rand = (n) => ((rng = (rng * 1103515245 + 12345) & 0x7fffffff) % n);
+
+const total = Number(totalRaw);
+let mismatches = 0;
+let first = '';
+for (let index = 0; index < total; index += 1) {
+  const lines = [];
+  const lineCount = 1 + rand(7);
+  for (let line = 0; line < lineCount; line += 1) {
+    let prefix = '';
+    const depth = rand(16);
+    for (let step = 0; step < depth; step += 1) prefix += MARKERS[rand(MARKERS.length)];
+    lines.push(prefix + CONTENT[rand(CONTENT.length)]);
+  }
+  const body = lines.join('\n');
+  const want = JSON.stringify(unbounded(body));
+  const got = JSON.stringify(bounded(body));
+  if (want !== got) {
+    mismatches += 1;
+    if (!first) first = `${JSON.stringify(body)} unbounded=${want} bounded=${got}`;
+  }
+}
+process.stdout.write(`${mismatches} ${total} ${first}\n`);
+DIFFERENTIAL
+
+depth_differential="$(node "$TMP_DEPTH_TREE/differential.mjs" \
+  "$ROOT/scripts/lib/pr-body-contract.mjs" "$TMP_DEPTH_TREE" 10000)"
+depth_mismatches="${depth_differential%% *}"
+if [ "$depth_mismatches" = "0" ]; then
+  ok "#1281: the bound changes no contract answer across 10000 randomized bodies"
+else
+  bad "#1281: the bound changed $depth_mismatches answers: ${depth_differential#* }"
+fi
+
+# Where GitHub actually places over-deep content, recorded from POST /markdown:
+# it stops opening new `<ul>` containers at ten levels and folds deeper markers
+# into the innermost item, so the content stays inside a container either way.
+renderer_contract "#1281: an over-deep nested declaration stays inside its list" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  "$(printf -- '- %.0s' {1..12})"$'Authoring-Agent: claude\n'
+renderer_contract "#1281: a top-level declaration after an over-deep list stays valid" \
+  '{"author":"claude","authorCount":1,"hasSelfReview":true}' \
+  "$(printf -- '- %.0s' {1..12})"$'x\n\nAuthoring-Agent: claude\n\n## Self-Review\nok'
 
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
