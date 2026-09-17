@@ -931,6 +931,21 @@ renderer_contract "nested-list continuation keeps its later declaration in the i
 renderer_contract "inline author comment remains part of a valid declaration" \
   '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
   $'Authoring-Agent: co<!-- note -->dex\n## Self-Review\n'
+# A comment INSIDE the heading delimiter is a different case from one after the
+# heading text, and the difference is not cosmetic: `##<!--x--> Self-Review` and
+# `#<!--x--># Self-Review` reduce to `## Self-Review` once comments are removed,
+# but GitHub renders NEITHER as a heading at all -- no `<h2>`, no `<h1>`. The
+# handwritten parser replaced here answered `hasSelfReview: true` for both,
+# letting a line that renders as plain text satisfy the Self-Review gate. This
+# parser answers false, matching the renderer. Codex read that as a regression
+# against the previous parser (finding 4040736899); it is a tightening, and
+# these controls pin it so it cannot be loosened back by accident.
+renderer_contract "a comment inside the heading delimiter does not make a heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'Authoring-Agent: codex\n\n##<!--x--> Self-Review\nok\n'
+renderer_contract "a comment splitting the heading delimiter does not make a heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'Authoring-Agent: codex\n\n#<!--x--># Self-Review\nok\n'
 renderer_contract "inline heading comment remains part of a valid heading" \
   '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
   $'Authoring-Agent: codex\n## Self-Review <!-- note -->\n'
@@ -1051,9 +1066,19 @@ else
   bad "#1281: 30000-deep blockquote returned [$deep_quote_contract]"
 fi
 
-renderer_contract "deep blockquote excludes its nested declaration without a stack overflow" \
-  '{"author":"","authorCount":0,"hasSelfReview":true}' \
-  "${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n'
+# The membership assertion REUSES the guarded parse above rather than launching
+# a second unguarded one. Re-parsing the same 30,000-level body through
+# renderer_contract would run node with no watchdog, so on the very regression
+# the timeout exists to terminate promptly, the suite would hang there until
+# the outer CI timeout -- the guard would have bought nothing (Codex finding
+# 4040736908). The expectation is identical to the renderer-verified one it
+# replaces; only the process launching it is shared.
+if [ "$deep_quote_rc" -eq 0 ] \
+  && [ "$deep_quote_contract" = '{"author":"","authorCount":0,"hasSelfReview":true}' ]; then
+  ok "#1192 renderer corpus: deep blockquote excludes its nested declaration without a stack overflow"
+elif [ "$deep_quote_rc" -eq 0 ]; then
+  bad "#1192 renderer corpus: deep blockquote membership: got [$deep_quote_contract]"
+fi
 renderer_contract "top-level declarations remain valid after the deep-container case" \
   '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
   $'Authoring-Agent: codex\n\n## Self-Review\n'
