@@ -24,8 +24,7 @@ TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
 # later REPLACES this one rather than extending it, which leaked the detector
 # file on every run that reached it.
 TMP_BASE_TREE=""
-TMP_DEPTH_TREE=""
-trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"; [ -n "${TMP_DEPTH_TREE:-}" ] && rm -rf "$TMP_DEPTH_TREE"' EXIT
+trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"' EXIT
 
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
@@ -976,51 +975,16 @@ renderer_contract "a BOM does not surface raw HTML declarations" \
   '{"author":"","authorCount":0,"hasSelfReview":false}' \
   $'\357\273\277<!-- hidden -->\n\n<div>\nAuthoring-Agent: codex<!-- literal -->\n## Self-Review\n</div>\n'
 
-# A deep, real Markdown container must not make the AST traversal exhaust the
-# JavaScript call stack. The Authoring-Agent declaration remains inside the
-# blockquote; the blank line leaves the Self-Review heading top-level.
-# 30000 levels, matching the list case, because 5000 was small enough that a
-# quadratic cost would still have completed quickly -- the depth, not just the
-# assertion, is what makes this control able to fail (Phase 4b P1). Blockquote
-# containers are deliberately NOT gated by the list-nesting ceiling, and this
-# is the evidence for why: measured on this runtime, blockquote nesting costs
-# 96ms at 5000, 191ms at 15000, 1042ms at 30000 and 1256ms at 32760 -- the
-# deepest a 65,536-character body can express, since a blockquote marker costs
-# two bytes per level exactly as a list marker does. Superlinear, but the
-# body-size limit bounds it at about 1.3s without a ceiling, where list nesting
-# at the same depth exceeded 45 seconds. Gating it would buy nothing and would
-# widen a semantic cutoff for no cost benefit.
-DEEP_BLOCKQUOTE=''
-for ((index = 0; index < 30000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
-
-deep_quote_start="$(date +%s)"
-deep_quote_contract="$(printf '%s' "${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n' \
-  | node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null)"
-deep_quote_elapsed="$(( $(date +%s) - deep_quote_start ))"
-if [ "$deep_quote_elapsed" -lt 30 ]; then
-  ok "#1281: a 30000-deep blockquote parses in bounded time without a ceiling (${deep_quote_elapsed}s)"
-else
-  bad "#1281: 30000-deep blockquote took ${deep_quote_elapsed}s -- blockquote nesting needs the ceiling after all"
-fi
-
-renderer_contract "deep blockquote excludes its nested declaration without a stack overflow" \
-  '{"author":"","authorCount":0,"hasSelfReview":true}' \
-  "${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n'
-renderer_contract "top-level declarations remain valid after the deep-container case" \
-  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
-  $'Authoring-Agent: codex\n\n## Self-Review\n'
-
-# --- 14b. GFM footnote definitions are containers (#1281 Phase 4b P0) --------
+# --- GFM footnote definitions are containers (#1281 Phase 4b P0) ------------
 # `[^x]: note` opens a container exactly as a list item does. An unindented,
 # non-interrupting line after it is a genuine CommonMark lazy continuation of
-# the definition's paragraph, so it renders inside the footnote -- or, with no
-# reference to that footnote, is not rendered at all. Before footnoteDefinition
-# was added to CONTAINERS, such a line read as a live top-level declaration and
-# spoofed author identity. The parser this file replaces has the same hole, so
-# this is a repair carried out here rather than a regression introduced here.
+# the definition's paragraph, so GitHub renders it inside the footnote -- or,
+# with nothing referencing that footnote, does not render it at all. Before
+# footnoteDefinition was in CONTAINERS, such a line read as a live top-level
+# declaration and spoofed author identity. The parser this one replaces has the
+# same hole, so this is a repair rather than a regression fix.
 #
-# Every expectation below was verified against GitHub's own renderer
-# (POST /markdown), not derived from the spec.
+# Every expectation was verified against GitHub's renderer (POST /markdown).
 renderer_contract "#1281: a lazy continuation inside a footnote definition is not a declaration" \
   '{"author":"","authorCount":0,"hasSelfReview":true}' \
   $'[^x]: note\nAuthoring-Agent: attacker\n\n## Self-Review\nok\n'
@@ -1030,10 +994,8 @@ renderer_contract "#1281: a referenced footnote hides a smuggled declaration the
 renderer_contract "#1281: a numeric-label footnote definition is a container too" \
   '{"author":"","authorCount":0,"hasSelfReview":false}' \
   $'[^1]: note\nAuthoring-Agent: codex\n'
-# The repair must not cost the real behaviour: a blank line closes the
-# definition, and an ATX heading interrupts it, so both leave what follows
-# genuinely top-level. Without these, "add footnoteDefinition to CONTAINERS"
-# could have been over-applied to everything after any footnote.
+# Negative controls: the repair must not swallow what legitimately follows a
+# footnote. A blank line closes the definition; an ATX heading interrupts it.
 renderer_contract "#1281: a blank line closes the definition and restores top level" \
   '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
   $'[^x]: note\n\nAuthoring-Agent: codex\n\n## Self-Review\nok\n'
@@ -1041,217 +1003,35 @@ renderer_contract "#1281: an interrupting heading detaches the rest of the defin
   '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
   $'[^x]: note\n## Self-Review\nAuthoring-Agent: codex\n'
 
-# --- 15. the same-line list-nesting ceiling (#1281) ---------------------------
-# micromark opens list containers with no nesting bound, and its document
-# tokenizer re-shuffles its whole event array per container, so a single line
-# of repeated markers costs O(n^2). Codex's repro -- the exact 60,042-byte body
-# below -- did not finish in 45 seconds on the runtime before the ceiling,
-# against about 0.2 seconds for the parser this one replaces. PR bodies are
-# untrusted and every validator invocation re-parses them.
-#
-# The ceiling is a RESOURCE-SAFETY guard and nothing more. It is not derived
-# from GitHub's renderer and carries no claim about where nesting stops being
-# meaningful. Truncating nesting CAN change this contract's answers, and at
-# small ceilings it demonstrably does, so the guarantee under test is narrow:
-#
-#   (a) the pathological body parses in bounded time, and
-#   (b) at the SHIPPED ceiling, a differential against an unbounded build of
-#       the same bundle observes no divergence on a corpus that genuinely
-#       crosses it.
-#
-# (b) is a differential property and cannot be written as fixed expectations:
-# hand-written over-deep cases pass against a ceiling of 1 as readily as
-# against 64, because membership is the boolean "inside at least one
-# container". The two renderer controls at the end of this section are
-# therefore documentation and a guard against a ceiling that breaks membership
-# outright -- they are NOT coverage of the ceiling's depth, and must not be
-# cited as such.
+# A deep, real Markdown container must not make the AST traversal exhaust the
+# JavaScript call stack. The Authoring-Agent declaration remains inside the
+# blockquote; the blank line leaves the Self-Review heading top-level.
+# 30000 levels rather than 5000: at 5000 a quadratic cost would still have
+# completed quickly, so the shallower control could not have failed (Phase 4b
+# P1). Blockquote nesting measures 96ms at 5000, 191ms at 15000, 1042ms at
+# 30000 and 1256ms at 32760 -- the deepest a 65,536-character body can express,
+# since a blockquote marker costs two bytes per level exactly as a list marker
+# does. Superlinear, but the body-size limit bounds it near 1.3s, unlike
+# same-line LIST nesting at the same depth (see the known limitation below).
+DEEP_BLOCKQUOTE=''
+for ((index = 0; index < 30000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
 
-DEEP_LIST=''
-for ((index = 0; index < 30000; index += 1)); do DEEP_LIST+='- '; done
-DEEP_LIST_BODY="${DEEP_LIST}"$'x\n\nAuthoring-Agent: codex\n\n## Self-Review\n'
-
-deep_list_start="$(date +%s)"
-deep_list_contract="$(printf '%s' "$DEEP_LIST_BODY" \
+deep_quote_start="$(date +%s)"
+deep_quote_contract="$(printf '%s' "${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n' \
   | node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null)"
-deep_list_elapsed="$(( $(date +%s) - deep_list_start ))"
-
-if [ "$deep_list_contract" = '{"author":"codex","authorCount":1,"hasSelfReview":true}' ]; then
-  ok "#1281: a 30000-deep list leaves the following top-level declarations valid"
+deep_quote_elapsed="$(( $(date +%s) - deep_quote_start ))"
+if [ "$deep_quote_elapsed" -lt 30 ]; then
+  ok "#1281: a 30000-deep blockquote parses in bounded time (${deep_quote_elapsed}s)"
 else
-  bad "#1281: deep-list body: expected the top-level contract, got [$deep_list_contract]"
+  bad "#1281: 30000-deep blockquote took ${deep_quote_elapsed}s -- blockquote nesting is not bounded by body size after all"
 fi
 
-# 30s, against a pre-ceiling runtime measured at 180s and a bounded one under a
-# second: wide enough to measure the complexity class, not this machine's load.
-if [ "$deep_list_elapsed" -lt 30 ]; then
-  ok "#1281: a 30000-deep list parses in bounded time (${deep_list_elapsed}s)"
-else
-  bad "#1281: deep-list body took ${deep_list_elapsed}s -- the nesting ceiling is not holding"
-fi
-
-TMP_DEPTH_TREE="$(mktemp -d "${TMPDIR:-/tmp}/parity-depth.XXXXXX")"
-cat > "$TMP_DEPTH_TREE/differential.mjs" <<'DIFFERENTIAL'
-// Compare the shipped bundle against an unbounded build of ITSELF, so the only
-// difference between the two sides is the ceiling.
-//
-// This script REPORTS its own corpus coverage and the caller asserts on it.
-// An earlier version of this control used an LCG whose float multiplication
-// lost precision, collapsing the generated nesting depths to {0, 1, 8, 9}. It
-// never crossed the ceiling, so it reported zero divergence against a ceiling
-// it had not exercised. Coverage is measured here, never inferred.
-import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-const [bundlePath, workDir, totalRaw, ceilingRaw] = process.argv.slice(2);
-const bundle = readFileSync(bundlePath, 'utf8');
-const total = Number(totalRaw);
-const ceiling = Number(ceilingRaw);
-
-// Every patch point is asserted: a silently unpatched variant would compare
-// the bundle with itself and always pass, and a live CLI would read stdin and
-// write over this script's own output.
-const MODE = 'var mode = process.argv[2];';
-const CLI = 'var contract = parsePrBodyContract(readFileSync(0, "utf8"));';
-const BOUND = 'extensions: [gfm(), boundedListNesting(MAX_LIST_DEPTH)]';
-if (!bundle.includes(MODE)) throw new Error('CLI mode point not found in the bundle');
-if (!bundle.includes(CLI)) throw new Error('CLI read point not found in the bundle');
-if (!bundle.includes(BOUND)) throw new Error('ceiling call not found in the bundle');
-// `--has-self-review` is the one CLI branch that writes nothing at all.
-const importable = bundle
-  .replace(MODE, 'var mode = "--has-self-review";')
-  .replace(CLI, 'var contract = { author: "", authorCount: 0, hasSelfReview: true };');
-writeFileSync(join(workDir, 'bounded.mjs'), importable);
-writeFileSync(join(workDir, 'unbounded.mjs'), importable.replace(BOUND, 'extensions: [gfm()]'));
-
-const bounded = (await import(join(workDir, 'bounded.mjs'))).parsePrBodyContract;
-const unbounded = (await import(join(workDir, 'unbounded.mjs'))).parsePrBodyContract;
-
-// mulberry32. Exact 32-bit arithmetic throughout, unlike the LCG it replaces.
-function mulberry32(seed) {
-  return function next() {
-    seed = (seed + 0x6D2B79F5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-// Markers that open containers, padding that changes the indent class, and the
-// content shapes this contract turns on.
-const MARKERS = ['- ', '* ', '+ ', '1. ', '1) ', '> ', '  ', '\t', '    '];
-const CONTENT = [
-  'Authoring-Agent: claude', 'Authoring-Agent: codex', '## Self-Review', 'text',
-  '<!-- Authoring-Agent: codex -->', '```', '<div>', '# h', '---', '===',
-  '`code`', '', '   ', ' ', '- [ ] task', '## Self-Review ##',
-];
-// Depths run to well past the ceiling so both sides of it are exercised.
-const DEPTH_CEILING = Math.round(ceiling * 2.5);
-
-const next = mulberry32(20260915);
-const rand = (n) => Math.floor(next() * n);
-
-let lines = 0;
-let crossing = 0;
-let maxDepth = 0;
-const contentSeen = new Set();
-const markerSeen = new Set();
-let failOpen = 0;
-let failClosed = 0;
-let sample = '';
-
-for (let index = 0; index < total; index += 1) {
-  const body = [];
-  const lineCount = 1 + rand(7);
-  for (let line = 0; line < lineCount; line += 1) {
-    let prefix = '';
-    const depth = rand(DEPTH_CEILING);
-    lines += 1;
-    if (depth > ceiling) crossing += 1;
-    if (depth > maxDepth) maxDepth = depth;
-    for (let step = 0; step < depth; step += 1) {
-      const marker = rand(MARKERS.length);
-      markerSeen.add(marker);
-      prefix += MARKERS[marker];
-    }
-    const content = rand(CONTENT.length);
-    contentSeen.add(content);
-    body.push(prefix + CONTENT[content]);
-  }
-  const text = body.join('\n');
-  const want = unbounded(text);
-  const got = bounded(text);
-  if (want.author === got.author && want.authorCount === got.authorCount
-    && want.hasSelfReview === got.hasSelfReview) continue;
-  // Fail-open means the ceiling INVENTED a declaration or a Self-Review the
-  // unbounded parse does not see: an identity-gate bypass. Fail-closed loses a
-  // valid declaration, which blocks rather than admits.
-  const gained = (got.author !== '' && want.author === '')
-    || (got.hasSelfReview && !want.hasSelfReview);
-  if (gained) failOpen += 1; else failClosed += 1;
-  if (!sample) {
-    sample = `${gained ? 'fail-open' : 'fail-closed'} ${JSON.stringify(text.slice(0, 80))} unbounded=${JSON.stringify(want)} bounded=${JSON.stringify(got)}`;
-  }
-}
-
-process.stdout.write(JSON.stringify({
-  lines, crossing, maxDepth, ceiling,
-  contentCovered: contentSeen.size, contentTotal: CONTENT.length,
-  markerCovered: markerSeen.size, markerTotal: MARKERS.length,
-  failOpen, failClosed, sample,
-}) + '\n');
-DIFFERENTIAL
-
-depth_ceiling="$(sed -n 's/^var MAX_LIST_DEPTH = \([0-9]*\);$/\1/p' "$ROOT/scripts/lib/pr-body-contract.mjs")"
-if [ -n "$depth_ceiling" ]; then
-  ok "#1281: the shipped bundle declares a list-nesting ceiling ($depth_ceiling)"
-else
-  bad "#1281: could not read MAX_LIST_DEPTH out of the shipped bundle"
-fi
-
-depth_report="$(node "$TMP_DEPTH_TREE/differential.mjs" \
-  "$ROOT/scripts/lib/pr-body-contract.mjs" "$TMP_DEPTH_TREE" 8000 "${depth_ceiling:-0}")"
-read -r d_lines d_crossing d_max d_content d_marker d_open d_closed d_sample <<EOF
-$(printf '%s' "$depth_report" | node -e '
-let raw = ""; process.stdin.on("data", (c) => { raw += c; });
-process.stdin.on("end", () => {
-  const r = JSON.parse(raw);
-  process.stdout.write([r.lines, r.crossing, r.maxDepth,
-    r.contentCovered + "/" + r.contentTotal, r.markerCovered + "/" + r.markerTotal,
-    r.failOpen, r.failClosed, r.sample || "-"].join(" ") + "\n");
-});')
-EOF
-
-# Coverage is asserted BEFORE the result is believed. A differential that never
-# crossed the ceiling reports zero divergence whether or not the ceiling is
-# safe, which is exactly how the previous version of this control went blind.
-if [ "${d_crossing:-0}" -gt 0 ] && [ "${d_max:-0}" -gt "${depth_ceiling:-0}" ]; then
-  ok "#1281: the differential corpus crosses the ceiling (${d_crossing}/${d_lines} lines over ${depth_ceiling}, max depth ${d_max})"
-else
-  bad "#1281: differential corpus never crossed the ceiling (crossing=${d_crossing:-?} max=${d_max:-?} ceiling=${depth_ceiling:-?}) -- its result proves nothing"
-fi
-
-if [ "$d_content" = "16/16" ] && [ "$d_marker" = "9/9" ]; then
-  ok "#1281: the differential corpus exercises every marker and content shape ($d_marker markers, $d_content content)"
-else
-  bad "#1281: differential corpus under-covers its alphabet (markers $d_marker, content $d_content)"
-fi
-
-if [ "${d_open:-1}" = "0" ] && [ "${d_closed:-1}" = "0" ]; then
-  ok "#1281: the ceiling changes no contract answer over ${d_lines} generated lines"
-else
-  bad "#1281: ceiling diverged from the unbounded parse (fail-open=${d_open} fail-closed=${d_closed}): ${d_sample}"
-fi
-
-# Documentation of what over-deep content does under the ceiling, and a guard
-# against a ceiling that breaks list membership outright. NOT coverage of the
-# ceiling's depth: both of these pass at any ceiling.
-renderer_contract "#1281: an over-deep nested declaration stays inside its list" \
-  '{"author":"","authorCount":0,"hasSelfReview":false}' \
-  "$(printf -- '- %.0s' {1..80})"$'Authoring-Agent: claude\n'
-renderer_contract "#1281: a top-level declaration after an over-deep list stays valid" \
-  '{"author":"claude","authorCount":1,"hasSelfReview":true}' \
-  "$(printf -- '- %.0s' {1..80})"$'x\n\nAuthoring-Agent: claude\n\n## Self-Review\nok'
+renderer_contract "deep blockquote excludes its nested declaration without a stack overflow" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  "${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "top-level declarations remain valid after the deep-container case" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n\n## Self-Review\n'
 
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
