@@ -1051,17 +1051,25 @@ parse_with_timeout() { # seconds, body -> stdout; rc 124 on expiry, 127 unavaila
     | "$pwt_tool" "$pwt_seconds" node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null
 }
 
+# The bound is 120s, not a tight fit around the measured cost. This suite runs
+# from repo_lint.yml's check_gh_as_author, which does NOT use actions/setup-node
+# (only pr-review-policy.yml pins a version), so it executes on whatever Node
+# the runner provides. The control exists to catch a quadratic regression --
+# which is 180s or never-finishing, not 40s -- so a wide bound loses no
+# discriminating power and cannot flake a required check on a slower runtime or
+# a loaded runner (Codex finding 4040833101). Measured cost of this fixture:
+# 909ms on Node 20.20.2, 1074ms on 22.23.2, 1027ms on 24.21.0.
 DEEP_QUOTE_BODY="${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n'
 deep_quote_start="$(date +%s)"
-deep_quote_contract="$(parse_with_timeout 30 "$DEEP_QUOTE_BODY")"
+deep_quote_contract="$(parse_with_timeout 120 "$DEEP_QUOTE_BODY")"
 deep_quote_rc=$?
 deep_quote_elapsed="$(( $(date +%s) - deep_quote_start ))"
 if [ "$deep_quote_rc" -eq 127 ]; then
   bad "#1281: neither timeout nor gtimeout is available -- the blockquote bound cannot be enforced here"
 elif [ "$deep_quote_rc" -eq 124 ]; then
-  bad "#1281: 30000-deep blockquote exceeded the 30s bound -- blockquote nesting is not bounded by body size after all"
+  bad "#1281: 30000-deep blockquote exceeded the 120s bound -- blockquote nesting is not bounded by body size after all"
 elif [ "$deep_quote_contract" = '{"author":"","authorCount":0,"hasSelfReview":true}' ]; then
-  ok "#1281: a 30000-deep blockquote parses within an enforced 30s bound (${deep_quote_elapsed}s)"
+  ok "#1281: a 30000-deep blockquote parses within an enforced 120s bound (${deep_quote_elapsed}s)"
 else
   bad "#1281: 30000-deep blockquote returned [$deep_quote_contract]"
 fi
