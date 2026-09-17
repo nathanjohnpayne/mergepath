@@ -11,11 +11,9 @@ const AUTHORING_AGENT_RE = /^Authoring-Agent:\s*(.*?)\s*$/i;
 const SELF_REVIEW_RE = /^##[ \t]+Self-Review(?:[ \t]+#*)?[ \t]*$/i;
 const CONTAINERS = new Set(['blockquote', 'list', 'listItem']);
 
-// GitHub's renderer stops opening new list containers past ten levels; deeper
-// markers become content of the innermost item rather than fresh containers.
-// Verified against POST /markdown: `'- '.repeat(n)` renders exactly ten `<ul>`
-// for every n >= 10.
-const MAX_LIST_DEPTH = 10;
+// A resource-safety ceiling on same-line list nesting. See boundedListNesting
+// below for why it exists and what it does NOT claim.
+const MAX_LIST_DEPTH = 64;
 
 // The codes micromark registers the CommonMark `list` construct under: the
 // three bullet markers and the ten digits that can open an ordered item.
@@ -33,25 +31,44 @@ function gfmMembershipExtensions() {
   return gfmFromMarkdown().map((extension) => ({ ...extension, transforms: [] }));
 }
 
-// micromark opens list containers without any nesting bound, so a single line
-// of repeated markers costs O(n^2): the document tokenizer re-shuffles its
-// whole event array as each container opens. A 60,042-byte body of
+// RESOURCE-SAFETY GUARD, not a semantic rule.
+//
+// micromark opens list containers without any nesting bound, and its document
+// tokenizer re-shuffles its whole event array as each container opens, so a
+// single line of repeated markers costs O(n^2). A 60,042-byte body of
 // `'- '.repeat(30000)` does not finish in 45 seconds, while the parser this
 // file replaces answers it in about 0.2 seconds -- and PR bodies are untrusted
-// input that three validator invocations each re-parse. micromark 4.0.2 is
-// the current release and exposes no depth option.
+// input that three validator invocations each re-parse. micromark 4.0.2 and
+// mdast-util-from-markdown 2.0.3 are the current upstream releases and neither
+// exposes a depth option, so the ceiling has to live here.
 //
-// Bound the nesting at the depth GitHub itself stops nesting at. This is a
-// gate, not a parser: the construct below never tokenizes a list. It runs
-// before the upstream `list` construct at each marker code and either lets it
-// run untouched, or -- past the bound -- vetoes it by name for exactly one
-// attempt, so the marker becomes content of the innermost open item. A third
-// construct registered after `list` lifts the veto in the same attempt, so no
-// later sibling item can inherit it.
+// The ceiling is justified ONLY as a cost bound on micromark's pathological
+// same-line list nesting. It is NOT a claim that 64 levels is where list
+// nesting stops meaning anything, and in particular it is NOT derived from
+// GitHub's renderer: cmark-gfm does cap list nesting, but it emits sibling
+// items past its cap rather than folding deeper markers into the innermost
+// item, so its lazy-continuation behaviour differs from what this gate
+// produces. Matching its number would not match its behaviour.
 //
-// Truncating depth cannot change this contract's answers. Membership is the
-// boolean "inside at least one container", and a marker that sits inside ten
-// list levels sits inside a container on either reading.
+// Truncating nesting CAN change this contract's answers, and at small
+// ceilings it does. The ceiling is therefore chosen empirically, as the point
+// where a differential against an unbounded parse stops diverging, with
+// margin. Over 1,277,759 generated lines (8 seeds) whose nesting straddles
+// each candidate, divergences were: ceiling 20 -> 7, ceiling 24 -> 2, ceiling
+// 32 -> 0, ceiling 64 -> 0. The margin is not decoration: a 10x smaller corpus
+// showed ceiling 24 clean, and only the larger one exposed it. Worst-case cost
+// at GitHub's 65,536-character body limit is flat from 24 to 64 (about 3.2s
+// CPU on Node 22, 2.4s on Node 24, on the many-lines-at-the-ceiling shape a
+// ceiling steers an adversary toward), so going lower buys nothing and 64
+// takes the headroom. Every divergence observed at any ceiling was
+// fail-closed -- a lost declaration, which blocks -- never fail-open.
+//
+// This is a gate, not a parser: the construct below never tokenizes a list. It
+// runs before the upstream `list` construct at each marker code and either
+// lets it run untouched, or -- past the ceiling -- vetoes it by name for
+// exactly one attempt, so the marker becomes content of the innermost open
+// item. A third construct registered after `list` lifts the veto in the same
+// attempt, so no later sibling item can inherit it.
 function boundedListNesting(limit) {
   const states = new WeakMap();
 

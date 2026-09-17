@@ -10,13 +10,19 @@ CommonMark with GFM extensions decides whether a raw candidate belongs to the do
 
 The parser uses GFM tokenization and mdast handlers to establish source positions and block membership; it does not render Markdown or consume rewritten inline link nodes. Its GFM post-parse transforms are therefore omitted, retaining the CLI's marker and membership results while avoiding an irrelevant recursive linkification walk.
 
-## List-nesting bound
+## Same-line list-nesting ceiling
 
-List container nesting is bounded at ten levels, the depth GitHub's own renderer stops at: `POST /markdown` returns exactly ten `<ul>` elements for `'- '.repeat(n)` at every `n >= 10`, folding deeper markers into the innermost item. micromark applies no such bound, and its document tokenizer re-shuffles the whole event array as each container opens, so a single line of repeated markers costs quadratic time---a 60,042-byte body of `'- '.repeat(30000)` does not complete in 45 seconds. PR bodies are untrusted input that every validator invocation re-parses.
+Same-line list container nesting is capped at 64 levels. This is a resource-safety guard and carries no semantic claim.
 
-The bound is a gate, not a second parser. A construct registered before the upstream `list` construct at each marker code either lets it run untouched or, past the bound, disables it by name for exactly one attempt; a construct registered after it lifts that veto in the same attempt, so no later sibling item inherits it. No Markdown is tokenized by this repository.
+micromark opens list containers with no nesting bound, and its document tokenizer re-shuffles its whole event array as each container opens, so a single line of repeated markers costs quadratic time: a 60,042-byte body of `'- '.repeat(30000)` does not complete in 45 seconds, while the parser this one replaces answers it in about 0.2 seconds. PR bodies are untrusted input that every validator invocation re-parses. micromark 4.0.2 and mdast-util-from-markdown 2.0.3 are the current upstream releases and neither exposes a depth option, so the ceiling lives in this adapter.
 
-Truncating depth cannot change the contract's answers. Membership is the boolean "inside at least one container", and a candidate inside ten list levels is inside a container on either reading. A 60,000-body randomized differential across nesting depths that straddle the bound found no answer that differs from the unbounded parse.
+The ceiling is **not** derived from GitHub's rendering. cmark-gfm does cap list nesting, but it emits sibling items past its cap rather than folding deeper markers into the innermost item, so its lazy-continuation behaviour differs from what this gate produces; matching its number would not match its behaviour. Nothing here asserts that 64 levels is where list nesting stops being meaningful.
+
+Truncating nesting can change the contract's answers, and at small ceilings it does. The value is therefore chosen empirically. Across 1,277,759 generated lines from eight seeds, whose nesting straddles each candidate, divergence from an unbounded parse falls away with depth: ceiling 20 diverges 7 times, ceiling 24 twice, ceiling 32 and ceiling 64 not at all. The margin above that tail is load-bearing rather than decorative---a corpus ten times smaller showed ceiling 24 clean, and only the larger one exposed it. Worst-case cost at GitHub's 65,536-character body limit is flat from 24 to 64 (about 3.2s CPU on Node 22 and 2.4s on Node 24, measured on the many-lines-at-the-ceiling shape that a ceiling steers an adversary toward), so going lower buys nothing and 64 takes the headroom. Every divergence observed at any ceiling was fail-closed, losing a declaration rather than inventing one.
+
+Zero observed divergence is evidence about the tested corpus, not a proof of renderer fidelity or of general answer-preservation.
+
+The ceiling is a gate, not a second parser. A construct registered before the upstream `list` construct at each marker code either lets it run untouched or, past the ceiling, disables it by name for exactly one attempt; a construct registered after it lifts that veto in the same attempt, so no later sibling item inherits it. No Markdown is tokenized by this repository.
 
 ## Generated runtime and rebuild
 
@@ -28,4 +34,4 @@ The lock pins every build dependency. The rebuild uses its esbuild metafile to i
 
 ## Regression coverage
 
-`tests/test_pr_body_contract_parity.sh` verifies the stable CLI result and all existing consumers' shared-parser use. Its #1192 corpus covers renderer-confirmed quote-first-block, list-transition, nested-list, comment, code, and malformed-heading outcomes. Its #1281 controls pin both halves of the list-nesting bound: an over-deep body parses in bounded time and still yields the top-level contract, while declarations genuinely inside the over-deep list, its lazy continuation, and its sibling items stay excluded exactly as the renderer places them.
+`tests/test_pr_body_contract_parity.sh` verifies the stable CLI result and all existing consumers' shared-parser use. Its #1192 corpus covers renderer-confirmed quote-first-block, list-transition, nested-list, comment, code, and malformed-heading outcomes. Its #1281 controls pin the narrow guarantee the ceiling actually makes: the pathological body parses in bounded time, and a differential against an unbounded build of the same bundle observes no divergence. That differential asserts its own measured coverage first---how many generated lines crossed the ceiling, and whether every marker and content shape was drawn---because an earlier version used a generator whose float multiplication collapsed the depths to a set that never reached the ceiling, and so reported zero divergence against a ceiling it had not exercised.
