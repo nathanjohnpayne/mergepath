@@ -1000,6 +1000,22 @@ renderer_contract "a BOM does not surface raw HTML declarations" \
 # same hole, so this is a repair rather than a regression fix.
 #
 # Every expectation was verified against GitHub's renderer (POST /markdown).
+# GFM table cells are containers too, and the unpiped form is the one that
+# slipped: `header` / `| --- |` / a marker line puts the declaration in a
+# tableCell, which GitHub renders inside a <td>. The parser being replaced
+# accepts it, so this is a repair rather than a regression (Codex finding
+# 4041000028). The piped form was already rejected, because the marker regex
+# anchors at column one and `| Authoring-Agent:` does not match there -- it is
+# pinned below so the two forms cannot drift apart.
+renderer_contract "#1281: an unpiped table cell declaration is not top level" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'header\n| --- |\nAuthoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "#1281: a piped table cell declaration is not top level either" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'| h |\n| --- |\n| Authoring-Agent: codex |\n\n## Self-Review\n'
+renderer_contract "#1281: a declaration after a table stays top level" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'header\n| --- |\ncell\n\nAuthoring-Agent: codex\n\n## Self-Review\n'
 renderer_contract "#1281: a lazy continuation inside a footnote definition is not a declaration" \
   '{"author":"","authorCount":0,"hasSelfReview":true}' \
   $'[^x]: note\nAuthoring-Agent: attacker\n\n## Self-Review\nok\n'

@@ -18,7 +18,18 @@ const SELF_REVIEW_RE = /^##[ \t]+Self-Review(?:[ \t]+#*)?[ \t]*$/i;
 // the same hole; it is repaired here rather than carried forward, because
 // this contract's stated guarantee is that GFM membership decides
 // top-level-ness, and this parser builds the node and then ignored it.
-const CONTAINERS = new Set(['blockquote', 'list', 'listItem', 'footnoteDefinition']);
+// GFM table cells are containers for the same reason: `header` / `| --- |` /
+// `Authoring-Agent: codex` puts the declaration in a tableCell, which GitHub
+// renders inside a `<td>`. The parser this file replaces accepts it too, so
+// this is a repair rather than a regression. The set below was checked by
+// sweeping every construct that can hold a marker line -- blockquote, list
+// item, list lazy continuation, footnote definition, table cell in both piped
+// and unpiped form, task list item, and a blockquote nested in a list item --
+// against GitHub's renderer; the unpiped table cell was the only disagreement.
+const CONTAINERS = new Set([
+  'blockquote', 'list', 'listItem', 'footnoteDefinition',
+  'table', 'tableRow', 'tableCell',
+]);
 
 function rawLines(body) {
   return body.split(/\r\n|\r|\n/);
