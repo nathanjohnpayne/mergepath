@@ -9,7 +9,16 @@ import { gfm } from 'micromark-extension-gfm';
 
 const AUTHORING_AGENT_RE = /^Authoring-Agent:\s*(.*?)\s*$/i;
 const SELF_REVIEW_RE = /^##[ \t]+Self-Review(?:[ \t]+#*)?[ \t]*$/i;
-const CONTAINERS = new Set(['blockquote', 'list', 'listItem']);
+// A GFM footnote definition is a container exactly as a list item is: an
+// unindented, non-interrupting line after `[^x]: note` is a lazy continuation
+// of the definition's paragraph, and GitHub renders it inside the footnote --
+// or, with no reference to the footnote, does not render it at all. Omitting
+// the node type here let such a line read as a live top-level declaration,
+// which is identity spoofing (Phase 4b P0, and Codex finding 4012896772
+// before it). The parser this file replaces has the same hole; it is repaired
+// here rather than carried forward, because this contract's stated guarantee
+// is that GFM membership decides top-level-ness.
+const CONTAINERS = new Set(['blockquote', 'list', 'listItem', 'footnoteDefinition']);
 
 // A resource-safety ceiling on same-line list nesting. See boundedListNesting
 // below for why it exists and what it does NOT claim.

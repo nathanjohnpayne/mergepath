@@ -979,14 +979,67 @@ renderer_contract "a BOM does not surface raw HTML declarations" \
 # A deep, real Markdown container must not make the AST traversal exhaust the
 # JavaScript call stack. The Authoring-Agent declaration remains inside the
 # blockquote; the blank line leaves the Self-Review heading top-level.
+# 30000 levels, matching the list case, because 5000 was small enough that a
+# quadratic cost would still have completed quickly -- the depth, not just the
+# assertion, is what makes this control able to fail (Phase 4b P1). Blockquote
+# containers are deliberately NOT gated by the list-nesting ceiling, and this
+# is the evidence for why: measured on this runtime, blockquote nesting costs
+# 96ms at 5000, 191ms at 15000, 1042ms at 30000 and 1256ms at 32760 -- the
+# deepest a 65,536-character body can express, since a blockquote marker costs
+# two bytes per level exactly as a list marker does. Superlinear, but the
+# body-size limit bounds it at about 1.3s without a ceiling, where list nesting
+# at the same depth exceeded 45 seconds. Gating it would buy nothing and would
+# widen a semantic cutoff for no cost benefit.
 DEEP_BLOCKQUOTE=''
-for ((index = 0; index < 5000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
+for ((index = 0; index < 30000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
+
+deep_quote_start="$(date +%s)"
+deep_quote_contract="$(printf '%s' "${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n' \
+  | node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null)"
+deep_quote_elapsed="$(( $(date +%s) - deep_quote_start ))"
+if [ "$deep_quote_elapsed" -lt 30 ]; then
+  ok "#1281: a 30000-deep blockquote parses in bounded time without a ceiling (${deep_quote_elapsed}s)"
+else
+  bad "#1281: 30000-deep blockquote took ${deep_quote_elapsed}s -- blockquote nesting needs the ceiling after all"
+fi
+
 renderer_contract "deep blockquote excludes its nested declaration without a stack overflow" \
   '{"author":"","authorCount":0,"hasSelfReview":true}' \
   "${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n'
 renderer_contract "top-level declarations remain valid after the deep-container case" \
   '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
   $'Authoring-Agent: codex\n\n## Self-Review\n'
+
+# --- 14b. GFM footnote definitions are containers (#1281 Phase 4b P0) --------
+# `[^x]: note` opens a container exactly as a list item does. An unindented,
+# non-interrupting line after it is a genuine CommonMark lazy continuation of
+# the definition's paragraph, so it renders inside the footnote -- or, with no
+# reference to that footnote, is not rendered at all. Before footnoteDefinition
+# was added to CONTAINERS, such a line read as a live top-level declaration and
+# spoofed author identity. The parser this file replaces has the same hole, so
+# this is a repair carried out here rather than a regression introduced here.
+#
+# Every expectation below was verified against GitHub's own renderer
+# (POST /markdown), not derived from the spec.
+renderer_contract "#1281: a lazy continuation inside a footnote definition is not a declaration" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'[^x]: note\nAuthoring-Agent: attacker\n\n## Self-Review\nok\n'
+renderer_contract "#1281: a referenced footnote hides a smuggled declaration the same way" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'see[^x]\n\n[^x]: note\nAuthoring-Agent: attacker\n\n## Self-Review\nok\n'
+renderer_contract "#1281: a numeric-label footnote definition is a container too" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'[^1]: note\nAuthoring-Agent: codex\n'
+# The repair must not cost the real behaviour: a blank line closes the
+# definition, and an ATX heading interrupts it, so both leave what follows
+# genuinely top-level. Without these, "add footnoteDefinition to CONTAINERS"
+# could have been over-applied to everything after any footnote.
+renderer_contract "#1281: a blank line closes the definition and restores top level" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'[^x]: note\n\nAuthoring-Agent: codex\n\n## Self-Review\nok\n'
+renderer_contract "#1281: an interrupting heading detaches the rest of the definition" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'[^x]: note\n## Self-Review\nAuthoring-Agent: codex\n'
 
 # --- 15. the same-line list-nesting ceiling (#1281) ---------------------------
 # micromark opens list containers with no nesting bound, and its document
