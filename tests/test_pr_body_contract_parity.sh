@@ -1016,14 +1016,39 @@ renderer_contract "#1281: an interrupting heading detaches the rest of the defin
 DEEP_BLOCKQUOTE=''
 for ((index = 0; index < 30000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
 
+# The bound has to be ENFORCED, not merely measured. Timing the parse after
+# the fact only reports how long a run that finished took: a genuine stall
+# would sit here until the enclosing job timeout and never reach the
+# comparison, so the control could not fail in exactly the case it exists to
+# catch (CodeRabbit finding 4039721486). Run it under a real timeout, and
+# treat "no timeout tool available" as a skip rather than a silent pass --
+# otherwise a machine without one reads as green.
+parse_with_timeout() { # seconds, body -> stdout; rc 124 on expiry, 127 unavailable
+  local pwt_seconds="$1" pwt_body="$2" pwt_tool=''
+  if command -v timeout >/dev/null 2>&1; then
+    pwt_tool=timeout
+  elif command -v gtimeout >/dev/null 2>&1; then
+    pwt_tool=gtimeout
+  else
+    return 127
+  fi
+  printf '%s' "$pwt_body" \
+    | "$pwt_tool" "$pwt_seconds" node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null
+}
+
+DEEP_QUOTE_BODY="${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n'
 deep_quote_start="$(date +%s)"
-deep_quote_contract="$(printf '%s' "${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n' \
-  | node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null)"
+deep_quote_contract="$(parse_with_timeout 30 "$DEEP_QUOTE_BODY")"
+deep_quote_rc=$?
 deep_quote_elapsed="$(( $(date +%s) - deep_quote_start ))"
-if [ "$deep_quote_elapsed" -lt 30 ]; then
-  ok "#1281: a 30000-deep blockquote parses in bounded time (${deep_quote_elapsed}s)"
+if [ "$deep_quote_rc" -eq 127 ]; then
+  bad "#1281: neither timeout nor gtimeout is available -- the blockquote bound cannot be enforced here"
+elif [ "$deep_quote_rc" -eq 124 ]; then
+  bad "#1281: 30000-deep blockquote exceeded the 30s bound -- blockquote nesting is not bounded by body size after all"
+elif [ "$deep_quote_contract" = '{"author":"","authorCount":0,"hasSelfReview":true}' ]; then
+  ok "#1281: a 30000-deep blockquote parses within an enforced 30s bound (${deep_quote_elapsed}s)"
 else
-  bad "#1281: 30000-deep blockquote took ${deep_quote_elapsed}s -- blockquote nesting is not bounded by body size after all"
+  bad "#1281: 30000-deep blockquote returned [$deep_quote_contract]"
 fi
 
 renderer_contract "deep blockquote excludes its nested declaration without a stack overflow" \
