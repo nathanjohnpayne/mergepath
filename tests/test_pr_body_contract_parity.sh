@@ -902,6 +902,211 @@ case "$p4b_fence" in
   *) bad "phase-4b rejected the fenced body but not via the contract: $p4b_fence" ;;
 esac
 
+# --- 18. #1192 renderer-membership and comment compatibility corpus ----------
+# These compact cases are representatives of the recorded GitHub renderer
+# corpus. They cover the distinct historical failures that the handwritten
+# container state could not model: a quote's initial indented-code block,
+# list transitions, and nested-list lazy continuation. The comment rows retain
+# established syntax treatment, while the malformed multiline-heading row is
+# deliberately a renderer-grounded rejection.
+renderer_contract() { # label, expected JSON, body
+  local renderer_got
+  renderer_got="$(printf '%s' "$3" | node "$ROOT/scripts/lib/pr-body-contract.mjs" --json)"
+  if [ "$renderer_got" = "$2" ]; then
+    ok "#1192 renderer corpus: $1"
+  else
+    bad "#1192 renderer corpus: $1 -- expected $2, got $renderer_got"
+  fi
+}
+
+renderer_contract "quote first-block code ends before a top-level declaration" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'>     x\nAuthoring-Agent: codex\n'
+renderer_contract "list transition keeps its later declaration in the item" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'-     y\n  text\nAuthoring-Agent: codex\n## Self-Review\n'
+renderer_contract "nested-list continuation keeps its later declaration in the item" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'- x\n  -     y\n  text\nAuthoring-Agent: codex\n## Self-Review\n'
+renderer_contract "inline author comment remains part of a valid declaration" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: co<!-- note -->dex\n## Self-Review\n'
+# A comment INSIDE the heading delimiter is a different case from one after the
+# heading text, and the difference is not cosmetic: `##<!--x--> Self-Review` and
+# `#<!--x--># Self-Review` reduce to `## Self-Review` once comments are removed,
+# but GitHub renders NEITHER as a heading at all -- no `<h2>`, no `<h1>`. The
+# handwritten parser replaced here answered `hasSelfReview: true` for both,
+# letting a line that renders as plain text satisfy the Self-Review gate. This
+# parser answers false, matching the renderer. Codex read that as a regression
+# against the previous parser (finding 4040736899); it is a tightening, and
+# these controls pin it so it cannot be loosened back by accident.
+renderer_contract "a comment inside the heading delimiter does not make a heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'Authoring-Agent: codex\n\n##<!--x--> Self-Review\nok\n'
+renderer_contract "a comment splitting the heading delimiter does not make a heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'Authoring-Agent: codex\n\n#<!--x--># Self-Review\nok\n'
+renderer_contract "inline heading comment remains part of a valid heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n## Self-Review <!-- note -->\n'
+renderer_contract "comment-looking fenced code does not alter later declarations" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'```\n<!-- literal -->\n```\nAuthoring-Agent: codex\n## Self-Review\n'
+renderer_contract "malformed multiline heading comment is not an exact heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'Authoring-Agent: codex\n## Self-Review <!-- a\nb -->\n'
+
+# mdast counts CR, CRLF and LF as line boundaries. The raw marker and
+# comment-visible line views must use the same boundary so source positions
+# cannot bind a nested marker to an earlier top-level text node.
+renderer_contract "LF line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "CRLF line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\r\n\r\n## Self-Review\r\n'
+renderer_contract "lone CR line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\r\r## Self-Review\r'
+renderer_contract "lone CR lines keep a lazy quoted declaration nested" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'## Self-Review\n\nfoo\rbar\rbaz\n> quote\nAuthoring-Agent: codex'
+renderer_contract "a BOM keeps the existing inline author-comment result" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'\357\273\277<!-- hidden -->\n\nAuthoring-Agent: codex<!-- tail -->\n\n## Self-Review\n'
+renderer_contract "a BOM keeps the existing inline heading-comment result" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'\357\273\277<!-- hidden -->\n\nAuthoring-Agent: codex\n\n## Self-Review<!-- tail -->\n'
+renderer_contract "a BOM does not make a first-line declaration valid" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'\357\273\277Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "an ordinary leading comment retains inline author handling" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'<!-- hidden -->\n\nAuthoring-Agent: codex<!-- tail -->\n\n## Self-Review\n'
+renderer_contract "a BOM does not surface fenced comment-looking declarations" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'\357\273\277<!-- hidden -->\n\n```\nAuthoring-Agent: codex<!-- literal -->\n## Self-Review\n```\n'
+renderer_contract "a BOM does not surface raw HTML declarations" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'\357\273\277<!-- hidden -->\n\n<div>\nAuthoring-Agent: codex<!-- literal -->\n## Self-Review\n</div>\n'
+
+# --- GFM footnote definitions are containers (#1281 Phase 4b P0) ------------
+# `[^x]: note` opens a container exactly as a list item does. An unindented,
+# non-interrupting line after it is a genuine CommonMark lazy continuation of
+# the definition's paragraph, so GitHub renders it inside the footnote -- or,
+# with nothing referencing that footnote, does not render it at all. Before
+# footnoteDefinition was in CONTAINERS, such a line read as a live top-level
+# declaration and spoofed author identity. The parser this one replaces has the
+# same hole, so this is a repair rather than a regression fix.
+#
+# Every expectation was verified against GitHub's renderer (POST /markdown).
+# GFM table cells are containers too, and the unpiped form is the one that
+# slipped: `header` / `| --- |` / a marker line puts the declaration in a
+# tableCell, which GitHub renders inside a <td>. The parser being replaced
+# accepts it, so this is a repair rather than a regression (Codex finding
+# 4041000028). The piped form was already rejected, because the marker regex
+# anchors at column one and `| Authoring-Agent:` does not match there -- it is
+# pinned below so the two forms cannot drift apart.
+renderer_contract "#1281: an unpiped table cell declaration is not top level" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'header\n| --- |\nAuthoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "#1281: a piped table cell declaration is not top level either" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'| h |\n| --- |\n| Authoring-Agent: codex |\n\n## Self-Review\n'
+renderer_contract "#1281: a declaration after a table stays top level" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'header\n| --- |\ncell\n\nAuthoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "#1281: a lazy continuation inside a footnote definition is not a declaration" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'[^x]: note\nAuthoring-Agent: attacker\n\n## Self-Review\nok\n'
+renderer_contract "#1281: a referenced footnote hides a smuggled declaration the same way" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'see[^x]\n\n[^x]: note\nAuthoring-Agent: attacker\n\n## Self-Review\nok\n'
+renderer_contract "#1281: a numeric-label footnote definition is a container too" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'[^1]: note\nAuthoring-Agent: codex\n'
+# Negative controls: the repair must not swallow what legitimately follows a
+# footnote. A blank line closes the definition; an ATX heading interrupts it.
+renderer_contract "#1281: a blank line closes the definition and restores top level" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'[^x]: note\n\nAuthoring-Agent: codex\n\n## Self-Review\nok\n'
+renderer_contract "#1281: an interrupting heading detaches the rest of the definition" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'[^x]: note\n## Self-Review\nAuthoring-Agent: codex\n'
+
+# A deep, real Markdown container must not make the AST traversal exhaust the
+# JavaScript call stack. The Authoring-Agent declaration remains inside the
+# blockquote; the blank line leaves the Self-Review heading top-level.
+# 30000 levels rather than 5000: at 5000 a quadratic cost would still have
+# completed quickly, so the shallower control could not have failed (Phase 4b
+# P1). Blockquote nesting measures 96ms at 5000, 191ms at 15000, 1042ms at
+# 30000 and 1256ms at 32760 -- the deepest a 65,536-character body can express,
+# since a blockquote marker costs two bytes per level exactly as a list marker
+# does. Superlinear, but the body-size limit bounds it near 1.3s, unlike
+# same-line LIST nesting at the same depth (see the known limitation below).
+DEEP_BLOCKQUOTE=''
+for ((index = 0; index < 30000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
+
+# The bound has to be ENFORCED, not merely measured. Timing the parse after
+# the fact only reports how long a run that finished took: a genuine stall
+# would sit here until the enclosing job timeout and never reach the
+# comparison, so the control could not fail in exactly the case it exists to
+# catch (CodeRabbit finding 4039721486). Run it under a real timeout, and
+# treat "no timeout tool available" as a skip rather than a silent pass --
+# otherwise a machine without one reads as green.
+parse_with_timeout() { # seconds, body -> stdout; rc 124 on expiry, 127 unavailable
+  local pwt_seconds="$1" pwt_body="$2" pwt_tool=''
+  if command -v timeout >/dev/null 2>&1; then
+    pwt_tool=timeout
+  elif command -v gtimeout >/dev/null 2>&1; then
+    pwt_tool=gtimeout
+  else
+    return 127
+  fi
+  printf '%s' "$pwt_body" \
+    | "$pwt_tool" "$pwt_seconds" node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null
+}
+
+# The bound is 120s, not a tight fit around the measured cost. This suite runs
+# from repo_lint.yml's check_gh_as_author, which does NOT use actions/setup-node
+# (only pr-review-policy.yml pins a version), so it executes on whatever Node
+# the runner provides. The control exists to catch a quadratic regression --
+# which is 180s or never-finishing, not 40s -- so a wide bound loses no
+# discriminating power and cannot flake a required check on a slower runtime or
+# a loaded runner (Codex finding 4040833101). Measured cost of this fixture:
+# 909ms on Node 20.20.2, 1074ms on 22.23.2, 1027ms on 24.21.0.
+DEEP_QUOTE_BODY="${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n'
+deep_quote_start="$(date +%s)"
+deep_quote_contract="$(parse_with_timeout 120 "$DEEP_QUOTE_BODY")"
+deep_quote_rc=$?
+deep_quote_elapsed="$(( $(date +%s) - deep_quote_start ))"
+if [ "$deep_quote_rc" -eq 127 ]; then
+  bad "#1281: neither timeout nor gtimeout is available -- the blockquote bound cannot be enforced here"
+elif [ "$deep_quote_rc" -eq 124 ]; then
+  bad "#1281: 30000-deep blockquote exceeded the 120s bound -- blockquote nesting is not bounded by body size after all"
+elif [ "$deep_quote_contract" = '{"author":"","authorCount":0,"hasSelfReview":true}' ]; then
+  ok "#1281: a 30000-deep blockquote parses within an enforced 120s bound (${deep_quote_elapsed}s)"
+else
+  bad "#1281: 30000-deep blockquote returned [$deep_quote_contract]"
+fi
+
+# The membership assertion REUSES the guarded parse above rather than launching
+# a second unguarded one. Re-parsing the same 30,000-level body through
+# renderer_contract would run node with no watchdog, so on the very regression
+# the timeout exists to terminate promptly, the suite would hang there until
+# the outer CI timeout -- the guard would have bought nothing (Codex finding
+# 4040736908). The expectation is identical to the renderer-verified one it
+# replaces; only the process launching it is shared.
+if [ "$deep_quote_rc" -eq 0 ] \
+  && [ "$deep_quote_contract" = '{"author":"","authorCount":0,"hasSelfReview":true}' ]; then
+  ok "#1192 renderer corpus: deep blockquote excludes its nested declaration without a stack overflow"
+elif [ "$deep_quote_rc" -eq 0 ]; then
+  bad "#1192 renderer corpus: deep blockquote membership: got [$deep_quote_contract]"
+fi
+renderer_contract "top-level declarations remain valid after the deep-container case" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n\n## Self-Review\n'
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
