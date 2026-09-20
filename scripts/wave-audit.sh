@@ -562,6 +562,8 @@ if [ "$FINALIZE_HISTORICAL" = false ]; then
 fi
 BYTES="$(wc -c < "$DIFF_FILE" | tr -d ' ')"
 FILES="$(grep -c '^diff --git ' "$DIFF_FILE" || true)"
+REPORT_BYTES="$BYTES"
+REPORT_FILES="$FILES"
 
 # advance_watermark — annotated (unsigned) tag on the audited head, pushed to
 # origin so every checkout resolves the same base next wave. Only called on a
@@ -577,7 +579,7 @@ advance_watermark() {
   else
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
       git -C "$REPO_DIR" tag -a "$tag" \
-        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${FILES} bytes=${BYTES}" \
+        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${REPORT_FILES} bytes=${REPORT_BYTES}" \
         "$HEAD_FULL"
   fi
   git -C "$REPO_DIR" push -q origin "refs/tags/$tag" \
@@ -622,7 +624,7 @@ advance_prefix_receipt() { # advance_prefix_receipt <orchestrator-summary-json>
 emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
   jq -n \
     --arg base "$BASE_FULL" --arg head "$HEAD_FULL" --arg repo "$REPO" \
-    --argjson pr "$PR" --argjson files "$FILES" --argjson bytes "$BYTES" \
+    --argjson pr "$PR" --argjson files "$REPORT_FILES" --argjson bytes "$REPORT_BYTES" \
     --argjson limit "$DIFF_MAX" \
     --argjson watermark "$BASE_WATERMARK_JSON" \
     --arg effort "$EFFORT" --argjson timeout "$TIMEOUT" \
@@ -634,13 +636,13 @@ emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
       dry_run:$dry}'
 }
 
-log "audit range ${RANGE_BASE} .. ${RANGE_HEAD} (intended head ${HEAD_FULL}) — ${FILES} file(s), ${BYTES} bytes in scope (effort=${EFFORT}, timeout=${TIMEOUT}s)"
-
 if [ "$FINALIZE_HISTORICAL" = true ]; then
   [ "$PREFIX_BASE" = "$HEAD_FULL" ] \
     || die 3 "historical coverage is incomplete: retained through $PREFIX_BASE, intended head is $HEAD_FULL"
   RECEIPT_PACKAGE="$(mktemp "${TMPDIR:-/tmp}/wave-audit-cumulative.XXXXXX")"
   TMP_FILES[${#TMP_FILES[@]}]="$RECEIPT_PACKAGE"
+  REPORT_BYTES=0
+  REPORT_FILES=0
   # Rebuild every retained chunk from the pinned Git objects. The tag
   # annotation is a locator and record; it cannot substitute different bytes
   # into final cumulative coverage.
@@ -657,6 +659,8 @@ if [ "$FINALIZE_HISTORICAL" = true ]; then
       --argjson bytes "$verify_bytes" --argjson files "$verify_files" \
       '.diff_oid == $oid and .scope_bytes == $bytes and .scope_files == $files' >/dev/null \
       || die 3 "prefix receipt through $verify_end does not match reconstructed curated bytes"
+    REPORT_BYTES=$((REPORT_BYTES + verify_bytes))
+    REPORT_FILES=$((REPORT_FILES + verify_files))
   done < <(jq -sc '.[]' "$RECEIPT_CHAIN")
   jq -s --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
     --arg manifest "$MANIFEST_BLOB" --arg scope "$SCOPE_FINGERPRINT" '
@@ -675,8 +679,10 @@ if [ "$FINALIZE_HISTORICAL" = true ]; then
   BYTES="$(wc -c < "$DIFF_FILE" | tr -d ' ')"
   FILES=1
   RANGE_BASE="$BASE_FULL"; RANGE_HEAD="$HEAD_FULL"
-  log "finalizing explicit cumulative historical coverage from $BASE_FULL through $HEAD_FULL"
+  log "finalizing explicit cumulative historical coverage from $BASE_FULL through $HEAD_FULL — ${REPORT_FILES} file(s), ${REPORT_BYTES} bytes across retained chunks (review package: ${BYTES} bytes)"
 fi
+
+log "audit range ${RANGE_BASE} .. ${RANGE_HEAD} (intended head ${HEAD_FULL}) — ${REPORT_FILES} file(s), ${REPORT_BYTES} bytes in scope (effort=${EFFORT}, timeout=${TIMEOUT}s)"
 
 if [ -n "$HISTORICAL_END" ] && [ "$BYTES" -eq 0 ]; then
   jq -n --arg base "$RANGE_BASE" --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" \

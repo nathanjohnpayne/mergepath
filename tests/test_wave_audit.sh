@@ -740,6 +740,14 @@ FAKE_ORCH_JSON=clean run_wa "$POLICY_SCOPE_DRIFT" reset 83 --repo owner/consumer
 # Merely finishing the last partial never finalizes. The explicit operation
 # presents a labeled cumulative receipt package to the ordinary non-dry
 # publication path; only its posted approval advances the full watermark.
+HIST_SCOPE_FILES=0
+HIST_SCOPE_BYTES=0
+for endpoint in "$C2" "$C3" "$C5" "$C6" "$LARGE_HEAD"; do
+  retained_receipt="$(git -C "$CANON" for-each-ref --format='%(contents)' \
+    "refs/tags/wave-audit-prefix/$LARGE_HEAD/$endpoint")"
+  HIST_SCOPE_FILES=$((HIST_SCOPE_FILES + $(printf '%s' "$retained_receipt" | jq -r .scope_files)))
+  HIST_SCOPE_BYTES=$((HIST_SCOPE_BYTES + $(printf '%s' "$retained_receipt" | jq -r .scope_bytes)))
+done
 remote_has_tag "$LARGE_HEAD" && fail "partial chain advanced full watermark before finalization" \
   || pass "complete prefix chain alone grants no full-wave clearance"
 for final_rc in 4 5; do
@@ -755,6 +763,7 @@ for final_rc in 4 5; do
 done
 run_wa "$POLICY_GOOD" reset 84 --repo owner/consumer --base "$C1" \
   --head-sha "$LARGE_HEAD" --finalize-historical > "$WORK/historical-final.json" \
+  2> "$WORK/historical-final.err" \
   && pass "explicit historical finalization uses ordinary approval path" \
   || fail "explicit historical finalization failed"
 if grep -q -- '--dry-run' "$CAPTURE/args"; then
@@ -771,6 +780,14 @@ jq -e '.artifact_kind == "wave-audit-cumulative-coverage-receipts" and
   || fail "final cumulative receipt package is mislabeled or incomplete"
 remote_has_tag "$LARGE_HEAD" && pass "only explicit successful finalization advances full watermark" \
   || fail "successful finalization did not advance full watermark"
+jq -e --argjson files "$HIST_SCOPE_FILES" --argjson bytes "$HIST_SCOPE_BYTES" \
+  '.scope_files == $files and .scope_bytes == $bytes' "$WORK/historical-final.json" >/dev/null \
+  && git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-pass/$LARGE_HEAD" \
+    | grep -Fq "files=$HIST_SCOPE_FILES bytes=$HIST_SCOPE_BYTES" \
+  && grep -Fq "${HIST_SCOPE_FILES} file(s), ${HIST_SCOPE_BYTES} bytes across retained chunks" \
+    "$WORK/historical-final.err" \
+  && pass "historical finalization reports cumulative retained coverage metrics" \
+  || fail "historical finalization reported receipt-package metrics as audited coverage"
 
 # Fixed intended-head scope survives intermediate manifest removal. A path
 # present at both the initial base and full head keeps ordinary deltas in the
