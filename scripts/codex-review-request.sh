@@ -1362,6 +1362,15 @@ post_codex_trigger() {
   request_count=$(crqe_count_triggers "$request_comments" "$AUTHOR_IDENTITY") \
     || die 3 "cannot count Codex request attempts; refusing a new '@codex review' trigger"
   if [ "$request_count" -ge "$max_review_rounds" ]; then
+    # The initial request may consume the final slot. Its missing eyes
+    # acknowledgement must suppress only the retry: the already-confirmed
+    # request still deserves its ordinary bounded review poll. An initial
+    # capped request has no such request to poll and remains fail-closed.
+    if [ "$TRIGGER_POSTED" = "true" ]; then
+      ACK_RETRY_REFUSED_BY_CAP=true
+      log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); suppressing acknowledgement retry and continuing normal review poll"
+      return 1
+    fi
     die 3 "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); refusing a new '@codex review' trigger"
   fi
 
@@ -1536,7 +1545,12 @@ run_trigger_ack_gate() {
 
     retries_used=$((retries_used + 1))
     log "re-posting '@codex review' because Codex did not acknowledge the trigger (${retries_used}/${MAX_ACK_RETRIES})"
-    post_codex_trigger
+    if ! post_codex_trigger; then
+      if [ "$ACK_RETRY_REFUSED_BY_CAP" = "true" ]; then
+        return 0
+      fi
+      die 3 "acknowledgement retry did not post a Codex trigger"
+    fi
   done
 }
 
@@ -1634,6 +1648,7 @@ TRIGGER_COMMENT_ID=""
 TERMINAL_TRIGGER_COMMENT_ID=""
 TRIGGER_POST_TIME=""
 TRIGGER_SIGNAL_THRESHOLD=""
+ACK_RETRY_REFUSED_BY_CAP=false
 
 if has_cleared_signal "$INITIAL_SCAN"; then
   log "Codex has already cleared on HEAD (reaction, no-blocking-tier review, or affirmative verdict comment) — skipping trigger comment"

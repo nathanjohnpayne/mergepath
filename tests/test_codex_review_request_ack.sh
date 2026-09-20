@@ -379,20 +379,20 @@ test_retry_cap_respected() {
   fi
 }
 
-# #813: the request-attempt cap is evaluated by post_codex_trigger itself, so
-# the first request can spend the final slot while the acknowledgement retry is
-# refused before its second author-comment write.
-test_request_attempt_cap_blocks_ack_retry() {
+# #813: the first request may spend the final slot. A missing acknowledgement
+# then suppresses the retry, but must leave the confirmed first request in the
+# ordinary review poll rather than returning an infrastructure-looking refusal.
+test_request_attempt_cap_suppresses_ack_retry_but_polls() {
   local dir rc count before=$FAIL
   dir=$(make_case "request-cap-blocks-retry" 0 1)
   printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
   rc=$(run_case "$dir" absent)
   count=$(trigger_count "$dir")
-  [ "$rc" = 3 ] || fail "#813 retry cap: exit $rc, expected 3; stderr=$(cat "$dir/err.log")"
+  [ "$rc" = 4 ] || fail "#813 retry cap: exit $rc, expected ordinary poll timeout 4; stderr=$(cat "$dir/err.log")"
   [ "$count" = 1 ] || fail "#813 retry cap: trigger count $count, expected original only"
-  grep -q 'request-attempt cap reached.*1/1' "$dir/err.log" \
-    || fail "#813 retry cap: no observable refusal"
-  [ "$FAIL" -ne "$before" ] || pass "#813: request budget permits the first trigger and blocks its acknowledgment retry"
+  grep -q 'request-attempt cap reached.*1/1.*continuing normal review poll' "$dir/err.log" \
+    || fail "#813 retry cap: no observable retry suppression"
+  [ "$FAIL" -ne "$before" ] || pass "#813: request budget permits the first trigger, suppresses its retry, and preserves its poll"
 }
 
 # A malformed cap is a new-write concern, not a reason to perturb an already
@@ -753,7 +753,7 @@ test_secret_descriptor_never_reveals_the_value() {
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
 test_retry_cap_respected
-test_request_attempt_cap_blocks_ack_retry
+test_request_attempt_cap_suppresses_ack_retry_but_polls
 test_malformed_request_cap_does_not_change_clearance_skip
 test_skip_path_posts_no_trigger_or_ack_check
 test_missing_comment_id_fails_closed_without_timeout_marker
