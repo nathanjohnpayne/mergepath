@@ -4,9 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="${REQUIRED_CHECK_PUBLISHER_WORKFLOW:-$ROOT/.github/workflows/required-check-publisher.yml}"
 
-if ! command -v ruby >/dev/null 2>&1 || ! ruby -e 'require "yaml"' >/dev/null 2>&1; then
-  echo "SKIP: required-check publisher dedup tests require ruby + YAML"
-  exit 0
+if ! command -v ruby >/dev/null 2>&1; then
+  echo "ERROR: required-check publisher dedup tests require ruby" >&2
+  exit 1
+fi
+if ! ruby -e 'require "yaml"' >/dev/null 2>&1; then
+  echo "ERROR: required-check publisher dedup tests require Ruby YAML support" >&2
+  exit 1
 fi
 
 TMP="$(mktemp -d)"
@@ -39,35 +43,35 @@ case "$*" in
     fi
     ;;
   *"/commits/"*"/check-runs"*)
-    marker="required-check-publisher:pending:${PARENT_RUN_ID}:${PARENT_RUN_ATTEMPT}"
+    summary="Publisher phase 1: evaluation queued for $HEAD_SHA. <!-- required-check-publisher:pending:${PARENT_RUN_ID}:${PARENT_RUN_ATTEMPT} -->"
     case "$GH_FIXTURE_MODE" in
       exact)
-        printf 'Merge clearance gate\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$marker"
-        printf 'Codex P1 unresolved threads\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t102\n' "$marker"
-        printf 'CodeRabbit unresolved blocking findings\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t103\n' "$marker"
+        printf 'Merge clearance gate\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$summary"
+        printf 'Codex P1 unresolved threads\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t102\n' "$summary"
+        printf 'CodeRabbit unresolved blocking findings\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t103\n' "$summary"
         ;;
       partial)
-        printf 'Merge clearance gate\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$marker"
+        printf 'Merge clearance gate\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$summary"
         ;;
       foreign)
-        printf 'Merge clearance gate\tin_progress\tforeign-run\tgithub-actions\t2026-09-20T12:00:01Z\t101\n'
-        printf 'Codex P1 unresolved threads\tin_progress\tforeign-run\tgithub-actions\t2026-09-20T12:00:01Z\t102\n'
-        printf 'CodeRabbit unresolved blocking findings\tin_progress\tforeign-run\tgithub-actions\t2026-09-20T12:00:01Z\t103\n'
+        printf 'Merge clearance gate\tin_progress\tforeign-summary\tgithub-actions\t2026-09-20T12:00:01Z\t101\n'
+        printf 'Codex P1 unresolved threads\tin_progress\tforeign-summary\tgithub-actions\t2026-09-20T12:00:01Z\t102\n'
+        printf 'CodeRabbit unresolved blocking findings\tin_progress\tforeign-summary\tgithub-actions\t2026-09-20T12:00:01Z\t103\n'
         ;;
       foreign-app)
-        printf 'Merge clearance gate\tin_progress\t%s\tother-check-producer\t2026-09-20T12:00:01Z\t101\n' "$marker"
-        printf 'Codex P1 unresolved threads\tin_progress\t%s\tother-check-producer\t2026-09-20T12:00:01Z\t102\n' "$marker"
-        printf 'CodeRabbit unresolved blocking findings\tin_progress\t%s\tother-check-producer\t2026-09-20T12:00:01Z\t103\n' "$marker"
+        printf 'Merge clearance gate\tin_progress\t%s\tother-check-producer\t2026-09-20T12:00:01Z\t101\n' "$summary"
+        printf 'Codex P1 unresolved threads\tin_progress\t%s\tother-check-producer\t2026-09-20T12:00:01Z\t102\n' "$summary"
+        printf 'CodeRabbit unresolved blocking findings\tin_progress\t%s\tother-check-producer\t2026-09-20T12:00:01Z\t103\n' "$summary"
         ;;
       completed-markers)
-        printf 'Merge clearance gate\tcompleted\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$marker"
-        printf 'Codex P1 unresolved threads\tcompleted\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t102\n' "$marker"
-        printf 'CodeRabbit unresolved blocking findings\tcompleted\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t103\n' "$marker"
+        printf 'Merge clearance gate\tcompleted\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$summary"
+        printf 'Codex P1 unresolved threads\tcompleted\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t102\n' "$summary"
+        printf 'CodeRabbit unresolved blocking findings\tcompleted\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t103\n' "$summary"
         ;;
       newer-completed)
-        printf 'Merge clearance gate\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$marker"
-        printf 'Codex P1 unresolved threads\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t102\n' "$marker"
-        printf 'CodeRabbit unresolved blocking findings\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t103\n' "$marker"
+        printf 'Merge clearance gate\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$summary"
+        printf 'Codex P1 unresolved threads\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t102\n' "$summary"
+        printf 'CodeRabbit unresolved blocking findings\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t103\n' "$summary"
         printf 'Merge clearance gate\tcompleted\tother\tgithub-actions\t2026-09-20T12:00:02Z\t201\n'
         printf 'Codex P1 unresolved threads\tcompleted\tother\tgithub-actions\t2026-09-20T12:00:02Z\t202\n'
         printf 'CodeRabbit unresolved blocking findings\tcompleted\tother\tgithub-actions\t2026-09-20T12:00:02Z\t203\n'
@@ -110,10 +114,10 @@ fail=0
 
 run_case() {
   local name="$1" action="$2" attempt="$3" mode="$4" want_calls="$5" want_posts="$6" want_probes="$7"
-  local dir="$TMP/$name" calls posts probes marker
+  local dir="$TMP/$name" calls posts probes summary
   mkdir -p "$dir"
   : >"$dir/calls"
-  marker="required-check-publisher:pending:4242:$attempt"
+  summary="Publisher phase 1: evaluation queued for abc123. <!-- required-check-publisher:pending:4242:$attempt -->"
 
   if ! PATH="$TMP:$PATH" \
       GH_CALL_LOG="$dir/calls" GH_FIXTURE_MODE="$mode" \
@@ -143,8 +147,14 @@ run_case() {
   fi
 
   if [ "$posts" -gt 0 ]; then
-    if [ "$(grep -c -- "-f external_id=$marker" "$dir/calls" || true)" -ne "$posts" ]; then
-      echo "FAIL: $name: every pending POST must carry the exact run/attempt marker"
+    if grep -q -- 'external_id' "$dir/calls"; then
+      echo "FAIL: $name: pending POST must not set external_id"
+      sed -n '1,120p' "$dir/calls"
+      fail=$((fail + 1))
+      return
+    fi
+    if [ "$(grep -Fc -- "-f output[summary]=$summary" "$dir/calls" || true)" -ne "$posts" ]; then
+      echo "FAIL: $name: every pending POST must carry the exact summary marker"
       sed -n '1,120p' "$dir/calls"
       fail=$((fail + 1))
       return

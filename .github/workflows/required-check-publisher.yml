@@ -123,16 +123,19 @@ jobs:
           # requested job leaves incomplete evidence and falls through to
           # the full open path. Reruns bypass this probe because GitHub does
           # not emit `requested` for a new attempt (#1130).
-          pending_external_id="required-check-publisher:pending:${PARENT_RUN_ID}:${PARENT_RUN_ATTEMPT}"
+          # Keep the proof marker in output metadata. The lineage
+          # discriminator for these required contexts must remain unset on
+          # Checks-API runs, or the native and synthetic lineages collapse.
+          pending_summary="Publisher phase 1: evaluation queued for $HEAD_SHA. <!-- required-check-publisher:pending:${PARENT_RUN_ID}:${PARENT_RUN_ATTEMPT} -->"
           if [ "$EVENT_ACTION" = "in_progress" ] && [ "$PARENT_RUN_ATTEMPT" = "1" ]; then
             if pending_runs=$(gh api --paginate -X GET \
                 "repos/$REPO/commits/$HEAD_SHA/check-runs" -f per_page=100 \
-                --jq '.check_runs[] | [.name, .status, (.external_id // ""), (.app.slug // ""), (.started_at // ""), .id] | @tsv'); then
+                --jq '.check_runs[] | [.name, .status, (.output.summary // ""), (.app.slug // ""), (.started_at // ""), .id] | @tsv'); then
               all_pending=1
               for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
-                if ! awk -F '\t' -v name="$name" -v marker="$pending_external_id" \
+                if ! awk -F '\t' -v name="$name" -v summary="$pending_summary" \
                     '$1 == name {
-                       row_exact = $2 == "in_progress" && $3 == marker && $4 == "github-actions"
+                       row_exact = $2 == "in_progress" && $3 == summary && $4 == "github-actions"
                        if (!found || $5 > started) {
                          found=1; started=$5; exact=row_exact; conflict=!row_exact
                        } else if ($5 == started) {
@@ -191,9 +194,8 @@ jobs:
                 -f name="$name" \
                 -f head_sha="$HEAD_SHA" \
                 -f status="in_progress" \
-                -f external_id="$pending_external_id" \
                 -f "output[title]=$name (re-evaluation in progress)" \
-                -f "output[summary]=Publisher phase 1: evaluation queued for $HEAD_SHA." \
+                -f "output[summary]=$pending_summary" \
                 >/dev/null; then
                 return 0
               fi
