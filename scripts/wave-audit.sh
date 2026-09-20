@@ -49,10 +49,14 @@
 #   exit 8  curated diff exceeds the configured byte budget. No reviewer
 #           is dispatched and no tag is written. Never fan out on this:
 #           the range needs bounded review, not another unavailable retry.
+#   exit 9  one historical chunk was validated and optionally retained as a
+#           non-clearance prefix receipt. Never fan out: only an explicit
+#           --finalize-historical run can produce ordinary exit 0 clearance.
 #
 # Usage:
 #   scripts/wave-audit.sh <canary-pr> --repo <owner/repo>
 #       [--base <sha>] [--head-sha <sha>] [--dry-run]
+#       [--historical-end <sha> | --finalize-historical]
 #   scripts/wave-audit.sh --parse-title-only "<pr title>"   # test/debug hook
 #
 # Config: top-level `propagation_audit:` block in .github/review-policy.yml
@@ -88,12 +92,13 @@ MANIFEST_RELPATH="${WAVE_AUDIT_MANIFEST_RELPATH:-.mergepath-sync.yml}"
 POLICY="${MERGEPATH_REVIEW_POLICY_PATH:-$REPO_DIR/.github/review-policy.yml}"
 ORCH="${WAVE_AUDIT_ORCHESTRATOR:-$ROOT/scripts/phase-4b-review.sh}"
 TAG_PREFIX="wave-audit-pass"
+PREFIX_TAG_PREFIX="wave-audit-prefix"
 
 log() { printf '[wave-audit] %s\n' "$*" >&2; }
 die() { local rc="$1"; shift; printf '[wave-audit] ERROR: %s\n' "$*" >&2; exit "$rc"; }
 
 usage() {
-  sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"
 }
 
 # parse_title <title> — print the mergepath sha a sync PR title names.
@@ -158,12 +163,15 @@ audit_list() {
 
 # --- args -------------------------------------------------------------------
 PR=""; REPO=""; BASE=""; HEAD_SHA=""; DRY_RUN=false
+HISTORICAL_END=""; FINALIZE_HISTORICAL=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)      REPO="${2:-}"; shift 2 ;;
     --base)      BASE="${2:-}"; shift 2 ;;
     --head-sha)  HEAD_SHA="${2:-}"; shift 2 ;;
     --dry-run)   DRY_RUN=true; shift ;;
+    --historical-end) HISTORICAL_END="${2:-}"; shift 2 ;;
+    --finalize-historical) FINALIZE_HISTORICAL=true; shift ;;
     --parse-title-only)
       parse_title "${2:-}" || die 3 "no mergepath@<sha> in title: ${2:-}"
       exit 0 ;;
@@ -174,6 +182,8 @@ while [ $# -gt 0 ]; do
       PR="$1"; shift ;;
   esac
 done
+[ -z "$HISTORICAL_END" ] || [ "$FINALIZE_HISTORICAL" = false ] \
+  || die 3 "--historical-end and --finalize-historical are mutually exclusive"
 [ -n "$PR" ] || { usage >&2; die 3 "canary PR number is required"; }
 case "$PR" in ''|*[!0-9]*) die 3 "canary PR must be a number: $PR" ;; esac
 [ -n "$REPO" ] || die 3 "--repo <owner/repo> is required"
@@ -348,42 +358,212 @@ EOF
   done
 }
 head_scope="$(manifest_paths_at "$HEAD_FULL" | in_scope)"
-base_scope="$(manifest_paths_at "$BASE_FULL" | in_scope || true)"
 
-# Split head scope into paths already manifested at base (range-diffed) and
-# NEWLY-MANIFESTED paths (Codex P2 on #663): a wave that adds a pre-existing
-# file/dir to the manifest newly delivers those bytes to consumers, but
-# `git diff base..head` is empty for content that predates the range — so
-# newly in-scope paths are diffed against the EMPTY TREE for full-content
-# review. Paths REMOVED from the manifest deliver nothing new and are not
-# audited. A manifest absent at base makes every head path newly in scope.
-common=(); added=()
-while IFS= read -r p; do
-  [ -n "$p" ] || continue
-  if printf '%s\n' "$base_scope" | grep -Fxq "$p"; then
-    common[${#common[@]}]="$p"
-  else
-    added[${#added[@]}]="$p"
-  fi
-done <<EOF
-$head_scope
-EOF
-[ $(( ${#common[@]} + ${#added[@]} )) -gt 0 ] \
+[ -n "$head_scope" ] \
   || die 3 "no manifest paths remain in audit scope at ${HEAD_SHA} (check ${MANIFEST_RELPATH} at that commit and scope_exclude_prefixes)"
 
+# Historical-prefix receipts are deliberately outside the clearance
+# watermark namespace. They retain only clean, dry-run-validated coverage
+# for one immutable intended head. Every binding below is recomputed from
+# committed objects before a receipt can be reused.
+MANIFEST_BLOB="$(git -C "$REPO_DIR" rev-parse --verify "${HEAD_FULL}:${MANIFEST_RELPATH}" 2>/dev/null)" \
+  || die 3 "could not resolve ${MANIFEST_RELPATH} blob at intended head $HEAD_FULL"
+SCOPE_FINGERPRINT="$(printf 'version=1\nbase=%s\nhead=%s\nmanifest=%s\nexcludes<<EOF\n%s\nEOF\nscope<<EOF\n%s\nEOF\n' \
+  "$BASE_FULL" "$HEAD_FULL" "$MANIFEST_BLOB" "$EXCLUDES" "$head_scope" \
+  | git -C "$REPO_DIR" hash-object --stdin)"
+
+TMP_FILES=()
+cleanup() {
+  local cleanup_file
+  for cleanup_file in "${TMP_FILES[@]}"; do rm -f "$cleanup_file"; done
+}
+trap cleanup EXIT
 DIFF_FILE="$(mktemp "${TMPDIR:-/tmp}/wave-audit-diff.XXXXXX")"
-trap 'rm -f "$DIFF_FILE"' EXIT
-: > "$DIFF_FILE"
-if [ "${#common[@]}" -gt 0 ]; then
-  git -C "$REPO_DIR" diff "${BASE_FULL}..${HEAD_FULL}" -- "${common[@]}" >> "$DIFF_FILE"
+TMP_FILES[${#TMP_FILES[@]}]="$DIFF_FILE"
+RECEIPT_RECORDS="$(mktemp "${TMPDIR:-/tmp}/wave-audit-receipts.XXXXXX")"
+RECEIPT_CHAIN="$(mktemp "${TMPDIR:-/tmp}/wave-audit-chain.XXXXXX")"
+TMP_FILES[${#TMP_FILES[@]}]="$RECEIPT_RECORDS"
+TMP_FILES[${#TMP_FILES[@]}]="$RECEIPT_CHAIN"
+: > "$RECEIPT_RECORDS"; : > "$RECEIPT_CHAIN"
+
+HISTORICAL=false
+[ -n "$HISTORICAL_END" ] && HISTORICAL=true
+[ "$FINALIZE_HISTORICAL" = true ] && HISTORICAL=true
+PREFIX_BASE="$BASE_FULL"
+
+if [ "$HISTORICAL" = true ]; then
+  # Fetch remote receipts one exact ref at a time. A wildcard refspec with no
+  # remote match can erase a local receipt left by a failed push, destroying
+  # the idempotent publish-only retry path.
+  remote_prefix_refs="$(git -C "$REPO_DIR" ls-remote --refs --tags origin \
+    "refs/tags/${PREFIX_TAG_PREFIX}/*" 2>/dev/null)" \
+    || die 3 "could not list ${PREFIX_TAG_PREFIX}/* receipts from origin"
+  while IFS=$'\t' read -r _remote_oid remote_ref; do
+    [ -n "$remote_ref" ] || continue
+    git -C "$REPO_DIR" fetch -q origin "+${remote_ref}:${remote_ref}" 2>/dev/null \
+      || die 3 "could not fetch prefix receipt $remote_ref from origin"
+  done <<EOF
+$remote_prefix_refs
+EOF
+  for receipt_tag in $(git -C "$REPO_DIR" tag -l "${PREFIX_TAG_PREFIX}/${HEAD_FULL}/*"); do
+    receipt_json="$(git -C "$REPO_DIR" for-each-ref --format='%(contents)' "refs/tags/$receipt_tag")"
+    printf '%s' "$receipt_json" | jq -e \
+      --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
+      --arg manifest "$MANIFEST_BLOB" --arg scope "$SCOPE_FINGERPRINT" '
+        .version == 1 and .kind == "wave-audit-prefix" and .clearance == false and
+        .initial_base == $base and .full_head == $head and
+        .manifest_blob == $manifest and .scope_fingerprint == $scope and
+        (.chunk_base | type == "string") and (.prefix_end | type == "string") and
+        (.review_provenance.direction | type == "string" and length > 0) and
+        (.review_provenance.reviewer_identity | type == "string" and length > 0) and
+        (.review_provenance.canary_head | type == "string") and
+        .validated_verdict.verdict == "APPROVED" and
+        (.validated_verdict.findings | type == "array" and length == 0)' >/dev/null \
+      || die 3 "prefix receipt $receipt_tag is incompatible with the pinned historical scope"
+    receipt_base="$(printf '%s' "$receipt_json" | jq -r .chunk_base)"
+    receipt_end="$(printf '%s' "$receipt_json" | jq -r .prefix_end)"
+    [ "$receipt_tag" = "${PREFIX_TAG_PREFIX}/${HEAD_FULL}/${receipt_end}" ] \
+      || die 3 "prefix receipt $receipt_tag does not use its recorded exact-head name"
+    receipt_target="$(git -C "$REPO_DIR" rev-parse --verify "${receipt_tag}^{}" 2>/dev/null)" \
+      || die 3 "could not peel prefix receipt $receipt_tag"
+    [ "$receipt_target" = "$receipt_end" ] \
+      || die 3 "prefix receipt $receipt_tag targets $receipt_target, not recorded end $receipt_end"
+    [ "$receipt_base" != "$receipt_end" ] \
+      || die 3 "prefix receipt $receipt_tag is not a strict forward range"
+    git -C "$REPO_DIR" merge-base --is-ancestor "$receipt_base" "$receipt_end" 2>/dev/null \
+      || die 3 "prefix receipt $receipt_tag is not a forward range"
+    git -C "$REPO_DIR" merge-base --is-ancestor "$receipt_end" "$HEAD_FULL" 2>/dev/null \
+      || die 3 "prefix receipt $receipt_tag ends outside intended head $HEAD_FULL"
+    printf '%s\t%s\t%s\n' "$receipt_base" "$receipt_end" "$receipt_tag" >> "$RECEIPT_RECORDS"
+  done
+
+  # Build exactly one contiguous chain. Alternative or disconnected receipts
+  # are ambiguity, never authority to skip a range.
+  cursor="$BASE_FULL"; used=0
+  while :; do
+    matches="$(awk -F '\t' -v base="$cursor" '$1 == base { print }' "$RECEIPT_RECORDS")"
+    match_count="$(printf '%s\n' "$matches" | awk 'NF { n++ } END { print n+0 }')"
+    [ "$match_count" -le 1 ] || die 3 "multiple prefix receipts continue from $cursor"
+    [ "$match_count" -eq 1 ] || break
+    next_end="$(printf '%s\n' "$matches" | cut -f2)"
+    next_tag="$(printf '%s\n' "$matches" | cut -f3)"
+    git -C "$REPO_DIR" for-each-ref --format='%(contents)' "refs/tags/$next_tag" >> "$RECEIPT_CHAIN"
+    printf '\n' >> "$RECEIPT_CHAIN"
+    cursor="$next_end"; used=$((used + 1))
+  done
+  total="$(awk 'NF { n++ } END { print n+0 }' "$RECEIPT_RECORDS")"
+  [ "$used" -eq "$total" ] || die 3 "prefix receipt set is disconnected from initial base $BASE_FULL"
+  PREFIX_BASE="$cursor"
 fi
-if [ "${#added[@]}" -gt 0 ]; then
-  EMPTY_TREE="$(git -C "$REPO_DIR" hash-object -t tree /dev/null)"
-  log "newly-manifested path(s) audited in full: ${added[*]}"
-  git -C "$REPO_DIR" diff "$EMPTY_TREE" "$HEAD_FULL" -- "${added[@]}" >> "$DIFF_FILE"
+
+if [ -n "$HISTORICAL_END" ]; then
+  RANGE_HEAD="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${HISTORICAL_END}^{commit}")" \
+    || die 3 "historical end $HISTORICAL_END not found in $REPO_DIR"
+  if [ "$RANGE_HEAD" = "$PREFIX_BASE" ]; then
+    retained_tag="${PREFIX_TAG_PREFIX}/${HEAD_FULL}/${RANGE_HEAD}"
+    retained_json="$(git -C "$REPO_DIR" for-each-ref --format='%(contents)' "refs/tags/$retained_tag")"
+    [ -n "$retained_json" ] || die 3 "historical end equals retained prefix but exact receipt $retained_tag is missing"
+    if [ "$DRY_RUN" = false ]; then
+      git -C "$REPO_DIR" push -q origin "refs/tags/$retained_tag" \
+        || die 3 "prefix receipt $retained_tag remains local because retry push failed"
+    fi
+    jq -n --arg base "$(printf '%s' "$retained_json" | jq -r .chunk_base)" \
+      --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" --arg tag "$retained_tag" \
+      --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" \
+      --argjson verdict "$(printf '%s' "$retained_json" | jq -c .validated_verdict)" '
+        {historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
+         prefix_receipt:$tag,receipt_written:($dry|not),receipt_reused:true,
+         watermark_advanced:false,fanout_authorized:false,dry_run:$dry,
+         validated_verdict:$verdict}'
+    if [ "$DRY_RUN" = true ]; then
+      log "historical chunk receipt already validated — dry-run made no receipt write or push; no full-wave clearance"
+    else
+      log "historical chunk receipt already validated — exact receipt ensured on origin without another review; no full-wave clearance"
+    fi
+    exit 9
+  fi
+  git -C "$REPO_DIR" merge-base --is-ancestor "$PREFIX_BASE" "$RANGE_HEAD" 2>/dev/null \
+    || die 3 "historical end $RANGE_HEAD does not continue retained prefix $PREFIX_BASE"
+  git -C "$REPO_DIR" merge-base --is-ancestor "$RANGE_HEAD" "$HEAD_FULL" 2>/dev/null \
+    || die 3 "historical end $RANGE_HEAD is not within intended head $HEAD_FULL"
+  RANGE_BASE="$PREFIX_BASE"
+else
+  RANGE_BASE="$BASE_FULL"
+  RANGE_HEAD="$HEAD_FULL"
+fi
+
+# Build one range using the intended head's fixed scope. A path newly
+# admitted to that scope during this chunk is diffed from the empty tree at
+# the chunk end, retaining pre-existing bytes; subsequent chunks carry its
+# ordinary deltas. Cumulative contiguous chunks therefore equal the existing
+# full-range coverage contract.
+build_curated_diff() { # build_curated_diff <range-base> <range-end> <output>
+  local range_base="$1" range_end="$2" output="$3"
+  local initial_base_scope range_base_scope range_end_scope p
+  local common=() added=()
+  initial_base_scope="$(manifest_scope_at "$BASE_FULL")"
+  range_base_scope="$(manifest_scope_at "$range_base")"
+  range_end_scope="$(manifest_scope_at "$range_end")"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    # Paths already shipped at the initial base remain ordinary range deltas
+    # for every chunk, even if an intermediate manifest temporarily removes
+    # them. The fixed full-head scope must retain deletions of their old bytes.
+    if printf '%s\n' "$initial_base_scope" | grep -Fxq "$p"; then
+      common[${#common[@]}]="$p"
+    elif printf '%s\n' "$range_end_scope" | grep -Fxq "$p"; then
+      if printf '%s\n' "$range_base_scope" | grep -Fxq "$p"; then
+        common[${#common[@]}]="$p"
+      else
+        added[${#added[@]}]="$p"
+      fi
+    else
+      # A newly admitted path that is absent at this chunk end delivers
+      # nothing yet. Its next admission is covered from the empty tree.
+      continue
+    fi
+  done <<EOF
+$head_scope
+EOF
+  : > "$output"
+  if [ "${#common[@]}" -gt 0 ]; then
+    git -C "$REPO_DIR" diff "${range_base}..${range_end}" -- "${common[@]}" >> "$output"
+  fi
+  if [ "${#added[@]}" -gt 0 ]; then
+    EMPTY_TREE="$(git -C "$REPO_DIR" hash-object -t tree /dev/null)"
+    log "newly-manifested path(s) audited in full for this range: ${added[*]}"
+    git -C "$REPO_DIR" diff "$EMPTY_TREE" "$range_end" -- "${added[@]}" >> "$output"
+  fi
+}
+
+manifest_scope_at() { # manifest_scope_at <commit>; absence is empty, read failure is fatal
+  local commit="$1" raw tree_paths
+  if git -C "$REPO_DIR" cat-file -e "${commit}:${MANIFEST_RELPATH}" 2>/dev/null; then
+    raw="$(manifest_paths_at "$commit")" \
+      || die 3 "could not read ${MANIFEST_RELPATH} at historical boundary $commit"
+    printf '%s\n' "$raw" | in_scope
+    return 0
+  fi
+  # A missing path is legitimate before the manifest was introduced. If the
+  # tree still names it, cat-file failed for another reason and cannot be
+  # interpreted as empty scope.
+  tree_paths="$(git -C "$REPO_DIR" ls-tree --name-only "$commit" -- "$MANIFEST_RELPATH" 2>/dev/null)" \
+    || die 3 "could not inspect ${MANIFEST_RELPATH} at historical boundary $commit"
+  if printf '%s\n' "$tree_paths" | grep -Fxq "$MANIFEST_RELPATH"; then
+    die 3 "could not read ${MANIFEST_RELPATH} at historical boundary $commit"
+  fi
+  git -C "$REPO_DIR" rev-parse --verify "${commit}^{tree}" >/dev/null 2>&1 \
+    || die 3 "could not read historical boundary tree $commit"
+  return 0
+}
+
+if [ "$FINALIZE_HISTORICAL" = false ]; then
+  build_curated_diff "$RANGE_BASE" "$RANGE_HEAD" "$DIFF_FILE"
 fi
 BYTES="$(wc -c < "$DIFF_FILE" | tr -d ' ')"
 FILES="$(grep -c '^diff --git ' "$DIFF_FILE" || true)"
+REPORT_BYTES="$BYTES"
+REPORT_FILES="$FILES"
 
 # advance_watermark — annotated (unsigned) tag on the audited head, pushed to
 # origin so every checkout resolves the same base next wave. Only called on a
@@ -399,7 +579,7 @@ advance_watermark() {
   else
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
       git -C "$REPO_DIR" tag -a "$tag" \
-        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${FILES} bytes=${BYTES}" \
+        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${REPORT_FILES} bytes=${REPORT_BYTES}" \
         "$HEAD_FULL"
   fi
   git -C "$REPO_DIR" push -q origin "refs/tags/$tag" \
@@ -407,10 +587,44 @@ advance_watermark() {
   log "watermark advanced: $tag"
 }
 
+advance_prefix_receipt() { # advance_prefix_receipt <orchestrator-summary-json>
+  local summary="$1" tag="${PREFIX_TAG_PREFIX}/${HEAD_FULL}/${RANGE_HEAD}"
+  local receipt_file diff_oid verdict provenance
+  receipt_file="$(mktemp "${TMPDIR:-/tmp}/wave-audit-prefix.XXXXXX")"
+  TMP_FILES[${#TMP_FILES[@]}]="$receipt_file"
+  diff_oid="$(git -C "$REPO_DIR" hash-object "$DIFF_FILE")"
+  verdict="$(printf '%s' "$summary" | jq -c .validated_verdict)"
+  provenance="$(printf '%s' "$summary" | jq -c '
+    {direction, reviewer_identity, adapter, canary_head:.head_sha,
+     repo, pr_number, reviewer_effort, adapter_timeout_seconds,
+     usage_source, token_count}')"
+  jq -n --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
+    --arg manifest "$MANIFEST_BLOB" --arg scope "$SCOPE_FINGERPRINT" \
+    --arg chunk_base "$RANGE_BASE" --arg prefix_end "$RANGE_HEAD" \
+    --arg diff_oid "$diff_oid" --argjson files "$FILES" --argjson bytes "$BYTES" \
+    --arg repo "$REPO" --argjson pr "$PR" --argjson verdict "$verdict" \
+    --argjson provenance "$provenance" \
+    '{version:1, kind:"wave-audit-prefix", clearance:false,
+      initial_base:$base, full_head:$head, manifest_blob:$manifest,
+      scope_fingerprint:$scope, chunk_base:$chunk_base, prefix_end:$prefix_end,
+      diff_oid:$diff_oid, scope_files:$files, scope_bytes:$bytes,
+      canary:{repo:$repo,pr:$pr}, review_provenance:$provenance,
+      validated_verdict:$verdict}' > "$receipt_file"
+  if git -C "$REPO_DIR" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+    log "prefix receipt $tag already present locally — ensuring it is on origin"
+  else
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
+      git -C "$REPO_DIR" tag -a "$tag" -F "$receipt_file" "$RANGE_HEAD"
+  fi
+  git -C "$REPO_DIR" push -q origin "refs/tags/$tag" \
+    || die 3 "prefix receipt $tag exists locally but the push failed — rerun to retain this exact chunk"
+  PREFIX_TAG_RESULT="$tag"
+}
+
 emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
   jq -n \
     --arg base "$BASE_FULL" --arg head "$HEAD_FULL" --arg repo "$REPO" \
-    --argjson pr "$PR" --argjson files "$FILES" --argjson bytes "$BYTES" \
+    --argjson pr "$PR" --argjson files "$REPORT_FILES" --argjson bytes "$REPORT_BYTES" \
     --argjson limit "$DIFF_MAX" \
     --argjson watermark "$BASE_WATERMARK_JSON" \
     --arg effort "$EFFORT" --argjson timeout "$TIMEOUT" \
@@ -422,7 +636,63 @@ emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
       dry_run:$dry}'
 }
 
-log "audit range ${BASE_FULL} .. ${HEAD_FULL} — ${FILES} file(s), ${BYTES} bytes in scope (effort=${EFFORT}, timeout=${TIMEOUT}s)"
+if [ "$FINALIZE_HISTORICAL" = true ]; then
+  [ "$PREFIX_BASE" = "$HEAD_FULL" ] \
+    || die 3 "historical coverage is incomplete: retained through $PREFIX_BASE, intended head is $HEAD_FULL"
+  RECEIPT_PACKAGE="$(mktemp "${TMPDIR:-/tmp}/wave-audit-cumulative.XXXXXX")"
+  TMP_FILES[${#TMP_FILES[@]}]="$RECEIPT_PACKAGE"
+  REPORT_BYTES=0
+  REPORT_FILES=0
+  # Rebuild every retained chunk from the pinned Git objects. The tag
+  # annotation is a locator and record; it cannot substitute different bytes
+  # into final cumulative coverage.
+  while IFS= read -r receipt_json; do
+    verify_diff="$(mktemp "${TMPDIR:-/tmp}/wave-audit-verify.XXXXXX")"
+    TMP_FILES[${#TMP_FILES[@]}]="$verify_diff"
+    verify_base="$(printf '%s' "$receipt_json" | jq -r .chunk_base)"
+    verify_end="$(printf '%s' "$receipt_json" | jq -r .prefix_end)"
+    build_curated_diff "$verify_base" "$verify_end" "$verify_diff"
+    verify_oid="$(git -C "$REPO_DIR" hash-object "$verify_diff")"
+    verify_bytes="$(wc -c < "$verify_diff" | tr -d ' ')"
+    verify_files="$(grep -c '^diff --git ' "$verify_diff" || true)"
+    printf '%s' "$receipt_json" | jq -e --arg oid "$verify_oid" \
+      --argjson bytes "$verify_bytes" --argjson files "$verify_files" \
+      '.diff_oid == $oid and .scope_bytes == $bytes and .scope_files == $files' >/dev/null \
+      || die 3 "prefix receipt through $verify_end does not match reconstructed curated bytes"
+    REPORT_BYTES=$((REPORT_BYTES + verify_bytes))
+    REPORT_FILES=$((REPORT_FILES + verify_files))
+  done < <(jq -sc '.[]' "$RECEIPT_CHAIN")
+  jq -s --arg base "$BASE_FULL" --arg head "$HEAD_FULL" \
+    --arg manifest "$MANIFEST_BLOB" --arg scope "$SCOPE_FINGERPRINT" '
+      {artifact_kind:"wave-audit-cumulative-coverage-receipts", version:1,
+       clearance:false, claims_prior_posted_approval:false,
+       review_instruction:"Review cumulative coverage receipts for the pinned historical range. This is not a code diff and not a prior posted approval. Verify the complete contiguous coverage and receipt bindings before issuing the final verdict.",
+       initial_base:$base, full_head:$head, manifest_blob:$manifest,
+       scope_fingerprint:$scope, receipts:.}' "$RECEIPT_CHAIN" > "$RECEIPT_PACKAGE"
+  {
+    receipt_lines="$(wc -l < "$RECEIPT_PACKAGE" | tr -d ' ')"
+    printf 'diff --git a/wave-audit-cumulative-coverage-receipts.json b/wave-audit-cumulative-coverage-receipts.json\n'
+    printf 'new file mode 100644\n--- /dev/null\n+++ b/wave-audit-cumulative-coverage-receipts.json\n'
+    printf '@@ -0,0 +1,%s @@\n' "$receipt_lines"
+    sed 's/^/+/' "$RECEIPT_PACKAGE"
+  } > "$DIFF_FILE"
+  BYTES="$(wc -c < "$DIFF_FILE" | tr -d ' ')"
+  FILES=1
+  RANGE_BASE="$BASE_FULL"; RANGE_HEAD="$HEAD_FULL"
+  log "finalizing explicit cumulative historical coverage from $BASE_FULL through $HEAD_FULL — ${REPORT_FILES} file(s), ${REPORT_BYTES} bytes across retained chunks (review package: ${BYTES} bytes)"
+fi
+
+log "audit range ${RANGE_BASE} .. ${RANGE_HEAD} (intended head ${HEAD_FULL}) — ${REPORT_FILES} file(s), ${REPORT_BYTES} bytes in scope (effort=${EFFORT}, timeout=${TIMEOUT}s)"
+
+if [ -n "$HISTORICAL_END" ] && [ "$BYTES" -eq 0 ]; then
+  jq -n --arg base "$RANGE_BASE" --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" \
+    --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" '
+      {historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
+       prefix_receipt:null,receipt_written:false,watermark_advanced:false,
+       fanout_authorized:false,dry_run:$dry,skipped:"empty-historical-chunk"}'
+  log "ERROR: historical chunk has no in-scope bytes, so no reviewer evidence can be retained — no receipt or clearance; choose a later endpoint that coalesces this empty interval with a non-empty chunk"
+  exit 3
+fi
 
 # The complete curated payload is already known. Refuse deterministic
 # overage before the orchestrator waits on providers or accounts feedback;
@@ -433,7 +703,7 @@ if [ "$BYTES" -gt "$DIFF_MAX" ]; then
   exit 8
 fi
 
-if [ "$BYTES" -eq 0 ]; then
+if [ "$BYTES" -eq 0 ] && [ "$HISTORICAL" = false ]; then
   # Only excluded-prefix (or no) content changed in the range: vacuously
   # clean. Advance the watermark so the next audit does not re-walk it.
   log "no in-scope changes — audit passes vacuously"
@@ -464,17 +734,80 @@ if [ -n "$pr_head" ]; then
   orch_args[${#orch_args[@]}]="--head"
   orch_args[${#orch_args[@]}]="$pr_head"
 fi
-[ "$DRY_RUN" = true ] && orch_args[${#orch_args[@]}]="--dry-run"
+if [ "$DRY_RUN" = true ] || [ -n "$HISTORICAL_END" ]; then
+  orch_args[${#orch_args[@]}]="--dry-run"
+fi
 if [ "$EFFORT" != "minimal" ]; then
   export P4B_CLAUDE_EFFORT="$EFFORT"
 fi
-set +e
-P4B_CODEX_EFFORT="$EFFORT" \
-P4B_ADAPTER_TIMEOUT_SECONDS="$TIMEOUT" \
-P4B_DIFF_MAX_BYTES="$DIFF_MAX" \
-  "$ORCH" "${orch_args[@]}"
-orc=$?
-set -e
+if [ -n "$HISTORICAL_END" ]; then
+  ORCH_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/wave-audit-orchestrator.XXXXXX")"
+  TMP_FILES[${#TMP_FILES[@]}]="$ORCH_OUTPUT"
+  set +e
+  P4B_CODEX_EFFORT="$EFFORT" P4B_ADAPTER_TIMEOUT_SECONDS="$TIMEOUT" \
+  P4B_DIFF_MAX_BYTES="$DIFF_MAX" "$ORCH" "${orch_args[@]}" > "$ORCH_OUTPUT"
+  orc=$?
+  set -e
+  if [ "$orc" -ne 0 ]; then
+    cat "$ORCH_OUTPUT"
+    log "historical chunk validation failed (orchestrator exit $orc) — no prefix receipt, watermark, or fan-out"
+    exit "$orc"
+  fi
+  orch_summary="$(jq -ce '
+    select(.dry_run == true and .review_posted == false) |
+    select((.direction | type == "string" and length > 0) and
+           (.reviewer_identity | type == "string" and length > 0) and
+           (.head_sha | type == "string")) |
+    select((.validated_verdict | type == "object") and
+           (.validated_verdict.verdict | type == "string") and
+           (.validated_verdict.findings | type == "array"))' "$ORCH_OUTPUT" 2>/dev/null)" \
+    || { cat "$ORCH_OUTPUT"; die 3 "historical dry-run returned no complete validated_verdict"; }
+  verdict="$(printf '%s' "$orch_summary" | jq -c .validated_verdict)"
+  if [ -n "$pr_head" ]; then
+    [ "$(printf '%s' "$orch_summary" | jq -r '.head_sha // empty')" = "$pr_head" ] \
+      || { cat "$ORCH_OUTPUT"; die 3 "historical dry-run verdict is not pinned to lane-verified canary head $pr_head"; }
+  fi
+  clean=false
+  printf '%s' "$verdict" | jq -e '.verdict == "APPROVED" and (.findings | length == 0)' >/dev/null && clean=true
+  if [ "$clean" != true ]; then
+    jq -n --arg base "$RANGE_BASE" --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" \
+      --argjson verdict "$verdict" \
+      '{historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
+        prefix_receipt:null,watermark_advanced:false,fanout_authorized:false,
+        validated_verdict:$verdict}'
+    log "historical chunk produced findings (including APPROVED advisories) — complete verdict retained for disposition; no receipt or clearance state written"
+    exit 1
+  fi
+  prefix_tag=null
+  if [ "$DRY_RUN" = false ]; then
+    PREFIX_TAG_RESULT=""
+    advance_prefix_receipt "$orch_summary"
+    prefix_tag="$PREFIX_TAG_RESULT"
+  fi
+  jq -n --arg base "$RANGE_BASE" --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" \
+    --arg tag "$prefix_tag" --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" \
+    --argjson verdict "$verdict" '
+      {historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
+       prefix_receipt:(if $tag == "null" then null else $tag end),
+       receipt_written:($dry|not),watermark_advanced:false,fanout_authorized:false,
+       dry_run:$dry,validated_verdict:$verdict}'
+  log "historical chunk validated clean — retained as non-clearance prefix only; explicit --finalize-historical is still required"
+  exit 9
+else
+  set +e
+  P4B_CODEX_EFFORT="$EFFORT" \
+  P4B_ADAPTER_TIMEOUT_SECONDS="$TIMEOUT" \
+  P4B_DIFF_MAX_BYTES="$DIFF_MAX" \
+    "$ORCH" "${orch_args[@]}"
+  orc=$?
+  set -e
+fi
+
+if [ "$FINALIZE_HISTORICAL" = true ] && [ "$orc" -ne 0 ]; then
+  emit_json "$orc" false null
+  log "historical finalization did not approve (orchestrator exit $orc) — full watermark unchanged; do NOT fan out or treat retained prefixes as clearance"
+  exit "$orc"
+fi
 
 case "$orc" in
   0)
