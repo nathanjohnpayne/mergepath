@@ -21,11 +21,13 @@ Anything else — a green under-threshold PR, or a Phase 4a clearance where `pha
 
 ### Author Identity
 
-All agents commit and push code under a single shared author identity:
+All agents author and push code under a single shared author identity:
 
 - **GitHub ID:** `nathanjohnpayne`
-- **Role:** Author, committer, and merger for all code changes
+- **Role:** Author and merger for all code changes
 - **Used by:** Whichever agent is currently writing or fixing code
+
+When GitHub creates a commit during a squash merge, `update-branch`, or a web-UI merge, its committer may be GitHub's `GitHub <noreply@github.com>` / `web-flow` identity. That server-side identity is not selectable by the agent and is not an agent identity; the author identity, reviewer identities, signing requirements, and merge rules above and below remain unchanged.
 
 ### Reviewer Identities
 
