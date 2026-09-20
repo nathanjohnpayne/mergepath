@@ -76,6 +76,7 @@ scenario=${CODEX_TEST_SCENARIO:?}
 author='nathanjohnpayne'
 reviewer='nathanpayne-codex'
 t='2026-06-04T00:00:00Z'
+old='2026-06-03T00:00:00Z'
 [ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
 [ "${1:-}" = "--paginate" ] && shift
@@ -89,9 +90,14 @@ case "$endpoint" in
   repos/owner/repo/issues/999/reactions) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
-      dup_author)    printf '[{"id":7001,"user":{"login":"%s"},"created_at":"%s","body":"@codex review"}]\n' "$author" "$t" ;;
-      reviewer_only) printf '[{"id":7002,"user":{"login":"%s"},"created_at":"%s","body":"@codex review"}]\n' "$reviewer" "$t" ;;
-      *)             printf '[]\n' ;;
+      dup_author)       jq -cn --arg who "$author" --arg t "$t" '[{id:7001,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      dup_author_upper) jq -cn --arg who "$author" --arg t "$t" '[{id:7002,user:{login:$who},created_at:$t,body:"@CODEX REVIEW"}]' ;;
+      author_prose)     jq -cn --arg who "$author" --arg t "$t" '[{id:7003,user:{login:$who},created_at:$t,body:"Status: @codex review was already requested."}]' ;;
+      author_quoted)    jq -cn --arg who "$author" --arg t "$t" '[{id:7004,user:{login:$who},created_at:$t,body:"Earlier note:\n> @codex review\n\nDo not run it again."}]' ;;
+      author_padded)    jq -cn --arg who "$author" --arg t "$t" '[{id:7005,user:{login:$who},created_at:$t,body:"@codex review "}]' ;;
+      stale_author)     jq -cn --arg who "$author" --arg t "$old" '[{id:7006,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      reviewer_only)    jq -cn --arg who "$reviewer" --arg t "$t" '[{id:7007,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      *)                printf '[]\n' ;;
     esac
     ;;
   *) echo "unexpected gh api endpoint: $endpoint" >&2; exit 99 ;;
@@ -152,6 +158,45 @@ test_dup_author_skips() {
   [ "$(trig_count "$dir")" = "0" ] || fail "B: expected 0 posts (idempotent skip), got $(trig_count "$dir")"
   [ "$(jqf "$dir" '.trigger_posted')" = "false" ] || fail "B: trigger_posted=$(jqf "$dir" '.trigger_posted'), expected false"
   [ "$FAIL" -ne "$before" ] || pass "B: existing author @codex trigger on HEAD → idempotent skip (no duplicate)"
+}
+
+# #1276: dedup evidence is the complete author command, case-insensitively.
+test_uppercase_author_command_skips() {
+  local dir rc before=$FAIL
+  dir=$(make_case "dup-uppercase")
+  rc=$(run_trigger_only "$dir" dup_author_upper)
+  [ "$rc" = "0" ] || fail "B1: expected exit 0, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "0" ] || fail "B1: uppercase exact author command must dedup, got $(trig_count "$dir") posts"
+  [ "$(jqf "$dir" '.trigger_posted')" = "false" ] || fail "B1: trigger_posted=$(jqf "$dir" '.trigger_posted'), expected false"
+  [ "$FAIL" -ne "$before" ] || pass "B1: uppercase exact author command retains case-insensitive idempotent skip"
+}
+
+test_author_containment_posts() {
+  local scenario desc dir rc before
+  for scenario in author_prose author_quoted author_padded; do
+    before=$FAIL
+    case "$scenario" in
+      author_prose) desc="prose mention" ;;
+      author_quoted) desc="quoted command" ;;
+      author_padded) desc="space-padded command" ;;
+    esac
+    dir=$(make_case "$scenario")
+    rc=$(run_trigger_only "$dir" "$scenario")
+    [ "$rc" = "0" ] || fail "B2: $desc expected exit 0, got $rc; err=$(cat "$dir/err.log")"
+    [ "$(trig_count "$dir")" = "1" ] || fail "B2: author $desc must not suppress the exact POST, got $(trig_count "$dir") posts"
+    [ "$(jqf "$dir" '.trigger_posted')" = "true" ] || fail "B2: $desc trigger_posted=$(jqf "$dir" '.trigger_posted'), expected true"
+    [ "$FAIL" -ne "$before" ] || pass "B2: author $desc is not complete-command dedup evidence → posts once"
+  done
+}
+
+test_stale_author_command_posts() {
+  local dir rc before=$FAIL
+  dir=$(make_case "stale-author")
+  rc=$(run_trigger_only "$dir" stale_author)
+  [ "$rc" = "0" ] || fail "B3: expected exit 0, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = "1" ] || fail "B3: stale author command must not suppress the exact POST, got $(trig_count "$dir") posts"
+  [ "$(jqf "$dir" '.trigger_posted')" = "true" ] || fail "B3: trigger_posted=$(jqf "$dir" '.trigger_posted'), expected true"
+  [ "$FAIL" -ne "$before" ] || pass "B3: stale author command remains outside the freshness-qualified dedup set"
 }
 
 # C: only a REVIEWER-authored trigger → not a valid trigger, still posts (#1)
@@ -619,6 +664,9 @@ test_workflow_declares_auto_trigger_flag() {
 
 test_fresh_posts_once_no_poll
 test_dup_author_skips
+test_uppercase_author_command_skips
+test_author_containment_posts
+test_stale_author_command_posts
 test_reviewer_trigger_does_not_count
 test_gate_skips_content_free_head
 test_gate_triggers_on_real_content_change

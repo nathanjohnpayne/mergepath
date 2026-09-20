@@ -327,10 +327,10 @@ paths:
   - path: scripts/lib/codex-request-evidence.sh
     type: canonical
     consumers: all
-  # Single source of truth for the Codex App failure-marker regexes (#722):
-  # the usage-limit / not-connected patterns audit-codex-latency.sh classifies
-  # retrospectively, factored out so the live Phase 4a scripts test the SAME
-  # patterns. #1085 also makes this the one grammar/parser for the durable,
+  # Single source of truth for the Codex App failure-marker regexes (#722): the
+  # live provider-response markers and the audit's broader historical usage-
+  # limit classifier share this owner without sharing live terminal semantics.
+  # #1085 also makes this the one grammar/parser for the durable,
   # exact-head Phase 4a timeout determination consumed by phase-4b/lib.sh.
   # Sourced (existence-guarded, flag-gated) by codex-review-request.sh and
   # codex-review-check.sh — declared in each of their requires: below so the

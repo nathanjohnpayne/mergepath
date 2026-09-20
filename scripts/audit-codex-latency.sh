@@ -119,9 +119,10 @@ else
 fi
 
 # --- shared Codex failure-marker regexes (#722) -----------------------------
-# The rate-limit / not-connected marker patterns are canonicalized in
-# scripts/lib/codex-failure-markers.sh so the live Phase 4a scripts test the
-# SAME patterns this audit classifies (proposal 1 of #722). Hard-require it:
+# The live and retrospective marker patterns are canonicalized in
+# scripts/lib/codex-failure-markers.sh. The audit retains its historically
+# broad rate-limit classifier while live usage-limit detection is restricted
+# to the provider response shape. Hard-require the shared definitions:
 # without it the normalize phase cannot classify the marker events the study
 # measures, so a missing lib is a dependency error, not a silent degrade.
 if [ -r "$__AUDIT_DIR/lib/codex-failure-markers.sh" ]; then
@@ -354,7 +355,7 @@ normalize() {
     jq -c '{kind:"commit", sha, committer_date}' "$RAW_DIR/pr_commits.jsonl"
 
     jq -c --arg bot "$BOT_LOGIN" \
-          --arg rate_re "$CODEX_USAGE_LIMIT_MARKER_RE" \
+          --arg rate_re "$CODEX_AUDIT_USAGE_LIMIT_MARKER_RE" \
           --arg nc_re "$CODEX_NOT_CONNECTED_MARKER_RE" '
       if (.login | startswith($bot)) then
         # Verdict = a line-anchored "Codex Review:" bot comment (#567).
@@ -368,10 +369,9 @@ normalize() {
              | [scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")]
              | (last // [])[0]) // null),
            affirmative:(.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b"))}
-        # Rate-limit / usage-limit / quota marker. Pattern shared with the
-        # live scripts via scripts/lib/codex-failure-markers.sh (#722); the
-        # inline (?i) flag is replaced by the test() "i" flag so the stored
-        # literal is flag-free and reusable.
+        # Historical rate-limit / usage-limit / quota marker. This broad audit
+        # classifier is distinct from the provider-response-specific live
+        # terminal marker in scripts/lib/codex-failure-markers.sh (#722).
         elif ((.body // "") | test($rate_re; "i")) then
           {kind:"rate_limit", pr, comment_id:.id, created_at}
         # Dropped-trigger markers (#570 class): the app was not connected /

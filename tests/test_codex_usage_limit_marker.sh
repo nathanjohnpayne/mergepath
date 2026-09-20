@@ -4,10 +4,9 @@
 # Regression coverage for Codex App account-/connection-level failure-marker
 # detection (#722):
 #
-#   - scripts/lib/codex-failure-markers.sh — the shared usage-limit /
-#     not-connected regexes + codex_failure_marker_of() classifier, factored
-#     out of scripts/audit-codex-latency.sh so the live Phase 4a scripts test
-#     the IDENTICAL patterns instead of drifting (proposal 1).
+#   - scripts/lib/codex-failure-markers.sh — the live usage-limit /
+#     not-connected regexes + codex_failure_marker_of() classifier, alongside
+#     the audit's intentionally broader historical usage-limit pattern.
 #   - scripts/codex-review-request.sh — scan_codex_state's `blocked` signal
 #     and the poll-loop short-circuit that turns a quota/not-connected comment
 #     into an immediate exit-4 (FALLBACK_REQUIRED) with a named
@@ -46,6 +45,37 @@ QUOTA_BODY='You have reached your Codex usage limits for code reviews. You can s
 NOT_CONNECTED_BODY='To use Codex here, create a Codex account and connect to GitHub, then comment @codex review.'
 CLEAN_VERDICT_BODY='Codex Review: Didn'"'"'t find any major issues. Swish!
 Reviewed commit: d05ff4d0'
+# Preserve the provider comment byte-for-byte, including literal shell-looking
+# text and its typographic apostrophe.
+# shellcheck disable=SC1112,SC2016
+CAPTURED_CLEAN_TASK_SUMMARY='## Review Result
+
+No blocking findings identified for head `d2c70ce6d1b2236326585484e8b0dfa17a40b172`.
+
+The implementation:
+
+- Restricts blocked-review diagnostic evidence to comments whose complete body is exactly `@codex review`, while retaining the existing author, freshness, and ordering selector semantics. [scripts/codex-review-check.shL2438-L2449](https://github.com/nathanjohnpayne/nathanpaynedotcom/blob/d2c70ce6d1b2236326585484e8b0dfa17a40b172/scripts/codex-review-check.sh#L2438-L2449) [scripts/lib/codex-request-evidence.shL4-L10](https://github.com/nathanjohnpayne/nathanpaynedotcom/blob/d2c70ce6d1b2236326585484e8b0dfa17a40b172/scripts/lib/codex-request-evidence.sh#L4-L10)
+- Binds acknowledgement lookup to the selected command’s comment ID and timestamp, then reports age and configured acknowledgement/review budgets without changing the blocked verdict. [scripts/codex-review-check.shL2463-L2480](https://github.com/nathanjohnpayne/nathanpaynedotcom/blob/d2c70ce6d1b2236326585484e8b0dfa17a40b172/scripts/codex-review-check.sh#L2463-L2480)
+- Reports provider-side block, terminal-review, and running/completed-summary observations independently of whether qualifying command evidence exists. [scripts/codex-review-check.shL2450-L2465](https://github.com/nathanjohnpayne/nathanpaynedotcom/blob/d2c70ce6d1b2236326585484e8b0dfa17a40b172/scripts/codex-review-check.sh#L2450-L2465)
+- Reuses the shared selection and acknowledgement helpers in the request path, while failing before any trigger write if those required helpers are unavailable. [scripts/codex-review-request.shL301-L308](https://github.com/nathanjohnpayne/nathanpaynedotcom/blob/d2c70ce6d1b2236326585484e8b0dfa17a40b172/scripts/codex-review-request.sh#L301-L308) [scripts/codex-review-request.shL1030-L1038](https://github.com/nathanjohnpayne/nathanpaynedotcom/blob/d2c70ce6d1b2236326585484e8b0dfa17a40b172/scripts/codex-review-request.sh#L1030-L1038) [scripts/codex-review-request.shL1305-L1311](https://github.com/nathanjohnpayne/nathanpaynedotcom/blob/d2c70ce6d1b2236326585484e8b0dfa17a40b172/scripts/codex-review-request.sh#L1305-L1311)
+- Covers exact-command selection, later prose mentions, incorrect acknowledgement linkage, freshness, provider-only activity, query-mode isolation, and carry-forward success. [tests/test_codex_request_evidence.shL118-L151](https://github.com/nathanjohnpayne/nathanpaynedotcom/blob/d2c70ce6d1b2236326585484e8b0dfa17a40b172/tests/test_codex_request_evidence.sh#L118-L151)
+
+No code changes were needed, so I did not create a follow-up commit or pull request.
+
+## Validation
+
+- ✅ `git diff --check c2390b2dcf97973d908085328c4e2339e80c0cb3..d2c70ce6d1b2236326585484e8b0dfa17a40b172`
+- ✅ `bash tests/test_codex_request_evidence.sh`
+- ✅ `bash tests/test_codex_review_request_trigger_only.sh`
+- ✅ `bash tests/test_codex_review_request_ack.sh`
+- ✅ `bash tests/test_codex_review_request_entry.sh`
+- ✅ `bash tests/test_codex_review_request_token_fallback.sh`
+- ✅ `bash tests/test_codex_usage_limit_marker.sh`
+- ✅ `bash tests/test_merge_clearance_gate.sh`
+- ⚠️ `eval "$(scripts/op-preflight.sh --agent codex --mode all)"` — credential preflight could not initialize because the environment does not contain the 1Password CLI, so no GitHub review was posted under the reviewer identity.
+
+ [View task →](https://chatgpt.com/s/cd_6aa90fce818c819189fceffa70a3ccac)'
+FILENAME_ONLY='tests/test_codex_usage_limit_marker.sh'
 
 # ── 1. Lib: the shared classifier + constants ───────────────────────────────
 # shellcheck source=../scripts/lib/codex-failure-markers.sh
@@ -54,6 +84,9 @@ Reviewed commit: d05ff4d0'
 [ -n "${CODEX_USAGE_LIMIT_MARKER_RE:-}" ] \
   && pass "lib defines CODEX_USAGE_LIMIT_MARKER_RE" \
   || fail "lib does not define CODEX_USAGE_LIMIT_MARKER_RE"
+[ -n "${CODEX_AUDIT_USAGE_LIMIT_MARKER_RE:-}" ] \
+  && pass "lib defines CODEX_AUDIT_USAGE_LIMIT_MARKER_RE" \
+  || fail "lib does not define CODEX_AUDIT_USAGE_LIMIT_MARKER_RE"
 [ -n "${CODEX_NOT_CONNECTED_MARKER_RE:-}" ] \
   && pass "lib defines CODEX_NOT_CONNECTED_MARKER_RE" \
   || fail "lib does not define CODEX_NOT_CONNECTED_MARKER_RE"
@@ -65,10 +98,23 @@ case "$CODEX_USAGE_LIMIT_MARKER_RE" in
   *) pass "usage-limit pattern is flag-free (callers apply case-insensitivity)" ;;
 esac
 
+if printf '%s' 'tests/test_codex_usage_limit_marker.sh' \
+   | grep -iqE "${CODEX_AUDIT_USAGE_LIMIT_MARKER_RE:-__missing__}"; then
+  pass "retrospective audit pattern preserves historical broad usage-limit classification"
+else
+  fail "retrospective audit pattern no longer preserves historical broad usage-limit classification"
+fi
+
 marker_of() { codex_failure_marker_of "$1"; }
 [ "$(marker_of "$QUOTA_BODY")" = "usage_limit" ] \
   && pass "classifier: real quota comment → usage_limit" \
   || fail "classifier: quota comment misclassified as '$(marker_of "$QUOTA_BODY")'"
+[ -z "$(marker_of "$CAPTURED_CLEAN_TASK_SUMMARY")" ] \
+  && pass "classifier: captured clean task summary is not terminal usage_limit evidence" \
+  || fail "classifier: captured clean task summary wrongly flagged as '$(marker_of "$CAPTURED_CLEAN_TASK_SUMMARY")'"
+[ -z "$(marker_of "$FILENAME_ONLY")" ] \
+  && pass "classifier: filename-only control is not terminal usage_limit evidence" \
+  || fail "classifier: filename-only control wrongly flagged as '$(marker_of "$FILENAME_ONLY")'"
 [ "$(marker_of "$NOT_CONNECTED_BODY")" = "not_connected" ] \
   && pass "classifier: real not-connected comment → not_connected" \
   || fail "classifier: not-connected comment misclassified as '$(marker_of "$NOT_CONNECTED_BODY")'"
@@ -121,11 +167,17 @@ check_blocked "a real verdict is NOT a marker (precedence: verdict first)" \
 check_blocked "a non-bot comment quoting the quota text is ignored" \
   "null" \
   "$(mk "nathanjohnpayne" "$QUOTA_BODY" "2026-07-07T01:10:19Z" 903)"
+check_blocked "captured clean task summary remains non-terminal" \
+  "null" \
+  "$(mk "$BOT" "$CAPTURED_CLEAN_TASK_SUMMARY" "2026-07-07T01:10:19Z" 904)"
+check_blocked "filename-only control remains non-terminal" \
+  "null" \
+  "$(mk "$BOT" "$FILENAME_ONLY" "2026-07-07T01:10:19Z" 905)"
 # Latest-wins: an older not_connected superseded by a newer usage_limit.
-older_nc="$(mk "$BOT" "$NOT_CONNECTED_BODY" "2026-07-07T01:00:00Z" 904)"
-newer_ul="$(mk "$BOT" "$QUOTA_BODY" "2026-07-07T02:00:00Z" 905)"
+older_nc="$(mk "$BOT" "$NOT_CONNECTED_BODY" "2026-07-07T01:00:00Z" 906)"
+newer_ul="$(mk "$BOT" "$QUOTA_BODY" "2026-07-07T02:00:00Z" 907)"
 check_blocked "newest marker wins (usage_limit @ 02:00 over not_connected @ 01:00)" \
-  '{"reason":"usage_limit","created_at":"2026-07-07T02:00:00Z","comment_id":905}' \
+  '{"reason":"usage_limit","created_at":"2026-07-07T02:00:00Z","comment_id":907}' \
   "$(jq -s 'add' <(printf '%s' "$older_nc") <(printf '%s' "$newer_ul"))"
 # #953: a same-second tie must resolve by the explicit [.created_at, .id] key,
 # not by whichever order the API happened to list the two comments in. Assert
@@ -246,6 +298,10 @@ sel_bad=""
 [ "$(sel_reason "$(_c '2026-07-01T10:05:00Z' 'Working on it.')")" = "none" ] \
   || sel_bad="$sel_bad noise-classified-as-block"
 [ "$(sel_reason '[]')" = "none" ] || sel_bad="$sel_bad empty-classified-as-block"
+[ "$(sel_reason "$(_c '2026-07-01T10:05:00Z' "$CAPTURED_CLEAN_TASK_SUMMARY")")" = "none" ] \
+  || sel_bad="$sel_bad captured-summary-classified-as-block"
+[ "$(sel_reason "$(_c '2026-07-01T10:05:00Z' "$FILENAME_ONLY")")" = "none" ] \
+  || sel_bad="$sel_bad filename-only-classified-as-block"
 # 3. The three filters. A marker BEFORE the freshness threshold is a prior
 #    head's and must not resurface; a non-bot author cannot speak for the Codex
 #    account; and a `Codex Review:` verdict that merely mentions limits is a
@@ -284,18 +340,20 @@ else
   fail "#839 block selection:$sel_bad"
 fi
 
-# ── 6. Drift guard: the audit sources the SAME lib (proposal 1). HUB-ONLY —
+# ── 6. Ownership guard: the audit sources the same lib but uses its separate
+#      retrospective pattern. HUB-ONLY —
 #      audit-codex-latency.sh is not propagated, so skip when absent (a
 #      consumer checkout, e.g. the check_repo_lint_consumer_safety fixture).
 if [ ! -r "$AUDIT" ]; then
   pass "audit drift guard: SKIP (hub-only audit-codex-latency.sh absent — consumer checkout)"
 else
   if grep -q 'codex-failure-markers.sh' "$AUDIT" \
+     && grep -q 'CODEX_AUDIT_USAGE_LIMIT_MARKER_RE' "$AUDIT" \
      && grep -q 'test(\$rate_re; "i")' "$AUDIT" \
      && grep -q 'test(\$nc_re; "i")' "$AUDIT"; then
-    pass "audit-codex-latency.sh sources the shared lib (no pattern drift)"
+    pass "audit-codex-latency.sh uses the shared lib's retrospective usage-limit pattern"
   else
-    fail "audit-codex-latency.sh does not use the shared marker lib"
+    fail "audit-codex-latency.sh does not use the shared retrospective marker pattern"
   fi
 
   # The audit must NOT still carry the old inline literal patterns (proving the
@@ -316,11 +374,16 @@ E2E_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-blocked-e2e.XXXXXX")"
 # No trap here on purpose — `cleanup_tmp` (registered above) already removes
 # this directory. A second EXIT trap would drop the selector snippet's cleanup.
 
-# Build a temp repo whose stubbed gh returns a bot marker comment (created
-# after the trigger). $1 = marker body → drives usage_limit vs not_connected.
-run_blocked_e2e() { # marker_body → prints "rc|blocked_reason|elapsed"
-  local body="$1" dir="$E2E_WORKDIR/case.$RANDOM" rc=0 start elapsed
+# Build a temp repo whose stubbed gh returns a bot comment after the trigger.
+# With later_verdict=true, the first post-trigger scan returns that comment and
+# the next returns a valid current-head verdict.
+run_request_e2e() { # comment_body [later_verdict] → prints "rc|blocked_reason|elapsed|affirmative"
+  # Keep punctuation in the ordinary fixture path so the generated stub must
+  # transport it as data rather than embedding it in shell source.
+  local body="$1" later_verdict="${2:-false}" dir="$E2E_WORKDIR/case $RANDOM's fixture" rc=0 start elapsed
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin"
+  printf '%s' "$body" >"$dir/comment-body.txt"
+  [ "$later_verdict" = true ] && : >"$dir/later-verdict"
   cp "$REQUEST" "$dir/scripts/codex-review-request.sh"; chmod +x "$dir/scripts/codex-review-request.sh"
   cp "$LIB" "$dir/scripts/lib/codex-failure-markers.sh"
   cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
@@ -333,7 +396,7 @@ codex:
   review_timeout_seconds: 120
   reaction_freshness_window_seconds: 999999999
   ack_wait_seconds: 0
-  max_ack_retries: 1
+  max_ack_retries: 0
 EOF
   cat >"$dir/scripts/gh-as-author.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -341,47 +404,81 @@ set -euo pipefail
 printf 'https://github.com/owner/repo/pull/999#issuecomment-1001\n'
 EOF
   chmod +x "$dir/scripts/gh-as-author.sh"
-  cat >"$dir/bin/gh" <<EOF
+  cat >"$dir/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 bot='chatgpt-codex-connector[bot]'
+head='d2c70ce6d1b2236326585484e8b0dfa17a40b172'
 t0='2026-07-07T01:08:39Z'
 t1='2026-07-07T01:10:19Z'
-[ "\${1:-}" = "api" ] || { echo "unexpected gh command: \$*" >&2; exit 99; }
+t2='2026-07-07T01:12:19Z'
+[ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
-[ "\${1:-}" = "--paginate" ] && shift
-endpoint=\${1:-}
-case "\$endpoint" in
-  repos/owner/repo/pulls/999)            printf '{"head":{"sha":"head-sha"}}\n' ;;
-  repos/owner/repo/commits/head-sha)     printf '%s\n' "\$t0" ;;
+[ "${1:-}" = "--paginate" ] && shift
+endpoint=${1:-}
+case "$endpoint" in
+  repos/owner/repo/pulls/999)            printf '{"head":{"sha":"%s"}}\n' "$head" ;;
+  repos/owner/repo/commits/$head)        printf '%s\n' "$t0" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)    printf '[]\n' ;;
   repos/owner/repo/pulls/999/comments)   printf '[]\n' ;;
   repos/owner/repo/issues/999/reactions) printf '[]\n' ;;
-  repos/owner/repo/issues/comments/1001) printf '%s\n' "\$t0" ;;
+  repos/owner/repo/issues/comments/1001) printf '%s\n' "$t0" ;;
   repos/owner/repo/issues/comments/1001/reactions) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
-    jq -cn --arg bot "\$bot" --arg t "\$t1" --arg body "$body" \
-      '[{id:8001,user:{login:\$bot},created_at:\$t,body:\$body}]' ;;
-  *) echo "unexpected gh api endpoint: \$endpoint" >&2; exit 99 ;;
+    case_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+    count_file="$case_dir/comment-read-count"
+    count=0
+    [ ! -r "$count_file" ] || count=$(cat "$count_file")
+    count=$((count + 1))
+    printf '%s' "$count" >"$count_file"
+    if [ -f "$case_dir/later-verdict" ] && [ "$count" -eq 1 ]; then
+      printf '[]\n'
+    elif [ -f "$case_dir/later-verdict" ] && [ "$count" -ge 3 ]; then
+      jq -cn --arg bot "$bot" --arg t "$t2" --arg head "$head" \
+        '[{id:8002,user:{login:$bot},created_at:$t,body:("Codex Review: Didn'"'"'t find any major issues. Swish!\nReviewed commit: " + $head)}]'
+    else
+      jq -Rsc --arg bot "$bot" --arg t "$t1" \
+        '[{id:8001,user:{login:$bot},created_at:$t,body:.}]' "$case_dir/comment-body.txt"
+    fi ;;
+  *) echo "unexpected gh api endpoint: $endpoint" >&2; exit 99 ;;
 esac
 EOF
   chmod +x "$dir/bin/gh"
+  cat >"$dir/bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$dir/bin/sleep"
   start=$(date +%s)
   ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
       ./scripts/codex-review-request.sh 999 owner/repo >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
   elapsed=$(( $(date +%s) - start ))
-  printf '%s|%s|%s' "$rc" "$(jq -r '.blocked_reason // "null"' "$dir/out.json" 2>/dev/null)" "$elapsed"
+  printf '%s|%s|%s|%s' "$rc" \
+    "$(jq -r '.blocked_reason // "null"' "$dir/out.json" 2>/dev/null)" \
+    "$elapsed" \
+    "$(jq -r '.verdict.affirmative // false' "$dir/out.json" 2>/dev/null)"
 }
 
 check_e2e() { # desc marker_body expected_reason
   local desc="$1" res rc reason elapsed
-  res=$(run_blocked_e2e "$2")
-  rc=${res%%|*}; reason=$(echo "$res" | cut -d'|' -f2); elapsed=${res##*|}
+  res=$(run_request_e2e "$2")
+  rc=${res%%|*}; reason=$(echo "$res" | cut -d'|' -f2); elapsed=$(echo "$res" | cut -d'|' -f3)
   if [ "$rc" = "4" ] && [ "$reason" = "$3" ] && [ "$elapsed" -lt 60 ]; then
     pass "e2e: $desc → exit 4, blocked_reason=$reason, short-circuited in ${elapsed}s"
   else
     fail "e2e: $desc → rc=$rc reason=$reason elapsed=${elapsed}s (want rc=4 reason=$3 elapsed<60)"
+  fi
+}
+
+check_later_verdict_e2e() { # desc interim_body
+  local desc="$1" res rc reason elapsed affirmative
+  res=$(run_request_e2e "$2" true)
+  rc=${res%%|*}; reason=$(echo "$res" | cut -d'|' -f2); elapsed=$(echo "$res" | cut -d'|' -f3); affirmative=${res##*|}
+  if [ "$rc" = "0" ] && [ "$reason" = "null" ] && [ "$affirmative" = true ] && [ "$elapsed" -lt 60 ]; then
+    pass "e2e: $desc → later current-head verdict reached, blocked_reason=null"
+  else
+    fail "e2e: $desc → rc=$rc reason=$reason affirmative=$affirmative elapsed=${elapsed}s (want rc=0 reason=null affirmative=true elapsed<60)"
   fi
 }
 
@@ -391,6 +488,8 @@ check_e2e "quota comment short-circuits to Phase 4b" \
 check_e2e "not-connected comment short-circuits to Phase 4b" \
   'To use Codex here, connect your GitHub account at chatgpt.com.' \
   "not_connected"
+check_later_verdict_e2e "captured clean task summary does not terminate the requester" \
+  "$CAPTURED_CLEAN_TASK_SUMMARY"
 
 echo ""
 echo "test_codex_usage_limit_marker: $PASS passed, $FAIL failed"
