@@ -18,7 +18,7 @@ A per-line nesting ceiling was implemented and withdrawn. It bounds the cost, bu
 
 Blockquote nesting is not affected: it costs 96ms at 5,000 levels, 191ms at 15,000, 1,042ms at 30,000 and 1,256ms at 32,760, the deepest a 65,536-character body can express. Superlinear, but already bounded near 1.3s by the body-size limit.
 
-Same-line list nesting is not the only shape that reaches this cost. A 65,441-byte body of `'['.repeat(32700) + ']'.repeat(32700)` does not complete in 15 seconds either, where the parser being replaced answers it in about 50ms. That one is inline link-reference nesting rather than container nesting, so it is a distinct vector reached through a different part of the parser, and no container ceiling would have bounded it. Both are recorded here so the limitation is not read as narrower than it is.
+Same-line list nesting is not the only shape that reaches this cost. A 65,441-byte body of `'['.repeat(32700) + ']'.repeat(32700) + '\n\nAuthoring-Agent: codex\n\n## Self-Review\n'` does not complete in 15 seconds either, where the parser being replaced answers it in about 50ms. The brackets contribute 65,400 bytes and the contract-marker suffix contributes 41 bytes. That one is inline link-reference nesting rather than container nesting, so it is a distinct vector reached through a different part of the parser, and no container ceiling would have bounded it. Both are recorded here so the limitation is not read as narrower than it is.
 
 This limitation is tracked separately and is not repaired by this change.
 
