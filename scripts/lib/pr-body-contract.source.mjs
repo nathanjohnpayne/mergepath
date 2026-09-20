@@ -99,8 +99,15 @@ function visibleLinesAfterComments(body, lines, entries) {
       for (let line = position.start.line; line <= position.end.line; line += 1) discardLines.add(line);
     }
   }
-  const visibleLines = rawLines(characters.join(''));
-  return visibleLines.map((line, index) => discardLines.has(index + 1) ? null : line);
+  // Slice at the original boundaries: deleting comment text can make a lone
+  // CR adjacent to a later LF, which must not become a new CRLF boundary.
+  let lineOffset = 0;
+  return lines.map((line, index) => {
+    const lineEnd = lineOffset + line.length;
+    const visible = characters.slice(lineOffset, lineEnd).join('');
+    lineOffset = lineEnd + (body.startsWith('\r\n', lineEnd) ? 2 : 1);
+    return discardLines.has(index + 1) ? null : visible;
+  });
 }
 
 export function parsePrBodyContract(body) {

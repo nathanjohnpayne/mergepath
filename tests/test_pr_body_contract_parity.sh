@@ -968,6 +968,15 @@ renderer_contract "CRLF line endings retain top-level markers" \
 renderer_contract "lone CR line endings retain top-level markers" \
   '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
   $'Authoring-Agent: codex\r\r## Self-Review\r'
+renderer_contract "stripping a comment cannot join distinct CR and LF boundaries" \
+  '{"author":"claude","authorCount":1,"hasSelfReview":true}' \
+  $'<!--x\ry-->\nAuthoring-Agent: claude\n## Self-Review\n'
+renderer_contract "mixed comment boundaries preserve duplicate declaration counting" \
+  '{"author":"","authorCount":2,"hasSelfReview":true}' \
+  $'<!--x\ry-->\nAuthoring-Agent: claude\r\nAuthoring-Agent: codex\r## Self-Review'
+renderer_contract "mixed comment boundaries keep quoted declarations nested" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'<!--x\ry-->\n> quote\nAuthoring-Agent: codex\n## Self-Review\n'
 renderer_contract "lone CR lines keep a lazy quoted declaration nested" \
   '{"author":"","authorCount":0,"hasSelfReview":true}' \
   $'## Self-Review\n\nfoo\rbar\rbaz\n> quote\nAuthoring-Agent: codex'
