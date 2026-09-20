@@ -1061,20 +1061,40 @@ for ((index = 0; index < 30000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
 # would sit here until the enclosing job timeout and never reach the
 # comparison, so the control could not fail in exactly the case it exists to
 # catch (CodeRabbit finding 4039721486). Run it under a real timeout, and
-# treat "no timeout tool available" as a skip rather than a silent pass --
-# otherwise a machine without one reads as green.
-parse_with_timeout() { # seconds, body -> stdout; rc 124 on expiry, 127 unavailable
-  local pwt_seconds="$1" pwt_body="$2" pwt_tool=''
-  if command -v timeout >/dev/null 2>&1; then
-    pwt_tool=timeout
-  elif command -v gtimeout >/dev/null 2>&1; then
-    pwt_tool=gtimeout
-  else
-    return 127
-  fi
-  printf '%s' "$pwt_body" \
-    | "$pwt_tool" "$pwt_seconds" node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null
+# otherwise a machine without one reads as green. Node is already the parser
+# runtime, so use its synchronous child-process timeout rather than requiring
+# GNU `timeout` (or macOS-only `gtimeout`). SIGKILL makes expiry non-negotiable.
+run_with_timeout() { # seconds, command...; stdin -> stdout; rc 124 on expiry
+  local rwt_seconds="$1"
+  shift
+  node -e '
+    const { readFileSync } = require("node:fs");
+    const { spawnSync } = require("node:child_process");
+    const seconds = Number(process.argv[1]);
+    const command = process.argv.slice(2);
+    const result = spawnSync(command[0], command.slice(1), {
+      input: readFileSync(0), encoding: "utf8", timeout: seconds * 1000, killSignal: "SIGKILL",
+    });
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (result.error?.code === "ETIMEDOUT") process.exit(124);
+    process.exit(result.status ?? 1);
+  ' "$rwt_seconds" "$@"
 }
+
+parse_with_timeout() { # seconds, body -> stdout; rc 124 on expiry
+  local pwt_seconds="$1" pwt_body="$2"
+  printf '%s' "$pwt_body" \
+    | run_with_timeout "$pwt_seconds" node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null
+}
+
+if printf '' | run_with_timeout 1 node -e 'setInterval(() => {}, 1000)' >/dev/null 2>&1; then
+  bad "#1281: Node watchdog accepted a nonterminating child"
+elif [ "$?" -eq 124 ]; then
+  ok "#1281: Node watchdog kills a nonterminating child"
+else
+  bad "#1281: Node watchdog did not report timeout exit 124"
+fi
 
 # The bound is 120s, not a tight fit around the measured cost. This suite runs
 # from repo_lint.yml's check_gh_as_author, which does NOT use actions/setup-node
@@ -1089,9 +1109,7 @@ deep_quote_start="$(date +%s)"
 deep_quote_contract="$(parse_with_timeout 120 "$DEEP_QUOTE_BODY")"
 deep_quote_rc=$?
 deep_quote_elapsed="$(( $(date +%s) - deep_quote_start ))"
-if [ "$deep_quote_rc" -eq 127 ]; then
-  bad "#1281: neither timeout nor gtimeout is available -- the blockquote bound cannot be enforced here"
-elif [ "$deep_quote_rc" -eq 124 ]; then
+if [ "$deep_quote_rc" -eq 124 ]; then
   bad "#1281: 30000-deep blockquote exceeded the 120s bound -- blockquote nesting is not bounded by body size after all"
 elif [ "$deep_quote_contract" = '{"author":"","authorCount":0,"hasSelfReview":true}' ]; then
   ok "#1281: a 30000-deep blockquote parses within an enforced 120s bound (${deep_quote_elapsed}s)"
