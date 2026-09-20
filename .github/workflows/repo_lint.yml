@@ -529,7 +529,7 @@ jobs:
         # here; they need a parsed shell AST and are tracked in #977.
         #
         # A consumer that has this wrapper but not yet the workflow SKIPs.
-        run: ./scripts/ci/check_required_check_publisher || { rc=$?; if [ ! -f scripts/ci/check_required_check_publisher ]; then echo "check_required_check_publisher not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+        run: ./scripts/ci/check_required_check_publisher --check || { rc=$?; if [ ! -f scripts/ci/check_required_check_publisher ]; then echo "check_required_check_publisher not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: install_yq_for_sync_manifest
         # mikefarah/yq is needed by check_sync_manifest and by
@@ -883,6 +883,10 @@ jobs:
       - name: check_merge_clearance_gate --self-test
         if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_merge_clearance_gate'))
         run: ./scripts/ci/check_merge_clearance_gate --self-test || { rc=$?; if [ ! -f scripts/ci/check_merge_clearance_gate ]; then echo "check_merge_clearance_gate not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
+
+      - name: check_required_check_publisher --self-test
+        if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_required_check_publisher'))
+        run: ./scripts/ci/check_required_check_publisher --self-test || { rc=$?; if [ ! -f scripts/ci/check_required_check_publisher ]; then echo "check_required_check_publisher not on this tree yet — soft pass (kit skew)"; exit 0; fi; exit "$rc"; }
 
       - name: check_pr_review_policy_nudge --self-test
         if: matrix.safety == 'consumer' && (needs.scope.outputs.full == 'true' || contains(fromJSON(needs.scope.outputs.checks), 'check_pr_review_policy_nudge'))
