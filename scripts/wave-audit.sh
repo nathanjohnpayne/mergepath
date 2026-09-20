@@ -475,7 +475,11 @@ if [ -n "$HISTORICAL_END" ]; then
          prefix_receipt:$tag,receipt_written:($dry|not),receipt_reused:true,
          watermark_advanced:false,fanout_authorized:false,dry_run:$dry,
          validated_verdict:$verdict}'
-    log "historical chunk receipt already validated — exact receipt ensured on origin without another review; no full-wave clearance"
+    if [ "$DRY_RUN" = true ]; then
+      log "historical chunk receipt already validated — dry-run made no receipt write or push; no full-wave clearance"
+    else
+      log "historical chunk receipt already validated — exact receipt ensured on origin without another review; no full-wave clearance"
+    fi
     exit 9
   fi
   git -C "$REPO_DIR" merge-base --is-ancestor "$PREFIX_BASE" "$RANGE_HEAD" 2>/dev/null \
@@ -533,7 +537,7 @@ EOF
 }
 
 manifest_scope_at() { # manifest_scope_at <commit>; absence is empty, read failure is fatal
-  local commit="$1" raw
+  local commit="$1" raw tree_paths
   if git -C "$REPO_DIR" cat-file -e "${commit}:${MANIFEST_RELPATH}" 2>/dev/null; then
     raw="$(manifest_paths_at "$commit")" \
       || die 3 "could not read ${MANIFEST_RELPATH} at historical boundary $commit"
@@ -543,8 +547,9 @@ manifest_scope_at() { # manifest_scope_at <commit>; absence is empty, read failu
   # A missing path is legitimate before the manifest was introduced. If the
   # tree still names it, cat-file failed for another reason and cannot be
   # interpreted as empty scope.
-  if git -C "$REPO_DIR" ls-tree --name-only "$commit" -- "$MANIFEST_RELPATH" 2>/dev/null \
-    | grep -Fxq "$MANIFEST_RELPATH"; then
+  tree_paths="$(git -C "$REPO_DIR" ls-tree --name-only "$commit" -- "$MANIFEST_RELPATH" 2>/dev/null)" \
+    || die 3 "could not inspect ${MANIFEST_RELPATH} at historical boundary $commit"
+  if printf '%s\n' "$tree_paths" | grep -Fxq "$MANIFEST_RELPATH"; then
     die 3 "could not read ${MANIFEST_RELPATH} at historical boundary $commit"
   fi
   git -C "$REPO_DIR" rev-parse --verify "${commit}^{tree}" >/dev/null 2>&1 \

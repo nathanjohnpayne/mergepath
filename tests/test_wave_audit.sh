@@ -558,6 +558,15 @@ FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
 cat "$CAPTURE/diff" >> "$HIST_CHUNKS"
 rc=0
 FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" --dry-run \
+  > "$WORK/push-retry-dry.json" 2> "$WORK/push-retry-dry.err" || rc=$?
+[ "$rc" -eq 9 ] && [ ! -e "$CAPTURE/args" ] && ! remote_has_prefix "$LARGE_HEAD" "$C2" \
+  && grep -q 'dry-run made no receipt write or push' "$WORK/push-retry-dry.err" \
+  && ! grep -q 'ensured on origin' "$WORK/push-retry-dry.err" \
+  && pass "retained-receipt dry-run reports validation without claiming a push" \
+  || fail "retained-receipt dry-run claimed or performed publication"
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
   --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" \
   > "$WORK/push-retry.json" 2> "$WORK/push-retry.err" || rc=$?
 [ "$rc" -eq 9 ] && [ ! -e "$CAPTURE/args" ] \
@@ -669,6 +678,27 @@ FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 83 --repo owner/consumer \
   && [ ! -e "$CAPTURE/args" ] \
   && pass "historical boundary manifest read failure stops before review or retention" \
   || fail "historical boundary manifest read failure became empty scope"
+
+TREE_FAIL_BIN="$WORK/tree-fail-bin"
+mkdir -p "$TREE_FAIL_BIN"
+cat > "$TREE_FAIL_BIN/git" <<'GIT'
+#!/usr/bin/env bash
+case "$*" in
+  *"cat-file -e ${TREE_FAIL_COMMIT}:.mergepath-sync.yml"*|*"ls-tree --name-only ${TREE_FAIL_COMMIT} -- .mergepath-sync.yml"*)
+    exit 2 ;;
+esac
+exec "$REAL_GIT" "$@"
+GIT
+chmod +x "$TREE_FAIL_BIN/git"
+rc=0
+PATH="$TREE_FAIL_BIN:$PATH" REAL_GIT="$REAL_GIT" TREE_FAIL_COMMIT="$C3" \
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 83 --repo owner/consumer \
+  --base "$C1" --head-sha "$DRIFT_HEAD" --historical-end "$C3" \
+  > "$WORK/manifest-tree-failed.json" 2> "$WORK/manifest-tree-failed.err" || rc=$?
+[ "$rc" -eq 3 ] && grep -q 'could not inspect .mergepath-sync.yml at historical boundary' "$WORK/manifest-tree-failed.err" \
+  && [ ! -e "$CAPTURE/args" ] \
+  && pass "failed historical tree inspection cannot become absent manifest scope" \
+  || fail "failed historical tree inspection was treated as absent manifest"
 
 # A malformed zero-length receipt must fail before the chain walker can
 # revisit the same cursor indefinitely.
