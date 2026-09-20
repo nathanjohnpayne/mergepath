@@ -98,6 +98,20 @@ for a in "$@"; do
   [ "$prev" = "--diff-file" ] && cp "$a" "$CAPTURE/diff"
   prev="$a"
 done
+case "${FAKE_ORCH_JSON:-}" in
+  clean)
+    jq -n --arg head "${FAKE_ORCH_HEAD:-}" \
+      '{dry_run:true,review_posted:false,head_sha:$head,validated_verdict:{verdict:"APPROVED",findings:[],summary:"clean historical chunk"}}'
+    ;;
+  advisory)
+    jq -n --arg head "${FAKE_ORCH_HEAD:-}" \
+      '{dry_run:true,review_posted:false,head_sha:$head,validated_verdict:{verdict:"APPROVED",findings:[{priority:"P3",body:"advisory"}],summary:"approval with advisory"}}'
+    ;;
+  changes)
+    jq -n --arg head "${FAKE_ORCH_HEAD:-}" \
+      '{dry_run:true,review_posted:false,head_sha:$head,validated_verdict:{verdict:"CHANGES_REQUESTED",findings:[{priority:"P1",body:"fix"}],summary:"findings"}}'
+    ;;
+esac
 exit "${FAKE_ORCH_EXIT:-0}"
 FAKE
 chmod +x "$FAKE_ORCH"
@@ -455,6 +469,139 @@ for metadata_case in invalid unavailable; do
     && pass "$metadata_case metadata leaves base and successful dry-run unchanged" \
     || fail "$metadata_case metadata changed outcome or claimed an age"
 done
+
+# ===========================================================================
+echo "wave-audit.sh — retained historical prefix and explicit finalization (#1186)"
+# ===========================================================================
+remote_has_prefix() {
+  git ls-remote --tags "$REMOTE" "refs/tags/wave-audit-prefix/$1/$2" | grep -q .
+}
+
+# Findings, including advisories attached to APPROVED, preserve the complete
+# verdict but write no receipt and grant no clearance.
+rc=0
+FAKE_ORCH_JSON=advisory run_wa "$POLICY_GOOD" reset 80 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" \
+  > "$WORK/historical-advisory.json" 2> "$WORK/historical-advisory.err" || rc=$?
+[ "$rc" -eq 1 ] && jq -e \
+  '.clearance == false and .watermark_advanced == false and .fanout_authorized == false and
+   .prefix_receipt == null and .validated_verdict.verdict == "APPROVED" and
+   (.validated_verdict.findings | length) == 1' "$WORK/historical-advisory.json" >/dev/null \
+  && pass "APPROVED with advisories stops with its complete verdict and no clearance" \
+  || fail "advisory historical outcome was dropped or treated as clean"
+remote_has_prefix "$LARGE_HEAD" "$C2" && fail "advisory outcome wrote a prefix receipt" \
+  || pass "advisory outcome writes no prefix receipt"
+
+# Top-level dry-run still runs the provider validation, but persists neither
+# the prefix receipt nor the ordinary full-wave watermark.
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 81 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" --dry-run \
+  > "$WORK/historical-dry.json" 2> "$WORK/historical-dry.err" || rc=$?
+[ "$rc" -eq 9 ] && jq -e \
+  '.receipt_written == false and .clearance == false and .watermark_advanced == false and
+   .fanout_authorized == false and .dry_run == true' "$WORK/historical-dry.json" >/dev/null \
+  && pass "clean historical dry-run returns distinct partial-progress exit 9" \
+  || fail "historical dry-run returned clearance-compatible status"
+remote_has_prefix "$LARGE_HEAD" "$C2" && fail "historical dry-run wrote prefix receipt" \
+  || pass "historical dry-run writes no prefix receipt"
+remote_has_tag "$LARGE_HEAD" && fail "historical dry-run advanced full watermark" \
+  || pass "historical dry-run leaves full watermark unchanged"
+
+# Retain five contiguous chunks. A failed first attempt is safely resumed;
+# every successful partial remains exit 9 and explicitly denies fan-out.
+HIST_CHUNKS="$WORK/historical-chunks.diff"
+: > "$HIST_CHUNKS"
+for endpoint in "$C2" "$C3" "$C5" "$C6" "$LARGE_HEAD"; do
+  rc=0
+  FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
+    --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$endpoint" \
+    > "$WORK/historical-clean.json" 2> "$WORK/historical-clean.err" || rc=$?
+  [ "$rc" -eq 9 ] && jq -e \
+    '.receipt_written == true and .clearance == false and .watermark_advanced == false and
+     .fanout_authorized == false and .validated_verdict.verdict == "APPROVED" and
+     (.validated_verdict.findings | length) == 0' "$WORK/historical-clean.json" >/dev/null \
+    && pass "clean chunk through ${endpoint:0:7} retained with exit 9 and no clearance" \
+    || fail "clean chunk through ${endpoint:0:7} did not retain safely"
+  remote_has_prefix "$LARGE_HEAD" "$endpoint" \
+    && pass "prefix receipt through ${endpoint:0:7} pushed" \
+    || fail "prefix receipt through ${endpoint:0:7} missing"
+  cat "$CAPTURE/diff" >> "$HIST_CHUNKS"
+done
+
+# The newly manifested file existed before the initial base. Its complete
+# content must enter coverage in the admission chunk, matching full-range
+# semantics rather than disappearing as an unchanged file.
+grep -q 'legacy v1 predates every audit range' "$HIST_CHUNKS" \
+  && pass "cumulative chunks cover pre-existing bytes at manifest admission" \
+  || fail "newly manifested pre-existing bytes escaped cumulative chunks"
+[ "$(git -C "$CANON" tag -l "wave-audit-prefix/$LARGE_HEAD/*" | wc -l | tr -d ' ')" -eq 5 ] \
+  && pass "five exact contiguous prefix receipts retained" \
+  || fail "historical receipt chain is not exactly five chunks"
+receipt_body="$(git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-prefix/$LARGE_HEAD/$C6")"
+printf '%s' "$receipt_body" | jq -e --arg base "$C5" --arg end "$C6" \
+  --arg full "$LARGE_HEAD" '.clearance == false and .chunk_base == $base and
+  .prefix_end == $end and .full_head == $full and (.manifest_blob|length) == 40 and
+  (.scope_fingerprint|length) == 40' >/dev/null \
+  && pass "receipt binds exact range, intended head, manifest and scope" \
+  || fail "receipt bindings are incomplete"
+
+# A different intended head with a different manifest blob has a separate
+# namespace and starts from the supplied initial base; it cannot consume the
+# completed chain for LARGE_HEAD.
+printf '\n# manifest drift fixture\n' >> "$CANON/.mergepath-sync.yml"
+git -C "$CANON" add .mergepath-sync.yml && git -C "$CANON" commit -qm manifest-drift
+DRIFT_HEAD="$(git -C "$CANON" rev-parse HEAD)"
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 83 --repo owner/consumer \
+  --base "$C1" --head-sha "$DRIFT_HEAD" --historical-end "$C2" --dry-run \
+  > "$WORK/head-manifest-drift.json" 2> "$WORK/head-manifest-drift.err" || rc=$?
+[ "$rc" -eq 9 ] && jq -e --arg base "$C1" --arg head "$DRIFT_HEAD" \
+  '.historical_chunk.base == $base and .historical_chunk.full_head == $head and
+   .receipt_written == false' "$WORK/head-manifest-drift.json" >/dev/null \
+  && pass "intended-head and manifest drift cannot reuse another receipt chain" \
+  || fail "different intended head reused retained prefix state"
+
+# Changing the configured scope cannot reuse the retained chain.
+POLICY_SCOPE_DRIFT="$WORK/policy-scope-drift.yml"
+awk '{ print; if ($0 ~ /- docs\//) print "    - newdir/" }' "$POLICY_GOOD" > "$POLICY_SCOPE_DRIFT"
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_SCOPE_DRIFT" reset 83 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --finalize-historical \
+  > "$WORK/scope-drift.json" 2> "$WORK/scope-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && grep -q 'incompatible with the pinned historical scope' "$WORK/scope-drift.err" \
+  && pass "scope/config drift rejects retained receipts" \
+  || fail "scope/config drift reused historical receipts"
+
+# Merely finishing the last partial never finalizes. The explicit operation
+# presents a labeled cumulative receipt package to the ordinary non-dry
+# publication path; only its posted approval advances the full watermark.
+remote_has_tag "$LARGE_HEAD" && fail "partial chain advanced full watermark before finalization" \
+  || pass "complete prefix chain alone grants no full-wave clearance"
+rc=0
+FAKE_ORCH_EXIT=1 run_wa "$POLICY_GOOD" reset 84 --repo owner/consumer --base "$C1" \
+  --head-sha "$LARGE_HEAD" --finalize-historical > "$WORK/historical-final-failed.json" \
+  2> "$WORK/historical-final-failed.err" || rc=$?
+[ "$rc" -eq 1 ] && ! remote_has_tag "$LARGE_HEAD" \
+  && pass "failed explicit finalization leaves full watermark unchanged" \
+  || fail "failed explicit finalization advanced clearance state"
+run_wa "$POLICY_GOOD" reset 84 --repo owner/consumer --base "$C1" \
+  --head-sha "$LARGE_HEAD" --finalize-historical > "$WORK/historical-final.json" \
+  && pass "explicit historical finalization uses ordinary approval path" \
+  || fail "explicit historical finalization failed"
+if grep -q -- '--dry-run' "$CAPTURE/args"; then
+  fail "historical finalization incorrectly used dry-run publication"
+else
+  pass "historical finalization is the sole non-dry publication step"
+fi
+jq -e '.artifact_kind == "wave-audit-cumulative-coverage-receipts" and
+  .clearance == false and .claims_prior_posted_approval == false and
+  (.review_instruction | contains("not a code diff") and contains("not a prior posted approval")) and
+  (.receipts | length) == 5' < <(sed -n '/^+{/,$s/^+//p' "$CAPTURE/diff") >/dev/null \
+  && pass "final reviewer input identifies cumulative receipts without claiming prior approval" \
+  || fail "final cumulative receipt package is mislabeled or incomplete"
+remote_has_tag "$LARGE_HEAD" && pass "only explicit successful finalization advances full watermark" \
+  || fail "successful finalization did not advance full watermark"
 
 echo
 echo "Summary: $PASS passed, $FAIL failed"
