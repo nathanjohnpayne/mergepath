@@ -98,7 +98,7 @@ log() { printf '[wave-audit] %s\n' "$*" >&2; }
 die() { local rc="$1"; shift; printf '[wave-audit] ERROR: %s\n' "$*" >&2; exit "$rc"; }
 
 usage() {
-  sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"
 }
 
 # parse_title <title> — print the mergepath sha a sync PR title names.
@@ -676,6 +676,16 @@ if [ "$FINALIZE_HISTORICAL" = true ]; then
   FILES=1
   RANGE_BASE="$BASE_FULL"; RANGE_HEAD="$HEAD_FULL"
   log "finalizing explicit cumulative historical coverage from $BASE_FULL through $HEAD_FULL"
+fi
+
+if [ -n "$HISTORICAL_END" ] && [ "$BYTES" -eq 0 ]; then
+  jq -n --arg base "$RANGE_BASE" --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" \
+    --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" '
+      {historical_chunk:{base:$base,end:$end,full_head:$head},clearance:false,
+       prefix_receipt:null,receipt_written:false,watermark_advanced:false,
+       fanout_authorized:false,dry_run:$dry,skipped:"empty-historical-chunk"}'
+  log "ERROR: historical chunk has no in-scope bytes, so no reviewer evidence can be retained — no receipt or clearance; choose a later endpoint that coalesces this empty interval with a non-empty chunk"
+  exit 3
 fi
 
 # The complete curated payload is already known. Refuse deterministic

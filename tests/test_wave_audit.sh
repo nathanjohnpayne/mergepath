@@ -221,6 +221,11 @@ got="$(bash "$WA" --parse-title-only "sync: bulk reconcile to mergepath@75eae1c 
 if bash "$WA" --parse-title-only "sync: no sha named here" >/dev/null 2>&1; then
   fail "sha-less title accepted"
 else pass "sha-less title rejected"; fi
+help_text="$(bash "$WA" --help)"
+printf '%s' "$help_text" | grep -q -- '--historical-end <sha> | --finalize-historical' \
+  && printf '%s' "$help_text" | grep -q 'exit 9' \
+  && pass "help renders historical flags and partial-progress exit" \
+  || fail "help truncated historical usage contract"
 
 # ===========================================================================
 echo "wave-audit.sh — first run (--base), scope, dispatch env, watermark"
@@ -790,7 +795,8 @@ cat >> "$CANON/.mergepath-sync.yml" <<'YAML'
     type: kit
     consumers: all
 YAML
-git -C "$CANON" add .mergepath-sync.yml && git -C "$CANON" commit -qm churn-readmitted
+printf 'newer\n' > "$CANON/churn/f.txt"
+git -C "$CANON" add .mergepath-sync.yml churn/f.txt && git -C "$CANON" commit -qm churn-readmitted
 CHURN_HEAD="$(git -C "$CANON" rev-parse HEAD)"
 rc=0
 FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer \
@@ -806,6 +812,23 @@ FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer \
 [ "$rc" -eq 9 ] && remote_has_prefix "$CHURN_HEAD" "$CHURN_HEAD" \
   && pass "readmission chunk completes fixed-scope two-chunk coverage" \
   || fail "readmission chunk did not complete fixed-scope coverage"
+
+# Real Phase 4b adapters reject an empty diff. Refuse an empty historical
+# chunk locally rather than dispatching or manufacturing reviewer evidence.
+printf 'excluded-only churn\n' >> "$CANON/tests/t.sh"
+git -C "$CANON" add tests/t.sh && git -C "$CANON" commit -qm churn-empty-suffix
+EMPTY_HIST_HEAD="$(git -C "$CANON" rev-parse HEAD)"
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 86 --repo owner/consumer \
+  --base "$CHURN_HEAD" --head-sha "$EMPTY_HIST_HEAD" --historical-end "$EMPTY_HIST_HEAD" \
+  > "$WORK/empty-historical.json" 2> "$WORK/empty-historical.err" || rc=$?
+[ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] \
+  && jq -e '.skipped == "empty-historical-chunk" and .clearance == false and
+    .receipt_written == false and .watermark_advanced == false and
+    .fanout_authorized == false' "$WORK/empty-historical.json" >/dev/null \
+  && grep -q 'choose a later endpoint that coalesces this empty interval' "$WORK/empty-historical.err" \
+  && pass "empty historical chunk refuses before adapter dispatch or receipt" \
+  || fail "empty historical chunk reached adapter or claimed reviewer evidence"
 
 echo
 echo "Summary: $PASS passed, $FAIL failed"
