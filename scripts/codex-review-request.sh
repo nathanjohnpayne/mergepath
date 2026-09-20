@@ -194,6 +194,10 @@
 #   6   FEEDBACK_UNACCOUNTED — at least one earlier reviewer finding has no
 #       durable disposition evidence. No new trigger is posted. Account for
 #       every reported finding, then rerun this script (#1000).
+#   7   CAP_EXHAUSTED — the configured per-PR request-attempt cap has already
+#       been reached before an initial request. JSON on stdout names the
+#       consumed and configured counts and requires the human-tiebreaker path;
+#       this requester-specific status is not Phase 4b's exit-7 contract.
 #
 # Design notes:
 #   - Writes only author-attributed PR comments: the `@codex review` trigger,
@@ -1335,6 +1339,48 @@ post_author_pr_comment() { # <body> <purpose> [body-file|inline]
   AUTHOR_COMMENT_OUTPUT="$output"
 }
 
+# The request-attempt cap is an intentional review-loop stop, not an API
+# failure and not a Phase 4a timeout. Emit the normal requester observations
+# with an explicit, machine-readable human-tiebreaker outcome so callers do
+# not route a non-converging review into automated Phase 4b. Malformed policy
+# or unreadable request evidence never reaches this function; those remain
+# exit 3 infrastructure failures.
+emit_cap_exhausted() { # <request_attempts> <max_request_attempts>
+  local request_attempts="$1" max_request_attempts="$2"
+  jq -n \
+    --argjson pr_number "$PR_NUMBER" \
+    --arg repo "$REPO" \
+    --arg head_sha "$HEAD_SHA" \
+    --arg head_committer_date "$HEAD_COMMITTER_DATE" \
+    --arg bot_login "$BOT_LOGIN" \
+    --argjson scan "$INITIAL_SCAN" \
+    --argjson request_attempts "$request_attempts" \
+    --argjson max_request_attempts "$max_request_attempts" '
+    {
+      pr_number: $pr_number,
+      repo: $repo,
+      head_sha: $head_sha,
+      head_committer_date: $head_committer_date,
+      bot_login: $bot_login,
+      review: $scan.review,
+      findings: $scan.findings,
+      reaction: $scan.reaction,
+      verdict: $scan.verdict,
+      blocked_reason: null,
+      terminal_determination: null,
+      cap_exhausted: {
+        request_attempts: $request_attempts,
+        max_request_attempts: $max_request_attempts,
+        escalation: "human_tiebreaker"
+      },
+      trigger_posted: false,
+      trigger_requested: true,
+      rounds_waited_seconds: 0
+    }
+  '
+  exit 7
+}
+
 post_codex_trigger() {
   # A new review round must not hide findings from an earlier round. This
   # enumerates both inline and top-level review-body findings and fails before
@@ -1371,7 +1417,8 @@ post_codex_trigger() {
       log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); suppressing acknowledgement retry and continuing normal review poll"
       return 1
     fi
-    die 3 "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); refusing a new '@codex review' trigger"
+    log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); stopping for the human tiebreaker without a new '@codex review' trigger"
+    emit_cap_exhausted "$request_count" "$max_review_rounds"
   fi
 
   # The Codex GitHub App ONLY monitors '@codex review' comments authored

@@ -224,8 +224,8 @@ test_request_attempt_cap() {
   for scenario in cap_at_limit cap_below_limit cap_duplicate_ids cap_bad_id; do
     case "$scenario" in
       cap_at_limit)
-        expected_rc=3; expected_posts=0
-        description="ten prior author requests refuse the eleventh" ;;
+        expected_rc=7; expected_posts=0
+        description="ten prior author requests stop for the human tiebreaker" ;;
       cap_below_limit)
         expected_rc=0; expected_posts=1
         description="nine prior author requests permit the tenth" ;;
@@ -246,6 +246,12 @@ test_request_attempt_cap() {
     if [ "$scenario" = cap_at_limit ]; then
       grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
         || fail "#813: cap refusal did not expose consumed/limit evidence"
+      [ "$(jqf "$dir" '.cap_exhausted.request_attempts')" = 10 ] \
+        || fail "#813: cap exhaustion did not report consumed attempts"
+      [ "$(jqf "$dir" '.cap_exhausted.max_request_attempts')" = 10 ] \
+        || fail "#813: cap exhaustion did not report configured bound"
+      [ "$(jqf "$dir" '.cap_exhausted.escalation')" = human_tiebreaker ] \
+        || fail "#813: cap exhaustion did not name the human-tiebreaker route"
     fi
     [ "$FAIL" -ne "$before" ] || pass "#813: $description"
   done
@@ -256,10 +262,12 @@ test_nondefault_request_attempt_cap() {
   dir=$(make_case "request-cap-nondefault")
   printf '  max_review_rounds: 3\n' >> "$dir/.github/review-policy.yml"
   rc=$(run_trigger_only "$dir" cap_three)
-  [ "$rc" = 3 ] || fail "#813: nondefault cap expected exit 3, got $rc; err=$(cat "$dir/err.log")"
+  [ "$rc" = 7 ] || fail "#813: nondefault cap expected exit 7, got $rc; err=$(cat "$dir/err.log")"
   [ "$(trig_count "$dir")" = 0 ] || fail "#813: nondefault cap posted despite three consumed requests"
   grep -q 'request-attempt cap reached.*3/3' "$dir/err.log" \
     || fail "#813: nondefault cap did not report the configured bound"
+  [ "$(jqf "$dir" '.cap_exhausted.escalation')" = human_tiebreaker ] \
+    || fail "#813: nondefault cap did not preserve the human-tiebreaker route"
   [ "$FAIL" -ne "$before" ] || pass "#813: configured nondefault cap governs a new request"
 }
 
