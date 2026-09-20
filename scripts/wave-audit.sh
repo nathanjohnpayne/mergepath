@@ -398,7 +398,7 @@ if [ "$HISTORICAL" = true ]; then
   remote_prefix_refs="$(git -C "$REPO_DIR" ls-remote --refs --tags origin \
     "refs/tags/${PREFIX_TAG_PREFIX}/*" 2>/dev/null)" \
     || die 3 "could not list ${PREFIX_TAG_PREFIX}/* receipts from origin"
-  while IFS=$'\t' read -r remote_oid remote_ref; do
+  while IFS=$'\t' read -r _remote_oid remote_ref; do
     [ -n "$remote_ref" ] || continue
     git -C "$REPO_DIR" fetch -q origin "+${remote_ref}:${remote_ref}" 2>/dev/null \
       || die 3 "could not fetch prefix receipt $remote_ref from origin"
