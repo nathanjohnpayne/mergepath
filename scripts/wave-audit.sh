@@ -616,7 +616,7 @@ advance_prefix_receipt() { # advance_prefix_receipt <orchestrator-summary-json>
   fi
   git -C "$REPO_DIR" push -q origin "refs/tags/$tag" \
     || die 3 "prefix receipt $tag exists locally but the push failed — rerun to retain this exact chunk"
-  printf '%s\n' "$tag"
+  PREFIX_TAG_RESULT="$tag"
 }
 
 emit_json() { # emit_json <orch_exit_or_null> <tagged> <skipped_reason_or_null>
@@ -774,7 +774,9 @@ if [ -n "$HISTORICAL_END" ]; then
   fi
   prefix_tag=null
   if [ "$DRY_RUN" = false ]; then
-    prefix_tag="$(advance_prefix_receipt "$orch_summary")"
+    PREFIX_TAG_RESULT=""
+    advance_prefix_receipt "$orch_summary"
+    prefix_tag="$PREFIX_TAG_RESULT"
   fi
   jq -n --arg base "$RANGE_BASE" --arg end "$RANGE_HEAD" --arg head "$HEAD_FULL" \
     --arg tag "$prefix_tag" --argjson dry "$([ "$DRY_RUN" = true ] && echo true || echo false)" \

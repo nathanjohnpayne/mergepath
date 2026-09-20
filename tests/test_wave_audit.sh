@@ -798,13 +798,20 @@ YAML
 printf 'newer\n' > "$CANON/churn/f.txt"
 git -C "$CANON" add .mergepath-sync.yml churn/f.txt && git -C "$CANON" commit -qm churn-readmitted
 CHURN_HEAD="$(git -C "$CANON" rev-parse HEAD)"
+RECEIPT_TMP="$WORK/receipt-tmp"
+mkdir -p "$RECEIPT_TMP"
 rc=0
-FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer \
+TMPDIR="$RECEIPT_TMP" FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer \
   --base "$CHURN_BASE" --head-sha "$CHURN_HEAD" --historical-end "$CHURN_MIDDLE" \
   > "$WORK/churn-first.json" 2> "$WORK/churn-first.err" || rc=$?
 [ "$rc" -eq 9 ] && grep -q '^-old' "$CAPTURE/diff" && grep -q '^+new' "$CAPTURE/diff" \
   && pass "removal chunk retains ordinary delta for initial-and-final common path" \
   || fail "intermediate manifest removal suppressed old-byte coverage"
+if find "$RECEIPT_TMP" -type f -name 'wave-audit-prefix.*' | grep -q .; then
+  fail "successful historical chunk leaked its receipt temp file"
+else
+  pass "successful historical chunk cleans its receipt temp file"
+fi
 rc=0
 FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer \
   --base "$CHURN_BASE" --head-sha "$CHURN_HEAD" --historical-end "$CHURN_HEAD" \
