@@ -97,6 +97,11 @@ case "$endpoint" in
       author_padded)    jq -cn --arg who "$author" --arg t "$t" '[{id:7005,user:{login:$who},created_at:$t,body:"@codex review "}]' ;;
       stale_author)     jq -cn --arg who "$author" --arg t "$old" '[{id:7006,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       reviewer_only)    jq -cn --arg who "$reviewer" --arg t "$t" '[{id:7007,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cap_at_limit)     jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8000 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cap_below_limit)  jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8100 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cap_three)        jq -cn --arg who "$author" --arg t "$old" '[range(3) | {id:(8150 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cap_duplicate_ids) jq -cn --arg who "$author" --arg t "$old" '[range(12) | {id:(8200 + (. % 9)),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cap_bad_id)       jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8300 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       *)                printf '[]\n' ;;
     esac
     ;;
@@ -208,6 +213,54 @@ test_reviewer_trigger_does_not_count() {
   [ "$(trig_count "$dir")" = "1" ] || fail "C: reviewer-authored @codex must NOT count → expected 1 post, got $(trig_count "$dir")"
   [ "$(jqf "$dir" '.trigger_posted')" = "true" ] || fail "C: trigger_posted=$(jqf "$dir" '.trigger_posted'), expected true"
   [ "$FAIL" -ne "$before" ] || pass "C: reviewer-authored @codex is not a valid trigger (author-scoped dedupe) → still posts"
+}
+
+# #813: max_review_rounds is enforced at the one request write boundary. The
+# counter intentionally follows author-owned exact command evidence rather
+# than provider review objects: clean summaries and reaction-only clearance do
+# not reliably create a review object.
+test_request_attempt_cap() {
+  local scenario expected_rc expected_posts description dir rc before
+  for scenario in cap_at_limit cap_below_limit cap_duplicate_ids cap_bad_id; do
+    case "$scenario" in
+      cap_at_limit)
+        expected_rc=3; expected_posts=0
+        description="ten prior author requests refuse the eleventh" ;;
+      cap_below_limit)
+        expected_rc=0; expected_posts=1
+        description="nine prior author requests permit the tenth" ;;
+      cap_duplicate_ids)
+        expected_rc=0; expected_posts=1
+        description="duplicate comment IDs do not consume additional slots" ;;
+      cap_bad_id)
+        expected_rc=3; expected_posts=0
+        description="a malformed qualifying request record fails closed" ;;
+    esac
+    before=$FAIL
+    dir=$(make_case "request-cap-$scenario")
+    rc=$(run_trigger_only "$dir" "$scenario")
+    [ "$rc" = "$expected_rc" ] \
+      || fail "#813: $description expected exit $expected_rc, got $rc; err=$(cat "$dir/err.log")"
+    [ "$(trig_count "$dir")" = "$expected_posts" ] \
+      || fail "#813: $description expected $expected_posts posts, got $(trig_count "$dir")"
+    if [ "$scenario" = cap_at_limit ]; then
+      grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
+        || fail "#813: cap refusal did not expose consumed/limit evidence"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "#813: $description"
+  done
+}
+
+test_nondefault_request_attempt_cap() {
+  local dir rc before=$FAIL
+  dir=$(make_case "request-cap-nondefault")
+  printf '  max_review_rounds: 3\n' >> "$dir/.github/review-policy.yml"
+  rc=$(run_trigger_only "$dir" cap_three)
+  [ "$rc" = 3 ] || fail "#813: nondefault cap expected exit 3, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = 0 ] || fail "#813: nondefault cap posted despite three consumed requests"
+  grep -q 'request-attempt cap reached.*3/3' "$dir/err.log" \
+    || fail "#813: nondefault cap did not report the configured bound"
+  [ "$FAIL" -ne "$before" ] || pass "#813: configured nondefault cap governs a new request"
 }
 
 # ---------------------------------------------------------------------------
@@ -668,6 +721,8 @@ test_uppercase_author_command_skips
 test_author_containment_posts
 test_stale_author_command_posts
 test_reviewer_trigger_does_not_count
+test_request_attempt_cap
+test_nondefault_request_attempt_cap
 test_gate_skips_content_free_head
 test_gate_triggers_on_real_content_change
 test_gate_triggers_without_prior_review

@@ -302,7 +302,7 @@ fi
 # shellcheck source=lib/codex-request-evidence.sh
 if [ ! -r "$__CODEX_REQUEST_DIR/lib/codex-request-evidence.sh" ] \
   || ! . "$__CODEX_REQUEST_DIR/lib/codex-request-evidence.sh" \
-  || ! declare -F crqe_select_trigger crqe_ack_present >/dev/null; then
+  || ! declare -F crqe_select_trigger crqe_count_triggers crqe_ack_present >/dev/null; then
   echo "[codex-review-request] ERROR: request evidence helper unavailable (see #1276)" >&2
   exit 3
 fi
@@ -1341,6 +1341,30 @@ post_codex_trigger() {
   # the author-attributed write when posted != dispositioned (#1000).
   run_feedback_accounting_gate
 
+  # Check immediately before every author-attributed trigger write, including
+  # an acknowledgement retry. Current-head clearance and idempotency return
+  # before this function, preserving their existing behavior. The complete
+  # paginated PR timeline is the only budget store; no local counter can make
+  # concurrent checkouts or later invocations agree.
+  # Parse this only at the new-write boundary. Disabled, cleared, and
+  # idempotently-reused paths spend no request attempt and retain their
+  # established behavior even if a later budget edit is malformed.
+  local max_review_rounds request_comments request_count
+  max_review_rounds=$(codex_field max_review_rounds)
+  max_review_rounds=${max_review_rounds:-10}
+  # Bound the decimal width before arithmetic: bash's integer comparison can
+  # overflow or error on an attacker-sized policy scalar.
+  if ! [[ "$max_review_rounds" =~ ^[0-9]{1,9}$ ]]; then
+    die 3 "codex.max_review_rounds must be a non-negative integer no greater than 999999999; refusing a new '@codex review' trigger"
+  fi
+  request_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex request-attempt evidence") \
+    || die 3 "cannot read Codex request-attempt evidence; refusing a new '@codex review' trigger"
+  request_count=$(crqe_count_triggers "$request_comments" "$AUTHOR_IDENTITY") \
+    || die 3 "cannot count Codex request attempts; refusing a new '@codex review' trigger"
+  if [ "$request_count" -ge "$max_review_rounds" ]; then
+    die 3 "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); refusing a new '@codex review' trigger"
+  fi
+
   # The Codex GitHub App ONLY monitors '@codex review' comments authored
   # by the repo's AUTHOR/human identity (nathanjohnpayne). A trigger
   # posted by a reviewer/bot identity (nathanpayne-claude/-codex/-cursor)
@@ -1351,7 +1375,7 @@ post_codex_trigger() {
   # GH_TOKEN. This SUPERSEDES the #284 `identity-check --expect-reviewer`
   # guard, which fail-closed on the WRONG identity for this particular
   # write.
-  log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY)"
+  log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
   post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
