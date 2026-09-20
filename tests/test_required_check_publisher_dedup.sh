@@ -77,9 +77,9 @@ case "$*" in
         printf 'CodeRabbit unresolved blocking findings\tcompleted\tother\tgithub-actions\t2026-09-20T12:00:02Z\t203\n'
         ;;
       tied-completed)
-        printf 'Merge clearance gate\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$marker"
-        printf 'Codex P1 unresolved threads\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t102\n' "$marker"
-        printf 'CodeRabbit unresolved blocking findings\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t103\n' "$marker"
+        printf 'Merge clearance gate\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t101\n' "$summary"
+        printf 'Codex P1 unresolved threads\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t102\n' "$summary"
+        printf 'CodeRabbit unresolved blocking findings\tin_progress\t%s\tgithub-actions\t2026-09-20T12:00:01Z\t103\n' "$summary"
         printf 'Merge clearance gate\tcompleted\tother\tgithub-actions\t2026-09-20T12:00:01Z\t201\n'
         printf 'Codex P1 unresolved threads\tcompleted\tother\tgithub-actions\t2026-09-20T12:00:01Z\t202\n'
         printf 'CodeRabbit unresolved blocking findings\tcompleted\tother\tgithub-actions\t2026-09-20T12:00:01Z\t203\n'
