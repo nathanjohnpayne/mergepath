@@ -33,7 +33,7 @@ This repository uses a multi-identity AI agent code review system. The full poli
 
 ### Identity Rules
 
-- All agents author and commit code as nathanjohnpayne.
+- All agents author code as nathanjohnpayne. The committer on a merged commit may be GitHub's `GitHub <noreply@github.com>` / `web-flow` identity when GitHub creates it during squash merge, `update-branch`, or a web-UI merge; that server-side identity is not selectable by the agent and is not an agent identity.
 - Each agent reviews code under its own reviewer identity (e.g., nathanpayne-claude, nathanpayne-cursor, nathanpayne-codex).
 - An agent never reviews code under the same identity that authored it.
 - Only nathanjohnpayne merges to the target branch.
