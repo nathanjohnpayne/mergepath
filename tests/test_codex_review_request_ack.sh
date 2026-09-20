@@ -379,6 +379,34 @@ test_retry_cap_respected() {
   fi
 }
 
+# #813: the request-attempt cap is evaluated by post_codex_trigger itself, so
+# the first request can spend the final slot while the acknowledgement retry is
+# refused before its second author-comment write.
+test_request_attempt_cap_blocks_ack_retry() {
+  local dir rc count before=$FAIL
+  dir=$(make_case "request-cap-blocks-retry" 0 1)
+  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir" absent)
+  count=$(trigger_count "$dir")
+  [ "$rc" = 3 ] || fail "#813 retry cap: exit $rc, expected 3; stderr=$(cat "$dir/err.log")"
+  [ "$count" = 1 ] || fail "#813 retry cap: trigger count $count, expected original only"
+  grep -q 'request-attempt cap reached.*1/1' "$dir/err.log" \
+    || fail "#813 retry cap: no observable refusal"
+  [ "$FAIL" -ne "$before" ] || pass "#813: request budget permits the first trigger and blocks its acknowledgment retry"
+}
+
+# A malformed cap is a new-write concern, not a reason to perturb an already
+# cleared no-spend path.
+test_malformed_request_cap_does_not_change_clearance_skip() {
+  local dir rc before=$FAIL
+  dir=$(make_case "malformed-cap-cleared" 0 1)
+  printf '  max_review_rounds: 999999999999999999999999\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir" skip_reaction)
+  [ "$rc" = 0 ] || fail "#813 malformed cap: cleared skip exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
+  [ "$(trigger_count "$dir")" = 0 ] || fail "#813 malformed cap: cleared skip posted a trigger"
+  [ "$FAIL" -ne "$before" ] || pass "#813: malformed cap leaves an already-cleared no-spend path unchanged"
+}
+
 test_skip_path_posts_no_trigger_or_ack_check() {
   local dir rc count ack_count reaction_content
   dir=$(make_case "skip-path" 0 1)
@@ -725,6 +753,8 @@ test_secret_descriptor_never_reveals_the_value() {
 test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
 test_retry_cap_respected
+test_request_attempt_cap_blocks_ack_retry
+test_malformed_request_cap_does_not_change_clearance_skip
 test_skip_path_posts_no_trigger_or_ack_check
 test_missing_comment_id_fails_closed_without_timeout_marker
 test_retry_missing_comment_id_stops_without_extra_retry
