@@ -43,7 +43,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-10.** Reviewer identities may only post review comments, request changes, and approve; they must never merge. ● — REVIEW_POLICY.md § Identity Rules
 
-**R-11.** All agents author and commit as `nathanjohnpayne`; each agent reviews under its own registered reviewer identity (`nathanpayne-{agent}`). ● — AGENTS.md § Identity Rules
+**R-11.** All agents author as `nathanjohnpayne`; a GitHub-created merge/update-branch/web-UI commit may carry GitHub's server-side committer identity; each agent reviews under its own registered reviewer identity (`nathanpayne-{agent}`). ● — AGENTS.md § Identity Rules
 
 **R-12.** The machine-global gh keyring's active account must never be relied on for author or reviewer bylines; the per-command token is the attribution source. ○ — REVIEW_POLICY.md § Reviewer PAT Quick Start
 
