@@ -177,6 +177,16 @@ endpoint=${1:-}
 
 case "$endpoint" in
   repos/owner/repo/pulls/999)
+    if [ "$scenario" = "head-drift" ]; then
+      reads=0
+      [ ! -f "$state_dir/head-reads" ] || reads=$(cat "$state_dir/head-reads")
+      reads=$((reads + 1))
+      printf '%s\n' "$reads" >"$state_dir/head-reads"
+      if [ "$reads" -gt 1 ]; then
+        printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
+        exit 0
+      fi
+    fi
     if [ "${2:-}" = "--jq" ]; then
       printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
     else
@@ -482,6 +492,57 @@ test_reused_final_slot_pending_stops_without_timeout_authority() {
   [ "$(jq -r '.terminal_determination // "null"' "$dir/out.json")" = null ] || fail "#813 reused pending cap: emitted timeout authority"
   [ "$(jq -r '.blocked_reason // "null"' "$dir/out.json")" = null ] || fail "#813 reused pending cap: emitted Phase 4b block authority"
   [ "$FAIL" -ne "$before" ] || pass "#813: a pending reused final slot stops at the cap without timeout authority"
+}
+
+test_reused_final_slot_preserves_recorded_timeout() {
+  local dir rc marker before=$FAIL
+  dir=$(make_case "reused-recorded-timeout" 0 0)
+  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir" absent)
+  [ "$rc" = 4 ] || fail "#813 recorded timeout setup: exit $rc, expected 4"
+  marker=$(jq -r '.terminal_determination.marker_comment_id' "$dir/out.json")
+  # A resumed invocation must not spend a second response window.
+  sed -i.bak 's/review_timeout_seconds: 0/review_timeout_seconds: 30/' "$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir" absent 1)
+  [ "$rc" = 4 ] || fail "#813 recorded timeout: exit $rc, expected preserved fallback 4; stderr=$(cat "$dir/err.log")"
+  [ "$(trigger_count "$dir")" = 1 ] || fail "#813 recorded timeout: posted another trigger"
+  [ "$(cat "$dir/state/terminal-count")" = 1 ] || fail "#813 recorded timeout: posted another marker"
+  [ "$(jq -r '.terminal_determination.marker_comment_id' "$dir/out.json")" = "$marker" ] || fail "#813 recorded timeout: lost the existing marker"
+  [ "$(jq -r '.rounds_waited_seconds' "$dir/out.json")" = 0 ] || fail "#813 recorded timeout: waited again for a terminal request"
+  [ "$(jq -r '.trigger_posted' "$dir/out.json")" = false ] || fail "#813 recorded timeout: claimed a new trigger"
+  [ "$FAIL" -ne "$before" ] || pass "#813: the final request's recorded timeout is preserved without a new poll or write"
+}
+
+test_reused_final_slot_timeout_marker_controls() {
+  local variant dir rc body expected count before
+  for variant in stale superseded uppercase-newer malformed head-drift; do
+    before=$FAIL
+    dir=$(make_case "reused-marker-$variant" 0 0)
+    printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+    seed_author_trigger "$dir" 9901 "2026-06-04T00:00:00Z"
+    body='<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=9901 -->'
+    expected=7
+    case "$variant" in
+      stale) body=${body/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb} ;;
+      malformed) body=${body/trigger_comment_id=9901/trigger_comment_id=invalid}; expected=3 ;;
+      head-drift) expected=3 ;;
+    esac
+    jq -cn --arg body "$body" '{id:9902,user:{login:"nathanjohnpayne"},body:$body,created_at:"2026-06-04T00:00:01Z"}' >>"$dir/state/comments.jsonl"
+    case "$variant" in
+      superseded) seed_author_trigger "$dir" 9903 "2026-06-04T00:00:02Z" ;;
+      uppercase-newer)
+        jq -cn '{id:9903,user:{login:"nathanjohnpayne"},body:"@CODEX REVIEW",created_at:"2026-06-04T00:00:02Z"}' >>"$dir/state/comments.jsonl"
+        ;;
+    esac
+    rc=$(run_case "$dir" "$variant")
+    [ "$rc" = "$expected" ] || fail "#813 $variant marker: exit $rc, expected $expected; stderr=$(cat "$dir/err.log")"
+    [ "$(trigger_count "$dir")" = 0 ] || fail "#813 $variant marker: posted another trigger"
+    [ ! -f "$dir/state/terminal-count" ] || fail "#813 $variant marker: posted timeout authority"
+    if [ "$expected" = 7 ]; then
+      [ "$(jq -r '.terminal_determination // "null"' "$dir/out.json")" = null ] || fail "#813 $variant marker: reused invalid timeout authority"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "#813: $variant marker cannot authorize the final request's fallback"
+  done
 }
 
 test_stale_trigger_is_not_reused_as_pending() {
@@ -906,6 +967,8 @@ test_retry_cap_respected
 test_request_attempt_cap_suppresses_ack_retry_but_polls
 test_reused_final_slot_trigger_polls_arriving_response
 test_reused_final_slot_pending_stops_without_timeout_authority
+test_reused_final_slot_preserves_recorded_timeout
+test_reused_final_slot_timeout_marker_controls
 test_stale_trigger_is_not_reused_as_pending
 test_current_terminal_finding_is_not_reused_as_pending
 test_current_terminal_finding_at_cap_does_not_claim_reuse

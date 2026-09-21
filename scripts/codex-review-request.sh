@@ -178,7 +178,8 @@
 #       explicit-review-required decision that mandates this path. Two
 #       sub-cases, distinguished by the `blocked_reason` field in the JSON:
 #       a plain timeout (blocked_reason:null) waited out the full window and
-#       successfully recorded terminal_determination for this exact head,
+#       successfully recorded terminal_determination for this exact head
+#       (or preserves that validated determination for the same capped request),
 #       whereas a detected account-/connection-level block
 #       (blocked_reason:"usage_limit"|"not_connected", #722) short-circuits
 #       the wait immediately — re-polling/re-triggering cannot help until a
@@ -1386,6 +1387,45 @@ emit_cap_exhausted() { # <request_attempts> <max_request_attempts>
   exit 7
 }
 
+preserve_final_request_timeout() { # <comments-json> <selected-trigger-json>
+  local state live_head
+  if [ "$CODEX_FAILURE_MARKERS_OK" != true ] \
+     || ! command -v codex_phase4a_timeout_marker_state >/dev/null 2>&1; then
+    die 3 "cannot classify the final Codex request: shared terminal-marker helper unavailable"
+  fi
+  state=$(codex_phase4a_timeout_marker_state "$HEAD_SHA" "$AUTHOR_IDENTITY" "$1")
+  case "$(printf '%s' "$state" | jq -r '.state // "malformed"')" in
+    current) ;;
+    none|stale|superseded) return 0 ;;
+    *) die 3 "cannot classify the final Codex request: trusted terminal-marker evidence is malformed" ;;
+  esac
+  # The marker parser recognizes exact lowercase commands; the request
+  # selector also recognizes case variants. A newer selected command must
+  # supersede an older timeout even when only the selector recognizes it.
+  printf '%s' "$state" | jq -e --argjson trigger "$2" \
+    '.trigger_comment_id == $trigger.id' >/dev/null || return 0
+  live_head=$(gh_api_scalar --shape sha "Recorded Phase 4a timeout live PR head" \
+    "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha') \
+    || die 3 "cannot reuse Phase 4a timeout: live PR head is unreadable"
+  [ "$live_head" = "$HEAD_SHA" ] \
+    || die 3 "cannot reuse Phase 4a timeout: PR head moved from $HEAD_SHA to $live_head"
+  log "final Codex request already has a validated timeout determination; preserving its fallback without another poll or write"
+  jq -n --argjson pr_number "$PR_NUMBER" --arg repo "$REPO" \
+    --arg head_sha "$HEAD_SHA" --arg head_committer_date "$HEAD_COMMITTER_DATE" \
+    --arg bot_login "$BOT_LOGIN" --argjson scan "$INITIAL_SCAN" --argjson state "$state" '
+    {
+      pr_number: $pr_number, repo: $repo, head_sha: $head_sha,
+      head_committer_date: $head_committer_date, bot_login: $bot_login,
+      review: $scan.review, findings: $scan.findings,
+      reaction: $scan.reaction, verdict: $scan.verdict, blocked_reason: null,
+      terminal_determination: {
+        provider: "codex", outcome: "timeout", marker_comment_id: $state.marker_id
+      },
+      trigger_posted: false, trigger_requested: true, rounds_waited_seconds: 0
+    }'
+  exit 4
+}
+
 post_codex_trigger() {
   # Check immediately before every author-attributed trigger write, including
   # an acknowledgement retry. Current-head clearance and idempotency return
@@ -1428,6 +1468,7 @@ post_codex_trigger() {
       TRIGGER_SIGNAL_THRESHOLD=$(printf '%s' "$pending_trigger" | jq -r '.created_at')
       if ! has_post_trigger_signal "$INITIAL_SCAN" \
          && [ -z "$(current_blocked_reason "$INITIAL_SCAN")" ]; then
+        preserve_final_request_timeout "$request_comments" "$pending_trigger"
         CAP_REQUEST_COUNT=$request_count
         CAP_REQUEST_LIMIT=$max_review_rounds
         log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); polling the existing final request without a new trigger"
