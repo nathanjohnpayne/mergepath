@@ -196,8 +196,11 @@
 #       every reported finding, then rerun this script (#1000).
 #   7   CAP_EXHAUSTED — the configured per-PR request-attempt cap has already
 #       been reached before an initial request. JSON on stdout names the
-#       consumed and configured counts and requires the human-tiebreaker path;
-#       this requester-specific status is not Phase 4b's exit-7 contract.
+#       consumed and configured counts; a gated call names the human-tiebreaker
+#       route, while an advisory call names a non-gating request stop. Any
+#       observed provider block is diagnostic-only and never grants Phase 4b
+#       routing authority. This requester-specific status is not Phase 4b's
+#       exit-7 contract.
 #
 # Design notes:
 #   - Writes only author-attributed PR comments: the `@codex review` trigger,
@@ -1341,10 +1344,11 @@ post_author_pr_comment() { # <body> <purpose> [body-file|inline]
 
 # The request-attempt cap is an intentional review-loop stop, not an API
 # failure and not a Phase 4a timeout. Emit the normal requester observations
-# with an explicit, machine-readable human-tiebreaker outcome so callers do
-# not route a non-converging review into automated Phase 4b. Malformed policy
-# or unreadable request evidence never reaches this function; those remain
-# exit 3 infrastructure failures.
+# with a machine-readable stop outcome. Only a Phase 4a-gated caller gets the
+# human-tiebreaker route; an advisory caller still stops further requests but
+# must not acquire a merge hold. Malformed policy or unreadable request
+# evidence never reaches this function; those remain exit 3 infrastructure
+# failures.
 emit_cap_exhausted() { # <request_attempts> <max_request_attempts>
   local request_attempts="$1" max_request_attempts="$2"
   jq -n \
@@ -1355,7 +1359,8 @@ emit_cap_exhausted() { # <request_attempts> <max_request_attempts>
     --arg bot_login "$BOT_LOGIN" \
     --argjson scan "$INITIAL_SCAN" \
     --argjson request_attempts "$request_attempts" \
-    --argjson max_request_attempts "$max_request_attempts" '
+    --argjson max_request_attempts "$max_request_attempts" \
+    --argjson phase4a_gated "$PHASE_4A_GATED" '
     {
       pr_number: $pr_number,
       repo: $repo,
@@ -1371,7 +1376,8 @@ emit_cap_exhausted() { # <request_attempts> <max_request_attempts>
       cap_exhausted: {
         request_attempts: $request_attempts,
         max_request_attempts: $max_request_attempts,
-        escalation: "human_tiebreaker"
+        escalation: (if $phase4a_gated then "human_tiebreaker" else "advisory_request_stop" end),
+        observed_provider_block: $scan.blocked
       },
       trigger_posted: false,
       trigger_requested: true,
@@ -1417,7 +1423,11 @@ post_codex_trigger() {
       log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); suppressing acknowledgement retry and continuing normal review poll"
       return 1
     fi
-    log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); stopping for the human tiebreaker without a new '@codex review' trigger"
+    if [ "$PHASE_4A_GATED" = "true" ]; then
+      log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); stopping for the human tiebreaker without a new '@codex review' trigger"
+    else
+      log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); stopping additional advisory requests without a new '@codex review' trigger"
+    fi
     emit_cap_exhausted "$request_count" "$max_review_rounds"
   fi
 
