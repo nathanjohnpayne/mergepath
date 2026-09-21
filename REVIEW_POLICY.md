@@ -886,13 +886,13 @@ When the internal reviewer and external reviewer disagree on whether code is rea
 
 ### Concrete detection signals (Phase 4a)
 
-In Phase 4a, the agent escalates to the human when either of the following fires:
+In Phase 4a, the agent escalates to the human when any of the following fires:
 
 1. **Repeat-after-rebuttal.** The agent posted a reply to a Codex inline finding explaining why the finding does not apply. Codex's next review re-flags the same or substantively-equivalent finding. The agent treats this as a disagreement: Codex is not convinced by the rebuttal, and the agent stops trying to change Codex's mind autonomously. Continuing the loop past this point is rude to the reviewer and wastes API calls.
 
 2. **Runaway rounds.** The round counter exceeds `codex.max_review_rounds` (10 since #1084; it was 2). This catches a review that keeps surfacing new, distinct issues without converging. The budget was raised because two rounds is below the observed convergence length of a real review, not above it: #1080 took four rounds, and rounds 2 and 3 each found a genuine defect that the previous round's fix had introduced. Escalating at the 3rd round would have stopped that review while it was still finding P1s. Ten rounds is a ceiling on non-convergence, not a target — a review still running at round 10 has stopped being a review of this PR and become evidence that its scope is too broad. On exhaustion the agent takes the **human-tiebreaker** route, not the automated Phase 4b leg: it stops the loop, posts a comment summarizing both positions with links to the review rounds, alerts the human, and does not merge. Routing a runaway to automated 4b would be wrong in a specific way — that leg can post an APPROVED and let the flow continue, so a review that never converged would merge with no human ever adjudicating it. Non-convergence is exactly the condition the human tiebreaker exists for. See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
 
-Independently of the response-round guard above, `codex-review-request.sh` enforces the same configured number as a per-PR cap on exact configured-author request comments, including acknowledgement retries (#813). Clean replies, reactions and absent responses all consume their request's slot. It refuses the next write at the cap with exit `7`; this required Phase 4a caller escalates that stop, while Phase 3 keeps it advisory. A request posted in the current invocation retains its normal bounded response poll and timeout outcome when its acknowledgement retry is capped. No cross-provider or cross-PR lifetime budget is implied.
+3. **Request cap.** Independently of the response-round guard above, `codex-review-request.sh` enforces the same configured number as a per-PR cap on exact configured-author request comments, including acknowledgement retries (#813). Clean replies, reactions and absent responses all consume their request's slot. It refuses the next write at the cap with exit `7`; this required Phase 4a caller escalates that stop, while Phase 3 keeps it advisory. A request posted in the current invocation retains its normal bounded response poll and timeout outcome when its acknowledgement retry is capped. No cross-provider or cross-PR lifetime budget is implied.
 
 **Timeout is NOT a disagreement signal.** A Codex response timeout (`codex-review-request.sh` exit code `4` = `FALLBACK_REQUIRED`) routes the PR directly to Phase 4b per step 15a above. It is a fallback trigger, not a tiebreaker trigger. Phase 4b itself mediates via the human through the manual handoff, so there is nothing for the disagreement detector to add on top.
 
@@ -900,7 +900,7 @@ Phase 4b escalation (the traditional cross-agent CLI flow) uses the human's judg
 
 ### Escalation procedure
 
-When either of the two signals above fires, the agent:
+When any of the signals above fires, the agent:
 
 1. **Stops the automated loop immediately.** Does NOT push more commits, does NOT re-run `@codex review`, does NOT run the merge gate, does NOT merge.
 2. **Posts a comment on the PR** summarizing:
@@ -908,6 +908,8 @@ When either of the two signals above fires, the agent:
    - Both positions (the agent's and Codex's) in plain language, with links to the specific review rounds and the rebuttal replies
    - The current round counter and a link to the `scripts/codex-review-request.sh` output from the terminating round
 3. **Alerts the human via chat** and waits for an explicit decision before taking any further action on the PR.
+
+For request-cap exhaustion, step 2 instead reports exit `7`, configured and consumed request counts, any provider-block diagnostic, and the observed final-request/response state (or that it is unknown). No opposing positions or rebuttal links are required for a cap stop.
 
 Note that timeout does NOT go through this escalation procedure. On a timeout (exit code `4` from `codex-review-request.sh`), the agent posts the handoff message per [Handoff Message Format](#handoff-message-format) and routes to Phase 4b directly from step 15a — no in-place tiebreaker.
 
