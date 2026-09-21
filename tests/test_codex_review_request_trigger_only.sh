@@ -253,8 +253,8 @@ test_request_attempt_cap() {
         || fail "#813: cap exhaustion did not report consumed attempts"
       [ "$(jqf "$dir" '.cap_exhausted.max_request_attempts')" = 10 ] \
         || fail "#813: cap exhaustion did not report configured bound"
-      [ "$(jqf "$dir" '.cap_exhausted.escalation')" = advisory_request_stop ] \
-        || fail "#813: advisory cap exhaustion did not name the non-gating request stop"
+      [ "$(jqf "$dir" '.cap_exhausted.escalation')" = null ] \
+        || fail "#813: advisory cap exhaustion invented caller routing"
       [ "$(jqf "$dir" '.cap_exhausted.observed_provider_block')" = null ] \
         || fail "#813: cap exhaustion fabricated provider-block diagnostics"
     fi
@@ -271,20 +271,20 @@ test_nondefault_request_attempt_cap() {
   [ "$(trig_count "$dir")" = 0 ] || fail "#813: nondefault cap posted despite three consumed requests"
   grep -q 'request-attempt cap reached.*3/3' "$dir/err.log" \
     || fail "#813: nondefault cap did not report the configured bound"
-  [ "$(jqf "$dir" '.cap_exhausted.escalation')" = advisory_request_stop ] \
-    || fail "#813: nondefault advisory cap did not preserve the non-gating request stop"
+  [ "$(jqf "$dir" '.cap_exhausted.escalation')" = null ] \
+    || fail "#813: nondefault advisory cap invented caller routing"
   [ "$FAIL" -ne "$before" ] || pass "#813: configured nondefault cap governs a new request"
 }
 
-test_gated_cap_retains_human_tiebreaker() {
+test_gated_cap_leaves_routing_to_caller() {
   local dir rc before=$FAIL
   dir=$(make_case "request-cap-gated")
   rc=$(run_trigger_only "$dir" cap_at_limit true)
   [ "$rc" = 7 ] || fail "#813 gated cap: expected exit 7, got $rc; err=$(cat "$dir/err.log")"
   [ "$(trig_count "$dir")" = 0 ] || fail "#813 gated cap: posted despite exhausted request budget"
-  [ "$(jqf "$dir" '.cap_exhausted.escalation')" = human_tiebreaker ] \
-    || fail "#813 gated cap did not retain the human-tiebreaker route"
-  [ "$FAIL" -ne "$before" ] || pass "#813: Phase 4a-gated cap retains the human-tiebreaker route"
+  [ "$(jqf "$dir" '.cap_exhausted.escalation')" = null ] \
+    || fail "#813 gated cap invented caller routing"
+  [ "$FAIL" -ne "$before" ] || pass "#813: Phase 4a-gated cap leaves routing to the caller"
 }
 
 test_cap_preserves_provider_block_as_diagnostic_only() {
@@ -295,8 +295,8 @@ test_cap_preserves_provider_block_as_diagnostic_only() {
   [ "$(trig_count "$dir")" = 0 ] || fail "#813 blocked cap: posted despite exhausted request budget"
   [ "$(jqf "$dir" '.blocked_reason')" = null ] \
     || fail "#813 blocked cap elevated the provider block into Phase 4b routing"
-  [ "$(jqf "$dir" '.cap_exhausted.escalation')" = human_tiebreaker ] \
-    || fail "#813 blocked cap lost the Phase 4a human-tiebreaker route"
+  [ "$(jqf "$dir" '.cap_exhausted.escalation')" = null ] \
+    || fail "#813 blocked cap invented caller routing"
   [ "$(jqf "$dir" '.cap_exhausted.observed_provider_block.reason')" = usage_limit ] \
     || fail "#813 blocked cap did not preserve the observed provider-block reason"
   [ "$(jqf "$dir" '.cap_exhausted.observed_provider_block.comment_id')" = 8060 ] \
@@ -671,6 +671,21 @@ EOF
   [ "$rc" = "6" ] || fail "O: expected feedback-unaccounted exit 6, got $rc; err=$(cat "$dir/err.log")"
   [ "$(trig_count "$dir")" = "0" ] || fail "O: accounting miss must block before @codex post"
   [ "$FAIL" -ne "$before" ] || pass "O: unaccounted feedback exits 6 before a new @codex trigger"
+  # An exhausted request never reaches the write that accounting protects.
+  rc=0
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODEX_TEST_STATE_DIR="$dir/state" CODEX_TEST_SCENARIO=cap_at_limit \
+      MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$gate" \
+      ./scripts/codex-review-request.sh --trigger-only 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  [ "$rc" = 7 ] || fail "O: exhausted cap with unaccounted feedback expected exit 7, got $rc"
+  [ "$(trig_count "$dir")" = 0 ] || fail "O: cap exhaustion with feedback posted a trigger"
+  [ "$(jqf "$dir" '.cap_exhausted.request_attempts')" = 10 ] \
+    || fail "O: cap exhaustion with feedback lost the request count"
+  [ "$FAIL" -ne "$before" ] || pass "O: exhaustion is reported before accounting without a new write"
 }
 
 # K: a registered approval stays in the candidate-controlled read-only lane.
@@ -764,7 +779,7 @@ test_stale_author_command_posts
 test_reviewer_trigger_does_not_count
 test_request_attempt_cap
 test_nondefault_request_attempt_cap
-test_gated_cap_retains_human_tiebreaker
+test_gated_cap_leaves_routing_to_caller
 test_cap_preserves_provider_block_as_diagnostic_only
 test_gate_skips_content_free_head
 test_gate_triggers_on_real_content_change
