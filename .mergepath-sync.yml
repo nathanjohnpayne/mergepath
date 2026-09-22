@@ -1122,6 +1122,8 @@ paths:
   - path: tests/test_required_check_publisher_dedup.sh
     type: canonical
     consumers: all
+    requires:
+      - ".github/workflows/required-check-publisher.yml"
   # Complete-history inline + review-body finding inventory, disposition
   # evidence, pagination, API fail-closed behavior, and the four enforcement
   # call sites (#1000). Hard-run by check_review_feedback_accounting.

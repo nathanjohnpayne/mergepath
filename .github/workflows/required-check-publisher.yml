@@ -129,7 +129,7 @@ jobs:
           pending_summary="Publisher phase 1: evaluation queued for $HEAD_SHA. <!-- required-check-publisher:pending:${PARENT_RUN_ID}:${PARENT_RUN_ATTEMPT} -->"
           if [ "$EVENT_ACTION" = "in_progress" ] && [ "$PARENT_RUN_ATTEMPT" = "1" ]; then
             if pending_runs=$(gh api --paginate -X GET \
-                "repos/$REPO/commits/$HEAD_SHA/check-runs" -f per_page=100 \
+                "repos/$REPO/commits/$HEAD_SHA/check-runs" -f per_page=100 -f filter=all \
                 --jq '.check_runs[] | [.name, .status, (.output.summary // ""), (.app.slug // ""), (.started_at // ""), .id] | @tsv'); then
               all_pending=1
               for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do

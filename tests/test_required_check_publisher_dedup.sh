@@ -43,6 +43,13 @@ case "$*" in
     fi
     ;;
   *"/commits/"*"/check-runs"*)
+    case " $* " in
+      *" -f filter=all "*) ;;
+      *)
+        echo "check-runs probe must request filter=all" >&2
+        exit 2
+        ;;
+    esac
     summary="Publisher phase 1: evaluation queued for $HEAD_SHA. <!-- required-check-publisher:pending:${PARENT_RUN_ID}:${PARENT_RUN_ATTEMPT} -->"
     case "$GH_FIXTURE_MODE" in
       exact)
