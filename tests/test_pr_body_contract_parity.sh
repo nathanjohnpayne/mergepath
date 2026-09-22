@@ -1048,15 +1048,15 @@ renderer_contract "#1281: an interrupting heading detaches the rest of the defin
 # blockquote; the blank line leaves the Self-Review heading top-level.
 # 30000 levels rather than 5000: at 5000 a quadratic cost would still have
 # completed quickly, so the shallower control could not have failed (Phase 4b
-# P1). Blockquote nesting measures 96ms at 5000, 191ms at 15000, 1042ms at
-# 30000 and 1256ms at 32760 -- the deepest a 65,536-character body can express,
-# since a blockquote marker costs two bytes per level exactly as a list marker
-# does. Superlinear, but the body-size limit bounds it near 1.3s, unlike
-# same-line LIST nesting at the same depth (see the known limitation below).
+# P1). Original local measurements were 96ms at 5000, 191ms at 15000, 1042ms
+# at 30000 and 1256ms at 32760. These are environment-specific observations,
+# not a body-size-derived wall-clock bound: another Node 20.20.2 environment
+# measured about 31–32 seconds at 30000 levels. The 120-second watchdog below
+# bounds this regression test, not production parser invocations.
 DEEP_BLOCKQUOTE=''
 for ((index = 0; index < 30000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
 
-# The bound has to be ENFORCED, not merely measured. Timing the parse after
+# The regression-test timeout must be enforced, not merely measured. Timing the parse after
 # the fact only reports how long a run that finished took: a genuine stall
 # would sit here until the enclosing job timeout and never reach the
 # comparison, so the control could not fail in exactly the case it exists to
