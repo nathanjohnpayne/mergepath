@@ -42,6 +42,7 @@ make_case() {
   cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
   cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
+  cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 author_identity: nathanjohnpayne
@@ -97,6 +98,12 @@ case "$endpoint" in
       author_padded)    jq -cn --arg who "$author" --arg t "$t" '[{id:7005,user:{login:$who},created_at:$t,body:"@codex review "}]' ;;
       stale_author)     jq -cn --arg who "$author" --arg t "$old" '[{id:7006,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       reviewer_only)    jq -cn --arg who "$reviewer" --arg t "$t" '[{id:7007,user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cap_at_limit)     jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8000 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cap_at_limit_blocked) jq -cn --arg who "$author" --arg t "$old" '[range(10) | {id:(8050 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{id:8060,user:{login:"chatgpt-codex-connector[bot]"},created_at:$t,body:"You have reached your Codex usage limits for code reviews."}]' ;;
+      cap_below_limit)  jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8100 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cap_three)        jq -cn --arg who "$author" --arg t "$old" '[range(3) | {id:(8150 + .),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cap_duplicate_ids) jq -cn --arg who "$author" --arg t "$old" '[range(12) | {id:(8200 + (. % 9)),user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
+      cap_bad_id)       jq -cn --arg who "$author" --arg t "$old" '[range(9) | {id:(8300 + .),user:{login:$who},created_at:$t,body:"@codex review"}] + [{user:{login:$who},created_at:$t,body:"@codex review"}]' ;;
       *)                printf '[]\n' ;;
     esac
     ;;
@@ -108,13 +115,14 @@ EOF
 }
 
 run_trigger_only() {
-  local dir=$1 scenario=$2 rc=0
+  local dir=$1 scenario=$2 phase4a_gated=${3:-false} rc=0
   (
     cd "$dir"
     PATH="$dir/bin:$PATH" \
       GH_TOKEN=test-token \
       CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO="$scenario" \
+      MERGEPATH_PHASE_4A_GATED="$phase4a_gated" \
       ./scripts/codex-review-request.sh --trigger-only 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log"
   ) || rc=$?
@@ -208,6 +216,92 @@ test_reviewer_trigger_does_not_count() {
   [ "$(trig_count "$dir")" = "1" ] || fail "C: reviewer-authored @codex must NOT count → expected 1 post, got $(trig_count "$dir")"
   [ "$(jqf "$dir" '.trigger_posted')" = "true" ] || fail "C: trigger_posted=$(jqf "$dir" '.trigger_posted'), expected true"
   [ "$FAIL" -ne "$before" ] || pass "C: reviewer-authored @codex is not a valid trigger (author-scoped dedupe) → still posts"
+}
+
+# #813: max_review_rounds is enforced at the one request write boundary. The
+# counter intentionally follows author-owned exact command evidence rather
+# than provider review objects: clean summaries and reaction-only clearance do
+# not reliably create a review object.
+test_request_attempt_cap() {
+  local scenario expected_rc expected_posts description dir rc before
+  for scenario in cap_at_limit cap_below_limit cap_duplicate_ids cap_bad_id; do
+    case "$scenario" in
+      cap_at_limit)
+        expected_rc=7; expected_posts=0
+        description="ten prior author requests stop additional advisory requests" ;;
+      cap_below_limit)
+        expected_rc=0; expected_posts=1
+        description="nine prior author requests permit the tenth" ;;
+      cap_duplicate_ids)
+        expected_rc=0; expected_posts=1
+        description="duplicate comment IDs do not consume additional slots" ;;
+      cap_bad_id)
+        expected_rc=3; expected_posts=0
+        description="a malformed qualifying request record fails closed" ;;
+    esac
+    before=$FAIL
+    dir=$(make_case "request-cap-$scenario")
+    rc=$(run_trigger_only "$dir" "$scenario")
+    [ "$rc" = "$expected_rc" ] \
+      || fail "#813: $description expected exit $expected_rc, got $rc; err=$(cat "$dir/err.log")"
+    [ "$(trig_count "$dir")" = "$expected_posts" ] \
+      || fail "#813: $description expected $expected_posts posts, got $(trig_count "$dir")"
+    if [ "$scenario" = cap_at_limit ]; then
+      grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
+        || fail "#813: cap refusal did not expose consumed/limit evidence"
+      [ "$(jqf "$dir" '.cap_exhausted.request_attempts')" = 10 ] \
+        || fail "#813: cap exhaustion did not report consumed attempts"
+      [ "$(jqf "$dir" '.cap_exhausted.max_request_attempts')" = 10 ] \
+        || fail "#813: cap exhaustion did not report configured bound"
+      [ "$(jqf "$dir" '.cap_exhausted.escalation')" = null ] \
+        || fail "#813: advisory cap exhaustion invented caller routing"
+      [ "$(jqf "$dir" '.cap_exhausted.observed_provider_block')" = null ] \
+        || fail "#813: cap exhaustion fabricated provider-block diagnostics"
+    fi
+    [ "$FAIL" -ne "$before" ] || pass "#813: $description"
+  done
+}
+
+test_nondefault_request_attempt_cap() {
+  local dir rc before=$FAIL
+  dir=$(make_case "request-cap-nondefault")
+  printf '  max_review_rounds: 3\n' >> "$dir/.github/review-policy.yml"
+  rc=$(run_trigger_only "$dir" cap_three)
+  [ "$rc" = 7 ] || fail "#813: nondefault cap expected exit 7, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = 0 ] || fail "#813: nondefault cap posted despite three consumed requests"
+  grep -q 'request-attempt cap reached.*3/3' "$dir/err.log" \
+    || fail "#813: nondefault cap did not report the configured bound"
+  [ "$(jqf "$dir" '.cap_exhausted.escalation')" = null ] \
+    || fail "#813: nondefault advisory cap invented caller routing"
+  [ "$FAIL" -ne "$before" ] || pass "#813: configured nondefault cap governs a new request"
+}
+
+test_gated_cap_leaves_routing_to_caller() {
+  local dir rc before=$FAIL
+  dir=$(make_case "request-cap-gated")
+  rc=$(run_trigger_only "$dir" cap_at_limit true)
+  [ "$rc" = 7 ] || fail "#813 gated cap: expected exit 7, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = 0 ] || fail "#813 gated cap: posted despite exhausted request budget"
+  [ "$(jqf "$dir" '.cap_exhausted.escalation')" = null ] \
+    || fail "#813 gated cap invented caller routing"
+  [ "$FAIL" -ne "$before" ] || pass "#813: Phase 4a-gated cap leaves routing to the caller"
+}
+
+test_cap_preserves_provider_block_as_diagnostic_only() {
+  local dir rc before=$FAIL
+  dir=$(make_case "request-cap-blocked")
+  rc=$(run_trigger_only "$dir" cap_at_limit_blocked true)
+  [ "$rc" = 7 ] || fail "#813 blocked cap: expected exit 7, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = 0 ] || fail "#813 blocked cap: posted despite exhausted request budget"
+  [ "$(jqf "$dir" '.blocked_reason')" = null ] \
+    || fail "#813 blocked cap elevated the provider block into Phase 4b routing"
+  [ "$(jqf "$dir" '.cap_exhausted.escalation')" = null ] \
+    || fail "#813 blocked cap invented caller routing"
+  [ "$(jqf "$dir" '.cap_exhausted.observed_provider_block.reason')" = usage_limit ] \
+    || fail "#813 blocked cap did not preserve the observed provider-block reason"
+  [ "$(jqf "$dir" '.cap_exhausted.observed_provider_block.comment_id')" = 8060 ] \
+    || fail "#813 blocked cap did not preserve the observed provider-block comment id"
+  [ "$FAIL" -ne "$before" ] || pass "#813: cap preserves provider-block diagnostics without changing routing"
 }
 
 # ---------------------------------------------------------------------------
@@ -577,6 +671,21 @@ EOF
   [ "$rc" = "6" ] || fail "O: expected feedback-unaccounted exit 6, got $rc; err=$(cat "$dir/err.log")"
   [ "$(trig_count "$dir")" = "0" ] || fail "O: accounting miss must block before @codex post"
   [ "$FAIL" -ne "$before" ] || pass "O: unaccounted feedback exits 6 before a new @codex trigger"
+  # An exhausted request never reaches the write that accounting protects.
+  rc=0
+  (
+    cd "$dir"
+    PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODEX_TEST_STATE_DIR="$dir/state" CODEX_TEST_SCENARIO=cap_at_limit \
+      MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD="$gate" \
+      ./scripts/codex-review-request.sh --trigger-only 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc=$?
+  [ "$rc" = 7 ] || fail "O: exhausted cap with unaccounted feedback expected exit 7, got $rc"
+  [ "$(trig_count "$dir")" = 0 ] || fail "O: cap exhaustion with feedback posted a trigger"
+  [ "$(jqf "$dir" '.cap_exhausted.request_attempts')" = 10 ] \
+    || fail "O: cap exhaustion with feedback lost the request count"
+  [ "$FAIL" -ne "$before" ] || pass "O: exhaustion is reported before accounting without a new write"
 }
 
 # K: a registered approval stays in the candidate-controlled read-only lane.
@@ -668,6 +777,10 @@ test_uppercase_author_command_skips
 test_author_containment_posts
 test_stale_author_command_posts
 test_reviewer_trigger_does_not_count
+test_request_attempt_cap
+test_nondefault_request_attempt_cap
+test_gated_cap_leaves_routing_to_caller
+test_cap_preserves_provider_block_as_diagnostic_only
 test_gate_skips_content_free_head
 test_gate_triggers_on_real_content_change
 test_gate_triggers_without_prior_review

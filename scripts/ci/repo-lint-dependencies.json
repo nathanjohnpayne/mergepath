@@ -62,6 +62,11 @@
       "tests/test_merge_clearance_gate.sh",
       "tests/test_465_fail_closed.sh"
     ],
+    "check_required_check_publisher": [
+      ".github/workflows/required-check-publisher.yml",
+      "scripts/lib/ci-check-modes.sh",
+      "tests/test_required_check_publisher_dedup.sh"
+    ],
     "check_phase_4b_automation": [
       "scripts/lib/ci-check-modes.sh",
       "scripts/phase-4b-review.sh",

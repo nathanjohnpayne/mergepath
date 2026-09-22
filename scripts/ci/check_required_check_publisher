@@ -123,12 +123,25 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+MODE_HELPER="scripts/lib/ci-check-modes.sh"
+if [ ! -f "$MODE_HELPER" ]; then
+  echo "check_required_check_publisher: ERROR scripts/lib/ci-check-modes.sh missing" >&2
+  exit 1
+fi
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: check_required_check_publisher [--check | --self-test]" >&2
+  exit 2
+fi
+
 # Overridable so tests/test_merge_clearance_gate.sh can aim the assertions
 # at a mutated copy without touching the canonical workflow on disk. Same
 # contract as MERGE_CLEARANCE_WORKFLOW in check_merge_clearance_gate.
 PUBLISHER="${REQUIRED_CHECK_PUBLISHER_WORKFLOW:-.github/workflows/required-check-publisher.yml}"
 PARENT_WORKFLOW="${REQUIRED_CHECK_PUBLISHER_PARENT:-.github/workflows/merge-clearance-gate.yml}"
 WORKFLOW_DIR="${REQUIRED_CHECK_PUBLISHER_WORKFLOW_DIR:-.github/workflows}"
+DEDUP_TEST="tests/test_required_check_publisher_dedup.sh"
 HUB_MARKER="scripts/sync-to-downstream.sh"
 
 FAILED=0
@@ -948,6 +961,22 @@ if [ "$TIER_SKIPPED" -ne 0 ]; then
   echo "      Install PyYAML to enforce the publisher's trigger set, head"
   echo "      bindings, permission scope, queue shape and native producers."
   exit 0
+fi
+
+# Fixture callers override the publisher path to exercise structural
+# mutations. Run the behavioral suite only against the canonical workflow;
+# otherwise every mutation case would recursively test the unmutated file.
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] \
+    && [ -z "${REQUIRED_CHECK_PUBLISHER_WORKFLOW:-}" ]; then
+  if [ ! -f "$DEDUP_TEST" ]; then
+    echo "FAIL: $DEDUP_TEST is missing; first-attempt deduplication behavior is untested."
+    echo "check_required_check_publisher: FAIL"
+    exit 1
+  fi
+  if ! bash "$DEDUP_TEST"; then
+    echo "check_required_check_publisher: FAIL (dedup behavior suite)"
+    exit 1
+  fi
 fi
 
 echo "check_required_check_publisher: PASS"
