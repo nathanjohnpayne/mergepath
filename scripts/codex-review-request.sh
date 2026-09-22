@@ -178,7 +178,8 @@
 #       explicit-review-required decision that mandates this path. Two
 #       sub-cases, distinguished by the `blocked_reason` field in the JSON:
 #       a plain timeout (blocked_reason:null) waited out the full window and
-#       successfully recorded terminal_determination for this exact head,
+#       successfully recorded terminal_determination for this exact head
+#       (or preserves that validated determination for the same capped request),
 #       whereas a detected account-/connection-level block
 #       (blocked_reason:"usage_limit"|"not_connected", #722) short-circuits
 #       the wait immediately — re-polling/re-triggering cannot help until a
@@ -194,6 +195,13 @@
 #   6   FEEDBACK_UNACCOUNTED — at least one earlier reviewer finding has no
 #       durable disposition evidence. No new trigger is posted. Account for
 #       every reported finding, then rerun this script (#1000).
+#   7   CAP_EXHAUSTED — the configured per-PR request-attempt cap has already
+#       been reached before an initial request. JSON on stdout names the
+#       consumed and configured counts; the caller retains its existing review
+#       policy. Exhaustion adds no routing or merge authority. Any
+#       observed provider block is diagnostic-only and never grants Phase 4b
+#       routing authority. This requester-specific status is not Phase 4b's
+#       exit-7 contract.
 #
 # Design notes:
 #   - Writes only author-attributed PR comments: the `@codex review` trigger,
@@ -302,7 +310,7 @@ fi
 # shellcheck source=lib/codex-request-evidence.sh
 if [ ! -r "$__CODEX_REQUEST_DIR/lib/codex-request-evidence.sh" ] \
   || ! . "$__CODEX_REQUEST_DIR/lib/codex-request-evidence.sh" \
-  || ! declare -F crqe_select_trigger crqe_ack_present >/dev/null; then
+  || ! declare -F crqe_select_trigger crqe_count_triggers crqe_ack_present >/dev/null; then
   echo "[codex-review-request] ERROR: request evidence helper unavailable (see #1276)" >&2
   exit 3
 fi
@@ -933,7 +941,7 @@ scan_codex_state() {
 # it — so treating it as a wait-ending signal is correct (#722).
 current_blocked_reason() {
   local scan=$1
-  if [ "$TRIGGER_POSTED" = "true" ]; then
+  if [ "$TRIGGER_POSTED" = "true" ] || [ "${CAP_REUSED_TRIGGER:-false}" = true ]; then
     local after=${TRIGGER_SIGNAL_THRESHOLD:-$TRIGGER_POST_TIME}
     echo "$scan" | jq -r --arg after "$after" '
       if (.blocked != null and .blocked.created_at >= $after)
@@ -1335,10 +1343,146 @@ post_author_pr_comment() { # <body> <purpose> [body-file|inline]
   AUTHOR_COMMENT_OUTPUT="$output"
 }
 
+# The request-attempt cap is an intentional review-loop stop, not an API
+# failure and not a Phase 4a timeout. Emit the normal requester observations
+# with a machine-readable stop outcome. The caller owns its already-selected
+# advisory or required review policy; this write cap does not classify it.
+# Malformed policy or unreadable request
+# evidence never reaches this function; those remain exit 3 infrastructure
+# failures.
+emit_cap_exhausted() { # <request_attempts> <max_request_attempts>
+  local request_attempts="$1" max_request_attempts="$2"
+  jq -n \
+    --argjson pr_number "$PR_NUMBER" \
+    --arg repo "$REPO" \
+    --arg head_sha "$HEAD_SHA" \
+    --arg head_committer_date "$HEAD_COMMITTER_DATE" \
+    --arg bot_login "$BOT_LOGIN" \
+    --argjson scan "$INITIAL_SCAN" \
+    --argjson request_attempts "$request_attempts" \
+    --argjson max_request_attempts "$max_request_attempts" \
+    --argjson elapsed "$ELAPSED" '
+    {
+      pr_number: $pr_number,
+      repo: $repo,
+      head_sha: $head_sha,
+      head_committer_date: $head_committer_date,
+      bot_login: $bot_login,
+      review: $scan.review,
+      findings: $scan.findings,
+      reaction: $scan.reaction,
+      verdict: $scan.verdict,
+      blocked_reason: null,
+      terminal_determination: null,
+      cap_exhausted: {
+        request_attempts: $request_attempts,
+        max_request_attempts: $max_request_attempts,
+        observed_provider_block: $scan.blocked
+      },
+      trigger_posted: false,
+      trigger_requested: true,
+      rounds_waited_seconds: $elapsed
+    }
+  '
+  exit 7
+}
+
+preserve_final_request_timeout() { # <comments-json> <selected-trigger-json>
+  local state live_head
+  if [ "$CODEX_FAILURE_MARKERS_OK" != true ] \
+     || ! command -v codex_phase4a_timeout_marker_state >/dev/null 2>&1; then
+    die 3 "cannot classify the final Codex request: shared terminal-marker helper unavailable"
+  fi
+  state=$(codex_phase4a_timeout_marker_state "$HEAD_SHA" "$AUTHOR_IDENTITY" "$1")
+  case "$(printf '%s' "$state" | jq -r '.state // "malformed"')" in
+    current) ;;
+    none|stale|superseded) return 0 ;;
+    *) die 3 "cannot classify the final Codex request: trusted terminal-marker evidence is malformed" ;;
+  esac
+  # The marker parser recognizes exact lowercase commands; the request
+  # selector also recognizes case variants. A newer selected command must
+  # supersede an older timeout even when only the selector recognizes it.
+  printf '%s' "$state" | jq -e --argjson trigger "$2" \
+    '.trigger_comment_id == $trigger.id' >/dev/null || return 0
+  live_head=$(gh_api_scalar --shape sha "Recorded Phase 4a timeout live PR head" \
+    "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha') \
+    || die 3 "cannot reuse Phase 4a timeout: live PR head is unreadable"
+  [ "$live_head" = "$HEAD_SHA" ] \
+    || die 3 "cannot reuse Phase 4a timeout: PR head moved from $HEAD_SHA to $live_head"
+  log "final Codex request already has a validated timeout determination; preserving its fallback without another poll or write"
+  jq -n --argjson pr_number "$PR_NUMBER" --arg repo "$REPO" \
+    --arg head_sha "$HEAD_SHA" --arg head_committer_date "$HEAD_COMMITTER_DATE" \
+    --arg bot_login "$BOT_LOGIN" --argjson scan "$INITIAL_SCAN" --argjson state "$state" '
+    {
+      pr_number: $pr_number, repo: $repo, head_sha: $head_sha,
+      head_committer_date: $head_committer_date, bot_login: $bot_login,
+      review: $scan.review, findings: $scan.findings,
+      reaction: $scan.reaction, verdict: $scan.verdict, blocked_reason: null,
+      terminal_determination: {
+        provider: "codex", outcome: "timeout", marker_comment_id: $state.marker_id
+      },
+      trigger_posted: false, trigger_requested: true, rounds_waited_seconds: 0
+    }'
+  exit 4
+}
+
 post_codex_trigger() {
-  # A new review round must not hide findings from an earlier round. This
-  # enumerates both inline and top-level review-body findings and fails before
-  # the author-attributed write when posted != dispositioned (#1000).
+  # Check immediately before every author-attributed trigger write, including
+  # an acknowledgement retry. Current-head clearance and idempotency return
+  # before this function, preserving their existing behavior. The complete
+  # paginated PR timeline is the only budget store; no local counter can make
+  # concurrent checkouts or later invocations agree.
+  # Parse this only at the new-write boundary. Disabled, cleared, and
+  # idempotently-reused paths spend no request attempt and retain their
+  # established behavior even if a later budget edit is malformed.
+  local max_review_rounds request_comments request_count
+  max_review_rounds=$(codex_field max_review_rounds)
+  max_review_rounds=${max_review_rounds:-10}
+  # Bound the decimal width before arithmetic: bash's integer comparison can
+  # overflow or error on an attacker-sized policy scalar.
+  if ! [[ "$max_review_rounds" =~ ^[0-9]{1,9}$ ]]; then
+    die 3 "codex.max_review_rounds must be a non-negative integer no greater than 999999999; refusing a new '@codex review' trigger"
+  fi
+  request_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex request-attempt evidence") \
+    || die 3 "cannot read Codex request-attempt evidence; refusing a new '@codex review' trigger"
+  request_count=$(crqe_count_triggers "$request_comments" "$AUTHOR_IDENTITY") \
+    || die 3 "cannot count Codex request attempts; refusing a new '@codex review' trigger"
+  if [ "$request_count" -ge "$max_review_rounds" ]; then
+    # The initial request may consume the final slot. Its missing eyes
+    # acknowledgement must suppress only the retry: the already-confirmed
+    # request still deserves its ordinary bounded review poll. An initial
+    # capped request has no such request to poll and remains fail-closed.
+    if [ "$TRIGGER_POSTED" = "true" ]; then
+      ACK_RETRY_REFUSED_BY_CAP=true
+      log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); suppressing acknowledgement retry and continuing normal review poll"
+      return 1
+    fi
+    # Trigger-only callers can consume the last slot before a separate waiter
+    # starts. Reuse only an unanswered fresh author trigger, and only at the
+    # cap; normal re-request behavior after a finding remains unchanged.
+    local pending_trigger
+    pending_trigger=$(crqe_select_trigger "$request_comments" "$AUTHOR_IDENTITY" "$REACTION_THRESHOLD") \
+      || die 3 "cannot select the final Codex request"
+    if [ "$TRIGGER_ONLY" != true ] && [ "$pending_trigger" != null ]; then
+      CAP_REUSED_TRIGGER=true
+      TRIGGER_SIGNAL_THRESHOLD=$(printf '%s' "$pending_trigger" | jq -r '.created_at')
+      if ! has_post_trigger_signal "$INITIAL_SCAN" \
+         && [ -z "$(current_blocked_reason "$INITIAL_SCAN")" ]; then
+        preserve_final_request_timeout "$request_comments" "$pending_trigger"
+        CAP_REQUEST_COUNT=$request_count
+        CAP_REQUEST_LIMIT=$max_review_rounds
+        log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); polling the existing final request without a new trigger"
+        return 0
+      fi
+      CAP_REUSED_TRIGGER=false
+    fi
+    log "Codex request-attempt cap reached for $REPO#$PR_NUMBER ($request_count/$max_review_rounds); refusing additional '@codex review' requests"
+    emit_cap_exhausted "$request_count" "$max_review_rounds"
+  fi
+
+  # Accounting protects new review requests. An exhausted cap performs no
+  # write and reports its distinct stop first; when a slot remains, no new
+  # round may hide undispositioned feedback (#1000).
   run_feedback_accounting_gate
 
   # The Codex GitHub App ONLY monitors '@codex review' comments authored
@@ -1351,7 +1495,7 @@ post_codex_trigger() {
   # GH_TOKEN. This SUPERSEDES the #284 `identity-check --expect-reviewer`
   # guard, which fail-closed on the WRONG identity for this particular
   # write.
-  log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY)"
+  log "posting '@codex review' trigger comment (as author identity $AUTHOR_IDENTITY; request attempts $request_count/$max_review_rounds)"
   post_author_pr_comment "@codex review" "'@codex review' trigger comment" inline
   POST_OUTPUT="$AUTHOR_COMMENT_OUTPUT"
   TRIGGER_POSTED=true
@@ -1512,7 +1656,12 @@ run_trigger_ack_gate() {
 
     retries_used=$((retries_used + 1))
     log "re-posting '@codex review' because Codex did not acknowledge the trigger (${retries_used}/${MAX_ACK_RETRIES})"
-    post_codex_trigger
+    if ! post_codex_trigger; then
+      if [ "$ACK_RETRY_REFUSED_BY_CAP" = "true" ]; then
+        return 0
+      fi
+      die 3 "acknowledgement retry did not post a Codex trigger"
+    fi
   done
 }
 
@@ -1610,6 +1759,10 @@ TRIGGER_COMMENT_ID=""
 TERMINAL_TRIGGER_COMMENT_ID=""
 TRIGGER_POST_TIME=""
 TRIGGER_SIGNAL_THRESHOLD=""
+ACK_RETRY_REFUSED_BY_CAP=false
+CAP_REUSED_TRIGGER=false
+CAP_REQUEST_COUNT=0
+CAP_REQUEST_LIMIT=0
 
 if has_cleared_signal "$INITIAL_SCAN"; then
   log "Codex has already cleared on HEAD (reaction, no-blocking-tier review, or affirmative verdict comment) — skipping trigger comment"
@@ -1673,7 +1826,7 @@ while :; do
   # at or after the first trigger in this run. Otherwise (no trigger
   # sent), any existing signal is fine — that's the cleared-on-arrival
   # path.
-  if [ "$TRIGGER_POSTED" = "true" ]; then
+  if [ "$TRIGGER_POSTED" = "true" ] || [ "$CAP_REUSED_TRIGGER" = true ]; then
     if has_post_trigger_signal "$FINAL_SCAN"; then
       log "Codex signal received after ${ELAPSED}s (post-trigger)"
       break
@@ -1693,7 +1846,7 @@ while :; do
   # name the real cause instead of a generic timeout.
   BLOCKED_REASON_NOW=$(current_blocked_reason "$FINAL_SCAN")
   if [ -n "$BLOCKED_REASON_NOW" ]; then
-    log "Codex reported '$BLOCKED_REASON_NOW' after ${ELAPSED}s — short-circuiting the wait; re-polling/re-triggering cannot clear it. Routing to Phase 4b with blocked_reason=$BLOCKED_REASON_NOW (#722)"
+    log "Codex reported '$BLOCKED_REASON_NOW' after ${ELAPSED}s — short-circuiting the wait; re-polling/re-triggering cannot clear it. The result preserves the invocation's existing routing authority (#722)"
     break
   fi
 
@@ -1719,6 +1872,14 @@ while :; do
     die 3 "poll scan failed"
   fi
 done
+
+# A reused trigger grants no new timeout/fallback authority. If its bounded
+# wait returns no response, report the cap with the final observations. Only
+# this invocation's own confirmed trigger may mint a timeout determination.
+if [ "$CAP_REUSED_TRIGGER" = true ] && ! has_post_trigger_signal "$FINAL_SCAN"; then
+  INITIAL_SCAN=$FINAL_SCAN
+  emit_cap_exhausted "$CAP_REQUEST_COUNT" "$CAP_REQUEST_LIMIT"
+fi
 
 # --- emit final JSON --------------------------------------------------------
 

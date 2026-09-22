@@ -98,6 +98,28 @@ for a in "$@"; do
   [ "$prev" = "--diff-file" ] && cp "$a" "$CAPTURE/diff"
   prev="$a"
 done
+case "${FAKE_ORCH_JSON:-}" in
+  clean)
+    jq -n --arg head "${FAKE_ORCH_HEAD:-}" \
+      '{dry_run:true,review_posted:false,head_sha:$head,direction:"codex-reviews-claude",
+        reviewer_identity:"nathanpayne-claude",adapter:"fake-claude",repo:"owner/consumer",
+        pr_number:82,reviewer_effort:"high",adapter_timeout_seconds:900,
+        usage_source:"fixture",token_count:123,
+        validated_verdict:{verdict:"APPROVED",findings:[],summary:"clean historical chunk"}}'
+    ;;
+  advisory)
+    jq -n --arg head "${FAKE_ORCH_HEAD:-}" \
+      '{dry_run:true,review_posted:false,head_sha:$head,direction:"codex-reviews-claude",
+        reviewer_identity:"nathanpayne-claude",adapter:"fake-claude",
+        validated_verdict:{verdict:"APPROVED",findings:[{priority:"P3",body:"advisory"}],summary:"approval with advisory"}}'
+    ;;
+  changes)
+    jq -n --arg head "${FAKE_ORCH_HEAD:-}" \
+      '{dry_run:true,review_posted:false,head_sha:$head,direction:"codex-reviews-claude",
+        reviewer_identity:"nathanpayne-claude",adapter:"fake-claude",
+        validated_verdict:{verdict:"CHANGES_REQUESTED",findings:[{priority:"P1",body:"fix"}],summary:"findings"}}'
+    ;;
+esac
 exit "${FAKE_ORCH_EXIT:-0}"
 FAKE
 chmod +x "$FAKE_ORCH"
@@ -126,6 +148,17 @@ run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
   local policy="$1" reset="$2"; shift 2
   [ "$reset" = keep ] || { rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"; }
   WAVE_AUDIT_REPO_DIR="$CANON" \
+  WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
+  WAVE_AUDIT_LANE_VERIFIED_OK=1 \
+  MERGEPATH_REVIEW_POLICY_PATH="$policy" \
+  CAPTURE="$CAPTURE" \
+    bash "$WA" "$@"
+}
+
+run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
+  local repo_dir="$1" policy="$2" reset="$3"; shift 3
+  [ "$reset" = keep ] || { rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"; }
+  WAVE_AUDIT_REPO_DIR="$repo_dir" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
@@ -188,6 +221,11 @@ got="$(bash "$WA" --parse-title-only "sync: bulk reconcile to mergepath@75eae1c 
 if bash "$WA" --parse-title-only "sync: no sha named here" >/dev/null 2>&1; then
   fail "sha-less title accepted"
 else pass "sha-less title rejected"; fi
+help_text="$(bash "$WA" --help)"
+printf '%s' "$help_text" | grep -q -- '--historical-end <sha> | --finalize-historical' \
+  && printf '%s' "$help_text" | grep -q 'exit 9' \
+  && pass "help renders historical flags and partial-progress exit" \
+  || fail "help truncated historical usage contract"
 
 # ===========================================================================
 echo "wave-audit.sh — first run (--base), scope, dispatch env, watermark"
@@ -455,6 +493,366 @@ for metadata_case in invalid unavailable; do
     && pass "$metadata_case metadata leaves base and successful dry-run unchanged" \
     || fail "$metadata_case metadata changed outcome or claimed an age"
 done
+
+# ===========================================================================
+echo "wave-audit.sh — retained historical prefix and explicit finalization (#1186)"
+# ===========================================================================
+remote_has_prefix() {
+  git ls-remote --tags "$REMOTE" "refs/tags/wave-audit-prefix/$1/$2" | grep -q .
+}
+
+# Findings, including advisories attached to APPROVED, preserve the complete
+# verdict but write no receipt and grant no clearance.
+rc=0
+FAKE_ORCH_JSON=advisory run_wa "$POLICY_GOOD" reset 80 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" \
+  > "$WORK/historical-advisory.json" 2> "$WORK/historical-advisory.err" || rc=$?
+[ "$rc" -eq 1 ] && jq -e \
+  '.clearance == false and .watermark_advanced == false and .fanout_authorized == false and
+   .prefix_receipt == null and .validated_verdict.verdict == "APPROVED" and
+   (.validated_verdict.findings | length) == 1' "$WORK/historical-advisory.json" >/dev/null \
+  && pass "APPROVED with advisories stops with its complete verdict and no clearance" \
+  || fail "advisory historical outcome was dropped or treated as clean"
+remote_has_prefix "$LARGE_HEAD" "$C2" && fail "advisory outcome wrote a prefix receipt" \
+  || pass "advisory outcome writes no prefix receipt"
+
+# Top-level dry-run still runs the provider validation, but persists neither
+# the prefix receipt nor the ordinary full-wave watermark.
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 81 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" --dry-run \
+  > "$WORK/historical-dry.json" 2> "$WORK/historical-dry.err" || rc=$?
+[ "$rc" -eq 9 ] && jq -e \
+  '.receipt_written == false and .clearance == false and .watermark_advanced == false and
+   .fanout_authorized == false and .dry_run == true' "$WORK/historical-dry.json" >/dev/null \
+  && pass "clean historical dry-run returns distinct partial-progress exit 9" \
+  || fail "historical dry-run returned clearance-compatible status"
+remote_has_prefix "$LARGE_HEAD" "$C2" && fail "historical dry-run wrote prefix receipt" \
+  || pass "historical dry-run writes no prefix receipt"
+remote_has_tag "$LARGE_HEAD" && fail "historical dry-run advanced full watermark" \
+  || pass "historical dry-run leaves full watermark unchanged"
+
+# Retain the first chunk while its first tag push fails. The local exact
+# receipt must make the identical retry a publish-only operation, with no
+# second provider run.
+HIST_CHUNKS="$WORK/historical-chunks.diff"
+: > "$HIST_CHUNKS"
+PUSH_FAIL_BIN="$WORK/push-fail-bin"
+PUSH_FAIL_STATE="$WORK/push-fail-state"
+mkdir -p "$PUSH_FAIL_BIN"
+cat > "$PUSH_FAIL_BIN/git" <<'GIT'
+#!/usr/bin/env bash
+if [ "$1" = "-C" ] && [ "$3" = "push" ] && printf '%s\n' "$*" | grep -q 'refs/tags/wave-audit-prefix/'; then
+  if [ ! -e "$PUSH_FAIL_STATE" ]; then
+    : > "$PUSH_FAIL_STATE"
+    exit 1
+  fi
+fi
+exec "$REAL_GIT" "$@"
+GIT
+chmod +x "$PUSH_FAIL_BIN/git"
+rc=0
+PATH="$PUSH_FAIL_BIN:$PATH" REAL_GIT="$REAL_GIT" PUSH_FAIL_STATE="$PUSH_FAIL_STATE" \
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" \
+  > "$WORK/push-failed.json" 2> "$WORK/push-failed.err" || rc=$?
+[ "$rc" -eq 3 ] && [ -n "$(git -C "$CANON" tag -l "wave-audit-prefix/$LARGE_HEAD/$C2")" ] \
+  && ! remote_has_prefix "$LARGE_HEAD" "$C2" \
+  && pass "failed prefix push leaves the exact validated receipt locally" \
+  || fail "failed prefix push did not preserve recoverable local state"
+cat "$CAPTURE/diff" >> "$HIST_CHUNKS"
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" --dry-run \
+  > "$WORK/push-retry-dry.json" 2> "$WORK/push-retry-dry.err" || rc=$?
+[ "$rc" -eq 9 ] && [ ! -e "$CAPTURE/args" ] && ! remote_has_prefix "$LARGE_HEAD" "$C2" \
+  && grep -q 'dry-run made no receipt write or push' "$WORK/push-retry-dry.err" \
+  && ! grep -q 'ensured on origin' "$WORK/push-retry-dry.err" \
+  && pass "retained-receipt dry-run reports validation without claiming a push" \
+  || fail "retained-receipt dry-run claimed or performed publication"
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C2" \
+  > "$WORK/push-retry.json" 2> "$WORK/push-retry.err" || rc=$?
+[ "$rc" -eq 9 ] && [ ! -e "$CAPTURE/args" ] \
+  && jq -e '.receipt_reused == true and .clearance == false and .fanout_authorized == false' "$WORK/push-retry.json" >/dev/null \
+  && remote_has_prefix "$LARGE_HEAD" "$C2" \
+  && pass "identical retry publishes retained receipt without another review" \
+  || fail "identical retry repeated review or failed to publish receipt"
+
+# A later unavailable chunk leaves the approved prefix intact. Resume it
+# from a separate checkout to prove the remote receipt carries continuity
+# and the earlier chunk is not reviewed again.
+rc=0
+FAKE_ORCH_EXIT=4 run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C3" \
+  > "$WORK/later-unavailable.json" 2> "$WORK/later-unavailable.err" || rc=$?
+[ "$rc" -eq 4 ] && ! remote_has_prefix "$LARGE_HEAD" "$C3" \
+  && grep -q 'a v3' "$CAPTURE/diff" && ! grep -q 'b v1' "$CAPTURE/diff" \
+  && pass "later unavailable chunk preserves earlier prefix and reviews only its suffix" \
+  || fail "later unavailable chunk lost or re-reviewed approved prefix"
+SECOND_CANON="$WORK/second-canon"
+git -C "$CANON" push -q origin "$LARGE_HEAD:refs/heads/historical-test-head"
+git clone -q --no-checkout "$REMOTE" "$SECOND_CANON"
+git -C "$SECOND_CANON" config user.email test@example.invalid
+git -C "$SECOND_CANON" config user.name wave-audit-second
+git -C "$SECOND_CANON" config tag.gpgsign false
+rc=0
+FAKE_ORCH_JSON=clean run_wa_repo "$SECOND_CANON" "$POLICY_GOOD" reset 82 \
+  --repo owner/consumer --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$C3" \
+  > "$WORK/cross-checkout-resume.json" 2> "$WORK/cross-checkout-resume.err" || rc=$?
+[ "$rc" -eq 9 ] && remote_has_prefix "$LARGE_HEAD" "$C3" \
+  && grep -q 'a v3' "$CAPTURE/diff" && ! grep -q 'b v1' "$CAPTURE/diff" \
+  && pass "cross-checkout resume continues after retained prefix without re-review" \
+  || fail "cross-checkout receipt continuity failed"
+cat "$CAPTURE/diff" >> "$HIST_CHUNKS"
+
+# Retain the remaining three chunks. Every successful partial remains exit 9
+# and explicitly denies fan-out.
+for endpoint in "$C5" "$C6" "$LARGE_HEAD"; do
+  rc=0
+  FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 82 --repo owner/consumer \
+    --base "$C1" --head-sha "$LARGE_HEAD" --historical-end "$endpoint" \
+    > "$WORK/historical-clean.json" 2> "$WORK/historical-clean.err" || rc=$?
+  [ "$rc" -eq 9 ] && jq -e \
+    '.receipt_written == true and .clearance == false and .watermark_advanced == false and
+     .fanout_authorized == false and .validated_verdict.verdict == "APPROVED" and
+     (.validated_verdict.findings | length) == 0' "$WORK/historical-clean.json" >/dev/null \
+    && pass "clean chunk through ${endpoint:0:7} retained with exit 9 and no clearance" \
+    || fail "clean chunk through ${endpoint:0:7} did not retain safely"
+  remote_has_prefix "$LARGE_HEAD" "$endpoint" \
+    && pass "prefix receipt through ${endpoint:0:7} pushed" \
+    || fail "prefix receipt through ${endpoint:0:7} missing"
+  cat "$CAPTURE/diff" >> "$HIST_CHUNKS"
+done
+
+# The newly manifested file existed before the initial base. Its complete
+# content must enter coverage in the admission chunk, matching full-range
+# semantics rather than disappearing as an unchanged file.
+grep -q 'legacy v1 predates every audit range' "$HIST_CHUNKS" \
+  && pass "cumulative chunks cover pre-existing bytes at manifest admission" \
+  || fail "newly manifested pre-existing bytes escaped cumulative chunks"
+[ "$(git -C "$CANON" tag -l "wave-audit-prefix/$LARGE_HEAD/*" | wc -l | tr -d ' ')" -eq 5 ] \
+  && pass "five exact contiguous prefix receipts retained" \
+  || fail "historical receipt chain is not exactly five chunks"
+receipt_body="$(git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-prefix/$LARGE_HEAD/$C6")"
+printf '%s' "$receipt_body" | jq -e --arg base "$C5" --arg end "$C6" \
+  --arg full "$LARGE_HEAD" '.clearance == false and .chunk_base == $base and
+  .prefix_end == $end and .full_head == $full and (.manifest_blob|length) == 40 and
+  (.scope_fingerprint|length) == 40 and
+  .review_provenance.direction == "codex-reviews-claude" and
+  .review_provenance.reviewer_identity == "nathanpayne-claude" and
+  .review_provenance.adapter == "fake-claude" and
+  (.review_provenance.canary_head | type == "string")' >/dev/null \
+  && pass "receipt binds exact scope and actual reviewer provenance" \
+  || fail "receipt bindings are incomplete"
+
+# A different intended head with a different manifest blob has a separate
+# namespace and starts from the supplied initial base; it cannot consume the
+# completed chain for LARGE_HEAD.
+printf '\n# manifest drift fixture\n' >> "$CANON/.mergepath-sync.yml"
+git -C "$CANON" add .mergepath-sync.yml && git -C "$CANON" commit -qm manifest-drift
+DRIFT_HEAD="$(git -C "$CANON" rev-parse HEAD)"
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 83 --repo owner/consumer \
+  --base "$C1" --head-sha "$DRIFT_HEAD" --historical-end "$C2" --dry-run \
+  > "$WORK/head-manifest-drift.json" 2> "$WORK/head-manifest-drift.err" || rc=$?
+[ "$rc" -eq 9 ] && jq -e --arg base "$C1" --arg head "$DRIFT_HEAD" \
+  '.historical_chunk.base == $base and .historical_chunk.full_head == $head and
+   .receipt_written == false' "$WORK/head-manifest-drift.json" >/dev/null \
+  && pass "intended-head and manifest drift cannot reuse another receipt chain" \
+  || fail "different intended head reused retained prefix state"
+
+# A boundary manifest that exists but cannot be read is not an empty scope.
+READ_FAIL_BIN="$WORK/read-fail-bin"
+mkdir -p "$READ_FAIL_BIN"
+cat > "$READ_FAIL_BIN/git" <<'GIT'
+#!/usr/bin/env bash
+if printf '%s\n' "$*" | grep -Fq "show ${READ_FAIL_COMMIT}:.mergepath-sync.yml"; then
+  exit 2
+fi
+exec "$REAL_GIT" "$@"
+GIT
+chmod +x "$READ_FAIL_BIN/git"
+rc=0
+PATH="$READ_FAIL_BIN:$PATH" REAL_GIT="$REAL_GIT" READ_FAIL_COMMIT="$C3" \
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 83 --repo owner/consumer \
+  --base "$C1" --head-sha "$DRIFT_HEAD" --historical-end "$C3" \
+  > "$WORK/manifest-read-failed.json" 2> "$WORK/manifest-read-failed.err" || rc=$?
+[ "$rc" -eq 3 ] && grep -q 'could not read .mergepath-sync.yml at historical boundary' "$WORK/manifest-read-failed.err" \
+  && [ ! -e "$CAPTURE/args" ] \
+  && pass "historical boundary manifest read failure stops before review or retention" \
+  || fail "historical boundary manifest read failure became empty scope"
+
+TREE_FAIL_BIN="$WORK/tree-fail-bin"
+mkdir -p "$TREE_FAIL_BIN"
+cat > "$TREE_FAIL_BIN/git" <<'GIT'
+#!/usr/bin/env bash
+case "$*" in
+  *"cat-file -e ${TREE_FAIL_COMMIT}:.mergepath-sync.yml"*|*"ls-tree --name-only ${TREE_FAIL_COMMIT} -- .mergepath-sync.yml"*)
+    exit 2 ;;
+esac
+exec "$REAL_GIT" "$@"
+GIT
+chmod +x "$TREE_FAIL_BIN/git"
+rc=0
+PATH="$TREE_FAIL_BIN:$PATH" REAL_GIT="$REAL_GIT" TREE_FAIL_COMMIT="$C3" \
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 83 --repo owner/consumer \
+  --base "$C1" --head-sha "$DRIFT_HEAD" --historical-end "$C3" \
+  > "$WORK/manifest-tree-failed.json" 2> "$WORK/manifest-tree-failed.err" || rc=$?
+[ "$rc" -eq 3 ] && grep -q 'could not inspect .mergepath-sync.yml at historical boundary' "$WORK/manifest-tree-failed.err" \
+  && [ ! -e "$CAPTURE/args" ] \
+  && pass "failed historical tree inspection cannot become absent manifest scope" \
+  || fail "failed historical tree inspection was treated as absent manifest"
+
+# A malformed zero-length receipt must fail before the chain walker can
+# revisit the same cursor indefinitely.
+DRIFT_MANIFEST_BLOB="$(git -C "$CANON" rev-parse "$DRIFT_HEAD:.mergepath-sync.yml")"
+DRIFT_SCOPE="$(printf 'version=1\nbase=%s\nhead=%s\nmanifest=%s\nexcludes<<EOF\ntests/\ndocs/\nEOF\nscope<<EOF\nnewdir/\nscripts/\nEOF\n' \
+  "$C1" "$DRIFT_HEAD" "$DRIFT_MANIFEST_BLOB" | git -C "$CANON" hash-object --stdin)"
+BAD_RECEIPT="$WORK/bad-zero-receipt.json"
+printf '%s' "$receipt_body" | jq --arg base "$C1" --arg head "$DRIFT_HEAD" \
+  --arg manifest "$DRIFT_MANIFEST_BLOB" --arg scope "$DRIFT_SCOPE" --arg point "$C3" \
+  '.initial_base=$base | .full_head=$head | .manifest_blob=$manifest |
+   .scope_fingerprint=$scope | .chunk_base=$point | .prefix_end=$point' > "$BAD_RECEIPT"
+BAD_TAG="wave-audit-prefix/$DRIFT_HEAD/$C3"
+git -C "$CANON" tag -a "$BAD_TAG" "$C3" -F "$BAD_RECEIPT"
+git -C "$CANON" push -q origin "refs/tags/$BAD_TAG"
+rc=0
+run_wa "$POLICY_GOOD" reset 83 --repo owner/consumer --base "$C1" \
+  --head-sha "$DRIFT_HEAD" --finalize-historical \
+  > "$WORK/bad-zero.json" 2> "$WORK/bad-zero.err" || rc=$?
+[ "$rc" -eq 3 ] && grep -q 'not a strict forward range' "$WORK/bad-zero.err" \
+  && pass "zero-length receipt fails promptly before chain traversal" \
+  || fail "zero-length receipt was accepted or hung chain traversal"
+
+# Changing the configured scope cannot reuse the retained chain.
+POLICY_SCOPE_DRIFT="$WORK/policy-scope-drift.yml"
+awk '{ print; if ($0 ~ /- docs\//) print "    - newdir/" }' "$POLICY_GOOD" > "$POLICY_SCOPE_DRIFT"
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_SCOPE_DRIFT" reset 83 --repo owner/consumer \
+  --base "$C1" --head-sha "$LARGE_HEAD" --finalize-historical \
+  > "$WORK/scope-drift.json" 2> "$WORK/scope-drift.err" || rc=$?
+[ "$rc" -eq 3 ] && grep -q 'incompatible with the pinned historical scope' "$WORK/scope-drift.err" \
+  && pass "scope/config drift rejects retained receipts" \
+  || fail "scope/config drift reused historical receipts"
+
+# Merely finishing the last partial never finalizes. The explicit operation
+# presents a labeled cumulative receipt package to the ordinary non-dry
+# publication path; only its posted approval advances the full watermark.
+HIST_SCOPE_FILES=0
+HIST_SCOPE_BYTES=0
+for endpoint in "$C2" "$C3" "$C5" "$C6" "$LARGE_HEAD"; do
+  retained_receipt="$(git -C "$CANON" for-each-ref --format='%(contents)' \
+    "refs/tags/wave-audit-prefix/$LARGE_HEAD/$endpoint")"
+  HIST_SCOPE_FILES=$((HIST_SCOPE_FILES + $(printf '%s' "$retained_receipt" | jq -r .scope_files)))
+  HIST_SCOPE_BYTES=$((HIST_SCOPE_BYTES + $(printf '%s' "$retained_receipt" | jq -r .scope_bytes)))
+done
+remote_has_tag "$LARGE_HEAD" && fail "partial chain advanced full watermark before finalization" \
+  || pass "complete prefix chain alone grants no full-wave clearance"
+for final_rc in 4 5; do
+  rc=0
+  FAKE_ORCH_EXIT="$final_rc" run_wa "$POLICY_GOOD" reset 84 --repo owner/consumer --base "$C1" \
+    --head-sha "$LARGE_HEAD" --finalize-historical > "$WORK/historical-final-failed.json" \
+    2> "$WORK/historical-final-failed.err" || rc=$?
+  [ "$rc" -eq "$final_rc" ] && ! remote_has_tag "$LARGE_HEAD" \
+    && grep -q 'do NOT fan out or treat retained prefixes as clearance' "$WORK/historical-final-failed.err" \
+    && ! grep -q 'wave may proceed' "$WORK/historical-final-failed.err" \
+    && pass "historical finalization exit $final_rc leaves watermark unchanged and denies fan-out" \
+    || fail "historical finalization exit $final_rc exposed ordinary fail-open semantics"
+done
+run_wa "$POLICY_GOOD" reset 84 --repo owner/consumer --base "$C1" \
+  --head-sha "$LARGE_HEAD" --finalize-historical > "$WORK/historical-final.json" \
+  2> "$WORK/historical-final.err" \
+  && pass "explicit historical finalization uses ordinary approval path" \
+  || fail "explicit historical finalization failed"
+if grep -q -- '--dry-run' "$CAPTURE/args"; then
+  fail "historical finalization incorrectly used dry-run publication"
+else
+  pass "historical finalization is the sole non-dry publication step"
+fi
+jq -e '.artifact_kind == "wave-audit-cumulative-coverage-receipts" and
+  .clearance == false and .claims_prior_posted_approval == false and
+  (.review_instruction | contains("not a code diff") and contains("not a prior posted approval")) and
+  (.receipts | length) == 5' < <(sed -n '/^+{/,$s/^+//p' "$CAPTURE/diff") >/dev/null \
+  && grep -Eq '^@@ -0,0 \+1,[0-9]+ @@$' "$CAPTURE/diff" \
+  && pass "final reviewer input identifies cumulative receipts without claiming prior approval" \
+  || fail "final cumulative receipt package is mislabeled or incomplete"
+remote_has_tag "$LARGE_HEAD" && pass "only explicit successful finalization advances full watermark" \
+  || fail "successful finalization did not advance full watermark"
+jq -e --argjson files "$HIST_SCOPE_FILES" --argjson bytes "$HIST_SCOPE_BYTES" \
+  '.scope_files == $files and .scope_bytes == $bytes' "$WORK/historical-final.json" >/dev/null \
+  && git -C "$CANON" for-each-ref --format='%(contents)' "refs/tags/wave-audit-pass/$LARGE_HEAD" \
+    | grep -Fq "files=$HIST_SCOPE_FILES bytes=$HIST_SCOPE_BYTES" \
+  && grep -Fq "${HIST_SCOPE_FILES} file(s), ${HIST_SCOPE_BYTES} bytes across retained chunks" \
+    "$WORK/historical-final.err" \
+  && pass "historical finalization reports cumulative retained coverage metrics" \
+  || fail "historical finalization reported receipt-package metrics as audited coverage"
+
+# Fixed intended-head scope survives intermediate manifest removal. A path
+# present at both the initial base and full head keeps ordinary deltas in the
+# removal chunk, so its old bytes cannot disappear from cumulative coverage.
+mkdir -p "$CANON/churn"
+printf 'old\n' > "$CANON/churn/f.txt"
+cat >> "$CANON/.mergepath-sync.yml" <<'YAML'
+  - path: churn/
+    type: kit
+    consumers: all
+YAML
+git -C "$CANON" add -A && git -C "$CANON" commit -qm churn-base
+CHURN_BASE="$(git -C "$CANON" rev-parse HEAD)"
+printf 'new\n' > "$CANON/churn/f.txt"
+awk 'BEGIN{drop=0} /  - path: churn\//{drop=1; next} drop && /    consumers: all/{drop=0; next} !drop{print}' \
+  "$CANON/.mergepath-sync.yml" > "$WORK/churn-manifest.yml"
+mv "$WORK/churn-manifest.yml" "$CANON/.mergepath-sync.yml"
+git -C "$CANON" add -A && git -C "$CANON" commit -qm churn-removed
+CHURN_MIDDLE="$(git -C "$CANON" rev-parse HEAD)"
+cat >> "$CANON/.mergepath-sync.yml" <<'YAML'
+  - path: churn/
+    type: kit
+    consumers: all
+YAML
+printf 'newer\n' > "$CANON/churn/f.txt"
+git -C "$CANON" add .mergepath-sync.yml churn/f.txt && git -C "$CANON" commit -qm churn-readmitted
+CHURN_HEAD="$(git -C "$CANON" rev-parse HEAD)"
+RECEIPT_TMP="$WORK/receipt-tmp"
+mkdir -p "$RECEIPT_TMP"
+rc=0
+TMPDIR="$RECEIPT_TMP" FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer \
+  --base "$CHURN_BASE" --head-sha "$CHURN_HEAD" --historical-end "$CHURN_MIDDLE" \
+  > "$WORK/churn-first.json" 2> "$WORK/churn-first.err" || rc=$?
+[ "$rc" -eq 9 ] && grep -q '^-old' "$CAPTURE/diff" && grep -q '^+new' "$CAPTURE/diff" \
+  && pass "removal chunk retains ordinary delta for initial-and-final common path" \
+  || fail "intermediate manifest removal suppressed old-byte coverage"
+if find "$RECEIPT_TMP" -type f -name 'wave-audit-prefix.*' | grep -q .; then
+  fail "successful historical chunk leaked its receipt temp file"
+else
+  pass "successful historical chunk cleans its receipt temp file"
+fi
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 85 --repo owner/consumer \
+  --base "$CHURN_BASE" --head-sha "$CHURN_HEAD" --historical-end "$CHURN_HEAD" \
+  > "$WORK/churn-second.json" 2> "$WORK/churn-second.err" || rc=$?
+[ "$rc" -eq 9 ] && remote_has_prefix "$CHURN_HEAD" "$CHURN_HEAD" \
+  && pass "readmission chunk completes fixed-scope two-chunk coverage" \
+  || fail "readmission chunk did not complete fixed-scope coverage"
+
+# Real Phase 4b adapters reject an empty diff. Refuse an empty historical
+# chunk locally rather than dispatching or manufacturing reviewer evidence.
+printf 'excluded-only churn\n' >> "$CANON/tests/t.sh"
+git -C "$CANON" add tests/t.sh && git -C "$CANON" commit -qm churn-empty-suffix
+EMPTY_HIST_HEAD="$(git -C "$CANON" rev-parse HEAD)"
+rc=0
+FAKE_ORCH_JSON=clean run_wa "$POLICY_GOOD" reset 86 --repo owner/consumer \
+  --base "$CHURN_HEAD" --head-sha "$EMPTY_HIST_HEAD" --historical-end "$EMPTY_HIST_HEAD" \
+  > "$WORK/empty-historical.json" 2> "$WORK/empty-historical.err" || rc=$?
+[ "$rc" -eq 3 ] && [ ! -e "$CAPTURE/args" ] \
+  && jq -e '.skipped == "empty-historical-chunk" and .clearance == false and
+    .receipt_written == false and .watermark_advanced == false and
+    .fanout_authorized == false' "$WORK/empty-historical.json" >/dev/null \
+  && grep -q 'choose a later endpoint that coalesces this empty interval' "$WORK/empty-historical.err" \
+  && pass "empty historical chunk refuses before adapter dispatch or receipt" \
+  || fail "empty historical chunk reached adapter or claimed reviewer evidence"
 
 echo
 echo "Summary: $PASS passed, $FAIL failed"
