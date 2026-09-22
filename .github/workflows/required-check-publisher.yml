@@ -26,8 +26,8 @@ on:
     # in_progress is the rerun cue: a rerun re-uses the run, so `requested`
     # never re-fires, and without it no pending entry would cover the
     # re-evaluation window (cross-agent P1 on #867). Ordinary runs emit
-    # both; the duplicate pending is idempotent and the same completed
-    # pass retires it.
+    # both; the open job uses exact pending evidence to avoid the duplicate
+    # first-attempt writes while retaining in_progress as fail-closed backup.
     types: [requested, in_progress, completed]
   repository_dispatch:
     # merge-clearance-recheck kept verbatim (#658 lane reaches this file
@@ -95,7 +95,9 @@ jobs:
           # branch's last commit, and binding to it would put every context
           # on a commit branch protection never consults (#845 risks).
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_ACTION: ${{ github.event.action }}
           PARENT_RUN_ID: ${{ github.event.workflow_run.id }}
+          PARENT_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
           set -euo pipefail
           if [ -z "$HEAD_SHA" ]; then
@@ -113,6 +115,46 @@ jobs:
             fi
           else
             echo "::warning::could not read parent run status; opening anyway (fail closed)."
+          fi
+          # Ordinary first attempts emit both `requested` and `in_progress`.
+          # The latter may skip only when the former has ALREADY published
+          # all three holds for this exact parent attempt. The Checks API is
+          # the coordination record: a delayed, failed, partial or racing
+          # requested job leaves incomplete evidence and falls through to
+          # the full open path. Reruns bypass this probe because GitHub does
+          # not emit `requested` for a new attempt (#1130).
+          # Keep the proof marker in output metadata. The lineage
+          # discriminator for these required contexts must remain unset on
+          # Checks-API runs, or the native and synthetic lineages collapse.
+          pending_summary="Publisher phase 1: evaluation queued for $HEAD_SHA. <!-- required-check-publisher:pending:${PARENT_RUN_ID}:${PARENT_RUN_ATTEMPT} -->"
+          if [ "$EVENT_ACTION" = "in_progress" ] && [ "$PARENT_RUN_ATTEMPT" = "1" ]; then
+            if pending_runs=$(gh api --paginate -X GET \
+                "repos/$REPO/commits/$HEAD_SHA/check-runs" -f per_page=100 -f filter=all \
+                --jq '.check_runs[] | [.name, .status, (.output.summary // ""), (.app.slug // ""), (.started_at // ""), .id] | @tsv'); then
+              all_pending=1
+              for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+                if ! awk -F '\t' -v name="$name" -v summary="$pending_summary" \
+                    '$1 == name {
+                       row_exact = $2 == "in_progress" && $3 == summary && $4 == "github-actions"
+                       if (!found || $5 > started) {
+                         found=1; started=$5; exact=row_exact; conflict=!row_exact
+                       } else if ($5 == started) {
+                         if (row_exact) exact=1; else conflict=1
+                       }
+                     }
+                     END {
+                       exit(found && exact && !conflict ? 0 : 1)
+                     }' <<<"$pending_runs"; then
+                  all_pending=0
+                fi
+              done
+              if [ "$all_pending" -eq 1 ]; then
+                echo "Requested delivery already opened all three pending entries for parent $PARENT_RUN_ID attempt $PARENT_RUN_ATTEMPT."
+                exit 0
+              fi
+            else
+              echo "::warning::could not read pending check runs; opening anyway (fail closed)."
+            fi
           fi
           # Open only on open-PR heads: the parent also fires on schedule,
           # where head_sha is main's tip. Resolution comes from the open-PR
@@ -153,7 +195,7 @@ jobs:
                 -f head_sha="$HEAD_SHA" \
                 -f status="in_progress" \
                 -f "output[title]=$name (re-evaluation in progress)" \
-                -f "output[summary]=Publisher phase 1: evaluation queued for $HEAD_SHA." \
+                -f "output[summary]=$pending_summary" \
                 >/dev/null; then
                 return 0
               fi

@@ -3772,8 +3772,9 @@ rcp_dir_case native-producer-needs-drift \
 # reddening nine consumers' lint. The mergepath direction is the other half:
 # there, the same absence is a deleted single writer and must be loud.
 RCP_CONSUMER="$RCP_DIR/consumer"
-mkdir -p "$RCP_CONSUMER/scripts/ci" "$RCP_CONSUMER/.github/workflows"
+mkdir -p "$RCP_CONSUMER/scripts/ci" "$RCP_CONSUMER/scripts/lib" "$RCP_CONSUMER/.github/workflows"
 cp "$RCP_CHECK" "$RCP_CONSUMER/scripts/ci/check_required_check_publisher"
+cp "$ROOT/scripts/lib/ci-check-modes.sh" "$RCP_CONSUMER/scripts/lib/ci-check-modes.sh"
 set +e
 OUT=$(cd "$RCP_CONSUMER" && ./scripts/ci/check_required_check_publisher 2>&1)
 RC=$?
@@ -3786,8 +3787,9 @@ else
 fi
 
 RCP_HUB="$RCP_DIR/hub-missing"
-mkdir -p "$RCP_HUB/scripts/ci" "$RCP_HUB/.github/workflows"
+mkdir -p "$RCP_HUB/scripts/ci" "$RCP_HUB/scripts/lib" "$RCP_HUB/.github/workflows"
 cp "$RCP_CHECK" "$RCP_HUB/scripts/ci/check_required_check_publisher"
+cp "$ROOT/scripts/lib/ci-check-modes.sh" "$RCP_HUB/scripts/lib/ci-check-modes.sh"
 printf '#!/usr/bin/env bash\n' > "$RCP_HUB/scripts/sync-to-downstream.sh"
 set +e
 OUT=$(cd "$RCP_HUB" && ./scripts/ci/check_required_check_publisher 2>&1)

@@ -343,7 +343,7 @@ else
   fi
 
   governance_modes_ok=1
-  for name in check_auto_clear_workflow check_coderabbit_wait check_merge_clearance_gate check_phase_4b_automation check_phase_4b_accounting; do
+  for name in check_auto_clear_workflow check_coderabbit_wait check_merge_clearance_gate check_required_check_publisher check_phase_4b_automation check_phase_4b_accounting; do
     name="$name" yq -e '([.jobs.lint_fast.steps[] | select(.name == strenv(name)) | .run | contains("--check")] | any) and ([.jobs.deep_safety.steps[] | select(.name == (strenv(name) + " --self-test")) | select((.if | contains("needs.scope.outputs.full")) and (.if | contains("needs.scope.outputs.checks"))) | .run | contains("--self-test")] | any)' "$REPO_LINT" >/dev/null || governance_modes_ok=0
   done
   if [ "$governance_modes_ok" -eq 1 ]; then
