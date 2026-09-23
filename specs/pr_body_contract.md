@@ -20,7 +20,17 @@ The original local blockquote benchmark measured 96ms at 5,000 levels, 191ms at 
 
 Same-line list nesting is not the only shape that reaches this cost. A 65,441-byte body of `'['.repeat(32700) + ']'.repeat(32700) + '\n\nAuthoring-Agent: codex\n\n## Self-Review\n'` does not complete in 15 seconds either, where the parser being replaced answers it in about 50ms. The brackets contribute 65,400 bytes and the contract-marker suffix contributes 41 bytes. That one is inline link-reference nesting rather than container nesting, so it is a distinct vector reached through a different part of the parser, and no container ceiling would have bounded it. Both are recorded here so the limitation is not read as narrower than it is.
 
-This limitation is tracked separately and is not repaired by this change.
+### Accepted risk
+
+This is a recorded risk acceptance, not a deferral notice. It is written here because the limitation is a property of the shipped parser, and a reader reaching this section should not have to reconstruct whether anyone weighed it.
+
+**Accepted by the repository owner on 2026-09-17, reaffirmed 2026-09-23, on the record in [#1281](https://github.com/nathanjohnpayne/mergepath/pull/1281).** The decision was taken after a per-line nesting ceiling had been implemented, measured, and withdrawn, and with both rejected mitigations and their measurements in front of the owner.
+
+What is accepted: this parser gates an identity and self-review check, it runs on fully untrusted pull-request body text, and it has no input cap, no nesting cap, and no production-side wall-clock timeout at any call site. `scripts/lib/pr-body-contract.sh` invokes the parser through a plain pipe in each of its helpers, so an adversarial body does not fail the gate---it stalls it, for as long as the enclosing job permits. The 120-second watchdog in the regression suite guards that one fixture and nothing in production. Any pull-request author, human or agent, can therefore slow or hang this check in CI.
+
+Why it was accepted rather than mitigated here: the replacement fixes 38 disagreements with GitHub's renderer across the archived 122-case corpus and closes two identity-spoofing bypasses (footnote definitions and table cells) that the handwritten parser also had. The two mitigations measured in this change both failed---the per-line ceiling changes answers at any height, and the cost-proportional budget is worse on cost---and the remaining candidate, rejecting over-nested bodies before parsing, is a different design that had not been built or measured. The owner judged the correctness gain to outweigh an availability risk on a check that is already gated behind CI rather than user-facing.
+
+What would reverse it: a report of this surface being used, or evidence that the exposure reaches beyond CI wall-clock. Mitigation is tracked in [#1289](https://github.com/nathanjohnpayne/mergepath/issues/1289), which carries both rejected strategies, their measurements, and the two traps a pre-parse bound has to clear---it cannot use the parser to measure nesting, and it must not return an empty author, which downstream reads as "no same-agent risk".
 
 ## Generated runtime and rebuild
 
