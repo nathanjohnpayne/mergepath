@@ -1240,6 +1240,85 @@ else
   bad "#1281: the production bound rejected a valid body"
 fi
 
+# --- 17. the hook timeout must outlast the parser bound (#1281) --------------
+# The production watchdog is only reachable if whatever invokes the guard waits
+# long enough to observe it. It did not: `scripts/hooks/gh-pr-guard.sh` makes
+# TWO sequential parser calls, each now permitted 120s, behind hook
+# registrations that killed the whole process at 10s. The 124 path -- and the
+# fail-closed handling built on it -- was therefore unreachable from the guard,
+# and the mitigation looked complete while not working end to end.
+#
+# The ordering that has to hold is `hook timeout > parser worst-case aggregate`.
+# These controls assert that RELATIONSHIP rather than the literal numbers: a
+# test pinning "timeout == 300" would still pass if the parser bound were later
+# raised to 200, which is exactly the drift that produced this defect. Both
+# operands are read from the files that own them, and the call count is counted
+# in the guard, so adding a third parser call there fails this section instead
+# of silently shrinking the margin.
+
+HOOK_GUARD_CALLS="$(grep -cE '^[[:space:]]*if ! [A-Z_]+=\$\(pr_body_(authoring_agent|authoring_agent_count|has_self_review) ' \
+  "$ROOT/scripts/hooks/gh-pr-guard.sh")"
+HOOK_PARSER_BOUND="$(sed -n 's/^PR_BODY_CONTRACT_TIMEOUT_SECONDS=\([0-9]*\)$/\1/p' \
+  "$ROOT/scripts/lib/pr-body-contract.sh")"
+
+if [ "${HOOK_GUARD_CALLS:-0}" -ge 1 ] && [ -n "$HOOK_PARSER_BOUND" ]; then
+  ok "#1281: read the guard's parser call count ($HOOK_GUARD_CALLS) and the parser bound (${HOOK_PARSER_BOUND}s)"
+else
+  bad "#1281: could not read the operands (calls=${HOOK_GUARD_CALLS:-none} bound=${HOOK_PARSER_BOUND:-none}); the ordering below would be vacuous"
+fi
+
+HOOK_AGGREGATE="$(( HOOK_GUARD_CALLS * HOOK_PARSER_BOUND ))"
+
+# Only the registration that actually invokes the parser-calling guard needs the
+# larger bound. label-removal-guard.sh makes no parser calls, so it is checked
+# separately and deliberately left tight -- an unrelated guard should not be
+# licensed to hang for minutes.
+hook_registration_bound() { # file -> timeout for the gh-pr-guard registration
+  node -e '
+    const d = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+    const hooks = d.hooks.PreToolUse.flatMap((g) => g.hooks);
+    const guard = hooks.filter((h) => h.command.includes("gh-pr-guard.sh"));
+    if (guard.length !== 1) { console.error("expected exactly one gh-pr-guard registration"); process.exit(1); }
+    process.stdout.write(String(guard[0].timeout));
+  ' "$1"
+}
+
+for hook_file in .claude/settings.json .codex/hooks.json; do
+  hook_bound="$(hook_registration_bound "$ROOT/$hook_file")" || hook_bound=""
+  if [ -z "$hook_bound" ]; then
+    bad "#1281: $hook_file has no single gh-pr-guard registration to read"
+  elif [ "$hook_bound" -gt "$HOOK_AGGREGATE" ]; then
+    ok "#1281: $hook_file allows ${hook_bound}s > ${HOOK_AGGREGATE}s aggregate, so a parser timeout is observable"
+  else
+    bad "#1281: $hook_file allows only ${hook_bound}s, under the ${HOOK_AGGREGATE}s the guard can spend in the parser -- the 124 path is unreachable from the guard"
+  fi
+done
+
+# The other half: the tight bound on the guard that does NOT call the parser is
+# intentional, not an oversight. Without this, "fix the mismatch" could be read
+# as raising every hook registration.
+for hook_file in .claude/settings.json .codex/hooks.json; do
+  other_bound="$(node -e '
+    const d = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+    const hooks = d.hooks.PreToolUse.flatMap((g) => g.hooks);
+    const other = hooks.filter((h) => h.command.includes("label-removal-guard.sh"));
+    process.stdout.write(other.length === 1 ? String(other[0].timeout) : "");
+  ' "$ROOT/$hook_file")"
+  if [ -n "$other_bound" ] && [ "$other_bound" -lt "$HOOK_AGGREGATE" ]; then
+    ok "#1281: $hook_file keeps the non-parser guard tight at ${other_bound}s"
+  else
+    bad "#1281: $hook_file raised the non-parser guard to ${other_bound:-none}s; only the parser-calling guard needs the larger bound"
+  fi
+done
+
+# And the guard must still source the lib it is being sized against, so the
+# aggregate is computed over a real dependency rather than a stale assumption.
+if grep -q 'scripts/lib/pr-body-contract.sh' "$ROOT/scripts/hooks/gh-pr-guard.sh"; then
+  ok "#1281: gh-pr-guard.sh sources the bounded parser lib the aggregate is derived from"
+else
+  bad "#1281: gh-pr-guard.sh no longer sources pr-body-contract.sh; the hook ordering above is measuring nothing"
+fi
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

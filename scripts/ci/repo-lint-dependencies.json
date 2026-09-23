@@ -28,6 +28,9 @@
       "tests/test_check_doc_ownership.sh"
     ],
     "check_gh_as_author": [
+      ".claude/settings.json",
+      ".codex/hooks.json",
+      "scripts/hooks/gh-pr-guard.sh",
       "scripts/lib/pr-body-contract.mjs",
       "scripts/lib/pr-body-contract.sh",
       "scripts/lib/pr-body-contract.source.mjs",
