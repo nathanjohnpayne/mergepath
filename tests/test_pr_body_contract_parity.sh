@@ -24,7 +24,8 @@ TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
 # later REPLACES this one rather than extending it, which leaked the detector
 # file on every run that reached it.
 TMP_BASE_TREE=""
-trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"' EXIT
+TMP_PROD_STALL=""
+trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"; [ -n "${TMP_PROD_STALL:-}" ] && rm -f "$TMP_PROD_STALL"' EXIT
 
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
@@ -1133,6 +1134,111 @@ fi
 renderer_contract "top-level declarations remain valid after the deep-container case" \
   '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
   $'Authoring-Agent: codex\n\n## Self-Review\n'
+
+# --- 16. production invocations are bounded (#1281) --------------------------
+# The parsing-cost limitation is real and documented, but until now it reached
+# production UNBOUNDED: the three helpers in scripts/lib/pr-body-contract.sh
+# piped into `node` with no watchdog, so a pathological untrusted body did not
+# FAIL this identity gate, it STALLED it for as long as the enclosing job
+# allowed. These controls pin the bound, not the parser's speed.
+#
+# The fixture is the documented pathological list body, and the bound is
+# overridden to 2s so the control itself terminates quickly. What is under test
+# is that the watchdog fires and what it produces when it does -- never how
+# fast the parser is, which is environment-dependent and deliberately not
+# asserted anywhere.
+
+PROD_BOUND_DEFAULT="$(sed -n 's/^PR_BODY_CONTRACT_TIMEOUT_SECONDS=\([0-9]*\)$/\1/p' \
+  "$ROOT/scripts/lib/pr-body-contract.sh")"
+if [ "$PROD_BOUND_DEFAULT" = "120" ]; then
+  ok "#1281: production parser invocations declare a 120s wall-clock bound"
+else
+  bad "#1281: expected a 120s production bound, found [${PROD_BOUND_DEFAULT:-none}]"
+fi
+
+TMP_PROD_STALL="$(mktemp "${TMPDIR:-/tmp}/parity-prod-stall.XXXXXX")"
+PROD_STALL_FIXTURE="$TMP_PROD_STALL"
+node -e 'require("node:fs").writeFileSync(process.argv[1], "- ".repeat(30000) + "x\n\nAuthoring-Agent: codex\n\n## Self-Review\n")' \
+  "$PROD_STALL_FIXTURE"
+
+# All three helpers, because each has a different output contract: two answer on
+# stdout and one answers with its exit status. A watchdog that covered only the
+# stdout pair would leave --has-self-review reading an expiry as a confident
+# "absent".
+#
+# Each call runs under an OUTER watchdog whose bound is far larger than the
+# production bound under test. That is deliberate: without it, a build that
+# LOST the production watchdog would make this control hang until the CI job
+# timeout rather than fail -- reproducing, inside the control, the exact defect
+# the control exists to close. With it, a missing production watchdog shows up
+# as elapsed time well past the 2s override and fails on the elapsed
+# assertion. Verified by mutation: removing pr_body_contract_run's watchdog
+# turns these three into failures rather than a hang.
+prod_timeout_case() { # label, helper
+  local ptc_label="$1" ptc_helper="$2" ptc_out ptc_rc=0 ptc_start ptc_elapsed
+  ptc_start="$(date +%s)"
+  ptc_out="$(printf '' | run_with_timeout 90 bash -c '
+    . "$1/scripts/lib/pr-body-contract.sh"
+    # Set AFTER sourcing: the lib assigns the default unconditionally.
+    PR_BODY_CONTRACT_TIMEOUT_SECONDS=2
+    "$2" "$(cat "$3")"
+  ' bash "$ROOT" "$ptc_helper" "$PROD_STALL_FIXTURE" 2>/dev/null)" || ptc_rc=$?
+  ptc_elapsed="$(( $(date +%s) - ptc_start ))"
+  if [ "$ptc_rc" -ne 124 ]; then
+    bad "#1281: $ptc_label did not report the watchdog status (rc=$ptc_rc after ${ptc_elapsed}s)"
+  elif [ -n "$ptc_out" ]; then
+    # A partial answer must never reach a gate: an empty author is read
+    # downstream as "no same-agent risk" and disables the gate (b) exclusion.
+    bad "#1281: $ptc_label emitted output on expiry: [$ptc_out]"
+  elif [ "$ptc_elapsed" -gt 30 ]; then
+    # 30s sits between the 2s production override and the 90s outer bound, so
+    # only the OUTER watchdog firing can land here.
+    bad "#1281: $ptc_label took ${ptc_elapsed}s against a 2s bound -- the production watchdog is not enforcing"
+  else
+    ok "#1281: $ptc_label terminates on expiry with status 124 and no output (${ptc_elapsed}s)"
+  fi
+}
+
+prod_timeout_case "pr_body_authoring_agent" pr_body_authoring_agent
+prod_timeout_case "pr_body_authoring_agent_count" pr_body_authoring_agent_count
+prod_timeout_case "pr_body_has_self_review" pr_body_has_self_review
+
+# The fail-closed half. pr_body_validate is the one caller that did not test
+# these helpers' status: it fell through to "missing a valid Authoring-Agent",
+# blaming the PR author for an infrastructure failure after emitting a raw
+# `integer expression expected` from the empty capture. It must now refuse, and
+# refuse for the stated reason.
+prod_validate_out="$(printf '' | run_with_timeout 90 bash -c '
+  . "$1/scripts/lib/pr-body-contract.sh"
+  PR_BODY_CONTRACT_TIMEOUT_SECONDS=2
+  pr_body_validate "$(cat "$2")" "$1/.github/review-policy.yml" 2>&1
+' bash "$ROOT" "$PROD_STALL_FIXTURE")" && prod_validate_rc=0 || prod_validate_rc=$?
+
+if [ "$prod_validate_rc" -eq 0 ]; then
+  bad "#1281: pr_body_validate ACCEPTED a body whose parse timed out -- fail-open"
+elif printf '%s' "$prod_validate_out" | grep -q "did not complete"; then
+  ok "#1281: pr_body_validate fails closed on a timed-out parse and names the cause"
+else
+  bad "#1281: pr_body_validate failed closed but misattributed the cause: $prod_validate_out"
+fi
+
+# The other half of that guarantee: the diagnosis must not be the author-blaming
+# one. Without this, rewording the timeout branch back into "missing a valid
+# Authoring-Agent" would still pass the check above.
+if printf '%s' "$prod_validate_out" | grep -q "missing a valid 'Authoring-Agent:' line"; then
+  bad "#1281: pr_body_validate blamed the PR author for a parser timeout"
+else
+  ok "#1281: pr_body_validate does not report a timeout as a missing declaration"
+fi
+
+# And the bound must not have cost the ordinary path: a valid body still
+# resolves through the watchdog exactly as it did before.
+prod_valid_body=$'Authoring-Agent: codex\n\n## Self-Review\nok\n'
+if pr_body_validate "$prod_valid_body" "$ROOT/.github/review-policy.yml" 2>/dev/null; then
+  ok "#1281: a valid body still validates through the bounded invocation path"
+else
+  bad "#1281: the production bound rejected a valid body"
+fi
 
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"

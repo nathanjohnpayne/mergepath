@@ -5,12 +5,71 @@ PR_BODY_CONTRACT_PARSER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pr-body-c
 # shellcheck source=reviewers-helpers.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/reviewers-helpers.sh"
 
+# Wall-clock bound on every production parser invocation (#1281).
+#
+# The parser has pathological cost on some untrusted inputs -- see
+# `specs/pr_body_contract.md` -- and without a bound here such a body does not
+# FAIL this gate, it STALLS it for as long as the enclosing job allows. That is
+# the difference this constant buys: a bounded failure instead of an unbounded
+# wait.
+#
+# 120 seconds. The slowest legitimate parse recorded on any fixture is about 32
+# seconds, for a 30,000-level blockquote near GitHub's 65,536-character body
+# limit, measured on a Node 20.20.2 environment where the same fixture takes
+# about 1.2 seconds locally. 120s is roughly 3.75x that worst observation, so
+# runner-speed variance cannot turn a valid body into a rejected one. It
+# matches the bound the parity suite already uses for the same reason, so there
+# is one number to reason about rather than two.
+#
+# This is a resource bound, NOT a parsing-time guarantee. It says when we stop
+# waiting; it says nothing about how long any parse takes. `pr_body_validate`
+# makes three invocations, so its worst case is three times this bound --
+# bounded, where it was previously unbounded.
+PR_BODY_CONTRACT_TIMEOUT_SECONDS=120
+
+# Node is already the parser runtime, so its synchronous child-process timeout
+# is the portable watchdog: no dependency on GNU `timeout` or macOS-only
+# `gtimeout`, which matters because this file is propagated to consumers whose
+# runners differ. SIGKILL makes expiry non-negotiable.
+#
+# Two properties of the expiry path are load-bearing:
+#
+#   1. rc 124, the conventional timeout status, so callers can tell "the parser
+#      did not finish" from "the parser answered". Every production caller
+#      already tests the helper's status -- `if ! VAR="$(...)"` -- so a timeout
+#      reaches their existing fail-closed guards without changing them.
+#   2. NO stdout. `spawnSync` can return partial output alongside ETIMEDOUT,
+#      and a partial answer must never reach a gate. In particular an empty
+#      author is read downstream as "no same-agent risk", which DISABLES the
+#      authoring-agent exclusion in gate (b) -- fail-open in the one place it
+#      must not be. This is why the production watchdog suppresses stdout on
+#      expiry where `run_with_timeout` in the parity suite does not: the suite
+#      asserts on output, a gate acts on it.
+pr_body_contract_run() { # mode, body -> parser stdout; rc 124 on expiry
+  printf '%s\n' "$2" | node -e '
+    const { readFileSync } = require("node:fs");
+    const { spawnSync } = require("node:child_process");
+    const seconds = Number(process.argv[1]);
+    const command = process.argv.slice(2);
+    const result = spawnSync(command[0], command.slice(1), {
+      input: readFileSync(0), encoding: "utf8", timeout: seconds * 1000, killSignal: "SIGKILL",
+    });
+    if (result.error?.code === "ETIMEDOUT") {
+      if (result.stderr) process.stderr.write(result.stderr);
+      process.exit(124);
+    }
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    process.exit(result.status ?? 1);
+  ' "$PR_BODY_CONTRACT_TIMEOUT_SECONDS" node "$PR_BODY_CONTRACT_PARSER" "$1"
+}
+
 pr_body_authoring_agent() {
-  printf '%s\n' "$1" | node "$PR_BODY_CONTRACT_PARSER" --author
+  pr_body_contract_run --author "$1"
 }
 
 pr_body_authoring_agent_count() {
-  printf '%s\n' "$1" | node "$PR_BODY_CONTRACT_PARSER" --author-count
+  pr_body_contract_run --author-count "$1"
 }
 
 # Derives the allowed AUTHORING agents from `available_reviewers`. There is no
@@ -65,7 +124,7 @@ pr_body_agent_is_allowed() {
 }
 
 pr_body_has_self_review() {
-  printf '%s\n' "$1" | node "$PR_BODY_CONTRACT_PARSER" --has-self-review
+  pr_body_contract_run --has-self-review "$1"
 }
 
 pr_body_validate() {
@@ -75,9 +134,25 @@ pr_body_validate() {
   local author_count
   local failed=0
 
-  author_count="$(pr_body_authoring_agent_count "$body")"
-  author="$(pr_body_authoring_agent "$body")"
-  if [ "$author_count" -eq 0 ]; then
+  local count_rc=0
+  local author_rc=0
+  author_count="$(pr_body_authoring_agent_count "$body")" || count_rc=$?
+  author="$(pr_body_authoring_agent "$body")" || author_rc=$?
+  # Every other caller of these helpers already tests their status; this one
+  # did not, and on a non-zero status fell through to "missing a valid
+  # Authoring-Agent" -- blaming the PR author for an infrastructure failure,
+  # after emitting a raw `[: : integer expression expected` from the empty
+  # capture. It failed closed, but by accident and with the wrong diagnosis.
+  # The branch below is the same infrastructure-versus-author distinction this
+  # function already draws for an unreadable policy file.
+  if [ "$count_rc" -ne 0 ] || [ "$author_rc" -ne 0 ]; then
+    echo "Cannot validate the Authoring-Agent: the PR-body parser did not complete (status ${count_rc}/${author_rc})." >&2
+    if [ "$count_rc" -eq 124 ] || [ "$author_rc" -eq 124 ]; then
+      echo "Status 124 means it exceeded the ${PR_BODY_CONTRACT_TIMEOUT_SECONDS}s wall-clock bound; see the parsing-cost limitation in specs/pr_body_contract.md." >&2
+    fi
+    echo "This is an infrastructure or input-complexity problem, not a missing declaration." >&2
+    failed=1
+  elif [ "$author_count" -eq 0 ]; then
     echo "PR description is missing a valid 'Authoring-Agent:' line (expected one agent identifier)." >&2
     failed=1
   elif [ "$author_count" -ne 1 ]; then
@@ -102,7 +177,14 @@ pr_body_validate() {
     fi
   fi
 
-  if ! pr_body_has_self_review "$body"; then
+  local review_rc=0
+  pr_body_has_self_review "$body" || review_rc=$?
+  # --has-self-review answers with its exit status (0 present, 1 absent), so a
+  # watchdog expiry would otherwise read as a confident "absent".
+  if [ "$review_rc" -eq 124 ]; then
+    echo "Cannot validate the '## Self-Review' section: the PR-body parser exceeded the ${PR_BODY_CONTRACT_TIMEOUT_SECONDS}s wall-clock bound." >&2
+    failed=1
+  elif [ "$review_rc" -ne 0 ]; then
     echo "PR description is missing a '## Self-Review' section." >&2
     failed=1
   fi
