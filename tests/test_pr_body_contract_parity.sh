@@ -1319,6 +1319,77 @@ else
   bad "#1281: gh-pr-guard.sh no longer sources pr-body-contract.sh; the hook ordering above is measuring nothing"
 fi
 
+# --- 18. workflow call sites carry the same bound (#1281) --------------------
+# The 120s watchdog lives in scripts/lib/pr-body-contract.sh, so it only covers
+# callers that go THROUGH that lib. Two workflows do not: reviewer assignment
+# (agent-review.yml) and the weekly audit (pr-audit.yml) both execFileSync the
+# generated parser directly, and both did so unbounded -- so a pathological PR
+# body could stall either workflow past the bound the spec claimed. Found by the
+# Phase 4b CLI reviewer at head 6556215, and it is the same defect class as the
+# hook mismatch in section 17: a bound is only real where every caller honours
+# it.
+#
+# This control ENUMERATES the direct call sites rather than checking the two
+# known ones. A third site added later without a bound fails here; a control
+# naming only these two files would pass while the new site stalled.
+
+WF_BOUND_SECONDS="$(sed -n 's/^PR_BODY_CONTRACT_TIMEOUT_SECONDS=\([0-9]*\)$/\1/p' \
+  "$ROOT/scripts/lib/pr-body-contract.sh")"
+WF_BOUND_MS="$(( WF_BOUND_SECONDS * 1000 ))"
+
+# Every workflow line that passes the generated parser to execFileSync. The
+# match is on the argument form, so a comment mentioning the path does not count
+# and a real invocation cannot hide behind different quoting of the surrounding
+# call.
+wf_sites="$(grep -rlE "'scripts/lib/pr-body-contract\.mjs'," "$ROOT/.github/workflows/" 2>/dev/null | sort)"
+
+if [ -n "$wf_sites" ]; then
+  ok "#1281: found direct parser invocations in $(printf '%s\n' "$wf_sites" | wc -l | tr -d ' ') workflow file(s) to check"
+else
+  bad "#1281: found no direct workflow parser invocations -- the enumeration below is vacuous, or the match shape drifted"
+fi
+
+while IFS= read -r wf; do
+  [ -n "$wf" ] || continue
+  wf_name="${wf#"$ROOT/"}"
+  wf_calls="$(grep -cE "'scripts/lib/pr-body-contract\.mjs'," "$wf")"
+  # One declared bound per file, and it must equal the lib's. Counting the
+  # timeout options rather than just grepping for the constant means a file that
+  # declares the constant but forgets to pass it to a second call still fails.
+  wf_opts="$(grep -cE 'timeout: PR_BODY_PARSE_TIMEOUT_MS' "$wf")"
+  wf_declared="$(sed -n 's/.*PR_BODY_PARSE_TIMEOUT_MS = \([0-9]*\);.*/\1/p' "$wf" | head -1)"
+  if [ -z "$wf_declared" ]; then
+    bad "#1281: $wf_name invokes the parser directly with no declared timeout -- unbounded, the spec's claim does not hold there"
+  elif [ "$wf_declared" -ne "$WF_BOUND_MS" ]; then
+    bad "#1281: $wf_name bounds the parser at ${wf_declared}ms but the lib bounds it at ${WF_BOUND_MS}ms -- the two have drifted"
+  elif [ "$wf_opts" -lt "$wf_calls" ]; then
+    bad "#1281: $wf_name has $wf_calls parser call(s) but passes the timeout to only $wf_opts -- at least one is unbounded"
+  else
+    ok "#1281: $wf_name bounds all $wf_calls parser call(s) at ${wf_declared}ms, matching the lib"
+  fi
+done <<< "$wf_sites"
+
+# The two failure modes differ by design and the difference is load-bearing, so
+# it is pinned rather than left to a reader of the workflow.
+#
+#   pr-audit.yml has NO catch: a timeout throws, the step fails, the weekly
+#   audit fails closed rather than auditing a PR it could not parse.
+#   agent-review.yml catches and yields '', which cannot equal any reviewer, so
+#   ASSIGNMENT falls through to the default. Safe only because assignment is not
+#   a gate -- the same empty value would be fail-open in gate (b).
+if grep -qE 'timeout: PR_BODY_PARSE_TIMEOUT_MS' "$ROOT/.github/workflows/pr-audit.yml" \
+  && ! sed -n '/function parsePrBodyContract/,/^            }/p' "$ROOT/.github/workflows/pr-audit.yml" | grep -q 'catch'; then
+  ok "#1281: pr-audit.yml lets a parser timeout throw, so the audit fails closed"
+else
+  bad "#1281: pr-audit.yml now swallows parser failure; a timed-out parse would be audited as if it had been read"
+fi
+
+if sed -n '/const runParser/,/^            };/p' "$ROOT/.github/workflows/agent-review.yml" | grep -q "return '';"; then
+  ok "#1281: agent-review.yml yields an empty agent on timeout, so assignment falls through to the default"
+else
+  bad "#1281: agent-review.yml no longer degrades to the default reviewer on parser failure"
+fi
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

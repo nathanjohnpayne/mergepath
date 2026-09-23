@@ -30,6 +30,8 @@
     "check_gh_as_author": [
       ".claude/settings.json",
       ".codex/hooks.json",
+      ".github/workflows/agent-review.yml",
+      ".github/workflows/pr-audit.yml",
       "scripts/hooks/gh-pr-guard.sh",
       "scripts/lib/pr-body-contract.mjs",
       "scripts/lib/pr-body-contract.sh",

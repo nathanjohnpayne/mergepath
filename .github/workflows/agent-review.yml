@@ -854,10 +854,26 @@ jobs:
             // fallback eligible. One parser, one answer, everywhere.
             const { execFileSync } = require('child_process');
             const body = pr.body || '';
+            // Bounded to match PR_BODY_CONTRACT_TIMEOUT_SECONDS in
+            // scripts/lib/pr-body-contract.sh (#1281). This call site does not
+            // go through that lib, so it carries the bound itself; the parity
+            // suite asserts the two agree.
+            //
+            // A timeout lands in the catch below and yields '', which for
+            // ASSIGNMENT is the conservative outcome: an empty agent name
+            // cannot equal any reviewer, so assignment falls through to the
+            // default rather than guessing. That is safe HERE and only here --
+            // assignment is not a gate. The same empty value would be
+            // fail-OPEN in gate (b), which is why the shell lib suppresses
+            // output on expiry instead of returning a blank contract.
+            const PR_BODY_PARSE_TIMEOUT_MS = 120000;
             const runParser = (flag) => {
               try {
                 return execFileSync('node', ['scripts/lib/pr-body-contract.mjs', flag],
-                  { input: body, encoding: 'utf8' }).trim();
+                  {
+                    input: body, encoding: 'utf8',
+                    timeout: PR_BODY_PARSE_TIMEOUT_MS, killSignal: 'SIGKILL',
+                  }).trim();
               } catch (e) {
                 console.log(`shared PR-body parser failed for ${flag}: ${e.message}`);
                 return '';
