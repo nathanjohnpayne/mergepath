@@ -48,6 +48,8 @@ Rebuild or verify it from a hub checkout with `node scripts/lib/pr-body-contract
 
 The lock pins every build dependency. The rebuild uses its esbuild metafile to identify bundled packages and embeds each package's version, locked npm source, declared license, and packaged license text in the generated runtime. A generic attribution file is insufficient because consumers receive the standalone runtime.
 
+The generated runtime disables ESLint rules for that artifact and removes micromark's two upstream `no-bitwise` directives. This keeps dependency implementation details and unused upstream lint directives from breaking a consumer's lint run; consumer lint configuration and the readable source remain unchanged. In `--check` mode, the pinned hub-only ESLint dependencies validate the generated output against the recommended JavaScript rules with unused-disable diagnostics treated as errors. Negative controls remove the exemption or restore an upstream directive and must produce lint errors. The hub parser suite runs this rebuild and lint check; consumer suites skip it and install no build or lint dependencies.
+
 ## Regression coverage
 
 `tests/test_pr_body_contract_parity.sh` verifies the stable CLI result and all existing consumers' shared-parser use. Its #1192 corpus covers renderer-confirmed quote-first-block, list-transition, nested-list, comment, code, and malformed-heading outcomes.
