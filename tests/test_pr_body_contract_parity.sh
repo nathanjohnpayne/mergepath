@@ -24,7 +24,8 @@ TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
 # later REPLACES this one rather than extending it, which leaked the detector
 # file on every run that reached it.
 TMP_BASE_TREE=""
-trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"' EXIT
+TMP_PROD_STALL=""
+trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"; [ -n "${TMP_PROD_STALL:-}" ] && rm -f "$TMP_PROD_STALL"' EXIT
 
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
@@ -901,6 +902,520 @@ case "$p4b_fence" in
   *contract*|*Authoring-Agent*) ok "phase-4b rejects a fenced ## Self-Review heading, and says why ($p4b_fence)" ;;
   *) bad "phase-4b rejected the fenced body but not via the contract: $p4b_fence" ;;
 esac
+
+# --- 18. #1192 renderer-membership and comment compatibility corpus ----------
+# These compact cases are representatives of the recorded GitHub renderer
+# corpus. They cover the distinct historical failures that the handwritten
+# container state could not model: a quote's initial indented-code block,
+# list transitions, and nested-list lazy continuation. The comment rows retain
+# established syntax treatment, while the malformed multiline-heading row is
+# deliberately a renderer-grounded rejection.
+renderer_contract() { # label, expected JSON, body
+  local renderer_got
+  renderer_got="$(printf '%s' "$3" | node "$ROOT/scripts/lib/pr-body-contract.mjs" --json)"
+  if [ "$renderer_got" = "$2" ]; then
+    ok "#1192 renderer corpus: $1"
+  else
+    bad "#1192 renderer corpus: $1 -- expected $2, got $renderer_got"
+  fi
+}
+
+renderer_contract "quote first-block code ends before a top-level declaration" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'>     x\nAuthoring-Agent: codex\n'
+renderer_contract "list transition keeps its later declaration in the item" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'-     y\n  text\nAuthoring-Agent: codex\n## Self-Review\n'
+renderer_contract "nested-list continuation keeps its later declaration in the item" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'- x\n  -     y\n  text\nAuthoring-Agent: codex\n## Self-Review\n'
+renderer_contract "inline author comment remains part of a valid declaration" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: co<!-- note -->dex\n## Self-Review\n'
+# A comment INSIDE the heading delimiter is a different case from one after the
+# heading text, and the difference is not cosmetic: `##<!--x--> Self-Review` and
+# `#<!--x--># Self-Review` reduce to `## Self-Review` once comments are removed,
+# but GitHub renders NEITHER as a heading at all -- no `<h2>`, no `<h1>`. The
+# handwritten parser replaced here answered `hasSelfReview: true` for both,
+# letting a line that renders as plain text satisfy the Self-Review gate. This
+# parser answers false, matching the renderer. Codex read that as a regression
+# against the previous parser (finding 4040736899); it is a tightening, and
+# these controls pin it so it cannot be loosened back by accident.
+renderer_contract "a comment inside the heading delimiter does not make a heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'Authoring-Agent: codex\n\n##<!--x--> Self-Review\nok\n'
+renderer_contract "a comment splitting the heading delimiter does not make a heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'Authoring-Agent: codex\n\n#<!--x--># Self-Review\nok\n'
+renderer_contract "inline heading comment remains part of a valid heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n## Self-Review <!-- note -->\n'
+renderer_contract "comment-looking fenced code does not alter later declarations" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'```\n<!-- literal -->\n```\nAuthoring-Agent: codex\n## Self-Review\n'
+renderer_contract "malformed multiline heading comment is not an exact heading" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":false}' \
+  $'Authoring-Agent: codex\n## Self-Review <!-- a\nb -->\n'
+
+# mdast counts CR, CRLF and LF as line boundaries. The raw marker and
+# comment-visible line views must use the same boundary so source positions
+# cannot bind a nested marker to an earlier top-level text node.
+renderer_contract "LF line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "CRLF line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\r\n\r\n## Self-Review\r\n'
+renderer_contract "lone CR line endings retain top-level markers" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\r\r## Self-Review\r'
+renderer_contract "stripping a comment cannot join distinct CR and LF boundaries" \
+  '{"author":"claude","authorCount":1,"hasSelfReview":true}' \
+  $'<!--x\ry-->\nAuthoring-Agent: claude\n## Self-Review\n'
+renderer_contract "mixed comment boundaries preserve duplicate declaration counting" \
+  '{"author":"","authorCount":2,"hasSelfReview":true}' \
+  $'<!--x\ry-->\nAuthoring-Agent: claude\r\nAuthoring-Agent: codex\r## Self-Review'
+renderer_contract "mixed comment boundaries keep quoted declarations nested" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'<!--x\ry-->\n> quote\nAuthoring-Agent: codex\n## Self-Review\n'
+renderer_contract "lone CR lines keep a lazy quoted declaration nested" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'## Self-Review\n\nfoo\rbar\rbaz\n> quote\nAuthoring-Agent: codex'
+renderer_contract "a BOM keeps the existing inline author-comment result" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'\357\273\277<!-- hidden -->\n\nAuthoring-Agent: codex<!-- tail -->\n\n## Self-Review\n'
+renderer_contract "a BOM keeps the existing inline heading-comment result" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'\357\273\277<!-- hidden -->\n\nAuthoring-Agent: codex\n\n## Self-Review<!-- tail -->\n'
+renderer_contract "a BOM does not make a first-line declaration valid" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'\357\273\277Authoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "an ordinary leading comment retains inline author handling" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'<!-- hidden -->\n\nAuthoring-Agent: codex<!-- tail -->\n\n## Self-Review\n'
+renderer_contract "a BOM does not surface fenced comment-looking declarations" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'\357\273\277<!-- hidden -->\n\n```\nAuthoring-Agent: codex<!-- literal -->\n## Self-Review\n```\n'
+renderer_contract "a BOM does not surface raw HTML declarations" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'\357\273\277<!-- hidden -->\n\n<div>\nAuthoring-Agent: codex<!-- literal -->\n## Self-Review\n</div>\n'
+
+# --- GFM footnote definitions are containers (#1281 Phase 4b P0) ------------
+# `[^x]: note` opens a container exactly as a list item does. An unindented,
+# non-interrupting line after it is a genuine CommonMark lazy continuation of
+# the definition's paragraph, so GitHub renders it inside the footnote -- or,
+# with nothing referencing that footnote, does not render it at all. Before
+# footnoteDefinition was in CONTAINERS, such a line read as a live top-level
+# declaration and spoofed author identity. The parser this one replaces has the
+# same hole, so this is a repair rather than a regression fix.
+#
+# Every expectation was verified against GitHub's renderer (POST /markdown).
+# GFM table cells are containers too, and the unpiped form is the one that
+# slipped: `header` / `| --- |` / a marker line puts the declaration in a
+# tableCell, which GitHub renders inside a <td>. The parser being replaced
+# accepts it, so this is a repair rather than a regression (Codex finding
+# 4041000028). The piped form was already rejected, because the marker regex
+# anchors at column one and `| Authoring-Agent:` does not match there -- it is
+# pinned below so the two forms cannot drift apart.
+renderer_contract "#1281: an unpiped table cell declaration is not top level" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'header\n| --- |\nAuthoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "#1281: a piped table cell declaration is not top level either" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'| h |\n| --- |\n| Authoring-Agent: codex |\n\n## Self-Review\n'
+renderer_contract "#1281: a declaration after a table stays top level" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'header\n| --- |\ncell\n\nAuthoring-Agent: codex\n\n## Self-Review\n'
+renderer_contract "#1281: a lazy continuation inside a footnote definition is not a declaration" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'[^x]: note\nAuthoring-Agent: attacker\n\n## Self-Review\nok\n'
+renderer_contract "#1281: a referenced footnote hides a smuggled declaration the same way" \
+  '{"author":"","authorCount":0,"hasSelfReview":true}' \
+  $'see[^x]\n\n[^x]: note\nAuthoring-Agent: attacker\n\n## Self-Review\nok\n'
+renderer_contract "#1281: a numeric-label footnote definition is a container too" \
+  '{"author":"","authorCount":0,"hasSelfReview":false}' \
+  $'[^1]: note\nAuthoring-Agent: codex\n'
+# Negative controls: the repair must not swallow what legitimately follows a
+# footnote. A blank line closes the definition; an ATX heading interrupts it.
+renderer_contract "#1281: a blank line closes the definition and restores top level" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'[^x]: note\n\nAuthoring-Agent: codex\n\n## Self-Review\nok\n'
+renderer_contract "#1281: an interrupting heading detaches the rest of the definition" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'[^x]: note\n## Self-Review\nAuthoring-Agent: codex\n'
+
+# A deep, real Markdown container must not make the AST traversal exhaust the
+# JavaScript call stack. The Authoring-Agent declaration remains inside the
+# blockquote; the blank line leaves the Self-Review heading top-level.
+# 30000 levels rather than 5000: at 5000 a quadratic cost would still have
+# completed quickly, so the shallower control could not have failed (Phase 4b
+# P1). Original local measurements were 96ms at 5000, 191ms at 15000, 1042ms
+# at 30000 and 1256ms at 32760. These are environment-specific observations,
+# not a body-size-derived wall-clock bound: another Node 20.20.2 environment
+# measured about 31–32 seconds at 30000 levels. The 120-second watchdog below
+# bounds this regression test, not production parser invocations.
+DEEP_BLOCKQUOTE=''
+for ((index = 0; index < 30000; index += 1)); do DEEP_BLOCKQUOTE+='> '; done
+
+# The regression-test timeout must be enforced, not merely measured. Timing the parse after
+# the fact only reports how long a run that finished took: a genuine stall
+# would sit here until the enclosing job timeout and never reach the
+# comparison, so the control could not fail in exactly the case it exists to
+# catch (CodeRabbit finding 4039721486). Run it under a real timeout, and
+# otherwise a machine without one reads as green. Node is already the parser
+# runtime, so use its synchronous child-process timeout rather than requiring
+# GNU `timeout` (or macOS-only `gtimeout`). SIGKILL makes expiry non-negotiable.
+run_with_timeout() { # seconds, command...; stdin -> stdout; rc 124 on expiry
+  local rwt_seconds="$1"
+  shift
+  node -e '
+    const { readFileSync } = require("node:fs");
+    const { spawnSync } = require("node:child_process");
+    const seconds = Number(process.argv[1]);
+    const command = process.argv.slice(2);
+    const result = spawnSync(command[0], command.slice(1), {
+      input: readFileSync(0), encoding: "utf8", timeout: seconds * 1000, killSignal: "SIGKILL",
+    });
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (result.error?.code === "ETIMEDOUT") process.exit(124);
+    process.exit(result.status ?? 1);
+  ' "$rwt_seconds" "$@"
+}
+
+parse_with_timeout() { # seconds, body -> stdout; rc 124 on expiry
+  local pwt_seconds="$1" pwt_body="$2"
+  printf '%s' "$pwt_body" \
+    | run_with_timeout "$pwt_seconds" node "$ROOT/scripts/lib/pr-body-contract.mjs" --json 2>/dev/null
+}
+
+if printf '' | run_with_timeout 1 node -e 'setInterval(() => {}, 1000)' >/dev/null 2>&1; then
+  bad "#1281: Node watchdog accepted a nonterminating child"
+elif [ "$?" -eq 124 ]; then
+  ok "#1281: Node watchdog kills a nonterminating child"
+else
+  bad "#1281: Node watchdog did not report timeout exit 124"
+fi
+
+# The bound is 120s, not a tight fit around the measured cost. This suite runs
+# from repo_lint.yml's check_gh_as_author, which does NOT use actions/setup-node
+# (only pr-review-policy.yml pins a version), so it executes on whatever Node
+# the runner provides. The control exists to catch a quadratic regression --
+# which is 180s or never-finishing, not 40s -- so a wide bound loses no
+# discriminating power and cannot flake a required check on a slower runtime or
+# a loaded runner (Codex finding 4040833101). Measured cost of this fixture:
+# 909ms on Node 20.20.2, 1074ms on 22.23.2, 1027ms on 24.21.0.
+DEEP_QUOTE_BODY="${DEEP_BLOCKQUOTE}"$'Authoring-Agent: codex\n\n## Self-Review\n'
+deep_quote_start="$(date +%s)"
+deep_quote_contract="$(parse_with_timeout 120 "$DEEP_QUOTE_BODY")"
+deep_quote_rc=$?
+deep_quote_elapsed="$(( $(date +%s) - deep_quote_start ))"
+if [ "$deep_quote_rc" -eq 124 ]; then
+  bad "#1281: 30000-deep blockquote exceeded the 120s bound -- blockquote nesting is not bounded by body size after all"
+elif [ "$deep_quote_contract" = '{"author":"","authorCount":0,"hasSelfReview":true}' ]; then
+  ok "#1281: a 30000-deep blockquote parses within an enforced 120s bound (${deep_quote_elapsed}s)"
+else
+  bad "#1281: 30000-deep blockquote returned [$deep_quote_contract]"
+fi
+
+# The membership assertion REUSES the guarded parse above rather than launching
+# a second unguarded one. Re-parsing the same 30,000-level body through
+# renderer_contract would run node with no watchdog, so on the very regression
+# the timeout exists to terminate promptly, the suite would hang there until
+# the outer CI timeout -- the guard would have bought nothing (Codex finding
+# 4040736908). The expectation is identical to the renderer-verified one it
+# replaces; only the process launching it is shared.
+if [ "$deep_quote_rc" -eq 0 ] \
+  && [ "$deep_quote_contract" = '{"author":"","authorCount":0,"hasSelfReview":true}' ]; then
+  ok "#1192 renderer corpus: deep blockquote excludes its nested declaration without a stack overflow"
+elif [ "$deep_quote_rc" -eq 0 ]; then
+  bad "#1192 renderer corpus: deep blockquote membership: got [$deep_quote_contract]"
+fi
+renderer_contract "top-level declarations remain valid after the deep-container case" \
+  '{"author":"codex","authorCount":1,"hasSelfReview":true}' \
+  $'Authoring-Agent: codex\n\n## Self-Review\n'
+
+# --- 16. production invocations are bounded (#1281) --------------------------
+# The parsing-cost limitation is real and documented, but until now it reached
+# production UNBOUNDED: the three helpers in scripts/lib/pr-body-contract.sh
+# piped into `node` with no watchdog, so a pathological untrusted body did not
+# FAIL this identity gate, it STALLED it for as long as the enclosing job
+# allowed. These controls pin the bound, not the parser's speed.
+#
+# The fixture is the documented pathological list body, and the bound is
+# overridden to 2s so the control itself terminates quickly. What is under test
+# is that the watchdog fires and what it produces when it does -- never how
+# fast the parser is, which is environment-dependent and deliberately not
+# asserted anywhere.
+
+PROD_BOUND_DEFAULT="$(sed -n 's/^PR_BODY_CONTRACT_TIMEOUT_SECONDS=\([0-9]*\)$/\1/p' \
+  "$ROOT/scripts/lib/pr-body-contract.sh")"
+if [ "$PROD_BOUND_DEFAULT" = "120" ]; then
+  ok "#1281: production parser invocations declare a 120s wall-clock bound"
+else
+  bad "#1281: expected a 120s production bound, found [${PROD_BOUND_DEFAULT:-none}]"
+fi
+
+TMP_PROD_STALL="$(mktemp "${TMPDIR:-/tmp}/parity-prod-stall.XXXXXX")"
+PROD_STALL_FIXTURE="$TMP_PROD_STALL"
+node -e 'require("node:fs").writeFileSync(process.argv[1], "- ".repeat(30000) + "x\n\nAuthoring-Agent: codex\n\n## Self-Review\n")' \
+  "$PROD_STALL_FIXTURE"
+
+# All three helpers, because each has a different output contract: two answer on
+# stdout and one answers with its exit status. A watchdog that covered only the
+# stdout pair would leave --has-self-review reading an expiry as a confident
+# "absent".
+#
+# Each call runs under an OUTER watchdog whose bound is far larger than the
+# production bound under test. That is deliberate: without it, a build that
+# LOST the production watchdog would make this control hang until the CI job
+# timeout rather than fail -- reproducing, inside the control, the exact defect
+# the control exists to close. With it, a missing production watchdog shows up
+# as elapsed time well past the 2s override and fails on the elapsed
+# assertion. Verified by mutation: removing pr_body_contract_run's watchdog
+# turns these three into failures rather than a hang.
+prod_timeout_case() { # label, helper
+  local ptc_label="$1" ptc_helper="$2" ptc_out ptc_rc=0 ptc_start ptc_elapsed
+  ptc_start="$(date +%s)"
+  ptc_out="$(printf '' | run_with_timeout 90 bash -c '
+    . "$1/scripts/lib/pr-body-contract.sh"
+    # Set AFTER sourcing: the lib assigns the default unconditionally.
+    PR_BODY_CONTRACT_TIMEOUT_SECONDS=2
+    "$2" "$(cat "$3")"
+  ' bash "$ROOT" "$ptc_helper" "$PROD_STALL_FIXTURE" 2>/dev/null)" || ptc_rc=$?
+  ptc_elapsed="$(( $(date +%s) - ptc_start ))"
+  if [ "$ptc_rc" -ne 124 ]; then
+    bad "#1281: $ptc_label did not report the watchdog status (rc=$ptc_rc after ${ptc_elapsed}s)"
+  elif [ -n "$ptc_out" ]; then
+    # A partial answer must never reach a gate: an empty author is read
+    # downstream as "no same-agent risk" and disables the gate (b) exclusion.
+    bad "#1281: $ptc_label emitted output on expiry: [$ptc_out]"
+  elif [ "$ptc_elapsed" -gt 30 ]; then
+    # 30s sits between the 2s production override and the 90s outer bound, so
+    # only the OUTER watchdog firing can land here.
+    bad "#1281: $ptc_label took ${ptc_elapsed}s against a 2s bound -- the production watchdog is not enforcing"
+  else
+    ok "#1281: $ptc_label terminates on expiry with status 124 and no output (${ptc_elapsed}s)"
+  fi
+}
+
+prod_timeout_case "pr_body_authoring_agent" pr_body_authoring_agent
+prod_timeout_case "pr_body_authoring_agent_count" pr_body_authoring_agent_count
+prod_timeout_case "pr_body_has_self_review" pr_body_has_self_review
+
+# The fail-closed half. pr_body_validate is the one caller that did not test
+# these helpers' status: it fell through to "missing a valid Authoring-Agent",
+# blaming the PR author for an infrastructure failure after emitting a raw
+# `integer expression expected` from the empty capture. It must now refuse, and
+# refuse for the stated reason.
+prod_validate_out="$(printf '' | run_with_timeout 90 bash -c '
+  . "$1/scripts/lib/pr-body-contract.sh"
+  PR_BODY_CONTRACT_TIMEOUT_SECONDS=2
+  pr_body_validate "$(cat "$2")" "$1/.github/review-policy.yml" 2>&1
+' bash "$ROOT" "$PROD_STALL_FIXTURE")" && prod_validate_rc=0 || prod_validate_rc=$?
+
+if [ "$prod_validate_rc" -eq 0 ]; then
+  bad "#1281: pr_body_validate ACCEPTED a body whose parse timed out -- fail-open"
+elif printf '%s' "$prod_validate_out" | grep -q "did not complete"; then
+  ok "#1281: pr_body_validate fails closed on a timed-out parse and names the cause"
+else
+  bad "#1281: pr_body_validate failed closed but misattributed the cause: $prod_validate_out"
+fi
+
+# The other half of that guarantee: the diagnosis must not be the author-blaming
+# one. Without this, rewording the timeout branch back into "missing a valid
+# Authoring-Agent" would still pass the check above.
+if printf '%s' "$prod_validate_out" | grep -q "missing a valid 'Authoring-Agent:' line"; then
+  bad "#1281: pr_body_validate blamed the PR author for a parser timeout"
+else
+  ok "#1281: pr_body_validate does not report a timeout as a missing declaration"
+fi
+
+# And the bound must not have cost the ordinary path: a valid body still
+# resolves through the watchdog exactly as it did before.
+prod_valid_body=$'Authoring-Agent: codex\n\n## Self-Review\nok\n'
+if pr_body_validate "$prod_valid_body" "$ROOT/.github/review-policy.yml" 2>/dev/null; then
+  ok "#1281: a valid body still validates through the bounded invocation path"
+else
+  bad "#1281: the production bound rejected a valid body"
+fi
+
+# --- 17. the hook timeout must outlast the parser bound (#1281) --------------
+# The production watchdog is only reachable if whatever invokes the guard waits
+# long enough to observe it. It did not: `scripts/hooks/gh-pr-guard.sh` makes
+# TWO sequential parser calls, each now permitted 120s, behind hook
+# registrations that killed the whole process at 10s. The 124 path -- and the
+# fail-closed handling built on it -- was therefore unreachable from the guard,
+# and the mitigation looked complete while not working end to end.
+#
+# The ordering that has to hold is `hook timeout > parser worst-case aggregate`.
+# These controls assert that RELATIONSHIP rather than the literal numbers: a
+# test pinning "timeout == 300" would still pass if the parser bound were later
+# raised to 200, which is exactly the drift that produced this defect. Both
+# operands are read from the files that own them, and the call count is counted
+# in the guard, so adding a third parser call there fails this section instead
+# of silently shrinking the margin.
+
+HOOK_GUARD_CALLS="$(grep -cE '^[[:space:]]*if ! [A-Z_]+=\$\(pr_body_(authoring_agent|authoring_agent_count|has_self_review) ' \
+  "$ROOT/scripts/hooks/gh-pr-guard.sh")"
+HOOK_PARSER_BOUND="$(sed -n 's/^PR_BODY_CONTRACT_TIMEOUT_SECONDS=\([0-9]*\)$/\1/p' \
+  "$ROOT/scripts/lib/pr-body-contract.sh")"
+
+if [ "${HOOK_GUARD_CALLS:-0}" -ge 1 ] && [ -n "$HOOK_PARSER_BOUND" ]; then
+  ok "#1281: read the guard's parser call count ($HOOK_GUARD_CALLS) and the parser bound (${HOOK_PARSER_BOUND}s)"
+else
+  bad "#1281: could not read the operands (calls=${HOOK_GUARD_CALLS:-none} bound=${HOOK_PARSER_BOUND:-none}); the ordering below would be vacuous"
+fi
+
+HOOK_AGGREGATE="$(( HOOK_GUARD_CALLS * HOOK_PARSER_BOUND ))"
+
+# Only the registration that actually invokes the parser-calling guard needs the
+# larger bound. label-removal-guard.sh makes no parser calls, so it is checked
+# separately and deliberately left tight -- an unrelated guard should not be
+# licensed to hang for minutes.
+hook_registration_bound() { # file -> timeout for the gh-pr-guard registration
+  node -e '
+    const d = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+    const hooks = d.hooks.PreToolUse.flatMap((g) => g.hooks);
+    const guard = hooks.filter((h) => h.command.includes("gh-pr-guard.sh"));
+    if (guard.length !== 1) { console.error("expected exactly one gh-pr-guard registration"); process.exit(1); }
+    process.stdout.write(String(guard[0].timeout));
+  ' "$1"
+}
+
+for hook_file in .claude/settings.json .codex/hooks.json; do
+  hook_bound="$(hook_registration_bound "$ROOT/$hook_file")" || hook_bound=""
+  if [ -z "$hook_bound" ]; then
+    bad "#1281: $hook_file has no single gh-pr-guard registration to read"
+  elif [ "$hook_bound" -gt "$HOOK_AGGREGATE" ]; then
+    ok "#1281: $hook_file allows ${hook_bound}s > ${HOOK_AGGREGATE}s aggregate, so a parser timeout is observable"
+  else
+    bad "#1281: $hook_file allows only ${hook_bound}s, under the ${HOOK_AGGREGATE}s the guard can spend in the parser -- the 124 path is unreachable from the guard"
+  fi
+done
+
+# The other half: the tight bound on the guard that does NOT call the parser is
+# intentional, not an oversight. Without this, "fix the mismatch" could be read
+# as raising every hook registration.
+for hook_file in .claude/settings.json .codex/hooks.json; do
+  other_bound="$(node -e '
+    const d = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+    const hooks = d.hooks.PreToolUse.flatMap((g) => g.hooks);
+    const other = hooks.filter((h) => h.command.includes("label-removal-guard.sh"));
+    process.stdout.write(other.length === 1 ? String(other[0].timeout) : "");
+  ' "$ROOT/$hook_file")"
+  if [ -n "$other_bound" ] && [ "$other_bound" -lt "$HOOK_AGGREGATE" ]; then
+    ok "#1281: $hook_file keeps the non-parser guard tight at ${other_bound}s"
+  else
+    bad "#1281: $hook_file raised the non-parser guard to ${other_bound:-none}s; only the parser-calling guard needs the larger bound"
+  fi
+done
+
+# And the guard must still source the lib it is being sized against, so the
+# aggregate is computed over a real dependency rather than a stale assumption.
+if grep -q 'scripts/lib/pr-body-contract.sh' "$ROOT/scripts/hooks/gh-pr-guard.sh"; then
+  ok "#1281: gh-pr-guard.sh sources the bounded parser lib the aggregate is derived from"
+else
+  bad "#1281: gh-pr-guard.sh no longer sources pr-body-contract.sh; the hook ordering above is measuring nothing"
+fi
+
+# --- 18. workflow call sites carry the same bound (#1281) --------------------
+# The 120s watchdog lives in scripts/lib/pr-body-contract.sh, so it only covers
+# callers that go THROUGH that lib. Two workflows do not: reviewer assignment
+# (agent-review.yml) and the weekly audit (pr-audit.yml) both execFileSync the
+# generated parser directly, and both did so unbounded -- so a pathological PR
+# body could stall either workflow past the bound the spec claimed. Found by the
+# Phase 4b CLI reviewer at head 6556215, and it is the same defect class as the
+# hook mismatch in section 17: a bound is only real where every caller honours
+# it.
+#
+# This control ENUMERATES the direct call sites rather than checking the two
+# known ones. A third site added later without a bound fails here; a control
+# naming only these two files would pass while the new site stalled.
+
+WF_BOUND_SECONDS="$(sed -n 's/^PR_BODY_CONTRACT_TIMEOUT_SECONDS=\([0-9]*\)$/\1/p' \
+  "$ROOT/scripts/lib/pr-body-contract.sh")"
+WF_BOUND_MS="$(( WF_BOUND_SECONDS * 1000 ))"
+
+# Every workflow line that passes the generated parser to execFileSync. The
+# match is on the argument form, so a comment mentioning the path does not count
+# and a real invocation cannot hide behind different quoting of the surrounding
+# call.
+wf_sites="$(grep -rlE "'scripts/lib/pr-body-contract\.mjs'," "$ROOT/.github/workflows/" 2>/dev/null | sort)"
+
+if [ -n "$wf_sites" ]; then
+  ok "#1281: found direct parser invocations in $(printf '%s\n' "$wf_sites" | wc -l | tr -d ' ') workflow file(s) to check"
+else
+  bad "#1281: found no direct workflow parser invocations -- the enumeration below is vacuous, or the match shape drifted"
+fi
+
+while IFS= read -r wf; do
+  [ -n "$wf" ] || continue
+  wf_name="${wf#"$ROOT/"}"
+  wf_calls="$(grep -cE "'scripts/lib/pr-body-contract\.mjs'," "$wf")"
+  # One declared bound per file, and it must equal the lib's. Counting the
+  # timeout options rather than just grepping for the constant means a file that
+  # declares the constant but forgets to pass it to a second call still fails.
+  wf_opts="$(grep -cE 'timeout: PR_BODY_PARSE_TIMEOUT_MS' "$wf")"
+  wf_declared="$(sed -n 's/.*PR_BODY_PARSE_TIMEOUT_MS = \([0-9]*\);.*/\1/p' "$wf" | head -1)"
+  if [ -z "$wf_declared" ]; then
+    bad "#1281: $wf_name invokes the parser directly with no declared timeout -- unbounded, the spec's claim does not hold there"
+  elif [ "$wf_declared" -ne "$WF_BOUND_MS" ]; then
+    bad "#1281: $wf_name bounds the parser at ${wf_declared}ms but the lib bounds it at ${WF_BOUND_MS}ms -- the two have drifted"
+  elif [ "$wf_opts" -lt "$wf_calls" ]; then
+    bad "#1281: $wf_name has $wf_calls parser call(s) but passes the timeout to only $wf_opts -- at least one is unbounded"
+  else
+    ok "#1281: $wf_name bounds all $wf_calls parser call(s) at ${wf_declared}ms, matching the lib"
+  fi
+done <<< "$wf_sites"
+
+# The two failure modes differ by design and the difference is load-bearing, so
+# it is pinned rather than left to a reader of the workflow.
+#
+#   pr-audit.yml rethrows timeout errors from its per-PR catch: the step fails
+#   rather than auditing a PR it could not parse.
+#   agent-review.yml catches and yields '', which cannot equal any reviewer, so
+#   ASSIGNMENT falls through to the default. Safe only because assignment is not
+#   a gate -- the same empty value would be fail-open in gate (b).
+if node - "$ROOT/.github/workflows/pr-audit.yml" <<'NODE'
+const fs = require('node:fs');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const start = source.indexOf('              let bodyContract = { author:');
+const end = source.indexOf('\n              // Fetch all reviews for this PR once', start);
+if (start < 0 || end < 0) throw new Error('audit parser caller block not found');
+const caller = new Function('pr', 'isDependabot', 'parsePrBodyContract', 'prViolations',
+  `${source.slice(start, end)}\nreturn { bodyContract, prViolations };`);
+const timeout = Object.assign(new Error('parser timed out'), { code: 'ETIMEDOUT' });
+for (const isDependabot of [false, true]) {
+  try {
+    caller({ body: 'pathological body' }, isDependabot, () => { throw timeout; }, []);
+    throw new Error(`timeout was swallowed for isDependabot=${isDependabot}`);
+  } catch (error) {
+    if (error !== timeout) throw error;
+  }
+}
+const ordinary = caller({ body: 'invalid body' }, false,
+  () => { throw new Error('ordinary parser failure'); }, []);
+if (ordinary.prViolations[0] !== 'Could not parse PR body contract') {
+  throw new Error('ordinary parser-error fallback changed');
+}
+const validContract = { author: 'codex', authorCount: 1, hasSelfReview: true };
+const valid = caller({ body: 'valid body' }, false, () => validContract, []);
+if (valid.bodyContract !== validContract || valid.prViolations.length !== 0) {
+  throw new Error('successful parser result changed');
+}
+NODE
+then
+  ok "#1281: pr-audit.yml propagates parser timeouts through the actual caller while retaining ordinary fallback"
+else
+  bad "#1281: pr-audit.yml swallowed a timeout or changed the ordinary parser result"
+fi
+
+if sed -n '/const runParser/,/^            };/p' "$ROOT/.github/workflows/agent-review.yml" | grep -q "return '';"; then
+  ok "#1281: agent-review.yml yields an empty agent on timeout, so assignment falls through to the default"
+else
+  bad "#1281: agent-review.yml no longer degrades to the default reviewer on parser failure"
+fi
 
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"

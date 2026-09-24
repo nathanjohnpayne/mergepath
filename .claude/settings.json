@@ -12,7 +12,7 @@
           {
             "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/hooks/gh-pr-guard.sh\"",
-            "timeout": 10
+            "timeout": 300
           },
           {
             "type": "command",

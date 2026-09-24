@@ -1,0 +1,11 @@
+{
+  "name": "mergepath-pr-body-contract-bundle",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "esbuild": "0.25.10",
+    "mdast-util-from-markdown": "2.0.3",
+    "mdast-util-gfm": "3.1.0",
+    "micromark-extension-gfm": "3.0.0"
+  }
+}
