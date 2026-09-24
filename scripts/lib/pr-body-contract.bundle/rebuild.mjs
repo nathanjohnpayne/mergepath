@@ -93,7 +93,7 @@ function build(tempDir) {
   copyFileSync(packagePath, join(tempDir, 'package.json'));
   copyFileSync(lockPath, join(tempDir, 'package-lock.json'));
   copyFileSync(sourcePath, join(tempDir, 'input.mjs'));
-  execFileSync('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], {
+  execFileSync('npm', ['ci', '--include=dev', '--ignore-scripts', '--no-audit', '--no-fund'], {
     cwd: tempDir,
     stdio: 'inherit',
   });
@@ -133,9 +133,79 @@ function build(tempDir) {
   return output;
 }
 
+function lintOutput(tempDir, output, label, expectedDiagnostics = null) {
+  const candidate = join(tempDir, `lint-${label}.mjs`);
+  const config = join(tempDir, `lint-${label}.config.mjs`);
+  writeFileSync(candidate, output);
+  writeFileSync(config, `import js from '@eslint/js';
+export default [{ ...js.configs.recommended, files: ['**/lint-${label}.mjs'],
+  languageOptions: { globals: { process: 'readonly', TextDecoder: 'readonly' } },
+  linterOptions: { reportUnusedDisableDirectives: 'error' } }];
+`);
+  let failure;
+  try {
+    execFileSync(join(tempDir, 'node_modules', '.bin', 'eslint'), [
+      '--config', `lint-${label}.config.mjs`, '--format', 'json', '--max-warnings', '0',
+      `lint-${label}.mjs`,
+    ], { cwd: tempDir, stdio: 'pipe' });
+  } catch (error) {
+    failure = error;
+  }
+  if (expectedDiagnostics) {
+    if (!failure) throw new Error(`${label}: ESLint unexpectedly passed`);
+    const detail = [failure.stdout, failure.stderr]
+      .filter(Boolean).map((value) => value.toString()).join('\n');
+    if (failure.status !== 1) {
+      throw new Error(`${label}: ESLint did not report a lint failure (exit ${failure.status ?? 'unknown'})\n${detail}`);
+    }
+    let messages;
+    try {
+      messages = JSON.parse(failure.stdout.toString()).flatMap((result) => result.messages);
+    } catch {
+      throw new Error(`${label}: ESLint returned unreadable diagnostics\n${detail}`);
+    }
+    for (const expected of expectedDiagnostics) {
+      if (!messages.some((message) => expected(message))) {
+        throw new Error(`${label}: ESLint omitted an expected regression diagnostic\n${detail}`);
+      }
+    }
+    return;
+  }
+  if (failure) {
+    const error = failure;
+    const detail = [error.stdout, error.stderr]
+      .filter(Boolean).map((value) => value.toString()).join('\n');
+    throw new Error(`${label}: generated runtime fails representative consumer ESLint\n${detail}`);
+  }
+}
+
+function verifyLintRegression(tempDir, output) {
+  // This is deliberately a real ESLint run against the actual generated
+  // runtime. The global exemption is required because a dependency bundle is
+  // not readable application source, while reportUnusedDisableDirectives
+  // ensures it cannot become a stale blanket suppression.
+  lintOutput(tempDir, output, 'runtime');
+  const exemption = '/* eslint-disable -- Generated dependency bundle; lint the readable source instead. */\n';
+  if (!output.includes(exemption)) throw new Error('generated runtime lost its lint exemption');
+  const withoutExemption = output.replace(exemption, '');
+  lintOutput(tempDir, withoutExemption, 'without-exemption', [
+    (message) => message.ruleId === 'no-unused-vars',
+    (message) => message.ruleId === 'no-empty',
+  ]);
+  const pragmaSite = `code2 > 64975 && code2 < 65008 ||
+    (code2 & 65535) === 65535 || (code2 & 65535) === 65534 ||`;
+  const withUpstreamPragmas = output.replace(pragmaSite, `code2 > 64975 && code2 < 65008 || /* eslint-disable no-bitwise */
+    (code2 & 65535) === 65535 || (code2 & 65535) === 65534 || /* eslint-enable no-bitwise */`);
+  if (withUpstreamPragmas === output) throw new Error('generated runtime lost the upstream pragma regression site');
+  lintOutput(tempDir, withUpstreamPragmas, 'upstream-pragma', [
+    (message) => message.ruleId === null && message.message.includes('Unused eslint-disable directive'),
+  ]);
+}
+
 const tempDir = mkdtempSync(join(tmpdir(), 'mergepath-pr-body-contract-'));
 try {
   const output = build(tempDir);
+  if (mode === '--check') verifyLintRegression(tempDir, output);
   if (mode === '--write') {
     writeFileSync(runtimePath, output);
     process.stdout.write(`wrote ${runtimePath} (${Buffer.byteLength(output)} bytes)\n`);

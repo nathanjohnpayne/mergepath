@@ -1417,6 +1417,37 @@ else
   bad "#1281: agent-review.yml no longer degrades to the default reviewer on parser failure"
 fi
 
+# --- 19. generated-runtime lint regression is hub-only (#1307) --------------
+# Consumers receive the runtime, never the generator inputs or its test-only
+# dependencies. The hub marker therefore gates the real rebuild --check; a
+# missing input on Mergepath is a failure, while consumer checkouts do no npm
+# installation at all.
+if [ -f "$ROOT/scripts/sync-to-downstream.sh" ]; then
+  bundle_inputs=(
+    scripts/lib/pr-body-contract.bundle/package.json
+    scripts/lib/pr-body-contract.bundle/package-lock.json
+    scripts/lib/pr-body-contract.bundle/rebuild.mjs
+    scripts/lib/pr-body-contract.source.mjs
+    scripts/lib/pr-body-contract.mjs
+  )
+  missing_bundle_input=""
+  for bundle_input in "${bundle_inputs[@]}"; do
+    if [ ! -f "$ROOT/$bundle_input" ]; then
+      missing_bundle_input="$bundle_input"
+      break
+    fi
+  done
+  if [ -n "$missing_bundle_input" ]; then
+    bad "#1307: hub bundle-lint regression input is missing: $missing_bundle_input"
+  elif node "$ROOT/scripts/lib/pr-body-contract.bundle/rebuild.mjs" --check; then
+    ok "#1307: generated runtime passes representative consumer ESLint and both lint-regression controls"
+  else
+    bad "#1307: generated runtime lint regression check failed"
+  fi
+else
+  ok "#1307: generated-runtime lint regression skipped on consumer checkout (hub build inputs are intentionally absent)"
+fi
+
 echo
 echo "test_pr_body_contract_parity: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
