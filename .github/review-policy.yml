@@ -900,7 +900,7 @@ phase_4b_automation:
   # Declarative cap for callers that loop this one-review-round helper after
   # CHANGES_REQUESTED. The reference orchestrator performs one adapter pass per
   # invocation and does not persist round state.
-  max_review_rounds: 2
+  max_review_rounds: 20
 
   # Fail closed: an ambiguous / non-schema-conformant adapter verdict must
   # NEVER become an APPROVED. The orchestrator falls back to the manual
