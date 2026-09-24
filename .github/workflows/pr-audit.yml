@@ -66,9 +66,9 @@ jobs:
             // Bounded to match PR_BODY_CONTRACT_TIMEOUT_SECONDS in
             // scripts/lib/pr-body-contract.sh (#1281). This call site does not
             // go through that lib, so it carries the bound itself; the parity
-            // suite asserts the two agree. Deliberately NOT caught: a timeout
-            // throws, the github-script step fails, and the weekly audit fails
-            // closed rather than auditing a PR it could not parse.
+            // suite asserts the two agree. The per-PR catch below rethrows a
+            // timeout so the github-script step fails rather than auditing a
+            // PR whose body it could not parse.
             const PR_BODY_PARSE_TIMEOUT_MS = 120000;
 
             function parsePrBodyContract(body) {
@@ -199,6 +199,10 @@ jobs:
               try {
                 bodyContract = parsePrBodyContract(pr.body);
               } catch (e) {
+                // An execFileSync timeout is a resource-bound failure, not a
+                // body-contract violation. Keep it visible as a failed audit;
+                // the fallback below is only for ordinary parser errors.
+                if (e?.code === 'ETIMEDOUT') throw e;
                 if (!isDependabot) {
                   prViolations.push('Could not parse PR body contract');
                 }

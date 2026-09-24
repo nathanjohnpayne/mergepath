@@ -1372,16 +1372,43 @@ done <<< "$wf_sites"
 # The two failure modes differ by design and the difference is load-bearing, so
 # it is pinned rather than left to a reader of the workflow.
 #
-#   pr-audit.yml has NO catch: a timeout throws, the step fails, the weekly
-#   audit fails closed rather than auditing a PR it could not parse.
+#   pr-audit.yml rethrows timeout errors from its per-PR catch: the step fails
+#   rather than auditing a PR it could not parse.
 #   agent-review.yml catches and yields '', which cannot equal any reviewer, so
 #   ASSIGNMENT falls through to the default. Safe only because assignment is not
 #   a gate -- the same empty value would be fail-open in gate (b).
-if grep -qE 'timeout: PR_BODY_PARSE_TIMEOUT_MS' "$ROOT/.github/workflows/pr-audit.yml" \
-  && ! sed -n '/function parsePrBodyContract/,/^            }/p' "$ROOT/.github/workflows/pr-audit.yml" | grep -q 'catch'; then
-  ok "#1281: pr-audit.yml lets a parser timeout throw, so the audit fails closed"
+if node - "$ROOT/.github/workflows/pr-audit.yml" <<'NODE'
+const fs = require('node:fs');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const start = source.indexOf('              let bodyContract = { author:');
+const end = source.indexOf('\n              // Fetch all reviews for this PR once', start);
+if (start < 0 || end < 0) throw new Error('audit parser caller block not found');
+const caller = new Function('pr', 'isDependabot', 'parsePrBodyContract', 'prViolations',
+  `${source.slice(start, end)}\nreturn { bodyContract, prViolations };`);
+const timeout = Object.assign(new Error('parser timed out'), { code: 'ETIMEDOUT' });
+for (const isDependabot of [false, true]) {
+  try {
+    caller({ body: 'pathological body' }, isDependabot, () => { throw timeout; }, []);
+    throw new Error(`timeout was swallowed for isDependabot=${isDependabot}`);
+  } catch (error) {
+    if (error !== timeout) throw error;
+  }
+}
+const ordinary = caller({ body: 'invalid body' }, false,
+  () => { throw new Error('ordinary parser failure'); }, []);
+if (ordinary.prViolations[0] !== 'Could not parse PR body contract') {
+  throw new Error('ordinary parser-error fallback changed');
+}
+const validContract = { author: 'codex', authorCount: 1, hasSelfReview: true };
+const valid = caller({ body: 'valid body' }, false, () => validContract, []);
+if (valid.bodyContract !== validContract || valid.prViolations.length !== 0) {
+  throw new Error('successful parser result changed');
+}
+NODE
+then
+  ok "#1281: pr-audit.yml propagates parser timeouts through the actual caller while retaining ordinary fallback"
 else
-  bad "#1281: pr-audit.yml now swallows parser failure; a timed-out parse would be audited as if it had been read"
+  bad "#1281: pr-audit.yml swallowed a timeout or changed the ordinary parser result"
 fi
 
 if sed -n '/const runParser/,/^            };/p' "$ROOT/.github/workflows/agent-review.yml" | grep -q "return '';"; then
