@@ -153,6 +153,88 @@ filtered=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
 echo "$filtered" | grep -q "scripts/keep-in-sync.sh" \
   && fail "--paths filter should have excluded scripts/keep-in-sync.sh"
 
+# Explicit selectors must be valid. A short consumer name and its owner/name
+# repository are interchangeable, while a typo must fail before audit reads a
+# consumer tree. An explicit path filter must select at least one managed path
+# for every selected consumer rather than silently reporting an empty audit.
+owner_selector_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos x/clean-consumer 2>&1)
+echo "$owner_selector_out" | grep -q '^clean-consumer (x/clean-consumer)' \
+  || fail "owner/name --repos selector did not select clean-consumer: $owner_selector_out"
+echo "$owner_selector_out" | grep -q '^drifted' \
+  && fail "owner/name --repos selector leaked a non-selected consumer: $owner_selector_out"
+
+set +e
+unknown_repos_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos clean-consumer,not-a-consumer 2>&1)
+unknown_repos_ec=$?
+empty_path_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos clean-consumer --paths 'not-managed/**' 2>&1)
+empty_path_ec=$?
+set -e
+[[ "$unknown_repos_ec" -eq 2 ]] \
+  || fail "unknown audit --repos selector should exit 2; got $unknown_repos_ec ($unknown_repos_out)"
+echo "$unknown_repos_out" | grep -q 'not-a-consumer' \
+  || fail "unknown audit --repos diagnostic omitted unmatched selector: $unknown_repos_out"
+echo "$unknown_repos_out" | grep -q 'clean-consumer (x/clean-consumer)' \
+  || fail "unknown audit --repos diagnostic omitted valid consumers: $unknown_repos_out"
+[[ "$empty_path_ec" -eq 2 ]] \
+  || fail "empty audit --paths selection should exit 2; got $empty_path_ec ($empty_path_out)"
+echo "$empty_path_out" | grep -q 'selects no managed path for clean-consumer' \
+  || fail "empty audit --paths diagnostic was unclear: $empty_path_out"
+
+# read -a would silently discard an empty trailing field and everything after a
+# newline. Reject both malformed selector lists before the audit driver starts.
+set +e
+trailing_selector_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos 'clean-consumer,' 2>&1)
+trailing_selector_ec=$?
+multiline_selector_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos $'clean-consumer\nnot-a-consumer' 2>&1)
+multiline_selector_ec=$?
+set -e
+for selector_ec in "$trailing_selector_ec" "$multiline_selector_ec"; do
+  [[ "$selector_ec" -eq 2 ]] \
+    || fail "malformed --repos list should exit 2; got $selector_ec"
+done
+for selector_out in "$trailing_selector_out" "$multiline_selector_out"; do
+  echo "$selector_out" | grep -q 'invalid --repos list' \
+    || fail "malformed --repos diagnostic was unclear: $selector_out"
+  echo "$selector_out" | grep -q '^clean-consumer (' \
+    && fail "audit driver started after malformed --repos input: $selector_out"
+done
+
+# Filter validation is pre-mutation only if it fails closed on its own manifest
+# reads. Make just the validation consumer query fail: the audit driver must
+# not run and turn that missing selection into a successful empty report.
+validation_yq_bin="$WORKDIR/validation-yq-bin"
+mkdir -p "$validation_yq_bin"
+validation_real_yq=$(command -v yq)
+cat >"$validation_yq_bin/yq" <<'YQSTUB'
+#!/usr/bin/env bash
+if [ "${MERGEPATH_TEST_YQ_FAILURE:-}" = "validation-consumers" ] \
+  && [[ "$*" == *'.consumers[]'* ]]; then
+  exit 73
+fi
+exec "$MERGEPATH_TEST_REAL_YQ" "$@"
+YQSTUB
+chmod +x "$validation_yq_bin/yq"
+set +e
+validation_yq_out=$(PATH="$validation_yq_bin:$PATH" \
+  MERGEPATH_TEST_YQ_FAILURE=validation-consumers \
+  MERGEPATH_TEST_REAL_YQ="$validation_real_yq" \
+  MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos clean-consumer \
+    --paths 'not-managed/**' 2>&1)
+validation_yq_ec=$?
+set -e
+[[ "$validation_yq_ec" -eq 2 ]] \
+  || fail "failed validation consumer read should exit 2; got $validation_yq_ec ($validation_yq_out)"
+echo "$validation_yq_out" | grep -q 'could not read manifest consumers while validating filters' \
+  || fail "failed validation consumer read lacked a clear diagnostic: $validation_yq_out"
+echo "$validation_yq_out" | grep -q '^clean-consumer (' \
+  && fail "audit driver started after validation consumer read failed: $validation_yq_out"
+
 # Audit honors .sync-overrides.yml on templated dest paths (#336).
 audit_override_workdir="$WORKDIR/audit-overrides"
 AO_MP="$audit_override_workdir/mergepath"
@@ -483,6 +565,36 @@ echo "$sync_out" | grep -q "+ scripts/hooks/the-hook.sh" \
   || fail "--paths filter excluded the requested path"
 echo "$sync_out" | grep -q "+ scripts/coderabbit-wait.sh" \
   && fail "--paths filter did not exclude scripts/coderabbit-wait.sh"
+
+# Commit and sync-all modes use the same preflight: both reject invalid
+# consumer selectors and empty path selections before planning delivery.
+set +e
+sync_unknown_repos_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" \
+  "$SCRIPT" "$sha_B" --dry-run --repos beta,no-such-consumer 2>&1)
+sync_unknown_repos_ec=$?
+sync_empty_path_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" \
+  "$SCRIPT" "$sha_B" --dry-run --repos beta --paths 'not-managed/**' 2>&1)
+sync_empty_path_ec=$?
+syncall_unknown_repos_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" \
+  "$SCRIPT" --sync-all --dry-run --repos beta,no-such-consumer 2>&1)
+syncall_unknown_repos_ec=$?
+syncall_empty_path_out=$(MERGEPATH_ROOT_OVERRIDE="$SYNC_MP" \
+  "$SCRIPT" --sync-all --dry-run --repos beta --paths 'not-managed/**' 2>&1)
+syncall_empty_path_ec=$?
+set -e
+for filter_ec in "$sync_unknown_repos_ec" "$sync_empty_path_ec" \
+                 "$syncall_unknown_repos_ec" "$syncall_empty_path_ec"; do
+  [[ "$filter_ec" -eq 2 ]] \
+    || fail "invalid delivery filter should exit 2; got $filter_ec"
+done
+echo "$sync_unknown_repos_out" | grep -q 'no-such-consumer' \
+  || fail "commit sync invalid --repos diagnostic omitted selector: $sync_unknown_repos_out"
+echo "$syncall_unknown_repos_out" | grep -q 'valid consumers:' \
+  || fail "sync-all invalid --repos diagnostic omitted valid consumers: $syncall_unknown_repos_out"
+echo "$sync_empty_path_out" | grep -q 'selects no managed path for beta' \
+  || fail "commit sync empty --paths diagnostic was unclear: $sync_empty_path_out"
+echo "$syncall_empty_path_out" | grep -q 'selects no managed path for beta' \
+  || fail "sync-all empty --paths diagnostic was unclear: $syncall_empty_path_out"
 
 # 4) Commit that only touches kit + templated → no canonical targets,
 #    summary marks each consumer as ⊘ (skipped, deferred-only).
