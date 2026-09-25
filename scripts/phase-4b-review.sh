@@ -551,6 +551,10 @@ hold_for_external_review() {
 # barrier's CodeRabbit arm classified `rate-limited` and it opened anyway on a
 # head-pinned Codex report. Read only by the review-body renderer below.
 BARRIER_CODERABBIT_RATE_LIMITED=false
+# A barrier whose CodeRabbit arm CARRIED an earlier head's review forward
+# (#1335): "<source-commit> <fingerprint>" when set, empty otherwise. Read only
+# by the review-body renderer below.
+BARRIER_CODERABBIT_CARRIED=""
 
 # Run the same-head barrier and act on it. Escalation routes to the existing
 # manual handoff; only the non-terminal case takes the new hold path.
@@ -574,6 +578,12 @@ run_same_head_barrier() {
       if [ "$(printf '%s' "$out" | jq -r '.coderabbit // empty' 2>/dev/null || true)" = "rate-limited" ]; then
         BARRIER_CODERABBIT_RATE_LIMITED=true
         p4b_warn "CodeRabbit refused $HEAD as rate limited and cannot be re-asked; the barrier opened on Codex's head-pinned report alone, so this review is ordered against Codex only"
+      fi
+      # #1335: the other shape that opens without CodeRabbit speaking on this
+      # exact head. Narrated for the same two readers, for the same reason.
+      if [ "$(printf '%s' "$out" | jq -r '.coderabbit // empty' 2>/dev/null || true)" = "carried" ]; then
+        BARRIER_CODERABBIT_CARRIED="$(printf '%s' "$out" | jq -r '[.coderabbit_carryforward.source_commit // "unknown", .coderabbit_carryforward.fingerprint // "unknown"] | join(" ")' 2>/dev/null || printf 'unknown unknown')"
+        p4b_warn "CodeRabbit did not re-review $HEAD (it does not review merge commits); its review of ${BARRIER_CODERABBIT_CARRIED%% *} carries forward because the external-review fingerprint is unchanged (${BARRIER_CODERABBIT_CARRIED#* })"
       fi
       return 0
       ;;
@@ -1107,6 +1117,11 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
   # this review than it supports.
   if [ "$BARRIER_CODERABBIT_RATE_LIMITED" = true ]; then
     printf -- '- Provider ordering: CodeRabbit was **rate limited** on this head and could not be re-asked, so the same-head barrier opened on Codex'"'"'s head-pinned report alone (#1178)\n'
+  fi
+  # #1335: likewise for a CodeRabbit review carried from identical content.
+  if [ -n "$BARRIER_CODERABBIT_CARRIED" ]; then
+    printf -- '- Provider ordering: CodeRabbit did not re-review this head (a base-only update); its review of `%s` carries forward because the external-review fingerprint is unchanged (`%s`) (#1335)\n' \
+      "${BARRIER_CODERABBIT_CARRIED%% *}" "${BARRIER_CODERABBIT_CARRIED#* }"
   fi
   if [ "$FINDINGS_COUNT" -gt 0 ]; then
     printf '\n### Findings\n\n'

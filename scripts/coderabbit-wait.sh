@@ -3371,6 +3371,11 @@ PROBE_JSON=null
 # the previous run's success while the new summary is pending.
 PROBE_CONTEXT_STATE=""
 PROBE_CONTEXT_UPDATED_AT=""
+# Same-content carry-forward EVIDENCE (#1335), set only by the probe's
+# no-review-object summary branch via crw_probe_carryforward_evidence; `null`
+# everywhere else. It is evidence, never a verdict: it changes no exit code and
+# no `observed` value, and the Phase 4b barrier alone decides what it is worth.
+PROBE_CARRYFORWARD_JSON=null
 # #489 rate-limit→Codex failover state. CODEX_FAILOVER_FIRED latches after the
 # first attempt so retries within a run don't re-post. CODEX_FAILOVER_REQUESTED
 # records whether Codex was actually engaged (the helper posted, or found an
@@ -3489,13 +3494,17 @@ emit_json_and_exit() {
   # context_updated_at carry the per-SHA StatusContext (state + refresh
   # time) sampled by the rc-7 review-object branch (#869) and are null on
   # every other path.
+  # `carryforward` (#1335) is null except on the rc-7 no-review-object paths
+  # where crw_probe_carryforward_evidence found a completed prior-head summary.
   if [ "$PROBE_MODE" = "true" ]; then
     PROBE_JSON=$(jq -nc --arg observed "${PROBE_OBSERVED:-terminal}" \
       --arg ctx "${PROBE_CONTEXT_STATE:-}" \
       --arg ctxat "${PROBE_CONTEXT_UPDATED_AT:-}" \
+      --argjson carry "${PROBE_CARRYFORWARD_JSON:-null}" \
       '{mode: true, observed: $observed,
         context_state: (if $ctx == "" then null else $ctx end),
-        context_updated_at: (if $ctxat == "" then null else $ctxat end)}')
+        context_updated_at: (if $ctxat == "" then null else $ctxat end),
+        carryforward: $carry}')
   fi
 
   jq -n \
@@ -4063,6 +4072,89 @@ crw_probe_head_review_in_progress() {
   return 0
 }
 
+# Same-content carry-forward evidence (#1335). <summary-body>
+#
+# A base-only update head — a merge from the base branch that changes none of
+# the PR's own files — is a head CodeRabbit will never report on. Its
+# auto-review runs and publishes `success | Review completed` on the head, but
+# merge commits are not reviewed, so no review object is posted and the
+# summary's range keeps naming the last CONTENT head. An explicit
+# `@coderabbitai review` is answered "Already reviewed the last commit" and
+# still produces nothing — which breaks the self-heal the design note below
+# relies on ("an explicit request always produces a review object"). Measured
+# on #1318, heads a76fa31 and d1682c9: the barrier waited out its whole budget
+# on both and fell back to the manual handoff.
+#
+# What the probe CAN say is which commit CodeRabbit last reviewed, and it says
+# it as EVIDENCE only: this helper changes no exit code and no `observed`
+# value, so every existing consumer reads exactly what it read before. Whether
+# the evidence is worth anything is a CONTENT question — is the reviewed
+# commit's PR content identical to this head's? — that the probe has no
+# business answering. The Phase 4b barrier answers it with the #705
+# external-review fingerprint (p4b_barrier_coderabbit_carryforward).
+#
+# Emitted only when the summary is itself a report CodeRabbit finished, in
+# the same terms the #851 head-pinned branch demands of it, minus the head:
+#   class review + stanzas all benign   not a pause/limit/in-progress/failure
+#                                       body, and nothing CodeRabbit has not
+#                                       shipped yet
+#   exactly ONE distinct range end      two ends is a body we cannot attribute
+#   that end is not this head           this head is the #851 branch's job
+#   no summary-only blocking marker     a #535 finding on the reviewed content
+#                                       must reach a human; carrying past it
+#                                       would skip the one reader it has
+#   the risk block, if present, agrees  a body that names two heads is not
+#                                       evidence for either
+# Every reader failure along the way (rc 3 from the fence reader, rc 2 from
+# the marker classifier) emits NOTHING, which leaves the barrier on its
+# ordinary bounded wait — the direction this evidence may never weaken.
+#
+# The per-SHA StatusContext on THIS head rides along, trust-gated like every
+# other status read here (null when the policy opts out, which the barrier
+# reads as no carry). It is what says CodeRabbit has seen this head and
+# finished with it, so a run still underway — which could yet publish a
+# finding — never carries.
+crw_probe_carryforward_evidence() {
+  local body=$1 unfenced ends end marker_rc=0 risk_rc=0 ctx_record state desc permits
+  PROBE_CARRYFORWARD_JSON=null
+  [ "$(classify_comment "$body")" = "review" ] || return 0
+  summary_stanzas_all_benign "$body" || return 0
+  unfenced=$(crw_unfenced_body "$body") || return 0
+  # The same shape summary_names_head reads — 40-hex on both ends, the END is
+  # the reviewed commit — so the two cannot disagree about what a range is.
+  ends=$(grep -oiE "between [0-9a-f]{40} and [0-9a-f]{40}([^0-9a-fA-F]|\$)" <<<"$unfenced" \
+    | sed -E 's/^between [0-9a-fA-F]{40} and ([0-9a-fA-F]{40}).*$/\1/' \
+    | tr '[:upper:]' '[:lower:]' | LC_ALL=C sort -u) || return 0
+  [ -n "$ends" ] || return 0
+  [ "$(printf '%s\n' "$ends" | wc -l | tr -d ' ')" = 1 ] || return 0
+  end=$ends
+  [ "$end" != "$(printf '%s' "$HEAD_SHA" | tr '[:upper:]' '[:lower:]')" ] || return 0
+  summary_blocking_marker_present "$body" || marker_rc=$?
+  [ "$marker_rc" = 1 ] || return 0
+  crw_summary_risk_names_other_head "$body" "$end" || risk_rc=$?
+  [ "$risk_rc" = 1 ] || return 0
+
+  state=""; desc=""; permits=false
+  local updated_at=""
+  if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
+    ctx_record=$(check_status_context_record) || ctx_record=""
+    state=$(crw_status_record_state "$ctx_record")
+    desc=$(printf '%s' "$ctx_record" | jq -r '.description // ""' 2>/dev/null || printf '')
+    updated_at=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""' 2>/dev/null || printf '')
+    if crw_status_description_permits_clearance "$desc"; then permits=true; fi
+  fi
+  PROBE_CARRYFORWARD_JSON=$(jq -nc --arg reviewed "$end" --arg st "$state" \
+    --arg d "$desc" --arg at "$updated_at" --argjson p "$permits" '
+    {reviewed_head: $reviewed,
+     head_context_state: (if $st == "" then null else $st end),
+     head_context_description: (if $st == "" then null else $d end),
+     head_context_updated_at: (if $at == "" then null else $at end),
+     head_context_permits_clearance: (if $st == "" then null else $p end)}') \
+    || PROBE_CARRYFORWARD_JSON=null
+  log "probe: summary last reviewed $end, not $HEAD_SHA; surfacing it as same-content carry-forward evidence (head context_state=${state:-unsampled}) (#1335)"
+  return 0
+}
+
 # --- probe verdict (#814) ---------------------------------------------------
 #
 # Probe mode answers ONE question and never enters the poll loop:
@@ -4530,6 +4622,10 @@ probe_emit_verdict() {
       log "probe: CodeRabbit reported on $HEAD_SHA via a head-pinned summary (clean incremental re-review, no review object)"
       emit_json_and_exit "reported" 0 "$sjson" 0
     fi
+    # Not a report on this head. What it DID last report on rides along as
+    # evidence for the barrier's same-content test (#1335); no verdict below
+    # reads it.
+    crw_probe_carryforward_evidence "$sbody"
   fi
 
   # Nothing active. Only NOW does auto-review eligibility settle it.

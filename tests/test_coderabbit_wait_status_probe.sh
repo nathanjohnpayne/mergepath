@@ -1175,6 +1175,98 @@ test_446_newer_comment_suppresses_stale_status() {
 }
 
 # ---------------------------------------------------------------------------
+# #1335: same-content carry-forward EVIDENCE. On a base-only update head
+# CodeRabbit posts no review object and its summary keeps naming the last
+# CONTENT head, so the probe stays rc 7 — and must: whether that earlier review
+# is worth anything is a content question only the Phase 4b barrier answers.
+# What the probe adds is `probe.carryforward`: the commit a completed, benign,
+# marker-free summary last reviewed, plus this head's StatusContext. Every
+# case asserts the verdict is UNCHANGED (rc and observed) and 0 writes, so the
+# evidence can never become a verdict by the back door.
+test_1335_probe_carryforward_evidence() {
+  local marker='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+  local a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  local c=cccccccccccccccccccccccccccccccccccccccc
+  local notes='<!-- This is an auto-generated comment: release notes by coderabbit.ai -->
+## Summary by CodeRabbit
+- Fixes
+<!-- end of auto-generated comment: release notes by coderabbit.ai -->'
+  local clean="$marker
+No actionable comments were generated in the recent review.
+
+Reviewing files that changed from the base of the PR and between $a and $b.
+
+$notes"
+  local bad="" dir rc
+  # <label> <trust:true|false> <status> <description> <body> <expected rc> <expected observed> <jq assertion over .probe.carryforward>
+  _cf_case() {
+    local label=$1 trust=$2 st=$3 desc=$4 body=$5 want_rc=$6 want_obs=$7 want=$8 got_obs
+    dir=$(make_case "probe-1335-$label" 600 true 30 3 2)
+    [ "$trust" = true ] && enable_trust_status_context "$dir"
+    rc=$(CODERABBIT_TEST_STATUS="$st" CODERABBIT_TEST_STATUS_DESCRIPTION="$desc" \
+      CODERABBIT_TEST_FALLBACK_BODY="$body" run_probe_case "$dir" fallback_summary)
+    got_obs=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+    if [ "$rc" != "$want_rc" ] || [ "$got_obs" != "$want_obs" ] \
+       || [ "$(probe_count "$dir")" != 0 ] || [ "$(codex_invocations "$dir")" != 0 ] \
+       || ! jq -e ".probe.carryforward | $want" "$dir/out.json" >/dev/null 2>&1; then
+      bad="$bad $label(rc=$rc observed=$got_obs cf=$(jq -c '.probe.carryforward' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR))"
+    fi
+  }
+
+  # 1. The #1318 shape: completed prior-head summary, this head's run finished.
+  _cf_case merge-head true success 'Review completed' "$clean" 7 summary-without-head-review \
+    ". == {reviewed_head:\"$b\", head_context_state:\"success\", head_context_description:\"Review completed\", head_context_updated_at:\"2026-06-04T00:00:00Z\", head_context_permits_clearance:true}"
+  # 2. A spurious success that names its own refusal (#891) is carried as
+  #    evidence but says it permits no clearance.
+  _cf_case ratelimited-success true success 'Review rate limited' "$clean" 7 summary-without-head-review \
+    '.reviewed_head != null and .head_context_permits_clearance == false'
+  # 3. A run still underway on this head is reported as such.
+  _cf_case run-pending true pending 'Review in progress' "$clean" 7 summary-without-head-review \
+    '.head_context_state == "pending"'
+  # 4. Trust opt-out: the status is never read, so the barrier sees null.
+  _cf_case trust-off false success 'Review completed' "$clean" 7 summary-without-head-review \
+    ".reviewed_head == \"$b\" and .head_context_state == null and .head_context_permits_clearance == null"
+  # 5. A summary-only blocking marker on the reviewed content must reach a
+  #    human; it is never evidence for carrying past it.
+  _cf_case blocking-marker true success 'Review completed' "$marker
+_⚠️ Potential issue_ carried only by this summary.
+
+Reviewing files that changed from the base of the PR and between $a and $b." 7 summary-without-head-review '. == null'
+  # 6. Two distinct range ends: a body we cannot attribute to one commit.
+  _cf_case two-ends true success 'Review completed' "$marker
+Reviewing files that changed from the base of the PR and between $a and $b.
+Reviewing files that changed from the base of the PR and between $b and $c." 7 summary-without-head-review '. == null'
+  # 7. An outcome stanza that is not a finished report (#790 failure).
+  _cf_case failure-stanza true success 'Review completed' "$marker
+<!-- This is an auto-generated comment: failure by coderabbit.ai -->
+> Review failed. Between $a and $b.
+<!-- end of auto-generated comment: failure by coderabbit.ai -->" 7 summary-without-head-review '. == null'
+  # 8. A range CodeRabbit is only QUOTING inside a fence is no range at all.
+  _cf_case fenced-range true success 'Review completed' "$marker
+No actionable comments were generated in the recent review.
+
+\`\`\`
+between $a and $b
+\`\`\`" 7 summary-without-head-review '. == null'
+  # 9. A risk block that names a different head than the range contradicts it.
+  _cf_case risk-disagrees true success 'Review completed' "$clean
+<!-- final_review_risk_start -->
+Risk assessed up to \`$c\`.
+<!-- final_review_risk_end -->" 7 summary-without-head-review '. == null'
+  # 10. A summary naming THIS head is the #851 report, not carry evidence.
+  _cf_case head-pinned true success 'Review completed' "$marker
+No actionable comments were generated in the recent review.
+
+Reviewing files that changed from the base of the PR and between $a and head-sha." 0 terminal '. == null'
+
+  unset -f _cf_case
+  if [ -z "$bad" ]; then
+    pass "#1335 probe: prior-head summary surfaces as carry-forward evidence only when it is a completed, marker-free, single-range report; the verdict never changes"
+  else
+    fail "#1335 probe carry-forward evidence wrong:$bad"
+  fi
+}
+
 # #814 — `--probe` read-only single-scan mode.
 #
 # These live in this file because the property they guard is this file's
@@ -3670,6 +3762,7 @@ test_837_badge_only_inline_finding_is_counted
 test_837_badge_only_summary_finding_probe_is_findings
 test_824_sha_matched_review_is_honored_regardless_of_timestamp
 test_1178_review_no_id_fails_closed
+test_1335_probe_carryforward_evidence
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

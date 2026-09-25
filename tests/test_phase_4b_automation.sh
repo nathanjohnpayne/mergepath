@@ -3771,6 +3771,12 @@ case "$endpoint" in
   repos/owner/repo/issues/7/comments)
     [ "${P4B_TEST_COMMENTS_FAIL:-false}" != true ] || exit 42
     printf '%s\n' "${P4B_TEST_COMMENTS_JSON-[]}" ;;
+  repos/owner/repo/pulls/7/files)
+    # #1335: the carry-forward reads the changed-file set once for both
+    # fingerprints. The content never matters here (the fingerprint delegate
+    # is stubbed); the failure knob does.
+    [ "${P4B_TEST_FILES_FAIL:-false}" != true ] || exit 42
+    printf '[{"filename":"scripts/x.sh"}]\n' ;;
   repos/owner/repo/pulls/7)
     if [ "${2:-}" = --jq ]; then
       printf '%s\n' "${P4B_TEST_LIVE_HEAD:-abc123}"
@@ -4175,6 +4181,189 @@ if [ -z "$bad" ]; then
 else
   fail "#1178 rate-limited routing wrong:$bad"
 fi
+
+# --- #1335: same-content CodeRabbit carry-forward on a base-only head --------
+#
+# The #1318 shape: CodeRabbit does not review merge commits, so on a base-only
+# update head the probe stays rc 7 forever and the barrier used to wait out its
+# whole budget, then hand off to a human. The CodeRabbit arm now carries its
+# review of the last content head forward — but ONLY when the #705
+# external-review fingerprint of that commit equals this head's. Every other
+# case must stay exactly the not-yet it was.
+bad=""
+_H=1111111111111111111111111111111111111111
+_L=2222222222222222222222222222222222222222
+_marker="$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-$_H.pending"
+_fplog="$WORK/stub-fp.log"
+cat >"$WORK/stub-fp.sh" <<'EOF'
+#!/bin/sh
+# Fingerprint delegate stub. P4B_TEST_FP_<ref> is the fingerprint for that
+# ref: unset means requires_review false (no fingerprint), FAIL means the
+# delegate itself failed.
+ref=""
+while [ $# -gt 0 ]; do
+  case "$1" in --ref) ref=$2; shift 2 ;; *) shift ;; esac
+done
+printf '%s\n' "$ref" >>"$P4B_TEST_FP_LOG"
+eval "fp=\${P4B_TEST_FP_$ref:-}"
+[ "$fp" != FAIL ] || exit 2
+if [ -z "$fp" ]; then
+  printf '{"requires_review":false,"fingerprint":""}'
+else
+  printf '{"requires_review":true,"fingerprint":"%s"}' "$fp"
+fi
+EOF
+chmod +x "$WORK/stub-fp.sh"
+export P4B_EXTERNAL_REVIEW_FINGERPRINT="$WORK/stub-fp.sh" P4B_TEST_FP_LOG="$_fplog"
+# <observed> <state> <permits> [reviewed]
+_cfjson() {
+  printf '{"head_sha":"%s","probe":{"mode":true,"observed":"%s","carryforward":{"reviewed_head":"%s","head_context_state":"%s","head_context_permits_clearance":%s}}}' \
+    "$_H" "$1" "${4-$_L}" "$2" "$3"
+}
+_cfreset() { rm -rf "$WORK/barrier-state/phase-4b-barrier"; : >"$_fplog"; }
+export "P4B_TEST_FP_$_H=external-review:v2:same" "P4B_TEST_FP_$_L=external-review:v2:same"
+
+# 1. The #1318 head: identical PR content, CodeRabbit finished its run on the
+#    head without reviewing it. OPENS, names the carry, starts no budget, and
+#    fingerprints exactly the two commits involved.
+for _o in summary-without-head-review none; do
+  _cfreset
+  out="$(_barrier 0 7 "$(_cfjson "$_o" success true)" "" "$_H")" && rc=0 || rc=$?
+  [ "$rc" = 0 ] || bad="$bad carried-$_o-rc=$rc"
+  printf '%s' "$out" | jq -e --arg l "$_L" '.decision == "open" and .coderabbit == "carried"
+    and .coderabbit_carryforward.source_commit == $l
+    and .coderabbit_carryforward.fingerprint == "external-review:v2:same"' >/dev/null 2>&1 \
+    || bad="$bad carried-$_o-json"
+  [ ! -f "$_marker" ] || bad="$bad carried-$_o-started-budget"
+  [ "$(sort "$_fplog" | tr '\n' ' ')" = "$_H $_L " ] || bad="$bad carried-$_o-fp-refs"
+done
+
+# 2. FAIL CLOSED on any content change: a different fingerprint is the
+#    ordinary not-yet — pending, budget started — never an open.
+_cfreset
+export "P4B_TEST_FP_$_L=external-review:v2:older"
+out="$(_barrier 0 7 "$(_cfjson summary-without-head-review success true)" "" "$_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad changed-content-rc=$rc"
+printf '%s' "$out" | jq -e '.coderabbit == "not-yet"' >/dev/null 2>&1 || bad="$bad changed-content-class"
+[ -f "$_marker" ] || bad="$bad changed-content-no-budget"
+export "P4B_TEST_FP_$_L=external-review:v2:same"
+
+# 3. A fingerprint that cannot be computed, or proves nothing, never carries.
+for _case in src-fail head-fail no-review files-fail; do
+  _cfreset
+  case "$_case" in
+    src-fail)  export "P4B_TEST_FP_$_L=FAIL" ;;
+    head-fail) export "P4B_TEST_FP_$_H=FAIL" ;;
+    no-review) unset "P4B_TEST_FP_$_H" "P4B_TEST_FP_$_L" ;;
+  esac
+  if [ "$_case" = files-fail ]; then
+    out="$(P4B_TEST_FILES_FAIL=true _barrier 0 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
+    [ ! -s "$_fplog" ] || bad="$bad files-fail-still-fingerprinted"
+  else
+    out="$(_barrier 0 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
+  fi
+  [ "$rc" = 1 ] || bad="$bad $_case-rc=$rc"
+  printf '%s' "$out" | jq -e '.coderabbit == "not-yet"' >/dev/null 2>&1 || bad="$bad $_case-class"
+  export "P4B_TEST_FP_$_H=external-review:v2:same" "P4B_TEST_FP_$_L=external-review:v2:same"
+done
+
+# 4. The head's own run must be FINISHED, and not the `Review rate limited`
+#    kind of success: a run still underway could yet publish a finding, and
+#    an unsampled status (trust opt-out) proves nothing. None of these even
+#    spends the fingerprint reads.
+for _st in 'pending true' 'success false' 'null false' 'failure true'; do
+  _cfreset
+  _state="${_st% *}" _permits="${_st#* }"
+  out="$(_barrier 0 7 "$(_cfjson none "$_state" "$_permits")" "" "$_H")" && rc=0 || rc=$?
+  [ "$rc" = 1 ] || bad="$bad status-$_state-$_permits-rc=$rc"
+  printf '%s' "$out" | jq -e '.coderabbit == "not-yet"' >/dev/null 2>&1 || bad="$bad status-$_state-$_permits-class"
+  [ ! -s "$_fplog" ] || bad="$bad status-$_state-$_permits-fingerprinted"
+done
+
+# 5. Only an IDLE CodeRabbit carries. A pause, a run in progress or a
+#    head-pinned object awaiting its summary is a CodeRabbit that is not done,
+#    whatever it reviewed before; a refusal keeps its own #1178 routing.
+for _o in paused in_progress awaiting-summary; do
+  _cfreset
+  out="$(_barrier 0 7 "$(_cfjson "$_o" success true)" "" "$_H")" && rc=0 || rc=$?
+  [ "$rc" = 1 ] || bad="$bad observed-$_o-rc=$rc"
+  printf '%s' "$out" | jq -e '.coderabbit == "not-yet"' >/dev/null 2>&1 || bad="$bad observed-$_o-class"
+done
+_cfreset
+out="$(_barrier 0 7 "$(_cfjson rate_limit success true)" "" "$_H")" && rc=0 || rc=$?
+printf '%s' "$out" | jq -e '.coderabbit == "rate-limited"' >/dev/null 2>&1 || bad="$bad observed-rate_limit-class"
+
+# 6. A summary-only blocking finding (probe rc 2) escalates as before, even
+#    when the JSON also carries evidence: carry-forward refines only a not-yet.
+_cfreset
+out="$(_barrier 0 2 "$(_cfjson terminal success true)" "" "$_H")" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad rc2-not-escalated"
+printf '%s' "$out" | jq -e '.reason | test("summary")' >/dev/null 2>&1 || bad="$bad rc2-reason"
+
+# 7. Evidence that names the head under review is not carry evidence, and a
+#    malformed or absent reviewed commit is no evidence at all.
+for _rv in "$_H" "not-a-sha" ""; do
+  _cfreset
+  out="$(_barrier 0 7 "$(_cfjson none success true "$_rv")" "" "$_H")" && rc=0 || rc=$?
+  [ "$rc" = 1 ] || bad="$bad reviewed-'$_rv'-rc=$rc"
+  [ ! -s "$_fplog" ] || bad="$bad reviewed-'$_rv'-fingerprinted"
+done
+
+# 8. Codex still working: CodeRabbit is carried, the hold is on CODEX alone,
+#    and no CodeRabbit request is spent or queued behind it.
+_cfreset
+out="$(_barrier 1 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad codexnotyet-rc=$rc"
+printf '%s' "$out" | jq -e '.coderabbit == "carried" and .codex == "not-yet" and .trigger == "skipped"' >/dev/null 2>&1 \
+  || bad="$bad codexnotyet-json"
+_cfreset
+
+unset -f _cfjson _cfreset
+unset P4B_EXTERNAL_REVIEW_FINGERPRINT P4B_TEST_FP_LOG "P4B_TEST_FP_$_H" "P4B_TEST_FP_$_L"
+if [ -z "$bad" ]; then
+  pass "#1335: a base-only head carries CodeRabbit's review of identical PR content, and every content change, unreadable fingerprint, unfinished run or busy CodeRabbit stays not-yet"
+else
+  fail "#1335 CodeRabbit carry-forward routing wrong:$bad"
+fi
+
+# #1335, end to end: an approval that posts over a CARRIED CodeRabbit says so
+# in its own Review Metadata — source commit and fingerprint — for the same
+# reason the #1178 partial quorum does: a reader who assumes CodeRabbit read
+# this exact head would draw a stronger conclusion than the review supports.
+_L=2222222222222222222222222222222222222222
+cat >"$WORK/stub-cr-carried.sh" <<EOF
+#!/bin/sh
+printf '{"head_sha":"abc123","probe":{"mode":true,"observed":"none","carryforward":{"reviewed_head":"$_L","head_context_state":"success","head_context_permits_clearance":true}}}'
+exit 7
+EOF
+mkdir -p "$WORK/cf-bin"
+cat >"$WORK/cf-bin/gh" <<EOF
+#!/usr/bin/env bash
+# The orchestrator fake serves no PR files list; the carry-forward reads one.
+if [ "\${1:-}" = api ] && [ "\${2:-}" = --paginate ] && [ "\${3:-}" = repos/o/r/pulls/1335/files ]; then
+  printf '[{"filename":"scripts/x.sh"}]\n'; exit 0
+fi
+exec "$BIN/gh" "\$@"
+EOF
+chmod +x "$WORK/stub-cr-carried.sh" "$WORK/cf-bin/gh"
+WRAPPER_LOG="$WORK/wrapper-carried.log"
+WRAPPER_BODY="$WORK/wrapper-carried-body.md"
+WRAPPER_PAYLOAD="$WORK/wrapper-carried-payload.json"
+: >"$WORK/stub-fp-e2e.log"
+set +e
+out="$(env PATH="$WORK/cf-bin:$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
+  P4B_CODERABBIT_WAIT="$WORK/stub-cr-carried.sh" P4B_EXTERNAL_REVIEW_FINGERPRINT="$WORK/stub-fp.sh" \
+  P4B_TEST_FP_LOG="$WORK/stub-fp-e2e.log" P4B_TEST_FP_abc123=external-review:v2:same "P4B_TEST_FP_$_L=external-review:v2:same" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 \
+  bash "$ORCH" 1335 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>"$WORK/carried-e2e.err")"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && jq -e '.commit_id == "abc123" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null 2>&1 \
+   && grep -qF -- "its review of \`$_L\` carries forward because the external-review fingerprint is unchanged (\`external-review:v2:same\`) (#1335)" "$WRAPPER_BODY" \
+   && grep -qF -- "CodeRabbit did not re-review abc123" "$WORK/carried-e2e.err" \
+   && ! grep -q -- "rate limited" "$WRAPPER_BODY"; then
+  pass "#1335: an approval over a carried CodeRabbit records the source commit and fingerprint in its Review Metadata"
+else fail "#1335 carried-approval metadata (rc=$rc, out=$out, body=$(test -e "$WRAPPER_BODY" && cat "$WRAPPER_BODY" || true), err=$(tail -20 "$WORK/carried-e2e.err" 2>/dev/null || true))"; fi
 
 # 4. The mention follows coderabbit.bot_login. coderabbit-wait.sh probes the
 #    configured bot, so a hardcoded @coderabbitai would address an account that
