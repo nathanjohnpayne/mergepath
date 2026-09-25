@@ -105,6 +105,14 @@ WRAPPED_STATUS_PROBE_BODY='<!-- This is an auto-generated reply by CodeRabbit --
 <!-- CodeRabbit review command invocation: status -->
 Here is a summary of where things stand.'
 
+ACTIONS_PERFORMED_STATUS_PROBE_BODY='<!-- This is an auto-generated reply by CodeRabbit -->
+
+<details><summary>✅ Actions performed</summary>
+
+Review triggered.
+
+> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits.'
+
 BARE_STATUS_PROBE_BODY='CodeRabbit review command invocation
 Still checking.'
 
@@ -403,6 +411,9 @@ case "\$endpoint" in
     fi ;;
   repos/owner/repo/issues/999/timeline) printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)
+    n=0
+    if [ -f "\$state_dir/reviews-read-count" ]; then n=\$(cat "\$state_dir/reviews-read-count"); fi
+    n=\$((n + 1)); printf '%s\n' "\$n" >"\$state_dir/reviews-read-count"
     # CODERABBIT_TEST_FAIL_REVIEWS=1: the reviews read fails. This is the
     # entry fetch of the count_potential_issues chain
     # (count_potential_issues -> head_review_finding_bodies ->
@@ -411,6 +422,10 @@ case "\$endpoint" in
     # observation: both leave the review id empty.
     if [ -n "\${CODERABBIT_TEST_FAIL_REVIEWS:-}" ]; then
       echo "simulated reviews API failure" >&2
+      exit 44
+    fi
+    if [ -n "\${CODERABBIT_TEST_FAIL_REVIEWS_AFTER:-}" ] && [ "\$n" -gt "\$CODERABBIT_TEST_FAIL_REVIEWS_AFTER" ]; then
+      echo "simulated reviews API failure after read \$CODERABBIT_TEST_FAIL_REVIEWS_AFTER" >&2
       exit 44
     fi
     # CODERABBIT_TEST_REVIEWS_OBJECT=1 (#967): a 200 whose body is a JSON
@@ -435,6 +450,10 @@ case "\$endpoint" in
       else
         printf '%s\n' "\$CODERABBIT_TEST_REVIEWS_RAW"
       fi
+      exit 0
+    fi
+    if [ -n "\${CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON:-}" ] && [ "\$n" -gt 1 ]; then
+      printf '%s\n' "\$CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON"
       exit 0
     fi
     if [ -n "\${CODERABBIT_TEST_REVIEWS_JSON:-}" ]; then
@@ -521,6 +540,8 @@ run_case() {
       GH_TOKEN=test-token \
       CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
       CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON="${CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON:-}" \
+      CODERABBIT_TEST_FAIL_REVIEWS_AFTER="${CODERABBIT_TEST_FAIL_REVIEWS_AFTER:-}" \
       CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
       CODEX_STUB_LOG="$dir/state/codex-stub.log" \
       ./scripts/coderabbit-wait.sh 999 owner/repo \
@@ -576,6 +597,37 @@ test_current_refusal_with_actual_head_review_clears() {
   [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3b: status=$(jqf "$dir" '.status'), expected cleared"
   grep -q 'body-bearing review id=8801 is pinned' "$dir/err.log" || fail "3b: expected exact-head review evidence log; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
   [ "$FAIL" -ne "$before" ] || pass "3b: #956 — a body-bearing review run pinned to HEAD outranks the current refusal"
+}
+
+# The #956 override selects and grades one body-bearing run before the
+# fast-path scans inline and summary surfaces. A later run on the same SHA can
+# arrive between those reads, so clearance must revalidate the selected run
+# rather than credit a superseded clean body.
+test_refusal_run_is_revalidated_before_clearance() {
+  local dir rc before=$FAIL clean superseding
+  clean=$(jq -nc '[{"id":8801,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed. No actionable comments."}]')
+  superseding=$(jq -nc '[
+    {"id":8801,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed. No actionable comments."},
+    {"id":8802,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T02:00:00Z","body":"_🟠 Major_ | A later same-SHA review finding."}
+  ]')
+
+  dir=$(make_case "headref-stable-review-run" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$clean" CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON="$clean" run_case "$dir")
+  [ "$rc" = "0" ] || fail "3b0 stable: unchanged selected review should clear, got $rc; err=$(tail -5 "$dir/err.log")"
+  [ "$(cat "$dir/state/reviews-read-count")" = "2" ] || fail "3b0 stable: expected selector revalidation read"
+
+  dir=$(make_case "headref-superseded-review-run" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$clean" CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON="$superseding" run_case "$dir")
+  [ "$rc" = "2" ] || fail "3b0 superseded: later blocking same-SHA review must emit findings, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "findings" ] || fail "3b0 superseded: expected findings after the newer run"
+  grep -q 'changed from id=8801 to id=8802' "$dir/err.log" || fail "3b0 superseded: expected selected-run replacement log"
+
+  dir=$(make_case "headref-unread-revalidation" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$clean" CODERABBIT_TEST_FAIL_REVIEWS_AFTER=1 run_case "$dir")
+  [ "$rc" = "5" ] || fail "3b0 unread: unread revalidation must withhold clearance, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b0 unread: unread revalidation cleared"
+  grep -q 'could not be re-read before clearance' "$dir/err.log" || fail "3b0 unread: expected re-read failure log"
+  [ "$FAIL" -ne "$before" ] || pass "3b0: #956 revalidates a stable clean run and withholds clearance when it is superseded or unread"
 }
 
 test_quoted_refusal_marker_is_not_current_refusal() {
@@ -674,12 +726,13 @@ Here is a summary of where things stand.' ;;
   [ "$FAIL" -ne "$before" ] || pass "3b7: provider-leading in-progress and narration bodies cannot release the current refusal"
 }
 
-test_wrapped_status_probe_does_not_supersede_refusal() {
+test_status_probe_does_not_supersede_refusal() {
   local mode reply dir rc before=$FAIL
-  for mode in wrapped bare; do
+  for mode in wrapped bare actions-performed; do
     case "$mode" in
       wrapped) reply=$WRAPPED_STATUS_PROBE_BODY ;;
       bare) reply=$BARE_STATUS_PROBE_BODY ;;
+      actions-performed) reply=$ACTIONS_PERFORMED_STATUS_PROBE_BODY ;;
     esac
     dir=$(make_case "refusal-before-$mode-status-probe" "$RATE_LIMIT_BODY_HEADREF" \
       "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
@@ -688,7 +741,7 @@ test_wrapped_status_probe_does_not_supersede_refusal() {
     [ "$rc" = "5" ] || fail "3b8 $mode: status probe should not supersede current refusal, got $rc; err=$(tail -6 "$dir/err.log")"
     [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b8 $mode: status probe allowed status-only clearance"
   done
-  [ "$FAIL" -ne "$before" ] || pass "3b8: wrapped and bare CodeRabbit command replies cannot supersede the current refusal"
+  [ "$FAIL" -ne "$before" ] || pass "3b8: wrapped, bare and action acknowledgement CodeRabbit command replies cannot supersede the current refusal"
 }
 
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
@@ -2052,6 +2105,7 @@ test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
 test_headref_later_status_without_review_stays_refused
 test_current_refusal_with_actual_head_review_clears
+test_refusal_run_is_revalidated_before_clearance
 test_current_refusal_with_bodyless_ack_stays_refused
 test_current_pause_with_later_status_resumes_instead_of_clearing
 test_headref_within_published_window_suppresses
@@ -2493,7 +2547,7 @@ test_current_refusal_with_nonbenign_head_review_stays_refused
 test_current_refusal_with_review_quoting_progress_clears
 test_legacy_leading_refusal_stays_current
 test_provider_leading_nonreview_run_stays_refused
-test_wrapped_status_probe_does_not_supersede_refusal
+test_status_probe_does_not_supersede_refusal
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
