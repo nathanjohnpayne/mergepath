@@ -4200,11 +4200,13 @@ cat >"$WORK/stub-fp.sh" <<'EOF'
 # Fingerprint delegate stub. P4B_TEST_FP_<ref> is the fingerprint for that
 # ref: unset means requires_review false (no fingerprint), FAIL means the
 # delegate itself failed.
-ref=""
+ref="" files=""
 while [ $# -gt 0 ]; do
-  case "$1" in --ref) ref=$2; shift 2 ;; *) shift ;; esac
+  case "$1" in --ref) ref=$2; shift 2 ;; --files-json) files=$2; shift 2 ;; *) shift ;; esac
 done
 printf '%s\n' "$ref" >>"$P4B_TEST_FP_LOG"
+# Which changed-file list this call hashed: path + content checksum.
+printf '%s %s\n' "$files" "$(cksum <"$files" 2>/dev/null || echo MISSING)" >>"$P4B_TEST_FP_LOG.files"
 eval "fp=\${P4B_TEST_FP_$ref:-}"
 [ "$fp" != FAIL ] || exit 2
 if [ -z "$fp" ]; then
@@ -4220,7 +4222,7 @@ _cfjson() {
   printf '{"head_sha":"%s","probe":{"mode":true,"observed":"%s","carryforward":{"reviewed_head":"%s","head_context_state":"%s","head_context_permits_clearance":%s}}}' \
     "$_H" "$1" "${4-$_L}" "$2" "$3"
 }
-_cfreset() { rm -rf "$WORK/barrier-state/phase-4b-barrier"; : >"$_fplog"; }
+_cfreset() { rm -rf "$WORK/barrier-state/phase-4b-barrier"; : >"$_fplog"; : >"$_fplog.files"; }
 export "P4B_TEST_FP_$_H=external-review:v2:same" "P4B_TEST_FP_$_L=external-review:v2:same"
 
 # 1. The #1318 head: identical PR content, CodeRabbit finished its run on the
@@ -4236,6 +4238,10 @@ for _o in summary-without-head-review none; do
     || bad="$bad carried-$_o-json"
   [ ! -f "$_marker" ] || bad="$bad carried-$_o-started-budget"
   [ "$(sort "$_fplog" | tr '\n' ' ')" = "$_H $_L " ] || bad="$bad carried-$_o-fp-refs"
+  # Both fingerprints hash ONE changed-file list — the same path set — or
+  # equality proves nothing about the paths only one of them saw.
+  [ "$(wc -l <"$_fplog.files" | tr -d ' ')" = 2 ] && [ "$(sort -u "$_fplog.files" | wc -l | tr -d ' ')" = 1 ] \
+    && ! grep -q MISSING "$_fplog.files" || bad="$bad carried-$_o-files-list"
 done
 
 # 2. FAIL CLOSED on any content change: a different fingerprint is the
@@ -4279,6 +4285,11 @@ for _st in 'pending true' 'success false' 'null false' 'failure true'; do
   printf '%s' "$out" | jq -e '.coderabbit == "not-yet"' >/dev/null 2>&1 || bad="$bad status-$_state-$_permits-class"
   [ ! -s "$_fplog" ] || bad="$bad status-$_state-$_permits-fingerprinted"
 done
+# The trust opt-out's real shape: JSON null state and permits, not strings.
+_cfreset
+out="$(_barrier 0 7 "{\"head_sha\":\"$_H\",\"probe\":{\"mode\":true,\"observed\":\"none\",\"carryforward\":{\"reviewed_head\":\"$_L\",\"head_context_state\":null,\"head_context_permits_clearance\":null}}}" "" "$_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad status-jsonnull-rc=$rc"
+[ ! -s "$_fplog" ] || bad="$bad status-jsonnull-fingerprinted"
 
 # 5. Only an IDLE CodeRabbit carries. A pause, a run in progress or a
 #    head-pinned object awaiting its summary is a CodeRabbit that is not done,

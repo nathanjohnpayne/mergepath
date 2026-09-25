@@ -3494,8 +3494,9 @@ emit_json_and_exit() {
   # context_updated_at carry the per-SHA StatusContext (state + refresh
   # time) sampled by the rc-7 review-object branch (#869) and are null on
   # every other path.
-  # `carryforward` (#1335) is null except on the rc-7 no-review-object paths
-  # where crw_probe_carryforward_evidence found a completed prior-head summary.
+  # `carryforward` (#1335) is null except on the rc-7 `none` /
+  # `summary-without-head-review` emits, where crw_probe_carryforward_evidence
+  # found a completed prior-head summary.
   if [ "$PROBE_MODE" = "true" ]; then
     PROBE_JSON=$(jq -nc --arg observed "${PROBE_OBSERVED:-terminal}" \
       --arg ctx "${PROBE_CONTEXT_STATE:-}" \
@@ -4109,6 +4110,11 @@ crw_probe_head_review_in_progress() {
 # the marker classifier) emits NOTHING, which leaves the barrier on its
 # ordinary bounded wait — the direction this evidence may never weaken.
 #
+# Only the marker-led summary COMMENT is read, never the reviewed commit's own
+# review-object body. Findings there are not lost: the complete-history
+# feedback-accounting gate reads every bot review body, and the Phase 4b
+# orchestrator runs it after the barrier and before the adapter.
+#
 # The per-SHA StatusContext on THIS head rides along, trust-gated like every
 # other status read here (null when the policy opts out, which the barrier
 # reads as no carry). It is what says CodeRabbit has seen this head and
@@ -4142,6 +4148,45 @@ crw_probe_carryforward_evidence() {
     desc=$(printf '%s' "$ctx_record" | jq -r '.description // ""' 2>/dev/null || printf '')
     updated_at=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""' 2>/dev/null || printf '')
     if crw_status_description_permits_clearance "$desc"; then permits=true; fi
+  fi
+  # Re-scan after a success (Codex P1 on #1340) — the #869 TOCTOU, on this
+  # path. The comments snapshot the summary came from predates the status
+  # read, so CodeRabbit can re-review THIS head in the gap (a force-push that
+  # recreates an earlier tree is enough), publish a new summary carrying a
+  # finding, and flip the status to success before we sample it. Pairing that
+  # fresh success with the stale clean summary is exactly the evidence the
+  # barrier carries on. So a success is admitted only if one re-fetch finds
+  # the summary BYTE-identical to the body evaluated above; a changed body, a
+  # vanished one, or a failed re-fetch emits nothing, and the next probe reads
+  # the new summary through its ordinary branches. Only `success` is
+  # re-checked because it is the only state the barrier can carry on.
+  if [ "$state" = success ]; then
+    local fresh="" resel="" rbody=""
+    fresh=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (carry-forward re-scan)") \
+      || { log "probe: carry-forward re-scan could not re-read the comments — emitting no evidence (#1335)"; return 0; }
+    resel=$(crw_select_summary_comment "$fresh" "$BOT_LOGIN" "$SUMMARY_MARKER") || resel=""
+    if [ -n "$resel" ]; then
+      rbody=$(printf '%s' "$resel" | base64 --decode | jq -r '.body' 2>/dev/null) || rbody=""
+    fi
+    if [ -z "$rbody" ] || [ "$rbody" != "$body" ]; then
+      log "probe: the CodeRabbit summary changed after the success on $HEAD_SHA was observed — emitting no carry-forward evidence from the stale snapshot (#1335)"
+      return 0
+    fi
+    # The summary is not the only thing that can land in the gap. #869
+    # records that a head-pinned review RUN and the per-SHA success can
+    # publish BEFORE the summary edit, so an unchanged summary does not prove
+    # CodeRabbit did not just review this head. A run on the head means
+    # CodeRabbit IS reporting here, and the ordinary review-object branch —
+    # not a carry — must read it on the next probe.
+    local reviews_again="" head_run=""
+    reviews_again=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews (carry-forward re-scan)") \
+      || { log "probe: carry-forward re-scan could not re-read the reviews — emitting no evidence (#1335)"; return 0; }
+    head_run=$(crw_select_head_pinned_review_run "$reviews_again" "$BOT_LOGIN" "$HEAD_SHA") \
+      || { log "probe: carry-forward re-scan could not select a head-pinned run — emitting no evidence (#1335)"; return 0; }
+    if [ -n "$head_run" ]; then
+      log "probe: a CodeRabbit review run landed on $HEAD_SHA after the snapshot — emitting no carry-forward evidence; the next probe reads it directly (#1335)"
+      return 0
+    fi
   fi
   PROBE_CARRYFORWARD_JSON=$(jq -nc --arg reviewed "$end" --arg st "$state" \
     --arg d "$desc" --arg at "$updated_at" --argjson p "$permits" '
@@ -4630,6 +4675,8 @@ probe_emit_verdict() {
 
   # Nothing active. Only NOW does auto-review eligibility settle it.
   if [ -n "${PROBE_STATIC_SKIP:-}" ]; then
+    # Carry-forward evidence belongs to the idle not-yet paths only (#1335).
+    PROBE_CARRYFORWARD_JSON=null
     SKIP_REASON="$PROBE_STATIC_SKIP"
     PROBE_OBSERVED="terminal"
     log "probe: no CodeRabbit review on $HEAD_SHA and auto-review will not fire ($PROBE_STATIC_SKIP)"
@@ -4660,6 +4707,8 @@ probe_emit_verdict() {
     die 3 "could not read CodeRabbit's newest comment on $HEAD_SHA while checking for an open rate-limit window — a failed read is not evidence that CodeRabbit has said nothing, so the probe refuses to report on it (#957)"
   fi
   if [ "$active_rc" = "0" ]; then
+    # A refusal is not an idle CodeRabbit; no carry-forward evidence (#1335).
+    PROBE_CARRYFORWARD_JSON=null
     # #1178 guard, site 3 of 3 — the open-window path. This notice is selected
     # anchor-free by newest_bot_comment_from_issue_comments, so it can be the
     # summarize comment itself; the masking is the same and so is the answer.

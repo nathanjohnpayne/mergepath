@@ -224,6 +224,18 @@ case "$endpoint" in
     ;;
   repos/owner/repo/pulls/999/reviews)
     case "$scenario" in
+      carry_review_appears)
+        # #1335 (independent review on #1340): the first reviews read has no
+        # run on the head; a run lands before the carry-forward re-scan.
+        n=0
+        [ ! -f "$state_dir/review-reads" ] || n=$(cat "$state_dir/review-reads")
+        n=$((n + 1)); printf '%s\n' "$n" >"$state_dir/review-reads"
+        if [ "$n" -gt 1 ]; then
+          printf '[{"id":94201,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","body":"%s"}]\n' "$bot" "$reply_time" "$run_body"
+        else
+          printf '[]\n'
+        fi
+        ;;
       aged_marker_fresh_benign_clean_head_run)
         # #878 control: immutable exact-head clean-run evidence stays first in
         # the published ladder, even when an older marker summary and pending
@@ -486,6 +498,23 @@ Fresh benign CodeRabbit activity without a summary marker.
             {id:87801,user:{login:$bot},created_at:$old_time,updated_at:$old_time,body:$old},
             {id:87802,user:{login:$bot},created_at:$fresh_time,updated_at:$fresh_time,body:$fresh}
           ]'
+        ;;
+      carry_summary_changes|carry_rescan_fails|carry_review_appears)
+        # #1335 TOCTOU (Codex P1 on #1340): the FIRST comments read serves the
+        # prior-head clean summary; every later read serves
+        # CODERABBIT_TEST_CARRY_BODY2 (a re-review published while the status
+        # flipped to success), or fails outright.
+        n=0
+        [ ! -f "$state_dir/comment-reads" ] || n=$(cat "$state_dir/comment-reads")
+        n=$((n + 1)); printf '%s\n' "$n" >"$state_dir/comment-reads"
+        if [ "$n" -gt 1 ] && [ "$scenario" = carry_rescan_fails ]; then
+          echo "simulated comments re-read failure" >&2
+          exit 42
+        fi
+        body=${CODERABBIT_TEST_FALLBACK_BODY:?}
+        [ "$n" -gt 1 ] && body=${CODERABBIT_TEST_CARRY_BODY2:?}
+        jq -nc --arg bot "$bot" --arg body "$body" --arg updated "$reply_time" \
+          '[{id:94101,user:{login:$bot},created_at:"2026-06-03T00:00:00Z",updated_at:$updated,body:$body}]'
         ;;
       fallback_summary|fallback_summary_during_probe)
         # #940: the walkthrough predates HEAD; only its edit is fresh. No
@@ -1258,6 +1287,53 @@ Risk assessed up to \`$c\`.
 No actionable comments were generated in the recent review.
 
 Reviewing files that changed from the base of the PR and between $a and head-sha." 0 terminal '. == null'
+
+  # 11. TOCTOU (Codex P1 on #1340): CodeRabbit publishes a new summary between
+  #     the comments snapshot and the status read. The fresh success must not
+  #     be paired with the stale clean summary — no evidence at all.
+  local changed="$marker
+_⚠️ Potential issue_ carried only by this summary.
+
+Reviewing files that changed from the base of the PR and between $a and head-sha."
+  dir=$(make_case probe-1335-toctou 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' \
+    CODERABBIT_TEST_FALLBACK_BODY="$clean" CODERABBIT_TEST_CARRY_BODY2="$changed" \
+    run_probe_case "$dir" carry_summary_changes)
+  { [ "$rc" = 7 ] && jq -e '.probe.carryforward == null' "$dir/out.json" >/dev/null 2>&1 \
+      && [ "$(cat "$dir/state/comment-reads")" = 2 ] \
+      && grep -q 'summary changed after the success' "$dir/err.log"; } \
+    || bad="$bad toctou-changed(rc=$rc cf=$(jq -c '.probe.carryforward' "$dir/out.json" 2>/dev/null))"
+  # 12. A re-read that FAILS is not evidence the summary held still.
+  dir=$(make_case probe-1335-rescan-fail 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' \
+    CODERABBIT_TEST_FALLBACK_BODY="$clean" CODERABBIT_TEST_CARRY_BODY2="$clean" \
+    run_probe_case "$dir" carry_rescan_fails)
+  { [ "$rc" = 7 ] && jq -e '.probe.carryforward == null' "$dir/out.json" >/dev/null 2>&1; } \
+    || bad="$bad toctou-refetch-fail(rc=$rc)"
+  # 13. Control: an unchanged re-read keeps the evidence (the re-scan is not
+  #     a blanket refusal), and it is exactly ONE extra read.
+  dir=$(make_case probe-1335-rescan-stable 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' \
+    CODERABBIT_TEST_FALLBACK_BODY="$clean" CODERABBIT_TEST_CARRY_BODY2="$clean" \
+    run_probe_case "$dir" carry_summary_changes)
+  { [ "$rc" = 7 ] && jq -e --arg b "$b" '.probe.carryforward.reviewed_head == $b' "$dir/out.json" >/dev/null 2>&1 \
+      && [ "$(cat "$dir/state/comment-reads")" = 2 ]; } \
+    || bad="$bad toctou-stable(rc=$rc reads=$(cat "$dir/state/comment-reads" 2>/dev/null))"
+
+  # 14. A head-pinned review RUN landing in the gap (with the summary still
+  #     unchanged, as #869 records it can be) is CodeRabbit reporting here —
+  #     no carry evidence; the next probe takes the review-object branch.
+  dir=$(make_case probe-1335-run-appears 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' \
+    CODERABBIT_TEST_FALLBACK_BODY="$clean" CODERABBIT_TEST_CARRY_BODY2="$clean" \
+    run_probe_case "$dir" carry_review_appears)
+  { [ "$rc" = 7 ] && jq -e '.probe.carryforward == null' "$dir/out.json" >/dev/null 2>&1 \
+      && grep -q 'review run landed on' "$dir/err.log"; } \
+    || bad="$bad run-appears(rc=$rc cf=$(jq -c '.probe.carryforward' "$dir/out.json" 2>/dev/null))"
 
   unset -f _cf_case
   if [ -z "$bad" ]; then
