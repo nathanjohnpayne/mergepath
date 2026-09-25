@@ -227,6 +227,8 @@ assert_match 'read-only feedback archive relay.*12345' "$RUN_ERR" "relay failure
 assert_match 'rerun that exact historical source run' "$RUN_ERR" "relay failure names the safe historical recovery"
 assert_match 'repos/acme/widget/actions/runs/12345/rerun' "$RUN_ERR" "relay recovery command targets the failed source run"
 assert_match 'new PR head or a different workflow run cannot' "$RUN_ERR" "relay recovery rejects unsafe substitutes"
+assert_match 'runs are rerunnable for 30 days' "$RUN_ERR" "relay recovery states the historical rerun limit"
+assert_match 'PR remains blocked and requires owner intervention' "$RUN_ERR" "unavailable relay recovery preserves the block"
 jq '. + [{
   "id": 3,
   "created_at": "2026-08-18T19:01:00Z",

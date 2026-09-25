@@ -254,7 +254,7 @@ RELAY_FAILURE_RUN=$(printf '%s' "$ISSUE_COMMENTS" | jq -r '
   | first // empty
 ') || die 2 "could not validate read-only feedback archive relay state"
 if [ -n "$RELAY_FAILURE_RUN" ]; then
-  die 2 "read-only feedback archive relay failed for source run $RELAY_FAILURE_RUN; rerun that exact historical source run with: gh api -X POST repos/$REPO/actions/runs/$RELAY_FAILURE_RUN/rerun. A new PR head or a different workflow run cannot publish its completion marker; prior feedback may be unrecoverable"
+  die 2 "read-only feedback archive relay failed for source run $RELAY_FAILURE_RUN; if GitHub still permits it (runs are rerunnable for 30 days), rerun that exact historical source run with: gh api -X POST repos/$REPO/actions/runs/$RELAY_FAILURE_RUN/rerun. A new PR head or a different workflow run cannot publish its completion marker. If that run is no longer rerunnable or recovery fails, the PR remains blocked and requires owner intervention; prior feedback may be unrecoverable"
 fi
 
 tier_rank() {
