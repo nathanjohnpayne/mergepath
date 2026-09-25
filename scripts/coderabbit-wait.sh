@@ -1671,7 +1671,7 @@ crw_provider_owned_refusal_class() {
       printf 'paused\n'; return 0 ;;
     'review in progress'*|'currently reviewing'*|'commit under review'*|'commits under review'*)
       printf 'in_progress\n'; return 0 ;;
-    '<!-- coderabbit review command invocation:'*|'here is a summary of where things stand'*|"here's a summary of where things stand"*|'coderabbit is an incremental review system'*|'does not re-review already reviewed commits'*)
+    '<!-- coderabbit review command invocation:'*|'coderabbit review command invocation'*|'here is a summary of where things stand'*|"here's a summary of where things stand"*|'coderabbit is an incremental review system'*|'does not re-review already reviewed commits'*)
       printf 'status_probe\n'; return 0 ;;
   esac
   case "$first_two" in

@@ -105,6 +105,9 @@ WRAPPED_STATUS_PROBE_BODY='<!-- This is an auto-generated reply by CodeRabbit --
 <!-- CodeRabbit review command invocation: status -->
 Here is a summary of where things stand.'
 
+BARE_STATUS_PROBE_BODY='CodeRabbit review command invocation
+Still checking.'
+
 # A PR-level summary that classifies as `review` and carries a blocking marker
 # ONLY in the summary body — the #535 summary-only class. There are no inline
 # findings on this head at all, so `count_potential_issues_for_sha` returns 0
@@ -672,14 +675,20 @@ Here is a summary of where things stand.' ;;
 }
 
 test_wrapped_status_probe_does_not_supersede_refusal() {
-  local dir rc before=$FAIL
-  dir=$(make_case "refusal-before-wrapped-status-probe" "$RATE_LIMIT_BODY_HEADREF" \
-    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
-    "$WRAPPED_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
-  rc=$(run_case "$dir")
-  [ "$rc" = "5" ] || fail "3b8: wrapped status probe should not supersede current refusal, got $rc; err=$(tail -6 "$dir/err.log")"
-  [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b8: wrapped status probe allowed status-only clearance"
-  [ "$FAIL" -ne "$before" ] || pass "3b8: a wrapped CodeRabbit command reply cannot supersede the current refusal"
+  local mode reply dir rc before=$FAIL
+  for mode in wrapped bare; do
+    case "$mode" in
+      wrapped) reply=$WRAPPED_STATUS_PROBE_BODY ;;
+      bare) reply=$BARE_STATUS_PROBE_BODY ;;
+    esac
+    dir=$(make_case "refusal-before-$mode-status-probe" "$RATE_LIMIT_BODY_HEADREF" \
+      "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+      "$reply" "$NOTICE_AFTER_SUMMARY_TIME")
+    rc=$(run_case "$dir")
+    [ "$rc" = "5" ] || fail "3b8 $mode: status probe should not supersede current refusal, got $rc; err=$(tail -6 "$dir/err.log")"
+    [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b8 $mode: status probe allowed status-only clearance"
+  done
+  [ "$FAIL" -ne "$before" ] || pass "3b8: wrapped and bare CodeRabbit command replies cannot supersede the current refusal"
 }
 
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
