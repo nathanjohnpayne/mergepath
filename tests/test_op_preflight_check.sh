@@ -2145,6 +2145,7 @@ test_firebaserc_parsers_agree() {
     'no-projects|{ "targets": { "projects": { "default": "wrong" } } }'
   )
   local entry name json py awkv
+  # shellcheck disable=SC2016  # "$1" expands in the child bash, by design
   for entry in "${cases[@]}"; do
     name="${entry%%|*}"
     json="${entry#*|}"
