@@ -1257,8 +1257,22 @@ emit_check_failure_guard() {
 # plain --mode deploy finds it fresh and silently re-exports the old key
 # without asking 1Password (Codex on #1318). The key FILE stays, because
 # shells that already exported it are still using it.
+#
+# The same goes for pre-slot deploy fields a not-yet-updated consumer wrote
+# into the shared session file (propagation skew): with the slot gone, the
+# next deploy would fall back to them and reuse the rotated key (Codex on
+# #1318). Strip them too -- staged + renamed, PATs kept -- rather than
+# deleting the whole file and forcing a PAT re-prompt.
 invalidate_deploy_slot() {
   rm -f "$(deploy_slot_file_for "${firebase_project:-}")"
+  if [[ -f "$SESSION_FILE" ]] && grep -Eq '^(GOOGLE_APPLICATION_CREDENTIALS|OP_PREFLIGHT_ADC_TMPFILE|OP_PREFLIGHT_FIREBASE_SA_TMPFILE|OP_PREFLIGHT_FIREBASE_PROJECT)=' "$SESSION_FILE"; then
+    local session_staged
+    session_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-session.staged.XXXXXX")"
+    grep -Ev '^(GOOGLE_APPLICATION_CREDENTIALS|OP_PREFLIGHT_ADC_TMPFILE|OP_PREFLIGHT_FIREBASE_SA_TMPFILE|OP_PREFLIGHT_FIREBASE_PROJECT)=' \
+      "$SESSION_FILE" > "$session_staged" || true
+    chmod 600 "$session_staged"
+    mv -f "$session_staged" "$SESSION_FILE"
+  fi
 }
 emit_deploy_failure_guard() {
   printf '%s\n' "$DEPLOY_CLEAR_STMT"

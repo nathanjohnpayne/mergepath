@@ -2116,6 +2116,29 @@ EOF
     return
   fi
   pass "test_failed_fetch_does_not_evict_shared_deploy_files: a failed deploy --refresh invalidates the slot but keeps the key file"
+
+  # 5. Propagation skew: a pre-slot consumer left deploy fields for this
+  #    project in the shared session file. After a failed --refresh those
+  #    must not be the fallback either -- while the PATs survive.
+  touch "$sa_ok"
+  if ! run_deploy deploy-reload; then
+    fail "no-evict: --mode deploy reload failed; stderr=$(cat "$case_dir/proj-gamma/deploy-reload.err")"
+    return
+  fi
+  make_aged_cache "$cache_dir" claude 0 "ne-reviewer-pat" "ne-author-pat"
+  printf 'GOOGLE_APPLICATION_CREDENTIALS=%s\nOP_PREFLIGHT_FIREBASE_SA_TMPFILE=%s\nOP_PREFLIGHT_FIREBASE_PROJECT=proj-gamma\n' \
+    "$sa_path" "$sa_path" >> "$cache_dir/op-preflight-claude.env"
+  rm -f "$sa_ok" "$adc_ok"
+  run_deploy deploy-refresh-fail-2 --refresh || true
+  if run_deploy deploy-after-fail-2; then
+    fail "no-evict: after a failed --refresh, plain --mode deploy fell back to pre-slot session deploy fields; out=$(cat "$case_dir/proj-gamma/deploy-after-fail-2.out")"
+    return
+  fi
+  if ! grep -q '^OP_PREFLIGHT_REVIEWER_PAT=ne-reviewer-pat$' "$cache_dir/op-preflight-claude.env"; then
+    fail "no-evict: invalidating deploy fields dropped the cached PATs from the session file"
+    return
+  fi
+  pass "test_failed_fetch_does_not_evict_shared_deploy_files: a failed deploy --refresh also strips pre-slot session deploy fields, PATs kept"
 }
 
 # ---------------------------------------------------------------------------
