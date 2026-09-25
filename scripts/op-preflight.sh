@@ -328,14 +328,20 @@ SSH_WARM_TTL_SECONDS="${OP_PREFLIGHT_SSH_WARM_TTL_SECONDS:-1800}"  # 30 min defa
 # ── Clearing deploy variables in the CALLER's shell ───────────────────
 # Emitted (and evaluated by the caller) before any deploy export, on review
 # hits, deploy/all hits, full fetches and deploy failures. It clears the
-# preflight markers and CF_API_TOKEN unconditionally, but clears
+# preflight markers unconditionally, but clears
 # GOOGLE_APPLICATION_CREDENTIALS only when a preflight marker in that shell
 # proves preflight put it there: a value with no matching marker is the
 # human override DEPLOYMENT.md ranks first (Codex on #1318), and a degraded
 # or failed run must not erase it. It runs in the caller (bash or zsh), so
 # it is plain POSIX test syntax.
 # shellcheck disable=SC2016  # expands in the caller's shell, by design
-DEPLOY_CLEAR_STMT='if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && { [ "$GOOGLE_APPLICATION_CREDENTIALS" = "${OP_PREFLIGHT_ADC_TMPFILE:-}" ] || [ "$GOOGLE_APPLICATION_CREDENTIALS" = "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" ]; }; then unset GOOGLE_APPLICATION_CREDENTIALS; fi; unset OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN'
+DEPLOY_CLEAR_STMT='if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && { [ "$GOOGLE_APPLICATION_CREDENTIALS" = "${OP_PREFLIGHT_ADC_TMPFILE:-}" ] || [ "$GOOGLE_APPLICATION_CREDENTIALS" = "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" ]; }; then unset GOOGLE_APPLICATION_CREDENTIALS; fi; unset OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT'
+# CF_API_TOKEN carries no ownership marker and is one shared purge token, not
+# a per-project identity, so deploy/all output only ever (re)exports it and
+# never clears it: an ambient token survives a run whose optional 1Password
+# read failed (Codex on #1318). A review-mode request keeps #466's behavior
+# of clearing every deploy variable, CF_API_TOKEN included.
+REVIEW_CLEAR_STMT="$DEPLOY_CLEAR_STMT; unset CF_API_TOKEN"
 
 # ── Deploy-credential slots (one per Firebase-project context) ────────
 # Deploy credentials are cached per context, not per agent: one slot per
@@ -429,9 +435,12 @@ json_string_field_no_python() {
 # json.loads duplicate-key semantics (the last root "projects" and the last
 # "default" in it win; a non-string or empty default is no project). String
 # escapes are decoded like json.loads (\uXXXX -> UTF-8, surrogate pairs
-# joined; LC_ALL=C so %c emits raw bytes in every awk); an invalid escape
-# fails the file as json.loads does, and a lone surrogate, which python
-# cannot print, yields no project. It is not a general JSON validator.
+# joined; LC_ALL=C so %c emits raw bytes in every awk); a lone surrogate,
+# which python cannot print, yields no project. It is ALSO a strict JSON
+# validator (grammar, trailing input, number/literal forms including
+# json.loads' NaN/Infinity, raw control characters, UTF-8 validity): a
+# malformed or truncated .firebaserc selects no project, as python and the
+# Firebase CLI reject it, rather than whatever prefix looked valid.
 firebaserc_default_project_no_python() {
   [[ -f .firebaserc ]] || return 1
   LC_ALL=C awk '
@@ -451,79 +460,127 @@ firebaserc_default_project_no_python() {
       if (cp < 65536) return sprintf("%c%c%c", 224 + int(cp / 4096), 128 + int(cp / 64) % 64, 128 + cp % 64)
       return sprintf("%c%c%c%c", 240 + int(cp / 262144), 128 + int(cp / 4096) % 64, 128 + int(cp / 64) % 64, 128 + cp % 64)
     }
+    # Consumed one scalar/container value at the current depth.
+    function after_value() {
+      if (depth == 0) expect = "done"
+      else if (st[depth] == "o") expect = "comma_or_end_o"
+      else expect = "comma_or_end_a"
+    }
+    function is_value_state() { return expect == "value" || expect == "value_or_end_a" }
+    BEGIN { for (b = 1; b < 256; b++) ord[sprintf("%c", b)] = b }
     { text = text $0 "\n" }
     END {
-      n = length(text); depth = 0; in_str = 0; esc = 0; str = ""; bad = 0
-      key = ""; after_colon = 0; proj_depth = 0; val = ""; seen = 0
+      n = length(text); depth = 0; expect = "value"
+      proj_depth = 0; val = ""; seen = 0
       for (i = 1; i <= n; i++) {
         c = substr(text, i, 1)
-        if (in_str) {
-          if (esc) {
-            esc = 0
-            if (c == "u") {
-              cp = hexval(substr(text, i + 1, 4))
-              if (cp < 0) exit 1
-              i += 4
-              if (cp >= 55296 && cp <= 56319) {
-                lo = (substr(text, i + 1, 2) == "\\u") ? hexval(substr(text, i + 3, 4)) : -1
-                if (lo >= 56320 && lo <= 57343) { cp = 65536 + (cp - 55296) * 1024 + (lo - 56320); i += 6 }
-                else { bad = 1; continue }
-              } else if (cp >= 56320 && cp <= 57343) { bad = 1; continue }
-              str = str utf8(cp)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r") continue
+        if (expect == "done") exit 1
+        if (c == "\"") {
+          # String token: decode escapes, reject raw control chars and
+          # invalid UTF-8 (python reads the file as UTF-8 and json.loads is
+          # strict about control characters).
+          str = ""; bad = 0; closed = 0
+          for (i++; i <= n; i++) {
+            c = substr(text, i, 1); o = ord[c]
+            if (c == "\"") { closed = 1; break }
+            if (o < 32) exit 1
+            if (c == "\\") {
+              i++; c = substr(text, i, 1)
+              if (c == "u") {
+                cp = hexval(substr(text, i + 1, 4))
+                if (cp < 0) exit 1
+                i += 4
+                if (cp >= 55296 && cp <= 56319) {
+                  lo = (substr(text, i + 1, 2) == "\\u") ? hexval(substr(text, i + 3, 4)) : -1
+                  if (lo >= 56320 && lo <= 57343) { cp = 65536 + (cp - 55296) * 1024 + (lo - 56320); i += 6 }
+                  else { bad = 1; continue }
+                } else if (cp >= 56320 && cp <= 57343) { bad = 1; continue }
+                str = str utf8(cp)
+              }
+              else if (c == "\"" || c == "\\" || c == "/") str = str c
+              else if (c == "n") str = str "\n"
+              else if (c == "t") str = str "\t"
+              else if (c == "r") str = str "\r"
+              else if (c == "b") str = str "\b"
+              else if (c == "f") str = str "\f"
+              else exit 1
+              continue
             }
-            else if (c == "\"" || c == "\\" || c == "/") str = str c
-            else if (c == "n") str = str "\n"
-            else if (c == "t") str = str "\t"
-            else if (c == "r") str = str "\r"
-            else if (c == "b") str = str "\b"
-            else if (c == "f") str = str "\f"
-            else exit 1
+            if (o >= 128) {
+              if (o >= 194 && o <= 223) { need = 1; lo_b = 128; hi_b = 191 }
+              else if (o == 224) { need = 2; lo_b = 160; hi_b = 191 }
+              else if ((o >= 225 && o <= 236) || o == 238 || o == 239) { need = 2; lo_b = 128; hi_b = 191 }
+              else if (o == 237) { need = 2; lo_b = 128; hi_b = 159 }
+              else if (o == 240) { need = 3; lo_b = 144; hi_b = 191 }
+              else if (o >= 241 && o <= 243) { need = 3; lo_b = 128; hi_b = 191 }
+              else if (o == 244) { need = 3; lo_b = 128; hi_b = 143 }
+              else exit 1
+              seq = c
+              for (k = 1; k <= need; k++) {
+                cb = ord[substr(text, i + k, 1)]
+                if (k == 1 && (cb < lo_b || cb > hi_b)) exit 1
+                if (k > 1 && (cb < 128 || cb > 191)) exit 1
+                seq = seq substr(text, i + k, 1)
+              }
+              i += need; str = str seq
+              continue
+            }
+            str = str c
+          }
+          if (!closed) exit 1
+          if (expect == "key_or_end" || expect == "key") {
+            keys[depth] = str; expect = "colon"
             continue
           }
-          if (c == "\\") { esc = 1; continue }
-          if (c != "\"") { str = str c; continue }
-          in_str = 0
-          if (after_colon) {
-            if (proj_depth && depth == proj_depth && key == "default") val = (bad ? "" : str)
-            if (depth == 1 && key == "projects") { val = ""; seen = 1 }
-            after_colon = 0
-          } else {
-            key = str
+          if (!is_value_state()) exit 1
+          if (st[depth] == "o" && depth == proj_depth && keys[depth] == "default") val = (bad ? "" : str)
+          if (depth == 1 && st[1] == "o" && keys[1] == "projects") { val = ""; seen = 1 }
+          after_value()
+          continue
+        }
+        if (c == "{" || c == "[") {
+          if (!is_value_state()) exit 1
+          if (depth == 1 && st[1] == "o" && keys[1] == "projects") {
+            val = ""; seen = 1
+            if (c == "{") proj_depth = 2
           }
+          depth++; st[depth] = (c == "{") ? "o" : "a"; keys[depth] = ""
+          expect = (c == "{") ? "key_or_end" : "value_or_end_a"
           continue
         }
-        if (c == "\"") { in_str = 1; str = ""; bad = 0; continue }
+        if (c == "}" || c == "]") {
+          if (c == "}" && expect != "key_or_end" && expect != "comma_or_end_o") exit 1
+          if (c == "]" && expect != "value_or_end_a" && expect != "comma_or_end_a") exit 1
+          if (depth == proj_depth) proj_depth = 0
+          depth--
+          after_value()
+          continue
+        }
         if (c == ":") {
-          after_colon = 1
-          if (proj_depth && depth == proj_depth && key == "default") val = ""
+          if (expect != "colon") exit 1
+          if (depth == proj_depth && keys[depth] == "default") val = ""
+          expect = "value"
           continue
         }
-        if (c == "{") {
-          depth++
-          if (after_colon && depth == 2 && key == "projects") { proj_depth = 2; val = ""; seen = 1 }
-          after_colon = 0; key = ""
+        if (c == ",") {
+          if (expect == "comma_or_end_o") expect = "key"
+          else if (expect == "comma_or_end_a") expect = "value"
+          else exit 1
           continue
         }
-        if (c == "}") {
-          if (proj_depth && depth == proj_depth) proj_depth = 0
-          depth--; after_colon = 0; key = ""
-          continue
-        }
-        if (c == "[") {
-          if (after_colon && depth == 1 && key == "projects") { val = ""; seen = 1 }
-          depth++; after_colon = 0; key = ""
-          continue
-        }
-        if (c == "]") { depth--; after_colon = 0; key = ""; continue }
-        if (c == ",") { after_colon = 0; key = ""; continue }
-        if (after_colon && proj_depth && depth == proj_depth && key == "default" && c !~ /[[:space:]]/) {
-          # non-string value (number/true/null...) for default
-          val = ""; after_colon = 0
-        }
-        # A root "projects" whose value is not an object discards any earlier one.
-        if (after_colon && depth == 1 && key == "projects" && c !~ /[[:space:]]/) { val = ""; seen = 1; after_colon = 0 }
+        # Number or literal: take the maximal run and validate it exactly
+        # as json.loads would (it also accepts NaN / Infinity / -Infinity).
+        if (!is_value_state()) exit 1
+        tok = ""
+        while (i <= n && substr(text, i, 1) ~ /[A-Za-z0-9+.-]/) { tok = tok substr(text, i, 1); i++ }
+        i--
+        if (tok !~ /^(true|false|null|NaN|Infinity|-Infinity)$/ && \
+            tok !~ /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?$/) exit 1
+        if (depth == 1 && st[1] == "o" && keys[1] == "projects") { val = ""; seen = 1 }
+        after_value()
       }
-      if (!seen || val == "") exit 1
+      if (expect != "done" || !seen || val == "") exit 1
       print val
     }
   ' .firebaserc
@@ -922,9 +979,21 @@ emit_from_session_file() (
     # the slot and actually carries a credential, it wins; its fields then
     # go through the same pre-slot project/usability checks below. A
     # slot-aware writer never puts deploy fields in the session file, so
-    # this only ever fires for a pre-slot write.
+    # this only ever fires for a pre-slot write. It must also be for THIS
+    # context (Codex on #1318): a pre-slot Firebase SA only for the current
+    # project, and pre-slot ADC (which records no project) only for the
+    # `adc` context -- never over a Firebase project's slot, which would
+    # swap the project SA for the shared ADC.
     legacy_supersedes_slot=false
-    if [[ -f "$deploy_slot_file" && -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+    legacy_context_matches=false
+    if [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" \
+          && "${GOOGLE_APPLICATION_CREDENTIALS:-}" == "$OP_PREFLIGHT_FIREBASE_SA_TMPFILE" ]]; then
+      [[ -n "$current_firebase_project" && "${OP_PREFLIGHT_FIREBASE_PROJECT:-}" == "$current_firebase_project" ]] \
+        && legacy_context_matches=true
+    elif [[ -z "$current_firebase_project" ]]; then
+      legacy_context_matches=true
+    fi
+    if [[ -f "$deploy_slot_file" && -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && $legacy_context_matches; then
       slot_created="$(grep '^OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=' "$deploy_slot_file" | cut -d= -f2- | tr -d "'\"" || true)"
       session_created="${OP_PREFLIGHT_CREATED_AT_EPOCH:-}"
       if [[ "$slot_created" =~ ^[0-9]+$ && "$session_created" =~ ^[0-9]+$ ]] \
@@ -1068,7 +1137,7 @@ emit_from_session_file() (
     # shell, so a review session does not retain stale deploy creds in its
     # environment (not just refrain from re-exporting them). Emitting unset
     # is idempotent when the caller never had them.
-    printf '%s\n' "$DEPLOY_CLEAR_STMT"
+    printf '%s\n' "$REVIEW_CLEAR_STMT"
   fi
   printf 'export OP_PREFLIGHT_DONE=1\n'
   printf 'export OP_PREFLIGHT_AGENT=%q\n' "$AGENT"
@@ -1183,6 +1252,14 @@ emit_check_failure_guard() {
 # per-project SA files that is a LIVE key for another project (Codex on
 # #1318), so the next deploy would run under the wrong identity. Clear the
 # deploy variables, then fail the eval.
+# A failed --mode deploy (typically --refresh during a key rotation or
+# revocation) must also invalidate this context's slot: otherwise the next
+# plain --mode deploy finds it fresh and silently re-exports the old key
+# without asking 1Password (Codex on #1318). The key FILE stays, because
+# shells that already exported it are still using it.
+invalidate_deploy_slot() {
+  rm -f "$(deploy_slot_file_for "${firebase_project:-}")"
+}
 emit_deploy_failure_guard() {
   printf '%s\n' "$DEPLOY_CLEAR_STMT"
   emit_eval_guard "--mode deploy loaded no deploy credential for Firebase project '${firebase_project:-none}'; deploy variables cleared (see stderr)"
@@ -1543,7 +1620,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
         # `exit 2` failure mode replayed on the full-fetch path — symmetric to
         # the line-696 cache-hit guard. `--mode all` deliberately keeps
         # degrading (callers still want the PATs), so scope this to deploy.
-        if [[ "$MODE" == "deploy" ]]; then emit_deploy_failure_guard; exit 1; fi
+        if [[ "$MODE" == "deploy" ]]; then invalidate_deploy_slot; emit_deploy_failure_guard; exit 1; fi
       fi
     else
       adc_op_reason="$(scrub_op_error "$ADC_OP_ERR")"
@@ -1555,7 +1632,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
       fi
       SUMMARY+=("GCP ADC: SKIPPED (not available)")
       # Fail closed (#534.2): see STALE branch above.
-      if [[ "$MODE" == "deploy" ]]; then emit_deploy_failure_guard; exit 1; fi
+      if [[ "$MODE" == "deploy" ]]; then invalidate_deploy_slot; emit_deploy_failure_guard; exit 1; fi
     fi
   fi
 

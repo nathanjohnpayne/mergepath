@@ -1732,6 +1732,15 @@ test_all_mode_degraded_deploy_does_not_reprompt() {
     fail "all-degraded: degraded cache hit erased a human-override GOOGLE_APPLICATION_CREDENTIALS (got '$kept')"
     return
   fi
+  # An ambient CF_API_TOKEN (no ownership marker exists for it) survives a
+  # deploy/all run whose optional Cloudflare read failed.
+  # shellcheck disable=SC2016  # expanded by the child bash, by design
+  kept=$(CF_API_TOKEN=ambient-cf-token bash -c \
+    'eval "$(grep -v "^export OP_PREFLIGHT_.*_PAT=" "$1")"; printf %s "${CF_API_TOKEN:-}"' _ "$case_dir/run2.out")
+  if [ "$kept" != "ambient-cf-token" ]; then
+    fail "all-degraded: a deploy/all hit erased an ambient CF_API_TOKEN (got '$kept')"
+    return
+  fi
   if ! grep -q "deploy credentials unavailable" "$case_dir/run2.err"; then
     fail "all-degraded: degraded cache hit did not warn that deploy creds are missing; stderr=$(cat "$case_dir/run2.err")"
     return
@@ -2075,6 +2084,38 @@ EOF
     fi
   done
   pass "test_failed_fetch_does_not_evict_shared_deploy_files: a failed SA refetch leaves the exported key intact, no staged leftovers"
+
+  # 4. A failed `--mode deploy --refresh` (key rotated or revoked) must
+  #    invalidate proj-gamma's slot, so the next plain `--mode deploy` does
+  #    not silently re-export the old key -- while the key FILE itself stays
+  #    for shells already using it.
+  run_deploy() { # <label> [--refresh]
+    local label="$1"
+    shift
+    (cd "$case_dir/proj-gamma" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+      GCP_ADC_OP_URI="op://Private/test-no-evict-adc/credential" \
+      "$SCRIPT" --agent claude --mode deploy "$@" >"$case_dir/proj-gamma/$label.out" 2>"$case_dir/proj-gamma/$label.err")
+  }
+  touch "$sa_ok"
+  if ! run_deploy deploy-load; then
+    fail "no-evict: --mode deploy load failed; stderr=$(cat "$case_dir/proj-gamma/deploy-load.err")"
+    return
+  fi
+  sa_path=$(sed -n "s/^export GOOGLE_APPLICATION_CREDENTIALS=//p" "$case_dir/proj-gamma/deploy-load.out")
+  rm -f "$sa_ok" "$adc_ok"
+  if run_deploy deploy-refresh-fail --refresh; then
+    fail "no-evict: --mode deploy --refresh with no credential available succeeded"
+    return
+  fi
+  if run_deploy deploy-after-fail; then
+    fail "no-evict: after a failed --refresh, plain --mode deploy re-exported the old key from the slot; out=$(cat "$case_dir/proj-gamma/deploy-after-fail.out")"
+    return
+  fi
+  if [ ! -s "$sa_path" ]; then
+    fail "no-evict: the failed refresh deleted the key file ($sa_path) shells may still be using"
+    return
+  fi
+  pass "test_failed_fetch_does_not_evict_shared_deploy_files: a failed deploy --refresh invalidates the slot but keeps the key file"
 }
 
 # ---------------------------------------------------------------------------
@@ -2190,6 +2231,20 @@ test_firebaserc_parsers_agree() {
     'surrogate-pair|{ "projects": { "default": "x\ud83d\ude00y" } }'
     'lone-surrogate|{ "projects": { "default": "x\ud83dy" } }'
     'invalid-escape|{ "projects": { "default": "a\qb" } }'
+    'truncated-then-garbage|{"projects":{"default":"prod"}} BROKEN'
+    'unclosed-root|{"projects":{"default":"prod"}'
+    'trailing-comma|{"projects":{"default":"prod",}}'
+    'line-comment|{"projects":{"default":"prod"}} // note'
+    'two-top-level-values|{"projects":{"default":"prod"}} {}'
+    'missing-colon|{"projects" {"default":"prod"}}'
+    'leading-zero-number|{"n": 01, "projects":{"default":"prod"}}'
+    'trailing-dot-number|{"n": 1., "projects":{"default":"prod"}}'
+    'plus-number|{"n": +1, "projects":{"default":"prod"}}'
+    'python-literals-ok|{"n": NaN, "m": -Infinity, "o": Infinity, "projects":{"default":"prod"}}'
+    'numbers-and-literals-ok|{"n": [-0, 1.5e3, 2E-2, 0.25, true, false, null, []], "projects":{"default":"prod"}}'
+    'top-level-array|[{"projects":{"default":"prod"}}]'
+    'top-level-scalar|"prod"'
+    'empty|'
   )
   local entry name json py awkv
   # shellcheck disable=SC2016  # "$1" expands in the child bash, by design
@@ -2205,7 +2260,33 @@ test_firebaserc_parsers_agree() {
       return
     fi
   done
-  pass "test_firebaserc_parsers_agree: no-python .firebaserc parser matches the python parser on ${#cases[@]} cases"
+  # Raw-byte cases need printf's octal escapes in the FORMAT (so '%' is never
+  # in these fixtures): a raw control character, valid and invalid UTF-8
+  # (bad lead byte, overlong, UTF-8-encoded surrogate) and a leading BOM.
+  local -a raw_cases=(
+    'raw-control-char|{"projects":{"default":"pr\001od"}}'
+    'raw-valid-utf8|{"projects":{"default":"caf\303\251"}}'
+    'raw-invalid-lead-byte|{"note":"\377","projects":{"default":"prod"}}'
+    'raw-overlong|{"note":"\300\257","projects":{"default":"prod"}}'
+    'raw-encoded-surrogate|{"note":"\355\240\200","projects":{"default":"prod"}}'
+    'raw-truncated-sequence|{"note":"\342\202","projects":{"default":"prod"}}'
+    'raw-bom|\357\273\277{"projects":{"default":"prod"}}'
+  )
+  # shellcheck disable=SC2016  # "$1" expands in the child bash, by design
+  for entry in "${raw_cases[@]}"; do
+    name="${entry%%|*}"
+    json="${entry#*|}"
+    mkdir -p "$case_dir/$name"
+    # shellcheck disable=SC2059  # the fixture IS the format: octal escapes, no '%'
+    printf "$json\n" > "$case_dir/$name/.firebaserc"
+    py=$(cd "$case_dir/$name" && env -u OP_PREFLIGHT_FIREBASE_PROJECT_ID bash -c '. "$1"; detect_firebase_project' _ "$case_dir/parsers.sh" 2>/dev/null || true)
+    awkv=$(cd "$case_dir/$name" && bash -c '. "$1"; firebaserc_default_project_no_python' _ "$case_dir/parsers.sh" 2>/dev/null || true)
+    if [ "$py" != "$awkv" ]; then
+      fail "firebaserc-parity[$name]: python parser '$py' != no-python parser '$awkv'"
+      return
+    fi
+  done
+  pass "test_firebaserc_parsers_agree: no-python .firebaserc parser matches the python parser on $(( ${#cases[@]} + ${#raw_cases[@]} )) cases"
 }
 
 # ---------------------------------------------------------------------------
@@ -2246,7 +2327,33 @@ test_newer_pre_slot_write_supersedes_slot() {
       return
     fi
   done
-  pass "test_newer_pre_slot_write_supersedes_slot: newer pre-slot deploy fields win, older ones do not"
+  # ...but only for the SAME context. In a Firebase repo with a valid project
+  # SA slot, a newer pre-slot write of shared ADC or of ANOTHER project's SA
+  # must not displace the slot (no swap to ADC, no refetch: op aborts here).
+  local fb_slot="$cache_dir/op-preflight-claude-deploy-fb-proj-kappa.slot" sa_file="$cache_dir/kappa-sa.json" variant
+  mkdir -p "$case_dir/kappa"
+  printf '{ "projects": { "default": "proj-kappa" } }\n' > "$case_dir/kappa/.firebaserc"
+  for variant in adc other-project-sa; do
+    rm -rf "$cache_dir"
+    make_aged_cache "$cache_dir" claude 0 "lv-reviewer-pat" "lv-author-pat"
+    printf '{"type": "service_account", "client_email": "firebase-deployer@proj-kappa.iam.gserviceaccount.com"}\n' > "$sa_file"
+    printf '{"type": "service_account", "client_email": "legacy@example.iam.gserviceaccount.com"}\n' > "$adc_file"
+    if [ "$variant" = adc ]; then
+      printf 'GOOGLE_APPLICATION_CREDENTIALS=%s\nOP_PREFLIGHT_ADC_TMPFILE=%s\n' "$adc_file" "$adc_file" >> "$cache_dir/op-preflight-claude.env"
+    else
+      printf 'GOOGLE_APPLICATION_CREDENTIALS=%s\nOP_PREFLIGHT_FIREBASE_SA_TMPFILE=%s\nOP_PREFLIGHT_FIREBASE_PROJECT=proj-other\n' "$adc_file" "$adc_file" >> "$cache_dir/op-preflight-claude.env"
+    fi
+    printf "OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=%s\nOP_PREFLIGHT_DEPLOY_CONTEXT=proj-kappa\nGOOGLE_APPLICATION_CREDENTIALS=%s\nOP_PREFLIGHT_FIREBASE_SA_TMPFILE=%s\nOP_PREFLIGHT_FIREBASE_PROJECT=proj-kappa\n" \
+      "$(( $(date +%s) - 300 ))" "$sa_file" "$sa_file" > "$fb_slot"
+    rc=0
+    out=$(cd "$case_dir/kappa" && PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+      "$SCRIPT" --agent claude --mode all --skip-ssh 2>"$case_dir/kappa-$variant.err") || rc=$?
+    if [ "$rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -q "^export GOOGLE_APPLICATION_CREDENTIALS=$sa_file$"; then
+      fail "legacy-vs-slot[$variant]: a newer pre-slot write for another context displaced proj-kappa's SA slot (rc=$rc); out=$(printf '%s\n' "$out" | grep -v PAT) err=$(cat "$case_dir/kappa-$variant.err")"
+      return
+    fi
+  done
+  pass "test_newer_pre_slot_write_supersedes_slot: newer pre-slot deploy fields win, older ones do not, other contexts never"
 }
 
 test_check_fresh_cache
