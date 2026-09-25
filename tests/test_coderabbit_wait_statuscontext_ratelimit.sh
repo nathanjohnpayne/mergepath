@@ -624,6 +624,23 @@ test_legacy_leading_refusal_stays_current() {
   [ "$FAIL" -ne "$before" ] || pass "3b6: a provider-owned leading legacy rate-limit notice remains authoritative"
 }
 
+test_provider_leading_nonreview_run_stays_refused() {
+  local mode body dir rc before=$FAIL reviews
+  for mode in progress narration; do
+    case "$mode" in
+      progress) body='Currently reviewing the latest changes.' ;;
+      narration) body='<!-- CodeRabbit review command invocation: status -->
+Here is a summary of where things stand.' ;;
+    esac
+    dir=$(make_case "headref-leading-$mode-run" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+    reviews=$(jq -nc --arg body "$body" '[{"id":8806,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":$body}]')
+    rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+    [ "$rc" = "5" ] || fail "3b7 $mode: provider-leading non-review body should not release refusal, got $rc; err=$(tail -5 "$dir/err.log")"
+    grep -q 'carries provider-owned' "$dir/err.log" || fail "3b7 $mode: expected provider-owned non-review log"
+  done
+  [ "$FAIL" -ne "$before" ] || pass "3b7: provider-leading in-progress and narration bodies cannot release the current refusal"
+}
+
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
 test_current_refusal_with_bodyless_ack_stays_refused() {
   local dir rc before=$FAIL reviews
@@ -2424,6 +2441,7 @@ test_summary_owned_refusal_stays_current
 test_current_refusal_with_nonbenign_head_review_stays_refused
 test_current_refusal_with_review_quoting_progress_clears
 test_legacy_leading_refusal_stays_current
+test_provider_leading_nonreview_run_stays_refused
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
