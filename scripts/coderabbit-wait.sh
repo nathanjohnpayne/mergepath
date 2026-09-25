@@ -2712,12 +2712,13 @@ crw_active_rate_limit_notice() {
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
   local issue_comments current latest class comment_id comment_created_at comment_fresh_at comment_body
-  local current_class reviews head_run review_rc
+  local current_class reviews head_run review_rc run_id run_body marker_rc
   local active_notice active_id active_remaining active_rc
   # A current refusal with no run still enters the verdict scanner so existing
   # inline/summary findings are surfaced immediately.  The scanner consults
   # this flag at its clearance edge and returns to polling instead of clearing.
   STATUS_CONTEXT_CLEARANCE_REFUSAL=""
+  STATUS_CONTEXT_HEAD_RUN_FINDING=false
   # ONE fetch, shared by both checks below. Explicitly status-checked: a failed
   # fetch_api_array read reaches a caller only as a return status (#831), so an
   # unchecked read failure left the scan with empty input, every classifier
@@ -2748,7 +2749,15 @@ status_context_fast_path_blocked_by_comment() {
     return 0
   }
   if [ "$(printf '%s' "$current" | jq 'length')" != "0" ]; then
-    current_class=$(classify_comment "$(printf '%s' "$current" | jq -r '.body')")
+    comment_body=$(printf '%s' "$current" | jq -r '.body')
+    case "$comment_body" in
+      "<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->"*) current_class=rate_limit ;;
+      "<!-- This is an auto-generated comment: $PAUSED_MARKER -->"*) current_class=paused ;;
+      "> [!WARNING]"$'\n'"> ## Rate limit exceeded"*) current_class=rate_limit ;;
+      "> [!WARNING]"$'\n'"> ## Review limit reached"*) current_class=rate_limit ;;
+      "> [!WARNING]"$'\n'"> ## Reviews paused"*) current_class=paused ;;
+      *) current_class=review ;;
+    esac
     case "$current_class" in
       rate_limit|paused)
         reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || {
@@ -2762,6 +2771,28 @@ status_context_fast_path_blocked_by_comment() {
           return 0
         fi
         if [ -n "$head_run" ]; then
+          run_id=$(printf '%s' "$head_run" | jq -r '.id') || {
+            log "StatusContext success suppressed: the current-HEAD review id could not be decoded (#956)"
+            return 0
+          }
+          run_body=$(printf '%s' "$reviews" | jq -er --argjson id "$run_id" '.[] | select(.id == $id) | .body | select(type == "string" and length > 0)' | head -1) || {
+            log "StatusContext success suppressed: body-bearing review id=$run_id could not be read back for grading (#956)"
+            return 0
+          }
+          marker_rc=0
+          summary_blocking_marker_present "$run_body" || marker_rc=$?
+          case "$marker_rc" in
+            0)
+              STATUS_CONTEXT_HEAD_RUN_FINDING=true
+              log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id carries a blocking marker (#956)"
+              return 1
+              ;;
+            1) : ;;
+            *)
+              log "StatusContext success suppressed: body-bearing current-HEAD review id=$run_id could not be graded (#956)"
+              return 0
+              ;;
+          esac
           log "StatusContext success may proceed despite CodeRabbit's current $current_class comment: body-bearing review id=$(printf '%s' "$head_run" | jq -r '.id') is pinned to current HEAD $HEAD_SHA (#956)"
           return 1
         fi
@@ -3677,6 +3708,10 @@ emit_status_context_verdict() {
     }')
   if [ "$potential_issues" -gt 0 ]; then
     log "StatusContext $state but $potential_issues blocking (p0/p1) inline finding(s) on HEAD — emitting findings (exit 2)"
+    emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
+  fi
+  if [ "${STATUS_CONTEXT_HEAD_RUN_FINDING:-false}" = true ]; then
+    log "StatusContext $state but the body-bearing current-HEAD review carries a blocking marker — emitting findings (exit 2) (#956)"
     emit_json_and_exit "findings" 2 "$synthetic" "$potential_issues"
   fi
   # #877: the inline scan above is only ONE of the two surfaces a blocking

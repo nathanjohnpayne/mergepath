@@ -70,6 +70,17 @@ REVIEW_BODY_CLEAN='<!-- This is an auto-generated comment: summarize by coderabb
 
 Reviewed everything up to head-sha. LGTM!'
 
+REVIEW_BODY_CLEAN_QUOTING_REFUSALS='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+
+**Actionable comments posted: 0**
+
+Reviewed everything up to head-sha. The diff contains these literals:
+
+```
+rate limited by coderabbit.ai
+review paused by coderabbit.ai
+```'
+
 # A PR-level summary that classifies as `review` and carries a blocking marker
 # ONLY in the summary body — the #535 summary-only class. There are no inline
 # findings on this head at all, so `count_potential_issues_for_sha` returns 0
@@ -540,6 +551,26 @@ test_current_refusal_with_actual_head_review_clears() {
   [ "$FAIL" -ne "$before" ] || pass "3b: #956 — a body-bearing review run pinned to HEAD outranks the current refusal"
 }
 
+test_quoted_refusal_marker_is_not_current_refusal() {
+  local dir rc before=$FAIL
+  dir=$(make_case "quoted-refusal-clean-summary" "$REVIEW_BODY_CLEAN_QUOTING_REFUSALS" "2026-06-04T02:00:00Z")
+  rc=$(run_case "$dir")
+  [ "$rc" = "0" ] || fail "3b1: clean summary quoting refusal literals should clear, got $rc; err=$(tail -5 "$dir/err.log")"
+  grep -q 'grading-only because CodeRabbit' "$dir/err.log" && fail "3b1: quoted marker was treated as the provider's own refusal"
+  [ "$FAIL" -ne "$before" ] || pass "3b1: quoted or fenced refusal literals do not become the provider's current refusal"
+}
+
+test_current_refusal_with_blocking_head_review_is_findings() {
+  local dir rc before=$FAIL reviews
+  dir=$(make_case "headref-blocking-review" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  reviews='[{"id":8803,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"_🟠 Major_ | **Do not clear this review finding.**"}]'
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "2" ] || fail "3b2: blocking current-HEAD review body should emit findings, got $rc; err=$(tail -5 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "findings" ] || fail "3b2: status=$(jqf "$dir" '.status'), expected findings"
+  grep -q 'body-bearing current-HEAD review id=8803 carries a blocking marker' "$dir/err.log" || fail "3b2: expected review-body grading log"
+  [ "$FAIL" -ne "$before" ] || pass "3b2: a blocking marker in the exact-HEAD review body cannot release a refusal into clearance"
+}
+
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
 test_current_refusal_with_bodyless_ack_stays_refused() {
   local dir rc before=$FAIL reviews
@@ -945,7 +976,7 @@ test_misclassified_summary_is_still_graded() {
   rc=$(run_case "$dir")
   # Non-vacuity: the body must actually be misclassified, or the class filter
   # selects it directly and this is test 5 with a longer fixture.
-  grep -q 'current comment is paused' "$dir/err.log" \
+  grep -q 'class=paused' "$dir/err.log" \
     || fail "21: the fixture no longer misclassifies — classify_comment did not grade it paused; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
   grep -q 'entering fast-path verdict' "$dir/err.log" \
     || fail "21: the fast path was suppressed instead of entered — the fixture no longer reaches the selection; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
@@ -2333,6 +2364,9 @@ test_final_risk_marker_fallback() {
 }
 
 test_final_risk_marker_fallback
+
+test_quoted_refusal_marker_is_not_current_refusal
+test_current_refusal_with_blocking_head_review_is_findings
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
