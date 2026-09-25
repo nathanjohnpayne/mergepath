@@ -1732,6 +1732,21 @@ test_all_mode_degraded_deploy_does_not_reprompt() {
     fail "all-degraded: degraded cache hit erased a human-override GOOGLE_APPLICATION_CREDENTIALS (got '$kept')"
     return
   fi
+  # Propagation skew: a pre-slot consumer's NEWER session write that carries
+  # only CF_API_TOKEN (its SA/ADC failed) must not be discarded by the older
+  # degraded slot -- the next deploy's cache purge depends on it.
+  local sess="$cache_dir/op-preflight-claude.env" cf_out
+  grep -v '^CF_API_TOKEN=' "$sess" > "$sess.tmp"; mv "$sess.tmp" "$sess"
+  sed "s/^OP_PREFLIGHT_CREATED_AT_EPOCH=.*/OP_PREFLIGHT_CREATED_AT_EPOCH=$(date +%s)/" "$sess" > "$sess.tmp"; mv "$sess.tmp" "$sess"
+  printf 'CF_API_TOKEN=pre-slot-cf-token\n' >> "$sess"
+  sed "s/^OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=.*/OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=$(( $(date +%s) - 5 ))/" \
+    "$cache_dir/op-preflight-claude-deploy-adc.slot" > "$cache_dir/slot.tmp" && mv "$cache_dir/slot.tmp" "$cache_dir/op-preflight-claude-deploy-adc.slot"
+  cf_out=$(cd "$case_dir" && PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent claude --mode all --skip-ssh 2>/dev/null || true)
+  if ! printf '%s\n' "$cf_out" | grep -q '^export CF_API_TOKEN=pre-slot-cf-token$'; then
+    fail "all-degraded: a newer pre-slot CF_API_TOKEN was discarded by an older degraded slot"
+    return
+  fi
   # An ambient CF_API_TOKEN (no ownership marker exists for it) survives a
   # deploy/all run whose optional Cloudflare read failed.
   # shellcheck disable=SC2016  # expanded by the child bash, by design
@@ -2254,6 +2269,9 @@ test_firebaserc_parsers_agree() {
     'surrogate-pair|{ "projects": { "default": "x\ud83d\ude00y" } }'
     'lone-surrogate|{ "projects": { "default": "x\ud83dy" } }'
     'invalid-escape|{ "projects": { "default": "a\qb" } }'
+    'lone-surrogate-in-root-key|{ "pro\ud800jects": { "default": "wrong" }, "x": 1 }'
+    'lone-surrogate-in-default-key|{ "projects": { "def\udc00ault": "wrong", "default": "right" } }'
+    'lone-surrogate-key-only|{ "projects": { "def\ud800ault": "wrong" } }'
     'truncated-then-garbage|{"projects":{"default":"prod"}} BROKEN'
     'unclosed-root|{"projects":{"default":"prod"}'
     'trailing-comma|{"projects":{"default":"prod",}}'

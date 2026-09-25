@@ -436,7 +436,8 @@ json_string_field_no_python() {
 # "default" in it win; a non-string or empty default is no project). String
 # escapes are decoded like json.loads (\uXXXX -> UTF-8, surrogate pairs
 # joined; LC_ALL=C so %c emits raw bytes in every awk); a lone surrogate,
-# which python cannot print, yields no project. It is ALSO a strict JSON
+# which python cannot print, yields no project (and in a KEY never aliases
+# an ordinary key). It is ALSO a strict JSON
 # validator (grammar, trailing input, number/literal forms including
 # json.loads' NaN/Infinity, raw control characters, UTF-8 validity): a
 # malformed or truncated .firebaserc selects no project, as python and the
@@ -530,7 +531,10 @@ firebaserc_default_project_no_python() {
           }
           if (!closed) exit 1
           if (expect == "key_or_end" || expect == "key") {
-            keys[depth] = str; expect = "colon"
+            # A key holding a lone surrogate is a distinct key to json.loads;
+            # prefix a byte no decoded string can contain (0xFF is never
+            # valid UTF-8) so it can never alias "projects" or "default".
+            keys[depth] = (bad ? "\377" str : str); expect = "colon"
             continue
           }
           if (!is_value_state()) exit 1
@@ -1002,6 +1006,12 @@ emit_from_session_file() (
       fi
     fi
     if [[ -f "$deploy_slot_file" ]] && ! $legacy_supersedes_slot; then
+      # A pre-slot writer persists CF_API_TOKEN whether or not its deploy
+      # credential loaded, so a newer session-file token must survive the
+      # slot load on its own (Codex on #1318). Slot-aware writers never put
+      # it in the session file, so this only ever carries a pre-slot write.
+      session_cf_token="${CF_API_TOKEN:-}"
+      session_created="${OP_PREFLIGHT_CREATED_AT_EPOCH:-}"
       unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
       unset OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT
       unset CF_API_TOKEN
@@ -1009,6 +1019,10 @@ emit_from_session_file() (
       . "$deploy_slot_file"
       slot_created="${OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH:-}"
       [[ "$slot_created" =~ ^[0-9]+$ ]] || exit 2
+      if [[ -n "$session_cf_token" && "$session_created" =~ ^[0-9]+$ ]] \
+         && (( 10#$session_created > 10#$slot_created )); then
+        CF_API_TOKEN="$session_cf_token"
+      fi
       slot_age=$(( $(date +%s) - 10#$slot_created ))
       [[ "$slot_age" -ge 0 && "$slot_age" -lt "$TTL_SECONDS" ]] || exit 2
       [[ "${OP_PREFLIGHT_DEPLOY_CONTEXT-__unset__}" == "$current_firebase_project" ]] || exit 2
