@@ -1060,6 +1060,16 @@ emit_check_compat_guard() {
 emit_check_failure_guard() {
   emit_eval_guard "--check found no usable cache for agent=$AGENT (mode=$MODE); run: scripts/op-preflight.sh --agent $AGENT --mode $MODE"
 }
+# `--mode deploy` fails closed when no deploy credential loads, but a bare
+# `exit 1` prints nothing: `eval "$(...)"` then returns 0 and the caller keeps
+# whatever GOOGLE_APPLICATION_CREDENTIALS an earlier eval exported. With
+# per-project SA files that is a LIVE key for another project (Codex on
+# #1318), so the next deploy would run under the wrong identity. Clear the
+# deploy variables, then fail the eval.
+emit_deploy_failure_guard() {
+  printf 'unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN\n'
+  emit_eval_guard "--mode deploy loaded no deploy credential for Firebase project '${firebase_project:-none}'; deploy variables cleared (see stderr)"
+}
 
 if $CHECK; then
   if ! session_is_fresh; then
@@ -1416,7 +1426,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
         # `exit 2` failure mode replayed on the full-fetch path — symmetric to
         # the line-696 cache-hit guard. `--mode all` deliberately keeps
         # degrading (callers still want the PATs), so scope this to deploy.
-        if [[ "$MODE" == "deploy" ]]; then exit 1; fi
+        if [[ "$MODE" == "deploy" ]]; then emit_deploy_failure_guard; exit 1; fi
       fi
     else
       adc_op_reason="$(scrub_op_error "$ADC_OP_ERR")"
@@ -1428,7 +1438,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
       fi
       SUMMARY+=("GCP ADC: SKIPPED (not available)")
       # Fail closed (#534.2): see STALE branch above.
-      if [[ "$MODE" == "deploy" ]]; then exit 1; fi
+      if [[ "$MODE" == "deploy" ]]; then emit_deploy_failure_guard; exit 1; fi
     fi
   fi
 

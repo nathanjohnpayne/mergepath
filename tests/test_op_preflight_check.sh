@@ -2082,6 +2082,39 @@ test_check_selects_same_deploy_context_without_python() {
   pass "test_check_selects_same_deploy_context_without_python: writer and --check agree on the deploy slot"
 }
 
+# ---------------------------------------------------------------------------
+# test_deploy_failure_clears_inherited_credentials (Codex on #1318): a failed
+# `--mode deploy` used to print nothing, so `eval "$(...)"` returned 0 and the
+# caller kept an earlier project's GOOGLE_APPLICATION_CREDENTIALS -- now a
+# live per-project key -- and deployed project B as project A. The failure
+# output must clear the deploy variables AND fail the eval.
+# ---------------------------------------------------------------------------
+test_deploy_failure_clears_inherited_credentials() {
+  local case_dir="$WORKDIR/deploy-fail-clears"
+  local cache_dir="$case_dir/cache" bin_dir="$case_dir/bin"
+  mkdir -p "$cache_dir" "$bin_dir"
+  printf '{ "projects": { "default": "proj-zeta" } }\n' > "$case_dir/.firebaserc"
+  make_degraded_op_stub "$bin_dir" "$case_dir/op.log"
+  printf '{"type": "service_account", "client_email": "firebase-deployer@proj-a.iam.gserviceaccount.com"}\n' > "$case_dir/proj-a-key.json"
+
+  local result
+  # shellcheck disable=SC2016  # expanded by the child bash, by design
+  result=$(cd "$case_dir" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    GCP_ADC_OP_URI="op://Private/test-deploy-fail-adc/credential" \
+    GOOGLE_APPLICATION_CREDENTIALS="$case_dir/proj-a-key.json" \
+    bash -c 'f() { eval "$("$@" 2>/dev/null)"; }; f "$@"; printf "%s|%s" "$?" "${GOOGLE_APPLICATION_CREDENTIALS:-}"' \
+    _ "$SCRIPT" --agent claude --mode deploy)
+  if [ "${result%%|*}" = "0" ]; then
+    fail "deploy-fail-clears: eval of a failed --mode deploy returned 0 (result=$result)"
+    return
+  fi
+  if [ -n "${result#*|}" ]; then
+    fail "deploy-fail-clears: a failed --mode deploy left GOOGLE_APPLICATION_CREDENTIALS=${result#*|} (another project's key) set"
+    return
+  fi
+  pass "test_deploy_failure_clears_inherited_credentials: failed --mode deploy clears inherited deploy creds and fails the eval"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -2115,6 +2148,7 @@ test_all_mode_rejects_review_only_cache
 test_all_mode_alternating_firebase_projects_do_not_evict
 test_failed_fetch_does_not_evict_shared_deploy_files
 test_check_selects_same_deploy_context_without_python
+test_deploy_failure_clears_inherited_credentials
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
