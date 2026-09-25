@@ -83,10 +83,13 @@
 #                        plan may show "would open PR" even when a PR
 #                        already exists, but the live run will catch and
 #                        skip it.
-#   --repos r1,r2        Restrict to a comma-separated subset of consumer names.
+#   --repos r1,r2        Restrict to a comma-separated subset of consumer names
+#                        or owner/name repositories. Every selector must match
+#                        a manifest consumer.
 #   --paths glob         Restrict to manifest paths matching the glob (e.g.
 #                        "scripts/*", ".github/workflows/agent-review.yml").
-#                        `--files <glob>` is accepted as an alias.
+#                        `--files <glob>` is accepted as an alias. The glob
+#                        must select a managed path for every selected consumer.
 #   --files <glob>       Alias for --paths (matches #199 spec; --paths predates).
 #   --no-pr              Sync mode only. Push branches but skip the
 #                        `gh pr create` step. Useful for staging the
@@ -945,9 +948,17 @@ emit_skip_line() {
 # 1 otherwise. FILTER_REPOS / FILTER_PATHS are global vars set from CLI.
 in_repo_filter() {
   local name=$1
+  local repo=$2
   [ -z "${FILTER_REPOS:-}" ] && return 0
-  local re=",$FILTER_REPOS,"
-  [[ "$re" == *",$name,"* ]]
+  local selector
+  local -a selectors=()
+  IFS=',' read -r -a selectors <<< "$FILTER_REPOS"
+  for selector in "${selectors[@]}"; do
+    if [ "$selector" = "$name" ] || [ "$selector" = "$repo" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 in_path_filter() {
@@ -955,6 +966,80 @@ in_path_filter() {
   [ -z "${FILTER_PATHS:-}" ] && return 0
   # shellcheck disable=SC2053
   [[ "$p" == ${FILTER_PATHS} ]]
+}
+
+# Validate explicit filters against the manifest before mode drivers begin.
+# An unmatched repository filter previously meant a no-op successful run, and
+# a path filter could likewise silently select nothing for one consumer.
+# Fail before audit fetches, sync author-token checks, clones, pushes, or PR
+# writes so a caller can correct the selection without any delivery side effect.
+validate_filters() {
+  local manifest=$1
+  local consumers paths selector consumer_name consumer_repo
+  consumers=$(yq -r '.consumers[] | (.name + "\t" + .repo)' "$manifest")
+
+  if [ -n "${FILTER_REPOS:-}" ]; then
+    local -a selectors=() unmatched=() valid_consumers=()
+    local found
+    IFS=',' read -r -a selectors <<< "$FILTER_REPOS"
+    while IFS=$'\t' read -r consumer_name consumer_repo; do
+      [ -z "$consumer_name" ] && continue
+      valid_consumers+=("$consumer_name ($consumer_repo)")
+    done <<< "$consumers"
+
+    for selector in "${selectors[@]}"; do
+      found=0
+      while IFS=$'\t' read -r consumer_name consumer_repo; do
+        [ -z "$consumer_name" ] && continue
+        if [ "$selector" = "$consumer_name" ] || [ "$selector" = "$consumer_repo" ]; then
+          found=1
+          break
+        fi
+      done <<< "$consumers"
+      [ "$found" = "1" ] || unmatched+=("${selector:-<empty>}")
+    done
+
+    if [ "${#unmatched[@]}" -gt 0 ]; then
+      err "unknown --repos selector(s): ${unmatched[*]}"
+      err "valid consumers:"
+      local valid_consumer
+      for valid_consumer in "${valid_consumers[@]}"; do
+        err "  $valid_consumer"
+      done
+      return 2
+    fi
+  fi
+
+  [ -z "${FILTER_PATHS:-}" ] && return 0
+  paths=$(yq -r '
+    .paths[]
+    | (.path + "\t" + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+  ' "$manifest")
+
+  while IFS=$'\t' read -r consumer_name consumer_repo; do
+    [ -z "$consumer_name" ] && continue
+    if ! in_repo_filter "$consumer_name" "$consumer_repo"; then
+      continue
+    fi
+
+    found=0
+    local mp_path mp_consumers
+    while IFS=$'\t' read -r mp_path mp_consumers; do
+      [ -z "$mp_path" ] && continue
+      if ! in_path_filter "$mp_path"; then
+        continue
+      fi
+      if [ "$mp_consumers" = "all" ] || [[ ",$mp_consumers," == *",$consumer_name,"* ]]; then
+        found=1
+        break
+      fi
+    done <<< "$paths"
+
+    if [ "$found" != "1" ]; then
+      err "--paths '$FILTER_PATHS' selects no managed path for $consumer_name ($consumer_repo)"
+      return 2
+    fi
+  done <<< "$consumers"
 }
 
 # Run the audit. Sets $AUDIT_DRIFT_FOUND=1 if any non-OK status seen.
@@ -970,7 +1055,7 @@ run_audit() {
 
   while IFS=$'\t' read -r consumer_name consumer_repo; do
     [ -z "$consumer_name" ] && continue
-    if ! in_repo_filter "$consumer_name"; then
+    if ! in_repo_filter "$consumer_name" "$consumer_repo"; then
       continue
     fi
 
@@ -2890,7 +2975,7 @@ run_sync_all() {
   consumers=$(yq -r '.consumers[] | (.name + "\t" + .repo)' "$manifest")
   while IFS=$'\t' read -r consumer_name consumer_repo; do
     [ -z "$consumer_name" ] && continue
-    if ! in_repo_filter "$consumer_name"; then continue; fi
+    if ! in_repo_filter "$consumer_name" "$consumer_repo"; then continue; fi
     echo "$consumer_name ($consumer_repo)"
     sync_all_one_consumer "$consumer_name" "$consumer_repo" "$sha" "$dry_run"
     echo
@@ -2951,7 +3036,7 @@ run_sync() {
   consumers=$(yq -r '.consumers[] | (.name + "\t" + .repo)' "$manifest")
   while IFS=$'\t' read -r consumer_name consumer_repo; do
     [ -z "$consumer_name" ] && continue
-    if ! in_repo_filter "$consumer_name"; then continue; fi
+    if ! in_repo_filter "$consumer_name" "$consumer_repo"; then continue; fi
     sync_one_consumer "$consumer_name" "$consumer_repo" "$sha" "$subject" \
                       "$changed_files" "$dry_run"
   done <<< "$consumers"
@@ -3179,6 +3264,7 @@ export SYNC_NO_PR SYNC_SKIP_EXISTING SYNC_RECREATE_EXISTING SYNC_VERBOSE
 
 require_yq
 require_manifest
+validate_filters "$MERGEPATH_ROOT/$MANIFEST_PATH" || exit $?
 
 case "$MODE" in
   audit)
