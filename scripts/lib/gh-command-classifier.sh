@@ -631,11 +631,6 @@ gh_source_has_direct_literal_pr_mutation() {
   # real direct `gh api graphql` segment has been selected below.
   dynamic_scan=$(printf '%s\n' "$protected_source" \
     | tr '\n' ';' | tr -d "\"'") || return 2
-  # Active legacy backticks were rejected by the pre-lexer. Keep this
-  # defensive normalization so an unexpected raw delimiter cannot join words.
-  normalized=${dynamic_scan//\`/;}
-  literal_newline_boundary="${literal_newline};"
-  normalized=${normalized//"$literal_newline_boundary"/"$literal_newline"}
   # Option run between a command word and the next command word. Enumerating
   # the options we happen to know (-R/--repo/--hostname) is the FAIL-OPEN
   # shape: any option outside the list ends the match, so `gh --verbose pr
@@ -663,12 +658,43 @@ gh_source_has_direct_literal_pr_mutation() {
   # Only options whose VALUE no later check inspects may be collapsed here;
   # `-X`/`--method` and the field flags carry values the method and
   # implicit-write tests below read, so they are deliberately absent.
-  normalized=$(printf '%s\n' "$normalized" \
-    | sed -E 's/(^|[;&|()[:space:]])(-q|--jq|-t|--template|-H|--header|--cache)[[:space:]]+([^;&|()[:space:]]+)/\1\2=\3/g') \
-    || return 2
-  dynamic_scan=$(printf '%s\n' "$dynamic_scan" \
-    | sed -E 's/(^|[;&|()[:space:]])(-q|--jq|-t|--template|-H|--header|--cache)[[:space:]]+([^;&|()[:space:]]+)/\1\2=\3/g') \
-    || return 2
+  # Do not collapse options belonging to a wrapper before gh: rewriting
+  # `sudo -H gh` as `sudo -H=gh` erases the command we must inspect. Quoted
+  # whitespace and separators already carry literal markers, so tokenize only
+  # the unquoted boundaries here and reset at each shell command separator.
+  dynamic_scan=$(printf '%s\n' "$dynamic_scan" | LC_ALL=C awk '
+    function collapse(segment, words, n, i, active, result, word) {
+      n = split(segment, words, /[[:space:]]+/)
+      active = 0
+      result = ""
+      for (i = 1; i <= n; i++) {
+        word = words[i]
+        if (word == "") continue
+        if (word ~ /(^|\/)gh$/) active = 1
+        if (active && word ~ /^(-q|--jq|-t|--template|-H|--header|--cache)$/ && i < n) {
+          word = word "=" words[++i]
+        }
+        result = result (result == "" ? "" : " ") word
+      }
+      return result
+    }
+    {
+      segment = ""
+      for (pos = 1; pos <= length($0); pos++) {
+        char = substr($0, pos, 1)
+        if (char ~ /[;&|()]/) {
+          printf "%s%s", collapse(segment), char
+          segment = ""
+        } else segment = segment char
+      }
+      print collapse(segment)
+    }
+  ') || return 2
+  # Active legacy backticks were rejected by the pre-lexer. Keep this
+  # defensive normalization so an unexpected raw delimiter cannot join words.
+  normalized=${dynamic_scan//\`/;}
+  literal_newline_boundary="${literal_newline};"
+  normalized=${normalized//"$literal_newline_boundary"/"$literal_newline"}
   gh_opt_run='([[:space:]]+-[^;&|()[:space:]]*([[:space:]]+[^-;&|()[:space:]][^;&|()[:space:]]*)?)*'
   gh_command_start_re='(^|[;&|()[:space:]])([^;&|()[:space:]]*/)?gh'"$gh_opt_run"
   api_command_start_re="$gh_command_start_re"'[[:space:]]+api'
@@ -713,7 +739,9 @@ gh_source_has_direct_literal_pr_mutation() {
   # hidden behind another short flag (for example `-iXPUT` or `-iFkey=value`)
   # is ambiguous to the token-oriented checks below, so reject the cluster.
   if printf '%s\n' "$normalized" | grep -Eiq \
-    "$api_command_start_re"'[^;&|]*[[:space:]]+-[^-;&|()[:space:]][^;&|()[:space:]]*[XfF][^;&|()[:space:]]*([;&|()[:space:]]|$)'; then
+    "$api_command_start_re"'[^;&|]*[[:space:]]+-[^-;&|()[:space:]=][^;&|()[:space:]=]*[XfF][^;&|()[:space:]]*([;&|()[:space:]]|$)' \
+    || printf '%s\n' "$normalized" | grep -Eiq \
+      "$gh_command_start_re"'[[:space:]]+-[^-;&|()[:space:]=][^;&|()[:space:]=]*[XfF][^;&|()[:space:]]*'"$gh_opt_run"'[[:space:]]+api([;&|()[:space:]]|$)'; then
     return 0
   fi
 
@@ -798,7 +826,9 @@ gh_source_has_direct_literal_pr_mutation() {
   # input flag is supplied.  Permit that syntax only when this sole API call
   # explicitly pins GET; otherwise it is an implicit write even without -X.
   if printf '%s\n' "$normalized" | grep -Eiq \
-      "$api_command_start_re"'[[:space:]]+([^;&|]*[[:space:]])?((-f|-F)([^;&|()[:space:]]*|[[:space:]]+[^;&|()[:space:]]+)|--field([=;&|()[:space:]]|$)|--raw-field([=;&|()[:space:]]|$)|--input([=;&|()[:space:]]|$))'; then
+      "$api_command_start_re"'[[:space:]]+([^;&|]*[[:space:]])?((-f|-F)([^;&|()[:space:]]*|[[:space:]]+[^;&|()[:space:]]+)|--field([=;&|()[:space:]]|$)|--raw-field([=;&|()[:space:]]|$)|--input([=;&|()[:space:]]|$))' \
+    || printf '%s\n' "$normalized" | grep -Eiq \
+      "$gh_command_start_re"'[[:space:]]+(-[fF][^;&|()[:space:]]*|--(field|raw-field|input)(=[^;&|()[:space:]]*)?)([[:space:]]+[^-;&|()[:space:]][^;&|()[:space:]]*)?'"$gh_opt_run"'[[:space:]]+api([;&|()[:space:]]|$)'; then
     # The method flag is a gh option, so it is legal on either side of `api`
     # (`gh -X GET api search/issues -f q=x` is a read, and gh sends the fields
     # as a query string). Recognising a wider option run made that prefix form
