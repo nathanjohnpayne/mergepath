@@ -1628,6 +1628,178 @@ EOF
   pass "test_preflight_mode_is_exported: OP_PREFLIGHT_MODE exported on full-fetch path (#556)"
 }
 
+# ---------------------------------------------------------------------------
+# test_all_mode_degraded_deploy_does_not_reprompt: a `--mode all` full fetch
+# that cannot load any deploy credential (no .firebaserc, GCP ADC unreadable)
+# writes a cache without GOOGLE_APPLICATION_CREDENTIALS. The cache-hit path
+# used to treat that as cross-mode-invalidated and re-fetch — a fresh Touch ID
+# prompt on EVERY `--mode all` call (39 in ~1h on 2026-09-24, all logged as
+# reason=cross-mode-invalidation). The degradation is now recorded and reused
+# for a short backoff window, bounded by the contracts pinned below.
+# ---------------------------------------------------------------------------
+make_degraded_op_stub() { # <bin_dir> <op_log>
+  cat > "$1/op" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\${1:-}" >> "$2"
+case "\${1:-}" in
+  inject)
+    printf '%s\n' "REVIEWER_PAT=degraded-reviewer-pat"
+    printf '%s\n' "AUTHOR_PAT=degraded-author-pat"
+    ;;
+  read)
+    echo "[ERROR] could not read secret: item not found" >&2
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$1/op"
+}
+
+run_all_mode() { # <case_dir> <cache_dir> <bin_dir> <label> [extra env...]
+  local case_dir="$1" cache_dir="$2" bin_dir="$3" label="$4"
+  shift 4
+  local rc=0
+  (
+    cd "$case_dir"
+    env PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+      GCP_ADC_OP_URI="op://Private/test-degraded-adc/credential" "$@" \
+      "$SCRIPT" --agent claude --mode all --skip-ssh \
+      >"$case_dir/$label.out" 2>"$case_dir/$label.err"
+  ) || rc=$?
+  return "$rc"
+}
+
+count_lines() { # <file> <pattern>
+  grep -c "$2" "$1" 2>/dev/null || true
+}
+
+test_all_mode_degraded_deploy_does_not_reprompt() {
+  local case_dir="$WORKDIR/all-degraded"
+  local cache_dir="$case_dir/cache" bin_dir="$case_dir/bin"
+  local op_log="$case_dir/op.log" bio_log="$case_dir/cache/biometric-log"
+  mkdir -p "$cache_dir" "$bin_dir"
+  make_degraded_op_stub "$bin_dir" "$op_log"
+
+  # Run 1: cold cache -> one full fetch, degraded deploy leg.
+  if ! run_all_mode "$case_dir" "$cache_dir" "$bin_dir" run1; then
+    fail "all-degraded: first --mode all failed; stderr=$(cat "$case_dir/run1.err")"
+    return
+  fi
+  local op_calls_after_run1
+  op_calls_after_run1=$(wc -l < "$op_log" | tr -d ' ')
+
+  # Run 2: same context, within the window -> cache hit, ZERO op calls.
+  if ! run_all_mode "$case_dir" "$cache_dir" "$bin_dir" run2; then
+    fail "all-degraded: second --mode all failed; stderr=$(cat "$case_dir/run2.err")"
+    return
+  fi
+  if [ "$(wc -l < "$op_log" | tr -d ' ')" != "$op_calls_after_run1" ]; then
+    fail "all-degraded: second --mode all invoked op again (re-prompt loop); op log: $(tr '\n' ' ' < "$op_log")"
+    return
+  fi
+  if [ "$(count_lines "$op_log" '^inject$')" != "1" ] || [ "$(count_lines "$bio_log" 'mode=all')" != "1" ]; then
+    fail "all-degraded: expected exactly one op inject and one biometric-log entry across two runs; op=$(tr '\n' ' ' < "$op_log") bio=$(cat "$bio_log")"
+    return
+  fi
+  if ! grep -q "export OP_PREFLIGHT_REVIEWER_PAT=degraded-reviewer-pat" "$case_dir/run2.out" \
+     || ! grep -q "export OP_PREFLIGHT_AUTHOR_PAT=degraded-author-pat" "$case_dir/run2.out"; then
+    fail "all-degraded: degraded cache hit did not emit the cached PATs; out=$(cat "$case_dir/run2.out")"
+    return
+  fi
+  if grep -q "GOOGLE_APPLICATION_CREDENTIALS" "$case_dir/run2.out"; then
+    fail "all-degraded: degraded cache hit exported GOOGLE_APPLICATION_CREDENTIALS; out=$(cat "$case_dir/run2.out")"
+    return
+  fi
+  if ! grep -q "deploy credentials unavailable" "$case_dir/run2.err"; then
+    fail "all-degraded: degraded cache hit did not warn that deploy creds are missing; stderr=$(cat "$case_dir/run2.err")"
+    return
+  fi
+  if ! grep -q '^OP_PREFLIGHT_DEPLOY_DEGRADED=1$' "$cache_dir/op-preflight-claude.env"; then
+    fail "all-degraded: run 1 did not record the deploy degradation in the session file"
+    return
+  fi
+  pass "test_all_mode_degraded_deploy_does_not_reprompt: second --mode all with ADC unavailable makes no op call"
+
+  # --check --mode all reuses the degraded verdict too (and never runs op).
+  local rc=0
+  (cd "$case_dir" && PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent claude --mode all --check >/dev/null 2>"$case_dir/check.err") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "all-degraded: --check --mode all rejected a degraded cache within the window; stderr=$(cat "$case_dir/check.err")"
+    return
+  fi
+  pass "test_all_mode_degraded_deploy_does_not_reprompt: --check --mode all accepts the degraded cache"
+
+  # --mode deploy must never accept the degraded verdict: it re-fetches and
+  # fails closed (#534.2) rather than succeeding without a credential.
+  rc=0
+  (cd "$case_dir" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    GCP_ADC_OP_URI="op://Private/test-degraded-adc/credential" \
+    "$SCRIPT" --agent claude --mode deploy >"$case_dir/deploy.out" 2>/dev/null) || rc=$?
+  if [ "$rc" -eq 0 ] || grep -q "OP_PREFLIGHT_DONE=1" "$case_dir/deploy.out"; then
+    fail "all-degraded: --mode deploy accepted a degraded --mode all cache (rc=$rc)"
+    return
+  fi
+  pass "test_all_mode_degraded_deploy_does_not_reprompt: --mode deploy still fails closed on a degraded cache"
+
+  # A different Firebase-project context was never evaluated -> re-fetch.
+  local injects_before
+  injects_before=$(count_lines "$op_log" '^inject$')
+  if ! run_all_mode "$case_dir" "$cache_dir" "$bin_dir" run3 OP_PREFLIGHT_FIREBASE_PROJECT_ID=other-project; then
+    fail "all-degraded: --mode all in a new Firebase context failed; stderr=$(cat "$case_dir/run3.err")"
+    return
+  fi
+  if [ "$(count_lines "$op_log" '^inject$')" != "$((injects_before + 1))" ]; then
+    fail "all-degraded: a degraded verdict for project '' was reused for project 'other-project'"
+    return
+  fi
+  pass "test_all_mode_degraded_deploy_does_not_reprompt: a new Firebase-project context re-fetches"
+
+  # Window expired -> re-fetch, logged as a deliberate retry.
+  injects_before=$(count_lines "$op_log" '^inject$')
+  if ! run_all_mode "$case_dir" "$cache_dir" "$bin_dir" run4 OP_PREFLIGHT_FIREBASE_PROJECT_ID=other-project \
+       OP_PREFLIGHT_DEPLOY_DEGRADED_BACKOFF_SECONDS=0; then
+    fail "all-degraded: --mode all after the backoff window failed; stderr=$(cat "$case_dir/run4.err")"
+    return
+  fi
+  if [ "$(count_lines "$op_log" '^inject$')" != "$((injects_before + 1))" ] \
+     || ! tail -1 "$bio_log" | grep -q 'reason=deploy-degraded-retry'; then
+    fail "all-degraded: expired window did not re-fetch as deploy-degraded-retry; bio=$(cat "$bio_log")"
+    return
+  fi
+  pass "test_all_mode_degraded_deploy_does_not_reprompt: expired backoff window re-fetches (reason=deploy-degraded-retry)"
+}
+
+# ---------------------------------------------------------------------------
+# test_all_mode_rejects_review_only_cache (friends-and-family-billing#227
+# round 3): a review-only cache must never satisfy `--mode all`, even though
+# `all` may now accept a DEGRADED cache. The difference is the marker: a
+# review cache never attempted deploy creds, so `all` must fetch them.
+# ---------------------------------------------------------------------------
+test_all_mode_rejects_review_only_cache() {
+  local case_dir="$WORKDIR/all-rejects-review"
+  local cache_dir="$case_dir/cache" bin_dir="$case_dir/bin" op_log="$case_dir/op.log"
+  mkdir -p "$bin_dir"
+  make_fresh_cache "$cache_dir" claude "rev-only-pat" "auth-only-pat"
+  make_degraded_op_stub "$bin_dir" "$op_log"
+  if ! run_all_mode "$case_dir" "$cache_dir" "$bin_dir" run; then
+    fail "test_all_mode_rejects_review_only_cache: --mode all failed; stderr=$(cat "$case_dir/run.err")"
+    return
+  fi
+  if [ "$(count_lines "$op_log" '^inject$')" != "1" ] || ! grep -q '^read$' "$op_log"; then
+    fail "test_all_mode_rejects_review_only_cache: --mode all served a review-only cache without fetching deploy creds; op=$(cat "$op_log" 2>/dev/null)"
+    return
+  fi
+  if ! grep -q 'reason=cross-mode-invalidation' "$cache_dir/biometric-log"; then
+    fail "test_all_mode_rejects_review_only_cache: refetch not logged as cross-mode-invalidation"
+    return
+  fi
+  pass "test_all_mode_rejects_review_only_cache: review-only cache still cannot satisfy --mode all (#227 r3)"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -1656,6 +1828,8 @@ test_deploy_full_fetch_fails_closed_on_unreadable_adc
 test_deploy_full_fetch_fail_closed_structural
 test_check_rejects_cache_from_a_different_pat_item
 test_preflight_mode_is_exported
+test_all_mode_degraded_deploy_does_not_reprompt
+test_all_mode_rejects_review_only_cache
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

@@ -79,6 +79,13 @@
 #                             with the PAT TTL. Skipping re-warm within
 #                             this window prevents a biometric prompt on
 #                             every cache-hit invocation. See #163.
+#   OP_PREFLIGHT_DEPLOY_DEGRADED_BACKOFF_SECONDS
+#                             How long a `--mode all` cache written without
+#                             deploy credentials (no Firebase SA, no usable
+#                             ADC) satisfies later `--mode all` hits in the
+#                             same Firebase-project context before a fresh
+#                             fetch retries (default 900s = 15 min).
+#                             `--mode deploy` never accepts it.
 #   OP_PREFLIGHT_QUIET        When set to 1, suppress the verbose
 #                             cached-hit stderr block. A single-line
 #                             "# preflight: cache hit, no biometric
@@ -186,6 +193,21 @@ DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mergepath"
 CACHE_DIR="${OP_PREFLIGHT_CACHE_DIR:-$DEFAULT_CACHE_DIR}"
 DEFAULT_TTL_SECONDS=36000  # 10 hours
 TTL_SECONDS="${OP_PREFLIGHT_TTL_SECONDS:-$DEFAULT_TTL_SECONDS}"
+
+# How long a `--mode all` fetch that could NOT load a deploy credential
+# (no Firebase SA key for this project and no usable GCP ADC) is reused by
+# later `--mode all` cache hits before a fresh fetch retries it. Without
+# this window every `--mode all` hit re-fetched (the cache has no
+# GOOGLE_APPLICATION_CREDENTIALS), re-prompted biometric, wrote the same
+# degraded cache, and looped: 39 Touch ID prompts in ~1h on 2026-09-24.
+# Short on purpose — a human who fixes ADC is picked up within the window,
+# and --refresh retries immediately.
+DEFAULT_DEPLOY_DEGRADED_BACKOFF_SECONDS=900  # 15 min
+DEPLOY_DEGRADED_BACKOFF_SECONDS="${OP_PREFLIGHT_DEPLOY_DEGRADED_BACKOFF_SECONDS:-$DEFAULT_DEPLOY_DEGRADED_BACKOFF_SECONDS}"
+if [[ ! "$DEPLOY_DEGRADED_BACKOFF_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "# WARNING: OP_PREFLIGHT_DEPLOY_DEGRADED_BACKOFF_SECONDS='$DEPLOY_DEGRADED_BACKOFF_SECONDS' is not a non-negative integer; falling back to default ${DEFAULT_DEPLOY_DEGRADED_BACKOFF_SECONDS}s" >&2
+  DEPLOY_DEGRADED_BACKOFF_SECONDS=$DEFAULT_DEPLOY_DEGRADED_BACKOFF_SECONDS
+fi
 
 # ── GCP ADC ───────────────────────────────────────────────────────────
 DEFAULT_ADC_OP_URI="${GCP_ADC_OP_URI:-op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential}"
@@ -665,6 +687,8 @@ emit_from_session_file() (
   unset OP_PREFLIGHT_DONE OP_PREFLIGHT_AGENT OP_PREFLIGHT_MODE
   unset OP_PREFLIGHT_TOKEN_MODE OP_PREFLIGHT_REVIEWER_PAT_SOURCE_REF
   unset OP_PREFLIGHT_CREATED_AT_EPOCH OP_PREFLIGHT_TTL_SECONDS
+  unset OP_PREFLIGHT_DEPLOY_DEGRADED OP_PREFLIGHT_DEPLOY_DEGRADED_AT_EPOCH
+  unset OP_PREFLIGHT_DEPLOY_DEGRADED_CONTEXT
 
   # Source the session file and re-emit only the vars we own, so a
   # hand-edited file with arbitrary content cannot inject exports.
@@ -717,7 +741,41 @@ emit_from_session_file() (
       fi
     fi
   fi
-  if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
+  # A `--mode all` full fetch that could not load ANY deploy credential
+  # records that in the cache (OP_PREFLIGHT_DEPLOY_DEGRADED, written only by
+  # an `all` fetch that actually evaluated deploy creds). Within the backoff
+  # window, and only for the Firebase-project context it was evaluated in,
+  # a `--mode all` hit reuses that verdict instead of exit 2 -> full fetch
+  # -> the same degraded write -> a fresh biometric on every call.
+  #
+  # This does NOT reopen friends-and-family-billing#227 round 3 (below): a
+  # review-only cache carries no marker, so it still cannot satisfy `all`;
+  # the marker means "deploy creds were attempted and failed moments ago",
+  # not "deploy creds were never loaded". `--mode deploy` never accepts it.
+  # rc 3 = the marker applied here but its window expired, so the refetch
+  # is logged as a deliberate retry rather than a cross-mode miss.
+  deploy_degraded_hit=false
+  if [[ "$MODE" == "all" && -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" \
+        && "${OP_PREFLIGHT_DEPLOY_DEGRADED:-0}" == "1" \
+        && "${OP_PREFLIGHT_MODE:-}" == "all" ]]; then
+    if [[ "${OP_PREFLIGHT_CHECK_MODE:-0}" == "1" ]]; then
+      current_firebase_project="$(detect_firebase_project_no_python 2>/dev/null || true)"
+    else
+      current_firebase_project="$(detect_firebase_project 2>/dev/null || true)"
+    fi
+    degraded_at="${OP_PREFLIGHT_DEPLOY_DEGRADED_AT_EPOCH:-}"
+    if [[ "$current_firebase_project" == "${OP_PREFLIGHT_DEPLOY_DEGRADED_CONTEXT:-}" \
+          && "$degraded_at" =~ ^[0-9]+$ ]]; then
+      degraded_age=$(( $(date +%s) - 10#$degraded_at ))
+      if [[ "$degraded_age" -ge 0 && "$degraded_age" -lt "$DEPLOY_DEGRADED_BACKOFF_SECONDS" ]]; then
+        deploy_degraded_hit=true
+        echo "# WARNING: deploy credentials unavailable (Firebase project '${current_firebase_project:-none}', checked ${degraded_age}s ago); serving cached PATs without GOOGLE_APPLICATION_CREDENTIALS. Retry in $(( DEPLOY_DEGRADED_BACKOFF_SECONDS - degraded_age ))s, or now with --refresh." >&2
+      else
+        exit 3
+      fi
+    fi
+  fi
+  if [[ "$MODE" == "deploy" || "$MODE" == "all" ]] && ! $deploy_degraded_hit; then
     # Both `--mode deploy` and `--mode all` require a usable deploy
     # credential from the cache to take the fast path. If the session
     # file's credential field is missing or the materialized file is
@@ -1067,10 +1125,13 @@ if ! $REFRESH && session_is_fresh; then
   # Distinguish a partial-cache miss (stale ADC, cross-mode invalidation)
   # from a full-fetch when logging the biometric trigger reason. The rc
   # from emit_from_session_file is in scope thanks to the if-condition
-  # capture above. rc=2 means cross-mode invalidation; anything else is
-  # treated as stale-ADC by default for log clarity.
+  # capture above. rc=2 means cross-mode invalidation; rc=3 means a
+  # degraded `--mode all` cache outlived its backoff window; anything else
+  # is treated as stale-ADC by default for log clarity.
   if [[ "${rc:-0}" == "2" ]]; then
     BIOMETRIC_REASON="cross-mode-invalidation"
+  elif [[ "${rc:-0}" == "3" ]]; then
+    BIOMETRIC_REASON="deploy-degraded-retry"
   else
     BIOMETRIC_REASON="stale-adc"
   fi
@@ -1200,6 +1261,7 @@ fi
 if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   firebase_project="$(detect_firebase_project 2>/dev/null || true)"
   firebase_sa_loaded=false
+  adc_loaded=false
 
   if [[ -n "$firebase_project" ]]; then
     echo "# Preflight: reading Firebase project SA key for $firebase_project..." >&2
@@ -1259,6 +1321,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
         SESSION_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
         SESSION_LINES+=("OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
         SUMMARY+=("GCP ADC: loaded -> $ADC_TMPFILE")
+        adc_loaded=true
       else
         rm -f "$ADC_TMPFILE"
         log_stale_adc_guidance
@@ -1283,6 +1346,18 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
       # Fail closed (#534.2): see STALE branch above.
       if [[ "$MODE" == "deploy" ]]; then exit 1; fi
     fi
+  fi
+
+  # Only `--mode all` reaches here without a deploy credential (`deploy`
+  # exited 1 above). Record the degradation and the Firebase-project context
+  # it was evaluated for, so the next `--mode all` cache hit can reuse this
+  # verdict for DEPLOY_DEGRADED_BACKOFF_SECONDS instead of re-prompting
+  # biometric just to fail the same way. See emit_from_session_file.
+  if [[ "$firebase_sa_loaded" != "true" && "$adc_loaded" != "true" ]]; then
+    SESSION_LINES+=("OP_PREFLIGHT_DEPLOY_DEGRADED=1")
+    SESSION_LINES+=("OP_PREFLIGHT_DEPLOY_DEGRADED_AT_EPOCH=$(date +%s)")
+    SESSION_LINES+=("OP_PREFLIGHT_DEPLOY_DEGRADED_CONTEXT=$(printf '%q' "$firebase_project")")
+    SUMMARY+=("Deploy credentials: DEGRADED — later --mode all runs reuse this for ${DEPLOY_DEGRADED_BACKOFF_SECONDS}s (--refresh retries now)")
   fi
 
   # Cloudflare cache-purge token (#167). Optional — if 1Password is
