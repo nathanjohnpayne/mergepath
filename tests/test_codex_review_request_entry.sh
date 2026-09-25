@@ -388,6 +388,19 @@ g1100_decide() {  # <accounting-json> -> "refuse" | "proceed"
   body="$(g1100_extract run_feedback_accounting_gate)"
   retire="$(g1100_extract __cra_retire_base_cfg)"
   [ -n "$body" ] && [ -n "$retire" ] || { printf 'extract-failed'; return 0; }
+  # Mutation proofs exercise the extracted production decision with either
+  # normalization removed. Each paired control below must then fail closed.
+  case "${G1100_MUTATION:-}" in
+    configured-normalization)
+      body="$(printf '%s\n' "$body" | sed "s/LC_ALL=C tr '\\[:upper:\\]' '\\[:lower:\\]'/cat/")"
+      ;;
+    gating-normalization)
+      body="$(printf '%s\n' "$body" | sed "/^        __cra_gating=/,/^        if / s/LC_ALL=C tr '\\[:upper:\\]' '\\[:lower:\\]'/cat/")"
+      ;;
+    observed-normalization)
+      body="$(printf '%s\n' "$body" | sed 's/ascii_downcase/./')"
+      ;;
+  esac
   fake="$(mktemp -d "${TMPDIR:-/tmp}/g1100-req.XXXXXX")"
   printf '%s' "$fake" > "$G1100_LASTDIR"
   mkdir -p "$fake/workflow"
@@ -539,6 +552,27 @@ G1100_CR='nathanjohnpayne' \
 G1100_CR='chatgpt-codex-connector[bot]' \
   g1100_case "collision voids the whole relax set, not just the colliding entry" \
     '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' refuse
+# GitHub logins are case-insensitive but policy fields are hand-written. A
+# casing-only collision must void the whole relax set just like its lower-case
+# equivalent, including when the outstanding finding belongs to the other
+# provider. Removing configured-set normalization mutates this back to proceed.
+G1100_CR='Chatgpt-Codex-Connector[Bot]' \
+  g1100_case "case-only provider collision voids the whole relax set" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' refuse
+G1100_MUTATION=configured-normalization G1100_CR='Chatgpt-Codex-Connector[Bot]' \
+  g1100_case "mutation: removing configured-set normalization reopens the collision" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' proceed
+G1100_MUTATION=''
+# The inverse spelling proves the gating set is independently normalized.
+# Leaving only this side case-sensitive would let the same collision relax the
+# uncollided provider's finding.
+G1100_CR='chatgpt-codex-connector[bot]' G1100_CODEX='Chatgpt-Codex-Connector[Bot]' \
+  g1100_case "case-only gating login collision voids the whole relax set" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' refuse
+G1100_MUTATION=gating-normalization G1100_CR='chatgpt-codex-connector[bot]' G1100_CODEX='Chatgpt-Codex-Connector[Bot]' \
+  g1100_case "mutation: removing gating-set normalization reopens the collision" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' proceed
+G1100_MUTATION=''
 
 # The gating set must be populated from DEFAULTS when the base policy omits a
 # field. policy_block_field_parsed exits 0 and prints nothing for an absent
@@ -558,6 +592,16 @@ G1100_AUTHOR='' G1100_CR='nathanjohnpayne' \
 G1100_CR='coderabbitai[bot]' G1100_GHAS='github-advanced-security[bot]' \
   g1100_case "distinct identities are not a collision" \
     '{"missing":[{"reviewer":"coderabbitai[bot]"},{"reviewer":"github-advanced-security[bot]"}]}' proceed
+# The observed login comes from GitHub, whose canonical casing need not match
+# the policy spelling. The provider exception remains legitimate across that
+# difference; removing observed-login normalization makes it refuse.
+G1100_CR='CodeRabbitAI[Bot]' \
+  g1100_case "case-insensitive observed provider login matches the relax set" \
+    '{"missing":[{"reviewer":"cOdErAbBiTaI[BoT]"}]}' proceed
+G1100_MUTATION=observed-normalization G1100_CR='CodeRabbitAI[Bot]' \
+  g1100_case "mutation: removing observed-login normalization refuses the provider exception" \
+    '{"missing":[{"reviewer":"cOdErAbBiTaI[BoT]"}]}' refuse
+G1100_MUTATION=''
 
 # ONE snapshot, both consumers. The relax set narrows what gates this request,
 # so it must come from the policy revision accounting classified `.missing`
