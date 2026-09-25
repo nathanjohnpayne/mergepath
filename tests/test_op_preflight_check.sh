@@ -171,6 +171,25 @@ test_check_rejects_cache_from_a_different_pat_item() {
   pass "a cached reviewer PAT is refused unless it names the item the agent currently maps to"
 }
 
+# Helper: move the deploy fields a fixture wrote into the (pre-slot) session
+# file into the slot for <context project>. Since #1318 a pre-slot SA entry is
+# never exported (it names the shared, cross-project key file), so fixtures
+# that exercise the SA project/usability validation put it in a slot, the path
+# that validation now guards.
+session_deploy_fields_to_slot() { # <cache_dir> <slot context project>
+  local main="$1/op-preflight-claude.env" ctx="$2" fields epoch
+  fields='^(GOOGLE_APPLICATION_CREDENTIALS|OP_PREFLIGHT_ADC_TMPFILE|OP_PREFLIGHT_FIREBASE_SA_TMPFILE|OP_PREFLIGHT_FIREBASE_PROJECT|CF_API_TOKEN)='
+  epoch=$(sed -n 's/^OP_PREFLIGHT_CREATED_AT_EPOCH=//p' "$main")
+  {
+    printf 'OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=%s\n' "$epoch"
+    printf 'OP_PREFLIGHT_DEPLOY_CONTEXT=%s\n' "$ctx"
+    grep -E "$fields" "$main"
+  } > "$1/op-preflight-claude-deploy-fb-$ctx.slot"
+  grep -Ev "$fields" "$main" > "$main.tmp" || true
+  mv "$main.tmp" "$main"
+  chmod 600 "$main" "$1/op-preflight-claude-deploy-fb-$ctx.slot"
+}
+
 # Helper: synthesize a fresh cache file.
 make_fresh_cache() {
   local dir="$1" agent="$2" reviewer_pat="$3" author_pat="$4"
@@ -764,6 +783,7 @@ OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$sa_file
 OP_PREFLIGHT_FIREBASE_PROJECT=$project
 EOF
   chmod 600 "$cache_dir/op-preflight-claude.env"
+  session_deploy_fields_to_slot "$cache_dir" "$project"
 
   cat > "$py_stub/python3" <<'EOF'
 #!/usr/bin/env bash
@@ -834,6 +854,7 @@ OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$sa_file
 OP_PREFLIGHT_FIREBASE_PROJECT=$cached_project
 EOF
   chmod 600 "$cache_dir/op-preflight-claude.env"
+  session_deploy_fields_to_slot "$cache_dir" "$current_project"
 
   cat > "$py_stub/python3" <<'EOF'
 #!/usr/bin/env bash
@@ -1007,6 +1028,7 @@ OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$bad_sa_file
 OP_PREFLIGHT_FIREBASE_PROJECT=$project
 EOF
   chmod 600 "$cache_dir/op-preflight-claude.env"
+  session_deploy_fields_to_slot "$cache_dir" "$project"
 
   cat > "$bin_dir/op" <<EOF
 #!/usr/bin/env bash
@@ -1136,6 +1158,7 @@ OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$cached_sa_file
 OP_PREFLIGHT_FIREBASE_PROJECT=$cached_project
 EOF
   chmod 600 "$cache_dir/op-preflight-claude.env"
+  session_deploy_fields_to_slot "$cache_dir" "$current_project"
 
   cat > "$bin_dir/op" <<EOF
 #!/usr/bin/env bash
@@ -1266,6 +1289,7 @@ OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$cached_sa_file
 OP_PREFLIGHT_FIREBASE_PROJECT=$current_project
 EOF
   chmod 600 "$cache_dir/op-preflight-claude.env"
+  session_deploy_fields_to_slot "$cache_dir" "$current_project"
 
   cat > "$bin_dir/op" <<EOF
 #!/usr/bin/env bash
@@ -2461,6 +2485,60 @@ test_firebaserc_project_cannot_inject_into_slot() {
   pass "test_firebaserc_project_cannot_inject_into_slot: an escaped-newline project name is rejected and never reaches the slot raw"
 }
 
+# ---------------------------------------------------------------------------
+# test_pre_slot_sa_is_never_exported (Phase 4b on #1318, P1): mixed-version
+# A/B. Project A (updated checkout) has an isolated slot; an OLDER checkout of
+# A then writes a newer session pointing at the one shared pre-slot
+# op-preflight-<agent>-firebase-sa.json, which an older checkout of project B
+# later overwrites. A must never be handed that shared path: the newer
+# pre-slot SA forces a fetch into A's own slot, whose key B cannot touch.
+# ---------------------------------------------------------------------------
+test_pre_slot_sa_is_never_exported() {
+  local case_dir="$WORKDIR/pre-slot-sa"
+  local cache_dir="$case_dir/cache" bin_dir="$case_dir/bin" op_log="$case_dir/op.log"
+  local shared="$cache_dir/op-preflight-claude-firebase-sa.json" out gac
+  mkdir -p "$cache_dir" "$bin_dir" "$case_dir/proj-a"
+  printf '{ "projects": { "default": "proj-a" } }\n' > "$case_dir/proj-a/.firebaserc"
+  cat > "$bin_dir/op" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\${1:-}" >> "$op_log"
+case "\${1:-}" in
+  inject) printf '%s\n' "REVIEWER_PAT=ps-reviewer-pat" "AUTHOR_PAT=ps-author-pat" ;;
+  document)
+    project="\${3%% *}"; out_path=""
+    while [ \$# -gt 0 ]; do if [ "\$1" = "--out-file" ]; then shift; out_path="\$1"; fi; shift || true; done
+    printf '{"type": "service_account", "client_email": "firebase-deployer@%s.iam.gserviceaccount.com"}\n' "\$project" > "\$out_path"
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$bin_dir/op"
+
+  # 1. Updated checkout of A: isolated slot.
+  run_all_mode "$case_dir/proj-a" "$cache_dir" "$bin_dir" first || { fail "pre-slot-sa: first fetch failed"; return; }
+  # 2. Older checkout of A: newer pre-slot session entry naming the SHARED file.
+  printf '{"type": "service_account", "client_email": "firebase-deployer@proj-a.iam.gserviceaccount.com"}\n' > "$shared"
+  sed "s/^OP_PREFLIGHT_CREATED_AT_EPOCH=.*/OP_PREFLIGHT_CREATED_AT_EPOCH=$(( $(date +%s) + 5 ))/" \
+    "$cache_dir/op-preflight-claude.env" > "$cache_dir/s.tmp" && mv "$cache_dir/s.tmp" "$cache_dir/op-preflight-claude.env"
+  printf 'GOOGLE_APPLICATION_CREDENTIALS=%s\nOP_PREFLIGHT_FIREBASE_SA_TMPFILE=%s\nOP_PREFLIGHT_FIREBASE_PROJECT=proj-a\n' "$shared" "$shared" \
+    >> "$cache_dir/op-preflight-claude.env"
+  # 3. Updated checkout of A runs again.
+  out=$(cd "$case_dir/proj-a" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent claude --mode all --skip-ssh 2>/dev/null) || { fail "pre-slot-sa: second run failed"; return; }
+  gac=$(printf '%s\n' "$out" | sed -n "s/^export GOOGLE_APPLICATION_CREDENTIALS=//p")
+  if [ "$gac" = "$shared" ]; then
+    fail "pre-slot-sa: the shared pre-slot SA path was exported to project A"
+    return
+  fi
+  # 4. Older checkout of B overwrites the shared file; A's key must be intact.
+  printf '{"type": "service_account", "client_email": "firebase-deployer@proj-b.iam.gserviceaccount.com"}\n' > "$shared"
+  if [ -z "$gac" ] || ! grep -q "firebase-deployer@proj-a" "$gac"; then
+    fail "pre-slot-sa: project A's exported key ($gac) no longer holds A's key after B overwrote the shared file"
+    return
+  fi
+  pass "test_pre_slot_sa_is_never_exported: a newer pre-slot SA forces a project-owned fetch; B's overwrite cannot reach A"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -2498,6 +2576,7 @@ test_deploy_failure_clears_inherited_credentials
 test_firebaserc_parsers_agree
 test_newer_pre_slot_write_supersedes_slot
 test_firebaserc_project_cannot_inject_into_slot
+test_pre_slot_sa_is_never_exported
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

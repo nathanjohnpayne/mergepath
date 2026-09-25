@@ -997,10 +997,20 @@ emit_from_session_file() (
     # project, and pre-slot ADC (which records no project) only for the
     # `adc` context -- never over a Firebase project's slot, which would
     # swap the project SA for the shared ADC.
+    #
+    # A pre-slot SA is NEVER exported, though (Phase 4b on #1318): it points
+    # at the one shared op-preflight-<agent>-firebase-sa.json that every
+    # pre-slot checkout still overwrites, whatever its project, so exporting
+    # it would re-open the cross-project key swap slots exist to close. A
+    # newer pre-slot SA for this project instead forces a fetch into the
+    # project-owned slot. Only pre-slot ADC (identical content for every
+    # context that uses it) can supersede.
     legacy_supersedes_slot=false
     legacy_context_matches=false
+    legacy_is_sa=false
     if [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" \
           && "${GOOGLE_APPLICATION_CREDENTIALS:-}" == "$OP_PREFLIGHT_FIREBASE_SA_TMPFILE" ]]; then
+      legacy_is_sa=true
       [[ -n "$current_firebase_project" && "${OP_PREFLIGHT_FIREBASE_PROJECT:-}" == "$current_firebase_project" ]] \
         && legacy_context_matches=true
     elif [[ -z "$current_firebase_project" ]]; then
@@ -1011,6 +1021,7 @@ emit_from_session_file() (
       session_created="${OP_PREFLIGHT_CREATED_AT_EPOCH:-}"
       if [[ "$slot_created" =~ ^[0-9]+$ && "$session_created" =~ ^[0-9]+$ ]] \
          && (( 10#$session_created > 10#$slot_created )); then
+        $legacy_is_sa && exit 2
         legacy_supersedes_slot=true
       fi
     fi
@@ -1056,6 +1067,11 @@ emit_from_session_file() (
     # there (which removes the slot) would be followed by a plain deploy
     # that silently reuses the old ADC file (Phase 4b on #1318). A pre-slot
     # SA is checked against the project by the validation below.
+    # For the same reason, with no slot a pre-slot SA is never exported:
+    # force a fetch into the project-owned slot instead.
+    if ! $slot_loaded && $legacy_is_sa; then
+      exit 2
+    fi
     if ! $slot_loaded && [[ -n "$current_firebase_project" && -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] \
        && ! [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" \
                && "$GOOGLE_APPLICATION_CREDENTIALS" == "$OP_PREFLIGHT_FIREBASE_SA_TMPFILE" ]]; then
