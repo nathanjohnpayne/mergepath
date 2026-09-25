@@ -41,10 +41,10 @@
 #          StatusContext even when the current-head PR-level CodeRabbit
 #          comment was a newer rate-limit notice. The helper returned
 #          cleared even though CodeRabbit explicitly had not reviewed
-#          the PR. The inverse matters too: an old rate-limit comment
-#          must not suppress a newer terminal SUCCESS status. CodeRabbit
-#          edits its summary comment in place, so the regression uses
-#          updated_at/freshness rather than created_at alone.
+#          the PR. Under the #956 owner decision, elapsed time or a
+#          newer SUCCESS status cannot clear a still-current refusal;
+#          an actual body-bearing review run on HEAD is required. Keep
+#          both timestamp orderings and the real-review positive control.
 #
 # This check exercises the jq filter literals in isolation against
 # in-memory fixtures so a future edit can't silently regress either
@@ -1367,7 +1367,11 @@ JSON
           fi
           ;;
         repos/nathanjohnpayne/mergepath/pulls/12345/reviews)
-          printf '[]\n'
+          if [ "${STUB_HEAD_REVIEW:-0}" = "1" ]; then
+            printf '%s\n' '[{"id":8801,"user":{"login":"coderabbitai[bot]"},"commit_id":"headsha","submitted_at":"2999-01-01T01:59:59Z","body":"Review completed. No actionable comments."}]'
+          else
+            printf '[]\n'
+          fi
           ;;
         *)
           printf 'unexpected paginated endpoint: %s\n' "${1:-}" >&2
@@ -1415,6 +1419,8 @@ coderabbit:
   max_rate_limit_retries: 2
   wallclock_freshness_window_seconds: 1800
   trust_status_context_for_clearance: true
+codex:
+  enabled: false # This fixture tests CodeRabbit evidence, not the separate failover adapter.
 YAML
 
 set +e
@@ -1429,7 +1435,7 @@ rc=$?
 set -e
 if [ "$rc" = "5" ] &&
    echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
-   echo "$out" | grep -q "StatusContext success ignored"; then
+   echo "$out" | grep -q "clearance remains suppressed"; then
   pass=$((pass + 1))
   echo "  PASS: StatusContext success does not clear a current-head rate-limit comment"
 else
@@ -1452,14 +1458,14 @@ out=$(
 )
 rc=$?
 set -e
-if [ "$rc" = "0" ] &&
-   echo "$out" | grep -q '"status": "cleared"' &&
-   echo "$out" | grep -q "does not reference current HEAD headsha"; then
+if [ "$rc" = "5" ] &&
+   echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
+   echo "$out" | grep -q "clearance remains suppressed"; then
   pass=$((pass + 1))
-  echo "  PASS: StatusContext success clears despite an unscoped non-HEAD rate-limit comment"
+  echo "  PASS: a later status alone cannot clear the current unscoped rate-limit comment (#956)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: unscoped non-HEAD rate-limit comment incorrectly suppressed StatusContext success (rc=$rc)" >&2
+  echo "  FAIL: current unscoped refusal was cleared without a HEAD review (rc=$rc)" >&2
   echo "$out" | sed 's/^/    /' >&2
 fi
 
@@ -1477,22 +1483,19 @@ out=$(
 )
 rc=$?
 set -e
-if [ "$rc" = "0" ] &&
-   echo "$out" | grep -q '"status": "cleared"' &&
-   echo "$out" | grep -q "does not reference current HEAD headsha"; then
+if [ "$rc" = "5" ] &&
+   echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
+   echo "$out" | grep -q "clearance remains suppressed"; then
   pass=$((pass + 1))
-  echo "  PASS: newer unscoped non-HEAD rate-limit comment does not suppress StatusContext success"
+  echo "  PASS: an edited unscoped rate-limit comment still requires a HEAD review (#956)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: fresh unscoped non-HEAD rate-limit comment incorrectly suppressed StatusContext success (rc=$rc)" >&2
+  echo "  FAIL: fresh current unscoped refusal was cleared without a HEAD review (rc=$rc)" >&2
   echo "$out" | sed 's/^/    /' >&2
 fi
 
-# #446 positive direction (CodeRabbit on #463): an unscoped non-HEAD
-# rate-limit comment CREATED after the StatusContext success means
-# CodeRabbit re-entered rate-limit post-success — the real fast-path must
-# SUPPRESS (keep polling → rate_limit_stalled), exercising the created_at
-# arbitration in status_context_fast_path_blocked_by_comment directly.
+# #446/#956: a refusal created after status success also stays refused.
+# Its timestamp ordering cannot replace actual current-HEAD review evidence.
 set +e
 out=$(
   cd "$CODERABBIT_FASTPATH_ROOT" &&
@@ -1509,7 +1512,7 @@ rc=$?
 set -e
 if [ "$rc" = "5" ] &&
    echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
-   echo "$out" | grep -q "StatusContext success suppressed"; then
+   echo "$out" | grep -q "clearance remains suppressed"; then
   pass=$((pass + 1))
   echo "  PASS: unscoped non-HEAD rate-limit comment created AFTER the status success suppresses the fast-path (#446)"
 else
@@ -1533,7 +1536,7 @@ rc=$?
 set -e
 if [ "$rc" = "5" ] &&
    echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
-   echo "$out" | grep -q "within the 630s window"; then
+   echo "$out" | grep -q "clearance remains suppressed"; then
   pass=$((pass + 1))
   echo "  PASS: a StatusContext success 1s after a current-head rate-limit notice is suppressed within the published 10-minute window (630s, window-aware grace) (#596/#599)"
 else
@@ -1542,13 +1545,8 @@ else
   echo "$out" | sed 's/^/    /' >&2
 fi
 
-# #596 escape: a StatusContext success that postdates the HEAD-referencing
-# rate-limit notice by MORE than STATUS_SUCCESS_GRACE_SECONDS (120s) is a
-# genuine later re-review (which per #221 can be silent — the status flips with
-# no new summary comment) and must still clear. Preserves the original "inverse"
-# intent (an older rate-limit comment followed by a genuinely later success
-# clears), now with a realistic post-window gap instead of the 1s that the #595
-# evidence disproved. fresh_at=2999:00 (via updated_at), status=+2h.
+# #956 supersedes the old #596 status-only escape: even two hours after
+# the refusal, a successful status alone does not prove that a review ran.
 set +e
 out=$(
   cd "$CODERABBIT_FASTPATH_ROOT" &&
@@ -1562,14 +1560,39 @@ out=$(
 )
 rc=$?
 set -e
-if [ "$rc" = "0" ] &&
-   echo "$out" | grep -q '"status": "cleared"' &&
-   echo "$out" | grep -q "postdates the HEAD-referencing rate_limit notice"; then
+if [ "$rc" = "5" ] &&
+   echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
+   echo "$out" | grep -q "clearance remains suppressed"; then
   pass=$((pass + 1))
-  echo "  PASS: a genuinely later StatusContext success (beyond the grace window) still clears despite an earlier current-head rate-limit comment (#596)"
+  echo "  PASS: status-only success beyond the grace/window cannot clear a current refusal (#956)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: a genuine later StatusContext success failed to clear over an earlier current-head rate-limit comment (rc=$rc)" >&2
+  echo "  FAIL: status-only success beyond the window cleared without an actual HEAD review (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+# Positive control: the same lingering refusal and delayed status do clear
+# once the immutable body-bearing review-run evidence exists for this HEAD.
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_STATUS_CREATED_AT="2999-01-01T02:00:00Z" \
+    STUB_HEAD_REVIEW=1 \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "0" ] &&
+   echo "$out" | grep -q '"status": "cleared"' &&
+   echo "$out" | grep -q 'body-bearing review id=8801 is pinned'; then
+  pass=$((pass + 1))
+  echo "  PASS: an actual current-HEAD review clears despite the lingering refusal (#956)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: an actual current-HEAD review failed to clear the refusal (rc=$rc)" >&2
   echo "$out" | sed 's/^/    /' >&2
 fi
 
