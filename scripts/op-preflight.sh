@@ -283,7 +283,7 @@ fi
 if $PURGE_ALL; then
   if [[ -d "$CACHE_DIR" ]]; then
     echo "# Purging all session files under $CACHE_DIR" >&2
-    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*-firebase-sa*.json' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
+    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*-firebase-sa*.json' -o -name 'op-preflight-*.staged.*' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
   fi
   exit 0
 fi
@@ -474,7 +474,8 @@ if $PURGE; then
   # Per-project SA keys + deploy slots, and the pre-slot single SA file.
   rm -f "$CACHE_DIR/op-preflight-$AGENT-firebase-sa.json" \
         "$CACHE_DIR/op-preflight-$AGENT-firebase-sa-"*.json \
-        "$CACHE_DIR/op-preflight-$AGENT-deploy-"*.env
+        "$CACHE_DIR/op-preflight-$AGENT-deploy-"*.env \
+        "$CACHE_DIR/op-preflight-$AGENT-"*.staged.*
   echo "# Purged session file + ADC tempfile + Firebase SA tempfiles + deploy slots + SSH-warm marker for agent=$AGENT" >&2
   exit 0
 fi
@@ -1339,10 +1340,11 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     # One file per project (never shared across projects), so a concurrent
     # session in another Firebase repo cannot overwrite the key this
     # session exported as GOOGLE_APPLICATION_CREDENTIALS.
+    # Download to a staged sibling (0600 under umask 077) and move it into
+    # place only once it validates: a failed fetch must never truncate or
+    # delete the key another session of the SAME project already exported.
     firebase_sa_file="$(firebase_sa_file_for "$firebase_project")"
-    touch "$firebase_sa_file"
-    chmod 600 "$firebase_sa_file"
-    : > "$firebase_sa_file"
+    firebase_sa_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-firebase-sa.staged.XXXXXX")"
 
     # For --mode deploy (no review credentials loaded), this is the first
     # op call of the run — log it. For --mode all, the Phase 1 op inject
@@ -1351,9 +1353,10 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     log_deploy_biometric_once
     if op document get "${firebase_project} — Firebase Deployer SA Key" \
          --vault "$FIREBASE_SA_VAULT" \
-         --out-file "$firebase_sa_file" \
+         --out-file "$firebase_sa_staged" \
          --force >/dev/null 2>&1 \
-       && firebase_sa_matches_project "$firebase_sa_file" "$firebase_project"; then
+       && firebase_sa_matches_project "$firebase_sa_staged" "$firebase_project"; then
+      mv -f "$firebase_sa_staged" "$firebase_sa_file"
       EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$firebase_sa_file")")
       EXPORTS+=("export OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$(printf '%q' "$firebase_sa_file")")
       EXPORTS+=("export OP_PREFLIGHT_FIREBASE_PROJECT=$(printf '%q' "$firebase_project")")
@@ -1363,7 +1366,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
       SUMMARY+=("Firebase SA key ($firebase_project): loaded -> $firebase_sa_file")
       firebase_sa_loaded=true
     else
-      rm -f "$firebase_sa_file"
+      rm -f "$firebase_sa_staged"
       SUMMARY+=("Firebase SA key ($firebase_project): SKIPPED (not found or did not match ${SA_NAME}@${firebase_project}.iam.gserviceaccount.com)")
     fi
   else
@@ -1373,10 +1376,13 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   if [[ "$firebase_sa_loaded" != "true" ]]; then
     echo "# Preflight: reading GCP ADC (reuses session)..." >&2
 
-    # Deterministic path so subsequent invocations find the same file.
-    # Overwrite in place — chmod 600 before writing secret content.
-    touch "$ADC_TMPFILE"
-    chmod 600 "$ADC_TMPFILE"
+    # Deterministic path so subsequent invocations find the same file. It is
+    # shared by every context that resolves to ADC (the `adc` slot plus any
+    # Firebase project without an SA key), so read into a staged sibling
+    # (0600 under umask 077) and move it into place only once it validates:
+    # a failed or stale fetch in one context must not truncate or delete the
+    # file another context's session already exported.
+    adc_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-adc.staged.XXXXXX")"
 
     log_deploy_biometric_once
     # Capture op's stderr so the could-not-read warning can say WHY (vault
@@ -1384,9 +1390,10 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     # available" (#534.3). Routed through scrub_op_error so a service-account
     # token can never leak into the diagnostic, mirroring the Phase 1 reader.
     ADC_OP_ERR="$(mktemp "${TMPDIR:-/tmp}/op-preflight-adc-err.XXXXXX")"
-    if op read "$DEFAULT_ADC_OP_URI" > "$ADC_TMPFILE" 2>"$ADC_OP_ERR" && [[ -s "$ADC_TMPFILE" ]]; then
+    if op read "$DEFAULT_ADC_OP_URI" > "$adc_staged" 2>"$ADC_OP_ERR" && [[ -s "$adc_staged" ]]; then
       rm -f "$ADC_OP_ERR"
-      if adc_is_usable "$ADC_TMPFILE"; then
+      if adc_is_usable "$adc_staged"; then
+        mv -f "$adc_staged" "$ADC_TMPFILE"
         EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
         EXPORTS+=("export OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
         DEPLOY_SLOT_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
@@ -1394,7 +1401,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
         SUMMARY+=("GCP ADC: loaded -> $ADC_TMPFILE")
         adc_loaded=true
       else
-        rm -f "$ADC_TMPFILE"
+        rm -f "$adc_staged"
         log_stale_adc_guidance
         SUMMARY+=("GCP ADC: STALE (refresh_token rejected — see warning above)")
         # Fail closed (#534.2): under `--mode deploy` a deploy script needs a
@@ -1407,7 +1414,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
       fi
     else
       adc_op_reason="$(scrub_op_error "$ADC_OP_ERR")"
-      rm -f "$ADC_TMPFILE" "$ADC_OP_ERR"
+      rm -f "$adc_staged" "$ADC_OP_ERR"
       if [[ -n "$adc_op_reason" ]]; then
         echo "# Warning: could not read GCP ADC. Deploy credentials not cached. (op: ${adc_op_reason})" >&2
       else

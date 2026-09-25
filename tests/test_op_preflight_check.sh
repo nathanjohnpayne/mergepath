@@ -1939,6 +1939,106 @@ EOF
   pass "test_all_mode_alternating_firebase_projects_do_not_evict: --purge removes per-project slots and keys"
 }
 
+# ---------------------------------------------------------------------------
+# test_failed_fetch_does_not_evict_shared_deploy_files (CodeRabbit on #1318):
+# the ADC file is shared by every context that resolves to ADC, and a
+# project's SA file by every session of that project. A failed fetch used to
+# truncate (`>`) and then `rm` the file in place, deleting a credential
+# another session had already exported. Fetches now stage and move into
+# place only on success.
+# ---------------------------------------------------------------------------
+test_failed_fetch_does_not_evict_shared_deploy_files() {
+  local case_dir="$WORKDIR/no-evict-shared"
+  local cache_dir="$case_dir/cache" bin_dir="$case_dir/bin"
+  local adc_ok="$case_dir/adc-ok" sa_ok="$case_dir/sa-ok"
+  mkdir -p "$cache_dir" "$bin_dir" "$case_dir/no-firebase" "$case_dir/proj-gamma" "$case_dir/proj-delta"
+  printf '{ "projects": { "default": "proj-gamma" } }\n' > "$case_dir/proj-gamma/.firebaserc"
+  printf '{ "projects": { "default": "proj-delta" } }\n' > "$case_dir/proj-delta/.firebaserc"
+
+  # op stub: ADC read and SA document get succeed only while their toggle
+  # file exists; the ADC is a self-contained service_account (no network).
+  cat > "$bin_dir/op" <<EOF
+#!/usr/bin/env bash
+case "\${1:-}" in
+  inject)
+    printf '%s\n' "REVIEWER_PAT=ne-reviewer-pat" "AUTHOR_PAT=ne-author-pat"
+    ;;
+  read)
+    if [ "\${2:-}" = "op://Private/test-no-evict-adc/credential" ] && [ -e "$adc_ok" ]; then
+      printf '{"type": "service_account", "client_email": "shared-adc@example.iam.gserviceaccount.com"}\n'
+      exit 0
+    fi
+    exit 1
+    ;;
+  document)
+    [ -e "$sa_ok" ] || exit 1
+    project="\${3%% *}"
+    out_path=""
+    while [ \$# -gt 0 ]; do
+      if [ "\$1" = "--out-file" ]; then shift; out_path="\$1"; fi
+      shift || true
+    done
+    printf '{"type": "service_account", "client_email": "firebase-deployer@%s.iam.gserviceaccount.com"}\n' "\$project" > "\$out_path"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$bin_dir/op"
+
+  run_ne() { # <dir> <label> [--refresh]
+    local dir="$1" label="$2"
+    shift 2
+    (cd "$dir" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+      GCP_ADC_OP_URI="op://Private/test-no-evict-adc/credential" \
+      "$SCRIPT" --agent claude --mode all --skip-ssh "$@" >"$dir/$label.out" 2>"$dir/$label.err")
+  }
+
+  # 1. A repo without Firebase loads the shared ADC and exports its path.
+  touch "$adc_ok"
+  if ! run_ne "$case_dir/no-firebase" adc-load; then
+    fail "no-evict: ADC load failed; stderr=$(cat "$case_dir/no-firebase/adc-load.err")"
+    return
+  fi
+  local adc_path
+  adc_path=$(sed -n "s/^export GOOGLE_APPLICATION_CREDENTIALS=//p" "$case_dir/no-firebase/adc-load.out")
+  # 2. A Firebase project with no SA key falls back to ADC, which now fails.
+  rm -f "$adc_ok"
+  if ! run_ne "$case_dir/proj-delta" adc-fail; then
+    fail "no-evict: degraded --mode all in proj-delta failed; stderr=$(cat "$case_dir/proj-delta/adc-fail.err")"
+    return
+  fi
+  if [ -z "$adc_path" ] || ! grep -q "shared-adc@" "$adc_path" 2>/dev/null; then
+    fail "no-evict: a failed ADC fetch in another context deleted or truncated the shared ADC file ($adc_path)"
+    return
+  fi
+  pass "test_failed_fetch_does_not_evict_shared_deploy_files: a failed ADC fetch leaves the shared ADC file intact"
+
+  # 3. Same project: a loaded SA key survives a failed --refresh of that project.
+  touch "$sa_ok"
+  if ! run_ne "$case_dir/proj-gamma" sa-load; then
+    fail "no-evict: SA load failed; stderr=$(cat "$case_dir/proj-gamma/sa-load.err")"
+    return
+  fi
+  local sa_path
+  sa_path=$(sed -n "s/^export GOOGLE_APPLICATION_CREDENTIALS=//p" "$case_dir/proj-gamma/sa-load.out")
+  rm -f "$sa_ok"
+  run_ne "$case_dir/proj-gamma" sa-fail --refresh || true
+  if [ -z "$sa_path" ] || ! grep -q "firebase-deployer@proj-gamma" "$sa_path" 2>/dev/null; then
+    fail "no-evict: a failed SA refetch deleted or truncated proj-gamma's exported key ($sa_path)"
+    return
+  fi
+  local staged
+  for staged in "$cache_dir"/*.staged.*; do
+    if [ -e "$staged" ]; then
+      fail "no-evict: a staged download was left behind: $staged"
+      return
+    fi
+  done
+  pass "test_failed_fetch_does_not_evict_shared_deploy_files: a failed SA refetch leaves the exported key intact, no staged leftovers"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -1970,6 +2070,7 @@ test_preflight_mode_is_exported
 test_all_mode_degraded_deploy_does_not_reprompt
 test_all_mode_rejects_review_only_cache
 test_all_mode_alternating_firebase_projects_do_not_evict
+test_failed_fetch_does_not_evict_shared_deploy_files
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
