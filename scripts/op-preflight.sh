@@ -1613,6 +1613,9 @@ chmod 600 "$SESSION_FILE"
 
 if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   deploy_slot_file="$(deploy_slot_file_for "$firebase_project")"
+  # Stage then rename: a concurrent session of the same context sources this
+  # path, and a half-written slot would read as stale (exit 2 -> refetch).
+  deploy_slot_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-deploy-slot.staged.XXXXXX")"
   {
     printf '# op-preflight deploy-credential slot — do NOT edit by hand.\n'
     printf '# Agent: %s  Context: %s\n' "$AGENT" "${firebase_project:-<no .firebaserc: GCP ADC>}"
@@ -1621,8 +1624,9 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     for line in "${DEPLOY_SLOT_LINES[@]}"; do
       printf '%s\n' "$line"
     done
-  } > "$deploy_slot_file"
-  chmod 600 "$deploy_slot_file"
+  } > "$deploy_slot_staged"
+  chmod 600 "$deploy_slot_staged"
+  mv -f "$deploy_slot_staged" "$deploy_slot_file"
 fi
 
 # ── Output ────────────────────────────────────────────────────────────

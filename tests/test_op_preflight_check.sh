@@ -1907,6 +1907,20 @@ EOF
   fi
   pass "test_all_mode_alternating_firebase_projects_do_not_evict: A/B/A/B/A/B costs one fetch per project, keys never swapped"
 
+  # Slots are replaced by rename, never rewritten in place (a concurrent
+  # reader must not source a half-written slot): a fresh fetch gives the
+  # slot a new inode.
+  local slot_path="$cache_dir/op-preflight-claude-deploy-fb-proj-alpha.slot" inode_before inode_after
+  inode_before=$(stat -c %i "$slot_path" 2>/dev/null || stat -f %i "$slot_path")
+  (cd "$case_dir/proj-alpha" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent claude --mode all --skip-ssh --refresh >/dev/null 2>&1)
+  inode_after=$(stat -c %i "$slot_path" 2>/dev/null || stat -f %i "$slot_path")
+  if [ -z "$inode_after" ] || [ "$inode_before" = "$inode_after" ]; then
+    fail "all-alternating: a refetch rewrote the deploy slot in place (inode $inode_before -> $inode_after)"
+    return
+  fi
+  pass "test_all_mode_alternating_firebase_projects_do_not_evict: deploy slots are replaced atomically (rename)"
+
   # Deploy slots must not break helper agent discovery, which auto-sources
   # the PAT cache from the ONE `op-preflight-*.env` in the cache dir.
   local discovered
@@ -1940,11 +1954,12 @@ EOF
   # the main session file is still fresh: age only the slot's own epoch.
   local slot="$cache_dir/op-preflight-claude-deploy-fb-proj-alpha.slot"
   sed "s/^OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=.*/OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=1/" "$slot" > "$slot.tmp" && mv "$slot.tmp" "$slot"
+  injects_before=$(count_lines "$op_log" '^inject')
   if ! run_all_mode "$case_dir/proj-alpha" "$cache_dir" "$bin_dir" run-ttl; then
     fail "all-alternating: TTL=0 run failed; stderr=$(cat "$case_dir/proj-alpha/run-ttl.err")"
     return
   fi
-  if [ "$(count_lines "$op_log" '^inject')" != "4" ]; then
+  if [ "$(count_lines "$op_log" '^inject')" != "$((injects_before + 1))" ]; then
     fail "all-alternating: an expired deploy slot was served from cache"
     return
   fi
