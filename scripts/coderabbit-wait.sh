@@ -1642,7 +1642,7 @@ crw_unfenced_body() {
 # unfenced, unquoted line keeps prose, diff excerpts, and fenced examples from
 # becoming provider state.
 crw_provider_owned_refusal_class() {
-  local body=$1 unfenced first_line first_two first_four
+  local body=$1 unfenced first_line first_two actions_lead
   unfenced=$(crw_unfenced_body "$body") || return 3
   if grep -Fxq "<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->" <<<"$unfenced"; then
     printf 'rate_limit\n'
@@ -1663,7 +1663,6 @@ crw_provider_owned_refusal_class() {
   esac
   first_line=$(awk 'NF { print; exit }' <<<"$unfenced") || return 3
   first_two=$(awk 'NF { print; if (++n == 2) exit }' <<<"$unfenced") || return 3
-  first_four=$(awk 'NF { print; if (++n == 4) exit }' <<<"$unfenced") || return 3
   first_line=$(printf '%s' "$first_line" | tr '[:upper:]' '[:lower:]') || return 3
   case "$first_line" in
     'rate limit exceeded'|'rate-limit exceeded'|'## rate limit exceeded'|'## rate-limit exceeded'|'review limit reached'|'## review limit reached')
@@ -1679,12 +1678,31 @@ crw_provider_owned_refusal_class() {
     '<!-- This is an auto-generated reply by CodeRabbit -->'$'\n''<!-- CodeRabbit review command invocation:'*)
       printf 'status_probe\n'; return 0 ;;
   esac
-  # CodeRabbit's command acknowledgement can use a generated
-  # wrapper followed by this action block. Keep the whole leading structure:
-  # its quoted narration can appear in a real refusal or review body, where it
-  # must not manufacture a later comment that supersedes the refusal.
-  case "$first_four" in
-    '<!-- This is an auto-generated reply by CodeRabbit -->'$'\n''<details><summary>✅ Actions performed</summary>'$'\n''Review triggered.'$'\n''> Note: CodeRabbit is an incremental review system'*)
+  # CodeRabbit's command acknowledgement can use a generated wrapper and can
+  # render details/summary on one line or two. Normalize only the bounded
+  # leading structure: line-ending whitespace and ASCII case are presentation,
+  # while quoted or fenced copies in a real refusal/review must stay eligible.
+  actions_lead=$(awk '
+    NF {
+      line = $0
+      sub(/[[:space:]]+$/, "", line)
+      print line
+      if (++n == 5) exit
+    }
+  ' <<<"$unfenced") || return 3
+  actions_lead=$(printf '%s' "$actions_lead" | tr '[:upper:]' '[:lower:]') || return 3
+  case "$actions_lead" in
+    '<!-- this is an auto-generated reply by coderabbit -->'$'\n'*)
+      actions_lead=${actions_lead#*$'\n'}
+      ;;
+  esac
+  case "$actions_lead" in
+    '<details><summary>✅ actions performed</summary>'$'\n''review triggered.'$'\n''> note: coderabbit is an incremental review system'*|\
+    '<details><summary>✅ actions performed</summary>'$'\n''review triggered.'$'\n''note: coderabbit is an incremental review system'*|\
+    '<details><summary>✅ actions performed</summary>'$'\n''review triggered.'$'\n''coderabbit is an incremental review system'*|\
+    '<details>'$'\n''<summary>✅ actions performed</summary>'$'\n''review triggered.'$'\n''> note: coderabbit is an incremental review system'*|\
+    '<details>'$'\n''<summary>✅ actions performed</summary>'$'\n''review triggered.'$'\n''note: coderabbit is an incremental review system'*|\
+    '<details>'$'\n''<summary>✅ actions performed</summary>'$'\n''review triggered.'$'\n''coderabbit is an incremental review system'*)
       printf 'status_probe\n'; return 0 ;;
   esac
   return 1
@@ -2762,6 +2780,7 @@ crw_active_rate_limit_notice() {
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
   local issue_comments current latest class comment_id comment_created_at comment_fresh_at comment_body
+  local current_length
   local current_class current_rc reviews head_run review_rc run_id run_body run_class run_class_rc marker_rc
   local active_notice active_id active_remaining active_rc
   # A current refusal with no run still enters the verdict scanner so existing
@@ -2769,6 +2788,7 @@ status_context_fast_path_blocked_by_comment() {
   # this flag at its clearance edge and returns to polling instead of clearing.
   STATUS_CONTEXT_CLEARANCE_REFUSAL=""
   STATUS_CONTEXT_CLEARANCE_RUN_ID=""
+  STATUS_CONTEXT_CLEARANCE_RUN_BODY=""
   STATUS_CONTEXT_HEAD_RUN_FINDING=false
   # ONE fetch, shared by both checks below. Explicitly status-checked: a failed
   # fetch_api_array read reaches a caller only as a return status (#831), so an
@@ -2799,8 +2819,15 @@ status_context_fast_path_blocked_by_comment() {
     log "StatusContext success suppressed: the newest CodeRabbit comment could not be decoded, so a current pause/rate-limit refusal cannot be ruled out — keep polling (#956)"
     return 0
   }
-  if [ "$(printf '%s' "$current" | jq 'length')" != "0" ]; then
-    comment_body=$(printf '%s' "$current" | jq -r '.body')
+  current_length=$(printf '%s' "$current" | jq -er 'length') || {
+    log "StatusContext success suppressed: the newest CodeRabbit comment length could not be decoded, so a current pause/rate-limit refusal cannot be ruled out — keep polling (#956)"
+    return 0
+  }
+  if [ "$current_length" != "0" ]; then
+    comment_body=$(printf '%s' "$current" | jq -er '.body | select(type == "string")') || {
+      log "StatusContext success suppressed: the newest CodeRabbit comment body could not be decoded, so a current pause/rate-limit refusal cannot be ruled out — keep polling (#956)"
+      return 0
+    }
     current_rc=0
     current_class=$(crw_provider_owned_refusal_class "$comment_body") || current_rc=$?
     if [ "$current_rc" = "3" ]; then
@@ -2861,6 +2888,7 @@ status_context_fast_path_blocked_by_comment() {
             return 1
           fi
           STATUS_CONTEXT_CLEARANCE_RUN_ID=$run_id
+          STATUS_CONTEXT_CLEARANCE_RUN_BODY=$run_body
           log "StatusContext success may proceed despite CodeRabbit's current $current_class comment: body-bearing review id=$(printf '%s' "$head_run" | jq -r '.id') is pinned to current HEAD $HEAD_SHA (#956)"
           return 1
         fi
@@ -3717,7 +3745,7 @@ sleep_or_timeout() {
 
 emit_status_context_verdict() {
   local state=$1
-  local revalidated_reviews revalidated_run revalidated_run_id
+  local revalidated_reviews revalidated_run revalidated_run_id revalidated_run_body
   # CodeRabbit's StatusContext SUCCESS state means "review completed"
   # — NOT "no findings remain." With CodeRabbit's default
   # `request_changes_workflow: false`, the status flips to success
@@ -3864,6 +3892,14 @@ emit_status_context_verdict() {
     }
     if [ "$revalidated_run_id" != "$STATUS_CONTEXT_CLEARANCE_RUN_ID" ]; then
       log "StatusContext success withheld: the current-HEAD review run changed from id=$STATUS_CONTEXT_CLEARANCE_RUN_ID to id=${revalidated_run_id:-<none>} before clearance (#956)"
+      return 0
+    fi
+    revalidated_run_body=$(printf '%s' "$revalidated_reviews" | jq -er --argjson id "$revalidated_run_id" 'first(.[] | select(.id == $id)) | .body | select(type == "string" and length > 0)') || {
+      log "StatusContext success withheld: body-bearing review id=$revalidated_run_id could not be read back before clearance (#956)"
+      return 0
+    }
+    if [ "$revalidated_run_body" != "$STATUS_CONTEXT_CLEARANCE_RUN_BODY" ]; then
+      log "StatusContext success withheld: body-bearing review id=$revalidated_run_id body changed before clearance (#956)"
       return 0
     fi
   fi

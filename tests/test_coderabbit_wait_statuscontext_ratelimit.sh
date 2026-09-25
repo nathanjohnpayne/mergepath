@@ -113,6 +113,12 @@ Review triggered.
 
 > Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits.'
 
+# Same command acknowledgement with the provider's equally valid split
+# details/summary layout, no generated wrapper, mixed case, CRLF and trailing
+# whitespace. Structural narration recognition must not depend on one byte
+# rendering of the leading block.
+ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY=$'<DeTaIlS>  \r\n<SuMmArY>✅ AcTiOnS PeRfOrMeD</sUmMaRy>\r\n\r\nReViEw TrIgGeReD. \r\n\r\nNoTe: CoDeRaBbIt Is An InCrEmEnTaL ReViEw SyStEm and does not re-review already reviewed commits.\r'
+
 BARE_STATUS_PROBE_BODY='CodeRabbit review command invocation
 Still checking.'
 
@@ -604,11 +610,14 @@ test_current_refusal_with_actual_head_review_clears() {
 # arrive between those reads, so clearance must revalidate the selected run
 # rather than credit a superseded clean body.
 test_refusal_run_is_revalidated_before_clearance() {
-  local dir rc before=$FAIL clean superseding
+  local dir rc before=$FAIL clean superseding mutated
   clean=$(jq -nc '[{"id":8801,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed. No actionable comments."}]')
   superseding=$(jq -nc '[
     {"id":8801,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed. No actionable comments."},
     {"id":8802,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T02:00:00Z","body":"_🟠 Major_ | A later same-SHA review finding."}
+  ]')
+  mutated=$(jq -nc '[
+    {"id":8801,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"_🟠 Major_ | The same review object now carries a blocking finding."}
   ]')
 
   dir=$(make_case "headref-stable-review-run" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
@@ -622,12 +631,18 @@ test_refusal_run_is_revalidated_before_clearance() {
   [ "$(jqf "$dir" '.status')" = "findings" ] || fail "3b0 superseded: expected findings after the newer run"
   grep -q 'changed from id=8801 to id=8802' "$dir/err.log" || fail "3b0 superseded: expected selected-run replacement log"
 
+  dir=$(make_case "headref-mutated-review-run" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$clean" CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON="$mutated" run_case "$dir")
+  [ "$rc" = "2" ] || fail "3b0 mutated: changed body on the selected review id must be regraded before clearance, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "findings" ] || fail "3b0 mutated: expected findings after the selected run body changed"
+  grep -q 'body changed before clearance' "$dir/err.log" || fail "3b0 mutated: expected selected-run body-change log"
+
   dir=$(make_case "headref-unread-revalidation" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
   rc=$(CODERABBIT_TEST_REVIEWS_JSON="$clean" CODERABBIT_TEST_FAIL_REVIEWS_AFTER=1 run_case "$dir")
   [ "$rc" = "5" ] || fail "3b0 unread: unread revalidation must withhold clearance, got $rc; err=$(tail -6 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b0 unread: unread revalidation cleared"
   grep -q 'could not be re-read before clearance' "$dir/err.log" || fail "3b0 unread: expected re-read failure log"
-  [ "$FAIL" -ne "$before" ] || pass "3b0: #956 revalidates a stable clean run and withholds clearance when it is superseded or unread"
+  [ "$FAIL" -ne "$before" ] || pass "3b0: #956 revalidates a stable clean run and withholds clearance when its id or body changes or becomes unread"
 }
 
 test_quoted_refusal_marker_is_not_current_refusal() {
@@ -728,11 +743,12 @@ Here is a summary of where things stand.' ;;
 
 test_status_probe_does_not_supersede_refusal() {
   local mode reply dir rc before=$FAIL
-  for mode in wrapped bare actions-performed; do
+  for mode in wrapped bare actions-performed actions-performed-split; do
     case "$mode" in
       wrapped) reply=$WRAPPED_STATUS_PROBE_BODY ;;
       bare) reply=$BARE_STATUS_PROBE_BODY ;;
       actions-performed) reply=$ACTIONS_PERFORMED_STATUS_PROBE_BODY ;;
+      actions-performed-split) reply=$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY ;;
     esac
     dir=$(make_case "refusal-before-$mode-status-probe" "$RATE_LIMIT_BODY_HEADREF" \
       "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
@@ -741,7 +757,22 @@ test_status_probe_does_not_supersede_refusal() {
     [ "$rc" = "5" ] || fail "3b8 $mode: status probe should not supersede current refusal, got $rc; err=$(tail -6 "$dir/err.log")"
     [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b8 $mode: status probe allowed status-only clearance"
   done
-  [ "$FAIL" -ne "$before" ] || pass "3b8: wrapped, bare and action acknowledgement CodeRabbit command replies cannot supersede the current refusal"
+  [ "$FAIL" -ne "$before" ] || pass "3b8: wrapped, bare and combined/split action acknowledgement CodeRabbit command replies cannot supersede the current refusal"
+}
+
+# The structural narration selector is shared with ordinary polling. Disable
+# the StatusContext fast path so this case reaches that selector directly: the
+# split acknowledgement above must be skipped and the older refusal retained.
+test_split_status_probe_is_excluded_by_polling_selector() {
+  local dir rc before=$FAIL
+  dir=$(make_case "polling-refusal-before-split-status-probe" "$RATE_LIMIT_BODY_HEADREF" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
+  sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] || fail "3b9: ordinary polling must skip split action narration and retain the refusal, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "3b9: ordinary polling selected action narration instead of the older refusal"
+  [ "$FAIL" -ne "$before" ] || pass "3b9: ordinary polling excludes split-layout action acknowledgement narration"
 }
 
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
@@ -2548,6 +2579,7 @@ test_current_refusal_with_review_quoting_progress_clears
 test_legacy_leading_refusal_stays_current
 test_provider_leading_nonreview_run_stays_refused
 test_status_probe_does_not_supersede_refusal
+test_split_status_probe_is_excluded_by_polling_selector
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
