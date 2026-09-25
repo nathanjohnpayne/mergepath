@@ -1713,12 +1713,23 @@ test_all_mode_degraded_deploy_does_not_reprompt() {
     fail "all-degraded: degraded cache hit exported GOOGLE_APPLICATION_CREDENTIALS; out=$(cat "$case_dir/run2.out")"
     return
   fi
-  # ...and actively clears one left in the caller's shell by an earlier eval.
-  local leaked
-  leaked=$(GOOGLE_APPLICATION_CREDENTIALS=/tmp/other-project-key.json bash -c \
+  # ...clears one an earlier preflight eval left in the caller's shell (its
+  # marker proves preflight owns it), but preserves a human override (no
+  # marker), which DEPLOYMENT.md ranks first.
+  local leaked kept
+  leaked=$(GOOGLE_APPLICATION_CREDENTIALS=/tmp/other-project-key.json \
+    OP_PREFLIGHT_FIREBASE_SA_TMPFILE=/tmp/other-project-key.json bash -c \
     'eval "$(grep -v "^export OP_PREFLIGHT_.*_PAT=" "$1")"; printf %s "${GOOGLE_APPLICATION_CREDENTIALS:-}"' _ "$case_dir/run2.out")
   if [ -n "$leaked" ]; then
-    fail "all-degraded: degraded cache hit left an inherited GOOGLE_APPLICATION_CREDENTIALS ($leaked) in the caller's shell"
+    fail "all-degraded: degraded cache hit left a preflight-owned GOOGLE_APPLICATION_CREDENTIALS ($leaked) in the caller's shell"
+    return
+  fi
+  # shellcheck disable=SC2016  # expanded by the child bash, by design
+  kept=$(env -u OP_PREFLIGHT_ADC_TMPFILE -u OP_PREFLIGHT_FIREBASE_SA_TMPFILE \
+    GOOGLE_APPLICATION_CREDENTIALS=/tmp/human-override.json bash -c \
+    'eval "$(grep -v "^export OP_PREFLIGHT_.*_PAT=" "$1")"; printf %s "${GOOGLE_APPLICATION_CREDENTIALS:-}"' _ "$case_dir/run2.out")
+  if [ "$kept" != "/tmp/human-override.json" ]; then
+    fail "all-degraded: degraded cache hit erased a human-override GOOGLE_APPLICATION_CREDENTIALS (got '$kept')"
     return
   fi
   if ! grep -q "deploy credentials unavailable" "$case_dir/run2.err"; then
@@ -2098,10 +2109,12 @@ test_deploy_failure_clears_inherited_credentials() {
   printf '{"type": "service_account", "client_email": "firebase-deployer@proj-a.iam.gserviceaccount.com"}\n' > "$case_dir/proj-a-key.json"
 
   local result
+  # A key an earlier preflight eval exported: its marker proves ownership.
   # shellcheck disable=SC2016  # expanded by the child bash, by design
   result=$(cd "$case_dir" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
     GCP_ADC_OP_URI="op://Private/test-deploy-fail-adc/credential" \
     GOOGLE_APPLICATION_CREDENTIALS="$case_dir/proj-a-key.json" \
+    OP_PREFLIGHT_FIREBASE_SA_TMPFILE="$case_dir/proj-a-key.json" OP_PREFLIGHT_FIREBASE_PROJECT=proj-a \
     bash -c 'f() { eval "$("$@" 2>/dev/null)"; }; f "$@"; printf "%s|%s" "$?" "${GOOGLE_APPLICATION_CREDENTIALS:-}"' \
     _ "$SCRIPT" --agent claude --mode deploy)
   if [ "${result%%|*}" = "0" ]; then
@@ -2112,7 +2125,19 @@ test_deploy_failure_clears_inherited_credentials() {
     fail "deploy-fail-clears: a failed --mode deploy left GOOGLE_APPLICATION_CREDENTIALS=${result#*|} (another project's key) set"
     return
   fi
-  pass "test_deploy_failure_clears_inherited_credentials: failed --mode deploy clears inherited deploy creds and fails the eval"
+  # A human override (no preflight marker) survives; the eval still fails.
+  # shellcheck disable=SC2016  # expanded by the child bash, by design
+  result=$(cd "$case_dir" && env -u OP_PREFLIGHT_ADC_TMPFILE -u OP_PREFLIGHT_FIREBASE_SA_TMPFILE \
+    PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    GCP_ADC_OP_URI="op://Private/test-deploy-fail-adc/credential" \
+    GOOGLE_APPLICATION_CREDENTIALS="$case_dir/human-override.json" \
+    bash -c 'f() { eval "$("$@" 2>/dev/null)"; }; f "$@"; printf "%s|%s" "$?" "${GOOGLE_APPLICATION_CREDENTIALS:-}"' \
+    _ "$SCRIPT" --agent claude --mode deploy)
+  if [ "${result%%|*}" = "0" ] || [ "${result#*|}" != "$case_dir/human-override.json" ]; then
+    fail "deploy-fail-clears: a failed --mode deploy must fail the eval but keep a human override (result=$result)"
+    return
+  fi
+  pass "test_deploy_failure_clears_inherited_credentials: failed --mode deploy clears preflight-owned creds, keeps a human override, fails the eval"
 }
 
 # ---------------------------------------------------------------------------
@@ -2135,7 +2160,7 @@ test_firebaserc_parsers_agree() {
     'braces-in-string|{ "note": "{\"projects\": {\"default\": \"wrong\"}}", "projects": { "default": "right" } }'
     'escaped-quote-key|{ "etags": { "a\"b": "c" }, "projects": { "prod": "p", "default": "right" } }'
     'nested-object-in-projects|{ "projects": { "meta": { "default": "wrong" }, "default": "right" } }'
-    'multiline|{\n  "projects": {\n    "default": "right"\n  }\n}'
+    $'multiline|{\n  "projects": {\n    "default": "right"\n  }\n}'
     'duplicate-projects|{ "projects": { "default": "first" }, "projects": { "default": "second" } }'
     'duplicate-default|{ "projects": { "default": "first", "default": "second" } }'
     'later-projects-string|{ "projects": { "default": "first" }, "projects": "x" }'
@@ -2143,6 +2168,13 @@ test_firebaserc_parsers_agree() {
     'numeric-default|{ "projects": { "default": 5 } }'
     'empty-default|{ "projects": { "default": "" } }'
     'no-projects|{ "targets": { "projects": { "default": "wrong" } } }'
+    'unicode-escape-ascii|{ "projects": { "default": "proj\u002dalpha" } }'
+    'escaped-slash-and-tab|{ "projects": { "default": "a\/b\tc" } }'
+    'escaped-key|{ "pro\u006aects": { "def\u0061ult": "right" } }'
+    'unicode-escape-bmp|{ "projects": { "default": "caf\u00e9" } }'
+    'surrogate-pair|{ "projects": { "default": "x\ud83d\ude00y" } }'
+    'lone-surrogate|{ "projects": { "default": "x\ud83dy" } }'
+    'invalid-escape|{ "projects": { "default": "a\qb" } }'
   )
   local entry name json py awkv
   # shellcheck disable=SC2016  # "$1" expands in the child bash, by design
@@ -2150,7 +2182,7 @@ test_firebaserc_parsers_agree() {
     name="${entry%%|*}"
     json="${entry#*|}"
     mkdir -p "$case_dir/$name"
-    printf '%b\n' "$json" > "$case_dir/$name/.firebaserc"
+    printf '%s\n' "$json" > "$case_dir/$name/.firebaserc"
     py=$(cd "$case_dir/$name" && env -u OP_PREFLIGHT_FIREBASE_PROJECT_ID bash -c '. "$1"; detect_firebase_project' _ "$case_dir/parsers.sh" 2>/dev/null || true)
     awkv=$(cd "$case_dir/$name" && bash -c '. "$1"; firebaserc_default_project_no_python' _ "$case_dir/parsers.sh" 2>/dev/null || true)
     if [ "$py" != "$awkv" ]; then
@@ -2159,6 +2191,47 @@ test_firebaserc_parsers_agree() {
     fi
   done
   pass "test_firebaserc_parsers_agree: no-python .firebaserc parser matches the python parser on ${#cases[@]} cases"
+}
+
+# ---------------------------------------------------------------------------
+# test_newer_pre_slot_write_supersedes_slot (Codex on #1318): during
+# propagation skew an older consumer's op-preflight.sh still writes deploy
+# fields into the shared session file and never touches slots. A newer such
+# write must win over an older slot (else a rotated key or a recovered
+# credential is ignored until the slot expires); an older one must not.
+# ---------------------------------------------------------------------------
+test_newer_pre_slot_write_supersedes_slot() {
+  local case_dir="$WORKDIR/legacy-vs-slot"
+  local cache_dir="$case_dir/cache" adc_file="$case_dir/cache/legacy-adc.json"
+  local slot="$case_dir/cache/op-preflight-claude-deploy-adc.slot"
+  local label session_age slot_age out rc
+  mkdir -p "$case_dir/repo"
+  for label in newer older; do
+    rm -rf "$cache_dir"
+    if [ "$label" = newer ]; then session_age=0; slot_age=300; else session_age=300; slot_age=0; fi
+    make_aged_cache "$cache_dir" claude "$session_age" "lv-reviewer-pat" "lv-author-pat"
+    printf '{"type": "service_account", "client_email": "legacy@example.iam.gserviceaccount.com"}\n' > "$adc_file"
+    printf 'GOOGLE_APPLICATION_CREDENTIALS=%s\nOP_PREFLIGHT_ADC_TMPFILE=%s\n' "$adc_file" "$adc_file" \
+      >> "$cache_dir/op-preflight-claude.env"
+    printf "OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=%s\nOP_PREFLIGHT_DEPLOY_CONTEXT=''\nOP_PREFLIGHT_DEPLOY_DEGRADED=1\nOP_PREFLIGHT_DEPLOY_DEGRADED_AT_EPOCH=%s\n" \
+      "$(( $(date +%s) - slot_age ))" "$(( $(date +%s) - slot_age ))" > "$slot"
+    rc=0
+    out=$(cd "$case_dir/repo" && PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+      "$SCRIPT" --agent claude --mode all --skip-ssh 2>"$case_dir/$label.err") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      fail "legacy-vs-slot[$label]: --mode all failed (op must not be needed); stderr=$(cat "$case_dir/$label.err")"
+      return
+    fi
+    if [ "$label" = newer ] && ! printf '%s\n' "$out" | grep -q "^export GOOGLE_APPLICATION_CREDENTIALS=$adc_file$"; then
+      fail "legacy-vs-slot[newer]: a newer pre-slot write did not supersede an older degraded slot; out=$(printf '%s\n' "$out" | grep -v PAT)"
+      return
+    fi
+    if [ "$label" = older ] && printf '%s\n' "$out" | grep -q "^export GOOGLE_APPLICATION_CREDENTIALS="; then
+      fail "legacy-vs-slot[older]: an older pre-slot write overrode a newer slot; out=$(printf '%s\n' "$out" | grep -v PAT)"
+      return
+    fi
+  done
+  pass "test_newer_pre_slot_write_supersedes_slot: newer pre-slot deploy fields win, older ones do not"
 }
 
 test_check_fresh_cache
@@ -2196,6 +2269,7 @@ test_failed_fetch_does_not_evict_shared_deploy_files
 test_check_selects_same_deploy_context_without_python
 test_deploy_failure_clears_inherited_credentials
 test_firebaserc_parsers_agree
+test_newer_pre_slot_write_supersedes_slot
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

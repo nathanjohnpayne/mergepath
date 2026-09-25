@@ -325,6 +325,18 @@ BIOMETRIC_LOG="$CACHE_DIR/biometric-log"  # #282: append a one-line
                                           # record on each fresh fetch.
 SSH_WARM_TTL_SECONDS="${OP_PREFLIGHT_SSH_WARM_TTL_SECONDS:-1800}"  # 30 min default; #163
 
+# ── Clearing deploy variables in the CALLER's shell ───────────────────
+# Emitted (and evaluated by the caller) before any deploy export, on review
+# hits, deploy/all hits, full fetches and deploy failures. It clears the
+# preflight markers and CF_API_TOKEN unconditionally, but clears
+# GOOGLE_APPLICATION_CREDENTIALS only when a preflight marker in that shell
+# proves preflight put it there: a value with no matching marker is the
+# human override DEPLOYMENT.md ranks first (Codex on #1318), and a degraded
+# or failed run must not erase it. It runs in the caller (bash or zsh), so
+# it is plain POSIX test syntax.
+# shellcheck disable=SC2016  # expands in the caller's shell, by design
+DEPLOY_CLEAR_STMT='if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && { [ "$GOOGLE_APPLICATION_CREDENTIALS" = "${OP_PREFLIGHT_ADC_TMPFILE:-}" ] || [ "$GOOGLE_APPLICATION_CREDENTIALS" = "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" ]; }; then unset GOOGLE_APPLICATION_CREDENTIALS; fi; unset OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN'
+
 # ── Deploy-credential slots (one per Firebase-project context) ────────
 # Deploy credentials are cached per context, not per agent: one slot per
 # Firebase project (with its own SA key file), plus one `adc` slot for
@@ -415,23 +427,64 @@ json_string_field_no_python() {
 # scanner, not a regex: it tracks string/escape state and nesting depth,
 # reads `default` only from a depth-1 "projects" object, and mirrors
 # json.loads duplicate-key semantics (the last root "projects" and the last
-# "default" in it win; a non-string or empty default is no project).
+# "default" in it win; a non-string or empty default is no project). String
+# escapes are decoded like json.loads (\uXXXX -> UTF-8, surrogate pairs
+# joined; LC_ALL=C so %c emits raw bytes in every awk); an invalid escape
+# fails the file as json.loads does, and a lone surrogate, which python
+# cannot print, yields no project. It is not a general JSON validator.
 firebaserc_default_project_no_python() {
   [[ -f .firebaserc ]] || return 1
-  awk '
+  LC_ALL=C awk '
+    function hexval(h,    k, d, v) {
+      if (length(h) != 4) return -1
+      v = 0
+      for (k = 1; k <= 4; k++) {
+        d = index("0123456789abcdef", tolower(substr(h, k, 1)))
+        if (d == 0) return -1
+        v = v * 16 + d - 1
+      }
+      return v
+    }
+    function utf8(cp) {
+      if (cp < 128) return sprintf("%c", cp)
+      if (cp < 2048) return sprintf("%c%c", 192 + int(cp / 64), 128 + cp % 64)
+      if (cp < 65536) return sprintf("%c%c%c", 224 + int(cp / 4096), 128 + int(cp / 64) % 64, 128 + cp % 64)
+      return sprintf("%c%c%c%c", 240 + int(cp / 262144), 128 + int(cp / 4096) % 64, 128 + int(cp / 64) % 64, 128 + cp % 64)
+    }
     { text = text $0 "\n" }
     END {
-      n = length(text); depth = 0; in_str = 0; esc = 0; str = ""
+      n = length(text); depth = 0; in_str = 0; esc = 0; str = ""; bad = 0
       key = ""; after_colon = 0; proj_depth = 0; val = ""; seen = 0
       for (i = 1; i <= n; i++) {
         c = substr(text, i, 1)
         if (in_str) {
-          if (esc) { str = str c; esc = 0; continue }
-          if (c == "\\") { esc = 1; str = str c; continue }
+          if (esc) {
+            esc = 0
+            if (c == "u") {
+              cp = hexval(substr(text, i + 1, 4))
+              if (cp < 0) exit 1
+              i += 4
+              if (cp >= 55296 && cp <= 56319) {
+                lo = (substr(text, i + 1, 2) == "\\u") ? hexval(substr(text, i + 3, 4)) : -1
+                if (lo >= 56320 && lo <= 57343) { cp = 65536 + (cp - 55296) * 1024 + (lo - 56320); i += 6 }
+                else { bad = 1; continue }
+              } else if (cp >= 56320 && cp <= 57343) { bad = 1; continue }
+              str = str utf8(cp)
+            }
+            else if (c == "\"" || c == "\\" || c == "/") str = str c
+            else if (c == "n") str = str "\n"
+            else if (c == "t") str = str "\t"
+            else if (c == "r") str = str "\r"
+            else if (c == "b") str = str "\b"
+            else if (c == "f") str = str "\f"
+            else exit 1
+            continue
+          }
+          if (c == "\\") { esc = 1; continue }
           if (c != "\"") { str = str c; continue }
           in_str = 0
           if (after_colon) {
-            if (proj_depth && depth == proj_depth && key == "default") val = str
+            if (proj_depth && depth == proj_depth && key == "default") val = (bad ? "" : str)
             if (depth == 1 && key == "projects") { val = ""; seen = 1 }
             after_colon = 0
           } else {
@@ -439,7 +492,7 @@ firebaserc_default_project_no_python() {
           }
           continue
         }
-        if (c == "\"") { in_str = 1; str = ""; continue }
+        if (c == "\"") { in_str = 1; str = ""; bad = 0; continue }
         if (c == ":") {
           after_colon = 1
           if (proj_depth && depth == proj_depth && key == "default") val = ""
@@ -863,7 +916,23 @@ emit_from_session_file() (
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     current_firebase_project="$(deploy_context_project 2>/dev/null || true)"
     deploy_slot_file="$(deploy_slot_file_for "$current_firebase_project")"
-    if [[ -f "$deploy_slot_file" ]]; then
+    # Propagation skew (Codex on #1318): a consumer still on the pre-slot
+    # script keeps writing freshly fetched deploy fields into the shared
+    # session file and never touches the slot. When that write is NEWER than
+    # the slot and actually carries a credential, it wins; its fields then
+    # go through the same pre-slot project/usability checks below. A
+    # slot-aware writer never puts deploy fields in the session file, so
+    # this only ever fires for a pre-slot write.
+    legacy_supersedes_slot=false
+    if [[ -f "$deploy_slot_file" && -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+      slot_created="$(grep '^OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=' "$deploy_slot_file" | cut -d= -f2- | tr -d "'\"" || true)"
+      session_created="${OP_PREFLIGHT_CREATED_AT_EPOCH:-}"
+      if [[ "$slot_created" =~ ^[0-9]+$ && "$session_created" =~ ^[0-9]+$ ]] \
+         && (( 10#$session_created > 10#$slot_created )); then
+        legacy_supersedes_slot=true
+      fi
+    fi
+    if [[ -f "$deploy_slot_file" ]] && ! $legacy_supersedes_slot; then
       unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
       unset OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT
       unset CF_API_TOKEN
@@ -982,7 +1051,7 @@ emit_from_session_file() (
     # caller's shell mirrors the cache exactly: a degraded `all` hit, or a
     # `cd` into another Firebase repo, must not leave a GOOGLE_APPLICATION_
     # CREDENTIALS from an earlier eval (possibly another project's key) live.
-    printf 'unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN\n'
+    printf '%s\n' "$DEPLOY_CLEAR_STMT"
     [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && \
       printf 'export GOOGLE_APPLICATION_CREDENTIALS=%q\n' "$GOOGLE_APPLICATION_CREDENTIALS"
     [[ -n "${OP_PREFLIGHT_ADC_TMPFILE:-}" ]] && \
@@ -999,7 +1068,7 @@ emit_from_session_file() (
     # shell, so a review session does not retain stale deploy creds in its
     # environment (not just refrain from re-exporting them). Emitting unset
     # is idempotent when the caller never had them.
-    printf 'unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN\n'
+    printf '%s\n' "$DEPLOY_CLEAR_STMT"
   fi
   printf 'export OP_PREFLIGHT_DONE=1\n'
   printf 'export OP_PREFLIGHT_AGENT=%q\n' "$AGENT"
@@ -1115,7 +1184,7 @@ emit_check_failure_guard() {
 # #1318), so the next deploy would run under the wrong identity. Clear the
 # deploy variables, then fail the eval.
 emit_deploy_failure_guard() {
-  printf 'unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN\n'
+  printf '%s\n' "$DEPLOY_CLEAR_STMT"
   emit_eval_guard "--mode deploy loaded no deploy credential for Firebase project '${firebase_project:-none}'; deploy variables cleared (see stderr)"
 }
 
@@ -1389,7 +1458,7 @@ fi
 
 if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   # Same clear-then-export contract as the cache-hit path.
-  EXPORTS+=("unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN")
+  EXPORTS+=("$DEPLOY_CLEAR_STMT")
   firebase_project="$(deploy_context_project 2>/dev/null || true)"
   firebase_sa_loaded=false
   adc_loaded=false
