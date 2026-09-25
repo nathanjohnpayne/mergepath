@@ -2775,7 +2775,7 @@ status_context_fast_path_blocked_by_comment() {
             log "StatusContext success suppressed: the current-HEAD review id could not be decoded (#956)"
             return 0
           }
-          run_body=$(printf '%s' "$reviews" | jq -er --argjson id "$run_id" '.[] | select(.id == $id) | .body | select(type == "string" and length > 0)' | head -1) || {
+          run_body=$(printf '%s' "$reviews" | jq -er --argjson id "$run_id" 'first(.[] | select(.id == $id)) | .body | select(type == "string" and length > 0)') || {
             log "StatusContext success suppressed: body-bearing review id=$run_id could not be read back for grading (#956)"
             return 0
           }

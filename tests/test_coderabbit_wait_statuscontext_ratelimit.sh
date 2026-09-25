@@ -563,7 +563,7 @@ test_quoted_refusal_marker_is_not_current_refusal() {
 test_current_refusal_with_blocking_head_review_is_findings() {
   local dir rc before=$FAIL reviews
   dir=$(make_case "headref-blocking-review" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
-  reviews='[{"id":8803,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"_🟠 Major_ | **Do not clear this review finding.**"}]'
+  reviews=$(jq -nc '[{"id":8803,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed.\n\n_🟠 Major_ | **Do not clear this review finding.**"}]')
   rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
   [ "$rc" = "2" ] || fail "3b2: blocking current-HEAD review body should emit findings, got $rc; err=$(tail -5 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" = "findings" ] || fail "3b2: status=$(jqf "$dir" '.status'), expected findings"
