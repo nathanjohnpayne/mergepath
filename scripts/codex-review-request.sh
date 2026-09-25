@@ -1217,7 +1217,7 @@ run_feedback_accounting_gate() {
         __cra_relax=$(printf '%s\n%s\n' \
           "$(policy_block_field_parsed coderabbit bot_login "$__cra_base_cfg" 2>/dev/null || true)" \
           "$(policy_block_field_parsed code_scanning bot_login "$__cra_base_cfg" 2>/dev/null || true)" \
-          | grep -v '^$' || true)
+          | LC_ALL=C tr '[:upper:]' '[:lower:]' | grep -v '^$' || true)
         # Sourcing the relax set from the BASE policy stops a PR nominating its
         # own skippable providers, but it does not stop a COLLISION.
         # validate_governing_policy (review-feedback-accounting.sh:127-129)
@@ -1245,7 +1245,7 @@ run_feedback_accounting_gate() {
           "${__cra_codex_bot:-chatgpt-codex-connector[bot]}" \
           "${__cra_author_id:-nathanjohnpayne}" \
           "$(printf '%s' "$__cra_policy_json" | jq -r '.available_reviewers[]? // empty' 2>/dev/null || true)" \
-          | grep -v '^$' || true)
+          | LC_ALL=C tr '[:upper:]' '[:lower:]' | grep -v '^$' || true)
         if [ -n "$__cra_relax" ] && [ -n "$__cra_gating" ] \
            && printf '%s\n' "$__cra_relax" | grep -qxF "$__cra_gating"; then
           log "review feedback accounting: the governing base policy gives a skippable provider the same login as Codex, the author identity, or a registered reviewer; no provider is skippable (#1100)"
@@ -1258,7 +1258,7 @@ run_feedback_accounting_gate() {
       __cra_blocking=$(printf '%s' "$output" | jq -r --arg relax "$__cra_relax" '
         ($relax | split("\n") | map(select(length > 0))) as $ok
         | if ((.missing | type) != "array") or ((.missing | length) == 0) then 1
-          else [ .missing[] | select((.reviewer // "") as $r | ($ok | index($r)) == null) ] | length
+          else [ .missing[] | select(((.reviewer // "") | ascii_downcase) as $r | ($ok | index($r)) == null) ] | length
           end' 2>/dev/null || printf '1')
       if [ "${__cra_blocking:-1}" -gt 0 ]; then
         printf '%s\n' "$output" >&2
