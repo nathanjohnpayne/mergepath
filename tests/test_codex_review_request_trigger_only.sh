@@ -325,6 +325,31 @@ test_invalid_present_governing_cap_refuses_new_write() {
   done
 }
 
+test_invalid_present_governing_codex_block_refuses_new_write() {
+  local value dir rc before
+  for value in false '[]' null; do
+    before=$FAIL
+    dir=$(make_case "request-cap-base-codex-$value")
+    printf 'author_identity: nathanjohnpayne\ncodex: %s\n' "$value" > "$dir/state/base-review-policy.yml"
+    rc=$(run_trigger_only "$dir" fresh)
+    [ "$rc" = 3 ] || fail "#813 governing codex $value: expected infrastructure exit 3, got $rc; err=$(cat "$dir/err.log")"
+    [ "$(trig_count "$dir")" = 0 ] || fail "#813 governing codex $value: posted despite invalid governed block"
+    [ "$FAIL" -ne "$before" ] || pass "#813: present $value governing codex block remains invalid at the write boundary"
+  done
+}
+
+test_missing_governing_codex_block_defaults_request_cap() {
+  local dir rc before=$FAIL
+  dir=$(make_case "request-cap-base-no-codex")
+  printf 'author_identity: nathanjohnpayne\n' > "$dir/state/base-review-policy.yml"
+  rc=$(run_trigger_only "$dir" cap_at_limit)
+  [ "$rc" = 7 ] || fail "#813 missing governing codex: expected default-cap exit 7, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = 0 ] || fail "#813 missing governing codex: posted despite default cap exhaustion"
+  grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
+    || fail "#813 missing governing codex: did not apply the default cap"
+  [ "$FAIL" -ne "$before" ] || pass "#813: missing governing codex block defaults the request cap to 10"
+}
+
 test_idempotent_skip_does_not_resolve_governing_cap() {
   local dir rc before=$FAIL
   dir=$(make_case "request-cap-idempotent-no-read")
@@ -842,6 +867,8 @@ test_nondefault_request_attempt_cap
 test_candidate_cannot_raise_governing_request_attempt_cap
 test_governing_cap_read_failure_refuses_new_write
 test_invalid_present_governing_cap_refuses_new_write
+test_invalid_present_governing_codex_block_refuses_new_write
+test_missing_governing_codex_block_defaults_request_cap
 test_idempotent_skip_does_not_resolve_governing_cap
 test_gated_cap_leaves_routing_to_caller
 test_cap_preserves_provider_block_as_diagnostic_only

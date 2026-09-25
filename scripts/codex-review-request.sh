@@ -1418,7 +1418,13 @@ governing_request_attempt_cap() {
   [ "$rc" -eq 0 ] && [ -n "$base_json" ] \
     || die 3 "cannot read codex.max_review_rounds from the governing base policy; refusing a new '@codex review' trigger"
   base_cap=$(printf '%s' "$base_json" | jq -r '
-    if ((.codex | type) == "object" and (.codex | has("max_review_rounds"))) then
+    if (type != "object") then
+      "__invalid__"
+    elif (has("codex") | not) then
+      "10"
+    elif ((.codex | type) != "object") then
+      "__invalid__"
+    elif (.codex | has("max_review_rounds")) then
       .codex.max_review_rounds
       | if (type == "string" or type == "number") then tostring else "__invalid__" end
     else
