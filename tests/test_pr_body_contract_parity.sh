@@ -25,7 +25,8 @@ TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
 # file on every run that reached it.
 TMP_BASE_TREE=""
 TMP_PROD_STALL=""
-trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"; [ -n "${TMP_PROD_STALL:-}" ] && rm -f "$TMP_PROD_STALL"' EXIT
+TMP_HOOK_CONFIG=""
+trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"; [ -n "${TMP_PROD_STALL:-}" ] && rm -f "$TMP_PROD_STALL"; [ -n "${TMP_HOOK_CONFIG:-}" ] && rm -f "$TMP_HOOK_CONFIG"' EXIT
 
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
@@ -1294,22 +1295,55 @@ for hook_file in .claude/settings.json .codex/hooks.json; do
   fi
 done
 
-# The other half: the tight bound on the guard that does NOT call the parser is
-# intentional, not an oversight. Without this, "fix the mismatch" could be read
-# as raising every hook registration.
-for hook_file in .claude/settings.json .codex/hooks.json; do
-  other_bound="$(node -e '
+# The other half: existing non-parser registrations keep a tight bound. The
+# consumer-owned Claude configuration may omit this unrelated guard; the hub
+# Claude config and propagated Codex config must retain their registrations.
+non_parser_hook_bound() { # file, aggregate parser bound, allow missing
+  node -e '
     const d = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
     const hooks = d.hooks.PreToolUse.flatMap((g) => g.hooks);
     const other = hooks.filter((h) => h.command.includes("label-removal-guard.sh"));
-    process.stdout.write(other.length === 1 ? String(other[0].timeout) : "");
-  ' "$ROOT/$hook_file")"
-  if [ -n "$other_bound" ] && [ "$other_bound" -lt "$HOOK_AGGREGATE" ]; then
-    ok "#1281: $hook_file keeps the non-parser guard tight at ${other_bound}s"
+    if (other.length === 0 && process.argv[3] === "true") {
+      process.stdout.write("absent (consumer-owned Claude registration is optional)");
+      process.exit(0);
+    }
+    if (other.length !== 1 || !Number.isFinite(other[0].timeout)
+        || other[0].timeout <= 0 || other[0].timeout >= Number(process.argv[2])) process.exit(1);
+    process.stdout.write(String(other[0].timeout) + "s");
+  ' "$1" "$2" "$3"
+}
+for hook_file in .claude/settings.json .codex/hooks.json; do
+  allow_missing_other=false
+  if [ "$hook_file" = .claude/settings.json ] && [ ! -f "$ROOT/scripts/sync-to-downstream.sh" ]; then
+    allow_missing_other=true
+  fi
+  if other_bound="$(non_parser_hook_bound "$ROOT/$hook_file" "$HOOK_AGGREGATE" "$allow_missing_other")"; then
+    ok "#1281: $hook_file non-parser guard bound: $other_bound"
   else
-    bad "#1281: $hook_file raised the non-parser guard to ${other_bound:-none}s; only the parser-calling guard needs the larger bound"
+    bad "#1281: $hook_file has a missing, duplicate or oversized non-parser guard registration"
   fi
 done
+
+# Exercise the consumer exception without weakening the two mandatory configs
+# or accepting an existing non-parser hook with a parser-sized timeout.
+TMP_HOOK_CONFIG="$(mktemp "${TMPDIR:-/tmp}/parity-hook.XXXXXX")"
+printf '%s\n' '{"hooks":{"PreToolUse":[{"hooks":[]}]}}' > "$TMP_HOOK_CONFIG"
+if non_parser_hook_bound "$TMP_HOOK_CONFIG" 240 true >/dev/null; then
+  ok "consumer Claude config may omit the unrelated label-removal hook"
+else
+  bad "consumer Claude config without a label-removal hook was rejected"
+fi
+if non_parser_hook_bound "$TMP_HOOK_CONFIG" 240 false >/dev/null; then
+  bad "mandatory hub/Codex label-removal hook was allowed to disappear"
+else
+  ok "mandatory hub/Codex label-removal hook remains required"
+fi
+printf '%s\n' '{"hooks":{"PreToolUse":[{"hooks":[{"command":"label-removal-guard.sh","timeout":300}]}]}}' > "$TMP_HOOK_CONFIG"
+if non_parser_hook_bound "$TMP_HOOK_CONFIG" 240 true >/dev/null; then
+  bad "optional consumer registration allowed an oversized non-parser timeout"
+else
+  ok "an existing optional consumer registration still needs a tight timeout"
+fi
 
 # And the guard must still source the lib it is being sized against, so the
 # aggregate is computed over a real dependency rather than a stale assumption.
