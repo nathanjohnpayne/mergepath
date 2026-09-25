@@ -100,6 +100,11 @@ LEGACY_RATE_LIMIT_BODY='Rate limit exceeded
 
 Please wait before requesting another review.'
 
+WRAPPED_STATUS_PROBE_BODY='<!-- This is an auto-generated reply by CodeRabbit -->
+
+<!-- CodeRabbit review command invocation: status -->
+Here is a summary of where things stand.'
+
 # A PR-level summary that classifies as `review` and carries a blocking marker
 # ONLY in the summary body — the #535 summary-only class. There are no inline
 # findings on this head at all, so `count_potential_issues_for_sha` returns 0
@@ -664,6 +669,17 @@ Here is a summary of where things stand.' ;;
     grep -q 'carries provider-owned' "$dir/err.log" || fail "3b7 $mode: expected provider-owned non-review log"
   done
   [ "$FAIL" -ne "$before" ] || pass "3b7: provider-leading in-progress and narration bodies cannot release the current refusal"
+}
+
+test_wrapped_status_probe_does_not_supersede_refusal() {
+  local dir rc before=$FAIL
+  dir=$(make_case "refusal-before-wrapped-status-probe" "$RATE_LIMIT_BODY_HEADREF" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$WRAPPED_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] || fail "3b8: wrapped status probe should not supersede current refusal, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b8: wrapped status probe allowed status-only clearance"
+  [ "$FAIL" -ne "$before" ] || pass "3b8: a wrapped CodeRabbit command reply cannot supersede the current refusal"
 }
 
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
@@ -2468,6 +2484,7 @@ test_current_refusal_with_nonbenign_head_review_stays_refused
 test_current_refusal_with_review_quoting_progress_clears
 test_legacy_leading_refusal_stays_current
 test_provider_leading_nonreview_run_stays_refused
+test_wrapped_status_probe_does_not_supersede_refusal
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block

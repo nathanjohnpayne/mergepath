@@ -1642,7 +1642,7 @@ crw_unfenced_body() {
 # unfenced, unquoted line keeps prose, diff excerpts, and fenced examples from
 # becoming provider state.
 crw_provider_owned_refusal_class() {
-  local body=$1 unfenced first_line
+  local body=$1 unfenced first_line first_two
   unfenced=$(crw_unfenced_body "$body") || return 3
   if grep -Fxq "<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->" <<<"$unfenced"; then
     printf 'rate_limit\n'
@@ -1662,6 +1662,7 @@ crw_provider_owned_refusal_class() {
     "> [!WARNING]"$'\n'"> ## Reviews paused"*) printf 'paused\n'; return 0 ;;
   esac
   first_line=$(awk 'NF { print; exit }' <<<"$unfenced") || return 3
+  first_two=$(awk 'NF { print; if (++n == 2) exit }' <<<"$unfenced") || return 3
   first_line=$(printf '%s' "$first_line" | tr '[:upper:]' '[:lower:]') || return 3
   case "$first_line" in
     'rate limit exceeded'|'rate-limit exceeded'|'## rate limit exceeded'|'## rate-limit exceeded'|'review limit reached'|'## review limit reached')
@@ -1671,6 +1672,10 @@ crw_provider_owned_refusal_class() {
     'review in progress'*|'currently reviewing'*|'commit under review'*|'commits under review'*)
       printf 'in_progress\n'; return 0 ;;
     '<!-- coderabbit review command invocation:'*|'here is a summary of where things stand'*|"here's a summary of where things stand"*|'coderabbit is an incremental review system'*|'does not re-review already reviewed commits'*)
+      printf 'status_probe\n'; return 0 ;;
+  esac
+  case "$first_two" in
+    '<!-- This is an auto-generated reply by CodeRabbit -->'$'\n''<!-- CodeRabbit review command invocation:'*)
       printf 'status_probe\n'; return 0 ;;
   esac
   return 1
