@@ -183,6 +183,37 @@ echo "$unknown_repos_out" | grep -q 'clean-consumer (x/clean-consumer)' \
 echo "$empty_path_out" | grep -q 'selects no managed path for clean-consumer' \
   || fail "empty audit --paths diagnostic was unclear: $empty_path_out"
 
+# Filter validation is pre-mutation only if it fails closed on its own manifest
+# reads. Make just the validation consumer query fail: the audit driver must
+# not run and turn that missing selection into a successful empty report.
+validation_yq_bin="$WORKDIR/validation-yq-bin"
+mkdir -p "$validation_yq_bin"
+validation_real_yq=$(command -v yq)
+cat >"$validation_yq_bin/yq" <<'YQSTUB'
+#!/usr/bin/env bash
+if [ "${MERGEPATH_TEST_YQ_FAILURE:-}" = "validation-consumers" ] \
+  && [[ "$*" == *'.consumers[]'* ]]; then
+  exit 73
+fi
+exec "$MERGEPATH_TEST_REAL_YQ" "$@"
+YQSTUB
+chmod +x "$validation_yq_bin/yq"
+set +e
+validation_yq_out=$(PATH="$validation_yq_bin:$PATH" \
+  MERGEPATH_TEST_YQ_FAILURE=validation-consumers \
+  MERGEPATH_TEST_REAL_YQ="$validation_real_yq" \
+  MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos clean-consumer \
+    --paths 'not-managed/**' 2>&1)
+validation_yq_ec=$?
+set -e
+[[ "$validation_yq_ec" -eq 2 ]] \
+  || fail "failed validation consumer read should exit 2; got $validation_yq_ec ($validation_yq_out)"
+echo "$validation_yq_out" | grep -q 'could not read manifest consumers while validating filters' \
+  || fail "failed validation consumer read lacked a clear diagnostic: $validation_yq_out"
+echo "$validation_yq_out" | grep -q '^clean-consumer (' \
+  && fail "audit driver started after validation consumer read failed: $validation_yq_out"
+
 # Audit honors .sync-overrides.yml on templated dest paths (#336).
 audit_override_workdir="$WORKDIR/audit-overrides"
 AO_MP="$audit_override_workdir/mergepath"

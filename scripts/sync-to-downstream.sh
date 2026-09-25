@@ -983,7 +983,10 @@ in_path_filter() {
 validate_filters() {
   local manifest=$1
   local consumers paths selector consumer_name consumer_repo
-  consumers=$(yq -r '.consumers[] | (.name + "\t" + .repo)' "$manifest")
+  if ! consumers=$(yq -r '.consumers[] | (.name + "\t" + .repo)' "$manifest"); then
+    err "could not read manifest consumers while validating filters"
+    return 2
+  fi
 
   if [ -n "${FILTER_REPOS:-}" ]; then
     local -a selectors=() unmatched=() valid_consumers=()
@@ -1018,10 +1021,13 @@ validate_filters() {
   fi
 
   [ -z "${FILTER_PATHS:-}" ] && return 0
-  paths=$(yq -r '
-    .paths[]
-    | (.path + "\t" + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
-  ' "$manifest")
+  if ! paths=$(yq -r '
+      .paths[]
+      | (.path + "\t" + (.consumers | (select(tag == "!!str") // (join(","))) | tostring))
+    ' "$manifest"); then
+    err "could not read manifest paths while validating filters"
+    return 2
+  fi
 
   while IFS=$'\t' read -r consumer_name consumer_repo; do
     [ -z "$consumer_name" ] && continue
