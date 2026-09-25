@@ -1725,7 +1725,7 @@ test_all_mode_degraded_deploy_does_not_reprompt() {
     fail "all-degraded: degraded cache hit did not warn that deploy creds are missing; stderr=$(cat "$case_dir/run2.err")"
     return
   fi
-  if ! grep -q '^OP_PREFLIGHT_DEPLOY_DEGRADED=1$' "$cache_dir/op-preflight-claude-deploy-adc.env"; then
+  if ! grep -q '^OP_PREFLIGHT_DEPLOY_DEGRADED=1$' "$cache_dir/op-preflight-claude-deploy-adc.slot"; then
     fail "all-degraded: run 1 did not record the deploy degradation in the adc deploy slot"
     return
   fi
@@ -1896,6 +1896,18 @@ EOF
   fi
   pass "test_all_mode_alternating_firebase_projects_do_not_evict: A/B/A/B/A/B costs one fetch per project, keys never swapped"
 
+  # Deploy slots must not break helper agent discovery, which auto-sources
+  # the PAT cache from the ONE `op-preflight-*.env` in the cache dir.
+  local discovered
+  # shellcheck disable=SC2016  # $1 expands in the child bash, by design
+  discovered=$(env -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    bash -c 'source "$1" && preflight_agent' _ "$ROOT/scripts/lib/preflight-helpers.sh" 2>/dev/null || true)
+  if [ "$discovered" != "claude" ]; then
+    fail "all-alternating: preflight_agent discovered '$discovered' (want claude) with deploy slots present: $(ls "$cache_dir")"
+    return
+  fi
+  pass "test_all_mode_alternating_firebase_projects_do_not_evict: deploy slots do not break helper agent discovery"
+
   # A `--mode review --refresh` rewrites the main session file (PATs only);
   # the deploy slot, CF_API_TOKEN included, must survive it intact.
   local injects_before
@@ -1915,7 +1927,7 @@ EOF
 
   # A slot past the session TTL is not honoured even though it exists and
   # the main session file is still fresh: age only the slot's own epoch.
-  local slot="$cache_dir/op-preflight-claude-deploy-fb-proj-alpha.env"
+  local slot="$cache_dir/op-preflight-claude-deploy-fb-proj-alpha.slot"
   sed "s/^OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=.*/OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=1/" "$slot" > "$slot.tmp" && mv "$slot.tmp" "$slot"
   if ! run_all_mode "$case_dir/proj-alpha" "$cache_dir" "$bin_dir" run-ttl; then
     fail "all-alternating: TTL=0 run failed; stderr=$(cat "$case_dir/proj-alpha/run-ttl.err")"
@@ -2039,6 +2051,37 @@ EOF
   pass "test_failed_fetch_does_not_evict_shared_deploy_files: a failed SA refetch leaves the exported key intact, no staged leftovers"
 }
 
+# ---------------------------------------------------------------------------
+# test_check_selects_same_deploy_context_without_python (Codex on #1318):
+# the full-fetch writer and --check must pick the SAME deploy slot. With a
+# broken python3 the writer's python .firebaserc parser used to see no
+# project (-> the `adc` slot) while --check's probe-free parser saw the
+# project (-> its `fb-*` slot), so --check --mode all reported the cache
+# incomplete on exactly the hosts its no-python path exists for.
+# ---------------------------------------------------------------------------
+test_check_selects_same_deploy_context_without_python() {
+  local case_dir="$WORKDIR/no-python-context"
+  local cache_dir="$case_dir/cache" bin_dir="$case_dir/bin" op_log="$case_dir/op.log"
+  mkdir -p "$cache_dir" "$bin_dir"
+  printf '{ "projects": { "default": "proj-epsilon" } }\n' > "$case_dir/.firebaserc"
+  make_degraded_op_stub "$bin_dir" "$op_log"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$bin_dir/python3"
+  chmod +x "$bin_dir/python3"
+
+  if ! run_all_mode "$case_dir" "$cache_dir" "$bin_dir" run; then
+    fail "no-python-context: --mode all failed; stderr=$(cat "$case_dir/run.err")"
+    return
+  fi
+  local rc=0
+  (cd "$case_dir" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent claude --mode all --check >/dev/null 2>"$case_dir/check.err") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "no-python-context: --check --mode all looked in a different slot than the writer used; slots: $(cd "$cache_dir" && echo op-preflight-*) stderr=$(cat "$case_dir/check.err")"
+    return
+  fi
+  pass "test_check_selects_same_deploy_context_without_python: writer and --check agree on the deploy slot"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -2071,6 +2114,7 @@ test_all_mode_degraded_deploy_does_not_reprompt
 test_all_mode_rejects_review_only_cache
 test_all_mode_alternating_firebase_projects_do_not_evict
 test_failed_fetch_does_not_evict_shared_deploy_files
+test_check_selects_same_deploy_context_without_python
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

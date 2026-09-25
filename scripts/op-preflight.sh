@@ -110,7 +110,7 @@
 #   Format:      bash-sourceable KEY='value' lines (printf %q-escaped)
 #   TTL anchor:  OP_PREFLIGHT_CREATED_AT_EPOCH (embedded in file, not mtime)
 #   Deploy creds: per Firebase-project context in
-#                $cache_dir/op-preflight-<agent>-deploy-<fb-project|adc>.env
+#                $cache_dir/op-preflight-<agent>-deploy-<fb-project|adc>.slot
 #                (own TTL anchor OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH), SA
 #                keys in op-preflight-<agent>-firebase-sa-fb-<project>.json
 #
@@ -283,7 +283,7 @@ fi
 if $PURGE_ALL; then
   if [[ -d "$CACHE_DIR" ]]; then
     echo "# Purging all session files under $CACHE_DIR" >&2
-    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*-firebase-sa*.json' -o -name 'op-preflight-*.staged.*' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
+    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*-firebase-sa*.json' -o -name 'op-preflight-*.staged.*' -o -name 'op-preflight-*-deploy-*.slot' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
   fi
   exit 0
 fi
@@ -350,7 +350,17 @@ deploy_context_slug() { # <firebase_project or "">
   fi
 }
 deploy_slot_file_for() { # <firebase_project or "">
-  printf '%s/op-preflight-%s-deploy-%s.env' "$CACHE_DIR" "$AGENT" "$(deploy_context_slug "${1:-}")"
+  # `.slot`, never `.env`: scripts/lib/preflight-helpers.sh discovers the
+  # agent from the single `op-preflight-*.env` in the cache dir, and a slot
+  # matching that glob would break helper auto-sourcing after any deploy run.
+  printf '%s/op-preflight-%s-deploy-%s.slot' "$CACHE_DIR" "$AGENT" "$(deploy_context_slug "${1:-}")"
+}
+# The ONE context selector for slots, used identically by the full-fetch
+# writer, the cache-hit reader, and --check. It is the probe-free parser, so
+# a host with no (or a broken) python3 cannot write one slot and then check
+# another. (detect_firebase_project stays for the pre-slot validation path.)
+deploy_context_project() {
+  detect_firebase_project_no_python
 }
 firebase_sa_file_for() { # <firebase_project>
   printf '%s/op-preflight-%s-firebase-sa-%s.json' "$CACHE_DIR" "$AGENT" "$(deploy_context_slug "$1")"
@@ -474,7 +484,7 @@ if $PURGE; then
   # Per-project SA keys + deploy slots, and the pre-slot single SA file.
   rm -f "$CACHE_DIR/op-preflight-$AGENT-firebase-sa.json" \
         "$CACHE_DIR/op-preflight-$AGENT-firebase-sa-"*.json \
-        "$CACHE_DIR/op-preflight-$AGENT-deploy-"*.env \
+        "$CACHE_DIR/op-preflight-$AGENT-deploy-"*.slot \
         "$CACHE_DIR/op-preflight-$AGENT-"*.staged.*
   echo "# Purged session file + ADC tempfile + Firebase SA tempfiles + deploy slots + SSH-warm marker for agent=$AGENT" >&2
   exit 0
@@ -491,7 +501,7 @@ if $DRY_RUN; then
   echo "#" >&2
   echo "# Session file:   $SESSION_FILE" >&2
   echo "# ADC tempfile:   $ADC_TMPFILE" >&2
-  echo "# Deploy slot:    $(deploy_slot_file_for "$(detect_firebase_project 2>/dev/null || true)")" >&2
+  echo "# Deploy slot:    $(deploy_slot_file_for "$(deploy_context_project 2>/dev/null || true)")" >&2
   echo "# TTL seconds:    $TTL_SECONDS" >&2
   if [[ -f "$SESSION_FILE" ]]; then
     # `|| true` so a missing epoch key doesn't take down dry-run under
@@ -533,7 +543,7 @@ if $DRY_RUN; then
     fi
   fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
-    if firebase_project="$(detect_firebase_project 2>/dev/null || true)" && [[ -n "$firebase_project" ]]; then
+    if firebase_project="$(deploy_context_project 2>/dev/null || true)" && [[ -n "$firebase_project" ]]; then
       echo "# Would read: Firebase project SA key (${firebase_project} — Firebase Deployer SA Key in vault ${FIREBASE_SA_VAULT})" >&2
       echo "# Would fall back to: GCP ADC ($DEFAULT_ADC_OP_URI)" >&2
     else
@@ -803,11 +813,7 @@ emit_from_session_file() (
   # window expired, so the refetch is logged as a retry, not a cross-mode miss.
   deploy_degraded_hit=false
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
-    if [[ "${OP_PREFLIGHT_CHECK_MODE:-0}" == "1" ]]; then
-      current_firebase_project="$(detect_firebase_project_no_python 2>/dev/null || true)"
-    else
-      current_firebase_project="$(detect_firebase_project 2>/dev/null || true)"
-    fi
+    current_firebase_project="$(deploy_context_project 2>/dev/null || true)"
     deploy_slot_file="$(deploy_slot_file_for "$current_firebase_project")"
     if [[ -f "$deploy_slot_file" ]]; then
       unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
@@ -1326,7 +1332,7 @@ fi
 if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   # Same clear-then-export contract as the cache-hit path.
   EXPORTS+=("unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN")
-  firebase_project="$(detect_firebase_project 2>/dev/null || true)"
+  firebase_project="$(deploy_context_project 2>/dev/null || true)"
   firebase_sa_loaded=false
   adc_loaded=false
   firebase_sa_file=""
