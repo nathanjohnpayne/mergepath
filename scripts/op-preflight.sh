@@ -407,23 +407,71 @@ json_string_field_no_python() {
   ' "$file"
 }
 
+# Root `projects.default` of .firebaserc, without python3. This is the
+# deploy-slot context selector (deploy_context_project), so it must read the
+# SAME value as the python parser and the Firebase CLI: a textual first-match
+# regex picked a nested "projects" object that preceded the root one and
+# cached another project's key (Codex on #1318). So this is a small JSON
+# scanner, not a regex: it tracks string/escape state and nesting depth,
+# reads `default` only from a depth-1 "projects" object, and mirrors
+# json.loads duplicate-key semantics (the last root "projects" and the last
+# "default" in it win; a non-string or empty default is no project).
 firebaserc_default_project_no_python() {
   [[ -f .firebaserc ]] || return 1
   awk '
-    { text = text $0 " " }
+    { text = text $0 "\n" }
     END {
-      if (!match(text, /"projects"[[:space:]]*:[[:space:]]*\{[^}]*\}/)) {
-        exit 1
+      n = length(text); depth = 0; in_str = 0; esc = 0; str = ""
+      key = ""; after_colon = 0; proj_depth = 0; val = ""; seen = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(text, i, 1)
+        if (in_str) {
+          if (esc) { str = str c; esc = 0; continue }
+          if (c == "\\") { esc = 1; str = str c; continue }
+          if (c != "\"") { str = str c; continue }
+          in_str = 0
+          if (after_colon) {
+            if (proj_depth && depth == proj_depth && key == "default") val = str
+            if (depth == 1 && key == "projects") { val = ""; seen = 1 }
+            after_colon = 0
+          } else {
+            key = str
+          }
+          continue
+        }
+        if (c == "\"") { in_str = 1; str = ""; continue }
+        if (c == ":") {
+          after_colon = 1
+          if (proj_depth && depth == proj_depth && key == "default") val = ""
+          continue
+        }
+        if (c == "{") {
+          depth++
+          if (after_colon && depth == 2 && key == "projects") { proj_depth = 2; val = ""; seen = 1 }
+          after_colon = 0; key = ""
+          continue
+        }
+        if (c == "}") {
+          if (proj_depth && depth == proj_depth) proj_depth = 0
+          depth--; after_colon = 0; key = ""
+          continue
+        }
+        if (c == "[") {
+          if (after_colon && depth == 1 && key == "projects") { val = ""; seen = 1 }
+          depth++; after_colon = 0; key = ""
+          continue
+        }
+        if (c == "]") { depth--; after_colon = 0; key = ""; continue }
+        if (c == ",") { after_colon = 0; key = ""; continue }
+        if (after_colon && proj_depth && depth == proj_depth && key == "default" && c !~ /[[:space:]]/) {
+          # non-string value (number/true/null...) for default
+          val = ""; after_colon = 0
+        }
+        # A root "projects" whose value is not an object discards any earlier one.
+        if (after_colon && depth == 1 && key == "projects" && c !~ /[[:space:]]/) { val = ""; seen = 1; after_colon = 0 }
       }
-      projects = substr(text, RSTART, RLENGTH)
-      if (!match(projects, /"default"[[:space:]]*:[[:space:]]*"[^"]+"/)) {
-        exit 1
-      }
-      matched = substr(projects, RSTART, RLENGTH)
-      if (split(matched, parts, "\"") < 4) {
-        exit 1
-      }
-      print parts[4]
+      if (!seen || val == "") exit 1
+      print val
     }
   ' .firebaserc
 }

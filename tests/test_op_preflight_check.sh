@@ -2115,6 +2115,51 @@ test_deploy_failure_clears_inherited_credentials() {
   pass "test_deploy_failure_clears_inherited_credentials: failed --mode deploy clears inherited deploy creds and fails the eval"
 }
 
+# ---------------------------------------------------------------------------
+# test_firebaserc_parsers_agree (Codex on #1318): the probe-free .firebaserc
+# parser picks the deploy slot AND the SA key to fetch, so it must read the
+# root `projects.default` exactly as the python parser (and the Firebase CLI)
+# does. A first-textual-match regex returned a nested "projects" object's
+# default and cached another project's key. Both real functions are lifted
+# out of the script and must agree on every case, including the failures.
+# ---------------------------------------------------------------------------
+test_firebaserc_parsers_agree() {
+  local case_dir="$WORKDIR/firebaserc-parity"
+  mkdir -p "$case_dir"
+  awk '/^(detect_firebase_project|firebaserc_default_project_no_python)\(\) \{/,/^\}/' "$SCRIPT" > "$case_dir/parsers.sh"
+
+  local -a cases=(
+    'simple|{ "projects": { "default": "right" } }'
+    'nested-projects-first|{ "targets": { "x": { "projects": { "default": "wrong" } } }, "projects": { "default": "right" } }'
+    'nested-in-array|{ "list": [ { "projects": { "default": "wrong" } } ], "projects": { "default": "right" } }'
+    'braces-in-string|{ "note": "{\"projects\": {\"default\": \"wrong\"}}", "projects": { "default": "right" } }'
+    'escaped-quote-key|{ "etags": { "a\"b": "c" }, "projects": { "prod": "p", "default": "right" } }'
+    'nested-object-in-projects|{ "projects": { "meta": { "default": "wrong" }, "default": "right" } }'
+    'multiline|{\n  "projects": {\n    "default": "right"\n  }\n}'
+    'duplicate-projects|{ "projects": { "default": "first" }, "projects": { "default": "second" } }'
+    'duplicate-default|{ "projects": { "default": "first", "default": "second" } }'
+    'later-projects-string|{ "projects": { "default": "first" }, "projects": "x" }'
+    'no-default|{ "projects": { "prod": "p" } }'
+    'numeric-default|{ "projects": { "default": 5 } }'
+    'empty-default|{ "projects": { "default": "" } }'
+    'no-projects|{ "targets": { "projects": { "default": "wrong" } } }'
+  )
+  local entry name json py awkv
+  for entry in "${cases[@]}"; do
+    name="${entry%%|*}"
+    json="${entry#*|}"
+    mkdir -p "$case_dir/$name"
+    printf '%b\n' "$json" > "$case_dir/$name/.firebaserc"
+    py=$(cd "$case_dir/$name" && env -u OP_PREFLIGHT_FIREBASE_PROJECT_ID bash -c '. "$1"; detect_firebase_project' _ "$case_dir/parsers.sh" 2>/dev/null || true)
+    awkv=$(cd "$case_dir/$name" && bash -c '. "$1"; firebaserc_default_project_no_python' _ "$case_dir/parsers.sh" 2>/dev/null || true)
+    if [ "$py" != "$awkv" ]; then
+      fail "firebaserc-parity[$name]: python parser '$py' != no-python parser '$awkv'"
+      return
+    fi
+  done
+  pass "test_firebaserc_parsers_agree: no-python .firebaserc parser matches the python parser on ${#cases[@]} cases"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -2149,6 +2194,7 @@ test_all_mode_alternating_firebase_projects_do_not_evict
 test_failed_fetch_does_not_evict_shared_deploy_files
 test_check_selects_same_deploy_context_without_python
 test_deploy_failure_clears_inherited_credentials
+test_firebaserc_parsers_agree
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
