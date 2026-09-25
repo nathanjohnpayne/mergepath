@@ -394,6 +394,9 @@ g1100_decide() {  # <accounting-json> -> "refuse" | "proceed"
     configured-normalization)
       body="$(printf '%s\n' "$body" | sed "s/LC_ALL=C tr '\\[:upper:\\]' '\\[:lower:\\]'/cat/")"
       ;;
+    gating-normalization)
+      body="$(printf '%s\n' "$body" | sed "/^        __cra_gating=/,/^        if / s/LC_ALL=C tr '\\[:upper:\\]' '\\[:lower:\\]'/cat/")"
+      ;;
     observed-normalization)
       body="$(printf '%s\n' "$body" | sed 's/ascii_downcase/./')"
       ;;
@@ -558,6 +561,16 @@ G1100_CR='Chatgpt-Codex-Connector[Bot]' \
     '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' refuse
 G1100_MUTATION=configured-normalization G1100_CR='Chatgpt-Codex-Connector[Bot]' \
   g1100_case "mutation: removing configured-set normalization reopens the collision" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' proceed
+G1100_MUTATION=''
+# The inverse spelling proves the gating set is independently normalized.
+# Leaving only this side case-sensitive would let the same collision relax the
+# uncollided provider's finding.
+G1100_CR='chatgpt-codex-connector[bot]' G1100_CODEX='Chatgpt-Codex-Connector[Bot]' \
+  g1100_case "case-only gating login collision voids the whole relax set" \
+    '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' refuse
+G1100_MUTATION=gating-normalization G1100_CR='chatgpt-codex-connector[bot]' G1100_CODEX='Chatgpt-Codex-Connector[Bot]' \
+  g1100_case "mutation: removing gating-set normalization reopens the collision" \
     '{"missing":[{"reviewer":"github-advanced-security[bot]"}]}' proceed
 G1100_MUTATION=''
 
