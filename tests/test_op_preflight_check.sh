@@ -2154,6 +2154,18 @@ EOF
     return
   fi
   pass "test_failed_fetch_does_not_evict_shared_deploy_files: a failed deploy --refresh also strips pre-slot session deploy fields, PATs kept"
+
+  # 6. ...but only the failing context's: another project's pre-slot entry
+  #    in the shared session file survives proj-gamma's failed refresh.
+  make_aged_cache "$cache_dir" claude 0 "ne-reviewer-pat" "ne-author-pat"
+  printf 'GOOGLE_APPLICATION_CREDENTIALS=/tmp/proj-omega-key.json\nOP_PREFLIGHT_FIREBASE_SA_TMPFILE=/tmp/proj-omega-key.json\nOP_PREFLIGHT_FIREBASE_PROJECT=proj-omega\n' \
+    >> "$cache_dir/op-preflight-claude.env"
+  run_deploy deploy-refresh-fail-3 --refresh || true
+  if ! grep -q '^OP_PREFLIGHT_FIREBASE_PROJECT=proj-omega$' "$cache_dir/op-preflight-claude.env"; then
+    fail "no-evict: proj-gamma's failed refresh stripped proj-omega's pre-slot session entry"
+    return
+  fi
+  pass "test_failed_fetch_does_not_evict_shared_deploy_files: a failed refresh strips only its own context's pre-slot entry"
 }
 
 # ---------------------------------------------------------------------------

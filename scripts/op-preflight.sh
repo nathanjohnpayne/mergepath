@@ -1277,9 +1277,29 @@ emit_check_failure_guard() {
 # next deploy would fall back to them and reuse the rotated key (Codex on
 # #1318). Strip them too -- staged + renamed, PATs kept -- rather than
 # deleting the whole file and forcing a PAT re-prompt.
+#
+# Only fields for THIS context are stripped (CodeRabbit on #1318), by the
+# same rule that lets pre-slot fields supersede a slot: a pre-slot Firebase
+# SA only when it is for the failing project, pre-slot ADC only when the
+# failing context is `adc`. Another project's pre-slot entry is untouched.
+session_field() { # <variable name>: its value in the session file, or ""
+  # shellcheck disable=SC1090
+  ( unset "$1"; . "$SESSION_FILE" 2>/dev/null; printf '%s' "${!1:-}" )
+}
 invalidate_deploy_slot() {
   rm -f "$(deploy_slot_file_for "${firebase_project:-}")"
-  if [[ -f "$SESSION_FILE" ]] && grep -Eq '^(GOOGLE_APPLICATION_CREDENTIALS|OP_PREFLIGHT_ADC_TMPFILE|OP_PREFLIGHT_FIREBASE_SA_TMPFILE|OP_PREFLIGHT_FIREBASE_PROJECT)=' "$SESSION_FILE"; then
+  [[ -f "$SESSION_FILE" ]] || return 0
+  local legacy_gac legacy_sa legacy_project
+  legacy_gac="$(session_field GOOGLE_APPLICATION_CREDENTIALS)"
+  legacy_sa="$(session_field OP_PREFLIGHT_FIREBASE_SA_TMPFILE)"
+  legacy_project="$(session_field OP_PREFLIGHT_FIREBASE_PROJECT)"
+  [[ -n "$legacy_gac" ]] || return 0
+  if [[ -n "$legacy_sa" && "$legacy_gac" == "$legacy_sa" ]]; then
+    [[ -n "${firebase_project:-}" && "$legacy_project" == "$firebase_project" ]] || return 0
+  else
+    [[ -z "${firebase_project:-}" ]] || return 0
+  fi
+  if grep -Eq '^(GOOGLE_APPLICATION_CREDENTIALS|OP_PREFLIGHT_ADC_TMPFILE|OP_PREFLIGHT_FIREBASE_SA_TMPFILE|OP_PREFLIGHT_FIREBASE_PROJECT)=' "$SESSION_FILE"; then
     local session_staged
     session_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-session.staged.XXXXXX")"
     grep -Ev '^(GOOGLE_APPLICATION_CREDENTIALS|OP_PREFLIGHT_ADC_TMPFILE|OP_PREFLIGHT_FIREBASE_SA_TMPFILE|OP_PREFLIGHT_FIREBASE_PROJECT)=' \
