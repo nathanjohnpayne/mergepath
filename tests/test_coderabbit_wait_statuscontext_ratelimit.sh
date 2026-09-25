@@ -105,6 +105,12 @@ WRAPPED_STATUS_PROBE_BODY='<!-- This is an auto-generated reply by CodeRabbit --
 <!-- CodeRabbit review command invocation: status -->
 Here is a summary of where things stand.'
 
+WRAPPED_SUMMARY_STATUS_PROBE_BODY=$'<!-- This is an auto-generated reply by CodeRabbit -->   \r\n\r\nHeRe\'s A sUmMaRy Of WhErE tHiNgS sTaNd. \r'
+
+WRAPPED_INCREMENTAL_STATUS_PROBE_BODY='<!-- This is an auto-generated reply by CodeRabbit -->
+
+Does not re-review already reviewed commits.'
+
 ACTIONS_PERFORMED_STATUS_PROBE_BODY='<!-- This is an auto-generated reply by CodeRabbit -->
 
 <details><summary>✅ Actions performed</summary>
@@ -743,9 +749,11 @@ Here is a summary of where things stand.' ;;
 
 test_status_probe_does_not_supersede_refusal() {
   local mode reply dir rc before=$FAIL
-  for mode in wrapped bare actions-performed actions-performed-split; do
+  for mode in wrapped wrapped-summary-whitespace wrapped-incremental bare actions-performed actions-performed-split; do
     case "$mode" in
       wrapped) reply=$WRAPPED_STATUS_PROBE_BODY ;;
+      wrapped-summary-whitespace) reply=$WRAPPED_SUMMARY_STATUS_PROBE_BODY ;;
+      wrapped-incremental) reply=$WRAPPED_INCREMENTAL_STATUS_PROBE_BODY ;;
       bare) reply=$BARE_STATUS_PROBE_BODY ;;
       actions-performed) reply=$ACTIONS_PERFORMED_STATUS_PROBE_BODY ;;
       actions-performed-split) reply=$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY ;;
@@ -757,22 +765,29 @@ test_status_probe_does_not_supersede_refusal() {
     [ "$rc" = "5" ] || fail "3b8 $mode: status probe should not supersede current refusal, got $rc; err=$(tail -6 "$dir/err.log")"
     [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b8 $mode: status probe allowed status-only clearance"
   done
-  [ "$FAIL" -ne "$before" ] || pass "3b8: wrapped, bare and combined/split action acknowledgement CodeRabbit command replies cannot supersede the current refusal"
+  [ "$FAIL" -ne "$before" ] || pass "3b8: wrapped, whitespace-normalized, bare and combined/split action acknowledgement CodeRabbit command replies cannot supersede the current refusal"
 }
 
 # The structural narration selector is shared with ordinary polling. Disable
-# the StatusContext fast path so this case reaches that selector directly: the
-# split acknowledgement above must be skipped and the older refusal retained.
-test_split_status_probe_is_excluded_by_polling_selector() {
-  local dir rc before=$FAIL
-  dir=$(make_case "polling-refusal-before-split-status-probe" "$RATE_LIMIT_BODY_HEADREF" \
-    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
-    "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
-  sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
-  rc=$(run_case "$dir")
-  [ "$rc" = "5" ] || fail "3b9: ordinary polling must skip split action narration and retain the refusal, got $rc; err=$(tail -6 "$dir/err.log")"
-  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "3b9: ordinary polling selected action narration instead of the older refusal"
-  [ "$FAIL" -ne "$before" ] || pass "3b9: ordinary polling excludes split-layout action acknowledgement narration"
+# the StatusContext fast path so these cases reach that selector directly: the
+# narration must be skipped and the older refusal retained.
+test_structural_status_probes_are_excluded_by_polling_selector() {
+  local mode reply dir rc before=$FAIL
+  for mode in actions-performed-split wrapped-summary-whitespace wrapped-incremental; do
+    case "$mode" in
+      actions-performed-split) reply=$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY ;;
+      wrapped-summary-whitespace) reply=$WRAPPED_SUMMARY_STATUS_PROBE_BODY ;;
+      wrapped-incremental) reply=$WRAPPED_INCREMENTAL_STATUS_PROBE_BODY ;;
+    esac
+    dir=$(make_case "polling-refusal-before-$mode-status-probe" "$RATE_LIMIT_BODY_HEADREF" \
+      "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+      "$reply" "$NOTICE_AFTER_SUMMARY_TIME")
+    sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+    rc=$(run_case "$dir")
+    [ "$rc" = "5" ] || fail "3b9 $mode: ordinary polling must skip structural status narration and retain the refusal, got $rc; err=$(tail -6 "$dir/err.log")"
+    [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "3b9 $mode: ordinary polling selected status narration instead of the older refusal"
+  done
+  [ "$FAIL" -ne "$before" ] || pass "3b9: ordinary polling excludes split-layout, wrapped and whitespace-normalized status narration"
 }
 
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
@@ -2579,7 +2594,7 @@ test_current_refusal_with_review_quoting_progress_clears
 test_legacy_leading_refusal_stays_current
 test_provider_leading_nonreview_run_stays_refused
 test_status_probe_does_not_supersede_refusal
-test_split_status_probe_is_excluded_by_polling_selector
+test_structural_status_probes_are_excluded_by_polling_selector
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block

@@ -1642,7 +1642,7 @@ crw_unfenced_body() {
 # unfenced, unquoted line keeps prose, diff excerpts, and fenced examples from
 # becoming provider state.
 crw_provider_owned_refusal_class() {
-  local body=$1 unfenced first_line first_two actions_lead
+  local body=$1 unfenced first_line narration_lead narration_first_line
   unfenced=$(crw_unfenced_body "$body") || return 3
   if grep -Fxq "<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->" <<<"$unfenced"; then
     printf 'rate_limit\n'
@@ -1662,7 +1662,6 @@ crw_provider_owned_refusal_class() {
     "> [!WARNING]"$'\n'"> ## Reviews paused"*) printf 'paused\n'; return 0 ;;
   esac
   first_line=$(awk 'NF { print; exit }' <<<"$unfenced") || return 3
-  first_two=$(awk 'NF { print; if (++n == 2) exit }' <<<"$unfenced") || return 3
   first_line=$(printf '%s' "$first_line" | tr '[:upper:]' '[:lower:]') || return 3
   case "$first_line" in
     'rate limit exceeded'|'rate-limit exceeded'|'## rate limit exceeded'|'## rate-limit exceeded'|'review limit reached'|'## review limit reached')
@@ -1671,18 +1670,13 @@ crw_provider_owned_refusal_class() {
       printf 'paused\n'; return 0 ;;
     'review in progress'*|'currently reviewing'*|'commit under review'*|'commits under review'*)
       printf 'in_progress\n'; return 0 ;;
-    '<!-- coderabbit review command invocation:'*|'coderabbit review command invocation'*|'here is a summary of where things stand'*|"here's a summary of where things stand"*|'coderabbit is an incremental review system'*|'does not re-review already reviewed commits'*)
-      printf 'status_probe\n'; return 0 ;;
   esac
-  case "$first_two" in
-    '<!-- This is an auto-generated reply by CodeRabbit -->'$'\n''<!-- CodeRabbit review command invocation:'*)
-      printf 'status_probe\n'; return 0 ;;
-  esac
-  # CodeRabbit's command acknowledgement can use a generated wrapper and can
-  # render details/summary on one line or two. Normalize only the bounded
-  # leading structure: line-ending whitespace and ASCII case are presentation,
-  # while quoted or fenced copies in a real refusal/review must stay eligible.
-  actions_lead=$(awk '
+  # CodeRabbit's status narration can use a generated wrapper, and its command
+  # acknowledgement can render details/summary on one line or two. Normalize
+  # only the bounded leading structure once: line-ending whitespace and ASCII
+  # case are presentation, while quoted or fenced copies in a real refusal or
+  # review body must stay eligible.
+  narration_lead=$(awk '
     NF {
       line = $0
       sub(/[[:space:]]+$/, "", line)
@@ -1690,13 +1684,18 @@ crw_provider_owned_refusal_class() {
       if (++n == 5) exit
     }
   ' <<<"$unfenced") || return 3
-  actions_lead=$(printf '%s' "$actions_lead" | tr '[:upper:]' '[:lower:]') || return 3
-  case "$actions_lead" in
+  narration_lead=$(printf '%s' "$narration_lead" | tr '[:upper:]' '[:lower:]') || return 3
+  case "$narration_lead" in
     '<!-- this is an auto-generated reply by coderabbit -->'$'\n'*)
-      actions_lead=${actions_lead#*$'\n'}
+      narration_lead=${narration_lead#*$'\n'}
       ;;
   esac
-  case "$actions_lead" in
+  narration_first_line=${narration_lead%%$'\n'*}
+  case "$narration_first_line" in
+    '<!-- coderabbit review command invocation:'*|'coderabbit review command invocation'*|'here is a summary of where things stand'*|"here's a summary of where things stand"*|'coderabbit is an incremental review system'*|'does not re-review already reviewed commits'*)
+      printf 'status_probe\n'; return 0 ;;
+  esac
+  case "$narration_lead" in
     '<details><summary>✅ actions performed</summary>'$'\n''review triggered.'$'\n''> note: coderabbit is an incremental review system'*|\
     '<details><summary>✅ actions performed</summary>'$'\n''review triggered.'$'\n''note: coderabbit is an incremental review system'*|\
     '<details><summary>✅ actions performed</summary>'$'\n''review triggered.'$'\n''coderabbit is an incremental review system'*|\
