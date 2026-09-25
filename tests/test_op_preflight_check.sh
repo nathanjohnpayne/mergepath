@@ -958,7 +958,7 @@ EOF
     fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: missing Firebase project export; out=$out"
     return
   fi
-  if echo "$out" | grep -q "OP_PREFLIGHT_ADC_TMPFILE"; then
+  if echo "$out" | grep -q "export OP_PREFLIGHT_ADC_TMPFILE"; then
     fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: should not export shared ADC marker; out=$out"
     return
   fi
@@ -1709,16 +1709,24 @@ test_all_mode_degraded_deploy_does_not_reprompt() {
     fail "all-degraded: degraded cache hit did not emit the cached PATs; out=$(cat "$case_dir/run2.out")"
     return
   fi
-  if grep -q "GOOGLE_APPLICATION_CREDENTIALS" "$case_dir/run2.out"; then
+  if grep -q "export GOOGLE_APPLICATION_CREDENTIALS" "$case_dir/run2.out"; then
     fail "all-degraded: degraded cache hit exported GOOGLE_APPLICATION_CREDENTIALS; out=$(cat "$case_dir/run2.out")"
+    return
+  fi
+  # ...and actively clears one left in the caller's shell by an earlier eval.
+  local leaked
+  leaked=$(GOOGLE_APPLICATION_CREDENTIALS=/tmp/other-project-key.json bash -c \
+    'eval "$(grep -v "^export OP_PREFLIGHT_.*_PAT=" "$1")"; printf %s "${GOOGLE_APPLICATION_CREDENTIALS:-}"' _ "$case_dir/run2.out")
+  if [ -n "$leaked" ]; then
+    fail "all-degraded: degraded cache hit left an inherited GOOGLE_APPLICATION_CREDENTIALS ($leaked) in the caller's shell"
     return
   fi
   if ! grep -q "deploy credentials unavailable" "$case_dir/run2.err"; then
     fail "all-degraded: degraded cache hit did not warn that deploy creds are missing; stderr=$(cat "$case_dir/run2.err")"
     return
   fi
-  if ! grep -q '^OP_PREFLIGHT_DEPLOY_DEGRADED=1$' "$cache_dir/op-preflight-claude.env"; then
-    fail "all-degraded: run 1 did not record the deploy degradation in the session file"
+  if ! grep -q '^OP_PREFLIGHT_DEPLOY_DEGRADED=1$' "$cache_dir/op-preflight-claude-deploy-adc.env"; then
+    fail "all-degraded: run 1 did not record the deploy degradation in the adc deploy slot"
     return
   fi
   pass "test_all_mode_degraded_deploy_does_not_reprompt: second --mode all with ADC unavailable makes no op call"
@@ -1753,7 +1761,7 @@ test_all_mode_degraded_deploy_does_not_reprompt() {
     return
   fi
   if [ "$(count_lines "$op_log" '^inject$')" != "$((injects_before + 1))" ]; then
-    fail "all-degraded: a degraded verdict for project '' was reused for project 'other-project'"
+    fail "all-degraded: a degraded verdict for the adc context was reused for project 'other-project'"
     return
   fi
   pass "test_all_mode_degraded_deploy_does_not_reprompt: a new Firebase-project context re-fetches"
@@ -1800,6 +1808,117 @@ test_all_mode_rejects_review_only_cache() {
   pass "test_all_mode_rejects_review_only_cache: review-only cache still cannot satisfy --mode all (#227 r3)"
 }
 
+# ---------------------------------------------------------------------------
+# test_all_mode_alternating_firebase_projects_do_not_evict: two sessions for
+# the same agent in two Firebase repos (nathanpaynedotcom and
+# fiveacross/gaycruisebingo on 2026-09-24) used to share ONE deploy slot and
+# ONE SA key file. Each `--mode all` saw the other project's key, treated it
+# as a miss, re-prompted biometric, and overwrote the shared key file under
+# the path the other session had exported. Per-project slots: alternating
+# A, B, A, B, A, B costs exactly one fetch per project, and B's fetch never
+# touches A's key file.
+# ---------------------------------------------------------------------------
+test_all_mode_alternating_firebase_projects_do_not_evict() {
+  local case_dir="$WORKDIR/all-alternating"
+  local cache_dir="$case_dir/cache" bin_dir="$case_dir/bin" op_log="$case_dir/op.log"
+  local proj
+  mkdir -p "$cache_dir" "$bin_dir"
+  for proj in proj-alpha proj-beta; do
+    mkdir -p "$case_dir/$proj"
+    printf '{ "projects": { "default": "%s" } }\n' "$proj" > "$case_dir/$proj/.firebaserc"
+  done
+
+  # op stub: inject -> PATs; `document get "<project> — Firebase Deployer SA
+  # Key"` -> a well-formed SA key for THAT project; read (CF token) -> fail.
+  cat > "$bin_dir/op" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\${1:-} \${3:-}" >> "$op_log"
+case "\${1:-}" in
+  inject)
+    printf '%s\n' "REVIEWER_PAT=alt-reviewer-pat" "AUTHOR_PAT=alt-author-pat"
+    ;;
+  document)
+    project="\${3%% *}"
+    out_path=""
+    while [ \$# -gt 0 ]; do
+      if [ "\$1" = "--out-file" ]; then shift; out_path="\$1"; fi
+      shift || true
+    done
+    [ -n "\$out_path" ] || exit 1
+    printf '{"type": "service_account", "project_id": "%s", "client_email": "firebase-deployer@%s.iam.gserviceaccount.com"}\n' \
+      "\$project" "\$project" > "\$out_path"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$bin_dir/op"
+
+  local round
+  for round in 1 2 3; do
+    for proj in proj-alpha proj-beta; do
+      if ! run_all_mode "$case_dir/$proj" "$cache_dir" "$bin_dir" "run-$round"; then
+        fail "all-alternating: --mode all in $proj (round $round) failed; stderr=$(cat "$case_dir/$proj/run-$round.err")"
+        return
+      fi
+      if ! grep -q "export OP_PREFLIGHT_FIREBASE_PROJECT=$proj" "$case_dir/$proj/run-$round.out"; then
+        fail "all-alternating: $proj (round $round) did not export its own project; out=$(grep -v PAT "$case_dir/$proj/run-$round.out")"
+        return
+      fi
+      # Remember every key path handed to this project's session.
+      sed -n "s/^export GOOGLE_APPLICATION_CREDENTIALS=//p" "$case_dir/$proj/run-$round.out" >> "$case_dir/$proj.gac-paths"
+    done
+  done
+
+  # Every path a session was handed must STILL hold that session's key after
+  # the other project fetched (the shared-file swap).
+  local gac_path
+  for proj in proj-alpha proj-beta; do
+    while IFS= read -r gac_path; do
+      if ! grep -q "firebase-deployer@$proj.iam" "$gac_path" 2>/dev/null; then
+        fail "all-alternating: $proj's exported GOOGLE_APPLICATION_CREDENTIALS ($gac_path) no longer holds $proj's key"
+        return
+      fi
+    done < "$case_dir/$proj.gac-paths"
+  done
+
+  if [ "$(count_lines "$op_log" '^inject')" != "2" ] || [ "$(count_lines "$op_log" '^document')" != "2" ]; then
+    fail "all-alternating: expected one fetch per project across 6 alternating runs; op log: $(tr '\n' '|' < "$op_log")"
+    return
+  fi
+  if [ "$(count_lines "$cache_dir/biometric-log" 'mode=all')" != "2" ]; then
+    fail "all-alternating: expected exactly 2 biometric-log entries; got $(cat "$cache_dir/biometric-log")"
+    return
+  fi
+  pass "test_all_mode_alternating_firebase_projects_do_not_evict: A/B/A/B/A/B costs one fetch per project, keys never swapped"
+
+  # A slot past the session TTL is not honoured even though it exists and
+  # the main session file is still fresh: age only the slot's own epoch.
+  local slot="$cache_dir/op-preflight-claude-deploy-fb-proj-alpha.env"
+  sed "s/^OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=.*/OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=1/" "$slot" > "$slot.tmp" && mv "$slot.tmp" "$slot"
+  if ! run_all_mode "$case_dir/proj-alpha" "$cache_dir" "$bin_dir" run-ttl; then
+    fail "all-alternating: TTL=0 run failed; stderr=$(cat "$case_dir/proj-alpha/run-ttl.err")"
+    return
+  fi
+  if [ "$(count_lines "$op_log" '^inject')" != "3" ]; then
+    fail "all-alternating: an expired deploy slot was served from cache"
+    return
+  fi
+  pass "test_all_mode_alternating_firebase_projects_do_not_evict: an expired deploy slot re-fetches"
+
+  # --purge removes every slot and per-project key file for the agent.
+  PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" "$SCRIPT" --agent claude --purge 2>/dev/null
+  local leftover
+  for leftover in "$cache_dir"/op-preflight-claude-deploy-* "$cache_dir"/op-preflight-claude-firebase-sa*; do
+    if [ -e "$leftover" ]; then
+      fail "all-alternating: --purge left $leftover behind"
+      return
+    fi
+  done
+  pass "test_all_mode_alternating_firebase_projects_do_not_evict: --purge removes per-project slots and keys"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -1830,6 +1949,7 @@ test_check_rejects_cache_from_a_different_pat_item
 test_preflight_mode_is_exported
 test_all_mode_degraded_deploy_does_not_reprompt
 test_all_mode_rejects_review_only_cache
+test_all_mode_alternating_firebase_projects_do_not_evict
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
