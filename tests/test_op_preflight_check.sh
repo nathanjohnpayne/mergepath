@@ -688,6 +688,12 @@ test_ttl_override_both_directions() {
 test_check_deploy_no_python3_probe() {
   local cache_dir="$WORKDIR/deploy-no-python3-cache"
   mkdir -p "$cache_dir" && chmod 700 "$cache_dir"
+  # This fixture models the shared ADC context, not a Firebase project. Run
+  # from an empty directory and discard a caller-provided project override so
+  # consumer repositories with a root .firebaserc cannot change the fixture's
+  # intended cache context.
+  local context_dir="$WORKDIR/deploy-no-python3-context"
+  mkdir -p "$context_dir"
   local adc_file="$WORKDIR/deploy-no-python3-adc.json"
   # Fake but well-formed service_account JSON. adc_is_usable
   # short-circuits to OK on service_account creds without HTTP, but
@@ -722,9 +728,11 @@ EOF
   chmod +x "$py_stub/python3"
 
   local out rc=0
-  out=$(OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
-        PATH="$py_stub:$STUB_DIR:$PATH" \
-        "$SCRIPT" --agent claude --mode deploy --check --print-exports 2>&1) || rc=$?
+  out=$(cd "$context_dir" && \
+        env -u OP_PREFLIGHT_FIREBASE_PROJECT_ID \
+          OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+          PATH="$py_stub:$STUB_DIR:$PATH" \
+          "$SCRIPT" --agent claude --mode deploy --check --print-exports 2>&1) || rc=$?
   if [ "$rc" -ne 0 ]; then
     fail "test_check_deploy_no_python3_probe: --check --print-exports --mode deploy returned rc=$rc; out=$out"
     return

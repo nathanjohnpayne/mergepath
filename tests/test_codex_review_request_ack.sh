@@ -48,7 +48,7 @@ make_case() {
   local review_timeout=${4:-0}
   local dir="$WORKDIR/$name"
 
-  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
+  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/scripts/workflow" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/codex-review-request.sh" "$dir/scripts/codex-review-request.sh"
   chmod +x "$dir/scripts/codex-review-request.sh"
   # #799: codex-review-request.sh HARD-sources this lib (exit 3 if absent),
@@ -60,6 +60,9 @@ make_case() {
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"
   cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
   cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
+  chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
 codex:
@@ -69,6 +72,7 @@ codex:
   ack_wait_seconds: $ack_wait
   max_ack_retries: $max_retries
 EOF
+  cp "$dir/.github/review-policy.yml" "$dir/state/base-review-policy.yml"
 
   cat >"$dir/scripts/gh-as-author.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -190,8 +194,11 @@ case "$endpoint" in
     if [ "${2:-}" = "--jq" ]; then
       printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
     else
-      printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}\n'
+      printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"base":{"ref":"main","sha":"base-sha","repo":{"default_branch":"main"}}}\n'
     fi
+    ;;
+  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
+    cat "$state_dir/base-review-policy.yml"
     ;;
   repos/owner/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
     printf '%s\n' "$now"
@@ -445,7 +452,7 @@ test_retry_cap_respected() {
 test_request_attempt_cap_suppresses_ack_retry_but_polls() {
   local dir rc count before=$FAIL
   dir=$(make_case "request-cap-blocks-retry" 0 1)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   rc=$(run_case "$dir" absent)
   count=$(trigger_count "$dir")
   [ "$rc" = 4 ] || fail "#813 retry cap: exit $rc, expected ordinary poll timeout 4; stderr=$(cat "$dir/err.log")"
@@ -461,7 +468,7 @@ test_request_attempt_cap_suppresses_ack_retry_but_polls() {
 test_reused_final_slot_trigger_polls_arriving_response() {
   local dir rc count ack_count review_body before=$FAIL
   dir=$(make_case "reused-final-slot-arrival" 0 1)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9901 "2026-06-04T00:00:00Z"
   rc=$(run_case "$dir" reused-final-slot-arrival)
   count=$(trigger_count "$dir")
@@ -479,7 +486,7 @@ test_reused_final_slot_trigger_polls_arriving_response() {
 test_reused_final_slot_pending_stops_without_timeout_authority() {
   local dir rc count ack_count before=$FAIL
   dir=$(make_case "reused-final-slot-pending" 0 1)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9902 "2026-06-04T00:00:00Z"
   rc=$(run_case "$dir" reused-final-slot-pending)
   count=$(trigger_count "$dir")
@@ -497,7 +504,7 @@ test_reused_final_slot_pending_stops_without_timeout_authority() {
 test_reused_final_slot_preserves_recorded_timeout() {
   local dir rc marker before=$FAIL
   dir=$(make_case "reused-recorded-timeout" 0 0)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   rc=$(run_case "$dir" absent)
   [ "$rc" = 4 ] || fail "#813 recorded timeout setup: exit $rc, expected 4"
   marker=$(jq -r '.terminal_determination.marker_comment_id' "$dir/out.json")
@@ -518,7 +525,7 @@ test_reused_final_slot_timeout_marker_controls() {
   for variant in stale superseded uppercase-newer malformed head-drift; do
     before=$FAIL
     dir=$(make_case "reused-marker-$variant" 0 0)
-    printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+    printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
     seed_author_trigger "$dir" 9901 "2026-06-04T00:00:00Z"
     body='<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=9901 -->'
     expected=7
@@ -548,7 +555,7 @@ test_reused_final_slot_timeout_marker_controls() {
 test_stale_trigger_is_not_reused_as_pending() {
   local dir rc count before=$FAIL
   dir=$(make_case "stale-trigger-control" 0 1)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9903 "2026-06-03T00:00:00Z"
   rc=$(run_case "$dir" stale-trigger-control)
   count=$(trigger_count "$dir")
@@ -563,7 +570,7 @@ test_stale_trigger_is_not_reused_as_pending() {
 test_current_terminal_finding_is_not_reused_as_pending() {
   local dir rc count before=$FAIL
   dir=$(make_case "fresh-terminal-finding" 0 0)
-  printf '  max_review_rounds: 2\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 2\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9904 "2026-06-04T00:00:00Z"
   rc=$(run_case "$dir" fresh-terminal-finding)
   count=$(trigger_count "$dir")
@@ -576,7 +583,7 @@ test_current_terminal_finding_is_not_reused_as_pending() {
 test_current_terminal_finding_at_cap_does_not_claim_reuse() {
   local dir rc count before=$FAIL
   dir=$(make_case "fresh-terminal-finding-at-cap" 0 1)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9907 "2026-06-04T00:00:00Z"
   rc=$(run_case "$dir" fresh-terminal-finding)
   count=$(trigger_count "$dir")
@@ -591,7 +598,7 @@ test_current_terminal_finding_at_cap_does_not_claim_reuse() {
 test_older_finding_before_final_trigger_does_not_block_reuse() {
   local dir rc count ack_count review_body before=$FAIL
   dir=$(make_case "older-finding-before-final-trigger" 0 0)
-  printf '  max_review_rounds: 2\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 2\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9905 "2026-06-04T00:00:00Z"
   seed_author_trigger "$dir" 9906 "2026-06-04T00:00:10Z"
   rc=$(run_case "$dir" older-finding-before-final-trigger)
@@ -611,7 +618,7 @@ test_older_finding_before_final_trigger_does_not_block_reuse() {
 test_malformed_request_cap_does_not_change_clearance_skip() {
   local dir rc before=$FAIL
   dir=$(make_case "malformed-cap-cleared" 0 1)
-  printf '  max_review_rounds: 999999999999999999999999\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 999999999999999999999999\n' >>"$dir/state/base-review-policy.yml"
   rc=$(run_case "$dir" skip_reaction)
   [ "$rc" = 0 ] || fail "#813 malformed cap: cleared skip exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
   [ "$(trigger_count "$dir")" = 0 ] || fail "#813 malformed cap: cleared skip posted a trigger"

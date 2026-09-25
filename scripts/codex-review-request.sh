@@ -1387,6 +1387,51 @@ emit_cap_exhausted() { # <request_attempts> <max_request_attempts>
   exit 7
 }
 
+governing_request_attempt_cap() {
+  # The cap protects the request WRITE, so the policy controlling it must be
+  # the PR's governing base policy. Reading only $CONFIG here lets a candidate
+  # raise its own budget before asking for another scarce provider review.
+  local base_cfg base_json base_cap resolver rc=0
+  GOVERNING_REQUEST_ATTEMPT_CAP=""
+
+  resolver="$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh"
+  [ -x "$resolver" ] \
+    || die 3 "governing review-policy resolver unavailable; refusing a new '@codex review' trigger"
+  declare -F policy_yaml_to_json >/dev/null \
+    || die 3 "governing review-policy parser unavailable; refusing a new '@codex review' trigger"
+
+  set +e
+  base_cfg=$("$resolver" --repo "$REPO" --pr "$PR_NUMBER" \
+    --default-config "$CONFIG" --materialize-default 2>/dev/null)
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] && [ -n "$base_cfg" ] && [ -r "$base_cfg" ] \
+    || die 3 "cannot resolve the governing base policy; refusing a new '@codex review' trigger"
+  if [ "$base_cfg" != "$CONFIG" ]; then
+    __cra_retire_base_cfg "$base_cfg"
+  fi
+
+  set +e
+  base_json=$(policy_yaml_to_json "$base_cfg" 2>/dev/null)
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] && [ -n "$base_json" ] \
+    || die 3 "cannot read codex.max_review_rounds from the governing base policy; refusing a new '@codex review' trigger"
+  base_cap=$(printf '%s' "$base_json" | jq -r '
+    if ((.codex | type) == "object" and (.codex | has("max_review_rounds"))) then
+      .codex.max_review_rounds
+      | if (type == "string" or type == "number") then tostring else "__invalid__" end
+    else
+      "10"
+    end
+  ') || die 3 "cannot read codex.max_review_rounds from the governing base policy; refusing a new '@codex review' trigger"
+  if ! [[ "$base_cap" =~ ^[0-9]{1,9}$ ]]; then
+    die 3 "governing codex.max_review_rounds must be a non-negative integer no greater than 999999999; refusing a new '@codex review' trigger"
+  fi
+
+  GOVERNING_REQUEST_ATTEMPT_CAP="$base_cap"
+}
+
 preserve_final_request_timeout() { # <comments-json> <selected-trigger-json>
   local state live_head
   if [ "$CODEX_FAILURE_MARKERS_OK" != true ] \
@@ -1436,13 +1481,8 @@ post_codex_trigger() {
   # idempotently-reused paths spend no request attempt and retain their
   # established behavior even if a later budget edit is malformed.
   local max_review_rounds request_comments request_count
-  max_review_rounds=$(codex_field max_review_rounds)
-  max_review_rounds=${max_review_rounds:-10}
-  # Bound the decimal width before arithmetic: bash's integer comparison can
-  # overflow or error on an attacker-sized policy scalar.
-  if ! [[ "$max_review_rounds" =~ ^[0-9]{1,9}$ ]]; then
-    die 3 "codex.max_review_rounds must be a non-negative integer no greater than 999999999; refusing a new '@codex review' trigger"
-  fi
+  governing_request_attempt_cap
+  max_review_rounds="$GOVERNING_REQUEST_ATTEMPT_CAP"
   request_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "Codex request-attempt evidence") \
     || die 3 "cannot read Codex request-attempt evidence; refusing a new '@codex review' trigger"
   request_count=$(crqe_count_triggers "$request_comments" "$AUTHOR_IDENTITY") \

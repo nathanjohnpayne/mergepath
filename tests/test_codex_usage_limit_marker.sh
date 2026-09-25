@@ -381,7 +381,7 @@ run_request_e2e() { # comment_body [later_verdict] → prints "rc|blocked_reason
   # Keep punctuation in the ordinary fixture path so the generated stub must
   # transport it as data rather than embedding it in shell source.
   local body="$1" later_verdict="${2:-false}" dir="$E2E_WORKDIR/case $RANDOM's fixture" rc=0 start elapsed
-  mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin"
+  mkdir -p "$dir/scripts/lib" "$dir/scripts/workflow" "$dir/.github" "$dir/bin" "$dir/state"
   printf '%s' "$body" >"$dir/comment-body.txt"
   [ "$later_verdict" = true ] && : >"$dir/later-verdict"
   cp "$REQUEST" "$dir/scripts/codex-review-request.sh"; chmod +x "$dir/scripts/codex-review-request.sh"
@@ -389,6 +389,9 @@ run_request_e2e() { # comment_body [later_verdict] → prints "rc|blocked_reason
   cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
   cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
+  chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 author_identity: nathanjohnpayne
 codex:
@@ -398,6 +401,7 @@ codex:
   ack_wait_seconds: 0
   max_ack_retries: 0
 EOF
+  cp "$dir/.github/review-policy.yml" "$dir/state/base-review-policy.yml"
   cat >"$dir/scripts/gh-as-author.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -417,7 +421,11 @@ shift
 [ "${1:-}" = "--paginate" ] && shift
 endpoint=${1:-}
 case "$endpoint" in
-  repos/owner/repo/pulls/999)            printf '{"head":{"sha":"%s"}}\n' "$head" ;;
+  repos/owner/repo/pulls/999)            printf '{"head":{"sha":"%s"},"base":{"ref":"main","sha":"base-sha","repo":{"default_branch":"main"}}}\n' "$head" ;;
+  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
+    case_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+    cat "$case_dir/state/base-review-policy.yml"
+    ;;
   repos/owner/repo/commits/$head)        printf '%s\n' "$t0" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)    printf '[]\n' ;;
