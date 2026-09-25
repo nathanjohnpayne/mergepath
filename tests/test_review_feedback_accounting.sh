@@ -88,19 +88,19 @@ case "$endpoint" in
 esac
 
 case "$endpoint" in
-  repos/acme/widget/pulls/7)
+  repos/acme/widget*/pulls/7)
     cat "$GH_FIXTURE_DIR/pull.json"
     ;;
-  repos/acme/widget/contents/.github/review-policy.yml\?ref=*)
+  repos/acme/widget*/contents/.github/review-policy.yml\?ref=*)
     cat "$GH_FIXTURE_DIR/base-review-policy.yml"
     ;;
-  repos/acme/widget/pulls/7/comments)
+  repos/acme/widget*/pulls/7/comments)
     cat "$GH_FIXTURE_DIR/inline.json"
     ;;
-  repos/acme/widget/pulls/7/reviews)
+  repos/acme/widget*/pulls/7/reviews)
     cat "$GH_FIXTURE_DIR/reviews.json"
     ;;
-  repos/acme/widget/issues/7/comments)
+  repos/acme/widget*/issues/7/comments)
     cat "$GH_FIXTURE_DIR/issues.json"
     ;;
   repos/acme/widget/pulls/comments/*/reactions)
@@ -171,7 +171,7 @@ RUN_RC=0
 RUN_JSON=""
 RUN_ERR=""
 run_gate() {
-  local token_mode="${1:-ambient}" config_mode="${2:-override}" gate_script="${3:-$SCRIPT}" out="$TMP/out.json" err="$TMP/err.log"
+  local token_mode="${1:-ambient}" config_mode="${2:-override}" gate_script="${3:-$SCRIPT}" repo_arg="${4:-acme/widget}" out="$TMP/out.json" err="$TMP/err.log"
   local -a gate_env=(
     "PATH=$TMP/bin:$PATH"
     "GH_FIXTURE_DIR=$TMP/fixtures"
@@ -189,10 +189,10 @@ run_gate() {
       "${gate_env[@]}" \
       OP_PREFLIGHT_REVIEWER_PAT=test-token \
       OP_PREFLIGHT_CACHE_DIR="$TMP/no-cache" \
-      "$gate_script" 7 acme/widget >"$out" 2>"$err"
+      "$gate_script" 7 "$repo_arg" >"$out" 2>"$err"
   else
     env "${gate_env[@]}" GH_TOKEN=test-token \
-      "$gate_script" 7 acme/widget >"$out" 2>"$err"
+      "$gate_script" 7 "$repo_arg" >"$out" 2>"$err"
   fi
   RUN_RC=$?
   set -e
@@ -224,6 +224,14 @@ JSON
 run_gate
 assert_eq 2 "$RUN_RC" "failed fork archive relay is a persistent infrastructure block"
 assert_match 'read-only feedback archive relay.*12345' "$RUN_ERR" "relay failure names the unrecoverable source run"
+assert_match 'rerun that exact historical source run' "$RUN_ERR" "relay failure names the safe historical recovery"
+assert_match 'repos/acme/widget/actions/runs/12345/rerun' "$RUN_ERR" "relay recovery command targets the failed source run"
+assert_match 'new PR head or a different workflow run cannot' "$RUN_ERR" "relay recovery rejects unsafe substitutes"
+assert_match 'runs are rerunnable for 30 days' "$RUN_ERR" "relay recovery states the historical rerun limit"
+assert_match 'PR remains blocked and requires owner intervention' "$RUN_ERR" "unavailable relay recovery preserves the block"
+run_gate ambient override "$SCRIPT" 'acme/widget; touch /tmp/relay-command-injection'
+assert_eq 2 "$RUN_RC" "shell-sensitive repository name still blocks the relay"
+assert_match 'repos/acme/widget\\;\\ touch\\ /tmp/relay-command-injection/actions/runs/12345/rerun' "$RUN_ERR" "relay recovery shell-quotes the repository in its command"
 jq '. + [{
   "id": 3,
   "created_at": "2026-08-18T19:01:00Z",
