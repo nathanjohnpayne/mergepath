@@ -102,10 +102,17 @@ while IFS='|' read -r name comments ack reviews mode opted expected pattern read
     grep -q 'not immutable SHA attribution' "$DIR/out"
   fi
   case "$name" in
-    completed-*) ! grep -q 'monitor provider progress' "$DIR/out" ;;
+    completed-*)
+      if grep -q 'monitor provider progress' "$DIR/out"; then
+        cat "$DIR/out"; echo "FAIL $name advised monitoring a completed review"; exit 1
+      fi ;;
     thumbs-unapproved)
-      ! grep -Eq 'no matching provider activity|request review through' "$DIR/out"
-      ! grep -q '/issues/99/reactions' "$DIR/calls" ;;
+      if grep -Eq 'no matching provider activity|request review through' "$DIR/out"; then
+        cat "$DIR/out"; echo 'FAIL thumbs-unapproved gave unsupported review advice'; exit 1
+      fi
+      if grep -q '/issues/99/reactions' "$DIR/calls"; then
+        cat "$DIR/calls"; echo 'FAIL thumbs-unapproved read issue reactions'; exit 1
+      fi ;;
   esac
   actual=$(grep -c '/issues/comments/' "$DIR/calls" || true)
   [ "$actual" = "$reads" ] || { echo "FAIL $name ack reads=$actual"; exit 1; }
