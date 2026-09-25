@@ -611,7 +611,9 @@ test_refusal_quoting_narration_outranks_older_comment() {
   dir=$(make_case "refusal-quotes-narration-terminal" "$CHAT_REPLY_AFTER_SUMMARY" \
     "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
     "$SUMMARY_BODY_WITH_RATE_LIMIT_STANZA" "$NOTICE_AFTER_SUMMARY_TIME")
-  sed -i.bak 's/max_wait_seconds: 15/max_wait_seconds: 0/' "$dir/.github/review-policy.yml"
+  sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 0/' "$dir/.github/review-policy.yml"
+  grep -q '^  max_wait_seconds: 0$' "$dir/.github/review-policy.yml" \
+    || fail "3b3a terminal: fixture did not set the zero-second terminal budget"
   rc=$(run_case "$dir")
   [ "$rc" != "0" ] || fail "3b3a terminal: post-probe upgrade cleared from the older comment underneath the refusal"
   [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b3a terminal: status unexpectedly cleared"
