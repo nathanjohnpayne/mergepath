@@ -79,6 +79,13 @@
 #                             with the PAT TTL. Skipping re-warm within
 #                             this window prevents a biometric prompt on
 #                             every cache-hit invocation. See #163.
+#   OP_PREFLIGHT_DEPLOY_DEGRADED_BACKOFF_SECONDS
+#                             How long a `--mode all` cache written without
+#                             deploy credentials (no Firebase SA, no usable
+#                             ADC) satisfies later `--mode all` hits in the
+#                             same Firebase-project context before a fresh
+#                             fetch retries (default 900s = 15 min).
+#                             `--mode deploy` never accepts it.
 #   OP_PREFLIGHT_QUIET        When set to 1, suppress the verbose
 #                             cached-hit stderr block. A single-line
 #                             "# preflight: cache hit, no biometric
@@ -102,6 +109,10 @@
 #   Permissions: 600 (owner read/write only)
 #   Format:      bash-sourceable KEY='value' lines (printf %q-escaped)
 #   TTL anchor:  OP_PREFLIGHT_CREATED_AT_EPOCH (embedded in file, not mtime)
+#   Deploy creds: per Firebase-project context in
+#                $cache_dir/op-preflight-<agent>-deploy-<fb-project|adc>.slot
+#                (own TTL anchor OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH), SA
+#                keys in op-preflight-<agent>-firebase-sa-fb-<project>.json
 #
 # After eval, downstream gh usage is token-first (see REVIEW_POLICY.md
 # § Reviewer PAT Quick Start):
@@ -187,6 +198,24 @@ CACHE_DIR="${OP_PREFLIGHT_CACHE_DIR:-$DEFAULT_CACHE_DIR}"
 DEFAULT_TTL_SECONDS=36000  # 10 hours
 TTL_SECONDS="${OP_PREFLIGHT_TTL_SECONDS:-$DEFAULT_TTL_SECONDS}"
 
+# How long a `--mode all` fetch that could NOT load a deploy credential
+# (no Firebase SA key for this project and no usable GCP ADC) is reused by
+# later `--mode all` cache hits before a fresh fetch retries it. Without
+# this window every `--mode all` hit re-fetched (the cache has no
+# GOOGLE_APPLICATION_CREDENTIALS), re-prompted biometric, wrote the same
+# degraded cache, and looped: 39 Touch ID prompts in ~1h on 2026-09-24.
+# Short on purpose — a human who fixes ADC is picked up within the window,
+# and --refresh retries immediately.
+DEFAULT_DEPLOY_DEGRADED_BACKOFF_SECONDS=900  # 15 min
+DEPLOY_DEGRADED_BACKOFF_SECONDS="${OP_PREFLIGHT_DEPLOY_DEGRADED_BACKOFF_SECONDS:-$DEFAULT_DEPLOY_DEGRADED_BACKOFF_SECONDS}"
+if [[ ! "$DEPLOY_DEGRADED_BACKOFF_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "# WARNING: OP_PREFLIGHT_DEPLOY_DEGRADED_BACKOFF_SECONDS='$DEPLOY_DEGRADED_BACKOFF_SECONDS' is not a non-negative integer; falling back to default ${DEFAULT_DEPLOY_DEGRADED_BACKOFF_SECONDS}s" >&2
+  DEPLOY_DEGRADED_BACKOFF_SECONDS=$DEFAULT_DEPLOY_DEGRADED_BACKOFF_SECONDS
+fi
+# Force decimal: `0900` passes the digit check but is invalid octal in
+# arithmetic, which would silently turn every hit into a retry.
+DEPLOY_DEGRADED_BACKOFF_SECONDS=$(( 10#$DEPLOY_DEGRADED_BACKOFF_SECONDS ))
+
 # ── GCP ADC ───────────────────────────────────────────────────────────
 DEFAULT_ADC_OP_URI="${GCP_ADC_OP_URI:-op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential}"
 
@@ -254,7 +283,7 @@ fi
 if $PURGE_ALL; then
   if [[ -d "$CACHE_DIR" ]]; then
     echo "# Purging all session files under $CACHE_DIR" >&2
-    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*-firebase-sa.json' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
+    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*-firebase-sa*.json' -o -name 'op-preflight-*.staged.*' -o -name 'op-preflight-*-deploy-*.slot' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
   fi
   exit 0
 fi
@@ -291,11 +320,69 @@ fi
 # ── Cache paths (deterministic per agent) ─────────────────────────────
 SESSION_FILE="$CACHE_DIR/op-preflight-$AGENT.env"
 ADC_TMPFILE="$CACHE_DIR/op-preflight-$AGENT-adc.json"
-FIREBASE_SA_TMPFILE="$CACHE_DIR/op-preflight-$AGENT-firebase-sa.json"
 SSH_WARM_MARKER="$CACHE_DIR/op-preflight-$AGENT.ssh-warmed"
 BIOMETRIC_LOG="$CACHE_DIR/biometric-log"  # #282: append a one-line
                                           # record on each fresh fetch.
 SSH_WARM_TTL_SECONDS="${OP_PREFLIGHT_SSH_WARM_TTL_SECONDS:-1800}"  # 30 min default; #163
+
+# ── Clearing deploy variables in the CALLER's shell ───────────────────
+# Emitted (and evaluated by the caller) before any deploy export, on review
+# hits, deploy/all hits, full fetches and deploy failures. It clears the
+# preflight markers unconditionally, but clears
+# GOOGLE_APPLICATION_CREDENTIALS only when a preflight marker in that shell
+# proves preflight put it there: a value with no matching marker is the
+# human override DEPLOYMENT.md ranks first (Codex on #1318), and a degraded
+# or failed run must not erase it. It runs in the caller (bash or zsh), so
+# it is plain POSIX test syntax.
+# shellcheck disable=SC2016  # expands in the caller's shell, by design
+DEPLOY_CLEAR_STMT='if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && { [ "$GOOGLE_APPLICATION_CREDENTIALS" = "${OP_PREFLIGHT_ADC_TMPFILE:-}" ] || [ "$GOOGLE_APPLICATION_CREDENTIALS" = "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" ]; }; then unset GOOGLE_APPLICATION_CREDENTIALS; fi; unset OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT'
+# CF_API_TOKEN carries no ownership marker and is one shared purge token, not
+# a per-project identity, so deploy/all output only ever (re)exports it and
+# never clears it: an ambient token survives a run whose optional 1Password
+# read failed (Codex on #1318). A review-mode request keeps #466's behavior
+# of clearing every deploy variable, CF_API_TOKEN included.
+REVIEW_CLEAR_STMT="$DEPLOY_CLEAR_STMT; unset CF_API_TOKEN"
+
+# ── Deploy-credential slots (one per Firebase-project context) ────────
+# Deploy credentials are cached per context, not per agent: one slot per
+# Firebase project (with its own SA key file), plus one `adc` slot for
+# checkouts with no .firebaserc. Everything the deploy phase fetches
+# (including CF_API_TOKEN) lives in the slot, so a later `--mode review`
+# rewrite of the main session file (PATs only) cannot strip part of it.
+#
+# A single per-agent slot made concurrent sessions in two Firebase repos
+# (e.g. nathanpaynedotcom and fiveacross/gaycruisebingo, both `--mode all`
+# as claude) evict each other: each run saw the other project's cached key,
+# treated the mismatch as a miss, re-fetched with a biometric prompt, and
+# overwrote the one shared key file -- under the PATH the other session had
+# already exported as GOOGLE_APPLICATION_CREDENTIALS. Per-context slots end
+# both the ping-pong and that cross-project key swap.
+deploy_context_slug() { # <firebase_project or "">
+  if [[ -z "${1:-}" ]]; then
+    printf 'adc'
+  else
+    # GCP project ids are [a-z0-9-]; anything else is folded to `_`. A
+    # fold collision is harmless: the slot records its exact context and
+    # a mismatch is a cache miss.
+    printf 'fb-%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9-' '_')"
+  fi
+}
+deploy_slot_file_for() { # <firebase_project or "">
+  # `.slot`, never `.env`: scripts/lib/preflight-helpers.sh discovers the
+  # agent from the single `op-preflight-*.env` in the cache dir, and a slot
+  # matching that glob would break helper auto-sourcing after any deploy run.
+  printf '%s/op-preflight-%s-deploy-%s.slot' "$CACHE_DIR" "$AGENT" "$(deploy_context_slug "${1:-}")"
+}
+# The ONE context selector for slots, used identically by the full-fetch
+# writer, the cache-hit reader, and --check. It is the probe-free parser, so
+# a host with no (or a broken) python3 cannot write one slot and then check
+# another. (detect_firebase_project stays for the pre-slot validation path.)
+deploy_context_project() {
+  detect_firebase_project_no_python
+}
+firebase_sa_file_for() { # <firebase_project>
+  printf '%s/op-preflight-%s-firebase-sa-%s.json' "$CACHE_DIR" "$AGENT" "$(deploy_context_slug "$1")"
+}
 
 detect_firebase_project() {
   if [[ -n "${OP_PREFLIGHT_FIREBASE_PROJECT_ID:-}" ]]; then
@@ -313,7 +400,10 @@ try:
     project = json.loads(pathlib.Path(".firebaserc").read_text())["projects"]["default"]
 except Exception:
     sys.exit(1)
-if not isinstance(project, str) or not project:
+# A project containing control characters (newline, NUL, ...) is not a
+# usable Firebase project id and must never reach a cache file or a vault
+# item name; both .firebaserc parsers reject it identically.
+if not isinstance(project, str) or not project or any(ord(ch) < 32 or ord(ch) == 127 for ch in project):
     sys.exit(1)
 print(project)
 PY
@@ -338,23 +428,173 @@ json_string_field_no_python() {
   ' "$file"
 }
 
+# Root `projects.default` of .firebaserc, without python3. This is the
+# deploy-slot context selector (deploy_context_project), so it must read the
+# SAME value as the python parser and the Firebase CLI: a textual first-match
+# regex picked a nested "projects" object that preceded the root one and
+# cached another project's key (Codex on #1318). So this is a small JSON
+# scanner, not a regex: it tracks string/escape state and nesting depth,
+# reads `default` only from a depth-1 "projects" object, and mirrors
+# json.loads duplicate-key semantics (the last root "projects" and the last
+# "default" in it win; a non-string or empty default is no project). String
+# escapes are decoded like json.loads (\uXXXX -> UTF-8, surrogate pairs
+# joined; LC_ALL=C so %c emits raw bytes in every awk); a lone surrogate,
+# which python cannot print, yields no project (and in a KEY never aliases
+# an ordinary key); an escaped NUL is treated the same way, since awk cannot
+# represent it. A project containing any control character is rejected by
+# both parsers. It is ALSO a strict JSON
+# validator (grammar, trailing input, number/literal forms including
+# json.loads' NaN/Infinity, raw control characters, UTF-8 validity): a
+# malformed or truncated .firebaserc selects no project, as python and the
+# Firebase CLI reject it, rather than whatever prefix looked valid.
 firebaserc_default_project_no_python() {
   [[ -f .firebaserc ]] || return 1
-  awk '
-    { text = text $0 " " }
+  LC_ALL=C awk '
+    function hexval(h,    k, d, v) {
+      if (length(h) != 4) return -1
+      v = 0
+      for (k = 1; k <= 4; k++) {
+        d = index("0123456789abcdef", tolower(substr(h, k, 1)))
+        if (d == 0) return -1
+        v = v * 16 + d - 1
+      }
+      return v
+    }
+    function utf8(cp) {
+      if (cp < 128) return sprintf("%c", cp)
+      if (cp < 2048) return sprintf("%c%c", 192 + int(cp / 64), 128 + cp % 64)
+      if (cp < 65536) return sprintf("%c%c%c", 224 + int(cp / 4096), 128 + int(cp / 64) % 64, 128 + cp % 64)
+      return sprintf("%c%c%c%c", 240 + int(cp / 262144), 128 + int(cp / 4096) % 64, 128 + int(cp / 64) % 64, 128 + cp % 64)
+    }
+    # Consumed one scalar/container value at the current depth.
+    function after_value() {
+      if (depth == 0) expect = "done"
+      else if (st[depth] == "o") expect = "comma_or_end_o"
+      else expect = "comma_or_end_a"
+    }
+    function is_value_state() { return expect == "value" || expect == "value_or_end_a" }
+    BEGIN { for (b = 1; b < 256; b++) ord[sprintf("%c", b)] = b }
+    { text = text $0 "\n" }
     END {
-      if (!match(text, /"projects"[[:space:]]*:[[:space:]]*\{[^}]*\}/)) {
-        exit 1
+      n = length(text); depth = 0; expect = "value"
+      proj_depth = 0; val = ""; seen = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(text, i, 1)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r") continue
+        if (expect == "done") exit 1
+        if (c == "\"") {
+          # String token: decode escapes, reject raw control chars and
+          # invalid UTF-8 (python reads the file as UTF-8 and json.loads is
+          # strict about control characters).
+          str = ""; bad = 0; closed = 0
+          for (i++; i <= n; i++) {
+            c = substr(text, i, 1); o = ord[c]
+            if (c == "\"") { closed = 1; break }
+            if (o < 32) exit 1
+            if (c == "\\") {
+              i++; c = substr(text, i, 1)
+              if (c == "u") {
+                cp = hexval(substr(text, i + 1, 4))
+                if (cp < 0) exit 1
+                i += 4
+                if (cp >= 55296 && cp <= 56319) {
+                  lo = (substr(text, i + 1, 2) == "\\u") ? hexval(substr(text, i + 3, 4)) : -1
+                  if (lo >= 56320 && lo <= 57343) { cp = 65536 + (cp - 55296) * 1024 + (lo - 56320); i += 6 }
+                  else { bad = 1; continue }
+                } else if (cp >= 56320 && cp <= 57343) { bad = 1; continue }
+                if (cp == 0) { bad = 1; continue }
+                str = str utf8(cp)
+              }
+              else if (c == "\"" || c == "\\" || c == "/") str = str c
+              else if (c == "n") str = str "\n"
+              else if (c == "t") str = str "\t"
+              else if (c == "r") str = str "\r"
+              else if (c == "b") str = str "\b"
+              else if (c == "f") str = str "\f"
+              else exit 1
+              continue
+            }
+            if (o >= 128) {
+              if (o >= 194 && o <= 223) { need = 1; lo_b = 128; hi_b = 191 }
+              else if (o == 224) { need = 2; lo_b = 160; hi_b = 191 }
+              else if ((o >= 225 && o <= 236) || o == 238 || o == 239) { need = 2; lo_b = 128; hi_b = 191 }
+              else if (o == 237) { need = 2; lo_b = 128; hi_b = 159 }
+              else if (o == 240) { need = 3; lo_b = 144; hi_b = 191 }
+              else if (o >= 241 && o <= 243) { need = 3; lo_b = 128; hi_b = 191 }
+              else if (o == 244) { need = 3; lo_b = 128; hi_b = 143 }
+              else exit 1
+              seq = c
+              for (k = 1; k <= need; k++) {
+                cb = ord[substr(text, i + k, 1)]
+                if (k == 1 && (cb < lo_b || cb > hi_b)) exit 1
+                if (k > 1 && (cb < 128 || cb > 191)) exit 1
+                seq = seq substr(text, i + k, 1)
+              }
+              i += need; str = str seq
+              continue
+            }
+            str = str c
+          }
+          if (!closed) exit 1
+          if (expect == "key_or_end" || expect == "key") {
+            # A key holding a lone surrogate is a distinct key to json.loads;
+            # prefix a byte no decoded string can contain (0xFF is never
+            # valid UTF-8) so it can never alias "projects" or "default".
+            keys[depth] = (bad ? "\377" str : str); expect = "colon"
+            continue
+          }
+          if (!is_value_state()) exit 1
+          if (st[depth] == "o" && depth == proj_depth && keys[depth] == "default") val = (bad ? "" : str)
+          if (depth == 1 && st[1] == "o" && keys[1] == "projects") { val = ""; seen = 1 }
+          after_value()
+          continue
+        }
+        if (c == "{" || c == "[") {
+          if (!is_value_state()) exit 1
+          if (depth == 1 && st[1] == "o" && keys[1] == "projects") {
+            val = ""; seen = 1
+            if (c == "{") proj_depth = 2
+          }
+          depth++; st[depth] = (c == "{") ? "o" : "a"; keys[depth] = ""
+          expect = (c == "{") ? "key_or_end" : "value_or_end_a"
+          continue
+        }
+        if (c == "}" || c == "]") {
+          if (c == "}" && expect != "key_or_end" && expect != "comma_or_end_o") exit 1
+          if (c == "]" && expect != "value_or_end_a" && expect != "comma_or_end_a") exit 1
+          if (depth == proj_depth) proj_depth = 0
+          depth--
+          after_value()
+          continue
+        }
+        if (c == ":") {
+          if (expect != "colon") exit 1
+          if (depth == proj_depth && keys[depth] == "default") val = ""
+          expect = "value"
+          continue
+        }
+        if (c == ",") {
+          if (expect == "comma_or_end_o") expect = "key"
+          else if (expect == "comma_or_end_a") expect = "value"
+          else exit 1
+          continue
+        }
+        # Number or literal: take the maximal run and validate it exactly
+        # as json.loads would (it also accepts NaN / Infinity / -Infinity).
+        if (!is_value_state()) exit 1
+        tok = ""
+        while (i <= n && substr(text, i, 1) ~ /[A-Za-z0-9+.-]/) { tok = tok substr(text, i, 1); i++ }
+        i--
+        if (tok !~ /^(true|false|null|NaN|Infinity|-Infinity)$/ && \
+            tok !~ /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?$/) exit 1
+        if (depth == 1 && st[1] == "o" && keys[1] == "projects") { val = ""; seen = 1 }
+        after_value()
       }
-      projects = substr(text, RSTART, RLENGTH)
-      if (!match(projects, /"default"[[:space:]]*:[[:space:]]*"[^"]+"/)) {
-        exit 1
-      }
-      matched = substr(projects, RSTART, RLENGTH)
-      if (split(matched, parts, "\"") < 4) {
-        exit 1
-      }
-      print parts[4]
+      if (expect != "done" || !seen || val == "") exit 1
+      # Control characters (newline, DEL, ...) are rejected exactly as the
+      # python parser rejects them: never a usable project id.
+      if (val ~ /[\001-\037\177]/) exit 1
+      print val
     }
   ' .firebaserc
 }
@@ -411,8 +651,13 @@ log_biometric_trigger() {
 
 # ── Purge mode ────────────────────────────────────────────────────────
 if $PURGE; then
-  rm -f "$SESSION_FILE" "$ADC_TMPFILE" "$FIREBASE_SA_TMPFILE" "$SSH_WARM_MARKER"
-  echo "# Purged session file + ADC tempfile + Firebase SA tempfile + SSH-warm marker for agent=$AGENT" >&2
+  rm -f "$SESSION_FILE" "$ADC_TMPFILE" "$SSH_WARM_MARKER"
+  # Per-project SA keys + deploy slots, and the pre-slot single SA file.
+  rm -f "$CACHE_DIR/op-preflight-$AGENT-firebase-sa.json" \
+        "$CACHE_DIR/op-preflight-$AGENT-firebase-sa-"*.json \
+        "$CACHE_DIR/op-preflight-$AGENT-deploy-"*.slot \
+        "$CACHE_DIR/op-preflight-$AGENT-"*.staged.*
+  echo "# Purged session file + ADC tempfile + Firebase SA tempfiles + deploy slots + SSH-warm marker for agent=$AGENT" >&2
   exit 0
 fi
 
@@ -427,7 +672,7 @@ if $DRY_RUN; then
   echo "#" >&2
   echo "# Session file:   $SESSION_FILE" >&2
   echo "# ADC tempfile:   $ADC_TMPFILE" >&2
-  echo "# Firebase SA tempfile: $FIREBASE_SA_TMPFILE" >&2
+  echo "# Deploy slot:    $(deploy_slot_file_for "$(deploy_context_project 2>/dev/null || true)")" >&2
   echo "# TTL seconds:    $TTL_SECONDS" >&2
   if [[ -f "$SESSION_FILE" ]]; then
     # `|| true` so a missing epoch key doesn't take down dry-run under
@@ -469,7 +714,7 @@ if $DRY_RUN; then
     fi
   fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
-    if firebase_project="$(detect_firebase_project 2>/dev/null || true)" && [[ -n "$firebase_project" ]]; then
+    if firebase_project="$(deploy_context_project 2>/dev/null || true)" && [[ -n "$firebase_project" ]]; then
       echo "# Would read: Firebase project SA key (${firebase_project} — Firebase Deployer SA Key in vault ${FIREBASE_SA_VAULT})" >&2
       echo "# Would fall back to: GCP ADC ($DEFAULT_ADC_OP_URI)" >&2
     else
@@ -665,6 +910,8 @@ emit_from_session_file() (
   unset OP_PREFLIGHT_DONE OP_PREFLIGHT_AGENT OP_PREFLIGHT_MODE
   unset OP_PREFLIGHT_TOKEN_MODE OP_PREFLIGHT_REVIEWER_PAT_SOURCE_REF
   unset OP_PREFLIGHT_CREATED_AT_EPOCH OP_PREFLIGHT_TTL_SECONDS
+  unset OP_PREFLIGHT_DEPLOY_DEGRADED OP_PREFLIGHT_DEPLOY_DEGRADED_AT_EPOCH
+  unset OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH OP_PREFLIGHT_DEPLOY_CONTEXT
 
   # Source the session file and re-emit only the vars we own, so a
   # hand-edited file with arbitrary content cannot inject exports.
@@ -717,7 +964,121 @@ emit_from_session_file() (
       fi
     fi
   fi
+  # Deploy credentials live in the slot for the CURRENT Firebase-project
+  # context (see deploy_slot_file_for), so a concurrent session in another
+  # Firebase repo can neither evict nor swap them. A present slot supersedes
+  # any deploy fields a pre-slot session file still carries; with no slot,
+  # those legacy fields fall through to the same project/usability checks
+  # below. A slot is honoured only within the session TTL and only for the
+  # exact context it recorded.
+  #
+  # A `--mode all` fetch that could not load ANY deploy credential records
+  # OP_PREFLIGHT_DEPLOY_DEGRADED in its slot. Within the backoff window a
+  # `--mode all` hit reuses that verdict instead of exit 2 -> full fetch ->
+  # the same degraded write -> a fresh biometric on every call. This does
+  # NOT reopen friends-and-family-billing#227 round 3 (below): a review-only
+  # cache has no slot, so it still cannot satisfy `all`; the marker means
+  # "deploy creds were attempted for this context and failed moments ago",
+  # not "deploy creds were never loaded". Only `all` writes it (`deploy`
+  # exits 1 on that path) and `--mode deploy` never accepts it. rc 3 = the
+  # window expired, so the refetch is logged as a retry, not a cross-mode miss.
+  deploy_degraded_hit=false
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
+    current_firebase_project="$(deploy_context_project 2>/dev/null || true)"
+    deploy_slot_file="$(deploy_slot_file_for "$current_firebase_project")"
+    # Propagation skew (Codex on #1318): a consumer still on the pre-slot
+    # script keeps writing freshly fetched deploy fields into the shared
+    # session file and never touches the slot. When that write is NEWER than
+    # the slot and actually carries a credential, it wins; its fields then
+    # go through the same pre-slot project/usability checks below. A
+    # slot-aware writer never puts deploy fields in the session file, so
+    # this only ever fires for a pre-slot write. It must also be for THIS
+    # context (Codex on #1318): a pre-slot Firebase SA only for the current
+    # project, and pre-slot ADC (which records no project) only for the
+    # `adc` context -- never over a Firebase project's slot, which would
+    # swap the project SA for the shared ADC.
+    #
+    # A pre-slot SA is NEVER exported, though (Phase 4b on #1318): it points
+    # at the one shared op-preflight-<agent>-firebase-sa.json that every
+    # pre-slot checkout still overwrites, whatever its project, so exporting
+    # it would re-open the cross-project key swap slots exist to close. A
+    # newer pre-slot SA for this project instead forces a fetch into the
+    # project-owned slot. Only pre-slot ADC (identical content for every
+    # context that uses it) can supersede.
+    legacy_supersedes_slot=false
+    legacy_context_matches=false
+    legacy_is_sa=false
+    if [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" \
+          && "${GOOGLE_APPLICATION_CREDENTIALS:-}" == "$OP_PREFLIGHT_FIREBASE_SA_TMPFILE" ]]; then
+      legacy_is_sa=true
+      [[ -n "$current_firebase_project" && "${OP_PREFLIGHT_FIREBASE_PROJECT:-}" == "$current_firebase_project" ]] \
+        && legacy_context_matches=true
+    elif [[ -z "$current_firebase_project" ]]; then
+      legacy_context_matches=true
+    fi
+    if [[ -f "$deploy_slot_file" && -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && $legacy_context_matches; then
+      slot_created="$(grep '^OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=' "$deploy_slot_file" | cut -d= -f2- | tr -d "'\"" || true)"
+      session_created="${OP_PREFLIGHT_CREATED_AT_EPOCH:-}"
+      if [[ "$slot_created" =~ ^[0-9]+$ && "$session_created" =~ ^[0-9]+$ ]] \
+         && (( 10#$session_created > 10#$slot_created )); then
+        $legacy_is_sa && exit 2
+        legacy_supersedes_slot=true
+      fi
+    fi
+    slot_loaded=false
+    if [[ -f "$deploy_slot_file" ]] && ! $legacy_supersedes_slot; then
+      slot_loaded=true
+      # A pre-slot writer persists CF_API_TOKEN whether or not its deploy
+      # credential loaded, so a newer session-file token must survive the
+      # slot load on its own (Codex on #1318). Slot-aware writers never put
+      # it in the session file, so this only ever carries a pre-slot write.
+      session_cf_token="${CF_API_TOKEN:-}"
+      session_created="${OP_PREFLIGHT_CREATED_AT_EPOCH:-}"
+      unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
+      unset OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT
+      unset CF_API_TOKEN
+      # shellcheck disable=SC1090
+      . "$deploy_slot_file"
+      slot_created="${OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH:-}"
+      [[ "$slot_created" =~ ^[0-9]+$ ]] || exit 2
+      if [[ -n "$session_cf_token" && "$session_created" =~ ^[0-9]+$ ]] \
+         && (( 10#$session_created > 10#$slot_created )); then
+        CF_API_TOKEN="$session_cf_token"
+      fi
+      slot_age=$(( $(date +%s) - 10#$slot_created ))
+      [[ "$slot_age" -ge 0 && "$slot_age" -lt "$TTL_SECONDS" ]] || exit 2
+      [[ "${OP_PREFLIGHT_DEPLOY_CONTEXT-__unset__}" == "$current_firebase_project" ]] || exit 2
+      if [[ "$MODE" == "all" && -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" \
+            && "${OP_PREFLIGHT_DEPLOY_DEGRADED:-0}" == "1" ]]; then
+        degraded_at="${OP_PREFLIGHT_DEPLOY_DEGRADED_AT_EPOCH:-}"
+        [[ "$degraded_at" =~ ^[0-9]+$ ]] || exit 3
+        degraded_age=$(( $(date +%s) - 10#$degraded_at ))
+        if [[ "$degraded_age" -ge 0 && "$degraded_age" -lt "$DEPLOY_DEGRADED_BACKOFF_SECONDS" ]]; then
+          deploy_degraded_hit=true
+          echo "# WARNING: deploy credentials unavailable (Firebase project '${current_firebase_project:-none}', checked ${degraded_age}s ago); serving cached PATs without GOOGLE_APPLICATION_CREDENTIALS. Retry in $(( DEPLOY_DEGRADED_BACKOFF_SECONDS - degraded_age ))s, or now with --refresh." >&2
+        else
+          exit 3
+        fi
+      fi
+    fi
+    # With no slot in play, pre-slot session fields obey the same context
+    # rule as everywhere else: pre-slot ADC (which records no project) is
+    # never a Firebase project's credential. Otherwise a failed --refresh
+    # there (which removes the slot) would be followed by a plain deploy
+    # that silently reuses the old ADC file (Phase 4b on #1318). A pre-slot
+    # SA is checked against the project by the validation below.
+    # For the same reason, with no slot a pre-slot SA is never exported:
+    # force a fetch into the project-owned slot instead.
+    if ! $slot_loaded && $legacy_is_sa; then
+      exit 2
+    fi
+    if ! $slot_loaded && [[ -n "$current_firebase_project" && -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] \
+       && ! [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" \
+               && "$GOOGLE_APPLICATION_CREDENTIALS" == "$OP_PREFLIGHT_FIREBASE_SA_TMPFILE" ]]; then
+      exit 2
+    fi
+  fi
+  if [[ "$MODE" == "deploy" || "$MODE" == "all" ]] && ! $deploy_degraded_hit; then
     # Both `--mode deploy` and `--mode all` require a usable deploy
     # credential from the cache to take the fast path. If the session
     # file's credential field is missing or the materialized file is
@@ -807,6 +1168,11 @@ emit_from_session_file() (
   # creds (GOOGLE_APPLICATION_CREDENTIALS, Firebase SA, CF_API_TOKEN).
   # Emit them only when the CURRENT request actually asked for deploy creds.
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
+    # Clear first, then export what THIS context's cache holds, so the
+    # caller's shell mirrors the cache exactly: a degraded `all` hit, or a
+    # `cd` into another Firebase repo, must not leave a GOOGLE_APPLICATION_
+    # CREDENTIALS from an earlier eval (possibly another project's key) live.
+    printf '%s\n' "$DEPLOY_CLEAR_STMT"
     [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && \
       printf 'export GOOGLE_APPLICATION_CREDENTIALS=%q\n' "$GOOGLE_APPLICATION_CREDENTIALS"
     [[ -n "${OP_PREFLIGHT_ADC_TMPFILE:-}" ]] && \
@@ -823,7 +1189,7 @@ emit_from_session_file() (
     # shell, so a review session does not retain stale deploy creds in its
     # environment (not just refrain from re-exporting them). Emitting unset
     # is idempotent when the caller never had them.
-    printf 'unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN\n'
+    printf '%s\n' "$REVIEW_CLEAR_STMT"
   fi
   printf 'export OP_PREFLIGHT_DONE=1\n'
   printf 'export OP_PREFLIGHT_AGENT=%q\n' "$AGENT"
@@ -931,6 +1297,58 @@ emit_check_compat_guard() {
 # something that FAILS when evaluated, unless real exports are being emitted.
 emit_check_failure_guard() {
   emit_eval_guard "--check found no usable cache for agent=$AGENT (mode=$MODE); run: scripts/op-preflight.sh --agent $AGENT --mode $MODE"
+}
+# `--mode deploy` fails closed when no deploy credential loads, but a bare
+# `exit 1` prints nothing: `eval "$(...)"` then returns 0 and the caller keeps
+# whatever GOOGLE_APPLICATION_CREDENTIALS an earlier eval exported. With
+# per-project SA files that is a LIVE key for another project (Codex on
+# #1318), so the next deploy would run under the wrong identity. Clear the
+# deploy variables, then fail the eval.
+# A failed --mode deploy (typically --refresh during a key rotation or
+# revocation) must also invalidate this context's slot: otherwise the next
+# plain --mode deploy finds it fresh and silently re-exports the old key
+# without asking 1Password (Codex on #1318). The key FILE stays, because
+# shells that already exported it are still using it.
+#
+# The same goes for pre-slot deploy fields a not-yet-updated consumer wrote
+# into the shared session file (propagation skew): with the slot gone, the
+# next deploy would fall back to them and reuse the rotated key (Codex on
+# #1318). Strip them too -- staged + renamed, PATs kept -- rather than
+# deleting the whole file and forcing a PAT re-prompt.
+#
+# Only fields for THIS context are stripped (CodeRabbit on #1318), by the
+# same rule that lets pre-slot fields supersede a slot: a pre-slot Firebase
+# SA only when it is for the failing project, pre-slot ADC only when the
+# failing context is `adc`. Another project's pre-slot entry is untouched.
+session_field() { # <variable name>: its value in the session file, or ""
+  # shellcheck disable=SC1090
+  ( unset "$1"; . "$SESSION_FILE" 2>/dev/null; printf '%s' "${!1:-}" )
+}
+invalidate_deploy_slot() {
+  rm -f "$(deploy_slot_file_for "${firebase_project:-}")"
+  [[ -f "$SESSION_FILE" ]] || return 0
+  local legacy_gac legacy_sa legacy_project
+  legacy_gac="$(session_field GOOGLE_APPLICATION_CREDENTIALS)"
+  legacy_sa="$(session_field OP_PREFLIGHT_FIREBASE_SA_TMPFILE)"
+  legacy_project="$(session_field OP_PREFLIGHT_FIREBASE_PROJECT)"
+  [[ -n "$legacy_gac" ]] || return 0
+  if [[ -n "$legacy_sa" && "$legacy_gac" == "$legacy_sa" ]]; then
+    [[ -n "${firebase_project:-}" && "$legacy_project" == "$firebase_project" ]] || return 0
+  else
+    [[ -z "${firebase_project:-}" ]] || return 0
+  fi
+  if grep -Eq '^(GOOGLE_APPLICATION_CREDENTIALS|OP_PREFLIGHT_ADC_TMPFILE|OP_PREFLIGHT_FIREBASE_SA_TMPFILE|OP_PREFLIGHT_FIREBASE_PROJECT)=' "$SESSION_FILE"; then
+    local session_staged
+    session_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-session.staged.XXXXXX")"
+    grep -Ev '^(GOOGLE_APPLICATION_CREDENTIALS|OP_PREFLIGHT_ADC_TMPFILE|OP_PREFLIGHT_FIREBASE_SA_TMPFILE|OP_PREFLIGHT_FIREBASE_PROJECT)=' \
+      "$SESSION_FILE" > "$session_staged" || true
+    chmod 600 "$session_staged"
+    mv -f "$session_staged" "$SESSION_FILE"
+  fi
+}
+emit_deploy_failure_guard() {
+  printf '%s\n' "$DEPLOY_CLEAR_STMT"
+  emit_eval_guard "--mode deploy loaded no deploy credential for Firebase project '${firebase_project:-none}'; deploy variables cleared (see stderr)"
 }
 
 if $CHECK; then
@@ -1067,10 +1485,13 @@ if ! $REFRESH && session_is_fresh; then
   # Distinguish a partial-cache miss (stale ADC, cross-mode invalidation)
   # from a full-fetch when logging the biometric trigger reason. The rc
   # from emit_from_session_file is in scope thanks to the if-condition
-  # capture above. rc=2 means cross-mode invalidation; anything else is
-  # treated as stale-ADC by default for log clarity.
+  # capture above. rc=2 means cross-mode invalidation; rc=3 means a
+  # degraded `--mode all` cache outlived its backoff window; anything else
+  # is treated as stale-ADC by default for log clarity.
   if [[ "${rc:-0}" == "2" ]]; then
     BIOMETRIC_REASON="cross-mode-invalidation"
+  elif [[ "${rc:-0}" == "3" ]]; then
+    BIOMETRIC_REASON="deploy-degraded-retry"
   else
     BIOMETRIC_REASON="stale-adc"
   fi
@@ -1094,6 +1515,7 @@ fi
 # ── Collect export statements + session-file lines ───────────────────
 EXPORTS=()
 SESSION_LINES=()
+DEPLOY_SLOT_LINES=()  # -> $(deploy_slot_file_for <context>), not the session file
 SUMMARY=()
 DEPLOY_BIOMETRIC_LOGGED=false
 
@@ -1198,8 +1620,12 @@ TPL
 fi
 
 if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
-  firebase_project="$(detect_firebase_project 2>/dev/null || true)"
+  # Same clear-then-export contract as the cache-hit path.
+  EXPORTS+=("$DEPLOY_CLEAR_STMT")
+  firebase_project="$(deploy_context_project 2>/dev/null || true)"
   firebase_sa_loaded=false
+  adc_loaded=false
+  firebase_sa_file=""
 
   if [[ -n "$firebase_project" ]]; then
     echo "# Preflight: reading Firebase project SA key for $firebase_project..." >&2
@@ -1207,9 +1633,14 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     # Deterministic path so subsequent invocations and op-firebase-deploy
     # can reuse the same cached project SA key without a second biometric
     # prompt. Overwrite in place — chmod 600 before writing secret content.
-    touch "$FIREBASE_SA_TMPFILE"
-    chmod 600 "$FIREBASE_SA_TMPFILE"
-    : > "$FIREBASE_SA_TMPFILE"
+    # One file per project (never shared across projects), so a concurrent
+    # session in another Firebase repo cannot overwrite the key this
+    # session exported as GOOGLE_APPLICATION_CREDENTIALS.
+    # Download to a staged sibling (0600 under umask 077) and move it into
+    # place only once it validates: a failed fetch must never truncate or
+    # delete the key another session of the SAME project already exported.
+    firebase_sa_file="$(firebase_sa_file_for "$firebase_project")"
+    firebase_sa_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-firebase-sa.staged.XXXXXX")"
 
     # For --mode deploy (no review credentials loaded), this is the first
     # op call of the run — log it. For --mode all, the Phase 1 op inject
@@ -1218,19 +1649,20 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     log_deploy_biometric_once
     if op document get "${firebase_project} — Firebase Deployer SA Key" \
          --vault "$FIREBASE_SA_VAULT" \
-         --out-file "$FIREBASE_SA_TMPFILE" \
+         --out-file "$firebase_sa_staged" \
          --force >/dev/null 2>&1 \
-       && firebase_sa_matches_project "$FIREBASE_SA_TMPFILE" "$firebase_project"; then
-      EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$FIREBASE_SA_TMPFILE")")
-      EXPORTS+=("export OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$(printf '%q' "$FIREBASE_SA_TMPFILE")")
+       && firebase_sa_matches_project "$firebase_sa_staged" "$firebase_project"; then
+      mv -f "$firebase_sa_staged" "$firebase_sa_file"
+      EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$firebase_sa_file")")
+      EXPORTS+=("export OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$(printf '%q' "$firebase_sa_file")")
       EXPORTS+=("export OP_PREFLIGHT_FIREBASE_PROJECT=$(printf '%q' "$firebase_project")")
-      SESSION_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$FIREBASE_SA_TMPFILE")")
-      SESSION_LINES+=("OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$(printf '%q' "$FIREBASE_SA_TMPFILE")")
-      SESSION_LINES+=("OP_PREFLIGHT_FIREBASE_PROJECT=$(printf '%q' "$firebase_project")")
-      SUMMARY+=("Firebase SA key ($firebase_project): loaded -> $FIREBASE_SA_TMPFILE")
+      DEPLOY_SLOT_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$firebase_sa_file")")
+      DEPLOY_SLOT_LINES+=("OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$(printf '%q' "$firebase_sa_file")")
+      DEPLOY_SLOT_LINES+=("OP_PREFLIGHT_FIREBASE_PROJECT=$(printf '%q' "$firebase_project")")
+      SUMMARY+=("Firebase SA key ($firebase_project): loaded -> $firebase_sa_file")
       firebase_sa_loaded=true
     else
-      rm -f "$FIREBASE_SA_TMPFILE"
+      rm -f "$firebase_sa_staged"
       SUMMARY+=("Firebase SA key ($firebase_project): SKIPPED (not found or did not match ${SA_NAME}@${firebase_project}.iam.gserviceaccount.com)")
     fi
   else
@@ -1240,10 +1672,13 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   if [[ "$firebase_sa_loaded" != "true" ]]; then
     echo "# Preflight: reading GCP ADC (reuses session)..." >&2
 
-    # Deterministic path so subsequent invocations find the same file.
-    # Overwrite in place — chmod 600 before writing secret content.
-    touch "$ADC_TMPFILE"
-    chmod 600 "$ADC_TMPFILE"
+    # Deterministic path so subsequent invocations find the same file. It is
+    # shared by every context that resolves to ADC (the `adc` slot plus any
+    # Firebase project without an SA key), so read into a staged sibling
+    # (0600 under umask 077) and move it into place only once it validates:
+    # a failed or stale fetch in one context must not truncate or delete the
+    # file another context's session already exported.
+    adc_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-adc.staged.XXXXXX")"
 
     log_deploy_biometric_once
     # Capture op's stderr so the could-not-read warning can say WHY (vault
@@ -1251,16 +1686,18 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     # available" (#534.3). Routed through scrub_op_error so a service-account
     # token can never leak into the diagnostic, mirroring the Phase 1 reader.
     ADC_OP_ERR="$(mktemp "${TMPDIR:-/tmp}/op-preflight-adc-err.XXXXXX")"
-    if op read "$DEFAULT_ADC_OP_URI" > "$ADC_TMPFILE" 2>"$ADC_OP_ERR" && [[ -s "$ADC_TMPFILE" ]]; then
+    if op read "$DEFAULT_ADC_OP_URI" > "$adc_staged" 2>"$ADC_OP_ERR" && [[ -s "$adc_staged" ]]; then
       rm -f "$ADC_OP_ERR"
-      if adc_is_usable "$ADC_TMPFILE"; then
+      if adc_is_usable "$adc_staged"; then
+        mv -f "$adc_staged" "$ADC_TMPFILE"
         EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
         EXPORTS+=("export OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
-        SESSION_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
-        SESSION_LINES+=("OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
+        DEPLOY_SLOT_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
+        DEPLOY_SLOT_LINES+=("OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
         SUMMARY+=("GCP ADC: loaded -> $ADC_TMPFILE")
+        adc_loaded=true
       else
-        rm -f "$ADC_TMPFILE"
+        rm -f "$adc_staged"
         log_stale_adc_guidance
         SUMMARY+=("GCP ADC: STALE (refresh_token rejected — see warning above)")
         # Fail closed (#534.2): under `--mode deploy` a deploy script needs a
@@ -1269,11 +1706,11 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
         # `exit 2` failure mode replayed on the full-fetch path — symmetric to
         # the line-696 cache-hit guard. `--mode all` deliberately keeps
         # degrading (callers still want the PATs), so scope this to deploy.
-        if [[ "$MODE" == "deploy" ]]; then exit 1; fi
+        if [[ "$MODE" == "deploy" ]]; then invalidate_deploy_slot; emit_deploy_failure_guard; exit 1; fi
       fi
     else
       adc_op_reason="$(scrub_op_error "$ADC_OP_ERR")"
-      rm -f "$ADC_TMPFILE" "$ADC_OP_ERR"
+      rm -f "$adc_staged" "$ADC_OP_ERR"
       if [[ -n "$adc_op_reason" ]]; then
         echo "# Warning: could not read GCP ADC. Deploy credentials not cached. (op: ${adc_op_reason})" >&2
       else
@@ -1281,8 +1718,19 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
       fi
       SUMMARY+=("GCP ADC: SKIPPED (not available)")
       # Fail closed (#534.2): see STALE branch above.
-      if [[ "$MODE" == "deploy" ]]; then exit 1; fi
+      if [[ "$MODE" == "deploy" ]]; then invalidate_deploy_slot; emit_deploy_failure_guard; exit 1; fi
     fi
+  fi
+
+  # Only `--mode all` reaches here without a deploy credential (`deploy`
+  # exited 1 above). Record the degradation in this context's slot so the
+  # next `--mode all` cache hit here can reuse the verdict for
+  # DEPLOY_DEGRADED_BACKOFF_SECONDS instead of re-prompting biometric just
+  # to fail the same way. See emit_from_session_file.
+  if [[ "$firebase_sa_loaded" != "true" && "$adc_loaded" != "true" ]]; then
+    DEPLOY_SLOT_LINES+=("OP_PREFLIGHT_DEPLOY_DEGRADED=1")
+    DEPLOY_SLOT_LINES+=("OP_PREFLIGHT_DEPLOY_DEGRADED_AT_EPOCH=$(date +%s)")
+    SUMMARY+=("Deploy credentials: DEGRADED — later --mode all runs reuse this for ${DEPLOY_DEGRADED_BACKOFF_SECONDS}s (--refresh retries now)")
   fi
 
   # Cloudflare cache-purge token (#167). Optional — if 1Password is
@@ -1292,7 +1740,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   cf_token=$(op read "$DEFAULT_CF_TOKEN_OP_URI" 2>/dev/null || true)
   if [[ -n "$cf_token" ]]; then
     EXPORTS+=("export CF_API_TOKEN=$(printf '%q' "$cf_token")")
-    SESSION_LINES+=("CF_API_TOKEN=$(printf '%q' "$cf_token")")
+    DEPLOY_SLOT_LINES+=("CF_API_TOKEN=$(printf '%q' "$cf_token")")
     SUMMARY+=("Cloudflare cache-purge token: loaded")
   else
     echo "# Warning: could not read Cloudflare cache-purge token. CF_API_TOKEN not exported; deploy.sh will skip the purge step." >&2
@@ -1325,6 +1773,29 @@ CREATED_AT=$(date +%s)
   done
 } > "$SESSION_FILE"
 chmod 600 "$SESSION_FILE"
+
+if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
+  deploy_slot_file="$(deploy_slot_file_for "$firebase_project")"
+  # Stage then rename: a concurrent session of the same context sources this
+  # path, and a half-written slot would read as stale (exit 2 -> refetch).
+  deploy_slot_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-deploy-slot.staged.XXXXXX")"
+  {
+    printf '# op-preflight deploy-credential slot — do NOT edit by hand.\n'
+    # The slot is SOURCED on the next read, so nothing here may be written
+    # raw: a .firebaserc project decoded from JSON escapes can contain
+    # newlines, and an unescaped comment line would turn them into commands
+    # (Phase 4b on #1318). Every value is %q-quoted; the comment carries
+    # only the slug, which deploy_context_slug restricts to [A-Za-z0-9_-].
+    printf '# Agent: %s  Context: %s\n' "$AGENT" "$(deploy_context_slug "$firebase_project")"
+    printf 'OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=%s\n' "$CREATED_AT"
+    printf 'OP_PREFLIGHT_DEPLOY_CONTEXT=%q\n' "$firebase_project"
+    for line in "${DEPLOY_SLOT_LINES[@]}"; do
+      printf '%s\n' "$line"
+    done
+  } > "$deploy_slot_staged"
+  chmod 600 "$deploy_slot_staged"
+  mv -f "$deploy_slot_staged" "$deploy_slot_file"
+fi
 
 # ── Output ────────────────────────────────────────────────────────────
 EXPORTS+=("export OP_PREFLIGHT_DONE=1")
