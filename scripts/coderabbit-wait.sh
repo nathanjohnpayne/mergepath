@@ -1642,7 +1642,7 @@ crw_unfenced_body() {
 # unfenced, unquoted line keeps prose, diff excerpts, and fenced examples from
 # becoming provider state.
 crw_provider_owned_refusal_class() {
-  local body=$1 unfenced
+  local body=$1 unfenced first_line
   unfenced=$(crw_unfenced_body "$body") || return 3
   if grep -Fxq "<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->" <<<"$unfenced"; then
     printf 'rate_limit\n'
@@ -1660,6 +1660,14 @@ crw_provider_owned_refusal_class() {
     "> [!WARNING]"$'\n'"> ## Rate limit exceeded"*) printf 'rate_limit\n'; return 0 ;;
     "> [!WARNING]"$'\n'"> ## Review limit reached"*) printf 'rate_limit\n'; return 0 ;;
     "> [!WARNING]"$'\n'"> ## Reviews paused"*) printf 'paused\n'; return 0 ;;
+  esac
+  first_line=$(awk 'NF { print; exit }' <<<"$unfenced") || return 3
+  first_line=$(printf '%s' "$first_line" | tr '[:upper:]' '[:lower:]') || return 3
+  case "$first_line" in
+    'rate limit exceeded'|'rate-limit exceeded'|'## rate limit exceeded'|'## rate-limit exceeded'|'review limit reached'|'## review limit reached')
+      printf 'rate_limit\n'; return 0 ;;
+    'reviews paused'|'## reviews paused')
+      printf 'paused\n'; return 0 ;;
   esac
   return 1
 }

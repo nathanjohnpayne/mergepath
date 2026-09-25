@@ -92,6 +92,10 @@ SUMMARY_BODY_WITH_RATE_LIMIT_STANZA='<!-- This is an auto-generated comment: sum
 >
 > **Next review available in:** **13 minutes**'
 
+LEGACY_RATE_LIMIT_BODY='Rate limit exceeded
+
+Please wait before requesting another review.'
+
 # A PR-level summary that classifies as `review` and carries a blocking marker
 # ONLY in the summary body — the #535 summary-only class. There are no inline
 # findings on this head at all, so `count_potential_issues_for_sha` returns 0
@@ -609,6 +613,15 @@ test_current_refusal_with_review_quoting_progress_clears() {
   [ "$rc" = "0" ] || fail "3b5: incidental review-in-progress prose should not disqualify a completed exact-HEAD review, got $rc; err=$(tail -5 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3b5: status=$(jqf "$dir" '.status'), expected cleared"
   [ "$FAIL" -ne "$before" ] || pass "3b5: incidental non-review prose does not override the structured exact-HEAD review evidence"
+}
+
+test_legacy_leading_refusal_stays_current() {
+  local dir rc before=$FAIL
+  dir=$(make_case "legacy-leading-refusal" "$LEGACY_RATE_LIMIT_BODY" "2026-06-04T02:00:00Z")
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] || fail "3b6: leading legacy refusal should remain rate-limit-stalled, got $rc; err=$(tail -5 "$dir/err.log")"
+  grep -q 'grading-only because CodeRabbit.*rate_limit' "$dir/err.log" || fail "3b6: leading legacy refusal was not recognized as provider state"
+  [ "$FAIL" -ne "$before" ] || pass "3b6: a provider-owned leading legacy rate-limit notice remains authoritative"
 }
 
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
@@ -2410,6 +2423,7 @@ test_current_refusal_with_blocking_head_review_is_findings
 test_summary_owned_refusal_stays_current
 test_current_refusal_with_nonbenign_head_review_stays_refused
 test_current_refusal_with_review_quoting_progress_clears
+test_legacy_leading_refusal_stays_current
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
