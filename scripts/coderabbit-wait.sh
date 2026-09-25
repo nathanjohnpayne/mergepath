@@ -1636,6 +1636,30 @@ crw_unfenced_body() {
   printf '%s\n' "$out"
 }
 
+# Identify only a provider-owned refusal stanza. CodeRabbit may edit the
+# rate-limit/pause stanza into its summarize comment, so the marker need not be
+# the first byte of the body. Requiring the complete marker on its own
+# unfenced, unquoted line keeps prose, diff excerpts, and fenced examples from
+# becoming provider state.
+crw_provider_owned_refusal_class() {
+  local body=$1 unfenced
+  unfenced=$(crw_unfenced_body "$body") || return 3
+  if grep -Fxq "<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->" <<<"$unfenced"; then
+    printf 'rate_limit\n'
+    return 0
+  fi
+  if grep -Fxq "<!-- This is an auto-generated comment: $PAUSED_MARKER -->" <<<"$unfenced"; then
+    printf 'paused\n'
+    return 0
+  fi
+  case "$unfenced" in
+    "> [!WARNING]"$'\n'"> ## Rate limit exceeded"*) printf 'rate_limit\n'; return 0 ;;
+    "> [!WARNING]"$'\n'"> ## Review limit reached"*) printf 'rate_limit\n'; return 0 ;;
+    "> [!WARNING]"$'\n'"> ## Reviews paused"*) printf 'paused\n'; return 0 ;;
+  esac
+  return 1
+}
+
 summary_names_head() {
   local unfenced
   unfenced=$(crw_unfenced_body "$1") || return 3
@@ -2712,7 +2736,7 @@ crw_active_rate_limit_notice() {
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
   local issue_comments current latest class comment_id comment_created_at comment_fresh_at comment_body
-  local current_class reviews head_run review_rc run_id run_body marker_rc
+  local current_class current_rc reviews head_run review_rc run_id run_body marker_rc
   local active_notice active_id active_remaining active_rc
   # A current refusal with no run still enters the verdict scanner so existing
   # inline/summary findings are surfaced immediately.  The scanner consults
@@ -2750,14 +2774,14 @@ status_context_fast_path_blocked_by_comment() {
   }
   if [ "$(printf '%s' "$current" | jq 'length')" != "0" ]; then
     comment_body=$(printf '%s' "$current" | jq -r '.body')
-    case "$comment_body" in
-      "<!-- This is an auto-generated comment: $RATE_LIMIT_MARKER -->"*) current_class=rate_limit ;;
-      "<!-- This is an auto-generated comment: $PAUSED_MARKER -->"*) current_class=paused ;;
-      "> [!WARNING]"$'\n'"> ## Rate limit exceeded"*) current_class=rate_limit ;;
-      "> [!WARNING]"$'\n'"> ## Review limit reached"*) current_class=rate_limit ;;
-      "> [!WARNING]"$'\n'"> ## Reviews paused"*) current_class=paused ;;
-      *) current_class=review ;;
-    esac
+    current_rc=0
+    current_class=$(crw_provider_owned_refusal_class "$comment_body") || current_rc=$?
+    if [ "$current_rc" = "3" ]; then
+      log "StatusContext success suppressed: the newest CodeRabbit comment could not be structurally read for a provider-owned refusal (#956)"
+      return 0
+    elif [ "$current_rc" != "0" ]; then
+      current_class=review
+    fi
     case "$current_class" in
       rate_limit|paused)
         reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || {
@@ -2780,6 +2804,11 @@ status_context_fast_path_blocked_by_comment() {
             return 0
           }
           marker_rc=0
+          if [ "$(classify_comment "$run_body")" != "review" ]; then
+            STATUS_CONTEXT_CLEARANCE_REFUSAL=$current_class
+            log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id is not a completed review-class body (#956)"
+            return 1
+          fi
           summary_blocking_marker_present "$run_body" || marker_rc=$?
           case "$marker_rc" in
             0)
@@ -2793,6 +2822,12 @@ status_context_fast_path_blocked_by_comment() {
               return 0
               ;;
           esac
+          if grep -qiE 'auto-generated comment: ' <<<"$run_body" \
+             && ! summary_stanzas_all_benign "$run_body"; then
+            STATUS_CONTEXT_CLEARANCE_REFUSAL=$current_class
+            log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id carries a non-benign generated stanza (#956)"
+            return 1
+          fi
           log "StatusContext success may proceed despite CodeRabbit's current $current_class comment: body-bearing review id=$(printf '%s' "$head_run" | jq -r '.id') is pinned to current HEAD $HEAD_SHA (#956)"
           return 1
         fi

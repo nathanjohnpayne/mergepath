@@ -81,6 +81,17 @@ rate limited by coderabbit.ai
 review paused by coderabbit.ai
 ```'
 
+SUMMARY_BODY_WITH_RATE_LIMIT_STANZA='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+
+**Actionable comments posted: 0**
+
+<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+
+> [!WARNING]
+> ## Review limit reached
+>
+> **Next review available in:** **13 minutes**'
+
 # A PR-level summary that classifies as `review` and carries a blocking marker
 # ONLY in the summary body — the #535 summary-only class. There are no inline
 # findings on this head at all, so `count_potential_issues_for_sha` returns 0
@@ -569,6 +580,25 @@ test_current_refusal_with_blocking_head_review_is_findings() {
   [ "$(jqf "$dir" '.status')" = "findings" ] || fail "3b2: status=$(jqf "$dir" '.status'), expected findings"
   grep -q 'body-bearing current-HEAD review id=8803 carries a blocking marker' "$dir/err.log" || fail "3b2: expected review-body grading log"
   [ "$FAIL" -ne "$before" ] || pass "3b2: a blocking marker in the exact-HEAD review body cannot release a refusal into clearance"
+}
+
+test_summary_owned_refusal_stays_current() {
+  local dir rc before=$FAIL
+  dir=$(make_case "summary-owned-rate-limit" "$SUMMARY_BODY_WITH_RATE_LIMIT_STANZA" "2026-06-04T02:00:00Z")
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] || fail "3b3: summary-owned refusal stanza should remain rate-limit-stalled, got $rc; err=$(tail -5 "$dir/err.log")"
+  grep -q 'grading-only because CodeRabbit.*rate_limit' "$dir/err.log" || fail "3b3: summary-owned refusal was not recognized as provider state"
+  [ "$FAIL" -ne "$before" ] || pass "3b3: an unfenced provider-owned refusal stanza inside the summary remains authoritative"
+}
+
+test_current_refusal_with_nonbenign_head_review_stays_refused() {
+  local dir rc before=$FAIL reviews
+  dir=$(make_case "headref-nonbenign-review" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  reviews=$(jq -nc '[{"id":8804,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed.\n\n<!-- This is an auto-generated comment: failure by coderabbit.ai -->"}]')
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "5" ] || fail "3b4: non-benign exact-HEAD review body should not release refusal, got $rc; err=$(tail -5 "$dir/err.log")"
+  grep -q 'non-benign generated stanza' "$dir/err.log" || fail "3b4: expected non-benign review-body refusal log"
+  [ "$FAIL" -ne "$before" ] || pass "3b4: a non-benign exact-HEAD review body cannot release the current refusal"
 }
 
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
@@ -2367,6 +2397,8 @@ test_final_risk_marker_fallback
 
 test_quoted_refusal_marker_is_not_current_refusal
 test_current_refusal_with_blocking_head_review_is_findings
+test_summary_owned_refusal_stays_current
+test_current_refusal_with_nonbenign_head_review_stays_refused
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
