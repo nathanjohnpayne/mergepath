@@ -85,7 +85,8 @@
 #                        skip it.
 #   --repos r1,r2        Restrict to a comma-separated subset of consumer names
 #                        or owner/name repositories. Every selector must match
-#                        a manifest consumer.
+#                        a manifest consumer; empty and multiline selectors are
+#                        rejected.
 #   --paths glob         Restrict to manifest paths matching the glob (e.g.
 #                        "scripts/*", ".github/workflows/agent-review.yml").
 #                        `--files <glob>` is accepted as an alias. The glob
@@ -953,10 +954,17 @@ consumer_matches_repo_selector() {
   [ "$selector" = "$name" ] || [ "$selector" = "$repo" ]
 }
 
+repo_filter_is_well_formed() {
+  [ -z "${FILTER_REPOS:-}" ] && return 0
+  [[ "$FILTER_REPOS" != *$'\n'* && "$FILTER_REPOS" != *$'\r'* ]] || return 1
+  [[ ",$FILTER_REPOS," != *",,"* ]]
+}
+
 in_repo_filter() {
   local name=$1
   local repo=$2
   [ -z "${FILTER_REPOS:-}" ] && return 0
+  repo_filter_is_well_formed || return 1
   local selector
   local -a selectors=()
   IFS=',' read -r -a selectors <<< "$FILTER_REPOS"
@@ -991,6 +999,10 @@ validate_filters() {
   if [ -n "${FILTER_REPOS:-}" ]; then
     local -a selectors=() unmatched=() valid_consumers=()
     local found
+    if ! repo_filter_is_well_formed; then
+      err "invalid --repos list: selectors must be nonempty, comma-separated single-line values"
+      return 2
+    fi
     IFS=',' read -r -a selectors <<< "$FILTER_REPOS"
     while IFS=$'\t' read -r consumer_name consumer_repo; do
       [ -z "$consumer_name" ] && continue

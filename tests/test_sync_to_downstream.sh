@@ -183,6 +183,27 @@ echo "$unknown_repos_out" | grep -q 'clean-consumer (x/clean-consumer)' \
 echo "$empty_path_out" | grep -q 'selects no managed path for clean-consumer' \
   || fail "empty audit --paths diagnostic was unclear: $empty_path_out"
 
+# read -a would silently discard an empty trailing field and everything after a
+# newline. Reject both malformed selector lists before the audit driver starts.
+set +e
+trailing_selector_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos 'clean-consumer,' 2>&1)
+trailing_selector_ec=$?
+multiline_selector_out=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos $'clean-consumer\nnot-a-consumer' 2>&1)
+multiline_selector_ec=$?
+set -e
+for selector_ec in "$trailing_selector_ec" "$multiline_selector_ec"; do
+  [[ "$selector_ec" -eq 2 ]] \
+    || fail "malformed --repos list should exit 2; got $selector_ec"
+done
+for selector_out in "$trailing_selector_out" "$multiline_selector_out"; do
+  echo "$selector_out" | grep -q 'invalid --repos list' \
+    || fail "malformed --repos diagnostic was unclear: $selector_out"
+  echo "$selector_out" | grep -q '^clean-consumer (' \
+    && fail "audit driver started after malformed --repos input: $selector_out"
+done
+
 # Filter validation is pre-mutation only if it fails closed on its own manifest
 # reads. Make just the validation consumer query fail: the audit driver must
 # not run and turn that missing selection into a successful empty report.
