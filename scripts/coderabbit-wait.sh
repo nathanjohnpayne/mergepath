@@ -2711,8 +2711,13 @@ crw_active_rate_limit_notice() {
 
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
-  local issue_comments latest class comment_id comment_created_at comment_fresh_at comment_body
+  local issue_comments current latest class comment_id comment_created_at comment_fresh_at comment_body
+  local current_class reviews head_run review_rc
   local active_notice active_id active_remaining active_rc
+  # A current refusal with no run still enters the verdict scanner so existing
+  # inline/summary findings are surfaced immediately.  The scanner consults
+  # this flag at its clearance edge and returns to polling instead of clearing.
+  STATUS_CONTEXT_CLEARANCE_REFUSAL=""
   # ONE fetch, shared by both checks below. Explicitly status-checked: a failed
   # fetch_api_array read reaches a caller only as a return status (#831), so an
   # unchecked read failure left the scan with empty input, every classifier
@@ -2722,6 +2727,50 @@ status_context_fast_path_blocked_by_comment() {
     log "StatusContext success suppressed: the issue-comments read failed, so a pending rate-limit / paused / in-progress notice cannot be ruled out — keep polling"
     return 0
   }
+
+  # #956: a StatusContext is completion CORROBORATION, not proof that a
+  # refused review later ran.  CodeRabbit can leave its pause/rate-limit notice
+  # as the newest provider comment and still publish `success | Review
+  # completed` on the same SHA without producing a review.  The old arbitration
+  # eventually trusted that status after its grace/published window elapsed,
+  # turning the passage of time into a false clearance and bypassing the
+  # existing resume/failover paths.
+  #
+  # Read the newest provider comment without the wall-clock floor: an expired
+  # window limits when we retry, not what the provider's current word says.  A
+  # later bot comment supersedes the refusal normally.  While pause/rate_limit
+  # remains current, only the existing immutable evidence rung can release the
+  # fast path: a body-bearing review run pinned to HEAD.  The shared selector
+  # deliberately excludes body-less acknowledgement wrappers (#900/#919).
+  # Failed reads/derivations suppress clearance; absence is not proof of a run.
+  current=$(newest_bot_comment_from_issue_comments "$issue_comments") || {
+    log "StatusContext success suppressed: the newest CodeRabbit comment could not be decoded, so a current pause/rate-limit refusal cannot be ruled out — keep polling (#956)"
+    return 0
+  }
+  if [ "$(printf '%s' "$current" | jq 'length')" != "0" ]; then
+    current_class=$(classify_comment "$(printf '%s' "$current" | jq -r '.body')")
+    case "$current_class" in
+      rate_limit|paused)
+        reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || {
+          log "StatusContext success suppressed: CodeRabbit's current comment is $current_class and the reviews list could not be read, so an actual current-HEAD review cannot be established (#956)"
+          return 0
+        }
+        review_rc=0
+        head_run=$(crw_select_head_pinned_review_run "$reviews" "$BOT_LOGIN" "$HEAD_SHA") || review_rc=$?
+        if [ "$review_rc" != "0" ]; then
+          log "StatusContext success suppressed: CodeRabbit's current comment is $current_class and the current-HEAD review run could not be derived, so the refusal remains authoritative (#956)"
+          return 0
+        fi
+        if [ -n "$head_run" ]; then
+          log "StatusContext success may proceed despite CodeRabbit's current $current_class comment: body-bearing review id=$(printf '%s' "$head_run" | jq -r '.id') is pinned to current HEAD $HEAD_SHA (#956)"
+          return 1
+        fi
+        STATUS_CONTEXT_CLEARANCE_REFUSAL=$current_class
+        log "StatusContext success is grading-only because CodeRabbit's current comment is $current_class and no body-bearing review run is pinned to current HEAD $HEAD_SHA — findings will still surface, but elapsed grace/window and body-less acknowledgements cannot permit clearance (#956)"
+        return 1
+        ;;
+    esac
+  fi
 
   # The DECODE is status-checked too, not only the fetch above (#959). #936
   # hardened the fetch and left this line bare, so a payload that survives
@@ -3687,6 +3736,10 @@ emit_status_context_verdict() {
       die 3 "could not read the PR-level summary to rule out a summary-only blocking marker on $HEAD_SHA — refusing to report a clearance"
       ;;
   esac
+  if [ -n "${STATUS_CONTEXT_CLEARANCE_REFUSAL:-}" ]; then
+    log "StatusContext $state found no blocking findings, but clearance remains suppressed by CodeRabbit's current $STATUS_CONTEXT_CLEARANCE_REFUSAL refusal until a body-bearing review run is pinned to HEAD $HEAD_SHA (#956)"
+    return 0
+  fi
   log "StatusContext $state and 0 blocking (p0/p1) inline findings — emitting cleared (exit 0)"
   emit_json_and_exit "cleared" 0 "$synthetic" 0
 }

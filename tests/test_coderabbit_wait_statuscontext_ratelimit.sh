@@ -52,6 +52,17 @@ RATE_LIMIT_BODY_HEADREF='<!-- This is an auto-generated comment: rate limited by
 
 <!-- end of auto-generated comment: rate limited by coderabbit.ai -->'
 
+PAUSED_BODY_HEADREF='<!-- This is an auto-generated comment: review paused by coderabbit.ai -->
+
+> [!WARNING]
+> ## Reviews paused
+>
+> Reviewing files that changed between the base and head-sha.
+>
+> Reply with `@coderabbitai resume` to resume automatic reviews.
+
+<!-- end of auto-generated comment: review paused by coderabbit.ai -->'
+
 # A genuine clean review summary (class=review), no rate-limit marker.
 REVIEW_BODY_CLEAN='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
 
@@ -388,6 +399,10 @@ case "\$endpoint" in
       fi
       exit 0
     fi
+    if [ -n "\${CODERABBIT_TEST_REVIEWS_JSON:-}" ]; then
+      printf '%s\n' "\$CODERABBIT_TEST_REVIEWS_JSON"
+      exit 0
+    fi
     printf '[]\n' ;;
   repos/owner/repo/pulls/999/comments) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
@@ -494,23 +509,58 @@ test_headref_ratelimit_suppresses_status() {
   [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "1: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
   [ "$(jqf "$dir" '.codex_failover_requested')" = "true" ] || fail "1: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected true (failover fired after suppression)"
   [ "$(stub_calls "$dir")" = "1" ] || fail "1: Codex failover invoked $(stub_calls "$dir") time(s), expected 1"
-  grep -q 'near-simultaneous rate-limit status flip' "$dir/err.log" || fail "1: expected the #596 suppression log line; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  grep -q 'clearance remains suppressed' "$dir/err.log" || fail "1: expected the current-refusal suppression log line; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
   [ "$FAIL" -ne "$before" ] || pass "1: #596 — near-simultaneous StatusContext success does not clear a HEAD-referencing rate-limit notice → failover + exit 5"
 }
 
-# --- Test 3: #596 escape — a genuinely LATER success (beyond grace) clears ----
+# --- Test 3: #956 — a later status alone does not prove a review ------------
 # The comment is a HEAD-referencing rate-limit notice at T, but the success
-# StatusContext lands 2h later — well beyond STATUS_SUCCESS_GRACE_SECONDS — so
-# it is a genuine (possibly silent, per #221) re-review of HEAD and must clear.
-test_headref_later_success_clears() {
+# StatusContext lands 2h later — well beyond STATUS_SUCCESS_GRACE_SECONDS.
+# With no review run on HEAD, elapsed grace is not recovery evidence.
+test_headref_later_status_without_review_stays_refused() {
   local dir rc before=$FAIL
   dir=$(make_case "headref-later" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
   rc=$(run_case "$dir")
-  [ "$rc" = "0" ] || fail "3: expected exit 0 (cleared) for a genuine later success, got $rc; err=$(tail -4 "$dir/err.log")"
-  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3: status=$(jqf "$dir" '.status'), expected cleared"
-  [ "$(stub_calls "$dir")" = "0" ] || fail "3: failover should not fire on a genuine-later clearance, fired $(stub_calls "$dir")"
-  grep -q 'remains authoritative' "$dir/err.log" || fail "3: expected the authoritative-later-success log; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
-  [ "$FAIL" -ne "$before" ] || pass "3: #596 escape — a StatusContext success beyond the grace window (genuine later re-review) still clears"
+  [ "$rc" = "5" ] || fail "3: expected exit 5 (rate_limit_stalled) without an actual HEAD review, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "3: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+  [ "$(stub_calls "$dir")" = "1" ] || fail "3: expected failover after the refusal remained current, fired $(stub_calls "$dir") time(s)"
+  grep -q 'clearance remains suppressed' "$dir/err.log" || fail "3: expected the #956 actual-review suppression log; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  [ "$FAIL" -ne "$before" ] || pass "3: #956 — a later completed StatusContext alone cannot clear a current rate-limit refusal"
+}
+
+# --- Test 3b: exact-head body-bearing review run wins -----------------------
+test_current_refusal_with_actual_head_review_clears() {
+  local dir rc before=$FAIL reviews
+  dir=$(make_case "headref-actual-review" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  reviews='[{"id":8801,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed. No actionable comments."}]'
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "0" ] || fail "3b: expected exit 0 with a body-bearing current-HEAD review, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3b: status=$(jqf "$dir" '.status'), expected cleared"
+  grep -q 'body-bearing review id=8801 is pinned' "$dir/err.log" || fail "3b: expected exact-head review evidence log; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
+  [ "$FAIL" -ne "$before" ] || pass "3b: #956 — a body-bearing review run pinned to HEAD outranks the current refusal"
+}
+
+# --- Test 3c: a body-less acknowledgement is not a review run --------------
+test_current_refusal_with_bodyless_ack_stays_refused() {
+  local dir rc before=$FAIL reviews
+  dir=$(make_case "headref-bodyless-ack" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  reviews='[{"id":8802,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":null}]'
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "5" ] || fail "3c: expected exit 5 with only a body-less acknowledgement, got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'body-less acknowledgements cannot permit clearance' "$dir/err.log" || fail "3c: expected body-less acknowledgement refusal log; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
+  [ "$FAIL" -ne "$before" ] || pass "3c: #956 — a body-less exact-head acknowledgement cannot clear the current refusal"
+}
+
+# --- Test 3d: a current pause also requires actual review evidence ----------
+test_current_pause_with_later_status_resumes_instead_of_clearing() {
+  local dir rc before=$FAIL
+  dir=$(make_case "headref-paused-later-status" "$PAUSED_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  rc=$(run_case "$dir")
+  [ "$rc" = "6" ] || fail "3d: expected exit 6 (paused) after bounded resume handling, got $rc; err=$(tail -5 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "paused" ] || fail "3d: status=$(jqf "$dir" '.status'), expected paused"
+  [ "$(jqf "$dir" '.resume_retries')" != "0" ] || fail "3d: the status-only path bypassed pause resume handling"
+  grep -q 'current comment is paused' "$dir/err.log" || fail "3d: expected current-pause suppression log; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
+  [ "$FAIL" -ne "$before" ] || pass "3d: #956 — later status-only completion cannot clear a current pause and resume handling still runs"
 }
 
 # --- Test 2: control — genuine review + status success STILL clears ----------
@@ -536,7 +586,7 @@ test_headref_within_published_window_suppresses() {
   rc=$(run_case "$dir")
   [ "$rc" = "5" ] || fail "4: expected exit 5 (suppressed within published window), got $rc; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "4: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
-  grep -q 'within the 810s window' "$dir/err.log" || fail "4: expected the published-window (810s) suppression log; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  grep -q 'clearance remains suppressed' "$dir/err.log" || fail "4: expected the current-refusal suppression log; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
   [ "$FAIL" -ne "$before" ] || pass "4: #599 — success past the 120s base grace but inside the published 13-minute window is still suppressed (window-aware grace)"
 }
 
@@ -628,27 +678,28 @@ test_aged_notice_with_open_window_suppresses() {
   # round came back `false` on the #909 false clear. It must still fire.
   [ "$(jqf "$dir" '.codex_failover_requested')" = "true" ] || fail "9: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected true"
   [ "$(stub_calls "$dir")" = "1" ] || fail "9: Codex failover invoked $(stub_calls "$dir") time(s), expected 1"
-  grep -q 'published window has NOT expired' "$dir/err.log" || fail "9: expected the published-window suppression log; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  grep -q 'clearance remains suppressed' "$dir/err.log" || fail "9: expected the current-refusal suppression log; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
   [ "$FAIL" -ne "$before" ] || pass "9: #891/#912 — an aged-out notice with an OPEN published window still governs → no clear, failover fires, exit 5"
 }
 
-# --- Test 10: escape — an aged-out notice whose window has EXPIRED ----------
-# The suppression is scoped by the PUBLISHED window, not by "a notice exists".
+# --- Test 10: #956 — expired window does not become review evidence --------
+# Retry scheduling remains scoped by the PUBLISHED window, but clearance while
+# the refusal is still CodeRabbit's newest comment requires an actual review.
 # Same aged timestamps as test 9, but a DIFFERENT notice body:
 # RATE_LIMIT_BODY_HEADREF, whose published window is 13 minutes (780s + 30s
-# buffer = 810s) and so long expired at 2400s elapsed. Because that body names
-# HEAD_SHA, the #596 HEAD-referencing arbitration participates here too, and
-# the head clears exactly as it did before — the boundary that keeps this rule
-# from becoming an unbounded block.
-test_aged_notice_with_expired_window_clears() {
+# buffer = 810s) and so long expired at 2400s elapsed. The window no longer
+# schedules a retry or failover, while the current refusal still prevents the
+# status-only fast path from clearing; the unchanged advisory budget therefore
+# ends at timeout.
+test_aged_notice_with_expired_window_stays_refused() {
   local dir rc before=$FAIL
   dir=$(make_case "aged-expired-window" "$RATE_LIMIT_BODY_HEADREF" \
     "$STATUS_AFTER_NOTICE" "Review completed" "$NOTICE_AGED_TIME" 1800)
   rc=$(run_case "$dir")
-  [ "$rc" = "0" ] || fail "10: expected exit 0 (cleared) once the published window expired, got $rc; err=$(tail -4 "$dir/err.log")"
-  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "10: status=$(jqf "$dir" '.status'), expected cleared"
-  [ "$(stub_calls "$dir")" = "0" ] || fail "10: failover should not fire once the window expired, fired $(stub_calls "$dir")"
-  [ "$FAIL" -ne "$before" ] || pass "10: escape — an aged notice whose published window has EXPIRED no longer suppresses (the rule is window-scoped, not notice-scoped)"
+  [ "$rc" = "4" ] || fail "10: expected exit 4 (advisory timeout) after the retry window expired but no actual HEAD review appeared, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "timeout" ] || fail "10: status=$(jqf "$dir" '.status'), expected timeout"
+  [ "$(stub_calls "$dir")" = "0" ] || fail "10: an expired window must not invent a new rate-limit retry/failover event, fired $(stub_calls "$dir")"
+  [ "$FAIL" -ne "$before" ] || pass "10: #956 — an expired rate-limit window ends retry scheduling but cannot supply missing current-HEAD review evidence"
 }
 
 # --- Test 11: #888 — a flag-shaped REPO positional is a usage error ---------
@@ -744,25 +795,22 @@ test_failed_summary_read_does_not_clear() {
   [ "$FAIL" -ne "$before" ] || pass "15: a failed PR-level summary read is exit 3 (infra), never a clearance"
 }
 
-# --- Test 14: the window rule is scoped to the arbitration's BLIND SPOT -----
+# --- Test 14: current refusal wins even inside the freshness floor ----------
 # Same notice and status as test 9, but with a freshness window wide enough
-# that the notice IS admitted to the anchored scan. The existing arbitration
-# then governs and reaches its own answer — here the #446 branch, where an
-# unscoped notice CREATED before the success is stale and does not suppress,
-# so the head clears. A window rule that ignored the status timestamp would
-# override that and suppress forever; scripts/ci/check_canonical_bugs_263caf3
-# catches the same regression from the other side. The defect #891/#912 report
-# is the notice going BLIND, not the arbitration being wrong.
-test_open_window_inside_freshness_defers_to_arbitration() {
+# that the notice IS admitted to the anchored scan. #956 deliberately replaces
+# the old #446 status-only escape for pause/rate-limit comments: while this is
+# still CodeRabbit's newest comment, the later status alone is not review
+# evidence. The existing open-window retry/failover path remains responsible
+# for the bounded outcome.
+test_open_window_inside_freshness_stays_refused() {
   local dir rc before=$FAIL
   dir=$(make_case "open-window-inside-freshness" "$RATE_LIMIT_BODY_LONG_WINDOW" \
     "$STATUS_AFTER_NOTICE" "Review completed" "$NOTICE_AGED_TIME" 999999999)
   rc=$(run_case "$dir")
-  [ "$rc" = "0" ] || fail "14: expected exit 0 (the #446 arbitration clears an unscoped pre-success notice), got $rc; err=$(tail -4 "$dir/err.log")"
-  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "14: status=$(jqf "$dir" '.status'), expected cleared"
-  grep -q 'remains authoritative' "$dir/err.log" || fail "14: expected the #446 arbitration to decide this, not the window rule; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
-  grep -q 'published window has NOT expired' "$dir/err.log" && fail "14: the window rule fired while the notice was inside the freshness floor — it must be scoped to the blind spot"
-  [ "$FAIL" -ne "$before" ] || pass "14: the published-window rule applies ONLY when nothing survived the freshness floor; a visible notice is still arbitrated against the status"
+  [ "$rc" = "5" ] || fail "14: expected exit 5 (rate_limit_stalled) while the current refusal has no actual HEAD review, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "14: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+  grep -q 'clearance remains suppressed' "$dir/err.log" || fail "14: expected the #956 current-refusal decision; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  [ "$FAIL" -ne "$before" ] || pass "14: #956 — a current rate-limit refusal inside the freshness floor still needs actual HEAD review evidence"
 }
 
 # --- Test 13: #912 — the fast-path verdict carries the STATUS' own time -----
@@ -860,10 +908,10 @@ test_later_notice_does_not_mask_head_summary() {
     "$STATUS_AFTER_BOTH_TIME" "Review completed" "$SUMMARY_ON_HEAD_TIME" 999999999 \
     "$RATE_LIMIT_BODY_LONG_WINDOW" "$NOTICE_AFTER_SUMMARY_TIME")
   rc=$(run_case "$dir")
-  # Non-vacuity: the notice must be visible to the arbitration AND lose there,
-  # or this is test 5 with an extra comment and proves nothing about selection.
-  grep -q 'remains authoritative' "$dir/err.log" \
-    || fail "18: the fast path was suppressed instead of entered — the fixture no longer reaches the selection; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
+  # Non-vacuity: the current notice must force grading-only mode, which still
+  # has to surface the earlier current-head summary finding rather than hide it.
+  grep -q 'StatusContext success is grading-only' "$dir/err.log" \
+    || fail "18: the current refusal did not enter grading-only mode; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
   [ "$rc" != "0" ] || fail "18: fast-path FALSE-CLEARED (exit 0) — a later non-review notice masked the head-anchored blocking summary; err=$(tail -4 "$dir/err.log")"
   [ "$rc" = "2" ] || fail "18: expected exit 2 (findings), got $rc; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" = "findings" ] || fail "18: status=$(jqf "$dir" '.status'), expected findings"
@@ -897,8 +945,8 @@ test_misclassified_summary_is_still_graded() {
   rc=$(run_case "$dir")
   # Non-vacuity: the body must actually be misclassified, or the class filter
   # selects it directly and this is test 5 with a longer fixture.
-  grep -q 'class=paused' "$dir/err.log" \
-    || fail "21: the fixture no longer misclassifies — classify_comment did not grade it paused; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  grep -q 'current comment is paused' "$dir/err.log" \
+    || fail "21: the fixture no longer misclassifies — classify_comment did not grade it paused; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
   grep -q 'entering fast-path verdict' "$dir/err.log" \
     || fail "21: the fast path was suppressed instead of entered — the fixture no longer reaches the selection; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
   [ "$rc" != "0" ] || fail "21: FALSE-CLEARED (exit 0) — the class filter dropped a blocking summary it could not recognize; err=$(tail -4 "$dir/err.log")"
@@ -1113,7 +1161,7 @@ test_failed_fast_path_comment_decode_does_not_clear() {
   [ "$rc" != "0" ] || fail "25: FALSE-CLEARED (exit 0) after the fast path's comment-list decode failed"
   [ "$rc" = "5" ] || fail "25: expected exit 5 (rate_limit_stalled, same as the test-1 control), got $rc; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "25: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
-  grep -q 'could not be DECODED' "$dir/err.log" \
+  grep -q 'newest CodeRabbit comment could not be decoded' "$dir/err.log" \
     || fail "25: expected the fast-path suppression message naming the failed decode; err=$(tail -4 "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "25: a failed comment-list DECODE inside the StatusContext fast path suppresses it (keep polling), never clears a rate-limited head"
 }
@@ -1723,10 +1771,10 @@ test_quoted_range_in_chat_reply_does_not_veto_current_head() {
 # `rate_limit` into the `review` default — the one class whose arm clears.
 # Measured on the pre-fix idiom at 245894 bytes: rc 141, class `review`.
 #
-# The fixture is test 1's exactly, with a ~98 KiB tail appended. Two assertions
-# beyond the exit code, because two predicates on this route share the idiom:
-# the class must be `rate_limit` (classify_comment) AND the notice must be seen
-# to reference HEAD (the fast-path's own `grep -Fq "$HEAD_SHA"`).
+# The fixture is test 1's exactly, with a ~98 KiB tail appended. The #956
+# current-refusal rule now decides before the older HEAD-reference grace branch,
+# so the non-vacuity assertion is that the oversized body still classifies as
+# `rate_limit` and enters grading-only refusal rather than the `review` default.
 #
 # The size sits inside a WINDOW, and both ends are asserted below. The lower
 # bound is the 64 KiB pipe buffer, without which the case proves nothing. The
@@ -1753,8 +1801,8 @@ $pad"
     || fail "38: FALSE-CLEARED (exit 0) — a HEAD-referencing rate-limit notice past the pipe buffer graded as a completed review; err=$(tail -4 "$dir/err.log")"
   [ "$rc" = "5" ] || fail "38: expected exit 5 (rate_limit_stalled after suppression), got $rc; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "38: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
-  grep -q 'class=rate_limit references current HEAD' "$dir/err.log" \
-    || fail "38: the large notice was not classified rate_limit AND seen to reference HEAD; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  grep -q 'current comment is rate_limit' "$dir/err.log" \
+    || fail "38: the large notice was not classified rate_limit; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
   [ "$FAIL" -ne "$before" ] || pass "38: #1005 — a rate-limit notice past the 64 KiB pipe buffer still classifies rate_limit and still suppresses the StatusContext fast path"
 }
 
@@ -1851,18 +1899,21 @@ test_notice_less_timeout_contract
 
 test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
-test_headref_later_success_clears
+test_headref_later_status_without_review_stays_refused
+test_current_refusal_with_actual_head_review_clears
+test_current_refusal_with_bodyless_ack_stays_refused
+test_current_pause_with_later_status_resumes_instead_of_clearing
 test_headref_within_published_window_suppresses
 test_summary_only_marker_is_findings_not_cleared
 test_ratelimited_description_without_notice_never_clears
 test_unknown_description_does_not_clear
 test_completed_description_still_clears
 test_aged_notice_with_open_window_suppresses
-test_aged_notice_with_expired_window_clears
+test_aged_notice_with_expired_window_stays_refused
 test_trailing_probe_flag_is_usage_error
 test_status_description_predicate_unit
 test_status_context_verdict_carries_status_created_at
-test_open_window_inside_freshness_defers_to_arbitration
+test_open_window_inside_freshness_stays_refused
 test_failed_summary_read_does_not_clear
 test_rate_limit_masking_a_blocking_marker_unit() {
   # #1178. classify_comment is marker-FIRST (#593), so a summarize comment that
