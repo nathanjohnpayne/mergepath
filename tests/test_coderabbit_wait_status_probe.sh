@@ -499,6 +499,27 @@ Fresh benign CodeRabbit activity without a summary marker.
             {id:87802,user:{login:$bot},created_at:$fresh_time,updated_at:$fresh_time,body:$fresh}
           ]'
         ;;
+      carry_notice)
+        # #1335 Phase 4b P1 on #1340: a SEPARATE provider notice beside an
+        # unchanged clean summary. The notice is served from comments-read
+        # number CODERABBIT_TEST_CARRY_NOTICE_FROM on (1 = every read, i.e. a
+        # standing notice; 2 = it lands between the probe's two reads), at
+        # CODERABBIT_TEST_CARRY_NOTICE_TIME. The summary's own timestamps are
+        # CODERABBIT_TEST_CARRY_SUMMARY_TIME (default: edited at reply_time).
+        n=0
+        [ ! -f "$state_dir/comment-reads" ] || n=$(cat "$state_dir/comment-reads")
+        n=$((n + 1)); printf '%s\n' "$n" >"$state_dir/comment-reads"
+        stime=${CODERABBIT_TEST_CARRY_SUMMARY_TIME:-$reply_time}
+        if [ "$n" -ge "${CODERABBIT_TEST_CARRY_NOTICE_FROM:?}" ]; then
+          jq -nc --arg bot "$bot" --arg body "${CODERABBIT_TEST_FALLBACK_BODY:?}" --arg st "$stime" \
+            --arg nbody "${CODERABBIT_TEST_CARRY_NOTICE_BODY:?}" --arg nt "${CODERABBIT_TEST_CARRY_NOTICE_TIME:?}" \
+            '[{id:94101,user:{login:$bot},created_at:"2026-06-03T00:00:00Z",updated_at:$st,body:$body},
+              {id:94301,user:{login:$bot},created_at:$nt,updated_at:$nt,body:$nbody}]'
+        else
+          jq -nc --arg bot "$bot" --arg body "${CODERABBIT_TEST_FALLBACK_BODY:?}" --arg st "$stime" \
+            '[{id:94101,user:{login:$bot},created_at:"2026-06-03T00:00:00Z",updated_at:$st,body:$body}]'
+        fi
+        ;;
       carry_summary_changes|carry_rescan_fails|carry_review_appears)
         # #1335 TOCTOU (Codex P1 on #1340): the FIRST comments read serves the
         # prior-head clean summary; every later read serves
@@ -1334,6 +1355,55 @@ Reviewing files that changed from the base of the PR and between $a and head-sha
   { [ "$rc" = 7 ] && jq -e '.probe.carryforward == null' "$dir/out.json" >/dev/null 2>&1 \
       && grep -q 'review run landed on' "$dir/err.log"; } \
     || bad="$bad run-appears(rc=$rc cf=$(jq -c '.probe.carryforward' "$dir/out.json" 2>/dev/null))"
+
+  # 15-18. A SEPARATE provider notice beside an unchanged clean summary (Phase
+  #     4b P1 on #1340). A success status does not outrank a current refusal
+  #     (#956), so none of these may emit evidence.
+  local pause_note='<!-- This is an auto-generated comment: review paused by coderabbit.ai -->
+> [!NOTE]
+> ## Reviews paused
+<!-- end of auto-generated comment: review paused by coderabbit.ai -->'
+  local progress_note='<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->
+> Currently processing new changes in this PR.
+<!-- end of auto-generated comment: review in progress by coderabbit.ai -->'
+  _notice_case() {  # <label> <notice-body> <notice-from-read> <notice-time> <summary-time> <want: none|evidence> <want-observed>
+    local label=$1 nbody=$2 from=$3 ntime=$4 stime=$5 want=$6 wobs=$7 got
+    dir=$(make_case "probe-1335-notice-$label" 600 true 30 3 2)
+    enable_trust_status_context "$dir"
+    rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' \
+      CODERABBIT_TEST_FALLBACK_BODY="$clean" CODERABBIT_TEST_CARRY_NOTICE_BODY="$nbody" \
+      CODERABBIT_TEST_CARRY_NOTICE_FROM="$from" CODERABBIT_TEST_CARRY_NOTICE_TIME="$ntime" \
+      CODERABBIT_TEST_CARRY_SUMMARY_TIME="$stime" run_probe_case "$dir" carry_notice)
+    got=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+    if [ "$want" = none ]; then
+      { [ "$rc" = 7 ] && [ "$got" = "$wobs" ] && jq -e '.probe.carryforward == null' "$dir/out.json" >/dev/null 2>&1; } \
+        || bad="$bad notice-$label(rc=$rc observed=$got cf=$(jq -c '.probe.carryforward' "$dir/out.json" 2>/dev/null))"
+    else
+      { [ "$rc" = 7 ] && [ "$got" = "$wobs" ] && jq -e --arg b "$b" '.probe.carryforward.reviewed_head == $b' "$dir/out.json" >/dev/null 2>&1; } \
+        || bad="$bad notice-$label(rc=$rc observed=$got cf=$(jq -c '.probe.carryforward' "$dir/out.json" 2>/dev/null))"
+    fi
+  }
+  # 15. A pause notice lands between the snapshot and the re-read.
+  _notice_case pause-in-gap "$pause_note" 2 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z none summary-without-head-review
+  # 16. The reviewer's reproduction: a STANDALONE pause that has aged below
+  #     HEAD_ANCHOR (both it and the summary predate the head), so the
+  #     anchored triage reports observed=none — the refusal is still current.
+  _notice_case pause-aged "$pause_note" 1 2026-06-03T12:00:00Z 2026-06-03T06:00:00Z none none
+  # 17. An in-progress notice landing in the gap.
+  _notice_case progress-in-gap "$progress_note" 2 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z none summary-without-head-review
+  # 18. Control: a newer NARRATION reply (the barrier's own "Already reviewed
+  #     the last commit" answer) is not provider state and must not block.
+  _notice_case narration-control '<!-- This is an auto-generated reply by CodeRabbit -->
+<!-- CodeRabbit review command invocation: v2:abc -->
+<details>
+<summary>⚠️ Action not completed</summary>
+
+Already reviewed the last commit.
+
+> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits.
+
+</details>' 1 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z evidence summary-without-head-review
+  unset -f _notice_case
 
   unset -f _cf_case
   if [ -z "$bad" ]; then

@@ -4411,6 +4411,39 @@ crw_probe_carryforward_evidence() {
       log "probe: the CodeRabbit summary changed after the success on $HEAD_SHA was observed — emitting no carry-forward evidence from the stale snapshot (#1335)"
       return 0
     fi
+    # Provider state on the REFRESHED snapshot (Phase 4b P1 on #1340). An
+    # unchanged clean summary says nothing about a SEPARATE pause, rate-limit
+    # or in-progress notice: one can arrive between the two reads, or a
+    # standalone pause can age below HEAD_ANCHOR — the anchored triage then
+    # stops seeing it and reports observed=none while CodeRabbit is still
+    # paused. #956 records that CodeRabbit publishes `success | Review
+    # completed` while such a refusal stays current, so the status cannot
+    # outrank it. Same anchor-free newest-comment read and the same
+    # provider-owned classifier the #956 fast-path guard uses, so the two
+    # cannot disagree about what a current refusal is; the legacy classifier
+    # is consulted as well, since it is what the probe's own triage keys on.
+    # Every unread rung emits nothing.
+    local newest="" newest_len="" newest_body="" newest_class="" newest_rc=0
+    newest=$(newest_bot_comment_for_refusal_guard "$fresh") \
+      || { log "probe: carry-forward re-scan could not decode CodeRabbit's newest comment — emitting no evidence (#1335)"; return 0; }
+    newest_len=$(printf '%s' "$newest" | jq -er 'length' 2>/dev/null) \
+      || { log "probe: carry-forward re-scan could not size CodeRabbit's newest comment — emitting no evidence (#1335)"; return 0; }
+    if [ "$newest_len" != "0" ]; then
+      newest_body=$(printf '%s' "$newest" | jq -er '.body | select(type == "string")' 2>/dev/null) \
+        || { log "probe: carry-forward re-scan could not read CodeRabbit's newest comment body — emitting no evidence (#1335)"; return 0; }
+      newest_class=$(crw_provider_owned_refusal_class "$newest_body") || newest_rc=$?
+      if [ "$newest_rc" = 3 ]; then
+        log "probe: carry-forward re-scan could not structurally read CodeRabbit's newest comment — emitting no evidence (#1335)"
+        return 0
+      fi
+      [ "$newest_rc" = 0 ] || newest_class=$(classify_comment "$newest_body")
+      case "$newest_class" in
+        rate_limit|paused|in_progress)
+          log "probe: CodeRabbit's newest comment is a current $newest_class notice — a success status does not outrank it, so no carry-forward evidence (#1335)"
+          return 0
+          ;;
+      esac
+    fi
     # The summary is not the only thing that can land in the gap. #869
     # records that a head-pinned review RUN and the per-SHA success can
     # publish BEFORE the summary edit, so an unchanged summary does not prove
