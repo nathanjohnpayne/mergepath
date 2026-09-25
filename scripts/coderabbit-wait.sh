@@ -1652,6 +1652,10 @@ crw_provider_owned_refusal_class() {
     printf 'paused\n'
     return 0
   fi
+  if grep -Fxq "<!-- This is an auto-generated comment: $IN_PROGRESS_MARKER -->" <<<"$unfenced"; then
+    printf 'in_progress\n'
+    return 0
+  fi
   case "$unfenced" in
     "> [!WARNING]"$'\n'"> ## Rate limit exceeded"*) printf 'rate_limit\n'; return 0 ;;
     "> [!WARNING]"$'\n'"> ## Review limit reached"*) printf 'rate_limit\n'; return 0 ;;
@@ -2736,7 +2740,7 @@ crw_active_rate_limit_notice() {
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
   local issue_comments current latest class comment_id comment_created_at comment_fresh_at comment_body
-  local current_class current_rc reviews head_run review_rc run_id run_body marker_rc
+  local current_class current_rc reviews head_run review_rc run_id run_body run_class run_class_rc marker_rc
   local active_notice active_id active_remaining active_rc
   # A current refusal with no run still enters the verdict scanner so existing
   # inline/summary findings are surfaced immediately.  The scanner consults
@@ -2804,9 +2808,14 @@ status_context_fast_path_blocked_by_comment() {
             return 0
           }
           marker_rc=0
-          if [ "$(classify_comment "$run_body")" != "review" ]; then
+          run_class_rc=0
+          run_class=$(crw_provider_owned_refusal_class "$run_body") || run_class_rc=$?
+          if [ "$run_class_rc" = "3" ]; then
+            log "StatusContext success suppressed: body-bearing current-HEAD review id=$run_id could not be structurally read for a provider-owned non-review state (#956)"
+            return 0
+          elif [ "$run_class_rc" = "0" ]; then
             STATUS_CONTEXT_CLEARANCE_REFUSAL=$current_class
-            log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id is not a completed review-class body (#956)"
+            log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id carries provider-owned $run_class state (#956)"
             return 1
           fi
           summary_blocking_marker_present "$run_body" || marker_rc=$?

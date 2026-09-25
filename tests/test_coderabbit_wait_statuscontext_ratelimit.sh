@@ -601,6 +601,16 @@ test_current_refusal_with_nonbenign_head_review_stays_refused() {
   [ "$FAIL" -ne "$before" ] || pass "3b4: a non-benign exact-HEAD review body cannot release the current refusal"
 }
 
+test_current_refusal_with_review_quoting_progress_clears() {
+  local dir rc before=$FAIL reviews
+  dir=$(make_case "headref-review-quotes-progress" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  reviews=$(jq -nc '[{"id":8805,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed. The diff quotes the phrase review in progress, but reports no findings."}]')
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "0" ] || fail "3b5: incidental review-in-progress prose should not disqualify a completed exact-HEAD review, got $rc; err=$(tail -5 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3b5: status=$(jqf "$dir" '.status'), expected cleared"
+  [ "$FAIL" -ne "$before" ] || pass "3b5: incidental non-review prose does not override the structured exact-HEAD review evidence"
+}
+
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
 test_current_refusal_with_bodyless_ack_stays_refused() {
   local dir rc before=$FAIL reviews
@@ -2399,6 +2409,7 @@ test_quoted_refusal_marker_is_not_current_refusal
 test_current_refusal_with_blocking_head_review_is_findings
 test_summary_owned_refusal_stays_current
 test_current_refusal_with_nonbenign_head_review_stays_refused
+test_current_refusal_with_review_quoting_progress_clears
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
