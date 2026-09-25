@@ -328,8 +328,9 @@ SSH_WARM_TTL_SECONDS="${OP_PREFLIGHT_SSH_WARM_TTL_SECONDS:-1800}"  # 30 min defa
 # ── Deploy-credential slots (one per Firebase-project context) ────────
 # Deploy credentials are cached per context, not per agent: one slot per
 # Firebase project (with its own SA key file), plus one `adc` slot for
-# checkouts with no .firebaserc. The main session file keeps only the
-# context-free material (PATs, CF_API_TOKEN).
+# checkouts with no .firebaserc. Everything the deploy phase fetches
+# (including CF_API_TOKEN) lives in the slot, so a later `--mode review`
+# rewrite of the main session file (PATs only) cannot strip part of it.
 #
 # A single per-agent slot made concurrent sessions in two Firebase repos
 # (e.g. nathanpaynedotcom and fiveacross/gaycruisebingo, both `--mode all`
@@ -810,6 +811,7 @@ emit_from_session_file() (
     if [[ -f "$deploy_slot_file" ]]; then
       unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
       unset OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT
+      unset CF_API_TOKEN
       # shellcheck disable=SC1090
       . "$deploy_slot_file"
       slot_created="${OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH:-}"
@@ -1435,7 +1437,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   cf_token=$(op read "$DEFAULT_CF_TOKEN_OP_URI" 2>/dev/null || true)
   if [[ -n "$cf_token" ]]; then
     EXPORTS+=("export CF_API_TOKEN=$(printf '%q' "$cf_token")")
-    SESSION_LINES+=("CF_API_TOKEN=$(printf '%q' "$cf_token")")
+    DEPLOY_SLOT_LINES+=("CF_API_TOKEN=$(printf '%q' "$cf_token")")
     SUMMARY+=("Cloudflare cache-purge token: loaded")
   else
     echo "# Warning: could not read Cloudflare cache-purge token. CF_API_TOKEN not exported; deploy.sh will skip the purge step." >&2

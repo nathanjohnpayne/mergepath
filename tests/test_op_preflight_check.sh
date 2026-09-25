@@ -1829,7 +1829,7 @@ test_all_mode_alternating_firebase_projects_do_not_evict() {
   done
 
   # op stub: inject -> PATs; `document get "<project> — Firebase Deployer SA
-  # Key"` -> a well-formed SA key for THAT project; read (CF token) -> fail.
+  # Key"` -> a well-formed SA key for THAT project; read -> the CF token.
   cat > "$bin_dir/op" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\${1:-} \${3:-}" >> "$op_log"
@@ -1847,6 +1847,9 @@ case "\${1:-}" in
     [ -n "\$out_path" ] || exit 1
     printf '{"type": "service_account", "project_id": "%s", "client_email": "firebase-deployer@%s.iam.gserviceaccount.com"}\n' \
       "\$project" "\$project" > "\$out_path"
+    ;;
+  read)
+    printf '%s\n' "alt-cf-token"
     ;;
   *)
     exit 1
@@ -1893,6 +1896,23 @@ EOF
   fi
   pass "test_all_mode_alternating_firebase_projects_do_not_evict: A/B/A/B/A/B costs one fetch per project, keys never swapped"
 
+  # A `--mode review --refresh` rewrites the main session file (PATs only);
+  # the deploy slot, CF_API_TOKEN included, must survive it intact.
+  local injects_before
+  injects_before=$(count_lines "$op_log" '^inject')
+  (cd "$case_dir/proj-alpha" && PATH="$bin_dir:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent claude --mode review --refresh --skip-ssh >/dev/null 2>&1)
+  if ! run_all_mode "$case_dir/proj-alpha" "$cache_dir" "$bin_dir" run-after-review; then
+    fail "all-alternating: --mode all after a review refresh failed; stderr=$(cat "$case_dir/proj-alpha/run-after-review.err")"
+    return
+  fi
+  if [ "$(count_lines "$op_log" '^inject')" != "$((injects_before + 1))" ] \
+     || ! grep -q "^export CF_API_TOKEN=alt-cf-token$" "$case_dir/proj-alpha/run-after-review.out"; then
+    fail "all-alternating: a review refresh cost the deploy slot its CF_API_TOKEN or forced a re-fetch; op=$(tr '\n' '|' < "$op_log")"
+    return
+  fi
+  pass "test_all_mode_alternating_firebase_projects_do_not_evict: a review refresh leaves the deploy slot (CF_API_TOKEN included) intact"
+
   # A slot past the session TTL is not honoured even though it exists and
   # the main session file is still fresh: age only the slot's own epoch.
   local slot="$cache_dir/op-preflight-claude-deploy-fb-proj-alpha.env"
@@ -1901,7 +1921,7 @@ EOF
     fail "all-alternating: TTL=0 run failed; stderr=$(cat "$case_dir/proj-alpha/run-ttl.err")"
     return
   fi
-  if [ "$(count_lines "$op_log" '^inject')" != "3" ]; then
+  if [ "$(count_lines "$op_log" '^inject')" != "4" ]; then
     fail "all-alternating: an expired deploy slot was served from cache"
     return
   fi
