@@ -1661,7 +1661,7 @@ crw_provider_owned_refusal_class() {
     "> [!WARNING]"$'\n'"> ## Review limit reached"*) printf 'rate_limit\n'; return 0 ;;
     "> [!WARNING]"$'\n'"> ## Reviews paused"*) printf 'paused\n'; return 0 ;;
   esac
-  first_line=$(awk 'NF { print; exit }' <<<"$unfenced") || return 3
+  first_line=$(awk 'NF { sub(/[[:space:]]+$/, ""); print; exit }' <<<"$unfenced") || return 3
   first_line=$(printf '%s' "$first_line" | tr '[:upper:]' '[:lower:]') || return 3
   case "$first_line" in
     'rate limit exceeded'|'rate-limit exceeded'|'## rate limit exceeded'|'## rate-limit exceeded'|'review limit reached'|'## review limit reached')
@@ -1694,6 +1694,8 @@ crw_provider_owned_refusal_class() {
   case "$narration_first_line" in
     '<!-- coderabbit review command invocation:'*|'coderabbit review command invocation'*|'here is a summary of where things stand'*|"here's a summary of where things stand"*|'coderabbit is an incremental review system'*|'does not re-review already reviewed commits'*)
       printf 'status_probe\n'; return 0 ;;
+    '`@'?*'`: here is a summary of where things stand'*|'`@'?*'`: here'\''s a summary of where things stand'*)
+      printf 'status_probe\n'; return 0 ;;
   esac
   case "$narration_lead" in
     '<details><summary>✅ actions performed</summary>'$'\n''review triggered.'$'\n''> note: coderabbit is an incremental review system'*|\
@@ -1705,6 +1707,21 @@ crw_provider_owned_refusal_class() {
       printf 'status_probe\n'; return 0 ;;
   esac
   return 1
+}
+
+# Classify a comment already selected as CodeRabbit's substantive latest word.
+# The structural classifier owns the narrow refusal/narration forms added for
+# #956; the legacy classifier remains the fallback for every other established
+# body. Preserve the structural reader's third rung so an unread body can never
+# fall through to legacy `review`, the one class that can clear.
+crw_classify_selected_comment() {
+  local body=$1 structural structural_rc=0
+  structural=$(crw_provider_owned_refusal_class "$body") || structural_rc=$?
+  case "$structural_rc" in
+    0) printf '%s\n' "$structural" ;;
+    1) classify_comment "$body" ;;
+    *) return 3 ;;
+  esac
 }
 
 summary_names_head() {
@@ -3253,7 +3270,10 @@ emit_terminal_review_after_probe_if_present() {
     log "post-probe terminal-review check: the selected comment body could not be derived — leaving the advisory timeout in place rather than grading an unread comment"
     return 0
   }
-  class=$(classify_comment "$body")
+  class=$(crw_classify_selected_comment "$body") || {
+    log "post-probe terminal-review check: the selected comment could not be structurally classified — leaving the advisory timeout in place"
+    return 0
+  }
   case "$class" in
     review)
       # #1031 round 2: select the graded review object ONCE, here, and use the
@@ -5014,7 +5034,8 @@ while :; do
   COMMENT_CREATED=$(echo "$LATEST" | jq -r '.created_at')
   COMMENT_FRESH_AT=$(echo "$LATEST" | jq -r '.fresh_at // .updated_at // .created_at')
 
-  CLASS=$(classify_comment "$COMMENT_BODY")
+  CLASS=$(crw_classify_selected_comment "$COMMENT_BODY") \
+    || die 3 "could not structurally classify the latest CodeRabbit comment — refusing to treat an unread body as a review"
   log "latest CodeRabbit comment id=$COMMENT_ID endpoint=$COMMENT_ENDPOINT class=$CLASS created=$COMMENT_CREATED fresh_at=$COMMENT_FRESH_AT"
 
   case "$CLASS" in

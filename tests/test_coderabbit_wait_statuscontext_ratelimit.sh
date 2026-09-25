@@ -100,6 +100,16 @@ LEGACY_RATE_LIMIT_BODY='Rate limit exceeded
 
 Please wait before requesting another review.'
 
+LEGACY_RATE_LIMIT_BODY_TRAILING=$'Rate limit exceeded  \r\n\r\nPlease wait before requesting another review.'
+
+LEGACY_REVIEW_LIMIT_BODY='Review limit reached
+
+Please wait before requesting another review.'
+
+LEGACY_PAUSED_BODY='Reviews paused
+
+Reply with `@coderabbitai resume` to continue.'
+
 WRAPPED_STATUS_PROBE_BODY='<!-- This is an auto-generated reply by CodeRabbit -->
 
 <!-- CodeRabbit review command invocation: status -->
@@ -110,6 +120,16 @@ WRAPPED_SUMMARY_STATUS_PROBE_BODY=$'<!-- This is an auto-generated reply by Code
 WRAPPED_INCREMENTAL_STATUS_PROBE_BODY='<!-- This is an auto-generated reply by CodeRabbit -->
 
 Does not re-review already reviewed commits.'
+
+MENTION_STATUS_PROBE_BODY='`@nathanjohnpayne`: Here is a summary of where things stand.
+
+### Open CodeRabbit Threads
+None yet.'
+
+MENTION_APOSTROPHE_STATUS_PROBE_BODY="\`@nathanjohnpayne\`: Here's a summary of where things stand.
+
+### Open CodeRabbit Threads
+None yet."
 
 ACTIONS_PERFORMED_STATUS_PROBE_BODY='<!-- This is an auto-generated reply by CodeRabbit -->
 
@@ -377,6 +397,29 @@ printf '%s\n' $((current + duration)) >"$clock_file"
 EOF
   chmod +x "$dir/bin/sleep"
 
+  [ -e "$dir/bin/awk-real" ] || ln -s "$(command -v awk)" "$dir/bin/awk-real"
+  cat >"$dir/bin/awk" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  *'function fence_info'*)
+    if [ -n "${CODERABBIT_TEST_FAIL_STRUCTURAL_ON:-}" ]; then
+      count_file=${CODERABBIT_TEST_STATE_DIR:?}/structural-awk-count
+      count=0
+      [ ! -f "$count_file" ] || count=$(cat "$count_file")
+      count=$((count + 1))
+      printf '%s\n' "$count" >"$count_file"
+      if [ "$count" = "$CODERABBIT_TEST_FAIL_STRUCTURAL_ON" ]; then
+        echo "simulated structural reader failure on call $count" >&2
+        exit 44
+      fi
+    fi
+    ;;
+esac
+exec "$(dirname "$0")/awk-real" "$@"
+EOF
+  chmod +x "$dir/bin/awk"
+
   # gh stub. The CodeRabbit StatusContext on head-sha is `success`, created 1s
   # AFTER the (persistent, same-id) issue comment served from comment-body.txt.
   cat >"$dir/bin/gh" <<EOF
@@ -554,6 +597,7 @@ run_case() {
       CODERABBIT_TEST_STATE_DIR="$dir/state" \
       CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON="${CODERABBIT_TEST_REVIEWS_AFTER_FIRST_JSON:-}" \
       CODERABBIT_TEST_FAIL_REVIEWS_AFTER="${CODERABBIT_TEST_FAIL_REVIEWS_AFTER:-}" \
+      CODERABBIT_TEST_FAIL_STRUCTURAL_ON="${CODERABBIT_TEST_FAIL_STRUCTURAL_ON:-}" \
       CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
       CODEX_STUB_LOG="$dir/state/codex-stub.log" \
       ./scripts/coderabbit-wait.sh 999 owner/repo \
@@ -722,12 +766,49 @@ test_current_refusal_with_review_quoting_progress_clears() {
 }
 
 test_legacy_leading_refusal_stays_current() {
+  local mode body expected dir rc before=$FAIL
+  for mode in rate-limit rate-limit-trailing review-limit paused; do
+    case "$mode" in
+      rate-limit) body=$LEGACY_RATE_LIMIT_BODY; expected=5 ;;
+      rate-limit-trailing) body=$LEGACY_RATE_LIMIT_BODY_TRAILING; expected=5 ;;
+      review-limit) body=$LEGACY_REVIEW_LIMIT_BODY; expected=5 ;;
+      paused) body=$LEGACY_PAUSED_BODY; expected=6 ;;
+    esac
+    dir=$(make_case "legacy-leading-$mode-refusal" "$body" "2026-06-04T02:00:00Z")
+    rc=$(run_case "$dir")
+    [ "$rc" = "$expected" ] || fail "3b6 $mode: leading legacy refusal should remain blocked, got $rc expected $expected; err=$(tail -5 "$dir/err.log")"
+    grep -q 'grading-only because CodeRabbit' "$dir/err.log" || fail "3b6 $mode: leading legacy refusal was not recognized as provider state"
+  done
+  [ "$FAIL" -ne "$before" ] || pass "3b6: supported markerless and trailing-whitespace legacy refusal headings remain authoritative through polling"
+}
+
+test_markerless_refusal_does_not_clear_at_terminal_probe() {
   local dir rc before=$FAIL
-  dir=$(make_case "legacy-leading-refusal" "$LEGACY_RATE_LIMIT_BODY" "2026-06-04T02:00:00Z")
+  dir=$(make_case "legacy-review-limit-terminal" "$LEGACY_REVIEW_LIMIT_BODY" "2026-06-04T02:00:00Z")
+  sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+  sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 0/' "$dir/.github/review-policy.yml"
   rc=$(run_case "$dir")
-  [ "$rc" = "5" ] || fail "3b6: leading legacy refusal should remain rate-limit-stalled, got $rc; err=$(tail -5 "$dir/err.log")"
-  grep -q 'grading-only because CodeRabbit.*rate_limit' "$dir/err.log" || fail "3b6: leading legacy refusal was not recognized as provider state"
-  [ "$FAIL" -ne "$before" ] || pass "3b6: a provider-owned leading legacy rate-limit notice remains authoritative"
+  [ "$rc" != "0" ] || fail "3b6a: post-probe terminal check cleared a supported markerless refusal"
+  [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b6a: terminal status unexpectedly cleared"
+  [ "$FAIL" -ne "$before" ] || pass "3b6a: post-probe terminal classification preserves a supported markerless refusal"
+}
+
+test_selected_comment_structural_failure_fails_closed() {
+  local dir rc before=$FAIL
+
+  dir=$(make_case "selected-comment-structural-failure-main" "$REVIEW_BODY_CLEAN")
+  sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=2 run_case "$dir")
+  [ "$rc" = "3" ] || fail "3b6b main: structural classification failure must stop polling with infra, got $rc; err=$(tail -6 "$dir/err.log")"
+  grep -q 'could not structurally classify the latest CodeRabbit comment' "$dir/err.log" || fail "3b6b main: expected fail-closed structural-classification diagnostic"
+
+  dir=$(make_case "selected-comment-structural-failure-terminal" "$REVIEW_BODY_CLEAN")
+  sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+  sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 0/' "$dir/.github/review-policy.yml"
+  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=2 run_case "$dir")
+  [ "$rc" = "4" ] || fail "3b6b terminal: structural classification failure must preserve advisory timeout, got $rc; err=$(tail -6 "$dir/err.log")"
+  grep -q 'could not be structurally classified' "$dir/err.log" || fail "3b6b terminal: expected suppressed terminal-upgrade diagnostic"
+  [ "$FAIL" -ne "$before" ] || pass "3b6b: selected-comment structural reader failure stops polling and suppresses terminal clearance"
 }
 
 test_provider_leading_nonreview_run_stays_refused() {
@@ -749,11 +830,13 @@ Here is a summary of where things stand.' ;;
 
 test_status_probe_does_not_supersede_refusal() {
   local mode reply dir rc before=$FAIL
-  for mode in wrapped wrapped-summary-whitespace wrapped-incremental bare actions-performed actions-performed-split; do
+  for mode in wrapped wrapped-summary-whitespace wrapped-incremental mention mention-apostrophe bare actions-performed actions-performed-split; do
     case "$mode" in
       wrapped) reply=$WRAPPED_STATUS_PROBE_BODY ;;
       wrapped-summary-whitespace) reply=$WRAPPED_SUMMARY_STATUS_PROBE_BODY ;;
       wrapped-incremental) reply=$WRAPPED_INCREMENTAL_STATUS_PROBE_BODY ;;
+      mention) reply=$MENTION_STATUS_PROBE_BODY ;;
+      mention-apostrophe) reply=$MENTION_APOSTROPHE_STATUS_PROBE_BODY ;;
       bare) reply=$BARE_STATUS_PROBE_BODY ;;
       actions-performed) reply=$ACTIONS_PERFORMED_STATUS_PROBE_BODY ;;
       actions-performed-split) reply=$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY ;;
@@ -773,11 +856,13 @@ test_status_probe_does_not_supersede_refusal() {
 # narration must be skipped and the older refusal retained.
 test_structural_status_probes_are_excluded_by_polling_selector() {
   local mode reply dir rc before=$FAIL
-  for mode in actions-performed-split wrapped-summary-whitespace wrapped-incremental; do
+  for mode in actions-performed-split wrapped-summary-whitespace wrapped-incremental mention mention-apostrophe; do
     case "$mode" in
       actions-performed-split) reply=$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY ;;
       wrapped-summary-whitespace) reply=$WRAPPED_SUMMARY_STATUS_PROBE_BODY ;;
       wrapped-incremental) reply=$WRAPPED_INCREMENTAL_STATUS_PROBE_BODY ;;
+      mention) reply=$MENTION_STATUS_PROBE_BODY ;;
+      mention-apostrophe) reply=$MENTION_APOSTROPHE_STATUS_PROBE_BODY ;;
     esac
     dir=$(make_case "polling-refusal-before-$mode-status-probe" "$RATE_LIMIT_BODY_HEADREF" \
       "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
@@ -2592,6 +2677,8 @@ test_refusal_quoting_narration_outranks_older_comment
 test_current_refusal_with_nonbenign_head_review_stays_refused
 test_current_refusal_with_review_quoting_progress_clears
 test_legacy_leading_refusal_stays_current
+test_markerless_refusal_does_not_clear_at_terminal_probe
+test_selected_comment_structural_failure_fails_closed
 test_provider_leading_nonreview_run_stays_refused
 test_status_probe_does_not_supersede_refusal
 test_structural_status_probes_are_excluded_by_polling_selector
