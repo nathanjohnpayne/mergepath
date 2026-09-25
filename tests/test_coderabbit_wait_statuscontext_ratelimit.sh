@@ -303,6 +303,13 @@ RATE_LIMIT_BODY_LONG_WINDOW='<!-- This is an auto-generated comment: rate limite
 
 <!-- end of auto-generated comment: rate limited by coderabbit.ai -->'
 
+# The supported markerless heading with the same long published window. Once
+# it ages past the anchored scan, crw_active_rate_limit_notice is the only path
+# that can preserve its retry/stall semantics.
+LEGACY_REVIEW_LIMIT_BODY_LONG_WINDOW='Review limit reached
+
+Next review available in: 59 minutes'
+
 # make_case <name> <comment_body> [status_time] [status_description]
 #          [comment_time] [freshness_window]
 #   status_time         when the CodeRabbit StatusContext success was created
@@ -1002,18 +1009,24 @@ test_completed_description_still_clears() {
 # description fix, the second run on #909 would still have cleared had
 # CodeRabbit stamped its stale success differently.
 test_aged_notice_with_open_window_suppresses() {
-  local dir rc before=$FAIL
-  dir=$(make_case "aged-open-window" "$RATE_LIMIT_BODY_LONG_WINDOW" \
-    "$STATUS_AFTER_NOTICE" "Review completed" "$NOTICE_AGED_TIME" 1800)
-  rc=$(run_case "$dir")
-  [ "$rc" != "0" ] || fail "9: FALSE-CLEARED (exit 0) after the rate-limit notice aged out of the freshness window; err=$(tail -4 "$dir/err.log")"
-  [ "$rc" = "5" ] || fail "9: expected exit 5 (rate_limit_stalled), got $rc; err=$(tail -4 "$dir/err.log")"
-  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "9: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
-  # #891 acceptance 4: the failover that compensates for a lost CodeRabbit
-  # round came back `false` on the #909 false clear. It must still fire.
-  [ "$(jqf "$dir" '.codex_failover_requested')" = "true" ] || fail "9: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected true"
-  [ "$(stub_calls "$dir")" = "1" ] || fail "9: Codex failover invoked $(stub_calls "$dir") time(s), expected 1"
-  grep -q 'clearance remains suppressed' "$dir/err.log" || fail "9: expected the current-refusal suppression log; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  local mode body dir rc before=$FAIL
+  for mode in marked markerless; do
+    case "$mode" in
+      marked) body=$RATE_LIMIT_BODY_LONG_WINDOW ;;
+      markerless) body=$LEGACY_REVIEW_LIMIT_BODY_LONG_WINDOW ;;
+    esac
+    dir=$(make_case "aged-open-window-$mode" "$body" \
+      "$STATUS_AFTER_NOTICE" "Review completed" "$NOTICE_AGED_TIME" 1800)
+    rc=$(run_case "$dir")
+    [ "$rc" != "0" ] || fail "9 $mode: FALSE-CLEARED (exit 0) after the rate-limit notice aged out of the freshness window; err=$(tail -4 "$dir/err.log")"
+    [ "$rc" = "5" ] || fail "9 $mode: expected exit 5 (rate_limit_stalled), got $rc; err=$(tail -4 "$dir/err.log")"
+    [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "9 $mode: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+    # #891 acceptance 4: the failover that compensates for a lost CodeRabbit
+    # round came back `false` on the #909 false clear. It must still fire.
+    [ "$(jqf "$dir" '.codex_failover_requested')" = "true" ] || fail "9 $mode: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected true"
+    [ "$(stub_calls "$dir")" = "1" ] || fail "9 $mode: Codex failover invoked $(stub_calls "$dir") time(s), expected 1"
+    grep -q 'clearance remains suppressed' "$dir/err.log" || fail "9 $mode: expected the current-refusal suppression log; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  done
   [ "$FAIL" -ne "$before" ] || pass "9: #891/#912 — an aged-out notice with an OPEN published window still governs → no clear, failover fires, exit 5"
 }
 

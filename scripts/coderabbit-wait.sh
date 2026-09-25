@@ -2763,7 +2763,9 @@ newest_bot_comment_for_refusal_guard() {
 #                      CodeRabbit's current word. Without this, a 59-minute
 #                      window would mask a genuine review that landed 20
 #                      minutes into it.
-#   classifies rate_limit  via the shared classifier, marker-first (#593).
+#   classifies rate_limit  via the structural-first selected-comment
+#                      classifier, with the legacy marker-first classifier as
+#                      its nonmatch fallback (#593/#956).
 #   window still open  `parse_rate_limit_window` must yield a window AND
 #                      fresh_at + window + buffer must be in the future. A
 #                      notice publishing no parseable window governs nothing
@@ -2774,7 +2776,7 @@ newest_bot_comment_for_refusal_guard() {
 # suppressing direction.
 crw_active_rate_limit_notice() {
   local issue_comments=${1:-}
-  local latest body window fresh_at elapsed remaining
+  local latest body class class_rc=0 window fresh_at elapsed remaining
   if [ -z "$issue_comments" ]; then
     issue_comments=$(fetch_api_array_best_effort "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || return 3
   fi
@@ -2784,7 +2786,9 @@ crw_active_rate_limit_notice() {
   latest=$(newest_bot_comment_from_issue_comments "$issue_comments") || return 3
   [ "$(echo "$latest" | jq 'length')" != "0" ] || return 1
   body=$(echo "$latest" | jq -r '.body')
-  [ "$(classify_comment "$body")" = "rate_limit" ] || return 1
+  class=$(crw_classify_selected_comment "$body") || class_rc=$?
+  [ "$class_rc" != "3" ] || return 3
+  [ "$class" = "rate_limit" ] || return 1
   window=$(parse_rate_limit_window "$body") || return 1
   fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
   elapsed=$(rate_limit_window_elapsed_seconds "$fresh_at" "$(date +%s)")
