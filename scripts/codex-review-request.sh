@@ -1391,7 +1391,7 @@ governing_request_attempt_cap() {
   # The cap protects the request WRITE, so the policy controlling it must be
   # the PR's governing base policy. Reading only $CONFIG here lets a candidate
   # raise its own budget before asking for another scarce provider review.
-  local base_cfg base_json base_cap resolver rc=0
+  local base_cfg base_json base_cap base_author resolver rc=0
   GOVERNING_REQUEST_ATTEMPT_CAP=""
 
   resolver="$__CODEX_REQUEST_DIR/workflow/resolve_base_policy.sh"
@@ -1416,7 +1416,22 @@ governing_request_attempt_cap() {
   rc=$?
   set -e
   [ "$rc" -eq 0 ] && [ -n "$base_json" ] \
-    || die 3 "cannot read codex.max_review_rounds from the governing base policy; refusing a new '@codex review' trigger"
+    || die 3 "cannot read the governing review policy; refusing a new '@codex review' trigger"
+  base_author=$(printf '%s' "$base_json" | jq -er '
+    if type != "object" then
+      error("governing policy must be an object")
+    elif has("author_identity") then
+      if ((.author_identity | type) == "string") and ((.author_identity | length) > 0) then
+        .author_identity
+      else
+        error("governing author_identity must be a nonempty string")
+      end
+    else
+      "nathanjohnpayne"
+    end
+  ') || die 3 "cannot read author_identity from the governing base policy; refusing a new '@codex review' trigger"
+  [ "$AUTHOR_IDENTITY" = "$base_author" ] \
+    || die 3 "candidate author_identity '$AUTHOR_IDENTITY' does not match the governing base policy author_identity '$base_author'; refusing a new '@codex review' trigger"
   base_cap=$(printf '%s' "$base_json" | jq -r '
     if (type != "object") then
       "__invalid__"

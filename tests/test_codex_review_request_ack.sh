@@ -798,6 +798,7 @@ test_bridge_passes_configured_author_identity() {
   # Custom author_identity repo (Codex P2 on PR #442): the wrapper must
   # be told to verify the configured login, not its stock default.
   printf 'author_identity: custom-owner\n' >>"$dir/.github/review-policy.yml"
+  printf 'author_identity: custom-owner\n' >>"$dir/state/base-review-policy.yml"
   cat >"$dir/scripts/identity-check.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -818,6 +819,50 @@ EOF
   else
     pass "bridge passes the configured author_identity to the wrapper (rc=$rc)"
   fi
+}
+
+test_candidate_author_cannot_reset_governing_request_cap() {
+  local dir rc before=$FAIL i
+  dir=$(make_case "candidate-author-cap-reset" 0 0)
+  # The governing author has already consumed every request slot. Before the
+  # write-boundary identity check, selecting a different candidate identity
+  # omitted those requests and let a verified token post another command.
+  printf '  max_review_rounds: 10\n' >>"$dir/state/base-review-policy.yml"
+  i=1
+  while [ "$i" -le 10 ]; do
+    seed_author_trigger "$dir" "$((9000 + i))" "2026-06-03T00:00:00Z"
+    i=$((i + 1))
+  done
+  printf 'author_identity: custom-owner\n' >>"$dir/.github/review-policy.yml"
+  cat >"$dir/scripts/identity-check.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = "--expect-token-identity" ] || exit 2
+[ "${2:-}" = "custom-owner" ] || exit 1
+[ "${GH_TOKEN:-}" = "author-pat-123" ] || exit 1
+exit 0
+EOF
+  chmod +x "$dir/scripts/identity-check.sh"
+
+  rc=$(run_case "$dir" absent 0 author-pat-123)
+  [ "$rc" = 3 ] || fail "#813 governing author mismatch: expected infrastructure exit 3, got $rc; stderr=$(cat "$dir/err.log")"
+  [ "$(trigger_count "$dir")" = 0 ] || fail "#813 governing author mismatch: candidate identity posted beyond the governing author's cap"
+  grep -q 'candidate author_identity.*governing base policy' "$dir/err.log" \
+    || fail "#813 governing author mismatch: refusal did not identify the policy mismatch"
+  [ "$FAIL" -ne "$before" ] || pass "#813: candidate author_identity cannot reset the governing request-attempt count"
+}
+
+test_invalid_governing_author_refuses_new_write() {
+  local value dir rc before
+  for value in false null '[]'; do
+    before=$FAIL
+    dir=$(make_case "governing-author-$value" 0 0)
+    printf 'author_identity: %s\n' "$value" >>"$dir/state/base-review-policy.yml"
+    rc=$(run_case "$dir" absent)
+    [ "$rc" = 3 ] || fail "#813 malformed governing author $value: expected infrastructure exit 3, got $rc; stderr=$(cat "$dir/err.log")"
+    [ "$(trigger_count "$dir")" = 0 ] || fail "#813 malformed governing author $value: posted despite invalid governed identity"
+    [ "$FAIL" -ne "$before" ] || pass "#813: present malformed governing author_identity $value refuses a new request write"
+  done
 }
 
 test_non_author_token_is_not_bridged() {
@@ -846,6 +891,7 @@ test_non_bridge_path_passes_configured_identity() {
   # Single-quoted on purpose: the parser must strip both YAML quote
   # styles (Codex P2 r9).
   printf "author_identity: 'custom-owner'\n" >>"$dir/.github/review-policy.yml"
+  printf "author_identity: 'custom-owner'\n" >>"$dir/state/base-review-policy.yml"
   rc=$(run_case "$dir" absent 0 reviewer-pat-456)
   identity=$(head -1 "$dir/state/author-identity-env" 2>/dev/null || printf '')
 
@@ -989,6 +1035,8 @@ test_retry_preserves_original_trigger_response
 test_ack_wait_window_is_bounded
 test_inline_author_pat_bridged_into_wrapper
 test_bridge_passes_configured_author_identity
+test_candidate_author_cannot_reset_governing_request_cap
+test_invalid_governing_author_refuses_new_write
 test_non_author_token_is_not_bridged
 test_non_bridge_path_passes_configured_identity
 test_missing_identity_checker_skips_bridge
