@@ -2041,21 +2041,36 @@ crw_rate_limit_hides_a_finding() {
 # does not fire for "could not read the comments". Control then fell through to
 # `classify_comment ""`, which grades `review`, the one class whose arm can
 # emit a clearance.
-latest_comment_from_issue_comments() {
-  local issue_comments=$1
-  local latest projected
-  latest=$(echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
-    def status_probe_reply:
-      ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
+crw_select_latest_non_narration_comment() {
+  local issue_comments=$1 after=${2:-} candidates encoded comment body owned owned_rc projected
+  candidates=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg after "$after" '
     [ .[]
       | select(.user.login == $bot)
       | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
-      | select(.fresh_at >= $after)
-      | select(status_probe_reply | not)
+      | select($after == "" or .fresh_at >= $after)
     ]
     | sort_by(.fresh_at)
-    | last // null
-  ') || {
+    | reverse[]
+    | @base64
+  ') || return 3
+  while IFS= read -r encoded; do
+    [ -n "$encoded" ] || continue
+    comment=$(printf '%s' "$encoded" | base64 --decode) || return 3
+    body=$(printf '%s' "$comment" | jq -r '.body // ""') || return 3
+    owned_rc=0
+    owned=$(crw_provider_owned_refusal_class "$body") || owned_rc=$?
+    [ "$owned_rc" != "3" ] || return 3
+    [ "$owned" = "status_probe" ] && continue
+    projected=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}') || return 3
+    printf '%s\n' "$projected"
+    return 0
+  done <<<"$candidates"
+  printf '{}\n'
+}
+
+latest_comment_from_issue_comments() {
+  local issue_comments=$1 latest
+  latest=$(crw_select_latest_non_narration_comment "$issue_comments" "$HEAD_ANCHOR") || {
     log "ERROR: failed to decode the CodeRabbit comment list — the comments are UNREAD, not empty"
     return 3
   }
@@ -2069,15 +2084,7 @@ latest_comment_from_issue_comments() {
     return 3
   fi
 
-  if [ "$latest" = "null" ]; then
-    echo '{}'
-    return 0
-  fi
-  projected=$(echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}') || {
-    log "ERROR: failed to project the selected CodeRabbit comment — the comment is UNREAD, not absent"
-    return 3
-  }
-  printf '%s\n' "$projected"
+  printf '%s\n' "$latest"
 }
 
 scan_latest_comment() {
@@ -2643,19 +2650,8 @@ rate_limit_window_elapsed_seconds() {
 # the comments" as "there is no active rate-limit notice", which is the
 # NON-suppressing answer.
 newest_bot_comment_from_issue_comments() {
-  local issue_comments=$1
-  local latest projected
-  latest=$(echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" '
-    def status_probe_reply:
-      ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
-    [ .[]
-      | select(.user.login == $bot)
-      | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
-      | select(status_probe_reply | not)
-    ]
-    | sort_by(.fresh_at)
-    | last // null
-  ') || {
+  local issue_comments=$1 latest
+  latest=$(crw_select_latest_non_narration_comment "$issue_comments" "") || {
     log "ERROR: failed to decode the CodeRabbit comment list while looking for its newest comment — the comments are UNREAD, not empty"
     return 3
   }
@@ -2663,15 +2659,15 @@ newest_bot_comment_from_issue_comments() {
     log "ERROR: the newest-comment decode produced no value at all — treating the comments as UNREAD"
     return 3
   fi
-  if [ "$latest" = "null" ]; then
-    echo '{}'
-    return 0
-  fi
-  projected=$(echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}') || {
-    log "ERROR: failed to project the newest CodeRabbit comment — the comment is UNREAD, not absent"
-    return 3
-  }
-  printf '%s\n' "$projected"
+  printf '%s\n' "$latest"
+}
+
+# Refusal-gate selector: skip only structurally provider-owned narration.
+# The generic selector above intentionally uses a broad narration substring
+# filter. That filter cannot decide this gate because CodeRabbit's mutable
+# refusal summary may quote the same prose in a walkthrough or diff excerpt.
+newest_bot_comment_for_refusal_guard() {
+  newest_bot_comment_from_issue_comments "$1"
 }
 
 # Seconds still remaining on the published window ride along ON the emitted
@@ -2784,7 +2780,7 @@ status_context_fast_path_blocked_by_comment() {
   # fast path: a body-bearing review run pinned to HEAD.  The shared selector
   # deliberately excludes body-less acknowledgement wrappers (#900/#919).
   # Failed reads/derivations suppress clearance; absence is not proof of a run.
-  current=$(newest_bot_comment_from_issue_comments "$issue_comments") || {
+  current=$(newest_bot_comment_for_refusal_guard "$issue_comments") || {
     log "StatusContext success suppressed: the newest CodeRabbit comment could not be decoded, so a current pause/rate-limit refusal cannot be ruled out — keep polling (#956)"
     return 0
   }

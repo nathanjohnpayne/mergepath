@@ -90,7 +90,11 @@ SUMMARY_BODY_WITH_RATE_LIMIT_STANZA='<!-- This is an auto-generated comment: sum
 > [!WARNING]
 > ## Review limit reached
 >
-> **Next review available in:** **13 minutes**'
+> **Next review available in:** **13 minutes**
+
+```
+CodeRabbit is an incremental review system.
+```'
 
 LEGACY_RATE_LIMIT_BODY='Rate limit exceeded
 
@@ -593,6 +597,25 @@ test_summary_owned_refusal_stays_current() {
   [ "$rc" = "5" ] || fail "3b3: summary-owned refusal stanza should remain rate-limit-stalled, got $rc; err=$(tail -5 "$dir/err.log")"
   grep -q 'grading-only because CodeRabbit.*rate_limit' "$dir/err.log" || fail "3b3: summary-owned refusal was not recognized as provider state"
   [ "$FAIL" -ne "$before" ] || pass "3b3: an unfenced provider-owned refusal stanza inside the summary remains authoritative"
+}
+
+test_refusal_quoting_narration_outranks_older_comment() {
+  local dir rc before=$FAIL
+  dir=$(make_case "refusal-quotes-narration-over-chat" "$CHAT_REPLY_AFTER_SUMMARY" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$SUMMARY_BODY_WITH_RATE_LIMIT_STANZA" "$NOTICE_AFTER_SUMMARY_TIME")
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] || fail "3b3a: current refusal quoting narration should outrank older comment, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b3a: polling cleared from the older comment underneath the refusal"
+
+  dir=$(make_case "refusal-quotes-narration-terminal" "$CHAT_REPLY_AFTER_SUMMARY" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$SUMMARY_BODY_WITH_RATE_LIMIT_STANZA" "$NOTICE_AFTER_SUMMARY_TIME")
+  sed -i.bak 's/max_wait_seconds: 15/max_wait_seconds: 0/' "$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir")
+  [ "$rc" != "0" ] || fail "3b3a terminal: post-probe upgrade cleared from the older comment underneath the refusal"
+  [ "$(jqf "$dir" '.status')" != "cleared" ] || fail "3b3a terminal: status unexpectedly cleared"
+  [ "$FAIL" -ne "$before" ] || pass "3b3a: a current refusal quoting narration survives both polling and terminal-upgrade selection"
 }
 
 test_current_refusal_with_nonbenign_head_review_stays_refused() {
@@ -2438,6 +2461,7 @@ test_final_risk_marker_fallback
 test_quoted_refusal_marker_is_not_current_refusal
 test_current_refusal_with_blocking_head_review_is_findings
 test_summary_owned_refusal_stays_current
+test_refusal_quoting_narration_outranks_older_comment
 test_current_refusal_with_nonbenign_head_review_stays_refused
 test_current_refusal_with_review_quoting_progress_clears
 test_legacy_leading_refusal_stays_current
