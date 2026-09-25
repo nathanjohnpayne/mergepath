@@ -946,6 +946,13 @@ emit_skip_line() {
 
 # Filter helpers — return 0 (truthy) if the entry passes the filter,
 # 1 otherwise. FILTER_REPOS / FILTER_PATHS are global vars set from CLI.
+consumer_matches_repo_selector() {
+  local name=$1
+  local repo=$2
+  local selector=$3
+  [ "$selector" = "$name" ] || [ "$selector" = "$repo" ]
+}
+
 in_repo_filter() {
   local name=$1
   local repo=$2
@@ -954,7 +961,7 @@ in_repo_filter() {
   local -a selectors=()
   IFS=',' read -r -a selectors <<< "$FILTER_REPOS"
   for selector in "${selectors[@]}"; do
-    if [ "$selector" = "$name" ] || [ "$selector" = "$repo" ]; then
+    if consumer_matches_repo_selector "$name" "$repo" "$selector"; then
       return 0
     fi
   done
@@ -991,7 +998,7 @@ validate_filters() {
       found=0
       while IFS=$'\t' read -r consumer_name consumer_repo; do
         [ -z "$consumer_name" ] && continue
-        if [ "$selector" = "$consumer_name" ] || [ "$selector" = "$consumer_repo" ]; then
+        if consumer_matches_repo_selector "$consumer_name" "$consumer_repo" "$selector"; then
           found=1
           break
         fi
