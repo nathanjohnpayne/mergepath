@@ -2166,6 +2166,20 @@ EOF
     return
   fi
   pass "test_failed_fetch_does_not_evict_shared_deploy_files: a failed refresh strips only its own context's pre-slot entry"
+
+  # 7. Pre-slot shared ADC is never a Firebase project's credential: after
+  #    proj-gamma's failed refresh removes its slot, a plain deploy must not
+  #    fall back to a pre-slot ADC entry in the session file.
+  make_aged_cache "$cache_dir" claude 0 "ne-reviewer-pat" "ne-author-pat"
+  printf '{"type": "service_account", "client_email": "shared-adc@example.iam.gserviceaccount.com"}\n' > "$cache_dir/legacy-adc.json"
+  printf 'GOOGLE_APPLICATION_CREDENTIALS=%s\nOP_PREFLIGHT_ADC_TMPFILE=%s\n' "$cache_dir/legacy-adc.json" "$cache_dir/legacy-adc.json" \
+    >> "$cache_dir/op-preflight-claude.env"
+  run_deploy deploy-refresh-fail-4 --refresh || true
+  if run_deploy deploy-after-fail-4; then
+    fail "no-evict: after a failed --refresh in proj-gamma, plain --mode deploy reused pre-slot shared ADC; out=$(grep -v PAT "$case_dir/proj-gamma/deploy-after-fail-4.out")"
+    return
+  fi
+  pass "test_failed_fetch_does_not_evict_shared_deploy_files: pre-slot shared ADC is never reused for a Firebase project"
 }
 
 # ---------------------------------------------------------------------------
@@ -2284,6 +2298,10 @@ test_firebaserc_parsers_agree() {
     'lone-surrogate-in-root-key|{ "pro\ud800jects": { "default": "wrong" }, "x": 1 }'
     'lone-surrogate-in-default-key|{ "projects": { "def\udc00ault": "wrong", "default": "right" } }'
     'lone-surrogate-key-only|{ "projects": { "def\ud800ault": "wrong" } }'
+    'nul-in-root-key|{ "pro\u0000jects": { "default": "wrong" } }'
+    'nul-in-default-value|{ "projects": { "default": "prod\u0000evil" } }'
+    'newline-in-default-value|{ "projects": { "default": "a\nb" } }'
+    'del-in-default-value|{ "projects": { "default": "a\u007fb" } }'
     'truncated-then-garbage|{"projects":{"default":"prod"}} BROKEN'
     'unclosed-root|{"projects":{"default":"prod"}'
     'trailing-comma|{"projects":{"default":"prod",}}'
@@ -2409,6 +2427,40 @@ test_newer_pre_slot_write_supersedes_slot() {
   pass "test_newer_pre_slot_write_supersedes_slot: newer pre-slot deploy fields win, older ones do not, other contexts never"
 }
 
+# ---------------------------------------------------------------------------
+# test_firebaserc_project_cannot_inject_into_slot (Phase 4b on #1318, P1): the
+# slot is SOURCED on the next read, and a .firebaserc project decoded from
+# JSON escapes can contain newlines. Written raw into the slot's header
+# comment, `"x\n<command>\n#"` became executable lines, run with the cached
+# PATs loaded. Both parsers now reject control characters in a project, and
+# the slot never carries a raw value.
+# ---------------------------------------------------------------------------
+test_firebaserc_project_cannot_inject_into_slot() {
+  local case_dir="$WORKDIR/slot-injection"
+  local cache_dir="$case_dir/cache" bin_dir="$case_dir/bin" marker="$case_dir/INJECTED" f line
+  mkdir -p "$cache_dir" "$bin_dir"
+  make_degraded_op_stub "$bin_dir" "$case_dir/op.log"
+  printf '{ "projects": { "default": "x\\ntouch %s\\n#" } }\n' "$marker" > "$case_dir/.firebaserc"
+  run_all_mode "$case_dir" "$cache_dir" "$bin_dir" first || true
+  run_all_mode "$case_dir" "$cache_dir" "$bin_dir" second || true
+  (cd "$case_dir" && PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent claude --mode all --check >/dev/null 2>&1) || true
+  if [ -e "$marker" ]; then
+    fail "slot-injection: a .firebaserc project name executed as shell code"
+    return
+  fi
+  for f in "$cache_dir"/*.slot; do
+    [ -e "$f" ] || continue
+    while IFS= read -r line; do
+      case "$line" in
+        '#'*|[A-Z_]*=*) ;;
+        *) fail "slot-injection: $f carries a raw non-assignment line: $line"; return ;;
+      esac
+    done < "$f"
+  done
+  pass "test_firebaserc_project_cannot_inject_into_slot: an escaped-newline project name is rejected and never reaches the slot raw"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -2445,6 +2497,7 @@ test_check_selects_same_deploy_context_without_python
 test_deploy_failure_clears_inherited_credentials
 test_firebaserc_parsers_agree
 test_newer_pre_slot_write_supersedes_slot
+test_firebaserc_project_cannot_inject_into_slot
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

@@ -400,7 +400,10 @@ try:
     project = json.loads(pathlib.Path(".firebaserc").read_text())["projects"]["default"]
 except Exception:
     sys.exit(1)
-if not isinstance(project, str) or not project:
+# A project containing control characters (newline, NUL, ...) is not a
+# usable Firebase project id and must never reach a cache file or a vault
+# item name; both .firebaserc parsers reject it identically.
+if not isinstance(project, str) or not project or any(ord(ch) < 32 or ord(ch) == 127 for ch in project):
     sys.exit(1)
 print(project)
 PY
@@ -437,7 +440,9 @@ json_string_field_no_python() {
 # escapes are decoded like json.loads (\uXXXX -> UTF-8, surrogate pairs
 # joined; LC_ALL=C so %c emits raw bytes in every awk); a lone surrogate,
 # which python cannot print, yields no project (and in a KEY never aliases
-# an ordinary key). It is ALSO a strict JSON
+# an ordinary key); an escaped NUL is treated the same way, since awk cannot
+# represent it. A project containing any control character is rejected by
+# both parsers. It is ALSO a strict JSON
 # validator (grammar, trailing input, number/literal forms including
 # json.loads' NaN/Infinity, raw control characters, UTF-8 validity): a
 # malformed or truncated .firebaserc selects no project, as python and the
@@ -497,6 +502,7 @@ firebaserc_default_project_no_python() {
                   if (lo >= 56320 && lo <= 57343) { cp = 65536 + (cp - 55296) * 1024 + (lo - 56320); i += 6 }
                   else { bad = 1; continue }
                 } else if (cp >= 56320 && cp <= 57343) { bad = 1; continue }
+                if (cp == 0) { bad = 1; continue }
                 str = str utf8(cp)
               }
               else if (c == "\"" || c == "\\" || c == "/") str = str c
@@ -585,6 +591,9 @@ firebaserc_default_project_no_python() {
         after_value()
       }
       if (expect != "done" || !seen || val == "") exit 1
+      # Control characters (newline, DEL, ...) are rejected exactly as the
+      # python parser rejects them: never a usable project id.
+      if (val ~ /[\001-\037\177]/) exit 1
       print val
     }
   ' .firebaserc
@@ -1005,7 +1014,9 @@ emit_from_session_file() (
         legacy_supersedes_slot=true
       fi
     fi
+    slot_loaded=false
     if [[ -f "$deploy_slot_file" ]] && ! $legacy_supersedes_slot; then
+      slot_loaded=true
       # A pre-slot writer persists CF_API_TOKEN whether or not its deploy
       # credential loaded, so a newer session-file token must survive the
       # slot load on its own (Codex on #1318). Slot-aware writers never put
@@ -1038,6 +1049,17 @@ emit_from_session_file() (
           exit 3
         fi
       fi
+    fi
+    # With no slot in play, pre-slot session fields obey the same context
+    # rule as everywhere else: pre-slot ADC (which records no project) is
+    # never a Firebase project's credential. Otherwise a failed --refresh
+    # there (which removes the slot) would be followed by a plain deploy
+    # that silently reuses the old ADC file (Phase 4b on #1318). A pre-slot
+    # SA is checked against the project by the validation below.
+    if ! $slot_loaded && [[ -n "$current_firebase_project" && -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] \
+       && ! [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" \
+               && "$GOOGLE_APPLICATION_CREDENTIALS" == "$OP_PREFLIGHT_FIREBASE_SA_TMPFILE" ]]; then
+      exit 2
     fi
   fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]] && ! $deploy_degraded_hit; then
@@ -1743,7 +1765,12 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   deploy_slot_staged="$(mktemp "$CACHE_DIR/op-preflight-$AGENT-deploy-slot.staged.XXXXXX")"
   {
     printf '# op-preflight deploy-credential slot — do NOT edit by hand.\n'
-    printf '# Agent: %s  Context: %s\n' "$AGENT" "${firebase_project:-<no .firebaserc: GCP ADC>}"
+    # The slot is SOURCED on the next read, so nothing here may be written
+    # raw: a .firebaserc project decoded from JSON escapes can contain
+    # newlines, and an unescaped comment line would turn them into commands
+    # (Phase 4b on #1318). Every value is %q-quoted; the comment carries
+    # only the slug, which deploy_context_slug restricts to [A-Za-z0-9_-].
+    printf '# Agent: %s  Context: %s\n' "$AGENT" "$(deploy_context_slug "$firebase_project")"
     printf 'OP_PREFLIGHT_DEPLOY_CREATED_AT_EPOCH=%s\n' "$CREATED_AT"
     printf 'OP_PREFLIGHT_DEPLOY_CONTEXT=%q\n' "$firebase_project"
     for line in "${DEPLOY_SLOT_LINES[@]}"; do
