@@ -2849,6 +2849,7 @@ status_context_fast_path_blocked_by_comment() {
   local issue_comments current latest class comment_id comment_created_at comment_fresh_at comment_body
   local current_length
   local current_class current_rc reviews head_run review_rc run_id run_body run_class run_class_rc marker_rc
+  local run_submitted_at accepted_after_rc
   local active_notice active_id active_remaining active_rc
   # A current refusal with no run still enters the verdict scanner so existing
   # inline/summary findings are surfaced immediately.  The scanner consults
@@ -2954,6 +2955,25 @@ status_context_fast_path_blocked_by_comment() {
             log "StatusContext success is grading-only: body-bearing current-HEAD review id=$run_id carries a non-benign generated stanza (#956)"
             return 1
           fi
+          run_submitted_at=$(printf '%s' "$head_run" \
+            | jq -er '.submitted_at | select(type == "string" and length > 0)') || {
+            log "StatusContext success suppressed: body-bearing current-HEAD review id=$run_id has no readable submission time, so a later accepted replacement trigger cannot be ruled out — keep polling (#956)"
+            return 0
+          }
+          accepted_after_rc=0
+          crw_newer_review_trigger_accepted "$issue_comments" "$run_submitted_at" \
+            || accepted_after_rc=$?
+          case "$accepted_after_rc" in
+            0)
+              log "StatusContext success suppressed: CodeRabbit acknowledged a replacement review after body-bearing current-HEAD review id=$run_id completed — keep polling for that newer run (#956)"
+              return 0
+              ;;
+            1) : ;;
+            *)
+              log "StatusContext success suppressed: accepted-trigger evidence could not be read relative to body-bearing current-HEAD review id=$run_id — keep polling (#956)"
+              return 0
+              ;;
+          esac
           STATUS_CONTEXT_CLEARANCE_RUN_ID=$run_id
           STATUS_CONTEXT_CLEARANCE_RUN_BODY=$run_body
           log "StatusContext success may proceed despite CodeRabbit's current $current_class comment: body-bearing review id=$(printf '%s' "$head_run" | jq -r '.id') is pinned to current HEAD $HEAD_SHA (#956)"
@@ -4435,6 +4455,44 @@ crw_review_trigger_accepted() {
     'review triggered.'|'full review triggered.') return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# True (0) when an already-fetched CodeRabbit issue-comment list contains a
+# structurally accepted review-trigger acknowledgement strictly newer than the
+# selected completed run's submitted_at; 1 when it does not; 3 when ordering or
+# acknowledgement evidence cannot be read. The refusal-release path uses this
+# immediately before crediting an older clean run, so a replacement run that
+# has started cannot inherit that run's clearance (#956).
+crw_newer_review_trigger_accepted() {
+  local issue_comments=$1 run_submitted_at=$2
+  local rows row body accepted_rc
+  rows=$(printf '%s' "$issue_comments" | jq -r \
+    --arg bot "$BOT_LOGIN" --arg submitted "$run_submitted_at" '
+      def epoch:
+        if type != "string" then error("timestamp is not a string")
+        else try fromdateiso8601 catch error("timestamp is not ISO-8601")
+        end;
+      ($submitted | epoch) as $run_epoch
+      | [ .[]
+          | select(.user.login == $bot)
+          | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+          | select((.fresh_at | epoch) > $run_epoch)
+          | (.body // "")
+          | @base64 ]
+      | .[]
+    ') || return 3
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    body=$(printf '%s' "$row" | base64 --decode 2>/dev/null) || return 3
+    accepted_rc=0
+    crw_review_trigger_accepted "$body" || accepted_rc=$?
+    case "$accepted_rc" in
+      0) return 0 ;;
+      1) ;;
+      *) return 3 ;;
+    esac
+  done <<<"$rows"
+  return 1
 }
 
 # Same-content carry-forward evidence (#1335). <summary-body>

@@ -1141,6 +1141,25 @@ test_current_refusal_with_bodyless_ack_stays_refused() {
   [ "$FAIL" -ne "$before" ] || pass "3c: #956 — a body-less exact-head acknowledgement cannot clear the current refusal"
 }
 
+test_refusal_release_waits_for_later_accepted_trigger() {
+  local dir rc before=$FAIL reviews body kind expected
+  reviews='[{"id":8801,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:10Z","body":"**Actionable comments posted: 0**"}]'
+  for kind in rate-limit paused; do
+    case "$kind" in rate-limit) body=$RATE_LIMIT_BODY_HEADREF ;; paused) body=$PAUSED_BODY_HEADREF ;; esac
+    dir=$(make_case "refusal-later-ack-$kind" "$body" "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
+    rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+    case "$kind" in rate-limit) expected=5 ;; paused) expected=6 ;; esac
+    [ "$rc" = "$expected" ] || fail "1424 $kind: later accepted trigger expected $expected, got $rc"
+    grep -q 'acknowledged a replacement review after body-bearing current-HEAD review' "$dir/err.log" \
+      || fail "1424 $kind: refusal release was not suppressed by the accepted-trigger guard"
+  done
+  reviews='[{"id":8802,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:30Z","body":"**Actionable comments posted: 0**"}]'
+  dir=$(make_case "refusal-ack-before-completed-run" "$RATE_LIMIT_BODY_HEADREF" "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "0" ] || fail "1424 control: acknowledgement before completed run should clear, got $rc"
+  [ "$FAIL" -ne "$before" ] || pass "1424: later accepted trigger suppresses refusal release; earlier trigger preserves completed-run clearance"
+}
+
 # --- Test 3d: a current pause also requires actual review evidence ----------
 test_current_pause_with_later_status_resumes_instead_of_clearing() {
   local dir rc before=$FAIL
@@ -2947,6 +2966,7 @@ test_provider_leading_nonreview_run_stays_refused
 test_status_probe_does_not_supersede_refusal
 test_structural_status_probes_are_excluded_by_polling_selector
 test_trigger_ack_is_polling_in_progress
+test_refusal_release_waits_for_later_accepted_trigger
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
