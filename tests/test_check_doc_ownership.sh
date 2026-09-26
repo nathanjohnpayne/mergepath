@@ -1712,16 +1712,16 @@ cat > "$transport_fix/bin/awk" <<'EOF'
 for arg in "$@"; do
   case "$arg" in ASCII_PUNCT=*) printf '%s\n' "${arg#ASCII_PUNCT=}" >> "$AWK_TRANSPORT_LOG" ;; esac
 done
-exec /usr/bin/awk "$@"
+exec "$AWK_TRANSPORT_DELEGATE" "$@"
 EOF
 chmod +x "$transport_fix/bin/awk"
 set +e
-out=$(PATH="$transport_fix/bin:$PATH" AWK_TRANSPORT_LOG="$transport_fix/awk-transport.log" MERGEPATH_MANIFEST_PATH="$transport_fix/manifest.yml" MERGEPATH_REPO_ROOT="$transport_fix" bash "$CHECK" 2>&1)
+out=$(PATH="$transport_fix/bin:$PATH" AWK_TRANSPORT_LOG="$transport_fix/awk-transport.log" AWK_TRANSPORT_DELEGATE="$(command -v awk)" MERGEPATH_MANIFEST_PATH="$transport_fix/manifest.yml" MERGEPATH_REPO_ROOT="$transport_fix" bash "$CHECK" 2>&1)
 rc=$?
 set -e
 transport_count=$(wc -l < "$transport_fix/awk-transport.log" | tr -d ' ')
 transport_bad=$(grep -Fvc '@[\\]' "$transport_fix/awk-transport.log" || true)
-if [ "$rc" = "1" \
+if [ "$rc" = "1" ] \
    && echo "$out" | grep -Fq "references the hub-only doc 'docs/agents/hub\(1).md' by a relative Markdown link" \
    && [ "$transport_count" -gt 0 ] && [ "$transport_bad" = "0" ]; then
   pass "Case 14u3: every ASCII punctuation transport quotes backslash before awk parses it"
