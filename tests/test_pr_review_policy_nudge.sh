@@ -728,6 +728,60 @@ check_wrapper_api_form 'gh  api -X POST' \
 check_wrapper_api_form $'gh\tapi -XPOST' \
   "the non-publication guard rejects a tab-separated gh api write"
 
+# The single check-runs spelling is authority for the nudge's observation, not
+# merely a countable token.  Never execute these fixtures: the wrapper's
+# hermetic --check lane is the subject under test.
+check_wrapper_checkrun_form() { # <replacement prefix> <expected rc> <description>
+  local replacement=$1 expected=$2 description=$3 rc=0
+  cp "$SUBJECT" "$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh"
+  REPLACEMENT="$replacement" python3 - "$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+old = 'gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs"'
+new = os.environ["REPLACEMENT"] + ' "repos/$REPO/commits/$HEAD_SHA/check-runs"'
+if text.count(old) != 1:
+    raise SystemExit("fixture could not locate the unique check-runs read")
+open(path, "w").write(text.replace(old, new))
+PY
+  env PATH="$TMP/wrapper-bin:$PATH" STUB_WRAPPER_ROOT="$WRAPPER_FIXTURE" \
+    bash "$ROOT/scripts/ci/check_pr_review_policy_nudge" --check \
+    >"$TMP/wrapper.out" 2>&1 || rc=$?
+  if [ "$rc" -eq "$expected" ] \
+     && { [ "$expected" -ne 1 ] || grep -q 'expected exactly one check-runs reference in the recognized literal read' "$TMP/wrapper.out"; }; then
+    pass "$description"
+  else
+    fail "$description: expected rc=$expected, got rc=$rc; $(cat "$TMP/wrapper.out")"
+  fi
+}
+
+check_wrapper_checkrun_form 'gh  api --paginate' 0 \
+  "the canonical check-runs read permits repeated spaces"
+check_wrapper_checkrun_form $'gh\tapi --paginate' 0 \
+  "the canonical check-runs read permits tabs"
+check_wrapper_checkrun_form $'gh api \\\n  --paginate' 0 \
+  "the canonical check-runs read permits a continued option"
+check_wrapper_checkrun_form 'curl -X POST' 1 \
+  "a sole curl POST check-runs reference is not accepted as the canonical read"
+
+# A canonical read plus another publisher-shaped reference must not pass the
+# former one-reference token count.  This is also never executed.
+cp "$SUBJECT" "$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh"
+cat >>"$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh" <<'EOF'
+curl -X POST "repos/$REPO/commits/$HEAD_SHA/check-runs"
+EOF
+rc=0
+env PATH="$TMP/wrapper-bin:$PATH" STUB_WRAPPER_ROOT="$WRAPPER_FIXTURE" \
+  bash "$ROOT/scripts/ci/check_pr_review_policy_nudge" --check \
+  >"$TMP/wrapper.out" 2>&1 || rc=$?
+if [ "$rc" -eq 1 ]; then
+  pass "an added curl check-runs reference is rejected alongside the canonical read"
+else
+  fail "an added curl check-runs reference must fail the wrapper check, got rc=$rc; $(cat "$TMP/wrapper.out")"
+fi
+
 # Restore the production read spelling and independently pin that matching a
 # broader separator does not reject a read-only `gh api` call.
 cp "$SUBJECT" "$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh"
