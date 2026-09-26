@@ -1302,7 +1302,8 @@ SUMMARY_BLOCKING='[]'
 SUMMARY_FINDINGS_FINGERPRINT_INPUT=''
 SUMMARY_CANDIDATE_COUNT=$(echo "$SUMMARY_CANDIDATES" | jq 'length')
 if [ "$SUMMARY_CANDIDATE_COUNT" -eq 0 ]; then
-  if [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] && [ -n "$HEAD_REVIEW_AT" ]; then
+  if [ "$REQUIRE_REVIEW_SUMMARY" = "true" ] && [ -n "$HEAD_REVIEW_AT" ] \
+      && [ "$BLOCKING_COUNT" -eq 0 ]; then
     # Exit 3, NOT 1 (Codex P1 + CodeRabbit Major on #886). "A review has begun
     # and its summary is not published yet" is not a finding count, and the two
     # publishers have to act on it differently: an event-driven run has to go
@@ -1312,6 +1313,11 @@ if [ "$SUMMARY_CANDIDATE_COUNT" -eq 0 ]; then
     # publication. Collapsing both into 1 forced a choice between a sweep that
     # reopens the gap and a sweep that can hold a required check red with no ack
     # channel and no break-glass under `enforce_admins: true`.
+    #
+    # Inline candidates must continue through thread resolution before this
+    # hold can apply: an unresolved known finding is a failure, while a fully
+    # resolved candidate set reaches hold_on_unrecognised_newer_run below and
+    # still withholds its otherwise-clean verdict.
     #
     # REACHING THIS IS NOW RARE BY CONSTRUCTION. The primary acceptors read the
     # summary out of the review RUN object's own body, so a run that carries a

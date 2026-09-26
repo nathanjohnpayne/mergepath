@@ -2882,6 +2882,55 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# The summary hold cannot outrank a known inline finding before the gate reads
+# that finding's thread state. An unresolved candidate must retain rc 1 so the
+# consolidated publisher writes red. Once that same candidate is resolved, the
+# existing clean-verdict hold remains responsible for the unrecognised newer
+# run and returns rc 3.
+echo "--- Test 47d-combined (#1364): known inline finding outranks the unread-run hold until resolved"
+COMBINED_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$MAJOR_BODY")
+COMBINED_UNRESOLVED_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [2001]}]')
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$COMBINED_COMMENTS" \
+  FIXTURE_THREADS="$COMBINED_UNRESOLVED_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "comment id 2001" \
+    && echo "$OUT" | grep -q "blocking-tier unresolved: 1"; then
+  pass "an unresolved known inline finding remains a failure despite the unrecognised run"
+else
+  fail "expected unresolved inline finding plus unrecognised run to exit 1; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+COMBINED_RESOLVED_THREADS=$(make_threads_fixture '[{isResolved: true, comment_ids: [2001]}]')
+set +e
+OUT=$(
+  REQUIRE_REVIEW_SUMMARY=true \
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$COMBINED_COMMENTS" \
+  FIXTURE_THREADS="$COMBINED_RESOLVED_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 3 ] && echo "$OUT" | grep -q "later review run" \
+    && echo "$OUT" | grep -q "blocking-tier unresolved: pending"; then
+  pass "a resolved inline candidate still withholds the clean verdict for the unrecognised run"
+else
+  fail "expected resolved inline candidate plus unrecognised run to exit 3; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # The PUBLISHER is the job, not the event. Scoping REQUIRE_REVIEW_SUMMARY to
 # `pull_request_review` left the SAME job — the one that owns the native check
 # for this head — running the arrival-independent scan on its other triggers, so
