@@ -573,7 +573,8 @@ p4b_carryforward_refusal() {
 # p4b_coderabbit_config_identity <repo> <sha>
 # The repository CodeRabbit configuration AT <sha>, as a canonical string of
 # its root-tree entries ({path, blob sha} for .coderabbit.yml / .coderabbit.yaml;
-# "[]" when there is none). Returns 3 on any unread rung. Codex P2 on #1340:
+# "[]" when there is none). Returns 3 on any unread rung and 4 when a config
+# entry is not a regular file. Codex P2 on #1340:
 # the external-review fingerprint covers only the PR's own paths, so a
 # base-only update that changes this file compares equal while CodeRabbit's
 # profile and path_instructions moved under the review being carried.
@@ -581,9 +582,18 @@ p4b_coderabbit_config_identity() {
   local repo="$1" sha="$2" tree
   tree="$(gh_api_scalar --shape sha "tree of $sha for the CodeRabbit config identity" \
     "repos/$repo/commits/$sha" --jq '.commit.tree.sha')" || return 3
-  gh_api_scalar "CodeRabbit config entries at $sha" "repos/$repo/git/trees/$tree" \
-    --jq '[.tree[]? | select(.path == ".coderabbit.yml" or .path == ".coderabbit.yaml") | {path, sha}] | sort_by(.path) | tostring' \
+  local entries
+  entries="$(gh_api_scalar "CodeRabbit config entries at $sha" "repos/$repo/git/trees/$tree" \
+    --jq '[.tree[]? | select(.path == ".coderabbit.yml" or .path == ".coderabbit.yaml") | {path, mode, type, sha}] | sort_by(.path) | tostring')" \
     || return 3
+  # Only a REGULAR file's blob sha is its content (Codex P2 on #1340). A
+  # symlink's blob is the target PATH, so the target could change under an
+  # identical entry; a submodule or tree is not a config file at all. Refuse
+  # rather than resolve: config that is not a plain file is rare enough that
+  # failing closed costs only this carry.
+  printf '%s' "$entries" | jq -e 'all(.[]; .type == "blob" and (.mode == "100644" or .mode == "100755"))' >/dev/null 2>&1 \
+    || return 4
+  printf '%s' "$entries"
 }
 
 p4b_barrier_coderabbit_carryforward() {
@@ -622,9 +632,9 @@ p4b_barrier_coderabbit_carryforward() {
   # The CodeRabbit configuration must be the one the carried review ran
   # under (Codex P2 on #1340) — see p4b_coderabbit_config_identity.
   head_cfg="$(p4b_coderabbit_config_identity "$repo" "$head")" \
-    || { p4b_carryforward_refusal "could not read the CodeRabbit configuration at $head"; return 1; }
+    || { p4b_carryforward_refusal "could not establish the CodeRabbit configuration at $head (unreadable, or not a regular file)"; return 1; }
   src_cfg="$(p4b_coderabbit_config_identity "$repo" "$reviewed")" \
-    || { p4b_carryforward_refusal "could not read the CodeRabbit configuration at $reviewed"; return 1; }
+    || { p4b_carryforward_refusal "could not establish the CodeRabbit configuration at $reviewed (unreadable, or not a regular file)"; return 1; }
   if [ "$head_cfg" != "$src_cfg" ]; then
     p4b_carryforward_refusal "the CodeRabbit configuration changed since $reviewed, so its review ran under different settings"
     return 1

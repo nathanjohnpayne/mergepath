@@ -3797,12 +3797,14 @@ case "$endpoint" in
   repos/owner/repo/git/trees/*)
     # P4B_TEST_CFG_<tree> is the .coderabbit.yml blob at that commit
     # (default: the same blob everywhere; "none" = no config file).
+    # P4B_TEST_CFG_MODE_<tree> is its git mode (default a regular file).
     tree=${endpoint##*/}
     eval "blob=\${P4B_TEST_CFG_$tree:-cfgsame}"
+    eval "mode=\${P4B_TEST_CFG_MODE_$tree:-100644}"
     if [ "$blob" = none ]; then
-      emit '{"tree":[{"path":"README.md","sha":"r"}]}'
+      emit '{"tree":[{"path":"README.md","mode":"100644","type":"blob","sha":"r"}]}'
     else
-      emit "{\"tree\":[{\"path\":\"README.md\",\"sha\":\"r\"},{\"path\":\".coderabbit.yml\",\"sha\":\"$blob\"}]}"
+      emit "{\"tree\":[{\"path\":\"README.md\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"r\"},{\"path\":\".coderabbit.yml\",\"mode\":\"$mode\",\"type\":\"blob\",\"sha\":\"$blob\"}]}"
     fi ;;
   repos/owner/repo/pulls/7)
     emit "{\"head\":{\"sha\":\"${P4B_TEST_LIVE_HEAD:-abc123}\"},\"base\":{\"sha\":\"${P4B_TEST_BASE_SHA:-3333333333333333333333333333333333333333}\"}}" ;;
@@ -4311,6 +4313,15 @@ export "P4B_TEST_CFG_$_H=none"
 out="$(_barrier 0 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
 [ "$rc" = 1 ] || bad="$bad cfg-removed-rc=$rc"
 unset "P4B_TEST_CFG_$_H"
+# A SYMLINKED config (mode 120000) at both commits, identical link blob:
+# the target could differ, so it is refused rather than compared.
+_cfreset
+export "P4B_TEST_CFG_MODE_$_H=120000" "P4B_TEST_CFG_MODE_$_L=120000"
+out="$(_barrier 0 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad cfg-symlink-rc=$rc"
+printf '%s' "$out" | jq -e '.coderabbit == "not-yet"' >/dev/null 2>&1 || bad="$bad cfg-symlink-class"
+[ ! -s "$_fplog" ] || bad="$bad cfg-symlink-fingerprinted"
+unset "P4B_TEST_CFG_MODE_$_H" "P4B_TEST_CFG_MODE_$_L"
 _cfreset
 out="$(P4B_TEST_CFG_FAIL=true _barrier 0 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
 [ "$rc" = 1 ] || bad="$bad cfg-unreadable-rc=$rc"
@@ -4413,7 +4424,7 @@ if [ "\${1:-}" = api ]; then
   case "\${2:-}" in
     repos/o/r/compare/*) printf '[{"filename":"scripts/x.sh"}]'; exit 0 ;;
     repos/o/r/commits/*) printf '4444444444444444444444444444444444444444'; exit 0 ;;
-    repos/o/r/git/trees/*) printf '[{"path":".coderabbit.yml","sha":"cfgsame"}]'; exit 0 ;;
+    repos/o/r/git/trees/*) printf '[{"path":".coderabbit.yml","mode":"100644","type":"blob","sha":"cfgsame"}]'; exit 0 ;;
   esac
 fi
 exec "$BIN/gh" "\$@"

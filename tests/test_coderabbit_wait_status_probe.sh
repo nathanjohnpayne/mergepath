@@ -1448,6 +1448,9 @@ Review triggered.
   # 25. Acknowledged BEFORE the success: the run it started is the one that
   #     completed — carries.
   CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:30Z _notice_case trigger-ack-before-success "$ack_note" 1 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z evidence summary-without-head-review
+  # 26. Codex P1 on #1340 (9e5368a): an acknowledgement in the SAME second as
+  #     the success cannot be ordered before it, so a tie blocks.
+  CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:09Z _notice_case trigger-ack-same-second "$ack_note" 1 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z none summary-without-head-review
   unset -f _notice_case
 
   # 22. Codex P1 on #1340: the status flips between the first sample and the

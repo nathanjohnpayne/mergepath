@@ -4507,14 +4507,17 @@ crw_probe_carryforward_evidence() {
     # before it flips the status to `pending`, and the selector above skips
     # that acknowledgement as narration — so the summary, the reviews and the
     # status can all still read as before while a run that may publish a
-    # finding is starting. Any successful-trigger acknowledgement fresher than
-    # the success sample suppresses the evidence; an older one is the run that
-    # produced that success. Unread rungs emit nothing.
+    # finding is starting. Any successful-trigger acknowledgement at-or-after
+    # the success sample suppresses the evidence — a TIE included (Codex P1 on
+    # #1340): the API's timestamps are whole seconds, so an acknowledgement in
+    # the same second as the success cannot be ordered before it. Only a
+    # strictly older one is the run that produced that success. Unread rungs
+    # emit nothing.
     local acks="" ack_row="" ack_body="" ack_rc=0
     acks=$(printf '%s' "$fresh" | jq -r --arg bot "$BOT_LOGIN" --arg s "$updated_at" '
       [ .[] | select(.user.login == $bot)
         | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
-        | select(.fresh_at > $s) ]
+        | select(.fresh_at >= $s) ]
       | .[] | (.body // "") | @base64') \
       || { log "probe: carry-forward re-scan could not list CodeRabbit comments newer than the success — emitting no evidence (#1335)"; return 0; }
     while IFS= read -r ack_row; do
