@@ -111,6 +111,12 @@ assert_allowed_source "a value-taking option whose value spells merge" \
   'gh pr -q merge view 1 --json title'
 assert_allowed_source "a value-taking long option whose value spells merge" \
   'gh pr --jq merge view 1 --json title'
+assert_allowed_source "a pre-verb short label value that spells merge" \
+  'gh pr -l merge list'
+assert_allowed_source "a pre-verb long label value that spells merge" \
+  'gh pr --label merge list'
+assert_prohibited_source "a short label value cannot hide a later merge verb" \
+  'gh pr -l merge merge 7'
 # The method flag is a gh option and is legal on either side of `api`; gh sends
 # the fields as a query string, so this is an explicit read.
 assert_allowed_source "an explicit GET pinned before the api command" \

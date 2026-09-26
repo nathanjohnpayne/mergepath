@@ -386,7 +386,8 @@ body="$(gh_api_scalar "PR body for $REPO#$PR" \
 # both enforcement paths.
 pr_body_validate "$body" "$(p4b_config)" \
   || p4b_die 3 "PR body does not satisfy the Authoring-Agent contract"
-BODY_AUTHOR="$(pr_body_authoring_agent "$body")"
+BODY_AUTHOR="$(pr_body_authoring_agent "$body")" \
+  || p4b_die 3 "could not parse Authoring-Agent from PR body (parser did not complete)"
 [ -n "$BODY_AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body"
 # #1143: when the caller ALSO named an identity, the two must agree. Compare
 # the normalized AGENT on both sides (p4b_agent_of_login lowercases and strips

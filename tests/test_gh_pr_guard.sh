@@ -314,6 +314,12 @@ assert_rc_contains "author wrapper issue comment blocked" 2 "reviewer token" \
 assert_rc_contains "direct pr edit blocked" 2 "token-verifying wrapper" \
   'gh pr edit 123 --title "new"'
 
+assert_rc_contains "pre-verb label value cannot hide direct pr merge" 2 "token-verifying wrapper" \
+  'gh pr -l merge merge 123 --squash'
+
+assert_rc_contains "pre-verb label value cannot hide direct pr edit" 2 "token-verifying wrapper" \
+  'gh pr --label merge edit 123 --title "new"'
+
 assert_rc_contains "author wrapper pr edit allowed" 0 "" \
   'scripts/gh-as-author.sh -- gh pr edit 123 --title "new"'
 

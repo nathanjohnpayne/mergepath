@@ -671,7 +671,7 @@ gh_source_has_direct_literal_pr_mutation() {
         word = words[i]
         if (word == "") continue
         if (word ~ /(^|\/)gh$/) active = 1
-        if (active && word ~ /^(-q|--jq|-t|--template|-H|--header|--cache)$/ && i < n) {
+        if (active && word ~ /^(-q|--jq|-t|--template|-H|--header|--cache|-l|--label)$/ && i < n) {
           word = word "=" words[++i]
         }
         result = result (result == "" ? "" : " ") word
