@@ -3750,24 +3750,32 @@ test_1178_review_no_id_fails_closed() {
 # Fail only the real tier-extraction grep, with plausible partial stdout. All
 # other grep users (provider selection, freshness, policy) remain operational.
 install_878_extraction_failure() {
-  local dir=$1
-  cat >"$dir/bin/grep" <<'EOF'
-#!/usr/bin/env bash
+  local dir=$1 real_grep
+  real_grep=$(command -v grep) || {
+    echo "missing grep required by #878 fixture" >&2
+    return 1
+  }
+  case "$real_grep" in
+    /*) ;;
+    *) echo "grep fixture requires an absolute executable path" >&2; return 1 ;;
+  esac
+  printf '#!/usr/bin/env bash\nREAL_GREP=%q\n' "$real_grep" >"$dir/bin/grep"
+  cat >>"$dir/bin/grep" <<'EOF'
 if [ "${1:-}" = -oE ]; then
   body=$(cat)
   case "$body" in
     *TIER_READ_FAILURE*)
       if [ -f "${CODERABBIT_TEST_STATE_DIR:?}/fail-after-first" ] && [ ! -f "$CODERABBIT_TEST_STATE_DIR/first-tier-read" ]; then
         : >"$CODERABBIT_TEST_STATE_DIR/first-tier-read"
-        exec /usr/bin/grep "$@" <<<"$body"
+        exec "$REAL_GREP" "$@" <<<"$body"
       fi
       printf 'hit\n' >>"${CODERABBIT_TEST_STATE_DIR:?}/tier-read-failures"
       printf '🟡 Minor\n'
       exit 2 ;;
   esac
-  exec /usr/bin/grep "$@" <<<"$body"
+  exec "$REAL_GREP" "$@" <<<"$body"
 fi
-exec /usr/bin/grep "$@"
+exec "$REAL_GREP" "$@"
 EOF
   chmod +x "$dir/bin/grep"
 }

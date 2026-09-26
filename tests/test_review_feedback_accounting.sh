@@ -2749,8 +2749,16 @@ assert_eq 1 "$CALLS" "same alert number referenced by two comments is fetched on
 
 # Force only the shared CodeRabbit marker read to fail after partial output.
 # Other grep users and all fixture/API reads keep their normal behavior.
-cat >"$TMP/bin/grep" <<'SH'
-#!/usr/bin/env bash
+REAL_GREP=$(command -v grep) || {
+  echo "missing grep required by feedback-accounting fixture" >&2
+  exit 1
+}
+case "$REAL_GREP" in
+  /*) ;;
+  *) echo "feedback-accounting fixture requires an absolute grep path" >&2; exit 1 ;;
+esac
+printf '#!/usr/bin/env bash\nREAL_GREP=%q\n' "$REAL_GREP" >"$TMP/bin/grep"
+cat >>"$TMP/bin/grep" <<'SH'
 if [ "${CODERABBIT_EXTRACT_FAIL:-0}" = 1 ] && [ "${1:-}" = -oE ]; then
   case "${2:-}" in
     '🟠 Major|'*)
@@ -2760,7 +2768,7 @@ if [ "${CODERABBIT_EXTRACT_FAIL:-0}" = 1 ] && [ "${1:-}" = -oE ]; then
       ;;
   esac
 fi
-exec /usr/bin/grep "$@"
+exec "$REAL_GREP" "$@"
 SH
 chmod +x "$TMP/bin/grep"
 export CODERABBIT_EXTRACT_FAIL_LOG="$TMP/extract-failure.log"
