@@ -694,6 +694,46 @@ check_wrapper_condition false 1 "the live wrapper rejects an always-false expres
 check_wrapper_condition "github.event.action == 'edited'" 0 \
   "the live wrapper preserves an explicitly supported edited condition"
 
+# The nudge's `gh api` scan is a structural non-publication fence. Shell allows
+# arbitrary horizontal whitespace between command words, so preserve the one
+# `check-runs` reference while changing only that separator: each write spelling
+# must reach the existing non-GET-option guard rather than escaping extraction.
+check_wrapper_api_form() { # <replacement command prefix> <description>
+  local replacement=$1 description=$2 rc=0
+  cp "$SUBJECT" "$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh"
+  REPLACEMENT="$replacement" python3 - "$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+old = 'gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs"'
+new = os.environ["REPLACEMENT"] + ' "repos/$REPO/commits/$HEAD_SHA/check-runs"'
+if text.count(old) != 1:
+    raise SystemExit("fixture could not locate the unique check-runs read")
+open(path, "w").write(text.replace(old, new))
+PY
+  env PATH="$TMP/wrapper-bin:$PATH" STUB_WRAPPER_ROOT="$WRAPPER_FIXTURE" \
+    bash "$ROOT/scripts/ci/check_pr_review_policy_nudge" --check \
+    >"$TMP/wrapper.out" 2>&1 || rc=$?
+  if [ "$rc" -eq 1 ] && grep -q 'non-GET gh api call' "$TMP/wrapper.out"; then
+    pass "$description"
+  else
+    fail "$description: expected the non-GET guard to fail (rc=1), got rc=$rc; $(cat "$TMP/wrapper.out")"
+  fi
+}
+
+check_wrapper_api_form 'gh  api -X POST' \
+  "the non-publication guard rejects a repeated-space gh api write"
+check_wrapper_api_form $'gh\tapi -XPOST' \
+  "the non-publication guard rejects a tab-separated gh api write"
+
+# Restore the production read spelling and independently pin that matching a
+# broader separator does not reject a read-only `gh api` call.
+cp "$SUBJECT" "$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh"
+check_wrapper_condition "github.event.action == 'edited'" 0 \
+  "the broader gh api matcher continues to allow the canonical read"
+
 echo
 echo "============================================"
 echo "test_pr_review_policy_nudge.sh: $PASSED passed, $FAILED failed"

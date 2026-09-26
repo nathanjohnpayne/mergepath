@@ -2090,7 +2090,7 @@ crw_rate_limit_hides_a_finding() {
 # `classify_comment ""`, which grades `review`, the one class whose arm can
 # emit a clearance.
 crw_select_latest_non_narration_comment() {
-  local issue_comments=$1 after=${2:-} candidates encoded comment body owned owned_rc projected
+  local issue_comments=$1 after=${2:-} candidates encoded comment body owned owned_rc accepted_rc projected
   candidates=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg after "$after" '
     [ .[]
       | select(.user.login == $bot)
@@ -2108,7 +2108,26 @@ crw_select_latest_non_narration_comment() {
     owned_rc=0
     owned=$(crw_provider_owned_refusal_class "$body") || owned_rc=$?
     [ "$owned_rc" != "3" ] || return 3
-    [ "$owned" = "status_probe" ] && continue
+    if [ "$owned" = "status_probe" ]; then
+      # Most command replies are narration and remain invisible to polling.
+      # A successful review-trigger acknowledgement is different: CodeRabbit
+      # publishes it before the new same-head run flips its status to pending.
+      # Skipping it exposes the older publication underneath and can clear
+      # while the replacement review is still starting. This override belongs
+      # only to polling selection; the #956 refusal guard deliberately keeps
+      # treating the same acknowledgement as narration.
+      accepted_rc=0
+      crw_review_trigger_accepted "$body" || accepted_rc=$?
+      case "$accepted_rc" in
+        0)
+          projected=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body, poll_class: "in_progress"}') || return 3
+          printf '%s\n' "$projected"
+          return 0
+          ;;
+        1) continue ;;
+        *) return 3 ;;
+      esac
+    fi
     projected=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}') || return 3
     printf '%s\n' "$projected"
     return 0
@@ -2969,7 +2988,13 @@ status_context_fast_path_blocked_by_comment() {
     return 1
   fi
 
-  class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
+  class=$(printf '%s' "$latest" | jq -r '.poll_class // empty') || {
+    log "StatusContext success suppressed: the selected CodeRabbit polling class could not be decoded — keep polling"
+    return 0
+  }
+  if [ -z "$class" ]; then
+    class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
+  fi
   case "$class" in
     rate_limit|paused|in_progress)
       # #490: `paused` joins rate_limit/in_progress here. An auto-pause NOTE
@@ -3246,7 +3271,7 @@ find_status_probe_reply() {
 }
 
 emit_terminal_review_after_probe_if_present() {
-  local latest body class potential_issues review_json summary_marker_rc
+  local latest body class poll_class potential_issues review_json summary_marker_rc
   local summary_head_claim_rc head_run_rc head_run_id graded_review_id
   # Status-checked (#957/#959). "Best effort" governs the FETCH — an
   # unreadable surface is not fatal on the timeout path — but the DECODE now
@@ -3274,10 +3299,18 @@ emit_terminal_review_after_probe_if_present() {
     log "post-probe terminal-review check: the selected comment body could not be derived — leaving the advisory timeout in place rather than grading an unread comment"
     return 0
   }
-  class=$(crw_classify_selected_comment "$body") || {
-    log "post-probe terminal-review check: the selected comment could not be structurally classified — leaving the advisory timeout in place"
+  poll_class=$(printf '%s' "$latest" | jq -r '.poll_class // empty') || {
+    log "post-probe terminal-review check: the selected polling class could not be derived — leaving the advisory timeout in place"
     return 0
   }
+  if [ -n "$poll_class" ]; then
+    class=$poll_class
+  else
+    class=$(crw_classify_selected_comment "$body") || {
+      log "post-probe terminal-review check: the selected comment could not be structurally classified — leaving the advisory timeout in place"
+      return 0
+    }
+  fi
   case "$class" in
     review)
       # #1031 round 2: select the graded review object ONCE, here, and use the
@@ -5354,8 +5387,14 @@ while :; do
   COMMENT_CREATED=$(echo "$LATEST" | jq -r '.created_at')
   COMMENT_FRESH_AT=$(echo "$LATEST" | jq -r '.fresh_at // .updated_at // .created_at')
 
-  CLASS=$(crw_classify_selected_comment "$COMMENT_BODY") \
-    || die 3 "could not structurally classify the latest CodeRabbit comment — refusing to treat an unread body as a review"
+  POLL_CLASS=$(printf '%s' "$LATEST" | jq -r '.poll_class // empty') \
+    || die 3 "could not decode the latest CodeRabbit polling class — refusing to treat an unread selection as a review"
+  if [ -n "$POLL_CLASS" ]; then
+    CLASS=$POLL_CLASS
+  else
+    CLASS=$(crw_classify_selected_comment "$COMMENT_BODY") \
+      || die 3 "could not structurally classify the latest CodeRabbit comment — refusing to treat an unread body as a review"
+  fi
   log "latest CodeRabbit comment id=$COMMENT_ID endpoint=$COMMENT_ENDPOINT class=$CLASS created=$COMMENT_CREATED fresh_at=$COMMENT_FRESH_AT"
 
   case "$CLASS" in

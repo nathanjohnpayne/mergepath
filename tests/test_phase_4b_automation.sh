@@ -667,7 +667,7 @@ run_approval_ack_case() {
     P4B_ACK_IDENTITY="$P4B_ACK_CASE/identity" P4B_ACK_POLICY="$POLICY_ON" \
     P4B_ACK_GATE_BIN="$WORK/approval-accounting-bin" \
     P4B_ACK_GATE_SCRIPT="$ROOT/scripts/review-feedback-accounting.sh" "$@" \
-    bash "$ORCH" 1261 --repo o/r --author "$author" --head abc123 --diff-file "$DIFF" "${extra_args[@]}" \
+    bash "$ORCH" 1261 --repo o/r --author "$author" --head abc123 --diff-file "$DIFF" ${extra_args[@]+"${extra_args[@]}"} \
     2>"$P4B_ACK_CASE/stderr")
   rc=$?
   set -e

@@ -93,7 +93,7 @@ CODE=$(grep -v '^[[:space:]]*#' "$SUBJECT")
 # rm operators elsewhere in the script. Backslash continuations are joined
 # first, or an option on a wrapped line goes unseen. `gh api` is the only verb
 # that can create a check run — `gh pr edit`, the one write here, cannot.
-GH_CALLS=$(printf '%s\n' "$CODE" | sed -e :a -e '/\\$/{N;s/\\\n//;ba' -e '}' | grep 'gh api' || true)
+GH_CALLS=$(printf '%s\n' "$CODE" | sed -e :a -e '/\\$/{N;s/\\\n//;ba' -e '}' | grep -E 'gh[[:space:]]+api' || true)
 
 # Every option that makes `gh api` non-GET. `-f` / `-F` / `--field` /
 # `--raw-field` matter as much as `-X`: gh's own help says "adding request

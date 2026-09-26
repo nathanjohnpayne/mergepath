@@ -411,7 +411,7 @@ g1100_decide() {  # <accounting-json> -> "refuse" | "proceed"
       body="$(printf '%s\n' "$body" | sed 's/ascii_downcase/./')"
       ;;
   esac
-  fake="$(mktemp -d "${TMPDIR:-/tmp}/g1100-req.XXXXXX")"
+  fake="$(mktemp -d "$WORKDIR/g1100-req.XXXXXX")"
   printf '%s' "$fake" > "$G1100_LASTDIR"
   mkdir -p "$fake/workflow"
   printf 'codex:\n  bot_login: "chatgpt-codex-connector[bot]"\n' > "$fake/default-policy.yml"

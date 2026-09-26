@@ -863,9 +863,8 @@ test_status_probe_does_not_supersede_refusal() {
 # narration must be skipped and the older refusal retained.
 test_structural_status_probes_are_excluded_by_polling_selector() {
   local mode reply dir rc before=$FAIL
-  for mode in actions-performed-split wrapped-summary-whitespace wrapped-incremental mention mention-apostrophe; do
+  for mode in wrapped-summary-whitespace wrapped-incremental mention mention-apostrophe; do
     case "$mode" in
-      actions-performed-split) reply=$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY ;;
       wrapped-summary-whitespace) reply=$WRAPPED_SUMMARY_STATUS_PROBE_BODY ;;
       wrapped-incremental) reply=$WRAPPED_INCREMENTAL_STATUS_PROBE_BODY ;;
       mention) reply=$MENTION_STATUS_PROBE_BODY ;;
@@ -879,7 +878,75 @@ test_structural_status_probes_are_excluded_by_polling_selector() {
     [ "$rc" = "5" ] || fail "3b9 $mode: ordinary polling must skip structural status narration and retain the refusal, got $rc; err=$(tail -6 "$dir/err.log")"
     [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "3b9 $mode: ordinary polling selected status narration instead of the older refusal"
   done
-  [ "$FAIL" -ne "$before" ] || pass "3b9: ordinary polling excludes split-layout, wrapped and whitespace-normalized status narration"
+  [ "$FAIL" -ne "$before" ] || pass "3b9: ordinary polling excludes wrapped and whitespace-normalized status narration"
+}
+
+# A successful review-trigger acknowledgement is structurally narration for
+# the #956 refusal guard, but it has stronger meaning in ordinary polling: a
+# new same-head run is starting. Skipping it there exposes the older clean
+# publication underneath and can clear before the replacement report lands.
+test_trigger_ack_is_polling_in_progress() {
+  local mode reply dir rc before=$FAIL quoted fenced
+  dir=$(make_case "polling-clean-before-trigger-ack" "$REVIEW_BODY_CLEAN" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
+  sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 15/' "$dir/.github/review-policy.yml"
+  sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir")
+  [ "$rc" = "4" ] || fail "3b10 ack: accepted trigger must keep polling instead of clearing the older summary, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "timeout" ] || fail "3b10 ack: expected bounded timeout while the acknowledged run remains in progress"
+  grep -q 'class=in_progress' "$dir/err.log" || fail "3b10 ack: polling never classified the accepted trigger as in_progress"
+
+  # The trusted StatusContext fast path consumes the same selector. A trigger
+  # acknowledgement newer than the sampled success suppresses that success;
+  # a genuinely later completed publication still clears normally.
+  dir=$(make_case "fast-path-clean-before-trigger-ack" "$REVIEW_BODY_CLEAN" \
+    "$STATUS_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
+  sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 15/' "$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir")
+  [ "$rc" = "4" ] || fail "3b10 fast ack: a post-success accepted trigger must suppress fast-path clearance, got $rc; err=$(tail -6 "$dir/err.log")"
+  grep -q 'class=in_progress.*at/after status_created' "$dir/err.log" || fail "3b10 fast ack: expected the trusted fast path to suppress its older success"
+
+  dir=$(make_case "fast-path-trigger-before-completed-report" "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$REVIEW_BODY_CLEAN" "$NOTICE_AFTER_SUMMARY_TIME")
+  rc=$(run_case "$dir")
+  [ "$rc" = "0" ] || fail "3b10 completed control: a genuinely later clean publication must still clear, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3b10 completed control: later completed report lost ordinary clearance"
+
+  # The selector must not promote quoted or fenced copies inside a genuine
+  # review. They remain review content and preserve the existing clearance.
+  quoted="$REVIEW_BODY_CLEAN
+
+> <details><summary>✅ Actions performed</summary>
+> Review triggered."
+  fenced="$REVIEW_BODY_CLEAN
+
+\`\`\`
+<details><summary>✅ Actions performed</summary>
+Review triggered.
+\`\`\`"
+  for mode in quoted fenced; do
+    case "$mode" in quoted) reply=$quoted ;; fenced) reply=$fenced ;; esac
+    dir=$(make_case "polling-$mode-trigger-lookalike" "$RATE_LIMIT_BODY_HEADREF" \
+      "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+      "$reply" "$NOTICE_AFTER_SUMMARY_TIME")
+    sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+    rc=$(run_case "$dir")
+    [ "$rc" = "0" ] || fail "3b10 $mode: a trigger lookalike inside a genuine review must retain review behavior, got $rc; err=$(tail -6 "$dir/err.log")"
+    [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3b10 $mode: trigger lookalike was promoted to provider in-progress state"
+  done
+
+  # The acknowledgement-specific structural read participates in the same
+  # fail-closed rc-3 contract as the surrounding selected-comment reader.
+  dir=$(make_case "polling-trigger-ack-decode-failure" "$REVIEW_BODY_CLEAN" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
+  sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=2 run_case "$dir")
+  [ "$rc" = "3" ] || fail "3b10 decode: unread trigger acknowledgement must stop polling with infra, got $rc; err=$(tail -6 "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "3b10: accepted trigger acknowledgements are polling in-progress; quoted/fenced lookalikes and decode failure retain their contracts"
 }
 
 # --- Test 3c: a body-less acknowledgement is not a review run --------------
@@ -2695,6 +2762,7 @@ test_selected_comment_structural_failure_fails_closed
 test_provider_leading_nonreview_run_stays_refused
 test_status_probe_does_not_supersede_refusal
 test_structural_status_probes_are_excluded_by_polling_selector
+test_trigger_ack_is_polling_in_progress
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
