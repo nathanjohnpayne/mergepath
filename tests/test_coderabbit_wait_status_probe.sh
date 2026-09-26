@@ -213,18 +213,28 @@ case "$endpoint" in
     # #1335 (Codex P1 on #1340): CODERABBIT_TEST_STATUS2[_TIME|_DESCRIPTION],
     # when set, replace the served status from the SECOND statuses read on —
     # a run starting between the probe's first sample and its re-sample.
+    # _KEEP_OLD=true serves BOTH statuses from that read on, newest-first as
+    # the real endpoint does, in the SAME second — the tie only a status id
+    # can order (Codex P1 on #1340, 43a54a4).
     st=${CODERABBIT_TEST_STATUS:-absent}
     st_time=${CODERABBIT_TEST_STATUS_TIME:-$head_time}
     st_desc=${CODERABBIT_TEST_STATUS_DESCRIPTION:-}
+    st_id=1
+    old_record=""
     if [ -n "${CODERABBIT_TEST_STATUS2:-}" ] && [ "$(wc -l <"$state_dir/status-reads" | tr -d ' ')" -ge 2 ]; then
+      if [ "${CODERABBIT_TEST_STATUS2_KEEP_OLD:-false}" = true ]; then
+        old_record=$(printf ',{"id":1,"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":%s}' \
+          "$st" "$st_time" "$st_time" "$bot" "$(json_string "$st_desc")")
+      fi
       st=$CODERABBIT_TEST_STATUS2
       st_time=${CODERABBIT_TEST_STATUS2_TIME:-$st_time}
       st_desc=${CODERABBIT_TEST_STATUS2_DESCRIPTION:-$st_desc}
+      st_id=2
     fi
     case "$st" in
       success|failure|pending|error)
-        printf '[{"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":%s}]\n' \
-          "$st" "$st_time" "$st_time" "$bot" "$(json_string "$st_desc")"
+        printf '[{"id":%s,"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":%s}%s]\n' \
+          "$st_id" "$st" "$st_time" "$st_time" "$bot" "$(json_string "$st_desc")" "$old_record"
         ;;
       unreadable)
         echo "simulated statuses endpoint failure" >&2
@@ -1475,6 +1485,20 @@ Review triggered.
     run_probe_case "$dir" carry_summary_changes)
   { [ "$rc" = 7 ] && jq -e '.probe.carryforward == null' "$dir/out.json" >/dev/null 2>&1; } \
     || bad="$bad status-refreshed(rc=$rc)"
+
+  # 27. Codex P1 on #1340 (43a54a4): a NEW pending status in the SAME second as
+  #     the sampled success, served newest-first beside it. Ordered by
+  #     created_at the old success wins the tie and both samples look
+  #     identical; ordered by status id the pending is the latest.
+  dir=$(make_case probe-1335-status-tie 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' \
+    CODERABBIT_TEST_STATUS2=pending CODERABBIT_TEST_STATUS2_DESCRIPTION='Review in progress' \
+    CODERABBIT_TEST_STATUS2_KEEP_OLD=true \
+    CODERABBIT_TEST_FALLBACK_BODY="$clean" CODERABBIT_TEST_CARRY_BODY2="$clean" \
+    run_probe_case "$dir" carry_summary_changes)
+  { [ "$rc" = 7 ] && jq -e '.probe.carryforward == null' "$dir/out.json" >/dev/null 2>&1; } \
+    || bad="$bad status-tie(rc=$rc cf=$(jq -c '.probe.carryforward' "$dir/out.json" 2>/dev/null))"
 
   unset -f _cf_case
   if [ -z "$bad" ]; then

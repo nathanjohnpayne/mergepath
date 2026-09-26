@@ -4312,6 +4312,31 @@ crw_probe_head_review_in_progress() {
   return 0
 }
 
+# The newest CodeRabbit StatusContext on HEAD_SHA, ordered by status ID, as
+# {id, state, description, updated_at}; the `unreadable` record on any failed
+# read, `missing` when there is none. Used ONLY by the carry-forward evidence
+# (Codex P1 on #1340). check_status_context_record orders by created_at, which
+# has whole-second resolution, and the statuses endpoint is newest-first, so a
+# `pending` posted in the same second as the prior `success` sorts BEFORE it
+# and the older success wins — enough to make two samples look identical while
+# a new run is active. Status IDs increase strictly with creation, so they
+# order a tie. Kept separate so no other consumer's ordering changes.
+crw_carry_status_record() {
+  local statuses out
+  statuses=$(fetch_api_array "repos/$REPO/commits/$HEAD_SHA/statuses" "statuses (carry-forward)") || {
+    printf '%s\n' "$CRW_STATUS_RECORD_UNREADABLE"; return 0; }
+  out=$(printf '%s' "$statuses" | jq -c --arg bot "$BOT_LOGIN" '
+    [ .[]? | select(.context == "CodeRabbit") | select((.creator.login // "") == $bot)
+      | select((.id | type) == "number") ]
+    | sort_by(.id) | last
+    | if . == null then {id: null, state: "missing", created_at: "", updated_at: "", description: ""}
+      else {id, state: (.state // "missing"), created_at: (.created_at // ""),
+            updated_at: (.updated_at // .created_at // ""), description: (.description // "")}
+      end' 2>/dev/null) || out=""
+  [ -n "$out" ] || out=$CRW_STATUS_RECORD_UNREADABLE
+  printf '%s\n' "$out"
+}
+
 # True (0) when <body> is CodeRabbit's SUCCESSFUL review-trigger
 # acknowledgement ("✅ Actions performed" / "Review triggered", including the
 # "Full review triggered" form); 1 when it is not; 3 when the body could not be
@@ -4399,9 +4424,10 @@ crw_probe_carryforward_evidence() {
   [ "$risk_rc" = 1 ] || return 0
 
   state=""; desc=""; permits=false
-  local updated_at=""
+  local updated_at="" status_id=""
   if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
-    ctx_record=$(check_status_context_record) || ctx_record=""
+    ctx_record=$(crw_carry_status_record) || ctx_record=""
+    status_id=$(printf '%s' "$ctx_record" | jq -r '.id // ""' 2>/dev/null || printf '')
     state=$(crw_status_record_state "$ctx_record")
     desc=$(printf '%s' "$ctx_record" | jq -r '.description // ""' 2>/dev/null || printf '')
     updated_at=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""' 2>/dev/null || printf '')
@@ -4552,17 +4578,21 @@ crw_probe_carryforward_evidence() {
     # `pending` before it posts any comment or review object, so both
     # refreshed reads above would look unchanged while a run that may yet
     # publish a finding is active. Emit only if the status is still the SAME
-    # sample: success, the identical description and the identical refresh
-    # time. This proves only that nothing changed; whether the sample permits
+    # sample: success, the same status ID, the identical description and the
+    # identical refresh time. This proves only that nothing changed; whether the sample permits
     # clearance stays the barrier's call (head_context_permits_clearance). Any
     # difference, or an unreadable read, emits nothing and the next probe
     # reads the new state.
-    local ctx_again="" state_again="" desc_again="" updated_again=""
-    ctx_again=$(check_status_context_record) || ctx_again=""
+    local ctx_again="" state_again="" desc_again="" updated_again="" id_again=""
+    ctx_again=$(crw_carry_status_record) || ctx_again=""
     state_again=$(crw_status_record_state "$ctx_again")
     desc_again=$(printf '%s' "$ctx_again" | jq -r '.description // ""' 2>/dev/null || printf '')
     updated_again=$(printf '%s' "$ctx_again" | jq -r '.updated_at // ""' 2>/dev/null || printf '')
-    if [ "$state_again" != success ] || [ -z "$updated_again" ] || [ "$updated_again" != "$updated_at" ] \
+    id_again=$(printf '%s' "$ctx_again" | jq -r '.id // ""' 2>/dev/null || printf '')
+    # The status ID is the sample's identity: a new status in the same
+    # second has the same timestamp but a larger ID.
+    if [ "$state_again" != success ] || [ -z "$status_id" ] || [ "$id_again" != "$status_id" ] \
+       || [ -z "$updated_again" ] || [ "$updated_again" != "$updated_at" ] \
        || [ "$desc_again" != "$desc" ]; then
       log "probe: the CodeRabbit status on $HEAD_SHA changed during the carry-forward re-scan (now ${state_again:-unreadable} @ ${updated_again:-?}, was $state @ $updated_at) — emitting no evidence (#1335)"
       return 0
