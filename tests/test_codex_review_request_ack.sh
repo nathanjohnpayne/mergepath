@@ -181,12 +181,15 @@ endpoint=${1:-}
 
 case "$endpoint" in
   repos/owner/repo/pulls/999)
-    if [ "$scenario" = "head-drift" ]; then
+    # The initial HEAD fetch and the governing-policy resolver both need full
+    # PR metadata. Only preserve_final_request_timeout's explicit scalar read
+    # proves the live head immediately before it reuses a timeout marker.
+    if [ "$scenario" = "head-drift" ] && [ "${2:-}" = "--jq" ] && [ "${3:-}" = ".head.sha" ]; then
       reads=0
       [ ! -f "$state_dir/head-reads" ] || reads=$(cat "$state_dir/head-reads")
       reads=$((reads + 1))
       printf '%s\n' "$reads" >"$state_dir/head-reads"
-      if [ "$reads" -gt 1 ]; then
+      if [ "$reads" -eq 1 ]; then
         printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
         exit 0
       fi
@@ -543,6 +546,10 @@ test_reused_final_slot_timeout_marker_controls() {
     esac
     rc=$(run_case "$dir" "$variant")
     [ "$rc" = "$expected" ] || fail "#813 $variant marker: exit $rc, expected $expected; stderr=$(cat "$dir/err.log")"
+    if [ "$variant" = head-drift ]; then
+      grep -q 'cannot reuse Phase 4a timeout: PR head moved' "$dir/err.log" \
+        || fail "#813 head-drift marker: exit 3 did not come from the live-head refusal; stderr=$(cat "$dir/err.log")"
+    fi
     [ "$(trigger_count "$dir")" = 0 ] || fail "#813 $variant marker: posted another trigger"
     [ ! -f "$dir/state/terminal-count" ] || fail "#813 $variant marker: posted timeout authority"
     if [ "$expected" = 7 ]; then
