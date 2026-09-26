@@ -448,7 +448,8 @@ if relay_job.is_a?(Hash)
     "read-only archive relay does not gate on the complete Codex P1 Gate run title"
   )
   relay_steps = Array(relay_job["steps"])
-  source_run = relay_steps.find { |step| step["id"].to_s == "source" }&.fetch("run", "").to_s
+  source_step = relay_steps.find { |step| step["id"].to_s == "source" }
+  source_run = source_step&.fetch("run", "").to_s
   source_index = relay_steps.index { |step| step["id"].to_s == "source" }
   checkout_index = relay_steps.index { |step| step["uses"].to_s.start_with?("actions/checkout@") }
   checkout_step = checkout_index ? relay_steps.fetch(checkout_index) : nil
@@ -458,7 +459,20 @@ if relay_job.is_a?(Hash)
       checkout_step.dig("with", "persist-credentials") == false,
     "read-only archive relay does not load its source resolver from a trusted default-branch checkout"
   )
-  source_bind = source_run.index('scripts/workflow/feedback-archive-relay-source.sh "$REPO" "$pr"')
+  resolver_step = relay_steps.find { |step| step["id"].to_s == "source_resolver" }
+  resolver_run = resolver_step&.fetch("run", "").to_s
+  require_shape.call(
+    checkout_step&.fetch("id", "") == "trusted_checkout" &&
+      resolver_step&.fetch("if", "").to_s.include?("always()") &&
+      resolver_step&.dig("env", "TRUSTED_REF") == "${{ github.sha }}" &&
+      resolver_run.include?('repos/$REPO/contents/$path?ref=$TRUSTED_REF') &&
+      resolver_run.include?('"${#TRUSTED_REF}" -eq 40') &&
+      resolver_run.include?('trusted_root="$RUNNER_TEMP/relay-source-resolver"') &&
+      source_step&.dig("env", "SOURCE_RESOLVER") == "${{ steps.source_resolver.outputs.path }}" &&
+      source_step&.fetch("if", "").to_s.include?("steps.trusted_checkout.outcome == 'success'"),
+    "read-only archive relay cannot recover its source resolver independently from a trusted workflow revision"
+  )
+  source_bind = source_run.index('"$SOURCE_RESOLVER" "$REPO" "$pr"')
   source_accept = source_run.index('[ "$bind_rc" -eq 0 ] || exit "$bind_rc"')
   source_arm = source_run.index('echo "source_bound=true"')
   require_shape.call(
@@ -475,11 +489,15 @@ if relay_job.is_a?(Hash)
     step["if"].to_s.include?("steps.source.outcome == 'failure'")
   end
   recovery_run = recovery_step&.fetch("run", "").to_s
-  recovery_bind = recovery_run.index('scripts/workflow/feedback-archive-relay-source.sh "$REPO" "$pr"')
+  recovery_bind = recovery_run.index('"$SOURCE_RESOLVER" "$REPO" "$pr"')
   recovery_reject = recovery_run.index('if [ "$bind_rc" -ne 0 ]; then')
   recovery_publish = recovery_run.index('gh api --method POST "repos/$REPO/check-runs"')
   require_shape.call(
-    [recovery_bind, recovery_reject, recovery_publish].all? &&
+    recovery_step&.fetch("if", "").to_s.include?("always()") &&
+      recovery_step&.fetch("if", "").to_s.include?("steps.trusted_checkout.outcome != 'success'") &&
+      recovery_step&.fetch("if", "").to_s.include?("steps.source_resolver.outcome == 'success'") &&
+      recovery_step&.dig("env", "SOURCE_RESOLVER") == "${{ steps.source_resolver.outputs.path }}" &&
+      [recovery_bind, recovery_reject, recovery_publish].all? &&
       recovery_bind < recovery_reject && recovery_reject < recovery_publish &&
       recovery_run.include?(%q{head_sha=$(jq -r '.publish_head_sha' <<<"$binding")}) &&
       recovery_run.include?('[ "$requires_relay" != true ]') &&

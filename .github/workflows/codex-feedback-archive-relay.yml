@@ -46,18 +46,75 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo (default branch — trusted relay scripts)
+        id: trusted_checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           fetch-depth: 1
 
+      - name: Prepare the trusted source resolver
+        id: source_resolver
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TRUSTED_REF: ${{ github.sha }}
+          CHECKOUT_OUTCOME: ${{ steps.trusted_checkout.outcome }}
+        run: |
+          set -euo pipefail
+          case "$TRUSTED_REF" in ''|*[!0-9a-f]*) echo "::error::Trusted workflow ref is not a full commit SHA"; exit 1 ;; esac
+          [ "${#TRUSTED_REF}" -eq 40 ] || { echo "::error::Trusted workflow ref is not a full commit SHA"; exit 1; }
+
+          if [ "$CHECKOUT_OUTCOME" = success ]; then
+            resolver="$GITHUB_WORKSPACE/scripts/workflow/feedback-archive-relay-source.sh"
+            dependency="$GITHUB_WORKSPACE/scripts/lib/gh-api-array.sh"
+            [ -x "$resolver" ] && [ -r "$dependency" ] \
+              || { echo "::error::Trusted checkout is missing the source resolver or its dependency"; exit 1; }
+          else
+            # `workflow_run` pins GITHUB_SHA to the trusted default-branch
+            # workflow version. Recover only these two inert resolver files at
+            # that exact commit; never load code from the source run's head or
+            # from a partial checkout left by the failed action.
+            trusted_root="$RUNNER_TEMP/relay-source-resolver"
+            mkdir -p "$trusted_root/scripts/workflow" "$trusted_root/scripts/lib"
+            resolver="$trusted_root/scripts/workflow/feedback-archive-relay-source.sh"
+            dependency="$trusted_root/scripts/lib/gh-api-array.sh"
+            fetch_trusted_file() {
+              local path="$1" destination="$2" response
+              response=$(mktemp "$RUNNER_TEMP/relay-source-content.XXXXXX")
+              if ! gh api "repos/$REPO/contents/$path?ref=$TRUSTED_REF" >"$response"; then
+                rm -f "$response"
+                return 1
+              fi
+              if ! jq -e '.type == "file" and .encoding == "base64" and (.content | type == "string")' \
+                "$response" >/dev/null \
+                || ! jq -r '.content' "$response" | tr -d '\n' | base64 --decode >"$destination"; then
+                rm -f "$response" "$destination"
+                return 1
+              fi
+              rm -f "$response"
+              [ -s "$destination" ]
+            }
+            fetch_trusted_file \
+              scripts/workflow/feedback-archive-relay-source.sh "$resolver" \
+              || { echo "::error::Could not recover the trusted source resolver at $TRUSTED_REF"; exit 1; }
+            fetch_trusted_file scripts/lib/gh-api-array.sh "$dependency" \
+              || { echo "::error::Could not recover the trusted resolver dependency at $TRUSTED_REF"; exit 1; }
+            chmod 0755 "$resolver"
+          fi
+          echo "path=$resolver" >> "$GITHUB_OUTPUT"
+
       - name: Resolve the source PR and read-only boundary
         id: source
+        if: >-
+          ${{ steps.trusted_checkout.outcome == 'success' &&
+          steps.source_resolver.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RESOLVER: ${{ steps.source_resolver.outputs.path }}
         run: |
           set -euo pipefail
           title=$(jq -r '.workflow_run.display_title // ""' "$GITHUB_EVENT_PATH")
@@ -71,7 +128,7 @@ jobs:
           source_run=$(jq -c '.workflow_run' "$GITHUB_EVENT_PATH")
           set +e
           binding=$(printf '%s' "$source_run" \
-            | scripts/workflow/feedback-archive-relay-source.sh "$REPO" "$pr")
+            | "$SOURCE_RESOLVER" "$REPO" "$pr")
           bind_rc=$?
           set -e
           if [ "$bind_rc" -eq 4 ]; then
@@ -99,11 +156,15 @@ jobs:
         # terminal marker: a `failed` marker on a run that never needed the relay
         # would wedge accounting permanently, while a failing check is bounded by
         # the sweep that republishes the truth.
-        if: ${{ always() && steps.source.outcome == 'failure' }}
+        if: >-
+          ${{ always() && steps.source_resolver.outcome == 'success' &&
+          (steps.trusted_checkout.outcome != 'success' ||
+          steps.source.outcome == 'failure') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RESOLVER: ${{ steps.source_resolver.outputs.path }}
           CHECK_NAME: Codex P1 unresolved threads
         run: |
           set -uo pipefail
@@ -121,7 +182,7 @@ jobs:
           for attempt in 1 2 3; do
             set +e
             binding=$(printf '%s' "$source_run" \
-              | scripts/workflow/feedback-archive-relay-source.sh "$REPO" "$pr")
+              | "$SOURCE_RESOLVER" "$REPO" "$pr")
             bind_rc=$?
             set -e
             [ "$bind_rc" -eq 0 ] && break
@@ -156,8 +217,8 @@ jobs:
             if gh api --method POST "repos/$REPO/check-runs" \
               -f name="$CHECK_NAME" -f head_sha="$head_sha" \
               -f status=completed -f conclusion=failure \
-              -f "output[title]=Codex feedback gate — trusted read-only relay could not resolve its source PR" \
-              -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed before it could bind to PR #$pr. Rerun the relay; the scheduled sweep also re-evaluates every 15 minutes." \
+              -f "output[title]=Codex feedback gate — trusted read-only relay setup failed" \
+              -f "output[summary]=The trusted relay for source run $SOURCE_RUN_ID failed after positively binding PR #$pr. Rerun the relay; the scheduled sweep also re-evaluates every 15 minutes." \
               >/dev/null; then
               published=true
               break

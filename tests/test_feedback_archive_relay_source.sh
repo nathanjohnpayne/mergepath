@@ -55,6 +55,20 @@ for arg in "$@"; do
   prev=$arg
 done
 case "$endpoint" in
+  repos/acme/widget/contents/*\?ref=*)
+    path=${endpoint#repos/acme/widget/contents/}
+    path=${path%%\?ref=*}
+    if [ "${FAIL_RESOLVER_DOWNLOAD:-false}" = true ]; then
+      printf 'trusted resolver download failure\n' >&2
+      exit 1
+    fi
+    case "$path" in
+      scripts/workflow/feedback-archive-relay-source.sh|scripts/lib/gh-api-array.sh) ;;
+      *) printf 'unexpected trusted resolver path: %s\n' "$path" >&2; exit 65 ;;
+    esac
+    jq -n --arg content "$(base64 <"$TEST_ROOT/$path" | tr -d '\n')" \
+      '{type:"file",encoding:"base64",content:$content}'
+    ;;
   repos/acme/widget/pulls/[0-9]*)
     pr=${endpoint##*/}
     file_var="PR_$pr"
@@ -253,6 +267,34 @@ awk '
 ' "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" >"$RECOVERY"
 [ -s "$RECOVERY" ] || { echo "could not extract relay recovery writer" >&2; exit 1; }
 chmod +x "$RECOVERY"
+
+# The recovery uses a resolver path supplied by the preceding trusted setup
+# step. Execute that setup after a simulated checkout failure, with contents
+# responses served by the gh shim, so the recovery path proves it uses the
+# downloaded helper and its colocated dependency rather than the workspace.
+PREPARE_RESOLVER="$TMP/prepare-resolver.sh"
+awk '
+  /name: Prepare the trusted source resolver/ { active=1 }
+  active && /^      - name: Resolve the source PR and read-only boundary/ { exit }
+  active && /^        run: \|$/ { body=1; next }
+  body { sub(/^          /, ""); print }
+' "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" >"$PREPARE_RESOLVER"
+[ -s "$PREPARE_RESOLVER" ] || { echo "could not extract trusted resolver preparation" >&2; exit 1; }
+chmod +x "$PREPARE_RESOLVER"
+TRUSTED_REF=$(sha 99)
+run_fallback_prepare() {
+  : >"$GH_LOG"
+  rm -rf "$TMP/fallback-runner"
+  : >"$TMP/resolver-output"
+  set +e
+  PATH="$BIN:$PATH" GH_LOG="$GH_LOG" TEST_ROOT="$ROOT" RUNNER_TEMP="$TMP/fallback-runner" \
+    GITHUB_WORKSPACE="$TMP/missing-checkout" REPO="$BASE_REPO" TRUSTED_REF="$TRUSTED_REF" \
+    CHECKOUT_OUTCOME=failure GITHUB_OUTPUT="$TMP/resolver-output" "$PREPARE_RESOLVER" \
+    >"$TMP/prepare.out" 2>"$TMP/prepare.err"
+  PREPARE_RC=$?
+  set -e
+  PREPARED_RESOLVER=$(sed -n 's/^path=//p' "$TMP/resolver-output")
+}
 run_recovery() {
   : >"$GH_LOG"
   jq -n --argjson pr "$1" --arg event "$2" --arg head "$3" --argjson repo_id "$4" \
@@ -261,7 +303,7 @@ run_recovery() {
   set +e
   PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" \
     GITHUB_EVENT_PATH="$TMP/event.json" RUNNER_TEMP="$TMP" REPO="$BASE_REPO" \
-    SOURCE_RUN_ID=501 CHECK_NAME='Codex P1 unresolved threads' "$RECOVERY" >"$TMP/recovery.out" 2>"$TMP/recovery.err"
+    SOURCE_RESOLVER="${9:-$SCRIPT}" SOURCE_RUN_ID=501 CHECK_NAME='Codex P1 unresolved threads' "$RECOVERY" >"$TMP/recovery.out" 2>"$TMP/recovery.err"
   RECOVERY_RC=$?
   set -e
 }
@@ -284,6 +326,46 @@ if grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/nu
 else
   fail "actual recovery writer did not target the bound PR API head: $(cat "$GH_LOG")"
 fi
+
+# A failed checkout skips the ordinary source step. The actual preparation
+# block must recover only the trusted resolver pair at the workflow SHA; then
+# the actual recovery block may publish a failure for a positively bound run.
+# This executes those two blocks from an otherwise checkout-free directory.
+run_fallback_prepare
+assert_eq "$PREPARE_RC" 0 "actual fallback preparation succeeds after checkout failure"
+assert_eq "$PREPARED_RESOLVER" "$TMP/fallback-runner/relay-source-resolver/scripts/workflow/feedback-archive-relay-source.sh" "fallback preparation exports its isolated trusted resolver path"
+if [ -x "$PREPARED_RESOLVER" ] \
+  && [ -r "$TMP/fallback-runner/relay-source-resolver/scripts/lib/gh-api-array.sh" ]; then
+  pass "fallback preparation downloads the resolver and its required dependency"
+else
+  fail "fallback preparation did not materialize the isolated resolver pair"
+fi
+run_recovery 41 pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml@refs/heads/main' "$PREPARED_RESOLVER"
+assert_eq "$RECOVERY_RC" 1 "checkout-failure recovery publishes a bound terminal failure"
+if [ "$(grep -Ec $'\t(POST|PATCH|DELETE)\t|--method\t(POST|PATCH|DELETE)' "$GH_LOG")" -eq 1 ] \
+  && grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+  && grep -F -- "head_sha=$PUBLISH" "$GH_LOG" >/dev/null \
+  && ! grep -F -- "head_sha=$SRC" "$GH_LOG" >/dev/null; then
+  pass "checkout-failure recovery writes only the positively bound API head"
+else
+  fail "checkout-failure recovery did not limit publication to the bound API head: $(cat "$GH_LOG")"
+fi
+
+# The fallback resolver retains its rejection boundary: recovering it after a
+# checkout failure cannot turn a forged title into permission to publish.
+run_fallback_prepare
+assert_eq "$PREPARE_RC" 0 "fallback preparation remains available for an unbound source"
+run_recovery 77 pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml' "$PREPARED_RESOLVER"
+assert_eq "$RECOVERY_RC" 1 "checkout-failure recovery remains inert for an unbound source"
+assert_empty_writes "checkout-failure fallback makes no target mutation for a forged source"
+
+# A failed trusted download exports no resolver path. In the workflow this
+# leaves the normal source step skipped and the recovery condition unarmed;
+# preparation itself must have made no target-PR mutation.
+FAIL_RESOLVER_DOWNLOAD=true run_fallback_prepare
+assert_eq "$PREPARE_RC" 1 "fallback preparation fails closed when trusted resolver download fails"
+assert_eq "$PREPARED_RESOLVER" "" "failed fallback preparation exports no resolver path"
+assert_empty_writes "failed fallback preparation makes no target-PR mutation"
 
 # Execute the actual persist writer from the workflow in a scratch trusted
 # checkout. The two locally supplied commands are only its gate/fingerprint
