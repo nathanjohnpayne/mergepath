@@ -4312,6 +4312,25 @@ crw_probe_head_review_in_progress() {
   return 0
 }
 
+# True (0) when <body> is CodeRabbit's SUCCESSFUL review-trigger
+# acknowledgement ("✅ Actions performed" / "Review triggered", including the
+# "Full review triggered" form); 1 when it is not; 3 when the body could not be
+# read. crw_provider_owned_refusal_class folds this into `status_probe` with
+# the no-op "Already reviewed the last commit" reply, which is right for the
+# refusal guard (neither supersedes a refusal) but not for the carry-forward
+# (Codex P1 on #1340): a successful trigger means a review is STARTING, and it
+# can land before CodeRabbit publishes the `pending` status. Same bounded,
+# case-folded lead the narration classifier reads.
+crw_review_trigger_accepted() {
+  local unfenced lead
+  unfenced=$(crw_unfenced_body "$1") || return 3
+  lead=$(awk 'NF { line = $0; sub(/[[:space:]]+$/, "", line); print line; if (++n == 6) exit }' <<<"$unfenced") || return 3
+  lead=$(printf '%s' "$lead" | tr '[:upper:]' '[:lower:]') || return 3
+  grep -Fq '✅ actions performed' <<<"$lead" || return 1
+  grep -Fq 'review triggered' <<<"$lead" || return 1
+  return 0
+}
+
 # Same-content carry-forward evidence (#1335). <summary-body>
 #
 # A base-only update head — a merge from the base branch that changes none of
@@ -4483,6 +4502,33 @@ crw_probe_carryforward_evidence() {
           log "probe: CodeRabbit's newest comment is a $newest_class notice that the head's later success ($updated_at) supersedes — not current, carry-forward still considered (#1335)" ;;
       esac
     fi
+    # A review TRIGGERED after the head's last completed run (Codex P1 on
+    # #1340). CodeRabbit acknowledges a successful `@coderabbitai review`
+    # before it flips the status to `pending`, and the selector above skips
+    # that acknowledgement as narration — so the summary, the reviews and the
+    # status can all still read as before while a run that may publish a
+    # finding is starting. Any successful-trigger acknowledgement fresher than
+    # the success sample suppresses the evidence; an older one is the run that
+    # produced that success. Unread rungs emit nothing.
+    local acks="" ack_row="" ack_body="" ack_rc=0
+    acks=$(printf '%s' "$fresh" | jq -r --arg bot "$BOT_LOGIN" --arg s "$updated_at" '
+      [ .[] | select(.user.login == $bot)
+        | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+        | select(.fresh_at > $s) ]
+      | .[] | (.body // "") | @base64') \
+      || { log "probe: carry-forward re-scan could not list CodeRabbit comments newer than the success — emitting no evidence (#1335)"; return 0; }
+    while IFS= read -r ack_row; do
+      [ -n "$ack_row" ] || continue
+      ack_body=$(printf '%s' "$ack_row" | base64 --decode 2>/dev/null) \
+        || { log "probe: carry-forward re-scan could not decode a CodeRabbit comment — emitting no evidence (#1335)"; return 0; }
+      ack_rc=0
+      crw_review_trigger_accepted "$ack_body" || ack_rc=$?
+      case "$ack_rc" in
+        0) log "probe: CodeRabbit acknowledged a review trigger after the success on $HEAD_SHA ($updated_at) — a run is starting, so no carry-forward evidence (#1335)"; return 0 ;;
+        1) ;;
+        *) log "probe: carry-forward re-scan could not read a CodeRabbit comment for a trigger acknowledgement — emitting no evidence (#1335)"; return 0 ;;
+      esac
+    done <<<"$acks"
     # The summary is not the only thing that can land in the gap. #869
     # records that a head-pinned review RUN and the per-SHA success can
     # publish BEFORE the summary edit, so an unchanged summary does not prove

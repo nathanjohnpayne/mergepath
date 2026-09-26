@@ -3767,22 +3767,45 @@ for a in "$@"; do
     *'.body'*) printf 'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n'; exit 0 ;;
   esac
 done
+# `gh api ... --jq EXPR` applies EXPR to the response; emulate that so the
+# fixtures below are documents, not per-expression answers.
+jqexpr=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = --jq ] && jqexpr=$a
+  prev=$a
+done
+emit() {
+  if [ -n "$jqexpr" ]; then printf '%s' "$1" | jq -rc "$jqexpr"; else printf '%s\n' "$1"; fi
+}
 case "$endpoint" in
   repos/owner/repo/issues/7/comments)
     [ "${P4B_TEST_COMMENTS_FAIL:-false}" != true ] || exit 42
     printf '%s\n' "${P4B_TEST_COMMENTS_JSON-[]}" ;;
-  repos/owner/repo/pulls/7/files)
-    # #1335: the carry-forward reads the changed-file set once for both
-    # fingerprints. The content never matters here (the fingerprint delegate
-    # is stubbed); the failure knob does.
+  repos/owner/repo/compare/*)
+    # #1335: the carry-forward's changed-file set, bound to the head by the
+    # compare range. Content never matters (the fingerprint delegate is
+    # stubbed); the failure and file-count knobs do.
     [ "${P4B_TEST_FILES_FAIL:-false}" != true ] || exit 42
-    printf '[{"filename":"scripts/x.sh"}]\n' ;;
-  repos/owner/repo/pulls/7)
-    if [ "${2:-}" = --jq ]; then
-      printf '%s\n' "${P4B_TEST_LIVE_HEAD:-abc123}"
+    emit "$(jq -nc --argjson n "${P4B_TEST_COMPARE_COUNT:-1}" '{files: [range($n) | {filename: "scripts/x\(.).sh"}]}')" ;;
+  repos/owner/repo/commits/*)
+    # #1335: a commit's tree, for the CodeRabbit-config identity. The tree sha
+    # IS the commit sha here, which keeps the per-commit config knob simple.
+    [ "${P4B_TEST_CFG_FAIL:-false}" != true ] || exit 42
+    sha=${endpoint##*/}
+    emit "{\"commit\":{\"tree\":{\"sha\":\"$sha\"}}}" ;;
+  repos/owner/repo/git/trees/*)
+    # P4B_TEST_CFG_<tree> is the .coderabbit.yml blob at that commit
+    # (default: the same blob everywhere; "none" = no config file).
+    tree=${endpoint##*/}
+    eval "blob=\${P4B_TEST_CFG_$tree:-cfgsame}"
+    if [ "$blob" = none ]; then
+      emit '{"tree":[{"path":"README.md","sha":"r"}]}'
     else
-      printf '{"head":{"sha":"%s"}}\n' "${P4B_TEST_LIVE_HEAD:-abc123}"
+      emit "{\"tree\":[{\"path\":\"README.md\",\"sha\":\"r\"},{\"path\":\".coderabbit.yml\",\"sha\":\"$blob\"}]}"
     fi ;;
+  repos/owner/repo/pulls/7)
+    emit "{\"head\":{\"sha\":\"${P4B_TEST_LIVE_HEAD:-abc123}\"},\"base\":{\"sha\":\"${P4B_TEST_BASE_SHA:-3333333333333333333333333333333333333333}\"}}" ;;
   *)
     printf '[]\n' ;;
 esac
@@ -4273,6 +4296,36 @@ for _case in src-fail head-fail no-review files-fail; do
   export "P4B_TEST_FP_$_H=external-review:v2:same" "P4B_TEST_FP_$_L=external-review:v2:same"
 done
 
+# 3b. Codex P2 on #1340: the CodeRabbit configuration must be the one the
+#     carried review ran under, and the changed-file set must be <head>'s own
+#     and complete. Each refusal happens before any fingerprint is computed.
+_cfreset
+export "P4B_TEST_CFG_$_L=cfgold"
+out="$(_barrier 0 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad cfg-changed-rc=$rc"
+printf '%s' "$out" | jq -e '.coderabbit == "not-yet"' >/dev/null 2>&1 || bad="$bad cfg-changed-class"
+[ ! -s "$_fplog" ] || bad="$bad cfg-changed-fingerprinted"
+unset "P4B_TEST_CFG_$_L"
+_cfreset
+export "P4B_TEST_CFG_$_H=none"
+out="$(_barrier 0 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad cfg-removed-rc=$rc"
+unset "P4B_TEST_CFG_$_H"
+_cfreset
+out="$(P4B_TEST_CFG_FAIL=true _barrier 0 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad cfg-unreadable-rc=$rc"
+[ ! -s "$_fplog" ] || bad="$bad cfg-unreadable-fingerprinted"
+_cfreset
+out="$(P4B_TEST_COMPARE_COUNT=300 _barrier 0 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad compare-capped-rc=$rc"
+[ ! -s "$_fplog" ] || bad="$bad compare-capped-fingerprinted"
+# Control: 299 files and an unchanged config (both absent) still carry.
+_cfreset
+export "P4B_TEST_CFG_$_H=none" "P4B_TEST_CFG_$_L=none"
+out="$(P4B_TEST_COMPARE_COUNT=299 _barrier 0 7 "$(_cfjson none success true)" "" "$_H")" && rc=0 || rc=$?
+[ "$rc" = 0 ] || bad="$bad compare-299-noconfig-rc=$rc"
+unset "P4B_TEST_CFG_$_H" "P4B_TEST_CFG_$_L"
+
 # 4. The head's own run must be FINISHED, and not the `Review rate limited`
 #    kind of success: a run still underway could yet publish a finding, and
 #    an unsampled status (trust opt-out) proves nothing. None of these even
@@ -4350,9 +4403,18 @@ EOF
 mkdir -p "$WORK/cf-bin"
 cat >"$WORK/cf-bin/gh" <<EOF
 #!/usr/bin/env bash
-# The orchestrator fake serves no PR files list; the carry-forward reads one.
-if [ "\${1:-}" = api ] && [ "\${2:-}" = --paginate ] && [ "\${3:-}" = repos/o/r/pulls/1335/files ]; then
-  printf '[{"filename":"scripts/x.sh"}]\n'; exit 0
+# The orchestrator fake serves none of the carry-forward's reads: the PR base
+# sha, the head-bound compare, and the commit/tree reads for the CodeRabbit
+# config identity. Everything else goes to the orchestrator fake.
+if [ "\${1:-}" = api ]; then
+  case "\${2:-} \${4:-}" in
+    "repos/o/r/pulls/1335 .base.sha") printf '3333333333333333333333333333333333333333'; exit 0 ;;
+  esac
+  case "\${2:-}" in
+    repos/o/r/compare/*) printf '[{"filename":"scripts/x.sh"}]'; exit 0 ;;
+    repos/o/r/commits/*) printf '4444444444444444444444444444444444444444'; exit 0 ;;
+    repos/o/r/git/trees/*) printf '[{"path":".coderabbit.yml","sha":"cfgsame"}]'; exit 0 ;;
+  esac
 fi
 exec "$BIN/gh" "\$@"
 EOF

@@ -1429,6 +1429,25 @@ Already reviewed the last commit.
   # 21. The same notice with its window still OPEN (59 minutes from 03:30 on
   #     the fake clock), even though the success postdates it: blocks.
   CODERABBIT_TEST_STATUS_TIME=2033-05-18T03:31:00Z _notice_case ratelimit-open 'Rate limit exceeded. Please wait 59 minutes and 0 seconds before requesting another review.' 2 2033-05-18T03:30:00Z 2033-05-18T03:29:00Z none summary-without-head-review
+  # 24-25. Codex P1 on #1340 (71990e2): a SUCCESSFUL review-trigger
+  #     acknowledgement means a run is starting, and CodeRabbit posts it
+  #     before the status flips to pending. The selector skips it as
+  #     narration, so it needs its own check. (Case 18 above is the no-op
+  #     "Already reviewed" reply newer than the success, which still carries.)
+  local ack_note='<!-- This is an auto-generated reply by CodeRabbit -->
+<details>
+<summary>✅ Actions performed</summary>
+
+Review triggered.
+
+> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.
+
+</details>'
+  # 24. Acknowledged AFTER the success sample: a run is starting — no evidence.
+  _notice_case trigger-ack-after-success "$ack_note" 1 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z none summary-without-head-review
+  # 25. Acknowledged BEFORE the success: the run it started is the one that
+  #     completed — carries.
+  CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:30Z _notice_case trigger-ack-before-success "$ack_note" 1 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z evidence summary-without-head-review
   unset -f _notice_case
 
   # 22. Codex P1 on #1340: the status flips between the first sample and the

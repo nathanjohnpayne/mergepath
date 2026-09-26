@@ -556,10 +556,10 @@ p4b_codex_timeout_determination() {
 #     non-empty                 (no external review required, or >=3000
 #                               files) proves nothing and does not carry
 #
-# Both fingerprints are computed from ONE read of the PR's changed files, so
-# they hash the same path set. A push landing between the probe and that read
-# can make the set belong to a newer head; that run is void regardless, since
-# the orchestrator's live-head check refuses to post on a drifted head.
+# Both fingerprints are computed from ONE changed-file list, so they hash the
+# same path set, and that list is <head>'s own (compare/<base>...<head>), so no
+# push, force-push or intervening head can substitute another head's set.
+# The CodeRabbit configuration file must also be identical at both commits.
 #
 # Deliberately CodeRabbit-only. The Codex arm keeps its head-identity contract
 # (--diagnostic-signal-only disables the #705 Codex carry-forward), because
@@ -570,10 +570,26 @@ p4b_carryforward_refusal() {
   jq -nc --arg r "$1" '{carried:false, reason:$r}'
 }
 
+# p4b_coderabbit_config_identity <repo> <sha>
+# The repository CodeRabbit configuration AT <sha>, as a canonical string of
+# its root-tree entries ({path, blob sha} for .coderabbit.yml / .coderabbit.yaml;
+# "[]" when there is none). Returns 3 on any unread rung. Codex P2 on #1340:
+# the external-review fingerprint covers only the PR's own paths, so a
+# base-only update that changes this file compares equal while CodeRabbit's
+# profile and path_instructions moved under the review being carried.
+p4b_coderabbit_config_identity() {
+  local repo="$1" sha="$2" tree
+  tree="$(gh_api_scalar --shape sha "tree of $sha for the CodeRabbit config identity" \
+    "repos/$repo/commits/$sha" --jq '.commit.tree.sha')" || return 3
+  gh_api_scalar "CodeRabbit config entries at $sha" "repos/$repo/git/trees/$tree" \
+    --jq '[.tree[]? | select(.path == ".coderabbit.yml" or .path == ".coderabbit.yaml") | {path, sha}] | sort_by(.path) | tostring' \
+    || return 3
+}
+
 p4b_barrier_coderabbit_carryforward() {
   local repo="$1" pr="$2" head="$3" rc="$4" json="$5"
   local observed reviewed state permits root fp_bin cfg files files_file
-  local head_fp src_fp head_out src_out
+  local head_fp src_fp head_out src_out head_cfg src_cfg base_sha nfiles
 
   if [ "$rc" != 7 ]; then p4b_carryforward_refusal "probe rc $rc is not a not-yet"; return 1; fi
   observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
@@ -595,15 +611,45 @@ p4b_barrier_coderabbit_carryforward() {
     return 1
   fi
 
-  if [ "$P4B_GH_API_ARRAY_OK" != true ] || ! command -v gh_api_array >/dev/null 2>&1; then
-    p4b_carryforward_refusal "array reader unavailable"; return 1
+  if ! command -v gh_api_scalar >/dev/null 2>&1; then
+    p4b_carryforward_refusal "scalar reader unavailable"; return 1
   fi
   root="$(p4b_repo_root)"
   fp_bin="${P4B_EXTERNAL_REVIEW_FINGERPRINT:-$root/scripts/workflow/external_review_fingerprint.sh}"
   cfg="$(p4b_config)"
   if [ ! -r "$fp_bin" ]; then p4b_carryforward_refusal "fingerprint helper missing at $fp_bin"; return 1; fi
-  files="$(gh_api_array "repos/$repo/pulls/$pr/files" "PR files for the CodeRabbit carry-forward")" \
-    || { p4b_carryforward_refusal "PR files read failed"; return 1; }
+
+  # The CodeRabbit configuration must be the one the carried review ran
+  # under (Codex P2 on #1340) — see p4b_coderabbit_config_identity.
+  head_cfg="$(p4b_coderabbit_config_identity "$repo" "$head")" \
+    || { p4b_carryforward_refusal "could not read the CodeRabbit configuration at $head"; return 1; }
+  src_cfg="$(p4b_coderabbit_config_identity "$repo" "$reviewed")" \
+    || { p4b_carryforward_refusal "could not read the CodeRabbit configuration at $reviewed"; return 1; }
+  if [ "$head_cfg" != "$src_cfg" ]; then
+    p4b_carryforward_refusal "the CodeRabbit configuration changed since $reviewed, so its review ran under different settings"
+    return 1
+  fi
+
+  # The changed-file set, BOUND TO <head> (Codex P2 on #1340). The live
+  # /pulls/{pr}/files list describes whatever the PR head is at read time,
+  # so a head that moved to T and was force-pushed back to <head> before the
+  # orchestrator's final head check could hand both fingerprints T's path set
+  # — one that omits a path where <head> and the reviewed commit differ.
+  # compare/<base>...<head> is keyed on two explicit SHAs, the same merge-base
+  # shape the fingerprint itself uses. It returns at most 300 files, so a
+  # list that reaches the cap proves nothing about the paths beyond it.
+  base_sha="$(gh_api_scalar --shape sha "PR base sha for the CodeRabbit carry-forward" \
+    "repos/$repo/pulls/$pr" --jq '.base.sha')" \
+    || { p4b_carryforward_refusal "PR base sha read failed"; return 1; }
+  files="$(gh_api_scalar "changed files of $head for the CodeRabbit carry-forward" \
+    "repos/$repo/compare/$base_sha...$head" --jq '.files // [] | tostring')" \
+    || { p4b_carryforward_refusal "changed-file read for $head failed"; return 1; }
+  if ! nfiles="$(printf '%s' "$files" | jq -e 'if type == "array" then length else error("not a list") end' 2>/dev/null)"; then
+    p4b_carryforward_refusal "changed-file list for $head is unreadable"; return 1
+  fi
+  if [ "$nfiles" -ge 300 ]; then
+    p4b_carryforward_refusal "changed-file list for $head reached the compare API's 300-file cap"; return 1
+  fi
   files_file="$(mktemp "${TMPDIR:-/tmp}/p4b-cf-files.XXXXXX")" \
     || { p4b_carryforward_refusal "mktemp failed"; return 1; }
   printf '%s' "$files" >"$files_file"
