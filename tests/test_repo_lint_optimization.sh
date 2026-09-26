@@ -215,6 +215,32 @@ else
     fail "phase-4b-review.sh must select both Phase 4b wrappers (got $selected)"
   fi
 
+  parser_routing_ok=1
+  for path in scripts/lib/pr-body-contract.mjs scripts/lib/pr-body-contract.sh \
+      scripts/lib/pr-body-contract.source.mjs scripts/lib/pr-body-contract.bundle/rebuild.mjs; do
+    selected=$(scope_value checks pull_request "$path")
+    full=$(scope_value full pull_request "$path")
+    if [ "$full" != "false" ] \
+       || ! jq -e 'index("check_gh_as_author") != null and index("check_phase_4b_automation") != null' \
+         <<<"$selected" >/dev/null 2>&1; then
+      parser_routing_ok=0
+      echo "INFO: $path full=$full selected=$selected" >&2
+    fi
+  done
+  if [ "$parser_routing_ok" -eq 1 ]; then
+    pass "shared PR-body parser implementation selects parity and Phase 4b behavioral coverage"
+  else
+    fail "every shared PR-body parser implementation input must select parity and Phase 4b automation coverage"
+  fi
+
+  selected=$(scope_value checks pull_request tests/test_required_check_publisher_summary_hold.sh)
+  full=$(scope_value full pull_request tests/test_required_check_publisher_summary_hold.sh)
+  if [ "$full" = "false" ] && [ "$selected" = '["check_required_check_publisher"]' ]; then
+    pass "publisher summary-hold suite selects only its publisher self-test"
+  else
+    fail "publisher summary-hold suite must avoid full deep fallback (full=$full, selected=$selected)"
+  fi
+
   if [ "$(scope_value full pull_request scripts/ci/repo-lint-scope.sh)" = "true" ] \
      && [ "$(scope_value checks pull_request scripts/ci/repo-lint-scope.sh)" = '[]' ]; then
     pass "classifier and graph changes fail closed to the full deep surface"
