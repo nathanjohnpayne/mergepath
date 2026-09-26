@@ -145,6 +145,20 @@ Review triggered.
 # rendering of the leading block.
 ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY=$'<DeTaIlS>  \r\n<SuMmArY>✅ AcTiOnS PeRfOrMeD</sUmMaRy>\r\n\r\nReViEw TrIgGeReD. \r\n\r\nNoTe: CoDeRaBbIt Is An InCrEmEnTaL ReViEw SyStEm and does not re-review already reviewed commits.\r'
 
+FULL_REVIEW_TRIGGER_BODY='<details><summary>✅ Actions performed</summary>
+
+Full review triggered.'
+
+FULL_REVIEW_TRIGGER_WITH_NOTE_BODY='<details><summary>✅ Actions performed</summary>
+
+Full review triggered.
+
+> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits.'
+
+REVIEW_TRIGGER_WITHOUT_NOTE_BODY='<details><summary>✅ Actions performed</summary>
+
+Review triggered.'
+
 BARE_STATUS_PROBE_BODY='CodeRabbit review command invocation
 Still checking.'
 
@@ -817,14 +831,14 @@ test_selected_comment_structural_failure_fails_closed() {
 
   dir=$(make_case "selected-comment-structural-failure-main" "$REVIEW_BODY_CLEAN")
   sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
-  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=2 run_case "$dir")
+  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=3 run_case "$dir")
   [ "$rc" = "3" ] || fail "3b6b main: structural classification failure must stop polling with infra, got $rc; err=$(tail -6 "$dir/err.log")"
   grep -q 'could not structurally classify the latest CodeRabbit comment' "$dir/err.log" || fail "3b6b main: expected fail-closed structural-classification diagnostic"
 
   dir=$(make_case "selected-comment-structural-failure-terminal" "$REVIEW_BODY_CLEAN")
   sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
   sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 0/' "$dir/.github/review-policy.yml"
-  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=2 run_case "$dir")
+  rc=$(CODERABBIT_TEST_FAIL_STRUCTURAL_ON=3 run_case "$dir")
   [ "$rc" = "4" ] || fail "3b6b terminal: structural classification failure must preserve advisory timeout, got $rc; err=$(tail -6 "$dir/err.log")"
   grep -q 'could not be structurally classified' "$dir/err.log" || fail "3b6b terminal: expected suppressed terminal-upgrade diagnostic"
   [ "$FAIL" -ne "$before" ] || pass "3b6b: selected-comment structural reader failure stops polling and suppresses terminal clearance"
@@ -849,7 +863,7 @@ Here is a summary of where things stand.' ;;
 
 test_status_probe_does_not_supersede_refusal() {
   local mode reply dir rc before=$FAIL
-  for mode in wrapped wrapped-summary-whitespace wrapped-incremental mention mention-apostrophe bare actions-performed actions-performed-split; do
+  for mode in wrapped wrapped-summary-whitespace wrapped-incremental mention mention-apostrophe bare actions-performed actions-performed-split full-review full-review-note; do
     case "$mode" in
       wrapped) reply=$WRAPPED_STATUS_PROBE_BODY ;;
       wrapped-summary-whitespace) reply=$WRAPPED_SUMMARY_STATUS_PROBE_BODY ;;
@@ -859,6 +873,8 @@ test_status_probe_does_not_supersede_refusal() {
       bare) reply=$BARE_STATUS_PROBE_BODY ;;
       actions-performed) reply=$ACTIONS_PERFORMED_STATUS_PROBE_BODY ;;
       actions-performed-split) reply=$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY ;;
+      full-review) reply=$FULL_REVIEW_TRIGGER_BODY ;;
+      full-review-note) reply=$FULL_REVIEW_TRIGGER_WITH_NOTE_BODY ;;
     esac
     dir=$(make_case "refusal-before-$mode-status-probe" "$RATE_LIMIT_BODY_HEADREF" \
       "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
@@ -898,7 +914,7 @@ test_structural_status_probes_are_excluded_by_polling_selector() {
 # new same-head run is starting. Skipping it there exposes the older clean
 # publication underneath and can clear before the replacement report lands.
 test_trigger_ack_is_polling_in_progress() {
-  local mode reply dir rc before=$FAIL quoted fenced
+  local mode reply dir rc before=$FAIL quoted fenced refusal_with_trigger
   dir=$(make_case "polling-clean-before-trigger-ack" "$REVIEW_BODY_CLEAN" \
     "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
     "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
@@ -908,6 +924,39 @@ test_trigger_ack_is_polling_in_progress() {
   [ "$rc" = "4" ] || fail "3b10 ack: accepted trigger must keep polling instead of clearing the older summary, got $rc; err=$(tail -6 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" = "timeout" ] || fail "3b10 ack: expected bounded timeout while the acknowledged run remains in progress"
   grep -q 'class=in_progress' "$dir/err.log" || fail "3b10 ack: polling never classified the accepted trigger as in_progress"
+
+  # Full-review acknowledgements and the note-less regular form use the same
+  # accepted-trigger contract even though the narrower narration classifier
+  # does not classify all three shapes as status_probe.
+  for mode in full-plain full-note regular-plain; do
+    case "$mode" in
+      full-plain) reply=$FULL_REVIEW_TRIGGER_BODY ;;
+      full-note) reply=$FULL_REVIEW_TRIGGER_WITH_NOTE_BODY ;;
+      regular-plain) reply=$REVIEW_TRIGGER_WITHOUT_NOTE_BODY ;;
+    esac
+    dir=$(make_case "polling-clean-before-$mode-trigger-ack" "$REVIEW_BODY_CLEAN" \
+      "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+      "$reply" "$NOTICE_AFTER_SUMMARY_TIME")
+    sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 15/' "$dir/.github/review-policy.yml"
+    sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+    rc=$(run_case "$dir")
+    [ "$rc" = "4" ] || fail "3b10 $mode: accepted trigger must keep ordinary polling in progress, got $rc; err=$(tail -6 "$dir/err.log")"
+    grep -q 'latest CodeRabbit comment id=7702.*class=in_progress' "$dir/err.log" || fail "3b10 $mode: polling did not classify the accepted trigger as in_progress"
+    grep -q 'latest CodeRabbit comment after status-probe wait is class=in_progress; continuing timeout' "$dir/err.log" || fail "3b10 $mode: post-probe upgrade did not retain the timeout"
+  done
+
+  for mode in full-plain full-note; do
+    case "$mode" in
+      full-plain) reply=$FULL_REVIEW_TRIGGER_BODY ;;
+      full-note) reply=$FULL_REVIEW_TRIGGER_WITH_NOTE_BODY ;;
+    esac
+    dir=$(make_case "polling-refusal-before-$mode-trigger-ack" "$RATE_LIMIT_BODY_HEADREF" \
+      "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+      "$reply" "$NOTICE_AFTER_SUMMARY_TIME")
+    sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+    rc=$(run_case "$dir")
+    [ "$rc" = "5" ] || fail "3b10 refusal before $mode: accepted trigger must not supersede the older refusal, got $rc; err=$(tail -6 "$dir/err.log")"
+  done
 
   # Selection is newest-first. An older accepted acknowledgement must not
   # replace the newest one while both sit above the prior clean publication.
@@ -933,6 +982,20 @@ test_trigger_ack_is_polling_in_progress() {
   [ "$rc" = "4" ] || fail "3b10 fast ack: a post-success accepted trigger must suppress fast-path clearance, got $rc; err=$(tail -6 "$dir/err.log")"
   grep -q 'class=in_progress.*at/after status_created' "$dir/err.log" || fail "3b10 fast ack: expected the trusted fast path to suppress its older success"
 
+  for mode in full-plain full-note; do
+    case "$mode" in
+      full-plain) reply=$FULL_REVIEW_TRIGGER_BODY ;;
+      full-note) reply=$FULL_REVIEW_TRIGGER_WITH_NOTE_BODY ;;
+    esac
+    dir=$(make_case "fast-path-clean-before-$mode-trigger-ack" "$REVIEW_BODY_CLEAN" \
+      "$STATUS_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+      "$reply" "$NOTICE_AFTER_SUMMARY_TIME")
+    sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 15/' "$dir/.github/review-policy.yml"
+    rc=$(run_case "$dir")
+    [ "$rc" = "4" ] || fail "3b10 fast $mode: accepted trigger must suppress the older StatusContext success, got $rc; err=$(tail -6 "$dir/err.log")"
+    grep -q 'class=in_progress.*at/after status_created' "$dir/err.log" || fail "3b10 fast $mode: trusted fast path did not consume the trigger classification"
+  done
+
   dir=$(make_case "fast-path-trigger-before-completed-report" "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" \
     "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
     "$REVIEW_BODY_CLEAN" "$NOTICE_AFTER_SUMMARY_TIME")
@@ -945,7 +1008,7 @@ test_trigger_ack_is_polling_in_progress() {
   quoted="$REVIEW_BODY_CLEAN
 
 > <details><summary>✅ Actions performed</summary>
-> Review triggered."
+> Full review triggered."
   fenced="$REVIEW_BODY_CLEAN
 
 \`\`\`
@@ -962,6 +1025,19 @@ Review triggered.
     [ "$rc" = "0" ] || fail "3b10 $mode: a trigger lookalike inside a genuine review must retain review behavior, got $rc; err=$(tail -6 "$dir/err.log")"
     [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3b10 $mode: trigger lookalike was promoted to provider in-progress state"
   done
+
+  # A genuine provider refusal remains authoritative even when its body also
+  # contains the accepted-trigger words.
+  refusal_with_trigger="$RATE_LIMIT_BODY_HEADREF
+
+<details><summary>✅ Actions performed</summary>
+Full review triggered."
+  dir=$(make_case "polling-refusal-containing-trigger-text" "$REVIEW_BODY_CLEAN" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$refusal_with_trigger" "$NOTICE_AFTER_SUMMARY_TIME")
+  sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] || fail "3b10 refusal text: a provider refusal containing trigger text lost its rate-limit routing, got $rc; err=$(tail -6 "$dir/err.log")"
 
   # The acknowledgement-specific structural read participates in the same
   # fail-closed rc-3 contract as the surrounding selected-comment reader.

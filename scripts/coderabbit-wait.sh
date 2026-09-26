@@ -2110,28 +2110,28 @@ crw_select_latest_non_narration_comment() {
     owned_rc=0
     owned=$(crw_provider_owned_refusal_class "$body") || owned_rc=$?
     [ "$owned_rc" != "3" ] || return 3
+    # Trigger acknowledgements are a polling-only state and their supported
+    # vocabulary is slightly wider than the narration classifier's exact
+    # `Review triggered` + incremental-note layouts. Check the bounded,
+    # unfenced/unquoted acknowledgement structure independently, without
+    # allowing trigger text inside a genuine provider refusal to replace it.
+    if [ "$owned" != "rate_limit" ] && [ "$owned" != "paused" ] && [ "$owned" != "in_progress" ]; then
+      accepted_rc=0
+      crw_review_trigger_accepted "$body" || accepted_rc=$?
+      case "$accepted_rc" in
+        0)
+          if [ "$polling" = "true" ] && [ -z "$accepted" ]; then
+            accepted=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body, poll_class: "in_progress"}') || return 3
+          fi
+          continue
+          ;;
+        1) ;;
+        *) return 3 ;;
+      esac
+    fi
     if [ "$owned" = "status_probe" ]; then
-      # Most command replies are narration and remain invisible to polling.
-      # A successful review-trigger acknowledgement is different: CodeRabbit
-      # publishes it before the new same-head run flips its status to pending.
-      # Skipping it exposes the older publication underneath and can clear
-      # while the replacement review is still starting. This override belongs
-      # only to polling selection; the #956 refusal guard deliberately keeps
-      # treating the same acknowledgement as narration.
-      if [ "$polling" = "true" ]; then
-        accepted_rc=0
-        crw_review_trigger_accepted "$body" || accepted_rc=$?
-        case "$accepted_rc" in
-          0)
-            if [ -z "$accepted" ]; then
-              accepted=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body, poll_class: "in_progress"}') || return 3
-            fi
-            continue
-            ;;
-          1) continue ;;
-          *) return 3 ;;
-        esac
-      fi
+      # Remaining command replies are narration and stay invisible to both
+      # polling and anchor-free refusal/window selection.
       continue
     fi
     projected=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}') || return 3
@@ -4393,20 +4393,40 @@ crw_carry_status_record() {
 # True (0) when <body> is CodeRabbit's SUCCESSFUL review-trigger
 # acknowledgement ("✅ Actions performed" / "Review triggered", including the
 # "Full review triggered" form); 1 when it is not; 3 when the body could not be
-# read. crw_provider_owned_refusal_class folds this into `status_probe` with
-# the no-op "Already reviewed the last commit" reply, which is right for the
-# refusal guard (neither supersedes a refusal) but not for the carry-forward
-# (Codex P1 on #1340): a successful trigger means a review is STARTING, and it
-# can land before CodeRabbit publishes the `pending` status. Same bounded,
-# case-folded lead the narration classifier reads.
+# read. Some accepted layouts also classify as `status_probe`, but callers do
+# not rely on that narrower vocabulary: a successful trigger means a review is
+# STARTING and can land before CodeRabbit publishes the `pending` status. The
+# bounded, case-folded leading structure rejects quoted and fenced lookalikes.
 crw_review_trigger_accepted() {
-  local unfenced lead
+  local unfenced lead first second trigger
   unfenced=$(crw_unfenced_body "$1") || return 3
   lead=$(awk 'NF { line = $0; sub(/[[:space:]]+$/, "", line); print line; if (++n == 6) exit }' <<<"$unfenced") || return 3
   lead=$(printf '%s' "$lead" | tr '[:upper:]' '[:lower:]') || return 3
-  grep -Fq '✅ actions performed' <<<"$lead" || return 1
-  grep -Fq 'review triggered' <<<"$lead" || return 1
-  return 0
+  case "$lead" in
+    '<!-- this is an auto-generated reply by coderabbit -->'$'\n'*)
+      lead=${lead#*$'\n'}
+      ;;
+  esac
+  first=${lead%%$'\n'*}
+  [ "$first" != "$lead" ] || return 1
+  lead=${lead#*$'\n'}
+  case "$first" in
+    '<details><summary>✅ actions performed</summary>')
+      trigger=${lead%%$'\n'*}
+      ;;
+    '<details>')
+      second=${lead%%$'\n'*}
+      [ "$second" = '<summary>✅ actions performed</summary>' ] || return 1
+      [ "$second" != "$lead" ] || return 1
+      lead=${lead#*$'\n'}
+      trigger=${lead%%$'\n'*}
+      ;;
+    *) return 1 ;;
+  esac
+  case "$trigger" in
+    'review triggered.'|'full review triggered.') return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Same-content carry-forward evidence (#1335). <summary-body>
