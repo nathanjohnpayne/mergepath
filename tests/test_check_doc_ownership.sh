@@ -1699,6 +1699,32 @@ else
   fail "Case 14u2 unexpected (rc=$rc): $out"
 fi
 
+# Capture the actual -v transport independently of the default awk implementation.
+# A wrapper records only the argument and delegates parsing to the system awk.
+transport_fix="$(mktemp -d "$WORKDIR/ascii-punct-transport.XXXXXX")"
+mkdir -p "$transport_fix/docs/agents" "$transport_fix/scripts" "$transport_fix/bin"
+printf '%s' "$MANIFEST_TRUTH_LITERAL_BACKSLASH" > "$transport_fix/manifest.yml"
+touch "$transport_fix/scripts/sync-to-downstream.sh"
+printf '%b\n' "$escaped_backslash_angle" > "$transport_fix/docs/agents/shared.md"
+printf '%s\n' '# Hub-only machinery' > "$transport_fix/docs/agents/hub\(1).md"
+cat > "$transport_fix/bin/awk" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in ASCII_PUNCT=*) printf '%s\n' "${arg#ASCII_PUNCT=}" >> "$AWK_TRANSPORT_LOG" ;; esac
+done
+exec /usr/bin/awk "$@"
+EOF
+chmod +x "$transport_fix/bin/awk"
+set +e
+out=$(PATH="$transport_fix/bin:$PATH" AWK_TRANSPORT_LOG="$transport_fix/awk-transport.log" MERGEPATH_MANIFEST_PATH="$transport_fix/manifest.yml" MERGEPATH_REPO_ROOT="$transport_fix" bash "$CHECK" 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "1" ] && grep -Fxq $'!"#$%&\'"'"'()*+,-./:;<=>?@[\\\\]^_`{|}~' "$transport_fix/awk-transport.log"; then
+  pass "Case 14u3: ASCII punctuation transport quotes backslash before awk parses it"
+else
+  fail "Case 14u3 unexpected (rc=$rc): $out"
+fi
+
 # ── CommonMark conformance matrix (Cases 14v / 14w / 14x) ────────────
 #
 # Every row below is derived from the CommonMark 0.31.2 spec section it
