@@ -2090,7 +2090,9 @@ crw_rate_limit_hides_a_finding() {
 # `classify_comment ""`, which grades `review`, the one class whose arm can
 # emit a clearance.
 crw_select_latest_non_narration_comment() {
-  local issue_comments=$1 after=${2:-} candidates encoded comment body owned owned_rc projected
+  local issue_comments=$1 after=${2:-} polling=${3:-false}
+  local candidates encoded comment body owned owned_rc accepted_rc projected
+  local accepted=""
   candidates=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg after "$after" '
     [ .[]
       | select(.user.login == $bot)
@@ -2108,17 +2110,51 @@ crw_select_latest_non_narration_comment() {
     owned_rc=0
     owned=$(crw_provider_owned_refusal_class "$body") || owned_rc=$?
     [ "$owned_rc" != "3" ] || return 3
-    [ "$owned" = "status_probe" ] && continue
+    # Trigger acknowledgements are a polling-only state and their supported
+    # vocabulary is slightly wider than the narration classifier's exact
+    # `Review triggered` + incremental-note layouts. Check the bounded,
+    # unfenced/unquoted acknowledgement structure independently, without
+    # allowing trigger text inside a genuine provider refusal to replace it.
+    if [ "$owned" != "rate_limit" ] && [ "$owned" != "paused" ] && [ "$owned" != "in_progress" ]; then
+      accepted_rc=0
+      crw_review_trigger_accepted "$body" || accepted_rc=$?
+      case "$accepted_rc" in
+        0)
+          if [ "$polling" = "true" ] && [ -z "$accepted" ]; then
+            accepted=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body, poll_class: "in_progress"}') || return 3
+          fi
+          continue
+          ;;
+        1) ;;
+        *) return 3 ;;
+      esac
+    fi
+    if [ "$owned" = "status_probe" ]; then
+      # Remaining command replies are narration and stay invisible to both
+      # polling and anchor-free refusal/window selection.
+      continue
+    fi
     projected=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}') || return 3
+    # A newer accepted trigger starts a replacement review, but cannot erase
+    # an older provider refusal (#956). Let a pause/rate-limit remain current;
+    # otherwise stop before exposing an older completed/benign publication.
+    if [ -n "$accepted" ] && [ "$owned" != "rate_limit" ] && [ "$owned" != "paused" ]; then
+      printf '%s\n' "$accepted"
+      return 0
+    fi
     printf '%s\n' "$projected"
     return 0
   done <<<"$candidates"
+  if [ -n "$accepted" ]; then
+    printf '%s\n' "$accepted"
+    return 0
+  fi
   printf '{}\n'
 }
 
 latest_comment_from_issue_comments() {
   local issue_comments=$1 latest
-  latest=$(crw_select_latest_non_narration_comment "$issue_comments" "$HEAD_ANCHOR") || {
+  latest=$(crw_select_latest_non_narration_comment "$issue_comments" "$HEAD_ANCHOR" true) || {
     log "ERROR: failed to decode the CodeRabbit comment list — the comments are UNREAD, not empty"
     return 3
   }
@@ -2684,8 +2720,11 @@ rate_limit_window_elapsed_seconds() {
 # The newest CodeRabbit comment on the PR, ANCHOR-FREE. Mirrors
 # latest_comment_from_issue_comments' selection (same bot filter, same
 # fresh_at = max(created_at, updated_at), same status-probe narration
-# exclusion) MINUS the `fresh_at >= HEAD_ANCHOR` filter. `{}` when the bot has
-# said nothing on this PR at all.
+# exclusion) MINUS the `fresh_at >= HEAD_ANCHOR` filter. Unlike polling, this
+# anchor-free selector deliberately excludes successful trigger
+# acknowledgements too: refusal/window arbitration asks for the provider's
+# last substantive word, not whether a replacement run has just started.
+# `{}` when the bot has said nothing on this PR at all.
 #
 # Anchor-free on purpose: the caller below asks "what was CodeRabbit's LAST
 # WORD", a question the moving wall-clock freshness floor answers wrongly by
@@ -2969,7 +3008,13 @@ status_context_fast_path_blocked_by_comment() {
     return 1
   fi
 
-  class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
+  class=$(printf '%s' "$latest" | jq -r '.poll_class // empty') || {
+    log "StatusContext success suppressed: the selected CodeRabbit polling class could not be decoded — keep polling"
+    return 0
+  }
+  if [ -z "$class" ]; then
+    class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
+  fi
   case "$class" in
     rate_limit|paused|in_progress)
       # #490: `paused` joins rate_limit/in_progress here. An auto-pause NOTE
@@ -3246,7 +3291,7 @@ find_status_probe_reply() {
 }
 
 emit_terminal_review_after_probe_if_present() {
-  local latest body class potential_issues review_json summary_marker_rc
+  local latest body class poll_class potential_issues review_json summary_marker_rc
   local summary_head_claim_rc head_run_rc head_run_id graded_review_id
   # Status-checked (#957/#959). "Best effort" governs the FETCH — an
   # unreadable surface is not fatal on the timeout path — but the DECODE now
@@ -3274,10 +3319,18 @@ emit_terminal_review_after_probe_if_present() {
     log "post-probe terminal-review check: the selected comment body could not be derived — leaving the advisory timeout in place rather than grading an unread comment"
     return 0
   }
-  class=$(crw_classify_selected_comment "$body") || {
-    log "post-probe terminal-review check: the selected comment could not be structurally classified — leaving the advisory timeout in place"
+  poll_class=$(printf '%s' "$latest" | jq -r '.poll_class // empty') || {
+    log "post-probe terminal-review check: the selected polling class could not be derived — leaving the advisory timeout in place"
     return 0
   }
+  if [ -n "$poll_class" ]; then
+    class=$poll_class
+  else
+    class=$(crw_classify_selected_comment "$body") || {
+      log "post-probe terminal-review check: the selected comment could not be structurally classified — leaving the advisory timeout in place"
+      return 0
+    }
+  fi
   case "$class" in
     review)
       # #1031 round 2: select the graded review object ONCE, here, and use the
@@ -4340,20 +4393,40 @@ crw_carry_status_record() {
 # True (0) when <body> is CodeRabbit's SUCCESSFUL review-trigger
 # acknowledgement ("✅ Actions performed" / "Review triggered", including the
 # "Full review triggered" form); 1 when it is not; 3 when the body could not be
-# read. crw_provider_owned_refusal_class folds this into `status_probe` with
-# the no-op "Already reviewed the last commit" reply, which is right for the
-# refusal guard (neither supersedes a refusal) but not for the carry-forward
-# (Codex P1 on #1340): a successful trigger means a review is STARTING, and it
-# can land before CodeRabbit publishes the `pending` status. Same bounded,
-# case-folded lead the narration classifier reads.
+# read. Some accepted layouts also classify as `status_probe`, but callers do
+# not rely on that narrower vocabulary: a successful trigger means a review is
+# STARTING and can land before CodeRabbit publishes the `pending` status. The
+# bounded, case-folded leading structure rejects quoted and fenced lookalikes.
 crw_review_trigger_accepted() {
-  local unfenced lead
+  local unfenced lead first second trigger
   unfenced=$(crw_unfenced_body "$1") || return 3
   lead=$(awk 'NF { line = $0; sub(/[[:space:]]+$/, "", line); print line; if (++n == 6) exit }' <<<"$unfenced") || return 3
   lead=$(printf '%s' "$lead" | tr '[:upper:]' '[:lower:]') || return 3
-  grep -Fq '✅ actions performed' <<<"$lead" || return 1
-  grep -Fq 'review triggered' <<<"$lead" || return 1
-  return 0
+  case "$lead" in
+    '<!-- this is an auto-generated reply by coderabbit -->'$'\n'*)
+      lead=${lead#*$'\n'}
+      ;;
+  esac
+  first=${lead%%$'\n'*}
+  [ "$first" != "$lead" ] || return 1
+  lead=${lead#*$'\n'}
+  case "$first" in
+    '<details><summary>✅ actions performed</summary>')
+      trigger=${lead%%$'\n'*}
+      ;;
+    '<details>')
+      second=${lead%%$'\n'*}
+      [ "$second" = '<summary>✅ actions performed</summary>' ] || return 1
+      [ "$second" != "$lead" ] || return 1
+      lead=${lead#*$'\n'}
+      trigger=${lead%%$'\n'*}
+      ;;
+    *) return 1 ;;
+  esac
+  case "$trigger" in
+    'review triggered.'|'full review triggered.') return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Same-content carry-forward evidence (#1335). <summary-body>
@@ -5354,8 +5427,14 @@ while :; do
   COMMENT_CREATED=$(echo "$LATEST" | jq -r '.created_at')
   COMMENT_FRESH_AT=$(echo "$LATEST" | jq -r '.fresh_at // .updated_at // .created_at')
 
-  CLASS=$(crw_classify_selected_comment "$COMMENT_BODY") \
-    || die 3 "could not structurally classify the latest CodeRabbit comment — refusing to treat an unread body as a review"
+  POLL_CLASS=$(printf '%s' "$LATEST" | jq -r '.poll_class // empty') \
+    || die 3 "could not decode the latest CodeRabbit polling class — refusing to treat an unread selection as a review"
+  if [ -n "$POLL_CLASS" ]; then
+    CLASS=$POLL_CLASS
+  else
+    CLASS=$(crw_classify_selected_comment "$COMMENT_BODY") \
+      || die 3 "could not structurally classify the latest CodeRabbit comment — refusing to treat an unread body as a review"
+  fi
   log "latest CodeRabbit comment id=$COMMENT_ID endpoint=$COMMENT_ENDPOINT class=$CLASS created=$COMMENT_CREATED fresh_at=$COMMENT_FRESH_AT"
 
   case "$CLASS" in

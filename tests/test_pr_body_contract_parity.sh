@@ -25,8 +25,9 @@ TMP_DETECTOR="$(mktemp "${TMPDIR:-/tmp}/parity-detector.XXXXXX")"
 # file on every run that reached it.
 TMP_BASE_TREE=""
 TMP_PROD_STALL=""
+TMP_STALL_PARSER=""
 TMP_HOOK_CONFIG=""
-trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"; [ -n "${TMP_PROD_STALL:-}" ] && rm -f "$TMP_PROD_STALL"; [ -n "${TMP_HOOK_CONFIG:-}" ] && rm -f "$TMP_HOOK_CONFIG"' EXIT
+trap 'rm -f "$TMP_DETECTOR"; [ -n "${TMP_BASE_TREE:-}" ] && rm -rf "$TMP_BASE_TREE"; [ -n "${TMP_PROD_STALL:-}" ] && rm -f "$TMP_PROD_STALL"; [ -n "${TMP_STALL_PARSER:-}" ] && rm -f "$TMP_STALL_PARSER"; [ -n "${TMP_HOOK_CONFIG:-}" ] && rm -f "$TMP_HOOK_CONFIG"' EXIT
 
 . "$ROOT/scripts/lib/pr-body-contract.sh"
 . "$ROOT/scripts/lib/gh-command-classifier.sh"
@@ -1143,11 +1144,10 @@ renderer_contract "top-level declarations remain valid after the deep-container 
 # FAIL this identity gate, it STALLED it for as long as the enclosing job
 # allowed. These controls pin the bound, not the parser's speed.
 #
-# The fixture is the documented pathological list body, and the bound is
-# overridden to 2s so the control itself terminates quickly. What is under test
-# is that the watchdog fires and what it produces when it does -- never how
-# fast the parser is, which is environment-dependent and deliberately not
-# asserted anywhere.
+# The fixture is an ordinary valid body and the parser is replaced below with a
+# deliberate staller. The bound is overridden to 2s so the control terminates
+# quickly. This isolates the watchdog and its output contract from parser speed,
+# which is environment-dependent and deliberately not asserted here.
 
 PROD_BOUND_DEFAULT="$(sed -n 's/^PR_BODY_CONTRACT_TIMEOUT_SECONDS=\([0-9]*\)$/\1/p' \
   "$ROOT/scripts/lib/pr-body-contract.sh")"
@@ -1159,8 +1159,9 @@ fi
 
 TMP_PROD_STALL="$(mktemp "${TMPDIR:-/tmp}/parity-prod-stall.XXXXXX")"
 PROD_STALL_FIXTURE="$TMP_PROD_STALL"
-node -e 'require("node:fs").writeFileSync(process.argv[1], "- ".repeat(30000) + "x\n\nAuthoring-Agent: codex\n\n## Self-Review\n")' \
-  "$PROD_STALL_FIXTURE"
+printf '%s\n' 'Authoring-Agent: codex' '' '## Self-Review' > "$PROD_STALL_FIXTURE"
+TMP_STALL_PARSER="$(mktemp "${TMPDIR:-/tmp}/parity-stall-parser.XXXXXX")"
+printf '%s\n' 'setInterval(() => {}, 1000);' > "$TMP_STALL_PARSER"
 
 # All three helpers, because each has a different output contract: two answer on
 # stdout and one answers with its exit status. A watchdog that covered only the
@@ -1182,8 +1183,9 @@ prod_timeout_case() { # label, helper
     . "$1/scripts/lib/pr-body-contract.sh"
     # Set AFTER sourcing: the lib assigns the default unconditionally.
     PR_BODY_CONTRACT_TIMEOUT_SECONDS=2
+    PR_BODY_CONTRACT_PARSER="$4"
     "$2" "$(cat "$3")"
-  ' bash "$ROOT" "$ptc_helper" "$PROD_STALL_FIXTURE" 2>/dev/null)" || ptc_rc=$?
+  ' bash "$ROOT" "$ptc_helper" "$PROD_STALL_FIXTURE" "$TMP_STALL_PARSER" 2>/dev/null)" || ptc_rc=$?
   ptc_elapsed="$(( $(date +%s) - ptc_start ))"
   if [ "$ptc_rc" -ne 124 ]; then
     bad "#1281: $ptc_label did not report the watchdog status (rc=$ptc_rc after ${ptc_elapsed}s)"
@@ -1212,8 +1214,9 @@ prod_timeout_case "pr_body_has_self_review" pr_body_has_self_review
 prod_validate_out="$(printf '' | run_with_timeout 90 bash -c '
   . "$1/scripts/lib/pr-body-contract.sh"
   PR_BODY_CONTRACT_TIMEOUT_SECONDS=2
+  PR_BODY_CONTRACT_PARSER="$3"
   pr_body_validate "$(cat "$2")" "$1/.github/review-policy.yml" 2>&1
-' bash "$ROOT" "$PROD_STALL_FIXTURE")" && prod_validate_rc=0 || prod_validate_rc=$?
+' bash "$ROOT" "$PROD_STALL_FIXTURE" "$TMP_STALL_PARSER")" && prod_validate_rc=0 || prod_validate_rc=$?
 
 if [ "$prod_validate_rc" -eq 0 ]; then
   bad "#1281: pr_body_validate ACCEPTED a body whose parse timed out -- fail-open"
