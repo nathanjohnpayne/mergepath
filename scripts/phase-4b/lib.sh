@@ -160,8 +160,14 @@ p4b_top_field() {
 #   rate-limited      it has REFUSED to report and no wait this run can make
 #                     lasts long enough to lift the refusal (#1178)
 #   escalate          a stuck condition only a human can clear
+#   carried           (CodeRabbit only, #1335) it will not report on this
+#                     head, but its completed review of an earlier head with
+#                     the identical external-review fingerprint carries
+#                     forward — see p4b_barrier_coderabbit_carryforward
 #
-# `reported`, `will-not-report` and `waived` let the barrier open. `not-yet`
+# `reported`, `will-not-report`, `waived` and `carried` let the barrier open.
+# `carried` is not assigned by the pure classifier below: it refines a
+# classifier `not-yet` inside the barrier, which alone does the I/O. `not-yet`
 # is a bounded, self-clearing wait; `escalate` goes to the human immediately.
 # `rate-limited` is the one class the CLASSIFIER cannot resolve on its own —
 # it names the provider's state and the composer decides, because the answer
@@ -501,6 +507,181 @@ p4b_codex_timeout_determination() {
       return 2
       ;;
   esac
+}
+
+# --- same-head provider barrier: same-content CodeRabbit carry-forward (#1335)
+#
+# p4b_barrier_coderabbit_carryforward <repo> <pr> <head> <probe-rc> <probe-json>
+#
+# Emits one JSON object and returns 0 when CodeRabbit's review of an earlier
+# head carries forward to <head>, 1 when it does not. Never escalates: every
+# failure, missing input and mismatch is "not carried", which leaves the arm on
+# the ordinary bounded not-yet it already had. The helper can only ever turn a
+# not-yet into `carried`; nothing else reaches it.
+#
+# WHY this exists. CodeRabbit does not review merge commits. On a base-only
+# update head — a merge from the base branch that touches none of the PR's own
+# files — its auto-review completes with no review object and leaves the
+# summary range naming the last CONTENT head, and the barrier's own
+# `@coderabbitai review` is answered "Already reviewed the last commit". So
+# the arm can never leave not-yet there, and every such head waited out the
+# whole budget and fell back to the manual handoff (#1318, heads a76fa31 and
+# d1682c9).
+#
+# WHAT carries. Not "CodeRabbit said it already reviewed" — that reply names
+# no commit, and a merge commit can carry conflict resolutions in the PR's own
+# files. What carries is CodeRabbit's completed review of commit L, where the
+# #705 external-review fingerprint of L equals the fingerprint of <head>. That
+# fingerprint hashes the tree entries of every path the PR changes, at the
+# ref AND at its merge base, so equality means the PR content — the diff the
+# approval is about to certify — is byte-identical. It is the same test
+# scripts/codex-review-check.sh uses to carry a Codex verdict across a
+# base-only update (scripts/workflow/external_review_carryforward.sh), and its
+# note there on why a fingerprint match is SUFFICIENT applies unchanged.
+#
+# The conjuncts, each closing a specific way to carry past something unread:
+#   probe rc 7                  a not-yet; rc 2 (a summary-only finding) and
+#                               every other rc keep their own routing
+#   observed none |             nothing adverse is pending — a pause, a limit
+#     summary-without-head-     or a run in progress on this head is not a
+#     review                    finished CodeRabbit
+#   carryforward.reviewed_head  the probe found a completed, benign,
+#                               marker-free summary with ONE range end
+#                               (crw_probe_carryforward_evidence)
+#   head status success and     CodeRabbit has processed THIS head and
+#     permits clearance         finished with it — so it will not publish a
+#                               late finding on it — and the success is not
+#                               the `Review rate limited` kind (#891)
+#   fingerprints equal and      identical PR content; an empty fingerprint
+#     non-empty                 (no external review required, or >=3000
+#                               files) proves nothing and does not carry
+#
+# Both fingerprints are computed from ONE changed-file list, so they hash the
+# same path set, and that list is <head>'s own (compare/<base>...<head>), so no
+# push, force-push or intervening head can substitute another head's set.
+# The CodeRabbit configuration file must also be identical at both commits.
+#
+# Deliberately CodeRabbit-only. The Codex arm keeps its head-identity contract
+# (--diagnostic-signal-only disables the #705 Codex carry-forward), because
+# Codex DOES re-review a merge head when asked. The barrier relaxes head
+# identity only for the provider that structurally cannot satisfy it.
+# The not-carried JSON shape, for every refusal that has only a reason to give.
+p4b_carryforward_refusal() {
+  jq -nc --arg r "$1" '{carried:false, reason:$r}'
+}
+
+# p4b_coderabbit_config_identity <repo> <sha>
+# The repository CodeRabbit configuration AT <sha>, as a canonical string of
+# its root-tree entries ({path, blob sha} for .coderabbit.yml / .coderabbit.yaml;
+# "[]" when there is none). Returns 3 on any unread rung and 4 when a config
+# entry is not a regular file. Codex P2 on #1340:
+# the external-review fingerprint covers only the PR's own paths, so a
+# base-only update that changes this file compares equal while CodeRabbit's
+# profile and path_instructions moved under the review being carried.
+p4b_coderabbit_config_identity() {
+  local repo="$1" sha="$2" tree
+  tree="$(gh_api_scalar --shape sha "tree of $sha for the CodeRabbit config identity" \
+    "repos/$repo/commits/$sha" --jq '.commit.tree.sha')" || return 3
+  local entries
+  entries="$(gh_api_scalar "CodeRabbit config entries at $sha" "repos/$repo/git/trees/$tree" \
+    --jq '[.tree[]? | select(.path == ".coderabbit.yml" or .path == ".coderabbit.yaml") | {path, mode, type, sha}] | sort_by(.path) | tostring')" \
+    || return 3
+  # Only a REGULAR file's blob sha is its content (Codex P2 on #1340). A
+  # symlink's blob is the target PATH, so the target could change under an
+  # identical entry; a submodule or tree is not a config file at all. Refuse
+  # rather than resolve: config that is not a plain file is rare enough that
+  # failing closed costs only this carry.
+  printf '%s' "$entries" | jq -e 'all(.[]; .type == "blob" and (.mode == "100644" or .mode == "100755"))' >/dev/null 2>&1 \
+    || return 4
+  printf '%s' "$entries"
+}
+
+p4b_barrier_coderabbit_carryforward() {
+  local repo="$1" pr="$2" head="$3" rc="$4" json="$5"
+  local observed reviewed state permits root fp_bin cfg files files_file
+  local head_fp src_fp head_out src_out head_cfg src_cfg base_sha nfiles
+
+  if [ "$rc" != 7 ]; then p4b_carryforward_refusal "probe rc $rc is not a not-yet"; return 1; fi
+  observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
+  case "$observed" in
+    none|summary-without-head-review) ;;
+    *) p4b_carryforward_refusal "probe observed '${observed:-missing}', not an idle CodeRabbit"; return 1 ;;
+  esac
+  reviewed="$(printf '%s' "$json" | jq -r '.probe.carryforward.reviewed_head // empty' 2>/dev/null || true)"
+  if ! printf '%s' "$reviewed" | grep -Eq '^[0-9a-f]{40}$'; then
+    p4b_carryforward_refusal "no completed prior-head CodeRabbit summary to carry"; return 1
+  fi
+  if [ "$reviewed" = "$(printf '%s' "$head" | tr '[:upper:]' '[:lower:]')" ]; then
+    p4b_carryforward_refusal "the summary already names this head"; return 1
+  fi
+  state="$(printf '%s' "$json" | jq -r '.probe.carryforward.head_context_state // empty' 2>/dev/null || true)"
+  permits="$(printf '%s' "$json" | jq -r '.probe.carryforward.head_context_permits_clearance // false' 2>/dev/null || true)"
+  if [ "$state" != success ] || [ "$permits" != true ]; then
+    p4b_carryforward_refusal "CodeRabbit status on $head is '${state:-unsampled}' (permits clearance: $permits), not a completed run"
+    return 1
+  fi
+
+  if ! command -v gh_api_scalar >/dev/null 2>&1; then
+    p4b_carryforward_refusal "scalar reader unavailable"; return 1
+  fi
+  root="$(p4b_repo_root)"
+  fp_bin="${P4B_EXTERNAL_REVIEW_FINGERPRINT:-$root/scripts/workflow/external_review_fingerprint.sh}"
+  cfg="$(p4b_config)"
+  if [ ! -r "$fp_bin" ]; then p4b_carryforward_refusal "fingerprint helper missing at $fp_bin"; return 1; fi
+
+  # The CodeRabbit configuration must be the one the carried review ran
+  # under (Codex P2 on #1340) — see p4b_coderabbit_config_identity.
+  head_cfg="$(p4b_coderabbit_config_identity "$repo" "$head")" \
+    || { p4b_carryforward_refusal "could not establish the CodeRabbit configuration at $head (unreadable, or not a regular file)"; return 1; }
+  src_cfg="$(p4b_coderabbit_config_identity "$repo" "$reviewed")" \
+    || { p4b_carryforward_refusal "could not establish the CodeRabbit configuration at $reviewed (unreadable, or not a regular file)"; return 1; }
+  if [ "$head_cfg" != "$src_cfg" ]; then
+    p4b_carryforward_refusal "the CodeRabbit configuration changed since $reviewed, so its review ran under different settings"
+    return 1
+  fi
+
+  # The changed-file set, BOUND TO <head> (Codex P2 on #1340). The live
+  # /pulls/{pr}/files list describes whatever the PR head is at read time,
+  # so a head that moved to T and was force-pushed back to <head> before the
+  # orchestrator's final head check could hand both fingerprints T's path set
+  # — one that omits a path where <head> and the reviewed commit differ.
+  # compare/<base>...<head> is keyed on two explicit SHAs, the same merge-base
+  # shape the fingerprint itself uses. It returns at most 300 files, so a
+  # list that reaches the cap proves nothing about the paths beyond it.
+  base_sha="$(gh_api_scalar --shape sha "PR base sha for the CodeRabbit carry-forward" \
+    "repos/$repo/pulls/$pr" --jq '.base.sha')" \
+    || { p4b_carryforward_refusal "PR base sha read failed"; return 1; }
+  files="$(gh_api_scalar "changed files of $head for the CodeRabbit carry-forward" \
+    "repos/$repo/compare/$base_sha...$head" --jq '.files // [] | tostring')" \
+    || { p4b_carryforward_refusal "changed-file read for $head failed"; return 1; }
+  if ! nfiles="$(printf '%s' "$files" | jq -e 'if type == "array" then length else error("not a list") end' 2>/dev/null)"; then
+    p4b_carryforward_refusal "changed-file list for $head is unreadable"; return 1
+  fi
+  if [ "$nfiles" -ge 300 ]; then
+    p4b_carryforward_refusal "changed-file list for $head reached the compare API's 300-file cap"; return 1
+  fi
+  files_file="$(mktemp "${TMPDIR:-/tmp}/p4b-cf-files.XXXXXX")" \
+    || { p4b_carryforward_refusal "mktemp failed"; return 1; }
+  printf '%s' "$files" >"$files_file"
+  head_out="$(bash "$fp_bin" --repo "$repo" --pr "$pr" --ref "$head" --config "$cfg" --files-json "$files_file" 2>/dev/null)" \
+    || { rm -f "$files_file"; p4b_carryforward_refusal "could not fingerprint $head"; return 1; }
+  src_out="$(bash "$fp_bin" --repo "$repo" --pr "$pr" --ref "$reviewed" --config "$cfg" --files-json "$files_file" 2>/dev/null)" \
+    || { rm -f "$files_file"; p4b_carryforward_refusal "could not fingerprint $reviewed"; return 1; }
+  rm -f "$files_file"
+  head_fp="$(printf '%s' "$head_out" | jq -r 'select(.requires_review == true) | .fingerprint // empty' 2>/dev/null || true)"
+  src_fp="$(printf '%s' "$src_out" | jq -r 'select(.requires_review == true) | .fingerprint // empty' 2>/dev/null || true)"
+  case "$head_fp" in
+    external-review:*) ;;
+    *) p4b_carryforward_refusal "$head has no external-review fingerprint"; return 1 ;;
+  esac
+  if [ "$head_fp" != "$src_fp" ]; then
+    jq -nc --arg s "$reviewed" --arg h "$head_fp" --arg p "${src_fp:-}" \
+      '{carried:false, reason:"PR content changed since CodeRabbit last reviewed", source_commit:$s, fingerprint:$h, source_fingerprint:$p}'
+    return 1
+  fi
+  jq -nc --arg s "$reviewed" --arg f "$head_fp" \
+    '{carried:true, source_commit:$s, fingerprint:$f}'
+  return 0
 }
 
 # --- same-head provider barrier: bounded not-yet retry (#814) ---------------
@@ -1282,7 +1463,7 @@ p4b_same_head_barrier() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
   local root cr_bin cx_bin rc json probe_head cx_timeout_json="" cx_timeout_rc=0
   local pending=false why="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
-  local cx_evidence="disabled"
+  local cx_evidence="disabled" cr_carry="" cr_carry_json="null"
   local elapsed budget remaining=0
   root="$(p4b_repo_root)"
   cr_bin="${P4B_CODERABBIT_WAIT:-$root/scripts/coderabbit-wait.sh}"
@@ -1374,8 +1555,20 @@ p4b_same_head_barrier() {
       cls_cr="drift"
     else
       cls_cr="$(p4b_barrier_class_coderabbit "$head" "$rc" "$json")"
+      # #1335: a not-yet that CodeRabbit will never leave on this head — a
+      # base-only update it does not re-review — carries its review of the
+      # identical PR content forward. Consulted BEFORE the trigger, so a
+      # carried head spends no request on a reply that can only say "Already
+      # reviewed the last commit". See p4b_barrier_coderabbit_carryforward.
+      if [ "$cls_cr" = not-yet ]; then
+        if cr_carry="$(p4b_barrier_coderabbit_carryforward "$repo" "$pr" "$head" "$rc" "$json")"; then
+          cls_cr="carried"
+          cr_carry_json="$cr_carry"
+        fi
+        p4b_log "CodeRabbit same-content carry-forward on $head: $cr_carry"
+      fi
       case "$cls_cr" in
-        reported|will-not-report|waived) ;;
+        reported|will-not-report|waived|carried) ;;
         rate-limited)
           # #1178. The classifier has established that CodeRabbit REFUSED
           # this head and that no wait available to this run lifts the
@@ -1518,8 +1711,11 @@ p4b_same_head_barrier() {
       '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, codex_evidence:$ce, trigger:$t, resume:$rs}'
     return 1
   fi
-  jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
-    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce}'
+  # `coderabbit_carryforward` is present only on an open barrier and is null
+  # unless the CodeRabbit arm carried (#1335): the orchestrator records the
+  # source commit and fingerprint in the approval it posts.
+  jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --argjson cf "$cr_carry_json" \
+    '{decision:"open", coderabbit:$cr, codex:$cx, codex_evidence:$ce, coderabbit_carryforward:$cf}'
   return 0
 }
 
