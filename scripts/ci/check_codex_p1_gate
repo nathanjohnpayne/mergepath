@@ -370,14 +370,16 @@ if sweep.is_a?(Hash)
     )
     api_ceiling = sweep_run.index('if [ "$source_total" -ge "$MAX_RELAY_SOURCE_RUNS" ]')
     window_split = sweep_run.index('scan_source_window "$source_event" "$window_start" "$midpoint"')
-    page_filter = sweep_run.index('done < <(jq -c --arg title')
+    page_filter = sweep_run.index('if ! matching_source_runs=$(jq -c')
     source_binding = sweep_run.index('scripts/workflow/feedback-archive-relay-source.sh "$REPO" "$PR"')
     source_count = sweep_run.index('source_count=$(jq')
     source_bound = sweep_run.index('if [ "$source_count" -ge "$MAX_RELAY_SOURCE_RUNS" ]')
     require_shape.call(
       [api_ceiling, window_split, page_filter, source_binding, source_count, source_bound].all? &&
-        api_ceiling < window_split && source_binding < source_count &&
+        api_ceiling < window_split && page_filter < source_binding && source_binding < source_count &&
         page_filter < source_count && source_count < source_bound &&
+        sweep_run.include?('if (.workflow_runs | type) != "array" then') &&
+        sweep_run.include?('done <<<"$matching_source_runs"') &&
         sweep_run.include?('if [ "$bind_rc" -eq 0 ]; then') &&
         sweep_run.include?('elif [ "$bind_rc" -ne 4 ]; then') &&
         sweep_run.include?(%q{bound_run=$(jq -c '.source_run_id' <<<"$binding")}),

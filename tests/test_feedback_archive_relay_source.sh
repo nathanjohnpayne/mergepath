@@ -55,6 +55,10 @@ for arg in "$@"; do
   prev=$arg
 done
 case "$endpoint" in
+  repos/acme/widget/actions/workflows/codex-p1-gate.yml/runs)
+    [ "$method" = GET ] || exit 65
+    cat "$WORKFLOW_RUNS"
+    ;;
   repos/acme/widget/contents/*\?ref=*)
     path=${endpoint#repos/acme/widget/contents/}
     path=${path%%\?ref=*}
@@ -120,6 +124,13 @@ cat >"$BIN/sleep" <<'SH'
 exit 0
 SH
 chmod +x "$BIN/sleep"
+cat >"$BIN/date" <<'SH'
+#!/usr/bin/env bash
+# The workflow runs on Ubuntu (GNU date); make its two scan-window `-d`
+# conversions deterministic when this hermetic test runs on macOS/BSD date.
+printf '%s\n' '2026-09-26T10:00:00Z'
+SH
+chmod +x "$BIN/date"
 
 sha() { printf '%040d' "$1"; }
 BASE_ID=100
@@ -159,7 +170,8 @@ run_case() {
 
 CANDIDATES="$TMP/candidates.json"
 GH_LOG="$TMP/gh.log"
-export CANDIDATES GH_LOG
+WORKFLOW_RUNS="$TMP/workflow-runs.json"
+export CANDIDATES GH_LOG WORKFLOW_RUNS
 
 # GitHub's observed review-event shape has no PR association. A unique source
 # origin/branch binds it, but publication uses the current PR API head after a
@@ -252,6 +264,76 @@ RUN_PR=80 write_run pull_request "$SRC" 201 fork/alice relay-branch '[]' '.githu
 run_case 80
 assert_eq "$RC" 3 "malformed candidate PR response fails as infrastructure"
 assert_empty_writes "malformed candidate response creates no mutation"
+
+# Exercise the scheduled sweep's real source-window scanner. The scanner is
+# the sole producer of its relay inventory; an API payload that cannot prove a
+# workflow_runs array must set relay_scan_error before the caller can consider
+# an empty inventory clear. This extracts the production function instead of
+# reproducing its jq/filter loop in the test.
+SCAN_FUNCTION="$TMP/scan-source-window.sh"
+awk '
+  /scan_source_window\(\) \{/ { active=1 }
+  active && /^              }$/ { sub(/^              /, ""); print; exit }
+  active { sub(/^              /, ""); print }
+' "$ROOT/.github/workflows/codex-p1-gate.yml" >"$SCAN_FUNCTION"
+[ -s "$SCAN_FUNCTION" ] || { echo "could not extract scheduled relay source scanner" >&2; exit 1; }
+SCAN_HARNESS="$TMP/scan-source-window-harness.sh"
+{
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+  cat "$SCAN_FUNCTION"
+  cat <<'SH'
+relay_scan_error=false
+source_runs='[]'
+relay_source_cache="$RUNNER_TEMP/relay-source-cache-$PR"
+rm -rf "$relay_source_cache"
+mkdir -p "$relay_source_cache"
+scan_source_window pull_request 1758880800 1758884400
+printf 'relay_scan_error=%s\n' "$relay_scan_error"
+printf 'source_runs=%s\n' "$source_runs"
+SH
+} >"$SCAN_HARNESS"
+chmod +x "$SCAN_HARNESS"
+run_scan() {
+  : >"$GH_LOG"
+  rm -rf "$TMP/scan-runner"
+  set +e
+  SCAN_OUTPUT=$(cd "$ROOT" && PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" \
+    WORKFLOW_RUNS="$WORKFLOW_RUNS" RUNNER_TEMP="$TMP/scan-runner" REPO="$BASE_REPO" \
+    PR=41 MAX_RELAY_SOURCE_RUNS=50 "$SCAN_HARNESS" 2>"$TMP/scan.err")
+  SCAN_RC=$?
+  set -e
+}
+
+printf '%s\n' '{"total_count":0}' >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after a missing workflow_runs array"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "missing workflow_runs marks the relay scan as an infrastructure error"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^source_runs=//p')" '[]' "missing workflow_runs never qualifies an empty relay inventory"
+assert_empty_writes "missing workflow_runs scan makes no target mutation"
+
+printf '%s\n' '{"total_count":0,"workflow_runs":{}}' >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after a wrong-shaped workflow_runs value"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "wrong-shaped workflow_runs marks the relay scan as an infrastructure error"
+assert_empty_writes "wrong-shaped workflow_runs scan makes no target mutation"
+
+printf '%s\n' '{"total_count":0,"workflow_runs":[]}' >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner accepts a legitimate empty workflow run page"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" false "legitimate empty workflow run page does not become an infrastructure error"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^source_runs=//p')" '[]' "legitimate empty workflow run page leaves the inventory empty"
+assert_empty_writes "legitimate empty workflow run scan makes no target mutation"
+
+# A matching, positively bound source is still retained. This guards the
+# checked capture from accidentally treating all nonempty pages as failures.
+jq -n --argjson base "$BASE_ID" --argjson head 201 --arg source fork/alice --arg branch relay-branch '[{number:41,created_at:"2026-09-25T09:00:00Z",base:{repo:{id:$base}},head:{repo:{id:$head,full_name:$source},ref:$branch}}]' >"$CANDIDATES"
+RUN_PR=41 write_run pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml'
+jq -n --slurpfile runs "$TMP/run.json" '{total_count:1,workflow_runs:$runs}' >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner accepts a valid matching source run"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" false "valid matching source run does not become an infrastructure error"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^source_runs=//p')" '[501]' "valid matching source run remains in the pending relay inventory"
+assert_empty_writes "sweep source inventory scan stays read-only for a matching source"
 
 # The recovery writer is a privileged sink. Execute the run block extracted
 # from the actual workflow, rather than duplicating it: a forged title/source
