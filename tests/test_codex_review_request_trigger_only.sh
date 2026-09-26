@@ -36,13 +36,16 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 make_case() {
   local name=$1
   local dir="$WORKDIR/$name"
-  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
+  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/scripts/workflow" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/codex-review-request.sh" "$dir/scripts/codex-review-request.sh"
   chmod +x "$dir/scripts/codex-review-request.sh"
   cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
   cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
   cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
+  chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 author_identity: nathanjohnpayne
@@ -53,6 +56,7 @@ codex:
   ack_wait_seconds: 0
   max_ack_retries: 2
 EOF
+  cp "$dir/.github/review-policy.yml" "$dir/state/base-review-policy.yml"
 
   # gh-as-author stub: records each @codex trigger post.
   cat >"$dir/scripts/gh-as-author.sh" <<'EOF'
@@ -83,7 +87,15 @@ shift
 [ "${1:-}" = "--paginate" ] && shift
 endpoint=${1:-}
 case "$endpoint" in
-  repos/owner/repo/pulls/999)            printf '{"head":{"sha":"head-sha"}}\n' ;;
+  repos/owner/repo/pulls/999)            printf '{"head":{"sha":"head-sha"},"base":{"ref":"main","sha":"base-sha","repo":{"default_branch":"main"}}}\n' ;;
+  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
+    printf '1\n' >>"$CODEX_TEST_STATE_DIR/base-policy-read-count"
+    if [ "${CODEX_TEST_BASE_POLICY_MODE:-ok}" = fail ]; then
+      echo 'simulated governing policy read failure' >&2
+      exit 1
+    fi
+    cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml"
+    ;;
   repos/owner/repo/commits/head-sha)     printf '%s\n' "$t" ;;
   repos/owner/repo/issues/999/timeline)  printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)    printf '[]\n' ;;
@@ -115,13 +127,14 @@ EOF
 }
 
 run_trigger_only() {
-  local dir=$1 scenario=$2 phase4a_gated=${3:-false} rc=0
+  local dir=$1 scenario=$2 phase4a_gated=${3:-false} base_policy_mode=${4:-ok} rc=0
   (
     cd "$dir"
     PATH="$dir/bin:$PATH" \
       GH_TOKEN=test-token \
       CODEX_TEST_STATE_DIR="$dir/state" \
       CODEX_TEST_SCENARIO="$scenario" \
+      CODEX_TEST_BASE_POLICY_MODE="$base_policy_mode" \
       MERGEPATH_PHASE_4A_GATED="$phase4a_gated" \
       ./scripts/codex-review-request.sh --trigger-only 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log"
@@ -265,7 +278,7 @@ test_request_attempt_cap() {
 test_nondefault_request_attempt_cap() {
   local dir rc before=$FAIL
   dir=$(make_case "request-cap-nondefault")
-  printf '  max_review_rounds: 3\n' >> "$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 3\n' >> "$dir/state/base-review-policy.yml"
   rc=$(run_trigger_only "$dir" cap_three)
   [ "$rc" = 7 ] || fail "#813: nondefault cap expected exit 7, got $rc; err=$(cat "$dir/err.log")"
   [ "$(trig_count "$dir")" = 0 ] || fail "#813: nondefault cap posted despite three consumed requests"
@@ -274,6 +287,78 @@ test_nondefault_request_attempt_cap() {
   [ "$(jqf "$dir" '.cap_exhausted.escalation')" = null ] \
     || fail "#813: nondefault advisory cap invented caller routing"
   [ "$FAIL" -ne "$before" ] || pass "#813: configured nondefault cap governs a new request"
+}
+
+test_candidate_cannot_raise_governing_request_attempt_cap() {
+  local dir rc before=$FAIL
+  dir=$(make_case "request-cap-governing-base")
+  printf '  max_review_rounds: 999999999\n' >> "$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 3\n' >> "$dir/state/base-review-policy.yml"
+  rc=$(run_trigger_only "$dir" cap_three)
+  [ "$rc" = 7 ] || fail "#813 governing cap: candidate-raised cap expected exit 7, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = 0 ] || fail "#813 governing cap: candidate-raised cap posted despite three consumed requests"
+  grep -q 'request-attempt cap reached.*3/3' "$dir/err.log" \
+    || fail "#813 governing cap: refusal did not report the base-policy bound"
+  [ "$FAIL" -ne "$before" ] || pass "#813: a PR cannot raise its governing base-policy request cap"
+}
+
+test_governing_cap_read_failure_refuses_new_write() {
+  local dir rc before=$FAIL
+  dir=$(make_case "request-cap-base-read-failure")
+  printf '  max_review_rounds: 1\n' >> "$dir/.github/review-policy.yml"
+  rc=$(run_trigger_only "$dir" fresh false fail)
+  [ "$rc" = 3 ] || fail "#813 governing cap read failure: expected infrastructure exit 3, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = 0 ] || fail "#813 governing cap read failure: posted despite unknown governing cap"
+  [ "$FAIL" -ne "$before" ] || pass "#813: an unreadable governing cap fails closed before a new request write"
+}
+
+test_invalid_present_governing_cap_refuses_new_write() {
+  local value dir rc before
+  for value in false null "'__absent__'"; do
+    before=$FAIL
+    dir=$(make_case "request-cap-base-$value")
+    printf '  max_review_rounds: %s\n' "$value" >> "$dir/state/base-review-policy.yml"
+    rc=$(run_trigger_only "$dir" fresh)
+    [ "$rc" = 3 ] || fail "#813 governing cap $value: expected infrastructure exit 3, got $rc; err=$(cat "$dir/err.log")"
+    [ "$(trig_count "$dir")" = 0 ] || fail "#813 governing cap $value: posted despite invalid governed value"
+    [ "$FAIL" -ne "$before" ] || pass "#813: present $value governing cap remains invalid at the write boundary"
+  done
+}
+
+test_invalid_present_governing_codex_block_refuses_new_write() {
+  local value dir rc before
+  for value in false '[]' null; do
+    before=$FAIL
+    dir=$(make_case "request-cap-base-codex-$value")
+    printf 'author_identity: nathanjohnpayne\ncodex: %s\n' "$value" > "$dir/state/base-review-policy.yml"
+    rc=$(run_trigger_only "$dir" fresh)
+    [ "$rc" = 3 ] || fail "#813 governing codex $value: expected infrastructure exit 3, got $rc; err=$(cat "$dir/err.log")"
+    [ "$(trig_count "$dir")" = 0 ] || fail "#813 governing codex $value: posted despite invalid governed block"
+    [ "$FAIL" -ne "$before" ] || pass "#813: present $value governing codex block remains invalid at the write boundary"
+  done
+}
+
+test_missing_governing_codex_block_defaults_request_cap() {
+  local dir rc before=$FAIL
+  dir=$(make_case "request-cap-base-no-codex")
+  printf 'author_identity: nathanjohnpayne\n' > "$dir/state/base-review-policy.yml"
+  rc=$(run_trigger_only "$dir" cap_at_limit)
+  [ "$rc" = 7 ] || fail "#813 missing governing codex: expected default-cap exit 7, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = 0 ] || fail "#813 missing governing codex: posted despite default cap exhaustion"
+  grep -q 'request-attempt cap reached.*10/10' "$dir/err.log" \
+    || fail "#813 missing governing codex: did not apply the default cap"
+  [ "$FAIL" -ne "$before" ] || pass "#813: missing governing codex block defaults the request cap to 10"
+}
+
+test_idempotent_skip_does_not_resolve_governing_cap() {
+  local dir rc before=$FAIL
+  dir=$(make_case "request-cap-idempotent-no-read")
+  printf '  max_review_rounds: 999999999\n' >> "$dir/.github/review-policy.yml"
+  rc=$(run_trigger_only "$dir" dup_author false fail)
+  [ "$rc" = 0 ] || fail "#813 idempotent cap skip: expected exit 0, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(trig_count "$dir")" = 0 ] || fail "#813 idempotent cap skip: posted a duplicate trigger"
+  [ ! -f "$dir/state/base-policy-read-count" ] || fail "#813 idempotent cap skip: resolved policy despite no write"
+  [ "$FAIL" -ne "$before" ] || pass "#813: idempotent no-write path does not resolve the governing cap"
 }
 
 test_gated_cap_leaves_routing_to_caller() {
@@ -779,6 +864,12 @@ test_stale_author_command_posts
 test_reviewer_trigger_does_not_count
 test_request_attempt_cap
 test_nondefault_request_attempt_cap
+test_candidate_cannot_raise_governing_request_attempt_cap
+test_governing_cap_read_failure_refuses_new_write
+test_invalid_present_governing_cap_refuses_new_write
+test_invalid_present_governing_codex_block_refuses_new_write
+test_missing_governing_codex_block_defaults_request_cap
+test_idempotent_skip_does_not_resolve_governing_cap
 test_gated_cap_leaves_routing_to_caller
 test_cap_preserves_provider_block_as_diagnostic_only
 test_gate_skips_content_free_head

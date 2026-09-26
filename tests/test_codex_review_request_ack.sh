@@ -48,7 +48,7 @@ make_case() {
   local review_timeout=${4:-0}
   local dir="$WORKDIR/$name"
 
-  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
+  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/scripts/workflow" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/codex-review-request.sh" "$dir/scripts/codex-review-request.sh"
   chmod +x "$dir/scripts/codex-review-request.sh"
   # #799: codex-review-request.sh HARD-sources this lib (exit 3 if absent),
@@ -60,6 +60,9 @@ make_case() {
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"
   cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
   cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
+  chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
 codex:
@@ -69,6 +72,7 @@ codex:
   ack_wait_seconds: $ack_wait
   max_ack_retries: $max_retries
 EOF
+  cp "$dir/.github/review-policy.yml" "$dir/state/base-review-policy.yml"
 
   cat >"$dir/scripts/gh-as-author.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -177,12 +181,15 @@ endpoint=${1:-}
 
 case "$endpoint" in
   repos/owner/repo/pulls/999)
-    if [ "$scenario" = "head-drift" ]; then
+    # The initial HEAD fetch and the governing-policy resolver both need full
+    # PR metadata. Only preserve_final_request_timeout's explicit scalar read
+    # proves the live head immediately before it reuses a timeout marker.
+    if [ "$scenario" = "head-drift" ] && [ "${2:-}" = "--jq" ] && [ "${3:-}" = ".head.sha" ]; then
       reads=0
       [ ! -f "$state_dir/head-reads" ] || reads=$(cat "$state_dir/head-reads")
       reads=$((reads + 1))
       printf '%s\n' "$reads" >"$state_dir/head-reads"
-      if [ "$reads" -gt 1 ]; then
+      if [ "$reads" -eq 1 ]; then
         printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
         exit 0
       fi
@@ -190,8 +197,11 @@ case "$endpoint" in
     if [ "${2:-}" = "--jq" ]; then
       printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
     else
-      printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}\n'
+      printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"base":{"ref":"main","sha":"base-sha","repo":{"default_branch":"main"}}}\n'
     fi
+    ;;
+  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha')
+    cat "$state_dir/base-review-policy.yml"
     ;;
   repos/owner/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
     printf '%s\n' "$now"
@@ -445,7 +455,7 @@ test_retry_cap_respected() {
 test_request_attempt_cap_suppresses_ack_retry_but_polls() {
   local dir rc count before=$FAIL
   dir=$(make_case "request-cap-blocks-retry" 0 1)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   rc=$(run_case "$dir" absent)
   count=$(trigger_count "$dir")
   [ "$rc" = 4 ] || fail "#813 retry cap: exit $rc, expected ordinary poll timeout 4; stderr=$(cat "$dir/err.log")"
@@ -461,7 +471,7 @@ test_request_attempt_cap_suppresses_ack_retry_but_polls() {
 test_reused_final_slot_trigger_polls_arriving_response() {
   local dir rc count ack_count review_body before=$FAIL
   dir=$(make_case "reused-final-slot-arrival" 0 1)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9901 "2026-06-04T00:00:00Z"
   rc=$(run_case "$dir" reused-final-slot-arrival)
   count=$(trigger_count "$dir")
@@ -479,7 +489,7 @@ test_reused_final_slot_trigger_polls_arriving_response() {
 test_reused_final_slot_pending_stops_without_timeout_authority() {
   local dir rc count ack_count before=$FAIL
   dir=$(make_case "reused-final-slot-pending" 0 1)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9902 "2026-06-04T00:00:00Z"
   rc=$(run_case "$dir" reused-final-slot-pending)
   count=$(trigger_count "$dir")
@@ -497,7 +507,7 @@ test_reused_final_slot_pending_stops_without_timeout_authority() {
 test_reused_final_slot_preserves_recorded_timeout() {
   local dir rc marker before=$FAIL
   dir=$(make_case "reused-recorded-timeout" 0 0)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   rc=$(run_case "$dir" absent)
   [ "$rc" = 4 ] || fail "#813 recorded timeout setup: exit $rc, expected 4"
   marker=$(jq -r '.terminal_determination.marker_comment_id' "$dir/out.json")
@@ -518,7 +528,7 @@ test_reused_final_slot_timeout_marker_controls() {
   for variant in stale superseded uppercase-newer malformed head-drift; do
     before=$FAIL
     dir=$(make_case "reused-marker-$variant" 0 0)
-    printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+    printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
     seed_author_trigger "$dir" 9901 "2026-06-04T00:00:00Z"
     body='<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa trigger_comment_id=9901 -->'
     expected=7
@@ -536,6 +546,10 @@ test_reused_final_slot_timeout_marker_controls() {
     esac
     rc=$(run_case "$dir" "$variant")
     [ "$rc" = "$expected" ] || fail "#813 $variant marker: exit $rc, expected $expected; stderr=$(cat "$dir/err.log")"
+    if [ "$variant" = head-drift ]; then
+      grep -q 'cannot reuse Phase 4a timeout: PR head moved' "$dir/err.log" \
+        || fail "#813 head-drift marker: exit 3 did not come from the live-head refusal; stderr=$(cat "$dir/err.log")"
+    fi
     [ "$(trigger_count "$dir")" = 0 ] || fail "#813 $variant marker: posted another trigger"
     [ ! -f "$dir/state/terminal-count" ] || fail "#813 $variant marker: posted timeout authority"
     if [ "$expected" = 7 ]; then
@@ -548,7 +562,7 @@ test_reused_final_slot_timeout_marker_controls() {
 test_stale_trigger_is_not_reused_as_pending() {
   local dir rc count before=$FAIL
   dir=$(make_case "stale-trigger-control" 0 1)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9903 "2026-06-03T00:00:00Z"
   rc=$(run_case "$dir" stale-trigger-control)
   count=$(trigger_count "$dir")
@@ -563,7 +577,7 @@ test_stale_trigger_is_not_reused_as_pending() {
 test_current_terminal_finding_is_not_reused_as_pending() {
   local dir rc count before=$FAIL
   dir=$(make_case "fresh-terminal-finding" 0 0)
-  printf '  max_review_rounds: 2\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 2\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9904 "2026-06-04T00:00:00Z"
   rc=$(run_case "$dir" fresh-terminal-finding)
   count=$(trigger_count "$dir")
@@ -576,7 +590,7 @@ test_current_terminal_finding_is_not_reused_as_pending() {
 test_current_terminal_finding_at_cap_does_not_claim_reuse() {
   local dir rc count before=$FAIL
   dir=$(make_case "fresh-terminal-finding-at-cap" 0 1)
-  printf '  max_review_rounds: 1\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 1\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9907 "2026-06-04T00:00:00Z"
   rc=$(run_case "$dir" fresh-terminal-finding)
   count=$(trigger_count "$dir")
@@ -591,7 +605,7 @@ test_current_terminal_finding_at_cap_does_not_claim_reuse() {
 test_older_finding_before_final_trigger_does_not_block_reuse() {
   local dir rc count ack_count review_body before=$FAIL
   dir=$(make_case "older-finding-before-final-trigger" 0 0)
-  printf '  max_review_rounds: 2\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 2\n' >>"$dir/state/base-review-policy.yml"
   seed_author_trigger "$dir" 9905 "2026-06-04T00:00:00Z"
   seed_author_trigger "$dir" 9906 "2026-06-04T00:00:10Z"
   rc=$(run_case "$dir" older-finding-before-final-trigger)
@@ -611,7 +625,7 @@ test_older_finding_before_final_trigger_does_not_block_reuse() {
 test_malformed_request_cap_does_not_change_clearance_skip() {
   local dir rc before=$FAIL
   dir=$(make_case "malformed-cap-cleared" 0 1)
-  printf '  max_review_rounds: 999999999999999999999999\n' >>"$dir/.github/review-policy.yml"
+  printf '  max_review_rounds: 999999999999999999999999\n' >>"$dir/state/base-review-policy.yml"
   rc=$(run_case "$dir" skip_reaction)
   [ "$rc" = 0 ] || fail "#813 malformed cap: cleared skip exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
   [ "$(trigger_count "$dir")" = 0 ] || fail "#813 malformed cap: cleared skip posted a trigger"
@@ -791,6 +805,7 @@ test_bridge_passes_configured_author_identity() {
   # Custom author_identity repo (Codex P2 on PR #442): the wrapper must
   # be told to verify the configured login, not its stock default.
   printf 'author_identity: custom-owner\n' >>"$dir/.github/review-policy.yml"
+  printf 'author_identity: custom-owner\n' >>"$dir/state/base-review-policy.yml"
   cat >"$dir/scripts/identity-check.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -811,6 +826,50 @@ EOF
   else
     pass "bridge passes the configured author_identity to the wrapper (rc=$rc)"
   fi
+}
+
+test_candidate_author_cannot_reset_governing_request_cap() {
+  local dir rc before=$FAIL i
+  dir=$(make_case "candidate-author-cap-reset" 0 0)
+  # The governing author has already consumed every request slot. Before the
+  # write-boundary identity check, selecting a different candidate identity
+  # omitted those requests and let a verified token post another command.
+  printf '  max_review_rounds: 10\n' >>"$dir/state/base-review-policy.yml"
+  i=1
+  while [ "$i" -le 10 ]; do
+    seed_author_trigger "$dir" "$((9000 + i))" "2026-06-03T00:00:00Z"
+    i=$((i + 1))
+  done
+  printf 'author_identity: custom-owner\n' >>"$dir/.github/review-policy.yml"
+  cat >"$dir/scripts/identity-check.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = "--expect-token-identity" ] || exit 2
+[ "${2:-}" = "custom-owner" ] || exit 1
+[ "${GH_TOKEN:-}" = "author-pat-123" ] || exit 1
+exit 0
+EOF
+  chmod +x "$dir/scripts/identity-check.sh"
+
+  rc=$(run_case "$dir" absent 0 author-pat-123)
+  [ "$rc" = 3 ] || fail "#813 governing author mismatch: expected infrastructure exit 3, got $rc; stderr=$(cat "$dir/err.log")"
+  [ "$(trigger_count "$dir")" = 0 ] || fail "#813 governing author mismatch: candidate identity posted beyond the governing author's cap"
+  grep -q 'candidate author_identity.*governing base policy' "$dir/err.log" \
+    || fail "#813 governing author mismatch: refusal did not identify the policy mismatch"
+  [ "$FAIL" -ne "$before" ] || pass "#813: candidate author_identity cannot reset the governing request-attempt count"
+}
+
+test_invalid_governing_author_refuses_new_write() {
+  local value dir rc before
+  for value in false null '[]'; do
+    before=$FAIL
+    dir=$(make_case "governing-author-$value" 0 0)
+    printf 'author_identity: %s\n' "$value" >>"$dir/state/base-review-policy.yml"
+    rc=$(run_case "$dir" absent)
+    [ "$rc" = 3 ] || fail "#813 malformed governing author $value: expected infrastructure exit 3, got $rc; stderr=$(cat "$dir/err.log")"
+    [ "$(trigger_count "$dir")" = 0 ] || fail "#813 malformed governing author $value: posted despite invalid governed identity"
+    [ "$FAIL" -ne "$before" ] || pass "#813: present malformed governing author_identity $value refuses a new request write"
+  done
 }
 
 test_non_author_token_is_not_bridged() {
@@ -839,6 +898,7 @@ test_non_bridge_path_passes_configured_identity() {
   # Single-quoted on purpose: the parser must strip both YAML quote
   # styles (Codex P2 r9).
   printf "author_identity: 'custom-owner'\n" >>"$dir/.github/review-policy.yml"
+  printf "author_identity: 'custom-owner'\n" >>"$dir/state/base-review-policy.yml"
   rc=$(run_case "$dir" absent 0 reviewer-pat-456)
   identity=$(head -1 "$dir/state/author-identity-env" 2>/dev/null || printf '')
 
@@ -982,6 +1042,8 @@ test_retry_preserves_original_trigger_response
 test_ack_wait_window_is_bounded
 test_inline_author_pat_bridged_into_wrapper
 test_bridge_passes_configured_author_identity
+test_candidate_author_cannot_reset_governing_request_cap
+test_invalid_governing_author_refuses_new_write
 test_non_author_token_is_not_bridged
 test_non_bridge_path_passes_configured_identity
 test_missing_identity_checker_skips_bridge
