@@ -453,17 +453,33 @@ jobs:
           # wrong for either PR. Detected once, posted once per head.
           dup_heads=$(cut -f2 <<<"$prs_raw" | sort | uniq -d)
           handled_dups=""
-          # gate <script> <context> <sentinel-or-empty>: evaluate one gate
-          # for one PR and POST the completed verdict on its head.
+          # gate <script> <context> <sentinel-or-empty> <pr> <head>
+          #      [require-review-summary]: evaluate one gate for one PR and
+          # POST the completed verdict on its head. The optional flag belongs
+          # only to CodeRabbit's #886/#1364 publication hold.
           gate() {
             local script="$1" context="$2" sentinel="$3" pr="$4" head="$5"
+            local summary_hold="${6:-false}"
             local output rc conclusion title
             set +e
-            output=$("$script" "$pr" "$REPO" 2>&1)
+            if [ "$summary_hold" = true ]; then
+              output=$(REQUIRE_REVIEW_SUMMARY=true "$script" "$pr" "$REPO" 2>&1)
+            else
+              output=$("$script" "$pr" "$REPO" 2>&1)
+            fi
             rc=$?
             set -e
             printf '%s\n' "$output"
             title="$context (publisher re-evaluation)"
+            if [ "$summary_hold" = true ] && [ "$rc" -eq 3 ]; then
+              # A current-head CodeRabbit run has no recognised summary yet.
+              # This Checks-API publisher can decline the write and retain the
+              # existing hold; publishing either green or an infra red would
+              # violate the same #886 contract as the legacy sweep. This does
+              # not close #906's wider publication-ordering residual.
+              echo "::notice::PR #$pr has a current-HEAD CodeRabbit review awaiting its PR-level summary; withholding $context publication"
+              return 0
+            fi
             case "$rc" in
               0) conclusion="success" ;;
               1) conclusion="failure" ;;
@@ -589,7 +605,7 @@ jobs:
             echo "::group::Publish PR #$PR @ $head_sha"
             gate scripts/merge-clearance-gate.sh   "$MCG_CONTEXT"        "Merge clearance: PASS" "$PR" "$head_sha"
             gate scripts/codex-p1-gate.sh          "$CODEX_P1_CONTEXT"   ""                      "$PR" "$head_sha"
-            gate scripts/coderabbit-severity-gate.sh "$CODERABBIT_CONTEXT" ""                    "$PR" "$head_sha"
+            gate scripts/coderabbit-severity-gate.sh "$CODERABBIT_CONTEXT" ""                    "$PR" "$head_sha" true
             echo "::endgroup::"
           done <<<"$targets"
 
