@@ -894,8 +894,11 @@ jobs:
                     fi
                   fi
                   page_runs='[]'
-                  if ! matching_source_runs=$(jq -c \
+                  if ! matching_source_runs=$(jq -cs \
                     --arg title "Codex P1 Gate relay-v1 PR #$PR" '
+                      if length != 1 then
+                        error("expected one workflow-runs response")
+                      else .[0] end |
                       if (.workflow_runs | type) != "array" then
                         error("workflow_runs is not an array")
                       else

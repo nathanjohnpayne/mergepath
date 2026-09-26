@@ -57,7 +57,15 @@ done
 case "$endpoint" in
   repos/acme/widget/actions/workflows/codex-p1-gate.yml/runs)
     [ "$method" = GET ] || exit 65
-    cat "$WORKFLOW_RUNS"
+    page=1
+    for arg in "$@"; do
+      case "$arg" in page=*) page=${arg#page=} ;; esac
+    done
+    if [ "$page" = 2 ] && [ -n "${WORKFLOW_RUNS_PAGE2:-}" ]; then
+      cat "$WORKFLOW_RUNS_PAGE2"
+    else
+      cat "$WORKFLOW_RUNS"
+    fi
     ;;
   repos/acme/widget/contents/*\?ref=*)
     path=${endpoint#repos/acme/widget/contents/}
@@ -233,6 +241,37 @@ run_case 41
 assert_eq "$RC" 4 "contradictory source association is rejected without title fallback"
 assert_empty_writes "contradictory association creates no mutation"
 
+# Nonempty associations are source evidence only when they identify one PR.
+# Two otherwise matching PRs can share a fork branch and commit across base
+# branches; a run title must not select between them. Exercise both candidate
+# titles so either target remains inert.
+write_pr 81 "$(sha 81)" 201 fork/alice relay-branch alice 2026-09-25T09:00:00Z
+write_pr 82 "$(sha 82)" 201 fork/alice relay-branch alice 2026-09-25T09:00:00Z
+jq -n --argjson base "$BASE_ID" --argjson head 201 --arg branch relay-branch '
+  [41,81] | map({number:.,base:{repo:{id:$base}},head:{repo:{id:$head},ref:$branch}})
+' >"$TMP/ambiguous-associations.json"
+RUN_PR=41 write_run pull_request "$SRC" 201 fork/alice relay-branch "$(cat "$TMP/ambiguous-associations.json")" '.github/workflows/codex-p1-gate.yml'
+run_case 41
+assert_eq "$RC" 4 "multiple matching source associations reject the first candidate title"
+assert_empty_writes "first ambiguous association target creates no mutation"
+RUN_PR=81 write_run pull_request "$SRC" 201 fork/alice relay-branch "$(cat "$TMP/ambiguous-associations.json")" '.github/workflows/codex-p1-gate.yml'
+run_case 81
+assert_eq "$RC" 4 "multiple matching source associations reject the second candidate title"
+assert_empty_writes "second ambiguous association target creates no mutation"
+
+jq -n --argjson base "$BASE_ID" --argjson head 201 --arg branch relay-branch '
+  [{number:41,base:{repo:{id:$base}},head:{repo:{id:$head},ref:$branch}}]
+' >"$TMP/single-association.json"
+RUN_PR=41 write_run pull_request "$SRC" 201 fork/alice relay-branch "$(cat "$TMP/single-association.json")" '.github/workflows/codex-p1-gate.yml'
+run_case 41
+assert_eq "$RC" 0 "one matching source association accepts its candidate"
+assert_empty_writes "verified single association remains read-only while binding"
+dup_associations=$(jq -c '[.[0], .[0]]' "$TMP/single-association.json")
+RUN_PR=41 write_run pull_request "$SRC" 201 fork/alice relay-branch "$dup_associations" '.github/workflows/codex-p1-gate.yml'
+run_case 41
+assert_eq "$RC" 0 "duplicate identical source associations collapse to one candidate"
+assert_empty_writes "duplicate identical association remains read-only while binding"
+
 # Two historical PRs for one source branch are intentionally unavailable: do
 # not choose the first target or let a reused branch acquire a later PR.
 jq -n --argjson base "$BASE_ID" --argjson head 201 --arg source fork/alice --arg branch relay-branch '[41,43] | map({number:.,created_at:"2026-09-25T09:00:00Z",base:{repo:{id:$base}},head:{repo:{id:$head,full_name:$source},ref:$branch}})' >"$CANDIDATES"
@@ -294,12 +333,14 @@ SH
 } >"$SCAN_HARNESS"
 chmod +x "$SCAN_HARNESS"
 run_scan() {
+  local page2=${1:-}
+  local max_runs=${2:-50}
   : >"$GH_LOG"
   rm -rf "$TMP/scan-runner"
   set +e
   SCAN_OUTPUT=$(cd "$ROOT" && PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" \
-    WORKFLOW_RUNS="$WORKFLOW_RUNS" RUNNER_TEMP="$TMP/scan-runner" REPO="$BASE_REPO" \
-    PR=41 MAX_RELAY_SOURCE_RUNS=50 "$SCAN_HARNESS" 2>"$TMP/scan.err")
+    WORKFLOW_RUNS="$WORKFLOW_RUNS" WORKFLOW_RUNS_PAGE2="$page2" RUNNER_TEMP="$TMP/scan-runner" REPO="$BASE_REPO" \
+    PR=41 MAX_RELAY_SOURCE_RUNS="$max_runs" "$SCAN_HARNESS" 2>"$TMP/scan.err")
   SCAN_RC=$?
   set -e
 }
@@ -317,12 +358,44 @@ assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after a wrong-shaped workfl
 assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "wrong-shaped workflow_runs marks the relay scan as an infrastructure error"
 assert_empty_writes "wrong-shaped workflow_runs scan makes no target mutation"
 
+# A successful API command that prints no JSON (including whitespace only) is
+# neither an empty page nor a valid inventory. Keep both cases bounded: the
+# checked singleton capture must set relay_scan_error on page one before any
+# pagination loop can advance.
+: >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after an empty successful response"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "empty successful response marks the relay scan as an infrastructure error"
+assert_empty_writes "empty successful response scan makes no target mutation"
+
+printf ' \n\t \n' >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after a whitespace-only successful response"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "whitespace-only successful response marks the relay scan as an infrastructure error"
+assert_empty_writes "whitespace-only successful response scan makes no target mutation"
+
 printf '%s\n' '{"total_count":0,"workflow_runs":[]}' >"$WORKFLOW_RUNS"
 run_scan
 assert_eq "$SCAN_RC" 0 "actual sweep scanner accepts a legitimate empty workflow run page"
 assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" false "legitimate empty workflow run page does not become an infrastructure error"
 assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^source_runs=//p')" '[]' "legitimate empty workflow run page leaves the inventory empty"
 assert_empty_writes "legitimate empty workflow run scan makes no target mutation"
+
+# A complete first page can still be followed by a malformed empty second
+# response. total_count=101 forces the actual pagination branch once, then the
+# singleton capture must fail closed rather than leaving the lease pending.
+printf '%s\n' '{"total_count":101,"workflow_runs":[]}' >"$WORKFLOW_RUNS"
+PAGE2="$TMP/workflow-runs-page2.json"
+: >"$PAGE2"
+run_scan "$PAGE2" 500
+assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after an empty second page"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "empty second page marks the relay scan as an infrastructure error"
+if grep -F -- $'page=2' "$GH_LOG" >/dev/null; then
+  pass "empty second-page case exercised the real pagination branch"
+else
+  fail "empty second-page case did not request page two: $(cat "$GH_LOG")"
+fi
+assert_empty_writes "empty second-page scan makes no target mutation"
 
 # A matching, positively bound source is still retained. This guards the
 # checked capture from accidentally treating all nonempty pages as failures.

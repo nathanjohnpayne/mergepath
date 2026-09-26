@@ -199,13 +199,21 @@ else
   printf '%s' "$ASSOCIATIONS" | jq -e 'type == "array"' >/dev/null 2>&1 \
     || reject "source PR associations are not an array"
   if [ "$(printf '%s' "$ASSOCIATIONS" | jq 'length')" -gt 0 ]; then
-    printf '%s' "$ASSOCIATIONS" | jq -e \
-      --argjson pr "$PR_NUMBER" --argjson base "$BASE_REPO_ID" \
+    ASSOCIATED_PRS=$(printf '%s' "$ASSOCIATIONS" | jq -c \
+      --argjson base "$BASE_REPO_ID" \
       --argjson head "$SOURCE_REPO_ID" --arg branch "$SOURCE_BRANCH" '
-        any(.[];
-          .number == $pr and .base.repo.id == $base and
-          .head.repo.id == $head and .head.ref == $branch)
-      ' >/dev/null || reject "source PR association contradicts the candidate"
+        [ .[]
+          | select(
+              (.number | type == "number" and floor == . and . > 0) and
+              .base.repo.id == $base and .head.repo.id == $head and
+              .head.ref == $branch)
+          | .number ]
+        | unique
+      ') || reject "source PR associations are malformed"
+    [ "$(printf '%s' "$ASSOCIATED_PRS" | jq 'length')" -eq 1 ] \
+      || reject "source PR associations do not identify exactly one PR"
+    [ "$(printf '%s' "$ASSOCIATED_PRS" | jq -r '.[0]')" = "$PR_NUMBER" ] \
+      || reject "source PR association contradicts the candidate"
   else
     SOURCE_OWNER=${SOURCE_REPO%%/*}
     [ -n "$SOURCE_OWNER" ] && [ "$SOURCE_OWNER" != "$SOURCE_REPO" ] \
