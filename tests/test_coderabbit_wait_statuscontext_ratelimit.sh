@@ -100,11 +100,18 @@ LEGACY_RATE_LIMIT_BODY='Rate limit exceeded
 
 Please wait before requesting another review.'
 
+# CodeRabbit's older notice can put the heading and retry prose on one line.
+# This must retain the same #956 provider-owned refusal status as the
+# established two-line form, without treating quoted or fenced copies as state.
+LEGACY_RATE_LIMIT_BODY_ONE_LINE='Rate limit exceeded. Please wait 10 seconds before requesting another review.'
+
 LEGACY_RATE_LIMIT_BODY_TRAILING=$'Rate limit exceeded  \r\n\r\nPlease wait before requesting another review.'
 
 LEGACY_REVIEW_LIMIT_BODY='Review limit reached
 
 Please wait before requesting another review.'
+
+LEGACY_REVIEW_LIMIT_BODY_ONE_LINE='Review limit reached: Please wait before requesting another review.'
 
 LEGACY_PAUSED_BODY='Reviews paused
 
@@ -685,7 +692,20 @@ test_current_refusal_with_actual_head_review_clears() {
   [ "$rc" = "0" ] || fail "3b: expected exit 0 with a body-bearing current-HEAD review, got $rc; err=$(tail -4 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3b: status=$(jqf "$dir" '.status'), expected cleared"
   grep -q 'body-bearing review id=8801 is pinned' "$dir/err.log" || fail "3b: expected exact-head review evidence log; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
-  [ "$FAIL" -ne "$before" ] || pass "3b: #956 — a body-bearing review run pinned to HEAD outranks the current refusal"
+  [ "$FAIL" -ne "$before" ] || pass "3b: #956 — a body-bearing review run pinned to HEAD outranks the marked current refusal"
+}
+
+# Keep the legacy one-line refusal under the same body-bearing exact-HEAD
+# precedence control, separately from the established marker-form regression.
+test_one_line_refusal_with_actual_head_review_clears() {
+  local dir rc before=$FAIL reviews
+  dir=$(make_case "one-line-actual-review" "$LEGACY_RATE_LIMIT_BODY_ONE_LINE" "2026-06-04T02:00:00Z")
+  reviews='[{"id":8801,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T01:59:59Z","body":"Review completed. No actionable comments."}]'
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  [ "$rc" = "0" ] || fail "3b legacy one-line: expected exit 0 with a body-bearing current-HEAD review, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3b legacy one-line: status=$(jqf "$dir" '.status'), expected cleared"
+  grep -q 'body-bearing review id=8801 is pinned' "$dir/err.log" || fail "3b legacy one-line: expected exact-head review evidence log; err=$(grep -i statuscontext "$dir/err.log" | tail -3)"
+  [ "$FAIL" -ne "$before" ] || pass "3b: #956 — a body-bearing review run pinned to HEAD also outranks the legacy one-line refusal"
 }
 
 # The #956 override selects and grades one body-bearing run before the
@@ -800,11 +820,13 @@ test_current_refusal_with_review_quoting_progress_clears() {
 
 test_legacy_leading_refusal_stays_current() {
   local mode body expected dir rc before=$FAIL
-  for mode in rate-limit rate-limit-trailing review-limit paused; do
+  for mode in rate-limit rate-limit-one-line rate-limit-trailing review-limit review-limit-one-line paused; do
     case "$mode" in
       rate-limit) body=$LEGACY_RATE_LIMIT_BODY; expected=5 ;;
+      rate-limit-one-line) body=$LEGACY_RATE_LIMIT_BODY_ONE_LINE; expected=5 ;;
       rate-limit-trailing) body=$LEGACY_RATE_LIMIT_BODY_TRAILING; expected=5 ;;
       review-limit) body=$LEGACY_REVIEW_LIMIT_BODY; expected=5 ;;
+      review-limit-one-line) body=$LEGACY_REVIEW_LIMIT_BODY_ONE_LINE; expected=5 ;;
       paused) body=$LEGACY_PAUSED_BODY; expected=6 ;;
     esac
     dir=$(make_case "legacy-leading-$mode-refusal" "$body" "2026-06-04T02:00:00Z")
@@ -812,7 +834,55 @@ test_legacy_leading_refusal_stays_current() {
     [ "$rc" = "$expected" ] || fail "3b6 $mode: leading legacy refusal should remain blocked, got $rc expected $expected; err=$(tail -5 "$dir/err.log")"
     grep -q 'grading-only because CodeRabbit' "$dir/err.log" || fail "3b6 $mode: leading legacy refusal was not recognized as provider state"
   done
-  [ "$FAIL" -ne "$before" ] || pass "3b6: supported markerless and trailing-whitespace legacy refusal headings remain authoritative through polling"
+  [ "$FAIL" -ne "$before" ] || pass "3b6: supported markerless, one-line, and trailing-whitespace legacy refusal headings remain authoritative through polling"
+}
+
+test_legacy_one_line_refusal_quote_and_fence_stay_nonprovider() {
+  local mode body dir rc before=$FAIL
+  for mode in quoted fenced; do
+    case "$mode" in
+      quoted) body="> $LEGACY_RATE_LIMIT_BODY_ONE_LINE" ;;
+      fenced) body=$(printf '```\n%s\n```' "$LEGACY_RATE_LIMIT_BODY_ONE_LINE") ;;
+    esac
+    dir=$(make_case "one-line-$mode-lookalike" "$body" "2026-06-04T02:00:00Z")
+    rc=$(run_case "$dir")
+    [ "$rc" = "0" ] || fail "3b6 $mode: quoted/fenced one-line refusal lookalike should not become provider state, got $rc; err=$(tail -5 "$dir/err.log")"
+    grep -q 'grading-only because CodeRabbit' "$dir/err.log" && fail "3b6 $mode: quoted/fenced one-line lookalike was promoted to provider state"
+  done
+  [ "$FAIL" -ne "$before" ] || pass "3b6: quoted and fenced one-line legacy refusal text remains non-provider content"
+}
+
+test_legacy_refusal_classifier_unit() {
+  local snip="$WORKDIR/legacy-refusal-classifier.sh" body class bad="" before=$FAIL
+  eval "$(grep -E '^(RATE_LIMIT_MARKER|PAUSED_MARKER|IN_PROGRESS_MARKER)=' \
+    "$ROOT/scripts/coderabbit-wait.sh")"
+  # shellcheck source=../scripts/lib/coderabbit-fence.sh
+  . "$ROOT/scripts/lib/coderabbit-fence.sh"
+  sed -n '/^crw_unfenced_body() {/,/^crw_classify_selected_comment() {/p' \
+    "$ROOT/scripts/coderabbit-wait.sh" | sed '$d' >"$snip"
+  [ -s "$snip" ] || { fail "3b6 unit: legacy refusal classifier extraction is empty"; return; }
+  # shellcheck disable=SC1090
+  . "$snip"
+
+  for body in \
+    '## Rate limit exceeded. Please wait before requesting another review.' \
+    '## Rate-limit exceeded. Please wait before requesting another review.' \
+    '## Review limit reached. Please wait before requesting another review.' \
+    '## Rate limit exceeded: Please wait before requesting another review.' \
+    '## Rate-limit exceeded: Please wait before requesting another review.' \
+    '## Review limit reached: Please wait before requesting another review.'; do
+    class=$(crw_provider_owned_refusal_class "$body") || class=""
+    [ "$class" = rate_limit ] || bad="$bad markdown-punctuation"
+  done
+  for body in \
+    'Rate limit exceeded while checking an unrelated example' \
+    '## Rate limit exceeded while checking an unrelated example'; do
+    class=$(crw_provider_owned_refusal_class "$body") || class=""
+    [ -z "$class" ] || bad="$bad generic-prefix"
+  done
+
+  [ -z "$bad" ] || fail "3b6 unit: bounded legacy refusal grammar wrong:$bad"
+  [ "$FAIL" -ne "$before" ] || pass "3b6 unit: punctuation variants stay bounded to the established legacy headings"
 }
 
 test_markerless_refusal_does_not_clear_at_terminal_probe() {
@@ -957,6 +1027,16 @@ test_trigger_ack_is_polling_in_progress() {
     rc=$(run_case "$dir")
     [ "$rc" = "5" ] || fail "3b10 refusal before $mode: accepted trigger must not supersede the older refusal, got $rc; err=$(tail -6 "$dir/err.log")"
   done
+
+  # The one-line legacy refusal is provider state too.  A newer accepted
+  # trigger starts a potential replacement review, but cannot erase the
+  # preceding refusal until a body-bearing review run supplies the evidence.
+  dir=$(make_case "polling-one-line-refusal-before-trigger-ack" "$LEGACY_RATE_LIMIT_BODY_ONE_LINE" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$FULL_REVIEW_TRIGGER_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
+  sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] || fail "3b10 one-line refusal before trigger: accepted trigger must not supersede the older one-line refusal, got $rc; err=$(tail -6 "$dir/err.log")"
 
   # Selection is newest-first. An older accepted acknowledgement must not
   # replace the newest one while both sit above the prior clean publication.
@@ -2417,6 +2497,7 @@ test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
 test_headref_later_status_without_review_stays_refused
 test_current_refusal_with_actual_head_review_clears
+test_one_line_refusal_with_actual_head_review_clears
 test_refusal_run_is_revalidated_before_clearance
 test_current_refusal_with_bodyless_ack_stays_refused
 test_current_pause_with_later_status_resumes_instead_of_clearing
@@ -2858,6 +2939,8 @@ test_refusal_quoting_narration_outranks_older_comment
 test_current_refusal_with_nonbenign_head_review_stays_refused
 test_current_refusal_with_review_quoting_progress_clears
 test_legacy_leading_refusal_stays_current
+test_legacy_one_line_refusal_quote_and_fence_stay_nonprovider
+test_legacy_refusal_classifier_unit
 test_markerless_refusal_does_not_clear_at_terminal_probe
 test_selected_comment_structural_failure_fails_closed
 test_provider_leading_nonreview_run_stays_refused

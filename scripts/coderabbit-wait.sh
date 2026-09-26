@@ -1666,6 +1666,14 @@ crw_provider_owned_refusal_class() {
   case "$first_line" in
     'rate limit exceeded'|'rate-limit exceeded'|'## rate limit exceeded'|'## rate-limit exceeded'|'review limit reached'|'## review limit reached')
       printf 'rate_limit\n'; return 0 ;;
+    # CodeRabbit's legacy refusal sometimes joins its heading and retry prose
+    # onto one line.  Keep the punctuation boundary narrow: it recognizes the
+    # provider heading without promoting a longer unstructured sentence.
+    'rate limit exceeded.'*|'rate-limit exceeded.'*|'review limit reached.'*|\
+    'rate limit exceeded:'*|'rate-limit exceeded:'*|'review limit reached:'*|\
+    '## rate limit exceeded.'*|'## rate-limit exceeded.'*|'## review limit reached.'*|\
+    '## rate limit exceeded:'*|'## rate-limit exceeded:'*|'## review limit reached:'*)
+      printf 'rate_limit\n'; return 0 ;;
     'reviews paused'|'## reviews paused')
       printf 'paused\n'; return 0 ;;
     'review in progress'*|'currently reviewing'*|'commit under review'*|'commits under review'*)
