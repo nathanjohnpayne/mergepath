@@ -77,7 +77,29 @@ jobs:
               'policy-violation',
               'human-hold',
             ];
-            const prLabels = context.payload.pull_request.labels.map(l => l.name);
+            // Read the PR's LIVE labels, never context.payload's snapshot
+            // (#1339). A re-run replays the ORIGINAL event payload, so a run
+            // that failed on a since-removed label failed identically on
+            // every re-run and could never be retired by one (#1318). A
+            // failed read fails closed: "could not read the labels" must not
+            // pass as "no blocking labels".
+            const issue_number = context.payload.pull_request.number;
+            let prLabels;
+            try {
+              const labels = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                per_page: 100,
+              });
+              prLabels = labels.map(l => l.name);
+            } catch (err) {
+              core.setFailed(
+                `Could not read the current labels of #${issue_number} (${err.message}); ` +
+                `failing closed rather than treating an unread label set as clear.`
+              );
+              return;
+            }
             const blockers = prLabels.filter(l => blockingLabels.includes(l));
 
             if (blockers.length > 0) {

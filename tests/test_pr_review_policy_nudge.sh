@@ -658,8 +658,11 @@ mkdir -p "$WRAPPER_FIXTURE/scripts/ci" "$WRAPPER_FIXTURE/scripts/lib" \
 cp "$SUBJECT" "$WRAPPER_FIXTURE/scripts/pr-review-policy-nudge.sh"
 cp "$ROOT/scripts/lib/ci-check-modes.sh" "$WRAPPER_FIXTURE/scripts/lib/"
 cp "$ROOT/.github/workflows/pr-review-policy.yml" "$WRAPPER_FIXTURE/.github/workflows/"
-touch "$WRAPPER_FIXTURE/scripts/sync-to-downstream.sh" "$WRAPPER_FIXTURE/tests/test_pr_review_policy_nudge.sh"
-chmod +x "$WRAPPER_FIXTURE/tests/test_pr_review_policy_nudge.sh"
+# The wrapper also requires the #1339 Label Gate test to exist and be
+# executable; an empty stand-in is enough for the --check lane exercised here.
+touch "$WRAPPER_FIXTURE/scripts/sync-to-downstream.sh" "$WRAPPER_FIXTURE/tests/test_pr_review_policy_nudge.sh" \
+  "$WRAPPER_FIXTURE/tests/test_label_gate_live_labels.sh"
+chmod +x "$WRAPPER_FIXTURE/tests/test_pr_review_policy_nudge.sh" "$WRAPPER_FIXTURE/tests/test_label_gate_live_labels.sh"
 cat > "$TMP/wrapper-bin/git" <<'STUB'
 #!/usr/bin/env bash
 [ "$*" = "rev-parse --show-toplevel" ] || exit 90
