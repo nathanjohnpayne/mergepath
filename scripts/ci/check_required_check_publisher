@@ -142,6 +142,7 @@ PUBLISHER="${REQUIRED_CHECK_PUBLISHER_WORKFLOW:-.github/workflows/required-check
 PARENT_WORKFLOW="${REQUIRED_CHECK_PUBLISHER_PARENT:-.github/workflows/merge-clearance-gate.yml}"
 WORKFLOW_DIR="${REQUIRED_CHECK_PUBLISHER_WORKFLOW_DIR:-.github/workflows}"
 DEDUP_TEST="tests/test_required_check_publisher_dedup.sh"
+SUMMARY_HOLD_TEST="tests/test_required_check_publisher_summary_hold.sh"
 HUB_MARKER="scripts/sync-to-downstream.sh"
 
 FAILED=0
@@ -975,6 +976,15 @@ if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ] \
   fi
   if ! bash "$DEDUP_TEST"; then
     echo "check_required_check_publisher: FAIL (dedup behavior suite)"
+    exit 1
+  fi
+  if [ ! -f "$SUMMARY_HOLD_TEST" ]; then
+    echo "FAIL: $SUMMARY_HOLD_TEST is missing; CodeRabbit's live publisher hold is untested."
+    echo "check_required_check_publisher: FAIL"
+    exit 1
+  fi
+  if ! bash "$SUMMARY_HOLD_TEST"; then
+    echo "check_required_check_publisher: FAIL (CodeRabbit summary-hold behavior suite)"
     exit 1
   fi
 fi
