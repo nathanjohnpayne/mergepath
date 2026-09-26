@@ -1671,6 +1671,65 @@ docs/agents/hub(1).md|# Hub-only machinery")
   fi
 done
 
+# A literal backslash in a destination is itself escaped, while the parentheses
+# are escaped separately. Passing ASCII_PUNCT through awk -v must preserve the
+# backslash member on BSD awk, gawk, and mawk; otherwise gawk/BSD awk leave an
+# extra slash in the extracted target and permit this consumer-broken link.
+escaped_backslash_angle='See [the audit](<hub\\\\\\(1\\).md>) for details.'
+MANIFEST_TRUTH_LITERAL_BACKSLASH="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+  - path: 'docs/agents/hub\\(1).md'
+    class: hub-only
+"
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH_LITERAL_BACKSLASH" \
+  "docs/agents/shared.md|$escaped_backslash_angle
+docs/agents/hub\\(1).md|# Hub-only machinery")
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -Fq "references the hub-only doc 'docs/agents/hub\(1).md' by a relative Markdown link"; then
+  pass "Case 14u2: escaped literal-backslash destination fails closed"
+else
+  fail "Case 14u2 unexpected (rc=$rc): $out"
+fi
+
+# Capture the actual -v transport independently of the default awk implementation.
+# A wrapper records only the argument and delegates parsing to the system awk.
+transport_fix="$(mktemp -d "$WORKDIR/ascii-punct-transport.XXXXXX")"
+mkdir -p "$transport_fix/docs/agents" "$transport_fix/scripts" "$transport_fix/bin"
+printf '%s' "$MANIFEST_TRUTH_LITERAL_BACKSLASH" > "$transport_fix/manifest.yml"
+touch "$transport_fix/scripts/sync-to-downstream.sh"
+printf '%b\n' "$escaped_backslash_angle" > "$transport_fix/docs/agents/shared.md"
+printf '%s\n' '# Hub-only machinery' > "$transport_fix/docs/agents/hub\(1).md"
+cat > "$transport_fix/bin/awk" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in ASCII_PUNCT=*) printf '%s\n' "${arg#ASCII_PUNCT=}" >> "$AWK_TRANSPORT_LOG" ;; esac
+done
+exec "$AWK_TRANSPORT_DELEGATE" "$@"
+EOF
+chmod +x "$transport_fix/bin/awk"
+transport_delegate=$(command -v awk)
+set +e
+out=$(PATH="$transport_fix/bin:$PATH" AWK_TRANSPORT_LOG="$transport_fix/awk-transport.log" AWK_TRANSPORT_DELEGATE="$transport_delegate" MERGEPATH_MANIFEST_PATH="$transport_fix/manifest.yml" MERGEPATH_REPO_ROOT="$transport_fix" bash "$CHECK" 2>&1)
+rc=$?
+set -e
+transport_count=$(wc -l < "$transport_fix/awk-transport.log" | tr -d ' ')
+transport_bad=$(grep -Fvc '@[\\]' "$transport_fix/awk-transport.log" || true)
+if [ "$rc" = "1" ] \
+   && echo "$out" | grep -Fq "references the hub-only doc 'docs/agents/hub\(1).md' by a relative Markdown link" \
+   && [ "$transport_count" -gt 0 ] && [ "$transport_bad" = "0" ]; then
+  pass "Case 14u3: every ASCII punctuation transport quotes backslash before awk parses it"
+else
+  fail "Case 14u3 unexpected (rc=$rc): $out"
+fi
+
 # ── CommonMark conformance matrix (Cases 14v / 14w / 14x) ────────────
 #
 # Every row below is derived from the CommonMark 0.31.2 spec section it
