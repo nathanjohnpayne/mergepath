@@ -91,9 +91,11 @@ CODE=$(grep -v '^[[:space:]]*#' "$SUBJECT")
 
 # Scan gh invocations, not the whole file: `-f` and `-F` are ordinary test and
 # rm operators elsewhere in the script. Backslash continuations are joined
-# first, or an option on a wrapped line goes unseen. `gh api` is the only verb
-# that can create a check run — `gh pr edit`, the one write here, cannot.
-GH_CALLS=$(printf '%s\n' "$CODE" | sed -e :a -e '/\\$/{N;s/\\\n//;ba' -e '}' | grep -E 'gh[[:space:]]+api' || true)
+# first, or an option on a wrapped line goes unseen. The recognized check-run
+# read is pinned separately below; `gh pr edit`, the one intended write here,
+# cannot create a check run.
+JOINED_CODE=$(printf '%s\n' "$CODE" | sed -e :a -e '/\\$/{N;s/\\\n//;ba' -e '}')
+GH_CALLS=$(printf '%s\n' "$JOINED_CODE" | grep -E 'gh[[:space:]]+api' || true)
 
 # Every option that makes `gh api` non-GET. `-f` / `-F` / `--field` /
 # `--raw-field` matter as much as `-X`: gh's own help says "adding request
@@ -112,10 +114,19 @@ if printf '%s\n' "$GH_CALLS" \
 fi
 
 # Occurrences, not matching lines: joining continuations above means one line
-# can now carry several references.
+# can now carry several references. Counting one reference is insufficient on
+# its own: another transport could replace the read with a write and preserve
+# the count. Pin that sole reference to the nudge's known literal GET shape.
+# This deliberately validates this command rather than parsing every possible
+# shell transport or dynamically assembled endpoint; changing the command's
+# shape requires an explicit review of this invariant (#931).
 CHECK_RUN_REFS=$(printf '%s\n' "$CODE" | grep -o 'check-runs' | grep -c '' || true)
-if [ "$CHECK_RUN_REFS" -ne 1 ]; then
-  echo "check_pr_review_policy_nudge: expected exactly one check-runs reference (the read) in $SUBJECT; found $CHECK_RUN_REFS" >&2
+# shellcheck disable=SC2016  # $REPO/$HEAD_SHA are literal subject tokens here.
+CHECK_RUN_READS=$(printf '%s\n' "$JOINED_CODE" \
+  | grep -Ec '^[[:space:]]*NAMES=\$\([[:space:]]*gh[[:space:]]+api[[:space:]]+--paginate[[:space:]]+"repos/\$REPO/commits/\$HEAD_SHA/check-runs"([[:space:]]|$)' \
+  || true)
+if [ "$CHECK_RUN_REFS" -ne 1 ] || [ "$CHECK_RUN_READS" -ne 1 ]; then
+  echo "check_pr_review_policy_nudge: expected exactly one check-runs reference in the recognized literal read in $SUBJECT; found references=$CHECK_RUN_REFS recognized_reads=$CHECK_RUN_READS" >&2
   exit 1
 fi
 
