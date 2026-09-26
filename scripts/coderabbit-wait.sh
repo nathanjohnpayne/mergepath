@@ -4437,11 +4437,50 @@ crw_probe_carryforward_evidence() {
         return 0
       fi
       [ "$newest_rc" = 0 ] || newest_class=$(classify_comment "$newest_body")
+      # Which notices are CURRENT (Codex P2 on #1340). Treating every
+      # rate-limit or in-progress notice as current forever brought back the
+      # stall this carry exists to end: on a base-only head CodeRabbit posts
+      # nothing newer, so an old notice would suppress every probe until the
+      # barrier budget ran out. The carry's safety is the content
+      # fingerprint, not CodeRabbit re-reviewing; what these checks guard is
+      # only "CodeRabbit is not done with this head", and each notice kind
+      # answers that differently:
+      #   paused       durable — it clears only on `resume`, so it is always
+      #                current (the #857 posture).
+      #   rate_limit   current while its PUBLISHED window is open
+      #                (crw_active_rate_limit_notice, the #891/#912 logic),
+      #                or while it is at-or-after the head's success — a
+      #                limit announced after the run is still in force.
+      #   in_progress  current unless the head's success postdates it: a
+      #                completed run after the notice means processing
+      #                finished.
+      # Unparseable timestamps and unread rungs fail toward "current".
+      local notice_fresh="" notice_current=true active_rc=0
+      notice_fresh=$(printf '%s' "$newest" | jq -r '.fresh_at // .updated_at // .created_at // empty' 2>/dev/null) || notice_fresh=""
       case "$newest_class" in
-        rate_limit|paused|in_progress)
-          log "probe: CodeRabbit's newest comment is a current $newest_class notice — a success status does not outrank it, so no carry-forward evidence (#1335)"
-          return 0
+        paused) notice_current=true ;;
+        rate_limit|in_progress)
+          notice_current=true
+          if [ -n "$notice_fresh" ] && [ -n "$updated_at" ] \
+             && [ "$(jq -rn --arg n "$notice_fresh" --arg s "$updated_at" \
+                  'try (($s | fromdateiso8601) > ($n | fromdateiso8601)) catch false' 2>/dev/null)" = "true" ]; then
+            notice_current=false
+          fi
+          if [ "$newest_class" = rate_limit ] && [ "$notice_current" = false ]; then
+            crw_active_rate_limit_notice "$fresh" >/dev/null 2>&1 || active_rc=$?
+            # 0 = window still open; 3 = could not decode; either keeps it current.
+            case "$active_rc" in 0|3) notice_current=true ;; esac
+          fi
           ;;
+        *) notice_current=false ;;
+      esac
+      if [ "$notice_current" = true ]; then
+        log "probe: CodeRabbit's newest comment is a current $newest_class notice — a success status does not outrank it, so no carry-forward evidence (#1335)"
+        return 0
+      fi
+      case "$newest_class" in
+        rate_limit|in_progress)
+          log "probe: CodeRabbit's newest comment is a $newest_class notice that the head's later success ($updated_at) supersedes — not current, carry-forward still considered (#1335)" ;;
       esac
     fi
     # The summary is not the only thing that can land in the gap. #869
@@ -4457,6 +4496,26 @@ crw_probe_carryforward_evidence() {
       || { log "probe: carry-forward re-scan could not select a head-pinned run — emitting no evidence (#1335)"; return 0; }
     if [ -n "$head_run" ]; then
       log "probe: a CodeRabbit review run landed on $HEAD_SHA after the snapshot — emitting no carry-forward evidence; the next probe reads it directly (#1335)"
+      return 0
+    fi
+    # Re-sample the status LAST (Codex P1 on #1340). A `@coderabbitai
+    # review` starting after the first sample can flip the head context to
+    # `pending` before it posts any comment or review object, so both
+    # refreshed reads above would look unchanged while a run that may yet
+    # publish a finding is active. Emit only if the status is still the SAME
+    # sample: success, the identical description and the identical refresh
+    # time. This proves only that nothing changed; whether the sample permits
+    # clearance stays the barrier's call (head_context_permits_clearance). Any
+    # difference, or an unreadable read, emits nothing and the next probe
+    # reads the new state.
+    local ctx_again="" state_again="" desc_again="" updated_again=""
+    ctx_again=$(check_status_context_record) || ctx_again=""
+    state_again=$(crw_status_record_state "$ctx_again")
+    desc_again=$(printf '%s' "$ctx_again" | jq -r '.description // ""' 2>/dev/null || printf '')
+    updated_again=$(printf '%s' "$ctx_again" | jq -r '.updated_at // ""' 2>/dev/null || printf '')
+    if [ "$state_again" != success ] || [ -z "$updated_again" ] || [ "$updated_again" != "$updated_at" ] \
+       || [ "$desc_again" != "$desc" ]; then
+      log "probe: the CodeRabbit status on $HEAD_SHA changed during the carry-forward re-scan (now ${state_again:-unreadable} @ ${updated_again:-?}, was $state @ $updated_at) — emitting no evidence (#1335)"
       return 0
     fi
   fi

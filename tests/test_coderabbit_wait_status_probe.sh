@@ -210,10 +210,21 @@ case "$endpoint" in
     # `absent` — the fixture has to be able to tell them apart before the
     # script can.
     printf 'read\n' >>"$state_dir/status-reads"
-    case "${CODERABBIT_TEST_STATUS:-absent}" in
+    # #1335 (Codex P1 on #1340): CODERABBIT_TEST_STATUS2[_TIME|_DESCRIPTION],
+    # when set, replace the served status from the SECOND statuses read on —
+    # a run starting between the probe's first sample and its re-sample.
+    st=${CODERABBIT_TEST_STATUS:-absent}
+    st_time=${CODERABBIT_TEST_STATUS_TIME:-$head_time}
+    st_desc=${CODERABBIT_TEST_STATUS_DESCRIPTION:-}
+    if [ -n "${CODERABBIT_TEST_STATUS2:-}" ] && [ "$(wc -l <"$state_dir/status-reads" | tr -d ' ')" -ge 2 ]; then
+      st=$CODERABBIT_TEST_STATUS2
+      st_time=${CODERABBIT_TEST_STATUS2_TIME:-$st_time}
+      st_desc=${CODERABBIT_TEST_STATUS2_DESCRIPTION:-$st_desc}
+    fi
+    case "$st" in
       success|failure|pending|error)
         printf '[{"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"},"description":%s}]\n' \
-          "${CODERABBIT_TEST_STATUS}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "$bot" "$(json_string "${CODERABBIT_TEST_STATUS_DESCRIPTION:-}")"
+          "$st" "$st_time" "$st_time" "$bot" "$(json_string "$st_desc")"
         ;;
       unreadable)
         echo "simulated statuses endpoint failure" >&2
@@ -1403,7 +1414,45 @@ Already reviewed the last commit.
 > Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits.
 
 </details>' 1 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z evidence summary-without-head-review
+  # 19-21. Which notices are CURRENT (Codex P2 on #1340). Pauses are durable
+  #     (15/16 above); a rate-limit or in-progress notice the head's later
+  #     success supersedes must not suppress the carry forever. Each notice
+  #     arrives between the probe's reads (from read 2) so the re-scan guard,
+  #     not the probe's own anchored triage, is what decides. The fake clock
+  #     reads 2000000000 (2033-05-18T03:33:20Z).
+  # 19. A stale in-progress notice, older than the success: carries.
+  _status_time=2026-06-04T00:00:30Z
+  CODERABBIT_TEST_STATUS_TIME=$_status_time _notice_case progress-superseded "$progress_note" 2 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z evidence summary-without-head-review
+  # 20. A rate-limit notice whose published window EXPIRED long ago and that
+  #     the success postdates: carries.
+  CODERABBIT_TEST_STATUS_TIME=$_status_time _notice_case ratelimit-expired 'Rate limit exceeded. Please wait 1 minutes and 0 seconds before requesting another review.' 2 2026-06-04T00:00:09Z 2026-06-04T00:00:06Z evidence summary-without-head-review
+  # 21. The same notice with its window still OPEN (59 minutes from 03:30 on
+  #     the fake clock), even though the success postdates it: blocks.
+  CODERABBIT_TEST_STATUS_TIME=2033-05-18T03:31:00Z _notice_case ratelimit-open 'Rate limit exceeded. Please wait 59 minutes and 0 seconds before requesting another review.' 2 2033-05-18T03:30:00Z 2033-05-18T03:29:00Z none summary-without-head-review
   unset -f _notice_case
+
+  # 22. Codex P1 on #1340: the status flips between the first sample and the
+  #     re-sample (a run started, no comment or review object yet). Both
+  #     refreshed reads are unchanged, so only the status re-read catches it.
+  dir=$(make_case probe-1335-status-flips 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' \
+    CODERABBIT_TEST_STATUS2=pending CODERABBIT_TEST_STATUS2_DESCRIPTION='Review in progress' \
+    CODERABBIT_TEST_FALLBACK_BODY="$clean" CODERABBIT_TEST_CARRY_BODY2="$clean" \
+    run_probe_case "$dir" carry_summary_changes)
+  { [ "$rc" = 7 ] && jq -e '.probe.carryforward == null' "$dir/out.json" >/dev/null 2>&1 \
+      && grep -q 'status on head-sha changed during the carry-forward re-scan' "$dir/err.log"; } \
+    || bad="$bad status-flips(rc=$rc cf=$(jq -c '.probe.carryforward' "$dir/out.json" 2>/dev/null))"
+  # 23. A NEWER success sample (a second completed run) is still a change the
+  #     emitted evidence would misreport, so it emits nothing either.
+  dir=$(make_case probe-1335-status-refreshed 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_DESCRIPTION='Review completed' \
+    CODERABBIT_TEST_STATUS2=success CODERABBIT_TEST_STATUS2_TIME=2026-06-04T00:00:40Z \
+    CODERABBIT_TEST_FALLBACK_BODY="$clean" CODERABBIT_TEST_CARRY_BODY2="$clean" \
+    run_probe_case "$dir" carry_summary_changes)
+  { [ "$rc" = 7 ] && jq -e '.probe.carryforward == null' "$dir/out.json" >/dev/null 2>&1; } \
+    || bad="$bad status-refreshed(rc=$rc)"
 
   unset -f _cf_case
   if [ -z "$bad" ]; then
