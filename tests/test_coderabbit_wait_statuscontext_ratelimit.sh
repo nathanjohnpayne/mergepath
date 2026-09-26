@@ -342,6 +342,9 @@ Next review available in: 59 minutes'
 #                       comment_time, i.e. never edited). #968 is the case
 #                       where these differ: CodeRabbit edits its summary in
 #                       place, which bumps updated_at without re-reviewing.
+#   third_body / third_time  optional third issue comment (id 7703), used to
+#                       prove a newer accepted trigger remains selected above
+#                       an older acknowledgement.
 make_case() {
   local name=$1 comment_body=$2 status_time=${3:-$STATUS_TIME}
   local status_description=${4:-} comment_time=${5:-$HEAD_TIME}
@@ -349,6 +352,7 @@ make_case() {
   local second_body=${7:-} second_time=${8:-$HEAD_TIME}
   local head_sha=${9:-head-sha}
   local comment_updated_time=${10:-$comment_time}
+  local third_body=${11:-} third_time=${12:-$HEAD_TIME}
   local dir="$WORKDIR/$name"
 
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
@@ -367,6 +371,7 @@ make_case() {
 
   printf '%s' "$comment_body" >"$dir/state/comment-body.txt"
   printf '%s' "$second_body" >"$dir/state/comment-body-2.txt"
+  printf '%s' "$third_body" >"$dir/state/comment-body-3.txt"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
 coderabbit:
@@ -440,6 +445,7 @@ comment_time='$comment_time'
 comment_updated_time='$comment_updated_time'
 head_sha='$head_sha'
 second_time='$second_time'
+third_time='$third_time'
 state_dir=\${CODERABBIT_TEST_STATE_DIR:?}
 [ "\${1:-}" = "api" ] || { echo "unexpected gh command: \$*" >&2; exit 99; }
 shift
@@ -568,13 +574,19 @@ case "\$endpoint" in
     body=\$(cat "\$state_dir/comment-body.txt")
     body2=""
     if [ -f "\$state_dir/comment-body-2.txt" ]; then body2=\$(cat "\$state_dir/comment-body-2.txt"); fi
+    body3=""
+    if [ -f "\$state_dir/comment-body-3.txt" ]; then body3=\$(cat "\$state_dir/comment-body-3.txt"); fi
     if [ -z "\$body" ]; then printf '[]\n'; else
       jq -cn --arg bot "\$bot" --arg t "\$comment_time" --arg body "\$body" \
         --arg tu "\$comment_updated_time" \
         --arg t2 "\$second_time" --arg body2 "\$body2" \
+        --arg t3 "\$third_time" --arg body3 "\$body3" \
         '[{id:7701,user:{login:\$bot},created_at:\$t,updated_at:\$tu,body:\$body}]
          + (if \$body2 == "" then []
             else [{id:7702,user:{login:\$bot},created_at:\$t2,updated_at:\$t2,body:\$body2}]
+            end)
+         + (if \$body3 == "" then []
+            else [{id:7703,user:{login:\$bot},created_at:\$t3,updated_at:\$t3,body:\$body3}]
             end)'
     fi ;;
   *) echo "unexpected gh api endpoint: \$endpoint" >&2; exit 99 ;;
@@ -896,6 +908,19 @@ test_trigger_ack_is_polling_in_progress() {
   [ "$rc" = "4" ] || fail "3b10 ack: accepted trigger must keep polling instead of clearing the older summary, got $rc; err=$(tail -6 "$dir/err.log")"
   [ "$(jqf "$dir" '.status')" = "timeout" ] || fail "3b10 ack: expected bounded timeout while the acknowledged run remains in progress"
   grep -q 'class=in_progress' "$dir/err.log" || fail "3b10 ack: polling never classified the accepted trigger as in_progress"
+
+  # Selection is newest-first. An older accepted acknowledgement must not
+  # replace the newest one while both sit above the prior clean publication.
+  dir=$(make_case "polling-newest-trigger-ack-wins" "$REVIEW_BODY_CLEAN" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" "2026-06-04T00:00:30Z" \
+    head-sha "$HEAD_TIME" "$ACTIONS_PERFORMED_STATUS_PROBE_BODY" \
+    "$NOTICE_AFTER_SUMMARY_TIME")
+  sed -i.bak 's/max_wait_seconds: 300/max_wait_seconds: 15/' "$dir/.github/review-policy.yml"
+  sed -i.bak 's/trust_status_context_for_clearance: true/trust_status_context_for_clearance: false/' "$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir")
+  [ "$rc" = "4" ] || fail "3b10 newest ack: accepted trigger must keep polling, got $rc; err=$(tail -6 "$dir/err.log")"
+  grep -q 'latest CodeRabbit comment id=7702.*class=in_progress' "$dir/err.log" || fail "3b10 newest ack: polling did not retain the newest accepted acknowledgement"
 
   # The trusted StatusContext fast path consumes the same selector. A trigger
   # acknowledgement newer than the sampled success suppresses that success;

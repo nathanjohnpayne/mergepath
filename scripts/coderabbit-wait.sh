@@ -2090,7 +2090,9 @@ crw_rate_limit_hides_a_finding() {
 # `classify_comment ""`, which grades `review`, the one class whose arm can
 # emit a clearance.
 crw_select_latest_non_narration_comment() {
-  local issue_comments=$1 after=${2:-} candidates encoded comment body owned owned_rc accepted_rc projected
+  local issue_comments=$1 after=${2:-} polling=${3:-false}
+  local candidates encoded comment body owned owned_rc accepted_rc projected
+  local accepted=""
   candidates=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg after "$after" '
     [ .[]
       | select(.user.login == $bot)
@@ -2116,28 +2118,43 @@ crw_select_latest_non_narration_comment() {
       # while the replacement review is still starting. This override belongs
       # only to polling selection; the #956 refusal guard deliberately keeps
       # treating the same acknowledgement as narration.
-      accepted_rc=0
-      crw_review_trigger_accepted "$body" || accepted_rc=$?
-      case "$accepted_rc" in
-        0)
-          projected=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body, poll_class: "in_progress"}') || return 3
-          printf '%s\n' "$projected"
-          return 0
-          ;;
-        1) continue ;;
-        *) return 3 ;;
-      esac
+      if [ "$polling" = "true" ]; then
+        accepted_rc=0
+        crw_review_trigger_accepted "$body" || accepted_rc=$?
+        case "$accepted_rc" in
+          0)
+            if [ -z "$accepted" ]; then
+              accepted=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body, poll_class: "in_progress"}') || return 3
+            fi
+            continue
+            ;;
+          1) continue ;;
+          *) return 3 ;;
+        esac
+      fi
+      continue
     fi
     projected=$(printf '%s' "$comment" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}') || return 3
+    # A newer accepted trigger starts a replacement review, but cannot erase
+    # an older provider refusal (#956). Let a pause/rate-limit remain current;
+    # otherwise stop before exposing an older completed/benign publication.
+    if [ -n "$accepted" ] && [ "$owned" != "rate_limit" ] && [ "$owned" != "paused" ]; then
+      printf '%s\n' "$accepted"
+      return 0
+    fi
     printf '%s\n' "$projected"
     return 0
   done <<<"$candidates"
+  if [ -n "$accepted" ]; then
+    printf '%s\n' "$accepted"
+    return 0
+  fi
   printf '{}\n'
 }
 
 latest_comment_from_issue_comments() {
   local issue_comments=$1 latest
-  latest=$(crw_select_latest_non_narration_comment "$issue_comments" "$HEAD_ANCHOR") || {
+  latest=$(crw_select_latest_non_narration_comment "$issue_comments" "$HEAD_ANCHOR" true) || {
     log "ERROR: failed to decode the CodeRabbit comment list — the comments are UNREAD, not empty"
     return 3
   }
@@ -2703,8 +2720,11 @@ rate_limit_window_elapsed_seconds() {
 # The newest CodeRabbit comment on the PR, ANCHOR-FREE. Mirrors
 # latest_comment_from_issue_comments' selection (same bot filter, same
 # fresh_at = max(created_at, updated_at), same status-probe narration
-# exclusion) MINUS the `fresh_at >= HEAD_ANCHOR` filter. `{}` when the bot has
-# said nothing on this PR at all.
+# exclusion) MINUS the `fresh_at >= HEAD_ANCHOR` filter. Unlike polling, this
+# anchor-free selector deliberately excludes successful trigger
+# acknowledgements too: refusal/window arbitration asks for the provider's
+# last substantive word, not whether a replacement run has just started.
+# `{}` when the bot has said nothing on this PR at all.
 #
 # Anchor-free on purpose: the caller below asks "what was CodeRabbit's LAST
 # WORD", a question the moving wall-clock freshness floor answers wrongly by
