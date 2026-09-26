@@ -845,6 +845,9 @@ jobs:
             relay_scan_error=false
             if [ "$requires_relay" = true ]; then
               source_runs='[]'
+              relay_source_cache="$RUNNER_TEMP/relay-source-cache-$PR"
+              rm -rf "$relay_source_cache"
+              mkdir -p "$relay_source_cache"
               # Scheduled runs and other PRs share this workflow. Query only
               # event kinds that can produce this PR's relay handoff, then
               # apply the fail-closed bound after filtering to its exact run
@@ -890,8 +893,30 @@ jobs:
                       return 0
                     fi
                   fi
-                  page_runs=$(jq -c --arg title "Codex P1 Gate relay-v1 PR #$PR" \
-                    '[.workflow_runs[] | select(.display_title == $title) | .id]' \
+                  page_runs='[]'
+                  while IFS= read -r source_run; do
+                    [ -n "$source_run" ] || continue
+                    set +e
+                    binding=$(printf '%s' "$source_run" \
+                      | MERGEPATH_RELAY_SOURCE_CACHE_DIR="$relay_source_cache" \
+                        scripts/workflow/feedback-archive-relay-source.sh "$REPO" "$PR")
+                    bind_rc=$?
+                    set -e
+                    if [ "$bind_rc" -eq 0 ]; then
+                      if [ "$(jq -r '.requires_relay' <<<"$binding")" = true ]; then
+                        bound_run=$(jq -c '.source_run_id' <<<"$binding")
+                        page_runs=$(printf '%s\n%s\n' "$page_runs" "$bound_run" \
+                          | jq -cs '.[0] + [.[1]]')
+                      fi
+                    elif [ "$bind_rc" -ne 4 ]; then
+                      echo "::error::Could not resolve the trusted source binding for a matching run on PR #$PR"
+                      relay_scan_error=true
+                      return 0
+                    fi
+                    # rc 4 is an unbound title lookalike. It has no authority
+                    # to hold this PR's sweep, so leave it out of the inventory.
+                  done < <(jq -c --arg title "Codex P1 Gate relay-v1 PR #$PR" \
+                    '.workflow_runs[] | select(.display_title == $title)' \
                     <<<"$source_page_json")
                   source_runs=$(printf '%s\n%s\n' "$source_runs" "$page_runs" \
                     | jq -cs '.[0] + .[1]')
