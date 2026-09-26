@@ -1671,6 +1671,34 @@ docs/agents/hub(1).md|# Hub-only machinery")
   fi
 done
 
+# A literal backslash in a destination is itself escaped, while the parentheses
+# are escaped separately. Passing ASCII_PUNCT through awk -v must preserve the
+# backslash member on BSD awk, gawk, and mawk; otherwise gawk/BSD awk leave an
+# extra slash in the extracted target and permit this consumer-broken link.
+escaped_backslash_angle='See [the audit](<hub\\\\\\(1\\).md>) for details.'
+MANIFEST_TRUTH_LITERAL_BACKSLASH="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+  - path: 'docs/agents/hub\\(1).md'
+    class: hub-only
+"
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH_LITERAL_BACKSLASH" \
+  "docs/agents/shared.md|$escaped_backslash_angle
+docs/agents/hub\\(1).md|# Hub-only machinery")
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -Fq "references the hub-only doc 'docs/agents/hub\(1).md' by a relative Markdown link"; then
+  pass "Case 14u2: escaped literal-backslash destination fails closed"
+else
+  fail "Case 14u2 unexpected (rc=$rc): $out"
+fi
+
 # ── CommonMark conformance matrix (Cases 14v / 14w / 14x) ────────────
 #
 # Every row below is derived from the CommonMark 0.31.2 spec section it

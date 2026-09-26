@@ -1185,6 +1185,10 @@ mp_doc_link_targets() {
   # Keep it in the shell and pass it to both awk stages so destination
   # balancing and normalization share one definition across awk locales.
   local ascii_punctuation=$'!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'
+  # `awk -v` parses backslash escapes in its value. Quote the one shared
+  # punctuation definition for that transport so an implementation that treats
+  # `\]` as an unknown escape does not drop the backslash member.
+  local ascii_punctuation_awk="${ascii_punctuation//\\/\\\\}"
   # These target-extraction awk stages compare pathname bytes. Pinning them to
   # the C locale keeps BSD awk, gawk, and mawk aligned; the preceding renderer
   # classifier keeps the caller's locale.
@@ -1194,7 +1198,7 @@ mp_doc_link_targets() {
     # balanced parentheses (`hub(1).md`), and angle destinations may
     # contain parentheses or spaces. The first-closing-paren spelling
     # truncates those valid links and hides consumer-broken references.
-    mp_markdown_renderable_text "$f" | LC_ALL=C awk -v ASCII_PUNCT="$ascii_punctuation" '
+    mp_markdown_renderable_text "$f" | LC_ALL=C awk -v ASCII_PUNCT="$ascii_punctuation_awk" '
       {
         line = $0
         n = length(line)
@@ -1300,7 +1304,7 @@ mp_doc_link_targets() {
         -e 's/^\]\(//' \
         -e 's/\)$//' \
         -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
-    | LC_ALL=C awk -v EMIT="$emit" -v ASCII_PUNCT="$ascii_punctuation" '
+    | LC_ALL=C awk -v EMIT="$emit" -v ASCII_PUNCT="$ascii_punctuation_awk" '
         # CommonMark resolves entity and numeric character references inside
         # a link destination (§ Entity and numeric character references), so
         # the path a reader actually opens is the DECODED one:
