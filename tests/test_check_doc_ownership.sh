@@ -1719,8 +1719,12 @@ set +e
 out=$(PATH="$transport_fix/bin:$PATH" AWK_TRANSPORT_LOG="$transport_fix/awk-transport.log" MERGEPATH_MANIFEST_PATH="$transport_fix/manifest.yml" MERGEPATH_REPO_ROOT="$transport_fix" bash "$CHECK" 2>&1)
 rc=$?
 set -e
-if [ "$rc" = "1" ] && grep -Fq '@[\\]' "$transport_fix/awk-transport.log"; then
-  pass "Case 14u3: ASCII punctuation transport quotes backslash before awk parses it"
+transport_count=$(wc -l < "$transport_fix/awk-transport.log" | tr -d ' ')
+transport_bad=$(grep -Fvc '@[\\]' "$transport_fix/awk-transport.log" || true)
+if [ "$rc" = "1" \
+   && echo "$out" | grep -Fq "references the hub-only doc 'docs/agents/hub\(1).md' by a relative Markdown link" \
+   && [ "$transport_count" -gt 0 ] && [ "$transport_bad" = "0" ]; then
+  pass "Case 14u3: every ASCII punctuation transport quotes backslash before awk parses it"
 else
   fail "Case 14u3 unexpected (rc=$rc): $out"
 fi
