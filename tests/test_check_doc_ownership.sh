@@ -1715,15 +1715,11 @@ done
 exec "$AWK_TRANSPORT_DELEGATE" "$@"
 EOF
 chmod +x "$transport_fix/bin/awk"
-transport_delegate="${MERGEPATH_TEST_AWK:-$(command -v awk)}"
-if [ ! -x "$transport_delegate" ]; then
-  fail "Case 14u3 setup: awk delegate is not executable: $transport_delegate"
-else
-  set +e
-  out=$(PATH="$transport_fix/bin:$PATH" AWK_TRANSPORT_LOG="$transport_fix/awk-transport.log" AWK_TRANSPORT_DELEGATE="$transport_delegate" MERGEPATH_MANIFEST_PATH="$transport_fix/manifest.yml" MERGEPATH_REPO_ROOT="$transport_fix" bash "$CHECK" 2>&1)
-  rc=$?
-  set -e
-fi
+transport_delegate=$(command -v awk)
+set +e
+out=$(PATH="$transport_fix/bin:$PATH" AWK_TRANSPORT_LOG="$transport_fix/awk-transport.log" AWK_TRANSPORT_DELEGATE="$transport_delegate" MERGEPATH_MANIFEST_PATH="$transport_fix/manifest.yml" MERGEPATH_REPO_ROOT="$transport_fix" bash "$CHECK" 2>&1)
+rc=$?
+set -e
 transport_count=$(wc -l < "$transport_fix/awk-transport.log" | tr -d ' ')
 transport_bad=$(grep -Fvc '@[\\]' "$transport_fix/awk-transport.log" || true)
 if [ "$rc" = "1" ] \
