@@ -2965,7 +2965,7 @@ status_context_fast_path_blocked_by_comment() {
             || accepted_after_rc=$?
           case "$accepted_after_rc" in
             0)
-              log "StatusContext success suppressed: CodeRabbit acknowledged a replacement review after body-bearing current-HEAD review id=$run_id completed — keep polling for that newer run (#956)"
+              log "StatusContext success suppressed: CodeRabbit acknowledged a replacement review at or after body-bearing current-HEAD review id=$run_id completed — keep polling for that newer or same-second run (#956)"
               return 0
               ;;
             1) : ;;
@@ -4458,9 +4458,11 @@ crw_review_trigger_accepted() {
 }
 
 # True (0) when an already-fetched CodeRabbit issue-comment list contains a
-# structurally accepted review-trigger acknowledgement strictly newer than the
-# selected completed run's submitted_at; 1 when it does not; 3 when ordering or
-# acknowledgement evidence cannot be read. The refusal-release path uses this
+# structurally accepted review-trigger acknowledgement at or after the selected
+# completed run's submitted_at; 1 when it does not; 3 when ordering or
+# acknowledgement evidence cannot be read. GitHub timestamps have whole-second
+# precision, so equality cannot prove that the acknowledgement preceded the
+# completed run and suppresses release. The refusal-release path uses this
 # immediately before crediting an older clean run, so a replacement run that
 # has started cannot inherit that run's clearance (#956).
 crw_newer_review_trigger_accepted() {
@@ -4476,7 +4478,7 @@ crw_newer_review_trigger_accepted() {
       | [ .[]
           | select(.user.login == $bot)
           | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
-          | select((.fresh_at | epoch) > $run_epoch)
+          | select((.fresh_at | epoch) >= $run_epoch)
           | (.body // "")
           | @base64 ]
       | .[]

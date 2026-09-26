@@ -1150,7 +1150,7 @@ test_refusal_release_waits_for_later_accepted_trigger() {
     rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
     case "$kind" in rate-limit) expected=5 ;; paused) expected=6 ;; esac
     [ "$rc" = "$expected" ] || fail "1424 $kind: later accepted trigger expected $expected, got $rc"
-    grep -q 'acknowledged a replacement review after body-bearing current-HEAD review' "$dir/err.log" \
+    grep -q 'acknowledged a replacement review' "$dir/err.log" \
       || fail "1424 $kind: refusal release was not suppressed by the accepted-trigger guard"
   done
   reviews='[{"id":8802,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:30Z","body":"**Actionable comments posted: 0**"}]'
@@ -1158,6 +1158,26 @@ test_refusal_release_waits_for_later_accepted_trigger() {
   rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
   [ "$rc" = "0" ] || fail "1424 control: acknowledgement before completed run should clear, got $rc"
   [ "$FAIL" -ne "$before" ] || pass "1424: later accepted trigger suppresses refusal release; earlier trigger preserves completed-run clearance"
+}
+
+# GitHub timestamps have one-second precision. A replacement acknowledgement
+# serialized in the selected completed run's same second is indeterminate
+# ordering evidence, not proof that it predates that run. Hold clearance until
+# a later run supplies unambiguous evidence.
+test_refusal_release_holds_for_same_second_accepted_trigger() {
+  local dir rc before=$FAIL reviews
+  reviews='[{"id":8803,"user":{"login":"coderabbitai[bot]"},"commit_id":"head-sha","submitted_at":"2026-06-04T00:00:20Z","body":"**Actionable comments posted: 0**"}]'
+  dir=$(make_case "refusal-same-second-ack" "$RATE_LIMIT_BODY_HEADREF" \
+    "$STATUS_AFTER_BOTH_TIME" "Review completed" "$HEAD_TIME" 999999999 \
+    "$ACTIONS_PERFORMED_SPLIT_STATUS_PROBE_BODY" "$NOTICE_AFTER_SUMMARY_TIME")
+  rc=$(CODERABBIT_TEST_REVIEWS_JSON="$reviews" run_case "$dir")
+  if [ "$rc" != "5" ]; then
+    fail "1425 same-second: accepted trigger timestamp equal to selected run must hold rate-limit clearance, got $rc"
+  else
+    grep -q 'acknowledged a replacement review' "$dir/err.log" \
+      || fail "1425 same-second: acceptance guard did not suppress the indeterminate ordering"
+  fi
+  [ "$FAIL" -ne "$before" ] || pass "1425: same-second accepted trigger acknowledgement withholds refusal release"
 }
 
 # --- Test 3d: a current pause also requires actual review evidence ----------
@@ -2967,6 +2987,7 @@ test_status_probe_does_not_supersede_refusal
 test_structural_status_probes_are_excluded_by_polling_selector
 test_trigger_ack_is_polling_in_progress
 test_refusal_release_waits_for_later_accepted_trigger
+test_refusal_release_holds_for_same_second_accepted_trigger
 
 test_aged_summary_only_marker_is_findings_not_cleared
 test_prior_head_summary_marker_does_not_block
