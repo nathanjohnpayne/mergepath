@@ -1117,6 +1117,11 @@ paths:
   - path: tests/test_codex_p1_gate.sh
     type: canonical
     consumers: all
+  - path: tests/test_feedback_archive_relay_source.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/workflow/feedback-archive-relay-source.sh"
   # Exercises the inline phase-1 publisher step with one-page HTTP fixtures:
   # exact first-attempt deduplication plus every fail-closed fallback (#1130).
   - path: tests/test_required_check_publisher_dedup.sh
@@ -1707,6 +1712,7 @@ paths:
       - "scripts/lib/feedback-policy-helpers.sh"   # #1113, ghas_alert_number_from_body / ghas_severity_tier
       - "scripts/lib/gh-api-scalar.sh"   # #1113, hard-sourced by ghas-alert-severity.sh's fetch
       - "scripts/lib/ghas-alert-severity.sh"   # #1113, GHAS severity by alert number
+      - "scripts/workflow/feedback-archive-relay-source.sh"   # #1413, positive source-run/PR binding for the scheduled inventory
   - path: .github/workflows/codex-feedback-archive-relay.yml
     type: canonical
     consumers: all
@@ -1716,6 +1722,8 @@ paths:
     requires:
       - "scripts/codex-p1-gate.sh"
       - "scripts/review-feedback-surface-fingerprint.sh"
+      - "scripts/workflow/feedback-archive-relay-source.sh"   # #1413, positive source-run/PR binding before every writer
+      - "scripts/lib/gh-api-array.sh"   # #1413, helper's paginated source-origin candidate resolution
   - path: .github/workflows/coderabbit-severity-gate.yml
     type: canonical
     consumers: all
@@ -1963,6 +1971,8 @@ paths:
       - ".github/workflows/repo_lint.yml"      # check_ci_scripts_wired scans it; bidirectional with its requires: scripts/ci/ (#601)
       - "scripts/coderabbit-should-invoke.sh"   # check_coderabbit_wait (#1084)
       - "tests/test_coderabbit_should_invoke.sh"  # check_coderabbit_wait (#1084)
+      - "scripts/workflow/feedback-archive-relay-source.sh"  # check_codex_p1_gate source-binding runtime (#1413)
+      - "tests/test_feedback_archive_relay_source.sh"  # check_codex_p1_gate source-binding fixtures (#1413)
   - path: scripts/gh-projects/
     type: kit
     consumers: all

@@ -25,12 +25,14 @@ cd "$REPO_ROOT"
 SCRIPT="scripts/codex-p1-gate.sh"
 WORKFLOW=".github/workflows/codex-p1-gate.yml"
 RELAY_WORKFLOW=".github/workflows/codex-feedback-archive-relay.yml"
+RELAY_SOURCE="scripts/workflow/feedback-archive-relay-source.sh"
 TEST="tests/test_codex_p1_gate.sh"
+RELAY_TEST="tests/test_feedback_archive_relay_source.sh"
 
 FAILED=0
 
 # Existence + executability checks.
-for rel in "$SCRIPT" "$TEST"; do
+for rel in "$SCRIPT" "$RELAY_SOURCE" "$TEST" "$RELAY_TEST"; do
   if [ ! -f "$rel" ]; then
     echo "FAIL: Missing required file: $rel"
     FAILED=1
@@ -368,13 +370,18 @@ if sweep.is_a?(Hash)
     )
     api_ceiling = sweep_run.index('if [ "$source_total" -ge "$MAX_RELAY_SOURCE_RUNS" ]')
     window_split = sweep_run.index('scan_source_window "$source_event" "$window_start" "$midpoint"')
-    page_filter = sweep_run.index('page_runs=$(jq -c --arg title')
+    page_filter = sweep_run.index('done < <(jq -c --arg title')
+    source_binding = sweep_run.index('scripts/workflow/feedback-archive-relay-source.sh "$REPO" "$PR"')
     source_count = sweep_run.index('source_count=$(jq')
     source_bound = sweep_run.index('if [ "$source_count" -ge "$MAX_RELAY_SOURCE_RUNS" ]')
     require_shape.call(
-      [api_ceiling, window_split, page_filter, source_count, source_bound].all? &&
-        api_ceiling < window_split && page_filter < source_count && source_count < source_bound,
-      "scheduled-sweep does not split API-ceiling windows and bound the filtered target-PR inventory"
+      [api_ceiling, window_split, page_filter, source_binding, source_count, source_bound].all? &&
+        api_ceiling < window_split && source_binding < source_count &&
+        page_filter < source_count && source_count < source_bound &&
+        sweep_run.include?('if [ "$bind_rc" -eq 0 ]; then') &&
+        sweep_run.include?('elif [ "$bind_rc" -ne 4 ]; then') &&
+        sweep_run.include?(%q{bound_run=$(jq -c '.source_run_id' <<<"$binding")}),
+      "scheduled-sweep does not split API-ceiling windows and bound its positively bound target-PR inventory"
     )
     before = sweep_run.index("feedback_fp_before=")
     lease = sweep_run.index('-f status="in_progress"')
@@ -442,16 +449,42 @@ if relay_job.is_a?(Hash)
   )
   relay_steps = Array(relay_job["steps"])
   source_run = relay_steps.find { |step| step["id"].to_s == "source" }&.fetch("run", "").to_s
+  source_index = relay_steps.index { |step| step["id"].to_s == "source" }
+  checkout_index = relay_steps.index { |step| step["uses"].to_s.start_with?("actions/checkout@") }
+  checkout_step = checkout_index ? relay_steps.fetch(checkout_index) : nil
   require_shape.call(
-    source_run.include?('if ! pr_json=$(gh api "repos/$REPO/pulls/$pr"') &&
-      source_run.include?("HTTP 404") && source_run.include?("api_err") &&
-      source_run.match?(/Could not resolve PR.*\n[\s\S]*exit 1/) &&
-      source_run.include?('echo "is_fork=false"') &&
+    source_index && checkout_index && checkout_index < source_index &&
+      checkout_step.dig("with", "ref").to_s.include?("github.event.repository.default_branch") &&
+      checkout_step.dig("with", "persist-credentials") == false,
+    "read-only archive relay does not load its source resolver from a trusted default-branch checkout"
+  )
+  source_bind = source_run.index('scripts/workflow/feedback-archive-relay-source.sh "$REPO" "$pr"')
+  source_accept = source_run.index('[ "$bind_rc" -eq 0 ] || exit "$bind_rc"')
+  source_arm = source_run.index('echo "source_bound=true"')
+  require_shape.call(
+    [source_bind, source_accept, source_arm].all? &&
+      source_bind < source_accept && source_accept < source_arm &&
+      source_run.include?('if [ "$bind_rc" -eq 4 ]; then') &&
+      source_run.include?('echo "source_bound=false"') &&
       source_run.include?('echo "requires_relay=false"') &&
-      source_run.include?('requires_relay="$is_fork"') &&
-      source_run.match?(/if \[ "\$pr_actor" = 'dependabot\[bot\]' \]; then\n\s+requires_relay=true/) &&
+      source_run.include?(%q{jq -r '.publish_head_sha' <<<"$binding"}) &&
       source_run.match?(/(?:^|\n)\s*exit 0(?:\s|$)/),
-    "read-only archive relay does not ignore ordinary issue_comment source runs safely"
+    "read-only archive relay arms outputs without a positive source binding or does not leave rejected sources inert"
+  )
+  recovery_step = relay_steps.find do |step|
+    step["if"].to_s.include?("steps.source.outcome == 'failure'")
+  end
+  recovery_run = recovery_step&.fetch("run", "").to_s
+  recovery_bind = recovery_run.index('scripts/workflow/feedback-archive-relay-source.sh "$REPO" "$pr"')
+  recovery_reject = recovery_run.index('if [ "$bind_rc" -ne 0 ]; then')
+  recovery_publish = recovery_run.index('gh api --method POST "repos/$REPO/check-runs"')
+  require_shape.call(
+    [recovery_bind, recovery_reject, recovery_publish].all? &&
+      recovery_bind < recovery_reject && recovery_reject < recovery_publish &&
+      recovery_run.include?(%q{head_sha=$(jq -r '.publish_head_sha' <<<"$binding")}) &&
+      recovery_run.include?('[ "$requires_relay" != true ]') &&
+      recovery_run.match?(/if \[ "\$bind_rc" -ne 0 \]; then\n[\s\S]*?exit 1\n\s*fi/),
+    "read-only archive relay source-error recovery can write before re-establishing source binding"
   )
   download_step = relay_steps.find { |step| step["uses"].to_s.start_with?("actions/download-artifact@") }
   require_shape.call(
@@ -465,6 +498,7 @@ if relay_job.is_a?(Hash)
     run.include?("status=failed") && run.include?("read-only archive handoff missing")
   end
   missing_index = relay_steps.index(missing_step)
+  missing_env = missing_step&.fetch("env", {}) || {}
   missing_run = missing_step&.fetch("run", nil)
   missing_condition = missing_step&.fetch("if", "").to_s
   require_shape.call(
@@ -475,6 +509,11 @@ if relay_job.is_a?(Hash)
       missing_condition.include?("steps.artifact.outputs.found != 'true'") &&
       artifact_index && missing_index && artifact_index < missing_index,
     "read-only archive relay does not persist and publish a missing-handoff failure"
+  )
+  require_shape.call(
+    missing_env.fetch("BOUND_HEAD_SHA", "").to_s.include?("steps.source.outputs.head_sha") &&
+      missing_run.to_s.include?('HEAD_SHA=$BOUND_HEAD_SHA'),
+    "missing-handoff failure publication loses its bound API-head fallback when a refresh fails"
   )
   # A successful relay RETIRES the handoff artifact it consumed, so rerunning
   # this trusted workflow for an already-archived source run finds no artifact
@@ -532,6 +571,10 @@ if relay_job.is_a?(Hash)
         relay_run.include?(".requires_relay == true") &&
         relay_run.include?("EXPECTED_IS_FORK") &&
         relay_run.include?("EXPECTED_PR_ACTOR") &&
+        relay_run.include?(".event_name == $expected_event") &&
+        relay_run.include?("else .head_sha == $expected_head end") &&
+        relay_run.include?(%q{head_sha=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')}) &&
+        !relay_run.include?(%q{head_sha=$(jq -r '.head_sha' "$HANDOFF_FILE")}) &&
         relay_run.include?(".archive_records") &&
         relay_run.include?('while IFS= read -r archive_record') &&
         relay_run.include?("mergepath-feedback-archive-relay:v1") &&
@@ -552,8 +595,10 @@ if relay_job.is_a?(Hash)
     require_shape.call(
       [republish, republish_reject].all? && after < republish &&
         republish < complete && republish_reject < complete &&
-        relay_run.include?(%q{[ "$fingerprint_publish" != "${fingerprint_after:-}" ]}),
-      "read-only archive relay publishes a leased success without re-reading the feedback surface immediately before it writes"
+        relay_run.include?(%q{[ "$fingerprint_publish" != "${fingerprint_after:-}" ]}) &&
+        relay_run.include?(%q{publish_head=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha'}) &&
+        relay_run.include?('[ "$publish_head" != "$head_sha" ]'),
+      "read-only archive relay publishes a leased success without re-reading the feedback surface and PR head immediately before it writes"
     )
     persist_step = relay_steps.find { |step| step["run"] == relay_run }
     persist_index = relay_steps.index(persist_step)
@@ -592,9 +637,11 @@ if relay_job.is_a?(Hash)
     )
     cleanup_env = cleanup_step&.fetch("env", {}) || {}
     require_shape.call(
-      cleanup_env.fetch("HEAD_SHA", "").to_s.include?("steps.source.outputs.head_sha") &&
+      cleanup_run.include?(%q{current_head=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha'}) &&
+        cleanup_env.fetch("BOUND_HEAD_SHA", "").to_s.include?("steps.source.outputs.head_sha") &&
+        cleanup_run.include?('current_head=$BOUND_HEAD_SHA') &&
         cleanup_run.match?(/elif \[ -z "\$CHECK_ID" \] && \[ "\$latest_status" != complete \]; then/) &&
-        cleanup_run.include?('-f name="$CHECK_NAME" -f head_sha="$HEAD_SHA"') &&
+        cleanup_run.include?('-f name="$CHECK_NAME" -f head_sha="$current_head"') &&
         cleanup_run.include?("conclusion=failure"),
       "read-only relay cleanup leaves the PR head unpublished when the relay failed before opening its lease"
     )
@@ -621,6 +668,10 @@ fi
 # Run the fixture-driven test suite.
 if ! bash "$TEST"; then
   echo "check_codex_p1_gate: FAIL (test suite)"
+  exit 1
+fi
+if ! bash "$RELAY_TEST"; then
+  echo "check_codex_p1_gate: FAIL (relay source binding suite)"
   exit 1
 fi
 
