@@ -39,12 +39,15 @@ make_case() {
   local name=$1
   local keyring_ok=$2
   local dir="$WORKDIR/$name"
-  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
+  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/scripts/workflow" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/codex-review-request.sh" "$dir/scripts/codex-review-request.sh"
   chmod +x "$dir/scripts/codex-review-request.sh"
   cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
   cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
+  chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 author_identity: nathanjohnpayne
@@ -54,6 +57,12 @@ codex:
   reaction_freshness_window_seconds: 999999999
   ack_wait_seconds: 0
   max_ack_retries: 0
+EOF
+  cat >"$dir/state/base-review-policy.yml" <<'EOF'
+author_identity: nathanjohnpayne
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+  max_review_rounds: 10
 EOF
 
   # gh-as-author stub: records each @codex trigger post and returns a
@@ -82,7 +91,8 @@ shift
 [ "\${1:-}" = "--paginate" ] && shift
 ep=\${1:-}
 case "\$ep" in
-  repos/owner/repo/pulls/999)                   printf '{"head":{"sha":"head-sha"}}\n' ;;
+  repos/owner/repo/pulls/999)                   printf '{"head":{"sha":"head-sha"},"base":{"ref":"main","sha":"base-sha","repo":{"default_branch":"main"}}}\n' ;;
+  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha') cat "$dir/state/base-review-policy.yml" ;;
   repos/owner/repo/commits/head-sha)            printf '%s\n' "\$now" ;;
   repos/owner/repo/issues/999/timeline)         printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)           printf '[]\n' ;;

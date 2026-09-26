@@ -34,13 +34,16 @@ make_case() {
   local codex_block=$2
   local dir="$WORKDIR/$name"
 
-  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
+  mkdir -p "$dir/scripts" "$dir/scripts/lib" "$dir/scripts/workflow" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/codex-review-request.sh" "$dir/scripts/codex-review-request.sh"
   chmod +x "$dir/scripts/codex-review-request.sh"
   cp "$ROOT/scripts/lib/codex-failure-markers.sh" "$dir/scripts/lib/codex-failure-markers.sh"
   cp "$ROOT/scripts/lib/gh-api-scalar.sh" "$dir/scripts/lib/gh-api-scalar.sh"   # #799, hard-sourced
   cp "$ROOT/scripts/lib/gh-api-array.sh" "$dir/scripts/lib/gh-api-array.sh"     # #1008, hard-sourced
   cp "$ROOT/scripts/lib/codex-request-evidence.sh" "$dir/scripts/lib/codex-request-evidence.sh"
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
+  cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$dir/scripts/workflow/resolve_base_policy.sh"
+  chmod +x "$dir/scripts/workflow/resolve_base_policy.sh"
 
   {
     printf 'codex:\n'
@@ -52,6 +55,12 @@ make_case() {
     printf '  ack_wait_seconds: 0\n'
     printf '  max_ack_retries: 0\n'
   } >"$dir/.github/review-policy.yml"
+  cat >"$dir/state/base-review-policy.yml" <<'EOF'
+author_identity: nathanjohnpayne
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+  max_review_rounds: 10
+EOF
 
   # gh-as-author records triggers and Phase 4a terminal markers separately.
   # The real wrapper receives either --body or --body-file after `--`.
@@ -105,8 +114,9 @@ case "$endpoint" in
     if [ "${2:-}" = "--jq" ]; then
       printf '%s\n' "${CODEX_TEST_LIVE_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
     else
-      printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}\n'
+      printf '{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"base":{"ref":"main","sha":"base-sha","repo":{"default_branch":"main"}}}\n'
     fi ;;
+  'repos/owner/repo/contents/.github/review-policy.yml?ref=base-sha') cat "$CODEX_TEST_STATE_DIR/base-review-policy.yml" ;;
   repos/owner/repo/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) printf '%s\n' "$now" ;;
   repos/owner/repo/issues/999/timeline)      printf '[]\n' ;;
   repos/owner/repo/pulls/999/reviews)        printf '[]\n' ;;
