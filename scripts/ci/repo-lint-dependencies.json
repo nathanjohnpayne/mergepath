@@ -110,7 +110,9 @@
     "check_pr_review_policy_nudge": [
       "scripts/pr-review-policy-nudge.sh",
       "tests/test_pr_review_policy_nudge.sh",
-      "scripts/lib/ci-check-modes.sh"
+      "scripts/lib/ci-check-modes.sh",
+      ".github/workflows/pr-review-policy.yml",
+      "tests/test_label_gate_live_labels.sh"
     ]
   }
 }

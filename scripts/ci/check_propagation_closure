@@ -295,9 +295,13 @@ ALLOW_LIST=(
   #     scripts/wave-audit.sh is hub-only, so the suite cannot run on a
   #     consumer and legitimately does not travel)
   #   - check_pr_review_policy_nudge → test_pr_review_policy_nudge.sh
+  #     + test_label_gate_live_labels.sh
   #     (marker SKIP; the #931 recovery nudge —
   #     scripts/pr-review-policy-nudge.sh is hub-only operator tooling,
-  #     so neither the driver nor its suite travels)
+  #     so neither the driver nor its suite travels. The #1339 Label Gate
+  #     suite rides the same wrapper: it tests the CANONICAL
+  #     pr-review-policy.yml, which only the hub owns, so it is not
+  #     needed where the wrapper SKIPs)
   #   - check_project_doc_sync      → test_project_doc_sync.sh
   #     (both-absent marker SKIP; the #642 project-doc-sync suite —
   #     scripts/project-doc-sync.sh is hub-only, so the suite cannot run
@@ -329,6 +333,7 @@ ALLOW_LIST=(
   "tests/test_wave_audit.sh"
   "tests/test_project_doc_sync.sh"
   "tests/test_pr_review_policy_nudge.sh"
+  "tests/test_label_gate_live_labels.sh"
   "tests/test_external_review_gh_stderr.sh"
   "tests/test_external_review_rename_protection.sh"
   "tests/test_resolve_base_policy.sh"
