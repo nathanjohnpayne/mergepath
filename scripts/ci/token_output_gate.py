@@ -1846,6 +1846,13 @@ def _skip_balanced_parens(text, start):
             # the enclosing double quote or balanced list (#1494 review).
             i = _skip_balanced_parens(text, i + 1)
             continue
+        if quotes and quotes[-1] == '"' and c == "`":
+            # Backticks also start an independent command-substitution
+            # context.  A quote in their body cannot close the enclosing
+            # double-quoted array element (#1494 review).
+            close = text.find("`", i + 1)
+            i = n if close == -1 else close + 1
+            continue
         if c == "'" and not (quotes and quotes[-1] == '"'):
             quotes.append("'")
             i += 1
@@ -4244,6 +4251,19 @@ CORPUS = [
         "array-double-quoted-nested-substitution-quote-context",
         MUST_FLAG,
         'args=("$(printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        # The legacy backtick spelling has the same independent quote
+        # context.  Its inner `")` is data and cannot hide the later emitter
+        # by closing the surrounding array element (#1494 review).
+        "array-double-quoted-backtick-quote-context",
+        MUST_FLAG,
+        'args=("`printf \'%s\' \'")\'`"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-backtick-quote-context-no-emitter-control",
+        MUST_NOT_FLAG,
+        'args=("`printf \'%s\' \'")\'`"); echo ok\n',
     ),
     (
         # A SUBSHELL inside an array assignment's absorbed `$( )`.  The same
