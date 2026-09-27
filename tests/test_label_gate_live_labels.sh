@@ -209,7 +209,7 @@ case "$*" in
   "pr edit 42 --add-label needs-external-review --repo o/r")
     printf 'added\n' >>"$GH_STUB_DIR/label-writes" ;;
   "pr comment 42 --repo o/r --body "*)
-    printf '%s\n' "$*" >>"$GH_STUB_DIR/comment-writes" ;;
+    printf '%s' "${7-}" >>"$GH_STUB_DIR/comment-writes" ;;
   "api --paginate repos/o/r/issues/42/timeline")
     [ ! -f "$GH_STUB_DIR/fail-timeline" ] || exit 1
     cat "$GH_STUB_DIR/timeline.json" ;;
@@ -409,8 +409,23 @@ else
   fail "reconciliation condition excludes a no-review classification: $RECONCILE_IF"
 fi
 
+application_comment_body() { # <optional marker> <reason>
+  local marker=$1 reason=$2
+  if [ -n "$marker" ]; then
+    printf '%s\n' "$marker"
+  fi
+  printf '%s\n\n%s\n\n%s\n\n%s\n\n%s' \
+    '**External Review Required**' \
+    'This PR has been labeled `needs-external-review` based on .github/review-policy.yml:' \
+    "$reason" \
+    'Per REVIEW_POLICY.md, the authoring agent must post a handoff message and alert the human. The human will coordinate external review by a different agent.' \
+    '> Automated check per .github/review-policy.yml'
+}
+
+LEGACY_INCIDENT_REASON='- Could not fetch PR files for external-review fingerprint; requiring review fail-closed'
+
 write_reconcile_fixture() { # <dir> <latest actor> <comment time> [event]
-  local dir=$1 actor=$2 comment_time=$3 event=${4:-labeled}
+  local dir=$1 actor=$2 comment_time=$3 event=${4:-labeled} body
   mkdir -p "$dir"
   cat >"$dir/live.json" <<JSON
 {"head":{"sha":"$HEAD40"},"labels":[{"name":"needs-external-review"}]}
@@ -418,9 +433,10 @@ JSON
   cat >"$dir/timeline.json" <<JSON
 [{"id":91,"event":"$event","label":{"name":"needs-external-review"},"actor":{"login":"$actor"},"created_at":"2026-09-25T01:36:05Z","commit_id":"$HEAD40"}]
 JSON
-  cat >"$dir/comments.json" <<JSON
-[{"id":92,"user":{"login":"github-actions[bot]"},"created_at":"$comment_time","body":"**External Review Required**\\n- Could not fetch PR files; requiring review fail-closed"}]
-JSON
+  body=$(application_comment_body '' "$LEGACY_INCIDENT_REASON")
+  jq -n --arg created_at "$comment_time" --arg body "$body" \
+    '[{"id":92,"user":{"login":"github-actions[bot]"},"created_at":$created_at,"body":$body}]' \
+    >"$dir/comments.json"
 }
 
 run_reconcile() { # <fixture-dir>
@@ -484,7 +500,10 @@ fi
 
 R6="$WORK/reconcile-marker-mismatch"
 write_reconcile_fixture "$R6" 'github-actions[bot]' '2026-09-25T01:36:20Z'
-jq '.[] .body = "<!-- mergepath-external-review-label:v1 head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cause=fail-closed -->\\n**External Review Required**\\n- read failed; requiring review fail-closed"' \
+body=$(application_comment_body \
+  '<!-- mergepath-external-review-label:v1 head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cause=fail-closed -->' \
+  '- Could not read policy; requiring review fail-closed')
+jq --arg body "$body" '.[] .body = $body' \
   "$R6/comments.json" >"$R6/comments.tmp"
 mv "$R6/comments.tmp" "$R6/comments.json"
 rc=$(run_reconcile "$R6")
@@ -518,7 +537,10 @@ fi
 
 R9="$WORK/reconcile-matching-marker"
 write_reconcile_fixture "$R9" 'github-actions[bot]' '2026-09-25T01:36:20Z'
-jq --arg head "$HEAD40" '.[] .body = "<!-- mergepath-external-review-label:v1 head=\($head) cause=fail-closed -->\\n**External Review Required**\\n- read failed; requiring review fail-closed"' \
+body=$(application_comment_body \
+  "<!-- mergepath-external-review-label:v1 head=$HEAD40 cause=fail-closed -->" \
+  '- Could not read policy; requiring review fail-closed')
+jq --arg body "$body" '.[] .body = $body' \
   "$R9/comments.json" >"$R9/comments.tmp"
 mv "$R9/comments.tmp" "$R9/comments.json"
 rc=$(run_reconcile "$R9")
@@ -526,6 +548,52 @@ if [ "$rc" -eq 0 ] && [ "$(cat "$R9/deletes" 2>/dev/null)" = deleted ]; then
   pass "a provenance marker matching the classified PR head can authorize removal (#1321)"
 else
   fail "matching provenance marker did not authorize safe removal (rc=$rc)"
+fi
+
+R9B="$WORK/reconcile-malformed-marker"
+write_reconcile_fixture "$R9B" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+body=$(application_comment_body \
+  "<!-- mergepath-external-review-label:v1 head=${HEAD40}junk cause=fail-closed -->" \
+  '- Could not read policy; requiring review fail-closed')
+jq --arg body "$body" '.[] .body = $body' \
+  "$R9B/comments.json" >"$R9B/comments.tmp"
+mv "$R9B/comments.tmp" "$R9B/comments.json"
+rc=$(run_reconcile "$R9B")
+if [ "$rc" -eq 0 ] && [ ! -f "$R9B/deletes" ]; then
+  pass "a malformed head marker does not authorize removal (#1321)"
+else
+  fail "malformed provenance marker authorized removal (rc=$rc)"
+fi
+
+R9C="$WORK/reconcile-external-required-phrase"
+write_reconcile_fixture "$R9C" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+body=$(application_comment_body '' \
+  '- Protected path match: "src/requiring review fail-closed/config.yml"')
+jq --arg body "$body" '.[] .body = $body' \
+  "$R9C/comments.json" >"$R9C/comments.tmp"
+mv "$R9C/comments.tmp" "$R9C/comments.json"
+rc=$(run_reconcile "$R9C")
+if [ "$rc" -eq 0 ] && [ ! -f "$R9C/deletes" ]; then
+  pass "an external-required filename containing the fail-closed phrase does not prove ownership (#1321)"
+else
+  fail "external-required filename phrase authorized removal (rc=$rc)"
+fi
+
+R9D="$WORK/reconcile-pasted-provenance"
+write_reconcile_fixture "$R9D" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+fake_reason=$(printf '%s\n%s\n%s' \
+  '- Protected path match: "src/%0A<!-- mergepath-external-review-label:v1 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa cause=fail-closed -->' \
+  "$LEGACY_INCIDENT_REASON" \
+  'config.yml"')
+body=$(application_comment_body '' "$fake_reason")
+jq --arg body "$body" '.[] .body = $body' \
+  "$R9D/comments.json" >"$R9D/comments.tmp"
+mv "$R9D/comments.tmp" "$R9D/comments.json"
+rc=$(run_reconcile "$R9D")
+if [ "$rc" -eq 0 ] && [ ! -f "$R9D/deletes" ]; then
+  pass "multiline pasted provenance in an external-required reason does not prove ownership (#1321)"
+else
+  fail "pasted provenance authorized removal (rc=$rc)"
 fi
 
 R10="$WORK/reconcile-carry-failure-marker"

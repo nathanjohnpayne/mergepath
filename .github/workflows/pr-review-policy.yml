@@ -675,36 +675,47 @@ jobs:
           LABEL_EVENT_ID=$(jq -r '.id' <<<"$LATEST")
           LABEL_EVENT_TIME=$(jq -r '.created_at' <<<"$LATEST")
 
-          # New applications carry an exact-head marker. Legacy applications
-          # are admitted only through the original exact body plus a five-minute
-          # adjacency to the latest github-actions label event; this recovers
-          # the incident that filed #1321 without treating an older comment as
-          # ownership of a later human-applied label.
-          OWNER_COMMENT=$(jq -c --arg applied "$LABEL_EVENT_TIME" '
+          # New applications carry an exact-head marker as the first line of
+          # the application envelope. Legacy applications are admitted only
+          # when the complete body matches one of the historical fail-closed
+          # templates. A title or reason substring can be supplied by an
+          # ordinary protected-path filename, so neither proves ownership.
+          OWNER_COMMENT=$(jq -c --arg applied "$LABEL_EVENT_TIME" --arg head "$EXPECTED_HEAD_SHA" '
+            def application_prefix:
+              "**External Review Required**\n\n"
+              + "This PR has been labeled `needs-external-review` based on .github/review-policy.yml:\n\n";
+            def application_suffix:
+              "\n\nPer REVIEW_POLICY.md, the authoring agent must post a handoff message and alert the human. "
+              + "The human will coordinate external review by a different agent.\n\n"
+              + "> Automated check per .github/review-policy.yml";
+            def application_body($reason):
+              application_prefix + $reason + application_suffix;
+            def legacy_body:
+              . == application_body("- Could not fetch PR files for external-review fingerprint; requiring review fail-closed")
+              or . == application_body("- Could not materialize the PR base tree for the external-review calculation; requiring review fail-closed")
+              or . == application_body("- No trusted review-policy.yml on the PR base or the default branch; requiring review fail-closed")
+              or . == application_body("- Trusted external-review fingerprint helper is unavailable on the PR base and the default branch; requiring review fail-closed")
+              or . == application_body("- External-review fingerprint helper failed; requiring review fail-closed");
+            def marked_body($expected_head):
+              ("<!-- mergepath-external-review-label:v1 head=" + $expected_head
+               + " cause=fail-closed -->\n" + application_prefix) as $prefix
+              | . as $body
+              | ($body | startswith($prefix))
+                and ($body | endswith(application_suffix))
+                and (($body | ltrimstr($prefix) | rtrimstr(application_suffix))
+                     | test("^- [^\\n]+; requiring review fail-closed$"));
             ($applied | fromdateiso8601) as $at
             | [ .[]
                 | select(.user.login == "github-actions[bot]")
                 | select((.created_at | fromdateiso8601) >= $at
                          and (.created_at | fromdateiso8601) <= ($at + 300))
-                | select(.body | contains("**External Review Required**")
-                                 and contains("requiring review fail-closed")) ]
+                | select(.body | legacy_body or marked_body($head)) ]
             | sort_by(.created_at, .id) | first // null
           ' "$COMMENTS")
           if [ "$OWNER_COMMENT" = null ]; then
             echo "No adjacent github-actions fail-closed application comment proves ownership; preserving needs-external-review."
             exit 0
           fi
-          OWNER_BODY=$(jq -r '.body' <<<"$OWNER_COMMENT")
-          MARKED_HEAD=$(printf '%s\n' "$OWNER_BODY" \
-            | sed -n 's/.*mergepath-external-review-label:v1 head=\([0-9a-fA-F]\{40\}\) cause=fail-closed.*/\1/p' \
-            | head -1)
-          if printf '%s\n' "$OWNER_BODY" | grep -Fq 'mergepath-external-review-label:v1'; then
-            if [ -z "$MARKED_HEAD" ] || [ "$MARKED_HEAD" != "$EXPECTED_HEAD_SHA" ]; then
-              echo "Fail-closed provenance marker does not match the classified PR head; preserving needs-external-review."
-              exit 0
-            fi
-          fi
-
           # Close the read/delete race as far as the API permits: repeat both
           # mutable facts immediately before deletion. A human re-application,
           # an unlinking event, a head move, or any read failure holds the label.
