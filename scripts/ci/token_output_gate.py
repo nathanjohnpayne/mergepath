@@ -343,7 +343,10 @@ under an array assignment's `$( )` was flagged with no capture at all
 (#1032 round 2).
 
 An array assignment's parenthesised list is data, and a `$( )` among its
-elements is a capture under that assignment.
+elements is a capture under that assignment.  Ordinary quote context still
+applies inside the list: a single quote suppresses expansion only outside
+double quotes, while an apostrophe inside `"..."` is literal and cannot hide
+the list's closing parenthesis, a substitution, or later source (#1494).
 
 REDACTION IS NOT EMISSION.  `${#VAR}` is a length and `${VAR:+set}` is a
 constant alternate; neither is a value reference, so both are legal with no
@@ -1059,6 +1062,7 @@ def _find_substitutions(s, quotes_are_literal=False):
     i = 0
     n = len(s)
     in_single = False
+    in_double = False
     while i < n:
         c = s[i]
         if c == "\\" and i + 1 < n:
@@ -1069,8 +1073,12 @@ def _find_substitutions(s, quotes_are_literal=False):
                 in_single = False
             i += 1
             continue
-        if c == "'" and not quotes_are_literal:
+        if c == "'" and not quotes_are_literal and not in_double:
             in_single = True
+            i += 1
+            continue
+        if c == '"' and not quotes_are_literal:
+            in_double = not in_double
             i += 1
             continue
         if c == "$" and s[i + 1 : i + 2] == "(" and s[i + 2 : i + 3] != "(":
@@ -1826,7 +1834,7 @@ def _skip_balanced_parens(text, start):
         if c == "\\":
             i += 2
             continue
-        if c == "'":
+        if c == "'" and not (quotes and quotes[-1] == '"'):
             quotes.append("'")
             i += 1
             continue
@@ -2740,7 +2748,7 @@ def _find_compound_close(text, open_idx):
             eol = text.find("\n", i)
             i = n if eol == -1 else eol
             continue
-        if c == "'":
+        if c == "'" and not (quotes and quotes[-1] == '"'):
             quotes.append("'")
             i += 1
             continue
@@ -2914,20 +2922,26 @@ def discover_emitter_helpers(text):
 def _word_has_verbatim_positional(w):
     """True when the word expands a positional parameter's VALUE.
 
-    Single-quoted text never expands, `${1:+set}` is a constant alternate and
-    `${#1}` is a length -- a helper is entitled to use the same two redacted
-    forms the check documents for callers.
+    Single-quoted text never expands, while an apostrophe inside double quotes
+    is literal.  `${1:+set}` is a constant alternate and `${#1}` is a length
+    -- a helper is entitled to use the same two redacted forms the check
+    documents for callers.
     """
     i = 0
     n = len(w)
+    in_double = False
     while i < n:
         c = w[i]
         if c == "\\" and i + 1 < n:
             i += 2
             continue
-        if c == "'":
+        if c == "'" and not in_double:
             j = w.find("'", i + 1)
             i = n if j == -1 else j + 1
+            continue
+        if c == '"':
+            in_double = not in_double
+            i += 1
             continue
         if c == "$":
             if i + 1 < n and w[i + 1] == "{":
@@ -4176,6 +4190,31 @@ CORPUS = [
         'args=($(printf \'%s\' "$GH_TOKEN"))\necho "n=${#args[@]}"\n',
     ),
     (
+        # An apostrophe inside double quotes is literal.  Treating it as an
+        # opening single quote makes the balanced-list walker ignore the real
+        # `)` and silently consume the later direct emitter (#1494).
+        "array-double-quoted-apostrophe-later-emitter",
+        MUST_FLAG,
+        'msgs=("don\'t panic")\necho "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-no-apostrophe-later-emitter-control",
+        MUST_FLAG,
+        'msgs=("do not panic")\necho "$GH_TOKEN"\n',
+    ),
+    (
+        # Command substitutions still run inside double quotes, and this
+        # stderr move escapes the array assignment's capture (#1494).
+        "array-double-quoted-apostrophe-cmdsub-stderr",
+        MUST_FLAG,
+        'msgs=("don\'t $(printf \'%s\' "$GH_TOKEN" >&2)")\n',
+    ),
+    (
+        "array-double-quoted-no-apostrophe-cmdsub-stderr-control",
+        MUST_FLAG,
+        'msgs=("do not $(printf \'%s\' "$GH_TOKEN" >&2)")\n',
+    ),
+    (
         # A SUBSHELL inside an array assignment's absorbed `$( )`.  The same
         # construct as `subshell-inside-capture`, and it must get the same
         # verdict: `_absorb_substitutions` re-parents only the segments the
@@ -4361,6 +4400,18 @@ CORPUS = [
         "helper-echo",
         MUST_FLAG,
         'die() { echo "fatal: $1" >&2; }\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        # The function-body matcher must not open single quotes on an
+        # apostrophe that is literal inside double quotes (#1494).
+        "helper-double-quoted-apostrophe",
+        MUST_FLAG,
+        'die() { echo "can\'t: $1" >&2; }\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-double-quoted-no-apostrophe-control",
+        MUST_FLAG,
+        'die() { echo "cannot: $1" >&2; }\ndie "$GH_TOKEN"\n',
     ),
     (
         "helper-function-keyword",
@@ -5060,6 +5111,19 @@ CORPUS = [
         "xtrace-disable-in-multiline-function",
         MUST_FLAG,
         'set -x\nf() {\n  set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        # `_function_body_line_spans` shares the function matcher.  Losing
+        # this body credits its uncalled `set +x` as a top-level disable and
+        # hides the later traced reference (#1494).
+        "xtrace-disable-after-double-quoted-apostrophe-in-function",
+        MUST_FLAG,
+        'set -x\nquiet() {\n  echo "don\'t trace"\n  set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-disable-after-double-quoted-no-apostrophe-control",
+        MUST_FLAG,
+        'set -x\nquiet() {\n  echo "do not trace"\n  set +x\n}\n: "$GH_TOKEN"\n',
     ),
     (
         # The declared cost of that asymmetry: a function that IS called and
