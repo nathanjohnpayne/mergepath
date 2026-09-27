@@ -1864,6 +1864,42 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────
+# Test 30a: a verdict recorded against the current re-raise must count.
+# The original finding's stale negative row is deliberately also present:
+# the resolver must ignore that old id and find the post-re-raise verdict.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 30a: a current re-raise ledger verdict is finding-bound evidence (#1007)"
+
+T30A_LEDGER="$SCRATCH/t30a-codex-ledger.jsonl"
+cat > "$T30A_LEDGER" <<'JSON'
+{"pr_number":778,"repo":"test/repo","comment_id":99101,"priority":"P1","verdict":"-1","reaction":"-1","location":"pull_request_review_comment","action":"posted","reviewer_identity":"nathanpayne-claude","reason":null,"recorded_at":"2026-01-04T00:00:00Z"}
+{"pr_number":778,"repo":"test/repo","comment_id":99102,"priority":"P1","verdict":"+1","reaction":"+1","location":"pull_request_review_comment","action":"posted","reviewer_identity":"nathanpayne-claude","reason":null,"recorded_at":"2026-01-06T00:00:00Z"}
+JSON
+COMMITS_T990_SAVE="$COMMITS_T990"
+COMMITS_T990='[{"sha":"c0ffee1234","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]'
+
+set +e
+out=$(run_t990 "$SCRATCH/t30a.log" "$(t990_threads "$T990_B_RERAISED")" \
+        CODEX_FEEDBACK_LEDGER="$T30A_LEDGER")
+rc=$?
+set -e
+COMMITS_T990="$COMMITS_T990_SAVE"
+
+t30a_resolved=$(resolved_threads "$SCRATCH/t30a.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 0 ] \
+   && [ "$t30a_resolved" = "PRT_990A PRT_990B " ] \
+   && grep -q 'verdict for finding 99102 recorded in t30a-codex-ledger.jsonl' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 0' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: current re-raise verdict admitted; stale original row ignored"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: current re-raise ledger verdict was not admitted (rc=$rc, resolved='$t30a_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
 # Test 31: this script's OWN [mergepath-resolve: ...] marker is not
 # evidence. A marker is the resolver's output — counting it would let a
 # tagged-but-readback-failed run from the old file-proxy behavior
