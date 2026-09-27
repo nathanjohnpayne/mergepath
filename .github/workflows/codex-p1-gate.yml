@@ -599,9 +599,15 @@ jobs:
             # a broken installation. A default branch whose workflow does not
             # yet reference the helper is in the one valid bootstrap window;
             # once it does, a missing helper is an infrastructure failure.
-            if grep -Fq 'scripts/review-feedback-surface-fingerprint.sh' \
+            if [ ! -r .github/workflows/codex-p1-gate.yml ]; then
+              echo "::error::Could not read the trusted Codex P1 workflow to determine fingerprint-helper bootstrap state"
+              exit 1
+            elif grep -Fq 'scripts/review-feedback-surface-fingerprint.sh' \
               .github/workflows/codex-p1-gate.yml; then
               echo "::error::Installed feedback-fingerprint helper is missing or not executable"
+              exit 1
+            elif [ "$?" -ne 1 ]; then
+              echo "::error::Could not read the trusted Codex P1 workflow to determine fingerprint-helper bootstrap state"
               exit 1
             fi
             echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the workflow-reference-absent bootstrap window"
@@ -790,15 +796,10 @@ jobs:
           MAX_RELAY_SOURCE_RUNS=1000
           fingerprint_available=false
           if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
-            # Scheduled runs always use this trusted default-branch checkout.
-            # If its workflow references the helper, a missing executable is
-            # an infrastructure failure rather than a silent fence downgrade.
-            if grep -Fq 'scripts/review-feedback-surface-fingerprint.sh' \
-              .github/workflows/codex-p1-gate.yml; then
-              echo "::error::Installed feedback-fingerprint helper is missing or not executable"
-              exit 1
-            fi
-            echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the workflow-reference-absent bootstrap window"
+            # Scheduled runs load this default-branch workflow and helper from
+            # the same revision, so there is no bootstrap skew to allow.
+            echo "::error::Installed feedback-fingerprint helper is missing or not executable"
+            exit 1
           else
             fingerprint_available=true
           fi
@@ -809,7 +810,12 @@ jobs:
             # Look up the PR's head SHA so the check_run lands on the
             # branch-protection-relevant commit (NOT the schedule's
             # default-branch HEAD).
-            pr_json=$(gh api "repos/$REPO/pulls/$PR")
+            if ! pr_json=$(gh api "repos/$REPO/pulls/$PR"); then
+              echo "::error::Could not read PR #$PR; cannot open a fail-closed lease"
+              had_infra_error=1
+              echo "::endgroup::"
+              continue
+            fi
             head_sha=$(jq -r '.head.sha' <<<"$pr_json")
             is_fork=$(jq -r '.head.repo.fork // false' <<<"$pr_json")
             pr_actor=$(jq -r '.user.login // ""' <<<"$pr_json")
@@ -985,23 +991,35 @@ jobs:
               rc=1
             else
               feedback_fp_before="bootstrap-unavailable"
+              fingerprint_error=false
               if [ "$fingerprint_available" = true ]; then
-                feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh \
-                  "$PR" "$REPO")
+                if ! feedback_fp_before=$(scripts/review-feedback-surface-fingerprint.sh \
+                  "$PR" "$REPO"); then
+                  fingerprint_error=true
+                fi
               fi
-              set +e
-              output=$(scripts/codex-p1-gate.sh "$PR" "$REPO" 2>&1)
-              rc=$?
-              set -e
+              if [ "$fingerprint_error" = true ]; then
+                output="Could not read the feedback surface before evaluating PR #$PR; closing this generation as failure."
+                rc=2
+                had_infra_error=1
+              else
+                set +e
+                output=$(scripts/codex-p1-gate.sh "$PR" "$REPO" 2>&1)
+                rc=$?
+                set -e
 
-              feedback_fp_after="$feedback_fp_before"
-              if [ "$fingerprint_available" = true ]; then
-                feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh \
-                  "$PR" "$REPO")
-                if [ "$feedback_fp_after" != "$feedback_fp_before" ]; then
-                  output="${output}"$'\n'"Feedback changed while PR #$PR was evaluated; closing this generation as failure."
-                  rc=2
-                  had_infra_error=1
+                feedback_fp_after="$feedback_fp_before"
+                if [ "$fingerprint_available" = true ]; then
+                  if ! feedback_fp_after=$(scripts/review-feedback-surface-fingerprint.sh \
+                    "$PR" "$REPO"); then
+                    output="${output}"$'\n'"Could not read the feedback surface after evaluating PR #$PR; closing this generation as failure."
+                    rc=2
+                    had_infra_error=1
+                  elif [ "$feedback_fp_after" != "$feedback_fp_before" ]; then
+                    output="${output}"$'\n'"Feedback changed while PR #$PR was evaluated; closing this generation as failure."
+                    rc=2
+                    had_infra_error=1
+                  fi
                 fi
               fi
               echo "$output"
