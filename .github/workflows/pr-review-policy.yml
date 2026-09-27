@@ -542,6 +542,25 @@ jobs:
             exit 0
           fi
 
+          # #1254: label-event runs can outlive the event head. Fence the write
+          # against the live PR immediately before applying the label, skipping
+          # classifications whose event head has already moved. An unreadable or
+          # malformed head fails this job (and therefore Label Gate) closed;
+          # a confirmed moved head is a successful stale-run no-op.
+          if ! LIVE_HEAD=$(gh api \
+            "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.head.sha'); then
+            echo "::error::Could not read the live PR head before applying needs-external-review." >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$LIVE_HEAD" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "::error::Live PR head is malformed; refusing to apply needs-external-review." >&2
+            exit 1
+          fi
+          if [ "$LIVE_HEAD" != "$HEAD_SHA" ]; then
+            echo "PR head moved from $HEAD_SHA to $LIVE_HEAD; skipping stale needs-external-review application."
+            exit 0
+          fi
+
           gh pr edit "$PR_NUMBER" --add-label "needs-external-review" \
             --repo "${{ github.repository }}"
 

@@ -184,6 +184,14 @@ else
   pass "fail-closed label reconciliation step is present"
 fi
 
+yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Apply label and comment") | .run' \
+  "$WORKFLOW" | sed 's|${{ github.repository }}|o/r|g' >"$WORK/apply.sh"
+if [ ! -s "$WORK/apply.sh" ]; then
+  fail "could not extract the label application step"
+else
+  pass "label application step is present"
+fi
+
 mkdir -p "$WORK/bin"
 REAL_BASH=$(command -v bash)
 cat >"$WORK/bin/gh" <<'SH'
@@ -193,6 +201,15 @@ printf '%s\n' "$*" >>"$GH_STUB_DIR/calls"
 case "$*" in
   "api --paginate repos/o/r/pulls/42/files")
     printf '[{"filename":"src/example.sh","status":"modified","additions":400,"deletions":0}]\n' ;;
+  "pr view 42 --repo o/r --json labels --jq .labels[].name")
+    cat "$GH_STUB_DIR/labels.txt" ;;
+  "api repos/o/r/pulls/42 --jq .head.sha")
+    [ ! -f "$GH_STUB_DIR/fail-live-head" ] || exit 1
+    cat "$GH_STUB_DIR/live-head" ;;
+  "pr edit 42 --add-label needs-external-review --repo o/r")
+    printf 'added\n' >>"$GH_STUB_DIR/label-writes" ;;
+  "pr comment 42 --repo o/r --body "*)
+    printf '%s\n' "$*" >>"$GH_STUB_DIR/comment-writes" ;;
   "api --paginate repos/o/r/issues/42/timeline")
     [ ! -f "$GH_STUB_DIR/fail-timeline" ] || exit 1
     cat "$GH_STUB_DIR/timeline.json" ;;
@@ -236,6 +253,72 @@ case "${1-}" in
 esac
 SH
 chmod +x "$WORK/bin/bash"
+
+HEAD40=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+OTHER_HEAD40=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+write_apply_fixture() { # <dir> <live-head> [labels]
+  local dir=$1 live_head=$2 labels=${3-}
+  mkdir -p "$dir"
+  printf '%s\n' "$live_head" >"$dir/live-head"
+  printf '%s\n' "$labels" >"$dir/labels.txt"
+}
+
+run_apply() { # <fixture-dir>
+  local dir=$1 rc=0
+  env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" GH_STUB_DIR="$dir" \
+    PR_NUMBER=42 HEAD_SHA="$HEAD40" CLASSIFICATION=fail-closed \
+    REASONS='- Could not read policy; requiring review fail-closed' \
+    "$REAL_BASH" "$WORK/apply.sh" >"$dir/out" 2>"$dir/err" || rc=$?
+  printf '%s' "$rc"
+}
+
+A1="$WORK/apply-current-head"
+write_apply_fixture "$A1" "$HEAD40"
+rc=$(run_apply "$A1")
+if [ "$rc" -eq 0 ] && [ "$(cat "$A1/label-writes" 2>/dev/null)" = added ] \
+   && grep -Fq "mergepath-external-review-label:v1 head=$HEAD40 cause=fail-closed" "$A1/comment-writes"; then
+  pass "current-head classification applies the label and matching provenance comment"
+else
+  fail "current-head classification did not publish both writes (rc=$rc out=$(cat "$A1/out") err=$(cat "$A1/err"))"
+fi
+
+A2="$WORK/apply-stale-head"
+write_apply_fixture "$A2" "$OTHER_HEAD40"
+rc=$(run_apply "$A2")
+if [ "$rc" -eq 0 ] && [ ! -f "$A2/label-writes" ] && [ ! -f "$A2/comment-writes" ]; then
+  pass "stale event head skips label and comment writes successfully"
+else
+  fail "stale event head wrote or failed unexpectedly (rc=$rc out=$(cat "$A2/out") err=$(cat "$A2/err"))"
+fi
+
+A3="$WORK/apply-head-read-failure"
+write_apply_fixture "$A3" "$HEAD40"
+touch "$A3/fail-live-head"
+rc=$(run_apply "$A3")
+if [ "$rc" -ne 0 ] && [ ! -f "$A3/label-writes" ] && [ ! -f "$A3/comment-writes" ]; then
+  pass "unreadable live head fails closed without label or comment writes"
+else
+  fail "unreadable live head did not fail closed (rc=$rc out=$(cat "$A3/out") err=$(cat "$A3/err"))"
+fi
+
+A4="$WORK/apply-malformed-head"
+write_apply_fixture "$A4" not-a-sha
+rc=$(run_apply "$A4")
+if [ "$rc" -ne 0 ] && [ ! -f "$A4/label-writes" ] && [ ! -f "$A4/comment-writes" ]; then
+  pass "malformed live head fails closed without label or comment writes"
+else
+  fail "malformed live head did not fail closed (rc=$rc out=$(cat "$A4/out") err=$(cat "$A4/err"))"
+fi
+
+A5="$WORK/apply-existing-label"
+write_apply_fixture "$A5" "$HEAD40" needs-external-review
+rc=$(run_apply "$A5")
+if [ "$rc" -eq 0 ] && [ ! -f "$A5/label-writes" ] && [ ! -f "$A5/comment-writes" ]; then
+  pass "an existing label still suppresses duplicate writes"
+else
+  fail "existing label produced duplicate writes (rc=$rc out=$(cat "$A5/out") err=$(cat "$A5/err"))"
+fi
 
 yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' \
   "$WORKFLOW" \
@@ -301,7 +384,6 @@ else
   fail "reconciliation condition excludes a no-review classification: $RECONCILE_IF"
 fi
 
-HEAD40=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 write_reconcile_fixture() { # <dir> <latest actor> <comment time> [event]
   local dir=$1 actor=$2 comment_time=$3 event=${4:-labeled}
   mkdir -p "$dir"
