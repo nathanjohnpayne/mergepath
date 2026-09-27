@@ -102,6 +102,25 @@ else
   fail "label lifecycle classification/apply boundary is missing"
 fi
 
+# GitHub compiles any run scalar containing an expression as one format
+# expression, which has a 21,000-character registration limit. Keep the large
+# classifier body expression-free by moving event values into its step env.
+CLASSIFIER_RUN_BYTES=$(printf '%s' "$CLASSIFIER_BODY" | LC_ALL=C wc -c | tr -d ' ')
+CLASSIFIER_ENV=$(yq -o=json -I=0 '.jobs."external-review-labeling".steps[] | select(.id == "check") | .env' "$WORKFLOW")
+if jq -e '
+        .BASE_SHA == "${{ github.event.pull_request.base.sha }}"
+        and .HEAD_SHA == "${{ github.event.pull_request.head.sha }}"
+        and .HEAD_REF == "${{ github.event.pull_request.head.ref }}"
+        and .PR_AUTHOR == "${{ github.event.pull_request.user.login }}"
+        and .REPO == "${{ github.repository }}"
+        and .DEFAULT_BRANCH == "${{ github.event.repository.default_branch }}"
+      ' <<<"$CLASSIFIER_ENV" >/dev/null \
+   && { [ "$CLASSIFIER_RUN_BYTES" -le 21000 ] || [[ "$CLASSIFIER_BODY" != *'${{'* ]]; }; then
+  pass "oversized classifier body keeps GitHub expressions in step env"
+else
+  fail "classifier run scalar can exceed GitHub's expression limit (bytes=$CLASSIFIER_RUN_BYTES)"
+fi
+
 # #1251: the live read must happen after classification, and a failed or
 # skipped classifier must make Label Gate red rather than silently skipping
 # the dependent required context.
@@ -461,15 +480,7 @@ git -C "$CLASSIFIER_REPO" commit --quiet -m 'fixture head'
 EVENT_HEAD=$(git -C "$CLASSIFIER_REPO" rev-parse HEAD)
 
 yq -r '.jobs."external-review-labeling".steps[] | select(.id == "check") | .run' \
-  "$WORKFLOW" \
-  | sed \
-      -e "s|\${{ github.event.pull_request.base.sha }}|$EVENT_BASE|g" \
-      -e "s|\${{ github.event.pull_request.head.sha }}|$EVENT_HEAD|g" \
-      -e 's|${{ github.event.pull_request.head.ref }}|codex/test-carry-forward|g' \
-      -e 's|${{ github.event.pull_request.user.login }}|fixture-author|g' \
-      -e 's|${{ github.event.repository.default_branch }}|main|g' \
-      -e 's|${{ github.repository }}|o/r|g' \
-  >"$WORK/classifier.sh"
+  "$WORKFLOW" >"$WORK/classifier.sh"
 
 run_classifier() { # <fixture-dir> <fingerprint-rc> <carry-rc> <carry-json> [clearance-rc]
   local dir=$1 fingerprint_rc=$2 carry_rc=$3 carry_json=$4 clearance_rc=${5:-1} rc=0
@@ -482,6 +493,9 @@ run_classifier() { # <fixture-dir> <fingerprint-rc> <carry-rc> <carry-json> [cle
     cd "$CLASSIFIER_REPO"
     env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" GH_STUB_DIR="$dir" \
       GITHUB_OUTPUT="$dir/output" PR_NUMBER=42 EVENT_ACTION="${EVENT_ACTION_OVERRIDE:-labeled}" \
+      BASE_SHA="$EVENT_BASE" HEAD_SHA="$EVENT_HEAD" \
+      HEAD_REF=codex/test-carry-forward PR_AUTHOR=fixture-author \
+      REPO=o/r DEFAULT_BRANCH=main \
       FINGERPRINT_RC="$fingerprint_rc" \
       FINGERPRINT_JSON='{"requires_review":true,"fingerprint":"fp-1","reasons":["protected path"]}' \
       CARRY_RC="$carry_rc" CARRY_JSON="$carry_json" CLEARANCE_RC="$clearance_rc" \

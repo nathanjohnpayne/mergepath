@@ -144,12 +144,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT_ACTION: ${{ github.event.action }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           NEEDS_REVIEW=false
           REASONS=""
-
-          BASE_SHA=${{ github.event.pull_request.base.sha }}
-          HEAD_SHA=${{ github.event.pull_request.head.sha }}
 
           # A base with no .github/review-policy.yml predates the policy file.
           # This used to SKIP the whole check (needs_review=false), which let a
@@ -265,8 +268,6 @@ jobs:
           # Must match SYNC_BRANCH_PREFIX in scripts/sync-to-downstream.sh.
           PROP_PREFIX=${PROP_PREFIX:-mergepath-sync/}
           AUTHOR_ID=$(top_field "$BASE_POLICY" author_identity)
-          HEAD_REF="${{ github.event.pull_request.head.ref }}"
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
           rm -f "$BASE_POLICY"
 
           if [ "$PROP_ENABLED" = "true" ] && [ -n "$PROP_PREFIX" ] \
@@ -341,7 +342,7 @@ jobs:
           # and comments, and same-repo PRs can edit scripts/workflow/**.
           FILES_JSON=$(mktemp)
           set +e
-          FILES_RAW=$(gh api --paginate "repos/${{ github.repository }}/pulls/$PR_NUMBER/files")
+          FILES_RAW=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files")
           files_rc=$?
           set -e
           if [ "$files_rc" -ne 0 ] || ! printf '%s\n' "$FILES_RAW" | jq -s 'add // []' > "$FILES_JSON"; then
@@ -377,7 +378,6 @@ jobs:
           # the safe skew direction — a current helper tolerates an older config
           # (missing keys take documented defaults); the reverse, an old helper
           # against a newer config, is the unsafe one and cannot arise here.
-          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
           TRUSTED_BASE_TREE=""
           TRUSTED_HELPER_TREE=""
           TRUSTED_CONFIG_TREE=""
@@ -470,7 +470,7 @@ jobs:
 
           set +e
           FINGERPRINT_JSON=$(bash "$FINGERPRINT_HELPER" \
-            --repo "${{ github.repository }}" \
+            --repo "$REPO" \
             --pr "$PR_NUMBER" \
             --ref "$HEAD_SHA" \
             --config "$TRUSTED_CONFIG" \
@@ -506,7 +506,7 @@ jobs:
           # event policy into a clearance claim about a different PR state.
           read_live_pair() {
             local pair
-            if ! pair=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" \
+            if ! pair=$(gh api "repos/$REPO/pulls/$PR_NUMBER" \
               --jq '{head:.head.sha,base:.base.sha}'); then
               return 1
             fi
@@ -534,7 +534,7 @@ jobs:
           if [ "$NEEDS_REVIEW" = "true" ] && [ -n "$FINGERPRINT" ] && [ -x "$CARRY_HELPER" ]; then
             set +e
             CARRY_JSON=$(bash "$CARRY_HELPER" \
-              --repo "${{ github.repository }}" \
+              --repo "$REPO" \
               --pr "$PR_NUMBER" \
               --head "$HEAD_SHA" \
               --current-fingerprint "$FINGERPRINT" \
@@ -583,7 +583,7 @@ jobs:
             CODEX_REVIEW_CHECK_SKIP_CI=1 \
               CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
               MERGEPATH_REVIEW_POLICY_PATH="$TRUSTED_CONFIG" \
-              bash "$CLEARANCE_HELPER" "$PR_NUMBER" "${{ github.repository }}"
+              bash "$CLEARANCE_HELPER" "$PR_NUMBER" "$REPO"
             clearance_rc=$?
             set -e
 
