@@ -1818,6 +1818,19 @@ class Lexer:
         finish_word()
 
 
+def _find_backtick_close(text, start):
+    """Return the next unescaped backtick at or after `start`, if any."""
+    i = start
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text):
+            i += 2
+            continue
+        if text[i] == "`":
+            return i
+        i += 1
+    return None
+
+
 def _skip_balanced_parens(text, start):
     """Return the index just past the `)` matching the `(` at `start`."""
     depth = 0
@@ -1850,8 +1863,8 @@ def _skip_balanced_parens(text, start):
             # Backticks also start an independent command-substitution
             # context.  A quote in their body cannot close the enclosing
             # double-quoted array element (#1494 review).
-            close = text.find("`", i + 1)
-            i = n if close == -1 else close + 1
+            close = _find_backtick_close(text, i + 1)
+            i = n if close is None else close + 1
             continue
         if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
             eol = text.find("\n", i)
@@ -2974,8 +2987,8 @@ def _word_has_verbatim_positional(w):
             i = n if j == -1 else j + 1
             continue
         if c == "`":
-            close = w.find("`", i + 1)
-            if close == -1:
+            close = _find_backtick_close(w, i + 1)
+            if close is None:
                 return _word_has_verbatim_positional(w[i + 1 :])
             if _word_has_verbatim_positional(w[i + 1 : close]):
                 return True
@@ -4276,6 +4289,19 @@ CORPUS = [
         "array-double-quoted-backtick-quote-context-no-emitter-control",
         MUST_NOT_FLAG,
         'args=("`printf \'%s\' \'")\'`"); echo ok\n',
+    ),
+    (
+        # An escaped backtick is data inside the legacy substitution.  It
+        # cannot close the substitution and expose its quote to the array
+        # walker's enclosing context (#1494 review).
+        "array-double-quoted-escaped-backtick-quote-context",
+        MUST_FLAG,
+        'args=("`printf \'%s\' \'\\`")\'`"); echo "$GH_TOKEN"\n',
+    ),
+    (
+        "array-double-quoted-escaped-backtick-no-emitter-control",
+        MUST_NOT_FLAG,
+        'args=("`printf \'%s\' \'\\`")\'`"); echo ok\n',
     ),
     (
         # A comment inside the nested substitution cannot add structural
