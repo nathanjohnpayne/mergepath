@@ -1853,6 +1853,10 @@ def _skip_balanced_parens(text, start):
             close = text.find("`", i + 1)
             i = n if close == -1 else close + 1
             continue
+        if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
+            eol = text.find("\n", i)
+            i = n if eol == -1 else eol
+            continue
         if c == "'" and not (quotes and quotes[-1] == '"'):
             quotes.append("'")
             i += 1
@@ -2968,6 +2972,14 @@ def _word_has_verbatim_positional(w):
         if c == "'" and not in_double:
             j = w.find("'", i + 1)
             i = n if j == -1 else j + 1
+            continue
+        if c == "`":
+            close = w.find("`", i + 1)
+            if close == -1:
+                return _word_has_verbatim_positional(w[i + 1 :])
+            if _word_has_verbatim_positional(w[i + 1 : close]):
+                return True
+            i = close + 1
             continue
         if c == '"':
             in_double = not in_double
@@ -4264,6 +4276,22 @@ CORPUS = [
         "array-double-quoted-backtick-quote-context-no-emitter-control",
         MUST_NOT_FLAG,
         'args=("`printf \'%s\' \'")\'`"); echo ok\n',
+    ),
+    (
+        # A comment inside the nested substitution cannot add structural
+        # parens.  Losing its real close hid the positional helper emission
+        # after the substitution (#1494 review).
+        "helper-nested-substitution-comment-paren",
+        MUST_FLAG,
+        'die() { echo "$( # ( is comment text\nprintf x\n) $1" >&2; }\n'
+        'die "$GH_TOKEN"\n',
+    ),
+    (
+        # Backtick bodies have their own quote context.  This positional is
+        # single-quoted there and reaches output only as the literal `$1`.
+        "helper-backtick-single-quoted-positional-control",
+        MUST_NOT_FLAG,
+        'die() { echo "`printf \'%s\' \'$1\'`"; }\ndie "$GH_TOKEN"\n',
     ),
     (
         # A SUBSHELL inside an array assignment's absorbed `$( )`.  The same
