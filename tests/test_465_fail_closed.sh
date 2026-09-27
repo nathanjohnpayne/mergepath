@@ -255,6 +255,14 @@ refute_grep "D10: auto-clear no longer removes via the unattributable gh pr edit
 assert_grep "D10: the scheduled sweep re-verifies the label against live state, not the search index (#827)" \
   "$W/auto-clear-blocking-labels.yml" 'stale search-index hit'
 
+# #1150: scoped sync-all branch keys retain the propagation lane while the
+# source checkout remains pinned to the SHA component. The suffix grammar is
+# exact so arbitrary text cannot widen branch recognition.
+assert_grep "D11: propagation lane accepts an exact sync-all scope digest (#1150)" \
+  "$W/pr-review-policy.yml" 'if [[ "$SYNC_KEY" =~ ^sync-all-([0-9a-fA-F]{7,40})(-[0-9a-f]{12})?$ ]]; then'
+assert_grep "D11: propagation lane extracts only the source SHA (#1150)" \
+  "$W/pr-review-policy.yml" 'SYNC_SHA="${BASH_REMATCH[1]}"'
+
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1

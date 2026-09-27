@@ -178,8 +178,8 @@ if [ "$1" = "pr" ]; then
     *"title,headRefName,headRefOid"*)
       # meta fetch: title / branch / head oid as tsv. FAKE_TITLE_SHA and
       # FAKE_BRANCH_SHA drive the round-3 title-vs-branch validation tests.
-      printf 'sync: bulk reconcile to mergepath@%s\tmergepath-sync/sync-all-%s\tcanaryhead1230000000000000000000000000000\n' \
-        "${FAKE_TITLE_SHA:?}" "${FAKE_BRANCH_SHA:?}"
+      printf 'sync: bulk reconcile to mergepath@%s\tmergepath-sync/sync-all-%s%s\tcanaryhead1230000000000000000000000000000\n' \
+        "${FAKE_TITLE_SHA:?}" "${FAKE_BRANCH_SHA:?}" "${FAKE_BRANCH_SUFFIX:-}"
       ;;
     *)
       printf 'canaryhead1230000000000000000000000000000\n'
@@ -204,6 +204,7 @@ run_wa_lane() { # run_wa_lane <FAKE_LANE 0|1> <args...> — lane check ACTIVE, f
   rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"
   PATH="$FAKEBIN:$PATH" FAKE_LANE="$lane" \
   FAKE_TITLE_SHA="${FAKE_TITLE_SHA:-$C2}" FAKE_BRANCH_SHA="${FAKE_BRANCH_SHA:-$C2}" \
+  FAKE_BRANCH_SUFFIX="${FAKE_BRANCH_SUFFIX--0123456789ab}" \
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=0 \
@@ -342,6 +343,16 @@ FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consume
   || fail "branch-derived head resolution failed"
 grep -q "scripts/b.sh" "$CAPTURE/diff" \
   && pass "audit range keyed off the branch sha" || fail "branch-derived range wrong"
+FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" FAKE_BRANCH_SUFFIX="" \
+  run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null \
+  && pass "legacy SHA-only sync-all branch remains parseable" \
+  || fail "legacy SHA-only sync-all branch was rejected"
+if FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" FAKE_BRANCH_SUFFIX="-bad" \
+  run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
+  fail "malformed sync-all scope suffix was accepted"
+else
+  [ $? -eq 3 ] && pass "malformed sync-all scope suffix fails closed" || fail "wrong exit for malformed scope suffix"
+fi
 if FAKE_TITLE_SHA="$C3" FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
   fail "title/branch sha mismatch was accepted"
 else

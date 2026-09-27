@@ -22,7 +22,8 @@
 #                        Honors .sync-overrides.yml per-consumer (an
 #                        intentional divergence is never clobbered),
 #                        kit allow-extras semantics, and a distinct
-#                        branch-name scheme (mergepath-sync/sync-all-<sha>)
+#                        branch-name scheme
+#                        (mergepath-sync/sync-all-<sha>-<scope-digest>)
 #                        so it doesn't collide with per-commit branches.
 #                        Templated paths are rendered per consumer facts
 #                        when the substitution lib is present (Layer 5).
@@ -65,8 +66,10 @@
 #                        divergence is never overwritten), kit allow-extras
 #                        semantics (consumer-only files are kept), and the
 #                        manifest's consumer opt-in. Uses a distinct branch
-#                        scheme (mergepath-sync/sync-all-<sha>) so it can't
-#                        collide with per-commit propagation branches.
+#                        scheme
+#                        (mergepath-sync/sync-all-<sha>-<scope-digest>) so it
+#                        cannot collide with per-commit propagation branches,
+#                        or with a different resolved scope at the same SHA.
 #                        Mutually exclusive with --audit and a positional
 #                        <commit-ish>. Honors the same sync-mode flags
 #                        below (--dry-run, --repos, --paths/--files,
@@ -1404,16 +1407,56 @@ sync_branch_name() {
   echo "${SYNC_BRANCH_PREFIX}/${sha:0:7}"
 }
 
-# Branch name for --sync-all runs. Keyed to mergepath HEAD at run time,
-# with a distinct `sync-all-` infix so a bulk reconcile branch can never
-# collide with a per-commit propagation branch (mergepath-sync/<sha>) —
-# even in the degenerate case where the per-commit sha and the sync-all
-# HEAD sha share a 7-char prefix. The distinct scheme also makes the
-# idempotency probe (sync_check_existing_pr) meaningful: a prior
-# --sync-all PR is found, a prior per-commit PR is not mistaken for one.
+# Normalize the concrete consumer destination paths selected by --sync-all.
+# Canonical and kit entries deliver at their manifest path. Templated entries
+# deliver at `dest` (or `path` when dest is omitted), so their consumer-facing
+# destination is the path that belongs in the idempotency scope. Sorting and
+# deduplicating makes manifest order and duplicate selectors irrelevant.
+sync_all_normalized_pathset() {
+  local manifest=$1
+  local canonical_targets=$2
+  local kit_targets=$3
+  local templated_targets=$4
+  local target
+
+  {
+    printf '%s\n' "$canonical_targets"
+    printf '%s\n' "$kit_targets"
+    while IFS= read -r target; do
+      [ -z "$target" ] && continue
+      MERGEPATH_TPL_PATH="$target" yq -r '
+        env(MERGEPATH_TPL_PATH) as $p
+        | .paths[] | select(.path == $p) | (.dest // .path)
+      ' "$manifest"
+    done <<< "$templated_targets"
+  } | sed '/^$/d' | LC_ALL=C sort -u
+}
+
+sync_all_scope_digest() {
+  local normalized_pathset=$1
+  printf '%s\n' "$normalized_pathset" | git hash-object --stdin | cut -c1-12
+}
+
+# Branch name for --sync-all runs. Every run appends a digest of its normalized,
+# resolved requested destination path set, so the same concrete scope always
+# reuses its key while a different scope at the same HEAD cannot be mistaken
+# for done. Hashing full scopes too avoids colliding with legacy SHA-only
+# branches that may have delivered only a filtered scope before #1150.
 sync_all_branch_name() {
   local sha=$1
-  echo "${SYNC_BRANCH_PREFIX}/sync-all-${sha:0:7}"
+  local delivered_pathset=${2:-}
+  local digest
+  digest=$(sync_all_scope_digest "$delivered_pathset") || return 1
+  echo "${SYNC_BRANCH_PREFIX}/sync-all-${sha:0:7}-${digest}"
+}
+
+sync_all_scope_description() {
+  local delivered_pathset=$1
+  local count noun digest
+  count=$(awk 'NF { n++ } END { print n + 0 }' <<< "$delivered_pathset")
+  [ "$count" -eq 1 ] && noun="path" || noun="paths"
+  digest=$(sync_all_scope_digest "$delivered_pathset") || return 1
+  printf '%s\n' "$digest ($count requested $noun, before consumer overrides)"
 }
 
 # Idempotency check: does a PR already exist on this consumer's repo from
@@ -2345,7 +2388,7 @@ sync_coderabbit_ignore_block() {
 #   $1 consumer_name
 #   $2 consumer_repo
 #   $3 sha               mergepath HEAD sha at run time
-#   $4 branch            sync-all branch name (mergepath-sync/sync-all-<sha>)
+#   $4 branch            sync-all branch name (full or scoped key)
 #   $5 canonical_targets newline-separated canonical paths
 #   $6 kit_targets       newline-separated kit paths (dir mirrors)
 #   $7 templated_list    comma-joined templated paths to render
@@ -2788,9 +2831,6 @@ sync_all_one_consumer() {
   local dry_run=${4:-0}
   local manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
 
-  local branch
-  branch=$(sync_all_branch_name "$sha")
-
   local recreate_existing_pr_num=""
 
   local canonical_targets kit_targets templated_targets
@@ -2803,6 +2843,24 @@ sync_all_one_consumer() {
   if [ -z "$canonical_targets" ] && [ -z "$kit_targets" ] && [ -z "$templated_targets" ]; then
     printf "  · %s (no canonical/kit/templated manifest paths opted in)\n" "$consumer_name"
     SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
+    return 0
+  fi
+
+  # Resolve the idempotency scope from concrete consumer destinations, after
+  # manifest opt-in and --paths matching. Consumer overrides are intentionally
+  # applied later, after the existing read-only PR probe and clone; the scope
+  # diagnostic names this boundary rather than claiming every path was copied.
+  local delivered_pathset branch scope_description
+  if ! delivered_pathset=$(sync_all_normalized_pathset "$manifest" \
+    "$canonical_targets" "$kit_targets" "$templated_targets"); then
+    printf "  ✗ %s — could not resolve requested sync-all destination paths\n" "$consumer_name"
+    SYNC_FAILED=$((SYNC_FAILED + 1))
+    return 0
+  fi
+  if ! branch=$(sync_all_branch_name "$sha" "$delivered_pathset") \
+     || ! scope_description=$(sync_all_scope_description "$delivered_pathset"); then
+    printf "  ✗ %s — could not fingerprint requested sync-all destination paths\n" "$consumer_name"
+    SYNC_FAILED=$((SYNC_FAILED + 1))
     return 0
   fi
 
@@ -2823,15 +2881,15 @@ sync_all_one_consumer() {
           recreate_existing_pr_num="$existing_pr_num"
           # Fall through — clone/commit FIRST, then close+delete+push.
         else
-          printf "  · %s already in flight (sync-all PR #%s on branch %s)\n" \
-            "$consumer_name" "$existing_pr_num" "$branch"
+          printf "  · %s already in flight (sync-all PR #%s on branch %s; requested scope: %s)\n" \
+            "$consumer_name" "$existing_pr_num" "$branch" "$scope_description"
           SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
           return 0
         fi
         ;;
       closed:*)
-        printf "  · %s already done (sync-all PR #%s closed/merged on branch %s)\n" \
-          "$consumer_name" "${pr_state#closed:}" "$branch"
+        printf "  · %s already done (sync-all PR #%s closed/merged on branch %s; requested scope: %s)\n" \
+          "$consumer_name" "${pr_state#closed:}" "$branch" "$scope_description"
         SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
         return 0
         ;;
@@ -2930,8 +2988,8 @@ sync_all_one_consumer() {
       return 0
     fi
 
-    printf "  ⤷ %s — would open PR on branch %s (%d canonical + %d kit path(s))\n" \
-      "$consumer_name" "$branch" "$canonical_count" "$kit_count"
+    printf "  ⤷ %s — would open PR on branch %s (%d canonical + %d kit path(s); requested scope: %s)\n" \
+      "$consumer_name" "$branch" "$canonical_count" "$kit_count" "$scope_description"
     while IFS= read -r p; do
       [ -z "$p" ] && continue
       printf "      + %s (canonical)\n" "$p"
@@ -2954,6 +3012,7 @@ sync_all_one_consumer() {
     return 0
   fi
 
+  printf "  · %s requested scope: %s\n" "$consumer_name" "$scope_description"
   if ! sync_all_open_pr "$consumer_name" "$consumer_repo" "$sha" "$branch" \
                         "$canonical_targets" "$kit_targets" "$templated_list" \
                         "$recreate_existing_pr_num"; then
@@ -2993,7 +3052,7 @@ run_sync_all() {
   fi
 
   echo "Sync-all: bulk reconcile to mergepath@${short_sha} (verbatim canonical/kit mirror per .mergepath-sync.yml)"
-  echo "Branch scheme: $(sync_all_branch_name "$sha")"
+  echo "Branch scheme: ${SYNC_BRANCH_PREFIX}/sync-all-${short_sha}-<resolved-requested-path-set-digest>"
   echo
 
   local consumers

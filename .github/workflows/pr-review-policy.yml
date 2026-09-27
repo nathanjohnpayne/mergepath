@@ -190,8 +190,9 @@ jobs:
           #      because it cannot edit its own BASE commit.
           #   2. branch name must start with propagation_prs.branch_prefix
           #      and PR author must be author_identity.
-          #   3. the <sha> in the branch name (mergepath-sync/[sync-all-]
-          #      <sha>) is checked out from PUBLIC nathanjohnpayne/
+          #   3. the <sha> in the branch name (mergepath-sync/<sha> or
+          #      mergepath-sync/sync-all-<sha>[-<scope-digest>]) is checked
+          #      out from PUBLIC nathanjohnpayne/
           #      mergepath, and mergepath@<sha>'s OWN
           #      verify-propagation-pr.sh byte-compares every changed
           #      file against mergepath@<sha>'s content + manifest. A
@@ -261,8 +262,12 @@ jobs:
             # extract the source <sha> from the branch name, check out
             # PUBLIC mergepath at that sha, and run mergepath@<sha>'s
             # OWN verifier against this PR. Anything off → no lane.
-            SYNC_SHA="${HEAD_REF#"$PROP_PREFIX"}"     # strip "mergepath-sync/"
-            SYNC_SHA="${SYNC_SHA#sync-all-}"          # strip optional "sync-all-"
+            SYNC_KEY="${HEAD_REF#"$PROP_PREFIX"}"     # strip "mergepath-sync/"
+            if [[ "$SYNC_KEY" =~ ^sync-all-([0-9a-fA-F]{7,40})(-[0-9a-f]{12})?$ ]]; then
+              SYNC_SHA="${BASH_REMATCH[1]}"
+            else
+              SYNC_SHA="$SYNC_KEY"
+            fi
             if printf '%s' "$SYNC_SHA" | grep -qE '^[0-9a-fA-F]{7,40}$'; then
               MP_DIR=$(mktemp -d)
               # mergepath is public — no token needed. blob:none keeps

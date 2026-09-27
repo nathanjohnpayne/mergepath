@@ -201,6 +201,30 @@ else
   echo "--- END ---" >&2
 fi
 
+# Scoped sync-all branches retain the mirror classification while malformed
+# suffixes do not widen the trusted branch grammar.
+write_pr_fixture nathanjohnpayne mergepath 283 \
+  "mergepath-sync/sync-all-abcdef1234567890-0123456789ab" \
+  "3333333333333333333333333333333333333333" \
+  "2222222222222222222222222222222222222222" \
+  1
+write_threads_fixture nathanjohnpayne mergepath 283 0
+SCOPED_OUT="$("$SCRIPT" nathanjohnpayne/mergepath#283)"
+printf '%s' "$SCOPED_OUT" | grep -q "verbatim mirror of mergepath@abcdef123456" \
+  && pass "scoped sync-all branch retains mirror classification" \
+  || fail "scoped sync-all branch was not classified as a mirror"
+
+write_pr_fixture nathanjohnpayne mergepath 284 \
+  "mergepath-sync/sync-all-abcdef1234567890-bad" \
+  "4444444444444444444444444444444444444444" \
+  "2222222222222222222222222222222222222222" \
+  1
+write_threads_fixture nathanjohnpayne mergepath 284 0
+MALFORMED_OUT="$("$SCRIPT" nathanjohnpayne/mergepath#284)"
+printf '%s' "$MALFORMED_OUT" | grep -q "novel work" \
+  && pass "malformed sync-all scope suffix is not trusted as a mirror" \
+  || fail "malformed sync-all scope suffix widened mirror classification"
+
 # ---------------------------------------------------------------------------
 # Case 2: Single-PR — non-sync branch → "novel work".
 # ---------------------------------------------------------------------------

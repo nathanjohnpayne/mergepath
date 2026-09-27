@@ -13,7 +13,8 @@
 #   base = newest wave-audit-pass/<sha> tag that is an ancestor of the wave
 #          head (--base <sha> on the first audited wave)
 #   head = the mergepath sha in the canary PR BRANCH name
-#          (mergepath-sync/[sync-all-]<sha> — what the lane verifies; a
+#          (mergepath-sync/<sha> or sync-all-<sha>[-<scope-digest>] — what
+#           the lane verifies; a
 #          parseable title must agree or the run fails closed), or --head-sha
 #   diff = git diff base..head -- <manifest paths minus excluded prefixes>
 #
@@ -206,7 +207,8 @@ EXCLUDES="$(audit_list scope_exclude_prefixes)"
 
 # --- resolve the wave head ----------------------------------------------------
 # The propagation lane derives and byte-verifies against the sha in the
-# BRANCH NAME (mergepath-sync/[sync-all-]<sha>), not the title — an edited
+# BRANCH NAME (mergepath-sync/<sha> or
+# mergepath-sync/sync-all-<sha>[-<scope-digest>]), not the title — an edited
 # or stale title could point the audit (and the watermark) at canonical
 # commits the lane never verified (#663 round-3 P1). The branch is the
 # source of truth; a parseable title must agree with it.
@@ -226,7 +228,10 @@ if [ "$need_meta" = true ]; then
   title="$(printf '%s' "$meta" | cut -f1)"
   branch="$(printf '%s' "$meta" | cut -f2)"
   PR_HEAD_OID="$(printf '%s' "$meta" | cut -f3)"
-  branch_sha="$(printf '%s\n' "$branch" | sed -n 's|.*/\(sync-all-\)\{0,1\}\([0-9a-f]\{7,40\}\)$|\2|p')"
+  branch_sha="$(printf '%s\n' "$branch" | sed -n \
+    -e 's|.*/sync-all-\([0-9a-f]\{7,40\}\)-[0-9a-f]\{12\}$|\1|p' \
+    -e 's|.*/sync-all-\([0-9a-f]\{7,40\}\)$|\1|p' \
+    -e 's|.*/\([0-9a-f]\{7,40\}\)$|\1|p')"
   [ -n "$branch_sha" ] || die 3 "canary branch '$branch' does not carry the mergepath-sync/<sha> shape — not a lane-verifiable sync canary"
   if [ -z "$HEAD_SHA" ]; then
     HEAD_SHA="$branch_sha"
