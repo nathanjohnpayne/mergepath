@@ -189,11 +189,11 @@ esac
 # condition is load-bearing for the whole mechanism, so a change to it should
 # force someone to re-reason rather than slip through a regex.
 # The verified set, one complete expression per line. Retain the workflow's
-# existing Dependabot exemption, exclude only the two label actions, or name
-# edited outright. Other nonempty conditions require explicit verification.
+# existing Dependabot exemption, run unconditionally after dependencies, or
+# name edited outright. Other nonempty conditions require explicit verification.
 JOB_CONDITIONS_VERIFIED_FOR_EDITED=$(cat <<'CONDITIONS'
 github.event.pull_request.user.login != 'dependabot[bot]'
-github.event.action != 'labeled' && github.event.action != 'unlabeled'
+always()
 github.event.action == 'edited'
 CONDITIONS
 )

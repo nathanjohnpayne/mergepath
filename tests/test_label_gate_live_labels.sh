@@ -59,6 +59,7 @@ Object.defineProperty(pull_request, 'labels', {
 });
 const context = { repo: { owner: 'o', repo: 'r' }, payload: { pull_request } };
 const core = { setFailed: msg => failures.push(msg) };
+process.env.CLASSIFIER_RESULT = scenario.classifierResult ?? 'success';
 
 let crashed = null;
 try {
@@ -77,8 +78,9 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 # #1254: label-only deliveries are recovery inputs for the classifier too. A
 # workflow-level `if` that excludes them can publish the two older required
 # contexts without ever deriving Phase 4 applicability. Label writes made by
-# this workflow use GITHUB_TOKEN, so allowing these deliveries does not create
-# a recursive run; PAT/human deliveries get one fresh classification.
+# the classifier use GITHUB_TOKEN, so its addition does not recurse; PAT-driven
+# removal is handled by the lifecycle guard below, while other label events
+# get one fresh classification.
 CLASSIFIER_IF=$(yq -r '.jobs."external-review-labeling".if // ""' "$WORKFLOW")
 if [[ "$CLASSIFIER_IF" != *"github.event.action != 'labeled'"* ]] \
    && [[ "$CLASSIFIER_IF" != *"github.event.action != 'unlabeled'"* ]]; then
@@ -100,6 +102,16 @@ else
   fail "label lifecycle classification/apply boundary is missing"
 fi
 
+# #1251: the live read must happen after classification, and a failed or
+# skipped classifier must make Label Gate red rather than silently skipping
+# the dependent required context.
+LABEL_NEEDS=$(yq -r '.jobs."label-gate".needs // ""' "$WORKFLOW")
+LABEL_IF=$(yq -r '.jobs."label-gate".if // ""' "$WORKFLOW")
+if [ "$LABEL_NEEDS" = "external-review-labeling" ] && [ "$LABEL_IF" = "always()" ]; then
+  pass "Label Gate waits for the classifier and still runs after non-success (#1251)"
+else
+  fail "Label Gate ordering contract missing (needs=$LABEL_NEEDS if=$LABEL_IF)"
+fi
 run() { node "$WORK/harness.mjs" "$WORK/script.js" "$1"; }
 
 # <label> <scenario-json> <jq assertion over the harness result>
@@ -140,12 +152,23 @@ check "a failed live read fails closed" \
   '{"readFails":true,"livePages":[[]]}' \
   '.crashed == null and (.failures | length) == 1 and (.failures[0] | test("Could not read the current labels"))'
 
-# 6. The read targets this PR's issue, paginated, through listLabelsOnIssue.
+# 6. A failed/skipped classifier cannot turn into a green or skipped Label
+#    Gate. It fails before the label read because that read cannot repair an
+#    unknown classification result.
+check "a failed classifier fails Label Gate closed without reading labels" \
+  '{"classifierResult":"failure","livePages":[[]]}' \
+  '.crashed == null and .calls == [] and (.failures | length) == 1 and (.failures[0] | test("finished with failure"))'
+
+check "a skipped classifier fails Label Gate closed without reading labels" \
+  '{"classifierResult":"skipped","livePages":[[]]}' \
+  '.crashed == null and .calls == [] and (.failures | length) == 1 and (.failures[0] | test("finished with skipped"))'
+
+# 8. The read targets this PR's issue, paginated, through listLabelsOnIssue.
 check "the read is listLabelsOnIssue for this PR, paginated" \
   '{"livePages":[[]]}' \
   '.calls == [{"method":"listLabelsOnIssue","params":{"owner":"o","repo":"r","issue_number":42,"per_page":100}}]'
 
-# 7. No unrelated labels, no failure.
+# 9. No unrelated labels, no failure.
 check "unrelated labels alone pass" \
   '{"livePages":[["documentation","enhancement"]]}' \
   '.crashed == null and .failures == []'

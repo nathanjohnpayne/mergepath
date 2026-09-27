@@ -65,12 +65,27 @@ jobs:
 
   label-gate:
     name: Label Gate
+    needs: external-review-labeling
+    if: always()
     runs-on: ubuntu-latest
+    env:
+      CLASSIFIER_RESULT: ${{ needs.external-review-labeling.result }}
     steps:
       - name: Block merge if blocking labels present
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
+            // The classifier may add needs-external-review during this run.
+            // Wait for it before reading live labels (#1251), and fail closed
+            // if it did not complete: an unread classifier result cannot make
+            // the event's pre-classification label set authoritative.
+            if (process.env.CLASSIFIER_RESULT !== 'success') {
+              core.setFailed(
+                `External Review Check finished with ${process.env.CLASSIFIER_RESULT || 'an unknown result'}; ` +
+                `failing closed before evaluating labels.`
+              );
+              return;
+            }
             const blockingLabels = [
               'needs-external-review',
               'needs-human-review',
