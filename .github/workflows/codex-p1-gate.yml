@@ -803,9 +803,11 @@ jobs:
           fingerprint_available=false
           if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
             # Scheduled runs load this default-branch workflow and helper from
-            # the same revision, so there is no bootstrap skew to allow.
+            # the same revision, so there is no bootstrap skew to allow. Keep
+            # iterating so every readable PR head receives a terminal failure
+            # generation instead of relying on this default-branch native job.
             echo "::error::Installed feedback-fingerprint helper is missing or not executable"
-            exit 1
+            had_infra_error=1
           else
             fingerprint_available=true
           fi
@@ -857,6 +859,20 @@ jobs:
             if [ -z "$check_id" ]; then
               echo "::error::Could not open the scheduled check lease for PR #$PR"
               had_infra_error=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            if [ "$fingerprint_available" != true ]; then
+              output="Installed feedback-fingerprint helper is missing or not executable; refusing scheduled clearance."
+              if ! gh api -X PATCH "repos/$REPO/check-runs/$check_id" \
+                -f status="completed" \
+                -f conclusion="failure" \
+                -f "output[title]=Codex P1 gate — fingerprint helper unavailable" \
+                -f "output[summary]=$output" \
+                >/dev/null; then
+                echo "::error::Failed to close check lease $check_id for PR #$PR; it remains pending"
+              fi
               echo "::endgroup::"
               continue
             fi

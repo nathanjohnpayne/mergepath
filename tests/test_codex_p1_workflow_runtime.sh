@@ -173,24 +173,6 @@ else
   pass "installed event helper fences the gate"
 fi
 
-# The scheduled workflow and helper arrive from one default-branch revision;
-# it never receives the event-driven bootstrap exception.
-dir="$TMP/sweep-no-bootstrap"
-make_common_fixture "$dir"
-if (
-  cd "$dir"
-  env PRS='' REPO=owner/repo CHECK_NAME='Codex P1 unresolved threads' \
-    RUNNER_TEMP="$dir/runner" bash "$SWEEP_STEP"
-) >"$dir/out" 2>&1; then
-  fail "scheduled sweep rejects a missing helper without a bootstrap exception" "workflow step exited 0"
-elif ! grep -Fq 'Installed feedback-fingerprint helper is missing or not executable' "$dir/out"; then
-  fail "scheduled sweep rejects a missing helper without a bootstrap exception" "infrastructure error missing"
-elif grep -Fq '::warning::' "$dir/out"; then
-  fail "scheduled sweep rejects a missing helper without a bootstrap exception" "bootstrap warning was emitted"
-else
-  pass "scheduled sweep rejects a missing helper without a bootstrap exception"
-fi
-
 make_sweep_fixture() {
   local dir="$1"
   make_common_fixture "$dir"
@@ -305,6 +287,31 @@ run_sweep() {
   set -e
   printf '%s' "$rc"
 }
+
+# The scheduled workflow and helper arrive from one default-branch revision;
+# it never receives the event-driven bootstrap exception. The native scheduled
+# job is attached to the default branch, so the missing-helper failure must also
+# publish a terminal failure generation on every readable PR head.
+dir="$TMP/sweep-no-bootstrap"
+make_sweep_fixture "$dir"
+rm "$dir/scripts/review-feedback-surface-fingerprint.sh"
+rc=$(run_sweep "$dir" stable stable)
+if [ "$rc" -eq 0 ]; then
+  fail "scheduled missing helper fails every readable PR-head lease" "workflow step exited 0"
+elif ! grep -Fq 'Installed feedback-fingerprint helper is missing or not executable' "$dir/out"; then
+  fail "scheduled missing helper fails every readable PR-head lease" "infrastructure error missing"
+elif grep -Fq '::warning::' "$dir/out"; then
+  fail "scheduled missing helper fails every readable PR-head lease" "bootstrap warning was emitted"
+elif ! grep -Fxq 'open 1 lease-1' "$dir/mutations.log" \
+  || ! grep -Fxq 'close lease-1 failure' "$dir/mutations.log" \
+  || ! grep -Fxq 'open 2 lease-2' "$dir/mutations.log" \
+  || ! grep -Fxq 'close lease-2 failure' "$dir/mutations.log"; then
+  fail "scheduled missing helper fails every readable PR-head lease" "not every exact PR-head lease was failed"
+elif [ -e "$dir/gate.log" ] || [ -s "$dir/fingerprint.log" ]; then
+  fail "scheduled missing helper fails every readable PR-head lease" "evaluation ran without the helper"
+else
+  pass "scheduled missing helper fails every readable PR-head lease"
+fi
 
 assert_failure_then_second_pr() {
   local name="$1" dir="$2" expected_first="$3"
