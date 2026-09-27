@@ -143,6 +143,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_ACTION: ${{ github.event.action }}
         run: |
           NEEDS_REVIEW=false
           REASONS=""
@@ -465,6 +466,7 @@ jobs:
           TRUSTED_HELPER_DIR="$TRUSTED_HELPER_TREE/scripts/workflow"
           FINGERPRINT_HELPER="$TRUSTED_HELPER_DIR/external_review_fingerprint.sh"
           CARRY_HELPER="$TRUSTED_HELPER_DIR/external_review_carryforward.sh"
+          CLEARANCE_HELPER="$TRUSTED_HELPER_TREE/scripts/codex-review-check.sh"
 
           set +e
           FINGERPRINT_JSON=$(bash "$FINGERPRINT_HELPER" \
@@ -492,6 +494,43 @@ jobs:
             echo "classification=external-required" >> "$GITHUB_OUTPUT"
           fi
 
+          # A label delivery can arrive after Phase 4 already
+          # cleared this exact head. Ask the canonical merge predicate rather
+          # than reimplementing Codex / Phase 4b authority here. Its normal
+          # mode retains reviewer identity, no-self-approval, latest-signal,
+          # blocking-label, and current-head rules; only CI is skipped because
+          # this required workflow would otherwise wait on itself.
+          #
+          # The governing config came from the event base. Bracket the helper
+          # with live head+base reads so a push or retarget cannot turn that
+          # event policy into a clearance claim about a different PR state.
+          read_live_pair() {
+            local pair
+            if ! pair=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" \
+              --jq '{head:.head.sha,base:.base.sha}'); then
+              return 1
+            fi
+            if ! jq -e '
+                select((.head | type) == "string" and (.head | test("^[0-9a-fA-F]{40}$")))
+                | select((.base | type) == "string" and (.base | test("^[0-9a-fA-F]{40}$")))
+              ' <<<"$pair" >/dev/null; then
+              return 1
+            fi
+            printf '%s\n' "$pair"
+          }
+          publish_stale_event() {
+            echo "External-review classification event no longer matches the live PR head/base; skipping stale result."
+            echo "classification=stale-event" >> "$GITHUB_OUTPUT"
+            echo "needs_review=false" >> "$GITHUB_OUTPUT"
+            echo "reasons=" >> "$GITHUB_OUTPUT"
+          }
+          publish_clearance_failure() {
+            echo "External-review clearance lookup failed closed: $1"
+            echo "classification=fail-closed" >> "$GITHUB_OUTPUT"
+            echo "needs_review=true" >> "$GITHUB_OUTPUT"
+            echo "reasons=- External-review clearance lookup failed; requiring review fail-closed" >> "$GITHUB_OUTPUT"
+          }
+
           if [ "$NEEDS_REVIEW" = "true" ] && [ -n "$FINGERPRINT" ] && [ -x "$CARRY_HELPER" ]; then
             set +e
             CARRY_JSON=$(bash "$CARRY_HELPER" \
@@ -514,8 +553,58 @@ jobs:
             elif [ "$carry_rc" -ne 0 ]; then
               echo "External-review carry-forward failed (rc=$carry_rc); requiring current-head review fail-closed."
               echo "classification=fail-closed" >> "$GITHUB_OUTPUT"
-              NEEDS_REVIEW=true
-              REASONS="- External-review carry-forward lookup failed (rc=$carry_rc); requiring review fail-closed"
+              echo "needs_review=true" >> "$GITHUB_OUTPUT"
+              echo "reasons=- External-review carry-forward lookup failed (rc=$carry_rc); requiring review fail-closed" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # Preserve the distinct carried-forward classification above so it
+          # remains eligible for #1321 reconciliation alongside under-threshold.
+          # A later canonical gate clearance suppresses application but grants
+          # no additional label-removal authority.
+          if [ "$NEEDS_REVIEW" = "true" ] \
+             && { [ "$EVENT_ACTION" = labeled ] || [ "$EVENT_ACTION" = unlabeled ]; }; then
+            if [ ! -x "$CLEARANCE_HELPER" ]; then
+              publish_clearance_failure "trusted canonical helper is unavailable"
+              exit 0
+            fi
+            if ! LIVE_PAIR_BEFORE=$(read_live_pair); then
+              publish_clearance_failure "could not read a valid live PR head/base pair"
+              exit 0
+            fi
+            if [ "$(jq -r '.head' <<<"$LIVE_PAIR_BEFORE")" != "$HEAD_SHA" ] \
+               || [ "$(jq -r '.base' <<<"$LIVE_PAIR_BEFORE")" != "$BASE_SHA" ]; then
+              publish_stale_event
+              exit 0
+            fi
+
+            set +e
+            CODEX_REVIEW_CHECK_SKIP_CI=1 \
+              CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+              MERGEPATH_REVIEW_POLICY_PATH="$TRUSTED_CONFIG" \
+              bash "$CLEARANCE_HELPER" "$PR_NUMBER" "${{ github.repository }}"
+            clearance_rc=$?
+            set -e
+
+            if [ "$clearance_rc" -eq 0 ]; then
+              if ! LIVE_PAIR_AFTER=$(read_live_pair); then
+                publish_clearance_failure "could not re-read a valid live PR head/base pair"
+                exit 0
+              fi
+              if [ "$(jq -r '.head' <<<"$LIVE_PAIR_AFTER")" != "$HEAD_SHA" ] \
+                 || [ "$(jq -r '.base' <<<"$LIVE_PAIR_AFTER")" != "$BASE_SHA" ]; then
+                publish_stale_event
+                exit 0
+              fi
+              echo "External review is already cleared by the canonical current-head gate; suppressing label application."
+              echo "classification=external-cleared" >> "$GITHUB_OUTPUT"
+              echo "needs_review=false" >> "$GITHUB_OUTPUT"
+              echo "reasons=" >> "$GITHUB_OUTPUT"
+              exit 0
+            elif [ "$clearance_rc" -ne 1 ]; then
+              publish_clearance_failure "canonical helper exited $clearance_rc"
+              exit 0
             fi
           fi
 
@@ -537,6 +626,7 @@ jobs:
           REASONS: ${{ steps.check.outputs.reasons }}
           CLASSIFICATION: ${{ steps.check.outputs.classification }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           # Check if label already applied to avoid duplicate comments
           EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
@@ -545,22 +635,28 @@ jobs:
             exit 0
           fi
 
-          # #1254: label-event runs can outlive the event head. Fence the write
-          # against the live PR immediately before applying the label, skipping
-          # classifications whose event head has already moved. An unreadable or
-          # malformed head fails this job (and therefore Label Gate) closed;
-          # a confirmed moved head is a successful stale-run no-op.
-          if ! LIVE_HEAD=$(gh api \
-            "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.head.sha'); then
-            echo "::error::Could not read the live PR head before applying needs-external-review." >&2
+          # #1254: label-event runs can outlive the event head or base. Fence
+          # the write against both live identities immediately before applying
+          # the label. An unreadable or malformed pair fails this job (and
+          # therefore Label Gate) closed; a confirmed move/retarget is a
+          # successful stale-run no-op.
+          if ! LIVE_PAIR=$(gh api \
+            "repos/${{ github.repository }}/pulls/$PR_NUMBER" \
+            --jq '{head:.head.sha,base:.base.sha}'); then
+            echo "::error::Could not read the live PR head/base before applying needs-external-review." >&2
             exit 1
           fi
-          if ! printf '%s\n' "$LIVE_HEAD" | grep -Eq '^[0-9a-fA-F]{40}$'; then
-            echo "::error::Live PR head is malformed; refusing to apply needs-external-review." >&2
+          if ! jq -e '
+              select((.head | type) == "string" and (.head | test("^[0-9a-fA-F]{40}$")))
+              | select((.base | type) == "string" and (.base | test("^[0-9a-fA-F]{40}$")))
+            ' <<<"$LIVE_PAIR" >/dev/null; then
+            echo "::error::Live PR head/base is malformed; refusing to apply needs-external-review." >&2
             exit 1
           fi
-          if [ "$LIVE_HEAD" != "$HEAD_SHA" ]; then
-            echo "PR head moved from $HEAD_SHA to $LIVE_HEAD; skipping stale needs-external-review application."
+          LIVE_HEAD=$(jq -r '.head' <<<"$LIVE_PAIR")
+          LIVE_BASE=$(jq -r '.base' <<<"$LIVE_PAIR")
+          if [ "$LIVE_HEAD" != "$HEAD_SHA" ] || [ "$LIVE_BASE" != "$BASE_SHA" ]; then
+            echo "PR head/base moved from $HEAD_SHA/$BASE_SHA to $LIVE_HEAD/$LIVE_BASE; skipping stale needs-external-review application."
             exit 0
           fi
 
@@ -596,6 +692,7 @@ jobs:
           LABEL_REMOVAL_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -626,11 +723,13 @@ jobs:
             gh api "repos/$REPO/pulls/$PR_NUMBER" >"$raw" 2>"$err" || rc=$?
             if [ "$rc" -ne 0 ] \
                || ! jq -e '
-                    select((.head.sha | type) == "string" and (.head.sha | length) == 40)
+                    select((.head.sha | type) == "string" and (.head.sha | test("^[0-9a-fA-F]{40}$")))
+                    | select((.base.sha | type) == "string" and (.base.sha | test("^[0-9a-fA-F]{40}$")))
                     | select((.labels | type) == "array")
-                    | {head_sha:.head.sha, labels:[.labels[] | select((.name | type) == "string") | .name]}
+                    | {head_sha:.head.sha, base_sha:.base.sha,
+                       labels:[.labels[] | select((.name | type) == "string") | .name]}
                   ' "$raw" >"$output"; then
-              echo "::warning::Could not read current PR head and labels; preserving needs-external-review." >&2
+              echo "::warning::Could not read current PR head, base, and labels; preserving needs-external-review." >&2
               cat "$err" >&2 || true
               rm -f "$raw" "$err"
               return 1
@@ -648,8 +747,9 @@ jobs:
             exit 0
           fi
           LIVE_HEAD=$(jq -r '.head_sha' "$LIVE")
-          if [ "$LIVE_HEAD" != "$EXPECTED_HEAD_SHA" ]; then
-            echo "::warning::PR head moved from $EXPECTED_HEAD_SHA to $LIVE_HEAD during classification; preserving needs-external-review." >&2
+          LIVE_BASE=$(jq -r '.base_sha' "$LIVE")
+          if [ "$LIVE_HEAD" != "$EXPECTED_HEAD_SHA" ] || [ "$LIVE_BASE" != "$EXPECTED_BASE_SHA" ]; then
+            echo "::warning::PR head/base moved from $EXPECTED_HEAD_SHA/$EXPECTED_BASE_SHA to $LIVE_HEAD/$LIVE_BASE during classification; preserving needs-external-review." >&2
             exit 0
           fi
           if ! jq -e '.labels | index("needs-external-review") != null' "$LIVE" >/dev/null; then
@@ -718,7 +818,7 @@ jobs:
           fi
           # Close the read/delete race as far as the API permits: repeat both
           # mutable facts immediately before deletion. A human re-application,
-          # an unlinking event, a head move, or any read failure holds the label.
+          # an unlinking event, a head/base move, or any read failure holds the label.
           if ! fetch_array "repos/$REPO/issues/$PR_NUMBER/timeline" "$TIMELINE"; then
             exit 0
           fi
@@ -735,8 +835,9 @@ jobs:
              || [ "$(jq -r '.event // ""' <<<"$LATEST_AGAIN")" != labeled ] \
              || [ "$(jq -r '.actor.login // ""' <<<"$LATEST_AGAIN")" != 'github-actions[bot]' ] \
              || [ "$(jq -r '.head_sha' "$LIVE")" != "$EXPECTED_HEAD_SHA" ] \
+             || [ "$(jq -r '.base_sha' "$LIVE")" != "$EXPECTED_BASE_SHA" ] \
              || ! jq -e '.labels | index("needs-external-review") != null' "$LIVE" >/dev/null; then
-            echo "::warning::PR head, label, or ownership changed during reconciliation; preserving needs-external-review." >&2
+            echo "::warning::PR head, base, label, or ownership changed during reconciliation; preserving needs-external-review." >&2
             exit 0
           fi
           if [ -z "$LABEL_REMOVAL_TOKEN" ]; then
