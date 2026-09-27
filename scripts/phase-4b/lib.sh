@@ -573,7 +573,7 @@ p4b_codex_request_budget_state() {
     || { jq -nc '{state:"unreadable",reason:"pr-policy-tuple-read-failed"}'; return 2; }
   if [ "$(printf '%s' "$initial_tuple" | jq -r .head_sha)" != "$head" ]; then
     jq -nc --arg h "$head" --argjson observed "$initial_tuple" \
-      '{state:"drift",reason:"head-moved",reviewed_head:$h,observed:$observed}'
+      '{state:"drift",reason:"head-moved",reviewed_head:$h,live_head:$observed.head_sha,observed:$observed}'
     return 2
   fi
   base_ref=$(printf '%s' "$initial_tuple" | jq -r .base_ref)
@@ -591,7 +591,7 @@ p4b_codex_request_budget_state() {
     || { jq -nc '{state:"unreadable",reason:"pr-policy-tuple-reread-failed"}'; return 2; }
   if [ "$final_tuple" != "$initial_tuple" ]; then
     jq -nc --argjson before "$initial_tuple" --argjson after "$final_tuple" \
-      '{state:"drift",reason:"pr-policy-tuple-changed",before:$before,after:$after}'
+      '{state:"drift",reason:"pr-policy-tuple-changed",live_head:$after.head_sha,before:$before,after:$after}'
     return 2
   fi
   if [ "$count" -lt "$cap" ]; then
@@ -620,7 +620,7 @@ p4b_codex_request_budget_state() {
     || { jq -nc '{state:"unreadable",reason:"pr-policy-tuple-reread-failed"}'; return 2; }
   if [ "$final_tuple" != "$initial_tuple" ]; then
     jq -nc --argjson before "$initial_tuple" --argjson after "$final_tuple" \
-      '{state:"drift",reason:"pr-policy-tuple-changed",before:$before,after:$after}'
+      '{state:"drift",reason:"pr-policy-tuple-changed",live_head:$after.head_sha,before:$before,after:$after}'
     return 2
   fi
   if [ "$selected" != null ]; then
@@ -1758,7 +1758,11 @@ p4b_same_head_barrier() {
               budget_unsafe=true
               cx_evidence="$cx_budget_state"
               if [ "$cx_budget_state" = drift ]; then
-                why="PR head moved during request-cap evaluation (reviewing $head, live $(printf '%s' "$cx_budget_json" | jq -r '.live_head // "unknown"')) — rerun on the new head"
+                if [ "$(printf '%s' "$cx_budget_json" | jq -r '.reason // empty')" = pr-policy-tuple-changed ]; then
+                  why="PR base policy source changed during request-cap evaluation — rerun with the stabilized target-base policy"
+                else
+                  why="PR head moved during request-cap evaluation (reviewing $head, live $(printf '%s' "$cx_budget_json" | jq -r '.live_head // "unknown"')) — rerun on the new head"
+                fi
               else
                 why="Codex request-cap evidence is unreadable; refusing to infer an available request or a human-tiebreaker stop"
               fi

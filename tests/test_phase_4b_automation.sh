@@ -4167,6 +4167,7 @@ out="$(
   p4b_codex_request_budget_state owner/repo 7 "$_p4a_head"
 )" && rc=0 || rc=$?
 [ "$rc" = 2 ] && [ "$(printf '%s' "$out" | jq -r .state)" = drift ] \
+  && [ "$(printf '%s' "$out" | jq -r .live_head)" = "$_p4a_old" ] \
   || bad="$bad available-budget-skipped-head-fence"
 
 # Governing policy authority is bound to the same stable PR tuple as the head.
@@ -4175,6 +4176,7 @@ _base_race="$WORK/cap-base-race.count"
 rm -f "$_base_race"
 out="$(P4B_TEST_BASE_RACE_FILE="$_base_race" P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+  && printf '%s' "$out" | jq -e '.reason | contains("base policy source changed")' >/dev/null 2>&1 \
   || bad="$bad governing-base-race-not-fail-closed"
 
 # A diagnostic report about a newly moved live head cannot open the NEW
