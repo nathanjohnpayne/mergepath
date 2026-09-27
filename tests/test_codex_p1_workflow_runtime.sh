@@ -212,6 +212,9 @@ fi
 if [ "${FP_MODE:-stable}" = post-fail-1 ] && [ "$pr" = 1 ] && [ "$count" -eq 2 ]; then
   exit 1
 fi
+if [ "${FP_MODE:-stable}" = publish-fail-1 ] && [ "$pr" = 1 ] && [ "$count" -eq 3 ]; then
+  exit 1
+fi
 echo "fp-$pr"
 SH
   chmod +x "$dir/scripts/review-feedback-surface-fingerprint.sh"
@@ -340,6 +343,12 @@ make_sweep_fixture "$dir"
 assert_failure_then_second_pr \
   "failed post-evaluation fingerprint closes its exact lease and continues" \
   "$dir" failure post-fail-1
+
+dir="$TMP/sweep-publication-fingerprint-failure"
+make_sweep_fixture "$dir"
+assert_failure_then_second_pr \
+  "failed publication-time fingerprint closes its exact lease and continues" \
+  "$dir" failure publish-fail-1
 
 dir="$TMP/sweep-head-moved"
 make_sweep_fixture "$dir"
