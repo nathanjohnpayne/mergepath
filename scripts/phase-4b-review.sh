@@ -594,8 +594,8 @@ BARRIER_CODERABBIT_CARRIED=""
 # manual handoff; only the non-terminal case takes the new hold path.
 P4B_PRE_ADAPTER_CODEX_EVIDENCE=""
 run_same_head_barrier() {
-  local where="$1" out rc=0
-  out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN")" || rc=$?
+  local where="$1" scope="${2:-all}" out rc=0
+  out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN" "$scope")" || rc=$?
   case "$rc" in
     0)
       if [ "$where" = "pre-adapter" ]; then
@@ -808,6 +808,12 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 if [ ! -x "$ADAPTER_SCRIPT" ]; then
+  # No adapter is an infrastructure fallback, never authority to bypass the
+  # governing Codex cap. This mode makes no provider-triggering writes and
+  # leaves below-cap fallback behavior unchanged. Offline dry runs stay offline.
+  if [ "$DRY_RUN" != true ]; then
+    run_same_head_barrier "pre-fallback" cap-only
+  fi
   fall_back_to_manual "no adapter for reviewer '$REVIEWER' (expected $ADAPTER_SCRIPT)"
 fi
 

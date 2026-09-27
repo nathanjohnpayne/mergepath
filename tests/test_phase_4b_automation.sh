@@ -4137,6 +4137,20 @@ out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/does-not-exist" P4B_TEST_COMMENTS_FAIL=t
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_current" P4B_TEST_LIVE_HEAD="$_p4a_head" _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = timeout ] || bad="$bad old-timeout-contract"
 
+# A case-insensitive final request supersedes an earlier lowercase timeout,
+# whether the final request remains eligible to poll or has expired.
+_cap_superseded=$(printf '%s' "$_current" | jq -c --arg now "$_cap_now" \
+  '. + [{id:9901,user:{login:"nathanjohnpayne"},body:"@CODEX REVIEW",created_at:$now}]')
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_superseded" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 1 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = request-cap-final-pending ] || bad="$bad uppercase-final-timeout-bypass"
+_cap_superseded=$(printf '%s' "$_cap_superseded" | jq -c '.[-1].created_at="2026-08-30T00:16:00Z"')
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_superseded" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = human-tiebreaker ] || bad="$bad expired-uppercase-timeout-bypass"
+out="$(crqe_select_trigger() { return 9; }; P4B_TEST_COMMENTS_JSON="$_current" _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] || bad="$bad timeout-selector-error-not-fail-closed"
+
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/does-not-exist" P4B_TEST_COMMENTS_JSON='[]' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] || bad="$bad unreadable-not-fail-closed"
 out="$(crqe_select_trigger() { return 9; }; P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
@@ -4757,6 +4771,56 @@ else
   fail "#1305: final-request exhaustion stop wrong (rc=$rc handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
 fi
 
+# Missing/non-executable adapters cannot skip cap authority checks, but the
+# fallback check must not probe or spend CodeRabbit allowance. Below the cap
+# the existing manual infrastructure fallback remains available.
+cat >"$WORK/cap-fallback-cr.sh" <<'EOF'
+#!/usr/bin/env bash
+echo invoked >>"$P4B_TEST_CR_PROBE_LOG"
+exit 3
+EOF
+chmod +x "$WORK/cap-fallback-cr.sh"
+mkdir -p "$WORK/cap-no-adapter" "$WORK/cap-nonexec-adapter"
+printf '#!/usr/bin/env bash\nexit 99\n' >"$WORK/cap-nonexec-adapter/review-via-codex.sh"
+chmod 644 "$WORK/cap-nonexec-adapter/review-via-codex.sh"
+for _case in exhausted pending expired available; do
+  _cfg="$WORK/cap-fallback-$_case.yml"
+  _comments='[]'
+  _adapter_dir="$WORK/cap-no-adapter"
+  case "$_case" in
+    exhausted) cp "$WORK/policy-cap-stop.yml" "$_cfg"; _expected=8 ;;
+    pending)
+      sed 's/max_wait_seconds: 0/max_wait_seconds: 100/' "$WORK/policy-cap-final-wait.yml" >"$_cfg"
+      _comments="$_cap_final"; _expected=6
+      _adapter_dir="$WORK/cap-nonexec-adapter"
+      ;;
+    expired) cp "$WORK/policy-cap-final-wait.yml" "$_cfg"; _comments="$_cap_final"; _expected=8 ;;
+    available) sed 's/max_review_rounds: 0/max_review_rounds: 3/' "$WORK/policy-cap-stop.yml" >"$_cfg"; _expected=4 ;;
+  esac
+  sed 's/enabled: false/enabled: true/' "$_cfg" >"$_cfg.cr"
+  : >"$HANDOFF_LOG"
+  : >"$WORK/cap-fallback-cr.log"
+  rm -rf "$WORK/barrier-state/phase-4b-barrier"
+  set +e
+  out="$(MERGEPATH_REVIEW_POLICY_PATH="$_cfg.cr" P4B_ADAPTER_DIR="$_adapter_dir" \
+    P4B_TEST_COMMENTS_JSON="$_comments" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+    P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+    P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" \
+    P4B_CODERABBIT_WAIT="$WORK/cap-fallback-cr.sh" P4B_TEST_CR_PROBE_LOG="$WORK/cap-fallback-cr.log" \
+    P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+    P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
+    PATH="$WORK/barrier-bin:$PATH" \
+    bash "$ORCH" 7 --repo owner/repo --author claude --reviewer nathanpayne-codex --head "$_p4a_head" --diff-file "$DIFF" 2>"$WORK/cap-fallback-stderr.log")"; rc=$?
+  set -e
+  if [ "$rc" = "$_expected" ] && [ ! -s "$WORK/cap-fallback-cr.log" ] \
+     && { { [ "$_case" = available ] && [ -s "$HANDOFF_LOG" ]; } \
+          || { [ "$_case" != available ] && [ ! -s "$HANDOFF_LOG" ]; }; }; then
+    pass "#1305: unavailable adapter preserves $_case cap routing without CodeRabbit calls"
+  else
+    fail "#1305: unavailable adapter $_case (rc=$rc expected=$_expected): $out $(cat "$WORK/cap-fallback-stderr.log")"
+  fi
+done
+
 # A pre-side-effect hold must leave NO accounting trace. Evaluate the full
 # barrier once before the adapter, then revalidate only a timeout-derived Codex
 # waiver immediately afterward. A second targeted recheck belongs immediately
@@ -4775,6 +4839,8 @@ n_eval="$(grep -c 'p4b_same_head_barrier ' "$ORCH" || true)"
 n_call="$(grep -c 'run_same_head_barrier "' "$ORCH" || true)"
 _n_timeout_recheck="$(grep -c '^  revalidate_phase4a_timeout_generation ' "$ORCH" || true)"
 _full_barrier_line="$(grep -n 'run_same_head_barrier "pre-adapter"' "$ORCH" | cut -d: -f1)"
+_cap_guard_line="$(grep -n 'run_same_head_barrier "pre-fallback" cap-only' "$ORCH" | cut -d: -f1)"
+_missing_adapter_line="$(grep -n 'fall_back_to_manual "no adapter for reviewer' "$ORCH" | cut -d: -f1)"
 _adapter_line="$(grep -n 'VERDICT_JSON="$(p4b_run_with_timeout ' "$ORCH" | cut -d: -f1)"
 _validate_line="$(grep -n '^if ! p4b_validate_verdict ' "$ORCH" | cut -d: -f1)"
 _post_adapter_line="$(grep -n '^  revalidate_phase4a_timeout_generation post-adapter$' "$ORCH" | cut -d: -f1)"
@@ -4783,7 +4849,8 @@ _first_loop_line="$(grep -n '^[[:space:]]*if p4b_acct_hook_record_loop ' "$ORCH"
 _pre_post_line="$(grep -n '^  revalidate_phase4a_timeout_generation pre-post$' "$ORCH" | cut -d: -f1)"
 _live_head_line="$(grep -n '^  live_head="$(gh_api_scalar --shape sha "live PR head for ' "$ORCH" | tail -1 | cut -d: -f1)"
 _payload_line="$(grep -n '^  payload_file="$(mktemp ' "$ORCH" | cut -d: -f1)"
-if [ "$n_eval" = "1" ] && [ "$n_call" = "1" ] && [ "$_n_timeout_recheck" = "2" ] \
+if [ "$n_eval" = "1" ] && [ "$n_call" = "2" ] && [ "$_n_timeout_recheck" = "2" ] \
+   && [ "$_cap_guard_line" -lt "$_missing_adapter_line" ] \
    && [ "$_full_barrier_line" -lt "$_adapter_line" ] \
    && [ "$_validate_line" -lt "$_post_adapter_line" ] \
    && [ "$_post_adapter_line" -lt "$_issue_line" ] \

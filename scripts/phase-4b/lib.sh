@@ -455,7 +455,7 @@ p4b_barrier_class_codex() {
 # this point must not let H's timeout waive H2 (including when CodeRabbit is
 # disabled and cannot independently expose the drift).
 p4b_codex_timeout_determination() {
-  local repo="$1" pr="$2" head="$3" comments state class live_head="" author
+  local repo="$1" pr="$2" head="$3" comments state class live_head="" author selected
   if [ "$P4B_CODEX_TERMINAL_MARKERS_OK" != true ] \
      || ! command -v codex_phase4a_timeout_marker_state >/dev/null 2>&1; then
     jq -nc '{state:"unreadable",reason:"terminal-marker-helper-unavailable"}'
@@ -491,6 +491,21 @@ p4b_codex_timeout_determination() {
   class="$(printf '%s' "$state" | jq -r '.state // "malformed"' 2>/dev/null || printf malformed)"
   case "$class" in
     current)
+      # The timeout grammar recognizes lowercase commands; the requester
+      # also accepts case variants. A newer selected command retracts this
+      # timeout regardless of whether its own freshness window has expired.
+      if [ "$P4B_CODEX_REQUEST_BUDGET_OK" != true ] \
+         || ! selected=$(crqe_select_trigger "$comments" "$author" "") \
+         || ! printf '%s' "$selected" | jq -e \
+           'type == "object" and (.id | type == "number" and . > 0 and floor == .)' >/dev/null 2>&1; then
+        jq -nc '{state:"unreadable",reason:"latest-request-selector-failed"}'
+        return 2
+      fi
+      if ! printf '%s' "$state" | jq -e --argjson trigger "$selected" \
+        '.trigger_comment_id == $trigger.id' >/dev/null 2>&1; then
+        printf '%s' "$state" | jq -c '. + {state:"superseded"}'
+        return 1
+      fi
       live_head="$(gh_api_scalar --shape sha "Phase 4a timeout live PR head" \
         "repos/$repo/pulls/$pr" --jq '.head.sha')" \
         || { jq -nc '{state:"unreadable",reason:"head-read-failed"}'; return 2; }
@@ -1538,6 +1553,10 @@ p4b_barrier_maybe_resume() {
 # simply not consulted — that, and not any rc, is the only route to
 # will-not-report, and it cannot flip mid-flight on a live PR.
 p4b_same_head_barrier() {
+  # cap-only is the read-only GitHub guard for an unavailable adapter: it
+  # shares the Codex decision and local final-request wait bound, but never
+  # probes or triggers CodeRabbit and never holds an available request budget.
+  local scope="${6:-all}"
   local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
   local root cr_bin cx_bin rc json probe_head cx_timeout_json="" cx_timeout_rc=0
   local cx_budget_json="" cx_budget_rc=0 cx_budget_state=""
@@ -1609,6 +1628,10 @@ p4b_same_head_barrier() {
             ;;
           *)
             cls_cx="escalate"
+            if [ "$(printf '%s' "$cx_timeout_json" | jq -r '.reason // empty')" = latest-request-selector-failed ]; then
+              budget_unsafe=true
+              cx_budget_json="$cx_timeout_json"
+            fi
             case "$cx_evidence" in
               drift)
                 why="PR head moved during evaluation (reviewing $head, live $(printf '%s' "$cx_timeout_json" | jq -r '.live_head // "unknown"')) — rerun on the new head"
@@ -1652,7 +1675,7 @@ p4b_same_head_barrier() {
   # CodeRabbit arm: probe (read-only, zero allowance) -> conditional trigger
   # -> bounded retry. The probe resolves the live head itself, so classifying
   # against "$head" is also what catches a push landing mid-run.
-  if [ -z "$why" ] && [ "$(p4b_policy_block_field coderabbit enabled)" != "false" ]; then
+  if [ "$scope" = all ] && [ -z "$why" ] && [ "$(p4b_policy_block_field coderabbit enabled)" != "false" ]; then
     rc=0
     json="$("$cr_bin" --probe "$pr" "$repo" 2>/dev/null)" || rc=$?
     # Head drift, detected BEFORE any trigger (Codex P2 on #842). The probe
@@ -1779,6 +1802,9 @@ p4b_same_head_barrier() {
     fi
   fi
 
+  if [ "$scope" = cap-only ] && [ "$cap_exhausted" != true ]; then
+    pending=false
+  fi
   if [ -z "$why" ] && [ "$pending" = true ]; then
     # Bounded: the marker records when THIS checkout began waiting on this
     # head. It asserts no provider event, so no clock value can turn a not-yet
