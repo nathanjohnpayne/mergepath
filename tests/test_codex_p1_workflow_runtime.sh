@@ -107,17 +107,48 @@ else
   pass "event first delivery without a helper reference warns and evaluates"
 fi
 
-# An absent trusted workflow is a read failure, not evidence of first delivery.
+# GitHub can execute the PR's first copy of this workflow while the trusted
+# default-branch checkout still predates both workflow and helper.
+dir="$TMP/event-workflow-absent"
+make_common_fixture "$dir"
+if ! run_event "$dir"; then
+  fail "event first delivery with an absent default-branch workflow warns and evaluates" "workflow step failed"
+elif ! grep -Fq '::warning::Feedback-fingerprint helper is not installed' "$dir/out"; then
+  fail "event first delivery with an absent default-branch workflow warns and evaluates" "warning missing"
+elif ! grep -Fxq 'gate 41' "$dir/gate.log"; then
+  fail "event first delivery with an absent default-branch workflow warns and evaluates" "gate did not run"
+else
+  pass "event first delivery with an absent default-branch workflow warns and evaluates"
+fi
+
+# An existing path that cannot be searched is an I/O failure, not evidence of
+# first delivery. A directory produces grep rc=2 even under a privileged UID.
 dir="$TMP/event-workflow-read-failure"
 make_common_fixture "$dir"
+mkdir "$dir/.github/workflows/codex-p1-gate.yml"
 if run_event "$dir"; then
-  fail "event bootstrap fails closed when the trusted workflow cannot be read" "workflow step exited 0"
+  fail "event bootstrap fails closed when the existing workflow cannot be searched" "workflow step exited 0"
 elif ! grep -Fq 'Could not read the trusted Codex P1 workflow' "$dir/out"; then
-  fail "event bootstrap fails closed when the trusted workflow cannot be read" "read error missing"
+  fail "event bootstrap fails closed when the existing workflow cannot be searched" "read error missing"
 elif [ -e "$dir/gate.log" ]; then
-  fail "event bootstrap fails closed when the trusted workflow cannot be read" "gate ran after read failure"
+  fail "event bootstrap fails closed when the existing workflow cannot be searched" "gate ran after read failure"
 else
-  pass "event bootstrap fails closed when the trusted workflow cannot be read"
+  pass "event bootstrap fails closed when the existing workflow cannot be searched"
+fi
+
+# A dangling link is an existing installation fault and must not masquerade as
+# positive absence merely because its target fails the ordinary -e predicate.
+dir="$TMP/event-workflow-dangling-link"
+make_common_fixture "$dir"
+ln -s missing-target "$dir/.github/workflows/codex-p1-gate.yml"
+if run_event "$dir"; then
+  fail "event bootstrap fails closed on a dangling trusted-workflow link" "workflow step exited 0"
+elif ! grep -Fq 'Could not read the trusted Codex P1 workflow' "$dir/out"; then
+  fail "event bootstrap fails closed on a dangling trusted-workflow link" "read error missing"
+elif [ -e "$dir/gate.log" ]; then
+  fail "event bootstrap fails closed on a dangling trusted-workflow link" "gate ran after read failure"
+else
+  pass "event bootstrap fails closed on a dangling trusted-workflow link"
 fi
 
 # With the helper installed, both reads fence the actual gate evaluation.

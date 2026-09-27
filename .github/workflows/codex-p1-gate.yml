@@ -599,7 +599,13 @@ jobs:
             # a broken installation. A default branch whose workflow does not
             # yet reference the helper is in the one valid bootstrap window;
             # once it does, a missing helper is an infrastructure failure.
-            if [ ! -r .github/workflows/codex-p1-gate.yml ]; then
+            if [ ! -e .github/workflows/codex-p1-gate.yml ] \
+              && [ ! -L .github/workflows/codex-p1-gate.yml ]; then
+              # GitHub can execute the PR's first delivery of this workflow
+              # while this trusted checkout still points at the older default
+              # branch, where neither the workflow nor helper exists yet.
+              :
+            elif [ ! -r .github/workflows/codex-p1-gate.yml ]; then
               echo "::error::Could not read the trusted Codex P1 workflow to determine fingerprint-helper bootstrap state"
               exit 1
             elif grep -Fq 'scripts/review-feedback-surface-fingerprint.sh' \

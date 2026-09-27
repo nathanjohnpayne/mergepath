@@ -268,7 +268,9 @@ if gate.is_a?(Hash)
   require_shape.call(!gate_run.nil?, "codex-p1-gate has no gate publisher step")
   if gate_run
     require_shape.call(
-      gate_run.include?("if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]") &&
+        gate_run.include?("if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]") &&
+        gate_run.include?("[ ! -e .github/workflows/codex-p1-gate.yml ]") &&
+        gate_run.include?("[ ! -L .github/workflows/codex-p1-gate.yml ]") &&
         gate_run.include?(".github/workflows/codex-p1-gate.yml") &&
         !gate_run.include?(".mergepath-sync.yml") && gate_run.include?("::error::") &&
         gate_run.include?("Could not read the trusted Codex P1 workflow to determine fingerprint-helper bootstrap state") &&
