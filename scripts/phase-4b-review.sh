@@ -16,7 +16,8 @@
 # Usage:
 #   scripts/phase-4b-review.sh <PR#> [--repo owner/repo]
 #       [--reviewer nathanpayne-<agent>] [--author <agent>]
-#       [--head <sha>] [--diff-file <path>] [--dry-run] [--force-enabled]
+#       [--head <sha>] [--expected-base-sha <sha>] [--diff-file <path>]
+#       [--dry-run] [--force-enabled]
 #
 # Overrides (mostly for tests / non-git contexts):
 #   --author         PR's authoring agent (claude|codex|...). NOT an override
@@ -29,6 +30,12 @@
 #   --reviewer       force the external reviewer login (skips selection, but
 #                    still must differ from the authoring agent).
 #   --head           HEAD sha. Default: gh api pulls/<n> .head.sha.
+#   --expected-base-sha
+#                    Optional 40-hex base SHA fence for a caller that already
+#                    captured the PR's base with its head. When supplied, the
+#                    live head/base pair is read together before adapter work,
+#                    before post-review issue filing, and immediately before
+#                    the review POST. A moved or unreadable base fails closed.
 #   --diff-file      pre-fetched unified diff (skips `gh pr diff`).
 #   --dry-run        do everything EXCEPT post the review; print intended
 #                    action.
@@ -216,14 +223,14 @@ GH_AS_AUTHOR="${P4B_GH_AS_AUTHOR:-$ROOT/gh-as-author.sh}"
 ADAPTER_TIMEOUT_ENV="${P4B_ADAPTER_TIMEOUT_SECONDS:-}"
 ADAPTER_TIMEOUT=""
 
-PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; DIFF_FILE="" ; DRY_RUN=false
+PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false
 FORCE_ENABLED=false
 case "${P4B_FORCE_ENABLED:-}" in
   1|true|TRUE|True|yes|YES) FORCE_ENABLED=true ;;
 esac
 
 usage() {
-  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--diff-file <path>] [--dry-run] [--force-enabled]" >&2
+  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--dry-run] [--force-enabled]" >&2
   exit 3
 }
 
@@ -233,6 +240,9 @@ while [ $# -gt 0 ]; do
     --reviewer)      REVIEWER="${2:-}"; shift 2 ;;
     --author)        AUTHOR="${2:-}"; shift 2 ;;
     --head)          HEAD="${2:-}"; shift 2 ;;
+    --expected-base-sha)
+      [ $# -ge 2 ] || p4b_die 3 "--expected-base-sha requires exactly 40 hexadecimal characters"
+      EXPECTED_BASE_SHA_SET=true; EXPECTED_BASE_SHA="$2"; shift 2 ;;
     --diff-file)     DIFF_FILE="${2:-}"; shift 2 ;;
     --dry-run)       DRY_RUN=true; shift ;;
     --force-enabled) FORCE_ENABLED=true; shift ;;
@@ -246,6 +256,11 @@ done
 
 [ -n "$PR" ] || usage
 [[ "$PR" =~ ^[1-9][0-9]*$ ]] || p4b_die 3 "PR# must be a positive integer; got '$PR'"
+if [ "$EXPECTED_BASE_SHA_SET" = true ]; then
+  [[ "$EXPECTED_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] \
+    || p4b_die 3 "--expected-base-sha must be exactly 40 hexadecimal characters"
+  EXPECTED_BASE_SHA="$(printf '%s' "$EXPECTED_BASE_SHA" | tr '[:upper:]' '[:lower:]')"
+fi
 
 # --- automation entry decision ---------------------------------------------
 # #1046: --force-enabled / P4B_FORCE_ENABLED overrides ONLY `enabled`, so a
@@ -339,6 +354,36 @@ fi
 # --- resolve repo / head / author ------------------------------------------
 need_gh() { command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required for this path (or pass the matching override flag)"; }
 
+# Opt-in base fence for callers that captured an exact head/base pair (#1475).
+# Read both mutable refs in ONE PR response: separate head and base reads can
+# manufacture a pair that never existed together. The historic --head-only
+# path deliberately remains unchanged when this option is absent.
+P4B_BASE_FENCE_REASON=""
+revalidate_expected_base() {  # <stage>
+  local stage="$1" pair live_head live_base extra
+  P4B_BASE_FENCE_REASON=""
+  [ "$EXPECTED_BASE_SHA_SET" = true ] || return 0
+  pair="$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | join(" ")' 2>/dev/null)" || pair=""
+  IFS=' ' read -r live_head live_base extra <<EOF
+$pair
+EOF
+  if [ -z "$live_head" ] || [ -z "$live_base" ] || [ -n "$extra" ] \
+     || ! looks_like_sha "$live_base"; then
+    P4B_BASE_FENCE_REASON="could not read one coherent live PR head/base pair ($stage)"
+    return 1
+  fi
+  if [ "$live_head" != "$HEAD" ]; then
+    P4B_BASE_FENCE_REASON="PR head changed during review (reviewed $HEAD, live $live_head; checked $stage)"
+    return 1
+  fi
+  live_base="$(printf '%s' "$live_base" | tr '[:upper:]' '[:lower:]')"
+  if [ "$live_base" != "$EXPECTED_BASE_SHA" ]; then
+    P4B_BASE_FENCE_REASON="PR base changed during review (expected $EXPECTED_BASE_SHA, live $live_base; checked $stage)"
+    return 1
+  fi
+  return 0
+}
+
 if [ -z "$REPO" ]; then
   need_gh
   REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
@@ -354,6 +399,10 @@ if [ -z "$HEAD" ]; then
   HEAD="$(gh_api_scalar --shape sha "HEAD sha for $REPO#$PR" \
     "repos/$REPO/pulls/$PR" --jq '.head.sha')" || HEAD=""
   [ -n "$HEAD" ] || p4b_die 3 "could not resolve HEAD sha for $REPO#$PR; pass --head"
+fi
+
+if ! revalidate_expected_base initial; then
+  p4b_die 3 "$P4B_BASE_FENCE_REASON"
 fi
 
 # Authoring agent. The PR BODY is the record of authorship, and it is read and
@@ -1003,10 +1052,9 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     POST_REVIEW_ISSUE_REFS="(dry-run: $FILE_COUNT issue(s) would be filed)"
   else
     # Side-effect ordering (#674 Codex P2): re-read the live head BEFORE
-    # filing anything. post_review re-checks again at POST time, but by
-    # then the issues would already exist — a head that drifted during the
-    # adapter run must refuse here, with zero issues claiming an approval
-    # that will never post.
+    # filing anything. The optional base fence reads the pair coherently at
+    # the same authority boundary, so a same-head retarget during adapter
+    # work cannot file observations for an approval that must not post.
     # #799: this re-read exists to catch head drift, so an unreadable answer
     # must NOT compare unequal-and-therefore-drifted, nor equal-and-therefore-
     # safe. gh_api_scalar makes it empty, which is what the fall-back below
@@ -1017,6 +1065,9 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
       || fall_back_to_manual "could not re-read the live PR head before filing post-review issues"
     if [ "$live_head_pre" != "$HEAD" ]; then
       fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
+    fi
+    if ! revalidate_expected_base pre-issue-filing; then
+      fall_back_to_manual "$P4B_BASE_FENCE_REASON — refusing to file post-review issues for an approval that will not post"
     fi
     # Identity drift (#1143), hoisted ahead of the side effects for the same
     # reason the head re-read above is: filing issues under the author PAT,
@@ -1371,6 +1422,15 @@ post_review() {
       "The PR body's declared Authoring-Agent" \
       "the Authoring-Agent declared by ${REPO}#${PR}"
     fall_back_to_manual "$P4B_BODY_DRIFT_REASON"
+  fi
+  # Keep the coherent head/base pair as the LAST live read before constructing
+  # the authority payload. Body validation above also reads GitHub, so placing
+  # this fence earlier would leave a fresh base-drift window before POST.
+  # As with late head drift, remove this invocation's filed observations first.
+  if ! revalidate_expected_base pre-post; then
+    cleanup_pre_post_refusal_side_effects "$P4B_BASE_FENCE_REASON" true \
+      "The PR base" "the base of ${REPO}#${PR}"
+    fall_back_to_manual "$P4B_BASE_FENCE_REASON"
   fi
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \

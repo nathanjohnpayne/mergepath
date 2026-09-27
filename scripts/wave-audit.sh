@@ -290,6 +290,25 @@ if [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ]; then
   log "canary lane verified for PR head/base $pr_head/$pr_base"
 fi
 
+# Re-read the live pair at each authority boundary. The initial marker binds
+# the originally observed pair; a later pair is never adopted implicitly,
+# even if it has since acquired its own marker. This closes the intervals in
+# which a same-head base move could otherwise let a stale review dispatch or
+# receipt advance the wave. It is still a read-before-write fence, not an
+# atomic GitHub transaction. The override remains limited to hermetic tests.
+revalidate_canary_pair() { # revalidate_canary_pair <operation>
+  local operation="$1" live_pair live_head live_base
+  [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ] || return 0
+  live_pair="$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefOid --jq '[.headRefOid, .baseRefOid] | @tsv' 2>/dev/null)" \
+    || die 3 "could not re-read PR $REPO#$PR head/base before $operation"
+  live_head="$(printf '%s' "$live_pair" | cut -f1)"
+  live_base="$(printf '%s' "$live_pair" | cut -f2)"
+  [[ "$live_head" =~ ^[0-9a-fA-F]{40}$ ]] && [[ "$live_base" =~ ^[0-9a-fA-F]{40}$ ]] \
+    || die 3 "invalid PR head/base reading $REPO#$PR before $operation"
+  [ "$live_head" = "$pr_head" ] && [ "$live_base" = "$pr_base" ] \
+    || die 3 "canary $REPO#$PR moved from verified pair $pr_head/$pr_base to $live_head/$live_base before $operation — refusing stale authority"
+}
+
 # --- resolve the audit base (chaining watermark) ------------------------------
 BASE_WATERMARK_TAG=""
 if [ -z "$BASE" ]; then
@@ -474,6 +493,7 @@ if [ -n "$HISTORICAL_END" ]; then
     retained_json="$(git -C "$REPO_DIR" for-each-ref --format='%(contents)' "refs/tags/$retained_tag")"
     [ -n "$retained_json" ] || die 3 "historical end equals retained prefix but exact receipt $retained_tag is missing"
     if [ "$DRY_RUN" = false ]; then
+      revalidate_canary_pair "publishing retained prefix receipt"
       git -C "$REPO_DIR" push -q origin "refs/tags/$retained_tag" \
         || die 3 "prefix receipt $retained_tag remains local because retry push failed"
     fi
@@ -587,11 +607,13 @@ advance_watermark() {
   if git -C "$REPO_DIR" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
     log "watermark $tag already present locally — ensuring it is on origin"
   else
+    revalidate_canary_pair "writing wave watermark"
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
       git -C "$REPO_DIR" tag -a "$tag" \
         -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${REPORT_FILES} bytes=${REPORT_BYTES}" \
         "$HEAD_FULL"
   fi
+  revalidate_canary_pair "publishing wave watermark"
   git -C "$REPO_DIR" push -q origin "refs/tags/$tag" \
     || die 3 "watermark tag $tag exists locally but the push failed — push it manually or rerun, or the next audit re-covers this range"
   log "watermark advanced: $tag"
@@ -623,9 +645,11 @@ advance_prefix_receipt() { # advance_prefix_receipt <orchestrator-summary-json>
   if git -C "$REPO_DIR" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
     log "prefix receipt $tag already present locally — ensuring it is on origin"
   else
+    revalidate_canary_pair "writing historical prefix receipt"
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
       git -C "$REPO_DIR" tag -a "$tag" -F "$receipt_file" "$RANGE_HEAD"
   fi
+  revalidate_canary_pair "publishing historical prefix receipt"
   git -C "$REPO_DIR" push -q origin "refs/tags/$tag" \
     || die 3 "prefix receipt $tag exists locally but the push failed — rerun to retain this exact chunk"
   PREFIX_TAG_RESULT="$tag"
@@ -735,14 +759,16 @@ fi
 # there the claude direction falls back to its configured gating-lane effort
 # rather than failing closed on an invalid value.
 orch_args=("$PR" --repo "$REPO" --diff-file "$DIFF_FILE")
-# Pin the review to the lane-verified head (#663 round-3 P1): without
-# --head, the orchestrator resolves the LIVE PR head at dispatch time, so a
-# canary push racing the lane check above could get an APPROVED on a head
-# the lane never verified. With the pin, the orchestrator's own live-head
-# recheck fails closed on any drift.
+# Pin review publication to the lane-verified pair: without --head, the
+# orchestrator could approve a pushed canary head the lane never verified;
+# without --expected-base-sha, a same-head retarget during the long review
+# interval could publish approval for the wrong base. The orchestrator's own
+# final pair check closes that provider interval.
 if [ -n "$pr_head" ]; then
   orch_args[${#orch_args[@]}]="--head"
   orch_args[${#orch_args[@]}]="$pr_head"
+  orch_args[${#orch_args[@]}]="--expected-base-sha"
+  orch_args[${#orch_args[@]}]="$pr_base"
 fi
 if [ "$DRY_RUN" = true ] || [ -n "$HISTORICAL_END" ]; then
   orch_args[${#orch_args[@]}]="--dry-run"
@@ -750,6 +776,7 @@ fi
 if [ "$EFFORT" != "minimal" ]; then
   export P4B_CLAUDE_EFFORT="$EFFORT"
 fi
+revalidate_canary_pair "dispatching external review"
 if [ -n "$HISTORICAL_END" ]; then
   ORCH_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/wave-audit-orchestrator.XXXXXX")"
   TMP_FILES[${#TMP_FILES[@]}]="$ORCH_OUTPUT"

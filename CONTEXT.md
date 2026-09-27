@@ -138,7 +138,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Hold**: A deliberate wait state distinguished from failure — no verdict or handoff is posted and no human is paged, though a hold may carry a recovery write (a resume, a re-trigger) that callers must read before duplicating it. Most holds self-clear as the awaited signal arrives; some name a cause needing action instead (a draft PR, a wrong base branch), and only patience-shaped holds should be retried. _Avoid_: conflating with `human-hold` (a human-controlled freeze) or with fallback (a reviewer that will not answer).
 
-**Marker**: A stable machine-readable token pinning a fact to a specific SHA or state — the lane's verified-head comment, a resolve-class tag, a pause notice, a pending file. An indeterminate marker read is fail-closed.
+**Marker**: A stable machine-readable token pinning a fact to a specific state — the lane's verified head/base-pair comment, a resolve-class tag, a pause notice, a pending file. An indeterminate marker read is fail-closed.
 
 **Verdict (reviewer output)**: Codex's clean-outcome shape — a summary issue comment naming the reviewed commit; findings rounds arrive only as a COMMENTED review object. Completion is checked from the union of both endpoints, HEAD-anchored. _Avoid_: watching either endpoint alone.
 
@@ -210,7 +210,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Faithful-mirror verification**: The lane's load-bearing teeth — every changed file byte-compared (mode and type included) against immutable public Mergepath content at the declared commit, from a trusted checkout. Path confinement alone is deliberately insufficient.
 
-**Lane marker**: The HEAD-pinned verified-head comment recording that verification passed, which downstream gates read to tell exemption apart from clearance.
+**Lane marker**: The pair-bound v2 verified-head/verified-base comment recording that verification passed. Downstream gates read the live pair and accept only a matching `github-actions[bot]` marker; legacy head-only markers grant no exemption.
 
 **Propagation-drift**: The label on the single fleet-wide tracking issue the weekly drift audit maintains; also shorthand for that visibility sweep. _Avoid_: tagging follow-up issues with it — the sweep auto-closes them.
 
