@@ -595,16 +595,16 @@ jobs:
           #   2 = config / usage error (CI failure, not a gate block)
           fingerprint_available=false
           if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
-            # One bootstrap exception is required while the introducing PR's
-            # trusted default branch predates both the helper and its manifest
-            # entry. Once the manifest declares the helper, absence is an
-            # infrastructure failure rather than a silent fence downgrade.
-            if grep -Fq 'path: scripts/review-feedback-surface-fingerprint.sh' \
-              .mergepath-sync.yml; then
+            # The trusted checkout itself distinguishes a first delivery from
+            # a broken installation. A default branch whose workflow does not
+            # yet reference the helper is in the one valid bootstrap window;
+            # once it does, a missing helper is an infrastructure failure.
+            if grep -Fq 'scripts/review-feedback-surface-fingerprint.sh' \
+              .github/workflows/codex-p1-gate.yml; then
               echo "::error::Installed feedback-fingerprint helper is missing or not executable"
               exit 1
             fi
-            echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the manifest-absent bootstrap window"
+            echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the workflow-reference-absent bootstrap window"
             feedback_fp_before="bootstrap-unavailable"
           else
             fingerprint_available=true
@@ -790,12 +790,15 @@ jobs:
           MAX_RELAY_SOURCE_RUNS=1000
           fingerprint_available=false
           if [ ! -x scripts/review-feedback-surface-fingerprint.sh ]; then
-            if grep -Fq 'path: scripts/review-feedback-surface-fingerprint.sh' \
-              .mergepath-sync.yml; then
+            # Scheduled runs always use this trusted default-branch checkout.
+            # If its workflow references the helper, a missing executable is
+            # an infrastructure failure rather than a silent fence downgrade.
+            if grep -Fq 'scripts/review-feedback-surface-fingerprint.sh' \
+              .github/workflows/codex-p1-gate.yml; then
               echo "::error::Installed feedback-fingerprint helper is missing or not executable"
               exit 1
             fi
-            echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the manifest-absent bootstrap window"
+            echo "::warning::Feedback-fingerprint helper is not installed on the trusted default branch yet; allowing only the workflow-reference-absent bootstrap window"
           else
             fingerprint_available=true
           fi
