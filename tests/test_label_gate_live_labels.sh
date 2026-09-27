@@ -173,6 +173,133 @@ check "unrelated labels alone pass" \
   '{"livePages":[["documentation","enhancement"]]}' \
   '.crashed == null and .failures == []'
 
+# #1321: execute the real reconciliation step with a fake public API. The stub
+# accepts only paginated timeline/comment reads, so the positive case also
+# proves that ownership is decided over the complete surfaces.
+yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Reconcile a policy-owned fail-closed label") | .run' \
+  "$WORKFLOW" >"$WORK/reconcile.sh"
+if [ ! -s "$WORK/reconcile.sh" ]; then
+  fail "could not extract the fail-closed label reconciliation step"
+else
+  pass "fail-closed label reconciliation step is present"
+fi
+
+mkdir -p "$WORK/bin"
+cat >"$WORK/bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$GH_STUB_DIR/calls"
+case "$*" in
+  "api --paginate repos/o/r/issues/42/timeline")
+    [ ! -f "$GH_STUB_DIR/fail-timeline" ] || exit 1
+    cat "$GH_STUB_DIR/timeline.json" ;;
+  "api --paginate repos/o/r/issues/42/comments")
+    cat "$GH_STUB_DIR/comments.json" ;;
+  "api repos/o/r/pulls/42")
+    count=$(cat "$GH_STUB_DIR/live-count" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$GH_STUB_DIR/live-count"
+    if [ "$count" -gt 1 ] && [ -f "$GH_STUB_DIR/live-2.json" ]; then
+      cat "$GH_STUB_DIR/live-2.json"
+    else
+      cat "$GH_STUB_DIR/live.json"
+    fi ;;
+  "api -X DELETE repos/o/r/issues/42/labels/needs-external-review")
+    printf 'deleted\n' >>"$GH_STUB_DIR/deletes"
+    printf '{}\n' ;;
+  *)
+    echo "unexpected gh call: $*" >&2
+    exit 90 ;;
+esac
+SH
+chmod +x "$WORK/bin/gh"
+
+HEAD40=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+write_reconcile_fixture() { # <dir> <latest actor> <comment time> [event]
+  local dir=$1 actor=$2 comment_time=$3 event=${4:-labeled}
+  mkdir -p "$dir"
+  cat >"$dir/live.json" <<JSON
+{"head":{"sha":"$HEAD40"},"labels":[{"name":"needs-external-review"}]}
+JSON
+  cat >"$dir/timeline.json" <<JSON
+[{"id":91,"event":"$event","label":{"name":"needs-external-review"},"actor":{"login":"$actor"},"created_at":"2026-09-25T01:36:05Z","commit_id":"$HEAD40"}]
+JSON
+  cat >"$dir/comments.json" <<JSON
+[{"id":92,"user":{"login":"github-actions[bot]"},"created_at":"$comment_time","body":"**External Review Required**\\n- Could not fetch PR files; requiring review fail-closed"}]
+JSON
+}
+
+run_reconcile() { # <fixture-dir>
+  local dir=$1 rc=0
+  env PATH="$WORK/bin:$PATH" GH_STUB_DIR="$dir" \
+    GH_TOKEN=fake-read LABEL_REMOVAL_TOKEN=fake-write \
+    PR_NUMBER=42 EXPECTED_HEAD_SHA="$HEAD40" REPO=o/r \
+    bash "$WORK/reconcile.sh" >"$dir/out" 2>"$dir/err" || rc=$?
+  printf '%s' "$rc"
+}
+
+R1="$WORK/reconcile-owned"
+write_reconcile_fixture "$R1" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+rc=$(run_reconcile "$R1")
+if [ "$rc" -eq 0 ] && [ "$(cat "$R1/deletes" 2>/dev/null)" = deleted ] \
+   && [ "$(grep -c '^api --paginate repos/o/r/issues/42/timeline$' "$R1/calls")" -eq 2 ]; then
+  pass "latest automation label plus adjacent fail-closed comment is reconciled after repeat readback (#1321)"
+else
+  fail "owned fail-closed label was not reconciled safely (rc=$rc out=$(cat "$R1/out") err=$(cat "$R1/err"))"
+fi
+
+R2="$WORK/reconcile-human"
+write_reconcile_fixture "$R2" human-owner '2026-09-25T01:36:20Z'
+rc=$(run_reconcile "$R2")
+if [ "$rc" -eq 0 ] && [ ! -f "$R2/deletes" ]; then
+  pass "a human's latest label event is preserved despite an old automation comment (#1321)"
+else
+  fail "human-applied label was not preserved (rc=$rc)"
+fi
+
+R3="$WORK/reconcile-old-comment"
+write_reconcile_fixture "$R3" 'github-actions[bot]' '2026-09-25T01:20:00Z'
+rc=$(run_reconcile "$R3")
+if [ "$rc" -eq 0 ] && [ ! -f "$R3/deletes" ]; then
+  pass "a non-adjacent historical fail-closed comment does not prove current ownership (#1321)"
+else
+  fail "historical comment incorrectly authorized removal (rc=$rc)"
+fi
+
+R4="$WORK/reconcile-head-move"
+write_reconcile_fixture "$R4" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+cat >"$R4/live-2.json" <<JSON
+{"head":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"labels":[{"name":"needs-external-review"}]}
+JSON
+rc=$(run_reconcile "$R4")
+if [ "$rc" -ne 0 ] && [ ! -f "$R4/deletes" ]; then
+  pass "a head move during reconciliation fails closed without removing the label (#1321)"
+else
+  fail "head move did not hold reconciliation (rc=$rc)"
+fi
+
+R5="$WORK/reconcile-read-failure"
+write_reconcile_fixture "$R5" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+touch "$R5/fail-timeline"
+rc=$(run_reconcile "$R5")
+if [ "$rc" -ne 0 ] && [ ! -f "$R5/deletes" ]; then
+  pass "an unreadable timeline fails closed without removing the label (#1321)"
+else
+  fail "timeline read failure did not hold reconciliation (rc=$rc)"
+fi
+
+R6="$WORK/reconcile-marker-mismatch"
+write_reconcile_fixture "$R6" 'github-actions[bot]' '2026-09-25T01:36:20Z'
+jq '.[] .body = "<!-- mergepath-external-review-label:v1 head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cause=fail-closed -->\\n**External Review Required**\\n- read failed; requiring review fail-closed"' \
+  "$R6/comments.json" >"$R6/comments.tmp"
+mv "$R6/comments.tmp" "$R6/comments.json"
+rc=$(run_reconcile "$R6")
+if [ "$rc" -eq 0 ] && [ ! -f "$R6/deletes" ]; then
+  pass "a head marker that disagrees with its label event does not authorize removal (#1321)"
+else
+  fail "mismatched provenance marker authorized removal (rc=$rc)"
+fi
+
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
