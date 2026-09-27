@@ -285,6 +285,16 @@ grep -q "do NOT fan out" "$WORK/err-feedback" \
   && pass "feedback-unaccounted messaging blocks fan-out" || fail "feedback-unaccounted fail-closed message missing"
 remote_has_tag "$C5" && fail "feedback-unaccounted advanced the watermark" || pass "no watermark on feedback-unaccounted"
 
+FAKE_ORCH_EXIT=8 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha "$C5" >/dev/null 2>"$WORK/err-cap" \
+  && fail "human-tiebreaker stop should exit 8" || { [ $? -eq 8 ] && pass "human-tiebreaker stop passes exit 8 through" || fail "wrong exit for human-tiebreaker stop"; }
+grep -q "do NOT fan out" "$WORK/err-cap" \
+  && pass "human-tiebreaker messaging blocks fan-out" || fail "human-tiebreaker fail-closed message missing"
+
+FAKE_ORCH_EXIT=10 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha "$C5" >/dev/null 2>"$WORK/err-budget" \
+  && fail "request-budget evidence error should exit 10" || { [ $? -eq 10 ] && pass "request-budget evidence error passes exit 10 through" || fail "wrong exit for request-budget evidence error"; }
+grep -q "do NOT fan out" "$WORK/err-budget" \
+  && pass "request-budget evidence error blocks fan-out" || fail "request-budget evidence fail-closed message missing"
+
 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha "$C5" --dry-run >/dev/null \
   && pass "dry-run APPROVED exits 0" || fail "dry-run exited nonzero"
 grep -q -- "--dry-run" "$CAPTURE/args" && pass "dry-run forwarded to orchestrator" || fail "--dry-run not forwarded"

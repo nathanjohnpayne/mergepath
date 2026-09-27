@@ -31,6 +31,81 @@ crqe_count_triggers() { # comments-json author
   '
 }
 
+# Compute the request freshness anchor shared by the requester and Phase 4b
+# cap sensing. Inputs are already-read evidence so each caller retains its own
+# API failure action. Prints the full anchor record as JSON.
+crqe_request_threshold() { # head-committer-date timeline-json freshness-seconds epoch-now
+  local committed="$1" timeline="$2" seconds="$3" epoch="$4"
+  local forced pushed source floor fresh threshold threshold_source
+  case "$seconds:$epoch" in *[!0-9:]*) return 1 ;; esac
+  forced=$(printf '%s' "$timeline" | jq -er \
+    '[.[] | select(.event == "head_ref_force_pushed") | .created_at] | max // ""') \
+    || return 1
+  pushed="$committed"
+  source="HEAD committer date"
+  if [ -n "$forced" ] && [[ "$forced" > "$pushed" ]]; then
+    pushed="$forced"
+    source="head_ref_force_pushed @ $forced"
+  fi
+  floor=$((epoch - seconds))
+  fresh=$(date -u -r "$floor" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@$floor" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || return 1
+  if [[ "$fresh" > "$pushed" ]]; then
+    threshold="$fresh"
+    threshold_source="freshness floor (NOW - ${seconds}s)"
+  else
+    threshold="$pushed"
+    threshold_source="HEAD pushed-at anchor ($source)"
+  fi
+  jq -nc --arg pushed "$pushed" --arg source "$source" --arg fresh "$fresh" \
+    --arg threshold "$threshold" --arg threshold_source "$threshold_source" \
+    '{head_pushed_at:$pushed,anchor_source:$source,reaction_floor:$fresh,
+      reaction_threshold:$threshold,reaction_threshold_source:$threshold_source}'
+}
+
+# Resolve the request budget from the PR's governing base policy. The caller
+# must already have sourced feedback-policy-helpers.sh (policy_yaml_to_json).
+# Prints {author_identity,max_request_attempts}; returns non-zero on every
+# unreadable or malformed input. A materialized policy is removed here.
+crqe_governing_budget() { # repo pr default-config candidate-author [resolver]
+  local repo="$1" pr="$2" config="$3" candidate="$4"
+  local resolver="${5:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/workflow/resolve_base_policy.sh}"
+  local base_cfg="" base_json="" author="" cap="" rc=0
+  command -v policy_yaml_to_json >/dev/null 2>&1 || return 1
+  [ -x "$resolver" ] || return 1
+  base_cfg=$("$resolver" --repo "$repo" --pr "$pr" \
+    --default-config "$config" --materialize-default 2>/dev/null) || return 1
+  [ -n "$base_cfg" ] && [ -r "$base_cfg" ] || return 1
+  base_json=$(policy_yaml_to_json "$base_cfg" 2>/dev/null) || rc=$?
+  [ "$base_cfg" = "$config" ] || rm -f "$base_cfg" 2>/dev/null || true
+  [ "$rc" -eq 0 ] && [ -n "$base_json" ] || return 1
+  author=$(printf '%s' "$base_json" | jq -er '
+    if type != "object" then error("policy")
+    elif has("author_identity") then
+      if ((.author_identity | type) == "string") and ((.author_identity | length) > 0)
+      then .author_identity else error("author") end
+    else "nathanjohnpayne" end') || return 1
+  if [ "$author" != "$candidate" ]; then
+    printf "candidate author_identity '%s' does not match the governing base policy author_identity '%s'\n" \
+      "$candidate" "$author" >&2
+    return 1
+  fi
+  cap=$(printf '%s' "$base_json" | jq -r '
+    if type != "object" then "__invalid__"
+    elif (has("codex") | not) then "10"
+    elif ((.codex | type) != "object") then "__invalid__"
+    elif (.codex | has("max_review_rounds")) then
+      .codex.max_review_rounds
+      | if (type == "string" or type == "number") then tostring else "__invalid__" end
+    else "10" end') || return 1
+  case "$cap" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#cap}" -le 9 ] || return 1
+  cap=$(printf '%s' "$cap" | sed 's/^0*//')
+  [ -n "$cap" ] || cap=0
+  jq -nc --arg author "$author" --argjson cap "$cap" \
+    '{author_identity:$author,max_request_attempts:$cap}'
+}
+
 crqe_ack_present() { # reactions-json bot trigger-time; caller binds comment ID
   printf '%s\n' "$1" | jq -r --arg bot "$2" --arg after "$3" '
     [.[] | select(.user.login == $bot) | select(.content == "eyes")

@@ -3823,6 +3823,8 @@ case "$endpoint" in
   repos/owner/repo/issues/7/comments)
     [ "${P4B_TEST_COMMENTS_FAIL:-false}" != true ] || exit 42
     printf '%s\n' "${P4B_TEST_COMMENTS_JSON-[]}" ;;
+  repos/owner/repo/issues/7/timeline)
+    printf '%s\n' "${P4B_TEST_TIMELINE_JSON-[]}" ;;
   repos/owner/repo/compare/*)
     # #1335: the carry-forward's changed-file set, bound to the head by the
     # compare range. Content never matters (the fingerprint delegate is
@@ -3834,7 +3836,7 @@ case "$endpoint" in
     # IS the commit sha here, which keeps the per-commit config knob simple.
     [ "${P4B_TEST_CFG_FAIL:-false}" != true ] || exit 42
     sha=${endpoint##*/}
-    emit "{\"commit\":{\"tree\":{\"sha\":\"$sha\"}}}" ;;
+    emit "{\"commit\":{\"committer\":{\"date\":\"${P4B_TEST_COMMIT_DATE:-2026-09-26T00:00:00Z}\"},\"tree\":{\"sha\":\"$sha\"}}}" ;;
   repos/owner/repo/git/trees/*)
     # P4B_TEST_CFG_<tree> is the .coderabbit.yml blob at that commit
     # (default: the same blob everywhere; "none" = no config file).
@@ -3854,6 +3856,27 @@ case "$endpoint" in
 esac
 EOF
 chmod +x "$WORK/barrier-bin/gh"
+cat >"$WORK/barrier-bin/resolve-policy" <<'EOF'
+#!/bin/sh
+set -eu
+default=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --default-config) default=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+source_path="${P4B_TEST_BASE_POLICY_PATH:-$default}"
+[ -r "$source_path" ] || exit 2
+tmp=$(mktemp "${TMPDIR:-/tmp}/p4b-test-policy.XXXXXX")
+cp "$source_path" "$tmp"
+printf '%s\n' "$tmp"
+EOF
+chmod +x "$WORK/barrier-bin/resolve-policy"
+# Every later orchestrator fixture inherits the same governing-policy shim.
+# It materializes the fixture's own policy unless a test supplies a distinct
+# base policy, matching the production resolver's ownership contract.
+export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
 
 _barrier() { # <cx_rc> <cr_rc> <cr_json> [policy] [head]
   printf '#!/bin/sh\nexit %s\n' "$1" >"$WORK/stub-cx.sh"
@@ -3864,8 +3887,12 @@ _barrier() { # <cx_rc> <cr_rc> <cr_json> [policy] [head]
     export P4B_ACCT_STATE_DIR="$WORK/barrier-state"
     export P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx.sh"
     export P4B_CODERABBIT_WAIT="$WORK/stub-cr.sh"
+    export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
     export P4B_TEST_COMMENTS_JSON="${P4B_TEST_COMMENTS_JSON-[]}" P4B_TEST_LIVE_HEAD="${P4B_TEST_LIVE_HEAD:-${5:-abc123}}"
     export P4B_TEST_COMMENTS_FAIL="${P4B_TEST_COMMENTS_FAIL:-false}"
+    export P4B_TEST_TIMELINE_JSON="${P4B_TEST_TIMELINE_JSON-[]}"
+    export P4B_TEST_COMMIT_DATE="${P4B_TEST_COMMIT_DATE:-2026-09-26T00:00:00Z}"
+    export P4B_TEST_BASE_POLICY_PATH="${P4B_TEST_BASE_POLICY_PATH-}"
     export PATH="$WORK/barrier-bin:$PATH"
     p4b_same_head_barrier owner/repo 7 "${5:-abc123}" rev-bot true
   )
@@ -4029,6 +4056,75 @@ else
   fail "#1085: Phase 4a timeout handoff routing wrong:$bad"
 fi
 
+# #1305: a spent governing request budget is a human-tiebreaker stop, never
+# authority for the Phase 4b adapter. The candidate policy deliberately raises
+# its own cap; the separate base fixture must still govern.
+cat >"$WORK/cap-candidate.yml" <<'EOF'
+author_identity: nathanjohnpayne
+coderabbit:
+  enabled: false
+  max_wait_seconds: 100
+codex:
+  enabled: true
+  max_review_rounds: 100
+  reaction_freshness_window_seconds: 1800
+EOF
+cat >"$WORK/cap-base.yml" <<'EOF'
+author_identity: nathanjohnpayne
+coderabbit:
+  enabled: false
+  max_wait_seconds: 100
+codex:
+  enabled: true
+  max_review_rounds: 2
+  reaction_freshness_window_seconds: 1800
+EOF
+cat >"$WORK/cap-base-zero-wait.yml" <<'EOF'
+author_identity: nathanjohnpayne
+coderabbit:
+  enabled: false
+  max_wait_seconds: 0
+codex:
+  enabled: true
+  max_review_rounds: 2
+  reaction_freshness_window_seconds: 1800
+EOF
+_cap_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+_cap_old='[{"id":5101,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-08-01T00:00:00Z"},{"id":5102,"user":{"login":"nathanjohnpayne"},"body":"@CODEX REVIEW","created_at":"2026-08-02T00:00:00Z"}]'
+_cap_final=$(printf '%s' "$_cap_old" | jq -c --arg now "$_cap_now" '.[1].created_at=$now')
+bad=""
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] || bad="$bad exhausted-not-tiebreak"
+printf '%s' "$out" | jq -e '.decision == "human-tiebreaker" and .request_budget.request_attempts == 2 and .request_budget.max_request_attempts == 2' >/dev/null 2>&1 || bad="$bad exhausted-payload"
+
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad final-request-not-polled"
+printf '%s' "$out" | jq -e '.codex_evidence == "request-cap-final-pending"' >/dev/null 2>&1 || bad="$bad final-request-evidence"
+
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-zero-wait.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-base-zero-wait.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] || bad="$bad final-wait-exhaustion-not-tiebreak"
+printf '%s' "$out" | jq -e '.codex_evidence == "request-cap-final-wait-exhausted"' >/dev/null 2>&1 || bad="$bad final-wait-exhaustion-evidence"
+
+# Current-head provider evidence wins before any budget read, even if that
+# read would fail. A trusted pre-existing timeout also keeps its old waiver.
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/does-not-exist" P4B_TEST_COMMENTS_FAIL=true _barrier 0 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] || bad="$bad reported-did-not-win"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_current" P4B_TEST_LIVE_HEAD="$_p4a_head" _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = timeout ] || bad="$bad old-timeout-contract"
+
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/does-not-exist" P4B_TEST_COMMENTS_JSON='[]' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] || bad="$bad unreadable-not-fail-closed"
+out="$(crqe_select_trigger() { return 9; }; P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .request_budget.reason)" = final-request-selector-failed ] || bad="$bad selector-error-not-fail-closed"
+if [ -z "$bad" ]; then
+  pass "#1305: governing request-cap exhaustion stops for a human while final-request polling, old timeout, and current report retain precedence"
+else
+  fail "#1305: request-cap barrier routing wrong:$bad"
+fi
+
 # An account-blocked Codex must WAIVE, not hold. Phase 4b is the documented
 # fallback for "4a unavailable", so holding the run behind a Codex that cannot
 # report meant the automated leg could never serve that role — it waited out
@@ -4093,6 +4189,7 @@ EOF
     export P4B_ACCT_STATE_DIR="$WORK/barrier-state"
     export P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx.sh"
     export P4B_CODERABBIT_WAIT="$WORK/stub-cr.sh"
+    export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
     export PATH="$WORK/barrier-bin:$PATH"
     p4b_same_head_barrier owner/repo 7 abc123 rev-bot true
   )
@@ -4563,6 +4660,79 @@ if [ "$rc" = 6 ] \
   pass "#814: a not-yet barrier holds on exit 6 with retry_after and renders no handoff — a wait is not a fallback"
 else
   fail "#814: barrier hold path wrong (rc=$rc handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
+fi
+
+# #1305 orchestrator contract: cap exhaustion has its own terminal exit and
+# cannot dispatch the adapter or render the authority-bearing Phase 4b handoff.
+cat >"$WORK/policy-cap-stop.yml" <<'EOF'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+author_identity: nathanjohnpayne
+phase_4b_automation:
+  enabled: true
+  mode: local
+coderabbit:
+  enabled: false
+codex:
+  enabled: true
+  max_review_rounds: 0
+EOF
+: >"$HANDOFF_LOG"
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-stop.yml" \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" \
+  P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
+  PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 8 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.human_tiebreaker_required')" = true ] \
+   && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = false ] \
+   && [ ! -s "$HANDOFF_LOG" ]; then
+  pass "#1305: cap exhaustion exits 8 for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+else
+  fail "#1305: orchestrator cap stop wrong (rc=$rc handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
+fi
+
+cat >"$WORK/policy-cap-final-wait.yml" <<'EOF'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+author_identity: nathanjohnpayne
+phase_4b_automation:
+  enabled: true
+  mode: local
+coderabbit:
+  enabled: false
+  max_wait_seconds: 0
+codex:
+  enabled: true
+  max_review_rounds: 2
+  reaction_freshness_window_seconds: 1800
+EOF
+: >"$HANDOFF_LOG"
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-cap-final-wait.yml" \
+  P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_LIVE_HEAD="$_p4a_head" \
+  P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" \
+  P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
+  PATH="$WORK/barrier-bin:$PATH" \
+  bash "$ORCH" 7 --repo owner/repo --author claude --head "$_p4a_head" --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 8 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier.codex_evidence')" = request-cap-final-wait-exhausted ] \
+   && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = false ] \
+   && [ ! -s "$HANDOFF_LOG" ]; then
+  pass "#1305: final-request wait exhaustion also exits 8 without adapter dispatch or Phase 4b handoff"
+else
+  fail "#1305: final-request exhaustion stop wrong (rc=$rc handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
 fi
 
 # A pre-side-effect hold must leave NO accounting trace. Evaluate the full

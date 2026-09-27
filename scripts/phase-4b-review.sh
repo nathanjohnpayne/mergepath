@@ -88,6 +88,11 @@
 #      Before dispatch, account for findings and rerun (#1000). After a posted
 #      approval, review_posted:true identifies an acknowledgment to repair
 #      without repeating the review. No handoff block is emitted.
+#   8  HUMAN_TIEBREAKER_REQUIRED — the governing Codex request cap is
+#      exhausted with no automated response path left. No adapter is run and
+#      no Phase 4b handoff is rendered; a human must decide the PR's state.
+#   10 BARRIER_EVIDENCE_ERROR — request-budget evidence was unreadable or the
+#      head moved. No adapter is run and no Phase 4b handoff is rendered.
 
 set -euo pipefail
 
@@ -548,6 +553,34 @@ hold_for_external_review() {
   exit 6
 }
 
+stop_for_human_tiebreaker() {
+  local payload="$1"
+  p4b_warn "Codex request budget exhausted; stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+    {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
+     reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
+     review_posted:false,fell_back_to_manual:false,barrier_pending:false,
+     human_tiebreaker_required:true,barrier:$b,reason:$b.reason,
+     automation_enabled:true,enabled_via:$enabled_via}'
+  exit 8
+}
+
+stop_for_barrier_error() {
+  local payload="$1"
+  p4b_warn "request-budget evidence failed; stopping without adapter dispatch or Phase 4b handoff"
+  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+    {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
+     reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
+     review_posted:false,fell_back_to_manual:false,barrier_pending:false,
+     infrastructure_error:true,barrier:$b,reason:$b.reason,
+     automation_enabled:true,enabled_via:$enabled_via}'
+  exit 10
+}
+
 # A barrier that opened over a rate-limited CodeRabbit (#1178). Set when the
 # barrier's CodeRabbit arm classified `rate-limited` and it opened anyway on a
 # head-pinned Codex report. Read only by the review-body renderer below.
@@ -589,6 +622,8 @@ run_same_head_barrier() {
       return 0
       ;;
     1) hold_for_external_review "$out" ;;
+    3) stop_for_human_tiebreaker "$out" ;;
+    4) stop_for_barrier_error "$out" ;;
     *) fall_back_to_manual "external review barrier ($where): $(printf '%s' "$out" | jq -r '.reason // "escalated"')" ;;
   esac
 }

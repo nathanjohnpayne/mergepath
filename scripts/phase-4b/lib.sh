@@ -48,6 +48,18 @@ if [ -r "$P4B_LIB_DIR/../lib/gh-api-array.sh" ]; then
   P4B_GH_API_ARRAY_OK=true
 fi
 
+# #1305 request-budget readers. The barrier must use the same exact-command
+# counter and governing-base-policy parser as the requester itself.
+P4B_CODEX_REQUEST_BUDGET_OK=false
+if [ -r "$P4B_LIB_DIR/../lib/feedback-policy-helpers.sh" ] \
+   && [ -r "$P4B_LIB_DIR/../lib/codex-request-evidence.sh" ]; then
+  # shellcheck source=../lib/feedback-policy-helpers.sh
+  . "$P4B_LIB_DIR/../lib/feedback-policy-helpers.sh"
+  # shellcheck source=../lib/codex-request-evidence.sh
+  . "$P4B_LIB_DIR/../lib/codex-request-evidence.sh"
+  P4B_CODEX_REQUEST_BUDGET_OK=true
+fi
+
 # Resolve the repo root from this library's own location (follow symlinks),
 # NOT $PWD — the same posture scripts/phase-4b-classifier.sh uses so a
 # PATH-symlinked or subdir invocation still finds the policy file.
@@ -507,6 +519,71 @@ p4b_codex_timeout_determination() {
       return 2
       ;;
   esac
+}
+
+# p4b_codex_request_budget_state <repo> <pr> <reviewed-head>
+# Prints a budget state after proving the live head and the current-head
+# request freshness anchor. `final-request-pending` preserves the last
+# request's legitimate wait; it never manufactures a timeout determination.
+p4b_codex_request_budget_state() {
+  local repo="$1" pr="$2" head="$3" config author resolver budget comments count cap
+  local live_head committed timeline threshold seconds epoch anchor selected select_rc=0
+  if [ "$P4B_CODEX_REQUEST_BUDGET_OK" != true ] \
+     || ! command -v crqe_governing_budget crqe_count_triggers crqe_select_trigger >/dev/null 2>&1 \
+     || ! command -v gh_api_array gh_api_scalar >/dev/null 2>&1; then
+    jq -nc '{state:"unreadable",reason:"request-budget-helper-unavailable"}'
+    return 2
+  fi
+  config="$(p4b_config)"
+  author="$(p4b_top_field author_identity)"
+  [ -n "$author" ] \
+    || { jq -nc '{state:"unreadable",reason:"author-identity-missing"}'; return 2; }
+  resolver="${P4B_RESOLVE_BASE_POLICY:-$P4B_LIB_DIR/../workflow/resolve_base_policy.sh}"
+  budget=$(crqe_governing_budget "$repo" "$pr" "$config" "$author" "$resolver") \
+    || { jq -nc '{state:"unreadable",reason:"governing-policy-unreadable"}'; return 2; }
+  comments=$(gh_api_array "repos/$repo/issues/$pr/comments" "Codex request-attempt evidence") \
+    || { jq -nc '{state:"unreadable",reason:"comments-read-failed"}'; return 2; }
+  count=$(crqe_count_triggers "$comments" "$author") \
+    || { jq -nc '{state:"unreadable",reason:"request-count-invalid"}'; return 2; }
+  cap=$(printf '%s' "$budget" | jq -r '.max_request_attempts')
+  if [ "$count" -lt "$cap" ]; then
+    jq -nc --argjson n "$count" --argjson cap "$cap" \
+      '{state:"available",request_attempts:$n,max_request_attempts:$cap}'
+    return 0
+  fi
+  live_head=$(gh_api_scalar --shape sha "Codex cap live PR head" \
+    "repos/$repo/pulls/$pr" --jq '.head.sha') \
+    || { jq -nc '{state:"unreadable",reason:"head-read-failed"}'; return 2; }
+  if [ "$live_head" != "$head" ]; then
+    jq -nc --arg h "$head" --arg l "$live_head" \
+      '{state:"drift",reason:"head-moved",reviewed_head:$h,live_head:$l}'
+    return 2
+  fi
+  committed=$(gh_api_scalar --shape timestamp "Codex cap head commit time" \
+    "repos/$repo/commits/$head" --jq '.commit.committer.date') \
+    || { jq -nc '{state:"unreadable",reason:"commit-time-read-failed"}'; return 2; }
+  timeline=$(gh_api_array "repos/$repo/issues/$pr/timeline" "Codex request freshness timeline") \
+    || { jq -nc '{state:"unreadable",reason:"timeline-read-failed"}'; return 2; }
+  seconds="$(p4b_policy_block_field codex reaction_freshness_window_seconds)"
+  seconds="${seconds:-1800}"
+  case "$seconds" in ''|*[!0-9]*) jq -nc '{state:"unreadable",reason:"freshness-policy-invalid"}'; return 2 ;; esac
+  epoch=$(date +%s 2>/dev/null) \
+    || { jq -nc '{state:"unreadable",reason:"clock-unreadable"}'; return 2; }
+  anchor=$(crqe_request_threshold "$committed" "$timeline" "$seconds" "$epoch") \
+    || { jq -nc '{state:"unreadable",reason:"freshness-threshold-failed"}'; return 2; }
+  threshold=$(printf '%s' "$anchor" | jq -r .reaction_threshold)
+  selected=$(crqe_select_trigger "$comments" "$author" "$threshold") || select_rc=$?
+  if [ "$select_rc" -ne 0 ] || [ -z "$selected" ]; then
+    jq -nc '{state:"unreadable",reason:"final-request-selector-failed"}'
+    return 2
+  fi
+  if [ "$selected" != null ]; then
+    jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" \
+      '{state:"final-request-pending",request_attempts:$n,max_request_attempts:$cap,threshold:$t}'
+  else
+    jq -nc --argjson n "$count" --argjson cap "$cap" --arg t "$threshold" \
+      '{state:"exhausted",request_attempts:$n,max_request_attempts:$cap,threshold:$t}'
+  fi
 }
 
 # --- same-head provider barrier: same-content CodeRabbit carry-forward (#1335)
@@ -1453,7 +1530,9 @@ p4b_barrier_maybe_resume() {
 # Emits one JSON object on stdout and returns:
 #   0  open      — every ENABLED provider is terminal on this exact head
 #   1  pending   — at least one is not yet, still inside the bound
-#   2  escalate  — a provider needs a human, or the bound is exhausted
+#   2  escalate  — a provider needs the ordinary manual Phase 4b fallback
+#   3  tiebreak  — Codex request cap exhausted; explicit human decision needed
+#   4  error     — request-budget evidence failed; no review authority follows
 #
 # Guarded only on the existing codex.enabled / coderabbit.enabled switches;
 # #814 ships with no new review-policy keys. A provider disabled in policy is
@@ -1462,8 +1541,11 @@ p4b_barrier_maybe_resume() {
 p4b_same_head_barrier() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
   local root cr_bin cx_bin rc json probe_head cx_timeout_json="" cx_timeout_rc=0
+  local cx_budget_json="" cx_budget_rc=0 cx_budget_state=""
   local pending=false why="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
   local cx_evidence="disabled" cr_carry="" cr_carry_json="null"
+  local cap_exhausted=false final_request_pending=false human_tiebreaker=false
+  local budget_unsafe=false
   local elapsed budget remaining=0
   root="$(p4b_repo_root)"
   cr_bin="${P4B_CODERABBIT_WAIT:-$root/scripts/coderabbit-wait.sh}"
@@ -1491,7 +1573,41 @@ p4b_same_head_barrier() {
         cx_evidence="$(printf '%s' "$cx_timeout_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
         case "$cx_timeout_rc" in
           0) cls_cx="waived"; cx_evidence="timeout" ;;
-          1) ;; # none/stale: keep ordinary not-yet
+          1)
+            # Absence of a trusted timeout is still pending only while a
+            # request can be made or the already-issued final request remains
+            # eligible to poll. At the governing cap there is no automated
+            # path left; #1305 sends that condition to the human tiebreaker,
+            # never to an adapter capable of conferring review authority.
+            cx_budget_rc=0
+            cx_budget_json="$(p4b_codex_request_budget_state "$repo" "$pr" "$head")" || cx_budget_rc=$?
+            cx_budget_state="$(printf '%s' "$cx_budget_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+            case "$cx_budget_rc:$cx_budget_state" in
+              0:available) ;;
+              0:final-request-pending)
+                cap_exhausted=true
+                final_request_pending=true
+                cx_evidence="request-cap-final-pending"
+                ;;
+              0:exhausted)
+                cap_exhausted=true
+                human_tiebreaker=true
+                cls_cx="cap-exhausted"
+                cx_evidence="request-cap"
+                why="Codex request cap exhausted with no eligible final request left to poll; human tiebreaker required"
+                ;;
+              *)
+                cls_cx="escalate"
+                budget_unsafe=true
+                cx_evidence="$cx_budget_state"
+                if [ "$cx_budget_state" = drift ]; then
+                  why="PR head moved during request-cap evaluation (reviewing $head, live $(printf '%s' "$cx_budget_json" | jq -r '.live_head // "unknown"')) — rerun on the new head"
+                else
+                  why="Codex request-cap evidence is unreadable; refusing to infer an available request or a human-tiebreaker stop"
+                fi
+                ;;
+            esac
+            ;;
           *)
             cls_cx="escalate"
             case "$cx_evidence" in
@@ -1671,7 +1787,14 @@ p4b_same_head_barrier() {
     elapsed="$(p4b_barrier_note_pending "$repo" "$pr" "$head")"
     budget="$(p4b_barrier_budget_seconds)"
     if [ "$elapsed" -ge "$budget" ]; then
-      why="external review did not reach the current head within ${budget}s"
+      if [ "$cap_exhausted" = true ] && [ "$final_request_pending" = true ]; then
+        human_tiebreaker=true
+        cls_cx="cap-exhausted"
+        cx_evidence="request-cap-final-wait-exhausted"
+        why="Codex request cap exhausted and its eligible final request did not report within ${budget}s; human tiebreaker required"
+      else
+        why="external review did not reach the current head within ${budget}s"
+      fi
       # Name the REFUSAL, not just the clock (#1178). This exhaustion is
       # reachable with cls_cr=rate-limited whenever Codex stayed not-yet for
       # the whole budget, and "did not reach the current head" reads as
@@ -1702,6 +1825,19 @@ p4b_same_head_barrier() {
   fi
 
   if [ -n "$why" ]; then
+    if [ "$human_tiebreaker" = true ]; then
+      jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
+        --arg t "$trigger" --arg rs "$resume" --argjson b "${cx_budget_json:-null}" \
+        '{decision:"human-tiebreaker",reason:$r,coderabbit:$cr,codex:$cx,codex_evidence:$ce,
+          trigger:$t,resume:$rs,request_budget:$b}'
+      return 3
+    fi
+    if [ "$budget_unsafe" = true ]; then
+      jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" \
+        --argjson b "${cx_budget_json:-null}" \
+        '{decision:"error",reason:$r,coderabbit:$cr,codex:$cx,codex_evidence:$ce,request_budget:$b}'
+      return 4
+    fi
     jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg ce "$cx_evidence" --arg t "$trigger" --arg rs "$resume" \
       '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, codex_evidence:$ce, trigger:$t, resume:$rs}'
     return 2
