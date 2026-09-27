@@ -1697,6 +1697,14 @@ p4b_same_head_barrier() {
           cx_budget_rc=0
           cx_budget_json="$(p4b_codex_request_budget_state "$repo" "$pr" "$head")" || cx_budget_rc=$?
           cx_budget_state="$(printf '%s' "$cx_budget_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+          # A fresh final request is worth polling only while Codex is
+          # genuinely still working. Preserve a terminal refusal (for example,
+          # account-blocked) and route the spent budget through the same final
+          # resample and human-tiebreaker decision as ordinary exhaustion.
+          if [ "$cx_budget_rc:$cx_budget_state" = 0:final-request-pending ] \
+             && [ "$initial_cls_cx" != not-yet ]; then
+            cx_budget_state=exhausted
+          fi
           case "$cx_budget_rc:$cx_budget_state" in
             0:available)
               cls_cx="$initial_cls_cx"

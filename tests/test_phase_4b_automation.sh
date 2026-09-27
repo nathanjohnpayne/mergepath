@@ -4190,6 +4190,14 @@ out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_
 [ "$rc" = 1 ] || bad="$bad final-request-not-polled"
 printf '%s' "$out" | jq -e '.codex_evidence == "request-cap-final-pending"' >/dev/null 2>&1 || bad="$bad final-request-evidence"
 
+# A fresh final request cannot turn a terminal Codex refusal back into a wait.
+# At the spent cap, preserve the refusal and stop for the human tiebreaker.
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 2 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-base.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] || bad="$bad terminal-refusal-reopened-final-wait"
+printf '%s' "$out" | jq -e '.decision == "human-tiebreaker" and .codex_evidence == "request-cap"' >/dev/null 2>&1 \
+  || bad="$bad terminal-refusal-not-tiebreaker"
+
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-zero-wait.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-base-zero-wait.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 3 ] || bad="$bad final-wait-exhaustion-not-tiebreak"
