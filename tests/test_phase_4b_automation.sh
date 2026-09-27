@@ -4106,8 +4106,19 @@ out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_
 [ "$rc" = 3 ] || bad="$bad exhausted-not-tiebreak"
 printf '%s' "$out" | jq -e '.decision == "human-tiebreaker" and .request_budget.request_attempts == 2 and .request_budget.max_request_attempts == 2' >/dev/null 2>&1 || bad="$bad exhausted-payload"
 
-out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-noauthor.yml" P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-noauthor.yml" "$_p4a_head")" && rc=0 || rc=$?
-[ "$rc" = 3 ] && [ "$(printf '%s' "$out" | jq -r '.request_budget.max_request_attempts')" = 0 ] || bad="$bad omitted-author-default"
+out="$(
+  export MERGEPATH_REVIEW_POLICY_PATH="$WORK/cap-noauthor.yml"
+  export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
+  export P4B_TEST_BASE_POLICY_PATH="$WORK/cap-noauthor.yml"
+  export P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_head"
+  export P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' P4B_TEST_TIMELINE_JSON='[]'
+  export PATH="$WORK/barrier-bin:$PATH"
+  p4b_codex_request_budget_state owner/repo 7 "$_p4a_head"
+)" && rc=0 || rc=$?
+[ "$rc" = 0 ] \
+  && [ "$(printf '%s' "$out" | jq -r .state)" = exhausted ] \
+  && [ "$(printf '%s' "$out" | jq -r .max_request_attempts)" = 0 ] \
+  || bad="$bad omitted-author-default"
 
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
