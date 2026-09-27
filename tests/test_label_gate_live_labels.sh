@@ -410,36 +410,53 @@ run_propagation() { # <fixture-dir>
 P1="$WORK/propagation-current-pair"
 write_propagation_fixture "$P1" "$HEAD40"
 rc=$(run_propagation "$P1")
-if [ "$rc" -eq 0 ] && [ "$(cat "$P1/label-removals" 2>/dev/null)" = removed ]; then
-  pass "verified propagation removes the label only on the event head/base"
+if [ "$rc" -eq 0 ] \
+   && [ -s "$P1/comment-writes" ] \
+   && [ "$(cat "$P1/dispatches" 2>/dev/null)" = dispatched ] \
+   && [ "$(cat "$P1/label-removals" 2>/dev/null)" = removed ]; then
+  pass "verified propagation publishes authority and removes the label only on the event head/base"
 else
-  fail "current propagation head/base did not remove the label (rc=$rc out=$(cat "$P1/out") err=$(cat "$P1/err"))"
+  fail "current propagation head/base did not publish and remove as expected (rc=$rc out=$(cat "$P1/out") err=$(cat "$P1/err"))"
 fi
 
 P2="$WORK/propagation-stale-head"
 write_propagation_fixture "$P2" "$OTHER_HEAD40"
 rc=$(run_propagation "$P2")
-if [ "$rc" -eq 0 ] && [ ! -f "$P2/label-removals" ]; then
-  pass "a delayed propagation run preserves a newer head's external-review label"
+if [ "$rc" -eq 0 ] && [ ! -f "$P2/comment-writes" ] \
+   && [ ! -f "$P2/dispatches" ] && [ ! -f "$P2/label-removals" ]; then
+  pass "a delayed propagation run publishes no authority and preserves a newer head's label"
 else
-  fail "stale propagation head removed the live label or failed unexpectedly (rc=$rc out=$(cat "$P2/out") err=$(cat "$P2/err"))"
+  fail "stale propagation head published authority, removed the label, or failed unexpectedly (rc=$rc out=$(cat "$P2/out") err=$(cat "$P2/err"))"
 fi
 
 P3="$WORK/propagation-stale-base"
 write_propagation_fixture "$P3" "$HEAD40" "$OTHER_BASE40"
 rc=$(run_propagation "$P3")
-if [ "$rc" -eq 0 ] && [ ! -f "$P3/label-removals" ]; then
-  pass "a delayed propagation run preserves the label after a base retarget"
+if [ "$rc" -eq 0 ] && [ ! -f "$P3/comment-writes" ] \
+   && [ ! -f "$P3/dispatches" ] && [ ! -f "$P3/label-removals" ]; then
+  pass "a delayed propagation run publishes no authority after a base retarget"
 else
-  fail "stale propagation base removed the live label or failed unexpectedly (rc=$rc out=$(cat "$P3/out") err=$(cat "$P3/err"))"
+  fail "stale propagation base published authority, removed the label, or failed unexpectedly (rc=$rc out=$(cat "$P3/out") err=$(cat "$P3/err"))"
+fi
+
+P3B="$WORK/propagation-stale-base-no-label"
+write_propagation_fixture "$P3B" "$HEAD40" "$OTHER_BASE40"
+: >"$P3B/labels.txt"
+rc=$(run_propagation "$P3B")
+if [ "$rc" -eq 0 ] && [ ! -f "$P3B/comment-writes" ] \
+   && [ ! -f "$P3B/dispatches" ] && [ ! -f "$P3B/label-removals" ]; then
+  pass "a stale same-head retarget publishes no authority even when no label is present"
+else
+  fail "label absence let a stale retarget publish propagation authority (rc=$rc out=$(cat "$P3B/out") err=$(cat "$P3B/err"))"
 fi
 
 P4="$WORK/propagation-pair-read-failure"
 write_propagation_fixture "$P4" "$HEAD40"
 touch "$P4/fail-live-head"
 rc=$(run_propagation "$P4")
-if [ "$rc" -ne 0 ] && [ ! -f "$P4/label-removals" ]; then
-  pass "an unreadable live pair fails propagation removal closed"
+if [ "$rc" -ne 0 ] && [ ! -f "$P4/comment-writes" ] \
+   && [ ! -f "$P4/dispatches" ] && [ ! -f "$P4/label-removals" ]; then
+  pass "an unreadable live pair fails propagation authority publication closed"
 else
   fail "unreadable propagation pair did not fail closed (rc=$rc out=$(cat "$P4/out") err=$(cat "$P4/err"))"
 fi
@@ -447,10 +464,25 @@ fi
 P5="$WORK/propagation-malformed-pair"
 write_propagation_fixture "$P5" not-a-sha
 rc=$(run_propagation "$P5")
-if [ "$rc" -ne 0 ] && [ ! -f "$P5/label-removals" ]; then
-  pass "a malformed live pair fails propagation removal closed"
+if [ "$rc" -ne 0 ] && [ ! -f "$P5/comment-writes" ] \
+   && [ ! -f "$P5/dispatches" ] && [ ! -f "$P5/label-removals" ]; then
+  pass "a malformed live pair fails propagation authority publication closed"
 else
   fail "malformed propagation pair did not fail closed (rc=$rc out=$(cat "$P5/out") err=$(cat "$P5/err"))"
+fi
+
+P6="$WORK/propagation-moves-after-marker"
+write_propagation_fixture "$P6" "$HEAD40"
+jq -n --arg head "$HEAD40" --arg base "$OTHER_BASE40" '{head:$head,base:$base}' \
+  >"$P6/live-pair-2"
+rc=$(run_propagation "$P6")
+if [ "$rc" -eq 0 ] \
+   && [ -s "$P6/comment-writes" ] \
+   && [ "$(cat "$P6/dispatches" 2>/dev/null)" = dispatched ] \
+   && [ ! -f "$P6/label-removals" ]; then
+  pass "movement after marker publication is caught by the pre-delete fence"
+else
+  fail "post-marker movement bypassed the pre-delete fence (rc=$rc out=$(cat "$P6/out") err=$(cat "$P6/err"))"
 fi
 
 # The classifier materializes trusted base trees with git worktree, so give it
