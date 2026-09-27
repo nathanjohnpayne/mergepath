@@ -874,6 +874,7 @@ jobs:
           # can confirm THIS head was verified, not merely that the PR was
           # once a faithful mirror at an earlier head.
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           # Recognized propagation PR (see REVIEW_POLICY.md § Propagation
           # PR review lane): the check step VERIFIED it is a byte-for-byte
@@ -963,6 +964,31 @@ jobs:
           # Runs AFTER the marker post above — see ORDER MATTERS.
           EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
           if [ -n "$EXISTING" ]; then
+            # The verified propagation result belongs to the event head/base.
+            # Fence the removal against the live pair immediately before the
+            # write so a delayed run cannot remove a label applied for a newer
+            # divergent head or a retargeted base. Unknown state fails closed;
+            # a confirmed move is a successful stale-run no-op.
+            if ! LIVE_PAIR=$(gh api \
+              "repos/${{ github.repository }}/pulls/$PR_NUMBER" \
+              --jq '{head:.head.sha,base:.base.sha}'); then
+              echo "::error::Could not read the live PR head/base before removing needs-external-review for verified propagation." >&2
+              exit 1
+            fi
+            if ! jq -e '
+                select((.head | type) == "string" and (.head | test("^[0-9a-fA-F]{40}$")))
+                | select((.base | type) == "string" and (.base | test("^[0-9a-fA-F]{40}$")))
+              ' <<<"$LIVE_PAIR" >/dev/null; then
+              echo "::error::Live PR head/base is malformed; refusing verified-propagation label removal." >&2
+              exit 1
+            fi
+            LIVE_HEAD=$(jq -r '.head' <<<"$LIVE_PAIR")
+            LIVE_BASE=$(jq -r '.base' <<<"$LIVE_PAIR")
+            if [ "$LIVE_HEAD" != "$HEAD_SHA" ] || [ "$LIVE_BASE" != "$BASE_SHA" ]; then
+              echo "PR head/base moved from $HEAD_SHA/$BASE_SHA to $LIVE_HEAD/$LIVE_BASE; preserving needs-external-review from the newer PR state."
+              exit 0
+            fi
+
             # PAT-driven so the removal fires the #620 unlabeled settle
             # re-arm (see LABEL_REMOVAL_TOKEN above).
             GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh pr edit "$PR_NUMBER" --remove-label "needs-external-review" \

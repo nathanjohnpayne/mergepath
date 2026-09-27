@@ -192,6 +192,14 @@ else
   pass "label application step is present"
 fi
 
+yq -r '.jobs."external-review-labeling".steps[] | select(.name == "Propagation PR review lane") | .run' \
+  "$WORKFLOW" | sed 's|${{ github.repository }}|o/r|g' >"$WORK/propagation.sh"
+if [ ! -s "$WORK/propagation.sh" ]; then
+  fail "could not extract the propagation review lane"
+else
+  pass "propagation review lane is present"
+fi
+
 mkdir -p "$WORK/bin"
 REAL_BASH=$(command -v bash)
 cat >"$WORK/bin/gh" <<'SH'
@@ -203,6 +211,8 @@ case "$*" in
     printf '[{"filename":"src/example.sh","status":"modified","additions":400,"deletions":0}]\n' ;;
   "pr view 42 --repo o/r --json labels --jq .labels[].name")
     cat "$GH_STUB_DIR/labels.txt" ;;
+  "pr view 42 --repo o/r --json comments --jq .comments[].body")
+    cat "$GH_STUB_DIR/pr-comments.txt" ;;
   "api repos/o/r/pulls/42 --jq {head:.head.sha,base:.base.sha}")
     [ ! -f "$GH_STUB_DIR/fail-live-head" ] || exit 1
     count=$(cat "$GH_STUB_DIR/pair-count" 2>/dev/null || echo 0)
@@ -215,8 +225,12 @@ case "$*" in
     fi ;;
   "pr edit 42 --add-label needs-external-review --repo o/r")
     printf 'added\n' >>"$GH_STUB_DIR/label-writes" ;;
+  "pr edit 42 --remove-label needs-external-review --repo o/r")
+    printf 'removed\n' >>"$GH_STUB_DIR/label-removals" ;;
   "pr comment 42 --repo o/r --body "*)
     printf '%s' "${7-}" >>"$GH_STUB_DIR/comment-writes" ;;
+  "api -X POST repos/o/r/dispatches "*)
+    printf 'dispatched\n' >>"$GH_STUB_DIR/dispatches" ;;
   "api --paginate repos/o/r/issues/42/timeline")
     [ ! -f "$GH_STUB_DIR/fail-timeline" ] || exit 1
     cat "$GH_STUB_DIR/timeline.json" ;;
@@ -353,6 +367,71 @@ if [ "$rc" -ne 0 ] && [ ! -f "$A5C/label-writes" ] && [ ! -f "$A5C/comment-write
   pass "a malformed live base fails closed without label or comment writes"
 else
   fail "malformed live base did not fail closed (rc=$rc out=$(cat "$A5C/out") err=$(cat "$A5C/err"))"
+fi
+
+write_propagation_fixture() { # <dir> <live-head> [live-base]
+  local dir=$1 live_head=$2 live_base=${3:-$BASE40}
+  mkdir -p "$dir"
+  jq -n --arg head "$live_head" --arg base "$live_base" '{head:$head,base:$base}' \
+    >"$dir/live-pair"
+  printf '%s\n' needs-external-review >"$dir/labels.txt"
+  : >"$dir/pr-comments.txt"
+}
+
+run_propagation() { # <fixture-dir>
+  local dir=$1 rc=0
+  env PATH="$WORK/bin:$PATH" REAL_BASH="$REAL_BASH" GH_STUB_DIR="$dir" \
+    GH_TOKEN=fake-read LABEL_REMOVAL_TOKEN=fake-write PR_NUMBER=42 \
+    HEAD_SHA="$HEAD40" BASE_SHA="$BASE40" \
+    "$REAL_BASH" --noprofile --norc -e -o pipefail "$WORK/propagation.sh" \
+      >"$dir/out" 2>"$dir/err" || rc=$?
+  printf '%s' "$rc"
+}
+
+P1="$WORK/propagation-current-pair"
+write_propagation_fixture "$P1" "$HEAD40"
+rc=$(run_propagation "$P1")
+if [ "$rc" -eq 0 ] && [ "$(cat "$P1/label-removals" 2>/dev/null)" = removed ]; then
+  pass "verified propagation removes the label only on the event head/base"
+else
+  fail "current propagation head/base did not remove the label (rc=$rc out=$(cat "$P1/out") err=$(cat "$P1/err"))"
+fi
+
+P2="$WORK/propagation-stale-head"
+write_propagation_fixture "$P2" "$OTHER_HEAD40"
+rc=$(run_propagation "$P2")
+if [ "$rc" -eq 0 ] && [ ! -f "$P2/label-removals" ]; then
+  pass "a delayed propagation run preserves a newer head's external-review label"
+else
+  fail "stale propagation head removed the live label or failed unexpectedly (rc=$rc out=$(cat "$P2/out") err=$(cat "$P2/err"))"
+fi
+
+P3="$WORK/propagation-stale-base"
+write_propagation_fixture "$P3" "$HEAD40" "$OTHER_BASE40"
+rc=$(run_propagation "$P3")
+if [ "$rc" -eq 0 ] && [ ! -f "$P3/label-removals" ]; then
+  pass "a delayed propagation run preserves the label after a base retarget"
+else
+  fail "stale propagation base removed the live label or failed unexpectedly (rc=$rc out=$(cat "$P3/out") err=$(cat "$P3/err"))"
+fi
+
+P4="$WORK/propagation-pair-read-failure"
+write_propagation_fixture "$P4" "$HEAD40"
+touch "$P4/fail-live-head"
+rc=$(run_propagation "$P4")
+if [ "$rc" -ne 0 ] && [ ! -f "$P4/label-removals" ]; then
+  pass "an unreadable live pair fails propagation removal closed"
+else
+  fail "unreadable propagation pair did not fail closed (rc=$rc out=$(cat "$P4/out") err=$(cat "$P4/err"))"
+fi
+
+P5="$WORK/propagation-malformed-pair"
+write_propagation_fixture "$P5" not-a-sha
+rc=$(run_propagation "$P5")
+if [ "$rc" -ne 0 ] && [ ! -f "$P5/label-removals" ]; then
+  pass "a malformed live pair fails propagation removal closed"
+else
+  fail "malformed propagation pair did not fail closed (rc=$rc out=$(cat "$P5/out") err=$(cat "$P5/err"))"
 fi
 
 # The classifier materializes trusted base trees with git worktree, so give it
