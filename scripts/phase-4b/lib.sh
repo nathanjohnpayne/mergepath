@@ -560,11 +560,6 @@ p4b_codex_request_budget_state() {
   count=$(crqe_count_triggers "$comments" "$author") \
     || { jq -nc '{state:"unreadable",reason:"request-count-invalid"}'; return 2; }
   cap=$(printf '%s' "$budget" | jq -r '.max_request_attempts')
-  if [ "$count" -lt "$cap" ]; then
-    jq -nc --argjson n "$count" --argjson cap "$cap" \
-      '{state:"available",request_attempts:$n,max_request_attempts:$cap}'
-    return 0
-  fi
   live_head=$(gh_api_scalar --shape sha "Codex cap live PR head" \
     "repos/$repo/pulls/$pr" --jq '.head.sha') \
     || { jq -nc '{state:"unreadable",reason:"head-read-failed"}'; return 2; }
@@ -572,6 +567,11 @@ p4b_codex_request_budget_state() {
     jq -nc --arg h "$head" --arg l "$live_head" \
       '{state:"drift",reason:"head-moved",reviewed_head:$h,live_head:$l}'
     return 2
+  fi
+  if [ "$count" -lt "$cap" ]; then
+    jq -nc --argjson n "$count" --argjson cap "$cap" \
+      '{state:"available",request_attempts:$n,max_request_attempts:$cap}'
+    return 0
   fi
   committed=$(gh_api_scalar --shape timestamp "Codex cap head commit time" \
     "repos/$repo/commits/$head" --jq '.commit.committer.date') \
@@ -1560,6 +1560,7 @@ p4b_same_head_barrier() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
   local root cr_bin cx_bin rc json probe_head cx_timeout_json="" cx_timeout_rc=0
   local cx_budget_json="" cx_budget_rc=0 cx_budget_state=""
+  local initial_cls_cx="" initial_cx_evidence=""
   local pending=false why="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
   local cx_evidence="disabled" cr_carry="" cr_carry_json="null"
   local cap_exhausted=false final_request_pending=false human_tiebreaker=false
@@ -1579,74 +1580,112 @@ p4b_same_head_barrier() {
     CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
       "$cx_bin" --diagnostic-signal-only "$pr" "$repo" >/dev/null 2>&1 || rc=$?
     cls_cx="$(p4b_barrier_class_codex "$rc")"
-    case "$cls_cx" in
-      reported) cx_evidence="signal" ;;
-      waived) cx_evidence="account-or-connection-block" ;;
-      not-yet)
-        # Diagnostic rc 1 alone means only "no current-head provider signal".
-        # A prior, positively recorded Phase 4a timeout for this head refines
-        # that absence into the documented fallback; no record remains pending.
+    initial_cls_cx="$cls_cx"
+    case "$initial_cls_cx" in
+      reported)
+        cx_evidence="signal"
+        ;;
+      *)
+        case "$initial_cls_cx" in
+          waived) initial_cx_evidence="account-or-connection-block" ;;
+          not-yet) initial_cx_evidence="none" ;;
+          *) initial_cx_evidence="diagnostic-error" ;;
+        esac
+
+        # Every non-report outcome must prove either a trusted timeout or the
+        # governing request budget before it can reach an authority-bearing
+        # fallback. Diagnostic infrastructure failures are included: at the
+        # cap they stop for a human, while unreadable budget evidence stops as
+        # an error. A valid earlier timeout continues to win before the cap.
         cx_timeout_rc=0
         cx_timeout_json="$(p4b_codex_timeout_determination "$repo" "$pr" "$head")" || cx_timeout_rc=$?
         cx_evidence="$(printf '%s' "$cx_timeout_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
-        case "$cx_timeout_rc" in
-          0) cls_cx="waived"; cx_evidence="timeout" ;;
-          1)
-            # Absence of a trusted timeout is still pending only while a
-            # request can be made or the already-issued final request remains
-            # eligible to poll. At the governing cap there is no automated
-            # path left; #1305 sends that condition to the human tiebreaker,
-            # never to an adapter capable of conferring review authority.
-            cx_budget_rc=0
-            cx_budget_json="$(p4b_codex_request_budget_state "$repo" "$pr" "$head")" || cx_budget_rc=$?
-            cx_budget_state="$(printf '%s' "$cx_budget_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
-            case "$cx_budget_rc:$cx_budget_state" in
-              0:available) ;;
-              0:final-request-pending)
-                cap_exhausted=true
-                final_request_pending=true
-                cx_evidence="request-cap-final-pending"
-                ;;
-              0:exhausted)
-                cap_exhausted=true
-                human_tiebreaker=true
-                cls_cx="cap-exhausted"
-                cx_evidence="request-cap"
-                why="Codex request cap exhausted with no eligible final request left to poll; human tiebreaker required"
-                ;;
-              *)
+        if [ "$initial_cls_cx" = not-yet ]; then
+          initial_cx_evidence="$cx_evidence"
+        fi
+        if [ "$cx_timeout_rc" = 0 ]; then
+          cls_cx="waived"
+          cx_evidence="timeout"
+        else
+          cx_budget_rc=0
+          cx_budget_json="$(p4b_codex_request_budget_state "$repo" "$pr" "$head")" || cx_budget_rc=$?
+          cx_budget_state="$(printf '%s' "$cx_budget_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+          case "$cx_budget_rc:$cx_budget_state" in
+            0:available)
+              cls_cx="$initial_cls_cx"
+              cx_evidence="$initial_cx_evidence"
+              if [ "$initial_cls_cx" = not-yet ] && [ "$cx_timeout_rc" != 1 ]; then
                 cls_cx="escalate"
-                budget_unsafe=true
-                cx_evidence="$cx_budget_state"
-                if [ "$cx_budget_state" = drift ]; then
-                  why="PR head moved during request-cap evaluation (reviewing $head, live $(printf '%s' "$cx_budget_json" | jq -r '.live_head // "unknown"')) — rerun on the new head"
-                else
-                  why="Codex request-cap evidence is unreadable; refusing to infer an available request or a human-tiebreaker stop"
+                cx_evidence="$(printf '%s' "$cx_timeout_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+                if [ "$(printf '%s' "$cx_timeout_json" | jq -r '.reason // empty')" = latest-request-selector-failed ]; then
+                  budget_unsafe=true
+                  cx_budget_json="$cx_timeout_json"
                 fi
-                ;;
-            esac
-            ;;
-          *)
-            cls_cx="escalate"
-            if [ "$(printf '%s' "$cx_timeout_json" | jq -r '.reason // empty')" = latest-request-selector-failed ]; then
+                case "$cx_evidence" in
+                  drift)
+                    budget_unsafe=true
+                    cx_budget_json="$cx_timeout_json"
+                    why="PR head moved during evaluation (reviewing $head, live $(printf '%s' "$cx_timeout_json" | jq -r '.live_head // "unknown"')) — rerun on the new head"
+                    ;;
+                  malformed) why="Phase 4a timeout evidence is malformed; refusing to waive Codex" ;;
+                  *) why="Phase 4a timeout evidence is unreadable; refusing to treat Codex as terminal" ;;
+                esac
+              fi
+              ;;
+            0:final-request-pending)
+              cap_exhausted=true
+              final_request_pending=true
+              cls_cx="not-yet"
+              cx_evidence="request-cap-final-pending"
+              ;;
+            0:exhausted)
+              cap_exhausted=true
+
+              # Budget evaluation performs several reads. Re-sample both
+              # terminal sources immediately before committing to the
+              # non-retryable human stop so a report or timeout that landed
+              # during those reads can still finish the automated path.
+              rc=0
+              CODEX_REVIEW_CHECK_SKIP_CI=1 \
+              CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+              CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
+                "$cx_bin" --diagnostic-signal-only "$pr" "$repo" >/dev/null 2>&1 || rc=$?
+              cls_cx="$(p4b_barrier_class_codex "$rc")"
+              if [ "$cls_cx" = reported ]; then
+                cx_evidence="signal"
+              else
+                cx_timeout_rc=0
+                cx_timeout_json="$(p4b_codex_timeout_determination "$repo" "$pr" "$head")" || cx_timeout_rc=$?
+                cx_evidence="$(printf '%s' "$cx_timeout_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+                if [ "$cx_timeout_rc" = 0 ]; then
+                  cls_cx="waived"
+                  cx_evidence="timeout"
+                elif [ "$cx_evidence" = drift ]; then
+                  cls_cx="escalate"
+                  budget_unsafe=true
+                  cx_budget_json="$cx_timeout_json"
+                  why="PR head moved during terminal-evidence recheck (reviewing $head, live $(printf '%s' "$cx_timeout_json" | jq -r '.live_head // "unknown"')) — rerun on the new head"
+                else
+                  human_tiebreaker=true
+                  cls_cx="cap-exhausted"
+                  cx_evidence="request-cap"
+                  why="Codex request cap exhausted with no eligible final request left to poll; human tiebreaker required"
+                fi
+              fi
+              ;;
+            *)
+              cls_cx="escalate"
               budget_unsafe=true
-              cx_budget_json="$cx_timeout_json"
-            fi
-            case "$cx_evidence" in
-              drift)
-                why="PR head moved during evaluation (reviewing $head, live $(printf '%s' "$cx_timeout_json" | jq -r '.live_head // "unknown"')) — rerun on the new head"
-                ;;
-              malformed)
-                why="Phase 4a timeout evidence is malformed; refusing to waive Codex"
-                ;;
-              *)
-                why="Phase 4a timeout evidence is unreadable; refusing to treat Codex as terminal"
-                ;;
-            esac
-            ;;
-        esac
+              cx_evidence="$cx_budget_state"
+              if [ "$cx_budget_state" = drift ]; then
+                why="PR head moved during request-cap evaluation (reviewing $head, live $(printf '%s' "$cx_budget_json" | jq -r '.live_head // "unknown"')) — rerun on the new head"
+              else
+                why="Codex request-cap evidence is unreadable; refusing to infer an available request or a human-tiebreaker stop"
+              fi
+              ;;
+          esac
+        fi
         ;;
-      *) cx_evidence="diagnostic-error" ;;
     esac
     # Waiving an account-blocked Codex only helps where a Phase 4b APPROVED can
     # actually clear gate (c). With codex.allow_phase_4b_substitute: false the

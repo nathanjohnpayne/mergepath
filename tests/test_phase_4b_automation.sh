@@ -3849,7 +3849,7 @@ case "$endpoint" in
     else
       emit "{\"tree\":[{\"path\":\"README.md\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"r\"},{\"path\":\".coderabbit.yml\",\"mode\":\"$mode\",\"type\":\"blob\",\"sha\":\"$blob\"}]}"
     fi ;;
-  repos/owner/repo/pulls/7)
+  repos/owner/repo/pulls/7|repos/o/r/pulls/814)
     emit "{\"head\":{\"sha\":\"${P4B_TEST_LIVE_HEAD:-abc123}\"},\"base\":{\"sha\":\"${P4B_TEST_BASE_SHA:-3333333333333333333333333333333333333333}\"}}" ;;
   *)
     printf '[]\n' ;;
@@ -3885,7 +3885,8 @@ _barrier() { # <cx_rc> <cr_rc> <cr_json> [policy] [head]
   (
     export MERGEPATH_REVIEW_POLICY_PATH="${4:-$WORK/barrier-both.yml}"
     export P4B_ACCT_STATE_DIR="$WORK/barrier-state"
-    export P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx.sh"
+    export P4B_CODEX_REVIEW_CHECK="${P4B_TEST_CODEX_STUB:-$WORK/stub-cx.sh}"
+    export P4B_TEST_CODEX_RECHECK_MARKER="${P4B_TEST_CODEX_RECHECK_MARKER:-$WORK/codex-recheck.marker}"
     export P4B_CODERABBIT_WAIT="$WORK/stub-cr.sh"
     export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
     export P4B_TEST_COMMENTS_JSON="${P4B_TEST_COMMENTS_JSON-[]}" P4B_TEST_LIVE_HEAD="${P4B_TEST_LIVE_HEAD:-${5:-abc123}}"
@@ -4024,7 +4025,7 @@ out="$(P4B_TEST_COMMENTS_JSON="$_malformed" P4B_TEST_LIVE_HEAD="$_p4a_head" \
 
 out="$(P4B_TEST_COMMENTS_FAIL=true P4B_TEST_LIVE_HEAD="$_p4a_head" \
   _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
-[ "$rc" = 2 ] || bad="$bad unreadable-not-escalated"
+[ "$rc" = 4 ] || bad="$bad unreadable-not-fail-closed"
 [ "$(printf '%s' "$out" | jq -r '.codex_evidence')" = unreadable ] || bad="$bad unreadable-evidence"
 
 # The canonical paginated-list reader must reject response streams that a
@@ -4037,14 +4038,14 @@ for _stream_case in empty null mixed; do
   esac
   out="$(P4B_TEST_COMMENTS_JSON="$_stream" P4B_TEST_LIVE_HEAD="$_p4a_head" \
     _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
-  [ "$rc" = 2 ] || bad="$bad ${_stream_case}-stream-not-escalated"
+  [ "$rc" = 4 ] || bad="$bad ${_stream_case}-stream-not-fail-closed"
   [ "$(printf '%s' "$out" | jq -r '.codex_evidence')" = unreadable ] \
     || bad="$bad ${_stream_case}-stream-evidence"
 done
 
 out="$(P4B_TEST_COMMENTS_JSON="$_current" P4B_TEST_LIVE_HEAD="$_p4a_old" \
   _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/barrier-both.yml" "$_p4a_head")" && rc=0 || rc=$?
-[ "$rc" = 2 ] || bad="$bad drift-not-escalated"
+[ "$rc" = 4 ] || bad="$bad drift-not-fail-closed"
 printf '%s' "$out" | jq -e '.reason | test("head moved")' >/dev/null 2>&1 || bad="$bad drift-reason"
 
 out="$(P4B_TEST_COMMENTS_JSON="$_current" P4B_TEST_LIVE_HEAD="$_p4a_head" \
@@ -4120,6 +4121,19 @@ out="$(
   && [ "$(printf '%s' "$out" | jq -r .max_request_attempts)" = 0 ] \
   || bad="$bad omitted-author-default"
 
+# Even an available request budget has no authority to classify an obsolete
+# reviewed head. The live-head fence precedes every successful budget state.
+out="$(
+  export MERGEPATH_REVIEW_POLICY_PATH="$WORK/cap-candidate.yml"
+  export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
+  export P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml"
+  export P4B_TEST_COMMENTS_JSON='[]' P4B_TEST_LIVE_HEAD="$_p4a_old"
+  export PATH="$WORK/barrier-bin:$PATH"
+  p4b_codex_request_budget_state owner/repo 7 "$_p4a_head"
+)" && rc=0 || rc=$?
+[ "$rc" = 2 ] && [ "$(printf '%s' "$out" | jq -r .state)" = drift ] \
+  || bad="$bad available-budget-skipped-head-fence"
+
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 1 ] || bad="$bad final-request-not-polled"
@@ -4155,6 +4169,32 @@ out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/does-not-exist" P4B_TEST_COMMENTS_JSON='
 [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] || bad="$bad unreadable-not-fail-closed"
 out="$(crqe_select_trigger() { return 9; }; P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .request_budget.reason)" = final-request-selector-failed ] || bad="$bad selector-error-not-fail-closed"
+
+# Diagnostic infrastructure errors cannot bypass the same governing cap. A
+# readable exhausted budget stops for a human; unreadable budget evidence has
+# no authority and takes the dedicated error path.
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 3 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 3 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = human-tiebreaker ] \
+  || bad="$bad diagnostic-error-bypassed-cap"
+out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/does-not-exist" P4B_TEST_COMMENTS_JSON='[]' _barrier 3 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+  || bad="$bad diagnostic-error-unreadable-budget"
+
+# Budget resolution is multi-read. If Codex reports during it, the terminal
+# recheck must observe that report before the non-retryable exit-8 decision.
+cat >"$WORK/stub-cx-report-on-recheck.sh" <<'EOF'
+#!/bin/sh
+if [ -e "$P4B_TEST_CODEX_RECHECK_MARKER" ]; then
+  exit 0
+fi
+: >"$P4B_TEST_CODEX_RECHECK_MARKER"
+exit 1
+EOF
+chmod +x "$WORK/stub-cx-report-on-recheck.sh"
+rm -f "$WORK/codex-recheck.marker"
+out="$(P4B_TEST_CODEX_STUB="$WORK/stub-cx-report-on-recheck.sh" P4B_TEST_CODEX_RECHECK_MARKER="$WORK/codex-recheck.marker" P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = signal ] \
+  || bad="$bad terminal-report-race-not-rechecked"
 if [ -z "$bad" ]; then
   pass "#1305: governing request-cap exhaustion stops for a human while final-request polling, old timeout, and current report retain precedence"
 else

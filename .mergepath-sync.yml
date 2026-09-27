@@ -1325,6 +1325,26 @@ paths:
   - path: tests/test_phase_4b_automation.sh
     type: canonical
     consumers: all
+    requires:
+      # This suite executes the complete Phase 4b package. Commit-path closure
+      # does not follow nested `requires`, so declare every runtime dependency
+      # directly on the test entry rather than relying on the two entrypoints.
+      - "scripts/phase-4b-review.sh"
+      - "scripts/phase-4b/"
+      - "scripts/lib/pr-body-contract.sh"
+      - "scripts/lib/pr-body-contract.mjs"
+      - "scripts/lib/codex-request-evidence.sh"
+      - "scripts/workflow/resolve_base_policy.sh"
+      - "scripts/lib/codex-failure-markers.sh"
+      - "scripts/lib/gh-api-array.sh"
+      - "scripts/lib/gh-api-scalar.sh"
+      - "scripts/gh-as-reviewer.sh"
+      - "scripts/post-phase-4b-handoff.sh"
+      - "scripts/coderabbit-wait.sh"
+      - "scripts/codex-review-check.sh"
+      - "scripts/review-feedback-accounting.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
+      - "tests/fixtures/phase_4b_verdicts.jsonl"
   # Pairs with scripts/phase-4b/accounting.sh (+ accounting.schema.json and
   # prices.json, all carried by the scripts/phase-4b/ kit) and is
   # hard-required by scripts/ci/check_phase_4b_accounting (#602). Offline:
