@@ -1834,6 +1834,18 @@ def _skip_balanced_parens(text, start):
         if c == "\\":
             i += 2
             continue
+        if (
+            quotes
+            and quotes[-1] == '"'
+            and c == "$"
+            and text[i + 1 : i + 2] == "("
+            and text[i + 2 : i + 3] != "("
+        ):
+            # A command substitution inside double quotes starts a fresh
+            # shell quote context.  Its quotes and parentheses cannot close
+            # the enclosing double quote or balanced list (#1494 review).
+            i = _skip_balanced_parens(text, i + 1)
+            continue
         if c == "'" and not (quotes and quotes[-1] == '"'):
             quotes.append("'")
             i += 1
@@ -2743,6 +2755,17 @@ def _find_compound_close(text, open_idx):
             continue
         if c == "\\":
             i += 2
+            continue
+        if (
+            quotes
+            and quotes[-1] == '"'
+            and c == "$"
+            and text[i + 1 : i + 2] == "("
+            and text[i + 2 : i + 3] != "("
+        ):
+            # Keep the enclosing function's quote and delimiter state out of
+            # the nested command substitution's independent shell text.
+            i = _skip_balanced_parens(text, i + 1)
             continue
         if c == "#" and not quotes and (i == 0 or text[i - 1] in _WORD_BREAK_BEFORE_COMMENT):
             eol = text.find("\n", i)
@@ -4215,6 +4238,14 @@ CORPUS = [
         'msgs=("do not $(printf \'%s\' "$GH_TOKEN" >&2)")\n',
     ),
     (
+        # A command substitution inside the double-quoted element starts a
+        # fresh quote context.  Its single-quoted `")` is data: neither
+        # character may close the outer quote or array span (#1494 review).
+        "array-double-quoted-nested-substitution-quote-context",
+        MUST_FLAG,
+        'args=("$(printf \'%s\' \'")\')"); echo "$GH_TOKEN"\n',
+    ),
+    (
         # A SUBSHELL inside an array assignment's absorbed `$( )`.  The same
         # construct as `subshell-inside-capture`, and it must get the same
         # verdict: `_absorb_substitutions` re-parents only the segments the
@@ -4412,6 +4443,11 @@ CORPUS = [
         "helper-double-quoted-no-apostrophe-control",
         MUST_FLAG,
         'die() { echo "cannot: $1" >&2; }\ndie "$GH_TOKEN"\n',
+    ),
+    (
+        "helper-double-quoted-nested-substitution-quote-context",
+        MUST_FLAG,
+        'die() { echo "$(printf \'%s\' \'")\') $1" >&2; }\ndie "$GH_TOKEN"\n',
     ),
     (
         "helper-function-keyword",
@@ -5124,6 +5160,11 @@ CORPUS = [
         "xtrace-disable-after-double-quoted-no-apostrophe-control",
         MUST_FLAG,
         'set -x\nquiet() {\n  echo "do not trace"\n  set +x\n}\n: "$GH_TOKEN"\n',
+    ),
+    (
+        "xtrace-function-nested-substitution-quote-context",
+        MUST_FLAG,
+        'set -x\nquiet() {\n  printf \'%s\' "$(printf \'%s\' \'")\')" >/dev/null\n  set +x\n}\n: "$GH_TOKEN"\n',
     ),
     (
         # The declared cost of that asymmetry: a function that IS called and
