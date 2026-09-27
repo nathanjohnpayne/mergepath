@@ -65,16 +65,24 @@ crqe_request_threshold() { # head-committer-date timeline-json freshness-seconds
 
 # Resolve the request budget from the PR's governing base policy. The caller
 # must already have sourced feedback-policy-helpers.sh (policy_yaml_to_json).
-# Prints {author_identity,max_request_attempts}; returns non-zero on every
+# Prints {author_identity,max_request_attempts,reaction_freshness_window_seconds};
+# returns non-zero on every
 # unreadable or malformed input. A materialized policy is removed here.
-crqe_governing_budget() { # repo pr default-config candidate-author [resolver]
+crqe_governing_budget() { # repo pr default-config candidate-author [resolver [base-ref base-sha default-branch]]
   local repo="$1" pr="$2" config="$3" candidate="$4"
   local resolver="${5:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/workflow/resolve_base_policy.sh}"
-  local base_cfg="" base_json="" author="" cap="" rc=0
+  local base_ref="${6:-}" base_sha="${7:-}" default_branch="${8:-}"
+  local base_cfg="" base_json="" author="" cap="" freshness="" rc=0
   command -v policy_yaml_to_json >/dev/null 2>&1 || return 1
   [ -x "$resolver" ] || return 1
-  base_cfg=$("$resolver" --repo "$repo" --pr "$pr" \
-    --default-config "$config" --materialize-default 2>/dev/null) || return 1
+  if [ -n "$base_ref$base_sha$default_branch" ]; then
+    [ -n "$base_ref" ] && [ -n "$base_sha" ] && [ -n "$default_branch" ] || return 1
+    base_cfg=$("$resolver" --repo "$repo" --base-ref "$base_ref" --base-sha "$base_sha" \
+      --default-branch "$default_branch" --default-config "$config" --materialize-default 2>/dev/null) || return 1
+  else
+    base_cfg=$("$resolver" --repo "$repo" --pr "$pr" \
+      --default-config "$config" --materialize-default 2>/dev/null) || return 1
+  fi
   [ -n "$base_cfg" ] && [ -r "$base_cfg" ] || return 1
   base_json=$(policy_yaml_to_json "$base_cfg" 2>/dev/null) || rc=$?
   [ "$base_cfg" = "$config" ] || rm -f "$base_cfg" 2>/dev/null || true
@@ -102,8 +110,21 @@ crqe_governing_budget() { # repo pr default-config candidate-author [resolver]
   [ "${#cap}" -le 9 ] || return 1
   cap=$(printf '%s' "$cap" | sed 's/^0*//')
   [ -n "$cap" ] || cap=0
-  jq -nc --arg author "$author" --argjson cap "$cap" \
-    '{author_identity:$author,max_request_attempts:$cap}'
+  freshness=$(printf '%s' "$base_json" | jq -r '
+    if type != "object" then "__invalid__"
+    elif (has("codex") | not) then "1800"
+    elif ((.codex | type) != "object") then "__invalid__"
+    elif (.codex | has("reaction_freshness_window_seconds")) then
+      .codex.reaction_freshness_window_seconds
+      | if (type == "string" or type == "number") then tostring else "__invalid__" end
+    else "1800" end') || return 1
+  case "$freshness" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#freshness}" -le 9 ] || return 1
+  freshness=$(printf '%s' "$freshness" | sed 's/^0*//')
+  [ -n "$freshness" ] || freshness=0
+  jq -nc --arg author "$author" --argjson cap "$cap" --argjson freshness "$freshness" \
+    '{author_identity:$author,max_request_attempts:$cap,
+      reaction_freshness_window_seconds:$freshness}'
 }
 
 crqe_ack_present() { # reactions-json bot trigger-time; caller binds comment ID

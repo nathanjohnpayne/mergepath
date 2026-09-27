@@ -2674,9 +2674,10 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   P4B_FAKE_LIVE_HEAD=def456 \
   bash "$ORCH" 137 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" = 4 ] \
-   && printf '%s' "$out" | jq -r '.reason' | grep -q "refusing to file post-review issues"; then
-  pass "#674: head drift refuses BEFORE issue filing"
+if [ "$rc" = 10 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.infrastructure_error')" = true ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "head moved"; then
+  pass "#674: head drift stops before issue filing with no stale-head authority"
 else fail "#674 head-drift pre-check (rc=$rc): $out"; fi
 [ ! -s "$DRIFT_ISSUE_LOG" ] \
   && pass "#674: no issues created for a drifted head" || fail "#674: issues created despite head drift"
@@ -2789,7 +2790,7 @@ DRIFT2_ISSUE_LOG="$WORK/issue-drift2.log"; : > "$DRIFT2_ISSUE_LOG"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DRIFT2_ISSUE_LOG" \
-  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=3 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-drift2-wrapper.log" \
   bash "$ORCH" 145 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
@@ -2841,7 +2842,7 @@ LATE_ISSUE_LOG="$WORK/issue-late-drift.log"; : > "$LATE_ISSUE_LOG"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$LATE_ISSUE_LOG" \
-  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=3 \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=4 \
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-late-wrapper.log" \
   bash "$ORCH" 147 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
@@ -2885,11 +2886,11 @@ out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$B
   P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=def456 \
   bash "$ORCH" 127 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
-if [ "$rc" = 4 ] \
-   && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
-   && [ "$(printf '%s' "$out" | jq -r '.reason')" = "PR head changed during review (reviewed abc123, live def456)" ] \
+if [ "$rc" = 10 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.infrastructure_error')" = "true" ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "head moved" \
    && [ ! -e "$WRAPPER_LOG" ]; then
-  pass "live head drift before posting → manual fallback, no review write"
+  pass "live head drift before posting → authority stop, no review write"
 else fail "stale-head guard (rc=$rc, out=$out, wrapper_log=$(test -e "$WRAPPER_LOG" && cat "$WRAPPER_LOG" || true))"; fi
 
 WRAPPER_LOG="$WORK/wrapper-success.log"
@@ -3821,8 +3822,17 @@ emit() {
 }
 case "$endpoint" in
   repos/owner/repo/issues/7/comments)
+    comments_json=${P4B_TEST_COMMENTS_JSON-[]}
+    if [ -n "${P4B_TEST_COMMENTS_RACE_FILE:-}" ]; then
+      cn=$(cat "$P4B_TEST_COMMENTS_RACE_FILE" 2>/dev/null || printf 0)
+      cn=$((cn + 1)); printf '%s\n' "$cn" >"$P4B_TEST_COMMENTS_RACE_FILE"
+      [ "$cn" -lt "${P4B_TEST_COMMENTS_FAIL_AFTER:-999}" ] || exit 42
+      if [ "$cn" -ge "${P4B_TEST_COMMENTS_CHANGE_AFTER:-999}" ]; then
+        comments_json=${P4B_TEST_COMMENTS_JSON_AFTER-$comments_json}
+      fi
+    fi
     [ "${P4B_TEST_COMMENTS_FAIL:-false}" != true ] || exit 42
-    printf '%s\n' "${P4B_TEST_COMMENTS_JSON-[]}" ;;
+    printf '%s\n' "$comments_json" ;;
   repos/owner/repo/issues/7/timeline)
     printf '%s\n' "${P4B_TEST_TIMELINE_JSON-[]}" ;;
   repos/owner/repo/compare/*)
@@ -3850,7 +3860,19 @@ case "$endpoint" in
       emit "{\"tree\":[{\"path\":\"README.md\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"r\"},{\"path\":\".coderabbit.yml\",\"mode\":\"$mode\",\"type\":\"blob\",\"sha\":\"$blob\"}]}"
     fi ;;
   repos/owner/repo/pulls/7|repos/o/r/pulls/814)
-    emit "{\"head\":{\"sha\":\"${P4B_TEST_LIVE_HEAD:-abc123}\"},\"base\":{\"sha\":\"${P4B_TEST_BASE_SHA:-3333333333333333333333333333333333333333}\"}}" ;;
+    head_sha=${P4B_TEST_LIVE_HEAD:-abc123}
+    if [ -n "${P4B_TEST_HEAD_RACE_FILE:-}" ]; then
+      hn=$(cat "$P4B_TEST_HEAD_RACE_FILE" 2>/dev/null || printf 0)
+      hn=$((hn + 1)); printf '%s\n' "$hn" >"$P4B_TEST_HEAD_RACE_FILE"
+      [ "$hn" -lt "${P4B_TEST_HEAD_RACE_AFTER:-1}" ] || head_sha=${P4B_TEST_LIVE_HEAD_AFTER:-def456}
+    fi
+    base_sha=${P4B_TEST_BASE_SHA:-3333333333333333333333333333333333333333}
+    if [ -n "${P4B_TEST_BASE_RACE_FILE:-}" ]; then
+      n=$(cat "$P4B_TEST_BASE_RACE_FILE" 2>/dev/null || printf 0)
+      n=$((n + 1)); printf '%s\n' "$n" >"$P4B_TEST_BASE_RACE_FILE"
+      [ "$n" -lt 2 ] || base_sha=${P4B_TEST_BASE_SHA_AFTER:-4444444444444444444444444444444444444444}
+    fi
+    emit "{\"head\":{\"sha\":\"$head_sha\"},\"base\":{\"ref\":\"${P4B_TEST_BASE_REF:-main}\",\"sha\":\"$base_sha\",\"repo\":{\"default_branch\":\"${P4B_TEST_DEFAULT_BRANCH:-main}\"}}}" ;;
   *)
     printf '[]\n' ;;
 esac
@@ -3891,11 +3913,16 @@ _barrier() { # <cx_rc> <cr_rc> <cr_json> [policy] [head]
     export P4B_RESOLVE_BASE_POLICY="$WORK/barrier-bin/resolve-policy"
     export P4B_TEST_COMMENTS_JSON="${P4B_TEST_COMMENTS_JSON-[]}" P4B_TEST_LIVE_HEAD="${P4B_TEST_LIVE_HEAD:-${5:-abc123}}"
     export P4B_TEST_COMMENTS_FAIL="${P4B_TEST_COMMENTS_FAIL:-false}"
+    export P4B_TEST_COMMENTS_RACE_FILE="${P4B_TEST_COMMENTS_RACE_FILE:-}" P4B_TEST_COMMENTS_FAIL_AFTER="${P4B_TEST_COMMENTS_FAIL_AFTER:-999}"
+    export P4B_TEST_COMMENTS_CHANGE_AFTER="${P4B_TEST_COMMENTS_CHANGE_AFTER:-999}" P4B_TEST_COMMENTS_JSON_AFTER="${P4B_TEST_COMMENTS_JSON_AFTER:-}"
     export P4B_TEST_TIMELINE_JSON="${P4B_TEST_TIMELINE_JSON-[]}"
     export P4B_TEST_COMMIT_DATE="${P4B_TEST_COMMIT_DATE:-2026-09-26T00:00:00Z}"
+    export P4B_TEST_BASE_REF="${P4B_TEST_BASE_REF:-main}" P4B_TEST_BASE_SHA="${P4B_TEST_BASE_SHA:-3333333333333333333333333333333333333333}"
+    export P4B_TEST_DEFAULT_BRANCH="${P4B_TEST_DEFAULT_BRANCH:-main}" P4B_TEST_BASE_RACE_FILE="${P4B_TEST_BASE_RACE_FILE:-}" P4B_TEST_BASE_SHA_AFTER="${P4B_TEST_BASE_SHA_AFTER:-4444444444444444444444444444444444444444}"
+    export P4B_TEST_HEAD_RACE_FILE="${P4B_TEST_HEAD_RACE_FILE:-}" P4B_TEST_HEAD_RACE_AFTER="${P4B_TEST_HEAD_RACE_AFTER:-1}" P4B_TEST_LIVE_HEAD_AFTER="${P4B_TEST_LIVE_HEAD_AFTER:-def456}"
     export P4B_TEST_BASE_POLICY_PATH="${P4B_TEST_BASE_POLICY_PATH-}"
     export PATH="$WORK/barrier-bin:$PATH"
-    p4b_same_head_barrier owner/repo 7 "${5:-abc123}" rev-bot true
+    p4b_same_head_barrier owner/repo 7 "${5:-abc123}" rev-bot true "${6:-all}"
   )
 }
 
@@ -4078,7 +4105,7 @@ coderabbit:
 codex:
   enabled: true
   max_review_rounds: 2
-  reaction_freshness_window_seconds: 1800
+  reaction_freshness_window_seconds: 7200
 EOF
 cat >"$WORK/cap-base-zero-wait.yml" <<'EOF'
 author_identity: nathanjohnpayne
@@ -4102,6 +4129,14 @@ _cap_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 _cap_old='[{"id":5101,"user":{"login":"nathanjohnpayne"},"body":"@codex review","created_at":"2026-08-01T00:00:00Z"},{"id":5102,"user":{"login":"nathanjohnpayne"},"body":"@CODEX REVIEW","created_at":"2026-08-02T00:00:00Z"}]'
 _cap_final=$(printf '%s' "$_cap_old" | jq -c --arg now "$_cap_now" '.[1].created_at=$now')
 bad=""
+# Request selection must use the target branch's governing freshness window,
+# not the candidate/trusted checkout's local value.
+_governing_budget="$({
+  export P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml"
+  crqe_governing_budget owner/repo 7 "$WORK/cap-candidate.yml" nathanjohnpayne "$WORK/barrier-bin/resolve-policy"
+})" || _governing_budget=''
+[ "$(printf '%s' "$_governing_budget" | jq -r '.reaction_freshness_window_seconds // empty')" = 7200 ] \
+  || bad="$bad governing-freshness-not-carried"
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 3 ] || bad="$bad exhausted-not-tiebreak"
@@ -4134,6 +4169,20 @@ out="$(
 [ "$rc" = 2 ] && [ "$(printf '%s' "$out" | jq -r .state)" = drift ] \
   || bad="$bad available-budget-skipped-head-fence"
 
+# Governing policy authority is bound to the same stable PR tuple as the head.
+# A base retarget/advance with an unchanged head invalidates the cap read.
+_base_race="$WORK/cap-base-race.count"
+rm -f "$_base_race"
+out="$(P4B_TEST_BASE_RACE_FILE="$_base_race" P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_LIVE_HEAD="$_p4a_head" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+  || bad="$bad governing-base-race-not-fail-closed"
+
+# A diagnostic report about a newly moved live head cannot open the NEW
+# cap-only missing-adapter path for the stale reviewed head.
+out="$(P4B_TEST_LIVE_HEAD="$_p4a_old" _barrier 0 0 "{\"head_sha\":\"$_p4a_old\"}" "$WORK/cap-candidate.yml" "$_p4a_head" cap-only)" && rc=0 || rc=$?
+[ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+  || bad="$bad cap-only-report-head-drift-opened"
+
 rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 1 ] || bad="$bad final-request-not-polled"
@@ -4143,6 +4192,102 @@ rm -rf "$WORK/barrier-state/phase-4b-barrier"
 out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-zero-wait.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-base-zero-wait.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 3 ] || bad="$bad final-wait-exhaustion-not-tiebreak"
 printf '%s' "$out" | jq -e '.codex_evidence == "request-cap-final-wait-exhausted"' >/dev/null 2>&1 || bad="$bad final-wait-exhaustion-evidence"
+
+# The final request may report while the zero/expired local wait is being
+# evaluated. That terminal result wins over the non-retryable human stop.
+cat >"$WORK/stub-cx-report-on-recheck.sh" <<'EOF'
+#!/bin/sh
+if [ -e "$P4B_TEST_CODEX_RECHECK_MARKER" ]; then
+  exit 0
+fi
+: >"$P4B_TEST_CODEX_RECHECK_MARKER"
+exit 1
+EOF
+chmod +x "$WORK/stub-cx-report-on-recheck.sh"
+rm -rf "$WORK/barrier-state/phase-4b-barrier"
+rm -f "$WORK/codex-recheck.marker"
+out="$(P4B_TEST_CODEX_STUB="$WORK/stub-cx-report-on-recheck.sh" P4B_TEST_CODEX_RECHECK_MARKER="$WORK/codex-recheck.marker" P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-zero-wait.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-base-zero-wait.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = signal ] \
+  || bad="$bad final-wait-report-race-not-rechecked"
+
+# Unreadable terminal evidence is never equivalent to "no result" at either
+# cap stop. It must take the authority-error path instead of exit 8.
+for _terminal_case in immediate final-wait; do
+  _comments_race="$WORK/${_terminal_case}-comments-race.count"
+  rm -f "$_comments_race" "$WORK/codex-recheck.marker" "$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-$_p4a_head.pending"
+  if [ "$_terminal_case" = immediate ]; then
+    _race_comments="$_cap_old"; _race_policy="$WORK/cap-base.yml"
+  else
+    _race_comments="$_cap_final"; _race_policy="$WORK/cap-base-zero-wait.yml"
+  fi
+  out="$(P4B_TEST_COMMENTS_RACE_FILE="$_comments_race" P4B_TEST_COMMENTS_FAIL_AFTER=3 P4B_TEST_BASE_POLICY_PATH="$_race_policy" P4B_TEST_COMMENTS_JSON="$_race_comments" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$_race_policy" "$_p4a_head")" && rc=0 || rc=$?
+  [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+    || bad="$bad ${_terminal_case}-unreadable-terminal-became-exit8"
+done
+
+# A head move visible only on the finishing sample invalidates both a newly
+# reported diagnostic and an otherwise-empty terminal resample.
+_head_race="$WORK/immediate-head-race.count"
+rm -f "$_head_race" "$WORK/codex-recheck.marker"
+out="$(P4B_TEST_CODEX_STUB="$WORK/stub-cx-report-on-recheck.sh" P4B_TEST_CODEX_RECHECK_MARKER="$WORK/codex-recheck.marker" P4B_TEST_HEAD_RACE_FILE="$_head_race" P4B_TEST_HEAD_RACE_AFTER=4 P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+  || bad="$bad reported-finishing-head-drift-opened"
+_head_race="$WORK/final-wait-head-race.count"
+rm -f "$_head_race" "$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-$_p4a_head.pending"
+out="$(P4B_TEST_HEAD_RACE_FILE="$_head_race" P4B_TEST_HEAD_RACE_AFTER=4 P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-zero-wait.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-base-zero-wait.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = error ] \
+  || bad="$bad empty-finishing-head-drift-became-exit8"
+
+# A finishing Codex report resolves only the Codex arm. Preserve the other
+# provider's state: ordinary CodeRabbit not-yet still exhausts to fallback,
+# while its terminal rate-limit refusal opens under the existing #1178 rule.
+cat >"$WORK/cap-base-zero-wait-cr.yml" <<'EOF'
+author_identity: nathanjohnpayne
+coderabbit:
+  enabled: true
+  max_wait_seconds: 0
+codex:
+  enabled: true
+  max_review_rounds: 2
+  reaction_freshness_window_seconds: 1800
+EOF
+for _cr_finish in not-yet rate-limited; do
+  rm -f "$WORK/codex-recheck.marker"
+  rm -rf "$WORK/barrier-state/phase-4b-barrier"
+  case "$_cr_finish" in
+    not-yet) _cr_json="{\"head_sha\":\"$_p4a_head\",\"probe\":{\"observed\":\"awaiting-summary\"}}" ;;
+    rate-limited) _cr_json="{\"head_sha\":\"$_p4a_head\",\"probe\":{\"observed\":\"rate_limit\"}}" ;;
+  esac
+  out="$(P4B_TEST_CODEX_STUB="$WORK/stub-cx-report-on-recheck.sh" P4B_TEST_CODEX_RECHECK_MARKER="$WORK/codex-recheck.marker" P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-zero-wait-cr.yml" P4B_TEST_COMMENTS_JSON="$_cap_final" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 7 "$_cr_json" "$WORK/cap-base-zero-wait-cr.yml" "$_p4a_head")" && rc=0 || rc=$?
+  case "$_cr_finish" in
+    not-yet) [ "$rc" = 2 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = escalate ] || bad="$bad final-report-erased-coderabbit-wait" ;;
+    rate-limited) [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = open ] || bad="$bad final-report-did-not-clear-rate-limit" ;;
+  esac
+done
+
+# A trusted timeout that first appears in the finishing sample still obeys
+# allow_phase_4b_substitute=false; it cannot open an unusable Phase 4b review.
+cat >"$WORK/cap-base-zero-wait-nosub.yml" <<'EOF'
+author_identity: nathanjohnpayne
+coderabbit:
+  enabled: false
+  max_wait_seconds: 0
+codex:
+  enabled: true
+  allow_phase_4b_substitute: false
+  max_review_rounds: 2
+  reaction_freshness_window_seconds: 1800
+EOF
+_cap_timeout_marker="<!-- mergepath-phase-4a-terminal:v1 provider=codex outcome=timeout head=$_p4a_head trigger_comment_id=5102 -->"
+_cap_final_lower=$(printf '%s' "$_cap_final" | jq -c '.[1].body="@codex review"')
+_cap_final_timeout=$(printf '%s' "$_cap_final_lower" | jq -c --arg body "$_cap_timeout_marker" \
+  '. + [{id:5199,user:{login:"nathanjohnpayne"},body:$body,created_at:"2026-09-27T23:59:59Z"}]')
+_comments_race="$WORK/final-timeout-nosub-comments.count"
+rm -f "$_comments_race" "$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-$_p4a_head.pending"
+out="$(P4B_TEST_COMMENTS_RACE_FILE="$_comments_race" P4B_TEST_COMMENTS_CHANGE_AFTER=3 P4B_TEST_COMMENTS_JSON_AFTER="$_cap_final_timeout" P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base-zero-wait-nosub.yml" P4B_TEST_COMMENTS_JSON="$_cap_final_lower" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-base-zero-wait-nosub.yml" "$_p4a_head")" && rc=0 || rc=$?
+[ "$rc" = 2 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = escalate ] \
+  && printf '%s' "$out" | jq -e '.reason | contains("allow_phase_4b_substitute=false")' >/dev/null 2>&1 \
+  || bad="$bad final-timeout-bypassed-no-substitute(rc=$rc,out=$out)"
 
 # Current-head provider evidence wins before any budget read, even if that
 # read would fail. A trusted pre-existing timeout also keeps its old waiver.
@@ -4182,15 +4327,6 @@ out="$(P4B_TEST_BASE_POLICY_PATH="$WORK/does-not-exist" P4B_TEST_COMMENTS_JSON='
 
 # Budget resolution is multi-read. If Codex reports during it, the terminal
 # recheck must observe that report before the non-retryable exit-8 decision.
-cat >"$WORK/stub-cx-report-on-recheck.sh" <<'EOF'
-#!/bin/sh
-if [ -e "$P4B_TEST_CODEX_RECHECK_MARKER" ]; then
-  exit 0
-fi
-: >"$P4B_TEST_CODEX_RECHECK_MARKER"
-exit 1
-EOF
-chmod +x "$WORK/stub-cx-report-on-recheck.sh"
 rm -f "$WORK/codex-recheck.marker"
 out="$(P4B_TEST_CODEX_STUB="$WORK/stub-cx-report-on-recheck.sh" P4B_TEST_CODEX_RECHECK_MARKER="$WORK/codex-recheck.marker" P4B_TEST_BASE_POLICY_PATH="$WORK/cap-base.yml" P4B_TEST_COMMENTS_JSON="$_cap_old" P4B_TEST_COMMIT_DATE='2026-08-01T00:00:00Z' _barrier 1 0 "{\"head_sha\":\"$_p4a_head\"}" "$WORK/cap-candidate.yml" "$_p4a_head")" && rc=0 || rc=$?
 [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .codex_evidence)" = signal ] \
@@ -5697,6 +5833,18 @@ chmod +x "$WORK/wp-wrapper.sh"
 
 # Composition: the barrier surfaces the resume outcome and keeps the trigger
 # declined on paused (asking a refusing provider is still forbidden).
+cat >"$WORK/barrier-bin/gh" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = api ] && [ "${2:-}" = repos/owner/repo/pulls/7 ]; then
+  for prev in "$@"; do
+    [ "${want_jq:-false}" = true ] && { printf '{"head":{"sha":"abc123"}}' | jq -r "$prev"; exit; }
+    [ "$prev" = --jq ] && want_jq=true
+  done
+  printf '{"head":{"sha":"abc123"}}\n'; exit
+fi
+printf '[]\n'
+EOF
+chmod +x "$WORK/barrier-bin/gh"
 bad=""
 out="$(_barrier 0 7 '{"head_sha":"abc123","probe":{"observed":"paused"},"review":{"id":771}}')" && rc=0 || rc=$?
 [ "$rc" = 1 ] || bad="$bad paused-rc"
