@@ -853,7 +853,7 @@ case "$orc" in
     ;;
   8)
     emit_json 8 false null
-    log "Codex request cap requires a human tiebreaker on ${REPO}#${PR} (orchestrator exit 8) — no watermark; do NOT fan out or substitute Phase 4b authority"
+    log "Phase 4b stopped without review authority on ${REPO}#${PR} (orchestrator exit 8: curated diff over budget or Codex-cap human tiebreaker) — no watermark; do NOT fan out or substitute Phase 4b authority"
     ;;
   10)
     emit_json 10 false null

@@ -289,6 +289,8 @@ FAKE_ORCH_EXIT=8 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha
   && fail "human-tiebreaker stop should exit 8" || { [ $? -eq 8 ] && pass "human-tiebreaker stop passes exit 8 through" || fail "wrong exit for human-tiebreaker stop"; }
 grep -q "do NOT fan out" "$WORK/err-cap" \
   && pass "human-tiebreaker messaging blocks fan-out" || fail "human-tiebreaker fail-closed message missing"
+grep -q "curated diff over budget or Codex-cap human tiebreaker" "$WORK/err-cap" \
+  && pass "exit-8 messaging preserves both meanings" || fail "exit-8 messaging incorrectly assumes only the Codex cap"
 
 FAKE_ORCH_EXIT=10 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha "$C5" >/dev/null 2>"$WORK/err-budget" \
   && fail "request-budget evidence error should exit 10" || { [ $? -eq 10 ] && pass "request-budget evidence error passes exit 10 through" || fail "wrong exit for request-budget evidence error"; }
