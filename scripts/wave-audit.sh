@@ -211,6 +211,7 @@ EXCLUDES="$(audit_list scope_exclude_prefixes)"
 # commits the lane never verified (#663 round-3 P1). The branch is the
 # source of truth; a parseable title must agree with it.
 PR_HEAD_OID=""
+PR_BASE_OID=""
 # Branch metadata is resolved whenever the run is OPERATIONAL (lane check
 # active) — even under --head-sha (#663 round-4 P2): a typo or stale manual
 # sha would otherwise dispatch and watermark a review for a different
@@ -221,11 +222,12 @@ need_meta=false
 [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ] && need_meta=true
 if [ "$need_meta" = true ]; then
   command -v gh >/dev/null 2>&1 || die 3 "gh is required to resolve the canary metadata (or pass --head-sha with WAVE_AUDIT_LANE_VERIFIED_OK=1 in hermetic tests)"
-  meta="$(gh pr view "$PR" --repo "$REPO" --json title,headRefName,headRefOid --jq '[.title, .headRefName, .headRefOid] | @tsv' 2>/dev/null)" \
+  meta="$(gh pr view "$PR" --repo "$REPO" --json title,headRefName,headRefOid,baseRefOid --jq '[.title, .headRefName, .headRefOid, .baseRefOid] | @tsv' 2>/dev/null)" \
     || die 3 "could not read PR $REPO#$PR metadata"
   title="$(printf '%s' "$meta" | cut -f1)"
   branch="$(printf '%s' "$meta" | cut -f2)"
   PR_HEAD_OID="$(printf '%s' "$meta" | cut -f3)"
+  PR_BASE_OID="$(printf '%s' "$meta" | cut -f4)"
   branch_sha="$(printf '%s\n' "$branch" | sed -n 's|.*/\(sync-all-\)\{0,1\}\([0-9a-f]\{7,40\}\)$|\2|p')"
   [ -n "$branch_sha" ] || die 3 "canary branch '$branch' does not carry the mergepath-sync/<sha> shape — not a lane-verifiable sync canary"
   if [ -z "$HEAD_SHA" ]; then
@@ -258,26 +260,34 @@ HEAD_FULL="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${HEAD_SHA}^{commit}
 # the canary PR content == mergepath@head — dispatching against a canary
 # whose current head is NOT lane-verified would let a non-faithful sync PR
 # clear external review without its actual PR diff ever being reviewed.
-# Fail closed unless the canary head carries the head-pinned trusted lane
-# marker (the same github-actions[bot] marker merge-clearance-gate.sh keys
-# on). WAVE_AUDIT_LANE_VERIFIED_OK=1 overrides — hermetic tests only.
+# Fail closed unless the canary's live head/base pair carries the exact
+# pair-bound trusted lane marker (the same github-actions[bot] marker
+# merge-clearance-gate.sh keys on). A legacy head-only marker cannot establish
+# which base was verified, so it is deliberately not a rollout compatibility
+# path. WAVE_AUDIT_LANE_VERIFIED_OK=1 overrides — hermetic tests only.
 pr_head=""
+pr_base=""
 if [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ]; then
   command -v gh >/dev/null 2>&1 || die 3 "gh is required for the lane-verification precondition"
-  if [ -n "$PR_HEAD_OID" ]; then
+  if [ -n "$PR_HEAD_OID" ] && [ -n "$PR_BASE_OID" ]; then
     pr_head="$PR_HEAD_OID"
+    pr_base="$PR_BASE_OID"
   else
-    pr_head="$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)" \
-      || die 3 "could not read PR $REPO#$PR head for lane verification"
+    live_pair="$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefOid --jq '[.headRefOid, .baseRefOid] | @tsv' 2>/dev/null)" \
+      || die 3 "could not read PR $REPO#$PR head/base for lane verification"
+    pr_head="$(printf '%s' "$live_pair" | cut -f1)"
+    pr_base="$(printf '%s' "$live_pair" | cut -f2)"
   fi
-  [ -n "$pr_head" ] || die 3 "empty PR head reading $REPO#$PR for lane verification"
+  [[ "$pr_head" =~ ^[0-9a-fA-F]{40}$ ]] && [[ "$pr_base" =~ ^[0-9a-fA-F]{40}$ ]] \
+    || die 3 "invalid PR head/base reading $REPO#$PR for lane verification"
   lane_comments="$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" \
     || die 3 "could not read canary PR comments for lane verification"
-  printf '%s' "$lane_comments" | jq -e --arg head "$pr_head" '
+  marker="<!-- mergepath-propagation-lane:v2 verified-head=$pr_head verified-base=$pr_base -->"
+  printf '%s' "$lane_comments" | jq -e --arg marker "$marker" '
     any(.[]; (.user.login == "github-actions[bot]")
-         and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))' >/dev/null 2>&1 \
-    || die 3 "canary $REPO#$PR head $pr_head is not lane-verified (no head-pinned mergepath-propagation-lane marker) — wait for the External Review Check lane run or investigate a diverged canary; refusing to dispatch"
-  log "canary lane verified for PR head $pr_head"
+         and ((.body // "") | contains($marker)))' >/dev/null 2>&1 \
+    || die 3 "canary $REPO#$PR pair $pr_head/$pr_base is not lane-verified (no exact pair-bound mergepath-propagation-lane:v2 marker) — wait for the External Review Check lane run or investigate a diverged canary; refusing to dispatch"
+  log "canary lane verified for PR head/base $pr_head/$pr_base"
 fi
 
 # --- resolve the audit base (chaining watermark) ------------------------------

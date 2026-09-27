@@ -166,44 +166,52 @@ run_wa_repo() { # run_wa_repo <repo-dir> <policy> <capture-reset> <args...>
     bash "$WA" "$@"
 }
 
-# fake gh for the lane-precondition tests: serves the canary PR head and the
-# issue-comments feed (with or without the head-pinned lane marker per
-# FAKE_LANE).
+# fake gh for the lane-precondition tests: serves the canary PR's live pair
+# and the issue-comments feed. FAKE_LANE selects a valid v2 marker or a
+# rejected legacy/malformed/wrong-pair/non-bot form.
 FAKEBIN="$WORK/fakebin"
 mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/gh" <<'GH'
 #!/usr/bin/env bash
 if [ "$1" = "pr" ]; then
   case "$*" in
-    *"title,headRefName,headRefOid"*)
+    *"title,headRefName,headRefOid,baseRefOid"*)
       # meta fetch: title / branch / head oid as tsv. FAKE_TITLE_SHA and
       # FAKE_BRANCH_SHA drive the round-3 title-vs-branch validation tests.
-      printf 'sync: bulk reconcile to mergepath@%s\tmergepath-sync/sync-all-%s\tcanaryhead1230000000000000000000000000000\n' \
-        "${FAKE_TITLE_SHA:?}" "${FAKE_BRANCH_SHA:?}"
+      printf 'sync: bulk reconcile to mergepath@%s\tmergepath-sync/sync-all-%s\t%s\t%s\n' \
+        "${FAKE_TITLE_SHA:?}" "${FAKE_BRANCH_SHA:?}" "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}"
       ;;
     *)
-      printf 'canaryhead1230000000000000000000000000000\n'
+      printf '%s\t%s\n' "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}"
       ;;
   esac
   exit 0
 fi
 if [ "$1" = "api" ]; then
-  if [ "${FAKE_LANE:-1}" = "1" ]; then
-    printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane verified-head=canaryhead1230000000000000000000000000000 -->"}]\n'
-  else
-    printf '[]\n'
-  fi
+  case "${FAKE_LANE:-good}" in
+    good) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=%s -->"}]\n' "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}" ;;
+    prose) printf '[{"user":{"login":"github-actions[bot]"},"body":"lane complete: <!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=%s -->; dispatch authorized"}]\n' "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}" ;;
+    wrong-head) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=dddddddddddddddddddddddddddddddddddddddd verified-base=%s -->"}]\n' "${FAKE_CANARY_BASE:?}" ;;
+    wrong-base) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=cccccccccccccccccccccccccccccccccccccccc -->"}]\n' "${FAKE_CANARY_HEAD:?}" ;;
+    v1) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane verified-head=%s -->"}]\n' "${FAKE_CANARY_HEAD:?}" ;;
+    malformed) printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=bad -->"}]\n' "${FAKE_CANARY_HEAD:?}" ;;
+    nonbot) printf '[{"user":{"login":"contributor"},"body":"<!-- mergepath-propagation-lane:v2 verified-head=%s verified-base=%s -->"}]\n' "${FAKE_CANARY_HEAD:?}" "${FAKE_CANARY_BASE:?}" ;;
+    unreadable) exit 1 ;;
+    *) printf '[]\n' ;;
+  esac
   exit 0
 fi
 exit 1
 GH
 chmod +x "$FAKEBIN/gh"
 
-run_wa_lane() { # run_wa_lane <FAKE_LANE 0|1> <args...> — lane check ACTIVE, fake gh
+run_wa_lane() { # run_wa_lane <FAKE_LANE mode> <args...> — lane check ACTIVE, fake gh
   local lane="$1"; shift
   rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"
   PATH="$FAKEBIN:$PATH" FAKE_LANE="$lane" \
   FAKE_TITLE_SHA="${FAKE_TITLE_SHA:-$C2}" FAKE_BRANCH_SHA="${FAKE_BRANCH_SHA:-$C2}" \
+  FAKE_CANARY_HEAD="${FAKE_CANARY_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+  FAKE_CANARY_BASE="${FAKE_CANARY_BASE:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" \
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=0 \
@@ -322,27 +330,45 @@ remote_has_tag "$C5" && pass "rerun pushed the local-only watermark to origin" \
 # ===========================================================================
 echo "wave-audit.sh — canary lane precondition (#663 P1)"
 # ===========================================================================
-run_wa_lane 1 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null \
+run_wa_lane good 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null \
   && pass "lane-verified canary dispatches" || fail "lane-verified canary refused"
 [ -e "$CAPTURE/args" ] && pass "orchestrator dispatched under a verified lane" || fail "no dispatch under verified lane"
-grep -q "canaryhead1230000000000000000000000000000" "$CAPTURE/args" \
+grep -q "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$CAPTURE/args" \
   && pass "review pinned to the lane-verified head (--head passed through)" \
   || fail "lane-verified head not pinned on dispatch (round-3 P1)"
-if run_wa_lane 0 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
+run_wa_lane prose 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null \
+  && pass "complete v2 marker in bot prose dispatches" || fail "complete v2 marker in bot prose refused"
+if run_wa_lane none 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
   fail "un-lane-verified canary was dispatched"
 else
   [ $? -eq 3 ] && pass "un-lane-verified canary fails closed (exit 3)" || fail "wrong exit for unverified lane"
 fi
 [ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched without the lane marker" || fail "dispatched despite missing lane marker"
 
+for rejected_lane in wrong-head wrong-base v1 malformed nonbot unreadable; do
+  if run_wa_lane "$rejected_lane" 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
+    fail "$rejected_lane lane marker was accepted"
+  else
+    [ $? -eq 3 ] && pass "$rejected_lane lane marker fails closed (exit 3)" || fail "wrong exit for $rejected_lane lane marker"
+  fi
+  [ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched for $rejected_lane lane marker" || fail "dispatched despite $rejected_lane lane marker"
+done
+
+if FAKE_CANARY_BASE=not-an-oid run_wa_lane good 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
+  fail "malformed live head/base pair was accepted"
+else
+  [ $? -eq 3 ] && pass "malformed live head/base pair fails closed (exit 3)" || fail "wrong exit for malformed live pair"
+fi
+[ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched for malformed live pair" || fail "dispatched despite malformed live pair"
+
 # Round-3 P1: the head is resolved from the lane-verified BRANCH sha, and a
 # parseable title must agree with it.
-FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null \
+FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null \
   && pass "branch-derived head with agreeing title dispatches" \
   || fail "branch-derived head resolution failed"
 grep -q "scripts/b.sh" "$CAPTURE/diff" \
   && pass "audit range keyed off the branch sha" || fail "branch-derived range wrong"
-if FAKE_TITLE_SHA="$C3" FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
+if FAKE_TITLE_SHA="$C3" FAKE_BRANCH_SHA="$C2" run_wa_lane good 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
   fail "title/branch sha mismatch was accepted"
 else
   [ $? -eq 3 ] && pass "title/branch sha mismatch fails closed (exit 3)" || fail "wrong exit for title/branch mismatch"
@@ -351,7 +377,7 @@ fi
 
 # Round-4 P2: an operational --head-sha must still match the lane-verified
 # branch sha.
-if FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consumer --base "$C1" --head-sha "$C3" --dry-run >/dev/null 2>&1; then
+if FAKE_BRANCH_SHA="$C2" run_wa_lane good 64 --repo owner/consumer --base "$C1" --head-sha "$C3" --dry-run >/dev/null 2>&1; then
   fail "mismatched --head-sha was accepted on an operational run"
 else
   [ $? -eq 3 ] && pass "operational --head-sha mismatch fails closed (exit 3)" || fail "wrong exit for --head-sha mismatch"

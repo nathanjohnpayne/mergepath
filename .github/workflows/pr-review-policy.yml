@@ -869,10 +869,10 @@ jobs:
           # default token.
           LABEL_REMOVAL_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          # Embedded in the lane marker so the signal is HEAD-PINNED — a
+          # Embedded in the lane marker so the signal is HEAD/BASE-PINNED — a
           # consumer (merge-clearance-gate.sh's propagation exemption, #429)
-          # can confirm THIS head was verified, not merely that the PR was
-          # once a faithful mirror at an earlier head.
+          # can confirm THIS pair was verified, not merely that the PR was
+          # once a faithful mirror before a push or retarget.
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -886,23 +886,23 @@ jobs:
           # and an internal reviewer-identity APPROVED (the standard
           # under-threshold path).
           #
-          # Post a HEAD-PINNED, machine-readable lane marker. The marker
-          # embeds the verified head SHA, so a consumer of this signal
+          # Post a HEAD/BASE-PINNED, machine-readable lane marker. The marker
+          # embeds the verified pair, so a consumer of this signal
           # (scripts/merge-clearance-gate.sh's propagation exemption, #429)
-          # exempts a head ONLY if the lane verified THAT head — not merely
-          # that the PR was once a faithful mirror at some earlier head.
+          # exempts a PR ONLY if the lane verified THAT head/base pair — not
+          # merely that the PR was once a faithful mirror before a retarget.
           # Posted only by this workflow (github-actions[bot]); a PR author
-          # cannot forge that identity. One marker per distinct verified
-          # head: grep includes the head SHA, so re-runs on the same head
-          # don't re-comment; a faithful re-push to a NEW head posts a fresh
-          # marker; a DIVERGED push never reaches this step (propagation_lane
-          # is false), so no marker is ever posted for an unverified head.
+          # cannot forge that identity. One marker per distinct verified pair:
+          # re-runs on the same pair don't re-comment; a faithful re-push or
+          # same-head retarget posts a fresh marker only after that new pair is
+          # verified; a DIVERGED push never reaches this step.
           # Marker contract is shared with merge-clearance-gate.sh
           # (lane_verified(), also consumed indirectly by agent-review.yml's
           # rc=5 branch via --derive-external-requiredness, #620) AND with
           # agent-review.yml's triage job (#656: triage skips its
-          # needs-external-review add only for a head this marker pins) —
-          # keep the `mergepath-propagation-lane verified-head=<sha>` form
+          # needs-external-review add only for a pair this marker pins) —
+          # keep the `mergepath-propagation-lane:v2 verified-head=<sha>
+          # verified-base=<sha>` form
           # in sync across the three files
           # (scripts/ci/check_agent_review_triage_defers asserts the
           # lockstep).
@@ -941,18 +941,18 @@ jobs:
             fi
           }
 
-          MARKER="<!-- mergepath-propagation-lane verified-head=$HEAD_SHA -->"
+          MARKER="<!-- mergepath-propagation-lane:v2 verified-head=$HEAD_SHA verified-base=$BASE_SHA -->"
           ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
           if [ -z "$ALREADY" ]; then
             # The marker and dispatch authorize the propagation exemption for
-            # this head. Check the complete event pair immediately before that
-            # authority is published; the marker schema remains head-pinned.
+            # this pair. Check the complete event pair immediately before that
+            # authority is published.
             fence_event_pair "publishing verified-propagation authority"
             gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<EOF
           $MARKER
-          **Propagation PR review lane** — verified faithful mirror ✅ (head \`$HEAD_SHA\`)
+          **Propagation PR review lane** — verified faithful mirror ✅ (head \`$HEAD_SHA\`, base \`$BASE_SHA\`)
 
-          This PR was checked out against \`mergepath\` at the source commit named in its branch and **verified byte-for-byte at this head**: every changed file is under a \`.mergepath-sync.yml\` path AND matches \`mergepath@<sha>\`'s content (\`scripts/workflow/verify-propagation-pr.sh\`). Its content was already reviewed in the upstream mergepath PR(s). Per REVIEW_POLICY.md § Propagation PR review lane it is **exempt from the Phase 4 external-review requirement**.
+          This PR was checked out against \`mergepath\` at the source commit named in its branch and **verified byte-for-byte at this head/base pair**: every changed file is under a \`.mergepath-sync.yml\` path AND matches \`mergepath@<sha>\`'s content (\`scripts/workflow/verify-propagation-pr.sh\`). Its content was already reviewed in the upstream mergepath PR(s). Per REVIEW_POLICY.md § Propagation PR review lane it is **exempt from the Phase 4 external-review requirement**.
 
           It is still subject to: CI green, CodeRabbit advisory review, and an internal reviewer-identity \`APPROVED\` — the standard under-threshold path. Merge as the author once those clear.
 
@@ -969,7 +969,7 @@ jobs:
             # workflow token is contents:read (cannot POST /dispatches), and
             # keeping the dispatch on the PAT avoids widening the GITHUB_TOKEN
             # scope. Best-effort — the gate re-derives clearance from THIS marker
-            # (lane_verified, head-pinned) and never trusts the dispatch payload,
+            # (lane_verified, head/base-pinned) and never trusts the dispatch payload,
             # so on any failure the */15 sweep still recovers the gate; a failed
             # dispatch must never fail the lane. Keep the event type in sync with
             # merge-clearance-gate.yml's repository_dispatch trigger.

@@ -15,6 +15,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="$ROOT/.github/workflows/pr-review-policy.yml"
+AGENT_WORKFLOW="$ROOT/.github/workflows/agent-review.yml"
 
 for tool in yq node; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -74,6 +75,11 @@ PASS=0
 FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+
+HEAD40=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+OTHER_HEAD40=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+BASE40=cccccccccccccccccccccccccccccccccccccccc
+OTHER_BASE40=dddddddddddddddddddddddddddddddddddddddd
 
 # #1254: label-only deliveries are recovery inputs for the classifier too. A
 # workflow-level `if` that excludes them can publish the two older required
@@ -192,6 +198,96 @@ check "unrelated labels alone pass" \
   '{"livePages":[["documentation","enhancement"]]}' \
   '.crashed == null and .failures == []'
 
+# The independent agent-review triage path consumes the same authority marker
+# before deciding whether to skip its needs-external-review add. Execute its
+# actual marker-reader block so producer/consumer lockstep is behavioral, not
+# only a grep assertion.
+yq -r '.jobs.triage.steps[] | select(.id == "check") | .with.script' \
+  "$AGENT_WORKFLOW" >"$WORK/agent-triage.js"
+awk '
+  /let laneVerifiedHead = false;/ { capture=1 }
+  capture && /\/\/ Export intrinsic threshold\/path requiredness/ { exit }
+  capture { print }
+' "$WORK/agent-triage.js" >"$WORK/agent-lane-reader.js"
+if [ ! -s "$WORK/agent-lane-reader.js" ]; then
+  fail "could not extract agent-review's propagation marker reader"
+else
+  cat >>"$WORK/agent-lane-reader.js" <<'NODE'
+return laneVerifiedHead;
+NODE
+fi
+
+cat >"$WORK/agent-lane-harness.mjs" <<'NODE'
+import { readFileSync } from 'node:fs';
+
+const body = readFileSync(process.argv[2], 'utf8');
+const scenario = JSON.parse(process.argv[3]);
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const warnings = [];
+const calls = [];
+const github = {
+  rest: { issues: { listComments() {} } },
+  async paginate(_method, params) {
+    calls.push(params);
+    if (scenario.readFails) throw new Error('HTTP 502');
+    return scenario.comments;
+  },
+};
+const context = { repo: { owner: 'o', repo: 'r' } };
+const core = { warning: message => warnings.push(message) };
+const needsExternal = true;
+const pr = {
+  number: 42,
+  head: { ref: 'mergepath-sync/deadbee', sha: scenario.head },
+  base: { sha: scenario.base },
+};
+let crashed = null;
+let laneVerifiedHead = null;
+try {
+  laneVerifiedHead = await new AsyncFunction(
+    'github', 'context', 'core', 'needsExternal', 'pr', body
+  )(github, context, core, needsExternal, pr);
+} catch (err) {
+  crashed = err.message;
+}
+process.stdout.write(JSON.stringify({ laneVerifiedHead, warnings, calls, crashed }));
+NODE
+
+agent_lane_check() { # <label> <scenario-json> <jq-assertion>
+  local label=$1 scenario=$2 assertion=$3 out
+  out=$(node "$WORK/agent-lane-harness.mjs" "$WORK/agent-lane-reader.js" "$scenario") \
+    || { fail "$label: harness exited non-zero"; return; }
+  if jq -e "$assertion" >/dev/null <<<"$out"; then
+    pass "$label"
+  else
+    fail "$label: $out"
+  fi
+}
+
+agent_lane_check "agent triage accepts a trusted exact-pair marker with surrounding prose" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[{user:{login:"github-actions[bot]"},body:("context\n<!-- mergepath-propagation-lane:v2 verified-head="+$h+" verified-base="+$b+" -->\nmore context")}]}')" \
+  '.crashed == null and .laneVerifiedHead == true and (.calls | length) == 1'
+
+agent_lane_check "agent triage rejects a marker for the old base" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" --arg old "$OTHER_BASE40" '{head:$h,base:$b,comments:[{user:{login:"github-actions[bot]"},body:("<!-- mergepath-propagation-lane:v2 verified-head="+$h+" verified-base="+$old+" -->")}]}')" \
+  '.crashed == null and .laneVerifiedHead == false'
+
+agent_lane_check "agent triage rejects a legacy head-only marker" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[{user:{login:"github-actions[bot]"},body:("<!-- mergepath-propagation-lane verified-head="+$h+" -->")}]}')" \
+  '.crashed == null and .laneVerifiedHead == false'
+
+agent_lane_check "agent triage rejects a non-bot exact-pair marker" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[{user:{login:"nathanjohnpayne"},body:("<!-- mergepath-propagation-lane:v2 verified-head="+$h+" verified-base="+$b+" -->")}]}')" \
+  '.crashed == null and .laneVerifiedHead == false'
+
+agent_lane_check "agent triage rejects malformed live pair input before reading comments" \
+  "$(jq -nc --arg b "$BASE40" '{head:"not-a-sha",base:$b,comments:[]}')" \
+  '.crashed == null and .laneVerifiedHead == false and .calls == [] and (.warnings | length) == 1'
+
+agent_lane_check "agent triage fails closed when comments are unreadable" \
+  "$(jq -nc --arg h "$HEAD40" --arg b "$BASE40" '{head:$h,base:$b,comments:[],readFails:true}')" \
+  '.crashed == null and .laneVerifiedHead == false and (.warnings | length) == 1'
+
 # #1321: execute the real reconciliation step with a fake public API. The stub
 # accepts only paginated timeline/comment reads, so the positive case also
 # proves that ownership is decided over the complete surfaces.
@@ -300,11 +396,6 @@ esac
 SH
 chmod +x "$WORK/bin/bash"
 
-HEAD40=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-OTHER_HEAD40=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-BASE40=cccccccccccccccccccccccccccccccccccccccc
-OTHER_BASE40=dddddddddddddddddddddddddddddddddddddddd
-
 write_apply_fixture() { # <dir> <live-head> [labels] [live-base]
   local dir=$1 live_head=$2 labels=${3-} live_base=${4:-$BASE40}
   mkdir -p "$dir"
@@ -412,11 +503,48 @@ write_propagation_fixture "$P1" "$HEAD40"
 rc=$(run_propagation "$P1")
 if [ "$rc" -eq 0 ] \
    && [ -s "$P1/comment-writes" ] \
+   && grep -Fq "<!-- mergepath-propagation-lane:v2 verified-head=$HEAD40 verified-base=$BASE40 -->" "$P1/comment-writes" \
    && [ "$(cat "$P1/dispatches" 2>/dev/null)" = dispatched ] \
    && [ "$(cat "$P1/label-removals" 2>/dev/null)" = removed ]; then
   pass "verified propagation publishes authority and removes the label only on the event head/base"
 else
   fail "current propagation head/base did not publish and remove as expected (rc=$rc out=$(cat "$P1/out") err=$(cat "$P1/err"))"
+fi
+
+P1B="$WORK/propagation-legacy-marker"
+write_propagation_fixture "$P1B" "$HEAD40"
+printf '%s\n' "<!-- mergepath-propagation-lane verified-head=$HEAD40 -->" >"$P1B/pr-comments.txt"
+rc=$(run_propagation "$P1B")
+if [ "$rc" -eq 0 ] \
+   && grep -Fq "<!-- mergepath-propagation-lane:v2 verified-head=$HEAD40 verified-base=$BASE40 -->" "$P1B/comment-writes" \
+   && [ "$(cat "$P1B/dispatches" 2>/dev/null)" = dispatched ]; then
+  pass "a legacy head-only marker does not suppress v2 pair authority"
+else
+  fail "legacy marker suppressed the v2 pair marker (rc=$rc out=$(cat "$P1B/out") err=$(cat "$P1B/err"))"
+fi
+
+P1C="$WORK/propagation-other-base-marker"
+write_propagation_fixture "$P1C" "$HEAD40"
+printf '%s\n' "<!-- mergepath-propagation-lane:v2 verified-head=$HEAD40 verified-base=$OTHER_BASE40 -->" >"$P1C/pr-comments.txt"
+rc=$(run_propagation "$P1C")
+if [ "$rc" -eq 0 ] \
+   && grep -Fq "<!-- mergepath-propagation-lane:v2 verified-head=$HEAD40 verified-base=$BASE40 -->" "$P1C/comment-writes" \
+   && [ "$(cat "$P1C/dispatches" 2>/dev/null)" = dispatched ]; then
+  pass "a same-head marker for another base does not suppress current-pair authority"
+else
+  fail "wrong-base marker suppressed current-pair authority (rc=$rc out=$(cat "$P1C/out") err=$(cat "$P1C/err"))"
+fi
+
+P1D="$WORK/propagation-existing-pair-marker"
+write_propagation_fixture "$P1D" "$HEAD40"
+printf '%s\n' "<!-- mergepath-propagation-lane:v2 verified-head=$HEAD40 verified-base=$BASE40 -->" >"$P1D/pr-comments.txt"
+rc=$(run_propagation "$P1D")
+if [ "$rc" -eq 0 ] && [ ! -f "$P1D/comment-writes" ] \
+   && [ ! -f "$P1D/dispatches" ] \
+   && [ "$(cat "$P1D/label-removals" 2>/dev/null)" = removed ]; then
+  pass "an existing current-pair v2 marker deduplicates authority publication"
+else
+  fail "current-pair marker did not deduplicate publication (rc=$rc out=$(cat "$P1D/out") err=$(cat "$P1D/err"))"
 fi
 
 P2="$WORK/propagation-stale-head"
