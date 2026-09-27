@@ -1644,7 +1644,7 @@ p4b_same_head_barrier() {
     case "$cls_cx" in
       reported|will-not-report|waived) ;;
       not-yet)  pending=true ;;
-      escalate) [ -n "$why" ] || why="codex signal check exited $rc" ;;
+      escalate|cap-exhausted) [ -n "$why" ] || why="codex signal check exited $rc" ;;
       *)        why="codex signal check exited $rc" ;;
     esac
   fi
